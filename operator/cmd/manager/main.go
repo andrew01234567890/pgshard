@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"strings"
 	"time"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
@@ -37,14 +38,15 @@ func init() {
 }
 
 type commandOptions struct {
-	metricsAddress         string
-	probeAddress           string
-	leaderElection         bool
-	secureMetrics          bool
-	webhookEnabled         bool
-	attestedRequestTimeout time.Duration
-	webhook                webhookCommandOptions
-	images                 owned.Images
+	metricsAddress              string
+	probeAddress                string
+	leaderElection              bool
+	secureMetrics               bool
+	webhookEnabled              bool
+	attestedRequestTimeout      time.Duration
+	unenumerableHAAckNamespaces string
+	webhook                     webhookCommandOptions
+	images                      owned.Images
 }
 
 type webhookCommandOptions struct {
@@ -82,12 +84,25 @@ func bindCommandFlags(flags *flag.FlagSet) *commandOptions {
 	flags.StringVar(&options.webhook.deploymentControllerName, "deployment-controller-identity", "system:serviceaccount:kube-system:deployment-controller", "authenticated username of the built-in Deployment controller that creates managed supporting ReplicaSets")
 	flags.StringVar(&options.webhook.hpaControllerName, "horizontalpodautoscaler-controller-identity", "system:serviceaccount:kube-system:horizontal-pod-autoscaler", "authenticated username of the built-in HorizontalPodAutoscaler controller, verified by the activation identity probe")
 	flags.DurationVar(&options.attestedRequestTimeout, "attested-max-request-timeout", 0, "installation-attested maximum whole-request lifetime across every API server (the effective --request-timeout ceiling); zero means unattested, which withholds isolation activation")
+	flags.StringVar(&options.unenumerableHAAckNamespaces, "allow-unenumerable-ha-isolation-namespaces", "", "comma-separated namespaces the cluster administrator attests may activate isolation over a single published API-server endpoint the EndpointSlices cannot prove is the complete physical backend set (opaque VIP); admin-controlled at install")
 	flags.StringVar(&options.images.Orchestrator, "orchestrator-image", options.images.Orchestrator, "pgshard orchestrator image reference")
 	flags.StringVar(&options.images.Pooler, "pooler-image", options.images.Pooler, "pgshard pooler image reference")
 	flags.StringVar(&options.images.PostgreSQL, "postgresql-image", options.images.PostgreSQL, "PostgreSQL 18 image reference")
 	flags.StringVar(&options.images.PostgreSQLBootstrap, "postgresql-bootstrap-image", options.images.PostgreSQLBootstrap, "digest-pinned pgshard PostgreSQL 18 bootstrap image required for single-member clusters and multi-member agent-quarantine composition; pgshard/postgres-agent:dev is local-only")
 	flags.Var(&options.images.PostgreSQLRuntime, "postgresql-runtime", "creation-time PostgreSQL process composition: direct or the explicit non-serving agent-quarantine integration mode; existing workload changes are rejected")
 	return options
+}
+
+// parseNamespaceSet turns a comma-separated flag value into a set, dropping empty
+// entries and surrounding whitespace.
+func parseNamespaceSet(raw string) map[string]bool {
+	set := map[string]bool{}
+	for _, entry := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(entry); trimmed != "" {
+			set[trimmed] = true
+		}
+	}
+	return set
 }
 
 func main() {
@@ -158,6 +173,7 @@ func main() {
 		IdentityProber:              controller.NewServerControllerIdentityProber(manager.GetClient(), controllerIdentities, identityProbeStore),
 		AttestedRequestTimeout:      options.attestedRequestTimeout,
 		ValidatingWebhookConfigName: options.webhook.validatingConfigurationName,
+		UnenumerableHAAckNamespaces: parseNamespaceSet(options.unenumerableHAAckNamespaces),
 	}).SetupWithManager(manager); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PgShardCluster")
 		os.Exit(1)

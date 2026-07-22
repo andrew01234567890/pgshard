@@ -99,6 +99,12 @@ type PgShardClusterReconciler struct {
 	// ValidatingWebhookConfigName scopes the dispatch-tuple watch to the pgshard
 	// validating webhook configuration.
 	ValidatingWebhookConfigName string
+	// UnenumerableHAAckNamespaces is the ADMIN-controlled set of namespaces the
+	// cluster administrator attested (via the --allow-unenumerable-ha-isolation-
+	// namespaces install flag) may activate isolation over a single published
+	// API-server endpoint that the EndpointSlices cannot prove is the complete
+	// physical backend set. It is never sourced from a mutable CR annotation.
+	UnenumerableHAAckNamespaces map[string]bool
 }
 
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters,verbs=get;list;watch;update;patch

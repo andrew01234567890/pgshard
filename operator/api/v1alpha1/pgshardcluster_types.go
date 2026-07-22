@@ -490,19 +490,6 @@ const IsolationActivationAnnotation = "pgshard.io/activate-isolation"
 // activation.
 const IsolationActivationRequested = "requested"
 
-// IsolationDispatchTopologyAckAnnotation is the DURABLE administrator
-// acknowledgement required when the kubernetes Service EndpointSlices enumerate
-// at most one API-server backend: a single published address may be a genuine
-// single server or an opaque VIP fronting several backends the probe cannot
-// enumerate. Without the acknowledgement, activation is withheld as
-// ha-unsupported; with it, the administrator attests the published endpoint is
-// the complete physical backend set (or the provider guarantees uniform webhook
-// dispatch behind it).
-const IsolationDispatchTopologyAckAnnotation = "pgshard.io/dispatch-topology-ack"
-
-// IsolationDispatchTopologyAckSingleServer is the acknowledgement value.
-const IsolationDispatchTopologyAckSingleServer = "single-server"
-
 // SealedParent is one protected parent workload sealed into the isolation
 // receipt at its exact API incarnation and contract hash.
 type SealedParent struct {

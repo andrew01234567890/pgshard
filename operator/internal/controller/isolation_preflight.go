@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
@@ -53,20 +54,24 @@ type dispatchProof struct {
 }
 
 // dispatchProofAccepted layers the enumeration-trust gate onto a converged
-// proof: a proof from at most one enumerated backend is accepted only with the
-// cluster's explicit durable single-server/provider acknowledgement. It returns
-// ok, or the ha-unsupported detail to surface.
-func dispatchProofAccepted(cluster *pgshardv1alpha1.PgShardCluster, proof dispatchProof) (bool, string) {
+// proof: a proof from at most one enumerated backend is accepted only when the
+// cluster ADMINISTRATOR has attested the namespace at operator install via the
+// --allow-unenumerable-ha-isolation-namespaces flag (UnenumerableHAAckNamespaces).
+// The attestation is deliberately NOT sourced from a namespaced PgShardCluster
+// annotation, which any principal with cluster update could set to force
+// activation over an unsound dispatch proof; the manager flag is admin-controlled
+// at install time. It returns ok, or the ha-unsupported detail to surface.
+func (r *PgShardClusterReconciler) dispatchProofAccepted(cluster *pgshardv1alpha1.PgShardCluster, proof dispatchProof) (bool, string) {
 	if !proof.converged {
 		return false, ""
 	}
 	if proof.backends > 1 {
 		return true, ""
 	}
-	if cluster.Annotations[pgshardv1alpha1.IsolationDispatchTopologyAckAnnotation] == pgshardv1alpha1.IsolationDispatchTopologyAckSingleServer {
+	if r.UnenumerableHAAckNamespaces[cluster.Namespace] {
 		return true, ""
 	}
-	return false, fmt.Sprintf("the kubernetes Service EndpointSlices enumerate %d API-server backend(s), which cannot prove physical-backend enumeration (an opaque VIP may hide unproven backends); set the %s=%s annotation to attest the published endpoint is the complete backend set", proof.backends, pgshardv1alpha1.IsolationDispatchTopologyAckAnnotation, pgshardv1alpha1.IsolationDispatchTopologyAckSingleServer)
+	return false, fmt.Sprintf("the kubernetes Service EndpointSlices enumerate %d API-server backend(s), which cannot prove physical-backend enumeration (an opaque VIP may hide unproven backends); the cluster administrator must attest namespace %q via the operator's --allow-unenumerable-ha-isolation-namespaces install flag to activate over a single published endpoint", proof.backends, cluster.Namespace)
 }
 
 // dispatchProber proves that every live API-server backend dispatches Pod CREATE
@@ -148,7 +153,7 @@ func (r *PgShardClusterReconciler) preflightConverged(ctx context.Context, clust
 		r.setIsolationPreflightCondition(cluster, condition, reason, proof.reasonMessage())
 		return proof, false
 	}
-	if ok, detail := dispatchProofAccepted(cluster, proof); !ok {
+	if ok, detail := r.dispatchProofAccepted(cluster, proof); !ok {
 		r.setIsolationPreflightCondition(cluster, isolationHAUnsupportedCondition, "EnumerationUnproven", detail)
 		return proof, false
 	}
@@ -157,28 +162,32 @@ func (r *PgShardClusterReconciler) preflightConverged(ctx context.Context, clust
 }
 
 // revalidateDispatchTuple re-proves dispatch convergence during an in-progress
-// activation. If the backend tuple changed or convergence was lost it fails
-// CLOSED: the receipt is held in ACTIVATING_QUIESCE (which denies every create),
-// never reset to INACTIVE, so enforcement is never dropped to fail-open while
-// membership is in flux. It re-enumerates by clearing the sealed state so the
-// quiesce phase re-seals under the fresh tuple. It returns whether the in-progress
-// proof is still valid.
+// activation (QUIESCE/RECREATE/ACTIVE). It fails CLOSED for BOTH an invalidated
+// tuple AND a proof read/confirmation ERROR: it FIRST durably drops the receipt
+// out of ACTIVE/RECREATE to ACTIVATING_QUIESCE (which denies every create) and
+// clears the seals, THEN returns any probe error — so a transient EndpointSlice/
+// VWC read or dispatch-confirmation failure can never leave an ACTIVE receipt
+// intact. It never resets to INACTIVE (fail-open). On a clean re-enumeration it
+// re-seals under the fresh tuple during the quiesce pass. It returns whether the
+// in-progress proof is still valid.
 func (r *PgShardClusterReconciler) revalidateDispatchTuple(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
 	receipt := cluster.Status.IsolationReceipt
 	var proof dispatchProof
+	var proveErr error
 	if r.DispatchProber != nil {
-		var err error
-		proof, err = r.DispatchProber.Prove(ctx, cluster.Namespace)
-		if err != nil {
-			return false, fmt.Errorf("re-prove dispatch convergence: %w", err)
+		proof, proveErr = r.DispatchProber.Prove(ctx, cluster.Namespace)
+	}
+	accepted := false
+	ackDetail := ""
+	if proveErr == nil {
+		accepted, ackDetail = r.dispatchProofAccepted(cluster, proof)
+		if r.DispatchProber != nil && accepted && proof.tupleHash == receipt.DispatchTupleHash {
+			return true, nil
 		}
 	}
-	accepted, ackDetail := dispatchProofAccepted(cluster, proof)
-	if r.DispatchProber != nil && accepted && proof.tupleHash == receipt.DispatchTupleHash {
-		return true, nil
-	}
-	// Invalidated. Hold a durable deny phase (QUIESCE) and re-enumerate; never drop
-	// to INACTIVE (fail-open) mid-activation.
+	// Fail CLOSED. Drop out of ACTIVE/RECREATE to the durable deny phase (QUIESCE)
+	// and clear the seals BEFORE returning — on a proof error just as on an
+	// invalidated tuple. Never drop to INACTIVE (fail-open).
 	receipt.Phase = pgshardv1alpha1.IsolationActivatingQuiesce
 	receipt.SealedParents = nil
 	receipt.RecreatePendingUIDs = nil
@@ -186,24 +195,28 @@ func (r *PgShardClusterReconciler) revalidateDispatchTuple(ctx context.Context, 
 	condition := isolationDispatchNotConvergedCondition
 	reason := "TupleInvalidated"
 	message := "the dispatch-convergence proof was invalidated (API-server backend set or webhook config changed during activation); the namespace is held quiesced while re-proving"
-	if accepted {
+	switch {
+	case proveErr != nil:
+		reason = "ProbeFailed"
+		message = fmt.Sprintf("re-proving dispatch convergence failed; the namespace is held quiesced (fail-closed) rather than left active: %v", proveErr)
+	case accepted:
 		// The new tuple is itself converged and accepted: re-seal under it while
 		// staying quiesced.
 		receipt.DispatchTupleHash = proof.tupleHash
-	} else if proof.converged {
+	case proof.converged:
 		condition = isolationHAUnsupportedCondition
 		reason = "EnumerationUnproven"
 		message = ackDetail
-	} else if proof.reason == dispatchUnconvergedReasonUnsupportedHA {
+	case proof.reason == dispatchUnconvergedReasonUnsupportedHA:
 		condition = isolationHAUnsupportedCondition
 		reason = "UnsupportedHA"
 		message = proof.reasonMessage()
 	}
 	r.setIsolationPreflightCondition(cluster, condition, reason, message)
-	if err := r.Status().Update(ctx, cluster); err != nil {
-		return false, fmt.Errorf("hold isolation quiesced after dispatch tuple invalidation: %w", err)
+	if updateErr := r.Status().Update(ctx, cluster); updateErr != nil {
+		return false, errors.Join(fmt.Errorf("hold isolation quiesced after dispatch re-proof: %w", updateErr), proveErr)
 	}
-	return false, nil
+	return false, proveErr
 }
 
 func (proof dispatchProof) reasonMessage() string {

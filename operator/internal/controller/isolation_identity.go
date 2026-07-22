@@ -13,6 +13,7 @@ import (
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -111,14 +112,15 @@ func isControllerPrincipal(username string) bool {
 // integration tests, not the fake-client unit tests. identitiesMatch, the
 // observation store, and the webhook recording are unit-tested directly.
 type serverControllerIdentityProber struct {
-	client     client.Client
-	identities podfence.ControllerIdentities
-	store      *podfence.IdentityObservationStore
-	timeout    time.Duration
+	client         client.Client
+	identities     podfence.ControllerIdentities
+	store          *podfence.IdentityObservationStore
+	timeout        time.Duration
+	cleanupTimeout time.Duration
 }
 
 func NewServerControllerIdentityProber(c client.Client, identities podfence.ControllerIdentities, store *podfence.IdentityObservationStore) *serverControllerIdentityProber {
-	return &serverControllerIdentityProber{client: c, identities: identities, store: store, timeout: 30 * time.Second}
+	return &serverControllerIdentityProber{client: c, identities: identities, store: store, timeout: 30 * time.Second, cleanupTimeout: 30 * time.Second}
 }
 
 func (p *serverControllerIdentityProber) Probe(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, string, error) {
@@ -162,17 +164,17 @@ func (p *serverControllerIdentityProber) Probe(ctx context.Context, cluster *pgs
 	created := []client.Object{}
 	for _, object := range objects {
 		if err := p.client.Create(ctx, object); err != nil {
-			cleanupErr := p.cleanupProbe(ctx, created)
+			cleanupErr := p.cleanupProbe(ctx, cluster.Namespace, token, created)
 			return false, "", errors.Join(fmt.Errorf("create identity-probe object %T: %w", object, err), cleanupErr)
 		}
 		created = append(created, object)
 	}
 
 	observed, conflicted, complete := p.awaitObservations(ctx, token)
-	cleanupErr := p.cleanupProbe(ctx, created)
-	if cleanupErr != nil {
-		// Cleanup must be verified: a probe workload left behind is a foreign
-		// object in the fenced namespace and must fail the probe, not be ignored.
+	if cleanupErr := p.cleanupProbe(ctx, cluster.Namespace, token, created); cleanupErr != nil {
+		// Cleanup completion is VERIFIED (foreground delete + poll to absence): a
+		// probe workload left behind is a foreign object in the fenced namespace and
+		// must fail the probe, not be ignored.
 		return false, "", cleanupErr
 	}
 	if conflicted {
@@ -216,17 +218,75 @@ func (p *serverControllerIdentityProber) awaitObservations(ctx context.Context, 
 	}
 }
 
-// cleanupProbe deletes every probe object and VERIFIES completion; delete errors
-// are returned, never ignored.
-func (p *serverControllerIdentityProber) cleanupProbe(ctx context.Context, objects []client.Object) error {
-	background := metav1.DeletePropagationBackground
+// cleanupProbe FOREGROUND-deletes every probe object and then POLLS the
+// authoritative API until every probe object AND its dependent ReplicaSets/Pods
+// are absent. Foreground deletion removes the dependents before the owner, and
+// the absence poll is verified against the live API — so a stale probe object
+// can never linger into the namespace inventory or the next probe. Delete and
+// confirmation errors are returned, never ignored. Cleanup runs on a cancellation
+// -detached context so a cancelled reconcile still tears the probe down, bounded
+// by cleanupTimeout.
+func (p *serverControllerIdentityProber) cleanupProbe(ctx context.Context, namespace, token string, objects []client.Object) error {
+	ctx = context.WithoutCancel(ctx)
+	foreground := metav1.DeletePropagationForeground
 	var errs []error
 	for _, object := range objects {
-		if err := p.client.Delete(context.WithoutCancel(ctx), object, &client.DeleteOptions{PropagationPolicy: &background}); err != nil && !apierrors.IsNotFound(err) {
+		if err := p.client.Delete(ctx, object, &client.DeleteOptions{PropagationPolicy: &foreground}); err != nil && !apierrors.IsNotFound(err) {
 			errs = append(errs, fmt.Errorf("delete identity-probe object %T %s: %w", object, object.GetName(), err))
 		}
 	}
-	return errors.Join(errs...)
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	deadline := time.Now().Add(p.cleanupTimeout)
+	for {
+		absent, err := p.probeArtifactsAbsent(ctx, namespace, token, objects)
+		if err != nil {
+			return err
+		}
+		if absent {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("identity-probe artifacts for token %s were not confirmed absent within %s", token, p.cleanupTimeout)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// probeArtifactsAbsent reports whether every named probe object and every
+// dependent ReplicaSet/Pod carrying the probe token label is gone from the live
+// API.
+func (p *serverControllerIdentityProber) probeArtifactsAbsent(ctx context.Context, namespace, token string, objects []client.Object) (bool, error) {
+	for _, object := range objects {
+		probe := object.DeepCopyObject().(client.Object)
+		err := p.client.Get(ctx, client.ObjectKeyFromObject(object), probe)
+		if err == nil {
+			return false, nil
+		}
+		if !apierrors.IsNotFound(err) {
+			return false, fmt.Errorf("confirm identity-probe object %T %s absence: %w", object, object.GetName(), err)
+		}
+	}
+	pods := &corev1.PodList{}
+	if err := p.client.List(ctx, pods, client.InNamespace(namespace), client.HasLabels{identityProbeLabel}); err != nil {
+		return false, fmt.Errorf("list identity-probe pods for cleanup confirmation: %w", err)
+	}
+	for i := range pods.Items {
+		if strings.HasSuffix(pods.Items[i].Labels[identityProbeLabel], token) {
+			return false, nil
+		}
+	}
+	replicaSets := &appsv1.ReplicaSetList{}
+	if err := p.client.List(ctx, replicaSets, client.InNamespace(namespace), client.HasLabels{identityProbeLabel}); err != nil {
+		return false, fmt.Errorf("list identity-probe ReplicaSets for cleanup confirmation: %w", err)
+	}
+	for i := range replicaSets.Items {
+		if strings.HasSuffix(replicaSets.Items[i].Labels[identityProbeLabel], token) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func newProbeToken() (string, error) {

@@ -406,7 +406,7 @@ func (v *PodCreateValidator) Handle(ctx context.Context, request admission.Reque
 	// and the store is append-only/conflict-detecting). This never relaxes the
 	// allow/deny decision.
 	if v.probeStore != nil {
-		if err := recordPodIdentityObservation(ctx, v.reader, v.probeStore, pod, request.UserInfo.Username); err != nil {
+		if err := recordPodIdentityObservation(ctx, v.reader, v.probeStore, v.identities, pod, request.UserInfo.Username); err != nil {
 			return admission.Errored(http.StatusInternalServerError, err)
 		}
 	}

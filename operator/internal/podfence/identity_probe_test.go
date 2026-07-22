@@ -127,6 +127,57 @@ func TestPodCreateRejectsForgedOwnerIdentityObservation(t *testing.T) {
 	}
 }
 
+func TestPodCreateIgnoresIdentityObservationFromNonControllerUsername(t *testing.T) {
+	t.Parallel()
+	scheme := workloadScheme(t)
+	store := NewIdentityObservationStore()
+	store.Register("tok", IdentityOwnerKey("StatefulSet", "pgshard-idprobe-sts-tok"))
+	liveProbeSTS := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+		Name: "pgshard-idprobe-sts-tok", Namespace: testWorkloadNS, UID: "sts-uid",
+		Annotations: map[string]string{IdentityProbeAnnotation: "tok"},
+	}}
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(testWorkloadCluster(), liveProbeSTS).Build()
+	validator := NewPodCreateValidator(reader, testControllerIdentities(), scheme).WithIdentityProbeStore(store)
+
+	controller := true
+	// An attacker who READ the live probe object presents the CORRECT owner name +
+	// UID + token, but authenticates as a non-controller principal. Recording is
+	// gated on the authenticated username equalling the configured statefulset
+	// controller, so the attacker cannot poison (or, via conflict, permanently
+	// block) the observation — a DoS on activation.
+	poison := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "attacker-pod", Namespace: testWorkloadNS,
+			Annotations:     map[string]string{IdentityProbeAnnotation: "tok"},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "pgshard-idprobe-sts-tok", UID: "sts-uid", Controller: &controller}},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "x", Image: "attacker"}}},
+	}
+	request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Name: poison.Name, Namespace: testWorkloadNS, Operation: admissionv1.Create,
+		Object:   runtime.RawExtension{Raw: marshalObject(t, poison)},
+		UserInfo: authenticationv1.UserInfo{Username: "system:serviceaccount:default:attacker"},
+	}}
+	validator.Handle(context.Background(), request)
+	if observed, conflicted := store.Observed("tok"); len(observed) != 0 || conflicted {
+		t.Fatalf("a non-controller username poisoned the identity observation: observed=%#v conflicted=%v", observed, conflicted)
+	}
+
+	// The genuine statefulset controller referencing the same live probe object IS
+	// recorded, proving the gate is not over-broad.
+	genuine := poison.DeepCopy()
+	genuine.Name = "pgshard-idprobe-sts-tok-0"
+	genuineRequest := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Name: genuine.Name, Namespace: testWorkloadNS, Operation: admissionv1.Create,
+		Object:   runtime.RawExtension{Raw: marshalObject(t, genuine)},
+		UserInfo: authenticationv1.UserInfo{Username: testControllerIdentities().StatefulSetController},
+	}}
+	validator.Handle(context.Background(), genuineRequest)
+	if observed, conflicted := store.Observed("tok"); observed[IdentityRoleStatefulSet] != testControllerIdentities().StatefulSetController || conflicted {
+		t.Fatalf("the genuine statefulset controller observation was not recorded: observed=%#v conflicted=%v", observed, conflicted)
+	}
+}
+
 func TestWorkloadIntegrityRecordsDeploymentIdentityProbe(t *testing.T) {
 	t.Parallel()
 	scheme := workloadScheme(t)

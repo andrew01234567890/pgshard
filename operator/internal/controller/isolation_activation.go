@@ -748,6 +748,16 @@ func (r *PgShardClusterReconciler) acquireIsolationExclusivityLease(ctx context.
 // parent can drift mid-ceremony through the operator's own apply. Template
 // changes resume (and bump the security generation) after ACTIVE or when no
 // ceremony is running.
+//
+// SCOPE — Secret-content rotation is DEFERRED, not frozen, during the ceremony.
+// This holds the pod TEMPLATE (the stamped contract surface); it does not freeze
+// the bytes of a mounted Secret, so a certificate/Secret rotation performed
+// mid-ceremony would change a running pod's mounted content without a template
+// change. That is acceptable and intentional: activation is a bounded maintenance
+// event (one drain window), certificate rotation is an operator-initiated action
+// that can wait for it to complete, and any template change is already caught by
+// the drift-reseal. Freezing arbitrary Secret content namespace-wide during the
+// window would be far more invasive than the risk warrants.
 func (r *PgShardClusterReconciler) holdPlanTemplatesDuringActivation(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, plan []client.Object) error {
 	receipt := cluster.Status.IsolationReceipt
 	phase := isolationReceiptPhase(receipt)

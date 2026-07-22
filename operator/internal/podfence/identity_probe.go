@@ -131,21 +131,26 @@ func identityProbeToken(annotations map[string]string) string {
 }
 
 // recordPodIdentityObservation records the authenticated username of the
-// controller that created a probe pod, but ONLY after authenticating the claimed
-// owner chain against the live API: the owner reference must resolve by name to
-// a live object with the same UID that itself carries the probe token (and, for
-// the replicaset role, whose own controller owner is the live probe Deployment).
-// The recorded fact — "username U created a pod controller-owned by live probe
-// object O" — is true regardless of the pod's final admission outcome, because
-// request.userInfo is authenticated by the API server. It never relaxes the
-// admission decision.
-func recordPodIdentityObservation(ctx context.Context, reader client.Reader, store *IdentityObservationStore, pod *corev1.Pod, username string) error {
+// controller that created a probe pod, but ONLY when TWO independent conditions
+// hold: (a) the authenticated request.userInfo.username EQUALS the configured
+// controller identity for the derived role (the statefulset controller for a
+// StatefulSet-owned pod, the replicaset controller for a ReplicaSet-owned pod) —
+// so a non-controller principal never produces an observation even if it forges
+// a correct owner reference; and (b) the claimed owner chain resolves against the
+// live API to an object with the same UID that carries the probe token. Because
+// an ordinary Pod creator cannot present the controller's authenticated identity,
+// it can neither poison nor block the probe. request.userInfo is authenticated by
+// the API server. This never relaxes the admission decision.
+func recordPodIdentityObservation(ctx context.Context, reader client.Reader, store *IdentityObservationStore, identities ControllerIdentities, pod *corev1.Pod, username string) error {
 	ref := controllerOwnerRef(pod.OwnerReferences)
 	if ref == nil {
 		return nil
 	}
 	switch ref.Kind {
 	case "StatefulSet":
+		if username != identities.StatefulSetController {
+			return nil
+		}
 		statefulSet := &appsv1.StatefulSet{}
 		if err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: ref.Name}, statefulSet); err != nil {
 			if apierrors.IsNotFound(err) {
@@ -159,6 +164,9 @@ func recordPodIdentityObservation(ctx context.Context, reader client.Reader, sto
 		}
 		store.record(token, IdentityRoleStatefulSet, username, IdentityOwnerKey("StatefulSet", statefulSet.Name))
 	case replicaSetKind:
+		if username != identities.ReplicaSetController {
+			return nil
+		}
 		replicaSet := &appsv1.ReplicaSet{}
 		if err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: ref.Name}, replicaSet); err != nil {
 			if apierrors.IsNotFound(err) {

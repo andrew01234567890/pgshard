@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -228,6 +229,47 @@ func TestRevalidateDispatchTupleInvalidation(t *testing.T) {
 	}
 }
 
+func TestRevalidateDispatchTupleErrorFailsClosedFromActive(t *testing.T) {
+	t.Parallel()
+	cluster := genCluster("activeerrcase", "activeerrcase-uid")
+	cluster.Status.IsolationReceipt = &pgshardv1alpha1.PostgreSQLIsolationReceipt{
+		NamespaceUID: "ns-uid", Phase: pgshardv1alpha1.IsolationActive, DispatchTupleHash: "tuple-old",
+		SealedParents: []pgshardv1alpha1.SealedParent{{Kind: "StatefulSet", Name: "x", UID: "sts-uid"}},
+	}
+	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster)
+	// An EndpointSlice/VWC-triggered re-proof that FAILS (read/confirmation error)
+	// must not leave the namespace ACTIVE.
+	reconciler.DispatchProber = fakeDispatchProber{err: errors.New("apiserver backend read failed")}
+
+	valid, err := reconciler.revalidateDispatchTuple(context.Background(), cluster)
+	if err == nil {
+		t.Fatal("a dispatch proof error was swallowed")
+	}
+	if valid {
+		t.Fatal("a failed re-proof was treated as still valid")
+	}
+	// FAIL-CLOSED: the receipt is durably demoted out of ACTIVE to QUIESCE with the
+	// seals cleared BEFORE the error returns, so enforcement never stays ACTIVE on
+	// an unverifiable proof.
+	receipt := reloadReceipt(t, kubeClient, cluster)
+	if receipt == nil {
+		t.Fatal("the receipt was dropped (fail-open) on a proof error")
+	}
+	if receipt.Phase != pgshardv1alpha1.IsolationActivatingQuiesce {
+		t.Fatalf("a proof error left the receipt in phase %q, want ACTIVATING_QUIESCE (fail-closed)", receipt.Phase)
+	}
+	if receipt.SealedParents != nil {
+		t.Fatalf("sealed parents were not cleared on the fail-closed demotion: %#v", receipt)
+	}
+	reloaded := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), reloaded); err != nil {
+		t.Fatal(err)
+	}
+	if condition := meta.FindStatusCondition(reloaded.Status.Conditions, isolationDispatchNotConvergedCondition); condition == nil || condition.Reason != "ProbeFailed" {
+		t.Fatalf("proof-error demotion did not surface the ProbeFailed dispatch condition: %#v", reloaded.Status.Conditions)
+	}
+}
+
 // tlsReadyActivationCluster is a multi-member cluster that satisfies the
 // activation prerequisites: opted in, server-tls-v1 transport, complete TLS
 // checkpoints.
@@ -431,21 +473,35 @@ func TestActivationWithheldOnUnprovenDispatchEnumerationWithoutAck(t *testing.T)
 		t.Fatalf("ha-unsupported condition not surfaced for the opaque single backend: %#v", reloaded.Status.Conditions)
 	}
 
-	// With the explicit durable acknowledgement, the same single-backend proof is
-	// accepted and the cluster enters quiesce.
-	acked := &pgshardv1alpha1.PgShardCluster{}
-	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), acked); err != nil {
+	// A CR annotation alone must NOT ack — the attestation is admin-controlled, not
+	// settable by any principal with cluster update.
+	annotated := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), annotated); err != nil {
 		t.Fatal(err)
 	}
-	acked.Annotations[pgshardv1alpha1.IsolationDispatchTopologyAckAnnotation] = pgshardv1alpha1.IsolationDispatchTopologyAckSingleServer
-	if err := kubeClient.Update(context.Background(), acked); err != nil {
+	annotated.Annotations["pgshard.io/dispatch-topology-ack"] = "single-server"
+	if err := kubeClient.Update(context.Background(), annotated); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.reconcileIsolationActivation(context.Background(), annotated); err != nil {
+		t.Fatal(err)
+	}
+	if reloadReceipt(t, kubeClient, cluster) != nil {
+		t.Fatal("a mutable CR annotation acked the unproven enumeration; the ack must be admin-controlled")
+	}
+
+	// With the ADMIN-controlled namespace attestation (the install flag), the same
+	// single-backend proof is accepted and the cluster enters quiesce.
+	reconciler.UnenumerableHAAckNamespaces = map[string]bool{genTestNamespace: true}
+	acked := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), acked); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := reconciler.reconcileIsolationActivation(context.Background(), acked); err != nil {
 		t.Fatal(err)
 	}
 	if receipt := reloadReceipt(t, kubeClient, cluster); receipt == nil || receipt.Phase != pgshardv1alpha1.IsolationActivatingQuiesce {
-		t.Fatalf("the durable single-server ack did not admit the single-backend proof: %#v", receipt)
+		t.Fatalf("the admin namespace attestation did not admit the single-backend proof: %#v", receipt)
 	}
 }
 
