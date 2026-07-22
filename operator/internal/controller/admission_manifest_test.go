@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
-	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -122,14 +121,14 @@ func TestAdmissionResourcesArePrecreatedAndExactlyScoped(t *testing.T) {
 		t.Fatalf("webhook RBAC bindings = %#v / %#v", secretBinding, configurationBinding)
 	}
 	mutatingSelectors := readManifest[admissionregistrationv1.MutatingWebhookConfiguration](t, "../../config/webhook/mutating_selectors_patch.yaml")
-	if len(mutatingSelectors.Webhooks) != 3 || mutatingSelectors.Webhooks[0].Name != podfence.BindingWebhookName || mutatingSelectors.Webhooks[0].NamespaceSelector == nil || mutatingSelectors.Webhooks[0].NamespaceSelector.MatchLabels[podfence.NamespaceLabel] != podfence.NamespaceLabelValue || mutatingSelectors.Webhooks[1].Name != podfence.StatusWebhookName || !selectsManagedPostgreSQL(mutatingSelectors.Webhooks[1].ObjectSelector) || mutatingSelectors.Webhooks[2].Name != podfence.HandshakeWebhookName || !selectsFencingNamespace(mutatingSelectors.Webhooks[2].NamespaceSelector) {
+	if len(mutatingSelectors.Webhooks) != 3 || mutatingSelectors.Webhooks[0].Name != podfence.BindingWebhookName || mutatingSelectors.Webhooks[0].NamespaceSelector == nil || mutatingSelectors.Webhooks[0].NamespaceSelector.MatchLabels[podfence.NamespaceLabel] != podfence.NamespaceLabelValue || mutatingSelectors.Webhooks[1].Name != podfence.StatusWebhookName || !selectsFencingNamespace(mutatingSelectors.Webhooks[1].NamespaceSelector) || mutatingSelectors.Webhooks[2].Name != podfence.HandshakeWebhookName || !selectsFencingNamespace(mutatingSelectors.Webhooks[2].NamespaceSelector) {
 		t.Fatalf("mutating webhook selector patch = %#v", mutatingSelectors.Webhooks)
 	}
 	validatingSelectors := readManifest[admissionregistrationv1.ValidatingWebhookConfiguration](t, "../../config/webhook/validating_selectors_patch.yaml")
 	if len(validatingSelectors.Webhooks) != 6 ||
-		validatingSelectors.Webhooks[0].Name != podfence.MetadataWebhookName || !selectsManagedPostgreSQL(validatingSelectors.Webhooks[0].ObjectSelector) ||
+		validatingSelectors.Webhooks[0].Name != podfence.MetadataWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[0].NamespaceSelector) ||
 		validatingSelectors.Webhooks[1].Name != podfence.NamespaceWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[1].ObjectSelector) ||
-		validatingSelectors.Webhooks[2].Name != podfence.StatusValidationWebhookName || !selectsManagedPostgreSQL(validatingSelectors.Webhooks[2].ObjectSelector) ||
+		validatingSelectors.Webhooks[2].Name != podfence.StatusValidationWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[2].NamespaceSelector) ||
 		validatingSelectors.Webhooks[3].Name != podfence.BindingValidationWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[3].NamespaceSelector) ||
 		validatingSelectors.Webhooks[4].Name != podfence.PodCreateWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[4].NamespaceSelector) ||
 		validatingSelectors.Webhooks[5].Name != podfence.WorkloadWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[5].NamespaceSelector) {
@@ -186,10 +185,6 @@ func assertWebhookPolicy(t *testing.T, clientConfig admissionregistrationv1.Webh
 	if clientConfig.Service == nil || clientConfig.Service.Name != "webhook-service" || clientConfig.Service.Namespace != "system" || clientConfig.Service.Port == nil || *clientConfig.Service.Port != 9444 || failurePolicy == nil || *failurePolicy != admissionregistrationv1.Fail || matchPolicy == nil || *matchPolicy != admissionregistrationv1.Equivalent || timeout == nil || *timeout != 5 {
 		t.Fatalf("webhook policy = client %#v failure %#v match %#v timeout %#v", clientConfig, failurePolicy, matchPolicy, timeout)
 	}
-}
-
-func selectsManagedPostgreSQL(selector *metav1.LabelSelector) bool {
-	return selector != nil && selector.MatchLabels[owned.ManagedByLabel] == owned.ManagedByValue && selector.MatchLabels[owned.ComponentLabel] == "postgresql" && len(selector.MatchLabels) == 2 && len(selector.MatchExpressions) == 0
 }
 
 func selectsFencingNamespace(selector *metav1.LabelSelector) bool {

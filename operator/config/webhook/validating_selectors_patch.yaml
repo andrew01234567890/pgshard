@@ -4,19 +4,17 @@ metadata:
   name: validating-webhook-configuration
 webhooks:
   - name: vpostgresqlpodmetadata.pgshard.io
-    objectSelector:
+    namespaceSelector:
       matchLabels:
-        app.kubernetes.io/component: postgresql
-        app.kubernetes.io/managed-by: pgshard-operator
+        pgshard.io/pod-fencing: enabled
   - name: vpostgresqlfencingnamespace.pgshard.io
     objectSelector:
       matchLabels:
         pgshard.io/pod-fencing: enabled
   - name: vpostgresqlpodstatus.pgshard.io
-    objectSelector:
+    namespaceSelector:
       matchLabels:
-        app.kubernetes.io/component: postgresql
-        app.kubernetes.io/managed-by: pgshard-operator
+        pgshard.io/pod-fencing: enabled
   - name: vpostgresqlpodbinding.pgshard.io
     namespaceSelector:
       matchLabels:

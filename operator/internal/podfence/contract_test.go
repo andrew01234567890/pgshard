@@ -12,6 +12,7 @@ import (
 	authenticationv1 "k8s.io/api/authentication/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -440,13 +441,11 @@ func TestWorkloadIntegrityValidatorDeniesIdentityTransitions(t *testing.T) {
 func TestResolveStampedParentRequiresLiveRevisionEvidence(t *testing.T) {
 	t.Parallel()
 	scheme := workloadScheme(t)
-	identities := testControllerIdentities()
 	cluster := testWorkloadCluster()
 	statefulSet := stampedMemberStatefulSet(t)
 	statefulSet.Status.CurrentRevision = "rev-a"
 	statefulSet.Status.UpdateRevision = "rev-b"
 	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, statefulSet).Build()
-	validator := NewPodCreateValidator(reader, identities, scheme)
 
 	memberPod := func(revision string) *corev1.Pod {
 		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: statefulSet.Name + "-0", Namespace: testWorkloadNS}}
@@ -456,15 +455,15 @@ func TestResolveStampedParentRequiresLiveRevisionEvidence(t *testing.T) {
 		return pod
 	}
 
-	if _, _, _, response := validator.resolveStampedParent(context.Background(), testWorkloadNS, memberPod("rev-x"), contractPodMember, 0, 0, testClusterName, cluster); response == nil ||
+	if _, _, _, response := resolveStampedParent(context.Background(), reader, testWorkloadNS, memberPod("rev-x"), contractPodMember, 0, 0, testClusterName, cluster); response == nil ||
 		!strings.Contains(response.Result.Message, "does not match the live StatefulSet revision state") {
 		t.Fatalf("forged member revision accepted: %#v", response)
 	}
-	if _, _, _, response := validator.resolveStampedParent(context.Background(), testWorkloadNS, memberPod(""), contractPodMember, 0, 0, testClusterName, cluster); response == nil ||
+	if _, _, _, response := resolveStampedParent(context.Background(), reader, testWorkloadNS, memberPod(""), contractPodMember, 0, 0, testClusterName, cluster); response == nil ||
 		!strings.Contains(response.Result.Message, "no controller revision evidence") {
 		t.Fatalf("revision-free member pod accepted: %#v", response)
 	}
-	_, _, provenance, response := validator.resolveStampedParent(context.Background(), testWorkloadNS, memberPod("rev-b"), contractPodMember, 0, 0, testClusterName, cluster)
+	_, _, provenance, response := resolveStampedParent(context.Background(), reader, testWorkloadNS, memberPod("rev-b"), contractPodMember, 0, 0, testClusterName, cluster)
 	if response != nil {
 		t.Fatalf("live update-revision member pod denied: %#v", response.Result)
 	}
@@ -474,8 +473,7 @@ func TestResolveStampedParentRequiresLiveRevisionEvidence(t *testing.T) {
 
 	blankStatus := stampedMemberStatefulSet(t)
 	blankReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, blankStatus).Build()
-	blankValidator := NewPodCreateValidator(blankReader, identities, scheme)
-	if _, _, _, response := blankValidator.resolveStampedParent(context.Background(), testWorkloadNS, memberPod("rev-b"), contractPodMember, 0, 0, testClusterName, cluster); response == nil ||
+	if _, _, _, response := resolveStampedParent(context.Background(), blankReader, testWorkloadNS, memberPod("rev-b"), contractPodMember, 0, 0, testClusterName, cluster); response == nil ||
 		!strings.Contains(response.Result.Message, "does not match the live StatefulSet revision state") {
 		t.Fatalf("member pod accepted against a StatefulSet with no recorded revisions: %#v", response)
 	}
@@ -494,8 +492,7 @@ func TestResolveStampedParentRequiresLiveRevisionEvidence(t *testing.T) {
 		OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: hashlessReplicaSet.Name, UID: hashlessReplicaSet.UID, Controller: &controller}},
 	}}
 	supportingReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, deployment, hashlessReplicaSet).Build()
-	supportingValidator := NewPodCreateValidator(supportingReader, identities, scheme)
-	if _, _, _, response := supportingValidator.resolveStampedParent(context.Background(), testWorkloadNS, supportingPod, contractPodOrchestrator, 0, 0, testClusterName, cluster); response == nil ||
+	if _, _, _, response := resolveStampedParent(context.Background(), supportingReader, testWorkloadNS, supportingPod, contractPodOrchestrator, 0, 0, testClusterName, cluster); response == nil ||
 		!strings.Contains(response.Result.Message, "no pod-template-hash evidence") {
 		t.Fatalf("supporting pod accepted against a hash-free ReplicaSet: %#v", response)
 	}
@@ -562,5 +559,179 @@ func TestCanonicalSecurityGeneration(t *testing.T) {
 		if _, ok := canonicalSecurityGeneration(raw); ok != want {
 			t.Fatalf("canonicalSecurityGeneration(%q) = %v, want %v", raw, ok, want)
 		}
+	}
+}
+
+func poolerDeploymentFixture(t *testing.T) *appsv1.Deployment {
+	t.Helper()
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "example-pooler", Namespace: testWorkloadNS, UID: "pooler-deploy-uid",
+			Labels: map[string]string{
+				owned.ManagedByLabel: owned.ManagedByValue, owned.ComponentLabel: "pooler", owned.ClusterLabel: testClusterName,
+			},
+			OwnerReferences: []metav1.OwnerReference{clusterOwnerReference()},
+		},
+		Spec: appsv1.DeploymentSpec{Template: stampedTemplate(t, owned.ClassPooler, 0, 0)},
+	}
+}
+
+func testTopologyNode() *corev1.Node {
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node-a", UID: "node-uid-a",
+			Labels: map[string]string{corev1.LabelTopologyZone: "zone-a", corev1.LabelTopologyRegion: "region-a"},
+		},
+		Status: corev1.NodeStatus{NodeInfo: corev1.NodeSystemInfo{BootID: "boot-a"}},
+	}
+}
+
+func TestValidateBoundPodContractProjectsNodeEvidence(t *testing.T) {
+	t.Parallel()
+	scheme := workloadScheme(t)
+	controller := true
+	deployment := poolerDeploymentFixture(t)
+	replicaSet := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "example-pooler-77abcde", Namespace: testWorkloadNS, UID: "pooler-rs-uid",
+			Labels:          map[string]string{podTemplateHashLabel: "77abcde"},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: deployment.Name, UID: deployment.UID, Controller: &controller}},
+		},
+		Spec: appsv1.ReplicaSetSpec{Template: *deployment.Spec.Template.DeepCopy()},
+	}
+	cluster := testWorkloadCluster()
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, deployment, replicaSet).Build()
+	node := testTopologyNode()
+
+	prebind := func() *corev1.Pod {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "example-pooler-77abcde-xyz", Namespace: testWorkloadNS,
+				Labels: map[string]string{
+					owned.ClusterLabel: testClusterName, owned.ComponentLabel: "pooler", podTemplateHashLabel: "77abcde",
+				},
+				Annotations:     map[string]string{},
+				OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: replicaSet.Name, UID: replicaSet.UID, Controller: &controller}},
+			},
+			Spec: *deployment.Spec.Template.Spec.DeepCopy(),
+		}
+		for key, value := range deployment.Spec.Template.Annotations {
+			pod.Annotations[key] = value
+		}
+		return pod
+	}
+
+	if response := validateBoundPodContract(context.Background(), reader, prebind(), node, cluster); response != nil {
+		t.Fatalf("honest pre-bind pod rejected at bind: %#v", response.Result)
+	}
+
+	stampless := prebind()
+	delete(stampless.Annotations, owned.PodContractHashAnnotation)
+	if response := validateBoundPodContract(context.Background(), reader, stampless, node, cluster); response != nil {
+		t.Fatalf("stampless pod rejected before activation: %#v", response.Result)
+	}
+
+	forgedResidue := prebind()
+	forgedResidue.Annotations[NodeUIDAnnotation] = "forged-node"
+	if response := validateBoundPodContract(context.Background(), reader, forgedResidue, node, cluster); response == nil ||
+		!strings.Contains(response.Result.Message, "node identity residue before it is bound") {
+		t.Fatalf("pre-bind node residue accepted: %#v", response)
+	}
+
+	forgedTopology := prebind()
+	forgedTopology.Labels[corev1.LabelTopologyZone] = "attacker-zone"
+	if response := validateBoundPodContract(context.Background(), reader, forgedTopology, node, cluster); response == nil ||
+		!strings.Contains(response.Result.Message, "topology label before it is bound") {
+		t.Fatalf("pre-bind topology label accepted: %#v", response)
+	}
+
+	drift := prebind()
+	drift.Spec.Containers[0].Image = "attacker/backdoor:latest"
+	if response := validateBoundPodContract(context.Background(), reader, drift, node, cluster); response == nil ||
+		!strings.Contains(response.Result.Message, "does not match its stamped contract") {
+		t.Fatalf("drifted bound pod accepted: %#v", response)
+	}
+}
+
+func TestMetadataValidatorDeniesAdoptionAndEscape(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	handler := NewMetadataValidator(testCodec(), scheme)
+
+	// ADOPTION: unmanaged pod mutated into a managed identity.
+	unmanaged := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "plain", Namespace: testWorkloadNS}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}}}
+	adopted := unmanaged.DeepCopy()
+	adopted.Labels = map[string]string{
+		owned.ManagedByLabel: owned.ManagedByValue, owned.ComponentLabel: "postgresql",
+		owned.ClusterLabel: testClusterName, owned.ShardLabel: "0000", owned.MemberLabel: "0000",
+	}
+	if response := handler.Handle(context.Background(), updateRequest(t, unmanaged, adopted, "")); response.Allowed ||
+		!strings.Contains(response.Result.Message, "may not be mutated into a managed identity") {
+		t.Fatalf("adoption of an unmanaged pod accepted: %#v", response.Result)
+	}
+
+	// ESCAPE: a managed member sheds its identity labels.
+	member := managedPod()
+	member.Spec.NodeName = ""
+	delete(member.Annotations, NodeUIDAnnotation)
+	delete(member.Annotations, NodeBootIDAnnotation)
+	member.DeletionTimestamp = nil
+	escaped := member.DeepCopy()
+	delete(escaped.Labels, owned.ComponentLabel)
+	if response := handler.Handle(context.Background(), updateRequest(t, member, escaped, "")); response.Allowed ||
+		!strings.Contains(response.Result.Message, "immutable") {
+		t.Fatalf("member identity escape accepted: %#v", response.Result)
+	}
+}
+
+func TestMetadataValidatorProtectsSupportingPods(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	handler := NewMetadataValidator(testCodec(), scheme)
+
+	supporting := func() *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "example-orchestrator-77abcde-xyz", Namespace: testWorkloadNS,
+				Labels: map[string]string{owned.ClusterLabel: testClusterName, owned.ComponentLabel: "orchestrator", podTemplateHashLabel: "77abcde"},
+				Annotations: map[string]string{
+					owned.PodContractHashAnnotation:       strings.Repeat("a", 64),
+					owned.PodSecurityGenerationAnnotation: "1",
+				},
+			},
+			Spec: corev1.PodSpec{NodeName: "node-a", Containers: []corev1.Container{{Name: "orchestrator", Image: "pgshard/orchestrator:dev"}}},
+		}
+	}
+
+	if response := handler.Handle(context.Background(), updateRequest(t, supporting(), supporting(), "")); !response.Allowed {
+		t.Fatalf("honest no-op supporting update denied: %#v", response.Result)
+	}
+
+	stampMutation := supporting()
+	stampMutation.Annotations[owned.PodContractHashAnnotation] = strings.Repeat("b", 64)
+	if response := handler.Handle(context.Background(), updateRequest(t, supporting(), stampMutation, "")); response.Allowed ||
+		!strings.Contains(response.Result.Message, "identity is immutable") {
+		t.Fatalf("supporting stamp mutation accepted: %#v", response.Result)
+	}
+
+	ephemeral := supporting()
+	ephemeral.Spec.EphemeralContainers = []corev1.EphemeralContainer{{EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: "debug", Image: "debug"}}}
+	if response := handler.Handle(context.Background(), updateRequest(t, supporting(), ephemeral, "ephemeralcontainers")); response.Allowed ||
+		!strings.Contains(response.Result.Message, "must not carry ephemeral containers") {
+		t.Fatalf("supporting ephemeral container accepted: %#v", response.Result)
+	}
+
+	resized := supporting()
+	resized.Spec.Containers[0].Resources.Limits = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}
+	if response := handler.Handle(context.Background(), updateRequest(t, supporting(), resized, "resize")); response.Allowed ||
+		!strings.Contains(response.Result.Message, "spec is immutable") {
+		t.Fatalf("supporting diverging resize accepted: %#v", response.Result)
+	}
+
+	escape := supporting()
+	delete(escape.Labels, owned.ComponentLabel)
+	if response := handler.Handle(context.Background(), updateRequest(t, supporting(), escape, "")); response.Allowed ||
+		!strings.Contains(response.Result.Message, "shed its managed identity") {
+		t.Fatalf("supporting identity escape accepted: %#v", response.Result)
 	}
 }

@@ -15,6 +15,7 @@ import (
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -103,8 +104,9 @@ type BindingValidator struct {
 }
 
 type bindingEvidence struct {
-	pod  *corev1.Pod
-	node *corev1.Node
+	pod     *corev1.Pod
+	node    *corev1.Node
+	cluster *pgshardv1alpha1.PgShardCluster
 }
 
 func NewBindingAttestor(reader client.Reader, scheme *runtime.Scheme) *BindingAttestor {
@@ -175,6 +177,9 @@ func (v *BindingValidator) Handle(ctx context.Context, request admission.Request
 	if binding.Annotations[NodeUIDAnnotation] != string(evidence.node.UID) || binding.Annotations[NodeBootIDAnnotation] != evidence.node.Status.NodeInfo.BootID {
 		return admission.Denied("managed PostgreSQL Pod binding does not carry the selected Node incarnation")
 	}
+	if response := validateBoundPodContract(ctx, v.reader, evidence.pod, evidence.node, evidence.cluster); response != nil {
+		return *response
+	}
 	return admission.Allowed("final Pod binding preserves the PostgreSQL Pod and Node identities")
 }
 
@@ -204,7 +209,8 @@ func readBindingEvidence(ctx context.Context, reader client.Reader, request admi
 		response := admission.Denied("managed PostgreSQL Pod binding must carry the exact Pod UID")
 		return nil, &response
 	}
-	if _, response := validateManagedPodClusterContract(ctx, reader, pod); response != nil {
+	cluster, response := validateManagedPodClusterContract(ctx, reader, pod)
+	if response != nil {
 		return nil, response
 	}
 	if binding.Target.Kind != "Node" || binding.Target.Name == "" {
@@ -220,7 +226,7 @@ func readBindingEvidence(ctx context.Context, reader client.Reader, request admi
 		response := admission.Denied("selected Node has no stable UID and boot ID")
 		return nil, &response
 	}
-	return &bindingEvidence{pod: pod, node: node}, nil
+	return &bindingEvidence{pod: pod, node: node, cluster: cluster}, nil
 }
 
 // validateManagedPodClusterContract binds a managed PostgreSQL Pod to its live
@@ -651,8 +657,19 @@ func (v *MetadataValidator) Handle(ctx context.Context, request admission.Reques
 	if err := v.decoder.Decode(request, newPod); err != nil {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode new Pod: %w", err))
 	}
+	oldIdentity, _, _, _ := classifyContractPod(oldPod)
+	newIdentity, _, _, _ := classifyContractPod(newPod)
+	// ADOPTION: an unmanaged pod may never be mutated into a managed identity.
+	if oldIdentity == contractPodUnmanaged && newIdentity != contractPodUnmanaged {
+		return admission.Denied("unmanaged PostgreSQL Pod may not be mutated into a managed identity")
+	}
+	// The complete member lifecycle (termination fence, attestation) keeps its
+	// existing semantics; the supporting path enforces the shared immutability.
 	if !IsManagedPostgreSQLPod(oldPod) {
-		return admission.Allowed("Pod is not a managed PostgreSQL member")
+		if oldIdentity == contractPodUnmanaged {
+			return admission.Allowed("Pod is not a managed PostgreSQL member")
+		}
+		return validateManagedPodUpdate(oldPod, newPod)
 	}
 	if !managedIdentityEqual(oldPod, newPod) {
 		return admission.Denied("managed PostgreSQL Pod identity and binding-time node identity are immutable")
@@ -746,6 +763,8 @@ func managedIdentityEqual(oldPod, newPod *corev1.Pod) bool {
 		owned.PostgreSQLRuntimeAnnotation,
 		owned.PostgreSQLGenerationDurabilityAnnotation,
 		owned.PostgreSQLSynchronousStandbysAnnotation,
+		owned.PodContractHashAnnotation,
+		owned.PodSecurityGenerationAnnotation,
 		NodeUIDAnnotation,
 		NodeBootIDAnnotation,
 	} {
@@ -755,7 +774,41 @@ func managedIdentityEqual(oldPod, newPod *corev1.Pod) bool {
 			return false
 		}
 	}
-	return true
+	return controllerOwnerReferenceEqual(oldPod.OwnerReferences, newPod.OwnerReferences)
+}
+
+// controllerOwnerReferenceEqual reports whether two objects carry the same
+// controller owner reference (or both none). The controller owner reference is
+// the pod's authoring-provenance anchor and is immutable post-create.
+func controllerOwnerReferenceEqual(old, updated []metav1.OwnerReference) bool {
+	oldRef, newRef := controllerOwnerRef(old), controllerOwnerRef(updated)
+	if (oldRef == nil) != (newRef == nil) {
+		return false
+	}
+	return oldRef == nil || (oldRef.Kind == newRef.Kind && oldRef.Name == newRef.Name && oldRef.UID == newRef.UID)
+}
+
+// validateManagedPodUpdate enforces the shared immutability contract on an
+// UPDATE to a managed pod that is not a complete member with a lifecycle fence:
+// supporting pods (pooler/orchestrator) and any label-managed pod. It denies
+// escape (shedding managed identity), any identity/stamp/ownerRef mutation,
+// ephemeral containers, and any spec mutation (which covers a diverging resize
+// and any general spec edit).
+func validateManagedPodUpdate(oldPod, newPod *corev1.Pod) admission.Response {
+	newIdentity, _, _, _ := classifyContractPod(newPod)
+	if newIdentity == contractPodUnmanaged {
+		return admission.Denied("managed PostgreSQL Pod may not shed its managed identity")
+	}
+	if !managedIdentityEqual(oldPod, newPod) {
+		return admission.Denied("managed PostgreSQL Pod identity is immutable")
+	}
+	if len(newPod.Spec.EphemeralContainers) != 0 {
+		return admission.Denied("managed PostgreSQL Pod must not carry ephemeral containers")
+	}
+	if !equality.Semantic.DeepEqual(oldPod.Spec, newPod.Spec) {
+		return admission.Denied("managed PostgreSQL Pod spec is immutable")
+	}
+	return admission.Allowed("managed PostgreSQL Pod update preserves its contract")
 }
 
 func nodeIdentityMessage(pod *corev1.Pod) string {

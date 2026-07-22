@@ -875,7 +875,7 @@ func (p *Provisioner) readConfigurations(ctx context.Context, caBundle []byte) (
 	}{
 		{name: mutatingWebhookName, path: mutatingWebhookPath, rules: matchesPgShardClusterRules},
 		{name: podfence.BindingWebhookName, path: podfence.BindingWebhookPath, rules: matchesPostgreSQLBindingRules, namespace: podFencingNamespaceSelector()},
-		{name: podfence.StatusWebhookName, path: podfence.StatusWebhookPath, rules: matchesPostgreSQLStatusRules, object: postgreSQLPodSelector()},
+		{name: podfence.StatusWebhookName, path: podfence.StatusWebhookPath, rules: matchesPostgreSQLStatusRules, namespace: podFencingNamespaceSelector()},
 		{name: podfence.HandshakeWebhookName, path: podfence.HandshakeWebhookPath, rules: matchesPostgreSQLHandshakeRules, namespace: podFencingNamespaceSelector()},
 	} {
 		webhook := findMutatingWebhook(mutating.Webhooks, expected.name)
@@ -905,9 +905,9 @@ func (p *Provisioner) readConfigurations(ctx context.Context, caBundle []byte) (
 		{name: validatingWebhookName, path: validatingWebhookPath, rules: matchesPgShardClusterRules},
 		{name: restoreWebhookName, path: restoreWebhookPath, rules: matchesPgShardRestoreRules},
 		{name: catalogActivationWebhookName, path: catalogActivationWebhookPath, rules: matchesPgShardCatalogActivationRules},
-		{name: podfence.MetadataWebhookName, path: podfence.MetadataWebhookPath, rules: matchesPostgreSQLMetadataRules, object: postgreSQLPodSelector()},
+		{name: podfence.MetadataWebhookName, path: podfence.MetadataWebhookPath, rules: matchesPostgreSQLMetadataRules, namespace: podFencingNamespaceSelector()},
 		{name: podfence.NamespaceWebhookName, path: podfence.NamespaceWebhookPath, rules: matchesPostgreSQLNamespaceRules, object: podFencingNamespaceSelector()},
-		{name: podfence.StatusValidationWebhookName, path: podfence.StatusValidationWebhookPath, rules: matchesPostgreSQLStatusRules, object: postgreSQLPodSelector()},
+		{name: podfence.StatusValidationWebhookName, path: podfence.StatusValidationWebhookPath, rules: matchesPostgreSQLStatusRules, namespace: podFencingNamespaceSelector()},
 		{name: podfence.BindingValidationWebhookName, path: podfence.BindingValidationWebhookPath, rules: matchesPostgreSQLBindingRules, namespace: podFencingNamespaceSelector()},
 		{name: podfence.PodCreateWebhookName, path: podfence.PodCreateWebhookPath, rules: matchesPostgreSQLPodCreateRules, namespace: podFencingNamespaceSelector()},
 		{name: podfence.WorkloadWebhookName, path: podfence.WorkloadWebhookPath, rules: matchesPostgreSQLWorkloadRules, namespace: podFencingNamespaceSelector()},
@@ -1059,13 +1059,6 @@ func matchesCoreResourceRules(rules []admissionregistrationv1.RuleWithOperations
 
 func podFencingNamespaceSelector() *metav1.LabelSelector {
 	return &metav1.LabelSelector{MatchLabels: map[string]string{podfence.NamespaceLabel: podfence.NamespaceLabelValue}}
-}
-
-func postgreSQLPodSelector() *metav1.LabelSelector {
-	return &metav1.LabelSelector{MatchLabels: map[string]string{
-		"app.kubernetes.io/component": "postgresql",
-		ManagedByLabel:                ManagedByValue,
-	}}
 }
 
 func findMutatingWebhook(webhooks []admissionregistrationv1.MutatingWebhook, name string) *admissionregistrationv1.MutatingWebhook {

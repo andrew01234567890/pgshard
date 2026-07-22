@@ -117,7 +117,7 @@ func (v *PodCreateValidator) validatePodContract(ctx context.Context, request ad
 		return deniedf("managed Pod does not belong to the live PgShardCluster UID")
 	}
 
-	class, template, provenance, response := v.resolveStampedParent(ctx, namespace, pod, kind, shard, member, clusterName, cluster)
+	class, template, provenance, response := resolveStampedParent(ctx, v.reader, namespace, pod, kind, shard, member, clusterName, cluster)
 	if response != nil {
 		return response
 	}
@@ -169,12 +169,12 @@ func (v *PodCreateValidator) validatePodContract(ctx context.Context, request ad
 // match the StatefulSet's recorded revision state, and the supporting evidence
 // comes from the owning ReplicaSet's own pod-template-hash label, which must be
 // present.
-func (v *PodCreateValidator) resolveStampedParent(ctx context.Context, namespace string, pod *corev1.Pod, kind contractPodKind, shard, member int32, clusterName string, cluster *pgshardv1alpha1.PgShardCluster) (owned.PodClass, *corev1.PodTemplateSpec, *owned.ControllerEvidence, *admission.Response) {
+func resolveStampedParent(ctx context.Context, reader client.Reader, namespace string, pod *corev1.Pod, kind contractPodKind, shard, member int32, clusterName string, cluster *pgshardv1alpha1.PgShardCluster) (owned.PodClass, *corev1.PodTemplateSpec, *owned.ControllerEvidence, *admission.Response) {
 	switch kind {
 	case contractPodMember:
 		statefulSetName := owned.PostgreSQLMemberStatefulSetName(clusterName, shard, member)
 		statefulSet := &appsv1.StatefulSet{}
-		if err := v.reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: statefulSetName}, statefulSet); err != nil {
+		if err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: statefulSetName}, statefulSet); err != nil {
 			if apierrors.IsNotFound(err) {
 				return "", nil, nil, deniedf("managed member Pod has no live owning StatefulSet")
 			}
@@ -205,7 +205,7 @@ func (v *PodCreateValidator) resolveStampedParent(ctx context.Context, namespace
 			return "", nil, nil, deniedf("managed supporting Pod is not owned by a ReplicaSet")
 		}
 		replicaSet := &appsv1.ReplicaSet{}
-		if err := v.reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: replicaSetRef.Name}, replicaSet); err != nil {
+		if err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: replicaSetRef.Name}, replicaSet); err != nil {
 			if apierrors.IsNotFound(err) {
 				return "", nil, nil, deniedf("managed supporting Pod's owning ReplicaSet no longer exists")
 			}
@@ -219,7 +219,7 @@ func (v *PodCreateValidator) resolveStampedParent(ctx context.Context, namespace
 			return "", nil, nil, deniedf("supporting ReplicaSet is not owned by a Deployment")
 		}
 		deployment := &appsv1.Deployment{}
-		if err := v.reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: deploymentRef.Name}, deployment); err != nil {
+		if err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: deploymentRef.Name}, deployment); err != nil {
 			if apierrors.IsNotFound(err) {
 				return "", nil, nil, deniedf("supporting ReplicaSet's owning Deployment no longer exists")
 			}
@@ -243,6 +243,102 @@ func (v *PodCreateValidator) resolveStampedParent(ctx context.Context, namespace
 		return class, &replicaSet.Spec.Template, provenance, nil
 	}
 	return "", nil, nil, deniedf("unclassified managed Pod")
+}
+
+// validateBoundPodContract runs the LIVE-mode contract comparison for a stamped
+// pod at the moment its Node identity is bound. It projects the pod as it will
+// exist once bound to the selected Node — nodeName, node-UID/boot-ID
+// annotations, and the Node's topology labels are all derived authoritatively
+// from the live Node, never trusted from the pod — then requires that
+// projection to normalize exactly equal to the pod's stamped parent template.
+// A pod that carries no reconciler stamp is left to the pre-activation legacy
+// path (nil). The pre-bind pod must carry no node residue of its own.
+func validateBoundPodContract(ctx context.Context, reader client.Reader, pod *corev1.Pod, node *corev1.Node, cluster *pgshardv1alpha1.PgShardCluster) *admission.Response {
+	if pod.Annotations[owned.PodContractHashAnnotation] == "" {
+		return nil
+	}
+	kind, shard, member, clusterName := classifyContractPod(pod)
+	if kind == contractPodUnmanaged {
+		return nil
+	}
+	if pod.Annotations[NodeUIDAnnotation] != "" || pod.Annotations[NodeBootIDAnnotation] != "" {
+		return deniedf("managed Pod carries node identity residue before it is bound")
+	}
+	for _, key := range []string{corev1.LabelTopologyZone, corev1.LabelTopologyRegion} {
+		if _, present := pod.Labels[key]; present {
+			return deniedf("managed Pod carries a topology label before it is bound")
+		}
+	}
+
+	class, template, provenance, response := resolveStampedParent(ctx, reader, pod.Namespace, pod, kind, shard, member, clusterName, cluster)
+	if response != nil {
+		return response
+	}
+	templateGeneration := template.Annotations[owned.PodSecurityGenerationAnnotation]
+	if pod.Annotations[owned.PodSecurityGenerationAnnotation] != templateGeneration {
+		return deniedf("managed Pod security generation does not match its stamped parent template")
+	}
+	generation, ok := canonicalSecurityGeneration(templateGeneration)
+	if !ok {
+		return deniedf("stamped parent template carries an invalid security generation")
+	}
+
+	evidence := &owned.BindingEvidence{
+		NodeName: node.Name,
+		NodeUID:  string(node.UID),
+		BootID:   node.Status.NodeInfo.BootID,
+		Zone:     node.Labels[corev1.LabelTopologyZone],
+		Region:   node.Labels[corev1.LabelTopologyRegion],
+	}
+	bound := projectBoundPod(pod, evidence)
+	nc := owned.NormContext{
+		Class:       class,
+		ClusterName: clusterName,
+		Namespace:   pod.Namespace,
+		Shard:       shard,
+		Member:      member,
+		Provenance:  provenance,
+		Binding:     evidence,
+	}
+	if err := owned.ComparePodToStampedTemplate(nc, bound.ObjectMeta, bound.Spec, template.ObjectMeta, template.Spec, owned.StageLive, false); err != nil {
+		return deniedf("bound managed Pod does not match its stamped contract: %v", err)
+	}
+	want := template.Annotations[owned.PodContractHashAnnotation]
+	if pod.Annotations[owned.PodContractHashAnnotation] != want {
+		return deniedf("bound managed Pod contract hash does not match its stamped parent template")
+	}
+	got, err := owned.HashAdmittedPod(nc, bound.ObjectMeta, bound.Spec, owned.StageLive, string(cluster.UID), generation)
+	if err != nil {
+		return erroredf("recompute bound managed Pod contract hash: %w", err)
+	}
+	if got != want {
+		return deniedf("bound managed Pod contract hash recomputation does not match its stamped parent template")
+	}
+	return nil
+}
+
+// projectBoundPod returns the pod as it will exist once the API server commits
+// the binding: assigned to the Node and carrying only the Node's authoritative
+// incarnation and topology residue.
+func projectBoundPod(pod *corev1.Pod, evidence *owned.BindingEvidence) *corev1.Pod {
+	bound := pod.DeepCopy()
+	bound.Spec.NodeName = evidence.NodeName
+	if bound.Annotations == nil {
+		bound.Annotations = map[string]string{}
+	}
+	bound.Annotations[NodeUIDAnnotation] = evidence.NodeUID
+	bound.Annotations[NodeBootIDAnnotation] = evidence.BootID
+	if bound.Labels == nil {
+		bound.Labels = map[string]string{}
+	}
+	for key, value := range map[string]string{corev1.LabelTopologyZone: evidence.Zone, corev1.LabelTopologyRegion: evidence.Region} {
+		if value == "" {
+			delete(bound.Labels, key)
+		} else {
+			bound.Labels[key] = value
+		}
+	}
+	return bound
 }
 
 // WorkloadIntegrityValidator authenticates the authorship, identity, and

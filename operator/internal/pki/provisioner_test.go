@@ -1334,7 +1334,7 @@ func installObjects() []client.Object {
 	bindingMutating := mutatingWebhook(podfence.BindingWebhookName, podfence.BindingWebhookPath, coreResourceRules(admissionregistrationv1.Create, "pods/binding"))
 	bindingMutating.NamespaceSelector = podFencingNamespaceSelector()
 	statusMutating := mutatingWebhook(podfence.StatusWebhookName, podfence.StatusWebhookPath, coreResourceRules(admissionregistrationv1.Update, "pods/status"))
-	statusMutating.ObjectSelector = postgreSQLPodSelector()
+	statusMutating.NamespaceSelector = podFencingNamespaceSelector()
 	handshakeMutating := mutatingWebhook(podfence.HandshakeWebhookName, podfence.HandshakeWebhookPath, []admissionregistrationv1.RuleWithOperations{{
 		Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Update},
 		Rule: admissionregistrationv1.Rule{
@@ -1357,7 +1357,7 @@ func installObjects() []client.Object {
 		},
 	}})
 	metadataValidating := validatingWebhook(podfence.MetadataWebhookName, podfence.MetadataWebhookPath, coreResourceRules(admissionregistrationv1.Update, "pods", "pods/ephemeralcontainers", "pods/resize"))
-	metadataValidating.ObjectSelector = postgreSQLPodSelector()
+	metadataValidating.NamespaceSelector = podFencingNamespaceSelector()
 	namespaceValidating := validatingWebhook(podfence.NamespaceWebhookName, podfence.NamespaceWebhookPath, []admissionregistrationv1.RuleWithOperations{{
 		Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Update},
 		Rule: admissionregistrationv1.Rule{
@@ -1367,7 +1367,7 @@ func installObjects() []client.Object {
 	}})
 	namespaceValidating.ObjectSelector = podFencingNamespaceSelector()
 	statusValidating := validatingWebhook(podfence.StatusValidationWebhookName, podfence.StatusValidationWebhookPath, coreResourceRules(admissionregistrationv1.Update, "pods/status"))
-	statusValidating.ObjectSelector = postgreSQLPodSelector()
+	statusValidating.NamespaceSelector = podFencingNamespaceSelector()
 	bindingValidating := validatingWebhook(podfence.BindingValidationWebhookName, podfence.BindingValidationWebhookPath, coreResourceRules(admissionregistrationv1.Create, "pods/binding"))
 	bindingValidating.NamespaceSelector = podFencingNamespaceSelector()
 	podCreateValidating := validatingWebhook(podfence.PodCreateWebhookName, podfence.PodCreateWebhookPath, coreResourceRules(admissionregistrationv1.Create, "pods"))
