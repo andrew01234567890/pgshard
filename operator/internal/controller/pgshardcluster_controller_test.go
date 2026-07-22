@@ -1929,6 +1929,207 @@ func TestReplicationCredentialReconciliationReindexesAfterSortedInsert(t *testin
 	}
 }
 
+func TestReplicationTLSIsStagedCheckpointedAndFailClosed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster, owned.PostgreSQLRuntimeAgentQuarantine)
+	base := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(base, base)
+	current := getCluster(t, ctx, base, cluster)
+	if err := reconciler.ensurePostgreSQLReplicationTLS(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+
+	current = getCluster(t, ctx, base, cluster)
+	if len(current.Status.PostgreSQLReplicationTLS) != int(cluster.Spec.Shards) {
+		t.Fatalf("replication TLS checkpoints = %#v", current.Status.PostgreSQLReplicationTLS)
+	}
+	now := time.Now().UTC()
+	for index := range current.Status.PostgreSQLReplicationTLS {
+		recorded := &current.Status.PostgreSQLReplicationTLS[index]
+		if recorded.Shard != int32(index) || recorded.CASecretUID == "" ||
+			!validCatalogAccessDigest(recorded.CASHA256) || recorded.RenewalDeadline.IsZero() ||
+			len(recorded.Members) != int(cluster.Spec.MembersPerShard) {
+			t.Fatalf("replication TLS checkpoint = %#v", recorded)
+		}
+		if !recorded.RenewalDeadline.Time.After(now.Add(4 * 365 * 24 * time.Hour)) {
+			t.Fatalf("replication TLS renewal deadline is not floored to the static lifetime: %v", recorded.RenewalDeadline)
+		}
+		caSecret := &corev1.Secret{}
+		if err := base.Get(ctx, types.NamespacedName{Namespace: current.Namespace, Name: recorded.CASecretName}, caSecret); err != nil {
+			t.Fatal(err)
+		}
+		if caSecret.Immutable == nil || !*caSecret.Immutable || len(caSecret.Data) != 1 || len(caSecret.Data[owned.PostgreSQLReplicationTLSCAKey]) == 0 {
+			t.Fatalf("replication CA Secret = %#v", caSecret)
+		}
+		if recorded.CASHA256 != owned.PostgreSQLReplicationTLSCAMaterialSHA256(caSecret.Data[owned.PostgreSQLReplicationTLSCAKey]) {
+			t.Fatalf("replication CA digest does not bind the stored certificate: %#v", recorded)
+		}
+		for _, member := range recorded.Members {
+			if member.SecretUID == "" || !validCatalogAccessDigest(member.ServerSHA256) || member.NotAfter.IsZero() {
+				t.Fatalf("replication TLS member checkpoint = %#v", member)
+			}
+			secret := &corev1.Secret{}
+			if err := base.Get(ctx, types.NamespacedName{Namespace: current.Namespace, Name: member.SecretName}, secret); err != nil {
+				t.Fatal(err)
+			}
+			certificate := secret.Data[owned.PostgreSQLReplicationTLSCertificateKey]
+			privateKey := secret.Data[owned.PostgreSQLReplicationTLSPrivateKeyKey]
+			if secret.Immutable == nil || !*secret.Immutable || len(secret.Data) != 2 || len(certificate) == 0 || len(privateKey) == 0 {
+				t.Fatalf("replication server Secret = %#v", secret)
+			}
+			if member.ServerSHA256 != owned.PostgreSQLReplicationTLSServerMaterialSHA256(certificate, privateKey) {
+				t.Fatalf("replication server digest does not bind the stored material: %#v", member)
+			}
+			names := owned.PostgreSQLMemberTLSDNSNames(current.Name, recorded.Shard, member.Member, current.Namespace)
+			if _, err := pki.ValidateReplicationTLSServer(caSecret.Data[owned.PostgreSQLReplicationTLSCAKey], certificate, privateKey, names, now); err != nil {
+				t.Fatalf("shard %d member %d server material: %v", recorded.Shard, member.Member, err)
+			}
+			foreign := owned.PostgreSQLMemberTLSDNSNames(current.Name, recorded.Shard, member.Member+1, current.Namespace)
+			if _, err := pki.ValidateReplicationTLSServer(caSecret.Data[owned.PostgreSQLReplicationTLSCAKey], certificate, privateKey, foreign, now); err == nil {
+				t.Fatalf("shard %d member %d certificate validated for another member's DNS name", recorded.Shard, member.Member)
+			}
+		}
+	}
+
+	checkpointed := current.DeepCopy()
+	if err := reconciler.ensurePostgreSQLReplicationTLS(ctx, current); err != nil {
+		t.Fatalf("checkpointed replication TLS revalidation failed: %v", err)
+	}
+	if !reflect.DeepEqual(checkpointed.Status.PostgreSQLReplicationTLS, current.Status.PostgreSQLReplicationTLS) {
+		t.Fatalf("revalidation mutated the checkpoint: %#v", current.Status.PostgreSQLReplicationTLS)
+	}
+
+	tampered := current.Status.PostgreSQLReplicationTLS[0].Members[0]
+	donor := current.Status.PostgreSQLReplicationTLS[1].Members[0]
+	donorSecret := &corev1.Secret{}
+	if err := base.Get(ctx, types.NamespacedName{Namespace: current.Namespace, Name: donor.SecretName}, donorSecret); err != nil {
+		t.Fatal(err)
+	}
+	secret := &corev1.Secret{}
+	if err := base.Get(ctx, types.NamespacedName{Namespace: current.Namespace, Name: tampered.SecretName}, secret); err != nil {
+		t.Fatal(err)
+	}
+	secret.Data = maps.Clone(donorSecret.Data)
+	if err := base.Update(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+	current = getCluster(t, ctx, base, cluster)
+	if err := reconciler.ensurePostgreSQLReplicationTLS(ctx, current); err == nil ||
+		!strings.Contains(err.Error(), "invalid TLS material") && !strings.Contains(err.Error(), "material differs from the checkpointed creation result") {
+		t.Fatalf("tampered replication server material error = %v", err)
+	}
+}
+
+func TestReplicationTLSFailsClosedOnSecretIdentityChange(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster, owned.PostgreSQLRuntimeAgentQuarantine)
+	base := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(base, base)
+	current := getCluster(t, ctx, base, cluster)
+	if err := reconciler.ensurePostgreSQLReplicationTLS(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	current = getCluster(t, ctx, base, cluster)
+	recorded := current.Status.PostgreSQLReplicationTLS[0].Members[1]
+
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: current.Namespace, Name: recorded.SecretName}
+	if err := base.Get(ctx, key, secret); err != nil {
+		t.Fatal(err)
+	}
+	replacement := secret.DeepCopy()
+	if err := base.Delete(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.ensurePostgreSQLReplicationTLS(ctx, getCluster(t, ctx, base, cluster)); err == nil || !strings.Contains(err.Error(), "is missing; explicit recovery is required") {
+		t.Fatalf("deleted checkpointed Secret error = %v", err)
+	}
+
+	replacement.UID = ""
+	replacement.ResourceVersion = ""
+	if err := base.Create(ctx, replacement); err != nil {
+		t.Fatal(err)
+	}
+	err := reconciler.ensurePostgreSQLReplicationTLS(ctx, getCluster(t, ctx, base, cluster))
+	if err == nil || !strings.Contains(err.Error(), "expected recorded UID") {
+		t.Fatalf("recreated Secret UID mismatch error = %v", err)
+	}
+}
+
+func TestReplicationTLSRefusesPartialInstallWithoutRecoverableCA(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster, owned.PostgreSQLRuntimeAgentQuarantine)
+	base := newFakeClient(t, cluster)
+	installsToAllow := 1
+	limited := interceptedClient(t, base, interceptor.Funcs{Update: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.UpdateOption) error {
+		secret, ok := object.(*corev1.Secret)
+		if ok && len(secret.Data) != 0 {
+			if installsToAllow == 0 {
+				return fmt.Errorf("injected replication TLS install outage")
+			}
+			installsToAllow--
+		}
+		return kubeClient.Update(ctx, object, options...)
+	}})
+	reconciler := developmentReconciler(limited, base)
+	err := reconciler.ensurePostgreSQLReplicationTLS(ctx, getCluster(t, ctx, base, cluster))
+	if err == nil || !strings.Contains(err.Error(), "injected replication TLS install outage") {
+		t.Fatalf("interrupted install error = %v", err)
+	}
+
+	recovered := developmentReconciler(base, base)
+	err = recovered.ensurePostgreSQLReplicationTLS(ctx, getCluster(t, ctx, base, cluster))
+	if err == nil || !strings.Contains(err.Error(), "partially installed") || !strings.Contains(err.Error(), "explicit recovery is required") {
+		t.Fatalf("partial install error = %v", err)
+	}
+}
+
+func TestReplicationTLSCheckpointsAfterInstallInterruptedBeforeDigestCheckpoint(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster, owned.PostgreSQLRuntimeAgentQuarantine)
+	base := newFakeClient(t, cluster)
+	// Shard zero consumes one intent checkpoint and one identity checkpoint
+	// per Secret; blocking the next status write interrupts exactly the digest
+	// checkpoint that follows the completed material installs.
+	checkpointsToAllow := 2 + int(cluster.Spec.MembersPerShard)
+	limited := interceptedClient(t, base, interceptor.Funcs{SubResourceUpdate: func(ctx context.Context, kubeClient client.Client, subResourceName string, object client.Object, options ...client.SubResourceUpdateOption) error {
+		if _, ok := object.(*pgshardv1alpha1.PgShardCluster); ok {
+			if checkpointsToAllow == 0 {
+				return fmt.Errorf("injected replication TLS checkpoint outage")
+			}
+			checkpointsToAllow--
+		}
+		return kubeClient.SubResource(subResourceName).Update(ctx, object, options...)
+	}})
+	reconciler := developmentReconciler(limited, base)
+	err := reconciler.ensurePostgreSQLReplicationTLS(ctx, getCluster(t, ctx, base, cluster))
+	if err == nil || !strings.Contains(err.Error(), "injected replication TLS checkpoint outage") {
+		t.Fatalf("interrupted digest checkpoint error = %v", err)
+	}
+
+	recovered := developmentReconciler(base, base)
+	if err := recovered.ensurePostgreSQLReplicationTLS(ctx, getCluster(t, ctx, base, cluster)); err != nil {
+		t.Fatalf("resumed digest checkpoint failed: %v", err)
+	}
+	current := getCluster(t, ctx, base, cluster)
+	if len(current.Status.PostgreSQLReplicationTLS) != int(cluster.Spec.Shards) {
+		t.Fatalf("replication TLS checkpoints = %#v", current.Status.PostgreSQLReplicationTLS)
+	}
+	for _, recorded := range current.Status.PostgreSQLReplicationTLS {
+		if !validCatalogAccessDigest(recorded.CASHA256) || recorded.RenewalDeadline.IsZero() {
+			t.Fatalf("replication TLS checkpoint = %#v", recorded)
+		}
+	}
+}
+
 func TestReplicationCredentialLifecycleRecoversEveryCommittedWriteResponse(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
