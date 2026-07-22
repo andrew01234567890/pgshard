@@ -96,7 +96,7 @@ type PgShardClusterReconciler struct {
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
@@ -309,6 +309,10 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		statusErr := r.reportFailure(ctx, cluster, "ContractStampFailed", fmt.Sprintf("cannot stamp owned workload contracts: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
+	if _, err := r.sealSupportingGenerationIntents(ctx, cluster, plan); err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "GenerationSealFailed", fmt.Sprintf("cannot seal supporting generation intents: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
 	states, err := r.preflightOwnership(ctx, cluster, plan)
 	if err != nil {
 		statusErr := r.reportFailure(ctx, cluster, "ReconcileFailed", fmt.Sprintf("owned resource reconciliation failed: %v", err))
@@ -332,6 +336,11 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 	}
 	if err := r.applyPlan(ctx, cluster, plan, states); err != nil {
 		statusErr := r.reportFailure(ctx, cluster, "ReconcileFailed", fmt.Sprintf("owned resource reconciliation failed: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
+	supportingRolling, err := r.advanceSupportingGenerations(ctx, cluster)
+	if err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "GenerationAdvanceFailed", fmt.Sprintf("cannot advance supporting generations: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
 	cleaningRetiredCoordinationStorage, err := r.cleanupRetiredEtcdStorage(ctx, cluster)
@@ -359,6 +368,11 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 			return ctrl.Result{Requeue: true}, nil
 		}
 		return ctrl.Result{}, err
+	}
+	if supportingRolling {
+		// A supporting-generation roll (bind, drain, or convergence) is in
+		// progress; requeue so the compare-and-set state machine advances.
+		return ctrl.Result{RequeueAfter: retryDelay}, nil
 	}
 	if !available {
 		return ctrl.Result{RequeueAfter: retryDelay}, nil

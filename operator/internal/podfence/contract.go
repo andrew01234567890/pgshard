@@ -175,6 +175,85 @@ func (v *PodCreateValidator) validatePodContract(ctx context.Context, request ad
 	if got != want {
 		return deniedf("managed Pod contract hash recomputation does not match its stamped parent template")
 	}
+	if response := validateSupportingAdmission(cluster, kind, class, provenance, &pod.Spec, want, generation); response != nil {
+		return response
+	}
+	return nil
+}
+
+// validateSupportingAdmission layers the always-on security floor and the
+// per-class generation compare-and-set barrier onto the comparator/provenance
+// validation of a supporting pod. Members are unaffected.
+func validateSupportingAdmission(cluster *pgshardv1alpha1.PgShardCluster, kind contractPodKind, class owned.PodClass, provenance *owned.ControllerEvidence, spec *corev1.PodSpec, stampedHash string, stampedGeneration int64) *admission.Response {
+	if kind != contractPodPooler && kind != contractPodOrchestrator {
+		return nil
+	}
+	if err := validateSupportingSecurityFloor(spec); err != nil {
+		return deniedf("managed supporting Pod violates the security floor: %v", err)
+	}
+	return validateSupportingGenerationBarrier(cluster, string(class), provenance.ParentUID, stampedHash, stampedGeneration)
+}
+
+// validateSupportingSecurityFloor enforces the class-independent, always-on
+// invariants that must hold on the live supporting pod regardless of its stamp:
+// zero host-namespace surface, no hostPath volume, and no debug ephemeral
+// container. The exact service account, automount setting, image digest pin, and
+// guarded volume/Secret set are already held to the stamped template by the
+// full-spec comparator; this floor is defense in depth for the host surface that
+// most directly bridges the isolation boundary.
+func validateSupportingSecurityFloor(spec *corev1.PodSpec) error {
+	if spec.HostNetwork || spec.HostPID || spec.HostIPC {
+		return fmt.Errorf("supporting Pod must not share the host network, PID, or IPC namespace")
+	}
+	if spec.HostUsers != nil && *spec.HostUsers {
+		return fmt.Errorf("supporting Pod must not share the host user namespace")
+	}
+	for i := range spec.Volumes {
+		if spec.Volumes[i].HostPath != nil {
+			return fmt.Errorf("supporting Pod must not mount a hostPath volume")
+		}
+	}
+	if len(spec.EphemeralContainers) != 0 {
+		return fmt.Errorf("supporting Pod must not carry ephemeral containers")
+	}
+	return nil
+}
+
+// validateSupportingGenerationBarrier decides which sealed ReplicaSet generation
+// a supporting pod may belong to. It reads the class's compare-and-set record: a
+// pod stamped below MinGenerationForNewCreates is a revoked/downgrade create, and
+// a pod must belong to the current or the (still-uncleared) prior ReplicaSet with
+// that generation's exact contract hash. When no record is sealed yet, the
+// barrier defers to the inventory-gated activation stage.
+func validateSupportingGenerationBarrier(cluster *pgshardv1alpha1.PgShardCluster, class, replicaSetUID, stampedHash string, stampedGeneration int64) *admission.Response {
+	record := supportingGenerationRecord(cluster, class)
+	if record == nil || record.CurrentReplicaSetUID == "" {
+		return nil
+	}
+	if stampedGeneration < record.MinGenerationForNewCreates {
+		return deniedf("managed supporting Pod security generation %d is below the revocation barrier %d", stampedGeneration, record.MinGenerationForNewCreates)
+	}
+	switch replicaSetUID {
+	case record.CurrentReplicaSetUID:
+		if stampedHash != record.CurrentContractHash {
+			return deniedf("managed supporting Pod does not match the current sealed generation")
+		}
+	case record.PriorReplicaSetUID:
+		if stampedHash != record.PriorContractHash {
+			return deniedf("managed supporting Pod does not match the prior sealed generation")
+		}
+	default:
+		return deniedf("managed supporting Pod belongs to a ReplicaSet outside the sealed generation set")
+	}
+	return nil
+}
+
+func supportingGenerationRecord(cluster *pgshardv1alpha1.PgShardCluster, class string) *pgshardv1alpha1.SupportingGenerationStatus {
+	for i := range cluster.Status.SupportingGenerations {
+		if cluster.Status.SupportingGenerations[i].Class == class {
+			return &cluster.Status.SupportingGenerations[i]
+		}
+	}
 	return nil
 }
 
@@ -329,6 +408,9 @@ func validateBoundPodContract(ctx context.Context, reader client.Reader, pod *co
 	}
 	if got != want {
 		return deniedf("bound managed Pod contract hash recomputation does not match its stamped parent template")
+	}
+	if response := validateSupportingAdmission(cluster, kind, class, provenance, &pod.Spec, want, generation); response != nil {
+		return response
 	}
 	return nil
 }

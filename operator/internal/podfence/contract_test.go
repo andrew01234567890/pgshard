@@ -913,3 +913,100 @@ func TestBindingValidatorRejectsSmuggledMetadata(t *testing.T) {
 		})
 	}
 }
+
+func poolerGenerationCluster(record pgshardv1alpha1.SupportingGenerationStatus) *pgshardv1alpha1.PgShardCluster {
+	cluster := testWorkloadCluster()
+	cluster.Status.SupportingGenerations = []pgshardv1alpha1.SupportingGenerationStatus{record}
+	return cluster
+}
+
+func TestValidateSupportingGenerationBarrierCoexistence(t *testing.T) {
+	t.Parallel()
+	hashA, hashB := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	cluster := poolerGenerationCluster(pgshardv1alpha1.SupportingGenerationStatus{
+		Class:                      "pooler",
+		CurrentReplicaSetUID:       "rs-b",
+		CurrentContractHash:        hashB,
+		CurrentTemplateGeneration:  1,
+		PriorReplicaSetUID:         "rs-a",
+		PriorContractHash:          hashA,
+		MinGenerationForNewCreates: 1,
+	})
+	// A -> B mid-rollout: both the current and prior generation are admissible,
+	// so neither pod is fenced.
+	if response := validateSupportingGenerationBarrier(cluster, "pooler", "rs-b", hashB, 1); response != nil {
+		t.Fatalf("current generation pod denied: %#v", response.Result)
+	}
+	if response := validateSupportingGenerationBarrier(cluster, "pooler", "rs-a", hashA, 1); response != nil {
+		t.Fatalf("prior generation pod denied during coexistence: %#v", response.Result)
+	}
+	if response := validateSupportingGenerationBarrier(cluster, "pooler", "rs-b", hashA, 1); response == nil ||
+		!strings.Contains(response.Result.Message, "current sealed generation") {
+		t.Fatalf("hash mismatch for current accepted: %#v", response)
+	}
+	if response := validateSupportingGenerationBarrier(cluster, "pooler", "rs-c", hashB, 1); response == nil ||
+		!strings.Contains(response.Result.Message, "outside the sealed generation set") {
+		t.Fatalf("pod owned by an unknown ReplicaSet accepted: %#v", response)
+	}
+	// No sealed record for another class: the barrier defers to activation.
+	if response := validateSupportingGenerationBarrier(cluster, "orchestrator", "rs-x", hashB, 1); response != nil {
+		t.Fatalf("unsealed class barrier denied: %#v", response.Result)
+	}
+}
+
+func TestValidateSupportingGenerationBarrierRevocation(t *testing.T) {
+	t.Parallel()
+	hashA, hashB := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	// A security roll has advanced the barrier to generation 2 and cleared the
+	// prior generation.
+	cluster := poolerGenerationCluster(pgshardv1alpha1.SupportingGenerationStatus{
+		Class:                      "pooler",
+		CurrentReplicaSetUID:       "rs-b",
+		CurrentContractHash:        hashB,
+		CurrentTemplateGeneration:  2,
+		MinGenerationForNewCreates: 2,
+		ConvergedGeneration:        2,
+	})
+	if response := validateSupportingGenerationBarrier(cluster, "pooler", "rs-b", hashB, 2); response != nil {
+		t.Fatalf("current generation pod denied after revocation: %#v", response.Result)
+	}
+	// A downgrade new-create stamped at the old generation is below the barrier.
+	if response := validateSupportingGenerationBarrier(cluster, "pooler", "rs-b", hashB, 1); response == nil ||
+		!strings.Contains(response.Result.Message, "below the revocation barrier") {
+		t.Fatalf("downgrade new-create accepted: %#v", response)
+	}
+	// A pod owned by the cleared prior ReplicaSet is denied.
+	if response := validateSupportingGenerationBarrier(cluster, "pooler", "rs-a", hashA, 2); response == nil ||
+		!strings.Contains(response.Result.Message, "outside the sealed generation set") {
+		t.Fatalf("pod owned by a cleared prior ReplicaSet accepted: %#v", response)
+	}
+}
+
+func TestValidateSupportingSecurityFloor(t *testing.T) {
+	t.Parallel()
+	base := func() *corev1.PodSpec {
+		return &corev1.PodSpec{Containers: []corev1.Container{{Name: "pooler", Image: "pgshard/pooler:dev"}}}
+	}
+	if err := validateSupportingSecurityFloor(base()); err != nil {
+		t.Fatalf("honest supporting spec rejected: %v", err)
+	}
+	hostUsers := true
+	for name, mutate := range map[string]func(*corev1.PodSpec){
+		"hostNetwork": func(spec *corev1.PodSpec) { spec.HostNetwork = true },
+		"hostPID":     func(spec *corev1.PodSpec) { spec.HostPID = true },
+		"hostIPC":     func(spec *corev1.PodSpec) { spec.HostIPC = true },
+		"hostUsers":   func(spec *corev1.PodSpec) { spec.HostUsers = &hostUsers },
+		"hostPath": func(spec *corev1.PodSpec) {
+			spec.Volumes = []corev1.Volume{{Name: "escape", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/"}}}}
+		},
+		"ephemeral": func(spec *corev1.PodSpec) {
+			spec.EphemeralContainers = []corev1.EphemeralContainer{{EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: "debug"}}}
+		},
+	} {
+		spec := base()
+		mutate(spec)
+		if err := validateSupportingSecurityFloor(spec); err == nil {
+			t.Fatalf("%s host surface accepted by the security floor", name)
+		}
+	}
+}

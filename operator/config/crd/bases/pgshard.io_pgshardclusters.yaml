@@ -1014,6 +1014,83 @@ spec:
                 x-kubernetes-list-map-keys:
                 - class
                 x-kubernetes-list-type: map
+              supportingGenerations:
+                description: |-
+                  SupportingGenerations records the per-class compare-and-set state machine
+                  that decides which ReplicaSet generation of a supporting workload may
+                  create pods, and the security-generation barrier below which new creates
+                  are revoked. It is sealed before the owning Deployment is mutated and
+                  recomputed deterministically from live ReplicaSet UIDs on manager restart.
+                items:
+                  description: |-
+                    SupportingGenerationStatus is the sealed compare-and-set record for one
+                    supporting workload class. CurrentReplicaSetUID and PriorReplicaSetUID are the
+                    only ReplicaSet generations whose pods admission accepts; a security roll
+                    advances MinGenerationForNewCreates so a prior (lower) generation is denied for
+                    new creates the instant the barrier is persisted, before the prior ReplicaSet
+                    is drained. PriorReplicaSetUID is cleared only once the prior generation is
+                    proven fully converged (drained to zero live pods).
+                  properties:
+                    class:
+                      enum:
+                      - pooler
+                      - orchestrator
+                      type: string
+                    convergedGeneration:
+                      description: ConvergedGeneration is the highest security generation
+                        proven fully drained.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    currentContractHash:
+                      pattern: ^([0-9a-f]{64})?$
+                      type: string
+                    currentReplicaSetUID:
+                      description: |-
+                        CurrentReplicaSetUID is the live ReplicaSet whose template carries
+                        CurrentContractHash. Empty until the first Bind.
+                      type: string
+                    currentTemplateGeneration:
+                      description: |-
+                        CurrentTemplateGeneration is the security generation the current template
+                        was stamped at.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    deploymentUID:
+                      description: |-
+                        DeploymentUID is the owning Deployment's UID; a change means the Deployment
+                        was recreated and the record must be rebuilt from scratch.
+                      type: string
+                    minGenerationForNewCreates:
+                      description: |-
+                        MinGenerationForNewCreates is the security-generation floor: a pod stamped
+                        below it is denied for new creates and, if it lands, is a late write to be
+                        deleted before convergence.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    priorContractHash:
+                      pattern: ^([0-9a-f]{64})?$
+                      type: string
+                    priorReplicaSetUID:
+                      description: |-
+                        PriorReplicaSetUID is the previous generation's ReplicaSet, still admissible
+                        during a bounded rollout; cleared on convergence.
+                      type: string
+                    sealedAt:
+                      description: |-
+                        SealedAt is when this record was last authoritatively written; the prior
+                        generation's drain timer is measured from it.
+                      format: date-time
+                      type: string
+                  required:
+                  - class
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - class
+                x-kubernetes-list-type: map
             type: object
         type: object
     served: true

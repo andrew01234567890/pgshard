@@ -401,6 +401,14 @@ type PgShardClusterStatus struct {
 	// +listType=map
 	// +listMapKey=class
 	SupportingContracts []SupportingContractStatus `json:"supportingContracts,omitempty"`
+	// SupportingGenerations records the per-class compare-and-set state machine
+	// that decides which ReplicaSet generation of a supporting workload may
+	// create pods, and the security-generation barrier below which new creates
+	// are revoked. It is sealed before the owning Deployment is mutated and
+	// recomputed deterministically from live ReplicaSet UIDs on manager restart.
+	// +listType=map
+	// +listMapKey=class
+	SupportingGenerations []SupportingGenerationStatus `json:"supportingGenerations,omitempty"`
 }
 
 // PostgreSQLMemberContractStatus binds one member StatefulSet's pod-template
@@ -428,6 +436,46 @@ type SupportingContractStatus struct {
 	ContractHash string `json:"contractHash"`
 	// +kubebuilder:validation:Minimum=1
 	SecurityGeneration int64 `json:"securityGeneration"`
+}
+
+// SupportingGenerationStatus is the sealed compare-and-set record for one
+// supporting workload class. CurrentReplicaSetUID and PriorReplicaSetUID are the
+// only ReplicaSet generations whose pods admission accepts; a security roll
+// advances MinGenerationForNewCreates so a prior (lower) generation is denied for
+// new creates the instant the barrier is persisted, before the prior ReplicaSet
+// is drained. PriorReplicaSetUID is cleared only once the prior generation is
+// proven fully converged (drained to zero live pods).
+type SupportingGenerationStatus struct {
+	// +kubebuilder:validation:Enum=pooler;orchestrator
+	Class string `json:"class"`
+	// DeploymentUID is the owning Deployment's UID; a change means the Deployment
+	// was recreated and the record must be rebuilt from scratch.
+	DeploymentUID string `json:"deploymentUID,omitempty"`
+	// CurrentReplicaSetUID is the live ReplicaSet whose template carries
+	// CurrentContractHash. Empty until the first Bind.
+	CurrentReplicaSetUID string `json:"currentReplicaSetUID,omitempty"`
+	// CurrentTemplateGeneration is the security generation the current template
+	// was stamped at.
+	// +kubebuilder:validation:Minimum=0
+	CurrentTemplateGeneration int64 `json:"currentTemplateGeneration,omitempty"`
+	// +kubebuilder:validation:Pattern=`^([0-9a-f]{64})?$`
+	CurrentContractHash string `json:"currentContractHash,omitempty"`
+	// PriorReplicaSetUID is the previous generation's ReplicaSet, still admissible
+	// during a bounded rollout; cleared on convergence.
+	PriorReplicaSetUID string `json:"priorReplicaSetUID,omitempty"`
+	// +kubebuilder:validation:Pattern=`^([0-9a-f]{64})?$`
+	PriorContractHash string `json:"priorContractHash,omitempty"`
+	// MinGenerationForNewCreates is the security-generation floor: a pod stamped
+	// below it is denied for new creates and, if it lands, is a late write to be
+	// deleted before convergence.
+	// +kubebuilder:validation:Minimum=0
+	MinGenerationForNewCreates int64 `json:"minGenerationForNewCreates,omitempty"`
+	// ConvergedGeneration is the highest security generation proven fully drained.
+	// +kubebuilder:validation:Minimum=0
+	ConvergedGeneration int64 `json:"convergedGeneration,omitempty"`
+	// SealedAt is when this record was last authoritatively written; the prior
+	// generation's drain timer is measured from it.
+	SealedAt metav1.Time `json:"sealedAt,omitempty"`
 }
 
 // CatalogActivationCarrierStatus binds the activation carrier's deterministic
