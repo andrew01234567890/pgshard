@@ -42,10 +42,11 @@ const (
 // contract layer trusts. Every value is an unforgeable request.userInfo.Username
 // asserted by the API server, never a self-declared label or annotation.
 type ControllerIdentities struct {
-	Operator              string
-	StatefulSetController string
-	ReplicaSetController  string
-	DeploymentController  string
+	Operator                          string
+	StatefulSetController             string
+	ReplicaSetController              string
+	DeploymentController              string
+	HorizontalPodAutoscalerController string
 }
 
 // contractPodKind is the protected class of an admitted pod, resolved from its

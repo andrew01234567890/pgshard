@@ -561,6 +561,15 @@ spec:
                   activatedAt:
                     format: date-time
                     type: string
+                  dispatchTupleHash:
+                    description: |-
+                      DispatchTupleHash binds the receipt to the exact dispatch-convergence proof
+                      tuple {webhook-config resourceVersion, backend EndpointSlice addresses and
+                      their resourceVersions}. Any change to the tuple during activation
+                      invalidates the in-progress proof and forces re-enumeration + re-proof; the
+                      receipt is never advanced under a stale tuple.
+                    pattern: ^([0-9a-f]{64})?$
+                    type: string
                   minAcceptableSecurityGeneration:
                     description: |-
                       MinAcceptableSecurityGeneration is the isolation-level floor: once ACTIVE, a

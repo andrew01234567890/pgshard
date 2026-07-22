@@ -24,21 +24,6 @@ import (
 
 const isolationActivationBlockedCondition = "IsolationActivationBlocked"
 
-// preflightConverged is the STEP-7b seam. Step 7a builds and enforces the whole
-// activation state machine but deliberately never STARTS activation: the real
-// preflight — the dispatch-convergence dryRun probe, the supported-minor
-// readiness gate, and the controller-identity probe — lands in step 7b. Until
-// then this returns false, so INACTIVE->ACTIVATING_QUIESCE never fires and
-// pre-activation behavior is byte-for-byte unchanged. Activation is additionally
-// impossible on a bridge build (the compile-time ceiling).
-func (r *PgShardClusterReconciler) preflightConverged(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) bool {
-	if !isolationBuildAllowsActivation {
-		return false
-	}
-	// STEP 7b: real convergence/readiness/identity preflight not yet implemented.
-	return false
-}
-
 // reconcileIsolationActivation drives the durable per-namespace isolation
 // activation state machine. Because preflightConverged is the step-7b stub, in
 // production it only ever observes INACTIVE and returns without starting
@@ -64,15 +49,25 @@ func (r *PgShardClusterReconciler) reconcileIsolationActivation(ctx context.Cont
 
 	switch isolationReceiptPhase(receipt) {
 	case pgshardv1alpha1.IsolationInactive:
-		if !r.preflightConverged(ctx, cluster) || !isolationEligible(cluster, namespace) {
+		// Eligibility (opt-in trigger + fenced namespace) is checked BEFORE the
+		// expensive preflight so non-opted-in clusters never probe the API
+		// servers or create probe workloads.
+		if !isolationEligible(cluster, namespace) {
 			return false, nil
+		}
+		proof, ok := r.preflightConverged(ctx, cluster)
+		if !ok {
+			// The preflight surfaced its own typed condition; withhold activation.
+			return false, r.Status().Update(ctx, cluster)
 		}
 		cluster.Status.IsolationReceipt = &pgshardv1alpha1.PostgreSQLIsolationReceipt{
 			NamespaceUID:       string(namespace.UID),
 			Phase:              pgshardv1alpha1.IsolationActivatingQuiesce,
 			SecurityGeneration: currentSecurityGeneration(cluster),
+			DispatchTupleHash:  proof.tupleHash,
 			ActivatedAt:        metav1.Now(),
 		}
+		clearIsolationPreflightConditions(cluster)
 		if err := r.Status().Update(ctx, cluster); err != nil {
 			return false, fmt.Errorf("enter isolation quiesce: %w", err)
 		}
@@ -92,6 +87,9 @@ func (r *PgShardClusterReconciler) reconcileIsolationActivation(ctx context.Cont
 // landed, then inventories the namespace. When the inventory is clean it advances
 // to ACTIVATING_RECREATE.
 func (r *PgShardClusterReconciler) driveIsolationQuiesce(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, namespace *corev1.Namespace) (bool, error) {
+	if valid, err := r.revalidateDispatchTuple(ctx, cluster); err != nil || !valid {
+		return true, err
+	}
 	receipt := cluster.Status.IsolationReceipt
 	if len(receipt.SealedParents) == 0 {
 		sealed, err := r.sealProtectedParents(ctx, cluster)
@@ -130,6 +128,9 @@ func (r *PgShardClusterReconciler) driveIsolationQuiesce(ctx context.Context, cl
 // at its guarded create), then re-inventories. When no pre-guard protected pod
 // remains and the inventory is clean it advances to ACTIVE.
 func (r *PgShardClusterReconciler) driveIsolationRecreate(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
+	if valid, err := r.revalidateDispatchTuple(ctx, cluster); err != nil || !valid {
+		return true, err
+	}
 	receipt := cluster.Status.IsolationReceipt
 	reader := r.authoritativeReader()
 	pods := &corev1.PodList{}
@@ -322,10 +323,15 @@ func isolationReceiptPhase(receipt *pgshardv1alpha1.PostgreSQLIsolationReceipt) 
 	return receipt.Phase
 }
 
-// isolationEligible reports whether a namespace may begin activation: it must be
-// a fenced namespace that is not terminating.
+// isolationEligible reports whether a namespace may begin activation. Activation
+// is OPT-IN and default OFF: the cluster must carry the activation annotation, be
+// in a fenced namespace, and not be terminating. Without the annotation a cluster
+// never activates, so existing clusters and the KIND smoke are unaffected even
+// though the preflight is now real.
 func isolationEligible(cluster *pgshardv1alpha1.PgShardCluster, namespace *corev1.Namespace) bool {
-	return namespace.DeletionTimestamp == nil &&
+	return cluster.DeletionTimestamp == nil &&
+		cluster.Annotations[pgshardv1alpha1.IsolationActivationAnnotation] == pgshardv1alpha1.IsolationActivationRequested &&
+		namespace.DeletionTimestamp == nil &&
 		namespace.Labels[podfence.NamespaceLabel] == podfence.NamespaceLabelValue
 }
 

@@ -12,6 +12,7 @@ import (
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -54,6 +55,7 @@ type webhookCommandOptions struct {
 	statefulSetControllerName   string
 	replicaSetControllerName    string
 	deploymentControllerName    string
+	hpaControllerName           string
 }
 
 func bindCommandFlags(flags *flag.FlagSet) *commandOptions {
@@ -74,6 +76,7 @@ func bindCommandFlags(flags *flag.FlagSet) *commandOptions {
 	flags.StringVar(&options.webhook.statefulSetControllerName, "statefulset-controller-identity", "system:serviceaccount:kube-system:statefulset-controller", "authenticated username of the built-in StatefulSet controller that creates managed member pods")
 	flags.StringVar(&options.webhook.replicaSetControllerName, "replicaset-controller-identity", "system:serviceaccount:kube-system:replicaset-controller", "authenticated username of the built-in ReplicaSet controller that creates managed supporting pods")
 	flags.StringVar(&options.webhook.deploymentControllerName, "deployment-controller-identity", "system:serviceaccount:kube-system:deployment-controller", "authenticated username of the built-in Deployment controller that creates managed supporting ReplicaSets")
+	flags.StringVar(&options.webhook.hpaControllerName, "horizontalpodautoscaler-controller-identity", "system:serviceaccount:kube-system:horizontal-pod-autoscaler", "authenticated username of the built-in HorizontalPodAutoscaler controller, verified by the activation identity probe")
 	flags.StringVar(&options.images.Orchestrator, "orchestrator-image", options.images.Orchestrator, "pgshard orchestrator image reference")
 	flags.StringVar(&options.images.Pooler, "pooler-image", options.images.Pooler, "pgshard pooler image reference")
 	flags.StringVar(&options.images.PostgreSQL, "postgresql-image", options.images.PostgreSQL, "PostgreSQL 18 image reference")
@@ -126,11 +129,27 @@ func main() {
 		AnchorSecret:     client.ObjectKey{Namespace: options.webhook.namespace, Name: options.webhook.caSecretName},
 		AnchorAnnotation: pki.PodFencingKeyFingerprintAnnotation,
 	}
+	controllerIdentities := podfence.ControllerIdentities{
+		Operator:                          "system:serviceaccount:" + options.webhook.namespace + ":pgshard-controller-manager",
+		StatefulSetController:             options.webhook.statefulSetControllerName,
+		ReplicaSetController:              options.webhook.replicaSetControllerName,
+		DeploymentController:              options.webhook.deploymentControllerName,
+		HorizontalPodAutoscalerController: options.webhook.hpaControllerName,
+	}
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(restConfig)
+	if err != nil {
+		setupLog.Error(err, "unable to build discovery client for the activation preflight")
+		os.Exit(1)
+	}
 	if err := (&controller.PgShardClusterReconciler{
 		Client:               manager.GetClient(),
 		APIReader:            manager.GetAPIReader(),
 		Images:               options.images,
 		PodFencingReceiptKey: receiptKey,
+		ControllerIdents:     controllerIdentities,
+		DispatchProber:       controller.NewServerDispatchProber(manager.GetAPIReader(), restConfig, options.webhook.namespace, options.webhook.validatingConfigurationName),
+		MinorGate:            controller.NewServerVersionGate(discoveryClient),
+		IdentityProber:       controller.NewServerControllerIdentityProber(controllerIdentities),
 	}).SetupWithManager(manager); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PgShardCluster")
 		os.Exit(1)
@@ -144,12 +163,6 @@ func main() {
 	}
 	if options.webhookEnabled {
 		handshakeCodec := podfence.NewSecretHandshakeCodec(manager.GetAPIReader(), receiptKey)
-		controllerIdentities := podfence.ControllerIdentities{
-			Operator:              "system:serviceaccount:" + options.webhook.namespace + ":pgshard-controller-manager",
-			StatefulSetController: options.webhook.statefulSetControllerName,
-			ReplicaSetController:  options.webhook.replicaSetControllerName,
-			DeploymentController:  options.webhook.deploymentControllerName,
-		}
 		if err := ctrl.NewWebhookManagedBy(manager, &pgshardv1alpha1.PgShardCluster{}).
 			WithDefaulter(&pgshardv1alpha1.PgShardClusterDefaulter{}).
 			WithValidator(&pgshardv1alpha1.PgShardClusterValidator{

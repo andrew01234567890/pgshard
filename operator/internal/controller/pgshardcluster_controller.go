@@ -81,6 +81,12 @@ type PgShardClusterReconciler struct {
 	APIReader            client.Reader
 	Images               owned.Images
 	PodFencingReceiptKey podfence.SecretReceiptKeyRef
+	// Isolation-activation preflight probers (step 7b). Nil until wired; a nil
+	// prober fails the preflight closed. Tests inject fakes.
+	DispatchProber   dispatchProber
+	MinorGate        minorGate
+	IdentityProber   controllerIdentityProber
+	ControllerIdents podfence.ControllerIdentities
 }
 
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters,verbs=get;list;watch;update;patch
@@ -90,8 +96,9 @@ type PgShardClusterReconciler struct {
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardcatalogactivations/status,verbs=update
 // +kubebuilder:rbac:groups="",resources=configmaps;persistentvolumeclaims;services;serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=endpoints,verbs=get
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;create;patch;delete
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get
+// +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get

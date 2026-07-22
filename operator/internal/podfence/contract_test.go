@@ -1164,3 +1164,31 @@ func TestWorkloadIntegrityQuiesceFreezesWorkloadCreate(t *testing.T) {
 		t.Fatalf("quiesce did not freeze a workload create: %#v", response)
 	}
 }
+
+func TestPodCreateSentinelAlwaysDeniedInEveryPhase(t *testing.T) {
+	t.Parallel()
+	scheme := workloadScheme(t)
+	for _, phase := range []pgshardv1alpha1.IsolationPhase{"", pgshardv1alpha1.IsolationActive, pgshardv1alpha1.IsolationActivatingQuiesce, pgshardv1alpha1.IsolationActivatingRecreate} {
+		phase := phase
+		t.Run(string(phase), func(t *testing.T) {
+			t.Parallel()
+			cluster := testWorkloadCluster()
+			if phase != "" {
+				cluster.Status.IsolationReceipt = &pgshardv1alpha1.PostgreSQLIsolationReceipt{NamespaceUID: "ns", Phase: phase}
+			}
+			reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster).Build()
+			sentinel := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name: DispatchProbeSentinelName, Namespace: testWorkloadNS,
+				Annotations: map[string]string{DispatchProbeSentinelAnnotation: DispatchProbeSentinelValue},
+			}}
+			request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+				Name: sentinel.Name, Namespace: testWorkloadNS, Operation: admissionv1.Create,
+				Object: runtime.RawExtension{Raw: marshalObject(t, sentinel)},
+			}}
+			response := NewPodCreateValidator(reader, testControllerIdentities(), scheme).Handle(context.Background(), request)
+			if response.Allowed || response.Result == nil || response.Result.Message != DispatchProbeSentinelMessage {
+				t.Fatalf("sentinel response in phase %q = %#v, want exact sentinel denial", phase, response.Result)
+			}
+		})
+	}
+}

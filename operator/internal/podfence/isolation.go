@@ -12,6 +12,27 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+const (
+	// DispatchProbeSentinelAnnotation marks a pod as the activation dispatch
+	// probe. A pod carrying it at the sentinel value is always denied by the
+	// PodCreate webhook, in every phase, with DispatchProbeSentinelMessage.
+	DispatchProbeSentinelAnnotation = "pgshard.io/dispatch-probe-sentinel"
+	DispatchProbeSentinelValue      = "v1"
+	// DispatchProbeSentinelName is the reserved name the probe uses; it never
+	// persists (dryRun=All) and the preflight additionally confirms no object of
+	// this name exists.
+	DispatchProbeSentinelName = "pgshard-dispatch-probe-sentinel"
+	// DispatchProbeSentinelMessage is the exact denial the preflight requires
+	// from every backend. Any other outcome means that backend does not dispatch
+	// Pod CREATE to this webhook.
+	DispatchProbeSentinelMessage = "pgshard dispatch-probe sentinel: this Pod create is always denied by the pgshard PodCreate webhook"
+)
+
+// IsDispatchProbeSentinel reports whether a pod is the reserved dispatch probe.
+func IsDispatchProbeSentinel(pod *corev1.Pod) bool {
+	return pod != nil && pod.Annotations[DispatchProbeSentinelAnnotation] == DispatchProbeSentinelValue
+}
+
 // namespaceIsolationReceipt authoritatively resolves the isolation phase of a
 // namespace. It reads the durable receipt off every PgShardCluster in the
 // namespace via the uncached reader, returning the first non-INACTIVE receipt.

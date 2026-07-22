@@ -381,6 +381,13 @@ func (v *PodCreateValidator) Handle(ctx context.Context, request admission.Reque
 	if err := v.decoder.Decode(request, pod); err != nil {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode created Pod: %w", err))
 	}
+	// The dispatch-convergence sentinel is always denied first, in every phase,
+	// with the exact sentinel message. The activation preflight submits a
+	// dryRun=All sentinel CREATE to each live API-server backend and requires
+	// exactly this response to prove that backend dispatches to this webhook.
+	if IsDispatchProbeSentinel(pod) {
+		return admission.Denied(DispatchProbeSentinelMessage)
+	}
 	receipt, err := namespaceIsolationReceipt(ctx, v.reader, request.Namespace)
 	if err != nil {
 		return admission.Errored(http.StatusInternalServerError, err)

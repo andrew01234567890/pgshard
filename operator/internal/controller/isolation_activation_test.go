@@ -19,6 +19,21 @@ func isolationNamespace(uid types.UID) *corev1.Namespace {
 	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: genTestNamespace, UID: uid}}
 }
 
+// fakeDispatchProber returns a fixed proof, standing in for the live per-backend
+// probe that the fake client cannot exercise.
+type fakeDispatchProber struct {
+	proof dispatchProof
+	err   error
+}
+
+func (f fakeDispatchProber) Prove(ctx context.Context) (dispatchProof, error) { return f.proof, f.err }
+
+// convergedDispatch matches the empty tuple hash used by the drive tests, so
+// revalidateDispatchTuple treats the in-progress activation as still valid.
+func convergedDispatch(tupleHash string) fakeDispatchProber {
+	return fakeDispatchProber{proof: dispatchProof{converged: true, tupleHash: tupleHash}}
+}
+
 func clusterControllerRef(cluster *pgshardv1alpha1.PgShardCluster) metav1.OwnerReference {
 	controller := true
 	return metav1.OwnerReference{
@@ -86,6 +101,7 @@ func TestDriveIsolationQuiesceSealsThenAdvances(t *testing.T) {
 	deployment := poolerDeploymentForClass(cluster.Name, "deploy-uid", genHashB, 1, 2)
 	deployment.OwnerReferences = []metav1.OwnerReference{clusterControllerRef(cluster)}
 	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster, statefulSet, deployment)
+	reconciler.DispatchProber = convergedDispatch("")
 
 	// First pass seals the parents at their exact incarnation.
 	if _, err := reconciler.reconcileIsolationActivation(context.Background(), cluster); err != nil {
@@ -136,6 +152,7 @@ func TestDriveIsolationQuiesceBlocksOnForeignPod(t *testing.T) {
 	}
 	foreign := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "intruder", Namespace: genTestNamespace}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c"}}}}
 	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster, foreign)
+	reconciler.DispatchProber = convergedDispatch("")
 
 	if _, err := reconciler.reconcileIsolationActivation(context.Background(), cluster); err != nil {
 		t.Fatal(err)
@@ -171,6 +188,7 @@ func TestDriveIsolationRecreateReguardsThenActivates(t *testing.T) {
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "postgresql"}}},
 	}
 	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster, preGuard)
+	reconciler.DispatchProber = convergedDispatch("")
 
 	// First pass deletes the pre-guard pod and stays in RECREATE.
 	if _, err := reconciler.reconcileIsolationActivation(context.Background(), cluster); err != nil {

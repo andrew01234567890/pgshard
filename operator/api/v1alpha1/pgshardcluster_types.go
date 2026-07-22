@@ -458,12 +458,31 @@ type PostgreSQLIsolationReceipt struct {
 	MinAcceptableSecurityGeneration int64 `json:"minAcceptableSecurityGeneration,omitempty"`
 	// +kubebuilder:validation:Pattern=`^([0-9a-f]{64})?$`
 	ResidueProfileHash string `json:"residueProfileHash,omitempty"`
+	// DispatchTupleHash binds the receipt to the exact dispatch-convergence proof
+	// tuple {webhook-config resourceVersion, backend EndpointSlice addresses and
+	// their resourceVersions}. Any change to the tuple during activation
+	// invalidates the in-progress proof and forces re-enumeration + re-proof; the
+	// receipt is never advanced under a stale tuple.
+	// +kubebuilder:validation:Pattern=`^([0-9a-f]{64})?$`
+	DispatchTupleHash string `json:"dispatchTupleHash,omitempty"`
 	// SealedParents are the exact protected-parent identities admission accepts
 	// as create parents during ACTIVATING_RECREATE.
 	// +listType=atomic
 	SealedParents []SealedParent `json:"sealedParents,omitempty"`
 	ActivatedAt   metav1.Time    `json:"activatedAt,omitempty"`
 }
+
+// IsolationActivationAnnotation is the opt-in trigger for per-namespace isolation
+// activation. It is absent by default, so a cluster never activates unless an
+// operator explicitly requests it; existing clusters and the KIND smoke are
+// unaffected. Activation additionally requires the build to permit it and the
+// full preflight (supported minor, controller-identity, dispatch-convergence) to
+// pass.
+const IsolationActivationAnnotation = "pgshard.io/activate-isolation"
+
+// IsolationActivationRequested is the annotation value that opts a cluster into
+// activation.
+const IsolationActivationRequested = "requested"
 
 // SealedParent is one protected parent workload sealed into the isolation
 // receipt at its exact API incarnation and contract hash.

@@ -35,7 +35,8 @@ func TestGeneratedManagerRoleAuthorizesRuntimeControlPaths(t *testing.T) {
 		{group: "", resource: "namespaces", verbs: []string{"get"}},
 		{group: "", resource: "nodes", verbs: []string{"get"}},
 		{group: "", resource: "persistentvolumeclaims", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
-		{group: "", resource: "pods", verbs: []string{"delete", "get", "list", "patch"}},
+		{group: "", resource: "pods", verbs: []string{"create", "delete", "get", "list", "patch"}},
+		{group: "discovery.k8s.io", resource: "endpointslices", verbs: []string{"get", "list"}},
 		{group: "", resource: "secrets", verbs: []string{"create", "delete", "get", "update"}},
 		{group: "", resource: "serviceaccounts", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
 		{group: "coordination.k8s.io", resource: "leases", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
@@ -69,7 +70,7 @@ func TestGeneratedManagerRoleAuthorizesRuntimeControlPaths(t *testing.T) {
 			t.Errorf("cluster-wide manager role grants forbidden Endpoints verb %q", forbidden)
 		}
 	}
-	for _, forbidden := range []string{"create", "update", "watch"} {
+	for _, forbidden := range []string{"update", "watch"} {
 		if roleAllows(role, "", "pods", []string{forbidden}) {
 			t.Errorf("cluster-wide manager role grants forbidden Pod verb %q", forbidden)
 		}
