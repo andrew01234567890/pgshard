@@ -154,8 +154,13 @@ func TestWorkloadIntegrityValidatorAuthenticatesMemberStatefulSets(t *testing.T)
 
 	unmanaged := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: testWorkloadNS}}
 	if response := build().Handle(context.Background(),
-		workloadRequest(t, unmanaged, "statefulsets", "", "other", "system:serviceaccount:tenant:someone", admissionv1.Create)); !response.Allowed {
-		t.Fatalf("unmanaged StatefulSet denied: %#v", response.Result)
+		workloadRequest(t, unmanaged, "statefulsets", "", "other", "system:serviceaccount:tenant:someone", admissionv1.Create)); response.Allowed ||
+		!strings.Contains(response.Result.Message, "authored by the pgshard operator") {
+		t.Fatalf("non-operator StatefulSet accepted in a fenced namespace: %#v", response.Result)
+	}
+	if response := build().Handle(context.Background(),
+		workloadRequest(t, unmanaged, "statefulsets", "", "other", identities.Operator, admissionv1.Create)); !response.Allowed {
+		t.Fatalf("operator-authored label-free StatefulSet denied: %#v", response.Result)
 	}
 }
 
@@ -272,5 +277,290 @@ func TestPodContractValidatorGatesOnReconcilerStamp(t *testing.T) {
 	if response := attempt(stamped, identities.ReplicaSetController, cluster); response.Allowed ||
 		!strings.Contains(response.Result.Message, "not owned by a ReplicaSet") {
 		t.Fatalf("stamped supporting pod without a ReplicaSet parent accepted: %#v", response.Result)
+	}
+}
+
+func workloadUpdateRequest(t *testing.T, old, updated any, resource, name, username string) admission.Request {
+	t.Helper()
+	request := workloadRequest(t, updated, resource, "", name, username, admissionv1.Update)
+	request.OldObject = runtime.RawExtension{Raw: marshalObject(t, old)}
+	return request
+}
+
+func orchestratorDeployment(t *testing.T) *appsv1.Deployment {
+	t.Helper()
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "example-orchestrator", Namespace: testWorkloadNS, UID: "deploy-uid",
+			Labels: map[string]string{
+				owned.ManagedByLabel: owned.ManagedByValue, owned.ComponentLabel: "orchestrator", owned.ClusterLabel: testClusterName,
+			},
+			OwnerReferences: []metav1.OwnerReference{clusterOwnerReference()},
+		},
+		Spec: appsv1.DeploymentSpec{Template: stampedTemplate(t, owned.ClassOrchestrator, 0, 0)},
+	}
+}
+
+func TestWorkloadIntegrityValidatorDeniesRogueReplicaSetLaundering(t *testing.T) {
+	t.Parallel()
+	scheme := workloadScheme(t)
+	identities := testControllerIdentities()
+	controller := true
+	deployment := orchestratorDeployment(t)
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(testWorkloadCluster(), deployment).Build()
+	validator := NewWorkloadIntegrityValidator(reader, identities, scheme)
+
+	attackerTemplate := func() corev1.PodTemplateSpec {
+		template := corev1.PodTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+				owned.ClusterLabel: testClusterName, owned.ComponentLabel: "orchestrator",
+			}},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "workload", Image: "attacker/backdoor:latest"}}},
+		}
+		// The HMAC key contains only public domain inputs, so an attacker CAN
+		// recompute a self-consistent stamp; provenance is the authenticator.
+		if _, err := owned.ApplyContractStamp(&template, owned.ClassOrchestrator, string(testClusterUID), 0, 0, 1); err != nil {
+			t.Fatal(err)
+		}
+		return template
+	}
+	rogue := func(template corev1.PodTemplateSpec) *appsv1.ReplicaSet {
+		return &appsv1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "innocuous", Namespace: testWorkloadNS,
+				OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: deployment.Name, UID: deployment.UID, Controller: &controller}},
+			},
+			Spec: appsv1.ReplicaSetSpec{Template: template},
+		}
+	}
+
+	if response := validator.Handle(context.Background(),
+		workloadRequest(t, rogue(attackerTemplate()), "replicasets", "", "innocuous", "system:serviceaccount:tenant:attacker", admissionv1.Create)); response.Allowed ||
+		!strings.Contains(response.Result.Message, "authored by the Deployment controller") {
+		t.Fatalf("attacker-created label-free rogue ReplicaSet accepted: %#v", response.Result)
+	}
+
+	if response := validator.Handle(context.Background(),
+		workloadRequest(t, rogue(attackerTemplate()), "replicasets", "", "innocuous", identities.DeploymentController, admissionv1.Create)); response.Allowed ||
+		!strings.Contains(response.Result.Message, "does not match its owning Deployment") {
+		t.Fatalf("self-stamped rogue ReplicaSet template accepted: %#v", response.Result)
+	}
+
+	laundered := attackerTemplate()
+	laundered.Annotations = map[string]string{
+		owned.PodContractHashAnnotation:       deployment.Spec.Template.Annotations[owned.PodContractHashAnnotation],
+		owned.PodSecurityGenerationAnnotation: deployment.Spec.Template.Annotations[owned.PodSecurityGenerationAnnotation],
+	}
+	if response := validator.Handle(context.Background(),
+		workloadRequest(t, rogue(laundered), "replicasets", "", "innocuous", identities.DeploymentController, admissionv1.Create)); response.Allowed ||
+		!strings.Contains(response.Result.Message, "diverges from its stamped owning Deployment") {
+		t.Fatalf("annotation-copying rogue ReplicaSet template accepted: %#v", response.Result)
+	}
+}
+
+func TestWorkloadIntegrityValidatorDeniesIdentityTransitions(t *testing.T) {
+	t.Parallel()
+	scheme := workloadScheme(t)
+	identities := testControllerIdentities()
+	build := func(objects ...client.Object) *WorkloadIntegrityValidator {
+		reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+		return NewWorkloadIntegrityValidator(reader, identities, scheme)
+	}
+
+	protected := stampedMemberStatefulSet(t)
+	stripped := protected.DeepCopy()
+	delete(stripped.Labels, owned.ComponentLabel)
+	if response := build(testWorkloadCluster()).Handle(context.Background(),
+		workloadUpdateRequest(t, protected, stripped, "statefulsets", protected.Name, identities.Operator)); response.Allowed ||
+		!strings.Contains(response.Result.Message, "transition into or out of managed identity") {
+		t.Fatalf("label removal from a protected StatefulSet accepted: %#v", response.Result)
+	}
+
+	reshard := protected.DeepCopy()
+	reshard.Labels[owned.ShardLabel] = "0001"
+	if response := build(testWorkloadCluster()).Handle(context.Background(),
+		workloadUpdateRequest(t, protected, reshard, "statefulsets", protected.Name, identities.Operator)); response.Allowed ||
+		!strings.Contains(response.Result.Message, "identity is immutable") {
+		t.Fatalf("shard identity mutation on a protected StatefulSet accepted: %#v", response.Result)
+	}
+
+	plain := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "plain", Namespace: testWorkloadNS, UID: "plain-uid"}}
+	promoted := plain.DeepCopy()
+	promoted.Labels = map[string]string{owned.ClusterLabel: testClusterName, owned.ComponentLabel: "pooler"}
+	if response := build(testWorkloadCluster()).Handle(context.Background(),
+		workloadUpdateRequest(t, plain, promoted, "deployments", "plain", identities.Operator)); response.Allowed ||
+		!strings.Contains(response.Result.Message, "transition into or out of managed identity") {
+		t.Fatalf("promotion of an unmanaged Deployment into managed identity accepted: %#v", response.Result)
+	}
+
+	deployment := orchestratorDeployment(t)
+	mutated := deployment.DeepCopy()
+	mutated.Spec.Template.Spec.Containers[0].Image = "attacker/backdoor:latest"
+	if response := build(testWorkloadCluster()).Handle(context.Background(),
+		workloadUpdateRequest(t, deployment, mutated, "deployments", deployment.Name, identities.DeploymentController)); response.Allowed ||
+		!strings.Contains(response.Result.Message, "may not mutate") {
+		t.Fatalf("Deployment-controller template mutation accepted: %#v", response.Result)
+	}
+
+	revisioned := deployment.DeepCopy()
+	revisioned.Annotations = map[string]string{"deployment.kubernetes.io/revision": "2"}
+	if response := build(testWorkloadCluster()).Handle(context.Background(),
+		workloadUpdateRequest(t, deployment, revisioned, "deployments", deployment.Name, identities.DeploymentController)); !response.Allowed {
+		t.Fatalf("Deployment-controller revision annotation sync denied: %#v", response.Result)
+	}
+
+	controller := true
+	replicaSet := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "example-orchestrator-77abcde", Namespace: testWorkloadNS, UID: "rs-uid",
+			Labels: map[string]string{
+				owned.ManagedByLabel: owned.ManagedByValue, owned.ComponentLabel: "orchestrator",
+				owned.ClusterLabel: testClusterName, podTemplateHashLabel: "77abcde",
+			},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: deployment.Name, UID: deployment.UID, Controller: &controller}},
+		},
+		Spec: appsv1.ReplicaSetSpec{Template: *deployment.Spec.Template.DeepCopy()},
+	}
+	scaled := replicaSet.DeepCopy()
+	replicas := int32(3)
+	scaled.Spec.Replicas = &replicas
+	if response := build().Handle(context.Background(),
+		workloadUpdateRequest(t, replicaSet, scaled, "replicasets", replicaSet.Name, identities.DeploymentController)); !response.Allowed {
+		t.Fatalf("Deployment-controller ReplicaSet scaling denied: %#v", response.Result)
+	}
+	retemplated := replicaSet.DeepCopy()
+	retemplated.Spec.Template.Spec.Containers[0].Image = "attacker/backdoor:latest"
+	if response := build().Handle(context.Background(),
+		workloadUpdateRequest(t, replicaSet, retemplated, "replicasets", replicaSet.Name, identities.DeploymentController)); response.Allowed ||
+		!strings.Contains(response.Result.Message, "pod template is immutable") {
+		t.Fatalf("ReplicaSet template mutation accepted: %#v", response.Result)
+	}
+}
+
+func TestResolveStampedParentRequiresLiveRevisionEvidence(t *testing.T) {
+	t.Parallel()
+	scheme := workloadScheme(t)
+	identities := testControllerIdentities()
+	cluster := testWorkloadCluster()
+	statefulSet := stampedMemberStatefulSet(t)
+	statefulSet.Status.CurrentRevision = "rev-a"
+	statefulSet.Status.UpdateRevision = "rev-b"
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, statefulSet).Build()
+	validator := NewPodCreateValidator(reader, identities, scheme)
+
+	memberPod := func(revision string) *corev1.Pod {
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: statefulSet.Name + "-0", Namespace: testWorkloadNS}}
+		if revision != "" {
+			pod.Labels = map[string]string{controllerRevisionHashLabel: revision}
+		}
+		return pod
+	}
+
+	if _, _, _, response := validator.resolveStampedParent(context.Background(), testWorkloadNS, memberPod("rev-x"), contractPodMember, 0, 0, testClusterName, cluster); response == nil ||
+		!strings.Contains(response.Result.Message, "does not match the live StatefulSet revision state") {
+		t.Fatalf("forged member revision accepted: %#v", response)
+	}
+	if _, _, _, response := validator.resolveStampedParent(context.Background(), testWorkloadNS, memberPod(""), contractPodMember, 0, 0, testClusterName, cluster); response == nil ||
+		!strings.Contains(response.Result.Message, "no controller revision evidence") {
+		t.Fatalf("revision-free member pod accepted: %#v", response)
+	}
+	_, _, provenance, response := validator.resolveStampedParent(context.Background(), testWorkloadNS, memberPod("rev-b"), contractPodMember, 0, 0, testClusterName, cluster)
+	if response != nil {
+		t.Fatalf("live update-revision member pod denied: %#v", response.Result)
+	}
+	if provenance.ControllerRevisionHash != "rev-b" {
+		t.Fatalf("member revision evidence = %q, want rev-b", provenance.ControllerRevisionHash)
+	}
+
+	blankStatus := stampedMemberStatefulSet(t)
+	blankReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, blankStatus).Build()
+	blankValidator := NewPodCreateValidator(blankReader, identities, scheme)
+	if _, _, _, response := blankValidator.resolveStampedParent(context.Background(), testWorkloadNS, memberPod("rev-b"), contractPodMember, 0, 0, testClusterName, cluster); response == nil ||
+		!strings.Contains(response.Result.Message, "does not match the live StatefulSet revision state") {
+		t.Fatalf("member pod accepted against a StatefulSet with no recorded revisions: %#v", response)
+	}
+
+	controller := true
+	deployment := orchestratorDeployment(t)
+	hashlessReplicaSet := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "example-orchestrator-77abcde", Namespace: testWorkloadNS, UID: "rs-uid",
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: deployment.Name, UID: deployment.UID, Controller: &controller}},
+		},
+		Spec: appsv1.ReplicaSetSpec{Template: *deployment.Spec.Template.DeepCopy()},
+	}
+	supportingPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "example-orchestrator-77abcde-xyz", Namespace: testWorkloadNS,
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: hashlessReplicaSet.Name, UID: hashlessReplicaSet.UID, Controller: &controller}},
+	}}
+	supportingReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, deployment, hashlessReplicaSet).Build()
+	supportingValidator := NewPodCreateValidator(supportingReader, identities, scheme)
+	if _, _, _, response := supportingValidator.resolveStampedParent(context.Background(), testWorkloadNS, supportingPod, contractPodOrchestrator, 0, 0, testClusterName, cluster); response == nil ||
+		!strings.Contains(response.Result.Message, "no pod-template-hash evidence") {
+		t.Fatalf("supporting pod accepted against a hash-free ReplicaSet: %#v", response)
+	}
+}
+
+func TestPodContractValidatorCrossChecksSecurityGeneration(t *testing.T) {
+	t.Parallel()
+	scheme := workloadScheme(t)
+	identities := testControllerIdentities()
+	controller := true
+	deployment := orchestratorDeployment(t)
+	replicaSet := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "example-orchestrator-77abcde", Namespace: testWorkloadNS, UID: "rs-uid",
+			Labels:          map[string]string{podTemplateHashLabel: "77abcde"},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: deployment.Name, UID: deployment.UID, Controller: &controller}},
+		},
+		Spec: appsv1.ReplicaSetSpec{Template: *deployment.Spec.Template.DeepCopy()},
+	}
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(testWorkloadCluster(), deployment, replicaSet).Build()
+	attempt := func(pod *corev1.Pod) admission.Response {
+		request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+			Name: pod.Name, Namespace: testWorkloadNS, Operation: admissionv1.Create,
+			Object:   runtime.RawExtension{Raw: marshalObject(t, pod)},
+			UserInfo: authenticationv1.UserInfo{Username: identities.ReplicaSetController},
+		}}
+		return NewPodCreateValidator(reader, identities, scheme).Handle(context.Background(), request)
+	}
+	stampedPod := func(generation string) *corev1.Pod {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "example-orchestrator-77abcde-xyz", Namespace: testWorkloadNS,
+				Labels: map[string]string{owned.ClusterLabel: testClusterName, owned.ComponentLabel: "orchestrator"},
+				Annotations: map[string]string{
+					owned.PostgreSQLPodClusterUIDAnnotation: string(testClusterUID),
+					owned.PodContractHashAnnotation:         deployment.Spec.Template.Annotations[owned.PodContractHashAnnotation],
+				},
+				OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: replicaSet.Name, UID: replicaSet.UID, Controller: &controller}},
+			},
+			Spec: *deployment.Spec.Template.Spec.DeepCopy(),
+		}
+		if generation != "" {
+			pod.Annotations[owned.PodSecurityGenerationAnnotation] = generation
+		}
+		return pod
+	}
+
+	if response := attempt(stampedPod("2")); response.Allowed ||
+		!strings.Contains(response.Result.Message, "security generation does not match") {
+		t.Fatalf("generation-skewed managed pod accepted: %#v", response.Result)
+	}
+	if response := attempt(stampedPod("")); response.Allowed ||
+		!strings.Contains(response.Result.Message, "security generation does not match") {
+		t.Fatalf("generation-free managed pod accepted: %#v", response.Result)
+	}
+}
+
+func TestCanonicalSecurityGeneration(t *testing.T) {
+	t.Parallel()
+	for raw, want := range map[string]bool{
+		"1": true, "42": true, "9223372036854775807": true,
+		"": false, "0": false, "-1": false, "+1": false, "01": false, " 1": false, "1 ": false, "x": false,
+	} {
+		if _, ok := canonicalSecurityGeneration(raw); ok != want {
+			t.Fatalf("canonicalSecurityGeneration(%q) = %v, want %v", raw, ok, want)
+		}
 	}
 }

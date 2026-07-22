@@ -329,9 +329,10 @@ func (v *PodCreateValidator) Handle(ctx context.Context, request admission.Reque
 	if err := decodeStrictObject(request.Object.Raw, &corev1.Pod{}); err != nil {
 		return admission.Denied(fmt.Sprintf("managed Pod carries unknown or duplicate fields: %v", err))
 	}
-	if pod.Namespace == "" {
-		pod.Namespace = request.Namespace
+	if pod.Namespace != "" && pod.Namespace != request.Namespace {
+		return admission.Denied("managed Pod namespace does not match the request namespace")
 	}
+	pod.Namespace = request.Namespace
 	if response := v.validatePodContract(ctx, request, pod, kind, shard, member, clusterName); response != nil {
 		return *response
 	}
