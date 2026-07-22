@@ -177,6 +177,9 @@ func main() {
 		webhookServer.Register(podfence.MetadataWebhookPath, &admission.Webhook{
 			Handler: podfence.NewMetadataValidator(handshakeCodec, scheme),
 		})
+		webhookServer.Register(podfence.PodCreateWebhookPath, &admission.Webhook{
+			Handler: podfence.NewPodCreateValidator(manager.GetAPIReader(), scheme),
+		})
 		webhookServer.Register(podfence.StatusValidationWebhookPath, &admission.Webhook{
 			Handler: podfence.NewStatusValidator(manager.GetAPIReader(), handshakeCodec, scheme),
 		})

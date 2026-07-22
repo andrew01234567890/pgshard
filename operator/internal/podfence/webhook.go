@@ -49,6 +49,8 @@ const (
 	MetadataWebhookPath          = "/validate-core-v1-postgresqlpodmetadata"
 	NamespaceWebhookName         = "vpostgresqlfencingnamespace.pgshard.io"
 	NamespaceWebhookPath         = "/validate-core-v1-postgresqlfencingnamespace"
+	PodCreateWebhookName         = "vpostgresqlpodcreate.pgshard.io"
+	PodCreateWebhookPath         = "/validate-core-v1-postgresqlpodcreate"
 )
 
 type HandshakeAttestor struct {
@@ -202,39 +204,8 @@ func readBindingEvidence(ctx context.Context, reader client.Reader, request admi
 		response := admission.Denied("managed PostgreSQL Pod binding must carry the exact Pod UID")
 		return nil, &response
 	}
-	clusterName := pod.Labels[owned.ClusterLabel]
-	cluster := &pgshardv1alpha1.PgShardCluster{}
-	if err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: clusterName}, cluster); err != nil {
-		if apierrors.IsNotFound(err) {
-			response := admission.Denied("managed PostgreSQL Pod's owning PgShardCluster no longer exists")
-			return nil, &response
-		}
-		response := admission.Errored(http.StatusInternalServerError, fmt.Errorf("read PgShardCluster selected for PostgreSQL Pod binding: %w", err))
-		return nil, &response
-	}
-	if cluster.UID == "" || cluster.UID != types.UID(pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation]) {
-		response := admission.Denied("managed PostgreSQL Pod does not belong to the live PgShardCluster UID")
-		return nil, &response
-	}
-	if cluster.DeletionTimestamp != nil {
-		response := admission.Denied("managed PostgreSQL Pod cannot bind while its PgShardCluster is deleting")
-		return nil, &response
-	}
-	if owned.IsPostgreSQLReplicationBootstrapSourcePod(pod) {
-		if !owned.IsCurrentPostgreSQLReplicationBootstrapSourcePod(pod) {
-			response := admission.Denied("legacy PostgreSQL replication-bootstrap source cannot receive a new Pod binding")
-			return nil, &response
-		}
-		if _, err := owned.ObservePostgreSQLRuntimeForCluster(cluster, pod.Annotations, pod.Spec); err != nil {
-			response := admission.Denied(fmt.Sprintf("PostgreSQL replication-bootstrap source does not match its PgShardCluster generation contract: %v", err))
-			return nil, &response
-		}
-	}
-	if owned.IsPostgreSQLReplicationStandbyPod(pod) {
-		if _, err := owned.ObservePostgreSQLRuntimeForCluster(cluster, pod.Annotations, pod.Spec); err != nil {
-			response := admission.Denied(fmt.Sprintf("PostgreSQL replication standby does not match its PgShardCluster transport contract: %v", err))
-			return nil, &response
-		}
+	if _, response := validateManagedPodClusterContract(ctx, reader, pod); response != nil {
+		return nil, response
 	}
 	if binding.Target.Kind != "Node" || binding.Target.Name == "" {
 		response := admission.Denied("managed PostgreSQL Pod binding must select a named Node")
@@ -250,6 +221,99 @@ func readBindingEvidence(ctx context.Context, reader client.Reader, request admi
 		return nil, &response
 	}
 	return &bindingEvidence{pod: pod, node: node}, nil
+}
+
+// validateManagedPodClusterContract binds a managed PostgreSQL Pod to its live
+// owning PgShardCluster and enforces the cluster-aware replication contracts.
+// It runs at Pod CREATE and again at binding admission. The replication-mode
+// check is deliberately independent of the role-neutral classifiers: any pod
+// that even hints at a replication process composition must validate as an
+// exact policy-bound source or standby, so a serving-role label or a mangled
+// composition can never dodge transport validation.
+func validateManagedPodClusterContract(ctx context.Context, reader client.Reader, pod *corev1.Pod) (*pgshardv1alpha1.PgShardCluster, *admission.Response) {
+	clusterName := pod.Labels[owned.ClusterLabel]
+	cluster := &pgshardv1alpha1.PgShardCluster{}
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: clusterName}, cluster); err != nil {
+		if apierrors.IsNotFound(err) {
+			response := admission.Denied("managed PostgreSQL Pod's owning PgShardCluster no longer exists")
+			return nil, &response
+		}
+		response := admission.Errored(http.StatusInternalServerError, fmt.Errorf("read PgShardCluster selected for PostgreSQL Pod admission: %w", err))
+		return nil, &response
+	}
+	if cluster.UID == "" || cluster.UID != types.UID(pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation]) {
+		response := admission.Denied("managed PostgreSQL Pod does not belong to the live PgShardCluster UID")
+		return nil, &response
+	}
+	if cluster.DeletionTimestamp != nil {
+		response := admission.Denied("managed PostgreSQL Pod cannot be admitted while its PgShardCluster is deleting")
+		return nil, &response
+	}
+	if owned.IsPostgreSQLReplicationBootstrapSourcePod(pod) {
+		if !owned.IsCurrentPostgreSQLReplicationBootstrapSourcePod(pod) {
+			response := admission.Denied("legacy PostgreSQL replication-bootstrap source cannot receive a new Pod admission")
+			return nil, &response
+		}
+		if _, err := owned.ObservePostgreSQLRuntimeForCluster(cluster, pod.Labels, pod.Annotations, pod.Spec); err != nil {
+			response := admission.Denied(fmt.Sprintf("PostgreSQL replication-bootstrap source does not match its PgShardCluster generation contract: %v", err))
+			return nil, &response
+		}
+	}
+	if owned.IsPostgreSQLReplicationStandbyPod(pod) {
+		if _, err := owned.ObservePostgreSQLRuntimeForCluster(cluster, pod.Labels, pod.Annotations, pod.Spec); err != nil {
+			response := admission.Denied(fmt.Sprintf("PostgreSQL replication standby does not match its PgShardCluster transport contract: %v", err))
+			return nil, &response
+		}
+	}
+	if owned.PostgreSQLReplicationModeEnvironmentPresent(pod.Spec) {
+		if _, hasRole := pod.Labels[owned.RoleLabel]; hasRole {
+			response := admission.Denied("managed PostgreSQL replication source and standby Pods must not carry a serving role")
+			return nil, &response
+		}
+		if err := owned.ValidatePostgreSQLReplicationPodContract(cluster, pod.Labels, pod.Annotations, pod.Spec); err != nil {
+			response := admission.Denied(fmt.Sprintf("managed PostgreSQL replication Pod does not match its PgShardCluster transport contract: %v", err))
+			return nil, &response
+		}
+	}
+	return cluster, nil
+}
+
+// PodCreateValidator refuses managed PostgreSQL Pods that try to enter the
+// namespace outside the operator's contract: pre-assigned to a node (which
+// would skip pods/binding admission entirely), carrying forged binding
+// evidence, or composed as a replication member that does not match the
+// owning PgShardCluster's recorded transport policy and TLS checkpoints.
+// Pods that are not managed PostgreSQL members are deliberately allowed.
+type PodCreateValidator struct {
+	reader  client.Reader
+	decoder admission.Decoder
+}
+
+func NewPodCreateValidator(reader client.Reader, scheme *runtime.Scheme) *PodCreateValidator {
+	return &PodCreateValidator{reader: reader, decoder: admission.NewDecoder(scheme)}
+}
+
+func (v *PodCreateValidator) Handle(ctx context.Context, request admission.Request) admission.Response {
+	if request.Operation != admissionv1.Create || request.SubResource != "" {
+		return admission.Errored(http.StatusBadRequest, fmt.Errorf("unexpected PostgreSQL Pod create validation request %s %q", request.Operation, request.SubResource))
+	}
+	pod := &corev1.Pod{}
+	if err := v.decoder.Decode(request, pod); err != nil {
+		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode created Pod: %w", err))
+	}
+	if !isPotentialManagedPostgreSQLPod(pod) {
+		return admission.Allowed("Pod is not a managed PostgreSQL member")
+	}
+	if !IsManagedPostgreSQLPod(pod) {
+		return admission.Denied("managed PostgreSQL Pod has incomplete identity or no termination fence")
+	}
+	if pod.Spec.NodeName != "" || pod.Annotations[NodeUIDAnnotation] != "" || pod.Annotations[NodeBootIDAnnotation] != "" {
+		return admission.Denied("managed PostgreSQL Pod must be created unassigned and scheduled through binding")
+	}
+	if _, response := validateManagedPodClusterContract(ctx, v.reader, pod); response != nil {
+		return *response
+	}
+	return admission.Allowed("managed PostgreSQL Pod creation matches its PgShardCluster contract")
 }
 
 func protectedBindingLabels() [6]string {
@@ -691,6 +755,7 @@ func hasTerminalPhase(pod *corev1.Pod) bool {
 // +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodbinding,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/binding,verbs=create,versions=v1,name=vpostgresqlpodbinding.pgshard.io,admissionReviewVersions=v1,servicePort=9444
 // +kubebuilder:webhook:path=/mutate-core-v1-postgresqlpodstatus,mutating=true,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/status,verbs=update,versions=v1,name=mpostgresqlpodstatus.pgshard.io,admissionReviewVersions=v1,servicePort=9444
 // +kubebuilder:webhook:path=/mutate-pgshard-io-v1alpha1-postgresqlfencinghandshake,mutating=true,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups=pgshard.io,resources=pgshardclusters,verbs=update,versions=v1alpha1,name=mpostgresqlfencinghandshake.pgshard.io,admissionReviewVersions=v1,servicePort=9444
+// +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodcreate,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods,verbs=create,versions=v1,name=vpostgresqlpodcreate.pgshard.io,admissionReviewVersions=v1,servicePort=9444
 // +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodmetadata,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods;pods/ephemeralcontainers;pods/resize,verbs=update,versions=v1,name=vpostgresqlpodmetadata.pgshard.io,admissionReviewVersions=v1,servicePort=9444
 // +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodstatus,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/status,verbs=update,versions=v1,name=vpostgresqlpodstatus.pgshard.io,admissionReviewVersions=v1,servicePort=9444
 // +kubebuilder:webhook:path=/validate-core-v1-postgresqlfencingnamespace,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=namespaces;namespaces/status;namespaces/finalize,verbs=update,versions=v1,name=vpostgresqlfencingnamespace.pgshard.io,admissionReviewVersions=v1,servicePort=9444

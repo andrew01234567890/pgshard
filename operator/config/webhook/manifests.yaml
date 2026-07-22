@@ -221,6 +221,28 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
+      path: /validate-core-v1-postgresqlpodcreate
+      port: 9444
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  name: vpostgresqlpodcreate.pgshard.io
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    resources:
+    - pods
+  sideEffects: None
+  timeoutSeconds: 5
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
       path: /validate-core-v1-postgresqlpodmetadata
       port: 9444
   failurePolicy: Fail

@@ -2412,11 +2412,13 @@ func ObservePostgreSQLRuntime(annotations map[string]string, spec corev1.PodSpec
 
 // ObservePostgreSQLRuntimeForCluster additionally binds a structurally valid
 // replication member to the PgShardCluster's immutable topology, durability,
-// and recorded replication transport policy. Pod annotations and container
-// composition describe shape; they are not an independent authority that may
-// downgrade the source's generation contract or strip a policy cluster's
-// transport encryption back to cleartext.
-func ObservePostgreSQLRuntimeForCluster(cluster *pgshardv1alpha1.PgShardCluster, annotations map[string]string, spec corev1.PodSpec) (PostgreSQLRuntime, error) {
+// recorded replication transport policy, and — under server TLS — the exact
+// recorded certificate checkpoint for its shard and member. Pod labels,
+// annotations, and container composition describe shape; they are not an
+// independent authority that may downgrade the source's generation contract,
+// strip a policy cluster's transport encryption back to cleartext, or swap
+// the operator-issued trust material for self-attested Secrets and digests.
+func ObservePostgreSQLRuntimeForCluster(cluster *pgshardv1alpha1.PgShardCluster, labels, annotations map[string]string, spec corev1.PodSpec) (PostgreSQLRuntime, error) {
 	if cluster == nil {
 		return "", fmt.Errorf("cluster is nil")
 	}
@@ -2440,10 +2442,20 @@ func ObservePostgreSQLRuntimeForCluster(cluster *pgshardv1alpha1.PgShardCluster,
 			if postgresqlStandbyTransportShape(spec, container) != wantShape {
 				return "", fmt.Errorf("replication standby transport composition does not match the recorded %q replication transport policy", clusterReplicationTransportPolicy(cluster))
 			}
+			if wantShape == postgresqlTransportShapeServerTLS {
+				if err := validateReplicationTransportCheckpointBinding(cluster, labels, spec, container, mode); err != nil {
+					return "", err
+				}
+			}
 			return observed, nil
 		}
 		if postgresqlSourceTransportShape(spec, container) != wantShape {
 			return "", fmt.Errorf("replication-bootstrap source transport composition does not match the recorded %q replication transport policy", clusterReplicationTransportPolicy(cluster))
+		}
+		if wantShape == postgresqlTransportShapeServerTLS {
+			if err := validateReplicationTransportCheckpointBinding(cluster, labels, spec, container, mode); err != nil {
+				return "", err
+			}
 		}
 		if postgresqlLegacyBootstrapGenerationShape(annotations, container) {
 			return observed, nil
@@ -2613,13 +2625,134 @@ func clusterReplicationTransportPolicy(cluster *pgshardv1alpha1.PgShardCluster) 
 	return cluster.Status.PostgreSQLBootstrapSpec.ReplicationTransportPolicy
 }
 
-func podHasSecretVolume(spec corev1.PodSpec, name string) bool {
-	for _, volume := range spec.Volumes {
-		if volume.Name == name {
-			return volume.Secret != nil && volume.Secret.SecretName != ""
+// validateReplicationTransportCheckpointBinding refuses server-TLS members
+// whose projected Secret or attested digest is not the operator-recorded
+// checkpoint for their exact shard and member. Without this binding, a
+// syntactically complete TLS composition could carry a self-issued keypair or
+// CA and silently replace the shard's trust root.
+func validateReplicationTransportCheckpointBinding(cluster *pgshardv1alpha1.PgShardCluster, labels map[string]string, spec corev1.PodSpec, postgres corev1.Container, mode string) error {
+	shardText := labels[ShardLabel]
+	shard, err := strconv.ParseInt(shardText, 10, 32)
+	if err != nil || shard < 0 || shardText != shardLabel(int32(shard)) {
+		return fmt.Errorf("replication member has no canonical shard label to bind its recorded TLS checkpoint")
+	}
+	memberText := labels[MemberLabel]
+	member, err := strconv.ParseInt(memberText, 10, 32)
+	if err != nil || member < 0 || memberText != memberLabel(int32(member)) ||
+		(cluster.Spec.MembersPerShard > 0 && member >= int64(cluster.Spec.MembersPerShard)) {
+		return fmt.Errorf("replication member has no canonical member label to bind its recorded TLS checkpoint")
+	}
+	var checkpoint *pgshardv1alpha1.PostgreSQLReplicationTLSStatus
+	for index := range cluster.Status.PostgreSQLReplicationTLS {
+		if cluster.Status.PostgreSQLReplicationTLS[index].Shard == int32(shard) {
+			checkpoint = &cluster.Status.PostgreSQLReplicationTLS[index]
+			break
+		}
+	}
+	if checkpoint == nil {
+		return fmt.Errorf("shard %s has no recorded replication TLS checkpoint", shardText)
+	}
+	if mode == "replication-standby" {
+		if member == 0 {
+			return fmt.Errorf("replication standby cannot be shard member zero")
+		}
+		if checkpoint.CASecretName == "" || checkpoint.CASHA256 == "" {
+			return fmt.Errorf("shard %s replication CA checkpoint is incomplete", shardText)
+		}
+		digest, digestOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_REPLICATION_TLS_CA_SHA256")
+		if podSecretVolumeSourceName(spec, "replication-ca-secret") != checkpoint.CASecretName ||
+			!digestOK || digest != checkpoint.CASHA256 {
+			return fmt.Errorf("replication standby TLS trust anchor does not match the recorded shard checkpoint")
+		}
+		return nil
+	}
+	if member != 0 {
+		return fmt.Errorf("replication-bootstrap source must be shard member zero")
+	}
+	var memberCheckpoint *pgshardv1alpha1.PostgreSQLReplicationTLSMemberStatus
+	for index := range checkpoint.Members {
+		if checkpoint.Members[index].Member == 0 {
+			memberCheckpoint = &checkpoint.Members[index]
+			break
+		}
+	}
+	if memberCheckpoint == nil || memberCheckpoint.SecretName == "" || memberCheckpoint.ServerSHA256 == "" {
+		return fmt.Errorf("shard %s replication server TLS checkpoint is incomplete", shardText)
+	}
+	digest, digestOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_REPLICATION_TLS_SERVER_SHA256")
+	if podSecretVolumeSourceName(spec, "server-tls-secret") != memberCheckpoint.SecretName ||
+		!digestOK || digest != memberCheckpoint.ServerSHA256 {
+		return fmt.Errorf("replication-bootstrap source TLS material does not match the recorded member checkpoint")
+	}
+	return nil
+}
+
+// PostgreSQLReplicationModeEnvironmentPresent reports whether any container or
+// init container carries a PGSHARD_POSTGRES_MODE entry that selects — or could
+// indeterminately select — a replication role. Admission uses it fail-closed:
+// a pod that even hints at replication must validate as an exact
+// source/standby, so a crafted composition cannot smuggle a replication agent
+// past the role-neutral classifiers.
+func PostgreSQLReplicationModeEnvironmentPresent(spec corev1.PodSpec) bool {
+	containers := make([]corev1.Container, 0, len(spec.Containers)+len(spec.InitContainers))
+	containers = append(containers, spec.Containers...)
+	containers = append(containers, spec.InitContainers...)
+	for _, container := range containers {
+		for _, environment := range container.Env {
+			if environment.Name != "PGSHARD_POSTGRES_MODE" {
+				continue
+			}
+			if environment.ValueFrom != nil ||
+				environment.Value == "replication-bootstrap-primary" || environment.Value == "replication-standby" {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// ValidatePostgreSQLReplicationPodContract accepts a pod that hints at
+// replication only when it is exactly a policy-bound replication source or
+// standby: agent-quarantine runtime, replication mode on the one postgresql
+// container, role-neutral, transport shape matching the recorded policy, and
+// (under server TLS) material bound to the recorded checkpoint.
+func ValidatePostgreSQLReplicationPodContract(cluster *pgshardv1alpha1.PgShardCluster, labels, annotations map[string]string, spec corev1.PodSpec) error {
+	if _, hasRole := labels[RoleLabel]; hasRole {
+		return fmt.Errorf("replication source and standby members must not carry a serving role")
+	}
+	observed, err := ObservePostgreSQLRuntimeForCluster(cluster, labels, annotations, spec)
+	if err != nil {
+		return err
+	}
+	if observed != PostgreSQLRuntimeAgentQuarantine {
+		return fmt.Errorf("replication process composition requires the agent-quarantine PostgreSQL runtime")
+	}
+	for _, container := range spec.Containers {
+		if container.Name != "postgresql" {
+			continue
+		}
+		mode, modeOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_MODE")
+		if modeOK && (mode == "replication-bootstrap-primary" || mode == "replication-standby") {
+			return nil
+		}
+	}
+	return fmt.Errorf("replication environment present without an exact replication source or standby composition")
+}
+
+func podHasSecretVolume(spec corev1.PodSpec, name string) bool {
+	return podSecretVolumeSourceName(spec, name) != ""
+}
+
+func podSecretVolumeSourceName(spec corev1.PodSpec, name string) string {
+	for _, volume := range spec.Volumes {
+		if volume.Name == name {
+			if volume.Secret == nil {
+				return ""
+			}
+			return volume.Secret.SecretName
+		}
+	}
+	return ""
 }
 
 // IsCurrentPostgreSQLReplicationBootstrapSourcePod excludes the complete

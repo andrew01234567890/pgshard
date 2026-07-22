@@ -894,8 +894,8 @@ func (p *Provisioner) readConfigurations(ctx context.Context, caBundle []byte) (
 	if err := p.client.Get(ctx, types.NamespacedName{Name: p.validatingConfigurationName}, validating); err != nil {
 		return nil, fmt.Errorf("get validating webhook configuration: %w", err)
 	}
-	if len(validating.Webhooks) != 7 {
-		return nil, fmt.Errorf("validating webhook configuration contains %d webhooks, want exactly seven", len(validating.Webhooks))
+	if len(validating.Webhooks) != 8 {
+		return nil, fmt.Errorf("validating webhook configuration contains %d webhooks, want exactly eight", len(validating.Webhooks))
 	}
 	for _, expected := range []struct {
 		name, path        string
@@ -909,6 +909,7 @@ func (p *Provisioner) readConfigurations(ctx context.Context, caBundle []byte) (
 		{name: podfence.NamespaceWebhookName, path: podfence.NamespaceWebhookPath, rules: matchesPostgreSQLNamespaceRules, object: podFencingNamespaceSelector()},
 		{name: podfence.StatusValidationWebhookName, path: podfence.StatusValidationWebhookPath, rules: matchesPostgreSQLStatusRules, object: postgreSQLPodSelector()},
 		{name: podfence.BindingValidationWebhookName, path: podfence.BindingValidationWebhookPath, rules: matchesPostgreSQLBindingRules, namespace: podFencingNamespaceSelector()},
+		{name: podfence.PodCreateWebhookName, path: podfence.PodCreateWebhookPath, rules: matchesPostgreSQLPodCreateRules, namespace: podFencingNamespaceSelector()},
 	} {
 		webhook := findValidatingWebhook(validating.Webhooks, expected.name)
 		if webhook == nil {
@@ -994,6 +995,10 @@ func matchesPgShardCatalogActivationRules(rules []admissionregistrationv1.RuleWi
 
 func matchesPostgreSQLBindingRules(rules []admissionregistrationv1.RuleWithOperations) bool {
 	return matchesCoreRules(rules, []admissionregistrationv1.OperationType{admissionregistrationv1.Create}, "pods/binding")
+}
+
+func matchesPostgreSQLPodCreateRules(rules []admissionregistrationv1.RuleWithOperations) bool {
+	return matchesCoreRules(rules, []admissionregistrationv1.OperationType{admissionregistrationv1.Create}, "pods")
 }
 
 func matchesPostgreSQLStatusRules(rules []admissionregistrationv1.RuleWithOperations) bool {

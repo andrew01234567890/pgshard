@@ -4055,11 +4055,9 @@ func TestClusterAwareSourceObservationRejectsSelfAttestedTopologyChanges(t *test
 	cluster := testCluster()
 	cluster.Spec.MembersPerShard = 5
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilitySynchronous
-	cluster.Status.PostgreSQLBootstrapSpec = &pgshardv1alpha1.PostgreSQLBootstrapSpecStatus{
-		ReplicationTransportPolicy: pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1,
-	}
+	cluster.Status.PostgreSQLReplicationTLS = testPostgreSQLReplicationTLS(cluster)
 	pod := testReplicationBootstrapSourcePodFor(t, cluster.Spec.MembersPerShard, cluster.Spec.Durability)
-	if observed, err := ObservePostgreSQLRuntimeForCluster(cluster, pod.Annotations, pod.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
+	if observed, err := ObservePostgreSQLRuntimeForCluster(cluster, pod.Labels, pod.Annotations, pod.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
 		t.Fatalf("observe exact five-member source = %q, %v", observed, err)
 	}
 
@@ -4070,7 +4068,7 @@ func TestClusterAwareSourceObservationRejectsSelfAttestedTopologyChanges(t *test
 	if observed, err := ObservePostgreSQLRuntime(wrongTopology.Annotations, wrongTopology.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
 		t.Fatalf("canonical but wrong-size source should remain structurally recognizable: %q, %v", observed, err)
 	}
-	if _, err := ObservePostgreSQLRuntimeForCluster(cluster, wrongTopology.Annotations, wrongTopology.Spec); err == nil || !strings.Contains(err.Error(), "immutable cluster topology") {
+	if _, err := ObservePostgreSQLRuntimeForCluster(cluster, wrongTopology.Labels, wrongTopology.Annotations, wrongTopology.Spec); err == nil || !strings.Contains(err.Error(), "immutable cluster topology") {
 		t.Fatalf("wrong-size source topology error = %v", err)
 	}
 
@@ -4084,7 +4082,7 @@ func TestClusterAwareSourceObservationRejectsSelfAttestedTopologyChanges(t *test
 	if observed, err := ObservePostgreSQLRuntime(downgraded.Annotations, downgraded.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
 		t.Fatalf("self-consistent downgrade should remain structurally recognizable: %q, %v", observed, err)
 	}
-	if _, err := ObservePostgreSQLRuntimeForCluster(cluster, downgraded.Annotations, downgraded.Spec); err == nil || !strings.Contains(err.Error(), "immutable cluster topology") {
+	if _, err := ObservePostgreSQLRuntimeForCluster(cluster, downgraded.Labels, downgraded.Annotations, downgraded.Spec); err == nil || !strings.Contains(err.Error(), "immutable cluster topology") {
 		t.Fatalf("source durability downgrade error = %v", err)
 	}
 }
@@ -4092,9 +4090,7 @@ func TestClusterAwareSourceObservationRejectsSelfAttestedTopologyChanges(t *test
 func TestLegacyBootstrapSourceRemainsFencedDuringGenerationUpgrade(t *testing.T) {
 	t.Parallel()
 	cluster := testCluster()
-	cluster.Status.PostgreSQLBootstrapSpec = &pgshardv1alpha1.PostgreSQLBootstrapSpecStatus{
-		ReplicationTransportPolicy: pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1,
-	}
+	cluster.Status.PostgreSQLReplicationTLS = testPostgreSQLReplicationTLS(cluster)
 	pod := testReplicationBootstrapSourcePod(t)
 	legacy := pod.DeepCopy()
 	legacy.Spec.Containers[0].Env = slices.DeleteFunc(legacy.Spec.Containers[0].Env, func(environment corev1.EnvVar) bool {
@@ -4108,7 +4104,7 @@ func TestLegacyBootstrapSourceRemainsFencedDuringGenerationUpgrade(t *testing.T)
 	if IsCurrentPostgreSQLReplicationBootstrapSourcePod(legacy) {
 		t.Fatal("complete v0.73 bootstrap source shape was accepted as a current generation")
 	}
-	if observed, err := ObservePostgreSQLRuntimeForCluster(cluster, legacy.Annotations, legacy.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
+	if observed, err := ObservePostgreSQLRuntimeForCluster(cluster, legacy.Labels, legacy.Annotations, legacy.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
 		t.Fatalf("observe complete v0.73 source = %q, %v", observed, err)
 	}
 
@@ -4134,7 +4130,7 @@ func TestLegacyBootstrapSourceRemainsFencedDuringGenerationUpgrade(t *testing.T)
 			if IsPostgreSQLReplicationBootstrapSourcePod(partial) {
 				t.Fatalf("partial generation settings retained source classification: %#v", partial.Spec.Containers[0].Env)
 			}
-			if _, err := ObservePostgreSQLRuntimeForCluster(cluster, partial.Annotations, partial.Spec); err == nil {
+			if _, err := ObservePostgreSQLRuntimeForCluster(cluster, partial.Labels, partial.Annotations, partial.Spec); err == nil {
 				t.Fatal("partial generation settings passed cluster-aware observation")
 			}
 		})
@@ -4354,25 +4350,26 @@ func TestClusterAwareObservationBindsReplicationTransportPolicy(t *testing.T) {
 		return cluster
 	}
 	policyCluster := clusterWithPolicy(pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)
+	policyCluster.Status.PostgreSQLReplicationTLS = testPostgreSQLReplicationTLS(policyCluster)
 	legacyCluster := clusterWithPolicy("")
 	unrecordedCluster := testCluster()
 
 	for name, pod := range map[string]*corev1.Pod{"source": tlsSource, "standby": tlsStandby} {
-		if observed, err := ObservePostgreSQLRuntimeForCluster(policyCluster, pod.Annotations, pod.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
+		if observed, err := ObservePostgreSQLRuntimeForCluster(policyCluster, pod.Labels, pod.Annotations, pod.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
 			t.Fatalf("policy cluster rejected its exact TLS %s: %q, %v", name, observed, err)
 		}
-		if _, err := ObservePostgreSQLRuntimeForCluster(legacyCluster, pod.Annotations, pod.Spec); err == nil || !strings.Contains(err.Error(), "transport composition does not match") {
+		if _, err := ObservePostgreSQLRuntimeForCluster(legacyCluster, pod.Labels, pod.Annotations, pod.Spec); err == nil || !strings.Contains(err.Error(), "transport composition does not match") {
 			t.Fatalf("legacy cluster accepted a TLS %s: %v", name, err)
 		}
-		if _, err := ObservePostgreSQLRuntimeForCluster(unrecordedCluster, pod.Annotations, pod.Spec); err == nil || !strings.Contains(err.Error(), "recorded PostgreSQL bootstrap contract") {
+		if _, err := ObservePostgreSQLRuntimeForCluster(unrecordedCluster, pod.Labels, pod.Annotations, pod.Spec); err == nil || !strings.Contains(err.Error(), "recorded PostgreSQL bootstrap contract") {
 			t.Fatalf("unrecorded cluster accepted a replication %s: %v", name, err)
 		}
 	}
 	for name, pod := range map[string]*corev1.Pod{"source": cleartextSource, "standby": cleartextStandby} {
-		if observed, err := ObservePostgreSQLRuntimeForCluster(legacyCluster, pod.Annotations, pod.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
+		if observed, err := ObservePostgreSQLRuntimeForCluster(legacyCluster, pod.Labels, pod.Annotations, pod.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
 			t.Fatalf("legacy cluster rejected its exact cleartext %s: %q, %v", name, observed, err)
 		}
-		if _, err := ObservePostgreSQLRuntimeForCluster(policyCluster, pod.Annotations, pod.Spec); err == nil || !strings.Contains(err.Error(), "transport composition does not match") {
+		if _, err := ObservePostgreSQLRuntimeForCluster(policyCluster, pod.Labels, pod.Annotations, pod.Spec); err == nil || !strings.Contains(err.Error(), "transport composition does not match") {
 			t.Fatalf("policy cluster accepted a cleartext %s: %v", name, err)
 		}
 	}
@@ -4433,18 +4430,87 @@ func TestClusterAwareObservationBindsReplicationTransportPolicy(t *testing.T) {
 		{name: "cleartext standby carrying one TLS artifact", pod: cleartextStandby, mutate: func(pod *corev1.Pod) {
 			pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{Name: "PGSHARD_POSTGRES_PRIMARY_SSLROOTCERT", Value: "/run/pgshard/standby-auth/ca.crt"})
 		}},
+		{name: "source projecting a self-attested server Secret", pod: tlsSource, mutate: func(pod *corev1.Pod) {
+			for index := range pod.Spec.Volumes {
+				if pod.Spec.Volumes[index].Name == "server-tls-secret" {
+					pod.Spec.Volumes[index].Secret.SecretName = "self-attested-server-tls"
+				}
+			}
+		}},
+		{name: "source attesting a foreign server digest", pod: tlsSource, mutate: func(pod *corev1.Pod) {
+			setLiteralEnvironment(pod, "PGSHARD_REPLICATION_TLS_SERVER_SHA256", strings.Repeat("9", 64))
+		}},
+		{name: "standby projecting a self-attested CA Secret", pod: tlsStandby, mutate: func(pod *corev1.Pod) {
+			for index := range pod.Spec.Volumes {
+				if pod.Spec.Volumes[index].Name == "replication-ca-secret" {
+					pod.Spec.Volumes[index].Secret.SecretName = "self-attested-replication-ca"
+				}
+			}
+		}},
+		{name: "standby attesting a foreign CA digest", pod: tlsStandby, mutate: func(pod *corev1.Pod) {
+			foreign := strings.Repeat("9", 64)
+			setLiteralEnvironment(pod, "PGSHARD_REPLICATION_TLS_CA_SHA256", foreign)
+			for index := range pod.Spec.InitContainers[0].Env {
+				if pod.Spec.InitContainers[0].Env[index].Name == "PGSHARD_REPLICATION_TLS_CA_SHA256" {
+					pod.Spec.InitContainers[0].Env[index].Value = foreign
+				}
+			}
+		}},
+		{name: "source labeled onto a foreign shard", pod: tlsSource, mutate: func(pod *corev1.Pod) {
+			pod.Labels[ShardLabel] = "0009"
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			changed := test.pod.DeepCopy()
 			test.mutate(changed)
-			if _, err := ObservePostgreSQLRuntimeForCluster(policyCluster, changed.Annotations, changed.Spec); err == nil {
-				t.Fatal("policy cluster accepted a stripped or mixed replication transport composition")
+			if _, err := ObservePostgreSQLRuntimeForCluster(policyCluster, changed.Labels, changed.Annotations, changed.Spec); err == nil {
+				t.Fatal("policy cluster accepted a stripped, mixed, or self-attested replication transport composition")
 			}
-			if _, err := ObservePostgreSQLRuntimeForCluster(legacyCluster, changed.Annotations, changed.Spec); err == nil {
-				t.Fatal("legacy cluster accepted a stripped or mixed replication transport composition")
+			if _, err := ObservePostgreSQLRuntimeForCluster(legacyCluster, changed.Labels, changed.Annotations, changed.Spec); err == nil {
+				t.Fatal("legacy cluster accepted a stripped, mixed, or self-attested replication transport composition")
 			}
 		})
+	}
+
+	uncheckpointedPolicyCluster := clusterWithPolicy(pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)
+	for name, pod := range map[string]*corev1.Pod{"source": tlsSource, "standby": tlsStandby} {
+		if _, err := ObservePostgreSQLRuntimeForCluster(uncheckpointedPolicyCluster, pod.Labels, pod.Annotations, pod.Spec); err == nil ||
+			!strings.Contains(err.Error(), "no recorded replication TLS checkpoint") {
+			t.Fatalf("policy cluster without a recorded checkpoint accepted a TLS %s: %v", name, err)
+		}
+	}
+
+	for name, pod := range map[string]*corev1.Pod{"source": tlsSource, "standby": tlsStandby} {
+		if err := ValidatePostgreSQLReplicationPodContract(policyCluster, pod.Labels, pod.Annotations, pod.Spec); err != nil {
+			t.Fatalf("policy cluster's exact TLS %s failed the replication pod contract: %v", name, err)
+		}
+		labeled := pod.DeepCopy()
+		labeled.Labels[RoleLabel] = "primary"
+		if err := ValidatePostgreSQLReplicationPodContract(policyCluster, labeled.Labels, labeled.Annotations, labeled.Spec); err == nil ||
+			!strings.Contains(err.Error(), "must not carry a serving role") {
+			t.Fatalf("role-labeled replication %s passed the replication pod contract: %v", name, err)
+		}
+	}
+	if !PostgreSQLReplicationModeEnvironmentPresent(tlsSource.Spec) || !PostgreSQLReplicationModeEnvironmentPresent(tlsStandby.Spec) {
+		t.Fatal("exact replication members do not report a replication mode environment")
+	}
+	smuggled := tlsSource.DeepCopy()
+	setLiteralEnvironment(smuggled, "PGSHARD_POSTGRES_MODE", "quarantine")
+	if !PostgreSQLReplicationModeEnvironmentPresent(corev1.PodSpec{Containers: []corev1.Container{{
+		Name: "sidecar",
+		Env:  []corev1.EnvVar{{Name: "PGSHARD_POSTGRES_MODE", Value: "replication-standby"}},
+	}}}) {
+		t.Fatal("replication mode environment on a foreign container went undetected")
+	}
+	if !PostgreSQLReplicationModeEnvironmentPresent(corev1.PodSpec{InitContainers: []corev1.Container{{
+		Name: "init",
+		Env:  []corev1.EnvVar{{Name: "PGSHARD_POSTGRES_MODE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}}},
+	}}}) {
+		t.Fatal("indeterminate replication mode environment went undetected")
+	}
+	if err := ValidatePostgreSQLReplicationPodContract(policyCluster, smuggled.Labels, smuggled.Annotations, smuggled.Spec); err == nil {
+		t.Fatal("replication pod contract accepted a non-replication main composition")
 	}
 }
 

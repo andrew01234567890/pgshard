@@ -1082,7 +1082,7 @@ func TestBootstrapRefusesUnmanagedOrMalformedState(t *testing.T) {
 					return webhook.Name == restoreWebhookName
 				})
 			},
-			want: "want exactly seven",
+			want: "want exactly eight",
 		},
 	}
 	for _, test := range tests {
@@ -1370,6 +1370,8 @@ func installObjects() []client.Object {
 	statusValidating.ObjectSelector = postgreSQLPodSelector()
 	bindingValidating := validatingWebhook(podfence.BindingValidationWebhookName, podfence.BindingValidationWebhookPath, coreResourceRules(admissionregistrationv1.Create, "pods/binding"))
 	bindingValidating.NamespaceSelector = podFencingNamespaceSelector()
+	podCreateValidating := validatingWebhook(podfence.PodCreateWebhookName, podfence.PodCreateWebhookPath, coreResourceRules(admissionregistrationv1.Create, "pods"))
+	podCreateValidating.NamespaceSelector = podFencingNamespaceSelector()
 	return []client.Object{
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testCASecretName, Labels: managedLabels}, Type: corev1.SecretTypeOpaque},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testServingSecretName, Labels: managedLabels}, Type: corev1.SecretTypeOpaque},
@@ -1379,7 +1381,7 @@ func installObjects() []client.Object {
 		},
 		&admissionregistrationv1.ValidatingWebhookConfiguration{
 			ObjectMeta: metav1.ObjectMeta{Name: testValidatingConfigurationName},
-			Webhooks:   []admissionregistrationv1.ValidatingWebhook{catalogActivationValidating, clusterValidating, restoreValidating, metadataValidating, namespaceValidating, statusValidating, bindingValidating},
+			Webhooks:   []admissionregistrationv1.ValidatingWebhook{catalogActivationValidating, clusterValidating, restoreValidating, metadataValidating, namespaceValidating, statusValidating, bindingValidating, podCreateValidating},
 		},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{
 			Namespace: testNamespace,
@@ -1551,7 +1553,7 @@ func assertInjectedBundles(t *testing.T, kubeClient client.Client, wanted []byte
 	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: testValidatingConfigurationName}, validating); err != nil {
 		t.Fatal(err)
 	}
-	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 7 {
+	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 8 {
 		t.Fatalf("CA bundles were not injected: mutating=%#v validating=%#v", mutating.Webhooks, validating.Webhooks)
 	}
 	for _, webhook := range mutating.Webhooks {

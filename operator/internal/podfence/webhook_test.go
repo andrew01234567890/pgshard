@@ -212,6 +212,14 @@ func TestBindingAdmissionEnforcesReplicationTransportPolicy(t *testing.T) {
 		cluster := managedClusterForPod(pod)
 		cluster.Spec.MembersPerShard = 3
 		cluster.Status.PostgreSQLBootstrapSpec.ReplicationTransportPolicy = policy
+		cluster.Status.PostgreSQLReplicationTLS = []pgshardv1alpha1.PostgreSQLReplicationTLSStatus{{
+			Shard:        0,
+			CASecretName: "staged-replication-ca",
+			CASHA256:     caDigest,
+			Members: []pgshardv1alpha1.PostgreSQLReplicationTLSMemberStatus{{
+				Member: 0, SecretName: "staged-server-tls", ServerSHA256: serverTLSDigest,
+			}},
+		}}
 		return cluster
 	}
 	attempt := func(t *testing.T, pod *corev1.Pod, cluster *pgshardv1alpha1.PgShardCluster) admission.Response {
@@ -303,13 +311,204 @@ func TestBindingAdmissionEnforcesReplicationTransportPolicy(t *testing.T) {
 		{name: "standby demoted to the cleartext clone script", build: tlsStandbyPod, mutate: func(pod *corev1.Pod) {
 			pod.Spec.InitContainers[0].Command = []string{"bash", "-ceu", owned.PostgreSQLStandbyBootstrapScript(false)}
 		}},
+		{name: "role-labeled replication source", build: tlsSourcePod, mutate: func(pod *corev1.Pod) {
+			pod.Labels[owned.RoleLabel] = "primary"
+		}},
+		{name: "role-labeled replication standby", build: tlsStandbyPod, mutate: func(pod *corev1.Pod) {
+			pod.Labels[owned.RoleLabel] = "replica"
+		}},
+		{name: "source projecting a self-attested server Secret", build: tlsSourcePod, mutate: func(pod *corev1.Pod) {
+			for index := range pod.Spec.Volumes {
+				if pod.Spec.Volumes[index].Name == "server-tls-secret" {
+					pod.Spec.Volumes[index].Secret.SecretName = "self-attested-server-tls"
+				}
+			}
+		}},
+		{name: "source attesting a foreign server digest", build: tlsSourcePod, mutate: func(pod *corev1.Pod) {
+			for index := range pod.Spec.Containers[0].Env {
+				if pod.Spec.Containers[0].Env[index].Name == "PGSHARD_REPLICATION_TLS_SERVER_SHA256" {
+					pod.Spec.Containers[0].Env[index].Value = strings.Repeat("9", 64)
+				}
+			}
+		}},
+		{name: "standby projecting a self-attested CA Secret", build: tlsStandbyPod, mutate: func(pod *corev1.Pod) {
+			for index := range pod.Spec.Volumes {
+				if pod.Spec.Volumes[index].Name == "replication-ca-secret" {
+					pod.Spec.Volumes[index].Secret.SecretName = "self-attested-replication-ca"
+				}
+			}
+		}},
+		{name: "standby attesting a foreign CA digest", build: tlsStandbyPod, mutate: func(pod *corev1.Pod) {
+			foreign := strings.Repeat("9", 64)
+			for index := range pod.Spec.Containers[0].Env {
+				if pod.Spec.Containers[0].Env[index].Name == "PGSHARD_REPLICATION_TLS_CA_SHA256" {
+					pod.Spec.Containers[0].Env[index].Value = foreign
+				}
+			}
+			for index := range pod.Spec.InitContainers[0].Env {
+				if pod.Spec.InitContainers[0].Env[index].Name == "PGSHARD_REPLICATION_TLS_CA_SHA256" {
+					pod.Spec.InitContainers[0].Env[index].Value = foreign
+				}
+			}
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			pod := test.build()
 			test.mutate(pod)
 			if response := attempt(t, pod, clusterFor(pod, policyServerTLS)); response.Allowed {
-				t.Fatal("policy cluster accepted a stripped replication transport binding")
+				t.Fatal("policy cluster accepted a stripped, role-labeled, or self-attested replication transport binding")
+			}
+		})
+	}
+}
+
+func TestPodCreateAdmissionEnforcesManagedPodContract(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	serverTLSDigest := strings.Repeat("a", 64)
+	caDigest := strings.Repeat("b", 64)
+	clusterFor := func(pod *corev1.Pod, policy string) *pgshardv1alpha1.PgShardCluster {
+		cluster := managedClusterForPod(pod)
+		cluster.Spec.MembersPerShard = 3
+		cluster.Status.PostgreSQLBootstrapSpec.ReplicationTransportPolicy = policy
+		cluster.Status.PostgreSQLReplicationTLS = []pgshardv1alpha1.PostgreSQLReplicationTLSStatus{{
+			Shard:        0,
+			CASecretName: "staged-replication-ca",
+			CASHA256:     caDigest,
+			Members: []pgshardv1alpha1.PostgreSQLReplicationTLSMemberStatus{{
+				Member: 0, SecretName: "staged-server-tls", ServerSHA256: serverTLSDigest,
+			}},
+		}}
+		return cluster
+	}
+	attemptCreate := func(t *testing.T, pod *corev1.Pod, objects ...client.Object) admission.Response {
+		t.Helper()
+		reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+		request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+			Name: pod.Name, Namespace: pod.Namespace, Operation: admissionv1.Create, Object: runtime.RawExtension{Raw: marshalObject(t, pod)},
+		}}
+		return NewPodCreateValidator(reader, scheme).Handle(context.Background(), request)
+	}
+	bindablePod := func(pod *corev1.Pod) *corev1.Pod {
+		pod.Spec.NodeName = ""
+		pod.DeletionTimestamp = nil
+		delete(pod.Annotations, NodeUIDAnnotation)
+		delete(pod.Annotations, NodeBootIDAnnotation)
+		return pod
+	}
+	tlsSource := func() *corev1.Pod {
+		pod := bindablePod(roleNeutralBootstrapSourcePod())
+		container := &pod.Spec.Containers[0]
+		for index := range container.Env {
+			if container.Env[index].Name == "PGSHARD_POSTGRES_HBA_FILE" {
+				container.Env[index].Value = "/etc/pgshard/replication-bootstrap-primary-tls.pg_hba.conf"
+			}
+		}
+		container.Env = append(container.Env,
+			corev1.EnvVar{Name: "PGSHARD_POSTGRES_SERVER_TLS_CERT", Value: "/run/pgshard/server-tls/tls.crt"},
+			corev1.EnvVar{Name: "PGSHARD_POSTGRES_SERVER_TLS_KEY", Value: "/run/pgshard/server-tls/tls.key"},
+			corev1.EnvVar{Name: "PGSHARD_REPLICATION_TLS_SERVER_SHA256", Value: serverTLSDigest},
+		)
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{Name: "server-tls", MountPath: "/run/pgshard/server-tls", ReadOnly: true})
+		pod.Spec.Volumes = append(pod.Spec.Volumes,
+			corev1.Volume{Name: "server-tls-secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: "staged-server-tls"}}},
+			corev1.Volume{Name: "server-tls", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}}},
+		)
+		return pod
+	}
+
+	unmanaged := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "sql-client", Namespace: "database", UID: "client-uid"},
+		Spec:       corev1.PodSpec{NodeName: "node-a", Containers: []corev1.Container{{Name: "psql"}}},
+	}
+	if response := attemptCreate(t, unmanaged); !response.Allowed {
+		t.Fatalf("unmanaged Pod creation denied: %#v", response.Result)
+	}
+
+	honest := tlsSource()
+	if response := attemptCreate(t, honest, clusterFor(honest, pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)); !response.Allowed {
+		t.Fatalf("honest unassigned TLS source creation denied: %#v", response.Result)
+	}
+	honestCleartext := bindablePod(roleNeutralBootstrapSourcePod())
+	if response := attemptCreate(t, honestCleartext, clusterFor(honestCleartext, "")); !response.Allowed {
+		t.Fatalf("honest legacy cleartext source creation denied: %#v", response.Result)
+	}
+	honestStandby := bindablePod(roleNeutralStandbyPod())
+	if response := attemptCreate(t, honestStandby, clusterFor(honestStandby, "")); !response.Allowed {
+		t.Fatalf("honest legacy cleartext standby creation denied: %#v", response.Result)
+	}
+	generic := bindablePod(managedPod())
+	if response := attemptCreate(t, generic, clusterFor(generic, "")); !response.Allowed {
+		t.Fatalf("honest role-labeled managed Pod creation denied: %#v", response.Result)
+	}
+
+	for _, test := range []struct {
+		name   string
+		build  func() (*corev1.Pod, *pgshardv1alpha1.PgShardCluster)
+		want   string
+		orphan bool
+	}{
+		{name: "preset node name skips binding admission", build: func() (*corev1.Pod, *pgshardv1alpha1.PgShardCluster) {
+			pod := tlsSource()
+			pod.Spec.NodeName = "node-a"
+			return pod, clusterFor(pod, pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)
+		}, want: "must be created unassigned"},
+		{name: "forged node binding evidence", build: func() (*corev1.Pod, *pgshardv1alpha1.PgShardCluster) {
+			pod := tlsSource()
+			pod.Annotations[NodeUIDAnnotation] = "forged-node-uid"
+			return pod, clusterFor(pod, pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)
+		}, want: "must be created unassigned"},
+		{name: "cleartext source under the server TLS policy", build: func() (*corev1.Pod, *pgshardv1alpha1.PgShardCluster) {
+			pod := bindablePod(roleNeutralBootstrapSourcePod())
+			return pod, clusterFor(pod, pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)
+		}, want: "transport"},
+		{name: "cleartext standby under the server TLS policy", build: func() (*corev1.Pod, *pgshardv1alpha1.PgShardCluster) {
+			pod := bindablePod(roleNeutralStandbyPod())
+			return pod, clusterFor(pod, pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)
+		}, want: "transport"},
+		{name: "role-labeled replication source", build: func() (*corev1.Pod, *pgshardv1alpha1.PgShardCluster) {
+			pod := tlsSource()
+			pod.Labels[owned.RoleLabel] = "primary"
+			return pod, clusterFor(pod, pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)
+		}, want: "must not carry a serving role"},
+		{name: "replication environment smuggled into a serving Pod", build: func() (*corev1.Pod, *pgshardv1alpha1.PgShardCluster) {
+			pod := bindablePod(managedPod())
+			pod.Spec.InitContainers = append(pod.Spec.InitContainers, corev1.Container{
+				Name: "smuggled-agent",
+				Env:  []corev1.EnvVar{{Name: "PGSHARD_POSTGRES_MODE", Value: "replication-standby"}},
+			})
+			return pod, clusterFor(pod, pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)
+		}, want: "must not carry a serving role"},
+		{name: "self-attested server Secret", build: func() (*corev1.Pod, *pgshardv1alpha1.PgShardCluster) {
+			pod := tlsSource()
+			for index := range pod.Spec.Volumes {
+				if pod.Spec.Volumes[index].Name == "server-tls-secret" {
+					pod.Spec.Volumes[index].Secret.SecretName = "self-attested-server-tls"
+				}
+			}
+			return pod, clusterFor(pod, pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)
+		}, want: "recorded member checkpoint"},
+		{name: "missing termination fence", build: func() (*corev1.Pod, *pgshardv1alpha1.PgShardCluster) {
+			pod := tlsSource()
+			pod.Finalizers = nil
+			return pod, clusterFor(pod, pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)
+		}, want: "incomplete identity or no termination fence"},
+		{name: "owning cluster is gone", build: func() (*corev1.Pod, *pgshardv1alpha1.PgShardCluster) {
+			return tlsSource(), nil
+		}, orphan: true, want: "no longer exists"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			pod, cluster := test.build()
+			var response admission.Response
+			if test.orphan {
+				response = attemptCreate(t, pod)
+			} else {
+				response = attemptCreate(t, pod, cluster)
+			}
+			if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, test.want) {
+				t.Fatalf("managed Pod creation response = %#v, want denial containing %q", response, test.want)
 			}
 		})
 	}
