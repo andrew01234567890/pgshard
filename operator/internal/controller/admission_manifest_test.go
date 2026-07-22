@@ -200,7 +200,19 @@ func selectsFencingNamespace(selector *metav1.LabelSelector) bool {
 
 func TestManagerTokenRequestPolicyShape(t *testing.T) {
 	t.Parallel()
-	file, err := os.Open("../../config/admission/validatingadmissionpolicy_tokenrequest.yaml")
+	const policyPath = "../../config/admission/validatingadmissionpolicy_tokenrequest.yaml"
+	raw, err := os.ReadFile(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The policy is namespace-independent by design: it identifies the manager
+	// token by service-account name cluster-wide, so it must not hardcode any
+	// installation namespace that a namespace change would leave stale and
+	// fail-open.
+	if strings.Contains(string(raw), "pgshard-system") {
+		t.Fatalf("TokenRequest policy hardcodes an installation namespace")
+	}
+	file, err := os.Open(policyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,10 +250,12 @@ func TestManagerTokenRequestPolicyShape(t *testing.T) {
 	}
 	for _, predicate := range []string{
 		"request.userInfo.username.startsWith('system:node:')",
+		"'system:nodes' in request.userInfo.groups",
 		"object.spec.boundObjectRef.kind == 'Pod'",
 		"object.spec.audiences",
-		"object.spec.expirationSeconds",
-		"pgshard-controller-manager",
+		"object.spec.expirationSeconds == 3607",
+		"object.spec.expirationSeconds <= 3600",
+		"request.name == 'pgshard-controller-manager'",
 	} {
 		if !strings.Contains(expressions+policyVariableExpressions(policy), predicate) {
 			t.Fatalf("policy validations are missing predicate %q", predicate)
@@ -251,9 +265,11 @@ func TestManagerTokenRequestPolicyShape(t *testing.T) {
 	if binding.Spec.PolicyName != policy.Name || !slices.Contains(binding.Spec.ValidationActions, admissionregistrationv1.Deny) {
 		t.Fatalf("policy binding = %#v", binding.Spec)
 	}
-	if binding.Spec.MatchResources == nil || binding.Spec.MatchResources.NamespaceSelector == nil ||
-		binding.Spec.MatchResources.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] != "pgshard-system" {
-		t.Fatalf("policy binding match resources = %#v", binding.Spec.MatchResources)
+	// The binding must select every namespace (no namespace-scoping) so a
+	// non-default installation namespace cannot escape the policy.
+	if binding.Spec.MatchResources != nil && binding.Spec.MatchResources.NamespaceSelector != nil &&
+		len(binding.Spec.MatchResources.NamespaceSelector.MatchLabels)+len(binding.Spec.MatchResources.NamespaceSelector.MatchExpressions) != 0 {
+		t.Fatalf("policy binding is namespace-scoped: %#v", binding.Spec.MatchResources)
 	}
 }
 

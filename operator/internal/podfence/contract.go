@@ -83,6 +83,22 @@ func classifyContractPod(pod *corev1.Pod) (contractPodKind, int32, int32, string
 	return contractPodUnmanaged, 0, 0, ""
 }
 
+// isManagedLooking reports whether a pod carries the surface shape of a managed
+// pod (a cluster label plus a managed component), regardless of whether its
+// shard/member identity is canonical. A managed-looking pod that classifies as
+// unmanaged is malformed and must be rejected, never silently treated as an
+// ordinary foreign pod.
+func isManagedLooking(pod *corev1.Pod) bool {
+	if pod.Labels[owned.ClusterLabel] == "" {
+		return false
+	}
+	switch pod.Labels[owned.ComponentLabel] {
+	case componentPostgreSQL, componentPooler, componentOrchestrator:
+		return true
+	}
+	return false
+}
+
 // validatePodContract enforces the canonical pod contract on a classified,
 // managed pod: the creator must be the expected built-in controller, the pod
 // must belong to the live cluster, and its full normalized form must equal the

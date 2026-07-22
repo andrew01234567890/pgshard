@@ -168,23 +168,69 @@ func (v *BindingValidator) Handle(ctx context.Context, request admission.Request
 	if response != nil {
 		return *response
 	}
-	for _, key := range protectedBindingLabels() {
-		bindingValue, bindingHas := binding.Labels[key]
-		podValue, podHas := evidence.pod.Labels[key]
-		if bindingHas != podHas || bindingValue != podValue {
-			return admission.Denied(fmt.Sprintf("managed PostgreSQL Pod binding label %s does not match the selected Pod", key))
-		}
-	}
-	if binding.Annotations[owned.PostgreSQLPodClusterUIDAnnotation] != evidence.pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation] {
-		return admission.Denied("managed PostgreSQL Pod binding does not carry the selected Pod cluster identity")
-	}
-	if binding.Annotations[NodeUIDAnnotation] != string(evidence.node.UID) || binding.Annotations[NodeBootIDAnnotation] != evidence.node.Status.NodeInfo.BootID {
-		return admission.Denied("managed PostgreSQL Pod binding does not carry the selected Node incarnation")
+	if response := validateBindingMetadata(binding, evidence); response != nil {
+		return *response
 	}
 	if response := validateBoundPodContract(ctx, v.reader, evidence.pod, evidence.node, evidence.cluster); response != nil {
 		return *response
 	}
 	return admission.Allowed("final Pod binding preserves the PostgreSQL Pod and Node identities")
+}
+
+// validateBindingMetadata enforces that the final Binding's copied metadata is an
+// exact sanctioned allowlist: every label is either a protected Pod label (equal
+// to the Pod's) or a Node-derived topology label (equal to the Node's), and every
+// annotation is the Pod's cluster-UID or one of the Node's incarnation
+// annotations. The API server copies Binding annotations — and, with the
+// PodTopologyLabels admission plugin, Binding labels — onto the Pod, so any other
+// entry would silently overwrite the Pod's validated contract metadata after
+// CREATE-time validation. Anything outside the allowlist, or a value that does
+// not match the authoritative Pod/Node, is rejected.
+func validateBindingMetadata(binding *corev1.Binding, evidence *bindingEvidence) *admission.Response {
+	protected := protectedBindingLabels()
+	protectedSet := make(map[string]struct{}, len(protected))
+	for _, key := range protected {
+		protectedSet[key] = struct{}{}
+	}
+	// A Binding label the API server would copy onto the Pod is only permitted if
+	// it is a protected identity label already carrying the Pod's own value, or a
+	// topology label carrying the selected Node's value. A missing protected label
+	// is harmless (the Pod keeps its own), so only extra or divergent labels are
+	// rejected.
+	for key, value := range binding.Labels {
+		if key == corev1.LabelTopologyZone || key == corev1.LabelTopologyRegion {
+			if value != evidence.node.Labels[key] {
+				return deniedf("PostgreSQL Pod binding topology label %s does not match the selected Node", key)
+			}
+			continue
+		}
+		if _, ok := protectedSet[key]; !ok {
+			return deniedf("PostgreSQL Pod binding carries an unexpected label %s", key)
+		}
+		podValue, podHas := evidence.pod.Labels[key]
+		if !podHas || value != podValue {
+			return deniedf("managed PostgreSQL Pod binding label %s does not match the selected Pod", key)
+		}
+	}
+	for key, value := range binding.Annotations {
+		switch key {
+		case owned.PostgreSQLPodClusterUIDAnnotation:
+			if value != evidence.pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation] {
+				return deniedf("managed PostgreSQL Pod binding does not carry the selected Pod cluster identity")
+			}
+		case NodeUIDAnnotation:
+			if value != string(evidence.node.UID) {
+				return deniedf("managed PostgreSQL Pod binding does not carry the selected Node incarnation")
+			}
+		case NodeBootIDAnnotation:
+			if value != evidence.node.Status.NodeInfo.BootID {
+				return deniedf("managed PostgreSQL Pod binding does not carry the selected Node incarnation")
+			}
+		default:
+			return deniedf("PostgreSQL Pod binding carries an unexpected annotation %s", key)
+		}
+	}
+	return nil
 }
 
 func readBindingEvidence(ctx context.Context, reader client.Reader, request admission.Request, binding *corev1.Binding) (*bindingEvidence, *admission.Response) {
@@ -197,13 +243,23 @@ func readBindingEvidence(ctx context.Context, reader client.Reader, request admi
 		response := admission.Errored(http.StatusInternalServerError, fmt.Errorf("read Pod selected for binding: %w", err))
 		return nil, &response
 	}
-	if !isPotentialManagedPostgreSQLPod(pod) {
+	kind, _, _, _ := classifyContractPod(pod)
+	switch kind {
+	case contractPodUnmanaged:
+		if isManagedLooking(pod) {
+			response := admission.Denied("managed-looking PostgreSQL Pod carries a malformed identity")
+			return nil, &response
+		}
 		response := admission.Allowed("Pod is not a managed PostgreSQL member")
 		return nil, &response
-	}
-	if !IsManagedPostgreSQLPod(pod) {
-		response := admission.Denied("managed PostgreSQL Pod has incomplete identity or no termination fence")
-		return nil, &response
+	case contractPodMember:
+		// Members carry the termination fence and replication-role shape;
+		// supporting pods (pooler/orchestrator) validate the stamped contract
+		// without those member-only requirements.
+		if !IsManagedPostgreSQLPod(pod) {
+			response := admission.Denied("managed PostgreSQL Pod has incomplete identity or no termination fence")
+			return nil, &response
+		}
 	}
 	if pod.DeletionTimestamp != nil || pod.Spec.NodeName != "" {
 		response := admission.Denied("managed PostgreSQL Pod must be live and unassigned when its node identity is bound")
@@ -661,25 +717,43 @@ func (v *MetadataValidator) Handle(ctx context.Context, request admission.Reques
 	if err := v.decoder.Decode(request, newPod); err != nil {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode new Pod: %w", err))
 	}
-	oldIdentity, _, _, _ := classifyContractPod(oldPod)
-	newIdentity, _, _, _ := classifyContractPod(newPod)
-	// ADOPTION: an unmanaged pod may never be mutated into a managed identity.
-	if oldIdentity == contractPodUnmanaged && newIdentity != contractPodUnmanaged {
+	oldKind, _, _, _ := classifyContractPod(oldPod)
+	newKind, _, _, _ := classifyContractPod(newPod)
+	oldLooking := isManagedLooking(oldPod)
+	newLooking := isManagedLooking(newPod)
+	// A managed-looking pod whose shard/member is noncanonical is malformed and
+	// may never be admitted through UPDATE (it would read as managed to the
+	// fencing logic while dodging the canonical contract).
+	if newLooking && newKind == contractPodUnmanaged {
+		return admission.Denied("managed-looking PostgreSQL Pod carries a malformed identity")
+	}
+	// ADOPTION: an unmanaged pod may never gain a managed identity.
+	if !oldLooking && newLooking {
 		return admission.Denied("unmanaged PostgreSQL Pod may not be mutated into a managed identity")
 	}
-	// The complete member lifecycle (termination fence, attestation) keeps its
-	// existing semantics; the supporting path enforces the shared immutability.
-	if !IsManagedPostgreSQLPod(oldPod) {
-		if oldIdentity == contractPodUnmanaged {
-			return admission.Allowed("Pod is not a managed PostgreSQL member")
-		}
-		return validateManagedPodUpdate(oldPod, newPod)
+	if !oldLooking {
+		return admission.Allowed("Pod is not a managed PostgreSQL member")
 	}
-	if !managedIdentityEqual(oldPod, newPod) {
-		return admission.Denied("managed PostgreSQL Pod identity and binding-time node identity are immutable")
+	// A complete member keeps its termination-fence lifecycle; every other
+	// protected pod (supporting, or a malformed-old identity) is fully immutable.
+	if oldKind == contractPodMember && IsManagedPostgreSQLPod(oldPod) {
+		return v.validateManagedMemberUpdate(ctx, oldPod, newPod)
+	}
+	return validateManagedPodUpdate(oldPod, newPod)
+}
+
+// validateManagedMemberUpdate holds a complete member pod's full metadata and
+// spec immutable, permitting only the authenticated termination-finalizer
+// removal during deletion.
+func (v *MetadataValidator) validateManagedMemberUpdate(ctx context.Context, oldPod, newPod *corev1.Pod) admission.Response {
+	if response := protectedPodMetadataImmutable(oldPod, newPod); response != nil {
+		return *response
 	}
 	if oldPod.Generation != newPod.Generation || !reflect.DeepEqual(oldPod.Spec, newPod.Spec) {
 		return admission.Denied("managed PostgreSQL Pod spec and generation are immutable")
+	}
+	if !finalizersImmutableExceptTermination(oldPod, newPod) {
+		return admission.Denied("managed PostgreSQL Pod finalizers are immutable except the termination fence")
 	}
 	oldFinalizer := slices.Contains(oldPod.Finalizers, owned.PostgreSQLPodTerminationFinalizer)
 	newFinalizer := slices.Contains(newPod.Finalizers, owned.PostgreSQLPodTerminationFinalizer)
@@ -792,19 +866,16 @@ func controllerOwnerReferenceEqual(old, updated []metav1.OwnerReference) bool {
 	return oldRef == nil || (oldRef.Kind == newRef.Kind && oldRef.Name == newRef.Name && oldRef.UID == newRef.UID)
 }
 
-// validateManagedPodUpdate enforces the shared immutability contract on an
-// UPDATE to a managed pod that is not a complete member with a lifecycle fence:
-// supporting pods (pooler/orchestrator) and any label-managed pod. It denies
-// escape (shedding managed identity), any identity/stamp/ownerRef mutation,
-// ephemeral containers, and any spec mutation (which covers a diverging resize
-// and any general spec edit).
+// validateManagedPodUpdate holds a protected non-member pod (supporting, or a
+// malformed-old managed identity) fully immutable: it denies escape, any
+// label/annotation/ownerReference mutation, ephemeral containers, any spec
+// mutation (covering a diverging resize), and any finalizer change.
 func validateManagedPodUpdate(oldPod, newPod *corev1.Pod) admission.Response {
-	newIdentity, _, _, _ := classifyContractPod(newPod)
-	if newIdentity == contractPodUnmanaged {
+	if !isManagedLooking(newPod) {
 		return admission.Denied("managed PostgreSQL Pod may not shed its managed identity")
 	}
-	if !managedIdentityEqual(oldPod, newPod) {
-		return admission.Denied("managed PostgreSQL Pod identity is immutable")
+	if response := protectedPodMetadataImmutable(oldPod, newPod); response != nil {
+		return *response
 	}
 	if len(newPod.Spec.EphemeralContainers) != 0 {
 		return admission.Denied("managed PostgreSQL Pod must not carry ephemeral containers")
@@ -812,7 +883,71 @@ func validateManagedPodUpdate(oldPod, newPod *corev1.Pod) admission.Response {
 	if !equality.Semantic.DeepEqual(oldPod.Spec, newPod.Spec) {
 		return admission.Denied("managed PostgreSQL Pod spec is immutable")
 	}
+	if !equalStringSets(oldPod.Finalizers, newPod.Finalizers) {
+		return admission.Denied("managed PostgreSQL Pod finalizers are immutable")
+	}
 	return admission.Allowed("managed PostgreSQL Pod update preserves its contract")
+}
+
+// protectedPodMetadataImmutable requires a protected pod's identity anchors —
+// UID, node assignment, the complete label and annotation sets, and every owner
+// reference — to be byte-for-byte unchanged across an UPDATE. Only server fields
+// outside metadata identity (resourceVersion, managedFields, the deletion
+// timestamp) and the separately governed finalizers/spec may differ.
+func protectedPodMetadataImmutable(oldPod, newPod *corev1.Pod) *admission.Response {
+	if oldPod.UID != newPod.UID || oldPod.Spec.NodeName != newPod.Spec.NodeName ||
+		!stringMapsEqual(oldPod.Labels, newPod.Labels) ||
+		!stringMapsEqual(oldPod.Annotations, newPod.Annotations) ||
+		!equality.Semantic.DeepEqual(oldPod.OwnerReferences, newPod.OwnerReferences) {
+		return deniedf("managed PostgreSQL Pod identity is immutable")
+	}
+	return nil
+}
+
+func finalizersImmutableExceptTermination(oldPod, newPod *corev1.Pod) bool {
+	return equalStringSets(
+		withoutString(oldPod.Finalizers, owned.PostgreSQLPodTerminationFinalizer),
+		withoutString(newPod.Finalizers, owned.PostgreSQLPodTerminationFinalizer),
+	)
+}
+
+func withoutString(values []string, drop string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value != drop {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func equalStringSets(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[string]int, len(a))
+	for _, value := range a {
+		counts[value]++
+	}
+	for _, value := range b {
+		counts[value]--
+		if counts[value] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func stringMapsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for key, value := range a {
+		if other, ok := b[key]; !ok || other != value {
+			return false
+		}
+	}
+	return true
 }
 
 func nodeIdentityMessage(pod *corev1.Pod) string {

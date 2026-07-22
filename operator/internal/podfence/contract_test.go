@@ -70,10 +70,13 @@ func testWorkloadCluster() *pgshardv1alpha1.PgShardCluster {
 func stampedTemplate(t *testing.T, class owned.PodClass, shard, member int32) corev1.PodTemplateSpec {
 	t.Helper()
 	template := corev1.PodTemplateSpec{
-		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
-			owned.ClusterLabel:   testClusterName,
-			owned.ComponentLabel: string(class),
-		}},
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{
+				owned.ClusterLabel:   testClusterName,
+				owned.ComponentLabel: string(class),
+			},
+			Annotations: map[string]string{owned.PostgreSQLPodClusterUIDAnnotation: string(testClusterUID)},
+		},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "workload", Image: "pgshard/example:dev"}}},
 	}
 	if _, err := owned.ApplyContractStamp(&template, class, string(testClusterUID), shard, member, 1); err != nil {
@@ -733,5 +736,180 @@ func TestMetadataValidatorProtectsSupportingPods(t *testing.T) {
 	if response := handler.Handle(context.Background(), updateRequest(t, supporting(), escape, "")); response.Allowed ||
 		!strings.Contains(response.Result.Message, "shed its managed identity") {
 		t.Fatalf("supporting identity escape accepted: %#v", response.Result)
+	}
+}
+
+func TestPodCreateValidatorAdmitsHonestSupportingPod(t *testing.T) {
+	t.Parallel()
+	scheme := workloadScheme(t)
+	identities := testControllerIdentities()
+	controller := true
+	deployment := poolerDeploymentFixture(t)
+	replicaSet := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "example-pooler-77abcde", Namespace: testWorkloadNS, UID: "pooler-rs-uid",
+			Labels:          map[string]string{podTemplateHashLabel: "77abcde"},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: deployment.Name, UID: deployment.UID, Controller: &controller}},
+		},
+		Spec: appsv1.ReplicaSetSpec{Template: *deployment.Spec.Template.DeepCopy()},
+	}
+	cluster := testWorkloadCluster()
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, deployment, replicaSet).Build()
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "example-pooler-77abcde-xyz", Namespace: testWorkloadNS,
+			Labels: map[string]string{
+				owned.ClusterLabel: testClusterName, owned.ComponentLabel: "pooler", podTemplateHashLabel: "77abcde",
+			},
+			Annotations:     map[string]string{},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: replicaSet.Name, UID: replicaSet.UID, Controller: &controller}},
+		},
+		Spec: *deployment.Spec.Template.Spec.DeepCopy(),
+	}
+	for key, value := range deployment.Spec.Template.Annotations {
+		pod.Annotations[key] = value
+	}
+	request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Name: pod.Name, Namespace: testWorkloadNS, Operation: admissionv1.Create,
+		Object:   runtime.RawExtension{Raw: marshalObject(t, pod)},
+		UserInfo: authenticationv1.UserInfo{Username: identities.ReplicaSetController},
+	}}
+	if response := NewPodCreateValidator(reader, identities, scheme).Handle(context.Background(), request); !response.Allowed {
+		t.Fatalf("honest stamped supporting pod CREATE denied: %#v", response.Result)
+	}
+}
+
+func TestMetadataValidatorHoldsSupportingContractImmutable(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	handler := NewMetadataValidator(testCodec(), scheme)
+	controller := true
+	base := func() *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "example-orchestrator-77abcde-xyz", Namespace: testWorkloadNS,
+				Labels: map[string]string{
+					owned.ClusterLabel: testClusterName, owned.ComponentLabel: "orchestrator", podTemplateHashLabel: "77abcde",
+					corev1.LabelTopologyZone: "zone-a",
+				},
+				Annotations: map[string]string{
+					owned.PostgreSQLPodClusterUIDAnnotation: string(testClusterUID),
+					owned.PodContractHashAnnotation:         strings.Repeat("a", 64),
+					owned.PodSecurityGenerationAnnotation:   "1",
+				},
+				OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "example-orchestrator-77abcde", UID: "rs-uid", Controller: &controller}},
+			},
+			Spec: corev1.PodSpec{NodeName: "node-a", Containers: []corev1.Container{{Name: "orchestrator", Image: "pgshard/orchestrator:dev"}}},
+		}
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*corev1.Pod)
+		want   string
+	}{
+		{"pod-template-hash", func(pod *corev1.Pod) { pod.Labels[podTemplateHashLabel] = "beefbeef" }, "identity is immutable"},
+		{"topology label", func(pod *corev1.Pod) { pod.Labels[corev1.LabelTopologyZone] = "attacker-zone" }, "identity is immutable"},
+		{"extra finalizer", func(pod *corev1.Pod) { pod.Finalizers = append(pod.Finalizers, "attacker/hold") }, "finalizers are immutable"},
+		{"extra owner reference", func(pod *corev1.Pod) {
+			pod.OwnerReferences = append(pod.OwnerReferences, metav1.OwnerReference{APIVersion: "v1", Kind: "Pod", Name: "sidecar", UID: "x"})
+		}, "identity is immutable"},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			changed := base()
+			test.mutate(changed)
+			response := handler.Handle(context.Background(), updateRequest(t, base(), changed, ""))
+			if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, test.want) {
+				t.Fatalf("%s response = %#v", test.name, response)
+			}
+		})
+	}
+
+	if response := handler.Handle(context.Background(), updateRequest(t, base(), base(), "")); !response.Allowed {
+		t.Fatalf("honest no-op supporting update denied: %#v", response.Result)
+	}
+}
+
+func TestMetadataValidatorDeniesNoncanonicalManagedIdentity(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	handler := NewMetadataValidator(testCodec(), scheme)
+	unmanaged := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "plain", Namespace: testWorkloadNS}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}}}
+	// A managed-looking identity with a noncanonical (non-four-digit) shard would
+	// read as managed to IsManagedPostgreSQLPod while dodging the canonical
+	// classifier; it must be denied at UPDATE.
+	malformed := unmanaged.DeepCopy()
+	malformed.Labels = map[string]string{
+		owned.ManagedByLabel: owned.ManagedByValue, owned.ComponentLabel: "postgresql",
+		owned.ClusterLabel: testClusterName, owned.ShardLabel: "1", owned.RoleLabel: "primary", owned.MemberLabel: "0",
+	}
+	malformed.Annotations = map[string]string{owned.PostgreSQLPodClusterUIDAnnotation: string(testClusterUID)}
+	malformed.Finalizers = []string{owned.PostgreSQLPodTerminationFinalizer}
+	if response := handler.Handle(context.Background(), updateRequest(t, unmanaged, malformed, "")); response.Allowed ||
+		!strings.Contains(response.Result.Message, "malformed identity") {
+		t.Fatalf("noncanonical managed identity accepted: %#v", response.Result)
+	}
+}
+
+func TestBindingValidatorRejectsSmuggledMetadata(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	pod := managedPod()
+	pod.Spec.NodeName = ""
+	pod.DeletionTimestamp = nil
+	delete(pod.Annotations, NodeUIDAnnotation)
+	delete(pod.Annotations, NodeBootIDAnnotation)
+	node := testNode("node-a", "node-uid-a", "boot-a")
+	cluster := managedClusterForPod(pod)
+	cluster.Spec.MembersPerShard = 3
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, node, cluster).Build()
+
+	base := func() *corev1.Binding {
+		return &corev1.Binding{
+			ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace, UID: pod.UID},
+			Target:     corev1.ObjectReference{Kind: "Node", Name: node.Name},
+		}
+	}
+	validate := func(binding *corev1.Binding) admission.Response {
+		request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+			Name: pod.Name, Namespace: pod.Namespace, Operation: admissionv1.Create, SubResource: "binding",
+			Object: runtime.RawExtension{Raw: marshalObject(t, binding)},
+		}}
+		return NewBindingValidator(reader, scheme).Handle(context.Background(), request)
+	}
+
+	if response := validate(base()); !response.Allowed {
+		t.Fatalf("honest member binding denied: %#v", response.Result)
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*corev1.Binding)
+		want   string
+	}{
+		{"smuggled label", func(binding *corev1.Binding) { binding.Labels = map[string]string{"attacker": "x"} }, "unexpected label"},
+		{"stamp override annotation", func(binding *corev1.Binding) {
+			binding.Annotations = map[string]string{owned.PodContractHashAnnotation: "forged"}
+		}, "unexpected annotation"},
+		{"forged node incarnation", func(binding *corev1.Binding) {
+			binding.Annotations = map[string]string{NodeUIDAnnotation: "forged-node"}
+		}, "Node incarnation"},
+		{"forged topology label", func(binding *corev1.Binding) {
+			binding.Labels = map[string]string{corev1.LabelTopologyZone: "attacker-zone"}
+		}, "topology label"},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			binding := base()
+			test.mutate(binding)
+			response := validate(binding)
+			if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, test.want) {
+				t.Fatalf("%s response = %#v", test.name, response)
+			}
+		})
 	}
 }

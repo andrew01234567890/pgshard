@@ -666,8 +666,14 @@ func TestBindingAdmissionAllowsNonPostgreSQLPgShardPods(t *testing.T) {
 					owned.ComponentLabel: component,
 					owned.ClusterLabel:   "example",
 				},
+				Annotations: map[string]string{owned.PostgreSQLPodClusterUIDAnnotation: "cluster-uid"},
 			}}
-			reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()
+			// Supporting pods are now bound through the class-aware path: they
+			// validate their cluster identity (and, when stamped, the Live
+			// contract), so the owning cluster and Node must be present.
+			cluster := &pgshardv1alpha1.PgShardCluster{ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "database", UID: "cluster-uid"}}
+			node := testNode("node-a", "node-uid-a", "boot-a")
+			reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, cluster, node).Build()
 			binding := &corev1.Binding{
 				ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace, UID: pod.UID},
 				Target:     corev1.ObjectReference{Kind: "Node", Name: "node-a"},

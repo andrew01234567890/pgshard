@@ -1,11 +1,17 @@
 package controller
 
 import (
+	"bufio"
+	"bytes"
+	"io"
 	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 
 	rbacv1 "k8s.io/api/rbac/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	yamlutil "k8s.io/apimachinery/pkg/util/yaml"
 	"sigs.k8s.io/yaml"
 )
 
@@ -208,38 +214,104 @@ func bindsManager(subjects []rbacv1.Subject) bool {
 	return false
 }
 
-func loadProjectRoles(t *testing.T) []projectRole {
+// discoverProjectRBAC renders every RBAC object reachable from both RBAC
+// kustomizations by recursively following their `resources` lists, so a Role,
+// ClusterRole, or binding added to either kustomization is automatically covered
+// without editing this test.
+func discoverProjectRBAC(t *testing.T) ([]projectRole, []projectBinding) {
 	t.Helper()
-	managerRole := readManifest[rbacv1.ClusterRole](t, "../../config/rbac/role.yaml")
-	configurationRole := readManifest[rbacv1.ClusterRole](t, "../../config/admission/rbac/configuration_role.yaml")
-	leaderRole := readManifest[rbacv1.Role](t, "../../config/rbac/leader_election_role.yaml")
-	certificateRole := readManifest[rbacv1.Role](t, "../../config/admission/rbac/certificate_role.yaml")
-	return []projectRole{
-		{"ClusterRole", managerRole.Name, managerRole.Rules, managerRole.AggregationRule},
-		{"ClusterRole", configurationRole.Name, configurationRole.Rules, configurationRole.AggregationRule},
-		{"Role", leaderRole.Name, leaderRole.Rules, nil},
-		{"Role", certificateRole.Name, certificateRole.Rules, nil},
+	var roles []projectRole
+	var bindings []projectBinding
+	seen := map[string]bool{}
+	var walk func(dir string)
+	walk = func(dir string) {
+		data, err := os.ReadFile(filepath.Join(dir, "kustomization.yaml"))
+		if err != nil {
+			t.Fatalf("read kustomization in %s: %v", dir, err)
+		}
+		var kustomization struct {
+			Resources []string `json:"resources"`
+		}
+		if err := yaml.Unmarshal(data, &kustomization); err != nil {
+			t.Fatalf("decode kustomization in %s: %v", dir, err)
+		}
+		for _, resource := range kustomization.Resources {
+			path := filepath.Clean(filepath.Join(dir, resource))
+			if seen[path] {
+				continue
+			}
+			seen[path] = true
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatalf("stat RBAC resource %s: %v", path, err)
+			}
+			if info.IsDir() {
+				walk(path)
+				continue
+			}
+			decodeRBACDocuments(t, path, &roles, &bindings)
+		}
+	}
+	walk("../../config/rbac")
+	walk("../../config/admission/rbac")
+	return roles, bindings
+}
+
+func decodeRBACDocuments(t *testing.T, path string, roles *[]projectRole, bindings *[]projectBinding) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read RBAC manifest %s: %v", path, err)
+	}
+	reader := yamlutil.NewYAMLReader(bufio.NewReader(bytes.NewReader(data)))
+	for {
+		document, err := reader.Read()
+		if err == io.EOF {
+			return
+		}
+		if err != nil {
+			t.Fatalf("read document in %s: %v", path, err)
+		}
+		if len(bytes.TrimSpace(document)) == 0 {
+			continue
+		}
+		var meta metav1.TypeMeta
+		if err := yaml.Unmarshal(document, &meta); err != nil {
+			t.Fatalf("decode kind in %s: %v", path, err)
+		}
+		switch meta.Kind {
+		case "ClusterRole":
+			var role rbacv1.ClusterRole
+			mustDecode(t, path, document, &role)
+			*roles = append(*roles, projectRole{"ClusterRole", role.Name, role.Rules, role.AggregationRule})
+		case "Role":
+			var role rbacv1.Role
+			mustDecode(t, path, document, &role)
+			*roles = append(*roles, projectRole{"Role", role.Name, role.Rules, nil})
+		case "ClusterRoleBinding":
+			var binding rbacv1.ClusterRoleBinding
+			mustDecode(t, path, document, &binding)
+			*bindings = append(*bindings, projectBinding{binding.RoleRef, binding.Subjects})
+		case "RoleBinding":
+			var binding rbacv1.RoleBinding
+			mustDecode(t, path, document, &binding)
+			*bindings = append(*bindings, projectBinding{binding.RoleRef, binding.Subjects})
+		default:
+			t.Fatalf("unexpected object kind %q in RBAC manifest %s", meta.Kind, path)
+		}
 	}
 }
 
-func loadProjectBindings(t *testing.T) []projectBinding {
+func mustDecode(t *testing.T, path string, document []byte, into any) {
 	t.Helper()
-	managerBinding := readManifest[rbacv1.ClusterRoleBinding](t, "../../config/rbac/role_binding.yaml")
-	configurationBinding := readManifest[rbacv1.ClusterRoleBinding](t, "../../config/admission/rbac/configuration_role_binding.yaml")
-	leaderBinding := readManifest[rbacv1.RoleBinding](t, "../../config/rbac/leader_election_role_binding.yaml")
-	certificateBinding := readManifest[rbacv1.RoleBinding](t, "../../config/admission/rbac/certificate_role_binding.yaml")
-	return []projectBinding{
-		{managerBinding.RoleRef, managerBinding.Subjects},
-		{configurationBinding.RoleRef, configurationBinding.Subjects},
-		{leaderBinding.RoleRef, leaderBinding.Subjects},
-		{certificateBinding.RoleRef, certificateBinding.Subjects},
+	if err := yaml.UnmarshalStrict(document, into); err != nil {
+		t.Fatalf("decode %s: %v", path, err)
 	}
 }
 
 func TestManagerRBACGrantsNoTokenOrImpersonationEscalation(t *testing.T) {
 	t.Parallel()
-	roles := loadProjectRoles(t)
-	bindings := loadProjectBindings(t)
+	roles, bindings := discoverProjectRBAC(t)
 
 	known := map[string]struct{}{}
 	byKindName := map[string]projectRole{}
