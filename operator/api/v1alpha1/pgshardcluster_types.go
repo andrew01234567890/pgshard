@@ -409,6 +409,72 @@ type PgShardClusterStatus struct {
 	// +listType=map
 	// +listMapKey=class
 	SupportingGenerations []SupportingGenerationStatus `json:"supportingGenerations,omitempty"`
+	// IsolationReceipt is the durable, namespace-UID-bound activation state
+	// machine that flips per-namespace isolation enforcement from the legacy
+	// pre-activation behavior (INACTIVE) to full deny-all enforcement (ACTIVE).
+	// It is absent until activation begins; while absent, admission behaves
+	// exactly as before activation.
+	IsolationReceipt *PostgreSQLIsolationReceipt `json:"isolationReceipt,omitempty"`
+}
+
+// IsolationPhase is the durable phase of a namespace's isolation activation.
+// +kubebuilder:validation:Enum=INACTIVE;ACTIVATING_QUIESCE;ACTIVATING_RECREATE;ACTIVE
+type IsolationPhase string
+
+const (
+	// IsolationInactive is the pre-activation phase: isolation is not enforced and
+	// admission behaves exactly as it did before activation (stampless and
+	// unclassified pods pass the legacy path).
+	IsolationInactive IsolationPhase = "INACTIVE"
+	// IsolationActivatingQuiesce freezes the namespace: every pod and workload
+	// create is denied while the reconciler seals every protected parent and
+	// drains in-flight creates.
+	IsolationActivatingQuiesce IsolationPhase = "ACTIVATING_QUIESCE"
+	// IsolationActivatingRecreate admits a create only if its controller-owner
+	// parent matches a sealed parent, while the reconciler deletes and
+	// controller-recreates every protected pod so each is authenticated at its
+	// guarded create.
+	IsolationActivatingRecreate IsolationPhase = "ACTIVATING_RECREATE"
+	// IsolationActive is full enforcement: every pod must carry a valid stamp,
+	// classify, and pass the full contract with digest pinning; any unknown,
+	// stampless, or unclassified pod is denied.
+	IsolationActive IsolationPhase = "ACTIVE"
+)
+
+// PostgreSQLIsolationReceipt is the durable per-namespace isolation activation
+// record. It is bound to the namespace UID so a recreated namespace cannot
+// inherit an activation, and it seals the exact parent identities admission
+// trusts during recreation.
+type PostgreSQLIsolationReceipt struct {
+	// +kubebuilder:validation:MinLength=1
+	NamespaceUID string         `json:"namespaceUID"`
+	Phase        IsolationPhase `json:"phase"`
+	// +kubebuilder:validation:Minimum=0
+	SecurityGeneration int64 `json:"securityGeneration,omitempty"`
+	// MinAcceptableSecurityGeneration is the isolation-level floor: once ACTIVE, a
+	// pod stamped below it is denied. It composes with (never lowers) the
+	// per-class SupportingGeneration barrier.
+	// +kubebuilder:validation:Minimum=0
+	MinAcceptableSecurityGeneration int64 `json:"minAcceptableSecurityGeneration,omitempty"`
+	// +kubebuilder:validation:Pattern=`^([0-9a-f]{64})?$`
+	ResidueProfileHash string `json:"residueProfileHash,omitempty"`
+	// SealedParents are the exact protected-parent identities admission accepts
+	// as create parents during ACTIVATING_RECREATE.
+	// +listType=atomic
+	SealedParents []SealedParent `json:"sealedParents,omitempty"`
+	ActivatedAt   metav1.Time    `json:"activatedAt,omitempty"`
+}
+
+// SealedParent is one protected parent workload sealed into the isolation
+// receipt at its exact API incarnation and contract hash.
+type SealedParent struct {
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+	// +kubebuilder:validation:MinLength=1
+	UID             string `json:"uid"`
+	ResourceVersion string `json:"resourceVersion,omitempty"`
+	// +kubebuilder:validation:Pattern=`^([0-9a-f]{64})?$`
+	ContractHash string `json:"contractHash,omitempty"`
 }
 
 // PostgreSQLMemberContractStatus binds one member StatefulSet's pod-template

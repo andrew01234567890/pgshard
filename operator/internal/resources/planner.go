@@ -6352,8 +6352,13 @@ func labels(cluster *pgshardv1alpha1.PgShardCluster, component string) map[strin
 	}
 }
 
+// componentSelector is the label selector shared by owned pod templates, their
+// StatefulSet/Deployment selectors, Services, and NetworkPolicy peers. It pins
+// the managed-by label so Service and NetworkPolicy selection cannot match a
+// foreign pod that merely borrows the cluster and component labels
+// (defense-in-depth for the network boundary).
 func componentSelector(cluster *pgshardv1alpha1.PgShardCluster, component string) map[string]string {
-	return map[string]string{ClusterLabel: cluster.Name, ComponentLabel: component}
+	return map[string]string{ManagedByLabel: ManagedByValue, ClusterLabel: cluster.Name, ComponentLabel: component}
 }
 
 func shardName(cluster string, shard int32) string {

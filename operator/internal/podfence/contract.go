@@ -103,7 +103,7 @@ func isManagedLooking(pod *corev1.Pod) bool {
 // managed pod: the creator must be the expected built-in controller, the pod
 // must belong to the live cluster, and its full normalized form must equal the
 // reconciler-stamped parent template plus a recomputed contract hash.
-func (v *PodCreateValidator) validatePodContract(ctx context.Context, request admission.Request, pod *corev1.Pod, kind contractPodKind, shard, member int32, clusterName string) *admission.Response {
+func (v *PodCreateValidator) validatePodContract(ctx context.Context, request admission.Request, pod *corev1.Pod, kind contractPodKind, shard, member int32, clusterName string, enforceDigestPin bool) *admission.Response {
 	creator := request.UserInfo.Username
 	switch kind {
 	case contractPodMember:
@@ -155,9 +155,9 @@ func (v *PodCreateValidator) validatePodContract(ctx context.Context, request ad
 		Member:      member,
 		Provenance:  provenance,
 	}
-	// enforceDigestPin is false until the activation stage pins protected image
-	// digests; the comparator still requires an exact normalized-contract match.
-	if err := owned.ComparePodToStampedTemplate(nc, pod.ObjectMeta, pod.Spec, template.ObjectMeta, template.Spec, owned.StageCreate, false); err != nil {
+	// enforceDigestPin is true only once isolation is ACTIVE; the comparator
+	// always requires an exact normalized-contract match either way.
+	if err := owned.ComparePodToStampedTemplate(nc, pod.ObjectMeta, pod.Spec, template.ObjectMeta, template.Spec, owned.StageCreate, enforceDigestPin); err != nil {
 		return deniedf("managed Pod does not match its stamped contract: %v", err)
 	}
 
@@ -348,7 +348,7 @@ func resolveStampedParent(ctx context.Context, reader client.Reader, namespace s
 // projection to normalize exactly equal to the pod's stamped parent template.
 // A pod that carries no reconciler stamp is left to the pre-activation legacy
 // path (nil). The pre-bind pod must carry no node residue of its own.
-func validateBoundPodContract(ctx context.Context, reader client.Reader, pod *corev1.Pod, node *corev1.Node, cluster *pgshardv1alpha1.PgShardCluster) *admission.Response {
+func validateBoundPodContract(ctx context.Context, reader client.Reader, pod *corev1.Pod, node *corev1.Node, cluster *pgshardv1alpha1.PgShardCluster, enforceDigestPin bool) *admission.Response {
 	if pod.Annotations[owned.PodContractHashAnnotation] == "" {
 		return nil
 	}
@@ -395,7 +395,7 @@ func validateBoundPodContract(ctx context.Context, reader client.Reader, pod *co
 		Provenance:  provenance,
 		Binding:     evidence,
 	}
-	if err := owned.ComparePodToStampedTemplate(nc, bound.ObjectMeta, bound.Spec, template.ObjectMeta, template.Spec, owned.StageLive, false); err != nil {
+	if err := owned.ComparePodToStampedTemplate(nc, bound.ObjectMeta, bound.Spec, template.ObjectMeta, template.Spec, owned.StageLive, enforceDigestPin); err != nil {
 		return deniedf("bound managed Pod does not match its stamped contract: %v", err)
 	}
 	want := template.Annotations[owned.PodContractHashAnnotation]
@@ -458,6 +458,19 @@ func NewWorkloadIntegrityValidator(reader client.Reader, identities ControllerId
 func (v *WorkloadIntegrityValidator) Handle(ctx context.Context, request admission.Request) admission.Response {
 	if request.Operation != admissionv1.Create && request.Operation != admissionv1.Update {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("unexpected workload integrity request %s", request.Operation))
+	}
+	if request.Operation == admissionv1.Create {
+		receipt, err := namespaceIsolationReceipt(ctx, v.reader, request.Namespace)
+		if err != nil {
+			return admission.Errored(http.StatusInternalServerError, err)
+		}
+		// During QUIESCE the namespace is frozen: no new workload may be created
+		// while the reconciler seals parents and drains. RECREATE deliberately
+		// still allows the CAS-roll ReplicaSet create (subject to the usual
+		// authorship checks below) so supporting pods can be re-authenticated.
+		if isolationPhase(receipt) == pgshardv1alpha1.IsolationActivatingQuiesce {
+			return admission.Denied("namespace isolation is quiescing; workload creation is frozen")
+		}
 	}
 	if request.SubResource == "scale" {
 		return v.handleScale(ctx, request)

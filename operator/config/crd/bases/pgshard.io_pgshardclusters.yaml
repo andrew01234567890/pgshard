@@ -550,6 +550,76 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              isolationReceipt:
+                description: |-
+                  IsolationReceipt is the durable, namespace-UID-bound activation state
+                  machine that flips per-namespace isolation enforcement from the legacy
+                  pre-activation behavior (INACTIVE) to full deny-all enforcement (ACTIVE).
+                  It is absent until activation begins; while absent, admission behaves
+                  exactly as before activation.
+                properties:
+                  activatedAt:
+                    format: date-time
+                    type: string
+                  minAcceptableSecurityGeneration:
+                    description: |-
+                      MinAcceptableSecurityGeneration is the isolation-level floor: once ACTIVE, a
+                      pod stamped below it is denied. It composes with (never lowers) the
+                      per-class SupportingGeneration barrier.
+                    format: int64
+                    minimum: 0
+                    type: integer
+                  namespaceUID:
+                    minLength: 1
+                    type: string
+                  phase:
+                    description: IsolationPhase is the durable phase of a namespace's
+                      isolation activation.
+                    enum:
+                    - INACTIVE
+                    - ACTIVATING_QUIESCE
+                    - ACTIVATING_RECREATE
+                    - ACTIVE
+                    type: string
+                  residueProfileHash:
+                    pattern: ^([0-9a-f]{64})?$
+                    type: string
+                  sealedParents:
+                    description: |-
+                      SealedParents are the exact protected-parent identities admission accepts
+                      as create parents during ACTIVATING_RECREATE.
+                    items:
+                      description: |-
+                        SealedParent is one protected parent workload sealed into the isolation
+                        receipt at its exact API incarnation and contract hash.
+                      properties:
+                        contractHash:
+                          pattern: ^([0-9a-f]{64})?$
+                          type: string
+                        kind:
+                          type: string
+                        name:
+                          type: string
+                        resourceVersion:
+                          type: string
+                        uid:
+                          minLength: 1
+                          type: string
+                      required:
+                      - kind
+                      - name
+                      - uid
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  securityGeneration:
+                    format: int64
+                    minimum: 0
+                    type: integer
+                required:
+                - namespaceUID
+                - phase
+                type: object
               observedGeneration:
                 format: int64
                 type: integer

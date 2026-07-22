@@ -343,6 +343,11 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		statusErr := r.reportFailure(ctx, cluster, "GenerationAdvanceFailed", fmt.Sprintf("cannot advance supporting generations: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
+	isolationActivating, err := r.reconcileIsolationActivation(ctx, cluster)
+	if err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "IsolationActivationFailed", fmt.Sprintf("cannot reconcile namespace isolation activation: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
 	cleaningRetiredCoordinationStorage, err := r.cleanupRetiredEtcdStorage(ctx, cluster)
 	if err != nil {
 		statusErr := r.reportFailure(ctx, cluster, "CoordinationMigrationFailed", fmt.Sprintf("retired etcd storage cleanup failed: %v", err))
@@ -369,9 +374,9 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		}
 		return ctrl.Result{}, err
 	}
-	if supportingRolling {
-		// A supporting-generation roll (bind, drain, or convergence) is in
-		// progress; requeue so the compare-and-set state machine advances.
+	if supportingRolling || isolationActivating {
+		// A supporting-generation roll or an isolation-activation phase transition
+		// is in progress; requeue so the state machine advances.
 		return ctrl.Result{RequeueAfter: retryDelay}, nil
 	}
 	if !available {

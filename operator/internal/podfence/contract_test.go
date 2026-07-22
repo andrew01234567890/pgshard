@@ -624,33 +624,33 @@ func TestValidateBoundPodContractProjectsNodeEvidence(t *testing.T) {
 		return pod
 	}
 
-	if response := validateBoundPodContract(context.Background(), reader, prebind(), node, cluster); response != nil {
+	if response := validateBoundPodContract(context.Background(), reader, prebind(), node, cluster, false); response != nil {
 		t.Fatalf("honest pre-bind pod rejected at bind: %#v", response.Result)
 	}
 
 	stampless := prebind()
 	delete(stampless.Annotations, owned.PodContractHashAnnotation)
-	if response := validateBoundPodContract(context.Background(), reader, stampless, node, cluster); response != nil {
+	if response := validateBoundPodContract(context.Background(), reader, stampless, node, cluster, false); response != nil {
 		t.Fatalf("stampless pod rejected before activation: %#v", response.Result)
 	}
 
 	forgedResidue := prebind()
 	forgedResidue.Annotations[NodeUIDAnnotation] = "forged-node"
-	if response := validateBoundPodContract(context.Background(), reader, forgedResidue, node, cluster); response == nil ||
+	if response := validateBoundPodContract(context.Background(), reader, forgedResidue, node, cluster, false); response == nil ||
 		!strings.Contains(response.Result.Message, "node identity residue before it is bound") {
 		t.Fatalf("pre-bind node residue accepted: %#v", response)
 	}
 
 	forgedTopology := prebind()
 	forgedTopology.Labels[corev1.LabelTopologyZone] = "attacker-zone"
-	if response := validateBoundPodContract(context.Background(), reader, forgedTopology, node, cluster); response == nil ||
+	if response := validateBoundPodContract(context.Background(), reader, forgedTopology, node, cluster, false); response == nil ||
 		!strings.Contains(response.Result.Message, "topology label before it is bound") {
 		t.Fatalf("pre-bind topology label accepted: %#v", response)
 	}
 
 	drift := prebind()
 	drift.Spec.Containers[0].Image = "attacker/backdoor:latest"
-	if response := validateBoundPodContract(context.Background(), reader, drift, node, cluster); response == nil ||
+	if response := validateBoundPodContract(context.Background(), reader, drift, node, cluster, false); response == nil ||
 		!strings.Contains(response.Result.Message, "does not match its stamped contract") {
 		t.Fatalf("drifted bound pod accepted: %#v", response)
 	}
@@ -1008,5 +1008,159 @@ func TestValidateSupportingSecurityFloor(t *testing.T) {
 		if err := validateSupportingSecurityFloor(spec); err == nil {
 			t.Fatalf("%s host surface accepted by the security floor", name)
 		}
+	}
+}
+
+func isolationReceiptCluster(phase pgshardv1alpha1.IsolationPhase, sealed ...pgshardv1alpha1.SealedParent) *pgshardv1alpha1.PgShardCluster {
+	cluster := testWorkloadCluster()
+	cluster.Status.IsolationReceipt = &pgshardv1alpha1.PostgreSQLIsolationReceipt{
+		NamespaceUID: "ns-uid", Phase: phase, SealedParents: sealed,
+	}
+	return cluster
+}
+
+func supportingCreateFixture(t *testing.T, cluster *pgshardv1alpha1.PgShardCluster) (client.Object, client.Object, *corev1.Pod) {
+	t.Helper()
+	controller := true
+	deployment := poolerDeploymentFixture(t)
+	replicaSet := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "example-pooler-77abcde", Namespace: testWorkloadNS, UID: "pooler-rs-uid",
+			Labels:          map[string]string{podTemplateHashLabel: "77abcde"},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: deployment.Name, UID: deployment.UID, Controller: &controller}},
+		},
+		Spec: appsv1.ReplicaSetSpec{Template: *deployment.Spec.Template.DeepCopy()},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "example-pooler-77abcde-xyz", Namespace: testWorkloadNS,
+			Labels: map[string]string{
+				owned.ClusterLabel: testClusterName, owned.ComponentLabel: "pooler", podTemplateHashLabel: "77abcde",
+			},
+			Annotations:     map[string]string{},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: replicaSet.Name, UID: replicaSet.UID, Controller: &controller}},
+		},
+		Spec: *deployment.Spec.Template.Spec.DeepCopy(),
+	}
+	for key, value := range deployment.Spec.Template.Annotations {
+		pod.Annotations[key] = value
+	}
+	return deployment, replicaSet, pod
+}
+
+func supportingCreateRequest(t *testing.T, pod *corev1.Pod) admission.Request {
+	t.Helper()
+	return admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Name: pod.Name, Namespace: testWorkloadNS, Operation: admissionv1.Create,
+		Object:   runtime.RawExtension{Raw: marshalObject(t, pod)},
+		UserInfo: authenticationv1.UserInfo{Username: testControllerIdentities().ReplicaSetController},
+	}}
+}
+
+func TestPodCreateIsolationQuiesceFreezesEveryCreate(t *testing.T) {
+	t.Parallel()
+	scheme := workloadScheme(t)
+	cluster := isolationReceiptCluster(pgshardv1alpha1.IsolationActivatingQuiesce)
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster).Build()
+	validator := NewPodCreateValidator(reader, testControllerIdentities(), scheme)
+
+	foreign := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "sql-client", Namespace: testWorkloadNS}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "psql"}}}}
+	request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Name: foreign.Name, Namespace: testWorkloadNS, Operation: admissionv1.Create,
+		Object:   runtime.RawExtension{Raw: marshalObject(t, foreign)},
+		UserInfo: authenticationv1.UserInfo{Username: testControllerIdentities().StatefulSetController},
+	}}
+	if response := validator.Handle(context.Background(), request); response.Allowed ||
+		!strings.Contains(response.Result.Message, "quiescing") {
+		t.Fatalf("quiesce did not freeze a controller-created Pod: %#v", response)
+	}
+}
+
+func TestPodCreateIsolationActiveDenyAll(t *testing.T) {
+	t.Parallel()
+	scheme := workloadScheme(t)
+
+	// Unmanaged foreign pod is denied under an ACTIVE receipt.
+	cluster := isolationReceiptCluster(pgshardv1alpha1.IsolationActive)
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster).Build()
+	validator := NewPodCreateValidator(reader, testControllerIdentities(), scheme)
+	foreign := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "sql-client", Namespace: testWorkloadNS}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "psql"}}}}
+	request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Name: foreign.Name, Namespace: testWorkloadNS, Operation: admissionv1.Create,
+		Object: runtime.RawExtension{Raw: marshalObject(t, foreign)},
+	}}
+	if response := validator.Handle(context.Background(), request); response.Allowed ||
+		!strings.Contains(response.Result.Message, "classified managed") {
+		t.Fatalf("active isolation admitted an unmanaged Pod: %#v", response)
+	}
+
+	// A stampless managed supporting pod is denied (stamp mandatory under ACTIVE).
+	stampless := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "example-pooler-x", Namespace: testWorkloadNS,
+			Labels: map[string]string{owned.ClusterLabel: testClusterName, owned.ComponentLabel: "pooler"},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "pooler"}}},
+	}
+	if response := validator.Handle(context.Background(), supportingCreateRequest(t, stampless)); response.Allowed ||
+		!strings.Contains(response.Result.Message, "must carry the reconciler stamp") {
+		t.Fatalf("active isolation admitted a stampless managed Pod: %#v", response)
+	}
+}
+
+func TestPodCreateIsolationActiveEnforcesDigestPin(t *testing.T) {
+	t.Parallel()
+	scheme := workloadScheme(t)
+	cluster := isolationReceiptCluster(pgshardv1alpha1.IsolationActive)
+	deployment, replicaSet, pod := supportingCreateFixture(t, cluster)
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, deployment, replicaSet).Build()
+	validator := NewPodCreateValidator(reader, testControllerIdentities(), scheme)
+
+	// The honest fixture image is tag-pinned; under ACTIVE digest pinning is
+	// enforced, so it is denied.
+	if response := validator.Handle(context.Background(), supportingCreateRequest(t, pod)); response.Allowed ||
+		!strings.Contains(response.Result.Message, "digest-pinned") {
+		t.Fatalf("active isolation admitted a tag-pinned image: %#v", response)
+	}
+
+	// The same pod is admitted when isolation is not active.
+	inactiveCluster := testWorkloadCluster()
+	inactiveReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(inactiveCluster, deployment, replicaSet).Build()
+	inactiveValidator := NewPodCreateValidator(inactiveReader, testControllerIdentities(), scheme)
+	if response := inactiveValidator.Handle(context.Background(), supportingCreateRequest(t, pod)); !response.Allowed {
+		t.Fatalf("inactive isolation denied an honest supporting Pod: %#v", response.Result)
+	}
+}
+
+func TestPodCreateIsolationRecreateRequiresSealedParent(t *testing.T) {
+	t.Parallel()
+	scheme := workloadScheme(t)
+	sealedCluster := isolationReceiptCluster(pgshardv1alpha1.IsolationActivatingRecreate, pgshardv1alpha1.SealedParent{Kind: "Deployment", UID: "pooler-deploy-uid"})
+	deployment, replicaSet, pod := supportingCreateFixture(t, sealedCluster)
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sealedCluster, deployment, replicaSet).Build()
+	if response := NewPodCreateValidator(reader, testControllerIdentities(), scheme).Handle(context.Background(), supportingCreateRequest(t, pod)); !response.Allowed {
+		t.Fatalf("recreate denied a sealed-parent Pod: %#v", response.Result)
+	}
+
+	// A receipt that seals a different Deployment denies this pod's create.
+	unsealedCluster := isolationReceiptCluster(pgshardv1alpha1.IsolationActivatingRecreate, pgshardv1alpha1.SealedParent{Kind: "Deployment", UID: "some-other-deploy"})
+	unsealedReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(unsealedCluster, deployment, replicaSet).Build()
+	if response := NewPodCreateValidator(unsealedReader, testControllerIdentities(), scheme).Handle(context.Background(), supportingCreateRequest(t, pod)); response.Allowed ||
+		!strings.Contains(response.Result.Message, "sealed parent") {
+		t.Fatalf("recreate admitted an unsealed-parent Pod: %#v", response)
+	}
+}
+
+func TestWorkloadIntegrityQuiesceFreezesWorkloadCreate(t *testing.T) {
+	t.Parallel()
+	scheme := workloadScheme(t)
+	cluster := isolationReceiptCluster(pgshardv1alpha1.IsolationActivatingQuiesce)
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster).Build()
+	validator := NewWorkloadIntegrityValidator(reader, testControllerIdentities(), scheme)
+	statefulSet := stampedMemberStatefulSet(t)
+	request := workloadRequest(t, statefulSet, "statefulsets", "", statefulSet.Name, testControllerIdentities().Operator, admissionv1.Create)
+	if response := validator.Handle(context.Background(), request); response.Allowed ||
+		!strings.Contains(response.Result.Message, "quiescing") {
+		t.Fatalf("quiesce did not freeze a workload create: %#v", response)
 	}
 }

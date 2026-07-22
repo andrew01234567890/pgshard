@@ -168,11 +168,24 @@ func (v *BindingValidator) Handle(ctx context.Context, request admission.Request
 	if response != nil {
 		return *response
 	}
+	receipt, err := namespaceIsolationReceipt(ctx, v.reader, request.Namespace)
+	if err != nil {
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+	active := isolationPhase(receipt) == pgshardv1alpha1.IsolationActive
+	if active && evidence.pod.Annotations[owned.PodContractHashAnnotation] == "" {
+		return admission.Denied("namespace isolation is active; every managed Pod must carry the reconciler stamp before binding")
+	}
 	if response := validateBindingMetadata(binding, evidence); response != nil {
 		return *response
 	}
-	if response := validateBoundPodContract(ctx, v.reader, evidence.pod, evidence.node, evidence.cluster); response != nil {
+	if response := validateBoundPodContract(ctx, v.reader, evidence.pod, evidence.node, evidence.cluster, active); response != nil {
 		return *response
+	}
+	if active {
+		if response := enforceIsolationGenerationFloor(evidence.pod, receipt); response != nil {
+			return *response
+		}
 	}
 	return admission.Allowed("final Pod binding preserves the PostgreSQL Pod and Node identities")
 }
@@ -368,9 +381,32 @@ func (v *PodCreateValidator) Handle(ctx context.Context, request admission.Reque
 	if err := v.decoder.Decode(request, pod); err != nil {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode created Pod: %w", err))
 	}
+	receipt, err := namespaceIsolationReceipt(ctx, v.reader, request.Namespace)
+	if err != nil {
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+	phase := isolationPhase(receipt)
+	if phase == pgshardv1alpha1.IsolationActivatingQuiesce {
+		// The namespace is quiescing: every pod create is frozen, including
+		// trusted controllers, so the parent seal + drain is race-free.
+		return admission.Denied("namespace isolation is quiescing; Pod creation is frozen")
+	}
+	if phase == pgshardv1alpha1.IsolationActivatingRecreate {
+		sealed, err := podControllerParentSealed(ctx, v.reader, pod, receipt)
+		if err != nil {
+			return admission.Errored(http.StatusInternalServerError, err)
+		}
+		if !sealed {
+			return admission.Denied("namespace isolation is recreating; only pods of a sealed parent may be created")
+		}
+	}
+	active := phase == pgshardv1alpha1.IsolationActive
 	kind, shard, member, clusterName := classifyContractPod(pod)
 	switch kind {
 	case contractPodUnmanaged:
+		if active {
+			return admission.Denied("namespace isolation is active; every Pod must be a classified managed PostgreSQL Pod")
+		}
 		if isPotentialManagedPostgreSQLPod(pod) {
 			return admission.Denied("managed PostgreSQL Pod has incomplete identity or an unrecognized composition")
 		}
@@ -387,9 +423,12 @@ func (v *PodCreateValidator) Handle(ctx context.Context, request admission.Reque
 		}
 	}
 	// The canonical contract is enforced whenever the reconciler's stamp is
-	// present; requiring the stamp on every managed pod is the activation
-	// stage's job (deferred), so a stampless pod keeps the legacy behavior.
+	// present. Under an ACTIVE receipt the stamp is mandatory (deny-all closes
+	// the stamp-gating seam); otherwise a stampless pod keeps the legacy path.
 	if pod.Annotations[owned.PodContractHashAnnotation] == "" {
+		if active {
+			return admission.Denied("namespace isolation is active; every managed Pod must carry the reconciler stamp")
+		}
 		return admission.Allowed("managed PostgreSQL Pod creation matches its PgShardCluster contract")
 	}
 	if err := decodeStrictObject(request.Object.Raw, &corev1.Pod{}); err != nil {
@@ -399,10 +438,31 @@ func (v *PodCreateValidator) Handle(ctx context.Context, request admission.Reque
 		return admission.Denied("managed Pod namespace does not match the request namespace")
 	}
 	pod.Namespace = request.Namespace
-	if response := v.validatePodContract(ctx, request, pod, kind, shard, member, clusterName); response != nil {
+	if response := v.validatePodContract(ctx, request, pod, kind, shard, member, clusterName, active); response != nil {
 		return *response
 	}
+	if active {
+		if response := enforceIsolationGenerationFloor(pod, receipt); response != nil {
+			return *response
+		}
+	}
 	return admission.Allowed("managed PostgreSQL Pod creation matches its PgShardCluster contract")
+}
+
+// enforceIsolationGenerationFloor denies a stamped pod whose security generation
+// is below the isolation receipt's MinAcceptableSecurityGeneration. This is the
+// isolation-level floor; it composes with (never lowers) the per-class
+// SupportingGeneration barrier already applied inside the contract validation.
+func enforceIsolationGenerationFloor(pod *corev1.Pod, receipt *pgshardv1alpha1.PostgreSQLIsolationReceipt) *admission.Response {
+	if receipt == nil || receipt.MinAcceptableSecurityGeneration <= 0 {
+		return nil
+	}
+	generation, ok := canonicalSecurityGeneration(pod.Annotations[owned.PodSecurityGenerationAnnotation])
+	if !ok || generation < receipt.MinAcceptableSecurityGeneration {
+		response := admission.Denied(fmt.Sprintf("managed Pod security generation is below the isolation floor %d", receipt.MinAcceptableSecurityGeneration))
+		return &response
+	}
+	return nil
 }
 
 func protectedBindingLabels() [6]string {
