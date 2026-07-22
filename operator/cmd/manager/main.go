@@ -51,6 +51,9 @@ type webhookCommandOptions struct {
 	mutatingConfigurationName   string
 	validatingConfigurationName string
 	certificateDirectory        string
+	statefulSetControllerName   string
+	replicaSetControllerName    string
+	deploymentControllerName    string
 }
 
 func bindCommandFlags(flags *flag.FlagSet) *commandOptions {
@@ -68,6 +71,9 @@ func bindCommandFlags(flags *flag.FlagSet) *commandOptions {
 	flags.StringVar(&options.webhook.mutatingConfigurationName, "webhook-mutating-configuration-name", "pgshard-mutating-webhook-configuration", "mutating webhook configuration name")
 	flags.StringVar(&options.webhook.validatingConfigurationName, "webhook-validating-configuration-name", "pgshard-validating-webhook-configuration", "validating webhook configuration name")
 	flags.StringVar(&options.webhook.certificateDirectory, "webhook-cert-dir", "/tmp/k8s-webhook-server/serving-certs", "private directory for generated webhook certificate files")
+	flags.StringVar(&options.webhook.statefulSetControllerName, "statefulset-controller-identity", "system:serviceaccount:kube-system:statefulset-controller", "authenticated username of the built-in StatefulSet controller that creates managed member pods")
+	flags.StringVar(&options.webhook.replicaSetControllerName, "replicaset-controller-identity", "system:serviceaccount:kube-system:replicaset-controller", "authenticated username of the built-in ReplicaSet controller that creates managed supporting pods")
+	flags.StringVar(&options.webhook.deploymentControllerName, "deployment-controller-identity", "system:serviceaccount:kube-system:deployment-controller", "authenticated username of the built-in Deployment controller that creates managed supporting ReplicaSets")
 	flags.StringVar(&options.images.Orchestrator, "orchestrator-image", options.images.Orchestrator, "pgshard orchestrator image reference")
 	flags.StringVar(&options.images.Pooler, "pooler-image", options.images.Pooler, "pgshard pooler image reference")
 	flags.StringVar(&options.images.PostgreSQL, "postgresql-image", options.images.PostgreSQL, "PostgreSQL 18 image reference")
@@ -138,6 +144,12 @@ func main() {
 	}
 	if options.webhookEnabled {
 		handshakeCodec := podfence.NewSecretHandshakeCodec(manager.GetAPIReader(), receiptKey)
+		controllerIdentities := podfence.ControllerIdentities{
+			Operator:              "system:serviceaccount:" + options.webhook.namespace + ":pgshard-controller-manager",
+			StatefulSetController: options.webhook.statefulSetControllerName,
+			ReplicaSetController:  options.webhook.replicaSetControllerName,
+			DeploymentController:  options.webhook.deploymentControllerName,
+		}
 		if err := ctrl.NewWebhookManagedBy(manager, &pgshardv1alpha1.PgShardCluster{}).
 			WithDefaulter(&pgshardv1alpha1.PgShardClusterDefaulter{}).
 			WithValidator(&pgshardv1alpha1.PgShardClusterValidator{
@@ -178,7 +190,10 @@ func main() {
 			Handler: podfence.NewMetadataValidator(handshakeCodec, scheme),
 		})
 		webhookServer.Register(podfence.PodCreateWebhookPath, &admission.Webhook{
-			Handler: podfence.NewPodCreateValidator(manager.GetAPIReader(), scheme),
+			Handler: podfence.NewPodCreateValidator(manager.GetAPIReader(), controllerIdentities, scheme),
+		})
+		webhookServer.Register(podfence.WorkloadWebhookPath, &admission.Webhook{
+			Handler: podfence.NewWorkloadIntegrityValidator(manager.GetAPIReader(), controllerIdentities, scheme),
 		})
 		webhookServer.Register(podfence.StatusValidationWebhookPath, &admission.Webhook{
 			Handler: podfence.NewStatusValidator(manager.GetAPIReader(), handshakeCodec, scheme),

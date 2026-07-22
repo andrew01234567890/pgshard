@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	cbor "github.com/fxamacker/cbor/v2"
@@ -450,6 +451,39 @@ func normalizeContractSpec(nc NormContext, spec *corev1.PodSpec, mode normMode) 
 
 func isMemberClass(class PodClass) bool {
 	return class == ClassSource || class == ClassStandby || class == ClassSingleMember
+}
+
+// IsMemberClass reports whether a class is a PostgreSQL member (as opposed to a
+// supporting pooler/orchestrator).
+func IsMemberClass(class PodClass) bool {
+	return isMemberClass(class)
+}
+
+// ClassForMember maps a member ordinal to its protected pod class. A
+// single-member topology is the serving single-member class; multi-member
+// member zero is the replication source, and every nonzero member is a standby.
+func ClassForMember(membersPerShard, member int32) PodClass {
+	if membersPerShard == 1 {
+		return ClassSingleMember
+	}
+	if member == 0 {
+		return ClassSource
+	}
+	return ClassStandby
+}
+
+// ParseIdentityLabel parses a fixed-width zero-padded shard or member ordinal
+// label. It returns false for any value that is not exactly four digits of a
+// non-negative int32.
+func ParseIdentityLabel(value string) (int32, bool) {
+	if len(value) != 4 {
+		return 0, false
+	}
+	parsed, err := strconv.ParseInt(value, 10, 32)
+	if err != nil || parsed < 0 {
+		return 0, false
+	}
+	return int32(parsed), true
 }
 
 func normalizeOrdinalIdentity(nc NormContext, spec *corev1.PodSpec, mode normMode) error {

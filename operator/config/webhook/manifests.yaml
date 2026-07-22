@@ -283,3 +283,31 @@ webhooks:
     - pods/status
   sideEffects: None
   timeoutSeconds: 5
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-apps-v1-postgresqlworkload
+      port: 9444
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  name: vpostgresqlworkload.pgshard.io
+  rules:
+  - apiGroups:
+    - apps
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - statefulsets
+    - deployments
+    - replicasets
+    - statefulsets/scale
+    - deployments/scale
+    - replicasets/scale
+  sideEffects: None
+  timeoutSeconds: 5

@@ -1082,7 +1082,7 @@ func TestBootstrapRefusesUnmanagedOrMalformedState(t *testing.T) {
 					return webhook.Name == restoreWebhookName
 				})
 			},
-			want: "want exactly eight",
+			want: "want exactly nine",
 		},
 	}
 	for _, test := range tests {
@@ -1372,6 +1372,14 @@ func installObjects() []client.Object {
 	bindingValidating.NamespaceSelector = podFencingNamespaceSelector()
 	podCreateValidating := validatingWebhook(podfence.PodCreateWebhookName, podfence.PodCreateWebhookPath, coreResourceRules(admissionregistrationv1.Create, "pods"))
 	podCreateValidating.NamespaceSelector = podFencingNamespaceSelector()
+	workloadValidating := validatingWebhook(podfence.WorkloadWebhookName, podfence.WorkloadWebhookPath, []admissionregistrationv1.RuleWithOperations{{
+		Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update},
+		Rule: admissionregistrationv1.Rule{
+			APIGroups: []string{"apps"}, APIVersions: []string{"v1"},
+			Resources: []string{"statefulsets", "deployments", "replicasets", "statefulsets/scale", "deployments/scale", "replicasets/scale"}, Scope: &scope,
+		},
+	}})
+	workloadValidating.NamespaceSelector = podFencingNamespaceSelector()
 	return []client.Object{
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testCASecretName, Labels: managedLabels}, Type: corev1.SecretTypeOpaque},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testServingSecretName, Labels: managedLabels}, Type: corev1.SecretTypeOpaque},
@@ -1381,7 +1389,7 @@ func installObjects() []client.Object {
 		},
 		&admissionregistrationv1.ValidatingWebhookConfiguration{
 			ObjectMeta: metav1.ObjectMeta{Name: testValidatingConfigurationName},
-			Webhooks:   []admissionregistrationv1.ValidatingWebhook{catalogActivationValidating, clusterValidating, restoreValidating, metadataValidating, namespaceValidating, statusValidating, bindingValidating, podCreateValidating},
+			Webhooks:   []admissionregistrationv1.ValidatingWebhook{catalogActivationValidating, clusterValidating, restoreValidating, metadataValidating, namespaceValidating, statusValidating, bindingValidating, podCreateValidating, workloadValidating},
 		},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{
 			Namespace: testNamespace,
@@ -1553,7 +1561,7 @@ func assertInjectedBundles(t *testing.T, kubeClient client.Client, wanted []byte
 	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: testValidatingConfigurationName}, validating); err != nil {
 		t.Fatal(err)
 	}
-	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 8 {
+	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 9 {
 		t.Fatalf("CA bundles were not injected: mutating=%#v validating=%#v", mutating.Webhooks, validating.Webhooks)
 	}
 	for _, webhook := range mutating.Webhooks {

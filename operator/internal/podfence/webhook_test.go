@@ -388,7 +388,7 @@ func TestPodCreateAdmissionEnforcesManagedPodContract(t *testing.T) {
 		request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
 			Name: pod.Name, Namespace: pod.Namespace, Operation: admissionv1.Create, Object: runtime.RawExtension{Raw: marshalObject(t, pod)},
 		}}
-		return NewPodCreateValidator(reader, scheme).Handle(context.Background(), request)
+		return NewPodCreateValidator(reader, testControllerIdentities(), scheme).Handle(context.Background(), request)
 	}
 	bindablePod := func(pod *corev1.Pod) *corev1.Pod {
 		pod.Spec.NodeName = ""

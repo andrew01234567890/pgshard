@@ -126,12 +126,13 @@ func TestAdmissionResourcesArePrecreatedAndExactlyScoped(t *testing.T) {
 		t.Fatalf("mutating webhook selector patch = %#v", mutatingSelectors.Webhooks)
 	}
 	validatingSelectors := readManifest[admissionregistrationv1.ValidatingWebhookConfiguration](t, "../../config/webhook/validating_selectors_patch.yaml")
-	if len(validatingSelectors.Webhooks) != 5 ||
+	if len(validatingSelectors.Webhooks) != 6 ||
 		validatingSelectors.Webhooks[0].Name != podfence.MetadataWebhookName || !selectsManagedPostgreSQL(validatingSelectors.Webhooks[0].ObjectSelector) ||
 		validatingSelectors.Webhooks[1].Name != podfence.NamespaceWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[1].ObjectSelector) ||
 		validatingSelectors.Webhooks[2].Name != podfence.StatusValidationWebhookName || !selectsManagedPostgreSQL(validatingSelectors.Webhooks[2].ObjectSelector) ||
 		validatingSelectors.Webhooks[3].Name != podfence.BindingValidationWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[3].NamespaceSelector) ||
-		validatingSelectors.Webhooks[4].Name != podfence.PodCreateWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[4].NamespaceSelector) {
+		validatingSelectors.Webhooks[4].Name != podfence.PodCreateWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[4].NamespaceSelector) ||
+		validatingSelectors.Webhooks[5].Name != podfence.WorkloadWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[5].NamespaceSelector) {
 		t.Fatalf("validating webhook selector patch = %#v", validatingSelectors.Webhooks)
 	}
 }
@@ -156,7 +157,7 @@ func TestGeneratedWebhookConfigurationsStayFailClosedAndBounded(t *testing.T) {
 	if err := decoder.Decode(&extra); err != io.EOF {
 		t.Fatalf("unexpected third webhook manifest: %v", err)
 	}
-	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 8 {
+	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 9 {
 		t.Fatalf("generated webhooks = %#v / %#v", mutating.Webhooks, validating.Webhooks)
 	}
 	activationFound := false

@@ -96,6 +96,7 @@ type PgShardClusterReconciler struct {
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
@@ -3309,7 +3310,7 @@ func planWorkloadContractTarget(cluster *pgshardv1alpha1.PgShardCluster, object 
 		if !shardOK || !memberOK {
 			return "", 0, 0, nil, false
 		}
-		class := ClassForMember(cluster.Spec.MembersPerShard, member)
+		class := owned.ClassForMember(cluster.Spec.MembersPerShard, member)
 		return class, shard, member, &workload.Spec.Template, true
 	case *appsv1.Deployment:
 		switch workload.Labels[owned.ComponentLabel] {
@@ -3320,19 +3321,6 @@ func planWorkloadContractTarget(cluster *pgshardv1alpha1.PgShardCluster, object 
 		}
 	}
 	return "", 0, 0, nil, false
-}
-
-// ClassForMember maps a member ordinal to its protected pod class. A
-// single-member topology is the serving single-member class; multi-member
-// member zero is the replication source, and every nonzero member is a standby.
-func ClassForMember(membersPerShard, member int32) owned.PodClass {
-	if membersPerShard == 1 {
-		return owned.ClassSingleMember
-	}
-	if member == 0 {
-		return owned.ClassSource
-	}
-	return owned.ClassStandby
 }
 
 func recordedContractGeneration(cluster *pgshardv1alpha1.PgShardCluster, class owned.PodClass, shard, member int32) int64 {

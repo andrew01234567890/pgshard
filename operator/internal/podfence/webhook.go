@@ -285,12 +285,13 @@ func validateManagedPodClusterContract(ctx context.Context, reader client.Reader
 // owning PgShardCluster's recorded transport policy and TLS checkpoints.
 // Pods that are not managed PostgreSQL members are deliberately allowed.
 type PodCreateValidator struct {
-	reader  client.Reader
-	decoder admission.Decoder
+	reader     client.Reader
+	identities ControllerIdentities
+	decoder    admission.Decoder
 }
 
-func NewPodCreateValidator(reader client.Reader, scheme *runtime.Scheme) *PodCreateValidator {
-	return &PodCreateValidator{reader: reader, decoder: admission.NewDecoder(scheme)}
+func NewPodCreateValidator(reader client.Reader, identities ControllerIdentities, scheme *runtime.Scheme) *PodCreateValidator {
+	return &PodCreateValidator{reader: reader, identities: identities, decoder: admission.NewDecoder(scheme)}
 }
 
 func (v *PodCreateValidator) Handle(ctx context.Context, request admission.Request) admission.Response {
@@ -301,16 +302,37 @@ func (v *PodCreateValidator) Handle(ctx context.Context, request admission.Reque
 	if err := v.decoder.Decode(request, pod); err != nil {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode created Pod: %w", err))
 	}
-	if !isPotentialManagedPostgreSQLPod(pod) {
+	kind, shard, member, clusterName := classifyContractPod(pod)
+	switch kind {
+	case contractPodUnmanaged:
+		if isPotentialManagedPostgreSQLPod(pod) {
+			return admission.Denied("managed PostgreSQL Pod has incomplete identity or an unrecognized composition")
+		}
 		return admission.Allowed("Pod is not a managed PostgreSQL member")
+	case contractPodMember:
+		if !IsManagedPostgreSQLPod(pod) {
+			return admission.Denied("managed PostgreSQL Pod has incomplete identity or no termination fence")
+		}
+		if pod.Spec.NodeName != "" || pod.Annotations[NodeUIDAnnotation] != "" || pod.Annotations[NodeBootIDAnnotation] != "" {
+			return admission.Denied("managed PostgreSQL Pod must be created unassigned and scheduled through binding")
+		}
+		if _, response := validateManagedPodClusterContract(ctx, v.reader, pod); response != nil {
+			return *response
+		}
 	}
-	if !IsManagedPostgreSQLPod(pod) {
-		return admission.Denied("managed PostgreSQL Pod has incomplete identity or no termination fence")
+	// The canonical contract is enforced whenever the reconciler's stamp is
+	// present; requiring the stamp on every managed pod is the activation
+	// stage's job (deferred), so a stampless pod keeps the legacy behavior.
+	if pod.Annotations[owned.PodContractHashAnnotation] == "" {
+		return admission.Allowed("managed PostgreSQL Pod creation matches its PgShardCluster contract")
 	}
-	if pod.Spec.NodeName != "" || pod.Annotations[NodeUIDAnnotation] != "" || pod.Annotations[NodeBootIDAnnotation] != "" {
-		return admission.Denied("managed PostgreSQL Pod must be created unassigned and scheduled through binding")
+	if err := decodeStrictObject(request.Object.Raw, &corev1.Pod{}); err != nil {
+		return admission.Denied(fmt.Sprintf("managed Pod carries unknown or duplicate fields: %v", err))
 	}
-	if _, response := validateManagedPodClusterContract(ctx, v.reader, pod); response != nil {
+	if pod.Namespace == "" {
+		pod.Namespace = request.Namespace
+	}
+	if response := v.validatePodContract(ctx, request, pod, kind, shard, member, clusterName); response != nil {
 		return *response
 	}
 	return admission.Allowed("managed PostgreSQL Pod creation matches its PgShardCluster contract")
@@ -759,3 +781,4 @@ func hasTerminalPhase(pod *corev1.Pod) bool {
 // +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodmetadata,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods;pods/ephemeralcontainers;pods/resize,verbs=update,versions=v1,name=vpostgresqlpodmetadata.pgshard.io,admissionReviewVersions=v1,servicePort=9444
 // +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodstatus,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/status,verbs=update,versions=v1,name=vpostgresqlpodstatus.pgshard.io,admissionReviewVersions=v1,servicePort=9444
 // +kubebuilder:webhook:path=/validate-core-v1-postgresqlfencingnamespace,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=namespaces;namespaces/status;namespaces/finalize,verbs=update,versions=v1,name=vpostgresqlfencingnamespace.pgshard.io,admissionReviewVersions=v1,servicePort=9444
+// +kubebuilder:webhook:path=/validate-apps-v1-postgresqlworkload,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups=apps,resources=statefulsets;deployments;replicasets;statefulsets/scale;deployments/scale;replicasets/scale,verbs=create;update,versions=v1,name=vpostgresqlworkload.pgshard.io,admissionReviewVersions=v1,servicePort=9444

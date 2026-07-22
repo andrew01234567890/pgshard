@@ -25,3 +25,7 @@ webhooks:
     namespaceSelector:
       matchLabels:
         pgshard.io/pod-fencing: enabled
+  - name: vpostgresqlworkload.pgshard.io
+    namespaceSelector:
+      matchLabels:
+        pgshard.io/pod-fencing: enabled
