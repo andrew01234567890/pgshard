@@ -153,6 +153,9 @@ func (r *PgShardClusterReconciler) advanceSupportingGenerations(ctx context.Cont
 				replicaSetByUID(replicaSets, record.CurrentReplicaSetUID) != nil {
 				record.PriorReplicaSetUID = record.CurrentReplicaSetUID
 				record.PriorContractHash = record.CurrentContractHash
+				// A freshly demoted prior is admissible during its rollout until
+				// the reconciler durably revokes it.
+				record.PriorRevoked = false
 			}
 			record.CurrentReplicaSetUID = string(currentReplicaSet.UID)
 			record.CurrentContractHash = desiredHash
@@ -170,6 +173,7 @@ func (r *PgShardClusterReconciler) advanceSupportingGenerations(ctx context.Cont
 			if converged {
 				record.PriorReplicaSetUID = ""
 				record.PriorContractHash = ""
+				record.PriorRevoked = false
 				record.ConvergedGeneration = record.CurrentTemplateGeneration
 				record.SealedAt = metav1.Now()
 				changed = true
@@ -195,6 +199,15 @@ func (r *PgShardClusterReconciler) advanceSupportingGenerations(ctx context.Cont
 // wait the pinned request-timeout drain, then delete any late-write pod still
 // owned by the prior ReplicaSet until two consecutive authoritative zero LISTs.
 func (r *PgShardClusterReconciler) driveSupportingRevocation(ctx context.Context, reader client.Reader, cluster *pgshardv1alpha1.PgShardCluster, deployment *appsv1.Deployment, replicaSets []appsv1.ReplicaSet, record *pgshardv1alpha1.SupportingGenerationStatus) (bool, bool, error) {
+	// Revoke the prior generation from the admissible set FIRST and persist it,
+	// before scaling down or draining, so admission stops accepting new
+	// prior-generation pods before any zero-pod proof.
+	if !record.PriorRevoked {
+		record.PriorRevoked = true
+		record.SealedAt = metav1.Now()
+		r.resetSupportingDrain(cluster.UID, record.Class)
+		return false, true, nil
+	}
 	priorReplicaSet := replicaSetByUID(replicaSets, record.PriorReplicaSetUID)
 	if priorReplicaSet != nil {
 		if priorReplicaSet.Spec.Replicas == nil || *priorReplicaSet.Spec.Replicas != 0 {
@@ -215,19 +228,19 @@ func (r *PgShardClusterReconciler) driveSupportingRevocation(ctx context.Context
 	if !supportingDeploymentConverged(deployment) {
 		return false, false, nil
 	}
-	if time.Since(record.SealedAt.Time) < supportingRevocationDrain {
+	// A full-second safety margin covers the metav1.Time one-second truncation and
+	// modest clock skew, so the drain never completes early.
+	if time.Since(record.SealedAt.Time) < supportingRevocationDrain+time.Second {
 		return false, false, nil
 	}
-	priorPods, err := r.listOwnedPods(ctx, reader, cluster.Namespace, record.PriorReplicaSetUID)
+	// Sweep EVERY revoked pod of the class: any pod owned by the prior ReplicaSet,
+	// and any pod stamped below the security-generation floor (a late write of a
+	// revoked generation), not just one prior UID.
+	swept, err := r.sweepRevokedSupportingPods(ctx, reader, cluster, record)
 	if err != nil {
 		return false, false, err
 	}
-	if len(priorPods) > 0 {
-		for i := range priorPods {
-			if err := r.Delete(ctx, &priorPods[i]); err != nil && !apierrors.IsNotFound(err) {
-				return false, false, fmt.Errorf("delete late-write supporting pod %s: %w", priorPods[i].Name, err)
-			}
-		}
+	if swept > 0 {
 		r.resetSupportingDrain(cluster.UID, record.Class)
 		return false, true, nil
 	}
@@ -236,6 +249,40 @@ func (r *PgShardClusterReconciler) driveSupportingRevocation(ctx context.Context
 	}
 	r.resetSupportingDrain(cluster.UID, record.Class)
 	return true, false, nil
+}
+
+// sweepRevokedSupportingPods deletes every pod of the class that belongs to a
+// revoked generation: owned by the prior ReplicaSet, or stamped below the
+// security-generation floor. It returns the number deleted.
+func (r *PgShardClusterReconciler) sweepRevokedSupportingPods(ctx context.Context, reader client.Reader, cluster *pgshardv1alpha1.PgShardCluster, record *pgshardv1alpha1.SupportingGenerationStatus) (int, error) {
+	pods := &corev1.PodList{}
+	if err := reader.List(ctx, pods, client.InNamespace(cluster.Namespace)); err != nil {
+		return 0, fmt.Errorf("list supporting pods to sweep: %w", err)
+	}
+	deleted := 0
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		// A pod owned by the prior ReplicaSet is definitionally a prior generation of
+		// this class and is swept regardless of its labels, so a late write cannot
+		// evade the sweep by stripping its class labels. The below-floor sweep is
+		// scoped to the class by label, so it never reaps another class's or another
+		// cluster's pods.
+		ownedByPrior := record.PriorReplicaSetUID != "" && string(controllerOwnerUID(pod.OwnerReferences)) == record.PriorReplicaSetUID
+		inClass := pod.Labels[owned.ComponentLabel] == record.Class && pod.Labels[owned.ClusterLabel] == cluster.Name
+		generation, _ := strconv.ParseInt(pod.Annotations[owned.PodSecurityGenerationAnnotation], 10, 64)
+		belowFloor := inClass && record.MinGenerationForNewCreates > 0 && generation < record.MinGenerationForNewCreates
+		if !ownedByPrior && !belowFloor {
+			continue
+		}
+		if err := r.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
+			return deleted, fmt.Errorf("delete revoked supporting pod %s: %w", pod.Name, err)
+		}
+		deleted++
+	}
+	return deleted, nil
 }
 
 // supportingDeploymentConverged reports whether a Deployment has fully rolled

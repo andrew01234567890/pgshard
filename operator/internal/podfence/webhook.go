@@ -56,6 +56,9 @@ const (
 	PodConnectWebhookPath        = "/validate-core-v1-postgresqlpodconnect"
 	PodConnectFencedWebhookName  = "vpostgresqlpodconnect.pgshard.io"
 	PodConnectManagerWebhookName = "vpostgresqlmanagerconnect.pgshard.io"
+
+	LimitRangeWebhookName = "vpostgresqllimitrange.pgshard.io"
+	LimitRangeWebhookPath = "/validate-core-v1-postgresqllimitrange"
 )
 
 type HandshakeAttestor struct {
@@ -367,10 +370,19 @@ type PodCreateValidator struct {
 	reader     client.Reader
 	identities ControllerIdentities
 	decoder    admission.Decoder
+	probeStore *IdentityObservationStore
 }
 
 func NewPodCreateValidator(reader client.Reader, identities ControllerIdentities, scheme *runtime.Scheme) *PodCreateValidator {
 	return &PodCreateValidator{reader: reader, identities: identities, decoder: admission.NewDecoder(scheme)}
+}
+
+// WithIdentityProbeStore lets the activation identity prober share a process-local
+// store into which this webhook records the authenticated controller usernames it
+// observes for probe-annotated pods.
+func (v *PodCreateValidator) WithIdentityProbeStore(store *IdentityObservationStore) *PodCreateValidator {
+	v.probeStore = store
+	return v
 }
 
 func (v *PodCreateValidator) Handle(ctx context.Context, request admission.Request) admission.Response {
@@ -388,6 +400,16 @@ func (v *PodCreateValidator) Handle(ctx context.Context, request admission.Reque
 	if IsDispatchProbeSentinel(pod) {
 		return admission.Denied(DispatchProbeSentinelMessage)
 	}
+	// Record the authenticated controller identity for an identity-probe pod. This
+	// only observes request.UserInfo (which the API server signs); it never relaxes
+	// the allow/deny decision, so an attacker who forges the probe annotation still
+	// faces normal enforcement (an unmanaged probe pod is denied under any guarded
+	// phase, and the probe only runs while INACTIVE).
+	if token := identityProbeToken(pod.Annotations); token != "" && v.probeStore != nil {
+		if role := podIdentityProbeRole(pod); role != "" {
+			v.probeStore.record(token, role, request.UserInfo.Username)
+		}
+	}
 	receipt, err := namespaceIsolationReceipt(ctx, v.reader, request.Namespace)
 	if err != nil {
 		return admission.Errored(http.StatusInternalServerError, err)
@@ -398,20 +420,27 @@ func (v *PodCreateValidator) Handle(ctx context.Context, request admission.Reque
 		// trusted controllers, so the parent seal + drain is race-free.
 		return admission.Denied("namespace isolation is quiescing; Pod creation is frozen")
 	}
-	if phase == pgshardv1alpha1.IsolationActivatingRecreate {
+	recreate := phase == pgshardv1alpha1.IsolationActivatingRecreate
+	if recreate {
+		// RECREATE is a fully guarded mode identical to ACTIVE for pod CREATE; the
+		// only relaxation is that a create is permitted at all provided its parent
+		// is a sealed one at its exact live incarnation.
 		sealed, err := podControllerParentSealed(ctx, v.reader, pod, receipt)
 		if err != nil {
 			return admission.Errored(http.StatusInternalServerError, err)
 		}
 		if !sealed {
-			return admission.Denied("namespace isolation is recreating; only pods of a sealed parent may be created")
+			return admission.Denied("namespace isolation is recreating; only pods of a sealed parent at its exact incarnation may be created")
 		}
 	}
-	active := phase == pgshardv1alpha1.IsolationActive
+	// Under RECREATE or ACTIVE the full contract is mandatory: the stamp is
+	// required (no stampless legacy path), unmanaged pods are denied, digest
+	// pinning is enforced, and both generation floors apply.
+	guarded := recreate || phase == pgshardv1alpha1.IsolationActive
 	kind, shard, member, clusterName := classifyContractPod(pod)
 	switch kind {
 	case contractPodUnmanaged:
-		if active {
+		if guarded {
 			return admission.Denied("namespace isolation is active; every Pod must be a classified managed PostgreSQL Pod")
 		}
 		if isPotentialManagedPostgreSQLPod(pod) {
@@ -430,10 +459,11 @@ func (v *PodCreateValidator) Handle(ctx context.Context, request admission.Reque
 		}
 	}
 	// The canonical contract is enforced whenever the reconciler's stamp is
-	// present. Under an ACTIVE receipt the stamp is mandatory (deny-all closes
-	// the stamp-gating seam); otherwise a stampless pod keeps the legacy path.
+	// present. Under a guarded (RECREATE/ACTIVE) receipt the stamp is mandatory
+	// (deny-all closes the stamp-gating seam); otherwise a stampless pod keeps the
+	// legacy path.
 	if pod.Annotations[owned.PodContractHashAnnotation] == "" {
-		if active {
+		if guarded {
 			return admission.Denied("namespace isolation is active; every managed Pod must carry the reconciler stamp")
 		}
 		return admission.Allowed("managed PostgreSQL Pod creation matches its PgShardCluster contract")
@@ -445,10 +475,10 @@ func (v *PodCreateValidator) Handle(ctx context.Context, request admission.Reque
 		return admission.Denied("managed Pod namespace does not match the request namespace")
 	}
 	pod.Namespace = request.Namespace
-	if response := v.validatePodContract(ctx, request, pod, kind, shard, member, clusterName, active); response != nil {
+	if response := v.validatePodContract(ctx, request, pod, kind, shard, member, clusterName, guarded); response != nil {
 		return *response
 	}
-	if active {
+	if guarded {
 		if response := enforceIsolationGenerationFloor(pod, receipt); response != nil {
 			return *response
 		}
@@ -744,6 +774,23 @@ type NamespaceValidator struct {
 
 func NewNamespaceValidator(scheme *runtime.Scheme) *NamespaceValidator {
 	return &NamespaceValidator{decoder: admission.NewDecoder(scheme)}
+}
+
+// LimitRangeValidator denies every LimitRange create or update in a fenced
+// namespace. A defaulting LimitRange would mutate recreated pods after they are
+// stamped, breaking the contract comparator after their predecessors have been
+// deleted, so a fenced namespace must carry none.
+type LimitRangeValidator struct{}
+
+func NewLimitRangeValidator() *LimitRangeValidator {
+	return &LimitRangeValidator{}
+}
+
+func (v *LimitRangeValidator) Handle(_ context.Context, request admission.Request) admission.Response {
+	if request.Operation != admissionv1.Create && request.Operation != admissionv1.Update {
+		return admission.Errored(http.StatusBadRequest, fmt.Errorf("unexpected LimitRange request %s", request.Operation))
+	}
+	return admission.Denied("LimitRanges are not permitted in a fenced pgshard namespace; a defaulting LimitRange would break the pod contract after stamping")
 }
 
 func (v *NamespaceValidator) Handle(_ context.Context, request admission.Request) admission.Response {
@@ -1044,3 +1091,4 @@ func hasTerminalPhase(pod *corev1.Pod) bool {
 // +kubebuilder:webhook:path=/validate-apps-v1-postgresqlworkload,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups=apps,resources=statefulsets;deployments;replicasets;statefulsets/scale;deployments/scale;replicasets/scale,verbs=create;update,versions=v1,name=vpostgresqlworkload.pgshard.io,admissionReviewVersions=v1,servicePort=9444
 // +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodconnect,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/exec;pods/attach;pods/portforward;pods/proxy,verbs=connect,versions=v1,name=vpostgresqlpodconnect.pgshard.io,admissionReviewVersions=v1,servicePort=9444
 // +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodconnect,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/exec;pods/attach;pods/portforward;pods/proxy,verbs=connect,versions=v1,name=vpostgresqlmanagerconnect.pgshard.io,admissionReviewVersions=v1,servicePort=9444
+// +kubebuilder:webhook:path=/validate-core-v1-postgresqllimitrange,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=limitranges,verbs=create;update,versions=v1,name=vpostgresqllimitrange.pgshard.io,admissionReviewVersions=v1,servicePort=9444

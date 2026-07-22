@@ -590,6 +590,16 @@ spec:
                     - ACTIVATING_RECREATE
                     - ACTIVE
                     type: string
+                  recreatePendingUIDs:
+                    description: |-
+                      RecreatePendingUIDs are the pre-guard protected pod UIDs sealed at the
+                      entry to ACTIVATING_RECREATE. Every one must be deleted (and its guarded
+                      replacement created) before ACTIVE; this replaces CreationTimestamp
+                      inference so no pod is authenticated by when it was created.
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: atomic
                   residueProfileHash:
                     pattern: ^([0-9a-f]{64})?$
                     type: string
@@ -1157,6 +1167,14 @@ spec:
                         PriorReplicaSetUID is the previous generation's ReplicaSet, still admissible
                         during a bounded rollout; cleared on convergence.
                       type: string
+                    priorRevoked:
+                      description: |-
+                        PriorRevoked removes the prior ReplicaSet from the admissible set for NEW
+                        creates while it is still being drained. It is set durably BEFORE the drain
+                        so admission stops accepting new prior-generation pods before any zero-pod
+                        proof, closing the race where a new prior pod is created between the final
+                        zero LIST and the status clear.
+                      type: boolean
                     sealedAt:
                       description: |-
                         SealedAt is when this record was last authoritatively written; the prior

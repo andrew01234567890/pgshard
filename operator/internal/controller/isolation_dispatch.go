@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
@@ -79,15 +80,34 @@ func dispatchTupleHash(webhookConfigResourceVersion string, probes []backendProb
 
 // dispatchProbeSentinelPod is the reserved sentinel the probe submits with
 // dryRun=All to each backend; the PodCreate webhook always denies it with the
-// exact sentinel message.
-func dispatchProbeSentinelPod(namespace string) *corev1.Pod {
+// exact sentinel message. It carries a restricted-Pod-Security-valid spec so
+// admission does not reject it for PSA before the webhook runs, and a per-probe
+// nonce name so it never collides with a real object.
+func dispatchProbeSentinelPod(namespace, name string) *corev1.Pod {
+	allowPrivilegeEscalation := false
+	runAsNonRoot := true
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        podfence.DispatchProbeSentinelName,
+			Name:        name,
 			Namespace:   namespace,
 			Annotations: map[string]string{podfence.DispatchProbeSentinelAnnotation: podfence.DispatchProbeSentinelValue},
 		},
-		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "sentinel", Image: "pgshard/sentinel@sha256:" + strings.Repeat("0", 64)}}},
+		Spec: corev1.PodSpec{
+			SecurityContext: &corev1.PodSecurityContext{
+				RunAsNonRoot:   &runAsNonRoot,
+				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+			},
+			Containers: []corev1.Container{{
+				Name:  "sentinel",
+				Image: "pgshard/sentinel@sha256:" + strings.Repeat("0", 64),
+				SecurityContext: &corev1.SecurityContext{
+					AllowPrivilegeEscalation: &allowPrivilegeEscalation,
+					RunAsNonRoot:             &runAsNonRoot,
+					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+					SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+				},
+			}},
+		},
 	}
 }
 
@@ -105,22 +125,26 @@ func dispatchProbeSentinelPod(namespace string) *corev1.Pod {
 type serverDispatchProber struct {
 	reader                client.Reader
 	baseConfig            *rest.Config
-	probeNamespace        string
 	webhookConfigName     string
 	perBackendDialTimeout time.Duration
 }
 
-func NewServerDispatchProber(reader client.Reader, baseConfig *rest.Config, probeNamespace, webhookConfigName string) *serverDispatchProber {
+// NewServerDispatchProber builds the real prober. The operator namespace is no
+// longer used (the probe runs in the activating cluster's fenced namespace,
+// passed to Prove).
+func NewServerDispatchProber(reader client.Reader, baseConfig *rest.Config, _ string, webhookConfigName string) *serverDispatchProber {
 	return &serverDispatchProber{
 		reader:                reader,
 		baseConfig:            baseConfig,
-		probeNamespace:        probeNamespace,
 		webhookConfigName:     webhookConfigName,
 		perBackendDialTimeout: 5 * time.Second,
 	}
 }
 
-func (p *serverDispatchProber) Prove(ctx context.Context) (dispatchProof, error) {
+func (p *serverDispatchProber) Prove(ctx context.Context, namespace string) (dispatchProof, error) {
+	// A per-probe nonce name so the sentinel never collides with a real object; the
+	// webhook recognizes the sentinel by annotation, not name.
+	sentinelName := fmt.Sprintf("%s-%d", podfence.DispatchProbeSentinelName, time.Now().UnixNano())
 	webhookConfig := &admissionregistrationv1.ValidatingWebhookConfiguration{}
 	if err := p.reader.Get(ctx, client.ObjectKey{Name: p.webhookConfigName}, webhookConfig); err != nil {
 		return dispatchProof{}, fmt.Errorf("read validating webhook configuration %q: %w", p.webhookConfigName, err)
@@ -144,23 +168,23 @@ func (p *serverDispatchProber) Prove(ctx context.Context) (dispatchProof, error)
 			}
 			for _, address := range endpoint.Addresses {
 				probe := backendProbe{sliceName: slice.Name, sliceRV: slice.ResourceVersion, address: address, port: port}
-				p.probeBackend(ctx, &probe)
+				p.probeBackend(ctx, namespace, sentinelName, &probe)
 				probes = append(probes, probe)
 			}
 		}
 	}
 	proof := aggregateDispatchProof(webhookConfig.ResourceVersion, probes)
 	// Belt: the dryRun sentinel must never have persisted.
-	if err := p.confirmSentinelAbsent(ctx); err != nil {
+	if err := p.confirmSentinelAbsent(ctx, namespace, sentinelName); err != nil {
 		return dispatchProof{}, err
 	}
 	return proof, nil
 }
 
 // probeBackend addresses one backend endpoint directly over TLS with
-// serverName=kubernetes.default.svc and submits a dryRun sentinel Pod create,
-// recording whether the exact sentinel denial came back.
-func (p *serverDispatchProber) probeBackend(ctx context.Context, probe *backendProbe) {
+// serverName=kubernetes.default.svc and submits a dryRun sentinel Pod create in
+// the fenced namespace, recording whether the exact sentinel denial came back.
+func (p *serverDispatchProber) probeBackend(ctx context.Context, namespace, sentinelName string, probe *backendProbe) {
 	config := rest.CopyConfig(p.baseConfig)
 	config.Host = "https://" + net.JoinHostPort(probe.address, strconv.Itoa(int(probe.port)))
 	config.TLSClientConfig.ServerName = "kubernetes.default.svc"
@@ -172,12 +196,12 @@ func (p *serverDispatchProber) probeBackend(ctx context.Context, probe *backendP
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, p.perBackendDialTimeout)
 	defer cancel()
-	_, err = clientset.CoreV1().Pods(p.probeNamespace).Create(dialCtx, dispatchProbeSentinelPod(p.probeNamespace), metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}})
+	_, err = clientset.CoreV1().Pods(namespace).Create(dialCtx, dispatchProbeSentinelPod(namespace, sentinelName), metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}})
 	if err == nil {
 		probe.outcome = "admitted"
 		return
 	}
-	if apierrors.IsForbidden(err) && strings.Contains(err.Error(), podfence.DispatchProbeSentinelMessage) {
+	if isExactSentinelDenial(err) {
 		probe.sentinelObserved = true
 		probe.outcome = "sentinel"
 		return
@@ -185,11 +209,30 @@ func (p *serverDispatchProber) probeBackend(ctx context.Context, probe *backendP
 	probe.outcome = fmt.Sprintf("other: %v", err)
 }
 
-func (p *serverDispatchProber) confirmSentinelAbsent(ctx context.Context) error {
+// isExactSentinelDenial reports whether an error is exactly the pgshard PodCreate
+// webhook's sentinel denial: a Forbidden status whose message is the API server's
+// webhook-denial wrapper around the exact sentinel message, from the PodCreate
+// webhook. An arbitrary denial that merely contains the sentinel text as a
+// substring does not qualify, so a backend that denies for another reason is
+// correctly counted as unconverged.
+func isExactSentinelDenial(err error) bool {
+	var status apierrors.APIStatus
+	if !errors.As(err, &status) {
+		return false
+	}
+	details := status.Status()
+	if details.Reason != metav1.StatusReasonForbidden || details.Code != 403 {
+		return false
+	}
+	expected := fmt.Sprintf("admission webhook %q denied the request: %s", podfence.PodCreateWebhookName, podfence.DispatchProbeSentinelMessage)
+	return details.Message == expected
+}
+
+func (p *serverDispatchProber) confirmSentinelAbsent(ctx context.Context, namespace, sentinelName string) error {
 	sentinel := &corev1.Pod{}
-	err := p.reader.Get(ctx, client.ObjectKey{Namespace: p.probeNamespace, Name: podfence.DispatchProbeSentinelName}, sentinel)
+	err := p.reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: sentinelName}, sentinel)
 	if err == nil {
-		return fmt.Errorf("dispatch-probe sentinel unexpectedly persisted in %s", p.probeNamespace)
+		return fmt.Errorf("dispatch-probe sentinel unexpectedly persisted in %s", namespace)
 	}
 	if apierrors.IsNotFound(err) {
 		return nil

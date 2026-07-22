@@ -932,6 +932,11 @@ func (in *PostgreSQLIsolationReceipt) DeepCopyInto(out *PostgreSQLIsolationRecei
 		*out = make([]SealedParent, len(*in))
 		copy(*out, *in)
 	}
+	if in.RecreatePendingUIDs != nil {
+		in, out := &in.RecreatePendingUIDs, &out.RecreatePendingUIDs
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	in.ActivatedAt.DeepCopyInto(&out.ActivatedAt)
 }
 

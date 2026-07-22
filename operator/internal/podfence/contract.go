@@ -240,6 +240,12 @@ func validateSupportingGenerationBarrier(cluster *pgshardv1alpha1.PgShardCluster
 			return deniedf("managed supporting Pod does not match the current sealed generation")
 		}
 	case record.PriorReplicaSetUID:
+		// The prior generation is admissible only while it is still being rolled
+		// out; once the reconciler durably revokes it (before the drain) no new
+		// prior-generation pod may be created.
+		if record.PriorRevoked {
+			return deniedf("managed supporting Pod belongs to a revoked prior generation")
+		}
 		if stampedHash != record.PriorContractHash {
 			return deniedf("managed supporting Pod does not match the prior sealed generation")
 		}
@@ -450,10 +456,19 @@ type WorkloadIntegrityValidator struct {
 	reader     client.Reader
 	identities ControllerIdentities
 	decoder    admission.Decoder
+	probeStore *IdentityObservationStore
 }
 
 func NewWorkloadIntegrityValidator(reader client.Reader, identities ControllerIdentities, scheme *runtime.Scheme) *WorkloadIntegrityValidator {
 	return &WorkloadIntegrityValidator{reader: reader, identities: identities, decoder: admission.NewDecoder(scheme)}
+}
+
+// WithIdentityProbeStore shares the process-local identity-probe observation
+// store so this webhook records the deployment-controller and HPA-controller
+// usernames it authenticates for probe workloads.
+func (v *WorkloadIntegrityValidator) WithIdentityProbeStore(store *IdentityObservationStore) *WorkloadIntegrityValidator {
+	v.probeStore = store
+	return v
 }
 
 func (v *WorkloadIntegrityValidator) Handle(ctx context.Context, request admission.Request) admission.Response {
@@ -594,6 +609,20 @@ func (v *WorkloadIntegrityValidator) handleReplicaSet(ctx context.Context, reque
 	if request.UserInfo.Username != v.identities.DeploymentController {
 		return admission.Denied("ReplicaSets in a fenced namespace may only be authored by the Deployment controller")
 	}
+	// An identity-probe ReplicaSet (created by the deployment controller from a
+	// disposable probe Deployment) records the authenticated deployment-controller
+	// username and is admitted so the replicaset controller in turn creates the
+	// probe pod (which records the replicaset-controller username at PodCreate).
+	// This is gated by the deployment-controller authorship check above, so it is
+	// not a create path for an untrusted caller.
+	if request.Operation == admissionv1.Create {
+		if token := identityProbeToken(replicaSet.Spec.Template.Annotations); token != "" {
+			if v.probeStore != nil {
+				v.probeStore.record(token, IdentityRoleDeployment, request.UserInfo.Username)
+			}
+			return admission.Allowed("identity-probe ReplicaSet observed")
+		}
+	}
 	if request.Operation == admissionv1.Update {
 		old := &appsv1.ReplicaSet{}
 		if err := v.decoder.DecodeRaw(request.OldObject, old); err != nil {
@@ -652,13 +681,25 @@ func (v *WorkloadIntegrityValidator) handleReplicaSet(ctx context.Context, reque
 	return admission.Allowed("fenced ReplicaSet inherits its owning Deployment's stamped contract")
 }
 
-// handleScale enforces the only scale bound this stage owns: a managed member
-// StatefulSet must stay a single replica. Supporting Deployment/ReplicaSet
-// autoscaling bounds are enforced by a later activation stage together with the
-// HorizontalPodAutoscaler identity probe.
+// handleScale gates every workload scale. A managed member StatefulSet must stay
+// a single replica. A supporting Deployment/ReplicaSet may be scaled ONLY by the
+// operator or the HorizontalPodAutoscaler controller — never by an arbitrary
+// caller, which could otherwise scale a revoked generation's ReplicaSet back up
+// and create revoked pods.
 func (v *WorkloadIntegrityValidator) handleScale(ctx context.Context, request admission.Request) admission.Response {
 	if request.Resource.Resource != "statefulsets" {
-		return admission.Allowed("supporting workload scale bounds are enforced by a later activation stage")
+		if request.UserInfo.Username != v.identities.Operator && request.UserInfo.Username != v.identities.HorizontalPodAutoscalerController {
+			return admission.Denied("supporting workloads in a fenced namespace may only be rescaled by the pgshard operator or the HorizontalPodAutoscaler controller")
+		}
+		// Record the authenticated HPA-controller username when it scales an
+		// identity-probe Deployment. The gate above already bounds this to the
+		// HPA controller, so a probe target does not weaken the scale gate.
+		if v.probeStore != nil && request.UserInfo.Username == v.identities.HorizontalPodAutoscalerController && request.Resource.Resource == "deployments" {
+			if token := v.scaleTargetProbeToken(ctx, request.Namespace, request.Name); token != "" {
+				v.probeStore.record(token, IdentityRoleHPA, request.UserInfo.Username)
+			}
+		}
+		return admission.Allowed("supporting workload scale is authorized")
 	}
 	scale := &autoscalingv1.Scale{}
 	if err := decodeStrictObject(request.Object.Raw, scale); err != nil {
@@ -678,6 +719,16 @@ func (v *WorkloadIntegrityValidator) handleScale(ctx context.Context, request ad
 		return admission.Denied("managed member StatefulSet must remain a single replica")
 	}
 	return admission.Allowed("managed member StatefulSet scale is within bounds")
+}
+
+// scaleTargetProbeToken returns the identity-probe token on a Deployment scale
+// target, or "" when the target is not a probe Deployment (or no longer exists).
+func (v *WorkloadIntegrityValidator) scaleTargetProbeToken(ctx context.Context, namespace, name string) string {
+	deployment := &appsv1.Deployment{}
+	if err := v.reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, deployment); err != nil {
+		return ""
+	}
+	return identityProbeToken(deployment.Spec.Template.Annotations)
 }
 
 func (v *WorkloadIntegrityValidator) boundCluster(ctx context.Context, namespace, clusterName string, ownerRefs []metav1.OwnerReference) (*pgshardv1alpha1.PgShardCluster, *admission.Response) {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
+	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -74,11 +75,23 @@ func sealedParentMatch(receipt *pgshardv1alpha1.PostgreSQLIsolationReceipt, kind
 	return nil
 }
 
+// sealedParentMatchesLive reports whether the live parent matches a sealed record
+// on the full tuple: kind, name, UID, and — verified against the live object, not
+// the pod's forgeable owner reference — the stamped contract hash. The sealed
+// resourceVersion is recorded for audit but not gated on, because a parent's
+// resourceVersion drifts on benign controller status writes during the recreate
+// ceremony; the live contract hash is the security-relevant binding.
+func sealedParentMatchesLive(receipt *pgshardv1alpha1.PostgreSQLIsolationReceipt, kind, name, uid, liveContractHash string) bool {
+	sealed := sealedParentMatch(receipt, kind, uid)
+	return sealed != nil && sealed.Name == name && sealed.ContractHash == liveContractHash
+}
+
 // podControllerParentSealed reports whether a pod's protected parent is sealed in
-// the receipt. A member pod's controller owner is its StatefulSet; a supporting
-// pod's controller owner is a ReplicaSet whose own controller owner is the sealed
-// Deployment. During ACTIVATING_RECREATE only pods whose parent is sealed at its
-// exact incarnation may be created.
+// the receipt at its exact live incarnation. A member pod's controller owner is
+// its StatefulSet; a supporting pod's controller owner is a ReplicaSet whose own
+// controller owner is the sealed Deployment. The parent is fetched authoritatively
+// and its live contract hash must equal the sealed hash, so a pod referencing a
+// sealed UID whose template was mutated after sealing is rejected.
 func podControllerParentSealed(ctx context.Context, reader client.Reader, pod *corev1.Pod, receipt *pgshardv1alpha1.PostgreSQLIsolationReceipt) (bool, error) {
 	ref := controllerOwnerRef(pod.OwnerReferences)
 	if ref == nil {
@@ -86,7 +99,17 @@ func podControllerParentSealed(ctx context.Context, reader client.Reader, pod *c
 	}
 	switch ref.Kind {
 	case "StatefulSet":
-		return sealedParentMatch(receipt, "StatefulSet", string(ref.UID)) != nil, nil
+		statefulSet := &appsv1.StatefulSet{}
+		if err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: ref.Name}, statefulSet); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		if statefulSet.UID != ref.UID {
+			return false, nil
+		}
+		return sealedParentMatchesLive(receipt, "StatefulSet", statefulSet.Name, string(statefulSet.UID), statefulSet.Spec.Template.Annotations[owned.PodContractHashAnnotation]), nil
 	case replicaSetKind:
 		replicaSet := &appsv1.ReplicaSet{}
 		if err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: ref.Name}, replicaSet); err != nil {
@@ -102,7 +125,17 @@ func podControllerParentSealed(ctx context.Context, reader client.Reader, pod *c
 		if deploymentRef == nil || deploymentRef.Kind != deploymentKind {
 			return false, nil
 		}
-		return sealedParentMatch(receipt, "Deployment", string(deploymentRef.UID)) != nil, nil
+		deployment := &appsv1.Deployment{}
+		if err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: deploymentRef.Name}, deployment); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		if deployment.UID != deploymentRef.UID {
+			return false, nil
+		}
+		return sealedParentMatchesLive(receipt, "Deployment", deployment.Name, string(deployment.UID), deployment.Spec.Template.Annotations[owned.PodContractHashAnnotation]), nil
 	}
 	return false, nil
 }

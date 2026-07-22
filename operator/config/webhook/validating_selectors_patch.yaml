@@ -35,3 +35,7 @@ webhooks:
     namespaceSelector:
       matchLabels:
         kubernetes.io/metadata.name: pgshard-system
+  - name: vpostgresqllimitrange.pgshard.io
+    namespaceSelector:
+      matchLabels:
+        pgshard.io/pod-fencing: enabled

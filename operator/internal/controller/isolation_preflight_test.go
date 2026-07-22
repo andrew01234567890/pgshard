@@ -2,10 +2,14 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/version"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -199,8 +203,21 @@ func TestRevalidateDispatchTupleInvalidation(t *testing.T) {
 	if valid {
 		t.Fatal("a changed dispatch tuple was treated as still valid")
 	}
-	if reloadReceipt(t, kubeClient, cluster) != nil {
-		t.Fatal("the receipt was not reset after tuple invalidation")
+	// The receipt is HELD in a durable-deny phase (QUIESCE), never reset to INACTIVE:
+	// enforcement must not drop to fail-open while the backend set is in flux. Because
+	// the new tuple is itself converged, it is re-sealed under it while quiesced.
+	receipt := reloadReceipt(t, kubeClient, cluster)
+	if receipt == nil {
+		t.Fatal("the receipt was dropped (fail-open) after tuple invalidation")
+	}
+	if receipt.Phase != pgshardv1alpha1.IsolationActivatingQuiesce {
+		t.Fatalf("receipt was not held quiesced after tuple invalidation: %#v", receipt)
+	}
+	if receipt.DispatchTupleHash != "tuple-new" {
+		t.Fatalf("receipt was not re-sealed under the new converged tuple: %#v", receipt)
+	}
+	if receipt.SealedParents != nil {
+		t.Fatalf("sealed parents were not cleared for re-enumeration: %#v", receipt)
 	}
 	reloaded := &pgshardv1alpha1.PgShardCluster{}
 	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), reloaded); err != nil {
@@ -211,10 +228,24 @@ func TestRevalidateDispatchTupleInvalidation(t *testing.T) {
 	}
 }
 
+// tlsReadyActivationCluster is a multi-member cluster that satisfies the
+// activation prerequisites: opted in, server-tls-v1 transport, complete TLS
+// checkpoints.
+func tlsReadyActivationCluster(name string, uid types.UID) *pgshardv1alpha1.PgShardCluster {
+	cluster := genCluster(name, uid)
+	cluster.Spec.MembersPerShard = 3
+	cluster.Annotations = map[string]string{pgshardv1alpha1.IsolationActivationAnnotation: pgshardv1alpha1.IsolationActivationRequested}
+	cluster.Status.PostgreSQLBootstrapSpec = &pgshardv1alpha1.PostgreSQLBootstrapSpecStatus{ReplicationTransportPolicy: pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1}
+	cluster.Status.PostgreSQLReplicationTLS = []pgshardv1alpha1.PostgreSQLReplicationTLSStatus{{
+		Shard: 0, CASecretName: name + "-replication-ca", CASHA256: strings.Repeat("a", 64),
+		Members: []pgshardv1alpha1.PostgreSQLReplicationTLSMemberStatus{{Member: 0, ServerSHA256: strings.Repeat("b", 64)}},
+	}}
+	return cluster
+}
+
 func TestReconcileIsolationActivationOptInEntersQuiesce(t *testing.T) {
 	t.Parallel()
-	cluster := genCluster("optincase", "optincase-uid")
-	cluster.Annotations = map[string]string{pgshardv1alpha1.IsolationActivationAnnotation: pgshardv1alpha1.IsolationActivationRequested}
+	cluster := tlsReadyActivationCluster("optincase", "optincase-uid")
 	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster)
 	reconciler.MinorGate = fakeMinorGate{ok: true, observed: "v1.36.2"}
 	reconciler.IdentityProber = fakeIdentityProber{matched: true}
@@ -246,5 +277,105 @@ func TestReconcileIsolationActivationOptOutStaysInactive(t *testing.T) {
 	}
 	if reloadReceipt(t, kubeClient, cluster) != nil {
 		t.Fatal("a non-opted-in cluster activated")
+	}
+}
+
+func TestActivationWithheldWithoutTLSPrerequisite(t *testing.T) {
+	t.Parallel()
+	// Opted in but legacy cleartext (no server-tls-v1 / no checkpoints).
+	cluster := genCluster("cleartextcase", "cleartextcase-uid")
+	cluster.Spec.MembersPerShard = 3
+	cluster.Annotations = map[string]string{pgshardv1alpha1.IsolationActivationAnnotation: pgshardv1alpha1.IsolationActivationRequested}
+	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster)
+	reconciler.MinorGate = fakeMinorGate{ok: true}
+	reconciler.IdentityProber = fakeIdentityProber{matched: true}
+	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, tupleHash: "t"}}
+	if _, err := reconciler.reconcileIsolationActivation(context.Background(), cluster); err != nil {
+		t.Fatal(err)
+	}
+	if reloadReceipt(t, kubeClient, cluster) != nil {
+		t.Fatal("a legacy cleartext cluster received an isolation receipt")
+	}
+	reloaded := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), reloaded); err != nil {
+		t.Fatal(err)
+	}
+	if meta.FindStatusCondition(reloaded.Status.Conditions, isolationTLSPrerequisiteCondition) == nil {
+		t.Fatalf("TLS prerequisite condition not surfaced: %#v", reloaded.Status.Conditions)
+	}
+}
+
+func TestActivationWithheldWithMultipleClusters(t *testing.T) {
+	t.Parallel()
+	clusterA := tlsReadyActivationCluster("clustera", "clustera-uid")
+	clusterB := tlsReadyActivationCluster("clusterb", "clusterb-uid")
+	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), clusterA, clusterB)
+	reconciler.MinorGate = fakeMinorGate{ok: true}
+	reconciler.IdentityProber = fakeIdentityProber{matched: true}
+	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, tupleHash: "t"}}
+	if _, err := reconciler.reconcileIsolationActivation(context.Background(), clusterA); err != nil {
+		t.Fatal(err)
+	}
+	if reloadReceipt(t, kubeClient, clusterA) != nil {
+		t.Fatal("activation proceeded with multiple clusters in the namespace")
+	}
+	reloaded := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(clusterA), reloaded); err != nil {
+		t.Fatal(err)
+	}
+	if meta.FindStatusCondition(reloaded.Status.Conditions, isolationMultipleClustersCondition) == nil {
+		t.Fatalf("multiple-clusters condition not surfaced: %#v", reloaded.Status.Conditions)
+	}
+}
+
+func TestActivationWithheldWithLimitRange(t *testing.T) {
+	t.Parallel()
+	cluster := tlsReadyActivationCluster("limitcase", "limitcase-uid")
+	limitRange := &corev1.LimitRange{ObjectMeta: metav1.ObjectMeta{Name: "defaults", Namespace: genTestNamespace}}
+	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster, limitRange)
+	reconciler.MinorGate = fakeMinorGate{ok: true}
+	reconciler.IdentityProber = fakeIdentityProber{matched: true}
+	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, tupleHash: "t"}}
+	if _, err := reconciler.reconcileIsolationActivation(context.Background(), cluster); err != nil {
+		t.Fatal(err)
+	}
+	if reloadReceipt(t, kubeClient, cluster) != nil {
+		t.Fatal("activation proceeded while a LimitRange was present")
+	}
+	reloaded := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), reloaded); err != nil {
+		t.Fatal(err)
+	}
+	if meta.FindStatusCondition(reloaded.Status.Conditions, isolationLimitRangePresentCondition) == nil {
+		t.Fatalf("limit-range condition not surfaced: %#v", reloaded.Status.Conditions)
+	}
+}
+
+func TestActivationWithheldWhileSupportingRolling(t *testing.T) {
+	t.Parallel()
+	cluster := tlsReadyActivationCluster("rollingcase", "rollingcase-uid")
+	// A supporting class is mid-roll: its prior generation is still populated, so
+	// the admissible set is in flux and activation must be withheld.
+	cluster.Status.SupportingGenerations = []pgshardv1alpha1.SupportingGenerationStatus{{
+		Class: "pooler", DeploymentUID: "deploy-uid",
+		CurrentReplicaSetUID: "rs-b", CurrentContractHash: genHashB,
+		PriorReplicaSetUID: "rs-a", PriorContractHash: genHashA,
+	}}
+	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster)
+	reconciler.MinorGate = fakeMinorGate{ok: true}
+	reconciler.IdentityProber = fakeIdentityProber{matched: true}
+	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, tupleHash: "t"}}
+	if _, err := reconciler.reconcileIsolationActivation(context.Background(), cluster); err != nil {
+		t.Fatal(err)
+	}
+	if reloadReceipt(t, kubeClient, cluster) != nil {
+		t.Fatal("activation proceeded while a supporting-generation roll was in progress")
+	}
+	reloaded := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), reloaded); err != nil {
+		t.Fatal(err)
+	}
+	if meta.FindStatusCondition(reloaded.Status.Conditions, isolationSupportingRollingCondition) == nil {
+		t.Fatalf("supporting-rolling condition not surfaced: %#v", reloaded.Status.Conditions)
 	}
 }

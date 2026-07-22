@@ -132,7 +132,7 @@ func TestAdvanceSupportingGenerationsConvergesAfterDrain(t *testing.T) {
 	cluster.Status.SupportingGenerations = []pgshardv1alpha1.SupportingGenerationStatus{{
 		Class: "pooler", DeploymentUID: "deploy-uid",
 		CurrentReplicaSetUID: "rs-b", CurrentContractHash: genHashB, CurrentTemplateGeneration: 1,
-		PriorReplicaSetUID: "rs-a", PriorContractHash: genHashA, MinGenerationForNewCreates: 1,
+		PriorReplicaSetUID: "rs-a", PriorContractHash: genHashA, PriorRevoked: true, MinGenerationForNewCreates: 1,
 		SealedAt: metav1.NewTime(time.Now().Add(-2 * supportingRevocationDrain)),
 	}}
 	deployment := poolerDeploymentForClass(cluster.Name, "deploy-uid", genHashB, 1, 2)
@@ -163,7 +163,7 @@ func TestDriveSupportingRevocationDeletesLateWritePods(t *testing.T) {
 	cluster.Status.SupportingGenerations = []pgshardv1alpha1.SupportingGenerationStatus{{
 		Class: "pooler", DeploymentUID: "deploy-uid",
 		CurrentReplicaSetUID: "rs-b", CurrentContractHash: genHashB, CurrentTemplateGeneration: 2,
-		PriorReplicaSetUID: "rs-a", PriorContractHash: genHashA,
+		PriorReplicaSetUID: "rs-a", PriorContractHash: genHashA, PriorRevoked: true,
 		MinGenerationForNewCreates: 2,
 		SealedAt:                   metav1.NewTime(time.Now().Add(-2 * supportingRevocationDrain)),
 	}}
@@ -187,6 +187,46 @@ func TestDriveSupportingRevocationDeletesLateWritePods(t *testing.T) {
 	record := reloadGenerationRecord(t, kubeClient, cluster, "pooler")
 	if record.PriorReplicaSetUID != "rs-a" {
 		t.Fatalf("prior cleared despite a late write: %#v", record)
+	}
+}
+
+func TestDriveSupportingRevocationSealsRevokeBeforeDraining(t *testing.T) {
+	t.Parallel()
+	controller := true
+	cluster := genCluster("revokefirstcase", "revokefirstcase-uid")
+	// Prior not yet revoked; everything else (drain elapsed, RS at zero) would
+	// otherwise permit a sweep. Revocation must be sealed and persisted FIRST.
+	cluster.Status.SupportingGenerations = []pgshardv1alpha1.SupportingGenerationStatus{{
+		Class: "pooler", DeploymentUID: "deploy-uid",
+		CurrentReplicaSetUID: "rs-b", CurrentContractHash: genHashB, CurrentTemplateGeneration: 2,
+		PriorReplicaSetUID: "rs-a", PriorContractHash: genHashA, PriorRevoked: false,
+		MinGenerationForNewCreates: 2,
+		SealedAt:                   metav1.NewTime(time.Now().Add(-2 * supportingRevocationDrain)),
+	}}
+	deployment := poolerDeploymentForClass(cluster.Name, "deploy-uid", genHashB, 2, 2)
+	replicaSetA := ownedReplicaSet("revokefirstcase-pooler-a", "rs-a", deployment.UID, genHashA, 0, 0)
+	replicaSetB := ownedReplicaSet("revokefirstcase-pooler-b", "rs-b", deployment.UID, genHashB, 2, 2)
+	lateWrite := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "late-write", Namespace: genTestNamespace, UID: "late-uid",
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: replicaSetA.Name, UID: "rs-a", Controller: &controller}},
+	}}
+	reconciler, kubeClient := genReconciler(t, cluster, deployment, replicaSetA, replicaSetB, lateWrite)
+
+	if _, err := reconciler.advanceSupportingGenerations(context.Background(), cluster); err != nil {
+		t.Fatal(err)
+	}
+	// The revocation is sealed first; no pod is reaped on this pass.
+	if err := kubeClient.Get(context.Background(), client.ObjectKey{Namespace: genTestNamespace, Name: "late-write"}, &corev1.Pod{}); err != nil {
+		t.Fatal("a pod was reaped before the revocation was durably sealed")
+	}
+	record := reloadGenerationRecord(t, kubeClient, cluster, "pooler")
+	if !record.PriorRevoked {
+		t.Fatalf("prior generation was not revoked first: %#v", record)
+	}
+	// The drain timer is reset by the revocation seal, so convergence cannot be
+	// claimed on the same pass.
+	if record.PriorReplicaSetUID != "rs-a" {
+		t.Fatalf("prior cleared on the revocation-seal pass: %#v", record)
 	}
 }
 

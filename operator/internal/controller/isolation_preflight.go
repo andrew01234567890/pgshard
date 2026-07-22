@@ -15,6 +15,10 @@ const (
 	isolationMinorUnsupportedCondition      = "IsolationMinorUnsupported"
 	isolationControllerIdentityMismatchCond = "IsolationControllerIdentityMismatch"
 	isolationHAUnsupportedCondition         = "IsolationHAUnsupported"
+	isolationTLSPrerequisiteCondition       = "IsolationTLSPrerequisiteMissing"
+	isolationMultipleClustersCondition      = "IsolationMultipleClusters"
+	isolationLimitRangePresentCondition     = "IsolationLimitRangePresent"
+	isolationSupportingRollingCondition     = "IsolationSupportingRolling"
 	dispatchUnconvergedReasonUnsupportedHA  = "ha-unsupported"
 )
 
@@ -23,6 +27,10 @@ var isolationPreflightConditions = []string{
 	isolationMinorUnsupportedCondition,
 	isolationControllerIdentityMismatchCond,
 	isolationHAUnsupportedCondition,
+	isolationTLSPrerequisiteCondition,
+	isolationMultipleClustersCondition,
+	isolationLimitRangePresentCondition,
+	isolationSupportingRollingCondition,
 }
 
 // dispatchProof is the result of a dispatch-convergence probe. converged is true
@@ -36,9 +44,11 @@ type dispatchProof struct {
 }
 
 // dispatchProber proves that every live API-server backend dispatches Pod CREATE
-// to the pgshard webhook via a per-backend dryRun sentinel probe.
+// to the pgshard webhook via a per-backend dryRun sentinel probe. The probe runs
+// in the activating cluster's FENCED namespace (which the PodCreate selector
+// covers), not the operator namespace.
 type dispatchProber interface {
-	Prove(ctx context.Context) (dispatchProof, error)
+	Prove(ctx context.Context, namespace string) (dispatchProof, error)
 }
 
 // minorGate reports whether the live API server is within the operator's
@@ -97,7 +107,7 @@ func (r *PgShardClusterReconciler) preflightConverged(ctx context.Context, clust
 		r.setIsolationPreflightCondition(cluster, isolationDispatchNotConvergedCondition, "Unavailable", "the dispatch-convergence prober is not wired")
 		return dispatchProof{}, false
 	}
-	proof, err := r.DispatchProber.Prove(ctx)
+	proof, err := r.DispatchProber.Prove(ctx, cluster.Namespace)
 	if err != nil {
 		r.setIsolationPreflightCondition(cluster, isolationDispatchNotConvergedCondition, "ProbeFailed", fmt.Sprintf("dispatch-convergence probe failed: %v", err))
 		return proof, false
@@ -117,37 +127,45 @@ func (r *PgShardClusterReconciler) preflightConverged(ctx context.Context, clust
 }
 
 // revalidateDispatchTuple re-proves dispatch convergence during an in-progress
-// activation and fails closed if the backend tuple changed or convergence was
-// lost: the receipt is reset to INACTIVE so activation re-enumerates and
-// re-proves from scratch. It returns whether the in-progress proof is still
-// valid.
+// activation. If the backend tuple changed or convergence was lost it fails
+// CLOSED: the receipt is held in ACTIVATING_QUIESCE (which denies every create),
+// never reset to INACTIVE, so enforcement is never dropped to fail-open while
+// membership is in flux. It re-enumerates by clearing the sealed state so the
+// quiesce phase re-seals under the fresh tuple. It returns whether the in-progress
+// proof is still valid.
 func (r *PgShardClusterReconciler) revalidateDispatchTuple(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
-	if r.DispatchProber == nil {
-		cluster.Status.IsolationReceipt = nil
-		r.setIsolationPreflightCondition(cluster, isolationDispatchNotConvergedCondition, "Unavailable", "the dispatch-convergence prober is not wired")
-		return false, r.Status().Update(ctx, cluster)
+	receipt := cluster.Status.IsolationReceipt
+	var proof dispatchProof
+	if r.DispatchProber != nil {
+		var err error
+		proof, err = r.DispatchProber.Prove(ctx, cluster.Namespace)
+		if err != nil {
+			return false, fmt.Errorf("re-prove dispatch convergence: %w", err)
+		}
 	}
-	proof, err := r.DispatchProber.Prove(ctx)
-	if err != nil {
-		return false, fmt.Errorf("re-prove dispatch convergence: %w", err)
-	}
-	if proof.converged && proof.tupleHash == cluster.Status.IsolationReceipt.DispatchTupleHash {
+	if r.DispatchProber != nil && proof.converged && proof.tupleHash == receipt.DispatchTupleHash {
 		return true, nil
 	}
-	// The backend set or webhook config changed, or convergence was lost: fail
-	// closed and re-block. Activation restarts from INACTIVE on the next pass.
-	cluster.Status.IsolationReceipt = nil
+	// Invalidated. Hold a durable deny phase (QUIESCE) and re-enumerate; never drop
+	// to INACTIVE (fail-open) mid-activation.
+	receipt.Phase = pgshardv1alpha1.IsolationActivatingQuiesce
+	receipt.SealedParents = nil
+	receipt.RecreatePendingUIDs = nil
+	receipt.ActivatedAt = metav1.Now()
 	condition := isolationDispatchNotConvergedCondition
 	reason := "TupleInvalidated"
-	message := "the dispatch-convergence proof was invalidated because the API-server backend set or webhook config changed during activation"
-	if proof.reason == dispatchUnconvergedReasonUnsupportedHA {
+	message := "the dispatch-convergence proof was invalidated (API-server backend set or webhook config changed during activation); the namespace is held quiesced while re-proving"
+	if proof.converged {
+		// The new tuple is itself converged: re-seal under it while staying quiesced.
+		receipt.DispatchTupleHash = proof.tupleHash
+	} else if proof.reason == dispatchUnconvergedReasonUnsupportedHA {
 		condition = isolationHAUnsupportedCondition
 		reason = "UnsupportedHA"
 		message = proof.reasonMessage()
 	}
 	r.setIsolationPreflightCondition(cluster, condition, reason, message)
 	if err := r.Status().Update(ctx, cluster); err != nil {
-		return false, fmt.Errorf("re-block isolation after dispatch tuple invalidation: %w", err)
+		return false, fmt.Errorf("hold isolation quiesced after dispatch tuple invalidation: %w", err)
 	}
 	return false, nil
 }

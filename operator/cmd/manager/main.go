@@ -12,6 +12,8 @@ import (
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"net/http"
+
 	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -141,6 +143,7 @@ func main() {
 		setupLog.Error(err, "unable to build discovery client for the activation preflight")
 		os.Exit(1)
 	}
+	identityProbeStore := podfence.NewIdentityObservationStore()
 	if err := (&controller.PgShardClusterReconciler{
 		Client:               manager.GetClient(),
 		APIReader:            manager.GetAPIReader(),
@@ -149,7 +152,7 @@ func main() {
 		ControllerIdents:     controllerIdentities,
 		DispatchProber:       controller.NewServerDispatchProber(manager.GetAPIReader(), restConfig, options.webhook.namespace, options.webhook.validatingConfigurationName),
 		MinorGate:            controller.NewServerVersionGate(discoveryClient),
-		IdentityProber:       controller.NewServerControllerIdentityProber(controllerIdentities),
+		IdentityProber:       controller.NewServerControllerIdentityProber(manager.GetClient(), controllerIdentities, identityProbeStore),
 	}).SetupWithManager(manager); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PgShardCluster")
 		os.Exit(1)
@@ -203,13 +206,16 @@ func main() {
 			Handler: podfence.NewMetadataValidator(handshakeCodec, scheme),
 		})
 		webhookServer.Register(podfence.PodCreateWebhookPath, &admission.Webhook{
-			Handler: podfence.NewPodCreateValidator(manager.GetAPIReader(), controllerIdentities, scheme),
+			Handler: podfence.NewPodCreateValidator(manager.GetAPIReader(), controllerIdentities, scheme).WithIdentityProbeStore(identityProbeStore),
 		})
 		webhookServer.Register(podfence.WorkloadWebhookPath, &admission.Webhook{
-			Handler: podfence.NewWorkloadIntegrityValidator(manager.GetAPIReader(), controllerIdentities, scheme),
+			Handler: podfence.NewWorkloadIntegrityValidator(manager.GetAPIReader(), controllerIdentities, scheme).WithIdentityProbeStore(identityProbeStore),
 		})
 		webhookServer.Register(podfence.PodConnectWebhookPath, &admission.Webhook{
 			Handler: podfence.NewPodConnectDenyValidator(manager.GetAPIReader(), options.webhook.namespace),
+		})
+		webhookServer.Register(podfence.LimitRangeWebhookPath, &admission.Webhook{
+			Handler: podfence.NewLimitRangeValidator(),
 		})
 		webhookServer.Register(podfence.StatusValidationWebhookPath, &admission.Webhook{
 			Handler: podfence.NewStatusValidator(manager.GetAPIReader(), handshakeCodec, scheme),
@@ -264,6 +270,18 @@ func main() {
 		}
 		if err := manager.AddReadyzCheck("webhook-server", webhookServer.StartedChecker()); err != nil {
 			setupLog.Error(err, "unable to add webhook server readiness check")
+			os.Exit(1)
+		}
+		// The isolation webhooks read the durable receipt authoritatively per
+		// request; report not-ready until an uncached API read succeeds, so a
+		// freshly restarted manager never serves admission before it can load the
+		// durable isolation state.
+		apiReader := manager.GetAPIReader()
+		if err := manager.AddReadyzCheck("isolation-state-load", func(request *http.Request) error {
+			clusters := &pgshardv1alpha1.PgShardClusterList{}
+			return apiReader.List(request.Context(), clusters, client.Limit(1))
+		}); err != nil {
+			setupLog.Error(err, "unable to add isolation state readiness check")
 			os.Exit(1)
 		}
 	}

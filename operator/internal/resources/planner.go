@@ -4480,7 +4480,7 @@ func applicationService(cluster *pgshardv1alpha1.PgShardCluster, mode string, te
 	appProtocol := "postgresql"
 	var selector map[string]string
 	if mode == "rw" {
-		selector = componentSelector(cluster, "pooler")
+		selector = hardenedComponentSelector(cluster, "pooler")
 	}
 	return &corev1.Service{
 		ObjectMeta: ownedMeta(cluster, cluster.Name+"-"+mode, "pooler", template.Annotations),
@@ -4499,7 +4499,7 @@ func applicationService(cluster *pgshardv1alpha1.PgShardCluster, mode string, te
 }
 
 func shardService(cluster *pgshardv1alpha1.PgShardCluster, shard int32) *corev1.Service {
-	selector := componentSelector(cluster, "postgresql")
+	selector := hardenedComponentSelector(cluster, "postgresql")
 	selector[ShardLabel] = shardLabel(shard)
 	return &corev1.Service{
 		ObjectMeta: ownedMeta(cluster, shardName(cluster.Name, shard), "postgresql", nil),
@@ -4728,7 +4728,7 @@ func CatalogTLSDNSNames(cluster, namespace string) []string {
 }
 
 func catalogService(cluster *pgshardv1alpha1.PgShardCluster) *corev1.Service {
-	selector := componentSelector(cluster, "postgresql")
+	selector := hardenedComponentSelector(cluster, "postgresql")
 	selector[ShardLabel] = shardLabel(0)
 	selector[RoleLabel] = "primary"
 	return &corev1.Service{
@@ -5874,7 +5874,7 @@ func orchestratorService(cluster *pgshardv1alpha1.PgShardCluster) *corev1.Servic
 	return &corev1.Service{
 		ObjectMeta: ownedMeta(cluster, cluster.Name+OrchestratorSuffix, "orchestrator", nil),
 		Spec: corev1.ServiceSpec{
-			Selector: componentSelector(cluster, "orchestrator"),
+			Selector: hardenedComponentSelector(cluster, "orchestrator"),
 			Ports:    []corev1.ServicePort{{Name: "http", Protocol: corev1.ProtocolTCP, Port: HTTPPort, TargetPort: intstr.FromString("http")}},
 		},
 	}
@@ -5886,7 +5886,7 @@ func poolerService(cluster *pgshardv1alpha1.PgShardCluster) *corev1.Service {
 		Spec: corev1.ServiceSpec{
 			Type:                     corev1.ServiceTypeClusterIP,
 			PublishNotReadyAddresses: true,
-			Selector:                 componentSelector(cluster, "pooler"),
+			Selector:                 hardenedComponentSelector(cluster, "pooler"),
 			Ports:                    []corev1.ServicePort{{Name: "http", Protocol: corev1.ProtocolTCP, Port: HTTPPort, TargetPort: intstr.FromString("http")}},
 		},
 	}
@@ -5972,11 +5972,11 @@ func postgresqlNetworkPolicy(cluster *pgshardv1alpha1.PgShardCluster, shard int3
 	tcp := corev1.ProtocolTCP
 	postgresqlPort := intstr.FromInt32(PostgreSQLPort)
 	agentHTTPPort := intstr.FromInt32(HTTPPort)
-	selector := componentSelector(cluster, "postgresql")
+	selector := hardenedComponentSelector(cluster, "postgresql")
 	selector[ShardLabel] = shardLabel(shard)
 	postgresqlPeer := maps.Clone(selector)
 	controlPeer := map[string]string{ClusterLabel: cluster.Name}
-	orchestratorPeer := componentSelector(cluster, "orchestrator")
+	orchestratorPeer := hardenedComponentSelector(cluster, "orchestrator")
 	return &networkingv1.NetworkPolicy{
 		ObjectMeta: ownedMeta(cluster, shardName(cluster.Name, shard)+"-ingress", "postgresql", nil),
 		Spec: networkingv1.NetworkPolicySpec{
@@ -6049,7 +6049,7 @@ func orchestratorDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash
 			Selector: &metav1.LabelSelector{MatchLabels: selector},
 			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RollingUpdateDeploymentStrategyType, RollingUpdate: &appsv1.RollingUpdateDeployment{MaxUnavailable: intOrStringPtr(intstr.FromInt32(1)), MaxSurge: intOrStringPtr(intstr.FromInt32(1))}},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: selector, Annotations: map[string]string{ConfigHashAnnotation: hash, PostgreSQLPodClusterUIDAnnotation: string(cluster.UID)}},
+				ObjectMeta: metav1.ObjectMeta{Labels: hardenedComponentSelector(cluster, "orchestrator"), Annotations: map[string]string{ConfigHashAnnotation: hash, PostgreSQLPodClusterUIDAnnotation: string(cluster.UID)}},
 				Spec:       podSpec,
 			},
 		},
@@ -6138,7 +6138,7 @@ func poolerDeployment(cluster *pgshardv1alpha1.PgShardCluster, image, hash strin
 			Replicas: desiredReplicas,
 			Selector: &metav1.LabelSelector{MatchLabels: selector},
 			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RollingUpdateDeploymentStrategyType, RollingUpdate: &appsv1.RollingUpdateDeployment{MaxUnavailable: intOrStringPtr(intstr.FromInt32(1)), MaxSurge: intOrStringPtr(intstr.FromInt32(1))}},
-			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: selector, Annotations: map[string]string{ConfigHashAnnotation: hash, PostgreSQLPodClusterUIDAnnotation: string(cluster.UID)}}, Spec: podSpec},
+			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: hardenedComponentSelector(cluster, "pooler"), Annotations: map[string]string{ConfigHashAnnotation: hash, PostgreSQLPodClusterUIDAnnotation: string(cluster.UID)}}, Spec: podSpec},
 		},
 	}, nil
 }
@@ -6352,12 +6352,22 @@ func labels(cluster *pgshardv1alpha1.PgShardCluster, component string) map[strin
 	}
 }
 
-// componentSelector is the label selector shared by owned pod templates, their
-// StatefulSet/Deployment selectors, Services, and NetworkPolicy peers. It pins
-// the managed-by label so Service and NetworkPolicy selection cannot match a
-// foreign pod that merely borrows the cluster and component labels
-// (defense-in-depth for the network boundary).
+// componentSelector is the immutable identity selector that feeds owned
+// StatefulSet/Deployment .spec.selector. It deliberately does NOT pin managed-by:
+// a StatefulSet/Deployment selector is immutable, so adding a label to it would
+// break server-side apply on every already-provisioned cluster. The managed-by
+// hardening lands on pod-template labels, Services, and NetworkPolicies via
+// hardenedComponentSelector instead.
 func componentSelector(cluster *pgshardv1alpha1.PgShardCluster, component string) map[string]string {
+	return map[string]string{ClusterLabel: cluster.Name, ComponentLabel: component}
+}
+
+// hardenedComponentSelector pins the managed-by label. It is used for pod-template
+// labels (a valid superset of the immutable workload selector) and for Service
+// and NetworkPolicy selection, so those cannot match a foreign pod that merely
+// borrows the cluster and component labels. It is never used as a workload
+// .spec.selector.
+func hardenedComponentSelector(cluster *pgshardv1alpha1.PgShardCluster, component string) map[string]string {
 	return map[string]string{ManagedByLabel: ManagedByValue, ClusterLabel: cluster.Name, ComponentLabel: component}
 }
 

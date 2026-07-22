@@ -1400,3 +1400,14 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	}
 	return scheme
 }
+
+func TestLimitRangeValidatorDeniesEveryWrite(t *testing.T) {
+	t.Parallel()
+	validator := NewLimitRangeValidator()
+	for _, op := range []admissionv1.Operation{admissionv1.Create, admissionv1.Update} {
+		request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: op, Resource: metav1.GroupVersionResource{Version: "v1", Resource: "limitranges"}}}
+		if response := validator.Handle(context.Background(), request); response.Allowed || !strings.Contains(response.Result.Message, "not permitted in a fenced") {
+			t.Fatalf("LimitRange %s allowed: %#v", op, response.Result)
+		}
+	}
+}

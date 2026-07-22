@@ -184,7 +184,7 @@ func TestPlanIsDeterministicAndWiresGeneratedConfiguration(t *testing.T) {
 		if service.Spec.Ports[0].Port != PostgreSQLPort || service.Spec.Ports[0].TargetPort.StrVal != "pooler-"+suffix {
 			t.Fatalf("%s service port = %#v", suffix, service.Spec.Ports[0])
 		}
-		if suffix == "rw" && !reflect.DeepEqual(service.Spec.Selector, componentSelector(cluster, "pooler")) {
+		if suffix == "rw" && !reflect.DeepEqual(service.Spec.Selector, hardenedComponentSelector(cluster, "pooler")) {
 			t.Fatalf("read-write Service selector = %#v", service.Spec.Selector)
 		}
 		if suffix != "rw" && service.Spec.Selector != nil {
@@ -3157,7 +3157,7 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 			t.Fatalf("PostgreSQL same-shard peers = %#v", postgresqlPeers)
 		}
 		agentPeers := postgresqlPolicy.Spec.Ingress[2].From
-		if len(agentPeers) != 1 || agentPeers[0].PodSelector == nil || agentPeers[0].NamespaceSelector != nil || agentPeers[0].IPBlock != nil || !maps.Equal(agentPeers[0].PodSelector.MatchLabels, componentSelector(cluster, "orchestrator")) || len(agentPeers[0].PodSelector.MatchExpressions) != 0 {
+		if len(agentPeers) != 1 || agentPeers[0].PodSelector == nil || agentPeers[0].NamespaceSelector != nil || agentPeers[0].IPBlock != nil || !maps.Equal(agentPeers[0].PodSelector.MatchLabels, hardenedComponentSelector(cluster, "orchestrator")) || len(agentPeers[0].PodSelector.MatchExpressions) != 0 {
 			t.Fatalf("PostgreSQL agent diagnostic peers = %#v", agentPeers)
 		}
 	}

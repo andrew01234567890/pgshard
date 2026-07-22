@@ -469,7 +469,13 @@ type PostgreSQLIsolationReceipt struct {
 	// as create parents during ACTIVATING_RECREATE.
 	// +listType=atomic
 	SealedParents []SealedParent `json:"sealedParents,omitempty"`
-	ActivatedAt   metav1.Time    `json:"activatedAt,omitempty"`
+	// RecreatePendingUIDs are the pre-guard protected pod UIDs sealed at the
+	// entry to ACTIVATING_RECREATE. Every one must be deleted (and its guarded
+	// replacement created) before ACTIVE; this replaces CreationTimestamp
+	// inference so no pod is authenticated by when it was created.
+	// +listType=atomic
+	RecreatePendingUIDs []string    `json:"recreatePendingUIDs,omitempty"`
+	ActivatedAt         metav1.Time `json:"activatedAt,omitempty"`
 }
 
 // IsolationActivationAnnotation is the opt-in trigger for per-namespace isolation
@@ -550,6 +556,12 @@ type SupportingGenerationStatus struct {
 	PriorReplicaSetUID string `json:"priorReplicaSetUID,omitempty"`
 	// +kubebuilder:validation:Pattern=`^([0-9a-f]{64})?$`
 	PriorContractHash string `json:"priorContractHash,omitempty"`
+	// PriorRevoked removes the prior ReplicaSet from the admissible set for NEW
+	// creates while it is still being drained. It is set durably BEFORE the drain
+	// so admission stops accepting new prior-generation pods before any zero-pod
+	// proof, closing the race where a new prior pod is created between the final
+	// zero LIST and the status clear.
+	PriorRevoked bool `json:"priorRevoked,omitempty"`
 	// MinGenerationForNewCreates is the security-generation floor: a pod stamped
 	// below it is denied for new creates and, if it lands, is a late write to be
 	// deleted before convergence.

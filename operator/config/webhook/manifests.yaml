@@ -199,6 +199,29 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
+      path: /validate-core-v1-postgresqllimitrange
+      port: 9444
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  name: vpostgresqllimitrange.pgshard.io
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - limitranges
+  sideEffects: None
+  timeoutSeconds: 5
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
       path: /validate-core-v1-postgresqlpodconnect
       port: 9444
   failurePolicy: Fail

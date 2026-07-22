@@ -126,7 +126,7 @@ func TestAdmissionResourcesArePrecreatedAndExactlyScoped(t *testing.T) {
 		t.Fatalf("mutating webhook selector patch = %#v", mutatingSelectors.Webhooks)
 	}
 	validatingSelectors := readManifest[admissionregistrationv1.ValidatingWebhookConfiguration](t, "../../config/webhook/validating_selectors_patch.yaml")
-	if len(validatingSelectors.Webhooks) != 8 ||
+	if len(validatingSelectors.Webhooks) != 9 ||
 		validatingSelectors.Webhooks[0].Name != podfence.MetadataWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[0].NamespaceSelector) ||
 		validatingSelectors.Webhooks[1].Name != podfence.NamespaceWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[1].ObjectSelector) ||
 		validatingSelectors.Webhooks[2].Name != podfence.StatusValidationWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[2].NamespaceSelector) ||
@@ -134,7 +134,8 @@ func TestAdmissionResourcesArePrecreatedAndExactlyScoped(t *testing.T) {
 		validatingSelectors.Webhooks[4].Name != podfence.PodCreateWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[4].NamespaceSelector) ||
 		validatingSelectors.Webhooks[5].Name != podfence.WorkloadWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[5].NamespaceSelector) ||
 		validatingSelectors.Webhooks[6].Name != podfence.PodConnectFencedWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[6].NamespaceSelector) ||
-		validatingSelectors.Webhooks[7].Name != podfence.PodConnectManagerWebhookName || !selectsOperatorNamespace(validatingSelectors.Webhooks[7].NamespaceSelector) {
+		validatingSelectors.Webhooks[7].Name != podfence.PodConnectManagerWebhookName || !selectsOperatorNamespace(validatingSelectors.Webhooks[7].NamespaceSelector) ||
+		validatingSelectors.Webhooks[8].Name != podfence.LimitRangeWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[8].NamespaceSelector) {
 		t.Fatalf("validating webhook selector patch = %#v", validatingSelectors.Webhooks)
 	}
 }
@@ -163,7 +164,7 @@ func TestGeneratedWebhookConfigurationsStayFailClosedAndBounded(t *testing.T) {
 	if err := decoder.Decode(&extra); err != io.EOF {
 		t.Fatalf("unexpected third webhook manifest: %v", err)
 	}
-	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 11 {
+	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 12 {
 		t.Fatalf("generated webhooks = %#v / %#v", mutating.Webhooks, validating.Webhooks)
 	}
 	activationFound := false

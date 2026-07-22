@@ -1019,7 +1019,7 @@ func isolationReceiptCluster(phase pgshardv1alpha1.IsolationPhase, sealed ...pgs
 	return cluster
 }
 
-func supportingCreateFixture(t *testing.T, cluster *pgshardv1alpha1.PgShardCluster) (client.Object, client.Object, *corev1.Pod) {
+func supportingCreateFixture(t *testing.T, cluster *pgshardv1alpha1.PgShardCluster) (*appsv1.Deployment, *appsv1.ReplicaSet, *corev1.Pod) {
 	t.Helper()
 	controller := true
 	deployment := poolerDeploymentFixture(t)
@@ -1135,15 +1135,42 @@ func TestPodCreateIsolationActiveEnforcesDigestPin(t *testing.T) {
 func TestPodCreateIsolationRecreateRequiresSealedParent(t *testing.T) {
 	t.Parallel()
 	scheme := workloadScheme(t)
-	sealedCluster := isolationReceiptCluster(pgshardv1alpha1.IsolationActivatingRecreate, pgshardv1alpha1.SealedParent{Kind: "Deployment", UID: "pooler-deploy-uid"})
-	deployment, replicaSet, pod := supportingCreateFixture(t, sealedCluster)
+	deployment, replicaSet, pod := supportingCreateFixture(t, testWorkloadCluster())
+	deploymentHash := deployment.Spec.Template.Annotations[owned.PodContractHashAnnotation]
+
+	// A sealed parent at its exact incarnation passes the recreate GATE, then hits
+	// the full guard (RECREATE is identical to ACTIVE): the fixture's tag image is
+	// rejected by digest pinning, proving RECREATE enforces the full contract.
+	sealedCluster := isolationReceiptCluster(pgshardv1alpha1.IsolationActivatingRecreate, pgshardv1alpha1.SealedParent{
+		Kind: "Deployment", Name: deployment.Name, UID: string(deployment.UID), ContractHash: deploymentHash,
+	})
 	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sealedCluster, deployment, replicaSet).Build()
-	if response := NewPodCreateValidator(reader, testControllerIdentities(), scheme).Handle(context.Background(), supportingCreateRequest(t, pod)); !response.Allowed {
-		t.Fatalf("recreate denied a sealed-parent Pod: %#v", response.Result)
+	if response := NewPodCreateValidator(reader, testControllerIdentities(), scheme).Handle(context.Background(), supportingCreateRequest(t, pod)); response.Allowed ||
+		!strings.Contains(response.Result.Message, "digest-pinned") {
+		t.Fatalf("recreate did not fully guard a sealed-parent Pod: %#v", response)
+	}
+
+	// A stampless pod of a sealed parent is denied (stamp mandatory under RECREATE).
+	stampless := pod.DeepCopy()
+	delete(stampless.Annotations, owned.PodContractHashAnnotation)
+	if response := NewPodCreateValidator(reader, testControllerIdentities(), scheme).Handle(context.Background(), supportingCreateRequest(t, stampless)); response.Allowed ||
+		!strings.Contains(response.Result.Message, "must carry the reconciler stamp") {
+		t.Fatalf("recreate admitted a stampless sealed-parent Pod: %#v", response)
+	}
+
+	// A receipt whose sealed hash differs from the live parent (post-seal template
+	// mutation) denies the create even though the UID matches.
+	mutatedCluster := isolationReceiptCluster(pgshardv1alpha1.IsolationActivatingRecreate, pgshardv1alpha1.SealedParent{
+		Kind: "Deployment", Name: deployment.Name, UID: string(deployment.UID), ContractHash: strings.Repeat("e", 64),
+	})
+	mutatedReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mutatedCluster, deployment, replicaSet).Build()
+	if response := NewPodCreateValidator(mutatedReader, testControllerIdentities(), scheme).Handle(context.Background(), supportingCreateRequest(t, pod)); response.Allowed ||
+		!strings.Contains(response.Result.Message, "sealed parent") {
+		t.Fatalf("recreate admitted a Pod whose sealed parent hash was mutated: %#v", response)
 	}
 
 	// A receipt that seals a different Deployment denies this pod's create.
-	unsealedCluster := isolationReceiptCluster(pgshardv1alpha1.IsolationActivatingRecreate, pgshardv1alpha1.SealedParent{Kind: "Deployment", UID: "some-other-deploy"})
+	unsealedCluster := isolationReceiptCluster(pgshardv1alpha1.IsolationActivatingRecreate, pgshardv1alpha1.SealedParent{Kind: "Deployment", Name: "other", UID: "some-other-deploy", ContractHash: deploymentHash})
 	unsealedReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(unsealedCluster, deployment, replicaSet).Build()
 	if response := NewPodCreateValidator(unsealedReader, testControllerIdentities(), scheme).Handle(context.Background(), supportingCreateRequest(t, pod)); response.Allowed ||
 		!strings.Contains(response.Result.Message, "sealed parent") {

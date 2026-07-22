@@ -49,11 +49,43 @@ func (r *PgShardClusterReconciler) reconcileIsolationActivation(ctx context.Cont
 
 	switch isolationReceiptPhase(receipt) {
 	case pgshardv1alpha1.IsolationInactive:
-		// Eligibility (opt-in trigger + fenced namespace) is checked BEFORE the
-		// expensive preflight so non-opted-in clusters never probe the API
-		// servers or create probe workloads.
-		if !isolationEligible(cluster, namespace) {
+		// Opt-in (trigger + fenced namespace) is checked BEFORE any prerequisite
+		// or probe so a non-opted-in cluster stays silently inactive and never
+		// probes the API servers.
+		if !isolationOptedIn(cluster, namespace) {
 			return false, nil
+		}
+		// A legacy cleartext cluster must never receive an ACTIVE receipt: require
+		// the durable server-tls-v1 transport policy and complete TLS checkpoints.
+		if !hasReplicationTLSPrerequisite(cluster) {
+			r.setIsolationPreflightCondition(cluster, isolationTLSPrerequisiteCondition, "TransportNotHardened", "isolation activation requires the durable server-tls-v1 replication transport policy and complete replication-TLS checkpoints (single-member activation-TLS parity is a ratified follow-up)")
+			return false, r.Status().Update(ctx, cluster)
+		}
+		// Namespace-wide activation seals and recreates every protected pod in the
+		// namespace, so it is unsafe with more than one cluster present.
+		single, err := r.exactlyOneClusterInNamespace(ctx, cluster)
+		if err != nil {
+			return false, err
+		}
+		if !single {
+			r.setIsolationPreflightCondition(cluster, isolationMultipleClustersCondition, "MultipleClusters", "isolation activation requires exactly one PgShardCluster in the fenced namespace")
+			return false, r.Status().Update(ctx, cluster)
+		}
+		// A defaulting LimitRange could mutate recreated pods after stamping and
+		// break the comparator; refuse activation while any exists (the webhook
+		// keeps new ones out during and after activation).
+		if name, err := r.limitRangePresent(ctx, cluster.Namespace); err != nil {
+			return false, err
+		} else if name != "" {
+			r.setIsolationPreflightCondition(cluster, isolationLimitRangePresentCondition, "LimitRangePresent", fmt.Sprintf("isolation activation is blocked while LimitRange %q exists in the fenced namespace", name))
+			return false, r.Status().Update(ctx, cluster)
+		}
+		// A supporting-generation roll in progress (a populated prior) means the
+		// admissible set is in flux; do not begin activation until every class has
+		// converged.
+		if supportingRollInProgress(cluster) {
+			r.setIsolationPreflightCondition(cluster, isolationSupportingRollingCondition, "SupportingRolling", "isolation activation is withheld while a supporting-generation roll is in progress")
+			return false, r.Status().Update(ctx, cluster)
 		}
 		proof, ok := r.preflightConverged(ctx, cluster)
 		if !ok {
@@ -103,7 +135,10 @@ func (r *PgShardClusterReconciler) driveIsolationQuiesce(ctx context.Context, cl
 		}
 		return true, nil
 	}
-	if time.Since(receipt.ActivatedAt.Time) < supportingRevocationDrain {
+	// A full-second safety margin covers the one-second truncation of the
+	// metav1.Time drain start plus modest clock skew, so the drain never completes
+	// early and lets a pre-quiesce in-flight create persist.
+	if time.Since(receipt.ActivatedAt.Time) < supportingRevocationDrain+time.Second {
 		return true, nil
 	}
 	blocked, residue, err := r.inventoryNamespace(ctx, cluster)
@@ -113,7 +148,14 @@ func (r *PgShardClusterReconciler) driveIsolationQuiesce(ctx context.Context, cl
 	if blocked != "" {
 		return r.blockIsolation(ctx, cluster, blocked)
 	}
+	// Seal the exact pre-guard protected pod UIDs; recreate authenticates by
+	// UID-deletion, never by CreationTimestamp.
+	pending, err := r.protectedPodUIDs(ctx, cluster)
+	if err != nil {
+		return false, err
+	}
 	receipt.ResidueProfileHash = residue
+	receipt.RecreatePendingUIDs = pending
 	receipt.Phase = pgshardv1alpha1.IsolationActivatingRecreate
 	receipt.ActivatedAt = metav1.Now()
 	meta.RemoveStatusCondition(&cluster.Status.Conditions, isolationActivationBlockedCondition)
@@ -123,34 +165,40 @@ func (r *PgShardClusterReconciler) driveIsolationQuiesce(ctx context.Context, cl
 	return true, nil
 }
 
-// driveIsolationRecreate deletes every protected pod that predates the recreate
-// phase so the controllers recreate it under the guard (each pod is authenticated
-// at its guarded create), then re-inventories. When no pre-guard protected pod
-// remains and the inventory is clean it advances to ACTIVE.
+// driveIsolationRecreate deletes every sealed pre-guard protected pod (by UID,
+// including terminating ones) so the controllers recreate each under the guard,
+// and only advances to ACTIVE once none of the sealed UIDs remains and the full
+// inventory validates. It never infers authentication from CreationTimestamp.
 func (r *PgShardClusterReconciler) driveIsolationRecreate(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
 	if valid, err := r.revalidateDispatchTuple(ctx, cluster); err != nil || !valid {
 		return true, err
 	}
 	receipt := cluster.Status.IsolationReceipt
 	reader := r.authoritativeReader()
+	pending := map[string]struct{}{}
+	for _, uid := range receipt.RecreatePendingUIDs {
+		pending[uid] = struct{}{}
+	}
 	pods := &corev1.PodList{}
 	if err := reader.List(ctx, pods, client.InNamespace(cluster.Namespace)); err != nil {
 		return false, fmt.Errorf("list pods for isolation recreate: %w", err)
 	}
-	preGuard := 0
+	remaining := 0
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if !isProtectedInventoryPod(pod) || pod.DeletionTimestamp != nil {
+		if _, sealed := pending[string(pod.UID)]; !sealed {
 			continue
 		}
-		if pod.CreationTimestamp.Time.Before(receipt.ActivatedAt.Time) {
-			preGuard++
+		remaining++
+		if pod.DeletionTimestamp == nil {
 			if err := r.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
 				return false, fmt.Errorf("delete pre-guard protected pod %s: %w", pod.Name, err)
 			}
 		}
 	}
-	if preGuard > 0 {
+	if remaining > 0 {
+		// Some pre-guard pod is still being deleted (or its guarded replacement not
+		// yet created); wait until every sealed UID is gone.
 		return true, nil
 	}
 	blocked, residue, err := r.inventoryNamespace(ctx, cluster)
@@ -161,6 +209,7 @@ func (r *PgShardClusterReconciler) driveIsolationRecreate(ctx context.Context, c
 		return r.blockIsolation(ctx, cluster, blocked)
 	}
 	receipt.ResidueProfileHash = residue
+	receipt.RecreatePendingUIDs = nil
 	receipt.Phase = pgshardv1alpha1.IsolationActive
 	receipt.MinAcceptableSecurityGeneration = receipt.SecurityGeneration
 	receipt.ActivatedAt = metav1.Now()
@@ -171,16 +220,42 @@ func (r *PgShardClusterReconciler) driveIsolationRecreate(ctx context.Context, c
 	return false, nil
 }
 
-// driveIsolationActive keeps the namespace clean: a foreign or contract-failing
-// pod that appears blocks and surfaces the condition; otherwise the receipt is
-// steady.
+// protectedPodUIDs returns the UIDs of every live protected pod in the namespace.
+func (r *PgShardClusterReconciler) protectedPodUIDs(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) ([]string, error) {
+	pods := &corev1.PodList{}
+	if err := r.authoritativeReader().List(ctx, pods, client.InNamespace(cluster.Namespace)); err != nil {
+		return nil, fmt.Errorf("list protected pods to seal for recreate: %w", err)
+	}
+	uids := []string{}
+	for i := range pods.Items {
+		if isProtectedInventoryPod(&pods.Items[i]) {
+			uids = append(uids, string(pods.Items[i].UID))
+		}
+	}
+	sort.Strings(uids)
+	return uids, nil
+}
+
+// driveIsolationActive re-inventories under enforcement. On drift — a pod that no
+// longer validates the full live contract — it does not merely raise a condition;
+// it returns the receipt to ACTIVATING_QUIESCE so the parents are re-sealed, the
+// namespace re-drained, and every protected pod re-recreated under the guard.
 func (r *PgShardClusterReconciler) driveIsolationActive(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
 	blocked, _, err := r.inventoryNamespace(ctx, cluster)
 	if err != nil {
 		return false, err
 	}
 	if blocked != "" {
-		return r.blockIsolation(ctx, cluster, blocked)
+		receipt := cluster.Status.IsolationReceipt
+		receipt.Phase = pgshardv1alpha1.IsolationActivatingQuiesce
+		receipt.SealedParents = nil
+		receipt.RecreatePendingUIDs = nil
+		receipt.ActivatedAt = metav1.Now()
+		r.blockIsolationCondition(cluster, blocked)
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return false, fmt.Errorf("remediate isolation drift by re-quiescing: %w", err)
+		}
+		return true, nil
 	}
 	if meta.FindStatusCondition(cluster.Status.Conditions, isolationActivationBlockedCondition) != nil {
 		meta.RemoveStatusCondition(&cluster.Status.Conditions, isolationActivationBlockedCondition)
@@ -191,7 +266,7 @@ func (r *PgShardClusterReconciler) driveIsolationActive(ctx context.Context, clu
 	return false, nil
 }
 
-func (r *PgShardClusterReconciler) blockIsolation(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, podName string) (bool, error) {
+func (r *PgShardClusterReconciler) blockIsolationCondition(cluster *pgshardv1alpha1.PgShardCluster, podName string) {
 	meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
 		Type:               isolationActivationBlockedCondition,
 		Status:             metav1.ConditionTrue,
@@ -199,6 +274,10 @@ func (r *PgShardClusterReconciler) blockIsolation(ctx context.Context, cluster *
 		Reason:             "UnauthenticatedPod",
 		Message:            fmt.Sprintf("isolation activation is blocked by pod %s, which does not satisfy the contract at the current generation", podName),
 	})
+}
+
+func (r *PgShardClusterReconciler) blockIsolation(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, podName string) (bool, error) {
+	r.blockIsolationCondition(cluster, podName)
 	if err := r.Status().Update(ctx, cluster); err != nil {
 		return false, fmt.Errorf("surface isolation activation block: %w", err)
 	}
@@ -283,6 +362,12 @@ func (r *PgShardClusterReconciler) inventoryNamespace(ctx context.Context, clust
 		if err != nil || generation < floor {
 			return pod.Name, "", nil
 		}
+		// Every protected pod must be digest-pinned once isolation is active; each
+		// was already fully validated (LiveNormalForm + parent + hash + provenance)
+		// at its guarded create during RECREATE.
+		if owned.ValidateProtectedImagesDigestPinned(&pod.Spec) != nil {
+			return pod.Name, "", nil
+		}
 		fingerprints = append(fingerprints, kind+":"+hash+":"+strconv.FormatInt(generation, 10))
 	}
 	sort.Strings(fingerprints)
@@ -323,16 +408,82 @@ func isolationReceiptPhase(receipt *pgshardv1alpha1.PostgreSQLIsolationReceipt) 
 	return receipt.Phase
 }
 
-// isolationEligible reports whether a namespace may begin activation. Activation
-// is OPT-IN and default OFF: the cluster must carry the activation annotation, be
-// in a fenced namespace, and not be terminating. Without the annotation a cluster
-// never activates, so existing clusters and the KIND smoke are unaffected even
-// though the preflight is now real.
-func isolationEligible(cluster *pgshardv1alpha1.PgShardCluster, namespace *corev1.Namespace) bool {
+// isolationOptedIn reports whether a cluster has explicitly requested activation.
+// Activation is OPT-IN and default OFF: the cluster must carry the activation
+// annotation, be in a fenced namespace, and neither be terminating. Without the
+// annotation a cluster never activates, so existing clusters and the KIND smoke
+// are unaffected even though the preflight is now real.
+func isolationOptedIn(cluster *pgshardv1alpha1.PgShardCluster, namespace *corev1.Namespace) bool {
 	return cluster.DeletionTimestamp == nil &&
 		cluster.Annotations[pgshardv1alpha1.IsolationActivationAnnotation] == pgshardv1alpha1.IsolationActivationRequested &&
 		namespace.DeletionTimestamp == nil &&
 		namespace.Labels[podfence.NamespaceLabel] == podfence.NamespaceLabelValue
+}
+
+// hasReplicationTLSPrerequisite reports whether a cluster's durable replication
+// transport is hardened enough to activate: the recorded transport policy is
+// server-tls-v1 and every shard has a complete replication-TLS checkpoint (CA
+// digest plus a server digest for every member). Single-member clusters gate off
+// until the ratified activation-TLS parity path lands.
+func hasReplicationTLSPrerequisite(cluster *pgshardv1alpha1.PgShardCluster) bool {
+	if cluster.Spec.MembersPerShard <= 1 {
+		return false
+	}
+	spec := cluster.Status.PostgreSQLBootstrapSpec
+	if spec == nil || spec.ReplicationTransportPolicy != pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1 {
+		return false
+	}
+	if len(cluster.Status.PostgreSQLReplicationTLS) == 0 {
+		return false
+	}
+	for _, shard := range cluster.Status.PostgreSQLReplicationTLS {
+		if shard.CASHA256 == "" || len(shard.Members) == 0 {
+			return false
+		}
+		for _, member := range shard.Members {
+			if member.ServerSHA256 == "" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// limitRangePresent returns the name of any LimitRange in the namespace, or "".
+func (r *PgShardClusterReconciler) limitRangePresent(ctx context.Context, namespace string) (string, error) {
+	list := &corev1.LimitRangeList{}
+	if err := r.authoritativeReader().List(ctx, list, client.InNamespace(namespace)); err != nil {
+		return "", fmt.Errorf("list LimitRanges for activation: %w", err)
+	}
+	if len(list.Items) > 0 {
+		return list.Items[0].Name, nil
+	}
+	return "", nil
+}
+
+// supportingRollInProgress reports whether any supporting class still has a
+// populated prior generation (a roll that has not converged).
+func supportingRollInProgress(cluster *pgshardv1alpha1.PgShardCluster) bool {
+	for _, record := range cluster.Status.SupportingGenerations {
+		if record.PriorReplicaSetUID != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *PgShardClusterReconciler) exactlyOneClusterInNamespace(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
+	list := &pgshardv1alpha1.PgShardClusterList{}
+	if err := r.authoritativeReader().List(ctx, list, client.InNamespace(cluster.Namespace)); err != nil {
+		return false, fmt.Errorf("list PgShardClusters in namespace for activation: %w", err)
+	}
+	live := 0
+	for i := range list.Items {
+		if list.Items[i].DeletionTimestamp == nil {
+			live++
+		}
+	}
+	return live == 1, nil
 }
 
 func currentSecurityGeneration(cluster *pgshardv1alpha1.PgShardCluster) int64 {

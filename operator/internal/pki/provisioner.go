@@ -894,8 +894,8 @@ func (p *Provisioner) readConfigurations(ctx context.Context, caBundle []byte) (
 	if err := p.client.Get(ctx, types.NamespacedName{Name: p.validatingConfigurationName}, validating); err != nil {
 		return nil, fmt.Errorf("get validating webhook configuration: %w", err)
 	}
-	if len(validating.Webhooks) != 11 {
-		return nil, fmt.Errorf("validating webhook configuration contains %d webhooks, want exactly eleven", len(validating.Webhooks))
+	if len(validating.Webhooks) != 12 {
+		return nil, fmt.Errorf("validating webhook configuration contains %d webhooks, want exactly twelve", len(validating.Webhooks))
 	}
 	for _, expected := range []struct {
 		name, path        string
@@ -913,6 +913,7 @@ func (p *Provisioner) readConfigurations(ctx context.Context, caBundle []byte) (
 		{name: podfence.WorkloadWebhookName, path: podfence.WorkloadWebhookPath, rules: matchesPostgreSQLWorkloadRules, namespace: podFencingNamespaceSelector()},
 		{name: podfence.PodConnectFencedWebhookName, path: podfence.PodConnectWebhookPath, rules: matchesPostgreSQLConnectRules, namespace: podFencingNamespaceSelector()},
 		{name: podfence.PodConnectManagerWebhookName, path: podfence.PodConnectWebhookPath, rules: matchesPostgreSQLConnectRules, namespace: operatorNamespaceSelector(p.namespace)},
+		{name: podfence.LimitRangeWebhookName, path: podfence.LimitRangeWebhookPath, rules: matchesPostgreSQLLimitRangeRules, namespace: podFencingNamespaceSelector()},
 	} {
 		webhook := findValidatingWebhook(validating.Webhooks, expected.name)
 		if webhook == nil {
@@ -1043,6 +1044,10 @@ func matchesPostgreSQLConnectRules(rules []admissionregistrationv1.RuleWithOpera
 		slices.Equal(rule.APIGroups, []string{""}) && slices.Equal(rule.APIVersions, []string{"v1"}) &&
 		slices.Equal(rule.Resources, []string{"pods/exec", "pods/attach", "pods/portforward", "pods/proxy"}) &&
 		(rule.Scope == nil || *rule.Scope == admissionregistrationv1.AllScopes)
+}
+
+func matchesPostgreSQLLimitRangeRules(rules []admissionregistrationv1.RuleWithOperations) bool {
+	return matchesCoreResourceRules(rules, []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update}, []string{"limitranges"})
 }
 
 func matchesPostgreSQLNamespaceRules(rules []admissionregistrationv1.RuleWithOperations) bool {

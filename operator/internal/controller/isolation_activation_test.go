@@ -26,7 +26,9 @@ type fakeDispatchProber struct {
 	err   error
 }
 
-func (f fakeDispatchProber) Prove(ctx context.Context) (dispatchProof, error) { return f.proof, f.err }
+func (f fakeDispatchProber) Prove(ctx context.Context, namespace string) (dispatchProof, error) {
+	return f.proof, f.err
+}
 
 // convergedDispatch matches the empty tuple hash used by the drive tests, so
 // revalidateDispatchTuple treats the in-progress activation as still valid.
@@ -176,6 +178,8 @@ func TestDriveIsolationRecreateReguardsThenActivates(t *testing.T) {
 	cluster := genCluster("recreatecase", "recreatecase-uid")
 	cluster.Status.IsolationReceipt = &pgshardv1alpha1.PostgreSQLIsolationReceipt{
 		NamespaceUID: "ns-uid", Phase: pgshardv1alpha1.IsolationActivatingRecreate, SecurityGeneration: 1, ActivatedAt: activatedAt,
+		// QUIESCE sealed the protected pods to recreate by exact UID.
+		RecreatePendingUIDs: []string{"pre-uid"},
 	}
 	// A pre-guard member pod (created before the recreate phase) must be deleted.
 	preGuard := &corev1.Pod{
