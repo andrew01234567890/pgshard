@@ -4540,8 +4540,10 @@ func TestReplicationBootstrapPrimaryHBAImageContract(t *testing.T) {
 	want := "local postgres postgres peer\n" +
 		"local all all reject\n" +
 		"local replication all reject\n" +
-		"host replication pgshard_replication 0.0.0.0/0 scram-sha-256\n" +
-		"host replication pgshard_replication ::0/0 scram-sha-256\n" +
+		"hostssl replication pgshard_replication 0.0.0.0/0 scram-sha-256\n" +
+		"hostssl replication pgshard_replication ::0/0 scram-sha-256\n" +
+		"hostnossl replication all 0.0.0.0/0 reject\n" +
+		"hostnossl replication all ::0/0 reject\n" +
 		"host all all 0.0.0.0/0 reject\n" +
 		"host all all ::0/0 reject\n"
 	if string(contents) != want {

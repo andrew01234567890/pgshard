@@ -99,8 +99,10 @@ const QUARANTINE_HBA_CONTENT: &[u8] =
 const REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT: &[u8] = b"local postgres postgres peer\n\
 local all all reject\n\
 local replication all reject\n\
-host replication pgshard_replication 0.0.0.0/0 scram-sha-256\n\
-host replication pgshard_replication ::0/0 scram-sha-256\n\
+hostssl replication pgshard_replication 0.0.0.0/0 scram-sha-256\n\
+hostssl replication pgshard_replication ::0/0 scram-sha-256\n\
+hostnossl replication all 0.0.0.0/0 reject\n\
+hostnossl replication all ::0/0 reject\n\
 host all all 0.0.0.0/0 reject\n\
 host all all ::0/0 reject\n";
 
@@ -6280,7 +6282,20 @@ mod tests {
     }
 
     #[test]
-    fn replication_bootstrap_primary_hba_allows_only_fixed_scram_replication_role() {
+    fn replication_bootstrap_primary_hba_allows_only_tls_scram_replication_role() {
+        assert_eq!(
+            REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT,
+            b"local postgres postgres peer\n\
+local all all reject\n\
+local replication all reject\n\
+hostssl replication pgshard_replication 0.0.0.0/0 scram-sha-256\n\
+hostssl replication pgshard_replication ::0/0 scram-sha-256\n\
+hostnossl replication all 0.0.0.0/0 reject\n\
+hostnossl replication all ::0/0 reject\n\
+host all all 0.0.0.0/0 reject\n\
+host all all ::0/0 reject\n"
+        );
+
         let fixture = TempDir::new().expect("create HBA fixture");
         let hba = fixture
             .path()
@@ -6301,20 +6316,49 @@ mod tests {
             Err(PostgresError::InvalidQuarantineHba { .. })
         ));
 
-        fs::set_permissions(&hba, fs::Permissions::from_mode(0o600))
-            .expect("make replication HBA replaceable");
-        fs::write(&hba, b"host all all 0.0.0.0/0 scram-sha-256\n")
-            .expect("write ordinary-client HBA");
-        fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
-            .expect("protect ordinary-client HBA");
-        assert!(matches!(
-            validate_hba_file(
-                &hba,
-                geteuid().as_raw(),
-                PostgresRuntimeRole::ReplicationBootstrapPrimary,
-            ),
-            Err(PostgresError::InvalidReplicationBootstrapPrimaryHba { .. })
-        ));
+        let plaintext_replication_hba: &[u8] = b"local postgres postgres peer\n\
+local all all reject\n\
+local replication all reject\n\
+host replication pgshard_replication 0.0.0.0/0 scram-sha-256\n\
+host replication pgshard_replication ::0/0 scram-sha-256\n\
+host all all 0.0.0.0/0 reject\n\
+host all all ::0/0 reject\n";
+        for rejected in [
+            &b"host all all 0.0.0.0/0 scram-sha-256\n"[..],
+            plaintext_replication_hba,
+        ] {
+            fs::set_permissions(&hba, fs::Permissions::from_mode(0o600))
+                .expect("make replication HBA replaceable");
+            fs::write(&hba, rejected).expect("write rejected HBA");
+            fs::set_permissions(&hba, fs::Permissions::from_mode(0o400))
+                .expect("protect rejected HBA");
+            assert!(matches!(
+                validate_hba_file(
+                    &hba,
+                    geteuid().as_raw(),
+                    PostgresRuntimeRole::ReplicationBootstrapPrimary,
+                ),
+                Err(PostgresError::InvalidReplicationBootstrapPrimaryHba { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn baked_replication_bootstrap_primary_hba_matches_strict_policy_bytes() {
+        let baked = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/images/replication-bootstrap-primary.pg_hba.conf");
+        assert_eq!(
+            fs::read(&baked).expect("read baked replication HBA"),
+            REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT,
+            "deploy/images/replication-bootstrap-primary.pg_hba.conf must stay byte-identical to the validated policy"
+        );
+        let baked_quarantine = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/images/quarantine.pg_hba.conf");
+        assert_eq!(
+            fs::read(&baked_quarantine).expect("read baked quarantine HBA"),
+            QUARANTINE_HBA_CONTENT,
+            "deploy/images/quarantine.pg_hba.conf must stay byte-identical to the validated policy"
+        );
     }
 
     #[test]
