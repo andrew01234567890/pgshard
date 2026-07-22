@@ -267,6 +267,7 @@ async fn read_startup(
 fn startup_policy(parameters: pgshard_pgwire::StartupParameters<'_>) -> StartupPolicy {
     let mut explicit_database = false;
     let mut catalog_user = false;
+    let mut invalid_replication = false;
     let mut policy = StartupPolicy::default();
     for parameter in parameters.iter() {
         let Ok((name, value)) = parameter else {
@@ -283,11 +284,45 @@ fn startup_policy(parameters: pgshard_pgwire::StartupParameters<'_>) -> StartupP
         } else if name == b"user" && value == b"shardschema" {
             catalog_user = true;
         } else if name == b"replication" {
-            policy.replication = true;
+            // PostgreSQL walsender semantics: the last recognized value wins,
+            // but any unrecognized value is FATAL regardless of position.
+            match replication_session(value) {
+                Some(replication) => policy.replication = replication,
+                None => invalid_replication = true,
+            }
         }
     }
     policy.catalog_database |= !explicit_database && catalog_user;
+    policy.replication |= invalid_replication;
     policy
+}
+
+fn replication_session(value: &[u8]) -> Option<bool> {
+    if value.eq_ignore_ascii_case(b"database") {
+        return Some(true);
+    }
+    parse_bool(value)
+}
+
+// Mirrors PostgreSQL parse_bool_with_len: case-insensitive unique prefixes of
+// true/false/yes/no, at-least-two-character prefixes of on/off, and
+// single-character 1/0.
+fn parse_bool(value: &[u8]) -> Option<bool> {
+    fn spelled(value: &[u8], word: &[u8], minimum: usize) -> bool {
+        (minimum..=word.len()).contains(&value.len())
+            && value.eq_ignore_ascii_case(&word[..value.len()])
+    }
+    match value.first()? {
+        b't' | b'T' => spelled(value, b"true", 1).then_some(true),
+        b'f' | b'F' => spelled(value, b"false", 1).then_some(false),
+        b'y' | b'Y' => spelled(value, b"yes", 1).then_some(true),
+        b'n' | b'N' => spelled(value, b"no", 1).then_some(false),
+        b'o' | b'O' if spelled(value, b"on", 2) => Some(true),
+        b'o' | b'O' if spelled(value, b"off", 2) => Some(false),
+        b'1' if value.len() == 1 => Some(true),
+        b'0' if value.len() == 1 => Some(false),
+        _ => None,
+    }
 }
 
 async fn relay_regular_startup(
@@ -462,6 +497,18 @@ mod tests {
         packet[..length].to_vec()
     }
 
+    fn policy_for(parameters: &[(&[u8], &[u8])]) -> StartupPolicy {
+        let packet = startup_packet(parameters);
+        let Ok(Decode::Complete {
+            frame: StartupFrame::Startup { parameters, .. },
+            ..
+        }) = decode_startup(&packet)
+        else {
+            panic!("test startup packet did not decode");
+        };
+        startup_policy(parameters)
+    }
+
     async fn regular_startup(stream: &mut TcpStream) {
         let packet = startup_packet(&[(b"user", b"postgres")]);
         stream
@@ -508,6 +555,95 @@ mod tests {
         );
         assert!(response.windows(6).any(|bytes| bytes == b"VFATAL"));
         response
+    }
+
+    #[test]
+    fn replication_parameter_blocks_only_replication_sessions() {
+        for value in [
+            b"f".as_slice(),
+            b"fa",
+            b"fal",
+            b"fals",
+            b"false",
+            b"n",
+            b"no",
+            b"of",
+            b"off",
+            b"0",
+            b"FALSE",
+            b"No",
+            b"OF",
+            b"OFF",
+            b"F",
+        ] {
+            assert!(
+                !policy_for(&[(b"user", b"postgres"), (b"replication", value)]).replication,
+                "blocked non-replication startup for {value:?}"
+            );
+        }
+        for value in [
+            b"t".as_slice(),
+            b"tr",
+            b"tru",
+            b"true",
+            b"y",
+            b"ye",
+            b"yes",
+            b"on",
+            b"1",
+            b"TRUE",
+            b"On",
+            b"Y",
+            b"database",
+            b"DATABASE",
+        ] {
+            assert!(
+                policy_for(&[(b"user", b"postgres"), (b"replication", value)]).replication,
+                "allowed replication startup for {value:?}"
+            );
+        }
+        for value in [
+            b"o".as_slice(),
+            b"onx",
+            b"ofx",
+            b"onn",
+            b"maybe",
+            b"2",
+            b"",
+            b"fals e",
+            b"truex",
+            b"offf",
+            b"00",
+            b"10",
+        ] {
+            assert!(
+                policy_for(&[(b"user", b"postgres"), (b"replication", value)]).replication,
+                "allowed unrecognized replication value {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_replication_parameters_use_the_last_recognized_value() {
+        let cases: [(&[u8], &[u8], bool); 5] = [
+            (b"on", b"off", false),
+            (b"off", b"on", true),
+            (b"database", b"false", false),
+            (b"true", b"garbage", true),
+            (b"garbage", b"false", true),
+        ];
+        for (first, second, replication) in cases {
+            assert_eq!(
+                policy_for(&[
+                    (b"user", b"postgres"),
+                    (b"replication", first),
+                    (b"replication", second),
+                ])
+                .replication,
+                replication,
+                "replication={first:?} then replication={second:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -717,6 +853,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relays_a_replication_false_startup_as_a_normal_session() {
+        let backend_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake backend");
+        let backend_address = backend_listener.local_addr().expect("fake backend address");
+        let backend_task = tokio::spawn(async move {
+            let (mut backend, _) = backend_listener.accept().await.expect("accept relay");
+            let startup = read_startup_packet(&mut backend).await;
+            backend
+                .write_all(b"ready")
+                .await
+                .expect("write ready marker");
+            startup
+        });
+        let (address, shutdown, task) = server(
+            test_policy(),
+            ready_state(),
+            Some(backend_target(backend_address)),
+        )
+        .await;
+
+        let startup = startup_packet(&[(b"user", b"postgres"), (b"replication", b"off")]);
+        let mut client = TcpStream::connect(address)
+            .await
+            .expect("connect replication-false client");
+        client.write_all(&startup).await.expect("send startup");
+        let mut ready = [0_u8; 5];
+        client
+            .read_exact(&mut ready)
+            .await
+            .expect("read ready marker");
+        assert_eq!(&ready, b"ready");
+        assert_eq!(backend_task.await.expect("fake backend task"), startup);
+
+        shutdown.send(()).expect("server retains shutdown receiver");
+        task.await.expect("server task").expect("clean shutdown");
+    }
+
+    #[tokio::test]
     async fn forwards_cancellation_to_the_same_configured_target() {
         let backend_listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -792,6 +967,20 @@ mod tests {
                 vec![
                     (b"user".as_slice(), b"postgres".as_slice()),
                     (b"replication".as_slice(), b"database".as_slice()),
+                ],
+                b"C0A000".as_slice(),
+            ),
+            (
+                vec![
+                    (b"user".as_slice(), b"postgres".as_slice()),
+                    (b"replication".as_slice(), b"on".as_slice()),
+                ],
+                b"C0A000".as_slice(),
+            ),
+            (
+                vec![
+                    (b"user".as_slice(), b"postgres".as_slice()),
+                    (b"replication".as_slice(), b"maybe".as_slice()),
                 ],
                 b"C0A000".as_slice(),
             ),

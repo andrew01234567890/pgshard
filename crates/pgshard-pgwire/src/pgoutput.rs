@@ -2168,9 +2168,17 @@ fn decode_commit(
     if flags != 0 {
         return Err(PgOutputError::InvalidFlags { message, flags });
     }
+    let commit_lsn = cursor.u64("commit LSN")?;
+    if commit_lsn == 0 {
+        return Err(PgOutputError::InvalidLsn("commit LSN"));
+    }
+    let end_lsn = cursor.u64("commit end LSN")?;
+    if end_lsn == 0 {
+        return Err(PgOutputError::InvalidLsn("commit end LSN"));
+    }
     Ok(PgOutputCommit {
-        commit_lsn: cursor.u64("commit LSN")?,
-        end_lsn: cursor.u64("commit end LSN")?,
+        commit_lsn,
+        end_lsn,
         commit_time: cursor.i64("commit time")?,
     })
 }
@@ -3983,6 +3991,34 @@ mod tests {
         assert_eq!(
             decode_pgoutput_control(&zero_lsn, base, utf8()),
             Err(PgOutputError::InvalidLsn("transaction final LSN"))
+        );
+
+        let mut zero_commit_lsn = commit(b'C', None);
+        zero_commit_lsn[2..10].fill(0);
+        assert_eq!(
+            decode_pgoutput_control(&zero_commit_lsn, base, utf8()),
+            Err(PgOutputError::InvalidLsn("commit LSN"))
+        );
+
+        let mut zero_commit_end_lsn = commit(b'C', None);
+        zero_commit_end_lsn[10..18].fill(0);
+        assert_eq!(
+            decode_pgoutput_control(&zero_commit_end_lsn, base, utf8()),
+            Err(PgOutputError::InvalidLsn("commit end LSN"))
+        );
+
+        let mut zero_stream_commit_lsn = commit(b'c', Some(1));
+        zero_stream_commit_lsn[6..14].fill(0);
+        assert_eq!(
+            decode_pgoutput_control(&zero_stream_commit_lsn, streaming, utf8()),
+            Err(PgOutputError::InvalidLsn("commit LSN"))
+        );
+
+        let mut zero_stream_commit_end_lsn = commit(b'c', Some(1));
+        zero_stream_commit_end_lsn[14..22].fill(0);
+        assert_eq!(
+            decode_pgoutput_control(&zero_stream_commit_end_lsn, streaming, utf8()),
+            Err(PgOutputError::InvalidLsn("commit end LSN"))
         );
 
         let mut trailing = begin();

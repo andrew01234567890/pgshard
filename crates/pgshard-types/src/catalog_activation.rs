@@ -376,10 +376,9 @@ fn postgresql_workload_prefix(cluster: &str) -> String {
     }
     let digest = Sha256::digest(cluster.as_bytes());
     let suffix = lower_hex(&digest[..POSTGRESQL_WORKLOAD_DIGEST_BYTES]);
-    format!(
-        "{}-{suffix}",
-        &cluster[..POSTGRESQL_WORKLOAD_PREFIX_MAXIMUM - suffix.len() - 1]
-    )
+    let boundary =
+        cluster.floor_char_boundary(POSTGRESQL_WORKLOAD_PREFIX_MAXIMUM - suffix.len() - 1);
+    format!("{}-{suffix}", &cluster[..boundary])
 }
 
 /// Returns the exact Pod name for one singleton `PostgreSQL` member workload.
@@ -1694,6 +1693,14 @@ mod tests {
         assert_eq!(
             postgresql_member_pod_name(&"a".repeat(42), 0, 0),
             "aaaaaaaaaaaaaaaaa-7a538607fdaab9296995929f-shard-0000-0"
+        );
+    }
+
+    #[test]
+    fn member_pod_name_truncates_multibyte_cluster_names_on_char_boundaries() {
+        assert_eq!(
+            postgresql_member_pod_name(&"é".repeat(21), 0, 0),
+            "éééééééé-5ddeaaa70c40d97ffb9c49f5-shard-0000-0"
         );
     }
 

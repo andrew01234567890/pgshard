@@ -740,10 +740,8 @@ fn bounded_postgresql_workload_prefix(cluster: &str) -> String {
     for byte in &digest[..DIGEST_BYTES] {
         let _ = write!(suffix, "{byte:02x}");
     }
-    format!(
-        "{}-{suffix}",
-        &cluster[..MAXIMUM_PREFIX_LENGTH - suffix.len() - 1]
-    )
+    let boundary = cluster.floor_char_boundary(MAXIMUM_PREFIX_LENGTH - suffix.len() - 1);
+    format!("{}-{suffix}", &cluster[..boundary])
 }
 
 fn validate_file_metadata(path: &Path, metadata: &fs::Metadata) -> Result<(), TopologyError> {
@@ -981,6 +979,10 @@ mod tests {
         assert_eq!(
             bounded_postgresql_workload_prefix(&"a".repeat(42)),
             "aaaaaaaaaaaaaaaaa-7a538607fdaab9296995929f"
+        );
+        assert_eq!(
+            bounded_postgresql_workload_prefix(&"é".repeat(21)),
+            "éééééééé-5ddeaaa70c40d97ffb9c49f5"
         );
     }
 
