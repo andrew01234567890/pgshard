@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
@@ -285,13 +286,29 @@ func resolveStampedParent(ctx context.Context, reader client.Reader, namespace s
 		if statefulSet.UID == "" || !isControlledBy(statefulSet.OwnerReferences, pgShardClusterKind, cluster.UID) {
 			return "", nil, nil, deniedf("member StatefulSet is not owned by the live PgShardCluster")
 		}
+		// SOUND, non-racy binding: the pod's controller owner reference must point to
+		// THIS live StatefulSet incarnation. Owner references are set atomically at
+		// pod creation by the StatefulSet controller, so this never lags (unlike the
+		// StatefulSet's Status.{Current,Update}Revision, which the controller updates
+		// in a SEPARATE, non-atomic step — comparing the pod's revision to it races
+		// and denies legitimate controller-created pods).
+		ownerRef := controllerOwnerRef(pod.OwnerReferences)
+		if ownerRef == nil || ownerRef.Kind != "StatefulSet" || ownerRef.Name != statefulSetName || ownerRef.UID != statefulSet.UID {
+			return "", nil, nil, deniedf("managed member Pod is not controller-owned by its live StatefulSet incarnation")
+		}
+		// The controller-revision-hash is controller-generated metadata: require it
+		// PRESENT and WELL-FORMED (the ControllerRevision name is "<statefulset>-<hash>"),
+		// but do NOT compare it to the StatefulSet's Status revisions (racy). Security
+		// comes from the creator-identity gate (StatefulSet controller only), the exact
+		// owner-UID binding above, and the canonical comparison of the pod to the
+		// StatefulSet's stamped .spec.template.
 		revision := pod.Labels[controllerRevisionHashLabel]
+		revisionPrefix := statefulSetName + "-"
 		if revision == "" {
 			return "", nil, nil, deniedf("managed member Pod carries no controller revision evidence")
 		}
-		current, updated := statefulSet.Status.CurrentRevision, statefulSet.Status.UpdateRevision
-		if (updated == "" || revision != updated) && (current == "" || revision != current) {
-			return "", nil, nil, deniedf("managed member Pod revision does not match the live StatefulSet revision state")
+		if !strings.HasPrefix(revision, revisionPrefix) || len(revision) <= len(revisionPrefix) {
+			return "", nil, nil, deniedf("managed member Pod carries a malformed controller revision label")
 		}
 		provenance := &owned.ControllerEvidence{ParentUID: string(statefulSet.UID), ControllerRevisionHash: revision}
 		return owned.ClassForMember(cluster.Spec.MembersPerShard, member), &statefulSet.Spec.Template, provenance, nil

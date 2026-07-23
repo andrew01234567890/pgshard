@@ -441,44 +441,64 @@ func TestWorkloadIntegrityValidatorDeniesIdentityTransitions(t *testing.T) {
 	}
 }
 
-func TestResolveStampedParentRequiresLiveRevisionEvidence(t *testing.T) {
+func TestResolveStampedParentAdmitsMemberDespiteRevisionRace(t *testing.T) {
 	t.Parallel()
 	scheme := workloadScheme(t)
 	cluster := testWorkloadCluster()
 	statefulSet := stampedMemberStatefulSet(t)
-	statefulSet.Status.CurrentRevision = "rev-a"
-	statefulSet.Status.UpdateRevision = "rev-b"
+	// The StatefulSet's Status revisions are values the controller has NOT yet
+	// propagated to the just-created pod (the real, non-atomic race). Admission
+	// must NOT compare the pod's revision to these.
+	statefulSet.Status.CurrentRevision = statefulSet.Name + "-oldrev"
+	statefulSet.Status.UpdateRevision = statefulSet.Name + "-newrev"
 	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, statefulSet).Build()
 
-	memberPod := func(revision string) *corev1.Pod {
+	controllerRef := true
+	memberPod := func(revision, ownerName string, ownerUID types.UID) *corev1.Pod {
 		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: statefulSet.Name + "-0", Namespace: testWorkloadNS}}
+		if ownerName != "" {
+			pod.OwnerReferences = []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "StatefulSet", Name: ownerName, UID: ownerUID, Controller: &controllerRef}}
+		}
 		if revision != "" {
 			pod.Labels = map[string]string{controllerRevisionHashLabel: revision}
 		}
 		return pod
 	}
 
-	if _, _, _, response := resolveStampedParent(context.Background(), reader, testWorkloadNS, memberPod("rev-x"), contractPodMember, 0, 0, testClusterName, cluster); response == nil ||
-		!strings.Contains(response.Result.Message, "does not match the live StatefulSet revision state") {
-		t.Fatalf("forged member revision accepted: %#v", response)
+	// A legitimate StatefulSet-controller-created member whose revision DIFFERS from
+	// both STS status revisions (the race) but is well-formed and owner-bound to the
+	// live STS: ADMITTED (this is the honest KIND flow's member pod).
+	racyRevision := statefulSet.Name + "-racyrev"
+	_, template, provenance, response := resolveStampedParent(context.Background(), reader, testWorkloadNS, memberPod(racyRevision, statefulSet.Name, statefulSet.UID), contractPodMember, 0, 0, testClusterName, cluster)
+	if response != nil {
+		t.Fatalf("a legitimate member whose revision lags the live STS status was DENIED (the race): %#v", response.Result)
 	}
-	if _, _, _, response := resolveStampedParent(context.Background(), reader, testWorkloadNS, memberPod(""), contractPodMember, 0, 0, testClusterName, cluster); response == nil ||
+	if template == nil || provenance == nil || provenance.ControllerRevisionHash != racyRevision {
+		t.Fatalf("member provenance = %#v", provenance)
+	}
+
+	// Missing revision → denied (present check retained).
+	if _, _, _, response := resolveStampedParent(context.Background(), reader, testWorkloadNS, memberPod("", statefulSet.Name, statefulSet.UID), contractPodMember, 0, 0, testClusterName, cluster); response == nil ||
 		!strings.Contains(response.Result.Message, "no controller revision evidence") {
 		t.Fatalf("revision-free member pod accepted: %#v", response)
 	}
-	_, _, provenance, response := resolveStampedParent(context.Background(), reader, testWorkloadNS, memberPod("rev-b"), contractPodMember, 0, 0, testClusterName, cluster)
-	if response != nil {
-		t.Fatalf("live update-revision member pod denied: %#v", response.Result)
-	}
-	if provenance.ControllerRevisionHash != "rev-b" {
-		t.Fatalf("member revision evidence = %q, want rev-b", provenance.ControllerRevisionHash)
+
+	// Malformed revision (not the "<statefulset>-<hash>" controller format) → denied.
+	if _, _, _, response := resolveStampedParent(context.Background(), reader, testWorkloadNS, memberPod("forged-revision", statefulSet.Name, statefulSet.UID), contractPodMember, 0, 0, testClusterName, cluster); response == nil ||
+		!strings.Contains(response.Result.Message, "malformed controller revision") {
+		t.Fatalf("malformed member revision accepted: %#v", response)
 	}
 
-	blankStatus := stampedMemberStatefulSet(t)
-	blankReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, blankStatus).Build()
-	if _, _, _, response := resolveStampedParent(context.Background(), blankReader, testWorkloadNS, memberPod("rev-b"), contractPodMember, 0, 0, testClusterName, cluster); response == nil ||
-		!strings.Contains(response.Result.Message, "does not match the live StatefulSet revision state") {
-		t.Fatalf("member pod accepted against a StatefulSet with no recorded revisions: %#v", response)
+	// No controller owner reference → denied (sound owner-UID binding retained).
+	if _, _, _, response := resolveStampedParent(context.Background(), reader, testWorkloadNS, memberPod(racyRevision, "", ""), contractPodMember, 0, 0, testClusterName, cluster); response == nil ||
+		!strings.Contains(response.Result.Message, "not controller-owned by its live StatefulSet") {
+		t.Fatalf("owner-reference-free member pod accepted: %#v", response)
+	}
+
+	// Forged owner UID (stale/replaced StatefulSet) → denied.
+	if _, _, _, response := resolveStampedParent(context.Background(), reader, testWorkloadNS, memberPod(racyRevision, statefulSet.Name, "forged-sts-uid"), contractPodMember, 0, 0, testClusterName, cluster); response == nil ||
+		!strings.Contains(response.Result.Message, "not controller-owned by its live StatefulSet") {
+		t.Fatalf("forged owner-UID member pod accepted: %#v", response)
 	}
 
 	controller := true
