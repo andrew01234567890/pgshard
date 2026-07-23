@@ -65,10 +65,12 @@ func (v *PodConnectDenyValidator) Handle(ctx context.Context, request admission.
 		return v.denyManagerConnect(ctx, request)
 	}
 	// The webhook's namespaceSelector restricts this entry to fenced workload
-	// namespaces. Interactive access is denied ONLY once isolation is ACTIVE; an
-	// un-activated (INACTIVE / QUIESCE / RECREATE / no-receipt) fenced namespace
-	// permits it, so the honest un-activated flow and admin/CI debugging are not
-	// blocked.
+	// namespaces that are ALSO isolation-enforcing (any non-INACTIVE phase), so an
+	// un-activated (INACTIVE / no-receipt) namespace never invokes it and its
+	// honest flow and admin/CI debugging survive a manager restart exactly as
+	// pre-isolation. Interactive access is denied ONLY once isolation is durably
+	// ACTIVE; QUIESCE and RECREATE still allow it. The phase check below is
+	// defense-in-depth for the at-most-one-reconcile label-propagation lag.
 	receipt, err := namespaceIsolationReceipt(ctx, v.reader, request.Namespace)
 	if err != nil {
 		return admission.Errored(http.StatusInternalServerError, err)

@@ -28,16 +28,20 @@ const (
 	NamespaceLabel      = "pgshard.io/pod-fencing"
 	NamespaceLabelValue = "enabled"
 
-	// NamespaceActiveLabel is set on a fenced namespace by the operator ONLY while
-	// its isolation receipt is durably ACTIVE, and removed when it leaves ACTIVE.
-	// The PodConnect (exec/attach/portforward/proxy) webhook's namespaceSelector
-	// requires it IN ADDITION to the fencing label, so an un-activated (INACTIVE /
-	// QUIESCE / RECREATE) fenced namespace does not invoke the connect webhook at
-	// all — interactive access (and a manager restart) behaves exactly as it did
-	// pre-isolation, and only a genuinely ACTIVE namespace pays the connect-webhook
-	// availability coupling (where denying is the intended behavior anyway).
-	NamespaceActiveLabel      = "pgshard.io/isolation-active"
-	NamespaceActiveLabelValue = "enforced"
+	// NamespaceEnforcingLabel is set on a fenced namespace by the operator while its
+	// isolation receipt is in ANY non-INACTIVE phase (ACTIVATING_QUIESCE,
+	// ACTIVATING_RECREATE, or ACTIVE) — because the isolation webhooks must fire
+	// during QUIESCE (deny-all), RECREATE (sealed-parent), and ACTIVE — and removed
+	// when the namespace returns to INACTIVE / has no receipt. The namespaceSelector
+	// of every GENUINELY-NEW isolation webhook (WorkloadIntegrity, PodConnect,
+	// LimitRange) requires it IN ADDITION to the fencing label, so an UN-ACTIVATED
+	// (INACTIVE) fenced namespace invokes NONE of them — ordinary applies/creates,
+	// exec/proxy, and a manager restart behave exactly as they did pre-isolation.
+	// The pre-existing base pod-fencing webhooks (binding, status, metadata,
+	// PodCreate) stay always-on (they carry base security), and their
+	// isolation-added logic is handler/stamp/phase-gated to no-op under INACTIVE.
+	NamespaceEnforcingLabel      = "pgshard.io/isolation-enforcing"
+	NamespaceEnforcingLabelValue = "enforced"
 
 	NodeUIDAnnotation            = owned.PostgreSQLNodeUIDAnnotation
 	NodeBootIDAnnotation         = owned.PostgreSQLNodeBootIDAnnotation

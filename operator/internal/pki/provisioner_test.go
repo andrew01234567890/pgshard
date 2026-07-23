@@ -1379,7 +1379,7 @@ func installObjects() []client.Object {
 			Resources: []string{"statefulsets", "deployments", "replicasets", "statefulsets/scale", "deployments/scale", "replicasets/scale"}, Scope: &scope,
 		},
 	}})
-	workloadValidating.NamespaceSelector = podFencingNamespaceSelector()
+	workloadValidating.NamespaceSelector = isolationEnforcingNamespaceSelector()
 	connectRules := []admissionregistrationv1.RuleWithOperations{{
 		Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Connect},
 		Rule: admissionregistrationv1.Rule{
@@ -1388,12 +1388,12 @@ func installObjects() []client.Object {
 		},
 	}}
 	connectFencedValidating := validatingWebhook(podfence.PodConnectFencedWebhookName, podfence.PodConnectWebhookPath, connectRules)
-	connectFencedValidating.NamespaceSelector = isolationActiveNamespaceSelector()
+	connectFencedValidating.NamespaceSelector = isolationEnforcingNamespaceSelector()
 	connectManagerValidating := validatingWebhook(podfence.PodConnectManagerWebhookName, podfence.PodConnectWebhookPath, connectRules)
 	connectManagerValidating.NamespaceSelector = operatorNamespaceSelector(testNamespace)
 	limitRangeValidating := validatingWebhook(podfence.LimitRangeWebhookName, podfence.LimitRangeWebhookPath, coreResourceRules(admissionregistrationv1.Create, "limitranges"))
 	limitRangeValidating.Rules[0].Operations = []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update}
-	limitRangeValidating.NamespaceSelector = podFencingNamespaceSelector()
+	limitRangeValidating.NamespaceSelector = isolationEnforcingNamespaceSelector()
 	return []client.Object{
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testCASecretName, Labels: managedLabels}, Type: corev1.SecretTypeOpaque},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testServingSecretName, Labels: managedLabels}, Type: corev1.SecretTypeOpaque},

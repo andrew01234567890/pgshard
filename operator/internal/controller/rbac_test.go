@@ -61,7 +61,7 @@ func TestGeneratedManagerRoleAuthorizesRuntimeControlPaths(t *testing.T) {
 		}
 	}
 	// namespaces get/patch/update are allowed (patch/update toggle the
-	// isolation-active label); create/delete/list/watch remain forbidden.
+	// isolation-enforcing label); create/delete/list/watch remain forbidden.
 	for _, forbidden := range []string{"create", "delete", "list", "watch"} {
 		if roleAllows(role, "", "namespaces", []string{forbidden}) {
 			t.Errorf("cluster-wide manager role grants forbidden Namespace verb %q", forbidden)

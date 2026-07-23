@@ -910,10 +910,10 @@ func (p *Provisioner) readConfigurations(ctx context.Context, caBundle []byte) (
 		{name: podfence.StatusValidationWebhookName, path: podfence.StatusValidationWebhookPath, rules: matchesPostgreSQLStatusRules, namespace: podFencingNamespaceSelector()},
 		{name: podfence.BindingValidationWebhookName, path: podfence.BindingValidationWebhookPath, rules: matchesPostgreSQLBindingRules, namespace: podFencingNamespaceSelector()},
 		{name: podfence.PodCreateWebhookName, path: podfence.PodCreateWebhookPath, rules: matchesPostgreSQLPodCreateRules, namespace: podFencingNamespaceSelector()},
-		{name: podfence.WorkloadWebhookName, path: podfence.WorkloadWebhookPath, rules: matchesPostgreSQLWorkloadRules, namespace: podFencingNamespaceSelector()},
-		{name: podfence.PodConnectFencedWebhookName, path: podfence.PodConnectWebhookPath, rules: matchesPostgreSQLConnectRules, namespace: isolationActiveNamespaceSelector()},
+		{name: podfence.WorkloadWebhookName, path: podfence.WorkloadWebhookPath, rules: matchesPostgreSQLWorkloadRules, namespace: isolationEnforcingNamespaceSelector()},
+		{name: podfence.PodConnectFencedWebhookName, path: podfence.PodConnectWebhookPath, rules: matchesPostgreSQLConnectRules, namespace: isolationEnforcingNamespaceSelector()},
 		{name: podfence.PodConnectManagerWebhookName, path: podfence.PodConnectWebhookPath, rules: matchesPostgreSQLConnectRules, namespace: operatorNamespaceSelector(p.namespace)},
-		{name: podfence.LimitRangeWebhookName, path: podfence.LimitRangeWebhookPath, rules: matchesPostgreSQLLimitRangeRules, namespace: podFencingNamespaceSelector()},
+		{name: podfence.LimitRangeWebhookName, path: podfence.LimitRangeWebhookPath, rules: matchesPostgreSQLLimitRangeRules, namespace: isolationEnforcingNamespaceSelector()},
 	} {
 		webhook := findValidatingWebhook(validating.Webhooks, expected.name)
 		if webhook == nil {
@@ -1079,15 +1079,18 @@ func podFencingNamespaceSelector() *metav1.LabelSelector {
 	return &metav1.LabelSelector{MatchLabels: map[string]string{podfence.NamespaceLabel: podfence.NamespaceLabelValue}}
 }
 
-// isolationActiveNamespaceSelector requires BOTH the fencing label AND the
-// isolation-active label, so the PodConnect (exec/attach/portforward/proxy)
-// webhook fires ONLY for a namespace whose isolation is durably ACTIVE. An
-// un-activated fenced namespace never invokes it, so interactive access there
-// survives a manager restart exactly as it did before isolation existed.
-func isolationActiveNamespaceSelector() *metav1.LabelSelector {
+// isolationEnforcingNamespaceSelector requires BOTH the fencing label AND the
+// isolation-enforcing label, so every genuinely-new isolation webhook
+// (WorkloadIntegrity, PodConnect, LimitRange) fires ONLY for a namespace whose
+// isolation is in a non-INACTIVE phase (QUIESCE/RECREATE/ACTIVE). An un-activated
+// (INACTIVE) fenced namespace never invokes any of them, so ordinary applies /
+// creates, interactive access, and a manager restart all behave exactly as they
+// did before isolation existed. The base pod-fencing webhooks (binding, status,
+// metadata, PodCreate) keep the fencing-only selector and stay always-on.
+func isolationEnforcingNamespaceSelector() *metav1.LabelSelector {
 	return &metav1.LabelSelector{MatchLabels: map[string]string{
-		podfence.NamespaceLabel:       podfence.NamespaceLabelValue,
-		podfence.NamespaceActiveLabel: podfence.NamespaceActiveLabelValue,
+		podfence.NamespaceLabel:          podfence.NamespaceLabelValue,
+		podfence.NamespaceEnforcingLabel: podfence.NamespaceEnforcingLabelValue,
 	}}
 }
 

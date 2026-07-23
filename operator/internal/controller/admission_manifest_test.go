@@ -132,10 +132,10 @@ func TestAdmissionResourcesArePrecreatedAndExactlyScoped(t *testing.T) {
 		validatingSelectors.Webhooks[2].Name != podfence.StatusValidationWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[2].NamespaceSelector) ||
 		validatingSelectors.Webhooks[3].Name != podfence.BindingValidationWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[3].NamespaceSelector) ||
 		validatingSelectors.Webhooks[4].Name != podfence.PodCreateWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[4].NamespaceSelector) ||
-		validatingSelectors.Webhooks[5].Name != podfence.WorkloadWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[5].NamespaceSelector) ||
-		validatingSelectors.Webhooks[6].Name != podfence.PodConnectFencedWebhookName || !selectsActiveIsolationNamespace(validatingSelectors.Webhooks[6].NamespaceSelector) ||
+		validatingSelectors.Webhooks[5].Name != podfence.WorkloadWebhookName || !selectsEnforcingIsolationNamespace(validatingSelectors.Webhooks[5].NamespaceSelector) ||
+		validatingSelectors.Webhooks[6].Name != podfence.PodConnectFencedWebhookName || !selectsEnforcingIsolationNamespace(validatingSelectors.Webhooks[6].NamespaceSelector) ||
 		validatingSelectors.Webhooks[7].Name != podfence.PodConnectManagerWebhookName || !selectsOperatorNamespace(validatingSelectors.Webhooks[7].NamespaceSelector) ||
-		validatingSelectors.Webhooks[8].Name != podfence.LimitRangeWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[8].NamespaceSelector) {
+		validatingSelectors.Webhooks[8].Name != podfence.LimitRangeWebhookName || !selectsEnforcingIsolationNamespace(validatingSelectors.Webhooks[8].NamespaceSelector) {
 		t.Fatalf("validating webhook selector patch = %#v", validatingSelectors.Webhooks)
 	}
 }
@@ -199,13 +199,14 @@ func selectsFencingNamespace(selector *metav1.LabelSelector) bool {
 	return selector != nil && selector.MatchLabels[podfence.NamespaceLabel] == podfence.NamespaceLabelValue && len(selector.MatchLabels) == 1 && len(selector.MatchExpressions) == 0
 }
 
-// selectsActiveIsolationNamespace matches the PodConnect webhook's selector, which
-// requires BOTH the fencing label AND the isolation-active label, so it fires only
-// for a namespace whose isolation is durably ACTIVE.
-func selectsActiveIsolationNamespace(selector *metav1.LabelSelector) bool {
+// selectsEnforcingIsolationNamespace matches every genuinely-new isolation
+// webhook's selector (WorkloadIntegrity, PodConnect, LimitRange), which requires
+// BOTH the fencing label AND the isolation-enforcing label, so it fires only for a
+// namespace whose isolation is in a non-INACTIVE phase (QUIESCE/RECREATE/ACTIVE).
+func selectsEnforcingIsolationNamespace(selector *metav1.LabelSelector) bool {
 	return selector != nil &&
 		selector.MatchLabels[podfence.NamespaceLabel] == podfence.NamespaceLabelValue &&
-		selector.MatchLabels[podfence.NamespaceActiveLabel] == podfence.NamespaceActiveLabelValue &&
+		selector.MatchLabels[podfence.NamespaceEnforcingLabel] == podfence.NamespaceEnforcingLabelValue &&
 		len(selector.MatchLabels) == 2 && len(selector.MatchExpressions) == 0
 }
 

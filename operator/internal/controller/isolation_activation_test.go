@@ -339,7 +339,7 @@ func TestDriveIsolationRecreateReguardsThenActivates(t *testing.T) {
 	}
 }
 
-func TestReconcileIsolationActivationManagesActiveNamespaceLabel(t *testing.T) {
+func TestReconcileIsolationActivationManagesEnforcingNamespaceLabel(t *testing.T) {
 	t.Parallel()
 	reload := func(t *testing.T, kubeClient client.Client, name string) *corev1.Namespace {
 		t.Helper()
@@ -350,36 +350,49 @@ func TestReconcileIsolationActivationManagesActiveNamespaceLabel(t *testing.T) {
 		return ns
 	}
 
-	// ACTIVE receipt → the operator sets the isolation-active namespace label so the
-	// connect webhook's selector matches (and only) this namespace.
-	activeCluster := genCluster("activelabelcase", "activelabelcase-uid")
-	activeCluster.Status.IsolationReceipt = &pgshardv1alpha1.PostgreSQLIsolationReceipt{
-		NamespaceUID: "ns-uid", Phase: pgshardv1alpha1.IsolationActive, DispatchTupleHash: "",
+	// Entering activation — QUIESCE is the FIRST non-INACTIVE phase — makes the
+	// operator set the isolation-enforcing namespace label, so every genuinely-new
+	// isolation webhook's selector (WorkloadIntegrity, PodConnect, LimitRange)
+	// begins matching this namespace the instant activation begins; the same
+	// non-INACTIVE predicate keeps it set through RECREATE and ACTIVE.
+	cluster := genCluster("enforcinglabelcase", "enforcinglabelcase-uid")
+	cluster.Status.IsolationReceipt = &pgshardv1alpha1.PostgreSQLIsolationReceipt{
+		NamespaceUID: "ns-uid", Phase: pgshardv1alpha1.IsolationActivatingQuiesce, ActivatedAt: metav1.Now(),
 	}
-	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), activeCluster)
+	statefulSet := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "enforcinglabelcase-member", Namespace: genTestNamespace, UID: "sts-uid",
+			Labels:          map[string]string{owned.ComponentLabel: "postgresql", owned.ClusterLabel: cluster.Name},
+			OwnerReferences: []metav1.OwnerReference{clusterControllerRef(cluster)},
+		},
+		Spec: appsv1.StatefulSetSpec{Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{owned.PodContractHashAnnotation: genHashA}}}},
+	}
+	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster, statefulSet)
 	reconciler.DispatchProber = convergedDispatch("")
-	if _, err := reconciler.reconcileIsolationActivation(context.Background(), activeCluster); err != nil {
+	if _, err := reconciler.reconcileIsolationActivation(context.Background(), cluster); err != nil {
 		t.Fatal(err)
 	}
-	if reload(t, kubeClient, genTestNamespace).Labels[podfence.NamespaceActiveLabel] != podfence.NamespaceActiveLabelValue {
-		t.Fatal("ACTIVE isolation did not set the isolation-active namespace label")
+	if reload(t, kubeClient, genTestNamespace).Labels[podfence.NamespaceEnforcingLabel] != podfence.NamespaceEnforcingLabelValue {
+		t.Fatal("entering activation (QUIESCE) did not set the isolation-enforcing namespace label")
 	}
 
-	// A subsequent non-ACTIVE (QUIESCE) receipt → the operator REMOVES the label, so
-	// the connect webhook stops firing for the namespace.
-	requiesced := &pgshardv1alpha1.PgShardCluster{}
-	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(activeCluster), requiesced); err != nil {
+	// Returning to INACTIVE (receipt cleared; the namespace is not opted-in, so it
+	// does not re-activate) makes the operator REMOVE the label, so the new
+	// isolation webhooks stop firing and the namespace behaves exactly as it did
+	// before isolation existed — ordinary applies/creates survive a manager restart.
+	inactive := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), inactive); err != nil {
 		t.Fatal(err)
 	}
-	requiesced.Status.IsolationReceipt.Phase = pgshardv1alpha1.IsolationActivatingQuiesce
-	if err := kubeClient.Status().Update(context.Background(), requiesced); err != nil {
+	inactive.Status.IsolationReceipt = nil
+	if err := kubeClient.Status().Update(context.Background(), inactive); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reconciler.reconcileIsolationActivation(context.Background(), requiesced); err != nil {
+	if _, err := reconciler.reconcileIsolationActivation(context.Background(), inactive); err != nil {
 		t.Fatal(err)
 	}
-	if _, present := reload(t, kubeClient, genTestNamespace).Labels[podfence.NamespaceActiveLabel]; present {
-		t.Fatal("leaving ACTIVE did not remove the isolation-active namespace label")
+	if _, present := reload(t, kubeClient, genTestNamespace).Labels[podfence.NamespaceEnforcingLabel]; present {
+		t.Fatal("returning to INACTIVE did not remove the isolation-enforcing namespace label")
 	}
 }
 
