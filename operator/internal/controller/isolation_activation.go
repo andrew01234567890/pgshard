@@ -308,6 +308,12 @@ func (r *PgShardClusterReconciler) driveIsolationQuiesce(ctx context.Context, cl
 	receipt.Phase = pgshardv1alpha1.IsolationActivatingRecreate
 	receipt.ActivatedAt = metav1.Now()
 	meta.RemoveStatusCondition(&cluster.Status.Conditions, isolationActivationBlockedCondition)
+	// Advancing means EVERY quiesce hold resolved (dispatch re-proven, no
+	// supporting roll, seals live, drain elapsed, post-drain LimitRange re-list
+	// clean), so any hold condition surfaced earlier in QUIESCE — e.g.
+	// IsolationLimitRangePresent from a drain-time re-list hit — is now stale and
+	// must not persist into RECREATE/ACTIVE.
+	clearIsolationPreflightConditions(cluster)
 	if err := r.Status().Update(ctx, cluster); err != nil {
 		return false, fmt.Errorf("advance to isolation recreate: %w", err)
 	}

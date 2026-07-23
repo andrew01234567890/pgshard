@@ -561,6 +561,15 @@ func TestDriveIsolationQuiesceReListsLimitRangesAfterDrain(t *testing.T) {
 	if got := reloadReceipt(t, kubeClient, cluster).Phase; got != pgshardv1alpha1.IsolationActivatingRecreate {
 		t.Fatalf("QUIESCE did not advance after the LimitRange was removed: %q", got)
 	}
+	// The hold condition is cleared on advance — it must not persist as a stale
+	// IsolationLimitRangePresent=True into RECREATE/ACTIVE.
+	advanced := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), advanced); err != nil {
+		t.Fatal(err)
+	}
+	if meta.FindStatusCondition(advanced.Status.Conditions, isolationLimitRangePresentCondition) != nil {
+		t.Fatalf("stale LimitRange hold condition survived the advance to RECREATE: %#v", advanced.Status.Conditions)
+	}
 }
 
 func TestReconcileIsolationEnforcingLabelNormalizesBogusValue(t *testing.T) {
