@@ -158,8 +158,11 @@ func TestKINDManagerHonestFlowSurvivesFencedAdmissionSurface(t *testing.T) {
 	waitForReplicationTLSReady(t, ctx, kubeClient, client.ObjectKeyFromObject(cluster), cluster.Spec.MembersPerShard)
 
 	// The honest controller-created member pods (StatefulSet workloads → CREATE →
-	// Live-mode binding) were all admitted and are Running+Ready.
-	waitForStablePods(t, ctx, kubeClient, namespace.Name, cluster.Name, "postgresql", int(cluster.Spec.MembersPerShard), true)
+	// Live-mode binding) were all admitted and run stably. agent-quarantine
+	// members are non-serving by design — evaluate_readiness never marks a
+	// replication bootstrap/standby member Ready — so wantReady=false, which is
+	// the STRONGER fence assertion: it fails if any member ever becomes routable.
+	waitForStablePods(t, ctx, kubeClient, namespace.Name, cluster.Name, "postgresql", int(cluster.Spec.MembersPerShard), false)
 	// The supporting workloads (Deployment/ReplicaSet → CREATE) were admitted too.
 	assertSupportingPodsRunning(t, ctx, kubeClient, namespace.Name, cluster.Name, "orchestrator")
 	assertSupportingPodsRunning(t, ctx, kubeClient, namespace.Name, cluster.Name, "pooler")
@@ -276,7 +279,11 @@ func TestKINDManagerActivationCeremony(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForReplicationTLSReady(t, ctx, kubeClient, client.ObjectKeyFromObject(cluster), cluster.Spec.MembersPerShard)
-	waitForStablePods(t, ctx, kubeClient, namespace.Name, cluster.Name, "postgresql", int(cluster.Spec.MembersPerShard), true)
+	// Members run stably but stay non-serving: agent-quarantine members are never
+	// marked Ready (evaluate_readiness returns PostgresReplicationBootstrap/Standby
+	// before any lease arm), so wantReady=false — the stronger fence check that
+	// fails if any member becomes routable.
+	waitForStablePods(t, ctx, kubeClient, namespace.Name, cluster.Name, "postgresql", int(cluster.Spec.MembersPerShard), false)
 
 	// Finding 4b: a foreign pod created while INACTIVE (un-activated fenced
 	// namespace permits it) MUST be cleaned up by the ceremony, not left to block.
@@ -305,7 +312,9 @@ func TestKINDManagerActivationCeremony(t *testing.T) {
 
 	// The honest controller-recreated member pods keep running under the guard
 	// (verified via pod state, NOT exec — exec is correctly denied under ACTIVE).
-	waitForStablePods(t, ctx, kubeClient, namespace.Name, cluster.Name, "postgresql", int(cluster.Spec.MembersPerShard), true)
+	// wantReady=false: agent-quarantine members are non-serving by design, so the
+	// fence assertion requires stable-Running-but-never-Ready.
+	waitForStablePods(t, ctx, kubeClient, namespace.Name, cluster.Name, "postgresql", int(cluster.Spec.MembersPerShard), false)
 
 	// ACTIVE denies interactive access (the connect webhook is now enforcing).
 	if _, _, err := runKubectlAllowError(ctx, "--namespace", namespace.Name, "exec", memberPodName(cluster, 0), "--", "true"); err == nil {
