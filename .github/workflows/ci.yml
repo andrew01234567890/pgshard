@@ -627,7 +627,11 @@ jobs:
       needs.changes.outputs.go == 'true' ||
       needs.changes.outputs.images == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # 60m: the isolation activation ceremony now runs in its own dedicated step
+    # (bounded at 30m) after the shared smoke step (30m) and before the
+    # agent-quarantine step (20m); the job cap must cover the sum of the step
+    # bounds' realistic tails plus image build + cluster setup.
+    timeout-minutes: 60
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -699,12 +703,26 @@ jobs:
           PGSHARD_POSTGRES_BOOTSTRAP_E2E: "true"
           PGSHARD_POSTGRES_BOOTSTRAP_IMAGE: pgshard/postgres-agent:dev
         run: |
-          go test -race -count=1 -timeout=65m \
-            -run '^TestKIND(AdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec|AdmissionRemainsAvailableDuringCompatibleManagerRestart|ManagerReconcilesFailClosedDevelopmentCluster|RestoreTopologyMismatchIsRejectedBeforeMutation|ManagerRunsSingleMemberPostgreSQL18Primaries|ManagerRejectsPostgreSQLRuntimeChange|ManagerDeletePolicyReleasesBoundPostgreSQLPVC|ManagerRetainPolicyReleasesExplicitlyDeletingPostgreSQLPVC|ManagerActivationCeremony)$' \
+          go test -race -count=1 -timeout=30m \
+            -run '^TestKIND(AdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec|AdmissionRemainsAvailableDuringCompatibleManagerRestart|ManagerReconcilesFailClosedDevelopmentCluster|RestoreTopologyMismatchIsRejectedBeforeMutation|ManagerRunsSingleMemberPostgreSQL18Primaries|ManagerRejectsPostgreSQLRuntimeChange|ManagerDeletePolicyReleasesBoundPostgreSQLPVC|ManagerRetainPolicyReleasesExplicitlyDeletingPostgreSQLPVC)$' \
             ./internal/controller
           go test -race -count=1 -timeout=10m \
             -run '^TestPostgreSQLBootstrapDockerRecoveryAndConflict$' \
             ./internal/resources
+      # The activation ceremony runs ALONE (like the agent-quarantine test): its
+      # multi-member server-tls-v1 bootstrap plus the CONVERGE->ACTIVE ceremony
+      # need dedicated KIND-worker time, and sharing the step with eight other
+      # cluster lifecycles made the bootstrap flaky. It must run BEFORE the
+      # non-serving agent-quarantine composition switch below, which replaces
+      # the manager's PostgreSQL runtime.
+      - name: Verify the isolation activation ceremony
+        working-directory: operator
+        env:
+          PGSHARD_KIND_MANAGER_E2E: "true"
+        run: >-
+          go test -race -count=1 -timeout=30m
+          -run '^TestKINDManagerActivationCeremony$'
+          ./internal/controller
       - name: Select the non-serving agent quarantine composition
         run: |
           mapfile -t previous_manager_pods < <(
