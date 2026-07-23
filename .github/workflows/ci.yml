@@ -627,11 +627,13 @@ jobs:
       needs.changes.outputs.go == 'true' ||
       needs.changes.outputs.images == 'true'
     runs-on: ubuntu-24.04
-    # 75m: image build + cluster setup (~15m), then the isolation activation
-    # ceremony alone on the fresh cluster (bounded 40m, expected ~10-15m), the
-    # shared smoke step (30m bound), and the agent-quarantine step (20m bound).
-    # The cap covers the realistic tails of the steps, not the sum of their
-    # worst-case bounds.
+    # 75m: image build + cluster setup (~15m), the shared smoke step under the
+    # direct runtime (30m bound), then the agent-quarantine composition switch
+    # followed by the isolation activation ceremony (bounded 40m, expected
+    # ~10-15m) and the agent-quarantine lease step (20m bound). The activation
+    # ceremony's multi-member server-tls-v1 bootstrap only provisions under the
+    # agent-quarantine runtime, so it runs after the switch. The cap covers the
+    # realistic tails of the steps, not the sum of their worst-case bounds.
     timeout-minutes: 75
     steps:
       - name: Check out source
@@ -697,23 +699,6 @@ jobs:
             --namespace pgshard-system \
             deployment/pgshard-controller-manager \
             --timeout=180s
-      # The activation ceremony runs FIRST, alone, on the FRESH cluster: its
-      # multi-member server-tls-v1 bootstrap is the heaviest single lifecycle in
-      # the job and was flaky whenever it ran after other tests had loaded the
-      # single KIND worker (terminating namespaces, storage churn) — running it
-      # after the shared step still timed out at TLS readiness. Right after
-      # manager install the worker is idle, so the bootstrap is fast and the
-      # CONVERGE->ACTIVE ceremony gets its full headroom. It must also run
-      # BEFORE the non-serving agent-quarantine composition switch below, which
-      # replaces the manager's PostgreSQL runtime.
-      - name: Verify the isolation activation ceremony
-        working-directory: operator
-        env:
-          PGSHARD_KIND_MANAGER_E2E: "true"
-        run: >-
-          go test -race -count=1 -timeout=40m
-          -run '^TestKINDManagerActivationCeremony$'
-          ./internal/controller
       - name: Verify admission and real reconciliation
         working-directory: operator
         env:
@@ -766,6 +751,24 @@ jobs:
               --output=json |
               jq --raw-output '.spec.template.spec.containers[] | select(.name == "manager") | .args[] | select(startswith("--postgresql-runtime="))'
           )" = "--postgresql-runtime=agent-quarantine"
+      # The isolation activation ceremony drives a multi-member server-tls-v1
+      # cluster from INACTIVE through CONVERGE->QUIESCE->RECREATE->ACTIVE. A
+      # multi-member cluster only checkpoints its PostgreSQL bootstrap spec — and
+      # therefore provisions shard members at all — under the agent-quarantine
+      # runtime (validatePostgreSQLRuntimeContract), so this MUST run AFTER the
+      # composition switch above. Under the direct runtime the reconcile silently
+      # never checkpoints, no shard StatefulSet is created, and the ceremony times
+      # out at TLS readiness. It runs first in the agent-quarantine phase for the
+      # most worker headroom; its multi-member bootstrap is the heaviest single
+      # lifecycle in the job (bounded 40m, expected ~10-15m).
+      - name: Verify the isolation activation ceremony
+        working-directory: operator
+        env:
+          PGSHARD_KIND_MANAGER_E2E: "true"
+        run: >-
+          go test -race -count=1 -timeout=40m
+          -run '^TestKINDManagerActivationCeremony$'
+          ./internal/controller
       - name: Verify exact Lease and target-fencing composition
         working-directory: operator
         env:
