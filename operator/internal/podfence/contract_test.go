@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
@@ -114,6 +115,44 @@ func workloadRequest(t *testing.T, object any, resource, subresource, name, user
 		Object:      runtime.RawExtension{Raw: marshalObject(t, object)},
 		UserInfo:    authenticationv1.UserInfo{Username: username},
 	}}
+}
+
+func TestWorkloadIntegrityValidatorAllowsGarbageCollectorFinalizerUpdate(t *testing.T) {
+	t.Parallel()
+	scheme := workloadScheme(t)
+	identities := testControllerIdentities()
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(testWorkloadCluster()).Build()
+	validator := NewWorkloadIntegrityValidator(reader, identities, scheme)
+
+	// During foreground cluster / namespace deletion the garbage collector and the
+	// namespace controller UPDATE owned workloads to remove the foregroundDeletion
+	// finalizer. Those non-operator updates on a DELETING workload must be ALLOWED,
+	// or deletion deadlocks.
+	deletion := metav1.NewTime(time.Unix(200, 0))
+	for _, actor := range []string{
+		"system:serviceaccount:kube-system:generic-garbage-collector",
+		"system:serviceaccount:kube-system:namespace-controller",
+	} {
+		for resource, object := range map[string]client.Object{
+			"statefulsets": &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "example-shard-0000", Namespace: testWorkloadNS, DeletionTimestamp: &deletion, Finalizers: []string{"foregroundDeletion"}}},
+			"deployments":  &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "example-orchestrator", Namespace: testWorkloadNS, DeletionTimestamp: &deletion, Finalizers: []string{"foregroundDeletion"}}},
+			"replicasets":  &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "example-orchestrator-abc", Namespace: testWorkloadNS, DeletionTimestamp: &deletion}},
+		} {
+			response := validator.Handle(context.Background(),
+				workloadUpdateRequest(t, object, object, resource, object.GetName(), actor))
+			if !response.Allowed {
+				t.Fatalf("%s %s finalizer update on a deleting workload was denied: %#v", actor, resource, response.Result)
+			}
+		}
+	}
+
+	// A NON-deleting workload update by the same actors is still denied (the bypass
+	// is strictly scoped to objects carrying a deletionTimestamp).
+	liveSTS := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "example-shard-0000", Namespace: testWorkloadNS}}
+	if response := validator.Handle(context.Background(),
+		workloadUpdateRequest(t, liveSTS, liveSTS, "statefulsets", liveSTS.Name, "system:serviceaccount:kube-system:generic-garbage-collector")); response.Allowed {
+		t.Fatal("a live (non-deleting) StatefulSet update by the garbage collector was allowed")
+	}
 }
 
 func TestWorkloadIntegrityValidatorAuthenticatesMemberStatefulSets(t *testing.T) {
@@ -931,6 +970,48 @@ func TestBindingValidatorRejectsSmuggledMetadata(t *testing.T) {
 				t.Fatalf("%s response = %#v", test.name, response)
 			}
 		})
+	}
+}
+
+func TestBindingValidatorAdmitsStamplessSupportingClientPodUnderInactive(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	node := testNode("node-a", "node-uid-a", "boot-a")
+	// A catalog/application CLIENT pod that borrows the cluster + component=pooler
+	// labels (no reconciler stamp, no cluster-UID annotation, no owner ref) is not a
+	// managed supporting pod. Under the un-activated (INACTIVE) fenced namespace it
+	// must BIND like an ordinary pod — the pre-isolation behaviour the honest
+	// catalog-login-rejection flow depends on.
+	clientPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pgshard-catalog-client-xyz", Namespace: testWorkloadNS, UID: types.UID("client-uid"),
+			Labels: map[string]string{owned.ClusterLabel: testClusterName, owned.ComponentLabel: "pooler"},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "psql"}}},
+	}
+	cluster := testWorkloadCluster()
+	binding := &corev1.Binding{
+		ObjectMeta: metav1.ObjectMeta{Name: clientPod.Name, Namespace: clientPod.Namespace, UID: clientPod.UID},
+		Target:     corev1.ObjectReference{Kind: "Node", Name: node.Name},
+	}
+	request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Name: clientPod.Name, Namespace: clientPod.Namespace, Operation: admissionv1.Create, SubResource: "binding",
+		Object: runtime.RawExtension{Raw: marshalObject(t, binding)},
+	}}
+
+	// INACTIVE (no isolation receipt): the client pod binds.
+	inactiveReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(clientPod, node, cluster).Build()
+	if response := NewBindingValidator(inactiveReader, scheme).Handle(context.Background(), request); !response.Allowed {
+		t.Fatalf("stampless supporting client pod binding denied while INACTIVE: %#v", response.Result)
+	}
+
+	// ACTIVE: the same stampless supporting pod is denied binding (finding 4a — it
+	// cannot bind + read Secrets during the fenced window).
+	activeCluster := isolationReceiptCluster(pgshardv1alpha1.IsolationActive)
+	activeReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(clientPod, node, activeCluster).Build()
+	if response := NewBindingValidator(activeReader, scheme).Handle(context.Background(), request); response.Allowed ||
+		!strings.Contains(response.Result.Message, "must carry the reconciler stamp before binding") {
+		t.Fatalf("stampless supporting pod binding under ACTIVE response = %#v", response)
 	}
 }
 

@@ -167,22 +167,31 @@ func (v *BindingValidator) Handle(ctx context.Context, request admission.Request
 	if err := v.decoder.Decode(request, binding); err != nil {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode final Pod binding: %w", err))
 	}
-	evidence, response := readBindingEvidence(ctx, v.reader, request, binding)
-	if response != nil {
-		return *response
-	}
 	receipt, err := namespaceIsolationReceipt(ctx, v.reader, request.Namespace)
 	if err != nil {
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 	// Once isolation is past INACTIVE (QUIESCE / RECREATE / ACTIVE) binding is
-	// GUARDED: a stampless or pre-guard classified pod must NOT be bound. This
+	// GUARDED: a stampless or pre-guard CLASSIFIED pod must NOT be bound. This
 	// closes the window where an attacker creates an unscheduled Secret-mounting
 	// pod while INACTIVE and binds (and runs) it during the activation ceremony —
-	// the ceremony then also UID-deletes such a pod (RECREATE cleanup).
+	// the ceremony then also UID-deletes such a pod (RECREATE cleanup). This runs
+	// BEFORE readBindingEvidence because that function admits a stampless supporting
+	// client pod as unmanaged (the honest pre-isolation behavior); the guard must
+	// not be bypassed by that early allow.
 	guarded := isolationPhase(receipt) != pgshardv1alpha1.IsolationInactive
-	if guarded && evidence.pod.Annotations[owned.PodContractHashAnnotation] == "" {
-		return admission.Denied("namespace isolation is activating; every managed Pod must carry the reconciler stamp before binding")
+	if guarded {
+		pod := &corev1.Pod{}
+		if err := v.reader.Get(ctx, types.NamespacedName{Namespace: request.Namespace, Name: request.Name}, pod); err != nil {
+			return admission.Errored(http.StatusInternalServerError, fmt.Errorf("read Pod for binding stamp gate: %w", err))
+		}
+		if kind, _, _, _ := classifyContractPod(pod); kind != contractPodUnmanaged && pod.Annotations[owned.PodContractHashAnnotation] == "" {
+			return admission.Denied("namespace isolation is activating; every managed Pod must carry the reconciler stamp before binding")
+		}
+	}
+	evidence, response := readBindingEvidence(ctx, v.reader, request, binding)
+	if response != nil {
+		return *response
 	}
 	if response := validateBindingMetadata(binding, evidence); response != nil {
 		return *response
@@ -279,6 +288,19 @@ func readBindingEvidence(ctx context.Context, reader client.Reader, request admi
 		// without those member-only requirements.
 		if !IsManagedPostgreSQLPod(pod) {
 			response := admission.Denied("managed PostgreSQL Pod has incomplete identity or no termination fence")
+			return nil, &response
+		}
+	case contractPodPooler, contractPodOrchestrator:
+		// A supporting-labeled pod that carries NO reconciler stamp is NOT a genuine
+		// managed supporting pod — it is a client/foreign pod borrowing the cluster +
+		// component labels (e.g. an application pooler client), which the pre-isolation
+		// binding path treated as unmanaged and admitted. Preserve that: bind it like
+		// an unmanaged pod. A GENUINE managed supporting pod carries the stamp and
+		// gets the full managed binding validation below. Under a guarded phase the
+		// BindingValidator's stampless-binding denial + the RECREATE UID-delete fence
+		// a pre-guard supporting pod, so this relaxation never opens an ACTIVE hole.
+		if pod.Annotations[owned.PodContractHashAnnotation] == "" {
+			response := admission.Allowed("stampless supporting Pod is not a managed binding target")
 			return nil, &response
 		}
 	}

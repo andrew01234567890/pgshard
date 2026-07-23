@@ -2,6 +2,7 @@ package podfence
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -511,6 +512,15 @@ func (v *WorkloadIntegrityValidator) Handle(ctx context.Context, request admissi
 	if request.SubResource != "" {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("unexpected workload subresource %q", request.SubResource))
 	}
+	// A workload that is BEING DELETED (carries a deletionTimestamp) may be updated
+	// by the garbage collector or namespace controller to manage its
+	// foregroundDeletion finalizer. Those non-operator updates MUST be allowed, or
+	// foreground cluster deletion and namespace deletion deadlock (the GC could
+	// never remove the finalizer). The workload is on its way out — its
+	// identity/template immutability no longer matters and it can create no pods.
+	if request.Operation == admissionv1.Update && workloadUpdateIsFinalizing(request.Object.Raw) {
+		return admission.Allowed("fenced workload is being deleted; finalizer management is permitted")
+	}
 	switch request.Resource.Resource {
 	case "statefulsets":
 		return v.handleStatefulSet(ctx, request)
@@ -520,6 +530,19 @@ func (v *WorkloadIntegrityValidator) Handle(ctx context.Context, request admissi
 		return v.handleReplicaSet(ctx, request)
 	}
 	return admission.Errored(http.StatusBadRequest, fmt.Errorf("unexpected workload resource %q", request.Resource.Resource))
+}
+
+// workloadUpdateIsFinalizing reports whether the updated workload carries a
+// deletionTimestamp — i.e. it is being deleted and this update is finalizer
+// management (by the garbage collector, namespace controller, or operator). It
+// decodes only the object's metadata, so an object shape the strict decoders in
+// the handlers would reject cannot suppress the deletion bypass.
+func workloadUpdateIsFinalizing(raw []byte) bool {
+	partial := &metav1.PartialObjectMetadata{}
+	if err := json.Unmarshal(raw, partial); err != nil {
+		return false
+	}
+	return partial.DeletionTimestamp != nil
 }
 
 // handleStatefulSet admits StatefulSet writes in a fenced namespace: only the

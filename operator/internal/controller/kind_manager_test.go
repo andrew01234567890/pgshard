@@ -211,8 +211,13 @@ func assertKINDHAAuthorityDiscoveryFoundation(t *testing.T, ctx context.Context,
 			if len(ingress.Ports) != 1 || ingress.Ports[0].Port == nil || ingress.Ports[0].Port.IntVal != 8080 {
 				continue
 			}
-			if diagnosticRuleFound || len(ingress.From) != 1 || ingress.From[0].PodSelector == nil || ingress.From[0].NamespaceSelector != nil || ingress.From[0].IPBlock != nil || !maps.Equal(ingress.From[0].PodSelector.MatchLabels, map[string]string{owned.ClusterLabel: cluster.Name, owned.ComponentLabel: "orchestrator"}) {
-				t.Fatalf("PostgreSQL diagnostic ingress for shard %d is broader than the orchestrator: %#v", shard, ingress)
+			// The orchestrator ingress peer is managed-by-hardened: only operator-authored
+			// orchestrator pods (which carry the managed-by label) may reach the
+			// diagnostic port — a foreign pod borrowing only the cluster+component labels
+			// cannot. The orchestrator Deployment's pod template carries managed-by, so
+			// this selector matches the real orchestrator pods.
+			if diagnosticRuleFound || len(ingress.From) != 1 || ingress.From[0].PodSelector == nil || ingress.From[0].NamespaceSelector != nil || ingress.From[0].IPBlock != nil || !maps.Equal(ingress.From[0].PodSelector.MatchLabels, map[string]string{owned.ManagedByLabel: owned.ManagedByValue, owned.ClusterLabel: cluster.Name, owned.ComponentLabel: "orchestrator"}) {
+				t.Fatalf("PostgreSQL diagnostic ingress for shard %d is broader than the managed orchestrator: %#v", shard, ingress)
 			}
 			diagnosticRuleFound = true
 		}
