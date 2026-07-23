@@ -23,7 +23,6 @@ rules:
   - ""
   resources:
   - endpoints
-  - namespaces
   - nodes
   verbs:
   - get
@@ -41,6 +40,14 @@ rules:
   verbs:
   - get
   - list
+- apiGroups:
+  - ""
+  resources:
+  - namespaces
+  verbs:
+  - get
+  - patch
+  - update
 - apiGroups:
   - ""
   resources:

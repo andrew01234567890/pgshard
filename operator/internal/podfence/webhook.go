@@ -28,6 +28,17 @@ const (
 	NamespaceLabel      = "pgshard.io/pod-fencing"
 	NamespaceLabelValue = "enabled"
 
+	// NamespaceActiveLabel is set on a fenced namespace by the operator ONLY while
+	// its isolation receipt is durably ACTIVE, and removed when it leaves ACTIVE.
+	// The PodConnect (exec/attach/portforward/proxy) webhook's namespaceSelector
+	// requires it IN ADDITION to the fencing label, so an un-activated (INACTIVE /
+	// QUIESCE / RECREATE) fenced namespace does not invoke the connect webhook at
+	// all — interactive access (and a manager restart) behaves exactly as it did
+	// pre-isolation, and only a genuinely ACTIVE namespace pays the connect-webhook
+	// availability coupling (where denying is the intended behavior anyway).
+	NamespaceActiveLabel      = "pgshard.io/isolation-active"
+	NamespaceActiveLabelValue = "enforced"
+
 	NodeUIDAnnotation            = owned.PostgreSQLNodeUIDAnnotation
 	NodeBootIDAnnotation         = owned.PostgreSQLNodeBootIDAnnotation
 	HandshakeChallengeAnnotation = pgshardv1alpha1.PodFencingChallengeAnnotation

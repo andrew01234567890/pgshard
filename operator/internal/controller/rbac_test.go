@@ -32,7 +32,7 @@ func TestGeneratedManagerRoleAuthorizesRuntimeControlPaths(t *testing.T) {
 	}{
 		{group: "", resource: "endpoints", verbs: []string{"get"}},
 		{group: "", resource: "events", verbs: []string{"create", "patch"}},
-		{group: "", resource: "namespaces", verbs: []string{"get"}},
+		{group: "", resource: "namespaces", verbs: []string{"get", "patch", "update"}},
 		{group: "", resource: "nodes", verbs: []string{"get"}},
 		{group: "", resource: "persistentvolumeclaims", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
 		{group: "", resource: "pods", verbs: []string{"create", "delete", "get", "list", "patch"}},
@@ -60,7 +60,9 @@ func TestGeneratedManagerRoleAuthorizesRuntimeControlPaths(t *testing.T) {
 			t.Errorf("cluster-wide manager role grants forbidden StorageClass verb %q", forbidden)
 		}
 	}
-	for _, forbidden := range []string{"create", "delete", "list", "patch", "update", "watch"} {
+	// namespaces get/patch/update are allowed (patch/update toggle the
+	// isolation-active label); create/delete/list/watch remain forbidden.
+	for _, forbidden := range []string{"create", "delete", "list", "watch"} {
 		if roleAllows(role, "", "namespaces", []string{forbidden}) {
 			t.Errorf("cluster-wide manager role grants forbidden Namespace verb %q", forbidden)
 		}

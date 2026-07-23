@@ -49,6 +49,17 @@ func (r *PgShardClusterReconciler) reconcileIsolationActivation(ctx context.Cont
 		return true, nil
 	}
 
+	// Reconcile the isolation-active namespace LABEL to match the receipt phase.
+	// The PodConnect webhook's namespaceSelector requires this label, so it only
+	// fires for a genuinely ACTIVE namespace — an un-activated fenced namespace's
+	// interactive access survives a manager restart exactly as pre-isolation. This
+	// is idempotent, so it also self-heals after a manager restart. The at-most-one-
+	// reconcile propagation lag is covered by the connect webhook handler, which is
+	// also phase-aware (it allows unless the receipt is ACTIVE).
+	if err := r.reconcileIsolationActiveLabel(ctx, namespace, isolationReceiptPhase(receipt) == pgshardv1alpha1.IsolationActive); err != nil {
+		return false, err
+	}
+
 	switch isolationReceiptPhase(receipt) {
 	case pgshardv1alpha1.IsolationInactive:
 		// TODO(isolation-rollout): step 8's distinct-v2-Service upgrade rollout +
@@ -131,7 +142,7 @@ func (r *PgShardClusterReconciler) reconcileIsolationActivation(ctx context.Cont
 	case pgshardv1alpha1.IsolationActivatingQuiesce:
 		return r.driveIsolationQuiesce(ctx, cluster, namespace)
 	case pgshardv1alpha1.IsolationActivatingRecreate:
-		return r.driveIsolationRecreate(ctx, cluster)
+		return r.driveIsolationRecreate(ctx, cluster, namespace)
 	case pgshardv1alpha1.IsolationActive:
 		return r.driveIsolationActive(ctx, cluster)
 	}
@@ -261,7 +272,7 @@ func (r *PgShardClusterReconciler) resealOnSealedParentDrift(ctx context.Context
 // pod passes the full shared live-contract validation, and a FINAL dispatch
 // re-proof succeeds immediately before the ACTIVE status write. It never infers
 // authentication from CreationTimestamp.
-func (r *PgShardClusterReconciler) driveIsolationRecreate(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
+func (r *PgShardClusterReconciler) driveIsolationRecreate(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, namespace *corev1.Namespace) (bool, error) {
 	if valid, err := r.revalidateDispatchTuple(ctx, cluster); err != nil || !valid {
 		return true, err
 	}
@@ -329,6 +340,13 @@ func (r *PgShardClusterReconciler) driveIsolationRecreate(ctx context.Context, c
 	// the ACTIVE-phase revalidation.
 	if valid, err := r.revalidateDispatchTuple(ctx, cluster); err != nil || !valid {
 		return true, err
+	}
+	// Set the isolation-active namespace label BEFORE the ACTIVE status write, so
+	// the connect webhook's selector matches the namespace the instant its receipt
+	// is ACTIVE (no window where an ACTIVE namespace still admits interactive
+	// access because the label lags the phase).
+	if err := r.reconcileIsolationActiveLabel(ctx, namespace, true); err != nil {
+		return false, err
 	}
 	receipt.ResidueProfileHash = residue
 	receipt.RecreatePendingUIDs = nil
@@ -705,6 +723,32 @@ func hasReplicationTLSPrerequisite(cluster *pgshardv1alpha1.PgShardCluster) bool
 		}
 	}
 	return true
+}
+
+// reconcileIsolationActiveLabel ensures the fenced namespace carries the
+// isolation-active label iff its isolation is durably ACTIVE. Setting/removing a
+// non-fencing label is permitted by the namespace webhook (which only pins the
+// fencing label), so the operator authors this. It is a no-op when the label
+// already matches, so it never churns the namespace.
+func (r *PgShardClusterReconciler) reconcileIsolationActiveLabel(ctx context.Context, namespace *corev1.Namespace, active bool) error {
+	has := namespace.Labels[podfence.NamespaceActiveLabel] == podfence.NamespaceActiveLabelValue
+	if has == active {
+		return nil
+	}
+	updated := namespace.DeepCopy()
+	if updated.Labels == nil {
+		updated.Labels = map[string]string{}
+	}
+	if active {
+		updated.Labels[podfence.NamespaceActiveLabel] = podfence.NamespaceActiveLabelValue
+	} else {
+		delete(updated.Labels, podfence.NamespaceActiveLabel)
+	}
+	if err := r.Patch(ctx, updated, client.MergeFrom(namespace)); err != nil {
+		return fmt.Errorf("reconcile isolation-active namespace label: %w", err)
+	}
+	*namespace = *updated
+	return nil
 }
 
 // limitRangePresent returns the name of any LimitRange in the namespace, or "".

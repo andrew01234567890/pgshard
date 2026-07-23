@@ -911,7 +911,7 @@ func (p *Provisioner) readConfigurations(ctx context.Context, caBundle []byte) (
 		{name: podfence.BindingValidationWebhookName, path: podfence.BindingValidationWebhookPath, rules: matchesPostgreSQLBindingRules, namespace: podFencingNamespaceSelector()},
 		{name: podfence.PodCreateWebhookName, path: podfence.PodCreateWebhookPath, rules: matchesPostgreSQLPodCreateRules, namespace: podFencingNamespaceSelector()},
 		{name: podfence.WorkloadWebhookName, path: podfence.WorkloadWebhookPath, rules: matchesPostgreSQLWorkloadRules, namespace: podFencingNamespaceSelector()},
-		{name: podfence.PodConnectFencedWebhookName, path: podfence.PodConnectWebhookPath, rules: matchesPostgreSQLConnectRules, namespace: podFencingNamespaceSelector()},
+		{name: podfence.PodConnectFencedWebhookName, path: podfence.PodConnectWebhookPath, rules: matchesPostgreSQLConnectRules, namespace: isolationActiveNamespaceSelector()},
 		{name: podfence.PodConnectManagerWebhookName, path: podfence.PodConnectWebhookPath, rules: matchesPostgreSQLConnectRules, namespace: operatorNamespaceSelector(p.namespace)},
 		{name: podfence.LimitRangeWebhookName, path: podfence.LimitRangeWebhookPath, rules: matchesPostgreSQLLimitRangeRules, namespace: podFencingNamespaceSelector()},
 	} {
@@ -1077,6 +1077,18 @@ func matchesCoreResourceRules(rules []admissionregistrationv1.RuleWithOperations
 
 func podFencingNamespaceSelector() *metav1.LabelSelector {
 	return &metav1.LabelSelector{MatchLabels: map[string]string{podfence.NamespaceLabel: podfence.NamespaceLabelValue}}
+}
+
+// isolationActiveNamespaceSelector requires BOTH the fencing label AND the
+// isolation-active label, so the PodConnect (exec/attach/portforward/proxy)
+// webhook fires ONLY for a namespace whose isolation is durably ACTIVE. An
+// un-activated fenced namespace never invokes it, so interactive access there
+// survives a manager restart exactly as it did before isolation existed.
+func isolationActiveNamespaceSelector() *metav1.LabelSelector {
+	return &metav1.LabelSelector{MatchLabels: map[string]string{
+		podfence.NamespaceLabel:       podfence.NamespaceLabelValue,
+		podfence.NamespaceActiveLabel: podfence.NamespaceActiveLabelValue,
+	}}
 }
 
 func operatorNamespaceSelector(namespace string) *metav1.LabelSelector {

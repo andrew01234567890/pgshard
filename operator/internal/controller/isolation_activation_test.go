@@ -339,6 +339,50 @@ func TestDriveIsolationRecreateReguardsThenActivates(t *testing.T) {
 	}
 }
 
+func TestReconcileIsolationActivationManagesActiveNamespaceLabel(t *testing.T) {
+	t.Parallel()
+	reload := func(t *testing.T, kubeClient client.Client, name string) *corev1.Namespace {
+		t.Helper()
+		ns := &corev1.Namespace{}
+		if err := kubeClient.Get(context.Background(), client.ObjectKey{Name: name}, ns); err != nil {
+			t.Fatal(err)
+		}
+		return ns
+	}
+
+	// ACTIVE receipt → the operator sets the isolation-active namespace label so the
+	// connect webhook's selector matches (and only) this namespace.
+	activeCluster := genCluster("activelabelcase", "activelabelcase-uid")
+	activeCluster.Status.IsolationReceipt = &pgshardv1alpha1.PostgreSQLIsolationReceipt{
+		NamespaceUID: "ns-uid", Phase: pgshardv1alpha1.IsolationActive, DispatchTupleHash: "",
+	}
+	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), activeCluster)
+	reconciler.DispatchProber = convergedDispatch("")
+	if _, err := reconciler.reconcileIsolationActivation(context.Background(), activeCluster); err != nil {
+		t.Fatal(err)
+	}
+	if reload(t, kubeClient, genTestNamespace).Labels[podfence.NamespaceActiveLabel] != podfence.NamespaceActiveLabelValue {
+		t.Fatal("ACTIVE isolation did not set the isolation-active namespace label")
+	}
+
+	// A subsequent non-ACTIVE (QUIESCE) receipt → the operator REMOVES the label, so
+	// the connect webhook stops firing for the namespace.
+	requiesced := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(activeCluster), requiesced); err != nil {
+		t.Fatal(err)
+	}
+	requiesced.Status.IsolationReceipt.Phase = pgshardv1alpha1.IsolationActivatingQuiesce
+	if err := kubeClient.Status().Update(context.Background(), requiesced); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.reconcileIsolationActivation(context.Background(), requiesced); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := reload(t, kubeClient, genTestNamespace).Labels[podfence.NamespaceActiveLabel]; present {
+		t.Fatal("leaving ACTIVE did not remove the isolation-active namespace label")
+	}
+}
+
 func TestDriveIsolationActiveReQuiescesOnBackendChange(t *testing.T) {
 	t.Parallel()
 	// A stale API-server backend is published after ACTIVE: the dispatch tuple

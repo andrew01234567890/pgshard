@@ -1388,7 +1388,7 @@ func installObjects() []client.Object {
 		},
 	}}
 	connectFencedValidating := validatingWebhook(podfence.PodConnectFencedWebhookName, podfence.PodConnectWebhookPath, connectRules)
-	connectFencedValidating.NamespaceSelector = podFencingNamespaceSelector()
+	connectFencedValidating.NamespaceSelector = isolationActiveNamespaceSelector()
 	connectManagerValidating := validatingWebhook(podfence.PodConnectManagerWebhookName, podfence.PodConnectWebhookPath, connectRules)
 	connectManagerValidating.NamespaceSelector = operatorNamespaceSelector(testNamespace)
 	limitRangeValidating := validatingWebhook(podfence.LimitRangeWebhookName, podfence.LimitRangeWebhookPath, coreResourceRules(admissionregistrationv1.Create, "limitranges"))
