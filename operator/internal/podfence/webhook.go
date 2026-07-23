@@ -69,8 +69,18 @@ const (
 	MetadataWebhookPath          = "/validate-core-v1-postgresqlpodmetadata"
 	NamespaceWebhookName         = "vpostgresqlfencingnamespace.pgshard.io"
 	NamespaceWebhookPath         = "/validate-core-v1-postgresqlfencingnamespace"
-	PodCreateWebhookName         = "vpostgresqlpodcreate.pgshard.io"
-	PodCreateWebhookPath         = "/validate-core-v1-postgresqlpodcreate"
+	// EnforcingNamespaceWebhookName is a SECOND entry served by the same namespace
+	// handler/path, selected by the presence of the enforcing label KEY (not the
+	// fencing label) and covering CREATE as well as UPDATE. It makes the enforcing-
+	// label reservation pre-seed-proof: any namespace — fenced or not — that gains,
+	// changes, or loses the label (on the old OR new object) is validated, so a
+	// bogus value can never be planted and later wedge activation. It is scoped to
+	// the label key rather than firing cluster-wide, so ordinary namespace
+	// operations that never touch the label do not pay this webhook's availability
+	// coupling.
+	EnforcingNamespaceWebhookName = "vpostgresqlenforcingnamespace.pgshard.io"
+	PodCreateWebhookName          = "vpostgresqlpodcreate.pgshard.io"
+	PodCreateWebhookPath          = "/validate-core-v1-postgresqlpodcreate"
 
 	PodConnectWebhookPath        = "/validate-core-v1-postgresqlpodconnect"
 	PodConnectFencedWebhookName  = "vpostgresqlpodconnect.pgshard.io"
@@ -872,32 +882,43 @@ func (v *LimitRangeValidator) Handle(_ context.Context, request admission.Reques
 }
 
 func (v *NamespaceValidator) Handle(_ context.Context, request admission.Request) admission.Response {
-	if request.Operation != admissionv1.Update ||
-		request.SubResource != "" && request.SubResource != "status" && request.SubResource != "finalize" {
+	if request.Operation != admissionv1.Create && request.Operation != admissionv1.Update {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("unexpected PostgreSQL fencing namespace request %s %q", request.Operation, request.SubResource))
 	}
+	if request.SubResource != "" && request.SubResource != "status" && request.SubResource != "finalize" {
+		return admission.Errored(http.StatusBadRequest, fmt.Errorf("unexpected PostgreSQL fencing namespace subresource %q", request.SubResource))
+	}
+	// On CREATE there is no OldObject; treat the prior namespace as absent so a
+	// CREATE that carries the enforcing label is evaluated as an absent->value
+	// transition (denied for a non-operator, or for any invalid value).
 	oldNamespace := &corev1.Namespace{}
-	if err := v.decoder.DecodeRaw(request.OldObject, oldNamespace); err != nil {
-		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode old PostgreSQL fencing namespace: %w", err))
+	if request.Operation == admissionv1.Update {
+		if err := v.decoder.DecodeRaw(request.OldObject, oldNamespace); err != nil {
+			return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode old PostgreSQL fencing namespace: %w", err))
+		}
 	}
 	newNamespace := &corev1.Namespace{}
 	if err := v.decoder.Decode(request, newNamespace); err != nil {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode new PostgreSQL fencing namespace: %w", err))
 	}
-	// The enforcing-label reservation comes FIRST: this webhook dispatches
-	// whenever the OLD or the NEW namespace carries the fencing label (the object
-	// selector matches either side of an UPDATE), so every set/change/removal of
-	// the enforcing label on a fenced — or becoming-fenced — namespace is seen
-	// here, before the early allow for not-yet-fenced namespaces below.
-	oldEnforcing := oldNamespace.Labels[NamespaceEnforcingLabel]
-	newEnforcing := newNamespace.Labels[NamespaceEnforcingLabel]
-	if oldEnforcing != newEnforcing {
+	// The enforcing-label reservation comes FIRST. The enforcing-key webhook entry
+	// fires for ANY namespace — fenced or not, at CREATE or UPDATE — that carries
+	// the label on its old or new object, so a bogus value can never be planted on
+	// an un-fenced namespace and later wedge activation. Compare (present, value)
+	// PAIRS so an empty-valued label is distinguishable from an absent one and
+	// rejected. A non-operator may not set, change, or remove it at all; the
+	// operator may only drive it to a VALID state — removed, or exactly the
+	// enforced value — never a bogus/empty value, so the label always means what
+	// the selector matches.
+	oldValue, oldPresent := oldNamespace.Labels[NamespaceEnforcingLabel]
+	newValue, newPresent := newNamespace.Labels[NamespaceEnforcingLabel]
+	if oldPresent != newPresent || oldValue != newValue {
 		if request.UserInfo.Username != v.operatorUsername {
 			return admission.Denied(fmt.Sprintf("namespace label %s is reserved: only the pgshard operator may set, change, or remove it (the label-gated isolation webhooks stop dispatching without it)", NamespaceEnforcingLabel))
 		}
-		if !(oldEnforcing == "" && newEnforcing == NamespaceEnforcingLabelValue) &&
-			!(oldEnforcing == NamespaceEnforcingLabelValue && newEnforcing == "") {
-			return admission.Denied(fmt.Sprintf("namespace label %s permits only the exact absent<->%s transitions", NamespaceEnforcingLabel, NamespaceEnforcingLabelValue))
+		newValid := !newPresent || newValue == NamespaceEnforcingLabelValue
+		if !newValid {
+			return admission.Denied(fmt.Sprintf("namespace label %s permits only removal or the exact value %q", NamespaceEnforcingLabel, NamespaceEnforcingLabelValue))
 		}
 	}
 	if oldNamespace.Labels[NamespaceLabel] != NamespaceLabelValue {
@@ -1182,6 +1203,7 @@ func hasTerminalPhase(pod *corev1.Pod) bool {
 // +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodmetadata,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods;pods/ephemeralcontainers;pods/resize,verbs=update,versions=v1,name=vpostgresqlpodmetadata.pgshard.io,admissionReviewVersions=v1,servicePort=9444
 // +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodstatus,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/status,verbs=update,versions=v1,name=vpostgresqlpodstatus.pgshard.io,admissionReviewVersions=v1,servicePort=9444
 // +kubebuilder:webhook:path=/validate-core-v1-postgresqlfencingnamespace,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=namespaces;namespaces/status;namespaces/finalize,verbs=update,versions=v1,name=vpostgresqlfencingnamespace.pgshard.io,admissionReviewVersions=v1,servicePort=9444
+// +kubebuilder:webhook:path=/validate-core-v1-postgresqlfencingnamespace,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=namespaces;namespaces/status;namespaces/finalize,verbs=create;update,versions=v1,name=vpostgresqlenforcingnamespace.pgshard.io,admissionReviewVersions=v1,servicePort=9444
 // +kubebuilder:webhook:path=/validate-apps-v1-postgresqlworkload,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups=apps,resources=statefulsets;deployments;replicasets;statefulsets/scale;deployments/scale;replicasets/scale,verbs=create;update,versions=v1,name=vpostgresqlworkload.pgshard.io,admissionReviewVersions=v1,servicePort=9444
 // +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodconnect,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/exec;pods/attach;pods/portforward;pods/proxy,verbs=connect,versions=v1,name=vpostgresqlpodconnect.pgshard.io,admissionReviewVersions=v1,servicePort=9444
 // +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodconnect,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/exec;pods/attach;pods/portforward;pods/proxy,verbs=connect,versions=v1,name=vpostgresqlmanagerconnect.pgshard.io,admissionReviewVersions=v1,servicePort=9444

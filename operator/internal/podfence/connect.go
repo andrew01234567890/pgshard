@@ -34,12 +34,13 @@ const (
 // In a fenced workload namespace the CONNECT deny is PHASE-AWARE, consistent
 // with the rest of the opt-in isolation model: pre-activation (INACTIVE, or no
 // receipt) a fenced namespace behaves like a normal namespace and interactive
-// access is ALLOWED (admin/debug/CI). The caller-path hardening is part of the
-// ratified ACTIVE enforcement — CONNECT is denied only once the namespace's
-// isolation is durably ACTIVE (the dedicated-namespace protection). QUIESCE and
-// RECREATE also allow it (the ceremony recreates every protected pod, and admin
-// access during the bounded transition is acceptable and matches the other
-// phase-aware webhooks which are permissive until ACTIVE).
+// access is ALLOWED (admin/debug/CI). Once isolation begins enforcing — CONVERGE,
+// QUIESCE, RECREATE, or ACTIVE — interactive access is DENIED for the whole
+// enforcing lifecycle, not only at ACTIVE. These subresources are long-running
+// and admission is checked only at connection start, so a CONNECT admitted mid-
+// ceremony could be retained past ACTIVE; denying from the first enforcing phase
+// means pod recreation in RECREATE terminates any earlier stream and nothing can
+// attach to a replacement.
 //
 // In the operator namespace only the controller-manager Pod is protected —
 // ALWAYS, regardless of any workload namespace's activation phase — because it
@@ -76,15 +77,26 @@ func (v *PodConnectDenyValidator) Handle(ctx context.Context, request admission.
 	// namespaces that are ALSO isolation-enforcing (any non-INACTIVE phase), so an
 	// un-activated (INACTIVE / no-receipt) namespace never invokes it and its
 	// honest flow and admin/CI debugging survive a manager restart exactly as
-	// pre-isolation. Interactive access is denied ONLY once isolation is durably
-	// ACTIVE; QUIESCE and RECREATE still allow it. The phase check below is
-	// defense-in-depth for the at-most-one-reconcile label-propagation lag.
+	// pre-isolation.
+	//
+	// Interactive access is denied for the WHOLE enforcing lifecycle — CONVERGE,
+	// QUIESCE, RECREATE, and ACTIVE — not only ACTIVE. exec/attach/portforward/
+	// proxy are long-running: Kubernetes evaluates admission only at connection
+	// START and classifies these subresources as long-running (outside the
+	// attested request timeout). If QUIESCE/RECREATE admitted a CONNECT, an
+	// attacker could open a stream into a pod during the ceremony and RETAIN it
+	// after ACTIVE. Denying from the first enforcing phase means any pre-CONVERGE
+	// stream is terminated when its pod is UID-deleted and recreated in RECREATE,
+	// and no new stream can attach at all. The namespace carries the enforcing
+	// label from CONVERGE onward, so this webhook dispatches for every enforcing
+	// phase; the phase check is the authoritative decision (defense in depth for
+	// the at-most-one-reconcile label-propagation lag).
 	receipt, err := namespaceIsolationReceipt(ctx, v.reader, request.Namespace)
 	if err != nil {
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
-	if isolationPhase(receipt) == pgshardv1alpha1.IsolationActive {
-		return admission.Denied("interactive access to a managed PostgreSQL Pod is not permitted while namespace isolation is active")
+	if isolationPhase(receipt) != pgshardv1alpha1.IsolationInactive {
+		return admission.Denied("interactive access to a managed PostgreSQL Pod is not permitted while namespace isolation is activating or active")
 	}
 	return admission.Allowed("namespace isolation is not active; interactive access is permitted")
 }

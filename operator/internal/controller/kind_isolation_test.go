@@ -54,10 +54,17 @@ func fencedKINDNamespace(name string) *corev1.Namespace {
 // server-tls-v1 replication-TLS checkpoint (CA digest + a verified server digest
 // for every member). The checkpoint is only written once verified TLS streaming
 // is established, so it is the live server-tls-v1 + verify-full proof.
+//
+// The cap is 10m, not 5m: a multi-member server-tls-v1 bootstrap on the single
+// KIND worker is materially slower when it runs LATE in a shared test step (the
+// activation ceremony test runs after eight other heavy KIND tests), so the same
+// bootstrap that finishes in ~2m alone can take several minutes under that load.
+// The wait still returns the instant the checkpoint appears, so a fast bootstrap
+// pays nothing.
 func waitForReplicationTLSReady(t *testing.T, ctx context.Context, kubeClient client.Client, key client.ObjectKey, membersPerShard int32) *pgshardv1alpha1.PgShardCluster {
 	t.Helper()
 	current := &pgshardv1alpha1.PgShardCluster{}
-	err := wait.PollUntilContextTimeout(ctx, 2*time.Second, 5*time.Minute, true, func(ctx context.Context) (bool, error) {
+	err := wait.PollUntilContextTimeout(ctx, 2*time.Second, 10*time.Minute, true, func(ctx context.Context) (bool, error) {
 		if err := kubeClient.Get(ctx, key, current); err != nil {
 			return false, err
 		}
@@ -241,7 +248,12 @@ func TestKINDManagerActivationCeremony(t *testing.T) {
 	if os.Getenv("PGSHARD_KIND_MANAGER_E2E") != "true" {
 		t.Skip("set PGSHARD_KIND_MANAGER_E2E=true against the installed admission manager")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	// 30m ctx: this runs late in the shared KIND step, so a slow multi-member TLS
+	// bootstrap (up to 10m under load) plus the full activation ceremony —
+	// CONVERGE (per-backend dispatch proof + the disposable identity probe),
+	// QUIESCE (attested drain), RECREATE (recreate every member under the guard),
+	// ACTIVE, and the observability re-converge — must all fit with headroom.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 	kubeClient := newKINDClient(t)
 
@@ -396,7 +408,10 @@ func waitForIsolationPhase(t *testing.T, ctx context.Context, kubeClient client.
 	t.Helper()
 	current := &pgshardv1alpha1.PgShardCluster{}
 	seen := map[pgshardv1alpha1.IsolationPhase]bool{}
-	err := wait.PollUntilContextTimeout(ctx, 3*time.Second, 6*time.Minute, true, func(ctx context.Context) (bool, error) {
+	// 10m cap: reaching ACTIVE traverses CONVERGE (per-backend dispatch proof + the
+	// disposable identity probe), the QUIESCE attested drain, and RECREATE (every
+	// member recreated under the guard, each waiting on PostgreSQL to come up).
+	err := wait.PollUntilContextTimeout(ctx, 3*time.Second, 10*time.Minute, true, func(ctx context.Context) (bool, error) {
 		if err := kubeClient.Get(ctx, key, current); err != nil {
 			return false, err
 		}

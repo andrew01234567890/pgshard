@@ -1509,4 +1509,72 @@ func TestNamespaceValidatorPermitsOperatorEnforcingTransitions(t *testing.T) {
 	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), toBogus); response.Allowed || !strings.Contains(response.Result.Message, "exact") {
 		t.Fatalf("operator bogus enforcing-label value = %#v", response.Result)
 	}
+
+	// An empty-VALUE set is not "absent" — it is a present label with an invalid
+	// value that the enforced-value selector would not match; the operator may not
+	// leave it that way either.
+	empty := enforcementNamespace(false)
+	empty.Labels[NamespaceEnforcingLabel] = ""
+	toEmpty := namespaceUpdateAs(t, testOperatorUsername, enforcementNamespace(false), empty, "")
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), toEmpty); response.Allowed || !strings.Contains(response.Result.Message, "exact") {
+		t.Fatalf("operator empty enforcing-label value = %#v", response.Result)
+	}
+}
+
+func unfencedNamespace(enforcingValue string, present bool) *corev1.Namespace {
+	labels := map[string]string{}
+	if present {
+		labels[NamespaceEnforcingLabel] = enforcingValue
+	}
+	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant", Labels: labels}}
+}
+
+func namespaceCreateAs(t *testing.T, username string, ns *corev1.Namespace) admission.Request {
+	t.Helper()
+	return admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Operation: admissionv1.Create,
+		Object:    runtime.RawExtension{Raw: marshalObject(t, ns)},
+		UserInfo:  authenticationv1.UserInfo{Username: username},
+	}}
+}
+
+func TestNamespaceValidatorIsPreSeedProofOnUnfencedAndCreate(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	const attacker = "system:serviceaccount:tenant:mallory"
+
+	// PRE-SEED via UPDATE on an UN-fenced namespace: without the enforcing-key
+	// webhook entry this would slip past the fencing-only selector. The label must
+	// be denied here so a bogus value can never be planted and later wedge
+	// activation once the namespace is fenced.
+	preSeed := namespaceUpdateAs(t, attacker, unfencedNamespace("", false), unfencedNamespace("bogus", true), "")
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), preSeed); response.Allowed || !strings.Contains(response.Result.Message, "reserved") {
+		t.Fatalf("attacker pre-seed on an unfenced namespace = %#v", response.Result)
+	}
+
+	// PRE-SEED at CREATE: a namespace born carrying the label (any value) by a
+	// non-operator is denied — there is no old object, so it reads as absent->value.
+	createBogus := namespaceCreateAs(t, attacker, unfencedNamespace("bogus", true))
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), createBogus); response.Allowed || !strings.Contains(response.Result.Message, "reserved") {
+		t.Fatalf("attacker CREATE carrying the enforcing label = %#v", response.Result)
+	}
+	createEnforced := namespaceCreateAs(t, attacker, unfencedNamespace(NamespaceEnforcingLabelValue, true))
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), createEnforced); response.Allowed || !strings.Contains(response.Result.Message, "reserved") {
+		t.Fatalf("attacker CREATE carrying the enforced label = %#v", response.Result)
+	}
+
+	// Even the OPERATOR may not create a namespace already bearing a bogus value:
+	// the resulting label must be valid or absent.
+	operatorCreateBogus := namespaceCreateAs(t, testOperatorUsername, unfencedNamespace("bogus", true))
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), operatorCreateBogus); response.Allowed || !strings.Contains(response.Result.Message, "exact") {
+		t.Fatalf("operator CREATE with a bogus enforcing value = %#v", response.Result)
+	}
+
+	// A plain namespace CREATE that never touches the label is unaffected (this
+	// entry only ever dispatches when the label key is present, but the handler
+	// must still allow it if it does run).
+	plainCreate := namespaceCreateAs(t, attacker, unfencedNamespace("", false))
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), plainCreate); !response.Allowed {
+		t.Fatalf("plain namespace CREATE was denied: %#v", response.Result)
+	}
 }

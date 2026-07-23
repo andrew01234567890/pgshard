@@ -126,22 +126,33 @@ func TestAdmissionResourcesArePrecreatedAndExactlyScoped(t *testing.T) {
 		t.Fatalf("mutating webhook selector patch = %#v", mutatingSelectors.Webhooks)
 	}
 	validatingSelectors := readManifest[admissionregistrationv1.ValidatingWebhookConfiguration](t, "../../config/webhook/validating_selectors_patch.yaml")
-	if len(validatingSelectors.Webhooks) != 9 ||
+	if len(validatingSelectors.Webhooks) != 10 ||
 		validatingSelectors.Webhooks[0].Name != podfence.MetadataWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[0].NamespaceSelector) ||
 		validatingSelectors.Webhooks[1].Name != podfence.NamespaceWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[1].ObjectSelector) ||
-		validatingSelectors.Webhooks[2].Name != podfence.StatusValidationWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[2].NamespaceSelector) ||
-		validatingSelectors.Webhooks[3].Name != podfence.BindingValidationWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[3].NamespaceSelector) ||
-		validatingSelectors.Webhooks[4].Name != podfence.PodCreateWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[4].NamespaceSelector) ||
-		validatingSelectors.Webhooks[5].Name != podfence.WorkloadWebhookName || !selectsEnforcingIsolationNamespace(validatingSelectors.Webhooks[5].NamespaceSelector) ||
-		validatingSelectors.Webhooks[6].Name != podfence.PodConnectFencedWebhookName || !selectsEnforcingIsolationNamespace(validatingSelectors.Webhooks[6].NamespaceSelector) ||
-		validatingSelectors.Webhooks[7].Name != podfence.PodConnectManagerWebhookName || !selectsOperatorNamespace(validatingSelectors.Webhooks[7].NamespaceSelector) ||
-		validatingSelectors.Webhooks[8].Name != podfence.LimitRangeWebhookName || !selectsEnforcingIsolationNamespace(validatingSelectors.Webhooks[8].NamespaceSelector) {
+		validatingSelectors.Webhooks[2].Name != podfence.EnforcingNamespaceWebhookName || !selectsEnforcingLabelKey(validatingSelectors.Webhooks[2].ObjectSelector) ||
+		validatingSelectors.Webhooks[3].Name != podfence.StatusValidationWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[3].NamespaceSelector) ||
+		validatingSelectors.Webhooks[4].Name != podfence.BindingValidationWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[4].NamespaceSelector) ||
+		validatingSelectors.Webhooks[5].Name != podfence.PodCreateWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[5].NamespaceSelector) ||
+		validatingSelectors.Webhooks[6].Name != podfence.WorkloadWebhookName || !selectsEnforcingIsolationNamespace(validatingSelectors.Webhooks[6].NamespaceSelector) ||
+		validatingSelectors.Webhooks[7].Name != podfence.PodConnectFencedWebhookName || !selectsEnforcingIsolationNamespace(validatingSelectors.Webhooks[7].NamespaceSelector) ||
+		validatingSelectors.Webhooks[8].Name != podfence.PodConnectManagerWebhookName || !selectsOperatorNamespace(validatingSelectors.Webhooks[8].NamespaceSelector) ||
+		validatingSelectors.Webhooks[9].Name != podfence.LimitRangeWebhookName || !selectsEnforcingIsolationNamespace(validatingSelectors.Webhooks[9].NamespaceSelector) {
 		t.Fatalf("validating webhook selector patch = %#v", validatingSelectors.Webhooks)
 	}
 }
 
 func selectsOperatorNamespace(selector *metav1.LabelSelector) bool {
 	return selector != nil && selector.MatchLabels["kubernetes.io/metadata.name"] == "pgshard-system" && len(selector.MatchLabels) == 1 && len(selector.MatchExpressions) == 0
+}
+
+// selectsEnforcingLabelKey matches the enforcing-namespace webhook's objectSelector,
+// which fires for ANY namespace carrying the enforcing label KEY (any value) so a
+// bogus value cannot be planted on an un-fenced namespace and later wedge activation.
+func selectsEnforcingLabelKey(selector *metav1.LabelSelector) bool {
+	return selector != nil && len(selector.MatchLabels) == 0 && len(selector.MatchExpressions) == 1 &&
+		selector.MatchExpressions[0].Key == podfence.NamespaceEnforcingLabel &&
+		selector.MatchExpressions[0].Operator == metav1.LabelSelectorOpExists &&
+		len(selector.MatchExpressions[0].Values) == 0
 }
 
 func TestGeneratedWebhookConfigurationsStayFailClosedAndBounded(t *testing.T) {
@@ -164,7 +175,7 @@ func TestGeneratedWebhookConfigurationsStayFailClosedAndBounded(t *testing.T) {
 	if err := decoder.Decode(&extra); err != io.EOF {
 		t.Fatalf("unexpected third webhook manifest: %v", err)
 	}
-	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 12 {
+	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 13 {
 		t.Fatalf("generated webhooks = %#v / %#v", mutating.Webhooks, validating.Webhooks)
 	}
 	activationFound := false

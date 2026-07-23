@@ -699,7 +699,7 @@ jobs:
           PGSHARD_POSTGRES_BOOTSTRAP_E2E: "true"
           PGSHARD_POSTGRES_BOOTSTRAP_IMAGE: pgshard/postgres-agent:dev
         run: |
-          go test -race -count=1 -timeout=50m \
+          go test -race -count=1 -timeout=65m \
             -run '^TestKIND(AdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec|AdmissionRemainsAvailableDuringCompatibleManagerRestart|ManagerReconcilesFailClosedDevelopmentCluster|RestoreTopologyMismatchIsRejectedBeforeMutation|ManagerRunsSingleMemberPostgreSQL18Primaries|ManagerRejectsPostgreSQLRuntimeChange|ManagerDeletePolicyReleasesBoundPostgreSQLPVC|ManagerRetainPolicyReleasesExplicitlyDeletingPostgreSQLPVC|ManagerActivationCeremony)$' \
             ./internal/controller
           go test -race -count=1 -timeout=10m \

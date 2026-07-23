@@ -894,8 +894,8 @@ func (p *Provisioner) readConfigurations(ctx context.Context, caBundle []byte) (
 	if err := p.client.Get(ctx, types.NamespacedName{Name: p.validatingConfigurationName}, validating); err != nil {
 		return nil, fmt.Errorf("get validating webhook configuration: %w", err)
 	}
-	if len(validating.Webhooks) != 12 {
-		return nil, fmt.Errorf("validating webhook configuration contains %d webhooks, want exactly twelve", len(validating.Webhooks))
+	if len(validating.Webhooks) != 13 {
+		return nil, fmt.Errorf("validating webhook configuration contains %d webhooks, want exactly thirteen", len(validating.Webhooks))
 	}
 	for _, expected := range []struct {
 		name, path        string
@@ -907,6 +907,7 @@ func (p *Provisioner) readConfigurations(ctx context.Context, caBundle []byte) (
 		{name: catalogActivationWebhookName, path: catalogActivationWebhookPath, rules: matchesPgShardCatalogActivationRules},
 		{name: podfence.MetadataWebhookName, path: podfence.MetadataWebhookPath, rules: matchesPostgreSQLMetadataRules, namespace: podFencingNamespaceSelector()},
 		{name: podfence.NamespaceWebhookName, path: podfence.NamespaceWebhookPath, rules: matchesPostgreSQLNamespaceRules, object: podFencingNamespaceSelector()},
+		{name: podfence.EnforcingNamespaceWebhookName, path: podfence.NamespaceWebhookPath, rules: matchesPostgreSQLEnforcingNamespaceRules, object: enforcingLabelKeyObjectSelector()},
 		{name: podfence.StatusValidationWebhookName, path: podfence.StatusValidationWebhookPath, rules: matchesPostgreSQLStatusRules, namespace: podFencingNamespaceSelector()},
 		{name: podfence.BindingValidationWebhookName, path: podfence.BindingValidationWebhookPath, rules: matchesPostgreSQLBindingRules, namespace: podFencingNamespaceSelector()},
 		{name: podfence.PodCreateWebhookName, path: podfence.PodCreateWebhookPath, rules: matchesPostgreSQLPodCreateRules, namespace: podFencingNamespaceSelector()},
@@ -1059,6 +1060,33 @@ func matchesPostgreSQLNamespaceRules(rules []admissionregistrationv1.RuleWithOpe
 		slices.Equal(rule.APIGroups, []string{""}) && slices.Equal(rule.APIVersions, []string{"v1"}) &&
 		slices.Equal(rule.Resources, []string{"namespaces", "namespaces/status", "namespaces/finalize"}) &&
 		(rule.Scope == nil || *rule.Scope == admissionregistrationv1.AllScopes)
+}
+
+// matchesPostgreSQLEnforcingNamespaceRules matches the enforcing-label reservation
+// entry, which additionally covers CREATE so a namespace born with the label is
+// validated before it can wedge activation.
+func matchesPostgreSQLEnforcingNamespaceRules(rules []admissionregistrationv1.RuleWithOperations) bool {
+	if len(rules) != 1 {
+		return false
+	}
+	rule := rules[0]
+	return slices.Equal(rule.Operations, []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update}) &&
+		slices.Equal(rule.APIGroups, []string{""}) && slices.Equal(rule.APIVersions, []string{"v1"}) &&
+		slices.Equal(rule.Resources, []string{"namespaces", "namespaces/status", "namespaces/finalize"}) &&
+		(rule.Scope == nil || *rule.Scope == admissionregistrationv1.AllScopes)
+}
+
+// enforcingLabelKeyObjectSelector selects any namespace that carries the
+// enforcing label KEY (any value). Kubernetes evaluates objectSelector against
+// the old OR the new object, so this fires for every set, value change, and
+// removal of the label — on fenced and un-fenced namespaces alike — while
+// leaving namespaces that never carry the label untouched (bounded availability
+// coupling, unlike a cluster-wide selector).
+func enforcingLabelKeyObjectSelector() *metav1.LabelSelector {
+	return &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{
+		Key:      podfence.NamespaceEnforcingLabel,
+		Operator: metav1.LabelSelectorOpExists,
+	}}}
 }
 
 func matchesCoreRules(rules []admissionregistrationv1.RuleWithOperations, operations []admissionregistrationv1.OperationType, resource string) bool {

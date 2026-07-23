@@ -274,6 +274,21 @@ func (r *PgShardClusterReconciler) driveIsolationQuiesce(ctx context.Context, cl
 	if time.Since(receipt.ActivatedAt.Time) < r.revocationDrainWindow()+time.Second {
 		return true, nil
 	}
+	// TOCTOU close: re-list LimitRanges AFTER the attested drain and BEFORE
+	// advancing to RECREATE. CONVERGE proved every backend now DENIES LimitRange
+	// creates, but a LimitRange that skipped a stale backend's webhook just before
+	// convergence can still commit during the drain window. Once it lands, its
+	// defaulting would mutate every recreated pod after stamping and reject each
+	// contract-checked replacement, deadlocking RECREATE. Hold QUIESCE (do not
+	// advance) while any exists, and surface the offending name. A new LimitRange
+	// can no longer be created post-convergence, so this drain-time re-list is the
+	// last window one could appear in.
+	if name, err := r.limitRangePresent(ctx, cluster.Namespace); err != nil {
+		return false, err
+	} else if name != "" {
+		r.setIsolationPreflightCondition(cluster, isolationLimitRangePresentCondition, "LimitRangePresent", fmt.Sprintf("a LimitRange %q was observed in the fenced namespace after the quiesce drain; isolation is held quiesced until it is removed (it would break the pod contract during recreate)", name))
+		return true, r.Status().Update(ctx, cluster)
+	}
 	// Seal EVERY live pod UID in the namespace — foreign/unclassified/pre-guard as
 	// well as protected. QUIESCE does NOT block on old pods that mismatch the
 	// (possibly newly-sealed) parent: RECREATE is the only phase that deletes pods,
@@ -810,16 +825,27 @@ func hasReplicationTLSPrerequisite(cluster *pgshardv1alpha1.PgShardCluster) bool
 }
 
 // reconcileIsolationEnforcingLabel ensures the fenced namespace carries the
-// isolation-enforcing label iff its isolation is in any non-INACTIVE phase
-// (CONVERGE/QUIESCE/RECREATE/ACTIVE). The namespace webhook RESERVES this label
-// to the authenticated operator identity (exact absent<->enforced transitions
-// only), so this reconciler — running as that identity — is the only writer; an
-// attacker with namespace update cannot strip the label to stop the gated
-// webhooks from dispatching. It is a no-op when the label already matches, so it
-// never churns the namespace.
+// isolation-enforcing label with EXACTLY the enforced value iff its isolation is
+// in any non-INACTIVE phase (CONVERGE/QUIESCE/RECREATE/ACTIVE), and no label at
+// all otherwise. The namespace webhook RESERVES this label to the authenticated
+// operator identity, so this reconciler — running as that identity — is the only
+// writer; an attacker cannot strip it to stop the gated webhooks dispatching.
+//
+// It normalizes a present-but-BOGUS value (empty or anything other than the
+// enforced value): such a value is NOT treated as "absent" (which would let a
+// pre-seeded bogus label survive and, on activation, wedge a bogus->enforced
+// write). Because the operator may drive the label to any VALID state, the
+// reconciler overwrites a bogus value to the enforced value when enforcing, or
+// removes it when not — self-healing rather than deadlocking. It is a no-op when
+// the label is already in the exact desired state, so it never churns the
+// namespace.
 func (r *PgShardClusterReconciler) reconcileIsolationEnforcingLabel(ctx context.Context, namespace *corev1.Namespace, enforcing bool) error {
-	has := namespace.Labels[podfence.NamespaceEnforcingLabel] == podfence.NamespaceEnforcingLabelValue
-	if has == enforcing {
+	value, present := namespace.Labels[podfence.NamespaceEnforcingLabel]
+	enforced := present && value == podfence.NamespaceEnforcingLabelValue
+	if enforcing && enforced {
+		return nil
+	}
+	if !enforcing && !present {
 		return nil
 	}
 	updated := namespace.DeepCopy()

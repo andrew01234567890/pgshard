@@ -11,6 +11,11 @@ webhooks:
     objectSelector:
       matchLabels:
         pgshard.io/pod-fencing: enabled
+  - name: vpostgresqlenforcingnamespace.pgshard.io
+    objectSelector:
+      matchExpressions:
+        - key: pgshard.io/isolation-enforcing
+          operator: Exists
   - name: vpostgresqlpodstatus.pgshard.io
     namespaceSelector:
       matchLabels:

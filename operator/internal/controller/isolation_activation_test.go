@@ -515,6 +515,89 @@ func TestDriveIsolationConvergeReListsLimitRangesAfterConvergence(t *testing.T) 
 	}
 }
 
+func TestDriveIsolationQuiesceReListsLimitRangesAfterDrain(t *testing.T) {
+	t.Parallel()
+	// A LimitRange that skipped a stale backend's webhook just before convergence
+	// can still COMMIT during the quiesce drain window. QUIESCE must re-list AFTER
+	// the drain and HOLD (not advance to RECREATE) while one exists — otherwise its
+	// defaulting would mutate every recreated pod after stamping and reject each
+	// contract-checked replacement, deadlocking RECREATE.
+	cluster := genCluster("quiescelimitcase", "quiescelimitcase-uid")
+	cluster.Status.IsolationReceipt = &pgshardv1alpha1.PostgreSQLIsolationReceipt{
+		NamespaceUID: "ns-uid", Phase: pgshardv1alpha1.IsolationActivatingQuiesce,
+		ActivatedAt:   metav1.NewTime(time.Now().Add(-2 * supportingRevocationDrain)),
+		SealedParents: []pgshardv1alpha1.SealedParent{{Kind: "StatefulSet", Name: "x", UID: "sts-uid"}},
+	}
+	sealedLive := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "x", Namespace: genTestNamespace, UID: "sts-uid"}}
+	sneaky := &corev1.LimitRange{ObjectMeta: metav1.ObjectMeta{Name: "sneaky-defaults", Namespace: genTestNamespace}}
+	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster, sealedLive, sneaky)
+	reconciler.DispatchProber = convergedDispatch("")
+
+	if _, err := reconciler.reconcileIsolationActivation(context.Background(), cluster); err != nil {
+		t.Fatal(err)
+	}
+	if got := reloadReceipt(t, kubeClient, cluster).Phase; got != pgshardv1alpha1.IsolationActivatingQuiesce {
+		t.Fatalf("QUIESCE advanced to %q despite a LimitRange landing during the drain", got)
+	}
+	reloaded := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), reloaded); err != nil {
+		t.Fatal(err)
+	}
+	if meta.FindStatusCondition(reloaded.Status.Conditions, isolationLimitRangePresentCondition) == nil {
+		t.Fatalf("post-drain LimitRange re-list did not surface its condition: %#v", reloaded.Status.Conditions)
+	}
+
+	// Once the LimitRange is removed the drain re-list is clean and QUIESCE advances.
+	if err := kubeClient.Delete(context.Background(), sneaky); err != nil {
+		t.Fatal(err)
+	}
+	fresh := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), fresh); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.reconcileIsolationActivation(context.Background(), fresh); err != nil {
+		t.Fatal(err)
+	}
+	if got := reloadReceipt(t, kubeClient, cluster).Phase; got != pgshardv1alpha1.IsolationActivatingRecreate {
+		t.Fatalf("QUIESCE did not advance after the LimitRange was removed: %q", got)
+	}
+}
+
+func TestReconcileIsolationEnforcingLabelNormalizesBogusValue(t *testing.T) {
+	t.Parallel()
+	// A present-but-bogus value must NOT be treated as "absent" (which would let a
+	// pre-seeded value survive and later wedge a bogus->enforced write). The
+	// reconciler self-heals it: overwrite to the exact enforced value when
+	// enforcing, remove it when not.
+	enforcingNS := isolationNamespace("ns-uid")
+	enforcingNS.Labels = map[string]string{podfence.NamespaceEnforcingLabel: "bogus"}
+	reconciler, kubeClient := genReconciler(t, enforcingNS)
+	if err := reconciler.reconcileIsolationEnforcingLabel(context.Background(), enforcingNS, true); err != nil {
+		t.Fatal(err)
+	}
+	live := &corev1.Namespace{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKey{Name: genTestNamespace}, live); err != nil {
+		t.Fatal(err)
+	}
+	if live.Labels[podfence.NamespaceEnforcingLabel] != podfence.NamespaceEnforcingLabelValue {
+		t.Fatalf("enforcing reconcile did not normalize a bogus value to enforced: %#v", live.Labels)
+	}
+
+	emptyNS := isolationNamespace("ns-uid")
+	emptyNS.Labels = map[string]string{podfence.NamespaceEnforcingLabel: ""}
+	reconciler2, kubeClient2 := genReconciler(t, emptyNS)
+	if err := reconciler2.reconcileIsolationEnforcingLabel(context.Background(), emptyNS, false); err != nil {
+		t.Fatal(err)
+	}
+	live2 := &corev1.Namespace{}
+	if err := kubeClient2.Get(context.Background(), client.ObjectKey{Name: genTestNamespace}, live2); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := live2.Labels[podfence.NamespaceEnforcingLabel]; present {
+		t.Fatalf("non-enforcing reconcile left a present-but-empty value instead of removing it: %#v", live2.Labels)
+	}
+}
+
 func TestDriveIsolationActiveReQuiescesOnBackendChange(t *testing.T) {
 	t.Parallel()
 	// A stale API-server backend is published after ACTIVE: the dispatch tuple
