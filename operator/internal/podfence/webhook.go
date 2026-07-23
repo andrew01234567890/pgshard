@@ -29,17 +29,21 @@ const (
 	NamespaceLabelValue = "enabled"
 
 	// NamespaceEnforcingLabel is set on a fenced namespace by the operator while its
-	// isolation receipt is in ANY non-INACTIVE phase (ACTIVATING_QUIESCE,
-	// ACTIVATING_RECREATE, or ACTIVE) — because the isolation webhooks must fire
-	// during QUIESCE (deny-all), RECREATE (sealed-parent), and ACTIVE — and removed
-	// when the namespace returns to INACTIVE / has no receipt. The namespaceSelector
-	// of every GENUINELY-NEW isolation webhook (WorkloadIntegrity, PodConnect,
-	// LimitRange) requires it IN ADDITION to the fencing label, so an UN-ACTIVATED
-	// (INACTIVE) fenced namespace invokes NONE of them — ordinary applies/creates,
-	// exec/proxy, and a manager restart behave exactly as they did pre-isolation.
-	// The pre-existing base pod-fencing webhooks (binding, status, metadata,
-	// PodCreate) stay always-on (they carry base security), and their
-	// isolation-added logic is handler/stamp/phase-gated to no-op under INACTIVE.
+	// isolation receipt is in ANY non-INACTIVE phase (ACTIVATING_CONVERGE,
+	// ACTIVATING_QUIESCE, ACTIVATING_RECREATE, or ACTIVE) — it precedes CONVERGE,
+	// whose per-backend proof turns "label set" into "gated webhooks provably
+	// dispatching" before any enforcing phase — and removed when the namespace
+	// returns to INACTIVE / has no receipt. The namespaceSelector of every
+	// GENUINELY-NEW isolation webhook (WorkloadIntegrity, PodConnect, LimitRange)
+	// requires it IN ADDITION to the fencing label, so an UN-ACTIVATED (INACTIVE)
+	// fenced namespace invokes NONE of them — ordinary applies/creates, exec/proxy,
+	// and a manager restart behave exactly as they did pre-isolation. The
+	// pre-existing base pod-fencing webhooks (binding, status, metadata, PodCreate)
+	// stay always-on (they carry base security), and their isolation-added logic is
+	// handler/stamp/phase-gated to no-op under INACTIVE. The NamespaceValidator
+	// RESERVES this label to the authenticated operator identity: it is a security
+	// boundary (Kubernetes stops DISPATCHING the gated webhooks without it), never
+	// a user-mutable annotation.
 	NamespaceEnforcingLabel      = "pgshard.io/isolation-enforcing"
 	NamespaceEnforcingLabelValue = "enforced"
 
@@ -827,12 +831,22 @@ type MetadataValidator struct {
 	codec   *HandshakeCodec
 }
 
+// NamespaceValidator pins the two operator-relevant namespace labels across
+// every namespace update (normal, status, and finalize):
+//   - the fencing label is immutable once enabled (the opt-in is sticky), and
+//   - the isolation-enforcing label is RESERVED to the authenticated operator.
+//     The label-gated isolation webhooks stop dispatching the instant it is
+//     removed — Kubernetes would simply stop calling them, so their handlers
+//     could never compensate — which makes any non-operator set/change/removal
+//     a security bypass, not a configuration choice. The operator itself may
+//     perform only the exact absent<->enforced transitions.
 type NamespaceValidator struct {
-	decoder admission.Decoder
+	decoder          admission.Decoder
+	operatorUsername string
 }
 
-func NewNamespaceValidator(scheme *runtime.Scheme) *NamespaceValidator {
-	return &NamespaceValidator{decoder: admission.NewDecoder(scheme)}
+func NewNamespaceValidator(operatorUsername string, scheme *runtime.Scheme) *NamespaceValidator {
+	return &NamespaceValidator{decoder: admission.NewDecoder(scheme), operatorUsername: operatorUsername}
 }
 
 // LimitRangeValidator denies every LimitRange create or update in a fenced
@@ -849,6 +863,11 @@ func (v *LimitRangeValidator) Handle(_ context.Context, request admission.Reques
 	if request.Operation != admissionv1.Create && request.Operation != admissionv1.Update {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("unexpected LimitRange request %s", request.Operation))
 	}
+	// The dispatch-convergence sentinel gets its distinct always-deny message so
+	// the pre-enforcement probe can pin the response to this exact handler.
+	if objectCarriesDispatchProbeSentinel(request.Object.Raw) {
+		return admission.Denied(LimitRangeDispatchProbeSentinelMessage)
+	}
 	return admission.Denied("LimitRanges are not permitted in a fenced pgshard namespace; a defaulting LimitRange would break the pod contract after stamping")
 }
 
@@ -864,6 +883,22 @@ func (v *NamespaceValidator) Handle(_ context.Context, request admission.Request
 	newNamespace := &corev1.Namespace{}
 	if err := v.decoder.Decode(request, newNamespace); err != nil {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode new PostgreSQL fencing namespace: %w", err))
+	}
+	// The enforcing-label reservation comes FIRST: this webhook dispatches
+	// whenever the OLD or the NEW namespace carries the fencing label (the object
+	// selector matches either side of an UPDATE), so every set/change/removal of
+	// the enforcing label on a fenced — or becoming-fenced — namespace is seen
+	// here, before the early allow for not-yet-fenced namespaces below.
+	oldEnforcing := oldNamespace.Labels[NamespaceEnforcingLabel]
+	newEnforcing := newNamespace.Labels[NamespaceEnforcingLabel]
+	if oldEnforcing != newEnforcing {
+		if request.UserInfo.Username != v.operatorUsername {
+			return admission.Denied(fmt.Sprintf("namespace label %s is reserved: only the pgshard operator may set, change, or remove it (the label-gated isolation webhooks stop dispatching without it)", NamespaceEnforcingLabel))
+		}
+		if !(oldEnforcing == "" && newEnforcing == NamespaceEnforcingLabelValue) &&
+			!(oldEnforcing == NamespaceEnforcingLabelValue && newEnforcing == "") {
+			return admission.Denied(fmt.Sprintf("namespace label %s permits only the exact absent<->%s transitions", NamespaceEnforcingLabel, NamespaceEnforcingLabelValue))
+		}
 	}
 	if oldNamespace.Labels[NamespaceLabel] != NamespaceLabelValue {
 		return admission.Allowed("namespace has not enabled PostgreSQL Pod fencing")

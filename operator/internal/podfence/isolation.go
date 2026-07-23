@@ -2,6 +2,7 @@ package podfence
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
@@ -9,6 +10,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -27,11 +29,48 @@ const (
 	// from every backend. Any other outcome means that backend does not dispatch
 	// Pod CREATE to this webhook.
 	DispatchProbeSentinelMessage = "pgshard dispatch-probe sentinel: this Pod create is always denied by the pgshard PodCreate webhook"
+
+	// The label-gated isolation webhooks (workload, connect, LimitRange) dispatch
+	// only for a namespace carrying the isolation-enforcing label, which every
+	// API-server backend evaluates from its OWN namespace-informer cache. The
+	// pre-enforcement convergence probe therefore submits one sentinel per GATED
+	// webhook to each backend: a converged backend (label visible → webhook
+	// dispatched) returns the exact sentinel denial below, while a stale backend
+	// (label not yet in its cache → webhook skipped) does not. Each handler denies
+	// its sentinel FIRST, in every phase, so the exact denial proves dispatch and
+	// nothing else.
+	//
+	// WorkloadDispatchProbeSentinel* marks a dryRun apps workload create.
+	WorkloadDispatchProbeSentinelMessage = "pgshard dispatch-probe sentinel: this workload write is always denied by the pgshard workload-integrity webhook"
+	// LimitRangeDispatchProbeSentinelMessage answers a dryRun sentinel LimitRange
+	// create (which the webhook denies anyway; the distinct message pins the probe
+	// to this exact handler).
+	LimitRangeDispatchProbeSentinelMessage = "pgshard dispatch-probe sentinel: this LimitRange write is always denied by the pgshard LimitRange webhook"
+	// ConnectDispatchProbeSentinelName is a reserved Pod name: a CONNECT
+	// (exec/attach/portforward/proxy) addressed to it is ALWAYS denied by the
+	// connect webhook with ConnectDispatchProbeSentinelMessage, in every phase and
+	// in both webhook entries. No managed pod ever carries this name; a
+	// non-dispatching backend instead fails the request with a NotFound for the
+	// nonexistent pod, so the probe distinguishes the two without any real pod.
+	ConnectDispatchProbeSentinelName    = "pgshard-connect-probe-sentinel"
+	ConnectDispatchProbeSentinelMessage = "pgshard dispatch-probe sentinel: connecting to the reserved sentinel Pod is always denied by the pgshard connect webhook"
 )
 
 // IsDispatchProbeSentinel reports whether a pod is the reserved dispatch probe.
 func IsDispatchProbeSentinel(pod *corev1.Pod) bool {
 	return pod != nil && pod.Annotations[DispatchProbeSentinelAnnotation] == DispatchProbeSentinelValue
+}
+
+// objectCarriesDispatchProbeSentinel reports whether an admission object's
+// metadata carries the dispatch-probe sentinel annotation. It decodes only the
+// metadata, so a malformed body that a handler's strict decoder would reject
+// cannot dodge the always-deny sentinel branch.
+func objectCarriesDispatchProbeSentinel(raw []byte) bool {
+	partial := &metav1.PartialObjectMetadata{}
+	if err := json.Unmarshal(raw, partial); err != nil {
+		return false
+	}
+	return partial.Annotations[DispatchProbeSentinelAnnotation] == DispatchProbeSentinelValue
 }
 
 // namespaceIsolationReceipt authoritatively resolves the isolation phase of a

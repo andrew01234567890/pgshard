@@ -117,6 +117,37 @@ func workloadRequest(t *testing.T, object any, resource, subresource, name, user
 	}}
 }
 
+func TestWorkloadIntegrityValidatorAnswersDispatchProbeSentinelInEveryPhase(t *testing.T) {
+	t.Parallel()
+	scheme := workloadScheme(t)
+	sentinel := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Name: "probe", Namespace: testWorkloadNS,
+		Annotations: map[string]string{DispatchProbeSentinelAnnotation: DispatchProbeSentinelValue},
+	}}
+	for _, phase := range []pgshardv1alpha1.IsolationPhase{
+		pgshardv1alpha1.IsolationInactive,
+		pgshardv1alpha1.IsolationActivatingConverge,
+		pgshardv1alpha1.IsolationActivatingQuiesce,
+		pgshardv1alpha1.IsolationActive,
+	} {
+		cluster := testWorkloadCluster()
+		if phase != pgshardv1alpha1.IsolationInactive {
+			cluster = isolationReceiptCluster(phase)
+		}
+		reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster).Build()
+		validator := NewWorkloadIntegrityValidator(reader, testControllerIdentities(), scheme)
+		// The sentinel is denied with the EXACT message before any authorship or
+		// phase logic — an anonymous author and the QUIESCE freeze must not change
+		// the response, or the per-backend convergence probe could not distinguish
+		// a dispatching backend from any other denial.
+		request := workloadRequest(t, sentinel, "deployments", "", sentinel.Name, "system:anonymous", admissionv1.Create)
+		response := validator.Handle(context.Background(), request)
+		if response.Allowed || response.Result.Message != WorkloadDispatchProbeSentinelMessage {
+			t.Fatalf("workload dispatch-probe sentinel under %q = %#v", phase, response.Result)
+		}
+	}
+}
+
 func TestWorkloadIntegrityValidatorAllowsGarbageCollectorFinalizerUpdate(t *testing.T) {
 	t.Parallel()
 	scheme := workloadScheme(t)

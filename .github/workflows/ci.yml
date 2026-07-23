@@ -699,8 +699,8 @@ jobs:
           PGSHARD_POSTGRES_BOOTSTRAP_E2E: "true"
           PGSHARD_POSTGRES_BOOTSTRAP_IMAGE: pgshard/postgres-agent:dev
         run: |
-          go test -race -count=1 -timeout=30m \
-            -run '^TestKIND(AdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec|AdmissionRemainsAvailableDuringCompatibleManagerRestart|ManagerReconcilesFailClosedDevelopmentCluster|RestoreTopologyMismatchIsRejectedBeforeMutation|ManagerRunsSingleMemberPostgreSQL18Primaries|ManagerRejectsPostgreSQLRuntimeChange|ManagerDeletePolicyReleasesBoundPostgreSQLPVC|ManagerRetainPolicyReleasesExplicitlyDeletingPostgreSQLPVC)$' \
+          go test -race -count=1 -timeout=50m \
+            -run '^TestKIND(AdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec|AdmissionRemainsAvailableDuringCompatibleManagerRestart|ManagerReconcilesFailClosedDevelopmentCluster|RestoreTopologyMismatchIsRejectedBeforeMutation|ManagerRunsSingleMemberPostgreSQL18Primaries|ManagerRejectsPostgreSQLRuntimeChange|ManagerDeletePolicyReleasesBoundPostgreSQLPVC|ManagerRetainPolicyReleasesExplicitlyDeletingPostgreSQLPVC|ManagerActivationCeremony)$' \
             ./internal/controller
           go test -race -count=1 -timeout=10m \
             -run '^TestPostgreSQLBootstrapDockerRecoveryAndConflict$' \

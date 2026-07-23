@@ -32,6 +32,36 @@ func managerPod() *corev1.Pod {
 	}
 }
 
+func TestPodConnectDenyValidatorAnswersDispatchProbeSentinelInEveryPhase(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	// The reserved sentinel Pod name is denied with the EXACT message in every
+	// phase and in the operator namespace too — the per-backend convergence probe
+	// distinguishes a dispatching backend (this denial) from a stale one (a
+	// NotFound for the nonexistent pod), so the response must never depend on
+	// phase or namespace.
+	for _, phase := range []pgshardv1alpha1.IsolationPhase{
+		pgshardv1alpha1.IsolationInactive,
+		pgshardv1alpha1.IsolationActivatingConverge,
+		pgshardv1alpha1.IsolationActive,
+	} {
+		builder := fake.NewClientBuilder().WithScheme(scheme)
+		if phase != pgshardv1alpha1.IsolationInactive {
+			builder = builder.WithObjects(isolationReceiptCluster(phase))
+		}
+		validator := NewPodConnectDenyValidator(builder.Build(), testOperatorNamespace)
+		response := validator.Handle(context.Background(), connectRequest(testWorkloadNS, ConnectDispatchProbeSentinelName, "exec"))
+		if response.Allowed || response.Result.Message != ConnectDispatchProbeSentinelMessage {
+			t.Fatalf("connect dispatch-probe sentinel under %q = %#v", phase, response.Result)
+		}
+	}
+	operatorEntry := NewPodConnectDenyValidator(fake.NewClientBuilder().WithScheme(scheme).Build(), testOperatorNamespace)
+	response := operatorEntry.Handle(context.Background(), connectRequest(testOperatorNamespace, ConnectDispatchProbeSentinelName, "exec"))
+	if response.Allowed || response.Result.Message != ConnectDispatchProbeSentinelMessage {
+		t.Fatalf("operator-namespace connect dispatch-probe sentinel = %#v", response.Result)
+	}
+}
+
 func TestPodConnectDenyValidatorDeniesFencedNamespaceOnlyWhenActive(t *testing.T) {
 	t.Parallel()
 	scheme := testScheme(t)

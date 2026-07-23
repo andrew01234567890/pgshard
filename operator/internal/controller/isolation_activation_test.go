@@ -11,6 +11,7 @@ import (
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -21,13 +22,23 @@ func isolationNamespace(uid types.UID) *corev1.Namespace {
 }
 
 // fakeDispatchProber returns a fixed proof, standing in for the live per-backend
-// probe that the fake client cannot exercise.
+// probe that the fake client cannot exercise. When enforcingProof is set,
+// ProveEnforcing returns it instead, so tests can drive a converged base proof
+// alongside a not-yet-converged gated proof (a stale backend's label lag).
 type fakeDispatchProber struct {
-	proof dispatchProof
-	err   error
+	proof          dispatchProof
+	enforcingProof *dispatchProof
+	err            error
 }
 
 func (f fakeDispatchProber) Prove(ctx context.Context, namespace string) (dispatchProof, error) {
+	return f.proof, f.err
+}
+
+func (f fakeDispatchProber) ProveEnforcing(ctx context.Context, namespace string) (dispatchProof, error) {
+	if f.enforcingProof != nil {
+		return *f.enforcingProof, f.err
+	}
 	return f.proof, f.err
 }
 
@@ -393,6 +404,114 @@ func TestReconcileIsolationActivationManagesEnforcingNamespaceLabel(t *testing.T
 	}
 	if _, present := reload(t, kubeClient, genTestNamespace).Labels[podfence.NamespaceEnforcingLabel]; present {
 		t.Fatal("returning to INACTIVE did not remove the isolation-enforcing namespace label")
+	}
+}
+
+func convergeCluster(name string) *pgshardv1alpha1.PgShardCluster {
+	cluster := genCluster(name, types.UID(name+"-uid"))
+	cluster.Status.IsolationReceipt = &pgshardv1alpha1.PostgreSQLIsolationReceipt{
+		NamespaceUID: "ns-uid", Phase: pgshardv1alpha1.IsolationActivatingConverge,
+		DispatchTupleHash: "base-tuple", ActivatedAt: metav1.Now(),
+	}
+	return cluster
+}
+
+func TestDriveIsolationConvergeAdvancesToQuiesceOnProvenGatedDispatch(t *testing.T) {
+	t.Parallel()
+	cluster := convergeCluster("convergecase")
+	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster)
+	enforcing := dispatchProof{converged: true, backends: 2, tupleHash: "enforcing-tuple"}
+	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, backends: 2, tupleHash: "base-tuple"}, enforcingProof: &enforcing}
+	reconciler.IdentityProber = fakeIdentityProber{matched: true}
+
+	if _, err := reconciler.reconcileIsolationActivation(context.Background(), cluster); err != nil {
+		t.Fatal(err)
+	}
+	receipt := reloadReceipt(t, kubeClient, cluster)
+	if receipt.Phase != pgshardv1alpha1.IsolationActivatingQuiesce {
+		t.Fatalf("proven converge did not advance to quiesce: %#v", receipt)
+	}
+	// Enforcement is bound to the ENFORCING tuple: every later revalidation
+	// re-proves the gated webhooks, never just the base PodCreate sentinel.
+	if receipt.DispatchTupleHash != "enforcing-tuple" {
+		t.Fatalf("quiesce receipt is not bound to the enforcing proof tuple: %#v", receipt)
+	}
+}
+
+func TestDriveIsolationConvergeHoldsWhileGatedDispatchUnproven(t *testing.T) {
+	t.Parallel()
+	cluster := convergeCluster("staleconvergecase")
+	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster)
+	// A stale backend's namespace informer has not observed the enforcing label:
+	// the gated proof stays unconverged even though the base proof is fine.
+	stale := dispatchProof{converged: false, reason: "10.0.0.2 skipped the workload webhook"}
+	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, backends: 2, tupleHash: "base-tuple"}, enforcingProof: &stale}
+	reconciler.IdentityProber = fakeIdentityProber{matched: true}
+
+	if _, err := reconciler.reconcileIsolationActivation(context.Background(), cluster); err != nil {
+		t.Fatal(err)
+	}
+	receipt := reloadReceipt(t, kubeClient, cluster)
+	if receipt.Phase != pgshardv1alpha1.IsolationActivatingConverge {
+		t.Fatalf("unproven gated dispatch advanced past converge: %#v", receipt)
+	}
+	reloaded := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), reloaded); err != nil {
+		t.Fatal(err)
+	}
+	if meta.FindStatusCondition(reloaded.Status.Conditions, isolationDispatchNotConvergedCondition) == nil {
+		t.Fatalf("gated-dispatch hold did not surface its condition: %#v", reloaded.Status.Conditions)
+	}
+}
+
+func TestDriveIsolationConvergeRunsIdentityProbeAfterGatedDispatch(t *testing.T) {
+	t.Parallel()
+	cluster := convergeCluster("identityconvergecase")
+	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster)
+	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, backends: 2, tupleHash: "enforcing-tuple"}}
+	reconciler.IdentityProber = fakeIdentityProber{matched: false, detail: "deployment-controller observed mallory"}
+
+	if _, err := reconciler.reconcileIsolationActivation(context.Background(), cluster); err != nil {
+		t.Fatal(err)
+	}
+	receipt := reloadReceipt(t, kubeClient, cluster)
+	if receipt.Phase != pgshardv1alpha1.IsolationActivatingConverge {
+		t.Fatalf("identity mismatch advanced past converge: %#v", receipt)
+	}
+	reloaded := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), reloaded); err != nil {
+		t.Fatal(err)
+	}
+	if meta.FindStatusCondition(reloaded.Status.Conditions, isolationControllerIdentityMismatchCond) == nil {
+		t.Fatalf("identity mismatch did not surface its condition: %#v", reloaded.Status.Conditions)
+	}
+}
+
+func TestDriveIsolationConvergeReListsLimitRangesAfterConvergence(t *testing.T) {
+	t.Parallel()
+	cluster := convergeCluster("limitconvergecase")
+	// A LimitRange slipped in AFTER the INACTIVE preflight check but before the
+	// gated LimitRange webhook was dispatching everywhere (the TOCTOU window). The
+	// post-convergence re-list catches it; once convergence is proven no backend
+	// admits a new one, so a clean re-list is durable.
+	limitRange := &corev1.LimitRange{ObjectMeta: metav1.ObjectMeta{Name: "sneaky-defaults", Namespace: genTestNamespace}}
+	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster, limitRange)
+	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, backends: 2, tupleHash: "enforcing-tuple"}}
+	reconciler.IdentityProber = fakeIdentityProber{matched: true}
+
+	if _, err := reconciler.reconcileIsolationActivation(context.Background(), cluster); err != nil {
+		t.Fatal(err)
+	}
+	receipt := reloadReceipt(t, kubeClient, cluster)
+	if receipt.Phase != pgshardv1alpha1.IsolationActivatingConverge {
+		t.Fatalf("a live LimitRange did not hold the converge state: %#v", receipt)
+	}
+	reloaded := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), reloaded); err != nil {
+		t.Fatal(err)
+	}
+	if meta.FindStatusCondition(reloaded.Status.Conditions, isolationLimitRangePresentCondition) == nil {
+		t.Fatalf("post-convergence LimitRange re-list did not surface its condition: %#v", reloaded.Status.Conditions)
 	}
 }
 

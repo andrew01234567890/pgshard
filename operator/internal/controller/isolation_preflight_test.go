@@ -72,17 +72,17 @@ func TestAggregateDispatchProof(t *testing.T) {
 		{sliceName: "kubernetes", sliceRV: "1", address: "10.0.0.1", port: 443, sentinelObserved: true, outcome: "sentinel"},
 		{sliceName: "kubernetes", sliceRV: "1", address: "10.0.0.2", port: 443, sentinelObserved: true, outcome: "sentinel"},
 	}
-	if proof := aggregateDispatchProof("rv7", allSentinel); !proof.converged {
+	if proof := aggregateDispatchProof(dispatchProbeModeBase, "rv7", allSentinel); !proof.converged {
 		t.Fatalf("all-backends-sentinel not converged: %#v", proof)
 	}
 	oneAllowed := []backendProbe{
 		{sliceName: "kubernetes", sliceRV: "1", address: "10.0.0.1", port: 443, sentinelObserved: true, outcome: "sentinel"},
 		{sliceName: "kubernetes", sliceRV: "1", address: "10.0.0.2", port: 443, sentinelObserved: false, outcome: "admitted"},
 	}
-	if proof := aggregateDispatchProof("rv7", oneAllowed); proof.converged {
+	if proof := aggregateDispatchProof(dispatchProbeModeBase, "rv7", oneAllowed); proof.converged {
 		t.Fatalf("one-backend-allow reported converged: %#v", proof)
 	}
-	if proof := aggregateDispatchProof("rv7", nil); proof.converged || proof.reason != dispatchUnconvergedReasonUnsupportedHA {
+	if proof := aggregateDispatchProof(dispatchProbeModeBase, "rv7", nil); proof.converged || proof.reason != dispatchUnconvergedReasonUnsupportedHA {
 		t.Fatalf("an empty backend set was not treated as unsupported HA: %#v", proof)
 	}
 }
@@ -90,20 +90,25 @@ func TestAggregateDispatchProof(t *testing.T) {
 func TestDispatchTupleHashBinding(t *testing.T) {
 	t.Parallel()
 	base := []backendProbe{{sliceName: "kubernetes", sliceRV: "1", address: "10.0.0.1", port: 443}}
-	stable := dispatchTupleHash("rv7", base)
-	if stable != dispatchTupleHash("rv7", base) {
+	stable := dispatchTupleHash(dispatchProbeModeBase, "rv7", base)
+	if stable != dispatchTupleHash(dispatchProbeModeBase, "rv7", base) {
 		t.Fatal("tuple hash is not deterministic")
 	}
 	// A new backend, a changed EndpointSlice RV, or a changed webhook-config RV all
 	// change the tuple.
-	if dispatchTupleHash("rv7", append(base, backendProbe{sliceName: "kubernetes", sliceRV: "1", address: "10.0.0.2", port: 443})) == stable {
+	if dispatchTupleHash(dispatchProbeModeBase, "rv7", append(base, backendProbe{sliceName: "kubernetes", sliceRV: "1", address: "10.0.0.2", port: 443})) == stable {
 		t.Fatal("a backend-set change did not change the tuple")
 	}
-	if dispatchTupleHash("rv8", base) == stable {
+	if dispatchTupleHash(dispatchProbeModeBase, "rv8", base) == stable {
 		t.Fatal("a webhook-config RV change did not change the tuple")
 	}
-	if dispatchTupleHash("rv7", []backendProbe{{sliceName: "kubernetes", sliceRV: "2", address: "10.0.0.1", port: 443}}) == stable {
+	if dispatchTupleHash(dispatchProbeModeBase, "rv7", []backendProbe{{sliceName: "kubernetes", sliceRV: "2", address: "10.0.0.1", port: 443}}) == stable {
 		t.Fatal("an EndpointSlice RV change did not change the tuple")
+	}
+	// A base proof can never satisfy an enforcing-phase revalidation: the probe
+	// mode is folded into the tuple.
+	if dispatchTupleHash(dispatchProbeModeEnforcing, "rv7", base) == stable {
+		t.Fatal("the probe mode did not change the tuple")
 	}
 }
 
@@ -138,7 +143,6 @@ func TestIdentitiesMatch(t *testing.T) {
 func preflightReconciler() *PgShardClusterReconciler {
 	return &PgShardClusterReconciler{
 		MinorGate:      fakeMinorGate{ok: true, observed: "v1.36.2"},
-		IdentityProber: fakeIdentityProber{matched: true},
 		DispatchProber: fakeDispatchProber{proof: dispatchProof{converged: true, backends: 2, tupleHash: "tuple-abc"}},
 	}
 }
@@ -147,6 +151,11 @@ func TestPreflightConvergedComposition(t *testing.T) {
 	t.Parallel()
 	cluster := genCluster("preflight", "preflight-uid")
 
+	// The identity probe is deliberately NOT part of the INACTIVE preflight (the
+	// reconciler above wires none): two of its observations come only from the
+	// label-gated workload webhook, which cannot dispatch before the enforcing
+	// label exists, so probing here would deadlock fresh activation. It runs in
+	// the CONVERGE state instead.
 	if proof, ok := preflightReconciler().preflightConverged(context.Background(), cluster); !ok || proof.tupleHash != "tuple-abc" {
 		t.Fatalf("all-gates-pass preflight withheld: ok=%v proof=%#v", ok, proof)
 	}
@@ -154,9 +163,6 @@ func TestPreflightConvergedComposition(t *testing.T) {
 	for name, mutate := range map[string]func(*PgShardClusterReconciler){
 		"minor unsupported": func(r *PgShardClusterReconciler) {
 			r.MinorGate = fakeMinorGate{ok: false, observed: "v1.29.0"}
-		},
-		"identity mismatch": func(r *PgShardClusterReconciler) {
-			r.IdentityProber = fakeIdentityProber{matched: false, detail: "deployment-controller observed mallory"}
 		},
 		"dispatch unconverged": func(r *PgShardClusterReconciler) {
 			r.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: false, reason: "backend allowed"}}
@@ -176,7 +182,6 @@ func TestPreflightConvergedComposition(t *testing.T) {
 			}
 			wantCondition := map[string]string{
 				"minor unsupported":    isolationMinorUnsupportedCondition,
-				"identity mismatch":    isolationControllerIdentityMismatchCond,
 				"dispatch unconverged": isolationDispatchNotConvergedCondition,
 				"ha unsupported":       isolationHAUnsupportedCondition,
 			}[name]
@@ -291,23 +296,24 @@ func tlsReadyActivationCluster(name string, uid types.UID) *pgshardv1alpha1.PgSh
 	return cluster
 }
 
-func TestReconcileIsolationActivationOptInEntersQuiesce(t *testing.T) {
+func TestReconcileIsolationActivationOptInEntersConverge(t *testing.T) {
 	t.Parallel()
 	cluster := tlsReadyActivationCluster("optincase", "optincase-uid")
 	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster)
 	reconciler.MinorGate = fakeMinorGate{ok: true, observed: "v1.36.2"}
-	reconciler.IdentityProber = fakeIdentityProber{matched: true}
 	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, backends: 2, tupleHash: "tuple-abc"}}
 
+	// Opt-in enters the PRE-ENFORCEMENT converge state — never quiesce directly:
+	// the label-gated webhooks must first be proven dispatching on every backend.
 	if _, err := reconciler.reconcileIsolationActivation(context.Background(), cluster); err != nil {
 		t.Fatal(err)
 	}
 	receipt := reloadReceipt(t, kubeClient, cluster)
-	if receipt == nil || receipt.Phase != pgshardv1alpha1.IsolationActivatingQuiesce {
-		t.Fatalf("opted-in cluster did not enter quiesce: %#v", receipt)
+	if receipt == nil || receipt.Phase != pgshardv1alpha1.IsolationActivatingConverge {
+		t.Fatalf("opted-in cluster did not enter converge: %#v", receipt)
 	}
 	if receipt.NamespaceUID != "ns-uid" || receipt.DispatchTupleHash != "tuple-abc" {
-		t.Fatalf("quiesce receipt not bound to namespace/tuple: %#v", receipt)
+		t.Fatalf("converge receipt not bound to namespace/tuple: %#v", receipt)
 	}
 }
 
@@ -491,7 +497,8 @@ func TestActivationWithheldOnUnprovenDispatchEnumerationWithoutAck(t *testing.T)
 	}
 
 	// With the ADMIN-controlled namespace attestation (the install flag), the same
-	// single-backend proof is accepted and the cluster enters quiesce.
+	// single-backend proof is accepted and the cluster enters the pre-enforcement
+	// converge state.
 	reconciler.UnenumerableHAAckNamespaces = map[string]bool{genTestNamespace: true}
 	acked := &pgshardv1alpha1.PgShardCluster{}
 	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), acked); err != nil {
@@ -500,7 +507,7 @@ func TestActivationWithheldOnUnprovenDispatchEnumerationWithoutAck(t *testing.T)
 	if _, err := reconciler.reconcileIsolationActivation(context.Background(), acked); err != nil {
 		t.Fatal(err)
 	}
-	if receipt := reloadReceipt(t, kubeClient, cluster); receipt == nil || receipt.Phase != pgshardv1alpha1.IsolationActivatingQuiesce {
+	if receipt := reloadReceipt(t, kubeClient, cluster); receipt == nil || receipt.Phase != pgshardv1alpha1.IsolationActivatingConverge {
 		t.Fatalf("the admin namespace attestation did not admit the single-backend proof: %#v", receipt)
 	}
 }

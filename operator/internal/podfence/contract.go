@@ -493,6 +493,14 @@ func (v *WorkloadIntegrityValidator) Handle(ctx context.Context, request admissi
 	if request.Operation != admissionv1.Create && request.Operation != admissionv1.Update {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("unexpected workload integrity request %s", request.Operation))
 	}
+	// The dispatch-convergence sentinel is always denied FIRST, in every phase,
+	// with the exact sentinel message: the pre-enforcement convergence probe
+	// submits a dryRun sentinel workload to each API-server backend and requires
+	// exactly this response to prove that backend dispatches to this label-gated
+	// webhook for the now-enforcing namespace.
+	if objectCarriesDispatchProbeSentinel(request.Object.Raw) {
+		return admission.Denied(WorkloadDispatchProbeSentinelMessage)
+	}
 	if request.Operation == admissionv1.Create {
 		receipt, err := namespaceIsolationReceipt(ctx, v.reader, request.Namespace)
 		if err != nil {
@@ -502,6 +510,9 @@ func (v *WorkloadIntegrityValidator) Handle(ctx context.Context, request admissi
 		// while the reconciler seals parents and drains. RECREATE deliberately
 		// still allows the CAS-roll ReplicaSet create (subject to the usual
 		// authorship checks below) so supporting pods can be re-authenticated.
+		// CONVERGE is deliberately NOT frozen: the pre-enforcement identity probe
+		// creates its disposable workloads then, and this webhook must observe
+		// (not freeze out) their controller activity.
 		if isolationPhase(receipt) == pgshardv1alpha1.IsolationActivatingQuiesce {
 			return admission.Denied("namespace isolation is quiescing; workload creation is frozen")
 		}
@@ -747,7 +758,8 @@ func (v *WorkloadIntegrityValidator) handleScale(ctx context.Context, request ad
 		// the sealed parent and restarting the ceremony — a fluctuating pooler HPA
 		// would otherwise livelock activation. The operator (draining a prior
 		// ReplicaSet via /scale during a roll) is never frozen. HPA scaling resumes
-		// after ACTIVE.
+		// after ACTIVE. CONVERGE is deliberately unfrozen: nothing is sealed yet and
+		// the identity probe's HPA scale must be observed here, not denied.
 		if request.UserInfo.Username == v.identities.HorizontalPodAutoscalerController {
 			receipt, err := namespaceIsolationReceipt(ctx, v.reader, request.Namespace)
 			if err != nil {

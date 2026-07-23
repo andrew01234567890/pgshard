@@ -50,13 +50,14 @@ func (r *PgShardClusterReconciler) reconcileIsolationActivation(ctx context.Cont
 	}
 
 	// Reconcile the isolation-ENFORCING namespace LABEL to match the receipt phase:
-	// present for ANY non-INACTIVE phase (QUIESCE/RECREATE/ACTIVE), absent for
-	// INACTIVE / no receipt. Every genuinely-new isolation webhook's
+	// present for ANY non-INACTIVE phase (CONVERGE/QUIESCE/RECREATE/ACTIVE), absent
+	// for INACTIVE / no receipt. Every genuinely-new isolation webhook's
 	// namespaceSelector requires it, so an un-activated fenced namespace invokes
 	// NONE of them — ordinary applies/creates and a manager restart behave exactly
 	// as pre-isolation. This is idempotent, so it self-heals after a manager
-	// restart. The INACTIVE→QUIESCE transition sets the label BEFORE the QUIESCE
-	// write (below) so enforcement is effective the instant activation begins.
+	// restart. The INACTIVE→CONVERGE transition sets the label BEFORE the receipt
+	// write (below), and the CONVERGE state then PROVES the gated webhooks dispatch
+	// on every backend before any enforcing phase begins.
 	if err := r.reconcileIsolationEnforcingLabel(ctx, namespace, isolationReceiptPhase(receipt) != pgshardv1alpha1.IsolationInactive); err != nil {
 		return false, err
 	}
@@ -128,24 +129,32 @@ func (r *PgShardClusterReconciler) reconcileIsolationActivation(ctx context.Cont
 			r.setIsolationPreflightCondition(cluster, isolationMultipleClustersCondition, "ExclusivityHeld", "the namespace isolation-activation lease is held by another PgShardCluster")
 			return false, r.Status().Update(ctx, cluster)
 		}
-		// Set the enforcing label BEFORE writing the QUIESCE receipt, so the
-		// isolation webhooks (WorkloadIntegrity deny-all, etc.) fire the instant
-		// activation begins — no window where QUIESCE is written but not enforced.
+		// Set the (admission-protected, operator-reserved) enforcing label BEFORE
+		// writing the CONVERGE receipt, then enter the PRE-ENFORCEMENT convergence
+		// state — NOT quiesce. The label-gated isolation webhooks are evaluated per
+		// backend from informer-cached namespace labels, so setting the label does
+		// not synchronously activate them everywhere; CONVERGE proves each gated
+		// webhook dispatches on EVERY backend (and runs the identity probe, which
+		// needs the workload webhook dispatching) before any enforcing phase is
+		// entered. The base proof's tuple is recorded for audit and is replaced by
+		// the enforcing tuple when CONVERGE completes.
 		if err := r.reconcileIsolationEnforcingLabel(ctx, namespace, true); err != nil {
 			return false, err
 		}
 		cluster.Status.IsolationReceipt = &pgshardv1alpha1.PostgreSQLIsolationReceipt{
 			NamespaceUID:       string(namespace.UID),
-			Phase:              pgshardv1alpha1.IsolationActivatingQuiesce,
+			Phase:              pgshardv1alpha1.IsolationActivatingConverge,
 			SecurityGeneration: currentSecurityGeneration(cluster),
 			DispatchTupleHash:  proof.tupleHash,
 			ActivatedAt:        metav1.Now(),
 		}
 		clearIsolationPreflightConditions(cluster)
 		if err := r.Status().Update(ctx, cluster); err != nil {
-			return false, fmt.Errorf("enter isolation quiesce: %w", err)
+			return false, fmt.Errorf("enter isolation converge: %w", err)
 		}
 		return true, nil
+	case pgshardv1alpha1.IsolationActivatingConverge:
+		return r.driveIsolationConverge(ctx, cluster)
 	case pgshardv1alpha1.IsolationActivatingQuiesce:
 		return r.driveIsolationQuiesce(ctx, cluster, namespace)
 	case pgshardv1alpha1.IsolationActivatingRecreate:
@@ -154,6 +163,78 @@ func (r *PgShardClusterReconciler) reconcileIsolationActivation(ctx context.Cont
 		return r.driveIsolationActive(ctx, cluster)
 	}
 	return false, nil
+}
+
+// driveIsolationConverge is the pre-enforcement convergence state, entered with
+// the isolation-enforcing label already set and admission-protected. In order:
+//  1. It proves — with a per-backend, per-gated-webhook sentinel — that EVERY
+//     live API-server backend now dispatches the workload, connect, and
+//     LimitRange webhooks for the enforcing namespace. A mutable namespace
+//     selector is evaluated from each backend's informer cache, so this is the
+//     step that turns "the label is set" into "the gate is provably closed on
+//     every backend"; a stale backend keeps the ceremony here.
+//  2. It runs the controller-identity probe, which needs the (now proven-
+//     dispatching) workload webhook to observe the Deployment- and
+//     HPA-controller identities — running it any earlier deadlocks.
+//  3. It RE-lists LimitRanges AFTER convergence, closing the preflight TOCTOU:
+//     from this point no backend can admit a new LimitRange, so a clean re-list
+//     is durable. (Protected workloads are re-listed by the QUIESCE seal itself,
+//     which reads the live API after this state.)
+//
+// Only then does it advance to ACTIVATING_QUIESCE, re-binding the receipt to the
+// ENFORCING proof tuple that every later revalidation must re-prove.
+func (r *PgShardClusterReconciler) driveIsolationConverge(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
+	receipt := cluster.Status.IsolationReceipt
+	if r.DispatchProber == nil {
+		r.setIsolationPreflightCondition(cluster, isolationDispatchNotConvergedCondition, "Unavailable", "the dispatch-convergence prober is not wired")
+		return false, r.Status().Update(ctx, cluster)
+	}
+	proof, err := r.DispatchProber.ProveEnforcing(ctx, cluster.Namespace)
+	if err != nil {
+		r.setIsolationPreflightCondition(cluster, isolationDispatchNotConvergedCondition, "ProbeFailed", fmt.Sprintf("gated-webhook dispatch-convergence probe failed: %v", err))
+		return true, r.Status().Update(ctx, cluster)
+	}
+	if !proof.converged {
+		condition := isolationDispatchNotConvergedCondition
+		reason := "NotConverged"
+		if proof.reason == dispatchUnconvergedReasonUnsupportedHA {
+			condition = isolationHAUnsupportedCondition
+			reason = "UnsupportedHA"
+		}
+		r.setIsolationPreflightCondition(cluster, condition, reason, proof.reasonMessage())
+		return true, r.Status().Update(ctx, cluster)
+	}
+	if ok, detail := r.dispatchProofAccepted(cluster, proof); !ok {
+		r.setIsolationPreflightCondition(cluster, isolationHAUnsupportedCondition, "EnumerationUnproven", detail)
+		return true, r.Status().Update(ctx, cluster)
+	}
+	if r.IdentityProber == nil {
+		r.setIsolationPreflightCondition(cluster, isolationControllerIdentityMismatchCond, "Unavailable", "the controller-identity probe is not wired")
+		return false, r.Status().Update(ctx, cluster)
+	}
+	matched, detail, err := r.IdentityProber.Probe(ctx, cluster)
+	if err != nil {
+		r.setIsolationPreflightCondition(cluster, isolationControllerIdentityMismatchCond, "ProbeFailed", fmt.Sprintf("controller-identity probe failed: %v", err))
+		return true, r.Status().Update(ctx, cluster)
+	}
+	if !matched {
+		r.setIsolationPreflightCondition(cluster, isolationControllerIdentityMismatchCond, "Mismatch", detail)
+		return true, r.Status().Update(ctx, cluster)
+	}
+	if name, err := r.limitRangePresent(ctx, cluster.Namespace); err != nil {
+		return false, err
+	} else if name != "" {
+		r.setIsolationPreflightCondition(cluster, isolationLimitRangePresentCondition, "LimitRangePresent", fmt.Sprintf("isolation activation is held in converge while LimitRange %q exists in the fenced namespace", name))
+		return true, r.Status().Update(ctx, cluster)
+	}
+	receipt.Phase = pgshardv1alpha1.IsolationActivatingQuiesce
+	receipt.DispatchTupleHash = proof.tupleHash
+	receipt.ActivatedAt = metav1.Now()
+	clearIsolationPreflightConditions(cluster)
+	if err := r.Status().Update(ctx, cluster); err != nil {
+		return false, fmt.Errorf("advance isolation converge to quiesce: %w", err)
+	}
+	return true, nil
 }
 
 // driveIsolationQuiesce seals every protected parent at its exact incarnation,
@@ -730,10 +811,12 @@ func hasReplicationTLSPrerequisite(cluster *pgshardv1alpha1.PgShardCluster) bool
 
 // reconcileIsolationEnforcingLabel ensures the fenced namespace carries the
 // isolation-enforcing label iff its isolation is in any non-INACTIVE phase
-// (QUIESCE/RECREATE/ACTIVE). Setting/removing a non-fencing label is permitted by
-// the namespace webhook (which only pins the fencing label), so the operator
-// authors this. It is a no-op when the label already matches, so it never churns
-// the namespace.
+// (CONVERGE/QUIESCE/RECREATE/ACTIVE). The namespace webhook RESERVES this label
+// to the authenticated operator identity (exact absent<->enforced transitions
+// only), so this reconciler — running as that identity — is the only writer; an
+// attacker with namespace update cannot strip the label to stop the gated
+// webhooks from dispatching. It is a no-op when the label already matches, so it
+// never churns the namespace.
 func (r *PgShardClusterReconciler) reconcileIsolationEnforcingLabel(ctx context.Context, namespace *corev1.Namespace, enforcing bool) error {
 	has := namespace.Labels[podfence.NamespaceEnforcingLabel] == podfence.NamespaceEnforcingLabelValue
 	if has == enforcing {

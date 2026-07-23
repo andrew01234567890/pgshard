@@ -36,6 +36,10 @@ func TestGeneratedManagerRoleAuthorizesRuntimeControlPaths(t *testing.T) {
 		{group: "", resource: "nodes", verbs: []string{"get"}},
 		{group: "", resource: "persistentvolumeclaims", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
 		{group: "", resource: "pods", verbs: []string{"create", "delete", "get", "list", "patch"}},
+		// limitranges create + name-pinned pods/exec create authorize ONLY the
+		// dispatch-convergence sentinels (dryRun / always-denied by our webhooks).
+		{group: "", resource: "limitranges", verbs: []string{"create", "get", "list"}},
+		{group: "", resource: "pods/exec", verbs: []string{"create"}},
 		{group: "discovery.k8s.io", resource: "endpointslices", verbs: []string{"get", "list"}},
 		{group: "", resource: "secrets", verbs: []string{"create", "delete", "get", "update"}},
 		{group: "", resource: "serviceaccounts", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},

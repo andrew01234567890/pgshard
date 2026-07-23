@@ -418,7 +418,7 @@ type PgShardClusterStatus struct {
 }
 
 // IsolationPhase is the durable phase of a namespace's isolation activation.
-// +kubebuilder:validation:Enum=INACTIVE;ACTIVATING_QUIESCE;ACTIVATING_RECREATE;ACTIVE
+// +kubebuilder:validation:Enum=INACTIVE;ACTIVATING_CONVERGE;ACTIVATING_QUIESCE;ACTIVATING_RECREATE;ACTIVE
 type IsolationPhase string
 
 const (
@@ -426,6 +426,15 @@ const (
 	// admission behaves exactly as it did before activation (stampless and
 	// unclassified pods pass the legacy path).
 	IsolationInactive IsolationPhase = "INACTIVE"
+	// IsolationActivatingConverge is the pre-enforcement convergence state: the
+	// isolation-enforcing namespace label is set (and admission-protected), and the
+	// reconciler proves that EVERY live API-server backend now DISPATCHES each
+	// label-gated isolation webhook (workload, connect, LimitRange) for the fenced
+	// namespace, then runs the controller-identity probe (which needs the workload
+	// webhook dispatching) and re-lists LimitRanges. Only a fully proven namespace
+	// advances to the enforcing phases; a stale backend's namespace-informer lag
+	// can therefore never let it skip the gated webhooks once enforcement begins.
+	IsolationActivatingConverge IsolationPhase = "ACTIVATING_CONVERGE"
 	// IsolationActivatingQuiesce freezes the namespace: every pod and workload
 	// create is denied while the reconciler seals every protected parent and
 	// drains in-flight creates.

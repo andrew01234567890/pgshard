@@ -61,6 +61,14 @@ func (v *PodConnectDenyValidator) Handle(ctx context.Context, request admission.
 	if request.Operation != admissionv1.Connect {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("unexpected Pod connect request %s", request.Operation))
 	}
+	// The dispatch-convergence sentinel is always denied FIRST, in every phase and
+	// for both webhook entries: the pre-enforcement convergence probe issues a
+	// CONNECT to the reserved sentinel Pod name against each API-server backend
+	// and requires exactly this response to prove that backend dispatches this
+	// label-gated webhook (a stale backend instead 404s the nonexistent pod).
+	if request.Name == ConnectDispatchProbeSentinelName {
+		return admission.Denied(ConnectDispatchProbeSentinelMessage)
+	}
 	if request.Namespace == v.operatorNamespace {
 		return v.denyManagerConnect(ctx, request)
 	}

@@ -1205,7 +1205,7 @@ func TestNamespaceValidatorMakesTheFencingOptInStickyAcrossSubresources(t *testi
 			t.Parallel()
 			newNamespace := oldNamespace.DeepCopy()
 			delete(newNamespace.Labels, NamespaceLabel)
-			response := NewNamespaceValidator(scheme).Handle(context.Background(), updateRequest(t, oldNamespace, newNamespace, subresource))
+			response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), updateRequest(t, oldNamespace, newNamespace, subresource))
 			if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, "immutable") {
 				t.Fatalf("fencing label removal through %q response = %#v", subresource, response)
 			}
@@ -1409,5 +1409,104 @@ func TestLimitRangeValidatorDeniesEveryWrite(t *testing.T) {
 		if response := validator.Handle(context.Background(), request); response.Allowed || !strings.Contains(response.Result.Message, "not permitted in a fenced") {
 			t.Fatalf("LimitRange %s allowed: %#v", op, response.Result)
 		}
+	}
+}
+
+func TestLimitRangeValidatorAnswersDispatchProbeSentinel(t *testing.T) {
+	t.Parallel()
+	sentinel := &corev1.LimitRange{ObjectMeta: metav1.ObjectMeta{
+		Name: "probe", Namespace: "database",
+		Annotations: map[string]string{DispatchProbeSentinelAnnotation: DispatchProbeSentinelValue},
+	}}
+	request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Operation: admissionv1.Create,
+		Resource:  metav1.GroupVersionResource{Version: "v1", Resource: "limitranges"},
+		Object:    runtime.RawExtension{Raw: marshalObject(t, sentinel)},
+	}}
+	response := NewLimitRangeValidator().Handle(context.Background(), request)
+	if response.Allowed || response.Result.Message != LimitRangeDispatchProbeSentinelMessage {
+		t.Fatalf("LimitRange dispatch-probe sentinel response = %#v", response.Result)
+	}
+}
+
+const testOperatorUsername = "system:serviceaccount:pgshard-system:pgshard-controller-manager"
+
+func namespaceUpdateAs(t *testing.T, username string, oldNamespace, newNamespace *corev1.Namespace, subresource string) admission.Request {
+	t.Helper()
+	request := updateRequest(t, oldNamespace, newNamespace, subresource)
+	request.UserInfo.Username = username
+	return request
+}
+
+func enforcementNamespace(enforcing bool) *corev1.Namespace {
+	labels := map[string]string{NamespaceLabel: NamespaceLabelValue}
+	if enforcing {
+		labels[NamespaceEnforcingLabel] = NamespaceEnforcingLabelValue
+	}
+	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "database", Labels: labels}}
+}
+
+func TestNamespaceValidatorReservesEnforcingLabelToOperator(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	const attacker = "system:serviceaccount:tenant:mallory"
+
+	// The gated isolation webhooks stop DISPATCHING the moment the label is gone
+	// (Kubernetes would simply stop calling them), so a non-operator removal while
+	// enforcement is durable (the ACTIVE shape) is a full bypass and must be
+	// denied on every namespace update surface.
+	for _, subresource := range []string{"", "status", "finalize"} {
+		removal := namespaceUpdateAs(t, attacker, enforcementNamespace(true), enforcementNamespace(false), subresource)
+		if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), removal); response.Allowed || !strings.Contains(response.Result.Message, "reserved") {
+			t.Fatalf("attacker enforcing-label removal through %q = %#v", subresource, response.Result)
+		}
+	}
+
+	// A non-operator SET while un-activated (the INACTIVE shape) would turn the
+	// deny-heavy gated webhooks on against the honest un-activated flow.
+	set := namespaceUpdateAs(t, attacker, enforcementNamespace(false), enforcementNamespace(true), "")
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), set); response.Allowed || !strings.Contains(response.Result.Message, "reserved") {
+		t.Fatalf("attacker enforcing-label set = %#v", response.Result)
+	}
+
+	// A non-operator value CHANGE stops the selector matching just like removal.
+	altered := enforcementNamespace(true)
+	altered.Labels[NamespaceEnforcingLabel] = "off"
+	change := namespaceUpdateAs(t, attacker, enforcementNamespace(true), altered, "")
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), change); response.Allowed || !strings.Contains(response.Result.Message, "reserved") {
+		t.Fatalf("attacker enforcing-label change = %#v", response.Result)
+	}
+
+	// An unrelated update that leaves the label alone stays permitted.
+	annotated := enforcementNamespace(true)
+	annotated.Annotations = map[string]string{"team": "db"}
+	unrelated := namespaceUpdateAs(t, attacker, enforcementNamespace(true), annotated, "")
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), unrelated); !response.Allowed {
+		t.Fatalf("unrelated namespace update was denied: %#v", response.Result)
+	}
+}
+
+func TestNamespaceValidatorPermitsOperatorEnforcingTransitions(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+
+	// The operator performs exactly the absent<->enforced transitions (entering
+	// and leaving activation).
+	set := namespaceUpdateAs(t, testOperatorUsername, enforcementNamespace(false), enforcementNamespace(true), "")
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), set); !response.Allowed {
+		t.Fatalf("operator enforcing-label set was denied: %#v", response.Result)
+	}
+	removal := namespaceUpdateAs(t, testOperatorUsername, enforcementNamespace(true), enforcementNamespace(false), "")
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), removal); !response.Allowed {
+		t.Fatalf("operator enforcing-label removal was denied: %#v", response.Result)
+	}
+
+	// Any other value is malformed even for the operator: the selector matches
+	// only the exact enforced value, so a drifting value must never persist.
+	bogus := enforcementNamespace(true)
+	bogus.Labels[NamespaceEnforcingLabel] = "maybe"
+	toBogus := namespaceUpdateAs(t, testOperatorUsername, enforcementNamespace(false), bogus, "")
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), toBogus); response.Allowed || !strings.Contains(response.Result.Message, "exact") {
+		t.Fatalf("operator bogus enforcing-label value = %#v", response.Result)
 	}
 }

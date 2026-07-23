@@ -38,6 +38,7 @@ rules:
   resources:
   - limitranges
   verbs:
+  - create
   - get
   - list
 - apiGroups:
@@ -58,6 +59,14 @@ rules:
   - get
   - list
   - patch
+- apiGroups:
+  - ""
+  resourceNames:
+  - pgshard-connect-probe-sentinel
+  resources:
+  - pods/exec
+  verbs:
+  - create
 - apiGroups:
   - ""
   resources:

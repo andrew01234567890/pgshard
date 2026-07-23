@@ -243,7 +243,7 @@ func main() {
 			Handler: podfence.NewStatusValidator(manager.GetAPIReader(), handshakeCodec, scheme),
 		})
 		webhookServer.Register(podfence.NamespaceWebhookPath, &admission.Webhook{
-			Handler: podfence.NewNamespaceValidator(scheme),
+			Handler: podfence.NewNamespaceValidator(controllerIdentities.Operator, scheme),
 		})
 	}
 	if err := manager.AddHealthzCheck("healthz", healthz.Ping); err != nil {

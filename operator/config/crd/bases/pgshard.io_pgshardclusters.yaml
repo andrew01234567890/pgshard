@@ -589,6 +589,7 @@ spec:
                       isolation activation.
                     enum:
                     - INACTIVE
+                    - ACTIVATING_CONVERGE
                     - ACTIVATING_QUIESCE
                     - ACTIVATING_RECREATE
                     - ACTIVE

@@ -117,7 +117,12 @@ type PgShardClusterReconciler struct {
 // +kubebuilder:rbac:groups="",resources=endpoints,verbs=get
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;create;patch;delete
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get
-// +kubebuilder:rbac:groups="",resources=limitranges,verbs=get;list
+// limitranges create and the name-pinned pods/exec create exist ONLY for the
+// dispatch-convergence sentinels (dryRun / always-denied): authorization runs
+// before admission, so proving a webhook dispatches requires the verb. The exec
+// grant is pinned to the reserved sentinel pod name, which never exists.
+// +kubebuilder:rbac:groups="",resources=limitranges,verbs=get;list;create
+// +kubebuilder:rbac:groups="",resources=pods/exec,resourceNames=pgshard-connect-probe-sentinel,verbs=create
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
 // +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingwebhookconfigurations,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;delete
