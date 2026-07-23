@@ -316,7 +316,18 @@ func supportingDeploymentConverged(deployment *appsv1.Deployment) bool {
 	if deployment.Spec.Replicas != nil {
 		desired = *deployment.Spec.Replicas
 	}
-	return deployment.Status.UpdatedReplicas == desired && deployment.Status.AvailableReplicas == desired && deployment.Status.Replicas == desired
+	// Prove the new generation MATERIALIZED, not that it is Available/Ready: every
+	// live Pod is the current template (UpdatedReplicas == desired) with no
+	// stragglers (Replicas == desired). Availability is deliberately NOT required.
+	// A supporting workload can be legitimately non-serving — the pooler under the
+	// agent-quarantine runtime never passes its /readyz probe, so its Deployment
+	// never reports AvailableReplicas > 0 — and readiness is an availability
+	// property, not a security one. Requiring it here deadlocked activation of
+	// every agent-quarantine cluster in QUIESCE. The revocation's security
+	// guarantee (no prior-generation Pod survives) is carried entirely by the
+	// ordered prior-ReplicaSet scale-to-zero, drain, and two-zero-LIST sweep that
+	// follow this gate in driveSupportingRevocation; none of that is weakened.
+	return deployment.Status.UpdatedReplicas == desired && deployment.Status.Replicas == desired
 }
 
 func (r *PgShardClusterReconciler) listOwnedReplicaSets(ctx context.Context, reader client.Reader, namespace string, deploymentUID types.UID) ([]appsv1.ReplicaSet, error) {

@@ -334,3 +334,40 @@ func TestSupportingGenerationDeploymentRecreateResetsRecord(t *testing.T) {
 		t.Fatalf("record was not rebuilt after Deployment recreation: %#v", record)
 	}
 }
+
+func TestSupportingDeploymentConvergedProvesMaterializationNotAvailability(t *testing.T) {
+	t.Parallel()
+	replicas := int32(1)
+	base := func() *appsv1.Deployment {
+		return &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Generation: 3},
+			Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
+			Status:     appsv1.DeploymentStatus{ObservedGeneration: 3, Replicas: 1, UpdatedReplicas: 1, AvailableReplicas: 1, ReadyReplicas: 1},
+		}
+	}
+	// A fully materialized generation converges even when the workload never
+	// becomes Available: the pooler under the agent-quarantine runtime is
+	// non-serving, so its Deployment reports AvailableReplicas/ReadyReplicas == 0
+	// forever. Requiring availability deadlocked activation of every
+	// agent-quarantine cluster in QUIESCE.
+	nonServing := base()
+	nonServing.Status.AvailableReplicas = 0
+	nonServing.Status.ReadyReplicas = 0
+	if !supportingDeploymentConverged(nonServing) {
+		t.Fatal("a materialized but non-serving supporting Deployment must converge")
+	}
+	// Materialization IS required: a stale observed generation, an un-updated Pod,
+	// or a straggler prior-generation Pod each blocks convergence so the revocation
+	// never sweeps ahead of the roll.
+	stale := base()
+	stale.Status.ObservedGeneration = 2
+	notUpdated := base()
+	notUpdated.Status.UpdatedReplicas = 0
+	straggler := base()
+	straggler.Status.Replicas = 2
+	for name, d := range map[string]*appsv1.Deployment{"staleObservedGeneration": stale, "notUpdated": notUpdated, "straggler": straggler} {
+		if supportingDeploymentConverged(d) {
+			t.Fatalf("%s: an unmaterialized supporting Deployment must not converge", name)
+		}
+	}
+}
