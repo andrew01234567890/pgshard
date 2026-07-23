@@ -572,9 +572,12 @@ spec:
                     type: string
                   minAcceptableSecurityGeneration:
                     description: |-
-                      MinAcceptableSecurityGeneration is the isolation-level floor: once ACTIVE, a
-                      pod stamped below it is denied. It composes with (never lowers) the
-                      per-class SupportingGeneration barrier.
+                      MinAcceptableSecurityGeneration is a DEPRECATED scalar isolation-level floor.
+                      It is retained for compatibility but no longer enforced: independent
+                      workload generations must never be collapsed into a namespace-wide maximum
+                      (a benign observability change to one class would otherwise reject every
+                      other class's pods against the global floor and deadlock activation). Use
+                      SecurityFloors, the per-component/shard/member floors, instead.
                     format: int64
                     minimum: 0
                     type: integer
@@ -643,6 +646,44 @@ spec:
                       - kind
                       - name
                       - uid
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  securityFloors:
+                    description: |-
+                      SecurityFloors are the PER-class/member security-generation floors sealed at
+                      activation: each protected pod is compared ONLY with the floor for its own
+                      component (postgresql/pooler/orchestrator) and, for members, its own
+                      shard+member. A pod stamped below its own floor is denied/blocked; a pod of
+                      another class at its own current generation is unaffected.
+                    items:
+                      description: |-
+                        IsolationSecurityFloor is one protected class/member's minimum admissible
+                        security generation, sealed at activation. Members are keyed by
+                        component=postgresql + shard + member; supporting workloads by
+                        component=pooler/orchestrator (shard/member 0).
+                      properties:
+                        component:
+                          enum:
+                          - postgresql
+                          - pooler
+                          - orchestrator
+                          type: string
+                        member:
+                          format: int32
+                          minimum: 0
+                          type: integer
+                        minGeneration:
+                          format: int64
+                          minimum: 0
+                          type: integer
+                        shard:
+                          format: int32
+                          minimum: 0
+                          type: integer
+                      required:
+                      - component
+                      - minGeneration
                       type: object
                     type: array
                     x-kubernetes-list-type: atomic
@@ -909,6 +950,16 @@ spec:
                       format: int32
                       minimum: 0
                       type: integer
+                    securityContractHash:
+                      description: |-
+                        SecurityContractHash digests ONLY the security-relevant surface of the pod
+                        template (image, security contexts, capabilities, service account, volumes
+                        and mounts, host-namespace flags, command/args) — never benign fields like
+                        env, resources, or annotations. The security generation is bumped only when
+                        THIS digest changes, so a benign observability/resource change rolls under
+                        normal bounded coexistence instead of forcing a revocation.
+                      pattern: ^([0-9a-f]{64})?$
+                      type: string
                     securityGeneration:
                       format: int64
                       minimum: 1
@@ -1104,6 +1155,12 @@ spec:
                       type: string
                     contractHash:
                       pattern: ^[0-9a-f]{64}$
+                      type: string
+                    securityContractHash:
+                      description: |-
+                        SecurityContractHash digests only the security-relevant template surface;
+                        see PostgreSQLMemberContractStatus.SecurityContractHash.
+                      pattern: ^([0-9a-f]{64})?$
                       type: string
                     securityGeneration:
                       format: int64

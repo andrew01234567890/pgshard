@@ -451,11 +451,21 @@ type PostgreSQLIsolationReceipt struct {
 	Phase        IsolationPhase `json:"phase"`
 	// +kubebuilder:validation:Minimum=0
 	SecurityGeneration int64 `json:"securityGeneration,omitempty"`
-	// MinAcceptableSecurityGeneration is the isolation-level floor: once ACTIVE, a
-	// pod stamped below it is denied. It composes with (never lowers) the
-	// per-class SupportingGeneration barrier.
+	// MinAcceptableSecurityGeneration is a DEPRECATED scalar isolation-level floor.
+	// It is retained for compatibility but no longer enforced: independent
+	// workload generations must never be collapsed into a namespace-wide maximum
+	// (a benign observability change to one class would otherwise reject every
+	// other class's pods against the global floor and deadlock activation). Use
+	// SecurityFloors, the per-component/shard/member floors, instead.
 	// +kubebuilder:validation:Minimum=0
 	MinAcceptableSecurityGeneration int64 `json:"minAcceptableSecurityGeneration,omitempty"`
+	// SecurityFloors are the PER-class/member security-generation floors sealed at
+	// activation: each protected pod is compared ONLY with the floor for its own
+	// component (postgresql/pooler/orchestrator) and, for members, its own
+	// shard+member. A pod stamped below its own floor is denied/blocked; a pod of
+	// another class at its own current generation is unaffected.
+	// +listType=atomic
+	SecurityFloors []IsolationSecurityFloor `json:"securityFloors,omitempty"`
 	// +kubebuilder:validation:Pattern=`^([0-9a-f]{64})?$`
 	ResidueProfileHash string `json:"residueProfileHash,omitempty"`
 	// DispatchTupleHash binds the receipt to the exact dispatch-convergence proof
@@ -511,6 +521,43 @@ type SealedParent struct {
 	ContractHash string `json:"contractHash,omitempty"`
 }
 
+// IsolationSecurityFloor is one protected class/member's minimum admissible
+// security generation, sealed at activation. Members are keyed by
+// component=postgresql + shard + member; supporting workloads by
+// component=pooler/orchestrator (shard/member 0).
+type IsolationSecurityFloor struct {
+	// +kubebuilder:validation:Enum=postgresql;pooler;orchestrator
+	Component string `json:"component"`
+	// +kubebuilder:validation:Minimum=0
+	Shard int32 `json:"shard,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	Member int32 `json:"member,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	MinGeneration int64 `json:"minGeneration"`
+}
+
+// SecurityFloorFor returns the sealed minimum admissible security generation for
+// a pod's own class/member, or 0 when no floor applies. Members match on
+// component=postgresql AND shard AND member; supporting workloads match on
+// component alone. It NEVER returns a namespace-wide maximum — each pod is
+// compared only with its own class/member floor.
+func (r *PostgreSQLIsolationReceipt) SecurityFloorFor(component string, shard, member int32) int64 {
+	if r == nil {
+		return 0
+	}
+	for i := range r.SecurityFloors {
+		floor := &r.SecurityFloors[i]
+		if floor.Component != component {
+			continue
+		}
+		if component == "postgresql" && (floor.Shard != shard || floor.Member != member) {
+			continue
+		}
+		return floor.MinGeneration
+	}
+	return 0
+}
+
 // PostgreSQLMemberContractStatus binds one member StatefulSet's pod-template
 // contract hash to its stable physical identity and the security generation it
 // was stamped at.
@@ -523,6 +570,14 @@ type PostgreSQLMemberContractStatus struct {
 	Class string `json:"class"`
 	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
 	ContractHash string `json:"contractHash"`
+	// SecurityContractHash digests ONLY the security-relevant surface of the pod
+	// template (image, security contexts, capabilities, service account, volumes
+	// and mounts, host-namespace flags, command/args) — never benign fields like
+	// env, resources, or annotations. The security generation is bumped only when
+	// THIS digest changes, so a benign observability/resource change rolls under
+	// normal bounded coexistence instead of forcing a revocation.
+	// +kubebuilder:validation:Pattern=`^([0-9a-f]{64})?$`
+	SecurityContractHash string `json:"securityContractHash,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	SecurityGeneration int64 `json:"securityGeneration"`
 }
@@ -534,6 +589,10 @@ type SupportingContractStatus struct {
 	Class string `json:"class"`
 	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
 	ContractHash string `json:"contractHash"`
+	// SecurityContractHash digests only the security-relevant template surface;
+	// see PostgreSQLMemberContractStatus.SecurityContractHash.
+	// +kubebuilder:validation:Pattern=`^([0-9a-f]{64})?$`
+	SecurityContractHash string `json:"securityContractHash,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	SecurityGeneration int64 `json:"securityGeneration"`
 }

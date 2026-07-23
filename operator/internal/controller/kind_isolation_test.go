@@ -1,9 +1,11 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -239,11 +241,17 @@ func TestKINDManagerActivationCeremony(t *testing.T) {
 	if os.Getenv("PGSHARD_KIND_MANAGER_E2E") != "true" {
 		t.Skip("set PGSHARD_KIND_MANAGER_E2E=true against the installed admission manager")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 18*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 	kubeClient := newKINDClient(t)
 
-	namespace := fencedKINDNamespace(fmt.Sprintf("pgshard-activation-%d", os.Getpid()))
+	// The admin attests this FIXED namespace via --allow-unenumerable-ha-isolation-
+	// namespaces (set in config/admission/manager_patch.yaml), so the single-
+	// apiserver KIND dispatch proof (backends=1) converges and the ceremony can
+	// reach ACTIVE — which is what makes CI cover the lifecycle deadlocks.
+	const namespaceName = "pgshard-isolation-lifecycle"
+	ensureAbsentNamespace(t, ctx, kubeClient, namespaceName)
+	namespace := fencedKINDNamespace(namespaceName)
 	if err := kubeClient.Create(ctx, namespace); err != nil {
 		t.Fatal(err)
 	}
@@ -256,67 +264,65 @@ func TestKINDManagerActivationCeremony(t *testing.T) {
 	waitForReplicationTLSReady(t, ctx, kubeClient, client.ObjectKeyFromObject(cluster), cluster.Spec.MembersPerShard)
 	waitForStablePods(t, ctx, kubeClient, namespace.Name, cluster.Name, "postgresql", int(cluster.Spec.MembersPerShard), true)
 
+	// Finding 4b: a foreign pod created while INACTIVE (un-activated fenced
+	// namespace permits it) MUST be cleaned up by the ceremony, not left to block.
+	foreignPod := adversarialInertPod(namespace.Name, "pre-activation-foreign")
+	if err := kubeClient.Create(ctx, foreignPod); err != nil {
+		t.Fatalf("INACTIVE fenced namespace rejected a benign foreign pod: %v", err)
+	}
+
 	// Opt in to activation.
 	if err := patchActivationOptIn(ctx, kubeClient, client.ObjectKeyFromObject(cluster)); err != nil {
 		t.Fatal(err)
 	}
 
-	// Poll until the activation reconcile engages: either the receipt appears
-	// (dispatch converged; ceremony under way) or a preflight condition is
-	// surfaced (a gate withheld — most likely the dispatch-dial seam).
-	current := &pgshardv1alpha1.PgShardCluster{}
-	engaged := wait.PollUntilContextTimeout(ctx, 3*time.Second, 4*time.Minute, true, func(ctx context.Context) (bool, error) {
-		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(cluster), current); err != nil {
-			return false, err
-		}
-		if current.Status.IsolationReceipt != nil {
-			return true, nil
-		}
-		for _, condition := range isolationPreflightConditions {
-			if hasTrueCondition(current, condition) {
-				return true, nil
-			}
-		}
-		return false, nil
-	})
-	if engaged != nil {
-		t.Fatalf("activation reconcile never engaged (no receipt, no preflight condition): %v; conditions = %#v", engaged, current.Status.Conditions)
-	}
-
-	if current.Status.IsolationReceipt == nil {
-		// Reachable-portion assertion + documented seam: the activation preflight
-		// ran live and withheld with a typed condition (the per-backend dispatch
-		// dial could not be driven in this harness). This still proves the honest
-		// flow's admission surface and the activation reconcile path are live.
-		surfaced := ""
-		for _, condition := range isolationPreflightConditions {
-			if hasTrueCondition(current, condition) {
-				surfaced = condition
-			}
-		}
-		t.Logf("SEAM(isolation-dispatch-dial): activation withheld with condition %q; the dispatch-convergence per-backend TLS dial is not drivable in this harness. Asserting the reachable portion (preflight ran live and withheld).", surfaced)
-		if surfaced == "" {
-			t.Fatal("activation withheld without surfacing a preflight condition")
-		}
-		return
-	}
-
-	// The receipt exists: the dispatch preflight converged. QUIESCE→RECREATE→ACTIVE
-	// is deterministic drain + recreate; poll to ACTIVE (resilient to ~15s
-	// requeues).
+	// REQUIRE reaching ACTIVE: with the namespace attested, the ceremony runs
+	// INACTIVE→QUIESCE→RECREATE→ACTIVE (members recreated under the guard,
+	// foreign pod cleaned). Resilient to ~15s requeues via a generous timeout.
 	receipt := waitForIsolationPhase(t, ctx, kubeClient, client.ObjectKeyFromObject(cluster), pgshardv1alpha1.IsolationActive)
-	if receipt.MinAcceptableSecurityGeneration <= 0 || receipt.ResidueProfileHash == "" {
-		t.Fatalf("ACTIVE receipt did not capture the security floor + residue profile: %#v", receipt)
+	if receipt.ResidueProfileHash == "" || len(receipt.SecurityFloors) == 0 {
+		t.Fatalf("ACTIVE receipt did not capture the residue profile + per-class floors: %#v", receipt)
 	}
 
-	// The honest controller-recreated member pods keep running under the guard.
+	// The foreign pod was UID-deleted during RECREATE (cleanup, not deadlock).
+	if err := kubeClient.Get(ctx, client.ObjectKey{Namespace: namespace.Name, Name: foreignPod.Name}, &corev1.Pod{}); err == nil {
+		t.Fatal("the pre-activation foreign pod was not cleaned up by the activation ceremony")
+	}
+
+	// The honest controller-recreated member pods keep running under the guard
+	// (verified via pod state, NOT exec — exec is correctly denied under ACTIVE).
 	waitForStablePods(t, ctx, kubeClient, namespace.Name, cluster.Name, "postgresql", int(cluster.Spec.MembersPerShard), true)
 
+	// ACTIVE denies interactive access (the connect webhook is now enforcing).
+	if _, _, err := runKubectlAllowError(ctx, "--namespace", namespace.Name, "exec", memberPodName(cluster, 0), "--", "true"); err == nil {
+		t.Fatal("exec into a member pod was permitted under ACTIVE isolation")
+	}
+
 	// ACTIVE deny-all: an adversarial unmanaged pod is rejected (dry-run).
+	if err := kubeClient.Create(ctx, adversarialInertPod(namespace.Name, "adversary-foreign"), &client.CreateOptions{DryRun: []string{metav1.DryRunAll}}); err == nil ||
+		!strings.Contains(err.Error(), podfence.PodCreateWebhookName) {
+		t.Fatalf("ACTIVE isolation did not deny an adversarial unmanaged pod via the pgshard webhook: %v", err)
+	}
+
+	// Finding 2/3b/3c: a BENIGN observability change while ACTIVE must converge
+	// (the supporting class rolls under bounded coexistence; activation waits for
+	// the roll and never gets stuck in permanent QUIESCE against a namespace-wide
+	// floor). Assert the receipt returns to ACTIVE.
+	if err := patchObservabilityEndpoint(ctx, kubeClient, client.ObjectKeyFromObject(cluster), "http://otel-collector.observability:4317"); err != nil {
+		t.Fatal(err)
+	}
+	waitForIsolationPhase(t, ctx, kubeClient, client.ObjectKeyFromObject(cluster), pgshardv1alpha1.IsolationActive)
+
+	// TODO(isolation-rollout): step 8's distinct-v2-Service upgrade rollout +
+	// bridge (bad8a18→new UPGRADES) is deferred; a staged-activation choreography
+	// for in-place upgrades would be wired here.
+}
+
+func adversarialInertPod(namespace, name string) *corev1.Pod {
 	runAsNonRoot := true
 	allowPrivilegeEscalation := false
-	foreign := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "adversary-foreign", Namespace: namespace.Name},
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 		Spec: corev1.PodSpec{
 			SecurityContext: &corev1.PodSecurityContext{RunAsNonRoot: &runAsNonRoot, SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}},
 			Containers: []corev1.Container{{
@@ -331,14 +337,46 @@ func TestKINDManagerActivationCeremony(t *testing.T) {
 			}},
 		},
 	}
-	err := kubeClient.Create(ctx, foreign, &client.CreateOptions{DryRun: []string{metav1.DryRunAll}})
-	if err == nil || !strings.Contains(err.Error(), podfence.PodCreateWebhookName) {
-		t.Fatalf("ACTIVE isolation did not deny an adversarial unmanaged pod via the pgshard webhook: %v", err)
-	}
+}
 
-	// TODO(isolation-rollout): step 8's distinct-v2-Service upgrade rollout +
-	// bridge (bad8a18→new UPGRADES) is deferred; a staged-activation choreography
-	// for in-place upgrades would be wired here.
+func memberPodName(cluster *pgshardv1alpha1.PgShardCluster, member int32) string {
+	return owned.PostgreSQLMemberStatefulSetName(cluster.Name, 0, member) + "-0"
+}
+
+func ensureAbsentNamespace(t *testing.T, ctx context.Context, kubeClient client.Client, name string) {
+	t.Helper()
+	existing := &corev1.Namespace{}
+	if err := kubeClient.Get(ctx, client.ObjectKey{Name: name}, existing); err != nil {
+		return
+	}
+	_ = kubeClient.Delete(ctx, existing)
+	if err := wait.PollUntilContextTimeout(ctx, time.Second, 3*time.Minute, true, func(ctx context.Context) (bool, error) {
+		err := kubeClient.Get(ctx, client.ObjectKey{Name: name}, &corev1.Namespace{})
+		return err != nil, nil
+	}); err != nil {
+		t.Fatalf("stale lifecycle namespace %s did not clear: %v", name, err)
+	}
+}
+
+func patchObservabilityEndpoint(ctx context.Context, kubeClient client.Client, key client.ObjectKey, endpoint string) error {
+	cluster := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(ctx, key, cluster); err != nil {
+		return err
+	}
+	patched := cluster.DeepCopy()
+	patched.Spec.Observability.OpenTelemetryEndpoint = endpoint
+	return kubeClient.Patch(ctx, patched, client.MergeFrom(cluster))
+}
+
+// runKubectlAllowError runs kubectl and returns stdout/stderr and the error
+// without failing the test, so a test can assert a command is DENIED.
+func runKubectlAllowError(ctx context.Context, arguments ...string) (string, string, error) {
+	command := exec.CommandContext(ctx, "kubectl", arguments...)
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	err := command.Run()
+	return stdout.String(), stderr.String(), err
 }
 
 func patchActivationOptIn(ctx context.Context, kubeClient client.Client, key client.ObjectKey) error {

@@ -108,7 +108,12 @@ func (r *PgShardClusterReconciler) sealSupportingGenerationIntents(ctx context.C
 		}
 	}
 	if changed {
-		if err := r.Status().Update(ctx, cluster); err != nil {
+		// Runs before applyPlan: commit CAS-safely so a transient conflict cannot
+		// abort the reconcile before resource bring-up.
+		generations := cluster.Status.SupportingGenerations
+		if err := r.commitClusterStatusFields(ctx, cluster, func(fresh *pgshardv1alpha1.PgShardCluster) {
+			fresh.Status.SupportingGenerations = generations
+		}); err != nil {
 			return false, fmt.Errorf("seal supporting generation intents: %w", err)
 		}
 	}

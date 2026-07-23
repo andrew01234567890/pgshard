@@ -181,3 +181,40 @@ func TestStampPlanContractsBumpsGenerationOnContractChange(t *testing.T) {
 		t.Fatalf("bumped template generation = %q, want 2", changed.Spec.Template.Annotations[owned.PodSecurityGenerationAnnotation])
 	}
 }
+
+func TestStampPlanContractsDoesNotBumpOnBenignChange(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	cluster.Spec.MembersPerShard = 3
+	base := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(base, base)
+	current := getCluster(t, ctx, base, cluster)
+
+	plan := []client.Object{poolerDeploymentForContract(current)}
+	if err := reconciler.stampPlanContracts(ctx, current, plan); err != nil {
+		t.Fatal(err)
+	}
+	first := getCluster(t, ctx, base, cluster)
+	if first.Status.SupportingContracts[0].SecurityGeneration != 1 || first.Status.SupportingContracts[0].SecurityContractHash == "" {
+		t.Fatalf("initial contract = %#v", first.Status.SupportingContracts[0])
+	}
+
+	// A BENIGN change (an OpenTelemetry endpoint env var, plus a resource tweak)
+	// changes the full contract hash but NOT the security surface, so the security
+	// generation must NOT bump — the class rolls under normal bounded coexistence,
+	// no forced revocation/Recreate.
+	current = getCluster(t, ctx, base, cluster)
+	benign := poolerDeploymentForContract(current)
+	benign.Spec.Template.Spec.Containers[0].Env = append(benign.Spec.Template.Spec.Containers[0].Env, corev1.EnvVar{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: "http://collector:4317"})
+	if err := reconciler.stampPlanContracts(ctx, current, []client.Object{benign}); err != nil {
+		t.Fatal(err)
+	}
+	after := getCluster(t, ctx, base, cluster)
+	if after.Status.SupportingContracts[0].SecurityGeneration != 1 {
+		t.Fatalf("a benign observability change bumped the security generation (would force a needless revocation): %#v", after.Status.SupportingContracts[0])
+	}
+	if benign.Spec.Template.Annotations[owned.PodSecurityGenerationAnnotation] != "1" {
+		t.Fatalf("benign change stamped generation = %q, want 1", benign.Spec.Template.Annotations[owned.PodSecurityGenerationAnnotation])
+	}
+}

@@ -38,6 +38,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -3317,14 +3318,15 @@ func (r *PgShardClusterReconciler) stampPlanContracts(ctx context.Context, clust
 			continue
 		}
 		generation := recordedContractGeneration(cluster, class, shard, member)
-		if recorded := recordedContractHash(cluster, class, shard, member); recorded != "" {
-			candidate, err := owned.ComputeContractStamp(class, string(cluster.UID), shard, member, generation, template)
-			if err != nil {
-				return fmt.Errorf("classify %s workload contract change for shard %d member %d: %w", class, shard, member, err)
-			}
-			if candidate != recorded {
-				generation++
-			}
+		// VERSIONED security-strengthening classifier: bump the generation ONLY when
+		// the SECURITY-relevant surface of the template changed (image, security
+		// contexts, capabilities, mounts, service account, host flags), never for a
+		// benign observability/resource change. A benign change still rolls (its full
+		// contract hash changes) but under normal bounded coexistence — no forced
+		// revocation/Recreate and no floor bump.
+		securityDigest := owned.ComputeSecurityContractDigest(template)
+		if recordedSecurity := recordedSecurityContractHash(cluster, class, shard, member); recordedSecurity != "" && securityDigest != recordedSecurity {
+			generation++
 		}
 		hash, err := owned.ApplyContractStamp(template, class, string(cluster.UID), shard, member, generation)
 		if err != nil {
@@ -3333,11 +3335,11 @@ func (r *PgShardClusterReconciler) stampPlanContracts(ctx context.Context, clust
 		switch class {
 		case owned.ClassPooler, owned.ClassOrchestrator:
 			supportingContracts = append(supportingContracts, pgshardv1alpha1.SupportingContractStatus{
-				Class: string(class), ContractHash: hash, SecurityGeneration: generation,
+				Class: string(class), ContractHash: hash, SecurityContractHash: securityDigest, SecurityGeneration: generation,
 			})
 		default:
 			memberContracts = append(memberContracts, pgshardv1alpha1.PostgreSQLMemberContractStatus{
-				Shard: shard, Member: member, Class: string(class), ContractHash: hash, SecurityGeneration: generation,
+				Shard: shard, Member: member, Class: string(class), ContractHash: hash, SecurityContractHash: securityDigest, SecurityGeneration: generation,
 			})
 		}
 	}
@@ -3354,12 +3356,38 @@ func (r *PgShardClusterReconciler) stampPlanContracts(ctx context.Context, clust
 		slices.Equal(cluster.Status.SupportingContracts, supportingContracts) {
 		return nil
 	}
-	cluster.Status.PostgreSQLMemberContracts = memberContracts
-	cluster.Status.SupportingContracts = supportingContracts
-	if err := r.Status().Update(ctx, cluster); err != nil {
+	// This checkpoint runs BEFORE applyPlan (which creates the bring-up resources
+	// such as the <cluster>-topology ConfigMap). A transient status conflict here
+	// must not abort the reconcile before that apply, so it is committed CAS-safely
+	// with conflict-retry that re-applies only these fields onto the fresh object.
+	if err := r.commitClusterStatusFields(ctx, cluster, func(fresh *pgshardv1alpha1.PgShardCluster) {
+		fresh.Status.PostgreSQLMemberContracts = memberContracts
+		fresh.Status.SupportingContracts = supportingContracts
+	}); err != nil {
 		return fmt.Errorf("checkpoint owned workload contract stamps: %w", err)
 	}
 	return nil
+}
+
+// commitClusterStatusFields writes the cluster status, retrying on conflict by
+// re-reading the authoritative object and re-applying ONLY the caller's fields
+// (never overwriting a concurrent writer's other status fields). apply must be
+// idempotent. It is used by the pre-applyPlan isolation status checkpoints so a
+// transient conflict cannot stall resource bring-up.
+func (r *PgShardClusterReconciler) commitClusterStatusFields(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, apply func(*pgshardv1alpha1.PgShardCluster)) error {
+	apply(cluster)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		err := r.Status().Update(ctx, cluster)
+		if err != nil && apierrors.IsConflict(err) {
+			fresh := &pgshardv1alpha1.PgShardCluster{}
+			if getErr := r.authoritativeReader().Get(ctx, client.ObjectKeyFromObject(cluster), fresh); getErr != nil {
+				return getErr
+			}
+			apply(fresh)
+			fresh.DeepCopyInto(cluster)
+		}
+		return err
+	})
 }
 
 // planWorkloadContractTarget classifies a plan object as a protected workload
@@ -3407,18 +3435,18 @@ func recordedContractGeneration(cluster *pgshardv1alpha1.PgShardCluster, class o
 	return 1
 }
 
-func recordedContractHash(cluster *pgshardv1alpha1.PgShardCluster, class owned.PodClass, shard, member int32) string {
+func recordedSecurityContractHash(cluster *pgshardv1alpha1.PgShardCluster, class owned.PodClass, shard, member int32) string {
 	switch class {
 	case owned.ClassPooler, owned.ClassOrchestrator:
 		for _, recorded := range cluster.Status.SupportingContracts {
 			if recorded.Class == string(class) {
-				return recorded.ContractHash
+				return recorded.SecurityContractHash
 			}
 		}
 	default:
 		for _, recorded := range cluster.Status.PostgreSQLMemberContracts {
 			if recorded.Shard == shard && recorded.Member == member {
-				return recorded.ContractHash
+				return recorded.SecurityContractHash
 			}
 		}
 	}

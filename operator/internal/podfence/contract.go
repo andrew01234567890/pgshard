@@ -702,6 +702,22 @@ func (v *WorkloadIntegrityValidator) handleScale(ctx context.Context, request ad
 		if request.UserInfo.Username != v.identities.Operator && request.UserInfo.Username != v.identities.HorizontalPodAutoscalerController {
 			return admission.Denied("supporting workloads in a fenced namespace may only be rescaled by the pgshard operator or the HorizontalPodAutoscaler controller")
 		}
+		// HPA scaling is FROZEN while isolation is activating (QUIESCE/RECREATE): an
+		// HPA scale of a supporting Deployment bumps its metadata.generation, drifting
+		// the sealed parent and restarting the ceremony — a fluctuating pooler HPA
+		// would otherwise livelock activation. The operator (draining a prior
+		// ReplicaSet via /scale during a roll) is never frozen. HPA scaling resumes
+		// after ACTIVE.
+		if request.UserInfo.Username == v.identities.HorizontalPodAutoscalerController {
+			receipt, err := namespaceIsolationReceipt(ctx, v.reader, request.Namespace)
+			if err != nil {
+				return admission.Errored(http.StatusInternalServerError, err)
+			}
+			switch isolationPhase(receipt) {
+			case pgshardv1alpha1.IsolationActivatingQuiesce, pgshardv1alpha1.IsolationActivatingRecreate:
+				return admission.Denied("HorizontalPodAutoscaler scaling is suspended while namespace isolation is activating")
+			}
+		}
 		// Record the authenticated HPA-controller username when it scales an
 		// identity-probe Deployment. The gate above already bounds this to the
 		// HPA controller, and the token comes from the LIVE registered target

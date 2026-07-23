@@ -2,8 +2,11 @@ package podfence
 
 import (
 	"context"
+	"strings"
 	"testing"
 
+	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
+	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	admissionv1 "k8s.io/api/admission/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	authenticationv1 "k8s.io/api/authentication/v1"
@@ -239,6 +242,75 @@ func TestHandleScaleGatesSupportingScaleToOperatorOrHPA(t *testing.T) {
 	}
 	if response := validator.Handle(context.Background(), scaleRequest(identities.HorizontalPodAutoscalerController)); !response.Allowed {
 		t.Fatalf("the HPA controller was denied a supporting scale: %#v", response)
+	}
+}
+
+func TestHandleScaleFreezesHPADuringActivation(t *testing.T) {
+	t.Parallel()
+	scheme := workloadScheme(t)
+	identities := testControllerIdentities()
+	identities.HorizontalPodAutoscalerController = "system:serviceaccount:kube-system:horizontal-pod-autoscaler"
+
+	scaleRequest := func(username string) admission.Request {
+		return admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+			Name: "example-pooler", Namespace: testWorkloadNS, Operation: admissionv1.Update, SubResource: "scale",
+			Resource: metav1.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"},
+			UserInfo: authenticationv1.UserInfo{Username: username},
+		}}
+	}
+
+	// During QUIESCE and RECREATE an HPA scale is DENIED — a scale would bump the
+	// sealed Deployment generation, drift the sealed parent, and livelock the
+	// ceremony. The operator is never frozen.
+	for _, phase := range []pgshardv1alpha1.IsolationPhase{pgshardv1alpha1.IsolationActivatingQuiesce, pgshardv1alpha1.IsolationActivatingRecreate} {
+		reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(isolationReceiptCluster(phase)).Build()
+		validator := NewWorkloadIntegrityValidator(reader, identities, scheme)
+		if response := validator.Handle(context.Background(), scaleRequest(identities.HorizontalPodAutoscalerController)); response.Allowed ||
+			!strings.Contains(response.Result.Message, "HorizontalPodAutoscaler scaling is suspended") {
+			t.Fatalf("HPA scale during %s was not frozen: %#v", phase, response)
+		}
+		// The operator (draining a prior ReplicaSet) is never frozen.
+		if response := validator.Handle(context.Background(), scaleRequest(identities.Operator)); !response.Allowed {
+			t.Fatalf("the operator was frozen out of a supporting scale during %s: %#v", phase, response)
+		}
+	}
+
+	// ACTIVE (and un-activated) permit HPA scaling again.
+	for _, cluster := range []*pgshardv1alpha1.PgShardCluster{isolationReceiptCluster(pgshardv1alpha1.IsolationActive), testWorkloadCluster()} {
+		reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster).Build()
+		validator := NewWorkloadIntegrityValidator(reader, identities, scheme)
+		if response := validator.Handle(context.Background(), scaleRequest(identities.HorizontalPodAutoscalerController)); !response.Allowed {
+			t.Fatalf("HPA scale outside the ceremony was denied: %#v", response)
+		}
+	}
+}
+
+func TestEnforceIsolationGenerationFloorIsPerClass(t *testing.T) {
+	t.Parallel()
+	// The receipt raised only the pooler floor to 2 (a benign pooler bump); the
+	// member floor stays 1. A member pod at generation 1 must NOT be rejected
+	// against the pooler's floor — each pod is compared only with its own floor.
+	receipt := &pgshardv1alpha1.PostgreSQLIsolationReceipt{
+		SecurityFloors: []pgshardv1alpha1.IsolationSecurityFloor{
+			{Component: "pooler", MinGeneration: 2},
+			{Component: "postgresql", Shard: 0, Member: 0, MinGeneration: 1},
+		},
+	}
+	member := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Labels:      map[string]string{owned.ClusterLabel: testClusterName, owned.ComponentLabel: "postgresql", owned.ShardLabel: "0000", owned.MemberLabel: "0000"},
+		Annotations: map[string]string{owned.PodSecurityGenerationAnnotation: "1"},
+	}}
+	if response := enforceIsolationGenerationFloor(member, receipt); response != nil {
+		t.Fatalf("a member at its own floor (1) was rejected against another class's floor: %#v", response)
+	}
+
+	// A pooler pod at generation 1 IS below its own floor (2) and is denied.
+	pooler := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Labels:      map[string]string{owned.ClusterLabel: testClusterName, owned.ComponentLabel: "pooler"},
+		Annotations: map[string]string{owned.PodSecurityGenerationAnnotation: "1"},
+	}}
+	if response := enforceIsolationGenerationFloor(pooler, receipt); response == nil || response.Allowed {
+		t.Fatalf("a pooler pod below its own floor was admitted: %#v", response)
 	}
 }
 

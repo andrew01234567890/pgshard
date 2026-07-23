@@ -112,6 +112,33 @@ func dispatchProbeSentinelPod(namespace, name string) *corev1.Pod {
 	}
 }
 
+// RATIFIED SUPPORT CONSTRAINT — IMMUTABLE CONTROL-PLANE MEMBERSHIP FOR THE WHOLE
+// ACTIVE LIFETIME.
+//
+// The dispatch proof is a point-in-time enumeration + per-backend sentinel probe.
+// It proves that every CURRENTLY-published API-server backend routes Pod CREATE
+// to this webhook. It CANNOT prevent a NEW backend (e.g. an initialized-but-
+// admission-stale API server) from being published and serving one preassigned-
+// nodeName Pod CREATE before the operator reacts — an admission gate is
+// necessarily downstream of routing, so a newly published stale backend leaves a
+// brief bypass window, and re-quiescing afterward cannot undo any key disclosure.
+//
+// The operator mitigates this best-effort and FAILS CLOSED on detection: the
+// EndpointSlice + ValidatingWebhookConfiguration WATCHES wake a reconcile on any
+// change, driveIsolationActive re-proves the tuple EVERY reconcile while ACTIVE,
+// and any backend-set/RV change immediately re-quiesces (driveIsolation* →
+// revalidateDispatchTuple), dropping enforcement to the durable deny phase and
+// limiting exposure to the detection latency. A ≤1-backend enumeration that
+// cannot be proven complete (opaque VIP / single published address) is refused
+// unless the admin attests the namespace via
+// --allow-unenumerable-ha-isolation-namespaces.
+//
+// Because the residual window cannot be closed in-band, immutable control-plane
+// API-server membership for the ENTIRE ACTIVE lifetime is a RATIFIED support
+// constraint (documented on the flag): control-plane upgrades/scaling while
+// ACTIVE are unsupported and trigger a re-quiesce (availability), with a brief
+// worst-case exposure between publication and detection.
+//
 // serverDispatchProber is the real dispatch-convergence prober. It enumerates the
 // live API-server backends from the `kubernetes` Service EndpointSlices and probes
 // each backend endpoint directly over authenticated TLS with a dryRun sentinel.

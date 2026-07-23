@@ -175,26 +175,23 @@ func (r *PgShardClusterReconciler) driveIsolationQuiesce(ctx context.Context, cl
 	if time.Since(receipt.ActivatedAt.Time) < r.revocationDrainWindow()+time.Second {
 		return true, nil
 	}
-	blocked, _, residue, err := r.inventoryNamespace(ctx, cluster, false)
+	// Seal EVERY live pod UID in the namespace — foreign/unclassified/pre-guard as
+	// well as protected. QUIESCE does NOT block on old pods that mismatch the
+	// (possibly newly-sealed) parent: RECREATE is the only phase that deletes pods,
+	// so blocking here would deadlock (an OnDelete member never re-matches without
+	// being deleted first). Instead RECREATE UID-deletes every sealed pod, driving
+	// cleanup: protected pods are recreated under the guard; foreign pods stay gone.
+	pending, err := r.allPodUIDs(ctx, cluster)
 	if err != nil {
 		return false, err
 	}
-	if blocked != "" {
-		return r.blockIsolation(ctx, cluster, blocked)
-	}
-	// Seal the exact pre-guard protected pod UIDs; recreate authenticates by
-	// UID-deletion, never by CreationTimestamp.
-	pending, err := r.protectedPodUIDs(ctx, cluster)
-	if err != nil {
-		return false, err
-	}
-	receipt.ResidueProfileHash = residue
 	receipt.RecreatePendingUIDs = pending
+	// Per-class/member floors are enforced from the FIRST guarded create: RECREATE
+	// applies each pod's own class/member floor and the per-class CAS barrier, not
+	// only ACTIVE, and never a namespace-wide maximum.
+	receipt.SecurityFloors = currentSecurityFloors(cluster)
+	receipt.MinAcceptableSecurityGeneration = 0
 	receipt.Phase = pgshardv1alpha1.IsolationActivatingRecreate
-	// The isolation generation floor is enforced from the FIRST guarded create:
-	// RECREATE applies both this floor and the per-class CAS barrier, not only
-	// ACTIVE.
-	receipt.MinAcceptableSecurityGeneration = receipt.SecurityGeneration
 	receipt.ActivatedAt = metav1.Now()
 	meta.RemoveStatusCondition(&cluster.Status.Conditions, isolationActivationBlockedCondition)
 	if err := r.Status().Update(ctx, cluster); err != nil {
@@ -336,7 +333,8 @@ func (r *PgShardClusterReconciler) driveIsolationRecreate(ctx context.Context, c
 	receipt.ResidueProfileHash = residue
 	receipt.RecreatePendingUIDs = nil
 	receipt.Phase = pgshardv1alpha1.IsolationActive
-	receipt.MinAcceptableSecurityGeneration = receipt.SecurityGeneration
+	receipt.SecurityFloors = currentSecurityFloors(cluster)
+	receipt.MinAcceptableSecurityGeneration = 0
 	receipt.ActivatedAt = metav1.Now()
 	meta.RemoveStatusCondition(&cluster.Status.Conditions, isolationActivationBlockedCondition)
 	if err := r.Status().Update(ctx, cluster); err != nil {
@@ -387,20 +385,53 @@ func (r *PgShardClusterReconciler) guardedReplacementsComplete(ctx context.Conte
 	return true, nil
 }
 
-// protectedPodUIDs returns the UIDs of every live protected pod in the namespace.
-func (r *PgShardClusterReconciler) protectedPodUIDs(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) ([]string, error) {
+// allPodUIDs returns the UIDs of EVERY live pod in the namespace — protected and
+// foreign alike — so RECREATE deletes them all: protected pods are recreated
+// under the guard, and foreign/unclassified/pre-guard pods (which have no sealed
+// parent to recreate them) are cleaned up rather than left to block activation.
+func (r *PgShardClusterReconciler) allPodUIDs(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) ([]string, error) {
 	pods := &corev1.PodList{}
 	if err := r.authoritativeReader().List(ctx, pods, client.InNamespace(cluster.Namespace)); err != nil {
-		return nil, fmt.Errorf("list protected pods to seal for recreate: %w", err)
+		return nil, fmt.Errorf("list pods to seal for recreate: %w", err)
 	}
-	uids := []string{}
+	uids := make([]string, 0, len(pods.Items))
 	for i := range pods.Items {
-		if isProtectedInventoryPod(&pods.Items[i]) {
-			uids = append(uids, string(pods.Items[i].UID))
-		}
+		uids = append(uids, string(pods.Items[i].UID))
 	}
 	sort.Strings(uids)
 	return uids, nil
+}
+
+// currentSecurityFloors derives the PER-class/member security-generation floors
+// from the recorded contract stamps: each supporting class and each member gets
+// its own floor at its own recorded generation.
+func currentSecurityFloors(cluster *pgshardv1alpha1.PgShardCluster) []pgshardv1alpha1.IsolationSecurityFloor {
+	floors := make([]pgshardv1alpha1.IsolationSecurityFloor, 0, len(cluster.Status.SupportingContracts)+len(cluster.Status.PostgreSQLMemberContracts))
+	for _, contract := range cluster.Status.SupportingContracts {
+		floors = append(floors, pgshardv1alpha1.IsolationSecurityFloor{Component: contract.Class, MinGeneration: contract.SecurityGeneration})
+	}
+	for _, contract := range cluster.Status.PostgreSQLMemberContracts {
+		floors = append(floors, pgshardv1alpha1.IsolationSecurityFloor{Component: "postgresql", Shard: contract.Shard, Member: contract.Member, MinGeneration: contract.SecurityGeneration})
+	}
+	sort.Slice(floors, func(a, b int) bool {
+		if floors[a].Component != floors[b].Component {
+			return floors[a].Component < floors[b].Component
+		}
+		if floors[a].Shard != floors[b].Shard {
+			return floors[a].Shard < floors[b].Shard
+		}
+		return floors[a].Member < floors[b].Member
+	})
+	return floors
+}
+
+// podInventorySecurityFloor resolves the sealed per-class/member floor for a pod
+// from its labels.
+func podInventorySecurityFloor(receipt *pgshardv1alpha1.PostgreSQLIsolationReceipt, pod *corev1.Pod) int64 {
+	component := pod.Labels[owned.ComponentLabel]
+	shard, _ := owned.ParseIdentityLabel(pod.Labels[owned.ShardLabel])
+	member, _ := owned.ParseIdentityLabel(pod.Labels[owned.MemberLabel])
+	return receipt.SecurityFloorFor(component, shard, member)
 }
 
 // driveIsolationActive re-validates dispatch convergence (ACTIVE is not exempt:
@@ -413,6 +444,15 @@ func (r *PgShardClusterReconciler) protectedPodUIDs(ctx context.Context, cluster
 func (r *PgShardClusterReconciler) driveIsolationActive(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
 	if valid, err := r.revalidateDispatchTuple(ctx, cluster); err != nil || !valid {
 		return true, err
+	}
+	// A supporting-generation roll (bounded coexistence: the old generation drains
+	// while the new one rolls out) transiently leaves old pods that do not match
+	// the current parent. Do NOT re-quiesce on that transient — re-quiescing would
+	// freeze the very creates the CAS roll needs to converge (a circular wait).
+	// WAIT for the roll to converge, THEN re-inventory. The roll is counted active
+	// from sealed intent through CurrentTemplateGeneration==ConvergedGeneration.
+	if supportingRollInProgress(cluster) {
+		return true, nil
 	}
 	blocked, _, _, err := r.inventoryNamespace(ctx, cluster, false)
 	if err != nil {
@@ -530,10 +570,7 @@ func (r *PgShardClusterReconciler) inventoryNamespace(ctx context.Context, clust
 	if err := reader.List(ctx, pods, client.InNamespace(cluster.Namespace)); err != nil {
 		return "", "", "", fmt.Errorf("inventory namespace pods: %w", err)
 	}
-	floor := currentSecurityGeneration(cluster)
-	if cluster.Status.IsolationReceipt != nil && cluster.Status.IsolationReceipt.SecurityGeneration > floor {
-		floor = cluster.Status.IsolationReceipt.SecurityGeneration
-	}
+	receipt := cluster.Status.IsolationReceipt
 	fingerprints := make([]string, 0, len(pods.Items))
 	for i := range pods.Items {
 		pod := &pods.Items[i]
@@ -561,7 +598,9 @@ func (r *PgShardClusterReconciler) inventoryNamespace(ctx context.Context, clust
 			continue
 		}
 		generation, err := strconv.ParseInt(pod.Annotations[owned.PodSecurityGenerationAnnotation], 10, 64)
-		if err != nil || generation < floor {
+		// Each pod is compared ONLY with its own class/member floor — never a
+		// namespace-wide maximum.
+		if err != nil || generation < podInventorySecurityFloor(receipt, pod) {
 			return pod.Name, "", "", nil
 		}
 		verdict, err := podfence.ValidateLiveProtectedPod(ctx, reader, pod, cluster.Status.IsolationReceipt, strict)
@@ -598,10 +637,6 @@ func inventoryClass(pod *corev1.Pod) string {
 		return "supporting"
 	}
 	return ""
-}
-
-func isProtectedInventoryPod(pod *corev1.Pod) bool {
-	return inventoryClass(pod) != ""
 }
 
 func isolationReceiptPhase(receipt *pgshardv1alpha1.PostgreSQLIsolationReceipt) pgshardv1alpha1.IsolationPhase {
@@ -684,11 +719,23 @@ func (r *PgShardClusterReconciler) limitRangePresent(ctx context.Context, namesp
 	return "", nil
 }
 
-// supportingRollInProgress reports whether any supporting class still has a
-// populated prior generation (a roll that has not converged).
+// supportingRollInProgress reports whether any supporting class is mid-roll. A
+// roll counts as in progress from SEALED INTENT (the revocation barrier or the
+// current template generation has advanced past the converged generation,
+// including the intent→new-ReplicaSet gap before the prior UID is populated)
+// until it fully converges (CurrentTemplateGeneration == ConvergedGeneration and
+// no prior remains). Activation waits for the whole window so it never enters or
+// completes the ceremony — or re-quiesces mid-ACTIVE — while the admissible set
+// is in flux.
 func supportingRollInProgress(cluster *pgshardv1alpha1.PgShardCluster) bool {
 	for _, record := range cluster.Status.SupportingGenerations {
 		if record.PriorReplicaSetUID != "" {
+			return true
+		}
+		if record.CurrentTemplateGeneration != record.ConvergedGeneration {
+			return true
+		}
+		if record.MinGenerationForNewCreates > record.ConvergedGeneration {
 			return true
 		}
 	}

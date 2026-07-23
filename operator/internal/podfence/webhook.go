@@ -175,17 +175,22 @@ func (v *BindingValidator) Handle(ctx context.Context, request admission.Request
 	if err != nil {
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
-	active := isolationPhase(receipt) == pgshardv1alpha1.IsolationActive
-	if active && evidence.pod.Annotations[owned.PodContractHashAnnotation] == "" {
-		return admission.Denied("namespace isolation is active; every managed Pod must carry the reconciler stamp before binding")
+	// Once isolation is past INACTIVE (QUIESCE / RECREATE / ACTIVE) binding is
+	// GUARDED: a stampless or pre-guard classified pod must NOT be bound. This
+	// closes the window where an attacker creates an unscheduled Secret-mounting
+	// pod while INACTIVE and binds (and runs) it during the activation ceremony —
+	// the ceremony then also UID-deletes such a pod (RECREATE cleanup).
+	guarded := isolationPhase(receipt) != pgshardv1alpha1.IsolationInactive
+	if guarded && evidence.pod.Annotations[owned.PodContractHashAnnotation] == "" {
+		return admission.Denied("namespace isolation is activating; every managed Pod must carry the reconciler stamp before binding")
 	}
 	if response := validateBindingMetadata(binding, evidence); response != nil {
 		return *response
 	}
-	if response := validateBoundPodContract(ctx, v.reader, evidence.pod, evidence.node, evidence.cluster, active); response != nil {
+	if response := validateBoundPodContract(ctx, v.reader, evidence.pod, evidence.node, evidence.cluster, guarded); response != nil {
 		return *response
 	}
-	if active {
+	if guarded {
 		if response := enforceIsolationGenerationFloor(evidence.pod, receipt); response != nil {
 			return *response
 		}
@@ -491,15 +496,32 @@ func (v *PodCreateValidator) Handle(ctx context.Context, request admission.Reque
 // isolation-level floor; it composes with (never lowers) the per-class
 // SupportingGeneration barrier already applied inside the contract validation.
 func enforceIsolationGenerationFloor(pod *corev1.Pod, receipt *pgshardv1alpha1.PostgreSQLIsolationReceipt) *admission.Response {
-	if receipt == nil || receipt.MinAcceptableSecurityGeneration <= 0 {
+	if receipt == nil {
+		return nil
+	}
+	// Each pod is compared ONLY with its OWN class/member floor — never a
+	// namespace-wide maximum, so a benign generation bump to one class never
+	// rejects another class's pods.
+	floor := podIsolationSecurityFloor(receipt, pod)
+	if floor <= 0 {
 		return nil
 	}
 	generation, ok := canonicalSecurityGeneration(pod.Annotations[owned.PodSecurityGenerationAnnotation])
-	if !ok || generation < receipt.MinAcceptableSecurityGeneration {
-		response := admission.Denied(fmt.Sprintf("managed Pod security generation is below the isolation floor %d", receipt.MinAcceptableSecurityGeneration))
+	if !ok || generation < floor {
+		response := admission.Denied(fmt.Sprintf("managed Pod security generation is below its class isolation floor %d", floor))
 		return &response
 	}
 	return nil
+}
+
+// podIsolationSecurityFloor resolves the sealed per-class/member floor for a pod
+// from its labels (component + shard + member for members, component for
+// supporting workloads).
+func podIsolationSecurityFloor(receipt *pgshardv1alpha1.PostgreSQLIsolationReceipt, pod *corev1.Pod) int64 {
+	component := pod.Labels[owned.ComponentLabel]
+	shard, _ := owned.ParseIdentityLabel(pod.Labels[owned.ShardLabel])
+	member, _ := owned.ParseIdentityLabel(pod.Labels[owned.MemberLabel])
+	return receipt.SecurityFloorFor(component, shard, member)
 }
 
 func protectedBindingLabels() [6]string {

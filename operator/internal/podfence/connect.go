@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 
+	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -28,14 +29,25 @@ const (
 // portforward/proxy) that would let a caller read a managed pod's mounted keys
 // or the controller-manager's projected token. The admission object for a
 // CONNECT is a Pod*Options with no pod labels and no old object, so selection is
-// by namespace: a single handler serves two webhook entries. In a fenced
-// workload namespace every CONNECT is denied unconditionally (the namespace is
-// dedicated; break-glass is the node/kubelet TCB path or the activation recreate
-// ceremony). In the operator namespace only the controller-manager Pod is
-// protected — the handler authoritatively GETs the request-named target and
-// denies when it is a manager Pod, leaving every other operator-namespace Pod
-// unaffected. Kubelet liveness/readiness exec probes run through the CRI, not
-// this API subresource, so probes are never affected.
+// by namespace: a single handler serves two webhook entries.
+//
+// In a fenced workload namespace the CONNECT deny is PHASE-AWARE, consistent
+// with the rest of the opt-in isolation model: pre-activation (INACTIVE, or no
+// receipt) a fenced namespace behaves like a normal namespace and interactive
+// access is ALLOWED (admin/debug/CI). The caller-path hardening is part of the
+// ratified ACTIVE enforcement — CONNECT is denied only once the namespace's
+// isolation is durably ACTIVE (the dedicated-namespace protection). QUIESCE and
+// RECREATE also allow it (the ceremony recreates every protected pod, and admin
+// access during the bounded transition is acceptable and matches the other
+// phase-aware webhooks which are permissive until ACTIVE).
+//
+// In the operator namespace only the controller-manager Pod is protected —
+// ALWAYS, regardless of any workload namespace's activation phase — because it
+// guards the manager service account's projected token. The handler
+// authoritatively GETs the request-named target and denies when it is a manager
+// Pod, leaving every other operator-namespace Pod unaffected. Kubelet
+// liveness/readiness exec probes run through the CRI, not this API subresource,
+// so probes are never affected.
 type PodConnectDenyValidator struct {
 	reader            client.Reader
 	operatorNamespace string
@@ -53,8 +65,18 @@ func (v *PodConnectDenyValidator) Handle(ctx context.Context, request admission.
 		return v.denyManagerConnect(ctx, request)
 	}
 	// The webhook's namespaceSelector restricts this entry to fenced workload
-	// namespaces, where interactive access is never allowed.
-	return admission.Denied("interactive access to a managed PostgreSQL Pod in a fenced namespace is not permitted")
+	// namespaces. Interactive access is denied ONLY once isolation is ACTIVE; an
+	// un-activated (INACTIVE / QUIESCE / RECREATE / no-receipt) fenced namespace
+	// permits it, so the honest un-activated flow and admin/CI debugging are not
+	// blocked.
+	receipt, err := namespaceIsolationReceipt(ctx, v.reader, request.Namespace)
+	if err != nil {
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+	if isolationPhase(receipt) == pgshardv1alpha1.IsolationActive {
+		return admission.Denied("interactive access to a managed PostgreSQL Pod is not permitted while namespace isolation is active")
+	}
+	return admission.Allowed("namespace isolation is not active; interactive access is permitted")
 }
 
 // denyManagerConnect resolves the request-named target Pod authoritatively and

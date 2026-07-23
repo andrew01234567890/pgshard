@@ -273,18 +273,20 @@ func TestComparatorRejectsAdversarialMutations(t *testing.T) {
 	}
 }
 
-// TestComparatorPinsSingleMemberCatalogServingTLS proves the activation-TLS
-// parity property (v7 §9): the single-member catalog-serving pod's
-// catalog-server-tls volume (its catalog Secret name + key projection), the
-// postmaster ssl_cert_file/ssl_key_file arguments, and ssl=on are all inside the
-// stamped canonical contract, so §1/§3 already pin them — a foreign catalog
-// Secret name or altered catalog ssl arguments make the pod diverge from its
-// stamped template and are DENIED by the comparator.
+// TestComparatorPinsSingleMemberCatalogServingComparatorTLS proves ONLY that the
+// single-member catalog-serving pod's catalog-server-tls Secret volume (its
+// catalog Secret name + key projection), the postmaster ssl_cert_file/
+// ssl_key_file arguments, and ssl=on are inside the stamped canonical contract,
+// so a foreign catalog Secret name or altered catalog ssl arguments make the pod
+// diverge from its stamped template and are DENIED by the COMPARATOR.
 //
-// NOTE: multi-member activation-TLS is DEFERRED — the shard-0 SOURCE pod has no
-// catalog-server-tls volume (it does not serve the catalog directly), so this
-// parity assertion is scoped to the single-member catalog-serving class.
-func TestComparatorPinsSingleMemberCatalogServingTLS(t *testing.T) {
+// SCOPE — this is COMPARATOR coverage, NOT activation lifecycle support. Isolation
+// ACTIVATION is still explicitly REJECTED for single-member clusters
+// (hasReplicationTLSPrerequisite requires membersPerShard > 1); this test does not
+// claim single-member activation works. Multi-member replication-TLS activation is
+// a separate supported surface, and multi-member activation-TLS parity is deferred
+// (the shard-0 SOURCE pod has no catalog-server-tls volume).
+func TestComparatorPinsSingleMemberCatalogServingComparatorTLS(t *testing.T) {
 	t.Parallel()
 	cluster := singleMemberPlannableCluster()
 	object := PostgreSQLMemberStatefulSetName(cluster.Name, 0, 0)

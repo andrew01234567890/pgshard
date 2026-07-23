@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,17 +32,36 @@ func managerPod() *corev1.Pod {
 	}
 }
 
-func TestPodConnectDenyValidatorDeniesFencedNamespaceAccess(t *testing.T) {
+func TestPodConnectDenyValidatorDeniesFencedNamespaceOnlyWhenActive(t *testing.T) {
 	t.Parallel()
 	scheme := testScheme(t)
-	validator := NewPodConnectDenyValidator(fake.NewClientBuilder().WithScheme(scheme).Build(), testOperatorNamespace)
 	for _, subresource := range []string{"exec", "attach", "portforward", "proxy"} {
 		subresource := subresource
 		t.Run(subresource, func(t *testing.T) {
 			t.Parallel()
-			response := validator.Handle(context.Background(), connectRequest("database", "example-shard-0000-0", subresource))
-			if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, "fenced namespace") {
-				t.Fatalf("fenced %s connect response = %#v", subresource, response)
+			// No isolation receipt (INACTIVE / un-activated fenced namespace): the
+			// honest flow and admin/CI debugging must be permitted.
+			inactive := NewPodConnectDenyValidator(fake.NewClientBuilder().WithScheme(scheme).Build(), testOperatorNamespace)
+			if response := inactive.Handle(context.Background(), connectRequest(testWorkloadNS, "example-shard-0000-0", subresource)); !response.Allowed {
+				t.Fatalf("un-activated fenced %s connect was denied: %#v", subresource, response.Result)
+			}
+
+			// QUIESCE and RECREATE are also permitted (the bounded transition).
+			for _, phase := range []pgshardv1alpha1.IsolationPhase{pgshardv1alpha1.IsolationActivatingQuiesce, pgshardv1alpha1.IsolationActivatingRecreate} {
+				cluster := isolationReceiptCluster(phase)
+				validator := NewPodConnectDenyValidator(fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster).Build(), testOperatorNamespace)
+				if response := validator.Handle(context.Background(), connectRequest(testWorkloadNS, "example-shard-0000-0", subresource)); !response.Allowed {
+					t.Fatalf("fenced %s connect during %s was denied: %#v", subresource, phase, response.Result)
+				}
+			}
+
+			// ACTIVE: the ratified dedicated-namespace protection denies interactive
+			// access.
+			active := isolationReceiptCluster(pgshardv1alpha1.IsolationActive)
+			validator := NewPodConnectDenyValidator(fake.NewClientBuilder().WithScheme(scheme).WithObjects(active).Build(), testOperatorNamespace)
+			if response := validator.Handle(context.Background(), connectRequest(testWorkloadNS, "example-shard-0000-0", subresource)); response.Allowed ||
+				response.Result == nil || !strings.Contains(response.Result.Message, "isolation is active") {
+				t.Fatalf("ACTIVE fenced %s connect response = %#v", subresource, response)
 			}
 		})
 	}

@@ -11,7 +11,6 @@ import (
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -146,34 +145,50 @@ func TestDriveIsolationQuiesceSealsThenAdvances(t *testing.T) {
 	}
 }
 
-func TestDriveIsolationQuiesceBlocksOnForeignPod(t *testing.T) {
+func TestDriveIsolationQuiesceSealsForeignPodForCleanup(t *testing.T) {
 	t.Parallel()
-	cluster := genCluster("blockcase", "blockcase-uid")
+	// QUIESCE must NOT block on a foreign pod (that deadlocks — nothing deletes it
+	// while quiesced). It seals EVERY pod UID and advances to RECREATE, which
+	// UID-deletes the foreign pod (cleanup, not blocking).
+	cluster := genCluster("cleanupcase", "cleanupcase-uid")
 	cluster.Status.IsolationReceipt = &pgshardv1alpha1.PostgreSQLIsolationReceipt{
 		NamespaceUID: "ns-uid", Phase: pgshardv1alpha1.IsolationActivatingQuiesce,
 		ActivatedAt:   metav1.NewTime(time.Now().Add(-2 * supportingRevocationDrain)),
 		SealedParents: []pgshardv1alpha1.SealedParent{{Kind: "StatefulSet", Name: "x", UID: "sts-uid"}},
 	}
-	// The sealed parent's live incarnation matches its seal, so the drift
-	// detector does not reseal and the foreign pod is what blocks.
 	sealedLive := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "x", Namespace: genTestNamespace, UID: "sts-uid"}}
-	foreign := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "intruder", Namespace: genTestNamespace}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c"}}}}
+	foreign := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "intruder", Namespace: genTestNamespace, UID: "intruder-uid"}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c"}}}}
 	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster, sealedLive, foreign)
 	reconciler.DispatchProber = convergedDispatch("")
 
+	// QUIESCE seals the foreign pod's UID and advances to RECREATE.
 	if _, err := reconciler.reconcileIsolationActivation(context.Background(), cluster); err != nil {
 		t.Fatal(err)
 	}
 	receipt := reloadReceipt(t, kubeClient, cluster)
-	if receipt.Phase != pgshardv1alpha1.IsolationActivatingQuiesce {
-		t.Fatalf("phase advanced despite a foreign pod: %q", receipt.Phase)
+	if receipt.Phase != pgshardv1alpha1.IsolationActivatingRecreate {
+		t.Fatalf("QUIESCE did not advance to RECREATE (it must not block on a foreign pod): %q", receipt.Phase)
 	}
-	reloaded := &pgshardv1alpha1.PgShardCluster{}
-	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), reloaded); err != nil {
+	sealedForeign := false
+	for _, uid := range receipt.RecreatePendingUIDs {
+		if uid == "intruder-uid" {
+			sealedForeign = true
+		}
+	}
+	if !sealedForeign {
+		t.Fatalf("foreign pod UID was not sealed for recreate cleanup: %#v", receipt.RecreatePendingUIDs)
+	}
+
+	// RECREATE UID-deletes the foreign pod.
+	fresh := &pgshardv1alpha1.PgShardCluster{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(cluster), fresh); err != nil {
 		t.Fatal(err)
 	}
-	if condition := meta.FindStatusCondition(reloaded.Status.Conditions, isolationActivationBlockedCondition); condition == nil || condition.Status != metav1.ConditionTrue {
-		t.Fatalf("IsolationActivationBlocked condition not surfaced: %#v", reloaded.Status.Conditions)
+	if _, err := reconciler.reconcileIsolationActivation(context.Background(), fresh); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Get(context.Background(), client.ObjectKey{Namespace: genTestNamespace, Name: "intruder"}, &corev1.Pod{}); err == nil {
+		t.Fatal("foreign pod was not cleaned up during RECREATE")
 	}
 }
 
@@ -243,10 +258,14 @@ func TestDriveIsolationRecreateReguardsThenActivates(t *testing.T) {
 	t.Parallel()
 	activatedAt := metav1.Now()
 	cluster := genCluster("recreatecase", "recreatecase-uid")
+	// The pooler class has a recorded contract at generation 1, so the ACTIVE
+	// receipt seals a per-class pooler floor.
+	cluster.Status.SupportingContracts = []pgshardv1alpha1.SupportingContractStatus{{Class: "pooler", ContractHash: genHashB, SecurityGeneration: 1}}
 	deployment, replicaSet, node, replacement := guardedPoolerChain(t, cluster)
 	cluster.Status.IsolationReceipt = &pgshardv1alpha1.PostgreSQLIsolationReceipt{
 		NamespaceUID: "ns-uid", Phase: pgshardv1alpha1.IsolationActivatingRecreate,
-		SecurityGeneration: 1, MinAcceptableSecurityGeneration: 1, ActivatedAt: activatedAt,
+		SecurityGeneration: 1, ActivatedAt: activatedAt,
+		SecurityFloors: []pgshardv1alpha1.IsolationSecurityFloor{{Component: "pooler", MinGeneration: 1}},
 		// QUIESCE sealed the protected pods to recreate by exact UID, and the
 		// parents (with their guarded replacement cardinality) at their exact
 		// incarnation.
@@ -310,8 +329,96 @@ func TestDriveIsolationRecreateReguardsThenActivates(t *testing.T) {
 	if receipt.Phase != pgshardv1alpha1.IsolationActive {
 		t.Fatalf("phase after guarded replacements = %q, want ACTIVE", receipt.Phase)
 	}
-	if receipt.MinAcceptableSecurityGeneration != 1 || receipt.ResidueProfileHash == "" {
-		t.Fatalf("active receipt = %#v", receipt)
+	if receipt.ResidueProfileHash == "" {
+		t.Fatalf("active receipt missing residue profile: %#v", receipt)
+	}
+	// The ACTIVE receipt seals the PER-class pooler floor (never a namespace-wide
+	// scalar).
+	if receipt.SecurityFloorFor("pooler", 0, 0) != 1 {
+		t.Fatalf("active receipt did not seal the per-class pooler floor: %#v", receipt.SecurityFloors)
+	}
+}
+
+func TestDriveIsolationActiveReQuiescesOnBackendChange(t *testing.T) {
+	t.Parallel()
+	// A stale API-server backend is published after ACTIVE: the dispatch tuple
+	// changes. The operator continuously re-proves while ACTIVE and, on the
+	// detected change, immediately re-quiesces (fail-closed remediation limiting
+	// exposure). This is the ratified immutable-membership constraint's enforcement.
+	cluster := genCluster("membershipcase", "membershipcase-uid")
+	cluster.Status.IsolationReceipt = &pgshardv1alpha1.PostgreSQLIsolationReceipt{
+		NamespaceUID: "ns-uid", Phase: pgshardv1alpha1.IsolationActive, DispatchTupleHash: "tuple-old",
+		SealedParents: []pgshardv1alpha1.SealedParent{{Kind: "StatefulSet", Name: "x", UID: "sts-uid"}},
+	}
+	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster)
+	// The prober now reports a DIFFERENT tuple (a newly published backend).
+	reconciler.DispatchProber = fakeDispatchProber{proof: dispatchProof{converged: true, backends: 2, tupleHash: "tuple-new"}}
+
+	if _, err := reconciler.reconcileIsolationActivation(context.Background(), cluster); err != nil {
+		t.Fatal(err)
+	}
+	receipt := reloadReceipt(t, kubeClient, cluster)
+	if receipt.Phase != pgshardv1alpha1.IsolationActivatingQuiesce {
+		t.Fatalf("ACTIVE did not re-quiesce on a backend-set change: %q", receipt.Phase)
+	}
+	if receipt.SealedParents != nil {
+		t.Fatalf("re-quiesce did not clear the sealed parents for re-enumeration: %#v", receipt.SealedParents)
+	}
+}
+
+func TestSupportingRollInProgressCoversIntentGap(t *testing.T) {
+	t.Parallel()
+	converged := genCluster("conv", "conv-uid")
+	converged.Status.SupportingGenerations = []pgshardv1alpha1.SupportingGenerationStatus{{
+		Class: "pooler", CurrentTemplateGeneration: 2, ConvergedGeneration: 2, MinGenerationForNewCreates: 2,
+	}}
+	if supportingRollInProgress(converged) {
+		t.Fatal("a fully converged class was reported as rolling")
+	}
+
+	// SEALED INTENT before the new ReplicaSet exists (no prior UID yet): the
+	// barrier advanced past the converged generation, so the roll is in progress.
+	intent := genCluster("intent", "intent-uid")
+	intent.Status.SupportingGenerations = []pgshardv1alpha1.SupportingGenerationStatus{{
+		Class: "pooler", CurrentTemplateGeneration: 1, ConvergedGeneration: 1, MinGenerationForNewCreates: 2,
+	}}
+	if !supportingRollInProgress(intent) {
+		t.Fatal("the intent→new-ReplicaSet gap was not counted as a roll in progress")
+	}
+
+	// Current template generation ahead of converged (rolling out).
+	rolling := genCluster("roll", "roll-uid")
+	rolling.Status.SupportingGenerations = []pgshardv1alpha1.SupportingGenerationStatus{{
+		Class: "pooler", CurrentTemplateGeneration: 2, ConvergedGeneration: 1,
+	}}
+	if !supportingRollInProgress(rolling) {
+		t.Fatal("an unconverged current generation was not counted as rolling")
+	}
+}
+
+func TestDriveIsolationActiveWaitsForSupportingRoll(t *testing.T) {
+	t.Parallel()
+	cluster := genCluster("activerollcase", "activerollcase-uid")
+	cluster.Status.IsolationReceipt = &pgshardv1alpha1.PostgreSQLIsolationReceipt{
+		NamespaceUID: "ns-uid", Phase: pgshardv1alpha1.IsolationActive, DispatchTupleHash: "",
+	}
+	// A supporting roll is in progress (bounded coexistence). driveIsolationActive
+	// must WAIT — re-quiescing would freeze the very creates the CAS roll needs.
+	cluster.Status.SupportingGenerations = []pgshardv1alpha1.SupportingGenerationStatus{{
+		Class: "pooler", CurrentReplicaSetUID: "rs-b", PriorReplicaSetUID: "rs-a",
+	}}
+	reconciler, kubeClient := genReconciler(t, isolationNamespace("ns-uid"), cluster)
+	reconciler.DispatchProber = convergedDispatch("")
+
+	activating, err := reconciler.reconcileIsolationActivation(context.Background(), cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !activating {
+		t.Fatal("ACTIVE with a supporting roll did not request a requeue to wait for convergence")
+	}
+	if receipt := reloadReceipt(t, kubeClient, cluster); receipt.Phase != pgshardv1alpha1.IsolationActive {
+		t.Fatalf("ACTIVE re-quiesced during a legitimate supporting roll (circular wait): %q", receipt.Phase)
 	}
 }
 

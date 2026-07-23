@@ -914,6 +914,52 @@ func TestBindingValidatorRejectsSmuggledMetadata(t *testing.T) {
 	}
 }
 
+func TestBindingValidatorDeniesStamplessBindOncePastInactive(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	node := testNode("node-a", "node-uid-a", "boot-a")
+	bind := func(cluster *pgshardv1alpha1.PgShardCluster) admission.Response {
+		pod := managedPod()
+		pod.Spec.NodeName = ""
+		pod.DeletionTimestamp = nil
+		delete(pod.Annotations, NodeUIDAnnotation)
+		delete(pod.Annotations, NodeBootIDAnnotation)
+		// STAMPLESS: an attacker's INACTIVE-created classified pod carries no
+		// reconciler stamp.
+		delete(pod.Annotations, owned.PodContractHashAnnotation)
+		reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, node, cluster).Build()
+		binding := &corev1.Binding{
+			ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace, UID: pod.UID},
+			Target:     corev1.ObjectReference{Kind: "Node", Name: node.Name},
+		}
+		request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+			Name: pod.Name, Namespace: pod.Namespace, Operation: admissionv1.Create, SubResource: "binding",
+			Object: runtime.RawExtension{Raw: marshalObject(t, binding)},
+		}}
+		return NewBindingValidator(reader, scheme).Handle(context.Background(), request)
+	}
+
+	// INACTIVE (opt-in model): the un-activated fenced namespace permits a stampless
+	// bind, matching the phase-aware CREATE path.
+	inactive := managedClusterForPod(managedPod())
+	inactive.Spec.MembersPerShard = 3
+	if response := bind(inactive); !response.Allowed {
+		t.Fatalf("stampless bind was denied while INACTIVE: %#v", response.Result)
+	}
+
+	// QUIESCE and RECREATE: a stampless (pre-guard) classified pod must NOT bind —
+	// this closes the delayed-bind Secret-read window during the ceremony.
+	for _, phase := range []pgshardv1alpha1.IsolationPhase{pgshardv1alpha1.IsolationActivatingQuiesce, pgshardv1alpha1.IsolationActivatingRecreate, pgshardv1alpha1.IsolationActive} {
+		guarded := managedClusterForPod(managedPod())
+		guarded.Spec.MembersPerShard = 3
+		guarded.Status.IsolationReceipt = &pgshardv1alpha1.PostgreSQLIsolationReceipt{NamespaceUID: "ns", Phase: phase}
+		if response := bind(guarded); response.Allowed || response.Result == nil ||
+			!strings.Contains(response.Result.Message, "must carry the reconciler stamp before binding") {
+			t.Fatalf("stampless bind during %s response = %#v", phase, response)
+		}
+	}
+}
+
 func poolerGenerationCluster(record pgshardv1alpha1.SupportingGenerationStatus) *pgshardv1alpha1.PgShardCluster {
 	cluster := testWorkloadCluster()
 	cluster.Status.SupportingGenerations = []pgshardv1alpha1.SupportingGenerationStatus{record}
