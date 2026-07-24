@@ -256,35 +256,51 @@ func (r *PgShardClusterReconciler) driveSupportingRevocation(ctx context.Context
 	// Sweep EVERY revoked pod of the class: any pod owned by the prior ReplicaSet,
 	// and any pod stamped below the security-generation floor (a late write of a
 	// revoked generation), not just one prior UID.
-	swept, err := r.sweepRevokedSupportingPods(ctx, reader, cluster, record)
+	remaining, mutated, err := r.sweepRevokedSupportingPods(ctx, reader, cluster, record)
 	if err != nil {
 		return false, false, err
 	}
-	if swept > 0 {
+	if remaining > 0 {
+		// A revoked Pod OBJECT still exists — possibly terminating-but-alive. Reset
+		// the zero-observation streak and hold. A terminating Pod's process can
+		// outlive its DeletionTimestamp (grace period, preStop, node partition, a
+		// held finalizer), and Kubernetes excludes terminating Pods from ReplicaSet
+		// and Deployment replica counters, so only an authoritative LIST with zero
+		// matching objects proves the prior generation is gone. A finalizer that
+		// pins one forever keeps activation fail-closed rather than converging over
+		// a live prior-generation process.
 		r.resetSupportingDrain(cluster.UID, record.Class)
-		return false, true, nil
+		return false, mutated, nil
 	}
 	if r.observeSupportingDrainZero(cluster.UID, record.Class) < 2 {
-		return false, false, nil
+		return false, mutated, nil
 	}
 	r.resetSupportingDrain(cluster.UID, record.Class)
-	return true, false, nil
+	return true, mutated, nil
 }
 
-// sweepRevokedSupportingPods deletes every pod of the class that belongs to a
-// revoked generation: owned by the prior ReplicaSet, or stamped below the
-// security-generation floor. It returns the number deleted.
-func (r *PgShardClusterReconciler) sweepRevokedSupportingPods(ctx context.Context, reader client.Reader, cluster *pgshardv1alpha1.PgShardCluster, record *pgshardv1alpha1.SupportingGenerationStatus) (int, error) {
+// sweepRevokedSupportingPods deletes every non-terminating Pod of the class that
+// belongs to a revoked generation (owned by the prior ReplicaSet, or stamped
+// below the security-generation floor) and returns how many matching Pod OBJECTS
+// still exist — terminating ones INCLUDED — plus whether it issued any delete.
+//
+// A terminating Pod counts as present: its process can outlive the object's
+// DeletionTimestamp (grace period, delayed preStop, node partition, a held
+// finalizer), and Kubernetes excludes terminating Pods from ReplicaSet and
+// Deployment replica counters. So neither those counters nor a delete count can
+// prove the prior generation is gone — only a LIST with zero matching objects
+// can. The caller treats a non-zero remaining count as "hold, not converged",
+// which keeps revocation (and therefore isolation activation) fail-closed while
+// any prior-generation Pod object lingers.
+func (r *PgShardClusterReconciler) sweepRevokedSupportingPods(ctx context.Context, reader client.Reader, cluster *pgshardv1alpha1.PgShardCluster, record *pgshardv1alpha1.SupportingGenerationStatus) (int, bool, error) {
 	pods := &corev1.PodList{}
 	if err := reader.List(ctx, pods, client.InNamespace(cluster.Namespace)); err != nil {
-		return 0, fmt.Errorf("list supporting pods to sweep: %w", err)
+		return 0, false, fmt.Errorf("list supporting pods to sweep: %w", err)
 	}
-	deleted := 0
+	remaining := 0
+	mutated := false
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if pod.DeletionTimestamp != nil {
-			continue
-		}
 		// A pod owned by the prior ReplicaSet is definitionally a prior generation of
 		// this class and is swept regardless of its labels, so a late write cannot
 		// evade the sweep by stripping its class labels. The below-floor sweep is
@@ -297,12 +313,18 @@ func (r *PgShardClusterReconciler) sweepRevokedSupportingPods(ctx context.Contex
 		if !ownedByPrior && !belowFloor {
 			continue
 		}
-		if err := r.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
-			return deleted, fmt.Errorf("delete revoked supporting pod %s: %w", pod.Name, err)
+		remaining++
+		if pod.DeletionTimestamp != nil {
+			// Already terminating: cannot re-delete, but it still counts as present
+			// until the object is gone.
+			continue
 		}
-		deleted++
+		if err := r.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
+			return remaining, mutated, fmt.Errorf("delete revoked supporting pod %s: %w", pod.Name, err)
+		}
+		mutated = true
 	}
-	return deleted, nil
+	return remaining, mutated, nil
 }
 
 // supportingDeploymentConverged reports whether a Deployment has fully rolled

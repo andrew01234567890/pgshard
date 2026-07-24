@@ -371,3 +371,57 @@ func TestSupportingDeploymentConvergedProvesMaterializationNotAvailability(t *te
 		}
 	}
 }
+
+// A terminating prior-generation Pod whose process is still alive (pinned here by
+// a finalizer) must block revocation convergence even though it is a non-serving
+// (AvailableReplicas == 0) pooler and Kubernetes excludes the terminating Pod
+// from every ReplicaSet/Deployment replica counter. Only the object LIST still
+// sees it, and revocation must stay fail-closed until it is truly gone —
+// otherwise a live below-floor process outlives isolation activation.
+func TestDriveSupportingRevocationHoldsForTerminatingPriorPod(t *testing.T) {
+	t.Parallel()
+	controller := true
+	cluster := genCluster("termcase", "termcase-uid")
+	cluster.Status.SupportingGenerations = []pgshardv1alpha1.SupportingGenerationStatus{{
+		Class: "pooler", DeploymentUID: "deploy-uid",
+		CurrentReplicaSetUID: "rs-b", CurrentContractHash: genHashB, CurrentTemplateGeneration: 2,
+		PriorReplicaSetUID: "rs-a", PriorContractHash: genHashA, PriorRevoked: true,
+		MinGenerationForNewCreates: 2,
+		SealedAt:                   metav1.NewTime(time.Now().Add(-2 * supportingRevocationDrain)),
+	}}
+	// Materialized (updated, no counted stragglers) but never Available: the exact
+	// shape of a quarantined pooler after its roll. Every counter-based gate passes.
+	deployment := poolerDeploymentForClass(cluster.Name, "deploy-uid", genHashB, 2, 2)
+	deployment.Status.AvailableReplicas = 0
+	deployment.Status.ReadyReplicas = 0
+	replicaSetA := ownedReplicaSet("termcase-pooler-a", "rs-a", deployment.UID, genHashA, 0, 0)
+	replicaSetB := ownedReplicaSet("termcase-pooler-b", "rs-b", deployment.UID, genHashB, 2, 2)
+	terminating := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "prior-terminating", Namespace: genTestNamespace, UID: "term-uid",
+		Finalizers:      []string{"pgshard.io/test-hold"},
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: replicaSetA.Name, UID: "rs-a", Controller: &controller}},
+	}}
+	reconciler, kubeClient := genReconciler(t, cluster, deployment, replicaSetA, replicaSetB, terminating)
+	// Delete under the finalizer to make the Pod terminating-but-present.
+	if err := kubeClient.Delete(context.Background(), terminating); err != nil {
+		t.Fatal(err)
+	}
+	current := &corev1.Pod{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKey{Namespace: genTestNamespace, Name: "prior-terminating"}, current); err != nil {
+		t.Fatalf("terminating prior pod should still exist under its finalizer: %v", err)
+	}
+	if current.DeletionTimestamp == nil {
+		t.Fatal("prior pod should be terminating (DeletionTimestamp set)")
+	}
+	// Run past the two-consecutive-zero-LIST window: it must never converge while
+	// the terminating object persists.
+	for pass := 0; pass < 3; pass++ {
+		if _, err := reconciler.advanceSupportingGenerations(context.Background(), cluster); err != nil {
+			t.Fatal(err)
+		}
+	}
+	record := reloadGenerationRecord(t, kubeClient, cluster, "pooler")
+	if record.PriorReplicaSetUID != "rs-a" {
+		t.Fatalf("prior generation converged while a terminating prior pod still existed: %#v", record)
+	}
+}
