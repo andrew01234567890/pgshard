@@ -3874,12 +3874,35 @@ func assertPostgreSQLRoleProfiles(t *testing.T, ctx context.Context, kubeClient 
 	}
 	databaseGenesis := configuration.Data["database-genesis.sql"]
 	for _, statement := range []string{
-		"BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;\n",
+		"SET LOCAL search_path = pg_catalog;\n",
 		"database genesis contains an undeclared active logical database",
-		"COMMIT;\n",
 	} {
 		if !strings.Contains(databaseGenesis, statement) {
 			t.Fatalf("database genesis is missing %q:\n%s", statement, databaseGenesis)
+		}
+	}
+	// Both inputs are caller-framed pure SQL: the applying transaction and the
+	// scalar values are owned by the caller, so a client meta-command,
+	// interpolation, or transaction-control statement here would be executed
+	// outside that contract.
+	for name, rendered := range map[string]string{
+		"database topology preflight": databaseTopologyPreflight,
+		"database genesis":            databaseGenesis,
+	} {
+		for _, forbidden := range []string{
+			"BEGIN TRANSACTION",
+			"\nBEGIN;",
+			"\nCOMMIT;",
+			"\\i ",
+			"\\if",
+			"\\set",
+			"\\endif",
+			":'",
+			":{?",
+		} {
+			if strings.Contains(rendered, forbidden) {
+				t.Fatalf("%s is not caller-framed pure SQL, contains %q:\n%s", name, forbidden, rendered)
+			}
 		}
 	}
 	common := configuration.Data["postgresql.conf"]

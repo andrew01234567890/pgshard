@@ -691,8 +691,8 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 			!strings.Contains(bootstrap.Command[2], "event_triggers=off") ||
 			!strings.Contains(bootstrap.Command[2], "session_replication_role=origin") ||
 			!strings.Contains(bootstrap.Command[2], "default_table_access_method=heap") ||
-			!strings.Contains(bootstrap.Command[2], "PGOPTIONS=\"$PGOPTIONS -c default_transaction_isolation=read_committed -c pgshard.expected_shard_count=$PGSHARD_SHARD_COUNT\"") ||
-			!strings.Contains(bootstrap.Command[2], "PGOPTIONS=\"$PGOPTIONS -c default_transaction_isolation=read_committed -c pgshard.bootstrap_allow_empty_database_topology=$catalog_requires_initial_inventory\"") ||
+			!strings.Contains(bootstrap.Command[2], "PGOPTIONS=\"$PGOPTIONS -c default_transaction_isolation=read\\\\ committed -c pgshard.expected_shard_count=$PGSHARD_SHARD_COUNT\"") ||
+			!strings.Contains(bootstrap.Command[2], "PGOPTIONS=\"$PGOPTIONS -c default_transaction_isolation=read\\\\ committed -c pgshard.bootstrap_allow_empty_database_topology=$catalog_requires_initial_inventory\"") ||
 			strings.Count(bootstrap.Command[2], "--single-transaction") != 2 ||
 			strings.Count(bootstrap.Command[2], "--set=ON_ERROR_STOP=1 --single-transaction") != 2 ||
 			!strings.Contains(bootstrap.Command[2], "shard inventory does not match the operator release") ||

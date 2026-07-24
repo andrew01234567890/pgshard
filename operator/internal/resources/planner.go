@@ -1416,7 +1416,7 @@ if [[ "$missing_shards" != "0" ]]; then
     echo "RestoreTopologyMismatch: shardschema inventory conflicts with the configured immutable shard topology" >&2
     exit 1
   fi
-  PGOPTIONS="$PGOPTIONS -c default_transaction_isolation=read_committed -c pgshard.expected_shard_count=$PGSHARD_SHARD_COUNT" \
+  PGOPTIONS="$PGOPTIONS -c default_transaction_isolation=read\\ committed -c pgshard.expected_shard_count=$PGSHARD_SHARD_COUNT" \
     psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
       --set=ON_ERROR_STOP=1 --single-transaction \
       --file="$PGSHARD_SHARD_INVENTORY"
@@ -1431,7 +1431,7 @@ fi
 
 validate_bootstrap_session_policy shardschema
 
-PGOPTIONS="$PGOPTIONS -c default_transaction_isolation=read_committed -c pgshard.bootstrap_allow_empty_database_topology=$catalog_requires_initial_inventory" \
+PGOPTIONS="$PGOPTIONS -c default_transaction_isolation=read\\ committed -c pgshard.bootstrap_allow_empty_database_topology=$catalog_requires_initial_inventory" \
   psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
     --set=ON_ERROR_STOP=1 --single-transaction \
     --file="$database_topology_preflight" --file="$database_genesis" >/dev/null
