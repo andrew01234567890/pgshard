@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 use tokio::sync::watch;
+use tokio::time::Instant;
 
 use crate::catalog_activation_challenge::{
     CatalogActivationChallengeClient, CatalogActivationChallengeError,
@@ -16,9 +17,12 @@ use crate::catalog_activation_challenge::{
 use crate::catalog_activation_live_objects::{
     AuthoritativeCatalogActivationLiveObjectReader, CatalogActivationLiveObjectError,
 };
+#[cfg(test)]
+use crate::catalog_activation_publisher::DefinitiveCatalogActivationRejection;
 use crate::catalog_activation_publisher::{
     CatalogActivationPublicationOutcome, CatalogActivationPublisher,
     CatalogActivationPublisherError, PendingCatalogActivationPublication,
+    RetryableCatalogActivationRejection,
 };
 use crate::catalog_candidate::{
     AuthoritativeCandidateReader, BoundCandidateSet, CatalogCandidateError,
@@ -32,12 +36,96 @@ use crate::catalog_materialization::{
 use crate::domain::OrchState;
 use crate::topology::CatalogCandidateObservationPlan;
 
+// The two independent proof collectors retain their last published proof
+// through every refresh bracket; a proof leaves only when its replacement
+// swaps in, a failure is recorded, or its own freshness deadline expires.
+// Once both collectors have published, the proof overlap is therefore
+// continuously observable at any poll instant regardless of collector
+// phasing. This shorter local-only poll merely shortens the wait for the
+// first overlap without increasing Kubernetes traffic before initial
+// authority exists.
+pub(crate) const AUTHORITY_POLL_PERIOD: Duration = Duration::from_millis(100);
+
+// A throttled publication (HTTP 429) is proven not to have committed, so
+// bounded re-publication cannot double-write. One budget exists per process
+// incarnation: both the attempt count and the deadline bound the loop so an
+// abusive or misconfigured API server cannot turn throttling into unlimited
+// write attempts.
+const REJECTION_RETRY_MAX_ATTEMPTS: u32 = 5;
+const REJECTION_RETRY_DEADLINE_BUDGET: Duration = Duration::from_mins(1);
+const REJECTION_RETRY_BACKOFF_FLOOR: Duration = Duration::from_millis(500);
+const REJECTION_RETRY_BACKOFF_CAP: Duration = Duration::from_secs(10);
+
+struct RejectionRetryBudget {
+    rejections: u32,
+    deadline: Option<Instant>,
+}
+
+impl RejectionRetryBudget {
+    const fn new() -> Self {
+        Self {
+            rejections: 0,
+            deadline: None,
+        }
+    }
+
+    /// Returns the delay before the next publication attempt, or `None` once
+    /// either the attempt count or the deadline budget is exhausted.
+    fn next_delay(
+        &mut self,
+        now: Instant,
+        retry_after: Option<Duration>,
+        entropy: u64,
+    ) -> Option<Duration> {
+        let deadline = *self
+            .deadline
+            .get_or_insert(now + REJECTION_RETRY_DEADLINE_BUDGET);
+        self.rejections = self.rejections.saturating_add(1);
+        if self.rejections >= REJECTION_RETRY_MAX_ATTEMPTS {
+            return None;
+        }
+        let delay =
+            jittered_backoff(self.rejections, entropy).max(retry_after.unwrap_or(Duration::ZERO));
+        let resumes_at = now.checked_add(delay)?;
+        if resumes_at >= deadline {
+            return None;
+        }
+        Some(delay)
+    }
+}
+
+// Equal jitter: half the capped exponential backoff is deterministic and the
+// other half is uniformly random, so the floor still spaces retries apart.
+fn jittered_backoff(rejections: u32, entropy: u64) -> Duration {
+    let doublings = rejections.saturating_sub(1).min(6);
+    let backoff = REJECTION_RETRY_BACKOFF_FLOOR
+        .saturating_mul(1_u32 << doublings)
+        .min(REJECTION_RETRY_BACKOFF_CAP);
+    let nanos = u64::try_from(backoff.as_nanos()).unwrap_or(u64::MAX);
+    let half = nanos / 2;
+    let jitter = if half == 0 { 0 } else { entropy % (half + 1) };
+    Duration::from_nanos(half + jitter)
+}
+
+fn rejection_retry_entropy() -> u64 {
+    let mut bytes = [0_u8; 8];
+    // Jitter is best-effort; a failed entropy read only degrades spreading.
+    if getrandom::fill(&mut bytes).is_err() {
+        return 0;
+    }
+    u64::from_le_bytes(bytes)
+}
+
 /// Runs the one-shot catalog-activation publisher until shutdown.
 ///
 /// Safe pre-publication failures are retried at the bounded observation
-/// cadence. Any nonempty carrier, successful publication, or ambiguous write
-/// is terminal for this process incarnation and waits for shutdown without a
-/// second write attempt.
+/// cadence, and every retry constructs a fresh proof attempt. A throttled
+/// write (HTTP 429) is proven not to have committed and is retried the same
+/// way inside a bounded attempt-count and deadline budget with capped,
+/// jittered exponential backoff that honors `Retry-After`. Any nonempty
+/// carrier, successful publication, definitive rejection, ambiguous write, or
+/// exhausted retry budget is terminal for this process incarnation and waits
+/// for shutdown without another write attempt.
 pub async fn supervise(
     plan: CatalogCandidateObservationPlan,
     state: OrchState,
@@ -71,11 +159,13 @@ pub async fn supervise(
         }
     };
 
+    let mut logged_authority_wait = false;
+    let mut rejection_budget = RejectionRetryBudget::new();
     loop {
         if *shutdown.borrow() {
             return;
         }
-        match Box::pin(attempt(
+        let retry_delay = match Box::pin(attempt(
             &candidates,
             &challenge,
             &state,
@@ -87,27 +177,68 @@ pub async fn supervise(
         {
             AttemptDisposition::Stopped => return,
             AttemptDisposition::Retry(error) => {
-                tracing::warn!(reason = %error, "catalog-activation publication preconditions unavailable");
+                if let Some(rejection) = error.retryable_publication_rejection() {
+                    let Some(delay) = rejection_budget.next_delay(
+                        Instant::now(),
+                        rejection.retry_after(),
+                        rejection_retry_entropy(),
+                    ) else {
+                        tracing::error!(
+                            http_status = rejection.status_code(),
+                            "catalog-activation publication retry budget is exhausted; no further writes will be attempted"
+                        );
+                        wait_until_shutdown(&mut shutdown).await;
+                        return;
+                    };
+                    tracing::warn!(
+                        http_status = rejection.status_code(),
+                        delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                        "catalog-activation publication was throttled before commit; retrying from fresh proof"
+                    );
+                    delay
+                } else if error.is_authority_unavailable() {
+                    if logged_authority_wait {
+                        tracing::debug!(reason = %error, "catalog-activation authority overlap remains unavailable");
+                    } else {
+                        tracing::warn!(reason = %error, "catalog-activation authority overlap is unavailable; polling for fresh proof overlap");
+                        logged_authority_wait = true;
+                    }
+                    error.retry_delay(retry_period)
+                } else {
+                    tracing::warn!(reason = %error, "catalog-activation publication preconditions unavailable");
+                    error.retry_delay(retry_period)
+                }
             }
             AttemptDisposition::Terminal(outcome) => {
-                match outcome {
-                    CatalogActivationPublicationOutcome::Installed => tracing::info!(
-                        "catalog-activation request publication is installed; no further writes will be attempted"
-                    ),
-                    CatalogActivationPublicationOutcome::ForeignPublication => tracing::error!(
-                        "catalog-activation carrier is nonempty or foreign; no write will be attempted"
-                    ),
-                    CatalogActivationPublicationOutcome::Indeterminate => tracing::error!(
-                        "catalog-activation publication outcome is indeterminate; no retry will be attempted"
-                    ),
-                }
+                log_terminal_outcome(&outcome);
                 wait_until_shutdown(&mut shutdown).await;
                 return;
             }
-        }
-        if wait_or_stop(&mut shutdown, retry_period).await {
+        };
+        if wait_or_stop(&mut shutdown, retry_delay).await {
             return;
         }
+    }
+}
+
+fn log_terminal_outcome(outcome: &CatalogActivationPublicationOutcome) {
+    match outcome {
+        CatalogActivationPublicationOutcome::Installed => tracing::info!(
+            "catalog-activation request publication is installed; no further writes will be attempted"
+        ),
+        CatalogActivationPublicationOutcome::ForeignPublication => tracing::error!(
+            "catalog-activation carrier is nonempty or foreign; no write will be attempted"
+        ),
+        CatalogActivationPublicationOutcome::DefinitiveRejection(rejection) => tracing::error!(
+            http_status = rejection.status_code(),
+            "catalog-activation publication was definitively rejected; no retry will be attempted"
+        ),
+        CatalogActivationPublicationOutcome::RetryableRejection(_) => {
+            unreachable!("throttled publication rejections are retryable attempt results")
+        }
+        CatalogActivationPublicationOutcome::Indeterminate => tracing::error!(
+            "catalog-activation publication outcome is indeterminate; no retry will be attempted"
+        ),
     }
 }
 
@@ -373,7 +504,12 @@ async fn run_attempt<D: CatalogActivationAttemptDriver>(
     if shutdown_requested(shutdown) {
         return AttemptDisposition::Stopped;
     }
-    AttemptDisposition::Terminal(attempt.publish().await)
+    match attempt.publish().await {
+        CatalogActivationPublicationOutcome::RetryableRejection(rejection) => {
+            AttemptDisposition::Retry(CatalogActivationAttemptError::RetryableRejection(rejection))
+        }
+        outcome => AttemptDisposition::Terminal(outcome),
+    }
 }
 
 fn run_prewrite_sync(
@@ -487,6 +623,29 @@ enum CatalogActivationAttemptError {
     Challenge(#[source] CatalogActivationChallengeError),
     #[error("catalog-activation publication preflight failed: {0}")]
     Publisher(#[source] CatalogActivationPublisherError),
+    #[error("catalog-activation publication was throttled before commit")]
+    RetryableRejection(RetryableCatalogActivationRejection),
+}
+
+impl CatalogActivationAttemptError {
+    fn is_authority_unavailable(&self) -> bool {
+        matches!(self, Self::AuthorityUnavailable)
+    }
+
+    fn retry_delay(&self, configured_retry_period: Duration) -> Duration {
+        if self.is_authority_unavailable() {
+            configured_retry_period.min(AUTHORITY_POLL_PERIOD)
+        } else {
+            configured_retry_period
+        }
+    }
+
+    fn retryable_publication_rejection(&self) -> Option<RetryableCatalogActivationRejection> {
+        match self {
+            Self::RetryableRejection(rejection) => Some(*rejection),
+            _ => None,
+        }
+    }
 }
 
 async fn wait_or_stop(shutdown: &mut watch::Receiver<bool>, duration: Duration) -> bool {
@@ -546,6 +705,24 @@ mod tests {
         Event::FinalRevalidate,
         Event::Put,
     ];
+
+    #[test]
+    fn authority_wait_breaks_collector_cadence_lock_without_accelerating_other_failures() {
+        let configured = Duration::from_secs(2);
+        assert_eq!(
+            CatalogActivationAttemptError::AuthorityUnavailable.retry_delay(configured),
+            AUTHORITY_POLL_PERIOD
+        );
+        assert_eq!(
+            CatalogActivationAttemptError::EvidenceChanged.retry_delay(configured),
+            configured
+        );
+        let already_faster = Duration::from_millis(50);
+        assert_eq!(
+            CatalogActivationAttemptError::AuthorityUnavailable.retry_delay(already_faster),
+            already_faster
+        );
+    }
 
     struct FakeAttempt {
         events: Arc<Mutex<Vec<Event>>>,
@@ -656,7 +833,7 @@ mod tests {
             self.record(Event::Put);
             self.paused.notify_one();
             tokio::time::sleep(self.publication_duration).await;
-            self.publication_outcome
+            self.publication_outcome.clone()
         }
     }
 
@@ -668,7 +845,7 @@ mod tests {
             CatalogActivationPublicationOutcome::Indeterminate,
         ] {
             let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-            let mut attempt = FakeAttempt::new(outcome);
+            let mut attempt = FakeAttempt::new(outcome.clone());
             let disposition = run_attempt(&mut attempt, &mut shutdown_rx).await;
             assert!(matches!(
                 disposition,
@@ -684,6 +861,138 @@ mod tests {
                 1
             );
             drop(shutdown_tx);
+        }
+    }
+
+    #[tokio::test]
+    async fn definitive_rejections_are_terminal_after_one_put() {
+        for rejection in [
+            DefinitiveCatalogActivationRejection::Forbidden,
+            DefinitiveCatalogActivationRejection::Conflict,
+            DefinitiveCatalogActivationRejection::UnprocessableEntity,
+        ] {
+            let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+            let mut attempt = FakeAttempt::new(
+                CatalogActivationPublicationOutcome::DefinitiveRejection(rejection),
+            );
+            let disposition = run_attempt(&mut attempt, &mut shutdown_rx).await;
+            assert!(matches!(
+                disposition,
+                AttemptDisposition::Terminal(
+                    CatalogActivationPublicationOutcome::DefinitiveRejection(actual)
+                ) if actual == rejection
+            ));
+            assert_eq!(attempt.recorded(), COMPLETE_ORDER);
+            assert_eq!(
+                attempt
+                    .recorded()
+                    .iter()
+                    .filter(|event| **event == Event::Put)
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn throttled_rejection_retries_only_through_a_fresh_full_attempt() {
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let rejection = RetryableCatalogActivationRejection::with_retry_after_for_test(Some(
+            Duration::from_secs(7),
+        ));
+        let mut rejected_attempt = FakeAttempt::new(
+            CatalogActivationPublicationOutcome::RetryableRejection(rejection),
+        );
+        let disposition = run_attempt(&mut rejected_attempt, &mut shutdown_rx).await;
+        assert!(matches!(
+            disposition,
+            AttemptDisposition::Retry(ref error)
+                if error.retryable_publication_rejection() == Some(rejection)
+        ));
+        assert_eq!(rejected_attempt.recorded(), COMPLETE_ORDER);
+
+        let mut fresh_attempt = FakeAttempt::new(CatalogActivationPublicationOutcome::Installed);
+        assert!(matches!(
+            run_attempt(&mut fresh_attempt, &mut shutdown_rx).await,
+            AttemptDisposition::Terminal(CatalogActivationPublicationOutcome::Installed)
+        ));
+        assert_eq!(fresh_attempt.recorded(), COMPLETE_ORDER);
+        for attempt in [&rejected_attempt, &fresh_attempt] {
+            assert_eq!(
+                attempt
+                    .recorded()
+                    .iter()
+                    .filter(|event| **event == Event::Put)
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn rejection_retry_budget_bounds_total_attempts() {
+        let mut budget = RejectionRetryBudget::new();
+        let now = Instant::now();
+        for _ in 1..REJECTION_RETRY_MAX_ATTEMPTS {
+            assert!(budget.next_delay(now, None, 0).is_some());
+        }
+        assert!(budget.next_delay(now, None, 0).is_none());
+        assert!(budget.next_delay(now, None, 0).is_none());
+    }
+
+    #[test]
+    fn rejection_retry_budget_bounds_the_deadline() {
+        let start = Instant::now();
+        let mut budget = RejectionRetryBudget::new();
+        assert!(budget.next_delay(start, None, 0).is_some());
+        assert!(
+            budget
+                .next_delay(start, Some(REJECTION_RETRY_DEADLINE_BUDGET), 0)
+                .is_none()
+        );
+
+        let mut elapsed = RejectionRetryBudget::new();
+        assert!(elapsed.next_delay(start, None, 0).is_some());
+        assert!(
+            elapsed
+                .next_delay(start + REJECTION_RETRY_DEADLINE_BUDGET, None, 0)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejection_retry_delay_honors_retry_after_within_the_budget() {
+        let mut budget = RejectionRetryBudget::new();
+        let retry_after = Duration::from_secs(7);
+        assert_eq!(
+            budget.next_delay(Instant::now(), Some(retry_after), 0),
+            Some(retry_after)
+        );
+    }
+
+    #[test]
+    fn rejection_retry_backoff_is_capped_and_jittered() {
+        let floor_half = u64::try_from(REJECTION_RETRY_BACKOFF_FLOOR.as_nanos())
+            .expect("floor fits in nanoseconds")
+            / 2;
+        assert_eq!(jittered_backoff(1, 0), Duration::from_nanos(floor_half));
+        assert_eq!(
+            jittered_backoff(1, floor_half),
+            REJECTION_RETRY_BACKOFF_FLOOR
+        );
+        let cap_half = u64::try_from(REJECTION_RETRY_BACKOFF_CAP.as_nanos())
+            .expect("cap fits in nanoseconds")
+            / 2;
+        assert_eq!(
+            jittered_backoff(u32::MAX, cap_half),
+            REJECTION_RETRY_BACKOFF_CAP
+        );
+        for rejections in 1..=8 {
+            for entropy in [0, 1, floor_half, u64::MAX] {
+                let delay = jittered_backoff(rejections, entropy);
+                assert!(delay >= Duration::from_nanos(floor_half));
+                assert!(delay <= REJECTION_RETRY_BACKOFF_CAP);
+            }
         }
     }
 

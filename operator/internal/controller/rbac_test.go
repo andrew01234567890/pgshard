@@ -33,7 +33,7 @@ func TestGeneratedManagerRoleAuthorizesRuntimeControlPaths(t *testing.T) {
 		{group: "", resource: "secrets", verbs: []string{"create", "delete", "get", "update"}},
 		{group: "", resource: "serviceaccounts", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
 		{group: "coordination.k8s.io", resource: "leases", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
-		{group: "pgshard.io", resource: "pgshardcatalogactivations", verbs: []string{"create", "get", "list", "watch"}},
+		{group: "pgshard.io", resource: "pgshardcatalogactivations", verbs: []string{"create", "get", "list", "update", "watch"}},
 		{group: "pgshard.io", resource: "pgshardcatalogactivations/status", verbs: []string{"update"}},
 		{group: "rbac.authorization.k8s.io", resource: "roles", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
 		{group: "rbac.authorization.k8s.io", resource: "rolebindings", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
@@ -73,7 +73,7 @@ func TestGeneratedManagerRoleAuthorizesRuntimeControlPaths(t *testing.T) {
 			t.Errorf("cluster-wide manager role grants forbidden Node verb %q", forbidden)
 		}
 	}
-	for _, forbidden := range []string{"delete", "patch", "update"} {
+	for _, forbidden := range []string{"delete", "patch"} {
 		if roleAllows(role, "pgshard.io", "pgshardcatalogactivations", []string{forbidden}) {
 			t.Errorf("cluster-wide manager role grants forbidden catalog activation verb %q", forbidden)
 		}

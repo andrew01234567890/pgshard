@@ -2743,6 +2743,24 @@ func assertKINDOrchestratorObservationRBAC(t *testing.T, ctx context.Context, cl
 	for _, name := range catalogCandidates {
 		assertKINDCanI(t, ctx, identity, cluster.Namespace, true, "get", "configmaps/"+name)
 	}
+	carrier := cluster.Status.CatalogActivation
+	if carrier == nil {
+		t.Fatal("catalog activation carrier status is missing")
+	}
+	carrierResource := "pgshardcatalogactivations.pgshard.io/" + carrier.Name
+	for _, verb := range []string{"get", "update"} {
+		assertKINDCanI(t, ctx, identity, cluster.Namespace, true, verb, carrierResource)
+		assertKINDCanI(t, ctx, identity, cluster.Namespace, false, verb, "pgshardcatalogactivations.pgshard.io/foreign-object")
+	}
+	for _, verb := range []string{"list", "watch", "create", "deletecollection"} {
+		assertKINDCanI(t, ctx, identity, cluster.Namespace, false, verb, "pgshardcatalogactivations.pgshard.io")
+	}
+	for _, verb := range []string{"patch", "delete"} {
+		assertKINDCanI(t, ctx, identity, cluster.Namespace, false, verb, carrierResource)
+	}
+	for _, verb := range []string{"get", "update", "patch", "delete"} {
+		assertKINDCanISubresource(t, ctx, identity, cluster.Namespace, false, verb, "pgshardcatalogactivations.pgshard.io", carrier.Name, "status")
+	}
 	orchestratorLease := cluster.Name + owned.OrchestratorLeaseSuffix
 	assertKINDCanI(t, ctx, identity, cluster.Namespace, true, "get", "leases.coordination.k8s.io/"+orchestratorLease)
 	assertKINDCanI(t, ctx, identity, cluster.Namespace, true, "update", "leases.coordination.k8s.io/"+orchestratorLease)
