@@ -2322,6 +2322,34 @@ async fn wait_for_authority_loss<F>(
     }
 }
 
+/// Waits for the lifecycle event while owning the catalog-runtime binder, and
+/// drops the binder before returning.
+///
+/// The binder withdraws its published handoff as it drops, so it has to be
+/// destroyed before the caller's teardown runs: performing teardown first would
+/// leave a stale capability observable for as long as process-tree cleanup
+/// takes, and indefinitely if an absence proof blocks. Returning is what
+/// guarantees the drop has already happened.
+async fn await_postmaster_lifecycle_event<B, E>(binder: B, events: E) -> PostmasterLifecycleEvent
+where
+    B: Future<Output = ()>,
+    E: Future<Output = PostmasterLifecycleEvent>,
+{
+    // The binder is pinned inside this block, so leaving the block destroys it
+    // and runs its withdrawal. Pinning at function scope would keep it alive
+    // until the whole future is dropped, which is after the caller has the
+    // event and has begun teardown.
+    let event = {
+        tokio::pin!(binder);
+        tokio::select! {
+            biased;
+            event = events => event,
+            () = &mut binder => unreachable!("catalog runtime binder never completes"),
+        }
+    };
+    event
+}
+
 /// Why the supervised postmaster is leaving its running state.
 ///
 /// The lifecycle select yields one of these instead of performing cleanup
@@ -2576,30 +2604,20 @@ where
             None => std::future::pending::<()>().await,
         }
     };
-    let mut catalog_runtime = Some(Box::pin(catalog_runtime));
     state.set_postgres_process(config.running_process_state());
-    // The select resolves to the lifecycle event only. Cleanup runs after the
-    // binder has been dropped, because the binder withdraws the published
-    // handoff as it drops: awaiting cleanup first would leave the handoff
-    // observable for as long as process-tree teardown takes.
-    let event = tokio::select! {
-        biased;
-        status = wait_pidfd_exit(pidfd) => PostmasterLifecycleEvent::Exited(status),
-        result = &mut evidence_monitor => PostmasterLifecycleEvent::EvidenceLost(result),
-        stop_mode = shutdown.as_mut() => PostmasterLifecycleEvent::Stopped(stop_mode),
-        () = &mut authority_lost => PostmasterLifecycleEvent::AuthorityLost,
-        error = wait_for_target_fence(&mut target_fence) => {
-            PostmasterLifecycleEvent::TargetFenceLost(error)
-        }
-        () = async {
-            match catalog_runtime.as_mut() {
-                Some(binder) => binder.as_mut().await,
-                None => std::future::pending::<()>().await,
+    let event = await_postmaster_lifecycle_event(catalog_runtime, async {
+        tokio::select! {
+            biased;
+            status = wait_pidfd_exit(pidfd) => PostmasterLifecycleEvent::Exited(status),
+            result = &mut evidence_monitor => PostmasterLifecycleEvent::EvidenceLost(result),
+            stop_mode = shutdown.as_mut() => PostmasterLifecycleEvent::Stopped(stop_mode),
+            () = &mut authority_lost => PostmasterLifecycleEvent::AuthorityLost,
+            error = wait_for_target_fence(&mut target_fence) => {
+                PostmasterLifecycleEvent::TargetFenceLost(error)
             }
-        } => unreachable!("catalog runtime binder never completes"),
-    };
-    catalog_runtime = None;
-    drop(catalog_runtime);
+        }
+    })
+    .await;
 
     match event {
         PostmasterLifecycleEvent::Exited(status) => {
@@ -9470,5 +9488,46 @@ mod tests {
         fs::write(path, QUARANTINE_HBA_CONTENT).expect("write quarantine HBA fixture");
         fs::set_permissions(path, fs::Permissions::from_mode(0o400))
             .expect("protect quarantine HBA fixture");
+    }
+
+    /// The binder must be destroyed before the lifecycle event is returned,
+    /// because the caller performs process-tree teardown next and the binder is
+    /// what withdraws the published catalog capability as it drops. The
+    /// previously broken wiring performed teardown inside the select arms with
+    /// the binder still alive, and passed the whole suite regardless.
+    #[tokio::test]
+    async fn a_lifecycle_event_is_returned_only_after_the_binder_is_dropped() {
+        struct DropSentinel(Arc<AtomicBool>);
+        impl Drop for DropSentinel {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        // Captured at construction, not created on first poll: the binder is
+        // never polled when the event is already available, and the point of
+        // the test is that destroying the future still runs the withdrawal.
+        let sentinel = DropSentinel(Arc::clone(&dropped));
+        let binder = async move {
+            let _sentinel = sentinel;
+            std::future::pending::<()>().await;
+        };
+        let observed_at_event = Arc::clone(&dropped);
+        let events = async move {
+            // The binder is still alive while the event resolves.
+            assert!(
+                !observed_at_event.load(Ordering::Acquire),
+                "binder was dropped before its lifecycle event resolved"
+            );
+            PostmasterLifecycleEvent::AuthorityLost
+        };
+
+        let event = await_postmaster_lifecycle_event(binder, events).await;
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "binder outlived the lifecycle event, so teardown would run while the capability is still published"
+        );
+        assert!(matches!(event, PostmasterLifecycleEvent::AuthorityLost));
     }
 }
