@@ -4,9 +4,10 @@
 //! complete API object so the parent-resource `PUT` preserves operator-owned
 //! metadata. Publication performs no read before its one `PUT`; callers can
 //! therefore revalidate in-process authority immediately before polling the
-//! returned future. A definitively rejected write returns to the supervisor for
-//! a completely fresh attempt. An ambiguous write is resolved by exactly one
-//! authoritative `GET` and is never retried.
+//! returned future. A definitively rejected write is terminal. A throttled
+//! write is proven not to have committed and returns to the supervisor for a
+//! completely fresh, budget-bounded attempt. An ambiguous write is resolved by
+//! exactly one authoritative `GET` and is never retried.
 
 use std::time::Duration;
 
@@ -50,6 +51,8 @@ pub(crate) enum CatalogActivationPublicationOutcome {
     ForeignPublication,
     /// Kubernetes proved that the write was rejected before it could commit.
     DefinitiveRejection(DefinitiveCatalogActivationRejection),
+    /// Kubernetes proved that the write was throttled before it could commit.
+    RetryableRejection(RetryableCatalogActivationRejection),
     /// The write result could not be proven after its one resolution read.
     Indeterminate,
 }
@@ -78,6 +81,35 @@ impl DefinitiveCatalogActivationRejection {
             422 => Some(Self::UnprocessableEntity),
             _ => None,
         }
+    }
+}
+
+/// Kubernetes proved this write was throttled before it could commit.
+///
+/// Only HTTP 429 qualifies: the API server emits it from request-filter
+/// paths that run before any write can commit, so re-publication cannot
+/// double-write. No other non-2xx status proves both non-commitment and
+/// transience, so everything else stays definitive or indeterminate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RetryableCatalogActivationRejection {
+    retry_after: Option<Duration>,
+}
+
+impl RetryableCatalogActivationRejection {
+    // The status is fixed by construction; `self` keeps the call sites
+    // symmetric with the definitive-rejection classification.
+    #[allow(clippy::unused_self)]
+    pub(crate) const fn status_code(self) -> u16 {
+        429
+    }
+
+    pub(crate) const fn retry_after(self) -> Option<Duration> {
+        self.retry_after
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn with_retry_after_for_test(retry_after: Option<Duration>) -> Self {
+        Self { retry_after }
     }
 }
 
@@ -219,6 +251,9 @@ async fn publish_with_store<S: CarrierPublicationStore>(
         Ok(Ok(carrier)) => classify_carrier(&carrier, expected, &request, &request_sha256),
         Ok(Err(CatalogActivationPublisherError::DefinitiveRejection(rejection))) => {
             CatalogActivationPublicationOutcome::DefinitiveRejection(rejection)
+        }
+        Ok(Err(CatalogActivationPublisherError::RetryableRejection(rejection))) => {
+            CatalogActivationPublicationOutcome::RetryableRejection(rejection)
         }
         Ok(Err(_)) | Err(_) => {
             resolve_failed_publication(store, expected, &request, &request_sha256, attempt_deadline)
@@ -410,6 +445,12 @@ impl CarrierPublicationStore for KubernetesCarrierPublicationStore {
         {
             Ok(Ok(response)) => {
                 let status = response.status().as_u16();
+                let retry_after = parse_retry_after_seconds(
+                    response
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|value| value.to_str().ok()),
+                );
                 let body = response
                     .into_body()
                     .collect_bytes()
@@ -417,7 +458,7 @@ impl CarrierPublicationStore for KubernetesCarrierPublicationStore {
                     .map_err(|error| {
                         CatalogActivationPublisherError::Kubernetes(Box::new(error))
                     })?;
-                classify_replace_response(status, &body)
+                classify_replace_response(status, retry_after, &body)
             }
             Ok(Err(error)) => Err(CatalogActivationPublisherError::Kubernetes(Box::new(error))),
             Err(_) => Err(CatalogActivationPublisherError::TimedOut),
@@ -427,6 +468,7 @@ impl CarrierPublicationStore for KubernetesCarrierPublicationStore {
 
 fn classify_replace_response(
     wire_status: u16,
+    retry_after: Option<Duration>,
     body: &[u8],
 ) -> Result<DynamicObject, CatalogActivationPublisherError> {
     if (200..300).contains(&wire_status) {
@@ -435,7 +477,8 @@ fn classify_replace_response(
         });
     }
 
-    if let Some(rejection) = DefinitiveCatalogActivationRejection::from_wire_status(wire_status) {
+    let definitive = DefinitiveCatalogActivationRejection::from_wire_status(wire_status);
+    if definitive.is_some() || wire_status == 429 {
         // The response body's Status.code is untrusted and can never authorize a
         // retry. A mismatch can only veto the classification derived from the
         // actual HTTP status line.
@@ -444,8 +487,13 @@ fn classify_replace_response(
             .map(|status| status.code)
             .filter(|code| *code != 0);
         if body_status.is_none_or(|body_status| body_status == wire_status) {
-            return Err(CatalogActivationPublisherError::DefinitiveRejection(
-                rejection,
+            if let Some(rejection) = definitive {
+                return Err(CatalogActivationPublisherError::DefinitiveRejection(
+                    rejection,
+                ));
+            }
+            return Err(CatalogActivationPublisherError::RetryableRejection(
+                RetryableCatalogActivationRejection { retry_after },
             ));
         }
     }
@@ -453,6 +501,13 @@ fn classify_replace_response(
     Err(CatalogActivationPublisherError::KubernetesHttpStatus(
         wire_status,
     ))
+}
+
+// Kubernetes emits Retry-After in delta-seconds form only; an HTTP-date or
+// otherwise malformed value is ignored rather than trusted.
+fn parse_retry_after_seconds(value: Option<&str>) -> Option<Duration> {
+    let seconds: u64 = value?.trim().parse().ok()?;
+    Some(Duration::from_secs(seconds))
 }
 
 /// Fail-closed publisher construction and preflight errors.
@@ -474,6 +529,8 @@ pub(crate) enum CatalogActivationPublisherError {
     TimedOut,
     #[error("catalog-activation Kubernetes PUT was definitively rejected")]
     DefinitiveRejection(DefinitiveCatalogActivationRejection),
+    #[error("catalog-activation Kubernetes PUT was throttled before commit")]
+    RetryableRejection(RetryableCatalogActivationRejection),
     #[error("catalog-activation Kubernetes request returned HTTP {0}")]
     KubernetesHttpStatus(u16),
     #[error("configure in-cluster catalog-activation publisher: {0}")]
@@ -753,12 +810,20 @@ mod tests {
     }
 
     fn wire_failure(wire_status: u16, body_status: u16) -> CatalogActivationPublisherError {
+        wire_failure_with_retry_after(wire_status, body_status, None)
+    }
+
+    fn wire_failure_with_retry_after(
+        wire_status: u16,
+        body_status: u16,
+        retry_after: Option<Duration>,
+    ) -> CatalogActivationPublisherError {
         let body = serde_json::to_vec(
             &Status::failure("untrusted response message", "UntrustedReason")
                 .with_code(body_status),
         )
         .expect("serialize synthetic Kubernetes Status");
-        match classify_replace_response(wire_status, &body) {
+        match classify_replace_response(wire_status, retry_after, &body) {
             Ok(_) => panic!("HTTP {wire_status} must not produce a carrier"),
             Err(error) => error,
         }
@@ -851,7 +916,7 @@ mod tests {
             (401, 401),
             (404, 404),
             (405, 405),
-            (429, 429),
+            (429, 500),
             (500, 500),
         ] {
             let error = wire_failure(wire_status, body_status);
@@ -880,6 +945,51 @@ mod tests {
             assert_eq!(store.replacements().len(), 1);
             assert_eq!(store.get_count(), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn throttled_put_is_retryable_after_one_put_without_a_resolution_read() {
+        let request = request();
+        let request_sha256 = digest(13);
+        for retry_after in [None, Some(Duration::from_secs(7))] {
+            let error = wire_failure_with_retry_after(429, 429, retry_after);
+            assert!(matches!(
+                &error,
+                CatalogActivationPublisherError::RetryableRejection(rejection)
+                    if rejection.status_code() == 429 && rejection.retry_after() == retry_after
+            ));
+            let store = FakeStore::new(
+                vec![Ok(carrier(serde_json::json!({"spec": {}, "status": {}})))],
+                Err(error),
+            );
+            assert!(matches!(
+                publish_with_store(&store, &expected(), pending(&request, &request_sha256)).await,
+                CatalogActivationPublicationOutcome::RetryableRejection(rejection)
+                    if rejection.retry_after() == retry_after
+            ));
+            assert_eq!(store.replacements().len(), 1);
+            assert_eq!(store.get_count(), 1);
+        }
+    }
+
+    #[test]
+    fn retry_after_parses_only_delta_seconds() {
+        assert_eq!(
+            parse_retry_after_seconds(Some("7")),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            parse_retry_after_seconds(Some(" 12 ")),
+            Some(Duration::from_secs(12))
+        );
+        assert_eq!(parse_retry_after_seconds(Some("0")), Some(Duration::ZERO));
+        assert_eq!(
+            parse_retry_after_seconds(Some("Fri, 01 Jan 2027 00:00:00 GMT")),
+            None
+        );
+        assert_eq!(parse_retry_after_seconds(Some("-1")), None);
+        assert_eq!(parse_retry_after_seconds(Some("")), None);
+        assert_eq!(parse_retry_after_seconds(None), None);
     }
 
     #[tokio::test]
