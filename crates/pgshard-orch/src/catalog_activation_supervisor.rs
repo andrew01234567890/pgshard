@@ -33,13 +33,15 @@ use crate::catalog_materialization::{
 use crate::domain::OrchState;
 use crate::topology::CatalogCandidateObservationPlan;
 
-// The two independent proof collectors intentionally discard their previous
-// evidence before every refresh. They use the configured Kubernetes retry
-// period, so polling authority on that same cadence can remain phase-locked
-// with both proof-free refresh windows forever. This shorter local-only poll
-// observes the first overlapping proof window without increasing Kubernetes
-// traffic before initial authority exists.
-const AUTHORITY_POLL_PERIOD: Duration = Duration::from_millis(100);
+// The two independent proof collectors retain their last published proof
+// through every refresh bracket; a proof leaves only when its replacement
+// swaps in, a failure is recorded, or its own freshness deadline expires.
+// Once both collectors have published, the proof overlap is therefore
+// continuously observable at any poll instant regardless of collector
+// phasing. This shorter local-only poll merely shortens the wait for the
+// first overlap without increasing Kubernetes traffic before initial
+// authority exists.
+pub(crate) const AUTHORITY_POLL_PERIOD: Duration = Duration::from_millis(100);
 
 /// Runs the one-shot catalog-activation publisher until shutdown.
 ///
