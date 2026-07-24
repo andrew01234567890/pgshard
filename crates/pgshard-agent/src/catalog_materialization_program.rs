@@ -274,6 +274,28 @@ impl<'a> Scanner<'a> {
     /// Digit separators, exponent signs and decimal points are deliberately not
     /// modelled: leaving those bytes in INITIAL can only widen what is
     /// inspected, never narrow it.
+    /// Consumes a numeric token so that it ends where `psql`'s does, or
+    /// rejects. Modelled against `PostgreSQL` 18 `psqlscan.l`; the numeric
+    /// definitions changed materially in 16 (digit separators, the binary and
+    /// octal forms, junk rules re-tailed to `{identifier}`), so this argument
+    /// must be redone before targeting an older client.
+    ///
+    /// Fifteen flex rules compete here at different lengths over overlapping
+    /// classes, which is why the extent cannot simply be pattern-matched. The
+    /// span stays safe because:
+    /// - it is confined to `[0-9 A-Za-z _ \x80-\xff $ . + -]`, so it can never
+    ///   contain `\`, `'`, `"`, `/`, `*` or `:`;
+    /// - the only INITIAL constructs reachable from that alphabet are `--`,
+    ///   which the sign guard makes unreachable inside the span (every sign
+    ///   must be followed by a digit, so two signs cannot adjoin), and a
+    ///   dollar body;
+    /// - a `$` is absorbed only through the `ident_start` branch, matching
+    ///   flex's `{identifier}` tail, which must begin with `ident_start` and
+    ///   then takes `ident_cont` greedily — same class, same extent;
+    /// - on return, the next byte can be no digit and no `ident_start` (the run
+    ///   would have taken it), and no `.`, `-` or `+` (the postcondition), and
+    ///   a `$` only in the case above. Every remaining byte appears in no flex
+    ///   numeric rule, so `psql`'s token ends there too.
     fn consume_number(&mut self) -> Result<(), CatalogMaterializationProgramError> {
         // Run to a fixpoint rather than as a fixed sequence of steps. A number
         // can re-enter numeric context after a consumed sign — `1-1e-` is a
