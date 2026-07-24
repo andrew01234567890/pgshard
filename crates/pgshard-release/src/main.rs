@@ -2311,6 +2311,12 @@ mod tests {
             .expect("PostgreSQL agent lifecycle trigger");
         for input in [
             "^crates/(pgshard-agent|pgshard-types|pgshard-version)/",
+            // A directory prefix, never a single migration filename: the agent
+            // lifecycle job is the only gate that runs the agent against a live
+            // PostgreSQL, and pinning one file silently skips it — and the
+            // aggregate counts a skipped job as a pass — the moment a second
+            // migration is added.
+            "^crates/pgshard-catalog/migrations/",
             "^extensions/pgshard_fence/",
             "images/rust\\.Dockerfile",
             "images/quarantine\\.pg_hba\\.conf",
@@ -2321,6 +2327,10 @@ mod tests {
                 "PostgreSQL agent trigger must include {input}"
             );
         }
+        assert!(
+            !postgres_agent_trigger.contains("0001_shardschema"),
+            "PostgreSQL agent trigger must not pin an individual migration file"
+        );
         assert!(workflow.contains("if: needs.changes.outputs.postgres_agent == 'true'"));
         for command in [
             "go mod tidy",
