@@ -18,6 +18,7 @@ use tokio::sync::watch;
 #[cfg(test)]
 use crate::boottime::system_clock;
 use crate::boottime::{BoottimeClock, BoottimeInstant};
+use crate::catalog_activation_runtime::CatalogRuntimeBindingAttempt;
 use crate::coordination::{
     self, WritableLeaseConfig, WritableLeaseError, WritableLeaseReleaseOutcome,
     WritableLeaseShutdown,
@@ -154,6 +155,34 @@ impl WritableAuthorityObserver {
         self.snapshot_valid_for(required).as_ref() == Some(expected)
     }
 
+    /// Runs one publication step while the watch still proves the exact
+    /// attempt-private generation and its current deadline exceeds `required`.
+    ///
+    /// The watch borrow remains held through `publish`, so Lease renewal or
+    /// revocation cannot interleave between the final authority check and the
+    /// publication. Deadline renewal is deliberately allowed: the stable
+    /// generation, rather than a mutable Lease `resourceVersion` or deadline,
+    /// is the runtime identity.
+    pub(crate) fn publish_while_generation_current<R>(
+        &self,
+        expected: &DurableWritableGeneration,
+        required: Duration,
+        publish: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let authority = self.authority.borrow();
+        let authority = authority.as_ref()?;
+        if !authority_valid_for(
+            &self.identity,
+            Some(authority),
+            required,
+            self.clock.as_ref(),
+        ) || &authority.generation != expected
+        {
+            return None;
+        }
+        Some(publish())
+    }
+
     /// Returns the exact remaining local boot-clock validity for a still
     /// current authority snapshot.
     pub(crate) fn remaining_validity(
@@ -181,11 +210,33 @@ impl WritableAuthorityObserver {
     /// when a suspend-aware absolute deadline elapses. Clock and timer failures
     /// are treated exactly like lost authority.
     pub(crate) fn wait_until_current_generation_invalid(
-        mut self,
+        self,
         required: Duration,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let expected = self.generation_valid_for(required);
+        let current = self.generation_valid_for(required);
+        self.wait_until_generation_invalid(current, required)
+    }
+
+    /// Waits until `expected` no longer has authority beyond `required`.
+    ///
+    /// A caller that has already acted for a particular generation must bind
+    /// the waiter to THAT generation, not to whatever is current when the
+    /// waiter is built: if another generation is installed in between, binding
+    /// to the current one would wait out the wrong generation and leave the
+    /// caller's work standing. Resolves immediately when `expected` is already
+    /// not the authorized generation.
+    pub(crate) fn wait_until_generation_invalid(
+        mut self,
+        expected: Option<DurableWritableGeneration>,
+        required: Duration,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let still_authorized = expected
+            .as_ref()
+            .is_some_and(|expected| self.generation_valid_for(required).as_ref() == Some(expected));
         Box::pin(async move {
+            if !still_authorized {
+                return;
+            }
             let Some(expected) = expected else {
                 return;
             };
@@ -290,6 +341,7 @@ pub async fn supervise_attempt(
     state: AgentState,
     postgres: PreparedPostgres,
     writable_lease: WritableLeaseConfig,
+    catalog_runtime: CatalogRuntimeBindingAttempt,
     shutdown: watch::Receiver<bool>,
 ) -> Result<WritableAttemptOutcome, WritableAttemptError> {
     let margin = writable_lease.shutdown_margin();
@@ -307,11 +359,12 @@ pub async fn supervise_attempt(
         // Even shutdown before acquisition flows through the writable
         // supervisor so it can produce the linear process-tree absence proof.
         postgres
-            .supervise_with_writable_authority(
+            .supervise_with_writable_authority_and_catalog_runtime(
                 postmaster_state,
                 postmaster_shutdown,
                 margin,
                 postgres_attempt,
+                catalog_runtime,
             )
             .await
     };
@@ -544,6 +597,60 @@ mod tests {
     }
 
     #[test]
+    fn guarded_runtime_publication_uses_stable_generation_not_mutable_deadline() {
+        let clock = Arc::new(crate::boottime::FakeBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        ));
+        let (lease_attempt, postgres_attempt) =
+            writable_attempt_pair_with_clock_for_test(clock.clone());
+        let generation = durable_generation_for_test(1);
+        lease_attempt.install_authority(
+            clock
+                .now()
+                .expect("fake clock")
+                .checked_add(Duration::from_secs(2))
+                .expect("first deadline"),
+            generation.clone(),
+        );
+        let observer = postgres_attempt.authority_observer();
+
+        // A normal Lease renewal changes the deadline but not the stable
+        // generation identity accepted by the request.
+        lease_attempt.install_authority(
+            clock
+                .now()
+                .expect("fake clock")
+                .checked_add(Duration::from_secs(3))
+                .expect("renewed deadline"),
+            generation.clone(),
+        );
+        let mut published = false;
+        assert_eq!(
+            observer.publish_while_generation_current(&generation, Duration::from_secs(1), || {
+                published = true;
+            }),
+            Some(())
+        );
+        assert!(published);
+
+        lease_attempt.install_authority(
+            clock
+                .now()
+                .expect("fake clock")
+                .checked_add(Duration::from_secs(3))
+                .expect("new generation deadline"),
+            durable_generation_for_test(2),
+        );
+        assert!(
+            observer
+                .publish_while_generation_current(&generation, Duration::from_secs(1), || panic!(
+                    "stale generation published"
+                ),)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn suspend_like_jump_and_clock_failure_revoke_private_authority() {
         let clock = Arc::new(crate::boottime::FakeBoottimeClock::new(
             BoottimeInstant::from_nanos_for_test(1_000_000_000),
@@ -609,6 +716,53 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(100), wait)
             .await
             .expect("fake absolute boot deadline wakes promptly");
+    }
+
+    #[tokio::test]
+    async fn a_wait_for_a_superseded_generation_resolves_immediately() {
+        // The race this closes: a caller publishes for one generation, another
+        // is installed, and only then does the caller build its waiter. Binding
+        // to whatever is current would wait out the replacement and leave the
+        // caller's published work standing, so a waiter named for a generation
+        // that is no longer authorized must complete at once.
+        let clock = Arc::new(crate::boottime::FakeBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        ));
+        let (lease_attempt, postgres_attempt) =
+            writable_attempt_pair_with_clock_for_test(clock.clone());
+        let deadline = clock
+            .now()
+            .expect("fake clock")
+            .checked_add(Duration::from_mins(1))
+            .expect("test deadline fits");
+        let acted_for = durable_generation_for_test(1);
+        lease_attempt.install_authority(deadline, acted_for.clone());
+        lease_attempt.install_authority(deadline, durable_generation_for_test(2));
+
+        let wait = postgres_attempt
+            .authority_observer()
+            .wait_until_generation_invalid(Some(acted_for), Duration::ZERO);
+        tokio::time::timeout(Duration::from_millis(100), wait)
+            .await
+            .expect("a superseded generation is already invalid");
+
+        // The still-authorized generation keeps waiting, so the check is not
+        // simply resolving for everything.
+        let current = postgres_attempt
+            .authority_observer()
+            .generation_valid_for(Duration::ZERO)
+            .expect("authority installed");
+        let mut wait = Box::pin(
+            postgres_attempt
+                .authority_observer()
+                .wait_until_generation_invalid(Some(current), Duration::ZERO),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut wait)
+                .await
+                .is_err(),
+            "the authorized generation must still be waited on"
+        );
     }
 
     #[tokio::test]

@@ -92,6 +92,15 @@ pub struct CatalogMaterializationHandoff {
     receiver: watch::Receiver<Option<Arc<ValidatedCatalogStaticInputs>>>,
 }
 
+impl CatalogMaterializationHandoff {
+    /// Moves the private receiver into the writable-runtime binding.
+    pub(crate) fn into_receiver(
+        self,
+    ) -> watch::Receiver<Option<Arc<ValidatedCatalogStaticInputs>>> {
+        self.receiver
+    }
+}
+
 /// Exact request-bound materialization program and scalars. This type is
 /// deliberately private, move-only, non-serializable, and non-debuggable.
 #[allow(
@@ -290,7 +299,7 @@ async fn wait_for_retry_or_change(
     }
 }
 
-fn exact_acceptance(
+pub(crate) fn exact_acceptance(
     left: &DurablyAcceptedCatalogActivation,
     right: &DurablyAcceptedCatalogActivation,
 ) -> bool {

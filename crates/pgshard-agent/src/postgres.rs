@@ -37,6 +37,9 @@ use tokio::sync::mpsc;
 use tokio::sync::{oneshot, watch};
 use tokio::time::{Instant, sleep, timeout};
 
+use crate::catalog_activation_runtime::{
+    CatalogRuntimeBindingAttempt, supervise_catalog_runtime_binding,
+};
 use crate::domain::{
     ActivationConfigEvidence, ActivationPostgresConfig, AgentIdentity, AgentState,
     PostgresProcessState, canonical_linux_boot_id,
@@ -70,6 +73,12 @@ struct AuthorityLossFutures {
     publication: Option<AuthorityLossFuture>,
     running: Option<AuthorityLossFuture>,
     target: Option<WritableAuthorityObserver>,
+}
+
+struct CatalogRuntimeSupervision {
+    binding: CatalogRuntimeBindingAttempt,
+    authority: WritableAuthorityObserver,
+    required_margin: Duration,
 }
 const PG_CONTROL_FILE_SIZE: u64 = 8_192;
 const MAX_POSTGRES_LOCK_FILE_BYTES: u64 = 8_192;
@@ -973,6 +982,7 @@ impl PreparedPostgres {
             },
             || PostgresStartDecision::Start,
             None,
+            None,
         )
         .await
     }
@@ -989,12 +999,49 @@ impl PreparedPostgres {
     ///
     /// Returns an error if startup authority is absent or if validation,
     /// process creation, supervision, or target fencing fails.
+    #[cfg(test)]
     pub(crate) async fn supervise_with_writable_authority(
         self,
         state: AgentState,
         shutdown: watch::Receiver<bool>,
         required_margin: Duration,
         attempt: WritablePostgresAttempt,
+    ) -> Result<WritablePostgresStopped, PostgresError> {
+        self.supervise_with_optional_catalog_runtime(
+            state,
+            shutdown,
+            required_margin,
+            attempt,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn supervise_with_writable_authority_and_catalog_runtime(
+        self,
+        state: AgentState,
+        shutdown: watch::Receiver<bool>,
+        required_margin: Duration,
+        attempt: WritablePostgresAttempt,
+        catalog_runtime: CatalogRuntimeBindingAttempt,
+    ) -> Result<WritablePostgresStopped, PostgresError> {
+        self.supervise_with_optional_catalog_runtime(
+            state,
+            shutdown,
+            required_margin,
+            attempt,
+            Some(catalog_runtime),
+        )
+        .await
+    }
+
+    async fn supervise_with_optional_catalog_runtime(
+        self,
+        state: AgentState,
+        shutdown: watch::Receiver<bool>,
+        required_margin: Duration,
+        attempt: WritablePostgresAttempt,
+        catalog_runtime: Option<CatalogRuntimeBindingAttempt>,
     ) -> Result<WritablePostgresStopped, PostgresError> {
         if self.config.forbids_writable_authority() {
             state.clear_lease();
@@ -1009,6 +1056,11 @@ impl PreparedPostgres {
             .config
             .requires_writable_authority()
             .then(|| attempt.authority_observer());
+        let catalog_runtime = catalog_runtime.map(|binding| CatalogRuntimeSupervision {
+            binding,
+            authority: attempt.authority_observer(),
+            required_margin,
+        });
         Box::pin(self.supervise_with_writable_authority_guard_and_loss(
             state,
             shutdown,
@@ -1022,6 +1074,7 @@ impl PreparedPostgres {
                 ),
                 target,
             }),
+            catalog_runtime,
             attempt,
         ))
         .await
@@ -1038,13 +1091,14 @@ impl PreparedPostgres {
     where
         G: Fn() -> Option<DurableWritableGeneration>,
     {
-        self.supervise_with_writable_authority_guard_and_loss(
+        Box::pin(self.supervise_with_writable_authority_guard_and_loss(
             state,
             shutdown,
             startup_guard,
             None,
+            None,
             attempt,
-        )
+        ))
         .await
     }
 
@@ -1054,6 +1108,7 @@ impl PreparedPostgres {
         mut shutdown: watch::Receiver<bool>,
         startup_guard: G,
         authority_loss: Option<AuthorityLossFutures>,
+        catalog_runtime: Option<CatalogRuntimeSupervision>,
         attempt: WritablePostgresAttempt,
     ) -> Result<WritablePostgresStopped, PostgresError>
     where
@@ -1089,6 +1144,7 @@ impl PreparedPostgres {
                 }
             },
             authority_loss,
+            catalog_runtime,
         )
         .await?;
         Ok(WritablePostgresStopped { attempt })
@@ -1101,6 +1157,7 @@ impl PreparedPostgres {
         shutdown: impl Future<Output = PostgresStopMode>,
         startup_guard: G,
         mut authority_loss: Option<AuthorityLossFutures>,
+        mut catalog_runtime: Option<CatalogRuntimeSupervision>,
     ) -> Result<(), PostgresError>
     where
         G: Fn() -> PostgresStartDecision,
@@ -1205,6 +1262,7 @@ impl PreparedPostgres {
             &startup_guard,
             running_authority_loss,
             target_fence,
+            catalog_runtime.take(),
         )
         .await;
         process_group_fence.disarm_if_reaped();
@@ -2264,6 +2322,46 @@ async fn wait_for_authority_loss<F>(
     }
 }
 
+/// Waits for the lifecycle event while owning the catalog-runtime binder, and
+/// drops the binder before returning.
+///
+/// The binder withdraws its published handoff as it drops, so it has to be
+/// destroyed before the caller's teardown runs: performing teardown first would
+/// leave a stale capability observable for as long as process-tree cleanup
+/// takes, and indefinitely if an absence proof blocks. Returning is what
+/// guarantees the drop has already happened.
+async fn await_postmaster_lifecycle_event<B, E>(binder: B, events: E) -> PostmasterLifecycleEvent
+where
+    B: Future<Output = ()>,
+    E: Future<Output = PostmasterLifecycleEvent>,
+{
+    // What guarantees the ordering is that this helper owns the binder: the
+    // caller cannot reach teardown without this call returning, and it cannot
+    // return without destroying the binder. The block only makes the point of
+    // destruction explicit at the call site.
+    {
+        tokio::pin!(binder);
+        tokio::select! {
+            biased;
+            event = events => event,
+            () = &mut binder => unreachable!("catalog runtime binder never completes"),
+        }
+    }
+}
+
+/// Why the supervised postmaster is leaving its running state.
+///
+/// The lifecycle select yields one of these instead of performing cleanup
+/// inline, so the catalog-runtime binder can be dropped — withdrawing its
+/// published handoff — before any teardown is awaited.
+enum PostmasterLifecycleEvent {
+    Exited(Result<ExitStatus, PostgresError>),
+    EvidenceLost(Result<(), ReplicationEvidenceError>),
+    Stopped(PostgresStopMode),
+    AuthorityLost,
+    TargetFenceLost(PostgresFenceError),
+}
+
 async fn wait_for_target_fence(target_fence: &mut Option<TargetFenceFuture>) -> PostgresFenceError {
     match target_fence.as_mut() {
         Some(target_fence) => match target_fence.as_mut().await {
@@ -2308,6 +2406,7 @@ async fn supervise_running_postmaster<F, G>(
     startup_guard: &G,
     authority_deadline: Option<AuthorityLossFuture>,
     target_fence: Option<TargetFenceFuture>,
+    catalog_runtime: Option<CatalogRuntimeSupervision>,
 ) -> Result<(), PostgresError>
 where
     F: Future<Output = PostgresStopMode>,
@@ -2338,6 +2437,7 @@ where
             startup_guard,
             authority_deadline,
             target_fence,
+            catalog_runtime,
         )
         .await;
     }
@@ -2453,7 +2553,7 @@ where
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn supervise_replication_source<F, G>(
     state: &AgentState,
     process: &mut PostgresProcessFence,
@@ -2465,6 +2565,7 @@ async fn supervise_replication_source<F, G>(
     startup_guard: &G,
     authority_deadline: Option<AuthorityLossFuture>,
     mut target_fence: Option<TargetFenceFuture>,
+    catalog_runtime: Option<CatalogRuntimeSupervision>,
 ) -> Result<(), PostgresError>
 where
     F: Future<Output = PostgresStopMode>,
@@ -2484,10 +2585,41 @@ where
     ));
     let authority_lost = wait_for_authority_loss(&authority_exact, authority_deadline);
     tokio::pin!(authority_lost);
+    let catalog_runtime = async {
+        match catalog_runtime {
+            Some(catalog_runtime) => {
+                supervise_catalog_runtime_binding(
+                    catalog_runtime.binding,
+                    &config.socket_dir,
+                    generation,
+                    catalog_runtime.authority,
+                    catalog_runtime.required_margin,
+                    u32::try_from(process_group.as_raw_pid())
+                        .expect("positive PostgreSQL PID fits u32"),
+                    read_linux_boot_id(),
+                )
+                .await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
     state.set_postgres_process(config.running_process_state());
-    tokio::select! {
-        biased;
-        status = wait_pidfd_exit(pidfd) => {
+    let event = await_postmaster_lifecycle_event(catalog_runtime, async {
+        tokio::select! {
+            biased;
+            status = wait_pidfd_exit(pidfd) => PostmasterLifecycleEvent::Exited(status),
+            result = &mut evidence_monitor => PostmasterLifecycleEvent::EvidenceLost(result),
+            stop_mode = shutdown.as_mut() => PostmasterLifecycleEvent::Stopped(stop_mode),
+            () = &mut authority_lost => PostmasterLifecycleEvent::AuthorityLost,
+            error = wait_for_target_fence(&mut target_fence) => {
+                PostmasterLifecycleEvent::TargetFenceLost(error)
+            }
+        }
+    })
+    .await;
+
+    match event {
+        PostmasterLifecycleEvent::Exited(status) => {
             state.clear_replication_evidence();
             state.set_postgres_process(PostgresProcessState::Stopping);
             let error = cleanup_after_error(
@@ -2499,43 +2631,39 @@ where
                     Ok(status) => PostgresError::UnexpectedExit(status),
                     Err(error) => error,
                 },
-            ).await;
+            )
+            .await;
             state.set_postgres_process(PostgresProcessState::Failed);
             Err(error)
         }
-        result = &mut evidence_monitor => {
-            Err(cleanup_tracked_startup_failure(
-                state,
-                process,
-                pidfd,
-                process_group,
-                replication_evidence_error(result),
-            ).await)
-        }
-        stop_mode = shutdown.as_mut() => {
+        PostmasterLifecycleEvent::EvidenceLost(result) => Err(cleanup_tracked_startup_failure(
+            state,
+            process,
+            pidfd,
+            process_group,
+            replication_evidence_error(result),
+        )
+        .await),
+        PostmasterLifecycleEvent::Stopped(stop_mode) => {
             drop(evidence_monitor);
-            stop_tracked_postmaster(
-                state, process, pidfd, process_group, config, stop_mode,
-            ).await
+            stop_tracked_postmaster(state, process, pidfd, process_group, config, stop_mode).await
         }
-        () = &mut authority_lost => {
-            Err(cleanup_tracked_startup_failure(
-                state,
-                process,
-                pidfd,
-                process_group,
-                PostgresError::StartupAuthorityChanged,
-            ).await)
-        }
-        error = wait_for_target_fence(&mut target_fence) => {
-            Err(cleanup_tracked_startup_failure(
-                state,
-                process,
-                pidfd,
-                process_group,
-                PostgresError::from(error),
-            ).await)
-        }
+        PostmasterLifecycleEvent::AuthorityLost => Err(cleanup_tracked_startup_failure(
+            state,
+            process,
+            pidfd,
+            process_group,
+            PostgresError::StartupAuthorityChanged,
+        )
+        .await),
+        PostmasterLifecycleEvent::TargetFenceLost(error) => Err(cleanup_tracked_startup_failure(
+            state,
+            process,
+            pidfd,
+            process_group,
+            PostgresError::from(error),
+        )
+        .await),
     }
 }
 
@@ -9359,5 +9487,46 @@ mod tests {
         fs::write(path, QUARANTINE_HBA_CONTENT).expect("write quarantine HBA fixture");
         fs::set_permissions(path, fs::Permissions::from_mode(0o400))
             .expect("protect quarantine HBA fixture");
+    }
+
+    /// The binder must be destroyed before the lifecycle event is returned,
+    /// because the caller performs process-tree teardown next and the binder is
+    /// what withdraws the published catalog capability as it drops. The
+    /// previously broken wiring performed teardown inside the select arms with
+    /// the binder still alive, and passed the whole suite regardless.
+    #[tokio::test]
+    async fn a_lifecycle_event_is_returned_only_after_the_binder_is_dropped() {
+        struct DropSentinel(Arc<AtomicBool>);
+        impl Drop for DropSentinel {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        // Captured at construction, not created on first poll: the binder is
+        // never polled when the event is already available, and the point of
+        // the test is that destroying the future still runs the withdrawal.
+        let sentinel = DropSentinel(Arc::clone(&dropped));
+        let binder = async move {
+            let _sentinel = sentinel;
+            std::future::pending::<()>().await;
+        };
+        let observed_at_event = Arc::clone(&dropped);
+        let events = async move {
+            // The binder is still alive while the event resolves.
+            assert!(
+                !observed_at_event.load(Ordering::Acquire),
+                "binder was dropped before its lifecycle event resolved"
+            );
+            PostmasterLifecycleEvent::AuthorityLost
+        };
+
+        let event = await_postmaster_lifecycle_event(binder, events).await;
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "binder outlived the lifecycle event, so teardown would run while the capability is still published"
+        );
+        assert!(matches!(event, PostmasterLifecycleEvent::AuthorityLost));
     }
 }
