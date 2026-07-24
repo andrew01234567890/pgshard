@@ -186,6 +186,7 @@ spec:
                 format: int32
                 type: integer
               observability:
+                default: {}
                 properties:
                   openTelemetryEndpoint:
                     maxLength: 2048
@@ -198,8 +199,17 @@ spec:
                     type: boolean
                 type: object
               pooler:
+                default: {}
                 properties:
                   scaling:
+                    default:
+                      hpa: {}
+                      mode: HPA
+                    description: |-
+                      An omitted scaling block means the documented autoscaling defaults, so it
+                      defaults to a complete HPA configuration rather than to an empty object
+                      that would then fail validation for a missing hpa. An explicit block is
+                      left exactly as written, so Fixed mode is unaffected.
                     properties:
                       fixed:
                         properties:
@@ -238,6 +248,11 @@ spec:
                         - Fixed
                         type: string
                     type: object
+                    x-kubernetes-validations:
+                    - message: hpa is required and fixed forbidden when mode is HPA;
+                        fixed is required and hpa forbidden when mode is Fixed
+                      rule: 'self.mode == ''HPA'' ? has(self.hpa) && !has(self.fixed)
+                        : has(self.fixed) && !has(self.hpa)'
                 type: object
               postgresql:
                 properties:
@@ -319,8 +334,10 @@ spec:
                 - resources
                 type: object
               services:
+                default: {}
                 properties:
                   r:
+                    default: {}
                     properties:
                       annotations:
                         additionalProperties:
@@ -337,6 +354,7 @@ spec:
                         type: string
                     type: object
                   ro:
+                    default: {}
                     properties:
                       annotations:
                         additionalProperties:
@@ -353,6 +371,7 @@ spec:
                         type: string
                     type: object
                   rw:
+                    default: {}
                     properties:
                       annotations:
                         additionalProperties:
