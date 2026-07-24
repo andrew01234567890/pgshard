@@ -240,10 +240,6 @@ async fn supervise_catalog_runtime_binding_with_connector<C, F>(
             continue;
         }
 
-        // Held in an Option so the in-flight connector can actually be
-        // dropped: parking inside a select arm would keep it alive and
-        // unpolled instead of cancelling it.
-        let mut connection = Some(Box::pin(connect(socket_dir.clone(), generation.clone())));
         // Bound to the generation this attempt acts for, not to whatever is
         // current now: another generation installed in between would otherwise
         // be waited out in its place, leaving this attempt's work standing.
@@ -251,26 +247,26 @@ async fn supervise_catalog_runtime_binding_with_connector<C, F>(
             .clone()
             .wait_until_generation_invalid(Some(generation.clone()), required_margin);
         tokio::pin!(authority_lost);
-        let outcome = tokio::select! {
-            result = async {
-                match connection.as_mut() {
-                    Some(connection) => connection.as_mut().await,
-                    None => std::future::pending().await,
+        // The connector lives only for this block, so leaving the block
+        // destroys it. Every arm yields an event and awaits nothing: parking
+        // or awaiting inside an arm would keep the connector alive and
+        // unpolled instead of cancelling it.
+        let outcome = {
+            let connection = connect(socket_dir.clone(), generation.clone());
+            tokio::pin!(connection);
+            tokio::select! {
+                result = &mut connection => ConnectOutcome::Connected(result),
+                changed = attempt.inputs.changed() => {
+                    if changed.is_err() {
+                        ConnectOutcome::Closed
+                    } else {
+                        ConnectOutcome::Restart
+                    }
                 }
-            } => ConnectOutcome::Connected(result),
-            changed = attempt.inputs.changed() => {
-                if changed.is_err() {
-                    ConnectOutcome::Closed
-                } else {
-                    ConnectOutcome::Restart
-                }
+                () = attempt.output.closed() => ConnectOutcome::Closed,
+                () = &mut authority_lost => ConnectOutcome::Restart,
             }
-            () = attempt.output.closed() => ConnectOutcome::Closed,
-            () = &mut authority_lost => ConnectOutcome::Restart,
         };
-        // Cancels the connector before anything else is awaited.
-        connection = None;
-        drop(connection);
         let connected = match outcome {
             ConnectOutcome::Connected(connected) => connected,
             ConnectOutcome::Restart => continue,
@@ -994,6 +990,88 @@ mod tests {
         assert!(output.borrow().is_none());
         assert!(!signals.published.load(Ordering::Acquire));
         assert_eq!(signals.dropped.load(Ordering::Acquire), 1);
+    }
+
+    /// Starts a supervisor whose connector blocks, waits until it is in flight,
+    /// runs `disturb`, and requires the connector to have been dropped rather
+    /// than left alive and unpolled.
+    async fn assert_inflight_connection_is_cancelled_by(
+        disturb: impl FnOnce(StaticInputSender, RuntimeOutputReceiver),
+    ) {
+        let (inputs, generation) = fixture();
+        let (input, attempt, output) = channels(Arc::new(inputs));
+        let (_clock, _lease, authority) = authority(&generation);
+        let signals = TestSessionSignals::new();
+        let (release, released) = oneshot::channel();
+        let released = Arc::new(Mutex::new(Some(released)));
+        let (started, mut started_receiver) = watch::channel(false);
+        let (finished, mut finished_receiver) = watch::channel(false);
+        let connector_signals = signals.clone();
+        let connector_release = Arc::clone(&released);
+        let connector = move |_: PathBuf, _: DurableWritableGeneration| {
+            let released = connector_release.lock().expect("release lock").take();
+            let started = started.clone();
+            let finished = finished.clone();
+            let signals = connector_signals.clone();
+            async move {
+                let Some(released) = released else {
+                    std::future::pending::<()>().await;
+                    unreachable!("pending connector completed");
+                };
+                started.send_replace(true);
+                let _completion = ConnectionAttemptCompletion(finished);
+                let _ = released.await;
+                Some(signals.connection())
+            }
+        };
+        let task = spawn_test_runtime(attempt, generation, authority, connector);
+
+        timeout(Duration::from_secs(1), async {
+            while !*started_receiver.borrow_and_update() {
+                started_receiver
+                    .changed()
+                    .await
+                    .expect("connector start watch");
+            }
+        })
+        .await
+        .expect("connector started");
+
+        disturb(input, output);
+
+        timeout(Duration::from_secs(1), async {
+            while !*finished_receiver.borrow_and_update() {
+                finished_receiver
+                    .changed()
+                    .await
+                    .expect("connector completion watch");
+            }
+        })
+        .await
+        .expect("inflight connector was cancelled");
+        assert!(
+            release.send(()).is_err(),
+            "connector still held its release gate"
+        );
+        assert!(!signals.published.load(Ordering::Acquire));
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn closing_the_input_channel_cancels_an_inflight_connection() {
+        // Sending None also cancels, but it leaves the channel open; a closed
+        // channel used to park inside the select arm, keeping the connector
+        // alive and unpolled instead of dropping it.
+        assert_inflight_connection_is_cancelled_by(|input, _output| drop(input)).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_the_output_handoff_cancels_an_inflight_connection() {
+        // The output handoff closing was not observed at all during a
+        // connection, so the connector ran on for a receiver that had gone.
+        assert_inflight_connection_is_cancelled_by(|_input, output| drop(output)).await;
     }
 
     #[tokio::test]

@@ -733,7 +733,7 @@ mod tests {
         let deadline = clock
             .now()
             .expect("fake clock")
-            .checked_add(Duration::from_secs(60))
+            .checked_add(Duration::from_mins(1))
             .expect("test deadline fits");
         let acted_for = durable_generation_for_test(1);
         lease_attempt.install_authority(deadline, acted_for.clone());
