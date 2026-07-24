@@ -1401,6 +1401,15 @@ if [[ ! -f "$database_topology_preflight" || -L "$database_topology_preflight" ]
   echo "database topology preflight is missing or not a regular file" >&2
   exit 1
 fi
+# A pre-existing catalog is proved compatible before the forward migration
+# touches it, so a conflicting restore is rejected with the catalog unchanged.
+if [[ "$catalog_core_tables" == "t|t|t" ]]; then
+  PGOPTIONS="$PGOPTIONS -c default_transaction_isolation=read\\ committed -c pgshard.bootstrap_allow_empty_database_topology=$catalog_genesis_pending" \
+    psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+      --set=ON_ERROR_STOP=1 --single-transaction \
+      --file="$database_topology_preflight" >/dev/null
+fi
+
 psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
   --set=ON_ERROR_STOP=1 --file="$PGSHARD_SHARDSCHEMA_MIGRATION"
 
