@@ -42,8 +42,10 @@ const MAX_CONCURRENT_BINDINGS: usize = 64;
 const MAXIMUM_WRITABLE_LEASE_DURATION_SECONDS: i32 = 300;
 const GO_ZERO_TIME_UNIX_SECONDS: i64 = -62_135_596_800;
 
-/// Repeatedly observes the complete finite target set without retaining stale
-/// evidence between attempts.
+/// Repeatedly observes the complete finite target set. Each attempt clears only
+/// the public collection diagnostic; the last exact proof stays live as
+/// authority until a fresh complete observation swaps it in, or a recorded
+/// failure, shutdown, or deadline expiry clears it.
 pub async fn supervise(
     targets: Vec<UnboundAgentObservationTarget>,
     state: OrchState,
@@ -89,8 +91,10 @@ async fn supervise_with_store<S: IdentityStore, C: AgentStatusCollector>(
         if *shutdown.borrow() {
             break;
         }
-        // Clear first: an earlier observation is never treated as last-good
-        // evidence while a newer collection is incomplete.
+        // Each attempt clears only the public collection diagnostic; the exact
+        // proof from a prior complete observation stays live (retained until a
+        // fresh observation swaps it in, or failure/shutdown/expiry clears it),
+        // so an incomplete newer collection never drops last-good authority.
         let result = tokio::select! {
             biased;
             changed = shutdown.changed() => {
