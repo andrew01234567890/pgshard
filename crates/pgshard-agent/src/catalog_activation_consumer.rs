@@ -243,8 +243,16 @@ impl DurablyAcceptedCatalogActivation {
 /// fail-closed handoff for a later dormant materializer composition.
 #[must_use = "dropping the catalog-activation handoff closes its private watch"]
 pub struct CatalogActivationHandoff {
-    #[allow(dead_code, reason = "retained for the next dormant materializer slice")]
     receiver: watch::Receiver<Option<Arc<DurablyAcceptedCatalogActivation>>>,
+}
+
+impl CatalogActivationHandoff {
+    /// Moves the private receiver into the next dormant activation stage.
+    pub(crate) fn into_receiver(
+        self,
+    ) -> watch::Receiver<Option<Arc<DurablyAcceptedCatalogActivation>>> {
+        self.receiver
+    }
 }
 
 #[derive(Clone)]
@@ -1173,7 +1181,7 @@ async fn complete_or_shutdown<F: Future>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::os::unix::fs::symlink;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -1389,7 +1397,7 @@ mod tests {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn request() -> CatalogActivationRequest {
+    pub(crate) fn request() -> CatalogActivationRequest {
         CatalogActivationRequest {
             schema_version: CATALOG_ACTIVATION_REQUEST_VERSION.to_owned(),
             carrier: KubernetesObjectIdentity {
@@ -1507,6 +1515,31 @@ mod tests {
                 replay_lsn: "4294967396".into(),
             },
         }
+    }
+
+    pub(crate) fn accepted(
+        request: CatalogActivationRequest,
+    ) -> Arc<DurablyAcceptedCatalogActivation> {
+        let acceptance = DurableCatalogActivationAcceptance::for_test(
+            request.carrier.uid.clone(),
+            request.sha256().expect("canonical request"),
+            request.source.pod_name.clone(),
+            request.source.pod_uid.clone(),
+        );
+        Arc::new(DurablyAcceptedCatalogActivation {
+            acceptance,
+            request,
+        })
+    }
+
+    pub(crate) fn handoff(
+        initial: Option<Arc<DurablyAcceptedCatalogActivation>>,
+    ) -> (
+        watch::Sender<Option<Arc<DurablyAcceptedCatalogActivation>>>,
+        CatalogActivationHandoff,
+    ) {
+        let (sender, receiver) = watch::channel(initial);
+        (sender, CatalogActivationHandoff { receiver })
     }
 
     async fn accepted_fixture(

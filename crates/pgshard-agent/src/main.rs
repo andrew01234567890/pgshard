@@ -1,7 +1,12 @@
 //! `pgshard-agent` Linux container entry point.
 
 use pgshard_agent::catalog_activation_consumer::{
-    CatalogActivationCapabilityState, spawn_catalog_activation_consumer,
+    CatalogActivationCapabilityState, CatalogActivationConsumerConfig,
+    spawn_catalog_activation_consumer,
+};
+use pgshard_agent::catalog_activation_static_inputs::{
+    CatalogActivationStaticInputsConfig, CatalogMaterializationHandoff,
+    spawn_catalog_activation_static_input_verifier,
 };
 use pgshard_agent::catalog_activation_tls::spawn_catalog_activation_tls_server;
 use pgshard_agent::config::{AgentConfig, ConfigError};
@@ -66,6 +71,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         postgres,
         activation_config,
         catalog_activation_consumer,
+        catalog_activation_static_inputs,
         catalog_activation_tls,
     } = config;
     let telemetry = telemetry.status();
@@ -79,14 +85,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(activation_config) = activation_config {
         state.set_activation_config(activation_config);
     }
-    let catalog_activation = if catalog_activation_consumer.is_some() {
-        CatalogActivationCapabilityState::configured()
-    } else {
-        CatalogActivationCapabilityState::disabled()
-    };
-    let _catalog_activation_handoff = spawn_catalog_activation_consumer(
+    let (catalog_activation, _catalog_materialization_handoff) = spawn_catalog_activation_stages(
         catalog_activation_consumer,
-        catalog_activation.clone(),
+        catalog_activation_static_inputs,
         shutdown_rx.clone(),
     );
     let postgres_config = postgres;
@@ -135,6 +136,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     result?;
     tracing::info!("agent shutdown complete");
     Ok(())
+}
+
+fn spawn_catalog_activation_stages(
+    consumer: Option<CatalogActivationConsumerConfig>,
+    static_inputs: Option<CatalogActivationStaticInputsConfig>,
+    shutdown: watch::Receiver<bool>,
+) -> (
+    CatalogActivationCapabilityState,
+    CatalogMaterializationHandoff,
+) {
+    let capability = if consumer.is_some() {
+        CatalogActivationCapabilityState::configured()
+    } else {
+        CatalogActivationCapabilityState::disabled()
+    };
+    let accepted =
+        spawn_catalog_activation_consumer(consumer, capability.clone(), shutdown.clone());
+    let materialization =
+        spawn_catalog_activation_static_input_verifier(static_inputs, accepted, shutdown);
+    (capability, materialization)
 }
 
 #[allow(clippy::too_many_arguments)]
