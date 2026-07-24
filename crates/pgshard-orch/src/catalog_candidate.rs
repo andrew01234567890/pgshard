@@ -2264,7 +2264,7 @@ mod tests {
                 target.target_agent_dns_name(),
                 "demo-shard-0000-0.demo-shard-0000.ns.svc"
             );
-            assert_eq!(target.target_agent_http_port(), 8_080);
+            assert_eq!(target.target_agent_tls_port(), 8_443);
             assert_eq!(target.capability_path(), "/capabilities/catalog-activation");
 
             let live_writable_lease = exact_replication_proof(&plan).writable_lease;

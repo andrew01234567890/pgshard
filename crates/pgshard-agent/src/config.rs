@@ -11,6 +11,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::catalog_activation_consumer::CatalogActivationConsumerConfig;
+use crate::catalog_activation_tls::{CatalogActivationTlsConfig, CatalogActivationTlsConfigError};
 use crate::coordination::WritableLeaseConfig;
 use crate::domain::{ActivationConfigEvidence, AgentIdentity};
 use crate::postgres::{
@@ -38,6 +39,8 @@ pub struct AgentConfig {
     pub activation_config: Option<ActivationConfigEvidence>,
     /// Optional dormant catalog-activation consumer.
     pub catalog_activation_consumer: Option<CatalogActivationConsumerConfig>,
+    /// Optional dedicated TLS endpoint for the dormant consumer capability.
+    pub catalog_activation_tls: Option<CatalogActivationTlsConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -111,6 +114,15 @@ struct RawConfig {
 
     #[arg(long, env = "PGSHARD_CATALOG_ACTIVATION_JOURNAL_ROOT")]
     catalog_activation_journal_root: Option<PathBuf>,
+
+    #[arg(long, env = "PGSHARD_CATALOG_ACTIVATION_TLS_BIND")]
+    catalog_activation_tls_bind: Option<SocketAddr>,
+
+    #[arg(long, env = "PGSHARD_CATALOG_ACTIVATION_TLS_CERT_FILE")]
+    catalog_activation_tls_cert_file: Option<PathBuf>,
+
+    #[arg(long, env = "PGSHARD_CATALOG_ACTIVATION_TLS_KEY_FILE")]
+    catalog_activation_tls_key_file: Option<PathBuf>,
 
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
@@ -308,6 +320,7 @@ impl AgentConfig {
     ///
     /// Returns an error for unknown arguments, invalid values, or unsafe
     /// identifiers.
+    #[allow(clippy::too_many_lines)]
     pub fn try_parse_from<I, T>(args: I) -> Result<Self, ConfigError>
     where
         I: IntoIterator<Item = T>,
@@ -399,6 +412,13 @@ impl AgentConfig {
             raw.catalog_activation_carrier_uid,
             raw.catalog_activation_journal_root,
         )?;
+        let catalog_activation_tls = build_catalog_activation_tls(
+            raw.http_bind,
+            raw.catalog_activation_tls_bind,
+            raw.catalog_activation_tls_cert_file,
+            raw.catalog_activation_tls_key_file,
+            catalog_activation_consumer.is_some(),
+        )?;
 
         let otlp_endpoint = raw
             .otlp_endpoint
@@ -416,8 +436,33 @@ impl AgentConfig {
             postgres,
             activation_config,
             catalog_activation_consumer,
+            catalog_activation_tls,
         })
     }
+}
+
+fn build_catalog_activation_tls(
+    http_bind: SocketAddr,
+    bind: Option<SocketAddr>,
+    certificate_path: Option<PathBuf>,
+    private_key_path: Option<PathBuf>,
+    consumer_configured: bool,
+) -> Result<Option<CatalogActivationTlsConfig>, ConfigError> {
+    let supplied = bind.is_some() || certificate_path.is_some() || private_key_path.is_some();
+    if !supplied {
+        return Ok(None);
+    }
+    let (Some(bind), Some(certificate_path), Some(private_key_path)) =
+        (bind, certificate_path, private_key_path)
+    else {
+        return Err(ConfigError::IncompleteCatalogActivationTls);
+    };
+    if !consumer_configured {
+        return Err(ConfigError::CatalogActivationTlsRequiresConsumer);
+    }
+    CatalogActivationTlsConfig::new(bind, certificate_path, private_key_path, http_bind)
+        .map(Some)
+        .map_err(ConfigError::from)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -682,6 +727,17 @@ pub enum ConfigError {
     /// Carrier, cluster, Pod, or journal identity is unsafe or inconsistent.
     #[error("catalog-activation consumer identity or journal root is invalid")]
     InvalidCatalogActivationConsumerIdentity,
+    /// Only part of the dedicated capability TLS endpoint was supplied.
+    #[error(
+        "catalog-activation TLS bind, certificate file, and private-key file must be supplied together"
+    )]
+    IncompleteCatalogActivationTls,
+    /// A TLS capability endpoint without the carrier consumer has no identity.
+    #[error("catalog-activation TLS endpoint requires the catalog-activation consumer")]
+    CatalogActivationTlsRequiresConsumer,
+    /// The dedicated TLS endpoint address or paths are unsafe.
+    #[error(transparent)]
+    CatalogActivationTls(#[from] CatalogActivationTlsConfigError),
     /// Endpoint URL parsing failed.
     #[error("invalid OTLP endpoint {value:?}: {source}")]
     InvalidOtlpEndpoint {
@@ -703,6 +759,8 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     fn required_args() -> Vec<&'static str> {
@@ -791,6 +849,17 @@ mod tests {
         ]
     }
 
+    fn catalog_activation_tls_args() -> Vec<&'static str> {
+        vec![
+            "--catalog-activation-tls-bind",
+            "0.0.0.0:8443",
+            "--catalog-activation-tls-cert-file",
+            "/etc/pgshard/catalog-tls/tls.crt",
+            "--catalog-activation-tls-key-file",
+            "/etc/pgshard/catalog-tls/tls.key",
+        ]
+    }
+
     fn expected_replication_standby(primary_port: u16) -> PostgresConfig {
         let standby = PostgresStandbyConfig::new(
             "cluster-1-shard-0003-member-0000.database.svc".to_owned(),
@@ -822,6 +891,7 @@ mod tests {
         assert!(config.postgres.is_none());
         assert!(config.activation_config.is_none());
         assert!(config.catalog_activation_consumer.is_none());
+        assert!(config.catalog_activation_tls.is_none());
     }
 
     #[test]
@@ -858,6 +928,68 @@ mod tests {
             AgentConfig::try_parse_from(nonzero_shard),
             Err(ConfigError::InvalidCatalogActivationConsumerRole)
         ));
+    }
+
+    #[test]
+    fn catalog_activation_tls_is_optional_complete_and_consumer_bound() {
+        let mut complete = catalog_activation_consumer_args();
+        complete.extend(catalog_activation_tls_args());
+        let config = AgentConfig::try_parse_from(complete).expect("complete TLS consumer");
+        let tls = config
+            .catalog_activation_tls
+            .expect("dedicated TLS endpoint");
+        assert_eq!(tls.bind(), "0.0.0.0:8443".parse().expect("socket"));
+        assert_eq!(
+            tls.certificate_path(),
+            Path::new("/etc/pgshard/catalog-tls/tls.crt")
+        );
+        assert_eq!(
+            tls.private_key_path(),
+            Path::new("/etc/pgshard/catalog-tls/tls.key")
+        );
+
+        let mut partial = catalog_activation_consumer_args();
+        partial.extend(&catalog_activation_tls_args()[..4]);
+        assert!(matches!(
+            AgentConfig::try_parse_from(partial),
+            Err(ConfigError::IncompleteCatalogActivationTls)
+        ));
+
+        let mut no_consumer = required_args();
+        no_consumer.extend(catalog_activation_tls_args());
+        assert!(matches!(
+            AgentConfig::try_parse_from(no_consumer),
+            Err(ConfigError::CatalogActivationTlsRequiresConsumer)
+        ));
+    }
+
+    #[test]
+    fn catalog_activation_tls_rejects_shared_port_and_unsafe_paths() {
+        for (setting, replacement) in [
+            ("--catalog-activation-tls-bind", "127.0.0.1:8080"),
+            ("--catalog-activation-tls-bind", "127.0.0.1:0"),
+            ("--catalog-activation-tls-cert-file", "relative/tls.crt"),
+            (
+                "--catalog-activation-tls-cert-file",
+                "/etc/pgshard/../other/tls.crt",
+            ),
+            (
+                "--catalog-activation-tls-cert-file",
+                "/etc/pgshard/catalog-tls/tls.key",
+            ),
+        ] {
+            let mut args = catalog_activation_consumer_args();
+            args.extend(catalog_activation_tls_args());
+            let index = args
+                .iter()
+                .position(|argument| *argument == setting)
+                .expect("TLS setting");
+            args[index + 1] = replacement;
+            assert!(matches!(
+                AgentConfig::try_parse_from(args),
+                Err(ConfigError::CatalogActivationTls(_))
+            ));
+        }
     }
 
     #[test]

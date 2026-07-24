@@ -19,16 +19,22 @@ pgshard-types = { path = "../pgshard-types", version = "=0.1.0" }
 pgshard-version = { path = "../pgshard-version", version = "=0.1.0" }
 postgres-protocol.workspace = true
 rustix.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile = "3.27.0"
 thiserror.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
+tokio-rustls.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+rcgen = "=0.14.5"
 
 [lints]
 workspace = true

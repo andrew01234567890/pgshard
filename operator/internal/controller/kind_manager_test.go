@@ -1,14 +1,19 @@
 package controller
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"maps"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -1387,12 +1392,23 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 		source.Spec.Template.Annotations[owned.PostgreSQLSynchronousStandbysAnnotation] != "pgshard_member_0001,pgshard_member_0002" {
 		t.Fatalf("replication bootstrap source environment = %#v", sourceAgent.Env)
 	}
-	const activationJournalRoot = "/var/lib/postgresql/18/.pgshard-catalog-activation"
+	const (
+		activationJournalRoot  = "/var/lib/postgresql/18/.pgshard-catalog-activation"
+		activationTLSMountPath = "/etc/pgshard/catalog-tls"
+	)
 	if agentEnvironmentFieldPath(sourceAgent.Env, "PGSHARD_CATALOG_ACTIVATION_CARRIER_NAMESPACE") != "metadata.namespace" ||
 		agentEnvironmentValue(sourceAgent.Env, "PGSHARD_CATALOG_ACTIVATION_CARRIER_NAME") != activationCheckpoint.Name ||
 		agentEnvironmentValue(sourceAgent.Env, "PGSHARD_CATALOG_ACTIVATION_CARRIER_UID") != string(activationCheckpoint.UID) ||
-		agentEnvironmentValue(sourceAgent.Env, "PGSHARD_CATALOG_ACTIVATION_JOURNAL_ROOT") != activationJournalRoot {
+		agentEnvironmentValue(sourceAgent.Env, "PGSHARD_CATALOG_ACTIVATION_JOURNAL_ROOT") != activationJournalRoot ||
+		agentEnvironmentValue(sourceAgent.Env, "PGSHARD_CATALOG_ACTIVATION_TLS_BIND") != "0.0.0.0:8443" ||
+		agentEnvironmentValue(sourceAgent.Env, "PGSHARD_CATALOG_ACTIVATION_TLS_CERT_FILE") != activationTLSMountPath+"/tls.crt" ||
+		agentEnvironmentValue(sourceAgent.Env, "PGSHARD_CATALOG_ACTIVATION_TLS_KEY_FILE") != activationTLSMountPath+"/tls.key" {
 		t.Fatalf("replication bootstrap source activation environment = %#v", sourceAgent.Env)
+	}
+	if !slices.ContainsFunc(sourceAgent.Ports, func(port corev1.ContainerPort) bool {
+		return port.Name == "activation-tls" && port.ContainerPort == owned.CatalogActivationTLSPort && port.Protocol == corev1.ProtocolTCP
+	}) {
+		t.Fatalf("replication bootstrap source activation TLS ports = %#v", sourceAgent.Ports)
 	}
 	if len(source.Spec.Template.Spec.InitContainers) != 2 {
 		t.Fatalf("replication bootstrap source init containers = %#v", source.Spec.Template.Spec.InitContainers)
@@ -1414,8 +1430,36 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 		t.Fatalf("replication bootstrap source activation volume = %#v", activationVolume)
 	}
 	activationMount := corev1.VolumeMount{Name: "catalog-activation-journal", MountPath: activationJournalRoot, SubPath: "root"}
-	if !slices.Contains(sourceAgent.VolumeMounts, activationMount) {
+	activationTLSMount := corev1.VolumeMount{Name: "catalog-activation-tls", MountPath: activationTLSMountPath, ReadOnly: true}
+	if !slices.Contains(sourceAgent.VolumeMounts, activationMount) || !slices.Contains(sourceAgent.VolumeMounts, activationTLSMount) {
 		t.Fatalf("replication bootstrap source activation mount = %#v", sourceAgent.VolumeMounts)
+	}
+	activationTLSProjection := podVolumeByName(t, source.Spec.Template.Spec.Volumes, "catalog-activation-tls").Secret
+	if activationTLSProjection == nil || activationTLSProjection.SecretName != haCurrent.Status.CatalogAccess.SecretName ||
+		activationTLSProjection.DefaultMode == nil || *activationTLSProjection.DefaultMode != 0o440 ||
+		!reflect.DeepEqual(projectedSecretItemKeys(activationTLSProjection.Items), []string{owned.CatalogTLSCertificateKey, owned.CatalogTLSPrivateKeyKey}) ||
+		len(activationTLSProjection.Items) != 2 || activationTLSProjection.Items[0].Mode == nil || *activationTLSProjection.Items[0].Mode != 0o440 ||
+		activationTLSProjection.Items[1].Mode == nil || *activationTLSProjection.Items[1].Mode != 0o440 {
+		t.Fatalf("replication bootstrap source activation TLS projection = %#v", activationTLSProjection)
+	}
+	activationTLSPolicy := &networkingv1.NetworkPolicy{}
+	activationTLSPolicyName := sourceName + "-catalog-activation-tls-ingress"
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: activationTLSPolicyName}, activationTLSPolicy); err != nil {
+		t.Fatalf("get catalog activation TLS NetworkPolicy: %v", err)
+	}
+	wantActivationSelector := map[string]string{
+		owned.ClusterLabel:   haCluster.Name,
+		owned.ComponentLabel: "postgresql",
+		owned.ShardLabel:     "0000",
+		owned.MemberLabel:    "0000",
+	}
+	if !maps.Equal(activationTLSPolicy.Spec.PodSelector.MatchLabels, wantActivationSelector) ||
+		len(activationTLSPolicy.Spec.Ingress) != 1 || len(activationTLSPolicy.Spec.Ingress[0].From) != 1 ||
+		activationTLSPolicy.Spec.Ingress[0].From[0].PodSelector == nil ||
+		!maps.Equal(activationTLSPolicy.Spec.Ingress[0].From[0].PodSelector.MatchLabels, map[string]string{owned.ClusterLabel: haCluster.Name, owned.ComponentLabel: "orchestrator"}) ||
+		len(activationTLSPolicy.Spec.Ingress[0].Ports) != 1 || activationTLSPolicy.Spec.Ingress[0].Ports[0].Port == nil ||
+		activationTLSPolicy.Spec.Ingress[0].Ports[0].Port.IntVal != owned.CatalogActivationTLSPort {
+		t.Fatalf("catalog activation TLS NetworkPolicy = %#v", activationTLSPolicy.Spec)
 	}
 	if source.Spec.Template.Spec.SecurityContext == nil || source.Spec.Template.Spec.SecurityContext.SeccompProfile == nil || source.Spec.Template.Spec.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
 		t.Fatalf("replication bootstrap source Pod security = %#v", source.Spec.Template.Spec.SecurityContext)
@@ -1502,15 +1546,80 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 			PodUID     string `json:"podUID"`
 		} `json:"target"`
 	}
-	activationCapabilityPath := fmt.Sprintf("/api/v1/namespaces/%s/pods/http:%s:8080/proxy/capabilities/catalog-activation", namespace.Name, sourcePodName)
+	type catalogActivationChallengeResponse struct {
+		SchemaVersion string                      `json:"schemaVersion"`
+		Nonce         string                      `json:"nonce"`
+		RequestSHA256 string                      `json:"requestSHA256"`
+		Capability    catalogActivationCapability `json:"capability"`
+	}
+	plaintextActivationPath := fmt.Sprintf("/api/v1/namespaces/%s/pods/http:%s:8080/proxy/capabilities/catalog-activation", namespace.Name, sourcePodName)
+	if status, output, err := kindAPIRequest(ctx, kindHTTPClient, kindRESTConfig.Host, http.MethodGet, plaintextActivationPath, nil); err != nil || status != http.StatusNotFound {
+		t.Fatalf("plaintext catalog activation endpoint = status %d error %v output %q, want 404", status, err, output)
+	}
+	activationTLSAddress := startKINDPodPortForward(t, ctx, namespace.Name, sourcePodName, owned.CatalogActivationTLSPort)
+	activationTLSRoots := x509.NewCertPool()
+	if !activationTLSRoots.AppendCertsFromPEM(catalogAccessSecret.Data[owned.CatalogCACertificateKey]) {
+		t.Fatal("catalog activation TLS CA is not a PEM trust anchor")
+	}
+	activationTLSServerName := owned.CatalogServiceName(haCluster.Name) + "." + namespace.Name + ".svc"
+	challengeCapability := func(ctx context.Context) (int, catalogActivationCapability, []byte, error) {
+		var capability catalogActivationCapability
+		nonceBytes := make([]byte, 32)
+		if _, err := rand.Read(nonceBytes); err != nil {
+			return 0, capability, nil, fmt.Errorf("generate catalog activation nonce: %w", err)
+		}
+		nonce := hex.EncodeToString(nonceBytes)
+		requestSHA256 := strings.Repeat("a", 64)
+		challenge := map[string]any{
+			"schemaVersion": "pgshard.catalog-activation-capability-challenge-request.v1",
+			"nonce":         nonce,
+			"requestSHA256": requestSHA256,
+			"cluster": map[string]any{
+				"name": haCluster.Name,
+				"uid":  string(haCurrent.UID),
+			},
+			"carrier": map[string]any{
+				"namespace": namespace.Name,
+				"name":      activationCheckpoint.Name,
+				"uid":       string(activationCheckpoint.UID),
+			},
+			"target": map[string]any{
+				"shard":      0,
+				"member":     0,
+				"instanceId": sourcePodName,
+				"podName":    sourcePodName,
+				"podUID":     string(sourcePod.UID),
+			},
+		}
+		challengeBody, err := json.Marshal(challenge)
+		if err != nil {
+			return 0, capability, nil, fmt.Errorf("marshal catalog activation challenge: %w", err)
+		}
+		status, output, err := kindCatalogActivationTLSRequest(ctx, activationTLSAddress, activationTLSServerName, activationTLSRoots, challengeBody)
+		if err != nil || status != http.StatusOK {
+			return status, capability, output, err
+		}
+		var response catalogActivationChallengeResponse
+		if err := json.Unmarshal(output, &response); err != nil {
+			return status, capability, output, fmt.Errorf("decode catalog activation challenge response: %w", err)
+		}
+		if response.SchemaVersion != "pgshard.catalog-activation-capability-challenge-response.v1" || response.Nonce != nonce || response.RequestSHA256 != requestSHA256 {
+			return status, capability, output, fmt.Errorf("catalog activation challenge response does not echo the fresh request")
+		}
+		return status, response.Capability, output, nil
+	}
 	var activationCapability catalogActivationCapability
 	var lastActivationCapabilityOutput string
 	if err := wait.PollUntilContextTimeout(ctx, time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
-		status, output, err := kindAPIRequest(ctx, kindHTTPClient, kindRESTConfig.Host, http.MethodGet, activationCapabilityPath, nil)
+		status, capability, output, err := challengeCapability(ctx)
 		lastActivationCapabilityOutput = string(output)
-		return err == nil && status == http.StatusOK && json.Unmarshal(output, &activationCapability) == nil, nil
+		if err == nil && status == http.StatusOK {
+			activationCapability = capability
+			return true, nil
+		}
+		return false, nil
 	}); err != nil {
-		t.Fatalf("wait for catalog activation capability: %v; last output=%q", err, lastActivationCapabilityOutput)
+		t.Fatalf("wait for authenticated catalog activation capability: %v; last output=%q", err, lastActivationCapabilityOutput)
 	}
 	if activationCapability.SchemaVersion != "pgshard.agent.catalog-activation-capability.v1" ||
 		activationCapability.Capability != "pgshard.catalog-activation-consumer.v1" ||
@@ -1658,7 +1767,7 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	}
 	var consumerUnavailableOutput string
 	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
-		status, output, err := kindAPIRequest(ctx, kindHTTPClient, kindRESTConfig.Host, http.MethodGet, activationCapabilityPath, nil)
+		status, _, output, err := challengeCapability(ctx)
 		consumerUnavailableOutput = string(output)
 		return err == nil && status == http.StatusServiceUnavailable, nil
 	}); err != nil {
@@ -1695,8 +1804,12 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
-		status, output, err := kindAPIRequest(ctx, kindHTTPClient, kindRESTConfig.Host, http.MethodGet, activationCapabilityPath, nil)
-		return err == nil && status == http.StatusOK && json.Unmarshal(output, &activationCapability) == nil, nil
+		status, capability, _, err := challengeCapability(ctx)
+		if err == nil && status == http.StatusOK {
+			activationCapability = capability
+			return true, nil
+		}
+		return false, nil
 	}); err != nil {
 		t.Fatalf("wait for catalog activation consumer recovery: %v", err)
 	}
@@ -3401,6 +3514,119 @@ func agentEnvironmentFieldPath(environment []corev1.EnvVar, name string) string 
 		}
 	}
 	return ""
+}
+
+func startKINDPodPortForward(t *testing.T, ctx context.Context, namespace, pod string, remotePort int32) string {
+	t.Helper()
+	reservation, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve catalog activation TLS port: %v", err)
+	}
+	localPort := reservation.Addr().(*net.TCPAddr).Port
+	if err := reservation.Close(); err != nil {
+		t.Fatalf("release catalog activation TLS port reservation: %v", err)
+	}
+
+	command := exec.CommandContext(
+		ctx,
+		"kubectl",
+		"--namespace", namespace,
+		"port-forward",
+		"--address=127.0.0.1",
+		"pod/"+pod,
+		fmt.Sprintf("%d:%d", localPort, remotePort),
+	)
+	command.Stdout = io.Discard
+	command.Stderr = io.Discard
+	if err := command.Start(); err != nil {
+		t.Fatalf("start catalog activation TLS port-forward: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	t.Cleanup(func() {
+		_ = command.Process.Signal(os.Interrupt)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			_ = command.Process.Kill()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+			}
+		}
+	})
+
+	address := fmt.Sprintf("127.0.0.1:%d", localPort)
+	deadline := time.NewTimer(15 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		connection, dialErr := net.DialTimeout("tcp", address, 100*time.Millisecond)
+		if dialErr == nil {
+			_ = connection.Close()
+			return address
+		}
+		select {
+		case err := <-done:
+			done <- err
+			t.Fatalf("catalog activation TLS port-forward exited before readiness: %v", err)
+		case <-deadline.C:
+			t.Fatal("catalog activation TLS port-forward was not ready")
+		case <-ctx.Done():
+			t.Fatalf("catalog activation TLS port-forward context ended: %v", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func kindCatalogActivationTLSRequest(ctx context.Context, address, serverName string, roots *x509.CertPool, body []byte) (int, []byte, error) {
+	dialer := &net.Dialer{Timeout: 2 * time.Second}
+	connection, err := dialer.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return 0, nil, err
+	}
+	tlsConnection := tls.Client(connection, &tls.Config{
+		MinVersion:             tls.VersionTLS13,
+		MaxVersion:             tls.VersionTLS13,
+		RootCAs:                roots,
+		ServerName:             serverName,
+		NextProtos:             []string{"http/1.1"},
+		SessionTicketsDisabled: true,
+	})
+	defer tlsConnection.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = tlsConnection.SetDeadline(deadline)
+	} else {
+		_ = tlsConnection.SetDeadline(time.Now().Add(3 * time.Second))
+	}
+	if err := tlsConnection.HandshakeContext(ctx); err != nil {
+		return 0, nil, err
+	}
+	requestHeader := fmt.Sprintf(
+		"POST /capabilities/catalog-activation HTTP/1.1\r\nHost: %s\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+		serverName,
+		len(body),
+	)
+	if _, err := io.WriteString(tlsConnection, requestHeader); err != nil {
+		return 0, nil, err
+	}
+	if _, err := tlsConnection.Write(body); err != nil {
+		return 0, nil, err
+	}
+	response, err := http.ReadResponse(bufio.NewReader(tlsConnection), &http.Request{Method: http.MethodPost})
+	if err != nil {
+		return 0, nil, err
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 4_097))
+	if err != nil {
+		return 0, nil, err
+	}
+	if len(responseBody) > 4_096 {
+		return 0, nil, fmt.Errorf("catalog activation TLS response exceeds four KiB")
+	}
+	return response.StatusCode, responseBody, nil
 }
 
 func kindAPIRequest(ctx context.Context, httpClient *http.Client, host, method, path string, body []byte) (int, []byte, error) {
