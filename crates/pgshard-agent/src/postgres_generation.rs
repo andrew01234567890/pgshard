@@ -25,6 +25,12 @@ use crate::domain::{
 use tokio::sync::oneshot;
 
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(25);
+/// The writable generation lives only here, so every generation proof is read
+/// on this database.
+pub(crate) const GENERATION_DATABASE: &str = "postgres";
+/// `pgshard_catalog` lives here, so every catalog mutation is applied here.
+pub(crate) const CATALOG_DATABASE: &str = "shardschema";
+
 const CONNECTION_OPTIONS: &str = "-c search_path=pg_catalog \
     -c session_preload_libraries= -c local_preload_libraries= \
     -c event_triggers=off -c jit=off -c default_tablespace= -c temp_tablespaces= \
@@ -308,14 +314,115 @@ pub(crate) struct CatalogRuntimeIdentity {
     pub(crate) timeline: u32,
 }
 
+/// A writable session on the catalog database, for the materializer.
+///
+/// `standard_conforming_strings` is pinned on: the input lexer refuses a
+/// backslash inside an ordinary string precisely because the closing quote
+/// would otherwise be ambiguous between the two server modes, and pinning the
+/// mode here removes the ambiguity from the executing side as well.
+pub(crate) struct CatalogWriterSession {
+    connection: ConnectedPostgres,
+}
+
+impl CatalogWriterSession {
+    /// The session's client. `ConnectedPostgres` stays private so the driver
+    /// task and its abort-on-drop remain owned here.
+    pub(crate) const fn client(&mut self) -> &mut Client {
+        &mut self.connection.client
+    }
+
+    pub(crate) async fn connect(socket_dir: &Path) -> Result<Self, PostgresGenerationError> {
+        let connection = connect_with_application_mode(
+            socket_dir,
+            "pgshard-catalog-materializer-writer",
+            CATALOG_DATABASE,
+            false,
+        )
+        .await?;
+        let observed: String = connection
+            .client
+            .query_one(OBSERVE_STANDARD_CONFORMING_STRINGS, &[])
+            .await?
+            .try_get(0)?;
+        if observed != "on" {
+            return Err(PostgresGenerationError::InvalidCatalogWriterSettings);
+        }
+        Ok(Self { connection })
+    }
+}
+
+/// Holds a lock on the generation row that conflicts with publication, so no
+/// new generation can be published while the caller mutates another database.
+///
+/// The two databases cannot share one transaction, so proving the generation
+/// once and then committing elsewhere would leave a window in which a new
+/// generation is published between the proof and the commit. Holding this lock
+/// across that commit closes the window.
+pub(crate) struct GenerationFence {
+    connection: ConnectedPostgres,
+}
+
+impl GenerationFence {
+    pub(crate) async fn hold(
+        socket_dir: &Path,
+        expected: &DurableWritableGeneration,
+    ) -> Result<Self, PostgresGenerationError> {
+        let connection = connect_with_application_mode(
+            socket_dir,
+            "pgshard-catalog-materializer-fence",
+            GENERATION_DATABASE,
+            false,
+        )
+        .await?;
+        let fence = Self { connection };
+        fence.prove(expected).await?;
+        Ok(fence)
+    }
+
+    /// Opens the fence transaction with an explicit `BEGIN` rather than the
+    /// RAII transaction wrapper: the transaction has to outlive this call and
+    /// stay open across the caller's commit on the other database, which is
+    /// exactly what the wrapper's rollback-on-drop would prevent.
+    async fn prove(
+        &self,
+        expected: &DurableWritableGeneration,
+    ) -> Result<(), PostgresGenerationError> {
+        let client = &self.connection.client;
+        client.batch_execute("BEGIN").await?;
+        client.batch_execute(EVIDENCE_TRANSACTION_SETTINGS).await?;
+        // The same lock publication takes, so a publication attempt blocks
+        // behind this transaction instead of racing it.
+        client.batch_execute(LOCK_GENERATION_TABLE).await?;
+        client.batch_execute(SELECT_FOR_UPDATE).await?;
+        let generation = read_generation_evidence(client).await?;
+        if &generation != expected {
+            return Err(PostgresGenerationError::GenerationEvidenceChanged);
+        }
+        Ok(())
+    }
+
+    /// Releases the held lock. Call only after the guarded commit has returned.
+    pub(crate) async fn release(self) {
+        let _ = self.connection.client.batch_execute("ROLLBACK").await;
+    }
+}
+
+const OBSERVE_STANDARD_CONFORMING_STRINGS: &str =
+    "SELECT pg_catalog.current_setting('standard_conforming_strings')";
+
 /// Connects over the fixed local peer-authenticated socket and observes an
 /// exact read-only generation and source identity in one coherent snapshot.
 pub(crate) async fn connect_catalog_runtime(
     socket_dir: &Path,
     expected_generation: &DurableWritableGeneration,
 ) -> Result<(CatalogRuntimeSession, CatalogRuntimeIdentity), PostgresGenerationError> {
-    let mut connection =
-        connect_with_application_mode(socket_dir, "pgshard-catalog-materializer", true).await?;
+    let mut connection = connect_with_application_mode(
+        socket_dir,
+        "pgshard-catalog-materializer",
+        GENERATION_DATABASE,
+        true,
+    )
+    .await?;
     let transaction = connection.client.transaction().await?;
     transaction
         .batch_execute(EVIDENCE_TRANSACTION_SETTINGS)
@@ -505,8 +612,8 @@ impl ReplicationEvidenceSession {
     }
 }
 
-async fn read_generation_evidence(
-    transaction: &tokio_postgres::Transaction<'_>,
+async fn read_generation_evidence<C: tokio_postgres::GenericClient>(
+    transaction: &C,
 ) -> Result<DurableWritableGeneration, PostgresGenerationError> {
     if query_safety(transaction, SCHEMA_IS_SAFE).await? != Some(true) {
         return Err(PostgresGenerationError::UnsafeSchema);
@@ -967,8 +1074,8 @@ fn verify_synchronous_publication(
     Ok(())
 }
 
-async fn query_safety(
-    transaction: &tokio_postgres::Transaction<'_>,
+async fn query_safety<C: tokio_postgres::GenericClient>(
+    transaction: &C,
     query: &str,
 ) -> Result<Option<bool>, tokio_postgres::Error> {
     match transaction.query_opt(query, &[]).await? {
@@ -1231,12 +1338,13 @@ async fn connect_with_application(
     socket_dir: &Path,
     application_name: &'static str,
 ) -> Result<ConnectedPostgres, tokio_postgres::Error> {
-    connect_with_application_mode(socket_dir, application_name, false).await
+    connect_with_application_mode(socket_dir, application_name, GENERATION_DATABASE, false).await
 }
 
 async fn connect_with_application_mode(
     socket_dir: &Path,
     application_name: &'static str,
+    dbname: &'static str,
     default_read_only: bool,
 ) -> Result<ConnectedPostgres, tokio_postgres::Error> {
     let mut config = Config::new();
@@ -1245,7 +1353,7 @@ async fn connect_with_application_mode(
         .host_path(socket_dir)
         .port(5432)
         .user("postgres")
-        .dbname("postgres")
+        .dbname(dbname)
         .application_name(application_name)
         .options(&options);
     let (client, connection) = config.connect(NoTls).await?;
@@ -1295,6 +1403,9 @@ pub enum PostgresGenerationError {
     /// Attempt-private authority no longer exactly matches the request.
     #[error("attempt-private writable authority changed during WAL publication")]
     AuthorityChanged,
+    /// The catalog writer session did not report the pinned string mode.
+    #[error("PostgreSQL catalog writer session settings are not exact")]
+    InvalidCatalogWriterSettings,
     /// The durable row is not the canonical bounded generation encoding.
     #[error("PostgreSQL writable-generation row is malformed")]
     MalformedGeneration,

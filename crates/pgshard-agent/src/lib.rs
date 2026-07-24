@@ -7,6 +7,7 @@ pub mod catalog_activation_runtime;
 pub mod catalog_activation_static_inputs;
 pub mod catalog_activation_tls;
 pub(crate) mod catalog_materialization_program;
+pub(crate) mod catalog_materializer;
 pub mod config;
 pub mod coordination;
 pub mod domain;
