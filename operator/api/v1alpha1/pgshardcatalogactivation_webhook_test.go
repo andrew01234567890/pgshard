@@ -96,7 +96,7 @@ func validCatalogActivationRequest() CatalogActivationRequest {
 			OperationWriter:         CatalogActivationMaterialIdentity{CatalogActivationObjectIdentity: CatalogActivationObjectIdentity{Name: "writer", UID: "writer-uid"}, MaterialSHA256: activationDigest(6)},
 			PostgreSQLConfiguration: CatalogActivationMaterialIdentity{CatalogActivationObjectIdentity: CatalogActivationObjectIdentity{Name: "configuration", UID: "configuration-uid"}, MaterialSHA256: activationDigest(7)},
 			MigrationSHA256:         activationDigest(8), ShardCount: "4", InventorySHA256: activationDigest(13),
-			GenesisSHA256:           activationDigest(9), PreflightSHA256: activationDigest(10),
+			GenesisSHA256: activationDigest(9), PreflightSHA256: activationDigest(10),
 			ServingHBAVersion: "pgshard.catalog-serving-hba.v1", ServingHBASHA256: activationDigest(11), TargetTemplateSHA256: activationDigest(12),
 		},
 		Source: CatalogActivationSource{
