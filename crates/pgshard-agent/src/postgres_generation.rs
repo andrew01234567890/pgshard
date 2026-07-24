@@ -1972,6 +1972,91 @@ mod tests {
         assert!(!CATALOG_RUNTIME_IDENTITY_OBSERVATION.contains("FOR UPDATE"));
     }
 
+    /// The fence's whole purpose is cross-database ordering, and none of it can
+    /// be established without a running server: that a row-locking SELECT is
+    /// rejected in a read-only transaction, that an idle holder is terminated
+    /// under the evidence timeouts, that the locks actually make a publisher
+    /// wait, and that they stay held across a commit on the other connection.
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL 18 Unix socket"]
+    async fn live_postgres18_materializer_fences_publication() {
+        let socket_dir = std::env::var_os("PGSHARD_AGENT_TEST_SOCKET_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("PGSHARD_AGENT_TEST_SOCKET_DIR is required");
+        let first = generation("cluster-1", "holder-a", 1);
+        let second = generation("cluster-1", "holder-a", 2);
+
+        publish_writable_generation(&socket_dir, &first, &|| true)
+            .await
+            .expect("publish the first generation");
+
+        // Establishing the fence at all is finding 1: this fails outright if
+        // the fence transaction is read-only.
+        let fence = GenerationFence::hold(&socket_dir, &first)
+            .await
+            .expect("hold the generation fence");
+
+        // Finding 2: the holder is deliberately idle for longer than the
+        // evidence transaction timeout. If the fence carried those settings the
+        // backend would already be gone by the time the guarded work commits.
+        tokio::time::sleep(Duration::from_secs(8)).await;
+
+        let publisher_socket = socket_dir.clone();
+        let publisher = tokio::spawn(async move {
+            publish_writable_generation(&publisher_socket, &second, &|| true).await
+        });
+
+        // The publisher must be waiting on the fence's locks, and the durable
+        // row must still read the first generation.
+        let mut observer = connect(&socket_dir).await.expect("observe locks");
+        let mut waiting = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let blocked: i64 = observer
+                .client
+                .query_one(
+                    "SELECT pg_catalog.count(*) FROM pg_catalog.pg_locks \
+                     WHERE NOT granted AND relation = 'pgshard_internal.writable_generation'::regclass",
+                    &[],
+                )
+                .await
+                .expect("read pg_locks")
+                .get(0);
+            if blocked > 0 {
+                waiting = true;
+                break;
+            }
+        }
+        assert!(waiting, "publication did not block behind the fence");
+
+        let transaction = observer
+            .client
+            .build_transaction()
+            .start()
+            .await
+            .expect("read the generation while the fence is held");
+        let durable = read_generation_evidence(&transaction)
+            .await
+            .expect("generation evidence while fenced");
+        assert_eq!(
+            durable, first,
+            "a fenced publication changed the durable generation"
+        );
+        transaction.rollback().await.expect("end the observation");
+
+        // The fence must still be alive after all of that, which is the
+        // property release() now reports.
+        fence
+            .release()
+            .await
+            .expect("fence survived the guarded window");
+
+        publisher
+            .await
+            .expect("publication task")
+            .expect("publication completes once the fence releases");
+    }
+
     #[tokio::test]
     #[ignore = "requires disposable primary and streaming-standby PostgreSQL 18 Unix sockets"]
     #[allow(clippy::too_many_lines)]

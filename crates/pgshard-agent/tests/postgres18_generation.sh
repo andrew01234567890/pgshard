@@ -385,6 +385,21 @@ docker run --rm --user 999:999 --network none --read-only \
   postgres_generation::tests::live_postgres18_proves_any_one_synchronous_generation_replay \
   --nocapture
 
+# The cross-database fence can only be established against a running server:
+# a read-only fence transaction cannot take the row lock, an idle holder is
+# terminated by the evidence timeouts, and the lock wait itself is the property
+# under test. None of that is reachable from a unit test.
+docker run --rm \
+  --network "$network" \
+  --volume "$primary_socket:/primary-socket" \
+  --mount "type=bind,src=$test_binary,dst=/test/pgshard-agent-test,readonly" \
+  --env PGSHARD_AGENT_TEST_SOCKET_DIR=/primary-socket \
+  --entrypoint /test/pgshard-agent-test \
+  "$image" \
+  --ignored --exact \
+  postgres_generation::tests::live_postgres18_materializer_fences_publication \
+  --nocapture
+
 if [[ -n "$runtime_image" ]]; then
   if ! docker stop --time 10 "$standby" >/dev/null; then
     fail_container "$standby" \
