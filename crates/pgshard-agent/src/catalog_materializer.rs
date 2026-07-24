@@ -6,6 +6,17 @@
 //! database where the writable generation lives, and with an exact authority
 //! observation immediately before each commit.
 //!
+//! What the fence does and does not guarantee. While it is held, a competing
+//! generation publication blocks on its locks, so it cannot advance past a
+//! catalog commit that is still to come. It cannot make the two atomic: they
+//! are separate databases and therefore separate transactions, and a commit is
+//! dispatched before its reply is known. If the fence is lost with a commit
+//! already in flight, whether that commit landed is genuinely unknown here, and
+//! the step reports `AmbiguousCatalogCommit` rather than a clean failure. The
+//! stage that drives this executor has to reconcile that state before treating
+//! the catalog as materialized — this module deliberately does not pretend to
+//! resolve it.
+//!
 //! Nothing here is driven yet: the materializer is constructed and unit-tested,
 //! but no caller applies a program.
 #![allow(
@@ -140,7 +151,7 @@ where
     // A fence that dies has released its locks, so the guarded work is no
     // longer fenced and must not be allowed to reach its commit.
     let outcome = tokio::select! {
-        outcome = apply(writer, authority_exact, step) => outcome,
+        outcome = apply(writer, authority_exact, &fence, step) => outcome,
         () = fence.lost() => Err(PostgresGenerationError::GenerationFenceLost),
     };
     // A lost fence outranks whatever the work reported: the guarantee was
@@ -155,6 +166,7 @@ where
 async fn apply<F>(
     writer: &mut CatalogWriterSession,
     authority_exact: &F,
+    fence: &GenerationFence,
     step: Step<'_>,
 ) -> Result<(), PostgresGenerationError>
 where
@@ -188,13 +200,25 @@ where
                 }
                 transaction.batch_execute(fragment).await?;
             }
-            // No await or state-changing operation may be inserted between this
-            // exact authority observation and dispatching COMMIT.
+            // No await or state-changing operation may be inserted between these
+            // exact observations and dispatching COMMIT. The fence check
+            // narrows, but cannot close, the window: COMMIT is queued before
+            // its reply is known, so a fence lost from here on leaves the
+            // commit's fate unknown rather than failed.
+            if !fence.holds() {
+                return Err(PostgresGenerationError::GenerationFenceLost);
+            }
             if !authority_exact() {
                 return Err(PostgresGenerationError::AuthorityChanged);
             }
-            transaction.commit().await?;
-            Ok(())
+            match transaction.commit().await {
+                Ok(()) => Ok(()),
+                Err(error) if !fence.holds() => {
+                    tracing::warn!(reason = %error, "catalog commit outcome is unknown: the generation fence was lost in flight");
+                    Err(PostgresGenerationError::AmbiguousCatalogCommit)
+                }
+                Err(error) => Err(error.into()),
+            }
         }
     }
 }

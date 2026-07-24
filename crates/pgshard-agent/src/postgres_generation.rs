@@ -431,6 +431,11 @@ impl GenerationFence {
             .map_err(|_| PostgresGenerationError::GenerationFenceLost)
     }
 
+    /// Reports whether the fence still holds its locks right now.
+    pub(crate) fn holds(&self) -> bool {
+        !*self.connection.driver_ended.borrow()
+    }
+
     /// Resolves if the fence stops holding its locks.
     pub(crate) async fn lost(&self) {
         let mut driver_ended = self.connection.driver_ended.clone();
@@ -1444,6 +1449,10 @@ pub enum PostgresGenerationError {
     /// The generation fence stopped holding its locks before the guarded commit.
     #[error("PostgreSQL generation fence was lost before the guarded commit")]
     GenerationFenceLost,
+    /// The fence was lost while a catalog commit was already in flight, so
+    /// whether that commit landed is unknown and cannot be resolved from here.
+    #[error("PostgreSQL catalog commit is ambiguous: the generation fence was lost in flight")]
+    AmbiguousCatalogCommit,
     /// The durable row is not the canonical bounded generation encoding.
     #[error("PostgreSQL writable-generation row is malformed")]
     MalformedGeneration,
