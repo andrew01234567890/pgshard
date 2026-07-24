@@ -996,7 +996,7 @@ mod tests {
     /// runs `disturb`, and requires the connector to have been dropped rather
     /// than left alive and unpolled.
     async fn assert_inflight_connection_is_cancelled_by(
-        disturb: impl FnOnce(StaticInputSender, RuntimeOutputReceiver),
+        disturb: impl FnOnce(&mut Option<StaticInputSender>, &mut Option<RuntimeOutputReceiver>),
     ) {
         let (inputs, generation) = fixture();
         let (input, attempt, output) = channels(Arc::new(inputs));
@@ -1037,7 +1037,11 @@ mod tests {
         .await
         .expect("connector started");
 
-        disturb(input, output);
+        // Each endpoint is retained until after the assertions, so a test that
+        // closes one cannot be satisfied by the other's cancellation arm.
+        let mut input = Some(input);
+        let mut output = Some(output);
+        disturb(&mut input, &mut output);
 
         timeout(Duration::from_secs(1), async {
             while !*finished_receiver.borrow_and_update() {
@@ -1055,6 +1059,8 @@ mod tests {
         );
         assert!(!signals.published.load(Ordering::Acquire));
 
+        drop(input);
+        drop(output);
         task.abort();
         let _ = task.await;
     }
@@ -1064,14 +1070,20 @@ mod tests {
         // Sending None also cancels, but it leaves the channel open; a closed
         // channel used to park inside the select arm, keeping the connector
         // alive and unpolled instead of dropping it.
-        assert_inflight_connection_is_cancelled_by(|input, _output| drop(input)).await;
+        assert_inflight_connection_is_cancelled_by(|input, _output| {
+            input.take();
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn dropping_the_output_handoff_cancels_an_inflight_connection() {
         // The output handoff closing was not observed at all during a
         // connection, so the connector ran on for a receiver that had gone.
-        assert_inflight_connection_is_cancelled_by(|_input, output| drop(output)).await;
+        assert_inflight_connection_is_cancelled_by(|_input, output| {
+            output.take();
+        })
+        .await;
     }
 
     #[tokio::test]

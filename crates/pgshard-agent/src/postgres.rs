@@ -2335,19 +2335,18 @@ where
     B: Future<Output = ()>,
     E: Future<Output = PostmasterLifecycleEvent>,
 {
-    // The binder is pinned inside this block, so leaving the block destroys it
-    // and runs its withdrawal. Pinning at function scope would keep it alive
-    // until the whole future is dropped, which is after the caller has the
-    // event and has begun teardown.
-    let event = {
+    // What guarantees the ordering is that this helper owns the binder: the
+    // caller cannot reach teardown without this call returning, and it cannot
+    // return without destroying the binder. The block only makes the point of
+    // destruction explicit at the call site.
+    {
         tokio::pin!(binder);
         tokio::select! {
             biased;
             event = events => event,
             () = &mut binder => unreachable!("catalog runtime binder never completes"),
         }
-    };
-    event
+    }
 }
 
 /// Why the supervised postmaster is leaving its running state.
