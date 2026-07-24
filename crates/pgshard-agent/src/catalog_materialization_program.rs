@@ -275,28 +275,46 @@ impl<'a> Scanner<'a> {
     /// modelled: leaving those bytes in INITIAL can only widen what is
     /// inspected, never narrow it.
     fn consume_number(&mut self) -> Result<(), CatalogMaterializationProgramError> {
-        self.consume_numeric_run();
-        // A fractional part belongs to the literal, including the empty one in
-        // `1.`: flex's `numeric` covers it, so `1.e-` is a `realfail` match that
-        // swallows the sign. Leaving the `.` to be scanned separately took the
-        // token out of numeric context and let a following `--` open a comment
-        // that `psql` does not open.
-        if self.peek(0) == Some(b'.') {
-            self.pos += 1;
+        // Run to a fixpoint rather than as a fixed sequence of steps. A number
+        // can re-enter numeric context after a consumed sign — `1-1e-` is a
+        // `decinteger`, an operator, then a `realfail` that swallows its sign —
+        // so a one-shot sequence leaves the tail unguarded and a following `--`
+        // reads as a comment `psql` does not open.
+        loop {
+            let start = self.pos;
             self.consume_numeric_run();
-        }
-        if matches!(self.peek(0), Some(b'-' | b'+')) {
-            // A sign closing a valid exponent belongs to the literal. A sign
-            // that is not part of one is where flex's `realfail` rule competes
-            // with the `*_junk` rules, and which of them wins decides whether a
-            // following `--` opens a comment or leaves a lone operator with
-            // live INITIAL bytes after it. Nothing rendered here abuts a
-            // number that way, so refuse the ambiguity rather than model it.
-            if !self.peek(1).is_some_and(|byte| byte.is_ascii_digit()) {
-                return Err(self.reject());
+            // A fractional part belongs to the literal, including the empty one
+            // in `1.`: flex's `numeric` covers it, so `1.e-` is a `realfail`
+            // match that swallows the sign.
+            if self.peek(0) == Some(b'.') {
+                self.pos += 1;
+                self.consume_numeric_run();
             }
-            self.pos += 1;
-            self.consume_numeric_run();
+            if matches!(self.peek(0), Some(b'-' | b'+')) {
+                // A sign closing a valid exponent belongs to the literal. A
+                // sign that is not part of one is where flex's `realfail` rule
+                // competes with the `*_junk` rules, and which of them wins
+                // decides whether a following `--` opens a comment or leaves a
+                // lone operator with live INITIAL bytes after it. Nothing
+                // rendered here abuts a number that way, so refuse the
+                // ambiguity rather than model it.
+                if !self.peek(1).is_some_and(|byte| byte.is_ascii_digit()) {
+                    return Err(self.reject());
+                }
+                self.pos += 1;
+                self.consume_numeric_run();
+            }
+            if self.pos == start {
+                break;
+            }
+        }
+        // The loop can only exit on a pass that consumed nothing, so this holds
+        // by construction today. It is asserted anyway: it is the property that
+        // actually matters — a numeric token never abuts a byte `psql`'s
+        // numeric rules could extend over — and keeping it explicit stops a
+        // later edit from weakening it silently.
+        if matches!(self.peek(0), Some(b'.' | b'-' | b'+')) {
+            return Err(self.reject());
         }
         Ok(())
     }
@@ -911,6 +929,15 @@ mod tests {
         // `--` from `psql` while the scanner reads it as a comment.
         assert_rejects_self_framed("BEGIN;\nSELECT 1.e--:v\n;\nCOMMIT;\n");
         assert_rejects_caller_framed("SELECT 1.e--\\echo PWNED\n;\n");
+        // Numeric context can be re-entered after a consumed sign, so the
+        // guard has to hold at a fixpoint rather than once: `1-1e-` is a
+        // decinteger, an operator, then a realfail that swallows its sign.
+        assert_rejects_caller_framed("SELECT 1-1e--\\echo PWNED\n;\n");
+        assert_rejects_caller_framed("SELECT 1-1.e--:pwn\n;\n");
+        assert_rejects_caller_framed("SELECT 1-1e--1\n;\n");
+        assert_rejects_caller_framed("SELECT .1-1e--\\echo PWNED\n;\n");
+        // Conservatism, not a divergence: `psql` also reads this `--` as a
+        // comment. It records that the guard over-rejects here by design.
         assert_rejects_caller_framed("SELECT 1.--\\echo PWNED\n;\n");
         assert_accepts_caller_framed("SELECT 1.e-5, 1.e+5, 1.5, 1.;\n");
         assert_rejects_caller_framed("SELECT 1e5$q$ \\echo PWNED $q$;\n");
