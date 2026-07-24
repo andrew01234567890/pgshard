@@ -498,6 +498,12 @@ pub(crate) fn prepare_catalog_activation_request(
                 .shardschema_migration
                 .sha256
                 .clone(),
+            shard_count: dispatch.materialization_bundle.shard_count.clone(),
+            inventory_sha256: dispatch
+                .materialization_bundle
+                .shard_inventory
+                .sha256
+                .clone(),
             genesis_sha256: dispatch
                 .materialization_bundle
                 .database_genesis

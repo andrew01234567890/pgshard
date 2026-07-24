@@ -1003,6 +1003,8 @@ fn validate_materialization_bundle(
         || !valid_uid(&bundle.postgresql_configuration.uid)
         || !valid_digest(&bundle.postgresql_configuration.data_sha256)
         || !valid_digest(&bundle.shardschema_migration.sha256)
+        || bundle.shard_count != plan.shard_count.to_string()
+        || !valid_digest(&bundle.shard_inventory.sha256)
         || !valid_digest(&bundle.database_genesis.sha256)
         || !valid_digest(&bundle.database_topology_preflight.sha256)
         || bundle.serving_hba.version != CATALOG_SERVING_HBA_POLICY_VERSION
@@ -1041,6 +1043,8 @@ fn validate_materialization_bundle(
     let bundle_input = MaterializationBundleDigestInput {
         postgresql_configuration: bundle.postgresql_configuration.clone(),
         shardschema_migration: bundle.shardschema_migration.clone(),
+        shard_count: bundle.shard_count.clone(),
+        shard_inventory: bundle.shard_inventory.clone(),
         database_genesis: bundle.database_genesis.clone(),
         database_topology_preflight: bundle.database_topology_preflight.clone(),
         catalog_access: bundle.catalog_access.clone(),
@@ -1071,6 +1075,8 @@ struct TargetPodTemplateDigestInput {
 struct MaterializationBundleDigestInput {
     postgresql_configuration: ConfigurationReference,
     shardschema_migration: ContentReference,
+    shard_count: String,
+    shard_inventory: ContentReference,
     database_genesis: ContentReference,
     database_topology_preflight: ContentReference,
     catalog_access: CatalogAccessReference,
@@ -1622,6 +1628,8 @@ pub(crate) struct PodTemplateReference {
 pub(crate) struct MaterializationBundle {
     pub(crate) postgresql_configuration: ConfigurationReference,
     pub(crate) shardschema_migration: ContentReference,
+    pub(crate) shard_count: String,
+    pub(crate) shard_inventory: ContentReference,
     pub(crate) database_genesis: ContentReference,
     pub(crate) database_topology_preflight: ContentReference,
     pub(crate) catalog_access: CatalogAccessReference,
@@ -2081,6 +2089,10 @@ mod tests {
             shardschema_migration: ContentReference {
                 sha256: "8".repeat(64),
             },
+            shard_count: "2".to_owned(),
+            shard_inventory: ContentReference {
+                sha256: "9".repeat(64),
+            },
             database_genesis: ContentReference {
                 sha256: "a".repeat(64),
             },
@@ -2101,6 +2113,8 @@ mod tests {
             &serde_json::to_vec(&MaterializationBundleDigestInput {
                 postgresql_configuration: bundle.postgresql_configuration.clone(),
                 shardschema_migration: bundle.shardschema_migration.clone(),
+                shard_count: bundle.shard_count.clone(),
+                shard_inventory: bundle.shard_inventory.clone(),
                 database_genesis: bundle.database_genesis.clone(),
                 database_topology_preflight: bundle.database_topology_preflight.clone(),
                 catalog_access: bundle.catalog_access.clone(),
@@ -3006,6 +3020,8 @@ mod tests {
             &serde_json::to_vec(&MaterializationBundleDigestInput {
                 postgresql_configuration: bundle.postgresql_configuration.clone(),
                 shardschema_migration: bundle.shardschema_migration.clone(),
+                shard_count: bundle.shard_count.clone(),
+                shard_inventory: bundle.shard_inventory.clone(),
                 database_genesis: bundle.database_genesis.clone(),
                 database_topology_preflight: bundle.database_topology_preflight.clone(),
                 catalog_access: bundle.catalog_access.clone(),

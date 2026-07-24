@@ -140,6 +140,12 @@ type CatalogActivationMaterials struct {
 	PostgreSQLConfiguration CatalogActivationMaterialIdentity        `json:"postgresqlConfiguration"`
 	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
 	MigrationSHA256 string `json:"migrationSHA256"`
+	// ShardCount is the canonical unsigned-decimal physical shard count.
+	// +kubebuilder:validation:MaxLength=20
+	// +kubebuilder:validation:Pattern=`^[1-9][0-9]{0,19}$`
+	ShardCount string `json:"shardCount"`
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
+	InventorySHA256 string `json:"inventorySHA256"`
 	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
 	GenesisSHA256 string `json:"genesisSHA256"`
 	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
@@ -441,8 +447,8 @@ func (request *CatalogActivationRequest) validate() error {
 	digests := []string{
 		request.Cluster.StatusSHA256, request.Candidate.PayloadSHA256, request.Materials.Replication.MaterialSHA256,
 		request.Materials.Catalog.ClientSHA256, request.Materials.Catalog.ServerSHA256, request.Materials.OperationWriter.MaterialSHA256,
-		request.Materials.PostgreSQLConfiguration.MaterialSHA256, request.Materials.MigrationSHA256, request.Materials.GenesisSHA256,
-		request.Materials.PreflightSHA256, request.Materials.ServingHBASHA256, request.Materials.TargetTemplateSHA256,
+		request.Materials.PostgreSQLConfiguration.MaterialSHA256, request.Materials.MigrationSHA256, request.Materials.InventorySHA256,
+		request.Materials.GenesisSHA256, request.Materials.PreflightSHA256, request.Materials.ServingHBASHA256, request.Materials.TargetTemplateSHA256,
 	}
 	for _, digest := range digests {
 		if !validActivationDigest(digest) {
@@ -450,7 +456,7 @@ func (request *CatalogActivationRequest) validate() error {
 		}
 	}
 	decimals := []string{
-		request.Cluster.Generation, request.WritableTerm.Generation, request.Source.SystemIdentifier, request.Source.GenerationBarrierLSN,
+		request.Cluster.Generation, request.WritableTerm.Generation, request.Materials.ShardCount, request.Source.SystemIdentifier, request.Source.GenerationBarrierLSN,
 		request.Source.TargetFenceAcknowledgement.ObservedAtUnixMS, request.Source.TargetFenceAcknowledgement.DeadlineBoottimeNS,
 		request.Source.TargetFenceAcknowledgement.RemainingValidityAtAckMS, request.Source.TargetFenceAcknowledgement.RemainingValidityAtReportMS,
 		request.RemoteApplyWitness.SystemIdentifier, request.RemoteApplyWitness.GenerationBarrierLSN,
@@ -594,7 +600,8 @@ func (request *CatalogActivationRequest) visitComponents(visit func(string)) {
 		request.Materials.Catalog.Name, string(request.Materials.Catalog.UID), request.Materials.Catalog.ClientSHA256, request.Materials.Catalog.ServerSHA256,
 		request.Materials.OperationWriter.Name, string(request.Materials.OperationWriter.UID), request.Materials.OperationWriter.MaterialSHA256,
 		request.Materials.PostgreSQLConfiguration.Name, string(request.Materials.PostgreSQLConfiguration.UID), request.Materials.PostgreSQLConfiguration.MaterialSHA256,
-		request.Materials.MigrationSHA256, request.Materials.GenesisSHA256, request.Materials.PreflightSHA256,
+		request.Materials.MigrationSHA256, request.Materials.ShardCount, request.Materials.InventorySHA256,
+		request.Materials.GenesisSHA256, request.Materials.PreflightSHA256,
 		request.Materials.ServingHBAVersion, request.Materials.ServingHBASHA256, request.Materials.TargetTemplateSHA256,
 		request.Source.ClusterName, string(request.Source.ClusterUID), request.Source.PodName, string(request.Source.PodUID), strconv.FormatInt(int64(request.Source.Shard), 10), strconv.FormatInt(int64(request.Source.Member), 10),
 		request.Source.InstanceID, request.Source.BootID, strconv.FormatInt(request.Source.PostmasterPID, 10), request.Source.SystemIdentifier,

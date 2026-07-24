@@ -118,6 +118,8 @@ const (
 	databaseTopologyPreflightPath             = "/etc/pgshard/postgresql/database-topology-preflight.sql"
 	shardschemaMigrationSHA256                = "10f90e15f468c3e33db03cc3a3ff714a38e020c454fd5d614d255fb367142fed"
 	shardschemaMigrationHashAnnotation        = "pgshard.io/shardschema-migration-sha256"
+	shardInventoryPath                        = "/usr/share/pgshard/inventory/0001_shard_inventory.sql"
+	shardInventorySHA256                      = "956a3e2524e537269bf6befc27ca34a76f112ed4adda17037b9d9282c67401a3"
 	catalogActivationJournalVolumeName        = "catalog-activation-journal"
 	catalogActivationJournalVolumeMountPath   = "/var/lib/pgshard/catalog-activation-volume"
 	catalogActivationJournalSubPath           = "root"
@@ -260,6 +262,15 @@ if [[ "$PGSHARD_BOOTSTRAP_SHARDSCHEMA" == "true" ]]; then
   read -r observed_migration_sha _ < <(sha256sum -- "$PGSHARD_SHARDSCHEMA_MIGRATION")
   if [[ "$observed_migration_sha" != "$PGSHARD_SHARDSCHEMA_MIGRATION_SHA256" ]]; then
     echo "shardschema migration does not match the operator release" >&2
+    exit 1
+  fi
+  if [[ ! -f "$PGSHARD_SHARD_INVENTORY" ]]; then
+    echo "shard inventory is missing from the bootstrap image" >&2
+    exit 1
+  fi
+  read -r observed_inventory_sha _ < <(sha256sum -- "$PGSHARD_SHARD_INVENTORY")
+  if [[ "$observed_inventory_sha" != "$PGSHARD_SHARD_INVENTORY_SHA256" ]]; then
+    echo "shard inventory does not match the operator release" >&2
     exit 1
   fi
   if [[ ! "$PGSHARD_CATALOG_CLIENT_SHA256" =~ ^[0-9a-f]{64}$ ]] \
@@ -1390,11 +1401,13 @@ if [[ ! -f "$database_topology_preflight" || -L "$database_topology_preflight" ]
   echo "database topology preflight is missing or not a regular file" >&2
   exit 1
 fi
+# A pre-existing catalog is proved compatible before the forward migration
+# touches it, so a conflicting restore is rejected with the catalog unchanged.
 if [[ "$catalog_core_tables" == "t|t|t" ]]; then
-  psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
-    --set=ON_ERROR_STOP=1 \
-    --set=PGSHARD_ALLOW_EMPTY_DATABASE_TOPOLOGY="$catalog_genesis_pending" \
-    --file="$database_topology_preflight" >/dev/null
+  PGOPTIONS="$PGOPTIONS -c default_transaction_isolation=read\\ committed -c pgshard.bootstrap_allow_empty_database_topology=$catalog_genesis_pending" \
+    psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+      --set=ON_ERROR_STOP=1 --single-transaction \
+      --file="$database_topology_preflight" >/dev/null
 fi
 
 psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
@@ -1412,53 +1425,10 @@ if [[ "$missing_shards" != "0" ]]; then
     echo "RestoreTopologyMismatch: shardschema inventory conflicts with the configured immutable shard topology" >&2
     exit 1
   fi
-  psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
-    --set=ON_ERROR_STOP=1 <<PGSHARD_SHARD_INVENTORY
-BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;
-SET LOCAL session_replication_role = origin;
-INSERT INTO pgshard_catalog.shards(shard_id, shard_number, state)
-SELECT (
-         'shard-' || pg_catalog.lpad(expected.shard_number::text, 4, '0')
-       )::pgshard_catalog.resource_name,
-       expected.shard_number,
-       'active'
-  FROM pg_catalog.generate_series(0, $PGSHARD_SHARD_COUNT::bigint - 1) AS expected(shard_number)
-  LEFT JOIN pgshard_catalog.shards AS shards
-    ON shards.shard_id::text = 'shard-' || pg_catalog.lpad(expected.shard_number::text, 4, '0')
-   AND shards.shard_number = expected.shard_number
- WHERE shards.shard_id IS NULL;
-DO \$pgshard_inventory_postcondition\$
-BEGIN
-  IF EXISTS (
-      SELECT
-        FROM pg_catalog.generate_series(
-               0,
-               $PGSHARD_SHARD_COUNT::bigint - 1
-             ) AS expected(shard_number)
-        LEFT JOIN pgshard_catalog.shards AS shards
-          ON shards.shard_id::text = 'shard-' || pg_catalog.lpad(
-               expected.shard_number::text,
-               4,
-               '0'
-             )
-         AND shards.shard_number = expected.shard_number
-       WHERE shards.shard_id IS NULL
-          OR shards.state <> 'active'
-          OR NOT EXISTS (
-               SELECT
-                 FROM pgshard_catalog.shard_restore_incarnations AS incarnations
-                WHERE incarnations.shard_id = shards.shard_id
-                  AND incarnations.state = 'active'
-             )
-  ) THEN
-    RAISE EXCEPTION USING
-      ERRCODE = '55000',
-      MESSAGE = 'initial shardschema inventory failed its transactional postcondition';
-  END IF;
-END
-\$pgshard_inventory_postcondition\$;
-COMMIT;
-PGSHARD_SHARD_INVENTORY
+  PGOPTIONS="$PGOPTIONS -c default_transaction_isolation=read\\ committed -c pgshard.expected_shard_count=$PGSHARD_SHARD_COUNT" \
+    psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+      --set=ON_ERROR_STOP=1 --single-transaction \
+      --file="$PGSHARD_SHARD_INVENTORY"
 fi
 
 validate_catalog_inventory false
@@ -1470,10 +1440,10 @@ fi
 
 validate_bootstrap_session_policy shardschema
 
-psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
-  --set=ON_ERROR_STOP=1 \
-  --set=PGSHARD_ALLOW_EMPTY_DATABASE_TOPOLOGY="$catalog_requires_initial_inventory" \
-  --file="$database_genesis" >/dev/null
+PGOPTIONS="$PGOPTIONS -c default_transaction_isolation=read\\ committed -c pgshard.bootstrap_allow_empty_database_topology=$catalog_requires_initial_inventory" \
+  psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
+    --set=ON_ERROR_STOP=1 --single-transaction \
+    --file="$database_topology_preflight" --file="$database_genesis" >/dev/null
 
 read_catalog_role_state() {
   psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
@@ -3187,6 +3157,8 @@ type catalogCandidatePodTemplateReference struct {
 type catalogCandidateMaterializationBundle struct {
 	PostgreSQLConfiguration   catalogCandidateConfigurationReference `json:"postgresqlConfiguration"`
 	ShardschemaMigration      catalogCandidateContentReference       `json:"shardschemaMigration"`
+	ShardCount                string                                 `json:"shardCount"`
+	ShardInventory            catalogCandidateContentReference       `json:"shardInventory"`
 	DatabaseGenesis           catalogCandidateContentReference       `json:"databaseGenesis"`
 	DatabaseTopologyPreflight catalogCandidateContentReference       `json:"databaseTopologyPreflight"`
 	CatalogAccess             catalogCandidateCatalogAccessReference `json:"catalogAccess"`
@@ -3385,6 +3357,8 @@ func buildCatalogCandidateMaterializationBundle(
 			DataSHA256: configurationCheckpoint.DataSHA256,
 		},
 		ShardschemaMigration:      catalogCandidateContentReference{SHA256: shardschemaMigrationSHA256},
+		ShardCount:                fmt.Sprintf("%d", cluster.Spec.Shards),
+		ShardInventory:            catalogCandidateContentReference{SHA256: shardInventorySHA256},
 		DatabaseGenesis:           catalogCandidateContentReference{SHA256: contentSHA256(genesis)},
 		DatabaseTopologyPreflight: catalogCandidateContentReference{SHA256: contentSHA256(preflight)},
 		CatalogAccess: catalogCandidateCatalogAccessReference{
@@ -3403,6 +3377,8 @@ func buildCatalogCandidateMaterializationBundle(
 	bundle.SHA256 = canonicalJSONSHA256("pgshard-catalog-materialization-bundle-v1", struct {
 		PostgreSQLConfiguration   catalogCandidateConfigurationReference `json:"postgresqlConfiguration"`
 		ShardschemaMigration      catalogCandidateContentReference       `json:"shardschemaMigration"`
+		ShardCount                string                                 `json:"shardCount"`
+		ShardInventory            catalogCandidateContentReference       `json:"shardInventory"`
 		DatabaseGenesis           catalogCandidateContentReference       `json:"databaseGenesis"`
 		DatabaseTopologyPreflight catalogCandidateContentReference       `json:"databaseTopologyPreflight"`
 		CatalogAccess             catalogCandidateCatalogAccessReference `json:"catalogAccess"`
@@ -3411,6 +3387,7 @@ func buildCatalogCandidateMaterializationBundle(
 		TargetPodTemplate         catalogCandidatePodTemplateReference   `json:"targetPodTemplate"`
 	}{
 		PostgreSQLConfiguration: bundle.PostgreSQLConfiguration, ShardschemaMigration: bundle.ShardschemaMigration,
+		ShardCount: bundle.ShardCount, ShardInventory: bundle.ShardInventory,
 		DatabaseGenesis: bundle.DatabaseGenesis, DatabaseTopologyPreflight: bundle.DatabaseTopologyPreflight,
 		CatalogAccess: bundle.CatalogAccess, OperationWriterAccess: bundle.OperationWriterAccess,
 		ServingHBA: bundle.ServingHBA, TargetPodTemplate: bundle.TargetPodTemplate,
@@ -3623,9 +3600,7 @@ func renderDatabaseGenesisSQL(cluster *pgshardv1alpha1.PgShardCluster) string {
 
 	var output strings.Builder
 	output.WriteString("-- Generated by pgshard-operator. Manual edits are overwritten.\n")
-	output.WriteString("BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;\n")
 	output.WriteString("SET LOCAL search_path = pg_catalog;\n")
-	output.WriteString("\\i " + databaseTopologyPreflightPath + "\n")
 	for _, database := range databases {
 		fmt.Fprintf(
 			&output,
@@ -3655,7 +3630,6 @@ func renderDatabaseGenesisSQL(cluster *pgshardv1alpha1.PgShardCluster) string {
 	output.WriteString("]::text[]))\n  ) THEN\n")
 	output.WriteString("    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'database genesis contains an undeclared active logical database';\n")
 	output.WriteString("  END IF;\nEND\n$pgshard_database_genesis_postcondition$;\n")
-	output.WriteString("COMMIT;\n")
 	return output.String()
 }
 
@@ -3767,7 +3741,7 @@ func renderDatabaseTopologyPreflightSQL(cluster *pgshardv1alpha1.PgShardCluster)
 		output.WriteString("    SELECT 1\n")
 		output.WriteString("      FROM expected_ranges\n")
 		output.WriteString("      FULL JOIN actual_ranges USING (database_name, range_ordinal)\n")
-		output.WriteString("     WHERE (NOT pg_catalog.current_setting('pgshard.bootstrap_allow_empty_database_topology')::boolean\n")
+		output.WriteString("     WHERE (NOT COALESCE(pg_catalog.current_setting('pgshard.bootstrap_allow_empty_database_topology', true)::boolean, false)\n")
 		output.WriteString("            OR NOT (SELECT is_empty FROM actual_topology_state))\n")
 		output.WriteString("       AND (expected_ranges.range_start IS DISTINCT FROM actual_ranges.range_start\n")
 		output.WriteString("         OR expected_ranges.range_end IS DISTINCT FROM actual_ranges.range_end\n")
@@ -3793,9 +3767,6 @@ func renderDatabaseTopologyPreflightSQL(cluster *pgshardv1alpha1.PgShardCluster)
 	}
 
 	output.WriteString("-- Generated by pgshard-operator. Manual edits are overwritten.\n")
-	output.WriteString("\\if :{?PGSHARD_ALLOW_EMPTY_DATABASE_TOPOLOGY}\n")
-	output.WriteString("\\else\n\\set PGSHARD_ALLOW_EMPTY_DATABASE_TOPOLOGY false\n\\endif\n")
-	output.WriteString("SELECT pg_catalog.set_config('pgshard.bootstrap_allow_empty_database_topology', :'PGSHARD_ALLOW_EMPTY_DATABASE_TOPOLOGY', false);\n")
 	output.WriteString("DO $pgshard_database_topology_preflight$\nDECLARE\n  topology_mismatch boolean;\nBEGIN\n")
 	output.WriteString("  PERFORM state.catalog_epoch FROM pgshard_catalog.cluster_state AS state WHERE state.singleton FOR UPDATE;\n")
 	output.WriteString("  IF NOT FOUND THEN\n")
@@ -4584,6 +4555,8 @@ func postgresqlShardStatefulSet(cluster *pgshardv1alpha1.PgShardCluster, shard i
 			{Name: "PGSHARD_BOOTSTRAP_SHARDSCHEMA", Value: fmt.Sprintf("%t", shard == 0)},
 			{Name: "PGSHARD_SHARDSCHEMA_MIGRATION", Value: shardschemaMigrationPath},
 			{Name: "PGSHARD_SHARDSCHEMA_MIGRATION_SHA256", Value: shardschemaMigrationSHA256},
+			{Name: "PGSHARD_SHARD_INVENTORY", Value: shardInventoryPath},
+			{Name: "PGSHARD_SHARD_INVENTORY_SHA256", Value: shardInventorySHA256},
 			{Name: "PGSHARD_POSTGRESQL_CONFIG_SHA256", Value: configurationHash},
 			{Name: "PGSHARD_NODE_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: fmt.Sprintf("metadata.annotations['%s']", PostgreSQLNodeUIDAnnotation)}}},
 			{Name: "PGSHARD_NODE_BOOT_ID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: fmt.Sprintf("metadata.annotations['%s']", PostgreSQLNodeBootIDAnnotation)}}},
@@ -4761,6 +4734,7 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 			corev1.EnvVar{Name: "PGSHARD_CATALOG_ACTIVATION_TLS_BIND", Value: fmt.Sprintf("0.0.0.0:%d", CatalogActivationTLSPort)},
 			corev1.EnvVar{Name: "PGSHARD_CATALOG_ACTIVATION_TLS_CERT_FILE", Value: catalogActivationTLSMountPath + "/tls.crt"},
 			corev1.EnvVar{Name: "PGSHARD_CATALOG_ACTIVATION_TLS_KEY_FILE", Value: catalogActivationTLSMountPath + "/tls.key"},
+			corev1.EnvVar{Name: "PGSHARD_CATALOG_ACTIVATION_INVENTORY_FILE", Value: shardInventoryPath},
 		)
 		agent.Ports = append(agent.Ports, corev1.ContainerPort{Name: "activation-tls", ContainerPort: CatalogActivationTLSPort, Protocol: corev1.ProtocolTCP})
 		agent.VolumeMounts = append(agent.VolumeMounts, corev1.VolumeMount{
@@ -4787,6 +4761,8 @@ func postgresqlReplicationBootstrapSourceStatefulSet(cluster *pgshardv1alpha1.Pg
 			{Name: "PGSHARD_REPLICATION_MATERIAL_SHA256", Value: replicationCredential.MaterialSHA256},
 			{Name: "PGSHARD_SHARDSCHEMA_MIGRATION", Value: shardschemaMigrationPath},
 			{Name: "PGSHARD_SHARDSCHEMA_MIGRATION_SHA256", Value: shardschemaMigrationSHA256},
+			{Name: "PGSHARD_SHARD_INVENTORY", Value: shardInventoryPath},
+			{Name: "PGSHARD_SHARD_INVENTORY_SHA256", Value: shardInventorySHA256},
 			{Name: "PGSHARD_POSTGRESQL_CONFIG_SHA256", Value: configurationHash},
 			{Name: "PGSHARD_NODE_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: fmt.Sprintf("metadata.annotations['%s']", PostgreSQLNodeUIDAnnotation)}}},
 			{Name: "PGSHARD_NODE_BOOT_ID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: fmt.Sprintf("metadata.annotations['%s']", PostgreSQLNodeBootIDAnnotation)}}},

@@ -95,7 +95,8 @@ func validCatalogActivationRequest() CatalogActivationRequest {
 			Catalog:                 CatalogActivationCatalogMaterialIdentity{CatalogActivationObjectIdentity: CatalogActivationObjectIdentity{Name: "catalog", UID: "catalog-uid"}, ClientSHA256: activationDigest(4), ServerSHA256: activationDigest(5)},
 			OperationWriter:         CatalogActivationMaterialIdentity{CatalogActivationObjectIdentity: CatalogActivationObjectIdentity{Name: "writer", UID: "writer-uid"}, MaterialSHA256: activationDigest(6)},
 			PostgreSQLConfiguration: CatalogActivationMaterialIdentity{CatalogActivationObjectIdentity: CatalogActivationObjectIdentity{Name: "configuration", UID: "configuration-uid"}, MaterialSHA256: activationDigest(7)},
-			MigrationSHA256:         activationDigest(8), GenesisSHA256: activationDigest(9), PreflightSHA256: activationDigest(10),
+			MigrationSHA256:         activationDigest(8), ShardCount: "4", InventorySHA256: activationDigest(13),
+			GenesisSHA256: activationDigest(9), PreflightSHA256: activationDigest(10),
 			ServingHBAVersion: "pgshard.catalog-serving-hba.v1", ServingHBASHA256: activationDigest(11), TargetTemplateSHA256: activationDigest(12),
 		},
 		Source: CatalogActivationSource{
@@ -150,7 +151,7 @@ func TestCatalogActivationDigestMatchesRustGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if digest != "2272dfe2f91126128f51746efed94637f326ea31fa8e83f1dff0e90be5d2f3aa" {
+	if digest != "0b10365ffc4250f986f2c23bb645db092359526808b4d1ef841e6ce98c9f2685" {
 		t.Fatalf("catalog activation request digest = %s", digest)
 	}
 	changed := validCatalogActivationRequest()
@@ -200,7 +201,7 @@ func TestCatalogActivationDigestMatchesRustGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if longDigest != "3c747fc699f1711f61e5f2be413de395a1eb3e081bc7b1eaa25455eb2a881809" {
+	if longDigest != "e3595fd49c95f87e456c22ff2a81e5785f2260b3bc49786df5d87d1cc6f5f4a1" {
 		t.Fatalf("long-name catalog activation request digest = %s", longDigest)
 	}
 }
