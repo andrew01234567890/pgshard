@@ -276,6 +276,15 @@ impl<'a> Scanner<'a> {
     /// inspected, never narrow it.
     fn consume_number(&mut self) -> Result<(), CatalogMaterializationProgramError> {
         self.consume_numeric_run();
+        // A fractional part belongs to the literal, including the empty one in
+        // `1.`: flex's `numeric` covers it, so `1.e-` is a `realfail` match that
+        // swallows the sign. Leaving the `.` to be scanned separately took the
+        // token out of numeric context and let a following `--` open a comment
+        // that `psql` does not open.
+        if self.peek(0) == Some(b'.') {
+            self.pos += 1;
+            self.consume_numeric_run();
+        }
         if matches!(self.peek(0), Some(b'-' | b'+')) {
             // A sign closing a valid exponent belongs to the literal. A sign
             // that is not part of one is where flex's `realfail` rule competes
@@ -897,6 +906,13 @@ mod tests {
         assert_rejects_caller_framed("SELECT 1e-5$q$ $q$ \\echo PWNED\n$q$;\n");
         // A statement smuggled past the envelope accounting by the same desync.
         assert_rejects_caller_framed("SELECT 1$q$ $q$;\nSELECT 'smuggled';\n$q$;\n");
+        // A fractional part keeps the token in numeric context, so the sign
+        // guard governs `1.e-` — the `realfail` shape that hides a following
+        // `--` from `psql` while the scanner reads it as a comment.
+        assert_rejects_self_framed("BEGIN;\nSELECT 1.e--:v\n;\nCOMMIT;\n");
+        assert_rejects_caller_framed("SELECT 1.e--\\echo PWNED\n;\n");
+        assert_rejects_caller_framed("SELECT 1.--\\echo PWNED\n;\n");
+        assert_accepts_caller_framed("SELECT 1.e-5, 1.e+5, 1.5, 1.;\n");
         assert_rejects_caller_framed("SELECT 1e5$q$ \\echo PWNED $q$;\n");
         assert_rejects_caller_framed("SELECT 1.5e2$q$ \\echo PWNED $q$;\n");
         assert_rejects_caller_framed("SELECT 1e5$$ \\echo PWNED $$;\n");
