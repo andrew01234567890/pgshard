@@ -413,7 +413,7 @@ func assertManagedAdmissionTLS(t *testing.T, ctx context.Context, kubeClient cli
 	if err := kubeClient.Get(ctx, types.NamespacedName{Name: "pgshard-validating-webhook-configuration"}, validating); err != nil {
 		t.Fatal(err)
 	}
-	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 7 {
+	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 13 {
 		t.Fatalf("injected CA bundles = %#v / %#v", mutating.Webhooks, validating.Webhooks)
 	}
 	for _, webhook := range mutating.Webhooks {
@@ -426,6 +426,43 @@ func assertManagedAdmissionTLS(t *testing.T, ctx context.Context, kubeClient cli
 			t.Fatalf("validating webhook %s CA bundle was not injected", webhook.Name)
 		}
 	}
+	assertLiveEnforcingNamespaceReservation(t, validating)
+}
+
+// assertLiveEnforcingNamespaceReservation pins the LIVE shape of the 13th
+// validating webhook — the enforcing-label reservation entry: fail-closed,
+// covering namespaces CREATE+UPDATE (plus status/finalize), and selected by the
+// enforcing-label KEY (Exists) so a bogus value can never be pre-seeded on any
+// namespace, fenced or not.
+func assertLiveEnforcingNamespaceReservation(t *testing.T, validating *admissionregistrationv1.ValidatingWebhookConfiguration) {
+	t.Helper()
+	for i := range validating.Webhooks {
+		webhook := &validating.Webhooks[i]
+		if webhook.Name != podfence.EnforcingNamespaceWebhookName {
+			continue
+		}
+		if webhook.FailurePolicy == nil || *webhook.FailurePolicy != admissionregistrationv1.Fail {
+			t.Fatalf("enforcing-namespace reservation is not fail-closed: %#v", webhook.FailurePolicy)
+		}
+		if webhook.ClientConfig.Service == nil || webhook.ClientConfig.Service.Path == nil || *webhook.ClientConfig.Service.Path != podfence.NamespaceWebhookPath {
+			t.Fatalf("enforcing-namespace reservation does not share the namespace handler path: %#v", webhook.ClientConfig.Service)
+		}
+		if len(webhook.Rules) != 1 ||
+			len(webhook.Rules[0].Operations) != 2 ||
+			webhook.Rules[0].Operations[0] != admissionregistrationv1.Create ||
+			webhook.Rules[0].Operations[1] != admissionregistrationv1.Update ||
+			len(webhook.Rules[0].Resources) != 3 || webhook.Rules[0].Resources[0] != "namespaces" {
+			t.Fatalf("enforcing-namespace reservation rules = %#v", webhook.Rules)
+		}
+		selector := webhook.ObjectSelector
+		if selector == nil || len(selector.MatchLabels) != 0 || len(selector.MatchExpressions) != 1 ||
+			selector.MatchExpressions[0].Key != podfence.NamespaceEnforcingLabel ||
+			selector.MatchExpressions[0].Operator != metav1.LabelSelectorOpExists {
+			t.Fatalf("enforcing-namespace reservation objectSelector = %#v", selector)
+		}
+		return
+	}
+	t.Fatalf("enforcing-namespace reservation webhook %q is not installed", podfence.EnforcingNamespaceWebhookName)
 }
 
 func readDevelopmentSample(t *testing.T) *pgshardv1alpha1.PgShardCluster {

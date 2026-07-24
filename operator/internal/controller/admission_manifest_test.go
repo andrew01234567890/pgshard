@@ -4,10 +4,10 @@ import (
 	"io"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
-	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -122,17 +122,37 @@ func TestAdmissionResourcesArePrecreatedAndExactlyScoped(t *testing.T) {
 		t.Fatalf("webhook RBAC bindings = %#v / %#v", secretBinding, configurationBinding)
 	}
 	mutatingSelectors := readManifest[admissionregistrationv1.MutatingWebhookConfiguration](t, "../../config/webhook/mutating_selectors_patch.yaml")
-	if len(mutatingSelectors.Webhooks) != 3 || mutatingSelectors.Webhooks[0].Name != podfence.BindingWebhookName || mutatingSelectors.Webhooks[0].NamespaceSelector == nil || mutatingSelectors.Webhooks[0].NamespaceSelector.MatchLabels[podfence.NamespaceLabel] != podfence.NamespaceLabelValue || mutatingSelectors.Webhooks[1].Name != podfence.StatusWebhookName || !selectsManagedPostgreSQL(mutatingSelectors.Webhooks[1].ObjectSelector) || mutatingSelectors.Webhooks[2].Name != podfence.HandshakeWebhookName || !selectsFencingNamespace(mutatingSelectors.Webhooks[2].NamespaceSelector) {
+	if len(mutatingSelectors.Webhooks) != 3 || mutatingSelectors.Webhooks[0].Name != podfence.BindingWebhookName || mutatingSelectors.Webhooks[0].NamespaceSelector == nil || mutatingSelectors.Webhooks[0].NamespaceSelector.MatchLabels[podfence.NamespaceLabel] != podfence.NamespaceLabelValue || mutatingSelectors.Webhooks[1].Name != podfence.StatusWebhookName || !selectsFencingNamespace(mutatingSelectors.Webhooks[1].NamespaceSelector) || mutatingSelectors.Webhooks[2].Name != podfence.HandshakeWebhookName || !selectsFencingNamespace(mutatingSelectors.Webhooks[2].NamespaceSelector) {
 		t.Fatalf("mutating webhook selector patch = %#v", mutatingSelectors.Webhooks)
 	}
 	validatingSelectors := readManifest[admissionregistrationv1.ValidatingWebhookConfiguration](t, "../../config/webhook/validating_selectors_patch.yaml")
-	if len(validatingSelectors.Webhooks) != 4 ||
-		validatingSelectors.Webhooks[0].Name != podfence.MetadataWebhookName || !selectsManagedPostgreSQL(validatingSelectors.Webhooks[0].ObjectSelector) ||
+	if len(validatingSelectors.Webhooks) != 10 ||
+		validatingSelectors.Webhooks[0].Name != podfence.MetadataWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[0].NamespaceSelector) ||
 		validatingSelectors.Webhooks[1].Name != podfence.NamespaceWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[1].ObjectSelector) ||
-		validatingSelectors.Webhooks[2].Name != podfence.StatusValidationWebhookName || !selectsManagedPostgreSQL(validatingSelectors.Webhooks[2].ObjectSelector) ||
-		validatingSelectors.Webhooks[3].Name != podfence.BindingValidationWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[3].NamespaceSelector) {
+		validatingSelectors.Webhooks[2].Name != podfence.EnforcingNamespaceWebhookName || !selectsEnforcingLabelKey(validatingSelectors.Webhooks[2].ObjectSelector) ||
+		validatingSelectors.Webhooks[3].Name != podfence.StatusValidationWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[3].NamespaceSelector) ||
+		validatingSelectors.Webhooks[4].Name != podfence.BindingValidationWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[4].NamespaceSelector) ||
+		validatingSelectors.Webhooks[5].Name != podfence.PodCreateWebhookName || !selectsFencingNamespace(validatingSelectors.Webhooks[5].NamespaceSelector) ||
+		validatingSelectors.Webhooks[6].Name != podfence.WorkloadWebhookName || !selectsEnforcingIsolationNamespace(validatingSelectors.Webhooks[6].NamespaceSelector) ||
+		validatingSelectors.Webhooks[7].Name != podfence.PodConnectFencedWebhookName || !selectsEnforcingIsolationNamespace(validatingSelectors.Webhooks[7].NamespaceSelector) ||
+		validatingSelectors.Webhooks[8].Name != podfence.PodConnectManagerWebhookName || !selectsOperatorNamespace(validatingSelectors.Webhooks[8].NamespaceSelector) ||
+		validatingSelectors.Webhooks[9].Name != podfence.LimitRangeWebhookName || !selectsEnforcingIsolationNamespace(validatingSelectors.Webhooks[9].NamespaceSelector) {
 		t.Fatalf("validating webhook selector patch = %#v", validatingSelectors.Webhooks)
 	}
+}
+
+func selectsOperatorNamespace(selector *metav1.LabelSelector) bool {
+	return selector != nil && selector.MatchLabels["kubernetes.io/metadata.name"] == "pgshard-system" && len(selector.MatchLabels) == 1 && len(selector.MatchExpressions) == 0
+}
+
+// selectsEnforcingLabelKey matches the enforcing-namespace webhook's objectSelector,
+// which fires for ANY namespace carrying the enforcing label KEY (any value) so a
+// bogus value cannot be planted on an un-fenced namespace and later wedge activation.
+func selectsEnforcingLabelKey(selector *metav1.LabelSelector) bool {
+	return selector != nil && len(selector.MatchLabels) == 0 && len(selector.MatchExpressions) == 1 &&
+		selector.MatchExpressions[0].Key == podfence.NamespaceEnforcingLabel &&
+		selector.MatchExpressions[0].Operator == metav1.LabelSelectorOpExists &&
+		len(selector.MatchExpressions[0].Values) == 0
 }
 
 func TestGeneratedWebhookConfigurationsStayFailClosedAndBounded(t *testing.T) {
@@ -155,7 +175,7 @@ func TestGeneratedWebhookConfigurationsStayFailClosedAndBounded(t *testing.T) {
 	if err := decoder.Decode(&extra); err != io.EOF {
 		t.Fatalf("unexpected third webhook manifest: %v", err)
 	}
-	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 7 {
+	if len(mutating.Webhooks) != 4 || len(validating.Webhooks) != 13 {
 		t.Fatalf("generated webhooks = %#v / %#v", mutating.Webhooks, validating.Webhooks)
 	}
 	activationFound := false
@@ -186,10 +206,100 @@ func assertWebhookPolicy(t *testing.T, clientConfig admissionregistrationv1.Webh
 	}
 }
 
-func selectsManagedPostgreSQL(selector *metav1.LabelSelector) bool {
-	return selector != nil && selector.MatchLabels[owned.ManagedByLabel] == owned.ManagedByValue && selector.MatchLabels[owned.ComponentLabel] == "postgresql" && len(selector.MatchLabels) == 2 && len(selector.MatchExpressions) == 0
-}
-
 func selectsFencingNamespace(selector *metav1.LabelSelector) bool {
 	return selector != nil && selector.MatchLabels[podfence.NamespaceLabel] == podfence.NamespaceLabelValue && len(selector.MatchLabels) == 1 && len(selector.MatchExpressions) == 0
+}
+
+// selectsEnforcingIsolationNamespace matches every genuinely-new isolation
+// webhook's selector (WorkloadIntegrity, PodConnect, LimitRange), which requires
+// BOTH the fencing label AND the isolation-enforcing label, so it fires only for a
+// namespace whose isolation is in a non-INACTIVE phase (QUIESCE/RECREATE/ACTIVE).
+func selectsEnforcingIsolationNamespace(selector *metav1.LabelSelector) bool {
+	return selector != nil &&
+		selector.MatchLabels[podfence.NamespaceLabel] == podfence.NamespaceLabelValue &&
+		selector.MatchLabels[podfence.NamespaceEnforcingLabel] == podfence.NamespaceEnforcingLabelValue &&
+		len(selector.MatchLabels) == 2 && len(selector.MatchExpressions) == 0
+}
+
+func TestManagerTokenRequestPolicyShape(t *testing.T) {
+	t.Parallel()
+	const policyPath = "../../config/admission/validatingadmissionpolicy_tokenrequest.yaml"
+	raw, err := os.ReadFile(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The policy is namespace-independent by design: it identifies the manager
+	// token by service-account name cluster-wide, so it must not hardcode any
+	// installation namespace that a namespace change would leave stale and
+	// fail-open.
+	if strings.Contains(string(raw), "pgshard-system") {
+		t.Fatalf("TokenRequest policy hardcodes an installation namespace")
+	}
+	file, err := os.Open(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	decoder := yamlutil.NewYAMLOrJSONDecoder(file, 4096)
+
+	policy := &admissionregistrationv1.ValidatingAdmissionPolicy{}
+	if err := decoder.Decode(policy); err != nil {
+		t.Fatal(err)
+	}
+	binding := &admissionregistrationv1.ValidatingAdmissionPolicyBinding{}
+	if err := decoder.Decode(binding); err != nil {
+		t.Fatal(err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		t.Fatalf("unexpected third TokenRequest policy document: %v", err)
+	}
+
+	if policy.Name != "pgshard-manager-tokenrequest" || policy.Spec.FailurePolicy == nil || *policy.Spec.FailurePolicy != admissionregistrationv1.Fail {
+		t.Fatalf("policy identity/failurePolicy = %#v", policy.Spec.FailurePolicy)
+	}
+	if policy.Spec.MatchConstraints == nil || len(policy.Spec.MatchConstraints.ResourceRules) != 1 {
+		t.Fatalf("policy matchConstraints = %#v", policy.Spec.MatchConstraints)
+	}
+	rule := policy.Spec.MatchConstraints.ResourceRules[0]
+	if !slices.Contains(rule.APIGroups, "") || !slices.Contains(rule.Resources, "serviceaccounts/token") ||
+		!slices.Contains(rule.Operations, admissionregistrationv1.Create) {
+		t.Fatalf("policy resource rule = %#v", rule)
+	}
+
+	expressions := ""
+	for _, validation := range policy.Spec.Validations {
+		expressions += validation.Expression + "\n"
+	}
+	for _, predicate := range []string{
+		"request.userInfo.username.startsWith('system:node:')",
+		"'system:nodes' in request.userInfo.groups",
+		"object.spec.boundObjectRef.kind == 'Pod'",
+		"object.spec.audiences",
+		"object.spec.expirationSeconds == 3607",
+		"object.spec.expirationSeconds <= 3600",
+		"request.name == 'pgshard-controller-manager'",
+	} {
+		if !strings.Contains(expressions+policyVariableExpressions(policy), predicate) {
+			t.Fatalf("policy validations are missing predicate %q", predicate)
+		}
+	}
+
+	if binding.Spec.PolicyName != policy.Name || !slices.Contains(binding.Spec.ValidationActions, admissionregistrationv1.Deny) {
+		t.Fatalf("policy binding = %#v", binding.Spec)
+	}
+	// The binding must select every namespace (no namespace-scoping) so a
+	// non-default installation namespace cannot escape the policy.
+	if binding.Spec.MatchResources != nil && binding.Spec.MatchResources.NamespaceSelector != nil &&
+		len(binding.Spec.MatchResources.NamespaceSelector.MatchLabels)+len(binding.Spec.MatchResources.NamespaceSelector.MatchExpressions) != 0 {
+		t.Fatalf("policy binding is namespace-scoped: %#v", binding.Spec.MatchResources)
+	}
+}
+
+func policyVariableExpressions(policy *admissionregistrationv1.ValidatingAdmissionPolicy) string {
+	joined := ""
+	for _, variable := range policy.Spec.Variables {
+		joined += variable.Expression + "\n"
+	}
+	return joined
 }

@@ -102,6 +102,106 @@ func TestStaticServerBundleFailsBeforeExpiry(t *testing.T) {
 	}
 }
 
+func TestReplicationTLSBundleRoundTrip(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.July, 17, 12, 0, 0, 0, time.UTC)
+	memberDNSNames := map[int32][]string{
+		0: {"demo-shard-0000-0.demo-shard-0000.default.svc"},
+		1: {"demo-shard-0000-m0001-0.demo-shard-0000.default.svc"},
+		2: {"demo-shard-0000-m0002-0.demo-shard-0000.default.svc"},
+	}
+	bundle, err := GenerateReplicationTLSBundle(now, rand.Reader, "example replication CA", memberDNSNames)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caNotAfter, err := ValidateReplicationTLSCA(bundle.CACertificate, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !caNotAfter.Equal(bundle.CANotAfter) {
+		t.Fatalf("CA NotAfter = %v, want %v", caNotAfter, bundle.CANotAfter)
+	}
+	if len(bundle.Servers) != len(memberDNSNames) {
+		t.Fatalf("issued servers = %d, want %d", len(bundle.Servers), len(memberDNSNames))
+	}
+	for member, names := range memberDNSNames {
+		material := bundle.Servers[member]
+		notAfter, err := ValidateReplicationTLSServer(bundle.CACertificate, material.Certificate, material.PrivateKey, names, now)
+		if err != nil {
+			t.Fatalf("member %d: %v", member, err)
+		}
+		if !notAfter.Equal(material.NotAfter) {
+			t.Fatalf("member %d NotAfter = %v, want %v", member, notAfter, material.NotAfter)
+		}
+		for other, otherNames := range memberDNSNames {
+			if other == member {
+				continue
+			}
+			if _, err := ValidateReplicationTLSServer(bundle.CACertificate, material.Certificate, material.PrivateKey, otherNames, now); err == nil {
+				t.Fatalf("member %d certificate validated for member %d's DNS name", member, other)
+			}
+		}
+	}
+}
+
+func TestReplicationTLSBundleRejectsMismatchedMaterial(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.July, 17, 12, 0, 0, 0, time.UTC)
+	names := map[int32][]string{0: {"demo-shard-0000-0.demo-shard-0000.default.svc"}}
+	first, err := GenerateReplicationTLSBundle(now, rand.Reader, "first replication CA", names)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := GenerateReplicationTLSBundle(now, rand.Reader, "second replication CA", names)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ValidateReplicationTLSServer(second.CACertificate, first.Servers[0].Certificate, first.Servers[0].PrivateKey, names[0], now); err == nil || !strings.Contains(err.Error(), "exact configured DNS name") {
+		t.Fatalf("foreign CA error = %v", err)
+	}
+	if _, err := ValidateReplicationTLSServer(first.CACertificate, first.Servers[0].Certificate, second.Servers[0].PrivateKey, names[0], now); err == nil || !strings.Contains(err.Error(), "do not form a key pair") {
+		t.Fatalf("mismatched key error = %v", err)
+	}
+	if _, err := ValidateReplicationTLSServer(first.Servers[0].Certificate, first.Servers[0].Certificate, first.Servers[0].PrivateKey, names[0], now); err == nil {
+		t.Fatal("leaf certificate was accepted as a CA")
+	}
+	checkAt := now.Add(staticServerValidity - staticRenewBefore + time.Second)
+	if _, err := ValidateReplicationTLSServer(first.CACertificate, first.Servers[0].Certificate, first.Servers[0].PrivateKey, names[0], checkAt); err == nil || !strings.Contains(err.Error(), "zero-downtime certificate rotation is not implemented") {
+		t.Fatalf("near-expiry error = %v", err)
+	}
+}
+
+func TestReplicationTLSBundleRequiresExactlyOneSANPerLeaf(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.July, 17, 12, 0, 0, 0, time.UTC)
+	if _, err := GenerateReplicationTLSBundle(now, rand.Reader, "example replication CA", map[int32][]string{
+		0: {"demo-a.default.svc", "demo-b.default.svc"},
+	}); err == nil || !strings.Contains(err.Error(), "exactly one non-empty DNS name") {
+		t.Fatalf("multi-SAN issuance error = %v", err)
+	}
+	if _, err := GenerateReplicationTLSBundle(now, rand.Reader, "example replication CA", map[int32][]string{0: {" "}}); err == nil || !strings.Contains(err.Error(), "exactly one non-empty DNS name") {
+		t.Fatalf("blank SAN issuance error = %v", err)
+	}
+	if _, err := GenerateReplicationTLSBundle(now, rand.Reader, "example replication CA", nil); err == nil || !strings.Contains(err.Error(), "at least one member") {
+		t.Fatalf("empty member set error = %v", err)
+	}
+	if _, err := GenerateReplicationTLSBundle(now, rand.Reader, "example replication CA", map[int32][]string{-1: {"demo.default.svc"}}); err == nil || !strings.Contains(err.Error(), "not a valid shard member") {
+		t.Fatalf("negative member error = %v", err)
+	}
+
+	names := []string{"demo-shard-0000-0.demo-shard-0000.default.svc"}
+	multiSAN, err := GenerateStaticServerBundle(now, rand.Reader, "example catalog CA", []string{names[0], "second.default.svc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ValidateReplicationTLSServer(multiSAN.CACertificate, multiSAN.ServerCertificate, multiSAN.ServerPrivateKey, names, now); err == nil || !strings.Contains(err.Error(), "exactly one DNS name") {
+		t.Fatalf("multi-SAN validation error = %v", err)
+	}
+	if _, err := ValidateReplicationTLSServer(multiSAN.CACertificate, multiSAN.ServerCertificate, multiSAN.ServerPrivateKey, []string{names[0], "second.default.svc"}, now); err == nil || !strings.Contains(err.Error(), "exactly one non-empty DNS name") {
+		t.Fatalf("multi-name validation request error = %v", err)
+	}
+}
+
 func TestGenerateStaticServerBundleValidatesInputs(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, time.July, 17, 12, 0, 0, 0, time.UTC)

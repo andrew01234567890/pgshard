@@ -4,6 +4,8 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"strings"
+	"time"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/operator/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/operator/internal/controller"
@@ -12,6 +14,9 @@ import (
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"net/http"
+
+	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -33,13 +38,15 @@ func init() {
 }
 
 type commandOptions struct {
-	metricsAddress string
-	probeAddress   string
-	leaderElection bool
-	secureMetrics  bool
-	webhookEnabled bool
-	webhook        webhookCommandOptions
-	images         owned.Images
+	metricsAddress              string
+	probeAddress                string
+	leaderElection              bool
+	secureMetrics               bool
+	webhookEnabled              bool
+	attestedRequestTimeout      time.Duration
+	unenumerableHAAckNamespaces string
+	webhook                     webhookCommandOptions
+	images                      owned.Images
 }
 
 type webhookCommandOptions struct {
@@ -51,6 +58,10 @@ type webhookCommandOptions struct {
 	mutatingConfigurationName   string
 	validatingConfigurationName string
 	certificateDirectory        string
+	statefulSetControllerName   string
+	replicaSetControllerName    string
+	deploymentControllerName    string
+	hpaControllerName           string
 }
 
 func bindCommandFlags(flags *flag.FlagSet) *commandOptions {
@@ -68,12 +79,30 @@ func bindCommandFlags(flags *flag.FlagSet) *commandOptions {
 	flags.StringVar(&options.webhook.mutatingConfigurationName, "webhook-mutating-configuration-name", "pgshard-mutating-webhook-configuration", "mutating webhook configuration name")
 	flags.StringVar(&options.webhook.validatingConfigurationName, "webhook-validating-configuration-name", "pgshard-validating-webhook-configuration", "validating webhook configuration name")
 	flags.StringVar(&options.webhook.certificateDirectory, "webhook-cert-dir", "/tmp/k8s-webhook-server/serving-certs", "private directory for generated webhook certificate files")
+	flags.StringVar(&options.webhook.statefulSetControllerName, "statefulset-controller-identity", "system:serviceaccount:kube-system:statefulset-controller", "authenticated username of the built-in StatefulSet controller that creates managed member pods")
+	flags.StringVar(&options.webhook.replicaSetControllerName, "replicaset-controller-identity", "system:serviceaccount:kube-system:replicaset-controller", "authenticated username of the built-in ReplicaSet controller that creates managed supporting pods")
+	flags.StringVar(&options.webhook.deploymentControllerName, "deployment-controller-identity", "system:serviceaccount:kube-system:deployment-controller", "authenticated username of the built-in Deployment controller that creates managed supporting ReplicaSets")
+	flags.StringVar(&options.webhook.hpaControllerName, "horizontalpodautoscaler-controller-identity", "system:serviceaccount:kube-system:horizontal-pod-autoscaler", "authenticated username of the built-in HorizontalPodAutoscaler controller, verified by the activation identity probe")
+	flags.DurationVar(&options.attestedRequestTimeout, "attested-max-request-timeout", 0, "installation-attested maximum whole-request lifetime across every API server (the effective --request-timeout ceiling); zero means unattested, which withholds isolation activation")
+	flags.StringVar(&options.unenumerableHAAckNamespaces, "allow-unenumerable-ha-isolation-namespaces", "", "comma-separated namespaces the cluster administrator attests may activate isolation over a single published API-server endpoint the EndpointSlices cannot prove is the complete physical backend set (opaque VIP); admin-controlled at install. RATIFIED CONSTRAINT: isolation ACTIVE requires IMMUTABLE control-plane API-server membership for its WHOLE active lifetime — the operator continuously re-proves the dispatch tuple while ACTIVE and re-quiesces (availability blip) on any backend-set/webhook-config change, and in the worst case between detection there is a brief exposure window an admission gate cannot close; control-plane upgrades/scaling while ACTIVE are therefore unsupported and will trigger a re-quiesce")
 	flags.StringVar(&options.images.Orchestrator, "orchestrator-image", options.images.Orchestrator, "pgshard orchestrator image reference")
 	flags.StringVar(&options.images.Pooler, "pooler-image", options.images.Pooler, "pgshard pooler image reference")
 	flags.StringVar(&options.images.PostgreSQL, "postgresql-image", options.images.PostgreSQL, "PostgreSQL 18 image reference")
 	flags.StringVar(&options.images.PostgreSQLBootstrap, "postgresql-bootstrap-image", options.images.PostgreSQLBootstrap, "digest-pinned pgshard PostgreSQL 18 bootstrap image required for single-member clusters and multi-member agent-quarantine composition; pgshard/postgres-agent:dev is local-only")
 	flags.Var(&options.images.PostgreSQLRuntime, "postgresql-runtime", "creation-time PostgreSQL process composition: direct or the explicit non-serving agent-quarantine integration mode; existing workload changes are rejected")
 	return options
+}
+
+// parseNamespaceSet turns a comma-separated flag value into a set, dropping empty
+// entries and surrounding whitespace.
+func parseNamespaceSet(raw string) map[string]bool {
+	set := map[string]bool{}
+	for _, entry := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(entry); trimmed != "" {
+			set[trimmed] = true
+		}
+	}
+	return set
 }
 
 func main() {
@@ -120,11 +149,31 @@ func main() {
 		AnchorSecret:     client.ObjectKey{Namespace: options.webhook.namespace, Name: options.webhook.caSecretName},
 		AnchorAnnotation: pki.PodFencingKeyFingerprintAnnotation,
 	}
+	controllerIdentities := podfence.ControllerIdentities{
+		Operator:                          "system:serviceaccount:" + options.webhook.namespace + ":pgshard-controller-manager",
+		StatefulSetController:             options.webhook.statefulSetControllerName,
+		ReplicaSetController:              options.webhook.replicaSetControllerName,
+		DeploymentController:              options.webhook.deploymentControllerName,
+		HorizontalPodAutoscalerController: options.webhook.hpaControllerName,
+	}
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(restConfig)
+	if err != nil {
+		setupLog.Error(err, "unable to build discovery client for the activation preflight")
+		os.Exit(1)
+	}
+	identityProbeStore := podfence.NewIdentityObservationStore()
 	if err := (&controller.PgShardClusterReconciler{
-		Client:               manager.GetClient(),
-		APIReader:            manager.GetAPIReader(),
-		Images:               options.images,
-		PodFencingReceiptKey: receiptKey,
+		Client:                      manager.GetClient(),
+		APIReader:                   manager.GetAPIReader(),
+		Images:                      options.images,
+		PodFencingReceiptKey:        receiptKey,
+		ControllerIdents:            controllerIdentities,
+		DispatchProber:              controller.NewServerDispatchProber(manager.GetAPIReader(), restConfig, options.webhook.namespace, options.webhook.validatingConfigurationName),
+		MinorGate:                   controller.NewServerVersionGate(discoveryClient),
+		IdentityProber:              controller.NewServerControllerIdentityProber(manager.GetClient(), controllerIdentities, identityProbeStore),
+		AttestedRequestTimeout:      options.attestedRequestTimeout,
+		ValidatingWebhookConfigName: options.webhook.validatingConfigurationName,
+		UnenumerableHAAckNamespaces: parseNamespaceSet(options.unenumerableHAAckNamespaces),
 	}).SetupWithManager(manager); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PgShardCluster")
 		os.Exit(1)
@@ -143,6 +192,7 @@ func main() {
 			WithValidator(&pgshardv1alpha1.PgShardClusterValidator{
 				FencingReceiptVerifier:    handshakeCodec,
 				FencingControllerUsername: "system:serviceaccount:" + options.webhook.namespace + ":pgshard-controller-manager",
+				NamespaceStateReader:      manager.GetAPIReader(),
 			}).
 			Complete(); err != nil {
 			setupLog.Error(err, "unable to create webhook", "webhook", "PgShardCluster")
@@ -177,11 +227,23 @@ func main() {
 		webhookServer.Register(podfence.MetadataWebhookPath, &admission.Webhook{
 			Handler: podfence.NewMetadataValidator(handshakeCodec, scheme),
 		})
+		webhookServer.Register(podfence.PodCreateWebhookPath, &admission.Webhook{
+			Handler: podfence.NewPodCreateValidator(manager.GetAPIReader(), controllerIdentities, scheme).WithIdentityProbeStore(identityProbeStore),
+		})
+		webhookServer.Register(podfence.WorkloadWebhookPath, &admission.Webhook{
+			Handler: podfence.NewWorkloadIntegrityValidator(manager.GetAPIReader(), controllerIdentities, scheme).WithIdentityProbeStore(identityProbeStore),
+		})
+		webhookServer.Register(podfence.PodConnectWebhookPath, &admission.Webhook{
+			Handler: podfence.NewPodConnectDenyValidator(manager.GetAPIReader(), options.webhook.namespace),
+		})
+		webhookServer.Register(podfence.LimitRangeWebhookPath, &admission.Webhook{
+			Handler: podfence.NewLimitRangeValidator(),
+		})
 		webhookServer.Register(podfence.StatusValidationWebhookPath, &admission.Webhook{
 			Handler: podfence.NewStatusValidator(manager.GetAPIReader(), handshakeCodec, scheme),
 		})
 		webhookServer.Register(podfence.NamespaceWebhookPath, &admission.Webhook{
-			Handler: podfence.NewNamespaceValidator(scheme),
+			Handler: podfence.NewNamespaceValidator(controllerIdentities.Operator, scheme),
 		})
 	}
 	if err := manager.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -230,6 +292,18 @@ func main() {
 		}
 		if err := manager.AddReadyzCheck("webhook-server", webhookServer.StartedChecker()); err != nil {
 			setupLog.Error(err, "unable to add webhook server readiness check")
+			os.Exit(1)
+		}
+		// The isolation webhooks read the durable receipt authoritatively per
+		// request; report not-ready until an uncached API read succeeds, so a
+		// freshly restarted manager never serves admission before it can load the
+		// durable isolation state.
+		apiReader := manager.GetAPIReader()
+		if err := manager.AddReadyzCheck("isolation-state-load", func(request *http.Request) error {
+			clusters := &pgshardv1alpha1.PgShardClusterList{}
+			return apiReader.List(request.Context(), clusters, client.Limit(1))
+		}); err != nil {
+			setupLog.Error(err, "unable to add isolation state readiness check")
 			os.Exit(1)
 		}
 	}

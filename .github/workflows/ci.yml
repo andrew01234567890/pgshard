@@ -627,7 +627,14 @@ jobs:
       needs.changes.outputs.go == 'true' ||
       needs.changes.outputs.images == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # 75m: image build + cluster setup (~15m), the shared smoke step under the
+    # direct runtime (30m bound), then the agent-quarantine composition switch
+    # followed by the isolation activation ceremony (bounded 40m, expected
+    # ~10-15m) and the agent-quarantine lease step (20m bound). The activation
+    # ceremony's multi-member server-tls-v1 bootstrap only provisions under the
+    # agent-quarantine runtime, so it runs after the switch. The cap covers the
+    # realistic tails of the steps, not the sum of their worst-case bounds.
+    timeout-minutes: 75
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -744,6 +751,24 @@ jobs:
               --output=json |
               jq --raw-output '.spec.template.spec.containers[] | select(.name == "manager") | .args[] | select(startswith("--postgresql-runtime="))'
           )" = "--postgresql-runtime=agent-quarantine"
+      # The isolation activation ceremony drives a multi-member server-tls-v1
+      # cluster from INACTIVE through CONVERGE->QUIESCE->RECREATE->ACTIVE. A
+      # multi-member cluster only checkpoints its PostgreSQL bootstrap spec — and
+      # therefore provisions shard members at all — under the agent-quarantine
+      # runtime (validatePostgreSQLRuntimeContract), so this MUST run AFTER the
+      # composition switch above. Under the direct runtime the reconcile silently
+      # never checkpoints, no shard StatefulSet is created, and the ceremony times
+      # out at TLS readiness. It runs first in the agent-quarantine phase for the
+      # most worker headroom; its multi-member bootstrap is the heaviest single
+      # lifecycle in the job (bounded 40m, expected ~10-15m).
+      - name: Verify the isolation activation ceremony
+        working-directory: operator
+        env:
+          PGSHARD_KIND_MANAGER_E2E: "true"
+        run: >-
+          go test -race -count=1 -timeout=40m
+          -run '^TestKINDManagerActivationCeremony$'
+          ./internal/controller
       - name: Verify exact Lease and target-fencing composition
         working-directory: operator
         env:

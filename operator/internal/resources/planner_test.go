@@ -81,10 +81,15 @@ func TestCatalogActivationJournalInitializerClearsInheritedSetgid(t *testing.T) 
 
 func TestPostgreSQLStandbyBootstrapScriptHasValidBashSyntax(t *testing.T) {
 	t.Parallel()
-	command := exec.Command("bash", "-n")
-	command.Stdin = strings.NewReader(postgresqlStandbyBootstrapScript)
-	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("PostgreSQL standby bootstrap script syntax: %v\n%s", err, output)
+	for name, replicationTLS := range map[string]bool{"server-tls": true, "legacy-cleartext": false} {
+		command := exec.Command("bash", "-n")
+		command.Stdin = strings.NewReader(PostgreSQLStandbyBootstrapScript(replicationTLS))
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("PostgreSQL standby bootstrap script syntax (%s): %v\n%s", name, err, output)
+		}
+	}
+	if strings.Contains(PostgreSQLStandbyBootstrapScript(true), "@PGSHARD_") || strings.Contains(PostgreSQLStandbyBootstrapScript(false), "@PGSHARD_") {
+		t.Fatal("standby bootstrap script retained an unrendered template placeholder")
 	}
 }
 
@@ -179,7 +184,7 @@ func TestPlanIsDeterministicAndWiresGeneratedConfiguration(t *testing.T) {
 		if service.Spec.Ports[0].Port != PostgreSQLPort || service.Spec.Ports[0].TargetPort.StrVal != "pooler-"+suffix {
 			t.Fatalf("%s service port = %#v", suffix, service.Spec.Ports[0])
 		}
-		if suffix == "rw" && !reflect.DeepEqual(service.Spec.Selector, componentSelector(cluster, "pooler")) {
+		if suffix == "rw" && !reflect.DeepEqual(service.Spec.Selector, hardenedComponentSelector(cluster, "pooler")) {
 			t.Fatalf("read-write Service selector = %#v", service.Spec.Selector)
 		}
 		if suffix != "rw" && service.Spec.Selector != nil {
@@ -541,7 +546,11 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 			t.Fatalf("PostgreSQL data volume = %#v", dataVolume)
 		}
 		pod := statefulSet.Spec.Template.Spec
-		if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken || pod.ServiceAccountName != "" || hasVolume(pod.Volumes, "kubernetes-api") || pod.NodeSelector[corev1.LabelOSStable] != "linux" || len(pod.InitContainers) != 1 || len(pod.Containers) != 1 {
+		// Direct-runtime members author the dedicated (already-created) agent
+		// ServiceAccount so stock ServiceAccount admission never sets "default"
+		// or injects default-SA imagePullSecrets, but keep automount off and
+		// project no token.
+		if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken || pod.ServiceAccountName != PostgreSQLAgentServiceAccountName(cluster.Name, shard) || hasVolume(pod.Volumes, "kubernetes-api") || pod.NodeSelector[corev1.LabelOSStable] != "linux" || len(pod.InitContainers) != 1 || len(pod.Containers) != 1 {
 			t.Fatalf("PostgreSQL Pod boundary = %#v", pod)
 		}
 		if pod.SecurityContext == nil || pod.SecurityContext.RunAsNonRoot == nil || !*pod.SecurityContext.RunAsNonRoot || pod.SecurityContext.RunAsUser == nil || *pod.SecurityContext.RunAsUser != 999 || pod.SecurityContext.FSGroup == nil || *pod.SecurityContext.FSGroup != 999 || pod.SecurityContext.FSGroupChangePolicy == nil || *pod.SecurityContext.FSGroupChangePolicy != corev1.FSGroupChangeOnRootMismatch {
@@ -3148,7 +3157,7 @@ func TestPlanIncludesSupportingAvailabilityControls(t *testing.T) {
 			t.Fatalf("PostgreSQL same-shard peers = %#v", postgresqlPeers)
 		}
 		agentPeers := postgresqlPolicy.Spec.Ingress[2].From
-		if len(agentPeers) != 1 || agentPeers[0].PodSelector == nil || agentPeers[0].NamespaceSelector != nil || agentPeers[0].IPBlock != nil || !maps.Equal(agentPeers[0].PodSelector.MatchLabels, componentSelector(cluster, "orchestrator")) || len(agentPeers[0].PodSelector.MatchExpressions) != 0 {
+		if len(agentPeers) != 1 || agentPeers[0].PodSelector == nil || agentPeers[0].NamespaceSelector != nil || agentPeers[0].IPBlock != nil || !maps.Equal(agentPeers[0].PodSelector.MatchLabels, hardenedComponentSelector(cluster, "orchestrator")) || len(agentPeers[0].PodSelector.MatchExpressions) != 0 {
 			t.Fatalf("PostgreSQL agent diagnostic peers = %#v", agentPeers)
 		}
 	}
@@ -3379,9 +3388,46 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 					if containsNamedVolumeMount(agent.VolumeMounts, "replication-credential") {
 						t.Fatalf("running PostgreSQL member %s retained the raw replication credential", object.Name)
 					}
+					shardTLS := cluster.Status.PostgreSQLReplicationTLS[shard]
 
 					if member == "0000" {
 						sources++
+						memberTLS := shardTLS.Members[0]
+						serverTLSSecretVolume := volumeByName(t, object.Spec.Template.Spec.Volumes, "server-tls-secret").Secret
+						if serverTLSSecretVolume == nil || serverTLSSecretVolume.SecretName != memberTLS.SecretName ||
+							serverTLSSecretVolume.DefaultMode == nil || *serverTLSSecretVolume.DefaultMode != 0o440 ||
+							!reflect.DeepEqual(secretItemKeys(serverTLSSecretVolume.Items), []string{PostgreSQLReplicationTLSCertificateKey, PostgreSQLReplicationTLSPrivateKeyKey}) {
+							t.Fatalf("bootstrap source %s server TLS projection = %#v", object.Name, serverTLSSecretVolume)
+						}
+						serverTLSVolume := volumeByName(t, object.Spec.Template.Spec.Volumes, "server-tls").EmptyDir
+						if serverTLSVolume == nil || serverTLSVolume.Medium != corev1.StorageMediumMemory {
+							t.Fatalf("bootstrap source %s server TLS staging volume = %#v", object.Name, serverTLSVolume)
+						}
+						if hasVolume(object.Spec.Template.Spec.Volumes, "replication-ca-secret") {
+							t.Fatalf("bootstrap source %s received the standby CA projection", object.Name)
+						}
+						var prepareServerTLS *corev1.Container
+						for index := range object.Spec.Template.Spec.InitContainers {
+							if object.Spec.Template.Spec.InitContainers[index].Name == "prepare-server-tls" {
+								prepareServerTLS = &object.Spec.Template.Spec.InitContainers[index]
+							}
+						}
+						if prepareServerTLS == nil ||
+							!reflect.DeepEqual(prepareServerTLS.Command, []string{"bash", "-ceu", PostgreSQLServerTLSPrepareScript}) ||
+							envValue(prepareServerTLS.Env, "PGSHARD_REPLICATION_TLS_SERVER_SHA256") != memberTLS.ServerSHA256 ||
+							!containsVolumeMount(prepareServerTLS.VolumeMounts, "server-tls-secret", true) ||
+							!containsVolumeMount(prepareServerTLS.VolumeMounts, "server-tls", false) {
+							t.Fatalf("bootstrap source %s server TLS initializer = %#v", object.Name, prepareServerTLS)
+						}
+						if containsNamedVolumeMount(agent.VolumeMounts, "server-tls-secret") || containsNamedVolumeMount(bootstrapContainer.VolumeMounts, "server-tls-secret") {
+							t.Fatalf("bootstrap source %s projected the raw server TLS Secret beyond its initializer", object.Name)
+						}
+						if !containerHasReadOnlyMount(agent, "server-tls", "/run/pgshard/server-tls") ||
+							!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_SERVER_TLS_CERT", "/run/pgshard/server-tls/tls.crt") ||
+							!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_SERVER_TLS_KEY", "/run/pgshard/server-tls/tls.key") ||
+							!containerHasLiteralEnvironment(agent, "PGSHARD_REPLICATION_TLS_SERVER_SHA256", memberTLS.ServerSHA256) {
+							t.Fatalf("bootstrap source %s agent server TLS contract = %#v", object.Name, agent)
+						}
 						if object.Spec.UpdateStrategy.Type != appsv1.OnDeleteStatefulSetStrategyType {
 							t.Fatalf("bootstrap source %s update strategy = %q", object.Name, object.Spec.UpdateStrategy.Type)
 						}
@@ -3391,7 +3437,7 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 						}
 						wantCandidateCSV := strings.Join(wantCandidates, ",")
 						if !containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_MODE", "replication-bootstrap-primary") ||
-							!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_HBA_FILE", "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf") ||
+							!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_HBA_FILE", "/etc/pgshard/replication-bootstrap-primary-tls.pg_hba.conf") ||
 							!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_GENERATION_DURABILITY", "remote-apply-any-one") ||
 							!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES", wantCandidateCSV) ||
 							object.Spec.Template.Annotations[PostgreSQLGenerationDurabilityAnnotation] != "remote-apply-any-one" ||
@@ -3416,7 +3462,7 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 								envValue(agent.Env, activationEnvironment[3]) != catalogActivationJournalRoot {
 								t.Fatalf("shard-zero source activation environment = %#v", agent.Env)
 							}
-							if len(object.Spec.Template.Spec.InitContainers) != 2 {
+							if len(object.Spec.Template.Spec.InitContainers) != 3 {
 								t.Fatalf("shard-zero source init containers = %#v", object.Spec.Template.Spec.InitContainers)
 							}
 							initializer := object.Spec.Template.Spec.InitContainers[1]
@@ -3447,7 +3493,7 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 									t.Fatalf("non-consumer source %s received activation environment %s", object.Name, name)
 								}
 							}
-							if hasVolume(object.Spec.Template.Spec.Volumes, catalogActivationJournalVolumeName) || containsNamedVolumeMount(agent.VolumeMounts, catalogActivationJournalVolumeName) || len(object.Spec.Template.Spec.InitContainers) != 1 {
+							if hasVolume(object.Spec.Template.Spec.Volumes, catalogActivationJournalVolumeName) || containsNamedVolumeMount(agent.VolumeMounts, catalogActivationJournalVolumeName) || len(object.Spec.Template.Spec.InitContainers) != 2 {
 								t.Fatalf("non-consumer source %s received activation storage: %#v", object.Name, object.Spec.Template.Spec)
 							}
 						}
@@ -3469,6 +3515,8 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 						!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_PRIMARY_HOST", sourceHost) ||
 						!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME", slotName) ||
 						!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_PRIMARY_PASSFILE", "/run/pgshard/standby-auth/passfile") ||
+						!containerHasLiteralEnvironment(agent, "PGSHARD_POSTGRES_PRIMARY_SSLROOTCERT", "/run/pgshard/standby-auth/ca.crt") ||
+						!containerHasLiteralEnvironment(agent, "PGSHARD_REPLICATION_TLS_CA_SHA256", shardTLS.CASHA256) ||
 						!containerHasReadOnlyMount(agent, "standby-passfile", "/run/pgshard/standby-auth") ||
 						containerHasEnvironment(agent, "PGSHARD_POSTGRES_GENERATION_DURABILITY") ||
 						containerHasEnvironment(agent, "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES") ||
@@ -3503,6 +3551,22 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 						volumeByName(t, object.Spec.Template.Spec.Volumes, "data").PersistentVolumeClaim.ClaimName != targetBootstrap.PVCName {
 						t.Fatalf("standby %s initialization = %#v", object.Name, bootstrapContainer)
 					}
+					replicationCAVolume := volumeByName(t, object.Spec.Template.Spec.Volumes, "replication-ca-secret").Secret
+					if replicationCAVolume == nil || replicationCAVolume.SecretName != shardTLS.CASecretName ||
+						replicationCAVolume.DefaultMode == nil || *replicationCAVolume.DefaultMode != 0o440 ||
+						!reflect.DeepEqual(secretItemKeys(replicationCAVolume.Items), []string{PostgreSQLReplicationTLSCAKey}) {
+						t.Fatalf("standby %s replication CA projection = %#v", object.Name, replicationCAVolume)
+					}
+					if !containsVolumeMount(bootstrapContainer.VolumeMounts, "replication-ca-secret", true) ||
+						envValue(bootstrapContainer.Env, "PGSHARD_REPLICATION_TLS_CA_SHA256") != shardTLS.CASHA256 {
+						t.Fatalf("standby %s CA initialization = %#v", object.Name, bootstrapContainer)
+					}
+					if containsNamedVolumeMount(agent.VolumeMounts, "replication-ca-secret") {
+						t.Fatalf("running standby %s retained the raw replication CA projection", object.Name)
+					}
+					if hasVolume(object.Spec.Template.Spec.Volumes, "server-tls-secret") || hasVolume(object.Spec.Template.Spec.Volumes, "server-tls") {
+						t.Fatalf("standby %s received server TLS key material: %#v", object.Name, object.Spec.Template.Spec.Volumes)
+					}
 					identifyIndex := strings.Index(bootstrapContainer.Command[2], "--command='IDENTIFY_SYSTEM'")
 					baseBackupIndex := strings.Index(bootstrapContainer.Command[2], "pg_basebackup")
 					if !strings.Contains(bootstrapContainer.Command[2], "timeout --signal=TERM --kill-after=10s 15m") ||
@@ -3518,11 +3582,21 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 						!strings.Contains(bootstrapContainer.Command[2], "source_pvc_uid=%s") ||
 						!strings.Contains(bootstrapContainer.Command[2], "replication_secret_uid=%s") ||
 						!strings.Contains(bootstrapContainer.Command[2], "pg_tblspc") ||
-						!strings.Contains(bootstrapContainer.Command[2], "pg_wal") ||
-						!strings.Contains(bootstrapContainer.Command[2], "sslmode=disable") {
-						// Replication TLS is intentionally deferred; this slice remains
-						// internal, TCP-closed, role-neutral, and non-serving.
+						!strings.Contains(bootstrapContainer.Command[2], "pg_wal") {
 						t.Fatalf("standby %s crash-safe bootstrap contract is incomplete", object.Name)
+					}
+					script := bootstrapContainer.Command[2]
+					if strings.Contains(script, "sslmode=disable") ||
+						strings.Count(script, "sslmode=verify-full sslrootcert=$replication_ca channel_binding=require") != 3 {
+						t.Fatalf("standby %s bootstrap client hops are not strictly server-authenticated: %q", object.Name, script)
+					}
+					caCopyIndex := strings.Index(script, "mv -- \"$replication_ca_staging\" \"$replication_ca\"")
+					fastExitIndex := strings.Index(script, "if [[ -e \"$final\" || -L \"$final\" ]]; then")
+					if caCopyIndex < 0 || fastExitIndex < 0 || caCopyIndex >= fastExitIndex {
+						t.Fatalf("standby %s CA copy does not precede the completed-clone fast exit", object.Name)
+					}
+					if !strings.Contains(script, "pgshard-catalog-material-digest replication-tls-ca \"$replication_ca_source\"") {
+						t.Fatalf("standby %s bootstrap does not digest-verify the replication CA", object.Name)
 					}
 				case *policyv1.PodDisruptionBudget:
 					if object.Labels[ComponentLabel] == "postgresql" {
@@ -3723,17 +3797,22 @@ func TestCatalogServingHBAPolicyIsExactAndLeastPrivilege(t *testing.T) {
 	want := "local postgres postgres peer\n" +
 		"local all all reject\n" +
 		"local replication all reject\n" +
-		"host replication pgshard_replication 0.0.0.0/0 scram-sha-256\n" +
-		"host replication pgshard_replication ::0/0 scram-sha-256\n" +
+		"hostssl replication pgshard_replication 0.0.0.0/0 scram-sha-256\n" +
+		"hostssl replication pgshard_replication ::0/0 scram-sha-256\n" +
+		"hostnossl replication all all reject\n" +
 		"hostnossl shardschema all all reject\n" +
 		"hostssl shardschema pgshard_pooler_catalog all scram-sha-256\n" +
 		"hostssl shardschema pgshard_orchestrator_catalog all scram-sha-256\n" +
 		"hostssl shardschema all all reject\n" +
 		"host all all 0.0.0.0/0 reject\n" +
 		"host all all ::0/0 reject\n"
-	if catalogServingHBAPolicyVersion != "pgshard.catalog-serving-hba.v1" || catalogServingHBAPolicy != want ||
-		!validCatalogMaterialSHA256(contentSHA256(catalogServingHBAPolicy)) {
+	const wantSHA256 = "f232b5738cab5c1aa30184c5490d54e647f252b8e6a8bf078138da68257be2fd"
+	if catalogServingHBAPolicyVersion != "pgshard.catalog-serving-hba.v2" || catalogServingHBAPolicy != want ||
+		contentSHA256(catalogServingHBAPolicy) != wantSHA256 {
 		t.Fatalf("catalog serving HBA policy is not exact: version=%q policy=%q digest=%q", catalogServingHBAPolicyVersion, catalogServingHBAPolicy, contentSHA256(catalogServingHBAPolicy))
+	}
+	if strings.Contains(catalogServingHBAPolicy, "\nhost replication") {
+		t.Fatal("catalog serving HBA policy permits replication without TLS")
 	}
 }
 
@@ -3980,8 +4059,9 @@ func TestClusterAwareSourceObservationRejectsSelfAttestedTopologyChanges(t *test
 	cluster := testCluster()
 	cluster.Spec.MembersPerShard = 5
 	cluster.Spec.Durability = pgshardv1alpha1.DurabilitySynchronous
+	cluster.Status.PostgreSQLReplicationTLS = testPostgreSQLReplicationTLS(cluster)
 	pod := testReplicationBootstrapSourcePodFor(t, cluster.Spec.MembersPerShard, cluster.Spec.Durability)
-	if observed, err := ObservePostgreSQLRuntimeForCluster(cluster, pod.Annotations, pod.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
+	if observed, err := ObservePostgreSQLRuntimeForCluster(cluster, pod.Labels, pod.Annotations, pod.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
 		t.Fatalf("observe exact five-member source = %q, %v", observed, err)
 	}
 
@@ -3992,7 +4072,7 @@ func TestClusterAwareSourceObservationRejectsSelfAttestedTopologyChanges(t *test
 	if observed, err := ObservePostgreSQLRuntime(wrongTopology.Annotations, wrongTopology.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
 		t.Fatalf("canonical but wrong-size source should remain structurally recognizable: %q, %v", observed, err)
 	}
-	if _, err := ObservePostgreSQLRuntimeForCluster(cluster, wrongTopology.Annotations, wrongTopology.Spec); err == nil || !strings.Contains(err.Error(), "immutable cluster topology") {
+	if _, err := ObservePostgreSQLRuntimeForCluster(cluster, wrongTopology.Labels, wrongTopology.Annotations, wrongTopology.Spec); err == nil || !strings.Contains(err.Error(), "immutable cluster topology") {
 		t.Fatalf("wrong-size source topology error = %v", err)
 	}
 
@@ -4006,7 +4086,7 @@ func TestClusterAwareSourceObservationRejectsSelfAttestedTopologyChanges(t *test
 	if observed, err := ObservePostgreSQLRuntime(downgraded.Annotations, downgraded.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
 		t.Fatalf("self-consistent downgrade should remain structurally recognizable: %q, %v", observed, err)
 	}
-	if _, err := ObservePostgreSQLRuntimeForCluster(cluster, downgraded.Annotations, downgraded.Spec); err == nil || !strings.Contains(err.Error(), "immutable cluster topology") {
+	if _, err := ObservePostgreSQLRuntimeForCluster(cluster, downgraded.Labels, downgraded.Annotations, downgraded.Spec); err == nil || !strings.Contains(err.Error(), "immutable cluster topology") {
 		t.Fatalf("source durability downgrade error = %v", err)
 	}
 }
@@ -4014,6 +4094,7 @@ func TestClusterAwareSourceObservationRejectsSelfAttestedTopologyChanges(t *test
 func TestLegacyBootstrapSourceRemainsFencedDuringGenerationUpgrade(t *testing.T) {
 	t.Parallel()
 	cluster := testCluster()
+	cluster.Status.PostgreSQLReplicationTLS = testPostgreSQLReplicationTLS(cluster)
 	pod := testReplicationBootstrapSourcePod(t)
 	legacy := pod.DeepCopy()
 	legacy.Spec.Containers[0].Env = slices.DeleteFunc(legacy.Spec.Containers[0].Env, func(environment corev1.EnvVar) bool {
@@ -4027,7 +4108,7 @@ func TestLegacyBootstrapSourceRemainsFencedDuringGenerationUpgrade(t *testing.T)
 	if IsCurrentPostgreSQLReplicationBootstrapSourcePod(legacy) {
 		t.Fatal("complete v0.73 bootstrap source shape was accepted as a current generation")
 	}
-	if observed, err := ObservePostgreSQLRuntimeForCluster(cluster, legacy.Annotations, legacy.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
+	if observed, err := ObservePostgreSQLRuntimeForCluster(cluster, legacy.Labels, legacy.Annotations, legacy.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
 		t.Fatalf("observe complete v0.73 source = %q, %v", observed, err)
 	}
 
@@ -4053,7 +4134,7 @@ func TestLegacyBootstrapSourceRemainsFencedDuringGenerationUpgrade(t *testing.T)
 			if IsPostgreSQLReplicationBootstrapSourcePod(partial) {
 				t.Fatalf("partial generation settings retained source classification: %#v", partial.Spec.Containers[0].Env)
 			}
-			if _, err := ObservePostgreSQLRuntimeForCluster(cluster, partial.Annotations, partial.Spec); err == nil {
+			if _, err := ObservePostgreSQLRuntimeForCluster(cluster, partial.Labels, partial.Annotations, partial.Spec); err == nil {
 				t.Fatal("partial generation settings passed cluster-aware observation")
 			}
 		})
@@ -4220,6 +4301,220 @@ func TestReplicationStandbyPodClassificationIsExact(t *testing.T) {
 				t.Fatalf("changed Pod retained standby identity: %#v", changed.ObjectMeta)
 			}
 		})
+	}
+}
+
+func testReplicationPodsForPolicy(t *testing.T, serverTLS bool) (*corev1.Pod, *corev1.Pod) {
+	t.Helper()
+	cluster := testCluster()
+	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
+	cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
+	cluster.Status.PostgreSQLReplicationCredentials = testPostgreSQLReplicationCredentials(cluster)
+	if !serverTLS {
+		cluster.Status.PostgreSQLBootstrapSpec.ReplicationTransportPolicy = ""
+		cluster.Status.PostgreSQLReplicationTLS = nil
+	}
+	images := DevelopmentImages()
+	images.PostgreSQLRuntime = PostgreSQLRuntimeAgentQuarantine
+	plan, err := Plan(cluster, images)
+	if err != nil {
+		t.Fatal(err)
+	}
+	podFor := func(member int32) *corev1.Pod {
+		name := PostgreSQLMemberStatefulSetName(cluster.Name, 0, member)
+		for _, item := range plan {
+			statefulSet, ok := item.(*appsv1.StatefulSet)
+			if !ok || statefulSet.Name != name {
+				continue
+			}
+			return &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        name + "-0",
+					Namespace:   cluster.Namespace,
+					Labels:      maps.Clone(statefulSet.Spec.Template.Labels),
+					Annotations: maps.Clone(statefulSet.Spec.Template.Annotations),
+					Finalizers:  slices.Clone(statefulSet.Spec.Template.Finalizers),
+				},
+				Spec: *statefulSet.Spec.Template.Spec.DeepCopy(),
+			}
+		}
+		t.Fatalf("plan has no PostgreSQL member StatefulSet %s", name)
+		return nil
+	}
+	return podFor(0), podFor(1)
+}
+
+func TestClusterAwareObservationBindsReplicationTransportPolicy(t *testing.T) {
+	t.Parallel()
+	tlsSource, tlsStandby := testReplicationPodsForPolicy(t, true)
+	cleartextSource, cleartextStandby := testReplicationPodsForPolicy(t, false)
+	clusterWithPolicy := func(policy string) *pgshardv1alpha1.PgShardCluster {
+		cluster := testCluster()
+		cluster.Status.PostgreSQLBootstrapSpec = &pgshardv1alpha1.PostgreSQLBootstrapSpecStatus{ReplicationTransportPolicy: policy}
+		return cluster
+	}
+	policyCluster := clusterWithPolicy(pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)
+	policyCluster.Status.PostgreSQLReplicationTLS = testPostgreSQLReplicationTLS(policyCluster)
+	legacyCluster := clusterWithPolicy("")
+	unrecordedCluster := testCluster()
+
+	for name, pod := range map[string]*corev1.Pod{"source": tlsSource, "standby": tlsStandby} {
+		if observed, err := ObservePostgreSQLRuntimeForCluster(policyCluster, pod.Labels, pod.Annotations, pod.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
+			t.Fatalf("policy cluster rejected its exact TLS %s: %q, %v", name, observed, err)
+		}
+		if _, err := ObservePostgreSQLRuntimeForCluster(legacyCluster, pod.Labels, pod.Annotations, pod.Spec); err == nil || !strings.Contains(err.Error(), "transport composition does not match") {
+			t.Fatalf("legacy cluster accepted a TLS %s: %v", name, err)
+		}
+		if _, err := ObservePostgreSQLRuntimeForCluster(unrecordedCluster, pod.Labels, pod.Annotations, pod.Spec); err == nil || !strings.Contains(err.Error(), "recorded PostgreSQL bootstrap contract") {
+			t.Fatalf("unrecorded cluster accepted a replication %s: %v", name, err)
+		}
+	}
+	for name, pod := range map[string]*corev1.Pod{"source": cleartextSource, "standby": cleartextStandby} {
+		if observed, err := ObservePostgreSQLRuntimeForCluster(legacyCluster, pod.Labels, pod.Annotations, pod.Spec); err != nil || observed != PostgreSQLRuntimeAgentQuarantine {
+			t.Fatalf("legacy cluster rejected its exact cleartext %s: %q, %v", name, observed, err)
+		}
+		if _, err := ObservePostgreSQLRuntimeForCluster(policyCluster, pod.Labels, pod.Annotations, pod.Spec); err == nil || !strings.Contains(err.Error(), "transport composition does not match") {
+			t.Fatalf("policy cluster accepted a cleartext %s: %v", name, err)
+		}
+	}
+
+	dropEnvironment := func(container *corev1.Container, name string) {
+		container.Env = slices.DeleteFunc(container.Env, func(environment corev1.EnvVar) bool { return environment.Name == name })
+	}
+	dropVolume := func(pod *corev1.Pod, name string) {
+		pod.Spec.Volumes = slices.DeleteFunc(pod.Spec.Volumes, func(volume corev1.Volume) bool { return volume.Name == name })
+	}
+	for _, test := range []struct {
+		name   string
+		pod    *corev1.Pod
+		mutate func(*corev1.Pod)
+	}{
+		{name: "source without TLS certificate environment", pod: tlsSource, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.Containers[0], "PGSHARD_POSTGRES_SERVER_TLS_CERT")
+		}},
+		{name: "source without TLS key environment", pod: tlsSource, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.Containers[0], "PGSHARD_POSTGRES_SERVER_TLS_KEY")
+		}},
+		{name: "source without TLS digest environment", pod: tlsSource, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.Containers[0], "PGSHARD_REPLICATION_TLS_SERVER_SHA256")
+		}},
+		{name: "source without the server-tls mount", pod: tlsSource, mutate: func(pod *corev1.Pod) {
+			pod.Spec.Containers[0].VolumeMounts = slices.DeleteFunc(pod.Spec.Containers[0].VolumeMounts, func(mount corev1.VolumeMount) bool { return mount.Name == "server-tls" })
+		}},
+		{name: "source without the server-tls-secret volume", pod: tlsSource, mutate: func(pod *corev1.Pod) {
+			dropVolume(pod, "server-tls-secret")
+		}},
+		{name: "source without the server-tls staging volume", pod: tlsSource, mutate: func(pod *corev1.Pod) {
+			dropVolume(pod, "server-tls")
+		}},
+		{name: "source demoted to the cleartext HBA policy", pod: tlsSource, mutate: func(pod *corev1.Pod) {
+			setLiteralEnvironment(pod, "PGSHARD_POSTGRES_HBA_FILE", "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf")
+		}},
+		{name: "cleartext source carrying one TLS artifact", pod: cleartextSource, mutate: func(pod *corev1.Pod) {
+			pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{Name: "PGSHARD_POSTGRES_SERVER_TLS_CERT", Value: "/run/pgshard/server-tls/tls.crt"})
+		}},
+		{name: "standby without the trust-anchor environment", pod: tlsStandby, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.Containers[0], "PGSHARD_POSTGRES_PRIMARY_SSLROOTCERT")
+		}},
+		{name: "standby without the agent CA digest", pod: tlsStandby, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.Containers[0], "PGSHARD_REPLICATION_TLS_CA_SHA256")
+		}},
+		{name: "standby without the initializer CA digest", pod: tlsStandby, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.InitContainers[0], "PGSHARD_REPLICATION_TLS_CA_SHA256")
+		}},
+		{name: "standby without the CA projection mount", pod: tlsStandby, mutate: func(pod *corev1.Pod) {
+			pod.Spec.InitContainers[0].VolumeMounts = slices.DeleteFunc(pod.Spec.InitContainers[0].VolumeMounts, func(mount corev1.VolumeMount) bool { return mount.Name == "replication-ca-secret" })
+		}},
+		{name: "standby without the replication-ca-secret volume", pod: tlsStandby, mutate: func(pod *corev1.Pod) {
+			dropVolume(pod, "replication-ca-secret")
+		}},
+		{name: "standby demoted to the cleartext clone script", pod: tlsStandby, mutate: func(pod *corev1.Pod) {
+			pod.Spec.InitContainers[0].Command = []string{"bash", "-ceu", PostgreSQLStandbyBootstrapScript(false)}
+		}},
+		{name: "cleartext standby carrying one TLS artifact", pod: cleartextStandby, mutate: func(pod *corev1.Pod) {
+			pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{Name: "PGSHARD_POSTGRES_PRIMARY_SSLROOTCERT", Value: "/run/pgshard/standby-auth/ca.crt"})
+		}},
+		{name: "source projecting a self-attested server Secret", pod: tlsSource, mutate: func(pod *corev1.Pod) {
+			for index := range pod.Spec.Volumes {
+				if pod.Spec.Volumes[index].Name == "server-tls-secret" {
+					pod.Spec.Volumes[index].Secret.SecretName = "self-attested-server-tls"
+				}
+			}
+		}},
+		{name: "source attesting a foreign server digest", pod: tlsSource, mutate: func(pod *corev1.Pod) {
+			setLiteralEnvironment(pod, "PGSHARD_REPLICATION_TLS_SERVER_SHA256", strings.Repeat("9", 64))
+		}},
+		{name: "standby projecting a self-attested CA Secret", pod: tlsStandby, mutate: func(pod *corev1.Pod) {
+			for index := range pod.Spec.Volumes {
+				if pod.Spec.Volumes[index].Name == "replication-ca-secret" {
+					pod.Spec.Volumes[index].Secret.SecretName = "self-attested-replication-ca"
+				}
+			}
+		}},
+		{name: "standby attesting a foreign CA digest", pod: tlsStandby, mutate: func(pod *corev1.Pod) {
+			foreign := strings.Repeat("9", 64)
+			setLiteralEnvironment(pod, "PGSHARD_REPLICATION_TLS_CA_SHA256", foreign)
+			for index := range pod.Spec.InitContainers[0].Env {
+				if pod.Spec.InitContainers[0].Env[index].Name == "PGSHARD_REPLICATION_TLS_CA_SHA256" {
+					pod.Spec.InitContainers[0].Env[index].Value = foreign
+				}
+			}
+		}},
+		{name: "source labeled onto a foreign shard", pod: tlsSource, mutate: func(pod *corev1.Pod) {
+			pod.Labels[ShardLabel] = "0009"
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			changed := test.pod.DeepCopy()
+			test.mutate(changed)
+			if _, err := ObservePostgreSQLRuntimeForCluster(policyCluster, changed.Labels, changed.Annotations, changed.Spec); err == nil {
+				t.Fatal("policy cluster accepted a stripped, mixed, or self-attested replication transport composition")
+			}
+			if _, err := ObservePostgreSQLRuntimeForCluster(legacyCluster, changed.Labels, changed.Annotations, changed.Spec); err == nil {
+				t.Fatal("legacy cluster accepted a stripped, mixed, or self-attested replication transport composition")
+			}
+		})
+	}
+
+	uncheckpointedPolicyCluster := clusterWithPolicy(pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)
+	for name, pod := range map[string]*corev1.Pod{"source": tlsSource, "standby": tlsStandby} {
+		if _, err := ObservePostgreSQLRuntimeForCluster(uncheckpointedPolicyCluster, pod.Labels, pod.Annotations, pod.Spec); err == nil ||
+			!strings.Contains(err.Error(), "no recorded replication TLS checkpoint") {
+			t.Fatalf("policy cluster without a recorded checkpoint accepted a TLS %s: %v", name, err)
+		}
+	}
+
+	for name, pod := range map[string]*corev1.Pod{"source": tlsSource, "standby": tlsStandby} {
+		if err := ValidatePostgreSQLReplicationPodContract(policyCluster, pod.Labels, pod.Annotations, pod.Spec); err != nil {
+			t.Fatalf("policy cluster's exact TLS %s failed the replication pod contract: %v", name, err)
+		}
+		labeled := pod.DeepCopy()
+		labeled.Labels[RoleLabel] = "primary"
+		if err := ValidatePostgreSQLReplicationPodContract(policyCluster, labeled.Labels, labeled.Annotations, labeled.Spec); err == nil ||
+			!strings.Contains(err.Error(), "must not carry a serving role") {
+			t.Fatalf("role-labeled replication %s passed the replication pod contract: %v", name, err)
+		}
+	}
+	if !PostgreSQLReplicationModeEnvironmentPresent(tlsSource.Spec) || !PostgreSQLReplicationModeEnvironmentPresent(tlsStandby.Spec) {
+		t.Fatal("exact replication members do not report a replication mode environment")
+	}
+	smuggled := tlsSource.DeepCopy()
+	setLiteralEnvironment(smuggled, "PGSHARD_POSTGRES_MODE", "quarantine")
+	if !PostgreSQLReplicationModeEnvironmentPresent(corev1.PodSpec{Containers: []corev1.Container{{
+		Name: "sidecar",
+		Env:  []corev1.EnvVar{{Name: "PGSHARD_POSTGRES_MODE", Value: "replication-standby"}},
+	}}}) {
+		t.Fatal("replication mode environment on a foreign container went undetected")
+	}
+	if !PostgreSQLReplicationModeEnvironmentPresent(corev1.PodSpec{InitContainers: []corev1.Container{{
+		Name: "init",
+		Env:  []corev1.EnvVar{{Name: "PGSHARD_POSTGRES_MODE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}}},
+	}}}) {
+		t.Fatal("indeterminate replication mode environment went undetected")
+	}
+	if err := ValidatePostgreSQLReplicationPodContract(policyCluster, smuggled.Labels, smuggled.Annotations, smuggled.Spec); err == nil {
+		t.Fatal("replication pod contract accepted a non-replication main composition")
 	}
 }
 
@@ -4390,21 +4685,172 @@ func TestMultiMemberPlanRequiresExactCatalogCandidateCheckpoints(t *testing.T) {
 	}
 }
 
-func TestReplicationBootstrapPrimaryHBAImageContract(t *testing.T) {
+func TestReplicationTLSMaterialDigestsMatchAgentContract(t *testing.T) {
 	t.Parallel()
-	contents, err := os.ReadFile(filepath.Join("..", "..", "..", "deploy", "images", "replication-bootstrap-primary.pg_hba.conf"))
+	if got := PostgreSQLReplicationTLSCAMaterialSHA256([]byte("ca-pem")); got != "f2c4fad225fc50778bcff483229722f34ef0420f32fe7c1e24e5f0fee9f4fd5c" {
+		t.Fatalf("replication CA digest diverged from the agent contract: %q", got)
+	}
+	if got := PostgreSQLReplicationTLSServerMaterialSHA256([]byte("server-cert"), []byte("server-key")); got != "006413f805aec7feb64e180fb1afb6f14609028b3a980e5a598d1f3e3599f514" {
+		t.Fatalf("replication server digest diverged from the agent contract: %q", got)
+	}
+}
+
+func TestMultiMemberPlanRequiresCompleteReplicationTLSCheckpoints(t *testing.T) {
+	t.Parallel()
+	base := testCluster()
+	base.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(base)
+	base.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(base)
+	base.Status.PostgreSQLReplicationCredentials = testPostgreSQLReplicationCredentials(base)
+	images := DevelopmentImages()
+	images.PostgreSQLRuntime = PostgreSQLRuntimeAgentQuarantine
+	if _, err := Plan(base, images); err != nil {
+		t.Fatalf("complete replication TLS checkpoints were rejected: %v", err)
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*pgshardv1alpha1.PgShardCluster)
+		want   string
+	}{
+		{name: "absent", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLReplicationTLS = nil
+		}, want: "shard 0 is missing"},
+		{name: "missing member", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLReplicationTLS[0].Members = cluster.Status.PostgreSQLReplicationTLS[0].Members[:1]
+		}, want: "member 1 is missing"},
+		{name: "empty CA UID", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLReplicationTLS[0].CASecretUID = ""
+		}, want: "shard 0 is invalid"},
+		{name: "invalid CA digest", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLReplicationTLS[0].CASHA256 = "not-a-digest"
+		}, want: "shard 0 is invalid"},
+		{name: "missing renewal deadline", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLReplicationTLS[0].RenewalDeadline = metav1.Time{}
+		}, want: "shard 0 is invalid"},
+		{name: "foreign CA name", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLReplicationTLS[0].CASecretName = "foreign"
+		}, want: "shard 0 is invalid"},
+		{name: "empty member UID", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLReplicationTLS[0].Members[0].SecretUID = ""
+		}, want: "member 0 is invalid"},
+		{name: "invalid member digest", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLReplicationTLS[0].Members[0].ServerSHA256 = strings.Repeat("g", 64)
+		}, want: "member 0 is invalid"},
+		{name: "missing member expiry", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLReplicationTLS[0].Members[0].NotAfter = metav1.Time{}
+		}, want: "member 0 is invalid"},
+		{name: "foreign member name", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLReplicationTLS[0].Members[1].SecretName = "foreign"
+		}, want: "member 1 is invalid"},
+		{name: "duplicate member UID", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLReplicationTLS[0].Members[1].SecretUID = cluster.Status.PostgreSQLReplicationTLS[0].Members[0].SecretUID
+		}, want: "is duplicated"},
+		{name: "checkpoints without the transport policy", mutate: func(cluster *pgshardv1alpha1.PgShardCluster) {
+			cluster.Status.PostgreSQLBootstrapSpec.ReplicationTransportPolicy = ""
+		}, want: "without the \"server-tls-v1\" bootstrap transport policy"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			cluster := base.DeepCopy()
+			test.mutate(cluster)
+			if _, err := Plan(cluster, images); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Plan error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestMultiMemberPlanWithoutTransportPolicyStaysCleartextUnchanged(t *testing.T) {
+	t.Parallel()
+	cluster := testCluster()
+	cluster.Status.PostgreSQLBootstraps = testPostgreSQLBootstraps(cluster)
+	cluster.Status.PostgreSQLWritableLeases = testPostgreSQLWritableLeases(cluster)
+	cluster.Status.PostgreSQLReplicationCredentials = testPostgreSQLReplicationCredentials(cluster)
+	// A cluster provisioned before replication TLS existed has a recorded
+	// bootstrap contract without the transport policy and no TLS checkpoints.
+	cluster.Status.PostgreSQLBootstrapSpec.ReplicationTransportPolicy = ""
+	cluster.Status.PostgreSQLReplicationTLS = nil
+	images := DevelopmentImages()
+	images.PostgreSQLRuntime = PostgreSQLRuntimeAgentQuarantine
+	plan, err := Plan(cluster, images)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "local postgres postgres peer\n" +
+	forbiddenEnvironment := []string{
+		"PGSHARD_POSTGRES_SERVER_TLS_CERT",
+		"PGSHARD_POSTGRES_SERVER_TLS_KEY",
+		"PGSHARD_REPLICATION_TLS_SERVER_SHA256",
+		"PGSHARD_REPLICATION_TLS_CA_SHA256",
+		"PGSHARD_POSTGRES_PRIMARY_SSLROOTCERT",
+	}
+	members := 0
+	for _, item := range plan {
+		object, ok := item.(*appsv1.StatefulSet)
+		if !ok || object.Labels[ComponentLabel] != "postgresql" {
+			continue
+		}
+		members++
+		for _, volume := range object.Spec.Template.Spec.Volumes {
+			switch volume.Name {
+			case "server-tls-secret", "server-tls", "replication-ca-secret":
+				t.Fatalf("policy-less member %s received TLS volume %s", object.Name, volume.Name)
+			}
+		}
+		containers := append(append([]corev1.Container{}, object.Spec.Template.Spec.InitContainers...), object.Spec.Template.Spec.Containers...)
+		for _, container := range containers {
+			if container.Name == "prepare-server-tls" {
+				t.Fatalf("policy-less member %s received the server TLS initializer", object.Name)
+			}
+			for _, name := range forbiddenEnvironment {
+				if containerHasEnvironment(container, name) {
+					t.Fatalf("policy-less member %s container %s received TLS environment %s", object.Name, container.Name, name)
+				}
+			}
+		}
+		if object.Spec.Template.Labels[MemberLabel] == "0000" {
+			continue
+		}
+		script := object.Spec.Template.Spec.InitContainers[0].Command[2]
+		if script != PostgreSQLStandbyBootstrapScript(false) ||
+			strings.Count(script, "sslmode=disable") != 2 ||
+			!strings.Contains(script, "--host=\"$PGSHARD_SOURCE_HOST\"") ||
+			strings.Contains(script, "verify-full") || strings.Contains(script, "replication-tls") {
+			t.Fatalf("policy-less standby %s bootstrap script is not the exact cleartext contract", object.Name)
+		}
+	}
+	if members != int(cluster.Spec.Shards*cluster.Spec.MembersPerShard) {
+		t.Fatalf("policy-less plan published %d PostgreSQL members", members)
+	}
+}
+
+func TestReplicationBootstrapPrimaryHBAImageContract(t *testing.T) {
+	t.Parallel()
+	wantCleartext := "local postgres postgres peer\n" +
 		"local all all reject\n" +
 		"local replication all reject\n" +
 		"host replication pgshard_replication 0.0.0.0/0 scram-sha-256\n" +
 		"host replication pgshard_replication ::0/0 scram-sha-256\n" +
 		"host all all 0.0.0.0/0 reject\n" +
 		"host all all ::0/0 reject\n"
-	if string(contents) != want {
-		t.Fatalf("replication bootstrap primary HBA = %q, want %q", contents, want)
+	wantTLS := "local postgres postgres peer\n" +
+		"local all all reject\n" +
+		"local replication all reject\n" +
+		"hostssl replication pgshard_replication 0.0.0.0/0 scram-sha-256\n" +
+		"hostssl replication pgshard_replication ::0/0 scram-sha-256\n" +
+		"hostnossl replication all 0.0.0.0/0 reject\n" +
+		"hostnossl replication all ::0/0 reject\n" +
+		"host all all 0.0.0.0/0 reject\n" +
+		"host all all ::0/0 reject\n"
+	for baked, want := range map[string]string{
+		"replication-bootstrap-primary.pg_hba.conf":     wantCleartext,
+		"replication-bootstrap-primary-tls.pg_hba.conf": wantTLS,
+	} {
+		contents, err := os.ReadFile(filepath.Join("..", "..", "..", "deploy", "images", baked))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(contents) != want {
+			t.Fatalf("%s = %q, want %q", baked, contents, want)
+		}
 	}
 }
 
@@ -4660,6 +5106,39 @@ func testPostgreSQLWritableLeases(cluster *pgshardv1alpha1.PgShardCluster) []pgs
 	return checkpoints
 }
 
+func testPostgreSQLReplicationTLS(cluster *pgshardv1alpha1.PgShardCluster) []pgshardv1alpha1.PostgreSQLReplicationTLSStatus {
+	if cluster.Status.PostgreSQLBootstrapSpec == nil {
+		cluster.Status.PostgreSQLBootstrapSpec = &pgshardv1alpha1.PostgreSQLBootstrapSpecStatus{
+			Shards:            cluster.Spec.Shards,
+			MembersPerShard:   cluster.Spec.MembersPerShard,
+			Durability:        cluster.Spec.Durability,
+			PostgreSQLRuntime: string(PostgreSQLRuntimeAgentQuarantine),
+		}
+	}
+	cluster.Status.PostgreSQLBootstrapSpec.ReplicationTransportPolicy = pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1
+	checkpoints := make([]pgshardv1alpha1.PostgreSQLReplicationTLSStatus, 0, cluster.Spec.Shards)
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		checkpoint := pgshardv1alpha1.PostgreSQLReplicationTLSStatus{
+			Shard:           shard,
+			CASecretName:    PostgreSQLReplicationTLSCASecretPrefix(cluster.Name, shard) + strings.Repeat("a", 32),
+			CASecretUID:     types.UID(fmt.Sprintf("test-replication-tls-ca-uid-%04d", shard)),
+			CASHA256:        strings.Repeat("c", 64),
+			RenewalDeadline: metav1.NewTime(time.Now().Add(24 * time.Hour).UTC()),
+		}
+		for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
+			checkpoint.Members = append(checkpoint.Members, pgshardv1alpha1.PostgreSQLReplicationTLSMemberStatus{
+				Member:       member,
+				SecretName:   PostgreSQLReplicationTLSServerSecretPrefix(cluster.Name, shard, member) + strings.Repeat("b", 32),
+				SecretUID:    types.UID(fmt.Sprintf("test-replication-tls-server-uid-%04d-%04d", shard, member)),
+				ServerSHA256: strings.Repeat("f", 64),
+				NotAfter:     metav1.NewTime(time.Now().Add(48 * time.Hour).UTC()),
+			})
+		}
+		checkpoints = append(checkpoints, checkpoint)
+	}
+	return checkpoints
+}
+
 func testPostgreSQLReplicationCredentials(cluster *pgshardv1alpha1.PgShardCluster) []pgshardv1alpha1.PostgreSQLReplicationCredentialStatus {
 	cluster.Status.CatalogActivation = &pgshardv1alpha1.CatalogActivationCarrierStatus{
 		Name: pgshardv1alpha1.CatalogActivationName(cluster.Name),
@@ -4675,6 +5154,7 @@ func testPostgreSQLReplicationCredentials(cluster *pgshardv1alpha1.PgShardCluste
 		})
 	}
 	cluster.Status.PostgreSQLReplicationCredentials = checkpoints
+	cluster.Status.PostgreSQLReplicationTLS = testPostgreSQLReplicationTLS(cluster)
 	postgresqlConfiguration, err := DesiredPostgreSQLConfigurationConfigMap(cluster)
 	if err != nil {
 		panic(fmt.Sprintf("build test PostgreSQL configuration: %v", err))

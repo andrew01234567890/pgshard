@@ -211,8 +211,13 @@ func assertKINDHAAuthorityDiscoveryFoundation(t *testing.T, ctx context.Context,
 			if len(ingress.Ports) != 1 || ingress.Ports[0].Port == nil || ingress.Ports[0].Port.IntVal != 8080 {
 				continue
 			}
-			if diagnosticRuleFound || len(ingress.From) != 1 || ingress.From[0].PodSelector == nil || ingress.From[0].NamespaceSelector != nil || ingress.From[0].IPBlock != nil || !maps.Equal(ingress.From[0].PodSelector.MatchLabels, map[string]string{owned.ClusterLabel: cluster.Name, owned.ComponentLabel: "orchestrator"}) {
-				t.Fatalf("PostgreSQL diagnostic ingress for shard %d is broader than the orchestrator: %#v", shard, ingress)
+			// The orchestrator ingress peer is managed-by-hardened: only operator-authored
+			// orchestrator pods (which carry the managed-by label) may reach the
+			// diagnostic port — a foreign pod borrowing only the cluster+component labels
+			// cannot. The orchestrator Deployment's pod template carries managed-by, so
+			// this selector matches the real orchestrator pods.
+			if diagnosticRuleFound || len(ingress.From) != 1 || ingress.From[0].PodSelector == nil || ingress.From[0].NamespaceSelector != nil || ingress.From[0].IPBlock != nil || !maps.Equal(ingress.From[0].PodSelector.MatchLabels, map[string]string{owned.ManagedByLabel: owned.ManagedByValue, owned.ClusterLabel: cluster.Name, owned.ComponentLabel: "orchestrator"}) {
+				t.Fatalf("PostgreSQL diagnostic ingress for shard %d is broader than the managed orchestrator: %#v", shard, ingress)
 			}
 			diagnosticRuleFound = true
 		}
@@ -1323,6 +1328,19 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 		if haCurrent.Status.CatalogActivation.Name != pgshardv1alpha1.CatalogActivationName(haCluster.Name) || haCurrent.Status.CatalogActivation.UID == "" {
 			return false, nil
 		}
+		if len(haCurrent.Status.PostgreSQLReplicationTLS) != 1 {
+			return false, nil
+		}
+		tlsCheckpoint := haCurrent.Status.PostgreSQLReplicationTLS[0]
+		if tlsCheckpoint.Shard != 0 || tlsCheckpoint.CASecretUID == "" || !validCatalogAccessDigest(tlsCheckpoint.CASHA256) ||
+			len(tlsCheckpoint.Members) != int(haCluster.Spec.MembersPerShard) {
+			return false, nil
+		}
+		for member, checkpoint := range tlsCheckpoint.Members {
+			if checkpoint.Member != int32(member) || checkpoint.SecretUID == "" || !validCatalogAccessDigest(checkpoint.ServerSHA256) {
+				return false, nil
+			}
+		}
 		for member, checkpoint := range haCurrent.Status.PostgreSQLCatalogCandidates {
 			if checkpoint.Member != int32(member) || !owned.PostgreSQLCatalogCandidateConfigMapNameIsValid(haCluster.Name, int32(member), checkpoint.ConfigMapName, checkpoint.PayloadSHA256) ||
 				checkpoint.ConfigMapUID == "" || !validCatalogAccessDigest(checkpoint.PayloadSHA256) {
@@ -1380,7 +1398,7 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	}
 	sourceAgent := source.Spec.Template.Spec.Containers[0]
 	if agentEnvironmentValue(sourceAgent.Env, "PGSHARD_POSTGRES_MODE") != "replication-bootstrap-primary" ||
-		agentEnvironmentValue(sourceAgent.Env, "PGSHARD_POSTGRES_HBA_FILE") != "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf" ||
+		agentEnvironmentValue(sourceAgent.Env, "PGSHARD_POSTGRES_HBA_FILE") != "/etc/pgshard/replication-bootstrap-primary-tls.pg_hba.conf" ||
 		agentEnvironmentValue(sourceAgent.Env, "PGSHARD_POSTGRES_GENERATION_DURABILITY") != "remote-apply-any-one" ||
 		agentEnvironmentValue(sourceAgent.Env, "PGSHARD_POSTGRES_SYNCHRONOUS_STANDBY_NAMES") != "pgshard_member_0001,pgshard_member_0002" ||
 		source.Spec.Template.Annotations[owned.PostgreSQLGenerationDurabilityAnnotation] != "remote-apply-any-one" ||
@@ -1394,7 +1412,7 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 		agentEnvironmentValue(sourceAgent.Env, "PGSHARD_CATALOG_ACTIVATION_JOURNAL_ROOT") != activationJournalRoot {
 		t.Fatalf("replication bootstrap source activation environment = %#v", sourceAgent.Env)
 	}
-	if len(source.Spec.Template.Spec.InitContainers) != 2 {
+	if len(source.Spec.Template.Spec.InitContainers) != 3 {
 		t.Fatalf("replication bootstrap source init containers = %#v", source.Spec.Template.Spec.InitContainers)
 	}
 	activationInitializer := source.Spec.Template.Spec.InitContainers[1]
@@ -1416,6 +1434,23 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	activationMount := corev1.VolumeMount{Name: "catalog-activation-journal", MountPath: activationJournalRoot, SubPath: "root"}
 	if !slices.Contains(sourceAgent.VolumeMounts, activationMount) {
 		t.Fatalf("replication bootstrap source activation mount = %#v", sourceAgent.VolumeMounts)
+	}
+	serverTLSCheckpoint := haCurrent.Status.PostgreSQLReplicationTLS[0].Members[0]
+	serverTLSInitializer := source.Spec.Template.Spec.InitContainers[2]
+	if serverTLSInitializer.Name != "prepare-server-tls" || serverTLSInitializer.Image != sourceAgent.Image ||
+		!reflect.DeepEqual(serverTLSInitializer.Command, []string{"bash", "-ceu", owned.PostgreSQLServerTLSPrepareScript}) ||
+		agentEnvironmentValue(serverTLSInitializer.Env, "PGSHARD_REPLICATION_TLS_SERVER_SHA256") != serverTLSCheckpoint.ServerSHA256 ||
+		!validCatalogAccessDigest(serverTLSCheckpoint.ServerSHA256) ||
+		serverTLSInitializer.SecurityContext == nil || serverTLSInitializer.SecurityContext.RunAsUser == nil || *serverTLSInitializer.SecurityContext.RunAsUser != 999 ||
+		serverTLSInitializer.SecurityContext.RunAsGroup == nil || *serverTLSInitializer.SecurityContext.RunAsGroup != 999 ||
+		serverTLSInitializer.SecurityContext.RunAsNonRoot == nil || !*serverTLSInitializer.SecurityContext.RunAsNonRoot ||
+		serverTLSInitializer.SecurityContext.AllowPrivilegeEscalation == nil || *serverTLSInitializer.SecurityContext.AllowPrivilegeEscalation ||
+		serverTLSInitializer.SecurityContext.ReadOnlyRootFilesystem == nil || !*serverTLSInitializer.SecurityContext.ReadOnlyRootFilesystem ||
+		serverTLSInitializer.SecurityContext.Capabilities == nil || !reflect.DeepEqual(serverTLSInitializer.SecurityContext.Capabilities.Drop, []corev1.Capability{"ALL"}) ||
+		len(serverTLSInitializer.VolumeMounts) != 2 ||
+		serverTLSInitializer.VolumeMounts[0] != (corev1.VolumeMount{Name: "server-tls-secret", MountPath: "/etc/pgshard/server-tls-secret", ReadOnly: true}) ||
+		serverTLSInitializer.VolumeMounts[1] != (corev1.VolumeMount{Name: "server-tls", MountPath: "/run/pgshard/server-tls"}) {
+		t.Fatalf("replication bootstrap source server TLS initializer = %#v", serverTLSInitializer)
 	}
 	if source.Spec.Template.Spec.SecurityContext == nil || source.Spec.Template.Spec.SecurityContext.SeccompProfile == nil || source.Spec.Template.Spec.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
 		t.Fatalf("replication bootstrap source Pod security = %#v", source.Spec.Template.Spec.SecurityContext)
@@ -2871,11 +2906,13 @@ func assertKINDPhysicalStandbys(t *testing.T, ctx context.Context, kubeClient cl
 		standbys[member] = standbyIdentity{podName: podName, podUID: pod.UID, pvcName: pvcName, pvcUID: pvc.UID}
 	}
 
-	wantStreams := "pgshard_member_0001:pgshard_member_0001:streaming,pgshard_member_0002:pgshard_member_0002:streaming"
+	wantStreams := "pgshard_member_0001:pgshard_member_0001:streaming:true:TLSv1.3,pgshard_member_0002:pgshard_member_0002:streaming:true:TLSv1.3"
 	waitForPhysicalReplicationStreams(t, ctx, namespace, sourcePodName, wantStreams)
 	for member := int32(1); member < cluster.Spec.MembersPerShard; member++ {
 		assertKINDPhysicalStandbyFailClosed(t, ctx, kubeClient, namespace, standbys[member].podName, member)
+		assertKINDStandbyWALReceiverVerifiedTLS(t, ctx, namespace, standbys[member].podName, member)
 	}
+	assertKINDReplicationIngressRequiresTLS(t, ctx, namespace, standbys[1].podName, wantSourceHost)
 	assertFailClosedApplicationServices(t, ctx, kubeClient, namespace, cluster.Name)
 
 	if _, err := runPostgreSQLPodQuery(ctx, namespace, sourcePodName, "CREATE TABLE IF NOT EXISTS pgshard_kind_physical_replication (id integer PRIMARY KEY, note text NOT NULL); INSERT INTO pgshard_kind_physical_replication VALUES (1, 'before-restart') ON CONFLICT (id) DO UPDATE SET note = EXCLUDED.note; SELECT pg_catalog.pg_switch_wal();"); err != nil {
@@ -2906,6 +2943,7 @@ func assertKINDPhysicalStandbys(t *testing.T, ctx context.Context, kubeClient cl
 	}
 	waitForPhysicalReplicationStreams(t, ctx, namespace, sourcePodName, wantStreams)
 	assertKINDPhysicalStandbyFailClosed(t, ctx, kubeClient, namespace, restarted.podName, restartedMember)
+	assertKINDStandbyWALReceiverVerifiedTLS(t, ctx, namespace, restarted.podName, restartedMember)
 	waitForPhysicalStandbyReplay(t, ctx, namespace, restarted.podName, 1, "before-restart")
 	if _, err := runPostgreSQLPodQuery(ctx, namespace, sourcePodName, "INSERT INTO pgshard_kind_physical_replication VALUES (2, 'after-restart') ON CONFLICT (id) DO UPDATE SET note = EXCLUDED.note; SELECT pg_catalog.pg_switch_wal();"); err != nil {
 		t.Fatalf("write post-restart physical-replication marker on source: %v", err)
@@ -3095,7 +3133,7 @@ func assertKINDSynchronousGenerationWaitsForRemoteReplay(t *testing.T, ctx conte
 		t.Fatalf("synchronous source changed Lease term across remote publication: %#v", finalLease.Spec)
 	}
 
-	synchronousState, err := runPostgreSQLPodQuery(ctx, namespace, sourcePodName, "SELECT pg_catalog.current_setting('synchronous_standby_names') || '|' || pg_catalog.current_setting('synchronous_commit') || '|' || (EXISTS (SELECT 1 FROM pg_catalog.pg_stat_replication WHERE application_name = 'pgshard_member_0002' AND state = 'streaming' AND sync_state IN ('sync', 'quorum')))::text;")
+	synchronousState, err := runPostgreSQLPodQuery(ctx, namespace, sourcePodName, "SELECT pg_catalog.current_setting('synchronous_standby_names') || '|' || pg_catalog.current_setting('synchronous_commit') || '|' || (EXISTS (SELECT 1 FROM pg_catalog.pg_stat_replication AS replication JOIN pg_catalog.pg_stat_ssl AS ssl ON ssl.pid = replication.pid WHERE replication.application_name = 'pgshard_member_0002' AND replication.state = 'streaming' AND replication.sync_state IN ('sync', 'quorum') AND ssl.ssl AND ssl.version = 'TLSv1.3'))::text;")
 	if err != nil || synchronousState != "ANY 1 (pgshard_member_0001, pgshard_member_0002)|local|true" {
 		t.Fatalf("active synchronous source contract = %q, error=%v", synchronousState, err)
 	}
@@ -3166,12 +3204,62 @@ func waitForPhysicalReplicationStreams(t *testing.T, ctx context.Context, namesp
 	t.Helper()
 	var last string
 	var lastErr error
-	query := "SELECT string_agg(replication.application_name || ':' || slots.slot_name || ':' || replication.state, ',' ORDER BY replication.application_name) FROM pg_catalog.pg_stat_replication AS replication JOIN pg_catalog.pg_replication_slots AS slots ON slots.active_pid = replication.pid WHERE replication.application_name IN ('pgshard_member_0001', 'pgshard_member_0002');"
+	query := "SELECT string_agg(replication.application_name || ':' || slots.slot_name || ':' || replication.state || ':' || ssl.ssl::text || ':' || ssl.version, ',' ORDER BY replication.application_name) FROM pg_catalog.pg_stat_replication AS replication JOIN pg_catalog.pg_replication_slots AS slots ON slots.active_pid = replication.pid JOIN pg_catalog.pg_stat_ssl AS ssl ON ssl.pid = replication.pid WHERE replication.application_name IN ('pgshard_member_0001', 'pgshard_member_0002');"
 	if err := wait.PollUntilContextTimeout(ctx, time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
 		last, lastErr = runPostgreSQLPodQuery(ctx, namespace, sourcePodName, query)
 		return lastErr == nil && last == want, nil
 	}); err != nil {
 		t.Fatalf("wait for exact physical replication streams: %v; last=%q error=%v", err, last, lastErr)
+	}
+}
+
+func assertKINDStandbyWALReceiverVerifiedTLS(t *testing.T, ctx context.Context, namespace, podName string, member int32) {
+	t.Helper()
+	conninfo, err := runPostgreSQLPodQuery(ctx, namespace, podName, "SELECT conninfo FROM pg_catalog.pg_stat_wal_receiver;")
+	if err != nil {
+		t.Fatalf("read physical standby member %d WAL receiver conninfo: %v", member, err)
+	}
+	if !strings.Contains(conninfo, "sslmode=verify-full") ||
+		!strings.Contains(conninfo, "sslrootcert=/run/pgshard/standby-auth/ca.crt") ||
+		!strings.Contains(conninfo, "channel_binding=require") {
+		t.Fatalf("physical standby member %d WAL receiver conninfo lacks verified TLS: %q", member, conninfo)
+	}
+}
+
+func assertKINDReplicationIngressRequiresTLS(t *testing.T, ctx context.Context, namespace, podName, sourceHost string) {
+	t.Helper()
+	baseConninfo := fmt.Sprintf("host=%s port=5432 user=pgshard_replication passfile=/run/pgshard/standby-auth/passfile replication=true", sourceHost)
+	identifySystem := func(conninfo string) (string, error) {
+		arguments := []string{
+			"--namespace", namespace,
+			"exec", podName,
+			"--container=postgresql",
+			"--",
+			"env", "LC_ALL=C",
+			"psql", "-X", "--no-password", "--no-align", "--tuples-only", "--field-separator=|",
+			conninfo,
+			"--command=IDENTIFY_SYSTEM",
+		}
+		output, err := exec.CommandContext(ctx, "kubectl", arguments...).CombinedOutput()
+		return strings.TrimSpace(string(output)), err
+	}
+
+	verified, err := identifySystem(baseConninfo + " sslmode=verify-full sslrootcert=/run/pgshard/standby-auth/ca.crt channel_binding=require")
+	if err != nil {
+		t.Fatalf("IDENTIFY_SYSTEM over verified replication TLS: %v: %s", err, verified)
+	}
+	if fields := strings.Split(verified, "|"); len(fields) != 4 || fields[0] == "" || fields[1] == "" || fields[2] == "" {
+		t.Fatalf("verified replication TLS IDENTIFY_SYSTEM = %q", verified)
+	}
+
+	cleartext, err := identifySystem(baseConninfo + " sslmode=disable")
+	var exitError *exec.ExitError
+	if err == nil {
+		t.Fatalf("cleartext replication connection was admitted: %s", cleartext)
+	} else if !errors.As(err, &exitError) || exitError.ExitCode() != 2 ||
+		!strings.Contains(cleartext, "pg_hba.conf rejects replication connection") ||
+		!strings.Contains(cleartext, "no encryption") {
+		t.Fatalf("cleartext replication denial = error %v output %q, want pg_hba no-encryption rejection with exit 2", err, cleartext)
 	}
 }
 

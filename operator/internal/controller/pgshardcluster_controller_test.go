@@ -1504,10 +1504,20 @@ func TestMultiMemberSourceStorageFinalizationHonorsDeletionPolicy(t *testing.T) 
 			}
 			current := getCluster(t, ctx, base, cluster)
 			bootstrap := bootstrapForShard(t, current, 0)
+			replicationTLSNames := make([]string, 0, 4)
+			for _, recorded := range current.Status.PostgreSQLReplicationTLS {
+				replicationTLSNames = append(replicationTLSNames, recorded.CASecretName)
+				for _, member := range recorded.Members {
+					replicationTLSNames = append(replicationTLSNames, member.SecretName)
+				}
+			}
+			if len(replicationTLSNames) != int(cluster.Spec.MembersPerShard)+1 {
+				t.Fatalf("multi-member cluster checkpointed %d replication TLS Secrets", len(replicationTLSNames))
+			}
 			if err := base.Delete(ctx, current); err != nil {
 				t.Fatal(err)
 			}
-			for range 16 {
+			for range 24 {
 				if _, err := reconciler.Reconcile(ctx, requestFor(cluster)); client.IgnoreNotFound(err) != nil {
 					t.Fatal(err)
 				}
@@ -1520,6 +1530,11 @@ func TestMultiMemberSourceStorageFinalizationHonorsDeletionPolicy(t *testing.T) 
 			}
 			if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.SecretName}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
 				t.Fatalf("source-storage credential survived finalization: %v", err)
+			}
+			for _, name := range replicationTLSNames {
+				if err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+					t.Fatalf("replication TLS Secret %s survived finalization: %v", name, err)
+				}
 			}
 			claim := &corev1.PersistentVolumeClaim{}
 			err := base.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: bootstrap.PVCName}, claim)
@@ -1926,6 +1941,533 @@ func TestReplicationCredentialReconciliationReindexesAfterSortedInsert(t *testin
 	observedShardOne, found := postgreSQLReplicationCredentialForShard(after, 1)
 	if !found || *observedShardOne != checkpointedShardOne {
 		t.Fatalf("broken later-shard checkpoint changed: before=%#v after=%#v", checkpointedShardOne, observedShardOne)
+	}
+}
+
+// describeTLSSecret summarizes a TLS Secret without ever printing key bytes:
+// generated private keys must not leak into test logs.
+func describeTLSSecret(secret *corev1.Secret) string {
+	keys := slices.Sorted(maps.Keys(secret.Data))
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d bytes", key, len(secret.Data[key])))
+	}
+	immutable := secret.Immutable != nil && *secret.Immutable
+	return fmt.Sprintf("name=%s uid=%s immutable=%t data={%s}", secret.Name, secret.UID, immutable, strings.Join(parts, " "))
+}
+
+func replicationTLSTestCluster() *pgshardv1alpha1.PgShardCluster {
+	cluster := validCluster()
+	cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster, owned.PostgreSQLRuntimeAgentQuarantine)
+	cluster.Status.PostgreSQLBootstrapSpec.ReplicationTransportPolicy = pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1
+	return cluster
+}
+
+func TestReplicationTLSIsStagedCheckpointedAndFailClosed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := replicationTLSTestCluster()
+	base := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(base, base)
+	current := getCluster(t, ctx, base, cluster)
+	if err := reconciler.ensurePostgreSQLReplicationTLS(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+
+	current = getCluster(t, ctx, base, cluster)
+	if len(current.Status.PostgreSQLReplicationTLS) != int(cluster.Spec.Shards) {
+		t.Fatalf("replication TLS checkpoints = %#v", current.Status.PostgreSQLReplicationTLS)
+	}
+	now := time.Now().UTC()
+	for index := range current.Status.PostgreSQLReplicationTLS {
+		recorded := &current.Status.PostgreSQLReplicationTLS[index]
+		if recorded.Shard != int32(index) || recorded.CASecretUID == "" ||
+			!validCatalogAccessDigest(recorded.CASHA256) || recorded.RenewalDeadline.IsZero() ||
+			len(recorded.Members) != int(cluster.Spec.MembersPerShard) {
+			t.Fatalf("replication TLS checkpoint = %#v", recorded)
+		}
+		if !recorded.RenewalDeadline.Time.After(now.Add(4 * 365 * 24 * time.Hour)) {
+			t.Fatalf("replication TLS renewal deadline is not floored to the static lifetime: %v", recorded.RenewalDeadline)
+		}
+		caSecret := &corev1.Secret{}
+		if err := base.Get(ctx, types.NamespacedName{Namespace: current.Namespace, Name: recorded.CASecretName}, caSecret); err != nil {
+			t.Fatal(err)
+		}
+		if caSecret.Immutable == nil || !*caSecret.Immutable || len(caSecret.Data) != 1 || len(caSecret.Data[owned.PostgreSQLReplicationTLSCAKey]) == 0 {
+			t.Fatalf("replication CA Secret = %s", describeTLSSecret(caSecret))
+		}
+		if recorded.CASHA256 != owned.PostgreSQLReplicationTLSCAMaterialSHA256(caSecret.Data[owned.PostgreSQLReplicationTLSCAKey]) {
+			t.Fatalf("replication CA digest does not bind the stored certificate: %#v", recorded)
+		}
+		for _, member := range recorded.Members {
+			if member.SecretUID == "" || !validCatalogAccessDigest(member.ServerSHA256) || member.NotAfter.IsZero() {
+				t.Fatalf("replication TLS member checkpoint = %#v", member)
+			}
+			secret := &corev1.Secret{}
+			if err := base.Get(ctx, types.NamespacedName{Namespace: current.Namespace, Name: member.SecretName}, secret); err != nil {
+				t.Fatal(err)
+			}
+			certificate := secret.Data[owned.PostgreSQLReplicationTLSCertificateKey]
+			privateKey := secret.Data[owned.PostgreSQLReplicationTLSPrivateKeyKey]
+			if secret.Immutable == nil || !*secret.Immutable || len(secret.Data) != 2 || len(certificate) == 0 || len(privateKey) == 0 {
+				t.Fatalf("replication server Secret = %s", describeTLSSecret(secret))
+			}
+			if member.ServerSHA256 != owned.PostgreSQLReplicationTLSServerMaterialSHA256(certificate, privateKey) {
+				t.Fatalf("replication server digest does not bind the stored material: %#v", member)
+			}
+			names := owned.PostgreSQLMemberTLSDNSNames(current.Name, recorded.Shard, member.Member, current.Namespace)
+			if _, err := pki.ValidateReplicationTLSServer(caSecret.Data[owned.PostgreSQLReplicationTLSCAKey], certificate, privateKey, names, now); err != nil {
+				t.Fatalf("shard %d member %d server material: %v", recorded.Shard, member.Member, err)
+			}
+			foreign := owned.PostgreSQLMemberTLSDNSNames(current.Name, recorded.Shard, member.Member+1, current.Namespace)
+			if _, err := pki.ValidateReplicationTLSServer(caSecret.Data[owned.PostgreSQLReplicationTLSCAKey], certificate, privateKey, foreign, now); err == nil {
+				t.Fatalf("shard %d member %d certificate validated for another member's DNS name", recorded.Shard, member.Member)
+			}
+		}
+	}
+
+	checkpointed := current.DeepCopy()
+	if err := reconciler.ensurePostgreSQLReplicationTLS(ctx, current); err != nil {
+		t.Fatalf("checkpointed replication TLS revalidation failed: %v", err)
+	}
+	if !reflect.DeepEqual(checkpointed.Status.PostgreSQLReplicationTLS, current.Status.PostgreSQLReplicationTLS) {
+		t.Fatalf("revalidation mutated the checkpoint: %#v", current.Status.PostgreSQLReplicationTLS)
+	}
+
+	tampered := current.Status.PostgreSQLReplicationTLS[0].Members[0]
+	donor := current.Status.PostgreSQLReplicationTLS[1].Members[0]
+	donorSecret := &corev1.Secret{}
+	if err := base.Get(ctx, types.NamespacedName{Namespace: current.Namespace, Name: donor.SecretName}, donorSecret); err != nil {
+		t.Fatal(err)
+	}
+	secret := &corev1.Secret{}
+	if err := base.Get(ctx, types.NamespacedName{Namespace: current.Namespace, Name: tampered.SecretName}, secret); err != nil {
+		t.Fatal(err)
+	}
+	secret.Data = maps.Clone(donorSecret.Data)
+	if err := base.Update(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+	current = getCluster(t, ctx, base, cluster)
+	if err := reconciler.ensurePostgreSQLReplicationTLS(ctx, current); err == nil ||
+		!strings.Contains(err.Error(), "invalid TLS material") && !strings.Contains(err.Error(), "material differs from the checkpointed creation result") {
+		t.Fatalf("tampered replication server material error = %v", err)
+	}
+}
+
+func TestReplicationTLSFailsClosedOnSecretIdentityChange(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := replicationTLSTestCluster()
+	base := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(base, base)
+	current := getCluster(t, ctx, base, cluster)
+	if err := reconciler.ensurePostgreSQLReplicationTLS(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	current = getCluster(t, ctx, base, cluster)
+	recorded := current.Status.PostgreSQLReplicationTLS[0].Members[1]
+
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: current.Namespace, Name: recorded.SecretName}
+	if err := base.Get(ctx, key, secret); err != nil {
+		t.Fatal(err)
+	}
+	replacement := secret.DeepCopy()
+	if err := base.Delete(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.ensurePostgreSQLReplicationTLS(ctx, getCluster(t, ctx, base, cluster)); err == nil || !strings.Contains(err.Error(), "is missing; explicit recovery is required") {
+		t.Fatalf("deleted checkpointed Secret error = %v", err)
+	}
+
+	replacement.UID = ""
+	replacement.ResourceVersion = ""
+	if err := base.Create(ctx, replacement); err != nil {
+		t.Fatal(err)
+	}
+	err := reconciler.ensurePostgreSQLReplicationTLS(ctx, getCluster(t, ctx, base, cluster))
+	if err == nil || !strings.Contains(err.Error(), "expected recorded UID") {
+		t.Fatalf("recreated Secret UID mismatch error = %v", err)
+	}
+}
+
+func TestReplicationTLSRefusesPartialInstallWithoutRecoverableCA(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := replicationTLSTestCluster()
+	base := newFakeClient(t, cluster)
+	installsToAllow := 1
+	limited := interceptedClient(t, base, interceptor.Funcs{Update: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.UpdateOption) error {
+		secret, ok := object.(*corev1.Secret)
+		if ok && len(secret.Data) != 0 {
+			if installsToAllow == 0 {
+				return fmt.Errorf("injected replication TLS install outage")
+			}
+			installsToAllow--
+		}
+		return kubeClient.Update(ctx, object, options...)
+	}})
+	reconciler := developmentReconciler(limited, base)
+	err := reconciler.ensurePostgreSQLReplicationTLS(ctx, getCluster(t, ctx, base, cluster))
+	if err == nil || !strings.Contains(err.Error(), "injected replication TLS install outage") {
+		t.Fatalf("interrupted install error = %v", err)
+	}
+
+	recovered := developmentReconciler(base, base)
+	err = recovered.ensurePostgreSQLReplicationTLS(ctx, getCluster(t, ctx, base, cluster))
+	if err == nil || !strings.Contains(err.Error(), "partially installed") || !strings.Contains(err.Error(), "explicit recovery is required") {
+		t.Fatalf("partial install error = %v", err)
+	}
+}
+
+func TestReplicationTLSCheckpointsAfterInstallInterruptedBeforeDigestCheckpoint(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := replicationTLSTestCluster()
+	base := newFakeClient(t, cluster)
+	// Shard zero consumes one intent checkpoint and one identity checkpoint
+	// per Secret; blocking the next status write interrupts exactly the digest
+	// checkpoint that follows the completed material installs.
+	checkpointsToAllow := 2 + int(cluster.Spec.MembersPerShard)
+	limited := interceptedClient(t, base, interceptor.Funcs{SubResourceUpdate: func(ctx context.Context, kubeClient client.Client, subResourceName string, object client.Object, options ...client.SubResourceUpdateOption) error {
+		if _, ok := object.(*pgshardv1alpha1.PgShardCluster); ok {
+			if checkpointsToAllow == 0 {
+				return fmt.Errorf("injected replication TLS checkpoint outage")
+			}
+			checkpointsToAllow--
+		}
+		return kubeClient.SubResource(subResourceName).Update(ctx, object, options...)
+	}})
+	reconciler := developmentReconciler(limited, base)
+	err := reconciler.ensurePostgreSQLReplicationTLS(ctx, getCluster(t, ctx, base, cluster))
+	if err == nil || !strings.Contains(err.Error(), "injected replication TLS checkpoint outage") {
+		t.Fatalf("interrupted digest checkpoint error = %v", err)
+	}
+
+	recovered := developmentReconciler(base, base)
+	if err := recovered.ensurePostgreSQLReplicationTLS(ctx, getCluster(t, ctx, base, cluster)); err != nil {
+		t.Fatalf("resumed digest checkpoint failed: %v", err)
+	}
+	current := getCluster(t, ctx, base, cluster)
+	if len(current.Status.PostgreSQLReplicationTLS) != int(cluster.Spec.Shards) {
+		t.Fatalf("replication TLS checkpoints = %#v", current.Status.PostgreSQLReplicationTLS)
+	}
+	for _, recorded := range current.Status.PostgreSQLReplicationTLS {
+		if !validCatalogAccessDigest(recorded.CASHA256) || recorded.RenewalDeadline.IsZero() {
+			t.Fatalf("replication TLS checkpoint = %#v", recorded)
+		}
+	}
+}
+
+func TestReplicationTLSIsNeverProvisionedForContractsWithoutTransportPolicy(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := validCluster()
+	// An existing cluster's contract was recorded before replication TLS
+	// existed: it carries no transport policy and must stay untouched.
+	cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster, owned.PostgreSQLRuntimeAgentQuarantine)
+	base := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(base, base)
+	current := getCluster(t, ctx, base, cluster)
+
+	secretsBefore := &corev1.SecretList{}
+	if err := base.List(ctx, secretsBefore, client.InNamespace(cluster.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.ensurePostgreSQLReplicationTLS(ctx, current); err != nil {
+		t.Fatalf("policy-less cluster reconciliation failed: %v", err)
+	}
+	current = getCluster(t, ctx, base, cluster)
+	if len(current.Status.PostgreSQLReplicationTLS) != 0 {
+		t.Fatalf("policy-less cluster received replication TLS checkpoints: %#v", current.Status.PostgreSQLReplicationTLS)
+	}
+	secretsAfter := &corev1.SecretList{}
+	if err := base.List(ctx, secretsAfter, client.InNamespace(cluster.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	if len(secretsAfter.Items) != len(secretsBefore.Items) {
+		t.Fatalf("policy-less cluster received Secrets: before=%d after=%d", len(secretsBefore.Items), len(secretsAfter.Items))
+	}
+
+	current.Status.PostgreSQLReplicationTLS = testReplicationTLSStatusFixture(current)
+	if err := reconciler.ensurePostgreSQLReplicationTLS(ctx, current); err == nil || !strings.Contains(err.Error(), "without the \"server-tls-v1\" bootstrap transport policy") {
+		t.Fatalf("policy-less cluster with TLS checkpoints error = %v", err)
+	}
+}
+
+func testReplicationTLSStatusFixture(cluster *pgshardv1alpha1.PgShardCluster) []pgshardv1alpha1.PostgreSQLReplicationTLSStatus {
+	checkpoints := make([]pgshardv1alpha1.PostgreSQLReplicationTLSStatus, 0, cluster.Spec.Shards)
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		checkpoint := pgshardv1alpha1.PostgreSQLReplicationTLSStatus{
+			Shard:           shard,
+			CASecretName:    owned.PostgreSQLReplicationTLSCASecretPrefix(cluster.Name, shard) + strings.Repeat("a", 32),
+			CASecretUID:     types.UID(fmt.Sprintf("fixture-ca-uid-%04d", shard)),
+			CASHA256:        strings.Repeat("c", 64),
+			RenewalDeadline: metav1.NewTime(time.Now().Add(24 * time.Hour).UTC()),
+		}
+		for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
+			checkpoint.Members = append(checkpoint.Members, pgshardv1alpha1.PostgreSQLReplicationTLSMemberStatus{
+				Member:       member,
+				SecretName:   owned.PostgreSQLReplicationTLSServerSecretPrefix(cluster.Name, shard, member) + strings.Repeat("b", 32),
+				SecretUID:    types.UID(fmt.Sprintf("fixture-server-uid-%04d-%04d", shard, member)),
+				ServerSHA256: strings.Repeat("d", 64),
+				NotAfter:     metav1.NewTime(time.Now().Add(48 * time.Hour).UTC()),
+			})
+		}
+		checkpoints = append(checkpoints, checkpoint)
+	}
+	return checkpoints
+}
+
+func TestRuntimeContractStampsTransportPolicyOnlyAtFirstRecord(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	fresh := validCluster()
+	base := newFakeClient(t, fresh)
+	reconciler := developmentReconciler(base, base)
+	current := getCluster(t, ctx, base, fresh)
+	if err := reconciler.validatePostgreSQLRuntimeContract(ctx, current, owned.PostgreSQLRuntimeAgentQuarantine); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.PostgreSQLBootstrapSpec.ReplicationTransportPolicy != pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1 {
+		t.Fatalf("fresh multi-member contract = %#v", current.Status.PostgreSQLBootstrapSpec)
+	}
+	if err := reconciler.validatePostgreSQLRuntimeContract(ctx, current, owned.PostgreSQLRuntimeAgentQuarantine); err != nil {
+		t.Fatalf("recorded policy-bearing contract was rejected: %v", err)
+	}
+
+	existing := validCluster()
+	existing.Name = "example-existing"
+	existing.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(existing, owned.PostgreSQLRuntimeAgentQuarantine)
+	existingBase := newFakeClient(t, existing)
+	existingReconciler := developmentReconciler(existingBase, existingBase)
+	existingCurrent := getCluster(t, ctx, existingBase, existing)
+	if err := existingReconciler.validatePostgreSQLRuntimeContract(ctx, existingCurrent, owned.PostgreSQLRuntimeAgentQuarantine); err != nil {
+		t.Fatal(err)
+	}
+	if existingCurrent.Status.PostgreSQLBootstrapSpec.ReplicationTransportPolicy != "" {
+		t.Fatalf("existing contract was retroactively stamped: %#v", existingCurrent.Status.PostgreSQLBootstrapSpec)
+	}
+
+	single := validCluster()
+	single.Name = "example-single"
+	single.Spec.MembersPerShard = 1
+	single.Spec.Durability = pgshardv1alpha1.DurabilityAsynchronous
+	singleBase := newFakeClient(t, single)
+	singleReconciler := developmentReconciler(singleBase, singleBase)
+	singleCurrent := getCluster(t, ctx, singleBase, single)
+	if err := singleReconciler.validatePostgreSQLRuntimeContract(ctx, singleCurrent, owned.PostgreSQLRuntimeDirect); err != nil {
+		t.Fatal(err)
+	}
+	if singleCurrent.Status.PostgreSQLBootstrapSpec.ReplicationTransportPolicy != "" {
+		t.Fatalf("single-member contract received a replication transport policy: %#v", singleCurrent.Status.PostgreSQLBootstrapSpec)
+	}
+}
+
+func TestReplicationTLSSecretsAreUIDFenceDeletedDuringFinalization(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := replicationTLSTestCluster()
+	base := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(base, base)
+	current := getCluster(t, ctx, base, cluster)
+	if err := reconciler.ensurePostgreSQLReplicationTLS(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	current = getCluster(t, ctx, base, cluster)
+	names := make([]string, 0, cluster.Spec.Shards*(cluster.Spec.MembersPerShard+1))
+	for _, recorded := range current.Status.PostgreSQLReplicationTLS {
+		names = append(names, recorded.CASecretName)
+		for _, member := range recorded.Members {
+			names = append(names, member.SecretName)
+		}
+	}
+
+	deletions := 0
+	for range len(names) + 1 {
+		deleting, err := reconciler.deletePostgreSQLReplicationTLSForFinalization(ctx, current)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !deleting {
+			break
+		}
+		deletions++
+	}
+	if deletions != len(names) {
+		t.Fatalf("replication TLS finalization issued %d deletions for %d Secrets", deletions, len(names))
+	}
+	for _, name := range names {
+		if err := base.Get(ctx, types.NamespacedName{Namespace: current.Namespace, Name: name}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("replication TLS Secret %s survived finalization: %v", name, err)
+		}
+	}
+	if deleting, err := reconciler.deletePostgreSQLReplicationTLSForFinalization(ctx, current); err != nil || deleting {
+		t.Fatalf("absent replication TLS Secrets still deleting=%t error=%v", deleting, err)
+	}
+}
+
+func TestReplicationTLSFinalizationFailsClosedOnForeignOrTamperedSecrets(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := replicationTLSTestCluster()
+	base := newFakeClient(t, cluster)
+	reconciler := developmentReconciler(base, base)
+	current := getCluster(t, ctx, base, cluster)
+	if err := reconciler.ensurePostgreSQLReplicationTLS(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	current = getCluster(t, ctx, base, cluster)
+	recorded := current.Status.PostgreSQLReplicationTLS[0].Members[0]
+	key := types.NamespacedName{Namespace: current.Namespace, Name: recorded.SecretName}
+
+	secret := &corev1.Secret{}
+	if err := base.Get(ctx, key, secret); err != nil {
+		t.Fatal(err)
+	}
+	tampered := secret.DeepCopy()
+	tampered.Data = map[string][]byte{
+		owned.PostgreSQLReplicationTLSCertificateKey: []byte("tampered"),
+		owned.PostgreSQLReplicationTLSPrivateKeyKey:  tampered.Data[owned.PostgreSQLReplicationTLSPrivateKeyKey],
+	}
+	if err := base.Update(ctx, tampered); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.deletePostgreSQLReplicationTLSForFinalization(ctx, current); err == nil ||
+		!strings.Contains(err.Error(), "material differs from the checkpointed creation result during finalization") {
+		t.Fatalf("tampered replication TLS finalization error = %v", err)
+	}
+
+	if err := base.Get(ctx, key, secret); err != nil {
+		t.Fatal(err)
+	}
+	replacement := secret.DeepCopy()
+	if err := base.Delete(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+	replacement.UID = ""
+	replacement.ResourceVersion = ""
+	if err := base.Create(ctx, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.deletePostgreSQLReplicationTLSForFinalization(ctx, current); err == nil ||
+		!strings.Contains(err.Error(), "expected recorded UID") || !strings.Contains(err.Error(), "during finalization") {
+		t.Fatalf("recreated replication TLS finalization error = %v", err)
+	}
+}
+
+func TestReplicationTLSFinalizationDeletesPartiallyStagedIntents(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cluster := replicationTLSTestCluster()
+	base := newFakeClient(t, cluster)
+	blocked := interceptedClient(t, base, interceptor.Funcs{Update: func(ctx context.Context, kubeClient client.WithWatch, object client.Object, options ...client.UpdateOption) error {
+		if secret, ok := object.(*corev1.Secret); ok && len(secret.Data) != 0 {
+			return fmt.Errorf("injected replication TLS install outage")
+		}
+		return kubeClient.Update(ctx, object, options...)
+	}})
+	staging := developmentReconciler(blocked, base)
+	if err := staging.ensurePostgreSQLReplicationTLS(ctx, getCluster(t, ctx, base, cluster)); err == nil || !strings.Contains(err.Error(), "injected replication TLS install outage") {
+		t.Fatalf("interrupted staging error = %v", err)
+	}
+
+	reconciler := developmentReconciler(base, base)
+	current := getCluster(t, ctx, base, cluster)
+	stagedIntents := 0
+	for _, recorded := range current.Status.PostgreSQLReplicationTLS {
+		if recorded.CASecretUID != "" {
+			stagedIntents++
+		}
+		for _, member := range recorded.Members {
+			if member.SecretUID != "" {
+				stagedIntents++
+			}
+		}
+	}
+	if stagedIntents == 0 {
+		t.Fatal("interrupted staging checkpointed no Secret identities")
+	}
+	deletions := 0
+	for range stagedIntents + 1 {
+		deleting, err := reconciler.deletePostgreSQLReplicationTLSForFinalization(ctx, current)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !deleting {
+			break
+		}
+		deletions++
+	}
+	if deletions != stagedIntents {
+		t.Fatalf("replication TLS finalization issued %d deletions for %d staged intents", deletions, stagedIntents)
+	}
+}
+
+func TestStatusesEqualIncludesReplicationTLS(t *testing.T) {
+	t.Parallel()
+	timestamp := metav1.NewTime(time.Now().UTC().Truncate(time.Second))
+	base := pgshardv1alpha1.PgShardClusterStatus{PostgreSQLReplicationTLS: []pgshardv1alpha1.PostgreSQLReplicationTLSStatus{{
+		Shard:           0,
+		CASecretName:    "example-tc0000-" + strings.Repeat("a", 32),
+		CASecretUID:     "ca-uid",
+		CASHA256:        strings.Repeat("c", 64),
+		RenewalDeadline: timestamp,
+		Members: []pgshardv1alpha1.PostgreSQLReplicationTLSMemberStatus{{
+			Member:       0,
+			SecretName:   "example-ts0000-m0000-" + strings.Repeat("b", 32),
+			SecretUID:    "server-uid",
+			ServerSHA256: strings.Repeat("d", 64),
+			NotAfter:     timestamp,
+		}},
+	}}}
+	copyStatus := func() pgshardv1alpha1.PgShardClusterStatus {
+		return *base.DeepCopy()
+	}
+	if !statusesEqual(base, copyStatus()) {
+		t.Fatal("equal replication TLS checkpoints compare unequal")
+	}
+	for _, mutate := range []func(*pgshardv1alpha1.PgShardClusterStatus){
+		func(status *pgshardv1alpha1.PgShardClusterStatus) { status.PostgreSQLReplicationTLS[0].Shard = 1 },
+		func(status *pgshardv1alpha1.PgShardClusterStatus) {
+			status.PostgreSQLReplicationTLS[0].CASecretName += "x"
+		},
+		func(status *pgshardv1alpha1.PgShardClusterStatus) {
+			status.PostgreSQLReplicationTLS[0].CASecretUID = "changed"
+		},
+		func(status *pgshardv1alpha1.PgShardClusterStatus) {
+			status.PostgreSQLReplicationTLS[0].CASHA256 = strings.Repeat("e", 64)
+		},
+		func(status *pgshardv1alpha1.PgShardClusterStatus) {
+			status.PostgreSQLReplicationTLS[0].RenewalDeadline = metav1.NewTime(timestamp.Add(time.Hour))
+		},
+		func(status *pgshardv1alpha1.PgShardClusterStatus) {
+			status.PostgreSQLReplicationTLS[0].Members[0].Member = 1
+		},
+		func(status *pgshardv1alpha1.PgShardClusterStatus) {
+			status.PostgreSQLReplicationTLS[0].Members[0].SecretName += "x"
+		},
+		func(status *pgshardv1alpha1.PgShardClusterStatus) {
+			status.PostgreSQLReplicationTLS[0].Members[0].SecretUID = "changed"
+		},
+		func(status *pgshardv1alpha1.PgShardClusterStatus) {
+			status.PostgreSQLReplicationTLS[0].Members[0].ServerSHA256 = strings.Repeat("e", 64)
+		},
+		func(status *pgshardv1alpha1.PgShardClusterStatus) {
+			status.PostgreSQLReplicationTLS[0].Members[0].NotAfter = metav1.NewTime(timestamp.Add(time.Hour))
+		},
+		func(status *pgshardv1alpha1.PgShardClusterStatus) {
+			status.PostgreSQLReplicationTLS[0].Members = nil
+		},
+		func(status *pgshardv1alpha1.PgShardClusterStatus) { status.PostgreSQLReplicationTLS = nil },
+	} {
+		changed := copyStatus()
+		mutate(&changed)
+		if statusesEqual(base, changed) {
+			t.Fatalf("changed replication TLS checkpoint compared equal: %#v", changed.PostgreSQLReplicationTLS)
+		}
 	}
 }
 

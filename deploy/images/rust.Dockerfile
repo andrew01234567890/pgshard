@@ -130,6 +130,7 @@ COPY --from=postgres-fence-build --chown=0:0 /out/usr/share/postgresql/18/extens
 RUN install -d -o 0 -g 0 -m 0755 /etc/pgshard /usr/share/pgshard/migrations
 COPY --chown=0:0 --chmod=0444 deploy/images/quarantine.pg_hba.conf /etc/pgshard/quarantine.pg_hba.conf
 COPY --chown=0:0 --chmod=0444 deploy/images/replication-bootstrap-primary.pg_hba.conf /etc/pgshard/replication-bootstrap-primary.pg_hba.conf
+COPY --chown=0:0 --chmod=0444 deploy/images/replication-bootstrap-primary-tls.pg_hba.conf /etc/pgshard/replication-bootstrap-primary-tls.pg_hba.conf
 COPY --chown=0:0 --chmod=0444 crates/pgshard-catalog/migrations/0001_shardschema.sql /usr/share/pgshard/migrations/0001_shardschema.sql
 
 USER 999:999

@@ -32,6 +32,11 @@ const (
 	staticServerValidity = 5 * 365 * 24 * time.Hour
 	staticRenewBefore    = 180 * 24 * time.Hour
 	certificateSkew      = 5 * time.Minute
+
+	// StaticRenewBefore is the minimum remaining static-material validity the
+	// operator accepts before failing closed instead of pretending it can
+	// rotate certificates without a restart.
+	StaticRenewBefore = staticRenewBefore
 )
 
 // StaticServerBundle contains one self-signed CA certificate and its issued
@@ -237,6 +242,107 @@ func ValidateStaticServerBundle(bundle *StaticServerBundle, dnsNames []string, n
 		return fmt.Errorf("server certificate expires too soon at %s; zero-downtime certificate rotation is not implemented", server.certificate.NotAfter.UTC().Format(time.RFC3339))
 	}
 	return nil
+}
+
+// ReplicationTLSServerMaterial is one member's issued server keypair.
+type ReplicationTLSServerMaterial struct {
+	Certificate []byte
+	PrivateKey  []byte
+	NotAfter    time.Time
+}
+
+// ReplicationTLSBundle contains one self-signed replication CA certificate and
+// one issued server keypair per shard member. The CA private key is discarded
+// after issuance, so a partially installed bundle can never be completed later.
+type ReplicationTLSBundle struct {
+	CACertificate []byte
+	CANotAfter    time.Time
+	Servers       map[int32]ReplicationTLSServerMaterial
+}
+
+// GenerateReplicationTLSBundle creates a long-lived self-signed CA and one
+// server certificate per member. Every leaf carries exactly one DNS SAN: the
+// member's stable Pod DNS name.
+func GenerateReplicationTLSBundle(now time.Time, random io.Reader, caCommonName string, memberDNSNames map[int32][]string) (*ReplicationTLSBundle, error) {
+	if random == nil {
+		return nil, fmt.Errorf("certificate randomness source is required")
+	}
+	if strings.TrimSpace(caCommonName) == "" {
+		return nil, fmt.Errorf("CA common name is required")
+	}
+	if len(memberDNSNames) == 0 {
+		return nil, fmt.Errorf("at least one member DNS name is required")
+	}
+	members := make([]int32, 0, len(memberDNSNames))
+	for member, names := range memberDNSNames {
+		if member < 0 {
+			return nil, fmt.Errorf("member %d is not a valid shard member", member)
+		}
+		if len(names) != 1 || strings.TrimSpace(names[0]) == "" {
+			return nil, fmt.Errorf("member %d requires exactly one non-empty DNS name", member)
+		}
+		members = append(members, member)
+	}
+	slices.Sort(members)
+	authority, err := generateCertificateAuthority(now, random, caCommonName)
+	if err != nil {
+		return nil, err
+	}
+	bundle := &ReplicationTLSBundle{
+		CACertificate: slices.Clone(authority.certificatePEM),
+		CANotAfter:    authority.certificate.NotAfter,
+		Servers:       make(map[int32]ReplicationTLSServerMaterial, len(members)),
+	}
+	for _, member := range members {
+		server, err := generateServingCertificateWithValidity(now, random, authority, memberDNSNames[member], staticServerValidity)
+		if err != nil {
+			return nil, fmt.Errorf("issue replication server certificate for member %d: %w", member, err)
+		}
+		bundle.Servers[member] = ReplicationTLSServerMaterial{
+			Certificate: slices.Clone(server.certificatePEM),
+			PrivateKey:  slices.Clone(server.privateKeyPEM),
+			NotAfter:    server.certificate.NotAfter,
+		}
+	}
+	return bundle, nil
+}
+
+// ValidateReplicationTLSCA verifies the self-signed replication CA certificate
+// and its remaining lifetime. The CA private key is deliberately discarded
+// after issuance and is not required.
+func ValidateReplicationTLSCA(caCertificate []byte, now time.Time) (time.Time, error) {
+	authority, err := parseCertificateAuthorityCertificate(caCertificate, now, staticRenewBefore)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return authority.certificate.NotAfter, nil
+}
+
+// ValidateReplicationTLSServer verifies one member's server keypair: key
+// pairing, a server-auth chain to the exact replication CA, exactly one exact
+// DNS SAN, and sufficient remaining lifetime.
+func ValidateReplicationTLSServer(caCertificate, serverCertificate, serverPrivateKey []byte, dnsNames []string, now time.Time) (time.Time, error) {
+	if len(dnsNames) != 1 || strings.TrimSpace(dnsNames[0]) == "" {
+		return time.Time{}, fmt.Errorf("replication server certificates require exactly one non-empty DNS name")
+	}
+	authority, err := parseCertificateAuthorityCertificate(caCertificate, now, staticRenewBefore)
+	if err != nil {
+		return time.Time{}, err
+	}
+	server, err := parseServingCertificate(serverCertificate, serverPrivateKey)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if len(server.certificate.DNSNames) != 1 {
+		return time.Time{}, fmt.Errorf("replication server certificate must carry exactly one DNS name")
+	}
+	if !servingCertificateIsUsable(server, authority, dnsNames, now) {
+		return time.Time{}, fmt.Errorf("replication server certificate is not valid for the exact configured DNS name and CA")
+	}
+	if !server.certificate.NotAfter.After(now.Add(staticRenewBefore)) {
+		return time.Time{}, fmt.Errorf("replication server certificate expires too soon at %s; zero-downtime certificate rotation is not implemented", server.certificate.NotAfter.UTC().Format(time.RFC3339))
+	}
+	return server.certificate.NotAfter, nil
 }
 
 func parseServingCertificate(certificatePEM, privateKeyPEM []byte) (*servingCertificate, error) {

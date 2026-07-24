@@ -163,6 +163,357 @@ func TestBindingAdmissionAcceptsOnlyTheExactRoleNeutralBootstrapSource(t *testin
 	}
 }
 
+func TestBindingAdmissionEnforcesReplicationTransportPolicy(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	serverTLSDigest := strings.Repeat("a", 64)
+	caDigest := strings.Repeat("b", 64)
+
+	bindablePod := func(pod *corev1.Pod) *corev1.Pod {
+		pod.Spec.NodeName = ""
+		pod.DeletionTimestamp = nil
+		delete(pod.Annotations, NodeUIDAnnotation)
+		delete(pod.Annotations, NodeBootIDAnnotation)
+		return pod
+	}
+	tlsSourcePod := func() *corev1.Pod {
+		pod := bindablePod(roleNeutralBootstrapSourcePod())
+		container := &pod.Spec.Containers[0]
+		for index := range container.Env {
+			if container.Env[index].Name == "PGSHARD_POSTGRES_HBA_FILE" {
+				container.Env[index].Value = "/etc/pgshard/replication-bootstrap-primary-tls.pg_hba.conf"
+			}
+		}
+		container.Env = append(container.Env,
+			corev1.EnvVar{Name: "PGSHARD_POSTGRES_SERVER_TLS_CERT", Value: "/run/pgshard/server-tls/tls.crt"},
+			corev1.EnvVar{Name: "PGSHARD_POSTGRES_SERVER_TLS_KEY", Value: "/run/pgshard/server-tls/tls.key"},
+			corev1.EnvVar{Name: "PGSHARD_REPLICATION_TLS_SERVER_SHA256", Value: serverTLSDigest},
+		)
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{Name: "server-tls", MountPath: "/run/pgshard/server-tls", ReadOnly: true})
+		pod.Spec.Volumes = append(pod.Spec.Volumes,
+			corev1.Volume{Name: "server-tls-secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: "staged-server-tls"}}},
+			corev1.Volume{Name: "server-tls", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}}},
+		)
+		return pod
+	}
+	tlsStandbyPod := func() *corev1.Pod {
+		pod := bindablePod(roleNeutralStandbyPod())
+		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env,
+			corev1.EnvVar{Name: "PGSHARD_POSTGRES_PRIMARY_SSLROOTCERT", Value: "/run/pgshard/standby-auth/ca.crt"},
+			corev1.EnvVar{Name: "PGSHARD_REPLICATION_TLS_CA_SHA256", Value: caDigest},
+		)
+		pod.Spec.InitContainers[0].Command = []string{"bash", "-ceu", owned.PostgreSQLStandbyBootstrapScript(true)}
+		pod.Spec.InitContainers[0].Env = append(pod.Spec.InitContainers[0].Env, corev1.EnvVar{Name: "PGSHARD_REPLICATION_TLS_CA_SHA256", Value: caDigest})
+		pod.Spec.InitContainers[0].VolumeMounts = append(pod.Spec.InitContainers[0].VolumeMounts, corev1.VolumeMount{Name: "replication-ca-secret", MountPath: "/etc/pgshard/replication-tls", ReadOnly: true})
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{Name: "replication-ca-secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: "staged-replication-ca"}}})
+		return pod
+	}
+	clusterFor := func(pod *corev1.Pod, policy string) *pgshardv1alpha1.PgShardCluster {
+		cluster := managedClusterForPod(pod)
+		cluster.Spec.MembersPerShard = 3
+		cluster.Status.PostgreSQLBootstrapSpec.ReplicationTransportPolicy = policy
+		cluster.Status.PostgreSQLReplicationTLS = []pgshardv1alpha1.PostgreSQLReplicationTLSStatus{{
+			Shard:        0,
+			CASecretName: "staged-replication-ca",
+			CASHA256:     caDigest,
+			Members: []pgshardv1alpha1.PostgreSQLReplicationTLSMemberStatus{{
+				Member: 0, SecretName: "staged-server-tls", ServerSHA256: serverTLSDigest,
+			}},
+		}}
+		return cluster
+	}
+	attempt := func(t *testing.T, pod *corev1.Pod, cluster *pgshardv1alpha1.PgShardCluster) admission.Response {
+		t.Helper()
+		node := testNode("node-a", "node-uid-a", "boot-a")
+		reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, node, cluster).Build()
+		binding := &corev1.Binding{
+			ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace, UID: pod.UID},
+			Target:     corev1.ObjectReference{Kind: "Node", Name: node.Name},
+		}
+		request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+			Name: pod.Name, Namespace: pod.Namespace, Operation: admissionv1.Create, SubResource: "binding", Object: runtime.RawExtension{Raw: marshalObject(t, binding)},
+		}}
+		return NewBindingAttestor(reader, scheme).Handle(context.Background(), request)
+	}
+
+	const policyServerTLS = pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1
+	for name, build := range map[string]func() *corev1.Pod{"source": tlsSourcePod, "standby": tlsStandbyPod} {
+		if response := attempt(t, build(), clusterFor(build(), policyServerTLS)); !response.Allowed {
+			t.Fatalf("policy cluster's exact TLS %s binding denied: %#v", name, response.Result)
+		}
+		if response := attempt(t, build(), clusterFor(build(), "")); response.Allowed {
+			t.Fatalf("legacy cluster accepted a TLS %s binding", name)
+		}
+	}
+	for name, build := range map[string]func() *corev1.Pod{
+		"source":  func() *corev1.Pod { return bindablePod(roleNeutralBootstrapSourcePod()) },
+		"standby": func() *corev1.Pod { return bindablePod(roleNeutralStandbyPod()) },
+	} {
+		if response := attempt(t, build(), clusterFor(build(), "")); !response.Allowed {
+			t.Fatalf("legacy cluster's exact cleartext %s binding denied: %#v", name, response.Result)
+		}
+		if response := attempt(t, build(), clusterFor(build(), policyServerTLS)); response.Allowed {
+			t.Fatalf("policy cluster accepted a cleartext %s binding", name)
+		}
+	}
+
+	dropEnvironment := func(container *corev1.Container, name string) {
+		container.Env = slices.DeleteFunc(container.Env, func(environment corev1.EnvVar) bool { return environment.Name == name })
+	}
+	dropVolume := func(pod *corev1.Pod, name string) {
+		pod.Spec.Volumes = slices.DeleteFunc(pod.Spec.Volumes, func(volume corev1.Volume) bool { return volume.Name == name })
+	}
+	for _, test := range []struct {
+		name   string
+		build  func() *corev1.Pod
+		mutate func(*corev1.Pod)
+	}{
+		{name: "source without TLS certificate environment", build: tlsSourcePod, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.Containers[0], "PGSHARD_POSTGRES_SERVER_TLS_CERT")
+		}},
+		{name: "source without TLS key environment", build: tlsSourcePod, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.Containers[0], "PGSHARD_POSTGRES_SERVER_TLS_KEY")
+		}},
+		{name: "source without TLS digest environment", build: tlsSourcePod, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.Containers[0], "PGSHARD_REPLICATION_TLS_SERVER_SHA256")
+		}},
+		{name: "source without the server-tls mount", build: tlsSourcePod, mutate: func(pod *corev1.Pod) {
+			pod.Spec.Containers[0].VolumeMounts = slices.DeleteFunc(pod.Spec.Containers[0].VolumeMounts, func(mount corev1.VolumeMount) bool { return mount.Name == "server-tls" })
+		}},
+		{name: "source without the server-tls-secret volume", build: tlsSourcePod, mutate: func(pod *corev1.Pod) {
+			dropVolume(pod, "server-tls-secret")
+		}},
+		{name: "source without the server-tls staging volume", build: tlsSourcePod, mutate: func(pod *corev1.Pod) {
+			dropVolume(pod, "server-tls")
+		}},
+		{name: "source demoted to the cleartext HBA policy", build: tlsSourcePod, mutate: func(pod *corev1.Pod) {
+			for index := range pod.Spec.Containers[0].Env {
+				if pod.Spec.Containers[0].Env[index].Name == "PGSHARD_POSTGRES_HBA_FILE" {
+					pod.Spec.Containers[0].Env[index].Value = "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf"
+				}
+			}
+		}},
+		{name: "standby without the trust-anchor environment", build: tlsStandbyPod, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.Containers[0], "PGSHARD_POSTGRES_PRIMARY_SSLROOTCERT")
+		}},
+		{name: "standby without the agent CA digest", build: tlsStandbyPod, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.Containers[0], "PGSHARD_REPLICATION_TLS_CA_SHA256")
+		}},
+		{name: "standby without the initializer CA digest", build: tlsStandbyPod, mutate: func(pod *corev1.Pod) {
+			dropEnvironment(&pod.Spec.InitContainers[0], "PGSHARD_REPLICATION_TLS_CA_SHA256")
+		}},
+		{name: "standby without the CA projection mount", build: tlsStandbyPod, mutate: func(pod *corev1.Pod) {
+			pod.Spec.InitContainers[0].VolumeMounts = slices.DeleteFunc(pod.Spec.InitContainers[0].VolumeMounts, func(mount corev1.VolumeMount) bool { return mount.Name == "replication-ca-secret" })
+		}},
+		{name: "standby without the replication-ca-secret volume", build: tlsStandbyPod, mutate: func(pod *corev1.Pod) {
+			dropVolume(pod, "replication-ca-secret")
+		}},
+		{name: "standby demoted to the cleartext clone script", build: tlsStandbyPod, mutate: func(pod *corev1.Pod) {
+			pod.Spec.InitContainers[0].Command = []string{"bash", "-ceu", owned.PostgreSQLStandbyBootstrapScript(false)}
+		}},
+		{name: "role-labeled replication source", build: tlsSourcePod, mutate: func(pod *corev1.Pod) {
+			pod.Labels[owned.RoleLabel] = "primary"
+		}},
+		{name: "role-labeled replication standby", build: tlsStandbyPod, mutate: func(pod *corev1.Pod) {
+			pod.Labels[owned.RoleLabel] = "replica"
+		}},
+		{name: "source projecting a self-attested server Secret", build: tlsSourcePod, mutate: func(pod *corev1.Pod) {
+			for index := range pod.Spec.Volumes {
+				if pod.Spec.Volumes[index].Name == "server-tls-secret" {
+					pod.Spec.Volumes[index].Secret.SecretName = "self-attested-server-tls"
+				}
+			}
+		}},
+		{name: "source attesting a foreign server digest", build: tlsSourcePod, mutate: func(pod *corev1.Pod) {
+			for index := range pod.Spec.Containers[0].Env {
+				if pod.Spec.Containers[0].Env[index].Name == "PGSHARD_REPLICATION_TLS_SERVER_SHA256" {
+					pod.Spec.Containers[0].Env[index].Value = strings.Repeat("9", 64)
+				}
+			}
+		}},
+		{name: "standby projecting a self-attested CA Secret", build: tlsStandbyPod, mutate: func(pod *corev1.Pod) {
+			for index := range pod.Spec.Volumes {
+				if pod.Spec.Volumes[index].Name == "replication-ca-secret" {
+					pod.Spec.Volumes[index].Secret.SecretName = "self-attested-replication-ca"
+				}
+			}
+		}},
+		{name: "standby attesting a foreign CA digest", build: tlsStandbyPod, mutate: func(pod *corev1.Pod) {
+			foreign := strings.Repeat("9", 64)
+			for index := range pod.Spec.Containers[0].Env {
+				if pod.Spec.Containers[0].Env[index].Name == "PGSHARD_REPLICATION_TLS_CA_SHA256" {
+					pod.Spec.Containers[0].Env[index].Value = foreign
+				}
+			}
+			for index := range pod.Spec.InitContainers[0].Env {
+				if pod.Spec.InitContainers[0].Env[index].Name == "PGSHARD_REPLICATION_TLS_CA_SHA256" {
+					pod.Spec.InitContainers[0].Env[index].Value = foreign
+				}
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			pod := test.build()
+			test.mutate(pod)
+			if response := attempt(t, pod, clusterFor(pod, policyServerTLS)); response.Allowed {
+				t.Fatal("policy cluster accepted a stripped, role-labeled, or self-attested replication transport binding")
+			}
+		})
+	}
+}
+
+func TestPodCreateAdmissionEnforcesManagedPodContract(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	serverTLSDigest := strings.Repeat("a", 64)
+	caDigest := strings.Repeat("b", 64)
+	clusterFor := func(pod *corev1.Pod, policy string) *pgshardv1alpha1.PgShardCluster {
+		cluster := managedClusterForPod(pod)
+		cluster.Spec.MembersPerShard = 3
+		cluster.Status.PostgreSQLBootstrapSpec.ReplicationTransportPolicy = policy
+		cluster.Status.PostgreSQLReplicationTLS = []pgshardv1alpha1.PostgreSQLReplicationTLSStatus{{
+			Shard:        0,
+			CASecretName: "staged-replication-ca",
+			CASHA256:     caDigest,
+			Members: []pgshardv1alpha1.PostgreSQLReplicationTLSMemberStatus{{
+				Member: 0, SecretName: "staged-server-tls", ServerSHA256: serverTLSDigest,
+			}},
+		}}
+		return cluster
+	}
+	attemptCreate := func(t *testing.T, pod *corev1.Pod, objects ...client.Object) admission.Response {
+		t.Helper()
+		reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+		request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+			Name: pod.Name, Namespace: pod.Namespace, Operation: admissionv1.Create, Object: runtime.RawExtension{Raw: marshalObject(t, pod)},
+		}}
+		return NewPodCreateValidator(reader, testControllerIdentities(), scheme).Handle(context.Background(), request)
+	}
+	bindablePod := func(pod *corev1.Pod) *corev1.Pod {
+		pod.Spec.NodeName = ""
+		pod.DeletionTimestamp = nil
+		delete(pod.Annotations, NodeUIDAnnotation)
+		delete(pod.Annotations, NodeBootIDAnnotation)
+		return pod
+	}
+	tlsSource := func() *corev1.Pod {
+		pod := bindablePod(roleNeutralBootstrapSourcePod())
+		container := &pod.Spec.Containers[0]
+		for index := range container.Env {
+			if container.Env[index].Name == "PGSHARD_POSTGRES_HBA_FILE" {
+				container.Env[index].Value = "/etc/pgshard/replication-bootstrap-primary-tls.pg_hba.conf"
+			}
+		}
+		container.Env = append(container.Env,
+			corev1.EnvVar{Name: "PGSHARD_POSTGRES_SERVER_TLS_CERT", Value: "/run/pgshard/server-tls/tls.crt"},
+			corev1.EnvVar{Name: "PGSHARD_POSTGRES_SERVER_TLS_KEY", Value: "/run/pgshard/server-tls/tls.key"},
+			corev1.EnvVar{Name: "PGSHARD_REPLICATION_TLS_SERVER_SHA256", Value: serverTLSDigest},
+		)
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{Name: "server-tls", MountPath: "/run/pgshard/server-tls", ReadOnly: true})
+		pod.Spec.Volumes = append(pod.Spec.Volumes,
+			corev1.Volume{Name: "server-tls-secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: "staged-server-tls"}}},
+			corev1.Volume{Name: "server-tls", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}}},
+		)
+		return pod
+	}
+
+	unmanaged := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "sql-client", Namespace: "database", UID: "client-uid"},
+		Spec:       corev1.PodSpec{NodeName: "node-a", Containers: []corev1.Container{{Name: "psql"}}},
+	}
+	if response := attemptCreate(t, unmanaged); !response.Allowed {
+		t.Fatalf("unmanaged Pod creation denied: %#v", response.Result)
+	}
+
+	honest := tlsSource()
+	if response := attemptCreate(t, honest, clusterFor(honest, pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)); !response.Allowed {
+		t.Fatalf("honest unassigned TLS source creation denied: %#v", response.Result)
+	}
+	honestCleartext := bindablePod(roleNeutralBootstrapSourcePod())
+	if response := attemptCreate(t, honestCleartext, clusterFor(honestCleartext, "")); !response.Allowed {
+		t.Fatalf("honest legacy cleartext source creation denied: %#v", response.Result)
+	}
+	honestStandby := bindablePod(roleNeutralStandbyPod())
+	if response := attemptCreate(t, honestStandby, clusterFor(honestStandby, "")); !response.Allowed {
+		t.Fatalf("honest legacy cleartext standby creation denied: %#v", response.Result)
+	}
+	generic := bindablePod(managedPod())
+	if response := attemptCreate(t, generic, clusterFor(generic, "")); !response.Allowed {
+		t.Fatalf("honest role-labeled managed Pod creation denied: %#v", response.Result)
+	}
+
+	for _, test := range []struct {
+		name   string
+		build  func() (*corev1.Pod, *pgshardv1alpha1.PgShardCluster)
+		want   string
+		orphan bool
+	}{
+		{name: "preset node name skips binding admission", build: func() (*corev1.Pod, *pgshardv1alpha1.PgShardCluster) {
+			pod := tlsSource()
+			pod.Spec.NodeName = "node-a"
+			return pod, clusterFor(pod, pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)
+		}, want: "must be created unassigned"},
+		{name: "forged node binding evidence", build: func() (*corev1.Pod, *pgshardv1alpha1.PgShardCluster) {
+			pod := tlsSource()
+			pod.Annotations[NodeUIDAnnotation] = "forged-node-uid"
+			return pod, clusterFor(pod, pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)
+		}, want: "must be created unassigned"},
+		{name: "cleartext source under the server TLS policy", build: func() (*corev1.Pod, *pgshardv1alpha1.PgShardCluster) {
+			pod := bindablePod(roleNeutralBootstrapSourcePod())
+			return pod, clusterFor(pod, pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)
+		}, want: "transport"},
+		{name: "cleartext standby under the server TLS policy", build: func() (*corev1.Pod, *pgshardv1alpha1.PgShardCluster) {
+			pod := bindablePod(roleNeutralStandbyPod())
+			return pod, clusterFor(pod, pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)
+		}, want: "transport"},
+		{name: "role-labeled replication source", build: func() (*corev1.Pod, *pgshardv1alpha1.PgShardCluster) {
+			pod := tlsSource()
+			pod.Labels[owned.RoleLabel] = "primary"
+			return pod, clusterFor(pod, pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)
+		}, want: "must not carry a serving role"},
+		{name: "replication environment smuggled into a serving Pod", build: func() (*corev1.Pod, *pgshardv1alpha1.PgShardCluster) {
+			pod := bindablePod(managedPod())
+			pod.Spec.InitContainers = append(pod.Spec.InitContainers, corev1.Container{
+				Name: "smuggled-agent",
+				Env:  []corev1.EnvVar{{Name: "PGSHARD_POSTGRES_MODE", Value: "replication-standby"}},
+			})
+			return pod, clusterFor(pod, pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)
+		}, want: "must not carry a serving role"},
+		{name: "self-attested server Secret", build: func() (*corev1.Pod, *pgshardv1alpha1.PgShardCluster) {
+			pod := tlsSource()
+			for index := range pod.Spec.Volumes {
+				if pod.Spec.Volumes[index].Name == "server-tls-secret" {
+					pod.Spec.Volumes[index].Secret.SecretName = "self-attested-server-tls"
+				}
+			}
+			return pod, clusterFor(pod, pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)
+		}, want: "recorded member checkpoint"},
+		{name: "missing termination fence", build: func() (*corev1.Pod, *pgshardv1alpha1.PgShardCluster) {
+			pod := tlsSource()
+			pod.Finalizers = nil
+			return pod, clusterFor(pod, pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)
+		}, want: "incomplete identity or no termination fence"},
+		{name: "owning cluster is gone", build: func() (*corev1.Pod, *pgshardv1alpha1.PgShardCluster) {
+			return tlsSource(), nil
+		}, orphan: true, want: "no longer exists"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			pod, cluster := test.build()
+			var response admission.Response
+			if test.orphan {
+				response = attemptCreate(t, pod)
+			} else {
+				response = attemptCreate(t, pod, cluster)
+			}
+			if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, test.want) {
+				t.Fatalf("managed Pod creation response = %#v, want denial containing %q", response, test.want)
+			}
+		})
+	}
+}
+
 func TestBindingAdmissionDeniesNewLegacyBootstrapSourceButRetainsItsLifecycleFence(t *testing.T) {
 	t.Parallel()
 	scheme := testScheme(t)
@@ -315,8 +666,14 @@ func TestBindingAdmissionAllowsNonPostgreSQLPgShardPods(t *testing.T) {
 					owned.ComponentLabel: component,
 					owned.ClusterLabel:   "example",
 				},
+				Annotations: map[string]string{owned.PostgreSQLPodClusterUIDAnnotation: "cluster-uid"},
 			}}
-			reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()
+			// Supporting pods are now bound through the class-aware path: they
+			// validate their cluster identity (and, when stamped, the Live
+			// contract), so the owning cluster and Node must be present.
+			cluster := &pgshardv1alpha1.PgShardCluster{ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "database", UID: "cluster-uid"}}
+			node := testNode("node-a", "node-uid-a", "boot-a")
+			reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, cluster, node).Build()
 			binding := &corev1.Binding{
 				ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace, UID: pod.UID},
 				Target:     corev1.ObjectReference{Kind: "Node", Name: "node-a"},
@@ -848,7 +1205,7 @@ func TestNamespaceValidatorMakesTheFencingOptInStickyAcrossSubresources(t *testi
 			t.Parallel()
 			newNamespace := oldNamespace.DeepCopy()
 			delete(newNamespace.Labels, NamespaceLabel)
-			response := NewNamespaceValidator(scheme).Handle(context.Background(), updateRequest(t, oldNamespace, newNamespace, subresource))
+			response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), updateRequest(t, oldNamespace, newNamespace, subresource))
 			if response.Allowed || response.Result == nil || !strings.Contains(response.Result.Message, "immutable") {
 				t.Fatalf("fencing label removal through %q response = %#v", subresource, response)
 			}
@@ -938,6 +1295,10 @@ func roleNeutralStandbyPod() *corev1.Pod {
 		LivenessProbe:  &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz"}}},
 		ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/readyz"}}},
 	}}
+	pod.Spec.InitContainers = []corev1.Container{{
+		Name:    "bootstrap-standby",
+		Command: []string{"bash", "-ceu", owned.PostgreSQLStandbyBootstrapScript(false)},
+	}}
 	pod.Spec.Volumes = []corev1.Volume{
 		{Name: "runtime", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}}},
 		{
@@ -950,12 +1311,19 @@ func roleNeutralStandbyPod() *corev1.Pod {
 	return pod
 }
 
+// managedClusterForPod records an empty replication transport policy: the
+// hand-built webhook fixtures reproduce the pre-TLS cleartext compositions.
 func managedClusterForPod(pod *corev1.Pod) *pgshardv1alpha1.PgShardCluster {
-	return &pgshardv1alpha1.PgShardCluster{ObjectMeta: metav1.ObjectMeta{
-		Name:      pod.Labels[owned.ClusterLabel],
-		Namespace: pod.Namespace,
-		UID:       types.UID(pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation]),
-	}}
+	return &pgshardv1alpha1.PgShardCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pod.Labels[owned.ClusterLabel],
+			Namespace: pod.Namespace,
+			UID:       types.UID(pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation]),
+		},
+		Status: pgshardv1alpha1.PgShardClusterStatus{
+			PostgreSQLBootstrapSpec: &pgshardv1alpha1.PostgreSQLBootstrapSpecStatus{},
+		},
+	}
 }
 
 func testNode(name string, uid types.UID, bootID string) *corev1.Node {
@@ -1031,4 +1399,182 @@ func testScheme(t *testing.T) *runtime.Scheme {
 		t.Fatal(err)
 	}
 	return scheme
+}
+
+func TestLimitRangeValidatorDeniesEveryWrite(t *testing.T) {
+	t.Parallel()
+	validator := NewLimitRangeValidator()
+	for _, op := range []admissionv1.Operation{admissionv1.Create, admissionv1.Update} {
+		request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: op, Resource: metav1.GroupVersionResource{Version: "v1", Resource: "limitranges"}}}
+		if response := validator.Handle(context.Background(), request); response.Allowed || !strings.Contains(response.Result.Message, "not permitted in a fenced") {
+			t.Fatalf("LimitRange %s allowed: %#v", op, response.Result)
+		}
+	}
+}
+
+func TestLimitRangeValidatorAnswersDispatchProbeSentinel(t *testing.T) {
+	t.Parallel()
+	sentinel := &corev1.LimitRange{ObjectMeta: metav1.ObjectMeta{
+		Name: "probe", Namespace: "database",
+		Annotations: map[string]string{DispatchProbeSentinelAnnotation: DispatchProbeSentinelValue},
+	}}
+	request := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Operation: admissionv1.Create,
+		Resource:  metav1.GroupVersionResource{Version: "v1", Resource: "limitranges"},
+		Object:    runtime.RawExtension{Raw: marshalObject(t, sentinel)},
+	}}
+	response := NewLimitRangeValidator().Handle(context.Background(), request)
+	if response.Allowed || response.Result.Message != LimitRangeDispatchProbeSentinelMessage {
+		t.Fatalf("LimitRange dispatch-probe sentinel response = %#v", response.Result)
+	}
+}
+
+const testOperatorUsername = "system:serviceaccount:pgshard-system:pgshard-controller-manager"
+
+func namespaceUpdateAs(t *testing.T, username string, oldNamespace, newNamespace *corev1.Namespace, subresource string) admission.Request {
+	t.Helper()
+	request := updateRequest(t, oldNamespace, newNamespace, subresource)
+	request.UserInfo.Username = username
+	return request
+}
+
+func enforcementNamespace(enforcing bool) *corev1.Namespace {
+	labels := map[string]string{NamespaceLabel: NamespaceLabelValue}
+	if enforcing {
+		labels[NamespaceEnforcingLabel] = NamespaceEnforcingLabelValue
+	}
+	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "database", Labels: labels}}
+}
+
+func TestNamespaceValidatorReservesEnforcingLabelToOperator(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	const attacker = "system:serviceaccount:tenant:mallory"
+
+	// The gated isolation webhooks stop DISPATCHING the moment the label is gone
+	// (Kubernetes would simply stop calling them), so a non-operator removal while
+	// enforcement is durable (the ACTIVE shape) is a full bypass and must be
+	// denied on every namespace update surface.
+	for _, subresource := range []string{"", "status", "finalize"} {
+		removal := namespaceUpdateAs(t, attacker, enforcementNamespace(true), enforcementNamespace(false), subresource)
+		if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), removal); response.Allowed || !strings.Contains(response.Result.Message, "reserved") {
+			t.Fatalf("attacker enforcing-label removal through %q = %#v", subresource, response.Result)
+		}
+	}
+
+	// A non-operator SET while un-activated (the INACTIVE shape) would turn the
+	// deny-heavy gated webhooks on against the honest un-activated flow.
+	set := namespaceUpdateAs(t, attacker, enforcementNamespace(false), enforcementNamespace(true), "")
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), set); response.Allowed || !strings.Contains(response.Result.Message, "reserved") {
+		t.Fatalf("attacker enforcing-label set = %#v", response.Result)
+	}
+
+	// A non-operator value CHANGE stops the selector matching just like removal.
+	altered := enforcementNamespace(true)
+	altered.Labels[NamespaceEnforcingLabel] = "off"
+	change := namespaceUpdateAs(t, attacker, enforcementNamespace(true), altered, "")
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), change); response.Allowed || !strings.Contains(response.Result.Message, "reserved") {
+		t.Fatalf("attacker enforcing-label change = %#v", response.Result)
+	}
+
+	// An unrelated update that leaves the label alone stays permitted.
+	annotated := enforcementNamespace(true)
+	annotated.Annotations = map[string]string{"team": "db"}
+	unrelated := namespaceUpdateAs(t, attacker, enforcementNamespace(true), annotated, "")
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), unrelated); !response.Allowed {
+		t.Fatalf("unrelated namespace update was denied: %#v", response.Result)
+	}
+}
+
+func TestNamespaceValidatorPermitsOperatorEnforcingTransitions(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+
+	// The operator performs exactly the absent<->enforced transitions (entering
+	// and leaving activation).
+	set := namespaceUpdateAs(t, testOperatorUsername, enforcementNamespace(false), enforcementNamespace(true), "")
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), set); !response.Allowed {
+		t.Fatalf("operator enforcing-label set was denied: %#v", response.Result)
+	}
+	removal := namespaceUpdateAs(t, testOperatorUsername, enforcementNamespace(true), enforcementNamespace(false), "")
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), removal); !response.Allowed {
+		t.Fatalf("operator enforcing-label removal was denied: %#v", response.Result)
+	}
+
+	// Any other value is malformed even for the operator: the selector matches
+	// only the exact enforced value, so a drifting value must never persist.
+	bogus := enforcementNamespace(true)
+	bogus.Labels[NamespaceEnforcingLabel] = "maybe"
+	toBogus := namespaceUpdateAs(t, testOperatorUsername, enforcementNamespace(false), bogus, "")
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), toBogus); response.Allowed || !strings.Contains(response.Result.Message, "exact") {
+		t.Fatalf("operator bogus enforcing-label value = %#v", response.Result)
+	}
+
+	// An empty-VALUE set is not "absent" — it is a present label with an invalid
+	// value that the enforced-value selector would not match; the operator may not
+	// leave it that way either.
+	empty := enforcementNamespace(false)
+	empty.Labels[NamespaceEnforcingLabel] = ""
+	toEmpty := namespaceUpdateAs(t, testOperatorUsername, enforcementNamespace(false), empty, "")
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), toEmpty); response.Allowed || !strings.Contains(response.Result.Message, "exact") {
+		t.Fatalf("operator empty enforcing-label value = %#v", response.Result)
+	}
+}
+
+func unfencedNamespace(enforcingValue string, present bool) *corev1.Namespace {
+	labels := map[string]string{}
+	if present {
+		labels[NamespaceEnforcingLabel] = enforcingValue
+	}
+	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant", Labels: labels}}
+}
+
+func namespaceCreateAs(t *testing.T, username string, ns *corev1.Namespace) admission.Request {
+	t.Helper()
+	return admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Operation: admissionv1.Create,
+		Object:    runtime.RawExtension{Raw: marshalObject(t, ns)},
+		UserInfo:  authenticationv1.UserInfo{Username: username},
+	}}
+}
+
+func TestNamespaceValidatorIsPreSeedProofOnUnfencedAndCreate(t *testing.T) {
+	t.Parallel()
+	scheme := testScheme(t)
+	const attacker = "system:serviceaccount:tenant:mallory"
+
+	// PRE-SEED via UPDATE on an UN-fenced namespace: without the enforcing-key
+	// webhook entry this would slip past the fencing-only selector. The label must
+	// be denied here so a bogus value can never be planted and later wedge
+	// activation once the namespace is fenced.
+	preSeed := namespaceUpdateAs(t, attacker, unfencedNamespace("", false), unfencedNamespace("bogus", true), "")
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), preSeed); response.Allowed || !strings.Contains(response.Result.Message, "reserved") {
+		t.Fatalf("attacker pre-seed on an unfenced namespace = %#v", response.Result)
+	}
+
+	// PRE-SEED at CREATE: a namespace born carrying the label (any value) by a
+	// non-operator is denied — there is no old object, so it reads as absent->value.
+	createBogus := namespaceCreateAs(t, attacker, unfencedNamespace("bogus", true))
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), createBogus); response.Allowed || !strings.Contains(response.Result.Message, "reserved") {
+		t.Fatalf("attacker CREATE carrying the enforcing label = %#v", response.Result)
+	}
+	createEnforced := namespaceCreateAs(t, attacker, unfencedNamespace(NamespaceEnforcingLabelValue, true))
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), createEnforced); response.Allowed || !strings.Contains(response.Result.Message, "reserved") {
+		t.Fatalf("attacker CREATE carrying the enforced label = %#v", response.Result)
+	}
+
+	// Even the OPERATOR may not create a namespace already bearing a bogus value:
+	// the resulting label must be valid or absent.
+	operatorCreateBogus := namespaceCreateAs(t, testOperatorUsername, unfencedNamespace("bogus", true))
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), operatorCreateBogus); response.Allowed || !strings.Contains(response.Result.Message, "exact") {
+		t.Fatalf("operator CREATE with a bogus enforcing value = %#v", response.Result)
+	}
+
+	// A plain namespace CREATE that never touches the label is unaffected (this
+	// entry only ever dispatches when the label key is present, but the handler
+	// must still allow it if it does run).
+	plainCreate := namespaceCreateAs(t, attacker, unfencedNamespace("", false))
+	if response := NewNamespaceValidator(testOperatorUsername, scheme).Handle(context.Background(), plainCreate); !response.Allowed {
+		t.Fatalf("plain namespace CREATE was denied: %#v", response.Result)
+	}
 }

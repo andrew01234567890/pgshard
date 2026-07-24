@@ -15,6 +15,7 @@ import (
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -26,6 +27,25 @@ import (
 const (
 	NamespaceLabel      = "pgshard.io/pod-fencing"
 	NamespaceLabelValue = "enabled"
+
+	// NamespaceEnforcingLabel is set on a fenced namespace by the operator while its
+	// isolation receipt is in ANY non-INACTIVE phase (ACTIVATING_CONVERGE,
+	// ACTIVATING_QUIESCE, ACTIVATING_RECREATE, or ACTIVE) — it precedes CONVERGE,
+	// whose per-backend proof turns "label set" into "gated webhooks provably
+	// dispatching" before any enforcing phase — and removed when the namespace
+	// returns to INACTIVE / has no receipt. The namespaceSelector of every
+	// GENUINELY-NEW isolation webhook (WorkloadIntegrity, PodConnect, LimitRange)
+	// requires it IN ADDITION to the fencing label, so an UN-ACTIVATED (INACTIVE)
+	// fenced namespace invokes NONE of them — ordinary applies/creates, exec/proxy,
+	// and a manager restart behave exactly as they did pre-isolation. The
+	// pre-existing base pod-fencing webhooks (binding, status, metadata, PodCreate)
+	// stay always-on (they carry base security), and their isolation-added logic is
+	// handler/stamp/phase-gated to no-op under INACTIVE. The NamespaceValidator
+	// RESERVES this label to the authenticated operator identity: it is a security
+	// boundary (Kubernetes stops DISPATCHING the gated webhooks without it), never
+	// a user-mutable annotation.
+	NamespaceEnforcingLabel      = "pgshard.io/isolation-enforcing"
+	NamespaceEnforcingLabelValue = "enforced"
 
 	NodeUIDAnnotation            = owned.PostgreSQLNodeUIDAnnotation
 	NodeBootIDAnnotation         = owned.PostgreSQLNodeBootIDAnnotation
@@ -49,6 +69,25 @@ const (
 	MetadataWebhookPath          = "/validate-core-v1-postgresqlpodmetadata"
 	NamespaceWebhookName         = "vpostgresqlfencingnamespace.pgshard.io"
 	NamespaceWebhookPath         = "/validate-core-v1-postgresqlfencingnamespace"
+	// EnforcingNamespaceWebhookName is a SECOND entry served by the same namespace
+	// handler/path, selected by the presence of the enforcing label KEY (not the
+	// fencing label) and covering CREATE as well as UPDATE. It makes the enforcing-
+	// label reservation pre-seed-proof: any namespace — fenced or not — that gains,
+	// changes, or loses the label (on the old OR new object) is validated, so a
+	// bogus value can never be planted and later wedge activation. It is scoped to
+	// the label key rather than firing cluster-wide, so ordinary namespace
+	// operations that never touch the label do not pay this webhook's availability
+	// coupling.
+	EnforcingNamespaceWebhookName = "vpostgresqlenforcingnamespace.pgshard.io"
+	PodCreateWebhookName          = "vpostgresqlpodcreate.pgshard.io"
+	PodCreateWebhookPath          = "/validate-core-v1-postgresqlpodcreate"
+
+	PodConnectWebhookPath        = "/validate-core-v1-postgresqlpodconnect"
+	PodConnectFencedWebhookName  = "vpostgresqlpodconnect.pgshard.io"
+	PodConnectManagerWebhookName = "vpostgresqlmanagerconnect.pgshard.io"
+
+	LimitRangeWebhookName = "vpostgresqllimitrange.pgshard.io"
+	LimitRangeWebhookPath = "/validate-core-v1-postgresqllimitrange"
 )
 
 type HandshakeAttestor struct {
@@ -101,8 +140,9 @@ type BindingValidator struct {
 }
 
 type bindingEvidence struct {
-	pod  *corev1.Pod
-	node *corev1.Node
+	pod     *corev1.Pod
+	node    *corev1.Node
+	cluster *pgshardv1alpha1.PgShardCluster
 }
 
 func NewBindingAttestor(reader client.Reader, scheme *runtime.Scheme) *BindingAttestor {
@@ -156,24 +196,100 @@ func (v *BindingValidator) Handle(ctx context.Context, request admission.Request
 	if err := v.decoder.Decode(request, binding); err != nil {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode final Pod binding: %w", err))
 	}
+	receipt, err := namespaceIsolationReceipt(ctx, v.reader, request.Namespace)
+	if err != nil {
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+	// Once isolation is past INACTIVE (QUIESCE / RECREATE / ACTIVE) binding is
+	// GUARDED: a stampless or pre-guard CLASSIFIED pod must NOT be bound. This
+	// closes the window where an attacker creates an unscheduled Secret-mounting
+	// pod while INACTIVE and binds (and runs) it during the activation ceremony —
+	// the ceremony then also UID-deletes such a pod (RECREATE cleanup). This runs
+	// BEFORE readBindingEvidence because that function admits a stampless supporting
+	// client pod as unmanaged (the honest pre-isolation behavior); the guard must
+	// not be bypassed by that early allow.
+	guarded := isolationPhase(receipt) != pgshardv1alpha1.IsolationInactive
+	if guarded {
+		pod := &corev1.Pod{}
+		if err := v.reader.Get(ctx, types.NamespacedName{Namespace: request.Namespace, Name: request.Name}, pod); err != nil {
+			return admission.Errored(http.StatusInternalServerError, fmt.Errorf("read Pod for binding stamp gate: %w", err))
+		}
+		if kind, _, _, _ := classifyContractPod(pod); kind != contractPodUnmanaged && pod.Annotations[owned.PodContractHashAnnotation] == "" {
+			return admission.Denied("namespace isolation is activating; every managed Pod must carry the reconciler stamp before binding")
+		}
+	}
 	evidence, response := readBindingEvidence(ctx, v.reader, request, binding)
 	if response != nil {
 		return *response
 	}
-	for _, key := range protectedBindingLabels() {
-		bindingValue, bindingHas := binding.Labels[key]
-		podValue, podHas := evidence.pod.Labels[key]
-		if bindingHas != podHas || bindingValue != podValue {
-			return admission.Denied(fmt.Sprintf("managed PostgreSQL Pod binding label %s does not match the selected Pod", key))
+	if response := validateBindingMetadata(binding, evidence); response != nil {
+		return *response
+	}
+	if response := validateBoundPodContract(ctx, v.reader, evidence.pod, evidence.node, evidence.cluster, guarded); response != nil {
+		return *response
+	}
+	if guarded {
+		if response := enforceIsolationGenerationFloor(evidence.pod, receipt); response != nil {
+			return *response
 		}
 	}
-	if binding.Annotations[owned.PostgreSQLPodClusterUIDAnnotation] != evidence.pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation] {
-		return admission.Denied("managed PostgreSQL Pod binding does not carry the selected Pod cluster identity")
-	}
-	if binding.Annotations[NodeUIDAnnotation] != string(evidence.node.UID) || binding.Annotations[NodeBootIDAnnotation] != evidence.node.Status.NodeInfo.BootID {
-		return admission.Denied("managed PostgreSQL Pod binding does not carry the selected Node incarnation")
-	}
 	return admission.Allowed("final Pod binding preserves the PostgreSQL Pod and Node identities")
+}
+
+// validateBindingMetadata enforces that the final Binding's copied metadata is an
+// exact sanctioned allowlist: every label is either a protected Pod label (equal
+// to the Pod's) or a Node-derived topology label (equal to the Node's), and every
+// annotation is the Pod's cluster-UID or one of the Node's incarnation
+// annotations. The API server copies Binding annotations — and, with the
+// PodTopologyLabels admission plugin, Binding labels — onto the Pod, so any other
+// entry would silently overwrite the Pod's validated contract metadata after
+// CREATE-time validation. Anything outside the allowlist, or a value that does
+// not match the authoritative Pod/Node, is rejected.
+func validateBindingMetadata(binding *corev1.Binding, evidence *bindingEvidence) *admission.Response {
+	protected := protectedBindingLabels()
+	protectedSet := make(map[string]struct{}, len(protected))
+	for _, key := range protected {
+		protectedSet[key] = struct{}{}
+	}
+	// A Binding label the API server would copy onto the Pod is only permitted if
+	// it is a protected identity label already carrying the Pod's own value, or a
+	// topology label carrying the selected Node's value. A missing protected label
+	// is harmless (the Pod keeps its own), so only extra or divergent labels are
+	// rejected.
+	for key, value := range binding.Labels {
+		if key == corev1.LabelTopologyZone || key == corev1.LabelTopologyRegion {
+			if value != evidence.node.Labels[key] {
+				return deniedf("PostgreSQL Pod binding topology label %s does not match the selected Node", key)
+			}
+			continue
+		}
+		if _, ok := protectedSet[key]; !ok {
+			return deniedf("PostgreSQL Pod binding carries an unexpected label %s", key)
+		}
+		podValue, podHas := evidence.pod.Labels[key]
+		if !podHas || value != podValue {
+			return deniedf("managed PostgreSQL Pod binding label %s does not match the selected Pod", key)
+		}
+	}
+	for key, value := range binding.Annotations {
+		switch key {
+		case owned.PostgreSQLPodClusterUIDAnnotation:
+			if value != evidence.pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation] {
+				return deniedf("managed PostgreSQL Pod binding does not carry the selected Pod cluster identity")
+			}
+		case NodeUIDAnnotation:
+			if value != string(evidence.node.UID) {
+				return deniedf("managed PostgreSQL Pod binding does not carry the selected Node incarnation")
+			}
+		case NodeBootIDAnnotation:
+			if value != evidence.node.Status.NodeInfo.BootID {
+				return deniedf("managed PostgreSQL Pod binding does not carry the selected Node incarnation")
+			}
+		default:
+			return deniedf("PostgreSQL Pod binding carries an unexpected annotation %s", key)
+		}
+	}
+	return nil
 }
 
 func readBindingEvidence(ctx context.Context, reader client.Reader, request admission.Request, binding *corev1.Binding) (*bindingEvidence, *admission.Response) {
@@ -186,13 +302,36 @@ func readBindingEvidence(ctx context.Context, reader client.Reader, request admi
 		response := admission.Errored(http.StatusInternalServerError, fmt.Errorf("read Pod selected for binding: %w", err))
 		return nil, &response
 	}
-	if !isPotentialManagedPostgreSQLPod(pod) {
+	kind, _, _, _ := classifyContractPod(pod)
+	switch kind {
+	case contractPodUnmanaged:
+		if isManagedLooking(pod) {
+			response := admission.Denied("managed-looking PostgreSQL Pod carries a malformed identity")
+			return nil, &response
+		}
 		response := admission.Allowed("Pod is not a managed PostgreSQL member")
 		return nil, &response
-	}
-	if !IsManagedPostgreSQLPod(pod) {
-		response := admission.Denied("managed PostgreSQL Pod has incomplete identity or no termination fence")
-		return nil, &response
+	case contractPodMember:
+		// Members carry the termination fence and replication-role shape;
+		// supporting pods (pooler/orchestrator) validate the stamped contract
+		// without those member-only requirements.
+		if !IsManagedPostgreSQLPod(pod) {
+			response := admission.Denied("managed PostgreSQL Pod has incomplete identity or no termination fence")
+			return nil, &response
+		}
+	case contractPodPooler, contractPodOrchestrator:
+		// A supporting-labeled pod that carries NO reconciler stamp is NOT a genuine
+		// managed supporting pod — it is a client/foreign pod borrowing the cluster +
+		// component labels (e.g. an application pooler client), which the pre-isolation
+		// binding path treated as unmanaged and admitted. Preserve that: bind it like
+		// an unmanaged pod. A GENUINE managed supporting pod carries the stamp and
+		// gets the full managed binding validation below. Under a guarded phase the
+		// BindingValidator's stampless-binding denial + the RECREATE UID-delete fence
+		// a pre-guard supporting pod, so this relaxation never opens an ACTIVE hole.
+		if pod.Annotations[owned.PodContractHashAnnotation] == "" {
+			response := admission.Allowed("stampless supporting Pod is not a managed binding target")
+			return nil, &response
+		}
 	}
 	if pod.DeletionTimestamp != nil || pod.Spec.NodeName != "" {
 		response := admission.Denied("managed PostgreSQL Pod must be live and unassigned when its node identity is bound")
@@ -202,33 +341,9 @@ func readBindingEvidence(ctx context.Context, reader client.Reader, request admi
 		response := admission.Denied("managed PostgreSQL Pod binding must carry the exact Pod UID")
 		return nil, &response
 	}
-	clusterName := pod.Labels[owned.ClusterLabel]
-	cluster := &pgshardv1alpha1.PgShardCluster{}
-	if err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: clusterName}, cluster); err != nil {
-		if apierrors.IsNotFound(err) {
-			response := admission.Denied("managed PostgreSQL Pod's owning PgShardCluster no longer exists")
-			return nil, &response
-		}
-		response := admission.Errored(http.StatusInternalServerError, fmt.Errorf("read PgShardCluster selected for PostgreSQL Pod binding: %w", err))
-		return nil, &response
-	}
-	if cluster.UID == "" || cluster.UID != types.UID(pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation]) {
-		response := admission.Denied("managed PostgreSQL Pod does not belong to the live PgShardCluster UID")
-		return nil, &response
-	}
-	if cluster.DeletionTimestamp != nil {
-		response := admission.Denied("managed PostgreSQL Pod cannot bind while its PgShardCluster is deleting")
-		return nil, &response
-	}
-	if owned.IsPostgreSQLReplicationBootstrapSourcePod(pod) {
-		if !owned.IsCurrentPostgreSQLReplicationBootstrapSourcePod(pod) {
-			response := admission.Denied("legacy PostgreSQL replication-bootstrap source cannot receive a new Pod binding")
-			return nil, &response
-		}
-		if _, err := owned.ObservePostgreSQLRuntimeForCluster(cluster, pod.Annotations, pod.Spec); err != nil {
-			response := admission.Denied(fmt.Sprintf("PostgreSQL replication-bootstrap source does not match its PgShardCluster generation contract: %v", err))
-			return nil, &response
-		}
+	cluster, response := validateManagedPodClusterContract(ctx, reader, pod)
+	if response != nil {
+		return nil, response
 	}
 	if binding.Target.Kind != "Node" || binding.Target.Name == "" {
 		response := admission.Denied("managed PostgreSQL Pod binding must select a named Node")
@@ -243,7 +358,221 @@ func readBindingEvidence(ctx context.Context, reader client.Reader, request admi
 		response := admission.Denied("selected Node has no stable UID and boot ID")
 		return nil, &response
 	}
-	return &bindingEvidence{pod: pod, node: node}, nil
+	return &bindingEvidence{pod: pod, node: node, cluster: cluster}, nil
+}
+
+// validateManagedPodClusterContract binds a managed PostgreSQL Pod to its live
+// owning PgShardCluster and enforces the cluster-aware replication contracts.
+// It runs at Pod CREATE and again at binding admission. The replication-mode
+// check is deliberately independent of the role-neutral classifiers: any pod
+// that even hints at a replication process composition must validate as an
+// exact policy-bound source or standby, so a serving-role label or a mangled
+// composition can never dodge transport validation.
+func validateManagedPodClusterContract(ctx context.Context, reader client.Reader, pod *corev1.Pod) (*pgshardv1alpha1.PgShardCluster, *admission.Response) {
+	clusterName := pod.Labels[owned.ClusterLabel]
+	cluster := &pgshardv1alpha1.PgShardCluster{}
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: clusterName}, cluster); err != nil {
+		if apierrors.IsNotFound(err) {
+			response := admission.Denied("managed PostgreSQL Pod's owning PgShardCluster no longer exists")
+			return nil, &response
+		}
+		response := admission.Errored(http.StatusInternalServerError, fmt.Errorf("read PgShardCluster selected for PostgreSQL Pod admission: %w", err))
+		return nil, &response
+	}
+	if cluster.UID == "" || cluster.UID != types.UID(pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation]) {
+		response := admission.Denied("managed PostgreSQL Pod does not belong to the live PgShardCluster UID")
+		return nil, &response
+	}
+	if cluster.DeletionTimestamp != nil {
+		response := admission.Denied("managed PostgreSQL Pod cannot be admitted while its PgShardCluster is deleting")
+		return nil, &response
+	}
+	if owned.IsPostgreSQLReplicationBootstrapSourcePod(pod) {
+		if !owned.IsCurrentPostgreSQLReplicationBootstrapSourcePod(pod) {
+			response := admission.Denied("legacy PostgreSQL replication-bootstrap source cannot receive a new Pod admission")
+			return nil, &response
+		}
+		if _, err := owned.ObservePostgreSQLRuntimeForCluster(cluster, pod.Labels, pod.Annotations, pod.Spec); err != nil {
+			response := admission.Denied(fmt.Sprintf("PostgreSQL replication-bootstrap source does not match its PgShardCluster generation contract: %v", err))
+			return nil, &response
+		}
+	}
+	if owned.IsPostgreSQLReplicationStandbyPod(pod) {
+		if _, err := owned.ObservePostgreSQLRuntimeForCluster(cluster, pod.Labels, pod.Annotations, pod.Spec); err != nil {
+			response := admission.Denied(fmt.Sprintf("PostgreSQL replication standby does not match its PgShardCluster transport contract: %v", err))
+			return nil, &response
+		}
+	}
+	if owned.PostgreSQLReplicationModeEnvironmentPresent(pod.Spec) {
+		if _, hasRole := pod.Labels[owned.RoleLabel]; hasRole {
+			response := admission.Denied("managed PostgreSQL replication source and standby Pods must not carry a serving role")
+			return nil, &response
+		}
+		if err := owned.ValidatePostgreSQLReplicationPodContract(cluster, pod.Labels, pod.Annotations, pod.Spec); err != nil {
+			response := admission.Denied(fmt.Sprintf("managed PostgreSQL replication Pod does not match its PgShardCluster transport contract: %v", err))
+			return nil, &response
+		}
+	}
+	return cluster, nil
+}
+
+// PodCreateValidator refuses managed PostgreSQL Pods that try to enter the
+// namespace outside the operator's contract: pre-assigned to a node (which
+// would skip pods/binding admission entirely), carrying forged binding
+// evidence, or composed as a replication member that does not match the
+// owning PgShardCluster's recorded transport policy and TLS checkpoints.
+// Pods that are not managed PostgreSQL members are deliberately allowed.
+type PodCreateValidator struct {
+	reader     client.Reader
+	identities ControllerIdentities
+	decoder    admission.Decoder
+	probeStore *IdentityObservationStore
+}
+
+func NewPodCreateValidator(reader client.Reader, identities ControllerIdentities, scheme *runtime.Scheme) *PodCreateValidator {
+	return &PodCreateValidator{reader: reader, identities: identities, decoder: admission.NewDecoder(scheme)}
+}
+
+// WithIdentityProbeStore lets the activation identity prober share a process-local
+// store into which this webhook records the authenticated controller usernames it
+// observes for probe-annotated pods.
+func (v *PodCreateValidator) WithIdentityProbeStore(store *IdentityObservationStore) *PodCreateValidator {
+	v.probeStore = store
+	return v
+}
+
+func (v *PodCreateValidator) Handle(ctx context.Context, request admission.Request) admission.Response {
+	if request.Operation != admissionv1.Create || request.SubResource != "" {
+		return admission.Errored(http.StatusBadRequest, fmt.Errorf("unexpected PostgreSQL Pod create validation request %s %q", request.Operation, request.SubResource))
+	}
+	pod := &corev1.Pod{}
+	if err := v.decoder.Decode(request, pod); err != nil {
+		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode created Pod: %w", err))
+	}
+	// The dispatch-convergence sentinel is always denied first, in every phase,
+	// with the exact sentinel message. The activation preflight submits a
+	// dryRun=All sentinel CREATE to each live API-server backend and requires
+	// exactly this response to prove that backend dispatches to this webhook.
+	if IsDispatchProbeSentinel(pod) {
+		return admission.Denied(DispatchProbeSentinelMessage)
+	}
+	// Record the authenticated controller identity for an identity-probe pod, but
+	// only after the claimed owner chain is authenticated against the LIVE probe
+	// objects registered by the prober (a forged owner reference records nothing,
+	// and the store is append-only/conflict-detecting). This never relaxes the
+	// allow/deny decision.
+	if v.probeStore != nil {
+		if err := recordPodIdentityObservation(ctx, v.reader, v.probeStore, v.identities, pod, request.UserInfo.Username); err != nil {
+			return admission.Errored(http.StatusInternalServerError, err)
+		}
+	}
+	receipt, err := namespaceIsolationReceipt(ctx, v.reader, request.Namespace)
+	if err != nil {
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+	phase := isolationPhase(receipt)
+	if phase == pgshardv1alpha1.IsolationActivatingQuiesce {
+		// The namespace is quiescing: every pod create is frozen, including
+		// trusted controllers, so the parent seal + drain is race-free.
+		return admission.Denied("namespace isolation is quiescing; Pod creation is frozen")
+	}
+	recreate := phase == pgshardv1alpha1.IsolationActivatingRecreate
+	if recreate {
+		// RECREATE is a fully guarded mode identical to ACTIVE for pod CREATE; the
+		// only relaxation is that a create is permitted at all provided its parent
+		// is a sealed one at its exact live incarnation.
+		sealed, err := podControllerParentSealed(ctx, v.reader, pod, receipt)
+		if err != nil {
+			return admission.Errored(http.StatusInternalServerError, err)
+		}
+		if sealed == nil {
+			return admission.Denied("namespace isolation is recreating; only pods of a sealed parent at its exact incarnation may be created")
+		}
+	}
+	// Under RECREATE or ACTIVE the full contract is mandatory: the stamp is
+	// required (no stampless legacy path), unmanaged pods are denied, digest
+	// pinning is enforced, and both generation floors apply.
+	guarded := recreate || phase == pgshardv1alpha1.IsolationActive
+	kind, shard, member, clusterName := classifyContractPod(pod)
+	switch kind {
+	case contractPodUnmanaged:
+		if guarded {
+			return admission.Denied("namespace isolation is active; every Pod must be a classified managed PostgreSQL Pod")
+		}
+		if isPotentialManagedPostgreSQLPod(pod) {
+			return admission.Denied("managed PostgreSQL Pod has incomplete identity or an unrecognized composition")
+		}
+		return admission.Allowed("Pod is not a managed PostgreSQL member")
+	case contractPodMember:
+		if !IsManagedPostgreSQLPod(pod) {
+			return admission.Denied("managed PostgreSQL Pod has incomplete identity or no termination fence")
+		}
+		if pod.Spec.NodeName != "" || pod.Annotations[NodeUIDAnnotation] != "" || pod.Annotations[NodeBootIDAnnotation] != "" {
+			return admission.Denied("managed PostgreSQL Pod must be created unassigned and scheduled through binding")
+		}
+		if _, response := validateManagedPodClusterContract(ctx, v.reader, pod); response != nil {
+			return *response
+		}
+	}
+	// The canonical contract is enforced whenever the reconciler's stamp is
+	// present. Under a guarded (RECREATE/ACTIVE) receipt the stamp is mandatory
+	// (deny-all closes the stamp-gating seam); otherwise a stampless pod keeps the
+	// legacy path.
+	if pod.Annotations[owned.PodContractHashAnnotation] == "" {
+		if guarded {
+			return admission.Denied("namespace isolation is active; every managed Pod must carry the reconciler stamp")
+		}
+		return admission.Allowed("managed PostgreSQL Pod creation matches its PgShardCluster contract")
+	}
+	if err := decodeStrictObject(request.Object.Raw, &corev1.Pod{}); err != nil {
+		return admission.Denied(fmt.Sprintf("managed Pod carries unknown or duplicate fields: %v", err))
+	}
+	if pod.Namespace != "" && pod.Namespace != request.Namespace {
+		return admission.Denied("managed Pod namespace does not match the request namespace")
+	}
+	pod.Namespace = request.Namespace
+	if response := v.validatePodContract(ctx, request, pod, kind, shard, member, clusterName, guarded); response != nil {
+		return *response
+	}
+	if guarded {
+		if response := enforceIsolationGenerationFloor(pod, receipt); response != nil {
+			return *response
+		}
+	}
+	return admission.Allowed("managed PostgreSQL Pod creation matches its PgShardCluster contract")
+}
+
+// enforceIsolationGenerationFloor denies a stamped pod whose security generation
+// is below the isolation receipt's MinAcceptableSecurityGeneration. This is the
+// isolation-level floor; it composes with (never lowers) the per-class
+// SupportingGeneration barrier already applied inside the contract validation.
+func enforceIsolationGenerationFloor(pod *corev1.Pod, receipt *pgshardv1alpha1.PostgreSQLIsolationReceipt) *admission.Response {
+	if receipt == nil {
+		return nil
+	}
+	// Each pod is compared ONLY with its OWN class/member floor — never a
+	// namespace-wide maximum, so a benign generation bump to one class never
+	// rejects another class's pods.
+	floor := podIsolationSecurityFloor(receipt, pod)
+	if floor <= 0 {
+		return nil
+	}
+	generation, ok := canonicalSecurityGeneration(pod.Annotations[owned.PodSecurityGenerationAnnotation])
+	if !ok || generation < floor {
+		response := admission.Denied(fmt.Sprintf("managed Pod security generation is below its class isolation floor %d", floor))
+		return &response
+	}
+	return nil
+}
+
+// podIsolationSecurityFloor resolves the sealed per-class/member floor for a pod
+// from its labels (component + shard + member for members, component for
+// supporting workloads).
+func podIsolationSecurityFloor(receipt *pgshardv1alpha1.PostgreSQLIsolationReceipt, pod *corev1.Pod) int64 {
+	component := pod.Labels[owned.ComponentLabel]
+	shard, _ := owned.ParseIdentityLabel(pod.Labels[owned.ShardLabel])
+	member, _ := owned.ParseIdentityLabel(pod.Labels[owned.MemberLabel])
+	return receipt.SecurityFloorFor(component, shard, member)
 }
 
 func protectedBindingLabels() [6]string {
@@ -512,26 +841,85 @@ type MetadataValidator struct {
 	codec   *HandshakeCodec
 }
 
+// NamespaceValidator pins the two operator-relevant namespace labels across
+// every namespace update (normal, status, and finalize):
+//   - the fencing label is immutable once enabled (the opt-in is sticky), and
+//   - the isolation-enforcing label is RESERVED to the authenticated operator.
+//     The label-gated isolation webhooks stop dispatching the instant it is
+//     removed — Kubernetes would simply stop calling them, so their handlers
+//     could never compensate — which makes any non-operator set/change/removal
+//     a security bypass, not a configuration choice. The operator itself may
+//     perform only the exact absent<->enforced transitions.
 type NamespaceValidator struct {
-	decoder admission.Decoder
+	decoder          admission.Decoder
+	operatorUsername string
 }
 
-func NewNamespaceValidator(scheme *runtime.Scheme) *NamespaceValidator {
-	return &NamespaceValidator{decoder: admission.NewDecoder(scheme)}
+func NewNamespaceValidator(operatorUsername string, scheme *runtime.Scheme) *NamespaceValidator {
+	return &NamespaceValidator{decoder: admission.NewDecoder(scheme), operatorUsername: operatorUsername}
+}
+
+// LimitRangeValidator denies every LimitRange create or update in a fenced
+// namespace. A defaulting LimitRange would mutate recreated pods after they are
+// stamped, breaking the contract comparator after their predecessors have been
+// deleted, so a fenced namespace must carry none.
+type LimitRangeValidator struct{}
+
+func NewLimitRangeValidator() *LimitRangeValidator {
+	return &LimitRangeValidator{}
+}
+
+func (v *LimitRangeValidator) Handle(_ context.Context, request admission.Request) admission.Response {
+	if request.Operation != admissionv1.Create && request.Operation != admissionv1.Update {
+		return admission.Errored(http.StatusBadRequest, fmt.Errorf("unexpected LimitRange request %s", request.Operation))
+	}
+	// The dispatch-convergence sentinel gets its distinct always-deny message so
+	// the pre-enforcement probe can pin the response to this exact handler.
+	if objectCarriesDispatchProbeSentinel(request.Object.Raw) {
+		return admission.Denied(LimitRangeDispatchProbeSentinelMessage)
+	}
+	return admission.Denied("LimitRanges are not permitted in a fenced pgshard namespace; a defaulting LimitRange would break the pod contract after stamping")
 }
 
 func (v *NamespaceValidator) Handle(_ context.Context, request admission.Request) admission.Response {
-	if request.Operation != admissionv1.Update ||
-		request.SubResource != "" && request.SubResource != "status" && request.SubResource != "finalize" {
+	if request.Operation != admissionv1.Create && request.Operation != admissionv1.Update {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("unexpected PostgreSQL fencing namespace request %s %q", request.Operation, request.SubResource))
 	}
+	if request.SubResource != "" && request.SubResource != "status" && request.SubResource != "finalize" {
+		return admission.Errored(http.StatusBadRequest, fmt.Errorf("unexpected PostgreSQL fencing namespace subresource %q", request.SubResource))
+	}
+	// On CREATE there is no OldObject; treat the prior namespace as absent so a
+	// CREATE that carries the enforcing label is evaluated as an absent->value
+	// transition (denied for a non-operator, or for any invalid value).
 	oldNamespace := &corev1.Namespace{}
-	if err := v.decoder.DecodeRaw(request.OldObject, oldNamespace); err != nil {
-		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode old PostgreSQL fencing namespace: %w", err))
+	if request.Operation == admissionv1.Update {
+		if err := v.decoder.DecodeRaw(request.OldObject, oldNamespace); err != nil {
+			return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode old PostgreSQL fencing namespace: %w", err))
+		}
 	}
 	newNamespace := &corev1.Namespace{}
 	if err := v.decoder.Decode(request, newNamespace); err != nil {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode new PostgreSQL fencing namespace: %w", err))
+	}
+	// The enforcing-label reservation comes FIRST. The enforcing-key webhook entry
+	// fires for ANY namespace — fenced or not, at CREATE or UPDATE — that carries
+	// the label on its old or new object, so a bogus value can never be planted on
+	// an un-fenced namespace and later wedge activation. Compare (present, value)
+	// PAIRS so an empty-valued label is distinguishable from an absent one and
+	// rejected. A non-operator may not set, change, or remove it at all; the
+	// operator may only drive it to a VALID state — removed, or exactly the
+	// enforced value — never a bogus/empty value, so the label always means what
+	// the selector matches.
+	oldValue, oldPresent := oldNamespace.Labels[NamespaceEnforcingLabel]
+	newValue, newPresent := newNamespace.Labels[NamespaceEnforcingLabel]
+	if oldPresent != newPresent || oldValue != newValue {
+		if request.UserInfo.Username != v.operatorUsername {
+			return admission.Denied(fmt.Sprintf("namespace label %s is reserved: only the pgshard operator may set, change, or remove it (the label-gated isolation webhooks stop dispatching without it)", NamespaceEnforcingLabel))
+		}
+		newValid := !newPresent || newValue == NamespaceEnforcingLabelValue
+		if !newValid {
+			return admission.Denied(fmt.Sprintf("namespace label %s permits only removal or the exact value %q", NamespaceEnforcingLabel, NamespaceEnforcingLabelValue))
+		}
 	}
 	if oldNamespace.Labels[NamespaceLabel] != NamespaceLabelValue {
 		return admission.Allowed("namespace has not enabled PostgreSQL Pod fencing")
@@ -558,14 +946,43 @@ func (v *MetadataValidator) Handle(ctx context.Context, request admission.Reques
 	if err := v.decoder.Decode(request, newPod); err != nil {
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("decode new Pod: %w", err))
 	}
-	if !IsManagedPostgreSQLPod(oldPod) {
+	oldKind, _, _, _ := classifyContractPod(oldPod)
+	newKind, _, _, _ := classifyContractPod(newPod)
+	oldLooking := isManagedLooking(oldPod)
+	newLooking := isManagedLooking(newPod)
+	// A managed-looking pod whose shard/member is noncanonical is malformed and
+	// may never be admitted through UPDATE (it would read as managed to the
+	// fencing logic while dodging the canonical contract).
+	if newLooking && newKind == contractPodUnmanaged {
+		return admission.Denied("managed-looking PostgreSQL Pod carries a malformed identity")
+	}
+	// ADOPTION: an unmanaged pod may never gain a managed identity.
+	if !oldLooking && newLooking {
+		return admission.Denied("unmanaged PostgreSQL Pod may not be mutated into a managed identity")
+	}
+	if !oldLooking {
 		return admission.Allowed("Pod is not a managed PostgreSQL member")
 	}
-	if !managedIdentityEqual(oldPod, newPod) {
-		return admission.Denied("managed PostgreSQL Pod identity and binding-time node identity are immutable")
+	// A complete member keeps its termination-fence lifecycle; every other
+	// protected pod (supporting, or a malformed-old identity) is fully immutable.
+	if oldKind == contractPodMember && IsManagedPostgreSQLPod(oldPod) {
+		return v.validateManagedMemberUpdate(ctx, oldPod, newPod)
+	}
+	return validateManagedPodUpdate(oldPod, newPod)
+}
+
+// validateManagedMemberUpdate holds a complete member pod's full metadata and
+// spec immutable, permitting only the authenticated termination-finalizer
+// removal during deletion.
+func (v *MetadataValidator) validateManagedMemberUpdate(ctx context.Context, oldPod, newPod *corev1.Pod) admission.Response {
+	if response := protectedPodMetadataImmutable(oldPod, newPod); response != nil {
+		return *response
 	}
 	if oldPod.Generation != newPod.Generation || !reflect.DeepEqual(oldPod.Spec, newPod.Spec) {
 		return admission.Denied("managed PostgreSQL Pod spec and generation are immutable")
+	}
+	if !finalizersImmutableExceptTermination(oldPod, newPod) {
+		return admission.Denied("managed PostgreSQL Pod finalizers are immutable except the termination fence")
 	}
 	oldFinalizer := slices.Contains(oldPod.Finalizers, owned.PostgreSQLPodTerminationFinalizer)
 	newFinalizer := slices.Contains(newPod.Finalizers, owned.PostgreSQLPodTerminationFinalizer)
@@ -653,12 +1070,109 @@ func managedIdentityEqual(oldPod, newPod *corev1.Pod) bool {
 		owned.PostgreSQLRuntimeAnnotation,
 		owned.PostgreSQLGenerationDurabilityAnnotation,
 		owned.PostgreSQLSynchronousStandbysAnnotation,
+		owned.PodContractHashAnnotation,
+		owned.PodSecurityGenerationAnnotation,
 		NodeUIDAnnotation,
 		NodeBootIDAnnotation,
 	} {
 		oldValue, oldHas := oldPod.Annotations[key]
 		newValue, newHas := newPod.Annotations[key]
 		if oldHas != newHas || oldValue != newValue {
+			return false
+		}
+	}
+	return controllerOwnerReferenceEqual(oldPod.OwnerReferences, newPod.OwnerReferences)
+}
+
+// controllerOwnerReferenceEqual reports whether two objects carry the same
+// controller owner reference (or both none). The controller owner reference is
+// the pod's authoring-provenance anchor and is immutable post-create.
+func controllerOwnerReferenceEqual(old, updated []metav1.OwnerReference) bool {
+	oldRef, newRef := controllerOwnerRef(old), controllerOwnerRef(updated)
+	if (oldRef == nil) != (newRef == nil) {
+		return false
+	}
+	return oldRef == nil || (oldRef.Kind == newRef.Kind && oldRef.Name == newRef.Name && oldRef.UID == newRef.UID)
+}
+
+// validateManagedPodUpdate holds a protected non-member pod (supporting, or a
+// malformed-old managed identity) fully immutable: it denies escape, any
+// label/annotation/ownerReference mutation, ephemeral containers, any spec
+// mutation (covering a diverging resize), and any finalizer change.
+func validateManagedPodUpdate(oldPod, newPod *corev1.Pod) admission.Response {
+	if !isManagedLooking(newPod) {
+		return admission.Denied("managed PostgreSQL Pod may not shed its managed identity")
+	}
+	if response := protectedPodMetadataImmutable(oldPod, newPod); response != nil {
+		return *response
+	}
+	if len(newPod.Spec.EphemeralContainers) != 0 {
+		return admission.Denied("managed PostgreSQL Pod must not carry ephemeral containers")
+	}
+	if !equality.Semantic.DeepEqual(oldPod.Spec, newPod.Spec) {
+		return admission.Denied("managed PostgreSQL Pod spec is immutable")
+	}
+	if !equalStringSets(oldPod.Finalizers, newPod.Finalizers) {
+		return admission.Denied("managed PostgreSQL Pod finalizers are immutable")
+	}
+	return admission.Allowed("managed PostgreSQL Pod update preserves its contract")
+}
+
+// protectedPodMetadataImmutable requires a protected pod's identity anchors —
+// UID, node assignment, the complete label and annotation sets, and every owner
+// reference — to be byte-for-byte unchanged across an UPDATE. Only server fields
+// outside metadata identity (resourceVersion, managedFields, the deletion
+// timestamp) and the separately governed finalizers/spec may differ.
+func protectedPodMetadataImmutable(oldPod, newPod *corev1.Pod) *admission.Response {
+	if oldPod.UID != newPod.UID || oldPod.Spec.NodeName != newPod.Spec.NodeName ||
+		!stringMapsEqual(oldPod.Labels, newPod.Labels) ||
+		!stringMapsEqual(oldPod.Annotations, newPod.Annotations) ||
+		!equality.Semantic.DeepEqual(oldPod.OwnerReferences, newPod.OwnerReferences) {
+		return deniedf("managed PostgreSQL Pod identity is immutable")
+	}
+	return nil
+}
+
+func finalizersImmutableExceptTermination(oldPod, newPod *corev1.Pod) bool {
+	return equalStringSets(
+		withoutString(oldPod.Finalizers, owned.PostgreSQLPodTerminationFinalizer),
+		withoutString(newPod.Finalizers, owned.PostgreSQLPodTerminationFinalizer),
+	)
+}
+
+func withoutString(values []string, drop string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value != drop {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func equalStringSets(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[string]int, len(a))
+	for _, value := range a {
+		counts[value]++
+	}
+	for _, value := range b {
+		counts[value]--
+		if counts[value] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func stringMapsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for key, value := range a {
+		if other, ok := b[key]; !ok || other != value {
 			return false
 		}
 	}
@@ -685,6 +1199,12 @@ func hasTerminalPhase(pod *corev1.Pod) bool {
 // +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodbinding,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/binding,verbs=create,versions=v1,name=vpostgresqlpodbinding.pgshard.io,admissionReviewVersions=v1,servicePort=9444
 // +kubebuilder:webhook:path=/mutate-core-v1-postgresqlpodstatus,mutating=true,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/status,verbs=update,versions=v1,name=mpostgresqlpodstatus.pgshard.io,admissionReviewVersions=v1,servicePort=9444
 // +kubebuilder:webhook:path=/mutate-pgshard-io-v1alpha1-postgresqlfencinghandshake,mutating=true,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups=pgshard.io,resources=pgshardclusters,verbs=update,versions=v1alpha1,name=mpostgresqlfencinghandshake.pgshard.io,admissionReviewVersions=v1,servicePort=9444
+// +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodcreate,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods,verbs=create,versions=v1,name=vpostgresqlpodcreate.pgshard.io,admissionReviewVersions=v1,servicePort=9444
 // +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodmetadata,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods;pods/ephemeralcontainers;pods/resize,verbs=update,versions=v1,name=vpostgresqlpodmetadata.pgshard.io,admissionReviewVersions=v1,servicePort=9444
 // +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodstatus,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/status,verbs=update,versions=v1,name=vpostgresqlpodstatus.pgshard.io,admissionReviewVersions=v1,servicePort=9444
 // +kubebuilder:webhook:path=/validate-core-v1-postgresqlfencingnamespace,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=namespaces;namespaces/status;namespaces/finalize,verbs=update,versions=v1,name=vpostgresqlfencingnamespace.pgshard.io,admissionReviewVersions=v1,servicePort=9444
+// +kubebuilder:webhook:path=/validate-core-v1-postgresqlfencingnamespace,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=namespaces;namespaces/status;namespaces/finalize,verbs=create;update,versions=v1,name=vpostgresqlenforcingnamespace.pgshard.io,admissionReviewVersions=v1,servicePort=9444
+// +kubebuilder:webhook:path=/validate-apps-v1-postgresqlworkload,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups=apps,resources=statefulsets;deployments;replicasets;statefulsets/scale;deployments/scale;replicasets/scale,verbs=create;update,versions=v1,name=vpostgresqlworkload.pgshard.io,admissionReviewVersions=v1,servicePort=9444
+// +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodconnect,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/exec;pods/attach;pods/portforward;pods/proxy,verbs=connect,versions=v1,name=vpostgresqlpodconnect.pgshard.io,admissionReviewVersions=v1,servicePort=9444
+// +kubebuilder:webhook:path=/validate-core-v1-postgresqlpodconnect,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/exec;pods/attach;pods/portforward;pods/proxy,verbs=connect,versions=v1,name=vpostgresqlmanagerconnect.pgshard.io,admissionReviewVersions=v1,servicePort=9444
+// +kubebuilder:webhook:path=/validate-core-v1-postgresqllimitrange,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,sideEffects=None,timeoutSeconds=5,groups="",resources=limitranges,verbs=create;update,versions=v1,name=vpostgresqllimitrange.pgshard.io,admissionReviewVersions=v1,servicePort=9444

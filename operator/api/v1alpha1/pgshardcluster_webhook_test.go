@@ -18,6 +18,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kruntime "k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
@@ -780,5 +782,42 @@ func TestValidationKeepsUnimplementedDataTransitionsImmutable(t *testing.T) {
 				t.Fatalf("%s transition was admitted: %v", name, err)
 			}
 		})
+	}
+}
+
+func TestValidateCreateEnforcesNamespaceIsolationExclusivity(t *testing.T) {
+	t.Parallel()
+	scheme := kruntime.NewScheme()
+	if err := AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	activating := validCluster()
+	activating.Name = "incumbent"
+	activating.Namespace = "database"
+	activating.UID = "incumbent-uid"
+	activating.Status.IsolationReceipt = &PostgreSQLIsolationReceipt{Phase: IsolationActivatingQuiesce, NamespaceUID: "ns"}
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(activating).Build()
+	validator := &PgShardClusterValidator{NamespaceStateReader: reader}
+
+	second := validCluster()
+	second.Name = "newcomer"
+	second.Namespace = "database"
+	second.UID = "newcomer-uid"
+	if _, err := validator.ValidateCreate(context.Background(), second); err == nil ||
+		!strings.Contains(err.Error(), "isolation-") {
+		t.Fatalf("a second cluster was admitted into an activating fenced namespace: %v", err)
+	}
+
+	// A namespace whose incumbent is INACTIVE places no exclusivity bar.
+	relaxed := validCluster()
+	relaxed.Name = "incumbent"
+	relaxed.Namespace = "other"
+	inactiveReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(relaxed).Build()
+	inactiveValidator := &PgShardClusterValidator{NamespaceStateReader: inactiveReader}
+	newcomer := validCluster()
+	newcomer.Name = "newcomer"
+	newcomer.Namespace = "other"
+	if _, err := inactiveValidator.ValidateCreate(context.Background(), newcomer); err != nil {
+		t.Fatalf("a second cluster was rejected without an active isolation receipt: %v", err)
 	}
 }

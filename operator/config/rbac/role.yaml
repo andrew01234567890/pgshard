@@ -23,7 +23,6 @@ rules:
   - ""
   resources:
   - endpoints
-  - namespaces
   - nodes
   verbs:
   - get
@@ -37,12 +36,37 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - limitranges
+  verbs:
+  - create
+  - get
+  - list
+- apiGroups:
+  - ""
+  resources:
+  - namespaces
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - ""
+  resources:
   - pods
   verbs:
+  - create
   - delete
   - get
   - list
   - patch
+- apiGroups:
+  - ""
+  resourceNames:
+  - pgshard-connect-probe-sentinel
+  resources:
+  - pods/exec
+  verbs:
+  - create
 - apiGroups:
   - ""
   resources:
@@ -52,6 +76,14 @@ rules:
   - delete
   - get
   - update
+- apiGroups:
+  - admissionregistration.k8s.io
+  resources:
+  - validatingwebhookconfigurations
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - apps
   resources:
@@ -65,6 +97,23 @@ rules:
   - patch
   - update
   - watch
+- apiGroups:
+  - apps
+  resources:
+  - replicasets
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - replicasets/scale
+  verbs:
+  - get
+  - update
 - apiGroups:
   - autoscaling
   resources:
@@ -88,6 +137,14 @@ rules:
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - discovery.k8s.io
+  resources:
+  - endpointslices
+  verbs:
+  - get
+  - list
   - watch
 - apiGroups:
   - networking.k8s.io
@@ -169,6 +226,13 @@ rules:
   - patch
   - update
   - watch
+- apiGroups:
+  - scheduling.k8s.io
+  resources:
+  - priorityclasses
+  verbs:
+  - create
+  - get
 - apiGroups:
   - storage.k8s.io
   resources:

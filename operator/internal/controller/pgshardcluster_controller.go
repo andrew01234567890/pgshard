@@ -20,13 +20,16 @@ import (
 	"github.com/andrew01234567890/pgshard/operator/internal/pki"
 	"github.com/andrew01234567890/pgshard/operator/internal/podfence"
 	owned "github.com/andrew01234567890/pgshard/operator/internal/resources"
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	schedulingv1 "k8s.io/api/scheduling/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -35,11 +38,13 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
@@ -80,6 +85,27 @@ type PgShardClusterReconciler struct {
 	APIReader            client.Reader
 	Images               owned.Images
 	PodFencingReceiptKey podfence.SecretReceiptKeyRef
+	// Isolation-activation preflight probers (step 7b). Nil until wired; a nil
+	// prober fails the preflight closed. Tests inject fakes.
+	DispatchProber   dispatchProber
+	MinorGate        minorGate
+	IdentityProber   controllerIdentityProber
+	ControllerIdents podfence.ControllerIdentities
+	// AttestedRequestTimeout is the installation-attested maximum whole-request
+	// lifetime across every API server (the effective --request-timeout ceiling).
+	// The drain ceremonies consume it (plus a one-second truncation margin); zero
+	// means UNATTESTED, which withholds isolation activation and falls back to the
+	// conservative one-minute default for ordinary supporting rolls.
+	AttestedRequestTimeout time.Duration
+	// ValidatingWebhookConfigName scopes the dispatch-tuple watch to the pgshard
+	// validating webhook configuration.
+	ValidatingWebhookConfigName string
+	// UnenumerableHAAckNamespaces is the ADMIN-controlled set of namespaces the
+	// cluster administrator attested (via the --allow-unenumerable-ha-isolation-
+	// namespaces install flag) may activate isolation over a single published
+	// API-server endpoint that the EndpointSlices cannot prove is the complete
+	// physical backend set. It is never sourced from a mutable CR annotation.
+	UnenumerableHAAckNamespaces map[string]bool
 }
 
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardclusters,verbs=get;list;watch;update;patch
@@ -89,18 +115,29 @@ type PgShardClusterReconciler struct {
 // +kubebuilder:rbac:groups=pgshard.io,resources=pgshardcatalogactivations/status,verbs=update
 // +kubebuilder:rbac:groups="",resources=configmaps;persistentvolumeclaims;services;serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=endpoints,verbs=get
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;create;patch;delete
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get
+// limitranges create and the name-pinned pods/exec create exist ONLY for the
+// dispatch-convergence sentinels (dryRun / always-denied): authorization runs
+// before admission, so proving a webhook dispatches requires the verb. The exec
+// grant is pinned to the reserved sentinel pod name, which never exists.
+// +kubebuilder:rbac:groups="",resources=limitranges,verbs=get;list;create
+// +kubebuilder:rbac:groups="",resources=pods/exec,resourceNames=pgshard-connect-probe-sentinel,verbs=create
+// +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
+// +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingwebhookconfigurations,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
-// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=apps,resources=replicasets/scale,verbs=get;update
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=list
+// +kubebuilder:rbac:groups=scheduling.k8s.io,resources=priorityclasses,verbs=get;create
 
 func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
 	cluster := &pgshardv1alpha1.PgShardCluster{}
@@ -180,6 +217,13 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		if deletingReplicationCredential {
 			return ctrl.Result{RequeueAfter: retryDelay}, nil
 		}
+		deletingReplicationTLS, err := r.deletePostgreSQLReplicationTLSForFinalization(ctx, cluster)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("delete PostgreSQL replication TLS material during cluster deletion: %w", err)
+		}
+		if deletingReplicationTLS {
+			return ctrl.Result{RequeueAfter: retryDelay}, nil
+		}
 		deletingOperationWriterAccess, err := r.deleteOperationWriterAccessForFinalization(ctx, cluster)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("delete shardschema operation-writer material during cluster deletion: %w", err)
@@ -252,6 +296,11 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		statusErr := r.reportFailure(ctx, cluster, "ReplicationCredentialReconcileFailed", fmt.Sprintf("PostgreSQL replication credential reconciliation failed: %v", err))
 		return ctrl.Result{}, errors.Join(err, fenceErr, statusErr)
 	}
+	if err := r.ensurePostgreSQLReplicationTLS(ctx, cluster); err != nil {
+		fenceErr := r.fenceMultiMemberPostgreSQLMembers(ctx, cluster)
+		statusErr := r.reportFailure(ctx, cluster, "ReplicationTLSReconcileFailed", fmt.Sprintf("PostgreSQL replication TLS reconciliation failed: %v", err))
+		return ctrl.Result{}, errors.Join(err, fenceErr, statusErr)
+	}
 	if err := r.ensureCatalogAccess(ctx, cluster); err != nil {
 		statusErr := r.reportFailure(ctx, cluster, "CatalogAccessReconcileFailed", fmt.Sprintf("shardschema access reconciliation failed: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
@@ -281,9 +330,25 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		statusErr := r.reportFailure(ctx, cluster, "PostgreSQLIdentityMigration", "stopping the legacy role-named PostgreSQL workload before creating its role-neutral replacement")
 		return ctrl.Result{RequeueAfter: retryDelay}, statusErr
 	}
+	if err := r.ensurePriorityClasses(ctx); err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "PriorityClassUnavailable", fmt.Sprintf("pgshard PriorityClasses are unavailable: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
 	plan, err := owned.Plan(cluster, images)
 	if err != nil {
 		statusErr := r.reportFailure(ctx, cluster, "PlanInvalid", fmt.Sprintf("cannot safely plan owned resources: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
+	if err := r.holdPlanTemplatesDuringActivation(ctx, cluster, plan); err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "ContractStampFailed", fmt.Sprintf("cannot hold protected templates during activation: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
+	if err := r.stampPlanContracts(ctx, cluster, plan); err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "ContractStampFailed", fmt.Sprintf("cannot stamp owned workload contracts: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
+	if _, err := r.sealSupportingGenerationIntents(ctx, cluster, plan); err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "GenerationSealFailed", fmt.Sprintf("cannot seal supporting generation intents: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
 	states, err := r.preflightOwnership(ctx, cluster, plan)
@@ -309,6 +374,16 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 	}
 	if err := r.applyPlan(ctx, cluster, plan, states); err != nil {
 		statusErr := r.reportFailure(ctx, cluster, "ReconcileFailed", fmt.Sprintf("owned resource reconciliation failed: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
+	supportingRolling, err := r.advanceSupportingGenerations(ctx, cluster)
+	if err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "GenerationAdvanceFailed", fmt.Sprintf("cannot advance supporting generations: %v", err))
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
+	isolationActivating, err := r.reconcileIsolationActivation(ctx, cluster)
+	if err != nil {
+		statusErr := r.reportFailure(ctx, cluster, "IsolationActivationFailed", fmt.Sprintf("cannot reconcile namespace isolation activation: %v", err))
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
 	cleaningRetiredCoordinationStorage, err := r.cleanupRetiredEtcdStorage(ctx, cluster)
@@ -337,6 +412,11 @@ func (r *PgShardClusterReconciler) Reconcile(ctx context.Context, request ctrl.R
 		}
 		return ctrl.Result{}, err
 	}
+	if supportingRolling || isolationActivating {
+		// A supporting-generation roll or an isolation-activation phase transition
+		// is in progress; requeue so the state machine advances.
+		return ctrl.Result{RequeueAfter: retryDelay}, nil
+	}
 	if !available {
 		return ctrl.Result{RequeueAfter: retryDelay}, nil
 	}
@@ -357,6 +437,7 @@ func (r *PgShardClusterReconciler) validatePostgreSQLRuntimeContract(ctx context
 	if cluster.Spec.MembersPerShard != 1 && desired != owned.PostgreSQLRuntimeAgentQuarantine {
 		if recorded != nil {
 			wanted := bootstrapSpecStatus(cluster, owned.PostgreSQLRuntime(recorded.PostgreSQLRuntime))
+			wanted.ReplicationTransportPolicy = recorded.ReplicationTransportPolicy
 			if !bootstrapSpecsEqual(recorded, wanted) {
 				return fmt.Errorf("current topology or storage differs from the provisioned PostgreSQL bootstrap spec; an explicit transition is required")
 			}
@@ -367,7 +448,14 @@ func (r *PgShardClusterReconciler) validatePostgreSQLRuntimeContract(ctx context
 		return nil
 	}
 	if recorded == nil {
-		cluster.Status.PostgreSQLBootstrapSpec = bootstrapSpecStatus(cluster, desired)
+		provisioned := bootstrapSpecStatus(cluster, desired)
+		// Only a bootstrap contract born under this operator carries the TLS
+		// transport marker: clusters recorded by earlier releases keep an
+		// empty policy forever and are never half-migrated.
+		if cluster.Spec.MembersPerShard > 1 && desired == owned.PostgreSQLRuntimeAgentQuarantine {
+			provisioned.ReplicationTransportPolicy = pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1
+		}
+		cluster.Status.PostgreSQLBootstrapSpec = provisioned
 		if err := r.Status().Update(ctx, cluster); err != nil {
 			return fmt.Errorf("checkpoint PostgreSQL runtime contract: %w", err)
 		}
@@ -406,7 +494,7 @@ func (r *PgShardClusterReconciler) validatePostgreSQLRuntimeContract(ctx context
 				if !metav1.IsControlledBy(statefulSet, cluster) {
 					return fmt.Errorf("StatefulSet %s is not controlled by PgShardCluster UID %s", name, cluster.UID)
 				}
-				observed, observeErr := owned.ObservePostgreSQLRuntimeForCluster(cluster, statefulSet.Spec.Template.Annotations, statefulSet.Spec.Template.Spec)
+				observed, observeErr := owned.ObservePostgreSQLRuntimeForCluster(cluster, statefulSet.Spec.Template.Labels, statefulSet.Spec.Template.Annotations, statefulSet.Spec.Template.Spec)
 				if observeErr != nil {
 					return fmt.Errorf("observe StatefulSet %s runtime: %w", name, observeErr)
 				}
@@ -426,7 +514,7 @@ func (r *PgShardClusterReconciler) validatePostgreSQLRuntimeContract(ctx context
 			if err != nil {
 				return fmt.Errorf("read Pod %s runtime: %w", podName, err)
 			}
-			observed, observeErr := owned.ObservePostgreSQLRuntimeForCluster(cluster, pod.Annotations, pod.Spec)
+			observed, observeErr := owned.ObservePostgreSQLRuntimeForCluster(cluster, pod.Labels, pod.Annotations, pod.Spec)
 			if observeErr != nil {
 				return fmt.Errorf("observe Pod %s runtime: %w", podName, observeErr)
 			}
@@ -1241,6 +1329,497 @@ func postgreSQLReplicationCredentialForShard(cluster *pgshardv1alpha1.PgShardClu
 		}
 	}
 	return nil, false
+}
+
+func (r *PgShardClusterReconciler) ensurePostgreSQLReplicationTLS(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) error {
+	if cluster.Spec.MembersPerShard == 1 {
+		if len(cluster.Status.PostgreSQLReplicationTLS) != 0 {
+			return fmt.Errorf("single-member topology has recorded replication TLS material")
+		}
+		return nil
+	}
+	if cluster.Status.PostgreSQLBootstrapSpec == nil {
+		if len(cluster.Status.PostgreSQLReplicationTLS) != 0 {
+			return fmt.Errorf("replication TLS material exists without a checkpointed PostgreSQL runtime contract")
+		}
+		return nil
+	}
+	if cluster.Status.PostgreSQLBootstrapSpec.PostgreSQLRuntime != owned.PostgreSQLRuntimeAgentQuarantine.String() {
+		if len(cluster.Status.PostgreSQLReplicationTLS) != 0 {
+			return fmt.Errorf("multi-member replication TLS material requires runtime %q", owned.PostgreSQLRuntimeAgentQuarantine)
+		}
+		return nil
+	}
+	if cluster.Status.PostgreSQLBootstrapSpec.ReplicationTransportPolicy != pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1 {
+		// Bootstrap contracts recorded before replication TLS existed carry no
+		// transport policy: their clusters keep running exactly as provisioned
+		// and never receive TLS Secrets or template changes.
+		if len(cluster.Status.PostgreSQLReplicationTLS) != 0 {
+			return fmt.Errorf("replication TLS material exists without the %q bootstrap transport policy", pgshardv1alpha1.ReplicationTransportPolicyServerTLSV1)
+		}
+		return nil
+	}
+	if err := validRecordedPostgreSQLReplicationTLSSet(cluster); err != nil {
+		return err
+	}
+	reader := r.authoritativeReader()
+	for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
+		if err := r.ensurePostgreSQLReplicationTLSForShard(ctx, cluster, shard, reader); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validRecordedPostgreSQLReplicationTLSSet(cluster *pgshardv1alpha1.PgShardCluster) error {
+	shards := make(map[int32]struct{}, len(cluster.Status.PostgreSQLReplicationTLS))
+	names := make(map[string]struct{})
+	uids := make(map[types.UID]struct{})
+	recordName := func(name string) error {
+		if _, duplicate := names[name]; duplicate {
+			return fmt.Errorf("recorded replication TLS state reuses Secret name %s", name)
+		}
+		names[name] = struct{}{}
+		return nil
+	}
+	recordUID := func(uid types.UID) error {
+		if uid == "" {
+			return nil
+		}
+		if _, duplicate := uids[uid]; duplicate {
+			return fmt.Errorf("recorded replication TLS state reuses Secret UID %s", uid)
+		}
+		uids[uid] = struct{}{}
+		return nil
+	}
+	for index := range cluster.Status.PostgreSQLReplicationTLS {
+		recorded := &cluster.Status.PostgreSQLReplicationTLS[index]
+		if recorded.Shard < 0 || recorded.Shard >= cluster.Spec.Shards || !validPostgreSQLReplicationTLSStatus(cluster, recorded) {
+			return fmt.Errorf("recorded replication TLS state for shard %d is invalid", recorded.Shard)
+		}
+		if _, duplicate := shards[recorded.Shard]; duplicate {
+			return fmt.Errorf("recorded replication TLS state repeats shard %d", recorded.Shard)
+		}
+		shards[recorded.Shard] = struct{}{}
+		if err := errors.Join(recordName(recorded.CASecretName), recordUID(recorded.CASecretUID)); err != nil {
+			return err
+		}
+		for _, member := range recorded.Members {
+			if err := errors.Join(recordName(member.SecretName), recordUID(member.SecretUID)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// validPostgreSQLReplicationTLSStatus accepts exactly the states the staged
+// lifecycle can write: named intents, checkpointed empty identities, and one
+// atomically checkpointed digest set covering the CA and every member.
+func validPostgreSQLReplicationTLSStatus(cluster *pgshardv1alpha1.PgShardCluster, status *pgshardv1alpha1.PostgreSQLReplicationTLSStatus) bool {
+	if status == nil || status.Shard < 0 ||
+		!owned.PostgreSQLReplicationTLSCASecretNameIsValid(cluster.Name, status.Shard, status.CASecretName) {
+		return false
+	}
+	if len(status.Members) != int(cluster.Spec.MembersPerShard) {
+		return false
+	}
+	committed := status.CASHA256 != ""
+	if committed && (!validCatalogAccessDigest(status.CASHA256) || status.RenewalDeadline.IsZero() || status.CASecretUID == "") {
+		return false
+	}
+	if !committed && !status.RenewalDeadline.IsZero() {
+		return false
+	}
+	members := make(map[int32]struct{}, len(status.Members))
+	for _, member := range status.Members {
+		if member.Member < 0 || member.Member >= cluster.Spec.MembersPerShard ||
+			!owned.PostgreSQLReplicationTLSServerSecretNameIsValid(cluster.Name, status.Shard, member.Member, member.SecretName) {
+			return false
+		}
+		if _, duplicate := members[member.Member]; duplicate {
+			return false
+		}
+		members[member.Member] = struct{}{}
+		if committed {
+			if member.SecretUID == "" || !validCatalogAccessDigest(member.ServerSHA256) || member.NotAfter.IsZero() {
+				return false
+			}
+			continue
+		}
+		if member.ServerSHA256 != "" || !member.NotAfter.IsZero() {
+			return false
+		}
+	}
+	return true
+}
+
+func postgreSQLReplicationTLSForShard(cluster *pgshardv1alpha1.PgShardCluster, shard int32) (*pgshardv1alpha1.PostgreSQLReplicationTLSStatus, bool) {
+	for index := range cluster.Status.PostgreSQLReplicationTLS {
+		recorded := &cluster.Status.PostgreSQLReplicationTLS[index]
+		if recorded.Shard == shard {
+			return recorded, true
+		}
+	}
+	return nil, false
+}
+
+func postgreSQLReplicationTLSMemberForShard(recorded *pgshardv1alpha1.PostgreSQLReplicationTLSStatus, member int32) *pgshardv1alpha1.PostgreSQLReplicationTLSMemberStatus {
+	for index := range recorded.Members {
+		candidate := &recorded.Members[index]
+		if candidate.Member == member {
+			return candidate
+		}
+	}
+	return nil
+}
+
+func (r *PgShardClusterReconciler) ensurePostgreSQLReplicationTLSForShard(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, shard int32, reader client.Reader) error {
+	recorded, ok := postgreSQLReplicationTLSForShard(cluster, shard)
+	if !ok {
+		if err := r.createPostgreSQLReplicationTLSIntent(ctx, cluster, shard); err != nil {
+			return err
+		}
+		recorded, _ = postgreSQLReplicationTLSForShard(cluster, shard)
+	}
+
+	memberSecrets := make(map[int32]*corev1.Secret, len(recorded.Members))
+	for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
+		memberRecord := postgreSQLReplicationTLSMemberForShard(recorded, member)
+		canonical := owned.PostgreSQLReplicationTLSServerIntentSecret(cluster, shard, member, memberRecord.SecretName)
+		secret, err := r.ensurePostgreSQLReplicationTLSSecretIdentity(ctx, cluster, canonical, memberRecord.SecretUID, func(uid types.UID) {
+			postgreSQLReplicationTLSMemberForShard(postgreSQLReplicationTLSStatusMust(cluster, shard), member).SecretUID = uid
+		}, reader)
+		if err != nil {
+			return err
+		}
+		recorded, _ = postgreSQLReplicationTLSForShard(cluster, shard)
+		memberSecrets[member] = secret
+	}
+	caCanonical := owned.PostgreSQLReplicationTLSCAIntentSecret(cluster, shard, recorded.CASecretName)
+	caSecret, err := r.ensurePostgreSQLReplicationTLSSecretIdentity(ctx, cluster, caCanonical, recorded.CASecretUID, func(uid types.UID) {
+		postgreSQLReplicationTLSStatusMust(cluster, shard).CASecretUID = uid
+	}, reader)
+	if err != nil {
+		return err
+	}
+	recorded, _ = postgreSQLReplicationTLSForShard(cluster, shard)
+
+	if recorded.CASHA256 != "" {
+		return validateCheckpointedPostgreSQLReplicationTLS(cluster, recorded, caSecret, memberSecrets)
+	}
+	return r.materializePostgreSQLReplicationTLSForShard(ctx, cluster, recorded, caSecret, memberSecrets, reader)
+}
+
+func postgreSQLReplicationTLSStatusMust(cluster *pgshardv1alpha1.PgShardCluster, shard int32) *pgshardv1alpha1.PostgreSQLReplicationTLSStatus {
+	recorded, _ := postgreSQLReplicationTLSForShard(cluster, shard)
+	return recorded
+}
+
+func (r *PgShardClusterReconciler) createPostgreSQLReplicationTLSIntent(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, shard int32) error {
+	caName, err := randomBootstrapName(owned.PostgreSQLReplicationTLSCASecretPrefix(cluster.Name, shard))
+	if err != nil {
+		return fmt.Errorf("generate replication CA Secret name for shard %d: %w", shard, err)
+	}
+	intent := pgshardv1alpha1.PostgreSQLReplicationTLSStatus{Shard: shard, CASecretName: caName}
+	for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
+		name, err := randomBootstrapName(owned.PostgreSQLReplicationTLSServerSecretPrefix(cluster.Name, shard, member))
+		if err != nil {
+			return fmt.Errorf("generate replication server TLS Secret name for shard %d member %d: %w", shard, member, err)
+		}
+		intent.Members = append(intent.Members, pgshardv1alpha1.PostgreSQLReplicationTLSMemberStatus{Member: member, SecretName: name})
+	}
+	cluster.Status.PostgreSQLReplicationTLS = append(cluster.Status.PostgreSQLReplicationTLS, intent)
+	sort.Slice(cluster.Status.PostgreSQLReplicationTLS, func(left, right int) bool {
+		return cluster.Status.PostgreSQLReplicationTLS[left].Shard < cluster.Status.PostgreSQLReplicationTLS[right].Shard
+	})
+	if err := r.Status().Update(ctx, cluster); err != nil {
+		return fmt.Errorf("checkpoint replication TLS creation intent for shard %d: %w", shard, err)
+	}
+	return nil
+}
+
+// ensurePostgreSQLReplicationTLSSecretIdentity creates a checkpointed-name
+// intent Secret when its recorded UID is still empty and binds the observed
+// API identity into status. A Secret observed under a recorded UID is returned
+// unmodified so callers can classify intent versus installed material.
+func (r *PgShardClusterReconciler) ensurePostgreSQLReplicationTLSSecretIdentity(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, canonical *corev1.Secret, recordedUID types.UID, checkpointUID func(types.UID), reader client.Reader) (*corev1.Secret, error) {
+	observed := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: canonical.Name}
+	if err := reader.Get(ctx, key, observed); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("read replication TLS Secret %s: %w", canonical.Name, err)
+		}
+		if recordedUID != "" {
+			return nil, fmt.Errorf("replication TLS Secret %s with recorded UID %s is missing; explicit recovery is required", canonical.Name, recordedUID)
+		}
+		candidate := canonical.DeepCopy()
+		if createErr := r.Create(ctx, candidate, client.FieldOwner(owned.ManagedByValue)); createErr != nil {
+			if readErr := reader.Get(ctx, key, observed); readErr != nil {
+				return nil, errors.Join(
+					fmt.Errorf("create replication TLS Secret %s: %w", canonical.Name, createErr),
+					fmt.Errorf("resolve replication TLS Secret creation outcome: %w", readErr),
+				)
+			}
+		} else {
+			observed = candidate
+		}
+		if observed.UID == "" {
+			if err := reader.Get(ctx, key, observed); err != nil {
+				return nil, fmt.Errorf("read created replication TLS Secret %s: %w", canonical.Name, err)
+			}
+		}
+	}
+	if recordedUID == "" {
+		if err := validatePostgreSQLReplicationTLSIntentSecret(observed, canonical); err != nil {
+			return nil, err
+		}
+		if observed.UID == "" {
+			return nil, fmt.Errorf("replication TLS intent Secret %s has no API-assigned UID", canonical.Name)
+		}
+		checkpointUID(observed.UID)
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return nil, fmt.Errorf("checkpoint replication TLS Secret identity %s: %w", canonical.Name, err)
+		}
+		return observed, nil
+	}
+	if observed.UID != recordedUID {
+		return nil, fmt.Errorf("replication TLS Secret %s has UID %s, expected recorded UID %s; explicit recovery is required", canonical.Name, observed.UID, recordedUID)
+	}
+	return observed, nil
+}
+
+func (r *PgShardClusterReconciler) materializePostgreSQLReplicationTLSForShard(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, recorded *pgshardv1alpha1.PostgreSQLReplicationTLSStatus, caSecret *corev1.Secret, memberSecrets map[int32]*corev1.Secret, reader client.Reader) error {
+	shard := recorded.Shard
+	caCanonical := owned.PostgreSQLReplicationTLSCAIntentSecret(cluster, shard, recorded.CASecretName)
+	caIsIntent := validatePostgreSQLReplicationTLSIntentSecret(caSecret, caCanonical) == nil
+	intentMembers := 0
+	for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
+		memberRecord := postgreSQLReplicationTLSMemberForShard(recorded, member)
+		canonical := owned.PostgreSQLReplicationTLSServerIntentSecret(cluster, shard, member, memberRecord.SecretName)
+		if validatePostgreSQLReplicationTLSIntentSecret(memberSecrets[member], canonical) == nil {
+			intentMembers++
+		}
+	}
+
+	if !caIsIntent && intentMembers == 0 {
+		// Every Secret already holds material: the process stopped between the
+		// final install and the digest checkpoint. Validate and checkpoint.
+		return r.checkpointPostgreSQLReplicationTLSMaterial(ctx, cluster, recorded, caSecret, memberSecrets)
+	}
+	if !caIsIntent || intentMembers != int(cluster.Spec.MembersPerShard) {
+		return fmt.Errorf("replication TLS material for shard %d is partially installed and its CA private key is unrecoverable; explicit recovery is required", shard)
+	}
+
+	memberDNSNames := make(map[int32][]string, cluster.Spec.MembersPerShard)
+	for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
+		memberDNSNames[member] = owned.PostgreSQLMemberTLSDNSNames(cluster.Name, shard, member, cluster.Namespace)
+	}
+	bundle, err := pki.GenerateReplicationTLSBundle(
+		time.Now().UTC(),
+		rand.Reader,
+		fmt.Sprintf("pgshard replication CA for %s/%s shard %04d", cluster.Namespace, cluster.Name, shard),
+		memberDNSNames,
+	)
+	if err != nil {
+		return fmt.Errorf("generate replication TLS bundle for shard %d: %w", shard, err)
+	}
+	for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
+		memberRecord := postgreSQLReplicationTLSMemberForShard(recorded, member)
+		canonical := owned.PostgreSQLReplicationTLSServerIntentSecret(cluster, shard, member, memberRecord.SecretName)
+		material := bundle.Servers[member]
+		installed, err := r.installPostgreSQLReplicationTLSMaterial(ctx, cluster, memberSecrets[member], canonical, memberRecord.SecretUID, map[string][]byte{
+			owned.PostgreSQLReplicationTLSCertificateKey: material.Certificate,
+			owned.PostgreSQLReplicationTLSPrivateKeyKey:  material.PrivateKey,
+		}, reader)
+		if err != nil {
+			return err
+		}
+		memberSecrets[member] = installed
+	}
+	installedCA, err := r.installPostgreSQLReplicationTLSMaterial(ctx, cluster, caSecret, caCanonical, recorded.CASecretUID, map[string][]byte{
+		owned.PostgreSQLReplicationTLSCAKey: bundle.CACertificate,
+	}, reader)
+	if err != nil {
+		return err
+	}
+	caSecret = installedCA
+
+	for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
+		memberRecord := postgreSQLReplicationTLSMemberForShard(recorded, member)
+		reread := &corev1.Secret{}
+		if err := reader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: memberRecord.SecretName}, reread); err != nil {
+			return fmt.Errorf("read installed replication TLS Secret %s: %w", memberRecord.SecretName, err)
+		}
+		memberSecrets[member] = reread
+	}
+	rereadCA := &corev1.Secret{}
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: recorded.CASecretName}, rereadCA); err != nil {
+		return fmt.Errorf("read installed replication CA Secret %s: %w", recorded.CASecretName, err)
+	}
+	return r.checkpointPostgreSQLReplicationTLSMaterial(ctx, cluster, recorded, rereadCA, memberSecrets)
+}
+
+func (r *PgShardClusterReconciler) installPostgreSQLReplicationTLSMaterial(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, secret *corev1.Secret, canonical *corev1.Secret, recordedUID types.UID, data map[string][]byte, reader client.Reader) (*corev1.Secret, error) {
+	if recordedUID == "" || secret.UID != recordedUID {
+		return nil, fmt.Errorf("replication TLS Secret %s identity changed before material installation", canonical.Name)
+	}
+	if err := validatePostgreSQLReplicationTLSIntentSecret(secret, canonical); err != nil {
+		return nil, err
+	}
+	candidate := secret.DeepCopy()
+	candidate.GenerateName = ""
+	candidate.Labels = maps.Clone(canonical.Labels)
+	candidate.Annotations = maps.Clone(canonical.Annotations)
+	candidate.OwnerReferences = append([]metav1.OwnerReference(nil), canonical.OwnerReferences...)
+	candidate.Finalizers = nil
+	candidate.Type = corev1.SecretTypeOpaque
+	immutable := true
+	candidate.Immutable = &immutable
+	candidate.Data = data
+	candidate.StringData = nil
+	if updateErr := r.Update(ctx, candidate, client.FieldOwner(owned.ManagedByValue)); updateErr != nil {
+		observed := &corev1.Secret{}
+		key := types.NamespacedName{Namespace: cluster.Namespace, Name: canonical.Name}
+		if readErr := reader.Get(ctx, key, observed); readErr != nil {
+			return nil, errors.Join(
+				fmt.Errorf("install immutable replication TLS material in Secret %s: %w", canonical.Name, updateErr),
+				fmt.Errorf("resolve replication TLS material update outcome: %w", readErr),
+			)
+		}
+		if observed.UID != recordedUID {
+			return nil, fmt.Errorf("replication TLS Secret %s has UID %s, expected recorded UID %s after material update; explicit recovery is required", canonical.Name, observed.UID, recordedUID)
+		}
+		if intentErr := validatePostgreSQLReplicationTLSIntentSecret(observed, canonical); intentErr == nil {
+			return nil, fmt.Errorf("install immutable replication TLS material in Secret %s: %w", canonical.Name, updateErr)
+		}
+		candidate = observed
+	}
+	return candidate, nil
+}
+
+func (r *PgShardClusterReconciler) checkpointPostgreSQLReplicationTLSMaterial(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, recorded *pgshardv1alpha1.PostgreSQLReplicationTLSStatus, caSecret *corev1.Secret, memberSecrets map[int32]*corev1.Secret) error {
+	observed, err := observedPostgreSQLReplicationTLSStatus(cluster, recorded, caSecret, memberSecrets)
+	if err != nil {
+		return err
+	}
+	recorded.CASHA256 = observed.CASHA256
+	recorded.RenewalDeadline = observed.RenewalDeadline
+	recorded.Members = observed.Members
+	if err := r.Status().Update(ctx, cluster); err != nil {
+		return fmt.Errorf("checkpoint replication TLS material for shard %d: %w", recorded.Shard, err)
+	}
+	return nil
+}
+
+func validateCheckpointedPostgreSQLReplicationTLS(cluster *pgshardv1alpha1.PgShardCluster, recorded *pgshardv1alpha1.PostgreSQLReplicationTLSStatus, caSecret *corev1.Secret, memberSecrets map[int32]*corev1.Secret) error {
+	observed, err := observedPostgreSQLReplicationTLSStatus(cluster, recorded, caSecret, memberSecrets)
+	if err != nil {
+		return err
+	}
+	if observed.CASHA256 != recorded.CASHA256 {
+		return fmt.Errorf("replication CA Secret %s material differs from the checkpointed creation result; explicit recovery is required", recorded.CASecretName)
+	}
+	for index := range observed.Members {
+		checkpointed := postgreSQLReplicationTLSMemberForShard(recorded, observed.Members[index].Member)
+		if observed.Members[index].ServerSHA256 != checkpointed.ServerSHA256 {
+			return fmt.Errorf("replication TLS Secret %s material differs from the checkpointed creation result; explicit recovery is required", checkpointed.SecretName)
+		}
+	}
+	return nil
+}
+
+// observedPostgreSQLReplicationTLSStatus validates the complete installed
+// bundle — Secret shapes, chain, exact single-SAN identity, key pairing, and
+// the expiry floor — and derives the digest checkpoint from the observed data.
+func observedPostgreSQLReplicationTLSStatus(cluster *pgshardv1alpha1.PgShardCluster, recorded *pgshardv1alpha1.PostgreSQLReplicationTLSStatus, caSecret *corev1.Secret, memberSecrets map[int32]*corev1.Secret) (*pgshardv1alpha1.PostgreSQLReplicationTLSStatus, error) {
+	shard := recorded.Shard
+	now := time.Now().UTC()
+	caCanonical := owned.PostgreSQLReplicationTLSCAIntentSecret(cluster, shard, recorded.CASecretName)
+	if err := validatePostgreSQLReplicationTLSMaterialSecret(caSecret, caCanonical, recorded.CASecretUID, []string{owned.PostgreSQLReplicationTLSCAKey}); err != nil {
+		return nil, err
+	}
+	caCertificate := caSecret.Data[owned.PostgreSQLReplicationTLSCAKey]
+	caNotAfter, err := pki.ValidateReplicationTLSCA(caCertificate, now)
+	if err != nil {
+		return nil, fmt.Errorf("replication CA Secret %s has invalid TLS material: %w", recorded.CASecretName, err)
+	}
+	observed := &pgshardv1alpha1.PostgreSQLReplicationTLSStatus{
+		Shard:        shard,
+		CASecretName: recorded.CASecretName,
+		CASecretUID:  recorded.CASecretUID,
+		CASHA256:     owned.PostgreSQLReplicationTLSCAMaterialSHA256(caCertificate),
+	}
+	earliestNotAfter := caNotAfter
+	for member := int32(0); member < cluster.Spec.MembersPerShard; member++ {
+		memberRecord := postgreSQLReplicationTLSMemberForShard(recorded, member)
+		secret := memberSecrets[member]
+		canonical := owned.PostgreSQLReplicationTLSServerIntentSecret(cluster, shard, member, memberRecord.SecretName)
+		if err := validatePostgreSQLReplicationTLSMaterialSecret(secret, canonical, memberRecord.SecretUID, []string{owned.PostgreSQLReplicationTLSCertificateKey, owned.PostgreSQLReplicationTLSPrivateKeyKey}); err != nil {
+			return nil, err
+		}
+		certificate := secret.Data[owned.PostgreSQLReplicationTLSCertificateKey]
+		privateKey := secret.Data[owned.PostgreSQLReplicationTLSPrivateKeyKey]
+		notAfter, err := pki.ValidateReplicationTLSServer(
+			caCertificate,
+			certificate,
+			privateKey,
+			owned.PostgreSQLMemberTLSDNSNames(cluster.Name, shard, member, cluster.Namespace),
+			now,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("replication TLS Secret %s has invalid TLS material: %w", memberRecord.SecretName, err)
+		}
+		if notAfter.Before(earliestNotAfter) {
+			earliestNotAfter = notAfter
+		}
+		observed.Members = append(observed.Members, pgshardv1alpha1.PostgreSQLReplicationTLSMemberStatus{
+			Member:       member,
+			SecretName:   memberRecord.SecretName,
+			SecretUID:    memberRecord.SecretUID,
+			ServerSHA256: owned.PostgreSQLReplicationTLSServerMaterialSHA256(certificate, privateKey),
+			NotAfter:     metav1.NewTime(notAfter.UTC()),
+		})
+	}
+	observed.RenewalDeadline = metav1.NewTime(earliestNotAfter.Add(-pki.StaticRenewBefore).UTC())
+	return observed, nil
+}
+
+func validatePostgreSQLReplicationTLSIntentSecret(secret *corev1.Secret, canonical *corev1.Secret) error {
+	if secret.DeletionTimestamp != nil || !postgreSQLReplicationTLSSecretMetadataMatches(secret, canonical, false) {
+		return fmt.Errorf("replication TLS intent Secret %s metadata is not bound to the exact PgShardCluster shard", canonical.Name)
+	}
+	if secret.Type != corev1.SecretTypeOpaque || (secret.Immutable != nil && *secret.Immutable) || len(secret.Data) != 0 || len(secret.StringData) != 0 {
+		return fmt.Errorf("replication TLS intent Secret %s must be empty, mutable, and have type Opaque", canonical.Name)
+	}
+	return nil
+}
+
+func validatePostgreSQLReplicationTLSMaterialSecret(secret *corev1.Secret, canonical *corev1.Secret, recordedUID types.UID, wantedKeys []string) error {
+	if recordedUID == "" || secret.UID != recordedUID {
+		return fmt.Errorf("replication TLS Secret %s has UID %s, expected recorded UID %s; explicit recovery is required", canonical.Name, secret.UID, recordedUID)
+	}
+	if secret.DeletionTimestamp != nil || !postgreSQLReplicationTLSSecretMetadataMatches(secret, canonical, false) {
+		return fmt.Errorf("replication TLS Secret %s metadata is not bound to the exact PgShardCluster shard", canonical.Name)
+	}
+	if secret.Type != corev1.SecretTypeOpaque || secret.Immutable == nil || !*secret.Immutable {
+		return fmt.Errorf("replication TLS Secret %s must be immutable and have type Opaque", canonical.Name)
+	}
+	if len(secret.Data) != len(wantedKeys) {
+		return fmt.Errorf("replication TLS Secret %s has an unexpected key set", canonical.Name)
+	}
+	for _, key := range wantedKeys {
+		if len(secret.Data[key]) == 0 {
+			return fmt.Errorf("replication TLS Secret %s has an unexpected key set", canonical.Name)
+		}
+	}
+	return nil
+}
+
+func postgreSQLReplicationTLSSecretMetadataMatches(secret *corev1.Secret, canonical *corev1.Secret, allowFinalizers bool) bool {
+	return secret.Name == canonical.Name && secret.Namespace == canonical.Namespace && secret.GenerateName == "" &&
+		maps.Equal(secret.Labels, canonical.Labels) && maps.Equal(secret.Annotations, canonical.Annotations) &&
+		reflect.DeepEqual(secret.OwnerReferences, canonical.OwnerReferences) && (allowFinalizers || len(secret.Finalizers) == 0)
 }
 
 func (r *PgShardClusterReconciler) ensureCatalogAccess(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) error {
@@ -2341,6 +2920,9 @@ func bootstrapSpecStatus(cluster *pgshardv1alpha1.PgShardCluster, postgresqlRunt
 func validateBootstrapSpecStatus(cluster *pgshardv1alpha1.PgShardCluster) error {
 	recorded := cluster.Status.PostgreSQLBootstrapSpec
 	wanted := bootstrapSpecStatus(cluster, owned.PostgreSQLRuntime(recorded.PostgreSQLRuntime))
+	// The transport policy is provisioning-time history, never derived from the
+	// current spec: the recorded value is authoritative.
+	wanted.ReplicationTransportPolicy = recorded.ReplicationTransportPolicy
 	if !bootstrapSpecsEqual(recorded, wanted) {
 		return fmt.Errorf("current topology or storage differs from the provisioned PostgreSQL bootstrap spec; an explicit transition is required")
 	}
@@ -2666,6 +3248,225 @@ func optionalStringsEqual(left, right *string) bool {
 		return left == nil && right == nil
 	}
 	return *left == *right
+}
+
+// ensurePriorityClasses idempotently installs the two installation-scoped
+// pgshard PriorityClasses that every protected pod template authors. They carry
+// no PgShardCluster ownerReference: they are shared installation constants. On
+// collision their value and preemptionPolicy are validated exactly (both are
+// immutable in the API); a mismatch is a fail-closed explicit-recovery error,
+// never a silent mutation or deletion.
+func (r *PgShardClusterReconciler) ensurePriorityClasses(ctx context.Context) error {
+	reader := r.authoritativeReader()
+	for _, desired := range owned.PgShardPriorityClasses() {
+		existing := &schedulingv1.PriorityClass{}
+		err := reader.Get(ctx, types.NamespacedName{Name: desired.Name}, existing)
+		if apierrors.IsNotFound(err) {
+			createErr := r.Create(ctx, desired.DeepCopy(), client.FieldOwner(owned.ManagedByValue))
+			if createErr == nil {
+				continue
+			}
+			if !apierrors.IsAlreadyExists(createErr) {
+				return fmt.Errorf("create PriorityClass %s: %w", desired.Name, createErr)
+			}
+			// Lost a create race: authoritatively re-read the winner and
+			// validate it, rather than assuming it matches (its immutable value
+			// could conflict). A vanished winner is retried on the next reconcile.
+			if err = reader.Get(ctx, types.NamespacedName{Name: desired.Name}, existing); err != nil {
+				return fmt.Errorf("re-read raced PriorityClass %s: %w", desired.Name, err)
+			}
+		} else if err != nil {
+			return fmt.Errorf("read PriorityClass %s: %w", desired.Name, err)
+		}
+		if existing.Value != desired.Value || !preemptionPoliciesEqual(existing.PreemptionPolicy, desired.PreemptionPolicy) {
+			return fmt.Errorf("PriorityClass %s exists with value %d/preemptionPolicy %v, expected the pinned %d/%v; installation constant conflict requires explicit recovery", desired.Name, existing.Value, ptrString(existing.PreemptionPolicy), desired.Value, ptrString(desired.PreemptionPolicy))
+		}
+	}
+	return nil
+}
+
+func preemptionPoliciesEqual(left, right *corev1.PreemptionPolicy) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func ptrString(policy *corev1.PreemptionPolicy) string {
+	if policy == nil {
+		return "<nil>"
+	}
+	return string(*policy)
+}
+
+// stampPlanContracts stamps every member StatefulSet and supporting Deployment
+// pod template in the plan with its full-contract hash and security generation,
+// so the controllers propagate the stamp to every pod they create, and records
+// the stamps in status. It mutates the plan objects in place before ownership
+// preflight and apply so the stamp is part of the desired object throughout.
+//
+// PRODUCTION GENERATION BUMP: whenever a workload's canonical contract changes —
+// the desired template no longer hashes to the recorded contract at the recorded
+// generation — the security generation is durably INCREMENTED before the plan is
+// applied (the contracts checkpoint below persists ahead of applyPlan). The
+// classifier is deliberately conservative: the canonical contract normal form is
+// exactly the security-relevant surface (images, security contexts, mounts,
+// service accounts, capabilities, composition), so ANY contract change is
+// treated as security-strengthening and raises the revocation barrier; a stale
+// template can then never be admitted after the change lands.
+func (r *PgShardClusterReconciler) stampPlanContracts(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, plan []client.Object) error {
+	memberContracts := make([]pgshardv1alpha1.PostgreSQLMemberContractStatus, 0, len(cluster.Status.PostgreSQLMemberContracts))
+	supportingContracts := make([]pgshardv1alpha1.SupportingContractStatus, 0, len(cluster.Status.SupportingContracts))
+	for _, object := range plan {
+		class, shard, member, template, ok := planWorkloadContractTarget(cluster, object)
+		if !ok {
+			continue
+		}
+		generation := recordedContractGeneration(cluster, class, shard, member)
+		// VERSIONED security-strengthening classifier: bump the generation ONLY when
+		// the SECURITY-relevant surface of the template changed (image, security
+		// contexts, capabilities, mounts, service account, host flags), never for a
+		// benign observability/resource change. A benign change still rolls (its full
+		// contract hash changes) but under normal bounded coexistence — no forced
+		// revocation/Recreate and no floor bump.
+		securityDigest := owned.ComputeSecurityContractDigest(template)
+		if recordedSecurity := recordedSecurityContractHash(cluster, class, shard, member); recordedSecurity != "" && securityDigest != recordedSecurity {
+			generation++
+		}
+		hash, err := owned.ApplyContractStamp(template, class, string(cluster.UID), shard, member, generation)
+		if err != nil {
+			return fmt.Errorf("stamp %s workload contract for shard %d member %d: %w", class, shard, member, err)
+		}
+		switch class {
+		case owned.ClassPooler, owned.ClassOrchestrator:
+			supportingContracts = append(supportingContracts, pgshardv1alpha1.SupportingContractStatus{
+				Class: string(class), ContractHash: hash, SecurityContractHash: securityDigest, SecurityGeneration: generation,
+			})
+		default:
+			memberContracts = append(memberContracts, pgshardv1alpha1.PostgreSQLMemberContractStatus{
+				Shard: shard, Member: member, Class: string(class), ContractHash: hash, SecurityContractHash: securityDigest, SecurityGeneration: generation,
+			})
+		}
+	}
+	sort.Slice(memberContracts, func(left, right int) bool {
+		if memberContracts[left].Shard != memberContracts[right].Shard {
+			return memberContracts[left].Shard < memberContracts[right].Shard
+		}
+		return memberContracts[left].Member < memberContracts[right].Member
+	})
+	sort.Slice(supportingContracts, func(left, right int) bool {
+		return supportingContracts[left].Class < supportingContracts[right].Class
+	})
+	if slices.Equal(cluster.Status.PostgreSQLMemberContracts, memberContracts) &&
+		slices.Equal(cluster.Status.SupportingContracts, supportingContracts) {
+		return nil
+	}
+	// This checkpoint runs BEFORE applyPlan (which creates the bring-up resources
+	// such as the <cluster>-topology ConfigMap). A transient status conflict here
+	// must not abort the reconcile before that apply, so it is committed CAS-safely
+	// with conflict-retry that re-applies only these fields onto the fresh object.
+	if err := r.commitClusterStatusFields(ctx, cluster, func(fresh *pgshardv1alpha1.PgShardCluster) {
+		fresh.Status.PostgreSQLMemberContracts = memberContracts
+		fresh.Status.SupportingContracts = supportingContracts
+	}); err != nil {
+		return fmt.Errorf("checkpoint owned workload contract stamps: %w", err)
+	}
+	return nil
+}
+
+// commitClusterStatusFields writes the cluster status, retrying on conflict by
+// re-reading the authoritative object and re-applying ONLY the caller's fields
+// (never overwriting a concurrent writer's other status fields). apply must be
+// idempotent. It is used by the pre-applyPlan isolation status checkpoints so a
+// transient conflict cannot stall resource bring-up.
+func (r *PgShardClusterReconciler) commitClusterStatusFields(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, apply func(*pgshardv1alpha1.PgShardCluster)) error {
+	apply(cluster)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		err := r.Status().Update(ctx, cluster)
+		if err != nil && apierrors.IsConflict(err) {
+			fresh := &pgshardv1alpha1.PgShardCluster{}
+			if getErr := r.authoritativeReader().Get(ctx, client.ObjectKeyFromObject(cluster), fresh); getErr != nil {
+				return getErr
+			}
+			apply(fresh)
+			fresh.DeepCopyInto(cluster)
+		}
+		return err
+	})
+}
+
+// planWorkloadContractTarget classifies a plan object as a protected workload
+// whose pod template must be stamped, returning its class, identity, and a
+// pointer to the template to mutate. Non-protected objects return ok=false.
+func planWorkloadContractTarget(cluster *pgshardv1alpha1.PgShardCluster, object client.Object) (owned.PodClass, int32, int32, *corev1.PodTemplateSpec, bool) {
+	switch workload := object.(type) {
+	case *appsv1.StatefulSet:
+		if workload.Labels[owned.ComponentLabel] != "postgresql" {
+			return "", 0, 0, nil, false
+		}
+		shard, shardOK := parseIdentityLabel(workload.Labels[owned.ShardLabel])
+		member, memberOK := parseIdentityLabel(workload.Labels[owned.MemberLabel])
+		if !shardOK || !memberOK {
+			return "", 0, 0, nil, false
+		}
+		class := owned.ClassForMember(cluster.Spec.MembersPerShard, member)
+		return class, shard, member, &workload.Spec.Template, true
+	case *appsv1.Deployment:
+		switch workload.Labels[owned.ComponentLabel] {
+		case "pooler":
+			return owned.ClassPooler, 0, 0, &workload.Spec.Template, true
+		case "orchestrator":
+			return owned.ClassOrchestrator, 0, 0, &workload.Spec.Template, true
+		}
+	}
+	return "", 0, 0, nil, false
+}
+
+func recordedContractGeneration(cluster *pgshardv1alpha1.PgShardCluster, class owned.PodClass, shard, member int32) int64 {
+	switch class {
+	case owned.ClassPooler, owned.ClassOrchestrator:
+		for _, recorded := range cluster.Status.SupportingContracts {
+			if recorded.Class == string(class) {
+				return recorded.SecurityGeneration
+			}
+		}
+	default:
+		for _, recorded := range cluster.Status.PostgreSQLMemberContracts {
+			if recorded.Shard == shard && recorded.Member == member {
+				return recorded.SecurityGeneration
+			}
+		}
+	}
+	return 1
+}
+
+func recordedSecurityContractHash(cluster *pgshardv1alpha1.PgShardCluster, class owned.PodClass, shard, member int32) string {
+	switch class {
+	case owned.ClassPooler, owned.ClassOrchestrator:
+		for _, recorded := range cluster.Status.SupportingContracts {
+			if recorded.Class == string(class) {
+				return recorded.SecurityContractHash
+			}
+		}
+	default:
+		for _, recorded := range cluster.Status.PostgreSQLMemberContracts {
+			if recorded.Shard == shard && recorded.Member == member {
+				return recorded.SecurityContractHash
+			}
+		}
+	}
+	return ""
+}
+
+func parseIdentityLabel(value string) (int32, bool) {
+	if len(value) != 4 {
+		return 0, false
+	}
+	parsed, err := strconv.ParseInt(value, 10, 32)
+	if err != nil || parsed < 0 {
+		return 0, false
+	}
+	return int32(parsed), true
 }
 
 func (r *PgShardClusterReconciler) applyPlan(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster, plan []client.Object, states map[string]ownershipState) error {
@@ -3922,6 +4723,84 @@ func validatePostgreSQLReplicationCredentialForDeletion(secret *corev1.Secret, c
 	return nil
 }
 
+func (r *PgShardClusterReconciler) deletePostgreSQLReplicationTLSForFinalization(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
+	if r.APIReader == nil {
+		return false, fmt.Errorf("authoritative API reader is required for replication TLS deletion")
+	}
+	for index := range cluster.Status.PostgreSQLReplicationTLS {
+		recorded := &cluster.Status.PostgreSQLReplicationTLS[index]
+		if !validPostgreSQLReplicationTLSStatus(cluster, recorded) {
+			return false, fmt.Errorf("recorded replication TLS state for shard %d is invalid", recorded.Shard)
+		}
+		for memberIndex := range recorded.Members {
+			member := &recorded.Members[memberIndex]
+			canonical := owned.PostgreSQLReplicationTLSServerIntentSecret(cluster, recorded.Shard, member.Member, member.SecretName)
+			deleting, err := r.deletePostgreSQLReplicationTLSSecretForFinalization(ctx, canonical, member.SecretUID, member.ServerSHA256, func(secret *corev1.Secret) string {
+				return owned.PostgreSQLReplicationTLSServerMaterialSHA256(secret.Data[owned.PostgreSQLReplicationTLSCertificateKey], secret.Data[owned.PostgreSQLReplicationTLSPrivateKeyKey])
+			})
+			if err != nil || deleting {
+				return deleting, err
+			}
+		}
+		canonical := owned.PostgreSQLReplicationTLSCAIntentSecret(cluster, recorded.Shard, recorded.CASecretName)
+		deleting, err := r.deletePostgreSQLReplicationTLSSecretForFinalization(ctx, canonical, recorded.CASecretUID, recorded.CASHA256, func(secret *corev1.Secret) string {
+			return owned.PostgreSQLReplicationTLSCAMaterialSHA256(secret.Data[owned.PostgreSQLReplicationTLSCAKey])
+		})
+		if err != nil || deleting {
+			return deleting, err
+		}
+	}
+	return false, nil
+}
+
+func (r *PgShardClusterReconciler) deletePostgreSQLReplicationTLSSecretForFinalization(ctx context.Context, canonical *corev1.Secret, recordedUID types.UID, recordedDigest string, observedDigest func(*corev1.Secret) string) (bool, error) {
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Namespace: canonical.Namespace, Name: canonical.Name}
+	if err := r.APIReader.Get(ctx, key, secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read replication TLS Secret %s during finalization: %w", canonical.Name, err)
+	}
+	if err := validatePostgreSQLReplicationTLSForDeletion(secret, canonical, recordedUID, recordedDigest, observedDigest); err != nil {
+		return false, err
+	}
+	if secret.DeletionTimestamp != nil {
+		return true, nil
+	}
+	uid := secret.UID
+	resourceVersion := secret.ResourceVersion
+	if uid == "" || resourceVersion == "" {
+		return false, fmt.Errorf("replication TLS Secret %s has no stable API identity", secret.Name)
+	}
+	if err := r.Delete(ctx, secret, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); err != nil && !apierrors.IsNotFound(err) {
+		return false, fmt.Errorf("delete replication TLS Secret %s with UID %s: %w", secret.Name, secret.UID, err)
+	}
+	return true, nil
+}
+
+func validatePostgreSQLReplicationTLSForDeletion(secret *corev1.Secret, canonical *corev1.Secret, recordedUID types.UID, recordedDigest string, observedDigest func(*corev1.Secret) string) error {
+	if secret.Name != canonical.Name || secret.Namespace != canonical.Namespace {
+		return fmt.Errorf("replication TLS Secret %s identity is not bound to the deleting PgShardCluster", canonical.Name)
+	}
+	if recordedUID != "" {
+		if secret.UID != recordedUID {
+			return fmt.Errorf("replication TLS Secret %s has UID %s, expected recorded UID %s during finalization", canonical.Name, secret.UID, recordedUID)
+		}
+		if recordedDigest != "" && observedDigest(secret) != recordedDigest {
+			return fmt.Errorf("replication TLS Secret %s material differs from the checkpointed creation result during finalization", canonical.Name)
+		}
+		return nil
+	}
+	if !postgreSQLReplicationTLSSecretMetadataMatches(secret, canonical, true) {
+		return fmt.Errorf("replication TLS intent Secret %s metadata is not bound to the exact deleting PgShardCluster shard", canonical.Name)
+	}
+	if secret.Type != corev1.SecretTypeOpaque || (secret.Immutable != nil && *secret.Immutable) || len(secret.Data) != 0 || len(secret.StringData) != 0 {
+		return fmt.Errorf("replication TLS intent Secret %s must be empty, mutable, and have type Opaque during finalization", canonical.Name)
+	}
+	return nil
+}
+
 func (r *PgShardClusterReconciler) deleteOperationWriterAccessForFinalization(ctx context.Context, cluster *pgshardv1alpha1.PgShardCluster) (bool, error) {
 	if r.APIReader == nil {
 		return false, fmt.Errorf("authoritative API reader is required for operation-writer access deletion")
@@ -4837,7 +5716,7 @@ func (r *PgShardClusterReconciler) updateStatus(ctx context.Context, cluster *pg
 }
 
 func statusesEqual(left, right pgshardv1alpha1.PgShardClusterStatus) bool {
-	if left.ObservedGeneration != right.ObservedGeneration || left.Phase != right.Phase || len(left.Conditions) != len(right.Conditions) || !bootstrapSpecsEqual(left.PostgreSQLBootstrapSpec, right.PostgreSQLBootstrapSpec) || !slices.EqualFunc(left.PostgreSQLBootstraps, right.PostgreSQLBootstraps, postgreSQLBootstrapsEqual) || !slices.EqualFunc(left.PostgreSQLWritableLeases, right.PostgreSQLWritableLeases, postgreSQLWritableLeasesEqual) || !slices.EqualFunc(left.PostgreSQLReplicationCredentials, right.PostgreSQLReplicationCredentials, postgreSQLReplicationCredentialsEqual) || !postgresqlConfigurationStatusesEqual(left.PostgreSQLConfiguration, right.PostgreSQLConfiguration) || !slices.EqualFunc(left.PostgreSQLCatalogCandidates, right.PostgreSQLCatalogCandidates, postgreSQLCatalogCandidatesEqual) || !catalogAccessStatusesEqual(left.CatalogAccess, right.CatalogAccess) || !operationWriterAccessStatusesEqual(left.OperationWriterAccess, right.OperationWriterAccess) || !catalogActivationStatusesEqual(left.CatalogActivation, right.CatalogActivation) {
+	if left.ObservedGeneration != right.ObservedGeneration || left.Phase != right.Phase || len(left.Conditions) != len(right.Conditions) || !bootstrapSpecsEqual(left.PostgreSQLBootstrapSpec, right.PostgreSQLBootstrapSpec) || !slices.EqualFunc(left.PostgreSQLBootstraps, right.PostgreSQLBootstraps, postgreSQLBootstrapsEqual) || !slices.EqualFunc(left.PostgreSQLWritableLeases, right.PostgreSQLWritableLeases, postgreSQLWritableLeasesEqual) || !slices.EqualFunc(left.PostgreSQLReplicationCredentials, right.PostgreSQLReplicationCredentials, postgreSQLReplicationCredentialsEqual) || !slices.EqualFunc(left.PostgreSQLReplicationTLS, right.PostgreSQLReplicationTLS, postgreSQLReplicationTLSStatusesEqual) || !postgresqlConfigurationStatusesEqual(left.PostgreSQLConfiguration, right.PostgreSQLConfiguration) || !slices.EqualFunc(left.PostgreSQLCatalogCandidates, right.PostgreSQLCatalogCandidates, postgreSQLCatalogCandidatesEqual) || !catalogAccessStatusesEqual(left.CatalogAccess, right.CatalogAccess) || !operationWriterAccessStatusesEqual(left.OperationWriterAccess, right.OperationWriterAccess) || !catalogActivationStatusesEqual(left.CatalogActivation, right.CatalogActivation) {
 		return false
 	}
 	for index := range left.Conditions {
@@ -4870,6 +5749,17 @@ func postgreSQLReplicationCredentialsEqual(left, right pgshardv1alpha1.PostgreSQ
 	return left.Shard == right.Shard && left.SecretName == right.SecretName && left.SecretUID == right.SecretUID && left.MaterialSHA256 == right.MaterialSHA256
 }
 
+func postgreSQLReplicationTLSStatusesEqual(left, right pgshardv1alpha1.PostgreSQLReplicationTLSStatus) bool {
+	return left.Shard == right.Shard && left.CASecretName == right.CASecretName && left.CASecretUID == right.CASecretUID &&
+		left.CASHA256 == right.CASHA256 && left.RenewalDeadline.Equal(&right.RenewalDeadline) &&
+		slices.EqualFunc(left.Members, right.Members, postgreSQLReplicationTLSMemberStatusesEqual)
+}
+
+func postgreSQLReplicationTLSMemberStatusesEqual(left, right pgshardv1alpha1.PostgreSQLReplicationTLSMemberStatus) bool {
+	return left.Member == right.Member && left.SecretName == right.SecretName && left.SecretUID == right.SecretUID &&
+		left.ServerSHA256 == right.ServerSHA256 && left.NotAfter.Equal(&right.NotAfter)
+}
+
 func postgreSQLWritableLeasesEqual(left, right pgshardv1alpha1.PostgreSQLWritableLeaseStatus) bool {
 	return left.Shard == right.Shard && left.LeaseName == right.LeaseName && left.LeaseUID == right.LeaseUID
 }
@@ -4893,7 +5783,7 @@ func bootstrapSpecsEqual(left, right *pgshardv1alpha1.PostgreSQLBootstrapSpecSta
 	if left == nil || right == nil {
 		return left == nil && right == nil
 	}
-	return left.Shards == right.Shards && left.MembersPerShard == right.MembersPerShard && left.Durability == right.Durability && left.PostgreSQLRuntime == right.PostgreSQLRuntime && left.DatabaseTopologySHA256 == right.DatabaseTopologySHA256 && left.StorageSize == right.StorageSize && optionalStringsEqual(left.StorageClassName, right.StorageClassName) && left.DeletionPolicy == right.DeletionPolicy
+	return left.Shards == right.Shards && left.MembersPerShard == right.MembersPerShard && left.Durability == right.Durability && left.PostgreSQLRuntime == right.PostgreSQLRuntime && left.ReplicationTransportPolicy == right.ReplicationTransportPolicy && left.DatabaseTopologySHA256 == right.DatabaseTopologySHA256 && left.StorageSize == right.StorageSize && optionalStringsEqual(left.StorageClassName, right.StorageClassName) && left.DeletionPolicy == right.DeletionPolicy
 }
 
 func postgreSQLBootstrapsEqual(left, right pgshardv1alpha1.PostgreSQLBootstrapStatus) bool {
@@ -4957,6 +5847,55 @@ func (r *PgShardClusterReconciler) SetupWithManager(manager ctrl.Manager) error 
 		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
 		Owns(&networkingv1.NetworkPolicy{}).
 		Owns(&policyv1.PodDisruptionBudget{}).
+		// The dispatch tuple is FROZEN through ACTIVE by watching its inputs: any
+		// change to the kubernetes Service EndpointSlices (the backend set) or the
+		// pgshard validating webhook configuration wakes every activating/active
+		// cluster, whose phase drive revalidates the tuple and re-quiesces on
+		// mismatch. Combined with the final re-proof before the ACTIVE write, no
+		// interval is left in which the proof can silently rot.
+		Watches(&discoveryv1.EndpointSlice{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueIsolationBoundClusters),
+			builder.WithPredicates(kubernetesBackendSliceEvents())).
+		Watches(&admissionregistrationv1.ValidatingWebhookConfiguration{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueIsolationBoundClusters),
+			builder.WithPredicates(r.dispatchWebhookConfigEvents())).
 		Named("pgshardcluster").
 		Complete(r)
+}
+
+// kubernetesBackendSliceEvents matches only the EndpointSlices that publish the
+// kubernetes Service backends in the default namespace — the exact objects the
+// dispatch tuple hashes.
+func kubernetesBackendSliceEvents() predicate.Funcs {
+	matches := func(object client.Object) bool {
+		return object.GetNamespace() == metav1.NamespaceDefault &&
+			object.GetLabels()[discoveryv1.LabelServiceName] == "kubernetes"
+	}
+	return predicate.NewPredicateFuncs(matches)
+}
+
+// dispatchWebhookConfigEvents matches only the pgshard validating webhook
+// configuration the dispatch tuple hashes.
+func (r *PgShardClusterReconciler) dispatchWebhookConfigEvents() predicate.Funcs {
+	return predicate.NewPredicateFuncs(func(object client.Object) bool {
+		return r.ValidatingWebhookConfigName != "" && object.GetName() == r.ValidatingWebhookConfigName
+	})
+}
+
+// enqueueIsolationBoundClusters wakes every cluster whose isolation receipt is
+// bound to the dispatch tuple (any phase past INACTIVE, including ACTIVE).
+func (r *PgShardClusterReconciler) enqueueIsolationBoundClusters(ctx context.Context, _ client.Object) []ctrl.Request {
+	list := &pgshardv1alpha1.PgShardClusterList{}
+	if err := r.List(ctx, list); err != nil {
+		return nil
+	}
+	requests := []ctrl.Request{}
+	for i := range list.Items {
+		cluster := &list.Items[i]
+		if isolationReceiptPhase(cluster.Status.IsolationReceipt) == pgshardv1alpha1.IsolationInactive {
+			continue
+		}
+		requests = append(requests, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name}})
+	}
+	return requests
 }

@@ -4,20 +4,46 @@ metadata:
   name: validating-webhook-configuration
 webhooks:
   - name: vpostgresqlpodmetadata.pgshard.io
-    objectSelector:
+    namespaceSelector:
       matchLabels:
-        app.kubernetes.io/component: postgresql
-        app.kubernetes.io/managed-by: pgshard-operator
+        pgshard.io/pod-fencing: enabled
   - name: vpostgresqlfencingnamespace.pgshard.io
     objectSelector:
       matchLabels:
         pgshard.io/pod-fencing: enabled
-  - name: vpostgresqlpodstatus.pgshard.io
+  - name: vpostgresqlenforcingnamespace.pgshard.io
     objectSelector:
+      matchExpressions:
+        - key: pgshard.io/isolation-enforcing
+          operator: Exists
+  - name: vpostgresqlpodstatus.pgshard.io
+    namespaceSelector:
       matchLabels:
-        app.kubernetes.io/component: postgresql
-        app.kubernetes.io/managed-by: pgshard-operator
+        pgshard.io/pod-fencing: enabled
   - name: vpostgresqlpodbinding.pgshard.io
     namespaceSelector:
       matchLabels:
         pgshard.io/pod-fencing: enabled
+  - name: vpostgresqlpodcreate.pgshard.io
+    namespaceSelector:
+      matchLabels:
+        pgshard.io/pod-fencing: enabled
+  - name: vpostgresqlworkload.pgshard.io
+    namespaceSelector:
+      matchLabels:
+        pgshard.io/pod-fencing: enabled
+        pgshard.io/isolation-enforcing: enforced
+  - name: vpostgresqlpodconnect.pgshard.io
+    namespaceSelector:
+      matchLabels:
+        pgshard.io/pod-fencing: enabled
+        pgshard.io/isolation-enforcing: enforced
+  - name: vpostgresqlmanagerconnect.pgshard.io
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: pgshard-system
+  - name: vpostgresqllimitrange.pgshard.io
+    namespaceSelector:
+      matchLabels:
+        pgshard.io/pod-fencing: enabled
+        pgshard.io/isolation-enforcing: enforced

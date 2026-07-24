@@ -349,6 +349,14 @@ type PgShardClusterStatus struct {
 	// +listType=map
 	// +listMapKey=shard
 	PostgreSQLReplicationCredentials []PostgreSQLReplicationCredentialStatus `json:"postgresqlReplicationCredentials,omitempty"`
+	// PostgreSQLReplicationTLS records one staged replication CA and one server
+	// certificate Secret per shard member. Multi-member workloads may reference
+	// a shard's Secrets only after every member digest and the CA digest are
+	// checkpointed. Missing, replaced, or changed Secrets require explicit
+	// recovery.
+	// +listType=map
+	// +listMapKey=shard
+	PostgreSQLReplicationTLS []PostgreSQLReplicationTLSStatus `json:"postgresqlReplicationTLS,omitempty"`
 	// PostgreSQLConfiguration pins the exact immutable, content-addressed
 	// PostgreSQL ConfigMap selected for a future shard-zero catalog
 	// materialization attempt. It is recorded before candidate documents are
@@ -377,6 +385,271 @@ type PgShardClusterStatus struct {
 	// for a future authenticated catalog materialization request. A missing or
 	// replaced carrier is an explicit-recovery boundary and is never recreated.
 	CatalogActivation *CatalogActivationCarrierStatus `json:"catalogActivation,omitempty"`
+	// PostgreSQLMemberContracts records the reconciler-stamped full-contract
+	// hash and monotonic security generation for each member StatefulSet's pod
+	// template. The controller propagates the stamp to every pod it creates;
+	// admission later validates a pod against its live owning parent's stamp.
+	// The barrier/generation-bump logic is not yet implemented — the generation
+	// is stamped at its current value only.
+	// +listType=map
+	// +listMapKey=shard
+	// +listMapKey=member
+	PostgreSQLMemberContracts []PostgreSQLMemberContractStatus `json:"postgresqlMemberContracts,omitempty"`
+	// SupportingContracts records the reconciler-stamped full-contract hash and
+	// security generation for each supporting workload class (pooler,
+	// orchestrator).
+	// +listType=map
+	// +listMapKey=class
+	SupportingContracts []SupportingContractStatus `json:"supportingContracts,omitempty"`
+	// SupportingGenerations records the per-class compare-and-set state machine
+	// that decides which ReplicaSet generation of a supporting workload may
+	// create pods, and the security-generation barrier below which new creates
+	// are revoked. It is sealed before the owning Deployment is mutated and
+	// recomputed deterministically from live ReplicaSet UIDs on manager restart.
+	// +listType=map
+	// +listMapKey=class
+	SupportingGenerations []SupportingGenerationStatus `json:"supportingGenerations,omitempty"`
+	// IsolationReceipt is the durable, namespace-UID-bound activation state
+	// machine that flips per-namespace isolation enforcement from the legacy
+	// pre-activation behavior (INACTIVE) to full deny-all enforcement (ACTIVE).
+	// It is absent until activation begins; while absent, admission behaves
+	// exactly as before activation.
+	IsolationReceipt *PostgreSQLIsolationReceipt `json:"isolationReceipt,omitempty"`
+}
+
+// IsolationPhase is the durable phase of a namespace's isolation activation.
+// +kubebuilder:validation:Enum=INACTIVE;ACTIVATING_CONVERGE;ACTIVATING_QUIESCE;ACTIVATING_RECREATE;ACTIVE
+type IsolationPhase string
+
+const (
+	// IsolationInactive is the pre-activation phase: isolation is not enforced and
+	// admission behaves exactly as it did before activation (stampless and
+	// unclassified pods pass the legacy path).
+	IsolationInactive IsolationPhase = "INACTIVE"
+	// IsolationActivatingConverge is the pre-enforcement convergence state: the
+	// isolation-enforcing namespace label is set (and admission-protected), and the
+	// reconciler proves that EVERY live API-server backend now DISPATCHES each
+	// label-gated isolation webhook (workload, connect, LimitRange) for the fenced
+	// namespace, then runs the controller-identity probe (which needs the workload
+	// webhook dispatching) and re-lists LimitRanges. Only a fully proven namespace
+	// advances to the enforcing phases; a stale backend's namespace-informer lag
+	// can therefore never let it skip the gated webhooks once enforcement begins.
+	IsolationActivatingConverge IsolationPhase = "ACTIVATING_CONVERGE"
+	// IsolationActivatingQuiesce freezes the namespace: every pod and workload
+	// create is denied while the reconciler seals every protected parent and
+	// drains in-flight creates.
+	IsolationActivatingQuiesce IsolationPhase = "ACTIVATING_QUIESCE"
+	// IsolationActivatingRecreate admits a create only if its controller-owner
+	// parent matches a sealed parent, while the reconciler deletes and
+	// controller-recreates every protected pod so each is authenticated at its
+	// guarded create.
+	IsolationActivatingRecreate IsolationPhase = "ACTIVATING_RECREATE"
+	// IsolationActive is full enforcement: every pod must carry a valid stamp,
+	// classify, and pass the full contract with digest pinning; any unknown,
+	// stampless, or unclassified pod is denied.
+	IsolationActive IsolationPhase = "ACTIVE"
+)
+
+// PostgreSQLIsolationReceipt is the durable per-namespace isolation activation
+// record. It is bound to the namespace UID so a recreated namespace cannot
+// inherit an activation, and it seals the exact parent identities admission
+// trusts during recreation.
+type PostgreSQLIsolationReceipt struct {
+	// +kubebuilder:validation:MinLength=1
+	NamespaceUID string         `json:"namespaceUID"`
+	Phase        IsolationPhase `json:"phase"`
+	// +kubebuilder:validation:Minimum=0
+	SecurityGeneration int64 `json:"securityGeneration,omitempty"`
+	// MinAcceptableSecurityGeneration is a DEPRECATED scalar isolation-level floor.
+	// It is retained for compatibility but no longer enforced: independent
+	// workload generations must never be collapsed into a namespace-wide maximum
+	// (a benign observability change to one class would otherwise reject every
+	// other class's pods against the global floor and deadlock activation). Use
+	// SecurityFloors, the per-component/shard/member floors, instead.
+	// +kubebuilder:validation:Minimum=0
+	MinAcceptableSecurityGeneration int64 `json:"minAcceptableSecurityGeneration,omitempty"`
+	// SecurityFloors are the PER-class/member security-generation floors sealed at
+	// activation: each protected pod is compared ONLY with the floor for its own
+	// component (postgresql/pooler/orchestrator) and, for members, its own
+	// shard+member. A pod stamped below its own floor is denied/blocked; a pod of
+	// another class at its own current generation is unaffected.
+	// +listType=atomic
+	SecurityFloors []IsolationSecurityFloor `json:"securityFloors,omitempty"`
+	// +kubebuilder:validation:Pattern=`^([0-9a-f]{64})?$`
+	ResidueProfileHash string `json:"residueProfileHash,omitempty"`
+	// DispatchTupleHash binds the receipt to the exact dispatch-convergence proof
+	// tuple {webhook-config resourceVersion, backend EndpointSlice addresses and
+	// their resourceVersions}. Any change to the tuple during activation
+	// invalidates the in-progress proof and forces re-enumeration + re-proof; the
+	// receipt is never advanced under a stale tuple.
+	// +kubebuilder:validation:Pattern=`^([0-9a-f]{64})?$`
+	DispatchTupleHash string `json:"dispatchTupleHash,omitempty"`
+	// SealedParents are the exact protected-parent identities admission accepts
+	// as create parents during ACTIVATING_RECREATE.
+	// +listType=atomic
+	SealedParents []SealedParent `json:"sealedParents,omitempty"`
+	// RecreatePendingUIDs are the pre-guard protected pod UIDs sealed at the
+	// entry to ACTIVATING_RECREATE. Every one must be deleted (and its guarded
+	// replacement created) before ACTIVE; this replaces CreationTimestamp
+	// inference so no pod is authenticated by when it was created.
+	// +listType=atomic
+	RecreatePendingUIDs []string    `json:"recreatePendingUIDs,omitempty"`
+	ActivatedAt         metav1.Time `json:"activatedAt,omitempty"`
+}
+
+// IsolationActivationAnnotation is the opt-in trigger for per-namespace isolation
+// activation. It is absent by default, so a cluster never activates unless an
+// operator explicitly requests it; existing clusters and the KIND smoke are
+// unaffected. Activation additionally requires the build to permit it and the
+// full preflight (supported minor, controller-identity, dispatch-convergence) to
+// pass.
+const IsolationActivationAnnotation = "pgshard.io/activate-isolation"
+
+// IsolationActivationRequested is the annotation value that opts a cluster into
+// activation.
+const IsolationActivationRequested = "requested"
+
+// SealedParent is one protected parent workload sealed into the isolation
+// receipt at its exact API incarnation and contract hash.
+type SealedParent struct {
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+	// +kubebuilder:validation:MinLength=1
+	UID             string `json:"uid"`
+	ResourceVersion string `json:"resourceVersion,omitempty"`
+	// Generation is the parent's spec incarnation (metadata.generation) at seal
+	// time. Unlike resourceVersion it never moves on status writes, so admission
+	// and the drift detector bind to it together with the contract hash.
+	// +kubebuilder:validation:Minimum=0
+	Generation int64 `json:"generation,omitempty"`
+	// Replicas is the parent's desired pod cardinality at seal time: the guarded
+	// replacement set RECREATE must prove exists (all valid) before ACTIVE.
+	// +kubebuilder:validation:Minimum=0
+	Replicas int32 `json:"replicas,omitempty"`
+	// +kubebuilder:validation:Pattern=`^([0-9a-f]{64})?$`
+	ContractHash string `json:"contractHash,omitempty"`
+}
+
+// IsolationSecurityFloor is one protected class/member's minimum admissible
+// security generation, sealed at activation. Members are keyed by
+// component=postgresql + shard + member; supporting workloads by
+// component=pooler/orchestrator (shard/member 0).
+type IsolationSecurityFloor struct {
+	// +kubebuilder:validation:Enum=postgresql;pooler;orchestrator
+	Component string `json:"component"`
+	// +kubebuilder:validation:Minimum=0
+	Shard int32 `json:"shard,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	Member int32 `json:"member,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	MinGeneration int64 `json:"minGeneration"`
+}
+
+// SecurityFloorFor returns the sealed minimum admissible security generation for
+// a pod's own class/member, or 0 when no floor applies. Members match on
+// component=postgresql AND shard AND member; supporting workloads match on
+// component alone. It NEVER returns a namespace-wide maximum — each pod is
+// compared only with its own class/member floor.
+func (r *PostgreSQLIsolationReceipt) SecurityFloorFor(component string, shard, member int32) int64 {
+	if r == nil {
+		return 0
+	}
+	for i := range r.SecurityFloors {
+		floor := &r.SecurityFloors[i]
+		if floor.Component != component {
+			continue
+		}
+		if component == "postgresql" && (floor.Shard != shard || floor.Member != member) {
+			continue
+		}
+		return floor.MinGeneration
+	}
+	return 0
+}
+
+// PostgreSQLMemberContractStatus binds one member StatefulSet's pod-template
+// contract hash to its stable physical identity and the security generation it
+// was stamped at.
+type PostgreSQLMemberContractStatus struct {
+	// +kubebuilder:validation:Minimum=0
+	Shard int32 `json:"shard"`
+	// +kubebuilder:validation:Minimum=0
+	Member int32 `json:"member"`
+	// +kubebuilder:validation:Enum=source;standby;single-member
+	Class string `json:"class"`
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
+	ContractHash string `json:"contractHash"`
+	// SecurityContractHash digests ONLY the security-relevant surface of the pod
+	// template (image, security contexts, capabilities, service account, volumes
+	// and mounts, host-namespace flags, command/args) — never benign fields like
+	// env, resources, or annotations. The security generation is bumped only when
+	// THIS digest changes, so a benign observability/resource change rolls under
+	// normal bounded coexistence instead of forcing a revocation.
+	// +kubebuilder:validation:Pattern=`^([0-9a-f]{64})?$`
+	SecurityContractHash string `json:"securityContractHash,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	SecurityGeneration int64 `json:"securityGeneration"`
+}
+
+// SupportingContractStatus binds one supporting workload class's pod-template
+// contract hash to the security generation it was stamped at.
+type SupportingContractStatus struct {
+	// +kubebuilder:validation:Enum=pooler;orchestrator
+	Class string `json:"class"`
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
+	ContractHash string `json:"contractHash"`
+	// SecurityContractHash digests only the security-relevant template surface;
+	// see PostgreSQLMemberContractStatus.SecurityContractHash.
+	// +kubebuilder:validation:Pattern=`^([0-9a-f]{64})?$`
+	SecurityContractHash string `json:"securityContractHash,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	SecurityGeneration int64 `json:"securityGeneration"`
+}
+
+// SupportingGenerationStatus is the sealed compare-and-set record for one
+// supporting workload class. CurrentReplicaSetUID and PriorReplicaSetUID are the
+// only ReplicaSet generations whose pods admission accepts; a security roll
+// advances MinGenerationForNewCreates so a prior (lower) generation is denied for
+// new creates the instant the barrier is persisted, before the prior ReplicaSet
+// is drained. PriorReplicaSetUID is cleared only once the prior generation is
+// proven fully converged (drained to zero live pods).
+type SupportingGenerationStatus struct {
+	// +kubebuilder:validation:Enum=pooler;orchestrator
+	Class string `json:"class"`
+	// DeploymentUID is the owning Deployment's UID; a change means the Deployment
+	// was recreated and the record must be rebuilt from scratch.
+	DeploymentUID string `json:"deploymentUID,omitempty"`
+	// CurrentReplicaSetUID is the live ReplicaSet whose template carries
+	// CurrentContractHash. Empty until the first Bind.
+	CurrentReplicaSetUID string `json:"currentReplicaSetUID,omitempty"`
+	// CurrentTemplateGeneration is the security generation the current template
+	// was stamped at.
+	// +kubebuilder:validation:Minimum=0
+	CurrentTemplateGeneration int64 `json:"currentTemplateGeneration,omitempty"`
+	// +kubebuilder:validation:Pattern=`^([0-9a-f]{64})?$`
+	CurrentContractHash string `json:"currentContractHash,omitempty"`
+	// PriorReplicaSetUID is the previous generation's ReplicaSet, still admissible
+	// during a bounded rollout; cleared on convergence.
+	PriorReplicaSetUID string `json:"priorReplicaSetUID,omitempty"`
+	// +kubebuilder:validation:Pattern=`^([0-9a-f]{64})?$`
+	PriorContractHash string `json:"priorContractHash,omitempty"`
+	// PriorRevoked removes the prior ReplicaSet from the admissible set for NEW
+	// creates while it is still being drained. It is set durably BEFORE the drain
+	// so admission stops accepting new prior-generation pods before any zero-pod
+	// proof, closing the race where a new prior pod is created between the final
+	// zero LIST and the status clear.
+	PriorRevoked bool `json:"priorRevoked,omitempty"`
+	// MinGenerationForNewCreates is the security-generation floor: a pod stamped
+	// below it is denied for new creates and, if it lands, is a late write to be
+	// deleted before convergence.
+	// +kubebuilder:validation:Minimum=0
+	MinGenerationForNewCreates int64 `json:"minGenerationForNewCreates,omitempty"`
+	// ConvergedGeneration is the highest security generation proven fully drained.
+	// +kubebuilder:validation:Minimum=0
+	ConvergedGeneration int64 `json:"convergedGeneration,omitempty"`
+	// SealedAt is when this record was last authoritatively written; the prior
+	// generation's drain timer is measured from it.
+	SealedAt metav1.Time `json:"sealedAt,omitempty"`
 }
 
 // CatalogActivationCarrierStatus binds the activation carrier's deterministic
@@ -455,6 +728,50 @@ type PostgreSQLReplicationCredentialStatus struct {
 	MaterialSHA256 string `json:"materialSHA256,omitempty"`
 }
 
+// PostgreSQLReplicationTLSMemberStatus binds one shard member to a staged
+// server-certificate Secret. SecretUID is checkpointed while the Secret is
+// still empty; ServerSHA256 and NotAfter appear only after the same UID holds
+// immutable material issued by the shard's checkpointed CA.
+type PostgreSQLReplicationTLSMemberStatus struct {
+	// Member is a stable physical identity, never a mutable PostgreSQL role.
+	// +kubebuilder:validation:Minimum=0
+	Member int32 `json:"member"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	SecretName string `json:"secretName"`
+	// SecretUID is empty only before the empty Secret identity is observed.
+	SecretUID types.UID `json:"secretUID,omitempty"`
+	// ServerSHA256 binds the exact server certificate and private-key
+	// projection to the checkpointed creation result.
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
+	ServerSHA256 string `json:"serverSHA256,omitempty"`
+	// NotAfter records the server certificate expiry.
+	NotAfter metav1.Time `json:"notAfter,omitempty"`
+}
+
+// PostgreSQLReplicationTLSStatus binds one shard to a staged replication CA
+// and its per-member server certificates. The CA digest is checkpointed only
+// after every member Secret holds validated immutable material.
+type PostgreSQLReplicationTLSStatus struct {
+	// +kubebuilder:validation:Minimum=0
+	Shard int32 `json:"shard"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	CASecretName string `json:"caSecretName"`
+	// CASecretUID is empty only before the empty Secret identity is observed.
+	CASecretUID types.UID `json:"caSecretUID,omitempty"`
+	// CASHA256 binds the exact CA certificate projection to the checkpointed
+	// creation result.
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
+	CASHA256 string `json:"caSHA256,omitempty"`
+	// RenewalDeadline is the moment the operator starts refusing this material
+	// instead of pretending it can rotate certificates without a restart.
+	RenewalDeadline metav1.Time `json:"renewalDeadline,omitempty"`
+	// +listType=map
+	// +listMapKey=member
+	Members []PostgreSQLReplicationTLSMemberStatus `json:"members,omitempty"`
+}
+
 // PostgreSQLWritableLeaseStatus pins one physical cell's writable-term Lease
 // to its API-assigned identity. The name is deterministic and role-neutral;
 // LeaseUID distinguishes deletion and recreation under that same name.
@@ -486,6 +803,12 @@ type CatalogAccessStatus struct {
 	ServerSHA256 string `json:"serverSHA256,omitempty"`
 }
 
+// ReplicationTransportPolicyServerTLSV1 marks a multi-member cluster whose
+// physical replication was born strictly server-authenticated: the operator
+// stages the replication CA and per-member server certificates and every
+// standby client hop requires verify-full TLS.
+const ReplicationTransportPolicyServerTLSV1 = "server-tls-v1"
+
 // PostgreSQLBootstrapSpecStatus is the provisioned data-plane contract. The
 // runtime is checkpointed before any credential or data volume is created so
 // deleted workload objects cannot erase the selected process composition.
@@ -495,6 +818,13 @@ type PostgreSQLBootstrapSpecStatus struct {
 	Durability      DurabilityMode `json:"durability"`
 	// +kubebuilder:validation:Enum=direct;agent-quarantine
 	PostgreSQLRuntime string `json:"postgresqlRuntime,omitempty"`
+	// ReplicationTransportPolicy is stamped only when the bootstrap contract is
+	// first recorded. Clusters provisioned before replication TLS existed have
+	// no marker and are deliberately left untouched: they receive no TLS
+	// Secrets and no workload-template change, and their physical replication
+	// stays cleartext until the cluster is recreated under a marked contract.
+	// +kubebuilder:validation:Enum=server-tls-v1
+	ReplicationTransportPolicy string `json:"replicationTransportPolicy,omitempty"`
 	// DatabaseTopologySHA256 binds provisioned storage to the complete resolved
 	// immutable logical-database genesis topology. It is omitted only on status
 	// written by releases that predate database-scoped genesis.
