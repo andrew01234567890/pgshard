@@ -193,6 +193,20 @@ const STANDBY_IDENTITY_OBSERVATION: &str = "\
 const STANDBY_WAL_OBSERVATION: &str = "\
     SELECT pg_catalog.pg_last_wal_receive_lsn()::text, \
            pg_catalog.pg_last_wal_replay_lsn()::text";
+/// The fence transaction is deliberately idle while another connection does the
+/// guarded work, so it must not carry the evidence settings: those make the
+/// transaction READ ONLY, which `PostgreSQL` rejects for a row-locking SELECT,
+/// and impose idle and transaction timeouts that would terminate the backend
+/// mid-window — releasing every lock while the caller still believed it held
+/// them. The caller bounds the window instead.
+const FENCE_TRANSACTION_SETTINGS: &str = "\
+    SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE;\
+    SET LOCAL search_path = pg_catalog;\
+    SET LOCAL lock_timeout = '5s';\
+    SET LOCAL statement_timeout = 0;\
+    SET LOCAL transaction_timeout = 0;\
+    SET LOCAL idle_in_transaction_session_timeout = 0;";
+
 const EVIDENCE_TRANSACTION_SETTINGS: &str = "\
     SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;\
     SET LOCAL search_path = pg_catalog;\
@@ -389,7 +403,7 @@ impl GenerationFence {
     ) -> Result<(), PostgresGenerationError> {
         let client = &self.connection.client;
         client.batch_execute("BEGIN").await?;
-        client.batch_execute(EVIDENCE_TRANSACTION_SETTINGS).await?;
+        client.batch_execute(FENCE_TRANSACTION_SETTINGS).await?;
         // The same lock publication takes, so a publication attempt blocks
         // behind this transaction instead of racing it.
         client.batch_execute(LOCK_GENERATION_TABLE).await?;
@@ -401,9 +415,30 @@ impl GenerationFence {
         Ok(())
     }
 
-    /// Releases the held lock. Call only after the guarded commit has returned.
-    pub(crate) async fn release(self) {
-        let _ = self.connection.client.batch_execute("ROLLBACK").await;
+    /// Releases the held locks, and reports whether the fence was still alive.
+    ///
+    /// Call only after the guarded commit has returned. A fence that died — a
+    /// terminated backend, a lost connection — released its locks early, so the
+    /// guarded work ran unfenced and the caller must not treat it as proven.
+    pub(crate) async fn release(self) -> Result<(), PostgresGenerationError> {
+        if *self.connection.driver_ended.borrow() {
+            return Err(PostgresGenerationError::GenerationFenceLost);
+        }
+        self.connection
+            .client
+            .batch_execute("ROLLBACK")
+            .await
+            .map_err(|_| PostgresGenerationError::GenerationFenceLost)
+    }
+
+    /// Resolves if the fence stops holding its locks.
+    pub(crate) async fn lost(&self) {
+        let mut driver_ended = self.connection.driver_ended.clone();
+        while !*driver_ended.borrow() {
+            if driver_ended.changed().await.is_err() {
+                return;
+            }
+        }
     }
 }
 
@@ -1406,6 +1441,9 @@ pub enum PostgresGenerationError {
     /// The catalog writer session did not report the pinned string mode.
     #[error("PostgreSQL catalog writer session settings are not exact")]
     InvalidCatalogWriterSettings,
+    /// The generation fence stopped holding its locks before the guarded commit.
+    #[error("PostgreSQL generation fence was lost before the guarded commit")]
+    GenerationFenceLost,
     /// The durable row is not the canonical bounded generation encoding.
     #[error("PostgreSQL writable-generation row is malformed")]
     MalformedGeneration,

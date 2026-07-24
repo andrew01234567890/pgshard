@@ -33,7 +33,18 @@ const SET_ALLOW_EMPTY_DATABASE_TOPOLOGY: &str =
 const APPLY_TRANSACTION_SETTINGS: &str = "\
     SET TRANSACTION ISOLATION LEVEL READ COMMITTED;\
     SET LOCAL search_path = pg_catalog;\
-    SET LOCAL lock_timeout = '5s';";
+    SET LOCAL lock_timeout = '5s';\
+    SET LOCAL statement_timeout = '60s';\
+    SET LOCAL transaction_timeout = '120s';\
+    SET LOCAL idle_in_transaction_session_timeout = '30s';";
+
+/// The self-framed migration brings its own transaction, so the executor pins
+/// the session bounds before applying it. Unbounded work here would hold the
+/// fence — and therefore block generation publication — indefinitely.
+const MIGRATION_SESSION_BOUNDS: &str = "\
+    SET statement_timeout = '120s';\
+    SET transaction_timeout = '300s';\
+    SET idle_in_transaction_session_timeout = '30s';";
 
 /// Applies one verified program to the catalog database, exactly once per call.
 ///
@@ -128,9 +139,16 @@ where
     // committing are on different databases and so cannot share a transaction;
     // the fence is what stops a new generation being published in between.
     let fence = GenerationFence::hold(socket_dir, expected_generation).await?;
-    let outcome = apply(writer, authority_exact, step).await;
-    fence.release().await;
-    outcome
+    // A fence that dies has released its locks, so the guarded work is no
+    // longer fenced and must not be allowed to reach its commit.
+    let outcome = tokio::select! {
+        outcome = apply(writer, authority_exact, step) => outcome,
+        () = fence.lost() => Err(PostgresGenerationError::GenerationFenceLost),
+    };
+    // Reported even when the work failed: a lost fence means the guarantee was
+    // absent, which the caller must not confuse with a clean failure.
+    let released = fence.release().await;
+    outcome.and(released)
 }
 
 async fn apply<F>(
@@ -144,6 +162,7 @@ where
     let client = writer.client();
     match step {
         Step::SelfFramed(sql) => {
+            client.batch_execute(MIGRATION_SESSION_BOUNDS).await?;
             if !authority_exact() {
                 return Err(PostgresGenerationError::AuthorityChanged);
             }
