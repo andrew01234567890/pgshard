@@ -23,6 +23,10 @@ use thiserror::Error;
 )]
 pub(crate) struct CatalogMaterializationProgram {
     pub(crate) migration: Box<str>,
+    /// The migration's statements without its own `BEGIN`/`COMMIT`, so an
+    /// executor can frame them and place its authority check immediately before
+    /// the commit. Still a verbatim slice of the same digest-verified snapshot.
+    pub(crate) migration_body: Box<str>,
     pub(crate) inventory: Box<str>,
     pub(crate) preflight: Box<str>,
     pub(crate) genesis: Box<str>,
@@ -36,12 +40,13 @@ pub(crate) fn compile_catalog_materialization_program(
     genesis: &[u8],
     preflight: &[u8],
 ) -> Result<CatalogMaterializationProgram, CatalogMaterializationProgramError> {
-    let migration = scan("migration", migration, Envelope::SelfFramed)?;
+    let (migration, migration_body) = scan_self_framed("migration", migration)?;
     let inventory = scan("inventory", inventory, Envelope::CallerFramed)?;
     let genesis = scan("genesis", genesis, Envelope::CallerFramed)?;
     let preflight = scan("preflight", preflight, Envelope::CallerFramed)?;
     Ok(CatalogMaterializationProgram {
         migration: migration.into(),
+        migration_body: migration_body.into(),
         inventory: inventory.into(),
         preflight: preflight.into(),
         genesis: genesis.into(),
@@ -65,12 +70,36 @@ fn scan<'a>(
     bytes: &'a [u8],
     envelope: Envelope,
 ) -> Result<&'a str, CatalogMaterializationProgramError> {
+    let (sql, _) = scan_with_body(name, bytes, envelope)?;
+    Ok(sql)
+}
+
+/// Scans a self-framed input and additionally returns its body: everything
+/// between its own `BEGIN` and its terminal `COMMIT`.
+fn scan_self_framed<'a>(
+    name: &'static str,
+    bytes: &'a [u8],
+) -> Result<(&'a str, &'a str), CatalogMaterializationProgramError> {
+    let (sql, body) = scan_with_body(name, bytes, Envelope::SelfFramed)?;
+    let body = body.ok_or_else(|| invalid_shape(name))?;
+    Ok((sql, body))
+}
+
+fn scan_with_body<'a>(
+    name: &'static str,
+    bytes: &'a [u8],
+    envelope: Envelope,
+) -> Result<(&'a str, Option<&'a str>), CatalogMaterializationProgramError> {
     let sql = str::from_utf8(bytes).map_err(|_| invalid_shape(name))?;
     if sql.contains(['\0', '\r']) || !sql.ends_with('\n') {
         return Err(invalid_shape(name));
     }
-    Scanner::new(name, sql.as_bytes()).run(envelope)?;
-    Ok(sql)
+    let body = Scanner::new(name, sql.as_bytes()).run(envelope)?;
+    let body = match body {
+        Some((start, end)) => Some(sql.get(start..end).ok_or_else(|| invalid_shape(name))?),
+        None => None,
+    };
+    Ok((sql, body))
 }
 
 /// Lexical states mirroring `psqlscan.l`. `psql` only interprets `\` and
@@ -137,7 +166,12 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    fn run(mut self, envelope: Envelope) -> Result<(), CatalogMaterializationProgramError> {
+    /// Returns the byte range between the framing statements for a self-framed
+    /// input.
+    fn run(
+        mut self,
+        envelope: Envelope,
+    ) -> Result<Option<(usize, usize)>, CatalogMaterializationProgramError> {
         let mut state = State::Initial;
         while self.pos < self.input.len() {
             state = match state {
@@ -159,7 +193,18 @@ impl<'a> Scanner<'a> {
         }
         self.statements
             .finish(envelope)
-            .map_err(|()| invalid_shape(self.name))
+            .map_err(|()| invalid_shape(self.name))?;
+        Ok(match envelope {
+            Envelope::SelfFramed => Some((
+                self.statements
+                    .first_statement_end
+                    .ok_or_else(|| invalid_shape(self.name))?,
+                self.statements
+                    .last_statement_start
+                    .ok_or_else(|| invalid_shape(self.name))?,
+            )),
+            Envelope::CallerFramed => None,
+        })
     }
 
     fn reject(&self) -> CatalogMaterializationProgramError {
@@ -172,6 +217,7 @@ impl<'a> Scanner<'a> {
 
     fn step_initial(&mut self) -> Result<State, CatalogMaterializationProgramError> {
         let byte = self.input[self.pos];
+        let start = self.pos;
         match byte {
             b' ' | b'\t' | b'\n' => {
                 self.pos += 1;
@@ -179,7 +225,7 @@ impl<'a> Scanner<'a> {
             }
             b';' => {
                 self.pos += 1;
-                self.statements.end_statement();
+                self.statements.end_statement(self.pos);
                 Ok(State::Initial)
             }
             b'\\' => Err(self.reject()),
@@ -193,19 +239,19 @@ impl<'a> Scanner<'a> {
             }
             b'\'' => {
                 self.pos += 1;
-                self.statements.other_token();
+                self.statements.other_token(start);
                 Ok(State::OrdinaryString)
             }
             b'"' => {
                 self.pos += 1;
-                self.statements.other_token();
+                self.statements.other_token(start);
                 Ok(State::QuotedIdentifier)
             }
             b'$' => Ok(self.classify_dollar()),
             b':' => self.classify_colon(),
             b'0'..=b'9' => {
                 self.consume_number()?;
-                self.statements.other_token();
+                self.statements.other_token(start);
                 Ok(State::Initial)
             }
             _ if is_identifier_start(byte) => Ok(self.classify_word()),
@@ -216,7 +262,7 @@ impl<'a> Scanner<'a> {
             0x00..=0x1f | 0x7f => Err(self.reject()),
             _ => {
                 self.pos += 1;
-                self.statements.other_token();
+                self.statements.other_token(start);
                 Ok(State::Initial)
             }
         }
@@ -228,34 +274,34 @@ impl<'a> Scanner<'a> {
     /// one identifier and never a dollar-quote opener.
     fn classify_word(&mut self) -> State {
         let byte = self.input[self.pos];
+        let start = self.pos;
         match byte {
             b'e' | b'E' if self.peek(1) == Some(b'\'') => {
                 self.pos += 2;
-                self.statements.other_token();
+                self.statements.other_token(start);
                 return State::EscapeString;
             }
             b'b' | b'B' | b'x' | b'X' if self.peek(1) == Some(b'\'') => {
                 self.pos += 2;
-                self.statements.other_token();
+                self.statements.other_token(start);
                 return State::OrdinaryString;
             }
             b'u' | b'U' if self.peek(1) == Some(b'&') && self.peek(2) == Some(b'\'') => {
                 self.pos += 3;
-                self.statements.other_token();
+                self.statements.other_token(start);
                 return State::UnicodeString;
             }
             b'u' | b'U' if self.peek(1) == Some(b'&') && self.peek(2) == Some(b'"') => {
                 self.pos += 3;
-                self.statements.other_token();
+                self.statements.other_token(start);
                 return State::UnicodeIdentifier;
             }
             _ => {}
         }
-        let start = self.pos;
         while self.peek(0).is_some_and(is_identifier_continuation) {
             self.pos += 1;
         }
-        self.statements.word(&self.input[start..self.pos]);
+        self.statements.word(&self.input[start..self.pos], start);
         State::Initial
     }
 
@@ -357,6 +403,7 @@ impl<'a> Scanner<'a> {
     }
 
     fn classify_dollar(&mut self) -> State {
+        let start = self.pos;
         let mut end = self.pos + 1;
         if self
             .input
@@ -378,27 +425,28 @@ impl<'a> Scanner<'a> {
             let tag_start = self.pos + 1;
             let tag_len = end - tag_start;
             self.pos = end + 1;
-            self.statements.other_token();
+            self.statements.other_token(start);
             State::DollarBody { tag_start, tag_len }
         } else {
             self.pos += 1;
-            self.statements.other_token();
+            self.statements.other_token(start);
             State::Initial
         }
     }
 
     fn classify_colon(&mut self) -> Result<State, CatalogMaterializationProgramError> {
+        let start = self.pos;
         match self.peek(1) {
             Some(b':' | b'=') => {
                 self.pos += 2;
-                self.statements.other_token();
+                self.statements.other_token(start);
                 Ok(State::Initial)
             }
             Some(b'\'' | b'"' | b'{') => Err(self.reject()),
             Some(byte) if is_variable_char(byte) => Err(self.reject()),
             _ => {
                 self.pos += 1;
-                self.statements.other_token();
+                self.statements.other_token(start);
                 Ok(State::Initial)
             }
         }
@@ -589,10 +637,15 @@ struct ClosedStatement {
 struct StatementAccounting {
     current_leading: Option<Leading>,
     current_tokens: u32,
+    current_start: Option<usize>,
     first_leading: Option<Leading>,
     control_statements: u32,
     executable_statements: u32,
     last_closed: Option<ClosedStatement>,
+    /// Byte offset just past the first statement's terminator.
+    first_statement_end: Option<usize>,
+    /// Byte offset of the last statement's first token.
+    last_statement_start: Option<usize>,
 }
 
 impl StatementAccounting {
@@ -600,15 +653,19 @@ impl StatementAccounting {
         Self {
             current_leading: None,
             current_tokens: 0,
+            current_start: None,
             first_leading: None,
             control_statements: 0,
             executable_statements: 0,
             last_closed: None,
+            first_statement_end: None,
+            last_statement_start: None,
         }
     }
 
-    fn word(&mut self, word: &[u8]) {
+    fn word(&mut self, word: &[u8], start: usize) {
         if self.current_tokens == 0 {
+            self.current_start = Some(start);
             self.current_leading = Some(match ControlKeyword::classify(word) {
                 Some(control) => Leading::Control(control),
                 None => Leading::Other,
@@ -617,18 +674,24 @@ impl StatementAccounting {
         self.current_tokens = self.current_tokens.saturating_add(1);
     }
 
-    fn other_token(&mut self) {
+    fn other_token(&mut self, start: usize) {
         if self.current_tokens == 0 {
+            self.current_start = Some(start);
             self.current_leading = Some(Leading::Other);
         }
         self.current_tokens = self.current_tokens.saturating_add(1);
     }
 
-    fn end_statement(&mut self) {
+    fn end_statement(&mut self, end: usize) {
+        let start = self.current_start.take();
         let Some(leading) = self.current_leading.take() else {
             self.current_tokens = 0;
             return;
         };
+        if self.first_statement_end.is_none() {
+            self.first_statement_end = Some(end);
+        }
+        self.last_statement_start = start;
         self.executable_statements = self.executable_statements.saturating_add(1);
         if self.first_leading.is_none() {
             self.first_leading = Some(leading);
@@ -910,6 +973,43 @@ mod tests {
         assert_rejects_caller_framed("SELECT 1E'\\' ; \\echo pwned ; ';\n");
         assert_rejects_caller_framed("SELECT junk1e'\\' ; \\echo pwned ; ';\n");
         assert_rejects_caller_framed("SELECT 1x'\\' ; \\echo pwned ; ';\n");
+    }
+
+    #[test]
+    fn the_migration_body_is_the_verified_bytes_without_its_own_framing() {
+        // The executor applies the body caller-framed so it can observe
+        // authority immediately before the commit. The body must therefore be a
+        // verbatim slice of the same verified snapshot, carrying no framing of
+        // its own — otherwise the digest no longer covers what executes.
+        let program = compile(MIGRATION, INVENTORY, GENESIS, PREFLIGHT).expect("program");
+        assert!(MIGRATION.contains(&*program.migration_body));
+        assert!(!program.migration_body.contains("BEGIN"));
+        assert!(!program.migration_body.contains("COMMIT"));
+        assert_eq!(&*program.migration, MIGRATION);
+        // And it is itself accepted as caller-framed, which is how it is run.
+        assert_accepts_caller_framed(&program.migration_body);
+    }
+
+    #[test]
+    fn the_real_migration_body_excludes_only_its_framing() {
+        let migration = include_bytes!("../../pgshard-catalog/migrations/0001_shardschema.sql");
+        let inventory = include_bytes!("../../pgshard-catalog/inventory/0001_shard_inventory.sql");
+        let genesis =
+            include_str!("../../pgshard-catalog/testdata/materialization/genesis.golden.sql");
+        let preflight =
+            include_str!("../../pgshard-catalog/testdata/materialization/preflight.golden.sql");
+        let program = compile_catalog_materialization_program(
+            migration,
+            inventory,
+            genesis.as_bytes(),
+            preflight.as_bytes(),
+        )
+        .expect("real inputs compile");
+        let whole = str::from_utf8(migration).expect("utf-8 migration");
+        assert!(whole.contains(&*program.migration_body));
+        assert!(whole.starts_with("BEGIN;"));
+        assert!(!program.migration_body.starts_with("BEGIN;"));
+        assert!(program.migration_body.len() + "BEGIN;".len() + "COMMIT;".len() <= whole.len());
     }
 
     #[test]

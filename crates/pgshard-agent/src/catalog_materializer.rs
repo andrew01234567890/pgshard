@@ -38,14 +38,6 @@ const APPLY_TRANSACTION_SETTINGS: &str = "\
     SET LOCAL transaction_timeout = '120s';\
     SET LOCAL idle_in_transaction_session_timeout = '30s';";
 
-/// The self-framed migration brings its own transaction, so the executor pins
-/// the session bounds before applying it. Unbounded work here would hold the
-/// fence — and therefore block generation publication — indefinitely.
-const MIGRATION_SESSION_BOUNDS: &str = "\
-    SET statement_timeout = '120s';\
-    SET transaction_timeout = '300s';\
-    SET idle_in_transaction_session_timeout = '30s';";
-
 /// Applies one verified program to the catalog database, exactly once per call.
 ///
 /// `authority_exact` reports whether the attempt-private writable authority
@@ -71,16 +63,20 @@ where
         "false"
     };
 
-    // The migration frames its own transaction, so the executor cannot place a
-    // check before that commit. The fence supplies the equivalent guarantee
-    // from the other side: publication cannot proceed while it is held, so no
-    // generation can change across the migration's commit.
+    // Applied caller-framed from the verified body, not as the self-framed
+    // file: an input that commits on its own leaves no point at which the
+    // executor can observe authority, so the migration could commit after the
+    // attempt's authority had been revoked. The body is the same
+    // digest-verified bytes with its own framing statements excluded.
     apply_fenced(
         socket_dir,
         &mut writer,
         expected_generation,
         authority_exact,
-        Step::SelfFramed(&program.migration),
+        Step::CallerFramed {
+            scalar: None,
+            fragments: &[&program.migration_body],
+        },
     )
     .await?;
 
@@ -113,8 +109,6 @@ where
 }
 
 enum Step<'a> {
-    /// Applied as-is; the fragment owns its transaction.
-    SelfFramed(&'a str),
     /// The executor owns the transaction and binds the scalar the fragments read.
     CallerFramed {
         scalar: Option<(&'static str, &'a str)>,
@@ -161,14 +155,6 @@ where
 {
     let client = writer.client();
     match step {
-        Step::SelfFramed(sql) => {
-            client.batch_execute(MIGRATION_SESSION_BOUNDS).await?;
-            if !authority_exact() {
-                return Err(PostgresGenerationError::AuthorityChanged);
-            }
-            client.batch_execute(sql).await?;
-            Ok(())
-        }
         Step::CallerFramed { scalar, fragments } => {
             let transaction = client.transaction().await?;
             transaction
