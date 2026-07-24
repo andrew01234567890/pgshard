@@ -16,7 +16,10 @@
 use std::path::Path;
 
 use crate::catalog_materialization_program::CatalogMaterializationProgram;
-use crate::postgres_generation::{CatalogWriterSession, GenerationFence, PostgresGenerationError};
+use crate::postgres_generation::{
+    CatalogWriterSession, GenerationFence, OBSERVE_STANDARD_CONFORMING_STRINGS,
+    PostgresGenerationError,
+};
 use crate::writable::DurableWritableGeneration;
 
 /// Binds the sealed shard count into the inventory's expectation. The value is
@@ -33,6 +36,7 @@ const SET_ALLOW_EMPTY_DATABASE_TOPOLOGY: &str =
 const APPLY_TRANSACTION_SETTINGS: &str = "\
     SET TRANSACTION ISOLATION LEVEL READ COMMITTED;\
     SET LOCAL search_path = pg_catalog;\
+    SET LOCAL standard_conforming_strings = on;\
     SET LOCAL lock_timeout = '5s';\
     SET LOCAL statement_timeout = '60s';\
     SET LOCAL transaction_timeout = '120s';\
@@ -164,6 +168,17 @@ where
                 transaction.execute(statement, &[&value]).await?;
             }
             for fragment in fragments {
+                // Re-observed per fragment rather than once per session: the
+                // string mode decides where a quoted literal ends, and the
+                // compiler's proof assumed one answer. A fragment that changed
+                // it would silently move the boundary for the next one.
+                let observed: String = transaction
+                    .query_one(OBSERVE_STANDARD_CONFORMING_STRINGS, &[])
+                    .await?
+                    .try_get(0)?;
+                if observed != "on" {
+                    return Err(PostgresGenerationError::InvalidCatalogWriterSettings);
+                }
                 transaction.batch_execute(fragment).await?;
             }
             // No await or state-changing operation may be inserted between this

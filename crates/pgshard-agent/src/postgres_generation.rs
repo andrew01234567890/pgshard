@@ -442,7 +442,7 @@ impl GenerationFence {
     }
 }
 
-const OBSERVE_STANDARD_CONFORMING_STRINGS: &str =
+pub(crate) const OBSERVE_STANDARD_CONFORMING_STRINGS: &str =
     "SELECT pg_catalog.current_setting('standard_conforming_strings')";
 
 /// Connects over the fixed local peer-authenticated socket and observes an
