@@ -34,13 +34,22 @@ func TestGeneratedManagerRoleAuthorizesRuntimeControlPaths(t *testing.T) {
 		{group: "", resource: "serviceaccounts", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
 		{group: "coordination.k8s.io", resource: "leases", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
 		{group: "pgshard.io", resource: "pgshardcatalogactivations", verbs: []string{"create", "get", "list", "watch"}},
-		{group: "pgshard.io", resource: "pgshardcatalogactivations/status", verbs: []string{"update"}},
 		{group: "rbac.authorization.k8s.io", resource: "roles", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
 		{group: "rbac.authorization.k8s.io", resource: "rolebindings", verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
 		{group: "storage.k8s.io", resource: "storageclasses", verbs: []string{"list"}},
 	} {
 		if !roleAllows(role, required.group, required.resource, required.verbs) {
 			t.Errorf("manager role does not authorize %q %q with verbs %v", required.group, required.resource, required.verbs)
+		}
+	}
+	for _, forbidden := range []string{"delete", "patch", "update"} {
+		if roleAllows(role, "pgshard.io", "pgshardcatalogactivations", []string{forbidden}) {
+			t.Errorf("cluster-wide manager role grants forbidden PgShardCatalogActivation verb %q", forbidden)
+		}
+	}
+	for _, forbidden := range []string{"create", "delete", "get", "list", "patch", "update", "watch"} {
+		if roleAllows(role, "pgshard.io", "pgshardcatalogactivations/status", []string{forbidden}) {
+			t.Errorf("cluster-wide manager role grants forbidden PgShardCatalogActivation status verb %q", forbidden)
 		}
 	}
 	for _, forbidden := range []string{"list", "patch", "watch"} {
