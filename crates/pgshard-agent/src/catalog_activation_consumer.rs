@@ -2,9 +2,9 @@
 //!
 //! This module can durably acknowledge one exact request, but deliberately has
 //! no executor and no connection to `PostgreSQL`, readiness, serving, routing,
-//! SQL, fencing, or Lease authority. Capability publication is held separately
-//! from `/status` and is withdrawn whenever local recovery or an exact direct
-//! carrier read fails.
+//! SQL, fencing, or Lease authority. Capability publication and the private
+//! accepted-fingerprint handoff are held separately from `/status` and are
+//! withdrawn whenever local recovery or an exact direct carrier read fails.
 
 use std::fs::{self, File, Metadata};
 use std::future::Future;
@@ -167,6 +167,140 @@ pub enum CatalogActivationEndpointState {
     Available(Box<CatalogActivationCapability>),
 }
 
+/// Inert proof that one exact carrier acceptance is both locally durable and
+/// observed in the exact carrier status.
+///
+/// This value is move-only and non-serializable. It grants no SQL, serving,
+/// readiness, routing, fencing, Lease, process, or execution authority.
+#[must_use = "durably accepted catalog activation must be handled explicitly"]
+pub struct DurablyAcceptedCatalogActivation {
+    acceptance: DurableCatalogActivationAcceptance,
+    request: CatalogActivationRequest,
+}
+
+impl DurablyAcceptedCatalogActivation {
+    /// Returns the exact accepted carrier UID.
+    #[must_use]
+    pub fn carrier_uid(&self) -> &str {
+        self.acceptance.carrier_uid()
+    }
+
+    /// Returns the exact canonical request fingerprint.
+    #[must_use]
+    pub fn request_sha256(&self) -> &str {
+        self.acceptance.request_sha256()
+    }
+
+    /// Returns the exact accepted target Pod name.
+    #[must_use]
+    pub fn target_pod_name(&self) -> &str {
+        self.acceptance.target_pod_name()
+    }
+
+    /// Returns the exact accepted target Pod UID.
+    #[must_use]
+    pub fn target_pod_uid(&self) -> &str {
+        self.acceptance.target_pod_uid()
+    }
+
+    /// Returns the original diagnostic journal persistence time.
+    ///
+    /// This timestamp is not freshness or execution authority.
+    #[must_use]
+    pub fn persisted_at_unix_ms(&self) -> &str {
+        self.acceptance.persisted_at_unix_ms()
+    }
+
+    /// Returns the exact validated request sealed to this durable acceptance.
+    ///
+    /// The request remains crate-private so this proof cannot become a public
+    /// serialization or execution surface before a materializer boundary is
+    /// reviewed separately.
+    #[allow(
+        dead_code,
+        reason = "sealed input for the next dormant materializer slice"
+    )]
+    pub(crate) fn request(&self) -> &CatalogActivationRequest {
+        &self.request
+    }
+
+    fn from_observed_acceptance(
+        acceptance: DurableCatalogActivationAcceptance,
+        request: ValidatedRequest,
+        observed: &ValidatedObservedAcceptance,
+    ) -> Result<Self, CatalogActivationConsumerError> {
+        require_receipt(&acceptance, &observed.0)?;
+        Ok(Self {
+            acceptance,
+            request: request.request,
+        })
+    }
+}
+
+/// Opaque retained receiver for the private accepted-fingerprint watch.
+///
+/// There is intentionally no observer API yet: this slice only establishes a
+/// fail-closed handoff for a later dormant materializer composition.
+#[must_use = "dropping the catalog-activation handoff closes its private watch"]
+pub struct CatalogActivationHandoff {
+    receiver: watch::Receiver<Option<Arc<DurablyAcceptedCatalogActivation>>>,
+}
+
+impl CatalogActivationHandoff {
+    /// Moves the private receiver into the next dormant activation stage.
+    pub(crate) fn into_receiver(
+        self,
+    ) -> watch::Receiver<Option<Arc<DurablyAcceptedCatalogActivation>>> {
+        self.receiver
+    }
+}
+
+#[derive(Clone)]
+struct CatalogActivationHandoffPublisher {
+    sender: watch::Sender<Option<Arc<DurablyAcceptedCatalogActivation>>>,
+}
+
+impl CatalogActivationHandoffPublisher {
+    fn publish(&self, accepted: Option<Arc<DurablyAcceptedCatalogActivation>>) {
+        let unchanged = {
+            let current = self.sender.borrow();
+            match (current.as_deref(), accepted.as_deref()) {
+                (None, None) => true,
+                (Some(current), Some(next)) => exact_acceptance(current, next),
+                _ => false,
+            }
+        };
+        if unchanged {
+            return;
+        }
+        self.sender.send_replace(accepted);
+    }
+
+    fn withdraw(&self) {
+        self.publish(None);
+    }
+}
+
+fn exact_acceptance(
+    left: &DurablyAcceptedCatalogActivation,
+    right: &DurablyAcceptedCatalogActivation,
+) -> bool {
+    left.request == right.request
+        && left.carrier_uid() == right.carrier_uid()
+        && left.request_sha256() == right.request_sha256()
+        && left.target_pod_name() == right.target_pod_name()
+        && left.target_pod_uid() == right.target_pod_uid()
+        && left.persisted_at_unix_ms() == right.persisted_at_unix_ms()
+}
+
+fn catalog_activation_handoff() -> (CatalogActivationHandoffPublisher, CatalogActivationHandoff) {
+    let (sender, receiver) = watch::channel(None);
+    (
+        CatalogActivationHandoffPublisher { sender },
+        CatalogActivationHandoff { receiver },
+    )
+}
+
 impl CatalogActivationCapabilityState {
     /// Creates a state for a disabled endpoint.
     #[must_use]
@@ -224,14 +358,17 @@ pub fn spawn_catalog_activation_consumer(
     config: Option<CatalogActivationConsumerConfig>,
     capability: CatalogActivationCapabilityState,
     shutdown: watch::Receiver<bool>,
-) {
+) -> CatalogActivationHandoff {
+    let (handoff_publisher, handoff) = catalog_activation_handoff();
     let Some(config) = config else {
-        return;
+        return handoff;
     };
     tokio::spawn(async move {
         let _withdraw_on_exit = CapabilityWithdrawalGuard(capability.clone());
-        supervise(config, capability, shutdown).await;
+        let _withdraw_handoff_on_exit = HandoffWithdrawalGuard(handoff_publisher.clone());
+        supervise(config, capability, handoff_publisher, shutdown).await;
     });
+    handoff
 }
 
 struct CapabilityWithdrawalGuard(CatalogActivationCapabilityState);
@@ -242,15 +379,25 @@ impl Drop for CapabilityWithdrawalGuard {
     }
 }
 
+struct HandoffWithdrawalGuard(CatalogActivationHandoffPublisher);
+
+impl Drop for HandoffWithdrawalGuard {
+    fn drop(&mut self) {
+        self.0.withdraw();
+    }
+}
+
 async fn supervise(
     config: CatalogActivationConsumerConfig,
     capability: CatalogActivationCapabilityState,
+    handoff: CatalogActivationHandoffPublisher,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut retry = INITIAL_RETRY;
     while !*shutdown.borrow() {
         capability.unavailable();
-        match run_attempt(&config, &capability, &mut shutdown).await {
+        handoff.withdraw();
+        match run_attempt(&config, &capability, &handoff, &mut shutdown).await {
             Ok(()) => return,
             Err(error) => {
                 tracing::warn!(reason = %error, retry_after_ms = retry.as_millis(),
@@ -267,6 +414,7 @@ async fn supervise(
 async fn run_attempt(
     config: &CatalogActivationConsumerConfig,
     capability: &CatalogActivationCapabilityState,
+    handoff: &CatalogActivationHandoffPublisher,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<(), CatalogActivationConsumerError> {
     let journal_root = config.journal_root.clone();
@@ -285,12 +433,13 @@ async fn run_attempt(
         return Ok(());
     }
     let store = KubernetesCarrierStore::new(config)?;
-    run_reconcile_loop(config, capability, &store, journal, shutdown).await
+    run_reconcile_loop(config, capability, handoff, &store, journal, shutdown).await
 }
 
 async fn run_reconcile_loop<S: CarrierStore>(
     config: &CatalogActivationConsumerConfig,
     capability: &CatalogActivationCapabilityState,
+    handoff: &CatalogActivationHandoffPublisher,
     store: &S,
     mut journal: CatalogActivationJournal,
     shutdown: &mut watch::Receiver<bool>,
@@ -302,21 +451,25 @@ async fn run_reconcile_loop<S: CarrierStore>(
             return Ok(());
         };
         match result {
-            Ok((returned, response)) => {
+            Ok((returned, response, accepted)) => {
                 journal = returned;
                 if *shutdown.borrow() {
                     capability.unavailable();
+                    handoff.withdraw();
                     return Ok(());
                 }
+                handoff.publish(accepted);
                 capability.available(response);
             }
             Err(error) => {
                 capability.unavailable();
+                handoff.withdraw();
                 return Err(error);
             }
         }
         if wait_or_stop(shutdown, READY_POLL_INTERVAL).await {
             capability.unavailable();
+            handoff.withdraw();
             return Ok(());
         }
     }
@@ -326,12 +479,18 @@ async fn reconcile_once<S: CarrierStore>(
     config: &CatalogActivationConsumerConfig,
     store: &S,
     journal: CatalogActivationJournal,
-) -> Result<(CatalogActivationJournal, CatalogActivationCapability), CatalogActivationConsumerError>
-{
+) -> Result<
+    (
+        CatalogActivationJournal,
+        CatalogActivationCapability,
+        Option<Arc<DurablyAcceptedCatalogActivation>>,
+    ),
+    CatalogActivationConsumerError,
+> {
     let carrier = store.get().await?;
     let validated = validate_carrier(config, &carrier)?;
     let Some(request) = validated.request else {
-        return Ok((journal, config.capability()));
+        return Ok((journal, config.capability(), None));
     };
 
     if let Some(existing) = validated.acceptance {
@@ -347,8 +506,12 @@ async fn reconcile_once<S: CarrierStore>(
                 })
         })
         .await?;
-        require_receipt(&receipt, &existing)?;
-        return Ok((journal, config.capability()));
+        let current = store.get().await?;
+        let observed = validate_replaced_acceptance(config, &request, &existing, &current)?;
+        let accepted = DurablyAcceptedCatalogActivation::from_observed_acceptance(
+            receipt, request, &observed,
+        )?;
+        return Ok((journal, config.capability(), Some(Arc::new(accepted))));
     }
 
     let target = config.target();
@@ -359,7 +522,6 @@ async fn reconcile_once<S: CarrierStore>(
     })
     .await?;
     let acceptance = acceptance_from_receipt(&receipt);
-    drop(receipt);
 
     // Yield after the durable local barrier. The supervising biased shutdown
     // select observes cancellation before this task is polled again and before
@@ -369,19 +531,26 @@ async fn reconcile_once<S: CarrierStore>(
         .replace_status(&validated.resource_version, &acceptance)
         .await
     {
-        Ok(replaced) => {
-            validate_replaced_acceptance(config, &request, &acceptance, &replaced)?;
-            Ok((journal, config.capability()))
+        Ok(_) => {
+            // The replace response is not publication evidence. Re-read the
+            // exact live carrier after the local durability barrier and the
+            // successful write so deletion or mutation cannot leave a token.
+            tokio::task::yield_now().await;
+            let current = store.get().await?;
+            let observed = validate_replaced_acceptance(config, &request, &acceptance, &current)?;
+            let accepted = DurablyAcceptedCatalogActivation::from_observed_acceptance(
+                receipt, request, &observed,
+            )?;
+            Ok((journal, config.capability(), Some(Arc::new(accepted))))
         }
         Err(replace_error) => {
             // A timeout is outcome-unknown and a 409 means another writer won
             // the resourceVersion race. Resolve both only from a new exact GET.
             tokio::task::yield_now().await;
-            async {
+            let observed = async {
                 let current = store.get().await?;
                 validate_replaced_acceptance(config, &request, &acceptance, &current)
-                    .map_err(|error| CarrierStoreError::Validation(Box::new(error)))?;
-                Ok(())
+                    .map_err(|error| CarrierStoreError::Validation(Box::new(error)))
             }
             .await
             .map_err(|resolution| {
@@ -390,7 +559,10 @@ async fn reconcile_once<S: CarrierStore>(
                     resolution: Box::new(resolution),
                 }
             })?;
-            Ok((journal, config.capability()))
+            let accepted = DurablyAcceptedCatalogActivation::from_observed_acceptance(
+                receipt, request, &observed,
+            )?;
+            Ok((journal, config.capability(), Some(Arc::new(accepted))))
         }
     }
 }
@@ -474,6 +646,8 @@ struct ValidatedCarrier {
     request: Option<ValidatedRequest>,
     acceptance: Option<CatalogActivationAcceptance>,
 }
+
+struct ValidatedObservedAcceptance(CatalogActivationAcceptance);
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -584,7 +758,7 @@ fn validate_acceptance(
     config: &CatalogActivationConsumerConfig,
     request: &ValidatedRequest,
     acceptance: &CatalogActivationAcceptance,
-) -> Result<(), CatalogActivationConsumerError> {
+) -> Result<ValidatedObservedAcceptance, CatalogActivationConsumerError> {
     if acceptance.schema_version != CATALOG_ACTIVATION_ACCEPTANCE_VERSION
         || acceptance.carrier_uid != config.carrier_uid
         || acceptance.request_sha256 != request.declared_digest
@@ -595,7 +769,7 @@ fn validate_acceptance(
     {
         return Err(CatalogActivationConsumerError::InvalidCarrierAcceptance);
     }
-    Ok(())
+    Ok(ValidatedObservedAcceptance(acceptance.clone()))
 }
 
 fn validate_replaced_acceptance(
@@ -603,7 +777,7 @@ fn validate_replaced_acceptance(
     request: &ValidatedRequest,
     acceptance: &CatalogActivationAcceptance,
     carrier: &DynamicObject,
-) -> Result<(), CatalogActivationConsumerError> {
+) -> Result<ValidatedObservedAcceptance, CatalogActivationConsumerError> {
     let validated = validate_carrier(config, carrier)?;
     let returned_request = validated
         .request
@@ -720,6 +894,9 @@ enum CarrierStoreError {
     EncodeStatus(#[source] serde_json::Error),
     #[error("replacement carrier validation failed: {0}")]
     Validation(#[source] Box<CatalogActivationConsumerError>),
+    #[cfg(test)]
+    #[error("injected missing catalog-activation carrier")]
+    Missing,
 }
 
 /// Fail-closed consumer error. Every variant withdraws only this capability.
@@ -1004,11 +1181,11 @@ async fn complete_or_shutdown<F: Future>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::os::unix::fs::symlink;
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
     use pgshard_types::catalog_activation::{
@@ -1031,6 +1208,8 @@ mod tests {
     #[derive(Clone, Copy)]
     enum ReplaceMode {
         Success,
+        SuccessThenDivergentGet,
+        SuccessThenMissingGet,
         ConflictAfterInstall,
     }
 
@@ -1058,6 +1237,7 @@ mod tests {
     struct FakeStore {
         carrier: Mutex<DynamicObject>,
         replacements: AtomicUsize,
+        missing: AtomicBool,
         mode: ReplaceMode,
         get_pause: Option<Arc<TestPause>>,
         replace_pause: Option<Arc<TestPause>>,
@@ -1068,6 +1248,7 @@ mod tests {
             Self {
                 carrier: Mutex::new(carrier),
                 replacements: AtomicUsize::new(0),
+                missing: AtomicBool::new(false),
                 mode,
                 get_pause: None,
                 replace_pause: None,
@@ -1096,6 +1277,9 @@ mod tests {
             if let Some(pause) = &self.get_pause {
                 pause.wait().await;
             }
+            if self.missing.load(Ordering::SeqCst) {
+                return Err(CarrierStoreError::Missing);
+            }
             Ok(self.carrier.lock().expect("carrier lock").clone())
         }
 
@@ -1114,8 +1298,18 @@ mod tests {
             }
             carrier.data["status"] = serde_json::json!({"acceptance": acceptance});
             carrier.metadata.resource_version = Some("2".into());
+            let response = carrier.clone();
             match self.mode {
-                ReplaceMode::Success => Ok(carrier.clone()),
+                ReplaceMode::Success => Ok(response),
+                ReplaceMode::SuccessThenDivergentGet => {
+                    carrier.data["status"]["acceptance"]["requestSHA256"] =
+                        serde_json::json!("ff".repeat(32));
+                    Ok(response)
+                }
+                ReplaceMode::SuccessThenMissingGet => {
+                    self.missing.store(true, Ordering::SeqCst);
+                    Ok(response)
+                }
                 ReplaceMode::ConflictAfterInstall => Err(CarrierStoreError::Conflict),
             }
         }
@@ -1203,7 +1397,7 @@ mod tests {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn request() -> CatalogActivationRequest {
+    pub(crate) fn request() -> CatalogActivationRequest {
         CatalogActivationRequest {
             schema_version: CATALOG_ACTIVATION_REQUEST_VERSION.to_owned(),
             carrier: KubernetesObjectIdentity {
@@ -1323,6 +1517,51 @@ mod tests {
         }
     }
 
+    pub(crate) fn accepted(
+        request: CatalogActivationRequest,
+    ) -> Arc<DurablyAcceptedCatalogActivation> {
+        let acceptance = DurableCatalogActivationAcceptance::for_test(
+            request.carrier.uid.clone(),
+            request.sha256().expect("canonical request"),
+            request.source.pod_name.clone(),
+            request.source.pod_uid.clone(),
+        );
+        Arc::new(DurablyAcceptedCatalogActivation {
+            acceptance,
+            request,
+        })
+    }
+
+    pub(crate) fn handoff(
+        initial: Option<Arc<DurablyAcceptedCatalogActivation>>,
+    ) -> (
+        watch::Sender<Option<Arc<DurablyAcceptedCatalogActivation>>>,
+        CatalogActivationHandoff,
+    ) {
+        let (sender, receiver) = watch::channel(initial);
+        (sender, CatalogActivationHandoff { receiver })
+    }
+
+    async fn accepted_fixture(
+        root: &TempDir,
+    ) -> (
+        CatalogActivationConsumerConfig,
+        CatalogActivationJournal,
+        Arc<DurablyAcceptedCatalogActivation>,
+    ) {
+        let configuration = config(root);
+        let store = FakeStore::new(carrier(Some(request())), ReplaceMode::Success);
+        let journal = open_journal(&configuration);
+        let (journal, _, accepted) = reconcile_once(&configuration, &store, journal)
+            .await
+            .expect("persist and observe fixture acceptance");
+        (
+            configuration,
+            journal,
+            accepted.expect("fixture accepted handoff"),
+        )
+    }
+
     #[test]
     fn config_rejects_foreign_roles_names_and_paths() {
         let root = TempDir::new().expect("temporary root");
@@ -1404,12 +1643,16 @@ mod tests {
         let task_capability = capability.clone();
         let task_configuration = configuration.clone();
         let task_store = store.clone();
+        let (handoff_publisher, handoff) = catalog_activation_handoff();
+        let task_handoff = handoff_publisher.clone();
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
             let _withdraw_on_exit = CapabilityWithdrawalGuard(task_capability.clone());
+            let _withdraw_handoff_on_exit = HandoffWithdrawalGuard(task_handoff.clone());
             run_reconcile_loop(
                 &task_configuration,
                 &task_capability,
+                &task_handoff,
                 task_store.as_ref(),
                 journal,
                 &mut shutdown_rx,
@@ -1426,6 +1669,7 @@ mod tests {
             CatalogActivationEndpointState::Unavailable
         );
         assert_eq!(store.replacement_count(), 0);
+        assert!(handoff.receiver.borrow().is_none());
         assert!(
             fs::read_dir(configuration.journal_path())
                 .expect("journal directory")
@@ -1488,12 +1732,16 @@ mod tests {
         let task_capability = capability.clone();
         let task_configuration = configuration.clone();
         let task_store = store.clone();
+        let (handoff_publisher, handoff) = catalog_activation_handoff();
+        let task_handoff = handoff_publisher.clone();
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
             let _withdraw_on_exit = CapabilityWithdrawalGuard(task_capability.clone());
+            let _withdraw_handoff_on_exit = HandoffWithdrawalGuard(task_handoff.clone());
             run_reconcile_loop(
                 &task_configuration,
                 &task_capability,
+                &task_handoff,
                 task_store.as_ref(),
                 journal,
                 &mut shutdown_rx,
@@ -1514,6 +1762,7 @@ mod tests {
             0,
             "shutdown must cancel status replacement before the fake dispatch"
         );
+        assert!(handoff.receiver.borrow().is_none());
         assert!(configuration.journal_path().join("accepted").is_file());
     }
 
@@ -1589,10 +1838,11 @@ mod tests {
         let configuration = config(&root);
         let journal = open_journal(&configuration);
         let store = FakeStore::new(carrier(None), ReplaceMode::Success);
-        let (journal, response) = reconcile_once(&configuration, &store, journal)
+        let (journal, response, accepted) = reconcile_once(&configuration, &store, journal)
             .await
             .expect("empty exact carrier");
         assert_eq!(response, configuration.capability());
+        assert!(accepted.is_none());
         assert_eq!(store.replacement_count(), 0);
         drop(journal);
         let entries = fs::read_dir(configuration.journal_path())
@@ -1611,19 +1861,35 @@ mod tests {
         let configuration = config(&root);
         let store = FakeStore::new(carrier(Some(request())), ReplaceMode::Success);
         let journal = open_journal(&configuration);
-        let (journal, response) = reconcile_once(&configuration, &store, journal)
+        let exact_request = request();
+        let expected_digest = exact_request.sha256().expect("valid request digest");
+        let (journal, response, accepted) = reconcile_once(&configuration, &store, journal)
             .await
             .expect("persist and publish acceptance");
         assert_eq!(response, configuration.capability());
+        let accepted = accepted.expect("durably accepted handoff");
+        assert_eq!(accepted.request(), &exact_request);
+        assert_eq!(accepted.carrier_uid(), "carrier-uid");
+        assert_eq!(accepted.request_sha256(), expected_digest);
+        assert_eq!(accepted.target_pod_name(), "demo-shard-0000-0");
+        assert_eq!(accepted.target_pod_uid(), "source-pod-uid");
+        assert!(canonical_decimal(accepted.persisted_at_unix_ms()));
         assert_eq!(store.replacement_count(), 1);
         assert!(configuration.journal_path().join("prepared").is_file());
         assert!(configuration.journal_path().join("accepted").is_file());
         drop(journal);
 
         let restarted = open_journal(&configuration);
-        let (restarted, _) = reconcile_once(&configuration, &store, restarted)
+        let (restarted, _, replayed) = reconcile_once(&configuration, &store, restarted)
             .await
             .expect("restart resolves exact local accepted record");
+        let replayed = replayed.expect("replayed accepted handoff");
+        assert_eq!(replayed.request(), accepted.request());
+        assert_eq!(replayed.request_sha256(), accepted.request_sha256());
+        assert_eq!(
+            replayed.persisted_at_unix_ms(),
+            accepted.persisted_at_unix_ms()
+        );
         assert_eq!(
             store.replacement_count(),
             1,
@@ -1643,15 +1909,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn private_handoff_withdraws_on_missing_carrier_state_and_task_exit() {
+        let root = TempDir::new().expect("temporary root");
+        let configuration = config(&root);
+        let store = FakeStore::new(carrier(Some(request())), ReplaceMode::Success);
+        let journal = open_journal(&configuration);
+        let (journal, _, accepted) = reconcile_once(&configuration, &store, journal)
+            .await
+            .expect("persist and observe acceptance");
+        let accepted = accepted.expect("accepted handoff");
+        let (publisher, handoff) = catalog_activation_handoff();
+        publisher.publish(Some(Arc::clone(&accepted)));
+        assert!(handoff.receiver.borrow().is_some());
+
+        *store.carrier.lock().expect("carrier lock") = carrier(None);
+        let (_, _, missing) = reconcile_once(&configuration, &store, journal)
+            .await
+            .expect("observe missing request");
+        publisher.publish(missing);
+        assert!(handoff.receiver.borrow().is_none());
+
+        publisher.publish(Some(accepted));
+        {
+            let _withdraw_on_exit = HandoffWithdrawalGuard(publisher.clone());
+            assert!(handoff.receiver.borrow().is_some());
+        }
+        assert!(handoff.receiver.borrow().is_none());
+    }
+
+    #[tokio::test]
+    async fn successful_replace_with_divergent_fresh_get_withdraws_without_a_token() {
+        let root = TempDir::new().expect("temporary root");
+        let (configuration, journal, accepted) = accepted_fixture(&root).await;
+        let store = FakeStore::new(
+            carrier(Some(request())),
+            ReplaceMode::SuccessThenDivergentGet,
+        );
+        let capability = CatalogActivationCapabilityState::configured();
+        capability.available(configuration.capability());
+        let (publisher, handoff) = catalog_activation_handoff();
+        publisher.publish(Some(accepted));
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let result = run_reconcile_loop(
+            &configuration,
+            &capability,
+            &publisher,
+            &store,
+            journal,
+            &mut shutdown_rx,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(CatalogActivationConsumerError::InvalidCarrierAcceptance)
+        ));
+        assert_eq!(store.replacement_count(), 1);
+        assert!(handoff.receiver.borrow().is_none());
+        assert_eq!(
+            capability.snapshot(),
+            CatalogActivationEndpointState::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_replace_with_missing_fresh_get_withdraws_without_a_token() {
+        let root = TempDir::new().expect("temporary root");
+        let (configuration, journal, accepted) = accepted_fixture(&root).await;
+        let store = FakeStore::new(carrier(Some(request())), ReplaceMode::SuccessThenMissingGet);
+        let capability = CatalogActivationCapabilityState::configured();
+        capability.available(configuration.capability());
+        let (publisher, handoff) = catalog_activation_handoff();
+        publisher.publish(Some(accepted));
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let result = run_reconcile_loop(
+            &configuration,
+            &capability,
+            &publisher,
+            &store,
+            journal,
+            &mut shutdown_rx,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(CatalogActivationConsumerError::Store(
+                CarrierStoreError::Missing
+            ))
+        ));
+        assert_eq!(store.replacement_count(), 1);
+        assert!(handoff.receiver.borrow().is_none());
+        assert_eq!(
+            capability.snapshot(),
+            CatalogActivationEndpointState::Unavailable
+        );
+    }
+
+    #[tokio::test]
     async fn status_conflict_is_resolved_only_by_a_new_exact_get() {
         let root = TempDir::new().expect("temporary root");
         let configuration = config(&root);
         let store = FakeStore::new(carrier(Some(request())), ReplaceMode::ConflictAfterInstall);
         let journal = open_journal(&configuration);
-        let (_, response) = reconcile_once(&configuration, &store, journal)
+        let (_, response, accepted) = reconcile_once(&configuration, &store, journal)
             .await
             .expect("exact GET resolves installed conflict");
         assert_eq!(response, configuration.capability());
+        assert!(accepted.is_some());
         assert_eq!(store.replacement_count(), 1);
     }
 
