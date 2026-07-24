@@ -706,8 +706,12 @@ fn expire_proof_state(inner: &mut OrchInner, now: Option<SuspendAwareInstant>) {
         .is_some_and(|(deadline, now)| deadline.is_live_at(now));
     if !identity_binding_live {
         inner.agent_identity_binding_deadline = None;
-        if inner.agent_status.phase == AgentStatusPhase::Fresh {
+        // Proofs are retained across open collection brackets, so expiry must
+        // clear them regardless of the diagnostic collection phase.
+        if inner.agent_shard_zero_replication_proof.is_some() {
             let _ = clear_agent_proof(inner);
+        }
+        if inner.agent_status.phase == AgentStatusPhase::Fresh {
             inner.agent_replication_correlation = None;
             inner.agent_status.phase = AgentStatusPhase::Expired;
             inner.agent_status.fresh_members = 0;
@@ -731,8 +735,10 @@ fn expire_proof_state(inner: &mut OrchInner, now: Option<SuspendAwareInstant>) {
         .is_some_and(|(deadline, now)| deadline.is_live_at(now));
     if !catalog_candidate_live {
         inner.catalog_candidate_deadline = None;
-        if inner.catalog_candidates.phase == CatalogCandidatePhase::Fresh {
+        if inner.catalog_candidate_proof.is_some() {
             let _ = clear_catalog_proof(inner);
+        }
+        if inner.catalog_candidates.phase == CatalogCandidatePhase::Fresh {
             inner.catalog_candidates.phase = CatalogCandidatePhase::Expired;
             inner.catalog_candidates.fresh_candidates = 0;
             inner.catalog_candidates.failure =
@@ -1145,7 +1151,10 @@ impl OrchState {
         inner.coordination_deadline = None;
     }
 
-    /// Clears earlier evidence before a new all-members collection begins.
+    /// Opens a new all-members collection bracket. The last published exact
+    /// proof and its freshness deadline are retained until the replacement
+    /// swaps in, a failure is recorded, or the deadline expires, so an
+    /// in-flight refresh never opens a proof-free window.
     pub(crate) fn record_agent_status_collecting(&self, maximum_age: Duration) {
         let mut inner = self
             .inner
@@ -1154,8 +1163,6 @@ impl OrchState {
         if inner.agent_status.phase == AgentStatusPhase::ShuttingDown {
             return;
         }
-        let _ = clear_agent_proof(&mut inner);
-        inner.agent_identity_binding_deadline = None;
         inner.agent_replication_correlation = None;
         inner.agent_status.phase = AgentStatusPhase::Collecting;
         inner.agent_status.fresh_members = 0;
@@ -1299,7 +1306,10 @@ impl OrchState {
         true
     }
 
-    /// Clears earlier candidate evidence before a new complete read bracket.
+    /// Opens a new complete candidate read bracket. The last published exact
+    /// proof and its freshness deadline are retained until the replacement
+    /// swaps in, a failure is recorded, or the deadline expires, so an
+    /// in-flight refresh never opens a proof-free window.
     pub(crate) fn record_catalog_candidates_collecting(
         &self,
         expected_candidates: usize,
@@ -1312,8 +1322,6 @@ impl OrchState {
         if inner.catalog_candidates.phase == CatalogCandidatePhase::ShuttingDown {
             return;
         }
-        let _ = clear_catalog_proof(&mut inner);
-        inner.catalog_candidate_deadline = None;
         inner.catalog_candidates.phase = CatalogCandidatePhase::Collecting;
         inner.catalog_candidates.expected_candidates = expected_candidates;
         inner.catalog_candidates.fresh_candidates = 0;
@@ -3643,15 +3651,17 @@ mod tests {
             .catalog_materialization_capability()
             .expect("replacement exact proof");
 
+        // Opening a refresh bracket retains the last proof; only the swap
+        // advances the private generation and invalidates issued tokens.
         state.record_catalog_candidates_collecting(3, Duration::from_secs(5));
-        assert!(!state.revalidate_catalog_materialization_capability(&second));
-        assert!(state.catalog_materialization_capability().is_none());
+        assert!(state.revalidate_catalog_materialization_capability(&second));
 
         let mut mismatched = exact_candidate_proof();
         mismatched.writable_lease.uid = "replacement-lease-uid".to_owned();
         assert!(
             state.record_catalog_candidates_fresh_exact(mismatched, now + Duration::from_secs(5),)
         );
+        assert!(!state.revalidate_catalog_materialization_capability(&second));
         assert!(state.catalog_materialization_capability().is_none());
 
         assert!(state.record_catalog_candidates_fresh_exact(
@@ -3743,6 +3753,143 @@ mod tests {
             inner.catalog_candidates.phase,
             CatalogCandidatePhase::Expired
         );
+    }
+
+    #[test]
+    fn adversarially_phased_collector_refreshes_keep_authority_overlap() {
+        let state = bootstrap_observation_state();
+        let now = Instant::now();
+        let summary = ReplicationCorrelationSummary {
+            correlated_shards: 1,
+            shard_zero_correlated: true,
+            acknowledged_correlated_shards: 1,
+            shard_zero_target_fence_acknowledged: true,
+            remote_apply_witnessed_shards: 1,
+            shard_zero_remote_apply_witnessed: true,
+        };
+        state.record_agent_status_collecting(Duration::from_secs(5));
+        state.record_catalog_candidates_collecting(3, Duration::from_secs(5));
+        assert!(state.record_agent_status_fresh_exact(
+            6,
+            summary,
+            Some(exact_replication_proof()),
+            now + Duration::from_secs(5),
+        ));
+        assert!(state.record_catalog_candidates_fresh_exact(
+            exact_candidate_proof(),
+            now + Duration::from_secs(5),
+        ));
+        assert!(state.record_coordination_ready(
+            "coordination-uid",
+            "coordination-rv-1",
+            true,
+            now + Duration::from_secs(5),
+        ));
+
+        // Adversarial phasing keeps one collector inside a refresh bracket at
+        // every instant. Discard-on-refresh collectors would never present
+        // both proofs simultaneously, livelocking any authority poll.
+        for _ in 0..3 {
+            state.record_agent_status_collecting(Duration::from_secs(5));
+            assert!(state.catalog_materialization_capability().is_some());
+            assert!(state.record_agent_status_fresh_exact(
+                6,
+                summary,
+                Some(exact_replication_proof()),
+                now + Duration::from_secs(5),
+            ));
+            state.record_catalog_candidates_collecting(3, Duration::from_secs(5));
+            assert!(state.catalog_materialization_capability().is_some());
+            assert!(state.record_catalog_candidates_fresh_exact(
+                exact_candidate_proof(),
+                now + Duration::from_secs(5),
+            ));
+        }
+        assert!(state.catalog_materialization_capability().is_some());
+    }
+
+    #[test]
+    fn sub_poll_period_overlap_survives_until_the_next_fixed_poll() {
+        let state = bootstrap_observation_state();
+        let now = Instant::now();
+        let summary = ReplicationCorrelationSummary {
+            correlated_shards: 1,
+            shard_zero_correlated: true,
+            acknowledged_correlated_shards: 1,
+            shard_zero_target_fence_acknowledged: true,
+            remote_apply_witnessed_shards: 1,
+            shard_zero_remote_apply_witnessed: true,
+        };
+        state.record_agent_status_collecting(Duration::from_secs(5));
+        state.record_catalog_candidates_collecting(3, Duration::from_secs(5));
+        assert!(state.record_agent_status_fresh_exact(
+            6,
+            summary,
+            Some(exact_replication_proof()),
+            now + Duration::from_secs(5),
+        ));
+        assert!(state.record_catalog_candidates_fresh_exact(
+            exact_candidate_proof(),
+            now + Duration::from_secs(5),
+        ));
+        assert!(state.record_coordination_ready(
+            "coordination-uid",
+            "coordination-rv-1",
+            true,
+            now + Duration::from_secs(5),
+        ));
+
+        // Both collectors reopen brackets immediately after publishing, so the
+        // proof pair coexisted far shorter than one authority-poll period.
+        // Discard-on-refresh collectors would leave nothing for the next poll.
+        state.record_agent_status_collecting(Duration::from_secs(5));
+        state.record_catalog_candidates_collecting(3, Duration::from_secs(5));
+        let poll = now + crate::catalog_activation_supervisor::AUTHORITY_POLL_PERIOD;
+        assert!(state.catalog_materialization_capability_at(poll).is_some());
+    }
+
+    #[test]
+    fn expired_proofs_clear_while_refresh_brackets_are_open() {
+        let state = bootstrap_observation_state();
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(2);
+        let summary = ReplicationCorrelationSummary {
+            correlated_shards: 1,
+            shard_zero_correlated: true,
+            acknowledged_correlated_shards: 1,
+            shard_zero_target_fence_acknowledged: true,
+            remote_apply_witnessed_shards: 1,
+            shard_zero_remote_apply_witnessed: true,
+        };
+        state.record_agent_status_collecting(Duration::from_secs(5));
+        state.record_catalog_candidates_collecting(3, Duration::from_secs(5));
+        assert!(state.record_agent_status_fresh_exact(
+            6,
+            summary,
+            Some(exact_replication_proof()),
+            deadline,
+        ));
+        assert!(state.record_catalog_candidates_fresh_exact(exact_candidate_proof(), deadline));
+        assert!(state.record_coordination_ready(
+            "coordination-uid",
+            "coordination-rv-1",
+            true,
+            deadline,
+        ));
+        state.record_agent_status_collecting(Duration::from_secs(5));
+        state.record_catalog_candidates_collecting(3, Duration::from_secs(5));
+        assert!(state.catalog_materialization_capability_at(now).is_some());
+
+        assert!(
+            state
+                .catalog_materialization_capability_at(deadline)
+                .is_none()
+        );
+        let inner = state.inner.lock().expect("state");
+        assert!(inner.agent_shard_zero_replication_proof.is_none());
+        assert!(inner.catalog_candidate_proof.is_none());
+        assert!(inner.agent_identity_binding_deadline.is_none());
+        assert!(inner.catalog_candidate_deadline.is_none());
     }
 
     #[test]

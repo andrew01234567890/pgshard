@@ -3182,6 +3182,7 @@ func TestAgentQuarantineExplicitlyScopesOrchestratorIdentityObservation(t *testi
 		{APIGroups: []string{coordinationv1.GroupName}, Resources: []string{"leases"}, ResourceNames: []string{"demo-shard-0000-term", "demo-shard-0001-term"}, Verbs: []string{"get"}},
 		{APIGroups: []string{pgshardv1alpha1.GroupVersion.Group}, Resources: []string{"pgshardclusters/status"}, ResourceNames: []string{"demo"}, Verbs: []string{"get"}},
 		{APIGroups: []string{corev1.GroupName}, Resources: []string{"configmaps"}, ResourceNames: candidateNames, Verbs: []string{"get"}},
+		{APIGroups: []string{pgshardv1alpha1.GroupVersion.Group}, Resources: []string{"pgshardcatalogactivations"}, ResourceNames: []string{cluster.Status.CatalogActivation.Name}, Verbs: []string{"get", "update"}},
 	}
 	if !reflect.DeepEqual(role.Rules, wantRules) {
 		t.Fatalf("agent-quarantine identity-observation Role is not exact: %#v", role.Rules)
@@ -3346,11 +3347,23 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 				t.Fatalf("orchestrator catalog activation CA projection = %#v", caProjection)
 			}
 			orchestratorRole := object[*rbacv1.Role](t, plan, cluster.Name+OrchestratorSuffix)
+			carrierRules := make([]rbacv1.PolicyRule, 0, 1)
 			for _, rule := range orchestratorRole.Rules {
-				if slices.Contains(rule.Resources, "secrets") ||
-					(slices.Contains(rule.Resources, "pgshardcatalogactivations") && slices.Contains(rule.Verbs, "update")) {
-					t.Fatalf("orchestrator received secret-read or activation-update authority: %#v", orchestratorRole.Rules)
+				if slices.Contains(rule.Resources, "secrets") {
+					t.Fatalf("orchestrator received secret-read authority: %#v", orchestratorRole.Rules)
 				}
+				if slices.Contains(rule.Resources, "pgshardcatalogactivations") || slices.Contains(rule.Resources, "pgshardcatalogactivations/status") {
+					carrierRules = append(carrierRules, rule)
+				}
+			}
+			wantCarrierRules := []rbacv1.PolicyRule{{
+				APIGroups:     []string{pgshardv1alpha1.GroupVersion.Group},
+				Resources:     []string{"pgshardcatalogactivations"},
+				ResourceNames: []string{carrier.Name},
+				Verbs:         []string{"get", "update"},
+			}}
+			if !reflect.DeepEqual(carrierRules, wantCarrierRules) {
+				t.Fatalf("orchestrator catalog activation authority = %#v, want %#v", carrierRules, wantCarrierRules)
 			}
 			for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 				role := object[*rbacv1.Role](t, plan, PostgreSQLAgentServiceAccountName(cluster.Name, shard))
