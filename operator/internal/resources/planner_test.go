@@ -3561,6 +3561,19 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 								envValue(agent.Env, activationEnvironment[6]) != catalogActivationTLSMountPath+"/tls.key" {
 								t.Fatalf("shard-zero source activation environment = %#v", agent.Env)
 							}
+							// The agent verifies four static inputs together and
+							// refuses to start on a partial set, so all four
+							// paths and the projection carrying the two rendered
+							// ones are part of the contract.
+							if envValue(agent.Env, "PGSHARD_CATALOG_ACTIVATION_MIGRATION_FILE") != shardschemaMigrationPath ||
+								envValue(agent.Env, "PGSHARD_CATALOG_ACTIVATION_INVENTORY_FILE") != shardInventoryPath ||
+								envValue(agent.Env, "PGSHARD_CATALOG_ACTIVATION_GENESIS_FILE") != catalogActivationGenesisPath ||
+								envValue(agent.Env, "PGSHARD_CATALOG_ACTIVATION_PREFLIGHT_FILE") != catalogActivationPreflightPath {
+								t.Fatalf("shard-zero source static-input environment = %#v", agent.Env)
+							}
+							if !containerHasVolumeMount(agent, catalogActivationStaticInputsVolumeName) {
+								t.Fatalf("shard-zero source static-input mount = %#v", agent.VolumeMounts)
+							}
 							if !containerHasPort(agent, "activation-tls", CatalogActivationTLSPort) {
 								t.Fatalf("shard-zero source activation TLS ports = %#v", agent.Ports)
 							}
