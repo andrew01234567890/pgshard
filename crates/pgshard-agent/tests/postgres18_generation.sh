@@ -389,7 +389,7 @@ docker run --rm --user 999:999 --network none --read-only \
 # a read-only fence transaction cannot take the row lock, an idle holder is
 # terminated by the evidence timeouts, and the lock wait itself is the property
 # under test. None of that is reachable from a unit test.
-docker run --rm \
+docker run --rm --user 999:999 \
   --network "$network" \
   --volume "$primary_socket:/primary-socket" \
   --mount "type=bind,src=$test_binary,dst=/test/pgshard-agent-test,readonly" \

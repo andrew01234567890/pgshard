@@ -1983,8 +1983,11 @@ mod tests {
         let socket_dir = std::env::var_os("PGSHARD_AGENT_TEST_SOCKET_DIR")
             .map(std::path::PathBuf::from)
             .expect("PGSHARD_AGENT_TEST_SOCKET_DIR is required");
-        let first = generation("cluster-1", "holder-a", 1);
-        let second = generation("cluster-1", "holder-a", 2);
+        // Terms above whatever the preceding live test left behind: a lower
+        // term is correctly rejected as stale, which would fail this test for a
+        // reason that has nothing to do with the fence.
+        let first = generation("cluster-1", "holder-f", 6);
+        let second = generation("cluster-1", "holder-f", 7);
 
         publish_writable_generation(&socket_dir, &first, &|| true)
             .await

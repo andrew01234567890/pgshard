@@ -639,6 +639,7 @@ struct StatementAccounting {
     current_tokens: u32,
     current_start: Option<usize>,
     first_leading: Option<Leading>,
+    first_closed: Option<ClosedStatement>,
     control_statements: u32,
     executable_statements: u32,
     last_closed: Option<ClosedStatement>,
@@ -655,6 +656,7 @@ impl StatementAccounting {
             current_tokens: 0,
             current_start: None,
             first_leading: None,
+            first_closed: None,
             control_statements: 0,
             executable_statements: 0,
             last_closed: None,
@@ -695,6 +697,10 @@ impl StatementAccounting {
         self.executable_statements = self.executable_statements.saturating_add(1);
         if self.first_leading.is_none() {
             self.first_leading = Some(leading);
+            self.first_closed = Some(ClosedStatement {
+                leading,
+                tokens: self.current_tokens,
+            });
         }
         if matches!(leading, Leading::Control(_)) {
             self.control_statements = self.control_statements.saturating_add(1);
@@ -717,10 +723,16 @@ impl StatementAccounting {
                         leading: Leading::Control(ControlKeyword::Commit),
                         tokens: 1,
                     });
-                if self.first_leading == Some(Leading::Control(ControlKeyword::Begin))
-                    && terminal_is_bare_commit
-                    && self.control_statements == 2
-                {
+                // Bare on both ends. `BEGIN READ ONLY` or `BEGIN ISOLATION
+                // LEVEL SERIALIZABLE` would otherwise be accepted and then have
+                // its modes sliced away, so the body would run under settings
+                // the input did not ask for.
+                let opens_bare = self.first_closed
+                    == Some(ClosedStatement {
+                        leading: Leading::Control(ControlKeyword::Begin),
+                        tokens: 1,
+                    });
+                if opens_bare && terminal_is_bare_commit && self.control_statements == 2 {
                     Ok(())
                 } else {
                     Err(())
@@ -973,6 +985,17 @@ mod tests {
         assert_rejects_caller_framed("SELECT 1E'\\' ; \\echo pwned ; ';\n");
         assert_rejects_caller_framed("SELECT junk1e'\\' ; \\echo pwned ; ';\n");
         assert_rejects_caller_framed("SELECT 1x'\\' ; \\echo pwned ; ';\n");
+    }
+
+    #[test]
+    fn a_self_framed_input_must_open_with_a_bare_begin() {
+        // The executor slices the framing statements away and supplies its own,
+        // so an opening that carries transaction modes would have them silently
+        // replaced. Reject rather than reinterpret.
+        assert_rejects_self_framed("BEGIN READ ONLY;\nSELECT 1;\nCOMMIT;\n");
+        assert_rejects_self_framed("BEGIN ISOLATION LEVEL SERIALIZABLE;\nSELECT 1;\nCOMMIT;\n");
+        assert_rejects_self_framed("BEGIN TRANSACTION READ WRITE;\nSELECT 1;\nCOMMIT;\n");
+        assert!(compile(MIGRATION, INVENTORY, GENESIS, PREFLIGHT).is_ok());
     }
 
     #[test]

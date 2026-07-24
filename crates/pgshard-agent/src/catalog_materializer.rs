@@ -143,10 +143,13 @@ where
         outcome = apply(writer, authority_exact, step) => outcome,
         () = fence.lost() => Err(PostgresGenerationError::GenerationFenceLost),
     };
-    // Reported even when the work failed: a lost fence means the guarantee was
-    // absent, which the caller must not confuse with a clean failure.
-    let released = fence.release().await;
-    outcome.and(released)
+    // A lost fence outranks whatever the work reported: the guarantee was
+    // absent, which the caller must not confuse with a clean failure. Result's
+    // `and` would have kept the earlier error and hidden exactly that.
+    match fence.release().await {
+        Err(lost) => Err(lost),
+        Ok(()) => outcome,
+    }
 }
 
 async fn apply<F>(
@@ -167,17 +170,21 @@ where
             if let Some((statement, value)) = scalar {
                 transaction.execute(statement, &[&value]).await?;
             }
-            for fragment in fragments {
-                // Re-observed per fragment rather than once per session: the
-                // string mode decides where a quoted literal ends, and the
-                // compiler's proof assumed one answer. A fragment that changed
-                // it would silently move the boundary for the next one.
-                let observed: String = transaction
-                    .query_one(OBSERVE_STANDARD_CONFORMING_STRINGS, &[])
-                    .await?
-                    .try_get(0)?;
-                if observed != "on" {
-                    return Err(PostgresGenerationError::InvalidCatalogWriterSettings);
+            for (index, fragment) in fragments.iter().enumerate() {
+                // Re-observed BETWEEN fragments: the string mode decides where a
+                // quoted literal ends and the compiler's proof assumed one
+                // answer, so a fragment that changed it would move the boundary
+                // for the next one. Not before the first, because issuing a
+                // query there would forbid a fragment's own SET TRANSACTION —
+                // the applying settings have already pinned the mode.
+                if index > 0 {
+                    let observed: String = transaction
+                        .query_one(OBSERVE_STANDARD_CONFORMING_STRINGS, &[])
+                        .await?
+                        .try_get(0)?;
+                    if observed != "on" {
+                        return Err(PostgresGenerationError::InvalidCatalogWriterSettings);
+                    }
                 }
                 transaction.batch_execute(fragment).await?;
             }
