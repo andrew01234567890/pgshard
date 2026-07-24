@@ -233,9 +233,12 @@ async fn supervise_catalog_runtime_binding_with_connector<C, F>(
 
         let connection = connect(socket_dir.clone(), generation.clone());
         tokio::pin!(connection);
+        // Bound to the generation this attempt acts for, not to whatever is
+        // current now: another generation installed in between would otherwise
+        // be waited out in its place, leaving this attempt's work standing.
         let authority_lost = authority
             .clone()
-            .wait_until_current_generation_invalid(required_margin);
+            .wait_until_generation_invalid(Some(generation.clone()), required_margin);
         tokio::pin!(authority_lost);
         let connected = tokio::select! {
             result = &mut connection => Some(result),
@@ -294,9 +297,12 @@ async fn supervise_catalog_runtime_binding_with_connector<C, F>(
             continue;
         }
 
+        // Bound to the generation this attempt acts for, not to whatever is
+        // current now: another generation installed in between would otherwise
+        // be waited out in its place, leaving this attempt's work standing.
         let authority_lost = authority
             .clone()
-            .wait_until_current_generation_invalid(required_margin);
+            .wait_until_generation_invalid(Some(generation.clone()), required_margin);
         tokio::pin!(authority_lost);
         tokio::select! {
             changed = attempt.inputs.changed() => {

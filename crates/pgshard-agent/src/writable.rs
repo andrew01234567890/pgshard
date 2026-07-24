@@ -210,11 +210,33 @@ impl WritableAuthorityObserver {
     /// when a suspend-aware absolute deadline elapses. Clock and timer failures
     /// are treated exactly like lost authority.
     pub(crate) fn wait_until_current_generation_invalid(
-        mut self,
+        self,
         required: Duration,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let expected = self.generation_valid_for(required);
+        let current = self.generation_valid_for(required);
+        self.wait_until_generation_invalid(current, required)
+    }
+
+    /// Waits until `expected` no longer has authority beyond `required`.
+    ///
+    /// A caller that has already acted for a particular generation must bind
+    /// the waiter to THAT generation, not to whatever is current when the
+    /// waiter is built: if another generation is installed in between, binding
+    /// to the current one would wait out the wrong generation and leave the
+    /// caller's work standing. Resolves immediately when `expected` is already
+    /// not the authorized generation.
+    pub(crate) fn wait_until_generation_invalid(
+        mut self,
+        expected: Option<DurableWritableGeneration>,
+        required: Duration,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let still_authorized = expected
+            .as_ref()
+            .is_some_and(|expected| self.generation_valid_for(required).as_ref() == Some(expected));
         Box::pin(async move {
+            if !still_authorized {
+                return;
+            }
             let Some(expected) = expected else {
                 return;
             };

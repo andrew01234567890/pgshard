@@ -2322,6 +2322,19 @@ async fn wait_for_authority_loss<F>(
     }
 }
 
+/// Why the supervised postmaster is leaving its running state.
+///
+/// The lifecycle select yields one of these instead of performing cleanup
+/// inline, so the catalog-runtime binder can be dropped — withdrawing its
+/// published handoff — before any teardown is awaited.
+enum PostmasterLifecycleEvent {
+    Exited(Result<ExitStatus, PostgresError>),
+    EvidenceLost(Result<(), ReplicationEvidenceError>),
+    Stopped(PostgresStopMode),
+    AuthorityLost,
+    TargetFenceLost(PostgresFenceError),
+}
+
 async fn wait_for_target_fence(target_fence: &mut Option<TargetFenceFuture>) -> PostgresFenceError {
     match target_fence.as_mut() {
         Some(target_fence) => match target_fence.as_mut().await {
@@ -2513,7 +2526,7 @@ where
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn supervise_replication_source<F, G>(
     state: &AgentState,
     process: &mut PostgresProcessFence,
@@ -2563,11 +2576,33 @@ where
             None => std::future::pending::<()>().await,
         }
     };
-    tokio::pin!(catalog_runtime);
+    let mut catalog_runtime = Some(Box::pin(catalog_runtime));
     state.set_postgres_process(config.running_process_state());
-    tokio::select! {
+    // The select resolves to the lifecycle event only. Cleanup runs after the
+    // binder has been dropped, because the binder withdraws the published
+    // handoff as it drops: awaiting cleanup first would leave the handoff
+    // observable for as long as process-tree teardown takes.
+    let event = tokio::select! {
         biased;
-        status = wait_pidfd_exit(pidfd) => {
+        status = wait_pidfd_exit(pidfd) => PostmasterLifecycleEvent::Exited(status),
+        result = &mut evidence_monitor => PostmasterLifecycleEvent::EvidenceLost(result),
+        stop_mode = shutdown.as_mut() => PostmasterLifecycleEvent::Stopped(stop_mode),
+        () = &mut authority_lost => PostmasterLifecycleEvent::AuthorityLost,
+        error = wait_for_target_fence(&mut target_fence) => {
+            PostmasterLifecycleEvent::TargetFenceLost(error)
+        }
+        () = async {
+            match catalog_runtime.as_mut() {
+                Some(binder) => binder.as_mut().await,
+                None => std::future::pending::<()>().await,
+            }
+        } => unreachable!("catalog runtime binder never completes"),
+    };
+    catalog_runtime = None;
+    drop(catalog_runtime);
+
+    match event {
+        PostmasterLifecycleEvent::Exited(status) => {
             state.clear_replication_evidence();
             state.set_postgres_process(PostgresProcessState::Stopping);
             let error = cleanup_after_error(
@@ -2579,44 +2614,39 @@ where
                     Ok(status) => PostgresError::UnexpectedExit(status),
                     Err(error) => error,
                 },
-            ).await;
+            )
+            .await;
             state.set_postgres_process(PostgresProcessState::Failed);
             Err(error)
         }
-        result = &mut evidence_monitor => {
-            Err(cleanup_tracked_startup_failure(
-                state,
-                process,
-                pidfd,
-                process_group,
-                replication_evidence_error(result),
-            ).await)
-        }
-        stop_mode = shutdown.as_mut() => {
+        PostmasterLifecycleEvent::EvidenceLost(result) => Err(cleanup_tracked_startup_failure(
+            state,
+            process,
+            pidfd,
+            process_group,
+            replication_evidence_error(result),
+        )
+        .await),
+        PostmasterLifecycleEvent::Stopped(stop_mode) => {
             drop(evidence_monitor);
-            stop_tracked_postmaster(
-                state, process, pidfd, process_group, config, stop_mode,
-            ).await
+            stop_tracked_postmaster(state, process, pidfd, process_group, config, stop_mode).await
         }
-        () = &mut authority_lost => {
-            Err(cleanup_tracked_startup_failure(
-                state,
-                process,
-                pidfd,
-                process_group,
-                PostgresError::StartupAuthorityChanged,
-            ).await)
-        }
-        error = wait_for_target_fence(&mut target_fence) => {
-            Err(cleanup_tracked_startup_failure(
-                state,
-                process,
-                pidfd,
-                process_group,
-                PostgresError::from(error),
-            ).await)
-        }
-        () = &mut catalog_runtime => unreachable!("catalog runtime binder never completes"),
+        PostmasterLifecycleEvent::AuthorityLost => Err(cleanup_tracked_startup_failure(
+            state,
+            process,
+            pidfd,
+            process_group,
+            PostgresError::StartupAuthorityChanged,
+        )
+        .await),
+        PostmasterLifecycleEvent::TargetFenceLost(error) => Err(cleanup_tracked_startup_failure(
+            state,
+            process,
+            pidfd,
+            process_group,
+            PostgresError::from(error),
+        )
+        .await),
     }
 }
 
