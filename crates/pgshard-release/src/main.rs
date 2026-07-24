@@ -2266,7 +2266,10 @@ mod tests {
     fn extract_emit_component_pattern(line: &str) -> &str {
         let opening = line.find('\'').expect("quoted change-trigger pattern");
         let rest = &line[opening + 1..];
-        let closing = rest.rfind('\'').expect("closed change-trigger pattern");
+        // The FIRST closing quote ends the shell word. Taking the last one
+        // would let a trailing `# '…'` comment supply the text the guard is
+        // looking for while the live pattern is something narrower.
+        let closing = rest.find('\'').expect("closed change-trigger pattern");
         &rest[..closing]
     }
 
@@ -2293,6 +2296,11 @@ mod tests {
                 _ => {}
             }
         }
+        // An unmatched group or a trailing escape makes grep reject the pattern
+        // outright, so the trigger would never fire. Refuse to certify a
+        // pattern this parser cannot fully account for.
+        assert_eq!(depth, 0, "change-trigger pattern has an unmatched group");
+        assert!(!escaped, "change-trigger pattern ends in a dangling escape");
         alternatives.push(&pattern[start..]);
         alternatives.into_iter()
     }
