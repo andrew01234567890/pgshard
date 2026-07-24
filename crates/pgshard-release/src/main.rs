@@ -2261,6 +2261,42 @@ mod tests {
         }
     }
 
+    /// Returns the single-quoted regular expression an `emit_component` line
+    /// passes as its change trigger.
+    fn extract_emit_component_pattern(line: &str) -> &str {
+        let opening = line.find('\'').expect("quoted change-trigger pattern");
+        let rest = &line[opening + 1..];
+        let closing = rest.rfind('\'').expect("closed change-trigger pattern");
+        &rest[..closing]
+    }
+
+    /// Splits an alternation on the `|` separators that are not inside a group,
+    /// so a nested alternation such as `(a|b)` stays one alternative.
+    fn top_level_alternatives(pattern: &str) -> impl Iterator<Item = &str> {
+        let mut alternatives = Vec::new();
+        let mut depth = 0_usize;
+        let mut start = 0;
+        let mut escaped = false;
+        for (index, character) in pattern.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match character {
+                '\\' => escaped = true,
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                '|' if depth == 0 => {
+                    alternatives.push(&pattern[start..index]);
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        alternatives.push(&pattern[start..]);
+        alternatives.into_iter()
+    }
+
     #[test]
     fn ci_guards_component_deletion_and_rust_policy_changes() {
         let workflow = include_str!("../../../.github/workflows/ci.yml");
@@ -2327,9 +2363,14 @@ mod tests {
                 "PostgreSQL agent trigger must include {input}"
             );
         }
+        // Substring containment is not enough here: it also passes for a
+        // narrowed alternative that merely starts with the directory, such as
+        // `^crates/pgshard-catalog/migrations/0002\.sql$`. Require the
+        // directory to be a complete alternative of its own.
         assert!(
-            !postgres_agent_trigger.contains("0001_shardschema"),
-            "PostgreSQL agent trigger must not pin an individual migration file"
+            top_level_alternatives(extract_emit_component_pattern(postgres_agent_trigger))
+                .any(|alternative| alternative == "^crates/pgshard-catalog/migrations/"),
+            "PostgreSQL agent trigger must match the whole migrations directory, not a file beneath it"
         );
         assert!(workflow.contains("if: needs.changes.outputs.postgres_agent == 'true'"));
         for command in [
