@@ -2717,6 +2717,10 @@ mod tests {
                 shardschema_migration: ContentReference {
                     sha256: "8".repeat(64),
                 },
+                shard_count: "1".to_owned(),
+                shard_inventory: ContentReference {
+                    sha256: "c".repeat(64),
+                },
                 database_genesis: ContentReference {
                     sha256: "9".repeat(64),
                 },

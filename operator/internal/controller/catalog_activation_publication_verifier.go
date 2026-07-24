@@ -399,6 +399,8 @@ type activationCandidateTarget struct {
 type activationCandidateBundle struct {
 	PostgreSQLConfiguration   activationCandidateConfiguration `json:"postgresqlConfiguration"`
 	ShardschemaMigration      activationCandidateContent       `json:"shardschemaMigration"`
+	ShardCount                string                           `json:"shardCount"`
+	ShardInventory            activationCandidateContent       `json:"shardInventory"`
 	DatabaseGenesis           activationCandidateContent       `json:"databaseGenesis"`
 	DatabaseTopologyPreflight activationCandidateContent       `json:"databaseTopologyPreflight"`
 	CatalogAccess             activationCandidateCatalog       `json:"catalogAccess"`
@@ -443,7 +445,7 @@ func validateRequestAgainstCandidate(document *activationCandidateDocument, requ
 		document.Catalog.Name != request.Materials.Catalog.Name || document.Catalog.UID != request.Materials.Catalog.UID || document.Catalog.ClientSHA256 != request.Materials.Catalog.ClientSHA256 || document.Catalog.ServerSHA256 != request.Materials.Catalog.ServerSHA256 ||
 		document.Materialization.PostgreSQLConfiguration.Name != request.Materials.PostgreSQLConfiguration.Name || document.Materialization.PostgreSQLConfiguration.UID != request.Materials.PostgreSQLConfiguration.UID || document.Materialization.PostgreSQLConfiguration.DataSHA256 != request.Materials.PostgreSQLConfiguration.MaterialSHA256 ||
 		document.Materialization.OperationWriterAccess.Name != request.Materials.OperationWriter.Name || document.Materialization.OperationWriterAccess.UID != request.Materials.OperationWriter.UID || document.Materialization.OperationWriterAccess.MaterialSHA256 != request.Materials.OperationWriter.MaterialSHA256 ||
-		document.Materialization.CatalogAccess != document.Catalog || document.Materialization.ShardschemaMigration.SHA256 != request.Materials.MigrationSHA256 || document.Materialization.DatabaseGenesis.SHA256 != request.Materials.GenesisSHA256 || document.Materialization.DatabaseTopologyPreflight.SHA256 != request.Materials.PreflightSHA256 ||
+		document.Materialization.CatalogAccess != document.Catalog || document.Materialization.ShardschemaMigration.SHA256 != request.Materials.MigrationSHA256 || document.Materialization.ShardCount != request.Materials.ShardCount || document.Materialization.ShardInventory.SHA256 != request.Materials.InventorySHA256 || document.Materialization.DatabaseGenesis.SHA256 != request.Materials.GenesisSHA256 || document.Materialization.DatabaseTopologyPreflight.SHA256 != request.Materials.PreflightSHA256 ||
 		document.Materialization.ServingHBA.Version != request.Materials.ServingHBAVersion || document.Materialization.ServingHBA.SHA256 != request.Materials.ServingHBASHA256 || document.Materialization.TargetPodTemplate.StatefulSetName != owned.PostgreSQLMemberStatefulSetName(request.Cluster.Name, 0, 0) || document.Materialization.TargetPodTemplate.PostgreSQLRuntime != owned.PostgreSQLRuntimeAgentQuarantine.String() || document.Materialization.TargetPodTemplate.BootstrapHBAMode != "replication-bootstrap-primary" || document.Materialization.TargetPodTemplate.SHA256 != request.Materials.TargetTemplateSHA256 {
 		return fmt.Errorf("activation request differs from the exact catalog candidate document")
 	}

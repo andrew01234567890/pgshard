@@ -1642,6 +1642,8 @@ mod tests {
                     material_sha256: digest(7),
                 },
                 migration_sha256: digest(8),
+                shard_count: "4".into(),
+                inventory_sha256: digest(13),
                 genesis_sha256: digest(9),
                 preflight_sha256: digest(10),
                 serving_hba_version: "pgshard.catalog-serving-hba.v1".into(),
