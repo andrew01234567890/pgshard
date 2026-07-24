@@ -115,7 +115,15 @@ rules:
   - create
   - get
   - list
+  - update
   - watch
+- apiGroups:
+  - pgshard.io
+  resources:
+  - pgshardcatalogactivations/status
+  - pgshardclusters/finalizers
+  verbs:
+  - update
 - apiGroups:
   - pgshard.io
   resources:
@@ -126,12 +134,6 @@ rules:
   - patch
   - update
   - watch
-- apiGroups:
-  - pgshard.io
-  resources:
-  - pgshardclusters/finalizers
-  verbs:
-  - update
 - apiGroups:
   - pgshard.io
   resources:
