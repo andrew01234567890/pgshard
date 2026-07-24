@@ -2261,6 +2261,50 @@ mod tests {
         }
     }
 
+    /// Returns the single-quoted regular expression an `emit_component` line
+    /// passes as its change trigger.
+    fn extract_emit_component_pattern(line: &str) -> &str {
+        let opening = line.find('\'').expect("quoted change-trigger pattern");
+        let rest = &line[opening + 1..];
+        // The FIRST closing quote ends the shell word. Taking the last one
+        // would let a trailing `# '…'` comment supply the text the guard is
+        // looking for while the live pattern is something narrower.
+        let closing = rest.find('\'').expect("closed change-trigger pattern");
+        &rest[..closing]
+    }
+
+    /// Splits an alternation on the `|` separators that are not inside a group,
+    /// so a nested alternation such as `(a|b)` stays one alternative.
+    fn top_level_alternatives(pattern: &str) -> impl Iterator<Item = &str> {
+        let mut alternatives = Vec::new();
+        let mut depth = 0_usize;
+        let mut start = 0;
+        let mut escaped = false;
+        for (index, character) in pattern.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match character {
+                '\\' => escaped = true,
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                '|' if depth == 0 => {
+                    alternatives.push(&pattern[start..index]);
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        // An unmatched group or a trailing escape makes grep reject the pattern
+        // outright, so the trigger would never fire. Refuse to certify a
+        // pattern this parser cannot fully account for.
+        assert_eq!(depth, 0, "change-trigger pattern has an unmatched group");
+        assert!(!escaped, "change-trigger pattern ends in a dangling escape");
+        alternatives.push(&pattern[start..]);
+        alternatives.into_iter()
+    }
+
     #[test]
     fn ci_guards_component_deletion_and_rust_policy_changes() {
         let workflow = include_str!("../../../.github/workflows/ci.yml");
@@ -2311,6 +2355,12 @@ mod tests {
             .expect("PostgreSQL agent lifecycle trigger");
         for input in [
             "^crates/(pgshard-agent|pgshard-types|pgshard-version)/",
+            // A directory prefix, never a single migration filename: the agent
+            // lifecycle job is the only gate that runs the agent against a live
+            // PostgreSQL, and pinning one file silently skips it — and the
+            // aggregate counts a skipped job as a pass — the moment a second
+            // migration is added.
+            "^crates/pgshard-catalog/migrations/",
             "^extensions/pgshard_fence/",
             "images/rust\\.Dockerfile",
             "images/quarantine\\.pg_hba\\.conf",
@@ -2321,6 +2371,15 @@ mod tests {
                 "PostgreSQL agent trigger must include {input}"
             );
         }
+        // Substring containment is not enough here: it also passes for a
+        // narrowed alternative that merely starts with the directory, such as
+        // `^crates/pgshard-catalog/migrations/0002\.sql$`. Require the
+        // directory to be a complete alternative of its own.
+        assert!(
+            top_level_alternatives(extract_emit_component_pattern(postgres_agent_trigger))
+                .any(|alternative| alternative == "^crates/pgshard-catalog/migrations/"),
+            "PostgreSQL agent trigger must match the whole migrations directory, not a file beneath it"
+        );
         assert!(workflow.contains("if: needs.changes.outputs.postgres_agent == 'true'"));
         for command in [
             "go mod tidy",
