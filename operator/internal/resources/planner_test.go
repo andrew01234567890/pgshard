@@ -2539,15 +2539,15 @@ PREPARE TRANSACTION 'pgshard_bootstrap_lock';
 		t.Fatalf("post-recovery catalog inventory = %q", got)
 	}
 
-	assertGenesisCrashRetry := func(dataParent, interruptedScript, probeSQL, wantProbe, boundary string, prepareRetry func()) {
+	assertGenesisCrashRetryWithOverrides := func(dataParent, interruptedScript, probeSQL, wantProbe, boundary string, crashVolumes, crashEnvironment []string, prepareRetry func()) {
 		t.Helper()
 		containerName := fmt.Sprintf("pgshard-genesis-crash-%d-%d", os.Getpid(), time.Now().UnixNano())
 		t.Cleanup(func() {
 			_, _ = runDocker("rm", "--force", containerName)
 		})
 		arguments := append(
-			[]string{"run", "--detach", "--name", containerName},
-			containerArguments(dataParent, interruptedScript, true, bootstrapEnvironment(true, 2)...)...,
+			append([]string{"run", "--detach", "--name", containerName}, crashVolumes...),
+			containerArguments(dataParent, interruptedScript, true, append(bootstrapEnvironment(true, 2), crashEnvironment...)...)...,
 		)
 		if output, err := runDocker(arguments...); err != nil {
 			t.Fatalf("start %s crash fixture: %v\n%s", boundary, err, output)
@@ -2604,6 +2604,10 @@ test ! -e "$PGDATA/.pgshard-catalog-genesis-intent"
 `); err != nil {
 			t.Fatalf("completed genesis retained its intent: %v\n%s", err, output)
 		}
+	}
+	assertGenesisCrashRetry := func(dataParent, interruptedScript, probeSQL, wantProbe, boundary string, prepareRetry func()) {
+		t.Helper()
+		assertGenesisCrashRetryWithOverrides(dataParent, interruptedScript, probeSQL, wantProbe, boundary, nil, nil, prepareRetry)
 	}
 	migrationCommand := `psql -X --no-password --host="$socket" --username=postgres --dbname=shardschema \
   --set=ON_ERROR_STOP=1 --file="$PGSHARD_SHARDSCHEMA_MIGRATION"
@@ -2705,29 +2709,47 @@ VALUES ('app');
 	}
 
 	const inventoryTransactionDataParent = "/var/lib/postgresql/18-genesis-inventory-transaction"
-	inventoryTransactionScript := strings.Replace(
-		bootstrapScript(inventoryTransactionDataParent),
-		" WHERE shards.shard_id IS NULL;\nDO \\$pgshard_inventory_postcondition\\$",
-		" WHERE shards.shard_id IS NULL;\nSELECT pg_catalog.pg_sleep(600);\nDO \\$pgshard_inventory_postcondition\\$",
+	canonicalShardInventory, err := os.ReadFile(filepath.Join("..", "..", "..", "crates", "pgshard-catalog", "inventory", "0001_shard_inventory.sql"))
+	if err != nil {
+		t.Fatalf("read canonical shard inventory: %v", err)
+	}
+	openShardInventory := strings.Replace(
+		string(canonicalShardInventory),
+		"DO $pgshard_inventory_postcondition$",
+		"SELECT pg_catalog.pg_sleep(600);\nDO $pgshard_inventory_postcondition$",
 		1,
 	)
-	if inventoryTransactionScript == bootstrapScript(inventoryTransactionDataParent) {
-		t.Fatal("catalog inventory transaction boundary injection did not match the bootstrap script")
+	if openShardInventory == string(canonicalShardInventory) {
+		t.Fatal("catalog inventory transaction boundary injection did not match the shard inventory")
 	}
-	assertGenesisCrashRetry(
+	openShardInventoryDigest := sha256.Sum256([]byte(openShardInventory))
+	openShardInventoryDirectory := newTraversableFixtureDirectory("pgshard-open-inventory-")
+	openShardInventoryPath := filepath.Join(openShardInventoryDirectory, "0001_shard_inventory.sql")
+	if err := os.WriteFile(openShardInventoryPath, []byte(openShardInventory), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	assertGenesisCrashRetryWithOverrides(
 		inventoryTransactionDataParent,
-		inventoryTransactionScript,
+		bootstrapScript(inventoryTransactionDataParent),
 		"SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE datname = 'shardschema' AND wait_event = 'PgSleep' AND query = 'SELECT pg_catalog.pg_sleep(600);'",
 		"1",
 		"open catalog inventory transaction",
+		[]string{"--volume", openShardInventoryPath + ":" + shardInventoryPath + ":ro"},
+		[]string{"PGSHARD_SHARD_INVENTORY_SHA256=" + hex.EncodeToString(openShardInventoryDigest[:])},
 		nil,
 	)
 
 	const inventoryBoundaryDataParent = "/var/lib/postgresql/18-genesis-inventory-boundary"
+	inventoryCommitCommand := `      --file="$PGSHARD_SHARD_INVENTORY"
+fi
+`
 	inventoryBoundaryScript := strings.Replace(
 		bootstrapScript(inventoryBoundaryDataParent),
-		"COMMIT;\nPGSHARD_SHARD_INVENTORY",
-		"COMMIT;\nSELECT pg_catalog.pg_sleep(600);\nPGSHARD_SHARD_INVENTORY",
+		inventoryCommitCommand,
+		`      --file="$PGSHARD_SHARD_INVENTORY"
+  while :; do sleep 1; done
+fi
+`,
 		1,
 	)
 	if inventoryBoundaryScript == bootstrapScript(inventoryBoundaryDataParent) {
@@ -2776,24 +2798,25 @@ VALUES ('app');
 		func() { writeDatabaseGenesis(canonicalDatabaseGenesis) },
 	)
 
-	committedDatabaseGenesis := strings.Replace(
-		canonicalDatabaseGenesis,
-		"COMMIT;\n",
-		"COMMIT;\nSELECT pg_catalog.pg_sleep(600);\n",
+	const committedDatabaseGenesisParent = "/var/lib/postgresql/18-genesis-database-committed"
+	databaseGenesisCommitCommand := `    --file="$database_topology_preflight" --file="$database_genesis" >/dev/null
+`
+	committedDatabaseGenesisScript := strings.Replace(
+		bootstrapScript(committedDatabaseGenesisParent),
+		databaseGenesisCommitCommand,
+		databaseGenesisCommitCommand+"while :; do sleep 1; done\n",
 		1,
 	)
-	if committedDatabaseGenesis == canonicalDatabaseGenesis {
-		t.Fatal("database genesis commit boundary injection did not match")
+	if committedDatabaseGenesisScript == bootstrapScript(committedDatabaseGenesisParent) {
+		t.Fatal("database genesis commit boundary injection did not match the bootstrap script")
 	}
-	writeDatabaseGenesis(committedDatabaseGenesis)
-	const committedDatabaseGenesisParent = "/var/lib/postgresql/18-genesis-database-committed"
 	assertGenesisCrashRetry(
 		committedDatabaseGenesisParent,
-		bootstrapScript(committedDatabaseGenesisParent),
+		committedDatabaseGenesisScript,
 		"SELECT (SELECT count(*) FROM pgshard_catalog.logical_databases WHERE state = 'active'), (SELECT count(*) FROM pgshard_catalog.routing_ranges AS ranges JOIN pgshard_catalog.active_routing_epochs AS active ON active.routing_epoch = ranges.routing_epoch)",
 		"2|3",
 		"database genesis commit",
-		func() { writeDatabaseGenesis(canonicalDatabaseGenesis) },
+		nil,
 	)
 
 	const emptyDataParent = "/var/lib/postgresql/18-empty"
