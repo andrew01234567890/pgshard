@@ -115,7 +115,6 @@ rules:
   - create
   - get
   - list
-  - update
   - watch
 - apiGroups:
   - pgshard.io
