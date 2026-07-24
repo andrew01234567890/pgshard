@@ -259,20 +259,23 @@ impl<'a> Scanner<'a> {
         State::Initial
     }
 
-    /// Consumes a numeric literal together with every identifier byte trailing
-    /// it, mirroring flex's `*_junk` rules, whose `{identifier}` tail matches
-    /// `ident_cont` — and `ident_cont` contains `$`. `psql` therefore lexes
-    /// `1e5$q$` as one junk token and stays in INITIAL, so absorbing the whole
-    /// run is what keeps the two agreed; stopping at the `$` would open a body
-    /// `psql` never opens and hide everything inside it.
+    /// Consumes a numeric literal and the identifier run that flex's `*_junk`
+    /// rules would fold into it.
+    ///
+    /// Those rules are `{number}{identifier}`, and `{identifier}` is
+    /// `{ident_start}{ident_cont}*`. `ident_cont` contains `$` but
+    /// `ident_start` does NOT, so the distinction is where the `$` sits:
+    /// `1e5$q$` is one junk token because `e` supplies the `ident_start` and
+    /// the `$`s are absorbed after it, while in `1$q$` the `$` ENDS the number
+    /// for `psql` and opens a dollar body. Absorbing that `$` too would leave
+    /// the scanner in INITIAL where `psql` is inside a body, and the two would
+    /// stay out of phase for the rest of the input.
     ///
     /// Digit separators, exponent signs and decimal points are deliberately not
     /// modelled: leaving those bytes in INITIAL can only widen what is
     /// inspected, never narrow it.
     fn consume_number(&mut self) -> Result<(), CatalogMaterializationProgramError> {
-        while self.peek(0).is_some_and(is_identifier_continuation) {
-            self.pos += 1;
-        }
+        self.consume_numeric_run();
         if matches!(self.peek(0), Some(b'-' | b'+')) {
             // A sign closing a valid exponent belongs to the literal. A sign
             // that is not part of one is where flex's `realfail` rule competes
@@ -284,11 +287,24 @@ impl<'a> Scanner<'a> {
                 return Err(self.reject());
             }
             self.pos += 1;
-            while self.peek(0).is_some_and(is_identifier_continuation) {
-                self.pos += 1;
-            }
+            self.consume_numeric_run();
         }
         Ok(())
+    }
+
+    fn consume_numeric_run(&mut self) {
+        while let Some(byte) = self.peek(0) {
+            if byte.is_ascii_digit() {
+                self.pos += 1;
+            } else if is_identifier_start(byte) {
+                while self.peek(0).is_some_and(is_identifier_continuation) {
+                    self.pos += 1;
+                }
+                return;
+            } else {
+                return;
+            }
+        }
     }
 
     fn classify_dollar(&mut self) -> State {
@@ -867,11 +883,20 @@ mod tests {
     }
 
     #[test]
-    fn a_numeric_literal_absorbs_its_whole_junk_run_including_dollars() {
-        // flex's `*_junk` rules end in `{identifier}`, whose `ident_cont`
-        // contains `$`, so `psql` lexes these as one token and stays in
-        // INITIAL. Stopping at the `$` would open a dollar body `psql` never
-        // opens and make everything inside it invisible.
+    fn a_numeric_literal_absorbs_only_a_junk_run_that_starts_with_ident_start() {
+        // flex's `*_junk` rules are `{number}{identifier}`, and `{identifier}`
+        // is `{ident_start}{ident_cont}*`. `ident_cont` contains `$` but
+        // `ident_start` does not, so `1e5$q$` is one token (the `e` starts the
+        // identifier) while in `1$q$` the `$` ends the number and opens a
+        // dollar body. Absorbing either too little or too much desynchronizes
+        // the scanner from `psql` for the remainder of the input.
+        assert_rejects_caller_framed("SELECT 1$q$ $q$ \\echo PWNED\n$q$;\n");
+        assert_rejects_caller_framed("SELECT 1.5$q$ $q$ \\echo PWNED\n$q$;\n");
+        assert_rejects_caller_framed("SELECT 007$q$ $q$ \\echo PWNED\n$q$;\n");
+        assert_rejects_caller_framed("SELECT 1$$ $$ \\echo PWNED\n$$;\n");
+        assert_rejects_caller_framed("SELECT 1e-5$q$ $q$ \\echo PWNED\n$q$;\n");
+        // A statement smuggled past the envelope accounting by the same desync.
+        assert_rejects_caller_framed("SELECT 1$q$ $q$;\nSELECT 'smuggled';\n$q$;\n");
         assert_rejects_caller_framed("SELECT 1e5$q$ \\echo PWNED $q$;\n");
         assert_rejects_caller_framed("SELECT 1.5e2$q$ \\echo PWNED $q$;\n");
         assert_rejects_caller_framed("SELECT 1e5$$ \\echo PWNED $$;\n");
