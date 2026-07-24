@@ -156,7 +156,8 @@ func main() {
 		}
 		if err := ctrl.NewWebhookManagedBy(manager, &pgshardv1alpha1.PgShardCatalogActivation{}).
 			WithValidator(&pgshardv1alpha1.PgShardCatalogActivationValidator{
-				ControllerUsername: "system:serviceaccount:" + options.webhook.namespace + ":pgshard-controller-manager",
+				ControllerUsername:  "system:serviceaccount:" + options.webhook.namespace + ":pgshard-controller-manager",
+				PublicationVerifier: controller.NewCatalogActivationPublicationVerifier(manager.GetAPIReader(), options.images),
 			}).
 			Complete(); err != nil {
 			setupLog.Error(err, "unable to create webhook", "webhook", "PgShardCatalogActivation")

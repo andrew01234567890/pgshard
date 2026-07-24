@@ -2475,6 +2475,7 @@ func assertKINDCatalogCandidatesNotConsumed(t *testing.T, ctx context.Context, k
 			}
 		}
 	}
+	orchestratorCAProjections := 0
 	for _, workload := range deployments.Items {
 		for _, volume := range workload.Spec.Template.Spec.Volumes {
 			if volume.ConfigMap != nil {
@@ -2483,9 +2484,25 @@ func assertKINDCatalogCandidatesNotConsumed(t *testing.T, ctx context.Context, k
 				}
 			}
 			if volume.Secret != nil && cluster.Status.CatalogAccess != nil && volume.Secret.SecretName == cluster.Status.CatalogAccess.SecretName {
-				t.Fatalf("Deployment %s consumed staged multi-member catalog access %s", workload.Name, volume.Secret.SecretName)
+				if workload.Name != cluster.Name+owned.OrchestratorSuffix || volume.Name != "catalog-activation-ca" ||
+					volume.Secret.DefaultMode == nil || *volume.Secret.DefaultMode != 0o440 || len(volume.Secret.Items) != 1 ||
+					volume.Secret.Items[0].Key != owned.CatalogCACertificateKey || volume.Secret.Items[0].Path != "ca.crt" ||
+					volume.Secret.Items[0].Mode == nil || *volume.Secret.Items[0].Mode != 0o440 || volume.Secret.Optional != nil {
+					t.Fatalf("Deployment %s consumed broader-than-CA catalog access %s through volume %#v", workload.Name, volume.Secret.SecretName, volume)
+				}
+				orchestratorCAProjections++
 			}
 		}
+		if workload.Name == cluster.Name+owned.OrchestratorSuffix {
+			if len(workload.Spec.Template.Spec.Containers) != 1 || workload.Spec.Template.Spec.Containers[0].Name != "orchestrator" ||
+				!slices.Contains(workload.Spec.Template.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: "catalog-activation-ca", MountPath: "/etc/pgshard/catalog-activation", ReadOnly: true}) ||
+				!activationContainerHasExactLiteralEnvironment(workload.Spec.Template.Spec, "orchestrator", "PGSHARD_CATALOG_ACTIVATION_CA_FILE", "/etc/pgshard/catalog-activation/ca.crt") {
+				t.Fatalf("orchestrator catalog activation CA projection is incomplete: %#v", workload.Spec.Template.Spec)
+			}
+		}
+	}
+	if cluster.Status.CatalogAccess != nil && orchestratorCAProjections != 1 {
+		t.Fatalf("orchestrator catalog activation CA projection count = %d, want 1", orchestratorCAProjections)
 	}
 	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: owned.CatalogServiceName(cluster.Name)}, &corev1.Service{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("multi-member catalog candidate foundation published catalog Service: %v", err)

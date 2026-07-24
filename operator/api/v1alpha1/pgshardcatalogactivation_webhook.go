@@ -19,7 +19,17 @@ import (
 // the inert carrier. RBAC in this slice grants neither future writer access.
 // +kubebuilder:object:generate=false
 type PgShardCatalogActivationValidator struct {
-	ControllerUsername string
+	ControllerUsername  string
+	PublicationVerifier CatalogActivationPublicationVerifier
+}
+
+// CatalogActivationPublicationVerifier proves that every Kubernetes object
+// bound by a proposed activation request is still the exact live publication
+// observed by the publisher. Implementations must use an authoritative reader;
+// the orchestrator is deliberately not granted Secret read access.
+// +kubebuilder:object:generate=false
+type CatalogActivationPublicationVerifier interface {
+	VerifyPublication(context.Context, *PgShardCatalogActivation, *PgShardCatalogActivation) error
 }
 
 func (validator *PgShardCatalogActivationValidator) ValidateCreate(ctx context.Context, activation *PgShardCatalogActivation) (admission.Warnings, error) {
@@ -34,7 +44,7 @@ func (validator *PgShardCatalogActivationValidator) ValidateCreate(ctx context.C
 	return nil, invalidCatalogActivationIfAny(activation.Name, errors)
 }
 
-func (*PgShardCatalogActivationValidator) ValidateUpdate(ctx context.Context, oldActivation, newActivation *PgShardCatalogActivation) (admission.Warnings, error) {
+func (validator *PgShardCatalogActivationValidator) ValidateUpdate(ctx context.Context, oldActivation, newActivation *PgShardCatalogActivation) (admission.Warnings, error) {
 	errors := validateCatalogActivationMetadataUpdate(oldActivation, newActivation)
 	request, requestErr := admission.RequestFromContext(ctx)
 	if requestErr != nil {
@@ -51,6 +61,13 @@ func (*PgShardCatalogActivationValidator) ValidateUpdate(ctx context.Context, ol
 	}
 	if specChanged && statusChanged {
 		errors = append(errors, field.Forbidden(field.NewPath("status"), "spec publication and status acceptance must be separate API operations"))
+	}
+	if specChanged && len(errors) == 0 {
+		if validator.PublicationVerifier == nil {
+			errors = append(errors, field.Forbidden(field.NewPath("spec"), "catalog activation publication verification is unavailable"))
+		} else if err := validator.PublicationVerifier.VerifyPublication(ctx, oldActivation, newActivation); err != nil {
+			return nil, fmt.Errorf("verify live catalog activation publication: %w", err)
+		}
 	}
 	return nil, invalidCatalogActivationIfAny(newActivation.Name, errors)
 }

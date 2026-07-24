@@ -143,11 +143,7 @@ async fn observe_once<S: CandidateStore>(
         // Anchor both local clocks before either Kubernetes read. Host suspend
         // and I/O latency consume this observation window.
         let started = state.suspend_aware_now()?;
-        let before = read_bound_candidates(store, plan).await?;
-        let after = read_bound_candidates(store, plan).await?;
-        if before != after {
-            return Err(CatalogCandidateError::EvidenceChanged);
-        }
+        let before = read_stable_bound_candidates(store, plan).await?;
         let deadline = started
             .checked_add(freshness)
             .ok_or(CatalogCandidateError::FreshnessExpired)?;
@@ -161,6 +157,72 @@ async fn observe_once<S: CandidateStore>(
         state.record_catalog_candidate_failure(error.failure_reason());
     }
     result
+}
+
+/// Reusable one-shot reader for an exact, stable pair of authoritative
+/// non-Secret Kubernetes observations.
+///
+/// This reader carries no mutation client and no publication capability. It
+/// reuses the diagnostic candidate parser so a later publisher cannot develop
+/// a second, weaker interpretation of cluster status or candidate `ConfigMaps`.
+#[allow(dead_code)] // Deliberately inert until publisher composition is reviewed.
+pub(crate) struct AuthoritativeCandidateReader {
+    store: KubernetesCandidateStore,
+    plan: CatalogCandidateObservationPlan,
+    overall_timeout: Duration,
+}
+
+#[allow(dead_code)] // Deliberately inert until publisher composition is reviewed.
+impl AuthoritativeCandidateReader {
+    /// Builds a read-only client with independent per-GET and whole-bracket
+    /// budgets. The overall budget may accumulate multiple individually
+    /// healthy reads but can never exceed the existing five-second evidence
+    /// window.
+    pub(crate) fn new(
+        plan: CatalogCandidateObservationPlan,
+        per_request_timeout: Duration,
+        overall_timeout: Duration,
+    ) -> Result<Self, CatalogCandidateError> {
+        validate_plan(&plan, MAXIMUM_CANDIDATE_FRESHNESS)?;
+        if !(Duration::from_millis(100)..=MAXIMUM_CANDIDATE_FRESHNESS)
+            .contains(&per_request_timeout)
+            || !(per_request_timeout..=MAXIMUM_CANDIDATE_FRESHNESS).contains(&overall_timeout)
+        {
+            return Err(CatalogCandidateError::InvalidPlan);
+        }
+        let store = KubernetesCandidateStore::new(&plan, per_request_timeout)?;
+        Ok(Self {
+            store,
+            plan,
+            overall_timeout,
+        })
+    }
+
+    pub(crate) async fn read(&self) -> Result<BoundCandidateSet, CatalogCandidateError> {
+        read_authoritative_with_store(&self.store, &self.plan, self.overall_timeout).await
+    }
+}
+
+async fn read_authoritative_with_store<S: CandidateStore>(
+    store: &S,
+    plan: &CatalogCandidateObservationPlan,
+    request_timeout: Duration,
+) -> Result<BoundCandidateSet, CatalogCandidateError> {
+    tokio::time::timeout(request_timeout, read_stable_bound_candidates(store, plan))
+        .await
+        .map_err(|_| CatalogCandidateError::AuthoritativeReadTimedOut)?
+}
+
+async fn read_stable_bound_candidates<S: CandidateStore>(
+    store: &S,
+    plan: &CatalogCandidateObservationPlan,
+) -> Result<BoundCandidateSet, CatalogCandidateError> {
+    let before = read_bound_candidates(store, plan).await?;
+    let after = read_bound_candidates(store, plan).await?;
+    if before != after {
+        return Err(CatalogCandidateError::EvidenceChanged);
+    }
+    Ok(before)
 }
 
 async fn read_bound_candidates<S: CandidateStore>(
@@ -322,6 +384,9 @@ fn validate_cluster_status(
         .get("status")
         .cloned()
         .ok_or(CatalogCandidateError::InvalidClusterStatus)?;
+    if !go_compatible_json_domain(&status_value) {
+        return Err(CatalogCandidateError::InvalidClusterStatus);
+    }
     let status: ClusterStatus = serde_json::from_value(status_value.clone())?;
     if status.observed_generation != generation
         || status.bootstrap_spec.shards != plan.shard_count
@@ -373,7 +438,7 @@ fn validate_cluster_status(
             generation,
             status_sha256: domain_digest(
                 CLUSTER_STATUS_FINGERPRINT_DOMAIN,
-                &serde_json::to_vec(&status_value)?,
+                &go_compatible_json(&status_value)?,
             ),
         },
         catalog_activation,
@@ -385,6 +450,81 @@ fn validate_cluster_status(
         operation_writer_access,
         postgresql_configuration,
     })
+}
+
+// Kubernetes admission recomputes this digest with Go's encoding/json. Match
+// its additional string escaping without changing JSON structure or literals.
+// The caller first restricts values to this shared integer-only number domain.
+fn go_compatible_json(value: &Value) -> Result<Vec<u8>, serde_json::Error> {
+    let encoded = serde_json::to_vec(value)?;
+    let mut compatible = Vec::with_capacity(encoded.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut index = 0;
+    while index < encoded.len() {
+        let byte = encoded[index];
+        if !in_string {
+            compatible.push(byte);
+            if byte == b'"' {
+                in_string = true;
+            }
+            index += 1;
+            continue;
+        }
+        if escaped {
+            compatible.push(byte);
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'\\' => {
+                compatible.push(byte);
+                escaped = true;
+                index += 1;
+            }
+            b'"' => {
+                compatible.push(byte);
+                in_string = false;
+                index += 1;
+            }
+            b'<' => {
+                compatible.extend_from_slice(br"\u003c");
+                index += 1;
+            }
+            b'>' => {
+                compatible.extend_from_slice(br"\u003e");
+                index += 1;
+            }
+            b'&' => {
+                compatible.extend_from_slice(br"\u0026");
+                index += 1;
+            }
+            0xe2 if encoded.get(index..index + 3) == Some(&[0xe2, 0x80, 0xa8]) => {
+                compatible.extend_from_slice(br"\u2028");
+                index += 3;
+            }
+            0xe2 if encoded.get(index..index + 3) == Some(&[0xe2, 0x80, 0xa9]) => {
+                compatible.extend_from_slice(br"\u2029");
+                index += 3;
+            }
+            _ => {
+                compatible.push(byte);
+                index += 1;
+            }
+        }
+    }
+    debug_assert!(!in_string && !escaped);
+    Ok(compatible)
+}
+
+fn go_compatible_json_domain(value: &Value) -> bool {
+    match value {
+        Value::Null | Value::Bool(_) | Value::String(_) => true,
+        Value::Number(number) => number.is_i64() || number.is_u64(),
+        Value::Array(values) => values.iter().all(go_compatible_json_domain),
+        Value::Object(values) => values.values().all(go_compatible_json_domain),
+    }
 }
 
 fn validate_catalog_activation(
@@ -1163,7 +1303,7 @@ impl CandidateStore for KubernetesCandidateStore {
 }
 
 #[derive(Debug, Error)]
-enum CatalogCandidateError {
+pub(crate) enum CatalogCandidateError {
     #[error("catalog-candidate observation plan is invalid")]
     InvalidPlan,
     #[error("PgShardCluster status is absent, stale, deleting, or inconsistent")]
@@ -1178,6 +1318,8 @@ enum CatalogCandidateError {
     EvidenceChanged,
     #[error("catalog-candidate observation expired before atomic publication")]
     FreshnessExpired,
+    #[error("authoritative catalog-candidate reread timed out")]
+    AuthoritativeReadTimedOut,
     #[error(transparent)]
     AuthorityClock(#[from] BoottimeError),
     #[error("in-cluster Kubernetes configuration is unavailable: {0}")]
@@ -1216,6 +1358,7 @@ impl CatalogCandidateError {
             | Self::InvalidCandidate
             | Self::InvalidObjectMetadata
             | Self::Json(_) => CatalogCandidateFailureReason::ValidationFailed,
+            Self::AuthoritativeReadTimedOut => CatalogCandidateFailureReason::CandidateUnavailable,
         }
     }
 }
@@ -1578,6 +1721,12 @@ mod tests {
 
     struct BlockingStore;
 
+    struct DelayedStore {
+        inner: StubStore,
+        delay: Duration,
+        per_request_timeout: Duration,
+    }
+
     impl CandidateStore for BlockingStore {
         async fn get_cluster_status(&self) -> Result<DynamicObject, CatalogCandidateError> {
             pending().await
@@ -1585,6 +1734,26 @@ mod tests {
 
         async fn get_candidate(&self, _name: &str) -> Result<ConfigMap, CatalogCandidateError> {
             pending().await
+        }
+    }
+
+    impl CandidateStore for DelayedStore {
+        async fn get_cluster_status(&self) -> Result<DynamicObject, CatalogCandidateError> {
+            tokio::time::timeout(self.per_request_timeout, async {
+                tokio::time::sleep(self.delay).await;
+                self.inner.get_cluster_status().await
+            })
+            .await
+            .map_err(|_| CatalogCandidateError::StatusRequestTimedOut)?
+        }
+
+        async fn get_candidate(&self, name: &str) -> Result<ConfigMap, CatalogCandidateError> {
+            tokio::time::timeout(self.per_request_timeout, async {
+                tokio::time::sleep(self.delay).await;
+                self.inner.get_candidate(name).await
+            })
+            .await
+            .map_err(|_| CatalogCandidateError::CandidateRequestTimedOut)?
         }
     }
 
@@ -2559,6 +2728,46 @@ mod tests {
     }
 
     #[test]
+    fn cluster_status_digest_matches_go_canonical_json() {
+        let status = json!({
+            "condition": "<ready>&\u{2028}\u{2029}",
+            "literal": r"\u003c\u2028",
+        });
+        let encoded = go_compatible_json(&status).expect("status JSON");
+        assert_eq!(
+            encoded,
+            br#"{"condition":"\u003cready\u003e\u0026\u2028\u2029","literal":"\\u003c\\u2028"}"#
+        );
+        assert_eq!(
+            domain_digest(CLUSTER_STATUS_FINGERPRINT_DOMAIN, &encoded),
+            "cbe68afa073340a29cc0a806ed69aba0ecd325f6d7b50df8c06f29b76e0f4471"
+        );
+    }
+
+    #[test]
+    fn cluster_status_digest_rejects_non_integer_numbers() {
+        assert!(go_compatible_json_domain(&json!({
+            "null": null,
+            "bool": true,
+            "string": "value",
+            "signed": -1,
+            "unsigned": 1,
+            "nested": [{"integer": 2}],
+        })));
+        assert!(!go_compatible_json_domain(&json!({"value": 1.0})));
+        assert!(!go_compatible_json_domain(
+            &json!({"value": [{"nested": 1.25}]})
+        ));
+
+        let (plan, mut cluster, _) = fixture();
+        cluster.data["status"]["numericDrift"] = json!(1.0);
+        assert!(matches!(
+            validate_cluster_status(&cluster, &plan),
+            Err(CatalogCandidateError::InvalidClusterStatus)
+        ));
+    }
+
+    #[test]
     fn rejects_noncanonical_payloads_and_metadata() {
         let (plan, cluster, candidates) = fixture();
         let status = validate_cluster_status(&cluster, &plan).expect("status");
@@ -2884,6 +3093,20 @@ mod tests {
         assert!(validate_plan(&plan(), Duration::from_millis(5_001)).is_err());
     }
 
+    #[test]
+    fn authoritative_reader_rejects_invalid_or_unbounded_budgets_before_client_creation() {
+        for (per_request, overall) in [
+            (Duration::from_millis(99), Duration::from_secs(1)),
+            (Duration::from_secs(1), Duration::from_millis(999)),
+            (Duration::from_secs(1), Duration::from_millis(5_001)),
+        ] {
+            assert!(matches!(
+                AuthoritativeCandidateReader::new(plan(), per_request, overall),
+                Err(CatalogCandidateError::InvalidPlan)
+            ));
+        }
+    }
+
     #[tokio::test]
     async fn rejects_pre_post_cluster_resource_version_or_generation_change_without_last_good() {
         for field in ["resource-version", "generation"] {
@@ -2922,6 +3145,38 @@ mod tests {
                 Some(CatalogCandidateFailureReason::EvidenceChanged)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn authoritative_reread_has_one_global_deadline() {
+        let error =
+            read_authoritative_with_store(&BlockingStore, &plan(), Duration::from_millis(10))
+                .await
+                .expect_err("stalled authoritative read");
+        assert!(matches!(
+            error,
+            CatalogCandidateError::AuthoritativeReadTimedOut
+        ));
+    }
+
+    #[tokio::test]
+    async fn authoritative_reread_accumulates_healthy_gets_under_a_distinct_total_budget() {
+        let (plan, cluster, candidates) = fixture();
+        let per_request_timeout = Duration::from_millis(100);
+        let store = DelayedStore {
+            inner: store(cluster, candidates),
+            delay: Duration::from_millis(20),
+            per_request_timeout,
+        };
+        let started = Instant::now();
+        let bound = read_authoritative_with_store(&store, &plan, Duration::from_millis(500))
+            .await
+            .expect("individually healthy stable reads fit the total budget");
+        assert_eq!(bound.candidate_count(), 3);
+        assert!(
+            started.elapsed() > per_request_timeout,
+            "the test must accumulate more latency than one GET budget"
+        );
     }
 
     #[tokio::test]

@@ -497,12 +497,15 @@ func TestSingleMemberPlanCreatesPostgreSQL18Primaries(t *testing.T) {
 		t.Fatalf("pooler received operation-writer material: volumes=%#v mounts=%#v", pooler.Spec.Template.Spec.Volumes, poolerContainer.VolumeMounts)
 	}
 	orchestrator := object[*appsv1.Deployment](t, plan, cluster.Name+OrchestratorSuffix)
-	if hasVolume(orchestrator.Spec.Template.Spec.Volumes, "catalog-operation-writer-auth") {
-		t.Fatalf("orchestrator received operation-writer material before connector composition: %#v", orchestrator.Spec.Template.Spec.Volumes)
+	if hasVolume(orchestrator.Spec.Template.Spec.Volumes, "catalog-operation-writer-auth") ||
+		hasVolume(orchestrator.Spec.Template.Spec.Volumes, catalogActivationCAVolumeName) {
+		t.Fatalf("single-member orchestrator received activation-only material before connector composition: %#v", orchestrator.Spec.Template.Spec.Volumes)
 	}
 	for _, container := range orchestrator.Spec.Template.Spec.Containers {
-		if containsVolumeMount(container.VolumeMounts, "catalog-operation-writer-auth", true) {
-			t.Fatalf("orchestrator mounted operation-writer material before connector composition: %#v", container.VolumeMounts)
+		if containsVolumeMount(container.VolumeMounts, "catalog-operation-writer-auth", true) ||
+			containsNamedVolumeMount(container.VolumeMounts, catalogActivationCAVolumeName) ||
+			containerHasEnvironment(container, "PGSHARD_CATALOG_ACTIVATION_CA_FILE") {
+			t.Fatalf("single-member orchestrator received activation-only configuration before connector composition: env=%#v mounts=%#v", container.Env, container.VolumeMounts)
 		}
 	}
 
@@ -3329,6 +3332,26 @@ func TestMultiMemberAgentPlanPublishesSourcesAndTCPClosedStandbys(t *testing.T) 
 				t.Fatal(err)
 			}
 			carrier := cluster.Status.CatalogActivation
+			orchestrator := object[*appsv1.Deployment](t, plan, cluster.Name+OrchestratorSuffix)
+			orchestratorContainer := orchestrator.Spec.Template.Spec.Containers[0]
+			if envValue(orchestratorContainer.Env, "PGSHARD_CATALOG_ACTIVATION_CA_FILE") != catalogActivationCAFilePath ||
+				!slices.Contains(orchestratorContainer.VolumeMounts, corev1.VolumeMount{Name: catalogActivationCAVolumeName, MountPath: catalogActivationCAMountPath, ReadOnly: true}) {
+				t.Fatalf("orchestrator catalog activation CA environment/mount = env %#v mounts %#v", orchestratorContainer.Env, orchestratorContainer.VolumeMounts)
+			}
+			caProjection := volumeByName(t, orchestrator.Spec.Template.Spec.Volumes, catalogActivationCAVolumeName).Secret
+			if caProjection == nil || caProjection.SecretName != cluster.Status.CatalogAccess.SecretName ||
+				caProjection.DefaultMode == nil || *caProjection.DefaultMode != 0o440 ||
+				len(caProjection.Items) != 1 || caProjection.Items[0].Key != CatalogCACertificateKey ||
+				caProjection.Items[0].Path != "ca.crt" || caProjection.Items[0].Mode == nil || *caProjection.Items[0].Mode != 0o440 {
+				t.Fatalf("orchestrator catalog activation CA projection = %#v", caProjection)
+			}
+			orchestratorRole := object[*rbacv1.Role](t, plan, cluster.Name+OrchestratorSuffix)
+			for _, rule := range orchestratorRole.Rules {
+				if slices.Contains(rule.Resources, "secrets") ||
+					(slices.Contains(rule.Resources, "pgshardcatalogactivations") && slices.Contains(rule.Verbs, "update")) {
+					t.Fatalf("orchestrator received secret-read or activation-update authority: %#v", orchestratorRole.Rules)
+				}
+			}
 			for shard := int32(0); shard < cluster.Spec.Shards; shard++ {
 				role := object[*rbacv1.Role](t, plan, PostgreSQLAgentServiceAccountName(cluster.Name, shard))
 				wantRules := []rbacv1.PolicyRule{{
