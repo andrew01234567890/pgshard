@@ -204,7 +204,7 @@ impl<'a> Scanner<'a> {
             b'$' => Ok(self.classify_dollar()),
             b':' => self.classify_colon(),
             b'0'..=b'9' => {
-                self.consume_number();
+                self.consume_number()?;
                 self.statements.other_token();
                 Ok(State::Initial)
             }
@@ -259,53 +259,36 @@ impl<'a> Scanner<'a> {
         State::Initial
     }
 
-    /// Numeric literals absorb trailing identifier characters exactly like
-    /// flex's `*_junk` and `realfail` rules, so `1E'…'` is numeric junk `1E`
-    /// followed by an ordinary string, never an `E'…'` string.
-    fn consume_number(&mut self) {
-        self.consume_digits();
-        if self.peek(0) == Some(b'.') && self.peek(1).is_some_and(|byte| byte.is_ascii_digit()) {
-            self.pos += 1;
-            self.consume_digits();
-        } else if self.peek(0) == Some(b'.') && self.peek(1) != Some(b'.') {
+    /// Consumes a numeric literal together with every identifier byte trailing
+    /// it, mirroring flex's `*_junk` rules, whose `{identifier}` tail matches
+    /// `ident_cont` — and `ident_cont` contains `$`. `psql` therefore lexes
+    /// `1e5$q$` as one junk token and stays in INITIAL, so absorbing the whole
+    /// run is what keeps the two agreed; stopping at the `$` would open a body
+    /// `psql` never opens and hide everything inside it.
+    ///
+    /// Digit separators, exponent signs and decimal points are deliberately not
+    /// modelled: leaving those bytes in INITIAL can only widen what is
+    /// inspected, never narrow it.
+    fn consume_number(&mut self) -> Result<(), CatalogMaterializationProgramError> {
+        while self.peek(0).is_some_and(is_identifier_continuation) {
             self.pos += 1;
         }
-        if let Some(b'e' | b'E') = self.peek(0) {
-            match (self.peek(1), self.peek(2)) {
-                (Some(digit), _) if digit.is_ascii_digit() => {
-                    self.pos += 1;
-                    self.consume_digits();
-                    self.consume_identifier_junk();
-                }
-                (Some(b'+' | b'-'), Some(digit)) if digit.is_ascii_digit() => {
-                    self.pos += 2;
-                    self.consume_digits();
-                    self.consume_identifier_junk();
-                }
-                (Some(b'+' | b'-'), _) => {
-                    self.pos += 2;
-                }
-                _ => {
-                    self.consume_identifier_junk();
-                }
+        if matches!(self.peek(0), Some(b'-' | b'+')) {
+            // A sign closing a valid exponent belongs to the literal. A sign
+            // that is not part of one is where flex's `realfail` rule competes
+            // with the `*_junk` rules, and which of them wins decides whether a
+            // following `--` opens a comment or leaves a lone operator with
+            // live INITIAL bytes after it. Nothing rendered here abuts a
+            // number that way, so refuse the ambiguity rather than model it.
+            if !self.peek(1).is_some_and(|byte| byte.is_ascii_digit()) {
+                return Err(self.reject());
             }
-        } else {
-            self.consume_identifier_junk();
-        }
-    }
-
-    fn consume_digits(&mut self) {
-        while self.peek(0).is_some_and(|byte| byte.is_ascii_digit()) {
             self.pos += 1;
-        }
-    }
-
-    fn consume_identifier_junk(&mut self) {
-        if self.peek(0).is_some_and(is_identifier_start) {
             while self.peek(0).is_some_and(is_identifier_continuation) {
                 self.pos += 1;
             }
         }
+        Ok(())
     }
 
     fn classify_dollar(&mut self) -> State {
@@ -365,7 +348,16 @@ impl<'a> Scanner<'a> {
                 b'\'' if self.peek(1) == Some(b'\'') => self.pos += 2,
                 b'\'' => {
                     self.pos += 1;
-                    return Ok(self.string_stop(kind));
+                    // A closing quote always returns to INITIAL. String
+                    // continuation — a second literal on a later line resuming
+                    // this one's state — is backend-lexer behaviour, which
+                    // reads a whole query buffer. `psql` feeds its scanner one
+                    // newline-stripped line at a time, so its continuation rule
+                    // requires a newline it never sees and it is back in
+                    // INITIAL on the next line. Modelling continuation here
+                    // kept the scanner inside the string while `psql` executed
+                    // what followed.
+                    return Ok(State::Initial);
                 }
                 b'\\' => match kind {
                     StringKind::Escape => self.pos += 2,
@@ -382,36 +374,6 @@ impl<'a> Scanner<'a> {
             }
         }
         Ok(kind.state())
-    }
-
-    /// Mirrors the `xqs` lookahead: horizontal whitespace and line comments
-    /// containing at least one newline before another `'` continue the string
-    /// in its original state (`state_before_str_stop`), never unconditionally
-    /// `xq`.
-    fn string_stop(&mut self, kind: StringKind) -> State {
-        let mut probe = self.pos;
-        let mut saw_newline = false;
-        while probe < self.input.len() {
-            match self.input[probe] {
-                b' ' | b'\t' => probe += 1,
-                b'\n' => {
-                    saw_newline = true;
-                    probe += 1;
-                }
-                b'-' if self.input.get(probe + 1) == Some(&b'-') => {
-                    probe += 2;
-                    while probe < self.input.len() && self.input[probe] != b'\n' {
-                        probe += 1;
-                    }
-                }
-                b'\'' if saw_newline => {
-                    self.pos = probe + 1;
-                    return kind.state();
-                }
-                _ => break,
-            }
-        }
-        State::Initial
     }
 
     fn step_double_quoted(&mut self, state: State) -> State {
@@ -886,14 +848,44 @@ mod tests {
     }
 
     #[test]
-    fn string_continuation_restores_the_original_string_state() {
-        assert_accepts_caller_framed("SELECT E'a'\n'\\'b';\n");
-        assert_accepts_caller_framed("SELECT E'a' -- note\n'\\'b';\n");
-        assert_accepts_caller_framed("SELECT E'a'\n\t \n'\\'b';\n");
-        assert_rejects_caller_framed("SELECT E'a' '\\'b';\n");
-        assert_rejects_caller_framed("SELECT E'a' /* block */\n'\\'b';\n");
+    fn a_closing_quote_always_returns_to_initial() {
+        // `psql` scans one newline-stripped line at a time, so its
+        // `quotecontinue` rule — which requires a literal newline — never
+        // matches and it is back in INITIAL on the next line. Resuming the
+        // previous string state here would leave every following byte
+        // uninspected while `psql` executed it.
+        assert_rejects_caller_framed("SELECT E'a'\n'\\' \\! id ; ';\n");
+        assert_rejects_caller_framed("SELECT E'a'\n'\\' \\echo pwned\n';\n");
+        assert_rejects_caller_framed("SELECT E'a'\n'\\' :evil\n';\n");
+        assert_rejects_caller_framed("SELECT E'a'\n'\\' ; COMMIT ; SELECT 1\n';\n");
+        assert_rejects_caller_framed("SELECT E'a' -- note\n'\\' \\echo pwned\n';\n");
+        assert_rejects_self_framed("BEGIN;\nSELECT E'a'\n'\\' \\i /etc/passwd\n';\nCOMMIT;\n");
+        assert_rejects_caller_framed("SELECT E'a'\n'\\'b';\n");
+        // Adjacent literals with no backslash remain ordinary INITIAL tokens.
         assert_accepts_caller_framed("SELECT 'a'\n'b';\n");
         assert_accepts_caller_framed("SELECT 'a' 'b';\n");
+    }
+
+    #[test]
+    fn a_numeric_literal_absorbs_its_whole_junk_run_including_dollars() {
+        // flex's `*_junk` rules end in `{identifier}`, whose `ident_cont`
+        // contains `$`, so `psql` lexes these as one token and stays in
+        // INITIAL. Stopping at the `$` would open a dollar body `psql` never
+        // opens and make everything inside it invisible.
+        assert_rejects_caller_framed("SELECT 1e5$q$ \\echo PWNED $q$;\n");
+        assert_rejects_caller_framed("SELECT 1.5e2$q$ \\echo PWNED $q$;\n");
+        assert_rejects_caller_framed("SELECT 1e5$$ \\echo PWNED $$;\n");
+        assert_rejects_caller_framed("SELECT $1e5$q$ \\echo PWNED $q$;\n");
+        assert_rejects_caller_framed("SELECT 1e5$x$;\n\\! touch /tmp/owned\n$x$;\n");
+        assert_rejects_caller_framed("SELECT $1e5$x$, :'secret';\n$x$;\n");
+        assert_rejects_caller_framed("SELECT 1_2E--\\echo pwned\n;\n");
+        assert_rejects_caller_framed("SET a = :=$1E--' \n ';\n");
+        assert_rejects_self_framed(
+            "BEGIN;\nSELECT 1e5$q$;\nROLLBACK;\nCREATE TABLE pwned(id int);\n$q$;\nCOMMIT;\n",
+        );
+        // A dollar body opened at a genuine token boundary still works.
+        assert_accepts_caller_framed("SELECT $tag$ body $tag$;\n");
+        assert_accepts_caller_framed("SELECT 5, $$body$$;\n");
     }
 
     #[test]
