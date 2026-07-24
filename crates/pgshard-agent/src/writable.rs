@@ -719,6 +719,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_wait_for_a_superseded_generation_resolves_immediately() {
+        // The race this closes: a caller publishes for one generation, another
+        // is installed, and only then does the caller build its waiter. Binding
+        // to whatever is current would wait out the replacement and leave the
+        // caller's published work standing, so a waiter named for a generation
+        // that is no longer authorized must complete at once.
+        let clock = Arc::new(crate::boottime::FakeBoottimeClock::new(
+            BoottimeInstant::from_nanos_for_test(1_000_000_000),
+        ));
+        let (lease_attempt, postgres_attempt) =
+            writable_attempt_pair_with_clock_for_test(clock.clone());
+        let deadline = clock
+            .now()
+            .expect("fake clock")
+            .checked_add(Duration::from_secs(60))
+            .expect("test deadline fits");
+        let acted_for = durable_generation_for_test(1);
+        lease_attempt.install_authority(deadline, acted_for.clone());
+        lease_attempt.install_authority(deadline, durable_generation_for_test(2));
+
+        let wait = postgres_attempt
+            .authority_observer()
+            .wait_until_generation_invalid(Some(acted_for), Duration::ZERO);
+        tokio::time::timeout(Duration::from_millis(100), wait)
+            .await
+            .expect("a superseded generation is already invalid");
+
+        // The still-authorized generation keeps waiting, so the check is not
+        // simply resolving for everything.
+        let current = postgres_attempt
+            .authority_observer()
+            .generation_valid_for(Duration::ZERO)
+            .expect("authority installed");
+        let mut wait = Box::pin(
+            postgres_attempt
+                .authority_observer()
+                .wait_until_generation_invalid(Some(current), Duration::ZERO),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut wait)
+                .await
+                .is_err(),
+            "the authorized generation must still be waited on"
+        );
+    }
+
+    #[tokio::test]
     async fn private_authority_wait_cannot_rebind_before_its_first_poll() {
         let clock = Arc::new(crate::boottime::FakeBoottimeClock::new(
             BoottimeInstant::from_nanos_for_test(1_000_000_000),

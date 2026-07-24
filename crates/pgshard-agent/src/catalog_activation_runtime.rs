@@ -131,6 +131,15 @@ impl CatalogRuntimeBinding {
     }
 }
 
+/// What ended the wait for a connection attempt.
+enum ConnectOutcome<S> {
+    Connected(Option<(S, CatalogRuntimeIdentity)>),
+    /// Authority or inputs moved on; start a fresh attempt.
+    Restart,
+    /// A private channel closed; this binder has nothing left to serve.
+    Closed,
+}
+
 struct OutputWithdrawalGuard(watch::Sender<Option<Arc<ValidatedCatalogRuntime>>>);
 
 impl Drop for OutputWithdrawalGuard {
@@ -231,8 +240,10 @@ async fn supervise_catalog_runtime_binding_with_connector<C, F>(
             continue;
         }
 
-        let connection = connect(socket_dir.clone(), generation.clone());
-        tokio::pin!(connection);
+        // Held in an Option so the in-flight connector can actually be
+        // dropped: parking inside a select arm would keep it alive and
+        // unpolled instead of cancelling it.
+        let mut connection = Some(Box::pin(connect(socket_dir.clone(), generation.clone())));
         // Bound to the generation this attempt acts for, not to whatever is
         // current now: another generation installed in between would otherwise
         // be waited out in its place, leaving this attempt's work standing.
@@ -240,18 +251,33 @@ async fn supervise_catalog_runtime_binding_with_connector<C, F>(
             .clone()
             .wait_until_generation_invalid(Some(generation.clone()), required_margin);
         tokio::pin!(authority_lost);
-        let connected = tokio::select! {
-            result = &mut connection => Some(result),
+        let outcome = tokio::select! {
+            result = async {
+                match connection.as_mut() {
+                    Some(connection) => connection.as_mut().await,
+                    None => std::future::pending().await,
+                }
+            } => ConnectOutcome::Connected(result),
             changed = attempt.inputs.changed() => {
                 if changed.is_err() {
-                    std::future::pending::<()>().await;
+                    ConnectOutcome::Closed
+                } else {
+                    ConnectOutcome::Restart
                 }
-                None
             }
-            () = &mut authority_lost => None,
+            () = attempt.output.closed() => ConnectOutcome::Closed,
+            () = &mut authority_lost => ConnectOutcome::Restart,
         };
-        let Some(connected) = connected else {
-            continue;
+        // Cancels the connector before anything else is awaited.
+        connection = None;
+        drop(connection);
+        let connected = match outcome {
+            ConnectOutcome::Connected(connected) => connected,
+            ConnectOutcome::Restart => continue,
+            ConnectOutcome::Closed => {
+                std::future::pending::<()>().await;
+                return;
+            }
         };
         let Some((session, identity)) = connected else {
             wait_for_retry_input_or_authority_loss(
@@ -279,6 +305,14 @@ async fn supervise_catalog_runtime_binding_with_connector<C, F>(
         }
         let mut driver_ended = session.driver_ended();
         if *driver_ended.borrow() {
+            // A server that accepts the identity query and then drops the
+            // connection would otherwise be reconnected to with no delay.
+            wait_for_retry_input_or_authority_loss(
+                &mut attempt.inputs,
+                authority.clone(),
+                required_margin,
+            )
+            .await;
             continue;
         }
         if !publish_if_current(
@@ -294,6 +328,12 @@ async fn supervise_catalog_runtime_binding_with_connector<C, F>(
             &boot_id,
             identity,
         ) {
+            wait_for_retry_input_or_authority_loss(
+                &mut attempt.inputs,
+                authority.clone(),
+                required_margin,
+            )
+            .await;
             continue;
         }
 
@@ -686,6 +726,18 @@ mod tests {
             Some(CatalogRuntimeIdentity {
                 system_identifier: identity.system_identifier,
                 timeline: 4,
+            }),
+        ));
+        // The identity is two independent fields; a timeline mismatch alone
+        // would pass even if the system identifier were never compared.
+        assert!(!request_matches_runtime(
+            &inputs,
+            &generation,
+            100,
+            boot_id,
+            Some(CatalogRuntimeIdentity {
+                system_identifier: identity.system_identifier ^ 1,
+                timeline: identity.timeline,
             }),
         ));
     }
