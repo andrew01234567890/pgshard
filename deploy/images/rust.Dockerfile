@@ -127,10 +127,11 @@ COPY --from=postgres-agent-build --chown=0:0 /out/pgshard-scram-verifier /usr/lo
 COPY --from=postgres-fence-build --chown=0:0 /out/usr/lib/postgresql/18/lib/pgshard_fence.so /usr/lib/postgresql/18/lib/pgshard_fence.so
 COPY --from=postgres-fence-build --chown=0:0 /out/usr/share/postgresql/18/extension/pgshard_fence.control /usr/share/postgresql/18/extension/pgshard_fence.control
 COPY --from=postgres-fence-build --chown=0:0 /out/usr/share/postgresql/18/extension/pgshard_fence--1.0.sql /usr/share/postgresql/18/extension/pgshard_fence--1.0.sql
-RUN install -d -o 0 -g 0 -m 0755 /etc/pgshard /usr/share/pgshard/migrations
+RUN install -d -o 0 -g 0 -m 0755 /etc/pgshard /usr/share/pgshard/migrations /usr/share/pgshard/inventory
 COPY --chown=0:0 --chmod=0444 deploy/images/quarantine.pg_hba.conf /etc/pgshard/quarantine.pg_hba.conf
 COPY --chown=0:0 --chmod=0444 deploy/images/replication-bootstrap-primary.pg_hba.conf /etc/pgshard/replication-bootstrap-primary.pg_hba.conf
 COPY --chown=0:0 --chmod=0444 crates/pgshard-catalog/migrations/0001_shardschema.sql /usr/share/pgshard/migrations/0001_shardschema.sql
+COPY --chown=0:0 --chmod=0444 crates/pgshard-catalog/inventory/0001_shard_inventory.sql /usr/share/pgshard/inventory/0001_shard_inventory.sql
 
 USER 999:999
 STOPSIGNAL SIGTERM
