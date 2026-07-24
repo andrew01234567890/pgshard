@@ -26,6 +26,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
+use crate::catalog_materialization::PreparedCatalogActivationRequest;
+
 const CATALOG_ACTIVATION_TLS_PORT: u16 = 8_443;
 const CATALOG_ACTIVATION_CAPABILITY_PATH: &str = "/capabilities/catalog-activation";
 const CATALOG_ACTIVATION_CA_FILE: &str = "/etc/pgshard/catalog-activation/ca.crt";
@@ -43,6 +45,46 @@ pub(crate) struct ExpectedCatalogActivationCapability {
     pub(crate) cluster: CatalogActivationCapabilityCluster,
     pub(crate) carrier: CatalogActivationCapabilityCarrier,
     pub(crate) target: CatalogActivationCapabilityTarget,
+}
+
+#[allow(dead_code)] // Composed only after the runtime supervisor is reviewed.
+impl ExpectedCatalogActivationCapability {
+    /// Derives the challenge identity solely from the exact prepared request.
+    /// This prevents the network target and challenge body from being assembled
+    /// from a second, weaker identity source.
+    pub(crate) fn from_prepared(
+        prepared: &PreparedCatalogActivationRequest,
+    ) -> Result<Self, CatalogActivationChallengeError> {
+        let request = prepared.request();
+        if request.source.shard != 0
+            || request.source.member != 0
+            || request.source.instance_id != request.source.pod_name
+            || request.sha256().as_deref() != Ok(prepared.sha256())
+        {
+            return Err(CatalogActivationChallengeError::InvalidTarget);
+        }
+        request
+            .validate()
+            .map_err(|_| CatalogActivationChallengeError::InvalidTarget)?;
+        Ok(Self {
+            cluster: CatalogActivationCapabilityCluster {
+                name: request.cluster.name.clone(),
+                uid: request.cluster.uid.clone(),
+            },
+            carrier: CatalogActivationCapabilityCarrier {
+                namespace: request.cluster.namespace.clone(),
+                name: request.carrier.name.clone(),
+                uid: request.carrier.uid.clone(),
+            },
+            target: CatalogActivationCapabilityTarget {
+                shard: request.source.shard,
+                member: request.source.member,
+                instance_id: request.source.instance_id.clone(),
+                pod_name: request.source.pod_name.clone(),
+                pod_uid: request.source.pod_uid.clone(),
+            },
+        })
+    }
 }
 
 /// TLS 1.3 and HTTP/1.1 client with one explicit CA and no ambient identity.
@@ -94,9 +136,9 @@ impl CatalogActivationChallengeClient {
     pub(crate) async fn challenge(
         &self,
         target_agent_dns: &str,
-        request_sha256: &str,
-        expected: ExpectedCatalogActivationCapability,
+        prepared: &PreparedCatalogActivationRequest,
     ) -> Result<CatalogActivationCapabilityChallengeResponse, CatalogActivationChallengeError> {
+        let expected = ExpectedCatalogActivationCapability::from_prepared(prepared)?;
         if !valid_dns_name(target_agent_dns)
             || expected.cluster.name != self.cluster_name
             || expected.carrier.namespace != self.namespace
@@ -114,7 +156,7 @@ impl CatalogActivationChallengeClient {
         let challenge = CatalogActivationCapabilityChallenge {
             schema_version: CATALOG_ACTIVATION_CAPABILITY_CHALLENGE_REQUEST_VERSION.to_owned(),
             nonce: fresh_nonce()?,
-            request_sha256: request_sha256.to_owned(),
+            request_sha256: prepared.sha256().to_owned(),
             cluster: expected.cluster,
             carrier: expected.carrier,
             target: expected.target,

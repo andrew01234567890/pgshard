@@ -6,6 +6,9 @@
 pub(crate) mod agent_status;
 mod boottime;
 mod catalog_activation_challenge;
+mod catalog_activation_live_objects;
+mod catalog_activation_publisher;
+pub mod catalog_activation_supervisor;
 pub mod catalog_candidate;
 mod catalog_materialization;
 pub mod config;

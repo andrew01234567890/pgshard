@@ -302,7 +302,7 @@ fn validate_plan(
 
 /// Bounded exact evidence from one stable read bracket. This type is private to
 /// the crate, deliberately non-serializable, and grants no mutation authority.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BoundCandidateSet {
     pub(crate) cluster: ClusterFingerprint,
     pub(crate) catalog_activation: ObjectReference,
@@ -1654,9 +1654,11 @@ mod tests {
         WritableLeaseProofIdentity,
     };
     use crate::boottime::{BoottimeInstant, FakeBoottimeClock};
+    use crate::catalog_activation_challenge::ExpectedCatalogActivationCapability;
     use crate::catalog_materialization::{
-        CatalogActivationDispatcherProof, bind_catalog_activation_live_objects,
-        catalog_activation_publication_target, prepare_catalog_activation_request,
+        CatalogActivationDispatcherProof, PreparedCatalogActivationRequest,
+        bind_catalog_activation_live_objects, catalog_activation_publication_target,
+        prepare_catalog_activation_request, rebind_catalog_activation_live_objects,
     };
     use crate::domain::{AgentStatusPhase, CatalogCandidatePhase, OrchState, OrchestratorIdentity};
     use crate::topology::{
@@ -2355,8 +2357,11 @@ mod tests {
             let (plan, cluster, candidates) = fixture_for_plan(plan_with_members(member_count));
             let validated_status =
                 validate_cluster_status(&cluster, &plan).expect("validated live status fixture");
-            let live_cluster = validated_status.fingerprint.clone();
             let live_carrier = validated_status.catalog_activation.clone();
+            let live_candidates =
+                read_bound_candidates(&store(cluster.clone(), candidates.clone()), &plan)
+                    .await
+                    .expect("authoritative live candidates");
             let total_members = plan.shard_count * plan.members.len();
             let state = OrchState::with_identity_topology_and_dispatcher(
                 OrchestratorIdentity {
@@ -2420,12 +2425,30 @@ mod tests {
             assert_eq!(target.carrier_api_group(), "pgshard.io");
             assert_eq!(target.carrier_api_version(), "v1alpha1");
             assert_eq!(target.carrier_api_plural(), "pgshardcatalogactivations");
-            assert_eq!(target.carrier_status_subresource(), "status");
             assert_eq!(target.carrier_namespace(), "ns");
             assert_eq!(target.carrier_name(), "demo-catalog-activation");
             assert_eq!(target.carrier_uid(), "catalog-activation-uid");
             assert_eq!(target.cluster_name(), "demo");
             assert_eq!(target.cluster_uid(), "cluster-uid");
+            assert_eq!(target.dispatcher_pod_name(), "demo-orchestrator-0");
+            assert_eq!(target.dispatcher_pod_uid(), "dispatcher-pod-uid");
+            assert_eq!(target.dispatcher_lease_name(), "demo-orch-lease");
+            assert_eq!(target.dispatcher_lease_uid(), "coordination-uid");
+            assert_eq!(
+                target.dispatcher_lease_resource_version(),
+                "coordination-rv-1"
+            );
+            assert_eq!(target.writable_lease_name(), "demo-shard-0000-term");
+            assert_eq!(target.writable_lease_uid(), "lease-uid-0");
+            assert_eq!(
+                target.writable_lease_resource_version(),
+                "writable-lease-rv-7"
+            );
+            assert_eq!(
+                target.writable_lease_holder(),
+                "demo-shard-0000-0/pod-uid-0/0123456789abcdef01234567"
+            );
+            assert_eq!(target.writable_lease_transitions(), 7);
             assert_eq!(target.target_stateful_set_name(), "demo-shard-0000");
             assert_eq!(target.target_pod_name(), "demo-shard-0000-0");
             assert_eq!(target.target_pod_uid(), "pod-uid-0");
@@ -2433,8 +2456,6 @@ mod tests {
                 target.target_agent_dns_name(),
                 "demo-shard-0000-0.demo-shard-0000.ns.svc"
             );
-            assert_eq!(target.target_agent_tls_port(), 8_443);
-            assert_eq!(target.capability_path(), "/capabilities/catalog-activation");
 
             let live_writable_lease = exact_replication_proof(&plan).writable_lease;
             let dispatcher = CatalogActivationDispatcherProof {
@@ -2452,14 +2473,29 @@ mod tests {
             let bind_dispatcher = |dispatcher| {
                 bind_catalog_activation_live_objects(
                     &dispatch,
-                    live_cluster.clone(),
+                    &live_candidates,
                     live_carrier.clone(),
+                    "carrier-rv-1".to_owned(),
                     ObjectReference {
                         name: "demo-shard-0000-0".to_owned(),
                         uid: "pod-uid-0".to_owned(),
                     },
                     live_writable_lease.clone(),
                     dispatcher,
+                )
+            };
+            let bind_candidates = |candidates: &BoundCandidateSet| {
+                bind_catalog_activation_live_objects(
+                    &dispatch,
+                    candidates,
+                    live_carrier.clone(),
+                    "carrier-rv-1".to_owned(),
+                    ObjectReference {
+                        name: "demo-shard-0000-0".to_owned(),
+                        uid: "pod-uid-0".to_owned(),
+                    },
+                    live_writable_lease.clone(),
+                    dispatcher.clone(),
                 )
             };
 
@@ -2524,8 +2560,12 @@ mod tests {
 
             let live = bind_dispatcher(dispatcher.clone())
                 .expect("exact configured dispatcher identities cross-bind");
+            assert_eq!(live.carrier_resource_version(), "carrier-rv-1");
             let prepared = prepare_catalog_activation_request(&dispatch, &live)
                 .expect("canonical activation request");
+            let rebound =
+                rebind_catalog_activation_live_objects(&dispatch, &live_candidates, &live);
+            assert!(rebound.as_ref() == Some(&live));
             prepared.request().validate().expect("validated request");
             assert_eq!(
                 prepared.sha256(),
@@ -2539,23 +2579,102 @@ mod tests {
                 "writable-lease-rv-7"
             );
             assert_eq!(prepared.request().writable_term.generation, "7");
+            let challenge_identity = ExpectedCatalogActivationCapability::from_prepared(&prepared)
+                .expect("request-derived challenge identity");
+            assert_eq!(challenge_identity.cluster.name, "demo");
+            assert_eq!(challenge_identity.cluster.uid, "cluster-uid");
+            assert_eq!(challenge_identity.carrier.namespace, "ns");
+            assert_eq!(challenge_identity.carrier.name, "demo-catalog-activation");
+            assert_eq!(challenge_identity.carrier.uid, "catalog-activation-uid");
+            assert_eq!(challenge_identity.target.shard, 0);
+            assert_eq!(challenge_identity.target.member, 0);
+            assert_eq!(challenge_identity.target.instance_id, "demo-shard-0000-0");
+            assert_eq!(challenge_identity.target.pod_name, "demo-shard-0000-0");
+            assert_eq!(challenge_identity.target.pod_uid, "pod-uid-0");
 
-            let mut foreign_carrier = live_carrier;
+            let mismatched_digest = PreparedCatalogActivationRequest::from_test_parts(
+                prepared.request().clone(),
+                "f".repeat(64),
+            );
+            assert!(
+                ExpectedCatalogActivationCapability::from_prepared(&mismatched_digest).is_err()
+            );
+            let mut nonzero_member_request = prepared.request().clone();
+            nonzero_member_request.source.member = 1;
+            let nonzero_member_digest = nonzero_member_request
+                .sha256()
+                .unwrap_or_else(|_| "e".repeat(64));
+            let nonzero_member = PreparedCatalogActivationRequest::from_test_parts(
+                nonzero_member_request,
+                nonzero_member_digest,
+            );
+            assert!(ExpectedCatalogActivationCapability::from_prepared(&nonzero_member).is_err());
+
+            for invalid_carrier_rv in [String::new(), "x".repeat(257)] {
+                assert!(
+                    bind_catalog_activation_live_objects(
+                        &dispatch,
+                        &live_candidates,
+                        live_carrier.clone(),
+                        invalid_carrier_rv,
+                        ObjectReference {
+                            name: "demo-shard-0000-0".to_owned(),
+                            uid: "pod-uid-0".to_owned(),
+                        },
+                        live_writable_lease.clone(),
+                        dispatcher.clone(),
+                    )
+                    .is_none()
+                );
+            }
+
+            for index in 1..live_candidates.candidates.len() {
+                let mut drifted = live_candidates.clone();
+                drifted.candidates[index].resource_version =
+                    format!("replacement-candidate-rv-{index}");
+                assert!(
+                    bind_candidates(&drifted).is_none(),
+                    "non-target candidate {index} drift cross-bound"
+                );
+
+                let mut drifted = live_candidates.clone();
+                drifted.shard_zero_bootstraps[index].secret.uid =
+                    format!("replacement-bootstrap-uid-{index}");
+                assert!(
+                    bind_candidates(&drifted).is_none(),
+                    "non-target bootstrap {index} drift cross-bound"
+                );
+
+                let mut drifted = live_candidates.clone();
+                drifted.materialization_bundles[index].sha256 = "f".repeat(64);
+                assert!(
+                    bind_candidates(&drifted).is_none(),
+                    "non-target materialization bundle {index} drift cross-bound"
+                );
+            }
+
+            let mut foreign_carrier = live_carrier.clone();
             foreign_carrier.uid = "replacement-carrier-uid".to_owned();
             assert!(
                 bind_catalog_activation_live_objects(
                     &dispatch,
-                    live_cluster,
+                    &live_candidates,
                     foreign_carrier,
+                    "carrier-rv-1".to_owned(),
                     ObjectReference {
                         name: "demo-shard-0000-0".to_owned(),
                         uid: "pod-uid-0".to_owned(),
                     },
-                    live_writable_lease,
-                    dispatcher,
+                    live_writable_lease.clone(),
+                    dispatcher.clone(),
                 )
                 .is_none()
             );
+
+            let mut drifted_candidates = live_candidates.clone();
+            drifted_candidates.candidates[0].resource_version =
+                "replacement-candidate-rv".to_owned();
+            assert!(bind_candidates(&drifted_candidates).is_none());
 
             let public = serde_json::to_string(&state.snapshot()).expect("public snapshot JSON");
             for private_value in [
