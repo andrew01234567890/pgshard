@@ -593,6 +593,12 @@ pub struct CatalogActivationMaterials {
     /// Lowercase SHA-256 digest of the exact shardschema migration.
     #[serde(rename = "migrationSHA256")]
     pub migration_sha256: String,
+    /// Canonical unsigned-decimal physical shard count for the inventory.
+    #[serde(rename = "shardCount")]
+    pub shard_count: String,
+    /// Lowercase SHA-256 digest of the image-baked shard inventory input.
+    #[serde(rename = "inventorySHA256")]
+    pub inventory_sha256: String,
     /// Lowercase SHA-256 digest of database genesis input.
     #[serde(rename = "genesisSHA256")]
     pub genesis_sha256: String,
@@ -843,6 +849,7 @@ impl CatalogActivationRequest {
             &self.materials.operation_writer.material_sha256,
             &self.materials.postgresql_configuration.material_sha256,
             &self.materials.migration_sha256,
+            &self.materials.inventory_sha256,
             &self.materials.genesis_sha256,
             &self.materials.preflight_sha256,
             &self.materials.serving_hba_sha256,
@@ -853,6 +860,7 @@ impl CatalogActivationRequest {
         for value in [
             &self.cluster.generation,
             &self.writable_term.generation,
+            &self.materials.shard_count,
             &self.source.system_identifier,
             &self.source.generation_barrier_lsn,
             &self.source.target_fence_acknowledgement.observed_at_unix_ms,
@@ -1027,6 +1035,8 @@ impl CatalogActivationRequest {
         material_components(&self.materials.operation_writer, &mut visit);
         material_components(&self.materials.postgresql_configuration, &mut visit);
         visit(&self.materials.migration_sha256);
+        visit(&self.materials.shard_count);
+        visit(&self.materials.inventory_sha256);
         visit(&self.materials.genesis_sha256);
         visit(&self.materials.preflight_sha256);
         visit(&self.materials.serving_hba_version);
@@ -1577,6 +1587,8 @@ mod tests {
                     material_sha256: digest(7),
                 },
                 migration_sha256: digest(8),
+                shard_count: "4".into(),
+                inventory_sha256: digest(13),
                 genesis_sha256: digest(9),
                 preflight_sha256: digest(10),
                 serving_hba_version: "pgshard.catalog-serving-hba.v1".into(),
@@ -1649,7 +1661,7 @@ mod tests {
         let digest = request.sha256().expect("valid request");
         assert_eq!(
             digest,
-            "2272dfe2f91126128f51746efed94637f326ea31fa8e83f1dff0e90be5d2f3aa"
+            "0b10365ffc4250f986f2c23bb645db092359526808b4d1ef841e6ce98c9f2685"
         );
 
         let mut changed = request.clone();
@@ -1660,7 +1672,7 @@ mod tests {
         let long_request = request_for_cluster(&"a".repeat(50));
         assert_eq!(
             long_request.sha256().expect("valid long-name request"),
-            "3c747fc699f1711f61e5f2be413de395a1eb3e081bc7b1eaa25455eb2a881809"
+            "e3595fd49c95f87e456c22ff2a81e5785f2260b3bc49786df5d87d1cc6f5f4a1"
         );
     }
 

@@ -286,6 +286,9 @@ spec:
                       genesisSHA256:
                         pattern: ^[0-9a-f]{64}$
                         type: string
+                      inventorySHA256:
+                        pattern: ^[0-9a-f]{64}$
+                        type: string
                       migrationSHA256:
                         pattern: ^[0-9a-f]{64}$
                         type: string
@@ -374,12 +377,19 @@ spec:
                         maxLength: 253
                         minLength: 1
                         type: string
+                      shardCount:
+                        description: ShardCount is the canonical unsigned-decimal
+                          physical shard count.
+                        maxLength: 20
+                        pattern: ^[1-9][0-9]{0,19}$
+                        type: string
                       targetTemplateSHA256:
                         pattern: ^[0-9a-f]{64}$
                         type: string
                     required:
                     - catalog
                     - genesisSHA256
+                    - inventorySHA256
                     - migrationSHA256
                     - operationWriter
                     - postgresqlConfiguration
@@ -387,6 +397,7 @@ spec:
                     - replication
                     - servingHBASHA256
                     - servingHBAVersion
+                    - shardCount
                     - targetTemplateSHA256
                     type: object
                   remoteApplyWitness:
