@@ -88,7 +88,19 @@ impl MaterializedCatalogHandoff {
         // A published proof is not a current capability. The supervisor
         // retracts asynchronously, so between the binding withdrawing and the
         // retraction landing the proof is still here and means nothing.
-        if !still_bound(&proof.binding, &proof.bound) {
+        //
+        // The binding guard is HELD across the action, not consulted and
+        // released. `still_bound` borrows and drops, which would leave the
+        // authoritative watch free to change while the action ran — blocking
+        // only proof retraction, which is the derived signal, not the source.
+        let binding = proof.binding.borrow();
+        if proof.binding.has_changed().is_err() {
+            return None;
+        }
+        if !binding
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &proof.bound))
+        {
             return None;
         }
         Some(action(proof))
@@ -381,6 +393,57 @@ mod tests {
 
     fn proof_is_still_published(handoff: &MaterializedCatalogHandoff) -> bool {
         handoff.receiver.borrow().is_some()
+    }
+
+    /// Holding the binding guard is what makes committing safe, and no
+    /// single-threaded test can tell holding it apart from consulting and
+    /// releasing it. This one can: another thread withdraws the capability
+    /// *while the action runs*. A released guard lets that withdrawal land
+    /// mid-action; a held one makes `send_replace` wait for the action to
+    /// finish. The action observes a flag the withdrawing thread sets only
+    /// after its send returns — and must never see it set.
+    #[test]
+    fn a_withdrawal_cannot_land_while_the_action_runs() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let runtime = std::sync::Arc::new(watch::channel(None).0);
+        let bound = capability();
+        runtime.send_replace(Some(Arc::clone(&bound)));
+        let (output, receiver) = watch::channel(None);
+        output.send_replace(Some(Arc::new(MaterializedCatalog {
+            bound: Arc::clone(&bound),
+            binding: runtime.subscribe(),
+        })));
+        let handoff = MaterializedCatalogHandoff { receiver };
+
+        let landed = std::sync::Arc::new(AtomicBool::new(false));
+        let started = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let withdrawer = {
+            let runtime = std::sync::Arc::clone(&runtime);
+            let landed = std::sync::Arc::clone(&landed);
+            let started = std::sync::Arc::clone(&started);
+            std::thread::spawn(move || {
+                started.wait();
+                runtime.send_replace(None);
+                landed.store(true, Ordering::Release);
+            })
+        };
+
+        let observed = handoff.commit_current(|_| {
+            started.wait();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            landed.load(Ordering::Acquire)
+        });
+        withdrawer.join().expect("the withdrawing thread finishes");
+        assert_eq!(
+            observed,
+            Some(false),
+            "a withdrawal landed while the action was still running"
+        );
+        assert!(
+            landed.load(Ordering::Acquire),
+            "the withdrawal never landed, so this proved nothing"
+        );
     }
 
     /// The handoff is how a consumer uses a proof, and it must not offer any
