@@ -1590,24 +1590,24 @@ jobs:
           JOB_EXPECTATIONS: >-
             changes=${{ needs.changes.result }}=true
             repository-policy=${{ needs.repository-policy.result }}=true
-            rust-static=${{ needs.rust-static.result }}=${{ needs.changes.outputs.rust }}
-            rust-test=${{ needs.rust-test.result }}=${{ needs.changes.outputs.rust }}
-            catalog-postgres=${{ needs.catalog-postgres.result }}=${{ needs.changes.outputs.catalog }}
-            orch-catalog-postgres=${{ needs.orch-catalog-postgres.result }}=${{ needs.changes.outputs.orch_catalog }}
+            rust-static=${{ needs.rust-static.result }}=${{ needs.changes.outputs.rust == 'true' }}
+            rust-test=${{ needs.rust-test.result }}=${{ needs.changes.outputs.rust == 'true' }}
+            catalog-postgres=${{ needs.catalog-postgres.result }}=${{ needs.changes.outputs.catalog == 'true' }}
+            orch-catalog-postgres=${{ needs.orch-catalog-postgres.result }}=${{ needs.changes.outputs.orch_catalog == 'true' }}
             pgwire-postgres=${{ needs.pgwire-postgres.result }}=${{ needs.changes.outputs.pgwire == 'true' || needs.changes.outputs.pooler_postgres == 'true' }}
-            pgwire-fuzz=${{ needs.pgwire-fuzz.result }}=${{ needs.changes.outputs.pgwire }}
-            planner-postgres=${{ needs.planner-postgres.result }}=${{ needs.changes.outputs.planner }}
-            protobuf=${{ needs.protobuf.result }}=${{ needs.changes.outputs.proto }}
-            go-operator=${{ needs.go-operator.result }}=${{ needs.changes.outputs.go }}
-            operator-kind=${{ needs.operator-kind.result }}=${{ needs.changes.outputs.go }}
+            pgwire-fuzz=${{ needs.pgwire-fuzz.result }}=${{ needs.changes.outputs.pgwire == 'true' }}
+            planner-postgres=${{ needs.planner-postgres.result }}=${{ needs.changes.outputs.planner == 'true' }}
+            protobuf=${{ needs.protobuf.result }}=${{ needs.changes.outputs.proto == 'true' }}
+            go-operator=${{ needs.go-operator.result }}=${{ needs.changes.outputs.go == 'true' }}
+            operator-kind=${{ needs.operator-kind.result }}=${{ needs.changes.outputs.go == 'true' }}
             operator-kind-manager=${{ needs.operator-kind-manager.result }}=${{ needs.changes.outputs.go == 'true' || needs.changes.outputs.images == 'true' }}
             website=${{ needs.website.result }}=${{ needs.changes.outputs.website == 'true' || (github.event_name != 'pull_request' && needs.changes.outputs.website_exists == 'true') }}
-            ui=${{ needs.ui.result }}=${{ needs.changes.outputs.ui }}
-            integration=${{ needs.integration.result }}=${{ needs.changes.outputs.integration }}
-            images=${{ needs.images.result }}=${{ needs.changes.outputs.images }}
-            agent-postgres=${{ needs.agent-postgres.result }}=${{ needs.changes.outputs.postgres_agent }}
-            kind=${{ needs.kind.result }}=${{ needs.changes.outputs.kind }}
-            performance=${{ needs.performance.result }}=${{ needs.changes.outputs.performance }}
+            ui=${{ needs.ui.result }}=${{ needs.changes.outputs.ui == 'true' }}
+            integration=${{ needs.integration.result }}=${{ needs.changes.outputs.integration == 'true' }}
+            images=${{ needs.images.result }}=${{ needs.changes.outputs.images == 'true' }}
+            agent-postgres=${{ needs.agent-postgres.result }}=${{ needs.changes.outputs.postgres_agent == 'true' }}
+            kind=${{ needs.kind.result }}=${{ needs.changes.outputs.kind == 'true' }}
+            performance=${{ needs.performance.result }}=${{ needs.changes.outputs.performance == 'true' }}
         shell: bash
         run: |
           set -euo pipefail

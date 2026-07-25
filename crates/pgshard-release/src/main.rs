@@ -1986,41 +1986,104 @@ mod tests {
         }
     }
 
-    /// Every job the aggregate waits on has to carry an expectation, or it is
-    /// waited on and then not actually required.
+    /// Every job the aggregate waits on has to carry an expectation, that
+    /// expectation has to read that job's own result, and it has to repeat the
+    /// job's own `if:` exactly. Any of the three being wrong retires the gate
+    /// while the aggregate still reports success.
     #[test]
-    fn every_aggregated_job_carries_an_expectation() {
+    fn every_aggregated_job_expects_its_own_condition() {
         let ci = include_str!("../../../.github/workflows/ci.yml");
         let aggregate = ci
-            .split_once("  aggregate:")
+            .split_once("\n  aggregate:")
             .expect("the aggregate job exists")
-            .1;
-        let needs = aggregate
-            .split_once("    needs:\n")
-            .expect("the aggregate declares its needs")
             .1;
         let expectations = aggregate
             .split_once("JOB_EXPECTATIONS: >-")
             .expect("the aggregate declares its expectations")
             .1;
-        // Compared as whole names: `operator-kind=` ends with `kind=`, so a
-        // substring check would accept a job whose expectation was removed.
-        let declared: std::collections::BTreeSet<&str> = expectations
+        let mut declared: Vec<(&str, &str, &str)> = Vec::new();
+        for line in expectations
             .lines()
             .take_while(|line| !line.trim_start().starts_with("shell:"))
-            .filter_map(|line| line.trim().split_once('='))
-            .map(|(job, _)| job)
-            .collect();
-        for job in needs
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            let (job, rest) = line.split_once('=').expect("an entry names a job");
+            let (result, expected) = rest.split_once("}}=").map_or_else(
+                || (rest, ""),
+                |(result, expected)| (result, expected.trim()),
+            );
+            declared.push((job, result.trim(), expected));
+        }
+
+        let waited: Vec<&str> = aggregate
+            .split_once("    needs:\n")
+            .expect("the aggregate declares its needs")
+            .1
             .lines()
             .take_while(|line| line.trim_start().starts_with("- "))
             .map(|line| line.trim().trim_start_matches("- "))
-        {
-            assert!(
-                declared.contains(job),
-                "the aggregate waits on {job} without requiring it"
+            .collect();
+        assert_eq!(
+            waited.len(),
+            declared.len(),
+            "the aggregate's needs and expectations are not the same set"
+        );
+
+        for job in &waited {
+            let (_, result, expected) = declared
+                .iter()
+                .find(|(name, ..)| name == job)
+                .unwrap_or_else(|| panic!("the aggregate waits on {job} without requiring it"));
+            // The result must be this job's, not a neighbour's: reading another
+            // job's result would let this one vanish unnoticed.
+            assert_eq!(
+                *result,
+                format!("${{{{ needs.{job}.result"),
+                "{job}'s expectation does not read {job}'s own result"
+            );
+            assert_eq!(
+                *expected,
+                job_condition(ci, job).map_or_else(
+                    || "true".to_owned(),
+                    |condition| format!("${{{{ {condition} }}}}")
+                ),
+                "{job}'s expectation does not repeat {job}'s own condition"
             );
         }
+    }
+
+    /// The `if:` of one job, whitespace-normalized, or `None` when it is
+    /// unconditional and therefore must always run.
+    fn job_condition(ci: &str, job: &str) -> Option<String> {
+        let indent = |line: &str| line.len() - line.trim_start().len();
+        let body: Vec<&str> = ci
+            .split_once(&format!("\n  {job}:\n"))?
+            .1
+            .lines()
+            // A job ends where the next one begins, at two spaces of indent.
+            .take_while(|line| line.trim().is_empty() || indent(line) > 2)
+            .collect();
+        // Exactly four spaces: a step's `if:` is nested deeper and is not the
+        // condition that decides whether this job runs at all.
+        let position = body
+            .iter()
+            .position(|line| indent(line) == 4 && line.trim_start().starts_with("if:"))?;
+        let head = body[position]
+            .trim_start()
+            .trim_start_matches("if:")
+            .trim_start();
+        if head != ">-" {
+            return Some(head.split_whitespace().collect::<Vec<_>>().join(" "));
+        }
+        Some(
+            body[position + 1..]
+                .iter()
+                .take_while(|line| line.trim().is_empty() || indent(line) > 4)
+                .flat_map(|line| line.split_whitespace())
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
     }
 
     #[test]
