@@ -398,6 +398,14 @@ func validateOverrideValue(key, value string, settings map[string]string) error 
 			// Reserve processes for parallel work and logical replication.
 			maximum = max64(1, configured-4)
 		}
+		// Each worker may take the emitted autovacuum_work_mem, which was sized
+		// for the generated count against a fixed share of the memory budget.
+		// Raising the count multiplies that ceiling, which is the cgroup kill
+		// this generation exists to avoid; autovacuum_work_mem is deliberately
+		// not overridable, so the count is the only lever and it may only fall.
+		if budgeted, err := strconv.ParseInt(settings["autovacuum_max_workers"], 10, 64); err == nil && budgeted < maximum {
+			maximum = max64(1, budgeted)
+		}
 		return validateIntegerRange(value, 1, maximum)
 	case "autovacuum_vacuum_cost_limit":
 		return validateIntegerRange(value, 1, 10_000)

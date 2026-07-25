@@ -394,3 +394,41 @@ func mebibytes(t *testing.T, value string) int64 {
 	}
 	return parsed
 }
+
+// autovacuum_work_mem is sized for the generated worker count against a fixed
+// share of the memory budget, and is not itself overridable. Raising the count
+// therefore multiplies the ceiling the generation exists to bound, so an
+// override may only lower it.
+func TestAutovacuumWorkerOverrideCannotExceedTheMemoryBudget(t *testing.T) {
+	result, err := Calculate(Input{
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("12"),
+				corev1.ResourceMemory: resource.MustParse("1Gi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("12"),
+				corev1.ResourceMemory: resource.MustParse("1Gi"),
+			},
+		},
+		PoolerMaxReplicas: 1, MembersPerShard: 1, MaximumChangeStreams: 1,
+	})
+	if err != nil {
+		t.Fatalf("a 12 core, 1Gi shape must be accepted: %v", err)
+	}
+	budgeted, err := strconv.ParseInt(result.Settings["autovacuum_max_workers"], 10, 64)
+	if err != nil {
+		t.Fatalf("autovacuum_max_workers is not an integer: %v", err)
+	}
+	// max_worker_processes is 52 for this shape, so the process-slot bound
+	// alone would permit 20 — far past what the memory share can afford.
+	if err := validateOverrideValue("autovacuum_max_workers", strconv.FormatInt(budgeted+1, 10), result.Settings); err == nil {
+		t.Fatalf("an override of %d workers was accepted against a budget for %d", budgeted+1, budgeted)
+	}
+	if err := validateOverrideValue("autovacuum_max_workers", strconv.FormatInt(budgeted, 10), result.Settings); err != nil {
+		t.Fatalf("the budgeted worker count was rejected: %v", err)
+	}
+	if err := validateOverrideValue("autovacuum_max_workers", "1", result.Settings); err != nil {
+		t.Fatalf("lowering the worker count was rejected: %v", err)
+	}
+}
