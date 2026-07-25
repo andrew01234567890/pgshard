@@ -241,6 +241,7 @@ func validateClusterFields(cluster *PgShardCluster) field.ErrorList {
 	poolerMax, scalingErrs := validateScaling(cluster.Spec.Pooler.Scaling, specPath.Child("pooler", "scaling"))
 	allErrs = append(allErrs, scalingErrs...)
 	settingsForOverrides := map[string]string{}
+	var autovacuumBudgetForOverrides int64
 	if poolerMax > 0 {
 		result, err := tuning.Calculate(tuning.Input{
 			Resources:            cluster.Spec.PostgreSQL.Resources,
@@ -253,9 +254,10 @@ func validateClusterFields(cluster *PgShardCluster) field.ErrorList {
 			allErrs = append(allErrs, field.Invalid(specPath.Child("postgresql", "resources"), cluster.Spec.PostgreSQL.Resources, err.Error()))
 		} else {
 			settingsForOverrides = result.Settings
+			autovacuumBudgetForOverrides = result.AutovacuumBudgetBytes
 		}
 	}
-	if err := tuning.ApplyOverrides(settingsForOverrides, cluster.Spec.PostgreSQL.Parameters); err != nil {
+	if err := tuning.ApplyOverrides(settingsForOverrides, cluster.Spec.PostgreSQL.Parameters, autovacuumBudgetForOverrides); err != nil {
 		allErrs = append(allErrs, field.Invalid(specPath.Child("postgresql", "parameters"), cluster.Spec.PostgreSQL.Parameters, err.Error()))
 	} else if _, tuningAvailable := settingsForOverrides["max_wal_size"]; tuningAvailable {
 		if err := tuning.ValidateStorage(settingsForOverrides, cluster.Spec.Storage.Size); err != nil {
@@ -811,7 +813,7 @@ func (cluster *PgShardCluster) ResolvedPostgreSQLConfiguration() (ResolvedPostgr
 	if err != nil {
 		return ResolvedPostgreSQLConfiguration{}, err
 	}
-	if err := tuning.ApplyOverrides(result.Settings, cluster.Spec.PostgreSQL.Parameters); err != nil {
+	if err := tuning.ApplyOverrides(result.Settings, cluster.Spec.PostgreSQL.Parameters, result.AutovacuumBudgetBytes); err != nil {
 		return ResolvedPostgreSQLConfiguration{}, err
 	}
 	if err := tuning.ValidateStorage(result.Settings, cluster.Spec.Storage.Size); err != nil {

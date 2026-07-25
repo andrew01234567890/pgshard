@@ -80,7 +80,11 @@ type Primary struct {
 }
 
 type Result struct {
-	MemoryBytes             int64
+	MemoryBytes int64
+	// Bytes the autovacuum fleet as a whole may occupy. Carried out of here
+	// because an override of the worker count is only safe against this, not
+	// against the worker count the budget happened to produce.
+	AutovacuumBudgetBytes   int64
 	CPUMilli                int64
 	ReservedBytes           int64
 	MaxConnections          int32
@@ -290,6 +294,7 @@ func Calculate(in Input) (Result, error) {
 	}
 
 	return Result{
+		AutovacuumBudgetBytes:   autovacuumBudget,
 		MemoryBytes:             memory,
 		CPUMilli:                cpu,
 		ReservedBytes:           reserved,
@@ -318,7 +323,7 @@ func postgresqlString(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
-func ApplyOverrides(settings map[string]string, overrides map[string]string) error {
+func ApplyOverrides(settings map[string]string, overrides map[string]string, autovacuumBudgetBytes int64) error {
 	keys := make([]string, 0, len(overrides))
 	for key := range overrides {
 		keys = append(keys, key)
@@ -339,7 +344,7 @@ func ApplyOverrides(settings map[string]string, overrides map[string]string) err
 		if strings.ContainsAny(value, "\r\n\x00") {
 			return fmt.Errorf("PostgreSQL parameter %q must be a single line without NUL bytes", key)
 		}
-		if err := validateOverrideValue(key, value, settings); err != nil {
+		if err := validateOverrideValue(key, value, settings, autovacuumBudgetBytes); err != nil {
 			return fmt.Errorf("invalid PostgreSQL parameter %q: %w", key, err)
 		}
 	}
@@ -386,7 +391,17 @@ func ValidateStorage(settings map[string]string, storage resource.Quantity) erro
 	return nil
 }
 
-func validateOverrideValue(key, value string, settings map[string]string) error {
+// Parses an emitted "<n>MB" quantity, returning 0 when absent or malformed so
+// the caller keeps the process-slot bound rather than losing all bounds.
+func emittedMebibytes(value string) int64 {
+	parsed, err := strconv.ParseInt(strings.TrimSuffix(value, "MB"), 10, 64)
+	if err != nil || parsed <= 0 {
+		return 0
+	}
+	return parsed
+}
+
+func validateOverrideValue(key, value string, settings map[string]string, autovacuumBudgetBytes int64) error {
 	switch key {
 	case "autovacuum_analyze_scale_factor", "autovacuum_vacuum_scale_factor", "checkpoint_completion_target":
 		return validateFloatRange(value, 0, 1)
@@ -398,13 +413,15 @@ func validateOverrideValue(key, value string, settings map[string]string) error 
 			// Reserve processes for parallel work and logical replication.
 			maximum = max64(1, configured-4)
 		}
-		// Each worker may take the emitted autovacuum_work_mem, which was sized
-		// for the generated count against a fixed share of the memory budget.
-		// Raising the count multiplies that ceiling, which is the cgroup kill
-		// this generation exists to avoid; autovacuum_work_mem is deliberately
-		// not overridable, so the count is the only lever and it may only fall.
-		if budgeted, err := strconv.ParseInt(settings["autovacuum_max_workers"], 10, 64); err == nil && budgeted < maximum {
-			maximum = max64(1, budgeted)
+		// autovacuum_work_mem is not overridable, so the count is the only
+		// lever on the fleet's ceiling. Bound it by what the fleet's budget
+		// affords rather than by the count the budget happened to produce:
+		// when the per-worker size is capped, fewer workers are generated
+		// than the budget can pay for, and raising it is legitimate.
+		if workMem := emittedMebibytes(settings["autovacuum_work_mem"]); workMem > 0 && autovacuumBudgetBytes > 0 {
+			if affordable := autovacuumBudgetBytes / (workMem * mib); affordable < maximum {
+				maximum = max64(1, affordable)
+			}
 		}
 		return validateIntegerRange(value, 1, maximum)
 	case "autovacuum_vacuum_cost_limit":

@@ -229,10 +229,10 @@ func TestCalculateRejectsQuantitiesBeforeIntegerOverflow(t *testing.T) {
 func TestApplyOverridesRejectsOwnedSafetySettings(t *testing.T) {
 	t.Parallel()
 	settings := map[string]string{"fsync": "on"}
-	if err := ApplyOverrides(settings, map[string]string{"fsync": "off"}); err == nil {
+	if err := ApplyOverrides(settings, map[string]string{"fsync": "off"}, 0); err == nil {
 		t.Fatal("expected fsync override to be rejected")
 	}
-	if err := ApplyOverrides(settings, map[string]string{"max_wal_size": "4GB"}); err != nil {
+	if err := ApplyOverrides(settings, map[string]string{"max_wal_size": "4GB"}, 0); err != nil {
 		t.Fatalf("safe override rejected: %v", err)
 	}
 	if settings["max_wal_size"] != "4GB" {
@@ -246,7 +246,7 @@ func TestApplyOverridesIsAtomicOnValidationFailure(t *testing.T) {
 	err := ApplyOverrides(settings, map[string]string{
 		"max_wal_size": "4GB",
 		"wal_level":    "minimal",
-	})
+	}, 0)
 	if err == nil {
 		t.Fatal("expected unsafe override to fail")
 	}
@@ -260,7 +260,7 @@ func TestApplyOverridesRejectsConfigurationInjection(t *testing.T) {
 	settings := map[string]string{"fsync": "on"}
 	err := ApplyOverrides(settings, map[string]string{
 		"log_statement": "none\nfsync = off",
-	})
+	}, 0)
 	if err == nil {
 		t.Fatal("expected multiline override to fail")
 	}
@@ -286,7 +286,7 @@ func TestApplyOverridesRejectsNonViableValues(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			settings := map[string]string{"max_worker_processes": "8", "min_wal_size": "80MB", "max_wal_size": "1GB"}
-			if err := ApplyOverrides(settings, overrides); err == nil {
+			if err := ApplyOverrides(settings, overrides, 0); err == nil {
 				t.Fatalf("unsafe overrides accepted: %#v", overrides)
 			}
 		})
@@ -309,7 +309,7 @@ func TestApplyOverridesAcceptsBoundedValues(t *testing.T) {
 		"min_wal_size":                    "1GB",
 		"random_page_cost":                "1.1",
 	}
-	if err := ApplyOverrides(settings, overrides); err != nil {
+	if err := ApplyOverrides(settings, overrides, 0); err != nil {
 		t.Fatalf("bounded overrides rejected: %v", err)
 	}
 }
@@ -422,13 +422,13 @@ func TestAutovacuumWorkerOverrideCannotExceedTheMemoryBudget(t *testing.T) {
 	}
 	// max_worker_processes is 52 for this shape, so the process-slot bound
 	// alone would permit 20 — far past what the memory share can afford.
-	if err := validateOverrideValue("autovacuum_max_workers", strconv.FormatInt(budgeted+1, 10), result.Settings); err == nil {
+	if err := validateOverrideValue("autovacuum_max_workers", strconv.FormatInt(budgeted+1, 10), result.Settings, result.AutovacuumBudgetBytes); err == nil {
 		t.Fatalf("an override of %d workers was accepted against a budget for %d", budgeted+1, budgeted)
 	}
-	if err := validateOverrideValue("autovacuum_max_workers", strconv.FormatInt(budgeted, 10), result.Settings); err != nil {
+	if err := validateOverrideValue("autovacuum_max_workers", strconv.FormatInt(budgeted, 10), result.Settings, result.AutovacuumBudgetBytes); err != nil {
 		t.Fatalf("the budgeted worker count was rejected: %v", err)
 	}
-	if err := validateOverrideValue("autovacuum_max_workers", "1", result.Settings); err != nil {
+	if err := validateOverrideValue("autovacuum_max_workers", "1", result.Settings, result.AutovacuumBudgetBytes); err != nil {
 		t.Fatalf("lowering the worker count was rejected: %v", err)
 	}
 }
