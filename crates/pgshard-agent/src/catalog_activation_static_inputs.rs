@@ -83,12 +83,10 @@ pub struct CatalogActivationStaticInputsConfigError;
 
 /// Opaque retained receiver for verified static input snapshots.
 ///
-/// There is intentionally no observer API. A later independently reviewed
-/// materializer must consume this private handoff before the snapshots can be
-/// used.
+/// There is intentionally no observer API. The materializer consumes this
+/// private handoff before the snapshots can be used.
 #[must_use = "dropping the static-input handoff closes its private watch"]
 pub struct CatalogMaterializationHandoff {
-    #[allow(dead_code, reason = "retained for a later dormant materializer stage")]
     receiver: watch::Receiver<Option<Arc<ValidatedCatalogStaticInputs>>>,
 }
 
@@ -103,10 +101,6 @@ impl CatalogMaterializationHandoff {
 
 /// Exact request-bound materialization program and scalars. This type is
 /// deliberately private, move-only, non-serializable, and non-debuggable.
-#[allow(
-    dead_code,
-    reason = "sealed input for a later dormant materializer stage"
-)]
 pub(crate) struct ValidatedCatalogStaticInputs {
     pub(crate) accepted: Arc<DurablyAcceptedCatalogActivation>,
     pub(crate) program: CatalogMaterializationProgram,
