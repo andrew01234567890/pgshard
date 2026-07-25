@@ -2215,12 +2215,34 @@ mod tests {
             policy.get("if").is_none(),
             "the job that proves the gates is itself gated"
         );
-        let runs = policy["steps"]
+        // Every step, not just the job: a step carries its own `if:`, and one
+        // conditioned on an event this workflow never receives runs never
+        // while the job still succeeds. `continue-on-error` is the same hole
+        // with a different spelling.
+        let steps = policy["steps"]
             .as_sequence()
-            .expect("the policy job declares steps")
+            .expect("the policy job declares steps");
+        for step in steps {
+            assert!(
+                step.get("if").is_none(),
+                "a step of the job that proves the gates is conditional"
+            );
+            assert!(
+                step.get("continue-on-error").is_none(),
+                "a step of the job that proves the gates may fail without failing it"
+            );
+        }
+        assert!(
+            policy.get("continue-on-error").is_none(),
+            "the job that proves the gates may fail without failing the aggregate"
+        );
+        let runs = steps
             .iter()
             .filter_map(|step| step["run"].as_str())
-            .any(|run| run.contains("cargo test") && run.contains("-p pgshard-release"));
+            .any(|run| {
+                run.split_whitespace().collect::<Vec<_>>().join(" ")
+                    == "cargo test --locked -p pgshard-release"
+            });
         assert!(
             runs,
             "the unconditional policy job does not run this crate's tests"
