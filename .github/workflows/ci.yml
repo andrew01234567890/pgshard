@@ -1596,23 +1596,30 @@ jobs:
           # trailing whitespace from a value, and a value of `true ` is not
           # `'true'` to the condition that gates the job, so the job would be
           # skipped while this check saw a clean `true`.
+          # Whether the detector reported each component AT ALL, as a value
+          # derived by GitHub rather than the raw output. A raw value would
+          # carry whatever the detector emitted -- trailing whitespace, an
+          # embedded newline -- into the shell, where it can normalize to a
+          # clean `true` while the strict `== 'true'` gating the job is false.
+          # Deriving it here means anything but exactly true/false lands as
+          # `false` and fails closed before any of that can matter.
           COMPONENT_OUTPUTS: |
-            rust=${{ needs.changes.outputs.rust }}
-            postgres_agent=${{ needs.changes.outputs.postgres_agent }}
-            catalog=${{ needs.changes.outputs.catalog }}
-            orch_catalog=${{ needs.changes.outputs.orch_catalog }}
-            pgwire=${{ needs.changes.outputs.pgwire }}
-            pooler_postgres=${{ needs.changes.outputs.pooler_postgres }}
-            planner=${{ needs.changes.outputs.planner }}
-            proto=${{ needs.changes.outputs.proto }}
-            go=${{ needs.changes.outputs.go }}
-            website=${{ needs.changes.outputs.website }}
-            website_exists=${{ needs.changes.outputs.website_exists }}
-            ui=${{ needs.changes.outputs.ui }}
-            integration=${{ needs.changes.outputs.integration }}
-            images=${{ needs.changes.outputs.images }}
-            kind=${{ needs.changes.outputs.kind }}
-            performance=${{ needs.changes.outputs.performance }}
+            rust=${{ needs.changes.outputs.rust == 'true' || needs.changes.outputs.rust == 'false' }}
+            postgres_agent=${{ needs.changes.outputs.postgres_agent == 'true' || needs.changes.outputs.postgres_agent == 'false' }}
+            catalog=${{ needs.changes.outputs.catalog == 'true' || needs.changes.outputs.catalog == 'false' }}
+            orch_catalog=${{ needs.changes.outputs.orch_catalog == 'true' || needs.changes.outputs.orch_catalog == 'false' }}
+            pgwire=${{ needs.changes.outputs.pgwire == 'true' || needs.changes.outputs.pgwire == 'false' }}
+            pooler_postgres=${{ needs.changes.outputs.pooler_postgres == 'true' || needs.changes.outputs.pooler_postgres == 'false' }}
+            planner=${{ needs.changes.outputs.planner == 'true' || needs.changes.outputs.planner == 'false' }}
+            proto=${{ needs.changes.outputs.proto == 'true' || needs.changes.outputs.proto == 'false' }}
+            go=${{ needs.changes.outputs.go == 'true' || needs.changes.outputs.go == 'false' }}
+            website=${{ needs.changes.outputs.website == 'true' || needs.changes.outputs.website == 'false' }}
+            website_exists=${{ needs.changes.outputs.website_exists == 'true' || needs.changes.outputs.website_exists == 'false' }}
+            ui=${{ needs.changes.outputs.ui == 'true' || needs.changes.outputs.ui == 'false' }}
+            integration=${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.integration == 'false' }}
+            images=${{ needs.changes.outputs.images == 'true' || needs.changes.outputs.images == 'false' }}
+            kind=${{ needs.changes.outputs.kind == 'true' || needs.changes.outputs.kind == 'false' }}
+            performance=${{ needs.changes.outputs.performance == 'true' || needs.changes.outputs.performance == 'false' }}
           JOB_EXPECTATIONS: >-
             changes=${{ needs.changes.result }}=true
             repository-policy=${{ needs.repository-policy.result }}=true
@@ -1642,8 +1649,8 @@ jobs:
             if [[ -n "$component" ]]; then
               name="${component%%=*}"
               reported="${component#*=}"
-              if [[ "$reported" != true && "$reported" != false ]]; then
-                echo "Detector did not report $name (reported '$reported')" >&2
+              if [[ "$reported" != true ]]; then
+                echo "Detector did not report $name" >&2
                 failed=true
               fi
             fi

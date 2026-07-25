@@ -1997,7 +1997,7 @@ mod tests {
     #[test]
     fn a_detector_that_does_not_report_a_component_fails_closed() {
         let (passed, stderr) =
-            run_aggregate_gate_with("rust=true\ngo=false\n", "rust-static=success=true");
+            run_aggregate_gate_with("rust=true\ngo=true\n", "rust-static=success=true");
         assert!(passed, "a fully reported detector was rejected: {stderr}");
 
         // `go=true ` is not `'true'` to the condition that gates the job, so
@@ -2044,8 +2044,11 @@ mod tests {
                 let (name, reference) = entry(line).expect("bounded by the take_while above");
                 assert_eq!(
                     reference,
-                    format!("${{{{ needs.changes.outputs.{name} }}}}"),
-                    "the {name} entry does not validate the {name} output"
+                    format!(
+                        "${{{{ needs.changes.outputs.{name} == 'true' \
+                         || needs.changes.outputs.{name} == 'false' }}}}"
+                    ),
+                    "the {name} entry does not derive {name}'s validity from {name}"
                 );
                 name
             })
@@ -2099,7 +2102,17 @@ mod tests {
             // `${{` is what makes it an output rather than the sibling `steps:`.
             .take_while(|line| indent(line) > 4 && line.contains("${{"))
             .filter_map(|line| line.trim().split_once(':'))
-            .map(|(name, _)| name)
+            .map(|(name, source)| {
+                // A declaration that exposes another component's detection is
+                // a valid-but-wrong value: it skips the jobs it gates while
+                // every structural check above still agrees.
+                assert_eq!(
+                    source.trim(),
+                    format!("${{{{ steps.detect.outputs.{name} }}}}"),
+                    "the {name} output does not expose {name}'s detection"
+                );
+                name
+            })
             .collect();
         for name in validated {
             assert!(
