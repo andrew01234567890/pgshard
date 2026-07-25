@@ -150,23 +150,53 @@ where
     let fence = GenerationFence::hold(socket_dir, expected_generation).await?;
     // A fence that dies has released its locks, so the guarded work is no
     // longer fenced and must not be allowed to reach its commit.
-    let outcome = tokio::select! {
-        outcome = apply(writer, authority_exact, &fence, step) => outcome,
-        () = fence.lost() => Err(PostgresGenerationError::GenerationFenceLost),
-    };
-    // A lost fence outranks whatever the work reported: the guarantee was
-    // absent, which the caller must not confuse with a clean failure. Result's
-    // `and` would have kept the earlier error and hidden exactly that.
-    match fence.release().await {
-        Err(lost) => Err(lost),
-        Ok(()) => outcome,
+    // Deliberately not raced against `fence.lost()`. Cancelling the work after
+    // COMMIT was queued cannot un-queue it, and classifying that as a plain
+    // lost fence hid the one state the caller most needs to tell apart. The
+    // writer's own timeouts bound the step instead.
+    let mut dispatched = CommitDispatch::NotReached;
+    let outcome = apply(writer, authority_exact, &fence, &mut dispatched, step).await;
+    let released = fence.release().await;
+    classify_step(outcome, released, dispatched)
+}
+
+/// Decides what a step's outcome means once the fence has been released.
+///
+/// A fence lost while a `COMMIT` was already in flight leaves that commit's
+/// fate unknown, and that outranks every other classification: the caller must
+/// be able to tell "did not happen" from "may have happened".
+fn classify_step(
+    outcome: Result<(), PostgresGenerationError>,
+    released: Result<(), PostgresGenerationError>,
+    dispatched: CommitDispatch,
+) -> Result<(), PostgresGenerationError> {
+    match (outcome, released) {
+        (_, Err(_)) | (Err(PostgresGenerationError::GenerationFenceLost), _)
+            if dispatched == CommitDispatch::Dispatched =>
+        {
+            Err(PostgresGenerationError::AmbiguousCatalogCommit)
+        }
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(lost)) => Err(lost),
+        (Ok(()), Ok(())) => Ok(()),
     }
+}
+
+/// Whether a `COMMIT` has been put on the wire for the current step.
+///
+/// Once it has, no later observation can prove it did not land, so a fence lost
+/// from that point on is ambiguous rather than failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommitDispatch {
+    NotReached,
+    Dispatched,
 }
 
 async fn apply<F>(
     writer: &mut CatalogWriterSession,
     authority_exact: &F,
     fence: &GenerationFence,
+    dispatched: &mut CommitDispatch,
     step: Step<'_>,
 ) -> Result<(), PostgresGenerationError>
 where
@@ -211,6 +241,7 @@ where
             if !authority_exact() {
                 return Err(PostgresGenerationError::AuthorityChanged);
             }
+            *dispatched = CommitDispatch::Dispatched;
             match transaction.commit().await {
                 Ok(()) => Ok(()),
                 Err(error) if !fence.holds() => {
@@ -226,6 +257,50 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The classification the enabling stage has to act on, so it must be
+    /// reachable rather than shadowed by the fence's own loss report.
+    #[test]
+    fn a_fence_lost_after_commit_was_dispatched_is_ambiguous_not_merely_lost() {
+        let classify = classify_step;
+
+        // Lost while the commit was in flight: unknown, not failed.
+        assert!(matches!(
+            classify(
+                Err(PostgresGenerationError::GenerationFenceLost),
+                Ok(()),
+                CommitDispatch::Dispatched,
+            ),
+            Err(PostgresGenerationError::AmbiguousCatalogCommit)
+        ));
+        assert!(matches!(
+            classify(
+                Ok(()),
+                Err(PostgresGenerationError::GenerationFenceLost),
+                CommitDispatch::Dispatched,
+            ),
+            Err(PostgresGenerationError::AmbiguousCatalogCommit)
+        ));
+        // Lost before the commit was ever dispatched: nothing landed.
+        assert!(matches!(
+            classify(
+                Err(PostgresGenerationError::GenerationFenceLost),
+                Ok(()),
+                CommitDispatch::NotReached,
+            ),
+            Err(PostgresGenerationError::GenerationFenceLost)
+        ));
+        // An ordinary failure keeps its own cause.
+        assert!(matches!(
+            classify(
+                Err(PostgresGenerationError::AuthorityChanged),
+                Ok(()),
+                CommitDispatch::NotReached,
+            ),
+            Err(PostgresGenerationError::AuthorityChanged)
+        ));
+        assert!(classify(Ok(()), Ok(()), CommitDispatch::Dispatched).is_ok());
+    }
 
     #[test]
     fn the_two_scalars_are_the_only_parameterized_statements() {

@@ -435,16 +435,6 @@ impl GenerationFence {
     pub(crate) fn holds(&self) -> bool {
         !*self.connection.driver_ended.borrow()
     }
-
-    /// Resolves if the fence stops holding its locks.
-    pub(crate) async fn lost(&self) {
-        let mut driver_ended = self.connection.driver_ended.clone();
-        while !*driver_ended.borrow() {
-            if driver_ended.changed().await.is_err() {
-                return;
-            }
-        }
-    }
 }
 
 pub(crate) const OBSERVE_STANDARD_CONFORMING_STRINGS: &str =
