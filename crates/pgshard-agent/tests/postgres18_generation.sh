@@ -14,6 +14,8 @@ readonly standby_data="pgshard-generation-standby-data-${suffix}"
 readonly primary_socket="pgshard-generation-primary-socket-${suffix}"
 readonly standby_socket="pgshard-generation-standby-socket-${suffix}"
 readonly standby_credentials="pgshard-generation-standby-credentials-${suffix}"
+readonly fence_primary="pgshard-generation-fence-${suffix}"
+readonly fence_socket="pgshard-generation-fence-socket-${suffix}"
 readonly replication_password="pgshard_generation_replication_test"
 readonly standby_application_name="pgshard_member_0001"
 readonly synchronous_standby_names="pgshard_member_0001, pgshard_member_0002"
@@ -43,11 +45,11 @@ if [[ ! "$image" =~ @sha256:[0-9a-f]{64}$ ]]; then
 fi
 
 cleanup() {
-  docker rm --force "$standby" "$primary" >/dev/null 2>&1 || true
+  docker rm --force "$standby" "$primary" "$fence_primary" >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
   docker volume rm --force \
     "$primary_data" "$standby_data" "$primary_socket" "$standby_socket" \
-    "$standby_credentials" \
+    "$standby_credentials" "$fence_socket" \
     >/dev/null 2>&1 || true
   rm -f "$primary_hba" "$build_messages"
   rmdir "$fixture_dir" 2>/dev/null || true
@@ -393,8 +395,6 @@ docker run --rm --user 999:999 --network none --read-only \
 # It runs against its own disposable server rather than the shared primary,
 # because it publishes generations of its own and the steps that follow assert
 # on the primary's final generation.
-readonly fence_primary="pgshard-generation-fence-${suffix}"
-readonly fence_socket="pgshard-generation-fence-socket-${suffix}"
 docker volume create "$fence_socket" >/dev/null
 docker run --detach --name "$fence_primary" \
   --network "$network" \

@@ -259,6 +259,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// The committed goldens are rendered for a four-shard fixture cluster, so
     /// the sealed shard count has to match or genesis references a cell the
@@ -273,11 +274,11 @@ mod tests {
     /// nothing it created survives. The unit tests cannot reach any of it.
     #[tokio::test]
     #[ignore = "requires a disposable PostgreSQL 18 Unix socket"]
+    #[allow(clippy::too_many_lines)]
     async fn live_postgres18_revoked_authority_does_not_materialize() {
         use crate::catalog_materialization_program::compile_catalog_materialization_program;
         use crate::postgres_generation::{
-            CATALOG_DATABASE, GENERATION_DATABASE, gate_next_pre_commit,
-            publish_writable_generation,
+            CATALOG_DATABASE, gate_next_pre_commit, publish_writable_generation,
         };
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -285,8 +286,10 @@ mod tests {
         let socket_dir = std::env::var_os("PGSHARD_AGENT_TEST_SOCKET_DIR")
             .map(std::path::PathBuf::from)
             .expect("PGSHARD_AGENT_TEST_SOCKET_DIR is required");
-        let first = crate::postgres_generation::tests::generation("cluster-1", "holder-a", 1);
-        let second = crate::postgres_generation::tests::generation("cluster-1", "holder-a", 2);
+        // Terms above the fence test's, which uses the same disposable server;
+        // a lower term is rejected as a regression before anything is tested.
+        let first = crate::postgres_generation::tests::generation("cluster-1", "holder-a", 3);
+        let second = crate::postgres_generation::tests::generation("cluster-1", "holder-a", 4);
 
         create_catalog_database(&socket_dir).await;
         publish_writable_generation(&socket_dir, &first, &|| true)
@@ -323,10 +326,25 @@ mod tests {
         entered
             .await
             .expect("the executor reached its commit checks");
+
+        // Started while the attempt still holds its fence, so it has to wait
+        // rather than move the durable generation out from under the checks the
+        // attempt is about to make.
+        let publisher_socket = socket_dir.clone();
+        let publisher_generation = second.clone();
+        let publisher = tokio::spawn(async move {
+            publish_writable_generation(&publisher_socket, &publisher_generation, &|| true).await
+        });
+        assert_generation_publication_waits(&socket_dir, &first).await;
+
         authorized.store(false, Ordering::Release);
         release.send(()).expect("release the executor");
 
         let outcome = attempt.await.expect("materializer task");
+        publisher
+            .await
+            .expect("publication task")
+            .expect("publication completes once the attempt releases its fence");
         assert!(
             matches!(outcome, Err(PostgresGenerationError::AuthorityChanged)),
             "a revoked attempt reported {outcome:?}"
@@ -347,32 +365,12 @@ mod tests {
             .get(0);
         assert!(!installed, "a revoked attempt left pgshard_catalog behind");
 
-        // The generation is untouched, so a later attempt can proceed.
-        let generation_db =
-            crate::postgres_generation::tests::connect_to(&socket_dir, GENERATION_DATABASE)
-                .await
-                .expect("inspect the generation database");
-        let observed: Vec<u8> = generation_db
-            .client()
-            .query_one(
-                "SELECT generation FROM pgshard_internal.writable_generation",
-                &[],
-            )
-            .await
-            .expect("read the generation")
-            .get(0);
-        assert_eq!(
-            observed,
-            first.canonical_bytes(),
-            "a revoked attempt changed the durable generation"
-        );
+        // The generation was already proven unchanged while the attempt held
+        // its fence; by now the waiting publication has legitimately landed.
 
         // A retry under a new generation must then materialize completely,
         // which also proves the revoked attempt left nothing that would block
         // it and that the executor's ordered apply actually works end to end.
-        publish_writable_generation(&socket_dir, &second, &|| true)
-            .await
-            .expect("publish the replacement generation");
         let program = compile_catalog_materialization_program(
             include_bytes!("../../pgshard-catalog/migrations/0001_shardschema.sql"),
             include_bytes!("../../pgshard-catalog/inventory/0001_shard_inventory.sql"),
@@ -418,6 +416,54 @@ mod tests {
             .expect("count genesis databases")
             .get(0);
         assert!(databases > 0, "genesis installed no logical database");
+    }
+
+    /// Requires a competing publication to be waiting on the fence the paused
+    /// attempt holds, with the durable generation still the one it acts for.
+    async fn assert_generation_publication_waits(
+        socket_dir: &std::path::Path,
+        acting_for: &DurableWritableGeneration,
+    ) {
+        let observer = crate::postgres_generation::tests::connect_to(
+            socket_dir,
+            crate::postgres_generation::GENERATION_DATABASE,
+        )
+        .await
+        .expect("observe generation locks");
+        let mut waiting = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let blocked: i64 = observer
+                .client()
+                .query_one(
+                    "SELECT pg_catalog.count(*) FROM pg_catalog.pg_locks \
+                     WHERE NOT granted \
+                       AND relation = 'pgshard_internal.writable_generation'::regclass",
+                    &[],
+                )
+                .await
+                .expect("read pg_locks")
+                .get(0);
+            if blocked > 0 {
+                waiting = true;
+                break;
+            }
+        }
+        assert!(waiting, "publication did not wait on the attempt's fence");
+        let durable: Vec<u8> = observer
+            .client()
+            .query_one(
+                "SELECT generation FROM pgshard_internal.writable_generation",
+                &[],
+            )
+            .await
+            .expect("read the durable generation")
+            .get(0);
+        assert_eq!(
+            durable,
+            acting_for.canonical_bytes(),
+            "a waiting publication changed the durable generation"
+        );
     }
 
     async fn create_catalog_database(socket_dir: &std::path::Path) {
