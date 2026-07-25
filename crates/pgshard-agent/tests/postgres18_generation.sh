@@ -434,6 +434,20 @@ docker run --rm --user 999:999 \
   catalog_materializer::tests::live_postgres18_revoked_authority_does_not_materialize \
   --nocapture
 
+# Verification has to reject a catalog that satisfies the fragments' own
+# postconditions but disagrees with the declared inventory, which only a real
+# catalog carrying an undeclared shard can demonstrate.
+docker run --rm --user 999:999 \
+  --network "$network" \
+  --volume "$fence_socket:/fence-socket" \
+  --mount "type=bind,src=$test_binary,dst=/test/pgshard-agent-test,readonly" \
+  --env PGSHARD_AGENT_TEST_SOCKET_DIR=/fence-socket \
+  --entrypoint /test/pgshard-agent-test \
+  "$image" \
+  --ignored --exact \
+  catalog_materializer::tests::live_postgres18_verification_rejects_an_unexpected_active_shard \
+  --nocapture
+
 docker rm --force "$fence_primary" >/dev/null
 docker volume rm "$fence_socket" >/dev/null
 

@@ -1476,6 +1476,9 @@ pub enum PostgresGenerationError {
     /// The generation fence stopped holding its locks before the guarded commit.
     #[error("PostgreSQL generation fence was lost before the guarded commit")]
     GenerationFenceLost,
+    /// The catalog does not hold the state the program declares.
+    #[error("PostgreSQL catalog does not match the declared materialization")]
+    CatalogNotMaterialized,
     /// The fence was lost while a catalog commit was already in flight, so
     /// whether that commit landed is unknown and cannot be resolved from here.
     #[error("PostgreSQL catalog commit is ambiguous: the generation fence was lost in flight")]

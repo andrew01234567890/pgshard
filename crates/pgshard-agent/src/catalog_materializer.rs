@@ -41,6 +41,24 @@ const SET_EXPECTED_SHARD_COUNT: &str =
 const SET_ALLOW_EMPTY_DATABASE_TOPOLOGY: &str =
     "SELECT pg_catalog.set_config('pgshard.bootstrap_allow_empty_database_topology', $1, true)";
 
+/// Proves the catalog holds exactly the configured shard inventory, not merely
+/// that the configured shards are present.
+///
+/// The inventory fragment's own postcondition checks that every expected shard
+/// exists, is active, and has an active restore incarnation. It cannot see an
+/// *unexpected* active shard, so a catalog carrying extra active shards would
+/// satisfy it while disagreeing with the sealed shard count.
+const INVENTORY_IS_EXACT: &str = "\
+    SELECT (SELECT pg_catalog.count(*) FROM pgshard_catalog.shards \
+              WHERE state = 'active') = $1::bigint \
+       AND NOT EXISTS ( \
+             SELECT FROM pgshard_catalog.shards \
+              WHERE state = 'active' \
+                AND (shards.shard_number < 0 \
+                     OR shards.shard_number > $1 - 1 \
+                     OR shards.shard_id::text <> 'shard-' || pg_catalog.lpad( \
+                          shards.shard_number::text, 4, '0')))";
+
 /// The applying transaction's own framing. The program's fragments carry none:
 /// that is what the input compiler enforces, and it is why the executor can put
 /// its authority check immediately before `COMMIT`.
@@ -121,6 +139,70 @@ where
         },
     )
     .await
+}
+
+/// Re-reads the catalog and requires it to equal what the program declares.
+///
+/// A successful apply is not proof: an ambiguous commit may have landed, an
+/// earlier attempt may have left a prefix, and the fragments' own postconditions
+/// do not establish full equality. This runs under its own fence, so the
+/// generation is proven current across the verification as well.
+pub(crate) async fn verify_materialized<F>(
+    socket_dir: &Path,
+    program: &CatalogMaterializationProgram,
+    shard_count: u32,
+    expected_generation: &DurableWritableGeneration,
+    authority_exact: &F,
+) -> Result<(), PostgresGenerationError>
+where
+    F: Fn() -> bool,
+{
+    if !authority_exact() {
+        return Err(PostgresGenerationError::AuthorityChanged);
+    }
+    let mut writer = CatalogWriterSession::connect(socket_dir).await?;
+    let fence = GenerationFence::hold(socket_dir, expected_generation).await?;
+    let outcome = read_back(&mut writer, program, shard_count).await;
+    let released = fence.release().await;
+    outcome?;
+    released?;
+    // The catalog matched, but only an attempt that still holds its authority
+    // may claim it materialized this state.
+    if !authority_exact() {
+        return Err(PostgresGenerationError::AuthorityChanged);
+    }
+    Ok(())
+}
+
+async fn read_back(
+    writer: &mut CatalogWriterSession,
+    program: &CatalogMaterializationProgram,
+    shard_count: u32,
+) -> Result<(), PostgresGenerationError> {
+    // Bound as an integer: the comparison is numeric, unlike the GUC the
+    // fragments read, which is text by definition.
+    let shard_count = i64::from(shard_count);
+    let transaction = writer.client().transaction().await?;
+    transaction
+        .batch_execute(APPLY_TRANSACTION_SETTINGS)
+        .await?;
+    let exact: bool = transaction
+        .query_one(INVENTORY_IS_EXACT, &[&shard_count])
+        .await?
+        .try_get(0)?;
+    if !exact {
+        return Err(PostgresGenerationError::CatalogNotMaterialized);
+    }
+    // Re-run the declared topology guard with the allow-empty policy off, so an
+    // empty or divergent topology raises here rather than being tolerated as it
+    // is during first materialization.
+    transaction
+        .execute(SET_ALLOW_EMPTY_DATABASE_TOPOLOGY, &[&"false"])
+        .await?;
+    transaction.batch_execute(&program.preflight).await?;
+    // Read-only: nothing to commit.
+    transaction.rollback().await?;
+    Ok(())
 }
 
 enum Step<'a> {
@@ -416,6 +498,71 @@ mod tests {
             .expect("count genesis databases")
             .get(0);
         assert!(databases > 0, "genesis installed no logical database");
+    }
+
+    /// Verification must reject a catalog that satisfies the fragments' own
+    /// postconditions but disagrees with the declared inventory.
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL 18 Unix socket"]
+    async fn live_postgres18_verification_rejects_an_unexpected_active_shard() {
+        use crate::catalog_materialization_program::compile_catalog_materialization_program;
+        use crate::postgres_generation::{CATALOG_DATABASE, publish_writable_generation};
+
+        let socket_dir = std::env::var_os("PGSHARD_AGENT_TEST_SOCKET_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("PGSHARD_AGENT_TEST_SOCKET_DIR is required");
+        let generation = crate::postgres_generation::tests::generation("cluster-1", "holder-a", 8);
+
+        create_catalog_database(&socket_dir).await;
+        publish_writable_generation(&socket_dir, &generation, &|| true)
+            .await
+            .expect("publish the generation");
+        let program = compile_catalog_materialization_program(
+            include_bytes!("../../pgshard-catalog/migrations/0001_shardschema.sql"),
+            include_bytes!("../../pgshard-catalog/inventory/0001_shard_inventory.sql"),
+            include_bytes!("../../pgshard-catalog/testdata/materialization/genesis.golden.sql"),
+            include_bytes!("../../pgshard-catalog/testdata/materialization/preflight.golden.sql"),
+        )
+        .expect("the real inputs compile");
+
+        materialize(
+            &socket_dir,
+            &program,
+            FIXTURE_SHARDS,
+            true,
+            &generation,
+            &|| true,
+        )
+        .await
+        .expect("materialize the declared state");
+        verify_materialized(&socket_dir, &program, FIXTURE_SHARDS, &generation, &|| true)
+            .await
+            .expect("the declared state verifies");
+
+        // An active shard the sealed count does not declare. The inventory's own
+        // postcondition still passes — it only looks for missing shards — so
+        // this is exactly the divergence verification has to catch.
+        let catalog = crate::postgres_generation::tests::connect_to(&socket_dir, CATALOG_DATABASE)
+            .await
+            .expect("connect to the catalog");
+        catalog
+            .client()
+            .batch_execute(
+                "INSERT INTO pgshard_catalog.shards(shard_id, shard_number, state) \
+                 VALUES ('shard-0009', 9, 'active')",
+            )
+            .await
+            .expect("introduce an undeclared active shard");
+
+        let outcome =
+            verify_materialized(&socket_dir, &program, FIXTURE_SHARDS, &generation, &|| true).await;
+        assert!(
+            matches!(
+                outcome,
+                Err(PostgresGenerationError::CatalogNotMaterialized)
+            ),
+            "verification accepted an undeclared active shard: {outcome:?}"
+        );
     }
 
     /// Requires a competing publication to be waiting on the fence the paused
