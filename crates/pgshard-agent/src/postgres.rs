@@ -1808,8 +1808,21 @@ impl PreparedPostgres {
             .arg("unix_socket_group=")
             .arg("-c")
             .arg("port=5432")
-            .arg("-c")
-            .arg("ssl=off")
+            // No `ssl` setting appears here, and none may be added. `ssl` is
+            // PGC_SIGHUP (`ConfigureNamesBool` in `guc_tables.c`), so a reload
+            // can raise it, but only from a source no higher than PGC_S_FILE.
+            // A postmaster argument is PGC_S_ARGV, which outranks that
+            // (`GucSource` in `guc.h`): `set_config_with_handle` in `guc.c`
+            // drops the lower-ranked write where `record->source > source`,
+            // and `ProcessConfigFileInternal` reverts only `PGC_S_FILE`
+            // values, so an argument is never reconsidered. Pinning `ssl=off`
+            // would deny TLS for the life of the postmaster, and activation is
+            // a reload — `process_pm_reload_request` in `postmaster.c` calls
+            // `secure_initialize` once `EnableSSL` is on — never a restart,
+            // which would lose the writable generation. `EnableSSL`'s
+            // `boot_val` is false, so omitting the setting leaves this
+            // postmaster as TLS-free as pinning it did; who may connect stays
+            // an HBA decision.
             .arg("-c")
             .arg("restart_after_crash=off");
         force_role_recovery_settings(&mut command, self.config.standby.as_ref());
@@ -7449,6 +7462,75 @@ mod tests {
             assert!(
                 !arguments.contains(&OsStr::new(source_only)),
                 "quarantine inherited source-only setting {source_only:?}"
+            );
+        }
+    }
+
+    /// Every `ssl*` setting is `PGC_SIGHUP`, and `set_config_with_handle` in
+    /// `guc.c` ignores a reload's `PGC_S_FILE` write once the higher-ranked
+    /// `PGC_S_ARGV` has claimed the setting. Naming one on the command line
+    /// therefore freezes TLS for the life of that postmaster, so no role may.
+    #[test]
+    fn no_role_pins_tls_availability_on_the_postmaster_command_line() {
+        let quarantine_root = TempDir::new().expect("create quarantine fixture");
+        let quarantine_data = pgdata_fixture_at(&quarantine_root.path().join("data"));
+        let quarantine_executable = quarantine_root.path().join("postgres");
+        write_executable(&quarantine_executable, "#!/bin/sh\nexit 0\n");
+        let quarantine = test_config(
+            quarantine_data,
+            quarantine_executable,
+            quarantine_root.path().join("socket"),
+        );
+
+        let primary_root = TempDir::new().expect("create bootstrap primary fixture");
+        let primary_data = pgdata_fixture_at(&primary_root.path().join("data"));
+        let primary_executable = primary_root.path().join("postgres");
+        write_executable(&primary_executable, "#!/bin/sh\nexit 0\n");
+        let primary_hba = primary_root
+            .path()
+            .join("replication-bootstrap-primary.pg_hba.conf");
+        fs::write(&primary_hba, REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT)
+            .expect("write replication HBA");
+        fs::set_permissions(&primary_hba, fs::Permissions::from_mode(0o400))
+            .expect("protect replication HBA");
+        let primary = PostgresConfig::new_replication_bootstrap_primary(
+            primary_data,
+            primary_executable,
+            primary_root.path().join("socket"),
+            primary_hba,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .expect("valid replication-bootstrap-primary config");
+
+        let standby_root = TempDir::new().expect("create standby fixture");
+        let standby_data = pgdata_fixture_at(&standby_root.path().join("data"));
+        let standby_executable = standby_root.path().join("postgres");
+        write_executable(&standby_executable, "#!/bin/sh\nexit 0\n");
+        let (standby, _passfile) = standby_test_config(
+            &standby_root,
+            standby_data,
+            standby_executable,
+            standby_root.path().join("socket"),
+        );
+
+        for (role, config) in [
+            ("quarantine", quarantine),
+            ("replication bootstrap primary", primary),
+            ("replication standby", standby),
+        ] {
+            let prepared = prepare_fixture(config).expect("prepare command fixture");
+            let command = prepared.command();
+            let pinned: Vec<_> = command
+                .as_std()
+                .get_args()
+                .filter(|argument| argument.as_bytes().starts_with(b"ssl"))
+                .collect();
+            assert!(
+                pinned.is_empty(),
+                "{role} pinned {pinned:?} on the postmaster command line, which no reload \
+                 can raise"
             );
         }
     }
