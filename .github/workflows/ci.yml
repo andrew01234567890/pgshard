@@ -173,6 +173,11 @@ jobs:
           cache: false
       - name: Validate workflow contracts
         run: make actions-check
+      # Unconditional on purpose. These tests are what stops a gate being
+      # retired, so running them from a gated job would let the same edit that
+      # retires a gate also stop the test that would have caught it.
+      - name: Prove the gates cannot be retired
+        run: cargo test --locked -p pgshard-release
       - name: Validate title and public content
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -1582,37 +1587,104 @@ jobs:
     steps:
       - name: Require every applicable job
         env:
-          JOB_RESULTS: >-
-            changes=${{ needs.changes.result }}
-            repository-policy=${{ needs.repository-policy.result }}
-            rust-static=${{ needs.rust-static.result }}
-            rust-test=${{ needs.rust-test.result }}
-            catalog-postgres=${{ needs.catalog-postgres.result }}
-            orch-catalog-postgres=${{ needs.orch-catalog-postgres.result }}
-            pgwire-postgres=${{ needs.pgwire-postgres.result }}
-            pgwire-fuzz=${{ needs.pgwire-fuzz.result }}
-            planner-postgres=${{ needs.planner-postgres.result }}
-            protobuf=${{ needs.protobuf.result }}
-            go-operator=${{ needs.go-operator.result }}
-            operator-kind=${{ needs.operator-kind.result }}
-            operator-kind-manager=${{ needs.operator-kind-manager.result }}
-            website=${{ needs.website.result }}
-            ui=${{ needs.ui.result }}
-            integration=${{ needs.integration.result }}
-            images=${{ needs.images.result }}
-            agent-postgres=${{ needs.agent-postgres.result }}
-            kind=${{ needs.kind.result }}
-            performance=${{ needs.performance.result }}
+          # job=result=expected-to-run, where the expectation repeats the
+          # condition that gates the job itself. A job may be skipped only when
+          # the detector said its component was untouched. Accepting `skipped`
+          # from any job let a detector fault, a stale path filter, or a
+          # cascade retire a gate without anything failing.
+          # Every detector output the expectations below consume. An
+          # expectation is a boolean expression, so a missing output is falsy
+          # and reads exactly like a legitimate `false` -- a removed or
+          # misspelled output declaration would silently authorize a skip.
+          # These are checked as literals so non-reporting fails closed.
+          # A literal block, not a folded one: word splitting would strip
+          # trailing whitespace from a value, and a value of `true ` is not
+          # `'true'` to the condition that gates the job, so the job would be
+          # skipped while this check saw a clean `true`.
+          # Whether the detector reported each component AT ALL, as a value
+          # derived by GitHub rather than the raw output. A raw value would
+          # carry whatever the detector emitted -- trailing whitespace, an
+          # embedded newline -- into the shell, where it can normalize to a
+          # clean `true` while the strict `== 'true'` gating the job is false.
+          # Deriving it here means anything but exactly true/false lands as
+          # `false` and fails closed before any of that can matter.
+          COMPONENT_OUTPUTS: |
+            rust=${{ needs.changes.outputs.rust == 'true' || needs.changes.outputs.rust == 'false' }}
+            postgres_agent=${{ needs.changes.outputs.postgres_agent == 'true' || needs.changes.outputs.postgres_agent == 'false' }}
+            catalog=${{ needs.changes.outputs.catalog == 'true' || needs.changes.outputs.catalog == 'false' }}
+            orch_catalog=${{ needs.changes.outputs.orch_catalog == 'true' || needs.changes.outputs.orch_catalog == 'false' }}
+            pgwire=${{ needs.changes.outputs.pgwire == 'true' || needs.changes.outputs.pgwire == 'false' }}
+            pooler_postgres=${{ needs.changes.outputs.pooler_postgres == 'true' || needs.changes.outputs.pooler_postgres == 'false' }}
+            planner=${{ needs.changes.outputs.planner == 'true' || needs.changes.outputs.planner == 'false' }}
+            proto=${{ needs.changes.outputs.proto == 'true' || needs.changes.outputs.proto == 'false' }}
+            go=${{ needs.changes.outputs.go == 'true' || needs.changes.outputs.go == 'false' }}
+            website=${{ needs.changes.outputs.website == 'true' || needs.changes.outputs.website == 'false' }}
+            website_exists=${{ needs.changes.outputs.website_exists == 'true' || needs.changes.outputs.website_exists == 'false' }}
+            ui=${{ needs.changes.outputs.ui == 'true' || needs.changes.outputs.ui == 'false' }}
+            integration=${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.integration == 'false' }}
+            images=${{ needs.changes.outputs.images == 'true' || needs.changes.outputs.images == 'false' }}
+            kind=${{ needs.changes.outputs.kind == 'true' || needs.changes.outputs.kind == 'false' }}
+            performance=${{ needs.changes.outputs.performance == 'true' || needs.changes.outputs.performance == 'false' }}
+          JOB_EXPECTATIONS: |
+            changes=${{ needs.changes.result }}=true
+            repository-policy=${{ needs.repository-policy.result }}=true
+            rust-static=${{ needs.rust-static.result }}=${{ needs.changes.outputs.rust == 'true' }}
+            rust-test=${{ needs.rust-test.result }}=${{ needs.changes.outputs.rust == 'true' }}
+            catalog-postgres=${{ needs.catalog-postgres.result }}=${{ needs.changes.outputs.catalog == 'true' }}
+            orch-catalog-postgres=${{ needs.orch-catalog-postgres.result }}=${{ needs.changes.outputs.orch_catalog == 'true' }}
+            pgwire-postgres=${{ needs.pgwire-postgres.result }}=${{ needs.changes.outputs.pgwire == 'true' || needs.changes.outputs.pooler_postgres == 'true' }}
+            pgwire-fuzz=${{ needs.pgwire-fuzz.result }}=${{ needs.changes.outputs.pgwire == 'true' }}
+            planner-postgres=${{ needs.planner-postgres.result }}=${{ needs.changes.outputs.planner == 'true' }}
+            protobuf=${{ needs.protobuf.result }}=${{ needs.changes.outputs.proto == 'true' }}
+            go-operator=${{ needs.go-operator.result }}=${{ needs.changes.outputs.go == 'true' }}
+            operator-kind=${{ needs.operator-kind.result }}=${{ needs.changes.outputs.go == 'true' }}
+            operator-kind-manager=${{ needs.operator-kind-manager.result }}=${{ needs.changes.outputs.go == 'true' || needs.changes.outputs.images == 'true' }}
+            website=${{ needs.website.result }}=${{ needs.changes.outputs.website == 'true' || (github.event_name != 'pull_request' && needs.changes.outputs.website_exists == 'true') }}
+            ui=${{ needs.ui.result }}=${{ needs.changes.outputs.ui == 'true' }}
+            integration=${{ needs.integration.result }}=${{ needs.changes.outputs.integration == 'true' }}
+            images=${{ needs.images.result }}=${{ needs.changes.outputs.images == 'true' }}
+            agent-postgres=${{ needs.agent-postgres.result }}=${{ needs.changes.outputs.postgres_agent == 'true' }}
+            kind=${{ needs.kind.result }}=${{ needs.changes.outputs.kind == 'true' }}
+            performance=${{ needs.performance.result }}=${{ needs.changes.outputs.performance == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
           failed=false
-          for result in $JOB_RESULTS; do
-            state="${result#*=}"
-            if [[ "$state" != success && "$state" != skipped ]]; then
-              echo "Required job did not pass: $result" >&2
-              failed=true
+          while IFS= read -r component; do
+            if [[ -n "$component" ]]; then
+              name="${component%%=*}"
+              reported="${component#*=}"
+              if [[ "$reported" != true ]]; then
+                echo "Detector did not report $name" >&2
+                failed=true
+              fi
             fi
+          done <<< "$COMPONENT_OUTPUTS"
+          for entry in $JOB_EXPECTATIONS; do
+            job="${entry%%=*}"
+            state="${entry#*=}"
+            expected="${state#*=}"
+            state="${state%%=*}"
+            case "$expected" in
+              true)
+                if [[ "$state" != success ]]; then
+                  echo "Required job did not pass: $job=$state" >&2
+                  failed=true
+                fi
+                ;;
+              false)
+                if [[ "$state" != success && "$state" != skipped ]]; then
+                  echo "Required job did not pass: $job=$state" >&2
+                  failed=true
+                fi
+                ;;
+              # No expectation means the detector did not report, which is
+              # exactly when a skip must not be taken on trust.
+              *)
+                echo "No expectation for $job (detector reported '$expected')" >&2
+                failed=true
+                ;;
+            esac
           done
           "$failed" && exit 1
           echo "All applicable CI jobs passed."

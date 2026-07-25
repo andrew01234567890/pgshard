@@ -591,6 +591,12 @@ fn aggregate_state(checks: &CheckRuns) -> AggregateState {
         .iter()
         .filter(|check| check.name == "CI aggregate" && check.app.slug == "github-actions")
         .collect::<Vec<_>>();
+    // Exactly one: a second job named `CI aggregate` publishes a second check
+    // run under the same name, and accepting any success would let that decoy
+    // answer for the real gate's failure.
+    if aggregates.len() > 1 {
+        return AggregateState::Failed;
+    }
     if aggregates
         .iter()
         .any(|check| check.status == "completed" && check.conclusion.as_deref() == Some("success"))
@@ -1922,6 +1928,651 @@ mod tests {
         assert!(!release.contains("done < <("));
         assert!(release.contains("run-id: ${{ steps.candidate.outputs.run_id }}"));
         assert!(!ci.contains("Deploy documentation to GitHub Pages"));
+    }
+
+    /// The shipped script, not a copy of it: a copy drifts, and the gate this
+    /// asserts on is the one that authorizes a release.
+    fn aggregate_gate_script() -> String {
+        // Taken from the step the assertions validate, not found by splitting
+        // the file: a text search can land on a decoy `run:` while the step
+        // that actually decides the release is something else entirely.
+        aggregate_gate_step(&parsed_workflow())["run"]
+            .as_str()
+            .expect("the aggregate gate step runs a script")
+            .to_owned()
+    }
+
+    fn run_aggregate_gate(expectations: &str) -> (bool, String) {
+        run_aggregate_gate_with("rust=true\n", expectations)
+    }
+
+    fn run_aggregate_gate_with(components: &str, expectations: &str) -> (bool, String) {
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(aggregate_gate_script())
+            .env("COMPONENT_OUTPUTS", components)
+            .env("JOB_EXPECTATIONS", expectations)
+            .output()
+            .expect("run the aggregate gate");
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    /// A release is authorized by this gate, so a component's tests not having
+    /// run may only pass when the detector said that component was untouched.
+    #[test]
+    fn the_aggregate_refuses_a_skip_the_detector_did_not_authorize() {
+        let (passed, stderr) =
+            run_aggregate_gate("rust-test=success=true go-operator=skipped=false");
+        assert!(
+            passed,
+            "a skip the detector authorized was rejected: {stderr}"
+        );
+
+        let (passed, stderr) =
+            run_aggregate_gate("rust-test=skipped=true go-operator=success=true");
+        assert!(!passed, "a gate skipped while its component changed passed");
+        assert!(stderr.contains("rust-test=skipped"), "{stderr}");
+
+        // An empty expectation is what a failed or skipped detector produces.
+        let (passed, stderr) = run_aggregate_gate("rust-test=skipped=");
+        assert!(!passed, "a skip with no expectation behind it passed");
+        assert!(stderr.contains("No expectation for rust-test"), "{stderr}");
+
+        for state in ["failure", "cancelled"] {
+            let (passed, _) = run_aggregate_gate(&format!("rust-test={state}=false"));
+            assert!(!passed, "an untouched component still shipped on {state}");
+        }
+    }
+
+    /// An expectation is a boolean expression, so a detector output that was
+    /// never emitted is falsy and indistinguishable from a legitimate `false`.
+    /// The detector's own reporting therefore has to be checked as a literal.
+    #[test]
+    fn a_detector_that_does_not_report_a_component_fails_closed() {
+        let (passed, stderr) =
+            run_aggregate_gate_with("rust=true\ngo=true\n", "rust-static=success=true");
+        assert!(passed, "a fully reported detector was rejected: {stderr}");
+
+        // `go=true ` is not `'true'` to the condition that gates the job, so
+        // the job is skipped -- and a check that let the value be trimmed
+        // before comparing would see a clean `true` and excuse that skip.
+        for unreported in [
+            "go=",
+            "go=maybe",
+            "go=TRUE",
+            "go=true ",
+            "go=true\t",
+            "go= true",
+        ] {
+            let (passed, stderr) = run_aggregate_gate_with(
+                &format!("rust=true\n{unreported}\n"),
+                "go-operator=skipped=false",
+            );
+            assert!(!passed, "a skip authorized by '{unreported}' was accepted");
+            assert!(stderr.contains("Detector did not report go"), "{stderr}");
+        }
+    }
+
+    /// Every detector output an expectation consumes has to be one the gate
+    /// validates, that validation has to derive the named component's own
+    /// validity, and the detector has to declare and emit it. Parsed as YAML:
+    /// a line-based reading of a YAML file can be fooled by continuation
+    /// lines that fold into the previous scalar, which is exactly how a wrong
+    /// mapping can hide behind a correct-looking one.
+    #[test]
+    fn every_consumed_detector_output_is_validated() {
+        let workflow = parsed_workflow();
+        let environment = aggregate_gate_step(&workflow)["env"]
+            .as_mapping()
+            .expect("the aggregate step declares an environment");
+
+        let validated: std::collections::BTreeSet<String> = environment["COMPONENT_OUTPUTS"]
+            .as_str()
+            .expect("COMPONENT_OUTPUTS is a scalar")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let (name, derivation) = line
+                    .trim()
+                    .split_once('=')
+                    .expect("an entry names a component");
+                assert_eq!(
+                    derivation,
+                    format!(
+                        "${{{{ needs.changes.outputs.{name} == 'true' \
+                         || needs.changes.outputs.{name} == 'false' }}}}"
+                    ),
+                    "the {name} entry does not derive {name}'s validity from {name}"
+                );
+                name.to_owned()
+            })
+            .collect();
+        assert!(!validated.is_empty(), "no detector outputs are validated");
+
+        let expectations = environment["JOB_EXPECTATIONS"]
+            .as_str()
+            .expect("JOB_EXPECTATIONS is a scalar");
+        for consumed in expectations.split("needs.changes.outputs.").skip(1) {
+            let name: &str = consumed
+                .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                .next()
+                .expect("an output reference names an output");
+            assert!(
+                validated.contains(name),
+                "the gate consumes {name} without validating the detector reported it"
+            );
+        }
+
+        // The detector's own mapping, read as YAML rather than as lines: a
+        // declaration folded into a previous scalar is not a declaration, and
+        // must not be able to stand in for the real one.
+        let detector = workflow_job(&workflow, "changes");
+        let declared = detector["outputs"]
+            .as_mapping()
+            .expect("the detector declares its outputs");
+        let detect = serde_norway::to_string(&detector["steps"]).expect("the detect step renders");
+        for name in &validated {
+            let source = declared
+                .get(serde_norway::Value::from(name.as_str()))
+                .unwrap_or_else(|| {
+                    panic!("the gate validates {name}, which the detector does not declare")
+                })
+                .as_str()
+                .unwrap_or_else(|| panic!("the {name} declaration is not a scalar"));
+            // A declaration exposing another component's detection is a
+            // valid-but-wrong value: it skips the jobs it gates while every
+            // other check still agrees.
+            assert_eq!(
+                source.trim(),
+                format!("${{{{ steps.detect.outputs.{name} }}}}"),
+                "the {name} output does not expose {name}'s detection"
+            );
+            // A declared output the detect step never writes renders empty, so
+            // the gate fails closed on every run. That is loud rather than
+            // dangerous, but it is cheaper to catch here.
+            assert!(
+                detect.contains(&format!("emit_component {name} "))
+                    || detect.contains(&format!("{name}=")),
+                "the detector declares {name} but never emits it"
+            );
+        }
+    }
+
+    /// The gate step, selected by identity: `steps[0]` would let a prepended
+    /// decoy satisfy every structural assertion while the real gate differed.
+    /// Its lack of an `if:` is part of the assertion — a gate that can be
+    /// conditioned out is not a gate.
+    fn aggregate_gate_step(workflow: &serde_norway::Value) -> &serde_norway::Value {
+        let steps = workflow_job(workflow, "aggregate")["steps"]
+            .as_sequence()
+            .expect("the aggregate declares steps");
+        let named: Vec<&serde_norway::Value> = steps
+            .iter()
+            .filter(|step| step["name"].as_str() == Some("Require every applicable job"))
+            .collect();
+        assert_eq!(named.len(), 1, "the aggregate gate step is not unique");
+        let step = named[0];
+        assert!(
+            step.get("if").is_none(),
+            "the aggregate gate step is conditional"
+        );
+        assert!(
+            step.get("uses").is_none() && step.get("run").is_some(),
+            "the aggregate gate step does not run a script of its own"
+        );
+        assert_step_environment(
+            step,
+            &["COMPONENT_OUTPUTS", "JOB_EXPECTATIONS"],
+            "the aggregate gate step",
+        );
+        step
+    }
+
+    /// What each aggregated job is gated on, restated here so the workflow is
+    /// not its own only authority.
+    ///
+    /// A shape check alone accepts a job gated on the wrong component -- the
+    /// Go jobs gated on `rust`, say -- because that is still a component
+    /// detection, still mirrored faithfully into the expectation, and still
+    /// skips the jobs it gates on an operator-only change. Changing what a job
+    /// is gated on therefore has to be done twice: once in the workflow and
+    /// once here, where it is reviewed as code.
+    const ALWAYS: &str = "";
+    const GATED_ON: [(&str, &str); 20] = [
+        ("changes", ALWAYS),
+        ("repository-policy", ALWAYS),
+        ("rust-static", "needs.changes.outputs.rust == 'true'"),
+        ("rust-test", "needs.changes.outputs.rust == 'true'"),
+        (
+            "catalog-postgres",
+            "needs.changes.outputs.catalog == 'true'",
+        ),
+        (
+            "orch-catalog-postgres",
+            "needs.changes.outputs.orch_catalog == 'true'",
+        ),
+        (
+            "pgwire-postgres",
+            "needs.changes.outputs.pgwire == 'true' || needs.changes.outputs.pooler_postgres == 'true'",
+        ),
+        ("pgwire-fuzz", "needs.changes.outputs.pgwire == 'true'"),
+        (
+            "planner-postgres",
+            "needs.changes.outputs.planner == 'true'",
+        ),
+        ("protobuf", "needs.changes.outputs.proto == 'true'"),
+        ("go-operator", "needs.changes.outputs.go == 'true'"),
+        ("operator-kind", "needs.changes.outputs.go == 'true'"),
+        (
+            "operator-kind-manager",
+            "needs.changes.outputs.go == 'true' || needs.changes.outputs.images == 'true'",
+        ),
+        (
+            "website",
+            "needs.changes.outputs.website == 'true' || (github.event_name != 'pull_request' && needs.changes.outputs.website_exists == 'true')",
+        ),
+        ("ui", "needs.changes.outputs.ui == 'true'"),
+        ("integration", "needs.changes.outputs.integration == 'true'"),
+        ("images", "needs.changes.outputs.images == 'true'"),
+        (
+            "agent-postgres",
+            "needs.changes.outputs.postgres_agent == 'true'",
+        ),
+        ("kind", "needs.changes.outputs.kind == 'true'"),
+        ("performance", "needs.changes.outputs.performance == 'true'"),
+    ];
+
+    /// Whether a job's condition is built only from component detections.
+    ///
+    /// The expectations mirror each job's condition, so a condition weakened
+    /// with anything else -- `&& false`, an actor check, a branch check --
+    /// would be mirrored faithfully and the resulting skip accepted.
+    fn condition_is_component_shaped(
+        condition: &str,
+        components: &std::collections::BTreeSet<String>,
+    ) -> bool {
+        let mut residue = condition.to_owned();
+        // Longest first: replacing `website` before `website_exists` would
+        // leave `_exists == 'true'` behind and read as a foreign term.
+        let mut names: Vec<&String> = components.iter().collect();
+        names.sort_by_key(|name| std::cmp::Reverse(name.len()));
+        for name in names {
+            residue = residue.replace(&format!("needs.changes.outputs.{name} == 'true'"), " ");
+        }
+        residue = residue.replace("github.event_name != 'pull_request'", " ");
+        residue.chars().all(|character| {
+            character.is_whitespace() || matches!(character, '(' | ')' | '|' | '&')
+        })
+    }
+
+    /// The tests in this file are what stop a gate being retired, so they
+    /// cannot run from a job that a gate governs: the edit that retires a gate
+    /// would also stop the test that catches it. They run from the
+    /// unconditional policy job, which `GATED_ON` pins as unconditional.
+    #[test]
+    fn the_gate_tests_run_from_an_unconditional_job() {
+        let workflow = parsed_workflow();
+        let policy = workflow_job(&workflow, "repository-policy");
+        assert!(
+            policy.get("if").is_none(),
+            "the job that proves the gates is itself gated"
+        );
+        let steps = steps_of(policy, "the job that proves the gates");
+        // The aggregate is the one externally required check, and GitHub counts
+        // a conditionally skipped job as passing. `if: github.event_name ==
+        // '\''issues'\''` on it is therefore a one-line disarmament that leaves
+        // every named step untouched.
+        let aggregate = workflow_job(&workflow, "aggregate");
+        assert_eq!(
+            aggregate.get("if").and_then(serde_norway::Value::as_str),
+            Some("always()"),
+            "the aggregate is conditioned on something other than always()"
+        );
+        steps_of(aggregate, "the aggregate");
+        // Identity, not existence: any other step carrying that text would
+        // otherwise satisfy this while the named step ran something else.
+        let enforcing: Vec<&serde_norway::Value> = steps
+            .iter()
+            .filter(|step| step["name"].as_str() == Some("Prove the gates cannot be retired"))
+            .collect();
+        assert_eq!(enforcing.len(), 1, "the enforcement step is not unique");
+        let enforcing = enforcing[0];
+        assert!(
+            enforcing.get("uses").is_none(),
+            "the enforcement step defers to an action instead of running the tests"
+        );
+        assert_eq!(
+            enforcing["run"]
+                .as_str()
+                .expect("the enforcement step runs a command")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            "cargo test --locked -p pgshard-release",
+            "the enforcement step does not run this crate's tests"
+        );
+        assert_step_environment(enforcing, &[], "the enforcement step");
+        assert_eq!(
+            GATED_ON
+                .iter()
+                .find(|(job, _)| *job == "repository-policy")
+                .map(|(_, condition)| *condition),
+            Some(ALWAYS),
+            "the policy job is not pinned as unconditional"
+        );
+    }
+
+    /// A job's steps, having proved none of them — nor the job — can be
+    /// conditioned out or allowed to fail. A step carries its own `if:`, and
+    /// one keyed on an event the workflow never receives runs never while the
+    /// job still reports success; `continue-on-error` is the same hole spelled
+    /// differently.
+    fn steps_of<'a>(job: &'a serde_norway::Value, described: &str) -> &'a [serde_norway::Value] {
+        assert!(
+            job.get("continue-on-error").is_none(),
+            "{described} may fail without failing"
+        );
+        assert!(
+            job.get("defaults").is_none(),
+            "{described} sets step defaults, which can replace the shell"
+        );
+        // A job-level `env:` reaches every step of the job, so it is the same
+        // hole as a step-level one with a wider blast radius.
+        assert!(
+            job.get("env").is_none(),
+            "{described} sets an environment for every one of its steps"
+        );
+        let steps = job["steps"].as_sequence().expect("the job declares steps");
+        for step in steps {
+            let keys: std::collections::BTreeSet<&str> = step
+                .as_mapping()
+                .expect("a step is a mapping")
+                .keys()
+                .filter_map(serde_norway::Value::as_str)
+                .collect();
+            // An allowlist rather than a list of known-bad keys: the ways to
+            // stop a step doing its job are not enumerable in advance, and a
+            // key nobody considered is exactly the one that gets used.
+            for key in &keys {
+                assert!(
+                    matches!(
+                        *key,
+                        "name" | "id" | "run" | "shell" | "uses" | "with" | "env"
+                    ),
+                    "a step of {described} carries `{key}`, which nothing here constrains"
+                );
+            }
+            // Allowlisting `shell` as a key says nothing about its value:
+            // `shell: /bin/true {0}` hands the script to a program that never
+            // reads it, so the step succeeds having executed nothing.
+            if let Some(shell) = step.get("shell") {
+                assert_eq!(
+                    shell.as_str(),
+                    Some("bash"),
+                    "a step of {described} runs under a shell that need not execute it"
+                );
+            }
+        }
+        steps
+    }
+
+    /// A job outside the aggregate's `needs` is a job outside the gate.
+    ///
+    /// The exempt jobs are the ones that run after it, so they are also the
+    /// ones that could take its display name: branch protection requires a
+    /// check called `CI aggregate`, and a second job publishing a check run
+    /// under that name lets a decoy answer for the real gate.
+    fn assert_every_job_is_aggregated(workflow: &serde_norway::Value, waited: &[&str]) {
+        let claiming: Vec<&str> = workflow["jobs"]
+            .as_mapping()
+            .expect("the workflow declares jobs")
+            .iter()
+            .filter(|(_, job)| job["name"].as_str() == Some("CI aggregate"))
+            .filter_map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(
+            claiming,
+            ["aggregate"],
+            "the required check name is published by something other than the aggregate alone"
+        );
+        // A literal comparison only sees literal names. `name: ${{ ... }}` is
+        // evaluated at run time and can render as anything, including the
+        // required check name, so a name carrying an expression is constrained
+        // to a shape whose fixed prefix cannot produce it.
+        for (job, definition) in workflow["jobs"]
+            .as_mapping()
+            .expect("the workflow declares jobs")
+            .iter()
+            .filter_map(|(job, definition)| Some((job.as_str()?, definition)))
+        {
+            let Some(name) = definition["name"].as_str() else {
+                continue;
+            };
+            if !name.contains("${{") {
+                continue;
+            }
+            let (literal, expression) = name
+                .split_once(" / ")
+                .unwrap_or_else(|| panic!("{job}'s computed name has no fixed prefix: {name}"));
+            assert!(
+                !literal.contains("${{") && literal != "CI aggregate",
+                "{job}'s computed name can render as the required check name: {name}"
+            );
+            assert!(
+                expression.starts_with("${{ matrix.") && expression.ends_with("}}"),
+                "{job}'s computed name is not a matrix leg suffix: {name}"
+            );
+        }
+        for job in workflow["jobs"]
+            .as_mapping()
+            .expect("the workflow declares jobs")
+            .keys()
+            .filter_map(serde_norway::Value::as_str)
+        {
+            assert!(
+                waited.contains(&job)
+                    || matches!(
+                        job,
+                        "aggregate" | "release" | "pages" | "cleanup-dependabot-ci-ref"
+                    ),
+                "{job} is neither aggregated nor one of the jobs that follow the gate"
+            );
+        }
+    }
+
+    /// A job whose `success` the aggregate consumes must not be able to
+    /// report it while a step of it failed.
+    fn assert_nothing_swallows_failure(job: &serde_norway::Value, described: &str) {
+        assert!(
+            job.get("continue-on-error").is_none(),
+            "{described} may fail without failing"
+        );
+        assert!(
+            job.get("defaults").is_none(),
+            "{described} sets step defaults, which can replace the shell"
+        );
+        assert!(
+            job.get("env").is_none(),
+            "{described} sets an environment for every one of its steps"
+        );
+        for step in job["steps"].as_sequence().expect("the job declares steps") {
+            assert!(
+                step.get("continue-on-error").is_none(),
+                "a step of {described} may fail without failing it"
+            );
+        }
+    }
+
+    /// The environment a gate step may declare, as an exact set.
+    ///
+    /// `env:` is a master key: `SHELLOPTS: noexec` makes bash parse the script
+    /// and exit zero without running a line of it, and `BASH_ENV` pointed at a
+    /// file containing `exit 0` does the same — with `run:` still stating
+    /// exactly what the step was supposed to do.
+    fn assert_step_environment(step: &serde_norway::Value, allowed: &[&str], described: &str) {
+        let declared: std::collections::BTreeSet<&str> = step
+            .get("env")
+            .and_then(serde_norway::Value::as_mapping)
+            .map(|env| env.keys().filter_map(serde_norway::Value::as_str).collect())
+            .unwrap_or_default();
+        let allowed: std::collections::BTreeSet<&str> = allowed.iter().copied().collect();
+        assert_eq!(
+            declared, allowed,
+            "{described} does not declare exactly the environment it is allowed"
+        );
+    }
+
+    fn parsed_workflow() -> serde_norway::Value {
+        let workflow: serde_norway::Value =
+            serde_norway::from_str(include_str!("../../../.github/workflows/ci.yml"))
+                .expect("the workflow is valid YAML");
+        assert!(
+            workflow.get("defaults").is_none(),
+            "the workflow sets step defaults, which can replace every shell"
+        );
+        // Workflow-level `env:` reaches every step of every job at once.
+        let environment: std::collections::BTreeSet<&str> = workflow
+            .get("env")
+            .and_then(serde_norway::Value::as_mapping)
+            .map(|env| env.keys().filter_map(serde_norway::Value::as_str).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            environment,
+            ["CARGO_TERM_COLOR", "RUST_BACKTRACE"].into_iter().collect(),
+            "the workflow declares an environment for every step of every job"
+        );
+        workflow
+    }
+
+    fn workflow_job<'a>(workflow: &'a serde_norway::Value, job: &str) -> &'a serde_norway::Value {
+        let job = &workflow["jobs"][job];
+        assert!(!job.is_null(), "the workflow declares no job named it");
+        job
+    }
+
+    /// Every job the aggregate waits on has to carry an expectation, that
+    /// expectation has to read that job's own result, and it has to repeat the
+    /// job's own `if:` exactly. Any of the three being wrong retires the gate
+    /// while the aggregate still reports success.
+    #[test]
+    fn every_aggregated_job_expects_its_own_condition() {
+        let workflow = parsed_workflow();
+        let waited: Vec<&str> = workflow_job(&workflow, "aggregate")["needs"]
+            .as_sequence()
+            .expect("the aggregate declares its needs")
+            .iter()
+            .map(|job| job.as_str().expect("a needed job is named"))
+            .collect();
+
+        let environment = &aggregate_gate_step(&workflow)["env"];
+        let components: std::collections::BTreeSet<String> = environment["COMPONENT_OUTPUTS"]
+            .as_str()
+            .expect("COMPONENT_OUTPUTS is a scalar")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                line.trim()
+                    .split_once('=')
+                    .expect("an entry names a component")
+                    .0
+                    .to_owned()
+            })
+            .collect();
+        let expectations = environment["JOB_EXPECTATIONS"]
+            .as_str()
+            .expect("the aggregate declares its expectations");
+        let declared: Vec<(&str, &str, &str)> = expectations
+            .lines()
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| {
+                let (job, rest) = entry.split_once('=').expect("an entry names a job");
+                let (result, expected) = rest
+                    .split_once("}}=")
+                    .map_or((rest, ""), |(result, expected)| {
+                        (result.trim_end(), expected)
+                    });
+                (job, result, expected)
+            })
+            .collect();
+        assert_eq!(
+            waited.len(),
+            declared.len(),
+            "the aggregate's needs and expectations are not the same set"
+        );
+        // Lengths alone survive substitution: needing one job twice in place of
+        // another keeps every count identical while the replaced job stops
+        // being aggregated at all.
+        let unique: std::collections::BTreeSet<&&str> = waited.iter().collect();
+        assert_eq!(
+            unique.len(),
+            waited.len(),
+            "the aggregate needs a job twice"
+        );
+        assert_every_job_is_aggregated(&workflow, &waited);
+        for (job, _) in &GATED_ON {
+            assert!(
+                waited.contains(job),
+                "{job} has a restated condition but is not aggregated"
+            );
+            // The jobs the aggregate consumes are what `success` is claimed
+            // about. They may legitimately carry conditional steps, so the
+            // guarantee asserted here is narrower than for a gate job: nothing
+            // may let a step fail without failing the job, because that is what
+            // turns `success` into a claim about work that did not pass.
+            assert_nothing_swallows_failure(workflow_job(&workflow, job), job);
+        }
+        assert_eq!(
+            waited.len(),
+            GATED_ON.len(),
+            "the restated conditions do not cover exactly the aggregated jobs"
+        );
+        for job in &waited {
+            let (_, result, expected) = declared
+                .iter()
+                .find(|(name, ..)| name == job)
+                .unwrap_or_else(|| panic!("the aggregate waits on {job} without requiring it"));
+            // The result must be this job's, not a neighbour's: reading another
+            // job's result would let this one vanish unnoticed.
+            assert_eq!(
+                *result,
+                format!("${{{{ needs.{job}.result"),
+                "{job}'s expectation does not read {job}'s own result"
+            );
+            let condition = workflow_job(&workflow, job)
+                .get("if")
+                .and_then(serde_norway::Value::as_str)
+                .map(|condition| condition.split_whitespace().collect::<Vec<_>>().join(" "));
+            assert_eq!(
+                *expected,
+                condition.clone().map_or_else(
+                    || "true".to_owned(),
+                    |condition| format!("${{{{ {condition} }}}}")
+                ),
+                "{job}'s expectation does not repeat {job}'s own condition"
+            );
+            // Mirroring is only a gate while the thing mirrored is a component
+            // detection. A condition weakened by any other term would be
+            // mirrored just as faithfully, and the skip it caused accepted.
+            if let Some(condition) = &condition {
+                assert!(
+                    condition_is_component_shaped(condition, &components),
+                    "{job} is gated on something other than its components: {condition}"
+                );
+            }
+            let (_, gated_on) = GATED_ON
+                .iter()
+                .find(|(name, _)| name == job)
+                .unwrap_or_else(|| panic!("{job} has no restated condition"));
+            assert_eq!(
+                condition.unwrap_or_default(),
+                *gated_on,
+                "{job} is not gated on what it is supposed to be gated on"
+            );
+        }
     }
 
     #[test]
