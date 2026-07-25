@@ -1582,37 +1582,61 @@ jobs:
     steps:
       - name: Require every applicable job
         env:
-          JOB_RESULTS: >-
-            changes=${{ needs.changes.result }}
-            repository-policy=${{ needs.repository-policy.result }}
-            rust-static=${{ needs.rust-static.result }}
-            rust-test=${{ needs.rust-test.result }}
-            catalog-postgres=${{ needs.catalog-postgres.result }}
-            orch-catalog-postgres=${{ needs.orch-catalog-postgres.result }}
-            pgwire-postgres=${{ needs.pgwire-postgres.result }}
-            pgwire-fuzz=${{ needs.pgwire-fuzz.result }}
-            planner-postgres=${{ needs.planner-postgres.result }}
-            protobuf=${{ needs.protobuf.result }}
-            go-operator=${{ needs.go-operator.result }}
-            operator-kind=${{ needs.operator-kind.result }}
-            operator-kind-manager=${{ needs.operator-kind-manager.result }}
-            website=${{ needs.website.result }}
-            ui=${{ needs.ui.result }}
-            integration=${{ needs.integration.result }}
-            images=${{ needs.images.result }}
-            agent-postgres=${{ needs.agent-postgres.result }}
-            kind=${{ needs.kind.result }}
-            performance=${{ needs.performance.result }}
+          # job=result=expected-to-run, where the expectation repeats the
+          # condition that gates the job itself. A job may be skipped only when
+          # the detector said its component was untouched. Accepting `skipped`
+          # from any job let a detector fault, a stale path filter, or a
+          # cascade retire a gate without anything failing.
+          JOB_EXPECTATIONS: >-
+            changes=${{ needs.changes.result }}=true
+            repository-policy=${{ needs.repository-policy.result }}=true
+            rust-static=${{ needs.rust-static.result }}=${{ needs.changes.outputs.rust }}
+            rust-test=${{ needs.rust-test.result }}=${{ needs.changes.outputs.rust }}
+            catalog-postgres=${{ needs.catalog-postgres.result }}=${{ needs.changes.outputs.catalog }}
+            orch-catalog-postgres=${{ needs.orch-catalog-postgres.result }}=${{ needs.changes.outputs.orch_catalog }}
+            pgwire-postgres=${{ needs.pgwire-postgres.result }}=${{ needs.changes.outputs.pgwire == 'true' || needs.changes.outputs.pooler_postgres == 'true' }}
+            pgwire-fuzz=${{ needs.pgwire-fuzz.result }}=${{ needs.changes.outputs.pgwire }}
+            planner-postgres=${{ needs.planner-postgres.result }}=${{ needs.changes.outputs.planner }}
+            protobuf=${{ needs.protobuf.result }}=${{ needs.changes.outputs.proto }}
+            go-operator=${{ needs.go-operator.result }}=${{ needs.changes.outputs.go }}
+            operator-kind=${{ needs.operator-kind.result }}=${{ needs.changes.outputs.go }}
+            operator-kind-manager=${{ needs.operator-kind-manager.result }}=${{ needs.changes.outputs.go == 'true' || needs.changes.outputs.images == 'true' }}
+            website=${{ needs.website.result }}=${{ needs.changes.outputs.website == 'true' || (github.event_name != 'pull_request' && needs.changes.outputs.website_exists == 'true') }}
+            ui=${{ needs.ui.result }}=${{ needs.changes.outputs.ui }}
+            integration=${{ needs.integration.result }}=${{ needs.changes.outputs.integration }}
+            images=${{ needs.images.result }}=${{ needs.changes.outputs.images }}
+            agent-postgres=${{ needs.agent-postgres.result }}=${{ needs.changes.outputs.postgres_agent }}
+            kind=${{ needs.kind.result }}=${{ needs.changes.outputs.kind }}
+            performance=${{ needs.performance.result }}=${{ needs.changes.outputs.performance }}
         shell: bash
         run: |
           set -euo pipefail
           failed=false
-          for result in $JOB_RESULTS; do
-            state="${result#*=}"
-            if [[ "$state" != success && "$state" != skipped ]]; then
-              echo "Required job did not pass: $result" >&2
-              failed=true
-            fi
+          for entry in $JOB_EXPECTATIONS; do
+            job="${entry%%=*}"
+            state="${entry#*=}"
+            expected="${state#*=}"
+            state="${state%%=*}"
+            case "$expected" in
+              true)
+                if [[ "$state" != success ]]; then
+                  echo "Required job did not pass: $job=$state" >&2
+                  failed=true
+                fi
+                ;;
+              false)
+                if [[ "$state" != success && "$state" != skipped ]]; then
+                  echo "Required job did not pass: $job=$state" >&2
+                  failed=true
+                fi
+                ;;
+              # No expectation means the detector did not report, which is
+              # exactly when a skip must not be taken on trust.
+              *)
+                echo "No expectation for $job (detector reported '$expected')" >&2
+                failed=true
+                ;;
+            esac
           done
           "$failed" && exit 1
           echo "All applicable CI jobs passed."

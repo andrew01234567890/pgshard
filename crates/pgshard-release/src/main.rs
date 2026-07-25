@@ -1924,6 +1924,105 @@ mod tests {
         assert!(!ci.contains("Deploy documentation to GitHub Pages"));
     }
 
+    /// The shipped script, not a copy of it: a copy drifts, and the gate this
+    /// asserts on is the one that authorizes a release.
+    fn aggregate_gate_script() -> String {
+        let ci = include_str!("../../../.github/workflows/ci.yml");
+        let body = ci
+            .split_once("- name: Require every applicable job")
+            .expect("the aggregate step exists")
+            .1
+            .split_once("run: |\n")
+            .expect("the aggregate step runs a script")
+            .1;
+        let indent = |line: &str| line.len() - line.trim_start().len();
+        let script_indent = indent(body.lines().next().expect("the script is not empty"));
+        body.lines()
+            .take_while(|line| line.trim().is_empty() || indent(line) >= script_indent)
+            .fold(String::new(), |mut script, line| {
+                script.push_str(line.get(script_indent..).unwrap_or(""));
+                script.push('\n');
+                script
+            })
+    }
+
+    fn run_aggregate_gate(expectations: &str) -> (bool, String) {
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(aggregate_gate_script())
+            .env("JOB_EXPECTATIONS", expectations)
+            .output()
+            .expect("run the aggregate gate");
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    /// A release is authorized by this gate, so a component's tests not having
+    /// run may only pass when the detector said that component was untouched.
+    #[test]
+    fn the_aggregate_refuses_a_skip_the_detector_did_not_authorize() {
+        let (passed, stderr) =
+            run_aggregate_gate("rust-test=success=true go-operator=skipped=false");
+        assert!(
+            passed,
+            "a skip the detector authorized was rejected: {stderr}"
+        );
+
+        let (passed, stderr) =
+            run_aggregate_gate("rust-test=skipped=true go-operator=success=true");
+        assert!(!passed, "a gate skipped while its component changed passed");
+        assert!(stderr.contains("rust-test=skipped"), "{stderr}");
+
+        // An empty expectation is what a failed or skipped detector produces.
+        let (passed, stderr) = run_aggregate_gate("rust-test=skipped=");
+        assert!(!passed, "a skip with no expectation behind it passed");
+        assert!(stderr.contains("No expectation for rust-test"), "{stderr}");
+
+        for state in ["failure", "cancelled"] {
+            let (passed, _) = run_aggregate_gate(&format!("rust-test={state}=false"));
+            assert!(!passed, "an untouched component still shipped on {state}");
+        }
+    }
+
+    /// Every job the aggregate waits on has to carry an expectation, or it is
+    /// waited on and then not actually required.
+    #[test]
+    fn every_aggregated_job_carries_an_expectation() {
+        let ci = include_str!("../../../.github/workflows/ci.yml");
+        let aggregate = ci
+            .split_once("  aggregate:")
+            .expect("the aggregate job exists")
+            .1;
+        let needs = aggregate
+            .split_once("    needs:\n")
+            .expect("the aggregate declares its needs")
+            .1;
+        let expectations = aggregate
+            .split_once("JOB_EXPECTATIONS: >-")
+            .expect("the aggregate declares its expectations")
+            .1;
+        // Compared as whole names: `operator-kind=` ends with `kind=`, so a
+        // substring check would accept a job whose expectation was removed.
+        let declared: std::collections::BTreeSet<&str> = expectations
+            .lines()
+            .take_while(|line| !line.trim_start().starts_with("shell:"))
+            .filter_map(|line| line.trim().split_once('='))
+            .map(|(job, _)| job)
+            .collect();
+        for job in needs
+            .lines()
+            .take_while(|line| line.trim_start().starts_with("- "))
+            .map(|line| line.trim().trim_start_matches("- "))
+        {
+            assert!(
+                declared.contains(job),
+                "the aggregate waits on {job} without requiring it"
+            );
+        }
+    }
+
     #[test]
     fn exact_ci_refs_require_full_object_ids() {
         assert!(is_complete_sha(&"a".repeat(40)));
