@@ -3,6 +3,7 @@
 pub mod catalog_activation;
 pub mod catalog_material;
 pub mod restore;
+pub mod serving_preparation;
 pub mod writable_generation;
 
 use std::cmp::Ordering;
