@@ -61,6 +61,17 @@ impl DurableWritableGeneration {
 
     /// Returns the monotonic fencing term.
     #[must_use]
+    /// The shard this generation coordinates.
+    ///
+    /// Exposed so a contract that names both a shard and a generation can
+    /// prove they agree; the canonical bytes carry it, but round-tripping
+    /// them proves only that the generation is canonical, not that it is the
+    /// generation for the shard being acted on.
+    #[must_use]
+    pub const fn shard_id(&self) -> ShardId {
+        self.shard_id
+    }
+
     pub const fn term(&self) -> u64 {
         self.term
     }

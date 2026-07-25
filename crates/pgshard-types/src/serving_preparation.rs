@@ -207,11 +207,13 @@ impl ServingPreparation {
         if parsed.canonical_bytes() != generation.as_bytes() {
             return Err(ServingPreparationError::InvalidGeneration);
         }
-        // The shard the generation coordinates is not exposed by the type, and
-        // adding an accessor is not this slice's business. It does not need to
-        // be: the round-trip equality above binds the exact canonical bytes, so
-        // the shard is bound transitively, and the stage that compares this
-        // preparation against a live generation compares those same bytes.
+        // Round-tripping proves the generation is canonical. It does NOT prove
+        // it is the generation for the shard being acted on, so the two are
+        // compared: a preparation naming shard zero and carrying another
+        // shard's generation is not a preparation for either of them.
+        if parsed.shard_id().0 != *shard {
+            return Err(ServingPreparationError::InvalidGeneration);
+        }
         for digest in [
             request_sha256,
             configuration_sha256,
@@ -536,6 +538,48 @@ mod tests {
                 "a non-canonical preparation was hashed anyway"
             );
         }
+    }
+
+    /// A canonical generation for a different shard is still canonical, so
+    /// round-tripping it proves nothing about whether it belongs to the shard
+    /// being acted on. This is the case that argument missed.
+    #[test]
+    fn a_generation_for_another_shard_is_rejected() {
+        let other_shard = crate::writable_generation::DurableWritableGeneration::new(
+            "demo".to_owned(),
+            "cccccccc-1111-2222-3333-444444444444".to_owned(),
+            crate::ShardId(3),
+            "database".to_owned(),
+            "demo-shard-0003-term".to_owned(),
+            "dddddddd-1111-2222-3333-444444444444".to_owned(),
+            "demo-shard-0003-0".to_owned(),
+            7,
+        )
+        .expect("a shard-three generation is valid on its own");
+        let canonical =
+            String::from_utf8(other_shard.canonical_bytes()).expect("canonical bytes are UTF-8");
+        // It round-trips, so the previous check accepted it.
+        assert_eq!(
+            crate::writable_generation::DurableWritableGeneration::parse_canonical(
+                canonical.as_bytes()
+            )
+            .expect("it parses")
+            .canonical_bytes(),
+            canonical.as_bytes(),
+        );
+
+        let mut mismatched = preparation();
+        mismatched.generation = canonical;
+        assert_eq!(
+            mismatched.validate(),
+            Err(ServingPreparationError::InvalidGeneration),
+            "a preparation for shard zero accepted another shard's generation"
+        );
+        assert_eq!(
+            mismatched.sha256(),
+            Err(ServingPreparationError::InvalidGeneration),
+            "a mismatched preparation was hashed anyway"
+        );
     }
 
     /// The digest is a cross-language contract, so it is pinned rather than
