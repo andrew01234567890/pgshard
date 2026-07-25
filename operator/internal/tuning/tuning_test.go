@@ -3,6 +3,7 @@ package tuning
 import (
 	"encoding/json"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -326,4 +327,70 @@ func TestValidateStorageBoundsCheckpointWAL(t *testing.T) {
 	if err := ValidateStorage(settings, resource.MustParse("4Gi")); err == nil || !strings.Contains(err.Error(), "one quarter") {
 		t.Fatalf("oversized WAL budget accepted: %v", err)
 	}
+}
+
+// The generated settings must fit the container's memory limit. The suite
+// otherwise exercises only balanced core/memory ratios, which is why a fleet of
+// autovacuum workers sized from cores alone, each inheriting an uncharged
+// maintenance_work_mem, went unnoticed.
+func TestSkewedResourceRatiosStayInsideTheMemoryLimit(t *testing.T) {
+	for _, shape := range []struct {
+		cpu, memory string
+	}{
+		{"12", "1Gi"}, {"16", "1Gi"}, {"8", "2Gi"}, {"16", "2Gi"},
+		{"4", "4Gi"}, {"16", "8Gi"}, {"1", "2Gi"}, {"2", "1Gi"},
+	} {
+		result, err := Calculate(Input{
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse(shape.cpu),
+					corev1.ResourceMemory: resource.MustParse(shape.memory),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse(shape.cpu),
+					corev1.ResourceMemory: resource.MustParse(shape.memory),
+				},
+			},
+			PoolerMaxReplicas: 1, MembersPerShard: 1, MaximumChangeStreams: 1,
+		})
+		if err != nil {
+			continue // a shape this small is rejected outright, which is also safe
+		}
+		workMem := mebibytes(t, result.Settings["autovacuum_work_mem"])
+		if workMem < minimumAutovacuumWorkMem/mib {
+			t.Fatalf("cpu=%s memory=%s starves autovacuum workers at %dMB", shape.cpu, shape.memory, workMem)
+		}
+		workers, err := strconv.ParseInt(result.Settings["autovacuum_max_workers"], 10, 64)
+		if err != nil {
+			t.Fatalf("autovacuum_max_workers is not an integer: %v", err)
+		}
+		shared := mebibytes(t, result.Settings["shared_buffers"])
+		maintenance := mebibytes(t, result.Settings["maintenance_work_mem"])
+		autovacuum := workers * workMem
+		// The fleet has a budget share; exceeding it is what a worker count
+		// derived from cores alone does, and the totals below can still look
+		// affordable while it does.
+		budget := (result.MemoryBytes-result.ReservedBytes)/mib - shared
+		if ceiling := max64(budget/4, minimumAutovacuumWorkMem/mib); autovacuum > ceiling {
+			t.Fatalf("cpu=%s memory=%s lets %d autovacuum workers reach %dMB against a %dMB share",
+				shape.cpu, shape.memory, workers, autovacuum, ceiling)
+		}
+		// shared_buffers, the whole autovacuum fleet, and one concurrent manual
+		// maintenance operation, all against the limit the cgroup enforces.
+		committed := shared + autovacuum + maintenance
+		limit := result.MemoryBytes / mib
+		if committed >= limit {
+			t.Fatalf("cpu=%s memory=%s commits %dMB (shared=%d autovacuum=%d*%d maintenance=%d) of a %dMB limit before the postmaster, backends or worker slots",
+				shape.cpu, shape.memory, committed, shared, workers, workMem, maintenance, limit)
+		}
+	}
+}
+
+func mebibytes(t *testing.T, value string) int64 {
+	t.Helper()
+	parsed, err := strconv.ParseInt(strings.TrimSuffix(value, "MB"), 10, 64)
+	if err != nil {
+		t.Fatalf("setting %q is not a MB quantity: %v", value, err)
+	}
+	return parsed
 }

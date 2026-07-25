@@ -17,6 +17,10 @@ import (
 
 const mib = int64(1024 * 1024)
 
+// Below this an autovacuum worker cannot make useful progress on a large
+// relation, so the worker count is reduced rather than each worker starved.
+const minimumAutovacuumWorkMem = 16 * mib
+
 var allowedOverrides = map[string]struct{}{
 	"autovacuum_analyze_scale_factor": {},
 	"autovacuum_max_workers":          {},
@@ -165,12 +169,30 @@ func Calculate(in Input) (Result, error) {
 
 	available := memory - reserved - shared
 	workMem := clamp64(available/(maxConnections*4), mib, 64*mib)
-	maintenance := clamp64(memory/20, 64*mib, 1024*mib)
 	cores := (cpu + 999) / 1000
 	workerProcesses := max64(8, cores*4+4)
 	parallelWorkers := max64(2, cores)
 	parallelWorkersPerGather := clamp64((cores+1)/2, 1, 4)
+
+	// Autovacuum is sized against memory as well as cores. Deriving the worker
+	// count from cores alone lets a skewed request -- many cores, little memory
+	// -- put a fleet of workers behind a maintenance_work_mem that was never
+	// charged against the budget, and each worker inherits that value unless
+	// autovacuum_work_mem is set. At cpu=12, memory=1Gi that reached 640MiB of
+	// autovacuum ceiling against a 256MiB budget, on top of a 256MiB
+	// shared_buffers, and the cgroup kills the postmaster.
+	autovacuumBudget := available / 4
 	autovacuumWorkers := clamp64(cores+1, 3, 10)
+	if affordable := autovacuumBudget / minimumAutovacuumWorkMem; affordable < autovacuumWorkers {
+		autovacuumWorkers = max64(1, affordable)
+	}
+	autovacuumWorkMem := clamp64(
+		autovacuumBudget/autovacuumWorkers,
+		minimumAutovacuumWorkMem,
+		256*mib,
+	)
+	// One session may run a manual VACUUM or CREATE INDEX alongside that fleet.
+	maintenance := clamp64(min64(memory/20, autovacuumBudget), 64*mib, 1024*mib)
 
 	operationSlots := int64(4) // reshard, schema, repair, and recovery consumers
 	physicalSlots := int64(in.MembersPerShard - 1)
@@ -201,6 +223,7 @@ func Calculate(in Input) (Result, error) {
 		// alone can retain WAL until pg_wal fills.
 		"archive_mode":                    "off",
 		"autovacuum_max_workers":          strconv.FormatInt(autovacuumWorkers, 10),
+		"autovacuum_work_mem":             formatMiB(autovacuumWorkMem),
 		"effective_cache_size":            formatMiB(effective),
 		"fsync":                           "on",
 		"full_page_writes":                "on",
