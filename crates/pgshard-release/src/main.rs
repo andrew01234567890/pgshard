@@ -2916,50 +2916,6 @@ mod tests {
         }
     }
 
-    /// Returns the single-quoted regular expression an `emit_component` line
-    /// passes as its change trigger.
-    fn extract_emit_component_pattern(line: &str) -> &str {
-        let opening = line.find('\'').expect("quoted change-trigger pattern");
-        let rest = &line[opening + 1..];
-        // The FIRST closing quote ends the shell word. Taking the last one
-        // would let a trailing `# '…'` comment supply the text the guard is
-        // looking for while the live pattern is something narrower.
-        let closing = rest.find('\'').expect("closed change-trigger pattern");
-        &rest[..closing]
-    }
-
-    /// Splits an alternation on the `|` separators that are not inside a group,
-    /// so a nested alternation such as `(a|b)` stays one alternative.
-    fn top_level_alternatives(pattern: &str) -> impl Iterator<Item = &str> {
-        let mut alternatives = Vec::new();
-        let mut depth = 0_usize;
-        let mut start = 0;
-        let mut escaped = false;
-        for (index, character) in pattern.char_indices() {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            match character {
-                '\\' => escaped = true,
-                '(' => depth += 1,
-                ')' => depth = depth.saturating_sub(1),
-                '|' if depth == 0 => {
-                    alternatives.push(&pattern[start..index]);
-                    start = index + 1;
-                }
-                _ => {}
-            }
-        }
-        // An unmatched group or a trailing escape makes grep reject the pattern
-        // outright, so the trigger would never fire. Refuse to certify a
-        // pattern this parser cannot fully account for.
-        assert_eq!(depth, 0, "change-trigger pattern has an unmatched group");
-        assert!(!escaped, "change-trigger pattern ends in a dangling escape");
-        alternatives.push(&pattern[start..]);
-        alternatives.into_iter()
-    }
-
     #[test]
     fn ci_guards_component_deletion_and_rust_policy_changes() {
         let workflow = include_str!("../../../.github/workflows/ci.yml");
@@ -2982,59 +2938,12 @@ mod tests {
                 "CI must check {manifest} at both head and base"
             );
         }
-        for policy in ["deny\\.toml", "rustfmt\\.toml", "^\\.cargo/", "^Makefile"] {
-            assert!(
-                workflow.contains(policy),
-                "Rust CI trigger must include {policy}"
-            );
-        }
-        let image_trigger = workflow
-            .lines()
-            .find(|line| line.contains("emit_component images"))
-            .expect("image CI trigger");
-        for input in [
-            "^extensions/",
-            "^\\.dockerignore$",
-            "^Cargo\\.(toml|lock)$",
-            "^rust-toolchain\\.toml$",
-            "^rustfmt\\.toml$",
-        ] {
-            assert!(
-                image_trigger.contains(input),
-                "image CI trigger must include {input}"
-            );
-        }
-        let postgres_agent_trigger = workflow
-            .lines()
-            .find(|line| line.contains("emit_component postgres_agent"))
-            .expect("PostgreSQL agent lifecycle trigger");
-        for input in [
-            "^crates/(pgshard-agent|pgshard-types|pgshard-version)/",
-            // A directory prefix, never a single migration filename: the agent
-            // lifecycle job is the only gate that runs the agent against a live
-            // PostgreSQL, and pinning one file silently skips it — and the
-            // aggregate counts a skipped job as a pass — the moment a second
-            // migration is added.
-            "^crates/pgshard-catalog/migrations/",
-            "^extensions/pgshard_fence/",
-            "images/rust\\.Dockerfile",
-            "images/quarantine\\.pg_hba\\.conf",
-            "images/replication-bootstrap-primary\\.pg_hba\\.conf",
-        ] {
-            assert!(
-                postgres_agent_trigger.contains(input),
-                "PostgreSQL agent trigger must include {input}"
-            );
-        }
-        // Substring containment is not enough here: it also passes for a
-        // narrowed alternative that merely starts with the directory, such as
-        // `^crates/pgshard-catalog/migrations/0002\.sql$`. Require the
-        // directory to be a complete alternative of its own.
-        assert!(
-            top_level_alternatives(extract_emit_component_pattern(postgres_agent_trigger))
-                .any(|alternative| alternative == "^crates/pgshard-catalog/migrations/"),
-            "PostgreSQL agent trigger must match the whole migrations directory, not a file beneath it"
-        );
+        // What each trigger has to cover is not asserted from its text. A
+        // pattern that mentions a path still skips it when the mention sits
+        // inside a narrower alternative, and shell word concatenation can append
+        // to a quoted pattern without the quoted part changing at all. Those
+        // inputs are put to the detector itself in
+        // `the_detector_fires_for_build_inputs_outside_the_crates`.
         assert!(workflow.contains("if: needs.changes.outputs.postgres_agent == 'true'"));
         for command in [
             "go mod tidy",
@@ -3057,5 +2966,1394 @@ mod tests {
         assert!(makefile.contains("concurrency queue key"));
         assert!(workflow.contains("      - planner-postgres"));
         assert!(workflow.contains("planner-postgres=${{ needs.planner-postgres.result }}"));
+    }
+
+    /// The repository root. CI reports changed files relative to it, so every
+    /// path handed to the detector below is stated the same way.
+    fn workspace_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("the release crate lives two levels below the workspace root")
+            .to_owned()
+    }
+
+    fn git_stdout(arguments: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(workspace_root())
+            .output()
+            .unwrap_or_else(|error| panic!("git {arguments:?} runs: {error}"));
+        assert!(
+            output.status.success(),
+            "git {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        String::from_utf8(output.stdout).expect("git reports paths as UTF-8")
+    }
+
+    /// Every path git tracks, which is exactly the universe CI can report as
+    /// changed.
+    ///
+    /// `git diff --name-only` C-quotes any name outside printable ASCII, so a
+    /// raw path holding a space or a newline would stand for something the
+    /// detector never sees, and the scratch index below is tab-delimited for the
+    /// same reason. The assumption is pinned here rather than relied upon.
+    fn tracked_files() -> std::collections::BTreeSet<String> {
+        let tracked: std::collections::BTreeSet<String> = git_stdout(&["ls-files", "-z"])
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            !tracked.is_empty(),
+            "git tracks no file, so every requirement below would be vacuous"
+        );
+        for path in &tracked {
+            assert!(
+                path.chars().all(|character| character.is_ascii_graphic()),
+                "{path} is not printable ASCII, so CI would quote it and this raw path no \
+                 longer represents what the detector matches"
+            );
+        }
+        tracked
+    }
+
+    /// A repository-relative, lexically normalized form of `path`, or `None`
+    /// when it resolves outside the repository — where CI can never report a
+    /// change to it, and where the toolchain and the registry live.
+    fn repository_path(root: &std::path::Path, path: &str) -> Option<String> {
+        let candidate = std::path::Path::new(path);
+        let relative = if candidate.is_absolute() {
+            candidate.strip_prefix(root).ok()?
+        } else {
+            candidate
+        };
+        let mut normalized = std::path::PathBuf::new();
+        for component in relative.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    if !normalized.pop() {
+                        return None;
+                    }
+                }
+                std::path::Component::Normal(part) => normalized.push(part),
+                std::path::Component::Prefix(_) | std::path::Component::RootDir => return None,
+            }
+        }
+        normalized.to_str().map(str::to_owned)
+    }
+
+    struct WorkspaceCrate {
+        directory: String,
+        manifest: String,
+        dependencies: Vec<String>,
+    }
+
+    /// The workspace as cargo resolves it: inheritance, renames, every
+    /// dependency table and every valid path spelling. Reading one of those
+    /// spellings out of the manifest text agreed with cargo today and would
+    /// silently shrink the closure the first time someone used another.
+    fn workspace_crates() -> std::collections::BTreeMap<String, WorkspaceCrate> {
+        let root = workspace_root();
+        let output = std::process::Command::new(env!("CARGO"))
+            .args([
+                "metadata",
+                "--format-version",
+                "1",
+                "--no-deps",
+                "--locked",
+                "--manifest-path",
+            ])
+            .arg(root.join("Cargo.toml"))
+            .output()
+            .expect("cargo metadata runs");
+        assert!(
+            output.status.success(),
+            "cargo metadata failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("cargo metadata emits JSON");
+        let packages = metadata["packages"]
+            .as_array()
+            .expect("cargo metadata lists the workspace packages");
+        assert!(!packages.is_empty(), "cargo metadata listed no package");
+        let members: std::collections::BTreeSet<&str> = packages
+            .iter()
+            .map(|package| package["name"].as_str().expect("a package is named"))
+            .collect();
+        let mut crates = std::collections::BTreeMap::new();
+        for package in packages {
+            let name = package["name"].as_str().expect("a package is named");
+            let manifest = package["manifest_path"]
+                .as_str()
+                .expect("a package has a manifest");
+            let manifest = repository_path(&root, manifest)
+                .unwrap_or_else(|| panic!("{name} is manifested outside the repository"));
+            let directory = manifest
+                .strip_suffix("/Cargo.toml")
+                .unwrap_or_else(|| panic!("{name} is not manifested in a directory of its own"))
+                .to_owned();
+            let mut dependencies: Vec<String> = package["dependencies"]
+                .as_array()
+                .expect("a package lists its dependencies")
+                .iter()
+                .map(|dependency| {
+                    dependency["name"]
+                        .as_str()
+                        .expect("a dependency is named")
+                        .to_owned()
+                })
+                .filter(|dependency| members.contains(dependency.as_str()))
+                .collect();
+            dependencies.sort();
+            dependencies.dedup();
+            let previous = crates.insert(
+                name.to_owned(),
+                WorkspaceCrate {
+                    directory,
+                    manifest,
+                    dependencies,
+                },
+            );
+            assert!(previous.is_none(), "cargo metadata listed {name} twice");
+        }
+        crates
+    }
+
+    fn transitive_closure(
+        root: &str,
+        crates: &std::collections::BTreeMap<String, WorkspaceCrate>,
+    ) -> std::collections::BTreeSet<String> {
+        let mut reached = std::collections::BTreeSet::new();
+        let mut pending = vec![root.to_owned()];
+        while let Some(name) = pending.pop() {
+            let entry = crates
+                .get(&name)
+                .unwrap_or_else(|| panic!("{name} is not a workspace crate"));
+            for dependency in &entry.dependencies {
+                if reached.insert(dependency.clone()) {
+                    pending.push(dependency.clone());
+                }
+            }
+        }
+        reached
+    }
+
+    /// The scratch build whose dep-info the coverage requirement is read from.
+    /// It is kept apart from the workspace target directory so that only this
+    /// build's own records are there to be read.
+    ///
+    /// CI carries this directory between commits in its cache, so a renamed or
+    /// deleted target can leave dep-info behind. That is fail-closed — the
+    /// record names a source cargo no longer reports, and it is dropped — but a
+    /// record that still names live files can require a path that no longer
+    /// needs covering. Deleting this directory is the cure for a failure that
+    /// names a file the tree no longer has.
+    fn component_detector_target() -> std::path::PathBuf {
+        workspace_root().join("target/component-detector")
+    }
+
+    /// Every dep-info record the scratch build wrote.
+    ///
+    /// A build script is a compilation like any other and reads whatever it is
+    /// given, but cargo files its record under `build/` rather than `deps/`.
+    /// Reading only `deps/` left a whole class of compiled-in input — the class
+    /// this check exists to catch — unseen.
+    fn dep_info_files(build: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut records = Vec::new();
+        let mut directories = vec![build.join("deps")];
+        let scripts = build.join("build");
+        if scripts.is_dir() {
+            for entry in std::fs::read_dir(&scripts)
+                .unwrap_or_else(|error| panic!("{} is readable: {error}", scripts.display()))
+            {
+                let path = entry.expect("a build directory entry").path();
+                if path.is_dir() {
+                    directories.push(path);
+                }
+            }
+        }
+        for directory in directories {
+            for entry in std::fs::read_dir(&directory)
+                .unwrap_or_else(|error| panic!("{} is readable: {error}", directory.display()))
+            {
+                let path = entry.expect("a dep-info directory entry").path();
+                if path.extension() == Some("d".as_ref()) {
+                    records.push(path);
+                }
+            }
+        }
+        assert!(
+            !records.is_empty(),
+            "{} holds no dep-info, so nothing could be required of the detector",
+            build.display()
+        );
+        records
+    }
+
+    /// Compiles the test targets of each root and returns, for every source
+    /// cargo built, the workspace crate it belongs to.
+    ///
+    /// Which crate a compilation belongs to comes from cargo, not from the
+    /// artifact's file name: a test target is named after its own source, so a
+    /// name would attribute it to no crate at all.
+    fn compiled_target_owners(
+        crates: &std::collections::BTreeMap<String, WorkspaceCrate>,
+    ) -> std::collections::BTreeMap<String, String> {
+        let root = workspace_root();
+        let mut command = std::process::Command::new(env!("CARGO"));
+        // `--workspace --all-targets`, because `rust-test` runs
+        // `cargo test --workspace --all-features` and its planner-gated step
+        // compiles bench targets. Taking a superset of what any live job builds
+        // is the direction that fails closed.
+        command.args([
+            "check",
+            "--locked",
+            "--workspace",
+            "--all-features",
+            "--all-targets",
+            "--message-format",
+            "json",
+        ]);
+        let output = command
+            .current_dir(&root)
+            .env("CARGO_TARGET_DIR", component_detector_target())
+            // Neither incremental state nor debug information changes what rustc
+            // records that it read, and both are most of what this scratch build
+            // would otherwise leave in the cache CI carries between runs.
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_PROFILE_DEV_DEBUG", "none")
+            .output()
+            .expect("cargo check runs");
+        assert!(
+            output.status.success(),
+            "cargo check --all-targets failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+
+        let owners: std::collections::BTreeMap<&str, &str> = crates
+            .iter()
+            .map(|(name, entry)| (entry.manifest.as_str(), name.as_str()))
+            .collect();
+        let mut compiled_by: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for line in String::from_utf8(output.stdout)
+            .expect("cargo emits UTF-8")
+            .lines()
+        {
+            let message: serde_json::Value =
+                serde_json::from_str(line).expect("cargo emits one JSON object a line");
+            if message["reason"].as_str() != Some("compiler-artifact") {
+                continue;
+            }
+            let manifest = message["manifest_path"]
+                .as_str()
+                .expect("an artifact names the manifest it was built from");
+            let Some(owner) = repository_path(&root, manifest)
+                .and_then(|manifest| owners.get(manifest.as_str()).copied())
+            else {
+                continue;
+            };
+            let source = message["target"]["src_path"]
+                .as_str()
+                .expect("an artifact names the source it was built from");
+            let source = repository_path(&root, source)
+                .unwrap_or_else(|| panic!("{owner} compiles {source}, outside the repository"));
+            compiled_by.insert(source, owner.to_owned());
+        }
+        assert!(
+            !compiled_by.is_empty(),
+            "cargo check reported no workspace artifact, so no input could be attributed"
+        );
+        compiled_by
+    }
+
+    /// Which repository files each workspace crate's compilation actually reads,
+    /// taken from the dep-info rustc writes beside every artifact.
+    ///
+    /// Reading `include_str!` out of the source missed a contract that a line
+    /// break separated from its macro, and would go on missing raw strings,
+    /// `concat!`, `include!`, `#[path]` modules and any name a macro builds.
+    /// rustc records what it opened, whatever the spelling. `cargo check` is
+    /// enough, because dep-info is written after expansion, and `--all-targets`
+    /// is what puts the `cfg(test)` and bench inputs into it.
+    fn compiled_inputs_by_crate(
+        crates: &std::collections::BTreeMap<String, WorkspaceCrate>,
+        tracked: &std::collections::BTreeSet<String>,
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+        let root = workspace_root();
+        let compiled_by = compiled_target_owners(crates);
+        let mut inputs: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        for path in dep_info_files(&component_detector_target().join("debug")) {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{} is readable: {error}", path.display()));
+            // Every input rustc records gets a rule of its own, which is the one
+            // reading that survives a name holding a space. What git does not
+            // track cannot reach a changed-file list, and is not in the checkout
+            // CI builds from either, so it is dropped rather than required.
+            let read: std::collections::BTreeSet<String> = text
+                .lines()
+                .filter_map(|line| line.strip_suffix(':'))
+                .filter_map(|input| repository_path(&root, input))
+                .filter(|input| tracked.contains(input))
+                .collect();
+            let compiled: std::collections::BTreeSet<&str> = read
+                .iter()
+                .filter_map(|input| compiled_by.get(input.as_str()).map(String::as_str))
+                .collect();
+            // A cached target directory keeps the dep-info of targets that have
+            // since been renamed or deleted, and those name no source cargo just
+            // reported. The per-crate assertion below is what stops this from
+            // swallowing a live one.
+            if compiled.is_empty() {
+                continue;
+            }
+            assert_eq!(
+                compiled.len(),
+                1,
+                "{} reads {read:?}, which cargo attributes to {compiled:?} rather than to one \
+                 workspace crate",
+                path.display()
+            );
+            let owner = compiled.into_iter().next().expect("exactly one owner");
+            inputs.entry(owner.to_owned()).or_default().extend(read);
+        }
+
+        for (name, entry) in crates {
+            let prefix = format!("{}/", entry.directory);
+            assert!(
+                inputs.get(name).is_some_and(|files| {
+                    files.iter().any(|file| {
+                        file.starts_with(&prefix)
+                            && std::path::Path::new(file).extension() == Some("rs".as_ref())
+                    })
+                }),
+                "no dep-info records a Rust source under {prefix}, so {name} was never compiled \
+                 and whatever it reads would go unchecked"
+            );
+        }
+        inputs
+    }
+
+    /// The workflow's own detector step, lifted out by identity. Taking it by
+    /// position would let a step prepended to the job answer for the one CI
+    /// runs.
+    fn detector_step_script() -> String {
+        let workflow = parsed_workflow();
+        let steps = workflow["jobs"]["changes"]["steps"]
+            .as_sequence()
+            .expect("the detector job lists its steps");
+        let detector: Vec<&serde_norway::Value> = steps
+            .iter()
+            .filter(|step| step["id"].as_str() == Some("detect"))
+            .collect();
+        assert_eq!(
+            detector.len(),
+            1,
+            "the detector job declares exactly one step identified as detect"
+        );
+        let step = detector[0];
+        assert_eq!(
+            step["shell"].as_str(),
+            Some("bash"),
+            "the detector step names bash, so running it under bash is faithful"
+        );
+        step["run"]
+            .as_str()
+            .expect("the detector step runs a script")
+            .to_owned()
+    }
+
+    /// Refuses to answer for CI unless the `grep` the detector will resolve is
+    /// the one the runner resolves.
+    ///
+    /// Running the step is only faithful because the runner and this check
+    /// execute the same matcher. Extended regular expressions are not one
+    /// language: a drop-in such as ugrep accepts `\p{L}`, which GNU grep does
+    /// not, so a developer machine could quietly approve a trigger the runner
+    /// never matches. Resolved through bash, exactly as the step's own call is.
+    fn assert_grep_is_the_one_ci_runs() {
+        let output = std::process::Command::new("bash")
+            .args(["-c", "grep --version"])
+            .output()
+            .expect("bash resolves grep");
+        assert!(output.status.success(), "grep --version failed");
+        let reported = String::from_utf8_lossy(&output.stdout);
+        let first = reported.lines().next().unwrap_or_default();
+        assert!(
+            first.contains("GNU grep"),
+            "the detector would match with {first}, not the GNU grep the runner has, so this run \
+             does not say what CI would decide"
+        );
+    }
+
+    /// Asks the detector what CI would decide about each candidate path.
+    ///
+    /// Nothing here reproduces the detector. The script is the workflow's own
+    /// `run:`, run by bash, so shell word concatenation cannot append to a
+    /// trigger behind this check's back; the trigger is never read, so no
+    /// second regular-expression engine can disagree with the `grep -E` the
+    /// script calls; and the answer is read from the `GITHUB_OUTPUT` the step
+    /// writes rather than inferred.
+    ///
+    /// The candidate reaches the script down the path a pull request takes: two
+    /// commits are written, and the step's own `git diff --name-only` between
+    /// them reports that one path. The candidate is the file the base commit
+    /// holds and the head commit does not, so it arrives as a deletion —
+    /// `--name-only` prints the same line for a deletion as for an edit, and
+    /// driving the deletion is what proves a removed input is covered too. The
+    /// commits are written to a scratch object directory, so the repository's
+    /// own object store is not touched.
+    fn detect_components(
+        candidates: &std::collections::BTreeSet<String>,
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>> {
+        assert!(
+            !candidates.is_empty(),
+            "no candidate path, so the check would be vacuous"
+        );
+        for candidate in candidates {
+            assert!(
+                candidate
+                    .chars()
+                    .all(|character| character.is_ascii_graphic()),
+                "{candidate} is not printable ASCII, so it does not represent a path CI reports"
+            );
+        }
+        assert_grep_is_the_one_ci_runs();
+        let root = workspace_root();
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let script = scratch.path().join("detect.sh");
+        std::fs::write(&script, detector_step_script()).expect("the detector script is written");
+        let objects = scratch.path().join("objects");
+        std::fs::create_dir(&objects).expect("a scratch object directory");
+        let commits = ScratchCommits {
+            objects,
+            alternates: format!(
+                "{}/objects",
+                git_stdout(&["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim()
+            ),
+            // A committed path needs a blob and the detector only ever reads
+            // names, so every candidate is written as the content of a file
+            // certainly present.
+            filler: git_stdout(&["rev-parse", "HEAD:Cargo.toml"])
+                .trim()
+                .to_owned(),
+            // Git's empty tree is known to every version of it, so the head
+            // commit holding nothing needs nothing written for it.
+            empty_tree: "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_owned(),
+        };
+
+        // A path no trigger mentions. A detector short-circuited to test
+        // everything — which is what a scheduled or dispatched run does — would
+        // answer true for it, and would then answer true for every requirement
+        // below without matching a thing.
+        let control = "component-detector-negative-control";
+        for (output, fired) in run_detector(&root, &script, &commits, control) {
+            assert!(
+                !fired || output == "website_exists",
+                "the detector reports {output} for {control}, which no trigger mentions, so this \
+                 run cannot tell a covered path from an uncovered one"
+            );
+        }
+
+        let ordered: Vec<&String> = candidates.iter().collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let detected = std::sync::Mutex::new(std::collections::BTreeMap::new());
+        let workers = std::thread::available_parallelism()
+            .map_or(4, std::num::NonZeroUsize::get)
+            .min(ordered.len());
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(candidate) = ordered.get(index) else {
+                            return;
+                        };
+                        let outputs = run_detector(&root, &script, &commits, candidate);
+                        detected
+                            .lock()
+                            .expect("the detector results survive every candidate")
+                            .insert((*candidate).clone(), outputs);
+                    }
+                });
+            }
+        });
+        let detected = detected
+            .into_inner()
+            .expect("the detector results survive every candidate");
+        assert_eq!(
+            detected.len(),
+            candidates.len(),
+            "every candidate was put to the detector exactly once"
+        );
+        detected
+    }
+
+    /// Where the two commits a detector run diffs are written, and what they are
+    /// written from.
+    struct ScratchCommits {
+        objects: std::path::PathBuf,
+        alternates: String,
+        filler: String,
+        empty_tree: String,
+    }
+
+    impl ScratchCommits {
+        fn git(&self, root: &std::path::Path, arguments: &[&str]) -> std::process::Command {
+            let mut command = std::process::Command::new("git");
+            command
+                .args(arguments)
+                .current_dir(root)
+                .env("GIT_OBJECT_DIRECTORY", &self.objects)
+                .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", &self.alternates);
+            // A commit needs an identity and a runner checkout has none: the
+            // workflows that commit configure one first, which they would not
+            // need to if git could find it. Supplying it here rather than
+            // reading `user.name` keeps this working on a bare checkout, which
+            // is exactly what the job running these tests has.
+            for (name, value) in [
+                ("GIT_AUTHOR_NAME", "pgshard component detector"),
+                ("GIT_AUTHOR_EMAIL", "component-detector@invalid"),
+                ("GIT_COMMITTER_NAME", "pgshard component detector"),
+                ("GIT_COMMITTER_EMAIL", "component-detector@invalid"),
+            ] {
+                command.env(name, value);
+            }
+            command
+        }
+
+        fn run(&self, root: &std::path::Path, arguments: &[&str], described: &str) -> String {
+            let output = self
+                .git(root, arguments)
+                .output()
+                .unwrap_or_else(|error| panic!("git {arguments:?} runs: {error}"));
+            assert!(
+                output.status.success(),
+                "{described} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            String::from_utf8(output.stdout)
+                .expect("git reports object ids as UTF-8")
+                .trim()
+                .to_owned()
+        }
+
+        /// A commit whose tree holds `candidate` and nothing else.
+        fn holding(
+            &self,
+            root: &std::path::Path,
+            candidate: &str,
+            index: &std::path::Path,
+        ) -> String {
+            let mut stage = self
+                .git(root, &["update-index", "--index-info"])
+                .env("GIT_INDEX_FILE", index)
+                .stdin(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("git update-index runs");
+            {
+                use std::io::Write as _;
+                let mut input = stage.stdin.take().expect("git update-index reads an index");
+                writeln!(input, "100644 {} 0\t{candidate}", self.filler)
+                    .expect("the candidate is staged");
+            }
+            let staged = stage.wait_with_output().expect("git update-index finishes");
+            assert!(
+                staged.status.success(),
+                "staging {candidate} failed: {}",
+                String::from_utf8_lossy(&staged.stderr).trim()
+            );
+            let tree = self
+                .git(root, &["write-tree"])
+                .env("GIT_INDEX_FILE", index)
+                .output()
+                .expect("git write-tree runs");
+            assert!(
+                tree.status.success(),
+                "writing a tree holding {candidate} failed: {}",
+                String::from_utf8_lossy(&tree.stderr).trim()
+            );
+            let tree = String::from_utf8(tree.stdout)
+                .expect("git reports object ids as UTF-8")
+                .trim()
+                .to_owned();
+            self.run(
+                root,
+                &["commit-tree", &tree, "-m", "component detector base"],
+                "committing the base tree",
+            )
+        }
+    }
+
+    fn run_detector(
+        root: &std::path::Path,
+        script: &std::path::Path,
+        commits: &ScratchCommits,
+        candidate: &str,
+    ) -> std::collections::BTreeMap<String, bool> {
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let index = scratch.path().join("index");
+        let runner_temp = scratch.path().join("runner-temp");
+        std::fs::create_dir(&runner_temp).expect("a runner temporary directory");
+        let published = scratch.path().join("github-output");
+        std::fs::write(&published, "").expect("an empty step output file");
+
+        let base = commits.holding(root, candidate, &index);
+        let head = commits.run(
+            root,
+            &[
+                "commit-tree",
+                &commits.empty_tree,
+                "-p",
+                &base,
+                "-m",
+                "component detector head",
+            ],
+            "committing the head tree",
+        );
+
+        let run = std::process::Command::new("bash")
+            .arg(script)
+            .current_dir(root)
+            .env("GIT_OBJECT_DIRECTORY", &commits.objects)
+            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", &commits.alternates)
+            .env("EVENT_NAME", "pull_request")
+            .env("PR_BASE_SHA", &base)
+            .env("PUSH_BEFORE_SHA", "")
+            .env("GH_TOKEN", "")
+            .env("GITHUB_SHA", &head)
+            .env("GITHUB_OUTPUT", &published)
+            .env("RUNNER_TEMP", &runner_temp)
+            .output()
+            .expect("the detector step runs");
+        assert!(
+            run.status.success(),
+            "the detector failed on {candidate}: {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        );
+
+        let mut outputs = std::collections::BTreeMap::new();
+        let emitted = std::fs::read_to_string(&published).expect("the detector output is UTF-8");
+        for line in emitted.lines() {
+            let (output, value) = line
+                .split_once('=')
+                .unwrap_or_else(|| panic!("the detector published {line}, which names no output"));
+            let value = match value {
+                "true" => true,
+                "false" => false,
+                other => panic!("the detector published {output}={other}, which is not a boolean"),
+            };
+            let previous = outputs.insert(output.to_owned(), value);
+            assert!(previous.is_none(), "the detector published {output} twice");
+        }
+        assert!(
+            !outputs.is_empty(),
+            "the detector published nothing for {candidate}"
+        );
+        outputs
+    }
+
+    /// The components whose job is built out of one workspace crate, and the
+    /// crate it is built out of.
+    ///
+    /// Stated here rather than derived from the workflow. Deriving it let the
+    /// file under test authorize itself: quoting a manifest path in an
+    /// `exists_at_head_or_base` line is a semantic no-op that silently dropped a
+    /// component while every count still agreed. What stops an entry being
+    /// dropped instead is `every_gated_component_is_classified`.
+    fn component_root_crates() -> std::collections::BTreeMap<&'static str, &'static str> {
+        [
+            ("postgres_agent", "pgshard-agent"),
+            ("catalog", "pgshard-catalog"),
+            ("orch_catalog", "pgshard-orch"),
+            ("pgwire", "pgshard-pgwire"),
+            ("pooler_postgres", "pgshard-pooler"),
+            ("planner", "pgshard-planner"),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    /// The components whose job is not built out of one workspace crate, and
+    /// what each is built out of instead.
+    const UNROOTED_COMPONENTS: [(&str, &str); 10] = [
+        ("rust", "compiles and tests the whole workspace at once"),
+        ("proto", "builds protobuf definitions, not a Rust crate"),
+        ("go", "builds and tests the Go operator"),
+        ("website", "builds the documentation site"),
+        ("website_exists", "reports availability rather than change"),
+        ("ui", "builds the admin interface"),
+        ("integration", "runs suites drawn from the whole workspace"),
+        (
+            "images",
+            "builds container images out of the whole repository",
+        ),
+        ("kind", "runs a Kubernetes cluster against the built images"),
+        (
+            "performance",
+            "runs benchmarks that have no crate in the workspace",
+        ),
+    ];
+
+    /// The components a skipped job costs the most: each one gates work that no
+    /// other job repeats.
+    const LIVE_COMPONENTS: &[&str] = &[
+        "postgres_agent",
+        "catalog",
+        "orch_catalog",
+        "pgwire",
+        "pooler_postgres",
+        "planner",
+        "rust",
+        "images",
+    ];
+
+    /// The components the workflow gates a job on, read off the conditions
+    /// `every_aggregated_job_expects_its_own_condition` pins to the workflow.
+    fn gated_components() -> std::collections::BTreeSet<&'static str> {
+        let mut gated: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for (_, condition) in GATED_ON {
+            for term in condition.split("needs.changes.outputs.").skip(1) {
+                let name = term
+                    .split_once(' ')
+                    .unwrap_or_else(|| panic!("{condition} names a component it does not compare"))
+                    .0;
+                gated.insert(name);
+            }
+        }
+        assert!(
+            !gated.is_empty(),
+            "no job is gated on a component, so this check would be vacuous"
+        );
+        gated
+    }
+
+    /// The components no change can make the detector report, and the manifest
+    /// whose absence is why.
+    ///
+    /// `website_exists` is not a trigger at all — it reports availability. The
+    /// other two are declared against a manifest the repository does not have,
+    /// so their outputs are permanently false and requiring them would prove
+    /// nothing. That also makes their share of a widened trigger a dead path:
+    /// reverting `^\.github/scripts/` for either is invisible, and stays so
+    /// until the manifest exists. The manifests are asserted absent, so adding
+    /// one puts the component back into the requirement rather than leaving it
+    /// excused.
+    const UNDETECTABLE_COMPONENTS: [(&str, Option<&str>); 3] = [
+        ("website_exists", None),
+        ("ui", Some("ui/package.json")),
+        ("performance", Some("benchmarks/Cargo.toml")),
+    ];
+
+    /// Every component the workflow gates a job on is either built out of a
+    /// workspace crate or explicitly is not.
+    ///
+    /// Without this, dropping a component from `component_root_crates` retires
+    /// its coverage in silence, and a component added to the workflow never
+    /// enters the coverage requirement at all. `GATED_ON` is what the workflow's
+    /// own conditions are pinned to, so every list here is answerable to it.
+    #[test]
+    fn every_gated_component_is_classified() {
+        let gated = gated_components();
+        let rooted: std::collections::BTreeSet<&str> =
+            component_root_crates().keys().copied().collect();
+        let unrooted: std::collections::BTreeSet<&str> =
+            UNROOTED_COMPONENTS.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            unrooted.len(),
+            UNROOTED_COMPONENTS.len(),
+            "a component is declared unrooted twice"
+        );
+        assert!(
+            rooted.is_disjoint(&unrooted),
+            "a component is declared both built out of a crate and not"
+        );
+        let classified: std::collections::BTreeSet<&str> =
+            rooted.union(&unrooted).copied().collect();
+        assert_eq!(
+            gated, classified,
+            "every component the workflow gates a job on has to be classified here, or its \
+             coverage is never required of anything"
+        );
+        let live: std::collections::BTreeSet<&str> = LIVE_COMPONENTS.iter().copied().collect();
+        assert_eq!(
+            live.len(),
+            LIVE_COMPONENTS.len(),
+            "a component is declared live twice"
+        );
+        assert!(
+            live.is_subset(&gated),
+            "a component declared live gates no job, so requiring the detector to report it \
+             proves nothing"
+        );
+        assert!(
+            rooted.is_subset(&live),
+            "a component whose job is built out of a crate of its own is live by construction, \
+             and dropping it here drops what the loose build inputs are required against"
+        );
+
+        // Derived rather than restated: a hand-kept second copy of the
+        // workflow's component set loses a name without anything objecting, and
+        // the directory it is required for is the only probe covering that tree.
+        let tracked = tracked_files();
+        let mut detectable = gated.clone();
+        for (component, manifest) in UNDETECTABLE_COMPONENTS {
+            assert!(
+                detectable.remove(component),
+                "{component} gates no job, so excusing it from detection proves nothing"
+            );
+            if let Some(manifest) = manifest {
+                assert!(
+                    !tracked.contains(manifest),
+                    "{manifest} is present, so {component} can be detected and has to be required \
+                     rather than excused"
+                );
+            }
+        }
+        let available: std::collections::BTreeSet<&str> =
+            EVERY_AVAILABLE_COMPONENT.iter().copied().collect();
+        assert_eq!(
+            available.len(),
+            EVERY_AVAILABLE_COMPONENT.len(),
+            "a component is declared available twice"
+        );
+        assert_eq!(
+            available, detectable,
+            "the components a change can be detected against are the gated ones the repository \
+             can report, and this list has to be exactly those"
+        );
+    }
+
+    /// A live `PostgreSQL` job skipped because something it compiles changed is
+    /// a silently unverified merge: the aggregate counts a skipped job as a
+    /// pass. So every file that reaches a component's binary has to make the
+    /// detector fire, and every part of that is taken from the world rather than
+    /// described — git says which files exist, cargo says which crates a
+    /// component is built from, rustc says which files it read, and the
+    /// workflow's own step says what CI would do about each of them.
+    ///
+    /// Whole-directory triggering is deliberate: a `README` change runs a job
+    /// that did not need to run, which costs time, while a missed source change
+    /// merges something no job verified.
+    #[test]
+    fn every_component_detects_every_file_its_job_compiles() {
+        let expected = component_root_crates();
+        let crates = workspace_crates();
+        let script = detector_step_script();
+        for (component, root) in &expected {
+            let entry = crates
+                .get(*root)
+                .unwrap_or_else(|| panic!("the workspace no longer contains {root}"));
+            let declaration = format!(
+                "exists_at_head_or_base {} && {component}_exists=true",
+                entry.manifest
+            );
+            assert!(
+                script.contains(&declaration),
+                "the detector no longer declares {component} against {root}"
+            );
+        }
+
+        let tracked = tracked_files();
+        let compiled = compiled_inputs_by_crate(&crates, &tracked);
+
+        // `rust-test` runs `cargo test --workspace`, so its component is built
+        // out of every crate there is. Stating that as a closure rather than
+        // leaving it out is what makes a contract compiled into any crate the
+        // detector's problem, not only one a live job happens to name.
+        let mut behind: std::collections::BTreeMap<
+            &'static str,
+            std::collections::BTreeSet<String>,
+        > = std::collections::BTreeMap::new();
+        for (component, root) in &expected {
+            let mut closure = transitive_closure(root, &crates);
+            closure.insert((*root).to_owned());
+            behind.insert(component, closure);
+        }
+        behind.insert("rust", crates.keys().cloned().collect());
+
+        let mut required: std::collections::BTreeMap<&str, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        for (component, closure) in behind {
+            let mut paths = std::collections::BTreeSet::new();
+            for name in &closure {
+                let entry = crates
+                    .get(name)
+                    .unwrap_or_else(|| panic!("{name} is not a workspace crate"));
+                let prefix = format!("{}/", entry.directory);
+                let owned: Vec<&String> = tracked
+                    .iter()
+                    .filter(|path| path.starts_with(&prefix))
+                    .collect();
+                assert!(
+                    !owned.is_empty(),
+                    "git tracks no file under {prefix}, so requiring it would be vacuous"
+                );
+                paths.extend(owned.into_iter().cloned());
+                paths.extend(compiled.get(name).into_iter().flatten().cloned());
+            }
+            required.insert(component, paths);
+        }
+
+        let candidates: std::collections::BTreeSet<String> =
+            required.values().flatten().cloned().collect();
+        let detected = detect_components(&candidates);
+        for (component, paths) in &required {
+            for path in paths {
+                let outputs = detected
+                    .get(path)
+                    .unwrap_or_else(|| panic!("{path} was not put to the detector"));
+                let fired = outputs
+                    .get(*component)
+                    .unwrap_or_else(|| panic!("the detector publishes no {component} output"));
+                assert!(
+                    *fired,
+                    "{component} is built from {path}, but the detector leaves {component} false, \
+                     so that change would merge with its job skipped"
+                );
+            }
+        }
+    }
+
+    /// A build input no compilation records, named either exactly or as the
+    /// directory it is one of.
+    enum Probe {
+        File(&'static str),
+        Directory(&'static str),
+    }
+
+    impl Probe {
+        /// The names a probe uses that are deliberately absent from the tree.
+        ///
+        /// A direct child is what separates a trigger that watches the directory
+        /// from one narrowed to the files in it today. The nested name is there
+        /// because a trigger narrowed by one level — `^contracts/[^/]+$` —
+        /// matches every current file and the direct child alike while it
+        /// silently stops covering `contracts/v2/anything`.
+        ///
+        /// Two blind spots, both inherent to probing with a finite set of names
+        /// rather than an oversight, and both in the shape "a trigger nobody
+        /// anticipated".
+        ///
+        /// DEPTH. These names refute a narrowing shallower than the deepest one
+        /// probed and nothing beyond it. `^contracts/([^/]+/)?[^/]+$` passes
+        /// both of these, and an `^operator/([^/]+/){0,4}[^/]+$` passes anything
+        /// short of five levels. Only a trigger that is a plain prefix is
+        /// actually safe, and reading one to find out is what this whole file
+        /// refuses to do. Add depth here if a narrowing of that shape ever
+        /// looks reachable.
+        ///
+        /// SIBLINGS. Broadening escapes them from the other side:
+        /// `^extensions/pgshard_fence/` widened to `^extensions/pgshard_` picks
+        /// up a second extension while matching neither name generated here.
+        /// That direction is the one this file's policy calls the safe one — it
+        /// runs a job that did not need to run — and the dangerous direction,
+        /// narrowing, is what the fire assertions catch. Left alone
+        /// deliberately.
+        fn absent_names(&self) -> Vec<String> {
+            match self {
+                Self::File(_) => Vec::new(),
+                Self::Directory(directory) => vec![
+                    format!("{directory}/added-after-this-test"),
+                    format!("{directory}/added-after-this-test/nested-added-after-this-test"),
+                ],
+            }
+        }
+
+        /// The paths a probe puts to the detector: the absent names, and every
+        /// file that is there.
+        fn candidates(&self, tracked: &std::collections::BTreeSet<String>) -> Vec<String> {
+            match self {
+                Self::File(path) => vec![(*path).to_owned()],
+                Self::Directory(directory) => {
+                    let prefix = format!("{directory}/");
+                    let mut paths = self.absent_names();
+                    paths.extend(
+                        tracked
+                            .iter()
+                            .filter(|path| path.starts_with(&prefix))
+                            .cloned(),
+                    );
+                    paths
+                }
+            }
+        }
+
+        fn named(&self) -> &'static str {
+            match self {
+                Self::File(path) | Self::Directory(path) => path,
+            }
+        }
+
+        /// The tracked files a probe accounts for.
+        fn accounts_for<'a>(
+            &self,
+            tracked: &'a std::collections::BTreeSet<String>,
+        ) -> Vec<&'a String> {
+            match self {
+                Self::File(path) => tracked.get(*path).into_iter().collect(),
+                Self::Directory(directory) => {
+                    let prefix = format!("{directory}/");
+                    tracked
+                        .iter()
+                        .filter(|path| path.starts_with(&prefix))
+                        .collect()
+                }
+            }
+        }
+    }
+
+    /// Build inputs a live job reads from inside a crate directory, which the
+    /// crate's own compilation does not record.
+    ///
+    /// The agent compiles whole catalog directories in without depending on the
+    /// catalog crate, so nothing in the Cargo graph puts them behind its
+    /// component.
+    const PROBED_INPUTS: [(&str, &[Probe]); 2] = [
+        ("rust", &[Probe::Directory(".cargo")]),
+        (
+            "postgres_agent",
+            &[
+                Probe::Directory("crates/pgshard-catalog/migrations"),
+                Probe::Directory("crates/pgshard-catalog/inventory"),
+                Probe::Directory("crates/pgshard-catalog/testdata"),
+            ],
+        ),
+    ];
+
+    /// Every component `.github/scripts` decides for. The helper there computes
+    /// the diff base every one of them is detected against, so a second script
+    /// beside it is theirs too. `ui` and `performance` are absent because
+    /// neither exists to be detected.
+    const EVERY_AVAILABLE_COMPONENT: &[&str] = &[
+        "postgres_agent",
+        "catalog",
+        "orch_catalog",
+        "pgwire",
+        "pooler_postgres",
+        "planner",
+        "rust",
+        "images",
+        "proto",
+        "go",
+        "website",
+        "integration",
+        "kind",
+    ];
+
+    /// Every tracked path outside the workspace crates: the components the
+    /// detector has to report for it, and the components it has to leave alone.
+    ///
+    /// What a job reads that no compilation records — the bake file, the ignore
+    /// file that defines its context, the format policy the image copies in, the
+    /// shell helpers the steps invoke, the contracts the operator reads at run
+    /// time — cannot be derived. Deriving it would mean running docker buildx
+    /// and make, which is what the jobs themselves are for. So it is stated, and
+    /// stated exhaustively: this has to account for the whole repository outside
+    /// the crates, which is the only way a tree that no probe reaches becomes
+    /// impossible rather than merely unlucky. Three inputs of the agent job were
+    /// missing while the list was a list of files someone thought of.
+    ///
+    /// The refusals are what pin a distinction rather than describe it. Over
+    /// triggering is deliberate almost everywhere — a `README` change running a
+    /// job that did not need to run costs time, and a missed source change
+    /// merges something no job verified — so a refusal is stated only where the
+    /// boundary is the point: the agent bakes `deploy/images`, not all of
+    /// `deploy`, and runs the fence out of `extensions/pgshard_fence`, not all
+    /// of `extensions`. A refusal is checked against the absent names only.
+    /// Applied to the files that are there it would contradict the narrower
+    /// entry that follows it.
+    ///
+    /// LIMIT, and it is the important one: a `Directory` entry accounts for
+    /// every future file beneath it, so this suite proves each path is CLAIMED,
+    /// never that the claim is CORRECT. `extensions` is claimed for `images`
+    /// alone, so a second extension — `extensions/pgshard_other/foo.c` —
+    /// arrives already classified while `postgres_agent` skips it, and nothing
+    /// here will say so. Split the entry when that happens.
+    ///
+    /// A refusal does not stand in the way of fixing that. It forbids the
+    /// blanket form only — widening the agent to `^extensions/` or `^deploy/`,
+    /// which erases the distinction the narrower entry beside it exists to
+    /// record. Covering the new tree specifically is what a refusal leaves
+    /// alone: adding `^extensions/pgshard_other/`, or a
+    /// `^deploy/agent-entrypoint\.sh$`, passes with nothing here touched. Only
+    /// the agent genuinely consuming all of `extensions` forces an edit, and it
+    /// is the one-line removal of `postgres_agent` from the refusal, with the
+    /// reasoning to weigh three lines above it.
+    ///
+    /// The crates themselves are not here: `every_component_detects_every_file_its_job_compiles`
+    /// requires every one of their files against the components built from them.
+    const OUTSIDE_THE_CRATES: [(Probe, &[&str], &[&str]); 31] = [
+        (
+            Probe::File(".dockerignore"),
+            &["images", "postgres_agent"],
+            &[],
+        ),
+        (Probe::File(".editorconfig"), &[], &[]),
+        (Probe::File(".gitignore"), &[], &[]),
+        (Probe::File("CODE_OF_CONDUCT.md"), &[], &[]),
+        (Probe::File("CONTRIBUTING.md"), &[], &[]),
+        (Probe::File("Cargo.lock"), LIVE_COMPONENTS, &[]),
+        (Probe::File("Cargo.toml"), LIVE_COMPONENTS, &[]),
+        (Probe::File("LICENSE"), &[], &[]),
+        (Probe::File("Makefile"), LIVE_COMPONENTS, &[]),
+        (Probe::File("README.md"), &[], &[]),
+        (Probe::File("SECURITY.md"), &[], &[]),
+        (Probe::File("buf.yaml"), &["proto"], &[]),
+        (Probe::File("deny.toml"), &["rust"], &[]),
+        (Probe::File("rust-toolchain.toml"), LIVE_COMPONENTS, &[]),
+        (
+            Probe::File("rustfmt.toml"),
+            &["rust", "images", "postgres_agent"],
+            &[],
+        ),
+        (
+            Probe::Directory(".github/scripts"),
+            EVERY_AVAILABLE_COMPONENT,
+            &[],
+        ),
+        (
+            Probe::File(".github/workflows/ci.yml"),
+            LIVE_COMPONENTS,
+            &[],
+        ),
+        (Probe::File(".github/dependabot.yml"), &["rust"], &[]),
+        (Probe::File(".github/pull_request_template.md"), &[], &[]),
+        (
+            Probe::File(".github/workflows/dependabot-automerge.yml"),
+            &["rust"],
+            &[],
+        ),
+        (Probe::File(".github/workflows/release.yml"), &["rust"], &[]),
+        // The Go operator reads the shared contracts at run time, so no
+        // compilation records them for it. Its own tests are what fail when a
+        // contract and the operator disagree.
+        (
+            Probe::Directory("contracts"),
+            &["rust", "go", "orch_catalog"],
+            &[],
+        ),
+        (
+            Probe::Directory("deploy"),
+            &["images", "kind"],
+            &["postgres_agent"],
+        ),
+        // Only this subtree reaches the agent image: its bake target builds
+        // rust.Dockerfile, which copies out of here.
+        (
+            Probe::Directory("deploy/images"),
+            &["images", "kind", "postgres_agent"],
+            &[],
+        ),
+        (
+            Probe::File("deploy/docker-bake.hcl"),
+            &["images", "kind", "postgres_agent"],
+            &[],
+        ),
+        (
+            Probe::Directory("extensions"),
+            &["images"],
+            &["postgres_agent"],
+        ),
+        (
+            Probe::Directory("extensions/pgshard_fence"),
+            &["images", "postgres_agent"],
+            &[],
+        ),
+        (
+            Probe::Directory("operator"),
+            &["go"],
+            // The orchestrator watches one subtree of the operator, below, and
+            // this is what keeps that from quietly becoming all of it.
+            &[
+                "postgres_agent",
+                "catalog",
+                "orch_catalog",
+                "pgwire",
+                "pooler_postgres",
+                "planner",
+                "rust",
+            ],
+        ),
+        // Nothing in the orchestrator crate reads this package, so it is an
+        // over-trigger rather than a compiled input — kept because narrowing a
+        // trigger on a reading of intent is the direction that merges unverified
+        // changes, and pinned here so it cannot be dropped by accident.
+        (
+            Probe::Directory("operator/internal/tuning"),
+            &["go", "orch_catalog"],
+            &[],
+        ),
+        (
+            Probe::Directory("proto"),
+            &["rust", "go", "proto"],
+            &["postgres_agent", "catalog", "pooler_postgres"],
+        ),
+        (Probe::Directory("website"), &["website"], LIVE_COMPONENTS),
+    ];
+
+    fn assert_detector_fires(
+        detected: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+        component: &str,
+        path: &str,
+    ) {
+        let outputs = detected
+            .get(path)
+            .unwrap_or_else(|| panic!("{path} was not put to the detector"));
+        let fired = outputs
+            .get(component)
+            .unwrap_or_else(|| panic!("the detector publishes no {component} output"));
+        assert!(
+            *fired,
+            "{path} is a build input of {component}, but the detector leaves {component} false, \
+             so that change would merge with its job skipped"
+        );
+    }
+
+    /// The other direction: a component the path is deliberately not an input of
+    /// must be left alone, or the boundary it was drawn at has moved.
+    fn assert_detector_refuses(
+        detected: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+        component: &str,
+        path: &str,
+    ) {
+        let outputs = detected
+            .get(path)
+            .unwrap_or_else(|| panic!("{path} was not put to the detector"));
+        let fired = outputs
+            .get(component)
+            .unwrap_or_else(|| panic!("the detector publishes no {component} output"));
+        assert!(
+            !*fired,
+            "{path} is not a build input of {component}, but the detector reports it, so the \
+             boundary a narrower entry draws no longer holds"
+        );
+    }
+
+    fn assert_every_probe_fires(required: &[(&str, String)]) {
+        assert!(
+            !required.is_empty(),
+            "no probe, so the check would be vacuous"
+        );
+        let candidates: std::collections::BTreeSet<String> =
+            required.iter().map(|(_, path)| path.clone()).collect();
+        let detected = detect_components(&candidates);
+        for (component, path) in required {
+            assert_detector_fires(&detected, component, path);
+        }
+    }
+
+    /// Everything outside the workspace crates is accounted for, and everything
+    /// claimed to be a build input fires the job that consumes it.
+    ///
+    /// The classification has to name the same paths the repository does, in
+    /// both directions. A tree nobody classified — a `charts/`, a second script
+    /// beside the one the detector special-cases by name — is then a failure
+    /// rather than a silence.
+    #[test]
+    fn every_path_outside_the_crates_is_classified() {
+        let crates = workspace_crates();
+        let tracked = tracked_files();
+        let inside: Vec<String> = crates
+            .values()
+            .map(|entry| format!("{}/", entry.directory))
+            .collect();
+        let outside: std::collections::BTreeSet<&String> = tracked
+            .iter()
+            .filter(|path| !inside.iter().any(|prefix| path.starts_with(prefix)))
+            .collect();
+        assert!(
+            !outside.is_empty(),
+            "every tracked path is inside a crate, so this check would be vacuous"
+        );
+
+        let named: std::collections::BTreeSet<&str> = OUTSIDE_THE_CRATES
+            .iter()
+            .map(|(probe, _, _)| probe.named())
+            .collect();
+        assert_eq!(
+            named.len(),
+            OUTSIDE_THE_CRATES.len(),
+            "a path outside the crates is classified twice"
+        );
+
+        let mut accounted: std::collections::BTreeSet<&String> = std::collections::BTreeSet::new();
+        let mut required: Vec<(&str, String)> = Vec::new();
+        let mut refused: Vec<(&str, String)> = Vec::new();
+        for (probe, fires, refuses) in &OUTSIDE_THE_CRATES {
+            let covered = probe.accounts_for(&tracked);
+            assert!(
+                !covered.is_empty(),
+                "{} is classified but names no tracked path",
+                probe.named()
+            );
+            // A refusal on its own is a claim that a path is nobody's input,
+            // which is how a tree ends up classified and built by no job at all.
+            assert!(
+                refuses.is_empty() || !fires.is_empty(),
+                "{} refuses a component while requiring none, so nothing would notice it \
+                 becoming an input of no job whatsoever",
+                probe.named()
+            );
+            accounted.extend(covered);
+            for path in probe.candidates(&tracked) {
+                for component in *fires {
+                    required.push((component, path.clone()));
+                }
+            }
+            for path in probe.absent_names() {
+                for component in *refuses {
+                    refused.push((component, path.clone()));
+                }
+            }
+        }
+        assert_eq!(
+            accounted, outside,
+            "this classification and the repository outside the crates have to name the same paths"
+        );
+        assert!(
+            !refused.is_empty(),
+            "no boundary is pinned, so over-triggering would be invisible"
+        );
+
+        let candidates: std::collections::BTreeSet<String> = required
+            .iter()
+            .chain(refused.iter())
+            .map(|(_, path)| path.clone())
+            .collect();
+        let detected = detect_components(&candidates);
+        for (component, path) in &required {
+            assert_detector_fires(&detected, component, path);
+        }
+        for (component, path) in &refused {
+            assert_detector_refuses(&detected, component, path);
+        }
+    }
+
+    /// The build inputs a crate directory holds but its own compilation does not
+    /// record.
+    ///
+    /// A trigger that mentions one of these still skips it when the mention sits
+    /// inside a narrower alternative, and shell word concatenation can append to
+    /// a quoted trigger without the quoted part changing, so each is put to the
+    /// detector rather than looked for in the trigger's text.
+    #[test]
+    fn the_detector_fires_for_build_inputs_no_compilation_records() {
+        let tracked = tracked_files();
+        let mut required: Vec<(&str, String)> = Vec::new();
+        for (component, probes) in PROBED_INPUTS {
+            for probe in probes {
+                for path in probe.candidates(&tracked) {
+                    required.push((component, path));
+                }
+            }
+        }
+        assert_every_probe_fires(&required);
     }
 }
