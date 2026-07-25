@@ -1947,7 +1947,7 @@ mod tests {
     }
 
     fn run_aggregate_gate(expectations: &str) -> (bool, String) {
-        run_aggregate_gate_with("rust=true", expectations)
+        run_aggregate_gate_with("rust=true\n", expectations)
     }
 
     fn run_aggregate_gate_with(components: &str, expectations: &str) -> (bool, String) {
@@ -1997,15 +1997,25 @@ mod tests {
     #[test]
     fn a_detector_that_does_not_report_a_component_fails_closed() {
         let (passed, stderr) =
-            run_aggregate_gate_with("rust=true go=false", "rust-static=success=true");
+            run_aggregate_gate_with("rust=true\ngo=false\n", "rust-static=success=true");
         assert!(passed, "a fully reported detector was rejected: {stderr}");
 
-        for missing in ["go=", "go=maybe", "go=TRUE"] {
+        // `go=true ` is not `'true'` to the condition that gates the job, so
+        // the job is skipped -- and a check that let the value be trimmed
+        // before comparing would see a clean `true` and excuse that skip.
+        for unreported in [
+            "go=",
+            "go=maybe",
+            "go=TRUE",
+            "go=true ",
+            "go=true\t",
+            "go= true",
+        ] {
             let (passed, stderr) = run_aggregate_gate_with(
-                &format!("rust=true {missing}"),
+                &format!("rust=true\n{unreported}\n"),
                 "go-operator=skipped=false",
             );
-            assert!(!passed, "a skip authorized by '{missing}' was accepted");
+            assert!(!passed, "a skip authorized by '{unreported}' was accepted");
             assert!(stderr.contains("Detector did not report go"), "{stderr}");
         }
     }
@@ -2020,22 +2030,44 @@ mod tests {
             .expect("the aggregate job exists")
             .1;
         let components = aggregate
-            .split_once("COMPONENT_OUTPUTS: >-")
+            .split_once("COMPONENT_OUTPUTS: |")
             .expect("the aggregate declares the outputs it validates")
             .1;
+        // Each entry must be exactly `name=${{ needs.changes.outputs.name }}`.
+        // Collecting only the left-hand name would accept an entry that
+        // validates one output under another's name.
         let validated: std::collections::BTreeSet<&str> = components
             .lines()
-            .take_while(|line| !line.trim_start().starts_with("JOB_EXPECTATIONS:"))
-            .filter_map(|line| line.trim().split_once('='))
-            .map(|(name, _)| name)
+            .skip(1)
+            .take_while(|line| entry(line).is_some())
+            .map(|line| {
+                let (name, reference) = entry(line).expect("bounded by the take_while above");
+                assert_eq!(
+                    reference,
+                    format!("${{{{ needs.changes.outputs.{name} }}}}"),
+                    "the {name} entry does not validate the {name} output"
+                );
+                name
+            })
             .collect();
+        assert!(!validated.is_empty(), "no detector outputs are validated");
+
         let expectations = aggregate
             .split_once("JOB_EXPECTATIONS: >-")
             .expect("the aggregate declares its expectations")
             .1;
-        let expectations = expectations
-            .split_once("shell:")
-            .map_or(expectations, |(declared, _)| declared);
+        // Bounded by the shape of an entry rather than by the next key, so a
+        // `shell:` appearing anywhere cannot truncate or extend the block.
+        let expectations: String = expectations
+            .lines()
+            .skip(1)
+            .take_while(|line| entry(line).is_some())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            expectations.contains("needs.changes.outputs."),
+            "no expectations were extracted"
+        );
         for consumed in expectations.split("needs.changes.outputs.").skip(1) {
             let name: &str = consumed
                 .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
@@ -2048,20 +2080,24 @@ mod tests {
         }
 
         // Catch a removed or misspelled declaration here rather than leaving it
-        // to fail the release run that first depends on it.
-        let declared = ci
-            .split_once("\n  changes:")
+        // to fail the release run that first depends on it. Bounded to the
+        // detector's own body, or a later job's `outputs:` would answer for it.
+        let indent = |line: &str| line.len() - line.trim_start().len();
+        let detector: Vec<&str> = ci
+            .split_once("\n  changes:\n")
             .expect("the detector job exists")
             .1
-            .split_once("    outputs:\n")
-            .expect("the detector declares its outputs")
-            .1;
-        let declared: std::collections::BTreeSet<&str> = declared
             .lines()
-            .take_while(|line| {
-                line.trim_start()
-                    .starts_with(|c: char| c.is_ascii_alphanumeric())
-            })
+            .take_while(|line| line.trim().is_empty() || indent(line) > 2)
+            .collect();
+        let outputs = detector
+            .iter()
+            .position(|line| indent(line) == 4 && line.trim_start() == "outputs:")
+            .expect("the detector declares its outputs");
+        let declared: std::collections::BTreeSet<&str> = detector[outputs + 1..]
+            .iter()
+            // `${{` is what makes it an output rather than the sibling `steps:`.
+            .take_while(|line| indent(line) > 4 && line.contains("${{"))
             .filter_map(|line| line.trim().split_once(':'))
             .map(|(name, _)| name)
             .collect();
@@ -2071,6 +2107,17 @@ mod tests {
                 "the gate validates {name}, which the detector does not declare as an output"
             );
         }
+    }
+
+    /// One `name=${{ ... }}` entry of a gate's environment block.
+    fn entry(line: &str) -> Option<(&str, &str)> {
+        let (name, reference) = line.trim().split_once('=')?;
+        (!name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            && reference.starts_with("${{"))
+        .then_some((name, reference))
     }
 
     /// Every job the aggregate waits on has to carry an expectation, that

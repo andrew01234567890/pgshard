@@ -1592,7 +1592,11 @@ jobs:
           # and reads exactly like a legitimate `false` -- a removed or
           # misspelled output declaration would silently authorize a skip.
           # These are checked as literals so non-reporting fails closed.
-          COMPONENT_OUTPUTS: >-
+          # A literal block, not a folded one: word splitting would strip
+          # trailing whitespace from a value, and a value of `true ` is not
+          # `'true'` to the condition that gates the job, so the job would be
+          # skipped while this check saw a clean `true`.
+          COMPONENT_OUTPUTS: |
             rust=${{ needs.changes.outputs.rust }}
             postgres_agent=${{ needs.changes.outputs.postgres_agent }}
             catalog=${{ needs.changes.outputs.catalog }}
@@ -1634,14 +1638,16 @@ jobs:
         run: |
           set -euo pipefail
           failed=false
-          for component in $COMPONENT_OUTPUTS; do
-            name="${component%%=*}"
-            reported="${component#*=}"
-            if [[ "$reported" != true && "$reported" != false ]]; then
-              echo "Detector did not report $name (reported '$reported')" >&2
-              failed=true
+          while IFS= read -r component; do
+            if [[ -n "$component" ]]; then
+              name="${component%%=*}"
+              reported="${component#*=}"
+              if [[ "$reported" != true && "$reported" != false ]]; then
+                echo "Detector did not report $name (reported '$reported')" >&2
+                failed=true
+              fi
             fi
-          done
+          done <<< "$COMPONENT_OUTPUTS"
           for entry in $JOB_EXPECTATIONS; do
             job="${entry%%=*}"
             state="${entry#*=}"
