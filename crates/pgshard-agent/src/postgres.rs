@@ -3979,6 +3979,7 @@ fn validate_prepared_state(
         controldata_executable,
         expected_uid,
     )?;
+    materialize_hba_file(&config.hba_file, expected_uid, config.role)?;
     let hba_file = validate_hba_file(&config.hba_file, expected_uid, config.role)?;
     let socket_dir = if create_socket_dir {
         ensure_socket_dir(&config.socket_dir, expected_uid)?
@@ -4762,20 +4763,144 @@ fn control_data_state_name(state: ControlDataState) -> &'static str {
     }
 }
 
-fn validate_hba_file(
-    path: &Path,
-    expected_uid: u32,
-    role: PostgresRuntimeRole,
-) -> Result<FileSnapshot, PostgresError> {
-    let name = hba_policy_name(role);
-    let expected_contents = match role {
+fn hba_policy_contents(role: PostgresRuntimeRole) -> &'static [u8] {
+    match role {
         PostgresRuntimeRole::Quarantine
         | PostgresRuntimeRole::ReplicationStandby
         | PostgresRuntimeRole::ServingPrimary => QUARANTINE_HBA_CONTENT,
         PostgresRuntimeRole::ReplicationBootstrapPrimary => {
             REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT
         }
-    };
+    }
+}
+
+/// Writes the policy the agent is about to be judged against, then leaves it
+/// read-only so [`validate_hba_file`] can accept it: that check refuses any HBA
+/// the runtime identity can still write, and agent and postmaster share a UID.
+/// The rename is what makes this safe to repeat — a reload must never observe a
+/// half-written policy, and a `0o400` file cannot be reopened for writing even
+/// by its owner, so replacement is the only way to rewrite one.
+fn materialize_hba_file(
+    path: &Path,
+    expected_uid: u32,
+    role: PostgresRuntimeRole,
+) -> Result<(), PostgresError> {
+    // Preparation validates, then spawn validates again and compares snapshots.
+    // Replacing an already-correct policy would change its inode between those
+    // two reads and be indistinguishable from tampering, so leave it alone.
+    if validate_hba_file(path, expected_uid, role).is_ok() {
+        return Ok(());
+    }
+
+    let name = hba_policy_name(role);
+    let contents = hba_policy_contents(role);
+    let parent = path.parent().ok_or_else(|| PostgresError::MissingParent {
+        path: path.to_owned(),
+    })?;
+    ensure_hba_dir(parent, expected_uid, name)?;
+
+    let staging_path = parent.join(".pg_hba.staging");
+    match fs::remove_file(&staging_path) {
+        Ok(()) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(PostgresError::MaterializeHba {
+                name,
+                operation: "remove interrupted staging file",
+                path: staging_path,
+                source,
+            });
+        }
+    }
+    let fd = open(
+        &staging_path,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|source| PostgresError::MaterializeHba {
+        name,
+        operation: "create staging file",
+        path: staging_path.clone(),
+        source: source.into(),
+    })?;
+    let mut staging_file = File::from(fd);
+    staging_file
+        .write_all(contents)
+        .and_then(|()| staging_file.sync_all())
+        .and_then(|()| staging_file.set_permissions(fs::Permissions::from_mode(0o400)))
+        .map_err(|source| PostgresError::MaterializeHba {
+            name,
+            operation: "write and seal staging file",
+            path: staging_path.clone(),
+            source,
+        })?;
+    drop(staging_file);
+    fs::rename(&staging_path, path).map_err(|source| PostgresError::MaterializeHba {
+        name,
+        operation: "install staged policy",
+        path: path.to_owned(),
+        source,
+    })
+}
+
+fn ensure_hba_dir(path: &Path, expected_uid: u32, name: &'static str) -> Result<(), PostgresError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = DirBuilder::new();
+            builder.mode(0o700);
+            builder
+                .create(path)
+                .map_err(|source| PostgresError::MaterializeHba {
+                    name,
+                    operation: "create policy directory",
+                    path: path.to_owned(),
+                    source,
+                })
+        }
+        Err(source) => Err(PostgresError::Metadata {
+            name,
+            path: path.to_owned(),
+            source,
+        }),
+    }
+    .and_then(|()| {
+        let metadata = strict_metadata(name, path)?;
+        if !metadata.is_dir() {
+            return Err(PostgresError::WrongFileType {
+                name,
+                path: path.to_owned(),
+                expected: "directory",
+            });
+        }
+        if metadata.uid() != 0 && metadata.uid() != expected_uid {
+            return Err(PostgresError::WrongOwner {
+                name,
+                path: path.to_owned(),
+                actual: metadata.uid(),
+                expected: expected_uid,
+            });
+        }
+        let mode = metadata.permissions().mode() & 0o7_777;
+        if mode & 0o022 != 0 {
+            return Err(PostgresError::UnsafePermissions {
+                name,
+                path: path.to_owned(),
+                mode,
+                expected: "not writable by group or world",
+            });
+        }
+        Ok(())
+    })
+}
+
+fn validate_hba_file(
+    path: &Path,
+    expected_uid: u32,
+    role: PostgresRuntimeRole,
+) -> Result<FileSnapshot, PostgresError> {
+    let name = hba_policy_name(role);
+    let expected_contents = hba_policy_contents(role);
     let metadata = strict_metadata(name, path)?;
     require_regular(name, path, &metadata)?;
     if metadata.uid() != 0 && metadata.uid() != expected_uid {
@@ -5618,6 +5743,18 @@ pub enum PostgresError {
     #[error("create PostgreSQL socket directory {path:?}: {source}")]
     CreateSocketDirectory {
         /// Socket directory path.
+        path: PathBuf,
+        /// Operating-system error.
+        source: std::io::Error,
+    },
+    /// The host-based authentication policy could not be written.
+    #[error("materialize {name} {path:?}: {operation}: {source}")]
+    MaterializeHba {
+        /// Which policy was being written.
+        name: &'static str,
+        /// Step that failed.
+        operation: &'static str,
+        /// Path being written.
         path: PathBuf,
         /// Operating-system error.
         source: std::io::Error,
@@ -6509,6 +6646,108 @@ mod tests {
             )
             .is_ok(),
             "phase timeouts plus final reap must fit the exact 55 second budget"
+        );
+    }
+
+    #[test]
+    fn materializes_every_role_policy_into_a_directory_it_creates() {
+        for role in [
+            PostgresRuntimeRole::Quarantine,
+            PostgresRuntimeRole::ReplicationStandby,
+            PostgresRuntimeRole::ServingPrimary,
+            PostgresRuntimeRole::ReplicationBootstrapPrimary,
+        ] {
+            let fixture = TempDir::new().expect("create HBA fixture");
+            let hba = fixture.path().join("hba").join("pg_hba.conf");
+            let uid = geteuid().as_raw();
+
+            materialize_hba_file(&hba, uid, role).expect("materialize into a missing directory");
+            assert_eq!(
+                fs::read(&hba).expect("read materialized policy"),
+                hba_policy_contents(role),
+                "the bytes written must be the bytes the validator demands"
+            );
+            assert_eq!(
+                fs::metadata(&hba)
+                    .expect("stat policy")
+                    .permissions()
+                    .mode()
+                    & 0o7_777,
+                0o400,
+                "a policy the runtime identity can rewrite is one the validator rejects"
+            );
+            validate_hba_file(&hba, uid, role).expect("the validator must accept what we wrote");
+            assert_eq!(
+                fs::metadata(hba.parent().expect("policy directory"))
+                    .expect("stat policy directory")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700,
+                "the directory must not be traversable by group or world; masked to permission \
+                 bits because an fsGroup mount can leave setgid set on the parent"
+            );
+
+            let installed = fs::metadata(&hba).expect("stat policy").ino();
+            materialize_hba_file(&hba, uid, role).expect("materialize again");
+            assert_eq!(
+                fs::metadata(&hba).expect("stat policy").ino(),
+                installed,
+                "re-materializing a correct policy must not replace it -- a new inode is \
+                 indistinguishable from tampering when spawn re-reads the snapshot"
+            );
+
+            fs::set_permissions(&hba, fs::Permissions::from_mode(0o600)).expect("open policy");
+            fs::write(&hba, "local all all trust\n").expect("tamper with policy");
+            materialize_hba_file(&hba, uid, role).expect("repair a tampered policy");
+            assert_eq!(
+                fs::read(&hba).expect("read repaired policy"),
+                hba_policy_contents(role),
+                "materialize must repair a policy someone rewrote"
+            );
+            validate_hba_file(&hba, uid, role).expect("the repaired policy must validate");
+        }
+    }
+
+    #[test]
+    fn materialize_recovers_from_staging_left_by_an_interrupted_run() {
+        let fixture = TempDir::new().expect("create HBA fixture");
+        let hba = fixture.path().join("pg_hba.conf");
+        let staging = fixture.path().join(".pg_hba.staging");
+        fs::write(&staging, b"left behind by a crash").expect("strand a staging file");
+
+        materialize_hba_file(&hba, geteuid().as_raw(), PostgresRuntimeRole::Quarantine)
+            .expect("a stranded staging file must not refuse the spawn forever");
+
+        assert_eq!(
+            fs::read(&hba).expect("read materialized policy"),
+            QUARANTINE_HBA_CONTENT
+        );
+        assert!(
+            !staging.exists(),
+            "the staging name must be consumed by the install, not left to collide again"
+        );
+    }
+
+    #[test]
+    fn materialize_refuses_when_the_policy_directory_cannot_be_written() {
+        let fixture = TempDir::new().expect("create HBA fixture");
+        let sealed = fixture.path().join("sealed");
+        fs::create_dir(&sealed).expect("create sealed directory");
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o500)).expect("seal directory");
+
+        let result = materialize_hba_file(
+            &sealed.join("pg_hba.conf"),
+            geteuid().as_raw(),
+            PostgresRuntimeRole::Quarantine,
+        );
+
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o700))
+            .expect("unseal for cleanup");
+        assert!(
+            matches!(result, Err(PostgresError::MaterializeHba { .. })),
+            "an unwritable policy directory must refuse the spawn, not start PostgreSQL \
+             with whatever policy happens to be there: {result:?}"
         );
     }
 

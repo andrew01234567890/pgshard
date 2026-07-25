@@ -1676,7 +1676,7 @@ jobs:
                   'pid="$(head -n 1 "$PGDATA/postmaster.pid")"; tr "\000" "\n" < "/proc/$pid/cmdline"')"
                 for expected in \
                   data_directory=/var/lib/postgresql/18/docker \
-                  hba_file=/etc/pgshard/quarantine.pg_hba.conf \
+                  hba_file=/run/pgshard/hba/pg_hba.conf \
                   external_pid_file=/run/pgshard/postgres/postmaster.external.pid \
                   listen_addresses= unix_socket_group= primary_conninfo= primary_slot_name= \
                   restore_command= archive_mode=on archive_command= archive_library= \
