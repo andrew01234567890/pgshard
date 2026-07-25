@@ -389,16 +389,39 @@ docker run --rm --user 999:999 --network none --read-only \
 # a read-only fence transaction cannot take the row lock, an idle holder is
 # terminated by the evidence timeouts, and the lock wait itself is the property
 # under test. None of that is reachable from a unit test.
+#
+# It runs against its own disposable server rather than the shared primary,
+# because it publishes generations of its own and the steps that follow assert
+# on the primary's final generation.
+readonly fence_primary="pgshard-generation-fence-${suffix}"
+readonly fence_socket="pgshard-generation-fence-socket-${suffix}"
+docker volume create "$fence_socket" >/dev/null
+docker run --detach --name "$fence_primary" \
+  --network "$network" \
+  --volume "$fence_socket:/var/run/postgresql" \
+  --env POSTGRES_PASSWORD=disposable-fence-password \
+  "$image" >/dev/null
+for _ in $(seq 1 60); do
+  if docker exec "$fence_primary" pg_isready --quiet; then
+    break
+  fi
+  sleep 1
+done
+docker exec "$fence_primary" pg_isready --quiet
+
 docker run --rm --user 999:999 \
   --network "$network" \
-  --volume "$primary_socket:/primary-socket" \
+  --volume "$fence_socket:/fence-socket" \
   --mount "type=bind,src=$test_binary,dst=/test/pgshard-agent-test,readonly" \
-  --env PGSHARD_AGENT_TEST_SOCKET_DIR=/primary-socket \
+  --env PGSHARD_AGENT_TEST_SOCKET_DIR=/fence-socket \
   --entrypoint /test/pgshard-agent-test \
   "$image" \
   --ignored --exact \
   postgres_generation::tests::live_postgres18_materializer_fences_publication \
   --nocapture
+
+docker rm --force "$fence_primary" >/dev/null
+docker volume rm "$fence_socket" >/dev/null
 
 if [[ -n "$runtime_image" ]]; then
   if ! docker stop --time 10 "$standby" >/dev/null; then
