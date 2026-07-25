@@ -2126,6 +2126,60 @@ mod tests {
         step
     }
 
+    /// What each aggregated job is gated on, restated here so the workflow is
+    /// not its own only authority.
+    ///
+    /// A shape check alone accepts a job gated on the wrong component -- the
+    /// Go jobs gated on `rust`, say -- because that is still a component
+    /// detection, still mirrored faithfully into the expectation, and still
+    /// skips the jobs it gates on an operator-only change. Changing what a job
+    /// is gated on therefore has to be done twice: once in the workflow and
+    /// once here, where it is reviewed as code.
+    const ALWAYS: &str = "";
+    const GATED_ON: [(&str, &str); 20] = [
+        ("changes", ALWAYS),
+        ("repository-policy", ALWAYS),
+        ("rust-static", "needs.changes.outputs.rust == 'true'"),
+        ("rust-test", "needs.changes.outputs.rust == 'true'"),
+        (
+            "catalog-postgres",
+            "needs.changes.outputs.catalog == 'true'",
+        ),
+        (
+            "orch-catalog-postgres",
+            "needs.changes.outputs.orch_catalog == 'true'",
+        ),
+        (
+            "pgwire-postgres",
+            "needs.changes.outputs.pgwire == 'true' || needs.changes.outputs.pooler_postgres == 'true'",
+        ),
+        ("pgwire-fuzz", "needs.changes.outputs.pgwire == 'true'"),
+        (
+            "planner-postgres",
+            "needs.changes.outputs.planner == 'true'",
+        ),
+        ("protobuf", "needs.changes.outputs.proto == 'true'"),
+        ("go-operator", "needs.changes.outputs.go == 'true'"),
+        ("operator-kind", "needs.changes.outputs.go == 'true'"),
+        (
+            "operator-kind-manager",
+            "needs.changes.outputs.go == 'true' || needs.changes.outputs.images == 'true'",
+        ),
+        (
+            "website",
+            "needs.changes.outputs.website == 'true' || (github.event_name != 'pull_request' && needs.changes.outputs.website_exists == 'true')",
+        ),
+        ("ui", "needs.changes.outputs.ui == 'true'"),
+        ("integration", "needs.changes.outputs.integration == 'true'"),
+        ("images", "needs.changes.outputs.images == 'true'"),
+        (
+            "agent-postgres",
+            "needs.changes.outputs.postgres_agent == 'true'",
+        ),
+        ("kind", "needs.changes.outputs.kind == 'true'"),
+        ("performance", "needs.changes.outputs.performance == 'true'"),
+    ];
+
     /// Whether a job's condition is built only from component detections.
     ///
     /// The expectations mirror each job's condition, so a condition weakened
@@ -2210,6 +2264,11 @@ mod tests {
             declared.len(),
             "the aggregate's needs and expectations are not the same set"
         );
+        assert_eq!(
+            waited.len(),
+            GATED_ON.len(),
+            "the restated conditions do not cover exactly the aggregated jobs"
+        );
 
         for job in &waited {
             let (_, result, expected) = declared
@@ -2238,12 +2297,21 @@ mod tests {
             // Mirroring is only a gate while the thing mirrored is a component
             // detection. A condition weakened by any other term would be
             // mirrored just as faithfully, and the skip it caused accepted.
-            if let Some(condition) = condition {
+            if let Some(condition) = &condition {
                 assert!(
-                    condition_is_component_shaped(&condition, &components),
+                    condition_is_component_shaped(condition, &components),
                     "{job} is gated on something other than its components: {condition}"
                 );
             }
+            let (_, gated_on) = GATED_ON
+                .iter()
+                .find(|(name, _)| name == job)
+                .unwrap_or_else(|| panic!("{job} has no restated condition"));
+            assert_eq!(
+                condition.unwrap_or_default(),
+                *gated_on,
+                "{job} is not gated on what it is supposed to be gated on"
+            );
         }
     }
 
