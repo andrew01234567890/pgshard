@@ -47,6 +47,15 @@ pub(crate) struct ServingInputPaths {
 }
 
 /// The digests the request sealed, which the projected bytes must match.
+///
+/// The field names mirror [`ServingPreparationPolicy`] deliberately: this type
+/// is the expectation and that one is the result, and a shared shape makes a
+/// mismatched assignment obvious. That common suffix is what the lint objects
+/// to, and the correspondence is worth more than the lint.
+#[allow(
+    clippy::struct_field_names,
+    reason = "mirrors ServingPreparationPolicy"
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ExpectedServingInputs {
     pub(crate) configuration_sha256: String,
