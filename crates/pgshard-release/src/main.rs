@@ -2203,6 +2203,38 @@ mod tests {
         })
     }
 
+    /// The tests in this file are what stop a gate being retired, so they
+    /// cannot run from a job that a gate governs: the edit that retires a gate
+    /// would also stop the test that catches it. They run from the
+    /// unconditional policy job, which `GATED_ON` pins as unconditional.
+    #[test]
+    fn the_gate_tests_run_from_an_unconditional_job() {
+        let workflow = parsed_workflow();
+        let policy = workflow_job(&workflow, "repository-policy");
+        assert!(
+            policy.get("if").is_none(),
+            "the job that proves the gates is itself gated"
+        );
+        let runs = policy["steps"]
+            .as_sequence()
+            .expect("the policy job declares steps")
+            .iter()
+            .filter_map(|step| step["run"].as_str())
+            .any(|run| run.contains("cargo test") && run.contains("-p pgshard-release"));
+        assert!(
+            runs,
+            "the unconditional policy job does not run this crate's tests"
+        );
+        assert_eq!(
+            GATED_ON
+                .iter()
+                .find(|(job, _)| *job == "repository-policy")
+                .map(|(_, condition)| *condition),
+            Some(ALWAYS),
+            "the policy job is not pinned as unconditional"
+        );
+    }
+
     fn parsed_workflow() -> serde_norway::Value {
         serde_norway::from_str(include_str!("../../../.github/workflows/ci.yml"))
             .expect("the workflow is valid YAML")

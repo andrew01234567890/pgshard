@@ -173,6 +173,11 @@ jobs:
           cache: false
       - name: Validate workflow contracts
         run: make actions-check
+      # Unconditional on purpose. These tests are what stops a gate being
+      # retired, so running them from a gated job would let the same edit that
+      # retires a gate also stop the test that would have caught it.
+      - name: Prove the gates cannot be retired
+        run: cargo test --locked -p pgshard-release
       - name: Validate title and public content
         env:
           EVENT_NAME: ${{ github.event_name }}
