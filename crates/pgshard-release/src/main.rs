@@ -2029,8 +2029,7 @@ mod tests {
     #[test]
     fn every_consumed_detector_output_is_validated() {
         let workflow = parsed_workflow();
-        let aggregate = workflow_job(&workflow, "aggregate");
-        let environment = aggregate["steps"][0]["env"]
+        let environment = aggregate_gate_step(&workflow)["env"]
             .as_mapping()
             .expect("the aggregate step declares an environment");
 
@@ -2106,6 +2105,50 @@ mod tests {
         }
     }
 
+    /// The gate step, selected by identity: `steps[0]` would let a prepended
+    /// decoy satisfy every structural assertion while the real gate differed.
+    /// Its lack of an `if:` is part of the assertion — a gate that can be
+    /// conditioned out is not a gate.
+    fn aggregate_gate_step(workflow: &serde_norway::Value) -> &serde_norway::Value {
+        let steps = workflow_job(workflow, "aggregate")["steps"]
+            .as_sequence()
+            .expect("the aggregate declares steps");
+        let named: Vec<&serde_norway::Value> = steps
+            .iter()
+            .filter(|step| step["name"].as_str() == Some("Require every applicable job"))
+            .collect();
+        assert_eq!(named.len(), 1, "the aggregate gate step is not unique");
+        let step = named[0];
+        assert!(
+            step.get("if").is_none(),
+            "the aggregate gate step is conditional"
+        );
+        step
+    }
+
+    /// Whether a job's condition is built only from component detections.
+    ///
+    /// The expectations mirror each job's condition, so a condition weakened
+    /// with anything else -- `&& false`, an actor check, a branch check --
+    /// would be mirrored faithfully and the resulting skip accepted.
+    fn condition_is_component_shaped(
+        condition: &str,
+        components: &std::collections::BTreeSet<String>,
+    ) -> bool {
+        let mut residue = condition.to_owned();
+        // Longest first: replacing `website` before `website_exists` would
+        // leave `_exists == 'true'` behind and read as a foreign term.
+        let mut names: Vec<&String> = components.iter().collect();
+        names.sort_by_key(|name| std::cmp::Reverse(name.len()));
+        for name in names {
+            residue = residue.replace(&format!("needs.changes.outputs.{name} == 'true'"), " ");
+        }
+        residue = residue.replace("github.event_name != 'pull_request'", " ");
+        residue.chars().all(|character| {
+            character.is_whitespace() || matches!(character, '(' | ')' | '|' | '&')
+        })
+    }
+
     fn parsed_workflow() -> serde_norway::Value {
         serde_norway::from_str(include_str!("../../../.github/workflows/ci.yml"))
             .expect("the workflow is valid YAML")
@@ -2124,15 +2167,28 @@ mod tests {
     #[test]
     fn every_aggregated_job_expects_its_own_condition() {
         let workflow = parsed_workflow();
-        let aggregate = workflow_job(&workflow, "aggregate");
-        let waited: Vec<&str> = aggregate["needs"]
+        let waited: Vec<&str> = workflow_job(&workflow, "aggregate")["needs"]
             .as_sequence()
             .expect("the aggregate declares its needs")
             .iter()
             .map(|job| job.as_str().expect("a needed job is named"))
             .collect();
 
-        let expectations = aggregate["steps"][0]["env"]["JOB_EXPECTATIONS"]
+        let environment = &aggregate_gate_step(&workflow)["env"];
+        let components: std::collections::BTreeSet<String> = environment["COMPONENT_OUTPUTS"]
+            .as_str()
+            .expect("COMPONENT_OUTPUTS is a scalar")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                line.trim()
+                    .split_once('=')
+                    .expect("an entry names a component")
+                    .0
+                    .to_owned()
+            })
+            .collect();
+        let expectations = environment["JOB_EXPECTATIONS"]
             .as_str()
             .expect("the aggregate declares its expectations");
         let declared: Vec<(&str, &str, &str)> = expectations
@@ -2173,12 +2229,21 @@ mod tests {
                 .map(|condition| condition.split_whitespace().collect::<Vec<_>>().join(" "));
             assert_eq!(
                 *expected,
-                condition.map_or_else(
+                condition.clone().map_or_else(
                     || "true".to_owned(),
                     |condition| format!("${{{{ {condition} }}}}")
                 ),
                 "{job}'s expectation does not repeat {job}'s own condition"
             );
+            // Mirroring is only a gate while the thing mirrored is a component
+            // detection. A condition weakened by any other term would be
+            // mirrored just as faithfully, and the skip it caused accepted.
+            if let Some(condition) = condition {
+                assert!(
+                    condition_is_component_shaped(&condition, &components),
+                    "{job} is gated on something other than its components: {condition}"
+                );
+            }
         }
     }
 
