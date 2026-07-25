@@ -12,6 +12,7 @@ pub(crate) mod catalog_materializer;
 pub mod config;
 pub mod coordination;
 pub mod domain;
+pub mod genesis_authority;
 pub mod http;
 pub mod postgres;
 pub mod postgres_fence;
