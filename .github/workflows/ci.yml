@@ -1,6 +1,14 @@
 name: CI
 
 on:
+  # Retargeting a pull request moves `base.sha` without moving the head SHA, so
+  # every base-relative check here keeps the green it earned against the base it
+  # no longer has: the documentation advisory gate, `buf breaking --against`,
+  # and `pgshard-release audit --base` all inherit that from this trigger, not
+  # from anything of their own. Re-running them on a retarget means adding
+  # `types: [edited]`, which also re-runs the whole of CI on every title and
+  # description edit, so it is a decision about this trigger rather than about
+  # any one gate.
   pull_request:
   push:
     branches: [main]
@@ -182,6 +190,12 @@ jobs:
         with:
           go-version: "1.26.5"
           cache-dependency-path: operator/go.sum
+      # The gate tests run the advisory gate itself, so this job needs the Node
+      # the gate runs under rather than whatever the runner image ships.
+      - name: Select Node.js toolchain
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
       - name: Validate workflow contracts
         run: make actions-check
       # Unconditional on purpose. These tests are what stops a gate being
@@ -987,6 +1001,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -994,7 +1010,37 @@ jobs:
           cache: npm
           cache-dependency-path: website/package-lock.json
       - name: Run documentation checks
-        run: make docs-check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidate=""
+          case "$EVENT_NAME" in
+            pull_request) candidate="$PR_BASE_SHA" ;;
+            push) candidate="$PUSH_BEFORE_SHA" ;;
+          esac
+          # Only a predecessor this commit descends from can say what this
+          # change did to the dependency tree. A scheduled or dispatched run
+          # has no predecessor, and a rewritten history can offer one this
+          # commit never came from -- comparing against either would excuse
+          # whatever the run was supposed to catch. Both audit the tree
+          # outright instead, which is also what a release-authorizing
+          # dispatch has to survive.
+          base=""
+          if [[ -n "$candidate" ]] &&
+            base="$(git rev-parse --verify --quiet "${candidate}^{commit}")" &&
+            [[ "$base" =~ ^[0-9a-f]{40}$ ]] &&
+            git merge-base --is-ancestor "$base" HEAD
+          then
+            echo "Auditing this change against $base."
+          else
+            base=""
+            echo "No verifiable predecessor: auditing the dependency tree outright."
+          fi
+          make docs-check PGSHARD_DOCS_AUDIT_BASE="$base"
       - name: Store Pages candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

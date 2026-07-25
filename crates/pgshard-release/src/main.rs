@@ -4089,7 +4089,7 @@ mod tests {
     ///
     /// The crates themselves are not here: `every_component_detects_every_file_its_job_compiles`
     /// requires every one of their files against the components built from them.
-    const OUTSIDE_THE_CRATES: [(Probe, &[&str], &[&str]); 31] = [
+    const OUTSIDE_THE_CRATES: [(Probe, &[&str], &[&str]); 32] = [
         (
             Probe::File(".dockerignore"),
             &["images", "postgres_agent"],
@@ -4127,6 +4127,14 @@ mod tests {
         (Probe::File(".github/pull_request_template.md"), &[], &[]),
         (
             Probe::File(".github/workflows/dependabot-automerge.yml"),
+            &["rust"],
+            &[],
+        ),
+        // A schedule, so it gates nothing this detector decides. It is here for
+        // the one component that does compile it: the release crate reads it to
+        // prove the absolute audit still runs somewhere that fails.
+        (
+            Probe::File(".github/workflows/dependency-advisories.yml"),
             &["rust"],
             &[],
         ),
@@ -4355,5 +4363,1270 @@ mod tests {
             }
         }
         assert_every_probe_fires(&required);
+    }
+
+    fn repository_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    fn git_in(repository: &std::path::Path, arguments: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(arguments)
+            .current_dir(repository)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("git wrote UTF-8")
+            .trim()
+            .to_owned()
+    }
+
+    /// The recipe as make will run it, which is the only form that shows a
+    /// disabled step: a commented recipe line keeps every substring a text
+    /// search looks for while make hands the shell a comment.
+    fn make_recipe(target: &str, overrides: &[&str]) -> Vec<String> {
+        let output = std::process::Command::new("make")
+            .arg("-n")
+            .arg(target)
+            .args(overrides)
+            .current_dir(repository_root())
+            .output()
+            .expect("run make");
+        assert!(
+            output.status.success(),
+            "make -n {target} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("make wrote UTF-8")
+            .lines()
+            .map(|line| line.trim().to_owned())
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    fn audit_command(recipe: &[String]) -> &str {
+        let commands: Vec<&String> = recipe
+            .iter()
+            .filter(|line| line.starts_with("node .github/scripts/npm-audit-gate.mjs"))
+            .collect();
+        assert_eq!(
+            commands.len(),
+            1,
+            "the recipe does not run the advisory gate exactly once: {recipe:?}"
+        );
+        commands[0]
+    }
+
+    /// The audit is a supply-chain gate whose severity floor and dependency
+    /// coverage are the entire signal. Comparing against a base is what stops
+    /// somebody else's publication blocking unrelated work; it must never
+    /// become the excuse for auditing less than before.
+    #[test]
+    fn the_documentation_audit_keeps_its_severity_floor_and_coverage() {
+        let gate = include_str!("../../../.github/scripts/npm-audit-gate.mjs");
+        assert!(gate.contains(r#"const BLOCKING_SEVERITIES = ["high", "critical"];"#));
+        assert!(!gate.contains("--omit"));
+        assert!(!gate.contains("--audit-level"));
+        assert!(!include_str!("../../../Makefile").contains("--omit"));
+
+        // What the job summary must not carry unescaped is a property of
+        // Markdown, so the requirement is stated here rather than copied from
+        // the gate, and the gate's own class is read out of its source and
+        // required to cover it. The class is pinned as source text as well:
+        // covering the requirement is satisfied by weakening both at once,
+        // and a pin is not. Exactly once, because a second copy satisfies the
+        // pin while the declaration that runs says something else.
+        assert_eq!(
+            gate.matches(r"const MARKDOWN_ACTIVE = /[\\`*_[\]<>&!~|]/g;")
+                .count(),
+            1
+        );
+        let escaped = gate_escape_class();
+        for starter in MARKDOWN_INLINE_STARTERS.chars() {
+            assert!(
+                escaped.contains(starter),
+                "the gate leaves {starter:?} active in the job summary"
+            );
+        }
+
+        assert_eq!(
+            audit_command(&make_recipe("docs-check", &[])),
+            "node .github/scripts/npm-audit-gate.mjs --directory website --base origin/main"
+        );
+        // No base is the absent-predecessor case CI hands it, and the answer
+        // to a comparison that cannot be made is the whole audit, never none.
+        assert_eq!(
+            audit_command(&make_recipe("docs-check", &["PGSHARD_DOCS_AUDIT_BASE="])),
+            "node .github/scripts/npm-audit-gate.mjs --directory website --report"
+        );
+        assert_eq!(
+            audit_command(&make_recipe("docs-audit", &[])),
+            "node .github/scripts/npm-audit-gate.mjs --directory website --report"
+        );
+    }
+
+    fn documentation_gate_script() -> String {
+        let workflow = parsed_workflow();
+        let job = workflow_job(&workflow, "website");
+        let step = job["steps"]
+            .as_sequence()
+            .expect("the website job declares steps")
+            .iter()
+            .find(|step| step["name"].as_str() == Some("Run documentation checks"))
+            .expect("the website job runs the documentation checks");
+        assert_eq!(
+            step["shell"].as_str(),
+            Some("bash"),
+            "the documentation gate step does not pin its shell"
+        );
+        assert_step_environment(
+            step,
+            &["EVENT_NAME", "PR_BASE_SHA", "PUSH_BEFORE_SHA"],
+            "the documentation gate step",
+        );
+        // The comparison reads the base commit's manifests out of the object
+        // store, which a shallow checkout does not contain.
+        let checkout = job["steps"]
+            .as_sequence()
+            .expect("the website job declares steps")
+            .iter()
+            .find(|step| {
+                step["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.starts_with("actions/checkout@"))
+            })
+            .expect("the website job checks out the source");
+        assert_eq!(checkout["with"]["fetch-depth"].as_u64(), Some(0));
+        // Release reconciliation publishes the `pages-site` artifact of a CI
+        // run. Uploading it from anywhere but the job that audits the tree
+        // would let the published documentation come from a tree this gate
+        // never looked at.
+        let upload = job["steps"]
+            .as_sequence()
+            .expect("the website job declares steps")
+            .iter()
+            .find(|step| {
+                step["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.starts_with("actions/upload-artifact@"))
+            })
+            .expect("the website job stores the Pages candidate");
+        assert_eq!(upload["with"]["name"].as_str(), Some("pages-site"));
+        assert_eq!(upload["with"]["if-no-files-found"].as_str(), Some("error"));
+        // The name alone says nothing about what is inside it: repointing the
+        // path publishes a different tree under the name release
+        // reconciliation looks for.
+        assert_eq!(upload["with"]["path"].as_str(), Some("website/build"));
+        step["run"]
+            .as_str()
+            .expect("the documentation gate step runs a script")
+            .to_owned()
+    }
+
+    /// A baseline this commit did not come from is not evidence about this
+    /// commit. Comparing a tree against itself excuses every advisory in it,
+    /// and a release-authorizing dispatch that does so publishes a tree whose
+    /// push run failed the same audit.
+    #[test]
+    fn the_documentation_gate_baselines_only_a_verifiable_predecessor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = documentation_gate_script();
+        let repository = tempfile::TempDir::new().expect("temporary repository");
+        let root = repository.path();
+        git_in(root, &["init", "--quiet", "--initial-branch=main"]);
+        git_in(root, &["config", "user.email", "gate@example.invalid"]);
+        git_in(root, &["config", "user.name", "gate"]);
+        let commit = |message: &str| {
+            std::fs::write(root.join("tree"), message).expect("write tree");
+            git_in(root, &["add", "--all"]);
+            git_in(root, &["commit", "--quiet", "-m", message]);
+            git_in(root, &["rev-parse", "HEAD"])
+        };
+        let base = commit("base");
+        git_in(root, &["switch", "--quiet", "-c", "rewritten"]);
+        let abandoned = commit("abandoned");
+        git_in(root, &["switch", "--quiet", "main"]);
+        let head = commit("head");
+
+        let stub = root.join("stub");
+        std::fs::create_dir(&stub).expect("stub directory");
+        std::fs::write(stub.join("make"), "#!/bin/sh\nprintf '%s\\n' \"$*\"\n")
+            .expect("write stub");
+        std::fs::set_permissions(stub.join("make"), std::fs::Permissions::from_mode(0o755))
+            .expect("stub is executable");
+        let path = format!("{}:{}", stub.display(), env::var("PATH").expect("PATH"));
+
+        let selected = |event: &str, pull_base: &str, push_before: &str| -> String {
+            let output = Command::new("bash")
+                .arg("-c")
+                .arg(&script)
+                .current_dir(root)
+                .env("PATH", &path)
+                .env("EVENT_NAME", event)
+                .env("PR_BASE_SHA", pull_base)
+                .env("PUSH_BEFORE_SHA", push_before)
+                .env("GITHUB_SHA", &head)
+                .output()
+                .expect("run the documentation gate step");
+            assert!(
+                output.status.success(),
+                "the step failed for {event}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).expect("the step wrote UTF-8");
+            let invocation = stdout
+                .lines()
+                .last()
+                .expect("the step invokes make")
+                .to_owned();
+            invocation
+                .strip_prefix("docs-check PGSHARD_DOCS_AUDIT_BASE=")
+                .unwrap_or_else(|| panic!("the step invoked make as {invocation}"))
+                .to_owned()
+        };
+
+        assert_eq!(selected("pull_request", &base, ""), base);
+        assert_eq!(selected("push", "", &base), base);
+        // Every remaining case has to fall back to the whole audit. A commit
+        // this history no longer contains, one it never contained, one from a
+        // discarded line of development, and the absent predecessor of a
+        // scheduled or dispatched run are all baselines that cannot say what
+        // this change did.
+        assert_eq!(selected("push", "", &abandoned), "");
+        assert_eq!(selected("push", "", &"0".repeat(40)), "");
+        assert_eq!(selected("push", "", &"b".repeat(40)), "");
+        assert_eq!(selected("push", "", ""), "");
+        assert_eq!(selected("pull_request", &abandoned, ""), "");
+        assert_eq!(selected("schedule", "", ""), "");
+        assert_eq!(selected("workflow_dispatch", "", ""), "");
+        // A dispatch is release-authorizing, so its fallback is the one that
+        // decides whether a failed push audit can be laundered into a green
+        // run. It must never resolve to the commit being audited.
+        assert_ne!(selected("workflow_dispatch", &head, &head), head);
+    }
+
+    /// Nothing is fixed on the strength of an advisory nobody sees. The audit
+    /// that no longer blocks a pull request still has to run somewhere that
+    /// fails, and a `run:` a workflow never reaches is text, not a gate.
+    #[test]
+    fn the_scheduled_advisory_workflow_audits_main_outright() {
+        let workflow: serde_norway::Value = serde_norway::from_str(include_str!(
+            "../../../.github/workflows/dependency-advisories.yml"
+        ))
+        .expect("the workflow is valid YAML");
+        // An unquoted `on` key is a YAML 1.1 boolean.
+        let triggers = workflow
+            .get(serde_norway::Value::Bool(true))
+            .or_else(|| workflow.get("on"))
+            .expect("the workflow declares triggers");
+        let schedule = triggers["schedule"]
+            .as_sequence()
+            .expect("the workflow is scheduled");
+        assert!(!schedule.is_empty());
+        for entry in schedule {
+            assert!(
+                entry["cron"].as_str().is_some_and(|cron| !cron.is_empty()),
+                "a schedule entry carries no cron expression"
+            );
+        }
+        assert!(
+            workflow.get("defaults").is_none(),
+            "the workflow sets step defaults, which can replace every shell"
+        );
+
+        let jobs = workflow["jobs"]
+            .as_mapping()
+            .expect("the workflow declares jobs");
+        let auditing: Vec<&serde_norway::Value> = jobs
+            .iter()
+            .filter(|(_, job)| {
+                job["steps"]
+                    .as_sequence()
+                    .is_some_and(|steps| steps.iter().any(runs_the_audit))
+            })
+            .map(|(_, job)| job)
+            .collect();
+        assert_eq!(
+            auditing.len(),
+            1,
+            "the workflow does not run the absolute audit in exactly one job"
+        );
+        assert_nothing_swallows_failure(auditing[0], "the scheduled advisory job");
+        assert!(
+            auditing[0].get("if").is_none(),
+            "the scheduled advisory job is conditional and can decline to run"
+        );
+    }
+
+    fn runs_the_audit(step: &serde_norway::Value) -> bool {
+        step["run"]
+            .as_str()
+            .is_some_and(|run| run.trim() == "make docs-audit")
+    }
+
+    /// `make -n` prints a recipe line with any `-`, `@` or `+` prefix stripped,
+    /// so the expansion cannot show that make was told to ignore the gate's
+    /// exit status. Only running the recipe against a failing gate can.
+    #[test]
+    fn the_documentation_recipe_fails_when_the_advisory_gate_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let support = tempfile::TempDir::new().expect("temporary support directory");
+        let stub = support.path().join("stub");
+        std::fs::create_dir(&stub).expect("stub directory");
+        let invocations = support.path().join("invocations");
+        std::fs::write(stub.join("npm"), "#!/bin/sh\nexit 0\n").expect("write the npm stub");
+        std::fs::write(
+            stub.join("node"),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 1\n",
+                invocations.display()
+            ),
+        )
+        .expect("write the node stub");
+        for stubbed in ["npm", "node"] {
+            std::fs::set_permissions(stub.join(stubbed), std::fs::Permissions::from_mode(0o755))
+                .expect("the stub is executable");
+        }
+
+        let output = Command::new("make")
+            .arg("docs-check")
+            .current_dir(repository_root())
+            .env(
+                "PATH",
+                format!("{}:{}", stub.display(), env::var("PATH").expect("PATH")),
+            )
+            .output()
+            .expect("run make");
+        let invoked = std::fs::read_to_string(&invocations).unwrap_or_default();
+        assert!(
+            invoked.contains(".github/scripts/npm-audit-gate.mjs"),
+            "the recipe never ran the advisory gate: {invoked:?}"
+        );
+        assert!(
+            !output.status.success(),
+            "the recipe reported success while the advisory gate failed: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    /// `npm audit --json` as npm emits it, reduced to the fields the gate
+    /// reads and keeping the shapes it has to survive: a package whose `via`
+    /// names another package by string rather than by advisory, and a severe
+    /// count that exceeds the advisories any parser can extract. Auditing for
+    /// real would ask the advisory database what is severe today, which is the
+    /// answer this gate exists to stop deciding whether a change passes.
+    fn advisory_report(title: &str, direct: bool, nodes: &[&str]) -> String {
+        // npm reports every package a vulnerable one is installed inside as
+        // vulnerable too, naming it by string rather than by advisory. Which
+        // packages those are is not free to choose: they are the enclosing
+        // installs the resolved paths name, all the way out, because npm nests
+        // deeper than one level.
+        let mut enclosing: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for node in nodes {
+            let mut path = *node;
+            while let Some((parent, _)) = path.rsplit_once("/node_modules/") {
+                enclosing
+                    .entry(package_at(parent).to_owned())
+                    .or_default()
+                    .push(parent.to_owned());
+                path = parent;
+            }
+        }
+
+        let mut vulnerabilities = serde_json::Map::new();
+        vulnerabilities.insert(
+            "lodash".to_owned(),
+            serde_json::json!({
+                "name": "lodash",
+                "severity": "high",
+                "isDirect": direct,
+                "nodes": nodes,
+                "effects": enclosing.keys().collect::<Vec<_>>(),
+                "range": "<4.17.21",
+                "fixAvailable": true,
+                "via": [{
+                    "source": 1_106_913,
+                    "name": "lodash",
+                    "dependency": "lodash",
+                    "title": title,
+                    "url": "https://github.com/advisories/GHSA-35jh-r3h4-6jhm",
+                    "severity": "high",
+                    "range": "<4.17.21"
+                }]
+            }),
+        );
+        for (dependent, paths) in &enclosing {
+            // Only an install the root reaches without going through another
+            // one is a direct dependency.
+            let root = paths.iter().any(|path| !path.contains("/node_modules/"));
+            vulnerabilities.insert(
+                dependent.clone(),
+                serde_json::json!({
+                    "name": dependent,
+                    "severity": "high",
+                    "isDirect": root,
+                    "nodes": paths,
+                    "effects": [],
+                    "range": "*",
+                    "fixAvailable": false,
+                    "via": ["lodash"]
+                }),
+            );
+        }
+
+        let severe = vulnerabilities.len();
+        serde_json::json!({
+            "auditReportVersion": 2,
+            "vulnerabilities": serde_json::Value::Object(vulnerabilities),
+            "metadata": {"vulnerabilities": {
+                "info": 0, "low": 0, "moderate": 0, "high": severe, "critical": 0, "total": severe
+            }}
+        })
+        .to_string()
+    }
+
+    /// npm reaching the registry and being told something, rather than being
+    /// handed a report. What it was told is written by whoever answered.
+    fn registry_failure(said: &str) -> String {
+        format!("#stderr\n{said}")
+    }
+
+    fn clean_report() -> String {
+        serde_json::json!({
+            "auditReportVersion": 2,
+            "vulnerabilities": {},
+            "metadata": {"vulnerabilities": {
+                "info": 0, "low": 0, "moderate": 0, "high": 0, "critical": 0, "total": 0
+            }}
+        })
+        .to_string()
+    }
+
+    /// One side of the comparison: the manifests a commit carries and what the
+    /// advisory database says about them. The two agree by construction --
+    /// what the report resolves an advisory at is what the lockfile installs,
+    /// and a package the report calls direct is one the manifest declares --
+    /// because a fixture npm would never have produced proves nothing about a
+    /// gate that reads npm.
+    struct Tree<'a> {
+        name: &'a str,
+        production: &'a [&'a str],
+        development: &'a [&'a str],
+        report: String,
+    }
+
+    impl Tree<'_> {
+        /// Deliberately not the name the fixture is keyed by. A stub that
+        /// selected its report from here would find nothing, which is what
+        /// makes the selection provably the lockfile's.
+        fn manifest(&self) -> String {
+            let (production, development) = self.declared();
+            serde_json::json!({
+                "name": format!("{}-manifest", self.name),
+                "version": "0.0.0",
+                "private": true,
+                "dependencies": serde_json::Value::Object(production),
+                "devDependencies": serde_json::Value::Object(development)
+            })
+            .to_string()
+        }
+
+        /// What the root declares, which npm is the one deciding: a package
+        /// the report calls direct is one the root declares, and the report
+        /// never says which section, so an advisory the scenario does not
+        /// place is a production dependency.
+        fn declared(
+            &self,
+        ) -> (
+            serde_json::Map<String, serde_json::Value>,
+            serde_json::Map<String, serde_json::Value>,
+        ) {
+            let section = |packages: &[&str]| -> serde_json::Map<String, serde_json::Value> {
+                packages
+                    .iter()
+                    .map(|package| {
+                        (
+                            (*package).to_owned(),
+                            serde_json::json!(installed_version(package)),
+                        )
+                    })
+                    .collect()
+            };
+            let mut production = section(self.production);
+            let development = section(self.development);
+            let mut declare = |name: &str| {
+                if !production.contains_key(name) && !development.contains_key(name) {
+                    production.insert(name.to_owned(), serde_json::json!(installed_version(name)));
+                }
+            };
+            for (name, vulnerability) in self.vulnerabilities() {
+                if vulnerability["isDirect"].as_bool() == Some(true) {
+                    declare(&name);
+                }
+            }
+            // An install nothing else encloses is one the root reached, said
+            // or not: npm has no other way to have put it there.
+            for path in self.installed().keys() {
+                if !path.contains("/node_modules/") {
+                    declare(package_at(path));
+                }
+            }
+            (production, development)
+        }
+
+        /// Every path this tree installs a package at, keyed to the package
+        /// installed there: the paths the report resolves advisories at, and
+        /// every install enclosing them, because npm nests deeper than one
+        /// level and a path nothing installs is not a tree npm produced.
+        fn installed(&self) -> std::collections::BTreeMap<String, String> {
+            let mut paths = std::collections::BTreeMap::new();
+            for (name, vulnerability) in self.vulnerabilities() {
+                for node in vulnerability["nodes"].as_array().into_iter().flatten() {
+                    let mut path = node.as_str().expect("a node path");
+                    paths.insert(path.to_owned(), name.clone());
+                    while let Some((parent, _)) = path.rsplit_once("/node_modules/") {
+                        paths.insert(parent.to_owned(), package_at(parent).to_owned());
+                        path = parent;
+                    }
+                }
+            }
+            paths
+        }
+
+        fn vulnerabilities(&self) -> Vec<(String, serde_json::Value)> {
+            // A registry failure is what npm was told, not a tree it resolved.
+            let Ok(report) = serde_json::from_str::<serde_json::Value>(&self.report) else {
+                assert!(
+                    self.report.starts_with("#stderr"),
+                    "the report is neither JSON nor a registry failure"
+                );
+                return Vec::new();
+            };
+            report["vulnerabilities"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter(|(_, vulnerability)| vulnerability["nodes"].is_array())
+                .map(|(name, vulnerability)| (name.clone(), vulnerability.clone()))
+                .collect()
+        }
+
+        /// npm resolves what it audits from the lockfile, so the lockfile is
+        /// what tells the two sides of a comparison apart. It is derived from
+        /// the report it is paired with rather than fixed: a clean tree
+        /// installs nothing, every path an advisory is resolved at exists, and
+        /// a nested install is reachable through the package it sits inside.
+        fn lockfile(&self) -> String {
+            let (production, development) = self.declared();
+            let installed = self.installed();
+            let mut packages = serde_json::Map::new();
+
+            for (path, name) in &installed {
+                let version = installed_version(name);
+                let mut entry = serde_json::json!({
+                    "version": version,
+                    "resolved": format!("https://registry.npmjs.org/{name}/-/{name}-{version}.tgz")
+                });
+                let inside: serde_json::Map<String, serde_json::Value> = installed
+                    .iter()
+                    .filter(|(nested, _)| {
+                        nested
+                            .rsplit_once("/node_modules/")
+                            .map(|(parent, _)| parent)
+                            == Some(path.as_str())
+                    })
+                    .map(|(_, child)| (child.clone(), serde_json::json!(installed_version(child))))
+                    .collect();
+                if !inside.is_empty() {
+                    entry["dependencies"] = serde_json::Value::Object(inside);
+                }
+                packages.insert(path.clone(), entry);
+            }
+            packages.insert(
+                String::new(),
+                serde_json::json!({
+                    "name": self.name,
+                    "version": "0.0.0",
+                    "dependencies": serde_json::Value::Object(production),
+                    "devDependencies": serde_json::Value::Object(development)
+                }),
+            );
+
+            serde_json::json!({
+                "name": self.name,
+                "version": "0.0.0",
+                "lockfileVersion": 3,
+                "requires": true,
+                "packages": serde_json::Value::Object(packages)
+            })
+            .to_string()
+        }
+    }
+
+    /// The package installed at a resolved path, which is the last segment
+    /// after the `node_modules` it is installed into.
+    fn package_at(path: &str) -> &str {
+        path.rsplit("/node_modules/")
+            .next()
+            .unwrap_or(path)
+            .trim_start_matches("node_modules/")
+    }
+
+    fn installed_version(package: &str) -> &'static str {
+        if package == "lodash" {
+            "4.17.15"
+        } else {
+            "1.0.0"
+        }
+    }
+
+    /// An `npm` that answers `npm audit --json` from the fixture named by the
+    /// lockfile it is asked about, and refuses anything else it is asked, so a
+    /// gate that quietly narrows what it audits cannot be served a report as
+    /// though it had asked the question the fixture answers. The vector is
+    /// checked and recorded argument by argument: joined, a single argument
+    /// `audit --json` is indistinguishable from the two the gate must pass. A
+    /// fixture marked `#stderr` is npm failing to reach the registry, which
+    /// reports what the far end said and no report at all.
+    const NPM_AUDIT_STUB: &str = r##"#!/bin/sh
+{ printf '%s\n' "$#"; [ "$#" -eq 0 ] || printf '%s\n' "$@"; } >> "$PGSHARD_AUDIT_ARGV"
+if [ "$#" -ne 2 ] || [ "$1" != audit ] || [ "$2" != --json ]; then
+  echo "the gate asked npm for $# arguments, not 'audit' '--json'" >&2
+  exit 3
+fi
+name=$(sed -n 's/.*"name": *"\([^"]*\)".*/\1/p' package-lock.json | head -n 1)
+report="$PGSHARD_AUDIT_FIXTURES/$name.json"
+if [ ! -f "$report" ]; then
+  echo "no audit fixture for '$name'" >&2
+  exit 3
+fi
+if [ "$(head -n 1 "$report")" = "#stderr" ]; then
+  tail -n +2 "$report" >&2
+  exit 1
+fi
+cat "$report"
+grep -q '"total": *0' "$report" && exit 0
+exit 1
+"##;
+
+    struct AuditScenario {
+        repository: tempfile::TempDir,
+        support: tempfile::TempDir,
+        path: String,
+        base: String,
+    }
+
+    impl AuditScenario {
+        fn new(base: &Tree<'_>, head: &Tree<'_>) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let repository = tempfile::TempDir::new().expect("temporary repository");
+            let support = tempfile::TempDir::new().expect("temporary support directory");
+            let root = repository.path();
+            let write = |tree: &Tree<'_>| {
+                std::fs::write(root.join("website/package.json"), tree.manifest())
+                    .expect("write the manifest");
+                std::fs::write(root.join("website/package-lock.json"), tree.lockfile())
+                    .expect("write the lockfile");
+            };
+            std::fs::create_dir(root.join("website")).expect("website directory");
+            write(base);
+            git_in(root, &["init", "--quiet", "--initial-branch=main"]);
+            git_in(root, &["config", "user.email", "gate@example.invalid"]);
+            git_in(root, &["config", "user.name", "gate"]);
+            git_in(root, &["add", "--all"]);
+            git_in(root, &["commit", "--quiet", "-m", "base"]);
+            let commit = git_in(root, &["rev-parse", "HEAD"]);
+            write(head);
+
+            let fixtures = support.path().join("fixtures");
+            std::fs::create_dir(&fixtures).expect("fixtures directory");
+            for tree in [base, head] {
+                std::fs::write(fixtures.join(format!("{}.json", tree.name)), &tree.report)
+                    .expect("write a fixture");
+            }
+            let stub = support.path().join("stub");
+            std::fs::create_dir(&stub).expect("stub directory");
+            std::fs::write(stub.join("npm"), NPM_AUDIT_STUB).expect("write the npm stub");
+            std::fs::set_permissions(stub.join("npm"), std::fs::Permissions::from_mode(0o755))
+                .expect("the stub is executable");
+            let path = format!("{}:{}", stub.display(), env::var("PATH").expect("PATH"));
+
+            Self {
+                repository,
+                support,
+                path,
+                base: commit,
+            }
+        }
+
+        /// The gate as CI runs it: annotating, and writing a job summary.
+        fn run(&self, arguments: &[&str]) -> Output {
+            self.invoke(arguments, true)
+        }
+
+        /// The gate as a maintainer runs it from a terminal, where an
+        /// annotation is noise rather than a record.
+        fn run_outside_actions(&self, arguments: &[&str]) -> Output {
+            self.invoke(arguments, false)
+        }
+
+        fn invoke(&self, arguments: &[&str], actions: bool) -> Output {
+            let mut gate = Command::new("node");
+            gate.arg(repository_root().join(".github/scripts/npm-audit-gate.mjs"))
+                .args(arguments)
+                .current_dir(self.repository.path())
+                .env("PATH", &self.path)
+                .env(
+                    "PGSHARD_AUDIT_FIXTURES",
+                    self.support.path().join("fixtures"),
+                )
+                .env("PGSHARD_AUDIT_ARGV", self.support.path().join("argv"))
+                .env("GITHUB_STEP_SUMMARY", self.support.path().join("summary"));
+            if actions {
+                gate.env("GITHUB_ACTIONS", "true");
+            } else {
+                gate.env_remove("GITHUB_ACTIONS");
+            }
+            gate.output().expect("run the advisory gate")
+        }
+
+        fn summary(&self) -> String {
+            std::fs::read_to_string(self.support.path().join("summary")).unwrap_or_default()
+        }
+
+        /// Every argument vector the gate handed npm. The stub records an
+        /// argument count and then the arguments, so a vector cannot be read
+        /// back as a different one that happens to join to the same line.
+        fn npm_invocations(&self) -> Vec<Vec<String>> {
+            let recorded =
+                std::fs::read_to_string(self.support.path().join("argv")).unwrap_or_default();
+            let mut lines = recorded.lines();
+            let mut invocations = Vec::new();
+            while let Some(count) = lines.next() {
+                let count: usize = count.parse().expect("the stub recorded an argument count");
+                invocations.push(lines.by_ref().take(count).map(ToOwned::to_owned).collect());
+            }
+            invocations
+        }
+    }
+
+    fn audited_the_whole_tree(scenario: &AuditScenario, times: usize) {
+        assert_eq!(
+            scenario.npm_invocations(),
+            vec![vec!["audit".to_owned(), "--json".to_owned()]; times],
+            "the gate asked npm something other than for the whole tree"
+        );
+    }
+
+    /// Every character an inline Markdown construct is built from. This is a
+    /// statement about Markdown, not a copy of what the gate escapes: a copy
+    /// would agree with the gate however the gate changed, and an escape
+    /// dropped from both halves of a mirror is a coherent-looking refactor
+    /// that retires the escape. The backslash is one of them, because escaping
+    /// by prefixing one hands whoever supplies their own the ability to
+    /// re-activate the character after it.
+    ///
+    /// Deliberately wider than the minimum: `]`, `>` and `!` begin nothing on
+    /// their own, and escaping `[` and `<` already forecloses what they finish.
+    /// Requiring them costs a backslash and removes the argument.
+    const MARKDOWN_INLINE_STARTERS: &str = "\\`*_[]<>&!~|";
+
+    /// How the gate declares its escape class, up to the members themselves.
+    const ESCAPE_CLASS_DECLARATION: &str = "const MARKDOWN_ACTIVE = /[";
+
+    /// The character class the gate escapes with, read out of its source. The
+    /// class is written as a regular expression, where a member that would
+    /// otherwise be syntax carries a backslash.
+    ///
+    /// A second declaration anywhere in the file -- commented out, in a
+    /// string, in a branch nothing reaches -- is what a reader taking the
+    /// first match reads, and it satisfies a containment check while the
+    /// declaration that runs says something else. There has to be one.
+    fn gate_escape_class() -> String {
+        let gate = include_str!("../../../.github/scripts/npm-audit-gate.mjs");
+        assert_eq!(
+            gate.matches(ESCAPE_CLASS_DECLARATION).count(),
+            1,
+            "the gate declares its escape class more than once"
+        );
+        let regex = gate
+            .split_once(ESCAPE_CLASS_DECLARATION)
+            .expect("the gate declares an escape class")
+            .1
+            .split_once("]/g;")
+            .expect("the escape class is a regular expression character class")
+            .0;
+        let mut members = String::new();
+        let mut characters = regex.chars();
+        while let Some(character) = characters.next() {
+            members.push(if character == '\\' {
+                characters.next().expect("the class ends inside an escape")
+            } else {
+                character
+            });
+        }
+        members
+    }
+
+    /// Markdown left active in the job summary, once every backslash escape is
+    /// accounted for. An image or a link is the forgery this rendering allows.
+    fn unescaped_markdown(summary: &str) -> String {
+        let mut remaining = summary.chars();
+        let mut plain = String::new();
+        while let Some(character) = remaining.next() {
+            if character == '\\' {
+                remaining.next();
+            } else {
+                plain.push(character);
+            }
+        }
+        plain.retain(|character| MARKDOWN_INLINE_STARTERS.contains(character));
+        plain
+    }
+
+    fn streams(output: &Output) -> (String, String) {
+        (
+            String::from_utf8(output.stdout.clone()).expect("the gate wrote UTF-8"),
+            String::from_utf8(output.stderr.clone()).expect("the gate wrote UTF-8"),
+        )
+    }
+
+    fn tree<'a>(name: &'a str, production: &'a [&'a str], report: String) -> Tree<'a> {
+        Tree {
+            name,
+            production,
+            development: &[],
+            report,
+        }
+    }
+
+    fn development_tree<'a>(name: &'a str, development: &'a [&'a str], report: String) -> Tree<'a> {
+        Tree {
+            name,
+            production: &[],
+            development,
+            report,
+        }
+    }
+
+    const ADVISORY_TITLE: &str = "Command Injection in lodash";
+    const ADVISORY_LINE: &str = "high lodash: Command Injection in lodash (https://github.com/advisories/GHSA-35jh-r3h4-6jhm)";
+
+    /// The gate's whole job is to fail a change that adds a severe advisory,
+    /// to say which one, and to have asked npm about the whole tree. Every way
+    /// of retiring it that leaves the file looking untouched — an early exit,
+    /// a filter inverted around its own pinned constant, a quietly narrowed
+    /// audit — is invisible to anything that only reads the source.
+    #[test]
+    fn the_advisory_gate_fails_a_change_that_introduces_an_advisory() {
+        let scenario = AuditScenario::new(
+            &tree("base", &[], clean_report()),
+            &tree(
+                "head",
+                &["lodash"],
+                advisory_report(ADVISORY_TITLE, true, &["node_modules/lodash"]),
+            ),
+        );
+        let output = scenario.run(&["--directory", "website", "--base", &scenario.base]);
+        let (stdout, stderr) = streams(&output);
+        assert!(
+            !output.status.success(),
+            "the gate passed a change that introduced a high advisory"
+        );
+        assert!(
+            stderr.contains("1 high or critical npm advisory is introduced into website"),
+            "the gate did not report the advisory it failed on: {stderr}"
+        );
+        assert!(
+            stderr.contains(ADVISORY_LINE),
+            "the gate did not name the advisory: {stderr}"
+        );
+        assert!(
+            stdout.contains(&format!("::error::{ADVISORY_LINE}")),
+            "the gate did not annotate the advisory: {stdout}"
+        );
+        // What the gate asks npm is the entire scope of the audit, and it is
+        // not visible in anything the gate writes.
+        audited_the_whole_tree(&scenario, 2);
+    }
+
+    /// The absolute audit is the whole gate on two paths that never compare
+    /// anything: the scheduled run that is meant to reach a maintainer, and
+    /// the release-authorizing dispatch, which has no predecessor to be
+    /// measured against and so audits the tree outright. Neither has a
+    /// comparison to notice going quiet.
+    #[test]
+    fn the_absolute_audit_fails_on_any_advisory_and_passes_a_clean_tree() {
+        let severe = AuditScenario::new(
+            &tree("base", &[], clean_report()),
+            &tree(
+                "head",
+                &["lodash"],
+                advisory_report(ADVISORY_TITLE, true, &["node_modules/lodash"]),
+            ),
+        );
+        let output = severe.run(&["--directory", "website", "--report"]);
+        let (stdout, stderr) = streams(&output);
+        assert!(
+            !output.status.success(),
+            "the absolute audit passed a tree with a high advisory"
+        );
+        assert!(
+            stderr.contains("1 high or critical npm advisory affects website"),
+            "the absolute audit did not report the advisory: {stderr}"
+        );
+        assert!(
+            stderr.contains(ADVISORY_LINE),
+            "the absolute audit did not name the advisory: {stderr}"
+        );
+        assert!(
+            stdout.contains(&format!("::error::{ADVISORY_LINE}")),
+            "the absolute audit did not annotate the advisory: {stdout}"
+        );
+        assert!(
+            severe.summary().contains(ADVISORY_LINE),
+            "the absolute audit wrote no job summary: {}",
+            severe.summary()
+        );
+        // The comparison is what the base-relative path skips; the audit
+        // itself is not, and a tree audited only at the head is audited once.
+        audited_the_whole_tree(&severe, 1);
+
+        // Outside Actions an annotation is noise, and suppressing it must not
+        // suppress the finding.
+        let output = severe.run_outside_actions(&["--directory", "website", "--report"]);
+        let (stdout, stderr) = streams(&output);
+        assert!(!output.status.success(), "the absolute audit passed");
+        assert!(
+            stderr.contains(ADVISORY_LINE),
+            "the finding went missing outside Actions: {stderr}"
+        );
+        assert_eq!(
+            stdout, "",
+            "the gate annotated a terminal that reads no commands: {stdout}"
+        );
+
+        let clean = AuditScenario::new(
+            &tree("base", &[], clean_report()),
+            &tree("head", &[], clean_report()),
+        );
+        let output = clean.run(&["--directory", "website", "--report"]);
+        let (stdout, stderr) = streams(&output);
+        assert!(
+            output.status.success(),
+            "the absolute audit failed a clean tree: {stderr}"
+        );
+        assert_eq!(
+            stdout, "No high or critical npm advisory affects website.\n",
+            "the absolute audit did not report a clean tree"
+        );
+        audited_the_whole_tree(&clean, 1);
+    }
+
+    /// Somebody else publishing an advisory against a tree that is already
+    /// merged is not this change's regression, and the whole point of the
+    /// comparison is that it does not block. Each of the three ways a change
+    /// widens its own exposure to that same advisory is.
+    #[test]
+    fn the_advisory_gate_blocks_only_the_exposure_this_change_adds() {
+        let reached = |direct: bool, nodes: &[&str]| advisory_report(ADVISORY_TITLE, direct, nodes);
+        let transitive = ["node_modules/widget/node_modules/lodash"];
+
+        let unchanged = AuditScenario::new(
+            &tree("base", &[], reached(false, &transitive)),
+            &tree("head", &[], reached(false, &transitive)),
+        );
+        let output = unchanged.run(&["--directory", "website", "--base", &unchanged.base]);
+        let (stdout, stderr) = streams(&output);
+        assert!(
+            output.status.success(),
+            "the gate failed a change on an advisory the base already had: {stderr}"
+        );
+        assert!(
+            stdout.contains("already affected website"),
+            "the gate did not report the pre-existing advisory: {stdout}"
+        );
+
+        let widening = |base: &Tree<'_>, head: &Tree<'_>, reason: &str| {
+            let scenario = AuditScenario::new(base, head);
+            let output = scenario.run(&["--directory", "website", "--base", &scenario.base]);
+            let (_, stderr) = streams(&output);
+            assert!(
+                !output.status.success(),
+                "the gate passed a change that widened its exposure: {reason}"
+            );
+            assert!(
+                stderr.contains(reason),
+                "the gate did not say what this change widened: {stderr}"
+            );
+        };
+        // Installed by something else this change added.
+        widening(
+            &tree("base", &[], reached(false, &transitive)),
+            &tree(
+                "head",
+                &[],
+                reached(false, &["node_modules/other/node_modules/lodash"]),
+            ),
+            "this change reaches it at node_modules/other/node_modules/lodash",
+        );
+        // Declared by the root, which is also what hoists a copy to the top of
+        // the tree beside the one already nested there.
+        widening(
+            &tree("base", &[], reached(false, &transitive)),
+            &tree(
+                "head",
+                &[],
+                reached(true, &["node_modules/lodash", transitive[0]]),
+            ),
+            "this change depends on it directly",
+        );
+        // Already declared on both sides, so npm calls it direct on both, and
+        // what moved is the section it is declared in.
+        widening(
+            &development_tree("base", &["lodash"], reached(true, &["node_modules/lodash"])),
+            &tree("head", &["lodash"], reached(true, &["node_modules/lodash"])),
+            "this change promotes it into production dependencies",
+        );
+    }
+
+    /// npm reports "the audit found nothing" and "the audit never ran" on the
+    /// same nonzero exit, and both parse as JSON. A tree nobody managed to
+    /// audit is not a tree that passed.
+    #[test]
+    fn the_advisory_gate_fails_a_tree_it_could_not_audit() {
+        let scenario = AuditScenario::new(
+            &tree("base", &[], clean_report()),
+            &tree(
+                "head",
+                &[],
+                serde_json::json!({
+                    "error": {
+                        "code": "ENETUNREACH",
+                        "summary": "request to https://registry.npmjs.org failed",
+                        "detail": ""
+                    }
+                })
+                .to_string(),
+            ),
+        );
+        let output = scenario.run(&["--directory", "website", "--base", &scenario.base]);
+        let (_, stderr) = streams(&output);
+        assert!(
+            !output.status.success(),
+            "the gate passed a tree the registry never answered for"
+        );
+        assert!(
+            stderr.contains("Cannot audit website"),
+            "the gate did not say the audit failed: {stderr}"
+        );
+
+        // What the far end said is quoted into that message, and the far end
+        // is the one part of this the repository does not write.
+        let registry = AuditScenario::new(
+            &tree("base", &[], clean_report()),
+            &tree(
+                "head",
+                &[],
+                registry_failure(
+                    "connection reset\n::error::forged by the registry\r::stop-commands::TOKEN of 100%",
+                ),
+            ),
+        );
+        let output = registry.run(&["--directory", "website", "--base", &registry.base]);
+        let (stdout, stderr) = streams(&output);
+        assert!(
+            !output.status.success(),
+            "the gate passed a tree the registry refused"
+        );
+        assert_eq!(
+            stderr.lines().count(),
+            1,
+            "the registry wrote lines of its own to standard error: {stderr:?}"
+        );
+        assert!(
+            stderr.starts_with("Cannot audit website: npm audit wrote no report:"),
+            "the gate did not say the audit failed: {stderr}"
+        );
+        assert!(
+            stderr.contains("connection reset%0A%3A%3Aerror%3A%3Aforged by the registry"),
+            "the gate dropped what the registry said instead of escaping it: {stderr}"
+        );
+        assert!(
+            stderr.contains("%0D%3A%3Astop-commands%3A%3ATOKEN of 100%25"),
+            "the gate left what the registry said active: {stderr}"
+        );
+        assert_eq!(
+            stdout
+                .lines()
+                .filter(|line| line.trim_start().starts_with("::"))
+                .count(),
+            0,
+            "the registry forged a command on standard output: {stdout:?}"
+        );
+    }
+
+    /// Every stream this gate writes an advisory title to is parsed by
+    /// something, and the title is written by somebody else. The ordinary
+    /// pull-request path is the one that prints a title to standard output as
+    /// prose, so a test that proves the annotation alone is inert proves it on
+    /// the one path where nothing could have gone wrong.
+    ///
+    /// What is asserted is the bytes the gate emits, against the workflow
+    /// command and Markdown grammars. No runner renders them here, so the
+    /// step reading them back as text is reasoned from those contracts rather
+    /// than executed.
+    #[test]
+    fn no_sink_lets_an_advisory_title_forge_a_workflow_command() {
+        // A title already carrying backslashes is the case the escaping has to
+        // survive: escaping by prefixing one re-activates whatever the gate
+        // just escaped unless the backslash is escaped too.
+        let title = "Injection\n::error::forged from the log line\r::stop-commands::TOKEN\n## Injected heading\n<img src=x onerror=alert(1)> ![pixel](https://attacker.example/p.png) [click](https://attacker.example) \\!\\[re\\](https://attacker.example/q.png) `code` *em* _em_ ~~strike~~ R&D a|b at 100%";
+        // A character the title never carries is one no mutation can be caught
+        // removing from the escape.
+        for starter in MARKDOWN_INLINE_STARTERS.chars() {
+            assert!(
+                title.contains(starter),
+                "the hostile title exercises no {starter:?}"
+            );
+        }
+        let hostile = |direct: bool, nodes: &[&str]| advisory_report(title, direct, nodes);
+        let transitive = ["node_modules/widget/node_modules/lodash"];
+
+        let commands = |stream: &str| {
+            stream
+                .lines()
+                .filter(|line| line.trim_start().starts_with("::"))
+                .count()
+        };
+        let assert_escaped = |text: &str, described: &str| {
+            assert!(text.contains("Injection%0A"), "{described}: {text}");
+            assert!(text.contains("the log line%0D"), "{described}: {text}");
+            assert!(text.contains("at 100%25"), "{described}: {text}");
+            assert!(
+                text.contains("%3A%3Aerror%3A%3Aforged from the log line"),
+                "the title was dropped instead of escaped in {described}: {text}"
+            );
+            assert!(
+                text.contains("%3A%3Astop-commands%3A%3ATOKEN"),
+                "{described}: {text}"
+            );
+        };
+
+        // An advisory the base already had: the gate warns, and prints the
+        // title to standard output as prose next to its own annotation.
+        let existing = AuditScenario::new(
+            &tree("base", &[], hostile(false, &transitive)),
+            &tree("head", &[], hostile(false, &transitive)),
+        );
+        let output = existing.run(&["--directory", "website", "--base", &existing.base]);
+        let (stdout, stderr) = streams(&output);
+        assert!(output.status.success(), "the gate failed: {stderr}");
+        assert_eq!(
+            stdout.lines().count(),
+            5,
+            "the title produced lines of its own on standard output: {stdout:?}"
+        );
+        assert_eq!(
+            commands(&stdout),
+            1,
+            "forged commands on stdout: {stdout:?}"
+        );
+        assert_eq!(stderr, "", "the gate wrote to stderr: {stderr:?}");
+        assert_escaped(&stdout, "the pre-existing standard output");
+        assert_escaped(&existing.summary(), "the pre-existing job summary");
+
+        // An advisory this change introduced: the gate annotates and lists it
+        // on standard error, and writes a second summary section.
+        let introduced = AuditScenario::new(
+            &tree("base", &[], clean_report()),
+            &tree("head", &[], hostile(true, &["node_modules/lodash"])),
+        );
+        let output = introduced.run(&["--directory", "website", "--base", &introduced.base]);
+        let (stdout, stderr) = streams(&output);
+        assert!(!output.status.success(), "the gate passed: {stdout}");
+        assert_eq!(
+            stdout.lines().count(),
+            1,
+            "the title produced lines of its own on standard output: {stdout:?}"
+        );
+        assert_eq!(
+            commands(&stdout),
+            1,
+            "forged commands on stdout: {stdout:?}"
+        );
+        assert_eq!(
+            stderr.lines().count(),
+            2,
+            "the title produced lines of its own on standard error: {stderr:?}"
+        );
+        assert_eq!(
+            commands(&stderr),
+            0,
+            "forged commands on stderr: {stderr:?}"
+        );
+        assert_escaped(&stdout, "the introduced standard output");
+        assert_escaped(&stderr, "the introduced standard error");
+        assert_escaped(&introduced.summary(), "the introduced job summary");
+
+        // The job summary is rendered Markdown: a heading the gate did not
+        // write, an element, an image GitHub's proxy fetches, or a link whose
+        // text disagrees with its target is the same forgery in another
+        // syntax.
+        for (summary, described) in [
+            (existing.summary(), "the pre-existing job summary"),
+            (introduced.summary(), "the introduced job summary"),
+        ] {
+            assert_eq!(
+                summary.lines().filter(|line| line.starts_with('#')).count(),
+                2,
+                "{described} carries a heading the gate did not write: {summary}"
+            );
+            assert_eq!(
+                unescaped_markdown(&summary),
+                "",
+                "{described} leaves Markdown active: {summary}"
+            );
+        }
+    }
+
+    /// These tests run the advisory gate itself, so the job that runs them
+    /// needs the Node the gate runs under. A runner image that happens to
+    /// carry one is not a pin, and a gate proved on a different Node from the
+    /// one CI audits with is proved about something else.
+    #[test]
+    fn the_gate_tests_run_on_the_node_the_gate_runs_on() {
+        let workflow = parsed_workflow();
+        let node_version = |job: &str| -> String {
+            workflow_job(&workflow, job)["steps"]
+                .as_sequence()
+                .expect("the job declares steps")
+                .iter()
+                .find(|step| {
+                    step["uses"]
+                        .as_str()
+                        .is_some_and(|uses| uses.starts_with("actions/setup-node@"))
+                })
+                .unwrap_or_else(|| panic!("{job} selects no Node toolchain"))["with"]
+                ["node-version"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{job} pins no Node version"))
+                .to_owned()
+        };
+        assert_eq!(
+            node_version("repository-policy"),
+            node_version("website"),
+            "the gate is proved on a different Node from the one it is run on"
+        );
     }
 }

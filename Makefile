@@ -1,10 +1,11 @@
-.PHONY: check rust-check rust-static rust-test pgwire-fuzz-static agent-target-fence-test agent-wal-generation-test catalog-test orch-catalog-test orch-slot-observer-test pgwire-postgres-test pooler-postgres-test planner-postgres-test proto-check go-check go-format-check go-generated-check docs-check actions-check public-check images release-build
+.PHONY: check rust-check rust-static rust-test pgwire-fuzz-static agent-target-fence-test agent-wal-generation-test catalog-test orch-catalog-test orch-slot-observer-test pgwire-postgres-test pooler-postgres-test planner-postgres-test proto-check go-check go-format-check go-generated-check docs-check docs-audit actions-check public-check images release-build
 
 PGSHARD_GIT_SHA ?= $(shell git rev-parse HEAD 2>/dev/null)
 PGSHARD_BUILD_VERSION ?= 0.0.0-dev+local.$(shell printf '%.12s' "$(PGSHARD_GIT_SHA)")$(shell test -z "$$(git status --porcelain --untracked-files=normal 2>/dev/null)" || printf '.dirty')
 PGSHARD_IMAGE_OUTPUT ?= artifacts/images
 PGSHARD_IMAGE_TAG ?= dev
 PGSHARD_IMAGE_TARGETS ?= ci
+PGSHARD_DOCS_AUDIT_BASE ?= origin/main
 
 check: rust-check proto-check go-check docs-check actions-check public-check
 
@@ -84,7 +85,10 @@ go-generated-check:
 docs-check:
 	cd website && npm ci
 	cd website && npm run check
-	cd website && npm audit --audit-level=high
+	node .github/scripts/npm-audit-gate.mjs --directory website $(if $(PGSHARD_DOCS_AUDIT_BASE),--base $(PGSHARD_DOCS_AUDIT_BASE),--report)
+
+docs-audit:
+	node .github/scripts/npm-audit-gate.mjs --directory website --report
 
 actions-check:
 	# actionlint v1.7.12 predates GitHub's official concurrency queue key.
