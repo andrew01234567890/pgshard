@@ -139,21 +139,21 @@ jobs:
           exists_at_head_or_base crates/pgshard-e2e/Cargo.toml && kind_exists=true
           exists_at_head_or_base benchmarks/Cargo.toml && performance_exists=true
 
-          emit_component rust "$rust_exists" '(^|/)(Cargo\.(toml|lock)|rust-toolchain(\.toml)?|[^/]+\.rs)$|^crates/|^proto/|^contracts/replication-slot-names\.json$|^deny\.toml$|^rustfmt\.toml$|^\.cargo/|^Makefile$|^\.github/workflows/'
-          emit_component postgres_agent "$postgres_agent_exists" '^crates/(pgshard-agent|pgshard-types|pgshard-version)/|^crates/pgshard-catalog/migrations/|^extensions/pgshard_fence/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^rustfmt\.toml$|^\.cargo/|^\.dockerignore$|^deploy/(docker-bake\.hcl|images/rust\.Dockerfile|images/quarantine\.pg_hba\.conf|images/replication-bootstrap-primary\.pg_hba\.conf)$|^Makefile$|^\.github/workflows/ci\.yml$'
-          emit_component catalog "$catalog_exists" '^crates/pgshard-catalog/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
-          emit_component orch_catalog "$orch_catalog_exists" '^crates/(pgshard-orch|pgshard-catalog|pgshard-types)/|^operator/internal/tuning/|^contracts/replication-slot-names\.json$|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
-          emit_component pgwire "$pgwire_exists" '^crates/pgshard-pgwire/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
-          emit_component pooler_postgres "$pooler_postgres_exists" '^crates/(pgshard-pooler|pgshard-pgwire|pgshard-catalog|pgshard-types|pgshard-version)/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
-          emit_component planner "$planner_exists" '^crates/pgshard-planner/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/workflows/'
-          emit_component proto "$proto_exists" '^buf\.yaml$|^proto/|^Makefile$|^\.github/workflows/'
-          emit_component go "$go_exists" '^operator/|^proto/|^contracts/replication-slot-names\.json$|^Makefile$|^\.github/workflows/'
-          emit_component website "$website_exists" '^website/|^docs/|^Makefile$|^\.github/workflows/'
-          emit_component ui "$ui_exists" '^ui/|^proto/|^Makefile$|^\.github/workflows/'
-          emit_component integration "$integration_exists" '^crates/|^operator/|^proto/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^\.cargo/|^Makefile$|^\.github/workflows/'
-          emit_component images "$images_exists" '^deploy/|^extensions/|^Dockerfile|/Dockerfile$|^\.dockerignore$|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^rustfmt\.toml$|^crates/|^operator/|^ui/|^Makefile$|^\.github/workflows/'
-          emit_component kind "$kind_exists" '^deploy/|^charts/|^crates/|^operator/|^ui/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^\.cargo/|^Makefile$|^\.github/workflows/'
-          emit_component performance "$performance_exists" '^benchmarks/|^crates/|^Cargo\.(toml|lock)$|^Makefile$|^\.github/workflows/'
+          emit_component rust "$rust_exists" '(^|/)(Cargo\.(toml|lock)|rust-toolchain(\.toml)?|[^/]+\.rs)$|^crates/|^proto/|^contracts/|^deny\.toml$|^rustfmt\.toml$|^\.cargo/|^Makefile$|^\.github/'
+          emit_component postgres_agent "$postgres_agent_exists" '^crates/(pgshard-agent|pgshard-types|pgshard-version)/|^crates/pgshard-catalog/migrations/|^crates/pgshard-catalog/inventory/|^crates/pgshard-catalog/testdata/|^contracts/replication-slot-names\.json$|^extensions/pgshard_fence/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^rustfmt\.toml$|^\.cargo/|^\.dockerignore$|^deploy/docker-bake\.hcl$|^deploy/images/|^Makefile$|^\.github/workflows/ci\.yml$|^\.github/scripts/'
+          emit_component catalog "$catalog_exists" '^crates/(pgshard-catalog|pgshard-types)/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/(workflows|scripts)/'
+          emit_component orch_catalog "$orch_catalog_exists" '^crates/(pgshard-orch|pgshard-catalog|pgshard-types|pgshard-version)/|^operator/internal/tuning/|^contracts/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/(workflows|scripts)/'
+          emit_component pgwire "$pgwire_exists" '^crates/pgshard-pgwire/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/(workflows|scripts)/'
+          emit_component pooler_postgres "$pooler_postgres_exists" '^crates/(pgshard-pooler|pgshard-pgwire|pgshard-catalog|pgshard-types|pgshard-version)/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/(workflows|scripts)/'
+          emit_component planner "$planner_exists" '^crates/(pgshard-planner|pgshard-catalog|pgshard-types)/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/(workflows|scripts)/'
+          emit_component proto "$proto_exists" '^buf\.yaml$|^proto/|^Makefile$|^\.github/(workflows|scripts)/'
+          emit_component go "$go_exists" '^operator/|^proto/|^contracts/|^Makefile$|^\.github/(workflows|scripts)/'
+          emit_component website "$website_exists" '^website/|^docs/|^Makefile$|^\.github/(workflows|scripts)/'
+          emit_component ui "$ui_exists" '^ui/|^proto/|^Makefile$|^\.github/(workflows|scripts)/'
+          emit_component integration "$integration_exists" '^crates/|^operator/|^proto/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^\.cargo/|^Makefile$|^\.github/(workflows|scripts)/'
+          emit_component images "$images_exists" '^deploy/|^extensions/|^Dockerfile|/Dockerfile$|^\.dockerignore$|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^rustfmt\.toml$|^crates/|^operator/|^ui/|^Makefile$|^\.github/(workflows|scripts)/'
+          emit_component kind "$kind_exists" '^deploy/|^charts/|^crates/|^operator/|^ui/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^\.cargo/|^Makefile$|^\.github/(workflows|scripts)/'
+          emit_component performance "$performance_exists" '^benchmarks/|^crates/|^Cargo\.(toml|lock)$|^Makefile$|^\.github/(workflows|scripts)/'
           current_website_exists=false
           [[ -f website/package.json ]] && current_website_exists=true
           echo "website_exists=${current_website_exists}" >> "$GITHUB_OUTPUT"
