@@ -49,8 +49,50 @@ use crate::postgres_generation::PostgresGenerationError;
 /// materialized catalog can be treated as usable.
 #[must_use = "dropping the materialization handoff closes its private watch"]
 pub struct MaterializedCatalogHandoff {
-    #[allow(dead_code, reason = "retained for the later serving-activation stage")]
     receiver: watch::Receiver<Option<Arc<MaterializedCatalog>>>,
+}
+
+impl MaterializedCatalogHandoff {
+    /// Commits `action` while a materialization proof is current, holding that
+    /// observation across it.
+    ///
+    /// There is deliberately no way to ask whether a proof exists and then act
+    /// on the answer. Asking releases the observation before the action runs,
+    /// and the binding can withdraw in between; moving the question closer to
+    /// the action shortens that interval without removing it. Here the
+    /// observation is held for the duration, and a withdrawal is a
+    /// `send_replace` that must take the same lock, so it waits rather than
+    /// interleaving.
+    ///
+    /// `action` is synchronous by type: it cannot await while a withdrawal is
+    /// blocked behind it. That bounds what this guard is worth. It makes a
+    /// *local* decision safe — deciding to dispatch, recording an intent — and
+    /// it does not make an external effect safe. An effect that outlives the
+    /// call has to be authorized at its own linearization point: for catalog
+    /// writes that is the generation fence, and for the serving policy it is
+    /// the reload itself, which must recheck at the moment it dispatches.
+    ///
+    /// Returns `None` having run nothing when no proof is current.
+    #[allow(dead_code, reason = "the serving-preparation stage is the consumer")]
+    pub(crate) fn commit_current<T>(
+        &self,
+        action: impl FnOnce(&MaterializedCatalog) -> T,
+    ) -> Option<T> {
+        // Taken before the closure check so a sender that closes cannot also
+        // replace the value about to be read.
+        let current = self.receiver.borrow();
+        if self.receiver.has_changed().is_err() {
+            return None;
+        }
+        let proof = current.as_ref()?;
+        // A published proof is not a current capability. The supervisor
+        // retracts asynchronously, so between the binding withdrawing and the
+        // retraction landing the proof is still here and means nothing.
+        if !still_bound(&proof.binding, &proof.bound) {
+            return None;
+        }
+        Some(action(proof))
+    }
 }
 
 /// Proof that the catalog held the declared state while this exact runtime
@@ -59,8 +101,12 @@ pub struct MaterializedCatalogHandoff {
 pub(crate) struct MaterializedCatalog {
     /// Retained so the proof cannot outlive the session, authority, and
     /// incarnation evidence it was established against.
-    #[allow(dead_code, reason = "retained evidence; the consuming stage reads it")]
     bound: Arc<ValidatedCatalogRuntime>,
+    /// Retained so committing can observe the binding directly. A published
+    /// proof is not the same claim as a current capability: retraction is
+    /// asynchronous, so the proof outlives the capability for as long as the
+    /// supervisor takes to be scheduled.
+    binding: watch::Receiver<Option<Arc<ValidatedCatalogRuntime>>>,
 }
 
 /// Starts the materialization stage against the runtime binding's output.
@@ -181,6 +227,7 @@ fn publish_if_current(
     }
     output.send_replace(Some(Arc::new(MaterializedCatalog {
         bound: Arc::clone(bound),
+        binding: runtime.clone(),
     })));
     true
 }
@@ -330,6 +377,62 @@ mod tests {
             !still_bound(&receiver, &bound),
             "a capability outlived the binding that published it"
         );
+    }
+
+    fn proof_is_still_published(handoff: &MaterializedCatalogHandoff) -> bool {
+        handoff.receiver.borrow().is_some()
+    }
+
+    /// The handoff is how a consumer uses a proof, and it must not offer any
+    /// way to learn a proof exists without acting under that same observation.
+    #[tokio::test]
+    async fn the_handoff_commits_only_while_a_proof_is_current() {
+        let (runtime, _keep) = watch::channel(None);
+        let (output, receiver) = watch::channel(None);
+        let handoff = MaterializedCatalogHandoff { receiver };
+        tokio::spawn(supervise(runtime.subscribe(), output, |_, _| async {
+            Ok(())
+        }));
+
+        // No proof yet: the action must not run at all, not merely be ignored.
+        let mut ran = false;
+        assert_eq!(
+            handoff.commit_current(|_| {
+                ran = true;
+            }),
+            None
+        );
+        assert!(!ran, "the action ran with no proof current");
+
+        let bound = capability();
+        runtime.send_replace(Some(Arc::clone(&bound)));
+        settle().await;
+        assert_eq!(
+            handoff.commit_current(|proof| std::ptr::from_ref(&*proof.bound)),
+            Some(std::ptr::from_ref::<ValidatedCatalogRuntime>(&bound)),
+            "the action was not handed the proof's own capability"
+        );
+
+        // Withdrawn, and the supervisor has NOT yet been scheduled to retract:
+        // the proof is still published, so this is the window a consumer can
+        // observe. Committing must refuse anyway.
+        // Deliberately NOT settled: the supervisor has not run, so the proof
+        // is still published. This is the window a consumer can observe, and
+        // it is the whole reason committing checks the binding rather than
+        // the proof's presence.
+        runtime.send_replace(None);
+        assert!(
+            proof_is_still_published(&handoff),
+            "the test did not reach the window it describes"
+        );
+        let mut ran_after = false;
+        assert_eq!(
+            handoff.commit_current(|_| {
+                ran_after = true;
+            }),
+            None
+        );
+        assert!(!ran_after, "the action ran after the proof was retracted");
     }
 
     #[tokio::test]
