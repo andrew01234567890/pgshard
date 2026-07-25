@@ -105,11 +105,14 @@ type PgShardClusterSpec struct {
 	// +kubebuilder:default=Synchronous
 	Durability DurabilityMode `json:"durability,omitempty"`
 
-	PostgreSQL    PostgreSQLSpec    `json:"postgresql"`
-	Storage       StorageSpec       `json:"storage"`
-	Pooler        PoolerSpec        `json:"pooler,omitempty"`
-	Services      ServiceSet        `json:"services,omitempty"`
-	Backup        BackupSpec        `json:"backup"`
+	PostgreSQL PostgreSQLSpec `json:"postgresql"`
+	Storage    StorageSpec    `json:"storage"`
+	// +kubebuilder:default={}
+	Pooler PoolerSpec `json:"pooler,omitempty"`
+	// +kubebuilder:default={}
+	Services ServiceSet `json:"services,omitempty"`
+	Backup   BackupSpec `json:"backup"`
+	// +kubebuilder:default={}
 	Observability ObservabilitySpec `json:"observability,omitempty"`
 
 	// Databases declares immutable genesis database topologies. Database
@@ -232,9 +235,15 @@ func (spec PgShardClusterSpec) DatabaseTopologySHA256() string {
 }
 
 type PoolerSpec struct {
+	// An omitted scaling block means the documented autoscaling defaults, so it
+	// defaults to a complete HPA configuration rather than to an empty object
+	// that would then fail validation for a missing hpa. An explicit block is
+	// left exactly as written, so Fixed mode is unaffected.
+	// +kubebuilder:default={mode: "HPA", hpa: {}}
 	Scaling PoolerScaling `json:"scaling,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="self.mode == 'HPA' ? has(self.hpa) && !has(self.fixed) : has(self.fixed) && !has(self.hpa)",message="hpa is required and fixed forbidden when mode is HPA; fixed is required and hpa forbidden when mode is Fixed"
 type PoolerScaling struct {
 	// +kubebuilder:validation:Enum=HPA;Fixed
 	// +kubebuilder:default=HPA
@@ -264,9 +273,12 @@ type FixedScaling struct {
 }
 
 type ServiceSet struct {
+	// +kubebuilder:default={}
 	ReadWrite ServiceTemplate `json:"rw,omitempty"`
-	ReadOnly  ServiceTemplate `json:"ro,omitempty"`
-	Read      ServiceTemplate `json:"r,omitempty"`
+	// +kubebuilder:default={}
+	ReadOnly ServiceTemplate `json:"ro,omitempty"`
+	// +kubebuilder:default={}
+	Read ServiceTemplate `json:"r,omitempty"`
 }
 
 type ServiceTemplate struct {
