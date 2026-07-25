@@ -1011,12 +1011,14 @@ func assertFencingNamespaceLabelImmutable(t *testing.T, ctx context.Context, kub
 		{name: "status subresource", update: func(namespace *corev1.Namespace) error { return kubeClient.Status().Update(ctx, namespace) }},
 	} {
 		t.Run("namespace label is immutable through "+test.name, func(t *testing.T) {
-			current := &corev1.Namespace{}
-			if err := kubeClient.Get(ctx, types.NamespacedName{Name: name}, current); err != nil {
-				t.Fatal(err)
-			}
-			delete(current.Labels, podfence.NamespaceLabel)
-			err := test.update(current)
+			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				current := &corev1.Namespace{}
+				if err := kubeClient.Get(ctx, types.NamespacedName{Name: name}, current); err != nil {
+					return err
+				}
+				delete(current.Labels, podfence.NamespaceLabel)
+				return test.update(current)
+			})
 			if !apierrors.IsForbidden(err) || !strings.Contains(err.Error(), "immutable once PostgreSQL Pod fencing is enabled") {
 				t.Fatalf("fencing namespace label removal error = %v, want webhook denial", err)
 			}
