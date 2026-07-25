@@ -1,0 +1,28 @@
+name: Dependency advisories
+
+# Advisories are published against dependency trees that are already merged, so
+# they are not a property of any change under test. This workflow is where they
+# surface: it fails on the default branch, which notifies the maintainers,
+# without gating a single pull request or the release of green main history.
+on:
+  schedule:
+    - cron: "43 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  npm:
+    name: npm advisories / website
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+      - name: Report documentation dependency advisories
+        run: make docs-audit
