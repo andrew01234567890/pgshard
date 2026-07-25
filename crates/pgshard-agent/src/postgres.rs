@@ -429,12 +429,20 @@ impl PostgresConfig {
         fast_shutdown_timeout: Duration,
         immediate_shutdown_timeout: Duration,
     ) -> Result<Self, PostgresConfigError> {
-        if (role == PostgresRuntimeRole::ReplicationStandby) != standby.is_some() {
+        let requires_standby_upstream = match role {
+            PostgresRuntimeRole::ReplicationStandby => true,
+            PostgresRuntimeRole::Quarantine | PostgresRuntimeRole::ReplicationBootstrapPrimary => {
+                false
+            }
+        };
+        if requires_standby_upstream != standby.is_some() {
             return Err(PostgresConfigError::InvalidStandbyComposition);
         }
-        if role != PostgresRuntimeRole::ReplicationBootstrapPrimary
-            && generation_durability != GenerationDurability::Local
-        {
+        let permits_durable_generation = match role {
+            PostgresRuntimeRole::ReplicationBootstrapPrimary => true,
+            PostgresRuntimeRole::Quarantine | PostgresRuntimeRole::ReplicationStandby => false,
+        };
+        if !permits_durable_generation && generation_durability != GenerationDurability::Local {
             return Err(PostgresConfigError::InvalidGenerationDurabilityComposition);
         }
         validate_generation_durability(&generation_durability)
@@ -528,15 +536,28 @@ impl PostgresConfig {
     /// Returns whether starting this role requires writable-Lease authority.
     #[must_use]
     pub(crate) fn requires_writable_authority(&self) -> bool {
-        self.role == PostgresRuntimeRole::ReplicationBootstrapPrimary
+        match self.role {
+            PostgresRuntimeRole::ReplicationBootstrapPrimary => true,
+            PostgresRuntimeRole::Quarantine | PostgresRuntimeRole::ReplicationStandby => false,
+        }
     }
 
     pub(crate) fn forbids_writable_authority(&self) -> bool {
-        self.role == PostgresRuntimeRole::ReplicationStandby
+        match self.role {
+            PostgresRuntimeRole::ReplicationStandby => true,
+            PostgresRuntimeRole::Quarantine | PostgresRuntimeRole::ReplicationBootstrapPrimary => {
+                false
+            }
+        }
     }
 
     pub(crate) fn is_replication_standby(&self) -> bool {
-        self.role == PostgresRuntimeRole::ReplicationStandby
+        match self.role {
+            PostgresRuntimeRole::ReplicationStandby => true,
+            PostgresRuntimeRole::Quarantine | PostgresRuntimeRole::ReplicationBootstrapPrimary => {
+                false
+            }
+        }
     }
 
     fn standby_member_slot_name(&self) -> Option<&str> {
@@ -2412,34 +2433,37 @@ where
     F: Future<Output = PostgresStopMode>,
     G: Fn() -> PostgresStartDecision,
 {
-    if config.is_replication_standby() {
-        return supervise_replication_standby(
-            state,
-            process,
-            pidfd,
-            process_group,
-            config,
-            shutdown.as_mut(),
-        )
-        .await;
-    }
-    if config.role == PostgresRuntimeRole::ReplicationBootstrapPrimary {
-        let generation = source_generation
-            .expect("replication bootstrap source always has writable generation authority");
-        return supervise_replication_source(
-            state,
-            process,
-            pidfd,
-            process_group,
-            config,
-            shutdown.as_mut(),
-            generation,
-            startup_guard,
-            authority_deadline,
-            target_fence,
-            catalog_runtime,
-        )
-        .await;
+    match config.role {
+        PostgresRuntimeRole::ReplicationStandby => {
+            return supervise_replication_standby(
+                state,
+                process,
+                pidfd,
+                process_group,
+                config,
+                shutdown.as_mut(),
+            )
+            .await;
+        }
+        PostgresRuntimeRole::ReplicationBootstrapPrimary => {
+            let generation = source_generation
+                .expect("replication bootstrap source always has writable generation authority");
+            return supervise_replication_source(
+                state,
+                process,
+                pidfd,
+                process_group,
+                config,
+                shutdown.as_mut(),
+                generation,
+                startup_guard,
+                authority_deadline,
+                target_fence,
+                catalog_runtime,
+            )
+            .await;
+        }
+        PostgresRuntimeRole::Quarantine => {}
     }
     if let Some(generation) = source_generation {
         return supervise_writable_quarantine(
@@ -4243,9 +4267,13 @@ fn validate_recovery_state(
     expected_mount_id: u64,
     role: PostgresRuntimeRole,
 ) -> Result<Option<FileSnapshot>, PostgresError> {
+    let expects_standby_signal = match role {
+        PostgresRuntimeRole::ReplicationStandby => true,
+        PostgresRuntimeRole::Quarantine | PostgresRuntimeRole::ReplicationBootstrapPrimary => false,
+    };
     let standby_signal_path = data_dir.join("standby.signal");
     let standby_signal = match fs::symlink_metadata(&standby_signal_path) {
-        Ok(_) if role == PostgresRuntimeRole::ReplicationStandby => {
+        Ok(_) if expects_standby_signal => {
             let metadata = strict_metadata("standby.signal", &standby_signal_path)?;
             validate_owned_regular_file(
                 "standby.signal",
@@ -4270,7 +4298,7 @@ fn validate_recovery_state(
             });
         }
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            if role == PostgresRuntimeRole::ReplicationStandby {
+            if expects_standby_signal {
                 return Err(PostgresError::StandbySignalMissing {
                     path: standby_signal_path,
                 });
