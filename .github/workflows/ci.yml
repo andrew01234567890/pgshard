@@ -894,6 +894,29 @@ jobs:
             --namespace pgshard-system \
             deployment/pgshard-controller-manager \
             --timeout=180s
+      # This job is now the first to create a PostgreSQL cluster on a cold
+      # KIND node; the eight controller tests used to do that first. Prove the
+      # control plane is actually serving before switching composition, so an
+      # agent that cannot read its Lease is a real finding rather than a race
+      # against a still-starting API server.
+      - name: Wait for the control plane to settle
+        run: |
+          set -euo pipefail
+          kubectl wait --for=condition=Ready nodes --all --timeout=120s
+          kubectl wait --for=condition=Ready pods --all \
+            --namespace kube-system --timeout=180s
+          for attempt in $(seq 1 30); do
+            if kubectl get --raw='/readyz?verbose' >/dev/null 2>&1; then
+              break
+            fi
+            if (( attempt == 30 )); then
+              echo "API server did not report ready" >&2
+              kubectl get --raw='/readyz?verbose' || true
+              exit 1
+            fi
+            sleep 2
+          done
+          kubectl auth can-i --list --namespace pgshard-system >/dev/null
       - name: Select the non-serving agent quarantine composition
         run: |
           mapfile -t previous_manager_pods < <(
