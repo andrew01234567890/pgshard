@@ -2114,10 +2114,19 @@ mod tests {
                 name
             })
             .collect();
+        let detect = detector.join("\n");
         for name in validated {
             assert!(
                 declared.contains(name),
                 "the gate validates {name}, which the detector does not declare as an output"
+            );
+            // A declared output the detect step never writes renders empty, so
+            // the gate fails closed on every run. That is loud rather than
+            // dangerous, but it is cheaper to catch here.
+            assert!(
+                detect.contains(&format!("emit_component {name} "))
+                    || detect.contains(&format!("{name}=")),
+                "the detector declares {name} but never emits it"
             );
         }
     }
