@@ -25,8 +25,9 @@
 //!
 //! Withdrawal of a proof is likewise asynchronous — this supervisor has to be
 //! scheduled to retract it — so observing a published proof is not by itself
-//! authorization. A consumer must revalidate with [`MaterializedCatalog::is_current`]
-//! immediately before every action it authorizes.
+//! authorization. [`MaterializedCatalog::authorize`] is the only way to use
+//! one, and it holds its observation across the action rather than reporting
+//! it and letting the caller act afterwards.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -55,24 +56,41 @@ pub(crate) struct MaterializedCatalog {
     /// Retained so the proof cannot outlive the session, authority, and
     /// incarnation evidence it was established against.
     bound: Arc<ValidatedCatalogRuntime>,
-    /// Retained so a consumer can settle that question itself rather than
+    /// Retained so authorization observes the binding directly rather than
     /// trusting that this proof has already been retracted.
     binding: watch::Receiver<Option<Arc<ValidatedCatalogRuntime>>>,
 }
 
 impl MaterializedCatalog {
-    /// Whether the capability this proof was established against is still the
-    /// current one.
+    /// Runs `action` only while the capability this proof rests on is current.
     ///
-    /// Retraction is asynchronous: the binding withdraws its capability
-    /// immediately, but this proof is only retracted once the supervisor is
-    /// scheduled. A consumer that acts on having *observed* a proof therefore
-    /// acts on a capability that may already be gone. This is the check that
-    /// closes that window, and it must be made immediately before every action
-    /// the proof authorizes, not once when the proof is first seen.
+    /// There is deliberately no method that merely *reports* currency. A
+    /// consumer that asked and then acted would have released its observation
+    /// before acting, and the binding could withdraw in between; moving the
+    /// check earlier only shortens that interval. Here the observation is held
+    /// across `action`, and a withdrawal is a `send_replace` that must take the
+    /// same lock, so it waits rather than interleaving.
+    ///
+    /// `action` is therefore synchronous by type: it cannot await, and it must
+    /// not block, because a withdrawal is blocked for its duration. Anything
+    /// with an external side effect needs authorization at that effect's own
+    /// linearization point — for catalog writes that is the generation fence,
+    /// not this guard.
+    ///
+    /// Returns `None` when the capability is gone, having run nothing.
     #[allow(dead_code, reason = "the serving-activation stage is the consumer")]
-    pub(crate) fn is_current(&self) -> bool {
-        still_bound(&self.binding, &self.bound)
+    pub(crate) fn authorize<T>(
+        &self,
+        action: impl FnOnce(&ValidatedCatalogRuntime) -> T,
+    ) -> Option<T> {
+        // Taken before the closure check so a sender that closes cannot also
+        // replace the value we are about to read.
+        let current = self.binding.borrow();
+        if self.binding.has_changed().is_err() {
+            return None;
+        }
+        let current = current.as_ref()?;
+        Arc::ptr_eq(current, &self.bound).then(|| action(current))
     }
 }
 
@@ -336,13 +354,18 @@ mod tests {
     /// capability still has a published proof. The proof has to be able to
     /// answer for itself inside that window.
     #[tokio::test]
-    async fn a_proof_reports_it_is_stale_before_it_has_been_retracted() {
+    async fn a_proof_refuses_to_authorize_before_it_has_been_retracted() {
         let (runtime, _keep) = watch::channel(None);
         let proof = start(&runtime, |_, _| async { Ok(()) });
-        runtime.send_replace(Some(capability()));
+        let bound = capability();
+        runtime.send_replace(Some(Arc::clone(&bound)));
         settle().await;
         let published = proof.borrow().clone().expect("the catalog was proved");
-        assert!(published.is_current(), "a live proof reported itself stale");
+        assert_eq!(
+            published.authorize(std::ptr::from_ref),
+            Some(std::ptr::from_ref::<ValidatedCatalogRuntime>(&bound)),
+            "authorization did not hand the action the capability it authorized"
+        );
 
         // No yield: the supervisor has not run, so the proof is still the
         // published one. That is exactly the window a consumer can observe.
@@ -351,9 +374,10 @@ mod tests {
             proof.borrow().is_some(),
             "the retraction was synchronous, so this test proves nothing"
         );
-        assert!(
-            !published.is_current(),
-            "a proof whose capability was withdrawn still reported itself current"
+        assert_eq!(
+            published.authorize(|_| "ran"),
+            None,
+            "a proof whose capability was withdrawn still authorized an action"
         );
     }
 
