@@ -714,31 +714,13 @@ jobs:
         run: kind delete cluster --name pgshard-operator
 
   operator-kind-manager:
-    name: Operator KIND manager smoke / ${{ matrix.group }}
+    name: Operator KIND manager smoke
     needs: changes
     if: >-
       needs.changes.outputs.go == 'true' ||
       needs.changes.outputs.images == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    strategy:
-      # Every leg builds its own images and cluster, so one failing leg must
-      # not cancel the diagnostics of the others.
-      fail-fast: false
-      matrix:
-        include:
-          - group: admission
-            package: ./internal/controller
-            tests: '^TestKIND(AdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec|AdmissionRemainsAvailableDuringCompatibleManagerRestart)$'
-          - group: reconciliation
-            package: ./internal/controller
-            tests: '^TestKIND(ManagerReconcilesFailClosedDevelopmentCluster|RestoreTopologyMismatchIsRejectedBeforeMutation|ManagerRejectsPostgreSQLRuntimeChange)$'
-          - group: postgresql
-            package: ./internal/controller
-            tests: '^TestKIND(ManagerRunsSingleMemberPostgreSQL18Primaries|ManagerDeletePolicyReleasesBoundPostgreSQLPVC|ManagerRetainPolicyReleasesExplicitlyDeletingPostgreSQLPVC)$'
-          - group: bootstrap
-            package: ./internal/resources
-            tests: '^TestPostgreSQLBootstrapDockerRecoveryAndConflict$'
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -811,89 +793,11 @@ jobs:
           PGSHARD_POSTGRES_BOOTSTRAP_IMAGE: pgshard/postgres-agent:dev
         run: |
           go test -race -count=1 -timeout=30m \
-            -run '${{ matrix.tests }}' \
-            ${{ matrix.package }}
-      - name: Capture manager diagnostics
-        if: failure()
-        run: |
-          kubectl get pods,deployments,statefulsets,leases --all-namespaces --show-labels
-          kubectl logs --namespace pgshard-system deployment/pgshard-controller-manager --all-containers --tail=200 || true
-      - name: Delete disposable Kubernetes cluster
-        if: always()
-        run: kind delete cluster --name pgshard-manager
-
-  operator-kind-quarantine:
-    name: Operator KIND agent quarantine
-    needs: changes
-    if: >-
-      needs.changes.outputs.go == 'true' ||
-      needs.changes.outputs.images == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    steps:
-      - name: Check out source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: operator/go.mod
-          cache-dependency-path: operator/go.sum
-      - name: Set up local-image Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-        with:
-          cache-binary: false
-      - name: Build manager smoke images without publishing
-        env:
-          PGSHARD_BUILD_VERSION: 0.0.0-dev+ci.${{ github.sha }}
-          PGSHARD_GIT_SHA: ${{ github.sha }}
-          PGSHARD_IMAGE_OUTPUT: artifacts/images
-          PGSHARD_IMAGE_TAG: dev
-          PGSHARD_IMAGE_TARGETS: operator orchestrator pooler postgres-agent
-        shell: bash
-        run: |
-          set -euo pipefail
-          make images
-          for component in operator orchestrator pooler postgres-agent; do
-            docker load --input "artifacts/images/pgshard-${component}.tar"
-            image="pgshard/${component}:dev"
-            test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image")" = "$PGSHARD_GIT_SHA"
-            test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$image")" = "$PGSHARD_BUILD_VERSION"
-          done
-      - name: Create disposable Kubernetes cluster
-        run: |
-          go install sigs.k8s.io/kind@v0.32.0
-          kind create cluster \
-            --name pgshard-manager \
-            --image kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5 \
-            --wait 90s
-          test "$(kubectl version --output=json | jq --raw-output '.serverVersion.minor')" = "36"
-          # Pull the digest through the node's CRI. Importing this image from
-          # Docker's containerd store can leave KIND with a transient source
-          # alias that kubelet cannot resolve when it creates a container.
-          readonly postgres_image="docker.io/library/postgres:18@sha256:32ca0af8e77bfb8c6610c488e4691f83f972a3e9e64d3b02facf3ab111ad5500"
-          for attempt in 1 2 3 4; do
-            if docker exec pgshard-manager-control-plane crictl pull "$postgres_image"; then
-              break
-            fi
-            if (( attempt == 4 )); then
-              echo "failed to pull the pinned PostgreSQL image after ${attempt} attempts" >&2
-              exit 1
-            fi
-            sleep $((attempt * 5))
-          done
-          kind load docker-image \
-            pgshard/operator:dev \
-            pgshard/orchestrator:dev \
-            pgshard/pooler:dev \
-            pgshard/postgres-agent:dev \
-            --name pgshard-manager
-      - name: Install the self-managed admission manager
-        run: |
-          kubectl apply --server-side --field-manager=pgshard-ci -k operator/config/admission
-          kubectl rollout status \
-            --namespace pgshard-system \
-            deployment/pgshard-controller-manager \
-            --timeout=180s
+            -run '^TestKIND(AdmissionWebhooksUseManagedTLSAndRejectUnsafeSpec|AdmissionRemainsAvailableDuringCompatibleManagerRestart|ManagerReconcilesFailClosedDevelopmentCluster|RestoreTopologyMismatchIsRejectedBeforeMutation|ManagerRunsSingleMemberPostgreSQL18Primaries|ManagerRejectsPostgreSQLRuntimeChange|ManagerDeletePolicyReleasesBoundPostgreSQLPVC|ManagerRetainPolicyReleasesExplicitlyDeletingPostgreSQLPVC)$' \
+            ./internal/controller
+          go test -race -count=1 -timeout=10m \
+            -run '^TestPostgreSQLBootstrapDockerRecoveryAndConflict$' \
+            ./internal/resources
       - name: Select the non-serving agent quarantine composition
         run: |
           mapfile -t previous_manager_pods < <(
@@ -1804,7 +1708,6 @@ jobs:
       - go-operator
       - operator-kind
       - operator-kind-manager
-      - operator-kind-quarantine
       - website
       - ui
       - integration
@@ -1868,7 +1771,6 @@ jobs:
             go-operator=${{ needs.go-operator.result }}=${{ needs.changes.outputs.go == 'true' }}
             operator-kind=${{ needs.operator-kind.result }}=${{ needs.changes.outputs.go == 'true' }}
             operator-kind-manager=${{ needs.operator-kind-manager.result }}=${{ needs.changes.outputs.go == 'true' || needs.changes.outputs.images == 'true' }}
-            operator-kind-quarantine=${{ needs.operator-kind-quarantine.result }}=${{ needs.changes.outputs.go == 'true' || needs.changes.outputs.images == 'true' }}
             website=${{ needs.website.result }}=${{ needs.changes.outputs.website == 'true' || (github.event_name != 'pull_request' && needs.changes.outputs.website_exists == 'true') }}
             ui=${{ needs.ui.result }}=${{ needs.changes.outputs.ui == 'true' }}
             integration=${{ needs.integration.result }}=${{ needs.changes.outputs.integration == 'true' }}
