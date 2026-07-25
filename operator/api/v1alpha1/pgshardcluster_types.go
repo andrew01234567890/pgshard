@@ -156,8 +156,13 @@ type StorageSpec struct {
 // +kubebuilder:validation:XValidation:rule="!(self.name in ['postgres', 'shardschema', 'template0', 'template1'])",message="database name is reserved by PostgreSQL or pgshard"
 // +kubebuilder:validation:XValidation:rule="self == oldSelf || (!has(oldSelf.shards) && !has(oldSelf.cells) && has(self.shards) && has(self.cells) && self.shards == size(self.cells) && self.cells.all(cell, cell == self.cells.indexOf(cell)))",message="database topology is immutable except for exact materialization of legacy defaults"
 type DatabaseTemplate struct {
+	// Name is the logical database name. Database genesis SQL is constructed
+	// from it, so it must be a DNS-1123 label. The pattern restates the
+	// admission webhook's check so the API server enforces the grammar
+	// structurally, whether or not the webhook is reachable.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	Name string `json:"name"`
 
 	// Shards is this database's logical shard count. Zero is defaulted to the

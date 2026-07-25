@@ -8,11 +8,14 @@ import (
 	"flag"
 	"fmt"
 	"maps"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -210,6 +213,233 @@ func TestPlanIsDeterministicAndWiresGeneratedConfiguration(t *testing.T) {
 		}
 		assertOwned(t, item, cluster)
 	}
+}
+
+func TestRenderedPostgreSQLConfigLexesUnderServerGrammar(t *testing.T) {
+	t.Parallel()
+	// Go's strconv accepts float spellings the server's configuration lexer
+	// splits into two tokens, and ParseConfigFp's bail_out makes that a FATAL
+	// at postmaster startup, so every accepted override must reach
+	// postgresql.conf in a spelling this grammar takes as one value. Lexing is
+	// not sufficient on its own: a subnormal renders as a flawless REAL that
+	// strtod then underflows on, so parse_real rejects it and the postmaster
+	// bails out anyway. Those are refused at admission instead.
+	spellings := map[string]struct {
+		override map[string]string
+		rendered string
+		refused  bool
+	}{
+		"subnormal float":           {override: map[string]string{"checkpoint_completion_target": "1e-320"}, refused: true},
+		"smallest subnormal":        {override: map[string]string{"autovacuum_vacuum_scale_factor": "5e-324"}, refused: true},
+		"exact subnormal expansion": {override: map[string]string{"autovacuum_analyze_scale_factor": strconv.FormatFloat(math.SmallestNonzeroFloat64, 'f', 1074, 64)}, refused: true},
+		"smallest normal":           {override: map[string]string{"checkpoint_completion_target": "2.2250738585072014e-308"}, rendered: "checkpoint_completion_target = 0." + strings.Repeat("0", 307) + "22250738585072014\n"},
+		"hexadecimal float":         {override: map[string]string{"checkpoint_completion_target": "0x1p-1"}, rendered: "checkpoint_completion_target = 0.5\n"},
+		"bare exponent":             {override: map[string]string{"random_page_cost": "1e1"}, rendered: "random_page_cost = 10\n"},
+		"separated float":           {override: map[string]string{"random_page_cost": "1_0.5"}, rendered: "random_page_cost = 10.5\n"},
+		"separated integer":         {override: map[string]string{"seq_page_cost": "1_0"}, rendered: "seq_page_cost = 10\n"},
+		"negative exponent":         {override: map[string]string{"autovacuum_vacuum_scale_factor": "1e-7"}, rendered: "autovacuum_vacuum_scale_factor = 0.0000001\n"},
+		"trailing point":            {override: map[string]string{"seq_page_cost": "5."}, rendered: "seq_page_cost = 5\n"},
+		"negative zero":             {override: map[string]string{"autovacuum_analyze_scale_factor": "-0.0"}, rendered: "autovacuum_analyze_scale_factor = -0\n"},
+		"upper hexadecimal":         {override: map[string]string{"checkpoint_completion_target": "0X1P-1"}, rendered: "checkpoint_completion_target = 0.5\n"},
+		"signed integer":            {override: map[string]string{"default_statistics_target": "+200"}, rendered: "default_statistics_target = 200\n"},
+		"zero padded integer":       {override: map[string]string{"effective_io_concurrency": "0200"}, rendered: "effective_io_concurrency = 200\n"},
+	}
+	for name, testCase := range spellings {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			cluster := testCluster()
+			cluster.Spec.PostgreSQL.Parameters = testCase.override
+			plan, err := Plan(cluster, DefaultImages())
+			if testCase.refused {
+				if err == nil {
+					t.Fatalf("spelling %#v was admitted, and PostgreSQL refuses it after the configuration is already rendered", testCase.override)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("spelling %#v was refused at admission, so it can no longer reach postgresql.conf: %v", testCase.override, err)
+			}
+			contents := postgresqlConfigMap(t, plan, cluster.Name).Data["postgresql.conf"]
+			if err := parseGUCConfiguration(contents); err != nil {
+				t.Fatalf("PostgreSQL would FATAL on the rendered configuration: %v\n%s", err, contents)
+			}
+			if !strings.Contains(contents, testCase.rendered) {
+				t.Fatalf("rendered value is not the parsed value %q:\n%s", testCase.rendered, contents)
+			}
+		})
+	}
+}
+
+func TestPostgreSQLStringLiteralMatchesQuoteLiteral(t *testing.T) {
+	t.Parallel()
+	// quote_literal_internal (src/backend/utils/adt/quote.c) doubles the
+	// backslash as well as the quote and prefixes E when any backslash is
+	// present, so the literal means the same thing under either
+	// standard_conforming_strings rather than only under the session pgshard
+	// happens to open.
+	for _, test := range []struct{ value, want string }{
+		{value: "app", want: "'app'"},
+		{value: "", want: "''"},
+		{value: "o'brien", want: "'o''brien'"},
+		{value: `a\b`, want: `E'a\\b'`},
+		{value: `a\'b`, want: `E'a\\''b'`},
+		{value: `\\`, want: `E'\\\\'`},
+	} {
+		if got := postgresqlStringLiteral(test.value); got != test.want {
+			t.Fatalf("postgresqlStringLiteral(%q) = %q, want %q", test.value, got, test.want)
+		}
+	}
+}
+
+func TestGUCConfigurationModelRejectsSplitValues(t *testing.T) {
+	t.Parallel()
+	// A model that accepted everything would make the conformance assertion
+	// vacuous, so it has to reject exactly what the server rejects.
+	for _, line := range []string{
+		"checkpoint_completion_target = 0x1p-1\n",
+		"random_page_cost = 1e1\n",
+		"random_page_cost = 1_0.5\n",
+		"seq_page_cost = 1_0\n",
+		"autovacuum_vacuum_scale_factor = 1e-7\n",
+		"random_page_cost = \n",
+		"= 1.5\n",
+	} {
+		if err := parseGUCConfiguration(line); err == nil {
+			t.Fatalf("guc-file.l model accepted %q, which the server rejects", line)
+		}
+	}
+	for _, line := range []string{
+		"# comment only\n",
+		"checkpoint_completion_target = 0.5\n",
+		"listen_addresses = '*'\n",
+		"log_statement = ddl\n",
+		"max_wal_size = 1GB\n",
+		"log_min_duration_statement = -1\n",
+		"autovacuum_vacuum_scale_factor = 0.0000001\n",
+		"include = '/etc/pgshard/postgresql/postgresql.conf'\n",
+		"synchronous_standby_names = 'ANY 1 (pgshard_member_0001,pgshard_member_0002)'\n",
+		"shared_buffers 512MB\n",
+	} {
+		if err := parseGUCConfiguration(line); err != nil {
+			t.Fatalf("guc-file.l model rejected %q, which the server accepts: %v", line, err)
+		}
+	}
+}
+
+type gucTokenKind int
+
+const (
+	gucEOL gucTokenKind = iota
+	gucID
+	gucQualifiedID
+	gucString
+	gucUnquotedString
+	gucInteger
+	gucReal
+	gucEquals
+	gucError
+	gucSkip
+)
+
+// Models the scanner in PostgreSQL 18's src/backend/utils/misc/guc-file.l over
+// the ASCII the renderer emits, so conformance is asserted against the server's
+// own grammar rather than against an expected rendering. Longest match wins and
+// ties go to the earlier rule, which is how flex disambiguates.
+var gucRules = []struct {
+	kind    gucTokenKind
+	pattern *regexp.Regexp
+}{
+	{kind: gucEOL, pattern: longestMatch(`^\n`)},
+	{kind: gucSkip, pattern: longestMatch(`^[ \t\r]+`)},
+	{kind: gucSkip, pattern: longestMatch(`^#[^\n]*`)},
+	{kind: gucID, pattern: longestMatch(`^[A-Za-z_][A-Za-z_0-9]*`)},
+	{kind: gucQualifiedID, pattern: longestMatch(`^[A-Za-z_][A-Za-z_0-9]*\.[A-Za-z_][A-Za-z_0-9]*`)},
+	{kind: gucString, pattern: longestMatch(`^'([^'\\\n]|\\[^\n]|'')*'`)},
+	{kind: gucUnquotedString, pattern: longestMatch(`^[A-Za-z_]([A-Za-z_0-9]|[-._:/])*`)},
+	{kind: gucInteger, pattern: longestMatch(`^[-+]?([0-9]+|0x[0-9a-fA-F]+)[A-Za-z]*`)},
+	{kind: gucReal, pattern: longestMatch(`^[-+]?[0-9]*\.[0-9]*([Ee][-+]?[0-9]+)?`)},
+	{kind: gucEquals, pattern: longestMatch(`^=`)},
+	{kind: gucError, pattern: longestMatch(`^[^\n]`)},
+}
+
+func longestMatch(pattern string) *regexp.Regexp {
+	compiled := regexp.MustCompile(pattern)
+	compiled.Longest()
+	return compiled
+}
+
+func nextGUCToken(input string) (gucTokenKind, string, string) {
+	for input != "" {
+		best, length := 0, 0
+		for index, rule := range gucRules {
+			if match := rule.pattern.FindString(input); len(match) > length {
+				best, length = index, len(match)
+			}
+		}
+		if length == 0 {
+			return gucError, input[:1], input[1:]
+		}
+		kind, text := gucRules[best].kind, input[:length]
+		input = input[length:]
+		if kind == gucSkip {
+			continue
+		}
+		return kind, text, input
+	}
+	return gucEOL, "", ""
+}
+
+// Reproduces the per-line contract in ParseConfigFp: a name, an optional equals
+// sign, exactly one value token, then end of line.
+func parseGUCConfiguration(contents string) error {
+	if !isASCII(contents) {
+		return fmt.Errorf("configuration is not ASCII, which this model does not cover")
+	}
+	line := 1
+	for contents != "" {
+		var kind gucTokenKind
+		var text string
+		kind, text, contents = nextGUCToken(contents)
+		if kind == gucEOL {
+			if text == "" {
+				return nil
+			}
+			line++
+			continue
+		}
+		if kind != gucID && kind != gucQualifiedID {
+			return fmt.Errorf("line %d: %q is not a parameter name", line, text)
+		}
+		name := text
+		kind, text, contents = nextGUCToken(contents)
+		if kind == gucEquals {
+			kind, text, contents = nextGUCToken(contents)
+		}
+		switch kind {
+		case gucID, gucString, gucInteger, gucReal, gucUnquotedString:
+		default:
+			return fmt.Errorf("line %d: %q has no value token, found %q", line, name, text)
+		}
+		value := text
+		kind, text, contents = nextGUCToken(contents)
+		if kind != gucEOL {
+			return fmt.Errorf("line %d: %q value %q is followed by a second token %q", line, name, value, text)
+		}
+		if text == "" {
+			return nil
+		}
+		line++
+	}
+	return nil
+}
+
+func isASCII(value string) bool {
+	for index := 0; index < len(value); index++ {
+		if value[index] > 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 func TestMaximumValidClusterFitsKubernetesConfigMaps(t *testing.T) {
