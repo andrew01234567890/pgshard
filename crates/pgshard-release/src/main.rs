@@ -2141,7 +2141,7 @@ mod tests {
     /// is gated on therefore has to be done twice: once in the workflow and
     /// once here, where it is reviewed as code.
     const ALWAYS: &str = "";
-    const GATED_ON: [(&str, &str); 20] = [
+    const GATED_ON: [(&str, &str); 21] = [
         ("changes", ALWAYS),
         ("repository-policy", ALWAYS),
         ("rust-static", "needs.changes.outputs.rust == 'true'"),
@@ -2168,6 +2168,10 @@ mod tests {
         ("operator-kind", "needs.changes.outputs.go == 'true'"),
         (
             "operator-kind-manager",
+            "needs.changes.outputs.go == 'true' || needs.changes.outputs.images == 'true'",
+        ),
+        (
+            "operator-kind-quarantine",
             "needs.changes.outputs.go == 'true' || needs.changes.outputs.images == 'true'",
         ),
         (
