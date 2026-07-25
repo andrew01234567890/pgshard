@@ -2338,6 +2338,34 @@ mod tests {
             ["aggregate"],
             "the required check name is published by something other than the aggregate alone"
         );
+        // A literal comparison only sees literal names. `name: ${{ ... }}` is
+        // evaluated at run time and can render as anything, including the
+        // required check name, so a name carrying an expression is constrained
+        // to a shape whose fixed prefix cannot produce it.
+        for (job, definition) in workflow["jobs"]
+            .as_mapping()
+            .expect("the workflow declares jobs")
+            .iter()
+            .filter_map(|(job, definition)| Some((job.as_str()?, definition)))
+        {
+            let Some(name) = definition["name"].as_str() else {
+                continue;
+            };
+            if !name.contains("${{") {
+                continue;
+            }
+            let (literal, expression) = name
+                .split_once(" / ")
+                .unwrap_or_else(|| panic!("{job}'s computed name has no fixed prefix: {name}"));
+            assert!(
+                !literal.contains("${{") && literal != "CI aggregate",
+                "{job}'s computed name can render as the required check name: {name}"
+            );
+            assert!(
+                expression.starts_with("${{ matrix.") && expression.ends_with("}}"),
+                "{job}'s computed name is not a matrix leg suffix: {name}"
+            );
+        }
         for job in workflow["jobs"]
             .as_mapping()
             .expect("the workflow declares jobs")
