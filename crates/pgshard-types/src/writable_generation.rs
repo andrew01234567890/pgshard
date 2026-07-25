@@ -70,6 +70,16 @@ impl DurableWritableGeneration {
         self.shard_id
     }
 
+    /// The cluster this generation coordinates.
+    ///
+    /// Exposed for the same reason as [`Self::shard_id`]: a contract that names
+    /// both a cluster and a generation has to prove they agree. Hashing both
+    /// binds what each one is, not that they are the same cluster.
+    #[must_use]
+    pub fn cluster_uid(&self) -> &str {
+        &self.cluster_uid
+    }
+
     /// Returns the monotonic fencing term.
     #[must_use]
     pub const fn term(&self) -> u64 {
