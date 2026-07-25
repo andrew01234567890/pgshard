@@ -729,13 +729,6 @@ jobs:
         with:
           go-version-file: operator/go.mod
           cache-dependency-path: operator/go.sum
-      - name: Cache image build layers
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: artifacts/buildx-cache
-          key: buildx-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'deploy/images/*.Dockerfile', 'deploy/docker-bake.hcl', 'operator/go.sum') }}
-          restore-keys: |
-            buildx-${{ runner.os }}-
       - name: Set up local-image Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
         with:
@@ -745,7 +738,6 @@ jobs:
           PGSHARD_BUILD_VERSION: 0.0.0-dev+ci.${{ github.sha }}
           PGSHARD_GIT_SHA: ${{ github.sha }}
           PGSHARD_IMAGE_OUTPUT: artifacts/images
-          PGSHARD_IMAGE_CACHE: artifacts/buildx-cache
           PGSHARD_IMAGE_TAG: dev
           PGSHARD_IMAGE_TARGETS: operator orchestrator pooler postgres-agent
         shell: bash
@@ -979,13 +971,6 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Cache image build layers
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: artifacts/buildx-cache
-          key: buildx-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'deploy/images/*.Dockerfile', 'deploy/docker-bake.hcl', 'operator/go.sum') }}
-          restore-keys: |
-            buildx-${{ runner.os }}-
       - name: Set up archive-capable Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
         with:
@@ -995,7 +980,6 @@ jobs:
           PGSHARD_BUILD_VERSION: 0.0.0-dev+ci.${{ github.sha }}
           PGSHARD_GIT_SHA: ${{ github.sha }}
           PGSHARD_IMAGE_OUTPUT: artifacts/images
-          PGSHARD_IMAGE_CACHE: artifacts/buildx-cache
           PGSHARD_IMAGE_TAG: ci
           PGSHARD_IMAGE_TARGETS: agent operator orchestrator pooler
         run: make images
@@ -1038,13 +1022,6 @@ jobs:
           key: rust-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
             rust-${{ github.job }}-${{ runner.os }}-
-      - name: Cache image build layers
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: artifacts/buildx-cache
-          key: buildx-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'deploy/images/*.Dockerfile', 'deploy/docker-bake.hcl', 'operator/go.sum') }}
-          restore-keys: |
-            buildx-${{ runner.os }}-
       - name: Set up local-image Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
         with:
@@ -1054,7 +1031,6 @@ jobs:
           PGSHARD_BUILD_VERSION: 0.0.0-dev+ci.${{ github.sha }}
           PGSHARD_GIT_SHA: ${{ github.sha }}
           PGSHARD_IMAGE_OUTPUT: artifacts/images
-          PGSHARD_IMAGE_CACHE: artifacts/buildx-cache
           PGSHARD_IMAGE_TAG: ci
           PGSHARD_IMAGE_TARGETS: postgres-agent
         run: make images

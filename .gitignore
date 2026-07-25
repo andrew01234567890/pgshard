@@ -6,7 +6,6 @@
 /crates/pgshard-pgwire/fuzz/corpus/*/*
 !/crates/pgshard-pgwire/fuzz/corpus/*/valid_*
 /crates/pgshard-pgwire/fuzz/target/
-/artifacts/buildx-cache/
 /artifacts/images/
 **/node_modules/
 **/.docusaurus/
