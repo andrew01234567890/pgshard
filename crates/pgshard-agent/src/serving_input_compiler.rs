@@ -291,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_input_is_refused_without_being_read_whole() {
+    fn an_oversized_input_is_refused() {
         let fixture = fixture();
         let oversized = vec![b'x'; usize::try_from(MAXIMUM_SERVING_INPUT_BYTES).unwrap() + 1];
         std::fs::write(&fixture.paths.configuration, &oversized).expect("write oversized");
@@ -322,6 +322,37 @@ mod tests {
             compile_serving_policy(&paths, &fixture.expected).expect_err("a directory is refused");
         assert!(
             matches!(error, ServingInputError::NotRegular { name } if name == "template"),
+            "expected a non-regular input, got {error}"
+        );
+    }
+
+    /// A FIFO opens, and `read` on it blocks forever without `O_NONBLOCK`.
+    /// The regular-file check is what refuses it; this proves the agent does
+    /// not hang first.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_input_is_refused_rather_than_blocking() {
+        let fixture = fixture();
+        let directory = fixture
+            .paths
+            .template
+            .parent()
+            .expect("a parent")
+            .to_path_buf();
+        let fifo = directory.join("serving.fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .is_ok_and(|status| status.success());
+        if !made {
+            return; // mkfifo unavailable; the regular-file check is covered elsewhere
+        }
+        let mut paths = fixture.paths.clone();
+        paths.serving_hba = fifo;
+        let error =
+            compile_serving_policy(&paths, &fixture.expected).expect_err("a FIFO is refused");
+        assert!(
+            matches!(error, ServingInputError::NotRegular { name } if name == "serving HBA"),
             "expected a non-regular input, got {error}"
         );
     }
