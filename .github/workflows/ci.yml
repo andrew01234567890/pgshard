@@ -1587,6 +1587,28 @@ jobs:
           # the detector said its component was untouched. Accepting `skipped`
           # from any job let a detector fault, a stale path filter, or a
           # cascade retire a gate without anything failing.
+          # Every detector output the expectations below consume. An
+          # expectation is a boolean expression, so a missing output is falsy
+          # and reads exactly like a legitimate `false` -- a removed or
+          # misspelled output declaration would silently authorize a skip.
+          # These are checked as literals so non-reporting fails closed.
+          COMPONENT_OUTPUTS: >-
+            rust=${{ needs.changes.outputs.rust }}
+            postgres_agent=${{ needs.changes.outputs.postgres_agent }}
+            catalog=${{ needs.changes.outputs.catalog }}
+            orch_catalog=${{ needs.changes.outputs.orch_catalog }}
+            pgwire=${{ needs.changes.outputs.pgwire }}
+            pooler_postgres=${{ needs.changes.outputs.pooler_postgres }}
+            planner=${{ needs.changes.outputs.planner }}
+            proto=${{ needs.changes.outputs.proto }}
+            go=${{ needs.changes.outputs.go }}
+            website=${{ needs.changes.outputs.website }}
+            website_exists=${{ needs.changes.outputs.website_exists }}
+            ui=${{ needs.changes.outputs.ui }}
+            integration=${{ needs.changes.outputs.integration }}
+            images=${{ needs.changes.outputs.images }}
+            kind=${{ needs.changes.outputs.kind }}
+            performance=${{ needs.changes.outputs.performance }}
           JOB_EXPECTATIONS: >-
             changes=${{ needs.changes.result }}=true
             repository-policy=${{ needs.repository-policy.result }}=true
@@ -1612,6 +1634,14 @@ jobs:
         run: |
           set -euo pipefail
           failed=false
+          for component in $COMPONENT_OUTPUTS; do
+            name="${component%%=*}"
+            reported="${component#*=}"
+            if [[ "$reported" != true && "$reported" != false ]]; then
+              echo "Detector did not report $name (reported '$reported')" >&2
+              failed=true
+            fi
+          done
           for entry in $JOB_EXPECTATIONS; do
             job="${entry%%=*}"
             state="${entry#*=}"

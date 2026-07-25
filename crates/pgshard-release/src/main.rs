@@ -1947,9 +1947,14 @@ mod tests {
     }
 
     fn run_aggregate_gate(expectations: &str) -> (bool, String) {
+        run_aggregate_gate_with("rust=true", expectations)
+    }
+
+    fn run_aggregate_gate_with(components: &str, expectations: &str) -> (bool, String) {
         let output = Command::new("bash")
             .arg("-c")
             .arg(aggregate_gate_script())
+            .env("COMPONENT_OUTPUTS", components)
             .env("JOB_EXPECTATIONS", expectations)
             .output()
             .expect("run the aggregate gate");
@@ -1983,6 +1988,88 @@ mod tests {
         for state in ["failure", "cancelled"] {
             let (passed, _) = run_aggregate_gate(&format!("rust-test={state}=false"));
             assert!(!passed, "an untouched component still shipped on {state}");
+        }
+    }
+
+    /// An expectation is a boolean expression, so a detector output that was
+    /// never emitted is falsy and indistinguishable from a legitimate `false`.
+    /// The detector's own reporting therefore has to be checked as a literal.
+    #[test]
+    fn a_detector_that_does_not_report_a_component_fails_closed() {
+        let (passed, stderr) =
+            run_aggregate_gate_with("rust=true go=false", "rust-static=success=true");
+        assert!(passed, "a fully reported detector was rejected: {stderr}");
+
+        for missing in ["go=", "go=maybe", "go=TRUE"] {
+            let (passed, stderr) = run_aggregate_gate_with(
+                &format!("rust=true {missing}"),
+                "go-operator=skipped=false",
+            );
+            assert!(!passed, "a skip authorized by '{missing}' was accepted");
+            assert!(stderr.contains("Detector did not report go"), "{stderr}");
+        }
+    }
+
+    /// Every detector output an expectation consumes has to be one the gate
+    /// validates, or that output can go missing without anything failing.
+    #[test]
+    fn every_consumed_detector_output_is_validated() {
+        let ci = include_str!("../../../.github/workflows/ci.yml");
+        let aggregate = ci
+            .split_once("\n  aggregate:")
+            .expect("the aggregate job exists")
+            .1;
+        let components = aggregate
+            .split_once("COMPONENT_OUTPUTS: >-")
+            .expect("the aggregate declares the outputs it validates")
+            .1;
+        let validated: std::collections::BTreeSet<&str> = components
+            .lines()
+            .take_while(|line| !line.trim_start().starts_with("JOB_EXPECTATIONS:"))
+            .filter_map(|line| line.trim().split_once('='))
+            .map(|(name, _)| name)
+            .collect();
+        let expectations = aggregate
+            .split_once("JOB_EXPECTATIONS: >-")
+            .expect("the aggregate declares its expectations")
+            .1;
+        let expectations = expectations
+            .split_once("shell:")
+            .map_or(expectations, |(declared, _)| declared);
+        for consumed in expectations.split("needs.changes.outputs.").skip(1) {
+            let name: &str = consumed
+                .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                .next()
+                .expect("an output reference names an output");
+            assert!(
+                validated.contains(name),
+                "the gate consumes {name} without validating the detector reported it"
+            );
+        }
+
+        // Catch a removed or misspelled declaration here rather than leaving it
+        // to fail the release run that first depends on it.
+        let declared = ci
+            .split_once("\n  changes:")
+            .expect("the detector job exists")
+            .1
+            .split_once("    outputs:\n")
+            .expect("the detector declares its outputs")
+            .1;
+        let declared: std::collections::BTreeSet<&str> = declared
+            .lines()
+            .take_while(|line| {
+                line.trim_start()
+                    .starts_with(|c: char| c.is_ascii_alphanumeric())
+            })
+            .filter_map(|line| line.trim().split_once(':'))
+            .map(|(name, _)| name)
+            .collect();
+        for name in validated {
+            assert!(
+                declared.contains(name),
+                "the gate validates {name}, which the detector does not declare as an output"
+            );
         }
     }
 
