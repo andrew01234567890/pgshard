@@ -100,6 +100,7 @@ images:
 	PGSHARD_GIT_SHA="$(PGSHARD_GIT_SHA)" \
 	PGSHARD_IMAGE_OUTPUT="$(PGSHARD_IMAGE_OUTPUT)" \
 	PGSHARD_IMAGE_TAG="$(PGSHARD_IMAGE_TAG)" \
+	PGSHARD_IMAGE_CACHE="$(PGSHARD_IMAGE_CACHE)" \
 	docker buildx bake --file deploy/docker-bake.hcl $(PGSHARD_IMAGE_TARGETS)
 
 release-build:
