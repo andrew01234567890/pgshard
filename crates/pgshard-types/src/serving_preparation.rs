@@ -16,6 +16,7 @@
 //! a different catalog, a different Pod, a different policy, or a different
 //! timeline.
 
+use crate::writable_generation::DurableWritableGeneration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -104,7 +105,9 @@ pub struct ServingPreparation {
     /// this preparation to one materialization rather than to "a catalog".
     #[serde(rename = "requestSHA256")]
     pub request_sha256: String,
-    /// Canonical writable generation the preparation is bound to.
+    /// Canonical writable generation the preparation is bound to, exactly as
+    /// `DurableWritableGeneration::canonical_bytes` renders it. Multi-line by
+    /// construction, so it is parsed rather than treated as bounded text.
     pub generation: String,
     /// Incarnation being replaced.
     pub source: ServingPreparationSource,
@@ -126,6 +129,11 @@ pub enum ServingPreparationError {
     /// A SHA-256 field is not canonical lowercase hexadecimal.
     #[error("serving preparation contains an invalid SHA-256 digest")]
     InvalidDigest,
+    /// The generation is not a canonical writable generation. Accepting
+    /// arbitrary text here would bind the preparation to something no other
+    /// stage can reconstruct or compare against.
+    #[error("serving preparation does not carry a canonical writable generation")]
+    InvalidGeneration,
     /// Serving activation is defined only for shard zero, member zero.
     #[error("serving preparation names a shard or member other than zero")]
     UnsupportedTarget,
@@ -188,10 +196,22 @@ impl ServingPreparation {
             pod_uid,
             stateful_set_uid,
             update_revision,
-            generation,
         ] {
             validate_text(text)?;
         }
+        // Reconstructed rather than pattern-matched: the only definition of
+        // canonical is what `DurableWritableGeneration` itself round-trips, and
+        // every other stage compares against exactly that.
+        let parsed = DurableWritableGeneration::parse_canonical(generation.as_bytes())
+            .ok_or(ServingPreparationError::InvalidGeneration)?;
+        if parsed.canonical_bytes() != generation.as_bytes() {
+            return Err(ServingPreparationError::InvalidGeneration);
+        }
+        // The shard the generation coordinates is not exposed by the type, and
+        // adding an accessor is not this slice's business. It does not need to
+        // be: the round-trip equality above binds the exact canonical bytes, so
+        // the shard is bound transitively, and the stage that compares this
+        // preparation against a live generation compares those same bytes.
         for digest in [
             request_sha256,
             configuration_sha256,
@@ -332,11 +352,29 @@ mod tests {
         })
     }
 
+    /// A real canonical generation, rendered by the type that defines what
+    /// canonical means. Inventing the text here is what the first version of
+    /// this fixture did, and it hid a validator that rejected every real value.
+    fn generation() -> String {
+        let generation = crate::writable_generation::DurableWritableGeneration::new(
+            "demo".to_owned(),
+            "cccccccc-1111-2222-3333-444444444444".to_owned(),
+            crate::ShardId(0),
+            "database".to_owned(),
+            "demo-shard-0000-term".to_owned(),
+            "dddddddd-1111-2222-3333-444444444444".to_owned(),
+            "demo-shard-0000-0".to_owned(),
+            7,
+        )
+        .expect("the fixture generation is valid");
+        String::from_utf8(generation.canonical_bytes()).expect("canonical bytes are UTF-8")
+    }
+
     fn preparation() -> ServingPreparation {
         ServingPreparation {
             schema_version: SERVING_PREPARATION_VERSION.to_owned(),
             request_sha256: digest(1),
-            generation: "cluster-1:holder-a:7".to_owned(),
+            generation: generation(),
             source: ServingPreparationSource {
                 shard: 0,
                 member: 0,
@@ -370,7 +408,20 @@ mod tests {
         it.request_sha256 = digest(9);
         mutations.push(("request", it));
         let mut it = preparation();
-        it.generation = "cluster-1:holder-a:8".to_owned();
+        it.generation = {
+            let other = crate::writable_generation::DurableWritableGeneration::new(
+                "demo".to_owned(),
+                "cccccccc-1111-2222-3333-444444444444".to_owned(),
+                crate::ShardId(0),
+                "database".to_owned(),
+                "demo-shard-0000-term".to_owned(),
+                "dddddddd-1111-2222-3333-444444444444".to_owned(),
+                "demo-shard-0000-0".to_owned(),
+                8,
+            )
+            .expect("valid");
+            String::from_utf8(other.canonical_bytes()).expect("utf8")
+        };
         mutations.push(("generation", it));
         let mut it = preparation();
         it.source.instance_id = "demo-shard-0000-1".to_owned();
@@ -464,6 +515,12 @@ mod tests {
                 Box::new(|it: &mut ServingPreparation| it.identity.timeline = 0),
             ),
             (
+                ServingPreparationError::InvalidGeneration,
+                Box::new(|it: &mut ServingPreparation| {
+                    it.generation = "cluster-1:holder-a:7".to_owned();
+                }),
+            ),
+            (
                 ServingPreparationError::IndistinctPolicy,
                 Box::new(|it: &mut ServingPreparation| {
                     it.policy.serving_hba_sha256 = it.policy.non_serving_hba_sha256.clone();
@@ -487,7 +544,7 @@ mod tests {
     fn the_canonical_vector_is_pinned() {
         assert_eq!(
             preparation().sha256().expect("the fixture is canonical"),
-            "bf58fe08b74a54a5ca786a12b02575180dee2f1bc76599608d65e647bcb06ab9",
+            "4d2d7bb1b9c2c0405426a1c831c63f7705791c0b77514ea2b481a27cb04f590f",
             "the canonical digest changed; regenerate the operator vector too"
         );
     }
