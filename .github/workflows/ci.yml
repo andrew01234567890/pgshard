@@ -709,6 +709,19 @@ jobs:
       - name: Create disposable Kubernetes cluster
         run: |
           go install sigs.k8s.io/kind@v0.32.0
+          # kind pulls the node image itself without retrying, and a
+          # registry timeout here leaves no cluster for every later step.
+          readonly node_image="kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5"
+          for attempt in 1 2 3 4; do
+            if docker pull "$node_image"; then
+              break
+            fi
+            if (( attempt == 4 )); then
+              echo "failed to pull the KIND node image after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
           kind create cluster \
             --name pgshard-operator \
             --image kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5 \
@@ -761,6 +774,23 @@ jobs:
         with:
           go-version-file: operator/go.mod
           cache-dependency-path: operator/go.sum
+      - name: Pull the Buildx builder image
+        run: |
+          # setup-buildx-action boots its builder from a container it pulls
+          # itself, with no retry, so one registry timeout fails the job before
+          # any of its work starts. Pulling first leaves the image local; the
+          # cascade otherwise reads as a cluster failure two steps later.
+          readonly buildkit_image="moby/buildkit:buildx-stable-1"
+          for attempt in 1 2 3 4; do
+            if docker pull "$buildkit_image"; then
+              break
+            fi
+            if (( attempt == 4 )); then
+              echo "failed to pull the Buildx builder image after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
       - name: Set up local-image Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
         with:
@@ -785,6 +815,19 @@ jobs:
       - name: Create disposable Kubernetes cluster
         run: |
           go install sigs.k8s.io/kind@v0.32.0
+          # kind pulls the node image itself without retrying, and a
+          # registry timeout here leaves no cluster for every later step.
+          readonly node_image="kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5"
+          for attempt in 1 2 3 4; do
+            if docker pull "$node_image"; then
+              break
+            fi
+            if (( attempt == 4 )); then
+              echo "failed to pull the KIND node image after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
           kind create cluster \
             --name pgshard-manager \
             --image kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5 \
@@ -852,6 +895,23 @@ jobs:
         with:
           go-version-file: operator/go.mod
           cache-dependency-path: operator/go.sum
+      - name: Pull the Buildx builder image
+        run: |
+          # setup-buildx-action boots its builder from a container it pulls
+          # itself, with no retry, so one registry timeout fails the job before
+          # any of its work starts. Pulling first leaves the image local; the
+          # cascade otherwise reads as a cluster failure two steps later.
+          readonly buildkit_image="moby/buildkit:buildx-stable-1"
+          for attempt in 1 2 3 4; do
+            if docker pull "$buildkit_image"; then
+              break
+            fi
+            if (( attempt == 4 )); then
+              echo "failed to pull the Buildx builder image after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
       - name: Set up local-image Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
         with:
@@ -876,6 +936,19 @@ jobs:
       - name: Create disposable Kubernetes cluster
         run: |
           go install sigs.k8s.io/kind@v0.32.0
+          # kind pulls the node image itself without retrying, and a
+          # registry timeout here leaves no cluster for every later step.
+          readonly node_image="kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5"
+          for attempt in 1 2 3 4; do
+            if docker pull "$node_image"; then
+              break
+            fi
+            if (( attempt == 4 )); then
+              echo "failed to pull the KIND node image after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
           kind create cluster \
             --name pgshard-manager \
             --image kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5 \
@@ -1136,6 +1209,23 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Pull the Buildx builder image
+        run: |
+          # setup-buildx-action boots its builder from a container it pulls
+          # itself, with no retry, so one registry timeout fails the job before
+          # any of its work starts. Pulling first leaves the image local; the
+          # cascade otherwise reads as a cluster failure two steps later.
+          readonly buildkit_image="moby/buildkit:buildx-stable-1"
+          for attempt in 1 2 3 4; do
+            if docker pull "$buildkit_image"; then
+              break
+            fi
+            if (( attempt == 4 )); then
+              echo "failed to pull the Buildx builder image after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
       - name: Set up archive-capable Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
         with:
@@ -1187,6 +1277,23 @@ jobs:
           key: rust-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
             rust-${{ github.job }}-${{ runner.os }}-
+      - name: Pull the Buildx builder image
+        run: |
+          # setup-buildx-action boots its builder from a container it pulls
+          # itself, with no retry, so one registry timeout fails the job before
+          # any of its work starts. Pulling first leaves the image local; the
+          # cascade otherwise reads as a cluster failure two steps later.
+          readonly buildkit_image="moby/buildkit:buildx-stable-1"
+          for attempt in 1 2 3 4; do
+            if docker pull "$buildkit_image"; then
+              break
+            fi
+            if (( attempt == 4 )); then
+              echo "failed to pull the Buildx builder image after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
       - name: Set up local-image Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
         with:
@@ -1780,6 +1887,19 @@ jobs:
       - name: Create disposable Kubernetes cluster
         run: |
           go install sigs.k8s.io/kind@v0.32.0
+          # kind pulls the node image itself without retrying, and a
+          # registry timeout here leaves no cluster for every later step.
+          readonly node_image="kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5"
+          for attempt in 1 2 3 4; do
+            if docker pull "$node_image"; then
+              break
+            fi
+            if (( attempt == 4 )); then
+              echo "failed to pull the KIND node image after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
           kind create cluster \
             --name pgshard-system-e2e \
             --image kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5 \
