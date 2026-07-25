@@ -17,13 +17,8 @@
 //! the catalog as materialized — this module deliberately does not pretend to
 //! resolve it.
 //!
-//! Nothing here is driven yet: the materializer is constructed and unit-tested,
-//! but no caller applies a program.
-#![allow(
-    dead_code,
-    reason = "dormant materializer; the enabling stage drives it"
-)]
-
+//! The materialization stage drives this executor from one exact
+//! writable-runtime capability; nothing else may apply a program.
 use std::path::Path;
 use std::time::Duration;
 

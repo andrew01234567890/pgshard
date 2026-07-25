@@ -12,6 +12,7 @@ use pgshard_agent::catalog_activation_static_inputs::{
     spawn_catalog_activation_static_input_verifier,
 };
 use pgshard_agent::catalog_activation_tls::spawn_catalog_activation_tls_server;
+use pgshard_agent::catalog_materialization_stage::spawn_catalog_materialization;
 use pgshard_agent::config::{AgentConfig, ConfigError};
 use pgshard_agent::coordination::WritableLeaseConfig;
 use pgshard_agent::domain::{AgentState, PostgresProcessState};
@@ -93,8 +94,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         catalog_activation_static_inputs,
         shutdown_rx.clone(),
     );
-    let (catalog_runtime_binding, _catalog_runtime_handoff) =
+    let (catalog_runtime_binding, catalog_runtime_handoff) =
         prepare_catalog_runtime_binding(catalog_materialization_handoff);
+    let _materialized_catalog_handoff = spawn_catalog_materialization(catalog_runtime_handoff);
     let postgres_config = postgres;
     let postgres = match postgres_config.clone() {
         Some(config) => {

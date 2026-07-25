@@ -1,10 +1,12 @@
-//! Dormant binding of catalog activation inputs to one writable runtime.
+//! Binds catalog activation inputs to one writable runtime.
 //!
-//! This stage is deliberately non-serving and non-mutating. It can publish an
-//! opaque private handoff only while the exact durable request, verified static
-//! inputs, attempt-private writable authority, postmaster incarnation, and a
-//! peer-authenticated local `PostgreSQL` identity all agree. It adds no secrets,
-//! SQL writes, HBA changes, readiness, routing, or serving authority.
+//! This stage is deliberately non-serving. It can publish an opaque private
+//! handoff only while the exact durable request, verified static inputs,
+//! attempt-private writable authority, postmaster incarnation, and a
+//! peer-authenticated local `PostgreSQL` identity all agree, and it withdraws
+//! that handoff the moment any of them stops agreeing. It adds no secrets, HBA
+//! changes, readiness, routing, or serving authority, and writes no SQL itself:
+//! the materialization stage consumes the handoff and owns every write.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -40,25 +42,74 @@ pub struct CatalogRuntimeBindingAttempt {
 
 /// Opaque retained receiver for the exact writable-runtime handoff.
 ///
-/// There is intentionally no observer API. A later independently reviewed SQL
-/// materializer must consume this move-only handoff before the bound session or
-/// verified static snapshots can be used.
+/// There is intentionally no observer API. The SQL materializer consumes this
+/// move-only handoff before the bound session or verified static snapshots can
+/// be used.
 #[must_use = "dropping the runtime handoff closes its private watch"]
 pub struct CatalogRuntimeHandoff {
-    #[allow(dead_code, reason = "retained for the later dormant SQL materializer")]
     receiver: watch::Receiver<Option<Arc<ValidatedCatalogRuntime>>>,
+}
+
+impl CatalogRuntimeHandoff {
+    /// Moves the private receiver into the materialization stage.
+    pub(crate) fn into_receiver(self) -> watch::Receiver<Option<Arc<ValidatedCatalogRuntime>>> {
+        self.receiver
+    }
 }
 
 /// Exact request, inputs, process incarnation, authority generation, and local
 /// `PostgreSQL` session. This capability is deliberately private, move-only,
 /// non-debuggable, and non-serializable.
-struct ValidatedCatalogRuntime {
-    _inputs: Arc<ValidatedCatalogStaticInputs>,
+pub(crate) struct ValidatedCatalogRuntime {
+    inputs: Arc<ValidatedCatalogStaticInputs>,
+    socket_dir: PathBuf,
     _session: RetainedCatalogRuntimeSession,
-    _generation: DurableWritableGeneration,
+    generation: DurableWritableGeneration,
     _postmaster_pid: u32,
     _boot_id: String,
     _identity: CatalogRuntimeIdentity,
+}
+
+impl ValidatedCatalogRuntime {
+    pub(crate) fn inputs(&self) -> &ValidatedCatalogStaticInputs {
+        &self.inputs
+    }
+
+    pub(crate) fn socket_dir(&self) -> &Path {
+        &self.socket_dir
+    }
+
+    /// The generation this capability is bound to, which is the one the
+    /// materializer must fence against.
+    pub(crate) fn generation(&self) -> &DurableWritableGeneration {
+        &self.generation
+    }
+
+    /// Builds a capability without a live server, so the stage that consumes
+    /// one can have its publication state machine exercised on its own.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        inputs: Arc<ValidatedCatalogStaticInputs>,
+        generation: DurableWritableGeneration,
+    ) -> Self {
+        let (driver_ended, _) = watch::channel(false);
+        Self {
+            inputs,
+            socket_dir: PathBuf::from("/run/postgresql"),
+            _session: RetainedCatalogRuntimeSession::Test(TestCatalogRuntimeSession {
+                driver_ended: driver_ended.subscribe(),
+                published: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                dropped: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+            generation,
+            _postmaster_pid: 1,
+            _boot_id: "test-boot".to_owned(),
+            _identity: CatalogRuntimeIdentity {
+                system_identifier: 1,
+                timeline: 1,
+            },
+        }
+    }
 }
 
 /// The retained local session behind a validated runtime capability.
@@ -322,6 +373,7 @@ async fn supervise_catalog_runtime_binding_with_connector<C, F>(
             required_margin,
             postmaster_pid,
             &boot_id,
+            &socket_dir,
             identity,
         ) {
             wait_for_retry_input_or_authority_loss(
@@ -369,6 +421,7 @@ fn publish_if_current(
     required_margin: Duration,
     postmaster_pid: u32,
     boot_id: &str,
+    socket_dir: &Path,
     identity: CatalogRuntimeIdentity,
 ) -> bool {
     // Keep the driver guard through publication so connection termination
@@ -391,9 +444,10 @@ fn publish_if_current(
             #[cfg(test)]
             session.mark_published();
             output.send_replace(Some(Arc::new(ValidatedCatalogRuntime {
-                _inputs: Arc::clone(current),
+                inputs: Arc::clone(current),
+                socket_dir: socket_dir.to_path_buf(),
                 _session: session,
-                _generation: generation.clone(),
+                generation: generation.clone(),
                 _postmaster_pid: postmaster_pid,
                 _boot_id: boot_id.to_owned(),
                 _identity: identity,
@@ -949,6 +1003,7 @@ mod tests {
             REQUIRED_MARGIN,
             TEST_POSTMASTER_PID,
             TEST_BOOT_ID,
+            std::path::Path::new("/run/postgresql"),
             identity,
         ));
         assert!(output.borrow().is_none());
@@ -985,6 +1040,7 @@ mod tests {
             REQUIRED_MARGIN,
             TEST_POSTMASTER_PID,
             TEST_BOOT_ID,
+            std::path::Path::new("/run/postgresql"),
             identity,
         ));
         assert!(output.borrow().is_none());
