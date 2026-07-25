@@ -2305,12 +2305,39 @@ mod tests {
                     "a step of {described} carries `{key}`, which nothing here constrains"
                 );
             }
+            // Allowlisting `shell` as a key says nothing about its value:
+            // `shell: /bin/true {0}` hands the script to a program that never
+            // reads it, so the step succeeds having executed nothing.
+            if let Some(shell) = step.get("shell") {
+                assert_eq!(
+                    shell.as_str(),
+                    Some("bash"),
+                    "a step of {described} runs under a shell that need not execute it"
+                );
+            }
         }
         steps
     }
 
     /// A job outside the aggregate's `needs` is a job outside the gate.
+    ///
+    /// The exempt jobs are the ones that run after it, so they are also the
+    /// ones that could take its display name: branch protection requires a
+    /// check called `CI aggregate`, and a second job publishing a check run
+    /// under that name lets a decoy answer for the real gate.
     fn assert_every_job_is_aggregated(workflow: &serde_norway::Value, waited: &[&str]) {
+        let claiming: Vec<&str> = workflow["jobs"]
+            .as_mapping()
+            .expect("the workflow declares jobs")
+            .iter()
+            .filter(|(_, job)| job["name"].as_str() == Some("CI aggregate"))
+            .filter_map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(
+            claiming,
+            ["aggregate"],
+            "the required check name is published by something other than the aggregate alone"
+        );
         for job in workflow["jobs"]
             .as_mapping()
             .expect("the workflow declares jobs")
