@@ -250,6 +250,8 @@ pub enum PostgresRuntimeRole {
     ReplicationBootstrapPrimary,
     /// TCP-closed physical standby that must remain in recovery.
     ReplicationStandby,
+    /// Writable-Lease-fenced primary serving client traffic over TCP.
+    ServingPrimary,
 }
 
 /// Typed upstream identity for a physical standby.
@@ -429,17 +431,25 @@ impl PostgresConfig {
         fast_shutdown_timeout: Duration,
         immediate_shutdown_timeout: Duration,
     ) -> Result<Self, PostgresConfigError> {
+        // Each arm below gives ServingPrimary its settled answer where one exists
+        // and the most restrictive answer where it does not. No such config can
+        // be built yet; the restrictive arms are what this refusal degrades to if
+        // it is ever lifted before the serving supervisor lands.
+        if matches!(role, PostgresRuntimeRole::ServingPrimary) {
+            return Err(PostgresConfigError::ServingPrimaryNotYetSupervised);
+        }
         let requires_standby_upstream = match role {
             PostgresRuntimeRole::ReplicationStandby => true,
-            PostgresRuntimeRole::Quarantine | PostgresRuntimeRole::ReplicationBootstrapPrimary => {
-                false
-            }
+            PostgresRuntimeRole::Quarantine
+            | PostgresRuntimeRole::ReplicationBootstrapPrimary
+            | PostgresRuntimeRole::ServingPrimary => false,
         };
         if requires_standby_upstream != standby.is_some() {
             return Err(PostgresConfigError::InvalidStandbyComposition);
         }
         let permits_durable_generation = match role {
-            PostgresRuntimeRole::ReplicationBootstrapPrimary => true,
+            PostgresRuntimeRole::ReplicationBootstrapPrimary
+            | PostgresRuntimeRole::ServingPrimary => true,
             PostgresRuntimeRole::Quarantine | PostgresRuntimeRole::ReplicationStandby => false,
         };
         if !permits_durable_generation && generation_durability != GenerationDurability::Local {
@@ -537,7 +547,8 @@ impl PostgresConfig {
     #[must_use]
     pub(crate) fn requires_writable_authority(&self) -> bool {
         match self.role {
-            PostgresRuntimeRole::ReplicationBootstrapPrimary => true,
+            PostgresRuntimeRole::ReplicationBootstrapPrimary
+            | PostgresRuntimeRole::ServingPrimary => true,
             PostgresRuntimeRole::Quarantine | PostgresRuntimeRole::ReplicationStandby => false,
         }
     }
@@ -545,18 +556,18 @@ impl PostgresConfig {
     pub(crate) fn forbids_writable_authority(&self) -> bool {
         match self.role {
             PostgresRuntimeRole::ReplicationStandby => true,
-            PostgresRuntimeRole::Quarantine | PostgresRuntimeRole::ReplicationBootstrapPrimary => {
-                false
-            }
+            PostgresRuntimeRole::Quarantine
+            | PostgresRuntimeRole::ReplicationBootstrapPrimary
+            | PostgresRuntimeRole::ServingPrimary => false,
         }
     }
 
     pub(crate) fn is_replication_standby(&self) -> bool {
         match self.role {
             PostgresRuntimeRole::ReplicationStandby => true,
-            PostgresRuntimeRole::Quarantine | PostgresRuntimeRole::ReplicationBootstrapPrimary => {
-                false
-            }
+            PostgresRuntimeRole::Quarantine
+            | PostgresRuntimeRole::ReplicationBootstrapPrimary
+            | PostgresRuntimeRole::ServingPrimary => false,
         }
     }
 
@@ -586,6 +597,12 @@ impl PostgresConfig {
         })
     }
 
+    #[allow(
+        clippy::match_same_arms,
+        reason = "the serving arm coincides with quarantine only because serving policy is \
+                  not settled; merging them would make the serving slice inherit this \
+                  answer silently instead of choosing one"
+    )]
     fn runtime_network_settings(
         &self,
     ) -> (
@@ -610,9 +627,21 @@ impl PostgresConfig {
             PostgresRuntimeRole::ReplicationStandby => {
                 ("listen_addresses=", None, None, "archive_mode=off")
             }
+            PostgresRuntimeRole::ServingPrimary => (
+                "listen_addresses=",
+                Some("max_wal_senders=0"),
+                None,
+                "archive_mode=on",
+            ),
         }
     }
 
+    #[allow(
+        clippy::match_same_arms,
+        reason = "the serving arm coincides with quarantine only because serving policy is \
+                  not settled; merging them would make the serving slice inherit this \
+                  answer silently instead of choosing one"
+    )]
     fn starting_process_state(&self) -> PostgresProcessState {
         match self.role {
             PostgresRuntimeRole::Quarantine => PostgresProcessState::StartingQuarantined,
@@ -622,9 +651,16 @@ impl PostgresConfig {
             PostgresRuntimeRole::ReplicationStandby => {
                 PostgresProcessState::StartingReplicationStandby
             }
+            PostgresRuntimeRole::ServingPrimary => PostgresProcessState::StartingQuarantined,
         }
     }
 
+    #[allow(
+        clippy::match_same_arms,
+        reason = "the serving arm coincides with quarantine only because serving policy is \
+                  not settled; merging them would make the serving slice inherit this \
+                  answer silently instead of choosing one"
+    )]
     fn running_process_state(&self) -> PostgresProcessState {
         match self.role {
             PostgresRuntimeRole::Quarantine => PostgresProcessState::RunningQuarantined,
@@ -634,6 +670,7 @@ impl PostgresConfig {
             PostgresRuntimeRole::ReplicationStandby => {
                 PostgresProcessState::RunningReplicationStandby
             }
+            PostgresRuntimeRole::ServingPrimary => PostgresProcessState::RunningQuarantined,
         }
     }
 
@@ -2464,6 +2501,9 @@ where
             .await;
         }
         PostgresRuntimeRole::Quarantine => {}
+        PostgresRuntimeRole::ServingPrimary => {
+            return Err(PostgresError::ServingPrimaryNotYetSupervised);
+        }
     }
     if let Some(generation) = source_generation {
         return supervise_writable_quarantine(
@@ -4269,7 +4309,9 @@ fn validate_recovery_state(
 ) -> Result<Option<FileSnapshot>, PostgresError> {
     let expects_standby_signal = match role {
         PostgresRuntimeRole::ReplicationStandby => true,
-        PostgresRuntimeRole::Quarantine | PostgresRuntimeRole::ReplicationBootstrapPrimary => false,
+        PostgresRuntimeRole::Quarantine
+        | PostgresRuntimeRole::ReplicationBootstrapPrimary
+        | PostgresRuntimeRole::ServingPrimary => false,
     };
     let standby_signal_path = data_dir.join("standby.signal");
     let standby_signal = match fs::symlink_metadata(&standby_signal_path) {
@@ -4638,6 +4680,10 @@ fn validate_control_data(
         (_, ControlDataState::StartingUp) => Err(PostgresError::UnsafeControlState {
             state: control_data_state_name(state),
         }),
+        // No control state admits a serving primary while nothing supervises one.
+        (PostgresRuntimeRole::ServingPrimary, _) => {
+            Err(PostgresError::ServingPrimaryNotYetSupervised)
+        }
         (
             PostgresRuntimeRole::ReplicationStandby,
             ControlDataState::ShutDownInRecovery | ControlDataState::InArchiveRecovery,
@@ -4710,9 +4756,9 @@ fn validate_hba_file(
 ) -> Result<FileSnapshot, PostgresError> {
     let name = hba_policy_name(role);
     let expected_contents = match role {
-        PostgresRuntimeRole::Quarantine | PostgresRuntimeRole::ReplicationStandby => {
-            QUARANTINE_HBA_CONTENT
-        }
+        PostgresRuntimeRole::Quarantine
+        | PostgresRuntimeRole::ReplicationStandby
+        | PostgresRuntimeRole::ServingPrimary => QUARANTINE_HBA_CONTENT,
         PostgresRuntimeRole::ReplicationBootstrapPrimary => {
             REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT
         }
@@ -4757,9 +4803,15 @@ fn hba_policy_name(role: PostgresRuntimeRole) -> &'static str {
             "PostgreSQL replication-bootstrap-primary HBA file"
         }
         PostgresRuntimeRole::ReplicationStandby => "PostgreSQL replication-standby HBA file",
+        PostgresRuntimeRole::ServingPrimary => "PostgreSQL serving-primary HBA file",
     }
 }
 
+#[allow(
+    clippy::match_same_arms,
+    reason = "the serving arm coincides with quarantine only because the serving HBA \
+              policy is not settled; merging them would hide that choice"
+)]
 fn invalid_hba(role: PostgresRuntimeRole, path: &Path) -> PostgresError {
     match role {
         PostgresRuntimeRole::Quarantine => PostgresError::InvalidQuarantineHba {
@@ -4771,6 +4823,11 @@ fn invalid_hba(role: PostgresRuntimeRole, path: &Path) -> PostgresError {
             }
         }
         PostgresRuntimeRole::ReplicationStandby => PostgresError::InvalidReplicationStandbyHba {
+            path: path.to_owned(),
+        },
+        // The serving primary is held to the quarantine policy, so it reports the
+        // violation of that policy rather than inventing one it does not enforce.
+        PostgresRuntimeRole::ServingPrimary => PostgresError::InvalidQuarantineHba {
             path: path.to_owned(),
         },
     }
@@ -5021,6 +5078,9 @@ fn validate_managed_member_name(name: &str) -> Result<(), PostgresConfigError> {
 /// Invalid opt-in postmaster configuration.
 #[derive(Debug, Error)]
 pub enum PostgresConfigError {
+    /// The serving-primary role has no supervisor yet, so no config may carry it.
+    #[error("PostgreSQL serving-primary role is not supervised yet")]
+    ServingPrimaryNotYetSupervised,
     /// Standby fields and runtime role did not form one exact composition.
     #[error("PostgreSQL standby settings are incomplete or supplied for another runtime role")]
     InvalidStandbyComposition,
@@ -5104,6 +5164,11 @@ pub enum PostgresConfigError {
 /// Offline validation or direct-child supervision failure.
 #[derive(Debug, Error)]
 pub enum PostgresError {
+    /// Reached only if the config-level refusal is lifted before the supervisor
+    /// exists; supervising a serving primary as anything else is what this
+    /// prevents.
+    #[error("PostgreSQL serving-primary role is not supervised yet")]
+    ServingPrimaryNotYetSupervised,
     /// The per-PGDATA cross-namespace supervisor lock could not be opened.
     #[error("open PostgreSQL supervisor lock {path:?}: {source}")]
     OpenSupervisorLock {
@@ -6291,6 +6356,46 @@ mod tests {
                 Err(error) => panic!("lock released after first agent exits: {error}"),
             }
         }
+    }
+
+    /// The variant exists so every role decision is written down, but nothing
+    /// supervises a serving primary yet. Refusing the config is what keeps the
+    /// placeholder answers below from ever being the answers a running node got.
+    #[test]
+    fn a_serving_primary_config_cannot_be_built_yet() {
+        assert!(matches!(
+            PostgresConfig::new_for_role(
+                PostgresRuntimeRole::ServingPrimary,
+                None,
+                GenerationDurability::Local,
+                PathBuf::from("/data"),
+                PathBuf::from("/bin/postgres"),
+                PathBuf::from("/run/pgshard"),
+                PathBuf::from("/etc/pgshard/quarantine.pg_hba.conf"),
+                Duration::from_secs(5),
+                Duration::from_secs(40),
+                Duration::from_secs(5),
+            ),
+            Err(PostgresConfigError::ServingPrimaryNotYetSupervised)
+        ));
+
+        // The refusal must not depend on the other arguments being wrong: the
+        // same call for a role that is supervised succeeds.
+        assert!(
+            PostgresConfig::new_for_role(
+                PostgresRuntimeRole::Quarantine,
+                None,
+                GenerationDurability::Local,
+                PathBuf::from("/data"),
+                PathBuf::from("/bin/postgres"),
+                PathBuf::from("/run/pgshard"),
+                PathBuf::from("/etc/pgshard/quarantine.pg_hba.conf"),
+                Duration::from_secs(5),
+                Duration::from_secs(40),
+                Duration::from_secs(5),
+            )
+            .is_ok()
+        );
     }
 
     #[test]
