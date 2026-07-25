@@ -17,6 +17,14 @@ import (
 
 const mib = int64(1024 * 1024)
 
+// Below this an autovacuum worker cannot make useful progress on a large
+// relation, so the worker count is reduced rather than each worker starved.
+const minimumAutovacuumWorkMem = 16 * mib
+
+// PostgreSQL 18's default autovacuum_worker_slots. It is restart-only, and it
+// is the real ceiling on autovacuum_max_workers.
+const autovacuumWorkerSlots = int64(16)
+
 var allowedOverrides = map[string]struct{}{
 	"autovacuum_analyze_scale_factor": {},
 	"autovacuum_max_workers":          {},
@@ -76,7 +84,11 @@ type Primary struct {
 }
 
 type Result struct {
-	MemoryBytes             int64
+	MemoryBytes int64
+	// Bytes the autovacuum fleet as a whole may occupy. Carried out of here
+	// because an override of the worker count is only safe against this, not
+	// against the worker count the budget happened to produce.
+	AutovacuumBudgetBytes   int64
 	CPUMilli                int64
 	ReservedBytes           int64
 	MaxConnections          int32
@@ -165,12 +177,30 @@ func Calculate(in Input) (Result, error) {
 
 	available := memory - reserved - shared
 	workMem := clamp64(available/(maxConnections*4), mib, 64*mib)
-	maintenance := clamp64(memory/20, 64*mib, 1024*mib)
 	cores := (cpu + 999) / 1000
 	workerProcesses := max64(8, cores*4+4)
 	parallelWorkers := max64(2, cores)
 	parallelWorkersPerGather := clamp64((cores+1)/2, 1, 4)
+
+	// Autovacuum is sized against memory as well as cores. Deriving the worker
+	// count from cores alone lets a skewed request -- many cores, little memory
+	// -- put a fleet of workers behind a maintenance_work_mem that was never
+	// charged against the budget, and each worker inherits that value unless
+	// autovacuum_work_mem is set. At cpu=12, memory=1Gi that reached 640MiB of
+	// autovacuum ceiling against a 256MiB budget, on top of a 256MiB
+	// shared_buffers, and the cgroup kills the postmaster.
+	autovacuumBudget := available / 4
 	autovacuumWorkers := clamp64(cores+1, 3, 10)
+	if affordable := autovacuumBudget / minimumAutovacuumWorkMem; affordable < autovacuumWorkers {
+		autovacuumWorkers = max64(1, affordable)
+	}
+	autovacuumWorkMem := clamp64(
+		autovacuumBudget/autovacuumWorkers,
+		minimumAutovacuumWorkMem,
+		256*mib,
+	)
+	// One session may run a manual VACUUM or CREATE INDEX alongside that fleet.
+	maintenance := clamp64(min64(memory/20, autovacuumBudget), 64*mib, 1024*mib)
 
 	operationSlots := int64(4) // reshard, schema, repair, and recovery consumers
 	physicalSlots := int64(in.MembersPerShard - 1)
@@ -201,6 +231,7 @@ func Calculate(in Input) (Result, error) {
 		// alone can retain WAL until pg_wal fills.
 		"archive_mode":                    "off",
 		"autovacuum_max_workers":          strconv.FormatInt(autovacuumWorkers, 10),
+		"autovacuum_work_mem":             formatMiB(autovacuumWorkMem),
 		"effective_cache_size":            formatMiB(effective),
 		"fsync":                           "on",
 		"full_page_writes":                "on",
@@ -267,6 +298,7 @@ func Calculate(in Input) (Result, error) {
 	}
 
 	return Result{
+		AutovacuumBudgetBytes:   autovacuumBudget,
 		MemoryBytes:             memory,
 		CPUMilli:                cpu,
 		ReservedBytes:           reserved,
@@ -295,7 +327,7 @@ func postgresqlString(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
-func ApplyOverrides(settings map[string]string, overrides map[string]string) error {
+func ApplyOverrides(settings map[string]string, overrides map[string]string, autovacuumBudgetBytes int64) error {
 	keys := make([]string, 0, len(overrides))
 	for key := range overrides {
 		keys = append(keys, key)
@@ -316,7 +348,7 @@ func ApplyOverrides(settings map[string]string, overrides map[string]string) err
 		if strings.ContainsAny(value, "\r\n\x00") {
 			return fmt.Errorf("PostgreSQL parameter %q must be a single line without NUL bytes", key)
 		}
-		if err := validateOverrideValue(key, value, settings); err != nil {
+		if err := validateOverrideValue(key, value, settings, autovacuumBudgetBytes); err != nil {
 			return fmt.Errorf("invalid PostgreSQL parameter %q: %w", key, err)
 		}
 	}
@@ -363,17 +395,42 @@ func ValidateStorage(settings map[string]string, storage resource.Quantity) erro
 	return nil
 }
 
-func validateOverrideValue(key, value string, settings map[string]string) error {
+// Parses an emitted "<n>MB" quantity, returning 0 when absent or malformed so
+// the caller keeps the process-slot bound rather than losing all bounds.
+func emittedMebibytes(value string) int64 {
+	parsed, err := strconv.ParseInt(strings.TrimSuffix(value, "MB"), 10, 64)
+	if err != nil || parsed <= 0 {
+		return 0
+	}
+	return parsed
+}
+
+func validateOverrideValue(key, value string, settings map[string]string, autovacuumBudgetBytes int64) error {
 	switch key {
 	case "autovacuum_analyze_scale_factor", "autovacuum_vacuum_scale_factor", "checkpoint_completion_target":
 		return validateFloatRange(value, 0, 1)
 	case "random_page_cost", "seq_page_cost":
 		return validateFloatRange(value, 0.1, 100)
 	case "autovacuum_max_workers":
-		maximum := int64(20)
-		if configured, err := strconv.ParseInt(settings["max_worker_processes"], 10, 64); err == nil && configured-4 < maximum {
-			// Reserve processes for parallel work and logical replication.
-			maximum = max64(1, configured-4)
+		// Autovacuum workers come from autovacuum_worker_slots, not from
+		// max_worker_processes: PostgreSQL 18 documents that a setting above
+		// autovacuum_worker_slots "will have no effect, since autovacuum
+		// workers are taken from the pool of slots established by that
+		// setting". Bounding by max_worker_processes accepted values that
+		// silently cap at the slot pool instead.
+		maximum := autovacuumWorkerSlots
+		if configured, err := strconv.ParseInt(settings["autovacuum_worker_slots"], 10, 64); err == nil && configured > 0 {
+			maximum = configured
+		}
+		// autovacuum_work_mem is not overridable, so the count is the only
+		// lever on the fleet's ceiling. Bound it by what the fleet's budget
+		// affords rather than by the count the budget happened to produce:
+		// when the per-worker size is capped, fewer workers are generated
+		// than the budget can pay for, and raising it is legitimate.
+		if workMem := emittedMebibytes(settings["autovacuum_work_mem"]); workMem > 0 && autovacuumBudgetBytes > 0 {
+			if affordable := autovacuumBudgetBytes / (workMem * mib); affordable < maximum {
+				maximum = max64(1, affordable)
+			}
 		}
 		return validateIntegerRange(value, 1, maximum)
 	case "autovacuum_vacuum_cost_limit":

@@ -3,6 +3,7 @@ package tuning
 import (
 	"encoding/json"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -228,10 +229,10 @@ func TestCalculateRejectsQuantitiesBeforeIntegerOverflow(t *testing.T) {
 func TestApplyOverridesRejectsOwnedSafetySettings(t *testing.T) {
 	t.Parallel()
 	settings := map[string]string{"fsync": "on"}
-	if err := ApplyOverrides(settings, map[string]string{"fsync": "off"}); err == nil {
+	if err := ApplyOverrides(settings, map[string]string{"fsync": "off"}, 0); err == nil {
 		t.Fatal("expected fsync override to be rejected")
 	}
-	if err := ApplyOverrides(settings, map[string]string{"max_wal_size": "4GB"}); err != nil {
+	if err := ApplyOverrides(settings, map[string]string{"max_wal_size": "4GB"}, 0); err != nil {
 		t.Fatalf("safe override rejected: %v", err)
 	}
 	if settings["max_wal_size"] != "4GB" {
@@ -245,7 +246,7 @@ func TestApplyOverridesIsAtomicOnValidationFailure(t *testing.T) {
 	err := ApplyOverrides(settings, map[string]string{
 		"max_wal_size": "4GB",
 		"wal_level":    "minimal",
-	})
+	}, 0)
 	if err == nil {
 		t.Fatal("expected unsafe override to fail")
 	}
@@ -259,7 +260,7 @@ func TestApplyOverridesRejectsConfigurationInjection(t *testing.T) {
 	settings := map[string]string{"fsync": "on"}
 	err := ApplyOverrides(settings, map[string]string{
 		"log_statement": "none\nfsync = off",
-	})
+	}, 0)
 	if err == nil {
 		t.Fatal("expected multiline override to fail")
 	}
@@ -285,7 +286,7 @@ func TestApplyOverridesRejectsNonViableValues(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			settings := map[string]string{"max_worker_processes": "8", "min_wal_size": "80MB", "max_wal_size": "1GB"}
-			if err := ApplyOverrides(settings, overrides); err == nil {
+			if err := ApplyOverrides(settings, overrides, 0); err == nil {
 				t.Fatalf("unsafe overrides accepted: %#v", overrides)
 			}
 		})
@@ -308,7 +309,7 @@ func TestApplyOverridesAcceptsBoundedValues(t *testing.T) {
 		"min_wal_size":                    "1GB",
 		"random_page_cost":                "1.1",
 	}
-	if err := ApplyOverrides(settings, overrides); err != nil {
+	if err := ApplyOverrides(settings, overrides, 0); err != nil {
 		t.Fatalf("bounded overrides rejected: %v", err)
 	}
 }
@@ -325,5 +326,109 @@ func TestValidateStorageBoundsCheckpointWAL(t *testing.T) {
 	settings["max_wal_size"] = "2GB"
 	if err := ValidateStorage(settings, resource.MustParse("4Gi")); err == nil || !strings.Contains(err.Error(), "one quarter") {
 		t.Fatalf("oversized WAL budget accepted: %v", err)
+	}
+}
+
+// The generated settings must fit the container's memory limit. The suite
+// otherwise exercises only balanced core/memory ratios, which is why a fleet of
+// autovacuum workers sized from cores alone, each inheriting an uncharged
+// maintenance_work_mem, went unnoticed.
+func TestSkewedResourceRatiosStayInsideTheMemoryLimit(t *testing.T) {
+	for _, shape := range []struct {
+		cpu, memory string
+	}{
+		{"12", "1Gi"}, {"16", "1Gi"}, {"8", "2Gi"}, {"16", "2Gi"},
+		{"4", "4Gi"}, {"16", "8Gi"}, {"1", "2Gi"}, {"2", "1Gi"},
+	} {
+		result, err := Calculate(Input{
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse(shape.cpu),
+					corev1.ResourceMemory: resource.MustParse(shape.memory),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse(shape.cpu),
+					corev1.ResourceMemory: resource.MustParse(shape.memory),
+				},
+			},
+			PoolerMaxReplicas: 1, MembersPerShard: 1, MaximumChangeStreams: 1,
+		})
+		if err != nil {
+			continue // a shape this small is rejected outright, which is also safe
+		}
+		workMem := mebibytes(t, result.Settings["autovacuum_work_mem"])
+		if workMem < minimumAutovacuumWorkMem/mib {
+			t.Fatalf("cpu=%s memory=%s starves autovacuum workers at %dMB", shape.cpu, shape.memory, workMem)
+		}
+		workers, err := strconv.ParseInt(result.Settings["autovacuum_max_workers"], 10, 64)
+		if err != nil {
+			t.Fatalf("autovacuum_max_workers is not an integer: %v", err)
+		}
+		shared := mebibytes(t, result.Settings["shared_buffers"])
+		maintenance := mebibytes(t, result.Settings["maintenance_work_mem"])
+		autovacuum := workers * workMem
+		// The fleet has a budget share; exceeding it is what a worker count
+		// derived from cores alone does, and the totals below can still look
+		// affordable while it does.
+		budget := (result.MemoryBytes-result.ReservedBytes)/mib - shared
+		if ceiling := max64(budget/4, minimumAutovacuumWorkMem/mib); autovacuum > ceiling {
+			t.Fatalf("cpu=%s memory=%s lets %d autovacuum workers reach %dMB against a %dMB share",
+				shape.cpu, shape.memory, workers, autovacuum, ceiling)
+		}
+		// shared_buffers, the whole autovacuum fleet, and one concurrent manual
+		// maintenance operation, all against the limit the cgroup enforces.
+		committed := shared + autovacuum + maintenance
+		limit := result.MemoryBytes / mib
+		if committed >= limit {
+			t.Fatalf("cpu=%s memory=%s commits %dMB (shared=%d autovacuum=%d*%d maintenance=%d) of a %dMB limit before the postmaster, backends or worker slots",
+				shape.cpu, shape.memory, committed, shared, workers, workMem, maintenance, limit)
+		}
+	}
+}
+
+func mebibytes(t *testing.T, value string) int64 {
+	t.Helper()
+	parsed, err := strconv.ParseInt(strings.TrimSuffix(value, "MB"), 10, 64)
+	if err != nil {
+		t.Fatalf("setting %q is not a MB quantity: %v", value, err)
+	}
+	return parsed
+}
+
+// autovacuum_work_mem is sized for the generated worker count against a fixed
+// share of the memory budget, and is not itself overridable. Raising the count
+// therefore multiplies the ceiling the generation exists to bound, so an
+// override may only lower it.
+func TestAutovacuumWorkerOverrideCannotExceedTheMemoryBudget(t *testing.T) {
+	result, err := Calculate(Input{
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("12"),
+				corev1.ResourceMemory: resource.MustParse("1Gi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("12"),
+				corev1.ResourceMemory: resource.MustParse("1Gi"),
+			},
+		},
+		PoolerMaxReplicas: 1, MembersPerShard: 1, MaximumChangeStreams: 1,
+	})
+	if err != nil {
+		t.Fatalf("a 12 core, 1Gi shape must be accepted: %v", err)
+	}
+	budgeted, err := strconv.ParseInt(result.Settings["autovacuum_max_workers"], 10, 64)
+	if err != nil {
+		t.Fatalf("autovacuum_max_workers is not an integer: %v", err)
+	}
+	// max_worker_processes is 52 for this shape, so the process-slot bound
+	// alone would permit 20 — far past what the memory share can afford.
+	if err := validateOverrideValue("autovacuum_max_workers", strconv.FormatInt(budgeted+1, 10), result.Settings, result.AutovacuumBudgetBytes); err == nil {
+		t.Fatalf("an override of %d workers was accepted against a budget for %d", budgeted+1, budgeted)
+	}
+	if err := validateOverrideValue("autovacuum_max_workers", strconv.FormatInt(budgeted, 10), result.Settings, result.AutovacuumBudgetBytes); err != nil {
+		t.Fatalf("the budgeted worker count was rejected: %v", err)
+	}
+	if err := validateOverrideValue("autovacuum_max_workers", "1", result.Settings, result.AutovacuumBudgetBytes); err != nil {
+		t.Fatalf("lowering the worker count was rejected: %v", err)
 	}
 }
