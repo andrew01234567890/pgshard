@@ -310,7 +310,7 @@ fn audit(base: &str, head: &str) -> Result<()> {
             "-m",
             "--no-commit-id",
             "--name-only",
-            "--diff-filter=ACMR",
+            HISTORY_DIFF_FILTER,
             "-r",
             commit,
             "--",
@@ -324,6 +324,11 @@ fn audit(base: &str, head: &str) -> Result<()> {
     println!("public repository audit passed for {range}");
     Ok(())
 }
+
+/// Lowercase excludes, so this audits every status except deletion, which has
+/// no child-tree content. An allowlist silently omits whatever git adds next;
+/// this cannot.
+const HISTORY_DIFF_FILTER: &str = "--diff-filter=d";
 
 fn audit_repository_path(path: &str) -> Result<()> {
     ensure!(
@@ -360,15 +365,283 @@ fn github_commit_details_are_verified(details: &GitHubCommitDetails, sha: &str) 
 }
 
 fn audit_content(path: &str, content: &str) -> Result<()> {
-    let forbidden = [
-        ["/", "home", "/"].concat(),
-        ["BEGIN ", "OPENSSH PRIVATE KEY"].concat(),
-        ["BEGIN ", "RSA PRIVATE KEY"].concat(),
-        ["github", "_pat_"].concat(),
-        ["gh", "p_"].concat(),
-        ["AK", "IA"].concat(),
-    ];
+    audit_plain_content(path, content)?;
+    audit_encoded_content(path, content)
+}
+
+/// A Kubernetes Secret carries `tls.key` as base64 of the whole PEM, so the
+/// delimiters never appear as text. Committing a rendered Secret is the most
+/// likely way a private key reaches this repository, and it is exactly the form
+/// a text scan cannot see.
+fn audit_encoded_content(path: &str, content: &str) -> Result<()> {
+    for_each_base64_run(content, |run| audit_encoded_run(path, run))
+}
+
+/// The encoded length of a twenty-byte access key id, which is the shortest
+/// credential any forbidden pattern can match in full. Sixty-four sat above an
+/// access key id and above a forty-byte access token alike, so the rendered
+/// Secret this decoding exists for was skipped unread.
+const MIN_ENCODED: usize = 28;
+
+fn audit_encoded_run(path: &str, run: &str) -> Result<()> {
+    if run.len() < MIN_ENCODED {
+        return Ok(());
+    }
+    // A run can carry a character the encoding did not. A patch marks each line
+    // with a plus, which is in the alphabet and so is absorbed instead of
+    // separating anything, and a character picked up at either end leaves a
+    // length that is not a whole number of quanta. Decoding is quantum-local, so
+    // starting one, two or three characters in recovers everything past the
+    // first boundary. Every alignment is decoded, because a run that decodes is
+    // not thereby shown to be the alignment that was encoded.
+    for offset in 0..4 {
+        let tail = &run[offset..];
+        let quanta = tail.len() - tail.len() % 4;
+        if quanta < MIN_ENCODED {
+            break;
+        }
+        let Ok(decoded) =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &tail[..quanta])
+        else {
+            continue;
+        };
+        // One level only: a decode of a decode is not a form anyone commits by
+        // accident, and recursing would make the audit unbounded.
+        audit_plain_content(
+            &format!("{path} (base64-encoded)"),
+            &String::from_utf8_lossy(&decoded),
+        )?;
+        // A run that is a whole number of quanta and decodes as it stands is an
+        // encoding as it stands. The other alignments would decode the same
+        // characters out of phase, which is only worth doing for a run that has
+        // already shown it carries something the encoding did not.
+        if offset == 0 && run.len().is_multiple_of(4) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+const fn is_base64_character(character: char) -> bool {
+    matches!(character, 'A'..='Z' | 'a'..='z' | '0'..='9' | '+' | '/' | '=')
+}
+
+/// Runs are offered four ways: as they fall on each line, rejoined from the
+/// pieces one line was broken into, rejoined across lines that hold nothing but
+/// encoded text, and rejoined across lines that hold one substantial run inside
+/// decoration. Over-joining costs nothing here because a joined string is never
+/// judged as text; it is decoded, and only the decoded bytes are matched.
+fn for_each_base64_run(content: &str, mut visit: impl FnMut(&str) -> Result<()>) -> Result<()> {
     for line in content.lines() {
+        for run in line.split(|character: char| !is_base64_character(character)) {
+            if !run.is_empty() {
+                visit(run)?;
+            }
+        }
+        // What separates the pieces of a value collapsed onto one line is a
+        // two-character escape whose letter is in the alphabet, so joining the
+        // pieces without taking the escape out first would splice a stray
+        // character into the middle of the value.
+        let unescaped;
+        let joinable = if line.contains('\\') {
+            unescaped = line
+                .replace(ESCAPED_NEWLINE, " ")
+                .replace(ESCAPED_RETURN, " ")
+                .replace(ESCAPED_TAB, " ");
+            unescaped.as_str()
+        } else {
+            line
+        };
+        let pieces = || {
+            joinable
+                .split(|character: char| !is_base64_character(character))
+                .filter(|run| !run.is_empty())
+        };
+        // Counted before anything is collected, so a line that cannot hold an
+        // encoded credential costs nothing.
+        if pieces().take(2).count() > 1 && pieces().map(str::len).sum::<usize>() >= MIN_ENCODED {
+            visit_rejoined(&pieces().collect::<Vec<_>>(), &mut visit)?;
+        }
+    }
+    rejoin_wrapped_lines(content, &mut visit)?;
+    rejoin_decorated_lines(content, &mut visit)
+}
+
+/// Wrapping splits an encoded key across lines, and a line decoded on its own is
+/// a window whose edges fall wherever the wrap fell, so whether a delimiter is
+/// visible is decided by the length of whatever preceded the key. Contiguous
+/// wrapped lines are rejoined into the run they were split from, together with
+/// the trailing run of the line the wrap continues, which is what a value folded
+/// after its own key name looks like and is misaligned without it.
+fn rejoin_wrapped_lines(content: &str, visit: &mut impl FnMut(&str) -> Result<()>) -> Result<()> {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut continues_a_line = false;
+    let mut trailing = "";
+
+    for line in content.lines() {
+        let body = line.trim();
+        if !body.is_empty() && body.chars().all(is_base64_character) {
+            if parts.is_empty() && !trailing.is_empty() {
+                continues_a_line = true;
+                parts.push(trailing);
+            }
+            parts.push(body);
+        } else {
+            visit_wrapped(&parts, continues_a_line, visit)?;
+            parts.clear();
+            continues_a_line = false;
+        }
+        trailing = trailing_base64_run(line);
+    }
+    visit_wrapped(&parts, continues_a_line, visit)
+}
+
+/// A single wrapped line that continues nothing was already offered on its own.
+fn visit_wrapped(
+    parts: &[&str],
+    continues_a_line: bool,
+    visit: &mut impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    let lines_joined = parts.len() - usize::from(continues_a_line);
+    if lines_joined > 1 || (lines_joined == 1 && continues_a_line) {
+        visit_rejoined(parts, visit)?;
+    }
+    Ok(())
+}
+
+/// Wrapped base64 does not always arrive naked. A patch marks every line with a
+/// plus, a C literal quotes every line, a shell continues every line with a
+/// backslash and a sequence introduces every line with a dash. Each such line
+/// still carries one substantial run, so those runs are rejoined as well.
+fn rejoin_decorated_lines(content: &str, visit: &mut impl FnMut(&str) -> Result<()>) -> Result<()> {
+    /// Below any width a tool wraps at, and above the identifiers that make
+    /// consecutive lines of ordinary code look like encoded text.
+    const MIN_DECORATED: usize = 16;
+
+    let mut parts: Vec<&str> = Vec::new();
+    let mut naked = true;
+
+    for line in content.lines() {
+        let body = line.trim();
+        let run = longest_base64_run(body.strip_prefix('+').unwrap_or(body));
+        if run.len() >= MIN_DECORATED {
+            naked &= run == body;
+            parts.push(run);
+        } else {
+            visit_decorated(&parts, naked, visit)?;
+            parts.clear();
+            naked = true;
+        }
+    }
+    visit_decorated(&parts, naked, visit)
+}
+
+/// Lines carrying nothing but encoded text are what the wrapped rejoin covers.
+fn visit_decorated(
+    parts: &[&str],
+    naked: bool,
+    visit: &mut impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    if parts.len() > 1 && !naked {
+        visit_rejoined(parts, visit)?;
+    }
+    Ok(())
+}
+
+const ESCAPED_NEWLINE: &str = "\\n";
+const ESCAPED_RETURN: &str = "\\r";
+const ESCAPED_TAB: &str = "\\t";
+
+/// The longest span the windowing guarantees a rule is shown whole. Every
+/// pattern matched here is tens of bytes; what is long is a private key
+/// collapsed onto one line, read from its opening delimiter to its closing one,
+/// and an exported keyring of several large keys reaches tens of kilobytes.
+///
+/// This bounds the overlap and nothing else. The rule that reads the longest
+/// span reads a span of any length, because refusing to judge a body for being
+/// long turns a concern about window seams into a key that is never looked at:
+/// a span longer than this is still read wherever it appears, and only its
+/// detection across a seam inside a group large enough to be windowed is
+/// unguaranteed.
+const MAX_RULE_SPAN: usize = 64 << 10;
+
+/// Derived rather than chosen, because an overlap shorter than the longest span
+/// a rule needs is a rule that stops working at a seam, and that is how a
+/// collapsed key came to be missed once already. Counted in characters, because
+/// a window holds encoded text.
+const WINDOW_OVERLAP: usize = MAX_RULE_SPAN.div_ceil(3) * 4;
+
+/// The relationship the two constants above have to hold, checked where it
+/// cannot be argued with: an overlap that decodes to less than the longest span
+/// a rule reads is a rule that stops working at a seam, and lowering either
+/// constant without the other stops this compiling.
+const _: () = assert!(WINDOW_OVERLAP / 4 * 3 >= MAX_RULE_SPAN);
+
+/// A group is offered in windows rather than as one string, because a blob that
+/// is nothing but wrapped base64 would otherwise be copied whole into memory and
+/// decoded whole beside it. Consecutive windows overlap by the longest span any
+/// rule reads, and each one begins a whole number of quanta into the group, so a
+/// seam hides nothing and shifts nothing.
+fn visit_rejoined(parts: &[&str], visit: &mut impl FnMut(&str) -> Result<()>) -> Result<()> {
+    const WINDOW: usize = 4 << 20;
+
+    let total: usize = parts.iter().map(|part| part.len()).sum();
+    let longest = parts
+        .iter()
+        .map(|part| part.len())
+        .max()
+        .unwrap_or_default();
+    let mut window = String::with_capacity(total.min(WINDOW) + longest);
+    for part in parts {
+        window.push_str(part);
+        if window.len() >= WINDOW {
+            visit(&window)?;
+            let dropped = (window.len() - WINDOW_OVERLAP) / 4 * 4;
+            window.drain(..dropped);
+        }
+    }
+    if !window.is_empty() {
+        visit(&window)?;
+    }
+    Ok(())
+}
+
+fn longest_base64_run(text: &str) -> &str {
+    text.split(|character: char| !is_base64_character(character))
+        .max_by_key(|run| run.len())
+        .unwrap_or_default()
+}
+
+fn trailing_base64_run(line: &str) -> &str {
+    let line = line.trim_end();
+    let start = line
+        .char_indices()
+        .rev()
+        .take_while(|(_, character)| is_base64_character(*character))
+        .last()
+        .map_or(line.len(), |(at, _)| at);
+    &line[start..]
+}
+
+fn audit_plain_content(path: &str, content: &str) -> Result<()> {
+    let forbidden = forbidden_patterns();
+    for line in content.lines() {
+        ensure!(
+            !is_private_key_delimiter(line),
+            "content in {path} carries a private-key delimiter"
+        );
+        ensure!(
+            !carries_collapsed_private_key(line),
+            "content in {path} carries a collapsed private key"
+        );
+        ensure!(
+            !carries_prefixed_credential(line),
+            "content in {path} matched a forbidden sensitive-data pattern"
+        );
+        ensure!(
+            !carries_password_bearing_dsn(line),
+            "content in {path} carries a connection string with an inline password"
+        );
         if let Some(pattern) = forbidden.iter().find(|pattern| line.contains(*pattern)) {
             ensure!(
                 is_legacy_scanner_fixture(path, line, pattern),
@@ -379,8 +652,468 @@ fn audit_content(path: &str, content: &str) -> Result<()> {
     Ok(())
 }
 
+/// Each entry is assembled at run time so that this source never carries the
+/// pattern it looks for, which is what lets the audit scan its own history.
+fn forbidden_patterns() -> [String; 19] {
+    [
+        ["/", "home", "/"].concat(),
+        ["BEGIN ", "OPENSSH PRIVATE KEY"].concat(),
+        ["BEGIN ", "RSA PRIVATE KEY"].concat(),
+        ["github", "_pat_"].concat(),
+        ["gh", "p_"].concat(),
+        ["gh", "s_"].concat(),
+        ["gh", "o_"].concat(),
+        ["gh", "u_"].concat(),
+        ["gh", "r_"].concat(),
+        ["AK", "IA"].concat(),
+        ["gl", "pat-"].concat(),
+        ["sk-", "ant-"].concat(),
+        ["dckr", "_pat_"].concat(),
+        ["xox", "b-"].concat(),
+        ["xox", "p-"].concat(),
+        ["xox", "a-"].concat(),
+        ["xox", "s-"].concat(),
+        ["xox", "r-"].concat(),
+        ["xox", "e-"].concat(),
+    ]
+}
+
+/// A credential prefix, the number of body characters its issuer emits after it,
+/// and the alphabet that body is drawn from.
+type PrefixedCredential = (String, usize, fn(char) -> bool);
+
+/// A four-character prefix is not evidence on its own: one of these spells a
+/// continent and another introduces every environment variable the node package
+/// manager exports. They are a credential only when the body the issuer emits
+/// follows the prefix in full.
+fn carries_prefixed_credential(line: &str) -> bool {
+    let prefixed: [PrefixedCredential; 3] = [
+        (["AS", "IA"].concat(), 16, is_access_key_character),
+        (["AI", "za"].concat(), 35, is_google_key_character),
+        (["npm", "_"].concat(), 36, is_base62_character),
+    ];
+    prefixed.iter().any(|(prefix, body, permitted)| {
+        line.match_indices(prefix.as_str()).any(|(at, _)| {
+            line[at + prefix.len()..]
+                .chars()
+                .take_while(|character| permitted(*character))
+                .count()
+                >= *body
+        })
+    })
+}
+
+fn is_base62_character(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+}
+
+fn is_access_key_character(character: char) -> bool {
+    character.is_ascii_uppercase() || character.is_ascii_digit()
+}
+
+fn is_google_key_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+}
+
+/// The credential this project will hold most of is a database password, and no
+/// pattern describes one. Only the shape of the string that carries it does.
+///
+/// What this shape does not cover, so that the next reader does not have to
+/// discover it: a password passed as a query parameter rather than as userinfo,
+/// the key-and-value form `libpq` also accepts, a scheme belonging to another
+/// database, and a password containing one of the characters that ends the
+/// string being read. Each is a separate shape rather than a wider pattern.
+fn carries_password_bearing_dsn(line: &str) -> bool {
+    if !line.contains("://") {
+        return false;
+    }
+    // Lowercased only to find the scheme, because lowercasing what is then
+    // compared against the exemption would let a password differing only in
+    // case reach it. Lowercasing ASCII does not move any byte, so the offsets
+    // hold in the line itself.
+    let lowered = line.to_ascii_lowercase();
+    let schemes = [["postgres", "://"].concat(), ["postgresql", "://"].concat()];
+    schemes.iter().any(|scheme| {
+        lowered.match_indices(scheme.as_str()).any(|(at, _)| {
+            let dsn = connection_string_at(&line[at..]);
+            dsn_carries_a_password(dsn, scheme.len()) && !PERMITTED_TEST_DSNS.contains(&dsn)
+        })
+    })
+}
+
+fn connection_string_at(text: &str) -> &str {
+    let end = text
+        .find(|character: char| {
+            character.is_whitespace() || matches!(character, '"' | '\'' | '`' | '\\' | '<' | '>')
+        })
+        .unwrap_or(text.len());
+    &text[..end]
+}
+
+fn dsn_carries_a_password(dsn: &str, scheme: usize) -> bool {
+    let Some(authority) = dsn.get(scheme..) else {
+        return false;
+    };
+    let authority = &authority[..authority.find(['/', '?', '#']).unwrap_or(authority.len())];
+    authority
+        .rsplit_once('@')
+        .and_then(|(userinfo, _)| userinfo.split_once(':'))
+        .is_some_and(|(_, password)| !password.is_empty())
+}
+
+/// Exact strings, because an exemption that recognised a shape could be shaped
+/// to. These are the loopback connection strings this repository's own workflow
+/// and README have carried throughout its history; reaching this exemption
+/// requires a leaked password to be one of these two, on this loopback address,
+/// at one of these ports, against one of these databases.
+const PERMITTED_TEST_DSNS: [&str; 5] = [
+    "postgresql://postgres:password@127.0.0.1:5432/shardschema",
+    "postgresql://postgres:pgshard-ci-only@127.0.0.1:5432/postgres",
+    "postgresql://postgres:pgshard-ci-only@127.0.0.1:5432/shardschema",
+    "postgresql://postgres:pgshard-ci-only@127.0.0.1:5433/shardschema",
+    "postgresql://postgres:pgshard-ci-only@127.0.0.1:5434/shardschema",
+];
+
+/// Code that validates PEM has to name the delimiter, so matching it anywhere in
+/// a line rejects the agent's own key-file validator. A leaked key carries the
+/// delimiter as a whole line; a validator embeds it in an expression.
+fn is_private_key_delimiter(line: &str) -> bool {
+    let line = line.trim_start();
+    // A key written into a multi-line literal closes with the quoting of
+    // whatever embedded it rather than with a newline, so the anchor has to look
+    // past that quoting.
+    let line = line.trim_end_matches(|character: char| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                '"' | '\'' | '`' | ',' | ';' | ')' | '}' | ']' | '\\'
+            )
+    });
+    is_whole_line_private_key_delimiter(line) || is_putty_private_key_header(line)
+}
+
+/// The whole of the line and nothing else: a line that opens with a delimiter
+/// and closes with one has something in between, and what that something is
+/// decides, which is the collapsed rule's job and not this one's. Every format's
+/// delimiter is recognised here, including the four-dash spaced form that
+/// `ssh-keygen -e` writes for RFC 4716.
+fn is_whole_line_private_key_delimiter(line: &str) -> bool {
+    private_key_delimiter_forms()
+        .into_iter()
+        .any(|(opens, closes, label_end)| {
+            [opens, closes]
+                .iter()
+                .any(|opening| delimiter_span(line, opening, &label_end) == Some((0, line.len())))
+        })
+}
+
+/// A `PuTTY` key file carries no delimiter of any kind: a version header and the
+/// line introducing the private body are its only markers. Both are followed by
+/// a value the format fixes, and requiring that value is what keeps prose that
+/// merely opens with the same words from being read as a key.
+fn is_putty_private_key_header(line: &str) -> bool {
+    if let Some(version) = line.strip_prefix(&["PuTTY-User-", "Key-File-"].concat()) {
+        let after_version =
+            version.trim_start_matches(|character: char| character.is_ascii_digit());
+        return after_version.len() < version.len() && after_version.starts_with(':');
+    }
+    if let Some(count) = line.strip_prefix(&["Private-", "Lines:"].concat()) {
+        let count = count.trim();
+        return !count.is_empty() && count.chars().all(|character| character.is_ascii_digit());
+    }
+    false
+}
+
+/// A key collapsed onto one line carries both delimiters with its body between
+/// them, and so does source that merely names them. No measurement of what lies
+/// between separates the two: the longest run, the total, and the total with an
+/// average were each tried, and each let a body through at some wrap width or
+/// refused ordinary source at some identifier length. What separates them is not
+/// a length at all. A key body is base64 that decodes to a private key, and a
+/// private key has a determinate structure that source code does not have, so
+/// the body is decoded and the structure decides.
+fn carries_collapsed_private_key(line: &str) -> bool {
+    let Some(body) = collapsed_private_key_body(line) else {
+        return false;
+    };
+    if carries_encrypted_pem_headers(body) {
+        return true;
+    }
+    // The escapes that put the body on one line are not part of it, and the
+    // letter in each is in the alphabet, so they come out before anything is
+    // joined.
+    let body = body
+        .replace(ESCAPED_NEWLINE, " ")
+        .replace(ESCAPED_RETURN, " ")
+        .replace(ESCAPED_TAB, " ");
+    // The body put back together, which is what a key wrapped, quoted or
+    // space-separated becomes; and each run on its own, which is what reaches
+    // the key material when a header precedes it inside the block, as an
+    // encrypted PEM and an armoured PGP block both have.
+    let rejoined = std::iter::once(body.as_str());
+    let alone = body.split(|character: char| !is_base64_character(character));
+    rejoined
+        .chain(alone)
+        .filter_map(decoded_key_candidate)
+        .any(|candidate| is_private_key_material(&candidate))
+}
+
+/// Whatever of the candidate is a whole number of quanta, decoded. Padding is
+/// dropped wherever it appears rather than only where it belongs, so that a body
+/// reassembled from pieces still decodes: nothing is skipped for being
+/// unreadable, because a key cut short or split apart is still a key.
+fn decoded_key_candidate(candidate: &str) -> Option<Vec<u8>> {
+    /// The shortest of the structures below is a sequence tag, a length and a
+    /// version, which is five bytes. Each structure bounds itself beyond that,
+    /// and a floor higher than the shortest one is a key cut short that nothing
+    /// looks at: measured against real `openssl` output, a floor of thirty-two
+    /// let a truncated Ed25519 and a truncated SEC1 key through.
+    const MIN_DECODED: usize = 5;
+
+    let encoded: String = candidate
+        .chars()
+        .filter(|character| is_base64_character(*character) && *character != '=')
+        .collect();
+    let quanta = encoded.len() - encoded.len() % 4;
+    let decoded = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        &encoded[..quanta],
+    )
+    .ok()?;
+    (decoded.len() >= MIN_DECODED).then_some(decoded)
+}
+
+/// A traditional encrypted key has no structure to decode: the encryption
+/// replaced its body with ciphertext, and ciphertext is indistinguishable from
+/// anything else. What identifies it is the header RFC 1421 requires the
+/// encryption to write into the block, and both halves of that header together
+/// appear between these delimiters in no other circumstance. Reading the body is
+/// therefore the wrong question for this one form, which is why asking it let
+/// every label but the two with separate literal cover through.
+fn carries_encrypted_pem_headers(body: &str) -> bool {
+    body.contains("Proc-Type:") && body.contains("DEK-Info:")
+}
+
+/// Every form these delimiters wrap that has a body worth decoding is one of
+/// four things: a DER object, an `OpenSSH` key, an `OpenPGP` secret-key packet,
+/// or an RFC 4716 key. A prefix of any of them counts, because a key cut short by
+/// a quote or a wrap is still a key.
+fn is_private_key_material(bytes: &[u8]) -> bool {
+    is_der_private_key(bytes)
+        || is_openssh_private_key(bytes)
+        || is_pgp_secret_key_packet(bytes)
+        || is_rfc4716_private_key(bytes)
+}
+
+/// The ssh.com format opens with a magic number rather than a structure.
+fn is_rfc4716_private_key(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0x3f, 0x6f, 0xf9, 0xeb])
+}
+
+/// PKCS#8, PKCS#1, SEC1 and the DSA and encrypted forms are all a SEQUENCE large
+/// enough to hold a key, opening either with the version integer of an unencrypted
+/// key or with the algorithm identifier of an encrypted one. The size is the one
+/// the SEQUENCE declares where it declares one, and what is present where it does
+/// not, since a BER indefinite length declares nothing.
+fn is_der_private_key(bytes: &[u8]) -> bool {
+    /// An Ed25519 key is forty-eight bytes of DER all told, the smallest anyone
+    /// issues. What follows the object is not measured, because a candidate
+    /// joined from the rest of a line carries whatever else that line held.
+    const MIN_DER_KEY: usize = 48;
+    const INTEGER: u8 = 0x02;
+    const OBJECT_IDENTIFIER: u8 = 0x06;
+
+    let Some((declared, header)) = der_sequence(bytes) else {
+        return false;
+    };
+    if header + declared < MIN_DER_KEY {
+        return false;
+    }
+    let contents = &bytes[header..];
+    matches!(contents, [INTEGER, 0x01, 0x00 | 0x01, ..])
+        || der_sequence(contents)
+            .is_some_and(|(_, algorithm)| contents.get(algorithm) == Some(&OBJECT_IDENTIFIER))
+}
+
+/// The declared length of a DER SEQUENCE and the width of its header.
+fn der_sequence(bytes: &[u8]) -> Option<(usize, usize)> {
+    const SEQUENCE: u8 = 0x30;
+    /// A length byte of `0x80` opens a BER indefinite length: the contents run to
+    /// an end-of-contents pair instead of declaring a size. DER forbids it, but
+    /// `OpenSSL` reads a key encoded that way, so refusing to recognise the SEQUENCE
+    /// at all would let one past. Measure what is present instead — this rule
+    /// already accepts a prefix, so an unterminated candidate is judged on the
+    /// same footing as a truncated definite-length one.
+    const INDEFINITE: u8 = 0x80;
+
+    if bytes.first() != Some(&SEQUENCE) {
+        return None;
+    }
+    let first = *bytes.get(1)?;
+    if first < 0x80 {
+        return Some((usize::from(first), 2));
+    }
+    if first == INDEFINITE {
+        return Some((bytes.len().saturating_sub(2), 2));
+    }
+    let width = usize::from(first & 0x7f);
+    if width == 0 || width > 4 {
+        return None;
+    }
+    let mut declared = 0usize;
+    for index in 0..width {
+        declared = (declared << 8) | usize::from(*bytes.get(2 + index)?);
+    }
+    Some((declared, 2 + width))
+}
+
+fn is_openssh_private_key(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"openssh-key-v1\0")
+}
+
+/// An armoured secret key opens with a packet tag: the top bit set, then the tag
+/// number, five for a secret key and seven for a secret subkey, in either the
+/// framing that predates RFC 4880 or the one it introduced. The packet body
+/// opens with its own version, three or four.
+fn is_pgp_secret_key_packet(bytes: &[u8]) -> bool {
+    const SECRET_KEY: u8 = 5;
+    const SECRET_SUBKEY: u8 = 7;
+    /// A tag and a version are three bytes of agreement, which is little enough
+    /// that the packet has to be long enough to be one as well. The smallest
+    /// secret key packet anyone writes is hundreds of bytes.
+    const MIN_PACKET: usize = 32;
+
+    if bytes.len() < MIN_PACKET {
+        return false;
+    }
+    let Some(&tag) = bytes.first() else {
+        return false;
+    };
+    let (number, header) = if tag & 0xc0 == 0xc0 {
+        let Some(&first) = bytes.get(1) else {
+            return false;
+        };
+        // Two octets for a length in the middle range, five for the marker
+        // that introduces a four-octet one, and one for everything else.
+        let length = match first {
+            192..=223 => 2,
+            255 => 5,
+            _ => 1,
+        };
+        (tag & 0x3f, 1 + length)
+    } else if tag & 0xc0 == 0x80 {
+        let length = match tag & 0x03 {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            _ => 0,
+        };
+        ((tag & 0x3c) >> 2, 1 + length)
+    } else {
+        return false;
+    };
+    matches!(number, SECRET_KEY | SECRET_SUBKEY) && matches!(bytes.get(header), Some(3 | 4))
+}
+
+/// Everything after the opening delimiter, up to the closing one where there is
+/// one. A key cut short by a quote, a wrap or a truncated paste has no closing
+/// delimiter and is still a key, so its absence bounds the body at the end of
+/// the line rather than abandoning it.
+fn collapsed_private_key_body(line: &str) -> Option<&str> {
+    private_key_delimiter_forms()
+        .into_iter()
+        .find_map(|(opens, closes, label_end)| {
+            let opened = delimiter_span(line, &opens, &label_end)?.1;
+            let body = &line[opened..];
+            let closed = delimiter_span(body, &closes, &label_end).map_or(body.len(), |at| at.0);
+            Some(&body[..closed])
+        })
+}
+
+/// The opening of a delimiter, the opening of the delimiter that closes the
+/// block, and the text that ends either. Split so this source carries none of
+/// them assembled.
+fn private_key_delimiter_forms() -> [(String, String, String); 3] {
+    let pem_open = ["-----", "BEGIN"].concat();
+    let pem_close = ["-----", "END"].concat();
+    [
+        (
+            pem_open.clone(),
+            pem_close.clone(),
+            [" PRIVATE ", "KEY-----"].concat(),
+        ),
+        (
+            pem_open,
+            pem_close,
+            [" PRIVATE ", "KEY BLOCK-----"].concat(),
+        ),
+        (
+            ["----", " BEGIN"].concat(),
+            ["----", " END"].concat(),
+            [" PRIVATE ", "KEY ----"].concat(),
+        ),
+    ]
+}
+
+/// Longer than `SSH2 ENCRYPTED`, which is the longest label any of these
+/// formats gives a private key.
+const MAX_LABEL: usize = 24;
+
+/// A delimiter is its opening, a label no longer than any format gives one, and
+/// the text that ends it. The cap is what stops a certificate delimiter earlier
+/// in the line from pairing with a key delimiter much later.
+fn delimiter_span(haystack: &str, opening: &str, label_end: &str) -> Option<(usize, usize)> {
+    haystack.match_indices(opening).find_map(|(at, _)| {
+        let labelled = haystack.get(at + opening.len()..)?;
+        let ends = labelled.find(label_end)?;
+        (ends <= MAX_LABEL).then_some((at, at + opening.len() + ends + label_end.len()))
+    })
+}
+
 fn audit_content_bytes(path: &str, content: &[u8]) -> Result<()> {
-    audit_content(path, &String::from_utf8_lossy(content))
+    ensure!(
+        !is_compressed(content),
+        "content in {path} is compressed, and the audit refuses what it cannot read"
+    );
+    let text = String::from_utf8_lossy(content);
+    audit_content(path, &text)?;
+    // UTF-16 and NUL-padded text keep every byte of a secret but never place two
+    // of its characters next to each other, so the same bytes are read again
+    // with the padding taken out. Decoding UTF-16 properly would add only the
+    // non-ASCII range, which no credential format uses.
+    if text.contains('\0') {
+        let mut stripped = String::with_capacity(text.len());
+        stripped.extend(text.chars().filter(|character| *character != '\0'));
+        audit_content(&format!("{path} (NUL-stripped)"), &stripped)?;
+    }
+    Ok(())
+}
+
+/// Reading inside a container means a decompressor for each of them, every one
+/// with its own bomb, and handling one of them is worse than handling none
+/// because it implies the rest are covered. The audit refuses what it cannot
+/// read instead of passing it, which turns a silent miss into a stop. A
+/// compressed asset added deliberately has to be exempted in the commit that
+/// adds it, because afterwards it is history and history is what is scanned.
+fn is_compressed(content: &[u8]) -> bool {
+    const MAGIC: [&[u8]; 9] = [
+        &[0x1f, 0x8b, 0x08],
+        b"PK\x03\x04",
+        b"PK\x07\x08",
+        &[0xfd, b'7', b'z', b'X', b'Z', 0x00],
+        &[0x28, 0xb5, 0x2f, 0xfd],
+        &[0x04, 0x22, 0x4d, 0x18],
+        b"7z\xbc\xaf\x27\x1c",
+        b"Rar!\x1a\x07",
+        // A zlib stream, whose header is a deflate method and one of the four
+        // levels a standard compressor writes. Bare deflate and brotli carry no
+        // header at all and cannot be recognised by any magic; those two remain
+        // unread, which is written here so the next reader is not surprised.
+        &[0x78, 0x9c],
+    ];
+    MAGIC.iter().any(|magic| content.starts_with(magic))
+        || (content.starts_with(b"BZh") && content.get(3).is_some_and(u8::is_ascii_digit))
+        || (content.starts_with(&[0x78]) && matches!(content.get(1), Some(0x01 | 0x5e | 0xda)))
 }
 
 fn is_legacy_scanner_fixture(path: &str, line: &str, pattern: &str) -> bool {
@@ -1840,6 +2573,1062 @@ mod tests {
         assert!(parse_bump("feat(scope)!!: change").is_err());
     }
 
+    fn encode(content: &str) -> String {
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            content.as_bytes(),
+        )
+    }
+
+    fn leaked_private_key() -> String {
+        leaked_private_key_of(4)
+    }
+
+    /// A key whose body is `lines` lines of the sixty-four characters `openssl`
+    /// wraps at.
+    fn leaked_private_key_of(lines: usize) -> String {
+        let mut body = String::new();
+        for line in 0..lines {
+            use std::fmt::Write;
+            writeln!(
+                body,
+                "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDB{line:012}"
+            )
+            .expect("writing to a string cannot fail");
+        }
+        [
+            "-----BEGIN ",
+            "PRIVATE ",
+            "KEY-----\n",
+            &body,
+            "-----END ",
+            "PRIVATE ",
+            "KEY-----\n",
+        ]
+        .concat()
+    }
+
+    /// The same key with its body rewrapped at `width`, which is what defeats
+    /// any rule that asks how long the longest unbroken run of it is.
+    fn rewrapped_private_key(lines: usize, width: usize) -> String {
+        let key = leaked_private_key_of(lines);
+        let mut parts = key.lines();
+        let begin = parts.next().expect("the opening delimiter");
+        let rest: Vec<&str> = parts.collect();
+        let (end, body) = rest.split_last().expect("the closing delimiter");
+        let body = body.concat();
+        let rewrapped = body
+            .as_bytes()
+            .chunks(width)
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{begin}\n{rewrapped}\n{end}\n")
+    }
+
+    /// A key with `preamble` bytes ahead of it, encoded. A bundle that puts a
+    /// certificate first, or a `Bag Attributes` header, is a preamble of some
+    /// length and nothing more, and the length is what decides where the edges
+    /// of every decoded window fall.
+    fn encoded_key(preamble: usize) -> String {
+        let ahead = if preamble == 0 {
+            String::new()
+        } else {
+            format!("{}\n", "#".repeat(preamble - 1))
+        };
+        assert_eq!(ahead.len(), preamble);
+        encode(&format!("{ahead}{}", leaked_private_key()))
+    }
+
+    /// That encoding wrapped at `width` into the block scalar of a Secret.
+    fn wrapped_key_manifest(preamble: usize, width: usize) -> String {
+        let wrapped = encoded_key(preamble)
+            .as_bytes()
+            .chunks(width)
+            .map(|chunk| format!("    {}", String::from_utf8_lossy(chunk)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("apiVersion: v1\nkind: Secret\ndata:\n  tls.key: |\n{wrapped}\n")
+    }
+
+    /// The forbidden list exists to catch credentials of the length their
+    /// issuers actually emit, and a rendered Secret carries them encoded, so the
+    /// length below which nothing is decoded has to sit under the shortest of
+    /// them rather than above it.
+    #[test]
+    fn an_encoded_credential_is_refused_at_the_length_its_issuer_emits() {
+        let secret = |value: &str| {
+            format!(
+                "apiVersion: v1\nkind: Secret\ndata:\n  value: {}\n",
+                encode(value)
+            )
+        };
+
+        let access_key = ["AK", "IA", "IOSFODNN7EXAMPLE"].concat();
+        assert_eq!(
+            access_key.len(),
+            20,
+            "an access key id is twenty characters"
+        );
+        assert_eq!(encode(&access_key).len(), 28);
+        assert!(
+            audit_content("secret.yaml", &secret(&access_key)).is_err(),
+            "an encoded access key id must be refused"
+        );
+
+        let token = ["gh", "s_", "0123456789abcdefghijklmnopqrstuvwxyz"].concat();
+        assert_eq!(token.len(), 40, "an access token is forty characters");
+        assert_eq!(encode(&token).len(), 56);
+        assert!(
+            audit_content("secret.yaml", &secret(&token)).is_err(),
+            "an encoded access token must be refused"
+        );
+
+        let key = leaked_private_key();
+        assert!(
+            !encode(&key).contains("PRIVATE"),
+            "the encoded form must not carry the delimiter as text, or this proves nothing"
+        );
+        assert!(audit_content("secret.yaml", &secret(&key)).is_err());
+
+        // Ordinary long hashes decode to noise and must not be rejected.
+        assert!(
+            audit_content(
+                "ok.lock",
+                &format!("checksum = \"{}\"", "a1b2c3d4".repeat(8))
+            )
+            .is_ok()
+        );
+        assert!(
+            audit_content(
+                "ok.lock",
+                &format!("integrity = \"{}\"", encode("harmless"))
+            )
+            .is_ok()
+        );
+    }
+
+    /// `base64 file` wraps at seventy-six characters and a block scalar wraps
+    /// wherever its writer chose, so an encoded key arrives as many short lines.
+    /// Decoded a line at a time, each is a window whose edges fall where the
+    /// wrap fell, and a delimiter straddling two of them is invisible. Whatever
+    /// precedes the key decides where those edges land, so the sweep varies it:
+    /// a certificate ahead of the key in a bundle, or a `Bag Attributes`
+    /// preamble, is nothing more than a preamble of some length.
+    #[test]
+    fn a_wrapped_key_is_refused_at_every_alignment() {
+        let mut missed = Vec::new();
+        let mut cases = 0usize;
+        for width in [8, 13, 32, 64, 76] {
+            for length in 0..48usize {
+                cases += 1;
+                if audit_content("secret.yaml", &wrapped_key_manifest(length, width)).is_ok() {
+                    missed.push((width, length));
+                }
+            }
+        }
+        assert_eq!(cases, 240);
+        assert!(
+            missed.is_empty(),
+            "a wrapped key escaped {} of {cases} times, at (width, preamble) {missed:?}",
+            missed.len()
+        );
+    }
+
+    /// Two lines is the first count that has to be rejoined at all, and a
+    /// rejoin that starts at three passes every other test in this file. What
+    /// exposes it is a credential that straddles the wrap: each line decodes to
+    /// a window that holds part of it and no window holds all of it, so nothing
+    /// short of putting the lines back together sees it.
+    #[test]
+    fn a_credential_wrapped_onto_each_small_number_of_lines_is_refused() {
+        let token = ["gh", "p_", "0123456789abcdefghijklmnopqrstuvwxyz"].concat();
+        let mut missed = Vec::new();
+        let mut cases = 0usize;
+        for lines in 2..=6usize {
+            for preamble in 9..48usize {
+                cases += 1;
+                let encoded = encode(&format!("{}{token}", "#".repeat(preamble)));
+                let width = encoded.len().div_ceil(lines);
+                let wrapped = encoded
+                    .as_bytes()
+                    .chunks(width)
+                    .map(|chunk| format!("    {}", String::from_utf8_lossy(chunk)))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    wrapped.len(),
+                    lines,
+                    "the fixture must wrap onto {lines} lines"
+                );
+                let manifest = format!("data:\n  token: |\n{}\n", wrapped.join("\n"));
+                if audit_content("secret.yaml", &manifest).is_ok() {
+                    missed.push((lines, preamble));
+                }
+            }
+        }
+        assert_eq!(cases, 195);
+        assert!(
+            missed.is_empty(),
+            "a wrapped credential escaped {} of {cases} times, at (lines, preamble) {missed:?}",
+            missed.len()
+        );
+    }
+
+    /// A group longer than one window is offered in overlapping pieces. The
+    /// overlap is what keeps a credential lying across a seam from falling
+    /// between two of them, and every piece has to begin a whole number of
+    /// quanta into the group or it would decode out of phase.
+    #[test]
+    fn rejoined_windows_overlap_and_stay_in_phase() {
+        const SEAM: usize = (4 << 20) / 4 * 3;
+
+        let alphabet: Vec<char> = ('a'..='z').chain('A'..='Z').chain('0'..='9').collect();
+        let mut state = 1u64;
+        let whole: String = (0..6 * 1024 * 1024)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                alphabet[(state >> 33) as usize % alphabet.len()]
+            })
+            .collect();
+        let parts: Vec<&str> = whole
+            .as_bytes()
+            // Deliberately not a multiple of four, so that a window ending
+            // mid quantum is what the phase assertion below reads.
+            .chunks(1023)
+            .map(|chunk| std::str::from_utf8(chunk).expect("the alphabet is ASCII"))
+            .collect();
+
+        let mut windows: Vec<String> = Vec::new();
+        visit_rejoined(&parts, &mut |window| {
+            windows.push(window.to_owned());
+            Ok(())
+        })
+        .expect("the visitor accepts every window");
+        assert!(windows.len() > 1, "the group must exceed one window");
+
+        let mut covered = 0usize;
+        let mut previous: Option<(usize, usize)> = None;
+        for (index, window) in windows.iter().enumerate() {
+            let at = whole
+                .find(window.as_str())
+                .expect("every window is a slice of the group");
+            assert_eq!(at % 4, 0, "window {index} begins out of phase");
+            if let Some((before, length)) = previous {
+                let overlap = before + length - at;
+                assert!(
+                    overlap >= WINDOW_OVERLAP,
+                    "window {index} overlaps the one before by only {overlap} characters"
+                );
+            }
+            covered = at + window.len();
+            previous = Some((at, window.len()));
+        }
+        assert_eq!(
+            covered,
+            whole.len(),
+            "the windows must cover the whole group"
+        );
+
+        // The same shape end to end, with a whole collapsed key lying across
+        // the seam. A key is the longest thing any rule reads at once, and an
+        // overlap shorter than one is how a key came to be missed before.
+        let collapsed = rewrapped_private_key(25, 64)
+            .trim_end()
+            .replace('\n', "\\n");
+        assert!(
+            collapsed.len() > 1600,
+            "the span must be a realistic key rather than a token"
+        );
+        let across = format!("{{\"tls.key\": \"{collapsed}\"}}");
+        let encoded = encode(&format!("{}{across}", "#".repeat(SEAM - across.len() / 2)));
+        let wrapped = encoded
+            .as_bytes()
+            .chunks(76)
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            audit_content("secret.b64", &format!("{wrapped}\n")).is_err(),
+            "a credential lying across the seam must be refused"
+        );
+    }
+
+    /// A rendered Secret folded to a column carries the start of the value on
+    /// the line that names it, and what follows is the rest of that value. A
+    /// rejoin that starts at the line below decodes a value it has already lost
+    /// the front of, and a short credential lives entirely in what was lost.
+    #[test]
+    fn a_value_folded_after_its_key_name_is_refused() {
+        let access_key = ["AK", "IA", "IOSFODNN7EXAMPLE"].concat();
+        let encoded = encode(&access_key);
+        assert_eq!(encoded.len(), 28);
+        for fold in 1..encoded.len() {
+            let (carried, rest) = encoded.split_at(fold);
+            let folded = format!("data:\n  key: {carried}\n{rest}\n");
+            assert!(
+                audit_content("secret.yaml", &folded).is_err(),
+                "a value folded after {fold} characters must be refused"
+            );
+        }
+    }
+
+    /// A named way of decorating each line of a wrapped encoding.
+    type Decoration = (&'static str, fn(&str) -> String);
+
+    /// Wrapped encoding does not always arrive naked: a committed patch marks
+    /// every line, a C literal quotes every line, a shell continues every line
+    /// and a sequence introduces every line. The preamble is swept for the same
+    /// reason as everywhere else, because a single length is a single alignment.
+    #[test]
+    fn a_wrapped_key_inside_line_decoration_is_refused() {
+        let decorations: [Decoration; 4] = [
+            ("a patch", |line| format!("+{line}")),
+            ("a C literal", |line| format!("  \"{line}\"")),
+            ("a continuation", |line| format!("{line}\\")),
+            ("a sequence", |line| format!("  - {line}")),
+        ];
+        let mut missed = Vec::new();
+        for (shape, decorate) in decorations {
+            for preamble in 0..48usize {
+                let body = encoded_key(preamble)
+                    .as_bytes()
+                    .chunks(20)
+                    .map(|chunk| decorate(&String::from_utf8_lossy(chunk)))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if audit_content("bad.txt", &format!("{body}\n")).is_ok() {
+                    missed.push((shape, preamble));
+                }
+            }
+        }
+        assert!(
+            missed.is_empty(),
+            "a decorated wrapped key escaped {} of 192 times: {missed:?}",
+            missed.len()
+        );
+
+        // A marker absorbed into the run leaves a length that is not a whole
+        // number of quanta, and a decoder that will not realign sees nothing.
+        let marked = format!("  tls.key: +{}", encoded_key(0));
+        assert!(
+            marked.rsplit(' ').next().unwrap_or_default().len() % 4 != 0,
+            "the fixture proves nothing unless the run is misaligned"
+        );
+        assert!(
+            audit_content("secret.yaml", &marked).is_err(),
+            "a marked single-line value must be refused"
+        );
+    }
+
+    /// Collapsed onto one line, a key reaches JSON, dotenv, Terraform, a chart
+    /// value and an inline literal with no delimiter standing alone anywhere,
+    /// whatever escaped its newlines and whatever else shares the line.
+    #[test]
+    fn a_key_collapsed_onto_one_line_is_refused() {
+        let key = leaked_private_key();
+        let collapsed = |escape: &str| key.trim_end().replace('\n', escape);
+        let mut holders = Vec::new();
+        for escape in ["\\n", "\\r\\n", "\\r", ""] {
+            let key = collapsed(escape);
+            holders.extend([
+                format!("{{\"tls.key\": \"{key}\"}}"),
+                format!("TLS_KEY=\"{key}\""),
+                format!("  private_key = \"{key}\""),
+                format!("const KEY: &str = \"{key}\";"),
+                format!("helm upgrade app . --set tls.key='{key}'"),
+                // The delimiter is not the last thing on the line in any of
+                // these, which is every position an anchor cannot reach.
+                format!("{{\"tls.key\": \"{key}\", \"other\": 1}}"),
+                format!("key = \"{key}\"  # rotate me"),
+                format!("INSERT INTO secrets VALUES ('{key}', 1);"),
+                format!("name,key,note\nleak,\"{key}\",rotate"),
+                format!("[\"{key}\", \"second\"]"),
+                format!("<secret key=\"{key}\" id=\"1\"/>"),
+            ]);
+        }
+        for holder in holders {
+            assert!(
+                audit_content("bad.txt", &holder).is_err(),
+                "a collapsed private key must be refused: {holder}"
+            );
+        }
+
+        // Every label a private key is issued under, collapsed. Without a label
+        // allowance nothing but the unlabelled form is recognised.
+        for label in [
+            "RSA ",
+            "EC ",
+            "DSA ",
+            "ENCRYPTED ",
+            "OPENSSH ",
+            "X25519 ",
+            "SSH2 ENCRYPTED ",
+        ] {
+            let labelled = leaked_private_key()
+                .replace("BEGIN ", &["BEGIN ", label].concat())
+                .replace("END ", &["END ", label].concat());
+            let collapsed = labelled.trim_end().replace('\n', "\\n");
+            assert!(
+                audit_content("bad.json", &format!("{{\"k\": \"{collapsed}\"}}")).is_err(),
+                "a collapsed {label}key must be refused"
+            );
+        }
+
+        // A multi-line literal closes with the quoting of whatever embedded it,
+        // so the last delimiter never reaches the end of its line.
+        let literal = format!("const KEY: &str = \"{}\";", key.trim_end());
+        assert!(audit_content("bad.rs", &literal).is_err());
+    }
+
+    /// A rule that asks how long the longest unbroken run of the body is falls
+    /// to rewrapping it, and the body of a real key can be rewrapped at any
+    /// Encrypting a traditional key replaces its body with ciphertext, so there is
+    /// no structure left to read. Every label but the two carrying separate literal
+    /// cover would otherwise walk through, which is what asking the body rather
+    /// than the header costs.
+    #[test]
+    fn an_encrypted_traditional_key_is_refused_whatever_its_label() {
+        for label in ["EC", "DSA", "ANY-FUTURE-LABEL"] {
+            let key = [
+                "-----BEGIN ",
+                label,
+                " PRIVATE ",
+                "KEY-----\n",
+                "Proc-Type: 4,ENCRYPTED\n",
+                "DEK-Info: AES-256-CBC,8E4A1B2C3D4E5F60718293A4B5C6D7E8\n\n",
+                // Ciphertext decodes to nothing in particular, which is the point.
+                "9k3Hs0mQxV2pLbY7cRtN4wZaEjFgUiOpAsDfGhJkLzXcVbNm1234567890abcdef\n",
+                "-----END ",
+                label,
+                " PRIVATE ",
+                "KEY-----\n",
+            ]
+            .concat();
+
+            assert!(
+                audit_content("bad.pem", &key).is_err(),
+                "an encrypted {label} key must be refused"
+            );
+            let collapsed = key.trim_end().replace('\n', "\\n");
+            assert!(
+                audit_content("bad.json", &format!("{{\"tls.key\": \"{collapsed}\"}}")).is_err(),
+                "an encrypted {label} key must be refused collapsed onto one line"
+            );
+        }
+    }
+
+    /// The ssh.com format opens with a magic number where the others open with a
+    /// structure, so it needs naming or it is simply not looked for.
+    #[test]
+    fn an_rfc4716_key_is_refused() {
+        let mut material = vec![0x3f, 0x6f, 0xf9, 0xeb];
+        material.extend(std::iter::repeat_n(0xcd, 60));
+        let body = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &material);
+        let key = [
+            "-----BEGIN ",
+            "PRIVATE ",
+            "KEY-----\n",
+            &body,
+            "\n-----END ",
+            "PRIVATE ",
+            "KEY-----\n",
+        ]
+        .concat();
+        let collapsed = key.trim_end().replace('\n', "\\n");
+
+        assert!(
+            audit_content("bad.json", &format!("{{\"tls.key\": \"{collapsed}\"}}")).is_err(),
+            "an RFC 4716 key must be refused"
+        );
+    }
+
+    /// A SEQUENCE may declare no length at all. DER forbids it and OpenSSL reads
+    /// it anyway, so a key encoded that way is a key, and a rule that recognises
+    /// only declared lengths would hand it straight through.
+    #[test]
+    fn a_key_whose_sequence_declares_no_length_is_refused() {
+        // SEQUENCE, indefinite length, then the version integer of an
+        // unencrypted key, then enough body to be one.
+        let mut material = vec![0x30, 0x80, 0x02, 0x01, 0x00];
+        material.extend(std::iter::repeat_n(0xab, 45));
+        let body = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &material);
+        let key = [
+            "-----BEGIN ",
+            "PRIVATE ",
+            "KEY-----\n",
+            &body,
+            "\n-----END ",
+            "PRIVATE ",
+            "KEY-----\n",
+        ]
+        .concat();
+
+        assert!(
+            audit_content("bad.pem", &key).is_err(),
+            "an indefinite-length key must be refused"
+        );
+        let collapsed = key.trim_end().replace('\n', "\\n");
+        assert!(
+            audit_content("bad.json", &format!("{{\"tls.key\": \"{collapsed}\"}}")).is_err(),
+            "an indefinite-length key must be refused collapsed onto one line too"
+        );
+    }
+
+    /// width at all without ceasing to be one.
+    #[test]
+    fn a_collapsed_key_is_refused_at_every_wrap_width() {
+        // Whatever put the body on one line left something between its lines,
+        // and both an escape and a plain space are used in the wild.
+        let mut missed = Vec::new();
+        for separator in ["\\n", " ", "\\r\\n", "\\t"] {
+            for width in 1..=76usize {
+                let collapsed = rewrapped_private_key(4, width)
+                    .trim_end()
+                    .replace('\n', separator);
+                if audit_content("bad.json", &format!("{{\"tls.key\": \"{collapsed}\"}}")).is_ok() {
+                    missed.push((separator, width));
+                }
+            }
+        }
+        assert!(
+            missed.is_empty(),
+            "a rewrapped collapsed key escaped at {} (separator, width) pairs: {missed:?}",
+            missed.len()
+        );
+
+        // A body long enough to be an exported keyring is judged, not skipped:
+        // being too long to fit a window is a reason to bound what the audit
+        // copies, never a reason to stop reading what it has.
+        let keyring = leaked_private_key_of(255);
+        let collapsed = keyring.trim_end().replace('\n', "\\n");
+        assert!(
+            collapsed.len() > 16_300,
+            "the body must be keyring-sized, not key-sized: {}",
+            collapsed.len()
+        );
+        for carrier in [
+            collapsed.clone(),
+            format!("TLS_KEY=\"{collapsed}\""),
+            format!("{{\"tls.key\": \"{collapsed}\"}}"),
+            format!(
+                "apiVersion: v1\nkind: Secret\ndata:\n  tls.key: {}\n",
+                encode(&collapsed)
+            ),
+        ] {
+            assert!(
+                audit_content("leak.txt", &carrier).is_err(),
+                "a keyring-sized collapsed key must be refused, carrier of {} characters",
+                carrier.len()
+            );
+        }
+
+        // The smallest key anyone issues is the floor, and a redaction shorter
+        // than one is not a key however much it looks like encoded text.
+        let smallest = leaked_private_key_of(1);
+        assert_eq!(
+            smallest.lines().nth(1).expect("a body line").len(),
+            64,
+            "the floor is the body of an Ed25519 key"
+        );
+        assert!(
+            audit_content(
+                "bad.json",
+                &format!(
+                    "{{\"k\": \"{}\"}}",
+                    smallest.trim_end().replace('\n', "\\n")
+                )
+            )
+            .is_err()
+        );
+        let begin = ["-----BEGIN ", "PRIVATE ", "KEY-----"].concat();
+        let end = ["-----END ", "PRIVATE ", "KEY-----"].concat();
+        let redacted = "REDACTED".repeat(4);
+        assert_eq!(redacted.len(), 32);
+        assert!(
+            audit_content("ok.md", &format!("{begin}\\n{redacted}\\n{end}")).is_ok(),
+            "a redaction shorter than the smallest key body is not a key"
+        );
+    }
+
+    /// What a body is cannot be measured, only decoded. These are the forms the
+    /// delimiters wrap, each recognised by the structure it actually has, and a
+    /// prefix of each, because a key cut short is still a key.
+    #[test]
+    fn a_collapsed_body_is_judged_by_what_it_decodes_to() {
+        // A PKCS#8 header: SEQUENCE, version zero, then the algorithm.
+        let pkcs8 = [
+            vec![0x30, 0x82, 0x04, 0xbd, 0x02, 0x01, 0x00, 0x30, 0x0d],
+            vec![0x2a; 200],
+        ]
+        .concat();
+        // SEC1 names version one, and an encrypted key opens with its algorithm.
+        let sec1 = [
+            vec![0x30, 0x77, 0x02, 0x01, 0x01, 0x04, 0x20],
+            vec![0x11; 114],
+        ]
+        .concat();
+        let encrypted = [
+            vec![0x30, 0x82, 0x01, 0x1e, 0x30, 0x58, 0x06, 0x09],
+            vec![0x33; 200],
+        ]
+        .concat();
+        let openssh = [b"openssh-key-v1\0".to_vec(), vec![0x44; 200]].concat();
+        let pgp = [
+            vec![0x95, 0x01, 0xa2, 0x04, 0x64, 0x00, 0x00, 0x00, 0x01],
+            vec![0x55; 200],
+        ]
+        .concat();
+        for (name, material) in [
+            ("PKCS#8", pkcs8),
+            ("SEC1", sec1),
+            ("an encrypted key", encrypted),
+            ("OpenSSH", openssh),
+            ("PGP", pgp),
+        ] {
+            assert!(
+                is_private_key_material(&material),
+                "{name} must be recognised by its structure"
+            );
+            assert!(
+                is_private_key_material(&material[..48]),
+                "a prefix of {name} must be recognised too"
+            );
+            let encoded =
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &material);
+            let begin = ["-----BEGIN ", "PRIVATE ", "KEY-----"].concat();
+            let end = ["-----END ", "PRIVATE ", "KEY-----"].concat();
+            assert!(
+                audit_content("bad.json", &format!("{begin}\\n{encoded}\\n{end}")).is_err(),
+                "{name} collapsed onto one line must be refused"
+            );
+        }
+
+        // Structure is not something arbitrary bytes have.
+        for (name, bytes) in [
+            (
+                "text",
+                b"the quick brown fox jumps over the lazy dog again".to_vec(),
+            ),
+            (
+                "a sequence that is too short",
+                vec![0x30, 0x20, 0x02, 0x01, 0x00],
+            ),
+            (
+                "a sequence declaring less than a key",
+                [vec![0x30, 0x20, 0x02, 0x01, 0x00], vec![0x66; 200]].concat(),
+            ),
+            (
+                "a sequence with no version and no algorithm",
+                [
+                    vec![0x30, 0x82, 0x04, 0xbd, 0x13, 0x01, 0x00],
+                    vec![0x77; 200],
+                ]
+                .concat(),
+            ),
+        ] {
+            assert!(
+                !is_private_key_material(&bytes),
+                "{name} is not private key material"
+            );
+        }
+    }
+
+    /// Two shapes a length cannot judge: a body whose runs are too short to
+    /// average anything, and source whose identifiers are long enough to look
+    /// like one. Both were wrong under the measurement this replaced.
+    #[test]
+    fn what_no_length_could_separate_is_separated_by_decoding() {
+        let key = leaked_private_key_of(4);
+        let body = key
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.contains("END"))
+            .collect::<String>();
+        let begin = ["-----BEGIN ", "PRIVATE ", "KEY-----"].concat();
+        let end = ["-----END ", "PRIVATE ", "KEY-----"].concat();
+
+        // Runs of fifteen average below sixteen; a run of sixty-four followed by
+        // single characters averages below one and a half.
+        let narrow = body
+            .as_bytes()
+            .chunks(15)
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (head, tail) = body.split_at(64);
+        let singles = tail
+            .chars()
+            .map(|character| character.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mixed = format!("{head} {singles}");
+        for (shape, collapsed) in [("runs of fifteen", narrow), ("one run then singles", mixed)] {
+            assert!(
+                audit_content("bad.json", &format!("{begin} {collapsed} {end}")).is_err(),
+                "a key body as {shape} must be refused"
+            );
+        }
+
+        // Three long identifiers between the two names are still source, in
+        // the shape that puts nothing but a comma between them.
+        let identifiers = [
+            "encodedPrivateKeyMaterial",
+            "reconstructedDelimiters",
+            "serialisedBodyBetween",
+        ];
+        assert!(
+            identifiers.iter().map(|name| name.len()).sum::<usize>() >= 64,
+            "the shape only bites when the identifiers are long"
+        );
+        for source in [
+            format!(
+                "let pem = [{begin}, {}, {end}].concat();",
+                identifiers.join(", ")
+            ),
+            format!("let pem = concat({begin},{},{end});", identifiers.join(",")),
+        ] {
+            assert!(
+                audit_content("ok.rs", &source).is_ok(),
+                "long identifiers between the two names are not a key: {source}"
+            );
+        }
+    }
+
+    /// A key cut short has no closing delimiter, and a key pasted into the
+    /// middle of a line has the rest of the line after it. Neither stops it
+    /// being a key, and neither is something a length could have known.
+    #[test]
+    fn a_key_without_a_closing_delimiter_is_still_refused() {
+        let collapsed = leaked_private_key_of(4).trim_end().replace('\n', "\\n");
+        let begin = ["-----BEGIN ", "PRIVATE ", "KEY-----"].concat();
+        let opening = collapsed
+            .split_once("KEY-----")
+            .expect("the opening delimiter")
+            .1;
+        for shape in [
+            format!("{begin}{opening}"),
+            format!("{begin}{}", &opening[..opening.len() / 3]),
+            format!("let pem = \"{begin}{opening}\" + footer + trailerGoesHereToo;"),
+        ] {
+            assert!(
+                audit_content("bad.rs", &shape).is_err(),
+                "a key without its closing delimiter must be refused"
+            );
+        }
+
+        // Six decoded bytes is all a key cut this short leaves, and it is still
+        // the head of a key.
+        let head = format!("{begin}\\nMIGuAgEA");
+        assert!(audit_content("bad.rs", &head).is_err());
+    }
+
+    /// A credential encoded and then broken up inside one line is that
+    /// credential once the pieces are put back together, and joining them is
+    /// safe because only the decoded bytes are ever matched.
+    #[test]
+    fn a_credential_split_inside_one_line_is_refused() {
+        let token = ["gh", "p_", "0123456789abcdefghijklmnopqrstuvwxyz"].concat();
+        let encoded = encode(&token);
+        for width in [8, 16, 24, 32] {
+            let pieces = encoded
+                .as_bytes()
+                .chunks(width)
+                .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                .collect::<Vec<_>>();
+            for line in [
+                format!("  token: {}", pieces.join(" ")),
+                format!("  token: \"{}\"", pieces.join("\\n")),
+                format!(
+                    "[{}]",
+                    pieces
+                        .iter()
+                        .map(|piece| format!("\"{piece}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ] {
+                assert!(
+                    audit_content("secret.yaml", &line).is_err(),
+                    "a credential split into {width}-character pieces must be refused: {line}"
+                );
+            }
+        }
+    }
+
+    /// Source that names both delimiters is how PEM gets built, parsed and
+    /// documented, and this gate reads history: one such line, once committed,
+    /// would refuse every release that ever follows it.
+    #[test]
+    fn source_that_names_the_delimiters_is_not_a_key() {
+        let begin = ["-----BEGIN ", "PRIVATE ", "KEY-----"].concat();
+        let end = ["-----END ", "PRIVATE ", "KEY-----"].concat();
+        let ordinary = [
+            format!("    if !contents.starts_with(b\"{begin}\\n\") {{"),
+            format!("let pem = format!(\"{begin}\\n{{body}}\\n{end}\\n\");"),
+            format!("// keys start with {begin} and end with {end}"),
+            format!("const FOOTER: &str = \"\\n{end}\\n\";"),
+            format!("let pem = \"{begin}\" + body + \"{end}\";"),
+            format!("assert_eq!(lines.first(), Some(&\"{begin}\"));"),
+            format!("expected the header {begin} before the body"),
+            format!("{begin} is written by every implementation"),
+            // Long enough that summing every encoded character between the two
+            // names reaches the floor for a key body; what it is not is a body.
+            format!(
+                "// the file opens with {begin}, then the base64 encoded DER of \
+                 the private key itself, and finally the trailer {end}"
+            ),
+        ];
+        for line in ordinary {
+            assert!(
+                audit_content("ok.rs", &line).is_ok(),
+                "ordinary source must not be read as a key: {line}"
+            );
+        }
+
+        // The body is what separates them, so a real one is still refused in
+        // exactly the shape those lines take.
+        let body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDBJ0000000000";
+        assert!(
+            audit_content(
+                "bad.rs",
+                &format!("let pem = \"{begin}\\n{body}\\n{end}\";")
+            )
+            .is_err()
+        );
+    }
+
+    /// `ssh-keygen -e` and `PuTTY` both write private keys that carry no PEM
+    /// delimiter for any anchor to match.
+    #[test]
+    fn key_formats_without_a_pem_delimiter_are_refused() {
+        let ssh2 = [
+            "---- BEGIN ",
+            "SSH2 ENCRYPTED PRIVATE ",
+            "KEY ----\nComment: \"key\"\n---- END ",
+            "SSH2 ENCRYPTED PRIVATE ",
+            "KEY ----\n",
+        ]
+        .concat();
+        assert!(audit_content("bad.txt", &ssh2).is_err());
+        let ssh2_plain = ["---- BEGIN ", "SSH2 PRIVATE ", "KEY ----"].concat();
+        assert!(audit_content("bad.txt", &ssh2_plain).is_err());
+
+        let putty = [
+            "PuTTY-User-",
+            "Key-File-3: ssh-ed25519\nEncryption: none\n",
+            "Private-",
+            "Lines: 1\n",
+        ]
+        .concat();
+        assert!(audit_content("bad.ppk", &putty).is_err());
+        for header in [
+            ["PuTTY-User-", "Key-File-2: ssh-rsa"].concat(),
+            ["Private-", "Lines: 14"].concat(),
+        ] {
+            assert!(audit_content("bad.ppk", &header).is_err());
+        }
+
+        // Naming either format in prose or in an expression is not a key. Both
+        // markers are followed by a value the format fixes, and prose that opens
+        // with the same words is not.
+        assert!(audit_content("ok.md", "generated with ssh-keygen -e (RFC 4716)").is_ok());
+        for prose in [
+            ["let header = \"PuTTY-User-", "Key-File-3:\";"].concat(),
+            [
+                "PuTTY-User-",
+                "Key-File-3 is the version this release writes",
+            ]
+            .concat(),
+            ["PuTTY-User-", "Key-File- headers name the format version"].concat(),
+            [
+                "Private-",
+                "Lines: how many lines the private body occupies",
+            ]
+            .concat(),
+            ["Private-", "Lines is the field that introduces the body"].concat(),
+        ] {
+            assert!(
+                audit_content("ok.md", &prose).is_ok(),
+                "prose that opens with a marker is not a key: {prose}"
+            );
+        }
+    }
+
+    /// A connection string with the password inline is the credential this
+    /// project will hold most of, and the loopback ones its own workflow has
+    /// always carried are exempt by their exact text, so nothing about the
+    /// exemption can be adopted by a leak.
+    #[test]
+    fn a_connection_string_carrying_a_password_is_refused() {
+        let password = "s3cr3t";
+        for leak in [
+            ["postgres://app:", password, "@db.example.com:5432/app"].concat(),
+            [
+                "postgresql://app:",
+                password,
+                "@10.0.0.4/app?sslmode=require",
+            ]
+            .concat(),
+            [
+                "PGSHARD_URL=\"postgresql://app:",
+                password,
+                "@db.internal/app\"",
+            ]
+            .concat(),
+            [
+                "  url: postgres://postgres:",
+                password,
+                "@127.0.0.1:5432/shardschema",
+            ]
+            .concat(),
+        ] {
+            assert!(
+                audit_content("bad.yaml", &leak).is_err(),
+                "an inline password must be refused: {leak}"
+            );
+        }
+
+        for permitted in PERMITTED_TEST_DSNS {
+            assert!(
+                audit_content("ci.yml", &format!("  URL: {permitted}")).is_ok(),
+                "the workflow's own loopback string must stay auditable: {permitted}"
+            );
+            let extended = permitted.replace("shardschema", "elsewhere");
+            assert!(
+                extended == permitted || audit_content("ci.yml", &extended).is_err(),
+                "the exemption must not extend past its exact text: {extended}"
+            );
+            let repassworded = permitted.replace("pgshard-ci-only", "hunter2");
+            assert!(
+                repassworded == permitted || audit_content("ci.yml", &repassworded).is_err(),
+                "the exemption must not survive a different password: {repassworded}"
+            );
+        }
+
+        for permitted in PERMITTED_TEST_DSNS {
+            assert!(
+                audit_content("ci.yml", &format!("  URL: {permitted}_extra")).is_err(),
+                "the exemption must not extend to anything appended to it"
+            );
+        }
+        assert!(
+            audit_content(
+                "bad.yaml",
+                &["  url: POSTGRESQL://app:", password, "@db.example.com/app"].concat()
+            )
+            .is_err(),
+            "a scheme in capitals is the same scheme"
+        );
+
+        // A connection string with no password is how every other one in this
+        // repository is written.
+        for safe in [
+            "postgresql://unused",
+            "postgresql://postgres@127.0.0.1/shardschema?sslmode=disable",
+            "postgresql://pgshard_pooler@127.0.0.1:5432/shardschema",
+        ] {
+            assert!(
+                audit_content("ok.rs", safe).is_ok(),
+                "not a password: {safe}"
+            );
+        }
+    }
+
+    /// Reading inside a container is a decompressor per format; refusing one is
+    /// a stop the maintainer can see.
+    #[test]
+    fn compressed_content_is_refused() {
+        for magic in [
+            vec![0x1f, 0x8b, 0x08, 0x00],
+            b"PK\x03\x04ordinary zip".to_vec(),
+            b"PK\x07\x08spanned zip".to_vec(),
+            vec![0xfd, b'7', b'z', b'X', b'Z', 0x00, 0x00],
+            vec![0x28, 0xb5, 0x2f, 0xfd, 0x00],
+            b"BZh9ordinary bzip".to_vec(),
+            vec![0x04, 0x22, 0x4d, 0x18, 0x00],
+            b"7z\xbc\xaf\x27\x1c".to_vec(),
+            b"Rar!\x1a\x07\x00".to_vec(),
+            vec![0x78, 0x9c, 0x00],
+            vec![0x78, 0x01, 0x00],
+            vec![0x78, 0xda, 0x00],
+            vec![0x78, 0x5e, 0x00],
+        ] {
+            assert!(
+                audit_content_bytes("asset.bin", &magic).is_err(),
+                "compressed content must be refused: {:?}",
+                &magic[..4.min(magic.len())]
+            );
+        }
+        assert!(audit_content_bytes("ok.bin", b"PKZIP is a program").is_ok());
+        assert!(audit_content_bytes("ok.md", b"BZh is the bzip2 magic").is_ok());
+        assert!(audit_content_bytes("ok.bin", &[0x1f, 0x8b, 0x09]).is_ok());
+    }
+
+    /// This audit is the only gate between a mistake and a permanently public
+    /// credential, and it holds for every issuer the project's own tooling can
+    /// reach, not only for the one whose forge hosts the repository.
+    #[test]
+    fn credentials_from_other_issuers_are_refused() {
+        let leaks = [
+            ["AS", "IA", "IOSFODNN7EXAMPLE"].concat(),
+            ["AI", "za", "SyA0123456789abcdefghijklmnopqrstuvw"].concat(),
+            ["npm", "_", "0123456789abcdefghijklmnopqrstuvwxyz"].concat(),
+            ["gl", "pat-", "0123456789abcdefghij"].concat(),
+            ["sk-", "ant-", "api03-0123456789"].concat(),
+            ["dckr", "_pat_", "0123456789abcdefghij"].concat(),
+            ["xox", "b-", "0123456789-0123456789"].concat(),
+            ["xox", "p-", "0123456789-0123456789"].concat(),
+            ["xox", "a-", "0123456789-0123456789"].concat(),
+            ["xox", "s-", "0123456789-0123456789"].concat(),
+            ["xox", "r-", "0123456789-0123456789"].concat(),
+            ["xox", "e-", "0123456789-0123456789"].concat(),
+        ];
+        for leak in &leaks {
+            assert!(
+                audit_content("bad.env", &format!("TOKEN={leak}")).is_err(),
+                "a leaked credential must be refused: {leak}"
+            );
+            assert!(
+                audit_content(
+                    "secret.yaml",
+                    &format!("  token: {}\n", encode(leak.as_str()))
+                )
+                .is_err(),
+                "an encoded leaked credential must be refused: {leak}"
+            );
+        }
+
+        // A prefix that is also ordinary text is not a credential on its own.
+        for innocent in [
+            ["AS", "IA", "_PACIFIC_REGION"].concat(),
+            ["npm", "_", "config_registry"].concat(),
+            ["npm", "_", "package_json"].concat(),
+            ["AI", "za", "rd support"].concat(),
+        ] {
+            assert!(
+                audit_content("ok.md", &innocent).is_ok(),
+                "ordinary text must not be read as a credential: {innocent}"
+            );
+        }
+    }
+
+    /// UTF-16 and NUL padding keep every byte of a credential but never place
+    /// two of its characters next to each other.
+    #[test]
+    fn a_credential_padded_with_nul_bytes_is_refused() {
+        let token = ["gh", "p_", "0123456789abcdefghijklmnopqrstuvwxyz"].concat();
+        let utf16: Vec<u8> = token.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert!(
+            audit_content_bytes("leak.bin", &utf16).is_err(),
+            "a UTF-16 credential must be refused"
+        );
+        let big_endian: Vec<u8> = token.encode_utf16().flat_map(u16::to_be_bytes).collect();
+        assert!(audit_content_bytes("leak.bin", &big_endian).is_err());
+        assert!(audit_content_bytes("ok.bin", &[0, 0xff, 0xfe, b's', b'a', b'f', b'e', 0]).is_ok());
+    }
+
     #[test]
     fn content_audit_rejects_sensitive_added_lines() {
         assert!(audit_content("safe.md", "safe public content").is_ok());
@@ -1854,6 +3643,47 @@ mod tests {
         assert!(audit_content(RELEASE_HELPER_SOURCE, &old_detector_line).is_ok());
         let disguised_leak = format!("let value = \"{old_pattern}actual-value\";");
         assert!(audit_content(RELEASE_HELPER_SOURCE, &disguised_leak).is_err());
+
+        for label in ["", "EC ", "DSA ", "RSA ", "OPENSSH "] {
+            for delimiter in ["-----BEGIN ", "-----END "] {
+                let pem = [delimiter, label, "PRIVATE ", "KEY-----"].concat();
+                assert!(
+                    audit_content("bad.md", &pem).is_err(),
+                    "a {label}private key PEM delimiter must be refused"
+                );
+                let indented = ["   ", &pem].concat();
+                assert!(
+                    audit_content("bad.md", &indented).is_err(),
+                    "indentation must not smuggle a {label}private key past the audit"
+                );
+            }
+        }
+        let pgp = ["-----BEGIN ", "PGP PRIVATE ", "KEY BLOCK", "-----"].concat();
+        assert!(audit_content("bad.md", &pgp).is_err());
+
+        // The agent must be able to validate that a key file has the expected
+        // PEM header, and the operator to name the PEM type.
+        let validator = [
+            "if !contents.starts_with(b\"-----BEGIN ",
+            "PRIVATE ",
+            "KEY-----",
+            "\\n\") {",
+        ]
+        .concat();
+        assert!(audit_content("ok.rs", &validator).is_ok());
+
+        for prefix in ["p", "s", "o", "u", "r"] {
+            let token = ["gh", prefix, "_", "0123456789abcdef"].concat();
+            assert!(
+                audit_content("bad.md", &token).is_err(),
+                "a gh{prefix}_ token must be refused"
+            );
+        }
+
+        // The operator legitimately names the PEM type without delimiters, and
+        // refusing that would make the gate unusable rather than safe.
+        assert!(audit_content("ok.go", "pem.Block{Type: \"PRIVATE KEY\"}").is_ok());
+        assert!(audit_content("ok.go", "expected exactly one PRIVATE KEY PEM block").is_ok());
     }
 
     #[test]
