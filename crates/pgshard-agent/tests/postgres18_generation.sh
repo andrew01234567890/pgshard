@@ -14,6 +14,8 @@ readonly standby_data="pgshard-generation-standby-data-${suffix}"
 readonly primary_socket="pgshard-generation-primary-socket-${suffix}"
 readonly standby_socket="pgshard-generation-standby-socket-${suffix}"
 readonly standby_credentials="pgshard-generation-standby-credentials-${suffix}"
+readonly fence_primary="pgshard-generation-fence-${suffix}"
+readonly fence_socket="pgshard-generation-fence-socket-${suffix}"
 readonly replication_password="pgshard_generation_replication_test"
 readonly standby_application_name="pgshard_member_0001"
 readonly synchronous_standby_names="pgshard_member_0001, pgshard_member_0002"
@@ -43,11 +45,11 @@ if [[ ! "$image" =~ @sha256:[0-9a-f]{64}$ ]]; then
 fi
 
 cleanup() {
-  docker rm --force "$standby" "$primary" >/dev/null 2>&1 || true
+  docker rm --force "$standby" "$primary" "$fence_primary" >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
   docker volume rm --force \
     "$primary_data" "$standby_data" "$primary_socket" "$standby_socket" \
-    "$standby_credentials" \
+    "$standby_credentials" "$fence_socket" \
     >/dev/null 2>&1 || true
   rm -f "$primary_hba" "$build_messages"
   rmdir "$fixture_dir" 2>/dev/null || true
@@ -384,6 +386,56 @@ docker run --rm --user 999:999 --network none --read-only \
   --ignored --exact \
   postgres_generation::tests::live_postgres18_proves_any_one_synchronous_generation_replay \
   --nocapture
+
+# The cross-database fence can only be established against a running server:
+# a read-only fence transaction cannot take the row lock, an idle holder is
+# terminated by the evidence timeouts, and the lock wait itself is the property
+# under test. None of that is reachable from a unit test.
+#
+# It runs against its own disposable server rather than the shared primary,
+# because it publishes generations of its own and the steps that follow assert
+# on the primary's final generation.
+docker volume create "$fence_socket" >/dev/null
+docker run --detach --name "$fence_primary" \
+  --network "$network" \
+  --volume "$fence_socket:/var/run/postgresql" \
+  --env POSTGRES_PASSWORD=disposable-fence-password \
+  "$image" >/dev/null
+for _ in $(seq 1 60); do
+  if docker exec "$fence_primary" pg_isready --quiet; then
+    break
+  fi
+  sleep 1
+done
+docker exec "$fence_primary" pg_isready --quiet
+
+docker run --rm --user 999:999 \
+  --network "$network" \
+  --volume "$fence_socket:/fence-socket" \
+  --mount "type=bind,src=$test_binary,dst=/test/pgshard-agent-test,readonly" \
+  --env PGSHARD_AGENT_TEST_SOCKET_DIR=/fence-socket \
+  --entrypoint /test/pgshard-agent-test \
+  "$image" \
+  --ignored --exact \
+  postgres_generation::tests::live_postgres18_materializer_fences_publication \
+  --nocapture
+
+# Drives the real compiled program and revokes authority in the window before
+# the commit checks, which is the only way to observe that a revoked attempt
+# leaves nothing behind and that a later one materializes completely.
+docker run --rm --user 999:999 \
+  --network "$network" \
+  --volume "$fence_socket:/fence-socket" \
+  --mount "type=bind,src=$test_binary,dst=/test/pgshard-agent-test,readonly" \
+  --env PGSHARD_AGENT_TEST_SOCKET_DIR=/fence-socket \
+  --entrypoint /test/pgshard-agent-test \
+  "$image" \
+  --ignored --exact \
+  catalog_materializer::tests::live_postgres18_revoked_authority_does_not_materialize \
+  --nocapture
+
+docker rm --force "$fence_primary" >/dev/null
+docker volume rm "$fence_socket" >/dev/null
 
 if [[ -n "$runtime_image" ]]; then
   if ! docker stop --time 10 "$standby" >/dev/null; then

@@ -25,6 +25,12 @@ use crate::domain::{
 use tokio::sync::oneshot;
 
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(25);
+/// The writable generation lives only here, so every generation proof is read
+/// on this database.
+pub(crate) const GENERATION_DATABASE: &str = "postgres";
+/// `pgshard_catalog` lives here, so every catalog mutation is applied here.
+pub(crate) const CATALOG_DATABASE: &str = "shardschema";
+
 const CONNECTION_OPTIONS: &str = "-c search_path=pg_catalog \
     -c session_preload_libraries= -c local_preload_libraries= \
     -c event_triggers=off -c jit=off -c default_tablespace= -c temp_tablespaces= \
@@ -187,6 +193,20 @@ const STANDBY_IDENTITY_OBSERVATION: &str = "\
 const STANDBY_WAL_OBSERVATION: &str = "\
     SELECT pg_catalog.pg_last_wal_receive_lsn()::text, \
            pg_catalog.pg_last_wal_replay_lsn()::text";
+/// The fence transaction is deliberately idle while another connection does the
+/// guarded work, so it must not carry the evidence settings: those make the
+/// transaction READ ONLY, which `PostgreSQL` rejects for a row-locking SELECT,
+/// and impose idle and transaction timeouts that would terminate the backend
+/// mid-window — releasing every lock while the caller still believed it held
+/// them. The caller bounds the window instead.
+const FENCE_TRANSACTION_SETTINGS: &str = "\
+    SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE;\
+    SET LOCAL search_path = pg_catalog;\
+    SET LOCAL lock_timeout = '5s';\
+    SET LOCAL statement_timeout = 0;\
+    SET LOCAL transaction_timeout = 0;\
+    SET LOCAL idle_in_transaction_session_timeout = 0;";
+
 const EVIDENCE_TRANSACTION_SETTINGS: &str = "\
     SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;\
     SET LOCAL search_path = pg_catalog;\
@@ -282,6 +302,10 @@ static TEST_EVIDENCE_SNAPSHOT_GATE: std::sync::Mutex<Option<StablePublicationGat
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
+static TEST_PRE_COMMIT_GATE: std::sync::Mutex<Option<StablePublicationGate>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
 static TEST_EVIDENCE_WAL_CAPTURE_GATE: std::sync::Mutex<Option<StablePublicationGate>> =
     std::sync::Mutex::new(None);
 
@@ -308,14 +332,131 @@ pub(crate) struct CatalogRuntimeIdentity {
     pub(crate) timeline: u32,
 }
 
+/// A writable session on the catalog database, for the materializer.
+///
+/// `standard_conforming_strings` is pinned on: the input lexer refuses a
+/// backslash inside an ordinary string precisely because the closing quote
+/// would otherwise be ambiguous between the two server modes, and pinning the
+/// mode here removes the ambiguity from the executing side as well.
+pub(crate) struct CatalogWriterSession {
+    connection: ConnectedPostgres,
+}
+
+impl CatalogWriterSession {
+    /// The session's client. `ConnectedPostgres` stays private so the driver
+    /// task and its abort-on-drop remain owned here.
+    pub(crate) const fn client(&mut self) -> &mut Client {
+        &mut self.connection.client
+    }
+
+    pub(crate) async fn connect(socket_dir: &Path) -> Result<Self, PostgresGenerationError> {
+        let connection = connect_with_application_mode(
+            socket_dir,
+            "pgshard-catalog-materializer-writer",
+            CATALOG_DATABASE,
+            false,
+        )
+        .await?;
+        let observed: String = connection
+            .client
+            .query_one(OBSERVE_STANDARD_CONFORMING_STRINGS, &[])
+            .await?
+            .try_get(0)?;
+        if observed != "on" {
+            return Err(PostgresGenerationError::InvalidCatalogWriterSettings);
+        }
+        Ok(Self { connection })
+    }
+}
+
+/// Holds a lock on the generation row that conflicts with publication, so no
+/// new generation can be published while the caller mutates another database.
+///
+/// The two databases cannot share one transaction, so proving the generation
+/// once and then committing elsewhere would leave a window in which a new
+/// generation is published between the proof and the commit. Holding this lock
+/// across that commit closes the window.
+pub(crate) struct GenerationFence {
+    connection: ConnectedPostgres,
+}
+
+impl GenerationFence {
+    pub(crate) async fn hold(
+        socket_dir: &Path,
+        expected: &DurableWritableGeneration,
+    ) -> Result<Self, PostgresGenerationError> {
+        let connection = connect_with_application_mode(
+            socket_dir,
+            "pgshard-catalog-materializer-fence",
+            GENERATION_DATABASE,
+            false,
+        )
+        .await?;
+        let fence = Self { connection };
+        fence.prove(expected).await?;
+        Ok(fence)
+    }
+
+    /// Opens the fence transaction with an explicit `BEGIN` rather than the
+    /// RAII transaction wrapper: the transaction has to outlive this call and
+    /// stay open across the caller's commit on the other database, which is
+    /// exactly what the wrapper's rollback-on-drop would prevent.
+    async fn prove(
+        &self,
+        expected: &DurableWritableGeneration,
+    ) -> Result<(), PostgresGenerationError> {
+        let client = &self.connection.client;
+        client.batch_execute("BEGIN").await?;
+        client.batch_execute(FENCE_TRANSACTION_SETTINGS).await?;
+        // The same lock publication takes, so a publication attempt blocks
+        // behind this transaction instead of racing it.
+        client.batch_execute(LOCK_GENERATION_TABLE).await?;
+        client.batch_execute(SELECT_FOR_UPDATE).await?;
+        let generation = read_generation_evidence(client).await?;
+        if &generation != expected {
+            return Err(PostgresGenerationError::GenerationEvidenceChanged);
+        }
+        Ok(())
+    }
+
+    /// Releases the held locks, and reports whether the fence was still alive.
+    ///
+    /// Call only after the guarded commit has returned. A fence that died — a
+    /// terminated backend, a lost connection — released its locks early, so the
+    /// guarded work ran unfenced and the caller must not treat it as proven.
+    pub(crate) async fn release(self) -> Result<(), PostgresGenerationError> {
+        if *self.connection.driver_ended.borrow() {
+            return Err(PostgresGenerationError::GenerationFenceLost);
+        }
+        self.connection
+            .client
+            .batch_execute("ROLLBACK")
+            .await
+            .map_err(|_| PostgresGenerationError::GenerationFenceLost)
+    }
+
+    /// Reports whether the fence still holds its locks right now.
+    pub(crate) fn holds(&self) -> bool {
+        !*self.connection.driver_ended.borrow()
+    }
+}
+
+pub(crate) const OBSERVE_STANDARD_CONFORMING_STRINGS: &str =
+    "SELECT pg_catalog.current_setting('standard_conforming_strings')";
+
 /// Connects over the fixed local peer-authenticated socket and observes an
 /// exact read-only generation and source identity in one coherent snapshot.
 pub(crate) async fn connect_catalog_runtime(
     socket_dir: &Path,
     expected_generation: &DurableWritableGeneration,
 ) -> Result<(CatalogRuntimeSession, CatalogRuntimeIdentity), PostgresGenerationError> {
-    let mut connection =
-        connect_with_application_mode(socket_dir, "pgshard-catalog-materializer", true).await?;
+    let mut connection = connect_with_application_mode(
+        socket_dir,
+        "pgshard-catalog-materializer",
+        GENERATION_DATABASE,
+        true,
+    )
+    .await?;
     let transaction = connection.client.transaction().await?;
     transaction
         .batch_execute(EVIDENCE_TRANSACTION_SETTINGS)
@@ -505,8 +646,8 @@ impl ReplicationEvidenceSession {
     }
 }
 
-async fn read_generation_evidence(
-    transaction: &tokio_postgres::Transaction<'_>,
+async fn read_generation_evidence<C: tokio_postgres::GenericClient>(
+    transaction: &C,
 ) -> Result<DurableWritableGeneration, PostgresGenerationError> {
     if query_safety(transaction, SCHEMA_IS_SAFE).await? != Some(true) {
         return Err(PostgresGenerationError::UnsafeSchema);
@@ -967,8 +1108,8 @@ fn verify_synchronous_publication(
     Ok(())
 }
 
-async fn query_safety(
-    transaction: &tokio_postgres::Transaction<'_>,
+async fn query_safety<C: tokio_postgres::GenericClient>(
+    transaction: &C,
     query: &str,
 ) -> Result<Option<bool>, tokio_postgres::Error> {
     match transaction.query_opt(query, &[]).await? {
@@ -1049,6 +1190,39 @@ fn gate_next_evidence_access_share() -> (oneshot::Receiver<()>, oneshot::Sender<
         })
         .is_none(),
         "test already has an evidence AccessShare gate"
+    );
+    (entered_rx, release_tx)
+}
+
+/// Pauses the next catalog step after its fragments have run and before it
+/// observes the fence and the attempt's authority, so a test can change the
+/// world in exactly that window.
+#[cfg(test)]
+pub(crate) async fn pre_commit_checkpoint() {
+    let gate = TEST_PRE_COMMIT_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.await;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn gate_next_pre_commit() -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let mut gate = TEST_PRE_COMMIT_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        gate.replace(StablePublicationGate {
+            entered: entered_tx,
+            release: release_rx,
+        })
+        .is_none(),
+        "test already has a pre-commit gate"
     );
     (entered_rx, release_tx)
 }
@@ -1231,12 +1405,13 @@ async fn connect_with_application(
     socket_dir: &Path,
     application_name: &'static str,
 ) -> Result<ConnectedPostgres, tokio_postgres::Error> {
-    connect_with_application_mode(socket_dir, application_name, false).await
+    connect_with_application_mode(socket_dir, application_name, GENERATION_DATABASE, false).await
 }
 
 async fn connect_with_application_mode(
     socket_dir: &Path,
     application_name: &'static str,
+    dbname: &'static str,
     default_read_only: bool,
 ) -> Result<ConnectedPostgres, tokio_postgres::Error> {
     let mut config = Config::new();
@@ -1245,7 +1420,7 @@ async fn connect_with_application_mode(
         .host_path(socket_dir)
         .port(5432)
         .user("postgres")
-        .dbname("postgres")
+        .dbname(dbname)
         .application_name(application_name)
         .options(&options);
     let (client, connection) = config.connect(NoTls).await?;
@@ -1295,6 +1470,16 @@ pub enum PostgresGenerationError {
     /// Attempt-private authority no longer exactly matches the request.
     #[error("attempt-private writable authority changed during WAL publication")]
     AuthorityChanged,
+    /// The catalog writer session did not report the pinned string mode.
+    #[error("PostgreSQL catalog writer session settings are not exact")]
+    InvalidCatalogWriterSettings,
+    /// The generation fence stopped holding its locks before the guarded commit.
+    #[error("PostgreSQL generation fence was lost before the guarded commit")]
+    GenerationFenceLost,
+    /// The fence was lost while a catalog commit was already in flight, so
+    /// whether that commit landed is unknown and cannot be resolved from here.
+    #[error("PostgreSQL catalog commit is ambiguous: the generation fence was lost in flight")]
+    AmbiguousCatalogCommit,
     /// The durable row is not the canonical bounded generation encoding.
     #[error("PostgreSQL writable-generation row is malformed")]
     MalformedGeneration,
@@ -1347,7 +1532,7 @@ pub enum PostgresGenerationError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[derive(serde::Deserialize)]
@@ -1362,7 +1547,29 @@ mod tests {
     }
     use pgshard_types::ShardId;
 
-    fn generation(cluster: &str, holder: &str, term: u64) -> DurableWritableGeneration {
+    /// Connects to a named database on the local socket, for tests that must
+    /// inspect the catalog database as well as the generation database.
+    pub(crate) async fn connect_to(
+        socket_dir: &Path,
+        dbname: &'static str,
+    ) -> Result<TestClient, tokio_postgres::Error> {
+        let connection =
+            connect_with_application_mode(socket_dir, "pgshard-agent-test", dbname, false).await?;
+        Ok(TestClient { connection })
+    }
+
+    /// A connection a test can query directly.
+    pub(crate) struct TestClient {
+        connection: ConnectedPostgres,
+    }
+
+    impl TestClient {
+        pub(crate) const fn client(&self) -> &Client {
+            &self.connection.client
+        }
+    }
+
+    pub(crate) fn generation(cluster: &str, holder: &str, term: u64) -> DurableWritableGeneration {
         DurableWritableGeneration::new(
             cluster.to_owned(),
             format!("{cluster}-uid"),
@@ -1821,6 +2028,93 @@ mod tests {
             "dormant catalog runtime session must fail read-only by default"
         );
         assert!(!CATALOG_RUNTIME_IDENTITY_OBSERVATION.contains("FOR UPDATE"));
+    }
+
+    /// The fence's whole purpose is cross-database ordering, and none of it can
+    /// be established without a running server: that a row-locking SELECT is
+    /// rejected in a read-only transaction, that an idle holder is terminated
+    /// under the evidence timeouts, that the locks actually make a publisher
+    /// wait, and that they stay held across a commit on the other connection.
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL 18 Unix socket"]
+    async fn live_postgres18_materializer_fences_publication() {
+        let socket_dir = std::env::var_os("PGSHARD_AGENT_TEST_SOCKET_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("PGSHARD_AGENT_TEST_SOCKET_DIR is required");
+        // Runs against its own disposable server: publishing here would
+        // otherwise change the generation the surrounding harness asserts on.
+        let first = generation("cluster-1", "holder-a", 1);
+        let second = generation("cluster-1", "holder-a", 2);
+
+        publish_writable_generation(&socket_dir, &first, &|| true)
+            .await
+            .expect("publish the first generation");
+
+        // Establishing the fence at all is finding 1: this fails outright if
+        // the fence transaction is read-only.
+        let fence = GenerationFence::hold(&socket_dir, &first)
+            .await
+            .expect("hold the generation fence");
+
+        // Finding 2: the holder is deliberately idle for longer than the
+        // evidence transaction timeout. If the fence carried those settings the
+        // backend would already be gone by the time the guarded work commits.
+        tokio::time::sleep(Duration::from_secs(8)).await;
+
+        let publisher_socket = socket_dir.clone();
+        let publisher = tokio::spawn(async move {
+            publish_writable_generation(&publisher_socket, &second, &|| true).await
+        });
+
+        // The publisher must be waiting on the fence's locks, and the durable
+        // row must still read the first generation.
+        let mut observer = connect(&socket_dir).await.expect("observe locks");
+        let mut waiting = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let blocked: i64 = observer
+                .client
+                .query_one(
+                    "SELECT pg_catalog.count(*) FROM pg_catalog.pg_locks \
+                     WHERE NOT granted AND relation = 'pgshard_internal.writable_generation'::regclass",
+                    &[],
+                )
+                .await
+                .expect("read pg_locks")
+                .get(0);
+            if blocked > 0 {
+                waiting = true;
+                break;
+            }
+        }
+        assert!(waiting, "publication did not block behind the fence");
+
+        let transaction = observer
+            .client
+            .build_transaction()
+            .start()
+            .await
+            .expect("read the generation while the fence is held");
+        let durable = read_generation_evidence(&transaction)
+            .await
+            .expect("generation evidence while fenced");
+        assert_eq!(
+            durable, first,
+            "a fenced publication changed the durable generation"
+        );
+        transaction.rollback().await.expect("end the observation");
+
+        // The fence must still be alive after all of that, which is the
+        // property release() now reports.
+        fence
+            .release()
+            .await
+            .expect("fence survived the guarded window");
+
+        publisher
+            .await
+            .expect("publication task")
+            .expect("publication completes once the fence releases");
     }
 
     #[tokio::test]
