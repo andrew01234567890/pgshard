@@ -2268,13 +2268,33 @@ mod tests {
                 step.get("continue-on-error").is_none(),
                 "a step of {described} may fail without failing it"
             );
+            // `shell: /bin/true {0}` hands the script to a program that never
+            // reads it: the step succeeds having run nothing, with its `run:`
+            // still saying exactly what it was supposed to do.
+            if let Some(shell) = step.get("shell") {
+                assert_eq!(
+                    shell.as_str(),
+                    Some("bash"),
+                    "a step of {described} runs under a shell that need not execute it"
+                );
+            }
         }
+        assert!(
+            job.get("defaults").is_none(),
+            "{described} sets step defaults, which can replace the shell"
+        );
         steps
     }
 
     fn parsed_workflow() -> serde_norway::Value {
-        serde_norway::from_str(include_str!("../../../.github/workflows/ci.yml"))
-            .expect("the workflow is valid YAML")
+        let workflow: serde_norway::Value =
+            serde_norway::from_str(include_str!("../../../.github/workflows/ci.yml"))
+                .expect("the workflow is valid YAML");
+        assert!(
+            workflow.get("defaults").is_none(),
+            "the workflow sets step defaults, which can replace every shell"
+        );
+        workflow
     }
 
     fn workflow_job<'a>(workflow: &'a serde_norway::Value, job: &str) -> &'a serde_norway::Value {
