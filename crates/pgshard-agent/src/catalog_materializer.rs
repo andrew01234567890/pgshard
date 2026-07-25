@@ -60,6 +60,44 @@ const INVENTORY_IS_EXACT: &str = "\
                      OR shards.shard_id::text <> 'shard-' || pg_catalog.lpad( \
                           shards.shard_number::text, 4, '0')))";
 
+/// Serializes verification against catalog writers, and proves the row every
+/// writer serializes on exists at all.
+///
+/// Normal catalog DML takes its target relation before this row, so taking it
+/// first here cannot deadlock against that order: verification only reads, and
+/// a reader never blocks a writer's relation lock. Holding it makes the
+/// predicates below one observation rather than several `READ COMMITTED`
+/// snapshots a writer can commit between.
+const LOCK_CLUSTER_STATE: &str =
+    "SELECT FROM pgshard_catalog.cluster_state WHERE singleton FOR UPDATE";
+
+/// Proves the catalog carries the one cluster identity the capability will be
+/// bound to. The singleton primary key already forbids a second row; what is
+/// checked here is that the row exists, names a real cluster, and homes the
+/// shard the topology is written against.
+const CLUSTER_IDENTITY_IS_CANONICAL: &str = "\
+    SELECT pg_catalog.count(*) = 1 FROM pgshard_catalog.cluster_configuration \
+     WHERE singleton \
+       AND cluster_id <> '00000000-0000-0000-0000-000000000000'::uuid \
+       AND home_shard_id::text = 'shard-0000'";
+
+/// Proves the restore lineage agrees with the shard states.
+///
+/// Retired incarnations and non-active shards are legitimate history, so this
+/// asserts a relationship rather than an absence: every shard has lineage, and
+/// a shard is active exactly when it has an active incarnation. The partial
+/// unique index makes that active incarnation unique, so counting is not needed.
+const SHARD_LINEAGE_IS_COMPLETE: &str = "\
+    SELECT NOT EXISTS ( \
+      SELECT FROM pgshard_catalog.shards \
+       WHERE NOT EXISTS ( \
+               SELECT FROM pgshard_catalog.shard_restore_incarnations AS lineage \
+                WHERE lineage.shard_id = shards.shard_id) \
+          OR (shards.state = 'active') <> EXISTS ( \
+               SELECT FROM pgshard_catalog.shard_restore_incarnations AS active_lineage \
+                WHERE active_lineage.shard_id = shards.shard_id \
+                  AND active_lineage.state = 'active'))";
+
 /// The applying transaction's own framing. The program's fragments carry none:
 /// that is what the input compiler enforces, and it is why the executor can put
 /// its authority check immediately before `COMMIT`.
@@ -97,7 +135,10 @@ where
     let mut attempts = 0_u32;
     loop {
         attempts += 1;
-        let outcome = materialize(
+        // Verification is a second fenced round trip, so it runs only once the
+        // apply has actually succeeded. A failed apply is classified below on
+        // its own terms: replayed if retryable, returned if terminal.
+        let outcome = match materialize(
             socket_dir,
             program,
             shard_count,
@@ -106,16 +147,19 @@ where
             authority_exact,
         )
         .await
-        .and(
-            verify_materialized(
-                socket_dir,
-                program,
-                shard_count,
-                expected_generation,
-                authority_exact,
-            )
-            .await,
-        );
+        {
+            Ok(()) => {
+                verify_materialized(
+                    socket_dir,
+                    program,
+                    shard_count,
+                    expected_generation,
+                    authority_exact,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
         match outcome {
             Ok(()) => return Ok(()),
             // Retryable only while this attempt is still the authoritative
@@ -264,13 +308,32 @@ async fn read_back(
     transaction
         .batch_execute(APPLY_TRANSACTION_SETTINGS)
         .await?;
-    let exact: bool = transaction
-        .query_one(INVENTORY_IS_EXACT, &[&shard_count])
-        .await?
-        .try_get(0)?;
-    if !exact {
+    // Every predicate below observes the catalog under this row lock.
+    if transaction.query(LOCK_CLUSTER_STATE, &[]).await?.len() != 1 {
+        tracing::warn!("catalog verification: the cluster-state singleton is absent");
         return Err(PostgresGenerationError::CatalogNotMaterialized);
     }
+    require(
+        &transaction,
+        INVENTORY_IS_EXACT,
+        &[&shard_count],
+        "inventory",
+    )
+    .await?;
+    require(
+        &transaction,
+        CLUSTER_IDENTITY_IS_CANONICAL,
+        &[],
+        "cluster identity",
+    )
+    .await?;
+    require(
+        &transaction,
+        SHARD_LINEAGE_IS_COMPLETE,
+        &[],
+        "restore lineage",
+    )
+    .await?;
     // Re-run the declared topology guard with the allow-empty policy off, so an
     // empty or divergent topology raises here rather than being tolerated as it
     // is during first materialization.
@@ -280,6 +343,25 @@ async fn read_back(
     transaction.batch_execute(&program.preflight).await?;
     // Read-only: nothing to commit.
     transaction.rollback().await?;
+    Ok(())
+}
+
+/// Runs one verification predicate, naming it if the catalog disagrees so the
+/// reconcile log says which invariant failed rather than only that one did.
+async fn require(
+    transaction: &tokio_postgres::Transaction<'_>,
+    predicate: &str,
+    parameters: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    invariant: &'static str,
+) -> Result<(), PostgresGenerationError> {
+    let holds: bool = transaction
+        .query_one(predicate, parameters)
+        .await?
+        .try_get(0)?;
+    if !holds {
+        tracing::warn!(invariant, "catalog verification: the catalog disagrees");
+        return Err(PostgresGenerationError::CatalogNotMaterialized);
+    }
     Ok(())
 }
 
@@ -708,6 +790,228 @@ mod tests {
         );
     }
 
+    /// Materializes once, then proves each remaining invariant is load-bearing:
+    /// breaking it is rejected and repairing it is accepted again.
+    #[tokio::test]
+    #[ignore = "requires a live PostgreSQL 18 server"]
+    async fn live_postgres18_verification_rejects_a_catalog_that_breaks_an_invariant() {
+        use crate::postgres_generation::CATALOG_DATABASE;
+
+        let (socket_dir, generation, program) = materialized_fixture(10).await;
+        let catalog = crate::postgres_generation::tests::connect_to(&socket_dir, CATALOG_DATABASE)
+            .await
+            .expect("connect to the catalog");
+
+        // `cluster_configuration_immutable` rejects ordinary DML, so reaching a
+        // divergent identity at all takes disabling that guard. The question
+        // verification has to answer is what happens to a catalog that already
+        // holds such a state, however it got there.
+        let unguarded = |statement: &str| {
+            format!(
+                "ALTER TABLE pgshard_catalog.cluster_configuration \
+                    DISABLE TRIGGER cluster_configuration_immutable; \
+                 {statement}; \
+                 ALTER TABLE pgshard_catalog.cluster_configuration \
+                    ENABLE TRIGGER cluster_configuration_immutable"
+            )
+        };
+        for (invariant, break_it, repair_it) in [
+            (
+                "the home shard the topology is written against",
+                unguarded(
+                    "UPDATE pgshard_catalog.cluster_configuration \
+                        SET home_shard_id = 'shard-0001' WHERE singleton",
+                ),
+                unguarded(
+                    "UPDATE pgshard_catalog.cluster_configuration \
+                        SET home_shard_id = 'shard-0000' WHERE singleton",
+                ),
+            ),
+            (
+                "a cluster identity the capability can bind",
+                unguarded(
+                    "UPDATE pgshard_catalog.cluster_configuration \
+                        SET cluster_id = '00000000-0000-0000-0000-000000000000'::uuid \
+                      WHERE singleton",
+                ),
+                unguarded(
+                    "UPDATE pgshard_catalog.cluster_configuration \
+                        SET cluster_id = pg_catalog.gen_random_uuid() WHERE singleton",
+                ),
+            ),
+            (
+                "an active shard has an active restore incarnation",
+                "UPDATE pgshard_catalog.shard_restore_incarnations \
+                    SET state = 'retired', retired_at = pg_catalog.statement_timestamp() \
+                  WHERE shard_id = 'shard-0000' AND state = 'active'"
+                    .to_owned(),
+                // Retirement is one-way, so lineage is repaired the way a real
+                // restore repairs it: by allocating a fresh active incarnation.
+                "INSERT INTO pgshard_catalog.shard_restore_incarnations\
+                     (restore_incarnation, shard_id, state) \
+                 VALUES (pg_catalog.gen_random_uuid(), 'shard-0000', 'active')"
+                    .to_owned(),
+            ),
+            (
+                "the row every catalog writer serializes on",
+                "DELETE FROM pgshard_catalog.cluster_state WHERE singleton".to_owned(),
+                "INSERT INTO pgshard_catalog.cluster_state(singleton) VALUES (true) \
+                 ON CONFLICT (singleton) DO NOTHING"
+                    .to_owned(),
+            ),
+        ] {
+            catalog
+                .client()
+                .batch_execute(&break_it)
+                .await
+                .unwrap_or_else(|error| panic!("break {invariant}: {error:?}"));
+            let outcome =
+                verify_materialized(&socket_dir, &program, FIXTURE_SHARDS, &generation, &|| true)
+                    .await;
+            assert!(
+                matches!(
+                    outcome,
+                    Err(PostgresGenerationError::CatalogNotMaterialized)
+                ),
+                "verification accepted a catalog that does not hold {invariant}: {outcome:?}"
+            );
+            catalog
+                .client()
+                .batch_execute(&repair_it)
+                .await
+                .unwrap_or_else(|error| panic!("repair {invariant}: {error:?}"));
+            verify_materialized(&socket_dir, &program, FIXTURE_SHARDS, &generation, &|| true)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("verification rejected a repaired catalog holding {invariant}: {error}")
+                });
+        }
+    }
+
+    /// The predicates must be one observation, not several `READ COMMITTED`
+    /// snapshots a writer can commit an undeclared shard between. Proven by
+    /// holding the row a writer serializes on: verification has to block on it.
+    #[tokio::test]
+    #[ignore = "requires a live PostgreSQL 18 server"]
+    async fn live_postgres18_verification_serializes_on_the_cluster_state_row() {
+        use crate::postgres_generation::CATALOG_DATABASE;
+
+        let (socket_dir, generation, program) = materialized_fixture(11).await;
+        let writer = crate::postgres_generation::tests::connect_to(&socket_dir, CATALOG_DATABASE)
+            .await
+            .expect("connect as a competing catalog writer");
+        writer
+            .client()
+            .batch_execute(&format!("BEGIN; {LOCK_CLUSTER_STATE};"))
+            .await
+            .expect("hold the row a catalog writer serializes on");
+
+        let outcome =
+            verify_materialized(&socket_dir, &program, FIXTURE_SHARDS, &generation, &|| true).await;
+        let Err(PostgresGenerationError::Database(error)) = outcome else {
+            panic!("verification observed the catalog without taking the row lock: {outcome:?}");
+        };
+        assert_eq!(
+            error.code(),
+            Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+            "verification failed for some reason other than the held row lock: {error}"
+        );
+
+        writer
+            .client()
+            .batch_execute("ROLLBACK")
+            .await
+            .expect("release the row");
+        verify_materialized(&socket_dir, &program, FIXTURE_SHARDS, &generation, &|| true)
+            .await
+            .expect("verification succeeds once the row is free");
+    }
+
+    /// The retry is bounded, so a divergence the idempotent program cannot undo
+    /// ends the attempt instead of holding the fence against publication.
+    #[tokio::test]
+    #[ignore = "requires a live PostgreSQL 18 server"]
+    async fn live_postgres18_bounded_retry_gives_up_on_a_catalog_it_cannot_reconcile() {
+        use crate::postgres_generation::CATALOG_DATABASE;
+
+        let (socket_dir, generation, program) = materialized_fixture(12).await;
+        let catalog = crate::postgres_generation::tests::connect_to(&socket_dir, CATALOG_DATABASE)
+            .await
+            .expect("connect to the catalog");
+        // Replaying the program cannot remove this, so every attempt verifies
+        // false and the loop has to stop rather than spin.
+        catalog
+            .client()
+            .batch_execute(
+                "INSERT INTO pgshard_catalog.shards(shard_id, shard_number, state) \
+                 VALUES ('shard-0009', 9, 'active')",
+            )
+            .await
+            .expect("introduce an undeclared active shard");
+
+        let outcome = materialize_and_verify(
+            &socket_dir,
+            &program,
+            FIXTURE_SHARDS,
+            true,
+            &generation,
+            &|| true,
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                Err(PostgresGenerationError::CatalogNotMaterialized)
+            ),
+            "the bounded retry did not end the attempt: {outcome:?}"
+        );
+    }
+
+    /// A freshly materialized catalog plus everything needed to re-verify it.
+    async fn materialized_fixture(
+        term: u64,
+    ) -> (
+        std::path::PathBuf,
+        DurableWritableGeneration,
+        CatalogMaterializationProgram,
+    ) {
+        use crate::catalog_materialization_program::compile_catalog_materialization_program;
+        use crate::postgres_generation::publish_writable_generation;
+
+        let socket_dir = std::env::var_os("PGSHARD_AGENT_TEST_SOCKET_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("PGSHARD_AGENT_TEST_SOCKET_DIR is required");
+        let generation =
+            crate::postgres_generation::tests::generation("cluster-1", "holder-a", term);
+
+        create_catalog_database(&socket_dir).await;
+        publish_writable_generation(&socket_dir, &generation, &|| true)
+            .await
+            .expect("publish the generation");
+        let program = compile_catalog_materialization_program(
+            include_bytes!("../../pgshard-catalog/migrations/0001_shardschema.sql"),
+            include_bytes!("../../pgshard-catalog/inventory/0001_shard_inventory.sql"),
+            include_bytes!("../../pgshard-catalog/testdata/materialization/genesis.golden.sql"),
+            include_bytes!("../../pgshard-catalog/testdata/materialization/preflight.golden.sql"),
+        )
+        .expect("the real inputs compile");
+
+        materialize(
+            &socket_dir,
+            &program,
+            FIXTURE_SHARDS,
+            true,
+            &generation,
+            &|| true,
+        )
+        .await
+        .expect("materialize the declared state");
+        verify_materialized(&socket_dir, &program, FIXTURE_SHARDS, &generation, &|| true)
+            .await
+            .expect("the declared state verifies");
+        (socket_dir, generation, program)
+    }
+
     /// Requires a competing publication to be waiting on the fence the paused
     /// attempt holds, with the durable generation still the one it acts for.
     async fn assert_generation_publication_waits(
@@ -790,17 +1094,56 @@ mod tests {
         assert!(databases > 0, "genesis installed no logical database");
     }
 
+    /// Gives the test a catalog database with no prior state.
+    ///
+    /// These tests share one server, and several of them deliberately leave the
+    /// catalog diverged — an undeclared shard, a committed migration-only
+    /// prefix. Dropping and recreating removes the ordering coupling that
+    /// otherwise makes a later test's premise depend on an earlier test's
+    /// leftovers.
     async fn create_catalog_database(socket_dir: &std::path::Path) {
         let admin = crate::postgres_generation::tests::connect_to(
             socket_dir,
             crate::postgres_generation::GENERATION_DATABASE,
         )
         .await
-        .expect("connect to create the catalog database");
-        let _ = admin
+        .expect("connect to reset the catalog database");
+        admin
             .client()
-            .batch_execute("CREATE DATABASE shardschema")
-            .await;
+            .batch_execute(&format!(
+                "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+                crate::postgres_generation::CATALOG_DATABASE
+            ))
+            .await
+            .expect("drop any prior catalog database");
+        // The migration refuses to bootstrap onto a server that already carries
+        // pgshard roles, and roles outlive the database that scoped their grants.
+        admin
+            .client()
+            .batch_execute(
+                "DO $reset$ \
+                 DECLARE role_name text; \
+                 BEGIN \
+                   FOREACH role_name IN ARRAY ARRAY[ \
+                     'pgshard_catalog_admin', 'pgshard_catalog_owner', \
+                     'pgshard_catalog_reader', 'pgshard_operation_writer'] LOOP \
+                     IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = role_name) THEN \
+                       EXECUTE pg_catalog.format('DROP OWNED BY %I', role_name); \
+                       EXECUTE pg_catalog.format('DROP ROLE %I', role_name); \
+                     END IF; \
+                   END LOOP; \
+                 END $reset$",
+            )
+            .await
+            .expect("drop any prior catalog roles");
+        admin
+            .client()
+            .batch_execute(&format!(
+                "CREATE DATABASE {}",
+                crate::postgres_generation::CATALOG_DATABASE
+            ))
+            .await
+            .expect("create the catalog database");
     }
 
     /// The classification the enabling stage has to act on, so it must be

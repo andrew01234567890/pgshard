@@ -461,6 +461,42 @@ docker run --rm --user 999:999 \
   catalog_materializer::tests::live_postgres18_reconciles_a_partially_materialized_catalog \
   --nocapture
 
+# Each remaining invariant has to be load-bearing, the predicates have to be one
+# locked observation, and a divergence the program cannot undo has to end the
+# attempt rather than hold the fence against publication.
+docker run --rm --user 999:999 \
+  --network "$network" \
+  --volume "$fence_socket:/fence-socket" \
+  --mount "type=bind,src=$test_binary,dst=/test/pgshard-agent-test,readonly" \
+  --env PGSHARD_AGENT_TEST_SOCKET_DIR=/fence-socket \
+  --entrypoint /test/pgshard-agent-test \
+  "$image" \
+  --ignored --exact \
+  catalog_materializer::tests::live_postgres18_verification_rejects_a_catalog_that_breaks_an_invariant \
+  --nocapture
+
+docker run --rm --user 999:999 \
+  --network "$network" \
+  --volume "$fence_socket:/fence-socket" \
+  --mount "type=bind,src=$test_binary,dst=/test/pgshard-agent-test,readonly" \
+  --env PGSHARD_AGENT_TEST_SOCKET_DIR=/fence-socket \
+  --entrypoint /test/pgshard-agent-test \
+  "$image" \
+  --ignored --exact \
+  catalog_materializer::tests::live_postgres18_verification_serializes_on_the_cluster_state_row \
+  --nocapture
+
+docker run --rm --user 999:999 \
+  --network "$network" \
+  --volume "$fence_socket:/fence-socket" \
+  --mount "type=bind,src=$test_binary,dst=/test/pgshard-agent-test,readonly" \
+  --env PGSHARD_AGENT_TEST_SOCKET_DIR=/fence-socket \
+  --entrypoint /test/pgshard-agent-test \
+  "$image" \
+  --ignored --exact \
+  catalog_materializer::tests::live_postgres18_bounded_retry_gives_up_on_a_catalog_it_cannot_reconcile \
+  --nocapture
+
 docker rm --force "$fence_primary" >/dev/null
 docker volume rm "$fence_socket" >/dev/null
 
