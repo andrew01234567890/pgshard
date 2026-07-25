@@ -21,6 +21,10 @@ const mib = int64(1024 * 1024)
 // relation, so the worker count is reduced rather than each worker starved.
 const minimumAutovacuumWorkMem = 16 * mib
 
+// PostgreSQL 18's default autovacuum_worker_slots. It is restart-only, and it
+// is the real ceiling on autovacuum_max_workers.
+const autovacuumWorkerSlots = int64(16)
+
 var allowedOverrides = map[string]struct{}{
 	"autovacuum_analyze_scale_factor": {},
 	"autovacuum_max_workers":          {},
@@ -408,10 +412,15 @@ func validateOverrideValue(key, value string, settings map[string]string, autova
 	case "random_page_cost", "seq_page_cost":
 		return validateFloatRange(value, 0.1, 100)
 	case "autovacuum_max_workers":
-		maximum := int64(20)
-		if configured, err := strconv.ParseInt(settings["max_worker_processes"], 10, 64); err == nil && configured-4 < maximum {
-			// Reserve processes for parallel work and logical replication.
-			maximum = max64(1, configured-4)
+		// Autovacuum workers come from autovacuum_worker_slots, not from
+		// max_worker_processes: PostgreSQL 18 documents that a setting above
+		// autovacuum_worker_slots "will have no effect, since autovacuum
+		// workers are taken from the pool of slots established by that
+		// setting". Bounding by max_worker_processes accepted values that
+		// silently cap at the slot pool instead.
+		maximum := autovacuumWorkerSlots
+		if configured, err := strconv.ParseInt(settings["autovacuum_worker_slots"], 10, 64); err == nil && configured > 0 {
+			maximum = configured
 		}
 		// autovacuum_work_mem is not overridable, so the count is the only
 		// lever on the fleet's ceiling. Bound it by what the fleet's budget
