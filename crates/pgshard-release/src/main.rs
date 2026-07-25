@@ -2021,56 +2021,45 @@ mod tests {
     }
 
     /// Every detector output an expectation consumes has to be one the gate
-    /// validates, or that output can go missing without anything failing.
+    /// validates, that validation has to derive the named component's own
+    /// validity, and the detector has to declare and emit it. Parsed as YAML:
+    /// a line-based reading of a YAML file can be fooled by continuation
+    /// lines that fold into the previous scalar, which is exactly how a wrong
+    /// mapping can hide behind a correct-looking one.
     #[test]
     fn every_consumed_detector_output_is_validated() {
-        let ci = include_str!("../../../.github/workflows/ci.yml");
-        let aggregate = ci
-            .split_once("\n  aggregate:")
-            .expect("the aggregate job exists")
-            .1;
-        let components = aggregate
-            .split_once("COMPONENT_OUTPUTS: |")
-            .expect("the aggregate declares the outputs it validates")
-            .1;
-        // Each entry must be exactly `name=${{ needs.changes.outputs.name }}`.
-        // Collecting only the left-hand name would accept an entry that
-        // validates one output under another's name.
-        let validated: std::collections::BTreeSet<&str> = components
+        let workflow = parsed_workflow();
+        let aggregate = workflow_job(&workflow, "aggregate");
+        let environment = aggregate["steps"][0]["env"]
+            .as_mapping()
+            .expect("the aggregate step declares an environment");
+
+        let validated: std::collections::BTreeSet<String> = environment["COMPONENT_OUTPUTS"]
+            .as_str()
+            .expect("COMPONENT_OUTPUTS is a scalar")
             .lines()
-            .skip(1)
-            .take_while(|line| entry(line).is_some())
+            .filter(|line| !line.trim().is_empty())
             .map(|line| {
-                let (name, reference) = entry(line).expect("bounded by the take_while above");
+                let (name, derivation) = line
+                    .trim()
+                    .split_once('=')
+                    .expect("an entry names a component");
                 assert_eq!(
-                    reference,
+                    derivation,
                     format!(
                         "${{{{ needs.changes.outputs.{name} == 'true' \
                          || needs.changes.outputs.{name} == 'false' }}}}"
                     ),
                     "the {name} entry does not derive {name}'s validity from {name}"
                 );
-                name
+                name.to_owned()
             })
             .collect();
         assert!(!validated.is_empty(), "no detector outputs are validated");
 
-        let expectations = aggregate
-            .split_once("JOB_EXPECTATIONS: >-")
-            .expect("the aggregate declares its expectations")
-            .1;
-        // Bounded by the shape of an entry rather than by the next key, so a
-        // `shell:` appearing anywhere cannot truncate or extend the block.
-        let expectations: String = expectations
-            .lines()
-            .skip(1)
-            .take_while(|line| entry(line).is_some())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            expectations.contains("needs.changes.outputs."),
-            "no expectations were extracted"
-        );
+        let expectations = environment["JOB_EXPECTATIONS"]
+            .as_str()
+            .expect("JOB_EXPECTATIONS is a scalar");
         for consumed in expectations.split("needs.changes.outputs.").skip(1) {
             let name: &str = consumed
                 .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
@@ -2082,43 +2071,29 @@ mod tests {
             );
         }
 
-        // Catch a removed or misspelled declaration here rather than leaving it
-        // to fail the release run that first depends on it. Bounded to the
-        // detector's own body, or a later job's `outputs:` would answer for it.
-        let indent = |line: &str| line.len() - line.trim_start().len();
-        let detector: Vec<&str> = ci
-            .split_once("\n  changes:\n")
-            .expect("the detector job exists")
-            .1
-            .lines()
-            .take_while(|line| line.trim().is_empty() || indent(line) > 2)
-            .collect();
-        let outputs = detector
-            .iter()
-            .position(|line| indent(line) == 4 && line.trim_start() == "outputs:")
+        // The detector's own mapping, read as YAML rather than as lines: a
+        // declaration folded into a previous scalar is not a declaration, and
+        // must not be able to stand in for the real one.
+        let detector = workflow_job(&workflow, "changes");
+        let declared = detector["outputs"]
+            .as_mapping()
             .expect("the detector declares its outputs");
-        let declared: std::collections::BTreeSet<&str> = detector[outputs + 1..]
-            .iter()
-            // `${{` is what makes it an output rather than the sibling `steps:`.
-            .take_while(|line| indent(line) > 4 && line.contains("${{"))
-            .filter_map(|line| line.trim().split_once(':'))
-            .map(|(name, source)| {
-                // A declaration that exposes another component's detection is
-                // a valid-but-wrong value: it skips the jobs it gates while
-                // every structural check above still agrees.
-                assert_eq!(
-                    source.trim(),
-                    format!("${{{{ steps.detect.outputs.{name} }}}}"),
-                    "the {name} output does not expose {name}'s detection"
-                );
-                name
-            })
-            .collect();
-        let detect = detector.join("\n");
-        for name in validated {
-            assert!(
-                declared.contains(name),
-                "the gate validates {name}, which the detector does not declare as an output"
+        let detect = serde_norway::to_string(&detector["steps"]).expect("the detect step renders");
+        for name in &validated {
+            let source = declared
+                .get(serde_norway::Value::from(name.as_str()))
+                .unwrap_or_else(|| {
+                    panic!("the gate validates {name}, which the detector does not declare")
+                })
+                .as_str()
+                .unwrap_or_else(|| panic!("the {name} declaration is not a scalar"));
+            // A declaration exposing another component's detection is a
+            // valid-but-wrong value: it skips the jobs it gates while every
+            // other check still agrees.
+            assert_eq!(
+                source.trim(),
+                format!("${{{{ steps.detect.outputs.{name} }}}}"),
+                "the {name} output does not expose {name}'s detection"
             );
             // A declared output the detect step never writes renders empty, so
             // the gate fails closed on every run. That is loud rather than
@@ -2131,15 +2106,15 @@ mod tests {
         }
     }
 
-    /// One `name=${{ ... }}` entry of a gate's environment block.
-    fn entry(line: &str) -> Option<(&str, &str)> {
-        let (name, reference) = line.trim().split_once('=')?;
-        (!name.is_empty()
-            && name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-            && reference.starts_with("${{"))
-        .then_some((name, reference))
+    fn parsed_workflow() -> serde_norway::Value {
+        serde_norway::from_str(include_str!("../../../.github/workflows/ci.yml"))
+            .expect("the workflow is valid YAML")
+    }
+
+    fn workflow_job<'a>(workflow: &'a serde_norway::Value, job: &str) -> &'a serde_norway::Value {
+        let job = &workflow["jobs"][job];
+        assert!(!job.is_null(), "the workflow declares no job named it");
+        job
     }
 
     /// Every job the aggregate waits on has to carry an expectation, that
@@ -2148,37 +2123,31 @@ mod tests {
     /// while the aggregate still reports success.
     #[test]
     fn every_aggregated_job_expects_its_own_condition() {
-        let ci = include_str!("../../../.github/workflows/ci.yml");
-        let aggregate = ci
-            .split_once("\n  aggregate:")
-            .expect("the aggregate job exists")
-            .1;
-        let expectations = aggregate
-            .split_once("JOB_EXPECTATIONS: >-")
-            .expect("the aggregate declares its expectations")
-            .1;
-        let mut declared: Vec<(&str, &str, &str)> = Vec::new();
-        for line in expectations
-            .lines()
-            .take_while(|line| !line.trim_start().starts_with("shell:"))
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-        {
-            let (job, rest) = line.split_once('=').expect("an entry names a job");
-            let (result, expected) = rest.split_once("}}=").map_or_else(
-                || (rest, ""),
-                |(result, expected)| (result, expected.trim()),
-            );
-            declared.push((job, result.trim(), expected));
-        }
-
-        let waited: Vec<&str> = aggregate
-            .split_once("    needs:\n")
+        let workflow = parsed_workflow();
+        let aggregate = workflow_job(&workflow, "aggregate");
+        let waited: Vec<&str> = aggregate["needs"]
+            .as_sequence()
             .expect("the aggregate declares its needs")
-            .1
+            .iter()
+            .map(|job| job.as_str().expect("a needed job is named"))
+            .collect();
+
+        let expectations = aggregate["steps"][0]["env"]["JOB_EXPECTATIONS"]
+            .as_str()
+            .expect("the aggregate declares its expectations");
+        let declared: Vec<(&str, &str, &str)> = expectations
             .lines()
-            .take_while(|line| line.trim_start().starts_with("- "))
-            .map(|line| line.trim().trim_start_matches("- "))
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| {
+                let (job, rest) = entry.split_once('=').expect("an entry names a job");
+                let (result, expected) = rest
+                    .split_once("}}=")
+                    .map_or((rest, ""), |(result, expected)| {
+                        (result.trim_end(), expected)
+                    });
+                (job, result, expected)
+            })
             .collect();
         assert_eq!(
             waited.len(),
@@ -2198,48 +2167,19 @@ mod tests {
                 format!("${{{{ needs.{job}.result"),
                 "{job}'s expectation does not read {job}'s own result"
             );
+            let condition = workflow_job(&workflow, job)
+                .get("if")
+                .and_then(serde_norway::Value::as_str)
+                .map(|condition| condition.split_whitespace().collect::<Vec<_>>().join(" "));
             assert_eq!(
                 *expected,
-                job_condition(ci, job).map_or_else(
+                condition.map_or_else(
                     || "true".to_owned(),
                     |condition| format!("${{{{ {condition} }}}}")
                 ),
                 "{job}'s expectation does not repeat {job}'s own condition"
             );
         }
-    }
-
-    /// The `if:` of one job, whitespace-normalized, or `None` when it is
-    /// unconditional and therefore must always run.
-    fn job_condition(ci: &str, job: &str) -> Option<String> {
-        let indent = |line: &str| line.len() - line.trim_start().len();
-        let body: Vec<&str> = ci
-            .split_once(&format!("\n  {job}:\n"))?
-            .1
-            .lines()
-            // A job ends where the next one begins, at two spaces of indent.
-            .take_while(|line| line.trim().is_empty() || indent(line) > 2)
-            .collect();
-        // Exactly four spaces: a step's `if:` is nested deeper and is not the
-        // condition that decides whether this job runs at all.
-        let position = body
-            .iter()
-            .position(|line| indent(line) == 4 && line.trim_start().starts_with("if:"))?;
-        let head = body[position]
-            .trim_start()
-            .trim_start_matches("if:")
-            .trim_start();
-        if head != ">-" {
-            return Some(head.split_whitespace().collect::<Vec<_>>().join(" "));
-        }
-        Some(
-            body[position + 1..]
-                .iter()
-                .take_while(|line| line.trim().is_empty() || indent(line) > 4)
-                .flat_map(|line| line.split_whitespace())
-                .collect::<Vec<_>>()
-                .join(" "),
-        )
     }
 
     #[test]

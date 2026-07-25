@@ -1620,7 +1620,7 @@ jobs:
             images=${{ needs.changes.outputs.images == 'true' || needs.changes.outputs.images == 'false' }}
             kind=${{ needs.changes.outputs.kind == 'true' || needs.changes.outputs.kind == 'false' }}
             performance=${{ needs.changes.outputs.performance == 'true' || needs.changes.outputs.performance == 'false' }}
-          JOB_EXPECTATIONS: >-
+          JOB_EXPECTATIONS: |
             changes=${{ needs.changes.result }}=true
             repository-policy=${{ needs.repository-policy.result }}=true
             rust-static=${{ needs.rust-static.result }}=${{ needs.changes.outputs.rust == 'true' }}
