@@ -18,5 +18,6 @@ pub mod postgres_fence;
 pub mod postgres_generation;
 pub(crate) mod postgres_recovery;
 pub(crate) mod postgres_replication;
+pub(crate) mod serving_input_compiler;
 pub mod telemetry;
 pub mod writable;
