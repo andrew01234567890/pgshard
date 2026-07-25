@@ -172,7 +172,7 @@ struct RawConfig {
     #[arg(
         long,
         env = "PGSHARD_POSTGRES_HBA_FILE",
-        default_value = "/etc/pgshard/quarantine.pg_hba.conf"
+        default_value = "/run/pgshard/hba/pg_hba.conf"
     )]
     postgres_hba_file: PathBuf,
 
@@ -954,7 +954,7 @@ mod tests {
             PathBuf::from("/var/lib/postgresql/data"),
             PathBuf::from("/usr/lib/postgresql/18/bin/postgres"),
             PathBuf::from("/run/pgshard/postgres"),
-            PathBuf::from("/etc/pgshard/quarantine.pg_hba.conf"),
+            PathBuf::from("/run/pgshard/hba/pg_hba.conf"),
             Duration::from_secs(5),
             Duration::from_secs(44),
             Duration::from_millis(500),

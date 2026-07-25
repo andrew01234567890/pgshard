@@ -2193,6 +2193,8 @@ rm -f -- \
   "$staging/.pgshard-writable-generation.next"
 
 primary_conninfo="host=$PGSHARD_SOURCE_HOST port=5432 user=pgshard_replication application_name=$PGSHARD_PRIMARY_SLOT_NAME passfile=$passfile sslmode=disable"
+# This postmaster is started by the script, not supervised by the agent, so
+# nothing materializes a policy for it. It reads the read-only image copy.
 pg_ctl -D "$staging" -w -t 60 start \
   -o "-c listen_addresses='' -c unix_socket_directories='$socket' -c unix_socket_permissions=0700 -c hba_file=/etc/pgshard/quarantine.pg_hba.conf -c external_pid_file=/tmp/pgshard-standby-bootstrap.pid -c ssl=off -c restart_after_crash=off -c primary_conninfo='$primary_conninfo' -c primary_slot_name='$PGSHARD_PRIMARY_SLOT_NAME' -c recovery_target_timeline=latest -c recovery_target_action=shutdown -c restore_command= -c archive_cleanup_command= -c recovery_end_command= -c shared_preload_libraries= -c synchronous_standby_names='' -c synchronous_commit=local"
 started=true
@@ -2441,7 +2443,7 @@ func IsPostgreSQLReplicationStandbyPod(pod *corev1.Pod) bool {
 		slot, slotOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME")
 		passfile, passfileOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_PRIMARY_PASSFILE")
 		return modeOK && hbaFileOK && sourceOK && slotOK && passfileOK &&
-			mode == "replication-standby" && hbaFile == "/etc/pgshard/quarantine.pg_hba.conf" &&
+			mode == "replication-standby" && hbaFile == "/run/pgshard/hba/pg_hba.conf" &&
 			source == expectedSource && slot == expectedSlot &&
 			passfile == "/run/pgshard/standby-auth/passfile" &&
 			containerHasReadOnlyMount(container, "standby-passfile", "/run/pgshard/standby-auth") &&
@@ -2456,9 +2458,9 @@ func postgresqlAgentShape(annotations map[string]string, spec corev1.PodSpec, po
 	}
 	mode, modeOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_MODE")
 	hbaFile, hbaFileOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_HBA_FILE")
-	quarantine := modeOK && hbaFileOK && mode == "quarantine" && hbaFile == "/etc/pgshard/quarantine.pg_hba.conf"
+	quarantine := modeOK && hbaFileOK && mode == "quarantine" && hbaFile == "/run/pgshard/hba/pg_hba.conf"
 	bootstrapSource := modeOK && hbaFileOK && mode == "replication-bootstrap-primary" && hbaFile == "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf"
-	standby := modeOK && hbaFileOK && mode == "replication-standby" && hbaFile == "/etc/pgshard/quarantine.pg_hba.conf"
+	standby := modeOK && hbaFileOK && mode == "replication-standby" && hbaFile == "/run/pgshard/hba/pg_hba.conf"
 	if bootstrapSource {
 		bootstrapSource = postgresqlBootstrapGenerationShape(annotations, postgres)
 	} else if annotations[PostgreSQLGenerationDurabilityAnnotation] != "" ||
@@ -5064,7 +5066,7 @@ func postgresqlReplicationStandbyStatefulSet(cluster *pgshardv1alpha1.PgShardClu
 }
 
 func postgresqlAgentQuarantineContainer(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image string, pullPolicy corev1.PullPolicy, security *corev1.SecurityContext, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus) corev1.Container {
-	return postgresqlAgentWritableContainer(cluster, shard, image, pullPolicy, security, writableLease, "quarantine", "/etc/pgshard/quarantine.pg_hba.conf")
+	return postgresqlAgentWritableContainer(cluster, shard, image, pullPolicy, security, writableLease, "quarantine", "/run/pgshard/hba/pg_hba.conf")
 }
 
 func postgresqlReplicationBootstrapPrimaryContainer(cluster *pgshardv1alpha1.PgShardCluster, shard int32, image string, pullPolicy corev1.PullPolicy, security *corev1.SecurityContext, writableLease pgshardv1alpha1.PostgreSQLWritableLeaseStatus) corev1.Container {
@@ -5104,7 +5106,7 @@ func postgresqlReplicationStandbyContainer(cluster *pgshardv1alpha1.PgShardClust
 		{Name: "PGDATA", Value: "/var/lib/postgresql/18/docker"},
 		{Name: "PGSHARD_POSTGRES_BIN", Value: "/usr/lib/postgresql/18/bin/postgres"},
 		{Name: "PGSHARD_POSTGRES_SOCKET_DIR", Value: "/run/pgshard/postgres"},
-		{Name: "PGSHARD_POSTGRES_HBA_FILE", Value: "/etc/pgshard/quarantine.pg_hba.conf"},
+		{Name: "PGSHARD_POSTGRES_HBA_FILE", Value: "/run/pgshard/hba/pg_hba.conf"},
 		{Name: "PGSHARD_POSTGRES_PRIMARY_HOST", Value: sourceHost},
 		{Name: "PGSHARD_POSTGRES_PRIMARY_PORT", Value: "5432"},
 		{Name: "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME", Value: slotName},

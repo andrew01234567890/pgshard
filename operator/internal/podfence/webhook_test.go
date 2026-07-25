@@ -923,7 +923,7 @@ func roleNeutralStandbyPod() *corev1.Pod {
 			{Name: "PGSHARD_CLUSTER_UID", Value: pod.Annotations[owned.PostgreSQLPodClusterUIDAnnotation]},
 			{Name: "PGSHARD_POD_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}},
 			{Name: "PGSHARD_POSTGRES_MODE", Value: "replication-standby"},
-			{Name: "PGSHARD_POSTGRES_HBA_FILE", Value: "/etc/pgshard/quarantine.pg_hba.conf"},
+			{Name: "PGSHARD_POSTGRES_HBA_FILE", Value: "/run/pgshard/hba/pg_hba.conf"},
 			{Name: "PGSHARD_POSTGRES_PRIMARY_HOST", Value: "example-shard-0000-0.example-shard-0000.database.svc"},
 			{Name: "PGSHARD_POSTGRES_PRIMARY_PORT", Value: "5432"},
 			{Name: "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME", Value: "pgshard_member_0001"},

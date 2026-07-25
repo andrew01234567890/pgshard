@@ -1183,7 +1183,7 @@ func TestAgentQuarantinePlanProjectsExactWritableLeaseIdentity(t *testing.T) {
 			"PGDATA":                                        "/var/lib/postgresql/18/docker",
 			"PGSHARD_POSTGRES_BIN":                          "/usr/lib/postgresql/18/bin/postgres",
 			"PGSHARD_POSTGRES_SOCKET_DIR":                   "/run/pgshard/postgres",
-			"PGSHARD_POSTGRES_HBA_FILE":                     "/etc/pgshard/quarantine.pg_hba.conf",
+			"PGSHARD_POSTGRES_HBA_FILE":                     "/run/pgshard/hba/pg_hba.conf",
 			"PGSHARD_POSTGRES_SMART_SHUTDOWN_MS":            "5000",
 			"PGSHARD_POSTGRES_FAST_SHUTDOWN_MS":             "44000",
 			"PGSHARD_POSTGRES_IMMEDIATE_SHUTDOWN_MS":        "500",
@@ -4324,7 +4324,7 @@ func TestReplicationBootstrapSourcePodClassificationIsExact(t *testing.T) {
 					pod.Spec.Containers[0].Env[index].Value = "quarantine"
 				}
 				if pod.Spec.Containers[0].Env[index].Name == "PGSHARD_POSTGRES_HBA_FILE" {
-					pod.Spec.Containers[0].Env[index].Value = "/etc/pgshard/quarantine.pg_hba.conf"
+					pod.Spec.Containers[0].Env[index].Value = "/run/pgshard/hba/pg_hba.conf"
 				}
 			}
 		}},
