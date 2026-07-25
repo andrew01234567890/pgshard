@@ -448,6 +448,19 @@ docker run --rm --user 999:999 \
   catalog_materializer::tests::live_postgres18_verification_rejects_an_unexpected_active_shard \
   --nocapture
 
+# Reconciliation has to settle the committed prefix an ambiguous commit or an
+# interrupted attempt leaves behind.
+docker run --rm --user 999:999 \
+  --network "$network" \
+  --volume "$fence_socket:/fence-socket" \
+  --mount "type=bind,src=$test_binary,dst=/test/pgshard-agent-test,readonly" \
+  --env PGSHARD_AGENT_TEST_SOCKET_DIR=/fence-socket \
+  --entrypoint /test/pgshard-agent-test \
+  "$image" \
+  --ignored --exact \
+  catalog_materializer::tests::live_postgres18_reconciles_a_partially_materialized_catalog \
+  --nocapture
+
 docker rm --force "$fence_primary" >/dev/null
 docker volume rm "$fence_socket" >/dev/null
 
