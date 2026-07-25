@@ -432,3 +432,57 @@ func TestAutovacuumWorkerOverrideCannotExceedTheMemoryBudget(t *testing.T) {
 		t.Fatalf("lowering the worker count was rejected: %v", err)
 	}
 }
+
+// PostgreSQL gives every walsender its own reorder buffer at 64MB by default,
+// and max_wal_senders here tracks MaximumChangeStreams. Without a budget an
+// 8Gi pod accepts 1028 senders, which is roughly 64GiB of buffer, and the
+// consumers all decode the same WAL so one large transaction reaches every
+// high-water mark together.
+func TestLogicalDecodingMemoryIsBudgetedAndOversubscriptionIsRefused(t *testing.T) {
+	t.Parallel()
+
+	got, err := Calculate(Input{
+		Resources:            resources("2", "4", "8Gi", "8Gi"),
+		PoolerMaxReplicas:    10,
+		MembersPerShard:      3,
+		MaximumChangeStreams: 64,
+		SynchronousStandbys:  1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	setting, ok := got.Settings["logical_decoding_work_mem"]
+	if !ok {
+		t.Fatal("logical_decoding_work_mem is unset, so PostgreSQL uses its 64MB default per sender")
+	}
+	if setting != "8MB" {
+		t.Fatalf("logical_decoding_work_mem = %q, want 8MB", setting)
+	}
+	// The whole fleet must fit the budget it was sized from.
+	perConsumer := int64(8) << 20
+	if total := perConsumer * int64(got.ManagedLogicalConsumers); total > got.LogicalDecodingBudgetBytes {
+		t.Fatalf("%d consumers at %d bytes exceed the %d byte budget", got.ManagedLogicalConsumers, perConsumer, got.LogicalDecodingBudgetBytes)
+	}
+
+	for _, refused := range []struct {
+		name    string
+		limit   string
+		streams int32
+	}{
+		{"an 8Gi pod cannot decode for 1024 change streams", "8Gi", 1024},
+		{"a 1Gi pod cannot decode for 16 change streams", "1Gi", 16},
+	} {
+		t.Run(refused.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := Calculate(Input{
+				Resources:            resources("2", "4", refused.limit, refused.limit),
+				PoolerMaxReplicas:    10,
+				MembersPerShard:      3,
+				MaximumChangeStreams: refused.streams,
+				SynchronousStandbys:  1,
+			}); err == nil {
+				t.Fatal("the spec was accepted; a silent OOM is what this refusal exists to prevent")
+			}
+		})
+	}
+}

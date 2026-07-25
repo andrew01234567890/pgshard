@@ -25,6 +25,11 @@ const minimumAutovacuumWorkMem = 16 * mib
 // is the real ceiling on autovacuum_max_workers.
 const autovacuumWorkerSlots = int64(16)
 
+// Far above PostgreSQL's 64kB floor, and low enough that a small pod can still
+// carry a few consumers. Below this, decoding spills to disk constantly rather
+// than failing outright, which is the harder failure to diagnose.
+const minLogicalDecodingWorkMem = int64(2) << 20
+
 var allowedOverrides = map[string]struct{}{
 	"autovacuum_analyze_scale_factor": {},
 	"autovacuum_max_workers":          {},
@@ -88,20 +93,25 @@ type Result struct {
 	// Bytes the autovacuum fleet as a whole may occupy. Carried out of here
 	// because an override of the worker count is only safe against this, not
 	// against the worker count the budget happened to produce.
-	AutovacuumBudgetBytes   int64
-	CPUMilli                int64
-	ReservedBytes           int64
-	MaxConnections          int32
-	MaxPreparedTransactions int32
-	MaxWALSenders           int32
-	MaxReplicationSlots     int32
-	ManagedLogicalConsumers int32
-	PrimarySlotDemand       int32
-	StandbySlotDemand       int32
-	PromotionSlotDemand     int32
-	Settings                map[string]string
-	Primaries               []Primary
-	Standbys                []Standby
+	AutovacuumBudgetBytes int64
+	// Bytes the logical decoding fleet as a whole may occupy. Carried out for
+	// the same reason as the autovacuum budget: an override of
+	// logical_decoding_work_mem is only safe against the fleet budget, never
+	// against the per-consumer value this happened to produce.
+	LogicalDecodingBudgetBytes int64
+	CPUMilli                   int64
+	ReservedBytes              int64
+	MaxConnections             int32
+	MaxPreparedTransactions    int32
+	MaxWALSenders              int32
+	MaxReplicationSlots        int32
+	ManagedLogicalConsumers    int32
+	PrimarySlotDemand          int32
+	StandbySlotDemand          int32
+	PromotionSlotDemand        int32
+	Settings                   map[string]string
+	Primaries                  []Primary
+	Standbys                   []Standby
 }
 
 func Calculate(in Input) (Result, error) {
@@ -223,6 +233,25 @@ func Calculate(in Input) (Result, error) {
 	}
 	maxSlots := max64(primarySlotDemand, promotionSlotDemand) + 2
 	maxSenders := maxSlots + 2
+
+	// PostgreSQL gives every walsender its own reorder buffer, defaulting to
+	// 64MB, and nothing above accounts for it: max_wal_senders tracks
+	// MaximumChangeStreams, so the default admits roughly 64GiB of buffer on a
+	// pod sized for a fraction of that. The consumers are not independent
+	// either. They all decode the same WAL, so one large transaction drives
+	// every one of them to its high-water mark at the same moment.
+	decodingBudget := available / 8
+	perConsumer := decodingBudget / max64(managedLogicalConsumers, 1)
+	if perConsumer < minLogicalDecodingWorkMem {
+		return Result{}, fmt.Errorf(
+			"resources cannot safely provide logical decoding memory for %d consumers: %s available for decoding allows %s each, below the %s minimum",
+			managedLogicalConsumers,
+			formatMiB(decodingBudget),
+			formatMiB(perConsumer),
+			formatMiB(minLogicalDecodingWorkMem),
+		)
+	}
+	logicalDecodingWorkMem := clamp64(perConsumer, minLogicalDecodingWorkMem, 64*mib)
 	maxPrepared := max64(32, int64(in.PoolerMaxReplicas)*4) + 8
 
 	settings := map[string]string{
@@ -245,6 +274,7 @@ func Calculate(in Input) (Result, error) {
 		"max_prepared_transactions":       strconv.FormatInt(maxPrepared, 10),
 		"max_replication_slots":           strconv.FormatInt(maxSlots, 10),
 		"max_wal_senders":                 strconv.FormatInt(maxSenders, 10),
+		"logical_decoding_work_mem":       formatMiB(logicalDecodingWorkMem),
 		"max_wal_size":                    "1GB",
 		"max_worker_processes":            strconv.FormatInt(workerProcesses, 10),
 		"password_encryption":             "scram-sha-256",
@@ -298,21 +328,22 @@ func Calculate(in Input) (Result, error) {
 	}
 
 	return Result{
-		AutovacuumBudgetBytes:   autovacuumBudget,
-		MemoryBytes:             memory,
-		CPUMilli:                cpu,
-		ReservedBytes:           reserved,
-		MaxConnections:          int32(maxConnections),
-		MaxPreparedTransactions: int32(maxPrepared),
-		MaxWALSenders:           int32(maxSenders),
-		MaxReplicationSlots:     int32(maxSlots),
-		ManagedLogicalConsumers: int32(managedLogicalConsumers),
-		PrimarySlotDemand:       int32(primarySlotDemand),
-		StandbySlotDemand:       int32(standbySlotDemand),
-		PromotionSlotDemand:     int32(promotionSlotDemand),
-		Settings:                settings,
-		Primaries:               primaries,
-		Standbys:                standbys,
+		AutovacuumBudgetBytes:      autovacuumBudget,
+		LogicalDecodingBudgetBytes: decodingBudget,
+		MemoryBytes:                memory,
+		CPUMilli:                   cpu,
+		ReservedBytes:              reserved,
+		MaxConnections:             int32(maxConnections),
+		MaxPreparedTransactions:    int32(maxPrepared),
+		MaxWALSenders:              int32(maxSenders),
+		MaxReplicationSlots:        int32(maxSlots),
+		ManagedLogicalConsumers:    int32(managedLogicalConsumers),
+		PrimarySlotDemand:          int32(primarySlotDemand),
+		StandbySlotDemand:          int32(standbySlotDemand),
+		PromotionSlotDemand:        int32(promotionSlotDemand),
+		Settings:                   settings,
+		Primaries:                  primaries,
+		Standbys:                   standbys,
 	}, nil
 }
 
