@@ -1427,8 +1427,28 @@ mod tests {
 
     const LIVE_CLUSTER_UID: &str = "11111111-2222-3333-4444-555555555555";
     const OTHER_CLUSTER_UID: &str = "99999999-2222-3333-4444-555555555555";
-    const MOUNTED_NONCE: &str = "9f1c3a7e5b0d2846af93c15e70b8d4629a5f0e13c7482b6d95a0fe3172c48b5d";
-    const OTHER_NONCE: &str = "1122334455667788990011223344556677889900112233445566778899001122";
+    /// `pg_control` carries thirty-two random bytes rendered as hex, and a
+    /// fixture standing in for them has to be deterministic, because the vectors
+    /// below are pinned to it. Written out as a literal it would be a sixty-four
+    /// character hex string in a public repository, indistinguishable from real
+    /// authentication material to a reader, to a scanner, and to this project's
+    /// own secret audit. Computed from a one-byte tag it is unmistakably
+    /// synthetic and just as fixed.
+    fn fixture_nonce(tag: u8) -> String {
+        (0..32u8).fold(String::new(), |mut text, index| {
+            use std::fmt::Write as _;
+            let _ = write!(text, "{:02x}", index.wrapping_mul(tag).wrapping_add(tag));
+            text
+        })
+    }
+
+    fn mounted_nonce() -> String {
+        fixture_nonce(1)
+    }
+
+    fn other_nonce() -> String {
+        fixture_nonce(2)
+    }
     const MOUNTED_SYSTEM_IDENTIFIER: u64 = 7_248_119_402_113_558_016;
 
     fn control_data(
@@ -1454,7 +1474,7 @@ mod tests {
             "1800",
             &MOUNTED_SYSTEM_IDENTIFIER.to_string(),
             "1",
-            MOUNTED_NONCE,
+            &mounted_nonce(),
         )
     }
 
@@ -2086,7 +2106,7 @@ mod tests {
             "1800",
             &MOUNTED_SYSTEM_IDENTIFIER.to_string(),
             "1",
-            OTHER_NONCE,
+            &other_nonce(),
         ))
         .expect("the second fixture parses");
         let mut second = agreeing_intent();
@@ -2148,7 +2168,7 @@ mod tests {
     fn the_gate_key_is_pinned() {
         assert_eq!(
             mounted_incarnation().key(),
-            "a93ec80da43b062023e82bf42c97c42a0ab2d37367ad3217354d6b06d1bd7cf5",
+            "d7006c70109cbf88ef382bf080dda6b9f75f410ed5d1246d863288224b23a249",
             "the gate key changed; every already-taken incarnation lost its record"
         );
     }
@@ -2377,7 +2397,10 @@ mod tests {
             ),
             (
                 "repeated nonce",
-                format!("{canonical}Mock authentication nonce:            {OTHER_NONCE}\n"),
+                format!(
+                    "{canonical}Mock authentication nonce:            {}\n",
+                    other_nonce()
+                ),
             ),
             (
                 "zero system identifier",
@@ -2413,15 +2436,15 @@ mod tests {
             ),
             (
                 "zero nonce",
-                canonical.replace(MOUNTED_NONCE, &"0".repeat(64)),
+                canonical.replace(&mounted_nonce(), &"0".repeat(64)),
             ),
             (
                 "short nonce",
-                canonical.replace(MOUNTED_NONCE, &MOUNTED_NONCE[..62]),
+                canonical.replace(&mounted_nonce(), &mounted_nonce()[..62]),
             ),
             (
                 "uppercase nonce",
-                canonical.replace(MOUNTED_NONCE, &MOUNTED_NONCE.to_uppercase()),
+                canonical.replace(&mounted_nonce(), &mounted_nonce().to_uppercase()),
             ),
         ] {
             assert_eq!(
@@ -2439,17 +2462,17 @@ mod tests {
     #[test]
     fn the_seed_is_a_domain_separated_digest_of_the_initdb_nonce() {
         let observed = mounted_incarnation();
-        assert_ne!(observed.seed_id(), MOUNTED_NONCE);
+        assert_ne!(observed.seed_id(), mounted_nonce());
         assert_eq!(
             observed.seed_id(),
-            "1143cb816486830585ed924997de78dd8d6cd28b4eb03019789fe6cb3e4d958e"
+            "22c3229e8f3042581254445238195a034623f697d6fdeee5721e7168b30f8fc7"
         );
 
         let other = parse_mounted_incarnation(&control_data(
             "1800",
             &MOUNTED_SYSTEM_IDENTIFIER.to_string(),
             "1",
-            OTHER_NONCE,
+            &other_nonce(),
         ))
         .expect("parses");
         assert_ne!(observed.seed_id(), other.seed_id());
