@@ -420,6 +420,20 @@ docker run --rm --user 999:999 \
   postgres_generation::tests::live_postgres18_materializer_fences_publication \
   --nocapture
 
+# Drives the real compiled program and revokes authority in the window before
+# the commit checks, which is the only way to observe that a revoked attempt
+# leaves nothing behind and that a later one materializes completely.
+docker run --rm --user 999:999 \
+  --network "$network" \
+  --volume "$fence_socket:/fence-socket" \
+  --mount "type=bind,src=$test_binary,dst=/test/pgshard-agent-test,readonly" \
+  --env PGSHARD_AGENT_TEST_SOCKET_DIR=/fence-socket \
+  --entrypoint /test/pgshard-agent-test \
+  "$image" \
+  --ignored --exact \
+  catalog_materializer::tests::live_postgres18_revoked_authority_does_not_materialize \
+  --nocapture
+
 docker rm --force "$fence_primary" >/dev/null
 docker volume rm "$fence_socket" >/dev/null
 

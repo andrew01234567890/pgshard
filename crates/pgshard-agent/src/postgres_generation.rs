@@ -302,6 +302,10 @@ static TEST_EVIDENCE_SNAPSHOT_GATE: std::sync::Mutex<Option<StablePublicationGat
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
+static TEST_PRE_COMMIT_GATE: std::sync::Mutex<Option<StablePublicationGate>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
 static TEST_EVIDENCE_WAL_CAPTURE_GATE: std::sync::Mutex<Option<StablePublicationGate>> =
     std::sync::Mutex::new(None);
 
@@ -1190,6 +1194,39 @@ fn gate_next_evidence_access_share() -> (oneshot::Receiver<()>, oneshot::Sender<
     (entered_rx, release_tx)
 }
 
+/// Pauses the next catalog step after its fragments have run and before it
+/// observes the fence and the attempt's authority, so a test can change the
+/// world in exactly that window.
+#[cfg(test)]
+pub(crate) async fn pre_commit_checkpoint() {
+    let gate = TEST_PRE_COMMIT_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.await;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn gate_next_pre_commit() -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let mut gate = TEST_PRE_COMMIT_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        gate.replace(StablePublicationGate {
+            entered: entered_tx,
+            release: release_rx,
+        })
+        .is_none(),
+        "test already has a pre-commit gate"
+    );
+    (entered_rx, release_tx)
+}
+
 #[cfg(test)]
 fn gate_next_evidence_snapshot() -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
     let (entered_tx, entered_rx) = oneshot::channel();
@@ -1495,7 +1532,7 @@ pub enum PostgresGenerationError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[derive(serde::Deserialize)]
@@ -1510,7 +1547,29 @@ mod tests {
     }
     use pgshard_types::ShardId;
 
-    fn generation(cluster: &str, holder: &str, term: u64) -> DurableWritableGeneration {
+    /// Connects to a named database on the local socket, for tests that must
+    /// inspect the catalog database as well as the generation database.
+    pub(crate) async fn connect_to(
+        socket_dir: &Path,
+        dbname: &'static str,
+    ) -> Result<TestClient, tokio_postgres::Error> {
+        let connection =
+            connect_with_application_mode(socket_dir, "pgshard-agent-test", dbname, false).await?;
+        Ok(TestClient { connection })
+    }
+
+    /// A connection a test can query directly.
+    pub(crate) struct TestClient {
+        connection: ConnectedPostgres,
+    }
+
+    impl TestClient {
+        pub(crate) const fn client(&self) -> &Client {
+            &self.connection.client
+        }
+    }
+
+    pub(crate) fn generation(cluster: &str, holder: &str, term: u64) -> DurableWritableGeneration {
         DurableWritableGeneration::new(
             cluster.to_owned(),
             format!("{cluster}-uid"),

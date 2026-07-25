@@ -230,6 +230,8 @@ where
                 }
                 transaction.batch_execute(fragment).await?;
             }
+            #[cfg(test)]
+            crate::postgres_generation::pre_commit_checkpoint().await;
             // No await or state-changing operation may be inserted between these
             // exact observations and dispatching COMMIT. The fence check
             // narrows, but cannot close, the window: COMMIT is queued before
@@ -257,6 +259,179 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The committed goldens are rendered for a four-shard fixture cluster, so
+    /// the sealed shard count has to match or genesis references a cell the
+    /// inventory never created.
+    const FIXTURE_SHARDS: u32 = 4;
+
+    /// Drives the real compiled program against a live server and revokes
+    /// authority in the window before the migration's commit checks.
+    ///
+    /// Everything this asserts is a server behaviour: that the fence blocks a
+    /// competing publication, that a revoked attempt does not commit, and that
+    /// nothing it created survives. The unit tests cannot reach any of it.
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL 18 Unix socket"]
+    async fn live_postgres18_revoked_authority_does_not_materialize() {
+        use crate::catalog_materialization_program::compile_catalog_materialization_program;
+        use crate::postgres_generation::{
+            CATALOG_DATABASE, GENERATION_DATABASE, gate_next_pre_commit,
+            publish_writable_generation,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let socket_dir = std::env::var_os("PGSHARD_AGENT_TEST_SOCKET_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("PGSHARD_AGENT_TEST_SOCKET_DIR is required");
+        let first = crate::postgres_generation::tests::generation("cluster-1", "holder-a", 1);
+        let second = crate::postgres_generation::tests::generation("cluster-1", "holder-a", 2);
+
+        create_catalog_database(&socket_dir).await;
+        publish_writable_generation(&socket_dir, &first, &|| true)
+            .await
+            .expect("publish the first generation");
+
+        let program = compile_catalog_materialization_program(
+            include_bytes!("../../pgshard-catalog/migrations/0001_shardschema.sql"),
+            include_bytes!("../../pgshard-catalog/inventory/0001_shard_inventory.sql"),
+            include_bytes!("../../pgshard-catalog/testdata/materialization/genesis.golden.sql"),
+            include_bytes!("../../pgshard-catalog/testdata/materialization/preflight.golden.sql"),
+        )
+        .expect("the real inputs compile");
+
+        // Revoked while the migration's fragments have run but before the
+        // executor observes the fence and the attempt's authority.
+        let authorized = Arc::new(AtomicBool::new(true));
+        let (entered, release) = gate_next_pre_commit();
+        let attempt_authorized = Arc::clone(&authorized);
+        let attempt_socket = socket_dir.clone();
+        let attempt_generation = first.clone();
+        let attempt = tokio::spawn(async move {
+            materialize(
+                &attempt_socket,
+                &program,
+                FIXTURE_SHARDS,
+                true,
+                &attempt_generation,
+                &move || attempt_authorized.load(Ordering::Acquire),
+            )
+            .await
+        });
+
+        entered
+            .await
+            .expect("the executor reached its commit checks");
+        authorized.store(false, Ordering::Release);
+        release.send(()).expect("release the executor");
+
+        let outcome = attempt.await.expect("materializer task");
+        assert!(
+            matches!(outcome, Err(PostgresGenerationError::AuthorityChanged)),
+            "a revoked attempt reported {outcome:?}"
+        );
+
+        // Nothing the revoked attempt ran may survive.
+        let catalog = crate::postgres_generation::tests::connect_to(&socket_dir, CATALOG_DATABASE)
+            .await
+            .expect("inspect the catalog database");
+        let installed: bool = catalog
+            .client()
+            .query_one(
+                "SELECT pg_catalog.to_regnamespace('pgshard_catalog') IS NOT NULL",
+                &[],
+            )
+            .await
+            .expect("observe the catalog schema")
+            .get(0);
+        assert!(!installed, "a revoked attempt left pgshard_catalog behind");
+
+        // The generation is untouched, so a later attempt can proceed.
+        let generation_db =
+            crate::postgres_generation::tests::connect_to(&socket_dir, GENERATION_DATABASE)
+                .await
+                .expect("inspect the generation database");
+        let observed: Vec<u8> = generation_db
+            .client()
+            .query_one(
+                "SELECT generation FROM pgshard_internal.writable_generation",
+                &[],
+            )
+            .await
+            .expect("read the generation")
+            .get(0);
+        assert_eq!(
+            observed,
+            first.canonical_bytes(),
+            "a revoked attempt changed the durable generation"
+        );
+
+        // A retry under a new generation must then materialize completely,
+        // which also proves the revoked attempt left nothing that would block
+        // it and that the executor's ordered apply actually works end to end.
+        publish_writable_generation(&socket_dir, &second, &|| true)
+            .await
+            .expect("publish the replacement generation");
+        let program = compile_catalog_materialization_program(
+            include_bytes!("../../pgshard-catalog/migrations/0001_shardschema.sql"),
+            include_bytes!("../../pgshard-catalog/inventory/0001_shard_inventory.sql"),
+            include_bytes!("../../pgshard-catalog/testdata/materialization/genesis.golden.sql"),
+            include_bytes!("../../pgshard-catalog/testdata/materialization/preflight.golden.sql"),
+        )
+        .expect("the real inputs compile");
+        materialize(
+            &socket_dir,
+            &program,
+            FIXTURE_SHARDS,
+            true,
+            &second,
+            &|| true,
+        )
+        .await
+        .expect("materialize under the replacement generation");
+
+        let catalog = crate::postgres_generation::tests::connect_to(&socket_dir, CATALOG_DATABASE)
+            .await
+            .expect("inspect the materialized catalog");
+        let shards: i64 = catalog
+            .client()
+            .query_one(
+                "SELECT pg_catalog.count(*) FROM pgshard_catalog.shards",
+                &[],
+            )
+            .await
+            .expect("count materialized shards")
+            .get(0);
+        assert_eq!(
+            shards,
+            i64::from(FIXTURE_SHARDS),
+            "the inventory did not materialize every configured shard"
+        );
+        let databases: i64 = catalog
+            .client()
+            .query_one(
+                "SELECT pg_catalog.count(*) FROM pgshard_catalog.logical_databases",
+                &[],
+            )
+            .await
+            .expect("count genesis databases")
+            .get(0);
+        assert!(databases > 0, "genesis installed no logical database");
+    }
+
+    async fn create_catalog_database(socket_dir: &std::path::Path) {
+        let admin = crate::postgres_generation::tests::connect_to(
+            socket_dir,
+            crate::postgres_generation::GENERATION_DATABASE,
+        )
+        .await
+        .expect("connect to create the catalog database");
+        let _ = admin
+            .client()
+            .batch_execute("CREATE DATABASE shardschema")
+            .await;
+    }
 
     /// The classification the enabling stage has to act on, so it must be
     /// reachable rather than shadowed by the fence's own loss report.
