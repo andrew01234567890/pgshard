@@ -8,11 +8,25 @@
 //! incarnation, and the local `PostgreSQL` identity.
 //!
 //! The binding withdraws and republishes its capability whenever any of those
-//! change, and each publication is a fresh `Arc`. Pointer identity against the
-//! capability this attempt captured is therefore the exact authority predicate
-//! the materializer needs: it holds only while every one of those observations
-//! still agrees, and it is re-observed immediately before every commit and
-//! again immediately before this stage publishes anything of its own.
+//! change, and each publication is a fresh `Arc`, so pointer identity against
+//! the captured capability observes revocation without having to re-derive it.
+//!
+//! What that observation is and is not. It is a snapshot, not a linearization
+//! point: it is taken, it releases its guard, and only then does the executor
+//! dispatch `COMMIT`. A withdrawal landing in that gap does not un-queue the
+//! commit. What makes the gap safe is not this predicate but the generation
+//! fence the executor holds across it: publishing a writable generation takes
+//! `SHARE ROW EXCLUSIVE` on the generation relation, which is the same lock the
+//! fence holds, so no competing generation can become authoritative while a
+//! fenced commit is in flight. A fence lost with a commit already dispatched is
+//! reported as `AmbiguousCatalogCommit` and reconciled against the catalog
+//! rather than guessed at. This predicate's job is narrower: end an attempt
+//! promptly once its capability is gone, and refuse to publish a proof for one.
+//!
+//! Withdrawal of a proof is likewise asynchronous — this supervisor has to be
+//! scheduled to retract it — so observing a published proof is not by itself
+//! authorization. A consumer must revalidate with [`MaterializedCatalog::is_current`]
+//! immediately before every action it authorizes.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -40,8 +54,26 @@ pub struct MaterializedCatalogHandoff {
 pub(crate) struct MaterializedCatalog {
     /// Retained so the proof cannot outlive the session, authority, and
     /// incarnation evidence it was established against.
-    #[allow(dead_code, reason = "retained evidence, not an observable")]
-    runtime: Arc<ValidatedCatalogRuntime>,
+    bound: Arc<ValidatedCatalogRuntime>,
+    /// Retained so a consumer can settle that question itself rather than
+    /// trusting that this proof has already been retracted.
+    binding: watch::Receiver<Option<Arc<ValidatedCatalogRuntime>>>,
+}
+
+impl MaterializedCatalog {
+    /// Whether the capability this proof was established against is still the
+    /// current one.
+    ///
+    /// Retraction is asynchronous: the binding withdraws its capability
+    /// immediately, but this proof is only retracted once the supervisor is
+    /// scheduled. A consumer that acts on having *observed* a proof therefore
+    /// acts on a capability that may already be gone. This is the check that
+    /// closes that window, and it must be made immediately before every action
+    /// the proof authorizes, not once when the proof is first seen.
+    #[allow(dead_code, reason = "the serving-activation stage is the consumer")]
+    pub(crate) fn is_current(&self) -> bool {
+        still_bound(&self.binding, &self.bound)
+    }
 }
 
 /// Starts the materialization stage against the runtime binding's output.
@@ -124,16 +156,21 @@ async fn supervise<M, F>(
     }
 }
 
-/// The exact authority predicate: this attempt is still acting for the one
-/// capability it captured, and no republication has replaced it.
+/// Whether this attempt is still acting for the one capability it captured.
+///
+/// A closed channel retains its last value, so a binding that is gone entirely
+/// would otherwise keep reading as current: its drop guard normally withdraws
+/// first, but a predicate that depends on that ordering is a predicate that
+/// fails open when it does not hold.
 fn still_bound(
     runtime: &watch::Receiver<Option<Arc<ValidatedCatalogRuntime>>>,
     bound: &Arc<ValidatedCatalogRuntime>,
 ) -> bool {
-    runtime
-        .borrow()
-        .as_ref()
-        .is_some_and(|current| Arc::ptr_eq(current, bound))
+    runtime.has_changed().is_ok()
+        && runtime
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, bound))
 }
 
 /// Publishes the proof only while the capability it was established against is
@@ -143,18 +180,21 @@ fn publish_if_current(
     output: &watch::Sender<Option<Arc<MaterializedCatalog>>>,
     bound: &Arc<ValidatedCatalogRuntime>,
 ) -> bool {
+    if runtime.has_changed().is_err() || output.is_closed() {
+        return false;
+    }
     // Held across the send: a republication landing between the check and the
     // send would otherwise publish a proof for a capability already withdrawn.
     let current = runtime.borrow();
     if !current
         .as_ref()
         .is_some_and(|current| Arc::ptr_eq(current, bound))
-        || output.is_closed()
     {
         return false;
     }
     output.send_replace(Some(Arc::new(MaterializedCatalog {
-        runtime: Arc::clone(bound),
+        bound: Arc::clone(bound),
+        binding: runtime.clone(),
     })));
     true
 }
@@ -233,7 +273,7 @@ mod tests {
         settle().await;
         let published = proof.borrow().clone().expect("the catalog was proved");
         assert!(
-            Arc::ptr_eq(&published.runtime, &bound),
+            Arc::ptr_eq(&published.bound, &bound),
             "the proof is not pinned to the capability it was established against"
         );
     }
@@ -289,6 +329,45 @@ mod tests {
             attempts.load(Ordering::Acquire),
             2,
             "a new capability did not start a new attempt"
+        );
+    }
+
+    /// Retraction is asynchronous, so there is a window in which a withdrawn
+    /// capability still has a published proof. The proof has to be able to
+    /// answer for itself inside that window.
+    #[tokio::test]
+    async fn a_proof_reports_it_is_stale_before_it_has_been_retracted() {
+        let (runtime, _keep) = watch::channel(None);
+        let proof = start(&runtime, |_, _| async { Ok(()) });
+        runtime.send_replace(Some(capability()));
+        settle().await;
+        let published = proof.borrow().clone().expect("the catalog was proved");
+        assert!(published.is_current(), "a live proof reported itself stale");
+
+        // No yield: the supervisor has not run, so the proof is still the
+        // published one. That is exactly the window a consumer can observe.
+        runtime.send_replace(None);
+        assert!(
+            proof.borrow().is_some(),
+            "the retraction was synchronous, so this test proves nothing"
+        );
+        assert!(
+            !published.is_current(),
+            "a proof whose capability was withdrawn still reported itself current"
+        );
+    }
+
+    /// A closed channel keeps its last value, so a binding that is gone must
+    /// not keep reading as present.
+    #[test]
+    fn a_capability_whose_binding_is_gone_is_not_current() {
+        let bound = capability();
+        let (runtime, receiver) = watch::channel(Some(Arc::clone(&bound)));
+        assert!(still_bound(&receiver, &bound));
+        drop(runtime);
+        assert!(
+            !still_bound(&receiver, &bound),
+            "a capability outlived the binding that published it"
         );
     }
 
