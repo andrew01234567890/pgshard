@@ -3799,8 +3799,18 @@ func sortedDatabaseTemplates(cluster *pgshardv1alpha1.PgShardCluster) []pgshardv
 	return databases
 }
 
+var postgresqlLiteralEscapes = strings.NewReplacer("'", "''", `\`, `\\`)
+
+// Mirrors quote_literal_internal (src/backend/utils/adt/quote.c): doubling the
+// backslash as well as the quote and prefixing E when any backslash is present
+// makes the literal correct under either standard_conforming_strings, so the
+// result does not depend on the session that executes it.
 func postgresqlStringLiteral(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+	quoted := "'" + postgresqlLiteralEscapes.Replace(value) + "'"
+	if strings.ContainsRune(value, '\\') {
+		return "E" + quoted
+	}
+	return quoted
 }
 
 type topologyDocument struct {

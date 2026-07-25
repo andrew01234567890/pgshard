@@ -333,6 +333,7 @@ func ApplyOverrides(settings map[string]string, overrides map[string]string, aut
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
+	accepted := make(map[string]string, len(overrides))
 	for _, key := range keys {
 		normalized := strings.ToLower(strings.TrimSpace(key))
 		if normalized != key {
@@ -348,27 +349,29 @@ func ApplyOverrides(settings map[string]string, overrides map[string]string, aut
 		if strings.ContainsAny(value, "\r\n\x00") {
 			return fmt.Errorf("PostgreSQL parameter %q must be a single line without NUL bytes", key)
 		}
-		if err := validateOverrideValue(key, value, settings, autovacuumBudgetBytes); err != nil {
+		canonical, err := canonicalOverrideValue(key, value, settings, autovacuumBudgetBytes)
+		if err != nil {
 			return fmt.Errorf("invalid PostgreSQL parameter %q: %w", key, err)
 		}
+		accepted[key] = canonical
 	}
-	minValue, hasMin := overrides["min_wal_size"]
+	minValue, hasMin := accepted["min_wal_size"]
 	if !hasMin {
 		minValue, hasMin = settings["min_wal_size"]
 	}
-	maxValue, hasMax := overrides["max_wal_size"]
+	maxValue, hasMax := accepted["max_wal_size"]
 	if !hasMax {
 		maxValue, hasMax = settings["max_wal_size"]
 	}
 	if hasMin && hasMax {
-		minBytes, minErr := parsePostgreSQLSize(minValue)
-		maxBytes, maxErr := parsePostgreSQLSize(maxValue)
+		minBytes, _, minErr := parsePostgreSQLSize(minValue)
+		maxBytes, _, maxErr := parsePostgreSQLSize(maxValue)
 		if minErr == nil && maxErr == nil && minBytes > maxBytes {
 			return fmt.Errorf("PostgreSQL parameter %q must not exceed max_wal_size", "min_wal_size")
 		}
 	}
 	for _, key := range keys {
-		settings[key] = overrides[key]
+		settings[key] = accepted[key]
 	}
 	return nil
 }
@@ -381,7 +384,7 @@ func ValidateStorage(settings map[string]string, storage resource.Quantity) erro
 	if !ok {
 		return fmt.Errorf("PostgreSQL max_wal_size is absent")
 	}
-	maximumBytes, err := parsePostgreSQLSize(maximum)
+	maximumBytes, _, err := parsePostgreSQLSize(maximum)
 	if err != nil {
 		return fmt.Errorf("PostgreSQL max_wal_size is invalid: %w", err)
 	}
@@ -405,12 +408,19 @@ func emittedMebibytes(value string) int64 {
 	return parsed
 }
 
-func validateOverrideValue(key, value string, settings map[string]string, autovacuumBudgetBytes int64) error {
+// canonicalOverrideValue returns the spelling that reaches postgresql.conf.
+// Go's parsers accept spellings the server's configuration lexer does not:
+// "0x1p-1", "1e1" and "1_0.5" are all floats to strconv, but guc-file.l splits
+// each into two tokens, and ProcessConfigFileInternal's bail_out turns that
+// into a FATAL at postmaster startup. Echoing the operator's spelling therefore
+// admits a value that stops every Pod, so the accepted value is always
+// regenerated from what was parsed.
+func canonicalOverrideValue(key, value string, settings map[string]string, autovacuumBudgetBytes int64) (string, error) {
 	switch key {
 	case "autovacuum_analyze_scale_factor", "autovacuum_vacuum_scale_factor", "checkpoint_completion_target":
-		return validateFloatRange(value, 0, 1)
+		return canonicalFloatInRange(value, 0, 1)
 	case "random_page_cost", "seq_page_cost":
-		return validateFloatRange(value, 0.1, 100)
+		return canonicalFloatInRange(value, 0.1, 100)
 	case "autovacuum_max_workers":
 		// Autovacuum workers come from autovacuum_worker_slots, not from
 		// max_worker_processes: PostgreSQL 18 documents that a setting above
@@ -432,75 +442,88 @@ func validateOverrideValue(key, value string, settings map[string]string, autova
 				maximum = max64(1, affordable)
 			}
 		}
-		return validateIntegerRange(value, 1, maximum)
+		return canonicalIntegerInRange(value, 1, maximum)
 	case "autovacuum_vacuum_cost_limit":
-		return validateIntegerRange(value, 1, 10_000)
+		return canonicalIntegerInRange(value, 1, 10_000)
 	case "default_statistics_target":
-		return validateIntegerRange(value, 1, 10_000)
+		return canonicalIntegerInRange(value, 1, 10_000)
 	case "effective_io_concurrency":
-		return validateIntegerRange(value, 0, 1_000)
+		return canonicalIntegerInRange(value, 0, 1_000)
 	case "log_min_duration_statement":
-		return validateIntegerRange(value, -1, 3_600_000)
+		return canonicalIntegerInRange(value, -1, 3_600_000)
 	case "log_statement":
 		if value != "none" && value != "ddl" && value != "mod" && value != "all" {
-			return fmt.Errorf("must be one of none, ddl, mod, or all")
+			return "", fmt.Errorf("must be one of none, ddl, mod, or all")
 		}
-		return nil
+		return value, nil
 	case "checkpoint_timeout":
-		duration, err := parsePostgreSQLDuration(value)
+		duration, canonical, err := parsePostgreSQLDuration(value)
 		if err != nil {
-			return err
+			return "", err
 		}
 		if duration < 30*time.Second || duration > 24*time.Hour {
-			return fmt.Errorf("must be between 30s and 24h")
+			return "", fmt.Errorf("must be between 30s and 24h")
 		}
-		return nil
+		return canonical, nil
 	case "max_wal_size":
-		bytes, err := parsePostgreSQLSize(value)
+		bytes, canonical, err := parsePostgreSQLSize(value)
 		if err != nil {
-			return err
+			return "", err
 		}
 		if bytes < 128*mib || bytes > 1024*1024*mib {
-			return fmt.Errorf("must be between 128MB and 1TB")
+			return "", fmt.Errorf("must be between 128MB and 1TB")
 		}
-		return nil
+		return canonical, nil
 	case "min_wal_size":
-		bytes, err := parsePostgreSQLSize(value)
+		bytes, canonical, err := parsePostgreSQLSize(value)
 		if err != nil {
-			return err
+			return "", err
 		}
 		if bytes < 32*mib || bytes > 1024*1024*mib {
-			return fmt.Errorf("must be between 32MB and 1TB")
+			return "", fmt.Errorf("must be between 32MB and 1TB")
 		}
-		return nil
+		return canonical, nil
 	default:
-		return fmt.Errorf("has no value validator")
+		return "", fmt.Errorf("has no value validator")
 	}
 }
 
-func validateFloatRange(value string, minimum, maximum float64) error {
+const smallestNormalFloat64 = 2.2250738585072014e-308
+
+func canonicalFloatInRange(value string, minimum, maximum float64) (string, error) {
 	parsed, err := strconv.ParseFloat(value, 64)
 	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
-		return fmt.Errorf("must be a finite number")
+		return "", fmt.Errorf("must be a finite number")
 	}
 	if parsed < minimum || parsed > maximum {
-		return fmt.Errorf("must be between %g and %g", minimum, maximum)
+		return "", fmt.Errorf("must be between %g and %g", minimum, maximum)
 	}
-	return nil
+	// A subnormal is indistinguishable from zero for every parameter here, and
+	// strtod underflows on it and sets ERANGE, which parse_real rejects. That
+	// makes set_config_option fail and the postmaster bail out, so the value is
+	// refused at admission where the operator can see it rather than accepted
+	// and then fatal at startup where they cannot.
+	if parsed != 0 && math.Abs(parsed) < smallestNormalFloat64 {
+		return "", fmt.Errorf("must be zero or at least %g in magnitude", smallestNormalFloat64)
+	}
+	// 'f' is the only format that never emits an exponent. guc-file.l's REAL
+	// rule requires a literal '.' before any exponent, so 'g' would render
+	// small magnitudes as "1e-07", which lexes as two tokens.
+	return strconv.FormatFloat(parsed, 'f', -1, 64), nil
 }
 
-func validateIntegerRange(value string, minimum, maximum int64) error {
+func canonicalIntegerInRange(value string, minimum, maximum int64) (string, error) {
 	parsed, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
-		return fmt.Errorf("must be an integer")
+		return "", fmt.Errorf("must be an integer")
 	}
 	if parsed < minimum || parsed > maximum {
-		return fmt.Errorf("must be between %d and %d", minimum, maximum)
+		return "", fmt.Errorf("must be between %d and %d", minimum, maximum)
 	}
-	return nil
+	return strconv.FormatInt(parsed, 10), nil
 }
 
-func parsePostgreSQLDuration(value string) (time.Duration, error) {
+func parsePostgreSQLDuration(value string) (time.Duration, string, error) {
 	units := []struct {
 		suffix     string
 		multiplier time.Duration
@@ -517,14 +540,14 @@ func parsePostgreSQLDuration(value string) (time.Duration, error) {
 		}
 		amount, err := strconv.ParseInt(strings.TrimSuffix(value, unit.suffix), 10, 64)
 		if err != nil || amount <= 0 || amount > int64(math.MaxInt64/time.Duration(unit.multiplier)) {
-			return 0, fmt.Errorf("must use a positive integer with ms, s, min, h, or d")
+			return 0, "", fmt.Errorf("must use a positive integer with ms, s, min, h, or d")
 		}
-		return time.Duration(amount) * unit.multiplier, nil
+		return time.Duration(amount) * unit.multiplier, strconv.FormatInt(amount, 10) + unit.suffix, nil
 	}
-	return 0, fmt.Errorf("must use a positive integer with ms, s, min, h, or d")
+	return 0, "", fmt.Errorf("must use a positive integer with ms, s, min, h, or d")
 }
 
-func parsePostgreSQLSize(value string) (int64, error) {
+func parsePostgreSQLSize(value string) (int64, string, error) {
 	units := []struct {
 		suffix     string
 		multiplier int64
@@ -541,11 +564,11 @@ func parsePostgreSQLSize(value string) (int64, error) {
 		number := strings.TrimSuffix(value, unit.suffix)
 		parsed, err := strconv.ParseInt(number, 10, 64)
 		if err != nil || parsed <= 0 || parsed > math.MaxInt64/unit.multiplier {
-			return 0, fmt.Errorf("must use a positive integer with kB, MB, GB, or TB")
+			return 0, "", fmt.Errorf("must use a positive integer with kB, MB, GB, or TB")
 		}
-		return parsed * unit.multiplier, nil
+		return parsed * unit.multiplier, strconv.FormatInt(parsed, 10) + unit.suffix, nil
 	}
-	return 0, fmt.Errorf("must use a positive integer with kB, MB, GB, or TB")
+	return 0, "", fmt.Errorf("must use a positive integer with kB, MB, GB, or TB")
 }
 
 func formatMiB(bytes int64) string { return strconv.FormatInt(bytes/mib, 10) + "MB" }

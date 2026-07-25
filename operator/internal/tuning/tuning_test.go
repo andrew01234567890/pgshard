@@ -274,6 +274,8 @@ func TestApplyOverridesRejectsNonViableValues(t *testing.T) {
 	tests := map[string]map[string]string{
 		"invalid enum":          {"log_statement": "everything"},
 		"invalid float":         {"checkpoint_completion_target": "999"},
+		"subnormal float":       {"checkpoint_completion_target": "1e-320"},
+		"smallest subnormal":    {"autovacuum_vacuum_scale_factor": "5e-324"},
 		"invalid integer":       {"default_statistics_target": "many"},
 		"invalid duration":      {"checkpoint_timeout": "forever"},
 		"too short duration":    {"checkpoint_timeout": "1s"},
@@ -311,6 +313,45 @@ func TestApplyOverridesAcceptsBoundedValues(t *testing.T) {
 	}
 	if err := ApplyOverrides(settings, overrides, 0); err != nil {
 		t.Fatalf("bounded overrides rejected: %v", err)
+	}
+}
+
+func TestApplyOverridesStoresTheParsedValueNotTheSpelling(t *testing.T) {
+	t.Parallel()
+	// Every spelling here is one strconv accepts, so it survives admission. The
+	// stored value is what reaches postgresql.conf, and guc-file.l has to take
+	// it as a single value token or the postmaster refuses to start.
+	tests := map[string]struct {
+		key   string
+		value string
+		want  string
+	}{
+		"hexadecimal float":   {key: "checkpoint_completion_target", value: "0x1p-1", want: "0.5"},
+		"bare exponent":       {key: "random_page_cost", value: "1e1", want: "10"},
+		"separated float":     {key: "random_page_cost", value: "1_0.5", want: "10.5"},
+		"separated integer":   {key: "seq_page_cost", value: "1_0", want: "10"},
+		"negative exponent":   {key: "autovacuum_vacuum_scale_factor", value: "1e-7", want: "0.0000001"},
+		"leading point":       {key: "autovacuum_analyze_scale_factor", value: ".05", want: "0.05"},
+		"trailing point":      {key: "seq_page_cost", value: "5.", want: "5"},
+		"negative zero":       {key: "autovacuum_analyze_scale_factor", value: "-0.0", want: "-0"},
+		"signed integer":      {key: "default_statistics_target", value: "+200", want: "200"},
+		"zero padded integer": {key: "effective_io_concurrency", value: "0200", want: "200"},
+		"signed duration":     {key: "checkpoint_timeout", value: "+15min", want: "15min"},
+		"zero padded size":    {key: "max_wal_size", value: "004GB", want: "4GB"},
+		"ordinary float":      {key: "checkpoint_completion_target", value: "0.9", want: "0.9"},
+		"ordinary enum":       {key: "log_statement", value: "ddl", want: "ddl"},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			settings := map[string]string{"max_worker_processes": "8", "min_wal_size": "80MB", "max_wal_size": "1GB"}
+			if err := ApplyOverrides(settings, map[string]string{test.key: test.value}, 0); err != nil {
+				t.Fatalf("%s = %q was refused, so it can no longer reach postgresql.conf: %v", test.key, test.value, err)
+			}
+			if got := settings[test.key]; got != test.want {
+				t.Fatalf("%s = %q was stored as %q, want the parsed value %q", test.key, test.value, got, test.want)
+			}
+		})
 	}
 }
 
@@ -422,13 +463,13 @@ func TestAutovacuumWorkerOverrideCannotExceedTheMemoryBudget(t *testing.T) {
 	}
 	// max_worker_processes is 52 for this shape, so the process-slot bound
 	// alone would permit 20 — far past what the memory share can afford.
-	if err := validateOverrideValue("autovacuum_max_workers", strconv.FormatInt(budgeted+1, 10), result.Settings, result.AutovacuumBudgetBytes); err == nil {
+	if _, err := canonicalOverrideValue("autovacuum_max_workers", strconv.FormatInt(budgeted+1, 10), result.Settings, result.AutovacuumBudgetBytes); err == nil {
 		t.Fatalf("an override of %d workers was accepted against a budget for %d", budgeted+1, budgeted)
 	}
-	if err := validateOverrideValue("autovacuum_max_workers", strconv.FormatInt(budgeted, 10), result.Settings, result.AutovacuumBudgetBytes); err != nil {
+	if _, err := canonicalOverrideValue("autovacuum_max_workers", strconv.FormatInt(budgeted, 10), result.Settings, result.AutovacuumBudgetBytes); err != nil {
 		t.Fatalf("the budgeted worker count was rejected: %v", err)
 	}
-	if err := validateOverrideValue("autovacuum_max_workers", "1", result.Settings, result.AutovacuumBudgetBytes); err != nil {
+	if _, err := canonicalOverrideValue("autovacuum_max_workers", "1", result.Settings, result.AutovacuumBudgetBytes); err != nil {
 		t.Fatalf("lowering the worker count was rejected: %v", err)
 	}
 }

@@ -136,8 +136,14 @@ spec:
                       minItems: 1
                       type: array
                     name:
+                      description: |-
+                        Name is the logical database name. Database genesis SQL is constructed
+                        from it, so it must be a DNS-1123 label. The pattern restates the
+                        admission webhook's check so the API server enforces the grammar
+                        structurally, whether or not the webhook is reachable.
                       maxLength: 63
                       minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                       type: string
                     shards:
                       description: |-
