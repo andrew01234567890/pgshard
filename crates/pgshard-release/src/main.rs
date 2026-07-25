@@ -2215,27 +2215,18 @@ mod tests {
             policy.get("if").is_none(),
             "the job that proves the gates is itself gated"
         );
-        // Every step, not just the job: a step carries its own `if:`, and one
-        // conditioned on an event this workflow never receives runs never
-        // while the job still succeeds. `continue-on-error` is the same hole
-        // with a different spelling.
-        let steps = policy["steps"]
-            .as_sequence()
-            .expect("the policy job declares steps");
-        for step in steps {
-            assert!(
-                step.get("if").is_none(),
-                "a step of the job that proves the gates is conditional"
-            );
-            assert!(
-                step.get("continue-on-error").is_none(),
-                "a step of the job that proves the gates may fail without failing it"
-            );
-        }
-        assert!(
-            policy.get("continue-on-error").is_none(),
-            "the job that proves the gates may fail without failing the aggregate"
+        let steps = steps_of(policy, "the job that proves the gates");
+        // The aggregate is the one externally required check, and GitHub counts
+        // a conditionally skipped job as passing. `if: github.event_name ==
+        // '\''issues'\''` on it is therefore a one-line disarmament that leaves
+        // every named step untouched.
+        let aggregate = workflow_job(&workflow, "aggregate");
+        assert_eq!(
+            aggregate.get("if").and_then(serde_norway::Value::as_str),
+            Some("always()"),
+            "the aggregate is conditioned on something other than always()"
         );
+        steps_of(aggregate, "the aggregate");
         let runs = steps
             .iter()
             .filter_map(|step| step["run"].as_str())
@@ -2255,6 +2246,30 @@ mod tests {
             Some(ALWAYS),
             "the policy job is not pinned as unconditional"
         );
+    }
+
+    /// A job's steps, having proved none of them — nor the job — can be
+    /// conditioned out or allowed to fail. A step carries its own `if:`, and
+    /// one keyed on an event the workflow never receives runs never while the
+    /// job still reports success; `continue-on-error` is the same hole spelled
+    /// differently.
+    fn steps_of<'a>(job: &'a serde_norway::Value, described: &str) -> &'a [serde_norway::Value] {
+        assert!(
+            job.get("continue-on-error").is_none(),
+            "{described} may fail without failing"
+        );
+        let steps = job["steps"].as_sequence().expect("the job declares steps");
+        for step in steps {
+            assert!(
+                step.get("if").is_none(),
+                "a step of {described} is conditional"
+            );
+            assert!(
+                step.get("continue-on-error").is_none(),
+                "a step of {described} may fail without failing it"
+            );
+        }
+        steps
     }
 
     fn parsed_workflow() -> serde_norway::Value {
