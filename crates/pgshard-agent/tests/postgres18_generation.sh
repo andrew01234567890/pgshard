@@ -224,10 +224,16 @@ normalize_standby_socket
 
 if [[ -n "$runtime_image" ]]; then
   test "$(docker inspect --format '{{.Config.User}}' "$runtime_image")" = "999:999"
+  # The Pod gives the agent a memory-backed runtime volume mounted read-write at
+  # /run/pgshard, with the socket and credential mounts nested inside it. A
+  # read-only root filesystem carrying only those nested mounts is a different
+  # deployment: the agent owns that directory and materializes the policy and
+  # configuration it is judged against into it before every spawn.
   start_agent_standby() {
     docker run --detach --name "$standby" \
       --network "$network" --read-only --cap-drop ALL \
       --security-opt no-new-privileges \
+      --tmpfs /run/pgshard:rw,uid=999,gid=999,mode=0700 \
       --volume "$standby_data:/var/lib/postgresql/18/docker" \
       --volume "$standby_socket:/run/pgshard/postgres" \
       --volume "$standby_credentials:/run/pgshard/credentials:ro" \
@@ -238,7 +244,7 @@ if [[ -n "$runtime_image" ]]; then
       --env PGSHARD_INSTANCE_ID=cluster-1-shard-0-1 \
       --env PGSHARD_POSTGRES_MODE=replication-standby \
       --env PGSHARD_POSTGRES_SOCKET_DIR=/run/pgshard/postgres \
-      --env PGSHARD_POSTGRES_HBA_FILE=/etc/pgshard/quarantine.pg_hba.conf \
+      --env PGSHARD_POSTGRES_HBA_FILE=/run/pgshard/hba/pg_hba.conf \
       --env PGSHARD_POSTGRES_PRIMARY_HOST=primary \
       --env PGSHARD_POSTGRES_PRIMARY_PORT=5432 \
       --env PGSHARD_POSTGRES_PRIMARY_SLOT_NAME="$standby_application_name" \
