@@ -339,20 +339,45 @@ jobs:
     if: needs.changes.outputs.catalog == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    services:
-      postgres:
-        image: postgres:18
-        env:
-          POSTGRES_DB: shardschema
-          POSTGRES_PASSWORD: pgshard-ci-only
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d shardschema"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
     steps:
+      - name: Start the PostgreSQL 18 fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The runner pulls a `services:` image before the first step runs,
+          # under a back-off no workflow step can reach, so one Docker Hub
+          # timeout fails the job before any of its work starts. Started from a
+          # step, the pull retries under our own control.
+          readonly postgres_image="postgres:18"
+          for attempt in 1 2 3 4 5; do
+            if docker pull "$postgres_image"; then
+              break
+            fi
+            if (( attempt == 5 )); then
+              echo "failed to pull ${postgres_image} after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+          docker run --detach --name pgshard-ci-postgres \
+            --env POSTGRES_DB=shardschema \
+            --env POSTGRES_PASSWORD=pgshard-ci-only \
+            --publish 5432:5432 \
+            "$postgres_image"
+          ready=false
+          for _ in {1..36}; do
+            if docker exec pgshard-ci-postgres \
+              pg_isready -U postgres -d shardschema >/dev/null
+            then
+              ready=true
+              break
+            fi
+            sleep 5
+          done
+          if [[ "$ready" != true ]]; then
+            docker logs pgshard-ci-postgres
+            exit 1
+          fi
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Cache Rust build
@@ -372,6 +397,9 @@ jobs:
         env:
           PGSHARD_TEST_DATABASE_URL: postgresql://postgres:pgshard-ci-only@127.0.0.1:5432/shardschema
         run: make catalog-test
+      - name: Remove the PostgreSQL 18 fixture
+        if: always()
+        run: docker rm --force pgshard-ci-postgres 2>/dev/null || true
 
   orch-catalog-postgres:
     name: Orchestrator catalog / PostgreSQL 18
@@ -379,33 +407,56 @@ jobs:
     if: needs.changes.outputs.orch_catalog == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    services:
-      postgres:
-        image: postgres:18
-        env:
-          POSTGRES_DB: shardschema
-          POSTGRES_PASSWORD: pgshard-ci-only
-          POSTGRES_INITDB_ARGS: --set wal_level=logical --set max_prepared_transactions=10 --set hot_standby_feedback=on --set wal_receiver_status_interval=1s --set sync_replication_slots=on --set primary_slot_name=pgshard_member_0001 --set synchronized_standby_slots=pgshard_member_0001
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d shardschema"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
-      postgres17:
-        image: postgres:17
-        env:
-          POSTGRES_DB: shardschema
-          POSTGRES_PASSWORD: pgshard-ci-only
-        ports:
-          - 5433:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d shardschema"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
     steps:
+      - name: Start the PostgreSQL 18 and PostgreSQL 17 fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The runner pulls a `services:` image before the first step runs,
+          # under a back-off no workflow step can reach, so one Docker Hub
+          # timeout fails the job before any of its work starts. Started from a
+          # step, the pull retries under our own control.
+          readonly primary_image="postgres:18"
+          readonly legacy_image="postgres:17"
+          for image in "$primary_image" "$legacy_image"; do
+            for attempt in 1 2 3 4 5; do
+              if docker pull "$image"; then
+                break
+              fi
+              if (( attempt == 5 )); then
+                echo "failed to pull ${image} after ${attempt} attempts" >&2
+                exit 1
+              fi
+              sleep $((attempt * 10))
+            done
+          done
+          docker run --detach --name pgshard-ci-postgres \
+            --env POSTGRES_DB=shardschema \
+            --env POSTGRES_PASSWORD=pgshard-ci-only \
+            --env POSTGRES_INITDB_ARGS="--set wal_level=logical --set max_prepared_transactions=10 --set hot_standby_feedback=on --set wal_receiver_status_interval=1s --set sync_replication_slots=on --set primary_slot_name=pgshard_member_0001 --set synchronized_standby_slots=pgshard_member_0001" \
+            --publish 5432:5432 \
+            "$primary_image"
+          docker run --detach --name pgshard-ci-postgres17 \
+            --env POSTGRES_DB=shardschema \
+            --env POSTGRES_PASSWORD=pgshard-ci-only \
+            --publish 5433:5432 \
+            "$legacy_image"
+          for container in pgshard-ci-postgres pgshard-ci-postgres17; do
+            ready=false
+            for _ in {1..36}; do
+              if docker exec "$container" \
+                pg_isready -U postgres -d shardschema >/dev/null
+              then
+                ready=true
+                break
+              fi
+              sleep 5
+            done
+            if [[ "$ready" != true ]]; then
+              docker logs "$container"
+              exit 1
+            fi
+          done
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Cache Rust build
@@ -429,11 +480,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t primary_containers < <(
-            docker ps --filter publish=5432 --format '{{.ID}}'
-          )
-          test "${#primary_containers[@]}" -eq 1
-          primary_container="${primary_containers[0]}"
+          readonly primary_container=pgshard-ci-postgres
           docker exec "$primary_container" psql \
             --username postgres --dbname shardschema --set ON_ERROR_STOP=1 \
             --command "CREATE ROLE pgshard_replicator WITH REPLICATION LOGIN PASSWORD 'pgshard-ci-only'"
@@ -502,17 +549,15 @@ jobs:
         run: |
           set -u
           docker rm --force pgshard-ci-standby 2>/dev/null || true
-          mapfile -t primary_containers < <(
-            docker ps --filter publish=5432 --format '{{.ID}}'
-          )
-          if [[ "${#primary_containers[@]}" -eq 1 ]]; then
-            docker exec "${primary_containers[0]}" psql \
-              --username postgres --dbname shardschema \
-              --command "SELECT pg_catalog.pg_drop_replication_slot(slot_name) FROM pg_catalog.pg_replication_slots WHERE slot_name = 'pgshard_ci_anchor_00000000000000000000000000000001'" \
-              --command "SELECT pg_catalog.pg_drop_replication_slot(slot_name) FROM pg_catalog.pg_replication_slots WHERE slot_name = 'pgshard_member_0001'" \
-              >/dev/null || true
-          fi
+          docker exec pgshard-ci-postgres psql \
+            --username postgres --dbname shardschema \
+            --command "SELECT pg_catalog.pg_drop_replication_slot(slot_name) FROM pg_catalog.pg_replication_slots WHERE slot_name = 'pgshard_ci_anchor_00000000000000000000000000000001'" \
+            --command "SELECT pg_catalog.pg_drop_replication_slot(slot_name) FROM pg_catalog.pg_replication_slots WHERE slot_name = 'pgshard_member_0001'" \
+            >/dev/null || true
           docker volume rm pgshard-ci-standby 2>/dev/null || true
+      - name: Remove the PostgreSQL 18 and PostgreSQL 17 fixtures
+        if: always()
+        run: docker rm --force pgshard-ci-postgres pgshard-ci-postgres17 2>/dev/null || true
 
   planner-postgres:
     name: Planner / PostgreSQL 18
@@ -520,20 +565,45 @@ jobs:
     if: needs.changes.outputs.planner == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    services:
-      postgres:
-        image: postgres:18
-        env:
-          POSTGRES_DB: postgres
-          POSTGRES_PASSWORD: pgshard-ci-only
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
     steps:
+      - name: Start the PostgreSQL 18 fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The runner pulls a `services:` image before the first step runs,
+          # under a back-off no workflow step can reach, so one Docker Hub
+          # timeout fails the job before any of its work starts. Started from a
+          # step, the pull retries under our own control.
+          readonly postgres_image="postgres:18"
+          for attempt in 1 2 3 4 5; do
+            if docker pull "$postgres_image"; then
+              break
+            fi
+            if (( attempt == 5 )); then
+              echo "failed to pull ${postgres_image} after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+          docker run --detach --name pgshard-ci-postgres \
+            --env POSTGRES_DB=postgres \
+            --env POSTGRES_PASSWORD=pgshard-ci-only \
+            --publish 5432:5432 \
+            "$postgres_image"
+          ready=false
+          for _ in {1..36}; do
+            if docker exec pgshard-ci-postgres \
+              pg_isready -U postgres -d postgres >/dev/null
+            then
+              ready=true
+              break
+            fi
+            sleep 5
+          done
+          if [[ "$ready" != true ]]; then
+            docker logs pgshard-ci-postgres
+            exit 1
+          fi
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Cache Rust build
@@ -553,6 +623,9 @@ jobs:
         env:
           PGSHARD_TEST_DATABASE_URL: postgresql://postgres:pgshard-ci-only@127.0.0.1:5432/postgres
         run: make planner-postgres-test
+      - name: Remove the PostgreSQL 18 fixture
+        if: always()
+        run: docker rm --force pgshard-ci-postgres 2>/dev/null || true
 
   pgwire-postgres:
     name: PostgreSQL wire / PostgreSQL 18
@@ -560,20 +633,45 @@ jobs:
     if: needs.changes.outputs.pgwire == 'true' || needs.changes.outputs.pooler_postgres == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    services:
-      postgres:
-        image: postgres:18
-        env:
-          POSTGRES_HOST_AUTH_METHOD: trust
-          POSTGRES_INITDB_ARGS: --set wal_level=logical --set max_prepared_transactions=10
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
     steps:
+      - name: Start the PostgreSQL 18 fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The runner pulls a `services:` image before the first step runs,
+          # under a back-off no workflow step can reach, so one Docker Hub
+          # timeout fails the job before any of its work starts. Started from a
+          # step, the pull retries under our own control.
+          readonly postgres_image="postgres:18"
+          for attempt in 1 2 3 4 5; do
+            if docker pull "$postgres_image"; then
+              break
+            fi
+            if (( attempt == 5 )); then
+              echo "failed to pull ${postgres_image} after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+          docker run --detach --name pgshard-ci-postgres \
+            --env POSTGRES_HOST_AUTH_METHOD=trust \
+            --env POSTGRES_INITDB_ARGS="--set wal_level=logical --set max_prepared_transactions=10" \
+            --publish 5432:5432 \
+            "$postgres_image"
+          ready=false
+          for _ in {1..36}; do
+            if docker exec pgshard-ci-postgres \
+              pg_isready -U postgres -d postgres >/dev/null
+            then
+              ready=true
+              break
+            fi
+            sleep 5
+          done
+          if [[ "$ready" != true ]]; then
+            docker logs pgshard-ci-postgres
+            exit 1
+          fi
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Cache Rust build
@@ -599,6 +697,9 @@ jobs:
         env:
           PGSHARD_POOLER_TEST_ADDRESS: 127.0.0.1:5432
         run: make pooler-postgres-test
+      - name: Remove the PostgreSQL 18 fixture
+        if: always()
+        run: docker rm --force pgshard-ci-postgres 2>/dev/null || true
 
   pgwire-fuzz:
     name: Pgwire fuzz / ${{ matrix.target }}
@@ -1164,21 +1265,46 @@ jobs:
         suite: [postgres18-wire]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    services:
-      postgres:
-        image: docker.io/library/postgres:18@sha256:32ca0af8e77bfb8c6610c488e4691f83f972a3e9e64d3b02facf3ab111ad5500
-        env:
-          POSTGRES_DB: postgres
-          POSTGRES_HOST_AUTH_METHOD: trust
-          POSTGRES_INITDB_ARGS: --set wal_level=logical --set max_prepared_transactions=10
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
     steps:
+      - name: Start the PostgreSQL 18 fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The runner pulls a `services:` image before the first step runs,
+          # under a back-off no workflow step can reach, so one Docker Hub
+          # timeout fails the job before any of its work starts. Started from a
+          # step, the pull retries under our own control.
+          readonly postgres_image="docker.io/library/postgres:18@sha256:32ca0af8e77bfb8c6610c488e4691f83f972a3e9e64d3b02facf3ab111ad5500"
+          for attempt in 1 2 3 4 5; do
+            if docker pull "$postgres_image"; then
+              break
+            fi
+            if (( attempt == 5 )); then
+              echo "failed to pull ${postgres_image} after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+          docker run --detach --name pgshard-ci-postgres \
+            --env POSTGRES_DB=postgres \
+            --env POSTGRES_HOST_AUTH_METHOD=trust \
+            --env POSTGRES_INITDB_ARGS="--set wal_level=logical --set max_prepared_transactions=10" \
+            --publish 5432:5432 \
+            "$postgres_image"
+          ready=false
+          for _ in {1..36}; do
+            if docker exec pgshard-ci-postgres \
+              pg_isready -U postgres -d postgres >/dev/null
+            then
+              ready=true
+              break
+            fi
+            sleep 5
+          done
+          if [[ "$ready" != true ]]; then
+            docker logs pgshard-ci-postgres
+            exit 1
+          fi
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Cache Rust build
@@ -1199,6 +1325,9 @@ jobs:
           PGSHARD_INTEGRATION_SUITE: ${{ matrix.suite }}
           PGSHARD_PGWIRE_TEST_ADDRESS: 127.0.0.1:5432
         run: cargo run --locked -p pgshard-integration-tests -- --suite "$PGSHARD_INTEGRATION_SUITE"
+      - name: Remove the PostgreSQL 18 fixture
+        if: always()
+        run: docker rm --force pgshard-ci-postgres 2>/dev/null || true
 
   images:
     name: Build local test images
