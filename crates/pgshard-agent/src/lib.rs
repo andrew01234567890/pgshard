@@ -14,6 +14,7 @@ pub mod coordination;
 pub mod domain;
 pub mod genesis_authority;
 pub mod http;
+pub(crate) mod kube_transport;
 pub mod postgres;
 pub mod postgres_fence;
 pub mod postgres_generation;

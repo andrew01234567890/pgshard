@@ -2170,7 +2170,14 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	runKubectl(t, ctx, "--namespace", namespace.Name, "scale", "statefulset/"+statefulSetName, "--replicas=0")
 
 	releasedLease := &coordinationv1.Lease{}
-	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+	// The agent releases only after its supervised process tree is proven
+	// absent, and the planner gives that shutdown 5s smart, 44s fast and 0.5s
+	// immediate inside a 60s termination grace period. A bound shorter than the
+	// budget the product is configured to spend fails a correct agent whenever
+	// the node is slow, so wait for the grace period the kubelet honours
+	// instead. What is asserted is unchanged: the exact holder is cleared, on
+	// the same Lease identity and fencing term, only after process absence.
+	if err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 90*time.Second, true, func(ctx context.Context) (bool, error) {
 		releasedLease = &coordinationv1.Lease{}
 		if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace.Name, Name: checkpoint.LeaseName}, releasedLease); err != nil {
 			return false, err

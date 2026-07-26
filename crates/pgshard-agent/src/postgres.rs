@@ -97,6 +97,9 @@ const MAX_DURABLE_WRITABLE_GENERATION_BYTES: u64 = 1_024;
 const MAX_SOCKET_DIRECTORY_BYTES: usize = 93;
 const MIN_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(10);
 const MAX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(55);
+// Spent before, not instead of, the writable-Lease release that follows it, so
+// this cap and `coordination::RELEASE_BUDGET_MULTIPLIER` share the Pod's
+// termination grace period. Nothing relates them; the planner pins both.
 const MAX_SHUTDOWN_BUDGET: Duration = Duration::from_secs(55);
 const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 const TARGET_FENCE_CLEANUP_STAGES: u32 = 3;
