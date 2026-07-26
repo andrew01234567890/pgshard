@@ -35,6 +35,7 @@ use crate::catalog_activation::{
     CatalogActivationJournal, CatalogActivationJournalError, DurableCatalogActivationAcceptance,
 };
 use crate::domain::AgentIdentity;
+use crate::kube_transport::apply_request_budget;
 
 const CARRIER_API_VERSION: &str = "pgshard.io/v1alpha1";
 const CARRIER_KIND: &str = "PgShardCatalogActivation";
@@ -813,10 +814,7 @@ impl KubernetesCarrierStore {
     ) -> Result<Self, CatalogActivationConsumerError> {
         let mut client_config = Config::incluster()
             .map_err(|error| CatalogActivationConsumerError::KubernetesConfig(error.to_string()))?;
-        client_config.connect_timeout = Some(config.request_timeout);
-        client_config.read_timeout = Some(config.request_timeout);
-        client_config.write_timeout = Some(config.request_timeout);
-        client_config.default_retry = false;
+        apply_request_budget(&mut client_config, config.request_timeout);
         let client = Client::try_from(client_config)
             .map_err(|error| CatalogActivationConsumerError::KubernetesClient(error.to_string()))?;
         let resource = ApiResource::from_gvk_with_plural(

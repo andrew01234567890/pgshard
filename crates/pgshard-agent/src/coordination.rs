@@ -20,6 +20,7 @@ use crate::domain::{
     ActivationConfigEvidence, ActivationPostgresConfig, AgentIdentity, AgentState, FencingLease,
     GenerationDurabilityEvidence, LeaseInstallError,
 };
+use crate::kube_transport::apply_request_budget;
 use crate::postgres::WritablePostgresStopped;
 use crate::writable::{DurableWritableGeneration, WritableLeaseAttempt, same_writable_attempt};
 
@@ -28,6 +29,13 @@ const MAX_RETRY: Duration = Duration::from_secs(5);
 const OWNER_API_VERSION: &str = "pgshard.io/v1alpha1";
 const OWNER_KIND: &str = "PgShardCluster";
 const PROCESS_INCARNATION_HEX_LENGTH: usize = 24;
+/// How much longer than one renewal request the post-fence release may take.
+///
+/// The release is issued after `PostgreSQL` has stopped, so this and
+/// `postgres::MAX_SHUTDOWN_BUDGET` are spent one after the other inside the
+/// Pod's termination grace period. Nothing relates the two constants; the
+/// planner is what keeps their sum inside the 60 seconds it grants.
+const RELEASE_BUDGET_MULTIPLIER: u32 = 3;
 
 /// Validated settings for one physical cell's writable-term Lease.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -154,6 +162,21 @@ impl WritableLeaseConfig {
         self.lease_duration.saturating_sub(self.renew_deadline)
     }
 
+    /// Returns the bound for the single conditional release request issued
+    /// after the supervised `PostgreSQL` process tree is proven absent.
+    ///
+    /// The renewal budget is deliberately short: a renewal that outlives it
+    /// would spend the margin reserved for fencing. The release races nothing.
+    /// It runs after the fence, and a release that arrives late still cannot
+    /// disturb a successor, because it is a conditional replace against the
+    /// exact resource version this process last observed. Holding it to the
+    /// renewal budget only made a fenced cell fall back to expiry whenever one
+    /// cold connection was slow.
+    fn release_timeout(&self) -> Duration {
+        self.request_timeout
+            .saturating_mul(RELEASE_BUDGET_MULTIPLIER)
+    }
+
     /// Builds status-only activation configuration from the exact writable
     /// Lease and `PostgreSQL` durability settings.
     pub(crate) fn activation_config(
@@ -221,7 +244,7 @@ impl WritableLeaseShutdown {
         let Some(release) = self.release else {
             return Ok(WritableLeaseReleaseOutcome::NotHeld);
         };
-        let store = KubernetesLeaseStore::new(&self.config)?;
+        let store = KubernetesLeaseStore::new(&self.config, self.config.release_timeout())?;
         release_with_store(&store, &self.config, release).await?;
         Ok(WritableLeaseReleaseOutcome::Released)
     }
@@ -254,7 +277,7 @@ pub(crate) async fn supervise(
     shutdown: watch::Receiver<bool>,
     attempt: WritableLeaseAttempt,
 ) -> Result<WritableLeaseShutdown, WritableLeaseError> {
-    let store = KubernetesLeaseStore::new(&config)?;
+    let store = KubernetesLeaseStore::new(&config, config.request_timeout)?;
     supervise_with_store(&store, &config, state, shutdown, attempt).await
 }
 
@@ -779,19 +802,19 @@ struct KubernetesLeaseStore {
 }
 
 impl KubernetesLeaseStore {
-    fn new(config: &WritableLeaseConfig) -> Result<Self, WritableLeaseError> {
+    fn new(
+        config: &WritableLeaseConfig,
+        request_timeout: Duration,
+    ) -> Result<Self, WritableLeaseError> {
         let mut client_config = Config::incluster()
             .map_err(|error| WritableLeaseError::InClusterConfiguration(error.to_string()))?;
-        client_config.connect_timeout = Some(config.request_timeout);
-        client_config.read_timeout = Some(config.request_timeout);
-        client_config.write_timeout = Some(config.request_timeout);
-        client_config.default_retry = false;
+        apply_request_budget(&mut client_config, request_timeout);
         let client = Client::try_from(client_config)
             .map_err(|error| WritableLeaseError::KubernetesClient(error.to_string()))?;
         Ok(Self {
             api: Api::namespaced(client, &config.namespace),
             name: config.lease_name.clone(),
-            request_timeout: config.request_timeout,
+            request_timeout,
         })
     }
 }
@@ -1284,6 +1307,24 @@ mod tests {
                 tokio::time::sleep(self.renewal_delay).await;
             }
             result
+        }
+    }
+
+    #[test]
+    fn the_post_fence_release_outlives_one_renewal_request() {
+        // The release is the only request issued on a client with no pooled
+        // connection, so it has to cover a handshake the renewal budget never
+        // had to. Every permitted request budget has to leave it that room, and
+        // none may stretch the release past what a terminating Pod can spend.
+        for request_timeout in [
+            Duration::from_millis(100),
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+        ] {
+            let mut config = config();
+            config.request_timeout = request_timeout;
+            assert!(config.release_timeout() > request_timeout);
+            assert!(config.release_timeout() <= Duration::from_secs(15));
         }
     }
 
