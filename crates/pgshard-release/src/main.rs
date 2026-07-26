@@ -405,6 +405,12 @@ fn audit_encoded_run(path: &str, run: &str) -> Result<()> {
         else {
             continue;
         };
+        // A key with no armour is bytes, and bytes survive the encoding intact
+        // while carrying nothing a text scan of the decode could match.
+        ensure!(
+            !is_bare_private_key_object(&decoded),
+            "content in {path} carries a private key encoded in binary form"
+        );
         // One level only: a decode of a decode is not a form anyone commits by
         // accident, and recursing would make the audit unbounded.
         audit_plain_content(
@@ -905,11 +911,12 @@ fn carries_encrypted_pem_headers(body: &str) -> bool {
 }
 
 /// Every form these delimiters wrap that has a body worth decoding is one of
-/// four things: a DER object, an `OpenSSH` key, an `OpenPGP` secret-key packet,
-/// or an RFC 4716 key. A prefix of any of them counts, because a key cut short by
-/// a quote or a wrap is still a key.
+/// five things: a DER object, a PKCS#12 bundle, an `OpenSSH` key, an `OpenPGP`
+/// secret-key packet, or an RFC 4716 key. A prefix of any of them counts,
+/// because a key cut short by a quote or a wrap is still a key.
 fn is_private_key_material(bytes: &[u8]) -> bool {
     is_der_private_key(bytes)
+        || is_pkcs12_bundle(bytes)
         || is_openssh_private_key(bytes)
         || is_pgp_secret_key_packet(bytes)
         || is_rfc4716_private_key(bytes)
@@ -943,6 +950,26 @@ fn is_der_private_key(bytes: &[u8]) -> bool {
     matches!(contents, [INTEGER, 0x01, 0x00 | 0x01, ..])
         || der_sequence(contents)
             .is_some_and(|(_, algorithm)| contents.get(algorithm) == Some(&OBJECT_IDENTIFIER))
+}
+
+/// A PKCS#12 bundle is the one form here that carries a key without ever naming
+/// one: a SEQUENCE holding the version integer three and then the content it
+/// authenticates, which opens with its own algorithm identifier. Three is the
+/// only version the standard defines and no other structure here declares one,
+/// so the version is what separates a bundle from the DER objects above.
+fn is_pkcs12_bundle(bytes: &[u8]) -> bool {
+    const INTEGER: u8 = 0x02;
+    const OBJECT_IDENTIFIER: u8 = 0x06;
+    /// `PFX` has had one version since PKCS#12 was published.
+    const VERSION: u8 = 3;
+
+    let Some((_, header)) = der_sequence(bytes) else {
+        return false;
+    };
+    let contents = &bytes[header..];
+    matches!(contents, [INTEGER, 0x01, VERSION, ..])
+        && der_sequence(&contents[3..])
+            .is_some_and(|(_, content)| contents.get(3 + content) == Some(&OBJECT_IDENTIFIER))
 }
 
 /// The declared length of a DER SEQUENCE and the width of its header.
@@ -981,13 +1008,14 @@ fn is_openssh_private_key(bytes: &[u8]) -> bool {
     bytes.starts_with(b"openssh-key-v1\0")
 }
 
+const PGP_SECRET_KEY: u8 = 5;
+const PGP_SECRET_SUBKEY: u8 = 7;
+
 /// An armoured secret key opens with a packet tag: the top bit set, then the tag
 /// number, five for a secret key and seven for a secret subkey, in either the
 /// framing that predates RFC 4880 or the one it introduced. The packet body
 /// opens with its own version, three or four.
 fn is_pgp_secret_key_packet(bytes: &[u8]) -> bool {
-    const SECRET_KEY: u8 = 5;
-    const SECRET_SUBKEY: u8 = 7;
     /// A tag and a version are three bytes of agreement, which is little enough
     /// that the packet has to be long enough to be one as well. The smallest
     /// secret key packet anyone writes is hundreds of bytes.
@@ -996,33 +1024,130 @@ fn is_pgp_secret_key_packet(bytes: &[u8]) -> bool {
     if bytes.len() < MIN_PACKET {
         return false;
     }
-    let Some(&tag) = bytes.first() else {
-        return false;
-    };
-    let (number, header) = if tag & 0xc0 == 0xc0 {
-        let Some(&first) = bytes.get(1) else {
-            return false;
-        };
-        // Two octets for a length in the middle range, five for the marker
-        // that introduces a four-octet one, and one for everything else.
-        let length = match first {
-            192..=223 => 2,
-            255 => 5,
-            _ => 1,
-        };
-        (tag & 0x3f, 1 + length)
-    } else if tag & 0xc0 == 0x80 {
-        let length = match tag & 0x03 {
+    openpgp_packet(bytes).is_some_and(|(number, header, _)| {
+        matches!(number, PGP_SECRET_KEY | PGP_SECRET_SUBKEY)
+            && matches!(bytes.get(header), Some(3 | 4))
+    })
+}
+
+/// A packet's tag number, the width of its header, and the length that header
+/// declares. A length is absent where the framing declares none: the oldest form
+/// runs to the end of the file, and the newest can announce only the first chunk
+/// of a body that continues. Neither bounds the packet from its header alone.
+fn openpgp_packet(bytes: &[u8]) -> Option<(u8, usize, Option<usize>)> {
+    let &tag = bytes.first()?;
+    if tag & 0xc0 == 0xc0 {
+        let &first = bytes.get(1)?;
+        // Two octets for a length in the middle range, five for the marker that
+        // introduces a four-octet one, and one for everything else.
+        return Some(match first {
+            192..=223 => (
+                tag & 0x3f,
+                3,
+                Some(((usize::from(first) - 192) << 8) + usize::from(*bytes.get(2)?) + 192),
+            ),
+            255 => (tag & 0x3f, 6, Some(big_endian(bytes.get(2..6)?))),
+            224..=254 => (tag & 0x3f, 2, None),
+            _ => (tag & 0x3f, 2, Some(usize::from(first))),
+        });
+    }
+    if tag & 0xc0 == 0x80 {
+        let width = match tag & 0x03 {
             0 => 1,
             1 => 2,
             2 => 4,
             _ => 0,
         };
-        ((tag & 0x3c) >> 2, 1 + length)
-    } else {
+        let declared = match width {
+            0 => None,
+            width => Some(big_endian(bytes.get(1..1 + width)?)),
+        };
+        return Some(((tag & 0x3c) >> 2, 1 + width, declared));
+    }
+    None
+}
+
+fn big_endian(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .fold(0, |value, &byte| (value << 8) | usize::from(byte))
+}
+
+/// Not every key is armoured. A DER key, a PKCS#12 bundle and an `OpenPGP`
+/// keyring are files of bytes with no delimiter, no label and no text of any
+/// kind, and a scan that reads lines cannot see one whether it is committed as
+/// it stands or encoded whole into a Secret. Both were measured against real
+/// `openssl` and `gnupg` output and both went through unread.
+///
+/// What is asked of a bare object is stricter than what is asked inside a
+/// delimiter, because there is no delimiter to have narrowed the question: the
+/// structure has to account for every byte it was given. A prefix will not do.
+/// That is what keeps the rule from reading a key into whichever run of encoded
+/// text happens to decode to a plausible first byte, and it costs nothing, since
+/// a file and a Secret's value are each the whole of an object or none of it.
+fn is_bare_private_key_object(bytes: &[u8]) -> bool {
+    is_whole_der_private_key(bytes)
+        || is_openssh_private_key(bytes)
+        || is_openpgp_keyring(bytes)
+        || is_java_keystore(bytes)
+}
+
+/// A Java keystore is neither a DER object nor a chain of packets: four bytes of
+/// magic, the format version, the number of entries, and then the entries. The
+/// key inside is encrypted under the store password and encoded in no form these
+/// rules read, so the header is all there is to go on. What the header does say
+/// is what the first entry holds, and that is the distinction worth drawing:
+/// `keytool` writes the same file for a private key and for the trust store of
+/// certificates that sits beside it in every Java project, and a trust store is
+/// published on purpose.
+fn is_java_keystore(bytes: &[u8]) -> bool {
+    const MAGIC: [u8; 4] = [0xfe, 0xed, 0xfe, 0xed];
+    const PRIVATE_KEY_ENTRY: u8 = 1;
+
+    bytes.starts_with(&MAGIC)
+        && matches!(bytes.get(4..8), Some([0, 0, 0, 1 | 2]))
+        && matches!(bytes.get(12..16), Some([0, 0, 0, PRIVATE_KEY_ENTRY]))
+}
+
+/// A DER object declares its own size, so a bare one is judged by whether that
+/// size is the size of the file.
+fn is_whole_der_private_key(bytes: &[u8]) -> bool {
+    der_sequence(bytes).is_some_and(|(declared, header)| header + declared == bytes.len())
+        && (is_der_private_key(bytes) || is_pkcs12_bundle(bytes))
+}
+
+/// A keyring declares no size of its own: it is a chain of packets, and the
+/// chain is what stands in for the delimiter. A file that opens with a secret
+/// key and whose packets end exactly where it ends is a keyring; one whose
+/// packets run past the end, or stop short of it, is something else that opened
+/// with the same byte.
+///
+/// Every packet has to declare its length for the chain to be followed at all,
+/// and the framings that declare none are refused here rather than treated as
+/// running to the end of the file. That is not a formality: an `npm` integrity
+/// hash in this repository's own lock file opens with a byte that reads as a
+/// secret subkey of indeterminate length, and reading it that way refused nine
+/// blobs of real history. Twelve bits of tag and version are not enough on their
+/// own; what carries this rule is the chain arriving exactly at the end.
+fn is_openpgp_keyring(bytes: &[u8]) -> bool {
+    /// The smallest secret key packet anyone writes is hundreds of bytes, and a
+    /// keyring holds one with an identity and a signature beside it.
+    const MIN_KEYRING: usize = 32;
+
+    if bytes.len() < MIN_KEYRING {
         return false;
-    };
-    matches!(number, SECRET_KEY | SECRET_SUBKEY) && matches!(bytes.get(header), Some(3 | 4))
+    }
+    let mut at = 0;
+    while at < bytes.len() {
+        let Some((number, header, Some(length))) = openpgp_packet(&bytes[at..]) else {
+            return false;
+        };
+        if at == 0 && !(number == PGP_SECRET_KEY && matches!(bytes.get(header), Some(3 | 4))) {
+            return false;
+        }
+        at = at.saturating_add(header).saturating_add(length);
+    }
+    at == bytes.len()
 }
 
 /// Everything after the opening delimiter, up to the closing one where there is
@@ -1093,6 +1218,10 @@ fn audit_content_bytes(path: &str, content: &[u8]) -> Result<()> {
     ensure!(
         !is_compressed(content),
         "content in {path} is compressed, and the audit refuses what it cannot read"
+    );
+    ensure!(
+        !is_bare_private_key_object(content),
+        "content in {path} is a private key in binary form"
     );
     let text = String::from_utf8_lossy(content);
     audit_content(path, &text)?;
@@ -3061,6 +3190,259 @@ mod tests {
             audit_content("bad.json", &format!("{{\"tls.key\": \"{collapsed}\"}}")).is_err(),
             "an RFC 4716 key must be refused"
         );
+    }
+
+    /// A DER SEQUENCE declaring exactly what it holds, which is what every key
+    /// `openssl` writes in that form looks like and what a bare object has to be.
+    fn der_sequence_of(contents: &[u8]) -> Vec<u8> {
+        let mut object = vec![0x30];
+        match u8::try_from(contents.len()) {
+            Ok(short) if short < 0x80 => object.push(short),
+            _ => {
+                object.push(0x82);
+                object.extend_from_slice(
+                    &u16::try_from(contents.len())
+                        .expect("the fixtures are kilobytes at most")
+                        .to_be_bytes(),
+                );
+            }
+        }
+        object.extend_from_slice(contents);
+        object
+    }
+
+    /// An `OpenPGP` packet in the framing that predates RFC 4880, which is the
+    /// one `gnupg` writes a keyring with: a tag with a two-octet length.
+    fn openpgp_packet_of(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0x80 | (tag << 2) | 0x01];
+        packet.extend_from_slice(
+            &u16::try_from(body.len())
+                .expect("the fixtures are kilobytes at most")
+                .to_be_bytes(),
+        );
+        packet.extend_from_slice(body);
+        packet
+    }
+
+    /// The same packet in the framing RFC 4880 introduced, whose length in the
+    /// middle range is two octets encoding an offset rather than a number.
+    fn new_format_packet_of(tag: u8, body: &[u8]) -> Vec<u8> {
+        assert!(
+            (192..8384).contains(&body.len()),
+            "the middle range is what this framing encodes differently"
+        );
+        let offset = body.len() - 192;
+        let mut packet = vec![
+            0xc0 | tag,
+            192 + u8::try_from(offset >> 8).expect("the middle range is two octets"),
+            u8::try_from(offset & 0xff).expect("one octet by construction"),
+        ];
+        packet.extend_from_slice(body);
+        packet
+    }
+
+    fn filler(length: usize) -> Vec<u8> {
+        vec![0x5a; length]
+    }
+
+    /// PKCS#8: the version integer, then the algorithm, then the key.
+    fn der_key() -> Vec<u8> {
+        der_sequence_of(&[vec![0x02, 0x01, 0x00], filler(200)].concat())
+    }
+
+    /// The version three PKCS#12 has had since it was published, then the
+    /// content it authenticates, which opens with its own algorithm.
+    fn pkcs12_bundle() -> Vec<u8> {
+        der_sequence_of(
+            &[
+                vec![0x02, 0x01, 0x03],
+                der_sequence_of(&[vec![0x06, 0x09], filler(200)].concat()),
+            ]
+            .concat(),
+        )
+    }
+
+    /// A version four secret key packet and the identity beside it, in each of
+    /// the two framings a keyring is written with.
+    fn openpgp_keyring(modern: bool) -> Vec<u8> {
+        let body = [vec![0x04], filler(300)].concat();
+        let key = if modern {
+            new_format_packet_of(5, &body)
+        } else {
+            openpgp_packet_of(5, &body)
+        };
+        [key, openpgp_packet_of(13, b"someone@example.invalid")].concat()
+    }
+
+    /// The magic, the format version, one entry, and the tag that says what the
+    /// entry holds.
+    fn java_keystore(version: u8, entry: u8) -> Vec<u8> {
+        [
+            vec![
+                0xfe, 0xed, 0xfe, 0xed, 0, 0, 0, version, 0, 0, 0, 1, 0, 0, 0, entry,
+            ],
+            filler(200),
+        ]
+        .concat()
+    }
+
+    /// The forms that declare a size, which is what the negatives interrogate.
+    fn sized_bare_key_objects() -> [(&'static str, Vec<u8>); 4] {
+        [
+            ("a DER key", der_key()),
+            ("a PKCS#12 bundle", pkcs12_bundle()),
+            ("an OpenPGP keyring", openpgp_keyring(false)),
+            (
+                "an OpenPGP keyring in the newer framing",
+                openpgp_keyring(true),
+            ),
+        ]
+    }
+
+    /// A key does not have to be text. A DER object, a PKCS#12 bundle, an
+    /// `OpenPGP` keyring and a Java keystore are files of bytes carrying no
+    /// delimiter, no label and nothing else a scan of lines can see, and each
+    /// was measured going through unread: `openssl genpkey -outform DER`,
+    /// `openssl pkcs12 -export`, `gpg --export-secret-keys` and `keytool
+    /// -genkeypair` all produced one.
+    #[test]
+    fn a_key_with_no_armour_is_refused_as_bytes_and_encoded() {
+        let unsized_forms = [
+            (
+                "an OpenSSH key",
+                [b"openssh-key-v1\0".to_vec(), filler(200)].concat(),
+            ),
+            ("a Java keystore", java_keystore(2, 1)),
+        ];
+        for (name, object) in sized_bare_key_objects().into_iter().chain(unsized_forms) {
+            assert!(
+                is_bare_private_key_object(&object),
+                "{name} must be recognised as bytes"
+            );
+            assert!(
+                audit_content_bytes("key.bin", &object).is_err(),
+                "{name} committed as it stands must be refused"
+            );
+            let secret = format!(
+                "apiVersion: v1\nkind: Secret\ndata:\n  tls.key: {}\n",
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &object)
+            );
+            assert!(
+                audit_content("secret.yaml", &secret).is_err(),
+                "{name} encoded whole into a Secret must be refused"
+            );
+        }
+
+        // A bundle pasted between private-key delimiters is a bundle still, and
+        // the delimiters are the only way one ever carries a label. Asked of the
+        // collapsed rule directly, because the rule that reads bare bytes would
+        // otherwise answer for it.
+        let begin = ["-----BEGIN ", "PRIVATE ", "KEY-----"].concat();
+        let end = ["-----END ", "PRIVATE ", "KEY-----"].concat();
+        let encoded =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pkcs12_bundle());
+        assert!(
+            carries_collapsed_private_key(&format!("{begin}\\n{encoded}\\n{end}")),
+            "a bundle between private-key delimiters must be read as a key"
+        );
+    }
+
+    /// A bare object is judged more strictly than a body inside a delimiter,
+    /// because there is no delimiter to have narrowed the question first: the
+    /// structure has to account for every byte of what it was handed. These are
+    /// what that strictness is for, and the first of them is not hypothetical --
+    /// this repository's own lock file carries one.
+    #[test]
+    fn what_opens_like_a_bare_key_without_accounting_for_the_bytes_is_not_one() {
+        // A hash is sixty-four bytes whatever it opens with, and one in every
+        // thirty thousand of them opens as a packet that declares no length:
+        // the subkey an `npm` integrity hash actually carried, which refused
+        // nine blobs of this repository's history, and the secret key that
+        // would have been read the same way.
+        for (name, opening) in [("a subkey", 0x9f), ("a secret key", 0x97)] {
+            let hash = [vec![opening, 0x04], vec![0x71; 62]].concat();
+            assert!(
+                !is_bare_private_key_object(&hash),
+                "a hash opening as {name} of no declared length is not a keyring"
+            );
+        }
+        let integrity = [vec![0x9f, 0x03], vec![0x71; 62]].concat();
+        let lock = format!(
+            "    \"integrity\": \"sha512-{}\"\n",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &integrity)
+        );
+        assert!(
+            audit_content("package-lock.json", &lock).is_ok(),
+            "an integrity hash must not be read as a key: {lock}"
+        );
+
+        // One byte more, or one byte fewer, and the declared structure no longer
+        // accounts for the file, which is the whole of what separates an object
+        // from data that opens with the same bytes.
+        for (name, object) in sized_bare_key_objects() {
+            let trailing = [object.clone(), vec![0x00]].concat();
+            assert!(
+                !is_bare_private_key_object(&trailing),
+                "{name} must not be recognised where it does not account for the bytes"
+            );
+            assert!(
+                !is_bare_private_key_object(&object[..object.len() - 1]),
+                "{name} cut short must not be recognised as a bare object either"
+            );
+        }
+
+        // A chain of packets that holds no secret key is a signature, a
+        // certificate or a message, and every one of those is published on
+        // purpose.
+        let signatures = [
+            openpgp_packet_of(2, &filler(300)),
+            openpgp_packet_of(13, b"someone@example.invalid"),
+        ]
+        .concat();
+        assert!(
+            !is_bare_private_key_object(&signatures),
+            "a chain that opens with a signature is not a keyring"
+        );
+
+        // Version three is what makes a bundle a bundle, and the content it
+        // authenticates has to be there behind it. The first of these differs
+        // from a bundle in one byte, which is the point: everything else about
+        // one is shared with the DER objects around it.
+        let content = der_sequence_of(&[vec![0x06, 0x09], filler(200)].concat());
+        for (name, contents) in [
+            (
+                "another version",
+                [vec![0x02, 0x01, 0x02], content].concat(),
+            ),
+            ("no content behind the version", vec![0x02, 0x01, 0x03]),
+            (
+                "content that names no algorithm",
+                [vec![0x02, 0x01, 0x03], der_sequence_of(&filler(200))].concat(),
+            ),
+        ] {
+            let object = der_sequence_of(&[contents, filler(200)].concat());
+            assert!(
+                !is_pkcs12_bundle(&object),
+                "a SEQUENCE with {name} is not a PKCS#12 bundle"
+            );
+        }
+
+        // A store of trusted certificates is the same file with one byte
+        // changed, and every Java project that has a keystore has one. A version
+        // the format never had is not that format at all: four bytes of magic
+        // are four bytes, and something else will carry them eventually.
+        for (name, store) in [
+            ("a store of trusted certificates", java_keystore(2, 2)),
+            (
+                "a format version the keystore never had",
+                java_keystore(9, 1),
+            ),
+        ] {
+            assert!(
+                !is_bare_private_key_object(&store),
+                "{name} is not a private key"
+            );
+        }
     }
 
     /// This gate reads every line of every blob in history, so what it costs to
