@@ -971,11 +971,26 @@ jobs:
           go test -race -count=1 -timeout=30m \
             -run '${{ matrix.tests }}' \
             ${{ matrix.package }}
-      - name: Capture manager diagnostics
+      # Runs before the cluster is deleted, and collects the node itself as
+      # well as the workloads. Every member, orchestrator, pooler and manager
+      # shares one KIND node, so a kube-proxy, CoreDNS, conntrack or CNI
+      # failure there surfaces as an unrelated product symptom in each of them.
+      - name: Capture KIND diagnostics
         if: failure()
         run: |
-          kubectl get pods,deployments,statefulsets,leases --all-namespaces --show-labels
-          kubectl logs --namespace pgshard-system deployment/pgshard-controller-manager --all-containers --tail=200 || true
+          set -euo pipefail
+          .github/scripts/capture-kind-diagnostics.sh \
+            pgshard-manager "$RUNNER_TEMP/kind-diagnostics"
+          cat "$RUNNER_TEMP/kind-diagnostics/cluster.txt"
+          tail --lines=200 "$RUNNER_TEMP/kind-diagnostics/logs/manager.log"
+      - name: Store KIND diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kind-diagnostics-manager-${{ matrix.group }}
+          path: ${{ runner.temp }}/kind-diagnostics
+          if-no-files-found: warn
+          retention-days: 7
       - name: Delete disposable Kubernetes cluster
         if: always()
         run: kind delete cluster --name pgshard-manager
@@ -1152,11 +1167,26 @@ jobs:
           go test -race -count=1 -timeout=20m
           -run '^TestKINDManagerRunsAgentQuarantine$'
           ./internal/controller
-      - name: Capture manager diagnostics
+      # This job's cluster carries the composition the flake appears in. The
+      # capture has to precede deletion, and has to reach kube-system and the
+      # node, because a failure of the node's own networking is invisible in
+      # workload logs alone.
+      - name: Capture KIND diagnostics
         if: failure()
         run: |
-          kubectl get pods,deployments,statefulsets,leases --all-namespaces --show-labels
-          kubectl logs --namespace pgshard-system deployment/pgshard-controller-manager --all-containers --tail=200 || true
+          set -euo pipefail
+          .github/scripts/capture-kind-diagnostics.sh \
+            pgshard-manager "$RUNNER_TEMP/kind-diagnostics"
+          cat "$RUNNER_TEMP/kind-diagnostics/cluster.txt"
+          tail --lines=200 "$RUNNER_TEMP/kind-diagnostics/logs/manager.log"
+      - name: Store KIND diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kind-diagnostics-quarantine
+          path: ${{ runner.temp }}/kind-diagnostics
+          if-no-files-found: warn
+          retention-days: 7
       - name: Delete disposable Kubernetes cluster
         if: always()
         run: kind delete cluster --name pgshard-manager
