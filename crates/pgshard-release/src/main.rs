@@ -734,8 +734,18 @@ fn carries_password_bearing_dsn(line: &str) -> bool {
     let lowered = line.to_ascii_lowercase();
     let schemes = [["postgres", "://"].concat(), ["postgresql", "://"].concat()];
     schemes.iter().any(|scheme| {
+        // Where the string starting at the previous occurrence ended. Nothing
+        // that ends a connection string lies between an occurrence and that
+        // point, so the next occurrence ends there too and the search resumes
+        // instead of starting again. Starting again cost a scan to the end of
+        // the line for every occurrence on it, which is quadratic in how many a
+        // line carries: two megabytes of them took two and a half minutes.
+        let mut ends = 0;
         lowered.match_indices(scheme.as_str()).any(|(at, _)| {
-            let dsn = connection_string_at(&line[at..]);
+            if ends <= at {
+                ends = at + connection_string_at(&line[at..]).len();
+            }
+            let dsn = &line[at..ends];
             dsn_carries_a_password(dsn, scheme.len()) && !PERMITTED_TEST_DSNS.contains(&dsn)
         })
     })
@@ -1062,11 +1072,20 @@ const MAX_LABEL: usize = 24;
 /// A delimiter is its opening, a label no longer than any format gives one, and
 /// the text that ends it. The cap is what stops a certificate delimiter earlier
 /// in the line from pairing with a key delimiter much later.
+///
+/// Only the positions a label could occupy are examined. Searching the rest of
+/// the line for a terminator that the cap would reject anyway made this
+/// quadratic in the number of openings one line carries, which a line of two
+/// megabytes turned into minutes of work for a verdict of `None`.
 fn delimiter_span(haystack: &str, opening: &str, label_end: &str) -> Option<(usize, usize)> {
     haystack.match_indices(opening).find_map(|(at, _)| {
-        let labelled = haystack.get(at + opening.len()..)?;
-        let ends = labelled.find(label_end)?;
-        (ends <= MAX_LABEL).then_some((at, at + opening.len() + ends + label_end.len()))
+        let labelled = haystack.get(at + opening.len()..)?.as_bytes();
+        let ends = (0..=MAX_LABEL).find(|start| {
+            labelled
+                .get(*start..)
+                .is_some_and(|rest| rest.starts_with(label_end.as_bytes()))
+        })?;
+        Some((at, at + opening.len() + ends + label_end.len()))
     })
 }
 
@@ -3042,6 +3061,48 @@ mod tests {
             audit_content("bad.json", &format!("{{\"tls.key\": \"{collapsed}\"}}")).is_err(),
             "an RFC 4716 key must be refused"
         );
+    }
+
+    /// This gate reads every line of every blob in history, so what it costs to
+    /// judge one line is what it costs to release. Two of these rules searched
+    /// the rest of a line again from every occurrence of the marker they look
+    /// for, which is quadratic in how many occurrences the line carries: two
+    /// megabytes of them took two and a half minutes each, and one minified
+    /// asset committed once would have cost that on every release afterwards.
+    ///
+    /// The bound is loose on purpose. What it is here to catch is not a
+    /// slowdown but a return to a different complexity, and the difference
+    /// between the two forms is four orders of magnitude.
+    #[test]
+    fn a_line_dense_with_markers_is_judged_in_bounded_time() {
+        const BOUND: Duration = Duration::from_secs(30);
+        const SIZE: usize = 1 << 20;
+
+        let opening = ["-----", "BEGIN"].concat();
+        let mut delimiters = String::with_capacity(SIZE + opening.len() + 1);
+        while delimiters.len() < SIZE {
+            delimiters.push_str(&opening);
+            delimiters.push('x');
+        }
+        let scheme = ["postgresql", "://"].concat();
+        let schemes = scheme.repeat(SIZE / scheme.len());
+
+        for (name, line) in [
+            ("openings without a label", delimiters),
+            ("schemes without an authority", schemes),
+        ] {
+            let started = Instant::now();
+            assert!(
+                audit_content("dense.txt", &line).is_ok(),
+                "a line of {name} carries no credential"
+            );
+            let taken = started.elapsed();
+            assert!(
+                taken < BOUND,
+                "{} bytes of {name} took {taken:?}, which is not the cost of reading a line once",
+                line.len()
+            );
+        }
     }
 
     /// A SEQUENCE may declare no length at all. DER forbids it and OpenSSL reads
