@@ -258,6 +258,7 @@ struct AgentFixture {
     executable: PathBuf,
     socket_dir: PathBuf,
     hba_file: PathBuf,
+    synchronous_conf_file: PathBuf,
 }
 
 impl AgentFixture {
@@ -279,6 +280,7 @@ impl AgentFixture {
             .expect("make control-data fixture executable");
         let socket_dir = root.path().join("socket");
         let hba_file = root.path().join("quarantine.pg_hba.conf");
+        let synchronous_conf_file = root.path().join("conf").join("synchronous.conf");
         fs::write(
             &hba_file,
             "local postgres postgres peer\nlocal all all reject\nlocal replication all reject\n",
@@ -292,6 +294,7 @@ impl AgentFixture {
             executable,
             socket_dir,
             hba_file,
+            synchronous_conf_file,
         }
     }
 
@@ -326,6 +329,10 @@ impl AgentFixture {
             .env("PGSHARD_POSTGRES_BIN", &self.executable)
             .env("PGSHARD_POSTGRES_SOCKET_DIR", &self.socket_dir)
             .env("PGSHARD_POSTGRES_HBA_FILE", &self.hba_file)
+            .env(
+                "PGSHARD_POSTGRES_SYNCHRONOUS_CONF_FILE",
+                &self.synchronous_conf_file,
+            )
             .env("PGSHARD_POSTGRES_SMART_SHUTDOWN_MS", "500")
             .env("PGSHARD_POSTGRES_FAST_SHUTDOWN_MS", "500")
             .env("PGSHARD_POSTGRES_IMMEDIATE_SHUTDOWN_MS", "500")
@@ -350,6 +357,16 @@ fn create_pgdata(path: &Path) {
     fs::write(path.join("PG_VERSION"), "18\n").expect("write PG_VERSION");
     fs::set_permissions(path.join("PG_VERSION"), fs::Permissions::from_mode(0o600))
         .expect("protect PG_VERSION");
+    fs::write(
+        path.join("postgresql.conf"),
+        b"# fixture standing in for what initdb writes\n",
+    )
+    .expect("write postgresql.conf");
+    fs::set_permissions(
+        path.join("postgresql.conf"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("protect postgresql.conf");
     let control = OpenOptions::new()
         .create_new(true)
         .write(true)

@@ -1184,6 +1184,7 @@ func TestAgentQuarantinePlanProjectsExactWritableLeaseIdentity(t *testing.T) {
 			"PGSHARD_POSTGRES_BIN":                          "/usr/lib/postgresql/18/bin/postgres",
 			"PGSHARD_POSTGRES_SOCKET_DIR":                   "/run/pgshard/postgres",
 			"PGSHARD_POSTGRES_HBA_FILE":                     "/run/pgshard/hba/pg_hba.conf",
+			"PGSHARD_POSTGRES_SYNCHRONOUS_CONF_FILE":        "/run/pgshard/conf/synchronous.conf",
 			"PGSHARD_POSTGRES_SMART_SHUTDOWN_MS":            "5000",
 			"PGSHARD_POSTGRES_FAST_SHUTDOWN_MS":             "44000",
 			"PGSHARD_POSTGRES_IMMEDIATE_SHUTDOWN_MS":        "500",
@@ -1280,6 +1281,17 @@ func TestPostgreSQLRuntimeObservationRejectsAnnotationShapeMismatch(t *testing.T
 	)
 	if _, err := ObservePostgreSQLRuntime(conflicting.Annotations, conflicting.Spec); err == nil || !strings.Contains(err.Error(), "does not match its process composition") {
 		t.Fatalf("agent annotation with conflicting runtime environment error = %v", err)
+	}
+	// The agent appends an include of this path to durable PGDATA state, so a
+	// redirected path leaves a directive behind that outlives the Pod.
+	redirected := template.DeepCopy()
+	for index := range redirected.Spec.Containers[0].Env {
+		if redirected.Spec.Containers[0].Env[index].Name == "PGSHARD_POSTGRES_SYNCHRONOUS_CONF_FILE" {
+			redirected.Spec.Containers[0].Env[index].Value = "/run/pgshard/conf/other.conf"
+		}
+	}
+	if _, err := ObservePostgreSQLRuntime(redirected.Annotations, redirected.Spec); err == nil || !strings.Contains(err.Error(), "does not match its process composition") {
+		t.Fatalf("agent annotation with a redirected synchronous configuration error = %v", err)
 	}
 	for index := range template.Spec.Containers[0].Env {
 		if template.Spec.Containers[0].Env[index].Name == "PGSHARD_POSTGRES_MODE" {
@@ -4580,6 +4592,9 @@ func TestReplicationStandbyPodClassificationIsExact(t *testing.T) {
 		{name: "direct runtime", mutate: func(pod *corev1.Pod) { pod.Annotations[PostgreSQLRuntimeAnnotation] = string(PostgreSQLRuntimeDirect) }},
 		{name: "different mode", mutate: func(pod *corev1.Pod) { setEnvironment(pod, "PGSHARD_POSTGRES_MODE", "quarantine") }},
 		{name: "different HBA", mutate: func(pod *corev1.Pod) { setEnvironment(pod, "PGSHARD_POSTGRES_HBA_FILE", "/other") }},
+		{name: "different synchronous configuration", mutate: func(pod *corev1.Pod) {
+			setEnvironment(pod, "PGSHARD_POSTGRES_SYNCHRONOUS_CONF_FILE", "/other")
+		}},
 		{name: "different source", mutate: func(pod *corev1.Pod) { setEnvironment(pod, "PGSHARD_POSTGRES_PRIMARY_HOST", "other.database.svc") }},
 		{name: "different slot", mutate: func(pod *corev1.Pod) {
 			setEnvironment(pod, "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME", "pgshard_member_0002")

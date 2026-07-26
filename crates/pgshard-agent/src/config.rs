@@ -176,6 +176,13 @@ struct RawConfig {
     )]
     postgres_hba_file: PathBuf,
 
+    #[arg(
+        long,
+        env = "PGSHARD_POSTGRES_SYNCHRONOUS_CONF_FILE",
+        default_value = "/run/pgshard/conf/synchronous.conf"
+    )]
+    postgres_synchronous_conf_file: PathBuf,
+
     #[arg(long, env = "PGSHARD_POSTGRES_PRIMARY_HOST")]
     postgres_primary_host: Option<String>,
 
@@ -311,6 +318,7 @@ impl RawConfig {
             self.postgres_bin.clone(),
             self.postgres_socket_dir.clone(),
             self.postgres_hba_file.clone(),
+            self.postgres_synchronous_conf_file.clone(),
             Duration::from_millis(self.postgres_smart_shutdown_ms),
             Duration::from_millis(self.postgres_fast_shutdown_ms),
             Duration::from_millis(self.postgres_immediate_shutdown_ms),
@@ -955,6 +963,7 @@ mod tests {
             PathBuf::from("/usr/lib/postgresql/18/bin/postgres"),
             PathBuf::from("/run/pgshard/postgres"),
             PathBuf::from("/run/pgshard/hba/pg_hba.conf"),
+            PathBuf::from("/run/pgshard/conf/synchronous.conf"),
             Duration::from_secs(5),
             Duration::from_secs(44),
             Duration::from_millis(500),
