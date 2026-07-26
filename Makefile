@@ -1,4 +1,4 @@
-.PHONY: check rust-check rust-static rust-test pgwire-fuzz-static agent-target-fence-test agent-wal-generation-test agent-reload-test catalog-test orch-catalog-test orch-slot-observer-test pgwire-postgres-test pooler-postgres-test planner-postgres-test proto-check go-check go-format-check go-generated-check docs-check docs-audit actions-check public-check images release-build
+.PHONY: check rust-check rust-static rust-test pgwire-fuzz-static agent-target-fence-test agent-wal-generation-test catalog-test orch-catalog-test orch-slot-observer-test pgwire-postgres-test pooler-postgres-test planner-postgres-test proto-check go-check go-format-check go-generated-check docs-check docs-audit actions-check public-check images release-build
 
 PGSHARD_GIT_SHA ?= $(shell git rev-parse HEAD 2>/dev/null)
 PGSHARD_BUILD_VERSION ?= 0.0.0-dev+local.$(shell printf '%.12s' "$(PGSHARD_GIT_SHA)")$(shell test -z "$$(git status --porcelain --untracked-files=normal 2>/dev/null)" || printf '.dirty')
@@ -31,10 +31,6 @@ agent-target-fence-test:
 
 agent-wal-generation-test:
 	crates/pgshard-agent/tests/postgres18_generation.sh
-
-agent-reload-test:
-	@test -n "$(PGSHARD_TEST_POSTGRES_BIN)" || (echo "PGSHARD_TEST_POSTGRES_BIN is required" >&2; exit 1)
-	cargo test --locked -p pgshard-agent --test postgres18_reload -- --ignored --test-threads=1
 
 catalog-test:
 	@test -n "$(PGSHARD_TEST_DATABASE_URL)" || (echo "PGSHARD_TEST_DATABASE_URL is required" >&2; exit 1)

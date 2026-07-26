@@ -1882,10 +1882,20 @@ impl PreparedPostgres {
             // rather than restart, because a restart loses the writable
             // generation the agent fences against. The value comes from the
             // agent-owned file included last by PGDATA/postgresql.conf instead.
-            // `allow_alter_system=off` is what keeps that file authoritative:
-            // postgresql.auto.conf is also `PGC_S_FILE` and is applied after
-            // postgresql.conf, so without this pin a superuser could outrank the
-            // agent's value at the next reload.
+            // Only one thing can still follow that include: `guc.c` parses
+            // postgresql.auto.conf after the whole main file and appends it to
+            // the same list, so its entries are the last equal-ranked
+            // assignment. Two things close that, and it takes both.
+            // `allow_alter_system=off` closes the `ALTER SYSTEM` statement —
+            // `AlterSystemSetConfigFile` raises `ERROR` on `!AllowAlterSystem` —
+            // and pinning it here is what makes it stick, since `PGC_S_ARGV`
+            // outranks the `PGC_S_FILE` an auto.conf line would carry.
+            // `validate_inactive_auto_conf` closes the file that arrives with
+            // the data directory. What neither closes is a superuser writing
+            // postgresql.auto.conf through the filesystem, which the parameter's
+            // own documentation calls out; today no role's HBA admits a
+            // superuser over a `host` line, so that actor is already uid 999 and
+            // can rewrite the agent's file directly.
             .arg("-c")
             .arg("allow_alter_system=off")
             .arg("-c")
@@ -5136,6 +5146,37 @@ fn postgresql_conf_include(synchronous_conf_file: &Path) -> Vec<u8> {
     directive
 }
 
+/// Length of the leading content an append should keep, discarding whatever an
+/// interrupted earlier append left behind.
+///
+/// A short write can only stop partway through the directive, so what it leaves
+/// behind is a proper prefix of it. No prefix is inert to `PostgreSQL`: the
+/// scanner in `guc-file.l` reads `include_if_exi` as an option name with no
+/// value and an unterminated `'` as `GUC_ERROR`, and either one reaches the
+/// `parse_error` label in `ParseConfigFp`. `ProcessConfigFileInternal` then
+/// bails out of the whole file, which `ereport`s `ERROR` under `PGC_POSTMASTER`
+/// — the postmaster refuses to start — and under `PGC_SIGHUP` applies nothing at
+/// all, silently discarding the reload the serving transition depends on. So the
+/// fragment is discarded rather than appended after.
+///
+/// Discarding repeats until nothing matches, which also takes the trailing
+/// newlines, because the one-byte prefix of the directive is a bare newline and
+/// nothing can tell that fragment from the terminator of the line above it.
+/// Taking both is what makes the result a function of the settled content alone:
+/// an interrupted attempt leaves no trace, and repeated ones cannot accumulate
+/// blank lines. `PostgreSQL` reads a blank line as `GUC_EOL` and nothing else,
+/// so no deployment intent goes with them.
+fn settled_conf_len(contents: &[u8], directive: &[u8]) -> usize {
+    let mut settled = contents.len();
+    while let Some(interrupted) = (1..directive.len())
+        .rev()
+        .find(|length| contents[..settled].ends_with(&directive[..*length]))
+    {
+        settled -= interrupted;
+    }
+    settled
+}
+
 /// Appends the agent's include to PGDATA/postgresql.conf so the reloadable
 /// setting reaches the postmaster that reads no other configuration file.
 ///
@@ -5146,6 +5187,13 @@ fn postgresql_conf_include(synchronous_conf_file: &Path) -> Vec<u8> {
 /// must not be fatal. The append is in place rather than a replacement: renaming
 /// into PGDATA would change the directory the supervisor lock snapshotted and be
 /// indistinguishable from tampering.
+///
+/// In-place appending is not atomic, so an interrupted write can leave a
+/// fragment of the directive at the end of the file. Truncating back to settled
+/// content first is what makes the append recoverable: every attempt starts from
+/// a tail no retry can stack a complete directive on top of. Truncation is also
+/// the only repair that keeps the supervisor lock's constraint, because it
+/// changes the file rather than the directory entry.
 fn ensure_postgresql_conf_include(
     data_dir: &Path,
     synchronous_conf_file: &Path,
@@ -5198,7 +5246,8 @@ fn ensure_postgresql_conf_include(
             source: source.into(),
         })?;
         let mut file = File::from(fd);
-        file.write_all(&directive)
+        file.set_len(settled_conf_len(&contents, &directive) as u64)
+            .and_then(|()| file.write_all(&directive))
             .and_then(|()| file.sync_all())
             .map_err(|source| PostgresError::Materialize {
                 name: POSTGRESQL_CONF_NAME,
@@ -5218,7 +5267,11 @@ fn ensure_postgresql_conf_include(
 /// `PostgreSQL` reads it from PGDATA unconditionally and applies it after every
 /// other file, so any active setting there outranks the file the agent
 /// materializes. The postmaster is started with `allow_alter_system=off`, which
-/// stops new entries; this refuses ones that arrived with the data directory.
+/// stops the `ALTER SYSTEM` statement from adding entries; this refuses the ones
+/// that arrived with the data directory. Every line that is not blank or a
+/// comment is refused, not only assignments, because `ParseConfigFp` acts on
+/// `include` and `include_if_exists` here exactly as it does in the main file
+/// and would pull the settings in from somewhere else.
 fn validate_inactive_auto_conf(
     data_dir: &Path,
     expected_uid: u32,
@@ -7204,6 +7257,27 @@ mod tests {
             Err(PostgresError::InvalidSynchronousConf { .. })
         ));
 
+        // A topology is a list of fixed-width member names, so the cheapest
+        // useful tampering keeps the length and swaps the members. Only reading
+        // the bytes catches it.
+        let quorum = synchronous_conf_contents("ANY 1 (pgshard_member_0001, pgshard_member_0002)")
+            .expect("render a remote topology");
+        let reordered =
+            synchronous_conf_contents("ANY 1 (pgshard_member_0002, pgshard_member_0001)")
+                .expect("render the same members in another order");
+        assert_eq!(
+            quorum.len(),
+            reordered.len(),
+            "the substitution must not be detectable by length alone"
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("open configuration");
+        fs::write(&path, reordered.as_bytes()).expect("write the substituted topology");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).expect("seal configuration");
+        assert!(matches!(
+            validate_synchronous_conf_file(&path, uid, quorum.as_bytes()),
+            Err(PostgresError::InvalidSynchronousConf { .. })
+        ));
+
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("open configuration");
         fs::write(&path, expected.as_bytes()).expect("write the exact bytes");
         assert!(matches!(
@@ -7270,6 +7344,43 @@ mod tests {
         );
     }
 
+    /// An in-place append is not atomic, so a short write can stop anywhere
+    /// inside the directive. No prefix of it is inert to `PostgreSQL` — an
+    /// option name with no value and an unterminated quoted string both reach
+    /// `parse_error` in `ParseConfigFp`, and `ProcessConfigFileInternal` then
+    /// abandons the whole file, which is fatal at postmaster start. Appending a
+    /// second directive after the fragment would leave that wreckage in place
+    /// forever, so the retry has to reach the same file a clean run does.
+    #[test]
+    fn an_interrupted_agent_include_is_repaired_by_the_next_attempt() {
+        let fixture = pgdata_fixture();
+        let conf = PathBuf::from("/run/pgshard/conf/synchronous.conf");
+        let uid = geteuid().as_raw();
+        let path = fixture.path().join(POSTGRESQL_CONF_FILE);
+        let directive = postgresql_conf_include(&conf);
+        let deployed = fs::read(&path).expect("read the untouched configuration");
+
+        ensure_postgresql_conf_include(fixture.path(), &conf, uid)
+            .expect("append the agent include");
+        let settled = fs::read(&path).expect("read a settled configuration");
+
+        for interrupted_at in 1..directive.len() {
+            let mut torn = deployed.clone();
+            torn.extend_from_slice(&directive[..interrupted_at]);
+            fs::write(&path, &torn).expect("leave an interrupted append behind");
+
+            ensure_postgresql_conf_include(fixture.path(), &conf, uid)
+                .expect("repair the interrupted append");
+
+            assert_eq!(
+                fs::read(&path).expect("read the repaired configuration"),
+                settled,
+                "an append interrupted after {interrupted_at} bytes must leave the same \
+                 configuration a clean run does"
+            );
+        }
+    }
+
     /// `postgresql.auto.conf` is read from PGDATA unconditionally and applied
     /// after every other file, so an active setting there wins over the file the
     /// agent materializes.
@@ -7301,6 +7412,25 @@ mod tests {
             validate_inactive_auto_conf(fixture.path(), uid),
             Err(PostgresError::ActiveAutomaticSettings { .. })
         ));
+
+        // `ParseConfigFp` acts on an inclusion here exactly as it does in the
+        // main file, so a directive carries settings in without naming one.
+        for indirect in [
+            b"include '/tmp/topology.conf'\n".as_slice(),
+            b"include_if_exists '/tmp/topology.conf'\n".as_slice(),
+            b"include_dir '/tmp/topology.d'\n".as_slice(),
+        ] {
+            let mut contents = Vec::from(b"# Do not edit this file manually!\n".as_slice());
+            contents.extend_from_slice(indirect);
+            fs::write(&path, &contents).expect("write an inclusion");
+            assert!(
+                matches!(
+                    validate_inactive_auto_conf(fixture.path(), uid),
+                    Err(PostgresError::ActiveAutomaticSettings { .. })
+                ),
+                "{indirect:?} reaches the same settings without naming one"
+            );
+        }
     }
 
     #[test]
@@ -7310,6 +7440,11 @@ mod tests {
             "ANY 1 (a\\b)",
             "ANY 1 (a)\"",
             "ANY 1 (a)\n",
+            // The value is written between single quotes, so the quote alone is
+            // the whole escape. Every other case here also carries a newline or
+            // a backslash and would be refused without deciding anything about
+            // this one.
+            "ANY 1 (a)'",
         ] {
             assert!(
                 matches!(
@@ -7437,6 +7572,101 @@ mod tests {
         assert_eq!(
             respawn, prepared.validated,
             "materializing again must leave spawn the exact state preparation validated"
+        );
+    }
+
+    /// Preparation and spawn read the topology file twice and compare the two
+    /// snapshots, so a file swapped in between those reads has to be refused
+    /// even when it carries the bytes the agent itself wrote. Nothing else
+    /// moves, which is what makes the topology's own snapshot the thing that
+    /// noticed.
+    #[test]
+    fn spawn_refuses_a_topology_file_replaced_after_preparation() {
+        let fixture = pgdata_fixture();
+        let executable = fixture.path().join("postgres");
+        write_executable(&executable, "#!/bin/sh\nexit 0\n");
+        let runtime = TempDir::new().expect("create runtime fixture");
+        let config = test_config(
+            fixture.path().to_owned(),
+            executable,
+            runtime.path().join("socket"),
+        );
+        let topology = config.synchronous_conf_file.clone();
+
+        let prepared = prepare_fixture(config.clone()).expect("prepare quarantine");
+
+        let restaged = topology.with_extension("restaged");
+        fs::write(
+            &restaged,
+            fs::read(&topology).expect("read the materialized topology"),
+        )
+        .expect("stage an identical topology");
+        fs::set_permissions(&restaged, fs::Permissions::from_mode(0o400))
+            .expect("seal the staged topology");
+        fs::rename(&restaged, &topology).expect("replace the materialized topology");
+
+        let respawn = validate_prepared_state(&config, false).expect("revalidate before spawn");
+        assert_ne!(
+            respawn.synchronous_conf_file, prepared.validated.synchronous_conf_file,
+            "a replaced topology file must not carry the snapshot preparation took"
+        );
+        assert_eq!(
+            respawn.hba_file, prepared.validated.hba_file,
+            "no other materialized file moved"
+        );
+        assert_eq!(
+            respawn.data, prepared.validated.data,
+            "nothing inside PGDATA moved"
+        );
+        assert_ne!(
+            respawn, prepared.validated,
+            "spawn compares the whole prepared state, so the replacement must reach it"
+        );
+    }
+
+    /// The include lives in durable PGDATA state that the postmaster reads at
+    /// every start and reload, so spawn has to notice it changing after
+    /// preparation validated it. Rewriting it in place leaves the directory
+    /// entry alone, which is what makes the configuration file's own snapshot
+    /// the only thing that could have noticed.
+    #[test]
+    fn spawn_refuses_a_configuration_file_rewritten_after_preparation() {
+        let fixture = pgdata_fixture();
+        let executable = fixture.path().join("postgres");
+        write_executable(&executable, "#!/bin/sh\nexit 0\n");
+        let runtime = TempDir::new().expect("create runtime fixture");
+        let config = test_config(
+            fixture.path().to_owned(),
+            executable,
+            runtime.path().join("socket"),
+        );
+        let path = fixture.path().join(POSTGRESQL_CONF_FILE);
+
+        let prepared = prepare_fixture(config.clone()).expect("prepare quarantine");
+
+        let directive = postgresql_conf_include(&config.synchronous_conf_file);
+        let settled = fs::read(&path).expect("read the settled configuration");
+        let mut rewritten = Vec::from(&settled[..settled.len() - directive.len()]);
+        rewritten.extend_from_slice(b"log_min_messages = 'debug5'");
+        rewritten.extend_from_slice(&directive);
+        fs::write(&path, &rewritten).expect("rewrite the configuration in place");
+
+        let respawn = validate_prepared_state(&config, false).expect("revalidate before spawn");
+        assert_ne!(
+            respawn.postgresql_conf, prepared.validated.postgresql_conf,
+            "a rewritten configuration file must not carry the snapshot preparation took"
+        );
+        assert_eq!(
+            respawn.hba_file, prepared.validated.hba_file,
+            "no other materialized file moved"
+        );
+        assert_eq!(
+            respawn.data, prepared.validated.data,
+            "the rewrite left the directory entry alone"
+        );
+        assert_ne!(
+            respawn, prepared.validated,
+            "spawn compares the whole prepared state, so the rewrite must reach it"
         );
     }
 
@@ -8511,8 +8741,10 @@ mod tests {
     /// on the command line claims it for `PGC_S_ARGV` and no reload can move it
     /// again. The serving transition changes the synchronous topology by reload,
     /// because a restart loses the writable generation the agent fences against,
-    /// so no role may pin it. `allow_alter_system=off` is the other half: without
-    /// it a superuser could outrank the agent's file from postgresql.auto.conf.
+    /// so no role may pin it. `allow_alter_system=off` is the other half, and it
+    /// has to be pinned here rather than written into a file: `PGC_S_ARGV`
+    /// outranks the `PGC_S_FILE` a postgresql.auto.conf line would carry, so
+    /// nothing can turn the statement back on.
     #[test]
     fn no_role_pins_the_synchronous_topology_on_the_postmaster_command_line() {
         let quarantine_root = TempDir::new().expect("create quarantine fixture");
