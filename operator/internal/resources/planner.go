@@ -2443,9 +2443,7 @@ func IsPostgreSQLReplicationStandbyPod(pod *corev1.Pod) bool {
 		source, sourceOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_PRIMARY_HOST")
 		slot, slotOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME")
 		passfile, passfileOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_PRIMARY_PASSFILE")
-		synchronousConf, synchronousConfOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_SYNCHRONOUS_CONF_FILE")
 		return modeOK && hbaFileOK && sourceOK && slotOK && passfileOK &&
-			synchronousConfOK && synchronousConf == postgreSQLSynchronousConfPath &&
 			mode == "replication-standby" && hbaFile == "/run/pgshard/hba/pg_hba.conf" &&
 			source == expectedSource && slot == expectedSlot &&
 			passfile == "/run/pgshard/standby-auth/passfile" &&
