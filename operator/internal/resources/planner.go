@@ -113,6 +113,7 @@ const (
 	postgresqlBootstrapMarker                 = ".pgshard-bootstrap-complete"
 	shardschemaMigrationPath                  = "/usr/share/pgshard/migrations/0001_shardschema.sql"
 	databaseGenesisKey                        = "database-genesis.sql"
+	postgreSQLSynchronousConfPath             = "/run/pgshard/conf/synchronous.conf"
 	databaseGenesisPath                       = "/etc/pgshard/postgresql/database-genesis.sql"
 	databaseTopologyPreflightKey              = "database-topology-preflight.sql"
 	databaseTopologyPreflightPath             = "/etc/pgshard/postgresql/database-topology-preflight.sql"
@@ -2442,7 +2443,9 @@ func IsPostgreSQLReplicationStandbyPod(pod *corev1.Pod) bool {
 		source, sourceOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_PRIMARY_HOST")
 		slot, slotOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME")
 		passfile, passfileOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_PRIMARY_PASSFILE")
+		synchronousConf, synchronousConfOK := containerUniqueLiteralEnvironment(container, "PGSHARD_POSTGRES_SYNCHRONOUS_CONF_FILE")
 		return modeOK && hbaFileOK && sourceOK && slotOK && passfileOK &&
+			synchronousConfOK && synchronousConf == postgreSQLSynchronousConfPath &&
 			mode == "replication-standby" && hbaFile == "/run/pgshard/hba/pg_hba.conf" &&
 			source == expectedSource && slot == expectedSlot &&
 			passfile == "/run/pgshard/standby-auth/passfile" &&
@@ -2458,9 +2461,14 @@ func postgresqlAgentShape(annotations map[string]string, spec corev1.PodSpec, po
 	}
 	mode, modeOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_MODE")
 	hbaFile, hbaFileOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_HBA_FILE")
-	quarantine := modeOK && hbaFileOK && mode == "quarantine" && hbaFile == "/run/pgshard/hba/pg_hba.conf"
-	bootstrapSource := modeOK && hbaFileOK && mode == "replication-bootstrap-primary" && hbaFile == "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf"
-	standby := modeOK && hbaFileOK && mode == "replication-standby" && hbaFile == "/run/pgshard/hba/pg_hba.conf"
+	// The agent appends an include of this path to the durable PGDATA
+	// configuration, so a Pod that redirects it leaves a directive behind that
+	// outlives the Pod. Only the exact runtime path is an agent composition.
+	synchronousConf, synchronousConfOK := containerUniqueLiteralEnvironment(postgres, "PGSHARD_POSTGRES_SYNCHRONOUS_CONF_FILE")
+	agentFiles := modeOK && hbaFileOK && synchronousConfOK && synchronousConf == postgreSQLSynchronousConfPath
+	quarantine := agentFiles && mode == "quarantine" && hbaFile == "/run/pgshard/hba/pg_hba.conf"
+	bootstrapSource := agentFiles && mode == "replication-bootstrap-primary" && hbaFile == "/etc/pgshard/replication-bootstrap-primary.pg_hba.conf"
+	standby := agentFiles && mode == "replication-standby" && hbaFile == "/run/pgshard/hba/pg_hba.conf"
 	if bootstrapSource {
 		bootstrapSource = postgresqlBootstrapGenerationShape(annotations, postgres)
 	} else if annotations[PostgreSQLGenerationDurabilityAnnotation] != "" ||
@@ -5107,6 +5115,7 @@ func postgresqlReplicationStandbyContainer(cluster *pgshardv1alpha1.PgShardClust
 		{Name: "PGSHARD_POSTGRES_BIN", Value: "/usr/lib/postgresql/18/bin/postgres"},
 		{Name: "PGSHARD_POSTGRES_SOCKET_DIR", Value: "/run/pgshard/postgres"},
 		{Name: "PGSHARD_POSTGRES_HBA_FILE", Value: "/run/pgshard/hba/pg_hba.conf"},
+		{Name: "PGSHARD_POSTGRES_SYNCHRONOUS_CONF_FILE", Value: postgreSQLSynchronousConfPath},
 		{Name: "PGSHARD_POSTGRES_PRIMARY_HOST", Value: sourceHost},
 		{Name: "PGSHARD_POSTGRES_PRIMARY_PORT", Value: "5432"},
 		{Name: "PGSHARD_POSTGRES_PRIMARY_SLOT_NAME", Value: slotName},
@@ -5177,6 +5186,7 @@ func postgresqlAgentWritableContainer(cluster *pgshardv1alpha1.PgShardCluster, s
 		{Name: "PGSHARD_POSTGRES_BIN", Value: "/usr/lib/postgresql/18/bin/postgres"},
 		{Name: "PGSHARD_POSTGRES_SOCKET_DIR", Value: "/run/pgshard/postgres"},
 		{Name: "PGSHARD_POSTGRES_HBA_FILE", Value: hbaFile},
+		{Name: "PGSHARD_POSTGRES_SYNCHRONOUS_CONF_FILE", Value: postgreSQLSynchronousConfPath},
 		{Name: "PGSHARD_POSTGRES_SMART_SHUTDOWN_MS", Value: "5000"},
 		{Name: "PGSHARD_POSTGRES_FAST_SHUTDOWN_MS", Value: "44000"},
 		{Name: "PGSHARD_POSTGRES_IMMEDIATE_SHUTDOWN_MS", Value: "500"},
