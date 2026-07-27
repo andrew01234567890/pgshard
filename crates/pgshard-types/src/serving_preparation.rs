@@ -15,6 +15,12 @@
 //! together means a replacement cannot be judged against a preparation made for
 //! a different catalog, a different Pod, a different policy, or a different
 //! timeline.
+//!
+//! `systemIdentifier` is deliberately decimal text and not a JSON number,
+//! because JSON numbers are IEEE 754 doubles to JavaScript and to `jq`'s
+//! default parser while a `pg_control` system identifier routinely exceeds
+//! 2^53, so a number would let the one field that names an incarnation be
+//! silently rounded into naming a different one. Do not tidy it back.
 
 use crate::writable_generation::DurableWritableGeneration;
 use serde::{Deserialize, Serialize};
@@ -89,7 +95,10 @@ pub struct ServingPreparationPolicy {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ServingPreparationIdentity {
-    /// `pg_control` system identifier, which must be unchanged.
+    /// `pg_control` system identifier, which must be unchanged. Crosses the
+    /// wire as decimal text rather than as a JSON number; see the wire form in
+    /// this module's documentation before changing that.
+    #[serde(with = "canonical_decimal_u64")]
     pub system_identifier: u64,
     /// Timeline the preparation was made on, which must be unchanged.
     pub timeline: u32,
@@ -342,9 +351,68 @@ fn lower_hex(bytes: &[u8]) -> String {
     })
 }
 
+/// Carries a `u64` as decimal text rather than as a JSON number.
+///
+/// JSON numbers are IEEE 754 doubles to JavaScript and to `jq`'s default
+/// parser, and a `pg_control` system identifier is a `uint64` built from a
+/// timestamp and a process ID, so it sits above 2^53 as a matter of course.
+/// Round-tripping such a document through either silently rewrites the one
+/// field whose whole purpose is to name a specific incarnation, and a fence
+/// that changes value in transit is worse than no fence. Text has no such
+/// range. The catalog activation CRD already spells `systemIdentifier` this
+/// way, so this is the repository's existing convention rather than a new one.
+///
+/// Deliberately duplicated from the sibling contract in
+/// [`crate::genesis_intent`] rather than shared with it. Each contract pins its
+/// own wire form byte for byte and is versioned on its own, so sharing one
+/// definition would let a change made for one encoding silently retune the
+/// other.
+mod canonical_decimal_u64 {
+    use serde::{Deserialize as _, Deserializer, Serializer, de::Error as _};
+
+    #[allow(clippy::trivially_copy_pass_by_ref)] // serde fixes this signature.
+    pub fn serialize<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    /// Accepts only the text `u64::to_string` would have produced.
+    ///
+    /// Round-tripping the parse is the whole rule: it admits exactly one
+    /// spelling per value, so a bare JSON number, a sign, padding, whitespace,
+    /// a digit separator, an overflowing value and an empty string are all
+    /// refused without being enumerated. Enumerating them would suggest the
+    /// rule has gaps.
+    ///
+    /// # Errors
+    ///
+    /// Returns a deserialization error for any other text, and for any JSON
+    /// value that is not a string. That is deliberately a different failure
+    /// from the zero-identifier rule in [`super::ServingPreparation::validate`],
+    /// which runs afterwards and still owns it: `"0"` parses here and is
+    /// refused there.
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<u64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let text = String::deserialize(deserializer)?;
+        let value = text
+            .parse::<u64>()
+            .map_err(|_| D::Error::custom("expected a canonical decimal u64 string"))?;
+        if value.to_string() != text {
+            return Err(D::Error::custom("expected a canonical decimal u64 string"));
+        }
+        Ok(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SYSTEM_IDENTIFIER: u64 = 7_248_119_402_113_558_016;
 
     fn digest(seed: u8) -> String {
         (0..32).fold(String::new(), |mut text, index| {
@@ -393,7 +461,7 @@ mod tests {
                 template_sha256: digest(5),
             },
             identity: ServingPreparationIdentity {
-                system_identifier: 7_248_119_402_113_558_016,
+                system_identifier: SYSTEM_IDENTIFIER,
                 timeline: 1,
             },
         }
@@ -590,6 +658,131 @@ mod tests {
             preparation().sha256().expect("the fixture is canonical"),
             "4d2d7bb1b9c2c0405426a1c831c63f7705791c0b77514ea2b481a27cb04f590f",
             "the canonical digest changed; regenerate the operator vector too"
+        );
+    }
+
+    /// The digest is taken over the fields, so renaming one moves the wire form
+    /// while `the_canonical_vector_is_pinned` keeps passing and every recorded
+    /// preparation stops deserializing. Pinning the JSON byte for byte is what
+    /// makes a rename announce itself as the breaking encoding change it is.
+    /// `deny_unknown_fields` is pinned beside it, so a field this version
+    /// cannot see is refused rather than dropped.
+    #[test]
+    fn the_wire_form_is_pinned_and_refuses_unknown_fields() {
+        let expected = concat!(
+            "{\"schemaVersion\":\"pgshard.serving-preparation.v1\",",
+            "\"requestSHA256\":\"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20\",",
+            "\"generation\":\"format=1\\ncluster_name=demo\\n",
+            "cluster_uid=cccccccc-1111-2222-3333-444444444444\\nshard=0\\n",
+            "lease_namespace=database\\nlease_name=demo-shard-0000-term\\n",
+            "lease_uid=dddddddd-1111-2222-3333-444444444444\\n",
+            "holder=demo-shard-0000-0\\nterm=7\\n\",",
+            "\"source\":{\"shard\":0,\"member\":0,",
+            "\"instanceId\":\"demo-shard-0000-0\",\"podName\":\"demo-shard-0000-0\",",
+            "\"podUID\":\"11111111-2222-3333-4444-555555555555\",",
+            "\"statefulSetUID\":\"66666666-7777-8888-9999-aaaaaaaaaaaa\",",
+            "\"updateRevision\":\"demo-shard-0000-7c9f4b8d5\"},",
+            "\"policy\":{",
+            "\"configurationSHA256\":\"02030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021\",",
+            "\"nonServingHBASHA256\":\"030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122\",",
+            "\"servingHBASHA256\":\"0405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223\",",
+            "\"templateSHA256\":\"05060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021222324\"},",
+            "\"identity\":{\"systemIdentifier\":\"7248119402113558016\",\"timeline\":1}}"
+        );
+        let encoded = serde_json::to_string(&preparation()).expect("serialize preparation");
+        assert_eq!(
+            encoded, expected,
+            "the wire form changed; every recorded preparation stopped deserializing"
+        );
+        assert_eq!(
+            serde_json::from_str::<ServingPreparation>(&encoded).expect("deserialize preparation"),
+            preparation()
+        );
+
+        for with_unknown in [
+            format!(
+                "{},\"unexpected\":true}}",
+                encoded.strip_suffix('}').expect("object JSON")
+            ),
+            encoded.replace("\"source\":{", "\"source\":{\"unexpected\":true,"),
+            encoded.replace("\"policy\":{", "\"policy\":{\"unexpected\":true,"),
+            encoded.replace("\"identity\":{", "\"identity\":{\"unexpected\":true,"),
+        ] {
+            let error = serde_json::from_str::<ServingPreparation>(&with_unknown)
+                .expect_err("an unknown field must be refused, not dropped");
+            assert!(
+                error.to_string().contains("unknown field"),
+                "unexpected rejection reason: {error}"
+            );
+        }
+    }
+
+    /// A `pg_control` system identifier is a `uint64` built from a timestamp
+    /// and a process ID, so it lives above 2^53 where a JSON number stops being
+    /// exact: JavaScript and `jq`'s default parser both round it, and the field
+    /// whose whole job is to name one incarnation would come out naming a
+    /// different one. It crosses the wire as text, and only the text
+    /// `u64::to_string` would have produced is accepted back — a bare number is
+    /// refused rather than coerced, so the hazard cannot return through
+    /// deserialization either.
+    #[test]
+    fn the_system_identifier_crosses_the_wire_as_canonical_decimal_text() {
+        const {
+            assert!(
+                SYSTEM_IDENTIFIER > (1 << 53),
+                "the fixture has to exceed exact JSON number range, or this proves nothing"
+            );
+        }
+
+        let encoded = serde_json::to_string(&preparation()).expect("serialize preparation");
+        let quoted = "\"7248119402113558016\"";
+        assert!(
+            encoded.contains(&format!("\"systemIdentifier\":{quoted}")),
+            "the identifier is not decimal text: {encoded}"
+        );
+        assert_eq!(
+            serde_json::from_str::<ServingPreparation>(&encoded)
+                .expect("deserialize preparation")
+                .identity
+                .system_identifier,
+            SYSTEM_IDENTIFIER,
+            "the identifier did not survive the round trip exactly"
+        );
+
+        for rejected in [
+            "7248119402113558016",
+            "7.248119402113558e18",
+            "\"007248119402113558016\"",
+            "\"+7248119402113558016\"",
+            "\"-1\"",
+            "\" 7248119402113558016\"",
+            "\"7248119402113558016 \"",
+            "\"7_248_119_402_113_558_016\"",
+            "\"7248119402113558016.0\"",
+            "\"18446744073709551616\"",
+            "\"0x64\"",
+            "\"\"",
+            "null",
+        ] {
+            let document = encoded.replace(quoted, rejected);
+            assert_ne!(
+                document, encoded,
+                "the {rejected} case never reached the parser"
+            );
+            assert!(
+                serde_json::from_str::<ServingPreparation>(&document).is_err(),
+                "a noncanonical system identifier was accepted: {rejected}"
+            );
+        }
+
+        // Zero is canonical decimal text, so it parses and is then refused by
+        // the rule that owns it. Neither failure hides behind the other.
+        assert_eq!(
+            serde_json::from_str::<ServingPreparation>(&encoded.replace(quoted, "\"0\""))
+                .expect("zero is canonical decimal text")
+                .validate(),
+            Err(ServingPreparationError::InvalidIdentity),
+            "a zero identifier has to be refused by validation, not by the parser"
         );
     }
 }
