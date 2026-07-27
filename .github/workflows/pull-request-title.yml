@@ -1,0 +1,64 @@
+name: Pull request title
+
+# Squash merge makes the pull request title the `main` commit subject, and
+# `publish` refuses a subject it cannot parse — `main` cannot be rewritten, so
+# the refusal stops the release of every commit behind it. CI validates the
+# title, but under a bare `pull_request:` trigger, whose activity types default
+# to `opened`, `synchronize` and `reopened`. A title edited after CI went green
+# is therefore merged never having been validated.
+#
+# The types belong here rather than on CI's trigger because that trigger is not
+# only a trigger: `types: [edited]` there re-runs the entire matrix on every
+# title and description edit, and the same trigger is where the documentation
+# advisory gate, `buf breaking --against` and `pgshard-release audit --base` all
+# inherit their base from. Validating the title on its own runner costs one
+# small job and changes nothing else.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+# The title arrives in the event payload, so nothing here reads repository state
+# except the source the validator is built from. `contents: read` is what
+# `actions/checkout` documents as its requirement; every other scope is `none`
+# by omission. This job is meant to become a required check, and a check that
+# cannot run is the same outage this workflow exists to prevent, so the
+# permission is the documented one rather than an empty set that happens to work
+# on public repositories.
+permissions:
+  contents: read
+
+# An `edited` event moves no SHA, so a burst of title edits would otherwise
+# queue a run each. The pull request number is empty on every event that is not
+# a pull request and falls back to the run identifier, so this group can only
+# ever collapse one pull request onto its own newest run — never hold one
+# commit's run behind another's.
+concurrency:
+  group: pgshard-pull-request-title-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  title:
+    name: Conventional Commit title
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # The default branch, not the pull request's own head. The title is read
+      # from the event payload either way, so the checkout supplies only the
+      # validator, and building that from the branch under test would let a
+      # pull request rewrite the rule about to be applied to it and would fail
+      # every title on a branch that merely does not compile. The default branch
+      # is also the one reference that cannot become unreachable, which a base
+      # SHA can once a stacked pull request's base branch is squash-merged and
+      # deleted.
+      - name: Check out the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      # The title is untrusted text, so it reaches the validator through the
+      # environment. Interpolated into the script it would be shell.
+      - name: Validate the pull request title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        shell: bash
+        run: cargo run --locked -p pgshard-release -- validate --subject "$PR_TITLE"

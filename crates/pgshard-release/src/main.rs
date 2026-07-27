@@ -294,11 +294,7 @@ fn main() -> Result<()> {
         }
         ReleaseCommand::Validate { subject } => {
             let message = subject.map_or_else(|| commit_message("HEAD"), Ok)?;
-            parse_bump(&message)?;
-            println!(
-                "valid Conventional Commit subject: {}",
-                message.lines().next().unwrap_or_default()
-            );
+            validate_subject(&message)?;
         }
         ReleaseCommand::Publish { sha, ready_only } => publish(&sha, ready_only)?,
         ReleaseCommand::DependabotAutomerge { repository, sha } => {
@@ -2024,6 +2020,24 @@ fn bump_precedence(bump: Bump) -> u8 {
         Bump::Minor => 1,
         Bump::Major => 2,
     }
+}
+
+/// The author of a rejected title has the title and this report, and reads the
+/// report in a workflow log rather than beside this source. So it carries what
+/// fixing the title needs: the subject that was refused, and the types that
+/// would have been accepted, listed from the one list a release is judged
+/// against.
+fn validate_subject(message: &str) -> Result<()> {
+    let subject = message.lines().next().unwrap_or_default();
+    parse_bump(message).with_context(|| {
+        format!(
+            "subject `{subject}` is not a releasable Conventional Commit; write \
+             `type(scope): description` with one of these types: {}",
+            CONVENTIONAL_COMMIT_TYPES.join(", ")
+        )
+    })?;
+    println!("valid Conventional Commit subject: {subject}");
+    Ok(())
 }
 
 fn parse_bump(message: &str) -> Result<Bump> {
@@ -5915,6 +5929,146 @@ esac
         }
     }
 
+    /// Squash merge makes the pull request title the `main` commit subject, and
+    /// `main` cannot be rewritten, so a subject `publish` refuses stops the
+    /// release of every commit behind it. CI validates the title under a bare
+    /// `pull_request:` trigger, whose activity types are `opened`,
+    /// `synchronize` and `reopened` — a title edited after CI went green is
+    /// merged never having been validated. This workflow is the only thing that
+    /// answers `edited`, so its trigger is asserted rather than read.
+    #[test]
+    fn an_edited_pull_request_title_is_validated_before_it_can_merge() {
+        let workflow: serde_norway::Value = serde_norway::from_str(include_str!(
+            "../../../.github/workflows/pull-request-title.yml"
+        ))
+        .expect("the workflow is valid YAML");
+        // An unquoted `on` key is a YAML 1.1 boolean.
+        let triggers = workflow
+            .get(serde_norway::Value::Bool(true))
+            .or_else(|| workflow.get("on"))
+            .expect("the workflow declares triggers");
+        assert!(
+            triggers
+                .as_mapping()
+                .is_some_and(|declared| declared.len() == 1),
+            "the title gate answers an event that carries no title"
+        );
+        let types: std::collections::BTreeSet<&str> = triggers["pull_request"]["types"]
+            .as_sequence()
+            .expect("the pull request trigger names its activity types")
+            .iter()
+            .filter_map(serde_norway::Value::as_str)
+            .collect();
+        assert!(
+            types.contains("edited"),
+            "a title edited after the last validation merges unvalidated"
+        );
+        // `opened` and `reopened` are what put a verdict on a pull request at
+        // all, and `synchronize` is what puts one on each new head SHA, which
+        // is the commit a required check is recorded against.
+        assert_eq!(
+            types,
+            ["edited", "opened", "reopened", "synchronize"]
+                .into_iter()
+                .collect(),
+            "the title gate does not answer every pull request event that can leave a \
+             title unvalidated on the head SHA"
+        );
+
+        let permissions: std::collections::BTreeMap<&str, &str> = workflow["permissions"]
+            .as_mapping()
+            .expect("the workflow declares permissions")
+            .iter()
+            .map(|(scope, access)| {
+                (
+                    scope.as_str().expect("a permission scope is named"),
+                    access.as_str().expect("a permission access is named"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            permissions,
+            [("contents", "read")].into_iter().collect(),
+            "the title gate holds a permission beyond reading the source it builds from"
+        );
+
+        assert_concurrency_cannot_hold_one_commit_behind_another(&workflow);
+        assert!(
+            workflow["concurrency"]["cancel-in-progress"]
+                .as_bool()
+                .is_some_and(|cancel| cancel),
+            "a burst of title edits leaves a run running for each"
+        );
+
+        let job = &workflow["jobs"]["title"];
+        assert_nothing_swallows_failure(job, "the title gate");
+        let steps = job["steps"]
+            .as_sequence()
+            .expect("the title gate declares steps");
+        assert_eq!(
+            steps.len(),
+            2,
+            "the title gate does more than check out the validator and run it"
+        );
+        assert_eq!(
+            steps[0]["with"]["ref"]
+                .as_str()
+                .expect("the checkout names a reference"),
+            "${{ github.event.repository.default_branch }}",
+            "the validator is built from the branch under test, which can rewrite the rule \
+             it is about to be judged by and fails every title when it merely does not compile"
+        );
+        assert_eq!(
+            steps[0]["with"]["persist-credentials"].as_bool(),
+            Some(false),
+            "the checkout leaves its token in the checkout"
+        );
+
+        let validate = &steps[1];
+        assert_step_environment(validate, &["PR_TITLE"], "the title gate");
+        assert_eq!(
+            validate["env"]["PR_TITLE"]
+                .as_str()
+                .expect("the title is read from the event"),
+            "${{ github.event.pull_request.title }}"
+        );
+        let run = validate["run"]
+            .as_str()
+            .expect("the title gate runs a script")
+            .trim();
+        assert_eq!(
+            run, "cargo run --locked -p pgshard-release -- validate --subject \"$PR_TITLE\"",
+            "the title gate runs something other than the validator alone"
+        );
+        assert!(
+            !run.contains("${{"),
+            "the title reaches the script as shell rather than as an environment value"
+        );
+    }
+
+    /// A refused title is fixed from the report, read in a workflow log by
+    /// someone who is not reading this file. So the report has to carry the
+    /// subject that was refused and the types that would have been accepted.
+    #[test]
+    fn a_refused_title_names_itself_and_the_types_that_would_pass() {
+        let error = validate_subject("wip(pgwire): park the fence").unwrap_err();
+        let reported = format!("{error:#}");
+        assert!(
+            reported.contains("wip(pgwire): park the fence"),
+            "the report does not name the title that was refused: {reported}"
+        );
+        assert!(
+            reported.contains("unsupported Conventional Commit type `wip`"),
+            "the report does not name what is wrong with the title: {reported}"
+        );
+        for kind in CONVENTIONAL_COMMIT_TYPES {
+            assert!(
+                reported.contains(kind),
+                "the report does not name `{kind}` as a type that would pass: {reported}"
+            );
+        }
+    }
+
     /// The shapes the workflow guard has to keep apart, asserted directly so
     /// that the ones which serialize the default branch are refused whether or
     /// not anyone thinks to write them into the workflow.
@@ -8305,7 +8459,7 @@ esac
     ///
     /// The crates themselves are not here: `every_component_detects_every_file_its_job_compiles`
     /// requires every one of their files against the components built from them.
-    const OUTSIDE_THE_CRATES: [(Probe, &[&str], &[&str]); 32] = [
+    const OUTSIDE_THE_CRATES: [(Probe, &[&str], &[&str]); 33] = [
         (
             Probe::File(".dockerignore"),
             &["images", "postgres_agent"],
@@ -8355,6 +8509,14 @@ esac
             &[],
         ),
         (Probe::File(".github/workflows/release.yml"), &["rust"], &[]),
+        // Gates nothing this detector decides — it runs the release crate
+        // against the pull request title and reads no component. It is here for
+        // the crate whose tests assert its trigger.
+        (
+            Probe::File(".github/workflows/pull-request-title.yml"),
+            &["rust"],
+            &[],
+        ),
         // The Go operator reads the shared contracts at run time, so no
         // compilation records them for it. Its own tests are what fail when a
         // contract and the operator disagree.
