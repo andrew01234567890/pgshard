@@ -168,7 +168,7 @@ jobs:
           emit_component pooler_postgres "$pooler_postgres_exists" '^crates/(pgshard-pooler|pgshard-pgwire|pgshard-catalog|pgshard-types|pgshard-version)/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/(workflows|scripts)/'
           emit_component planner "$planner_exists" '^crates/(pgshard-planner|pgshard-catalog|pgshard-types)/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/(workflows|scripts)/'
           emit_component proto "$proto_exists" '^buf\.yaml$|^proto/|^Makefile$|^\.github/(workflows|scripts)/'
-          emit_component go "$go_exists" '^operator/|^proto/|^contracts/|^Makefile$|^\.github/(workflows|scripts)/'
+          emit_component go "$go_exists" '^operator/|^deploy/|^proto/|^contracts/|^Makefile$|^\.github/(workflows|scripts)/'
           emit_component website "$website_exists" '^website/|^docs/|^Makefile$|^\.github/(workflows|scripts)/'
           emit_component ui "$ui_exists" '^ui/|^proto/|^Makefile$|^\.github/(workflows|scripts)/'
           emit_component integration "$integration_exists" '^crates/|^operator/|^proto/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^\.cargo/|^Makefile$|^\.github/(workflows|scripts)/'

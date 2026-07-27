@@ -671,6 +671,7 @@ func TestPostgreSQL18PinsAgreeWithTheDeployedServerImage(t *testing.T) {
 		{"operator", "config", "manager", "deployment.yaml"},
 		{"operator", "config", "admission", "manager_patch.yaml"},
 		{"crates", "pgshard-agent", "tests", "postgres18_generation.sh"},
+		{".github", "workflows", "ci.yml"},
 	} {
 		relative := filepath.Join(site...)
 		contents, err := os.ReadFile(filepath.Join("..", "..", "..", relative))
