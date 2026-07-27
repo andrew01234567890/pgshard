@@ -88,20 +88,24 @@ type Result struct {
 	// Bytes the autovacuum fleet as a whole may occupy. Carried out of here
 	// because an override of the worker count is only safe against this, not
 	// against the worker count the budget happened to produce.
-	AutovacuumBudgetBytes   int64
-	CPUMilli                int64
-	ReservedBytes           int64
-	MaxConnections          int32
-	MaxPreparedTransactions int32
-	MaxWALSenders           int32
-	MaxReplicationSlots     int32
-	ManagedLogicalConsumers int32
-	PrimarySlotDemand       int32
-	StandbySlotDemand       int32
-	PromotionSlotDemand     int32
-	Settings                map[string]string
-	Primaries               []Primary
-	Standbys                []Standby
+	AutovacuumBudgetBytes int64
+	// Bytes every managed logical consumer's reorder buffer may occupy in
+	// total. Carried out for the same reason: the per-buffer value alone says
+	// nothing about what the fleet costs.
+	LogicalDecodingBudgetBytes int64
+	CPUMilli                   int64
+	ReservedBytes              int64
+	MaxConnections             int32
+	MaxPreparedTransactions    int32
+	MaxWALSenders              int32
+	MaxReplicationSlots        int32
+	ManagedLogicalConsumers    int32
+	PrimarySlotDemand          int32
+	StandbySlotDemand          int32
+	PromotionSlotDemand        int32
+	Settings                   map[string]string
+	Primaries                  []Primary
+	Standbys                   []Standby
 }
 
 func Calculate(in Input) (Result, error) {
@@ -176,6 +180,15 @@ func Calculate(in Input) (Result, error) {
 	}
 
 	available := memory - reserved - shared
+	// available is an expected-concurrency pot, not an additive budget, and the
+	// claims on it deliberately overlap. work_mem's own ceiling is the whole pot
+	// by construction below -- every backend running four memory-hungry nodes at
+	// once -- while the autovacuum fleet and the logical decoding fleet each
+	// reserve a quarter of the same pot. Only the continuously resident claims
+	// are required to fit the cgroup limit together: shared_buffers, the
+	// autovacuum fleet, every managed reorder buffer, and one manual maintenance
+	// operation. A per-node transient that every backend reaches simultaneously
+	// is not a shape this sizing supports; reserved is what absorbs the overlap.
 	workMem := clamp64(available/(maxConnections*4), mib, 64*mib)
 	cores := (cpu + 999) / 1000
 	workerProcesses := max64(8, cores*4+4)
@@ -225,6 +238,33 @@ func Calculate(in Input) (Result, error) {
 	maxSenders := maxSlots + 2
 	maxPrepared := max64(32, int64(in.PoolerMaxReplicas)*4) + 8
 
+	// logical_decoding_work_mem is charged per reorder buffer, and every managed
+	// consumer's walsender holds one. PostgreSQL's 64MB default is justified by
+	// installations where max_wal_senders keeps the concurrent buffer count
+	// small; this configuration provisions a sender for every consumer at once,
+	// so the default is a per-buffer figure multiplied by the whole fleet and it
+	// exceeds the entire budget at the smallest accepted shape.
+	// ReorderBufferCheckMemoryLimit streams or serializes to pg_replslot instead
+	// of raising an error, so the cost of a low value is I/O, while the cost of
+	// an unbudgeted one is the cgroup killing the postmaster.
+	//
+	// This is the one fleet on the pot charged at its full size, because unlike
+	// work_mem it is not a per-operation transient: a reorder buffer lives as
+	// long as its replication connection, its occupancy is driven by the WAL
+	// stream rather than by any client, and every managed consumer decodes the
+	// same stream, so a single large transaction pushes all of them toward the
+	// limit together. The fleet total is the expected cost, not a worst case.
+	//
+	// This bounds the buffered change payload accounted by rb->size only. Each
+	// walsender's catalog and relcache and the pgoutput send buffer are charged
+	// on top of it, which is why the reserved floor must stay unspent.
+	logicalDecodingBudget := available / 4
+	// The floor keeps a rendered value inside PostgreSQL's own lower bound:
+	// formatMiB truncates, and anything under a mebibyte reaches postgresql.conf
+	// as "0MB", which is below the parameter's 64kB minimum and is fatal at
+	// startup rather than merely small.
+	logicalDecodingWorkMem := clamp64(logicalDecodingBudget/managedLogicalConsumers, mib, 64*mib)
+
 	settings := map[string]string{
 		// Archiving stays disabled until the operator reconciles and verifies a
 		// real archive_command/archive_library pipeline. Enabling archive_mode
@@ -238,6 +278,7 @@ func Calculate(in Input) (Result, error) {
 		"hot_standby":                     "on",
 		"idle_replication_slot_timeout":   "0",
 		"listen_addresses":                "'*'",
+		"logical_decoding_work_mem":       formatMiB(logicalDecodingWorkMem),
 		"maintenance_work_mem":            formatMiB(maintenance),
 		"max_connections":                 strconv.FormatInt(maxConnections, 10),
 		"max_parallel_workers":            strconv.FormatInt(parallelWorkers, 10),
@@ -298,21 +339,22 @@ func Calculate(in Input) (Result, error) {
 	}
 
 	return Result{
-		AutovacuumBudgetBytes:   autovacuumBudget,
-		MemoryBytes:             memory,
-		CPUMilli:                cpu,
-		ReservedBytes:           reserved,
-		MaxConnections:          int32(maxConnections),
-		MaxPreparedTransactions: int32(maxPrepared),
-		MaxWALSenders:           int32(maxSenders),
-		MaxReplicationSlots:     int32(maxSlots),
-		ManagedLogicalConsumers: int32(managedLogicalConsumers),
-		PrimarySlotDemand:       int32(primarySlotDemand),
-		StandbySlotDemand:       int32(standbySlotDemand),
-		PromotionSlotDemand:     int32(promotionSlotDemand),
-		Settings:                settings,
-		Primaries:               primaries,
-		Standbys:                standbys,
+		AutovacuumBudgetBytes:      autovacuumBudget,
+		LogicalDecodingBudgetBytes: logicalDecodingBudget,
+		MemoryBytes:                memory,
+		CPUMilli:                   cpu,
+		ReservedBytes:              reserved,
+		MaxConnections:             int32(maxConnections),
+		MaxPreparedTransactions:    int32(maxPrepared),
+		MaxWALSenders:              int32(maxSenders),
+		MaxReplicationSlots:        int32(maxSlots),
+		ManagedLogicalConsumers:    int32(managedLogicalConsumers),
+		PrimarySlotDemand:          int32(primarySlotDemand),
+		StandbySlotDemand:          int32(standbySlotDemand),
+		PromotionSlotDemand:        int32(promotionSlotDemand),
+		Settings:                   settings,
+		Primaries:                  primaries,
+		Standbys:                   standbys,
 	}, nil
 }
 
