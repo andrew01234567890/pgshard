@@ -2,6 +2,7 @@ package tuning
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -380,73 +381,163 @@ func TestValidateStorageBoundsCheckpointWAL(t *testing.T) {
 // otherwise exercises only balanced core/memory ratios, which is why a fleet of
 // autovacuum workers sized from cores alone, each inheriting an uncharged
 // maintenance_work_mem, went unnoticed. A fleet of reorder buffers left at
-// PostgreSQL's per-buffer default is the same failure at a larger magnitude.
+// PostgreSQL's per-buffer default is the same failure below 4Gi. At and above
+// 4Gi that default happens to fit its share, and the derived value is itself
+// 64MB there, so what has to be caught at those shapes is the parameter going
+// unemitted rather than any bound on its value.
 func TestSkewedResourceRatiosStayInsideTheMemoryLimit(t *testing.T) {
-	for _, shape := range []struct {
-		cpu, memory string
+	// The decoding fleet is fixed by admission rather than by the CR: the webhook
+	// always passes its own maximumChangeStreams constant of 4, and Calculate adds
+	// four operation slots, so every real cluster decodes with eight managed
+	// consumers whatever its resources are. This package cannot import v1alpha1 to
+	// say so -- v1alpha1 imports this package -- so the resolved topology is
+	// restated here and exercised alongside the smallest one input validation
+	// accepts. Each shape is its own subtest so a regression is reported wherever
+	// it occurs rather than only at the first shape that trips.
+	for _, topology := range []struct {
+		name                                              string
+		poolerMaxReplicas, membersPerShard, changeStreams int32
 	}{
-		{"12", "1Gi"}, {"16", "1Gi"}, {"8", "2Gi"}, {"16", "2Gi"},
-		{"4", "4Gi"}, {"16", "8Gi"}, {"1", "2Gi"}, {"2", "1Gi"},
+		{"minimum", 1, 1, 1},
+		{"admission-resolved", 10, 3, 4},
 	} {
-		result, err := Calculate(Input{
-			Resources: corev1.ResourceRequirements{
-				Requests: corev1.ResourceList{
-					corev1.ResourceCPU:    resource.MustParse(shape.cpu),
-					corev1.ResourceMemory: resource.MustParse(shape.memory),
-				},
-				Limits: corev1.ResourceList{
-					corev1.ResourceCPU:    resource.MustParse(shape.cpu),
-					corev1.ResourceMemory: resource.MustParse(shape.memory),
-				},
-			},
-			PoolerMaxReplicas: 1, MembersPerShard: 1, MaximumChangeStreams: 1,
-		})
-		if err != nil {
-			continue // a shape this small is rejected outright, which is also safe
+		for _, shape := range []struct {
+			cpu, memory string
+		}{
+			{"12", "1Gi"}, {"16", "1Gi"}, {"8", "2Gi"}, {"16", "2Gi"},
+			{"4", "4Gi"}, {"16", "8Gi"}, {"1", "2Gi"}, {"2", "1Gi"},
+		} {
+			t.Run(fmt.Sprintf("%s/%score/%s", topology.name, shape.cpu, shape.memory), func(t *testing.T) {
+				result, err := Calculate(Input{
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse(shape.cpu),
+							corev1.ResourceMemory: resource.MustParse(shape.memory),
+						},
+						Limits: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse(shape.cpu),
+							corev1.ResourceMemory: resource.MustParse(shape.memory),
+						},
+					},
+					PoolerMaxReplicas:    topology.poolerMaxReplicas,
+					MembersPerShard:      topology.membersPerShard,
+					MaximumChangeStreams: topology.changeStreams,
+				})
+				if err != nil {
+					t.Skipf("a shape this small is rejected outright, which is also safe: %v", err)
+				}
+				workMem := mebibytes(t, result.Settings["autovacuum_work_mem"])
+				if workMem < minimumAutovacuumWorkMem/mib {
+					t.Fatalf("autovacuum workers are starved at %dMB", workMem)
+				}
+				workers, err := strconv.ParseInt(result.Settings["autovacuum_max_workers"], 10, 64)
+				if err != nil {
+					t.Fatalf("autovacuum_max_workers is not an integer: %v", err)
+				}
+				shared := mebibytes(t, result.Settings["shared_buffers"])
+				maintenance := mebibytes(t, result.Settings["maintenance_work_mem"])
+				autovacuum := workers * workMem
+				// The fleet has a budget share; exceeding it is what a worker count
+				// derived from cores alone does, and the totals below can still look
+				// affordable while it does.
+				pot := (result.MemoryBytes-result.ReservedBytes)/mib - shared
+				if ceiling := max64(pot/4, minimumAutovacuumWorkMem/mib); autovacuum > ceiling {
+					t.Fatalf("%d autovacuum workers reach %dMB against a %dMB share", workers, autovacuum, ceiling)
+				}
+				// logical_decoding_work_mem is charged per reorder buffer and every
+				// managed consumer's walsender holds one, so the fleet -- not one
+				// buffer -- is what the budget has to cover. PostgreSQL spills these to
+				// disk instead of raising an error, so nothing but the cgroup enforces
+				// the total.
+				consumers := int64(result.ManagedLogicalConsumers)
+				if consumers < 1 {
+					t.Fatalf("the shape reports %d logical consumers", consumers)
+				}
+				// Absence is the defect this replaced, and it is the only part of that
+				// defect visible at every shape. An unemitted parameter leaves the
+				// server on PostgreSQL's built-in 64MB, a default its own documentation
+				// justifies by assuming few concurrent replication connections. From
+				// 4Gi upward the derived value is itself 64MB, so no bound on the value
+				// can tell a budgeted configuration from an inherited default there --
+				// only the emission can.
+				emitted, ok := result.Settings["logical_decoding_work_mem"]
+				if !ok {
+					t.Fatalf("no logical_decoding_work_mem is emitted, leaving %d reorder buffers on PostgreSQL's unbudgeted 64MB default", consumers)
+				}
+				decodingWorkMem := mebibytes(t, emitted)
+				decoding := consumers * decodingWorkMem
+				if ceiling := max64(pot/4, consumers); decoding > ceiling {
+					t.Fatalf("%d logical decoding buffers reach %dMB against a %dMB share", consumers, decoding, ceiling)
+				}
+				// What follows budgets the resident commitments only: shared_buffers,
+				// the whole autovacuum fleet, every managed reorder buffer, and one
+				// concurrent manual maintenance operation, against the limit the cgroup
+				// enforces.
+				//
+				// The work_mem fleet is deliberately not a term in it. work_mem is
+				// sized as pot/(max_connections*4), so that fleet's own product is the
+				// entire pot by construction -- the last assertion states exactly that
+				// -- and the two quarter-shares are drawn from the same pot. Summing
+				// all three exceeds the limit at every shape above the 1Gi minimum, so
+				// such an invariant would bound nothing and would only make supported
+				// shapes unrepresentable.
+				//
+				// The exclusion turns on what drives each fleet. A backend reaches
+				// work_mem only while executing a query node whose input exceeds it,
+				// those peaks are independent across clients, and the pooler bounds how
+				// many clients there are. A reorder buffer is held for as long as its
+				// replication connection lives, its occupancy is driven by the WAL
+				// stream rather than by any client, and every managed consumer decodes
+				// the same stream, so one large transaction pushes the whole fleet
+				// toward its limit at once. For reorder buffers the fleet total is the
+				// expected cost; for work_mem it is a ceiling no workload is sized to
+				// reach.
+				resident := shared + autovacuum + decoding + maintenance
+				limit := result.MemoryBytes / mib
+				t.Logf("limit=%dMB pot=%dMB resident=%dMB (shared=%d autovacuum=%d*%d decoding=%d*%d maintenance=%d)",
+					limit, pot, resident, shared, workers, workMem, consumers, decodingWorkMem, maintenance)
+				if resident >= limit {
+					t.Fatalf("resident commitments reach %dMB (shared=%d autovacuum=%d*%d decoding=%d*%d maintenance=%d) of a %dMB limit before the postmaster, backends or worker slots",
+						resident, shared, workers, workMem, consumers, decodingWorkMem, maintenance, limit)
+				}
+				// The claim that exclusion rests on, checked rather than asserted: the
+				// transient fleet's ceiling is the whole pot and never more than it. A
+				// change that broke this would make work_mem a claim the resident
+				// budget above could no longer leave out.
+				transient := int64(result.MaxConnections) * 4 * mebibytes(t, result.Settings["work_mem"])
+				if transient > pot {
+					t.Fatalf("%d backends running four operations of %s each reach %dMB against a %dMB pot",
+						result.MaxConnections, result.Settings["work_mem"], transient, pot)
+				}
+			})
 		}
-		workMem := mebibytes(t, result.Settings["autovacuum_work_mem"])
-		if workMem < minimumAutovacuumWorkMem/mib {
-			t.Fatalf("cpu=%s memory=%s starves autovacuum workers at %dMB", shape.cpu, shape.memory, workMem)
-		}
-		workers, err := strconv.ParseInt(result.Settings["autovacuum_max_workers"], 10, 64)
-		if err != nil {
-			t.Fatalf("autovacuum_max_workers is not an integer: %v", err)
-		}
-		shared := mebibytes(t, result.Settings["shared_buffers"])
-		maintenance := mebibytes(t, result.Settings["maintenance_work_mem"])
-		autovacuum := workers * workMem
-		// The fleet has a budget share; exceeding it is what a worker count
-		// derived from cores alone does, and the totals below can still look
-		// affordable while it does.
-		budget := (result.MemoryBytes-result.ReservedBytes)/mib - shared
-		if ceiling := max64(budget/4, minimumAutovacuumWorkMem/mib); autovacuum > ceiling {
-			t.Fatalf("cpu=%s memory=%s lets %d autovacuum workers reach %dMB against a %dMB share",
-				shape.cpu, shape.memory, workers, autovacuum, ceiling)
-		}
-		// logical_decoding_work_mem is charged per reorder buffer and every
-		// managed consumer's walsender holds one, so the fleet -- not one buffer
-		// -- is what the budget has to cover. PostgreSQL spills these to disk
-		// instead of raising an error, so nothing but the cgroup enforces the
-		// total.
-		consumers := int64(result.ManagedLogicalConsumers)
-		if consumers < 1 {
-			t.Fatalf("cpu=%s memory=%s reports %d logical consumers", shape.cpu, shape.memory, consumers)
-		}
-		decodingWorkMem := mebibytes(t, result.Settings["logical_decoding_work_mem"])
-		decoding := consumers * decodingWorkMem
-		if ceiling := max64(budget/4, consumers); decoding > ceiling {
-			t.Fatalf("cpu=%s memory=%s lets %d logical decoding buffers reach %dMB against a %dMB share",
-				shape.cpu, shape.memory, consumers, decoding, ceiling)
-		}
-		// shared_buffers, the whole autovacuum fleet, every managed reorder
-		// buffer, and one concurrent manual maintenance operation, all against
-		// the limit the cgroup enforces.
-		committed := shared + autovacuum + decoding + maintenance
-		limit := result.MemoryBytes / mib
-		if committed >= limit {
-			t.Fatalf("cpu=%s memory=%s commits %dMB (shared=%d autovacuum=%d*%d decoding=%d*%d maintenance=%d) of a %dMB limit before the postmaster, backends or worker slots",
-				shape.cpu, shape.memory, committed, shared, workers, workMem, consumers, decodingWorkMem, maintenance, limit)
-		}
+	}
+}
+
+// formatMiB truncates, so a per-buffer share below a mebibyte would reach
+// postgresql.conf as "0MB" -- under the parameter's own 64kB minimum, which
+// makes it fatal at postmaster startup rather than merely small. What keeps the
+// fleet itself inside its share at this cardinality is admission pinning the
+// change stream count, not this arithmetic; the floor exists so that a fleet
+// larger than its share still renders a value the server can start on.
+func TestLogicalDecodingWorkMemNeverRendersBelowItsMinimum(t *testing.T) {
+	t.Parallel()
+	result, err := Calculate(Input{
+		Resources:            resources("1", "1", "1Gi", "1Gi"),
+		PoolerMaxReplicas:    1,
+		MembersPerShard:      1,
+		MaximumChangeStreams: maximumChangeStreams,
+	})
+	if err != nil {
+		t.Fatalf("the smallest shape at the largest accepted stream count must be accepted: %v", err)
+	}
+	if share := result.LogicalDecodingBudgetBytes / int64(result.ManagedLogicalConsumers); share >= mib {
+		t.Fatalf("this shape no longer drives the floor: %d consumers still afford %d bytes each",
+			result.ManagedLogicalConsumers, share)
+	}
+	if got := mebibytes(t, result.Settings["logical_decoding_work_mem"]); got < 1 {
+		t.Fatalf("logical_decoding_work_mem = %q, which PostgreSQL rejects at startup",
+			result.Settings["logical_decoding_work_mem"])
 	}
 }
 

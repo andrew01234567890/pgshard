@@ -180,6 +180,15 @@ func Calculate(in Input) (Result, error) {
 	}
 
 	available := memory - reserved - shared
+	// available is an expected-concurrency pot, not an additive budget, and the
+	// claims on it deliberately overlap. work_mem's own ceiling is the whole pot
+	// by construction below -- every backend running four memory-hungry nodes at
+	// once -- while the autovacuum fleet and the logical decoding fleet each
+	// reserve a quarter of the same pot. Only the continuously resident claims
+	// are required to fit the cgroup limit together: shared_buffers, the
+	// autovacuum fleet, every managed reorder buffer, and one manual maintenance
+	// operation. A per-node transient that every backend reaches simultaneously
+	// is not a shape this sizing supports; reserved is what absorbs the overlap.
 	workMem := clamp64(available/(maxConnections*4), mib, 64*mib)
 	cores := (cpu + 999) / 1000
 	workerProcesses := max64(8, cores*4+4)
@@ -238,6 +247,13 @@ func Calculate(in Input) (Result, error) {
 	// ReorderBufferCheckMemoryLimit streams or serializes to pg_replslot instead
 	// of raising an error, so the cost of a low value is I/O, while the cost of
 	// an unbudgeted one is the cgroup killing the postmaster.
+	//
+	// This is the one fleet on the pot charged at its full size, because unlike
+	// work_mem it is not a per-operation transient: a reorder buffer lives as
+	// long as its replication connection, its occupancy is driven by the WAL
+	// stream rather than by any client, and every managed consumer decodes the
+	// same stream, so a single large transaction pushes all of them toward the
+	// limit together. The fleet total is the expected cost, not a worst case.
 	//
 	// This bounds the buffered change payload accounted by rb->size only. Each
 	// walsender's catalog and relcache and the pgoutput send buffer are charged
