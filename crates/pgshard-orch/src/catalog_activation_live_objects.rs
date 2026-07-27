@@ -26,6 +26,7 @@ use crate::catalog_materialization::{
     CatalogActivationPublicationTarget, CatalogBootstrapDispatch,
     bind_catalog_activation_live_objects, dispatcher_holder_matches,
 };
+use crate::kube_transport::apply_request_budget;
 
 const CARRIER_KIND: &str = "PgShardCatalogActivation";
 const CLUSTER_OWNER_API_VERSION: &str = "pgshard.io/v1alpha1";
@@ -536,10 +537,7 @@ impl KubernetesLiveObjectStore {
         let mut client_config = Config::incluster().map_err(|error| {
             CatalogActivationLiveObjectError::InClusterConfiguration(error.to_string())
         })?;
-        client_config.connect_timeout = Some(request_timeout);
-        client_config.read_timeout = Some(request_timeout);
-        client_config.write_timeout = Some(request_timeout);
-        client_config.default_retry = false;
+        apply_request_budget(&mut client_config, request_timeout);
         let client = Client::try_from(client_config).map_err(|error| {
             CatalogActivationLiveObjectError::KubernetesClient(error.to_string())
         })?;

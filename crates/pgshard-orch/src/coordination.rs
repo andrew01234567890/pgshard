@@ -13,7 +13,15 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::boottime::SuspendAwareInstant;
+use crate::config::{
+    MAXIMUM_KUBERNETES_LEASE_DURATION_SECONDS, MAXIMUM_KUBERNETES_LEASE_RETRY_MILLIS,
+};
 use crate::domain::{OrchState, OrchestratorIdentity};
+use crate::kube_transport::apply_request_budget;
+
+/// Kubernetes leader-election renewal ratio: a holder renews at a third of the
+/// Lease duration, leaving room for a failed renewal before it expires.
+pub(crate) const LEADER_RENEWAL_DIVISOR: u32 = 3;
 
 const INITIAL_RETRY: Duration = Duration::from_millis(250);
 const MAX_RETRY: Duration = Duration::from_secs(5);
@@ -85,9 +93,9 @@ impl CoordinationConfig {
             || !uid(&cluster_uid)
             || !uid(&pod_uid)
             || lease_duration.subsec_nanos() != 0
-            || !(6..=300).contains(&lease_seconds)
+            || !(6..=MAXIMUM_KUBERNETES_LEASE_DURATION_SECONDS).contains(&lease_seconds)
             || !(100..=5_000).contains(&request_millis)
-            || !(100..=30_000).contains(&retry_millis)
+            || !(100..=MAXIMUM_KUBERNETES_LEASE_RETRY_MILLIS).contains(&retry_millis)
             || request_millis > lease_seconds.saturating_mul(1_000) / 3
             || retry_millis > lease_seconds.saturating_mul(1_000) / 3
         {
@@ -369,7 +377,7 @@ async fn replace_as_holder<S: LeaseStore>(
         resource_version: evidence.resource_version,
         leader: true,
         valid_until,
-        delay: config.lease_duration / 3,
+        delay: config.lease_duration / LEADER_RENEWAL_DIVISOR,
     })
 }
 
@@ -536,10 +544,7 @@ impl KubernetesLeaseStore {
     fn new(config: &CoordinationConfig) -> Result<Self, CoordinationError> {
         let mut client_config = Config::incluster()
             .map_err(|error| CoordinationError::InClusterConfiguration(error.to_string()))?;
-        client_config.connect_timeout = Some(config.request_timeout);
-        client_config.read_timeout = Some(config.request_timeout);
-        client_config.write_timeout = Some(config.request_timeout);
-        client_config.default_retry = false;
+        apply_request_budget(&mut client_config, config.request_timeout);
         let client = Client::try_from(client_config)
             .map_err(|error| CoordinationError::KubernetesClient(error.to_string()))?;
         Ok(Self {

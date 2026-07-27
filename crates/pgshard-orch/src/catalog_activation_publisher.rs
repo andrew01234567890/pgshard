@@ -25,6 +25,7 @@ use tokio::time::Instant;
 use crate::catalog_materialization::{
     CatalogActivationPublicationTarget, PreparedCatalogActivationRequest,
 };
+use crate::kube_transport::apply_request_budget;
 
 const CARRIER_KIND: &str = "PgShardCatalogActivation";
 const PUBLISH_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
@@ -394,10 +395,7 @@ impl KubernetesCarrierPublicationStore {
         let mut client_config = Config::incluster().map_err(|error| {
             CatalogActivationPublisherError::KubernetesConfig(error.to_string())
         })?;
-        client_config.connect_timeout = Some(PUBLISH_REQUEST_TIMEOUT);
-        client_config.read_timeout = Some(PUBLISH_REQUEST_TIMEOUT);
-        client_config.write_timeout = Some(PUBLISH_REQUEST_TIMEOUT);
-        client_config.default_retry = false;
+        apply_request_budget(&mut client_config, PUBLISH_REQUEST_TIMEOUT);
         let client = Client::try_from(client_config).map_err(|error| {
             CatalogActivationPublisherError::KubernetesClient(error.to_string())
         })?;
