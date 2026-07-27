@@ -5050,10 +5050,8 @@ mod tests {
         let ci = include_str!("../../../.github/workflows/ci.yml");
         let release = include_str!("../../../.github/workflows/release.yml");
         assert!(ci.contains("workflow_dispatch"));
-        assert!(ci.contains(
-            "group: pgshard-ci-${{ github.event_name == 'pull_request' && github.run_id || 'main' }}"
-        ));
-        assert_eq!(ci.matches("queue: max").count(), 1);
+        assert_eq!(ci.matches("queue: max").count(), 0);
+        assert_concurrency_cannot_hold_one_commit_behind_another(&parsed_workflow());
         assert!(ci.contains("aggregate:"));
         assert_eq!(ci.matches(".github/scripts/ci-diff-base.sh").count(), 3);
         assert!(ci.contains("latest released first-parent commit"));
@@ -5086,6 +5084,50 @@ mod tests {
         assert!(!release.contains("done < <("));
         assert!(release.contains("run-id: ${{ steps.candidate.outputs.run_id }}"));
         assert!(!ci.contains("Deploy documentation to GitHub Pages"));
+    }
+
+    /// The shapes the workflow guard has to keep apart, asserted directly so
+    /// that the ones which serialize the default branch are refused whether or
+    /// not anyone thinks to write them into the workflow.
+    #[test]
+    fn a_ci_concurrency_group_may_not_select_a_value_two_runs_share() {
+        for shared in [
+            "pgshard-ci-main",
+            "${{ github.ref }}",
+            "pgshard-ci-${{ github.ref_name }}",
+            "${{ github.event_name == 'push' && 'pgshard-main' || github.run_id }}",
+            "${{ github.event_name == 'push' && 'pgshard-main' || \
+              github.event_name == 'schedule' && 'pgshard-cron' || github.run_id }}",
+            "pgshard-${{\n  github.event_name == 'push' &&\n  'main' ||\n  github.run_id }}",
+            "${{ github.run_id }}-${{ github.ref }}",
+            "${{ github.event_name == 'push' && 'a||b' || github.run_id }}",
+            // The release workflow's own group. Holding one run behind another
+            // is what a release queue is for and is wrong only here, which is
+            // why this property holds over CI alone.
+            "pgshard-source-release-${{ github.event.workflow_run.conclusion == 'success' && \
+             'eligible' || github.run_id }}",
+        ] {
+            assert!(
+                group_selects_only_run_distinct_operands(shared).is_err(),
+                "{shared} can hold one commit's run behind another's"
+            );
+        }
+
+        for distinct in [
+            "${{ github.run_id }}",
+            "pgshard-ci-${{ github.run_id }}",
+            "pgshard-ci-pr-${{ github.event.pull_request.number || github.run_id }}",
+            "pgshard-ci-${{\n  github.event.pull_request.number\n  || github.run_id\n}}",
+            "${{ github.event_name == 'pull_request' && \
+             github.event.pull_request.number || github.run_id }}",
+            // An operator inside a string literal is not an operator.
+            "${{ github.head_ref == 'feature/a||b' && \
+             github.event.pull_request.number || github.run_id }}",
+        ] {
+            if let Err(shared) = group_selects_only_run_distinct_operands(distinct) {
+                panic!("{distinct} was refused for resolving to {shared}, which it cannot");
+            }
+        }
     }
 
     /// The shipped script, not a copy of it: a copy drifts, and the gate this
@@ -5585,6 +5627,132 @@ mod tests {
             declared, allowed,
             "{described} does not declare exactly the environment it is allowed"
         );
+    }
+
+    /// The operands a CI concurrency group is allowed to resolve to.
+    ///
+    /// The run identifier is distinct for every run. The pull request number
+    /// is empty on every event that is not a pull request, so an alternative
+    /// selecting it can only ever collapse a pull request onto its own newest
+    /// run, which is the one collapse CI permits.
+    const RUN_DISTINCT_GROUP_OPERANDS: [&str; 2] =
+        ["github.run_id", "github.event.pull_request.number"];
+
+    /// CI may collapse a pull request onto its own newest run, but no group
+    /// may span two commits. A group shared across commits holds a whole run
+    /// pending before any job is created, so the default branch advances at
+    /// one run per full CI duration and everything past a hundred waiting runs
+    /// is cancelled outright.
+    ///
+    /// Reading the last `||` alternative proves nothing about that. A GitHub
+    /// expression yields its *first* truthy alternative and an `&&` chain
+    /// yields its last operand, so `github.event_name == 'push' &&
+    /// 'pgshard-main' || github.run_id` serializes the default branch with
+    /// `github.run_id` sitting unreachable behind it. What has to hold is that
+    /// no value the group can select is one two runs share, so every
+    /// alternative of every expression in it has to select a run-distinct
+    /// operand, and a constant such as `'pgshard-main'` or a branch-scoped
+    /// `github.ref` is refused wherever it appears.
+    ///
+    /// This holds over CI, whose runs share nothing and are independent. The
+    /// release workflow groups on the same shape to the opposite end — it
+    /// deliberately holds one release behind another — and is asserted on its
+    /// own terms.
+    fn assert_concurrency_cannot_hold_one_commit_behind_another(workflow: &serde_norway::Value) {
+        let mut declared = vec![("the workflow", workflow.get("concurrency"))];
+        for (name, job) in workflow["jobs"]
+            .as_mapping()
+            .expect("the workflow declares jobs")
+        {
+            let name = name.as_str().expect("a job is named");
+            declared.push((name, job.get("concurrency")));
+        }
+
+        for (described, concurrency) in declared {
+            let Some(concurrency) = concurrency else {
+                continue;
+            };
+            let group = concurrency
+                .get("group")
+                .map_or_else(|| concurrency.as_str(), serde_norway::Value::as_str)
+                .unwrap_or_else(|| panic!("{described} names no concurrency group"));
+            if let Err(shared) = group_selects_only_run_distinct_operands(group) {
+                panic!(
+                    "{described} groups on {group}, which can resolve to {shared} and \
+                     hold one commit's run behind another's"
+                );
+            }
+        }
+    }
+
+    /// `Err` names a value the group can select that two runs can share.
+    fn group_selects_only_run_distinct_operands(group: &str) -> Result<(), String> {
+        let expressions = template_expressions(group);
+        if expressions.is_empty() {
+            return Err(format!("the fixed name {}", collapse_whitespace(group)));
+        }
+        for expression in expressions {
+            for alternative in split_outside_quotes(expression, "||") {
+                // An `&&` chain that was selected at all was wholly truthy, so
+                // what it contributed to the group is its final operand.
+                let selected = collapse_whitespace(
+                    split_outside_quotes(alternative, "&&")
+                        .last()
+                        .expect("splitting yields at least one part"),
+                );
+                if !RUN_DISTINCT_GROUP_OPERANDS.contains(&selected.as_str()) {
+                    return Err(selected);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The body of every `${{ }}` in a template, in order. A group with none
+    /// is a fixed name however it was written, including the
+    /// `concurrency: <string>` shorthand.
+    fn template_expressions(group: &str) -> Vec<&str> {
+        let mut expressions = Vec::new();
+        let mut rest = group;
+        while let Some(open) = rest.find("${{") {
+            let body = &rest[open + "${{".len()..];
+            let close = body
+                .find("}}")
+                .unwrap_or_else(|| panic!("the concurrency group {group} is unterminated"));
+            expressions.push(&body[..close]);
+            rest = &body[close + "}}".len()..];
+        }
+        expressions
+    }
+
+    /// Splitting has to ignore an operator inside a string literal, because a
+    /// literal is exactly what makes a group unsafe and it may contain
+    /// anything.
+    fn split_outside_quotes<'a>(expression: &'a str, operator: &str) -> Vec<&'a str> {
+        let mut parts = Vec::new();
+        let mut quoted = false;
+        let mut start = 0;
+        let mut consumed = 0;
+        for (index, character) in expression.char_indices() {
+            if index < consumed {
+                continue;
+            }
+            if character == '\'' {
+                quoted = !quoted;
+            } else if !quoted && expression[index..].starts_with(operator) {
+                parts.push(&expression[start..index]);
+                consumed = index + operator.len();
+                start = consumed;
+            }
+        }
+        parts.push(&expression[start..]);
+        parts
+    }
+
+    /// A folded or literal block scalar carries the newlines and indentation
+    /// the author used, and none of it changes what the group resolves to.
+    fn collapse_whitespace(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     fn parsed_workflow() -> serde_norway::Value {
