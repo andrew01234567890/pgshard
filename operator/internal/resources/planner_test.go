@@ -5259,3 +5259,60 @@ func configMapVolumeName(t *testing.T, volumes []corev1.Volume, name string) str
 	t.Fatalf("ConfigMap volume %q not found: %#v", name, volumes)
 	return ""
 }
+
+// PostgreSQL recycles a WAL segment only once XLogArchiveCheckDone accepts it,
+// and a .ready with no matching .done is never accepted, so archive_mode=on
+// without something to consume the backlog grows pg_wal until the volume fills
+// and the cluster can make no further durable progress. archive_mode is
+// PGC_POSTMASTER and so has to be decided here; archive_command and
+// archive_library are PGC_SIGHUP, and pinning either on the command line would
+// outrank every later reload and leave a filled pg_wal recoverable only by a
+// restart.
+//
+// Every postmaster is reached from its own pg_ctl start rather than from
+// whatever lines happen to look like an option string, and the number of start
+// sites is fixed, so a site that stops carrying its options inline fails here
+// instead of silently dropping out of the check.
+func TestBootstrapPostmastersDisableArchivingWithoutPinningThePipeline(t *testing.T) {
+	t.Parallel()
+	for name, script := range map[string]struct {
+		body       string
+		startSites int
+	}{
+		"bootstrap":         {body: postgresqlBootstrapScript, startSites: 2},
+		"standby bootstrap": {body: postgresqlStandbyBootstrapScript, startSites: 1},
+	} {
+		lines := strings.Split(script.body, "\n")
+		started := 0
+		for index, line := range lines {
+			fields := strings.Fields(line)
+			if len(fields) == 0 || fields[0] != "pg_ctl" || !slices.Contains(fields, "start") {
+				continue
+			}
+			started++
+			if index+1 == len(lines) {
+				t.Errorf("%s script line %d starts a postmaster with no line after it to carry options",
+					name, index+1)
+				continue
+			}
+			options, inline := strings.CutPrefix(strings.TrimSpace(lines[index+1]), `-o "`)
+			if !inline {
+				t.Errorf("%s script line %d starts a postmaster whose options are not inline on line %d: %s",
+					name, index+1, index+2, lines[index+1])
+				continue
+			}
+			if !strings.Contains(options, "-c archive_mode=off") {
+				t.Errorf("%s postmaster options omit -c archive_mode=off:\n%s", name, options)
+			}
+			for _, pinned := range []string{"-c archive_command=", "-c archive_library="} {
+				if strings.Contains(options, pinned) {
+					t.Errorf("%s postmaster options pin %s, which no reload can then replace", name, pinned)
+				}
+			}
+		}
+		if started != script.startSites {
+			t.Errorf("%s script starts %d postmasters, want %d; every one needs archiving disabled",
+				name, started, script.startSites)
+		}
+	}
+}

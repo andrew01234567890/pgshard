@@ -1759,11 +1759,14 @@ jobs:
               "ignore_checksum_failure = on" \
               "zero_damaged_pages = on" \
               >> "$PGDATA/postgresql.conf"'
+          # An inherited archive obligation nothing will ever discharge: a
+          # segment with a .ready and no .done. Assert it lands, so the check
+          # after shutdown that it is gone cannot pass on a missing fixture.
           pending_wal=000000010000000000000000
           docker run --rm --user 999:999 --entrypoint /bin/sh \
             --volume "$volume:/var/lib/postgresql/18/docker" \
             "$image" -ceu \
-            'truncate -s 16777216 "$PGDATA/pg_wal/$1"; : > "$PGDATA/pg_wal/archive_status/$1.ready"' \
+            'truncate -s 16777216 "$PGDATA/pg_wal/$1"; : > "$PGDATA/pg_wal/archive_status/$1.ready"; test -f "$PGDATA/pg_wal/$1"; test -f "$PGDATA/pg_wal/archive_status/$1.ready"; test ! -e "$PGDATA/pg_wal/archive_status/$1.done"' \
             -- "$pending_wal"
 
           docker run --rm --user 999:999 --entrypoint /bin/sh \
@@ -1851,7 +1854,7 @@ jobs:
                   hba_file=/run/pgshard/hba/pg_hba.conf \
                   external_pid_file=/run/pgshard/postgres/postmaster.external.pid \
                   listen_addresses= unix_socket_group= primary_conninfo= primary_slot_name= \
-                  restore_command= archive_mode=on archive_command= archive_library= \
+                  restore_command= archive_mode=off \
                   max_wal_senders=0 \
                   max_logical_replication_workers=0 \
                   idle_replication_slot_timeout=0 max_slot_wal_keep_size=-1 \
@@ -1867,6 +1870,15 @@ jobs:
                 if grep --quiet --fixed-strings -- synchronous_standby_names= \
                   <<<"$postmaster_arguments"; then
                   echo "postmaster pinned synchronous_standby_names on its command line" >&2
+                  exit 1
+                fi
+                # archive_command and archive_library are PGC_SIGHUP under the
+                # same rule, so naming either here would put an archive pipeline
+                # out of reach of every later reload, and a pg_wal already held
+                # by an undrainable .ready backlog with it.
+                if grep --quiet --extended-regexp '^archive_(command|library)=' \
+                  <<<"$postmaster_arguments"; then
+                  echo "postmaster pinned the archive pipeline on its command line" >&2
                   exit 1
                 fi
                 docker exec "$container" /usr/bin/test \
@@ -2066,10 +2078,16 @@ jobs:
           docker run --rm --user 999:999 --entrypoint /usr/bin/test \
             --volume "$runtime_volume:/run/pgshard" \
             "$image" ! -e /run/pgshard/postgres/postmaster.external.pid
+          # The obligation injected above is discharged, not honoured. With
+          # archiving inactive XLogArchiveCheckDone answers true before it ever
+          # looks for a .done, so the checkpoints this postmaster wrote let
+          # RemoveOldXlogFiles recycle or unlink the segment and let
+          # XLogArchiveCleanup drop its status file. Holding both instead is the
+          # unbounded pg_wal growth this pins archive_mode=off to avoid.
           docker run --rm --user 999:999 --entrypoint /bin/sh \
             --volume "$volume:/var/lib/postgresql/18/docker" \
             "$image" -ceu \
-            'test -f "$PGDATA/pg_wal/$1"; test -f "$PGDATA/pg_wal/archive_status/$1.ready"' \
+            'test ! -e "$PGDATA/pg_wal/$1"; test ! -e "$PGDATA/pg_wal/archive_status/$1.ready"' \
             -- "$pending_wal"
           test "$(docker run --rm --user 999:999 --entrypoint /bin/sh \
             --volume "$runtime_volume:/run/pgshard" \
