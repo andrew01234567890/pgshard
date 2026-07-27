@@ -6,9 +6,21 @@ pub mod catalog_activation_consumer;
 pub mod catalog_activation_runtime;
 pub mod catalog_activation_static_inputs;
 pub mod catalog_activation_tls;
+#[allow(
+    dead_code,
+    reason = "sealed identity checks for the next catalog materialization stage; the \
+              compatibility bootstrap shell remains the producer until it is retired"
+)]
+pub(crate) mod catalog_identity;
 pub(crate) mod catalog_materialization_program;
 pub mod catalog_materialization_stage;
 pub(crate) mod catalog_materializer;
+#[allow(
+    dead_code,
+    reason = "sealed material checks for the next catalog materialization stage; the \
+              compatibility bootstrap shell remains the producer until it is retired"
+)]
+pub(crate) mod catalog_secret_material;
 pub mod config;
 pub mod coordination;
 pub mod domain;

@@ -16,6 +16,10 @@ readonly standby_socket="pgshard-generation-standby-socket-${suffix}"
 readonly standby_credentials="pgshard-generation-standby-credentials-${suffix}"
 readonly fence_primary="pgshard-generation-fence-${suffix}"
 readonly fence_socket="pgshard-generation-fence-socket-${suffix}"
+readonly identity_primary="pgshard-generation-identity-${suffix}"
+readonly identity_socket="pgshard-generation-identity-socket-${suffix}"
+readonly identity_hba="pgshard-generation-identity-hba-${suffix}"
+readonly identity_log="pgshard-generation-identity-log-${suffix}"
 readonly replication_password="pgshard_generation_replication_test"
 readonly standby_application_name="pgshard_member_0001"
 readonly synchronous_standby_names="pgshard_member_0001, pgshard_member_0002"
@@ -45,11 +49,13 @@ if [[ ! "$image" =~ @sha256:[0-9a-f]{64}$ ]]; then
 fi
 
 cleanup() {
-  docker rm --force "$standby" "$primary" "$fence_primary" >/dev/null 2>&1 || true
+  docker rm --force "$standby" "$primary" "$fence_primary" "$identity_primary" \
+    >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
   docker volume rm --force \
     "$primary_data" "$standby_data" "$primary_socket" "$standby_socket" \
     "$standby_credentials" "$fence_socket" \
+    "$identity_socket" "$identity_hba" "$identity_log" \
     >/dev/null 2>&1 || true
   rm -f "$primary_hba" "$build_messages"
   rmdir "$fixture_dir" 2>/dev/null || true
@@ -499,6 +505,121 @@ docker run --rm --user 999:999 \
 
 docker rm --force "$fence_primary" >/dev/null
 docker volume rm "$fence_socket" >/dev/null
+
+# The catalog identity checks decide a role's exact shape, its role-wide and
+# database-wide defaults, whether an installed credential really authenticates,
+# and whether the session it authenticates into is the one a production client
+# gets. Only a real server answers any of those, and three of them need a
+# server the test may reconfigure while it runs: an HBA file it rewrites and
+# reloads, a statement log it reads back, and a catalog database it drops and
+# rebuilds. That is a disposable server of its own rather than the shared
+# primary, whose final generation the steps above and below assert on.
+docker volume create "$identity_socket" >/dev/null
+docker volume create "$identity_hba" >/dev/null
+docker volume create "$identity_log" >/dev/null
+
+# The postmaster refuses to start without an HBA file it can read, and the
+# tests rewrite this one in place, so it is seeded and owned by the runtime
+# user before the server exists.
+docker run --rm --user 0:0 \
+  --volume "$identity_hba:/hba" --volume "$identity_log:/log" \
+  --entrypoint /bin/sh "$image" -ceu '
+    printf "local all all trust\n" > /hba/pg_hba.conf
+    chown -R 999:999 /hba /log
+    chmod 0600 /hba/pg_hba.conf
+    chmod 0700 /log
+  '
+
+# log_statement=all is what makes the credential-log test able to conclude
+# anything: it proves the log was recording the installing statement before it
+# concludes the verifier is absent from it. The collector is what turns that
+# log into a file the test container can read.
+docker run --detach --name "$identity_primary" \
+  --network "$network" \
+  --volume "$identity_socket:/var/run/postgresql" \
+  --volume "$identity_hba:/hba" \
+  --volume "$identity_log:/log" \
+  --env POSTGRES_PASSWORD=disposable-identity-password \
+  "$image" \
+  -c listen_addresses= \
+  -c hba_file=/hba/pg_hba.conf \
+  -c log_statement=all \
+  -c logging_collector=on \
+  -c log_destination=stderr \
+  -c log_directory=/log \
+  -c log_filename=server.log \
+  -c log_file_mode=0600 \
+  -c log_rotation_age=0 \
+  -c log_rotation_size=0 \
+  -c log_truncate_on_rotation=off \
+  -c event_triggers=off >/dev/null
+wait_ready "$identity_primary"
+
+# Two of these tests leave their own policy in force, and one of them leaves a
+# policy that admits no catalog identity at all. Each starts from the same
+# known policy rather than from whatever the previous one left behind.
+reset_identity_policy() {
+  docker run --rm --user 999:999 --volume "$identity_hba:/hba" \
+    --entrypoint /bin/sh "$image" -ceu \
+    'printf "local all all trust\n" > /hba/pg_hba.conf'
+  docker exec --user 999:999 "$identity_primary" psql -X --no-password \
+    --host=/var/run/postgresql --username=postgres --dbname=postgres \
+    --set=ON_ERROR_STOP=1 --command="SELECT pg_catalog.pg_reload_conf()" >/dev/null
+}
+
+run_identity_test() {
+  local identity_test="$1"
+  reset_identity_policy
+  docker run --rm --user 999:999 --network none --read-only \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --volume "$identity_socket:/identity-socket" \
+    --volume "$identity_hba:/identity-hba" \
+    --volume "$identity_log:/identity-log:ro" \
+    --mount "type=bind,src=$test_binary,dst=/test/pgshard-agent-test,readonly" \
+    --env PGSHARD_AGENT_TEST_SOCKET_DIR=/identity-socket \
+    --env PGSHARD_AGENT_TEST_HBA_FILE=/identity-hba/pg_hba.conf \
+    --env PGSHARD_AGENT_TEST_SERVER_LOG=/identity-log/server.log \
+    --entrypoint /test/pgshard-agent-test \
+    "$image" \
+    --ignored --exact "$identity_test" --nocapture
+}
+
+# The four states a role passes through and the shape it must never be adopted
+# from, each divergence one at a time.
+run_identity_test \
+  catalog_identity::tests::live_postgres18_classifies_the_operator_owned_role_states
+run_identity_test \
+  catalog_identity::tests::live_postgres18_refuses_to_adopt_a_role_the_operator_does_not_own
+
+# The update's own WHERE clause cannot see the role-wide defaults that are part
+# of the operation writer's shape, so only the framed post-condition can refuse
+# an installation that would leave a role the operator does not own.
+run_identity_test \
+  catalog_identity::tests::live_postgres18_refuses_an_installation_that_leaves_a_role_it_does_not_own
+
+# PostgreSQL stores role-wide defaults in application order and the state query
+# compares them with an ordered array literal. Only the server settles which
+# order that is.
+run_identity_test \
+  catalog_identity::tests::live_postgres18_role_defaults_store_exactly_the_array_the_state_query_compares
+
+# Binding the verifier keeps it out of the statement text; the DETAIL and
+# auto_explain channels are what the installation has to close for itself, on a
+# session that demonstrably logs bound parameters both before and after.
+run_identity_test \
+  catalog_identity::tests::live_postgres18_a_credential_never_reaches_the_statement_log
+
+# A connection that succeeded under trust or peer proves nothing about the
+# credential, and the agent's own pre-serving policy uses peer. Both halves of
+# that — a path that admits without asking, and a policy that admits nothing —
+# need real HBA records the server reloads.
+run_identity_test \
+  catalog_identity::tests::live_postgres18_a_credential_proof_needs_an_hba_record_that_admits_it
+run_identity_test \
+  catalog_identity::tests::live_postgres18_authenticating_is_not_the_same_as_a_canonical_session
+
+docker rm --force "$identity_primary" >/dev/null
+docker volume rm "$identity_socket" "$identity_hba" "$identity_log" >/dev/null
 
 if [[ -n "$runtime_image" ]]; then
   if ! docker stop --time 10 "$standby" >/dev/null; then
