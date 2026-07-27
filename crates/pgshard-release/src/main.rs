@@ -6563,6 +6563,20 @@ mod tests {
         "images",
     ];
 
+    /// The detectable components deliberately left out of `LIVE_COMPONENTS`.
+    ///
+    /// Which skips are the expensive ones is a judgment and cannot be derived,
+    /// but leaving it at that made `rust` and `images` removable in silence:
+    /// neither has a crate of its own requiring it back, so deleting the name
+    /// and narrowing its trigger to match passed. An exception has to be
+    /// written down here instead, where dropping a component from the
+    /// whole-repository requirement is an edit somebody signs for.
+    ///
+    /// The undetectable components need no entry. A permanently false output
+    /// cannot satisfy a requirement to fire, so live is drawn from the
+    /// detectable components rather than from every gated one.
+    const NOT_LIVE_COMPONENTS: [&str; 5] = ["proto", "go", "website", "integration", "kind"];
+
     /// The components the workflow gates a job on, read off the conditions
     /// `every_aggregated_job_expects_its_own_condition` pins to the workflow.
     fn gated_components() -> std::collections::BTreeSet<&'static str> {
@@ -6594,6 +6608,13 @@ mod tests {
     /// until the manifest exists. The manifests are asserted absent, so adding
     /// one puts the component back into the requirement rather than leaving it
     /// excused.
+    ///
+    /// Each pair is required against the detector's own declaration, because an
+    /// excuse answerable to nothing excuses anything: a manifest nobody reads
+    /// for the component is absent forever, and so is a path no file will ever
+    /// be committed at. Bound to the declaration, the excuse names the manifest
+    /// the workflow actually decides the component by, and `None` is available
+    /// only where the workflow decides nothing.
     const UNDETECTABLE_COMPONENTS: [(&str, Option<&str>); 3] = [
         ("website_exists", None),
         ("ui", Some("ui/package.json")),
@@ -6630,39 +6651,36 @@ mod tests {
             "every component the workflow gates a job on has to be classified here, or its \
              coverage is never required of anything"
         );
-        let live: std::collections::BTreeSet<&str> = LIVE_COMPONENTS.iter().copied().collect();
-        assert_eq!(
-            live.len(),
-            LIVE_COMPONENTS.len(),
-            "a component is declared live twice"
-        );
-        assert!(
-            live.is_subset(&gated),
-            "a component declared live gates no job, so requiring the detector to report it \
-             proves nothing"
-        );
-        assert!(
-            rooted.is_subset(&live),
-            "a component whose job is built out of a crate of its own is live by construction, \
-             and dropping it here drops what the loose build inputs are required against"
-        );
-
         // Derived rather than restated: a hand-kept second copy of the
         // workflow's component set loses a name without anything objecting, and
         // the directory it is required for is the only probe covering that tree.
         let tracked = tracked_files();
+        let script = detector_step_script();
         let mut detectable = gated.clone();
         for (component, manifest) in UNDETECTABLE_COMPONENTS {
             assert!(
                 detectable.remove(component),
                 "{component} gates no job, so excusing it from detection proves nothing"
             );
-            if let Some(manifest) = manifest {
-                assert!(
-                    !tracked.contains(manifest),
-                    "{manifest} is present, so {component} can be detected and has to be required \
-                     rather than excused"
-                );
+            let decided = format!("&& {component}_exists=true");
+            match manifest {
+                Some(manifest) => {
+                    assert!(
+                        script.contains(&format!("exists_at_head_or_base {manifest} {decided}")),
+                        "the detector does not decide {component} by whether {manifest} exists, \
+                         so the absence of {manifest} excuses nothing"
+                    );
+                    assert!(
+                        !tracked.contains(manifest),
+                        "{manifest} is present, so {component} can be detected and has to be \
+                         required rather than excused"
+                    );
+                }
+                None => assert!(
+                    !script.contains(&decided),
+                    "the detector decides {component} by whether a manifest exists, so that \
+                     manifest is what excuses it and has to be named here and asserted absent"
+                ),
             }
         }
         let available: std::collections::BTreeSet<&str> =
@@ -6676,6 +6694,49 @@ mod tests {
             available, detectable,
             "the components a change can be detected against are the gated ones the repository \
              can report, and this list has to be exactly those"
+        );
+        // Deriving the list and then not requiring anything of it retires the
+        // coverage as quietly as losing a name would: emptied, the one entry
+        // that reads it stops answering for the helper every component's
+        // detection runs through.
+        let helper = OUTSIDE_THE_CRATES
+            .iter()
+            .find(|(probe, _, _)| probe.named() == ".github/scripts")
+            .map(|(_, fires, _)| *fires)
+            .expect("the scripts the detector runs through are classified");
+        assert_eq!(
+            helper
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<&str>>(),
+            available,
+            "the helper under .github/scripts computes the base every component is detected \
+             against, so changing it has to fire every component that can be detected at all"
+        );
+
+        let live: std::collections::BTreeSet<&str> = LIVE_COMPONENTS.iter().copied().collect();
+        assert_eq!(
+            live.len(),
+            LIVE_COMPONENTS.len(),
+            "a component is declared live twice"
+        );
+        let mut expensive = available.clone();
+        for component in NOT_LIVE_COMPONENTS {
+            assert!(
+                expensive.remove(component),
+                "no change can be detected against {component}, so declaring it not live proves \
+                 nothing"
+            );
+        }
+        assert_eq!(
+            live, expensive,
+            "the components a skipped job costs the most are the detectable ones nothing excepts, \
+             so a component leaves that requirement by being excepted and never by being deleted"
+        );
+        assert!(
+            rooted.is_subset(&live),
+            "a component whose job is built out of a crate of its own is live by construction, \
+             and dropping it here drops what the loose build inputs are required against"
         );
     }
 
