@@ -7,6 +7,12 @@
 //! state `psql`'s `psqlscan.l` would and inspects tokens only in the INITIAL
 //! state. It performs no I/O and grants no SQL, serving, routing, or process
 //! authority.
+//!
+//! The scanner has two consumers and must be conservative for both. `psql` runs
+//! these files in the legacy flow and is the only consumer that interprets `\`
+//! and `:name`. The materializer executes them through `batch_execute`, so the
+//! backend's `src/backend/parser/scan.l` — not `psqlscan.l` — decides the
+//! statement boundaries the envelope accounting depends on.
 
 use std::str;
 
@@ -461,15 +467,20 @@ impl<'a> Scanner<'a> {
                 b'\'' if self.peek(1) == Some(b'\'') => self.pos += 2,
                 b'\'' => {
                     self.pos += 1;
-                    // A closing quote always returns to INITIAL. String
-                    // continuation — a second literal on a later line resuming
-                    // this one's state — is backend-lexer behaviour, which
-                    // reads a whole query buffer. `psql` feeds its scanner one
-                    // newline-stripped line at a time, so its continuation rule
-                    // requires a newline it never sees and it is back in
-                    // INITIAL on the next line. Modelling continuation here
-                    // kept the scanner inside the string while `psql` executed
-                    // what followed.
+                    // A closing quote always returns to INITIAL. The backend
+                    // lexer that executes these fragments does resume the
+                    // literal when `{quotecontinue}` matches (scan.l:230,
+                    // scan.l:586), but a continuation only merges two adjacent
+                    // literals over the same byte extent — only whitespace and
+                    // `--` comments can separate them, and those are inert here
+                    // too — so no `;` changes side and every statement keeps
+                    // its boundary. Scanning the literals apart yields at least
+                    // as many INITIAL tokens as the backend produces, which
+                    // only tightens the one-token BEGIN and COMMIT checks. What
+                    // must not be inherited is the resumed state: a continued
+                    // `E'…'` keeps its backslash escapes, so the ordinary-string
+                    // backslash rejection below is what keeps the closing quote
+                    // unambiguous.
                     return Ok(State::Initial);
                 }
                 b'\\' => match kind {
@@ -1037,11 +1048,13 @@ mod tests {
 
     #[test]
     fn a_closing_quote_always_returns_to_initial() {
-        // `psql` scans one newline-stripped line at a time, so its
-        // `quotecontinue` rule — which requires a literal newline — never
-        // matches and it is back in INITIAL on the next line. Resuming the
-        // previous string state here would leave every following byte
-        // uninspected while `psql` executed it.
+        // The backend lexer these fragments run through does implement
+        // `{quotecontinue}` (scan.l:586), and resuming a continued `E'…'` keeps
+        // its backslash escapes. Inheriting that state here would leave every
+        // following byte uninspected; refusing the backslash instead keeps the
+        // closing quote unambiguous without moving any statement boundary,
+        // because the merged literal covers exactly the bytes the two separate
+        // literals do.
         assert_rejects_caller_framed("SELECT E'a'\n'\\' \\! id ; ';\n");
         assert_rejects_caller_framed("SELECT E'a'\n'\\' \\echo pwned\n';\n");
         assert_rejects_caller_framed("SELECT E'a'\n'\\' :evil\n';\n");

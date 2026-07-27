@@ -3,6 +3,18 @@
 //! The candidate parser is configured with its `PostgreSQL` dialect but is
 //! intentionally treated as permissive. A successful parse is not
 //! `PostgreSQL` semantic validation and never authorizes routing by itself.
+//!
+//! `standard_conforming_strings = on` is assumed throughout and, unlike
+//! [`CatalogOnlySearchPath`], nothing proves it: no type here carries an
+//! observation of the setting and no caller pins it. The assumption is
+//! one-directional, so it is not a routing hole — `off` starts `'…'` in the
+//! backslash-escaping `xe` state (`src/backend/parser/scan.l:545-551`), which
+//! can only carry a literal past a closing quote that this crate honours, so
+//! [`parse_one`] can only see extra statement separators and reject. Proving
+//! the setting the way the session `search_path` is proved is outstanding; the
+//! agent's catalog materialization path already pins and re-reads it.
+
+mod postgres_lexer;
 
 use std::{collections::BTreeSet, fmt, num::NonZeroU16, ops::ControlFlow};
 
@@ -894,8 +906,17 @@ fn prove_select(select: &Select) -> Result<(TableName, String, NonZeroU16), Rout
     else {
         return Err(RouteTemplateError::UnsupportedShape);
     };
-    if !optimizer_hints.is_empty()
-        || !is_plain_wildcard(projection)
+    // Core PostgreSQL lexes `/*+ … */` as an ordinary comment: `xcstart` is
+    // `\/\*{op_chars}*` and the rule throws the `+` back
+    // (`src/backend/parser/scan.l:328`, `scan.l:447-454`). Rejecting it
+    // therefore costs a route PostgreSQL alone would have served, and that is
+    // deliberate: the candidate parser surfaces the comment as a hint because
+    // an extension can give it directive meaning, and nothing proven here
+    // establishes that no such extension is loaded on the shard.
+    if !optimizer_hints.is_empty() {
+        return Err(RouteTemplateError::UnsupportedShape);
+    }
+    if !is_plain_wildcard(projection)
         || from.len() != 1
         || !lateral_views.is_empty()
         || !connect_by.is_empty()
@@ -1054,6 +1075,15 @@ pub enum RouteTemplateError {
 
 /// Parses exactly one bounded candidate statement using a `PostgreSQL` dialect.
 ///
+/// Statement boundaries are decided by [`postgres_lexer`], which models
+/// `PostgreSQL` 18's own `src/backend/parser/scan.l`, not by the candidate
+/// parser's tokenizer. The two disagree — most visibly about dollar-quote tags,
+/// where `scan.l:285` forbids a leading digit that the candidate tokenizer
+/// accepts — and only `PostgreSQL`'s answer describes what a backend would
+/// execute. A returned statement therefore carries a fail-closed claim that
+/// `PostgreSQL` either sees exactly one statement in `sql` or refuses the whole
+/// input before executing any of it.
+///
 /// # Errors
 ///
 /// Rejects oversized input, embedded zero bytes, invalid or overly recursive
@@ -1068,6 +1098,12 @@ pub fn parse_one(sql: &str) -> Result<ParsedStatement, ParseError> {
     }
     if sql.as_bytes().contains(&0) {
         return Err(ParseError::EmbeddedZero);
+    }
+    match postgres_lexer::count_statements(sql) {
+        Ok(0) => return Err(ParseError::NoStatement),
+        Ok(1) => {}
+        Ok(_) => return Err(ParseError::MultipleStatements),
+        Err(postgres_lexer::UnterminatedLexeme) => return Err(ParseError::InvalidSyntax),
     }
 
     let dialect = PostgreSqlDialect {};
@@ -1113,7 +1149,11 @@ fn parse_tokens(
         .map_err(|error| ParseError::from_upstream(&error))?;
     while parser.consume_token(&Token::SemiColon) {}
     if parser.peek_token_ref().token != Token::EOF {
-        return Err(ParseError::MultipleStatements);
+        // PostgreSQL's lexer already proved there is one statement, so leftover
+        // candidate tokens mean the candidate parser stopped short of syntax
+        // PostgreSQL accepts — for example `U&"…"` — not that more statements
+        // follow.
+        return Err(ParseError::InvalidSyntax);
     }
     if statement.visit(&mut AstBudget::new()).is_break() {
         return Err(ParseError::TooManyAstNodes {
@@ -1302,16 +1342,19 @@ pub enum ParseError {
     /// `PostgreSQL` protocol strings cannot contain embedded zero bytes.
     #[error("SQL contains an embedded zero byte")]
     EmbeddedZero,
-    /// The candidate parser rejected the syntax.
+    /// The syntax is not supported: either `PostgreSQL`'s lexer cannot finish
+    /// the input, or the candidate parser rejected or did not consume it. The
+    /// last case includes single statements `PostgreSQL` accepts and the
+    /// candidate parser does not, such as `U&"…"` identifiers.
     #[error("SQL syntax is not supported")]
     InvalidSyntax,
     /// The syntax tree exceeds the bounded recursion depth.
     #[error("SQL syntax exceeds the planner recursion limit")]
     RecursionLimit,
-    /// No nonempty statement was supplied.
+    /// `PostgreSQL`'s lexer finds no nonempty statement.
     #[error("expected one SQL statement, received none")]
     NoStatement,
-    /// Input remains after the first statement.
+    /// `PostgreSQL`'s lexer finds more than one statement.
     #[error("expected one SQL statement, received multiple")]
     MultipleStatements,
 }
@@ -1520,6 +1563,74 @@ mod tests {
             ParseError::MultipleStatements
         );
         assert!(parse_one(";;; select 1;;;").is_ok());
+    }
+
+    #[test]
+    fn statement_boundaries_follow_postgres_not_the_candidate_tokenizer() {
+        // `scan.l:285` defines `dolq_start [A-Za-z\200-\377_]`, so PostgreSQL
+        // reads `$1` as `{param}` and the following `$` as `{other}` and the
+        // `;` separates two statements. The candidate tokenizer accepts a tag
+        // of `1` and swallows `; select 2` into one dollar-quoted string.
+        assert_eq!(
+            parse_one("select $1$; select 2 $1$").expect_err("two statements"),
+            ParseError::MultipleStatements
+        );
+        // The same byte class admits every byte of a multi-byte character, so
+        // `$§$` opens a body PostgreSQL closes at the matching delimiter. Here
+        // PostgreSQL sees one statement, so reporting multiple would be false.
+        assert_eq!(
+            parse_one("select $\u{a7}$; select 2 $\u{a7}$")
+                .expect_err("candidate tokenizer disagrees"),
+            ParseError::InvalidSyntax
+        );
+        // `ident_cont` contains `$` (`scan.l:333`), so `x$q$` is one identifier
+        // and the `;` after it is a separator.
+        assert_eq!(
+            parse_one("select x$q$; select 2").expect_err("two statements"),
+            ParseError::MultipleStatements
+        );
+        assert!(parse_one("select $q$; select 2 $q$").is_ok());
+    }
+
+    #[test]
+    fn one_statement_the_candidate_parser_cannot_read_is_not_multiple() {
+        // `scan.l:301` defines `xuistart [uU]&{dquote}`, so each of these is a
+        // single PostgreSQL statement. The candidate parser stops early and
+        // leaves tokens behind; calling that "multiple statements" would both
+        // be untrue and hide why the route was lost.
+        for sql in [
+            "select * from U&\"public\".U&\"events\" where tenant_id = $1",
+            "select U&\"d\\0061t\" uescape '\\' from public.events",
+            "select * from public.events where tenant_id = $\u{a7}$1$\u{a7}$",
+        ] {
+            assert_eq!(
+                parse_one(sql).expect_err("candidate parser cannot read"),
+                ParseError::InvalidSyntax,
+                "unexpected error class for {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unterminated_postgres_lexeme_is_rejected_before_parsing() {
+        for sql in [
+            "select 1 /* unterminated",
+            "select $tag$ unterminated",
+            "select \"unterminated",
+            "select 'unterminated",
+            // `$§$` opens a body PostgreSQL never closes (`scan.l:787`), while
+            // the candidate parser reads a placeholder and an alias and
+            // succeeds.
+            "select $\u{a7}$",
+            "select $\u{a7}$ from public.events",
+            "select 1, $\u{a7}$",
+        ] {
+            assert_eq!(
+                parse_one(sql).expect_err("unterminated lexeme"),
+                ParseError::InvalidSyntax,
+                "unexpected error class for {sql}"
+            );
+        }
     }
 
     #[test]
@@ -1825,6 +1936,7 @@ mod tests {
             "select * from public.events where tenant_id == $1",
             "select top 1 * from public.events where tenant_id = $1",
             "select * from públic.events where tenant_id = $1",
+            "select /*+ IndexScan(events) */ * from public.events where tenant_id = $1",
         ] {
             let rejected = parse_one(sql).map_or(true, |statement| {
                 let (snapshot, database_id) = route_snapshot();

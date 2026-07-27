@@ -3812,7 +3812,11 @@ var postgresqlLiteralEscapes = strings.NewReplacer("'", "''", `\`, `\\`)
 // Mirrors quote_literal_internal (src/backend/utils/adt/quote.c): doubling the
 // backslash as well as the quote and prefixing E when any backslash is present
 // makes the literal correct under either standard_conforming_strings, so the
-// result does not depend on the session that executes it.
+// result does not depend on the session that executes it. That independence is
+// load-bearing rather than theoretical: the bootstrap PGOPTIONS does not pin
+// the setting and ALTER DATABASE shardschema RESET ALL runs only after these
+// files execute, so a database-scoped off restored with a foreign PGDATA is
+// live while genesis runs.
 func postgresqlStringLiteral(value string) string {
 	quoted := "'" + postgresqlLiteralEscapes.Replace(value) + "'"
 	if strings.ContainsRune(value, '\\') {
