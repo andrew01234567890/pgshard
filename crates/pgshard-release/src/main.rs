@@ -641,6 +641,10 @@ fn audit_plain_content(path: &str, content: &str) -> Result<()> {
             "content in {path} carries a collapsed private key"
         );
         ensure!(
+            !carries_libgcrypt_private_key(line),
+            "content in {path} carries a private key as an s-expression"
+        );
+        ensure!(
             !carries_prefixed_credential(line),
             "content in {path} matched a forbidden sensitive-data pattern"
         );
@@ -897,6 +901,28 @@ fn decoded_key_candidate(candidate: &str) -> Option<Vec<u8>> {
     )
     .ok()?;
     (decoded.len() >= MIN_DECODED).then_some(decoded)
+}
+
+/// Where a modern `gnupg` actually keeps a secret key is neither a keyring nor a
+/// PEM block. `private-keys-v1.d/<keygrip>.key` is a plain-ASCII s-expression
+/// holding the key's own parameters as hexadecimal, the private exponent among
+/// them and in the clear when the key has no passphrase. Nothing is encoded, no
+/// delimiter appears and no structure is reachable by decoding, so the token the
+/// format opens its key with is the only thing there is to recognise. Measured
+/// on real `gnupg` 2.4 output, all four files it wrote went through unread.
+///
+/// The token is matched with the parenthesis the s-expression opens its algorithm
+/// with, which is what separates the format from prose naming it, from a path
+/// mentioning the directory, and from an identifier that merely reads the same.
+/// The shadowed form is deliberately absent: it stands in for a key held on a
+/// card and carries no secret to leak.
+fn carries_libgcrypt_private_key(line: &str) -> bool {
+    [
+        ["(private-", "key ("].concat(),
+        ["(protected-private-", "key ("].concat(),
+    ]
+    .iter()
+    .any(|token| line.contains(token.as_str()))
 }
 
 /// A traditional encrypted key has no structure to decode: the encryption
@@ -3730,6 +3756,48 @@ mod tests {
             is_der_private_key(&public),
             "the labelled path is deliberately the broader of the two"
         );
+    }
+
+    /// The file a modern `gnupg` actually keeps a secret key in is a plain text
+    /// s-expression, which no delimiter marks and no decoding reaches. Measured
+    /// against real `gnupg` 2.4 output: all four files it wrote into
+    /// `private-keys-v1.d` went through the audit unread, two of them with the
+    /// private exponent in the clear.
+    #[test]
+    fn a_key_written_as_an_s_expression_is_refused() {
+        let opening = |token: &str| ["(", token, "-", "key ("].concat();
+        for token in ["private", "protected-private"] {
+            let key = format!(
+                "Key: {}rsa (n #00A9F91D2B0ACE094446BC27EE8373C784BCB7A1C9BC#)",
+                opening(token)
+            );
+            assert!(
+                audit_content("k.key", &key).is_err(),
+                "a key written as {token} must be refused"
+            );
+            // The same file as `gnupg` lays it out, with the timestamp above it.
+            let stored = format!("Created: 20260727T130823\n{key}\n");
+            assert!(audit_content_bytes("private-keys-v1.d/k.key", stored.as_bytes()).is_err());
+        }
+
+        // The token is matched with the parenthesis its algorithm opens with, so
+        // naming the format is not writing one. The shadowed form stands in for
+        // a key held on a card and has no secret to leak.
+        for innocent in [
+            "the agent keeps each one as a private-key s-expression".to_owned(),
+            "fn private_key(bytes: &[u8]) -> Key { todo!() }".to_owned(),
+            "see ~/.gnupg/private-keys-v1.d for the keygrip".to_owned(),
+            "(define (private-key material) (car material))".to_owned(),
+            format!(
+                "Key: {}rsa (card-serial #D276#))",
+                ["(", "shadowed-private", "-", "key ("].concat()
+            ),
+        ] {
+            assert!(
+                audit_content("ok.md", &innocent).is_ok(),
+                "naming the format is not writing one: {innocent}"
+            );
+        }
     }
 
     /// This gate reads every line of every blob in history, so what it costs to
