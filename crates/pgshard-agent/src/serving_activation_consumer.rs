@@ -236,6 +236,7 @@ mod tests {
         PostmasterIncarnation {
             boot_id: "fixture-boot".to_owned(),
             pid,
+            start_ticks: u64::from(pid) * 10,
         }
     }
 

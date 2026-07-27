@@ -36,7 +36,9 @@ use std::io::{Read as _, Write as _};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::panic::AssertUnwindSafe;
 use std::path::{Component, Path, PathBuf};
+use std::task::Poll;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{
@@ -65,16 +67,29 @@ const SERVING_POLICY_STAGING_FILE: &str = ".pg_hba.serving.staging";
 
 /// The exact postmaster an activation is bound to.
 ///
-/// A pid is not on its own an identity — pids are reused within a boot — so it
-/// is paired with the boot it was observed in, and the dispatch goes through a
-/// retained pidfd rather than the pid, which is what makes the signal
-/// incarnation-exact regardless of reuse.
+/// A pid is not an identity and neither is a pid paired with a boot. Pairing
+/// with the boot rules out reuse *across* boots; reuse *within* one is the
+/// common case here, because a restarted container gets a fresh pid namespace
+/// whose pids start at 1 while the host boot identifier does not change, so the
+/// replacement postmaster very likely has the pid its predecessor had. A
+/// durable record compared after a restart has no pidfd to fall back on, so the
+/// identity itself has to distinguish them.
+///
+/// The kernel's process start time does. `PostgreSQL` reaches for the same
+/// distinguisher for the same reason: `CreateLockFile` in
+/// `src/backend/utils/init/miscinit.c` writes the postmaster start time into
+/// `postmaster.pid` so a stale lock file naming a recycled pid can be told from
+/// a live one. `starttime` is field 22 of `/proc/<pid>/stat` (`proc(5)`),
+/// measured against the host boot rather than the namespace, so it separates
+/// two pid-1 postmasters in successive containers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PostmasterIncarnation {
     /// Canonical Linux boot identifier the pid was observed in.
     pub boot_id: String,
     /// Process identifier of the supervised postmaster.
     pub pid: u32,
+    /// Kernel start time of that process, in clock ticks since the host boot.
+    pub start_ticks: u64,
 }
 
 /// A postmaster incarnation the caller still holds open.
@@ -97,17 +112,30 @@ impl RetainedPostmaster {
 
     /// Opens a pidfd for a child the caller supervises.
     ///
+    /// The start time is read on both sides of the open. Between the two reads
+    /// the pidfd exists, so a pid recycled in that window changes the answer and
+    /// is refused rather than recorded under the wrong identity.
+    ///
     /// # Errors
     ///
     /// Returns the raw `pidfd_open` failure, which is `ESRCH` for a process
-    /// that has already been reaped.
+    /// that has already been reaped, or `ESRCH` when the start time cannot be
+    /// read or did not hold still.
     pub fn open(pid: u32, boot_id: String) -> Result<Self, Errno> {
         let raw = i32::try_from(pid).map_err(|_| Errno::SRCH)?;
         let handle = Pid::from_raw(raw).ok_or(Errno::SRCH)?;
+        let before = process_start_ticks(pid).ok_or(Errno::SRCH)?;
         let pidfd = pidfd_open(handle, PidfdFlags::empty())?;
+        if process_start_ticks(pid) != Some(before) {
+            return Err(Errno::SRCH);
+        }
         Ok(Self {
             pidfd,
-            incarnation: PostmasterIncarnation { boot_id, pid },
+            incarnation: PostmasterIncarnation {
+                boot_id,
+                pid,
+                start_ticks: before,
+            },
         })
     }
 
@@ -245,6 +273,9 @@ pub enum ServingReloadProbe {
 pub enum FenceReason {
     /// Authority was lost after the sealed policy reached the disk.
     AuthorityLost,
+    /// The sealed policy reached the path but the install could not be
+    /// confirmed, so what the next reload would load is unknown.
+    UnconfirmedInstall,
     /// The signal could not be dispatched to a determinate conclusion.
     IndeterminateReload,
     /// The postmaster is still running the policy it started with, so the
@@ -260,6 +291,7 @@ impl FenceReason {
     const fn label(self) -> &'static str {
         match self {
             Self::AuthorityLost => "authority was lost",
+            Self::UnconfirmedInstall => "the installed policy could not be confirmed",
             Self::IndeterminateReload => "the reload signal had no determinate outcome",
             Self::ReloadRefused => "the postmaster kept the policy it started with",
             Self::UnprovedReload => "the loaded policy could not be determined",
@@ -477,6 +509,27 @@ pub enum ServingPolicyInstall {
     Installed,
 }
 
+/// Why an install failed, and — the part that matters — whether the sealed
+/// policy is already at the path.
+///
+/// The rename is the instant the policy goes live. It is visible to anything
+/// that opens the path from that moment, whether or not the directory entry has
+/// reached the disk, so several steps that follow it can fail with the sealed
+/// policy already in force. Splitting the failure here is what stops a caller
+/// from reading "the install failed" as "nothing happened".
+#[derive(Debug, Error)]
+pub enum ServingPolicyInstallError {
+    /// Failed before the rename. The path still holds the previous policy, so
+    /// there is nothing to undo and nothing to fence.
+    #[error("the serving policy was not installed: {0}")]
+    NotInstalled(#[source] ServingActivationError),
+    /// Failed at or after the rename. The sealed policy may already be the one
+    /// a reload would load, so the postmaster it was installed for has to be
+    /// fenced.
+    #[error("the serving policy may be live but was not confirmed: {0}")]
+    MayBeLive(#[source] ServingActivationError),
+}
+
 /// Installs the sealed policy at the runtime path the postmaster reads.
 ///
 /// The write is staged in the same directory, flushed, sealed read-only and
@@ -492,49 +545,61 @@ pub enum ServingPolicyInstall {
 ///
 /// # Errors
 ///
-/// Returns a typed filesystem or validation failure. Nothing is left partially
-/// installed: the live path holds either the previous policy or the sealed one.
+/// Returns [`ServingPolicyInstallError`], whose two arms say whether the sealed
+/// policy is at the path. Nothing is left partially installed either way: the
+/// live path holds the whole previous policy or the whole sealed one.
 pub fn install_serving_policy(
     path: &Path,
     expected_uid: u32,
     policy: &SealedServingPolicy,
-) -> Result<ServingPolicyInstall, ServingActivationError> {
-    if installed_exactly(path, expected_uid, policy)? {
+) -> Result<ServingPolicyInstall, ServingPolicyInstallError> {
+    // Every step up to the rename can only fail with the previous policy still
+    // in place, so they are gathered where that is true of all of them at once.
+    let staged = (|| {
+        let parent = path
+            .parent()
+            .ok_or_else(|| ServingActivationError::InvalidPath {
+                path: path.to_owned(),
+            })?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| ServingActivationError::InvalidPath {
+                path: path.to_owned(),
+            })?;
+        if installed_exactly(path, expected_uid, policy)? {
+            return Ok(None);
+        }
+        let directory = open_directory(parent)?;
+        // The policy directory is created by the spawn path, which allows group
+        // and world read. Only writability is a policy question here.
+        validate_directory(parent, &directory, expected_uid, 0o022)?;
+        let staging = parent.join(SERVING_POLICY_STAGING_FILE);
+        remove_if_present(&directory, SERVING_POLICY_STAGING_FILE, &staging)?;
+
+        let descriptor = openat(
+            &directory,
+            SERVING_POLICY_STAGING_FILE,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|source| io_error("create staged serving policy", &staging, source.into()))?;
+        let mut file = File::from(descriptor);
+        file.write_all(policy.bytes())
+            .and_then(|()| file.sync_all())
+            .and_then(|()| file.set_permissions(fs::Permissions::from_mode(0o400)))
+            .map_err(|source| io_error("write staged serving policy", &staging, source))?;
+        drop(file);
+        #[cfg(test)]
+        crash_checkpoint(CrashCheckpoint::PolicyStaged)?;
+        Ok(Some((directory, parent, name)))
+    })()
+    .map_err(ServingPolicyInstallError::NotInstalled)?;
+    let Some((directory, parent, name)) = staged else {
         return Ok(ServingPolicyInstall::AlreadyInstalled);
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| ServingActivationError::InvalidPath {
-            path: path.to_owned(),
-        })?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| ServingActivationError::InvalidPath {
-            path: path.to_owned(),
-        })?;
-    let directory = open_directory(parent)?;
-    // The policy directory is created by the spawn path, which allows group and
-    // world read. Only writability is a policy question here.
-    validate_directory(parent, &directory, expected_uid, 0o022)?;
-    let staging = parent.join(SERVING_POLICY_STAGING_FILE);
-    remove_if_present(&directory, SERVING_POLICY_STAGING_FILE, &staging)?;
+    };
 
-    let descriptor = openat(
-        &directory,
-        SERVING_POLICY_STAGING_FILE,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .map_err(|source| io_error("create staged serving policy", &staging, source.into()))?;
-    let mut file = File::from(descriptor);
-    file.write_all(policy.bytes())
-        .and_then(|()| file.sync_all())
-        .and_then(|()| file.set_permissions(fs::Permissions::from_mode(0o400)))
-        .map_err(|source| io_error("write staged serving policy", &staging, source))?;
-    drop(file);
-    #[cfg(test)]
-    crash_checkpoint(CrashCheckpoint::PolicyStaged)?;
-
+    // A rename that fails did not happen, so its own failure still leaves the
+    // previous policy in place.
     renameat_with(
         &directory,
         SERVING_POLICY_STAGING_FILE,
@@ -542,24 +607,38 @@ pub fn install_serving_policy(
         name,
         RenameFlags::empty(),
     )
-    .map_err(|source| io_error("install staged serving policy", path, source.into()))?;
-    #[cfg(test)]
-    crash_checkpoint(CrashCheckpoint::PolicyRenamed)?;
-    #[cfg(test)]
-    tamper_with_the_installed_policy_if_requested(path);
-    directory
-        .sync_all()
-        .map_err(|source| io_error("flush serving policy directory", parent, source))?;
+    .map_err(|source| {
+        ServingPolicyInstallError::NotInstalled(io_error(
+            "install staged serving policy",
+            path,
+            source.into(),
+        ))
+    })?;
 
-    // The postmaster runs as the same identity as the agent, so "this process
-    // just wrote it" is not the same claim as "this is what is there now".
-    if !installed_exactly(path, expected_uid, policy)? {
-        return Err(ServingActivationError::UnsafeObject {
-            path: path.to_owned(),
-            reason: "the installed serving policy did not survive its own write",
-        });
-    }
-    Ok(ServingPolicyInstall::Installed)
+    // The sealed policy is live from here. Anything that opens the path now
+    // gets it, flushed or not, so every remaining failure has to say so.
+    (|| {
+        #[cfg(test)]
+        crash_checkpoint(CrashCheckpoint::PolicyRenamed)?;
+        #[cfg(test)]
+        tamper_with_the_installed_policy_if_requested(path);
+        directory
+            .sync_all()
+            .map_err(|source| io_error("flush serving policy directory", parent, source))?;
+
+        // The postmaster runs as the same identity as the agent, so "this
+        // process just wrote it" is not the same claim as "this is what is
+        // there now".
+        if installed_exactly(path, expected_uid, policy)? {
+            Ok(ServingPolicyInstall::Installed)
+        } else {
+            Err(ServingActivationError::UnsafeObject {
+                path: path.to_owned(),
+                reason: "the installed serving policy did not survive its own write",
+            })
+        }
+    })()
+    .map_err(ServingPolicyInstallError::MayBeLive)
 }
 
 /// Runs one activation attempt against one bound incarnation.
@@ -594,10 +673,20 @@ where
     if let Some(proof) = journal.arm(policy, bound)? {
         return Ok(ServingActivationOutcome::Serving(proof));
     }
-    install_serving_policy(hba_path, expected_uid, policy)?;
+    match install_serving_policy(hba_path, expected_uid, policy) {
+        Ok(_) => {}
+        // The path still holds the policy the postmaster started under, so
+        // nothing happened and saying so is honest.
+        Err(ServingPolicyInstallError::NotInstalled(error)) => return Err(error),
+        // The sealed policy is at the path without a confirmed install, which
+        // is the same exposure as an unproved reload.
+        Err(ServingPolicyInstallError::MayBeLive(error)) => {
+            return Ok(journal.fence(bound, FenceReason::UnconfirmedInstall, &error.to_string()));
+        }
+    }
 
-    // From here the sealed policy is on disk under a postmaster that has not
-    // been proved to have loaded it, so every exit is an outcome.
+    // From here the sealed policy is at the path under a postmaster that has
+    // not been proved to have loaded it, so every exit is an outcome.
     for phase in [Phase::Installed, Phase::Reloading] {
         if let Err(error) = journal.record(phase, policy, bound) {
             return Ok(journal.fence(bound, FenceReason::UnrecordedProgress, &error.to_string()));
@@ -608,50 +697,123 @@ where
         return Ok(journal.fence(bound, reason, reason.label()));
     }
 
-    let observed = probe().await;
-    match observed {
-        ServingReloadProbe::ServingRulesInEffect => {}
-        ServingReloadProbe::NonServingRulesStillInEffect => {
-            return Ok(journal.fence(
-                bound,
-                FenceReason::ReloadRefused,
-                FenceReason::ReloadRefused.label(),
-            ));
-        }
-        ServingReloadProbe::Indeterminate => {
-            return Ok(journal.fence(
-                bound,
-                FenceReason::UnprovedReload,
-                FenceReason::UnprovedReload.label(),
-            ));
-        }
-    }
+    // The signal has gone out. The one await left is the probe, and a task can
+    // be cancelled at an await: a dropped future runs nothing but destructors,
+    // so no arm of this function would be reached and no caller would learn to
+    // stop the postmaster. The sentinel makes the fence durable in that case,
+    // which is the record the next incarnation reads.
+    let mut dispatched = DispatchedReload {
+        journal,
+        bound,
+        armed: true,
+    };
+    let observed = probe_without_unwinding(probe).await;
+    let refusal = match observed {
+        ServingReloadProbe::ServingRulesInEffect => None,
+        ServingReloadProbe::NonServingRulesStillInEffect => Some(FenceReason::ReloadRefused),
+        ServingReloadProbe::Indeterminate => Some(FenceReason::UnprovedReload),
+    };
     // The probe awaited, so the authority it ran under is evidence about then
     // and not about now. A postmaster that is serving without current authority
     // is exactly what must not keep running.
-    if !holds_authority(authority, bound) {
-        return Ok(journal.fence(
-            bound,
-            FenceReason::AuthorityLost,
-            FenceReason::AuthorityLost.label(),
-        ));
+    let reason = refusal.or_else(|| {
+        (!holds_authority(authority, dispatched.bound)).then_some(FenceReason::AuthorityLost)
+    });
+    if let Some(reason) = reason {
+        dispatched.armed = false;
+        return Ok(dispatched.journal.fence(bound, reason, reason.label()));
     }
-    match journal.record(Phase::Serving, policy, bound) {
-        Ok(()) => Ok(ServingActivationOutcome::Serving(ServingProof {
-            incarnation: bound.incarnation.clone(),
-            policy_sha256: policy.sha256().to_owned(),
-        })),
-        Err(error) => Ok(journal.fence(bound, FenceReason::UnrecordedProgress, &error.to_string())),
+    match dispatched.journal.record(Phase::Serving, policy, bound) {
+        Ok(()) => {
+            dispatched.armed = false;
+            Ok(ServingActivationOutcome::Serving(ServingProof {
+                incarnation: bound.incarnation.clone(),
+                policy_sha256: policy.sha256().to_owned(),
+            }))
+        }
+        Err(error) => {
+            dispatched.armed = false;
+            Ok(dispatched
+                .journal
+                .fence(bound, FenceReason::UnrecordedProgress, &error.to_string()))
+        }
     }
+}
+
+/// Records the fence if an attempt stops existing after its reload went out.
+///
+/// Cancellation is not an error path a `?` can carry: the future is dropped and
+/// only destructors run. This is the destructor that leaves the durable record
+/// behind, and it is disarmed on every path that produces an outcome instead.
+struct DispatchedReload<'a> {
+    journal: &'a mut ServingActivationJournal,
+    bound: &'a BoundServingAttempt,
+    armed: bool,
+}
+
+impl Drop for DispatchedReload<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        tracing::error!(
+            pid = self.bound.incarnation.pid,
+            "serving activation stopped after its reload was dispatched; recording a fence"
+        );
+        if let Err(error) = self.journal.write_fence(self.bound) {
+            tracing::error!(reason = %error, "could not record that fence");
+        }
+    }
+}
+
+/// Runs the probe so that a panic inside it is an answer rather than an escape.
+///
+/// The probe is caller-supplied and runs after the signal, so letting it unwind
+/// out of here would leave a reloaded postmaster with nothing to conclude. A
+/// panic is exactly as informative as a probe that could not tell, so it is
+/// reported as that and fences.
+///
+/// The inner future is boxed so it can be pinned without `unsafe`, and it is
+/// never polled again after a panic.
+async fn probe_without_unwinding<P, F>(probe: P) -> ServingReloadProbe
+where
+    P: FnOnce() -> F,
+    F: Future<Output = ServingReloadProbe>,
+{
+    let started = std::panic::catch_unwind(AssertUnwindSafe(|| Box::pin(probe())));
+    let Ok(mut probe) = started else {
+        tracing::error!("the serving reload probe panicked before it ran");
+        return ServingReloadProbe::Indeterminate;
+    };
+    std::future::poll_fn(|context| {
+        let Ok(polled) =
+            std::panic::catch_unwind(AssertUnwindSafe(|| probe.as_mut().poll(context)))
+        else {
+            tracing::error!("the serving reload probe panicked");
+            return Poll::Ready(ServingReloadProbe::Indeterminate);
+        };
+        polled
+    })
+    .await
 }
 
 /// Re-derives every fact the reload rests on and signals, with nothing awaited
 /// in between.
 ///
-/// This is synchronous for a reason a comment cannot enforce but a signature
-/// can: there is no point inside it at which the task can be descheduled, so
-/// the checks and the signal are one step as far as every asynchronous
-/// withdrawal upstream is concerned.
+/// Synchronous is not atomic, and this does not claim to be. Other threads hold
+/// and withdraw the authority these checks read, so a withdrawal landing between
+/// the last check and `pidfd_send_signal` is reachable in wall-clock time and no
+/// arrangement of synchronous checks can close it. What the signature does buy
+/// is that *this* task cannot be descheduled in the middle, which removes the
+/// unbounded gap an `await` here would open.
+///
+/// The gap that remains is not relied upon. A dispatched signal is not a
+/// serving postmaster: `load_hba` may keep the rules it had, so an outcome of
+/// `Serving` requires a probe afterwards *and* [`holds_authority`] re-derived
+/// after it — the same predicate this function checks, so a withdrawal anywhere
+/// around the signal is caught on the far side and fences. Closing the window
+/// itself would need the reload to be atomic with the authority, and it cannot
+/// be: the postmaster acts on `SIGHUP` asynchronously whatever the sender holds.
 ///
 /// The liveness check that precedes the signal is not what makes the dispatch
 /// exact — a process can exit immediately after it. The pidfd is: a signal sent
@@ -661,21 +823,12 @@ fn authorize_and_dispatch_reload<A: ServingReloadAuthority>(
     authority: &A,
     bound: &BoundServingAttempt,
 ) -> Result<(), FenceReason> {
-    if !authority.materialization_is_current() {
-        return Err(FenceReason::AuthorityLost);
-    }
-    if authority.writable_generation().as_ref() != Some(&bound.generation) {
-        return Err(FenceReason::AuthorityLost);
-    }
-    if !authority.target_fence_is_installed() {
+    if !holds_authority(authority, bound) {
         return Err(FenceReason::AuthorityLost);
     }
     let Some(postmaster) = authority.postmaster() else {
         return Err(FenceReason::AuthorityLost);
     };
-    if postmaster.incarnation() != &bound.incarnation || !postmaster.is_live() {
-        return Err(FenceReason::AuthorityLost);
-    }
     match postmaster.dispatch_reload() {
         Ok(()) => Ok(()),
         // The process is gone, so nothing was reloaded. That much is
@@ -686,13 +839,20 @@ fn authorize_and_dispatch_reload<A: ServingReloadAuthority>(
     }
 }
 
+/// Every fact an activation rests on, in one predicate.
+///
+/// Deliberately one predicate rather than two similar ones. It is checked
+/// immediately before the signal and again after the probe, and the value of
+/// the second check is that it asks exactly the same question as the first —
+/// a check that omitted liveness would let a postmaster that died during the
+/// probe be reported as serving.
 fn holds_authority<A: ServingReloadAuthority>(authority: &A, bound: &BoundServingAttempt) -> bool {
     authority.materialization_is_current()
         && authority.writable_generation().as_ref() == Some(&bound.generation)
         && authority.target_fence_is_installed()
-        && authority
-            .postmaster()
-            .is_some_and(|postmaster| postmaster.incarnation() == &bound.incarnation)
+        && authority.postmaster().is_some_and(|postmaster| {
+            postmaster.incarnation() == &bound.incarnation && postmaster.is_live()
+        })
 }
 
 /// The durable state of serving activation for one journal directory.
@@ -812,21 +972,25 @@ impl ServingActivationJournal {
     ) -> Result<Option<ServingProof>, ServingActivationError> {
         self.with_exclusive_lock(|journal| {
             journal.validate_entries()?;
-            if let Some(existing) = journal.read_state()?
-                && existing.describes(policy, bound)?
-            {
-                match existing.phase()? {
-                    Phase::Serving => {
-                        return Ok(Some(ServingProof {
-                            incarnation: bound.incarnation.clone(),
-                            policy_sha256: existing.policy_sha256,
-                        }));
-                    }
-                    Phase::Fenced => return Err(ServingActivationError::AlreadyFenced),
-                    // An interrupted attempt for this same incarnation replays
-                    // from the beginning: every check is repeated and no
-                    // recorded progress is inherited.
-                    Phase::Armed | Phase::Installed | Phase::Reloading => {}
+            if let Some(existing) = journal.read_state()? {
+                // A fence is terminal for the incarnation it names, and is
+                // keyed on that alone. A later attempt presenting a different
+                // sealed policy or a newer generation is still an attempt to
+                // reload the same process the supervisor was told to stop, and
+                // arming it would erase the only durable record of that.
+                if existing.phase()? == Phase::Fenced
+                    && existing.incarnation()? == bound.incarnation
+                {
+                    return Err(ServingActivationError::AlreadyFenced);
+                }
+                // Replay is keyed on the whole attempt, because a proof is a
+                // claim about one policy under one generation and says nothing
+                // about another. Anything else starts over and proves again.
+                if existing.phase()? == Phase::Serving && existing.describes(policy, bound)? {
+                    return Ok(Some(ServingProof {
+                        incarnation: bound.incarnation.clone(),
+                        policy_sha256: existing.policy_sha256,
+                    }));
                 }
             }
             journal
@@ -919,6 +1083,7 @@ impl ServingActivationJournal {
             policy_sha256: policy.sha256().to_owned(),
             boot_id: bound.incarnation.boot_id.clone(),
             postmaster_pid: bound.incarnation.pid.to_string(),
+            postmaster_start_ticks: bound.incarnation.start_ticks.to_string(),
             generation: generation_text(&bound.generation),
             persistence: FSYNC_PERSISTENCE.to_owned(),
             persisted_at_unix_ms: persisted_at_unix_ms()?,
@@ -1138,6 +1303,7 @@ struct StateRecord {
     #[serde(rename = "bootID")]
     boot_id: String,
     postmaster_pid: String,
+    postmaster_start_ticks: String,
     generation: String,
     persistence: String,
     #[serde(rename = "persistedAtUnixMS")]
@@ -1152,13 +1318,15 @@ impl StateRecord {
     }
 
     fn incarnation(&self) -> Result<PostmasterIncarnation, ServingActivationError> {
-        let pid =
-            canonical_pid(&self.postmaster_pid).ok_or(ServingActivationError::CorruptRecord {
-                path: PathBuf::from(STATE_FILE),
-            })?;
+        let corrupt = || ServingActivationError::CorruptRecord {
+            path: PathBuf::from(STATE_FILE),
+        };
+        let pid = u32::try_from(canonical_decimal(&self.postmaster_pid).ok_or_else(corrupt)?)
+            .map_err(|_| corrupt())?;
         Ok(PostmasterIncarnation {
             boot_id: self.boot_id.clone(),
             pid,
+            start_ticks: canonical_decimal(&self.postmaster_start_ticks).ok_or_else(corrupt)?,
         })
     }
 
@@ -1179,9 +1347,9 @@ impl StateRecord {
     }
 }
 
-/// Rejects a pid that is not canonical decimal, so one record cannot name two
-/// different spellings of the same number.
-fn canonical_pid(value: &str) -> Option<u32> {
+/// Rejects a number that is not canonical decimal, so one record cannot name
+/// two different spellings of the same value.
+fn canonical_decimal(value: &str) -> Option<u64> {
     if value.is_empty() || (value.len() > 1 && value.starts_with('0')) {
         return None;
     }
@@ -1189,6 +1357,22 @@ fn canonical_pid(value: &str) -> Option<u32> {
         return None;
     }
     value.parse().ok()
+}
+
+/// Reads a process's kernel start time from `/proc/<pid>/stat`.
+///
+/// `comm` is parenthesised and may itself contain spaces and parentheses, so
+/// the fixed-position fields only begin after its last `)`. `starttime` is
+/// field 22 overall, which is the twentieth field after that point.
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    const STARTTIME_FIELDS_AFTER_COMM: usize = 19;
+    let stat = fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let tail = stat.rsplit(|byte| *byte == b')').next()?;
+    let field = tail
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty())
+        .nth(STARTTIME_FIELDS_AFTER_COMM)?;
+    std::str::from_utf8(field).ok()?.parse().ok()
 }
 
 fn generation_text(generation: &DurableWritableGeneration) -> String {
@@ -1442,6 +1626,8 @@ mod tests {
     use std::cell::Cell;
     use std::os::unix::fs::symlink;
     use std::process::{Child, Command, Stdio};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use tempfile::TempDir;
@@ -1506,6 +1692,31 @@ host all all all reject\n";
 
         fn installed(&self) -> Vec<u8> {
             fs::read(&self.hba).expect("read the installed policy")
+        }
+    }
+
+    /// Counts probe calls.
+    ///
+    /// `probe_without_unwinding` turns a panicking probe into an answer on
+    /// purpose, so a test that means "this must never be probed" has to count
+    /// rather than panic -- a panic here would be swallowed and read as a
+    /// fence for the wrong reason.
+    #[derive(Default)]
+    struct ProbeLog(AtomicUsize);
+
+    impl ProbeLog {
+        fn calls(&self) -> usize {
+            self.0.load(Ordering::Acquire)
+        }
+    }
+
+    fn counting_probe(
+        log: Arc<ProbeLog>,
+        answer: ServingReloadProbe,
+    ) -> impl FnOnce() -> std::future::Ready<ServingReloadProbe> {
+        move || {
+            log.0.fetch_add(1, Ordering::AcqRel);
+            std::future::ready(answer)
         }
     }
 
@@ -1713,8 +1924,13 @@ host all all all reject\n";
         let error = install_serving_policy(&fixture.hba, uid(), &policy())
             .expect_err("a symlinked policy path is refused");
         assert!(
-            matches!(error, ServingActivationError::UnsafeObject { .. }),
-            "expected an unsafe object, got {error}"
+            matches!(
+                error,
+                ServingPolicyInstallError::NotInstalled(
+                    ServingActivationError::UnsafeObject { .. }
+                )
+            ),
+            "expected an unsafe object refused before the rename, got {error}"
         );
         assert_eq!(
             fs::read(&elsewhere).expect("read the target"),
@@ -1732,7 +1948,10 @@ host all all all reject\n";
         let _guard = inject_crash(CrashCheckpoint::PolicyStaged, 0);
         let error = install_serving_policy(&fixture.hba, uid(), &policy())
             .expect_err("the injected crash stops the install");
-        assert!(matches!(error, ServingActivationError::InjectedCrash));
+        assert!(matches!(
+            error,
+            ServingPolicyInstallError::NotInstalled(ServingActivationError::InjectedCrash)
+        ));
         assert_eq!(
             fixture.installed(),
             NON_SERVING,
@@ -1752,7 +1971,13 @@ host all all all reject\n";
         let _guard = inject_crash(CrashCheckpoint::PolicyRenamed, 0);
         let error = install_serving_policy(&fixture.hba, uid(), &policy())
             .expect_err("the injected crash stops the install");
-        assert!(matches!(error, ServingActivationError::InjectedCrash));
+        assert!(
+            matches!(
+                error,
+                ServingPolicyInstallError::MayBeLive(ServingActivationError::InjectedCrash)
+            ),
+            "a failure after the rename must say the sealed policy may be live, got {error}"
+        );
         assert_eq!(
             fixture.installed(),
             SERVING,
@@ -1868,11 +2093,17 @@ host all all all reject\n";
 
     /// The invariant a later incarnation depends on: a proof is about one
     /// process, and the next process is a different one.
+    ///
+    /// The case that matters most is the third. A restarted container keeps the
+    /// host boot identifier and gets a fresh pid namespace, so the replacement
+    /// postmaster very often has its predecessor's pid, and only the kernel
+    /// start time separates them.
     #[test]
     fn a_proof_never_admits_a_later_incarnation() {
         let proved = PostmasterIncarnation {
             boot_id: "boot-a".to_owned(),
             pid: 4242,
+            start_ticks: 900_100,
         };
         let recovery = ServingActivationRecovery::Proved {
             incarnation: proved.clone(),
@@ -1881,17 +2112,25 @@ host all all all reject\n";
         assert!(recovery.admits_serving(&proved));
         assert!(
             !recovery.admits_serving(&PostmasterIncarnation {
-                boot_id: "boot-a".to_owned(),
                 pid: 4243,
+                ..proved.clone()
             }),
             "a proof for one pid admitted another"
         );
         assert!(
             !recovery.admits_serving(&PostmasterIncarnation {
                 boot_id: "boot-b".to_owned(),
-                pid: 4242,
+                ..proved.clone()
             }),
             "a proof from one boot admitted a reused pid in another"
+        );
+        assert!(
+            !recovery.admits_serving(&PostmasterIncarnation {
+                start_ticks: 900_101,
+                ..proved.clone()
+            }),
+            "a proof admitted a replacement postmaster that reused the pid in the same boot, \
+             which is what a restarted container's pid namespace makes the common case"
         );
         for interrupted in [
             ServingActivationRecovery::Fresh,
@@ -1911,6 +2150,7 @@ host all all all reject\n";
 
     #[tokio::test]
     async fn an_exact_repeat_replays_the_proof_without_repeating_the_transition() {
+        let probes = Arc::new(ProbeLog::default());
         let fixture = Fixture::new();
         fixture.install_non_serving();
         let child = SignalledChild::start();
@@ -1940,11 +2180,15 @@ host all all all reject\n";
             &policy,
             &authority,
             &bound,
-            || async { panic!("a replay must not probe again") },
+            counting_probe(
+                Arc::clone(&probes),
+                ServingReloadProbe::ServingRulesInEffect,
+            ),
         )
         .await
         .expect("the replay returns an outcome");
         assert!(matches!(second, ServingActivationOutcome::Serving(_)));
+        assert_eq!(probes.calls(), 0, "a replay probed instead of replaying");
         std::thread::sleep(SETTLE);
         assert_eq!(
             child.hangups(),
@@ -2004,6 +2248,7 @@ host all all all reject\n";
             incarnation: PostmasterIncarnation {
                 boot_id: "an-older-boot".to_owned(),
                 pid: 1,
+                start_ticks: 1,
             },
             generation: durable_generation_for_test(6),
         };
@@ -2111,12 +2356,12 @@ host all all all reject\n";
         assert!(
             matches!(
                 error,
-                ServingActivationError::UnsafeObject {
+                ServingPolicyInstallError::MayBeLive(ServingActivationError::UnsafeObject {
                     reason: "the installed serving policy did not survive its own write",
                     ..
-                }
+                })
             ),
-            "expected a refusal of the installed policy, got {error}"
+            "expected a may-be-live refusal of the installed policy, got {error}"
         );
     }
 
@@ -2161,13 +2406,378 @@ host all all all reject\n";
         }
     }
 
+    /// The install's rename is what makes the sealed policy live, and several
+    /// steps run after it. Through `activate`, every one of them has to reach
+    /// a fence: the postmaster is running, the path holds a policy no proof
+    /// covers, and any later reload from any source would put it into effect.
+    ///
+    /// This goes through `activate` on purpose. The same fault checked against
+    /// `install_serving_policy` alone reports the right thing and still lets
+    /// the caller treat it as "nothing happened".
+    #[tokio::test]
+    async fn a_failure_after_the_policy_went_live_fences_rather_than_returning_an_error() {
+        let probes = Arc::new(ProbeLog::default());
+        let fixture = Fixture::new();
+        fixture.install_non_serving();
+        let child = SignalledChild::start();
+        let authority = FakeAuthority::complete(&child);
+        let bound = bound(&child);
+        let mut journal = fixture.journal();
+
+        let _guard = tamper_after_the_next_policy_rename();
+        let outcome = activate(
+            &mut journal,
+            &fixture.hba,
+            uid(),
+            &policy(),
+            &authority,
+            &bound,
+            counting_probe(
+                Arc::clone(&probes),
+                ServingReloadProbe::ServingRulesInEffect,
+            ),
+        )
+        .await
+        .expect("a failure after the policy went live is an outcome, not an error");
+        let ServingActivationOutcome::Fenced(fenced) = outcome else {
+            panic!("an unconfirmed install was reported as serving");
+        };
+        assert_eq!(fenced.reason(), FenceReason::UnconfirmedInstall);
+        assert_eq!(fenced.incarnation(), &bound.incarnation);
+        assert_eq!(
+            probes.calls(),
+            0,
+            "an unconfirmed install was still probed for a proof"
+        );
+        assert!(matches!(
+            fixture.journal().recover().expect("recover"),
+            ServingActivationRecovery::Fenced { .. }
+        ));
+        std::thread::sleep(SETTLE);
+        assert_eq!(
+            child.hangups(),
+            0,
+            "an unconfirmed install still dispatched a reload"
+        );
+    }
+
+    /// A crash between the rename and the directory flush is the same exposure
+    /// for the live postmaster: the rename is already visible to anything that
+    /// opens the path, flushed or not.
+    #[tokio::test]
+    async fn a_crash_between_the_rename_and_the_flush_fences_the_live_postmaster() {
+        let probes = Arc::new(ProbeLog::default());
+        let fixture = Fixture::new();
+        fixture.install_non_serving();
+        let child = SignalledChild::start();
+        let authority = FakeAuthority::complete(&child);
+        let bound = bound(&child);
+        let mut journal = fixture.journal();
+
+        let _guard = inject_crash(CrashCheckpoint::PolicyRenamed, 0);
+        let outcome = activate(
+            &mut journal,
+            &fixture.hba,
+            uid(),
+            &policy(),
+            &authority,
+            &bound,
+            counting_probe(
+                Arc::clone(&probes),
+                ServingReloadProbe::ServingRulesInEffect,
+            ),
+        )
+        .await
+        .expect("a failure after the rename is an outcome, not an error");
+        let ServingActivationOutcome::Fenced(fenced) = outcome else {
+            panic!("a crash before the flush was reported as serving");
+        };
+        assert_eq!(
+            fenced.reason(),
+            FenceReason::UnconfirmedInstall,
+            "the fence has to name the install, not something later"
+        );
+        assert_eq!(fixture.installed(), SERVING);
+        assert_eq!(probes.calls(), 0, "an unconfirmed install was still probed");
+        std::thread::sleep(SETTLE);
+        assert_eq!(child.hangups(), 0, "an unconfirmed install still reloaded");
+    }
+
+    /// A fence is a conclusion about a process, not about a document. A later
+    /// attempt naming a different sealed policy, or the same one under a newer
+    /// generation, is still an attempt to reload the process the supervisor was
+    /// told to stop -- and arming it would erase the only durable record of
+    /// that decision.
+    #[tokio::test]
+    async fn a_fence_is_terminal_for_the_incarnation_whatever_is_presented_next() {
+        let probes = Arc::new(ProbeLog::default());
+        let other_bytes =
+            b"local postgres postgres peer\nhostssl shardschema all all reject\n".to_vec();
+        let other = SealedServingPolicy::seal(
+            other_bytes.clone(),
+            &sha256_hex(&other_bytes),
+            &sha256_hex(NON_SERVING),
+        )
+        .expect("seal a second policy");
+
+        for (name, next_policy, generation) in [
+            (
+                "a different sealed policy",
+                other,
+                durable_generation_for_test(7),
+            ),
+            (
+                "a newer writable generation",
+                policy(),
+                durable_generation_for_test(8),
+            ),
+        ] {
+            let fixture = Fixture::new();
+            fixture.install_non_serving();
+            let child = SignalledChild::start();
+            let authority = FakeAuthority::complete(&child);
+            let fenced_attempt = bound(&child);
+            let mut journal = fixture.journal();
+
+            let first = activate(
+                &mut journal,
+                &fixture.hba,
+                uid(),
+                &policy(),
+                &authority,
+                &fenced_attempt,
+                || async { ServingReloadProbe::Indeterminate },
+            )
+            .await
+            .expect("the first attempt returns an outcome");
+            assert!(matches!(first, ServingActivationOutcome::Fenced(_)));
+            child.wait_for_hangups(1);
+
+            let next = BoundServingAttempt {
+                incarnation: fenced_attempt.incarnation.clone(),
+                generation,
+            };
+            let error = activate(
+                &mut journal,
+                &fixture.hba,
+                uid(),
+                &next_policy,
+                &authority,
+                &next,
+                counting_probe(
+                    Arc::clone(&probes),
+                    ServingReloadProbe::ServingRulesInEffect,
+                ),
+            )
+            .await
+            .expect_err("a fenced incarnation is refused");
+            assert!(
+                matches!(error, ServingActivationError::AlreadyFenced),
+                "{name} resumed a fenced incarnation: {error}"
+            );
+            assert!(
+                matches!(
+                    fixture.journal().recover().expect("recover"),
+                    ServingActivationRecovery::Fenced { .. }
+                ),
+                "{name} erased the fence"
+            );
+            assert_eq!(probes.calls(), 0, "{name} probed a fenced incarnation");
+            std::thread::sleep(SETTLE);
+            assert_eq!(
+                child.hangups(),
+                1,
+                "{name} dispatched a second reload to a fenced postmaster"
+            );
+        }
+    }
+
+    /// A restarted container keeps the host boot identifier and starts a new pid
+    /// namespace, so the replacement postmaster very often has its predecessor's
+    /// pid. The durable proof must not carry over to it.
+    #[tokio::test]
+    async fn a_proof_does_not_carry_to_a_replacement_that_reused_the_pid() {
+        let probes = Arc::new(ProbeLog::default());
+        let fixture = Fixture::new();
+        fixture.install_non_serving();
+        let child = SignalledChild::start();
+        let authority = FakeAuthority::complete(&child);
+        let proved = bound(&child);
+        let policy = policy();
+        let mut journal = fixture.journal();
+
+        let outcome = activate(
+            &mut journal,
+            &fixture.hba,
+            uid(),
+            &policy,
+            &authority,
+            &proved,
+            || async { ServingReloadProbe::ServingRulesInEffect },
+        )
+        .await
+        .expect("the first attempt returns an outcome");
+        assert!(matches!(outcome, ServingActivationOutcome::Serving(_)));
+        child.wait_for_hangups(1);
+
+        // The same boot and the same pid, started at a different instant.
+        let replacement = PostmasterIncarnation {
+            start_ticks: proved.incarnation.start_ticks + 1,
+            ..proved.incarnation.clone()
+        };
+        assert!(
+            !fixture
+                .journal()
+                .recover()
+                .expect("recover")
+                .admits_serving(&replacement),
+            "a proof carried over to a replacement that reused the pid"
+        );
+
+        // And the replacement really does have to earn it again, rather than
+        // replaying the proof it did not establish.
+        let mut replaced = FakeAuthority::complete(&child);
+        replaced.postmaster = None;
+        let next = BoundServingAttempt {
+            incarnation: replacement,
+            generation: proved.generation.clone(),
+        };
+        let outcome = activate(
+            &mut journal,
+            &fixture.hba,
+            uid(),
+            &policy,
+            &replaced,
+            &next,
+            counting_probe(
+                Arc::clone(&probes),
+                ServingReloadProbe::ServingRulesInEffect,
+            ),
+        )
+        .await
+        .expect("the replacement's attempt returns an outcome");
+        assert!(
+            matches!(outcome, ServingActivationOutcome::Fenced(_)),
+            "a replacement that reused the pid replayed its predecessor's proof"
+        );
+        assert_eq!(
+            probes.calls(),
+            0,
+            "the replacement got as far as probing without any authority"
+        );
+    }
+
+    #[test]
+    fn a_retained_postmaster_carries_the_kernel_start_time_of_that_exact_process() {
+        let child = SignalledChild::start();
+        let retained = child.retained();
+        let observed = process_start_ticks(child.child.id()).expect("read the start time");
+        assert_eq!(retained.incarnation().start_ticks, observed);
+        assert!(observed > 0, "a live process has a start time");
+        assert_eq!(
+            child.retained().incarnation(),
+            retained.incarnation(),
+            "the same process produced two different identities"
+        );
+        // The agent's own start time differs from its child's, which is the
+        // property the identity depends on.
+        assert_ne!(
+            process_start_ticks(std::process::id()).expect("read our own start time"),
+            observed
+        );
+    }
+
+    /// The probe runs after the signal, so a panic inside it cannot be allowed
+    /// to unwind past the point where the outcome is decided.
+    #[tokio::test]
+    async fn a_probe_that_panics_fences_instead_of_unwinding() {
+        let fixture = Fixture::new();
+        fixture.install_non_serving();
+        let child = SignalledChild::start();
+        let authority = FakeAuthority::complete(&child);
+        let bound = bound(&child);
+        let mut journal = fixture.journal();
+
+        let outcome = activate(
+            &mut journal,
+            &fixture.hba,
+            uid(),
+            &policy(),
+            &authority,
+            &bound,
+            || async { panic!("the probe fails in the worst way") },
+        )
+        .await
+        .expect("a panicking probe still produces an outcome");
+        let ServingActivationOutcome::Fenced(fenced) = outcome else {
+            panic!("a panicking probe was treated as a proof");
+        };
+        assert_eq!(fenced.reason(), FenceReason::UnprovedReload);
+        child.wait_for_hangups(1);
+        assert!(matches!(
+            fixture.journal().recover().expect("recover"),
+            ServingActivationRecovery::Fenced { .. }
+        ));
+    }
+
+    /// Cancellation is not an error path. Dropping the attempt at its one
+    /// remaining await runs no arm of `activate`, so the durable fence is the
+    /// only thing that can survive to warn the next incarnation.
+    #[tokio::test]
+    async fn an_attempt_cancelled_after_its_reload_still_records_the_fence() {
+        let fixture = Fixture::new();
+        fixture.install_non_serving();
+        let child = SignalledChild::start();
+        let authority = FakeAuthority::complete(&child);
+        let bound = bound(&child);
+        let policy = policy();
+        let mut journal = fixture.journal();
+
+        {
+            let attempt = activate(
+                &mut journal,
+                &fixture.hba,
+                uid(),
+                &policy,
+                &authority,
+                &bound,
+                std::future::pending::<ServingReloadProbe>,
+            );
+            let mut attempt = Box::pin(attempt);
+            let polled = futures_poll_once(attempt.as_mut()).await;
+            assert!(
+                polled.is_none(),
+                "the attempt was expected to park at its probe"
+            );
+            child.wait_for_hangups(1);
+            drop(attempt);
+        }
+
+        assert!(
+            matches!(
+                fixture.journal().recover().expect("recover"),
+                ServingActivationRecovery::Fenced { .. }
+            ),
+            "a cancelled attempt left a reloaded postmaster with no durable fence"
+        );
+    }
+
+    /// Polls a future exactly once, so a test can observe it parking.
+    async fn futures_poll_once<F: Future>(mut future: std::pin::Pin<&mut F>) -> Option<F::Output> {
+        std::future::poll_fn(move |context| match future.as_mut().poll(context) {
+            Poll::Ready(value) => Poll::Ready(Some(value)),
+            Poll::Pending => Poll::Ready(None),
+        })
+        .await
+    }
+
     #[test]
     fn a_pid_that_is_not_canonical_decimal_is_refused() {
-        assert_eq!(canonical_pid("4242"), Some(4242));
-        assert_eq!(canonical_pid("0"), Some(0));
+        assert_eq!(canonical_decimal("4242"), Some(4242));
+        assert_eq!(canonical_decimal("0"), Some(0));
         for spelling in ["", "0042", " 42", "42 ", "+42", "-42", "4_2", "0x2a"] {
             assert!(
-                canonical_pid(spelling).is_none(),
+                canonical_decimal(spelling).is_none(),
                 "{spelling:?} was accepted as a pid"
             );
         }
@@ -2178,6 +2788,7 @@ host all all all reject\n";
     /// that would have recorded one.
     #[tokio::test]
     async fn every_missing_authority_stops_the_dispatch_and_fences() {
+        let probes = Arc::new(ProbeLog::default());
         for (name, mutate) in [
             (
                 "materialization",
@@ -2218,7 +2829,10 @@ host all all all reject\n";
                 &policy(),
                 &authority,
                 &bound,
-                || async { panic!("a refused dispatch must never be probed") },
+                counting_probe(
+                    Arc::clone(&probes),
+                    ServingReloadProbe::ServingRulesInEffect,
+                ),
             )
             .await
             .expect("the attempt returns an outcome");
@@ -2227,6 +2841,7 @@ host all all all reject\n";
             };
             assert_eq!(fenced.reason(), FenceReason::AuthorityLost);
             assert_eq!(fenced.incarnation(), &bound.incarnation);
+            assert_eq!(probes.calls(), 0, "a missing {name} was still probed");
 
             std::thread::sleep(SETTLE);
             assert_eq!(
@@ -2252,6 +2867,7 @@ host all all all reject\n";
     /// looking for a proof.
     #[tokio::test]
     async fn a_postmaster_that_has_already_exited_stops_the_dispatch() {
+        let probes = Arc::new(ProbeLog::default());
         let fixture = Fixture::new();
         fixture.install_non_serving();
         let mut child = Command::new("/bin/sh")
@@ -2294,7 +2910,10 @@ host all all all reject\n";
             &policy(),
             &authority,
             &bound,
-            || async { panic!("a postmaster that has already exited must never be probed") },
+            counting_probe(
+                Arc::clone(&probes),
+                ServingReloadProbe::ServingRulesInEffect,
+            ),
         )
         .await
         .expect("the attempt returns an outcome");
@@ -2302,11 +2921,17 @@ host all all all reject\n";
             panic!("an exited postmaster was reported as serving");
         };
         assert_eq!(fenced.reason(), FenceReason::AuthorityLost);
+        assert_eq!(
+            probes.calls(),
+            0,
+            "an exited postmaster was still probed for a proof"
+        );
         child.wait().expect("reap the fixture");
     }
 
     #[tokio::test]
     async fn an_incarnation_that_moved_on_stops_the_dispatch() {
+        let probes = Arc::new(ProbeLog::default());
         let fixture = Fixture::new();
         fixture.install_non_serving();
         let child = SignalledChild::start();
@@ -2322,11 +2947,15 @@ host all all all reject\n";
             &policy(),
             &authority,
             &bound,
-            || async { panic!("a refused dispatch must never be probed") },
+            counting_probe(
+                Arc::clone(&probes),
+                ServingReloadProbe::ServingRulesInEffect,
+            ),
         )
         .await
         .expect("the attempt returns an outcome");
         assert!(matches!(outcome, ServingActivationOutcome::Fenced(_)));
+        assert_eq!(probes.calls(), 0, "a refused dispatch was still probed");
         std::thread::sleep(SETTLE);
         assert_eq!(
             child.hangups(),
@@ -2458,6 +3087,7 @@ host all all all reject\n";
     /// answer left, so the journal failing must not turn into one.
     #[tokio::test]
     async fn a_journal_failure_after_the_install_fences_rather_than_returning_an_error() {
+        let probes = Arc::new(ProbeLog::default());
         let fixture = Fixture::new();
         fixture.install_non_serving();
         let child = SignalledChild::start();
@@ -2475,7 +3105,10 @@ host all all all reject\n";
             &policy(),
             &authority,
             &bound,
-            || async { panic!("a fenced attempt must never be probed") },
+            counting_probe(
+                Arc::clone(&probes),
+                ServingReloadProbe::ServingRulesInEffect,
+            ),
         )
         .await
         .expect("a failure after the install is an outcome, not an error");
@@ -2483,6 +3116,7 @@ host all all all reject\n";
             panic!("an unrecorded install still served");
         };
         assert_eq!(fenced.reason(), FenceReason::UnrecordedProgress);
+        assert_eq!(probes.calls(), 0, "an unrecorded attempt was still probed");
         assert_eq!(fixture.installed(), SERVING);
         std::thread::sleep(SETTLE);
         assert_eq!(
@@ -2496,6 +3130,7 @@ host all all all reject\n";
     /// honest answer, and the disk must show that nothing happened.
     #[tokio::test]
     async fn a_failure_before_the_install_returns_an_error_and_changes_nothing() {
+        let probes = Arc::new(ProbeLog::default());
         let fixture = Fixture::new();
         fixture.install_non_serving();
         let child = SignalledChild::start();
@@ -2511,11 +3146,19 @@ host all all all reject\n";
             &policy(),
             &authority,
             &bound,
-            || async { panic!("an attempt that never armed must never probe") },
+            counting_probe(
+                Arc::clone(&probes),
+                ServingReloadProbe::ServingRulesInEffect,
+            ),
         )
         .await
         .expect_err("an attempt that cannot arm returns an error");
         assert!(matches!(error, ServingActivationError::InjectedCrash));
+        assert_eq!(
+            probes.calls(),
+            0,
+            "an attempt that never armed still probed"
+        );
         assert_eq!(
             fixture.installed(),
             NON_SERVING,
