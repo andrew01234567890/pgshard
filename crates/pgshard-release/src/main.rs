@@ -4741,10 +4741,14 @@ mod tests {
         let ci = include_str!("../../../.github/workflows/ci.yml");
         let release = include_str!("../../../.github/workflows/release.yml");
         assert!(ci.contains("workflow_dispatch"));
-        assert!(ci.contains(
-            "group: pgshard-ci-${{ github.event_name == 'pull_request' && github.run_id || 'main' }}"
-        ));
-        assert_eq!(ci.matches("queue: max").count(), 1);
+        // CI must not carry a concurrency group of its own. A shared group for
+        // non-pull-request runs holds each whole run pending with no job
+        // created, so main serializes end to end at one run per full CI
+        // duration; a hundred pending runs later, GitHub cancels the excess
+        // outright. It buys nothing, because the assertions below are what
+        // keeps publication serialized and exact.
+        assert!(!ci.contains("concurrency:"));
+        assert_eq!(ci.matches("queue: max").count(), 0);
         assert!(ci.contains("aggregate:"));
         assert_eq!(ci.matches(".github/scripts/ci-diff-base.sh").count(), 3);
         assert!(ci.contains("latest released first-parent commit"));

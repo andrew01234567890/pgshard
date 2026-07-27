@@ -19,12 +19,12 @@ on:
 permissions:
   contents: read
 
-# Pull requests keep independent CI capacity. Every default-branch, scheduled,
-# and exact-SHA dispatch run joins one FIFO queue so rapid main updates cannot
-# build or publish concurrently.
-concurrency:
-  group: pgshard-ci-${{ github.event_name == 'pull_request' && github.run_id || 'main' }}
-  queue: max
+# No concurrency group. This workflow only reads the repository and writes
+# run-scoped artifacts and caches, so two runs of it share nothing that can
+# race. Serializing it here would stall whole runs before any job is created
+# without protecting anything: publication order is held by the release
+# workflow's own queue, and every release re-verifies the exact aggregate
+# check of each commit it tags.
 
 env:
   CARGO_TERM_COLOR: always

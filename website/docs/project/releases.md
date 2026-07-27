@@ -35,12 +35,17 @@ commit.
 Documentation-only and CI-only default-branch commits still receive patch
 releases.
 
-The complete CI workflow is serialized for every non-pull-request run. Main
-pushes, scheduled validation, and exact-SHA Dependabot dispatches share a
-maximum-depth concurrency queue, so only one such run builds at a time while
-pull requests retain independent CI capacity. GitHub processes this queue
-first-in-first-out by the time each run starts waiting, rather than by dispatch
-or commit order. For a main push whose predecessor has no exact SemVer tag,
+CI itself is not serialized. Pull requests, main pushes, scheduled validation
+and exact-SHA Dependabot dispatches all run concurrently, because a CI run only
+reads the repository and writes run-scoped artifacts and caches. It holds no
+write permission, publishes no image or tag, and touches no shared external
+state, so two runs of it cannot race. Correctness never depended on CI order:
+publication order is held by the release workflow's own queue, and each release
+independently rechecks the exact aggregate of every commit it tags. Serializing
+CI would only hold whole runs pending before any job is created, delaying the
+aggregate result that authorizes a release.
+
+For a main push whose predecessor has no exact SemVer tag,
 component detection and the public-history audit widen their base to the latest
 first-parent SemVer tag with a GitHub Release targeting that exact commit. An
 orphan or mismatched tag cannot narrow CI and is rejected as a release planner
@@ -48,7 +53,11 @@ baseline. The later green endpoint therefore validates every
 component changed anywhere in the gap. With no release tag, component detection
 runs against every tracked file and auditing starts immediately before the
 release marker. Release-eligible exact-SHA dispatches run the same full-gap
-audit as main pushes.
+audit as main pushes. Concurrent CI makes that widened base the ordinary case
+rather than a recovery path, because a run now commonly starts before its
+predecessor has been released. Widening can only move the base further back, so
+a concurrent run always tests a superset of what the same commit would have
+tested had it waited.
 
 Publication runs in a separate trusted `workflow_run` workflow after successful
 CI and retains its own serialized queue. Normal main publication resolves the
