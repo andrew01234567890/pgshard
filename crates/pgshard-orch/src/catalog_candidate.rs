@@ -23,6 +23,7 @@ use tokio::sync::watch;
 
 use crate::boottime::BoottimeError;
 use crate::domain::{CatalogCandidateFailureReason, OrchState};
+use crate::kube_transport::apply_request_budget;
 use crate::topology::{CatalogCandidateObservationPlan, CatalogCandidateTopologyMember};
 
 const CANDIDATE_SCHEMA_VERSION: &str = "pgshard.catalog-bootstrap-candidate.v1";
@@ -1266,10 +1267,7 @@ impl KubernetesCandidateStore {
     ) -> Result<Self, CatalogCandidateError> {
         let mut client_config = Config::incluster()
             .map_err(|error| CatalogCandidateError::InClusterConfiguration(error.to_string()))?;
-        client_config.connect_timeout = Some(request_timeout);
-        client_config.read_timeout = Some(request_timeout);
-        client_config.write_timeout = Some(request_timeout);
-        client_config.default_retry = false;
+        apply_request_budget(&mut client_config, request_timeout);
         let client = Client::try_from(client_config)
             .map_err(|error| CatalogCandidateError::KubernetesClient(error.to_string()))?;
         let resource = ApiResource::from_gvk_with_plural(

@@ -14,6 +14,11 @@ use crate::endpoint::valid_credential_free_http_endpoint;
 use crate::telemetry::TelemetryConfig;
 use crate::topology::DEFAULT_TOPOLOGY_FILE;
 
+/// Longest Kubernetes Lease duration this process accepts.
+pub(crate) const MAXIMUM_KUBERNETES_LEASE_DURATION_SECONDS: u64 = 300;
+/// Slowest Kubernetes observation and retry cadence this process accepts.
+pub(crate) const MAXIMUM_KUBERNETES_LEASE_RETRY_MILLIS: u64 = 30_000;
+
 /// Validated orchestrator configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OrchConfig {
@@ -168,7 +173,9 @@ impl OrchConfig {
         if !(1_000..=300_000).contains(&raw.lease_ttl_ms) {
             return Err(ConfigError::InvalidLeaseTtl(raw.lease_ttl_ms));
         }
-        if !(6..=300).contains(&raw.kubernetes_lease_duration_seconds) {
+        if !(6..=MAXIMUM_KUBERNETES_LEASE_DURATION_SECONDS)
+            .contains(&raw.kubernetes_lease_duration_seconds)
+        {
             return Err(ConfigError::InvalidKubernetesLeaseDuration(
                 raw.kubernetes_lease_duration_seconds,
             ));
@@ -183,7 +190,7 @@ impl OrchConfig {
                 raw.identity_binding_freshness_ms,
             ));
         }
-        if !(100..=30_000).contains(&raw.kubernetes_lease_retry_ms) {
+        if !(100..=MAXIMUM_KUBERNETES_LEASE_RETRY_MILLIS).contains(&raw.kubernetes_lease_retry_ms) {
             return Err(ConfigError::InvalidKubernetesLeaseRetry(
                 raw.kubernetes_lease_retry_ms,
             ));

@@ -26,6 +26,7 @@ use crate::agent_status::{
 };
 use crate::boottime::{BoottimeError, SuspendAwareInstant};
 use crate::domain::{AgentStatusFailureReason, OrchState};
+use crate::kube_transport::apply_request_budget;
 use crate::topology::UnboundAgentObservationTarget;
 
 const CLUSTER_LABEL: &str = "pgshard.io/cluster";
@@ -925,10 +926,7 @@ impl KubernetesIdentityStore {
         }
         let mut client_config = Config::incluster()
             .map_err(|error| IdentityBindingError::InClusterConfiguration(error.to_string()))?;
-        client_config.connect_timeout = Some(request_timeout);
-        client_config.read_timeout = Some(request_timeout);
-        client_config.write_timeout = Some(request_timeout);
-        client_config.default_retry = false;
+        apply_request_budget(&mut client_config, request_timeout);
         let client = Client::try_from(client_config)
             .map_err(|error| IdentityBindingError::KubernetesClient(error.to_string()))?;
         Ok(Self {
