@@ -5,7 +5,7 @@ use pgshard_catalog::{
     RegisteredTable, RoutingHashConfig, ShardKeyType, ShardRoute, TableName,
 };
 use pgshard_planner::{
-    CatalogOnlySearchPath, PhysicalSchemaError, PhysicalShardKeyCatalogIdentity,
+    CatalogOnlySearchPath, ParseError, PhysicalSchemaError, PhysicalShardKeyCatalogIdentity,
     PhysicalShardKeyObservation, PhysicalShardKeyProof, RouteTemplateError, StatementKind,
     parse_one,
 };
@@ -435,6 +435,44 @@ async fn check_operator_search_path_reanalysis(
     );
 }
 
+/// `dolq_start` is `[A-Za-z\200-\377_]` (`src/backend/parser/scan.l:285`): a
+/// digit cannot open a dollar-quote tag, and every byte of a multi-byte
+/// character can.
+async fn check_dollar_quote_tag_grammar(client: &tokio_postgres::Client) {
+    assert_eq!(
+        parse_one("SELECT $1$;$1$").expect_err("two statements"),
+        ParseError::MultipleStatements
+    );
+    assert!(
+        client.prepare("SELECT $1$;$1$").await.is_err(),
+        "PostgreSQL unexpectedly read a dollar-quote tag starting with a digit"
+    );
+
+    let body: String = client
+        .query_one("SELECT ($\u{a7}$;$\u{a7}$)::text", &[])
+        .await
+        .expect("high-byte dollar-quote tag")
+        .get(0);
+    assert_eq!(body, ";");
+    assert_eq!(
+        parse_one("SELECT ($\u{a7}$;$\u{a7}$)::text").expect_err("candidate tokenizer"),
+        ParseError::InvalidSyntax,
+        "one PostgreSQL statement must never be reported as multiple"
+    );
+}
+
+/// `xuistart` is `[uU]&{dquote}` (`src/backend/parser/scan.l:301`). The
+/// candidate parser cannot read it, so the route is lost — but the input is one
+/// statement and the error class must say so.
+async fn check_unicode_identifiers(client: &tokio_postgres::Client) {
+    const SQL: &str = "SELECT value FROM U&\"planner_target\" WHERE tenant_id = $1";
+    client.prepare(SQL).await.expect("PostgreSQL 18 parse");
+    assert_eq!(
+        parse_one(SQL).expect_err("candidate parser"),
+        ParseError::InvalidSyntax
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires PGSHARD_TEST_DATABASE_URL pointing to PostgreSQL 18"]
 async fn admitted_dml_parses_on_postgres18() {
@@ -524,6 +562,9 @@ async fn admitted_dml_parses_on_postgres18() {
             "PostgreSQL unexpectedly accepted candidate-only syntax"
         );
     }
+
+    check_dollar_quote_tag_grammar(&client).await;
+    check_unicode_identifiers(&client).await;
 
     check_parameter_route(&client).await;
 
