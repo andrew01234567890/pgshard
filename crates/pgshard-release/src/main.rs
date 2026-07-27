@@ -1180,6 +1180,19 @@ fn big_endian(bytes: &[u8]) -> usize {
 /// as a private one, and taking a packet tag on its own read an `npm` integrity
 /// hash as a keyring. A key that arrives padded is a miss; a rule that wedges
 /// the gate is unrecoverable, because history is rescanned on every release.
+///
+/// Two more limits are known and accepted rather than patched over. Two DER
+/// objects that are not keys are read as keys, one through each arm above: the
+/// timestamp request `openssl ts -query` writes opens with the version integer
+/// one, exactly as a key does, and a bare `DigestInfo` is an algorithm
+/// identifier followed by an OCTET STRING, which is an encrypted key's shape to
+/// the byte. Neither occurred once in a hundred and twenty thousand real files
+/// or a hundred million random blobs, and a discriminator for each is a
+/// per-collision escape hatch that would end up letting a key through. And a vendored dependency brings its own fixtures:
+/// `ring` and `x509-cert` are both in this lock file and both ship private keys
+/// in DER, so `cargo vendor` would refuse every release afterwards. The content
+/// really is a private key, so the rule is right and there is no exemption to
+/// reach for -- which is the thing to know before vendoring, not after.
 fn is_bare_private_key_object(bytes: &[u8]) -> bool {
     is_whole_der_private_key(bytes)
         || is_openssh_private_key(bytes)
@@ -1212,8 +1225,11 @@ fn is_java_keystore(bytes: &[u8]) -> bool {
         return false;
     }
     // Version two only. It is what every `keytool` anyone still runs writes,
-    // and the one before it laid certificates out differently; a branch for a
-    // layout that cannot be produced to test against is a liability in a gate.
+    // and the version before it laid certificates out differently. A store in
+    // that layout is missed: it can be built, so this is a choice rather than a
+    // limit, and the exposure is what makes it -- nothing has written version
+    // one since JDK 1.2, and a second layout is a second thing to be wrong
+    // about in a rule whose false positives cannot be undone.
     if big_endian_at(bytes, 4, 4) != Some(2) {
         return false;
     }
@@ -1283,7 +1299,35 @@ fn is_whole_der_private_key(bytes: &[u8]) -> bool {
     der_sequence(bytes).is_some_and(|(declared, header)| header + declared == bytes.len())
         && (der_key_contents(bytes)
             .is_some_and(|contents| declares_a_key_version(contents) || encrypts_a_key(contents))
-            || is_pkcs12_bundle(bytes))
+            || (is_pkcs12_bundle(bytes) && carries_a_pkcs12_key_bag(bytes)))
+}
+
+/// A PKCS#12 file is a container, and being one says nothing about what is in
+/// it. A bundle holding a key names the bag it put the key in, and that name
+/// stays in the clear even when the key itself does not: `openssl` and `keytool`
+/// both write the bag's identifier into the layer above the ciphertext. A file
+/// holding only certificates names no such bag, and that file is a trust store,
+/// which every project that has a bundle has beside it and publishes on purpose.
+/// Asking only whether the container was a bundle refused both of the ones built
+/// here, by either tool.
+///
+/// A bundle whose bags are themselves inside an encrypted `SafeContents` names
+/// nothing readable and is missed. That is the direction to be wrong in: no tool
+/// measured here writes one, and the alternative is refusing every trust store.
+fn carries_a_pkcs12_key_bag(bytes: &[u8]) -> bool {
+    /// `keyBag` and `pkcs8ShroudedKeyBag`, as the object identifiers appear.
+    const BAGS: [[u8; 13]; 2] = [
+        [
+            0x06, 0x0b, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x0c, 0x0a, 0x01, 0x01,
+        ],
+        [
+            0x06, 0x0b, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x0c, 0x0a, 0x01, 0x02,
+        ],
+    ];
+
+    bytes
+        .windows(BAGS[0].len())
+        .any(|window| BAGS.iter().any(|bag| window == bag))
 }
 
 /// A keyring declares no size of its own: it is a chain of packets, and the
@@ -3435,15 +3479,30 @@ mod tests {
     }
 
     /// The version three PKCS#12 has had since it was published, then the
-    /// content it authenticates, which opens with its own algorithm.
+    /// content it authenticates, which opens with its own algorithm and names
+    /// the shrouded bag the key was put into.
     fn pkcs12_bundle() -> Vec<u8> {
         der_sequence_of(
             &[
                 vec![0x02, 0x01, 0x03],
-                der_sequence_of(&[vec![0x06, 0x09], filler(200)].concat()),
+                der_sequence_of(
+                    &[vec![0x06, 0x09], filler(30), pkcs12_bag(2), filler(160)].concat(),
+                ),
             ]
             .concat(),
         )
+    }
+
+    /// The object identifier of one of the bags a PKCS#12 file holds: one is a
+    /// key, two a shrouded key, three a certificate.
+    fn pkcs12_bag(kind: u8) -> Vec<u8> {
+        [
+            vec![
+                0x06, 0x0b, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x0c, 0x0a, 0x01,
+            ],
+            vec![kind],
+        ]
+        .concat()
     }
 
     /// A version four secret key packet and the identity beside it, in each of
@@ -3846,6 +3905,54 @@ mod tests {
                 "naming the format is not writing one: {innocent}"
             );
         }
+    }
+
+    /// A PKCS#12 file says only that something was put in a container. A trust
+    /// store is the same container holding certificates, every project that has
+    /// a bundle has one, and refusing it refuses the release: both of the ones
+    /// built here, by `openssl -nokeys` and by `keytool -importcert`, were.
+    #[test]
+    fn a_pkcs12_holding_no_key_is_a_trust_store() {
+        let bundle = |bags: &[u8]| {
+            let mut content = vec![0x06, 0x09];
+            content.extend(filler(30));
+            for last in bags {
+                content.extend(pkcs12_bag(*last));
+            }
+            content.extend(filler(160));
+            der_sequence_of(&[vec![0x02, 0x01, 0x03], der_sequence_of(&content)].concat())
+        };
+
+        // A key bag and a shrouded key bag are what a key is carried in, and
+        // both names stay in the clear even when the key does not.
+        for (name, last) in [("a key bag", 1), ("a shrouded key bag", 2)] {
+            let held = bundle(&[3, last]);
+            assert!(
+                is_bare_private_key_object(&held),
+                "a bundle naming {name} holds a key"
+            );
+            assert!(audit_content_bytes("bundle.p12", &held).is_err());
+        }
+
+        // Certificates only, which is what a trust store is.
+        let trusted = bundle(&[3, 3]);
+        assert!(is_pkcs12_bundle(&trusted), "it is still a bundle");
+        assert!(
+            !is_bare_private_key_object(&trusted),
+            "a bundle naming no key bag is a trust store"
+        );
+        assert!(
+            audit_content_bytes("truststore.p12", &trusted).is_ok(),
+            "committing a trust store must not wedge the gate"
+        );
+        let secret = format!(
+            "apiVersion: v1\nkind: Secret\ndata:\n  truststore.p12: {}\n",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &trusted)
+        );
+        assert!(
+            audit_content("secret.yaml", &secret).is_ok(),
+            "nor encoded into a Secret"
+        );
     }
 
     /// This gate reads every line of every blob in history, so what it costs to
