@@ -143,7 +143,9 @@ const OBSERVE_PRIMARY_REPLICATION_SQL: &str = "\
            physical.datoid::pg_catalog.int8 AS database_oid, \
            physical.temporary, physical.active, \
            physical.active_pid::pg_catalog.int8, \
+           physical.xmin::pg_catalog.text, \
            physical.catalog_xmin::pg_catalog.text, \
+           pg_catalog.age(physical.xmin)::pg_catalog.int8 AS physical_xmin_age, \
            physical.restart_lsn::pg_catalog.text, physical.wal_status, \
            physical.invalidation_reason, \
            sender.pid::pg_catalog.int4 AS sender_pid, \
@@ -183,7 +185,7 @@ const OBSERVE_PRIMARY_REPLICATION_SQL: &str = "\
      ) AS sync_policy \
       LEFT JOIN LATERAL ( \
             SELECT slot_name, plugin, slot_type, datoid, temporary, active, \
-                   active_pid, catalog_xmin, restart_lsn, wal_status, \
+                   active_pid, xmin, catalog_xmin, restart_lsn, wal_status, \
                    invalidation_reason \
               FROM pg_catalog.pg_replication_slots \
              WHERE slot_name OPERATOR(pg_catalog.=) $1::pg_catalog.name \
@@ -409,6 +411,7 @@ pub struct LocalPhysicalReplicationSlotObservation {
     name: ReplicationSlotName,
     persistence: SlotPersistence,
     activity: SlotActivity,
+    data_horizon: Option<PinnedDataHorizon>,
     catalog_xmin: Option<LocalPostgresTransactionId>,
     restart_lsn: Option<PgLsn>,
     wal_retention: Option<SlotWalRetention>,
@@ -434,6 +437,12 @@ impl LocalPhysicalReplicationSlotObservation {
         self.activity
     }
 
+    /// Returns the data horizon this slot pins on every table, if any.
+    #[must_use]
+    pub const fn data_horizon(&self) -> Option<PinnedDataHorizon> {
+        self.data_horizon
+    }
+
     /// Returns the raw catalog horizon carried by hot-standby feedback.
     #[must_use]
     pub const fn catalog_xmin(&self) -> Option<LocalPostgresTransactionId> {
@@ -456,6 +465,56 @@ impl LocalPhysicalReplicationSlotObservation {
     #[must_use]
     pub const fn invalidation(&self) -> Option<SlotInvalidation> {
         self.invalidation
+    }
+}
+
+/// The `data.xmin` a physical slot stores, with the server's own age for it.
+///
+/// `PostgreSQL` writes this value into the slot itself from hot-standby
+/// feedback, so it outlives the walsender that reported it and bounds `VACUUM`
+/// on every table until the slot is dropped or invalidated. The raw 32-bit
+/// transaction ID carries no cross-sample ordering, so the age is taken from
+/// the same server in the same row rather than derived here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PinnedDataHorizon {
+    xmin: LocalPostgresTransactionId,
+    age: u32,
+}
+
+impl PinnedDataHorizon {
+    /// Returns the raw transaction ID stored in the slot.
+    #[must_use]
+    pub const fn xmin(self) -> LocalPostgresTransactionId {
+        self.xmin
+    }
+
+    /// Returns `PostgreSQL`'s own `age(xmin)` for that transaction ID.
+    #[must_use]
+    pub const fn age(self) -> u32 {
+        self.age
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn physical_slot_fixture(
+    name: ReplicationSlotName,
+    persistence: SlotPersistence,
+    activity: SlotActivity,
+    data_horizon: Option<(NonZeroU32, u32)>,
+    invalidation: Option<SlotInvalidation>,
+) -> LocalPhysicalReplicationSlotObservation {
+    LocalPhysicalReplicationSlotObservation {
+        name,
+        persistence,
+        activity,
+        data_horizon: data_horizon.map(|(xmin, age)| PinnedDataHorizon {
+            xmin: LocalPostgresTransactionId(xmin),
+            age,
+        }),
+        catalog_xmin: None,
+        restart_lsn: None,
+        wal_retention: None,
+        invalidation,
     }
 }
 
@@ -1196,10 +1255,12 @@ fn parse_physical_slot(
     let temporary: Option<bool> = row.try_get(12)?;
     let active: Option<bool> = row.try_get(13)?;
     let active_pid: Option<i64> = row.try_get(14)?;
-    let catalog_xmin: Option<String> = row.try_get(15)?;
-    let restart_lsn: Option<String> = row.try_get(16)?;
-    let wal_status: Option<String> = row.try_get(17)?;
-    let invalidation_reason: Option<String> = row.try_get(18)?;
+    let xmin: Option<String> = row.try_get(15)?;
+    let catalog_xmin: Option<String> = row.try_get(16)?;
+    let xmin_age: Option<i64> = row.try_get(17)?;
+    let restart_lsn: Option<String> = row.try_get(18)?;
+    let wal_status: Option<String> = row.try_get(19)?;
+    let invalidation_reason: Option<String> = row.try_get(20)?;
 
     let Some(name) = name else {
         if plugin.is_some()
@@ -1208,7 +1269,9 @@ fn parse_physical_slot(
             || temporary.is_some()
             || active.is_some()
             || active_pid.is_some()
+            || xmin.is_some()
             || catalog_xmin.is_some()
+            || xmin_age.is_some()
             || restart_lsn.is_some()
             || wal_status.is_some()
             || invalidation_reason.is_some()
@@ -1232,6 +1295,7 @@ fn parse_physical_slot(
         name: parsed_name,
         persistence: classify_persistence(temporary),
         activity,
+        data_horizon: parse_pinned_data_horizon(xmin, xmin_age)?,
         catalog_xmin: catalog_xmin
             .map(|value| parse_transaction_id(&value))
             .transpose()?,
@@ -1252,11 +1316,11 @@ fn parse_wal_sender(
     row: &Row,
     physical_slot: Option<&LocalPhysicalReplicationSlotObservation>,
 ) -> Result<Option<LocalWalSenderObservation>, LocalSlotObservationError> {
-    let pid: Option<i32> = row.try_get(19)?;
-    let application_name: Option<String> = row.try_get(20)?;
-    let backend_start_epoch_micros: Option<i64> = row.try_get(21)?;
-    let state: Option<String> = row.try_get(22)?;
-    let reply_epoch_micros: Option<i64> = row.try_get(23)?;
+    let pid: Option<i32> = row.try_get(21)?;
+    let application_name: Option<String> = row.try_get(22)?;
+    let backend_start_epoch_micros: Option<i64> = row.try_get(23)?;
+    let state: Option<String> = row.try_get(24)?;
+    let reply_epoch_micros: Option<i64> = row.try_get(25)?;
     if pid.is_none()
         && application_name.is_none()
         && backend_start_epoch_micros.is_none()
@@ -1318,6 +1382,23 @@ fn parse_wal_sender_activity(
         "stopping" => Ok(LocalWalSenderActivity::Stopping),
         _ => Err(LocalSlotObservationError::UnsupportedWalSenderState(state)),
     }
+}
+
+fn parse_pinned_data_horizon(
+    xmin: Option<String>,
+    age: Option<i64>,
+) -> Result<Option<PinnedDataHorizon>, LocalSlotObservationError> {
+    let (Some(xmin), Some(age)) = (xmin, age) else {
+        // `pg_catalog.age` is strict, so both fields are null together.
+        return Ok(None);
+    };
+    let xmin = parse_transaction_id(&xmin)?;
+    let age =
+        u32::try_from(age).map_err(|_| LocalSlotObservationError::InvalidNonnegativeInteger {
+            field: "physical_xmin_age",
+            value: age,
+        })?;
+    Ok(Some(PinnedDataHorizon { xmin, age }))
 }
 
 fn parse_transaction_id(
@@ -1659,20 +1740,20 @@ fn parse_primary_failover_anchor(
     row: &Row,
     target: &ManagedSlotTarget,
 ) -> Result<Option<LogicalSlotObservation>, LocalSlotObservationError> {
-    let name_text: Option<String> = row.try_get(24)?;
-    let plugin: Option<String> = row.try_get(25)?;
-    let slot_type: Option<String> = row.try_get(26)?;
-    let database_oid: Option<i64> = row.try_get(27)?;
-    let temporary: Option<bool> = row.try_get(28)?;
-    let active: Option<bool> = row.try_get(29)?;
-    let active_pid: Option<i64> = row.try_get(30)?;
-    let wal_status: Option<String> = row.try_get(31)?;
-    let two_phase: Option<bool> = row.try_get(32)?;
-    let two_phase_at: Option<String> = row.try_get(33)?;
-    let invalidation_reason: Option<String> = row.try_get(34)?;
-    let failover: Option<bool> = row.try_get(35)?;
-    let synced: Option<bool> = row.try_get(36)?;
-    let confirmed_flush_lsn: Option<String> = row.try_get(37)?;
+    let name_text: Option<String> = row.try_get(26)?;
+    let plugin: Option<String> = row.try_get(27)?;
+    let slot_type: Option<String> = row.try_get(28)?;
+    let database_oid: Option<i64> = row.try_get(29)?;
+    let temporary: Option<bool> = row.try_get(30)?;
+    let active: Option<bool> = row.try_get(31)?;
+    let active_pid: Option<i64> = row.try_get(32)?;
+    let wal_status: Option<String> = row.try_get(33)?;
+    let two_phase: Option<bool> = row.try_get(34)?;
+    let two_phase_at: Option<String> = row.try_get(35)?;
+    let invalidation_reason: Option<String> = row.try_get(36)?;
+    let failover: Option<bool> = row.try_get(37)?;
+    let synced: Option<bool> = row.try_get(38)?;
+    let confirmed_flush_lsn: Option<String> = row.try_get(39)?;
     let Some(name_text) = name_text else {
         if plugin.is_some()
             || slot_type.is_some()

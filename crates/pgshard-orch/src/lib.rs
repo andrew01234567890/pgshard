@@ -26,6 +26,7 @@ pub mod slot_probe_catalog;
 pub mod standby_slots;
 pub mod telemetry;
 pub mod topology;
+pub mod vacuum_horizon;
 
 fn parse_lsn(value: &str) -> Option<pgshard_types::PgLsn> {
     let (high, low) = value.split_once('/')?;
