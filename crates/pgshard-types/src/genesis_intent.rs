@@ -95,12 +95,32 @@
 //! ## Fence the destructive act a second time, in the engine
 //!
 //! Permission logic can be wrong, so do not let it be the only thing standing
-//! between a mistake and a created database. Perform the catalog creation over
-//! a role that cannot write while the server is in recovery or
-//! `default_transaction_read_only` is set, and do not grant that role the
-//! ability to override either. Authority and the engine's own writability then
-//! both have to agree, and a node that wrongly believes it may create the
-//! catalog gets a failed statement instead of a new database.
+//! between a mistake and a created database. The engine can carry exactly one
+//! part of that, and it is recovery state: perform the catalog creation
+//! against a server that is not in recovery, and let the engine refuse the
+//! statement when it is. `StartTransaction` in
+//! `src/backend/access/transam/xact.c` sets `XactReadOnly` from
+//! `RecoveryInProgress()` at the start of every transaction,
+//! `check_transaction_read_only` in `src/backend/commands/variable.c` refuses
+//! to clear it while recovery is active, and `standard_ProcessUtility` in
+//! `src/backend/tcop/utility.c` then refuses `CREATE DATABASE` through
+//! `PreventCommandIfReadOnly`, with `GetNewTransactionId` in
+//! `src/backend/access/transam/varsup.c` as the backstop no session setting
+//! can reach. Authority and the engine's own writability then both have to
+//! agree, and a node that wrongly believes it may create the catalog gets a
+//! failed statement instead of a new database.
+//!
+//! That is a property of the server and not one that can be given to a role,
+//! so do not go looking for a role that cannot write.
+//! `default_transaction_read_only` in particular is no part of the fence,
+//! however it is configured: `guc_tables.c` declares it `PGC_USERSET`, and the
+//! privilege switch in `set_config_with_handle` answers "always okay" for that
+//! context, so every role may `SET` it off for its own session and there is no
+//! privilege that could be withheld to stop one. `GRANT SET ON PARAMETER` only
+//! relaxes the check `PGC_SUSET` imposes; it cannot impose one where the
+//! engine asks for none. Setting it on documents an expectation and costs
+//! nothing, and it stops nobody who wanted to write, which is the only caller
+//! a fence is for.
 //!
 //! # The `members` gap
 //!
