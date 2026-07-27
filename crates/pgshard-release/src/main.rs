@@ -911,18 +911,36 @@ fn decoded_key_candidate(candidate: &str) -> Option<Vec<u8>> {
 /// format opens its key with is the only thing there is to recognise. Measured
 /// on real `gnupg` 2.4 output, all four files it wrote went through unread.
 ///
-/// The token is matched with the parenthesis the s-expression opens its algorithm
-/// with, which is what separates the format from prose naming it, from a path
-/// mentioning the directory, and from an identifier that merely reads the same.
-/// The shadowed form is deliberately absent: it stands in for a key held on a
-/// card and carries no secret to leak.
+/// A substring would be the wrong instrument and was: matching the token
+/// anywhere refused a paragraph documenting this rule, an ordinary Scheme
+/// definition, five shared libraries that merely link against `libgcrypt`, and
+/// -- with no way back -- a commit message describing the rule itself.
+///
+/// What is matched instead is the whole of the field the format writes: the
+/// field name at the start of a line, the token, and the algorithm the
+/// s-expression opens with. That is a line only this format produces, and prose
+/// quoting the token, a path naming the directory, an identifier spelled the
+/// same way and a Lisp definition binding the same words all fall outside it.
+///
+/// The `#`-prefixed parameter is deliberately not required on the same line: an
+/// Ed25519 key from `gnupg` 2.4 carries the curve and flags there and does not
+/// reach its first parameter until the line after. The shadowed form is absent
+/// too, standing as it does for a key held on a card, with no secret to leak.
 fn carries_libgcrypt_private_key(line: &str) -> bool {
+    /// What `libgcrypt` names a key's algorithm. Nothing else opens one.
+    const ALGORITHMS: [&str; 4] = ["rsa", "dsa", "elg", "ecc"];
+
     [
         ["(private-", "key ("].concat(),
         ["(protected-private-", "key ("].concat(),
     ]
     .iter()
-    .any(|token| line.contains(token.as_str()))
+    .filter_map(|token| line.strip_prefix(["Key: ", token].concat().as_str()))
+    .any(|opens| {
+        ALGORITHMS
+            .iter()
+            .any(|algorithm| opens.starts_with(algorithm))
+    })
 }
 
 /// A traditional encrypted key has no structure to decode: the encryption
@@ -3763,35 +3781,65 @@ mod tests {
     /// against real `gnupg` 2.4 output: all four files it wrote into
     /// `private-keys-v1.d` went through the audit unread, two of them with the
     /// private exponent in the clear.
+    ///
+    /// What is matched is the whole field, not the token inside it. Matching the
+    /// token alone refused ordinary text -- and, with no way to take it back, a
+    /// commit message describing this very rule.
     #[test]
     fn a_key_written_as_an_s_expression_is_refused() {
-        let opening = |token: &str| ["(", token, "-", "key ("].concat();
+        let field = |token: &str, algorithm: &str| {
+            format!("Key: ({token}-key ({algorithm} (n #00A9F91D2B0ACE094446BC27EE8373C7#)")
+        };
         for token in ["private", "protected-private"] {
-            let key = format!(
-                "Key: {}rsa (n #00A9F91D2B0ACE094446BC27EE8373C784BCB7A1C9BC#)",
-                opening(token)
-            );
-            assert!(
-                audit_content("k.key", &key).is_err(),
-                "a key written as {token} must be refused"
-            );
-            // The same file as `gnupg` lays it out, with the timestamp above it.
-            let stored = format!("Created: 20260727T130823\n{key}\n");
-            assert!(audit_content_bytes("private-keys-v1.d/k.key", stored.as_bytes()).is_err());
+            for algorithm in ["rsa", "dsa", "elg", "ecc"] {
+                let key = field(token, algorithm);
+                assert!(
+                    audit_content("k.key", &key).is_err(),
+                    "a {algorithm} key written as {token} must be refused"
+                );
+                let stored = format!("Created: 20260727T130823\n{key}\n");
+                assert!(
+                    audit_content_bytes("private-keys-v1.d/k.key", stored.as_bytes()).is_err(),
+                    "the file as gnupg lays it out must be refused"
+                );
+            }
         }
 
-        // The token is matched with the parenthesis its algorithm opens with, so
-        // naming the format is not writing one. The shadowed form stands in for
-        // a key held on a card and has no secret to leak.
+        // An Ed25519 key reaches no parameter on the line the field opens on:
+        // the curve and the flags are there instead, and the first `#` is on the
+        // line after. Requiring one here would have missed every one of them.
+        let ed25519 = "Key: (private-key (ecc (curve Ed25519)(flags eddsa)(q";
+        assert!(audit_content("k.key", ed25519).is_err());
+
+        // Everything below is ordinary text that a substring match refused. The
+        // last of them is the case with no way back: this gate reads commit
+        // messages, and a merged one cannot be amended.
+        let token = ["(private-", "key ("].concat();
+        let protected = ["(protected-private-", "key ("].concat();
         for innocent in [
+            format!("The rule matches the token {token}rsa ...) that gnupg writes."),
+            format!("| `{token}` | the unprotected form |"),
+            // Left as a literal on purpose: this file is itself audited, so
+            // carrying the shapes that a substring match refused is the proof
+            // that it no longer does.
+            "(define k (private-key (rsa)))".to_owned(),
+            "| `(private-key (` | the unprotected form |".to_owned(),
+            format!("fix(release): refuse a key written as {protected}rsa ...)"),
             "the agent keeps each one as a private-key s-expression".to_owned(),
             "fn private_key(bytes: &[u8]) -> Key { todo!() }".to_owned(),
             "see ~/.gnupg/private-keys-v1.d for the keygrip".to_owned(),
-            "(define (private-key material) (car material))".to_owned(),
             format!(
                 "Key: {}rsa (card-serial #D276#))",
                 ["(", "shadowed-private", "-", "key ("].concat()
             ),
+            // The field name, but not at the start of a line, is prose about it.
+            format!("  wrote Key: {token}rsa ...) into the file"),
+            // Documentation shows the field and elides what fills it. The
+            // algorithm is what the format always puts there, so requiring it
+            // is what separates the field from a description of the field.
+            "Key: (private-key (...))".to_owned(),
+            "Key: (private-key (<algorithm> <parameters>))".to_owned(),
+            format!("Key: {token}"),
         ] {
             assert!(
                 audit_content("ok.md", &innocent).is_ok(),
