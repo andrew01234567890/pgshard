@@ -1623,9 +1623,9 @@ pub(crate) fn inject_crash(checkpoint: CrashCheckpoint, skip: usize) -> CrashGua
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::os::unix::fs::symlink;
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Child, Command, ExitStatus, Stdio};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
@@ -1730,8 +1730,9 @@ host all all all reject\n";
     /// only honest way to assert that a signal was or was not sent is to have a
     /// process that would notice.
     struct SignalledChild {
-        child: Child,
+        child: RefCell<Child>,
         counter: PathBuf,
+        installed_traps: PathBuf,
         _directory: TempDir,
     }
 
@@ -1739,10 +1740,13 @@ host all all all reject\n";
         fn start() -> Self {
             let directory = TempDir::new().expect("create a child fixture");
             let counter = directory.path().join("hangups");
+            let installed_traps = directory.path().join("installed-traps");
             fs::write(&counter, b"").expect("create the hangup counter");
             let script = format!(
-                "trap 'printf x >> {counter}' HUP; while :; do sleep 0.02; done",
-                counter = counter.display()
+                "trap 'printf x >> {counter}' HUP; trap > {installed_traps}; \
+                 while :; do sleep 0.02; done",
+                counter = counter.display(),
+                installed_traps = installed_traps.display()
             );
             let child = Command::new("/bin/sh")
                 .arg("-c")
@@ -1752,19 +1756,80 @@ host all all all reject\n";
                 .stderr(Stdio::null())
                 .spawn()
                 .expect("spawn a signal fixture");
-            Self {
-                child,
+            let started = Self {
+                child: RefCell::new(child),
                 counter,
+                installed_traps,
                 _directory: directory,
+            };
+            started.wait_until_the_hangup_trap_is_installed();
+            started
+        }
+
+        /// Blocks until the child holds the `SIGHUP` trap it was started for.
+        ///
+        /// `spawn` returns once the shell has been exec'd, which carries no
+        /// claim that the shell has run a line. The default disposition of
+        /// `SIGHUP` is to terminate, so a dispatch that wins the race to the
+        /// unprotected shell kills it, and the hangup it never recorded is not
+        /// late -- it is never coming. The shell is made to report the traps it
+        /// holds, so what is waited for is the trap itself and not the time it
+        /// usually takes to install one.
+        fn wait_until_the_hangup_trap_is_installed(&self) {
+            let deadline = Instant::now() + POLL_LIMIT;
+            loop {
+                let reported = fs::read_to_string(&self.installed_traps).unwrap_or_default();
+                if reported.contains("HUP")
+                    && reported.contains(&self.counter.display().to_string())
+                {
+                    return;
+                }
+                if let Some(status) = self.exited() {
+                    panic!(
+                        "the fixture child exited before it installed a SIGHUP trap: {status}; it \
+                         reported {reported:?}"
+                    );
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the fixture child installed no SIGHUP trap within {POLL_LIMIT:?}; it reported \
+                     {reported:?}"
+                );
+                std::thread::sleep(Duration::from_millis(1));
             }
         }
 
+        fn pid(&self) -> u32 {
+            self.child.borrow().id()
+        }
+
         fn retained(&self) -> RetainedPostmaster {
-            RetainedPostmaster::open(self.child.id(), "fixture-boot".to_owned())
+            RetainedPostmaster::open(self.pid(), "fixture-boot".to_owned())
                 .expect("open a pidfd for the fixture child")
         }
 
+        /// The exit status of a child that is no longer running, if there is one.
+        fn exited(&self) -> Option<ExitStatus> {
+            self.child
+                .borrow_mut()
+                .try_wait()
+                .expect("inspect the fixture child")
+        }
+
+        /// The hangups recorded by a child that is still there to record more.
+        ///
+        /// A child that has died reports exactly what a child that was never
+        /// signalled reports, so a count taken from a dead one proves nothing
+        /// about what was dispatched.
         fn hangups(&self) -> usize {
+            let recorded = self.recorded_hangups();
+            if let Some(status) = self.exited() {
+                panic!("the fixture child is gone having recorded {recorded} hangups: {status}");
+            }
+            recorded
+        }
+
+        fn recorded_hangups(&self) -> usize {
             fs::read(&self.counter)
                 .expect("read the hangup counter")
                 .len()
@@ -1772,23 +1837,31 @@ host all all all reject\n";
 
         fn wait_for_hangups(&self, expected: usize) {
             let deadline = Instant::now() + POLL_LIMIT;
-            while Instant::now() < deadline {
-                if self.hangups() >= expected {
+            loop {
+                let recorded = self.recorded_hangups();
+                if recorded >= expected {
                     return;
                 }
+                if let Some(status) = self.exited() {
+                    panic!(
+                        "the fixture child died having recorded {recorded} of {expected} hangups: \
+                         {status}"
+                    );
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the fixture child recorded {recorded} hangups, expected at least {expected}"
+                );
                 std::thread::sleep(Duration::from_millis(10));
             }
-            panic!(
-                "the fixture child recorded {} hangups, expected at least {expected}",
-                self.hangups()
-            );
         }
     }
 
     impl Drop for SignalledChild {
         fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            let child = self.child.get_mut();
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 
@@ -2671,7 +2744,7 @@ host all all all reject\n";
     fn a_retained_postmaster_carries_the_kernel_start_time_of_that_exact_process() {
         let child = SignalledChild::start();
         let retained = child.retained();
-        let observed = process_start_ticks(child.child.id()).expect("read the start time");
+        let observed = process_start_ticks(child.pid()).expect("read the start time");
         assert_eq!(retained.incarnation().start_ticks, observed);
         assert!(observed > 0, "a live process has a start time");
         assert_eq!(
