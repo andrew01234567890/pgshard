@@ -84,8 +84,17 @@ jobs:
             schedule|workflow_dispatch) force_all=true ;;
           esac
 
+          # Union of what every commit in the range touched, not a diff of the
+          # two endpoints. An endpoint diff is not monotone in its base: a
+          # change made and then reverted inside a wider window vanishes from
+          # it, so widening the base could drop a component and let the
+          # aggregate authorize a tree no run ever tested. Renames stay
+          # undetected so both paths are reported, as the history audit reads
+          # them.
           if [[ -n "$base" ]] && git cat-file -e "${base}^{commit}" 2>/dev/null; then
-            git diff --name-only "$base" "$GITHUB_SHA" > "$RUNNER_TEMP/changed-files"
+            git log --first-parent --diff-merges=first-parent --no-renames \
+              --name-only --pretty=format: "$base..$GITHUB_SHA" \
+              | sed '/^$/d' | sort -u > "$RUNNER_TEMP/changed-files"
           else
             git ls-files > "$RUNNER_TEMP/changed-files"
           fi

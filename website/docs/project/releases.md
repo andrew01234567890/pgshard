@@ -6,9 +6,10 @@ description: SemVer rules and source-only GitHub releases.
 # Releases and versioning
 
 Every successful new commit on `main` at or after the repository's release-start
-marker normally receives one SemVer tag and a source-only GitHub Release. If an
-earlier commit could not be released, its complete untagged first-parent gap is
-instead recovered by one later green endpoint release.
+marker is eligible for one SemVer tag and a source-only GitHub Release. Where an
+earlier commit has not been released — because it failed, or because concurrent
+CI has not finished it yet — its complete untagged first-parent gap is instead
+recovered by one later green endpoint release.
 Before 1.0, releases use `0.x` prerelease versions. The initial foundation
 commit predates the release-start marker and remains an untagged bootstrap
 commit rather than bypassing the exact-head CI release gate.
@@ -53,11 +54,30 @@ baseline. The later green endpoint therefore validates every
 component changed anywhere in the gap. With no release tag, component detection
 runs against every tracked file and auditing starts immediately before the
 release marker. Release-eligible exact-SHA dispatches run the same full-gap
-audit as main pushes. Concurrent CI makes that widened base the ordinary case
-rather than a recovery path, because a run now commonly starts before its
-predecessor has been released. Widening can only move the base further back, so
-a concurrent run always tests a superset of what the same commit would have
-tested had it waited.
+audit as main pushes.
+
+Concurrent CI makes that widened base the ordinary case rather than a recovery
+path, because a run now commonly starts before its predecessor has been
+released. Component detection therefore reports the union of the paths every
+commit in the range touched, rather than a diff of the range's two endpoints.
+An endpoint diff is not monotone in its base: a change made and then reverted
+inside the wider window is absent from it, so a wider base could report fewer
+components than a narrower one and let an endpoint aggregate authorize a tree
+whose parts were never built together. The union has no such gap, which is what
+makes a widened base a strict superset and lets a concurrent run stand in for a
+serialized one. Renames are left undetected so that both the path a file left
+and the path it arrived at are reported, matching how the public-history audit
+reads the same range.
+
+Out-of-order completion also changes release granularity. Publication now
+commonly finds an earlier commit's aggregate still pending, which ends the
+leading all-green prefix at that commit and folds the rest of the gap into the
+green endpoint. The gap's strongest Conventional Commit bump is applied once, so
+two `feat:` commits that would each have earned a minor release under serialized
+CI commonly earn one minor release together. Nothing is lost: the endpoint
+release's notes carry every commit message in the gap and the version still
+reflects the strongest change in it. What changes is that an individual commit
+no longer reliably receives its own tag.
 
 Publication runs in a separate trusted `workflow_run` workflow after successful
 CI and retains its own serialized queue. Normal main publication resolves the

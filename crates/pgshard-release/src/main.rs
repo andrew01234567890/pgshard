@@ -4741,14 +4741,8 @@ mod tests {
         let ci = include_str!("../../../.github/workflows/ci.yml");
         let release = include_str!("../../../.github/workflows/release.yml");
         assert!(ci.contains("workflow_dispatch"));
-        // CI must not carry a concurrency group of its own. A shared group for
-        // non-pull-request runs holds each whole run pending with no job
-        // created, so main serializes end to end at one run per full CI
-        // duration; a hundred pending runs later, GitHub cancels the excess
-        // outright. It buys nothing, because the assertions below are what
-        // keeps publication serialized and exact.
-        assert!(!ci.contains("concurrency:"));
         assert_eq!(ci.matches("queue: max").count(), 0);
+        assert_concurrency_cannot_hold_one_commit_behind_another(&parsed_workflow());
         assert!(ci.contains("aggregate:"));
         assert_eq!(ci.matches(".github/scripts/ci-diff-base.sh").count(), 3);
         assert!(ci.contains("latest released first-parent commit"));
@@ -5280,6 +5274,46 @@ mod tests {
             declared, allowed,
             "{described} does not declare exactly the environment it is allowed"
         );
+    }
+
+    /// CI may collapse a pull request onto its own newest run, but no group
+    /// may span two commits. A group shared across commits holds a whole run
+    /// pending before any job is created, so the default branch advances at
+    /// one run per full CI duration and everything past a hundred waiting runs
+    /// is cancelled outright. A group keeps distinct commits apart exactly
+    /// when its last `||` alternative — what the expression falls back to for
+    /// every event that is not a pull request — is the run's own identifier.
+    fn assert_concurrency_cannot_hold_one_commit_behind_another(workflow: &serde_norway::Value) {
+        let mut declared = vec![("the workflow", workflow.get("concurrency"))];
+        for (name, job) in workflow["jobs"]
+            .as_mapping()
+            .expect("the workflow declares jobs")
+        {
+            let name = name.as_str().expect("a job is named");
+            declared.push((name, job.get("concurrency")));
+        }
+
+        for (described, concurrency) in declared {
+            let Some(concurrency) = concurrency else {
+                continue;
+            };
+            let group = concurrency
+                .get("group")
+                .map_or_else(|| concurrency.as_str(), serde_norway::Value::as_str)
+                .unwrap_or_else(|| panic!("{described} names no concurrency group"));
+            let fallback = group
+                .trim_end()
+                .trim_end_matches("}}")
+                .rsplit("||")
+                .next()
+                .expect("an expression has a last alternative")
+                .trim();
+            assert_eq!(
+                fallback, "github.run_id",
+                "{described} groups on {group}, which can hold one commit's \
+                 run behind another's"
+            );
+        }
     }
 
     fn parsed_workflow() -> serde_norway::Value {
