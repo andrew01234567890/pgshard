@@ -38,7 +38,7 @@ RUN find target/release/deps -maxdepth 1 -type f -name 'pgshard_agent-*' -perm -
     test "$(printf '%s\n' "${test_binary}" | wc -l)" -eq 1 && \
     install -D -m 0755 "${test_binary}" /out/pgshard-agent-tests
 
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:66aa873a4a14fb164aa01296058efd8253744606d72715e45acface073359faa AS runtime
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e AS runtime
 
 ARG PGSHARD_BUILD_VERSION
 ARG PGSHARD_GIT_SHA
