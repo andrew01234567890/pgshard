@@ -13,8 +13,14 @@ tag accepted by PostgreSQL 18. Startup packets retain PostgreSQL's 10,004-byte
 total limit; fixed negotiation and cancellation-key bounds are enforced from
 their eight-byte header before buffering the rest. Ordinary messages use the
 stricter of PostgreSQL's small-message limit, general authentication limit, or
-1,024-byte SCRAM limit and a caller-supplied large-message limit, with a hard
-64 MiB pooler ceiling. Entering the SCRAM phase requires the proof returned by
+1,024-byte SCRAM limit and a caller-supplied large-message limit. A caller may
+select any policy up to PostgreSQL's own `PQ_LARGE_MESSAGE_LIMIT` of
+1,073,741,822 bytes; `DEFAULT_LARGE_MESSAGE_LENGTH` is a conservative 16 MiB
+operating policy and not a PostgreSQL bound, so a caller that must admit every
+message PostgreSQL serves has to raise it and budget the buffering. The
+decoders never allocate: an over-long frame is reported from its length word
+and an incomplete one reports the exact buffer it needs.
+Entering the SCRAM phase requires the proof returned by
 a successful bounded SCRAM-advertisement encode; callers cannot construct that
 phase directly. Bytes
 already present after an SSL request remain unconsumed so an accepted TLS
@@ -53,7 +59,9 @@ four-to-256-byte PostgreSQL 18 cancellation key, `ParameterDescription`
 includes at most 65,535 OIDs, startup authentication and protocol-negotiation
 messages use libpq's 2,000-byte ceiling, other tags not classified as long
 retain libpq's 30,000-byte defensive ceiling, and long row/COPY/error/notice
-families remain subject to the caller ceiling no larger than 64 MiB. Unknown
+families remain subject to the caller ceiling. libpq applies no ceiling at all
+to those long families, so any caller policy below PostgreSQL's own limit can
+refuse a frame a real server would have sent. Unknown
 tags are rejected before their length is trusted. Authentication, query-cycle,
 COPY, and replication phase legality remains the future session state machine's
 responsibility. The typed backend body decoders validate
@@ -87,7 +95,12 @@ anything other than canonical `UTF8`. The effective session must still bind
 the protocol proof and backend key data to one exact upstream socket and
 enforce authentication ordering and policy, channel binding, server identity,
 and configured client-protocol policy. The frontend body decoders include
-`Describe` and `Close` statement/portal targets. They do not associate a
+`Describe` and `Close` statement/portal targets. `Bind` validates PostgreSQL's
+parameter-format cardinality rule but carries format-code values through
+unvalidated, because PostgreSQL raises "unsupported format code" only where a
+parameter is converted or a result column is printed; a `Bind` that declares one
+and never decodes a value under it succeeds on a real server. The session layer
+owns that error. They do not associate a
 description with a Parse generation, virtualize a name, track a query cycle,
 identify a backend, or establish a catalog fence.
 
@@ -103,7 +116,7 @@ otherwise-unconstructible proof required to frame subsequent SCRAM responses.
 validates the five-byte SQLSTATE and nonempty UTF-8 message, and deliberately
 omits optional diagnostics. Its explicit caller limit uses libpq's 30,000-byte
 pre-authentication ceiling during startup while allowing bounded authenticated
-session policy up to the pooler's 64 MiB hard limit. Variable frames are
+session policy up to PostgreSQL's own large-message limit. Variable frames are
 completely sized and validated before the output is touched. They retain
 PostgreSQL 18's family bounds and never include values or cancellation keys in
 errors. Unsupported

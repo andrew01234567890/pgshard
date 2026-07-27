@@ -71,15 +71,43 @@ pub const MAX_STARTUP_BODY_LENGTH: usize = 10_000;
 /// Maximum total startup frame size, including its four-byte length word.
 pub const MAX_STARTUP_FRAME_LENGTH: usize = MAX_STARTUP_BODY_LENGTH + 4;
 /// `PostgreSQL` 18 small-message bound, including the four-byte length word.
+///
+/// `PQ_SMALL_MESSAGE_LIMIT` in `src/include/libpq/libpq.h:30`.
 pub const SMALL_MESSAGE_LENGTH: usize = 10_000;
 /// `PostgreSQL` 18 authentication-message bound, including the length word.
 pub const AUTHENTICATION_MESSAGE_LENGTH: usize = 65_535;
 /// `PostgreSQL` 18's maximum length word for one frontend SCRAM message.
 pub const SCRAM_MESSAGE_LENGTH: usize = 1_024;
-/// Default bound for typed protocol messages that may carry large payloads.
+/// `PostgreSQL` 18 large-message bound, including the four-byte length word.
+///
+/// `PQ_LARGE_MESSAGE_LIMIT` is `MaxAllocSize - 1`
+/// (`src/include/libpq/libpq.h:31`, `src/include/utils/memutils.h:40`).
+/// `SocketBackend` applies it to `Query`, `FunctionCall`, `Bind`, `Parse`, and
+/// `CopyData` (`src/backend/tcop/postgres.c:399`, `:404`, `:416`, `:437`), and
+/// `CopyGetData` and `WalSndGetData` apply it to `CopyData`
+/// (`src/backend/commands/copyfromparse.c:283`,
+/// `src/backend/replication/walsender.c:751` and `:2305`). A frame `PostgreSQL`
+/// itself would serve is bounded by this value and nothing smaller.
+pub const LARGE_MESSAGE_LENGTH: usize = 1_073_741_822;
+/// Conservative default bound for typed messages that may carry large payloads.
+///
+/// This is a pooler operating policy, **not** a `PostgreSQL` bound. `PostgreSQL`
+/// charges a long message to one backend process per connection, which the
+/// postmaster can lose on its own; a pooler holds every session in one address
+/// space, so the same frame size multiplies by the connection count and one
+/// client can exhaust the process shared by every tenant. Callers that must
+/// admit every message `PostgreSQL` would serve — a 20 MiB `Bind` parameter, an
+/// oversized `PQputCopyData` chunk, a detoasted column inside `XLogData` — have
+/// to select a larger policy explicitly, up to [`LARGE_MESSAGE_LENGTH`], and
+/// budget the buffering that implies.
 pub const DEFAULT_LARGE_MESSAGE_LENGTH: usize = 16 * 1024 * 1024;
-/// Hard pooler bound for one typed protocol message, regardless of caller policy.
-pub const MAX_LARGE_MESSAGE_LENGTH: usize = 64 * 1024 * 1024;
+/// Largest caller policy the decoders accept, equal to `PostgreSQL`'s own bound.
+///
+/// The decoders never allocate: an over-long frame is reported from its length
+/// word, and [`Decode::Incomplete`] tells the caller the exact buffer a complete
+/// frame needs. The memory decision therefore belongs to the caller, and this
+/// ceiling exists so a caller can choose protocol fidelity.
+pub const MAX_LARGE_MESSAGE_LENGTH: usize = LARGE_MESSAGE_LENGTH;
 /// Minimum key size accepted by a `PostgreSQL` 18 `CancelRequest`.
 pub const MIN_CANCEL_REQUEST_KEY_LENGTH: usize = 1;
 /// Minimum key size accepted from `PostgreSQL` 18 `BackendKeyData`.
@@ -1312,6 +1340,59 @@ mod tests {
                 Err(DecodeError::UnexpectedTagForPhase { .. })
             ));
         }
+    }
+
+    // PostgreSQL serves any long message whose length word fits
+    // PQ_LARGE_MESSAGE_LIMIT (src/include/libpq/libpq.h:31), so a Bind carrying
+    // one 20 MiB bytea is a frame a real server answers. The conservative
+    // default refuses it; PostgreSQL's own limit, which a caller may now select,
+    // does not.
+    #[test]
+    fn postgres_admits_long_frames_the_conservative_default_refuses() {
+        const TWENTY_MEBIBYTES: usize = 20 * 1024 * 1024;
+        assert_eq!(LARGE_MESSAGE_LENGTH, 0x3fff_ffff - 1, "MaxAllocSize - 1");
+
+        let header = |length: usize| {
+            let mut header = vec![b'B'];
+            header.extend_from_slice(&u32::try_from(length).expect("length fits").to_be_bytes());
+            header
+        };
+
+        assert!(matches!(
+            decode_frontend(
+                &header(TWENTY_MEBIBYTES),
+                FrontendPhase::Regular,
+                DEFAULT_LARGE_MESSAGE_LENGTH,
+            ),
+            Err(DecodeError::FrameTooLarge {
+                maximum: DEFAULT_LARGE_MESSAGE_LENGTH,
+                ..
+            })
+        ));
+        assert!(matches!(
+            decode_frontend(
+                &header(TWENTY_MEBIBYTES),
+                FrontendPhase::Regular,
+                LARGE_MESSAGE_LENGTH,
+            ),
+            Ok(Decode::Incomplete { required }) if required == TWENTY_MEBIBYTES + 1
+        ));
+        assert!(matches!(
+            decode_frontend(
+                &header(LARGE_MESSAGE_LENGTH),
+                FrontendPhase::Regular,
+                LARGE_MESSAGE_LENGTH,
+            ),
+            Ok(Decode::Incomplete { .. })
+        ));
+        assert!(matches!(
+            decode_frontend(
+                &header(LARGE_MESSAGE_LENGTH + 1),
+                FrontendPhase::Regular,
+                LARGE_MESSAGE_LENGTH,
+            ),
+            Err(DecodeError::FrameTooLarge { .. })
+        ));
     }
 
     #[test]

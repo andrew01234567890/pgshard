@@ -2,11 +2,23 @@
 
 use libfuzzer_sys::fuzz_target;
 use pgshard_pgwire::{
-    ClientEncoding, DEFAULT_LARGE_MESSAGE_LENGTH, Decode, FrontendFrame, FrontendPhase,
-    ScramMechanisms, decode_bind, decode_close, decode_describe, decode_execute, decode_frontend,
-    decode_parse, decode_query, decode_sasl_initial_response, decode_sasl_response,
-    encode_authentication_sasl, require_empty_body,
+    ClientEncoding, DEFAULT_LARGE_MESSAGE_LENGTH, Decode, DecodeError, FrontendFrame, FrontendPhase,
+    MAX_LARGE_MESSAGE_LENGTH, SCRAM_MESSAGE_LENGTH, SMALL_MESSAGE_LENGTH, ScramMechanisms,
+    decode_bind, decode_close, decode_describe, decode_execute, decode_frontend, decode_parse,
+    decode_query, decode_sasl_initial_response, decode_sasl_response, encode_authentication_sasl,
+    require_empty_body,
 };
+
+// Caller policies from the decoder's minimum to PostgreSQL's own large-message
+// limit, so the family-versus-caller minimum is exercised on both sides of every
+// family bound instead of only at the 16 MiB default.
+const LIMITS: [usize; 5] = [
+    4,
+    SCRAM_MESSAGE_LENGTH,
+    SMALL_MESSAGE_LENGTH,
+    DEFAULT_LARGE_MESSAGE_LENGTH,
+    MAX_LARGE_MESSAGE_LENGTH,
+];
 
 fuzz_target!(|input: &[u8]| {
     let mut advertisement = [0_u8; 64];
@@ -20,10 +32,19 @@ fuzz_target!(|input: &[u8]| {
         FrontendPhase::CopyIn,
         FrontendPhase::ReplicationStreaming,
     ] {
-        if let Ok(Decode::Complete { frame, .. }) =
-            decode_frontend(input, phase, DEFAULT_LARGE_MESSAGE_LENGTH)
-        {
-            exercise_typed_decoders(frame);
+        for limit in LIMITS {
+            if let Ok(Decode::Complete { frame, .. }) = decode_frontend(input, phase, limit) {
+                exercise_typed_decoders(frame);
+            }
+        }
+        for rejected in [3, MAX_LARGE_MESSAGE_LENGTH + 1] {
+            assert!(
+                matches!(
+                    decode_frontend(input, phase, rejected),
+                    Err(DecodeError::InvalidMaximum { .. })
+                ),
+                "an out-of-range caller policy must be rejected before the input"
+            );
         }
     }
 });

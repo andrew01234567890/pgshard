@@ -61,6 +61,12 @@ empty-path token that the caller must rebuild from the current backend, and
 checks PostgreSQL's authoritative parameter count plus the selected
 format/NULL/value bytes without copying before producing a canonical shard
 route. It intentionally does not accept or trust statement and portal names.
+Format codes other than text and binary are decoded and carried rather than
+rejected, because PostgreSQL raises "unsupported format code" only where a
+parameter is converted or a result column is printed; a `Bind` that declares one
+without decoding a value under it is accepted by a real server and so by the
+decoder. Routing still refuses such a parameter, exactly where PostgreSQL would
+fail to convert it.
 The backend codec supplies framing, borrowed type OIDs, completion-body
 validation, transaction-status bytes, and bounded startup-control encoders
 only; it does not prove that a description belongs to the relevant Parse,
@@ -135,7 +141,15 @@ session encoding before storage; routing raw bytes from any other encoding can
 disagree with the stored value and is therefore not allowed. Both formats also
 reject the zero byte exactly as PostgreSQL does.
 
-The decoder caps one frontend frame at 64 MiB. Startup, authentication, and
+The decoder caps one frontend frame at a caller-supplied limit, which may be
+anything up to PostgreSQL's own 1,073,741,822-byte `PQ_LARGE_MESSAGE_LIMIT`.
+The 16 MiB default is a conservative pooler operating policy rather than a
+PostgreSQL bound: PostgreSQL charges a long message to one backend process per
+connection, whereas a pooler holds every session in one address space. A caller
+that must admit every message PostgreSQL serves — a multi-megabyte `Bind`
+parameter, a large `PQputCopyData` chunk, a detoasted column inside `XLogData` —
+must raise it explicitly.
+Startup, authentication, and
 control-message families retain PostgreSQL 18's smaller family-specific limits.
 SCRAM responses use a dedicated authentication phase whose proof is returned
 only after the bounded SCRAM advertisement encoder succeeds. That phase applies
@@ -197,8 +211,8 @@ to select SCRAM frontend framing.
 Minimal errors contain canonical localized and nonlocalized severity, SQLSTATE,
 and primary-message fields; optional diagnostic fields are not encoded yet.
 The caller supplies the phase-appropriate error limit: 30,000 bytes before
-authentication or a bounded authenticated-session policy no greater than the
-64 MiB pooler ceiling. Caller-buffered encoders validate the complete bounded
+authentication or a bounded authenticated-session policy no greater than
+PostgreSQL's own large-message limit. Caller-buffered encoders validate the complete bounded
 frame before changing output and redact payloads from errors. The PostgreSQL 18
 fixture requires non-SASL startup-control output other than `ErrorResponse` to
 equal live server bytes; the SCRAM and error primitives currently have

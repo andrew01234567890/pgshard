@@ -34,6 +34,8 @@ const CATALOG_DATABASE_MESSAGE: &str =
 const REPLICATION_SQLSTATE: [u8; 5] = *b"0A000";
 const REPLICATION_MESSAGE: &str =
     "replication connections are not available through the application pooler";
+const PROTOCOL_VIOLATION_SQLSTATE: [u8; 5] = *b"08P01";
+const UNENCRYPTED_SSL_MESSAGE: &str = "received unencrypted data after SSL request";
 const ERROR_BUFFER_LENGTH: usize = 128;
 
 struct FrontendServerPolicy {
@@ -152,12 +154,12 @@ async fn serve_connection(
     let action = tokio::time::timeout(startup_timeout, read_startup(&mut stream, &mut input)).await;
     let result = match action {
         Ok(Ok(StartupAction::Regular {
-            length,
+            buffered,
             startup_policy,
         })) => {
             relay_regular_startup(
                 &mut stream,
-                &input[..length],
+                &input[..buffered],
                 startup_policy,
                 &state,
                 backend.as_ref(),
@@ -187,7 +189,8 @@ async fn serve_connection(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StartupAction {
     Regular {
-        length: usize,
+        /// Startup packet plus any bytes the client pipelined behind it.
+        buffered: usize,
         startup_policy: StartupPolicy,
     },
     Cancel {
@@ -202,6 +205,16 @@ struct StartupPolicy {
     replication: bool,
 }
 
+/// Reads one startup-phase decision, honouring pipelining exactly as
+/// `PostgreSQL` does.
+///
+/// `ProcessStartupPacket` reads exactly the packet's own bytes and leaves
+/// whatever follows in `PqRecvBuffer` for the session to consume
+/// (`src/backend/tcop/backend_startup.c:553`), so a client that writes its
+/// `StartupMessage` and first query in one `write` is served. The no-trailing-data
+/// rule applies only after SSL or GSS negotiation, where `PostgreSQL` reports
+/// `pq_buffer_remaining_data() > 0` as a FATAL protocol violation
+/// (`src/backend/tcop/backend_startup.c:627` and `:690`).
 async fn read_startup(
     stream: &mut TcpStream,
     input: &mut [u8; MAX_STARTUP_FRAME_LENGTH],
@@ -224,15 +237,22 @@ async fn read_startup(
             }
             Ok(Decode::Complete { frame, consumed }) => match frame {
                 StartupFrame::SslRequest => {
-                    if ssl_refused || consumed != filled {
+                    if ssl_refused {
                         return Ok(StartupAction::Closed);
                     }
                     ssl_refused = true;
                     stream.write_all(b"N").await?;
+                    if consumed != filled {
+                        send_fatal(stream, PROTOCOL_VIOLATION_SQLSTATE, UNENCRYPTED_SSL_MESSAGE)
+                            .await?;
+                        return Ok(StartupAction::Closed);
+                    }
                     filled = 0;
                 }
                 StartupFrame::GssEncryptionRequest => {
-                    if gss_refused || consumed != filled {
+                    // `decode_startup` has already rejected buffered bytes
+                    // behind a GSS request, so `consumed == filled` here.
+                    if gss_refused {
                         return Ok(StartupAction::Closed);
                     }
                     gss_refused = true;
@@ -240,18 +260,14 @@ async fn read_startup(
                     filled = 0;
                 }
                 StartupFrame::CancelRequest { .. } => {
-                    return Ok(if consumed == filled {
-                        StartupAction::Cancel { length: consumed }
-                    } else {
-                        StartupAction::Closed
-                    });
+                    // ProcessCancelRequestPacket honours the request and the
+                    // backend then terminates, discarding anything buffered
+                    // behind it (src/backend/tcop/backend_startup.c:570).
+                    return Ok(StartupAction::Cancel { length: consumed });
                 }
                 StartupFrame::Startup { parameters, .. } => {
-                    if consumed != filled {
-                        return Ok(StartupAction::Closed);
-                    }
                     return Ok(StartupAction::Regular {
-                        length: consumed,
+                        buffered: filled,
                         startup_policy: startup_policy(parameters),
                     });
                 }
@@ -298,7 +314,10 @@ fn startup_policy(parameters: pgshard_pgwire::StartupParameters<'_>) -> StartupP
 }
 
 fn replication_session(value: &[u8]) -> Option<bool> {
-    if value.eq_ignore_ascii_case(b"database") {
+    // PostgreSQL compares this value with strcmp, not case-insensitively
+    // (src/backend/tcop/backend_startup.c:781), so "DATABASE" is not the
+    // logical-replication spelling; it falls through to parse_bool and is FATAL.
+    if value == b"database" {
         return Some(true);
     }
     parse_bool(value)
@@ -325,9 +344,15 @@ fn parse_bool(value: &[u8]) -> Option<bool> {
     }
 }
 
+/// Relays one accepted startup to shard zero.
+///
+/// `buffered_startup` is the startup packet followed by any bytes the client
+/// pipelined behind it. Both are written to the backend in one go: the backend
+/// is a real `PostgreSQL`, which buffers the remainder until the session reaches
+/// it, so forwarding verbatim reproduces direct-connection behaviour.
 async fn relay_regular_startup(
     frontend: &mut TcpStream,
-    startup: &[u8],
+    buffered_startup: &[u8],
     startup_policy: StartupPolicy,
     state: &PoolerState,
     target: Option<&BackendTarget>,
@@ -362,7 +387,11 @@ async fn relay_regular_startup(
     frontend.set_nodelay(true)?;
     backend.set_nodelay(true)?;
     if !matches!(
-        tokio::time::timeout(target.connect_timeout(), backend.write_all(startup)).await,
+        tokio::time::timeout(
+            target.connect_timeout(),
+            backend.write_all(buffered_startup)
+        )
+        .await,
         Ok(Ok(()))
     ) {
         tracing::debug!("shard-zero backend startup write failed");
@@ -623,6 +652,27 @@ mod tests {
         }
     }
 
+    // PostgreSQL selects logical replication with strcmp(valptr, "database")
+    // (src/backend/tcop/backend_startup.c:781). Any other casing falls through
+    // to parse_bool, which rejects it, so the two must not be conflated once a
+    // replication path exists.
+    #[test]
+    fn only_lowercase_database_selects_logical_replication() {
+        assert_eq!(replication_session(b"database"), Some(true));
+        for value in [
+            b"DATABASE".as_slice(),
+            b"Database",
+            b"dataBASE",
+            b"databasE",
+        ] {
+            assert_eq!(
+                replication_session(value),
+                None,
+                "PostgreSQL rejects replication={value:?} as an invalid boolean"
+            );
+        }
+    }
+
     #[test]
     fn duplicate_replication_parameters_use_the_last_recognized_value() {
         let cases: [(&[u8], &[u8], bool); 5] = [
@@ -847,6 +897,145 @@ mod tests {
             .expect("read result bytes");
         assert_eq!(&result, b"result");
         assert_eq!(backend_task.await.expect("fake backend task"), startup);
+
+        shutdown.send(()).expect("server retains shutdown receiver");
+        task.await.expect("server task").expect("clean shutdown");
+    }
+
+    // PostgreSQL reads exactly the startup packet and leaves the rest in
+    // PqRecvBuffer for SocketBackend (src/backend/tcop/backend_startup.c:553),
+    // so a driver that writes its StartupMessage and first query in one write
+    // is served rather than dropped.
+    #[tokio::test]
+    async fn a_startup_pipelined_with_a_query_relays_both_to_the_backend() {
+        const PIPELINED_QUERY: &[u8] = b"Q\x00\x00\x00\x0dSELECT 1\x00";
+
+        let backend_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind pipelined backend");
+        let backend_address = backend_listener
+            .local_addr()
+            .expect("pipelined backend address");
+        let backend_task = tokio::spawn(async move {
+            let (mut backend, _) = backend_listener.accept().await.expect("accept pipelined");
+            let startup = read_startup_packet(&mut backend).await;
+            let mut query = [0_u8; PIPELINED_QUERY.len()];
+            backend
+                .read_exact(&mut query)
+                .await
+                .expect("read pipelined query");
+            backend
+                .write_all(b"ready")
+                .await
+                .expect("write ready marker");
+            (startup, query)
+        });
+        let (address, shutdown, task) = server(
+            test_policy(),
+            ready_state(),
+            Some(backend_target(backend_address)),
+        )
+        .await;
+
+        let startup = startup_packet(&[(b"user", b"postgres"), (b"database", b"postgres")]);
+        let mut pipelined = startup.clone();
+        pipelined.extend_from_slice(PIPELINED_QUERY);
+        let mut client = TcpStream::connect(address)
+            .await
+            .expect("connect pipelined client");
+        client
+            .write_all(&pipelined)
+            .await
+            .expect("send startup and query in one write");
+        let mut ready = [0_u8; 5];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut ready))
+            .await
+            .expect("pipelined session deadline")
+            .expect("read ready marker");
+        assert_eq!(&ready, b"ready");
+        let (relayed_startup, relayed_query) = backend_task.await.expect("pipelined backend task");
+        assert_eq!(relayed_startup, startup);
+        assert_eq!(relayed_query.as_slice(), PIPELINED_QUERY);
+
+        shutdown.send(()).expect("server retains shutdown receiver");
+        task.await.expect("server task").expect("clean shutdown");
+    }
+
+    // ProcessCancelRequestPacket honours the request and the backend then exits
+    // (src/backend/tcop/backend_startup.c:570), so bytes behind the request are
+    // discarded rather than voiding the cancellation.
+    #[tokio::test]
+    async fn a_cancel_request_is_forwarded_despite_pipelined_bytes() {
+        let backend_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind pipelined cancellation backend");
+        let backend_address = backend_listener
+            .local_addr()
+            .expect("pipelined cancellation backend address");
+        let backend_task = tokio::spawn(async move {
+            let (mut backend, _) = backend_listener
+                .accept()
+                .await
+                .expect("accept pipelined cancel");
+            let mut request = Vec::new();
+            backend
+                .read_to_end(&mut request)
+                .await
+                .expect("read cancellation request");
+            request
+        });
+        let (address, shutdown, task) = server(
+            test_policy(),
+            ready_state(),
+            Some(backend_target(backend_address)),
+        )
+        .await;
+
+        let request = [0, 0, 0, 16, 4, 210, 22, 46, 0, 0, 0, 7, 1, 2, 3, 4];
+        let mut pipelined = request.to_vec();
+        pipelined.extend_from_slice(b"Q\x00\x00\x00\x0dSELECT 1\x00");
+        let mut client = TcpStream::connect(address)
+            .await
+            .expect("connect pipelined cancellation client");
+        client
+            .write_all(&pipelined)
+            .await
+            .expect("send cancellation request and trailing bytes");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), backend_task)
+                .await
+                .expect("pipelined cancellation deadline")
+                .expect("pipelined cancellation task"),
+            request
+        );
+
+        shutdown.send(()).expect("server retains shutdown receiver");
+        task.await.expect("server task").expect("clean shutdown");
+    }
+
+    // Only the encryption-negotiation paths forbid buffered data, and PostgreSQL
+    // reports it as a FATAL protocol violation rather than closing in silence
+    // (src/backend/tcop/backend_startup.c:627).
+    #[tokio::test]
+    async fn unencrypted_data_after_a_refused_ssl_request_is_a_fatal_protocol_violation() {
+        let (address, shutdown, task) = server(test_policy(), ready_state(), None).await;
+
+        let mut pipelined = encode_ssl_request().to_vec();
+        pipelined.extend_from_slice(b"Q\x00\x00\x00\x0dSELECT 1\x00");
+        let mut client = TcpStream::connect(address)
+            .await
+            .expect("connect unencrypted-data client");
+        client
+            .write_all(&pipelined)
+            .await
+            .expect("send SSL request and unencrypted data");
+        let mut refusal = [0];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut refusal))
+            .await
+            .expect("SSL refusal deadline")
+            .expect("read SSL refusal");
+        assert_eq!(refusal, *b"N");
+        read_fatal(&mut client, b"C08P01").await;
 
         shutdown.send(()).expect("server retains shutdown receiver");
         task.await.expect("server task").expect("clean shutdown");
