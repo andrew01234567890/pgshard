@@ -21,6 +21,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1767,13 +1768,13 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	var consumerUnavailableOutput string
+	var consumerUnavailable catalogActivationAttempt
 	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
-		status, _, output, err := challengeCapability(ctx)
-		consumerUnavailableOutput = string(output)
-		return err == nil && status == http.StatusServiceUnavailable, nil
+		status, _, output, challengeErr := challengeCapability(ctx)
+		consumerUnavailable = catalogActivationAttempt{status: status, output: output, err: challengeErr}
+		return challengeErr == nil && status == http.StatusServiceUnavailable, nil
 	}); err != nil {
-		t.Fatalf("wait for isolated catalog activation 503: %v; last output=%q", err, consumerUnavailableOutput)
+		t.Fatalf("wait for isolated catalog activation 503: %v; %s", err, consumerUnavailable)
 	}
 	var statusDuringConsumerFailure struct {
 		PostgresProcess string `json:"postgres_process"`
@@ -1805,15 +1806,17 @@ func TestKINDManagerRunsAgentQuarantine(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	var consumerRecovery catalogActivationAttempt
 	if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
-		status, capability, _, err := challengeCapability(ctx)
-		if err == nil && status == http.StatusOK {
+		status, capability, output, challengeErr := challengeCapability(ctx)
+		consumerRecovery = catalogActivationAttempt{status: status, output: output, err: challengeErr}
+		if challengeErr == nil && status == http.StatusOK {
 			activationCapability = capability
 			return true, nil
 		}
 		return false, nil
 	}); err != nil {
-		t.Fatalf("wait for catalog activation consumer recovery: %v", err)
+		t.Fatalf("wait for catalog activation consumer recovery: %v; %s", err, consumerRecovery)
 	}
 	runKubectl(t, ctx, "--namespace", "pgshard-system", "scale", "deployment/pgshard-controller-manager", "--replicas=1")
 	waitForManagerReplicas(t, ctx, kubeClient, 1)
@@ -3560,6 +3563,39 @@ func agentEnvironmentFieldPath(environment []corev1.EnvVar, name string) string 
 	return ""
 }
 
+// catalogActivationAttempt keeps the whole outcome of a challenge, because a
+// poll that reports only its own deadline hides whether the endpoint refused
+// the request or the transport never carried it.
+type catalogActivationAttempt struct {
+	status int
+	output []byte
+	err    error
+}
+
+func (attempt catalogActivationAttempt) String() string {
+	return fmt.Sprintf("last attempt: status=%d error=%v output=%q", attempt.status, attempt.err, attempt.output)
+}
+
+// portForwardDiagnostics collects the port-forward's own account of itself.
+// kubectl reports a forwarding failure on stderr and then exits, which leaves
+// every later request dialing a port nothing is listening on.
+type portForwardDiagnostics struct {
+	mutex sync.Mutex
+	lines bytes.Buffer
+}
+
+func (diagnostics *portForwardDiagnostics) Write(data []byte) (int, error) {
+	diagnostics.mutex.Lock()
+	defer diagnostics.mutex.Unlock()
+	return diagnostics.lines.Write(data)
+}
+
+func (diagnostics *portForwardDiagnostics) String() string {
+	diagnostics.mutex.Lock()
+	defer diagnostics.mutex.Unlock()
+	return diagnostics.lines.String()
+}
+
 func startKINDPodPortForward(t *testing.T, ctx context.Context, namespace, pod string, remotePort int32) string {
 	t.Helper()
 	reservation, err := net.Listen("tcp", "127.0.0.1:0")
@@ -3580,11 +3616,17 @@ func startKINDPodPortForward(t *testing.T, ctx context.Context, namespace, pod s
 		"pod/"+pod,
 		fmt.Sprintf("%d:%d", localPort, remotePort),
 	)
-	command.Stdout = io.Discard
-	command.Stderr = io.Discard
+	diagnostics := &portForwardDiagnostics{}
+	command.Stdout = diagnostics
+	command.Stderr = diagnostics
 	if err := command.Start(); err != nil {
 		t.Fatalf("start catalog activation TLS port-forward: %v", err)
 	}
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("catalog activation TLS port-forward output:\n%s", diagnostics)
+		}
+	})
 	done := make(chan error, 1)
 	go func() { done <- command.Wait() }()
 	t.Cleanup(func() {
@@ -3614,11 +3656,11 @@ func startKINDPodPortForward(t *testing.T, ctx context.Context, namespace, pod s
 		select {
 		case err := <-done:
 			done <- err
-			t.Fatalf("catalog activation TLS port-forward exited before readiness: %v", err)
+			t.Fatalf("catalog activation TLS port-forward exited before readiness: %v; last dial=%v; output:\n%s", err, dialErr, diagnostics)
 		case <-deadline.C:
-			t.Fatal("catalog activation TLS port-forward was not ready")
+			t.Fatalf("catalog activation TLS port-forward was not ready: last dial=%v; output:\n%s", dialErr, diagnostics)
 		case <-ctx.Done():
-			t.Fatalf("catalog activation TLS port-forward context ended: %v", ctx.Err())
+			t.Fatalf("catalog activation TLS port-forward context ended: %v; last dial=%v; output:\n%s", ctx.Err(), dialErr, diagnostics)
 		case <-ticker.C:
 		}
 	}
