@@ -7,6 +7,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -99,17 +101,17 @@ fn poll_child(
 
 #[test]
 fn quarantine_process_status_and_sigterm_form_one_supervised_contract() {
-    let fixture = AgentFixture::new("#!/bin/sh\nwhile :; do :; done\n");
+    let fixture = AgentFixture::new("while :; do :; done\n");
     let signal_handlers_ready = fixture.root.path().join("signal-handlers-ready");
-    fixture.replace_executable(&format!(
-        "#!/bin/sh\ntrap 'exit 0' TERM\n: > '{}'\nwhile :; do :; done\n",
+    fixture.install_postmaster(&format!(
+        "trap 'exit 0' TERM\n: > '{}'\nwhile :; do :; done\n",
         signal_handlers_ready.display()
     ));
     let address = reserve_address();
     let mut child = fixture.spawn(address);
 
-    wait_for_quarantine(&mut child, address);
-    wait_for_marker(&signal_handlers_ready);
+    wait_for_supervised_postmaster(&mut child, address, &fixture);
+    wait_for_marker(&mut child, &signal_handlers_ready);
 
     let readiness = request_http(address, "/readyz").expect("request readiness");
     assert!(readiness.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
@@ -136,10 +138,10 @@ fn quarantine_process_status_and_sigterm_form_one_supervised_contract() {
 
 #[test]
 fn postmaster_crash_aborts_a_held_http_request_within_the_process_bound() {
-    let fixture = AgentFixture::new("#!/bin/sh\nwhile :; do :; done\n");
+    let fixture = AgentFixture::new("while :; do :; done\n");
     let address = reserve_address();
     let mut child = fixture.spawn(address);
-    wait_for_quarantine(&mut child, address);
+    wait_for_supervised_postmaster(&mut child, address, &fixture);
 
     let postgres_pid = wait_for_only_child(child.child().id());
     let held_request = open_partial_http_request(address);
@@ -163,20 +165,20 @@ fn postmaster_crash_aborts_a_held_http_request_within_the_process_bound() {
 
 #[test]
 fn setsid_descendant_is_reaped_before_pgdata_can_be_reacquired() {
-    let fixture = AgentFixture::new("#!/bin/sh\nwhile :; do sleep 1; done\n");
+    let fixture = AgentFixture::new("while :; do sleep 1; done\n");
     let postmaster_marker = fixture.root.path().join("postmaster.pid");
     let descendant_marker = fixture.root.path().join("setsid-descendant.pid");
-    fixture.replace_executable(&format!(
-        "#!/bin/sh\nprintf \"%s\\n\" \"$$\" > '{}'\n/usr/bin/setsid --fork /bin/sh -c 'trap \"\" TERM INT QUIT HUP; printf \"%s\\n\" \"$$\" > \"$1\"; kill -STOP \"$$\"; while :; do sleep 1; done' descendant '{}' &\nwhile :; do sleep 1; done\n",
+    fixture.install_postmaster(&format!(
+        "printf \"%s\\n\" \"$$\" > '{}'\n/usr/bin/setsid --fork /bin/sh -c 'trap \"\" TERM INT QUIT HUP; printf \"%s\\n\" \"$$\" > \"$1\"; kill -STOP \"$$\"; while :; do sleep 1; done' descendant '{}' &\nwhile :; do sleep 1; done\n",
         postmaster_marker.display(),
         descendant_marker.display()
     ));
     let address = reserve_address();
     let mut first_agent = fixture.spawn(address);
-    wait_for_quarantine(&mut first_agent, address);
+    wait_for_supervised_postmaster(&mut first_agent, address, &fixture);
 
-    let postmaster_pid = wait_for_pid_marker(&postmaster_marker);
-    let descendant_pid = wait_for_pid_marker(&descendant_marker);
+    let postmaster_pid = wait_for_pid_marker(&mut first_agent, &postmaster_marker);
+    let descendant_pid = wait_for_pid_marker(&mut first_agent, &descendant_marker);
     assert_eq!(
         namespace_status_id(descendant_pid, "NSpid:"),
         descendant_pid,
@@ -208,14 +210,14 @@ fn setsid_descendant_is_reaped_before_pgdata_can_be_reacquired() {
         .root
         .path()
         .join("replacement-signal-handlers-ready");
-    fixture.replace_executable(&format!(
-        "#!/bin/sh\ntrap 'exit 0' TERM\n: > '{}'\nwhile :; do :; done\n",
+    fixture.install_postmaster(&format!(
+        "trap 'exit 0' TERM\n: > '{}'\nwhile :; do :; done\n",
         replacement_ready.display()
     ));
     let replacement_address = reserve_address();
     let mut replacement = fixture.spawn(replacement_address);
-    wait_for_quarantine(&mut replacement, replacement_address);
-    wait_for_marker(&replacement_ready);
+    wait_for_supervised_postmaster(&mut replacement, replacement_address, &fixture);
+    wait_for_marker(&mut replacement, &replacement_ready);
     kill_process(Pid::from_child(replacement.child()), Signal::TERM)
         .expect("stop replacement agent");
     let replacement_status = replacement.wait().expect("wait for replacement agent");
@@ -229,12 +231,7 @@ fn setsid_descendant_is_reaped_before_pgdata_can_be_reacquired() {
 
 #[test]
 fn occupied_http_listener_prevents_postmaster_spawn() {
-    let fixture = AgentFixture::new("#!/bin/sh\nwhile :; do :; done\n");
-    let marker = fixture.root.path().join("postmaster-started");
-    fixture.replace_executable(&format!(
-        "#!/bin/sh\n: > '{}'\nwhile :; do :; done\n",
-        marker.display()
-    ));
+    let fixture = AgentFixture::new("while :; do :; done\n");
     let listener = TcpListener::bind("127.0.0.1:0").expect("reserve occupied listener");
     let address = listener.local_addr().expect("read occupied address");
     let mut child = fixture.spawn(address);
@@ -245,31 +242,50 @@ fn occupied_http_listener_prevents_postmaster_spawn() {
         child.diagnostics()
     );
     assert!(
-        !marker.exists(),
+        !fixture.started_marker().exists(),
         "postmaster started even though the control listener could not bind"
     );
     child.disarm_after_descendants_are_gone();
     drop(listener);
 }
 
+#[test]
+fn a_status_served_by_another_process_does_not_report_a_started_postmaster() {
+    let occupant = QuarantineStatusServer::bind();
+    let fixture = AgentFixture::new("while :; do sleep 1; done\n");
+    let mut child = fixture.spawn(occupant.address());
+
+    let failure = supervised_postmaster_start(&mut child, occupant.address(), &fixture)
+        .expect_err("another process answering /status must not satisfy the readiness gate");
+
+    assert!(
+        failure.contains("agent exited before its supervised postmaster started"),
+        "readiness failed for the wrong reason: {failure}"
+    );
+    assert!(
+        failure.contains("Address already in use"),
+        "readiness failure did not name the losing agent's own error: {failure}"
+    );
+    child.disarm_after_descendants_are_gone();
+}
+
 struct AgentFixture {
     root: TempDir,
     data_dir: PathBuf,
     executable: PathBuf,
+    started_marker: PathBuf,
     socket_dir: PathBuf,
     hba_file: PathBuf,
     synchronous_conf_file: PathBuf,
 }
 
 impl AgentFixture {
-    fn new(script: &str) -> Self {
+    fn new(body: &str) -> Self {
         let root = TempDir::new().expect("create agent fixture");
         let data_dir = root.path().join("data");
         create_pgdata(&data_dir);
         let executable = root.path().join("postgres");
-        fs::write(&executable, script).expect("write postmaster fixture");
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o500))
-            .expect("make postmaster fixture executable");
+        let started_marker = root.path().join("postmaster-started");
         let controldata = root.path().join("pg_controldata");
         fs::write(
             &controldata,
@@ -288,25 +304,46 @@ impl AgentFixture {
         .expect("write quarantine HBA fixture");
         fs::set_permissions(&hba_file, fs::Permissions::from_mode(0o400))
             .expect("protect quarantine HBA fixture");
-        Self {
+        let fixture = Self {
             root,
             data_dir,
             executable,
+            started_marker,
             socket_dir,
             hba_file,
             synchronous_conf_file,
-        }
+        };
+        fixture.install_postmaster(body);
+        fixture
     }
 
-    fn replace_executable(&self, script: &str) {
-        fs::set_permissions(&self.executable, fs::Permissions::from_mode(0o700))
-            .expect("make postmaster fixture replaceable");
-        fs::write(&self.executable, script).expect("replace postmaster fixture");
+    fn started_marker(&self) -> &Path {
+        &self.started_marker
+    }
+
+    /// Installs a postmaster fixture that announces itself before running `body`.
+    ///
+    /// The agent reports a running postmaster as soon as it has spawned one, which
+    /// carries no claim that the spawned shell has executed a single line. A test
+    /// that needs the fixture's own behaviour has to wait for the fixture, so every
+    /// script says so itself rather than leaving the test to infer it.
+    fn install_postmaster(&self, body: &str) {
+        if self.executable.exists() {
+            fs::set_permissions(&self.executable, fs::Permissions::from_mode(0o700))
+                .expect("make postmaster fixture replaceable");
+        }
+        let script = format!("#!/bin/sh\n: > '{}'\n{body}", self.started_marker.display());
+        fs::write(&self.executable, script).expect("write postmaster fixture");
         fs::set_permissions(&self.executable, fs::Permissions::from_mode(0o500))
-            .expect("protect replacement postmaster fixture");
+            .expect("protect postmaster fixture");
     }
 
     fn spawn(&self, address: SocketAddr) -> ChildGuard {
+        match fs::remove_file(&self.started_marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => panic!("clear the postmaster start marker: {error}"),
+        }
         let stderr_path = self
             .root
             .path()
@@ -343,6 +380,73 @@ impl AgentFixture {
             .spawn()
             .expect("spawn agent");
         ChildGuard::new(child, stderr_path)
+    }
+}
+
+/// Holds an address and answers every request with a running quarantine status.
+///
+/// This is what an agent that loses the race to bind a reserved port leaves
+/// behind for the agent that lost it: an address whose status describes someone
+/// else's postmaster.
+struct QuarantineStatusServer {
+    address: SocketAddr,
+    stop: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl QuarantineStatusServer {
+    fn bind() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind quarantine status server");
+        let address = listener.local_addr().expect("read status server address");
+        listener
+            .set_nonblocking(true)
+            .expect("poll the status server without blocking its shutdown");
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || {
+                const BODY: &str = r#"{"postgres_process":"running_quarantined"}"#;
+                while !stop.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            // Closing on an unread request would reset the
+                            // connection and lose the response the caller has
+                            // to be offered before it can refuse it.
+                            let mut request = [0_u8; 1024];
+                            let _ = stream.set_read_timeout(Some(HTTP_CLOSE_TIMEOUT));
+                            let _ = stream.read(&mut request);
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{BODY}",
+                                BODY.len()
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                        }
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            }
+        });
+        Self {
+            address,
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    fn address(&self) -> SocketAddr {
+        self.address
+    }
+}
+
+impl Drop for QuarantineStatusServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -432,21 +536,50 @@ fn assert_http_connection_closes(mut stream: TcpStream) {
     }
 }
 
-fn wait_for_quarantine(child: &mut ChildGuard, address: SocketAddr) {
+fn wait_for_supervised_postmaster(
+    child: &mut ChildGuard,
+    address: SocketAddr,
+    fixture: &AgentFixture,
+) {
+    if let Err(failure) = supervised_postmaster_start(child, address, fixture) {
+        panic!("{failure}");
+    }
+}
+
+/// Waits until this agent's own postmaster fixture is running under quarantine.
+///
+/// A quarantine status alone proves neither that the answering agent is this
+/// one — an agent that loses the race to bind a reserved port leaves its address
+/// to whichever agent won it — nor that the postmaster it spawned has run. The
+/// start marker lives in this fixture's directory, so only this agent's
+/// postmaster can raise it.
+fn supervised_postmaster_start(
+    child: &mut ChildGuard,
+    address: SocketAddr,
+    fixture: &AgentFixture,
+) -> Result<(), String> {
     let started = Instant::now();
     loop {
-        if let Ok(status) = request_http(address, "/status")
+        if let Some(status) = child.child_mut().try_wait().expect("inspect agent") {
+            return Err(format!(
+                "agent exited before its supervised postmaster started: {status}; stderr: {}",
+                child.diagnostics()
+            ));
+        }
+        if fixture.started_marker().exists()
+            && let Ok(status) = request_http(address, "/status")
             && status.contains(r#""postgres_process":"running_quarantined""#)
         {
-            return;
+            return Ok(());
         }
-        if let Some(status) = child.child_mut().try_wait().expect("inspect agent") {
-            panic!("agent exited before quarantine status was visible: {status}");
+        if started.elapsed() >= PROCESS_TIMEOUT {
+            return Err(format!(
+                "supervised postmaster did not start within {PROCESS_TIMEOUT:?}; postmaster \
+                 started: {}; agent stderr: {}",
+                fixture.started_marker().exists(),
+                child.diagnostics()
+            ));
         }
-        assert!(
-            started.elapsed() < PROCESS_TIMEOUT,
-            "quarantine startup timed out"
-        );
         thread::sleep(Duration::from_millis(10));
     }
 }
@@ -466,7 +599,7 @@ fn wait_for_only_child(parent_pid: u32) -> u32 {
     }
 }
 
-fn wait_for_pid_marker(path: &Path) -> u32 {
+fn wait_for_pid_marker(child: &mut ChildGuard, path: &Path) -> u32 {
     let started = Instant::now();
     loop {
         if let Ok(value) = fs::read_to_string(path)
@@ -474,25 +607,43 @@ fn wait_for_pid_marker(path: &Path) -> u32 {
         {
             return pid;
         }
-        assert!(
-            started.elapsed() < PROCESS_TIMEOUT,
-            "process marker {} was not populated",
-            path.display()
-        );
+        assert_marker_is_still_coming(child, path, started, "populated");
         thread::sleep(Duration::from_millis(10));
     }
 }
 
-fn wait_for_marker(path: &Path) {
+fn wait_for_marker(child: &mut ChildGuard, path: &Path) {
     let started = Instant::now();
     while !path.exists() {
-        assert!(
-            started.elapsed() < PROCESS_TIMEOUT,
-            "process marker {} was not created",
-            path.display()
-        );
+        assert_marker_is_still_coming(child, path, started, "created");
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Fails a marker wait as soon as nothing is left that could raise the marker.
+///
+/// Only the supervised postmaster writes these markers, so once the agent has
+/// gone the marker never arrives; reporting that as a timeout spends the whole
+/// bound and then names the marker instead of the exit that stranded it.
+fn assert_marker_is_still_coming(
+    child: &mut ChildGuard,
+    path: &Path,
+    started: Instant,
+    verb: &str,
+) {
+    if let Some(status) = child.child_mut().try_wait().expect("inspect agent") {
+        panic!(
+            "agent exited before process marker {} was {verb}: {status}; stderr: {}",
+            path.display(),
+            child.diagnostics()
+        );
+    }
+    assert!(
+        started.elapsed() < PROCESS_TIMEOUT,
+        "process marker {} was not {verb}; agent stderr: {}",
+        path.display(),
+        child.diagnostics()
+    );
 }
 
 fn namespace_status_id(pid: u32, field: &str) -> u32 {
