@@ -1343,13 +1343,19 @@ fn is_whole_der_private_key(bytes: &[u8]) -> bool {
 /// nothing readable and is missed. That is the direction to be wrong in: no tool
 /// measured here writes one, and the alternative is refusing every trust store.
 fn carries_a_pkcs12_key_bag(bytes: &[u8]) -> bool {
-    /// `keyBag` and `pkcs8ShroudedKeyBag`, as the object identifiers appear.
-    const BAGS: [[u8; 13]; 2] = [
+    /// `keyBag` and `pkcs8ShroudedKeyBag`: the identifiers themselves, without
+    /// the tag and length that introduce them. Those were matched too at first,
+    /// and it made the rule a rule about one encoding rather than about the
+    /// identifier. A bundle whose identifier declares its length the long way --
+    /// `06 81 0b` where DER asks for `06 0b` -- carries the same key, and
+    /// `OpenSSL` 3.0 reads it, reports the shrouded bag and hands the key back.
+    /// Nothing writes one by accident; something can write one on purpose.
+    const BAGS: [[u8; 11]; 2] = [
         [
-            0x06, 0x0b, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x0c, 0x0a, 0x01, 0x01,
+            0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x0c, 0x0a, 0x01, 0x01,
         ],
         [
-            0x06, 0x0b, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x0c, 0x0a, 0x01, 0x02,
+            0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x0c, 0x0a, 0x01, 0x02,
         ],
     ];
 
@@ -3522,15 +3528,21 @@ mod tests {
     }
 
     /// The object identifier of one of the bags a PKCS#12 file holds: one is a
-    /// key, two a shrouded key, three a certificate.
-    fn pkcs12_bag(kind: u8) -> Vec<u8> {
-        [
-            vec![
-                0x06, 0x0b, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x0c, 0x0a, 0x01,
-            ],
+    /// key, two a shrouded key, three a certificate. `long` declares the
+    /// identifier's length the roundabout way that DER forbids and `OpenSSL`
+    /// reads anyway.
+    fn pkcs12_bag_encoded(kind: u8, long: bool) -> Vec<u8> {
+        let identifier = [
+            vec![0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x0c, 0x0a, 0x01],
             vec![kind],
         ]
-        .concat()
+        .concat();
+        let length = if long { vec![0x81, 0x0b] } else { vec![0x0b] };
+        [vec![0x06], length, identifier].concat()
+    }
+
+    fn pkcs12_bag(kind: u8) -> Vec<u8> {
+        pkcs12_bag_encoded(kind, false)
     }
 
     /// A version four secret key packet and the identity beside it, in each of
@@ -3971,6 +3983,22 @@ mod tests {
             );
             assert!(audit_content_bytes("bundle.p12", &held).is_err());
         }
+
+        // The same bundle, with the bag's identifier declaring its length the
+        // way DER forbids and `OpenSSL` reads regardless: it reports the
+        // shrouded bag and hands the key back, so the rule is about the
+        // identifier and not about one of its encodings.
+        let long_form = {
+            let mut content = vec![0x06, 0x09];
+            content.extend(filler(30));
+            content.extend(pkcs12_bag_encoded(2, true));
+            content.extend(filler(160));
+            der_sequence_of(&[vec![0x02, 0x01, 0x03], der_sequence_of(&content)].concat())
+        };
+        assert!(
+            is_bare_private_key_object(&long_form),
+            "a key bag is a key bag however its identifier declares its length"
+        );
 
         // Certificates only, which is what a trust store is.
         let trusted = bundle(&[3, 3]);
