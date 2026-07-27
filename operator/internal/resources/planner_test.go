@@ -660,6 +660,36 @@ func TestShardInventoryHashMatchesCanonicalSource(t *testing.T) {
 	}
 }
 
+// Dependabot's docker ecosystem is scoped to /deploy/images, so a digest bump
+// reaches the Dockerfile alone and silently splits the image the agent ships
+// from the one the operator deploys and the live tests exercise.
+func TestPostgreSQL18PinsAgreeWithTheDeployedServerImage(t *testing.T) {
+	t.Parallel()
+	pin := regexp.MustCompile(`docker\.io/library/postgres:18@sha256:[0-9a-f]{64}`)
+	for _, site := range [][]string{
+		{"deploy", "images", "rust.Dockerfile"},
+		{"operator", "config", "manager", "deployment.yaml"},
+		{"operator", "config", "admission", "manager_patch.yaml"},
+		{"crates", "pgshard-agent", "tests", "postgres18_generation.sh"},
+	} {
+		relative := filepath.Join(site...)
+		contents, err := os.ReadFile(filepath.Join("..", "..", "..", relative))
+		if err != nil {
+			t.Fatal(err)
+		}
+		pins := pin.FindAllString(string(contents), -1)
+		if len(pins) == 0 {
+			t.Errorf("%s no longer pins a PostgreSQL 18 image by digest", relative)
+			continue
+		}
+		for _, found := range pins {
+			if found != defaultPostgreSQLImage {
+				t.Errorf("%s pins %s, want %s", relative, found, defaultPostgreSQLImage)
+			}
+		}
+	}
+}
+
 var updateMaterializationGoldens = flag.Bool("update", false, "rewrite the committed catalog materialization goldens")
 
 func TestCatalogMaterializationRenderersMatchCommittedGoldens(t *testing.T) {
