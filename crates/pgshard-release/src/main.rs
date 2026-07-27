@@ -926,9 +926,37 @@ fn decoded_key_candidate(candidate: &str) -> Option<Vec<u8>> {
 /// Ed25519 key from `gnupg` 2.4 carries the curve and flags there and does not
 /// reach its first parameter until the line after. The shadowed form is absent
 /// too, standing as it does for a key held on a card, with no secret to leak.
+///
+/// What the column pays for is written here so the next reader does not have to
+/// find it: the same real key indented by one space is accepted. That is a key
+/// inside a YAML block scalar, and a key in a committed `.patch`, where every
+/// line carries a leading `+`. Both are missed. Matching without the column is
+/// what refused this gate's own commit message, so the column stays and the miss
+/// is the price. A fenced code block reproducing the field verbatim, with a real
+/// algorithm and no indentation, is still refused -- correctly, since what is in
+/// it is then a key.
 fn carries_libgcrypt_private_key(line: &str) -> bool {
-    /// What `libgcrypt` names a key's algorithm. Nothing else opens one.
-    const ALGORITHMS: [&str; 4] = ["rsa", "dsa", "elg", "ecc"];
+    /// Every algorithm `gnupg` will store a key under, taken from the table its
+    /// agent matches against and copied whole rather than sampled: `protect.c`
+    /// looks the plaintext key's algorithm up in `protect_info` and keeps the
+    /// name it found, so any entry there can open a stored key.
+    ///
+    /// Four of them were guessed at once and it cost five of the seventeen key
+    /// files `gnupg` ships in `tests/openpgp/privkeys`, every one a Kyber key
+    /// with its secret parameter in the clear. Guessing which of a table's rows
+    /// matter is what turned a rule that refused those files into one that
+    /// passed them, so the table is transcribed and not abridged.
+    const ALGORITHMS: [&str; 9] = [
+        "rsa",
+        "dsa",
+        "elg",
+        "ecdsa",
+        "ecdh",
+        "ecc",
+        "kyber512",
+        "kyber768",
+        "kyber1024",
+    ];
 
     [
         ["(private-", "key ("].concat(),
@@ -3850,7 +3878,17 @@ mod tests {
             format!("Key: ({token}-key ({algorithm} (n #00A9F91D2B0ACE094446BC27EE8373C7#)")
         };
         for token in ["private", "protected-private"] {
-            for algorithm in ["rsa", "dsa", "elg", "ecc"] {
+            for algorithm in [
+                "rsa",
+                "dsa",
+                "elg",
+                "ecdsa",
+                "ecdh",
+                "ecc",
+                "kyber512",
+                "kyber768",
+                "kyber1024",
+            ] {
                 let key = field(token, algorithm);
                 assert!(
                     audit_content("k.key", &key).is_err(),
