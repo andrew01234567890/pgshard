@@ -18,7 +18,7 @@ commit rather than bypassing the exact-head CI release gate.
 
 - The first green squash commit containing the release-start marker is `v0.1.0`.
 - Before 1.0, `feat`, `!`, or a `BREAKING CHANGE:` footer increments the minor version.
-- `fix`, `perf`, `refactor`, `revert`, `docs`, `test`, `build`, `ci`, and `chore` increment patch.
+- `fix`, `perf`, `refactor`, `revert`, `docs`, `style`, `test`, `build`, `ci`, and `chore` increment patch.
 - A recovered gap applies its highest Conventional Commit bump once relative to the preceding tag. For example, a failed `feat` followed by a green `test` fix advances `v0.74.0` to `v0.75.0`, not `v0.75.1`.
 - Promotion to 1.0 is an explicit maintainer decision and is not performed by the automated pre-1.0 calculator.
 - Pull request titles follow Conventional Commits because squash merge makes the title the `main` commit subject.
