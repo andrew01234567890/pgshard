@@ -7277,6 +7277,457 @@ esac
         assert!(workflow.contains("planner-postgres=${{ needs.planner-postgres.result }}"));
     }
 
+    /// The store the workflow caches every registry image into, stated once so
+    /// a job that caches some other directory cannot pass for one that caches
+    /// this.
+    const CI_IMAGE_STORE: &str = "~/.cache/pgshard-ci-images";
+
+    /// What a restoring job's cache key is built from, either side of the
+    /// image names it is keyed on.
+    const CI_IMAGE_KEY_PREFIX: &str = "ci-images-${{ runner.os }}-";
+    const CI_IMAGE_KEY_SUFFIX: &str = "-${{ hashFiles('.github/scripts/ci-images.lock') }}";
+
+    /// The name the workflow gives the Buildx builder image locally.
+    ///
+    /// Buildx calls `ImagePull` before it will look in the local image store,
+    /// and neither the docker-container driver nor `setup-buildx-action` takes
+    /// an option that skips it, so the builder cannot simply be told to use
+    /// what is already there. Aiming that pull at a name reserved never to
+    /// resolve makes it fail at DNS in the ordinary case, which is what leaves
+    /// the local image to boot from.
+    ///
+    /// That is where the alias stops. RFC 6761 makes the negative answer a
+    /// `SHOULD`, and a resolver, a hosts entry or an intercepting proxy can
+    /// answer for any name; buildx inspects and runs whatever came back
+    /// without comparing it to anything. So the alias is asserted below as an
+    /// optimisation, and `BUILDER_IDENTITY_CHECK` is the gate.
+    const BUILDKIT_ALIAS: &str = "pgshard.invalid/buildkit:pinned";
+
+    /// What a job runs once its builder exists to hold the container that
+    /// actually booted to the lock, and the name the docker-container driver
+    /// gives that container. Prose in a comment satisfies a search for the
+    /// prefix on its own, so the two are asserted as one argument.
+    const BUILDER_IDENTITY_CHECK: &str = ".github/scripts/ci-image.sh --assert-container buildkit";
+    const BUILDER_CONTAINER_PREFIX: &str = "buildx_buildkit_";
+
+    /// The lock entry the operator's `PostgreSQL` pods run, and the image whose
+    /// presence in a KIND cluster is what says such pods will exist there.
+    const POSTGRES_RUNTIME: &str = "postgres18";
+    const POSTGRES_AGENT_IMAGE: &str = "pgshard/postgres-agent:dev";
+
+    /// Every image name a `run:` script asks `ci-image.sh` to make available.
+    ///
+    /// The helper's `--assert-container` form names an image too, but it
+    /// fetches nothing and is checked by what it is bound to instead.
+    fn requested_images(script: &str) -> Vec<&str> {
+        script
+            .split(".github/scripts/ci-image.sh")
+            .skip(1)
+            .filter_map(|rest| rest.split_whitespace().next())
+            .filter(|word| !word.starts_with('-'))
+            .map(|name| name.trim_end_matches(&[')', '"', '\''][..]))
+            .collect()
+    }
+
+    /// What `ci-images.lock` pins, as `name -> (reference, image id)`, checked
+    /// on the way through for everything the helper relies on the file for.
+    fn pinned_images(lock: &str) -> std::collections::BTreeMap<&str, (&str, &str)> {
+        let pinned: std::collections::BTreeMap<&str, (&str, &str)> = lock
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| {
+                let mut fields = line.split_whitespace();
+                let name = fields.next().expect("a non-blank line opens with a name");
+                let reference = fields
+                    .next()
+                    .unwrap_or_else(|| panic!("`{line}` names no reference"));
+                let identity = fields.next().unwrap_or_else(|| {
+                    panic!(
+                        "`{line}` names no image id, so the helper would have nothing outside the \
+                         cache to check a restored archive against"
+                    )
+                });
+                assert!(
+                    fields.next().is_none(),
+                    "`{line}` carries a field the helper does not read"
+                );
+                (name, (reference, identity))
+            })
+            .collect();
+        assert!(
+            !pinned.is_empty(),
+            "the lock pins nothing, so everything keyed on it is vacuous"
+        );
+        for (name, (reference, identity)) in &pinned {
+            // Cache keys join these names with `-`, so one containing a `-`
+            // would make a key ambiguous about what it holds.
+            assert!(
+                name.chars()
+                    .all(|character| character.is_ascii_alphanumeric()),
+                "`{name}` cannot be named in a cache key"
+            );
+            let (repository, digest) = reference
+                .split_once("@sha256:")
+                .unwrap_or_else(|| panic!("{name} is pinned by tag, not digest: {reference}"));
+            assert!(is_digest(digest), "{name} pins no digest: {digest}");
+            // The reference the helper prints is this one without its digest,
+            // because an archive restores a tag and never a repository digest.
+            // A pin with no tag would leave it printing a bare repository.
+            assert!(
+                repository.rsplit('/').next().is_some_and(|last| last
+                    .split_once(':')
+                    .is_some_and(|(_, tag)| !tag.is_empty())),
+                "{name} pins no tag for the helper to restore under: {repository}"
+            );
+            // The repository digest names bytes no archive can be checked
+            // against, since `docker load` restores no repository digest. The
+            // image id can be: it is the digest of the image config, which
+            // `docker load` recomputes from the archive's own bytes.
+            let identity = identity.strip_prefix("sha256:").unwrap_or_else(|| {
+                panic!("{name} carries an image id that is not a sha256 digest: {identity}")
+            });
+            assert!(
+                is_digest(identity),
+                "{name} carries no image id: {identity}"
+            );
+            assert_ne!(
+                identity, digest,
+                "{name} repeats its repository digest as its image id; those are digests of \
+                 different documents and can never be equal, so this one was not read off a pull"
+            );
+        }
+        pinned
+    }
+
+    /// Whether a string is the hexadecimal half of a `sha256:` digest.
+    fn is_digest(candidate: &str) -> bool {
+        candidate.len() == 64
+            && candidate
+                .chars()
+                .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+    }
+
+    /// Every digest the workflow spells out itself belongs to a lock entry,
+    /// under the repository that entry pairs it with, and how many it spells
+    /// out.
+    ///
+    /// A KIND node's `crictl pull` reaches the registry on every run and cannot
+    /// be served from the host's archive, so what is enforceable is not that
+    /// the pull stops happening but that it cannot name an image the lock does
+    /// not. The count is returned because that is an assertion over whatever
+    /// digests happen to be there: the caller has to say, from something other
+    /// than the workflow's own literals, how many there should be.
+    fn resolved_digests_that_are_pinned(
+        workflow: &str,
+        pinned: &std::collections::BTreeMap<&str, (&str, &str)>,
+    ) -> usize {
+        let mut resolved = 0;
+        for (index, _) in workflow.match_indices("sha256:") {
+            let digest: String = workflow[index + "sha256:".len()..]
+                .chars()
+                .take_while(char::is_ascii_hexdigit)
+                .collect();
+            let before = &workflow[..index];
+            assert!(
+                pinned.values().any(|(reference, _)| reference
+                    .split_once("sha256:")
+                    .is_some_and(|(prefix, locked)| before.ends_with(prefix) && locked == digest)),
+                "the workflow resolves sha256:{digest} itself, and no lock entry pins that \
+                 reference, so the image it fetches can drift from the one the fixtures assert on"
+            );
+            resolved += 1;
+        }
+        resolved
+    }
+
+    /// How many Buildx builders the workflow boots, having held every one of
+    /// them to the image `ci-images.lock` pins.
+    ///
+    /// Buildx pulls its builder image before it consults the local store, and
+    /// no driver option or action input suppresses that. Aiming the pull at a
+    /// `.invalid` name is what usually makes it miss, but a resolver that
+    /// answers anyway is answered by buildx running those bytes as a
+    /// privileged container, so what a job can be held to is not that the pull
+    /// failed: it is that the container it ended up with is running the image
+    /// the lock names.
+    fn builders_held_to_the_lock(parsed: &serde_norway::Value) -> usize {
+        let driver_option = format!("image={BUILDKIT_ALIAS}");
+        let identity_check =
+            format!("{BUILDER_IDENTITY_CHECK} \"{BUILDER_CONTAINER_PREFIX}${{node}}\"");
+        let mut builders = 0;
+        let mut checks = 0;
+        for (job, definition) in parsed["jobs"]
+            .as_mapping()
+            .expect("the workflow declares jobs")
+        {
+            let job = job.as_str().expect("every job is named");
+            let mut aliased = false;
+            let mut booted: Option<&str> = None;
+            let mut checked = false;
+            for step in definition["steps"]
+                .as_sequence()
+                .expect("every job declares steps")
+            {
+                let script = step["run"].as_str().unwrap_or_default();
+                if script.contains(&format!("docker tag \"$builder_image\" {BUILDKIT_ALIAS}")) {
+                    aliased = true;
+                }
+                if step["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.starts_with("docker/setup-buildx-action@"))
+                {
+                    builders += 1;
+                    // Left unset, the driver boots from whatever the floating
+                    // `buildx-stable-1` tag resolves to when it pulls, which is
+                    // neither what the lock pins nor reachable during the
+                    // outages this whole arrangement exists for.
+                    assert_eq!(
+                        step["with"]["driver-opts"].as_str(),
+                        Some(driver_option.as_str()),
+                        "{job} boots Buildx off its own default image"
+                    );
+                    assert!(
+                        aliased,
+                        "{job} points Buildx at {BUILDKIT_ALIAS} without an earlier step giving \
+                         that name to the image the lock pins, so there is nothing local for the \
+                         failed pull to fall back to"
+                    );
+                    booted = Some(step["id"].as_str().unwrap_or_else(|| {
+                        panic!(
+                            "{job} sets up Buildx under no step id, so no later step can name the \
+                             builder it created"
+                        )
+                    }));
+                }
+                if script.contains(BUILDER_IDENTITY_CHECK) {
+                    let identifier = booted.unwrap_or_else(|| {
+                        panic!("{job} checks a Buildx builder before any step creates one")
+                    });
+                    assert!(
+                        script.contains(&identity_check),
+                        "{job} checks a builder without naming the container the \
+                         docker-container driver runs each of its nodes in, so it checks \
+                         something else"
+                    );
+                    // Reading the node names off the step that made the builder
+                    // is what ties the container checked to the builder booted;
+                    // any other source could name a container this job did not
+                    // create.
+                    assert_eq!(
+                        step["env"]["BUILDER_NODES"].as_str(),
+                        Some(format!("${{{{ steps.{identifier}.outputs.nodes }}}}").as_str()),
+                        "{job} checks builder containers it did not take the node names of"
+                    );
+                    checked = true;
+                    checks += 1;
+                }
+            }
+            assert!(
+                booted.is_none() || checked,
+                "{job} boots a Buildx builder and never reads back the image it booted from; the \
+                 alias only makes the pull miss, so a pull that resolves anyway would go \
+                 unnoticed and run as a privileged container"
+            );
+        }
+        assert_eq!(
+            checks, builders,
+            "the workflow boots {builders} Buildx builders and checks {checks} of them"
+        );
+        builders
+    }
+
+    /// How many jobs put the pinned `PostgreSQL` into a KIND node's own
+    /// containerd, having held every one of them to the lock's reference.
+    ///
+    /// Loading the agent image into a cluster is what says `PostgreSQL` pods
+    /// will run there, and the image those pods name cannot be seeded from the
+    /// host's archive, because `docker save` carries no repository digest and
+    /// the pod spec names one. So the pull stays, and what it names does not
+    /// get to drift from the lock.
+    fn kind_jobs_seeded_with_pinned_postgres(
+        parsed: &serde_norway::Value,
+        reference: &str,
+    ) -> usize {
+        let mut seeded = 0;
+        for (job, definition) in parsed["jobs"]
+            .as_mapping()
+            .expect("the workflow declares jobs")
+        {
+            let job = job.as_str().expect("every job is named");
+            let scripts: String = definition["steps"]
+                .as_sequence()
+                .expect("every job declares steps")
+                .iter()
+                .filter_map(|step| step["run"].as_str())
+                .collect();
+            if !(scripts.contains("kind load docker-image")
+                && scripts.contains(POSTGRES_AGENT_IMAGE))
+            {
+                continue;
+            }
+            seeded += 1;
+            assert!(
+                scripts.contains(&format!("postgres_image=\"{reference}\"")),
+                "{job} loads {POSTGRES_AGENT_IMAGE} into a KIND cluster, so PostgreSQL pods will \
+                 run there, and it names no PostgreSQL image the lock pins"
+            );
+            assert!(
+                scripts.contains("crictl pull \"$postgres_image\""),
+                "{job} names the pinned PostgreSQL image but never pulls it through the node's \
+                 own containerd, which is the only thing that puts it where kubelet resolves it \
+                 from"
+            );
+        }
+        seeded
+    }
+
+    /// The image names a cache key claims to hold.
+    fn keyed_images(key: &str) -> std::collections::BTreeSet<&str> {
+        key.strip_prefix(CI_IMAGE_KEY_PREFIX)
+            .and_then(|rest| rest.strip_suffix(CI_IMAGE_KEY_SUFFIX))
+            .unwrap_or_else(|| panic!("`{key}` is not an image cache key"))
+            .split('-')
+            .collect()
+    }
+
+    /// The images `ci-image.sh` hands to the runner's own Docker daemon are off
+    /// Docker Hub's steady-state path, and stay off it.
+    ///
+    /// Three separate jobs have failed on a Docker Hub timeout, each with its
+    /// own retry loop already in place, because no affordable number of
+    /// attempts outlasts an outage measured in minutes. What replaces the
+    /// retries is a cache of the image itself, and it is only sound while three
+    /// things hold together: every pin is a digest, so a cache entry cannot be
+    /// serving something a reader of the lock would not expect; every job that
+    /// fetches an image restores that cache before it fetches one, so a job
+    /// cannot quietly go back to pulling on every run; and every entry carries
+    /// the image id the helper checks a restored archive against, because a
+    /// cache entry is unsigned input and a check against a value the cache also
+    /// supplied would prove nothing.
+    ///
+    /// Two registry paths are outside all of that, and nothing asserted below
+    /// should be read as covering them. `make images` fetches every base
+    /// `deploy/images/*.Dockerfile` names, on a builder with no cross-run image
+    /// cache. The KIND jobs pull `PostgreSQL` through the node's own containerd,
+    /// which an archive cannot seed, because `docker save` carries no
+    /// repository digest and the pod spec names one. What this does hold those
+    /// pulls to is the lock's digests, so the cluster cannot drift from the
+    /// image the fixtures pin even though the pull itself still happens.
+    ///
+    /// Buildx is a third case, and the one worth being blunt about. Its pull
+    /// cannot be suppressed and cannot be reliably made to fail, so the builder
+    /// image is not prevented from arriving over the network -- it is checked
+    /// after it has. A job that boots a builder and does not check it is the
+    /// failure this test exists to catch.
+    #[test]
+    fn every_image_the_helper_serves_is_digest_pinned_and_restored_before_it_is_fetched() {
+        let lock = include_str!("../../../.github/scripts/ci-images.lock");
+        let workflow = include_str!("../../../.github/workflows/ci.yml");
+        let parsed = parsed_workflow();
+
+        let pinned = pinned_images(lock);
+        let (postgres_reference, _) = pinned.get(POSTGRES_RUNTIME).unwrap_or_else(|| {
+            panic!("the lock pins no `{POSTGRES_RUNTIME}` for a KIND node to be seeded with")
+        });
+
+        // The helper is what keeps the runner's own image pulls off the
+        // registry, so a `docker pull` anywhere else is one nothing caches.
+        // This says nothing about pulls the runner does not issue: see the
+        // doc comment, and `resolved_digests_that_are_pinned` for what is
+        // held to the lock instead.
+        assert!(
+            !workflow.contains("docker pull"),
+            "a `docker pull` outside .github/scripts/ci-image.sh is served from no cache"
+        );
+        let resolved = resolved_digests_that_are_pinned(workflow, &pinned);
+
+        // The alias only has to make the pull miss, and the check after the
+        // builder boots is what makes a hit harmless, so this is asserted for
+        // what it buys and not as a boundary.
+        assert!(
+            BUILDKIT_ALIAS
+                .split_once('/')
+                .is_some_and(|(domain, _)| domain.ends_with(".invalid")),
+            "the builder alias has to sit under a domain no registry is expected to answer for, \
+             or the pull buildx cannot be told to skip goes to Docker Hub on every run"
+        );
+
+        let mut asked = std::collections::BTreeSet::new();
+        for (job, definition) in parsed["jobs"]
+            .as_mapping()
+            .expect("the workflow declares jobs")
+        {
+            let job = job.as_str().expect("every job is named");
+            let mut restored: Option<std::collections::BTreeSet<&str>> = None;
+            let mut fetched = std::collections::BTreeSet::new();
+            for step in definition["steps"]
+                .as_sequence()
+                .expect("every job declares steps")
+            {
+                if step["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.starts_with("actions/cache@"))
+                    && step["with"]["path"].as_str() == Some(CI_IMAGE_STORE)
+                {
+                    restored =
+                        Some(keyed_images(step["with"]["key"].as_str().unwrap_or_else(
+                            || panic!("{job} restores images under no key"),
+                        )));
+                }
+                for name in requested_images(step["run"].as_str().unwrap_or_default()) {
+                    asked.insert(name);
+                    fetched.insert(name);
+                    assert!(
+                        pinned.contains_key(name),
+                        "{job} asks for `{name}`, which the lock does not pin"
+                    );
+                    assert!(
+                        restored.is_some(),
+                        "{job} fetches `{name}` before restoring the image cache, \
+                         so it reaches Docker Hub on every run"
+                    );
+                }
+            }
+            // Jobs share an entry by sharing a key, so a key naming anything
+            // other than what its job fetches either misses forever or claims
+            // to hold an image nothing put there.
+            if let Some(keyed) = restored {
+                assert_eq!(
+                    keyed, fetched,
+                    "{job} keys its image cache on images it does not fetch, or the other \
+                     way round"
+                );
+            }
+        }
+        for name in pinned.keys() {
+            assert!(
+                asked.contains(name),
+                "the lock pins `{name}` and no job asks the helper for it, so that entry is \
+                 carried but never checked"
+            );
+        }
+
+        let builders = builders_held_to_the_lock(&parsed);
+        assert!(
+            builders > 0,
+            "no job sets up Buildx, so the builder assertions above are vacuous"
+        );
+
+        let seeded = kind_jobs_seeded_with_pinned_postgres(&parsed, postgres_reference);
+        assert!(
+            seeded > 0,
+            "no job loads {POSTGRES_AGENT_IMAGE} into a KIND cluster, so the pull that seeds one \
+             is asserted over nothing"
+        );
+        assert_eq!(
+            resolved, seeded,
+            "the workflow resolves {resolved} image digests of its own and {seeded} jobs run \
+             PostgreSQL pods in a KIND cluster; each of those needs exactly one, so a digest \
+             with no job behind it is unaccounted for and a job with none seeds nothing"
+        );
+    }
+
     /// The repository root. CI reports changed files relative to it, so every
     /// path handed to the detector below is stated the same way.
     fn workspace_root() -> std::path::PathBuf {
