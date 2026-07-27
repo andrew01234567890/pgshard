@@ -2,6 +2,7 @@
 
 use std::env;
 use std::ffi::OsStr;
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,6 +15,9 @@ use serde::{Deserialize, Serialize};
 const FIRST_VERSION: Version = Version::new(0, 1, 0);
 const RELEASE_MARKER: &str = "crates/pgshard-release/RELEASE_START";
 const RELEASE_HELPER_SOURCE: &str = "crates/pgshard-release/src/main.rs";
+const WORKFLOW_DIRECTORY: &str = ".github/workflows";
+const DEFAULT_BRANCH: &str = "main";
+const CHECKOUT: &str = ".";
 const CI_WAIT_TIMEOUT: Duration = Duration::from_mins(15);
 const CI_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const UNPRIVILEGED_DEPENDABOT_FILE_PAIRS: [[&str; 2]; 2] = [
@@ -96,6 +100,7 @@ struct ReleaseCandidate {
     messages: Vec<String>,
     state: AggregateState,
     existing_tag: Option<String>,
+    targetable: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1556,8 +1561,9 @@ fn publish(requested_sha: &str, ready_only: bool) -> Result<()> {
     }
 
     let repository = env::var("GITHUB_REPOSITORY").context("GITHUB_REPOSITORY is required")?;
+    let default_head = default_branch_head(&repository)?;
     ensure!(
-        main_contains_commit(&repository, &sha)?,
+        main_contains_commit(&repository, &sha, &default_head)?,
         "release commit {sha} is not reachable from current main"
     );
 
@@ -1579,15 +1585,19 @@ fn publish(requested_sha: &str, ready_only: bool) -> Result<()> {
     let previous_tag = plan
         .first()
         .and_then(|release| release.previous_tag.clone());
+    let checkout = Path::new(CHECKOUT);
+    ensure_commit_available(checkout, &default_head)?;
     let mut candidates = Vec::with_capacity(plan.len());
     for release in plan {
         let state = exact_aggregate_state(&repository, &release.sha)?;
         let existing_tag = semver_tag_at(&release.sha)?;
+        let targetable = !workflow_files_differ(checkout, &default_head, &release.sha)?;
         candidates.push(ReleaseCandidate {
             sha: release.sha,
             messages: release.messages,
             state,
             existing_tag,
+            targetable,
         });
     }
 
@@ -1617,13 +1627,20 @@ fn publish(requested_sha: &str, ready_only: bool) -> Result<()> {
     }
 
     let recovery_start = release_recovery_start(&candidates);
-    if recovery_start < candidates.len()
-        && candidates.last().map(|candidate| candidate.state) != Some(AggregateState::Passed)
+    if let Some(endpoint) = candidates.last()
+        && recovery_start < candidates.len()
     {
-        println!(
-            "release deferred from {} until a later exact CI aggregate succeeds",
-            candidates[recovery_start].sha
-        );
+        if !endpoint.targetable {
+            println!(
+                "release deferred from {} until an endpoint shares the default branch's workflow files",
+                candidates[recovery_start].sha
+            );
+        } else if endpoint.state != AggregateState::Passed {
+            println!(
+                "release deferred from {} until a later exact CI aggregate succeeds",
+                candidates[recovery_start].sha
+            );
+        }
     }
     Ok(())
 }
@@ -1832,7 +1849,7 @@ fn aggregate_release_plan(
     let Some(endpoint) = recovery.last() else {
         return Ok(releases);
     };
-    if endpoint.state != AggregateState::Passed {
+    if endpoint.state != AggregateState::Passed || !endpoint.targetable {
         return Ok(releases);
     }
 
@@ -1865,8 +1882,70 @@ fn ensure_release_plan_baseline(plan: &[PlannedRelease]) -> Result<()> {
 fn release_recovery_start(candidates: &[ReleaseCandidate]) -> usize {
     candidates
         .iter()
-        .position(|candidate| candidate.state != AggregateState::Passed)
+        .position(|candidate| candidate.state != AggregateState::Passed || !candidate.targetable)
         .unwrap_or(candidates.len())
+}
+
+/// Creating a release whose target differs from the default branch under
+/// `.github/workflows/` demands the `workflows` write permission, which the
+/// Actions token can never hold, so the request is refused outright. A lagging
+/// target only becomes unreachable once a workflow edit lands above it, and the
+/// backlog it blocks then grows forever. Fold such a commit into the aggregate
+/// release at the endpoint instead of asking for a call that cannot succeed.
+///
+/// The comparison is against the live default-branch head, which is what the
+/// refusal compares against; the commit the release run was handed is an
+/// arbitrary point below it and answers a different question. Two dots, because
+/// every candidate is an ancestor of that head and a merge-base diff would
+/// report nothing.
+fn workflow_files_differ(checkout: &Path, default_head: &str, sha: &str) -> Result<bool> {
+    Ok(!git_at(
+        checkout,
+        &[
+            "diff",
+            "--name-only",
+            default_head,
+            sha,
+            "--",
+            WORKFLOW_DIRECTORY,
+        ],
+    )?
+    .is_empty())
+}
+
+/// The default-branch head is read from the API, so it can name a commit pushed
+/// after this job fetched its checkout, and a diff cannot read an object that is
+/// absent. Asking for the branch rather than the bare object name keeps the
+/// request to what every server advertises.
+fn ensure_commit_available(checkout: &Path, sha: &str) -> Result<()> {
+    if commit_is_present(checkout, sha) {
+        return Ok(());
+    }
+    git_at(
+        checkout,
+        &[
+            "fetch",
+            "--no-tags",
+            "--quiet",
+            "origin",
+            &format!("refs/heads/{DEFAULT_BRANCH}"),
+        ],
+    )?;
+    ensure!(
+        commit_is_present(checkout, sha),
+        "default branch head {sha} is absent from the checkout after fetching {DEFAULT_BRANCH}"
+    );
+    Ok(())
+}
+
+fn commit_is_present(checkout: &Path, sha: &str) -> bool {
+    Command::new("git")
+        .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
+        .current_dir(checkout)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn first_parent_chain(sha: &str) -> Result<Vec<String>> {
@@ -2120,7 +2199,7 @@ fn dependabot_automerge(repository: &str, requested_sha: &str) -> Result<()> {
         merge_sha
     };
     ensure!(
-        main_contains_commit(repository, &merge_sha)?,
+        main_contains_commit(repository, &merge_sha, &default_branch_head(repository)?)?,
         "Dependabot squash commit is not reachable from current main"
     );
     ensure!(
@@ -2188,15 +2267,7 @@ fn all_checks_terminal_without_failure(checks: &CheckRuns) -> bool {
 }
 
 fn dependabot_base_is_current(repository: &str, requested_sha: &str) -> Result<bool> {
-    let main_sha = run(
-        "gh",
-        [
-            "api",
-            &format!("repos/{repository}/git/ref/heads/main"),
-            "--jq",
-            ".object.sha",
-        ],
-    )?;
+    let main_sha = default_branch_head(repository)?;
     let response = run(
         "gh",
         [
@@ -2214,16 +2285,7 @@ fn compare_contains_base(comparison: &CompareResult, base_sha: &str) -> bool {
         && matches!(comparison.status.as_str(), "ahead" | "identical")
 }
 
-fn main_contains_commit(repository: &str, commit_sha: &str) -> Result<bool> {
-    let main_sha = run(
-        "gh",
-        [
-            "api",
-            &format!("repos/{repository}/git/ref/heads/main"),
-            "--jq",
-            ".object.sha",
-        ],
-    )?;
+fn main_contains_commit(repository: &str, commit_sha: &str, main_sha: &str) -> Result<bool> {
     let response = run(
         "gh",
         [
@@ -2233,6 +2295,23 @@ fn main_contains_commit(repository: &str, commit_sha: &str) -> Result<bool> {
     )?;
     let comparison: CompareResult = serde_json::from_str(&response)?;
     Ok(compare_contains_base(&comparison, commit_sha))
+}
+
+fn default_branch_head(repository: &str) -> Result<String> {
+    let sha = run(
+        "gh",
+        [
+            "api",
+            &format!("repos/{repository}/git/ref/heads/{DEFAULT_BRANCH}"),
+            "--jq",
+            ".object.sha",
+        ],
+    )?;
+    ensure!(
+        is_complete_sha(&sha),
+        "the {DEFAULT_BRANCH} reference does not name a commit"
+    );
+    Ok(sha)
 }
 
 fn validate_dependabot_context(repository: &str, requested_sha: &str) -> Result<()> {
@@ -2632,12 +2711,23 @@ fn ensure_release_exists(tag: &str, sha: &str) -> Result<()> {
 }
 
 fn git(args: &[&str]) -> Result<String> {
-    Ok(String::from_utf8(git_bytes(args)?)?.trim().to_owned())
+    git_at(Path::new(CHECKOUT), args)
+}
+
+fn git_at(checkout: &Path, args: &[&str]) -> Result<String> {
+    Ok(String::from_utf8(git_bytes_at(checkout, args)?)?
+        .trim()
+        .to_owned())
 }
 
 fn git_bytes(args: &[&str]) -> Result<Vec<u8>> {
+    git_bytes_at(Path::new(CHECKOUT), args)
+}
+
+fn git_bytes_at(checkout: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new("git")
         .args(args)
+        .current_dir(checkout)
         .output()
         .with_context(|| format!("failed to run git {}", args.join(" ")))?;
     output_bytes("git", output)
@@ -2681,7 +2771,226 @@ mod tests {
             messages: vec![message.to_owned()],
             state,
             existing_tag: None,
+            targetable: true,
         }
+    }
+
+    fn untargetable(mut candidate: ReleaseCandidate) -> ReleaseCandidate {
+        candidate.targetable = false;
+        candidate
+    }
+
+    #[test]
+    fn a_green_commit_behind_a_workflow_edit_folds_into_the_endpoint() {
+        let releases = aggregate_release_plan(
+            Some(Version::new(0, 113, 3)),
+            Some("v0.113.3".to_owned()),
+            &[
+                untargetable(release_candidate(
+                    "stranded-feature",
+                    "feat(agent): reach TLS by reload",
+                    AggregateState::Passed,
+                )),
+                untargetable(release_candidate(
+                    "workflow-edit",
+                    "ci: retry the registry pulls",
+                    AggregateState::Passed,
+                )),
+                release_candidate(
+                    "head",
+                    "fix(agent): fence the postmaster",
+                    AggregateState::Passed,
+                ),
+            ],
+        )
+        .expect("a reachable endpoint closes the gap");
+
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].sha, "head");
+        assert_eq!(releases[0].version, Version::new(0, 114, 0));
+        assert_eq!(releases[0].messages.len(), 3);
+    }
+
+    #[test]
+    fn an_unreachable_endpoint_defers_instead_of_being_refused() {
+        let releases = aggregate_release_plan(
+            Some(Version::new(0, 113, 3)),
+            Some("v0.113.3".to_owned()),
+            &[untargetable(release_candidate(
+                "stranded-feature",
+                "feat(agent): reach TLS by reload",
+                AggregateState::Passed,
+            ))],
+        )
+        .expect("an unreachable endpoint is not an error");
+
+        assert!(releases.is_empty());
+    }
+
+    fn workflow_history() -> tempfile::TempDir {
+        let repository = tempfile::TempDir::new().expect("temporary repository");
+        let root = repository.path();
+        git_in(root, &["init", "--quiet", "--initial-branch=main"]);
+        git_in(root, &["config", "user.email", "release@example.invalid"]);
+        git_in(root, &["config", "user.name", "release"]);
+        repository
+    }
+
+    fn commit_tree(root: &Path, workflow: &str, source: &str, note: &str) -> String {
+        let workflows = root.join(WORKFLOW_DIRECTORY);
+        std::fs::create_dir_all(&workflows).expect("workflow directory");
+        std::fs::write(workflows.join("ci.yml"), workflow).expect("write workflow");
+        std::fs::write(root.join("source"), source).expect("write source");
+        git_in(root, &["add", "--all"]);
+        git_in(root, &["commit", "--quiet", "-m", note]);
+        git_in(root, &["rev-parse", "HEAD"])
+    }
+
+    #[test]
+    fn a_commit_the_head_shares_workflow_files_with_is_targetable() {
+        let repository = workflow_history();
+        let root = repository.path();
+        let behind = commit_tree(root, "name: CI\n", "first", "test: first");
+        let head = commit_tree(root, "name: CI\n", "second", "test: second");
+
+        assert!(!workflow_files_differ(root, &head, &behind).expect("the diff runs"));
+    }
+
+    #[test]
+    fn a_commit_below_a_workflow_edit_is_untargetable() {
+        let repository = workflow_history();
+        let root = repository.path();
+        let behind = commit_tree(root, "name: CI\n", "first", "test: first");
+        let head = commit_tree(root, "name: CI\non: push\n", "first", "ci: retune");
+
+        assert!(workflow_files_differ(root, &head, &behind).expect("the diff runs"));
+    }
+
+    /// Content, not history: a commit stranded by a workflow edit becomes
+    /// targetable again the moment the edit is reverted, and the reverting
+    /// commit's own predecessor takes its place.
+    #[test]
+    fn a_reverted_workflow_edit_releases_the_commit_it_stranded() {
+        let repository = workflow_history();
+        let root = repository.path();
+        let stranded = commit_tree(root, "name: CI\n", "first", "test: first");
+        let edited = commit_tree(root, "name: CI\non: push\n", "second", "ci: retune");
+        let head = commit_tree(root, "name: CI\n", "third", "revert: ci: retune");
+
+        assert!(!workflow_files_differ(root, &head, &stranded).expect("the diff runs"));
+        assert!(workflow_files_differ(root, &head, &edited).expect("the diff runs"));
+    }
+
+    #[test]
+    fn byte_identical_workflow_files_reached_apart_are_targetable() {
+        let repository = workflow_history();
+        let root = repository.path();
+        let base = commit_tree(root, "name: CI\n", "base", "test: base");
+        git_in(root, &["switch", "--quiet", "-c", "side", &base]);
+        let side = commit_tree(
+            root,
+            "name: CI\non: push\n",
+            "side",
+            "ci: retune on the side",
+        );
+        git_in(root, &["switch", "--quiet", "main"]);
+        let head = commit_tree(root, "name: CI\non: push\n", "head", "ci: retune on main");
+
+        assert_ne!(side, head);
+        assert!(!workflow_files_differ(root, &head, &side).expect("the diff runs"));
+        assert!(workflow_files_differ(root, &head, &base).expect("the diff runs"));
+    }
+
+    /// The refusal covers the workflow directory, so a path that merely starts
+    /// with its name must not strand a commit that no release permission
+    /// applies to.
+    #[test]
+    fn a_neighbour_of_the_workflow_directory_strands_nothing() {
+        let repository = workflow_history();
+        let root = repository.path();
+        let neighbour = root.join(".github/workflows-notes");
+        std::fs::create_dir_all(&neighbour).expect("neighbouring directory");
+        std::fs::write(neighbour.join("note.yml"), "first\n").expect("write note");
+        let behind = commit_tree(root, "name: CI\n", "first", "test: first");
+        std::fs::write(neighbour.join("note.yml"), "second\n").expect("rewrite note");
+        let head = commit_tree(root, "name: CI\n", "second", "docs: renote");
+
+        assert!(!workflow_files_differ(root, &head, &behind).expect("the diff runs"));
+    }
+
+    /// An origin whose default branch has moved on and a checkout that stops
+    /// below it, holding no object the commits above it introduced.
+    fn checkout_behind_its_origin() -> (tempfile::TempDir, tempfile::TempDir, String, String) {
+        let origin = workflow_history();
+        let root = origin.path();
+        let behind = commit_tree(root, "name: CI\n", "first", "test: first");
+        let head = commit_tree(root, "name: CI\non: push\n", "second", "ci: retune");
+
+        let checkout = tempfile::TempDir::new().expect("temporary checkout");
+        git_in(
+            checkout.path(),
+            &[
+                "clone",
+                "--quiet",
+                &root.display().to_string(),
+                &checkout.path().join("work").display().to_string(),
+            ],
+        );
+        let work = checkout.path().join("work");
+        git_in(&work, &["reset", "--quiet", "--hard", &behind]);
+        git_in(&work, &["update-ref", "-d", "refs/remotes/origin/main"]);
+        git_in(&work, &["reflog", "expire", "--expire=now", "--all"]);
+        git_in(&work, &["gc", "--prune=now", "--quiet"]);
+        assert!(
+            !commit_is_present(&work, &head),
+            "the fixture must start without the object the checkout has to fetch"
+        );
+        (origin, checkout, behind, head)
+    }
+
+    /// A checkout without the object cannot be diffed against it, and a run
+    /// that treated the failure as sameness would target exactly the commits
+    /// the refusal rejects.
+    #[test]
+    fn the_default_branch_head_is_fetched_before_it_is_diffed() {
+        let (_origin, checkout, behind, head) = checkout_behind_its_origin();
+        let work = checkout.path().join("work");
+
+        ensure_commit_available(&work, &head).expect("the checkout fetches its default branch");
+
+        assert!(commit_is_present(&work, &head));
+        assert!(workflow_files_differ(&work, &head, &behind).expect("the diff runs"));
+    }
+
+    #[test]
+    fn an_unreachable_origin_fails_instead_of_reporting_sameness() {
+        let (_origin, checkout, _behind, head) = checkout_behind_its_origin();
+        let work = checkout.path().join("work");
+        git_in(
+            &work,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                &checkout.path().join("absent").display().to_string(),
+            ],
+        );
+
+        assert!(ensure_commit_available(&work, &head).is_err());
+    }
+
+    #[test]
+    fn a_head_the_default_branch_no_longer_reaches_fails() {
+        let (origin, checkout, behind, head) = checkout_behind_its_origin();
+        let work = checkout.path().join("work");
+        git_in(origin.path(), &["update-ref", "refs/heads/main", &behind]);
+
+        let error = ensure_commit_available(&work, &head).expect_err("the object never arrives");
+
+        assert!(
+            error.to_string().contains(&head),
+            "the failure names the head it could not obtain: {error}"
+        );
     }
 
     #[test]
