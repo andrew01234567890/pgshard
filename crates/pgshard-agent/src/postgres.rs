@@ -7186,6 +7186,50 @@ mod tests {
         }
     }
 
+    /// Serving activation installs its sealed policy at this exact path under a
+    /// running postmaster. Nothing stops that postmaster from dying with the
+    /// policy still installed, so the next incarnation must come up under the
+    /// non-serving policy again and re-earn the transition. This is the check
+    /// that makes "every incarnation starts non-serving" true rather than
+    /// hoped for: preparation calls `materialize_hba_file`, and it must repair
+    /// a left-behind serving policy exactly as it repairs a tampered one.
+    #[test]
+    fn a_serving_policy_left_behind_by_a_crashed_attempt_never_survives_into_the_next_spawn() {
+        // The shape serving activation installs: sealed 0400, and admitting
+        // exactly what the role policy does not.
+        const LEFT_BEHIND_SERVING_POLICY: &[u8] = b"local postgres postgres peer\n\
+hostssl shardschema pgshard_pooler_catalog all scram-sha-256\n\
+host all all all reject\n";
+
+        for role in [
+            PostgresRuntimeRole::Quarantine,
+            PostgresRuntimeRole::ReplicationStandby,
+            PostgresRuntimeRole::ServingPrimary,
+            PostgresRuntimeRole::ReplicationBootstrapPrimary,
+        ] {
+            let fixture = TempDir::new().expect("create HBA fixture");
+            let hba = fixture.path().join("hba").join("pg_hba.conf");
+            let uid = geteuid().as_raw();
+            materialize_hba_file(&hba, uid, role).expect("materialize the role policy");
+
+            fs::set_permissions(&hba, fs::Permissions::from_mode(0o600)).expect("open policy");
+            fs::write(&hba, LEFT_BEHIND_SERVING_POLICY).expect("leave a serving policy behind");
+            fs::set_permissions(&hba, fs::Permissions::from_mode(0o400)).expect("seal it");
+            assert!(
+                validate_hba_file(&hba, uid, role).is_err(),
+                "a serving policy validated as the role policy, so nothing would repair it"
+            );
+
+            materialize_hba_file(&hba, uid, role).expect("restore the role policy");
+            assert_eq!(
+                fs::read(&hba).expect("read the restored policy"),
+                hba_policy_contents(role),
+                "a serving policy left behind by a crashed attempt survived into the next spawn"
+            );
+            validate_hba_file(&hba, uid, role).expect("the restored policy must validate");
+        }
+    }
+
     /// The value legitimately changes at runtime, so being idempotent means
     /// matching the value about to be installed rather than a constant. Getting
     /// that wrong replaces a correct file on every spawn and gives the second
