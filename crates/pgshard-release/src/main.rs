@@ -18,6 +18,13 @@ const RELEASE_HELPER_SOURCE: &str = "crates/pgshard-release/src/main.rs";
 const WORKFLOW_DIRECTORY: &str = ".github/workflows";
 const DEFAULT_BRANCH: &str = "main";
 const CHECKOUT: &str = ".";
+// Every type the Conventional Commits v1.0.0 recommendation names. A missing
+// type is not a stricter policy: `main` cannot be rewritten, so the first
+// subject that uses one blocks the release of every commit behind it until this
+// list changes.
+const CONVENTIONAL_COMMIT_TYPES: &[&str] = &[
+    "build", "chore", "ci", "docs", "feat", "fix", "perf", "refactor", "revert", "style", "test",
+];
 const CI_WAIT_TIMEOUT: Duration = Duration::from_mins(15);
 const CI_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const UNPRIVILEGED_DEPENDABOT_FILE_PAIRS: [[&str; 2]; 2] = [
@@ -1803,7 +1810,8 @@ fn release_plan(sha: &str) -> Result<Vec<PlannedRelease>> {
             "release history contains a non-nearest tagged gap"
         );
         let message = commit_message(commit)?;
-        let version = next_version(current.as_ref(), &message)?;
+        let version =
+            next_version(current.as_ref(), &message).with_context(|| format!("commit {commit}"))?;
         plan.push(PlannedRelease {
             sha: commit.clone(),
             messages: vec![message],
@@ -1975,7 +1983,11 @@ fn aggregate_next_version(current: Option<&Version>, messages: &[String]) -> Res
     );
     let bump = messages
         .iter()
-        .map(|message| parse_bump(message))
+        .map(|message| {
+            parse_bump(message).with_context(|| {
+                format!("subject `{}`", message.lines().next().unwrap_or_default())
+            })
+        })
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .max_by_key(|bump| bump_precedence(*bump))
@@ -2057,11 +2069,8 @@ fn parse_bump(message: &str) -> Result<Bump> {
         "Conventional Commit type must not be empty"
     );
 
-    let allowed = [
-        "build", "chore", "ci", "docs", "feat", "fix", "perf", "refactor", "revert", "test",
-    ];
     ensure!(
-        allowed.contains(&kind),
+        CONVENTIONAL_COMMIT_TYPES.contains(&kind),
         "unsupported Conventional Commit type `{kind}`"
     );
 
@@ -3278,6 +3287,58 @@ mod tests {
         assert!(notes.contains("- test(operator): retry identity conflict"));
         assert!(notes.contains("compare/v0.74.0..."));
         assert!(notes.contains("source code only"));
+    }
+
+    /// Restated from the Conventional Commits v1.0.0 recommendation rather than
+    /// read from the list under test: `feat` and `fix` from the specification,
+    /// and the nine the summary points at through
+    /// `@commitlint/config-conventional`. Sharing one definition would let an
+    /// omission satisfy the assertion it is supposed to fail.
+    const RECOMMENDED_CONVENTIONAL_TYPES: [&str; 11] = [
+        "build", "chore", "ci", "docs", "feat", "fix", "perf", "refactor", "revert", "style",
+        "test",
+    ];
+
+    #[test]
+    fn every_recommended_conventional_type_is_releasable() {
+        let mut accepted = CONVENTIONAL_COMMIT_TYPES.to_vec();
+        accepted.sort_unstable();
+        let mut recommended = RECOMMENDED_CONVENTIONAL_TYPES.to_vec();
+        recommended.sort_unstable();
+        assert_eq!(
+            accepted, recommended,
+            "a type the recommendation names but this list omits blocks every release behind the first commit that uses it"
+        );
+
+        for kind in RECOMMENDED_CONVENTIONAL_TYPES {
+            let bump = parse_bump(&format!("{kind}(scope): change something"))
+                .unwrap_or_else(|error| panic!("`{kind}` is unreleasable: {error:#}"));
+            let expected = if kind == "feat" {
+                Bump::Minor
+            } else {
+                Bump::Patch
+            };
+            assert_eq!(bump, expected, "`{kind}` bumps the wrong component");
+        }
+    }
+
+    #[test]
+    fn an_unsupported_type_names_the_subject_that_carried_it() {
+        let error = aggregate_next_version(
+            Some(&Version::new(0, 113, 3)),
+            &["wip(pgwire): park the fence".to_owned()],
+        )
+        .unwrap_err();
+
+        let reported = format!("{error:#}");
+        assert!(
+            reported.contains("wip(pgwire): park the fence"),
+            "the failure names the offending subject: {reported}"
+        );
+        assert!(
+            reported.contains("unsupported Conventional Commit type `wip`"),
+            "the failure names the offending type: {reported}"
+        );
     }
 
     #[test]
