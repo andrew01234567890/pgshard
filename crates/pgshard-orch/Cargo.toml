@@ -36,7 +36,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 postgres-protocol.workspace = true
-rcgen = "=0.14.5"
+rcgen = "=0.14.8"
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
