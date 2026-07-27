@@ -2,16 +2,38 @@
 
 use libfuzzer_sys::fuzz_target;
 use pgshard_pgwire::{
-    AuthenticationRequest, BackendFrame, DEFAULT_LARGE_MESSAGE_LENGTH, Decode,
-    decode_authentication_request, decode_backend, decode_backend_key_data,
+    AuthenticationRequest, BACKEND_SHORT_MESSAGE_LENGTH, BACKEND_STARTUP_MESSAGE_LENGTH,
+    BackendFrame, DEFAULT_LARGE_MESSAGE_LENGTH, Decode, DecodeError, MAX_LARGE_MESSAGE_LENGTH,
+    ReplicationCopyData, decode_authentication_request, decode_backend, decode_backend_key_data,
     decode_parameter_description, decode_parameter_status, decode_protocol_negotiation,
-    decode_ready_for_query, require_empty_backend_body,
+    decode_ready_for_query, decode_replication_copy_data, require_empty_backend_body,
 };
 
+// Caller policies from the decoder's minimum to PostgreSQL's own large-message
+// limit, so the family-versus-caller minimum is exercised on both sides of every
+// family bound instead of only at the 16 MiB default.
+const LIMITS: [usize; 5] = [
+    4,
+    BACKEND_STARTUP_MESSAGE_LENGTH,
+    BACKEND_SHORT_MESSAGE_LENGTH,
+    DEFAULT_LARGE_MESSAGE_LENGTH,
+    MAX_LARGE_MESSAGE_LENGTH,
+];
+
 fuzz_target!(|input: &[u8]| {
-    if let Ok(Decode::Complete { frame, .. }) = decode_backend(input, DEFAULT_LARGE_MESSAGE_LENGTH)
-    {
-        exercise_typed_decoders(frame);
+    for limit in LIMITS {
+        if let Ok(Decode::Complete { frame, .. }) = decode_backend(input, limit) {
+            exercise_typed_decoders(frame);
+        }
+    }
+    for rejected in [3, MAX_LARGE_MESSAGE_LENGTH + 1] {
+        assert!(
+            matches!(
+                decode_backend(input, rejected),
+                Err(DecodeError::InvalidMaximum { .. })
+            ),
+            "an out-of-range caller policy must be rejected before the input"
+        );
     }
 });
 
@@ -31,6 +53,16 @@ fn exercise_typed_decoders(frame: BackendFrame<'_>) {
             std::hint::black_box(
                 parameter_type.expect("decoded parameter-type iterator invariant"),
             );
+        }
+    }
+    if let Ok(payload) = decode_replication_copy_data(frame) {
+        match payload {
+            ReplicationCopyData::XLogData(data) => {
+                std::hint::black_box(data.data());
+            }
+            ReplicationCopyData::PrimaryKeepalive(keepalive) => {
+                std::hint::black_box(keepalive);
+            }
         }
     }
     let _ = std::hint::black_box(decode_parameter_status(frame));

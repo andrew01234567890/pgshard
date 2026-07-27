@@ -47,6 +47,11 @@ limit, applies a five-second startup deadline, and drains for at most two
 seconds. It refuses GSS and SSL negotiation with PostgreSQL's single-byte `N`,
 closes malformed requests without reflecting their contents, and returns a
 minimal `FATAL`/`57P03` response when no ready compatibility target exists.
+Like PostgreSQL, it reads exactly the startup packet and treats whatever the
+client pipelined behind it as session bytes, so a driver that writes its
+StartupMessage and first query in one `write` is served; only the encryption
+negotiations forbid trailing data, and unencrypted bytes after a refused SSL
+request are answered with PostgreSQL's `FATAL`/`08P01` protocol violation.
 With `PGSHARD_RW_BACKEND_HOST` configured and the catalog ready, it relays one
 raw client connection to that target, preserving PostgreSQL authentication and
 subsequent session bytes end to end. Cancellation requests are forwarded to the

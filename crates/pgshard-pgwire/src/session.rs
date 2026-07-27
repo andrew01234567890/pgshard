@@ -5,11 +5,17 @@ use std::fmt;
 use thiserror::Error;
 
 use crate::{
-    BackendKeyData, LATEST_PROTOCOL_MINOR, MIN_BACKEND_CANCEL_KEY_LENGTH, ProtocolNegotiation,
-    ProtocolVersion, StartupFrame, StartupParameters, ValidatedIteratorError,
+    BackendKeyData, MIN_BACKEND_CANCEL_KEY_LENGTH, ProtocolNegotiation, ProtocolVersion,
+    StartupFrame, StartupParameters, ValidatedIteratorError,
 };
 
 const POSTGRES18_MODERN_CANCEL_KEY_LENGTH: usize = 32;
+// PostgreSQL compares the requested protocol against the literal PG_PROTOCOL(3,
+// 2), not against the latest version it implements
+// (src/backend/tcop/postgres.c:4272). Deriving this from the crate's latest
+// negotiated minor would silently shorten every key the day PostgreSQL 3.3
+// lands.
+const POSTGRES18_MODERN_CANCEL_KEY_MINOR: u16 = 2;
 
 /// A linear validator for the exact startup packet sent to `PostgreSQL` 18.
 ///
@@ -184,10 +190,11 @@ impl Postgres18Protocol {
     /// Returns the cancellation-key length emitted by `PostgreSQL` 18.
     ///
     /// `PostgreSQL` 18 emits its 32-byte key for protocol 3.2 and later, and the
-    /// legacy four-byte key for earlier protocol-three minor versions.
+    /// legacy four-byte key for earlier protocol-three minor versions
+    /// (`src/backend/tcop/postgres.c:4272`).
     #[must_use]
     pub const fn expected_backend_key_length(self) -> usize {
-        if self.version.minor() >= LATEST_PROTOCOL_MINOR {
+        if self.version.minor() >= POSTGRES18_MODERN_CANCEL_KEY_MINOR {
             POSTGRES18_MODERN_CANCEL_KEY_LENGTH
         } else {
             MIN_BACKEND_CANCEL_KEY_LENGTH

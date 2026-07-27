@@ -266,20 +266,32 @@ impl Iterator for ParameterTypeIter<'_> {
 }
 
 /// `PostgreSQL` text or binary field format.
+///
+/// `PostgreSQL` treats a format code as data until something decodes a value
+/// with it. `exec_bind_message` copies both format arrays without inspecting
+/// them (`src/backend/tcop/postgres.c:1710` and `:2003`); "unsupported format
+/// code" is raised per parameter as that parameter is converted
+/// (`src/backend/tcop/postgres.c:1951`) and per result column as that column is
+/// printed (`src/backend/access/common/printtup.c:292`). A `Bind` that declares
+/// an unsupported code but never decodes a value under it — a zero-parameter
+/// statement, or a portal returning no tuples — succeeds on `PostgreSQL`, so
+/// this decoder carries the code through instead of rejecting the message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FormatCode {
     /// Text representation.
     Text,
     /// Binary representation.
     Binary,
+    /// A code `PostgreSQL` accepts on the wire but cannot convert a value with.
+    Unsupported(u16),
 }
 
 impl FormatCode {
-    fn decode(value: u16) -> Result<Self, MessageError> {
+    const fn from_wire(value: u16) -> Self {
         match value {
-            0 => Ok(Self::Text),
-            1 => Ok(Self::Binary),
-            _ => Err(MessageError::InvalidFormatCode(value)),
+            0 => Self::Text,
+            1 => Self::Binary,
+            other => Self::Unsupported(other),
         }
     }
 }
@@ -487,14 +499,7 @@ impl<'a> BindParameterIter<'a> {
     fn format_layout_is_valid(&self) -> bool {
         let length = self.format_bytes.len();
         let expected = usize::from(self.count) * 2;
-        if !(length == 0 || length == 2 || length == expected) {
-            return false;
-        }
-        if self.count == 0 && length == 2 {
-            let bytes = [self.format_bytes[0], self.format_bytes[1]];
-            return FormatCode::decode(u16::from_be_bytes(bytes)).is_ok();
-        }
-        true
+        length == 0 || length == 2 || length == expected
     }
 
     fn next_validated(&mut self) -> Result<BindParameter<'a>, ValidatedIteratorError> {
@@ -518,7 +523,7 @@ impl<'a> BindParameterIter<'a> {
                     .ok_or_else(invalid)?
                     .try_into()
                     .map_err(|_| invalid())?;
-                FormatCode::decode(u16::from_be_bytes(*bytes)).map_err(|_| invalid())?
+                FormatCode::from_wire(u16::from_be_bytes(*bytes))
             }
         };
         let length_bytes: &[u8; 4] = self
@@ -580,12 +585,8 @@ impl Iterator for FormatCodeIter<'_> {
         let bytes: &[u8; 2] = bytes
             .try_into()
             .expect("a checked two-byte slice has array length two");
-        let Ok(value) = FormatCode::decode(u16::from_be_bytes(*bytes)) else {
-            self.remaining = &[];
-            return Some(Err(ValidatedIteratorError::new("format code")));
-        };
         self.remaining = &self.remaining[2..];
-        Some(Ok(value))
+        Some(Ok(FormatCode::from_wire(u16::from_be_bytes(*bytes))))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -760,10 +761,16 @@ pub fn decode_parse(
 
 /// Decodes a complete extended-query `Bind` body.
 ///
+/// Format-code values are carried through rather than validated here, because
+/// `PostgreSQL` validates them only where a value is decoded; see
+/// [`FormatCode`]. The parameter format cardinality is validated, because
+/// `exec_bind_message` validates that before touching any value
+/// (`src/backend/tcop/postgres.c:1721`).
+///
 /// # Errors
 ///
-/// Rejects the wrong tag, truncated or negative non-NULL values, unsupported
-/// format codes, format/parameter count mismatches, overflow, or trailing data.
+/// Rejects the wrong tag, truncated or negative non-NULL values,
+/// format/parameter count mismatches, overflow, or trailing data.
 pub fn decode_bind(
     frame: FrontendFrame<'_>,
     _client_encoding: ClientEncoding,
@@ -778,8 +785,6 @@ pub fn decode_bind(
         .checked_mul(2)
         .ok_or(MessageError::LengthOverflow)?;
     let format_bytes = cursor.take(format_byte_count, "parameter formats")?;
-    validate_formats(format_bytes)?;
-
     let parameter_count = cursor.u16("parameter count")?;
     if format_count > 1 && format_count != usize::from(parameter_count) {
         return Err(MessageError::ParameterFormatCountMismatch {
@@ -807,7 +812,6 @@ pub fn decode_bind(
         .checked_mul(2)
         .ok_or(MessageError::LengthOverflow)?;
     let result_format_bytes = cursor.take(result_byte_count, "result formats")?;
-    validate_formats(result_format_bytes)?;
     cursor.finish()?;
 
     Ok(BindMessage {
@@ -878,15 +882,6 @@ fn decode_extended_query_object(body: &[u8]) -> Result<(ExtendedQueryObject, &st
     let name = cursor.cstring_utf8("extended-query object name")?;
     cursor.finish()?;
     Ok((object, name))
-}
-
-fn validate_formats(mut bytes: &[u8]) -> Result<(), MessageError> {
-    while let Some(value) = bytes.get(..2) {
-        FormatCode::decode(u16::from_be_bytes([value[0], value[1]]))?;
-        bytes = &bytes[2..];
-    }
-    debug_assert!(bytes.is_empty());
-    Ok(())
 }
 
 struct Cursor<'a> {
@@ -995,9 +990,6 @@ pub enum MessageError {
         /// Supplied value count.
         parameters: usize,
     },
-    /// A format code is neither text zero nor binary one.
-    #[error("unsupported PostgreSQL format code {0}")]
-    InvalidFormatCode(u16),
     /// A parameter length is negative but not the NULL sentinel `-1`.
     #[error("invalid bind parameter length {0}")]
     InvalidParameterLength(i32),
@@ -1039,6 +1031,15 @@ mod tests {
 
     fn push_i32(bytes: &mut Vec<u8>, value: i32) {
         bytes.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn wire_format(format: FormatCode) -> i16 {
+        let code: u16 = match format {
+            FormatCode::Text => 0,
+            FormatCode::Binary => 1,
+            FormatCode::Unsupported(code) => code,
+        };
+        i16::from_be_bytes(code.to_be_bytes())
     }
 
     #[test]
@@ -1329,13 +1330,7 @@ mod tests {
                 i16::try_from(formats.len()).expect("format count"),
             );
             for format in &formats {
-                push_i16(
-                    &mut body,
-                    match format {
-                        FormatCode::Text => 0,
-                        FormatCode::Binary => 1,
-                    },
-                );
+                push_i16(&mut body, wire_format(*format));
             }
             push_i16(&mut body, 2);
             push_i32(&mut body, 1);
@@ -1354,6 +1349,83 @@ mod tests {
         }
     }
 
+    // PostgreSQL never inspects the format arrays while decoding Bind; a
+    // zero-parameter statement carrying one parameter format code of 2 binds
+    // successfully (src/backend/tcop/postgres.c:1710 and :1721).
+    #[test]
+    fn a_zero_parameter_bind_accepts_an_unsupported_parameter_format() {
+        let mut body = b"\0\0".to_vec();
+        push_i16(&mut body, 1);
+        push_i16(&mut body, 2);
+        push_i16(&mut body, 0);
+        push_i16(&mut body, 0);
+
+        let bind = decode_bind(frame(b'B', &body), utf8())
+            .expect("PostgreSQL binds a zero-parameter statement with format code 2");
+        assert!(bind.parameters().is_empty());
+        assert_eq!(
+            bind.parameters()
+                .iter()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("validated Bind parameters"),
+            vec![]
+        );
+    }
+
+    // The error fires per value converted (src/backend/tcop/postgres.c:1951)
+    // and per result column printed
+    // (src/backend/access/common/printtup.c:292), so the decoder must hand the
+    // code and the untouched value to the session layer that raises it.
+    #[test]
+    fn unsupported_format_codes_reach_the_session_layer_with_their_values() {
+        let mut body = b"\0\0".to_vec();
+        push_i16(&mut body, 1);
+        push_i16(&mut body, 2);
+        push_i16(&mut body, 1);
+        push_i32(&mut body, 3);
+        body.extend_from_slice(b"abc");
+        push_i16(&mut body, 1);
+        push_i16(&mut body, 9);
+
+        let bind = decode_bind(frame(b'B', &body), utf8())
+            .expect("PostgreSQL decodes the Bind before converting any value");
+        assert_eq!(
+            bind.parameters()
+                .iter()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("validated Bind parameters"),
+            vec![BindParameter {
+                format: FormatCode::Unsupported(2),
+                value: Some(b"abc"),
+            }]
+        );
+        assert_eq!(
+            bind.result_formats()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("validated result formats"),
+            vec![FormatCode::Unsupported(9)]
+        );
+    }
+
+    // PostgreSQL reads format codes as unsigned 16-bit fields, so 0xFFFF is a
+    // format code and not a negative count (src/backend/tcop/postgres.c:1715).
+    #[test]
+    fn a_format_code_with_the_high_bit_set_is_carried_unsigned() {
+        let mut body = b"\0\0".to_vec();
+        push_i16(&mut body, 0);
+        push_i16(&mut body, 0);
+        push_i16(&mut body, 1);
+        push_i16(&mut body, wire_format(FormatCode::Unsupported(0xFFFF)));
+
+        let bind = decode_bind(frame(b'B', &body), utf8()).expect("bind");
+        assert_eq!(
+            bind.result_formats()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("validated result formats"),
+            vec![FormatCode::Unsupported(0xFFFF)]
+        );
+    }
+
     #[test]
     fn malformed_bind_fields_fail_closed() {
         let mut mismatch = b"\0\0".to_vec();
@@ -1365,16 +1437,6 @@ mod tests {
             decode_bind(frame(b'B', &mismatch), utf8()),
             Err(MessageError::ParameterFormatCountMismatch { .. })
         ));
-
-        let mut invalid_format = b"\0\0".to_vec();
-        push_i16(&mut invalid_format, 1);
-        push_i16(&mut invalid_format, 2);
-        push_i16(&mut invalid_format, 0);
-        push_i16(&mut invalid_format, 0);
-        assert_eq!(
-            decode_bind(frame(b'B', &invalid_format), utf8()),
-            Err(MessageError::InvalidFormatCode(2))
-        );
 
         let mut negative = b"\0\0".to_vec();
         push_i16(&mut negative, 0);
@@ -1504,7 +1566,7 @@ mod tests {
         assert!(matches!(parameter_types.next(), Some(Err(_))));
         assert_eq!(parameter_types.len(), 0);
 
-        let mut formats = FormatCodeIter { remaining: &[0, 2] };
+        let mut formats = FormatCodeIter { remaining: &[0] };
         assert!(matches!(formats.next(), Some(Err(_))));
         assert_eq!(formats.len(), 0);
 
@@ -1517,12 +1579,6 @@ mod tests {
             },
             BindParameterIter {
                 format_bytes: &[0, 1, 0],
-                value_bytes: &[0, 0, 0, 0],
-                index: 0,
-                count: 1,
-            },
-            BindParameterIter {
-                format_bytes: &[0, 2],
                 value_bytes: &[0, 0, 0, 0],
                 index: 0,
                 count: 1,
@@ -1541,12 +1597,6 @@ mod tests {
             },
             BindParameterIter {
                 format_bytes: &[0],
-                value_bytes: &[],
-                index: 0,
-                count: 0,
-            },
-            BindParameterIter {
-                format_bytes: &[0, 2],
                 value_bytes: &[],
                 index: 0,
                 count: 0,

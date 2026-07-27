@@ -154,6 +154,12 @@ fn route_resolved_bind(
     let format = match parameter.format() {
         FormatCode::Text => ParameterFormat::Text,
         FormatCode::Binary => ParameterFormat::Binary,
+        // PostgreSQL raises "unsupported format code" as it converts this very
+        // parameter (src/backend/tcop/postgres.c:1951), so no value under it is
+        // ever routable.
+        FormatCode::Unsupported(code) => {
+            return Err(BindRouteError::UnsupportedParameterFormat(code));
+        }
     };
     route_bound_parameter(
         snapshot,
@@ -282,6 +288,9 @@ enum BindRouteError {
     /// A private validated Bind iterator invariant was violated.
     #[error(transparent)]
     ValidatedIterator(#[from] ValidatedIteratorError),
+    /// The shard-key parameter uses a format code `PostgreSQL` cannot convert.
+    #[error("unsupported PostgreSQL format code {0}")]
+    UnsupportedParameterFormat(u16),
     /// The selected shard-key value cannot be routed exactly.
     #[error(transparent)]
     Route(RouteError),
@@ -437,6 +446,7 @@ mod tests {
             let code = match format {
                 FormatCode::Text => 0_u16,
                 FormatCode::Binary => 1_u16,
+                FormatCode::Unsupported(code) => *code,
             };
             body.extend_from_slice(&code.to_be_bytes());
         }
