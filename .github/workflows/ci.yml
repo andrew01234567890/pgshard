@@ -89,8 +89,12 @@ jobs:
           # change made and then reverted inside a wider window vanishes from
           # it, so widening the base could drop a component and let the
           # aggregate authorize a tree no run ever tested. Renames stay
-          # undetected so both paths are reported, as the history audit reads
-          # them.
+          # undetected so that both the path a file left and the path it
+          # arrived at are reported; the history audit leaves them undetected
+          # too, but it excludes deletions and so sees only the destination.
+          # `--first-parent` already implies `--diff-merges=first-parent`, which
+          # is named anyway so that a merge cannot become invisible here if that
+          # default ever moves.
           if [[ -n "$base" ]] && git cat-file -e "${base}^{commit}" 2>/dev/null; then
             git log --first-parent --diff-merges=first-parent --no-renames \
               --name-only --pretty=format: "$base..$GITHUB_SHA" \

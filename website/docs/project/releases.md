@@ -66,8 +66,10 @@ components than a narrower one and let an endpoint aggregate authorize a tree
 whose parts were never built together. The union has no such gap, which is what
 makes a widened base a strict superset and lets a concurrent run stand in for a
 serialized one. Renames are left undetected so that both the path a file left
-and the path it arrived at are reported, matching how the public-history audit
-reads the same range.
+and the path it arrived at are reported. The public-history audit also leaves
+renames undetected, but it otherwise reads the same range differently: it walks
+every commit rather than the first-parent line, and it excludes deletions, so a
+rename reaches it as the destination path alone.
 
 Out-of-order completion also changes release granularity. Publication now
 commonly finds an earlier commit's aggregate still pending, which ends the
