@@ -2,11 +2,11 @@
 
 use libfuzzer_sys::fuzz_target;
 use pgshard_pgwire::{
-    ClientEncoding, DEFAULT_LARGE_MESSAGE_LENGTH, Decode, DecodeError, FrontendFrame, FrontendPhase,
-    MAX_LARGE_MESSAGE_LENGTH, SCRAM_MESSAGE_LENGTH, SMALL_MESSAGE_LENGTH, ScramMechanisms,
-    decode_bind, decode_close, decode_describe, decode_execute, decode_frontend, decode_parse,
-    decode_query, decode_sasl_initial_response, decode_sasl_response, encode_authentication_sasl,
-    require_empty_body,
+    ClientEncoding, DEFAULT_LARGE_MESSAGE_LENGTH, Decode, DecodeError, FrontendFrame,
+    FrontendPhase, MAX_LARGE_MESSAGE_LENGTH, SCRAM_MESSAGE_LENGTH, SMALL_MESSAGE_LENGTH,
+    ScramMechanisms, decode_bind, decode_close, decode_describe, decode_execute, decode_frontend,
+    decode_parse, decode_query, decode_sasl_initial_response, decode_sasl_response,
+    encode_authentication_sasl, require_empty_body,
 };
 
 // Caller policies from the decoder's minimum to PostgreSQL's own large-message
