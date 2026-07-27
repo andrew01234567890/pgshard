@@ -59,8 +59,20 @@ use crate::postgres_generation::PostgresGenerationError;
 /// be reviewed against each other.
 #[must_use = "dropping the materialization handoff closes its private watch"]
 pub struct MaterializedCatalogHandoff {
-    #[allow(dead_code, reason = "the serving-activation stage is the consumer")]
     receiver: watch::Receiver<Option<Arc<MaterializedCatalog>>>,
+}
+
+impl MaterializedCatalogHandoff {
+    /// Moves the private receiver into the serving-activation stage.
+    pub(crate) fn into_receiver(self) -> watch::Receiver<Option<Arc<MaterializedCatalog>>> {
+        self.receiver
+    }
+
+    /// Wraps a receiver so the consuming stage can be exercised on its own.
+    #[cfg(test)]
+    pub(crate) fn for_test(receiver: watch::Receiver<Option<Arc<MaterializedCatalog>>>) -> Self {
+        Self { receiver }
+    }
 }
 
 /// Proof that the catalog held the declared state while this exact runtime
@@ -69,14 +81,38 @@ pub struct MaterializedCatalogHandoff {
 pub(crate) struct MaterializedCatalog {
     /// Retained so the proof cannot outlive the session, authority, and
     /// incarnation evidence it was established against.
-    #[allow(dead_code, reason = "the serving-activation stage is the consumer")]
     bound: Arc<ValidatedCatalogRuntime>,
     /// Retained so the consumer can observe the binding directly. A published
     /// proof is not the same claim as a current capability: retraction is
     /// asynchronous, so the proof outlives the capability for as long as the
     /// supervisor takes to be scheduled.
-    #[allow(dead_code, reason = "the serving-activation stage is the consumer")]
     binding: watch::Receiver<Option<Arc<ValidatedCatalogRuntime>>>,
+}
+
+impl MaterializedCatalog {
+    /// The runtime capability this proof was established against.
+    pub(crate) fn bound(&self) -> &Arc<ValidatedCatalogRuntime> {
+        &self.bound
+    }
+
+    /// Whether the capability behind this proof is still the published one.
+    ///
+    /// This is what makes observing the proof insufficient on its own: the
+    /// proof is withdrawn by a supervisor that has to be scheduled first, so a
+    /// consumer holding one must ask the binding directly at the point it acts.
+    pub(crate) fn capability_is_current(&self) -> bool {
+        still_bound(&self.binding, &self.bound)
+    }
+
+    /// Builds a proof around a caller-held binding, so the stage that consumes
+    /// one can be exercised without a live server.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        bound: Arc<ValidatedCatalogRuntime>,
+        binding: watch::Receiver<Option<Arc<ValidatedCatalogRuntime>>>,
+    ) -> Self {
+        Self { bound, binding }
+    }
 }
 
 /// Starts the materialization stage against the runtime binding's output.
