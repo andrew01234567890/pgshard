@@ -407,13 +407,7 @@ docker run --detach --name "$fence_primary" \
   --volume "$fence_socket:/var/run/postgresql" \
   --env POSTGRES_PASSWORD=disposable-fence-password \
   "$image" >/dev/null
-for _ in $(seq 1 60); do
-  if docker exec "$fence_primary" pg_isready --quiet; then
-    break
-  fi
-  sleep 1
-done
-docker exec "$fence_primary" pg_isready --quiet
+wait_ready "$fence_primary"
 
 docker run --rm --user 999:999 \
   --network "$network" \
