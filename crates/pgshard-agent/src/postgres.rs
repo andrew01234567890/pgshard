@@ -3826,16 +3826,8 @@ fn direct_child_processes() -> Result<Vec<DirectChildProcess>, PostgresError> {
             continue;
         }
         let status_path = entry.path().join("status");
-        let status = match fs::read(&status_path) {
-            Ok(status) => status,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(source) => {
-                return Err(PostgresError::Read {
-                    name: "Linux process status",
-                    path: status_path,
-                    source,
-                });
-            }
+        let Some(status) = scanned_process_status(fs::read(&status_path), &status_path)? else {
+            continue;
         };
         if let Some(child) =
             direct_child_from_status(&status, &status_path, supervisor_pid, namespace_column)?
@@ -3845,6 +3837,34 @@ fn direct_child_processes() -> Result<Vec<DirectChildProcess>, PostgresError> {
     }
     children.sort_unstable_by_key(|child| child.pid.as_raw_pid());
     Ok(children)
+}
+
+/// Reports a scanned task's `/proc/<pid>/status` bytes, or `None` when the task
+/// vanished mid-scan.
+///
+/// The scan walks every process in the PID namespace, so an unrelated process
+/// exiting is routine and must not fail it. A task reaped between `open` and
+/// `read` reports `ESRCH`, which Rust maps to `ErrorKind::Uncategorized` rather
+/// than `ErrorKind::NotFound`, so the raw errno is the only reliable signal.
+/// Every other failure still surfaces.
+fn scanned_process_status(
+    status: std::io::Result<Vec<u8>>,
+    path: &Path,
+) -> Result<Option<Vec<u8>>, PostgresError> {
+    match status {
+        Ok(status) => Ok(Some(status)),
+        Err(source)
+            if source.kind() == std::io::ErrorKind::NotFound
+                || rustix::io::Errno::from_io_error(&source) == Some(rustix::io::Errno::SRCH) =>
+        {
+            Ok(None)
+        }
+        Err(source) => Err(PostgresError::Read {
+            name: "Linux process status",
+            path: path.to_owned(),
+            source,
+        }),
+    }
 }
 
 fn direct_child_from_status(
@@ -3877,6 +3897,12 @@ fn direct_child_from_status(
         .ok_or_else(|| PostgresError::InvalidProcessStatus {
             path: path.to_owned(),
         })?;
+    if raw_pid == 0 {
+        // Linux reports `NSpid: 0` for a task that is no longer alive in any
+        // namespace, which a task caught mid-reap is. It has no PID left to
+        // fence, so it vanished rather than reported a malformed status.
+        return Ok(None);
+    }
     let pid = Pid::from_raw(raw_pid).ok_or_else(|| PostgresError::InvalidProcessStatus {
         path: path.to_owned(),
     })?;
@@ -3909,16 +3935,8 @@ fn process_group_has_live_members(process_group: Pid) -> Result<bool, PostgresEr
             continue;
         }
         let status_path = entry.path().join("status");
-        let status = match fs::read(&status_path) {
-            Ok(status) => status,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(source) => {
-                return Err(PostgresError::Read {
-                    name: "Linux process status",
-                    path: status_path,
-                    source,
-                });
-            }
+        let Some(status) = scanned_process_status(fs::read(&status_path), &status_path)? else {
+            continue;
         };
         if process_status_is_live_group_member(
             &status,
@@ -6707,6 +6725,91 @@ mod tests {
         assert!(current_pid_namespace_column(b"NSpid:\t700 8\n", path, 7).is_err());
     }
 
+    fn read_status_of_task_reaped_mid_read() -> std::io::Error {
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn a task that exits immediately");
+        let status_path = PathBuf::from(format!("/proc/{}/status", child.id()));
+        loop {
+            let status = fs::read_to_string(&status_path).expect("read the live task status");
+            if status.contains("State:\tZ") {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let mut handle = File::open(&status_path).expect("open the unreaped task status");
+        child.wait().expect("reap the task");
+        let mut buffer = Vec::new();
+        handle
+            .read_to_end(&mut buffer)
+            .expect_err("read the status of a reaped task")
+    }
+
+    #[test]
+    fn process_scan_tolerates_a_task_reaped_between_open_and_read() {
+        let path = Path::new("/proc/42/status");
+        let error = read_status_of_task_reaped_mid_read();
+        assert_eq!(
+            rustix::io::Errno::from_io_error(&error),
+            Some(rustix::io::Errno::SRCH)
+        );
+        // Linux reports the reaped task as ESRCH, which Rust does not map to
+        // `NotFound`. Tolerating only `NotFound` would fail the whole scan.
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            scanned_process_status(Err(error), path).expect("tolerate a task reaped mid-scan"),
+            None
+        );
+        assert_eq!(
+            scanned_process_status(
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                path
+            )
+            .expect("tolerate a task directory that already vanished"),
+            None
+        );
+        assert_eq!(
+            scanned_process_status(Ok(b"State:\tS (sleeping)\n".to_vec()), path)
+                .expect("report a readable task status"),
+            Some(b"State:\tS (sleeping)\n".to_vec())
+        );
+    }
+
+    #[test]
+    fn process_scan_still_fails_on_errors_other_than_a_vanished_task() {
+        let path = Path::new("/proc/42/status");
+        for probe in ["/proc/self/task", "/proc/self/mem"] {
+            let error = fs::read(probe).expect_err("a /proc read that genuinely fails");
+            assert_ne!(
+                rustix::io::Errno::from_io_error(&error),
+                Some(rustix::io::Errno::SRCH)
+            );
+            assert!(matches!(
+                scanned_process_status(Err(error), path),
+                Err(PostgresError::Read {
+                    name: "Linux process status",
+                    ..
+                })
+            ));
+        }
+        // Reading this process's own memory at an unmapped address reports
+        // EIO, which Rust maps to the same `ErrorKind` as ESRCH. Only the raw
+        // errno separates a vanished task from a genuine failure.
+        assert_eq!(
+            fs::read("/proc/self/mem")
+                .expect_err("read this process's memory at an unmapped address")
+                .kind(),
+            read_status_of_task_reaped_mid_read().kind()
+        );
+        assert!(matches!(
+            scanned_process_status(
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                path
+            ),
+            Err(PostgresError::Read { .. })
+        ));
+    }
+
     #[test]
     fn direct_child_status_uses_the_supervisor_namespace_and_zombie_state() {
         let supervisor = Pid::from_raw(7).expect("positive supervisor PID");
@@ -6753,6 +6856,34 @@ mod tests {
                 path,
                 supervisor,
                 1,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn direct_child_status_treats_a_task_caught_mid_reap_as_gone() {
+        let supervisor = Pid::from_raw(7).expect("positive supervisor PID");
+        let path = Path::new("/proc/42/status");
+        // Verbatim field order Linux reports for a task caught between exit and
+        // reaping: it is unhashed from every namespace, so `NSpid` reads 0.
+        assert_eq!(
+            direct_child_from_status(
+                b"Name:\ttrue\nState:\tX (dead)\nTgid:\t42\nNgid:\t0\nPid:\t42\nPPid:\t7\n\
+                  TracerPid:\t0\nNStgid:\t0\nNSpid:\t0\nNSpgid:\t0\nNSsid:\t0\n",
+                path,
+                supervisor,
+                0,
+            )
+            .expect("skip a task caught mid-reap"),
+            None
+        );
+        assert!(
+            direct_child_from_status(
+                b"State:\tX (dead)\nPPid:\t7\nNSpid:\tnotapid\n",
+                path,
+                supervisor,
+                0,
             )
             .is_err()
         );
