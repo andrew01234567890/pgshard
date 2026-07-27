@@ -2522,16 +2522,17 @@ fn dispatch_exact_ci(repository: &str, merge_sha: &str) -> Result<()> {
         "merge SHA must be a complete hexadecimal object ID"
     );
     let existing_runs = exact_ci_dispatches(repository, merge_sha)?;
-    if !existing_runs.is_empty() {
-        let run_ids = existing_runs
-            .iter()
-            .map(|run| run.id.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        println!("exact-SHA CI was already dispatched in run(s) {run_ids}");
-        return Ok(());
+    match already_dispatched(merge_sha, &existing_runs) {
+        Err(run_ids) => {
+            println!("exact-SHA CI was already dispatched in run(s) {run_ids}");
+            Ok(())
+        }
+        Ok(undispatched) => create_exact_ci_dispatch(repository, &undispatched),
     }
+}
 
+fn create_exact_ci_dispatch(repository: &str, commit: &UndispatchedCommit) -> Result<()> {
+    let merge_sha = commit.merge_sha;
     let ref_name = format!("pgshard-ci-{merge_sha}");
     if let Some(existing) = remote_tag_target(repository, &ref_name)? {
         ensure!(
@@ -2620,7 +2621,13 @@ fn exact_ci_dispatches(repository: &str, merge_sha: &str) -> Result<Vec<Workflow
             ),
         ],
     )?;
-    let runs: WorkflowRuns = serde_json::from_str(&response)?;
+    exact_dispatch_page(serde_json::from_str(&response)?, merge_sha)
+}
+
+/// A page GitHub could have truncated cannot say a commit has no run, and an
+/// entry for another commit means it answered a different question. Either way
+/// the caller would be free to dispatch a second run onto one temporary ref.
+fn exact_dispatch_page(runs: WorkflowRuns, merge_sha: &str) -> Result<Vec<WorkflowRun>> {
     ensure!(
         runs.total_count == runs.workflow_runs.len() && runs.total_count < 100,
         "exact-SHA workflow-run lookup reached its page limit and is ambiguous"
@@ -2632,6 +2639,30 @@ fn exact_ci_dispatches(repository: &str, merge_sha: &str) -> Result<Vec<Workflow
         "GitHub returned a mismatched exact-SHA workflow run"
     );
     Ok(runs.workflow_runs)
+}
+
+/// A commit that carries no exact-SHA CI run yet. `already_dispatched` is the
+/// only way to obtain one, so a second run cannot be created on a temporary
+/// ref without having first looked for the runs already on it.
+struct UndispatchedCommit<'a> {
+    merge_sha: &'a str,
+}
+
+/// `Err` names the runs already carrying exact-SHA CI for this commit. A
+/// second run on one temporary ref outlives the release that retracts that
+/// ref, and would be left fetching a ref that is no longer there.
+fn already_dispatched<'a>(
+    merge_sha: &'a str,
+    existing_runs: &[WorkflowRun],
+) -> Result<UndispatchedCommit<'a>, String> {
+    if existing_runs.is_empty() {
+        return Ok(UndispatchedCommit { merge_sha });
+    }
+    Err(existing_runs
+        .iter()
+        .map(|run| run.id.to_string())
+        .collect::<Vec<_>>()
+        .join(","))
 }
 
 fn remote_tag_target(repository: &str, ref_name: &str) -> Result<Option<String>> {
@@ -5145,6 +5176,743 @@ mod tests {
         assert!(!release.contains("done < <("));
         assert!(release.contains("run-id: ${{ steps.candidate.outputs.run_id }}"));
         assert!(!ci.contains("Deploy documentation to GitHub Pages"));
+    }
+
+    /// A temporary `pgshard-ci-` ref is an armed release trigger rather than
+    /// clutter: the release workflow's concurrency group and its job condition
+    /// both accept one. A step that GitHub skips once an earlier step failed
+    /// therefore leaks that trigger on every path that fails, which is every
+    /// path the retraction exists for.
+    #[test]
+    fn the_temporary_ref_is_retracted_however_the_release_ended() {
+        let (job, name, step) = the_one_ref_retraction();
+        let condition = step["if"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{job}'s `{name}` states no condition"));
+
+        // Evaluated, not searched for: `always() || startsWith(...)` contains
+        // every substring the guard needs and deletes on every event there is.
+        for failed_earlier in [false, true] {
+            assert!(
+                condition_runs(
+                    condition,
+                    &format!("pgshard-ci-{}", "a".repeat(40)),
+                    failed_earlier
+                ),
+                "{job}'s `{name}` is skipped when an earlier step failed: {failed_earlier}, \
+                 which is when the ref it deletes is left behind"
+            );
+            for unrelated in [
+                "main",
+                "",
+                "pgshard-ci",
+                "release/pgshard-ci-refs",
+                "PGSHARD-CI-0000000000000000000000000000000000000000",
+            ] {
+                assert!(
+                    !condition_runs(condition, unrelated, failed_earlier),
+                    "{job}'s `{name}` deletes on {unrelated}, which never carried a temporary ref"
+                );
+            }
+        }
+
+        // A failed run has no step outputs to read, so everything the
+        // retraction names has to come from the triggering event.
+        for borrowed in ["steps.", "needs.", "jobs."] {
+            assert!(
+                !condition.contains(borrowed),
+                "{job}'s `{name}` is gated on `{borrowed}`, which a failed run cannot produce"
+            );
+        }
+        let environment = step["env"]
+            .as_mapping()
+            .unwrap_or_else(|| panic!("{job}'s `{name}` declares no environment"));
+        let value = |key: &str| {
+            environment
+                .get(serde_norway::Value::from(key))
+                .and_then(serde_norway::Value::as_str)
+        };
+        assert_eq!(
+            value("REF_NAME"),
+            Some("${{ github.event.workflow_run.head_branch }}"),
+            "{job}'s `{name}` names its ref from something other than the triggering event"
+        );
+        assert_eq!(
+            value("RELEASE_SHA"),
+            Some("${{ github.event.workflow_run.head_sha }}"),
+            "{job}'s `{name}` cannot re-derive the exact name the run validated"
+        );
+        assert_eq!(
+            value("GH_TOKEN"),
+            Some("${{ github.token }}"),
+            "{job}'s `{name}` authenticates with something other than the run's own token"
+        );
+        for (key, value) in environment {
+            let key = key.as_str().unwrap_or_default();
+            let value = value.as_str().unwrap_or_default();
+            assert!(
+                value == "${{ github.token }}"
+                    || value.starts_with("${{ github.event.workflow_run."),
+                "{job}'s `{name}` reads {key} from {value}, which a failed run may not have"
+            );
+        }
+    }
+
+    /// The shipped retraction script, driven against a recorded `gh`. What it
+    /// tolerates has to be provable here rather than from an experiment against
+    /// a real remote that nobody can re-run.
+    #[test]
+    fn the_retraction_deletes_only_the_ref_that_names_the_released_commit() {
+        let released = "a".repeat(40);
+        let ref_name = format!("pgshard-ci-{released}");
+        let inspected = format!("repos/pgshard/pgshard/git/ref/tags/{ref_name}");
+        let deleted = format!("repos/pgshard/pgshard/git/refs/tags/{ref_name}");
+
+        let retracted = retract(&ref_name, &released, &format!("ok:{released}"), "ok:");
+        assert!(retracted.succeeded, "{}", retracted.stderr);
+        assert_eq!(retracted.calls.len(), 2, "{:?}", retracted.calls);
+        assert!(
+            retracted.calls[0].contains(&inspected),
+            "the retraction deleted a ref it never read: {:?}",
+            retracted.calls
+        );
+        assert!(
+            retracted.calls[1].contains(&deleted),
+            "the retraction deleted something other than the temporary ref: {:?}",
+            retracted.calls
+        );
+
+        // Deleting a ref an equivalent run already deleted is the one failure
+        // the release tolerates, and it is tolerated by both of its parts.
+        let absent = retract(&ref_name, &released, "Not Found (HTTP 404)", "ok:");
+        assert!(absent.succeeded, "{}", absent.stderr);
+        assert_eq!(absent.calls.len(), 1, "an absent ref was deleted anyway");
+        let raced = retract(
+            &ref_name,
+            &released,
+            &format!("ok:{released}"),
+            "Reference does not exist (HTTP 422)",
+        );
+        assert!(raced.succeeded, "{}", raced.stderr);
+
+        for intolerable in [
+            "Reference does not exist (HTTP 403)",
+            "Validation Failed (HTTP 422)",
+            "Resource not accessible by integration (HTTP 403)",
+            "error connecting to api.github.com",
+        ] {
+            let refused = retract(&ref_name, &released, &format!("ok:{released}"), intolerable);
+            assert!(
+                !refused.succeeded,
+                "the retraction passed off `{intolerable}` as an already-deleted ref"
+            );
+            assert!(
+                refused.stderr.contains(intolerable),
+                "the retraction hid `{intolerable}`"
+            );
+        }
+
+        // Nothing that merely shares the guard's prefix, and nothing this run
+        // did not create, reaches the delete at all.
+        for (unrelated, sha) in [
+            (format!("pgshard-ci-{}", "A".repeat(40)), released.clone()),
+            ("pgshard-ci-main".to_owned(), released.clone()),
+            (format!("pgshard-ci-{released}x"), released.clone()),
+            (format!("pgshard-ci-{}", "b".repeat(40)), released.clone()),
+            ("pgshard-ci-".to_owned(), released.clone()),
+        ] {
+            let refused = retract(&unrelated, &sha, &format!("ok:{sha}"), "ok:");
+            assert!(
+                !refused.succeeded,
+                "{unrelated} was accepted as {sha}'s ref"
+            );
+            assert!(
+                refused.calls.is_empty(),
+                "{unrelated} reached GitHub before it was refused"
+            );
+        }
+        let moved = retract(
+            &ref_name,
+            &released,
+            &format!("ok:{}", "c".repeat(40)),
+            "ok:",
+        );
+        assert!(!moved.succeeded, "a ref on another commit was deleted");
+        assert_eq!(moved.calls.len(), 1, "a ref on another commit was deleted");
+        let unreadable = retract(
+            &ref_name,
+            &released,
+            "Resource not accessible by integration (HTTP 403)",
+            "ok:",
+        );
+        assert!(!unreadable.succeeded, "an unverifiable ref was deleted");
+        assert_eq!(unreadable.calls.len(), 1, "an unverifiable ref was deleted");
+    }
+
+    /// The reachability the retraction is designed against: two CI runs on one
+    /// temporary ref, where the first release to finish retracts the ref the
+    /// second has not checked out yet. The dispatcher creates nothing once a
+    /// run exists for the commit, refuses a listing that could have hidden one,
+    /// and is reached only from a workflow that serializes itself per commit.
+    #[test]
+    fn one_commit_gets_one_exact_sha_ci_dispatch() {
+        let released = "a".repeat(40);
+        let listing = |total: usize, runs: &str| -> WorkflowRuns {
+            serde_json::from_str(&format!(
+                "{{\"total_count\":{total},\"workflow_runs\":[{runs}]}}"
+            ))
+            .expect("a workflow-run listing")
+        };
+        let dispatch = |id: u64, sha: &str, event: &str| {
+            format!(
+                "{{\"id\":{id},\"head_branch\":\"pgshard-ci-{sha}\",\
+                 \"head_sha\":\"{sha}\",\"event\":\"{event}\"}}"
+            )
+        };
+
+        let empty = exact_dispatch_page(listing(0, ""), &released).expect("an empty listing");
+        assert_eq!(
+            already_dispatched(&released, &empty)
+                .map(|undispatched| undispatched.merge_sha.to_owned()),
+            Ok(released.clone()),
+            "a commit with no run would never get one"
+        );
+        let listed = exact_dispatch_page(
+            listing(
+                2,
+                &format!(
+                    "{},{}",
+                    dispatch(11, &released, "workflow_dispatch"),
+                    dispatch(12, &released, "workflow_dispatch")
+                ),
+            ),
+            &released,
+        )
+        .expect("a complete listing");
+        assert_eq!(
+            already_dispatched(&released, &listed)
+                .map(|undispatched| undispatched.merge_sha.to_owned())
+                .err()
+                .as_deref(),
+            Some("11,12"),
+            "a commit that already has a run would get a second one"
+        );
+
+        // A listing that could have hidden a run must not read as "no run". A
+        // page GitHub filled to its limit is the one that hides a later run
+        // while still counting every entry it returned.
+        let full_page: Vec<String> = (0..100)
+            .map(|id| dispatch(id, &released, "workflow_dispatch"))
+            .collect();
+        for ambiguous in [
+            listing(100, &full_page.join(",")),
+            listing(100, &dispatch(11, &released, "workflow_dispatch")),
+            listing(2, &dispatch(11, &released, "workflow_dispatch")),
+            listing(1, &dispatch(11, &"b".repeat(40), "workflow_dispatch")),
+            listing(1, &dispatch(11, &released, "push")),
+        ] {
+            assert!(
+                exact_dispatch_page(ambiguous, &released).is_err(),
+                "an incomplete listing reads as a commit with no run"
+            );
+        }
+
+        // The check and the create are one function, so two dispatchers can
+        // only interleave by running at once. Nothing lets them.
+        let automerge: serde_norway::Value = serde_norway::from_str(include_str!(
+            "../../../.github/workflows/dependabot-automerge.yml"
+        ))
+        .expect("the auto-merge workflow is valid YAML");
+        let concurrency = &automerge["jobs"]["enable"]["concurrency"];
+        assert_eq!(
+            concurrency["group"].as_str(),
+            Some("pgshard-dependabot-automerge-${{ github.event.workflow_run.head_sha }}"),
+            "two dispatchers for one commit can run at once"
+        );
+        assert_eq!(
+            concurrency["cancel-in-progress"].as_bool(),
+            Some(false),
+            "a queued dispatcher replaces the running one instead of waiting for it"
+        );
+    }
+
+    struct Retraction {
+        succeeded: bool,
+        stderr: String,
+        calls: Vec<String>,
+    }
+
+    /// Records what the retraction asked GitHub for, and answers as told.
+    const RECORDED_GH: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "$GH_CALLS"
+case "$*" in
+  *DELETE*) answer="$GH_DELETE" ;;
+  *) answer="$GH_INSPECT" ;;
+esac
+case "$answer" in
+  ok:*) printf '%s\n' "${answer#ok:}" ;;
+  *) printf 'gh: %s\n' "$answer" >&2; exit 1 ;;
+esac
+"#;
+
+    /// Runs the release workflow's retraction step against a `gh` that records
+    /// what it was asked for and answers as told. `inspect` and `delete` are
+    /// either `ok:<stdout>` or an error `gh` reports and exits non-zero on.
+    fn retract(ref_name: &str, release_sha: &str, inspect: &str, delete: &str) -> Retraction {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_, _, step) = the_one_ref_retraction();
+        let script = step["run"].as_str().expect("the retraction runs a script");
+        let scratch = tempfile::TempDir::new().expect("temporary retraction directory");
+        let stub = scratch.path().join("gh");
+        std::fs::write(&stub, RECORDED_GH).expect("write the recorded gh");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("the recorded gh is executable");
+        let calls = scratch.path().join("calls");
+        std::fs::write(&calls, "").expect("start the call log");
+
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    scratch.path().display(),
+                    env::var("PATH").expect("PATH")
+                ),
+            )
+            .env("GITHUB_REPOSITORY", "pgshard/pgshard")
+            .env("REF_NAME", ref_name)
+            .env("RELEASE_SHA", release_sha)
+            .env("GH_CALLS", &calls)
+            .env("GH_INSPECT", inspect)
+            .env("GH_DELETE", delete)
+            .output()
+            .expect("run the retraction step");
+        Retraction {
+            succeeded: output.status.success(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            calls: std::fs::read_to_string(&calls)
+                .expect("read the call log")
+                .lines()
+                .map(str::to_owned)
+                .collect(),
+        }
+    }
+
+    /// The single step in the release workflow that issues an HTTP DELETE,
+    /// found by the method it sends rather than by the spelling of one flag.
+    fn the_one_ref_retraction() -> (String, String, serde_norway::Value) {
+        let workflow: serde_norway::Value =
+            serde_norway::from_str(include_str!("../../../.github/workflows/release.yml"))
+                .expect("the release workflow is valid YAML");
+        let mut retractions = Vec::new();
+        for (job, definition) in workflow["jobs"]
+            .as_mapping()
+            .expect("the workflow declares jobs")
+        {
+            let job = job.as_str().expect("every job is named").to_owned();
+            for step in definition["steps"]
+                .as_sequence()
+                .expect("every job declares steps")
+            {
+                let Some(script) = step["run"].as_str() else {
+                    continue;
+                };
+                if issues_an_http_delete(script) {
+                    let name = step["name"].as_str().unwrap_or_default().to_owned();
+                    retractions.push((job.clone(), name, step.clone()));
+                }
+            }
+        }
+        assert_eq!(
+            retractions.len(),
+            1,
+            "the release workflow no longer deletes exactly the temporary ref: {:?}",
+            retractions
+                .iter()
+                .map(|(job, name, _)| format!("{job}'s `{name}`"))
+                .collect::<Vec<_>>()
+        );
+        retractions.pop().expect("the one retraction")
+    }
+
+    /// Every spelling of an HTTP DELETE a step can send, so that renaming a
+    /// flag cannot hide a ref retraction from the assertions above.
+    fn issues_an_http_delete(script: &str) -> bool {
+        let words: Vec<String> = script
+            .replace("\\\n", " ")
+            .split_whitespace()
+            .map(|word| {
+                word.trim_matches(|character| character == '\'' || character == '"')
+                    .to_owned()
+            })
+            .collect();
+        words.iter().enumerate().any(|(index, word)| {
+            let following = words.get(index + 1).map_or("", String::as_str);
+            let (flag, method) = match word.split_once('=') {
+                Some(split) => split,
+                None if word.starts_with("-X") && word.len() > "-X".len() => {
+                    ("-X", &word["-X".len()..])
+                }
+                None => (word.as_str(), following),
+            };
+            matches!(flag, "-X" | "--method" | "--request") && method.eq_ignore_ascii_case("DELETE")
+        })
+    }
+
+    /// Whether GitHub runs a step with this condition, for a triggering
+    /// `head_branch` and a job an earlier step may already have failed.
+    fn condition_runs(condition: &str, head_branch: &str, failed_earlier: bool) -> bool {
+        let tokens = tokenize_condition(condition);
+        assert!(!tokens.is_empty(), "`{condition}` is not a condition");
+        let scope = ConditionScope {
+            head_branch,
+            failed_earlier,
+        };
+        let mut index = 0;
+        let selected = evaluate_alternatives(&tokens, &mut index, &scope);
+        assert_eq!(
+            index,
+            tokens.len(),
+            "`{condition}` has an unconsumed remainder"
+        );
+        // GitHub applies an implicit `success()` to a condition that names no
+        // status function, which is exactly what skips a plain guard after an
+        // earlier step failed.
+        let stated_status = tokens.iter().any(|token| {
+            matches!(token, ConditionToken::Term(term)
+                if ["always(", "success(", "failure(", "cancelled("]
+                    .iter()
+                    .any(|status| term.starts_with(status)))
+        });
+        selected.truthy() && (stated_status || !failed_earlier)
+    }
+
+    struct ConditionScope<'a> {
+        head_branch: &'a str,
+        failed_earlier: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum ConditionToken {
+        And,
+        Or,
+        Not,
+        Equal,
+        Unequal,
+        Open,
+        Close,
+        Term(String),
+    }
+
+    #[derive(Debug, Clone)]
+    enum ConditionValue {
+        Truth(bool),
+        Text(String),
+    }
+
+    impl ConditionValue {
+        fn truthy(&self) -> bool {
+            match self {
+                Self::Truth(truth) => *truth,
+                Self::Text(text) => !text.is_empty(),
+            }
+        }
+
+        fn text(&self) -> String {
+            match self {
+                Self::Truth(truth) => truth.to_string(),
+                Self::Text(text) => text.clone(),
+            }
+        }
+    }
+
+    fn tokenize_condition(condition: &str) -> Vec<ConditionToken> {
+        let characters: Vec<char> = condition.chars().collect();
+        let mut tokens = Vec::new();
+        let mut index = 0;
+        while index < characters.len() {
+            let character = characters[index];
+            if character.is_whitespace() {
+                index += 1;
+                continue;
+            }
+            match character {
+                '&' | '|' | '=' => {
+                    let pair: String = characters[index..(index + 2).min(characters.len())]
+                        .iter()
+                        .collect();
+                    tokens.push(match pair.as_str() {
+                        "&&" => ConditionToken::And,
+                        "||" => ConditionToken::Or,
+                        "==" => ConditionToken::Equal,
+                        other => panic!("`{condition}` uses the operator `{other}`"),
+                    });
+                    index += 2;
+                }
+                '!' => {
+                    if characters.get(index + 1) == Some(&'=') {
+                        tokens.push(ConditionToken::Unequal);
+                        index += 2;
+                    } else {
+                        tokens.push(ConditionToken::Not);
+                        index += 1;
+                    }
+                }
+                '(' => {
+                    tokens.push(ConditionToken::Open);
+                    index += 1;
+                }
+                ')' => {
+                    tokens.push(ConditionToken::Close);
+                    index += 1;
+                }
+                '\'' => {
+                    let start = index;
+                    index += 1;
+                    while index < characters.len() && characters[index] != '\'' {
+                        index += 1;
+                    }
+                    assert!(
+                        index < characters.len(),
+                        "`{condition}` has an open literal"
+                    );
+                    index += 1;
+                    tokens.push(ConditionToken::Term(
+                        characters[start..index].iter().collect(),
+                    ));
+                }
+                _ => {
+                    let start = index;
+                    while index < characters.len()
+                        && (characters[index].is_ascii_alphanumeric()
+                            || characters[index] == '_'
+                            || characters[index] == '.')
+                    {
+                        index += 1;
+                    }
+                    assert!(index > start, "`{condition}` contains `{character}`");
+                    if characters.get(index) == Some(&'(') {
+                        index = end_of_call(&characters, index, condition);
+                    }
+                    tokens.push(ConditionToken::Term(
+                        characters[start..index].iter().collect(),
+                    ));
+                }
+            }
+        }
+        tokens
+    }
+
+    fn end_of_call(characters: &[char], mut index: usize, condition: &str) -> usize {
+        let mut depth = 0_usize;
+        let mut quoted = false;
+        loop {
+            assert!(index < characters.len(), "`{condition}` has an open call");
+            let character = characters[index];
+            index += 1;
+            if character == '\'' {
+                quoted = !quoted;
+            } else if !quoted && character == '(' {
+                depth += 1;
+            } else if !quoted && character == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    return index;
+                }
+            }
+        }
+    }
+
+    fn evaluate_alternatives(
+        tokens: &[ConditionToken],
+        index: &mut usize,
+        scope: &ConditionScope,
+    ) -> ConditionValue {
+        let mut selected = evaluate_conjunction(tokens, index, scope);
+        while tokens.get(*index) == Some(&ConditionToken::Or) {
+            *index += 1;
+            let alternative = evaluate_conjunction(tokens, index, scope);
+            if !selected.truthy() {
+                selected = alternative;
+            }
+        }
+        selected
+    }
+
+    fn evaluate_conjunction(
+        tokens: &[ConditionToken],
+        index: &mut usize,
+        scope: &ConditionScope,
+    ) -> ConditionValue {
+        let mut selected = evaluate_comparison(tokens, index, scope);
+        while tokens.get(*index) == Some(&ConditionToken::And) {
+            *index += 1;
+            let operand = evaluate_comparison(tokens, index, scope);
+            if selected.truthy() {
+                selected = operand;
+            }
+        }
+        selected
+    }
+
+    fn evaluate_comparison(
+        tokens: &[ConditionToken],
+        index: &mut usize,
+        scope: &ConditionScope,
+    ) -> ConditionValue {
+        let left = evaluate_negation(tokens, index, scope);
+        let comparison = match tokens.get(*index) {
+            Some(ConditionToken::Equal) => true,
+            Some(ConditionToken::Unequal) => false,
+            _ => return left,
+        };
+        *index += 1;
+        let right = evaluate_negation(tokens, index, scope);
+        ConditionValue::Truth((left.text() == right.text()) == comparison)
+    }
+
+    fn evaluate_negation(
+        tokens: &[ConditionToken],
+        index: &mut usize,
+        scope: &ConditionScope,
+    ) -> ConditionValue {
+        if tokens.get(*index) == Some(&ConditionToken::Not) {
+            *index += 1;
+            return ConditionValue::Truth(!evaluate_negation(tokens, index, scope).truthy());
+        }
+        match tokens.get(*index) {
+            Some(ConditionToken::Open) => {
+                *index += 1;
+                let grouped = evaluate_alternatives(tokens, index, scope);
+                assert_eq!(
+                    tokens.get(*index),
+                    Some(&ConditionToken::Close),
+                    "a group in the condition is never closed"
+                );
+                *index += 1;
+                grouped
+            }
+            Some(ConditionToken::Term(term)) => {
+                let term = term.clone();
+                *index += 1;
+                evaluate_term(&term, scope)
+            }
+            other => panic!("the condition has {other:?} where it needs a value"),
+        }
+    }
+
+    fn evaluate_term(term: &str, scope: &ConditionScope) -> ConditionValue {
+        if let Some(literal) = term
+            .strip_prefix('\'')
+            .and_then(|rest| rest.strip_suffix('\''))
+        {
+            return ConditionValue::Text(literal.to_owned());
+        }
+        if let Some(open) = term.find('(') {
+            let arguments: Vec<ConditionValue> = term[open + 1..term.len() - 1]
+                .split(',')
+                .map(str::trim)
+                .filter(|argument| !argument.is_empty())
+                .map(|argument| evaluate_term(argument, scope))
+                .collect();
+            return match (&term[..open], arguments.as_slice()) {
+                ("always", []) => ConditionValue::Truth(true),
+                ("success", []) => ConditionValue::Truth(!scope.failed_earlier),
+                ("failure", []) => ConditionValue::Truth(scope.failed_earlier),
+                ("cancelled", []) => ConditionValue::Truth(false),
+                ("startsWith", [subject, part]) => {
+                    ConditionValue::Truth(subject.text().starts_with(&part.text()))
+                }
+                ("endsWith", [subject, part]) => {
+                    ConditionValue::Truth(subject.text().ends_with(&part.text()))
+                }
+                ("contains", [subject, part]) => {
+                    ConditionValue::Truth(subject.text().contains(&part.text()))
+                }
+                _ => panic!("the condition calls `{term}`, which is not modelled here"),
+            };
+        }
+        match term {
+            "true" => ConditionValue::Truth(true),
+            "false" => ConditionValue::Truth(false),
+            "github.event.workflow_run.head_branch" => {
+                ConditionValue::Text(scope.head_branch.to_owned())
+            }
+            other => panic!("the condition reads `{other}`, which is not modelled here"),
+        }
+    }
+
+    /// The evaluator the retraction's guard is asserted through, checked
+    /// against the shapes that pass a substring search and delete the wrong
+    /// ref anyway.
+    #[test]
+    fn a_step_condition_is_evaluated_rather_than_searched() {
+        let temporary = format!("pgshard-ci-{}", "a".repeat(40));
+        let guard = "always() && startsWith(github.event.workflow_run.head_branch, 'pgshard-ci-')";
+        assert!(condition_runs(guard, &temporary, true));
+        assert!(condition_runs(guard, &temporary, false));
+        assert!(!condition_runs(guard, "main", true));
+        assert!(!condition_runs(guard, "main", false));
+
+        // Skipped after a failure, which is the shape this fix replaced.
+        let unguarded = "startsWith(github.event.workflow_run.head_branch, 'pgshard-ci-')";
+        assert!(condition_runs(unguarded, &temporary, false));
+        assert!(!condition_runs(unguarded, &temporary, true));
+
+        // Contains `always()` and the exact guard, and deletes on everything.
+        let widened =
+            "always() || startsWith(github.event.workflow_run.head_branch, 'pgshard-ci-')";
+        assert!(condition_runs(widened, "main", false));
+
+        // Contains `always()` and the exact guard, and deletes on nothing.
+        let disarmed = format!("{guard} && false");
+        assert!(!condition_runs(&disarmed, &temporary, true));
+
+        assert!(condition_runs("always() && !cancelled()", "main", true));
+        assert!(!condition_runs("failure()", &temporary, false));
+        assert!(condition_runs(
+            "always() && (github.event.workflow_run.head_branch == 'main' || \
+             startsWith(github.event.workflow_run.head_branch, 'pgshard-ci-'))",
+            "main",
+            true
+        ));
+        assert!(!condition_runs(
+            "always() && github.event.workflow_run.head_branch != 'main'",
+            "main",
+            true
+        ));
+    }
+
+    /// The delete forms the retraction has to stay visible through.
+    #[test]
+    fn every_spelling_of_an_http_delete_is_a_ref_retraction() {
+        for spelled in [
+            "gh api --method DELETE repos/o/r/git/refs/tags/t",
+            "gh api --method=DELETE repos/o/r/git/refs/tags/t",
+            "gh api -X DELETE repos/o/r/git/refs/tags/t",
+            "gh api -XDELETE repos/o/r/git/refs/tags/t",
+            "curl -X DELETE https://api.github.com/repos/o/r/git/refs/tags/t",
+            "curl --request DELETE https://api.github.com/repos/o/r/git/refs/tags/t",
+            "curl --request=DELETE https://api.github.com/repos/o/r/git/refs/tags/t",
+            "gh api --method 'DELETE' repos/o/r/git/refs/tags/t",
+            "gh api \\\n  --method DELETE \\\n  repos/o/r/git/refs/tags/t",
+        ] {
+            assert!(issues_an_http_delete(spelled), "{spelled} was not seen");
+        }
+        for benign in [
+            "gh api repos/o/r/git/ref/tags/t --jq .object.sha",
+            "gh api --method POST repos/o/r/git/refs",
+            "echo DELETE",
+            "gh release delete v1.0.0",
+        ] {
+            assert!(
+                !issues_an_http_delete(benign),
+                "{benign} was read as a DELETE"
+            );
+        }
     }
 
     /// The shapes the workflow guard has to keep apart, asserted directly so
