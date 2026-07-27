@@ -407,9 +407,17 @@ against the checkpointed storage snapshot before it can be retained or deleted.
 `Retain` does not
 override an explicit PVC deletion and cannot preserve a namespaced PVC when its
 namespace is deleted. Automated
-defragmentation is not implemented. PostgreSQL
-`archive_mode` remains off until a real archival pipeline is reconciled and
-verified, so the generated configuration cannot silently fill `pg_wal`.
+defragmentation is not implemented. The generated configuration sets
+`archive_mode = off`, but a rendered file is not a server's whole
+configuration — startup arguments set parameters too — so that value alone
+does not establish that archiving is inactive at runtime. Two `pg_wal`
+retention paths are open regardless: `max_wal_size` is a checkpoint target
+PostgreSQL documents as a soft limit, and the generated configuration leaves
+`max_slot_wal_keep_size` at the `-1` default, meaning no maximum, while
+pinning `idle_replication_slot_timeout` to `0`, which disables idle-timeout
+invalidation — so a lagging or abandoned replication slot retains WAL without
+bound. `ValidateStorage` bounds only the configured `max_wal_size` against a
+quarter of the data volume. Monitor `pg_wal` usage and replication slot lag.
 
 This lifecycle receipt is not physical node fencing. Do not delete and recreate
 a Node under the same name while a bound pgshard Pod may still exist on the old

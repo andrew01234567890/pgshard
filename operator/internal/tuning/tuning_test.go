@@ -71,6 +71,7 @@ func TestCalculateDeterministicSafeSettings(t *testing.T) {
 		"shared_buffers":                  "1024MB",
 		"effective_cache_size":            "2867MB",
 		"maintenance_work_mem":            "204MB",
+		"logical_decoding_work_mem":       "64MB",
 		"work_mem":                        "5MB",
 		"max_connections":                 "100",
 		"max_prepared_transactions":       "48",
@@ -232,6 +233,11 @@ func TestApplyOverridesRejectsOwnedSafetySettings(t *testing.T) {
 	if err := ApplyOverrides(settings, map[string]string{"fsync": "off"}, 0); err == nil {
 		t.Fatal("expected fsync override to be rejected")
 	}
+	// The generated value divides a budget share across every managed reorder
+	// buffer, so a per-buffer override silently remultiplies it by the fleet.
+	if err := ApplyOverrides(settings, map[string]string{"logical_decoding_work_mem": "64MB"}, 0); err == nil {
+		t.Fatal("expected logical_decoding_work_mem override to be rejected")
+	}
 	if err := ApplyOverrides(settings, map[string]string{"max_wal_size": "4GB"}, 0); err != nil {
 		t.Fatalf("safe override rejected: %v", err)
 	}
@@ -373,7 +379,8 @@ func TestValidateStorageBoundsCheckpointWAL(t *testing.T) {
 // The generated settings must fit the container's memory limit. The suite
 // otherwise exercises only balanced core/memory ratios, which is why a fleet of
 // autovacuum workers sized from cores alone, each inheriting an uncharged
-// maintenance_work_mem, went unnoticed.
+// maintenance_work_mem, went unnoticed. A fleet of reorder buffers left at
+// PostgreSQL's per-buffer default is the same failure at a larger magnitude.
 func TestSkewedResourceRatiosStayInsideTheMemoryLimit(t *testing.T) {
 	for _, shape := range []struct {
 		cpu, memory string
@@ -416,13 +423,29 @@ func TestSkewedResourceRatiosStayInsideTheMemoryLimit(t *testing.T) {
 			t.Fatalf("cpu=%s memory=%s lets %d autovacuum workers reach %dMB against a %dMB share",
 				shape.cpu, shape.memory, workers, autovacuum, ceiling)
 		}
-		// shared_buffers, the whole autovacuum fleet, and one concurrent manual
-		// maintenance operation, all against the limit the cgroup enforces.
-		committed := shared + autovacuum + maintenance
+		// logical_decoding_work_mem is charged per reorder buffer and every
+		// managed consumer's walsender holds one, so the fleet -- not one buffer
+		// -- is what the budget has to cover. PostgreSQL spills these to disk
+		// instead of raising an error, so nothing but the cgroup enforces the
+		// total.
+		consumers := int64(result.ManagedLogicalConsumers)
+		if consumers < 1 {
+			t.Fatalf("cpu=%s memory=%s reports %d logical consumers", shape.cpu, shape.memory, consumers)
+		}
+		decodingWorkMem := mebibytes(t, result.Settings["logical_decoding_work_mem"])
+		decoding := consumers * decodingWorkMem
+		if ceiling := max64(budget/4, consumers); decoding > ceiling {
+			t.Fatalf("cpu=%s memory=%s lets %d logical decoding buffers reach %dMB against a %dMB share",
+				shape.cpu, shape.memory, consumers, decoding, ceiling)
+		}
+		// shared_buffers, the whole autovacuum fleet, every managed reorder
+		// buffer, and one concurrent manual maintenance operation, all against
+		// the limit the cgroup enforces.
+		committed := shared + autovacuum + decoding + maintenance
 		limit := result.MemoryBytes / mib
 		if committed >= limit {
-			t.Fatalf("cpu=%s memory=%s commits %dMB (shared=%d autovacuum=%d*%d maintenance=%d) of a %dMB limit before the postmaster, backends or worker slots",
-				shape.cpu, shape.memory, committed, shared, workers, workMem, maintenance, limit)
+			t.Fatalf("cpu=%s memory=%s commits %dMB (shared=%d autovacuum=%d*%d decoding=%d*%d maintenance=%d) of a %dMB limit before the postmaster, backends or worker slots",
+				shape.cpu, shape.memory, committed, shared, workers, workMem, consumers, decodingWorkMem, maintenance, limit)
 		}
 	}
 }
