@@ -4789,7 +4789,7 @@ mod tests {
                 "operator CI target must run {command}"
             );
         }
-        assert!(workflow.contains("bufbuild/buf-action@fd21066df7214747548607aaa45548ba2b9bc1ff"));
+        assert!(workflow.contains("bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3"));
         assert!(!workflow.contains("bufbuild/buf-setup-action"));
         assert!(workflow.contains("run: make go-check"));
         assert!(makefile.contains("actionlint@v1.7.12 -ignore"));
