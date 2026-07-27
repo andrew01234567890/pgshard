@@ -19,6 +19,7 @@ use axum::http::header::{
     ACCEPT, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, EXPECT,
     HOST, TRANSFER_ENCODING, UPGRADE,
 };
+use axum::http::request::Parts;
 use axum::http::uri::Authority;
 use axum::http::{
     HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Version,
@@ -28,8 +29,8 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use pgshard_types::catalog_activation::{
-    CATALOG_ACTIVATION_CAPABILITY_CHALLENGE_RESPONSE_VERSION, CatalogActivationCapabilityChallenge,
-    CatalogActivationCapabilityChallengeResponse,
+    CATALOG_ACTIVATION_CAPABILITY_CHALLENGE_RESPONSE_VERSION, CatalogActivationCapability,
+    CatalogActivationCapabilityChallenge, CatalogActivationCapabilityChallengeResponse,
 };
 use rustix::fs::{Mode, OFlags};
 use rustls::ServerConfig;
@@ -506,49 +507,90 @@ fn connection_task_result(result: Result<(), JoinError>) -> io::Result<()> {
     })
 }
 
+/// Owns the request body, so it is the only place a rejection can escape
+/// without the body being consumed first.
 async fn handle_request(
     request: Request<Body>,
     capability: CatalogActivationCapabilityState,
 ) -> Response<Body> {
-    if request.version() != Version::HTTP_11 {
-        return empty_response(StatusCode::BAD_REQUEST);
+    let (parts, body) = request.into_parts();
+    let accepted = match accept_request(&parts, &capability) {
+        Ok(accepted) => accepted,
+        Err(status) => return reject(body, &parts.headers, status).await,
+    };
+    match to_bytes(body, MAXIMUM_CHALLENGE_BYTES).await {
+        Ok(challenge) => answer_challenge(accepted, &challenge),
+        Err(_) => empty_response(StatusCode::PAYLOAD_TOO_LARGE),
     }
-    if request
-        .uri()
+}
+
+struct AcceptedRequest {
+    content_length: usize,
+    capability: Box<CatalogActivationCapability>,
+}
+
+/// Decides every rejection from the head alone, with no access to the body.
+fn accept_request(
+    parts: &Parts,
+    capability: &CatalogActivationCapabilityState,
+) -> Result<AcceptedRequest, StatusCode> {
+    if parts.version != Version::HTTP_11 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if parts
+        .uri
         .path_and_query()
         .map(axum::http::uri::PathAndQuery::as_str)
         != Some(CATALOG_ACTIVATION_CAPABILITY_PATH)
     {
-        return empty_response(StatusCode::NOT_FOUND);
+        return Err(StatusCode::NOT_FOUND);
     }
-    if request.method() != Method::POST {
-        return empty_response(StatusCode::METHOD_NOT_ALLOWED);
+    if parts.method != Method::POST {
+        return Err(StatusCode::METHOD_NOT_ALLOWED);
     }
-    let content_length = match validate_headers(request.headers()) {
-        Ok(content_length) => content_length,
-        Err(RequestHeaderError::UnsupportedMediaType) => {
-            return empty_response(StatusCode::UNSUPPORTED_MEDIA_TYPE);
-        }
-        Err(RequestHeaderError::BodyTooLarge) => {
-            return empty_response(StatusCode::PAYLOAD_TOO_LARGE);
-        }
-        Err(RequestHeaderError::Invalid) => return empty_response(StatusCode::BAD_REQUEST),
-    };
+    let content_length = validate_headers(&parts.headers).map_err(|error| match error {
+        RequestHeaderError::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        RequestHeaderError::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+        RequestHeaderError::Invalid => StatusCode::BAD_REQUEST,
+    })?;
     let capability = match capability.snapshot() {
-        CatalogActivationEndpointState::Disabled => {
-            return empty_response(StatusCode::NOT_FOUND);
-        }
-        CatalogActivationEndpointState::Unavailable => {
-            return empty_response(StatusCode::SERVICE_UNAVAILABLE);
-        }
+        CatalogActivationEndpointState::Disabled => return Err(StatusCode::NOT_FOUND),
+        CatalogActivationEndpointState::Unavailable => return Err(StatusCode::SERVICE_UNAVAILABLE),
         CatalogActivationEndpointState::Available(capability) => capability,
     };
-    let body = match to_bytes(request.into_body(), MAXIMUM_CHALLENGE_BYTES).await {
-        Ok(body) if body.len() == content_length => body,
-        Ok(_) => return empty_response(StatusCode::BAD_REQUEST),
-        Err(_) => return empty_response(StatusCode::PAYLOAD_TOO_LARGE),
-    };
-    let challenge: CatalogActivationCapabilityChallenge = match serde_json::from_slice(&body) {
+    Ok(AcceptedRequest {
+        content_length,
+        capability,
+    })
+}
+
+/// Answers a rejected request only once its body has left the socket receive
+/// queue. Closing a socket that still holds unread bytes emits RST instead of
+/// FIN, and an RST discards the response the peer was already handed.
+///
+/// The drain is bounded by the largest body this endpoint ever accepts: a
+/// client that sends more than that has already been refused, and reading it
+/// out would let a declared length hold the listener open.
+async fn reject(body: Body, headers: &HeaderMap, status: StatusCode) -> Response<Body> {
+    // A client that declared `Expect` withholds its body until an interim
+    // response this endpoint never sends, so nothing is queued to drain and
+    // waiting for one would stall the refusal until the connection deadline.
+    if !headers.contains_key(EXPECT) {
+        let _ = to_bytes(body, MAXIMUM_CHALLENGE_BYTES).await;
+    }
+    empty_response(status)
+}
+
+/// Runs after the body is consumed, and holds no body of its own.
+fn answer_challenge(accepted: AcceptedRequest, body: &[u8]) -> Response<Body> {
+    let AcceptedRequest {
+        content_length,
+        capability,
+    } = accepted;
+    if body.len() != content_length {
+        return empty_response(StatusCode::BAD_REQUEST);
+    }
+    let challenge: CatalogActivationCapabilityChallenge = match serde_json::from_slice(body) {
         Ok(challenge) => challenge,
         Err(_) => return empty_response(StatusCode::BAD_REQUEST),
     };
@@ -733,6 +775,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::oneshot;
+    use tokio::task::JoinHandle;
     use tokio::time::{Duration, timeout};
     use tokio_rustls::TlsConnector;
 
@@ -1117,6 +1160,135 @@ mod tests {
             .await
             .expect("join test server")
             .expect("serve cleanly");
+    }
+
+    /// Connects a strict client to an endpoint whose consumer is unavailable,
+    /// so every challenge is refused with 503.
+    async fn refusing_endpoint() -> (
+        tokio_rustls::client::TlsStream<TcpStream>,
+        oneshot::Sender<()>,
+        JoinHandle<std::io::Result<()>>,
+    ) {
+        let (certificate, private_key, certificate_der) = tls_material();
+        let server_config =
+            server_config_from_material(certificate.as_bytes(), private_key.as_bytes())
+                .expect("valid TLS material");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_on_with_policy(
+            listener,
+            server_config,
+            CatalogActivationCapabilityState::configured(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            DEFAULT_SERVER_POLICY,
+        ));
+        let stream = TcpStream::connect(address)
+            .await
+            .expect("connect TLS client");
+        let server_name = ServerName::try_from("localhost".to_owned()).expect("valid server name");
+        let tls = TlsConnector::from(client_config(certificate_der))
+            .connect(server_name, stream)
+            .await
+            .expect("authenticated TLS 1.3 handshake");
+        (tls, shutdown_tx, server)
+    }
+
+    fn challenge_head(content_length: usize, expect_continue: bool) -> String {
+        let expect = if expect_continue {
+            "Expect: 100-continue\r\n"
+        } else {
+            ""
+        };
+        format!(
+            "POST {CATALOG_ACTIVATION_CAPABILITY_PATH} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {content_length}\r\n{expect}Connection: close\r\n\r\n"
+        )
+    }
+
+    /// A refused challenge must leave nothing unread on the socket. Closing a
+    /// socket that still holds request bytes emits RST instead of FIN, and the
+    /// peer then loses the refusal it was already handed.
+    #[tokio::test]
+    async fn refused_challenge_reads_its_body_before_closing() {
+        let (mut tls, shutdown_tx, server) = refusing_endpoint().await;
+        let body = serde_json::to_vec(&challenge()).expect("serialize challenge");
+        tls.write_all(challenge_head(body.len(), false).as_bytes())
+            .await
+            .expect("write HTTP headers");
+        let mut premature = [0_u8; 1_024];
+        assert!(
+            timeout(Duration::from_millis(250), tls.read(&mut premature))
+                .await
+                .is_err(),
+            "answered a refusal while {} body bytes were still unread",
+            body.len()
+        );
+
+        tls.write_all(&body).await.expect("write HTTP body");
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(5), tls.read_to_end(&mut response))
+            .await
+            .expect("bounded refusal")
+            .expect("read refusal");
+        assert!(
+            response.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"),
+            "refused challenge response = {:?}",
+            String::from_utf8_lossy(&response)
+        );
+
+        // A reset only surfaces to the peer on its next write, which for the
+        // catalog-activation client is the closing TLS alert.
+        tls.shutdown().await.expect("write closing TLS alert");
+        assert_eq!(raw_close_kind(tls.get_mut().0).await, "clean-eof");
+
+        shutdown_tx.send(()).expect("request test shutdown");
+        server
+            .await
+            .expect("join test server")
+            .expect("serve cleanly");
+    }
+
+    /// `Expect` is outside this endpoint's dialect, so the client is still
+    /// holding its body: the refusal must not wait for bytes that will never
+    /// be sent.
+    #[tokio::test]
+    async fn refused_expect_continue_answers_without_awaiting_a_body() {
+        let (mut tls, shutdown_tx, server) = refusing_endpoint().await;
+        tls.write_all(challenge_head(512, true).as_bytes())
+            .await
+            .expect("write HTTP headers");
+        let mut response = Vec::new();
+        timeout(Duration::from_millis(500), tls.read_to_end(&mut response))
+            .await
+            .expect("refusal that does not await a withheld body")
+            .expect("read refusal");
+        assert!(
+            response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"),
+            "refused expect-continue response = {:?}",
+            String::from_utf8_lossy(&response)
+        );
+
+        shutdown_tx.send(()).expect("request test shutdown");
+        server
+            .await
+            .expect("join test server")
+            .expect("serve cleanly");
+    }
+
+    async fn raw_close_kind(stream: &mut TcpStream) -> String {
+        let mut discarded = [0_u8; 512];
+        loop {
+            match timeout(Duration::from_secs(5), stream.read(&mut discarded)).await {
+                Ok(Ok(0)) => return "clean-eof".to_owned(),
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => return format!("{:?}", error.kind()),
+                Err(_) => return "timeout".to_owned(),
+            }
+        }
     }
 
     #[tokio::test]
