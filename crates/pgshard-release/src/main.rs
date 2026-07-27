@@ -929,27 +929,66 @@ fn is_rfc4716_private_key(bytes: &[u8]) -> bool {
 
 /// PKCS#8, PKCS#1, SEC1 and the DSA and encrypted forms are all a SEQUENCE large
 /// enough to hold a key, opening either with the version integer of an unencrypted
-/// key or with the algorithm identifier of an encrypted one. The size is the one
-/// the SEQUENCE declares where it declares one, and what is present where it does
-/// not, since a BER indefinite length declares nothing.
+/// key or with the algorithm identifier of an encrypted one.
+///
+/// The second of those is ambiguous, and only a label resolves it. Every caller
+/// of this reads a body a `PRIVATE KEY` delimiter wrapped, which is the label.
+/// A caller without one wants `encrypts_a_key` instead.
 fn is_der_private_key(bytes: &[u8]) -> bool {
+    der_key_contents(bytes).is_some_and(|contents| {
+        declares_a_key_version(contents) || opens_with_an_algorithm(contents)
+    })
+}
+
+/// The contents of a SEQUENCE large enough to hold a key. The size is the one
+/// the SEQUENCE declares where it declares one, and what is present where it
+/// does not, since a BER indefinite length declares nothing.
+fn der_key_contents(bytes: &[u8]) -> Option<&[u8]> {
     /// An Ed25519 key is forty-eight bytes of DER all told, the smallest anyone
     /// issues. What follows the object is not measured, because a candidate
     /// joined from the rest of a line carries whatever else that line held.
     const MIN_DER_KEY: usize = 48;
+
+    let (declared, header) = der_sequence(bytes)?;
+    (header + declared >= MIN_DER_KEY).then(|| &bytes[header..])
+}
+
+/// PKCS#8, PKCS#1, SEC1 and DSA all open with the version integer of the key.
+fn declares_a_key_version(contents: &[u8]) -> bool {
     const INTEGER: u8 = 0x02;
+
+    matches!(contents, [INTEGER, 0x01, 0x00 | 0x01, ..])
+}
+
+/// An encrypted key opens with the algorithm identifier that encrypted it.
+fn opens_with_an_algorithm(contents: &[u8]) -> bool {
     const OBJECT_IDENTIFIER: u8 = 0x06;
 
-    let Some((declared, header)) = der_sequence(bytes) else {
-        return false;
-    };
-    if header + declared < MIN_DER_KEY {
-        return false;
-    }
-    let contents = &bytes[header..];
-    matches!(contents, [INTEGER, 0x01, 0x00 | 0x01, ..])
-        || der_sequence(contents)
-            .is_some_and(|(_, algorithm)| contents.get(algorithm) == Some(&OBJECT_IDENTIFIER))
+    der_sequence(contents)
+        .is_some_and(|(_, algorithm)| contents.get(algorithm) == Some(&OBJECT_IDENTIFIER))
+}
+
+/// The same opening, and the string that follows the algorithm as well.
+///
+/// An encrypted private key and a public key are the same structure: a SEQUENCE
+/// holding an algorithm identifier and then a string. What differs is which
+/// string. The key's ciphertext is an OCTET STRING; the public key's key is a
+/// BIT STRING. Confirmed against `openssl` output for RSA, EC, Ed448, X25519 and
+/// DSA: every public key of every one of them carries the BIT STRING, and the
+/// encrypted key carries the OCTET STRING.
+///
+/// Inside a delimiter the label already says which of the two it is and this
+/// question is never asked. A bare object has no label, and asking the shorter
+/// question there read every public key as a private one -- twelve of twenty
+/// innocent artefacts, including anything anyone would commit a verification key
+/// as, and each one would have refused every release that followed it.
+fn encrypts_a_key(contents: &[u8]) -> bool {
+    const OCTET_STRING: u8 = 0x04;
+
+    opens_with_an_algorithm(contents)
+        && der_sequence(contents).is_some_and(|(declared, algorithm)| {
+            contents.get(algorithm + declared) == Some(&OCTET_STRING)
+        })
 }
 
 /// A PKCS#12 bundle is the one form here that carries a key without ever naming
@@ -1010,6 +1049,7 @@ fn is_openssh_private_key(bytes: &[u8]) -> bool {
 
 const PGP_SECRET_KEY: u8 = 5;
 const PGP_SECRET_SUBKEY: u8 = 7;
+const PGP_USER_ID: u8 = 13;
 
 /// An armoured secret key opens with a packet tag: the top bit set, then the tag
 /// number, five for a secret key and seven for a secret subkey, in either the
@@ -1083,8 +1123,19 @@ fn big_endian(bytes: &[u8]) -> usize {
 /// delimiter, because there is no delimiter to have narrowed the question: the
 /// structure has to account for every byte it was given. A prefix will not do.
 /// That is what keeps the rule from reading a key into whichever run of encoded
-/// text happens to decode to a plausible first byte, and it costs nothing, since
-/// a file and a Secret's value are each the whole of an object or none of it.
+/// text happens to decode to a plausible first byte, and it costs nothing in the
+/// ordinary case, since a file and a Secret's value are each the whole of an
+/// object or none of it.
+///
+/// The limitation that buys, stated so nobody has to rediscover it: accounting
+/// for every byte means every byte. One trailing newline, one leading byte of
+/// anything, or two objects concatenated -- `cat a.der b.der > keys.der` -- and
+/// none of these rules fires. That is deliberate and it is not to be loosened.
+/// Every attempt to relax the question here has been measured refusing innocent
+/// content instead: reading a prefix rather than the whole read every public key
+/// as a private one, and taking a packet tag on its own read an `npm` integrity
+/// hash as a keyring. A key that arrives padded is a miss; a rule that wedges
+/// the gate is unrecoverable, because history is rescanned on every release.
 fn is_bare_private_key_object(bytes: &[u8]) -> bool {
     is_whole_der_private_key(bytes)
         || is_openssh_private_key(bytes)
@@ -1093,27 +1144,102 @@ fn is_bare_private_key_object(bytes: &[u8]) -> bool {
 }
 
 /// A Java keystore is neither a DER object nor a chain of packets: four bytes of
-/// magic, the format version, the number of entries, and then the entries. The
-/// key inside is encrypted under the store password and encoded in no form these
-/// rules read, so the header is all there is to go on. What the header does say
-/// is what the first entry holds, and that is the distinction worth drawing:
-/// `keytool` writes the same file for a private key and for the trust store of
-/// certificates that sits beside it in every Java project, and a trust store is
-/// published on purpose.
+/// magic, the format version, the number of entries, and then the entries, each
+/// saying what it holds. The key inside is encrypted under the store password
+/// and encoded in no form these rules read, so walking the entries is all there
+/// is to go on -- and the walk has to reach the digest the store closes with,
+/// which is what keeps a file that merely opens with the magic from being one.
+///
+/// Every entry is walked and not just the first, because the order entries come
+/// out in is a hash table's rather than the order they were added: of three
+/// stores built by `keytool` with a certificate added before a key, two put the
+/// certificate first. Reading only the first entry let both of them through.
+///
+/// A store holding no key at all is a trust store, which every Java project has
+/// and publishes on purpose.
 fn is_java_keystore(bytes: &[u8]) -> bool {
     const MAGIC: [u8; 4] = [0xfe, 0xed, 0xfe, 0xed];
-    const PRIVATE_KEY_ENTRY: u8 = 1;
+    const PRIVATE_KEY_ENTRY: usize = 1;
+    const TRUSTED_CERTIFICATE_ENTRY: usize = 2;
+    /// The store closes with the digest that authenticates it.
+    const DIGEST: usize = 20;
 
-    bytes.starts_with(&MAGIC)
-        && matches!(bytes.get(4..8), Some([0, 0, 0, 1 | 2]))
-        && matches!(bytes.get(12..16), Some([0, 0, 0, PRIVATE_KEY_ENTRY]))
+    if !bytes.starts_with(&MAGIC) {
+        return false;
+    }
+    // Version two only. It is what every `keytool` anyone still runs writes,
+    // and the one before it laid certificates out differently; a branch for a
+    // layout that cannot be produced to test against is a liability in a gate.
+    if big_endian_at(bytes, 4, 4) != Some(2) {
+        return false;
+    }
+    let Some(entries) = big_endian_at(bytes, 8, 4) else {
+        return false;
+    };
+    let mut at = 12;
+    let mut holds_a_key = false;
+    for _ in 0..entries {
+        let Some(tag) = big_endian_at(bytes, at, 4) else {
+            return false;
+        };
+        // The tag, then the alias that names the entry and the day it was made.
+        let Some(alias) = big_endian_at(bytes, at + 4, 2) else {
+            return false;
+        };
+        at = at + 6 + alias + 8;
+        match tag {
+            PRIVATE_KEY_ENTRY => {
+                let Some(key) = big_endian_at(bytes, at, 4) else {
+                    return false;
+                };
+                let Some(chain) = big_endian_at(bytes, at + 4 + key, 4) else {
+                    return false;
+                };
+                at = at + 8 + key;
+                for _ in 0..chain {
+                    let Some(ends) = keystore_certificate_ends(bytes, at) else {
+                        return false;
+                    };
+                    at = ends;
+                }
+                holds_a_key = true;
+            }
+            TRUSTED_CERTIFICATE_ENTRY => {
+                let Some(ends) = keystore_certificate_ends(bytes, at) else {
+                    return false;
+                };
+                at = ends;
+            }
+            _ => return false,
+        }
+        if at > bytes.len() {
+            return false;
+        }
+    }
+    holds_a_key && at + DIGEST == bytes.len()
+}
+
+/// A certificate inside a store is its encoding, introduced by the name of the
+/// format it is written in.
+fn keystore_certificate_ends(bytes: &[u8], at: usize) -> Option<usize> {
+    let at = at + 2 + big_endian_at(bytes, at, 2)?;
+    Some(at + 4 + big_endian_at(bytes, at, 4)?)
+}
+
+/// A big-endian number of `width` bytes, where the bytes are there to be read.
+fn big_endian_at(bytes: &[u8], at: usize, width: usize) -> Option<usize> {
+    Some(big_endian(bytes.get(at..at.checked_add(width)?)?))
 }
 
 /// A DER object declares its own size, so a bare one is judged by whether that
-/// size is the size of the file.
+/// size is the size of the file, and then by whether what it holds is a key.
+/// The second question is asked more narrowly than it is behind a delimiter,
+/// because the delimiter's label is not there to have answered it.
 fn is_whole_der_private_key(bytes: &[u8]) -> bool {
     der_sequence(bytes).is_some_and(|(declared, header)| header + declared == bytes.len())
-        && (is_der_private_key(bytes) || is_pkcs12_bundle(bytes))
+        && (der_key_contents(bytes)
+            .is_some_and(|contents| declares_a_key_version(contents) || encrypts_a_key(contents))
+            || is_pkcs12_bundle(bytes))
 }
 
 /// A keyring declares no size of its own: it is a chain of packets, and the
@@ -1126,18 +1252,31 @@ fn is_whole_der_private_key(bytes: &[u8]) -> bool {
 /// and the framings that declare none are refused here rather than treated as
 /// running to the end of the file. That is not a formality: an `npm` integrity
 /// hash in this repository's own lock file opens with a byte that reads as a
-/// secret subkey of indeterminate length, and reading it that way refused nine
-/// blobs of real history. Twelve bits of tag and version are not enough on their
-/// own; what carries this rule is the chain arriving exactly at the end.
+/// secret subkey of indeterminate length.
+///
+/// Ending at the end is not enough either. A hash of sixty-four bytes whose
+/// first three read as a secret key packet of sixty-two completes the chain in
+/// one packet, and that is not hypothetical: a real integrity line in this
+/// repository's lock file does exactly that, roughly two blobs in ten million.
+/// A lock file carries thousands of them and gains more with every dependency
+/// bump, and history is rescanned forever, so the exposure only ever grows.
+///
+/// What a keyring has that a coincidence does not is somebody's name. Every
+/// secret key `gnupg` exports carries a User ID packet -- confirmed on keys of
+/// both algorithms, with several identities, with subkeys, with and without a
+/// passphrase, exported minimally and as subkeys only. A length floor was the
+/// other candidate and it is wrong: the smallest real first packet measured is
+/// eighty-eight bytes, so any floor above that refuses real Ed25519 keyrings.
 fn is_openpgp_keyring(bytes: &[u8]) -> bool {
-    /// The smallest secret key packet anyone writes is hundreds of bytes, and a
-    /// keyring holds one with an identity and a signature beside it.
+    /// A secret key packet, an identity and a signature. Nothing shorter is a
+    /// keyring, and this only saves the walk from starting.
     const MIN_KEYRING: usize = 32;
 
     if bytes.len() < MIN_KEYRING {
         return false;
     }
     let mut at = 0;
+    let mut names_somebody = false;
     while at < bytes.len() {
         let Some((number, header, Some(length))) = openpgp_packet(&bytes[at..]) else {
             return false;
@@ -1145,9 +1284,10 @@ fn is_openpgp_keyring(bytes: &[u8]) -> bool {
         if at == 0 && !(number == PGP_SECRET_KEY && matches!(bytes.get(header), Some(3 | 4))) {
             return false;
         }
+        names_somebody |= number == PGP_USER_ID;
         at = at.saturating_add(header).saturating_add(length);
     }
-    at == bytes.len()
+    names_somebody && at == bytes.len()
 }
 
 /// Everything after the opening delimiter, up to the closing one where there is
@@ -3274,27 +3414,78 @@ mod tests {
         [key, openpgp_packet_of(13, b"someone@example.invalid")].concat()
     }
 
-    /// The magic, the format version, one entry, and the tag that says what the
-    /// entry holds.
-    fn java_keystore(version: u8, entry: u8) -> Vec<u8> {
-        [
-            vec![
-                0xfe, 0xed, 0xfe, 0xed, 0, 0, 0, version, 0, 0, 0, 1, 0, 0, 0, entry,
-            ],
-            filler(200),
-        ]
-        .concat()
+    /// A Java keystore holding the entries named, in the order named, closing
+    /// with the digest that ends one. Tag one is a private key and tag two a
+    /// trusted certificate.
+    fn java_keystore(version: u8, entries: &[u8]) -> Vec<u8> {
+        let certificate =
+            || [vec![0, 5], b"X.509".to_vec(), vec![0, 0, 0, 40], filler(40)].concat();
+        let mut store = vec![0xfe, 0xed, 0xfe, 0xed, 0, 0, 0, version];
+        store.extend_from_slice(
+            &u32::try_from(entries.len())
+                .expect("a handful of entries")
+                .to_be_bytes(),
+        );
+        for entry in entries {
+            store.extend_from_slice(&u32::from(*entry).to_be_bytes());
+            store.extend_from_slice(&[0, 1, b'a']);
+            store.extend_from_slice(&[0; 8]);
+            if *entry == 1 {
+                store.extend_from_slice(&[0, 0, 0, 64]);
+                store.extend(filler(64));
+                store.extend_from_slice(&[0, 0, 0, 1]);
+            }
+            store.extend(certificate());
+        }
+        store.extend(filler(20));
+        store
+    }
+
+    /// A public key: the algorithm identifier a bare encrypted key also opens
+    /// with, and then the key itself. What differs is only which string holds
+    /// it -- a BIT STRING here, an OCTET STRING there.
+    fn spki_public_key() -> Vec<u8> {
+        der_sequence_of(
+            &[
+                der_sequence_of(&[vec![0x06, 0x09], filler(11)].concat()),
+                vec![0x03, 0x81, 0x81, 0x00],
+                filler(128),
+            ]
+            .concat(),
+        )
+    }
+
+    /// An encrypted private key: the same shape, holding ciphertext instead.
+    fn encrypted_der_key() -> Vec<u8> {
+        der_sequence_of(
+            &[
+                der_sequence_of(&[vec![0x06, 0x09], filler(11)].concat()),
+                vec![0x04, 0x81, 0x80],
+                filler(128),
+            ]
+            .concat(),
+        )
     }
 
     /// The forms that declare a size, which is what the negatives interrogate.
-    fn sized_bare_key_objects() -> [(&'static str, Vec<u8>); 4] {
+    fn sized_bare_key_objects() -> [(&'static str, Vec<u8>); 7] {
         [
             ("a DER key", der_key()),
+            ("an encrypted DER key", encrypted_der_key()),
             ("a PKCS#12 bundle", pkcs12_bundle()),
             ("an OpenPGP keyring", openpgp_keyring(false)),
             (
                 "an OpenPGP keyring in the newer framing",
                 openpgp_keyring(true),
+            ),
+            ("a Java keystore", java_keystore(2, &[1])),
+            // The order entries come out in is a hash table's rather than the
+            // order they were added: of three stores `keytool` built with the
+            // certificate added before the key, two put the certificate first,
+            // so reading only the first entry let both of them through.
+            (
+                "a keystore whose key is not its first entry",
+                java_keystore(2, &[2, 1]),
             ),
         ]
     }
@@ -3307,13 +3498,10 @@ mod tests {
     /// -genkeypair` all produced one.
     #[test]
     fn a_key_with_no_armour_is_refused_as_bytes_and_encoded() {
-        let unsized_forms = [
-            (
-                "an OpenSSH key",
-                [b"openssh-key-v1\0".to_vec(), filler(200)].concat(),
-            ),
-            ("a Java keystore", java_keystore(2, 1)),
-        ];
+        let unsized_forms = [(
+            "an OpenSSH key",
+            [b"openssh-key-v1\0".to_vec(), filler(200)].concat(),
+        )];
         for (name, object) in sized_bare_key_objects().into_iter().chain(unsized_forms) {
             assert!(
                 is_bare_private_key_object(&object),
@@ -3391,19 +3579,6 @@ mod tests {
             );
         }
 
-        // A chain of packets that holds no secret key is a signature, a
-        // certificate or a message, and every one of those is published on
-        // purpose.
-        let signatures = [
-            openpgp_packet_of(2, &filler(300)),
-            openpgp_packet_of(13, b"someone@example.invalid"),
-        ]
-        .concat();
-        assert!(
-            !is_bare_private_key_object(&signatures),
-            "a chain that opens with a signature is not a keyring"
-        );
-
         // Version three is what makes a bundle a bundle, and the content it
         // authenticates has to be there behind it. The first of these differs
         // from a bundle in one byte, which is the point: everything else about
@@ -3427,15 +3602,16 @@ mod tests {
             );
         }
 
-        // A store of trusted certificates is the same file with one byte
-        // changed, and every Java project that has a keystore has one. A version
-        // the format never had is not that format at all: four bytes of magic
-        // are four bytes, and something else will carry them eventually.
+        // A store that holds no key holds certificates, and every Java project
+        // that has a keystore has one of those beside it. A version the format
+        // never had is not the format at all: four bytes of magic are four
+        // bytes, and something else will carry them eventually.
         for (name, store) in [
-            ("a store of trusted certificates", java_keystore(2, 2)),
+            ("a store of trusted certificates", java_keystore(2, &[2])),
+            ("a store of several certificates", java_keystore(2, &[2, 2])),
             (
                 "a format version the keystore never had",
-                java_keystore(9, 1),
+                java_keystore(9, &[1]),
             ),
         ] {
             assert!(
@@ -3443,6 +3619,117 @@ mod tests {
                 "{name} is not a private key"
             );
         }
+    }
+
+    /// A chain of packets that ends where the file ends is still only a chain of
+    /// packets. What a keyring has and a coincidence does not is somebody's
+    /// name, and every secret key `gnupg` exports carries a User ID beside it --
+    /// measured on keys of both algorithms, with several identities, with
+    /// subkeys, with and without a passphrase, exported minimally and as subkeys
+    /// only. A floor on the first packet's length was the other candidate and it
+    /// is wrong: the smallest real one measured is eighty-eight bytes.
+    #[test]
+    fn a_chain_of_packets_that_names_nobody_is_not_a_keyring() {
+        // Ending where the file ends is not enough on its own. Sixty-four bytes
+        // whose first three read as a secret key packet of sixty-two complete
+        // the chain in a single packet, and one real integrity line in this
+        // repository's own lock file does exactly that. What a keyring has and
+        // a coincidence does not is somebody's name: every secret key `gnupg`
+        // exports carries a User ID packet beside it.
+        for (name, opening) in [("the older framing", 0x94), ("the newer", 0xc5)] {
+            let coincidence = [vec![opening, 0x3e, 0x04], filler(61)].concat();
+            assert_eq!(coincidence.len(), 64, "the length of a hash");
+            assert!(
+                !is_bare_private_key_object(&coincidence),
+                "a hash whose first packet fills it in {name} is not a keyring"
+            );
+        }
+        let unnamed = [
+            openpgp_packet_of(5, &[vec![0x04], filler(300)].concat()),
+            openpgp_packet_of(2, &filler(120)),
+        ]
+        .concat();
+        assert!(
+            !is_bare_private_key_object(&unnamed),
+            "a chain that names nobody is not a keyring"
+        );
+
+        // A packet declaring no length is refused wherever it sits, not only
+        // where the chain starts. This one is an identity in the framing that
+        // runs to the end of the file, and it is the last byte there is, so a
+        // rule that stepped over it would finish the walk and call this a
+        // keyring with somebody's name on it.
+        let trailing_identity = [
+            openpgp_packet_of(5, &[vec![0x04], filler(300)].concat()),
+            vec![0x80 | (13 << 2) | 0x03],
+        ]
+        .concat();
+        assert!(
+            !is_bare_private_key_object(&trailing_identity),
+            "a packet that declares no length bounds nothing, wherever it sits"
+        );
+
+        // A packet that announces only the first chunk of a body bounds nothing,
+        // so the chain cannot be followed past it. The octet that announces one
+        // is also a number, and the body here is exactly as long as reading it
+        // as a number would make it -- so a rule that read it that way would
+        // walk this chain to its end and call it a keyring.
+        let partial = [
+            vec![0xc5, 0xe1, 0x04],
+            filler(224),
+            openpgp_packet_of(13, b"someone@example.invalid"),
+        ]
+        .concat();
+        assert!(
+            !is_bare_private_key_object(&partial),
+            "a partial body length does not bound a packet"
+        );
+
+        // A chain of packets that holds no secret key is a signature, a
+        // certificate or a message, and every one of those is published on
+        // purpose.
+        let signatures = [
+            openpgp_packet_of(2, &filler(300)),
+            openpgp_packet_of(13, b"someone@example.invalid"),
+        ]
+        .concat();
+        assert!(
+            !is_bare_private_key_object(&signatures),
+            "a chain that opens with a signature is not a keyring"
+        );
+    }
+
+    /// An encrypted private key and a public key are the same structure: an
+    /// algorithm identifier and then a string. Reading only as far as the
+    /// algorithm read every public key as a private one -- twelve of twenty
+    /// innocent artefacts `openssl` writes, in DER and PEM alike -- and any one
+    /// of them committed would have refused every release that followed.
+    #[test]
+    fn a_public_key_is_not_a_private_one() {
+        let public = spki_public_key();
+        assert!(
+            !is_bare_private_key_object(&public),
+            "a public key is not a private key"
+        );
+        assert!(
+            audit_content_bytes("cosign.pub", &public).is_ok(),
+            "committing a verification key must not wedge the gate"
+        );
+        let secret = format!(
+            "apiVersion: v1\nkind: Secret\ndata:\n  tls.crt: {}\n",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &public)
+        );
+        assert!(
+            audit_content("secret.yaml", &secret).is_ok(),
+            "a public key encoded into a Secret must not wedge the gate either"
+        );
+        // Inside a delimiter the same bytes are still refused, because there the
+        // label has already said what they are and a public key never carries
+        // this one. That breadth is the delimiter path's to keep.
+        assert!(
+            is_der_private_key(&public),
+            "the labelled path is deliberately the broader of the two"
+        );
     }
 
     /// This gate reads every line of every blob in history, so what it costs to
