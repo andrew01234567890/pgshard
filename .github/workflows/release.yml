@@ -84,14 +84,41 @@ jobs:
           export PGSHARD_RELEASE_SHA
           cargo run --locked -p pgshard-release -- publish \
             --sha "$PGSHARD_RELEASE_SHA" --ready-only
+      # A surviving temporary ref stays armed: the concurrency group and the
+      # job condition above both accept a `pgshard-ci-` head branch, so any
+      # later CI dispatch on it re-enters the release queue for a commit this
+      # run already handled. Retraction has to outlive the failure it cleans
+      # up after, and reads only the event payload so it can.
       - name: Delete temporary ref after release
-        if: startsWith(github.event.workflow_run.head_branch, 'pgshard-ci-')
+        if: always() && startsWith(github.event.workflow_run.head_branch, 'pgshard-ci-')
         env:
           GH_TOKEN: ${{ github.token }}
           REF_NAME: ${{ github.event.workflow_run.head_branch }}
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
         shell: bash
         run: |
           set -euo pipefail
+          # The prefix this step is gated on is not the shape the run validated.
+          # Re-derive the exact name, and delete only a tag that still carries
+          # the released commit, so nothing else that shares the prefix is
+          # retracted by a run that never created it.
+          expected_sha="${REF_NAME#pgshard-ci-}"
+          if [[ ! "$expected_sha" =~ ^[0-9a-f]{40}$ || "$expected_sha" != "$RELEASE_SHA" ]]; then
+            echo "$REF_NAME does not name the temporary ref of $RELEASE_SHA" >&2
+            exit 1
+          fi
+          if ! target="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$REF_NAME" --jq .object.sha 2>&1)"; then
+            if [[ "$target" == *"HTTP 404"* ]]; then
+              echo "Temporary ref was already deleted by an equivalent exact-SHA run."
+              exit 0
+            fi
+            printf '%s\n' "$target" >&2
+            exit 1
+          fi
+          if [[ "$target" != "$RELEASE_SHA" ]]; then
+            echo "$REF_NAME points at $target, not at the released $RELEASE_SHA" >&2
+            exit 1
+          fi
           if ! output="$(gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$REF_NAME" 2>&1)"; then
             if [[ "$output" == *"Reference does not exist"* && "$output" == *"HTTP 422"* ]]; then
               echo "Temporary ref was already deleted by an equivalent exact-SHA run."
