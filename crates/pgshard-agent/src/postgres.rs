@@ -629,34 +629,20 @@ impl PostgresConfig {
     )]
     fn runtime_network_settings(
         &self,
-    ) -> (
-        &'static str,
-        Option<&'static str>,
-        Option<&'static str>,
-        &'static str,
-    ) {
+    ) -> (&'static str, Option<&'static str>, Option<&'static str>) {
         match self.role {
-            PostgresRuntimeRole::Quarantine => (
-                "listen_addresses=",
-                Some("max_wal_senders=0"),
-                None,
-                "archive_mode=on",
-            ),
+            PostgresRuntimeRole::Quarantine => {
+                ("listen_addresses=", Some("max_wal_senders=0"), None)
+            }
             PostgresRuntimeRole::ReplicationBootstrapPrimary => (
                 "listen_addresses=*",
                 Some("max_wal_senders=5"),
                 Some("max_replication_slots=5"),
-                "archive_mode=off",
             ),
-            PostgresRuntimeRole::ReplicationStandby => {
-                ("listen_addresses=", None, None, "archive_mode=off")
+            PostgresRuntimeRole::ReplicationStandby => ("listen_addresses=", None, None),
+            PostgresRuntimeRole::ServingPrimary => {
+                ("listen_addresses=", Some("max_wal_senders=0"), None)
             }
-            PostgresRuntimeRole::ServingPrimary => (
-                "listen_addresses=",
-                Some("max_wal_senders=0"),
-                None,
-                "archive_mode=on",
-            ),
         }
     }
 
@@ -1800,7 +1786,7 @@ impl PreparedPostgres {
 
     #[allow(clippy::too_many_lines)]
     fn command(&self) -> Command {
-        let (listen_addresses, max_wal_senders, max_replication_slots, archive_mode) =
+        let (listen_addresses, max_wal_senders, max_replication_slots) =
             self.config.runtime_network_settings();
         let target_fenced = self.config.requires_writable_authority();
         let shared_preload_libraries = if target_fenced {
@@ -1861,15 +1847,43 @@ impl PreparedPostgres {
             .arg("-c")
             .arg("recovery_end_command=")
             .arg("-c")
-            // Quarantine preserves existing `.ready` archive state without
-            // executing deployment callbacks. The bootstrap source disables
-            // archiving until a verified pipeline exists, avoiding unbounded
-            // WAL retention while physical clones are created.
-            .arg(archive_mode)
-            .arg("-c")
-            .arg("archive_command=")
-            .arg("-c")
-            .arg("archive_library=");
+            // `archive_mode=on` is safe only while something can consume
+            // `.ready`, and no role here can. `pgarch.c` reports "archiving is
+            // not configured" and returns before the `.ready` scan whenever the
+            // archive callback is unconfigured, so no `.done` is ever written,
+            // and `RemoveOldXlogFiles` in `xlog.c` reaches `RemoveXlogFile`
+            // only inside `if (XLogArchiveCheckDone(...))`, which
+            // `xlogarchive.c` answers false forever for a `.ready` with no
+            // `.done`. That gates recycling, not merely deletion, so every
+            // segment written would be retained until the volume fills. A full
+            // `pg_wal` does not erase committed transactions — `XLogWrite`
+            // raises PANIC rather than acknowledge a write it could not
+            // complete — it costs write availability, crash-recovery churn, and
+            // any further durable progress. The WAL retention pgshard does want
+            // is the replication slot's, which has a consumer.
+            //
+            // `archive_mode` is `PGC_POSTMASTER`, so `off` must be decided
+            // here, and claiming it for `PGC_S_ARGV` is what keeps an inherited
+            // `archive_mode` from raising it — which is in turn what makes the
+            // two settings below safe to omit, since `postmaster.c` starts the
+            // archiver only when `XLogArchivingActive()`. This is the value the
+            // operator already generates and the previous pin silently
+            // outranked. Enabling archiving later has to change this line and
+            // supply a consumer: no settings knob reaches `archive_mode`,
+            // because a reload can install a pipeline but cannot raise a
+            // `PGC_POSTMASTER` value.
+            .arg("archive_mode=off");
+        // No `archive_command` or `archive_library` setting appears here, and
+        // none may be added. Both are `PGC_SIGHUP` under the same rule as
+        // `ssl`: a `PGC_S_ARGV` value outranks the `PGC_S_FILE` a reload
+        // writes, and `ProcessConfigFileInternal` never reconsiders an
+        // argument. Pinning them empty is what made a `.ready` backlog
+        // unrecoverable, because draining one needs an archiver with a callback
+        // and no reload could supply one. Omitting them does not by itself make
+        // archiving reachable — `archive_mode` above still gates that, and it
+        // is `PGC_POSTMASTER` — it keeps installing a verified pipeline a
+        // reload, so that the restart which raises `archive_mode` is the only
+        // restart such a future needs.
         append_optional_postmaster_setting(&mut command, max_wal_senders);
         append_optional_postmaster_setting(&mut command, max_replication_slots);
         command
@@ -8664,9 +8678,7 @@ host all all all reject\n";
             "restore_command=",
             "archive_cleanup_command=",
             "recovery_end_command=",
-            "archive_mode=on",
-            "archive_command=",
-            "archive_library=",
+            "archive_mode=off",
             "max_wal_senders=0",
             "max_logical_replication_workers=0",
             "sync_replication_slots=off",
@@ -8700,6 +8712,14 @@ host all all all reject\n";
                 .any(|argument| argument.as_bytes().starts_with(b"max_replication_slots=")),
             "quarantine must preserve persistent slots instead of shrinking their startup capacity"
         );
+        for reloadable in ["archive_command", "archive_library"] {
+            assert!(
+                !arguments
+                    .iter()
+                    .any(|argument| argument.as_bytes().starts_with(reloadable.as_bytes())),
+                "quarantine pinned {reloadable:?}, which no reload could then replace"
+            );
+        }
         for source_only in [
             "autovacuum=off",
             "max_worker_processes=0",
@@ -8869,6 +8889,96 @@ host all all all reject\n";
             assert!(
                 arguments.contains(&OsStr::new("allow_alter_system=off")),
                 "{role} left ALTER SYSTEM able to outrank the file the agent materializes"
+            );
+        }
+    }
+
+    /// `archive_mode=on` is safe only while something can consume `.ready`.
+    /// Nothing here can, and an unconsumed `.ready` blocks `XLogArchiveCheckDone`
+    /// forever, which stops `RemoveOldXlogFiles` from recycling the segment as
+    /// well as from deleting it, so `pg_wal` grows until the volume fills and
+    /// the cluster can make no further durable progress.
+    /// `archive_mode` is `PGC_POSTMASTER`, so the answer has to come from the
+    /// command line;
+    /// `archive_command` and `archive_library` are `PGC_SIGHUP`, so pinning
+    /// either would claim it for `PGC_S_ARGV` and leave a filled `pg_wal`
+    /// recoverable only by the restart the agent must never take.
+    ///
+    /// This covers the three roles a `PostgresConfig` can be built for.
+    /// `ServingPrimary` is not among them: `PostgresConfig::new` refuses it with
+    /// `ServingPrimaryNotYetSupervised`, so no fixture can reach `command`
+    /// through it. It needs no per-role assertion — `command` appends
+    /// `archive_mode=off` unconditionally, outside the per-role tuple, so the
+    /// role cannot select a different answer once it is constructible.
+    #[test]
+    fn every_constructible_role_disables_archiving_without_pinning_the_pipeline() {
+        let quarantine_root = TempDir::new().expect("create quarantine fixture");
+        let quarantine_data = pgdata_fixture_at(&quarantine_root.path().join("data"));
+        let quarantine_executable = quarantine_root.path().join("postgres");
+        write_executable(&quarantine_executable, "#!/bin/sh\nexit 0\n");
+        let quarantine = test_config(
+            quarantine_data,
+            quarantine_executable,
+            quarantine_root.path().join("socket"),
+        );
+
+        let primary_root = TempDir::new().expect("create bootstrap primary fixture");
+        let primary_data = pgdata_fixture_at(&primary_root.path().join("data"));
+        let primary_executable = primary_root.path().join("postgres");
+        write_executable(&primary_executable, "#!/bin/sh\nexit 0\n");
+        let primary_hba = primary_root
+            .path()
+            .join("replication-bootstrap-primary.pg_hba.conf");
+        fs::write(&primary_hba, REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT)
+            .expect("write replication HBA");
+        fs::set_permissions(&primary_hba, fs::Permissions::from_mode(0o400))
+            .expect("protect replication HBA");
+        let primary = PostgresConfig::new_replication_bootstrap_primary(
+            primary_data,
+            primary_executable,
+            primary_root.path().join("socket"),
+            primary_hba.clone(),
+            synchronous_conf_beside(&primary_hba),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .expect("valid replication-bootstrap-primary config");
+
+        let standby_root = TempDir::new().expect("create standby fixture");
+        let standby_data = pgdata_fixture_at(&standby_root.path().join("data"));
+        let standby_executable = standby_root.path().join("postgres");
+        write_executable(&standby_executable, "#!/bin/sh\nexit 0\n");
+        let (standby, _passfile) = standby_test_config(
+            &standby_root,
+            standby_data,
+            standby_executable,
+            standby_root.path().join("socket"),
+        );
+
+        for (role, config) in [
+            ("quarantine", quarantine),
+            ("replication bootstrap primary", primary),
+            ("replication standby", standby),
+        ] {
+            let prepared = prepare_fixture(config).expect("prepare command fixture");
+            let command = prepared.command();
+            let arguments: Vec<_> = command.as_std().get_args().collect();
+            assert!(
+                arguments.contains(&OsStr::new("archive_mode=off")),
+                "{role} left WAL recycling gated on an archiver that cannot consume `.ready`"
+            );
+            let pinned: Vec<_> = arguments
+                .iter()
+                .filter(|argument| {
+                    argument.as_bytes().starts_with(b"archive_command")
+                        || argument.as_bytes().starts_with(b"archive_library")
+                })
+                .collect();
+            assert!(
+                pinned.is_empty(),
+                "{role} pinned {pinned:?} on the postmaster command line, which no reload \
+                 can replace"
             );
         }
     }
