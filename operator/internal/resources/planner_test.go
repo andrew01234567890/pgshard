@@ -4173,7 +4173,7 @@ func TestMultiMemberCatalogCandidateConfigurationsAreImmutableAndInert(t *testin
 
 func TestCatalogServingHBAPolicyIsExactAndLeastPrivilege(t *testing.T) {
 	t.Parallel()
-	want := "local postgres postgres peer\n" +
+	want := "local postgres,shardschema postgres peer\n" +
 		"local all all reject\n" +
 		"local replication all reject\n" +
 		"host replication pgshard_replication 0.0.0.0/0 scram-sha-256\n" +
