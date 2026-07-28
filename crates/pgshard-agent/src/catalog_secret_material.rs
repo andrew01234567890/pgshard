@@ -510,6 +510,67 @@ pub(crate) enum CatalogSecretMaterialError {
     },
 }
 
+/// Stand-in credentials for the tests here and in `catalog_identity`.
+///
+/// A fixture that spelled out sixty-four hexadecimal characters is
+/// indistinguishable from a real credential — to a reader, to a scanner, and to
+/// anyone who finds the repository — and a repository is the one place a real
+/// one must never be. These are a published function of a printable name
+/// instead: the whole input is the label written at the call, the sequence is
+/// the linear congruential generator from the C standard's own example, and no
+/// byte of it comes from entropy or from anything anyone owns. Recomputing one
+/// by hand needs nothing that is not on this page.
+///
+/// The shape is still the controller's own, because a fixture of a different
+/// shape would silently stop exercising the checks that read it.
+#[cfg(test)]
+pub(crate) mod generated {
+    use super::PASSWORD_BYTES;
+
+    /// The generator published as the C standard's own example, so a reader
+    /// can look it up rather than take it on trust. Its low bits cycle far too
+    /// quickly to render directly, which is why the nibble is taken from the
+    /// middle of the state.
+    const MULTIPLIER: u64 = 1_103_515_245;
+    const INCREMENT: u64 = 12_345;
+    const MODULUS: u64 = 1 << 31;
+
+    /// The credential `label` names: the controller's shape, the same
+    /// characters on every run, and different characters for every label.
+    pub(crate) fn credential(label: &str) -> String {
+        let mut state = seed(label);
+        let mut credential = String::new();
+        for _ in 0..PASSWORD_BYTES {
+            state = (state * MULTIPLIER + INCREMENT) % MODULUS;
+            let nibble = u8::try_from((state >> 16) % 16).expect("a nibble is one byte");
+            credential.push(char::from(if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + nibble - 10
+            }));
+        }
+        credential
+    }
+
+    /// A stand-in that is deliberately not the shape a credential is: as many
+    /// characters as `label` has, every one of them outside the hexadecimal
+    /// alphabet a real credential is drawn from.
+    pub(crate) fn outside_the_credential_alphabet(label: &str) -> String {
+        label
+            .bytes()
+            .map(|byte| char::from(b'g' + byte % 20))
+            .collect()
+    }
+
+    fn seed(label: &str) -> u64 {
+        let mut state = 0_u64;
+        for byte in label.bytes() {
+            state = (state * MULTIPLIER + INCREMENT + u64::from(byte)) % MODULUS;
+        }
+        state
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,15 +580,21 @@ mod tests {
     use pgshard_types::catalog_activation::{CatalogMaterialIdentity, MaterialIdentity};
     use tempfile::TempDir;
 
-    const REPLICATION_PASSWORD: &[u8; 64] =
-        b"1111111111111111111111111111111111111111111111111111111111111111";
-    const CATALOG_PASSWORD: &[u8; 64] =
-        b"2222222222222222222222222222222222222222222222222222222222222222";
-    const OPERATION_WRITER_PASSWORD: &[u8; 64] =
-        b"3333333333333333333333333333333333333333333333333333333333333333";
     const CA: &[u8] = b"-----BEGIN CERTIFICATE-----\ncatalog-ca\n";
     const KEY: &[u8] = b"-----BEGIN PRIVATE KEY-----\ncatalog-key\n";
     const CERTIFICATE: &[u8] = b"-----BEGIN CERTIFICATE-----\ncatalog-server\n";
+
+    fn replication_password() -> String {
+        generated::credential("replication")
+    }
+
+    fn catalog_password() -> String {
+        generated::credential("catalog")
+    }
+
+    fn operation_writer_password() -> String {
+        generated::credential("operation-writer")
+    }
 
     struct Fixture {
         root: TempDir,
@@ -538,14 +605,14 @@ mod tests {
             let root = TempDir::new().expect("material fixture");
             fs::write(
                 root.path().join("replication-password"),
-                REPLICATION_PASSWORD,
+                replication_password(),
             )
             .expect("replication credential");
-            fs::write(root.path().join("catalog-password"), CATALOG_PASSWORD)
+            fs::write(root.path().join("catalog-password"), catalog_password())
                 .expect("catalog credential");
             fs::write(
                 root.path().join("operation-writer-password"),
-                OPERATION_WRITER_PASSWORD,
+                operation_writer_password(),
             )
             .expect("operation-writer credential");
             fs::write(root.path().join("ca.crt"), CA).expect("CA");
@@ -592,7 +659,7 @@ mod tests {
                     uid: "replication-uid".to_owned(),
                     material_sha256: catalog_material_sha256(
                         POSTGRESQL_REPLICATION_DIGEST_DOMAIN,
-                        REPLICATION_PASSWORD,
+                        replication_password().as_bytes(),
                         std::iter::empty(),
                     ),
                 },
@@ -601,7 +668,7 @@ mod tests {
                     uid: "catalog-uid".to_owned(),
                     client_sha256: catalog_material_sha256(
                         CATALOG_CLIENT_DIGEST_DOMAIN,
-                        CATALOG_PASSWORD,
+                        catalog_password().as_bytes(),
                         [CA],
                     ),
                     server_sha256: catalog_material_sha256(
@@ -615,7 +682,7 @@ mod tests {
                     uid: "operation-writer-uid".to_owned(),
                     material_sha256: catalog_material_sha256(
                         OPERATION_WRITER_DIGEST_DOMAIN,
-                        OPERATION_WRITER_PASSWORD,
+                        operation_writer_password().as_bytes(),
                         [CA],
                     ),
                 },
@@ -641,9 +708,15 @@ mod tests {
         let fixture = Fixture::new();
         let secrets = verify_catalog_secret_material(&fixture.paths(), &fixture.materials())
             .expect("checkpointed material verifies");
-        assert_eq!(secrets.replication.expose(), REPLICATION_PASSWORD);
-        assert_eq!(secrets.catalog.expose(), CATALOG_PASSWORD);
-        assert_eq!(secrets.operation_writer.expose(), OPERATION_WRITER_PASSWORD);
+        assert_eq!(
+            secrets.replication.expose(),
+            replication_password().as_bytes()
+        );
+        assert_eq!(secrets.catalog.expose(), catalog_password().as_bytes());
+        assert_eq!(
+            secrets.operation_writer.expose(),
+            operation_writer_password().as_bytes()
+        );
     }
 
     /// Every material is load-bearing: changing any one of them by a single
@@ -804,13 +877,70 @@ mod tests {
         );
     }
 
+    /// The fixture credentials are generated rather than written down, so the
+    /// shape a reader could once check by counting characters is checked here
+    /// instead. They also have to differ from one another: tests offer one
+    /// identity's credential to another and require it to be refused, and two
+    /// identities sharing a credential would make that refusal impossible.
+    #[test]
+    fn the_generated_fixture_credentials_are_the_canonical_shape_and_all_differ() {
+        let credentials = [
+            replication_password(),
+            catalog_password(),
+            operation_writer_password(),
+        ];
+        for credential in &credentials {
+            assert_eq!(
+                u64::try_from(credential.len()).expect("a fixture length"),
+                PASSWORD_BYTES,
+                "a fixture credential is not the length the controller generates"
+            );
+            assert!(
+                credential
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+                "a fixture credential is not the alphabet the controller generates"
+            );
+        }
+        let distinct: std::collections::BTreeSet<&String> = credentials.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            credentials.len(),
+            "two fixture identities share a credential"
+        );
+        // Reproducible run to run, which is the whole reason a generated
+        // fixture is allowed to stand in for a written-down one.
+        assert_eq!(
+            generated::credential("catalog"),
+            catalog_password(),
+            "the fixture credential is not a function of its label alone"
+        );
+        assert!(
+            generated::outside_the_credential_alphabet("catalog")
+                .bytes()
+                .all(|byte| !byte.is_ascii_digit() && !matches!(byte, b'a'..=b'f')),
+            "the non-canonical stand-in is inside the credential alphabet"
+        );
+    }
+
     #[test]
     fn a_credential_that_is_not_the_canonical_generated_shape_is_refused() {
+        // One defect each, so a credential that is refused is refused for the
+        // reason it carries.
+        let canonical = catalog_password();
+        let mut one_character_short = canonical.clone().into_bytes();
+        one_character_short.pop();
+        let terminated = format!("{canonical}\n").into_bytes();
+        let mut outside_ascii = canonical.clone().into_bytes();
+        outside_ascii[0] = 0xff;
+        let mut outside_the_alphabet = canonical.clone().into_bytes();
+        outside_the_alphabet[0] = b'A';
+
         for invalid in [
-            &b"111111111111111111111111111111111111111111111111111111111111111"[..],
-            b"1111111111111111111111111111111111111111111111111111111111111111\n",
-            b"1111111111111111111111111111111111111111111111111111111111111\xffA",
-            b"1111111111111111111111111111111111111111111111111111111111111AAA",
+            one_character_short,
+            terminated,
+            outside_ascii,
+            outside_the_alphabet,
         ] {
             let fixture = Fixture::new();
             let materials = fixture.materials();
@@ -856,14 +986,14 @@ mod tests {
     fn errors_never_render_the_material_they_refused() {
         let fixture = Fixture::new();
         let materials = fixture.materials();
-        let credential = "4444444444444444444444444444444444444444444444444444444444444444";
-        fs::write(fixture.path("catalog-password"), credential).expect("write credential");
+        let credential = generated::credential("a credential the checkpoint does not name");
+        fs::write(fixture.path("catalog-password"), &credential).expect("write credential");
         let error = verify_catalog_secret_material(&fixture.paths(), &materials)
             .err()
             .expect("a replaced credential is refused");
         let rendered = format!("{error}: {error:?}");
         assert!(
-            !rendered.contains(credential),
+            !rendered.contains(credential.as_str()),
             "an error rendered {rendered}"
         );
         assert!(rendered.contains("catalog client"));

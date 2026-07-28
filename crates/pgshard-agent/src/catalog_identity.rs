@@ -1257,6 +1257,8 @@ ALTER ROLE pgshard_orchestrator_catalog IN DATABASE shardschema SET jit = off;";
 mod tests {
     use super::*;
 
+    use crate::catalog_secret_material::generated;
+
     const LOGINS: [CatalogLogin; 3] = [
         CatalogLogin::PoolerCatalog,
         CatalogLogin::OrchestratorCatalog,
@@ -1427,16 +1429,16 @@ mod tests {
     /// pinned format. The password must not be recoverable from it.
     #[test]
     fn the_derived_verifier_is_the_pinned_format_and_hides_the_password() {
-        let password = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let verifier =
-            ScramVerifier::derive(password, CatalogLogin::PoolerCatalog).expect("derive verifier");
+        let password = generated::credential("verifier derivation");
+        let verifier = ScramVerifier::derive(password.as_bytes(), CatalogLogin::PoolerCatalog)
+            .expect("derive verifier");
         let bound = verifier.as_str().expect("a bindable verifier");
         assert!(bound.starts_with(SCRAM_VERIFIER_PREFIX));
-        assert!(!bound.contains(std::str::from_utf8(password).expect("ASCII password")));
+        assert!(!bound.contains(password.as_str()));
         // Salted, so two derivations of the same password differ. A constant
         // verifier would mean the salt was not being drawn.
-        let again =
-            ScramVerifier::derive(password, CatalogLogin::PoolerCatalog).expect("derive verifier");
+        let again = ScramVerifier::derive(password.as_bytes(), CatalogLogin::PoolerCatalog)
+            .expect("derive verifier");
         assert_ne!(bound, again.as_str().expect("a bindable verifier"));
     }
 
@@ -1525,10 +1527,9 @@ mod tests {
 
     /// A credential shaped exactly the way the controller generates one. The
     /// live fixture's own, so the two cannot drift apart.
-    const A_REAL_CREDENTIAL: &str = match std::str::from_utf8(CATALOG_PASSWORD) {
-        Ok(credential) => credential,
-        Err(_) => panic!("the fixture credential is ASCII"),
-    };
+    fn a_real_credential() -> String {
+        catalog_password()
+    }
 
     /// Enough draws that a generator which is secretly a function of its input
     /// repeats, and few enough that the test costs nothing. Two independent
@@ -1540,8 +1541,14 @@ mod tests {
     /// cannot be the one under test, for every input the caller can hand it.
     #[test]
     fn the_negative_control_credential_can_never_be_the_one_under_test() {
-        for password in ["", A_REAL_CREDENTIAL, "!", "!!", "not canonical at all"] {
-            let probe = negative_control_credential(password)
+        for password in [
+            String::new(),
+            a_real_credential(),
+            generated::outside_the_credential_alphabet("a"),
+            generated::outside_the_credential_alphabet("ab"),
+            generated::outside_the_credential_alphabet("not canonical at all"),
+        ] {
+            let probe = negative_control_credential(&password)
                 .expect("the negative control has an entropy source");
             assert_ne!(
                 probe.expose(),
@@ -1569,9 +1576,10 @@ mod tests {
         // coercion is what fails to compile if that ever stops being true.
         let _: fn() -> Result<ProbeCredential, CatalogIdentityError> = fresh_probe_credential;
 
+        let under_test = a_real_credential();
         let mut offered = std::collections::BTreeSet::new();
         for _ in 0..NEGATIVE_CONTROL_SAMPLES {
-            let probe = negative_control_credential(A_REAL_CREDENTIAL)
+            let probe = negative_control_credential(&under_test)
                 .expect("the negative control has an entropy source");
             assert!(
                 offered.insert(probe.expose().to_vec()),
@@ -1610,13 +1618,14 @@ mod tests {
     /// would be read as proof that the path verifies credentials.
     #[test]
     fn the_negative_control_credential_is_the_shape_a_real_credential_is() {
+        let under_test = a_real_credential();
         assert_eq!(
             PROBE_CREDENTIAL_BYTES,
-            A_REAL_CREDENTIAL.len(),
+            under_test.len(),
             "the probe is not the length the controller generates"
         );
         for _ in 0..NEGATIVE_CONTROL_SAMPLES {
-            let probe = negative_control_credential(A_REAL_CREDENTIAL)
+            let probe = negative_control_credential(&under_test)
                 .expect("the negative control has an entropy source");
             assert_eq!(
                 probe.expose().len(),
@@ -1689,12 +1698,21 @@ mod tests {
     // and an authentication decision are all things only `PostgreSQL` can
     // answer, and every one of them is what these checks exist to observe.
 
-    const CATALOG_PASSWORD: &[u8; 64] =
-        b"5f6d7e8c9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f809";
-    const OPERATION_WRITER_PASSWORD: &[u8; 64] =
-        b"a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
-    const REPLICATION_PASSWORD: &[u8; 64] =
-        b"0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
+    // One credential per login identity, generated from the identity's own name
+    // rather than written down. The shape and the mutual distinctness the tests
+    // below read them for are asserted where the generator lives, in
+    // `catalog_secret_material::generated`.
+    fn catalog_password() -> String {
+        generated::credential("catalog")
+    }
+
+    fn operation_writer_password() -> String {
+        generated::credential("operation-writer")
+    }
+
+    fn replication_password() -> String {
+        generated::credential("replication")
+    }
 
     const MIGRATION: &str = include_str!("../../pgshard-catalog/migrations/0001_shardschema.sql");
 
@@ -1831,13 +1849,17 @@ SELECT settings.setconfig \
             .batch_execute(INSTALL_ORCHESTRATOR_CATALOG_DEFAULTS)
             .await
             .expect("install the orchestrator catalog defaults");
-        install_login_credential(catalog, CatalogLogin::PoolerCatalog, CATALOG_PASSWORD)
-            .await
-            .expect("install the pooler catalog credential");
+        install_login_credential(
+            catalog,
+            CatalogLogin::PoolerCatalog,
+            catalog_password().as_bytes(),
+        )
+        .await
+        .expect("install the pooler catalog credential");
         install_login_credential(
             catalog,
             CatalogLogin::OrchestratorCatalog,
-            OPERATION_WRITER_PASSWORD,
+            operation_writer_password().as_bytes(),
         )
         .await
         .expect("install the orchestrator catalog credential");
@@ -1911,20 +1933,24 @@ SELECT settings.setconfig \
             );
         }
 
-        install_login_credential(&mut catalog, CatalogLogin::PoolerCatalog, CATALOG_PASSWORD)
-            .await
-            .expect("install the pooler catalog credential");
+        install_login_credential(
+            &mut catalog,
+            CatalogLogin::PoolerCatalog,
+            catalog_password().as_bytes(),
+        )
+        .await
+        .expect("install the pooler catalog credential");
         install_login_credential(
             &mut catalog,
             CatalogLogin::OrchestratorCatalog,
-            OPERATION_WRITER_PASSWORD,
+            operation_writer_password().as_bytes(),
         )
         .await
         .expect("install the orchestrator catalog credential");
         install_login_credential(
             &mut generation,
             CatalogLogin::Replication,
-            REPLICATION_PASSWORD,
+            replication_password().as_bytes(),
         )
         .await
         .expect("install the replication credential");
@@ -1949,9 +1975,12 @@ SELECT settings.setconfig \
         // A staged role can receive a credential exactly once: the update
         // re-states the staging shape, so replaying it against a role that
         // already has one is refused rather than silently replacing it.
-        let replayed =
-            install_login_credential(&mut catalog, CatalogLogin::PoolerCatalog, CATALOG_PASSWORD)
-                .await;
+        let replayed = install_login_credential(
+            &mut catalog,
+            CatalogLogin::PoolerCatalog,
+            catalog_password().as_bytes(),
+        )
+        .await;
         assert!(
             matches!(
                 replayed,
@@ -2064,7 +2093,7 @@ SELECT settings.setconfig \
         let refused = install_login_credential(
             &mut catalog,
             CatalogLogin::OrchestratorCatalog,
-            OPERATION_WRITER_PASSWORD,
+            operation_writer_password().as_bytes(),
         )
         .await;
         assert!(
@@ -2100,7 +2129,7 @@ SELECT settings.setconfig \
         install_login_credential(
             &mut catalog,
             CatalogLogin::OrchestratorCatalog,
-            OPERATION_WRITER_PASSWORD,
+            operation_writer_password().as_bytes(),
         )
         .await
         .expect("install the orchestrator catalog credential");
@@ -2198,9 +2227,13 @@ SELECT settings.setconfig \
         );
 
         let before = log_end();
-        install_login_credential(&mut catalog, CatalogLogin::PoolerCatalog, CATALOG_PASSWORD)
-            .await
-            .expect("install the pooler catalog credential");
+        install_login_credential(
+            &mut catalog,
+            CatalogLogin::PoolerCatalog,
+            catalog_password().as_bytes(),
+        )
+        .await
+        .expect("install the pooler catalog credential");
         let written = read_log(before);
 
         // The exact verifier the server now stores. Searching the log for the
@@ -2229,7 +2262,7 @@ SELECT settings.setconfig \
             "the derived SCRAM verifier reached the statement log"
         );
         assert!(
-            !written.contains(std::str::from_utf8(CATALOG_PASSWORD).expect("ASCII credential")),
+            !written.contains(catalog_password().as_str()),
             "a credential reached the statement log"
         );
 
@@ -2258,7 +2291,7 @@ SELECT settings.setconfig \
         let refused = install_login_credential(
             &mut catalog,
             CatalogLogin::OrchestratorCatalog,
-            OPERATION_WRITER_PASSWORD,
+            operation_writer_password().as_bytes(),
         )
         .await;
         catalog.batch_execute("RESET ROLE").await.expect("reset");
@@ -2300,7 +2333,12 @@ SELECT settings.setconfig \
             ),
         )
         .await;
-        prove_catalog_credential(socket_dir, CatalogLogin::PoolerCatalog, CATALOG_PASSWORD).await
+        prove_catalog_credential(
+            socket_dir,
+            CatalogLogin::PoolerCatalog,
+            catalog_password().as_bytes(),
+        )
+        .await
     }
 
     /// The policy the compatibility bootstrap shell reloads onto its private
@@ -2346,7 +2384,8 @@ SELECT settings.setconfig \
             CatalogLogin::PoolerCatalog,
             CatalogLogin::OrchestratorCatalog,
         ] {
-            let refused = prove_catalog_credential(&socket_dir, login, CATALOG_PASSWORD).await;
+            let refused =
+                prove_catalog_credential(&socket_dir, login, catalog_password().as_bytes()).await;
             assert!(
                 matches!(
                     refused,
@@ -2396,13 +2435,17 @@ SELECT settings.setconfig \
         );
 
         install_check_time_policy(&admin).await;
-        prove_catalog_credential(&socket_dir, CatalogLogin::PoolerCatalog, CATALOG_PASSWORD)
-            .await
-            .expect("the pooler credential authenticates into its canonical session");
+        prove_catalog_credential(
+            &socket_dir,
+            CatalogLogin::PoolerCatalog,
+            catalog_password().as_bytes(),
+        )
+        .await
+        .expect("the pooler credential authenticates into its canonical session");
         prove_catalog_credential(
             &socket_dir,
             CatalogLogin::OrchestratorCatalog,
-            OPERATION_WRITER_PASSWORD,
+            operation_writer_password().as_bytes(),
         )
         .await
         .expect("the operation-writer credential authenticates into its canonical session");
@@ -2413,7 +2456,7 @@ SELECT settings.setconfig \
         let wrong = prove_catalog_credential(
             &socket_dir,
             CatalogLogin::PoolerCatalog,
-            OPERATION_WRITER_PASSWORD,
+            operation_writer_password().as_bytes(),
         )
         .await;
         assert!(
@@ -2437,9 +2480,13 @@ SELECT settings.setconfig \
         let mut catalog = reset_catalog().await;
         stage_and_install(&mut catalog).await;
         install_check_time_policy(&superuser("postgres").await).await;
-        prove_catalog_credential(&socket_dir, CatalogLogin::PoolerCatalog, CATALOG_PASSWORD)
-            .await
-            .expect("the fixture starts from a canonical session");
+        prove_catalog_credential(
+            &socket_dir,
+            CatalogLogin::PoolerCatalog,
+            catalog_password().as_bytes(),
+        )
+        .await
+        .expect("the fixture starts from a canonical session");
 
         // Every case is a refusal; the flag marks the ones whose refusal must
         // be the predicate's own verdict rather than a server privilege error.
@@ -2448,14 +2495,14 @@ SELECT settings.setconfig \
                 "a role-wide default a production session would inherit",
                 "ALTER ROLE pgshard_pooler_catalog IN DATABASE shardschema SET jit = on",
                 CatalogLogin::PoolerCatalog,
-                CATALOG_PASSWORD,
+                catalog_password().as_bytes(),
                 true,
             ),
             (
                 "the reader membership the operation writer must not hold",
                 "GRANT pgshard_catalog_reader TO pgshard_orchestrator_catalog",
                 CatalogLogin::OrchestratorCatalog,
-                OPERATION_WRITER_PASSWORD,
+                operation_writer_password().as_bytes(),
                 true,
             ),
             // Last: revoking this also takes away the schema privileges the
@@ -2465,7 +2512,7 @@ SELECT settings.setconfig \
                 "the reader membership the pooler must hold",
                 "REVOKE pgshard_catalog_reader FROM pgshard_pooler_catalog",
                 CatalogLogin::PoolerCatalog,
-                CATALOG_PASSWORD,
+                catalog_password().as_bytes(),
                 false,
             ),
         ] {
