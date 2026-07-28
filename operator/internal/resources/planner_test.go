@@ -4855,7 +4855,16 @@ func TestReplicationBootstrapPrimaryHBAImageContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "local postgres postgres peer\n" +
+	// The file's source of truth is the agent's own
+	// REPLICATION_BOOTSTRAP_PRIMARY_HBA_CONTENT, which fails to compile if the
+	// two disagree. This is the operator-side half of that contract: the planner
+	// hands this path to the bootstrap-source agent as PGSHARD_POSTGRES_HBA_FILE
+	// and installs the file into the standby's staging directory, so a change to
+	// it lands here rather than only in a Rust build the operator lane does not
+	// run. Update it only together with the agent constant.
+	want := "local postgres,shardschema postgres peer\n" +
+		"local shardschema pgshard_pooler_catalog scram-sha-256\n" +
+		"local shardschema pgshard_orchestrator_catalog scram-sha-256\n" +
 		"local all all reject\n" +
 		"local replication all reject\n" +
 		"host replication pgshard_replication 0.0.0.0/0 scram-sha-256\n" +

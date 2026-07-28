@@ -160,7 +160,7 @@ jobs:
           exists_at_head_or_base crates/pgshard-e2e/Cargo.toml && kind_exists=true
           exists_at_head_or_base benchmarks/Cargo.toml && performance_exists=true
 
-          emit_component rust "$rust_exists" '(^|/)(Cargo\.(toml|lock)|rust-toolchain(\.toml)?|[^/]+\.rs)$|^crates/|^proto/|^contracts/|^deny\.toml$|^rustfmt\.toml$|^\.cargo/|^Makefile$|^\.github/'
+          emit_component rust "$rust_exists" '(^|/)(Cargo\.(toml|lock)|rust-toolchain(\.toml)?|[^/]+\.rs)$|^crates/|^proto/|^contracts/|^deny\.toml$|^rustfmt\.toml$|^\.cargo/|^deploy/images/|^Makefile$|^\.github/'
           emit_component postgres_agent "$postgres_agent_exists" '^crates/(pgshard-agent|pgshard-types|pgshard-version)/|^crates/pgshard-catalog/migrations/|^crates/pgshard-catalog/inventory/|^crates/pgshard-catalog/testdata/|^contracts/replication-slot-names\.json$|^extensions/pgshard_fence/|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^rustfmt\.toml$|^\.cargo/|^\.dockerignore$|^deploy/docker-bake\.hcl$|^deploy/images/|^Makefile$|^\.github/workflows/ci\.yml$|^\.github/scripts/'
           emit_component catalog "$catalog_exists" '^crates/(pgshard-catalog|pgshard-types)/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/(workflows|scripts)/'
           emit_component orch_catalog "$orch_catalog_exists" '^crates/(pgshard-orch|pgshard-catalog|pgshard-types|pgshard-version)/|^operator/internal/tuning/|^contracts/|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^Makefile$|^\.github/(workflows|scripts)/'

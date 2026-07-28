@@ -1634,10 +1634,14 @@ mod tests {
 
     use crate::writable::durable_generation_for_test;
 
-    /// The non-serving policy every incarnation starts under, in the shape the
-    /// agent already materializes. Only its digest matters here.
+    /// The non-serving policy every incarnation starts under.
+    ///
+    /// Only its digest matters to the sealing below, but it is read from the
+    /// product rather than copied: a fixture asserting it is "the shape the
+    /// agent materializes" while holding its own bytes is a claim that stops
+    /// being true the moment the policy changes, and says so to nobody.
     const NON_SERVING: &[u8] =
-        b"local postgres postgres peer\nlocal all all reject\nlocal replication all reject\n";
+        crate::postgres::hba_policy_contents(crate::postgres::PostgresRuntimeRole::Quarantine);
     const SERVING: &[u8] = b"local postgres postgres peer\n\
 hostssl shardschema pgshard_pooler_catalog all scram-sha-256\n\
 hostssl shardschema all all reject\n\
