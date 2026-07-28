@@ -22,11 +22,12 @@ use pgshard_orch::{
     },
     slot_observer::{
         CorrelatedStandbyReplicationPath, LocalLogicalSlotObservationBatch,
-        LocalPrimaryReplicationObservationBatch, LocalSlotObservationError,
-        LocalSlotSyncWorkerActivity, LocalWalReceiverActivity, LocalWalSenderActivity,
-        LogicalSlotObservationRequest, PrimaryReplicationObservationRequest,
-        StandbyReplicationPathCorrelationError, correlate_standby_replication_path,
-        observe_local_logical_slots, observe_local_primary_replication,
+        LocalPhysicalReplicationSlotObservation, LocalPrimaryReplicationObservationBatch,
+        LocalSlotObservationError, LocalSlotSyncWorkerActivity, LocalWalReceiverActivity,
+        LocalWalSenderActivity, LogicalSlotObservationRequest,
+        PrimaryReplicationObservationRequest, StandbyReplicationPathCorrelationError,
+        correlate_standby_replication_path, observe_local_logical_slots,
+        observe_local_primary_replication,
     },
     slot_probe_catalog::{
         CatalogSlotSyncProbe, SlotSyncProbeAllocation, SlotSyncProbeAllocationSource,
@@ -41,6 +42,10 @@ use pgshard_orch::{
         ReplicationSourceIdentity, SettingState, SlotActivity, SlotGeneration, SlotOwnership,
         SlotPersistence, SlotWalRetention, StandbyDecoderEvidenceLimits, StandbyDecoderPolicy,
         StandbyDecoderTarget,
+    },
+    vacuum_horizon::{
+        FROZEN_DATA_HORIZON_CORROBORATION_XIDS, FROZEN_DATA_HORIZON_XID_AGE, VacuumHorizonState,
+        VacuumHorizonWatch,
     },
 };
 use pgshard_types::{CatalogEpoch, PgLsn};
@@ -81,6 +86,7 @@ const EXPECTED_SYNCED_ANCHOR_NAME: &str = "pgshard_ci_anchor_0000000000000000000
 // and cleanup each retain their own one-minute bound. The outer mutation
 // fixture must cover those sequential phases instead of racing any one of them.
 const MUTATION_FIXTURE_TIMEOUT: Duration = Duration::from_mins(5);
+const HORIZON_PROBE_TRANSACTIONS: u32 = 50_000;
 const STANDBY_CATCHUP_TIMEOUT: Duration = Duration::from_mins(1);
 const STANDBY_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const RESTRICTED_OBSERVER_ROLE: &str = "pgshard_observer_restricted";
@@ -5266,4 +5272,263 @@ async fn timeout_aborts_the_connection_and_backend_while_the_blocker_remains() -
     rollback_result?;
     blocker_result?;
     monitor_result
+}
+
+async fn observe_physical_slot(
+    database_url: &str,
+    physical_slot: &ReplicationSlotName,
+) -> TestResult<LocalPhysicalReplicationSlotObservation> {
+    let anchor = target("pgshard_horizon_anchor")?;
+    let request = PrimaryReplicationObservationRequest::new(physical_slot.clone(), anchor)?;
+    observe_primary_path(database_url, &request)
+        .await?
+        .physical_slot()
+        .cloned()
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "physical slot {} is absent",
+                physical_slot.as_str()
+            ))
+            .into()
+        })
+}
+
+async fn wait_for_streaming_data_horizon(
+    database_url: &str,
+    physical_slot: &ReplicationSlotName,
+) -> TestResult<LocalPhysicalReplicationSlotObservation> {
+    let deadline = Instant::now() + STANDBY_CATCHUP_TIMEOUT;
+    loop {
+        let slot = observe_physical_slot(database_url, physical_slot).await?;
+        if slot.data_horizon().is_some() && matches!(slot.activity(), SlotActivity::Active(_)) {
+            return Ok(slot);
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(
+                "primary physical slot never reported a walsender-owned data horizon",
+            )
+            .into());
+        }
+        sleep(STANDBY_POLL_INTERVAL).await;
+    }
+}
+
+async fn burn_transaction_ids(client: &Client, count: u32) -> TestResult {
+    // Each committed iteration assigns exactly one transaction ID, which is
+    // what ages a pinned horizon. `count` is a crate constant, not input.
+    client
+        .batch_execute(&format!(
+            "DO $$ BEGIN FOR i IN 1..{count} LOOP \
+                 PERFORM pg_catalog.pg_current_xact_id(); COMMIT; \
+             END LOOP; END $$"
+        ))
+        .await?;
+    Ok(())
+}
+
+async fn terminate_wal_sender(
+    client: &Client,
+    physical_slot: &ReplicationSlotName,
+) -> TestResult<bool> {
+    let terminated = client
+        .query_opt(
+            "SELECT pg_catalog.pg_terminate_backend(active_pid) \
+               FROM pg_catalog.pg_replication_slots \
+              WHERE slot_name OPERATOR(pg_catalog.=) $1::pg_catalog.name \
+                AND active_pid IS NOT NULL",
+            &[&physical_slot.as_str()],
+        )
+        .await?;
+    Ok(terminated.is_some())
+}
+
+/// Drives the walsender through repeated crash-and-respawn cycles and returns
+/// how many samples caught the slot unowned.
+async fn count_uncorroborated_blips(
+    client: &Client,
+    database_url: &str,
+    physical_slot: &ReplicationSlotName,
+    watch: &mut VacuumHorizonWatch,
+) -> TestResult<u32> {
+    let mut detached_samples = 0;
+    let deadline = Instant::now() + STANDBY_CATCHUP_TIMEOUT;
+    while Instant::now() < deadline {
+        terminate_wal_sender(client, physical_slot).await?;
+        burn_transaction_ids(client, HORIZON_PROBE_TRANSACTIONS).await?;
+        let slot = observe_physical_slot(database_url, physical_slot).await?;
+        let condition = watch.observe(&slot);
+        assert!(
+            !condition.is_frozen(),
+            "a walsender restart must never report a frozen horizon: {}",
+            condition.message()
+        );
+        if slot.activity() == SlotActivity::Inactive && slot.data_horizon().is_some() {
+            detached_samples += 1;
+            assert_eq!(condition.reason(), "HorizonDetachmentUncorroborated");
+            if detached_samples >= 3 {
+                break;
+            }
+        }
+        sleep(STANDBY_POLL_INTERVAL).await;
+    }
+    Ok(detached_samples)
+}
+
+async fn run_frozen_data_horizon_fixture(
+    database_url: String,
+    physical_slot: ReplicationSlotName,
+    probe_slot: ReplicationSlotName,
+) -> TestResult {
+    let (client, connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    let connection_task = tokio::spawn(connection);
+    let fixture_result: TestResult = async {
+        let streaming = wait_for_streaming_data_horizon(&database_url, &physical_slot).await?;
+        let streaming_horizon = streaming
+            .data_horizon()
+            .ok_or_else(|| io::Error::other("streaming slot lost its data horizon"))?;
+
+        // An owned slot is lagging, never frozen. Zero bounds are the most
+        // hostile pair a watch can be given and still it must stay quiet.
+        let mut streaming_watch = VacuumHorizonWatch::with_limits(0, 0);
+        let streaming_condition = streaming_watch.observe(&streaming);
+        assert!(!streaming_condition.is_frozen());
+        assert_eq!(streaming_condition.reason(), "HorizonReportedByWalSender");
+        assert!(matches!(
+            streaming_condition.state(),
+            VacuumHorizonState::Attached { .. }
+        ));
+
+        // PostgreSQL stores the reported xmin in the slot, so a copy inherits a
+        // live pin that no walsender owns.
+        client
+            .execute(
+                "SELECT pg_catalog.pg_copy_physical_replication_slot( \
+                     $1::pg_catalog.name, $2::pg_catalog.name)",
+                &[&physical_slot.as_str(), &probe_slot.as_str()],
+            )
+            .await?;
+        let probe = observe_physical_slot(&database_url, &probe_slot).await?;
+        let probe_horizon = probe
+            .data_horizon()
+            .ok_or_else(|| io::Error::other("copied slot carried no data horizon"))?;
+        assert_eq!(probe_horizon.xmin(), streaming_horizon.xmin());
+        assert_eq!(probe.activity(), SlotActivity::Inactive);
+
+        // Even at a zero reportable age the first detached sample proves
+        // nothing: it carries whatever age the pin already had.
+        let mut probe_watch = VacuumHorizonWatch::with_limits(0, HORIZON_PROBE_TRANSACTIONS);
+        let first = probe_watch.observe(&probe);
+        assert!(!first.is_frozen());
+        assert_eq!(first.reason(), "HorizonDetachmentUncorroborated");
+        assert_eq!(first.slot(), &probe_slot);
+
+        let mut shipped_watch = VacuumHorizonWatch::new();
+        assert!(!shipped_watch.observe(&probe).is_frozen());
+
+        burn_transaction_ids(&client, HORIZON_PROBE_TRANSACTIONS).await?;
+
+        // The unowned slot cannot move: same xmin, strictly older. Once the
+        // detachment has outlasted the corroboration span it is reportable.
+        let deadline = Instant::now() + STANDBY_CATCHUP_TIMEOUT;
+        loop {
+            let probe = observe_physical_slot(&database_url, &probe_slot).await?;
+            let aged = probe
+                .data_horizon()
+                .ok_or_else(|| io::Error::other("frozen slot lost its data horizon"))?;
+            assert_eq!(aged.xmin(), probe_horizon.xmin());
+            assert!(
+                aged.age()
+                    >= probe_horizon
+                        .age()
+                        .saturating_add(HORIZON_PROBE_TRANSACTIONS)
+            );
+            let corroborated = probe_watch.observe(&probe);
+            assert!(corroborated.is_frozen());
+            assert_eq!(corroborated.reason(), "VacuumHorizonFrozen");
+            assert!(corroborated.message().contains("no walsender"));
+            // The shipped age is nowhere near reached, so the same evidence
+            // stays quiet under the shipped bounds.
+            assert!(aged.age() < FROZEN_DATA_HORIZON_XID_AGE);
+            assert!(!shipped_watch.observe(&probe).is_frozen());
+
+            let streaming = observe_physical_slot(&database_url, &physical_slot).await?;
+            let live = streaming
+                .data_horizon()
+                .ok_or_else(|| io::Error::other("streaming slot lost its data horizon"))?;
+            let caught_up =
+                live.age() < aged.age() && matches!(streaming.activity(), SlotActivity::Active(_));
+            if caught_up {
+                assert!(!streaming_watch.observe(&streaming).is_frozen());
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::other(format!(
+                    "streaming horizon age {} never fell below the frozen age {}",
+                    live.age(),
+                    aged.age()
+                ))
+                .into());
+            }
+            sleep(STANDBY_POLL_INTERVAL).await;
+        }
+
+        // A walsender crash-and-respawn detaches the slot for a moment and
+        // leaves the pin exactly as old as it already was. At a zero reportable
+        // age every one of those samples clears the age bound, so only the
+        // corroboration span keeps the condition quiet.
+        let mut blip_watch =
+            VacuumHorizonWatch::with_limits(0, FROZEN_DATA_HORIZON_CORROBORATION_XIDS);
+        let blips =
+            count_uncorroborated_blips(&client, &database_url, &physical_slot, &mut blip_watch)
+                .await?;
+        assert!(
+            blips > 0,
+            "no sample caught the slot unowned, so the restart case was never exercised"
+        );
+        wait_for_streaming_data_horizon(&database_url, &physical_slot).await?;
+        Ok(())
+    }
+    .await;
+    drop(client);
+    let connection_result = finish_connection(connection_task).await;
+    combine_named_results([
+        ("fixture", fixture_result),
+        ("fixture connection", connection_result),
+    ])
+}
+
+#[tokio::test]
+#[ignore = "requires the CI PostgreSQL 18 primary and streaming standby"]
+async fn only_a_sustained_unowned_physical_slot_freezes_the_data_horizon() -> TestResult {
+    let database_url = std::env::var("PGSHARD_TEST_DATABASE_URL")?;
+    let physical_slot = ReplicationSlotName::new(EXPECTED_PRIMARY_SLOT_NAME)?;
+    let probe_slot = target("pgshard_frozen_horizon")?.name().clone();
+    let (cleanup, cleanup_connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    let cleanup_task = tokio::spawn(cleanup_connection);
+    let fixture_result = finish_bounded_fixture(
+        tokio::spawn(run_frozen_data_horizon_fixture(
+            database_url.clone(),
+            physical_slot,
+            probe_slot.clone(),
+        )),
+        "frozen data-horizon fixture",
+    )
+    .await;
+    let cleanup_result = cleanup
+        .execute(
+            "SELECT pg_catalog.pg_drop_replication_slot(slot_name) \
+               FROM pg_catalog.pg_replication_slots \
+              WHERE slot_name OPERATOR(pg_catalog.=) $1::pg_catalog.name",
+            &[&probe_slot.as_str()],
+        )
+        .await
+        .map(|_| ())
+        .map_err(TestError::from);
+    drop(cleanup);
+    let cleanup_connection_result = finish_connection(cleanup_task).await;
+    combine_named_results([
+        ("fixture", fixture_result),
+        ("probe slot cleanup", cleanup_result),
+        ("probe slot cleanup connection", cleanup_connection_result),
+    ])
 }

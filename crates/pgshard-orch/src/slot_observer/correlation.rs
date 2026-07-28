@@ -878,6 +878,7 @@ mod tests {
     use super::super::{
         LocalPhysicalReplicationSlotObservation, LocalSlotSyncWorkerObservation,
         LocalStandbyPrerequisiteObservation, LocalWalSenderObservation, LogicalSlotSnapshotEntry,
+        PinnedDataHorizon,
     };
     use super::*;
     use crate::standby_slots::{
@@ -1068,6 +1069,10 @@ mod tests {
                 name: policy.physical_slot().clone(),
                 persistence: SlotPersistence::Unproven,
                 activity: SlotActivity::Active(sender_pid),
+                data_horizon: Some(PinnedDataHorizon {
+                    xmin: LocalPostgresTransactionId(nonzero_u32(754)),
+                    age: 0,
+                }),
                 catalog_xmin: Some(LocalPostgresTransactionId(nonzero_u32(755))),
                 restart_lsn: Some(RESTART),
                 wal_retention: Some(SlotWalRetention::Reserved),
