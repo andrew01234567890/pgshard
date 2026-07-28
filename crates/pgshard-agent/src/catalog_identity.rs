@@ -45,21 +45,22 @@
 //! probe whose purpose is to be refused — and a refusal afterwards does not
 //! recall bytes already in the server's memory and possibly its log.
 //!
-//! # What this module cannot do on its own
+//! # The path this module needs is a record the agent installs
 //!
 //! Proving a credential requires an authentication path, and an authentication
-//! path is an HBA record. Before serving activation the postmaster runs under
-//! the agent's pre-serving policy, which carries no `scram-sha-256` record and
-//! no record for the catalog database at all, so both catalog identities are
-//! refused before they are ever asked for a password. The shell solves this by
-//! reloading a third, check-time policy onto its private bootstrap postmaster
-//! for the duration of the two probes. Until the agent owns an equivalent
-//! policy, [`prove_catalog_credential`] reports
-//! [`CatalogIdentityError::NoProvenAuthenticationPath`] and refuses. It is
-//! deliberately not weakened into a comparison against the stored verifier:
-//! that would prove the catalog holds a hash derived from the Secret, which is
-//! already established by [`install_login_credential`], and would not prove
-//! that the identity can log in.
+//! path is an HBA record. The shell reloads a third, check-time policy onto its
+//! private bootstrap postmaster for the duration of the two probes. The agent
+//! does not: the policy it installs for every runtime role carries a
+//! `scram-sha-256` record for each catalog identity on the catalog database, so
+//! the path is there for the whole life of the postmaster and nothing is
+//! reloaded to obtain it.
+//!
+//! Where a record is absent the refusal stands, and it is
+//! [`CatalogIdentityError::NoProvenAuthenticationPath`] rather than a verdict on
+//! the credential. It is deliberately not weakened into a comparison against the
+//! stored verifier: that would prove the catalog holds a hash derived from the
+//! Secret, which is already established by [`install_login_credential`], and
+//! would not prove that the identity can log in.
 
 use std::path::Path;
 use std::time::Duration;
@@ -1776,6 +1777,7 @@ SELECT settings.setconfig \
     /// that already carries pgshard roles, and roles outlive the database that
     /// scoped their grants.
     async fn reset_catalog() -> Client {
+        require_the_fixture_starts_from_the_product_policy();
         let admin = superuser("postgres").await;
         admin
             .batch_execute("DROP DATABASE IF EXISTS shardschema WITH (FORCE)")
@@ -2341,26 +2343,47 @@ SELECT settings.setconfig \
         .await
     }
 
-    /// The policy the compatibility bootstrap shell reloads onto its private
-    /// postmaster for exactly the two credential probes, and nothing else. It
-    /// is neither the pre-serving policy nor the serving policy.
-    async fn install_check_time_policy(admin: &Client) {
+    /// Puts the agent's own policy in front of every test below, taken from the
+    /// product rather than copied into the fixture.
+    ///
+    /// A copy is what let a policy that refuses every catalog identity ship as
+    /// green: the fixture ran `local all all trust`, which admits everything, so
+    /// no proof below was ever put in front of a record that could refuse it.
+    /// Reading [`hba_policy_contents`] instead means a policy that stops
+    /// admitting an identity cannot leave these tests passing.
+    async fn install_product_policy(admin: &Client) {
+        let policy =
+            crate::postgres::hba_policy_contents(crate::postgres::PostgresRuntimeRole::Quarantine);
         install_policy(
             admin,
-            "local all postgres trust\n\
-             local shardschema pgshard_pooler_catalog scram-sha-256\n\
-             local shardschema pgshard_orchestrator_catalog scram-sha-256\n\
-             local all all reject\n\
-             host all all 0.0.0.0/0 reject\n\
-             host all all ::0/0 reject\n",
+            std::str::from_utf8(policy).expect("the installed policy is text"),
         )
         .await;
     }
 
-    /// Proving a credential needs an HBA record that admits the identity, and
-    /// the agent's pre-serving policy carries none. This is the whole reason
-    /// the check cannot yet succeed before serving activation, so it is stated
-    /// as an executable fact rather than a comment.
+    /// The fixture has to start from the policy the product installs, or every
+    /// live test below is answered by a server more permissive than any the
+    /// product deploys.
+    fn require_the_fixture_starts_from_the_product_policy() {
+        let hba_file = std::env::var_os("PGSHARD_AGENT_TEST_HBA_FILE")
+            .map(std::path::PathBuf::from)
+            .expect("PGSHARD_AGENT_TEST_HBA_FILE is required");
+        assert_eq!(
+            std::fs::read(&hba_file).expect("read the fixture policy"),
+            crate::postgres::hba_policy_contents(crate::postgres::PostgresRuntimeRole::Quarantine),
+            "the live fixture seeds a policy the agent does not install, so nothing below \
+             observes the policy production runs"
+        );
+    }
+
+    /// A policy naming no record for an identity has to be reported as an absent
+    /// path, and a path that admits without consulting the credential has to be
+    /// named as one rather than mistaken for a proof.
+    ///
+    /// Every policy here is a deliberate control rather than a copy of one the
+    /// product installs: what they establish is how the classification reads an
+    /// HBA decision, and they must keep establishing it however the product's
+    /// own policies change.
     ///
     /// Requires `PGSHARD_AGENT_TEST_HBA_FILE` to name a reloadable HBA file the
     /// running server was started with. The test leaves its own policy in
@@ -2373,8 +2396,11 @@ SELECT settings.setconfig \
         stage_and_install(&mut catalog).await;
         let admin = superuser("postgres").await;
 
-        // The agent's own pre-serving policy, verbatim. It admits the local
-        // publisher session and nothing else.
+        // A policy that names the publisher session and nothing else. This is a
+        // deliberate control rather than a copy of any policy the product
+        // installs: what it establishes is that an absent record is classified
+        // as an absent path, and it must keep doing so however the product's own
+        // policies change.
         install_policy(
             &admin,
             "local postgres postgres peer\nlocal all all reject\nlocal replication all reject\n",
@@ -2391,7 +2417,8 @@ SELECT settings.setconfig \
                     refused,
                     Err(CatalogIdentityError::NoProvenAuthenticationPath)
                 ),
-                "{} was not refused for want of a record under the pre-serving policy: {refused:?}",
+                "{} was not refused for want of a record under a policy that names none: \
+                 {refused:?}",
                 login.role()
             );
         }
@@ -2433,8 +2460,28 @@ SELECT settings.setconfig \
             ),
             "a cleartext password record was accepted as the pinned method: {cleartext:?}"
         );
+    }
 
-        install_check_time_policy(&admin).await;
+    /// The policy the agent installs has to admit both catalog identities on the
+    /// catalog database, and nothing else it did not name.
+    ///
+    /// Taken from [`hba_policy_contents`] rather than copied into the fixture,
+    /// so a policy that stops admitting an identity cannot leave this passing.
+    /// This is the half a fixture running `trust` could never observe either
+    /// way: `trust` admits every identity on every database without consulting a
+    /// credential, so neither the admissions nor the refusals below were being
+    /// decided by an HBA record at all.
+    ///
+    /// Requires `PGSHARD_AGENT_TEST_HBA_FILE` to name a reloadable HBA file the
+    /// running server was started with.
+    #[tokio::test]
+    #[ignore = "requires a PostgreSQL 18 server with a writable, reloadable HBA file"]
+    async fn live_postgres18_the_installed_policy_admits_both_catalog_identities() {
+        let socket_dir = socket_dir();
+        let mut catalog = reset_catalog().await;
+        stage_and_install(&mut catalog).await;
+        install_product_policy(&superuser("postgres").await).await;
+
         prove_catalog_credential(
             &socket_dir,
             CatalogLogin::PoolerCatalog,
@@ -2463,6 +2510,42 @@ SELECT settings.setconfig \
             matches!(wrong, Err(CatalogIdentityError::CredentialRejected)),
             "a wrong credential on an admitted path reported {wrong:?}"
         );
+
+        // The records admit one role to one database each. The identity the
+        // policy names nowhere stays out, and so does an identity it names
+        // reaching a database it was not named on.
+        let unnamed = prove_catalog_credential(
+            &socket_dir,
+            CatalogLogin::Replication,
+            replication_password().as_bytes(),
+        )
+        .await;
+        assert!(
+            matches!(
+                unnamed,
+                Err(CatalogIdentityError::NotASessionIdentity { .. })
+            ),
+            "the replication identity is not a SQL session identity and must be refused \
+             before it reaches a record: {unnamed:?}"
+        );
+        let mut wrong_database = Config::new();
+        wrong_database
+            .host_path(&socket_dir)
+            .port(5432)
+            .user(CatalogLogin::PoolerCatalog.role())
+            .dbname(GENERATION_DATABASE)
+            .password(catalog_password().as_bytes())
+            .connect_timeout(CONNECT_TIMEOUT)
+            .application_name("pgshard-catalog-identity-wrong-database");
+        let Err(refused) = wrong_database.connect(NoTls).await else {
+            panic!("the pooler identity reached a database the policy never named it on");
+        };
+        assert_eq!(
+            classify_sql_state(refused.code()),
+            ConnectVerdict::NoProvenPath,
+            "the pooler identity on the generation database was refused for something other \
+             than having no record: {refused}"
+        );
     }
 
     /// A session that authenticates is not yet a proof. The predicate has to
@@ -2471,15 +2554,15 @@ SELECT settings.setconfig \
     /// defaults a production client will inherit.
     ///
     /// Requires `PGSHARD_AGENT_TEST_HBA_FILE` to name a reloadable HBA file the
-    /// running server was started with; the check-time policy is what makes the
-    /// identities reachable at all.
+    /// running server was started with; the policy the agent installs is what
+    /// makes the identities reachable at all.
     #[tokio::test]
     #[ignore = "requires a PostgreSQL 18 server with a writable, reloadable HBA file"]
     async fn live_postgres18_authenticating_is_not_the_same_as_a_canonical_session() {
         let socket_dir = socket_dir();
         let mut catalog = reset_catalog().await;
         stage_and_install(&mut catalog).await;
-        install_check_time_policy(&superuser("postgres").await).await;
+        install_product_policy(&superuser("postgres").await).await;
         prove_catalog_credential(
             &socket_dir,
             CatalogLogin::PoolerCatalog,

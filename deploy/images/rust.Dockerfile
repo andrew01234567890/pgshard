@@ -7,6 +7,11 @@ WORKDIR /workspace
 COPY Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml ./
 COPY crates ./crates
 COPY contracts ./contracts
+# The agent's test target includes these to assert the baked policies are the
+# policies it installs, and the fence test binary below is built from that
+# target, so they are a compile input here rather than only image content. The
+# runtime binaries do not carry them: the agent reads its policy from disk.
+COPY deploy/images/quarantine.pg_hba.conf deploy/images/replication-bootstrap-primary.pg_hba.conf ./deploy/images/
 
 FROM build-base AS build
 

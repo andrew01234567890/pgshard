@@ -2033,6 +2033,189 @@ pub(crate) mod tests {
         assert!(!CATALOG_RUNTIME_IDENTITY_OBSERVATION.contains("FOR UPDATE"));
     }
 
+    /// Gives the catalog database to a test that opens a session on it.
+    ///
+    /// Created here rather than left to whichever test ran first: a test whose
+    /// verdict depends on another having run is a test that reports the order
+    /// it was invoked in. `CREATE DATABASE` cannot run inside a transaction or
+    /// a `DO` block, so the existence check is a separate statement.
+    async fn ensure_catalog_database(admin: &TestClient) {
+        let present: i64 = admin
+            .client()
+            .query_one(
+                "SELECT pg_catalog.count(*) FROM pg_catalog.pg_database \
+                  WHERE datname OPERATOR(pg_catalog.=) $1",
+                &[&CATALOG_DATABASE],
+            )
+            .await
+            .expect("read whether the catalog database exists")
+            .get(0);
+        if present == 0 {
+            admin
+                .client()
+                .batch_execute(&format!("CREATE DATABASE {CATALOG_DATABASE}"))
+                .await
+                .expect("create the catalog database");
+        }
+    }
+
+    /// Every session the materializer opens has to survive the policy the agent
+    /// itself installs, and only the server can answer whether it does.
+    ///
+    /// This is the check whose absence let a policy that refuses catalog
+    /// materialization outright ship as green: the live fixture ran a stock
+    /// `trust` policy, which admits everything, so no session the materializer
+    /// opens was ever put in front of a record that could refuse it. The policy
+    /// installed here is not a copy — it is the array the product writes to
+    /// disk, read back through [`hba_policy_contents`], so a policy that stops
+    /// admitting the writer cannot leave this test passing.
+    ///
+    /// Requires `PGSHARD_AGENT_TEST_HBA_FILE` to name a reloadable HBA file the
+    /// running server was started with. The test leaves the product policy in
+    /// force.
+    #[tokio::test]
+    #[ignore = "requires a PostgreSQL 18 server with a writable, reloadable HBA file"]
+    async fn live_postgres18_the_installed_policy_admits_every_materializer_session() {
+        use crate::postgres::{PostgresRuntimeRole, hba_policy_contents};
+
+        let socket_dir = std::env::var_os("PGSHARD_AGENT_TEST_SOCKET_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("PGSHARD_AGENT_TEST_SOCKET_DIR is required");
+        let hba_file = std::env::var_os("PGSHARD_AGENT_TEST_HBA_FILE")
+            .map(std::path::PathBuf::from)
+            .expect("PGSHARD_AGENT_TEST_HBA_FILE is required");
+
+        // Opened on the generation database, which every policy has always
+        // admitted. A session on the catalog database is the thing under test,
+        // so taking one here would report the defect as a broken fixture.
+        let admin = connect_to(&socket_dir, GENERATION_DATABASE)
+            .await
+            .expect("connect to install the policy under test");
+        ensure_catalog_database(&admin).await;
+
+        for role in [
+            PostgresRuntimeRole::Quarantine,
+            PostgresRuntimeRole::ReplicationStandby,
+            PostgresRuntimeRole::ServingPrimary,
+            PostgresRuntimeRole::ReplicationBootstrapPrimary,
+        ] {
+            let policy = hba_policy_contents(role);
+            std::fs::write(&hba_file, policy).expect("install the product policy");
+            admin
+                .client()
+                .batch_execute("SELECT pg_catalog.pg_reload_conf()")
+                .await
+                .expect("reload the product policy");
+            assert_eq!(
+                std::fs::read(&hba_file).expect("read the policy in force"),
+                policy,
+                "the fixture is running a policy the product does not install"
+            );
+
+            // The three sessions the materializer opens, each on the database it
+            // opens it on. The writer's is the one the deny-all refused.
+            CatalogWriterSession::connect(&socket_dir)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{role:?} refuses the catalog writer session: {error:?}")
+                });
+            connect_to(&socket_dir, CATALOG_DATABASE)
+                .await
+                .unwrap_or_else(|error| panic!("{role:?} refuses the catalog database: {error:?}"));
+            connect_to(&socket_dir, GENERATION_DATABASE)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{role:?} refuses the generation database: {error:?}")
+                });
+        }
+    }
+
+    /// The policy is only worth installing if it still refuses what it always
+    /// refused. A widened record is caught here rather than in production.
+    ///
+    /// Requires `PGSHARD_AGENT_TEST_HBA_FILE` to name a reloadable HBA file the
+    /// running server was started with.
+    #[tokio::test]
+    #[ignore = "requires a PostgreSQL 18 server with a writable, reloadable HBA file"]
+    async fn live_postgres18_the_installed_policy_still_refuses_an_identity_it_never_named() {
+        use crate::postgres::{PostgresRuntimeRole, hba_policy_contents};
+
+        let socket_dir = std::env::var_os("PGSHARD_AGENT_TEST_SOCKET_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("PGSHARD_AGENT_TEST_SOCKET_DIR is required");
+        let hba_file = std::env::var_os("PGSHARD_AGENT_TEST_HBA_FILE")
+            .map(std::path::PathBuf::from)
+            .expect("PGSHARD_AGENT_TEST_HBA_FILE is required");
+
+        let admin = connect_to(&socket_dir, GENERATION_DATABASE)
+            .await
+            .expect("connect to install the policy under test");
+        admin
+            .client()
+            .batch_execute(
+                "DROP ROLE IF EXISTS pgshard_generation_unnamed_identity; \
+                 CREATE ROLE pgshard_generation_unnamed_identity LOGIN PASSWORD 'unnamed'",
+            )
+            .await
+            .expect("create a login the policy names nowhere");
+        std::fs::write(
+            &hba_file,
+            hba_policy_contents(PostgresRuntimeRole::Quarantine),
+        )
+        .expect("install the product policy");
+        admin
+            .client()
+            .batch_execute("SELECT pg_catalog.pg_reload_conf()")
+            .await
+            .expect("reload the product policy");
+
+        for (role, database, why) in [
+            (
+                "pgshard_generation_unnamed_identity",
+                CATALOG_DATABASE,
+                "a login the policy names nowhere reached the catalog database",
+            ),
+            (
+                "pgshard_generation_unnamed_identity",
+                GENERATION_DATABASE,
+                "a login the policy names nowhere reached the generation database",
+            ),
+            // The catalog writer's own role, on a database the policy never
+            // named. The peer record admits it to exactly two databases, and
+            // this is what tells that apart from a record widened to all of
+            // them: the runtime identity does satisfy peer here, so only the
+            // database field can refuse it.
+            (
+                "postgres",
+                "template1",
+                "the catalog writer reached a database the policy never named",
+            ),
+        ] {
+            let mut config = Config::new();
+            config
+                .host_path(&socket_dir)
+                .port(5432)
+                .user(role)
+                .dbname(database)
+                .password("unnamed")
+                .application_name("pgshard-agent-test-unnamed-identity");
+            let Err(error) = config.connect(NoTls).await else {
+                panic!("{why}");
+            };
+            assert_eq!(
+                error.code(),
+                Some(&tokio_postgres::error::SqlState::INVALID_AUTHORIZATION_SPECIFICATION),
+                "{why} -- refused, but for some reason other than having no record: {error}"
+            );
+        }
+
+        admin
+            .client()
+            .batch_execute("DROP ROLE pgshard_generation_unnamed_identity")
+            .await
+            .expect("drop the unnamed login");
+    }
+
     /// The fence's whole purpose is cross-database ordering, and none of it can
     /// be established without a running server: that a row-locking SELECT is
     /// rejected in a read-only transaction, that an idle holder is terminated
