@@ -38,7 +38,7 @@ const TARGET_POD_TEMPLATE_DOMAIN: &[u8] = b"pgshard-catalog-target-pod-template-
 const CATALOG_SERVING_HBA_POLICY_VERSION: &str = "pgshard.catalog-serving-hba.v1";
 #[cfg(test)]
 const CATALOG_SERVING_HBA_POLICY: &str = concat!(
-    "local postgres postgres peer\n",
+    "local postgres,shardschema postgres peer\n",
     "local all all reject\n",
     "local replication all reject\n",
     "host replication pgshard_replication 0.0.0.0/0 scram-sha-256\n",
@@ -51,7 +51,7 @@ const CATALOG_SERVING_HBA_POLICY: &str = concat!(
     "host all all ::0/0 reject\n",
 );
 const CATALOG_SERVING_HBA_POLICY_SHA256: &str =
-    "6753a3516fef3a8a459042ca474935f5b306d1b1cf591018f0698e585027af17";
+    "3ca128e7e7414d0d588e137a54443079d054a4d039fb42c2fa2b0be22b9df410";
 
 const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
 const INSTANCE_LABEL: &str = "app.kubernetes.io/instance";
@@ -3047,6 +3047,128 @@ mod tests {
             validate_candidate(&candidate, &plan, member, &checkpoint, &status),
             Err(CatalogCandidateError::InvalidCandidate)
         ));
+    }
+
+    /// The two fields a `local` record is matched on, for one ordinary backend.
+    struct LocalSession<'a> {
+        database: &'a str,
+        role: &'a str,
+    }
+
+    /// Whether a database field admits `database`, per `check_db` in
+    /// `src/backend/libpq/hba.c` around line 993.
+    ///
+    /// `token_matches` there is `strcmp`, so every token that is not one of the
+    /// keywords is an exact database name: `postgres` in this field is a
+    /// literal, not a keyword for the connecting role's own database.
+    /// `replication` matches a physical walsender and nothing else, and no
+    /// session asked about here is one.
+    fn database_admits(field: &str, database: &str) -> bool {
+        field.split(',').any(|token| match token {
+            "all" => true,
+            "replication" => false,
+            _ => {
+                assert_modelled(token);
+                token == database
+            }
+        })
+    }
+
+    /// Whether a user field admits `role`, per `check_role` in the same file
+    /// around line 954. `all` is a keyword there too and everything else this
+    /// policy uses is an exact role name.
+    fn role_admits(field: &str, role: &str) -> bool {
+        field.split(',').any(|token| {
+            if token == "all" {
+                return true;
+            }
+            assert_modelled(token);
+            token == role
+        })
+    }
+
+    /// Fails rather than reading an unreproduced token as a non-match, so a
+    /// record this matcher cannot judge can never be silently skipped.
+    fn assert_modelled(token: &str) {
+        assert!(
+            !token.starts_with('/')
+                && !token.starts_with('+')
+                && !matches!(token, "sameuser" | "samerole" | "samegroup"),
+            "the serving policy uses the HBA token {token:?}, whose meaning this test does not \
+             reproduce"
+        );
+    }
+
+    /// The authentication method of the first `local` record that matches, or
+    /// `None` when the policy holds no `local` record for the session.
+    ///
+    /// `check_hba` in `src/backend/libpq/hba.c` walks the parsed lines in file
+    /// order and stops at the first record whose connection type, database and
+    /// role all match, so a later record cannot rescue a session an earlier one
+    /// rejected. The `replication` database keyword matches only a physical
+    /// walsender (`check_db` around line 993), which no session here is.
+    fn local_record_method<'a>(policy: &'a str, session: &LocalSession<'_>) -> Option<&'a str> {
+        policy.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            if fields.next()? != "local" {
+                return None;
+            }
+            let database = fields.next().expect("a local record names a database");
+            let role = fields.next().expect("a local record names a role");
+            let method = fields.next().expect("a local record names a method");
+            (database_admits(database, session.database) && role_admits(role, session.role))
+                .then_some(method)
+        })
+    }
+
+    /// The catalog materializer's own sessions, which the runtime binding
+    /// re-establishes for every capability it publishes — including capabilities
+    /// published after this policy is in effect.
+    #[test]
+    fn the_serving_policy_admits_the_local_catalog_sessions() {
+        assert_eq!(
+            content_digest(CATALOG_SERVING_HBA_POLICY.as_bytes()),
+            CATALOG_SERVING_HBA_POLICY_SHA256,
+            "the policy under test is not the one the materialization bundle is pinned to"
+        );
+
+        for database in ["postgres", "shardschema"] {
+            assert_eq!(
+                local_record_method(
+                    CATALOG_SERVING_HBA_POLICY,
+                    &LocalSession {
+                        database,
+                        role: "postgres",
+                    }
+                ),
+                Some("peer"),
+                "the serving policy refuses the local {database} session the agent opens"
+            );
+        }
+    }
+
+    #[test]
+    fn the_serving_policy_refuses_every_other_local_session() {
+        assert_eq!(
+            content_digest(CATALOG_SERVING_HBA_POLICY.as_bytes()),
+            CATALOG_SERVING_HBA_POLICY_SHA256,
+            "the policy under test is not the one the materialization bundle is pinned to"
+        );
+
+        for (database, role) in [
+            ("shardschema", "pgshard_pooler_catalog"),
+            ("shardschema", "pgshard_orchestrator_catalog"),
+            ("postgres", "pgshard_pooler_catalog"),
+            ("postgres", "pgshard_replication"),
+            ("template1", "postgres"),
+            ("shardschema_shadow", "postgres"),
+        ] {
+            assert_eq!(
+                local_record_method(CATALOG_SERVING_HBA_POLICY, &LocalSession { database, role }),
+                Some("reject"),
+                "the serving policy admits {role} to {database} over the local socket"
+            );
+        }
     }
 
     #[test]

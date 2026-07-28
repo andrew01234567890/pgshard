@@ -81,7 +81,13 @@ const (
 	// postmaster consumes it; future materialization must publish these exact
 	// replication-preserving, catalog-only serving rules after revalidation.
 	catalogServingHBAPolicyVersion = "pgshard.catalog-serving-hba.v1"
-	catalogServingHBAPolicy        = "local postgres postgres peer\n" +
+	// The peer record names both databases because check_db in
+	// src/backend/libpq/hba.c compares the database field with strcmp and
+	// treats postgres there as a literal, so a single-database record never
+	// admits the shardschema sessions the agent's catalog materializer opens
+	// on this socket for every runtime capability, including the ones the
+	// runtime binding publishes after this policy is in effect.
+	catalogServingHBAPolicy = "local postgres,shardschema postgres peer\n" +
 		"local all all reject\n" +
 		"local replication all reject\n" +
 		"host replication pgshard_replication 0.0.0.0/0 scram-sha-256\n" +
