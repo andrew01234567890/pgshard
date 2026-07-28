@@ -19,12 +19,47 @@
 //!
 //! The materialization stage drives this executor from one exact
 //! writable-runtime capability; nothing else may apply a program.
+//!
+//! # There has to be a catalog to reconcile
+//!
+//! This executor reconciles an existing catalog. It has no authority to create
+//! one, so before it applies anything it requires one to be there, and refuses
+//! by name otherwise: [`PostgresGenerationError::CatalogDatabaseAbsent`] when
+//! the database itself is gone, and
+//! [`PostgresGenerationError::CatalogNotInstalled`] when the database is there
+//! and carries no catalog. Both end the attempt, so a crash-replay finds a state
+//! it can classify rather than one that reads as "unknown".
+//!
+//! Both checks are read-only and both run before the first statement, which is
+//! the part that matters: the executor commits the migration and the inventory
+//! in their own fenced transactions *before* the topology preflight runs, so a
+//! check placed after the program would already have written to a database it
+//! was about to refuse.
+//!
+//! # What the check does not establish
+//!
+//! It does not establish that the catalog belongs to this cluster, and it must
+//! not be read as though it did. Nothing in `pgshard_catalog` identifies the
+//! cluster it was installed for: `cluster_configuration.cluster_id` is
+//! `gen_random_uuid()` minted locally when the migration first ran
+//! (`0001_shardschema.sql:2194`, seeded at `:3035` by an insert that names only
+//! `singleton`) and then frozen by the `cluster_configuration_immutable` trigger
+//! (`:6996`), so it is unrelated to the Kubernetes cluster UID and can never be
+//! back-filled from it. A catalog restored into a different cluster is, from the
+//! database's own contents, indistinguishable from the original.
+//!
+//! The evidence that *can* tell those apart is not in the database: it is the
+//! `PGDATA` incarnation, which
+//! [`crate::genesis_authority`] reads from `pg_controldata` and keys its
+//! at-most-once record by. Until that module is wired, this check answers the
+//! narrower question it can answer honestly — is there a catalog here at all —
+//! and the wider one stays open rather than being answered wrongly.
 use std::path::Path;
 use std::time::Duration;
 
 use crate::catalog_materialization_program::CatalogMaterializationProgram;
 use crate::postgres_generation::{
-    CatalogWriterSession, GenerationFence, OBSERVE_STANDARD_CONFORMING_STRINGS,
+    CATALOG_DATABASE, CatalogWriterSession, GenerationFence, OBSERVE_STANDARD_CONFORMING_STRINGS,
     PostgresGenerationError,
 };
 use crate::writable::DurableWritableGeneration;
@@ -93,6 +128,34 @@ const SHARD_LINEAGE_IS_COMPLETE: &str = "\
                 WHERE active_lineage.shard_id = shards.shard_id \
                   AND active_lineage.state = 'active'))";
 
+/// Counts the logical databases the verified catalog actually holds.
+///
+/// Read under the same row lock as every other predicate, so it describes the
+/// same observation the verification passed on. `ONLY` for the same reason the
+/// preflight uses it: a partition or a child table is not the declared
+/// topology.
+const LOGICAL_DATABASE_COUNT: &str = "\
+    SELECT pg_catalog.count(*) FROM ONLY pgshard_catalog.logical_databases \
+     WHERE state <> 'retired'";
+
+/// What the verified catalog's declared topology actually turned out to be.
+///
+/// A genesis that declares no logical database is a legitimate, finite state:
+/// the topology preflight accepts an empty catalog against an empty declared
+/// topology, so materialization succeeds and there is nothing to serve. It is
+/// reported as its own case rather than as a plain success so a later stage
+/// cannot read "the catalog materialized" as "there are databases behind it".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MaterializedTopology {
+    /// The catalog holds no non-retired logical database at all.
+    Empty,
+    /// The catalog holds the declared logical databases.
+    Populated {
+        /// How many non-retired logical databases were observed.
+        logical_databases: u32,
+    },
+}
+
 /// The applying transaction's own framing. The program's fragments carry none:
 /// that is what the input compiler enforces, and it is why the executor can put
 /// its authority check immediately before `COMMIT`.
@@ -123,7 +186,7 @@ pub(crate) async fn materialize_and_verify<F>(
     allow_empty_database_topology: bool,
     expected_generation: &DurableWritableGeneration,
     authority_exact: &F,
-) -> Result<(), PostgresGenerationError>
+) -> Result<MaterializedTopology, PostgresGenerationError>
 where
     F: Fn() -> bool,
 {
@@ -156,7 +219,7 @@ where
             Err(error) => Err(error),
         };
         match outcome {
-            Ok(()) => return Ok(()),
+            Ok(topology) => return Ok(topology),
             // Retryable only while this attempt is still the authoritative
             // one: an ambiguous commit, a lost fence, or a catalog that does
             // not yet match are all resolved by running the idempotent program
@@ -205,7 +268,7 @@ pub(crate) async fn materialize<F>(
 where
     F: Fn() -> bool,
 {
-    let mut writer = CatalogWriterSession::connect(socket_dir).await?;
+    let mut writer = open_catalog(socket_dir, allow_empty_database_topology).await?;
     let shard_count = shard_count.to_string();
     let allow_empty = if allow_empty_database_topology {
         "true"
@@ -270,32 +333,133 @@ pub(crate) async fn verify_materialized<F>(
     shard_count: u32,
     expected_generation: &DurableWritableGeneration,
     authority_exact: &F,
-) -> Result<(), PostgresGenerationError>
+) -> Result<MaterializedTopology, PostgresGenerationError>
 where
     F: Fn() -> bool,
 {
     if !authority_exact() {
         return Err(PostgresGenerationError::AuthorityChanged);
     }
-    let mut writer = CatalogWriterSession::connect(socket_dir).await?;
+    // Verification never installs anything, so it always requires a catalog.
+    let mut writer = open_catalog(socket_dir, false).await?;
     let fence = GenerationFence::hold(socket_dir, expected_generation).await?;
     let outcome = read_back(&mut writer, program, shard_count).await;
     let released = fence.release().await;
-    outcome?;
+    let topology = outcome?;
     released?;
     // The catalog matched, but only an attempt that still holds its authority
     // may claim it materialized this state.
     if !authority_exact() {
         return Err(PostgresGenerationError::AuthorityChanged);
     }
-    Ok(())
+    Ok(topology)
+}
+
+/// Whether the migration's own relations are installed here.
+///
+/// Structure only, and deliberately no row state. Row state is what
+/// verification owns: `LOCK_CLUSTER_STATE` and the predicates beside it decide
+/// whether a catalog that exists holds what it should, and they classify a
+/// catalog that does not as [`PostgresGenerationError::CatalogNotMaterialized`],
+/// which is reconcilable. A gate that also read rows would re-answer those
+/// questions one step earlier and turn a reconcilable catalog into a terminal
+/// "not installed" — narrowing recovery rather than widening safety.
+///
+/// Kept to `pg_catalog` lookups because a statement that referenced
+/// `pgshard_catalog` relations directly would fail to parse — not answer false —
+/// when the schema is absent: `PostgreSQL` resolves every relation in a
+/// statement before executing any of it. `to_regclass` returns null for a
+/// missing relation, and for a missing schema, without raising.
+///
+/// This is what a bare namespace does not satisfy. The migration adopts a
+/// pre-existing `pgshard_catalog` namespace rather than refusing it — `CREATE
+/// SCHEMA IF NOT EXISTS` at `0001_shardschema.sql:1853`, under the owner
+/// takeover above it — so a namespace created by hand, or one an interrupted
+/// restore left behind, passes a "does the schema exist" test and is then
+/// written to. It does not carry these relations.
+///
+/// The limit, stated rather than glossed: relations can be forged by anyone who
+/// can already write to this database, so this establishes that a catalog was
+/// installed here, not that nobody tampered with it, and not whose it is.
+const CATALOG_RELATIONS_INSTALLED: &str = "\
+    SELECT pg_catalog.to_regclass('pgshard_catalog.cluster_configuration') IS NOT NULL \
+       AND pg_catalog.to_regclass('pgshard_catalog.cluster_state') IS NOT NULL \
+       AND pg_catalog.to_regclass('pgshard_catalog.shards') IS NOT NULL \
+       AND pg_catalog.to_regclass('pgshard_catalog.logical_databases') IS NOT NULL \
+       AND pg_catalog.to_regclass('pgshard_catalog.shard_restore_incarnations') IS NOT NULL";
+
+/// Opens the catalog writer, and refuses before any mutation is possible.
+///
+/// `InitPostgres` in `src/backend/utils/init/postinit.c` raises
+/// `ERRCODE_UNDEFINED_DATABASE` when the named database has no `pg_database`
+/// row, so 3D000 on connect is the server saying the catalog database does not
+/// exist rather than a transport failure. Anything else stays the transport
+/// failure it is.
+///
+/// # What `may_install` is, and what it is not
+///
+/// It is `allow_empty_database_topology`: the caller's existing declaration
+/// that this attempt is a first materialization rather than a reconcile. It is
+/// caller-supplied and it is **not** evidence — it proves nothing, and this
+/// module makes no claim that it does. What makes the refusal below real is
+/// that the only production producer of that value,
+/// `catalog_activation_static_inputs`, sets it to a constant `false`, so in
+/// production this check is unconditional. A caller passing `true` has said it
+/// intends to install, and the executor takes it at its word; the authority
+/// that ought to stand behind such a claim is [`crate::genesis_authority`],
+/// which is written and not yet wired.
+///
+/// # Why the check has to be here and not after the program
+///
+/// The flag previously reached only the topology preflight, which runs in the
+/// executor's *third* transaction. The migration and the inventory commit in
+/// the two before it, so a reconcile against a database with no catalog
+/// installed the whole schema and the whole inventory and only then found out
+/// it should not have. Closing the flag over the apply rather than over one
+/// fragment of it is the fix, and it is independent of the program's contents:
+/// a declared topology that is itself empty satisfies the preflight against an
+/// empty catalog whatever the flag says, so the program can never be relied on
+/// to refuse this.
+async fn open_catalog(
+    socket_dir: &Path,
+    may_install: bool,
+) -> Result<CatalogWriterSession, PostgresGenerationError> {
+    let mut writer = match CatalogWriterSession::connect(socket_dir).await {
+        Ok(writer) => writer,
+        Err(PostgresGenerationError::Database(error))
+            if error.code() == Some(&tokio_postgres::error::SqlState::UNDEFINED_DATABASE) =>
+        {
+            tracing::error!(
+                database = CATALOG_DATABASE,
+                "the catalog database is absent; this executor reconciles a catalog and cannot create one"
+            );
+            return Err(PostgresGenerationError::CatalogDatabaseAbsent);
+        }
+        Err(error) => return Err(error),
+    };
+    if may_install {
+        return Ok(writer);
+    }
+    let installed: bool = writer
+        .client()
+        .query_one(CATALOG_RELATIONS_INSTALLED, &[])
+        .await?
+        .try_get(0)?;
+    if !installed {
+        tracing::error!(
+            database = CATALOG_DATABASE,
+            "the catalog database carries no installed catalog; this executor reconciles a catalog and cannot install one"
+        );
+        return Err(PostgresGenerationError::CatalogNotInstalled);
+    }
+    Ok(writer)
 }
 
 async fn read_back(
     writer: &mut CatalogWriterSession,
     program: &CatalogMaterializationProgram,
     shard_count: u32,
-) -> Result<(), PostgresGenerationError> {
+) -> Result<MaterializedTopology, PostgresGenerationError> {
     // Bound as an integer: the comparison is numeric, unlike the GUC the
     // fragments read, which is text by definition.
     let shard_count = i64::from(shard_count);
@@ -336,9 +500,41 @@ async fn read_back(
         .execute(SET_ALLOW_EMPTY_DATABASE_TOPOLOGY, &[&"false"])
         .await?;
     transaction.batch_execute(&program.preflight).await?;
+    // Taken after the guard, so the count describes a topology that has already
+    // been proven to equal the declared one. Zero is therefore "the declared
+    // topology is empty", not "the catalog has not been populated yet".
+    let logical_databases: i64 = transaction
+        .query_one(LOGICAL_DATABASE_COUNT, &[])
+        .await?
+        .try_get(0)?;
+    let topology = classify_topology(logical_databases)?;
     // Read-only: nothing to commit.
     transaction.rollback().await?;
-    Ok(())
+    Ok(topology)
+}
+
+/// Names the topology a verified count describes.
+///
+/// Zero is a state and not a failure, because the guard above has already
+/// proven the catalog equals the declared topology: a count of zero therefore
+/// means the declaration itself is empty, never that the catalog has not been
+/// populated yet.
+fn classify_topology(
+    logical_databases: i64,
+) -> Result<MaterializedTopology, PostgresGenerationError> {
+    match u32::try_from(logical_databases) {
+        Ok(0) => Ok(MaterializedTopology::Empty),
+        Ok(logical_databases) => Ok(MaterializedTopology::Populated { logical_databases }),
+        // A negative or out-of-range count is not a topology this can describe,
+        // and describing it wrongly is worse than refusing.
+        Err(_) => {
+            tracing::warn!(
+                logical_databases,
+                "catalog verification: the logical-database count is not a topology"
+            );
+            Err(PostgresGenerationError::CatalogNotMaterialized)
+        }
+    }
 }
 
 /// Runs one verification predicate, naming it if the catalog disagrees so the
@@ -502,6 +698,14 @@ mod tests {
     /// the sealed shard count has to match or genesis references a cell the
     /// inventory never created.
     const FIXTURE_SHARDS: u32 = 4;
+
+    /// The value production compiles for `allow_empty_database_topology`, and
+    /// therefore the only one a reconcile ever runs under. Named rather than
+    /// spelled `false` at the call site: `cargo fmt` split one of these across
+    /// lines between an edit and its verification, and a bare boolean that
+    /// silently reverted to `true` left the gate untested while the test still
+    /// passed.
+    const RECONCILE: bool = false;
 
     /// Drives the real compiled program against a live server and revokes
     /// authority in the window before the migration's commit checks.
@@ -701,13 +905,13 @@ mod tests {
         // Verification must refuse that prefix, and reconciliation must settle it.
         assert!(
             matches!(
-                verify_materialized(&socket_dir, &program, FIXTURE_SHARDS, &generation, &|| true)
+                verify_materialized(&socket_dir, &program, FIXTURE_SHARDS, &generation, &|| true,)
                     .await,
                 Err(PostgresGenerationError::CatalogNotMaterialized)
             ),
             "verification accepted a migration-only prefix"
         );
-        materialize_and_verify(
+        let topology = materialize_and_verify(
             &socket_dir,
             &program,
             FIXTURE_SHARDS,
@@ -717,6 +921,16 @@ mod tests {
         )
         .await
         .expect("reconcile the partially materialized catalog");
+        // The committed golden declares analytics, app and billing, and the
+        // topology reported to the stage has to be the one actually installed
+        // rather than a constant the executor chose.
+        assert_eq!(
+            topology,
+            MaterializedTopology::Populated {
+                logical_databases: 3
+            },
+            "the reported topology is not the golden's declared topology"
+        );
         assert_catalog_is_canonical(&socket_dir).await;
     }
 
@@ -1207,5 +1421,226 @@ mod tests {
         assert!(!APPLY_TRANSACTION_SETTINGS.contains('$'));
         assert!(APPLY_TRANSACTION_SETTINGS.contains("ISOLATION LEVEL READ COMMITTED"));
         assert!(APPLY_TRANSACTION_SETTINGS.contains("SET LOCAL search_path = pg_catalog"));
+    }
+
+    /// A declared topology with no logical database is a state the consumer has
+    /// to handle, not a success it may read as "there are databases".
+    #[test]
+    fn an_empty_declared_topology_is_a_state_and_not_a_failure() {
+        assert_eq!(
+            classify_topology(0).expect("an empty topology verifies"),
+            MaterializedTopology::Empty
+        );
+        for count in [1_i64, 3, 128, i64::from(u32::MAX)] {
+            assert_eq!(
+                classify_topology(count).expect("a populated topology verifies"),
+                MaterializedTopology::Populated {
+                    logical_databases: u32::try_from(count).expect("fixture count"),
+                },
+                "a count of {count} was not carried through"
+            );
+        }
+        // Nothing can produce these, which is exactly why they must not be
+        // silently narrowed into a topology that was never observed.
+        for impossible in [-1_i64, i64::from(u32::MAX) + 1, i64::MIN, i64::MAX] {
+            assert!(
+                matches!(
+                    classify_topology(impossible),
+                    Err(PostgresGenerationError::CatalogNotMaterialized)
+                ),
+                "a count of {impossible} was described as a topology"
+            );
+        }
+    }
+
+    /// The count is only meaningful because it is read under the same lock and
+    /// after the guard that proves the catalog equals the declaration.
+    #[test]
+    fn the_topology_count_reads_the_declared_relation_only() {
+        assert!(LOGICAL_DATABASE_COUNT.contains("FROM ONLY pgshard_catalog.logical_databases"));
+        assert!(LOGICAL_DATABASE_COUNT.contains("state <> 'retired'"));
+        assert!(!LOGICAL_DATABASE_COUNT.contains('$'));
+    }
+
+    /// Every state this executor can be started in that has no catalog to
+    /// reconcile has to refuse, by name, before it writes anything.
+    ///
+    /// Three states, and the third is the one a bare presence test misses. The
+    /// migration adopts a pre-existing `pgshard_catalog` namespace rather than
+    /// refusing it, so a namespace somebody created by hand -- or one an
+    /// interrupted restore left behind -- satisfies "the schema is there" and
+    /// then gets written to.
+    ///
+    /// Driven with `RECONCILE` throughout — the allow-empty setting OFF, which
+    /// is the value production compiles and therefore the only one a reconcile
+    /// ever runs under. With it ON the caller has declared a first
+    /// materialization and the executor takes it at its word, so ON would test
+    /// nothing here.
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL 18 Unix socket"]
+    #[allow(clippy::too_many_lines)]
+    async fn live_postgres18_a_database_with_no_catalog_is_refused_before_it_is_written_to() {
+        use crate::catalog_materialization_program::compile_catalog_materialization_program;
+        use crate::postgres_generation::{GENERATION_DATABASE, publish_writable_generation};
+
+        let socket_dir = std::env::var_os("PGSHARD_AGENT_TEST_SOCKET_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("PGSHARD_AGENT_TEST_SOCKET_DIR is required");
+        // Above every other term on this shared disposable server, and the
+        // harness runs this last: the durable generation only advances, so a
+        // test taking a lower term after this one is refused as a regression.
+        let generation = crate::postgres_generation::tests::generation("cluster-1", "holder-a", 20);
+
+        create_catalog_database(&socket_dir).await;
+        publish_writable_generation(&socket_dir, &generation, &|| true)
+            .await
+            .expect("publish the generation");
+        let program = compile_catalog_materialization_program(
+            include_bytes!("../../pgshard-catalog/migrations/0001_shardschema.sql"),
+            include_bytes!("../../pgshard-catalog/inventory/0001_shard_inventory.sql"),
+            include_bytes!("../../pgshard-catalog/testdata/materialization/genesis.golden.sql"),
+            include_bytes!("../../pgshard-catalog/testdata/materialization/preflight.golden.sql"),
+        )
+        .expect("the real inputs compile");
+
+        let admin = crate::postgres_generation::tests::connect_to(&socket_dir, GENERATION_DATABASE)
+            .await
+            .expect("connect to reshape the catalog database");
+
+        // 1. No database at all.
+        admin
+            .client()
+            .batch_execute(&format!("DROP DATABASE {CATALOG_DATABASE} WITH (FORCE)"))
+            .await
+            .expect("remove the catalog database");
+        assert_every_entry_point_refuses(
+            &socket_dir,
+            &program,
+            &generation,
+            &PostgresGenerationError::CatalogDatabaseAbsent,
+            "a database that does not exist",
+        )
+        .await;
+
+        // 2. The database back, carrying nothing.
+        create_catalog_database(&socket_dir).await;
+        assert_every_entry_point_refuses(
+            &socket_dir,
+            &program,
+            &generation,
+            &PostgresGenerationError::CatalogNotInstalled,
+            "a database with no catalog",
+        )
+        .await;
+
+        // 3. A bare namespace, owned by the bootstrap superuser exactly as the
+        //    migration's own takeover accepts. This is what a presence test
+        //    reads as an installed catalog.
+        let catalog = crate::postgres_generation::tests::connect_to(&socket_dir, CATALOG_DATABASE)
+            .await
+            .expect("connect to plant the namespace");
+        catalog
+            .client()
+            .batch_execute("CREATE SCHEMA pgshard_catalog AUTHORIZATION postgres")
+            .await
+            .expect("plant a bare namespace");
+        drop(catalog);
+        assert_every_entry_point_refuses(
+            &socket_dir,
+            &program,
+            &generation,
+            &PostgresGenerationError::CatalogNotInstalled,
+            "a bare pgshard_catalog namespace",
+        )
+        .await;
+
+        // Left as it was found, so no later test inherits a planted namespace.
+        create_catalog_database(&socket_dir).await;
+    }
+
+    /// Refuses at every entry point, and leaves nothing behind at any of them.
+    ///
+    /// `materialize_and_verify` is included because it is what the stage calls:
+    /// a refusal that only held for the two inner functions would still let the
+    /// driver publish a proof.
+    async fn assert_every_entry_point_refuses(
+        socket_dir: &std::path::Path,
+        program: &CatalogMaterializationProgram,
+        generation: &DurableWritableGeneration,
+        expected: &PostgresGenerationError,
+        state: &str,
+    ) {
+        for (entry, outcome) in [
+            (
+                "materialize",
+                materialize(
+                    socket_dir,
+                    program,
+                    FIXTURE_SHARDS,
+                    RECONCILE,
+                    generation,
+                    &|| true,
+                )
+                .await
+                .map(|()| String::new()),
+            ),
+            (
+                "verify_materialized",
+                verify_materialized(socket_dir, program, FIXTURE_SHARDS, generation, &|| true)
+                    .await
+                    .map(|topology| format!("{topology:?}")),
+            ),
+            (
+                "materialize_and_verify",
+                materialize_and_verify(
+                    socket_dir,
+                    program,
+                    FIXTURE_SHARDS,
+                    RECONCILE,
+                    generation,
+                    &|| true,
+                )
+                .await
+                .map(|topology| format!("{topology:?}")),
+            ),
+        ] {
+            let Err(error) = outcome else {
+                panic!("{entry} materialized {state}");
+            };
+            assert_eq!(
+                std::mem::discriminant(&error),
+                std::mem::discriminant(expected),
+                "{entry} reported {error:?} for {state} instead of {expected:?}"
+            );
+            assert_no_catalog_was_installed(socket_dir, entry, state).await;
+        }
+    }
+
+    /// Proves the refusal happened before anything was committed.
+    ///
+    /// The migration is the first thing the executor applies and it creates
+    /// `cluster_configuration`, so a relation that is still absent is a database
+    /// that was never written to. Skipped when the database itself is gone,
+    /// which is its own proof.
+    async fn assert_no_catalog_was_installed(
+        socket_dir: &std::path::Path,
+        entry: &str,
+        state: &str,
+    ) {
+        let Ok(catalog) =
+            crate::postgres_generation::tests::connect_to(socket_dir, CATALOG_DATABASE).await
+        else {
+            return;
+        };
+        let installed: bool = catalog
+            .client()
+            .query_one(CATALOG_RELATIONS_INSTALLED, &[])
+            .await
+            .expect("observe the catalog relations")
+            .get(0);
+        assert!(
+            !installed,
+            "{entry} committed the migration into {state} before refusing"
+        );
     }
 }
