@@ -595,6 +595,23 @@ bounded catalog_materializer::tests::live_postgres18_bounded_retry_gives_up_on_a
   catalog_materializer::tests::live_postgres18_bounded_retry_gives_up_on_a_catalog_it_cannot_reconcile \
   --nocapture
 
+# There has to be a catalog to reconcile. Only a real server can show that a
+# database with none -- no database, an empty database, or a bare namespace the
+# migration would have adopted -- is refused before the migration is applied.
+# Runs last on this server because it removes and rebuilds the catalog database
+# and takes the highest generation term.
+bounded catalog_materializer::tests::live_postgres18_a_database_with_no_catalog_is_refused_before_it_is_written_to \
+  docker run --rm --user 999:999 \
+    --network "$network" \
+    --volume "$fence_socket:/fence-socket" \
+    --mount "type=bind,src=$test_binary,dst=/test/pgshard-agent-test,readonly" \
+    --env PGSHARD_AGENT_TEST_SOCKET_DIR=/fence-socket \
+    --entrypoint /test/pgshard-agent-test \
+    "$image" \
+  --ignored --exact \
+  catalog_materializer::tests::live_postgres18_a_database_with_no_catalog_is_refused_before_it_is_written_to \
+  --nocapture
+
 docker rm --force "$fence_primary" >/dev/null
 docker volume rm "$fence_socket" "$fence_hba" >/dev/null
 

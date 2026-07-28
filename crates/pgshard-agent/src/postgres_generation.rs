@@ -1479,6 +1479,16 @@ pub enum PostgresGenerationError {
     /// The catalog does not hold the state the program declares.
     #[error("PostgreSQL catalog does not match the declared materialization")]
     CatalogNotMaterialized,
+    /// The catalog database does not exist. This executor reconciles a catalog
+    /// and has no authority to create one, so this is terminal rather than
+    /// repaired: an absent database is equally an unpopulated restore, a
+    /// wrong-cluster mount, and a catalog somebody dropped.
+    #[error("PostgreSQL catalog database is absent")]
+    CatalogDatabaseAbsent,
+    /// The catalog database exists but carries no installed catalog. Refused
+    /// before any mutation, for the same reason.
+    #[error("PostgreSQL catalog database carries no installed catalog")]
+    CatalogNotInstalled,
     /// The fence was lost while a catalog commit was already in flight, so
     /// whether that commit landed is unknown and cannot be resolved from here.
     #[error("PostgreSQL catalog commit is ambiguous: the generation fence was lost in flight")]

@@ -39,7 +39,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::catalog_activation_runtime::{CatalogRuntimeHandoff, ValidatedCatalogRuntime};
-use crate::catalog_materializer::materialize_and_verify;
+use crate::catalog_materializer::{MaterializedTopology, materialize_and_verify};
 use crate::postgres_generation::PostgresGenerationError;
 
 /// Opaque retained receiver for the exact materialized-catalog handoff.
@@ -87,12 +87,26 @@ pub(crate) struct MaterializedCatalog {
     /// asynchronous, so the proof outlives the capability for as long as the
     /// supervisor takes to be scheduled.
     binding: watch::Receiver<Option<Arc<ValidatedCatalogRuntime>>>,
+    /// What the verified catalog's declared topology turned out to be. Carried
+    /// on the proof so a consumer has to decide what an empty one means instead
+    /// of inferring databases from a bare success.
+    topology: MaterializedTopology,
 }
 
 impl MaterializedCatalog {
     /// The runtime capability this proof was established against.
     pub(crate) fn bound(&self) -> &Arc<ValidatedCatalogRuntime> {
         &self.bound
+    }
+
+    /// The declared topology this proof was established over.
+    #[allow(
+        dead_code,
+        reason = "consumed by the serving-activation stage, which introduces its \
+                  empty-topology decision together with the action it gates"
+    )]
+    pub(crate) const fn topology(&self) -> MaterializedTopology {
+        self.topology
     }
 
     /// Whether the capability behind this proof is still the published one.
@@ -111,7 +125,13 @@ impl MaterializedCatalog {
         bound: Arc<ValidatedCatalogRuntime>,
         binding: watch::Receiver<Option<Arc<ValidatedCatalogRuntime>>>,
     ) -> Self {
-        Self { bound, binding }
+        Self {
+            bound,
+            binding,
+            topology: MaterializedTopology::Populated {
+                logical_databases: 1,
+            },
+        }
     }
 }
 
@@ -153,7 +173,7 @@ async fn supervise<M, F>(
     materialize: M,
 ) where
     M: Fn(Arc<ValidatedCatalogRuntime>, watch::Receiver<Option<Arc<ValidatedCatalogRuntime>>>) -> F,
-    F: Future<Output = Result<(), PostgresGenerationError>>,
+    F: Future<Output = Result<MaterializedTopology, PostgresGenerationError>>,
 {
     let _withdraw_on_exit = OutputWithdrawalGuard(output.clone());
     loop {
@@ -171,8 +191,13 @@ async fn supervise<M, F>(
         }
 
         match materialize(Arc::clone(&bound), runtime.clone()).await {
-            Ok(()) => {
-                publish_if_current(&runtime, &output, &bound);
+            Ok(topology) => {
+                if let MaterializedTopology::Empty = topology {
+                    tracing::info!(
+                        "the materialized catalog declares no logical database; nothing is routable"
+                    );
+                }
+                publish_if_current(&runtime, &output, &bound, topology);
             }
             // The materializer already bounded its own reconciliation. Anything
             // reaching here ends this attempt; a fresh capability starts the
@@ -218,6 +243,7 @@ fn publish_if_current(
     runtime: &watch::Receiver<Option<Arc<ValidatedCatalogRuntime>>>,
     output: &watch::Sender<Option<Arc<MaterializedCatalog>>>,
     bound: &Arc<ValidatedCatalogRuntime>,
+    topology: MaterializedTopology,
 ) -> bool {
     if runtime.has_changed().is_err() || output.is_closed() {
         return false;
@@ -234,6 +260,7 @@ fn publish_if_current(
     output.send_replace(Some(Arc::new(MaterializedCatalog {
         bound: Arc::clone(bound),
         binding: runtime.clone(),
+        topology,
     })));
     true
 }
@@ -250,6 +277,11 @@ mod tests {
 
     type RuntimeSender = watch::Sender<Option<Arc<ValidatedCatalogRuntime>>>;
     type ProofReceiver = watch::Receiver<Option<Arc<MaterializedCatalog>>>;
+
+    /// The stage is indifferent to what the topology is; it only carries it.
+    const POPULATED: MaterializedTopology = MaterializedTopology::Populated {
+        logical_databases: 3,
+    };
 
     /// The stage is indifferent to the program's contents; it only decides
     /// whether the materializer may run it.
@@ -284,7 +316,7 @@ mod tests {
             ) -> F
             + Send
             + 'static,
-        F: Future<Output = Result<(), PostgresGenerationError>> + Send + 'static,
+        F: Future<Output = Result<MaterializedTopology, PostgresGenerationError>> + Send + 'static,
     {
         let (output, proof) = watch::channel(None);
         tokio::spawn(supervise(runtime.subscribe(), output, materialize));
@@ -305,7 +337,7 @@ mod tests {
     #[tokio::test]
     async fn a_capability_that_materializes_is_proved_against_that_capability() {
         let (runtime, _keep) = watch::channel(None);
-        let proof = start(&runtime, |_, _| async { Ok(()) });
+        let proof = start(&runtime, |_, _| async { Ok(POPULATED) });
         let bound = capability();
         runtime.send_replace(Some(Arc::clone(&bound)));
 
@@ -327,7 +359,7 @@ mod tests {
             // Exactly the race the predicate exists for: authority moved on
             // after the last commit and before publication.
             replace_with.send_replace(Some(capability()));
-            async { Ok(()) }
+            async { Ok(POPULATED) }
         });
         runtime.send_replace(Some(capability()));
 
@@ -385,10 +417,33 @@ mod tests {
         );
     }
 
+    /// The proof has to report what the materializer observed, so a consumer
+    /// deciding what to do about an empty topology is reading the catalog's
+    /// answer rather than a constant this stage chose.
+    #[tokio::test]
+    async fn the_proof_carries_the_topology_the_materializer_observed() {
+        for observed in [POPULATED, MaterializedTopology::Empty] {
+            let (runtime, _keep) = watch::channel(None);
+            let proof = start(&runtime, move |_, _| async move { Ok(observed) });
+            runtime.send_replace(Some(capability()));
+
+            settle().await;
+            assert_eq!(
+                proof
+                    .borrow()
+                    .as_ref()
+                    .expect("the catalog was proved")
+                    .topology(),
+                observed,
+                "the proof does not carry the observed topology"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn withdrawing_the_capability_withdraws_the_proof() {
         let (runtime, _keep) = watch::channel(None);
-        let proof = start(&runtime, |_, _| async { Ok(()) });
+        let proof = start(&runtime, |_, _| async { Ok(POPULATED) });
         runtime.send_replace(Some(capability()));
         settle().await;
         assert!(proof.borrow().is_some(), "the catalog was not proved");
