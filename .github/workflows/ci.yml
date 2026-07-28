@@ -353,6 +353,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Restore the pinned CI images
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pgshard-ci-images
+          key: ci-images-${{ runner.os }}-postgres18-${{ hashFiles('.github/scripts/ci-images.lock') }}
       - name: Start the PostgreSQL 18 fixture
         shell: bash
         run: |
@@ -360,18 +367,9 @@ jobs:
           # The runner pulls a `services:` image before the first step runs,
           # under a back-off no workflow step can reach, so one Docker Hub
           # timeout fails the job before any of its work starts. Started from a
-          # step, the pull retries under our own control.
-          readonly postgres_image="postgres:18"
-          for attempt in 1 2 3 4 5; do
-            if docker pull "$postgres_image"; then
-              break
-            fi
-            if (( attempt == 5 )); then
-              echo "failed to pull ${postgres_image} after ${attempt} attempts" >&2
-              exit 1
-            fi
-            sleep $((attempt * 10))
-          done
+          # step, the image comes from the cache restored above instead.
+          postgres_image="$(.github/scripts/ci-image.sh postgres18)"
+          readonly postgres_image
           docker run --detach --name pgshard-ci-postgres \
             --env POSTGRES_DB=shardschema \
             --env POSTGRES_PASSWORD=pgshard-ci-only \
@@ -391,8 +389,6 @@ jobs:
             docker logs pgshard-ci-postgres
             exit 1
           fi
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Cache Rust build
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -421,6 +417,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Restore the pinned CI images
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pgshard-ci-images
+          key: ci-images-${{ runner.os }}-postgres17-postgres18-${{ hashFiles('.github/scripts/ci-images.lock') }}
       - name: Start the PostgreSQL 18 and PostgreSQL 17 fixtures
         shell: bash
         run: |
@@ -428,21 +431,11 @@ jobs:
           # The runner pulls a `services:` image before the first step runs,
           # under a back-off no workflow step can reach, so one Docker Hub
           # timeout fails the job before any of its work starts. Started from a
-          # step, the pull retries under our own control.
-          readonly primary_image="postgres:18"
-          readonly legacy_image="postgres:17"
-          for image in "$primary_image" "$legacy_image"; do
-            for attempt in 1 2 3 4 5; do
-              if docker pull "$image"; then
-                break
-              fi
-              if (( attempt == 5 )); then
-                echo "failed to pull ${image} after ${attempt} attempts" >&2
-                exit 1
-              fi
-              sleep $((attempt * 10))
-            done
-          done
+          # step, the image comes from the cache restored above instead.
+          primary_image="$(.github/scripts/ci-image.sh postgres18)"
+          readonly primary_image
+          legacy_image="$(.github/scripts/ci-image.sh postgres17)"
+          readonly legacy_image
           docker run --detach --name pgshard-ci-postgres \
             --env POSTGRES_DB=shardschema \
             --env POSTGRES_PASSWORD=pgshard-ci-only \
@@ -470,8 +463,6 @@ jobs:
               exit 1
             fi
           done
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Cache Rust build
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -494,6 +485,8 @@ jobs:
         run: |
           set -euo pipefail
           readonly primary_container=pgshard-ci-postgres
+          primary_image="$(.github/scripts/ci-image.sh postgres18)"
+          readonly primary_image
           docker exec "$primary_container" psql \
             --username postgres --dbname shardschema --set ON_ERROR_STOP=1 \
             --command "CREATE ROLE pgshard_replicator WITH REPLICATION LOGIN PASSWORD 'pgshard-ci-only'"
@@ -510,7 +503,7 @@ jobs:
             --add-host host.docker.internal:host-gateway \
             --env PGPASSWORD=pgshard-ci-only \
             --volume pgshard-ci-standby:/var/lib/postgresql \
-            postgres:18 \
+            "$primary_image" \
             pg_basebackup --host host.docker.internal --port 5432 \
               --username pgshard_replicator \
               --pgdata /var/lib/postgresql/18/docker \
@@ -524,7 +517,7 @@ jobs:
             --publish 5434:5434 \
             --user postgres \
             --volume pgshard-ci-standby:/var/lib/postgresql \
-            postgres:18 \
+            "$primary_image" \
             postgres -D /var/lib/postgresql/18/docker -p 5434 \
               -c "primary_conninfo=host=host.docker.internal port=5432 user=pgshard_replicator password=pgshard-ci-only dbname=shardschema application_name=pgshard_member_0001 sslmode=disable" \
               -c primary_slot_name=pgshard_member_0001 \
@@ -579,6 +572,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Restore the pinned CI images
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pgshard-ci-images
+          key: ci-images-${{ runner.os }}-postgres18-${{ hashFiles('.github/scripts/ci-images.lock') }}
       - name: Start the PostgreSQL 18 fixture
         shell: bash
         run: |
@@ -586,18 +586,9 @@ jobs:
           # The runner pulls a `services:` image before the first step runs,
           # under a back-off no workflow step can reach, so one Docker Hub
           # timeout fails the job before any of its work starts. Started from a
-          # step, the pull retries under our own control.
-          readonly postgres_image="postgres:18"
-          for attempt in 1 2 3 4 5; do
-            if docker pull "$postgres_image"; then
-              break
-            fi
-            if (( attempt == 5 )); then
-              echo "failed to pull ${postgres_image} after ${attempt} attempts" >&2
-              exit 1
-            fi
-            sleep $((attempt * 10))
-          done
+          # step, the image comes from the cache restored above instead.
+          postgres_image="$(.github/scripts/ci-image.sh postgres18)"
+          readonly postgres_image
           docker run --detach --name pgshard-ci-postgres \
             --env POSTGRES_DB=postgres \
             --env POSTGRES_PASSWORD=pgshard-ci-only \
@@ -617,8 +608,6 @@ jobs:
             docker logs pgshard-ci-postgres
             exit 1
           fi
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Cache Rust build
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -647,6 +636,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Restore the pinned CI images
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pgshard-ci-images
+          key: ci-images-${{ runner.os }}-postgres18-${{ hashFiles('.github/scripts/ci-images.lock') }}
       - name: Start the PostgreSQL 18 fixture
         shell: bash
         run: |
@@ -654,18 +650,9 @@ jobs:
           # The runner pulls a `services:` image before the first step runs,
           # under a back-off no workflow step can reach, so one Docker Hub
           # timeout fails the job before any of its work starts. Started from a
-          # step, the pull retries under our own control.
-          readonly postgres_image="postgres:18"
-          for attempt in 1 2 3 4 5; do
-            if docker pull "$postgres_image"; then
-              break
-            fi
-            if (( attempt == 5 )); then
-              echo "failed to pull ${postgres_image} after ${attempt} attempts" >&2
-              exit 1
-            fi
-            sleep $((attempt * 10))
-          done
+          # step, the image comes from the cache restored above instead.
+          postgres_image="$(.github/scripts/ci-image.sh postgres18)"
+          readonly postgres_image
           docker run --detach --name pgshard-ci-postgres \
             --env POSTGRES_HOST_AUTH_METHOD=trust \
             --env POSTGRES_INITDB_ARGS="--set wal_level=logical --set max_prepared_transactions=10" \
@@ -685,8 +672,6 @@ jobs:
             docker logs pgshard-ci-postgres
             exit 1
           fi
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Cache Rust build
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -820,25 +805,23 @@ jobs:
         with:
           go-version-file: operator/go.mod
           cache-dependency-path: operator/go.sum
+      - name: Restore the pinned CI images
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pgshard-ci-images
+          key: ci-images-${{ runner.os }}-kindnode-${{ hashFiles('.github/scripts/ci-images.lock') }}
       - name: Create disposable Kubernetes cluster
+        shell: bash
         run: |
+          set -euo pipefail
           go install sigs.k8s.io/kind@v0.32.0
           # kind pulls the node image itself without retrying, and a
           # registry timeout here leaves no cluster for every later step.
-          readonly node_image="kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5"
-          for attempt in 1 2 3 4; do
-            if docker pull "$node_image"; then
-              break
-            fi
-            if (( attempt == 4 )); then
-              echo "failed to pull the KIND node image after ${attempt} attempts" >&2
-              exit 1
-            fi
-            sleep $((attempt * 5))
-          done
+          node_image="$(.github/scripts/ci-image.sh kindnode)"
+          readonly node_image
           kind create cluster \
             --name pgshard-operator \
-            --image kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5 \
+            --image "$node_image" \
             --wait 90s
           test "$(kubectl version --output=json | jq --raw-output '.serverVersion.minor')" = "36"
           kubectl apply --server-side --field-manager=pgshard-ci -f operator/config/crd/bases/pgshard.io_pgshardclusters.yaml
@@ -888,27 +871,63 @@ jobs:
         with:
           go-version-file: operator/go.mod
           cache-dependency-path: operator/go.sum
-      - name: Pull the Buildx builder image
+      - name: Restore the pinned CI images
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pgshard-ci-images
+          key: ci-images-${{ runner.os }}-buildkit-kindnode-${{ hashFiles('.github/scripts/ci-images.lock') }}
+      - name: Aim the Buildx builder pull away from Docker Hub
+        shell: bash
         run: |
-          # setup-buildx-action boots its builder from a container it pulls
-          # itself, with no retry, so one registry timeout fails the job before
-          # any of its work starts. Pulling first leaves the image local; the
-          # cascade otherwise reads as a cluster failure two steps later.
-          readonly buildkit_image="moby/buildkit:buildx-stable-1"
-          for attempt in 1 2 3 4; do
-            if docker pull "$buildkit_image"; then
-              break
-            fi
-            if (( attempt == 4 )); then
-              echo "failed to pull the Buildx builder image after ${attempt} attempts" >&2
-              exit 1
-            fi
-            sleep $((attempt * 5))
-          done
+          set -euo pipefail
+          # Buildx boots its builder from a container, and it calls ImagePull
+          # before it will look in the local image store. That pull is
+          # unconditional: the docker-container driver takes no option that
+          # skips it, and setup-buildx-action exposes none either, so left at
+          # its default the builder re-resolves the floating `buildx-stable-1`
+          # tag on every run. With Docker Hub up that replaces the image the
+          # lock pins; with Docker Hub down the job waits on it anyway.
+          #
+          # Aliasing the pinned image under `.invalid` aims that pull at a name
+          # no registry is expected to answer for, so it fails at DNS and
+          # buildx falls back to the local image. Read that as an optimisation
+          # and not as a boundary: RFC 6761 says a resolver should return an
+          # immediate negative answer, and should is not cannot -- a corporate
+          # resolver, a hosts entry or an intercepting proxy can answer for any
+          # name, and buildx would run whatever came back. What the job rests
+          # on is the next step, which reads the image the builder container
+          # booted from and holds it to the lock.
+          builder_image="$(.github/scripts/ci-image.sh buildkit)"
+          readonly builder_image
+          docker tag "$builder_image" pgshard.invalid/buildkit:pinned
       - name: Set up local-image Buildx
+        id: buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
         with:
           cache-binary: false
+          driver-opts: image=pgshard.invalid/buildkit:pinned
+      - name: Hold the booted Buildx builder to the pinned BuildKit image
+        env:
+          BUILDER_NODES: ${{ steps.buildx.outputs.nodes }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Nothing above stops buildx pulling, so what booted is checked
+          # rather than assumed. The docker-container driver runs each node in
+          # a container named `buildx_buildkit_` followed by the node name --
+          # the same name setup-buildx-action derives to remove it afterwards
+          # -- and `docker container inspect` reports that container's image
+          # id, which is the value the lock's third column carries. A builder
+          # booted from anything else fails the job here, whatever answered for
+          # the `.invalid` alias.
+          mapfile -t nodes < <(jq --raw-output '.[].name' <<<"$BUILDER_NODES")
+          if (( ${#nodes[@]} == 0 )); then
+            echo "buildx reported no builder node to check against the lock" >&2
+            exit 1
+          fi
+          for node in "${nodes[@]}"; do
+            .github/scripts/ci-image.sh --assert-container buildkit "buildx_buildkit_${node}"
+          done
       - name: Build manager smoke images without publishing
         env:
           PGSHARD_BUILD_VERSION: 0.0.0-dev+ci.${{ github.sha }}
@@ -927,24 +946,17 @@ jobs:
             test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$image")" = "$PGSHARD_BUILD_VERSION"
           done
       - name: Create disposable Kubernetes cluster
+        shell: bash
         run: |
+          set -euo pipefail
           go install sigs.k8s.io/kind@v0.32.0
           # kind pulls the node image itself without retrying, and a
           # registry timeout here leaves no cluster for every later step.
-          readonly node_image="kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5"
-          for attempt in 1 2 3 4; do
-            if docker pull "$node_image"; then
-              break
-            fi
-            if (( attempt == 4 )); then
-              echo "failed to pull the KIND node image after ${attempt} attempts" >&2
-              exit 1
-            fi
-            sleep $((attempt * 5))
-          done
+          node_image="$(.github/scripts/ci-image.sh kindnode)"
+          readonly node_image
           kind create cluster \
             --name pgshard-manager \
-            --image kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5 \
+            --image "$node_image" \
             --wait 90s
           test "$(kubectl version --output=json | jq --raw-output '.serverVersion.minor')" = "36"
           # Pull the digest through the node's CRI. Importing this image from
@@ -1024,27 +1036,63 @@ jobs:
         with:
           go-version-file: operator/go.mod
           cache-dependency-path: operator/go.sum
-      - name: Pull the Buildx builder image
+      - name: Restore the pinned CI images
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pgshard-ci-images
+          key: ci-images-${{ runner.os }}-buildkit-kindnode-${{ hashFiles('.github/scripts/ci-images.lock') }}
+      - name: Aim the Buildx builder pull away from Docker Hub
+        shell: bash
         run: |
-          # setup-buildx-action boots its builder from a container it pulls
-          # itself, with no retry, so one registry timeout fails the job before
-          # any of its work starts. Pulling first leaves the image local; the
-          # cascade otherwise reads as a cluster failure two steps later.
-          readonly buildkit_image="moby/buildkit:buildx-stable-1"
-          for attempt in 1 2 3 4; do
-            if docker pull "$buildkit_image"; then
-              break
-            fi
-            if (( attempt == 4 )); then
-              echo "failed to pull the Buildx builder image after ${attempt} attempts" >&2
-              exit 1
-            fi
-            sleep $((attempt * 5))
-          done
+          set -euo pipefail
+          # Buildx boots its builder from a container, and it calls ImagePull
+          # before it will look in the local image store. That pull is
+          # unconditional: the docker-container driver takes no option that
+          # skips it, and setup-buildx-action exposes none either, so left at
+          # its default the builder re-resolves the floating `buildx-stable-1`
+          # tag on every run. With Docker Hub up that replaces the image the
+          # lock pins; with Docker Hub down the job waits on it anyway.
+          #
+          # Aliasing the pinned image under `.invalid` aims that pull at a name
+          # no registry is expected to answer for, so it fails at DNS and
+          # buildx falls back to the local image. Read that as an optimisation
+          # and not as a boundary: RFC 6761 says a resolver should return an
+          # immediate negative answer, and should is not cannot -- a corporate
+          # resolver, a hosts entry or an intercepting proxy can answer for any
+          # name, and buildx would run whatever came back. What the job rests
+          # on is the next step, which reads the image the builder container
+          # booted from and holds it to the lock.
+          builder_image="$(.github/scripts/ci-image.sh buildkit)"
+          readonly builder_image
+          docker tag "$builder_image" pgshard.invalid/buildkit:pinned
       - name: Set up local-image Buildx
+        id: buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
         with:
           cache-binary: false
+          driver-opts: image=pgshard.invalid/buildkit:pinned
+      - name: Hold the booted Buildx builder to the pinned BuildKit image
+        env:
+          BUILDER_NODES: ${{ steps.buildx.outputs.nodes }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Nothing above stops buildx pulling, so what booted is checked
+          # rather than assumed. The docker-container driver runs each node in
+          # a container named `buildx_buildkit_` followed by the node name --
+          # the same name setup-buildx-action derives to remove it afterwards
+          # -- and `docker container inspect` reports that container's image
+          # id, which is the value the lock's third column carries. A builder
+          # booted from anything else fails the job here, whatever answered for
+          # the `.invalid` alias.
+          mapfile -t nodes < <(jq --raw-output '.[].name' <<<"$BUILDER_NODES")
+          if (( ${#nodes[@]} == 0 )); then
+            echo "buildx reported no builder node to check against the lock" >&2
+            exit 1
+          fi
+          for node in "${nodes[@]}"; do
+            .github/scripts/ci-image.sh --assert-container buildkit "buildx_buildkit_${node}"
+          done
       - name: Build manager smoke images without publishing
         env:
           PGSHARD_BUILD_VERSION: 0.0.0-dev+ci.${{ github.sha }}
@@ -1063,24 +1111,17 @@ jobs:
             test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$image")" = "$PGSHARD_BUILD_VERSION"
           done
       - name: Create disposable Kubernetes cluster
+        shell: bash
         run: |
+          set -euo pipefail
           go install sigs.k8s.io/kind@v0.32.0
           # kind pulls the node image itself without retrying, and a
           # registry timeout here leaves no cluster for every later step.
-          readonly node_image="kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5"
-          for attempt in 1 2 3 4; do
-            if docker pull "$node_image"; then
-              break
-            fi
-            if (( attempt == 4 )); then
-              echo "failed to pull the KIND node image after ${attempt} attempts" >&2
-              exit 1
-            fi
-            sleep $((attempt * 5))
-          done
+          node_image="$(.github/scripts/ci-image.sh kindnode)"
+          readonly node_image
           kind create cluster \
             --name pgshard-manager \
-            --image kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5 \
+            --image "$node_image" \
             --wait 90s
           test "$(kubectl version --output=json | jq --raw-output '.serverVersion.minor')" = "36"
           # Pull the digest through the node's CRI. Importing this image from
@@ -1309,6 +1350,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Restore the pinned CI images
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pgshard-ci-images
+          key: ci-images-${{ runner.os }}-postgres18-${{ hashFiles('.github/scripts/ci-images.lock') }}
       - name: Start the PostgreSQL 18 fixture
         shell: bash
         run: |
@@ -1316,18 +1364,9 @@ jobs:
           # The runner pulls a `services:` image before the first step runs,
           # under a back-off no workflow step can reach, so one Docker Hub
           # timeout fails the job before any of its work starts. Started from a
-          # step, the pull retries under our own control.
-          readonly postgres_image="docker.io/library/postgres:18@sha256:32ca0af8e77bfb8c6610c488e4691f83f972a3e9e64d3b02facf3ab111ad5500"
-          for attempt in 1 2 3 4 5; do
-            if docker pull "$postgres_image"; then
-              break
-            fi
-            if (( attempt == 5 )); then
-              echo "failed to pull ${postgres_image} after ${attempt} attempts" >&2
-              exit 1
-            fi
-            sleep $((attempt * 10))
-          done
+          # step, the image comes from the cache restored above instead.
+          postgres_image="$(.github/scripts/ci-image.sh postgres18)"
+          readonly postgres_image
           docker run --detach --name pgshard-ci-postgres \
             --env POSTGRES_DB=postgres \
             --env POSTGRES_HOST_AUTH_METHOD=trust \
@@ -1348,8 +1387,6 @@ jobs:
             docker logs pgshard-ci-postgres
             exit 1
           fi
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Cache Rust build
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -1381,27 +1418,63 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Pull the Buildx builder image
+      - name: Restore the pinned CI images
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pgshard-ci-images
+          key: ci-images-${{ runner.os }}-buildkit-${{ hashFiles('.github/scripts/ci-images.lock') }}
+      - name: Aim the Buildx builder pull away from Docker Hub
+        shell: bash
         run: |
-          # setup-buildx-action boots its builder from a container it pulls
-          # itself, with no retry, so one registry timeout fails the job before
-          # any of its work starts. Pulling first leaves the image local; the
-          # cascade otherwise reads as a cluster failure two steps later.
-          readonly buildkit_image="moby/buildkit:buildx-stable-1"
-          for attempt in 1 2 3 4; do
-            if docker pull "$buildkit_image"; then
-              break
-            fi
-            if (( attempt == 4 )); then
-              echo "failed to pull the Buildx builder image after ${attempt} attempts" >&2
-              exit 1
-            fi
-            sleep $((attempt * 5))
-          done
+          set -euo pipefail
+          # Buildx boots its builder from a container, and it calls ImagePull
+          # before it will look in the local image store. That pull is
+          # unconditional: the docker-container driver takes no option that
+          # skips it, and setup-buildx-action exposes none either, so left at
+          # its default the builder re-resolves the floating `buildx-stable-1`
+          # tag on every run. With Docker Hub up that replaces the image the
+          # lock pins; with Docker Hub down the job waits on it anyway.
+          #
+          # Aliasing the pinned image under `.invalid` aims that pull at a name
+          # no registry is expected to answer for, so it fails at DNS and
+          # buildx falls back to the local image. Read that as an optimisation
+          # and not as a boundary: RFC 6761 says a resolver should return an
+          # immediate negative answer, and should is not cannot -- a corporate
+          # resolver, a hosts entry or an intercepting proxy can answer for any
+          # name, and buildx would run whatever came back. What the job rests
+          # on is the next step, which reads the image the builder container
+          # booted from and holds it to the lock.
+          builder_image="$(.github/scripts/ci-image.sh buildkit)"
+          readonly builder_image
+          docker tag "$builder_image" pgshard.invalid/buildkit:pinned
       - name: Set up archive-capable Buildx
+        id: buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
         with:
           cache-binary: false
+          driver-opts: image=pgshard.invalid/buildkit:pinned
+      - name: Hold the booted Buildx builder to the pinned BuildKit image
+        env:
+          BUILDER_NODES: ${{ steps.buildx.outputs.nodes }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Nothing above stops buildx pulling, so what booted is checked
+          # rather than assumed. The docker-container driver runs each node in
+          # a container named `buildx_buildkit_` followed by the node name --
+          # the same name setup-buildx-action derives to remove it afterwards
+          # -- and `docker container inspect` reports that container's image
+          # id, which is the value the lock's third column carries. A builder
+          # booted from anything else fails the job here, whatever answered for
+          # the `.invalid` alias.
+          mapfile -t nodes < <(jq --raw-output '.[].name' <<<"$BUILDER_NODES")
+          if (( ${#nodes[@]} == 0 )); then
+            echo "buildx reported no builder node to check against the lock" >&2
+            exit 1
+          fi
+          for node in "${nodes[@]}"; do
+            .github/scripts/ci-image.sh --assert-container buildkit "buildx_buildkit_${node}"
+          done
       - name: Build local image archives without publishing
         env:
           PGSHARD_BUILD_VERSION: 0.0.0-dev+ci.${{ github.sha }}
@@ -1449,27 +1522,63 @@ jobs:
           key: rust-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
             rust-${{ github.job }}-${{ runner.os }}-
-      - name: Pull the Buildx builder image
+      - name: Restore the pinned CI images
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pgshard-ci-images
+          key: ci-images-${{ runner.os }}-buildkit-${{ hashFiles('.github/scripts/ci-images.lock') }}
+      - name: Aim the Buildx builder pull away from Docker Hub
+        shell: bash
         run: |
-          # setup-buildx-action boots its builder from a container it pulls
-          # itself, with no retry, so one registry timeout fails the job before
-          # any of its work starts. Pulling first leaves the image local; the
-          # cascade otherwise reads as a cluster failure two steps later.
-          readonly buildkit_image="moby/buildkit:buildx-stable-1"
-          for attempt in 1 2 3 4; do
-            if docker pull "$buildkit_image"; then
-              break
-            fi
-            if (( attempt == 4 )); then
-              echo "failed to pull the Buildx builder image after ${attempt} attempts" >&2
-              exit 1
-            fi
-            sleep $((attempt * 5))
-          done
+          set -euo pipefail
+          # Buildx boots its builder from a container, and it calls ImagePull
+          # before it will look in the local image store. That pull is
+          # unconditional: the docker-container driver takes no option that
+          # skips it, and setup-buildx-action exposes none either, so left at
+          # its default the builder re-resolves the floating `buildx-stable-1`
+          # tag on every run. With Docker Hub up that replaces the image the
+          # lock pins; with Docker Hub down the job waits on it anyway.
+          #
+          # Aliasing the pinned image under `.invalid` aims that pull at a name
+          # no registry is expected to answer for, so it fails at DNS and
+          # buildx falls back to the local image. Read that as an optimisation
+          # and not as a boundary: RFC 6761 says a resolver should return an
+          # immediate negative answer, and should is not cannot -- a corporate
+          # resolver, a hosts entry or an intercepting proxy can answer for any
+          # name, and buildx would run whatever came back. What the job rests
+          # on is the next step, which reads the image the builder container
+          # booted from and holds it to the lock.
+          builder_image="$(.github/scripts/ci-image.sh buildkit)"
+          readonly builder_image
+          docker tag "$builder_image" pgshard.invalid/buildkit:pinned
       - name: Set up local-image Buildx
+        id: buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
         with:
           cache-binary: false
+          driver-opts: image=pgshard.invalid/buildkit:pinned
+      - name: Hold the booted Buildx builder to the pinned BuildKit image
+        env:
+          BUILDER_NODES: ${{ steps.buildx.outputs.nodes }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Nothing above stops buildx pulling, so what booted is checked
+          # rather than assumed. The docker-container driver runs each node in
+          # a container named `buildx_buildkit_` followed by the node name --
+          # the same name setup-buildx-action derives to remove it afterwards
+          # -- and `docker container inspect` reports that container's image
+          # id, which is the value the lock's third column carries. A builder
+          # booted from anything else fails the job here, whatever answered for
+          # the `.invalid` alias.
+          mapfile -t nodes < <(jq --raw-output '.[].name' <<<"$BUILDER_NODES")
+          if (( ${#nodes[@]} == 0 )); then
+            echo "buildx reported no builder node to check against the lock" >&2
+            exit 1
+          fi
+          for node in "${nodes[@]}"; do
+            .github/scripts/ci-image.sh --assert-container buildkit "buildx_buildkit_${node}"
+          done
       - name: Build the local PostgreSQL agent without publishing
         env:
           PGSHARD_BUILD_VERSION: 0.0.0-dev+ci.${{ github.sha }}
@@ -2141,25 +2250,23 @@ jobs:
           cache-dependency-path: operator/go.sum
       - name: Select repository Rust toolchain
         run: rustup show active-toolchain
+      - name: Restore the pinned CI images
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pgshard-ci-images
+          key: ci-images-${{ runner.os }}-kindnode-${{ hashFiles('.github/scripts/ci-images.lock') }}
       - name: Create disposable Kubernetes cluster
+        shell: bash
         run: |
+          set -euo pipefail
           go install sigs.k8s.io/kind@v0.32.0
           # kind pulls the node image itself without retrying, and a
           # registry timeout here leaves no cluster for every later step.
-          readonly node_image="kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5"
-          for attempt in 1 2 3 4; do
-            if docker pull "$node_image"; then
-              break
-            fi
-            if (( attempt == 4 )); then
-              echo "failed to pull the KIND node image after ${attempt} attempts" >&2
-              exit 1
-            fi
-            sleep $((attempt * 5))
-          done
+          node_image="$(.github/scripts/ci-image.sh kindnode)"
+          readonly node_image
           kind create cluster \
             --name pgshard-system-e2e \
-            --image kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5 \
+            --image "$node_image" \
             --wait 90s
           test "$(kubectl config current-context)" = kind-pgshard-system-e2e
           test "$(kubectl version --output=json | jq --raw-output '.serverVersion.minor')" = "36"

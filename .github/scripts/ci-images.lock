@@ -1,0 +1,38 @@
+# Every image `.github/scripts/ci-image.sh` puts into the runner's own Docker
+# image store, as `<name> <reference> <image id>`. Bases a Dockerfile pulls
+# during `make images`, and images a KIND node's containerd pulls, are not
+# served from here and are not listed; the helper says what it does and does
+# not take off the registry path.
+#
+# The reference is pinned by repository digest, so a republished tag can never
+# be served from a cache entry keyed on this file. That alone does not make the
+# cache trustworthy: the archive the cache holds is unsigned input that anything
+# able to write this branch's cache can replace, and `docker load` restores a
+# tag and never a repository digest, so the pinned reference is not something
+# the helper can re-check a restored image against.
+#
+# The third column closes that gap. It is the image id, the digest of the
+# linux/amd64 image config, which is what `docker image inspect --format
+# '{{.Id}}'` reports and what `docker load` recomputes from the archive's own
+# bytes. The helper serves an image only when its id is this one, so the value
+# it trusts comes from this file rather than from the cache. Every job runs on
+# `ubuntu-24.04`, so linux/amd64 is the only platform these resolve on.
+#
+# The buildkit id carries a second job. Buildx pulls its builder image before
+# it looks in the local store and offers no way to skip that, so the builder is
+# not stopped from fetching one: after it boots, `docker container inspect
+# --format '{{.Image}}'` reports the id it is running, and the job fails unless
+# that is the id below.
+#
+# To change a pin, pull the new reference and read both columns back from it:
+#
+#   docker pull <reference>
+#   docker image inspect --format '{{.Id}}' <reference>
+#
+# postgres18 is the digest the operator deploys, so the fixtures exercise the
+# PostgreSQL the product ships rather than whatever `postgres:18` points at
+# today.
+buildkit    moby/buildkit:buildx-stable-1@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec    sha256:e0e67ea9c4bb07bdef683e29f70f3b623d1eb9c82274a9ec04e6bb0511449fb0
+kindnode    kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5    sha256:152b34afd8a2de5c8348a264426bc99b71058ee0e1a15eab9b30849605e4752d
+postgres17  docker.io/library/postgres:17@sha256:a426e44bac0b759c95894d68e1a0ac03ecc20b619f498a91aae373bf06d8508d    sha256:f9cab62aaf3471220dcbdeea5a686fca1c7f9e99621db14fdaebceaffe7a8f24
+postgres18  docker.io/library/postgres:18@sha256:32ca0af8e77bfb8c6610c488e4691f83f972a3e9e64d3b02facf3ab111ad5500    sha256:1bf3d6960db467e87a506daef30feb41fecc23b7c5f96b157e873059f2ffb50a
