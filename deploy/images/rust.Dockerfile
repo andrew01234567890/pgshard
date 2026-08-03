@@ -67,7 +67,7 @@ FROM runtime AS pooler
 COPY --from=build /out/pgshard-pooler /usr/local/bin/pgshard-pooler
 ENTRYPOINT ["/usr/local/bin/pgshard-pooler"]
 
-FROM docker.io/library/postgres:18@sha256:32ca0af8e77bfb8c6610c488e4691f83f972a3e9e64d3b02facf3ab111ad5500 AS postgres-fence-build
+FROM docker.io/library/postgres:18@sha256:3a82e1f56c8f0f5616a11103ac3d47e632c3938698946a7ad26da0df1334744a AS postgres-fence-build
 
 RUN rm -f /etc/apt/sources.list.d/pgdg.list && \
     sed -i \
@@ -117,7 +117,7 @@ COPY extensions/pgshard_fence /src/pgshard_fence
 RUN make -C /src/pgshard_fence PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config && \
     make -C /src/pgshard_fence install DESTDIR=/out PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config
 
-FROM docker.io/library/postgres:18@sha256:32ca0af8e77bfb8c6610c488e4691f83f972a3e9e64d3b02facf3ab111ad5500 AS postgres-agent
+FROM docker.io/library/postgres:18@sha256:3a82e1f56c8f0f5616a11103ac3d47e632c3938698946a7ad26da0df1334744a AS postgres-agent
 
 ARG PGSHARD_BUILD_VERSION
 ARG PGSHARD_GIT_SHA
