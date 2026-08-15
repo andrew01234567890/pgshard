@@ -54,8 +54,18 @@ if "$repo_dir/hack/stack-tip.sh" 0000000000000000000000000000000000000000 "$tip_
   printf 'stack-tip.sh accepted a mismatched tip SHA\n' >&2
   exit 1
 fi
-default_parent=$(git -C "$repo_dir" rev-parse HEAD^)
-if "$repo_dir/hack/stack-tip.sh" "$tip_sha" "$tip_sha" "$default_parent" dispatch >/dev/null 2>&1; then
+dispatch_repo="$tmp_dir/dispatch-repo"
+git init --quiet "$dispatch_repo"
+git -C "$dispatch_repo" config user.name fixture
+git -C "$dispatch_repo" config user.email fixture@example.invalid
+printf 'default main\n' >"$dispatch_repo/state.txt"
+git -C "$dispatch_repo" add state.txt
+git -C "$dispatch_repo" commit --quiet -m default-main
+dispatch_default_sha=$(git -C "$dispatch_repo" rev-parse HEAD)
+printf 'candidate\n' >"$dispatch_repo/state.txt"
+git -C "$dispatch_repo" commit --quiet -am candidate
+dispatch_tip_sha=$(git -C "$dispatch_repo" rev-parse HEAD)
+if (cd "$dispatch_repo" && "$repo_dir/hack/stack-tip.sh" "$dispatch_tip_sha" "$dispatch_tip_sha" "$dispatch_default_sha" dispatch) >/dev/null 2>&1; then
   printf 'stack-tip.sh accepted a dispatch baseline absent from default head\n' >&2
   exit 1
 fi
