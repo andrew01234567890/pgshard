@@ -1,6 +1,7 @@
 name: Stack tip benchmark
 
 on:
+  pull_request:
   workflow_dispatch:
     inputs:
       expected_tip_sha:
@@ -30,6 +31,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -39,8 +41,8 @@ jobs:
 
       - name: Validate exact tip and compare benchmarks
         env:
-          EXPECTED_TIP_SHA: ${{ inputs.expected_tip_sha }}
-          EXPECTED_BASELINE_SHA: ${{ inputs.expected_baseline_sha }}
+          EXPECTED_TIP_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.expected_tip_sha }}
+          EXPECTED_BASELINE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || inputs.expected_baseline_sha }}
         run: hack/stack-tip.sh "$EXPECTED_TIP_SHA" "$EXPECTED_BASELINE_SHA"
 
       # This hosted comparison is deliberately limited to deterministic Go benchmark runs.
