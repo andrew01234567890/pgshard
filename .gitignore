@@ -1,0 +1,28 @@
+# Go build and test output.
+/bin/
+/dist/
+*.test
+*.out
+coverage.out
+
+# Local configuration and credentials. Use references to managed Secrets in
+# deployment manifests and synthetic fixtures in tests instead.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.secret
+*.secrets
+
+# Local tooling and operating-system files.
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# Temporary files.
+/tmp/
