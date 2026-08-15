@@ -45,4 +45,25 @@ if ! "$repo_dir/hack/compare-benchmarks.sh" "$tmp_dir/base-bench.txt" "$tmp_dir/
   exit 1
 fi
 
+fixture_dir="$tmp_dir/benchmark-fixture"
+mkdir -p "$fixture_dir"
+printf 'package fixture\n\nfunc BenchmarkFixture(b *testing.B) {}\n' >"$fixture_dir/fixture_test.go"
+mkdir -p "$tmp_dir/no-rg-bin"
+printf '#!/usr/bin/env bash\nexit 99\n' >"$tmp_dir/no-rg-bin/rg"
+chmod +x "$tmp_dir/no-rg-bin/rg"
+if ! PATH="$tmp_dir/no-rg-bin:$PATH" "$repo_dir/hack/has-benchmarks.sh" "$fixture_dir"; then
+  printf 'has-benchmarks.sh failed when an unavailable rg was shadowed\n' >&2
+  exit 1
+fi
+printf '#!/usr/bin/env bash\nexit 99\n' >"$tmp_dir/no-rg-bin/find"
+chmod +x "$tmp_dir/no-rg-bin/find"
+set +e
+PATH="$tmp_dir/no-rg-bin:$PATH" "$repo_dir/hack/has-benchmarks.sh" "$fixture_dir" >/dev/null 2>&1
+benchmark_scan_status=$?
+set -e
+if [[ "$benchmark_scan_status" -ne 2 ]]; then
+  printf 'has-benchmarks.sh did not distinguish find failure (status=%s)\n' "$benchmark_scan_status" >&2
+  exit 1
+fi
+
 printf 'CI helper checks passed\n'

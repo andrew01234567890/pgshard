@@ -55,13 +55,27 @@ git archive "$expected_tip" | tar -x -C "$candidate_dir"
 git archive "$base_sha" | tar -x -C "$base_dir"
 
 has_benchmarks() {
-  rg -l --glob '*_test.go' '^func Benchmark[A-Za-z0-9_]+\(' "$1" >/dev/null 2>&1
+  "$repo_dir/hack/has-benchmarks.sh" "$1"
 }
-if ! has_benchmarks "$candidate_dir"; then
+if has_benchmarks "$candidate_dir"; then
+  :
+else
+  benchmark_status=$?
+  if ((benchmark_status > 1)); then
+    printf 'unable to determine whether candidate %s contains Go benchmarks\n' "$expected_tip" >&2
+    exit 1
+  fi
   printf 'no Go benchmarks found at candidate %s; no baseline available for comparison\n' "$expected_tip" >&2
   exit 1
 fi
-if ! has_benchmarks "$base_dir"; then
+if has_benchmarks "$base_dir"; then
+  :
+else
+  benchmark_status=$?
+  if ((benchmark_status > 1)); then
+    printf 'unable to determine whether baseline %s contains Go benchmarks\n' "$base_sha" >&2
+    exit 1
+  fi
   printf 'no Go benchmark baseline found at %s; refusing to claim performance\n' "$base_sha" >&2
   exit 1
 fi
