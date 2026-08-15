@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if (($# != 2)); then
-  printf 'usage: %s EXPECTED_TIP_SHA EXPECTED_BASELINE_SHA\n' "$0" >&2
+if (($# != 4)); then
+  printf 'usage: %s EXPECTED_TIP_SHA EXPECTED_BASELINE_SHA DEFAULT_REMOTE_REF BASELINE_MODE\n' "$0" >&2
   exit 2
 fi
 
 expected_tip=$1
 expected_baseline=$2
+default_remote_ref=$3
+baseline_mode=$4
 if [[ ! "$expected_tip" =~ ^[0-9a-fA-F]{40}$ ]]; then
   printf 'expected tip SHA must be exactly 40 hexadecimal characters: %s\n' "$expected_tip" >&2
   exit 1
 fi
 if [[ ! "$expected_baseline" =~ ^[0-9a-fA-F]{40}$ ]]; then
   printf 'expected baseline SHA must be exactly 40 hexadecimal characters: %s\n' "$expected_baseline" >&2
+  exit 1
+fi
+if [[ "$baseline_mode" != "pull-request" && "$baseline_mode" != "dispatch" ]]; then
+  printf 'baseline mode must be pull-request or dispatch: %s\n' "$baseline_mode" >&2
   exit 1
 fi
 
@@ -43,6 +49,16 @@ fi
 if ! git merge-base --is-ancestor "$base_sha" "$expected_tip"; then
   printf 'expected tip %s is not descended from baseline %s; refusing comparison\n' "$expected_tip" "$base_sha" >&2
   exit 1
+fi
+if [[ "$baseline_mode" == "dispatch" ]]; then
+  default_head=$(git rev-parse --verify "${default_remote_ref}^{commit}") || {
+    printf 'fetched default-branch head is unavailable: %s\n' "$default_remote_ref" >&2
+    exit 1
+  }
+  if ! git merge-base --is-ancestor "$expected_baseline" "$default_head"; then
+    printf 'dispatch baseline %s is not an ancestor of fetched default-branch head %s\n' "$expected_baseline" "$default_head" >&2
+    exit 1
+  fi
 fi
 
 repo_dir=$(git rev-parse --show-toplevel)
@@ -91,10 +107,11 @@ run_benchmarks() {
 
 base_output="$tmp_dir/base.txt"
 candidate_output="$tmp_dir/candidate.txt"
-printf 'running deterministic baseline benchmarks from %s\n' "$base_sha"
+printf 'running fixed-setting baseline benchmarks from %s\n' "$base_sha"
 run_benchmarks "$base_dir" "$base_output"
-printf 'running deterministic candidate benchmarks from %s\n' "$expected_tip"
+printf 'running fixed-setting candidate benchmarks from %s\n' "$expected_tip"
 run_benchmarks "$candidate_dir" "$candidate_output"
 "$repo_dir/hack/compare-benchmarks.sh" "$base_output" "$candidate_output"
 
+printf 'Hosted benchmark comparison has no hard regression threshold yet; results are informational.\n'
 printf 'KIND validation and production performance gates are intentionally not part of this workflow yet.\n'

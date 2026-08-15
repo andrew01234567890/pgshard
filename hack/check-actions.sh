@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Validate the repository's workflow safety invariants without requiring a YAML parser.
+# Apply conservative textual guardrails; actionlint is the authoritative YAML check.
 # Usage: hack/check-actions.sh [workflow-directory]
 
 workflow_dir=${1:-.github/workflows}
@@ -19,7 +19,7 @@ fi
 
 failed=0
 for workflow in "${workflows[@]}"; do
-  if grep -nE '(^|[[:space:]])pull_request_target([[:space:]:]|$)' "$workflow"; then
+  if grep -nF 'pull_request_target' "$workflow"; then
     printf 'forbidden pull_request_target event in %s\n' "$workflow" >&2
     failed=1
   fi
@@ -29,13 +29,23 @@ for workflow in "${workflows[@]}"; do
     failed=1
   fi
 
-  if grep -nE '^permissions:[[:space:]]*(write|write-all|read-all)[[:space:]]*$' "$workflow"; then
-    printf 'broad top-level permissions in %s\n' "$workflow" >&2
+  if grep -nE '^[[:space:]]*permissions:[[:space:]]*(write|write-all|read-all)[[:space:]]*$' "$workflow"; then
+    printf 'broad permissions in %s\n' "$workflow" >&2
     failed=1
   fi
 
-  if grep -nE '\$\{\{[[:space:]]*secrets\.' "$workflow"; then
+  if grep -nE '^[[:space:]]*(contents|actions|pull-requests|issues|packages|id-token):[[:space:]]*write[[:space:]]*$' "$workflow"; then
+    printf 'unnecessary write permission in %s\n' "$workflow" >&2
+    failed=1
+  fi
+
+  if grep -nE '\$\{\{[[:space:]]*secrets' "$workflow"; then
     printf 'workflow references repository secrets; PR workflows must run without secrets: %s\n' "$workflow" >&2
+    failed=1
+  fi
+
+  if grep -nE 'github\.event\.pull_request\.title' "$workflow"; then
+    printf 'workflow interpolates an untrusted pull-request title: %s\n' "$workflow" >&2
     failed=1
   fi
 

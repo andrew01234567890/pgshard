@@ -9,7 +9,7 @@ on:
         required: true
         type: string
       expected_baseline_sha:
-        description: Exact 40-character SHA of the already merged baseline commit
+        description: Exact selected PR base SHA, or an already merged main SHA for dispatch
         required: true
         type: string
 
@@ -24,6 +24,7 @@ jobs:
   benchmark:
     name: Validate tip and compare Go benchmarks
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -39,11 +40,19 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Fetch default branch head for dispatch validation
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: git fetch --no-tags --prune origin "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+
       - name: Validate exact tip and compare benchmarks
         env:
           EXPECTED_TIP_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.expected_tip_sha }}
           EXPECTED_BASELINE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || inputs.expected_baseline_sha }}
-        run: hack/stack-tip.sh "$EXPECTED_TIP_SHA" "$EXPECTED_BASELINE_SHA"
+          DEFAULT_REMOTE_REF: refs/remotes/origin/${{ github.event.repository.default_branch }}
+          BASELINE_MODE: ${{ github.event_name == 'workflow_dispatch' && 'dispatch' || 'pull-request' }}
+        run: hack/stack-tip.sh "$EXPECTED_TIP_SHA" "$EXPECTED_BASELINE_SHA" "$DEFAULT_REMOTE_REF" "$BASELINE_MODE"
 
-      # This hosted comparison is deliberately limited to deterministic Go benchmark runs.
+      # This hosted comparison is deliberately limited to fixed-setting Go benchmark runs.
       # KIND validation and production performance gates are separate future work.

@@ -4,18 +4,20 @@ on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
 
 permissions:
   contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}
 
 jobs:
   go:
     name: Go checks
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -30,6 +32,18 @@ jobs:
 
       - name: Verify module metadata
         run: go mod verify
+
+      - name: Check module tidiness
+        run: go mod tidy -diff
+
+      - name: Install actionlint
+        run: |
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          GOBIN="$RUNNER_TEMP/actionlint" go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+          echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
+
+      - name: Run repository CI policy checks
+        run: hack/test-ci.sh
 
       - name: Check formatting
         run: make fmt-check

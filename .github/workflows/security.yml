@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
   schedule:
     - cron: '17 3 * * 1'
   workflow_dispatch:
@@ -13,12 +14,13 @@ permissions:
 
 concurrency:
   group: security-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}
 
 jobs:
   codeql:
     name: CodeQL
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       actions: read
       contents: read
@@ -52,19 +54,35 @@ jobs:
   govulncheck:
     name: govulncheck
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
-      - name: Run govulncheck
-        uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          go-package: ./...
-          check-latest: false
+          cache: true
+
+      - name: Install govulncheck
+        run: |
+          mkdir -p "$RUNNER_TEMP/govulncheck"
+          # golang.org/x/vuln v1.7.0, official source commit 617f44b718537dccdea1915395650e0529e3b72e.
+          GOBIN="$RUNNER_TEMP/govulncheck" go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+
+      - name: Run govulncheck
+        run: |
+          "$RUNNER_TEMP/govulncheck/govulncheck" ./...
 
   secret-scan:
     name: Secret scan
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
