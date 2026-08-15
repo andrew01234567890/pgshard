@@ -18,7 +18,12 @@ COMMANDS := \
 .PHONY: fmt-check vet test test-race build verify
 
 fmt-check:
-	@test -z "$$(gofmt -l $$(find . -type f -name '*.go' -not -path './$(BIN_DIR)/*'))"
+	@set -eu; \
+	offenders="$$(gofmt -l $$(find . -type f -name '*.go' -not -path './$(BIN_DIR)/*'))"; \
+	if [ -n "$$offenders" ]; then \
+		printf '%s\n' "$$offenders"; \
+		exit 1; \
+	fi
 
 vet:
 	$(GO) vet ./...
@@ -30,9 +35,10 @@ test-race:
 	$(GO) test -race ./...
 
 build:
-	@mkdir -p $(BIN_DIR)
-	@for command in $(COMMANDS); do \
-		$(GO) build $(GO_BUILD_FLAGS) -o $(BIN_DIR)/$$command ./cmd/$$command; \
+	@set -eu; \
+	mkdir -p $(BIN_DIR); \
+	for command in $(COMMANDS); do \
+		$(GO) build $(GO_BUILD_FLAGS) -o $(BIN_DIR)/$$command ./cmd/$$command || { status=$$?; exit $$status; }; \
 	done
 
 verify: fmt-check vet test test-race build
