@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Binds to 127.0.0.1 only; the container uses trust auth for local development.
 # Usage: hack/pg/run.sh <major> [name] [port]
 # Starts a throwaway PostgreSQL container for integration tests (trust auth, logical WAL, prepared xacts).
 set -euo pipefail
@@ -11,7 +12,7 @@ if ! docker image inspect "$image" >/dev/null 2>&1; then
   image="postgres:${major}"
 fi
 docker rm -f "$name" >/dev/null 2>&1 || true
-docker run -d --name "$name" -p "${port}:5432" -e PGDATA=/var/lib/postgresql/data --user postgres "$image" sh -c '
+docker run -d --name "$name" -p "127.0.0.1:${port}:5432" -e PGDATA=/var/lib/postgresql/data --user postgres "$image" sh -c '
   set -e
   [ -s "$PGDATA/PG_VERSION" ] || initdb -D "$PGDATA" --auth=trust --username=postgres >/dev/null
   echo "host all all 0.0.0.0/0 trust" >> "$PGDATA/pg_hba.conf"
