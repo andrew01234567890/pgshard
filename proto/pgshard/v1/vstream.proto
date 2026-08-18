@@ -1,0 +1,157 @@
+// Cluster-wide change stream contract for consumers of pgshard data.
+syntax = "proto3";
+
+package pgshard.v1;
+
+import "pgshard/v1/common.proto";
+
+option go_package = "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1;pgshardv1";
+
+// VStream merges per-shard change streams into one ordered event stream that
+// survives resharding.
+service VStream {
+  // Stream opens a change stream. The first request must carry start; later
+  // requests carry ack so the server may advance retained positions.
+  rpc Stream(stream VStreamRequest) returns (stream VEvent);
+}
+
+// VStreamRequest is either the initial start or a subsequent ack.
+message VStreamRequest {
+  oneof request {
+    VStreamStart start = 1;
+    // Consumer has durably processed everything up to this position.
+    Position ack = 2;
+  }
+}
+
+// VStreamStart configures a stream.
+message VStreamStart {
+  // Position to resume from; empty means the current position.
+  Position start = 1;
+  // True to first copy existing rows before streaming changes.
+  bool copy = 2;
+  // Database to stream.
+  string database = 3;
+  // Tables to stream; empty means all.
+  repeated string tables = 4;
+  // Stream options.
+  VStreamOptions options = 5;
+}
+
+// VStreamOptions tunes stream behaviour.
+message VStreamOptions {
+  // Emit Prepare/CommitPrepared/RollbackPrepared for two-phase transactions.
+  bool two_phase = 1;
+  // End the stream with a Journal event instead of following resharding.
+  bool stop_on_reshard = 2;
+  // Interval between Heartbeat events in milliseconds; zero disables.
+  uint32 heartbeat_interval_ms = 3;
+  // Prefer to keep shard streams close in time over throughput.
+  bool minimize_skew = 4;
+}
+
+// Column is one typed column value.
+message Column {
+  string name = 1;
+  // PostgreSQL type OID.
+  uint32 type_oid = 2;
+  bool null = 3;
+  // Text-format value bytes.
+  bytes value = 4;
+}
+
+// Tuple is one row image.
+message Tuple {
+  repeated Column columns = 1;
+}
+
+// VEvent is one change-stream event.
+message VEvent {
+  // Transaction begins on a shard.
+  message Begin {
+    ShardRef shard = 1;
+    uint32 xid = 2;
+    // Commit timestamp in microseconds since the PostgreSQL epoch, when known.
+    optional int64 commit_ts = 3;
+  }
+  // One row change.
+  message Row {
+    // Row change kind.
+    enum Kind {
+      KIND_UNSPECIFIED = 0;
+      KIND_INSERT = 1;
+      KIND_UPDATE = 2;
+      KIND_DELETE = 3;
+      KIND_TRUNCATE = 4;
+    }
+    string table = 1;
+    Kind kind = 2;
+    // Old image; present for UPDATE/DELETE when replica identity allows.
+    Tuple old = 3;
+    // New image; present for INSERT/UPDATE.
+    Tuple new = 4;
+  }
+  // Transaction commits on a shard.
+  message Commit {
+    ShardRef shard = 1;
+    uint64 lsn = 2;
+  }
+  // Heartbeat proves liveness while no changes flow.
+  message Heartbeat {}
+  // Journal announces a resharding event and where the stream continues.
+  message Journal {
+    // Target shard and the LSN to resume from on it.
+    message Target {
+      ShardRef shard = 1;
+      uint64 lsn = 2;
+    }
+    string journal_id = 1;
+    // Source shards participating in the reshard.
+    repeated ShardRef participants = 2;
+    repeated Target targets = 3;
+  }
+  // CopyCompleted marks the end of the initial copy phase for a table.
+  message CopyCompleted {
+    string table = 1;
+  }
+  // LastPK reports copy progress so a consumer can resume the copy.
+  message LastPK {
+    string table = 1;
+    Tuple pk = 2;
+  }
+  // DdlMarker records a DDL statement applied at this point.
+  message DdlMarker {
+    string database = 1;
+    string statement = 2;
+  }
+  // Prepare marks a two-phase transaction prepared.
+  message Prepare {
+    ShardRef shard = 1;
+    string gid = 2;
+  }
+  // CommitPrepared marks a prepared transaction committed.
+  message CommitPrepared {
+    ShardRef shard = 1;
+    string gid = 2;
+  }
+  // RollbackPrepared marks a prepared transaction rolled back.
+  message RollbackPrepared {
+    ShardRef shard = 1;
+    string gid = 2;
+  }
+  oneof event {
+    Begin begin = 1;
+    Row row = 2;
+    Commit commit = 3;
+    // Position the consumer may ack after processing preceding events.
+    Position position = 4;
+    Heartbeat heartbeat = 5;
+    Journal journal = 6;
+    CopyCompleted copy_completed = 7;
+    LastPK last_pk = 8;
+    DdlMarker ddl_marker = 9;
+    Prepare prepare = 10;
+    CommitPrepared commit_prepared = 11;
+    RollbackPrepared rollback_prepared = 12;
+  }
+}

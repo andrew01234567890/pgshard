@@ -1,0 +1,264 @@
+// Control plane to per-instance agent contract.
+syntax = "proto3";
+
+package pgshard.v1;
+
+import "pgshard/v1/common.proto";
+
+option go_package = "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1;pgshardv1";
+
+// Agent runs next to one PostgreSQL instance and applies lifecycle commands.
+//
+// Epoch fencing: every mutating command carries an epoch. The agent accepts a
+// command only when its epoch is strictly greater than the last accepted
+// epoch, persists the new epoch before acting, and otherwise responds with an
+// Error. Read-only commands (Status, ListSlots, RestoreInfo) are not fenced.
+service Agent {
+  // Status reports role, epoch and replication position. Read-only.
+  rpc Status(StatusRequest) returns (StatusResponse);
+  // Promote makes a standby the primary under the given epoch.
+  rpc Promote(PromoteRequest) returns (PromoteResponse);
+  // Demote turns a primary into a standby of the current lease holder.
+  rpc Demote(DemoteRequest) returns (DemoteResponse);
+  // Rewind runs pg_rewind against a source so a former primary can follow it.
+  rpc Rewind(RewindRequest) returns (RewindResponse);
+  // Reclone rebuilds the data directory from a source or backup.
+  rpc Reclone(RecloneRequest) returns (RecloneResponse);
+  // Reload signals the instance to reread its configuration.
+  rpc Reload(ReloadRequest) returns (ReloadResponse);
+  // Restart stops and starts the instance.
+  rpc Restart(RestartRequest) returns (RestartResponse);
+  // CreateRestorePoint creates a named WAL restore point.
+  rpc CreateRestorePoint(CreateRestorePointRequest) returns (CreateRestorePointResponse);
+  // CreateSlot creates a replication slot.
+  rpc CreateSlot(CreateSlotRequest) returns (CreateSlotResponse);
+  // DropSlot drops a replication slot.
+  rpc DropSlot(DropSlotRequest) returns (DropSlotResponse);
+  // ListSlots lists replication slots. Read-only.
+  rpc ListSlots(ListSlotsRequest) returns (ListSlotsResponse);
+  // Backup takes a base or incremental backup.
+  rpc Backup(BackupRequest) returns (BackupResponse);
+  // RestoreInfo reports what the instance was last restored from. Read-only.
+  rpc RestoreInfo(RestoreInfoRequest) returns (RestoreInfoResponse);
+}
+
+// StatusRequest asks for the instance status.
+message StatusRequest {}
+
+// StatusResponse describes the instance.
+message StatusResponse {
+  // Instance role.
+  enum Role {
+    ROLE_UNSPECIFIED = 0;
+    ROLE_PRIMARY = 1;
+    ROLE_STANDBY = 2;
+  }
+  Role role = 1;
+  // Last accepted epoch.
+  uint64 epoch = 2;
+  // Current write LSN on a primary or replay LSN on a standby.
+  uint64 lsn = 3;
+  // Current timeline id.
+  uint32 timeline = 4;
+  // True when PostgreSQL accepts connections.
+  bool running = 5;
+  Error error = 6;
+}
+
+// PromoteRequest promotes the instance.
+message PromoteRequest {
+  // Fencing epoch; must exceed the last accepted epoch.
+  uint64 epoch = 1;
+  // Identity of the lease holder authorising the promotion.
+  string lease_holder = 2;
+}
+
+// PromoteResponse reports the outcome.
+message PromoteResponse {
+  uint64 epoch = 1;
+  // Timeline id after promotion.
+  uint32 timeline = 2;
+  Error error = 3;
+}
+
+// DemoteRequest demotes the instance.
+message DemoteRequest {
+  // Fencing epoch; must exceed the last accepted epoch.
+  uint64 epoch = 1;
+}
+
+// DemoteResponse reports the outcome.
+message DemoteResponse {
+  uint64 epoch = 1;
+  Error error = 2;
+}
+
+// RewindRequest rewinds the instance to follow a source.
+message RewindRequest {
+  uint64 epoch = 1;
+  // Connection string of the source to rewind against.
+  string source = 2;
+}
+
+// RewindResponse reports the outcome.
+message RewindResponse {
+  uint64 epoch = 1;
+  Error error = 2;
+}
+
+// RecloneRequest rebuilds the data directory.
+message RecloneRequest {
+  // Where the clone comes from.
+  enum SourceKind {
+    SOURCE_KIND_UNSPECIFIED = 0;
+    // pg_basebackup from a live instance.
+    SOURCE_KIND_PRIMARY = 1;
+    // Restore from a backup repository.
+    SOURCE_KIND_BACKUP = 2;
+  }
+  uint64 epoch = 1;
+  SourceKind source_kind = 2;
+  // Backup identifier when source_kind is BACKUP.
+  string backup_ref = 3;
+}
+
+// RecloneResponse reports the outcome.
+message RecloneResponse {
+  uint64 epoch = 1;
+  Error error = 2;
+}
+
+// ReloadRequest reloads configuration.
+message ReloadRequest {
+  uint64 epoch = 1;
+}
+
+// ReloadResponse reports the outcome.
+message ReloadResponse {
+  uint64 epoch = 1;
+  Error error = 2;
+}
+
+// RestartRequest restarts the instance.
+message RestartRequest {
+  // Shutdown mode passed to pg_ctl.
+  enum Mode {
+    MODE_UNSPECIFIED = 0;
+    MODE_SMART = 1;
+    MODE_FAST = 2;
+    MODE_IMMEDIATE = 3;
+  }
+  uint64 epoch = 1;
+  Mode mode = 2;
+}
+
+// RestartResponse reports the outcome.
+message RestartResponse {
+  uint64 epoch = 1;
+  Error error = 2;
+}
+
+// CreateRestorePointRequest creates a named restore point.
+message CreateRestorePointRequest {
+  uint64 epoch = 1;
+  string name = 2;
+}
+
+// CreateRestorePointResponse reports the restore point LSN.
+message CreateRestorePointResponse {
+  uint64 epoch = 1;
+  uint64 lsn = 2;
+  Error error = 3;
+}
+
+// SlotKind distinguishes physical from logical slots.
+enum SlotKind {
+  SLOT_KIND_UNSPECIFIED = 0;
+  SLOT_KIND_PHYSICAL = 1;
+  SLOT_KIND_LOGICAL = 2;
+}
+
+// CreateSlotRequest creates a replication slot.
+message CreateSlotRequest {
+  uint64 epoch = 1;
+  string name = 2;
+  SlotKind kind = 3;
+  // Logical output plugin; ignored for physical slots.
+  string plugin = 4;
+  // True to synchronise the slot to standbys for failover.
+  bool failover = 5;
+}
+
+// CreateSlotResponse reports the slot's confirmed LSN.
+message CreateSlotResponse {
+  uint64 epoch = 1;
+  uint64 lsn = 2;
+  Error error = 3;
+}
+
+// DropSlotRequest drops a replication slot.
+message DropSlotRequest {
+  uint64 epoch = 1;
+  string name = 2;
+}
+
+// DropSlotResponse reports the outcome.
+message DropSlotResponse {
+  uint64 epoch = 1;
+  Error error = 2;
+}
+
+// ListSlotsRequest lists replication slots.
+message ListSlotsRequest {}
+
+// Slot describes one replication slot.
+message Slot {
+  string name = 1;
+  SlotKind kind = 2;
+  string plugin = 3;
+  bool failover = 4;
+  bool active = 5;
+  uint64 restart_lsn = 6;
+  uint64 confirmed_flush_lsn = 7;
+}
+
+// ListSlotsResponse returns the slots.
+message ListSlotsResponse {
+  uint64 epoch = 1;
+  repeated Slot slots = 2;
+  Error error = 3;
+}
+
+// BackupRequest takes a backup.
+message BackupRequest {
+  // Backup type.
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    TYPE_FULL = 1;
+    TYPE_DIFF = 2;
+    TYPE_INCR = 3;
+  }
+  uint64 epoch = 1;
+  Type type = 2;
+}
+
+// BackupResponse reports the backup reference.
+message BackupResponse {
+  uint64 epoch = 1;
+  // Identifier usable as RecloneRequest.backup_ref.
+  string backup_ref = 2;
+  Error error = 3;
+}
+
+// RestoreInfoRequest asks for restore provenance.
+message RestoreInfoRequest {}
+
+// RestoreInfoResponse describes the last restore.
+message RestoreInfoResponse {
+  uint64 epoch = 1;
+  // Backup the data directory was restored from; empty if never restored.
+  string backup_ref = 2;
+  // LSN at which recovery ended.
+  uint64 recovery_end_lsn = 3;
+  Error error = 4;
+}

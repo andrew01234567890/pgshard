@@ -1,0 +1,151 @@
+// Operator to controller contract: long-running workflows and DDL.
+syntax = "proto3";
+
+package pgshard.v1;
+
+import "pgshard/v1/common.proto";
+
+option go_package = "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1;pgshardv1";
+
+// Controller owns cluster-wide workflows such as resharding and DDL migration.
+service Controller {
+  // ListWorkflows lists workflows, optionally filtered by kind and state.
+  rpc ListWorkflows(ListWorkflowsRequest) returns (ListWorkflowsResponse);
+  // GetWorkflow returns one workflow.
+  rpc GetWorkflow(GetWorkflowRequest) returns (GetWorkflowResponse);
+  // PauseWorkflow suspends a running workflow at its next safe point.
+  rpc PauseWorkflow(PauseWorkflowRequest) returns (PauseWorkflowResponse);
+  // ResumeWorkflow continues a paused workflow.
+  rpc ResumeWorkflow(ResumeWorkflowRequest) returns (ResumeWorkflowResponse);
+  // ResolveTransactions triggers a resolution pass over in-doubt
+  // distributed transactions.
+  rpc ResolveTransactions(ResolveTransactionsRequest) returns (ResolveTransactionsResponse);
+  // ApplyDDL starts a DDL migration and streams per-shard progress.
+  rpc ApplyDDL(ApplyDDLRequest) returns (stream ApplyDDLResponse);
+}
+
+// WorkflowKind enumerates workflow types.
+enum WorkflowKind {
+  WORKFLOW_KIND_UNSPECIFIED = 0;
+  // Split or merge shards.
+  WORKFLOW_KIND_RESHARD = 1;
+  // Change the sharding key of a table.
+  WORKFLOW_KIND_REKEY = 2;
+  // Major-version PostgreSQL upgrade.
+  WORKFLOW_KIND_UPGRADE = 3;
+  // Online schema change.
+  WORKFLOW_KIND_DDL_MIGRATION = 4;
+}
+
+// WorkflowState enumerates workflow lifecycle states.
+enum WorkflowState {
+  WORKFLOW_STATE_UNSPECIFIED = 0;
+  WORKFLOW_STATE_PENDING = 1;
+  WORKFLOW_STATE_RUNNING = 2;
+  WORKFLOW_STATE_PAUSED = 3;
+  WORKFLOW_STATE_COMPLETED = 4;
+  WORKFLOW_STATE_FAILED = 5;
+  WORKFLOW_STATE_CANCELLED = 6;
+}
+
+// Workflow is a long-running controller operation.
+message Workflow {
+  string id = 1;
+  WorkflowKind kind = 2;
+  WorkflowState state = 3;
+  // Human-readable progress or failure description.
+  string message = 4;
+  // Shards touched by the workflow.
+  repeated ShardRef shards = 5;
+  Error error = 6;
+}
+
+// ListWorkflowsRequest filters workflows.
+message ListWorkflowsRequest {
+  // Zero value means any kind.
+  WorkflowKind kind = 1;
+  // Zero value means any state.
+  WorkflowState state = 2;
+}
+
+// ListWorkflowsResponse returns matching workflows.
+message ListWorkflowsResponse {
+  repeated Workflow workflows = 1;
+}
+
+// GetWorkflowRequest names a workflow.
+message GetWorkflowRequest {
+  string id = 1;
+}
+
+// GetWorkflowResponse returns the workflow.
+message GetWorkflowResponse {
+  Workflow workflow = 1;
+}
+
+// PauseWorkflowRequest names a workflow to pause.
+message PauseWorkflowRequest {
+  string id = 1;
+}
+
+// PauseWorkflowResponse returns the workflow after the request.
+message PauseWorkflowResponse {
+  Workflow workflow = 1;
+}
+
+// ResumeWorkflowRequest names a workflow to resume.
+message ResumeWorkflowRequest {
+  string id = 1;
+}
+
+// ResumeWorkflowResponse returns the workflow after the request.
+message ResumeWorkflowResponse {
+  Workflow workflow = 1;
+}
+
+// ResolveTransactionsRequest triggers resolution, optionally for one shard set.
+message ResolveTransactionsRequest {
+  // Empty means all shard sets.
+  string shard_set = 1;
+}
+
+// ResolveTransactionsResponse counts the outcomes of the pass.
+message ResolveTransactionsResponse {
+  uint32 committed = 1;
+  uint32 rolled_back = 2;
+  // Transactions still in doubt after the pass.
+  uint32 unresolved = 3;
+  Error error = 4;
+}
+
+// ApplyDDLRequest starts a DDL migration.
+message ApplyDDLRequest {
+  // Target database.
+  string database = 1;
+  // DDL statement to apply on every shard.
+  string statement = 2;
+  // True returns after the migration is registered; false streams to completion.
+  bool async = 3;
+}
+
+// ShardDDLState is the migration state on one shard.
+message ShardDDLState {
+  // Per-shard migration state.
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_QUEUED = 1;
+    STATE_RUNNING = 2;
+    STATE_COMPLETED = 3;
+    STATE_FAILED = 4;
+  }
+  ShardRef shard = 1;
+  State state = 2;
+  Error error = 3;
+}
+
+// ApplyDDLResponse is the first message with the migration id, then per-shard
+// state updates until the stream ends.
+message ApplyDDLResponse {
+  string migration_id = 1;
+  ShardDDLState shard_state = 2;
+}

@@ -7,7 +7,7 @@ LDFLAGS  := -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
             -X $(MODULE)/internal/buildinfo.Date=$(DATE)
 CMDS     := $(notdir $(wildcard cmd/*))
 
-.PHONY: build vet fmt-check lint test verify clean
+.PHONY: build vet fmt-check lint test verify clean proto proto-lint proto-breaking
 
 build:
 	@mkdir -p bin
@@ -25,7 +25,20 @@ lint:
 test:
 	go test -race ./...
 
-verify: fmt-check vet lint test build
+verify: fmt-check vet lint proto-lint test build
 
 clean:
 	rm -rf bin dist
+
+proto:
+	buf generate
+
+proto-lint:
+	buf lint
+
+proto-breaking:
+	@if git ls-tree -r --name-only main -- proto | grep -q '\.proto$$'; then \
+		buf breaking --against '.git#branch=main'; \
+	else \
+		echo "proto-breaking: no proto files on main, skipping"; \
+	fi
