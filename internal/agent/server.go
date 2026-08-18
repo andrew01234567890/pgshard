@@ -47,9 +47,15 @@ func pgErr(err error) *pgshardv1.Error {
 	return &pgshardv1.Error{Sqlstate: code, Message: err.Error()}
 }
 
-// fence accepts epoch or returns the stale-epoch error to embed.
+// fence accepts a strictly greater epoch (role changes) or returns the
+// stale-epoch error to embed.
 func (s *Server) fence(epoch uint64) error {
 	return s.epoch.Accept(epoch)
+}
+
+// fenceCurrent accepts only the current epoch (same-term operations).
+func (s *Server) fenceCurrent(epoch uint64) error {
+	return s.epoch.RequireCurrent(epoch)
 }
 
 // Status is read-only.
@@ -156,7 +162,7 @@ func (s *Server) Rewind(ctx context.Context, req *pgshardv1.RewindRequest) (*pgs
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	resp := &pgshardv1.RewindResponse{Epoch: s.epoch.Current()}
-	if err := s.fence(req.GetEpoch()); err != nil {
+	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
@@ -179,7 +185,7 @@ func (s *Server) Reclone(ctx context.Context, req *pgshardv1.RecloneRequest) (*p
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	resp := &pgshardv1.RecloneResponse{Epoch: s.epoch.Current()}
-	if err := s.fence(req.GetEpoch()); err != nil {
+	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
@@ -198,7 +204,7 @@ func (s *Server) Reload(ctx context.Context, req *pgshardv1.ReloadRequest) (*pgs
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	resp := &pgshardv1.ReloadResponse{Epoch: s.epoch.Current()}
-	if err := s.fence(req.GetEpoch()); err != nil {
+	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
@@ -214,7 +220,7 @@ func (s *Server) Restart(ctx context.Context, req *pgshardv1.RestartRequest) (*p
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	resp := &pgshardv1.RestartResponse{Epoch: s.epoch.Current()}
-	if err := s.fence(req.GetEpoch()); err != nil {
+	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
@@ -237,7 +243,7 @@ func (s *Server) Restart(ctx context.Context, req *pgshardv1.RestartRequest) (*p
 // CreateRestorePoint fences and creates a named restore point.
 func (s *Server) CreateRestorePoint(ctx context.Context, req *pgshardv1.CreateRestorePointRequest) (*pgshardv1.CreateRestorePointResponse, error) {
 	resp := &pgshardv1.CreateRestorePointResponse{Epoch: s.epoch.Current()}
-	if err := s.fence(req.GetEpoch()); err != nil {
+	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
@@ -252,7 +258,7 @@ func (s *Server) CreateRestorePoint(ctx context.Context, req *pgshardv1.CreateRe
 // CreateSlot fences and creates a physical or logical slot.
 func (s *Server) CreateSlot(ctx context.Context, req *pgshardv1.CreateSlotRequest) (*pgshardv1.CreateSlotResponse, error) {
 	resp := &pgshardv1.CreateSlotResponse{Epoch: s.epoch.Current()}
-	if err := s.fence(req.GetEpoch()); err != nil {
+	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
@@ -284,7 +290,7 @@ func (s *Server) CreateSlot(ctx context.Context, req *pgshardv1.CreateSlotReques
 // DropSlot fences and drops a slot.
 func (s *Server) DropSlot(ctx context.Context, req *pgshardv1.DropSlotRequest) (*pgshardv1.DropSlotResponse, error) {
 	resp := &pgshardv1.DropSlotResponse{Epoch: s.epoch.Current()}
-	if err := s.fence(req.GetEpoch()); err != nil {
+	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}

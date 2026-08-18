@@ -49,3 +49,24 @@ func TestEpochStoreRejectsCorruptFile(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+func TestRequireCurrentAcceptsOnlyTheCurrentEpoch(t *testing.T) {
+	s, err := OpenEpochStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Accept(3); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RequireCurrent(3); err != nil {
+		t.Fatalf("current epoch must be accepted: %v", err)
+	}
+	for _, e := range []uint64{0, 2, 4} {
+		if err := s.RequireCurrent(e); !errors.Is(err, ErrStaleEpoch) {
+			t.Fatalf("epoch %d must be rejected as stale, got %v", e, err)
+		}
+	}
+	if s.Current() != 3 {
+		t.Fatalf("RequireCurrent must not move the epoch, got %d", s.Current())
+	}
+}

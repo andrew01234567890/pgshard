@@ -46,6 +46,17 @@ func (s *EpochStore) Current() uint64 {
 	return s.cur
 }
 
+// RequireCurrent accepts epoch only when it equals the last accepted epoch:
+// same-term operations and idempotent retries pass, a stale controller is fenced.
+func (s *EpochStore) RequireCurrent(epoch uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if epoch != s.cur {
+		return fmt.Errorf("%w: got %d, current %d", ErrStaleEpoch, epoch, s.cur)
+	}
+	return nil
+}
+
 // Accept stores epoch if it is strictly greater than the current one; the
 // write is fsynced before returning so a crash cannot roll the fence back.
 func (s *EpochStore) Accept(epoch uint64) error {
