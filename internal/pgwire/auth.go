@@ -2,11 +2,7 @@ package pgwire
 
 import (
 	"context"
-	"crypto/md5" //nolint:gosec // MD5 is mandated by the PostgreSQL protocol.
-	"crypto/rand"
 	"crypto/subtle"
-	"encoding/hex"
-	"strings"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -39,10 +35,11 @@ func (TrustAuthenticator) Authenticate(context.Context, map[string]string, AuthE
 	return &AuthResult{}, nil
 }
 
-// PasswordLookup returns the stored secret for a user. For cleartext and MD5
-// it may be the plain password or an "md5<hex>" hash; for SCRAM it must be a
-// SCRAM-SHA-256 verifier string. Any error fails
-// authentication.
+// PasswordLookup returns the stored secret for a user. For cleartext it is
+// the plain password; for SCRAM it must be a SCRAM-SHA-256 verifier string.
+// Any error fails authentication. MD5 authentication is deliberately not
+// offered: pgshard roles only ever carry SCRAM verifiers, so an MD5 exchange
+// could never be verified, and the method is deprecated in PostgreSQL 18.
 type PasswordLookup func(ctx context.Context, user string) (string, error)
 
 func authFailed() error {
@@ -68,54 +65,10 @@ func (a CleartextAuthenticator) Authenticate(ctx context.Context, startup map[st
 	if err != nil {
 		return nil, authFailed()
 	}
-	if strings.HasPrefix(secret, "md5") {
-		if subtle.ConstantTimeCompare([]byte(md5Hex(pw.Password+user)), []byte(secret[3:])) != 1 {
-			return nil, authFailed()
-		}
-		return &AuthResult{}, nil
-	}
 	if subtle.ConstantTimeCompare([]byte(pw.Password), []byte(secret)) != 1 {
 		return nil, authFailed()
 	}
 	return &AuthResult{}, nil
-}
-
-// MD5Authenticator runs the salted MD5 challenge.
-type MD5Authenticator struct{ Lookup PasswordLookup }
-
-// Authenticate implements Authenticator.
-func (a MD5Authenticator) Authenticate(ctx context.Context, startup map[string]string, ex AuthExchange) (*AuthResult, error) {
-	user := startup["user"]
-	var salt [4]byte
-	if _, err := rand.Read(salt[:]); err != nil {
-		return nil, err
-	}
-	reply, err := ex.Request(&pgproto3.AuthenticationMD5Password{Salt: salt}, pgproto3.AuthTypeMD5Password)
-	if err != nil {
-		return nil, err
-	}
-	pw, ok := reply.(*pgproto3.PasswordMessage)
-	if !ok {
-		return nil, Errorf(CodeProtocolViolation, "expected password response, got %T", reply)
-	}
-	secret, err := a.Lookup(ctx, user)
-	if err != nil {
-		return nil, authFailed()
-	}
-	inner := secret
-	if !strings.HasPrefix(secret, "md5") {
-		inner = "md5" + md5Hex(secret+user)
-	}
-	want := "md5" + md5Hex(inner[3:]+string(salt[:]))
-	if subtle.ConstantTimeCompare([]byte(pw.Password), []byte(want)) != 1 {
-		return nil, authFailed()
-	}
-	return &AuthResult{}, nil
-}
-
-func md5Hex(s string) string {
-	sum := md5.Sum([]byte(s)) //nolint:gosec // protocol-mandated
-	return hex.EncodeToString(sum[:])
 }
 
 // SCRAMAuthenticator runs SCRAM-SHA-256 from a stored verifier. Only the

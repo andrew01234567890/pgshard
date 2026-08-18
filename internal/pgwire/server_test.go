@@ -458,8 +458,7 @@ func TestAuthenticators(t *testing.T) {
 		name string
 		auth Authenticator
 	}{
-		{"cleartext", CleartextAuthenticator{Lookup: lookup(map[string]string{"alice": "s3cret", "bob": "md5" + md5Hex("s3cretbob")})}},
-		{"md5", MD5Authenticator{Lookup: lookup(map[string]string{"alice": "s3cret", "bob": "md5" + md5Hex("s3cretbob")})}},
+		{"cleartext", CleartextAuthenticator{Lookup: lookup(map[string]string{"alice": "s3cret", "bob": "s3cret"})}},
 		{"scram", SCRAMAuthenticator{Lookup: lookup(map[string]string{"alice": scram.String(), "bob": scram.String()})}},
 	}
 	for _, c := range cases {
