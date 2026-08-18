@@ -1,0 +1,20 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pgshard-operator
+rules:
+  - apiGroups: ["pgshard.io"]
+    resources: ["pgshardclusters", "pgshardgroups"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["pgshard.io"]
+    resources: ["pgshardclusters/status", "pgshardgroups/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods", "persistentvolumeclaims", "services", "configmaps", "secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
