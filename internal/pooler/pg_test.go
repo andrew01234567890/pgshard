@@ -20,9 +20,15 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
 )
 
+// pgImages lists candidate images per major; the project image is preferred
+// and the official image is the fallback (used in CI until the project images
+// are published). One image per label is run.
 var pgImages = []struct{ name, label string }{
 	{"ghcr.io/andrew01234567890/pgshard-postgres:18", "pg18"},
+	{"postgres:18", "pg18"},
 	{"ghcr.io/andrew01234567890/pgshard-postgres:19", "pg19"},
+	{"postgres:19", "pg19"},
+	{"postgres:19beta3", "pg19"},
 }
 
 func TestPostgres(t *testing.T) {
@@ -33,7 +39,11 @@ func TestPostgres(t *testing.T) {
 		t.Skip("docker daemon unavailable")
 	}
 	ran := 0
+	seen := map[string]bool{}
 	for _, img := range pgImages {
+		if seen[img.label] {
+			continue
+		}
 		if exec.Command("docker", "image", "inspect", img.name).Run() != nil {
 			if out, err := exec.Command("docker", "pull", img.name).CombinedOutput(); err != nil {
 				t.Logf("image %s unavailable: %v: %s", img.name, err, out)
@@ -41,6 +51,7 @@ func TestPostgres(t *testing.T) {
 			}
 		}
 		ran++
+		seen[img.label] = true
 		t.Run(img.label, func(t *testing.T) { runPGSuite(t, img.name) })
 	}
 	if ran == 0 {
@@ -54,7 +65,7 @@ func startPostgres(t *testing.T, image string) (addr, adminDSN string) {
 	script := `initdb -D /tmp/pgdata --auth=trust -U postgres >/dev/null &&
 		 printf 'host all postgres all trust\nhost all all all scram-sha-256\n' >> /tmp/pgdata/pg_hba.conf &&
 		 exec postgres -D /tmp/pgdata -c listen_addresses='*'`
-	out, err := exec.Command("docker", "run", "-d", "--rm", "-p", fmt.Sprintf("127.0.0.1:%d:5432", port), image, "sh", "-ec", script).CombinedOutput()
+	out, err := exec.Command("docker", "run", "-d", "--rm", "-p", fmt.Sprintf("127.0.0.1:%d:5432", port), "--entrypoint", "sh", image, "-ec", script).CombinedOutput()
 	if err != nil {
 		t.Fatalf("docker run: %v: %s", err, out)
 	}
