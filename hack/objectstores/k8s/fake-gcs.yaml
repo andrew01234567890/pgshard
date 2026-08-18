@@ -1,0 +1,34 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: objectstores
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fake-gcs
+  namespace: objectstores
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: fake-gcs}
+  template:
+    metadata:
+      labels: {app: fake-gcs}
+    spec:
+      containers:
+        - name: fake-gcs
+          image: fsouza/fake-gcs-server:1.55.1
+          args: ["-scheme", "http", "-port", "4443", "-public-host", "fake-gcs.objectstores.svc:4443"]
+          ports:
+            - {containerPort: 4443, name: http}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fake-gcs
+  namespace: objectstores
+spec:
+  selector: {app: fake-gcs}
+  ports:
+    - {name: http, port: 4443, targetPort: 4443}
