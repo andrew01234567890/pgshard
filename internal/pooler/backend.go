@@ -38,6 +38,8 @@ type Backend struct {
 	lastUsed time.Time
 	txStatus byte
 	broken   bool
+	// unflushed counts messages buffered in fe but not yet written.
+	unflushed int
 }
 
 // dialBackend performs startup and SCRAM-SHA-256 with forwarded keys. It
@@ -131,13 +133,23 @@ func contains(xs []string, s string) bool {
 	return false
 }
 
-func (b *Backend) send(msg pgproto3.FrontendMessage) { b.fe.Send(msg) }
+// send buffers msg in the frontend; nothing reaches PostgreSQL until flush.
+func (b *Backend) send(msg pgproto3.FrontendMessage) {
+	b.fe.Send(msg)
+	b.unflushed++
+}
+
+// hasUnflushed reports whether buffered messages have not been written yet.
+// A backend in that state must never be reused or drained with a
+// simple query: that would flush the pending pipeline into PostgreSQL.
+func (b *Backend) hasUnflushed() bool { return b.unflushed > 0 }
 
 func (b *Backend) flush() error {
 	if err := b.fe.Flush(); err != nil {
 		b.broken = true
 		return err
 	}
+	b.unflushed = 0
 	return nil
 }
 

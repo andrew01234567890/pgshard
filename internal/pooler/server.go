@@ -175,6 +175,10 @@ func (r *relay) send(msg *pgshardv1.ExecuteResponse) error {
 }
 
 func (r *relay) refuse(e *pgshardv1.Error) error {
+	// A refused request must not leave buffered, never-flushed messages
+	// behind: a later Sync, Release (ROLLBACK/DISCARD ALL) or reuse would
+	// flush them into PostgreSQL after the client was told they failed.
+	r.dropUnflushed()
 	if err := r.send(errorResponse(r.se.id, e)); err != nil {
 		return err
 	}
@@ -184,6 +188,17 @@ func (r *relay) refuse(e *pgshardv1.Error) error {
 	}
 	return r.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_ReadyForQuery{
 		ReadyForQuery: &pgshardv1.ReadyForQuery{TxnStatus: txnStatus(st)}}})
+}
+
+// dropUnflushed discards a held backend whose pipeline still holds unflushed
+// messages, so those messages can never reach PostgreSQL.
+func (r *relay) dropUnflushed() {
+	b := r.backend()
+	if b == nil || !b.hasUnflushed() {
+		return
+	}
+	r.srv.cfg.Pool.Discard(b)
+	r.setBackend(nil)
 }
 
 func (r *relay) backend() *Backend {
@@ -318,6 +333,10 @@ func (s *Server) Release(_ context.Context, req *pgshardv1.ReleaseRequest) (*pgs
 	s.mu.Unlock()
 	s.forget(se)
 	if b == nil {
+		return &pgshardv1.ReleaseResponse{}, nil
+	}
+	if b.hasUnflushed() {
+		s.cfg.Pool.Discard(b)
 		return &pgshardv1.ReleaseResponse{}, nil
 	}
 	if !b.idle() {
