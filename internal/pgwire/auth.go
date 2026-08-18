@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -73,7 +74,33 @@ func (a CleartextAuthenticator) Authenticate(ctx context.Context, startup map[st
 
 // SCRAMAuthenticator runs SCRAM-SHA-256 from a stored verifier. Only the
 // plain mechanism is advertised; -PLUS, GSS and ident requests are refused.
-type SCRAMAuthenticator struct{ Lookup PasswordLookup }
+//
+// MockSecret seeds the deterministic salt of the throwaway exchange run for
+// unknown users, so that repeated probes see a stable salt exactly like a
+// real user would (PostgreSQL derives its mock salt the same way). When nil a
+// process-wide random secret is used.
+type SCRAMAuthenticator struct {
+	Lookup     PasswordLookup
+	MockSecret []byte
+}
+
+var processMockSecret = func() []byte {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		panic("pgwire: cannot seed mock secret: " + err.Error())
+	}
+	return b
+}()
+
+// mockSalt derives a stable, user-specific salt for the mock exchange.
+func (a SCRAMAuthenticator) mockSalt(user string) []byte {
+	secret := a.MockSecret
+	if len(secret) == 0 {
+		secret = processMockSecret
+	}
+	sum := hmacSHA256(secret, []byte("pgshard mock salt\x00"+user))
+	return sum[:16]
+}
 
 // Authenticate implements Authenticator.
 func (a SCRAMAuthenticator) Authenticate(ctx context.Context, startup map[string]string, ex AuthExchange) (*AuthResult, error) {
@@ -97,8 +124,10 @@ func (a SCRAMAuthenticator) Authenticate(ctx context.Context, startup map[string
 	verifier, perr := ParseSCRAMVerifier(secret)
 	if err != nil || perr != nil {
 		// Run a throwaway exchange so a missing user is indistinguishable
-		// from a wrong password, as PostgreSQL does with a mock verifier.
-		verifier, err = BuildSCRAMVerifier(user, nil, DefaultSCRAMIterations)
+		// from a wrong password, as PostgreSQL does with a mock verifier:
+		// the salt is deterministic per user so repeated probes cannot tell
+		// a mock exchange from a real one.
+		verifier, err = BuildSCRAMVerifier(user, a.mockSalt(user), DefaultSCRAMIterations)
 		if err != nil {
 			return nil, err
 		}
