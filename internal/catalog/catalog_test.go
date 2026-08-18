@@ -23,6 +23,7 @@ type pgImage struct {
 var candidateImages = []pgImage{
 	{name: "ghcr.io/andrew01234567890/pgshard-postgres:18", label: "pg18", bare: true},
 	{name: "postgres:18", label: "pg18"},
+	{name: "ghcr.io/andrew01234567890/pgshard-postgres:19", label: "pg19", bare: true},
 	{name: "postgres:19", label: "pg19"},
 	{name: "postgres:19beta2", label: "pg19"},
 }
@@ -233,6 +234,31 @@ func runSuite(t *testing.T, img pgImage) {
 			})
 		}
 
+		t.Run("move_between_shard_sets_checks_source", func(t *testing.T) {
+			mustExec(t, conn, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES
+				('src', 0, '[,0)'), ('src', 1, '[0,)'), ('dst', 0, '[,0)'), ('dst', 9, '[0,)')`)
+			tx, err := conn.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			mustTx(t, tx, `DELETE FROM pgshard.shard_ranges WHERE shard_set = 'dst' AND shard_id = 9`)
+			mustTx(t, tx, `UPDATE pgshard.shard_ranges SET shard_set = 'dst', shard_id = 1 WHERE shard_set = 'src' AND shard_id = 1`)
+			err = tx.Commit(ctx)
+			if err == nil {
+				t.Fatal("commit succeeded although the source shard set was left without its top range")
+			}
+			var pgErr *pgconn.PgError
+			if !errors.As(err, &pgErr) || pgErr.Code != "23514" || !strings.Contains(pgErr.Message, "src") {
+				t.Fatalf("expected check violation naming the source shard set, got %v", err)
+			}
+		})
+
+		t.Run("negative_shard_id_rejected", func(t *testing.T) {
+			_, err := conn.Exec(ctx, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES ('neg', -1, '[,)')`)
+			expectPgError(t, err, "23514", "shard_id")
+		})
+
 		t.Run("split_in_one_transaction", func(t *testing.T) {
 			tx, err := conn.Begin(ctx)
 			if err != nil {
@@ -307,6 +333,14 @@ func runSuite(t *testing.T, img pgImage) {
 		mustExec(t, reader, `SET ROLE `+RoleReader)
 		_, err = reader.Exec(ctx, `INSERT INTO pgshard.databases (name) VALUES ('by_reader')`)
 		expectPgError(t, err, "42501", "databases")
+		mustExec(t, admin, `INSERT INTO pgshard.roles (rolname, verifier) VALUES ('app', 'SCRAM-SHA-256$4096:c2FsdA==$c3RvcmVk:c2VydmVy')`)
+		if _, err := reader.Exec(ctx, `SELECT rolname, attributes FROM pgshard.roles`); err != nil {
+			t.Fatalf("reader must be able to list roles without verifiers: %v", err)
+		}
+		_, err = reader.Exec(ctx, `SELECT verifier FROM pgshard.roles`)
+		expectPgError(t, err, "42501", "roles")
+		_, err = reader.Exec(ctx, `SELECT * FROM pgshard.roles`)
+		expectPgError(t, err, "42501", "roles")
 	})
 
 	t.Run("status_read_api", func(t *testing.T) {

@@ -27,7 +27,7 @@ CREATE TABLE pgshard.tables (
 
 CREATE TABLE pgshard.shard_ranges (
     shard_set          text        NOT NULL DEFAULT 'default',
-    shard_id           integer     NOT NULL,
+    shard_id           integer     NOT NULL CHECK (shard_id >= 0),
     range              int8range   NOT NULL CHECK (NOT isempty(range)),
     desired_generation bigint      NOT NULL DEFAULT 0,
     updated_at         timestamptz NOT NULL DEFAULT now(),
@@ -42,8 +42,12 @@ DECLARE
     target   text;
     expected bigint;
     r        record;
+    targets  text[];
 BEGIN
-    target := CASE WHEN TG_OP = 'DELETE' THEN OLD.shard_set ELSE NEW.shard_set END;
+    targets := ARRAY[]::text[];
+    IF TG_OP IN ('DELETE', 'UPDATE') THEN targets := targets || OLD.shard_set; END IF;
+    IF TG_OP = 'INSERT' OR (TG_OP = 'UPDATE' AND OLD.shard_set IS DISTINCT FROM NEW.shard_set) THEN targets := targets || NEW.shard_set; END IF;
+    FOREACH target IN ARRAY targets LOOP
     expected := -9223372036854775808;
     FOR r IN
         SELECT shard_id, range FROM pgshard.shard_ranges
@@ -68,6 +72,7 @@ BEGIN
         RAISE EXCEPTION 'shard_set % does not extend to the top of the key space (ends at %)', target, expected
             USING ERRCODE = 'check_violation';
     END IF;
+    END LOOP;
     RETURN NULL;
 END
 $$;
@@ -116,7 +121,11 @@ BEGIN
             'CREATE TRIGGER notify_desired_delete AFTER DELETE ON pgshard.%I
              FOR EACH STATEMENT EXECUTE FUNCTION pgshard.notify_desired_change()', t);
         EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON pgshard.%I TO pgshard_admin', t);
-        EXECUTE format('GRANT SELECT ON pgshard.%I TO pgshard_reader', t);
+        IF t = 'roles' THEN
+            EXECUTE 'GRANT SELECT (rolname, attributes, desired_generation, updated_at) ON pgshard.roles TO pgshard_reader';
+        ELSE
+            EXECUTE format('GRANT SELECT ON pgshard.%I TO pgshard_reader', t);
+        END IF;
     END LOOP;
 END
 $$;
