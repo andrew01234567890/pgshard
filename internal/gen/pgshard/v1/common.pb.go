@@ -263,13 +263,17 @@ func (x *Error) GetHint() string {
 	return ""
 }
 
-// KeyRange is a half-open interval of hashed shard keys, [start, end_exclusive).
+// KeyRange is a closed interval of hashed shard keys, [start, end], over the
+// full signed 64-bit key space. Bounds are inclusive so that the whole space
+// [MinInt64, MaxInt64] and its top range are representable; the catalog stores
+// the same ranges as int8range with an unbounded upper bound, which maps to
+// end = MaxInt64.
 type KeyRange struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Inclusive lower bound.
 	Start int64 `protobuf:"varint,1,opt,name=start,proto3" json:"start,omitempty"`
-	// Exclusive upper bound.
-	EndExclusive  int64 `protobuf:"varint,2,opt,name=end_exclusive,json=endExclusive,proto3" json:"end_exclusive,omitempty"`
+	// Inclusive upper bound.
+	End           int64 `protobuf:"varint,2,opt,name=end,proto3" json:"end,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -311,9 +315,9 @@ func (x *KeyRange) GetStart() int64 {
 	return 0
 }
 
-func (x *KeyRange) GetEndExclusive() int64 {
+func (x *KeyRange) GetEnd() int64 {
 	if x != nil {
-		return x.EndExclusive
+		return x.End
 	}
 	return 0
 }
@@ -341,10 +345,10 @@ const file_pgshard_v1_common_proto_rawDesc = "" +
 	"\bsqlstate\x18\x01 \x01(\tR\bsqlstate\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12\x16\n" +
 	"\x06detail\x18\x03 \x01(\tR\x06detail\x12\x12\n" +
-	"\x04hint\x18\x04 \x01(\tR\x04hint\"E\n" +
+	"\x04hint\x18\x04 \x01(\tR\x04hint\"2\n" +
 	"\bKeyRange\x12\x14\n" +
-	"\x05start\x18\x01 \x01(\x03R\x05start\x12#\n" +
-	"\rend_exclusive\x18\x02 \x01(\x03R\fendExclusiveB\xae\x01\n" +
+	"\x05start\x18\x01 \x01(\x03R\x05start\x12\x10\n" +
+	"\x03end\x18\x02 \x01(\x03R\x03endB\xae\x01\n" +
 	"\x0ecom.pgshard.v1B\vCommonProtoP\x01ZFgithub.com/andrew01234567890/pgshard/internal/gen/pgshard/v1;pgshardv1\xa2\x02\x03PXX\xaa\x02\n" +
 	"Pgshard.V1\xca\x02\n" +
 	"Pgshard\\V1\xe2\x02\x16Pgshard\\V1\\GPBMetadata\xea\x02\vPgshard::V1b\x06proto3"

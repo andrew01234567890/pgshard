@@ -42,10 +42,14 @@ const (
 //
 // Agent runs next to one PostgreSQL instance and applies lifecycle commands.
 //
-// Epoch fencing: every mutating command carries an epoch. The agent accepts a
-// command only when its epoch is strictly greater than the last accepted
-// epoch, persists the new epoch before acting, and otherwise responds with an
-// Error. Read-only commands (Status, ListSlots, RestoreInfo) are not fenced.
+// Epoch fencing: role changes (Promote, Demote) carry a new epoch and are
+// accepted only when it is strictly greater than the last accepted epoch; the
+// agent persists the new epoch before acting. All other mutating commands
+// (Rewind, Reclone, Reload, Restart, CreateRestorePoint, slot and backup
+// operations) carry the caller's view of the current epoch and are accepted
+// only when it EQUALS the last accepted epoch, so a stale controller is fenced
+// while same-term operations and idempotent retries remain possible.
+// Read-only commands (Status, ListSlots, RestoreInfo) are not fenced.
 type AgentClient interface {
 	// Status reports role, epoch and replication position. Read-only.
 	Status(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResponse, error)
@@ -219,10 +223,14 @@ func (c *agentClient) RestoreInfo(ctx context.Context, in *RestoreInfoRequest, o
 //
 // Agent runs next to one PostgreSQL instance and applies lifecycle commands.
 //
-// Epoch fencing: every mutating command carries an epoch. The agent accepts a
-// command only when its epoch is strictly greater than the last accepted
-// epoch, persists the new epoch before acting, and otherwise responds with an
-// Error. Read-only commands (Status, ListSlots, RestoreInfo) are not fenced.
+// Epoch fencing: role changes (Promote, Demote) carry a new epoch and are
+// accepted only when it is strictly greater than the last accepted epoch; the
+// agent persists the new epoch before acting. All other mutating commands
+// (Rewind, Reclone, Reload, Restart, CreateRestorePoint, slot and backup
+// operations) carry the caller's view of the current epoch and are accepted
+// only when it EQUALS the last accepted epoch, so a stale controller is fenced
+// while same-term operations and idempotent retries remain possible.
+// Read-only commands (Status, ListSlots, RestoreInfo) are not fenced.
 type AgentServer interface {
 	// Status reports role, epoch and replication position. Read-only.
 	Status(context.Context, *StatusRequest) (*StatusResponse, error)

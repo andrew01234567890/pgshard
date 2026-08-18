@@ -9,10 +9,14 @@ option go_package = "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v
 
 // Agent runs next to one PostgreSQL instance and applies lifecycle commands.
 //
-// Epoch fencing: every mutating command carries an epoch. The agent accepts a
-// command only when its epoch is strictly greater than the last accepted
-// epoch, persists the new epoch before acting, and otherwise responds with an
-// Error. Read-only commands (Status, ListSlots, RestoreInfo) are not fenced.
+// Epoch fencing: role changes (Promote, Demote) carry a new epoch and are
+// accepted only when it is strictly greater than the last accepted epoch; the
+// agent persists the new epoch before acting. All other mutating commands
+// (Rewind, Reclone, Reload, Restart, CreateRestorePoint, slot and backup
+// operations) carry the caller's view of the current epoch and are accepted
+// only when it EQUALS the last accepted epoch, so a stale controller is fenced
+// while same-term operations and idempotent retries remain possible.
+// Read-only commands (Status, ListSlots, RestoreInfo) are not fenced.
 service Agent {
   // Status reports role, epoch and replication position. Read-only.
   rpc Status(StatusRequest) returns (StatusResponse);
@@ -95,6 +99,7 @@ message DemoteResponse {
 
 // RewindRequest rewinds the instance to follow a source.
 message RewindRequest {
+  // Caller's view of the current epoch; must EQUAL the last accepted epoch.
   uint64 epoch = 1;
   // Connection string of the source to rewind against.
   string source = 2;
@@ -130,6 +135,7 @@ message RecloneResponse {
 
 // ReloadRequest reloads configuration.
 message ReloadRequest {
+  // Caller's view of the current epoch; must EQUAL the last accepted epoch.
   uint64 epoch = 1;
 }
 
@@ -160,6 +166,7 @@ message RestartResponse {
 
 // CreateRestorePointRequest creates a named restore point.
 message CreateRestorePointRequest {
+  // Caller's view of the current epoch; must EQUAL the last accepted epoch.
   uint64 epoch = 1;
   string name = 2;
 }
@@ -180,6 +187,7 @@ enum SlotKind {
 
 // CreateSlotRequest creates a replication slot.
 message CreateSlotRequest {
+  // Caller's view of the current epoch; must EQUAL the last accepted epoch.
   uint64 epoch = 1;
   string name = 2;
   SlotKind kind = 3;
@@ -198,6 +206,7 @@ message CreateSlotResponse {
 
 // DropSlotRequest drops a replication slot.
 message DropSlotRequest {
+  // Caller's view of the current epoch; must EQUAL the last accepted epoch.
   uint64 epoch = 1;
   string name = 2;
 }

@@ -626,7 +626,8 @@ func (x *DemoteResponse) GetError() *Error {
 // RewindRequest rewinds the instance to follow a source.
 type RewindRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	Epoch uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	// Caller's view of the current epoch; must EQUAL the last accepted epoch.
+	Epoch uint64 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
 	// Connection string of the source to rewind against.
 	Source        string `protobuf:"bytes,2,opt,name=source,proto3" json:"source,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -847,8 +848,9 @@ func (x *RecloneResponse) GetError() *Error {
 
 // ReloadRequest reloads configuration.
 type ReloadRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Epoch         uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Caller's view of the current epoch; must EQUAL the last accepted epoch.
+	Epoch         uint64 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1051,9 +1053,10 @@ func (x *RestartResponse) GetError() *Error {
 
 // CreateRestorePointRequest creates a named restore point.
 type CreateRestorePointRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Epoch         uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	Name          string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Caller's view of the current epoch; must EQUAL the last accepted epoch.
+	Epoch         uint64 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	Name          string `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1166,9 +1169,10 @@ func (x *CreateRestorePointResponse) GetError() *Error {
 // CreateSlotRequest creates a replication slot.
 type CreateSlotRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	Epoch uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	Name  string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
-	Kind  SlotKind               `protobuf:"varint,3,opt,name=kind,proto3,enum=pgshard.v1.SlotKind" json:"kind,omitempty"`
+	// Caller's view of the current epoch; must EQUAL the last accepted epoch.
+	Epoch uint64   `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	Name  string   `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	Kind  SlotKind `protobuf:"varint,3,opt,name=kind,proto3,enum=pgshard.v1.SlotKind" json:"kind,omitempty"`
 	// Logical output plugin; ignored for physical slots.
 	Plugin string `protobuf:"bytes,4,opt,name=plugin,proto3" json:"plugin,omitempty"`
 	// True to synchronise the slot to standbys for failover.
@@ -1305,9 +1309,10 @@ func (x *CreateSlotResponse) GetError() *Error {
 
 // DropSlotRequest drops a replication slot.
 type DropSlotRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Epoch         uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	Name          string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Caller's view of the current epoch; must EQUAL the last accepted epoch.
+	Epoch         uint64 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	Name          string `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }

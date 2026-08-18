@@ -43,10 +43,14 @@ message Error {
   string hint = 4;
 }
 
-// KeyRange is a half-open interval of hashed shard keys, [start, end_exclusive).
+// KeyRange is a closed interval of hashed shard keys, [start, end], over the
+// full signed 64-bit key space. Bounds are inclusive so that the whole space
+// [MinInt64, MaxInt64] and its top range are representable; the catalog stores
+// the same ranges as int8range with an unbounded upper bound, which maps to
+// end = MaxInt64.
 message KeyRange {
   // Inclusive lower bound.
   int64 start = 1;
-  // Exclusive upper bound.
-  int64 end_exclusive = 2;
+  // Inclusive upper bound.
+  int64 end = 2;
 }
