@@ -42,3 +42,17 @@ proto-breaking:
 	else \
 		echo "proto-breaking: no proto files on main, skipping"; \
 	fi
+
+.PHONY: kind-up kind-down e2e perf-bench
+
+kind-up:
+	hack/kind/up.sh
+
+kind-down:
+	hack/kind/down.sh
+
+e2e:
+	go test -tags e2e -count=1 -v ./test/e2e/...
+
+perf-bench:
+	hack/perf/benchstat.sh $(PERF_BASE_REF) $(PERF_OUT_DIR)
