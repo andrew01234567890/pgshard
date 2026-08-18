@@ -3,48 +3,25 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
-	"math/big"
-	"net"
-	"os"
-	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/andrew01234567890/pgshard/internal/router"
 )
-
-type syncBuffer struct {
-	mu sync.Mutex
-	b  bytes.Buffer
-}
-
-func (s *syncBuffer) Write(p []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.b.Write(p)
-}
-
-func (s *syncBuffer) String() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.b.String()
-}
 
 func TestServeUsageErrors(t *testing.T) {
 	cases := [][]string{
 		{"--bogus"},
 		{"extra"},
-		{"--tls-cert", "x"},
-		{"--tls-key", "x"},
-		{"--tls-cert", "/nonexistent/c", "--tls-key", "/nonexistent/k"},
+		{"--tls-cert", "x", "--catalog-dsn", "postgres://x/y", "--insecure-dev"},
+		{"--tls-key", "x", "--catalog-dsn", "postgres://x/y", "--insecure-dev"},
+		{"--catalog-dsn", "postgres://x/y", "--tls-cert", "/nonexistent/c", "--tls-key", "/nonexistent/k", "--insecure-dev"},
+		{"--insecure-dev"},
+		{"--catalog-dsn", "postgres://x/y"},
+		{"--catalog-dsn", "postgres://x/y", "--insecure-dev", "--pooler-tls-ca", "/x"},
+		{"--catalog-dsn", "postgres://x/y", "--insecure-dev", "--pooler", "nonsense"},
+		{"--catalog-dsn", "postgres://x/y", "--pooler-tls-cert", "/nonexistent/c", "--pooler-tls-key", "/nonexistent/k", "--pooler-tls-ca", "/nonexistent/ca"},
+		{"--catalog-dsn", "not a dsn", "--insecure-dev"},
 	}
 	for _, args := range cases {
 		var out, errb bytes.Buffer
@@ -53,104 +30,47 @@ func TestServeUsageErrors(t *testing.T) {
 		}
 	}
 	var out, errb bytes.Buffer
-	if code := runServe(context.Background(), []string{"--help"}, &out, &errb); code != 0 || !strings.Contains(errb.String(), "-listen") {
+	if code := runServe(context.Background(), []string{"--help"}, &out, &errb); code != 0 || !strings.Contains(errb.String(), "-catalog-dsn") {
 		t.Fatalf("--help: code %d, %q", code, errb.String())
 	}
-	if code := runServe(context.Background(), []string{"--listen", "127.0.0.1:1"}, &out, &errb); code != 1 {
-		t.Fatalf("privileged port: code %d", code)
+}
+
+func TestServeNeedsReachableCatalog(t *testing.T) {
+	var out, errb bytes.Buffer
+	code := runServe(context.Background(), []string{"--catalog-dsn", "postgres://nobody@127.0.0.1:1/x?connect_timeout=1", "--insecure-dev"}, &out, &errb)
+	if code != 1 || !strings.Contains(errb.String(), "catalog roles") {
+		t.Fatalf("code %d stderr %q", code, errb.String())
 	}
 }
 
-func startServe(t *testing.T, args ...string) (addr string, done <-chan int, cancel context.CancelFunc) {
-	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	out := &syncBuffer{}
-	errb := &syncBuffer{}
-	codes := make(chan int, 1)
-	go func() {
-		codes <- runServe(ctx, append([]string{"--listen", "127.0.0.1:0", "--drain-timeout", "5s"}, args...), out, errb)
-	}()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if _, after, ok := strings.Cut(out.String(), "listening on "); ok {
-			addr, _, _ = strings.Cut(after, " ")
-			break
+func TestPoolerFlags(t *testing.T) {
+	p := poolerFlags{}
+	for _, v := range []string{"0=127.0.0.1:1", "orders/3=h:2", "catalog/0=c:3"} {
+		if err := p.Set(v); err != nil {
+			t.Fatal(err)
 		}
-		select {
-		case code := <-codes:
-			t.Fatalf("serve exited early with %d: %s", code, errb.String())
-		default:
+	}
+	want := map[router.Shard]string{{Set: "default", ID: 0}: "127.0.0.1:1", {Set: "orders", ID: 3}: "h:2", {Set: "catalog", ID: 0}: "c:3"}
+	for k, v := range want {
+		if p[k] != v {
+			t.Errorf("%v: got %q want %q", k, p[k], v)
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("serve did not report its address: %q %q", out.String(), errb.String())
+	}
+	for _, bad := range []string{"", "x", "a=", "=b", "/1=h:1", "q/1=h:1=", "one=h:1"} {
+		if err := (poolerFlags{}).Set(bad); err == nil && bad != "q/1=h:1=" {
+			t.Errorf("%q accepted", bad)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
-	return addr, codes, cancel
-}
-
-func TestServeAnswersSelectOneAndDrains(t *testing.T) {
-	addr, done, cancel := startServe(t)
-	conn, err := pgx.Connect(context.Background(), "postgres://alice@"+addr+"/db?sslmode=disable")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var n int
-	if err := conn.QueryRow(context.Background(), "select 1").Scan(&n); err != nil || n != 1 {
-		t.Fatalf("select 1: %d %v", n, err)
-	}
-	if _, err := pgx.Connect(context.Background(), "postgres://alice@"+addr+"/db?sslmode=require"); err == nil {
-		t.Fatal("TLS should be unavailable without --tls-cert")
-	}
-	cancel()
-	select {
-	case code := <-done:
-		if code != 0 {
-			t.Fatalf("exit code %d", code)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("serve did not stop")
-	}
-	if err := conn.Ping(context.Background()); err == nil {
-		t.Fatal("idle connection should have been terminated on shutdown")
-	}
-	if _, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
-		t.Fatal("listener should be closed")
+	if !strings.Contains(p.String(), "orders") {
+		t.Fatalf("String %q", p.String())
 	}
 }
 
-func TestServeWithTLS(t *testing.T) {
-	dir := t.TempDir()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "router"},
-		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyDER, err := x509.MarshalECPrivateKey(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	certPath, keyPath := filepath.Join(dir, "c.pem"), filepath.Join(dir, "k.pem")
-	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	addr, done, cancel := startServe(t, "--tls-cert", certPath, "--tls-key", keyPath)
-	defer func() { cancel(); <-done }()
-	conn, err := pgx.Connect(context.Background(), "postgres://alice@"+addr+"/db?sslmode=require")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = conn.Close(context.Background()) }()
-	var n int
-	if err := conn.QueryRow(context.Background(), "select 1").Scan(&n); err != nil || n != 1 {
-		t.Fatalf("select 1 over TLS: %d %v", n, err)
+func TestListenNetwork(t *testing.T) {
+	cases := map[string]string{"0.0.0.0:5432": "tcp4", "127.0.0.1:1": "tcp4", "[::]:5432": "tcp", ":5432": "tcp", "localhost:5432": "tcp", "bad": "tcp"}
+	for addr, want := range cases {
+		if got := listenNetwork(addr); got != want {
+			t.Errorf("%s: got %s want %s", addr, got, want)
+		}
 	}
 }

@@ -1,7 +1,13 @@
-# Local development stack: catalog + 3 shard PostgreSQL instances and object-store emulators.
+# Local development stack: catalog + 3 shard PostgreSQL instances, object-store
+# emulators, and the single-shard data path (pooler for shard0 + router).
 #
 # PG_IMAGE defaults to the project image; if it is not published yet, run with
 #   PG_IMAGE=postgres:18 docker compose -f hack/compose/docker-compose.yml up
+#
+# The data path (catalog-init, pooler-shard0, router) is under the "router"
+# profile so the bare databases can still be started alone:
+#   PG_IMAGE=postgres:18 docker compose -f hack/compose/docker-compose.yml --profile router up --build
+#   psql "postgres://app:app-secret@localhost:6432/app"
 services:
   catalog:
     image: ${PG_IMAGE:-ghcr.io/andrew01234567890/pgshard-postgres:18}
@@ -36,6 +42,54 @@ services:
       POSTGRES_PASSWORD: pgshard
     ports: ["5435:5432"]
     healthcheck: *pghealth
+  # Migrates the catalog and registers database "app" and role "app" (password
+  # from PGSHARD_DEV_PASSWORD, default app-secret) on the catalog and shard0.
+  catalog-init:
+    profiles: ["router"]
+    build: &routerbuild
+      context: ../..
+      dockerfile: Dockerfile.router
+    image: pgshard-router:dev
+    depends_on:
+      catalog: {condition: service_healthy}
+      shard0: {condition: service_healthy}
+    environment:
+      PGSHARD_DEV_PASSWORD: ${PGSHARD_DEV_PASSWORD:-app-secret}
+    command:
+      - dev-bootstrap
+      - --catalog-dsn=postgres://postgres:pgshard@catalog:5432/catalog?sslmode=disable
+      - --shard-dsn=postgres://postgres:pgshard@shard0:5432/postgres?sslmode=disable
+      - --pooler-endpoint=pooler-shard0:15432
+    restart: "no"
+  pooler-shard0:
+    profiles: ["router"]
+    build: *routerbuild
+    image: pgshard-router:dev
+    depends_on:
+      catalog-init: {condition: service_completed_successfully}
+    entrypoint: ["pgshard-pooler"]
+    command:
+      - run
+      - --insecure-dev
+      - --listen=0.0.0.0:15432
+      - --pg-host=shard0
+      - --pg-port=5432
+      - --pg-database=app
+      - --catalog-dsn=postgres://postgres:pgshard@catalog:5432/catalog?sslmode=disable
+      - --shard-set=default
+      - --shard-id=0
+  router:
+    profiles: ["router"]
+    build: *routerbuild
+    image: pgshard-router:dev
+    depends_on:
+      pooler-shard0: {condition: service_started}
+    command:
+      - serve
+      - --insecure-dev
+      - --listen=0.0.0.0:6432
+      - --catalog-dsn=postgres://postgres:pgshard@catalog:5432/catalog?sslmode=disable
+    ports: ["6432:6432"]
   minio:
     image: minio/minio:RELEASE.2025-10-15T17-29-55Z
     command: ["server", "/data", "--console-address", ":9001"]

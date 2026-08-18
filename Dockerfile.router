@@ -1,0 +1,19 @@
+# syntax=docker/dockerfile:1
+# Router and pooler binaries for the local compose stack. The router links the
+# PostgreSQL parser through cgo, so the build stage needs a C toolchain and a glibc with strlcpy (Debian trixie or newer).
+FROM golang:1.26-trixie AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=1 go build -trimpath -o /out/pgshard-router ./cmd/pgshard-router && \
+    CGO_ENABLED=0 go build -trimpath -o /out/pgshard-pooler ./cmd/pgshard-pooler
+
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin pgshard
+COPY --from=build /out/pgshard-router /out/pgshard-pooler /usr/local/bin/
+USER pgshard
+ENTRYPOINT ["pgshard-router"]
+CMD ["serve"]

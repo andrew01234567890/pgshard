@@ -1,0 +1,570 @@
+package router
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgproto3"
+
+	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
+	"github.com/andrew01234567890/pgshard/internal/pgwire"
+)
+
+const (
+	codeConnectionFailure = "08006"
+	maxIdentifierLen      = 63
+	releaseTimeout        = 5 * time.Second
+)
+
+type prepared struct {
+	sql   string
+	oids  []uint32
+	class StmtClass
+}
+
+type gucEntry struct {
+	name string
+	sql  string
+}
+
+// Executor is the router's pgwire.Executor: one client session relayed to
+// its home shard's pooler.
+type Executor struct {
+	r     *Router
+	info  pgwire.SessionInfo
+	sid   string
+	home  Shard
+	ident *pgshardv1.UserIdentity
+
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	conn     *poolerStream
+	pinned   bool
+	tx       pgwire.TxStatus
+	lastTag  string
+	txnEnded bool
+	// cancelSent dedupes cancel requests within one batch.
+	cancelSent atomic.Bool
+
+	gucs   []gucEntry
+	staged []gucEntry
+	// stagedMark is the staged length before the current extended batch.
+	stagedMark int
+	stmts      map[string]prepared
+	// portals maps portal names to logical statement names.
+	portals map[string]string
+
+	batch       []*pgshardv1.ExecuteRequest
+	batchStmts  []string
+	batchFailed bool
+	batchWriter pgwire.ResultWriter
+}
+
+func newExecutor(r *Router, info pgwire.SessionInfo, home Shard) *Executor {
+	ctx, cancel := context.WithCancel(context.Background())
+	keys := info.Auth.SCRAM
+	return &Executor{
+		r: r, info: info, sid: r.prefix + "-" + strconv.FormatUint(info.ID, 10), home: home,
+		ident: &pgshardv1.UserIdentity{Username: info.User,
+			ScramClientKey: append([]byte(nil), keys.ClientKey...), ScramServerKey: append([]byte(nil), keys.ServerKey...)},
+		ctx: ctx, cancel: cancel, tx: pgwire.TxIdle,
+		stmts: map[string]prepared{}, portals: map[string]string{},
+	}
+}
+
+// Home reports the shard this session is bound to.
+func (e *Executor) Home() Shard { return e.home }
+
+// TransactionStatus implements pgwire.Executor.
+func (e *Executor) TransactionStatus() pgwire.TxStatus { return e.tx }
+
+// physical maps a client statement name onto the per-session backend name.
+func (e *Executor) physical(name string) string {
+	if name == "" {
+		return ""
+	}
+	p := "pgshard_" + strconv.FormatUint(e.info.ID, 10) + "_"
+	if len(p)+len(name) > maxIdentifierLen {
+		sum := sha256.Sum256([]byte(name))
+		return p + "h" + hex.EncodeToString(sum[:12])
+	}
+	return p + name
+}
+
+func (e *Executor) needsPin() bool {
+	if len(e.gucs) > 0 || len(e.staged) > 0 {
+		return true
+	}
+	for name := range e.stmts {
+		if name != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// SimpleQuery implements pgwire.Executor.
+func (e *Executor) SimpleQuery(ctx context.Context, sql string, w pgwire.ResultWriter) error {
+	plan, err := e.r.cfg.Planner.Plan(ctx, e.home, sql)
+	if err != nil {
+		return err
+	}
+	if err := e.acquire(ctx, nil); err != nil {
+		return err
+	}
+	if plan.Class.SetGUC {
+		if err := e.ensurePinned(ctx); err != nil {
+			return err
+		}
+	}
+	if err := e.send(simpleQuery(sql)); err != nil {
+		return err
+	}
+	err = e.pump(ctx, w)
+	if plan.Class.SetGUC && err == nil {
+		e.staged = append(e.staged, gucEntry{name: plan.Class.GUCName, sql: sql})
+	}
+	return e.afterBatch(ctx, err)
+}
+
+// Parse implements pgwire.Executor: the message is buffered until Sync.
+func (e *Executor) Parse(ctx context.Context, name, sql string, paramOIDs []uint32) error {
+	if e.batchFailed {
+		return nil
+	}
+	plan, err := e.r.cfg.Planner.Plan(ctx, e.home, sql)
+	if err != nil {
+		e.failBatch()
+		return err
+	}
+	e.stmts[name] = prepared{sql: sql, oids: paramOIDs, class: plan.Class}
+	e.batchStmts = append(e.batchStmts, name)
+	e.batch = append(e.batch, parseReq(e.physical(name), sql, paramOIDs))
+	return nil
+}
+
+// Bind implements pgwire.Executor.
+func (e *Executor) Bind(_ context.Context, portal, statement string, paramFormats []int16, params [][]byte, resultFormats []int16) error {
+	if e.batchFailed {
+		return nil
+	}
+	e.portals[portal] = statement
+	e.batch = append(e.batch, bindReq(portal, e.physical(statement), paramFormats, params, resultFormats))
+	return nil
+}
+
+// Describe implements pgwire.Executor.
+func (e *Executor) Describe(_ context.Context, kind pgwire.DescribeKind, name string, w pgwire.ResultWriter) error {
+	if e.batchFailed {
+		return nil
+	}
+	e.batchWriter = w
+	if kind == pgwire.DescribeStatement {
+		name = e.physical(name)
+	}
+	e.batch = append(e.batch, describeReq(kind, name))
+	return nil
+}
+
+// Execute implements pgwire.Executor.
+func (e *Executor) Execute(_ context.Context, portal string, maxRows int32, w pgwire.ResultWriter) error {
+	if e.batchFailed {
+		return nil
+	}
+	e.batchWriter = w
+	if st, ok := e.stmts[e.portals[portal]]; ok && st.class.SetGUC {
+		e.staged = append(e.staged, gucEntry{name: st.class.GUCName, sql: st.sql})
+	}
+	e.batch = append(e.batch, executeReq(portal, maxRows))
+	return nil
+}
+
+// Close implements pgwire.Executor.
+func (e *Executor) Close(_ context.Context, kind pgwire.DescribeKind, name string) error {
+	if e.batchFailed {
+		return nil
+	}
+	if kind == pgwire.DescribeStatement {
+		delete(e.stmts, name)
+		name = e.physical(name)
+	} else {
+		delete(e.portals, name)
+	}
+	e.batch = append(e.batch, closeReq(kind, name))
+	return nil
+}
+
+func (e *Executor) failBatch() {
+	for _, name := range e.batchStmts {
+		delete(e.stmts, name)
+	}
+	e.staged = e.staged[:e.stagedMark]
+	e.batch, e.batchStmts, e.batchFailed, e.batchWriter = nil, nil, true, nil
+}
+
+// Sync implements pgwire.Executor: it ships the buffered batch followed by
+// Sync and relays every response.
+func (e *Executor) Sync(ctx context.Context) error {
+	if e.batchFailed {
+		e.batchFailed = false
+		return nil
+	}
+	batch, w := e.batch, e.batchWriter
+	pin := false
+	fresh := map[string]bool{}
+	for _, name := range e.batchStmts {
+		pin = pin || name != ""
+		fresh[name] = true
+	}
+	e.batch, e.batchStmts, e.batchWriter = nil, nil, nil
+	if len(batch) == 0 {
+		return nil
+	}
+	if err := e.acquire(ctx, fresh); err != nil {
+		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
+		return err
+	}
+	if pin || len(e.staged) > e.stagedMark {
+		if err := e.ensurePinned(ctx); err != nil {
+			e.staged = e.staged[:e.stagedMark]
+			return err
+		}
+	}
+	for _, req := range batch {
+		if err := e.send(req); err != nil {
+			return err
+		}
+	}
+	if err := e.send(syncReq()); err != nil {
+		return err
+	}
+	if w == nil {
+		w = discardWriter{}
+	}
+	return e.afterBatch(ctx, e.pump(ctx, w))
+}
+
+// afterBatch settles staged GUCs and releases the pinned backend when a
+// transaction just ended.
+func (e *Executor) afterBatch(ctx context.Context, err error) error {
+	if e.tx == pgwire.TxIdle {
+		switch {
+		case err != nil || strings.HasPrefix(e.lastTag, "ROLLBACK"):
+			e.staged = nil
+		default:
+			e.applyStaged()
+		}
+	}
+	if e.txnEnded && e.pinned {
+		e.txnEnded = false
+		if rerr := e.release(ctx); rerr != nil && err == nil {
+			err = rerr
+		}
+	}
+	e.txnEnded = false
+	e.stagedMark = len(e.staged)
+	return err
+}
+
+func (e *Executor) applyStaged() {
+	for _, g := range e.staged {
+		if g.name == "" {
+			e.gucs = nil
+			continue
+		}
+		kept := e.gucs[:0]
+		for _, old := range e.gucs {
+			if old.name != g.name {
+				kept = append(kept, old)
+			}
+		}
+		kept = append(kept, g)
+		e.gucs = kept
+	}
+	e.staged = nil
+}
+
+func (e *Executor) generation() *pgshardv1.Generation { return e.r.cfg.Poolers.Generation(e.home) }
+
+func (e *Executor) client() (pgshardv1.PoolerClient, error) { return e.r.cfg.Poolers.Client(e.home) }
+
+// acquire opens the pooler stream when needed; statements named in fresh
+// are being parsed by the current batch and are not replayed.
+func (e *Executor) acquire(ctx context.Context, fresh map[string]bool) error {
+	if e.conn != nil {
+		return nil
+	}
+	client, err := e.client()
+	if err != nil {
+		return err
+	}
+	ps, err := openStream(e.ctx, client)
+	if err != nil {
+		return e.poolerLost(err)
+	}
+	e.conn = ps
+	if !e.needsPin() {
+		return nil
+	}
+	if err := e.ensurePinned(ctx); err != nil {
+		return err
+	}
+	return e.replay(ctx, fresh)
+}
+
+func (e *Executor) ensurePinned(ctx context.Context) error {
+	if e.pinned {
+		return nil
+	}
+	client, err := e.client()
+	if err != nil {
+		return err
+	}
+	resp, err := client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: e.sid, Generation: e.generation()})
+	if err != nil {
+		return e.poolerLost(err)
+	}
+	if resp.Error != nil {
+		return toPgwireError(resp.Error)
+	}
+	e.pinned = true
+	return nil
+}
+
+// replay re-establishes session GUCs and named prepared statements on a
+// freshly pinned backend.
+func (e *Executor) replay(ctx context.Context, skip map[string]bool) error {
+	if len(e.gucs) > 0 {
+		parts := make([]string, len(e.gucs))
+		for i, g := range e.gucs {
+			parts[i] = strings.TrimRight(strings.TrimSpace(g.sql), ";")
+		}
+		if err := e.send(simpleQuery(strings.Join(parts, "; "))); err != nil {
+			return err
+		}
+		if err := e.pump(ctx, discardWriter{}); err != nil {
+			return fmt.Errorf("router: replaying session settings: %w", err)
+		}
+	}
+	n := 0
+	for name, st := range e.stmts {
+		if name == "" || skip[name] {
+			continue
+		}
+		if err := e.send(parseReq(e.physical(name), st.sql, st.oids)); err != nil {
+			return err
+		}
+		n++
+	}
+	if n == 0 {
+		return nil
+	}
+	if err := e.send(syncReq()); err != nil {
+		return err
+	}
+	if err := e.pump(ctx, discardWriter{}); err != nil {
+		return fmt.Errorf("router: replaying prepared statements: %w", err)
+	}
+	return nil
+}
+
+func (e *Executor) send(req *pgshardv1.ExecuteRequest) error {
+	if err := e.conn.send(req, e.sid, e.generation(), e.ident); err != nil {
+		return e.poolerLost(err)
+	}
+	return nil
+}
+
+// poolerLost drops the stream and reports 08006; the next statement
+// reacquires a backend and replays session state.
+func (e *Executor) poolerLost(cause error) error {
+	if e.conn != nil {
+		e.conn.abort()
+		e.conn = nil
+	}
+	if e.pinned {
+		e.pinned = false
+		go func() { _ = e.releaseRPC(context.Background()) }()
+	}
+	e.tx = pgwire.TxIdle
+	e.staged, e.stagedMark = nil, 0
+	if _, isPG := errors.AsType[*pgwire.Error](cause); isPG {
+		return cause
+	}
+	return pgwire.Errorf(codeConnectionFailure, "pooler connection lost: %v", cause)
+}
+
+// pump relays responses until ReadyForQuery. Errors from the backend are
+// returned after the batch is drained so pgwire reports them itself.
+func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
+	var firstErr error
+	e.cancelSent.Store(false)
+	onCancel := func() { e.cancelBackend(context.Background()) }
+	for {
+		resp, err := e.conn.recv(ctx, onCancel)
+		if err != nil {
+			return e.poolerLost(err)
+		}
+		var werr error
+		switch m := resp.Message.(type) {
+		case *pgshardv1.ExecuteResponse_RowDescription:
+			werr = w.RowDescription(fieldDescriptions(m.RowDescription.Fields))
+		case *pgshardv1.ExecuteResponse_DataRow:
+			werr = w.DataRow(rowValues(m.DataRow.Columns))
+		case *pgshardv1.ExecuteResponse_CommandComplete:
+			e.lastTag = m.CommandComplete.Tag
+			werr = w.CommandComplete(m.CommandComplete.Tag)
+		case *pgshardv1.ExecuteResponse_EmptyQuery:
+			werr = w.EmptyQueryResponse()
+		case *pgshardv1.ExecuteResponse_Error:
+			if firstErr == nil {
+				firstErr = toPgwireError(m.Error.GetError())
+			}
+		case *pgshardv1.ExecuteResponse_Notice:
+			werr = w.Notice(toNotice(m.Notice.GetNotice()))
+		case *pgshardv1.ExecuteResponse_ParameterDescription:
+			werr = w.ParameterDescription(m.ParameterDescription.ParamOids)
+		case *pgshardv1.ExecuteResponse_NoData:
+			werr = w.NoData()
+		case *pgshardv1.ExecuteResponse_CopyInResponse:
+			werr = e.copyIn(w, m.CopyInResponse)
+		case *pgshardv1.ExecuteResponse_CopyOutResponse:
+			werr = w.CopyOut(byte(m.CopyOutResponse.Format), toUint16s(m.CopyOutResponse.ColumnFormats))
+		case *pgshardv1.ExecuteResponse_CopyData:
+			werr = w.CopyData(m.CopyData.Data)
+		case *pgshardv1.ExecuteResponse_CopyDone:
+			werr = w.CopyDone()
+		case *pgshardv1.ExecuteResponse_ReadyForQuery:
+			prev := e.tx
+			e.tx = txStatus(m.ReadyForQuery.TxnStatus)
+			if prev != pgwire.TxIdle && e.tx == pgwire.TxIdle {
+				e.txnEnded = true
+			}
+			return firstErr
+		case *pgshardv1.ExecuteResponse_ParseComplete, *pgshardv1.ExecuteResponse_BindComplete,
+			*pgshardv1.ExecuteResponse_ParameterStatus:
+		default:
+			e.r.cfg.Logger.Warn("unexpected pooler response", "session", e.sid, "type", fmt.Sprintf("%T", resp.Message))
+		}
+		if werr != nil {
+			return werr
+		}
+	}
+}
+
+// copyIn relays a COPY FROM STDIN: client chunks go to the pooler until the
+// client ends the transfer.
+func (e *Executor) copyIn(w pgwire.ResultWriter, resp *pgshardv1.CopyInResponse) error {
+	in, err := w.CopyIn(byte(resp.Format), toUint16s(resp.ColumnFormats))
+	if err != nil {
+		return err
+	}
+	for {
+		data, err := in.Next()
+		switch {
+		case err == nil:
+			if err := e.send(copyDataReq(data)); err != nil {
+				return err
+			}
+		case errors.Is(err, pgwire.ErrCopyFail):
+			return e.send(copyFailReq("COPY terminated by client"))
+		case errors.Is(err, io.EOF):
+			return e.send(copyDoneReq())
+		default:
+			_ = e.send(copyFailReq("client connection lost"))
+			return err
+		}
+	}
+}
+
+// cancelBackend asks the pooler to interrupt the statement running for this
+// session.
+func (e *Executor) cancelBackend(ctx context.Context) {
+	if !e.cancelSent.CompareAndSwap(false, true) {
+		return
+	}
+	client, err := e.client()
+	if err != nil {
+		return
+	}
+	cctx, cancel := context.WithTimeout(ctx, releaseTimeout)
+	defer cancel()
+	if _, err := client.Cancel(cctx, &pgshardv1.CancelRequest{SessionId: e.sid}); err != nil {
+		e.r.cfg.Logger.Warn("cancel failed", "session", e.sid, "err", err)
+	}
+}
+
+// release detaches the stream and returns the pinned backend to the pool.
+func (e *Executor) release(ctx context.Context) error {
+	if e.conn != nil {
+		e.conn.close()
+		e.conn = nil
+	}
+	e.pinned = false
+	return e.releaseRPC(ctx)
+}
+
+func (e *Executor) releaseRPC(ctx context.Context) error {
+	client, err := e.client()
+	if err != nil {
+		return err
+	}
+	rctx, cancel := context.WithTimeout(ctx, releaseTimeout)
+	defer cancel()
+	resp, err := client.Release(rctx, &pgshardv1.ReleaseRequest{SessionId: e.sid})
+	if err != nil {
+		return pgwire.Errorf(codeConnectionFailure, "pooler release failed: %v", err)
+	}
+	if resp.Error != nil {
+		return toPgwireError(resp.Error)
+	}
+	return nil
+}
+
+// Release implements pgwire.Executor: the session is over.
+func (e *Executor) Release() {
+	e.r.forget(e)
+	pinned := e.pinned
+	if e.conn != nil {
+		e.conn.close()
+		e.conn = nil
+	}
+	if pinned {
+		_ = e.releaseRPC(context.Background())
+	}
+	e.cancel()
+	zero(e.ident.ScramClientKey)
+	zero(e.ident.ScramServerKey)
+}
+
+func zero(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
+
+type discardWriter struct{}
+
+func (discardWriter) RowDescription([]pgproto3.FieldDescription) error { return nil }
+func (discardWriter) DataRow([][]byte) error                           { return nil }
+func (discardWriter) CommandComplete(string) error                     { return nil }
+func (discardWriter) EmptyQueryResponse() error                        { return nil }
+func (discardWriter) ParameterDescription([]uint32) error              { return nil }
+func (discardWriter) NoData() error                                    { return nil }
+func (discardWriter) PortalSuspended() error                           { return nil }
+func (discardWriter) Notice(*pgproto3.NoticeResponse) error            { return nil }
+func (discardWriter) CopyIn(byte, []uint16) (pgwire.CopyInStream, error) {
+	return nil, pgwire.Errorf(pgwire.CodeProtocolViolation, "unexpected COPY while replaying session state")
+}
+func (discardWriter) CopyOut(byte, []uint16) error { return nil }
+func (discardWriter) CopyData([]byte) error        { return nil }
+func (discardWriter) CopyDone() error              { return nil }
