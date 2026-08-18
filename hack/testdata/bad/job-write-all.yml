@@ -1,0 +1,10 @@
+name: bad
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    permissions: write-all
+    steps:
+      - run: echo hi

@@ -1,0 +1,16 @@
+title = "pgshard gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Placeholders and documentation hosts"
+regexes = [
+  '''REPLACE_ME''',
+  '''CHANGE_ME''',
+  '''example\.com''',
+  '''example\.org''',
+]
+paths = [
+  '''go\.sum$''',
+]

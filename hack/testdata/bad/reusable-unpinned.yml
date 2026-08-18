@@ -1,0 +1,7 @@
+name: bad
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  j:
+    uses: someone/repo/.github/workflows/x.yml@main
