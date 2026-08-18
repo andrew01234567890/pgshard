@@ -4,6 +4,7 @@ variable "PG18_SHA256" { default = "555610c24d53e4316da5b7d3fc25c279d96856d5e0e2
 variable "PG19_VERSION" { default = "19beta3" }
 variable "PG19_SHA256" { default = "ea4ad8933121930a58f23c73dc99c26a4184faca26faefa77d15ce0fba7dfe2c" }
 variable "PGBACKREST_VERSION" { default = "2.59.1" }
+variable "PGBACKREST_SHA256" { default = "ca1e75c7490989a2fb39b8266c0f3c518dd3c873ddc0c3a346ca9b5dccc16455" }
 variable "REGISTRY" { default = "ghcr.io/andrew01234567890" }
 variable "GIT_SHA" { default = "" }
 variable "CI" { default = "" }
@@ -24,7 +25,7 @@ target "_common" {
   dockerfile = "Dockerfile"
   cache-from = CI == "true" ? ["type=gha"] : []
   cache-to   = CI == "true" ? ["type=gha,mode=max"] : []
-  args = { PGBACKREST_VERSION = PGBACKREST_VERSION }
+  args = { PGBACKREST_VERSION = PGBACKREST_VERSION, PGBACKREST_SHA256 = PGBACKREST_SHA256 }
 }
 
 target "postgres-18" {

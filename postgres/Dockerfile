@@ -33,12 +33,14 @@ RUN ./configure --prefix=/usr/local/pgsql --with-openssl --with-icu --with-lz4 -
 
 FROM debian:bookworm-slim AS pgbackrest-build
 ARG PGBACKREST_VERSION
+ARG PGBACKREST_SHA256
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       build-essential meson ninja-build libssl-dev libxml2-dev liblz4-dev libzstd-dev libbz2-dev \
       libyaml-dev libssh2-1-dev zlib1g-dev libpq-dev pkg-config python3 curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /usr/src
 RUN curl -fsSLo pgbackrest.tar.gz "https://github.com/pgbackrest/pgbackrest/archive/refs/tags/release/${PGBACKREST_VERSION}.tar.gz" \
+    && echo "${PGBACKREST_SHA256}  pgbackrest.tar.gz" | sha256sum -c - \
     && mkdir pgbackrest && tar -xzf pgbackrest.tar.gz -C pgbackrest --strip-components=1 \
     && meson setup build pgbackrest -Dbuildtype=release \
     && ninja -C build \
