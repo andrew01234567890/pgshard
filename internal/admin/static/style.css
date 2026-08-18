@@ -1,0 +1,15 @@
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+body { margin: 0; padding: 1rem 2rem; background: Canvas; color: CanvasText; }
+header { display: flex; align-items: baseline; gap: 1rem; border-bottom: 1px solid GrayText; margin-bottom: 1rem; }
+header h1 { margin: 0.5rem 0; font-size: 1.4rem; }
+header .meta { color: GrayText; font-size: 0.9rem; }
+table { border-collapse: collapse; width: 100%; margin-bottom: 1.5rem; }
+th, td { text-align: left; padding: 0.3rem 0.6rem; border-bottom: 1px solid color-mix(in srgb, GrayText 40%, transparent); font-size: 0.92rem; }
+th { font-weight: 600; }
+h2 { font-size: 1.1rem; margin: 1.5rem 0 0.5rem; }
+h3 { font-size: 1rem; margin: 1rem 0 0.3rem; }
+.ok { color: #1a7f37; }
+.bad { color: #cf222e; }
+.pill { display: inline-block; padding: 0 0.4rem; border-radius: 0.6rem; background: color-mix(in srgb, GrayText 25%, transparent); font-size: 0.8rem; }
+.notice { color: GrayText; font-size: 0.85rem; }
+a { color: LinkText; }

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -70,6 +71,52 @@ func (c *Cluster) Kubectl(ctx context.Context, stdin []byte, args ...string) (st
 		return stdout.String(), fmt.Errorf("kubectl %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return stdout.String(), nil
+}
+
+// PortForward runs kubectl port-forward to a Service on an ephemeral local
+// port and returns the base URL once the port is accepting connections. The
+// forwarder stops when ctx is cancelled or the returned function is called.
+func (c *Cluster) PortForward(ctx context.Context, namespace, service string, port int) (string, func(), error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "", nil, err
+	}
+	local := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	full := []string{}
+	if c.Kubeconfig != "" {
+		full = append(full, "--kubeconfig", c.Kubeconfig)
+	}
+	if c.Context != "" {
+		full = append(full, "--context", c.Context)
+	}
+	full = append(full, "-n", namespace, "port-forward", "--address", "127.0.0.1", "svc/"+service, fmt.Sprintf("%d:%d", local, port))
+	ctx, cancel := context.WithCancel(ctx)
+	cmd := exec.CommandContext(ctx, "kubectl", full...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return "", nil, err
+	}
+	stop := func() {
+		cancel()
+		_ = cmd.Wait()
+	}
+	addr := fmt.Sprintf("127.0.0.1:%d", local)
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		conn, err := net.DialTimeout("tcp", addr, time.Second)
+		if err == nil {
+			_ = conn.Close()
+			return "http://" + addr, stop, nil
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			stop()
+			return "", nil, fmt.Errorf("port-forward %s/%s: %w: %s", namespace, service, err, strings.TrimSpace(stderr.String()))
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 // Apply applies a manifest from memory.

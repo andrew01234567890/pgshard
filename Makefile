@@ -43,7 +43,7 @@ proto-breaking:
 		echo "proto-breaking: no proto files on main, skipping"; \
 	fi
 
-.PHONY: kind-up kind-down e2e perf-bench
+.PHONY: kind-up kind-down e2e perf-bench admin-image deploy-admin undeploy-admin
 
 kind-up:
 	hack/kind/up.sh
@@ -86,7 +86,7 @@ envtest-assets:
 		hack/envtest/setup-envtest.sh $(ENVTEST_ASSETS_DIR)
 
 envtest: envtest-assets
-	KUBEBUILDER_ASSETS="$$(hack/envtest/setup-envtest.sh $(ENVTEST_ASSETS_DIR))" go test -race -count=1 ./api/... ./internal/operator/...
+	KUBEBUILDER_ASSETS="$$(hack/envtest/setup-envtest.sh $(ENVTEST_ASSETS_DIR))" go test -race -count=1 ./api/... ./internal/operator/... ./internal/admin/...
 
 IMG ?= ghcr.io/andrew01234567890/pgshard-operator:latest
 
@@ -101,6 +101,19 @@ uninstall:
 operator-image:
 	docker build -f Dockerfile.control --build-arg CMD=pgshard-operator \
 		--build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg DATE=$(DATE) -t $(IMG) .
+
+ADMIN_IMG ?= ghcr.io/andrew01234567890/pgshard-admin:latest
+
+admin-image:
+	docker build -f Dockerfile.control --build-arg CMD=pgshard-admin \
+		--build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg DATE=$(DATE) -t $(ADMIN_IMG) .
+
+deploy-admin:
+	kubectl apply -f config/admin/service_account.yaml -f config/admin/rbac.yaml
+	sed 's|image: ghcr.io/andrew01234567890/pgshard-admin:latest|image: $(ADMIN_IMG)|' config/admin/deployment.yaml | kubectl apply -f -
+
+undeploy-admin:
+	kubectl delete --ignore-not-found -f config/admin
 
 deploy: install
 	kubectl apply -f config/manager/namespace.yaml
