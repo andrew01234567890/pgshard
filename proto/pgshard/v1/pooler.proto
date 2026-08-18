@@ -1,0 +1,415 @@
+// Router to pooler contract: pgwire-shaped statements and results per shard.
+syntax = "proto3";
+
+package pgshard.v1;
+
+import "pgshard/v1/common.proto";
+
+option go_package = "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1;pgshardv1";
+
+// Pooler fronts one PostgreSQL shard and multiplexes router sessions onto
+// backend connections. Message shapes mirror the PostgreSQL wire protocol.
+service Pooler {
+  // Execute carries an ordered stream of pgwire-like requests for one or more
+  // router sessions and returns the mirrored responses. Bidirectional.
+  rpc Execute(stream ExecuteRequest) returns (stream ExecuteResponse);
+  // Reserve pins a dedicated backend to the session (transactions, cursors,
+  // session-level state). Released explicitly with Release.
+  rpc Reserve(ReserveRequest) returns (ReserveResponse);
+  // Release returns a pinned backend to the pool.
+  rpc Release(ReleaseRequest) returns (ReleaseResponse);
+  // Cancel interrupts the statement currently running for a session.
+  rpc Cancel(CancelRequest) returns (CancelResponse);
+  // Health streams the shard's role and lag; the router uses it for routing
+  // and read-replica selection.
+  rpc Health(HealthRequest) returns (stream HealthStatus);
+  // StreamChanges exposes logical decoding output from the shard.
+  // Placeholder for the change-stream milestone; shapes are minimal.
+  rpc StreamChanges(StreamRequest) returns (stream ChangeEvent);
+}
+
+// UserIdentity carries the SCRAM verifier material for the client user.
+// SENSITIVE: contains key material; never log or persist these fields.
+message UserIdentity {
+  // Role name the client authenticated as.
+  string username = 1;
+  // SCRAM ClientKey bytes. Sensitive.
+  bytes scram_client_key = 2;
+  // SCRAM ServerKey bytes. Sensitive.
+  bytes scram_server_key = 3;
+}
+
+// SimpleQuery is the pgwire Query message.
+message SimpleQuery {
+  // One or more SQL statements separated by semicolons.
+  string sql = 1;
+}
+
+// Parse is the pgwire Parse message.
+message Parse {
+  // Prepared statement name; empty for the unnamed statement.
+  string name = 1;
+  // SQL text with $n placeholders.
+  string sql = 2;
+  // Parameter type OIDs; zero lets the server infer.
+  repeated uint32 param_oids = 3;
+}
+
+// Bind is the pgwire Bind message.
+message Bind {
+  // Destination portal name; empty for the unnamed portal.
+  string portal = 1;
+  // Source prepared statement name.
+  string statement = 2;
+  // Parameter values encoded per param_formats.
+  repeated Value params = 3;
+  // Parameter formats (0 text, 1 binary); one, zero or per-param entries.
+  repeated int32 param_formats = 4;
+  // Result column formats (0 text, 1 binary); one, zero or per-column entries.
+  repeated int32 result_formats = 5;
+}
+
+// Value is a possibly-null raw pgwire value.
+message Value {
+  // True when the value is SQL NULL; data is then empty.
+  bool null = 1;
+  // Raw bytes in the negotiated format.
+  bytes data = 2;
+}
+
+// ExecutePortal is the pgwire Execute message.
+message ExecutePortal {
+  // Portal to run; empty for the unnamed portal.
+  string portal = 1;
+  // Maximum rows to return; zero means unlimited.
+  int32 max_rows = 2;
+}
+
+// Describe is the pgwire Describe message.
+message Describe {
+  // Kind of object to describe.
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_STATEMENT = 1;
+    KIND_PORTAL = 2;
+  }
+  Kind kind = 1;
+  // Statement or portal name.
+  string name = 2;
+}
+
+// Close is the pgwire Close message.
+message Close {
+  // Kind of object to close.
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_STATEMENT = 1;
+    KIND_PORTAL = 2;
+  }
+  Kind kind = 1;
+  // Statement or portal name.
+  string name = 2;
+}
+
+// Sync is the pgwire Sync message; ends an extended-protocol batch.
+message Sync {}
+
+// CopyData carries one chunk of COPY payload in either direction.
+message CopyData {
+  // Raw COPY bytes.
+  bytes data = 1;
+}
+
+// CopyDone marks the end of a COPY payload.
+message CopyDone {}
+
+// CopyFail aborts a COPY FROM STDIN.
+message CopyFail {
+  // Reason reported to the server.
+  string message = 1;
+}
+
+// CancelRequest interrupts the running statement of a session.
+message CancelRequest {
+  // Router session whose statement is cancelled.
+  string session_id = 1;
+}
+
+// CancelResponse acknowledges a cancel; delivery is best effort.
+message CancelResponse {}
+
+// ExecuteRequest is one router-originated pgwire message.
+message ExecuteRequest {
+  // Router session the message belongs to.
+  string session_id = 1;
+  // Topology fence; the pooler rejects stale generations.
+  Generation generation = 2;
+  // Authenticated user; sent on the first message of a session.
+  UserIdentity user = 3;
+  // Exactly one pgwire-shaped message.
+  oneof message {
+    SimpleQuery simple_query = 10;
+    Parse parse = 11;
+    Bind bind = 12;
+    ExecutePortal execute = 13;
+    Describe describe = 14;
+    Close close = 15;
+    Sync sync = 16;
+    CopyData copy_data = 17;
+    CopyDone copy_done = 18;
+    CopyFail copy_fail = 19;
+    CancelRequest cancel = 20;
+  }
+}
+
+// FieldDescription describes one result column.
+message FieldDescription {
+  // Column name.
+  string name = 1;
+  // Table OID or zero.
+  uint32 table_oid = 2;
+  // Attribute number within the table or zero.
+  int32 column_attr = 3;
+  // Data type OID.
+  uint32 type_oid = 4;
+  // Data type size; negative for variable width.
+  int32 type_size = 5;
+  // Type modifier.
+  int32 type_modifier = 6;
+  // Format code (0 text, 1 binary).
+  int32 format = 7;
+}
+
+// RowDescription mirrors pgwire RowDescription.
+message RowDescription {
+  repeated FieldDescription fields = 1;
+}
+
+// DataRow mirrors pgwire DataRow with raw column bytes.
+message DataRow {
+  repeated Value columns = 1;
+}
+
+// CommandComplete mirrors pgwire CommandComplete.
+message CommandComplete {
+  // Command tag such as "INSERT 0 1".
+  string tag = 1;
+}
+
+// ErrorResponse mirrors pgwire ErrorResponse.
+message ErrorResponse {
+  Error error = 1;
+}
+
+// NoticeResponse mirrors pgwire NoticeResponse.
+message NoticeResponse {
+  Error notice = 1;
+}
+
+// ReadyForQuery mirrors pgwire ReadyForQuery.
+message ReadyForQuery {
+  // Backend transaction status.
+  enum TxnStatus {
+    TXN_STATUS_UNSPECIFIED = 0;
+    // 'I': idle, not in a transaction.
+    TXN_STATUS_IDLE = 1;
+    // 'T': inside a transaction block.
+    TXN_STATUS_IN_TRANSACTION = 2;
+    // 'E': inside a failed transaction block.
+    TXN_STATUS_FAILED = 3;
+  }
+  TxnStatus txn_status = 1;
+}
+
+// ParseComplete mirrors pgwire ParseComplete.
+message ParseComplete {}
+
+// BindComplete mirrors pgwire BindComplete.
+message BindComplete {}
+
+// NoData mirrors pgwire NoData.
+message NoData {}
+
+// ParameterDescription mirrors pgwire ParameterDescription.
+message ParameterDescription {
+  repeated uint32 param_oids = 1;
+}
+
+// CopyInResponse mirrors pgwire CopyInResponse.
+message CopyInResponse {
+  // Overall format (0 text, 1 binary).
+  int32 format = 1;
+  // Per-column formats.
+  repeated int32 column_formats = 2;
+}
+
+// CopyOutResponse mirrors pgwire CopyOutResponse.
+message CopyOutResponse {
+  // Overall format (0 text, 1 binary).
+  int32 format = 1;
+  // Per-column formats.
+  repeated int32 column_formats = 2;
+}
+
+// ParameterStatus mirrors pgwire ParameterStatus.
+message ParameterStatus {
+  string name = 1;
+  string value = 2;
+}
+
+// EmptyQuery mirrors pgwire EmptyQueryResponse.
+message EmptyQuery {}
+
+// ExecuteResponse is one pooler-originated pgwire message.
+message ExecuteResponse {
+  // Router session the message belongs to.
+  string session_id = 1;
+  // Exactly one pgwire-shaped message.
+  oneof message {
+    RowDescription row_description = 10;
+    DataRow data_row = 11;
+    CommandComplete command_complete = 12;
+    ErrorResponse error = 13;
+    ReadyForQuery ready_for_query = 14;
+    ParseComplete parse_complete = 15;
+    BindComplete bind_complete = 16;
+    NoData no_data = 17;
+    ParameterDescription parameter_description = 18;
+    CopyInResponse copy_in_response = 19;
+    CopyOutResponse copy_out_response = 20;
+    CopyData copy_data = 21;
+    CopyDone copy_done = 22;
+    NoticeResponse notice = 23;
+    ParameterStatus parameter_status = 24;
+    EmptyQuery empty_query = 25;
+  }
+}
+
+// ReserveRequest pins a backend to a session.
+message ReserveRequest {
+  string session_id = 1;
+  Generation generation = 2;
+}
+
+// ReserveResponse reports the pinned backend.
+message ReserveResponse {
+  // Backend process id, usable for out-of-band cancel.
+  int32 backend_pid = 1;
+  // Set when no backend could be pinned.
+  Error error = 2;
+}
+
+// ReleaseRequest unpins the session's backend.
+message ReleaseRequest {
+  string session_id = 1;
+}
+
+// ReleaseResponse acknowledges the release.
+message ReleaseResponse {
+  Error error = 1;
+}
+
+// HealthRequest opens a health stream.
+message HealthRequest {}
+
+// HealthStatus is a snapshot of the shard behind the pooler.
+message HealthStatus {
+  // Replication role of the backing PostgreSQL instance.
+  enum Role {
+    ROLE_UNSPECIFIED = 0;
+    ROLE_PRIMARY = 1;
+    ROLE_STANDBY = 2;
+  }
+  Role role = 1;
+  // Bytes of WAL received but not yet replayed; zero on a primary.
+  uint64 replay_lag_bytes = 2;
+  // Primary epoch the instance serves under.
+  uint64 epoch = 3;
+  // Shard map generation the pooler is configured with.
+  uint64 generation = 4;
+  // True when the pooler accepts client traffic.
+  bool serving = 5;
+}
+
+// StreamRequest opens a logical decoding stream from the shard.
+message StreamRequest {
+  // Replication slot to consume.
+  string slot = 1;
+  // Publication to decode.
+  string publication = 2;
+  // LSN to start from; zero resumes from the slot's confirmed position.
+  uint64 start_lsn = 3;
+  // Output plugin options.
+  map<string, string> options = 4;
+}
+
+// ChangeEvent is one decoded logical replication message.
+message ChangeEvent {
+  // Transaction begins.
+  message Begin {
+    uint32 xid = 1;
+    uint64 final_lsn = 2;
+  }
+  // One changed row.
+  message Row {
+    // Row change kind.
+    enum Kind {
+      KIND_UNSPECIFIED = 0;
+      KIND_INSERT = 1;
+      KIND_UPDATE = 2;
+      KIND_DELETE = 3;
+      KIND_TRUNCATE = 4;
+    }
+    string schema = 1;
+    string table = 2;
+    Kind kind = 3;
+    // Old tuple, when replica identity provides it.
+    repeated Value old = 4;
+    // New tuple.
+    repeated Value new = 5;
+  }
+  // Transaction commits.
+  message Commit {
+    uint64 commit_lsn = 1;
+    uint64 end_lsn = 2;
+  }
+  // Keepalive; carries the server's current WAL position.
+  message Keepalive {
+    uint64 wal_end = 1;
+    // True when the server wants a reply now.
+    bool reply_requested = 2;
+  }
+  // Two-phase PREPARE TRANSACTION.
+  message Prepare {
+    string gid = 1;
+    uint64 prepare_lsn = 2;
+  }
+  // COMMIT PREPARED of an earlier Prepare.
+  message CommitPrepared {
+    string gid = 1;
+    uint64 commit_lsn = 2;
+  }
+  // ROLLBACK PREPARED of an earlier Prepare.
+  message RollbackPrepared {
+    string gid = 1;
+    uint64 rollback_lsn = 2;
+  }
+  // Logical decoding message (pg_logical_emit_message).
+  message Message {
+    string prefix = 1;
+    bytes content = 2;
+    bool transactional = 3;
+  }
+  // WAL position of the event.
+  uint64 lsn = 1;
+  oneof event {
+    Begin begin = 10;
+    Row row = 11;
+    Commit commit = 12;
+    Keepalive keepalive = 13;
+    Prepare prepare = 14;
+    CommitPrepared commit_prepared = 15;
+    RollbackPrepared rollback_prepared = 16;
+    Message message = 17;
+  }
+}

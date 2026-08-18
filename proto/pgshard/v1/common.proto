@@ -1,0 +1,56 @@
+// Shared identifiers and value types used by every pgshard service.
+syntax = "proto3";
+
+package pgshard.v1;
+
+option go_package = "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1;pgshardv1";
+
+// ShardRef identifies one shard within a shard set.
+message ShardRef {
+  // Name of the shard set (a group of shards sharing one key space).
+  string shard_set = 1;
+  // Identifier of the shard within the shard set.
+  uint32 shard_id = 2;
+}
+
+// Generation fences a request against the cluster topology it was planned for.
+// A server rejects requests whose generation is older than what it serves.
+message Generation {
+  // Monotonic version of the shard map (key range to shard assignment).
+  uint64 shard_map_generation = 1;
+  // Monotonic epoch of the primary serving the target shard; bumps on every promotion.
+  uint64 primary_epoch = 2;
+}
+
+// Position is a consistent point across shards, expressed as a per-shard LSN
+// plus the shard map generation the LSNs were captured under.
+message Position {
+  // Shard id to WAL LSN (PostgreSQL XLogRecPtr as an unsigned 64-bit integer).
+  map<uint32, uint64> shard_lsn = 1;
+  // Shard map generation in effect when the LSNs were captured.
+  uint64 shard_map_generation = 2;
+}
+
+// Error mirrors the PostgreSQL error fields a client is expected to see.
+message Error {
+  // Five-character SQLSTATE code.
+  string sqlstate = 1;
+  // Primary human-readable message.
+  string message = 2;
+  // Optional secondary detail.
+  string detail = 3;
+  // Optional hint on how to resolve the error.
+  string hint = 4;
+}
+
+// KeyRange is a closed interval of hashed shard keys, [start, end], over the
+// full signed 64-bit key space. Bounds are inclusive so that the whole space
+// [MinInt64, MaxInt64] and its top range are representable; the catalog stores
+// the same ranges as int8range with an unbounded upper bound, which maps to
+// end = MaxInt64.
+message KeyRange {
+  // Inclusive lower bound.
+  int64 start = 1;
+  // Inclusive upper bound.
+  int64 end = 2;
+}
