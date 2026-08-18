@@ -4,7 +4,8 @@ import "testing"
 
 func TestUnknownUserMockSaltIsStablePerUser(t *testing.T) {
 	a := SCRAMAuthenticator{MockSecret: []byte("test-secret")}
-	if string(a.mockSalt("ghost")) != string(a.mockSalt("ghost")) {
+	first := string(a.mockSalt("ghost"))
+	if second := string(a.mockSalt("ghost")); first != second {
 		t.Fatal("mock salt must be deterministic for one user")
 	}
 	if string(a.mockSalt("ghost")) == string(a.mockSalt("other")) {
