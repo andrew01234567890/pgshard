@@ -9,7 +9,8 @@ import (
 
 func main() {
 	os.Exit(cli.RunWith("pgshard-router", os.Args[1:], os.Stdout, os.Stderr, map[string]cli.Subcommand{
-		"serve": serve,
-		"parse": runParse,
+		"serve":         serve,
+		"parse":         runParse,
+		"catalog-watch": runCatalogWatch,
 	}))
 }
