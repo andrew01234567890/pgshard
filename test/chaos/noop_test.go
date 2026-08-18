@@ -7,6 +7,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,6 +34,21 @@ func TestNoopPodChaos(t *testing.T) {
 	if err := waitExperimentDone(ctx, c, "pgshard-chaos", "noop-pod-kill", 3*time.Minute); err != nil {
 		t.Fatal(err)
 	}
+	// pod-kill deletes the bare target Pod; a fault that was really injected leaves it gone.
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		out, err := c.Kubectl(ctx, nil, "-n", "pgshard-chaos", "get", "pod", "chaos-dummy", "-o", "jsonpath={.metadata.deletionTimestamp}")
+		if err != nil && strings.Contains(err.Error()+out, "NotFound") {
+			return
+		}
+		if err == nil && strings.TrimSpace(out) != "" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("target pod chaos-dummy was not killed by the experiment (kubectl: %v %s)", err, out)
+		}
+		time.Sleep(2 * time.Second)
+	}
 }
 
 func waitExperimentDone(ctx context.Context, c *e2e.Cluster, ns, name string, timeout time.Duration) error {
@@ -57,7 +73,7 @@ func waitExperimentDone(ctx context.Context, c *e2e.Cluster, ns, name string, ti
 						injected = true
 					}
 				}
-				if injected || obj.Status.Experiment.DesiredPhase == "Stop" {
+				if injected {
 					return nil
 				}
 			}
