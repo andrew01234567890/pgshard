@@ -1,0 +1,54 @@
+name: images
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "postgres/**"
+      - "docker-bake.hcl"
+      - ".github/workflows/images.yml"
+  pull_request:
+    paths:
+      - "postgres/**"
+      - "docker-bake.hcl"
+      - ".github/workflows/images.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  postgres:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        major: [18, 19]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/bake-action@5be5f02ff8819ecd3092ea6b2e6261c31774f2b4 # v6
+        with:
+          source: .
+          targets: postgres-${{ matrix.major }}
+          push: ${{ github.event_name != 'pull_request' }}
+          load: ${{ github.event_name == 'pull_request' }}
+        env:
+          CI: "true"
+          GIT_SHA: ${{ github.sha }}
+      - name: smoke
+        run: |
+          image=ghcr.io/andrew01234567890/pgshard-postgres:${{ matrix.major }}
+          docker run --rm "$image" postgres --version
+          docker run --rm "$image" pgbackrest version
