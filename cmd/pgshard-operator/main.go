@@ -15,7 +15,7 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "run" {
 		os.Exit(run(os.Args[2:]))
 	}
-	os.Exit(cli.Run("pgshard-operator", os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(cli.RunWith("pgshard-operator", os.Args[1:], os.Stdout, os.Stderr, map[string]cli.Subcommand{"tune": tune}))
 }
 
 func run(args []string) int {
