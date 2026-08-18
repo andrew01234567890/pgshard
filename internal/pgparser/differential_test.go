@@ -159,7 +159,7 @@ func startPostgres18(t *testing.T) string {
 	}
 	port := l.Addr().(*net.TCPAddr).Port
 	_ = l.Close()
-	out, err := exec.Command("docker", "run", "-d", "--rm", "-p", fmt.Sprintf("127.0.0.1:%d:5432", port), pg18Image, "sh", "-ec",
+	out, err := exec.Command("docker", "run", "-d", "--rm", "-p", fmt.Sprintf("127.0.0.1:%d:5432", port), "--entrypoint", "sh", pg18Image, "-ec",
 		`initdb -D /tmp/pgdata --auth=trust -U postgres >/dev/null &&
 		 echo "host all all all trust" >> /tmp/pgdata/pg_hba.conf &&
 		 exec postgres -D /tmp/pgdata -c listen_addresses='*'`).CombinedOutput()
