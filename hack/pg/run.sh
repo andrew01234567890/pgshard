@@ -12,7 +12,7 @@ if ! docker image inspect "$image" >/dev/null 2>&1; then
   image="postgres:${major}"
 fi
 docker rm -f "$name" >/dev/null 2>&1 || true
-docker run -d --name "$name" -p "127.0.0.1:${port}:5432" -e PGDATA=/var/lib/postgresql/data --user postgres "$image" sh -c '
+docker run -d --name "$name" -p "127.0.0.1:${port}:5432" -e PGDATA=/var/lib/postgresql/data --user postgres --entrypoint sh "$image" -c '
   set -e
   [ -s "$PGDATA/PG_VERSION" ] || initdb -D "$PGDATA" --auth=trust --username=postgres >/dev/null
   echo "host all all 0.0.0.0/0 trust" >> "$PGDATA/pg_hba.conf"

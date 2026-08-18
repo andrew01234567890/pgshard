@@ -58,6 +58,11 @@ func RenderPostgresqlConf(c *Config, standby bool) string {
 		set["primary_conninfo"] = quote(PrimaryConninfo(c))
 		set["primary_slot_name"] = quote(c.SlotName())
 	}
+	for k, v := range c.Postgres.Parameters {
+		if _, owned := set[k]; !owned {
+			set[k] = quote(v)
+		}
+	}
 	keys := make([]string, 0, len(set))
 	for k := range set {
 		keys = append(keys, k)

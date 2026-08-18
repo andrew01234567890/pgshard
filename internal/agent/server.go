@@ -126,6 +126,14 @@ func (s *Server) startHold() {
 	}()
 }
 
+// releaseLease hands the lease back once postgres has stopped, so a
+// successor need not wait for expiry.
+func (s *Server) releaseLease(ctx context.Context) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stopHold(ctx)
+}
+
 func (s *Server) stopHold(ctx context.Context) {
 	if s.holdStop != nil {
 		s.holdStop()

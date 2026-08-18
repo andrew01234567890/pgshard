@@ -18,20 +18,43 @@ type PrimaryState struct {
 	SyncStandbyNames string
 }
 
-// Prober talks SQL to a group primary. It is an interface so envtest can
+// StandbyState is what the operator learned from one probe of a member
+// during failover.
+type StandbyState struct {
+	InRecovery bool
+	// Streaming is true while a WAL receiver is still connected to a primary.
+	Streaming bool
+	// FlushLSN is pg_last_wal_receive_lsn(): the WAL durably received.
+	FlushLSN uint64
+}
+
+// Prober talks SQL to group members. It is an interface so envtest can
 // substitute a fake; the real one dials with pgx.
 type Prober interface {
 	Probe(ctx context.Context, dsn string) (PrimaryState, error)
+	ProbeStandby(ctx context.Context, dsn string) (StandbyState, error)
 	SetSyncStandbyNames(ctx context.Context, dsn, value string) error
 	MigrateCatalog(ctx context.Context, dsn string) error
+	// PublishShardStatus upserts pgshard.shard_status for one shard group;
+	// it never lowers primary_epoch.
+	PublishShardStatus(ctx context.Context, dsn string, shardID int, groupName string, epoch int64, endpoint string) error
+	// EnsureSlots creates the missing physical slots in want on the primary
+	// and drops an inactive slot named drop (the primary's own, inherited
+	// from its time as a standby, which would otherwise pin WAL forever).
+	EnsureSlots(ctx context.Context, dsn string, want []string, drop string) error
 }
 
 // DSN builds the connection URL for a group's -rw Service.
 func DSN(host, namespace, password string) string {
+	return HostDSN(fmt.Sprintf("%s.%s.svc", host, namespace), password)
+}
+
+// HostDSN builds the connection URL for one host (a Service name or pod IP).
+func HostDSN(host, password string) string {
 	u := url.URL{
 		Scheme:   "postgres",
 		User:     url.UserPassword(superuserName, password),
-		Host:     fmt.Sprintf("%s.%s.svc:%d", host, namespace, postgresPort),
+		Host:     fmt.Sprintf("%s:%d", host, postgresPort),
 		Path:     "/postgres",
 		RawQuery: "sslmode=disable&connect_timeout=5",
 	}
@@ -79,6 +102,66 @@ func (PgxProber) Probe(ctx context.Context, dsn string) (PrimaryState, error) {
 		return PrimaryState{}, err
 	}
 	return st, nil
+}
+
+// ProbeStandby reads recovery and WAL receiver state from one member.
+func (PgxProber) ProbeStandby(ctx context.Context, dsn string) (StandbyState, error) {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return StandbyState{}, err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	var st StandbyState
+	var lsn *int64
+	err = conn.QueryRow(ctx, `SELECT pg_is_in_recovery(),
+		EXISTS (SELECT 1 FROM pg_stat_wal_receiver WHERE status = 'streaming'),
+		CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn() ELSE pg_current_wal_flush_lsn() END - '0/0'::pg_lsn`).
+		Scan(&st.InRecovery, &st.Streaming, &lsn)
+	if err != nil {
+		return StandbyState{}, err
+	}
+	if lsn != nil {
+		st.FlushLSN = uint64(*lsn)
+	}
+	return st, nil
+}
+
+// PublishShardStatus upserts the shard's fence into pgshard.shard_status.
+func (PgxProber) PublishShardStatus(ctx context.Context, dsn string, shardID int, groupName string, epoch int64, endpoint string) error {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	_, err = conn.Exec(ctx, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch, primary_endpoint)
+		VALUES ($1, $2, $3, 'serving', $4, $5)
+		ON CONFLICT (shard_set, shard_id) DO UPDATE
+		SET group_name = EXCLUDED.group_name, primary_epoch = EXCLUDED.primary_epoch,
+		    primary_endpoint = EXCLUDED.primary_endpoint, updated_at = now()
+		WHERE pgshard.shard_status.primary_epoch <= EXCLUDED.primary_epoch`,
+		shardSet, shardID, groupName, epoch, endpoint)
+	return err
+}
+
+// EnsureSlots creates missing physical slots and drops the primary's own.
+func (PgxProber) EnsureSlots(ctx context.Context, dsn string, want []string, drop string) error {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	for _, name := range want {
+		if _, err := conn.Exec(ctx, `SELECT pg_create_physical_replication_slot($1, true)
+			WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)`, name); err != nil {
+			return fmt.Errorf("create slot %s: %w", name, err)
+		}
+	}
+	if drop == "" {
+		return nil
+	}
+	_, err = conn.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
+		WHERE slot_name = $1 AND NOT active`, drop)
+	return err
 }
 
 // SetSyncStandbyNames applies synchronous_standby_names via ALTER SYSTEM and reloads.

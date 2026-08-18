@@ -66,6 +66,9 @@ type PostgresSettings struct {
 	WALKeepSize string `json:"walKeepSize"`
 	// RestoreCommand fetches archived WAL; when set pg_rewind may use it.
 	RestoreCommand string `json:"restoreCommand"`
+	// Parameters are user settings appended to postgresql.conf; a name the
+	// agent owns is ignored.
+	Parameters map[string]string `json:"parameters,omitempty"`
 }
 
 // TLSFiles points at the server certificate; empty disables ssl.

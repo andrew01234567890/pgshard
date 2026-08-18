@@ -148,3 +148,15 @@ func TestRestoreCommandRenderedOnlyWhenSet(t *testing.T) {
 		t.Fatal("restore_command missing")
 	}
 }
+
+func TestRenderPostgresqlConfAppendsUserParametersWithoutOverridingOwnedOnes(t *testing.T) {
+	c := testConfig()
+	c.Postgres.Parameters = map[string]string{"work_mem": "8MB", "port": "1", "wal_level": "minimal"}
+	got := RenderPostgresqlConf(c, false)
+	if !strings.Contains(got, "work_mem = '8MB'\n") {
+		t.Fatalf("user parameter missing:\n%s", got)
+	}
+	if !strings.Contains(got, "port = 5432\n") || !strings.Contains(got, "wal_level = logical\n") {
+		t.Fatalf("owned settings must win:\n%s", got)
+	}
+}

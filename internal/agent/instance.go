@@ -20,19 +20,23 @@ type Instance struct {
 	epoch *EpochStore
 	log   *slog.Logger
 	// pgctl and basebackup hooks are swappable for unit tests.
-	rewindFn  func(ctx context.Context, source string) error
-	recloneFn func(ctx context.Context) error
-	startFn   func(ctx context.Context) error
-	slotFn    func(ctx context.Context, source string) error
+	rewindFn     func(ctx context.Context, source string) error
+	recloneFn    func(ctx context.Context) error
+	startFn      func(ctx context.Context) error
+	slotFn       func(ctx context.Context, source string) error
+	waitSourceFn func(ctx context.Context, source string) error
+	// cloneRetry is the pause between bootstrap clone attempts.
+	cloneRetry time.Duration
 }
 
 // NewInstance wires an Instance from its parts.
 func NewInstance(cfg *Config, sup *Supervisor, epoch *EpochStore, log *slog.Logger) *Instance {
-	in := &Instance{cfg: cfg, sup: sup, epoch: epoch, log: log}
+	in := &Instance{cfg: cfg, sup: sup, epoch: epoch, log: log, cloneRetry: 5 * time.Second}
 	in.rewindFn = in.pgRewind
 	in.recloneFn = in.baseBackup
 	in.startFn = in.Start
 	in.slotFn = in.ensureSlotOnSource
+	in.waitSourceFn = in.waitSource
 	sup.Env = append(sup.Env, "PGPASSFILE="+in.pgpassPath())
 	return in
 }
@@ -67,16 +71,22 @@ func (in *Instance) Bootstrap(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if empty {
-		switch in.cfg.Role {
-		case RolePrimary:
-			if err := in.initdb(ctx); err != nil {
-				return err
-			}
-		case RoleStandby:
-			if err := in.baseBackup(ctx); err != nil {
-				return err
-			}
+	switch {
+	case empty && in.cfg.Role == RolePrimary:
+		if err := in.initdb(ctx); err != nil {
+			return err
+		}
+	case empty && in.cfg.Role == RoleStandby:
+		if err := in.retryClone(ctx); err != nil {
+			return err
+		}
+	case !empty && in.cfg.Role == RoleStandby && !in.IsStandby():
+		in.log.Info("data directory belongs to a former primary; rejoining as a standby")
+		if err := in.waitSourceFn(ctx, in.cfg.PrimaryConninfo); err != nil {
+			return err
+		}
+		if err := in.follow(ctx, in.cfg.PrimaryConninfo); err != nil {
+			return err
 		}
 	}
 	return WriteConfig(in.cfg, in.IsStandby())
@@ -89,6 +99,23 @@ func (in *Instance) initdb(ctx context.Context) error {
 		"--encoding=UTF8", "--locale=C.UTF-8")
 	_, err := in.sup.RunTracked(cmd)
 	return err
+}
+
+// retryClone keeps cloning until it succeeds or ctx ends: at bootstrap the
+// primary is usually still initialising when the standbys start.
+func (in *Instance) retryClone(ctx context.Context) error {
+	for {
+		err := in.recloneFn(ctx)
+		if err == nil {
+			return nil
+		}
+		in.log.Warn("clone failed; retrying", "err", err, "in", in.cloneRetry)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w (last: %w)", ctx.Err(), err)
+		case <-time.After(in.cloneRetry):
+		}
+	}
 }
 
 // baseBackup replaces PGDATA with a fresh clone of the primary.
@@ -252,6 +279,16 @@ func (in *Instance) Demote(ctx context.Context, source string) error {
 	if source == "" {
 		source = in.cfg.PrimaryConninfo
 	}
+	if err := in.follow(ctx, source); err != nil {
+		return err
+	}
+	return in.startFn(ctx)
+}
+
+// follow turns a stopped former primary into a standby of source: pg_rewind
+// (falling back to a full reclone), stale slot removal and standby
+// configuration. postgres must not be running.
+func (in *Instance) follow(ctx context.Context, source string) error {
 	if err := in.rewindFn(ctx, source); err != nil {
 		in.log.Warn("pg_rewind failed; recloning", "err", err)
 		if err := in.recloneFn(ctx); err != nil {
@@ -266,10 +303,30 @@ func (in *Instance) Demote(ctx context.Context, source string) error {
 	if err := in.writeStandbySignal(); err != nil {
 		return err
 	}
-	if err := WriteConfig(in.cfg, true); err != nil {
+	return WriteConfig(in.cfg, true)
+}
+
+// waitSource blocks until the source primary accepts connections, so a
+// rejoin can pg_rewind instead of falling back to a full reclone while the
+// -rw Service still has no endpoint.
+func (in *Instance) waitSource(ctx context.Context, source string) error {
+	pw, err := in.password()
+	if err != nil {
 		return err
 	}
-	return in.startFn(ctx)
+	for {
+		conn, err := pgx.Connect(ctx, source+" password="+pw+" connect_timeout=5")
+		if err == nil {
+			_ = conn.Close(ctx)
+			return nil
+		}
+		in.log.Warn("source primary not reachable yet; waiting", "err", err)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for source: %w (last: %w)", ctx.Err(), err)
+		case <-time.After(in.cloneRetry):
+		}
+	}
 }
 
 // ensureSlotOnSource creates this member's physical slot on the source

@@ -18,7 +18,7 @@ RUN curl -fsSLo postgresql.tar.bz2 "https://ftp.postgresql.org/pub/source/v${PG_
     && echo "${PG_SHA256}  postgresql.tar.bz2" | sha256sum -c - \
     && mkdir postgresql && tar -xjf postgresql.tar.bz2 -C postgresql --strip-components=1 \
     && rm postgresql.tar.bz2
-COPY patches/${PG_MAJOR}/ /usr/src/patches/
+COPY postgres/patches/${PG_MAJOR}/ /usr/src/patches/
 WORKDIR /usr/src/postgresql
 RUN set -eu; \
     if [ -f /usr/src/patches/series ]; then \
@@ -46,6 +46,14 @@ RUN curl -fsSLo pgbackrest.tar.gz "https://github.com/pgbackrest/pgbackrest/arch
     && ninja -C build \
     && install -m 0755 build/src/pgbackrest /usr/local/bin/pgbackrest
 
+FROM golang:1.26-bookworm AS agent-build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/pgshard-agent ./cmd/pgshard-agent
+
 FROM debian:bookworm-slim
 ARG PG_MAJOR
 ARG PG_VERSION
@@ -53,7 +61,7 @@ ARG PGBACKREST_VERSION
 LABEL org.opencontainers.image.source="https://github.com/andrew01234567890/pgshard" \
       org.opencontainers.image.title="pgshard-postgres" \
       org.opencontainers.image.version="${PG_VERSION}" \
-      org.opencontainers.image.description="PostgreSQL ${PG_MAJOR} built from source with pgBackRest ${PGBACKREST_VERSION}" \
+      org.opencontainers.image.description="PostgreSQL ${PG_MAJOR} built from source with pgBackRest ${PGBACKREST_VERSION} and pgshard-agent as PID 1" \
       io.pgshard.postgres.major="${PG_MAJOR}"
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       libreadline8 zlib1g libssl3 libicu72 liblz4-1 libzstd1 libxml2 libxslt1.1 libuuid1 \
@@ -67,10 +75,12 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     && chmod 0700 /var/lib/postgresql/data
 COPY --from=pg-build /usr/local/pgsql /usr/local/pgsql
 COPY --from=pgbackrest-build /usr/local/bin/pgbackrest /usr/local/bin/pgbackrest
+COPY --from=agent-build /out/pgshard-agent /usr/local/bin/pgshard-agent
 ENV LANG=en_US.utf8 \
     PATH=/usr/local/pgsql/bin:$PATH \
     PGDATA=/var/lib/postgresql/data
 USER postgres
 WORKDIR /var/lib/postgresql
-EXPOSE 5432
-CMD ["postgres", "--version"]
+EXPOSE 5432 8080 9090
+ENTRYPOINT ["pgshard-agent"]
+CMD ["run", "--config", "/etc/pgshard/agent.json"]

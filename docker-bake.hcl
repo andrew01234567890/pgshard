@@ -21,8 +21,8 @@ function "tags" {
 }
 
 target "_common" {
-  context    = "postgres"
-  dockerfile = "Dockerfile"
+  context    = "."
+  dockerfile = "postgres/Dockerfile"
   cache-from = CI == "true" ? ["type=gha"] : []
   cache-to   = CI == "true" ? ["type=gha,mode=max"] : []
   args = { PGBACKREST_VERSION = PGBACKREST_VERSION, PGBACKREST_SHA256 = PGBACKREST_SHA256 }

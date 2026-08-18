@@ -49,13 +49,6 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	if err := inst.Bootstrap(ctx); err != nil {
 		return fmt.Errorf("bootstrap: %w", err)
 	}
-	startCtx, startCancel := context.WithTimeout(ctx, 10*time.Minute)
-	err = inst.Start(startCtx)
-	startCancel()
-	if err != nil {
-		return err
-	}
-
 	fatal := func(err error) { cancel(err) }
 	sup.OnUnexpectedExit = fatal
 	srv := NewServer(inst, epoch, lease, log, fatal)
@@ -64,6 +57,12 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 			return fmt.Errorf("primary cannot start without the lease: %w", err)
 		}
 		srv.startHold()
+	}
+	startCtx, startCancel := context.WithTimeout(ctx, 10*time.Minute)
+	err = inst.Start(startCtx)
+	startCancel()
+	if err != nil {
+		return err
 	}
 
 	probes := &Probes{Health: inst, MaxLagBytes: cfg.MaxLagBytes, Peers: cfg.PeerFailsafeURLs,
@@ -123,5 +122,6 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	if err := sup.Stop(stopCtx, mode, time.Duration(cfg.ShutdownTimeout)); err != nil {
 		return errors.Join(runErr, err)
 	}
+	srv.releaseLease(stopCtx)
 	return runErr
 }
