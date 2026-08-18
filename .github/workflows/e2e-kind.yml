@@ -39,6 +39,8 @@ jobs:
         run: hack/kind/up.sh
       - name: Run e2e suite
         run: |
+          set -o pipefail
+          mkdir -p "$E2E_ARTIFACTS"
           go test -tags e2e -count=1 -v -run 'Smoke' ./test/e2e/... 2>&1 | tee "$E2E_ARTIFACTS/go-test.log"
         env:
           E2E_SUITE: ${{ matrix.suite }}
