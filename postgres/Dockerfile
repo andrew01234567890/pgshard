@@ -52,7 +52,8 @@ COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/pgshard-agent ./cmd/pgshard-agent
+    CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/pgshard-agent ./cmd/pgshard-agent \
+    && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/pgshard-pooler ./cmd/pgshard-pooler
 
 FROM debian:bookworm-slim
 ARG PG_MAJOR
@@ -61,7 +62,7 @@ ARG PGBACKREST_VERSION
 LABEL org.opencontainers.image.source="https://github.com/andrew01234567890/pgshard" \
       org.opencontainers.image.title="pgshard-postgres" \
       org.opencontainers.image.version="${PG_VERSION}" \
-      org.opencontainers.image.description="PostgreSQL ${PG_MAJOR} built from source with pgBackRest ${PGBACKREST_VERSION} and pgshard-agent as PID 1" \
+      org.opencontainers.image.description="PostgreSQL ${PG_MAJOR} built from source with pgBackRest ${PGBACKREST_VERSION} , pgshard-agent as PID 1 and pgshard-pooler" \
       io.pgshard.postgres.major="${PG_MAJOR}"
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       libreadline8 zlib1g libssl3 libicu72 liblz4-1 libzstd1 libxml2 libxslt1.1 libuuid1 \
@@ -75,12 +76,12 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     && chmod 0700 /var/lib/postgresql/data
 COPY --from=pg-build /usr/local/pgsql /usr/local/pgsql
 COPY --from=pgbackrest-build /usr/local/bin/pgbackrest /usr/local/bin/pgbackrest
-COPY --from=agent-build /out/pgshard-agent /usr/local/bin/pgshard-agent
+COPY --from=agent-build /out/pgshard-agent /out/pgshard-pooler /usr/local/bin/
 ENV LANG=en_US.utf8 \
     PATH=/usr/local/pgsql/bin:$PATH \
     PGDATA=/var/lib/postgresql/data
 USER postgres
 WORKDIR /var/lib/postgresql
-EXPOSE 5432 8080 9090
+EXPOSE 5432 8080 8082 9090 9091
 ENTRYPOINT ["pgshard-agent"]
 CMD ["run", "--config", "/etc/pgshard/agent.json"]

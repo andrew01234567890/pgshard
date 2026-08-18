@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -214,6 +216,7 @@ func newCluster(name string) *pgshardv1alpha1.PgShardCluster {
 			Catalog:          pgshardv1alpha1.CatalogSpec{Replicas: 3, Storage: pgshardv1alpha1.StorageSpec{Size: resource.MustParse("1Gi")}},
 			ReplicasPerShard: 3,
 			Storage:          pgshardv1alpha1.StorageSpec{Size: resource.MustParse("2Gi")},
+			Router:           pgshardv1alpha1.RouterSpec{MinReplicas: 2, MaxReplicas: 5},
 		},
 	}
 }
@@ -236,7 +239,7 @@ func setupWithAgents(t *testing.T, name string) (*ClusterReconciler, *fakeProber
 	journal := &[]string{}
 	fp := &fakeProber{err: errors.New("dial: refused"), standbys: map[string]StandbyState{}, journal: journal}
 	fa := newFakeAgents(journal)
-	r := &ClusterReconciler{Client: k8sClient, Renderer: Renderer{}, Prober: fp, Agents: fa, FailoverDelay: time.Nanosecond, PollInterval: time.Millisecond, QuiesceTimeout: 200 * time.Millisecond}
+	r := &ClusterReconciler{Client: k8sClient, Renderer: Renderer{RouterImage: "router:test"}, Prober: fp, Agents: fa, FailoverDelay: time.Nanosecond, PollInterval: time.Millisecond, QuiesceTimeout: 200 * time.Millisecond}
 	return r, fp, fa, c
 }
 
@@ -363,6 +366,9 @@ func TestReconcileGeneratesGroupObjects(t *testing.T) {
 			if pod.Spec.Volumes[0].PersistentVolumeClaim.ClaimName != pod.Name {
 				t.Errorf("pod %s must mount its own PVC: %+v", pod.Name, pod.Spec.Volumes[0])
 			}
+			if len(pod.Spec.Containers) != 2 || pod.Spec.Containers[1].Name != "pooler" || pod.Spec.Containers[1].Image != ctr.Image || pod.Spec.Containers[1].ReadinessProbe.TCPSocket == nil {
+				t.Errorf("pod %s must carry the pooler sidecar from the same image: %+v", pod.Name, pod.Spec.Containers)
+			}
 			var pvc corev1.PersistentVolumeClaim
 			get(t, g.MemberName(i), &pvc)
 			ownedBy(t, &pvc, c)
@@ -377,6 +383,34 @@ func TestReconcileGeneratesGroupObjects(t *testing.T) {
 	if cond := condition(t, "gen", ConditionCatalogReady); cond.Status != metav1.ConditionFalse {
 		t.Errorf("CatalogReady must be False: %+v", cond)
 	}
+	var dep appsv1.Deployment
+	get(t, "gen-router", &dep)
+	ownedBy(t, &dep, c)
+	if *dep.Spec.Replicas != 2 || dep.Spec.Template.Spec.Containers[0].Image != "router:test" {
+		t.Errorf("router deployment: replicas=%d image=%s", *dep.Spec.Replicas, dep.Spec.Template.Spec.Containers[0].Image)
+	}
+	var hpa autoscalingv2.HorizontalPodAutoscaler
+	get(t, "gen-router", &hpa)
+	ownedBy(t, &hpa, c)
+	if *hpa.Spec.MinReplicas != 2 || hpa.Spec.MaxReplicas != 5 || hpa.Spec.ScaleTargetRef.Name != "gen-router" || *hpa.Spec.Metrics[0].Resource.Target.AverageUtilization != 70 {
+		t.Errorf("router hpa: %+v", hpa.Spec)
+	}
+	var rpdb policyv1.PodDisruptionBudget
+	get(t, "gen-router", &rpdb)
+	ownedBy(t, &rpdb, c)
+	if rpdb.Spec.MinAvailable.IntValue() != 1 || rpdb.Spec.Selector.MatchLabels[LabelComponent] != "router" {
+		t.Errorf("router pdb: %+v", rpdb.Spec)
+	}
+	var rsvc corev1.Service
+	get(t, "gen-router", &rsvc)
+	ownedBy(t, &rsvc, c)
+	if rsvc.Spec.Ports[0].Port != 5432 || rsvc.Spec.Selector[LabelComponent] != "router" {
+		t.Errorf("router service: %+v", rsvc.Spec)
+	}
+	var rsa corev1.ServiceAccount
+	get(t, "gen-router", &rsa)
+	ownedBy(t, &rsa, c)
+
 	var role rbacv1.Role
 	get(t, MemberServiceAccount("gen"), &role)
 	ownedBy(t, &role, c)

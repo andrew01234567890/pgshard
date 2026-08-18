@@ -19,6 +19,7 @@ type Options struct {
 	LeaderElect   bool
 	LeaderElectID string
 	AdminImage    string
+	RouterImage   string
 	Development   bool
 }
 
@@ -32,6 +33,7 @@ func ParseFlags(args []string, stderr io.Writer) (Options, error) {
 	fs.BoolVar(&o.LeaderElect, "leader-elect", false, "enable leader election")
 	fs.StringVar(&o.LeaderElectID, "leader-election-id", "pgshard-operator.pgshard.io", "leader election lease name")
 	fs.StringVar(&o.AdminImage, "admin-image", DefaultAdminImage, "image of the admin UI deployed for clusters with spec.admin.enabled")
+	fs.StringVar(&o.RouterImage, "router-image", DefaultRouterImage, "image of the router Deployment created for every cluster")
 	fs.BoolVar(&o.Development, "development", false, "human-readable logs")
 	if err := fs.Parse(args); err != nil {
 		return o, err
@@ -59,7 +61,7 @@ func Run(ctx context.Context, o Options) error {
 	if err != nil {
 		return fmt.Errorf("new manager: %w", err)
 	}
-	r := &ClusterReconciler{Client: mgr.GetClient(), Renderer: Renderer{AdminImage: o.AdminImage}, Prober: PgxProber{}, Agents: GRPCAgentClient{}}
+	r := &ClusterReconciler{Client: mgr.GetClient(), Renderer: Renderer{AdminImage: o.AdminImage, RouterImage: o.RouterImage}, Prober: PgxProber{}, Agents: GRPCAgentClient{}}
 	if err := r.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup reconciler: %w", err)
 	}

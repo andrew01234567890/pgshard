@@ -10,6 +10,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -66,9 +67,7 @@ func (r *ClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&coordinationv1.Lease{}).
 		Owns(&policyv1.PodDisruptionBudget{}).
 		Owns(&appsv1.Deployment{}).
-		Owns(&corev1.ServiceAccount{}).
-		Owns(&rbacv1.Role{}).
-		Owns(&rbacv1.RoleBinding{}).
+		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
 		Named("pgshardcluster").
 		Complete(r)
 }
@@ -152,6 +151,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	if err := r.reconcileAdmin(ctx, &cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("admin: %w", err)
+	}
+	if err := r.reconcileRouter(ctx, &cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("router: %w", err)
 	}
 	catalogReady := r.reconcileCatalogSchema(ctx, &cluster, observations, password)
 	if err := r.updateStatus(ctx, &cluster, observations, catalogReady); err != nil {

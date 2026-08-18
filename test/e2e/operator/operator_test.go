@@ -87,7 +87,11 @@ func deployOperator(ctx context.Context, t *testing.T, c *e2e.Cluster, root, ima
 		t.Fatal(err)
 	}
 	manifest := strings.Replace(string(raw), "image: ghcr.io/andrew01234567890/pgshard-operator:latest", "image: "+image, 1)
-	manifest = strings.Replace(manifest, "            - run\n", "            - run\n            - --admin-image="+env("ADMIN_IMAGE", "pgshard-admin:e2e")+"\n", 1)
+	extraArgs := "            - --admin-image=" + env("ADMIN_IMAGE", "pgshard-admin:e2e") + "\n"
+	if img := os.Getenv("ROUTER_IMAGE"); img != "" {
+		extraArgs += "            - --router-image=" + img + "\n"
+	}
+	manifest = strings.Replace(manifest, "            - run\n", "            - run\n"+extraArgs, 1)
 	if err := c.Apply(ctx, manifest); err != nil {
 		t.Fatal(err)
 	}
@@ -286,8 +290,8 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 	if n := count(ctx, t, c, "svc", sel+",pgshard.io/group"); n != 6 {
 		t.Errorf("group services: got %d want 6", n)
 	}
-	if n := count(ctx, t, c, "pdb", sel); n != 4 {
-		t.Errorf("pdbs: got %d want 4", n)
+	if n := count(ctx, t, c, "pdb", sel+",pgshard.io/group"); n != 4 {
+		t.Errorf("group pdbs: got %d want 4", n)
 	}
 	if n := count(ctx, t, c, "pgshardgroups", sel); n != 2 {
 		t.Errorf("groups: got %d want 2", n)
@@ -314,6 +318,48 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 	if out, err := psql(ctx, c, clusterName+"-catalog-rw", "SELECT to_regclass('pgshard.databases') IS NOT NULL"); err != nil || out != "t" {
 		t.Errorf("catalog tables: %q %v", out, err)
 	}
+
+	t.Run("PoolerSidecarReadyInEveryMemberPod", func(t *testing.T) {
+		out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pods", "-l", sel+",pgshard.io/group", "-o",
+			`jsonpath={range .items[*]}{.metadata.name}{" "}{range .status.containerStatuses[?(@.name=="pooler")]}{.ready}{end}{"\n"}{end}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(strings.TrimSpace(out), "\n")
+		if len(lines) != 6 {
+			t.Fatalf("member pods: %q", out)
+		}
+		for _, l := range lines {
+			if !strings.HasSuffix(l, " true") {
+				t.Errorf("pooler container not ready: %q", l)
+			}
+		}
+	})
+
+	t.Run("RouterDeploymentAndHPA", func(t *testing.T) {
+		rsel := sel + ",pgshard.io/component=router"
+		for kind, want := range map[string]int{"deployment": 1, "hpa": 1, "pdb": 1, "svc": 1, "serviceaccount": 1} {
+			if n := count(ctx, t, c, kind, rsel); n != want {
+				t.Errorf("router %s: got %d want %d", kind, n, want)
+			}
+		}
+		if got := jsonpath(ctx, t, c, "hpa", clusterName+"-router", "{.spec.minReplicas}/{.spec.maxReplicas}"); got != "2/10" {
+			t.Errorf("router hpa bounds: %q", got)
+		}
+		if got := jsonpath(ctx, t, c, "deployment", clusterName+"-router", "{.spec.replicas}"); got != "2" {
+			t.Errorf("router deployment replicas: %q", got)
+		}
+		// The router image is built on its own track and may be absent from
+		// the kind node; readiness is asserted only when the pods pull it.
+		if err := c.WaitPodsReady(ctx, testNamespace, rsel, 3*time.Minute); err != nil {
+			reasons, _ := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pods", "-l", rsel, "-o", "jsonpath={.items[*].status.containerStatuses[*].state.waiting.reason}")
+			if strings.Contains(reasons, "ImagePullBackOff") || strings.Contains(reasons, "ErrImagePull") {
+				t.Logf("router image unavailable, skipping pod readiness: %s", reasons)
+				return
+			}
+			t.Fatal(err)
+		}
+	})
 
 	t.Run("AdminUIServesTopology", func(t *testing.T) {
 		if err := c.WaitPodsReady(ctx, testNamespace, "pgshard.io/cluster="+clusterName+",pgshard.io/component=admin", 3*time.Minute); err != nil {
