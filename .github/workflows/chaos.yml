@@ -33,6 +33,7 @@ jobs:
         run: hack/chaos/install.sh
       - name: Run chaos suite
         run: |
+          set -o pipefail
           mkdir -p "$E2E_ARTIFACTS"
           go test -tags chaos -count=1 -v ./test/chaos/... 2>&1 | tee "$E2E_ARTIFACTS/go-test.log"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
