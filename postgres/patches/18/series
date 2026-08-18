@@ -1,0 +1,2 @@
+# Patch series for PostgreSQL 18. One patch filename per line, applied in order with patch -p1.
+# See ../README.md for the policy. Blank lines and lines starting with # are ignored.
