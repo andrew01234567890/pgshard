@@ -26,12 +26,26 @@ var descriptions = map[string]string{
 	"pgshard-admin":      "Administrative CLI for inspecting and changing a pgshard cluster.",
 }
 
+// Subcommand runs one named subcommand with the arguments that follow it.
+type Subcommand func(args []string, stdout, stderr io.Writer) int
+
 // Run executes command name with args and returns the process exit code.
 func Run(name string, args []string, stdout, stderr io.Writer) int {
+	return RunWith(name, args, stdout, stderr, nil)
+}
+
+// RunWith is Run with command-specific subcommands; the first argument
+// selects one and the rest are passed through unchanged.
+func RunWith(name string, args []string, stdout, stderr io.Writer, subcommands map[string]Subcommand) int {
 	desc, ok := descriptions[name]
 	if !ok {
 		fmt.Fprintf(stderr, "%s: unknown command\n", name)
 		return ExitUsage
+	}
+	if len(args) > 0 {
+		if sub, ok := subcommands[args[0]]; ok {
+			return sub(args[1:], stdout, stderr)
+		}
 	}
 	switch {
 	case len(args) == 0:
