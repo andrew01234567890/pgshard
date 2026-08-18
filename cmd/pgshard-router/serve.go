@@ -2,14 +2,18 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -18,13 +22,16 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 	"github.com/andrew01234567890/pgshard/internal/cli"
+	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
 	"github.com/andrew01234567890/pgshard/internal/router"
+	"github.com/andrew01234567890/pgshard/internal/router/cancelpeer"
 )
 
 // serve runs the router: a pgwire front end whose sessions are authenticated
@@ -74,7 +81,17 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	insecureDev := fs.Bool("insecure-dev", false, "talk plaintext gRPC to poolers (development only)")
 	rolesTTL := fs.Duration("roles-ttl", 5*time.Second, "how long catalog role verifiers are cached")
 	snapshotWait := fs.Duration("snapshot-wait", 30*time.Second, "time to wait for the first catalog snapshot")
-	drain := fs.Duration("drain-timeout", 30*time.Second, "time to wait for active queries on shutdown")
+	drain := fs.Duration("drain-timeout", 30*time.Second, "time to wait for open transactions and active queries on shutdown")
+	drainDelay := fs.Duration("drain-delay", 5*time.Second, "time between readiness turning false and closing the listener")
+	healthListen := fs.String("health-listen", "", "HTTP address for /readyz and /healthz (empty disables)")
+	instanceID := fs.Uint("instance-id", 0, "router instance id embedded in protocol 3.2 cancel keys (0 draws a random one)")
+	peerListen := fs.String("peer-cancel-listen", "", "gRPC address for cancels forwarded by peer routers (empty disables)")
+	peers := peerFlags{}
+	fs.Var(peers, "peer", "static peer router ID=host:port (repeatable)")
+	peerService := fs.String("peer-service", "", "host:port whose DNS records enumerate peer routers (headless Service)")
+	peerRate := fs.Float64("peer-cancel-rate", 50, "forwarded cancels per second (burst equal)")
+	bufferWindow := fs.Duration("buffer-window", 10*time.Second, "how long a statement waits for a shard failover")
+	bufferCap := fs.Int("buffer-cap", 256, "statements buffered per shard during failover")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return cli.ExitOK
@@ -83,6 +100,14 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	}
 	if fs.NArg() != 0 {
 		fmt.Fprintf(stderr, "pgshard-router serve: unexpected argument %q\n", fs.Arg(0))
+		return cli.ExitUsage
+	}
+	if *instanceID > math.MaxUint32 {
+		fmt.Fprintln(stderr, "pgshard-router serve: --instance-id must fit in 32 bits")
+		return cli.ExitUsage
+	}
+	if (len(peers) > 0 || *peerService != "") && *peerListen == "" {
+		fmt.Fprintln(stderr, "pgshard-router serve: --peer or --peer-service require --peer-cancel-listen")
 		return cli.ExitUsage
 	}
 	if (*certFile == "") != (*keyFile == "") {
@@ -136,25 +161,49 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		fmt.Fprintln(stderr, "pgshard-router serve: no catalog snapshot within --snapshot-wait")
 		return cli.ExitNotReady
 	}
+	if *instanceID == 0 {
+		var b [4]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
+			return cli.ExitNotReady
+		}
+		*instanceID = uint(binary.BigEndian.Uint32(b[:]) | 1)
+		if *peerListen != "" {
+			logger.Warn("random instance id; peers cannot address this instance statically", "instance_id", *instanceID)
+		}
+	}
+	var srv *pgwire.Server
+	srvCfg := pgwire.Config{
+		Authenticator: pgwire.SCRAMAuthenticator{Lookup: roles.Lookup},
+		TLSConfig:     tlsCfg,
+		ServerVersion: "18.6 (pgshard)",
+		InstanceID:    uint32(*instanceID),
+		Logger:        logger,
+	}
+	var forwarder *cancelpeer.Forwarder
+	if *peerListen != "" {
+		forwarder, err = cancelpeer.New(cancelpeer.Config{Self: uint32(*instanceID), Static: peers, Service: *peerService,
+			Creds: creds, Rate: *peerRate, Burst: int(*peerRate), Logger: logger})
+		if err != nil {
+			fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
+			return cli.ExitUsage
+		}
+		defer forwarder.Close()
+	}
 	rt, err := router.New(router.Config{
-		Snapshot: w.Current,
-		Poolers:  router.NewPoolers(poolers, w.Current, creds),
-		Logger:   logger,
+		Snapshot:  w.Current,
+		Poolers:   router.NewPoolers(poolers, w.Current, creds),
+		Logger:    logger,
+		Peers:     peersOrNil(forwarder),
+		Buffering: router.Buffering{Window: *bufferWindow, PerShardCap: *bufferCap, Changes: w.Subscribe},
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
 		return cli.ExitUsage
 	}
-	var srv *pgwire.Server
-	cfg := pgwire.Config{
-		Authenticator: pgwire.SCRAMAuthenticator{Lookup: roles.Lookup},
-		NewExecutor:   rt.NewExecutor,
-		CancelHandler: func(ctx context.Context, key pgwire.CancelKey) { rt.CancelHandler(srv)(ctx, key) },
-		TLSConfig:     tlsCfg,
-		ServerVersion: "18.6 (pgshard)",
-		Logger:        logger,
-	}
-	srv, err = pgwire.NewServer(cfg)
+	srvCfg.NewExecutor = rt.NewExecutor
+	srvCfg.CancelHandler = func(ctx context.Context, key pgwire.CancelKey) { rt.CancelHandler(srv)(ctx, key) }
+	srv, err = pgwire.NewServer(srvCfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
 		return cli.ExitUsage
@@ -163,6 +212,37 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	if err != nil {
 		fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
 		return cli.ExitNotReady
+	}
+	if *peerListen != "" {
+		serverCreds, err := peerCredentials(*poolerCert, *poolerKey, *poolerCA, *insecureDev)
+		if err != nil {
+			fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
+			return cli.ExitUsage
+		}
+		pl, err := net.Listen(listenNetwork(*peerListen), *peerListen)
+		if err != nil {
+			fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
+			return cli.ExitNotReady
+		}
+		g := grpc.NewServer(grpc.Creds(serverCreds))
+		pgshardv1.RegisterRouterPeerServer(g, &cancelpeer.Server{Local: func(ctx context.Context, key pgwire.CancelKey) bool {
+			return rt.CancelLocal(ctx, srv, key)
+		}})
+		go func() { _ = g.Serve(pl) }()
+		defer g.Stop()
+		fmt.Fprintf(stdout, "pgshard-router serve: peer cancels on %s (instance %d)\n", pl.Addr(), srv.InstanceID())
+	}
+	drainer := router.NewDrainer(srv, *drainDelay, *drain)
+	if *healthListen != "" {
+		hl, err := net.Listen(listenNetwork(*healthListen), *healthListen)
+		if err != nil {
+			fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
+			return cli.ExitNotReady
+		}
+		hs := &http.Server{Handler: drainer.Handler(), ReadHeaderTimeout: 5 * time.Second}
+		go func() { _ = hs.Serve(hl) }()
+		defer func() { _ = hs.Close() }()
+		fmt.Fprintf(stdout, "pgshard-router serve: health on %s\n", hl.Addr())
 	}
 	mode := "pooler mTLS"
 	if *insecureDev {
@@ -177,13 +257,34 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		return cli.ExitNotReady
 	case <-ctx.Done():
 	}
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), *drain)
-	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
+	fmt.Fprintf(stdout, "pgshard-router serve: draining (delay %s, timeout %s)\n", *drainDelay, *drain)
+	if err := drainer.Drain(context.Background()); err != nil {
 		fmt.Fprintf(stderr, "pgshard-router serve: shutdown: %v\n", err)
 	}
 	<-errc
 	return cli.ExitOK
+}
+
+func peersOrNil(f *cancelpeer.Forwarder) router.CancelForwarder {
+	if f == nil {
+		return nil
+	}
+	return f
+}
+
+type peerFlags map[uint32]string
+
+func (p peerFlags) String() string { return fmt.Sprint(map[uint32]string(p)) }
+
+// Set accepts "ID=host:port".
+func (p peerFlags) Set(v string) error {
+	id, addr, ok := strings.Cut(v, "=")
+	n, err := strconv.ParseUint(id, 10, 32)
+	if !ok || addr == "" || err != nil || n == 0 {
+		return fmt.Errorf("want ID=host:port with a non-zero 32-bit ID, got %q", v)
+	}
+	p[uint32(n)] = addr
+	return nil
 }
 
 // listenNetwork keeps an IPv4 literal on an IPv4-only socket instead of a
@@ -208,6 +309,28 @@ func waitSnapshot(ctx context.Context, w *snapshot.Watcher, wait time.Duration) 
 		time.Sleep(50 * time.Millisecond)
 	}
 	return true
+}
+
+// peerCredentials secures the RouterPeer listener with the same certificate
+// the router presents to poolers; peers must chain to the pooler CA.
+func peerCredentials(certFile, keyFile, caFile string, insecureDev bool) (credentials.TransportCredentials, error) {
+	if insecureDev {
+		return insecure.NewCredentials(), nil
+	}
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, err
+	}
+	pem, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("%s: no certificates found", caFile)
+	}
+	return credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}, ClientCAs: pool,
+		ClientAuth: tls.RequireAndVerifyClientCert, MinVersion: tls.VersionTLS13}), nil
 }
 
 func poolerCredentials(certFile, keyFile, caFile string, insecureDev bool) (credentials.TransportCredentials, error) {

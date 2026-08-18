@@ -60,12 +60,84 @@ sharded planning can replace it without touching the executor.
 - **Cancel.** A `CancelRequest` is verified against the session's key and
   forwarded as the pooler `Cancel` RPC; a query context that ends while a
   batch is in flight (drain) does the same. The batch is always drained to
-  `ReadyForQuery` so the stream stays in sync.
+  `ReadyForQuery` so the stream stays in sync. Keys no local session owns
+  are forwarded to peer routers (see *Operations*).
 - **COPY.** `COPY ... FROM STDIN` relays client chunks to the pooler until
   `CopyDone`/`CopyFail`; `COPY ... TO STDOUT` streams back.
 - **Not yet.** `Flush`-driven pipelining (results before `Sync`),
   `PortalSuspended` (`Execute` with a row limit) and `ParameterStatus`
   forwarding are not supported by the pooler contract in this layer.
+
+## Operations
+
+### Cancel forwarding between instances
+
+Behind a Service a client's `CancelRequest` can land on any router pod,
+while the session lives on the pod that minted the key. Every router
+therefore runs a small `RouterPeer.Cancel` gRPC service
+(`--peer-cancel-listen`, secured with the pooler client certificate and CA,
+or plaintext under `--insecure-dev`) and knows its peers either statically
+(`--peer ID=host:port`, repeatable) or through DNS (`--peer-service
+host:port`, a headless Service whose A/AAAA records are the peers).
+
+- A protocol 3.2 key embeds the minting router's `--instance-id`
+  (32 bits; 0 draws a random one, which peers cannot address statically).
+  A key that no local session matches is forwarded to the instance it
+  names; when that id is not statically known it goes to every discovered
+  peer; an unknown id with no discovery is ignored, as PostgreSQL itself
+  ignores unmatched cancel keys.
+- Protocol 3.0 keys carry no prefix, so a non-local one is sent to every
+  peer. The receiving peer only cancels a local session whose secret
+  matches; it never forwards again, so a misdirected cancel cannot bounce.
+- Forwarded cancels are token-bucket limited (`--peer-cancel-rate`,
+  default 50/s with an equal burst); excess ones are dropped and logged.
+  Cancel is best effort end to end.
+
+### Drain on SIGTERM
+
+`SIGTERM`/`SIGINT` starts a drain designed for HPA scale-down and rolling
+updates:
+
+1. `/readyz` on `--health-listen` turns `503` at once (`/healthz` stays
+   `200`) and the router waits `--drain-delay` (5s) with the listener still
+   open so endpoint controllers stop routing new connections to it. Point
+   the readiness probe at `/readyz`; no `preStop` hook is needed.
+2. The listener closes; new connections are refused. Idle sessions get a
+   `FATAL 57P01` immediately. Sessions inside an open transaction block, and
+   statements in flight, run to the end of the transaction (or statement)
+   and are then terminated with `57P01`.
+3. After `--drain-timeout` (30s) whatever remains is closed forcibly and the
+   process exits.
+
+### Failover buffering
+
+While a shard changes primaries the catalog's `shard_status` shows it as
+`fenced` or `migrating` (or without a `primary_endpoint`), and a pooler may
+answer `55000` to a stamp with a stale generation or epoch. The router
+hides short failovers from clients where it can do so safely:
+
+- A statement whose shard is blocking, or that came back `55000`, or whose
+  pooler refused the connection outright, is **buffered** if nothing of it
+  has reached the client yet and no transaction block is open: it waits
+  until the snapshot shows the shard serving again (LISTEN/NOTIFY wakes it;
+  status-only edits are picked up by a 200ms poll) or `--buffer-window`
+  (10s) elapses, then runs once more against the refreshed endpoint. A
+  window that expires with the shard still blocking is `08006`.
+- Inside a transaction block the earlier statements ran on the old primary
+  and cannot be replayed, so the statement fails with **`40001`
+  (serialization_failure) "shard failover; retry the transaction"**, the
+  transaction is dropped and the session returns to idle. `40001` was chosen
+  over `08006`/`57P01` because the connection is intact and the transaction
+  is retryable as a whole, which is exactly how clients already treat
+  serialization failures; connection-class errors would make drivers
+  reconnect for no reason.
+- A statement that already produced output (rows, a command tag, a notice,
+  COPY) is never retried; the original error is reported. A stream lost
+  after a statement was sent is likewise not retried, since it may have
+  run.
+- At most `--buffer-cap` (256) statements wait per shard; the next one is
+  refused with `53300`. A client cancel while buffered is honoured with
+  `57014`.
 
 ## Running
 
@@ -84,14 +156,24 @@ registers a database, a role (password from `PGSHARD_DEV_PASSWORD`) and shard
 
 ## Testing
 
-`go test ./internal/router/` drives a real pgwire server and pgx client
+`go test ./internal/router/...` drives a real pgwire server and pgx client
 against an in-process scripted pooler: SCRAM auth, `3D000`, refusals, error
 and notice relay, transactions, GUC staging across rollback/commit, prepared
 statement replay after release, cancel, COPY, stale generation and stream
-loss. `go test -tags integration ./test/e2e/router/` builds the pooler and
+loss; two routers on one pooler with cancels forwarded through `RouterPeer`;
+the drain sequence against a fake listener and its `/readyz` handler; the
+buffering decision table (no output / in transaction / output sent / window
+expiry / cap) and each outcome end to end (held select, `40001`, `53300`,
+`08006`, `57014` while buffered); and the peer target selection and rate
+limit in `cancelpeer`. `go test -tags integration ./test/e2e/router/` builds the pooler and
 router, starts a catalog and a shard in Docker, bootstraps them and runs
 DDL/DML, prepared statements, rollback, replay-after-release (proved with an
 advisory lock the release drops), COPY, cancel (`57014`), `28P01`, `3D000`,
-`0A000` and psql. `PGSHARD_BENCH_ROUTER=1 go test -tags integration -bench
+`0A000` and psql. `TestRouterOps` adds a second router that cancels a
+session owned by the first, `SIGTERM`s a third with an open transaction
+(readiness flips, listener stays open for the delay, the transaction commits,
+new connections are refused, the process exits) and fences shard 0 in the
+catalog (`update pgshard.shard_status set serving_state`) to show a select
+held for the fence and a `40001` inside an open transaction. `PGSHARD_BENCH_ROUTER=1 go test -tags integration -bench
 RouterSelect1 ./test/e2e/router/` compares `select 1` through the router with
 a direct connection.

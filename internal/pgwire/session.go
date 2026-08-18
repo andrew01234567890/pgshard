@@ -36,6 +36,9 @@ type session struct {
 	draining    bool
 	closed      bool
 	queryCancel context.CancelFunc
+	// inTxn mirrors the executor's transaction status for drain decisions;
+	// it is only written by the session goroutine.
+	inTxn bool
 
 	// skipToSync is set after an extended-protocol error until Sync arrives.
 	skipToSync bool
@@ -89,11 +92,12 @@ func (s *session) forceClose() {
 }
 
 // drain asks the session to end: idle sessions are terminated immediately,
-// active ones after the current query.
+// active ones and sessions inside a transaction block once the transaction
+// (or the current statement, outside a block) has finished.
 func (s *session) drain() {
 	s.mu.Lock()
 	s.draining = true
-	idle := !s.active && !s.closed
+	idle := !s.active && !s.inTxn && !s.closed
 	s.mu.Unlock()
 	if idle {
 		// The session goroutine is blocked in Receive, so write the error
@@ -115,11 +119,11 @@ func (s *session) terminate(err error) {
 }
 
 // beginMessage marks the session active; it reports false if the session is
-// draining and must stop.
+// draining outside a transaction block and must stop.
 func (s *session) beginMessage() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.draining || s.closed {
+	if (s.draining && !s.inTxn) || s.closed {
 		return false
 	}
 	s.active = true
@@ -194,9 +198,10 @@ func (s *session) run() {
 			return
 		}
 		s.mu.Lock()
-		draining := s.draining
+		s.inTxn = s.exec != nil && s.exec.TransactionStatus() != TxIdle
+		terminate := s.draining && !s.inTxn
 		s.mu.Unlock()
-		if draining {
+		if terminate {
 			s.terminate(Errorf(CodeAdminShutdown, "terminating connection due to administrator command"))
 			return
 		}

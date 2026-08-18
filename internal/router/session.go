@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
@@ -118,22 +120,84 @@ func (e *Executor) SimpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 	if err != nil {
 		return err
 	}
-	if err := e.acquire(ctx, nil); err != nil {
-		return err
-	}
-	if plan.Class.SetGUC {
-		if err := e.ensurePinned(ctx); err != nil {
+	return e.withFailover(ctx, w, func(cw pgwire.ResultWriter) error {
+		if err := e.acquire(ctx, nil); err != nil {
 			return err
 		}
-	}
-	if err := e.send(simpleQuery(sql)); err != nil {
+		if plan.Class.SetGUC {
+			if err := e.ensurePinned(ctx); err != nil {
+				return err
+			}
+		}
+		if err := e.send(simpleQuery(sql)); err != nil {
+			return err
+		}
+		err := e.pump(ctx, cw)
+		if plan.Class.SetGUC && err == nil {
+			e.staged = append(e.staged, gucEntry{name: plan.Class.GUCName, sql: sql})
+		}
 		return err
+	})
+}
+
+// withFailover runs one statement through run, buffering it while its shard
+// fails over: a shard that is blocking in the snapshot is waited for before
+// the first attempt, and a stale-generation refusal or a refused pooler
+// connection is retried once after the snapshot moves, provided nothing has
+// reached the client and no transaction is open (see decideFailover).
+func (e *Executor) withFailover(ctx context.Context, w pgwire.ResultWriter, run func(pgwire.ResultWriter) error) error {
+	inTxn := e.tx != pgwire.TxIdle
+	if e.r.blocking(e.home) {
+		switch decideFailover(true, inTxn, false, e.r.Buffered(e.home), e.r.cfg.Buffering.PerShardCap) {
+		case failoverFailTxn:
+			e.dropStream()
+			return e.afterBatch(ctx, failoverInTxnError())
+		case failoverRefuse:
+			return e.afterBatch(ctx, e.bufferFull())
+		case failoverWait:
+			if ok, err := e.r.awaitConsistent(ctx, e.home, false); err != nil {
+				return e.afterBatch(ctx, err)
+			} else if !ok {
+				return e.afterBatch(ctx, pgwire.Errorf(codeConnectionFailure, "shard %s/%d has no serving primary", e.home.Set, e.home.ID))
+			}
+		}
 	}
-	err = e.pump(ctx, w)
-	if plan.Class.SetGUC && err == nil {
-		e.staged = append(e.staged, gucEntry{name: plan.Class.GUCName, sql: sql})
+	cw := &countingWriter{w: w}
+	err := run(cw)
+	switch decideFailover(isFailover(err), inTxn, cw.wrote, e.r.Buffered(e.home), e.r.cfg.Buffering.PerShardCap) {
+	case failoverFailTxn:
+		e.dropStream()
+		err = failoverInTxnError()
+	case failoverRefuse:
+		err = e.bufferFull()
+	case failoverWait:
+		e.dropStream()
+		ok, werr := e.r.awaitConsistent(ctx, e.home, true)
+		switch {
+		case werr != nil:
+			err = werr
+		case ok:
+			e.r.cfg.Logger.Info("retrying statement after shard failover", "session", e.sid, "shard", e.home)
+			err = run(cw)
+		}
 	}
 	return e.afterBatch(ctx, err)
+}
+
+func (e *Executor) bufferFull() error { return bufferFullError(e.home) }
+
+// dropStream discards the pooler stream so the retry reacquires a backend
+// from the refreshed endpoint and replays session state.
+func (e *Executor) dropStream() {
+	if e.conn != nil {
+		e.conn.abort()
+		e.conn = nil
+	}
+	if e.pinned {
+		e.pinned = false
+		go func() { _ = e.releaseRPC(context.Background()) }()
+	}
+	e.tx = pgwire.TxIdle
 }
 
 // Parse implements pgwire.Executor: the message is buffered until Sync.
@@ -229,28 +293,30 @@ func (e *Executor) Sync(ctx context.Context) error {
 	if len(batch) == 0 {
 		return nil
 	}
-	if err := e.acquire(ctx, fresh); err != nil {
-		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
-		return err
-	}
-	if pin || len(e.staged) > e.stagedMark {
-		if err := e.ensurePinned(ctx); err != nil {
-			e.staged = e.staged[:e.stagedMark]
-			return err
-		}
-	}
-	for _, req := range batch {
-		if err := e.send(req); err != nil {
-			return err
-		}
-	}
-	if err := e.send(syncReq()); err != nil {
-		return err
-	}
 	if w == nil {
 		w = discardWriter{}
 	}
-	return e.afterBatch(ctx, e.pump(ctx, w))
+	return e.withFailover(ctx, w, func(cw pgwire.ResultWriter) error {
+		if err := e.acquire(ctx, fresh); err != nil {
+			e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
+			return err
+		}
+		if pin || len(e.staged) > e.stagedMark {
+			if err := e.ensurePinned(ctx); err != nil {
+				e.staged = e.staged[:e.stagedMark]
+				return err
+			}
+		}
+		for _, req := range batch {
+			if err := e.send(req); err != nil {
+				return err
+			}
+		}
+		if err := e.send(syncReq()); err != nil {
+			return err
+		}
+		return e.pump(ctx, cw)
+	})
 }
 
 // afterBatch settles staged GUCs and releases the pinned backend when a
@@ -309,7 +375,7 @@ func (e *Executor) acquire(ctx context.Context, fresh map[string]bool) error {
 	}
 	ps, err := openStream(e.ctx, client)
 	if err != nil {
-		return e.poolerLost(err)
+		return e.poolerRefused(err)
 	}
 	e.conn = ps
 	if !e.needsPin() {
@@ -331,7 +397,7 @@ func (e *Executor) ensurePinned(ctx context.Context) error {
 	}
 	resp, err := client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: e.sid, Generation: e.generation()})
 	if err != nil {
-		return e.poolerLost(err)
+		return e.poolerRefused(err)
 	}
 	if resp.Error != nil {
 		return toPgwireError(resp.Error)
@@ -402,6 +468,22 @@ func (e *Executor) poolerLost(cause error) error {
 	}
 	return pgwire.Errorf(codeConnectionFailure, "pooler connection lost: %v", cause)
 }
+
+// poolerRefused is poolerLost for a connection that could not be opened at
+// all: nothing was sent, so the statement is safe to retry after failover.
+func (e *Executor) poolerRefused(cause error) error {
+	err := e.poolerLost(cause)
+	if status.Code(cause) == codes.Unavailable {
+		return &refusedError{err}
+	}
+	return err
+}
+
+// refusedError marks a pooler that refused the connection before any
+// statement was sent.
+type refusedError struct{ error }
+
+func (r *refusedError) Unwrap() error { return r.error }
 
 // pump relays responses until ReadyForQuery. Errors from the backend are
 // returned after the batch is drained so pgwire reports them itself.
