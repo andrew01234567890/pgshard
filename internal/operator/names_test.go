@@ -1,6 +1,7 @@
 package operator
 
 import (
+	"reflect"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -87,5 +88,19 @@ func TestGroupsAndNames(t *testing.T) {
 func TestQuoteLiteral(t *testing.T) {
 	if got := quoteLiteral(`ANY 1 ("a", "b'c")`); got != `'ANY 1 ("a", "b''c")'` {
 		t.Fatalf("got %s", got)
+	}
+}
+
+func TestSynchronizedStandbySlotsListsStreamingSyncCandidatesOnly(t *testing.T) {
+	g := Group{Cluster: "c", Kind: "catalog", Replicas: 3}
+	streaming := map[string]bool{"c-catalog-0": true, "c-catalog-2": true}
+	if got := SynchronizedStandbySlots(g, "c-catalog-0", 1, streaming); !reflect.DeepEqual(got, []string{SlotName("c-catalog-2")}) {
+		t.Fatalf("got %v", got)
+	}
+	if got := SynchronizedStandbySlots(g, "c-catalog-0", 0, streaming); got != nil {
+		t.Fatalf("asynchronous group must list no slots, got %v", got)
+	}
+	if got := SynchronizedStandbySlots(g, "c-catalog-0", 1, nil); got != nil {
+		t.Fatalf("nothing streaming must list no slots, got %v", got)
 	}
 }

@@ -1,0 +1,9 @@
+Begin xid=763 final=17A08F0 ts=2026-08-19T09:05:49.530286Z
+Message transactional=true lsn=17A08F0 prefix=txn content="inside"
+Commit flags=0 lsn=17A08F0 end=17A0920
+Message transactional=false lsn=17A0990 prefix=now content="b"
+Begin xid=764 final=17A0990 ts=2026-08-19T09:05:49.531260Z
+Message transactional=true lsn=17A0958 prefix=txn content="a"
+Commit flags=0 lsn=17A0990 end=17A09C0
+Message transactional=false lsn=17A0A00 prefix=plain content="outside"
+Message transactional=false lsn=17A0A40 prefix=pgshard content="end"

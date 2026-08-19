@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -128,6 +129,21 @@ type fakeAgents struct {
 	// reloadHash is what Reload reports per addr; reloads records calls.
 	reloadHash map[string]string
 	reloads    []string
+	// syncSlots records the last SetSynchronizedStandbySlots call per addr.
+	syncSlots map[string][]string
+}
+
+func (f *fakeAgents) SetSynchronizedStandbySlots(_ context.Context, addr string, slots []string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.errs[addr]; err != nil {
+		return nil, err
+	}
+	if f.syncSlots == nil {
+		f.syncSlots = map[string][]string{}
+	}
+	f.syncSlots[addr] = slots
+	return slots, nil
 }
 
 func (f *fakeAgents) Reload(_ context.Context, addr string) (string, error) {
@@ -568,7 +584,7 @@ func TestReadinessRequiresProbeAndStreaming(t *testing.T) {
 }
 
 func TestSyncStandbyNamesAppliedHealthyFirst(t *testing.T) {
-	r, fp, c := setup(t, "sync")
+	r, fp, fa, c := setupWithAgents(t, "sync")
 	reconcile(t, r, c)
 	markPodsRunning(t, c)
 	fp.err = nil
@@ -577,6 +593,9 @@ func TestSyncStandbyNamesAppliedHealthyFirst(t *testing.T) {
 	got := fp.syncNames[DSN("sync-catalog-rw", "default", currentPassword(t, "sync"))]
 	if got != `ANY 1 ("sync-catalog-2", "sync-catalog-1")` {
 		t.Fatalf("catalog sync names: %q", got)
+	}
+	if slots := fa.syncSlots[agentAddr(podIP(0, 0))]; !reflect.DeepEqual(slots, []string{SlotName("sync-catalog-2")}) {
+		t.Fatalf("synchronized_standby_slots must list the streaming standby's slot only: %v", slots)
 	}
 	if got := fp.syncNames[DSN("sync-shard-0-rw", "default", currentPassword(t, "sync"))]; got != `ANY 1 ("sync-shard-0-1", "sync-shard-0-2")` {
 		t.Fatalf("shard sync names: %q", got)

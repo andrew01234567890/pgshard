@@ -15,6 +15,7 @@ type Querier interface {
 
 // Execer is satisfied by *pgx.Conn, pgx.Tx and *pgxpool.Pool.
 type Execer interface {
+	Querier
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 

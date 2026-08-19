@@ -213,3 +213,21 @@ func SyncStandbyNames(g Group, primary string, numSync int, streaming map[string
 	}
 	return fmt.Sprintf("ANY %d (%s)", numSync, strings.Join(quoted, ", "))
 }
+
+// SynchronizedStandbySlots lists the physical slots of the streaming
+// standbys that synchronous_standby_names can pick from, so failover slots
+// never get ahead of a synchronous standby; empty when replication is
+// asynchronous. Slots of members that are not streaming are left out: a
+// listed slot that is inactive stalls every failover-slot walsender.
+func SynchronizedStandbySlots(g Group, primary string, numSync int, streaming map[string]bool) []string {
+	if numSync < 1 {
+		return nil
+	}
+	var slots []string
+	for _, name := range g.MemberNames() {
+		if name != primary && streaming[name] {
+			slots = append(slots, SlotName(name))
+		}
+	}
+	return slots
+}

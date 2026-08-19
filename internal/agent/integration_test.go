@@ -376,6 +376,63 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	if ds, err := s.grpc.DropSlot(ctx, &pgshardv1.DropSlotRequest{Epoch: 1, Name: "extra"}); err != nil || ds.GetError() != nil {
 		t.Fatalf("drop slot: %v %v", ds, err)
 	}
+	t.Log("stream slot lifecycle: failover slot, publication, standby sync, synchronized_standby_slots")
+	if r, err := s.grpc.CreateStreamSlot(ctx, &pgshardv1.CreateStreamSlotRequest{Epoch: 0, Stream: "orders", Database: "postgres"}); err != nil || r.GetError() == nil {
+		t.Fatalf("stale create stream slot accepted: %v %v", r, err)
+	}
+	if r, err := s.grpc.CreateStreamSlot(ctx, &pgshardv1.CreateStreamSlotRequest{Epoch: 1, Stream: "Bad-Name", Database: "postgres"}); err != nil || r.GetError() == nil {
+		t.Fatalf("bad stream name accepted: %v %v", r, err)
+	}
+	css, err := s.grpc.CreateStreamSlot(ctx, &pgshardv1.CreateStreamSlotRequest{Epoch: 1, Stream: "orders", Database: "postgres", TwoPhase: true})
+	if err != nil || css.GetError() != nil || css.GetSlot() != "pgshard_orders_s0" || css.GetLsn() == 0 {
+		t.Fatalf("create stream slot: %v %v", css, err)
+	}
+	if got := s.psql("SELECT puballtables FROM pg_publication WHERE pubname = 'pgshard_all'"); got != "t" {
+		t.Fatalf("publication: %q", got)
+	}
+	ls, err = s.grpc.ListSlots(ctx, &pgshardv1.ListSlotsRequest{})
+	if err != nil || len(ls.GetSlots()) != 2 {
+		t.Fatalf("list slots: %v %v", ls, err)
+	}
+	if sl := ls.GetSlots()[0]; sl.GetName() != "pgshard_orders_s0" || sl.GetKind() != pgshardv1.SlotKind_SLOT_KIND_LOGICAL || sl.GetPlugin() != "pgoutput" ||
+		!sl.GetFailover() || !sl.GetTwoPhase() || sl.GetActive() || sl.GetWalStatus() != "reserved" || sl.GetDatabase() != "postgres" || sl.GetSynced() || sl.GetTemporary() {
+		t.Fatalf("stream slot: %v", sl)
+	}
+	sss, err := s.grpc.SetSynchronizedStandbySlots(ctx, &pgshardv1.SetSynchronizedStandbySlotsRequest{Epoch: 1, Slots: []string{"pgshard_s0_0", "pgshard_missing"}})
+	if err != nil || sss.GetError() != nil || len(sss.GetApplied()) != 1 || sss.GetApplied()[0] != "pgshard_s0_0" {
+		t.Fatalf("set synchronized standby slots: %v %v", sss, err)
+	}
+	if got := s.psql("SHOW synchronized_standby_slots"); got != "pgshard_s0_0" {
+		t.Fatalf("synchronized_standby_slots: %q", got)
+	}
+	s.psql("INSERT INTO t VALUES (4, 'for-sync')")
+	deadline := time.Now().Add(90 * time.Second)
+	for {
+		pls, err := p.grpc.ListSlots(ctx, &pgshardv1.ListSlotsRequest{})
+		if err == nil && len(pls.GetSlots()) == 1 && pls.GetSlots()[0].GetName() == "pgshard_orders_s0" && pls.GetSlots()[0].GetSynced() && pls.GetSlots()[0].GetFailover() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("failover slot not synchronized to the standby: %v %v\n%s", pls, err, p.logs())
+		}
+		time.Sleep(time.Second)
+	}
+	if r, err := s.grpc.SetSynchronizedStandbySlots(ctx, &pgshardv1.SetSynchronizedStandbySlotsRequest{Epoch: 1}); err != nil || r.GetError() != nil || len(r.GetApplied()) != 0 {
+		t.Fatalf("clear synchronized standby slots: %v %v", r, err)
+	}
+	if got := s.psql("SHOW synchronized_standby_slots"); got != "" {
+		t.Fatalf("synchronized_standby_slots after clear: %q", got)
+	}
+	if r, err := s.grpc.DropStreamSlot(ctx, &pgshardv1.DropStreamSlotRequest{Epoch: 1, Stream: "orders"}); err != nil || r.GetError() != nil {
+		t.Fatalf("drop stream slot: %v %v", r, err)
+	}
+	if r, err := s.grpc.DropStreamSlot(ctx, &pgshardv1.DropStreamSlotRequest{Epoch: 1, Stream: "orders"}); err != nil || r.GetError() != nil {
+		t.Fatalf("drop stream slot twice: %v %v", r, err)
+	}
+	if got := s.psql("SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pgshard_orders_s0'"); got != "0" {
+		t.Fatalf("stream slot still present: %s", got)
+	}
+
 	rp, err := s.grpc.CreateRestorePoint(ctx, &pgshardv1.CreateRestorePointRequest{Epoch: 1, Name: "rp1"})
 	if err != nil || rp.GetError() != nil || rp.GetLsn() == 0 {
 		t.Fatalf("restore point: %v %v", rp, err)
@@ -400,7 +457,7 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	t.Log("isolated primary without kube API self-fences")
 	docker(t, "stop", "-t", "30", p.container)
 	s.waitHTTP("/livez", 500, 30*time.Second)
-	deadline := time.Now().Add(60 * time.Second)
+	deadline = time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		if docker(t, "inspect", "-f", "{{.State.Running}}", s.container) == "false" {
 			break

@@ -23,9 +23,18 @@ service Pooler {
   // Health streams the shard's role and lag; the router uses it for routing
   // and read-replica selection.
   rpc Health(HealthRequest) returns (stream HealthStatus);
-  // StreamChanges exposes logical decoding output from the shard.
-  // Placeholder for the change-stream milestone; shapes are minimal.
+  // StreamChanges exposes logical decoding output from the shard, one
+  // event per message. Stream is the batched form used by the controller.
   rpc StreamChanges(StreamRequest) returns (stream ChangeEvent);
+  // Stream opens the shard's slot for a change stream and streams decoded
+  // pgoutput events batched per transaction (or per batch_bytes). Only one
+  // reader per slot is admitted; a second one is refused with
+  // FAILED_PRECONDITION. With start_lsn zero the slot resumes from its
+  // confirmed position. Keepalive batches prove liveness while idle.
+  rpc Stream(StreamRequest) returns (stream ChangeBatch);
+  // Ack advances the slot's confirmed position; events up to and including
+  // lsn are never resent after a restart.
+  rpc Ack(AckRequest) returns (AckResponse);
 }
 
 // UserIdentity carries the SCRAM verifier material for the client user.
@@ -333,14 +342,44 @@ message HealthStatus {
 
 // StreamRequest opens a logical decoding stream from the shard.
 message StreamRequest {
-  // Replication slot to consume.
+  // Replication slot to consume; derived from stream when empty.
   string slot = 1;
-  // Publication to decode.
+  // Publication to decode; pgshard_all when empty.
   string publication = 2;
   // LSN to start from; zero resumes from the slot's confirmed position.
   uint64 start_lsn = 3;
-  // Output plugin options.
+  // Extra pgoutput options; proto_version, publication_names, streaming and
+  // messages are fixed by the pooler, two_phase defaults to off.
   map<string, string> options = 4;
+  // Change stream whose slot pgshard_<stream>_<shard> is consumed.
+  string stream = 5;
+  // Database the slot decodes.
+  string database = 6;
+  // Flush a batch once it holds this many bytes of tuple data; zero means
+  // one batch per transaction (64 KiB cap).
+  uint32 batch_bytes = 7;
+}
+
+// AckRequest confirms events up to lsn for a slot.
+message AckRequest {
+  // Slot to advance; derived from stream when empty.
+  string slot = 1;
+  string stream = 2;
+  // Highest end position processed by the consumer.
+  uint64 lsn = 3;
+}
+
+// AckResponse reports the outcome.
+message AckResponse {
+  Error error = 1;
+}
+
+// ChangeBatch groups consecutive events of one slot.
+message ChangeBatch {
+  repeated ChangeEvent events = 1;
+  // End position of the last WAL record in the batch; acknowledgeable
+  // once the batch is processed.
+  uint64 end_lsn = 2;
 }
 
 // ChangeEvent is one decoded logical replication message.
@@ -367,6 +406,13 @@ message ChangeEvent {
     repeated Value old = 4;
     // New tuple.
     repeated Value new = 5;
+    uint32 relation_id = 6;
+    // True when old carries the key columns only (pgoutput 'K'), false for
+    // a full old image ('O').
+    bool old_is_key = 7;
+    // Columns of new (same order) whose value is an unchanged TOAST datum
+    // that pgoutput did not send; the entry in new is empty, not null.
+    repeated uint32 unchanged_toast = 8;
   }
   // Transaction commits.
   message Commit {
@@ -400,8 +446,71 @@ message ChangeEvent {
     bytes content = 2;
     bool transactional = 3;
   }
+  // Relation describes a table before its first change in the stream and
+  // again after its columns change.
+  message Relation {
+    // Column of a relation.
+    message Column {
+      string name = 1;
+      uint32 type_oid = 2;
+      int32 type_modifier = 3;
+      // True when the column is part of the replica identity.
+      bool key = 4;
+    }
+    uint32 relation_id = 1;
+    string schema = 2;
+    string table = 3;
+    // Replica identity: d default, n nothing, f full, i index.
+    string replica_identity = 4;
+    repeated Column columns = 5;
+  }
+  // Truncate of one or more tables.
+  message Truncate {
+    repeated uint32 relation_ids = 1;
+    bool cascade = 2;
+    bool restart_identity = 3;
+  }
+  // StreamStart opens a segment of an in-progress (streamed) transaction.
+  message StreamStart {
+    uint32 xid = 1;
+    bool first_segment = 2;
+  }
+  // StreamStop closes a streamed segment.
+  message StreamStop {}
+  // StreamCommit commits a streamed transaction.
+  message StreamCommit {
+    uint32 xid = 1;
+    uint64 commit_lsn = 2;
+    uint64 end_lsn = 3;
+  }
+  // StreamAbort aborts a streamed transaction or subtransaction.
+  message StreamAbort {
+    uint32 xid = 1;
+    uint32 subxid = 2;
+    uint64 abort_lsn = 3;
+  }
+  // BeginPrepare opens a two-phase transaction.
+  message BeginPrepare {
+    string gid = 1;
+    uint32 xid = 2;
+    uint64 prepare_lsn = 3;
+  }
+  // StreamPrepare prepares a streamed transaction.
+  message StreamPrepare {
+    string gid = 1;
+    uint32 xid = 2;
+    uint64 prepare_lsn = 3;
+  }
+  // Origin names the replication origin of the transaction.
+  message Origin {
+    string name = 1;
+    uint64 commit_lsn = 2;
+  }
   // WAL position of the event.
   uint64 lsn = 1;
+  // Transaction id; set for every event of a streamed transaction and for
+  // Begin/Prepare-style events.
+  uint32 xid = 2;
   oneof event {
     Begin begin = 10;
     Row row = 11;
@@ -411,5 +520,14 @@ message ChangeEvent {
     CommitPrepared commit_prepared = 15;
     RollbackPrepared rollback_prepared = 16;
     Message message = 17;
+    Relation relation = 18;
+    Truncate truncate = 19;
+    StreamStart stream_start = 20;
+    StreamStop stream_stop = 21;
+    StreamCommit stream_commit = 22;
+    StreamAbort stream_abort = 23;
+    BeginPrepare begin_prepare = 24;
+    StreamPrepare stream_prepare = 25;
+    Origin origin = 26;
   }
 }

@@ -1,0 +1,14 @@
+Begin xid=716 final=18546E8 ts=2026-08-19T09:05:56.834878Z
+Relation id=16420 public.d identity=d cols=[*id:23(-1)]
+Insert rel=16420 new=("1")
+Commit flags=0 lsn=18546E8 end=1854718
+Begin xid=718 final=1857278 ts=2026-08-19T09:05:56.837860Z
+Relation id=16420 public.d identity=d cols=[*id:23(-1) extra:25(-1)]
+Insert rel=16420 new=("2","two")
+Commit flags=0 lsn=1857278 end=18572A8
+Begin xid=720 final=185A040 ts=2026-08-19T09:05:56.840521Z
+Type id=16430 public.mood
+Relation id=16420 public.d identity=d cols=[*id:23(-1) extra:25(-1) m:16430(-1)]
+Update rel=16420 key=- old=- new=("2","two","happy")
+Commit flags=0 lsn=185A040 end=185A070
+Message transactional=false lsn=185A0B0 prefix=pgshard content="end"

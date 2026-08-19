@@ -16,8 +16,11 @@ const (
 	postgresqlConf = "postgresql.conf"
 	pgHBAConf      = "pg_hba.conf"
 	overrideConf   = "pgshard.override.conf"
-	standbySignal  = "standby.signal"
-	autoConf       = "postgresql.auto.conf"
+	// slotsConf holds synchronized_standby_slots, rewritten at runtime by
+	// SetSynchronizedStandbySlots and kept across config re-renders.
+	slotsConf     = "pgshard.slots.conf"
+	standbySignal = "standby.signal"
+	autoConf      = "postgresql.auto.conf"
 )
 
 // RenderPostgresqlConf renders the fixed pgshard postgresql.conf. When
@@ -51,6 +54,7 @@ func renderPostgresqlConf(c *Config, standby, recovering bool) string {
 		fmt.Fprintf(&b, "%s = %s\n", k, set[k])
 	}
 	fmt.Fprintf(&b, "include_if_exists = %s\n", quote(overrideConf))
+	fmt.Fprintf(&b, "include_if_exists = %s\n", quote(slotsConf))
 	return b.String()
 }
 
@@ -111,6 +115,9 @@ func ownedSettings(c *Config, standby, recovering bool) map[string]string {
 	if standby {
 		set["primary_conninfo"] = quote(PrimaryConninfo(c))
 		set["primary_slot_name"] = quote(c.SlotName())
+		// Failover slots are synchronized to standbys; needs
+		// hot_standby_feedback and a dbname in primary_conninfo (both set).
+		set["sync_replication_slots"] = "on"
 	}
 	if recovering && c.Restore != nil && c.Backup != nil {
 		set["archive_mode"] = "off"

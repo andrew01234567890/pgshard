@@ -278,7 +278,7 @@ func (x BackupRequest_Type) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use BackupRequest_Type.Descriptor instead.
 func (BackupRequest_Type) EnumDescriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{23, 0}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{29, 0}
 }
 
 // StatusRequest asks for the instance status.
@@ -1471,8 +1471,18 @@ type Slot struct {
 	Active            bool                   `protobuf:"varint,5,opt,name=active,proto3" json:"active,omitempty"`
 	RestartLsn        uint64                 `protobuf:"varint,6,opt,name=restart_lsn,json=restartLsn,proto3" json:"restart_lsn,omitempty"`
 	ConfirmedFlushLsn uint64                 `protobuf:"varint,7,opt,name=confirmed_flush_lsn,json=confirmedFlushLsn,proto3" json:"confirmed_flush_lsn,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// pg_replication_slots.wal_status: reserved, extended, unreserved or lost.
+	WalStatus string `protobuf:"bytes,8,opt,name=wal_status,json=walStatus,proto3" json:"wal_status,omitempty"`
+	// pg_replication_slots.invalidation_reason; empty while valid.
+	InvalidationReason string `protobuf:"bytes,9,opt,name=invalidation_reason,json=invalidationReason,proto3" json:"invalidation_reason,omitempty"`
+	// True on a standby when the slot was synchronized from the primary.
+	Synced    bool `protobuf:"varint,10,opt,name=synced,proto3" json:"synced,omitempty"`
+	Temporary bool `protobuf:"varint,11,opt,name=temporary,proto3" json:"temporary,omitempty"`
+	TwoPhase  bool `protobuf:"varint,12,opt,name=two_phase,json=twoPhase,proto3" json:"two_phase,omitempty"`
+	// Database the logical slot belongs to; empty for physical slots.
+	Database      string `protobuf:"bytes,13,opt,name=database,proto3" json:"database,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Slot) Reset() {
@@ -1554,6 +1564,415 @@ func (x *Slot) GetConfirmedFlushLsn() uint64 {
 	return 0
 }
 
+func (x *Slot) GetWalStatus() string {
+	if x != nil {
+		return x.WalStatus
+	}
+	return ""
+}
+
+func (x *Slot) GetInvalidationReason() string {
+	if x != nil {
+		return x.InvalidationReason
+	}
+	return ""
+}
+
+func (x *Slot) GetSynced() bool {
+	if x != nil {
+		return x.Synced
+	}
+	return false
+}
+
+func (x *Slot) GetTemporary() bool {
+	if x != nil {
+		return x.Temporary
+	}
+	return false
+}
+
+func (x *Slot) GetTwoPhase() bool {
+	if x != nil {
+		return x.TwoPhase
+	}
+	return false
+}
+
+func (x *Slot) GetDatabase() string {
+	if x != nil {
+		return x.Database
+	}
+	return ""
+}
+
+// CreateStreamSlotRequest creates a change stream's slot on this shard.
+type CreateStreamSlotRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Caller's view of the current epoch; must EQUAL the last accepted epoch.
+	Epoch uint64 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	// Stream name; the slot is named pgshard_<stream>_<shard>.
+	Stream string `protobuf:"bytes,2,opt,name=stream,proto3" json:"stream,omitempty"`
+	// Database the stream decodes.
+	Database string `protobuf:"bytes,3,opt,name=database,proto3" json:"database,omitempty"`
+	// Enable two-phase decoding for the slot.
+	TwoPhase      bool `protobuf:"varint,4,opt,name=two_phase,json=twoPhase,proto3" json:"two_phase,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CreateStreamSlotRequest) Reset() {
+	*x = CreateStreamSlotRequest{}
+	mi := &file_pgshard_v1_agent_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CreateStreamSlotRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CreateStreamSlotRequest) ProtoMessage() {}
+
+func (x *CreateStreamSlotRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_agent_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CreateStreamSlotRequest.ProtoReflect.Descriptor instead.
+func (*CreateStreamSlotRequest) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *CreateStreamSlotRequest) GetEpoch() uint64 {
+	if x != nil {
+		return x.Epoch
+	}
+	return 0
+}
+
+func (x *CreateStreamSlotRequest) GetStream() string {
+	if x != nil {
+		return x.Stream
+	}
+	return ""
+}
+
+func (x *CreateStreamSlotRequest) GetDatabase() string {
+	if x != nil {
+		return x.Database
+	}
+	return ""
+}
+
+func (x *CreateStreamSlotRequest) GetTwoPhase() bool {
+	if x != nil {
+		return x.TwoPhase
+	}
+	return false
+}
+
+// CreateStreamSlotResponse reports the created slot.
+type CreateStreamSlotResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Epoch uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	Slot  string                 `protobuf:"bytes,2,opt,name=slot,proto3" json:"slot,omitempty"`
+	// Consistent point the slot starts from.
+	Lsn           uint64 `protobuf:"varint,3,opt,name=lsn,proto3" json:"lsn,omitempty"`
+	Error         *Error `protobuf:"bytes,4,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CreateStreamSlotResponse) Reset() {
+	*x = CreateStreamSlotResponse{}
+	mi := &file_pgshard_v1_agent_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CreateStreamSlotResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CreateStreamSlotResponse) ProtoMessage() {}
+
+func (x *CreateStreamSlotResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_agent_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CreateStreamSlotResponse.ProtoReflect.Descriptor instead.
+func (*CreateStreamSlotResponse) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *CreateStreamSlotResponse) GetEpoch() uint64 {
+	if x != nil {
+		return x.Epoch
+	}
+	return 0
+}
+
+func (x *CreateStreamSlotResponse) GetSlot() string {
+	if x != nil {
+		return x.Slot
+	}
+	return ""
+}
+
+func (x *CreateStreamSlotResponse) GetLsn() uint64 {
+	if x != nil {
+		return x.Lsn
+	}
+	return 0
+}
+
+func (x *CreateStreamSlotResponse) GetError() *Error {
+	if x != nil {
+		return x.Error
+	}
+	return nil
+}
+
+// DropStreamSlotRequest drops a change stream's slot on this shard.
+type DropStreamSlotRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Caller's view of the current epoch; must EQUAL the last accepted epoch.
+	Epoch         uint64 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	Stream        string `protobuf:"bytes,2,opt,name=stream,proto3" json:"stream,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DropStreamSlotRequest) Reset() {
+	*x = DropStreamSlotRequest{}
+	mi := &file_pgshard_v1_agent_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DropStreamSlotRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DropStreamSlotRequest) ProtoMessage() {}
+
+func (x *DropStreamSlotRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_agent_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DropStreamSlotRequest.ProtoReflect.Descriptor instead.
+func (*DropStreamSlotRequest) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *DropStreamSlotRequest) GetEpoch() uint64 {
+	if x != nil {
+		return x.Epoch
+	}
+	return 0
+}
+
+func (x *DropStreamSlotRequest) GetStream() string {
+	if x != nil {
+		return x.Stream
+	}
+	return ""
+}
+
+// DropStreamSlotResponse reports the outcome.
+type DropStreamSlotResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Epoch         uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	Error         *Error                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DropStreamSlotResponse) Reset() {
+	*x = DropStreamSlotResponse{}
+	mi := &file_pgshard_v1_agent_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DropStreamSlotResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DropStreamSlotResponse) ProtoMessage() {}
+
+func (x *DropStreamSlotResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_agent_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DropStreamSlotResponse.ProtoReflect.Descriptor instead.
+func (*DropStreamSlotResponse) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{25}
+}
+
+func (x *DropStreamSlotResponse) GetEpoch() uint64 {
+	if x != nil {
+		return x.Epoch
+	}
+	return 0
+}
+
+func (x *DropStreamSlotResponse) GetError() *Error {
+	if x != nil {
+		return x.Error
+	}
+	return nil
+}
+
+// SetSynchronizedStandbySlotsRequest names the physical slots of the
+// synchronous standbys whose confirmation failover slots must wait for.
+type SetSynchronizedStandbySlotsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Caller's view of the current epoch; must EQUAL the last accepted epoch.
+	Epoch         uint64   `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	Slots         []string `protobuf:"bytes,2,rep,name=slots,proto3" json:"slots,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetSynchronizedStandbySlotsRequest) Reset() {
+	*x = SetSynchronizedStandbySlotsRequest{}
+	mi := &file_pgshard_v1_agent_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetSynchronizedStandbySlotsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetSynchronizedStandbySlotsRequest) ProtoMessage() {}
+
+func (x *SetSynchronizedStandbySlotsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_agent_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetSynchronizedStandbySlotsRequest.ProtoReflect.Descriptor instead.
+func (*SetSynchronizedStandbySlotsRequest) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{26}
+}
+
+func (x *SetSynchronizedStandbySlotsRequest) GetEpoch() uint64 {
+	if x != nil {
+		return x.Epoch
+	}
+	return 0
+}
+
+func (x *SetSynchronizedStandbySlotsRequest) GetSlots() []string {
+	if x != nil {
+		return x.Slots
+	}
+	return nil
+}
+
+// SetSynchronizedStandbySlotsResponse reports the slots actually applied.
+type SetSynchronizedStandbySlotsResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Epoch uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	// Subset of the requested slots that exist and are active.
+	Applied       []string `protobuf:"bytes,2,rep,name=applied,proto3" json:"applied,omitempty"`
+	Error         *Error   `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetSynchronizedStandbySlotsResponse) Reset() {
+	*x = SetSynchronizedStandbySlotsResponse{}
+	mi := &file_pgshard_v1_agent_proto_msgTypes[27]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetSynchronizedStandbySlotsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetSynchronizedStandbySlotsResponse) ProtoMessage() {}
+
+func (x *SetSynchronizedStandbySlotsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_agent_proto_msgTypes[27]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetSynchronizedStandbySlotsResponse.ProtoReflect.Descriptor instead.
+func (*SetSynchronizedStandbySlotsResponse) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{27}
+}
+
+func (x *SetSynchronizedStandbySlotsResponse) GetEpoch() uint64 {
+	if x != nil {
+		return x.Epoch
+	}
+	return 0
+}
+
+func (x *SetSynchronizedStandbySlotsResponse) GetApplied() []string {
+	if x != nil {
+		return x.Applied
+	}
+	return nil
+}
+
+func (x *SetSynchronizedStandbySlotsResponse) GetError() *Error {
+	if x != nil {
+		return x.Error
+	}
+	return nil
+}
+
 // ListSlotsResponse returns the slots.
 type ListSlotsResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -1566,7 +1985,7 @@ type ListSlotsResponse struct {
 
 func (x *ListSlotsResponse) Reset() {
 	*x = ListSlotsResponse{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[22]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1578,7 +1997,7 @@ func (x *ListSlotsResponse) String() string {
 func (*ListSlotsResponse) ProtoMessage() {}
 
 func (x *ListSlotsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[22]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1591,7 +2010,7 @@ func (x *ListSlotsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSlotsResponse.ProtoReflect.Descriptor instead.
 func (*ListSlotsResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{22}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *ListSlotsResponse) GetEpoch() uint64 {
@@ -1626,7 +2045,7 @@ type BackupRequest struct {
 
 func (x *BackupRequest) Reset() {
 	*x = BackupRequest{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[23]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1638,7 +2057,7 @@ func (x *BackupRequest) String() string {
 func (*BackupRequest) ProtoMessage() {}
 
 func (x *BackupRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[23]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1651,7 +2070,7 @@ func (x *BackupRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackupRequest.ProtoReflect.Descriptor instead.
 func (*BackupRequest) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{23}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *BackupRequest) GetEpoch() uint64 {
@@ -1694,7 +2113,7 @@ type BackupInfo struct {
 
 func (x *BackupInfo) Reset() {
 	*x = BackupInfo{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[24]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1706,7 +2125,7 @@ func (x *BackupInfo) String() string {
 func (*BackupInfo) ProtoMessage() {}
 
 func (x *BackupInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[24]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1719,7 +2138,7 @@ func (x *BackupInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackupInfo.ProtoReflect.Descriptor instead.
 func (*BackupInfo) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{24}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *BackupInfo) GetLabel() string {
@@ -1815,7 +2234,7 @@ type BackupResponse struct {
 
 func (x *BackupResponse) Reset() {
 	*x = BackupResponse{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[25]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1827,7 +2246,7 @@ func (x *BackupResponse) String() string {
 func (*BackupResponse) ProtoMessage() {}
 
 func (x *BackupResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[25]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1840,7 +2259,7 @@ func (x *BackupResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackupResponse.ProtoReflect.Descriptor instead.
 func (*BackupResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{25}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *BackupResponse) GetEpoch() uint64 {
@@ -1887,7 +2306,7 @@ type RestoreInfoRequest struct {
 
 func (x *RestoreInfoRequest) Reset() {
 	*x = RestoreInfoRequest{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[26]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1899,7 +2318,7 @@ func (x *RestoreInfoRequest) String() string {
 func (*RestoreInfoRequest) ProtoMessage() {}
 
 func (x *RestoreInfoRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[26]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1912,7 +2331,7 @@ func (x *RestoreInfoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreInfoRequest.ProtoReflect.Descriptor instead.
 func (*RestoreInfoRequest) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{26}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{32}
 }
 
 // RestoreInfoResponse describes the stanza in the repository.
@@ -1938,7 +2357,7 @@ type RestoreInfoResponse struct {
 
 func (x *RestoreInfoResponse) Reset() {
 	*x = RestoreInfoResponse{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[27]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1950,7 +2369,7 @@ func (x *RestoreInfoResponse) String() string {
 func (*RestoreInfoResponse) ProtoMessage() {}
 
 func (x *RestoreInfoResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[27]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1963,7 +2382,7 @@ func (x *RestoreInfoResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreInfoResponse.ProtoReflect.Descriptor instead.
 func (*RestoreInfoResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{27}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *RestoreInfoResponse) GetEpoch() uint64 {
@@ -2047,7 +2466,7 @@ type ExpireRequest struct {
 
 func (x *ExpireRequest) Reset() {
 	*x = ExpireRequest{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[28]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2059,7 +2478,7 @@ func (x *ExpireRequest) String() string {
 func (*ExpireRequest) ProtoMessage() {}
 
 func (x *ExpireRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[28]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2072,7 +2491,7 @@ func (x *ExpireRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExpireRequest.ProtoReflect.Descriptor instead.
 func (*ExpireRequest) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{28}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *ExpireRequest) GetEpoch() uint64 {
@@ -2094,7 +2513,7 @@ type ExpireResponse struct {
 
 func (x *ExpireResponse) Reset() {
 	*x = ExpireResponse{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[29]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2106,7 +2525,7 @@ func (x *ExpireResponse) String() string {
 func (*ExpireResponse) ProtoMessage() {}
 
 func (x *ExpireResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[29]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2119,7 +2538,7 @@ func (x *ExpireResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExpireResponse.ProtoReflect.Descriptor instead.
 func (*ExpireResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{29}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *ExpireResponse) GetEpoch() uint64 {
@@ -2152,7 +2571,7 @@ type VerifyRequest struct {
 
 func (x *VerifyRequest) Reset() {
 	*x = VerifyRequest{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[30]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2164,7 +2583,7 @@ func (x *VerifyRequest) String() string {
 func (*VerifyRequest) ProtoMessage() {}
 
 func (x *VerifyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[30]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2177,7 +2596,7 @@ func (x *VerifyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VerifyRequest.ProtoReflect.Descriptor instead.
 func (*VerifyRequest) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{30}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{36}
 }
 
 // VerifyResponse reports the outcome.
@@ -2192,7 +2611,7 @@ type VerifyResponse struct {
 
 func (x *VerifyResponse) Reset() {
 	*x = VerifyResponse{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[31]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2204,7 +2623,7 @@ func (x *VerifyResponse) String() string {
 func (*VerifyResponse) ProtoMessage() {}
 
 func (x *VerifyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[31]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2217,7 +2636,7 @@ func (x *VerifyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VerifyResponse.ProtoReflect.Descriptor instead.
 func (*VerifyResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{31}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *VerifyResponse) GetEpoch() uint64 {
@@ -2256,7 +2675,7 @@ type TransactionDecision struct {
 
 func (x *TransactionDecision) Reset() {
 	*x = TransactionDecision{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[32]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2268,7 +2687,7 @@ func (x *TransactionDecision) String() string {
 func (*TransactionDecision) ProtoMessage() {}
 
 func (x *TransactionDecision) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[32]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2281,7 +2700,7 @@ func (x *TransactionDecision) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TransactionDecision.ProtoReflect.Descriptor instead.
 func (*TransactionDecision) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{32}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *TransactionDecision) GetGid() string {
@@ -2321,7 +2740,7 @@ type ListTransactionDecisionsRequest struct {
 
 func (x *ListTransactionDecisionsRequest) Reset() {
 	*x = ListTransactionDecisionsRequest{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[33]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2333,7 +2752,7 @@ func (x *ListTransactionDecisionsRequest) String() string {
 func (*ListTransactionDecisionsRequest) ProtoMessage() {}
 
 func (x *ListTransactionDecisionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[33]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2346,7 +2765,7 @@ func (x *ListTransactionDecisionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListTransactionDecisionsRequest.ProtoReflect.Descriptor instead.
 func (*ListTransactionDecisionsRequest) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{33}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{39}
 }
 
 // ListTransactionDecisionsResponse returns the decision log.
@@ -2361,7 +2780,7 @@ type ListTransactionDecisionsResponse struct {
 
 func (x *ListTransactionDecisionsResponse) Reset() {
 	*x = ListTransactionDecisionsResponse{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[34]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2373,7 +2792,7 @@ func (x *ListTransactionDecisionsResponse) String() string {
 func (*ListTransactionDecisionsResponse) ProtoMessage() {}
 
 func (x *ListTransactionDecisionsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[34]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2386,7 +2805,7 @@ func (x *ListTransactionDecisionsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListTransactionDecisionsResponse.ProtoReflect.Descriptor instead.
 func (*ListTransactionDecisionsResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{34}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *ListTransactionDecisionsResponse) GetEpoch() uint64 {
@@ -2424,7 +2843,7 @@ type ReconcilePreparedTransactionsRequest struct {
 
 func (x *ReconcilePreparedTransactionsRequest) Reset() {
 	*x = ReconcilePreparedTransactionsRequest{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[35]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2436,7 +2855,7 @@ func (x *ReconcilePreparedTransactionsRequest) String() string {
 func (*ReconcilePreparedTransactionsRequest) ProtoMessage() {}
 
 func (x *ReconcilePreparedTransactionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[35]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2449,7 +2868,7 @@ func (x *ReconcilePreparedTransactionsRequest) ProtoReflect() protoreflect.Messa
 
 // Deprecated: Use ReconcilePreparedTransactionsRequest.ProtoReflect.Descriptor instead.
 func (*ReconcilePreparedTransactionsRequest) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{35}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *ReconcilePreparedTransactionsRequest) GetEpoch() uint64 {
@@ -2488,7 +2907,7 @@ type ReconcilePreparedTransactionsResponse struct {
 
 func (x *ReconcilePreparedTransactionsResponse) Reset() {
 	*x = ReconcilePreparedTransactionsResponse{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[36]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2500,7 +2919,7 @@ func (x *ReconcilePreparedTransactionsResponse) String() string {
 func (*ReconcilePreparedTransactionsResponse) ProtoMessage() {}
 
 func (x *ReconcilePreparedTransactionsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[36]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2513,7 +2932,7 @@ func (x *ReconcilePreparedTransactionsResponse) ProtoReflect() protoreflect.Mess
 
 // Deprecated: Use ReconcilePreparedTransactionsResponse.ProtoReflect.Descriptor instead.
 func (*ReconcilePreparedTransactionsResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{36}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *ReconcilePreparedTransactionsResponse) GetEpoch() uint64 {
@@ -2564,7 +2983,7 @@ type SetWriteFenceRequest struct {
 
 func (x *SetWriteFenceRequest) Reset() {
 	*x = SetWriteFenceRequest{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[37]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2576,7 +2995,7 @@ func (x *SetWriteFenceRequest) String() string {
 func (*SetWriteFenceRequest) ProtoMessage() {}
 
 func (x *SetWriteFenceRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[37]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2589,7 +3008,7 @@ func (x *SetWriteFenceRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetWriteFenceRequest.ProtoReflect.Descriptor instead.
 func (*SetWriteFenceRequest) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{37}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *SetWriteFenceRequest) GetEpoch() uint64 {
@@ -2624,7 +3043,7 @@ type SetWriteFenceResponse struct {
 
 func (x *SetWriteFenceResponse) Reset() {
 	*x = SetWriteFenceResponse{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[38]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2636,7 +3055,7 @@ func (x *SetWriteFenceResponse) String() string {
 func (*SetWriteFenceResponse) ProtoMessage() {}
 
 func (x *SetWriteFenceResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[38]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2649,7 +3068,7 @@ func (x *SetWriteFenceResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetWriteFenceResponse.ProtoReflect.Descriptor instead.
 func (*SetWriteFenceResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{38}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{44}
 }
 
 func (x *SetWriteFenceResponse) GetEpoch() uint64 {
@@ -2757,7 +3176,7 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\x10DropSlotResponse\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12'\n" +
 	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"\x12\n" +
-	"\x10ListSlotsRequest\"\xe1\x01\n" +
+	"\x10ListSlotsRequest\"\xa0\x03\n" +
 	"\x04Slot\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12(\n" +
 	"\x04kind\x18\x02 \x01(\x0e2\x14.pgshard.v1.SlotKindR\x04kind\x12\x16\n" +
@@ -2766,7 +3185,38 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\x06active\x18\x05 \x01(\bR\x06active\x12\x1f\n" +
 	"\vrestart_lsn\x18\x06 \x01(\x04R\n" +
 	"restartLsn\x12.\n" +
-	"\x13confirmed_flush_lsn\x18\a \x01(\x04R\x11confirmedFlushLsn\"z\n" +
+	"\x13confirmed_flush_lsn\x18\a \x01(\x04R\x11confirmedFlushLsn\x12\x1d\n" +
+	"\n" +
+	"wal_status\x18\b \x01(\tR\twalStatus\x12/\n" +
+	"\x13invalidation_reason\x18\t \x01(\tR\x12invalidationReason\x12\x16\n" +
+	"\x06synced\x18\n" +
+	" \x01(\bR\x06synced\x12\x1c\n" +
+	"\ttemporary\x18\v \x01(\bR\ttemporary\x12\x1b\n" +
+	"\ttwo_phase\x18\f \x01(\bR\btwoPhase\x12\x1a\n" +
+	"\bdatabase\x18\r \x01(\tR\bdatabase\"\x80\x01\n" +
+	"\x17CreateStreamSlotRequest\x12\x14\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x16\n" +
+	"\x06stream\x18\x02 \x01(\tR\x06stream\x12\x1a\n" +
+	"\bdatabase\x18\x03 \x01(\tR\bdatabase\x12\x1b\n" +
+	"\ttwo_phase\x18\x04 \x01(\bR\btwoPhase\"\x7f\n" +
+	"\x18CreateStreamSlotResponse\x12\x14\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x12\n" +
+	"\x04slot\x18\x02 \x01(\tR\x04slot\x12\x10\n" +
+	"\x03lsn\x18\x03 \x01(\x04R\x03lsn\x12'\n" +
+	"\x05error\x18\x04 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"E\n" +
+	"\x15DropStreamSlotRequest\x12\x14\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x16\n" +
+	"\x06stream\x18\x02 \x01(\tR\x06stream\"W\n" +
+	"\x16DropStreamSlotResponse\x12\x14\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12'\n" +
+	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"P\n" +
+	"\"SetSynchronizedStandbySlotsRequest\x12\x14\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x14\n" +
+	"\x05slots\x18\x02 \x03(\tR\x05slots\"~\n" +
+	"#SetSynchronizedStandbySlotsResponse\x12\x14\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x18\n" +
+	"\aapplied\x18\x02 \x03(\tR\aapplied\x12'\n" +
+	"\x05error\x18\x03 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"z\n" +
 	"\x11ListSlotsResponse\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12&\n" +
 	"\x05slots\x18\x02 \x03(\v2\x10.pgshard.v1.SlotR\x05slots\x12'\n" +
@@ -2862,7 +3312,7 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\bSlotKind\x12\x19\n" +
 	"\x15SLOT_KIND_UNSPECIFIED\x10\x00\x12\x16\n" +
 	"\x12SLOT_KIND_PHYSICAL\x10\x01\x12\x15\n" +
-	"\x11SLOT_KIND_LOGICAL\x10\x022\x81\v\n" +
+	"\x11SLOT_KIND_LOGICAL\x10\x022\xb9\r\n" +
 	"\x05Agent\x12?\n" +
 	"\x06Status\x12\x19.pgshard.v1.StatusRequest\x1a\x1a.pgshard.v1.StatusResponse\x12B\n" +
 	"\aPromote\x12\x1a.pgshard.v1.PromoteRequest\x1a\x1b.pgshard.v1.PromoteResponse\x12?\n" +
@@ -2875,7 +3325,10 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\n" +
 	"CreateSlot\x12\x1d.pgshard.v1.CreateSlotRequest\x1a\x1e.pgshard.v1.CreateSlotResponse\x12E\n" +
 	"\bDropSlot\x12\x1b.pgshard.v1.DropSlotRequest\x1a\x1c.pgshard.v1.DropSlotResponse\x12H\n" +
-	"\tListSlots\x12\x1c.pgshard.v1.ListSlotsRequest\x1a\x1d.pgshard.v1.ListSlotsResponse\x12?\n" +
+	"\tListSlots\x12\x1c.pgshard.v1.ListSlotsRequest\x1a\x1d.pgshard.v1.ListSlotsResponse\x12]\n" +
+	"\x10CreateStreamSlot\x12#.pgshard.v1.CreateStreamSlotRequest\x1a$.pgshard.v1.CreateStreamSlotResponse\x12W\n" +
+	"\x0eDropStreamSlot\x12!.pgshard.v1.DropStreamSlotRequest\x1a\".pgshard.v1.DropStreamSlotResponse\x12~\n" +
+	"\x1bSetSynchronizedStandbySlots\x12..pgshard.v1.SetSynchronizedStandbySlotsRequest\x1a/.pgshard.v1.SetSynchronizedStandbySlotsResponse\x12?\n" +
 	"\x06Backup\x12\x19.pgshard.v1.BackupRequest\x1a\x1a.pgshard.v1.BackupResponse\x12N\n" +
 	"\vRestoreInfo\x12\x1e.pgshard.v1.RestoreInfoRequest\x1a\x1f.pgshard.v1.RestoreInfoResponse\x12?\n" +
 	"\x06Expire\x12\x19.pgshard.v1.ExpireRequest\x1a\x1a.pgshard.v1.ExpireResponse\x12?\n" +
@@ -2901,7 +3354,7 @@ func file_pgshard_v1_agent_proto_rawDescGZIP() []byte {
 }
 
 var file_pgshard_v1_agent_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
-var file_pgshard_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 39)
+var file_pgshard_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 45)
 var file_pgshard_v1_agent_proto_goTypes = []any{
 	(SlotKind)(0),                                 // 0: pgshard.v1.SlotKind
 	(StatusResponse_Role)(0),                      // 1: pgshard.v1.StatusResponse.Role
@@ -2930,96 +3383,111 @@ var file_pgshard_v1_agent_proto_goTypes = []any{
 	(*DropSlotResponse)(nil),                      // 24: pgshard.v1.DropSlotResponse
 	(*ListSlotsRequest)(nil),                      // 25: pgshard.v1.ListSlotsRequest
 	(*Slot)(nil),                                  // 26: pgshard.v1.Slot
-	(*ListSlotsResponse)(nil),                     // 27: pgshard.v1.ListSlotsResponse
-	(*BackupRequest)(nil),                         // 28: pgshard.v1.BackupRequest
-	(*BackupInfo)(nil),                            // 29: pgshard.v1.BackupInfo
-	(*BackupResponse)(nil),                        // 30: pgshard.v1.BackupResponse
-	(*RestoreInfoRequest)(nil),                    // 31: pgshard.v1.RestoreInfoRequest
-	(*RestoreInfoResponse)(nil),                   // 32: pgshard.v1.RestoreInfoResponse
-	(*ExpireRequest)(nil),                         // 33: pgshard.v1.ExpireRequest
-	(*ExpireResponse)(nil),                        // 34: pgshard.v1.ExpireResponse
-	(*VerifyRequest)(nil),                         // 35: pgshard.v1.VerifyRequest
-	(*VerifyResponse)(nil),                        // 36: pgshard.v1.VerifyResponse
-	(*TransactionDecision)(nil),                   // 37: pgshard.v1.TransactionDecision
-	(*ListTransactionDecisionsRequest)(nil),       // 38: pgshard.v1.ListTransactionDecisionsRequest
-	(*ListTransactionDecisionsResponse)(nil),      // 39: pgshard.v1.ListTransactionDecisionsResponse
-	(*ReconcilePreparedTransactionsRequest)(nil),  // 40: pgshard.v1.ReconcilePreparedTransactionsRequest
-	(*ReconcilePreparedTransactionsResponse)(nil), // 41: pgshard.v1.ReconcilePreparedTransactionsResponse
-	(*SetWriteFenceRequest)(nil),                  // 42: pgshard.v1.SetWriteFenceRequest
-	(*SetWriteFenceResponse)(nil),                 // 43: pgshard.v1.SetWriteFenceResponse
-	(*Error)(nil),                                 // 44: pgshard.v1.Error
+	(*CreateStreamSlotRequest)(nil),               // 27: pgshard.v1.CreateStreamSlotRequest
+	(*CreateStreamSlotResponse)(nil),              // 28: pgshard.v1.CreateStreamSlotResponse
+	(*DropStreamSlotRequest)(nil),                 // 29: pgshard.v1.DropStreamSlotRequest
+	(*DropStreamSlotResponse)(nil),                // 30: pgshard.v1.DropStreamSlotResponse
+	(*SetSynchronizedStandbySlotsRequest)(nil),    // 31: pgshard.v1.SetSynchronizedStandbySlotsRequest
+	(*SetSynchronizedStandbySlotsResponse)(nil),   // 32: pgshard.v1.SetSynchronizedStandbySlotsResponse
+	(*ListSlotsResponse)(nil),                     // 33: pgshard.v1.ListSlotsResponse
+	(*BackupRequest)(nil),                         // 34: pgshard.v1.BackupRequest
+	(*BackupInfo)(nil),                            // 35: pgshard.v1.BackupInfo
+	(*BackupResponse)(nil),                        // 36: pgshard.v1.BackupResponse
+	(*RestoreInfoRequest)(nil),                    // 37: pgshard.v1.RestoreInfoRequest
+	(*RestoreInfoResponse)(nil),                   // 38: pgshard.v1.RestoreInfoResponse
+	(*ExpireRequest)(nil),                         // 39: pgshard.v1.ExpireRequest
+	(*ExpireResponse)(nil),                        // 40: pgshard.v1.ExpireResponse
+	(*VerifyRequest)(nil),                         // 41: pgshard.v1.VerifyRequest
+	(*VerifyResponse)(nil),                        // 42: pgshard.v1.VerifyResponse
+	(*TransactionDecision)(nil),                   // 43: pgshard.v1.TransactionDecision
+	(*ListTransactionDecisionsRequest)(nil),       // 44: pgshard.v1.ListTransactionDecisionsRequest
+	(*ListTransactionDecisionsResponse)(nil),      // 45: pgshard.v1.ListTransactionDecisionsResponse
+	(*ReconcilePreparedTransactionsRequest)(nil),  // 46: pgshard.v1.ReconcilePreparedTransactionsRequest
+	(*ReconcilePreparedTransactionsResponse)(nil), // 47: pgshard.v1.ReconcilePreparedTransactionsResponse
+	(*SetWriteFenceRequest)(nil),                  // 48: pgshard.v1.SetWriteFenceRequest
+	(*SetWriteFenceResponse)(nil),                 // 49: pgshard.v1.SetWriteFenceResponse
+	(*Error)(nil),                                 // 50: pgshard.v1.Error
 }
 var file_pgshard_v1_agent_proto_depIdxs = []int32{
 	1,  // 0: pgshard.v1.StatusResponse.role:type_name -> pgshard.v1.StatusResponse.Role
-	44, // 1: pgshard.v1.StatusResponse.error:type_name -> pgshard.v1.Error
-	44, // 2: pgshard.v1.PromoteResponse.error:type_name -> pgshard.v1.Error
-	44, // 3: pgshard.v1.DemoteResponse.error:type_name -> pgshard.v1.Error
-	44, // 4: pgshard.v1.RewindResponse.error:type_name -> pgshard.v1.Error
+	50, // 1: pgshard.v1.StatusResponse.error:type_name -> pgshard.v1.Error
+	50, // 2: pgshard.v1.PromoteResponse.error:type_name -> pgshard.v1.Error
+	50, // 3: pgshard.v1.DemoteResponse.error:type_name -> pgshard.v1.Error
+	50, // 4: pgshard.v1.RewindResponse.error:type_name -> pgshard.v1.Error
 	2,  // 5: pgshard.v1.RecloneRequest.source_kind:type_name -> pgshard.v1.RecloneRequest.SourceKind
-	44, // 6: pgshard.v1.RecloneResponse.error:type_name -> pgshard.v1.Error
-	44, // 7: pgshard.v1.ReloadResponse.error:type_name -> pgshard.v1.Error
+	50, // 6: pgshard.v1.RecloneResponse.error:type_name -> pgshard.v1.Error
+	50, // 7: pgshard.v1.ReloadResponse.error:type_name -> pgshard.v1.Error
 	3,  // 8: pgshard.v1.RestartRequest.mode:type_name -> pgshard.v1.RestartRequest.Mode
-	44, // 9: pgshard.v1.RestartResponse.error:type_name -> pgshard.v1.Error
-	44, // 10: pgshard.v1.CreateRestorePointResponse.error:type_name -> pgshard.v1.Error
+	50, // 9: pgshard.v1.RestartResponse.error:type_name -> pgshard.v1.Error
+	50, // 10: pgshard.v1.CreateRestorePointResponse.error:type_name -> pgshard.v1.Error
 	0,  // 11: pgshard.v1.CreateSlotRequest.kind:type_name -> pgshard.v1.SlotKind
-	44, // 12: pgshard.v1.CreateSlotResponse.error:type_name -> pgshard.v1.Error
-	44, // 13: pgshard.v1.DropSlotResponse.error:type_name -> pgshard.v1.Error
+	50, // 12: pgshard.v1.CreateSlotResponse.error:type_name -> pgshard.v1.Error
+	50, // 13: pgshard.v1.DropSlotResponse.error:type_name -> pgshard.v1.Error
 	0,  // 14: pgshard.v1.Slot.kind:type_name -> pgshard.v1.SlotKind
-	26, // 15: pgshard.v1.ListSlotsResponse.slots:type_name -> pgshard.v1.Slot
-	44, // 16: pgshard.v1.ListSlotsResponse.error:type_name -> pgshard.v1.Error
-	4,  // 17: pgshard.v1.BackupRequest.type:type_name -> pgshard.v1.BackupRequest.Type
-	44, // 18: pgshard.v1.BackupResponse.error:type_name -> pgshard.v1.Error
-	29, // 19: pgshard.v1.BackupResponse.info:type_name -> pgshard.v1.BackupInfo
-	44, // 20: pgshard.v1.RestoreInfoResponse.error:type_name -> pgshard.v1.Error
-	29, // 21: pgshard.v1.RestoreInfoResponse.backups:type_name -> pgshard.v1.BackupInfo
-	44, // 22: pgshard.v1.ExpireResponse.error:type_name -> pgshard.v1.Error
-	44, // 23: pgshard.v1.VerifyResponse.error:type_name -> pgshard.v1.Error
-	37, // 24: pgshard.v1.ListTransactionDecisionsResponse.decisions:type_name -> pgshard.v1.TransactionDecision
-	44, // 25: pgshard.v1.ListTransactionDecisionsResponse.error:type_name -> pgshard.v1.Error
-	37, // 26: pgshard.v1.ReconcilePreparedTransactionsRequest.decisions:type_name -> pgshard.v1.TransactionDecision
-	44, // 27: pgshard.v1.ReconcilePreparedTransactionsResponse.error:type_name -> pgshard.v1.Error
-	44, // 28: pgshard.v1.SetWriteFenceResponse.error:type_name -> pgshard.v1.Error
-	5,  // 29: pgshard.v1.Agent.Status:input_type -> pgshard.v1.StatusRequest
-	7,  // 30: pgshard.v1.Agent.Promote:input_type -> pgshard.v1.PromoteRequest
-	9,  // 31: pgshard.v1.Agent.Demote:input_type -> pgshard.v1.DemoteRequest
-	11, // 32: pgshard.v1.Agent.Rewind:input_type -> pgshard.v1.RewindRequest
-	13, // 33: pgshard.v1.Agent.Reclone:input_type -> pgshard.v1.RecloneRequest
-	15, // 34: pgshard.v1.Agent.Reload:input_type -> pgshard.v1.ReloadRequest
-	17, // 35: pgshard.v1.Agent.Restart:input_type -> pgshard.v1.RestartRequest
-	19, // 36: pgshard.v1.Agent.CreateRestorePoint:input_type -> pgshard.v1.CreateRestorePointRequest
-	21, // 37: pgshard.v1.Agent.CreateSlot:input_type -> pgshard.v1.CreateSlotRequest
-	23, // 38: pgshard.v1.Agent.DropSlot:input_type -> pgshard.v1.DropSlotRequest
-	25, // 39: pgshard.v1.Agent.ListSlots:input_type -> pgshard.v1.ListSlotsRequest
-	28, // 40: pgshard.v1.Agent.Backup:input_type -> pgshard.v1.BackupRequest
-	31, // 41: pgshard.v1.Agent.RestoreInfo:input_type -> pgshard.v1.RestoreInfoRequest
-	33, // 42: pgshard.v1.Agent.Expire:input_type -> pgshard.v1.ExpireRequest
-	35, // 43: pgshard.v1.Agent.Verify:input_type -> pgshard.v1.VerifyRequest
-	38, // 44: pgshard.v1.Agent.ListTransactionDecisions:input_type -> pgshard.v1.ListTransactionDecisionsRequest
-	40, // 45: pgshard.v1.Agent.ReconcilePreparedTransactions:input_type -> pgshard.v1.ReconcilePreparedTransactionsRequest
-	42, // 46: pgshard.v1.Agent.SetWriteFence:input_type -> pgshard.v1.SetWriteFenceRequest
-	6,  // 47: pgshard.v1.Agent.Status:output_type -> pgshard.v1.StatusResponse
-	8,  // 48: pgshard.v1.Agent.Promote:output_type -> pgshard.v1.PromoteResponse
-	10, // 49: pgshard.v1.Agent.Demote:output_type -> pgshard.v1.DemoteResponse
-	12, // 50: pgshard.v1.Agent.Rewind:output_type -> pgshard.v1.RewindResponse
-	14, // 51: pgshard.v1.Agent.Reclone:output_type -> pgshard.v1.RecloneResponse
-	16, // 52: pgshard.v1.Agent.Reload:output_type -> pgshard.v1.ReloadResponse
-	18, // 53: pgshard.v1.Agent.Restart:output_type -> pgshard.v1.RestartResponse
-	20, // 54: pgshard.v1.Agent.CreateRestorePoint:output_type -> pgshard.v1.CreateRestorePointResponse
-	22, // 55: pgshard.v1.Agent.CreateSlot:output_type -> pgshard.v1.CreateSlotResponse
-	24, // 56: pgshard.v1.Agent.DropSlot:output_type -> pgshard.v1.DropSlotResponse
-	27, // 57: pgshard.v1.Agent.ListSlots:output_type -> pgshard.v1.ListSlotsResponse
-	30, // 58: pgshard.v1.Agent.Backup:output_type -> pgshard.v1.BackupResponse
-	32, // 59: pgshard.v1.Agent.RestoreInfo:output_type -> pgshard.v1.RestoreInfoResponse
-	34, // 60: pgshard.v1.Agent.Expire:output_type -> pgshard.v1.ExpireResponse
-	36, // 61: pgshard.v1.Agent.Verify:output_type -> pgshard.v1.VerifyResponse
-	39, // 62: pgshard.v1.Agent.ListTransactionDecisions:output_type -> pgshard.v1.ListTransactionDecisionsResponse
-	41, // 63: pgshard.v1.Agent.ReconcilePreparedTransactions:output_type -> pgshard.v1.ReconcilePreparedTransactionsResponse
-	43, // 64: pgshard.v1.Agent.SetWriteFence:output_type -> pgshard.v1.SetWriteFenceResponse
-	47, // [47:65] is the sub-list for method output_type
-	29, // [29:47] is the sub-list for method input_type
-	29, // [29:29] is the sub-list for extension type_name
-	29, // [29:29] is the sub-list for extension extendee
-	0,  // [0:29] is the sub-list for field type_name
+	50, // 15: pgshard.v1.CreateStreamSlotResponse.error:type_name -> pgshard.v1.Error
+	50, // 16: pgshard.v1.DropStreamSlotResponse.error:type_name -> pgshard.v1.Error
+	50, // 17: pgshard.v1.SetSynchronizedStandbySlotsResponse.error:type_name -> pgshard.v1.Error
+	26, // 18: pgshard.v1.ListSlotsResponse.slots:type_name -> pgshard.v1.Slot
+	50, // 19: pgshard.v1.ListSlotsResponse.error:type_name -> pgshard.v1.Error
+	4,  // 20: pgshard.v1.BackupRequest.type:type_name -> pgshard.v1.BackupRequest.Type
+	50, // 21: pgshard.v1.BackupResponse.error:type_name -> pgshard.v1.Error
+	35, // 22: pgshard.v1.BackupResponse.info:type_name -> pgshard.v1.BackupInfo
+	50, // 23: pgshard.v1.RestoreInfoResponse.error:type_name -> pgshard.v1.Error
+	35, // 24: pgshard.v1.RestoreInfoResponse.backups:type_name -> pgshard.v1.BackupInfo
+	50, // 25: pgshard.v1.ExpireResponse.error:type_name -> pgshard.v1.Error
+	50, // 26: pgshard.v1.VerifyResponse.error:type_name -> pgshard.v1.Error
+	43, // 27: pgshard.v1.ListTransactionDecisionsResponse.decisions:type_name -> pgshard.v1.TransactionDecision
+	50, // 28: pgshard.v1.ListTransactionDecisionsResponse.error:type_name -> pgshard.v1.Error
+	43, // 29: pgshard.v1.ReconcilePreparedTransactionsRequest.decisions:type_name -> pgshard.v1.TransactionDecision
+	50, // 30: pgshard.v1.ReconcilePreparedTransactionsResponse.error:type_name -> pgshard.v1.Error
+	50, // 31: pgshard.v1.SetWriteFenceResponse.error:type_name -> pgshard.v1.Error
+	5,  // 32: pgshard.v1.Agent.Status:input_type -> pgshard.v1.StatusRequest
+	7,  // 33: pgshard.v1.Agent.Promote:input_type -> pgshard.v1.PromoteRequest
+	9,  // 34: pgshard.v1.Agent.Demote:input_type -> pgshard.v1.DemoteRequest
+	11, // 35: pgshard.v1.Agent.Rewind:input_type -> pgshard.v1.RewindRequest
+	13, // 36: pgshard.v1.Agent.Reclone:input_type -> pgshard.v1.RecloneRequest
+	15, // 37: pgshard.v1.Agent.Reload:input_type -> pgshard.v1.ReloadRequest
+	17, // 38: pgshard.v1.Agent.Restart:input_type -> pgshard.v1.RestartRequest
+	19, // 39: pgshard.v1.Agent.CreateRestorePoint:input_type -> pgshard.v1.CreateRestorePointRequest
+	21, // 40: pgshard.v1.Agent.CreateSlot:input_type -> pgshard.v1.CreateSlotRequest
+	23, // 41: pgshard.v1.Agent.DropSlot:input_type -> pgshard.v1.DropSlotRequest
+	25, // 42: pgshard.v1.Agent.ListSlots:input_type -> pgshard.v1.ListSlotsRequest
+	27, // 43: pgshard.v1.Agent.CreateStreamSlot:input_type -> pgshard.v1.CreateStreamSlotRequest
+	29, // 44: pgshard.v1.Agent.DropStreamSlot:input_type -> pgshard.v1.DropStreamSlotRequest
+	31, // 45: pgshard.v1.Agent.SetSynchronizedStandbySlots:input_type -> pgshard.v1.SetSynchronizedStandbySlotsRequest
+	34, // 46: pgshard.v1.Agent.Backup:input_type -> pgshard.v1.BackupRequest
+	37, // 47: pgshard.v1.Agent.RestoreInfo:input_type -> pgshard.v1.RestoreInfoRequest
+	39, // 48: pgshard.v1.Agent.Expire:input_type -> pgshard.v1.ExpireRequest
+	41, // 49: pgshard.v1.Agent.Verify:input_type -> pgshard.v1.VerifyRequest
+	44, // 50: pgshard.v1.Agent.ListTransactionDecisions:input_type -> pgshard.v1.ListTransactionDecisionsRequest
+	46, // 51: pgshard.v1.Agent.ReconcilePreparedTransactions:input_type -> pgshard.v1.ReconcilePreparedTransactionsRequest
+	48, // 52: pgshard.v1.Agent.SetWriteFence:input_type -> pgshard.v1.SetWriteFenceRequest
+	6,  // 53: pgshard.v1.Agent.Status:output_type -> pgshard.v1.StatusResponse
+	8,  // 54: pgshard.v1.Agent.Promote:output_type -> pgshard.v1.PromoteResponse
+	10, // 55: pgshard.v1.Agent.Demote:output_type -> pgshard.v1.DemoteResponse
+	12, // 56: pgshard.v1.Agent.Rewind:output_type -> pgshard.v1.RewindResponse
+	14, // 57: pgshard.v1.Agent.Reclone:output_type -> pgshard.v1.RecloneResponse
+	16, // 58: pgshard.v1.Agent.Reload:output_type -> pgshard.v1.ReloadResponse
+	18, // 59: pgshard.v1.Agent.Restart:output_type -> pgshard.v1.RestartResponse
+	20, // 60: pgshard.v1.Agent.CreateRestorePoint:output_type -> pgshard.v1.CreateRestorePointResponse
+	22, // 61: pgshard.v1.Agent.CreateSlot:output_type -> pgshard.v1.CreateSlotResponse
+	24, // 62: pgshard.v1.Agent.DropSlot:output_type -> pgshard.v1.DropSlotResponse
+	33, // 63: pgshard.v1.Agent.ListSlots:output_type -> pgshard.v1.ListSlotsResponse
+	28, // 64: pgshard.v1.Agent.CreateStreamSlot:output_type -> pgshard.v1.CreateStreamSlotResponse
+	30, // 65: pgshard.v1.Agent.DropStreamSlot:output_type -> pgshard.v1.DropStreamSlotResponse
+	32, // 66: pgshard.v1.Agent.SetSynchronizedStandbySlots:output_type -> pgshard.v1.SetSynchronizedStandbySlotsResponse
+	36, // 67: pgshard.v1.Agent.Backup:output_type -> pgshard.v1.BackupResponse
+	38, // 68: pgshard.v1.Agent.RestoreInfo:output_type -> pgshard.v1.RestoreInfoResponse
+	40, // 69: pgshard.v1.Agent.Expire:output_type -> pgshard.v1.ExpireResponse
+	42, // 70: pgshard.v1.Agent.Verify:output_type -> pgshard.v1.VerifyResponse
+	45, // 71: pgshard.v1.Agent.ListTransactionDecisions:output_type -> pgshard.v1.ListTransactionDecisionsResponse
+	47, // 72: pgshard.v1.Agent.ReconcilePreparedTransactions:output_type -> pgshard.v1.ReconcilePreparedTransactionsResponse
+	49, // 73: pgshard.v1.Agent.SetWriteFence:output_type -> pgshard.v1.SetWriteFenceResponse
+	53, // [53:74] is the sub-list for method output_type
+	32, // [32:53] is the sub-list for method input_type
+	32, // [32:32] is the sub-list for extension type_name
+	32, // [32:32] is the sub-list for extension extendee
+	0,  // [0:32] is the sub-list for field type_name
 }
 
 func init() { file_pgshard_v1_agent_proto_init() }
@@ -3034,7 +3502,7 @@ func file_pgshard_v1_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pgshard_v1_agent_proto_rawDesc), len(file_pgshard_v1_agent_proto_rawDesc)),
 			NumEnums:      5,
-			NumMessages:   39,
+			NumMessages:   45,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

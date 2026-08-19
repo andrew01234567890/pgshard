@@ -110,6 +110,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		applier := &controller.Applier{Store: &controller.PGMigrationStore{Pool: pool}, Logger: logger, Shards: dialer, DDLRole: *ddlRole,
 			Catalog: controller.CatalogDialer(pool), Roles: roles}
 		go applier.Run(ctx, *applyEvery, leader.Load)
+		go (&controller.StreamMonitor{Pool: pool, Logger: logger, Shards: dialer}).Run(ctx, *resolveEvery)
 	}
 
 	if *listen == "" {

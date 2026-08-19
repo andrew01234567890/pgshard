@@ -1,0 +1,30 @@
+Begin xid=694 final=17AA8C8 ts=2026-08-19T09:05:56.085494Z
+Relation id=16385 public.t identity=d cols=[*id:23(-1) note:25(-1) big:25(-1)]
+Insert rel=16385 new=("1","one","xxxxxxxxxxxxxxxxxxxx...(10000 bytes)")
+Commit flags=0 lsn=17AA8C8 end=17AA8F8
+Begin xid=695 final=17AA990 ts=2026-08-19T09:05:56.086620Z
+Update rel=16385 key=- old=- new=("1","uno",<unchanged>)
+Commit flags=0 lsn=17AA990 end=17AA9C0
+Begin xid=696 final=17AAAA0 ts=2026-08-19T09:05:56.087549Z
+Update rel=16385 key=("1",NULL,NULL) old=- new=("2","uno",<unchanged>)
+Commit flags=0 lsn=17AAAA0 end=17AAAD0
+Begin xid=697 final=17AAC60 ts=2026-08-19T09:05:56.088579Z
+Delete rel=16385 key=("2",NULL,NULL) old=-
+Commit flags=0 lsn=17AAC60 end=17AAC90
+Begin xid=699 final=17BCD88 ts=2026-08-19T09:05:56.091023Z
+Relation id=16394 public.f identity=f cols=[*a:23(-1) *b:25(-1)]
+Insert rel=16394 new=("1","x")
+Insert rel=16394 new=("2",NULL)
+Commit flags=0 lsn=17BCD88 end=17BCDB8
+Begin xid=700 final=17BCE10 ts=2026-08-19T09:05:56.091905Z
+Update rel=16394 key=- old=("1","x") new=("1","y")
+Commit flags=0 lsn=17BCE10 end=17BCE40
+Begin xid=701 final=17BCE80 ts=2026-08-19T09:05:56.092751Z
+Delete rel=16394 key=- old=("2",NULL)
+Commit flags=0 lsn=17BCE80 end=17BCEB0
+Begin xid=702 final=17BE270 ts=2026-08-19T09:05:56.094339Z
+Relation id=16385 public.t identity=d cols=[*id:23(-1) note:25(-1) big:25(-1)]
+Relation id=16394 public.f identity=f cols=[*a:23(-1) *b:25(-1)]
+Truncate rels=[16385 16394] cascade=false restart=true
+Commit flags=0 lsn=17BE270 end=17BE4B0
+Message transactional=false lsn=17BE4F0 prefix=pgshard content="end"

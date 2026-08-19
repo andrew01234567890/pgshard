@@ -27,6 +27,8 @@ const (
 	Pooler_Cancel_FullMethodName        = "/pgshard.v1.Pooler/Cancel"
 	Pooler_Health_FullMethodName        = "/pgshard.v1.Pooler/Health"
 	Pooler_StreamChanges_FullMethodName = "/pgshard.v1.Pooler/StreamChanges"
+	Pooler_Stream_FullMethodName        = "/pgshard.v1.Pooler/Stream"
+	Pooler_Ack_FullMethodName           = "/pgshard.v1.Pooler/Ack"
 )
 
 // PoolerClient is the client API for Pooler service.
@@ -49,9 +51,18 @@ type PoolerClient interface {
 	// Health streams the shard's role and lag; the router uses it for routing
 	// and read-replica selection.
 	Health(ctx context.Context, in *HealthRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[HealthStatus], error)
-	// StreamChanges exposes logical decoding output from the shard.
-	// Placeholder for the change-stream milestone; shapes are minimal.
+	// StreamChanges exposes logical decoding output from the shard, one
+	// event per message. Stream is the batched form used by the controller.
 	StreamChanges(ctx context.Context, in *StreamRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ChangeEvent], error)
+	// Stream opens the shard's slot for a change stream and streams decoded
+	// pgoutput events batched per transaction (or per batch_bytes). Only one
+	// reader per slot is admitted; a second one is refused with
+	// FAILED_PRECONDITION. With start_lsn zero the slot resumes from its
+	// confirmed position. Keepalive batches prove liveness while idle.
+	Stream(ctx context.Context, in *StreamRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ChangeBatch], error)
+	// Ack advances the slot's confirmed position; events up to and including
+	// lsn are never resent after a restart.
+	Ack(ctx context.Context, in *AckRequest, opts ...grpc.CallOption) (*AckResponse, error)
 }
 
 type poolerClient struct {
@@ -143,6 +154,35 @@ func (c *poolerClient) StreamChanges(ctx context.Context, in *StreamRequest, opt
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Pooler_StreamChangesClient = grpc.ServerStreamingClient[ChangeEvent]
 
+func (c *poolerClient) Stream(ctx context.Context, in *StreamRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ChangeBatch], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Pooler_ServiceDesc.Streams[3], Pooler_Stream_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[StreamRequest, ChangeBatch]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Pooler_StreamClient = grpc.ServerStreamingClient[ChangeBatch]
+
+func (c *poolerClient) Ack(ctx context.Context, in *AckRequest, opts ...grpc.CallOption) (*AckResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AckResponse)
+	err := c.cc.Invoke(ctx, Pooler_Ack_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // PoolerServer is the server API for Pooler service.
 // All implementations must embed UnimplementedPoolerServer
 // for forward compatibility.
@@ -163,9 +203,18 @@ type PoolerServer interface {
 	// Health streams the shard's role and lag; the router uses it for routing
 	// and read-replica selection.
 	Health(*HealthRequest, grpc.ServerStreamingServer[HealthStatus]) error
-	// StreamChanges exposes logical decoding output from the shard.
-	// Placeholder for the change-stream milestone; shapes are minimal.
+	// StreamChanges exposes logical decoding output from the shard, one
+	// event per message. Stream is the batched form used by the controller.
 	StreamChanges(*StreamRequest, grpc.ServerStreamingServer[ChangeEvent]) error
+	// Stream opens the shard's slot for a change stream and streams decoded
+	// pgoutput events batched per transaction (or per batch_bytes). Only one
+	// reader per slot is admitted; a second one is refused with
+	// FAILED_PRECONDITION. With start_lsn zero the slot resumes from its
+	// confirmed position. Keepalive batches prove liveness while idle.
+	Stream(*StreamRequest, grpc.ServerStreamingServer[ChangeBatch]) error
+	// Ack advances the slot's confirmed position; events up to and including
+	// lsn are never resent after a restart.
+	Ack(context.Context, *AckRequest) (*AckResponse, error)
 	mustEmbedUnimplementedPoolerServer()
 }
 
@@ -193,6 +242,12 @@ func (UnimplementedPoolerServer) Health(*HealthRequest, grpc.ServerStreamingServ
 }
 func (UnimplementedPoolerServer) StreamChanges(*StreamRequest, grpc.ServerStreamingServer[ChangeEvent]) error {
 	return status.Errorf(codes.Unimplemented, "method StreamChanges not implemented")
+}
+func (UnimplementedPoolerServer) Stream(*StreamRequest, grpc.ServerStreamingServer[ChangeBatch]) error {
+	return status.Errorf(codes.Unimplemented, "method Stream not implemented")
+}
+func (UnimplementedPoolerServer) Ack(context.Context, *AckRequest) (*AckResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Ack not implemented")
 }
 func (UnimplementedPoolerServer) mustEmbedUnimplementedPoolerServer() {}
 func (UnimplementedPoolerServer) testEmbeddedByValue()                {}
@@ -298,6 +353,35 @@ func _Pooler_StreamChanges_Handler(srv interface{}, stream grpc.ServerStream) er
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Pooler_StreamChangesServer = grpc.ServerStreamingServer[ChangeEvent]
 
+func _Pooler_Stream_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(StreamRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(PoolerServer).Stream(m, &grpc.GenericServerStream[StreamRequest, ChangeBatch]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Pooler_StreamServer = grpc.ServerStreamingServer[ChangeBatch]
+
+func _Pooler_Ack_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AckRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PoolerServer).Ack(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Pooler_Ack_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PoolerServer).Ack(ctx, req.(*AckRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Pooler_ServiceDesc is the grpc.ServiceDesc for Pooler service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -317,6 +401,10 @@ var Pooler_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "Cancel",
 			Handler:    _Pooler_Cancel_Handler,
 		},
+		{
+			MethodName: "Ack",
+			Handler:    _Pooler_Ack_Handler,
+		},
 	},
 	Streams: []grpc.StreamDesc{
 		{
@@ -333,6 +421,11 @@ var Pooler_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "StreamChanges",
 			Handler:       _Pooler_StreamChanges_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "Stream",
+			Handler:       _Pooler_Stream_Handler,
 			ServerStreams: true,
 		},
 	},

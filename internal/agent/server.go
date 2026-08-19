@@ -320,7 +320,8 @@ func (s *Server) ListSlots(ctx context.Context, _ *pgshardv1.ListSlotsRequest) (
 	resp := &pgshardv1.ListSlotsResponse{Epoch: s.epoch.Current()}
 	err := s.withConn(ctx, func(q querier) error {
 		rows, err := q.Query(ctx, `SELECT slot_name, slot_type, coalesce(plugin, ''), failover, active,
-			coalesce(restart_lsn - '0/0'::pg_lsn, 0), coalesce(confirmed_flush_lsn - '0/0'::pg_lsn, 0)
+			coalesce(restart_lsn - '0/0'::pg_lsn, 0), coalesce(confirmed_flush_lsn - '0/0'::pg_lsn, 0),
+			coalesce(wal_status, ''), coalesce(invalidation_reason, ''), synced, temporary, two_phase, coalesce(database, '')
 			FROM pg_replication_slots ORDER BY slot_name`)
 		if err != nil {
 			return err
@@ -329,7 +330,8 @@ func (s *Server) ListSlots(ctx context.Context, _ *pgshardv1.ListSlotsRequest) (
 		for rows.Next() {
 			var sl pgshardv1.Slot
 			var kind string
-			if err := rows.Scan(&sl.Name, &kind, &sl.Plugin, &sl.Failover, &sl.Active, &sl.RestartLsn, &sl.ConfirmedFlushLsn); err != nil {
+			if err := rows.Scan(&sl.Name, &kind, &sl.Plugin, &sl.Failover, &sl.Active, &sl.RestartLsn, &sl.ConfirmedFlushLsn,
+				&sl.WalStatus, &sl.InvalidationReason, &sl.Synced, &sl.Temporary, &sl.TwoPhase, &sl.Database); err != nil {
 				return err
 			}
 			sl.Kind = pgshardv1.SlotKind_SLOT_KIND_PHYSICAL

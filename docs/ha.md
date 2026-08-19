@@ -88,7 +88,10 @@ The next passes recreate the old primary pod as a `replica` (it rejoins via
 `pg_rewind`), create the other members' physical slots on the new primary
 (slots do not replicate; the primary's own inherited slot is dropped so it
 cannot pin WAL), recompute `synchronous_standby_names` around the new
-primary, and publish `pgshard.shard_status` again. Convergence rules run every pass:
+primary together with `synchronized_standby_slots` (the physical slots of the
+streaming standbys, via `Agent.SetSynchronizedStandbySlots`, so logical
+failover slots never confirm past a synchronous standby; see
+[streams.md](streams.md)), and publish `pgshard.shard_status` again. Convergence rules run every pass:
 a designated primary answering as a standby is (re)promoted with an epoch
 above whatever it accepted; a non-designated member answering as a primary is
 labelled `unhealthy` and sent `Agent.Demote{group epoch}`.
