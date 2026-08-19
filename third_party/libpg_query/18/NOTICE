@@ -1,0 +1,5 @@
+This directory vendors libpg_query (https://github.com/pganalyze/libpg_query)
+at tag 18.0.0 (commit 204fbdbd3ed5f8691ab358e49f1fc5397b4679e2), which is licensed under the BSD 3-Clause
+License (see LICENSE). It bundles portions of PostgreSQL 18 (see
+COPYRIGHT.postgresql, PostgreSQL License), protobuf-c (BSD 2-Clause) and
+xxHash (BSD 2-Clause). Regenerate with: hack/pgparser/sync.sh 18 18.0.0

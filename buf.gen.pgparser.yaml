@@ -1,0 +1,12 @@
+version: v2
+inputs:
+  - directory: third_party/libpg_query/18/protobuf
+managed:
+  enabled: true
+  override:
+    - file_option: go_package
+      value: github.com/andrew01234567890/pgshard/internal/pgparser/pg18/pgquerypb;pgquerypb
+plugins:
+  - local: protoc-gen-go
+    out: internal/pgparser/pg18/pgquerypb
+    opt: paths=source_relative

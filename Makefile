@@ -7,7 +7,7 @@ LDFLAGS  := -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
             -X $(MODULE)/internal/buildinfo.Date=$(DATE)
 CMDS     := $(notdir $(wildcard cmd/*))
 
-.PHONY: build vet fmt-check lint test verify clean proto proto-lint proto-breaking
+.PHONY: build vet fmt-check lint test verify clean proto proto-lint proto-breaking pgparser-sync pgparser-proto
 
 build:
 	@mkdir -p bin
@@ -56,3 +56,13 @@ e2e:
 
 perf-bench:
 	hack/perf/benchstat.sh $(PERF_BASE_REF) $(PERF_OUT_DIR)
+
+# libpg_query vendoring: one pinned tag per PostgreSQL major.
+LIBPG_QUERY_18_TAG := 18.0.0
+
+pgparser-sync:
+	hack/pgparser/sync.sh 18 $(LIBPG_QUERY_18_TAG)
+	$(MAKE) pgparser-proto
+
+pgparser-proto:
+	buf generate --template buf.gen.pgparser.yaml
