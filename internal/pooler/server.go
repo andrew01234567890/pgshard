@@ -239,6 +239,9 @@ func (r *relay) dropUnflushed() {
 	}
 	r.srv.cfg.Pool.Discard(b)
 	r.setBackend(nil)
+	// The discarded backend owed replies the injected closes were waiting
+	// for; a fresh backend must start with a clean reply queue.
+	r.closes, r.parsed, r.batchErr = nil, nil, false
 }
 
 func (r *relay) backend() *Backend {
@@ -307,6 +310,9 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 func (r *relay) forward(b *Backend, fm pgproto3.FrontendMessage) {
 	switch m := fm.(type) {
 	case *pgproto3.Parse:
+		if touchesPrepared(m.Query) {
+			b.prepared.doubtAll()
+		}
 		if m.Name == "" {
 			break
 		}

@@ -408,3 +408,29 @@ func TestUnreservedBatchLeavesNoStatementsInThePool(t *testing.T) {
 		t.Fatalf("idle = %d", idle)
 	}
 }
+
+func TestDeallocateThroughExtendedProtocolDoubtsHeldStatements(t *testing.T) {
+	h := startHarness(t, PoolConfig{})
+	ctx := context.Background()
+	if _, err := h.client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: "s", Generation: gen(7, 3)}); err != nil {
+		t.Fatal(err)
+	}
+	stream, _ := h.client.Execute(ctx)
+	rs := parseBatch(t, stream, parseReq("s", "select 1", identity("alice")), syncReq("s"))
+	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
+		t.Fatalf("first parse: %s", got)
+	}
+	unnamed := &pgshardv1.ExecuteRequest{SessionId: "s", Generation: gen(7, 3),
+		Message: &pgshardv1.ExecuteRequest_Parse{Parse: &pgshardv1.Parse{Name: "", Sql: "DEALLOCATE ALL"}}}
+	rs = parseBatch(t, stream, unnamed, syncReq("s"))
+	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
+		t.Fatalf("deallocate parse: %s", got)
+	}
+	rs = parseBatch(t, stream, parseReq("s", "select 1", nil), syncReq("s"))
+	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
+		t.Fatalf("parse after deallocate: %s (%v)", got, h.pg.seen)
+	}
+	if h.pg.count("PARSE st1") != 2 {
+		t.Fatalf("a statement deallocated through the extended protocol must be parsed again: %v", h.pg.seen)
+	}
+}
