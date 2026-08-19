@@ -4,12 +4,13 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
-permissions:
-  contents: write
-  pull-requests: write
+permissions: {}
 
 jobs:
   automerge:
+    permissions:
+      contents: write
+      pull-requests: write
     if: github.event.pull_request.user.login == 'dependabot[bot]' && github.repository == 'andrew01234567890/pgshard'
     runs-on: ubuntu-latest
     steps:
