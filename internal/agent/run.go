@@ -52,6 +52,7 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	fatal := func(err error) { cancel(err) }
 	sup.OnUnexpectedExit = fatal
 	srv := NewServer(inst, epoch, lease, log, fatal)
+	srv.bgCtx = ctx
 	if !inst.IsStandby() && lease != nil {
 		if err := lease.Acquire(ctx); err != nil {
 			return fmt.Errorf("primary cannot start without the lease: %w", err)
@@ -64,6 +65,7 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	go inst.ensureStanzaLoop(ctx, stanzaRetry)
 
 	probes := &Probes{Health: inst, MaxLagBytes: cfg.MaxLagBytes, Peers: cfg.PeerFailsafeURLs,
 		Fenced: func() { fatal(errors.New("primary isolated: self-fencing")) }}

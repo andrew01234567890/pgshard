@@ -65,6 +65,8 @@ spec:
             description: PgShardBackupStatus is the observed state of a backup.
             properties:
               backupId:
+                description: BackupID is the catalog stanza's backup label once every
+                  group completed.
                 type: string
               completedAt:
                 format: date-time
@@ -123,6 +125,48 @@ spec:
                   - reason
                   - status
                   - type
+                  type: object
+                type: array
+              error:
+                type: string
+              groups:
+                items:
+                  description: GroupBackupStatus is the outcome of one group's pgBackRest
+                    backup.
+                  properties:
+                    backupId:
+                      type: string
+                    completedAt:
+                      format: date-time
+                      type: string
+                    duration:
+                      type: string
+                    error:
+                      type: string
+                    group:
+                      type: string
+                    repoSizeBytes:
+                      format: int64
+                      type: integer
+                    sizeBytes:
+                      format: int64
+                      type: integer
+                    stanza:
+                      type: string
+                    startLSN:
+                      type: string
+                    startedAt:
+                      format: date-time
+                      type: string
+                    stopLSN:
+                      type: string
+                    walStart:
+                      type: string
+                    walStop:
+                      type: string
+                  required:
+                  - group
+                  - stanza
                   type: object
                 type: array
               phase:

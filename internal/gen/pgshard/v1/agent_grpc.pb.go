@@ -34,6 +34,8 @@ const (
 	Agent_ListSlots_FullMethodName          = "/pgshard.v1.Agent/ListSlots"
 	Agent_Backup_FullMethodName             = "/pgshard.v1.Agent/Backup"
 	Agent_RestoreInfo_FullMethodName        = "/pgshard.v1.Agent/RestoreInfo"
+	Agent_Expire_FullMethodName             = "/pgshard.v1.Agent/Expire"
+	Agent_Verify_FullMethodName             = "/pgshard.v1.Agent/Verify"
 )
 
 // AgentClient is the client API for Agent service.
@@ -75,8 +77,12 @@ type AgentClient interface {
 	ListSlots(ctx context.Context, in *ListSlotsRequest, opts ...grpc.CallOption) (*ListSlotsResponse, error)
 	// Backup takes a base or incremental backup.
 	Backup(ctx context.Context, in *BackupRequest, opts ...grpc.CallOption) (*BackupResponse, error)
-	// RestoreInfo reports what the instance was last restored from. Read-only.
+	// RestoreInfo reports the backup repository contents. Read-only.
 	RestoreInfo(ctx context.Context, in *RestoreInfoRequest, opts ...grpc.CallOption) (*RestoreInfoResponse, error)
+	// Expire applies the retention policy to the backup repository.
+	Expire(ctx context.Context, in *ExpireRequest, opts ...grpc.CallOption) (*ExpireResponse, error)
+	// Verify checks the backup repository for corruption. Read-only.
+	Verify(ctx context.Context, in *VerifyRequest, opts ...grpc.CallOption) (*VerifyResponse, error)
 }
 
 type agentClient struct {
@@ -217,6 +223,26 @@ func (c *agentClient) RestoreInfo(ctx context.Context, in *RestoreInfoRequest, o
 	return out, nil
 }
 
+func (c *agentClient) Expire(ctx context.Context, in *ExpireRequest, opts ...grpc.CallOption) (*ExpireResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ExpireResponse)
+	err := c.cc.Invoke(ctx, Agent_Expire_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *agentClient) Verify(ctx context.Context, in *VerifyRequest, opts ...grpc.CallOption) (*VerifyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(VerifyResponse)
+	err := c.cc.Invoke(ctx, Agent_Verify_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AgentServer is the server API for Agent service.
 // All implementations must embed UnimplementedAgentServer
 // for forward compatibility.
@@ -256,8 +282,12 @@ type AgentServer interface {
 	ListSlots(context.Context, *ListSlotsRequest) (*ListSlotsResponse, error)
 	// Backup takes a base or incremental backup.
 	Backup(context.Context, *BackupRequest) (*BackupResponse, error)
-	// RestoreInfo reports what the instance was last restored from. Read-only.
+	// RestoreInfo reports the backup repository contents. Read-only.
 	RestoreInfo(context.Context, *RestoreInfoRequest) (*RestoreInfoResponse, error)
+	// Expire applies the retention policy to the backup repository.
+	Expire(context.Context, *ExpireRequest) (*ExpireResponse, error)
+	// Verify checks the backup repository for corruption. Read-only.
+	Verify(context.Context, *VerifyRequest) (*VerifyResponse, error)
 	mustEmbedUnimplementedAgentServer()
 }
 
@@ -306,6 +336,12 @@ func (UnimplementedAgentServer) Backup(context.Context, *BackupRequest) (*Backup
 }
 func (UnimplementedAgentServer) RestoreInfo(context.Context, *RestoreInfoRequest) (*RestoreInfoResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RestoreInfo not implemented")
+}
+func (UnimplementedAgentServer) Expire(context.Context, *ExpireRequest) (*ExpireResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Expire not implemented")
+}
+func (UnimplementedAgentServer) Verify(context.Context, *VerifyRequest) (*VerifyResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Verify not implemented")
 }
 func (UnimplementedAgentServer) mustEmbedUnimplementedAgentServer() {}
 func (UnimplementedAgentServer) testEmbeddedByValue()               {}
@@ -562,6 +598,42 @@ func _Agent_RestoreInfo_Handler(srv interface{}, ctx context.Context, dec func(i
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Agent_Expire_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ExpireRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).Expire(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_Expire_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).Expire(ctx, req.(*ExpireRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Agent_Verify_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(VerifyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).Verify(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_Verify_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).Verify(ctx, req.(*VerifyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Agent_ServiceDesc is the grpc.ServiceDesc for Agent service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -620,6 +692,14 @@ var Agent_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RestoreInfo",
 			Handler:    _Agent_RestoreInfo_Handler,
+		},
+		{
+			MethodName: "Expire",
+			Handler:    _Agent_Expire_Handler,
+		},
+		{
+			MethodName: "Verify",
+			Handler:    _Agent_Verify_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

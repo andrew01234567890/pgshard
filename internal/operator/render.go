@@ -71,17 +71,26 @@ type MemberTemplate struct {
 	Resources    corev1.ResourceRequirements `json:"resources"`
 	Settings     map[string]string           `json:"settings"`
 	RestartToken string                      `json:"restartToken,omitempty"`
+	// Backup is the policy the members archive to; it changes the pod
+	// (mounted Secrets) and archive_mode, so it is part of the pod hash.
+	Backup *pgshardv1alpha1.PgShardBackupPolicySpec `json:"backup,omitempty"`
 }
 
 // Template computes the desired member template of a group. tuning is the
-// derived override for the group (nil when none applies).
-func Template(c *pgshardv1alpha1.PgShardCluster, tuning pgtune.Settings) MemberTemplate {
-	return MemberTemplate{
+// derived override for the group (nil when none applies); pol the backup
+// policy bound to the cluster (nil when none).
+func Template(c *pgshardv1alpha1.PgShardCluster, tuning pgtune.Settings, pol *pgshardv1alpha1.PgShardBackupPolicy) MemberTemplate {
+	tpl := MemberTemplate{
 		Image:        Image(c),
 		Resources:    c.Spec.Resources,
 		Settings:     effectiveSettings(c.Spec.PostgreSQL.Parameters, tuning),
 		RestartToken: c.Annotations[AnnotationRestart],
 	}
+	if pol != nil {
+		spec := pol.Spec.DeepCopy()
+		tpl.Backup = spec
+	}
+	return tpl
 }
 
 // Hash is the pod-shaped part of the template (image, resources, restart
@@ -110,10 +119,10 @@ func (t MemberTemplate) SettingsHash() string {
 // AgentConfig renders the pgshard-agent JSON config for one member given
 // the group's current primary.
 func AgentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary string) agent.Config {
-	return agentConfig(c, g, member, primary, Template(c, nil).SettingsHash(), false)
+	return agentConfig(c, g, member, primary, Template(c, nil, nil), false)
 }
 
-func agentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary, settingsHash string, override bool) agent.Config {
+func agentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary string, tpl MemberTemplate, override bool) agent.Config {
 	role := agent.RoleStandby
 	if member == primary {
 		role = agent.RolePrimary
@@ -143,10 +152,14 @@ func agentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary, se
 		},
 		Lease:           agent.LeaseConfig{Enabled: true, Namespace: c.Namespace},
 		ShutdownTimeout: agent.Duration(agentShutdownTimeout),
-		SettingsHash:    settingsHash,
+		SettingsHash:    tpl.SettingsHash(),
 	}
 	if override {
 		cfg.OverrideFile = configMountPath + "/" + overrideConfKey
+	}
+	if tpl.Backup != nil {
+		bs := BackupSettings(c, g, tpl.Backup)
+		cfg.Backup = &bs
 	}
 	return cfg
 }
@@ -155,15 +168,15 @@ func agentConfigKey(member string) string { return member + ".json" }
 
 // ConfigMap renders the per-member agent configs and the derived override;
 // primary decides which member bootstraps with initdb and which ones clone.
-func (Renderer) ConfigMap(c *pgshardv1alpha1.PgShardCluster, g Group, primary string, tuning pgtune.Settings) *corev1.ConfigMap {
-	tpl := Template(c, tuning)
+func (Renderer) ConfigMap(c *pgshardv1alpha1.PgShardCluster, g Group, primary string, tuning pgtune.Settings, pol *pgshardv1alpha1.PgShardBackupPolicy) *corev1.ConfigMap {
+	tpl := Template(c, tuning, pol)
 	data := map[string]string{}
 	override := OverrideConf(tuning)
 	if override != "" {
 		data[overrideConfKey] = override
 	}
 	for _, m := range g.MemberNames() {
-		b, err := json.MarshalIndent(agentConfig(c, g, m, primary, tpl.SettingsHash(), override != ""), "", "  ")
+		b, err := json.MarshalIndent(agentConfig(c, g, m, primary, tpl, override != ""), "", "  ")
 		if err != nil {
 			panic(err)
 		}
@@ -296,7 +309,7 @@ func (Renderer) Pod(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, rol
 	uid := postgresUID
 	meta := objectMeta(g, name, c.Namespace, map[string]string{LabelOrdinal: strconv.Itoa(ordinal), LabelRole: role})
 	meta.Annotations = map[string]string{AnnotationTemplateHash: tpl.Hash(), AnnotationSettingsHash: tpl.SettingsHash()}
-	return &corev1.Pod{
+	pod := &corev1.Pod{
 		ObjectMeta: meta,
 		Spec: corev1.PodSpec{
 			Hostname:           name,
@@ -336,6 +349,10 @@ func (Renderer) Pod(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, rol
 			},
 		},
 	}
+	if tpl.Backup != nil {
+		mountBackupSecrets(pod, tpl.Backup)
+	}
+	return pod
 }
 
 // poolerSidecar renders the pooler container that fronts the local server

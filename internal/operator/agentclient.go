@@ -132,3 +132,121 @@ func (c GRPCAgentClient) Reload(ctx context.Context, addr string) (string, error
 	}
 	return resp.GetSettingsHash(), nil
 }
+
+// BackupResult is the operator's view of a completed agent backup.
+type BackupResult struct {
+	Label        string
+	Type         string
+	StartLSN     uint64
+	StopLSN      uint64
+	ArchiveStart string
+	ArchiveStop  string
+	SizeBytes    uint64
+	RepoBytes    uint64
+	StartedAt    int64
+	FinishedAt   int64
+	Log          []string
+}
+
+// RepoInfo is the operator's view of a stanza in the repository.
+type RepoInfo struct {
+	Stanza        string
+	StatusCode    int64
+	StatusMessage string
+	ArchiveMin    string
+	ArchiveMax    string
+	Backups       []BackupResult
+}
+
+// BackupAgentClient drives the backup RPCs of member agents.
+type BackupAgentClient interface {
+	// Backup runs pgbackrest backup of the given type on the primary at addr;
+	// t is full, diff or incr.
+	Backup(ctx context.Context, addr string, t string) (BackupResult, error)
+	// Expire applies retention on the primary at addr.
+	Expire(ctx context.Context, addr string) error
+	// Info reads the repository contents through the agent at addr.
+	Info(ctx context.Context, addr string) (RepoInfo, error)
+}
+
+func backupResultFromProto(i *pgshardv1.BackupInfo) BackupResult {
+	return BackupResult{Label: i.GetLabel(), Type: i.GetType(), StartLSN: i.GetStartLsn(), StopLSN: i.GetStopLsn(),
+		ArchiveStart: i.GetArchiveStart(), ArchiveStop: i.GetArchiveStop(), SizeBytes: i.GetSizeBytes(), RepoBytes: i.GetRepoSizeBytes(),
+		StartedAt: i.GetStartedAt(), FinishedAt: i.GetFinishedAt()}
+}
+
+// Backup reads the agent's epoch and calls Agent.Backup at that epoch.
+func (c GRPCAgentClient) Backup(ctx context.Context, addr string, t string) (BackupResult, error) {
+	conn, cl, err := c.dial(ctx, addr)
+	if err != nil {
+		return BackupResult{}, err
+	}
+	defer func() { _ = conn.Close() }()
+	st, err := cl.Status(ctx, &pgshardv1.StatusRequest{})
+	if err != nil {
+		return BackupResult{}, err
+	}
+	var kind pgshardv1.BackupRequest_Type
+	switch t {
+	case "full":
+		kind = pgshardv1.BackupRequest_TYPE_FULL
+	case "diff":
+		kind = pgshardv1.BackupRequest_TYPE_DIFF
+	case "incr":
+		kind = pgshardv1.BackupRequest_TYPE_INCR
+	default:
+		return BackupResult{}, fmt.Errorf("unknown backup type %q", t)
+	}
+	resp, err := cl.Backup(ctx, &pgshardv1.BackupRequest{Epoch: st.GetEpoch(), Type: kind})
+	if err != nil {
+		return BackupResult{}, err
+	}
+	res := backupResultFromProto(resp.GetInfo())
+	res.Log = resp.GetLog()
+	if e := resp.GetError(); e != nil {
+		return res, fmt.Errorf("backup: %s (%s)", e.GetMessage(), e.GetSqlstate())
+	}
+	return res, nil
+}
+
+// Expire reads the agent's epoch and calls Agent.Expire at that epoch.
+func (c GRPCAgentClient) Expire(ctx context.Context, addr string) error {
+	conn, cl, err := c.dial(ctx, addr)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	st, err := cl.Status(ctx, &pgshardv1.StatusRequest{})
+	if err != nil {
+		return err
+	}
+	resp, err := cl.Expire(ctx, &pgshardv1.ExpireRequest{Epoch: st.GetEpoch()})
+	if err != nil {
+		return err
+	}
+	if e := resp.GetError(); e != nil {
+		return fmt.Errorf("expire: %s (%s)", e.GetMessage(), e.GetSqlstate())
+	}
+	return nil
+}
+
+// Info calls Agent.RestoreInfo.
+func (c GRPCAgentClient) Info(ctx context.Context, addr string) (RepoInfo, error) {
+	conn, cl, err := c.dial(ctx, addr)
+	if err != nil {
+		return RepoInfo{}, err
+	}
+	defer func() { _ = conn.Close() }()
+	resp, err := cl.RestoreInfo(ctx, &pgshardv1.RestoreInfoRequest{})
+	if err != nil {
+		return RepoInfo{}, err
+	}
+	if e := resp.GetError(); e != nil {
+		return RepoInfo{}, fmt.Errorf("info: %s (%s)", e.GetMessage(), e.GetSqlstate())
+	}
+	info := RepoInfo{Stanza: resp.GetStanza(), StatusCode: resp.GetStatusCode(), StatusMessage: resp.GetStatusMessage(), ArchiveMin: resp.GetArchiveMin(), ArchiveMax: resp.GetArchiveMax()}
+	for _, b := range resp.GetBackups() {
+		info.Backups = append(info.Backups, backupResultFromProto(b))
+	}
+	return info, nil
+}

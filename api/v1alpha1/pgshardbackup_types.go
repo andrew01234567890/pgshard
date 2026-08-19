@@ -9,20 +9,55 @@ import (
 type ObjectStoreSpec struct {
 	// +kubebuilder:validation:Enum=s3;azure;gcs;posix;sftp
 	Type string `json:"type"`
+	// Bucket is the S3 or GCS bucket.
 	// +optional
 	Bucket string `json:"bucket,omitempty"`
+	// Container is the Azure blob container.
 	// +optional
 	Container string `json:"container,omitempty"`
+	// Endpoint overrides the store endpoint; an http:// or https:// URL or a
+	// host[:port].
 	// +optional
 	Endpoint string `json:"endpoint,omitempty"`
 	// +optional
 	Region string `json:"region,omitempty"`
+	// Prefix is the path inside the store the repository lives under.
 	// +optional
 	Prefix string `json:"prefix,omitempty"`
+	// URIStyle is host or path addressing for S3 and Azure.
+	// +kubebuilder:validation:Enum=host;path
+	// +optional
+	URIStyle string `json:"uriStyle,omitempty"`
+	// VerifyTLS defaults to true; false accepts self-signed store certificates.
+	// +optional
+	VerifyTLS *bool `json:"verifyTLS,omitempty"`
+	// CredentialType selects how pgBackRest authenticates:
+	// s3 shared|web-id|auto, azure shared|sas, gcs service|token|auto.
+	// +kubebuilder:validation:Enum=shared;web-id;auto;sas;service;token
+	// +optional
+	CredentialType string `json:"credentialType,omitempty"`
+	// Credentials names the Secret whose keys hold the store credentials:
+	// s3 key/keySecret, azure account/key, gcs key.json, sftp privateKey.
 	// +optional
 	Credentials SecretRefSpec `json:"credentials,omitempty"`
+	// Encryption names the Secret whose passphrase key encrypts the
+	// repository with aes-256-cbc.
 	// +optional
 	Encryption SecretRefSpec `json:"encryption,omitempty"`
+	// SFTP holds the host settings of an sftp store.
+	// +optional
+	SFTP *SFTPStoreSpec `json:"sftp,omitempty"`
+}
+
+// SFTPStoreSpec locates an sftp repository host.
+type SFTPStoreSpec struct {
+	Host string `json:"host"`
+	User string `json:"user"`
+	// +optional
+	Port int `json:"port,omitempty"`
+	// +kubebuilder:validation:Enum=strict;accept-new;fingerprint;none
+	// +optional
+	HostKeyCheck string `json:"hostKeyCheck,omitempty"`
 }
 
 // SecretRefSpec wraps an optional Secret reference.
@@ -51,24 +86,64 @@ type BackupRetention struct {
 	Differential int `json:"differential,omitempty"`
 }
 
-// PgShardBackupPolicySpec is the desired backup policy.
+// PgShardBackupPolicySpec is the desired backup policy. Clusters bind to it
+// through spec.backup.policyRef.
 type PgShardBackupPolicySpec struct {
 	ObjectStore ObjectStoreSpec `json:"objectStore"`
 	// +optional
 	Schedules BackupSchedules `json:"schedules,omitempty"`
 	// +optional
 	Retention BackupRetention `json:"retention,omitempty"`
+	// LogLevel is the pgBackRest log level (off, error, warn, info, detail,
+	// debug, trace).
+	// +kubebuilder:validation:Enum=off;error;warn;info;detail;debug;trace
+	// +optional
+	LogLevel string `json:"logLevel,omitempty"`
+	// ProcessMax bounds pgBackRest parallelism per member.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	ProcessMax int `json:"processMax,omitempty"`
+}
+
+// ClusterBackupStatus is the backup health of one cluster bound to a policy.
+type ClusterBackupStatus struct {
+	Name string `json:"name"`
+	// +optional
+	LastFullTime *metav1.Time `json:"lastFullTime,omitempty"`
+	// +optional
+	LastDifferentialTime *metav1.Time `json:"lastDifferentialTime,omitempty"`
+	// +optional
+	LastIncrementalTime *metav1.Time `json:"lastIncrementalTime,omitempty"`
+	Healthy             bool         `json:"healthy"`
+	// +optional
+	Message string `json:"message,omitempty"`
+}
+
+// PgShardBackupPolicyStatus is the observed state of a policy.
+type PgShardBackupPolicyStatus struct {
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+	// Clusters lists every cluster whose spec.backup.policyRef names this
+	// policy with its last successful backups.
+	// +optional
+	Clusters []ClusterBackupStatus `json:"clusters,omitempty"`
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // PgShardBackupPolicy defines where and when clusters are backed up.
 // +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Store",type=string,JSONPath=`.spec.objectStore.type`
+// +kubebuilder:printcolumn:name="Healthy",type=string,JSONPath=`.status.conditions[?(@.type=="BackupHealthy")].status`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 type PgShardBackupPolicy struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
 	Spec PgShardBackupPolicySpec `json:"spec"`
+	// +optional
+	Status PgShardBackupPolicyStatus `json:"status,omitempty"`
 }
 
 // PgShardBackupPolicyList is a list of PgShardBackupPolicy.
@@ -88,16 +163,57 @@ type PgShardBackupSpec struct {
 	Type string `json:"type,omitempty"`
 }
 
+// Backup phases.
+const (
+	BackupPhasePending   = "Pending"
+	BackupPhaseRunning   = "Running"
+	BackupPhaseCompleted = "Completed"
+	BackupPhaseFailed    = "Failed"
+)
+
+// GroupBackupStatus is the outcome of one group's pgBackRest backup.
+type GroupBackupStatus struct {
+	Group  string `json:"group"`
+	Stanza string `json:"stanza"`
+	// +optional
+	BackupID string `json:"backupId,omitempty"`
+	// +optional
+	StartLSN string `json:"startLSN,omitempty"`
+	// +optional
+	StopLSN string `json:"stopLSN,omitempty"`
+	// +optional
+	WALStart string `json:"walStart,omitempty"`
+	// +optional
+	WALStop string `json:"walStop,omitempty"`
+	// +optional
+	SizeBytes int64 `json:"sizeBytes,omitempty"`
+	// +optional
+	RepoSizeBytes int64 `json:"repoSizeBytes,omitempty"`
+	// +optional
+	StartedAt *metav1.Time `json:"startedAt,omitempty"`
+	// +optional
+	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
+	// +optional
+	Duration string `json:"duration,omitempty"`
+	// +optional
+	Error string `json:"error,omitempty"`
+}
+
 // PgShardBackupStatus is the observed state of a backup.
 type PgShardBackupStatus struct {
 	// +optional
 	Phase string `json:"phase,omitempty"`
+	// BackupID is the catalog stanza's backup label once every group completed.
 	// +optional
 	BackupID string `json:"backupId,omitempty"`
 	// +optional
 	StartedAt *metav1.Time `json:"startedAt,omitempty"`
 	// +optional
 	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
+	// +optional
+	Groups []GroupBackupStatus `json:"groups,omitempty"`
+	// +optional
+	Error string `json:"error,omitempty"`
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }

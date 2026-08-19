@@ -16,6 +16,9 @@ spec:
     metadata:
       labels: {app: fake-gcs}
     spec:
+      # fake-gcs-server reads FAKE_GCS_PORT from the environment, which the
+      # Service link of the same name would populate with a tcp:// URL.
+      enableServiceLinks: false
       containers:
         - name: fake-gcs
           image: fsouza/fake-gcs-server:1.55.1
@@ -32,3 +35,20 @@ spec:
   selector: {app: fake-gcs}
   ports:
     - {name: http, port: 4443, targetPort: 4443}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fake-gcs-create-bucket
+  namespace: objectstores
+spec:
+  backoffLimit: 20
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: curl
+          image: curlimages/curl:8.14.1
+          command: ["/bin/sh", "-c"]
+          args:
+            - curl -fsS -X POST -H 'Content-Type:application/json' -d '{"name":"pgshard"}' http://fake-gcs.objectstores.svc:4443/storage/v1/b || curl -fsS http://fake-gcs.objectstores.svc:4443/storage/v1/b/pgshard

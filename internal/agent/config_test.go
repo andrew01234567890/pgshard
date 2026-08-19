@@ -3,9 +3,12 @@ package agent
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/andrew01234567890/pgshard/internal/agent/backup"
 )
 
 func testConfig() *Config {
@@ -47,6 +50,36 @@ func TestRenderPostgresqlConfPrimaryTLSGolden(t *testing.T) {
 	c.TLS = TLSFiles{CertFile: "/certs/tls.crt", KeyFile: "/certs/tls.key", CAFile: "/certs/ca.crt"}
 	golden(t, "postgresql.primary-tls.conf", RenderPostgresqlConf(c, false))
 	golden(t, "pg_hba.tls.conf", RenderPgHBAConf(c))
+}
+
+func TestRenderPostgresqlConfBackupGolden(t *testing.T) {
+	c := testConfig()
+	c.Role = RolePrimary
+	c.Backup = &backup.Settings{Stanza: "demo-s0-pg18", Repo: backup.Repo{Type: backup.TypePosix}}
+	got := RenderPostgresqlConf(c, false)
+	golden(t, "postgresql.primary-backup.conf", got)
+	for _, want := range []string{
+		"archive_mode = on\n",
+		"archive_command = 'pgbackrest --config=/etc/pgbackrest/pgbackrest.conf --stanza=demo-s0-pg18 archive-push %p'\n",
+		"restore_command = 'pgbackrest --config=/etc/pgbackrest/pgbackrest.conf --stanza=demo-s0-pg18 archive-get %f \"%p\"'\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q", want)
+		}
+	}
+	c.Postgres.RestoreCommand = "custom"
+	if !strings.Contains(RenderPostgresqlConf(c, false), "restore_command = 'custom'\n") {
+		t.Error("explicit restore_command must win over the pgbackrest one")
+	}
+	c.Backup = nil
+	if !strings.Contains(RenderPostgresqlConf(c, false), "archive_mode = off\n") {
+		t.Error("archive_mode must be off without a backup policy")
+	}
+	for _, name := range []string{"archive_mode", "archive_command", "restore_command"} {
+		if !slices.Contains(OwnedSettings(), name) {
+			t.Errorf("%s must be agent-owned", name)
+		}
+	}
 }
 
 func TestRenderPgHBAConfGolden(t *testing.T) {

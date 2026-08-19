@@ -42,8 +42,12 @@ service Agent {
   rpc ListSlots(ListSlotsRequest) returns (ListSlotsResponse);
   // Backup takes a base or incremental backup.
   rpc Backup(BackupRequest) returns (BackupResponse);
-  // RestoreInfo reports what the instance was last restored from. Read-only.
+  // RestoreInfo reports the backup repository contents. Read-only.
   rpc RestoreInfo(RestoreInfoRequest) returns (RestoreInfoResponse);
+  // Expire applies the retention policy to the backup repository.
+  rpc Expire(ExpireRequest) returns (ExpireResponse);
+  // Verify checks the backup repository for corruption. Read-only.
+  rpc Verify(VerifyRequest) returns (VerifyResponse);
 }
 
 // StatusRequest asks for the instance status.
@@ -254,18 +258,42 @@ message BackupRequest {
   Type type = 2;
 }
 
+// BackupInfo describes one backup set in the repository.
+message BackupInfo {
+  // pgBackRest backup label, e.g. 20260101-120000F.
+  string label = 1;
+  // full, diff or incr.
+  string type = 2;
+  uint64 start_lsn = 3;
+  uint64 stop_lsn = 4;
+  // First and last WAL segment the backup needs.
+  string archive_start = 5;
+  string archive_stop = 6;
+  // Database size and the size stored in the repository (bytes).
+  uint64 size_bytes = 7;
+  uint64 repo_size_bytes = 8;
+  // Unix seconds.
+  int64 started_at = 9;
+  int64 finished_at = 10;
+  // Prior backup this one depends on; empty for a full backup.
+  string prior = 11;
+}
+
 // BackupResponse reports the backup reference.
 message BackupResponse {
   uint64 epoch = 1;
   // Identifier usable as RecloneRequest.backup_ref.
   string backup_ref = 2;
   Error error = 3;
+  BackupInfo info = 4;
+  // Tail of the pgbackrest console log.
+  repeated string log = 5;
 }
 
-// RestoreInfoRequest asks for restore provenance.
+// RestoreInfoRequest asks for the repository contents.
 message RestoreInfoRequest {}
 
-// RestoreInfoResponse describes the last restore.
+// RestoreInfoResponse describes the stanza in the repository.
 message RestoreInfoResponse {
   uint64 epoch = 1;
   // Backup the data directory was restored from; empty if never restored.
@@ -273,4 +301,35 @@ message RestoreInfoResponse {
   // LSN at which recovery ended.
   uint64 recovery_end_lsn = 3;
   Error error = 4;
+  string stanza = 5;
+  // pgBackRest stanza status code and message (0 = ok).
+  int64 status_code = 6;
+  string status_message = 7;
+  // Oldest and newest archived WAL segment.
+  string archive_min = 8;
+  string archive_max = 9;
+  repeated BackupInfo backups = 10;
+}
+
+// ExpireRequest applies retention.
+message ExpireRequest {
+  // Caller's view of the current epoch; must EQUAL the last accepted epoch.
+  uint64 epoch = 1;
+}
+
+// ExpireResponse reports the outcome.
+message ExpireResponse {
+  uint64 epoch = 1;
+  Error error = 2;
+  repeated string log = 3;
+}
+
+// VerifyRequest checks the repository.
+message VerifyRequest {}
+
+// VerifyResponse reports the outcome.
+message VerifyResponse {
+  uint64 epoch = 1;
+  Error error = 2;
+  repeated string log = 3;
 }

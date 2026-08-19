@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/andrew01234567890/pgshard/internal/agent/backup"
 )
 
 // Files rendered by the agent under PGDATA.
@@ -45,7 +47,7 @@ func RenderPostgresqlConf(c *Config, standby bool) string {
 // OwnedSettings lists the postgresql.conf names the agent fixes itself; a
 // value for one of them from any other source is ignored.
 func OwnedSettings() []string {
-	set := ownedSettings(&Config{TLS: TLSFiles{CertFile: "x", KeyFile: "x", CAFile: "x"}, Postgres: PostgresSettings{RestoreCommand: "x"}}, true)
+	set := ownedSettings(&Config{TLS: TLSFiles{CertFile: "x", KeyFile: "x", CAFile: "x"}, Postgres: PostgresSettings{RestoreCommand: "x"}, Backup: &backup.Settings{}}, true)
 	keys := make([]string, 0, len(set))
 	for k := range set {
 		keys = append(keys, k)
@@ -84,6 +86,11 @@ func ownedSettings(c *Config, standby bool) map[string]string {
 		if c.TLS.CAFile != "" {
 			set["ssl_ca_file"] = quote(c.TLS.CAFile)
 		}
+	}
+	set["archive_mode"] = onOff(c.Backup != nil)
+	if c.Backup != nil {
+		set["archive_command"] = quote(backup.ArchiveCommand(*c.Backup))
+		set["restore_command"] = quote(backup.RestoreCommand(*c.Backup))
 	}
 	if c.Postgres.RestoreCommand != "" {
 		set["restore_command"] = quote(c.Postgres.RestoreCommand)
@@ -161,6 +168,11 @@ func WriteConfig(c *Config, standby bool) error {
 	for name, body := range files {
 		if err := writeFileSync(filepath.Join(c.PGData, name), []byte(body)); err != nil {
 			return err
+		}
+	}
+	if c.Backup != nil {
+		if err := backup.WriteConfig(*c.Backup, c.PGData, c.Port); err != nil {
+			return fmt.Errorf("pgbackrest config: %w", err)
 		}
 	}
 	return nil
