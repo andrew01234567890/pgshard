@@ -60,8 +60,10 @@ connection usable), and `SendStandbyStatus`.
   the slots of the streaming standbys (`SynchronizedStandbySlots`), and
   with no slots when replication is asynchronous.
 - Invalidation: `wal_status = 'lost'` is visible in `ListSlots`; the
-  controller's `StreamMonitor` copies every slot's state into
-  `pgshard.stream_status` and marks the stream `lost`.
+  controller's `StreamMonitor` copies every slot's state (including the WAL
+  retained behind `restart_lsn` and the `synced`/`failover` flags) into
+  `pgshard.stream_status` and marks the stream `lost`. The admin UI shows
+  this on `/streams` (see [admin.md](admin.md)).
 
 ## Pooler `Stream` RPC
 

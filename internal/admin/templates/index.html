@@ -1,14 +1,17 @@
 {{template "head" "Clusters"}}
 <header><h1>pgshard clusters</h1><span class="meta">{{if .Namespace}}namespace {{.Namespace}}{{else}}all namespaces{{end}}</span></header>
-<nav class="tabs" aria-label="Sections"><a href="/" aria-current="page">Clusters</a><a href="/backups">Backups</a><a href="/migrations">Migrations</a></nav>
+<nav class="tabs" aria-label="Sections"><a href="/" aria-current="page">Clusters</a><a href="/backups">Backups</a><a href="/migrations">Migrations</a><a href="/streams">Streams</a></nav>
 {{with .Cards}}
 <section class="cards" aria-label="Backup overview">
 <div class="card"><div class="label">Last successful backup</div>
 {{if .LastSuccess}}<ul>{{range $k, $v := .LastSuccess}}<li>{{$k}}: {{$v}} ago</li>{{end}}</ul>{{else}}<div class="value">—</div>{{end}}</div>
 <div class="card"><div class="label">Failed backups</div><div class="value {{if .FailedBackups}}bad{{else}}ok{{end}}">{{.FailedBackups}}</div></div>
 <div class="card"><div class="label">Restores in progress</div><div class="value">{{.RestoresInProgress}}</div></div>
+{{with $.Streams}}<div class="card" aria-labelledby="streams-card"><div class="label" id="streams-card"><a href="/streams">Change streams</a></div>
+<div class="value">{{.Count}} stream{{if ne .Count 1}}s{{end}}</div><span class="{{if .Lost}}bad{{else}}ok{{end}}">{{.Lost}} lost</span></div>{{end}}
 </section>
 {{end}}
+{{if .StreamsError}}<p class="notice">Streams unavailable: {{.StreamsError}}</p>{{end}}
 {{if .Clusters}}
 <table>
 <thead><tr><th>Namespace</th><th>Name</th><th>PostgreSQL</th><th>Shards</th><th>Ready</th></tr></thead>

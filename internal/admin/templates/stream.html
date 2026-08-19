@@ -1,0 +1,9 @@
+{{template "head" .Name}}
+<header><h1><a href="/">clusters</a> / <a href="/streams">streams</a> / {{.Name}}</h1><span class="meta">database {{.Database}} · two-phase {{if .TwoPhase}}on{{else}}off{{end}} · created {{.CreatedAt.UTC.Format "2006-01-02 15:04"}}</span></header>
+<nav class="tabs" aria-label="Sections"><a href="/">Clusters</a><a href="/backups">Backups</a><a href="/migrations">Migrations</a><a href="/streams" aria-current="page">Streams</a></nav>
+<div id="streams" data-live hx-get="/streams/{{.Name}}" hx-trigger="topology" hx-swap="innerHTML" aria-live="polite">
+{{template "stream_detail.html" .}}
+</div>
+<p class="notice"><a href="/api/v1/streams/{{.Name}}">JSON</a></p>
+<script src="/static/app.js" defer></script>
+{{template "foot"}}

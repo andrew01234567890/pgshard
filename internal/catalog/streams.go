@@ -67,7 +67,11 @@ type StreamStatus struct {
 	InvalidationReason string
 	ConfirmedFlushLSN  uint64
 	RestartLSN         uint64
+	RetainedBytes      int64
 	Active             bool
+	Synced             bool
+	Failover           bool
+	UpdatedAt          time.Time
 }
 
 // CreateStream inserts a stream row; it is an error if the name is taken.
@@ -109,12 +113,14 @@ func DeleteStream(ctx context.Context, q Execer, name string) error {
 // lost slot also marks the stream lost.
 func UpsertStreamStatus(ctx context.Context, q Execer, st StreamStatus) error {
 	_, err := q.Exec(ctx, `INSERT INTO pgshard.stream_status
-		(stream, shard_set, shard_id, slot, wal_status, invalidation_reason, confirmed_flush_lsn, restart_lsn, active, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+		(stream, shard_set, shard_id, slot, wal_status, invalidation_reason, confirmed_flush_lsn, restart_lsn, retained_bytes, active, synced, failover, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
 		ON CONFLICT (stream, shard_set, shard_id) DO UPDATE SET slot = EXCLUDED.slot, wal_status = EXCLUDED.wal_status,
 		invalidation_reason = EXCLUDED.invalidation_reason, confirmed_flush_lsn = EXCLUDED.confirmed_flush_lsn,
-		restart_lsn = EXCLUDED.restart_lsn, active = EXCLUDED.active, updated_at = now()`,
-		st.Stream, st.ShardSet, st.ShardID, st.Slot, st.WALStatus, st.InvalidationReason, int64(st.ConfirmedFlushLSN), int64(st.RestartLSN), st.Active)
+		restart_lsn = EXCLUDED.restart_lsn, retained_bytes = EXCLUDED.retained_bytes, active = EXCLUDED.active,
+		synced = EXCLUDED.synced, failover = EXCLUDED.failover, updated_at = now()`,
+		st.Stream, st.ShardSet, st.ShardID, st.Slot, st.WALStatus, st.InvalidationReason, int64(st.ConfirmedFlushLSN), int64(st.RestartLSN),
+		st.RetainedBytes, st.Active, st.Synced, st.Failover)
 	if err != nil {
 		return err
 	}
@@ -126,7 +132,8 @@ func UpsertStreamStatus(ctx context.Context, q Execer, st StreamStatus) error {
 
 // ListStreamStatus returns the per-shard rows of one stream ("" for all).
 func ListStreamStatus(ctx context.Context, q Querier, stream string) ([]StreamStatus, error) {
-	rows, err := q.Query(ctx, `SELECT stream, shard_set, shard_id, slot, wal_status, invalidation_reason, confirmed_flush_lsn, restart_lsn, active
+	rows, err := q.Query(ctx, `SELECT stream, shard_set, shard_id, slot, wal_status, invalidation_reason, confirmed_flush_lsn, restart_lsn,
+		retained_bytes, active, synced, failover, updated_at
 		FROM pgshard.stream_status WHERE ($1 = '' OR stream = $1) ORDER BY stream, shard_set, shard_id`, stream)
 	if err != nil {
 		return nil, err

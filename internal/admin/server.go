@@ -82,6 +82,10 @@ func NewServer(c client.Reader, catalogSrc CatalogSource, n *Notifier, namespace
 	mux.HandleFunc("GET /migrations/{id}/detail", s.handleMigrationFragment)
 	mux.HandleFunc("GET /api/v1/migrations", s.handleAPIMigrations)
 	mux.HandleFunc("GET /api/v1/migrations/{id}", s.handleAPIMigration)
+	mux.HandleFunc("GET /streams", s.handleStreams)
+	mux.HandleFunc("GET /streams/{name}", s.handleStream)
+	mux.HandleFunc("GET /api/v1/streams", s.handleAPIStreams)
+	mux.HandleFunc("GET /api/v1/streams/{name}", s.handleAPIStream)
 	mux.HandleFunc("GET /api/v1/clusters", s.handleAPIClusters)
 	mux.HandleFunc("GET /api/v1/clusters/{ns}/{name}", s.handleAPICluster)
 	mux.HandleFunc("GET /events", s.handleEvents)
@@ -119,6 +123,11 @@ func (r *statusRecorder) Flush() {
 	}
 }
 
+func (s *Server) streamSource() StreamSource {
+	src, _ := s.Catalog.(StreamSource)
+	return src
+}
+
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	clusters, err := ListClusters(r.Context(), s.Client, s.Namespace)
 	if err != nil {
@@ -130,7 +139,16 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	s.render(w, "index.html", map[string]any{"Clusters": clusters, "Namespace": s.Namespace, "Cards": cards})
+	data := map[string]any{"Clusters": clusters, "Namespace": s.Namespace, "Cards": cards}
+	if src := s.streamSource(); src != nil {
+		overview, err := BuildStreamsOverview(r.Context(), src)
+		if err != nil {
+			data["StreamsError"] = err.Error()
+		} else {
+			data["Streams"] = overview
+		}
+	}
+	s.render(w, "index.html", data)
 }
 
 func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request) {
@@ -209,6 +227,50 @@ func (s *Server) topology(r *http.Request) (*Topology, error) {
 	}
 	t.DDL = s.ddlSummary(r.Context())
 	return t, nil
+}
+
+func (s *Server) handleStreams(w http.ResponseWriter, r *http.Request) {
+	overview, err := BuildStreamsOverview(r.Context(), s.streamSource())
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	if r.Header.Get("HX-Request") == "true" {
+		s.render(w, "streams_list.html", overview)
+		return
+	}
+	s.render(w, "streams.html", overview)
+}
+
+func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
+	d, err := BuildStreamDetail(r.Context(), s.streamSource(), r.PathValue("name"))
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	if r.Header.Get("HX-Request") == "true" {
+		s.render(w, "stream_detail.html", d)
+		return
+	}
+	s.render(w, "stream.html", d)
+}
+
+func (s *Server) handleAPIStreams(w http.ResponseWriter, r *http.Request) {
+	overview, err := BuildStreamsOverview(r.Context(), s.streamSource())
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, overview)
+}
+
+func (s *Server) handleAPIStream(w http.ResponseWriter, r *http.Request) {
+	d, err := BuildStreamDetail(r.Context(), s.streamSource(), r.PathValue("name"))
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, d)
 }
 
 func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
@@ -308,9 +370,12 @@ func (s *Server) render(w http.ResponseWriter, name string, data any) {
 
 func (s *Server) fail(w http.ResponseWriter, err error) {
 	code := http.StatusInternalServerError
-	if apierrors.IsNotFound(err) || errors.Is(err, pgx.ErrNoRows) {
+	switch {
+	case apierrors.IsNotFound(err), errors.Is(err, pgx.ErrNoRows), errors.Is(err, ErrStreamNotFound):
 		code = http.StatusNotFound
-	} else if errors.Is(err, context.Canceled) {
+	case errors.Is(err, ErrNoStreamSource):
+		code = http.StatusServiceUnavailable
+	case errors.Is(err, context.Canceled):
 		code = 499
 	}
 	s.Logger.Error("request failed", "err", err)

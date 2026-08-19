@@ -37,3 +37,4 @@ dl.kv dd { margin: 0; }
 .state-queued, .state-pending { color: GrayText; }
 pre { white-space: pre-wrap; word-break: break-word; }
 .steps li { margin: 0.2rem 0; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
