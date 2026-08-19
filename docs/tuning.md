@@ -6,6 +6,18 @@ operator writes the result to `pgshard.override.conf`, which the agent's
 `postgresql.conf` pulls in through `include_if_exists`, and records every
 derived value with its reason under `status.tuning.derived` (`DerivedSetting`).
 
+The operator feeds `Derive` with the memory and CPU of `spec.resources`
+(limits, else requests), the group's `storage.size`, `spec.postgresql.profile`
+and `spec.postgresql.parameters` as overrides. Without a memory request nothing
+is derived (`TuningApplied=False/NoMemoryBudget`) and the agent's fixed
+configuration stands alone; a derivation error surfaces as
+`TuningApplied=False/DeriveFailed`. Settings the agent fixes itself in
+`postgresql.conf` (`ssl`, `wal_level`, slot and sender counts,
+`max_prepared_transactions`, `synchronous_commit`, ...) are dropped from the
+override so the two never disagree. Changing resources restarts members;
+changing a reloadable parameter is applied live (see
+[ha.md](ha.md#rolling-operations)).
+
 Preview what a given shape produces:
 
 ```

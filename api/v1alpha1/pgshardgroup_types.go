@@ -2,6 +2,18 @@ package v1alpha1
 
 import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+// GroupRollout is the rolling operation in flight on one group.
+type GroupRollout struct {
+	Phase string `json:"phase"`
+	// +optional
+	Member string `json:"member,omitempty"`
+	// +optional
+	Reason string `json:"reason,omitempty"`
+	// Since is when the current step began; the hold timeout counts from it.
+	// +optional
+	Since *metav1.Time `json:"since,omitempty"`
+}
+
 // PgShardGroupSpec identifies the replication group this object mirrors.
 type PgShardGroupSpec struct {
 	ClusterRef string `json:"clusterRef"`
@@ -19,6 +31,12 @@ type PgShardGroupStatus struct {
 	Epoch int64 `json:"epoch,omitempty"`
 	// +optional
 	Members []MemberStatus `json:"members,omitempty"`
+	// +optional
+	Rollout *GroupRollout `json:"rollout,omitempty"`
+	// SettingsRestartPending is set once a postmaster-context setting
+	// changed; it stays until every member restarted with the new settings.
+	// +optional
+	SettingsRestartPending bool `json:"settingsRestartPending,omitempty"`
 }
 
 // PgShardGroup is a status-only view of one catalog or shard group.

@@ -1,0 +1,35 @@
+# A cluster with a memory budget: the operator derives pgshard.override.conf
+# from the resources (see docs/tuning.md) and applies parameter changes as
+# live reloads or rolling restarts (see docs/ha.md#rolling-operations).
+apiVersion: pgshard.io/v1alpha1
+kind: PgShardCluster
+metadata:
+  name: tuned
+  # Rolling restart of every member on demand: change the value.
+  # annotations:
+  #   pgshard.io/restart: "2026-08-18T10:00Z"
+spec:
+  postgresql:
+    major: 18
+    profile: oltp
+    parameters:
+      # sighup context: applied with a reload, no pod restart
+      log_min_duration_statement: 250ms
+  catalog:
+    replicas: 3
+    storage:
+      size: 5Gi
+  shards: 2
+  replicasPerShard: 3
+  storage:
+    size: 20Gi
+    # Changing the class rebuilds members one at a time onto new claims;
+    # growing the size on an expandable class resizes the claims in place.
+    storageClassName: standard
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+    limits:
+      cpu: "4"
+      memory: 4Gi

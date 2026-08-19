@@ -143,6 +143,9 @@ message ReloadRequest {
 message ReloadResponse {
   uint64 epoch = 1;
   Error error = 2;
+  // settings_hash identifies the configuration the agent applied, as
+  // published by the operator in the agent config.
+  string settings_hash = 3;
 }
 
 // RestartRequest restarts the instance.

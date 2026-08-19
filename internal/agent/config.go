@@ -52,6 +52,15 @@ type Config struct {
 	MaxLagBytes int64 `json:"maxLagBytes"`
 	// ShutdownTimeout bounds a smart shutdown before falling back to fast.
 	ShutdownTimeout Duration `json:"shutdownTimeout"`
+	// OverrideFile is a rendered postgresql.conf fragment (the operator's
+	// derived tuning) copied into PGDATA as pgshard.override.conf.
+	OverrideFile string `json:"overrideFile,omitempty"`
+	// SettingsHash identifies the operator-rendered settings; Reload reports
+	// it back so the operator can tell a stale volume from an applied change.
+	SettingsHash string `json:"settingsHash,omitempty"`
+
+	// path is where the config was loaded from; Refresh rereads it.
+	path string
 }
 
 // PostgresSettings are the operator-provided values in postgresql.conf.
@@ -123,7 +132,25 @@ func LoadConfig(path string) (*Config, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
+	c.path = path
 	return &c, nil
+}
+
+// Refresh rereads the file the config was loaded from and takes over the
+// settings that may change while the instance runs: the user parameters
+// and the override file. Everything else stays as loaded at start.
+func (c *Config) Refresh() error {
+	if c.path == "" {
+		return nil
+	}
+	fresh, err := LoadConfig(c.path)
+	if err != nil {
+		return err
+	}
+	c.Postgres.Parameters = fresh.Postgres.Parameters
+	c.OverrideFile = fresh.OverrideFile
+	c.SettingsHash = fresh.SettingsHash
+	return nil
 }
 
 func (c *Config) applyDefaults() {

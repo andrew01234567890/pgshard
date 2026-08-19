@@ -71,6 +71,23 @@ type fakeProber struct {
 	slots []string
 	// journal records fence writes and promotions in order.
 	journal *[]string
+	// settings is the pg_settings view of every member; contexts default to
+	// "sighup" for names not listed.
+	settings map[string]SettingState
+}
+
+func (f *fakeProber) Settings(_ context.Context, _ string, names []string) (map[string]SettingState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]SettingState{}
+	for _, n := range names {
+		st, ok := f.settings[n]
+		if !ok {
+			st = SettingState{Context: "sighup"}
+		}
+		out[n] = st
+	}
+	return out, nil
 }
 
 func (f *fakeProber) ProbeStandby(_ context.Context, dsn string) (StandbyState, error) {
@@ -108,10 +125,23 @@ type fakeAgents struct {
 	promotes []string
 	demotes  []string
 	journal  *[]string
+	// reloadHash is what Reload reports per addr; reloads records calls.
+	reloadHash map[string]string
+	reloads    []string
+}
+
+func (f *fakeAgents) Reload(_ context.Context, addr string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.errs[addr]; err != nil {
+		return "", err
+	}
+	f.reloads = append(f.reloads, addr)
+	return f.reloadHash[addr], nil
 }
 
 func newFakeAgents(journal *[]string) *fakeAgents {
-	return &fakeAgents{status: map[string]AgentStatus{}, errs: map[string]error{}, journal: journal}
+	return &fakeAgents{status: map[string]AgentStatus{}, errs: map[string]error{}, journal: journal, reloadHash: map[string]string{}}
 }
 
 func (f *fakeAgents) set(ip string, st AgentStatus, err error) {

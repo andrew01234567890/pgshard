@@ -220,6 +220,7 @@ func (s *Server) Reload(ctx context.Context, req *pgshardv1.ReloadRequest) (*pgs
 	if err := s.inst.Reload(ctx); err != nil {
 		resp.Error = pgErr(err)
 	}
+	resp.SettingsHash = s.inst.cfg.SettingsHash
 	return resp, nil
 }
 

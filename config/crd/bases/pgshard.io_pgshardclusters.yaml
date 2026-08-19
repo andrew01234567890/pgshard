@@ -379,6 +379,24 @@ spec:
               observedGeneration:
                 format: int64
                 type: integer
+              rollout:
+                description: RolloutStatus summarises the rolling operation in flight
+                  across groups.
+                properties:
+                  lastRestartToken:
+                    description: |-
+                      LastRestartToken is the pgshard.io/restart value the last completed
+                      whole-cluster restart carried.
+                    type: string
+                  member:
+                    description: Member is the member being reloaded, restarted or
+                      rebuilt.
+                    type: string
+                  phase:
+                    type: string
+                  reason:
+                    type: string
+                type: object
               shardMapGeneration:
                 format: int64
                 type: integer
@@ -397,6 +415,10 @@ spec:
                           in a group.
                         properties:
                           name:
+                            type: string
+                          pvc:
+                            description: PVC is the claim the member's data directory
+                              lives on.
                             type: string
                           ready:
                             type: boolean

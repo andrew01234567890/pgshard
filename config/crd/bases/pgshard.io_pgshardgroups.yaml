@@ -76,6 +76,10 @@ spec:
                   properties:
                     name:
                       type: string
+                    pvc:
+                      description: PVC is the claim the member's data directory lives
+                        on.
+                      type: string
                     ready:
                       type: boolean
                     replayLagBytes:
@@ -89,6 +93,29 @@ spec:
                 type: array
               primary:
                 type: string
+              rollout:
+                description: GroupRollout is the rolling operation in flight on one
+                  group.
+                properties:
+                  member:
+                    type: string
+                  phase:
+                    type: string
+                  reason:
+                    type: string
+                  since:
+                    description: Since is when the current step began; the hold timeout
+                      counts from it.
+                    format: date-time
+                    type: string
+                required:
+                - phase
+                type: object
+              settingsRestartPending:
+                description: |-
+                  SettingsRestartPending is set once a postmaster-context setting
+                  changed; it stays until every member restarted with the new settings.
+                type: boolean
             type: object
         required:
         - spec

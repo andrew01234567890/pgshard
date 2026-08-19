@@ -15,6 +15,9 @@ const (
 	LabelKind    = "pgshard.io/group-kind"
 	LabelOrdinal = "pgshard.io/ordinal"
 	LabelRole    = "pgshard.io/role"
+	// LabelMember on a PVC names the member it belongs to; the claim name
+	// itself gains a -v<n> suffix after a storage rebuild.
+	LabelMember = "pgshard.io/member"
 
 	RolePrimary = "primary"
 	RoleReplica = "replica"
@@ -25,6 +28,12 @@ const (
 	// AnnotationSwitchover on a PgShardCluster names the member to promote;
 	// the operator removes it once the switchover ran.
 	AnnotationSwitchover = "pgshard.io/switchover"
+	// AnnotationRestart on a PgShardCluster requests a rolling restart of
+	// every member; the value is remembered in status.rollout.lastRestartToken.
+	AnnotationRestart = "pgshard.io/restart"
+	// AnnotationTemplateHash on a member pod is the MemberTemplate hash the
+	// member runs with.
+	AnnotationTemplateHash = "pgshard.io/template-hash"
 	// AnnotationPrimaryEpoch and AnnotationPrimary on the group Lease publish
 	// the fence for readers that cannot reach the catalog.
 	AnnotationPrimaryEpoch = "pgshard.io/primary-epoch"

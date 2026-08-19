@@ -136,9 +136,10 @@ func (c *Cluster) WaitPodsReady(ctx context.Context, namespace, selector string,
 	deadline := time.Now().Add(timeout)
 	for {
 		out, err := c.Kubectl(ctx, nil, "-n", namespace, "get", "pods", "-l", selector, "-o", "name")
-		if err == nil && strings.TrimSpace(out) != "" {
+		remaining := time.Until(deadline).Truncate(time.Second)
+		if err == nil && strings.TrimSpace(out) != "" && remaining > 0 {
 			_, err = c.Kubectl(ctx, nil, "-n", namespace, "wait", "--for=condition=Ready", "pod", "-l", selector,
-				"--timeout="+time.Until(deadline).Truncate(time.Second).String())
+				"--timeout="+remaining.String())
 			if err == nil {
 				return nil
 			}

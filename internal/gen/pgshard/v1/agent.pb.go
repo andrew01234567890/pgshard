@@ -894,9 +894,12 @@ func (x *ReloadRequest) GetEpoch() uint64 {
 
 // ReloadResponse reports the outcome.
 type ReloadResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Epoch         uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	Error         *Error                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Epoch uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	Error *Error                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	// settings_hash identifies the configuration the agent applied, as
+	// published by the operator in the agent config.
+	SettingsHash  string `protobuf:"bytes,3,opt,name=settings_hash,json=settingsHash,proto3" json:"settings_hash,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -943,6 +946,13 @@ func (x *ReloadResponse) GetError() *Error {
 		return x.Error
 	}
 	return nil
+}
+
+func (x *ReloadResponse) GetSettingsHash() string {
+	if x != nil {
+		return x.SettingsHash
+	}
+	return ""
 }
 
 // RestartRequest restarts the instance.
@@ -1879,10 +1889,11 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12'\n" +
 	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"%\n" +
 	"\rReloadRequest\x12\x14\n" +
-	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\"O\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\"t\n" +
 	"\x0eReloadResponse\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12'\n" +
-	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"\xac\x01\n" +
+	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\x12#\n" +
+	"\rsettings_hash\x18\x03 \x01(\tR\fsettingsHash\"\xac\x01\n" +
 	"\x0eRestartRequest\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x123\n" +
 	"\x04mode\x18\x02 \x01(\x0e2\x1f.pgshard.v1.RestartRequest.ModeR\x04mode\"O\n" +

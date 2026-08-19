@@ -160,3 +160,67 @@ func TestRenderPostgresqlConfAppendsUserParametersWithoutOverridingOwnedOnes(t *
 		t.Fatalf("owned settings must win:\n%s", got)
 	}
 }
+
+func TestWriteConfigCopiesTheOverrideFileIntoPGDATA(t *testing.T) {
+	c := testConfig()
+	c.PGData = t.TempDir()
+	dir := t.TempDir()
+	c.OverrideFile = filepath.Join(dir, "pgshard.override.conf")
+	if err := WriteConfig(c, true); err != nil {
+		t.Fatal(err)
+	}
+	if body, err := os.ReadFile(filepath.Join(c.PGData, overrideConf)); err != nil || len(body) != 0 {
+		t.Fatalf("a missing override file writes an empty include target: %q %v", body, err)
+	}
+	if err := os.WriteFile(c.OverrideFile, []byte("shared_buffers = '1GB'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteConfig(c, true); err != nil {
+		t.Fatal(err)
+	}
+	if body, _ := os.ReadFile(filepath.Join(c.PGData, overrideConf)); string(body) != "shared_buffers = '1GB'\n" {
+		t.Fatalf("override not copied: %q", body)
+	}
+	c.OverrideFile = ""
+	if err := os.Remove(filepath.Join(c.PGData, overrideConf)); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteConfig(c, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(c.PGData, overrideConf)); !os.IsNotExist(err) {
+		t.Fatal("no override file configured: PGDATA is left alone")
+	}
+}
+
+func TestRefreshTakesOverParametersOverrideAndSettingsHash(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "member.json")
+	write := func(body string) {
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(`{"cluster":"c","shard":"s","member":"m","role":"primary","pgdata":"/d","passwordFile":"/p","port":5433,"postgres":{"parameters":{"work_mem":"4MB"}},"settingsHash":"a"}`)
+	c, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(`{"cluster":"c","shard":"s","member":"m","role":"standby","primaryConninfo":"host=x","pgdata":"/other","passwordFile":"/p","port":9999,"postgres":{"parameters":{"work_mem":"8MB"}},"overrideFile":"/etc/o.conf","settingsHash":"b"}`)
+	if err := c.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	if c.Postgres.Parameters["work_mem"] != "8MB" || c.OverrideFile != "/etc/o.conf" || c.SettingsHash != "b" {
+		t.Fatalf("refresh must take the reloadable fields: %+v", c)
+	}
+	if c.Role != RolePrimary || c.PGData != "/d" || c.Port != 5433 {
+		t.Fatalf("refresh must leave identity and paths alone: %+v", c)
+	}
+	write(`{not json`)
+	if err := c.Refresh(); err == nil {
+		t.Fatal("a broken file must fail the refresh, not blank the settings")
+	}
+	if (&Config{}).Refresh() != nil {
+		t.Fatal("a config not loaded from a file has nothing to refresh")
+	}
+}
