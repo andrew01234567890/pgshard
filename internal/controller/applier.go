@@ -494,6 +494,9 @@ func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, key string,
 	if m.Meta.Object.Kind == "role" || m.Meta.Object.Kind == "database" || strings.HasSuffix(m.Kind, "ROLE") {
 		db = ""
 	}
+	if key != catalogKey {
+		defer a.releaseDDLRole(ctx, id, m.Meta.RunAs)
+	}
 	conn, err := a.prepare(ctx, m, key, id, db)
 	if err != nil {
 		return "", err
@@ -540,9 +543,9 @@ func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, key string,
 }
 
 // provisionDDLRole makes sure the DDL role exists on shard id with this
-// process's password (once per shard) and may SET ROLE into runAs, then
-// returns the password. A superuser runAs is refused: the DDL session must
-// never be able to become one.
+// process's password and no memberships (once per shard) and may SET ROLE
+// into runAs, then returns the password. A superuser runAs is refused: the
+// DDL session must never be able to become one.
 func (a *Applier) provisionDDLRole(ctx context.Context, id int32, runAs string) (string, error) {
 	a.ddlMu.Lock()
 	defer a.ddlMu.Unlock()
@@ -566,8 +569,9 @@ func (a *Applier) provisionDDLRole(ctx context.Context, id int32, runAs string) 
 	if !a.ddlReady[id] {
 		for _, sql := range []string{
 			fmt.Sprintf(`DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s) THEN
-				CREATE ROLE %s LOGIN NOSUPERUSER NOINHERIT NOBYPASSRLS NOREPLICATION CREATEDB CREATEROLE; END IF; END $$`, quoteLiteral(a.ddlRole()), role),
-			"ALTER ROLE " + role + " LOGIN NOSUPERUSER NOINHERIT NOBYPASSRLS NOREPLICATION CREATEDB CREATEROLE PASSWORD " + quoteLiteral(a.ddlPassword),
+				CREATE ROLE %s LOGIN NOSUPERUSER NOINHERIT NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION; END IF; END $$`, quoteLiteral(a.ddlRole()), role),
+			"ALTER ROLE " + role + " LOGIN NOSUPERUSER NOINHERIT NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION PASSWORD " + quoteLiteral(a.ddlPassword),
+			revokeAllMemberships(a.ddlRole()),
 		} {
 			if _, err := conn.Exec(ctx, sql); err != nil {
 				return "", fmt.Errorf("provisioning %s: %w", a.ddlRole(), err)
@@ -598,12 +602,39 @@ func (a *Applier) provisionDDLRole(ctx context.Context, id int32, runAs string) 
 	return a.ddlPassword, nil
 }
 
+// revokeAllMemberships drops every membership the DDL role holds: a
+// previous process may have died between a grant and its revoke.
+func revokeAllMemberships(ddlRole string) string {
+	return fmt.Sprintf(`DO $$ DECLARE r text; BEGIN FOR r IN SELECT roleid::regrole::text FROM pg_auth_members WHERE member = %s::regrole LOOP
+		EXECUTE format('REVOKE %%s FROM %%I', r, %s); END LOOP; END $$`, quoteLiteral(ddlRole), quoteLiteral(ddlRole))
+}
+
+// releaseDDLRole revokes runAs from the DDL role on shard id once the
+// statement that needed it finished, however it ended, so a later session
+// cannot SET ROLE into a tenant it is not running for.
+func (a *Applier) releaseDDLRole(ctx context.Context, id int32, runAs string) {
+	if runAs == "" {
+		return
+	}
+	ctx = context.WithoutCancel(ctx)
+	conn, err := a.Shards.DialDatabase(ctx, a.shardSet(), id, "")
+	if err != nil {
+		a.logger().Warn("revoking DDL role membership: connect failed", "shard", id, "role", runAs, "err", err)
+		return
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if _, err := conn.Exec(ctx, "REVOKE "+pgx.Identifier{runAs}.Sanitize()+" FROM "+pgx.Identifier{a.ddlRole()}.Sanitize()); err != nil {
+		a.logger().Warn("revoking DDL role membership failed", "shard", id, "role", runAs, "err", err)
+	}
+}
+
 // runStep executes one step of a multistep migration on one shard. The
 // step is skipped when its check says it already happened; a CREATE INDEX
 // CONCURRENTLY step drops an invalid leftover before running, rebuilds
 // once on failure and leaves no invalid index behind; a step with OnFail
 // runs it after a hard failure so a re-run starts clean.
 func (a *Applier) runStep(ctx context.Context, m *catalog.DDLMigration, id int32, st catalog.MigrationStep) (string, error) {
+	defer a.releaseDDLRole(ctx, id, m.Meta.RunAs)
 	conn, err := a.prepare(ctx, m, shardKey(id), id, m.Database)
 	if err != nil {
 		return "", err

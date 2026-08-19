@@ -195,8 +195,31 @@ func TestRouterDDLMigrations(t *testing.T) {
 		if got := s.onShards(t, "select not rolsuper from pg_roles where rolname = $1", appRole); !allTrue(got) {
 			t.Fatalf("client role stayed a plain role per shard: %v", got)
 		}
-		if got := s.onShards(t, "select not rolsuper and not rolbypassrls from pg_roles where rolname = 'pgshard_ddl'"); !allTrue(got) {
+		if got := s.onShards(t, "select not rolsuper and not rolbypassrls and not rolcreaterole and not rolcreatedb from pg_roles where rolname = 'pgshard_ddl'"); !allTrue(got) {
 			t.Fatalf("pgshard_ddl is a plain login per shard: %v", got)
+		}
+		if got := s.onShards(t, "select count(*) = 0 from pg_auth_members where member = 'pgshard_ddl'::regrole"); !allTrue(got) {
+			t.Fatalf("pgshard_ddl keeps no membership after the migration: %v", got)
+		}
+
+		for id := 0; id < 3; id++ {
+			shard := s.shardConn(t, id)
+			for _, sql := range []string{
+				"do $$ begin if not exists (select 1 from pg_roles where rolname = 'other_tenant') then create role other_tenant; end if; end $$",
+				`create or replace function public.hop(int) returns bool language plpgsql as $$
+				begin reset role; set role other_tenant; return true; end $$`,
+			} {
+				if _, err := shard.Exec(ctx, sql); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		_, err = conn.Exec(ctx, "alter table orders add constraint orders_hop check (public.hop(id))")
+		if !errors.As(err, &pgErr) || pgErr.Code != "42501" {
+			t.Fatalf("a CHECK that resets the role and hops to another tenant: expected 42501, got %v\nmigration: %+v", err, s.migration(t, "statement like '%orders_hop%'"))
+		}
+		if got := s.onShards(t, "select count(*) = 0 from pg_auth_members where member = 'pgshard_ddl'::regrole"); !allTrue(got) {
+			t.Fatalf("pgshard_ddl keeps no membership after a failed migration: %v", got)
 		}
 		for tenant := 2; tenant <= 12; tenant++ {
 			if _, err := conn.Exec(ctx, "delete from orders where tenant_id = $1", tenant); err != nil {
