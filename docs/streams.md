@@ -70,6 +70,31 @@ See [pooler.md](pooler.md): batched `ChangeBatch`es per transaction or per
 idle, resume from the confirmed position with `start_lsn = 0`, and one
 reader per slot.
 
+## Pooler `CopyTables` RPC
+
+`CopyTables(stream, database, publication, two_phase, batch_rows,
+done_tables, resume_schema/table/lastpk)` is the per-shard copy phase of an
+initial copy (see below). The pooler opens a replication connection and
+creates the stream's slot `pgshard_<stream>_<shard>` with `SNAPSHOT
+'export'` (`failover`, `two_phase` as requested) when it does not exist yet;
+when it exists, a temporary slot `pgshard_copy_<random>` exports the
+snapshot instead and disappears with the connection. The first message is
+`Snapshot{slot, stream_slot, consistent_point, snapshot_name}`. A second
+connection runs `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET
+TRANSACTION SNAPSHOT '<name>'` while the replication connection stays open,
+lists the tables of the publication (`pg_publication_tables`, so `FOR ALL
+TABLES` is expanded inside the snapshot) and, for every table not in
+`done_tables`, sends `TableBegin{relation, by_ctid}`, `Rows{rows, lastpk}`
+batches of `batch_rows` (default 1000) in primary-key order, then
+`TableDone`; `Done` closes the copy. Pagination is keyset on the primary key
+(`WHERE (k1, k2) > ($1::t1, $2::t2) ORDER BY k1, k2 LIMIT n`, composite keys
+included); a table without a primary key is walked by `ctid` ranges in the
+same way (`by_ctid`). `lastpk` is a JSON array of the key's text values
+(`["3","k1"]`, `["(0,7)"]` for ctid) and `resume_*` continues a table after
+it; rows at or below the checkpoint are never sent again. Rows committed
+after the snapshot are invisible to the copy and reach the consumer through
+the change stream.
+
 ## Catalog
 
 `pgshard.streams` (`name`, `database`, `two_phase`, `state`, `created_at`)
@@ -146,10 +171,65 @@ serves `pgshard.v1.VStream` with the router↔pooler mTLS material
   - buffering is bounded: each shard may run at most 16 assembled
     transactions ahead of the consumer; beyond that the pooler stream stalls
     (flow control back to the walsender).
+- `start_from: COPY` runs an initial copy for every shard missing from the
+  position (see "Initial copy"); `copy_batch_rows` sizes its batches.
 - `two_phase` on `Stream` requires a stream created with `two_phase`; it
   adds `Prepare`, `CommitPrepared` and `RollbackPrepared` events and
   `Begin.gid` for prepared transactions. Without it, prepared transactions
   are decoded at commit time as ordinary transactions.
+
+## Initial copy
+
+`Stream` with `options.start_from = START_FROM_COPY` and an empty position
+(or a position missing some shards) copies every table of the publication
+on those shards before streaming changes, the way logical replication's
+tablesync and Vitess VReplication do:
+
+1. The router asks each shard's pooler for `CopyTables`. The pooler creates
+   the stream slot with an exported snapshot if the slot does not exist yet
+   (a stream created through `Create` already has it, so a temporary slot
+   exports the snapshot); the snapshot's `consistent_point` becomes the
+   shard's LSN in the vector and is where streaming starts once the copy is
+   done. Transactions committed before it are in the copy; transactions
+   committed after it arrive as ordinary stream events.
+2. Per shard the events are `CopyBegin{shard, schema, table}`, the
+   `Relation` (once per table across shards, as for streamed rows), `Row`
+   batches with `copy = true` (always `KIND_INSERT`), a `VGtid` after every
+   batch, `CopyCompleted{shard, schema, table}` per table and
+   `CopyCompleted{shard}` once every table of the shard is copied. Copy
+   events of a shard are never interleaved with that shard's streamed
+   transactions (they all come first); other shards proceed independently,
+   so shard 1 may already stream while shard 0 still copies. Once the last
+   shard finishes, a `CopyCompleted` without shard closes the copy phase of
+   the stream.
+3. `VPosition.copy_state` carries, per shard still copying, the table in
+   progress with the last key delivered (`lastpk`) and the tables done;
+   `VGtid` and `Heartbeat` vectors include it. Resuming from such a vector
+   (with `start_from = COPY`) continues the copy: the pooler exports a new
+   snapshot from a temporary slot, skips the done tables and the rows at or
+   below `lastpk` of the table in progress, and streaming later starts from
+   the original consistent point kept in the vector. A shard with an LSN and
+   no copy state simply streams; a shard without either starts its copy.
+   Acks for shards still copying are held (there is nothing to confirm on
+   the slot yet).
+
+Delivery is at-least-once at batch boundaries and around a resume:
+
+- rows at or below the checkpoint are never resent; rows above it (within
+  the batch the consumer did not finish) are resent once;
+- a resumed copy sees rows committed between the original consistent point
+  and the new snapshot, and the stream from the original point delivers
+  them again as transactions;
+- `CopyBegin` repeats for a table a resume continues.
+
+Consumers therefore apply copy rows with upsert semantics keyed by the
+primary key (and treat stream inserts the same way during and right after
+the copy). Tables without a primary key are copied by `ctid`; across a
+resume their rows are identified by position only, so a `VACUUM FULL` or
+`CLUSTER` between the two snapshots can repeat or skip rows of such a table.
+The row-count oracle in `test/e2e/router` (`TestRouterVStreamInitialCopy`:
+10k rows per shard, concurrent inserts, the consumer killed twice mid-copy)
+checks that the upserted consumer state equals the tables on both shards.
 
 Example with `grpcurl` against a development router (`--insecure-dev`):
 
@@ -157,6 +237,9 @@ Example with `grpcurl` against a development router (`--insecure-dev`):
 grpcurl -plaintext -d '{"stream":"orders","database":"app","two_phase":true}' \
   127.0.0.1:15600 pgshard.v1.VStream/Create
 grpcurl -plaintext -d '{"start":{"stream":"orders","options":{"heartbeat_interval_ms":1000}}}' \
+  127.0.0.1:15600 pgshard.v1.VStream/Stream
+# initial copy of every table, then changes from the copy's consistent point
+grpcurl -plaintext -d '{"start":{"stream":"orders","options":{"start_from":"START_FROM_COPY","copy_batch_rows":500}}}' \
   127.0.0.1:15600 pgshard.v1.VStream/Stream
 # resume from a VGtid and ack it (acks are later messages on the same call;
 # the unary form works while a Stream is open)

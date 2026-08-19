@@ -17,11 +17,14 @@ type options struct {
 	alignSkew     bool
 	skew          time.Duration
 	alignTimeout  time.Duration
+	copy          bool
+	copyBatch     uint32
 }
 
 func resolveOptions(o *pgshardv1.VStreamOptions) options {
 	out := options{twoPhase: o.GetTwoPhase(), stopOnReshard: o.GetStopOnReshard(), alignSkew: o.GetAlignSkew(),
-		heartbeat: 5 * time.Second, skew: time.Second, alignTimeout: 10 * time.Second}
+		heartbeat: 5 * time.Second, skew: time.Second, alignTimeout: 10 * time.Second,
+		copy: o.GetStartFrom() == pgshardv1.StartFrom_START_FROM_COPY, copyBatch: o.GetCopyBatchRows()}
 	if o.GetHeartbeatIntervalMs() > 0 {
 		out.heartbeat = time.Duration(o.GetHeartbeatIntervalMs()) * time.Millisecond
 	}
@@ -50,7 +53,9 @@ type merger struct {
 	opts       options
 	now        func() time.Time
 
-	position   map[router.Shard]uint64
+	position map[router.Shard]uint64
+	// copying holds the copy state of every shard still in its copy phase.
+	copying    map[router.Shard]*pgshardv1.VCopyState
 	sentRel    map[string]string
 	lastCommit map[router.Shard]int64
 	heldSince  map[router.Shard]time.Time
@@ -64,6 +69,9 @@ func (m *merger) vector() *pgshardv1.VPosition {
 		if lsn := m.position[sh]; lsn > 0 {
 			pos.Shards = append(pos.Shards, &pgshardv1.VPosition_Shard{Shard: shardRef(sh), Lsn: lsn})
 		}
+		if st := m.copying[sh]; st != nil {
+			pos.CopyState = append(pos.CopyState, st)
+		}
 	}
 	return pos
 }
@@ -76,6 +84,9 @@ func (m *merger) run(ctx context.Context) error {
 	m.lastCommit = map[router.Shard]int64{}
 	m.heldSince = map[router.Shard]time.Time{}
 	m.heads = map[router.Shard]*unit{}
+	if m.copying == nil {
+		m.copying = map[router.Shard]*pgshardv1.VCopyState{}
+	}
 	if m.now == nil {
 		m.now = time.Now
 	}
@@ -269,16 +280,25 @@ func (m *merger) emit(u *unit) error {
 	if u.commitTS != 0 {
 		m.lastCommit[u.shard] = u.commitTS
 	}
-	if !u.position {
-		return nil
-	}
-	if u.endLSN > m.position[u.shard] {
+	if u.position && u.endLSN > m.position[u.shard] {
 		m.position[u.shard] = u.endLSN
 	}
-	if len(u.events) == 0 {
+	if u.copy != nil {
+		m.copying[u.shard] = u.copy
+	}
+	if u.copyDone {
+		delete(m.copying, u.shard)
+	}
+	if !u.position && u.copy == nil && !u.copyDone || len(u.events) == 0 {
 		return nil
 	}
-	return m.send(&pgshardv1.VEvent{Event: &pgshardv1.VEvent_Vgtid{Vgtid: &pgshardv1.VEvent_VGtid{Position: m.vector()}}})
+	if err := m.send(&pgshardv1.VEvent{Event: &pgshardv1.VEvent_Vgtid{Vgtid: &pgshardv1.VEvent_VGtid{Position: m.vector()}}}); err != nil {
+		return err
+	}
+	if u.copyDone && len(m.copying) == 0 {
+		return m.send(&pgshardv1.VEvent{Event: &pgshardv1.VEvent_CopyCompleted_{CopyCompleted: &pgshardv1.VEvent_CopyCompleted{}}})
+	}
+	return nil
 }
 
 // forwardAck clamps every shard's acked LSN to what was delivered and hands
@@ -286,7 +306,7 @@ func (m *merger) emit(u *unit) error {
 func (m *merger) forwardAck(pos *pgshardv1.VPosition) {
 	for _, p := range pos.GetShards() {
 		sh := router.Shard{Set: p.GetShard().GetShardSet(), ID: int32(p.GetShard().GetShardId())}
-		if _, ok := m.inputs[sh]; !ok {
+		if _, ok := m.inputs[sh]; !ok || m.copying[sh] != nil {
 			continue
 		}
 		lsn := p.GetLsn()
@@ -304,6 +324,15 @@ func positionFrom(pos *pgshardv1.VPosition) map[router.Shard]uint64 {
 	out := map[router.Shard]uint64{}
 	for _, p := range pos.GetShards() {
 		out[router.Shard{Set: p.GetShard().GetShardSet(), ID: int32(p.GetShard().GetShardId())}] = p.GetLsn()
+	}
+	return out
+}
+
+// copyStateFrom turns a VPosition's copy states into per-shard entries.
+func copyStateFrom(pos *pgshardv1.VPosition) map[router.Shard]*pgshardv1.VCopyState {
+	out := map[router.Shard]*pgshardv1.VCopyState{}
+	for _, st := range pos.GetCopyState() {
+		out[router.Shard{Set: st.GetShard().GetShardSet(), ID: int32(st.GetShard().GetShardId())}] = st
 	}
 	return out
 }

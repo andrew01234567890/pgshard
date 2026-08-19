@@ -46,6 +46,41 @@ message VStreamOptions {
   uint32 align_timeout_ms = 6;
   // Shard set to stream; empty means default.
   string shard_set = 7;
+  // Where a shard absent from position starts: its slot's confirmed
+  // position (default) or an initial copy of every table followed by
+  // streaming from the copy's consistent point.
+  StartFrom start_from = 8;
+  // Rows per copy batch (one checkpoint per batch); zero means 1000.
+  uint32 copy_batch_rows = 9;
+}
+
+// StartFrom selects how a shard without a position starts.
+enum StartFrom {
+  START_FROM_UNSPECIFIED = 0;
+  // Resume from the slot's confirmed position.
+  START_FROM_SLOT = 1;
+  // Copy every table of the publication through an exported snapshot,
+  // then stream from the snapshot's consistent point.
+  START_FROM_COPY = 2;
+}
+
+// VCopyState is the copy progress of one shard: the table being copied and
+// the last key delivered for it, plus the tables already copied. A shard
+// listed here is still in its copy phase; its lsn in the vector is the
+// consistent point streaming starts from once the copy is complete.
+message VCopyState {
+  // Table in progress.
+  message Table {
+    string schema = 1;
+    string table = 2;
+    // Last primary key (or ctid for tables without one) delivered, in the
+    // pooler's encoding; empty when no row was delivered yet.
+    bytes lastpk = 3;
+  }
+  ShardRef shard = 1;
+  Table current = 2;
+  // Fully copied tables as schema.table.
+  repeated string done = 3;
 }
 
 // CreateVStreamRequest registers a stream.
@@ -116,6 +151,8 @@ message VPosition {
   }
   repeated Shard shards = 1;
   uint64 shard_map_generation = 2;
+  // Shards still in their initial copy.
+  repeated VCopyState copy_state = 3;
 }
 
 // VStreamRequest is the start of a stream or an ack.
@@ -207,6 +244,24 @@ message VEvent {
     bool old_is_key = 6;
     // New image for INSERT/UPDATE.
     VTuple new = 7;
+    // True for a row of the initial copy (always KIND_INSERT; apply as an
+    // upsert, rows may repeat across a resume).
+    bool copy = 8;
+  }
+  // CopyBegin opens the copy of one table on a shard; it repeats when a
+  // resumed stream continues the table.
+  message CopyBegin {
+    ShardRef shard = 1;
+    string schema = 2;
+    string table = 3;
+  }
+  // CopyCompleted closes the copy of one table on a shard (schema and table
+  // set), of every table of a shard (shard set, table empty) or of every
+  // shard of the stream (shard unset).
+  message CopyCompleted {
+    ShardRef shard = 1;
+    string schema = 2;
+    string table = 3;
   }
   // Truncate of one or more tables.
   message Truncate {
@@ -306,5 +361,7 @@ message VEvent {
     Heartbeat heartbeat = 11;
     Journal journal = 12;
     Error error = 13;
+    CopyBegin copy_begin = 14;
+    CopyCompleted copy_completed = 15;
   }
 }

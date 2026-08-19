@@ -47,6 +47,9 @@ func describe(ev *pgshardv1.VEvent) string {
 			}
 		}
 		s := fmt.Sprintf("row shard=%d %s %s.%s new=[%s]", e.Row.GetShard().GetShardId(), strings.TrimPrefix(e.Row.GetKind().String(), "KIND_"), e.Row.GetSchema(), e.Row.GetTable(), strings.Join(vals, ","))
+		if e.Row.GetCopy() {
+			s += " copy"
+		}
 		if e.Row.GetOld() != nil {
 			s += fmt.Sprintf(" old_cols=%d key=%t", len(e.Row.GetOld().GetColumns()), e.Row.GetOldIsKey())
 		}
@@ -75,6 +78,16 @@ func describe(ev *pgshardv1.VEvent) string {
 		return fmt.Sprintf("journal participants=%d targets=%d gen=%d", len(e.Journal.GetParticipants()), len(e.Journal.GetTargets()), e.Journal.GetShardMapGeneration())
 	case *pgshardv1.VEvent_Error_:
 		return fmt.Sprintf("error %s shard=%d", strings.TrimPrefix(e.Error.GetCode().String(), "CODE_"), e.Error.GetShard().GetShardId())
+	case *pgshardv1.VEvent_CopyBegin_:
+		return fmt.Sprintf("copy_begin shard=%d %s.%s", e.CopyBegin.GetShard().GetShardId(), e.CopyBegin.GetSchema(), e.CopyBegin.GetTable())
+	case *pgshardv1.VEvent_CopyCompleted_:
+		switch {
+		case e.CopyCompleted.GetShard() == nil:
+			return "copy_completed stream"
+		case e.CopyCompleted.GetTable() == "":
+			return fmt.Sprintf("copy_completed shard=%d", e.CopyCompleted.GetShard().GetShardId())
+		}
+		return fmt.Sprintf("copy_completed shard=%d %s.%s", e.CopyCompleted.GetShard().GetShardId(), e.CopyCompleted.GetSchema(), e.CopyCompleted.GetTable())
 	}
 	return fmt.Sprintf("%T", ev.GetEvent())
 }
@@ -84,7 +97,15 @@ func describePos(p *pgshardv1.VPosition) string {
 	for _, s := range p.GetShards() {
 		parts = append(parts, fmt.Sprintf("%d:%d", s.GetShard().GetShardId(), s.GetLsn()))
 	}
-	return fmt.Sprintf("gen=%d {%s}", p.GetShardMapGeneration(), strings.Join(parts, " "))
+	out := fmt.Sprintf("gen=%d {%s}", p.GetShardMapGeneration(), strings.Join(parts, " "))
+	for _, c := range p.GetCopyState() {
+		cur := "-"
+		if c.GetCurrent() != nil {
+			cur = fmt.Sprintf("%s.%s@%s", c.GetCurrent().GetSchema(), c.GetCurrent().GetTable(), c.GetCurrent().GetLastpk())
+		}
+		out += fmt.Sprintf(" copy[%d done=%s cur=%s]", c.GetShard().GetShardId(), strings.Join(c.GetDone(), ","), cur)
+	}
+	return out
 }
 
 // recvN receives n events or fails after the timeout.

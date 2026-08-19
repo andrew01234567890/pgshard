@@ -29,6 +29,7 @@ const (
 	Pooler_StreamChanges_FullMethodName = "/pgshard.v1.Pooler/StreamChanges"
 	Pooler_Stream_FullMethodName        = "/pgshard.v1.Pooler/Stream"
 	Pooler_Ack_FullMethodName           = "/pgshard.v1.Pooler/Ack"
+	Pooler_CopyTables_FullMethodName    = "/pgshard.v1.Pooler/CopyTables"
 )
 
 // PoolerClient is the client API for Pooler service.
@@ -63,6 +64,11 @@ type PoolerClient interface {
 	// Ack advances the slot's confirmed position; events up to and including
 	// lsn are never resent after a restart.
 	Ack(ctx context.Context, in *AckRequest, opts ...grpc.CallOption) (*AckResponse, error)
+	// CopyTables exports a snapshot from a logical slot (the stream's slot
+	// when it does not exist yet, a temporary one otherwise) and streams the
+	// rows of every table of the publication as seen by that snapshot, in
+	// primary-key order with a checkpoint per batch.
+	CopyTables(ctx context.Context, in *CopyTablesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[CopyTablesResponse], error)
 }
 
 type poolerClient struct {
@@ -183,6 +189,25 @@ func (c *poolerClient) Ack(ctx context.Context, in *AckRequest, opts ...grpc.Cal
 	return out, nil
 }
 
+func (c *poolerClient) CopyTables(ctx context.Context, in *CopyTablesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[CopyTablesResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Pooler_ServiceDesc.Streams[4], Pooler_CopyTables_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[CopyTablesRequest, CopyTablesResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Pooler_CopyTablesClient = grpc.ServerStreamingClient[CopyTablesResponse]
+
 // PoolerServer is the server API for Pooler service.
 // All implementations must embed UnimplementedPoolerServer
 // for forward compatibility.
@@ -215,6 +240,11 @@ type PoolerServer interface {
 	// Ack advances the slot's confirmed position; events up to and including
 	// lsn are never resent after a restart.
 	Ack(context.Context, *AckRequest) (*AckResponse, error)
+	// CopyTables exports a snapshot from a logical slot (the stream's slot
+	// when it does not exist yet, a temporary one otherwise) and streams the
+	// rows of every table of the publication as seen by that snapshot, in
+	// primary-key order with a checkpoint per batch.
+	CopyTables(*CopyTablesRequest, grpc.ServerStreamingServer[CopyTablesResponse]) error
 	mustEmbedUnimplementedPoolerServer()
 }
 
@@ -248,6 +278,9 @@ func (UnimplementedPoolerServer) Stream(*StreamRequest, grpc.ServerStreamingServ
 }
 func (UnimplementedPoolerServer) Ack(context.Context, *AckRequest) (*AckResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Ack not implemented")
+}
+func (UnimplementedPoolerServer) CopyTables(*CopyTablesRequest, grpc.ServerStreamingServer[CopyTablesResponse]) error {
+	return status.Errorf(codes.Unimplemented, "method CopyTables not implemented")
 }
 func (UnimplementedPoolerServer) mustEmbedUnimplementedPoolerServer() {}
 func (UnimplementedPoolerServer) testEmbeddedByValue()                {}
@@ -382,6 +415,17 @@ func _Pooler_Ack_Handler(srv interface{}, ctx context.Context, dec func(interfac
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Pooler_CopyTables_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(CopyTablesRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(PoolerServer).CopyTables(m, &grpc.GenericServerStream[CopyTablesRequest, CopyTablesResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Pooler_CopyTablesServer = grpc.ServerStreamingServer[CopyTablesResponse]
+
 // Pooler_ServiceDesc is the grpc.ServiceDesc for Pooler service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -426,6 +470,11 @@ var Pooler_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "Stream",
 			Handler:       _Pooler_Stream_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "CopyTables",
+			Handler:       _Pooler_CopyTables_Handler,
 			ServerStreams: true,
 		},
 	},

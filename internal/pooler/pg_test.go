@@ -183,6 +183,7 @@ func runPGSuite(t *testing.T, image string) {
 	t.Run("copy_in", h.testCopyIn)
 	t.Run("stale_generation", h.testStaleGeneration)
 	t.Run("cancel", h.testCancel)
+	t.Run("copy_tables", h.testCopyTables)
 	t.Run("change_stream", h.testStream)
 	t.Run("drain_lets_txn_commit", h.testDrain)
 }
