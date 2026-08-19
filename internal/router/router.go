@@ -25,6 +25,8 @@ type Config struct {
 	Peers CancelForwarder
 	// Buffering tunes failover buffering; zero values pick defaults.
 	Buffering Buffering
+	// Scatter bounds multi-shard reads; zero values pick defaults.
+	Scatter ScatterConfig
 }
 
 // CancelForwarder delivers a cancel key to the router instances it may
@@ -38,6 +40,8 @@ type CancelForwarder interface {
 type Router struct {
 	cfg    Config
 	prefix string
+
+	scatter *scatterSlots
 
 	mu       sync.Mutex
 	sessions map[uint64]*Executor
@@ -59,11 +63,13 @@ func New(cfg Config) (*Router, error) {
 		cfg.CatalogDatabase = "pgshard"
 	}
 	cfg.Buffering = cfg.Buffering.withDefaults()
+	cfg.Scatter = cfg.Scatter.withDefaults()
 	var b [4]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return nil, err
 	}
-	return &Router{cfg: cfg, prefix: hex.EncodeToString(b[:]), sessions: map[uint64]*Executor{}, buffered: map[Shard]int{}}, nil
+	return &Router{cfg: cfg, prefix: hex.EncodeToString(b[:]), scatter: newScatterSlots(cfg.Scatter.MaxStreams),
+		sessions: map[uint64]*Executor{}, buffered: map[Shard]int{}}, nil
 }
 
 // NewExecutor implements pgwire.Config.NewExecutor: it resolves the session's

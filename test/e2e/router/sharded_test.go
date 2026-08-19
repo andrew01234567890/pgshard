@@ -119,10 +119,10 @@ func TestRouterShardedRouting(t *testing.T) {
 		}
 	}
 	// The router's snapshot follows the catalog through LISTEN/NOTIFY; wait
-	// until the table is known as sharded (a scatter read is then refused).
+	// until the table is known as sharded (a locking scatter is then refused).
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		_, err := conn.Exec(ctx, "select * from orders", pgx.QueryExecModeSimpleProtocol)
+		_, err := conn.Exec(ctx, "select * from orders for update", pgx.QueryExecModeSimpleProtocol)
 		if sqlstate(err) == "0A000" {
 			break
 		}
@@ -192,8 +192,8 @@ func TestRouterShardedRouting(t *testing.T) {
 
 	t.Run("refusals", func(t *testing.T) {
 		for _, c := range []struct{ sql, msg string }{
-			{"select * from orders", "scatter execution is not available yet"},
-			{"select count(*) from orders", "scatter SELECT with aggregates is not available yet"},
+			{"select * from orders for update", "multi-shard SELECT with FOR UPDATE/SHARE is not available yet"},
+			{"select avg(id) from orders", "multi-shard avg() is not available yet"},
 			{"insert into orders values (1, 2)", "insert requires the shard key"},
 			{"update orders set tenant_id = 1 where tenant_id = 2", "shard key is immutable"},
 			{"delete from orders", "scatter DELETE without a shard key predicate is not available yet"},

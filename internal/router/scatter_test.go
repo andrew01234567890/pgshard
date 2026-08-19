@@ -1,0 +1,364 @@
+package router
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
+)
+
+func contains(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+func int4Rows(vals ...string) script {
+	sc := script{cols: []scriptCol{{name: "v", oid: 23}}}
+	for _, v := range vals {
+		sc.rows = append(sc.rows, []string{v})
+	}
+	return sc
+}
+
+func collectInts(t *testing.T, conn *pgx.Conn, sql string) []int {
+	t.Helper()
+	rows, err := conn.Query(context.Background(), sql)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []int
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, v)
+	}
+	if rows.Err() != nil {
+		t.Fatal(rows.Err())
+	}
+	return out
+}
+
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestScatterConcatenatesEveryShard(t *testing.T) {
+	h := newShardedHarness(t)
+	conn := h.connect(t, h.dsn()+"&default_query_exec_mode=simple_protocol")
+	rows, err := conn.Query(context.Background(), "select * from orders")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for rows.Next() {
+		n++
+	}
+	if rows.Err() != nil || n != 4 {
+		t.Fatalf("rows=%d err=%v, want one row per shard", n, rows.Err())
+	}
+	if tag := rows.CommandTag(); tag.String() != "SELECT 4" {
+		t.Fatalf("command tag %q", tag)
+	}
+	for i := range h.poolers {
+		if !h.ranOn(i, "select * from orders") {
+			t.Fatalf("shard %d did not run the scatter", i)
+		}
+	}
+}
+
+func TestScatterMergesOrderedStreamsWithLimitPushdown(t *testing.T) {
+	h := newShardedHarness(t)
+	shardRows := [][]string{{"1", "5", "9"}, {"2", "6"}, {"3"}, {"4", "8"}}
+	for i, fp := range h.poolers {
+		fp.script("select v from orders order by v", int4Rows(shardRows[i]...))
+		fp.script("SELECT v FROM orders ORDER BY v LIMIT 4", int4Rows(shardRows[i]...))
+		fp.script("SELECT v FROM orders ORDER BY v DESC LIMIT 2", int4Rows(reverse(shardRows[i])...))
+	}
+	for _, mode := range []string{"simple_protocol", "cache_statement"} {
+		conn := h.connect(t, h.dsn()+"&default_query_exec_mode="+mode)
+		got := collectInts(t, conn, "select v from orders order by v")
+		if want := []int{1, 2, 3, 4, 5, 6, 8, 9}; !equalInts(got, want) {
+			t.Fatalf("%s: merged %v, want %v", mode, got, want)
+		}
+		got = collectInts(t, conn, "select v from orders order by v limit 3 offset 1")
+		if want := []int{2, 3, 4}; !equalInts(got, want) {
+			t.Fatalf("%s: limit/offset gave %v, want %v", mode, got, want)
+		}
+		got = collectInts(t, conn, "select v from orders order by v desc limit 2")
+		if want := []int{9, 8}; !equalInts(got, want) {
+			t.Fatalf("%s: desc gave %v, want %v", mode, got, want)
+		}
+	}
+	for i := range h.poolers {
+		if !h.ranOn(i, "select v from orders order by v limit 4") {
+			t.Fatalf("shard %d did not receive the pushed-down LIMIT 4 (limit+offset): %v", i, h.poolers[i].ran())
+		}
+	}
+}
+
+func reverse(s []string) []string {
+	out := make([]string, len(s))
+	for i, v := range s {
+		out[len(s)-1-i] = v
+	}
+	return out
+}
+
+func TestScatterCombinesDistributiveAggregates(t *testing.T) {
+	h := newShardedHarness(t)
+	sql := "select count(*), sum(v), min(v), max(v) from orders"
+	cols := []scriptCol{{"count", 20}, {"sum", 20}, {"min", 23}, {"max", 23}}
+	perShard := [][]string{{"2", "10", "1", "9"}, {"0", "NULL", "NULL", "NULL"}, {"1", "5", "5", "5"}, {"3", "6", "2", "3"}}
+	for i, fp := range h.poolers {
+		fp.script(sql, script{cols: cols, rows: [][]string{perShard[i]}})
+	}
+	conn := h.connect(t, h.dsn())
+	var count, sum int64
+	var mn, mx int
+	if err := conn.QueryRow(context.Background(), sql).Scan(&count, &sum, &mn, &mx); err != nil {
+		t.Fatal(err)
+	}
+	if count != 6 || sum != 21 || mn != 1 || mx != 9 {
+		t.Fatalf("combined (%d, %d, %d, %d), want (6, 21, 1, 9)", count, sum, mn, mx)
+	}
+	for _, fp := range h.poolers {
+		fp.script("select sum(v) from orders", script{cols: cols[1:2], rows: [][]string{{"NULL"}}})
+	}
+	var null *int64
+	if err := conn.QueryRow(context.Background(), "select sum(v) from orders").Scan(&null); err != nil || null != nil {
+		t.Fatalf("all-NULL sum: %v %v", null, err)
+	}
+}
+
+func TestScatterRefusesTextOrderWithoutCCollation(t *testing.T) {
+	h := newShardedHarness(t)
+	for _, fp := range h.poolers {
+		fp.script("select name from orders order by name", script{cols: []scriptCol{{"name", 25}}, rows: [][]string{{"b"}}})
+		fp.script(`select name from orders order by name collate "c"`, script{cols: []scriptCol{{"name", 25}}, rows: [][]string{{"b"}}})
+	}
+	conn := h.connect(t, h.dsn()+"&default_query_exec_mode=simple_protocol")
+	ctx := context.Background()
+	_, err := conn.Exec(ctx, "select name from orders order by name")
+	_ = expectRefusal(t, err, `multi-shard ORDER BY on a text column needs an explicit COLLATE "C"`)
+	rows, err := conn.Query(ctx, `select name from orders order by name collate "C"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for rows.Next() {
+		n++
+	}
+	if rows.Err() != nil || n != 4 {
+		t.Fatalf("collated order: rows=%d err=%v", n, rows.Err())
+	}
+}
+
+func TestScatterFirstErrorCancelsTheOthers(t *testing.T) {
+	h := newShardedHarness(t)
+	for i, fp := range h.poolers {
+		if i == 2 {
+			fp.script("select v from orders", script{err: `relation "orders" does not exist on shard 2`})
+		} else {
+			fp.script("select v from orders", int4Rows("1"))
+		}
+	}
+	conn := h.connect(t, h.dsn()+"&default_query_exec_mode=simple_protocol")
+	_, err := conn.Exec(context.Background(), "select v from orders")
+	var pe *pgconn.PgError
+	if !errors.As(err, &pe) || pe.Code != "42P01" || !strings.Contains(pe.Message, "shard 2") {
+		t.Fatalf("expected the shard error, got %v", err)
+	}
+	var n int
+	if err := conn.QueryRow(context.Background(), "select 1").Scan(&n); err != nil {
+		t.Fatalf("session unusable after a shard error: %v", err)
+	}
+}
+
+func TestScatterRowDescriptionMismatchIsAnError(t *testing.T) {
+	h := newShardedHarness(t)
+	for i, fp := range h.poolers {
+		sc := int4Rows("1")
+		if i == 3 {
+			sc.cols[0].oid = 20
+		}
+		fp.script("select v from orders", sc)
+	}
+	conn := h.connect(t, h.dsn()+"&default_query_exec_mode=simple_protocol")
+	_, err := conn.Exec(context.Background(), "select v from orders")
+	var pe *pgconn.PgError
+	if !errors.As(err, &pe) || pe.Code != "XX000" || !strings.Contains(pe.Message, "disagree on the result shape") {
+		t.Fatalf("expected a shape mismatch error, got %v", err)
+	}
+}
+
+func TestScatterClientCancelReachesEveryShard(t *testing.T) {
+	h := newShardedHarness(t)
+	conn := h.connect(t, h.dsn()+"&default_query_exec_mode=simple_protocol")
+	ctx := context.Background()
+	go func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			asleep := 0
+			for _, fp := range h.poolers {
+				fp.mu.Lock()
+				asleep += len(fp.sleeping)
+				fp.mu.Unlock()
+			}
+			if asleep == len(h.poolers) {
+				_ = conn.PgConn().CancelRequest(ctx)
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+	_, err := conn.Exec(ctx, "select pg_sleep(10) from orders")
+	if sqlstate(err) != "57014" {
+		t.Fatalf("cancel: %v", err)
+	}
+	for i, fp := range h.poolers {
+		fp.mu.Lock()
+		cancels := append([]string(nil), fp.cancels...)
+		fp.mu.Unlock()
+		if !contains(cancels, h.sidOf(t)+"-x"+itoa(int64(i))) {
+			t.Fatalf("shard %d cancels %v, want the scatter participant", i, cancels)
+		}
+	}
+	var n int
+	if err := conn.QueryRow(ctx, "select 1").Scan(&n); err != nil || n != 1 {
+		t.Fatalf("session after cancel: %v", err)
+	}
+}
+
+func TestScatterRefusalsThroughTheWire(t *testing.T) {
+	h := newShardedHarness(t)
+	ctx := context.Background()
+	conn := h.connect(t, h.dsn()+"&default_query_exec_mode=simple_protocol")
+	cases := []struct{ sql, msg string }{
+		{"select avg(id) from orders", "multi-shard avg() is not available yet"},
+		{"select * from orders limit $1", "multi-shard LIMIT must be an integer constant"},
+		{"select id from orders group by id", "multi-shard GROUP BY without the shard key is not available yet"},
+		{"explain select * from orders", "only a plain SELECT can run on multiple shards"},
+	}
+	for _, c := range cases {
+		_, err := conn.Exec(ctx, c.sql)
+		_ = expectRefusal(t, err, c.msg)
+	}
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values (1, 1)"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = tx.Exec(ctx, "select * from orders")
+	_ = expectRefusal(t, err, "multi-shard read inside a transaction pinned to shard")
+	_ = tx.Rollback(ctx)
+	if _, err := conn.Exec(ctx, "begin isolation level repeatable read"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = conn.Exec(ctx, "select * from orders")
+	_ = expectRefusal(t, err, "multi-shard reads under REPEATABLE READ or SERIALIZABLE isolation are not available yet")
+	if _, err := conn.Exec(ctx, "rollback"); err != nil {
+		t.Fatal(err)
+	}
+	// A read-only transaction that has not touched a shard may scatter.
+	if _, err := conn.Exec(ctx, "begin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "select * from orders"); err != nil {
+		t.Fatalf("scatter in an untouched transaction: %v", err)
+	}
+	if _, err := conn.Exec(ctx, "commit"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestScatterStatementMustBeAloneInItsBatch(t *testing.T) {
+	h := newShardedHarness(t)
+	conn, err := pgx.Connect(context.Background(), h.dsn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hj, err := conn.PgConn().Hijack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hj.Conn.Close() })
+	fe := hj.Frontend
+	send := func(msgs ...pgproto3.FrontendMessage) {
+		for _, m := range msgs {
+			fe.Send(m)
+		}
+		if err := fe.Flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	drain := func() *pgproto3.ErrorResponse {
+		var first *pgproto3.ErrorResponse
+		for {
+			msg, err := fe.Receive()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if e, ok := msg.(*pgproto3.ErrorResponse); ok && first == nil {
+				first = e
+			}
+			if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+				return first
+			}
+		}
+	}
+	send(&pgproto3.Parse{Query: "select * from orders"}, &pgproto3.Bind{}, &pgproto3.Execute{},
+		&pgproto3.Parse{Query: "select 1"}, &pgproto3.Bind{}, &pgproto3.Execute{}, &pgproto3.Sync{})
+	if e := drain(); e == nil || e.Code != "0A000" || !strings.HasPrefix(e.Message, "a multi-shard statement must be the only statement of its batch") {
+		t.Fatalf("expected the mixed-batch refusal, got %+v", e)
+	}
+	// Partial fetches from a multi-shard portal are refused.
+	send(&pgproto3.Parse{Query: "select * from orders"}, &pgproto3.Bind{}, &pgproto3.Execute{MaxRows: 5}, &pgproto3.Sync{})
+	if e := drain(); e == nil || e.Code != "0A000" || !strings.HasPrefix(e.Message, "partial fetches (Execute with a row limit) from a multi-shard portal") {
+		t.Fatalf("expected the partial-fetch refusal, got %+v", e)
+	}
+	// A portal bound in an earlier batch cannot be executed later.
+	send(&pgproto3.Parse{Query: "select * from orders"}, &pgproto3.Bind{}, &pgproto3.Sync{})
+	if e := drain(); e != nil {
+		t.Fatalf("bind-only batch failed: %+v", e)
+	}
+	send(&pgproto3.Execute{}, &pgproto3.Sync{})
+	if e := drain(); e == nil || e.Code != "0A000" || !strings.HasPrefix(e.Message, "a multi-shard portal must be bound and executed in the same batch") {
+		t.Fatalf("expected the late-execute refusal, got %+v", e)
+	}
+	for i := range h.poolers {
+		for _, q := range h.poolers[i].ran() {
+			if q == "select 1" || q == "select * from orders" {
+				t.Fatalf("refused batch reached shard %d: %v", i, h.poolers[i].ran())
+			}
+		}
+	}
+	send(&pgproto3.Terminate{})
+}
+
+func TestScatterHonoursTheShardLimit(t *testing.T) {
+	h := newShardedHarnessWith(t, Config{Scatter: ScatterConfig{MaxShards: 2}})
+	conn := h.connect(t, h.dsn()+"&default_query_exec_mode=simple_protocol")
+	_, err := conn.Exec(context.Background(), "select * from orders")
+	_ = expectRefusal(t, err, "statement fans out to 4 shards, more than the router's limit of 2")
+}

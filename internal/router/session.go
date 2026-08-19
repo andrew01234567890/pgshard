@@ -107,7 +107,11 @@ type Executor struct {
 	batchWriter pgwire.ResultWriter
 	// batchTarget is the shard the current extended batch resolved to.
 	batchTarget *Shard
-	batchExec   []execItem
+	// batchScatter is the multi-shard plan the current batch is bound to,
+	// and batchScatterStmt the one statement it may carry.
+	batchScatter     *plan.Plan
+	batchScatterStmt string
+	batchExec        []execItem
 	// describes lists the statements a batch asked to Describe, in order,
 	// so ParameterDescription replies can be attributed.
 	describes []string
@@ -220,9 +224,7 @@ func (e *Executor) target(pl plan.Plan) (Shard, error) {
 	case pl.Deferred:
 		return Shard{}, pgwire.Errorf(pgwire.CodeInternalError, "router: deferred plan was not resolved")
 	case len(pl.Shards) != 1:
-		err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "scatter execution is not available yet (%s plan over %d shards)", pl.Kind, len(pl.Shards))
-		err.Hint = "filter on one shard key value; scatter-gather execution is planned for M3.3"
-		return Shard{}, err
+		return Shard{}, pgwire.Errorf(pgwire.CodeInternalError, "router: %s plan over %d shards has no single target", pl.Kind, len(pl.Shards))
 	}
 	return Shard{Set: e.home.Set, ID: pl.Shards[0]}, nil
 }
@@ -295,6 +297,9 @@ func (e *Executor) SimpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 	pl, err := e.r.cfg.Planner.Plan(ctx, e.planSession(), sql)
 	if err != nil {
 		return err
+	}
+	if multiShard(pl) {
+		return e.afterBatch(ctx, e.scatterSimple(ctx, pl, sql, w))
 	}
 	target, err := e.target(pl)
 	if err != nil {
@@ -407,7 +412,13 @@ func (e *Executor) Parse(ctx context.Context, name, sql string, paramOIDs []uint
 		return err
 	}
 	if !pl.Deferred && pl.Kind != plan.SessionLocal {
-		if err := e.aimBatch(pl); err != nil {
+		var err error
+		if multiShard(pl) {
+			_, err = pl.MultiShard()
+		} else {
+			err = e.aimBatch(pl, name)
+		}
+		if err != nil {
 			e.failBatch()
 			return err
 		}
@@ -418,12 +429,30 @@ func (e *Executor) Parse(ctx context.Context, name, sql string, paramOIDs []uint
 	return nil
 }
 
+// multiShard reports whether a resolved plan runs on several shards.
+func multiShard(pl plan.Plan) bool {
+	return pl.Kind != plan.SessionLocal && pl.Kind != plan.Refuse && !pl.Deferred && len(pl.Shards) > 1
+}
+
 // aimBatch records the shard a resolved plan needs; one batch may only
-// target one shard.
-func (e *Executor) aimBatch(pl plan.Plan) error {
+// target one shard, or carry one multi-shard statement.
+func (e *Executor) aimBatch(pl plan.Plan, stmt string) error {
+	if multiShard(pl) {
+		if _, err := pl.MultiShard(); err != nil {
+			return err
+		}
+		if e.batchTarget != nil || e.batchScatter != nil && e.batchScatterStmt != stmt {
+			return mixedBatchError()
+		}
+		e.batchScatter, e.batchScatterStmt = &pl, stmt
+		return nil
+	}
 	target, err := e.target(pl)
 	if err != nil {
 		return err
+	}
+	if e.batchScatter != nil {
+		return mixedBatchError()
 	}
 	if e.batchTarget != nil && *e.batchTarget != target {
 		err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "statements of one batch target different shards (%s/%d and %s/%d)",
@@ -433,6 +462,12 @@ func (e *Executor) aimBatch(pl plan.Plan) error {
 	}
 	e.batchTarget = &target
 	return nil
+}
+
+func mixedBatchError() error {
+	err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "a multi-shard statement must be the only statement of its batch")
+	err.Hint = "send a Sync before and after a statement that fans out to several shards"
+	return err
 }
 
 // currentSnapshot is the snapshot plans of this session are made against;
@@ -470,7 +505,7 @@ func (e *Executor) Bind(ctx context.Context, portal, statement string, paramForm
 				return err
 			}
 		}
-		if err := e.aimBatch(pl); err != nil {
+		if err := e.aimBatch(pl, statement); err != nil {
 			e.failBatch()
 			return err
 		}
@@ -501,6 +536,12 @@ func (e *Executor) Execute(_ context.Context, portal string, maxRows int32, w pg
 	}
 	e.batchWriter = w
 	if st, ok := e.stmts[e.portals[portal]]; ok {
+		if multiShard(st.plan) && e.batchScatter == nil {
+			e.failBatch()
+			err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "a multi-shard portal must be bound and executed in the same batch")
+			err.Hint = "send Bind and Execute before one Sync"
+			return err
+		}
 		if st.class.SetGUC {
 			e.staged = append(e.staged, gucEntry{name: st.class.GUCName, sql: st.sql, searchPath: st.class.SearchPath})
 		}
@@ -532,6 +573,7 @@ func (e *Executor) failBatch() {
 	e.staged = e.staged[:e.stagedMark]
 	e.batch, e.batchStmts, e.batchFailed, e.batchWriter = nil, nil, true, nil
 	e.batchTarget, e.batchExec, e.describes = nil, nil, nil
+	e.batchScatter, e.batchScatterStmt = nil, ""
 }
 
 // Sync implements pgwire.Executor: it ships the buffered batch followed by
@@ -546,6 +588,9 @@ func (e *Executor) Sync(ctx context.Context) error {
 	if e.batchTarget != nil {
 		target = *e.batchTarget
 	}
+	scatterPlan, scatterStmt := e.batchScatter, e.batchScatterStmt
+	e.batchScatter, e.batchScatterStmt = nil, ""
+
 	pin := false
 	fresh := map[string]bool{}
 	for _, name := range e.batchStmts {
@@ -559,6 +604,10 @@ func (e *Executor) Sync(ctx context.Context) error {
 	}
 	if w == nil {
 		w = discardWriter{}
+	}
+	if scatterPlan != nil {
+		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
+		return e.afterBatch(ctx, e.scatterBatch(ctx, *scatterPlan, scatterStmt, batch, w))
 	}
 	if err := e.moveTo(target); err != nil {
 		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]

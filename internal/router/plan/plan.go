@@ -78,6 +78,11 @@ type Plan struct {
 	// Err carries the refusal for Kind Refuse.
 	Err error
 
+	// merge is how the executor combines shard streams when the plan runs
+	// on more than one shard; mergeErr says why it cannot.
+	merge    *Merge
+	mergeErr error
+
 	terms    []keyTerm
 	multiRow bool
 	touches  Kind
