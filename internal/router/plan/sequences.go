@@ -99,8 +99,9 @@ func fillable(node *pgquerypb.Node) bool {
 // for every registered sequence column that is absent from the column
 // list, or given as DEFAULT or nextval(), a parameter is injected. It
 // returns nil when the statement supplies every sequence column itself.
-// injected maps each column to the parameter numbers of its rows.
-func (w *walker) rewriteInsert(s *pgquerypb.InsertStmt, r *rel) (*SequenceFill, map[string][]int32, error) {
+// injected maps each column to the parameter number of each VALUES row
+// (by row index) that received one.
+func (w *walker) rewriteInsert(s *pgquerypb.InsertStmt, r *rel) (*SequenceFill, map[string]map[int]int32, error) {
 	sel := s.GetSelectStmt().GetSelectStmt()
 	rows := sel.GetValuesLists()
 	if len(r.seqCols) == 0 || len(rows) == 0 {
@@ -138,14 +139,14 @@ func (w *walker) rewriteInsert(s *pgquerypb.InsertStmt, r *rel) (*SequenceFill, 
 	tree := proto.Clone(w.tree).(*pgquerypb.ParseResult)
 	ins := tree.GetStmts()[0].GetStmt().GetInsertStmt()
 	fill := &SequenceFill{Base: maxParam(w.tree.(*pgquerypb.ParseResult).GetStmts()[0].GetStmt())}
-	injected := map[string][]int32{}
+	injected := map[string]map[int]int32{}
 	param := int32(fill.Base)
 	for _, sl := range slots {
 		if sl.index >= len(ins.Cols) {
 			ins.Cols = append(ins.Cols, &pgquerypb.Node{Node: &pgquerypb.Node_ResTarget{ResTarget: &pgquerypb.ResTarget{Name: sl.col}}})
 		}
 	}
-	for _, row := range ins.GetSelectStmt().GetSelectStmt().GetValuesLists() {
+	for rowIdx, row := range ins.GetSelectStmt().GetSelectStmt().GetValuesLists() {
 		items := row.GetList().GetItems()
 		if len(items) != len(cols) {
 			return nil, nil, notYet("INSERT into \""+r.name+"\" has a VALUES row with a different number of values than columns", "")
@@ -162,7 +163,10 @@ func (w *walker) rewriteInsert(s *pgquerypb.InsertStmt, r *rel) (*SequenceFill, 
 				items = append(items, ref)
 			}
 			fill.Names = append(fill.Names, SequenceName(w.sess.Database, r.schema, r.name, sl.col))
-			injected[sl.col] = append(injected[sl.col], param)
+			if injected[sl.col] == nil {
+				injected[sl.col] = map[int]int32{}
+			}
+			injected[sl.col][rowIdx] = param
 		}
 		row.GetList().Items = items
 	}

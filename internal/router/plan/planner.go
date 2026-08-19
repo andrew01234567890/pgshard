@@ -1154,11 +1154,12 @@ func (w *walker) insert(s *pgquerypb.InsertStmt) error {
 				"list the columns explicitly and include \""+r.shardKey+"\"")
 		}
 		for i, row := range sel.GetValuesLists() {
-			if len(keyParams) > 0 {
-				// The key column is a sequence column filled by the router:
-				// keyParams has one parameter per row.
-				r.terms = append(r.terms, keyTerm{params: []ParamRef{{Number: keyParams[i], Hint: HintInt}}})
+			if param, ok := keyParams[i]; ok {
+				r.terms = append(r.terms, keyTerm{params: []ParamRef{{Number: param, Hint: HintInt}}})
 				continue
+			}
+			if keyIdx < 0 {
+				return notYet("insert requires the shard key: VALUES row has fewer values than columns", "")
 			}
 			items := row.GetList().GetItems()
 			if keyIdx >= len(items) {

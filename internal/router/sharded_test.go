@@ -71,7 +71,7 @@ func newShardedHarnessWith(t *testing.T, cfg Config) *shardedHarness {
 	pl := NewPoolers(nil, h.snap, insecure.NewCredentials())
 	t.Cleanup(pl.Close)
 	sh := &shardedHarness{harness: h, poolers: poolers, snap: snap}
-	startHarness(t, h, Config{Snapshot: h.snap, Poolers: pl, Logger: slog.New(slog.DiscardHandler), Scatter: cfg.Scatter, Decisions: cfg.Decisions, Sequences: cfg.Sequences,
+	startHarness(t, h, Config{Snapshot: h.snap, Poolers: pl, Logger: slog.New(slog.DiscardHandler), Scatter: cfg.Scatter, Decisions: cfg.Decisions, Sequences: cfg.Sequences, Planner: cfg.Planner,
 		Buffering: Buffering{Window: 700 * time.Millisecond, Poll: 20 * time.Millisecond, PerShardCap: 2, Changes: h.subscribe}})
 	return sh
 }
@@ -605,5 +605,34 @@ func TestPreparedStatementReplansOnNewSnapshot(t *testing.T) {
 	}
 	if !h.ranOn(h.shardOf(t, a), "values ($1, $2)") {
 		t.Fatalf("after the catalog declared the table the cached statement still ran on home; shard %d saw %v", h.shardOf(t, a), h.poolers[h.shardOf(t, a)].ran())
+	}
+}
+
+func TestPanicInPlanningIsConfinedToTheSession(t *testing.T) {
+	planner := NewPlanner()
+	planner.before = func(sql string) {
+		if strings.Contains(sql, "boom") {
+			panic("planner exploded on " + sql)
+		}
+	}
+	h := newShardedHarnessWith(t, Config{Planner: planner})
+	ctx := context.Background()
+	conn := h.connect(t, h.dsn())
+
+	for _, mode := range []pgx.QueryExecMode{pgx.QueryExecModeSimpleProtocol, pgx.QueryExecModeCacheStatement} {
+		_, err := conn.Exec(ctx, "select boom", mode)
+		var pe *pgconn.PgError
+		if !errors.As(err, &pe) || pe.Code != "XX000" || !strings.Contains(pe.Message, "internal error") {
+			t.Fatalf("mode %v: got %v, want XX000 internal error", mode, err)
+		}
+		var n int
+		if err := conn.QueryRow(ctx, "select 1", mode).Scan(&n); err != nil || n != 1 {
+			t.Fatalf("mode %v: session unusable after the panic: %v", mode, err)
+		}
+	}
+	other := h.connect(t, h.dsn())
+	var n int
+	if err := other.QueryRow(ctx, "select 1").Scan(&n); err != nil {
+		t.Fatalf("server did not survive the panic: %v", err)
 	}
 }

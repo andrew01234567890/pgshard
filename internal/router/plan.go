@@ -25,6 +25,9 @@ type StmtClass = plan.StmtClass
 // Planner decides which shards a statement touches (see package plan).
 type Planner struct {
 	inner *plan.Planner
+	// before, when set, runs ahead of every Plan call (tests use it to
+	// inject faults).
+	before func(sql string)
 }
 
 // NewPlanner builds a Planner with a bounded parse cache.
@@ -33,5 +36,8 @@ func NewPlanner() *Planner { return &Planner{inner: plan.New()} }
 // Plan plans sql for a session of the router; sessions on the catalog shard
 // set plan every statement onto the catalog shard.
 func (p *Planner) Plan(ctx context.Context, sess plan.Session, sql string) (plan.Plan, error) {
+	if p.before != nil {
+		p.before(sql)
+	}
 	return p.inner.Plan(ctx, sess, sql)
 }

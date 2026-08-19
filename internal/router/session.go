@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -316,8 +317,35 @@ func (e *Executor) needsPin() bool {
 	return false
 }
 
+// guard confines a panic in planning or execution to the calling session:
+// it is logged, the session's shard stream is dropped and the client gets an
+// XX000 error instead of the router process dying.
+func (e *Executor) guard(op string, run func() error) (err error) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		e.r.cfg.Logger.Error("router: panic in session", "op", op, "session", e.sid, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+		e.failBatch()
+		// Between Parse and Sync the pgwire layer skips to Sync, where the
+		// failed batch is cleared; a simple query or Sync itself has no
+		// batch left to skip.
+		e.batchFailed = op == "Parse" || op == "Bind" || op == "Execute"
+		e.dropStream()
+		e.staged, e.stagedMark = nil, 0
+		e.txnPrelude, e.txnTouched = nil, false
+		err = pgwire.Errorf(pgwire.CodeInternalError, "internal error while processing the statement; the session state was reset")
+	}()
+	return run()
+}
+
 // SimpleQuery implements pgwire.Executor.
 func (e *Executor) SimpleQuery(ctx context.Context, sql string, w pgwire.ResultWriter) error {
+	return e.guard("SimpleQuery", func() error { return e.simpleQuery(ctx, sql, w) })
+}
+
+func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultWriter) error {
 	pl, err := e.r.cfg.Planner.Plan(ctx, e.planSession(), sql)
 	if err != nil {
 		return err
@@ -462,6 +490,10 @@ func (e *Executor) releaseAsync() {
 
 // Parse implements pgwire.Executor: the message is buffered until Sync.
 func (e *Executor) Parse(ctx context.Context, name, sql string, paramOIDs []uint32) error {
+	return e.guard("Parse", func() error { return e.parse(ctx, name, sql, paramOIDs) })
+}
+
+func (e *Executor) parse(ctx context.Context, name, sql string, paramOIDs []uint32) error {
 	if e.batchFailed {
 		return nil
 	}
@@ -564,6 +596,10 @@ func (e *Executor) currentSnapshot() *snapshot.Snapshot {
 // the shard key parameters are known. A statement prepared against an
 // older snapshot is planned again first.
 func (e *Executor) Bind(ctx context.Context, portal, statement string, paramFormats []int16, params [][]byte, resultFormats []int16) error {
+	return e.guard("Bind", func() error { return e.bind(ctx, portal, statement, paramFormats, params, resultFormats) })
+}
+
+func (e *Executor) bind(ctx context.Context, portal, statement string, paramFormats []int16, params [][]byte, resultFormats []int16) error {
 	if e.batchFailed {
 		return nil
 	}
@@ -631,6 +667,10 @@ func (e *Executor) Describe(_ context.Context, kind pgwire.DescribeKind, name st
 
 // Execute implements pgwire.Executor.
 func (e *Executor) Execute(_ context.Context, portal string, maxRows int32, w pgwire.ResultWriter) error {
+	return e.guard("Execute", func() error { return e.execute(portal, maxRows, w) })
+}
+
+func (e *Executor) execute(portal string, maxRows int32, w pgwire.ResultWriter) error {
 	if e.batchFailed {
 		return nil
 	}
@@ -679,6 +719,10 @@ func (e *Executor) failBatch() {
 // Sync implements pgwire.Executor: it ships the buffered batch followed by
 // Sync and relays every response.
 func (e *Executor) Sync(ctx context.Context) error {
+	return e.guard("Sync", func() error { return e.sync(ctx) })
+}
+
+func (e *Executor) sync(ctx context.Context) error {
 	if e.batchFailed {
 		e.batchFailed = false
 		return nil
