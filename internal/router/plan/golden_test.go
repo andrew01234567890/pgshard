@@ -143,6 +143,11 @@ func golden() []want {
 		{sql: "insert into orders (id, tenant_id) values ($1, $2), ($3, $4)", kind: Refuse, msg: "multi-row INSERT spanning shards", values: map[int32]any{1: int64(1), 2: int64(1), 3: int64(2), 4: int64(2)}},
 		{sql: "select * from orders o join order_lines l on o.tenant_id = l.tenant_id where o.tenant_id = $1", kind: EqualUnique, shards: "k:1", values: map[int32]any{1: int64(1)}},
 		{sql: "select * from orders o, order_lines l where o.tenant_id = $1 and l.tenant_id = $2", kind: Refuse, msg: "cross-shard join", values: map[int32]any{1: int64(1), 2: int64(2)}},
+		{sql: "select * from orders o left join order_lines l on o.tenant_id = l.tenant_id and l.tenant_id = 7", kind: Refuse, msg: "cross-shard join"},
+		{sql: "select * from orders o right join order_lines l on o.tenant_id = l.tenant_id and o.tenant_id = 7", kind: Refuse, msg: "cross-shard join"},
+		{sql: "select * from orders o full join order_lines l on o.tenant_id = l.tenant_id and l.tenant_id in (7, 8)", kind: Refuse, msg: "cross-shard join"},
+		{sql: "select * from orders o left join order_lines l on o.tenant_id = l.tenant_id and l.tenant_id = 7 where o.tenant_id = 7", kind: EqualUnique, shards: "k:7"},
+		{sql: "select * from orders o inner join order_lines l on o.tenant_id = l.tenant_id and l.tenant_id = 7", kind: EqualUnique, shards: "k:7"},
 		{sql: "select * from orders where tenant_id = $1 and id = 1", kind: Refuse, msg: "parameter $1 cannot be a shard key", values: map[int32]any{1: nil}},
 
 		// INSERT rules.

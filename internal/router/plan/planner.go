@@ -150,6 +150,9 @@ type walker struct {
 	scatterBlockers []string
 	nested          bool
 	stmt            string
+	// outerQuals is set while walking the ON clause of an outer join: a key
+	// literal there filters only the inner side, so it must not pin the query.
+	outerQuals bool
 }
 
 func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
@@ -577,6 +580,11 @@ func (w *walker) fromItem(node *pgquerypb.Node) error {
 		if len(n.JoinExpr.GetUsingClause()) > 0 || n.JoinExpr.GetIsNatural() {
 			w.joinUsing(n.JoinExpr, w.rels[scope:])
 		}
+		if n.JoinExpr.GetJointype() != pgquerypb.JoinType_JOIN_INNER {
+			prev := w.outerQuals
+			w.outerQuals = true
+			defer func() { w.outerQuals = prev }()
+		}
 		return w.where(n.JoinExpr.GetQuals(), w.rels[scope:])
 	case *pgquerypb.Node_RangeSubselect:
 		w.blocker("subqueries")
@@ -684,12 +692,12 @@ func (w *walker) conjunct(node *pgquerypb.Node, scope []*rel) error {
 				unify(l, r)
 			}
 			return nil
-		case lok:
+		case lok && !w.outerQuals:
 			return w.term(l, ae.GetRexpr(), false)
-		case rok:
+		case rok && !w.outerQuals:
 			return w.term(r, ae.GetLexpr(), false)
 		}
-	case ae.GetKind() == pgquerypb.A_Expr_Kind_AEXPR_IN && op == "=":
+	case ae.GetKind() == pgquerypb.A_Expr_Kind_AEXPR_IN && op == "=" && !w.outerQuals:
 		if l, ok := w.keyColumn(ae.GetLexpr(), scope); ok {
 			return w.term(l, ae.GetRexpr(), true)
 		}
