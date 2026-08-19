@@ -56,12 +56,45 @@ type MigrationMeta struct {
 	// Roles carries the desired-state delta of role, membership, grant and
 	// setting statements.
 	Roles *RoleChanges `json:"roles,omitempty"`
+	// Steps is the ordered plan of a "multistep" migration; the applier
+	// runs them per shard, each under its own lock_timeout retry.
+	Steps []MigrationStep `json:"steps,omitempty"`
+}
+
+// MigrationStep is one statement of a multistep migration.
+type MigrationStep struct {
+	SQL string `json:"sql"`
+	// Concurrent steps run outside a transaction (CONCURRENTLY forms).
+	Concurrent bool `json:"concurrent,omitempty"`
+	// Skip is the check under which the step is already done.
+	Skip MigrationCheck `json:"skip,omitempty"`
+	// Index names the index a CREATE INDEX CONCURRENTLY step builds; an
+	// invalid leftover is dropped before the step runs and after it fails.
+	Index string `json:"index,omitempty"`
+	// OnFail runs after a hard failure of the step (drops the NOT VALID
+	// constraint a failed VALIDATE leaves behind) so a re-run is clean.
+	OnFail string `json:"on_fail,omitempty"`
+}
+
+// MigrationCheck is a catalog predicate on one shard.
+type MigrationCheck struct {
+	// Kind is "constraint" (exists), "constraint_valid", "notnull" (a
+	// not-null constraint on the column exists), "notnull_valid",
+	// "index_valid", "detached" (not a partition of Table
+	// any more) or "detach_pending" (detached or its detach is pending).
+	Kind   string `json:"kind,omitempty"`
+	Schema string `json:"schema,omitempty"`
+	Table  string `json:"table,omitempty"`
+	// Name is the constraint, column, index or partition the check is on.
+	Name string `json:"name,omitempty"`
 }
 
 // ShardMigration is one shard's entry in migrations.per_shard.
 type ShardMigration struct {
 	State    string `json:"state"`
 	Attempts int    `json:"attempts,omitempty"`
+	// Step is the index into meta.steps the shard is on (multistep).
+	Step     int    `json:"step,omitempty"`
 	Error    string `json:"error,omitempty"`
 	SQLState string `json:"sqlstate,omitempty"`
 }
@@ -88,16 +121,29 @@ type RowQuerier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
+// StrategyMultistep is the strategy of a migration driven by meta.steps.
+// The strategy column admits direct and concurrent only; a multistep
+// migration is stored as direct with its steps in meta and read back as
+// multistep, so the schema needs no change for it.
+const StrategyMultistep = "multistep"
+
 // EnqueueMigration inserts m as queued and returns its id.
 func EnqueueMigration(ctx context.Context, db RowQuerier, m DDLMigration) (string, error) {
 	meta, err := json.Marshal(m.Meta)
 	if err != nil {
 		return "", err
 	}
+	strategy := m.Strategy
+	if strategy == StrategyMultistep {
+		if len(m.Meta.Steps) == 0 {
+			return "", fmt.Errorf("catalog: enqueue migration: a multistep migration needs steps")
+		}
+		strategy = "direct"
+	}
 	var id string
 	err = db.QueryRow(ctx, `INSERT INTO pgshard.migrations (id, database, statement, kind, strategy, scope, home_shard, meta, state)
 		VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, 'queued') RETURNING id::text`,
-		m.Database, m.Statement, m.Kind, m.Strategy, m.Scope, m.HomeShard, meta).Scan(&id)
+		m.Database, m.Statement, m.Kind, strategy, m.Scope, m.HomeShard, meta).Scan(&id)
 	if err != nil {
 		return "", fmt.Errorf("catalog: enqueue migration: %w", err)
 	}
@@ -142,6 +188,9 @@ func collectMigrations(rows pgx.Rows) ([]DDLMigration, error) {
 		}
 		if err := json.Unmarshal(meta, &m.Meta); err != nil {
 			return nil, fmt.Errorf("catalog: migration %s meta: %w", m.ID, err)
+		}
+		if len(m.Meta.Steps) > 0 {
+			m.Strategy = StrategyMultistep
 		}
 		m.PerShard = map[string]ShardMigration{}
 		if err := json.Unmarshal(perShard, &m.PerShard); err != nil {

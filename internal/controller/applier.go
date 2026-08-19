@@ -364,10 +364,36 @@ func (a *Applier) targets(ctx context.Context, m catalog.DDLMigration) ([]int32,
 	return ids, nil
 }
 
-// applyOn runs one shard step, retrying lock and connection failures with
-// backoff, and returns the shard's final entry.
+// applyOn drives one shard to its final entry: a single statement, or the
+// steps of a multistep migration one after the other, each retried on lock
+// and connection failures with backoff.
 func (a *Applier) applyOn(ctx context.Context, logger *slog.Logger, m *catalog.DDLMigration, key string, id int32, s catalog.ShardMigration) catalog.ShardMigration {
-	resumed := s.State == catalog.ShardRunning || s.State == catalog.ShardRetrying
+	if m.Strategy != "multistep" {
+		resumed := s.State == catalog.ShardRunning || s.State == catalog.ShardRetrying
+		return a.retrying(ctx, logger, m, key, id, s, func() (string, error) {
+			defer func() { resumed = true }()
+			return a.step(ctx, m, key, id, resumed)
+		})
+	}
+	steps := m.Meta.Steps
+	for s.Step < len(steps) {
+		st := steps[s.Step]
+		s = a.retrying(ctx, logger, m, key, id, s, func() (string, error) { return a.runStep(ctx, m, id, st) })
+		if s.State != catalog.ShardApplied {
+			return s
+		}
+		s.Step++
+		m.PerShard[key] = s
+		if err := a.Store.Save(ctx, *m); err != nil {
+			logger.Warn("progress not saved", "err", err)
+		}
+	}
+	return s
+}
+
+// retrying runs one shard step until it ends, retrying transient failures
+// with backoff, and returns the shard's entry.
+func (a *Applier) retrying(ctx context.Context, logger *slog.Logger, m *catalog.DDLMigration, key string, id int32, s catalog.ShardMigration, run func() (string, error)) catalog.ShardMigration {
 	b := a.backoff()
 	start, wait := a.now(), b.Min
 	for {
@@ -377,8 +403,7 @@ func (a *Applier) applyOn(ctx context.Context, logger *slog.Logger, m *catalog.D
 		if err := a.Store.Save(ctx, *m); err != nil {
 			logger.Warn("progress not saved", "err", err)
 		}
-		outcome, err := a.step(ctx, m, key, id, resumed)
-		resumed = true
+		outcome, err := run()
 		if err == nil {
 			s.State, s.Error, s.SQLState = outcome, "", ""
 			return s
@@ -394,12 +419,12 @@ func (a *Applier) applyOn(ctx context.Context, logger *slog.Logger, m *catalog.D
 		}
 		if !transient(err) {
 			s.State = catalog.ShardFailed
-			logger.Warn("shard step failed", "shard", id, "err", err)
+			logger.Warn("shard step failed", "shard", id, "step", s.Step, "err", err)
 			return s
 		}
 		if a.now().Sub(start) >= b.Total {
 			s.State = catalog.ShardFailed
-			logger.Warn("shard step gave up", "shard", id, "attempts", s.Attempts, "err", err)
+			logger.Warn("shard step gave up", "shard", id, "step", s.Step, "attempts", s.Attempts, "err", err)
 			return s
 		}
 		s.State = catalog.ShardRetrying
@@ -407,7 +432,7 @@ func (a *Applier) applyOn(ctx context.Context, logger *slog.Logger, m *catalog.D
 		if err := a.Store.Save(ctx, *m); err != nil {
 			logger.Warn("progress not saved", "err", err)
 		}
-		logger.Info("shard step retrying", "shard", id, "attempt", s.Attempts, "wait", wait, "err", err)
+		logger.Info("shard step retrying", "shard", id, "step", s.Step, "attempt", s.Attempts, "wait", wait, "err", err)
 		if err := a.sleep(ctx, wait); err != nil {
 			return s
 		}
@@ -571,6 +596,96 @@ func (a *Applier) provisionDDLRole(ctx context.Context, id int32, runAs string) 
 		return "", fmt.Errorf("granting %s to %s: %w", runAs, a.ddlRole(), err)
 	}
 	return a.ddlPassword, nil
+}
+
+// runStep executes one step of a multistep migration on one shard. The
+// step is skipped when its check says it already happened; a CREATE INDEX
+// CONCURRENTLY step drops an invalid leftover before running, rebuilds
+// once on failure and leaves no invalid index behind; a step with OnFail
+// runs it after a hard failure so a re-run starts clean.
+func (a *Applier) runStep(ctx context.Context, m *catalog.DDLMigration, id int32, st catalog.MigrationStep) (string, error) {
+	conn, err := a.prepare(ctx, m, shardKey(id), id, m.Database)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	done, err := checkHolds(ctx, conn, st.Skip)
+	if err != nil {
+		return "", err
+	}
+	if done {
+		return catalog.ShardApplied, nil
+	}
+	run := func() error {
+		if st.Concurrent {
+			_, err := conn.Exec(ctx, st.SQL)
+			return err
+		}
+		return inTransaction(ctx, conn, st.SQL)
+	}
+	if st.Index != "" {
+		idx := catalog.MigrationObject{Kind: "relation", Schema: st.Skip.Schema, Name: st.Index}
+		if _, err := dropInvalidIndex(ctx, conn, idx); err != nil {
+			return "", err
+		}
+		err = run()
+		if err != nil && !transient(err) && ctx.Err() == nil {
+			if _, derr := dropInvalidIndex(ctx, conn, idx); derr == nil {
+				err = run()
+			}
+		}
+		if err != nil && ctx.Err() == nil {
+			_, _ = dropInvalidIndex(context.WithoutCancel(ctx), conn, idx)
+		}
+	} else {
+		err = run()
+	}
+	if err != nil {
+		if st.OnFail != "" && !transient(err) && ctx.Err() == nil {
+			_, _ = conn.Exec(context.WithoutCancel(ctx), st.OnFail)
+		}
+		return "", err
+	}
+	return catalog.ShardApplied, nil
+}
+
+// checkHolds evaluates a step's skip predicate on the shard.
+func checkHolds(ctx context.Context, conn ShardConn, c catalog.MigrationCheck) (bool, error) {
+	const rel = `SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.relname = $1 AND ($2 = '' AND n.nspname = ANY (current_schemas(false)) OR n.nspname = $2)`
+	var sql string
+	switch c.Kind {
+	case "":
+		return false, nil
+	case "constraint":
+		sql = `SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = $3 AND conrelid = (` + rel + `))`
+	case "constraint_valid":
+		sql = `SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = $3 AND convalidated AND conrelid = (` + rel + `))`
+	case "notnull":
+		sql = `SELECT EXISTS (SELECT 1 FROM pg_constraint k JOIN pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = ANY (k.conkey)
+			WHERE k.contype = 'n' AND a.attname = $3 AND k.conrelid = (` + rel + `))`
+	case "notnull_valid":
+		sql = `SELECT EXISTS (SELECT 1 FROM pg_constraint k JOIN pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = ANY (k.conkey)
+			WHERE k.contype = 'n' AND k.convalidated AND a.attname = $3 AND k.conrelid = (` + rel + `))`
+	case "index_valid":
+		rows, err := conn.Query(ctx, `SELECT EXISTS (SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE i.indisvalid AND c.relname = $1 AND ($2 = '' AND n.nspname = ANY (current_schemas(false)) OR n.nspname = $2))`, c.Name, c.Schema)
+		if err != nil {
+			return false, err
+		}
+		return pgx.CollectOneRow(rows, pgx.RowTo[bool])
+	case "detached":
+		sql = `SELECT NOT EXISTS (SELECT 1 FROM pg_inherits h JOIN pg_class p ON p.oid = h.inhrelid WHERE p.relname = $3 AND h.inhparent = (` + rel + `))`
+	case "detach_pending":
+		sql = `SELECT NOT EXISTS (SELECT 1 FROM pg_inherits h JOIN pg_class p ON p.oid = h.inhrelid WHERE p.relname = $3 AND NOT h.inhdetachpending AND h.inhparent = (` + rel + `))`
+	default:
+		return false, fmt.Errorf("unknown step check %q", c.Kind)
+	}
+	rows, err := conn.Query(ctx, sql, c.Table, c.Schema, c.Name)
+	if err != nil {
+		return false, err
+	}
+	return pgx.CollectOneRow(rows, pgx.RowTo[bool])
 }
 
 // outsideTransaction lists the kinds PostgreSQL refuses inside a

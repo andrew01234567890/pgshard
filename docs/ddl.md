@@ -19,8 +19,8 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
 1. **Classify.** The router parses the statement (`internal/router/plan/ddl.go`)
    and produces `kind` (also the command tag: `CREATE TABLE`, `GRANT`, …),
    `strategy` (`direct` inside a per-shard transaction, `concurrent` outside
-   one for `CREATE/DROP INDEX CONCURRENTLY` and `REINDEX CONCURRENTLY`), and
-   `scope`:
+   one, `multistep` for a plan of several statements — see *Strategies*
+   below), and `scope`:
 
    | Statement | Scope |
    |---|---|
@@ -36,6 +36,30 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
    it by schema and name). One statement cannot mix sharded and unsharded
    tables (`DROP TABLE a, b`, `GRANT … ON a, b`).
 
+   **Strategies.** Forms that would hold a strong lock for the length of a
+   table scan or an index build are rewritten so no step takes a long
+   `ACCESS EXCLUSIVE`/`SHARE ROW EXCLUSIVE` lock; the client sends the plain
+   statement and gets the plain tag back. Steps live in `meta.steps` and
+   are run per shard in order, each under its own `lock_timeout` retry:
+
+   | Statement | Strategy | What runs on each shard |
+   |---|---|---|
+   | `ADD CONSTRAINT … CHECK (…)` | multistep | `ADD CONSTRAINT <name> CHECK (…) NOT VALID` (brief `ACCESS EXCLUSIVE`), then `VALIDATE CONSTRAINT` (`SHARE UPDATE EXCLUSIVE`) |
+   | `ADD CONSTRAINT … FOREIGN KEY … REFERENCES t` | multistep | same `NOT VALID` + `VALIDATE` pair; only when the referenced rows are co-located: a sharded table may reference a reference table or a sharded table by mapping its shard key onto the referenced shard key, an unsharded table may not reference a sharded one, a reference table only another reference table; otherwise `0A000 cross-shard foreign key` |
+   | `ALTER COLUMN c SET NOT NULL` (PostgreSQL 18+) | multistep | `ADD CONSTRAINT <table>_<c>_not_null NOT NULL c NOT VALID`, then `VALIDATE CONSTRAINT`; the validated not-null constraint is the column's `NOT NULL` |
+   | `ADD PRIMARY KEY (cols)` / `ADD [CONSTRAINT n] UNIQUE (cols)` | multistep | for a primary key, the `SET NOT NULL` pair for every column first; `CREATE UNIQUE INDEX CONCURRENTLY <name> ON t (cols)`; `ADD CONSTRAINT <name> PRIMARY KEY/UNIQUE USING INDEX <name>` (`DEFERRABLE`, `INCLUDE`, `NULLS NOT DISTINCT` carried; `WITH (…)`, `USING INDEX TABLESPACE` and `WITHOUT OVERLAPS` forms stay direct). The shard-key rule applies as before |
+   | `REINDEX INDEX/TABLE/SCHEMA/DATABASE` | concurrent | `REINDEX (CONCURRENTLY) …`; `REINDEX SYSTEM` stays direct |
+   | `DROP INDEX name` (one index, no `CASCADE`) | concurrent | `DROP INDEX CONCURRENTLY name` |
+   | `DETACH PARTITION p` | multistep | `DETACH PARTITION p CONCURRENTLY`, then `DETACH PARTITION p FINALIZE` (a no-op unless a crash left the detach pending) |
+   | `ADD COLUMN … DEFAULT <constant>`, `GENERATED ALWAYS AS (…) VIRTUAL`, `DROP COLUMN`, `… NOT VALID` forms, `CONCURRENTLY` forms | direct / concurrent | as written |
+
+   Constraint and index names the client left out are chosen by the router
+   in PostgreSQL's shape (`<table>_<cols>_check`, `_fkey`, `_not_null`,
+   `_key`, `<table>_pkey`), deterministically and at most 63 bytes (an
+   over-long name keeps a prefix plus an 8-hex hash), so every shard ends up
+   with the same name. An `ALTER TABLE` with several actions of which one
+   needs steps is refused (`0A000`): run that action as its own statement.
+
 2. **Refuse what cannot be applied online.** `0A000`:
    * DDL inside a transaction block — each shard commits its own
      transaction; the fan-out cannot be rolled back with the client's.
@@ -44,9 +68,10 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
      `ADD COLUMN … GENERATED AS IDENTITY`, `ADD COLUMN … serial`,
      `ADD COLUMN … GENERATED … STORED`): these rewrite the table under an
      exclusive lock and wait for online schema change (M8). Metadata-only
-     and weaker-lock forms (`ADD COLUMN` with a constant or stable default
-     such as `now()`/`CURRENT_TIMESTAMP`, `DROP COLUMN`, `ADD CONSTRAINT`,
-     `SET NOT NULL`, …) are applied.
+     forms (`ADD COLUMN` with a constant or stable default such as
+     `now()`/`CURRENT_TIMESTAMP`, `DROP COLUMN`, …) are applied as written;
+     constraint, index and partition work takes the weaker-lock strategies
+     above.
    * `TRUNCATE`, `LOCK`, `VACUUM`, `COPY` on sharded/reference tables and
      `CREATE TABLE AS` over them (not migrations; still refused).
    * Roles with `SUPERUSER`, `REPLICATION` or `BYPASSRLS` (they would apply
@@ -82,6 +107,21 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
      transaction; when `CREATE INDEX CONCURRENTLY` fails and leaves an
      invalid index (`pg_index.indisvalid = false`) the index is dropped
      concurrently and the statement run once more before the shard fails.
+   * `multistep`: `meta.steps` in order; each step runs in its own
+     transaction (or outside one when it is a `CONCURRENTLY` form) under the
+     same `lock_timeout` retry, and `per_shard.<shard>.step` records the
+     step the shard is on. Every step is idempotent for crash-resume: it is
+     skipped when its `skip` check already holds on the shard (`constraint`
+     exists, `constraint_valid`, a `notnull` constraint on the column
+     exists / is `notnull_valid`, `index_valid`, partition `detached` or
+     its `detach_pending`). A `CREATE UNIQUE INDEX CONCURRENTLY` step drops
+     an invalid leftover before it runs, rebuilds once when the build fails
+     and drops the invalid index again before the shard fails, so no invalid
+     index is left behind. A `VALIDATE CONSTRAINT` that fails (a row
+     violates the constraint, `23502`/`23503`/`23514`) drops the `NOT VALID`
+     constraint on that shard before the shard fails, so the statement can
+     be re-run as is once the rows are fixed; shards already applied stay
+     applied and are skipped by the checks on the re-run.
    * `CREATE`/`DROP DATABASE` and role statements run outside a transaction
      against the maintenance database; everything else against the
      migration's database.
@@ -149,7 +189,14 @@ fails on that shard only.
 ```sql
 SELECT id, kind, state, scope, per_shard, error, created_at, finished_at
 FROM pgshard.migrations ORDER BY created_at DESC LIMIT 20;
+-- the steps of a multistep migration and the step each shard is on
+SELECT id, jsonb_path_query_array(meta, '$.steps[*].sql') AS steps, per_shard
+FROM pgshard.migrations WHERE meta ? 'steps' ORDER BY created_at DESC LIMIT 5;
 ```
+
+The `strategy` column of the row stays `direct` for a multistep migration;
+`meta.steps` being present is what makes it one (the catalog readers
+report `multistep`).
 
 The controller applies migrations only when started with `--shard-dsn` or
 `--shard-dsn-template` (the same DSNs the transaction resolver uses); those

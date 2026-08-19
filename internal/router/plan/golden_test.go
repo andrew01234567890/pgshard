@@ -327,7 +327,7 @@ func golden() []want {
 		{sql: "drop table orders", kind: MigrationKind, mig: "DROP TABLE all"},
 		{sql: "drop table public.orders, items", kind: Refuse, msg: "one DDL statement cannot touch both sharded and unsharded tables"},
 		{sql: "drop table items, docs", kind: Refuse, msg: "one DDL statement cannot touch both sharded and unsharded tables"},
-		{sql: "drop index orders_idx", kind: MigrationKind, mig: "DROP INDEX existing"},
+		{sql: "drop index orders_idx", kind: MigrationKind, mig: "DROP INDEX existing concurrent"},
 		{sql: "truncate orders", kind: Refuse, msg: "TRUNCATE on sharded and reference tables is not available yet"},
 		{sql: "truncate items, orders", kind: Refuse, msg: "TRUNCATE on sharded and reference tables is not available yet"},
 		{sql: "vacuum orders", kind: Refuse, msg: "VACUUM and ANALYZE on sharded and reference tables is not available yet"},
@@ -435,8 +435,8 @@ func migrationShape(pl Plan) string {
 		return ""
 	}
 	out := m.Kind + " " + m.Scope
-	if m.Strategy == StrategyConcurrent {
-		out += " concurrent"
+	if m.Strategy != StrategyDirect {
+		out += " " + m.Strategy
 	}
 	return out
 }

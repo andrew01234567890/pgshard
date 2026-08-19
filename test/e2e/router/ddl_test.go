@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -58,6 +60,8 @@ func startDDLStack(tb testing.TB) *ddlStack {
 		`INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES ('default', 0, '[,-3000000000000000000)'), ('default', 1, '[-3000000000000000000,3000000000000000000)'), ('default', 2, '[3000000000000000000,)')`,
 		`INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('app', 'public', 'orders', 'sharded', 'tenant_id')`,
 		`INSERT INTO pgshard.table_status (database, schema_name, table_name, effective_placement, effective_shard_key) VALUES ('app', 'public', 'orders', 'sharded', 'tenant_id')`,
+		`INSERT INTO pgshard.tables (database, schema_name, table_name, placement) VALUES ('app', 'public', 'regions', 'reference')`,
+		`INSERT INTO pgshard.table_status (database, schema_name, table_name, effective_placement) VALUES ('app', 'public', 'regions', 'reference')`,
 	} {
 		if _, err := cat.Exec(ctx, sql); err != nil {
 			tb.Fatalf("%s: %v", sql, err)
@@ -409,6 +413,279 @@ func TestRouterDDLMigrations(t *testing.T) {
 		}
 		if got := s.onShards(t, "select not exists (select 1 from pg_roles where rolname = 'analyst')"); !allTrue(got) {
 			t.Fatalf("role dropped per shard: %v", got)
+		}
+	})
+	t.Run("online_steps", func(t *testing.T) { testOnlineSteps(t, s, conn, top) })
+
+}
+
+// workload runs readers and writers against orders through the router
+// while DDL is applied and reports the slowest statement and any error.
+var workloadSeq atomic.Int64
+
+type workload struct {
+	stop    chan struct{}
+	done    chan struct{}
+	mu      sync.Mutex
+	slowest time.Duration
+	errs    []error
+	n       int
+}
+
+func startWorkload(tb testing.TB, s *ddlStack) *workload {
+	tb.Helper()
+	w := &workload{stop: make(chan struct{}), done: make(chan struct{})}
+	ctx := context.Background()
+	var conns []*pgx.Conn
+	for i := 0; i < 3; i++ {
+		conns = append(conns, s.connect(tb))
+	}
+	go func() {
+		defer close(w.done)
+		i := 0
+		for {
+			select {
+			case <-w.stop:
+				return
+			default:
+			}
+			i++
+			seq := int(workloadSeq.Add(1))
+			// One tenant per connection keeps a session on one shard.
+			tenant := int64(i%3 + 1)
+			var sql string
+			var args []any
+			switch i % 3 {
+			case 0:
+				sql, args = "insert into orders (tenant_id, id, note, region) values ($1, $2, 'w', 1)", []any{tenant, 100000 + seq}
+			case 1:
+				sql, args = "select count(*) from orders where tenant_id = $1", []any{tenant}
+			default:
+				sql, args = "update orders set note = 'u' where tenant_id = $1 and id = $2", []any{tenant, 100000 + seq - 2}
+			}
+			start := time.Now()
+			_, err := conns[i%3].Exec(ctx, sql, args...)
+			d := time.Since(start)
+			w.mu.Lock()
+			w.n++
+			if d > w.slowest {
+				w.slowest = d
+			}
+			if err != nil && len(w.errs) < 5 {
+				w.errs = append(w.errs, fmt.Errorf("%s: %w", sql, err))
+			}
+			w.mu.Unlock()
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+	return w
+}
+
+func (w *workload) finish(tb testing.TB) {
+	tb.Helper()
+	close(w.stop)
+	<-w.done
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.errs) > 0 {
+		tb.Fatalf("workload errors (%d statements): %v", w.n, w.errs)
+	}
+	if w.slowest > 2*time.Second {
+		tb.Fatalf("a workload statement waited %s behind DDL", w.slowest)
+	}
+	if w.n < 20 {
+		tb.Fatalf("workload ran only %d statements", w.n)
+	}
+	tb.Logf("workload: %d statements, slowest %s", w.n, w.slowest)
+}
+
+func testOnlineSteps(t *testing.T, s *ddlStack, conn *pgx.Conn, top *testing.T) {
+	ctx := context.Background()
+	for _, sql := range []string{
+		"create table regions (id int primary key, name text)",
+		"alter table orders add column region int",
+		"alter table orders add column amount int default 1",
+	} {
+		if _, err := conn.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v\ncontroller log:\n%s", sql, err, s.controllerLog.String())
+		}
+	}
+	for id := 0; id < 3; id++ {
+		sc := s.shardConn(t, id)
+		for _, sql := range []string{
+			"insert into regions values (1, 'eu'), (2, 'us')",
+			"insert into orders (tenant_id, id, note, region) select t, i, 'seed', 1 + i % 2 from generate_series(1, 7) t, generate_series(1, 300) i on conflict do nothing",
+		} {
+			if _, err := sc.Exec(ctx, sql); err != nil {
+				t.Fatalf("shard %d: %s: %v", id, sql, err)
+			}
+		}
+	}
+
+	t.Run("check_constraint_is_added_not_valid_then_validated", func(t *testing.T) {
+		w := startWorkload(t, s)
+		_, err := conn.Exec(ctx, "alter table orders add check (amount >= 0)")
+		w.finish(t)
+		if err != nil {
+			t.Fatalf("%v\ncontroller log:\n%s", err, s.controllerLog.String())
+		}
+		if got := s.onShards(t, "select convalidated from pg_constraint where conname = 'orders_amount_check'"); !allTrue(got) {
+			t.Fatalf("validated per shard: %v", got)
+		}
+		r := s.migration(t, "statement like '%amount >= 0%'")
+		if r.state != "complete" || !strings.Contains(r.perShard, `"step": 2`) {
+			t.Fatalf("migration %+v", r)
+		}
+		var steps int
+		cat, err := pgx.Connect(ctx, s.catalogDSN)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = cat.Close(ctx) }()
+		if err := cat.QueryRow(ctx, "select jsonb_array_length(meta->'steps') from pgshard.migrations where statement like '%amount >= 0%'").Scan(&steps); err != nil || steps != 2 {
+			t.Fatalf("steps %d %v", steps, err)
+		}
+	})
+
+	t.Run("set_not_null_fails_on_a_violating_row_and_leaves_no_constraint", func(t *testing.T) {
+		if _, err := s.shardConn(t, 1).Exec(ctx, "insert into orders (tenant_id, id, note) values (2, 999999, null)"); err != nil {
+			t.Fatal(err)
+		}
+		_, err := conn.Exec(ctx, "alter table orders alter column region set not null")
+		if sqlstate(err) != "23502" {
+			t.Fatalf("expected 23502, got %v\ncontroller log:\n%s", err, s.controllerLog.String())
+		}
+		if got := s.onShards(t, "select coalesce((select convalidated from pg_constraint where conname = 'orders_region_not_null'), false)"); fmt.Sprint(got) != "[true false false]" {
+			t.Fatalf("constraint valid on shard 0, dropped on the failing shard 1, never added on shard 2: %v", got)
+		}
+		for id := 0; id < 3; id++ {
+			if _, err := s.shardConn(t, id).Exec(ctx, "update orders set region = 1 where region is null"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		w := startWorkload(t, s)
+		_, err = conn.Exec(ctx, "alter table orders alter column region set not null")
+		w.finish(t)
+		if err != nil {
+			t.Fatalf("%v\ncontroller log:\n%s", err, s.controllerLog.String())
+		}
+		if got := s.onShards(t, "select attnotnull and (select convalidated from pg_constraint where conname = 'orders_region_not_null') from pg_attribute where attrelid = 'orders'::regclass and attname = 'region'"); !allTrue(got) {
+			t.Fatalf("column not null per shard: %v", got)
+		}
+	})
+
+	t.Run("foreign_key_to_a_reference_table_and_unique_via_concurrent_index", func(t *testing.T) {
+		w := startWorkload(t, s)
+		_, err := conn.Exec(ctx, "alter table orders add foreign key (region) references regions (id)")
+		if err == nil {
+			_, err = conn.Exec(ctx, "alter table orders add constraint orders_tid unique (tenant_id, id)")
+		}
+		w.finish(t)
+		if err != nil {
+			t.Fatalf("%v\ncontroller log:\n%s", err, s.controllerLog.String())
+		}
+		if got := s.onShards(t, "select convalidated from pg_constraint where conname = 'orders_region_fkey'"); !allTrue(got) {
+			t.Fatalf("fk validated per shard: %v", got)
+		}
+		if got := s.onShards(t, "select exists (select 1 from pg_constraint where conname = 'orders_tid' and contype = 'u') and (select indisvalid from pg_index where indexrelid = 'orders_tid'::regclass)"); !allTrue(got) {
+			t.Fatalf("unique constraint per shard: %v", got)
+		}
+		_, err = conn.Exec(ctx, "alter table orders add foreign key (id) references notes (id)")
+		if sqlstate(err) != "0A000" || !strings.Contains(err.Error(), "cross-shard foreign key") {
+			t.Fatalf("cross-shard fk: %v\nmigration: %+v", err, s.migration(t, "statement like '%references notes%'"))
+		}
+	})
+
+	t.Run("reindex_and_drop_index_run_concurrently", func(t *testing.T) {
+		w := startWorkload(t, s)
+		_, err := conn.Exec(ctx, "reindex table orders")
+		if err == nil {
+			_, err = conn.Exec(ctx, "drop index orders_id")
+		}
+		w.finish(t)
+		if err != nil {
+			t.Fatalf("%v\ncontroller log:\n%s", err, s.controllerLog.String())
+		}
+		if got := s.onShards(t, "select to_regclass('orders_id') is null"); !allTrue(got) {
+			t.Fatalf("index dropped per shard: %v", got)
+		}
+		cat, err := pgx.Connect(ctx, s.catalogDSN)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = cat.Close(ctx) }()
+		var stmts []string
+		rows, err := cat.Query(ctx, "select statement from pgshard.migrations where strategy = 'concurrent' and (kind = 'REINDEX' or statement like 'DROP INDEX%') order by created_at")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stmts, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
+			t.Fatal(err)
+		}
+		if fmt.Sprint(stmts) != "[REINDEX (CONCURRENTLY) TABLE orders DROP INDEX CONCURRENTLY orders_id]" {
+			t.Fatalf("concurrent statements %q", stmts)
+		}
+	})
+
+	t.Run("detach_partition_concurrently", func(t *testing.T) {
+		for _, sql := range []string{
+			"create table ev (k int) partition by list (k)",
+			"create table ev1 partition of ev for values in (1)",
+			"alter table ev detach partition ev1",
+		} {
+			if _, err := conn.Exec(ctx, sql); err != nil {
+				t.Fatalf("%s: %v\ncontroller log:\n%s", sql, err, s.controllerLog.String())
+			}
+		}
+		var attached bool
+		if err := s.shardConn(t, 0).QueryRow(ctx, "select exists (select 1 from pg_inherits where inhrelid = 'ev1'::regclass)").Scan(&attached); err != nil || attached {
+			t.Fatalf("ev1 still attached: %v %v", attached, err)
+		}
+		r := s.migration(t, "statement like '%detach partition%'")
+		if r.state != "complete" || !strings.Contains(r.perShard, `"step": 2`) {
+			t.Fatalf("migration %+v", r)
+		}
+	})
+
+	t.Run("controller_killed_mid_steps_resumes_at_the_step", func(t *testing.T) {
+		holder := s.shardConn(t, 2)
+		held := make(chan error, 1)
+		go func() {
+			_, err := holder.Exec(ctx, "begin; select count(*) from orders; select pg_sleep(6); commit")
+			held <- err
+		}()
+		time.Sleep(500 * time.Millisecond)
+		if _, err := conn.Exec(ctx, "set pgshard.ddl_async = on"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Exec(ctx, "alter table orders add constraint amount_small check (amount < 1000000)"); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(20 * time.Second)
+		var seen []string
+		for {
+			r := s.migration(t, "statement like '%amount_small%'")
+			seen = append(seen, r.perShard)
+			if strings.Contains(r.perShard, `"2": {"error": "ERROR: canceling statement due to lock timeout (SQLSTATE 55P03)", "state": "retrying"`) && strings.Count(r.perShard, `"step": 2`) == 2 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("migration never reached the retrying shard: %+v\nseen: %s", r, strings.Join(seen, "\n"))
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		s.killController()
+		s.startController(top)
+		r := s.awaitMigration(t, "statement like '%amount_small%'")
+		if r.state != "complete" || strings.Count(r.perShard, `"step": 2`) != 3 {
+			t.Fatalf("after restart: %+v\ncontroller log:\n%s", r, s.controllerLog.String())
+		}
+		<-held
+		if got := s.onShards(t, "select count(*) = 1 from pg_constraint where conname = 'amount_small' and convalidated"); !allTrue(got) {
+			t.Fatalf("constraint validated exactly once per shard: %v", got)
+		}
+		if _, err := conn.Exec(ctx, "reset pgshard.ddl_async"); err != nil {
+			t.Fatal(err)
 		}
 	})
 }
