@@ -193,7 +193,7 @@ func TestRouterShardedRouting(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, err = tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 201)", t1)
-		if sqlstate(err) != "0A000" || !strings.Contains(err.Error(), "multi-shard transactions are not available yet") {
+		if sqlstate(err) != "0A000" || !strings.Contains(err.Error(), "cannot take part in a multi-shard transaction") {
 			t.Fatalf("second shard inside a transaction: %v", err)
 		}
 		if err := tx.Commit(ctx); err != nil {
