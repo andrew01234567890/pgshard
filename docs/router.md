@@ -605,4 +605,14 @@ new connections are refused, the process exits) and fences shard 0 in the
 catalog (`update pgshard.shard_status set serving_state`) to show a select
 held for the fence and a `40001` inside an open transaction. `PGSHARD_BENCH_ROUTER=1 go test -tags integration -bench
 RouterSelect1 ./test/e2e/router/` compares `select 1` through the router with
-a direct connection.
+a direct connection. `TestRouterVStream` and
+`TestRouterVStreamFailoverContinuity` start a controller and a router with
+`--vstream-listen`/`--controller` on the two-shard stack (poolers with
+`--stream-dsn`): the first creates a two-phase stream, inserts through the
+router including a 2PC transaction, consumes with a consumer killed and
+resumed from its last VGtid (every id exactly once, Prepare/CommitPrepared
+on both shards), acks and checks `confirmed_flush_lsn`, then drops the
+stream; the second clones shard 1 into a slot-synchronizing standby, waits
+for the failover slot to be synced and persistent, promotes it, publishes
+the new pooler with a higher epoch and shows the stream continuing on the
+promoted standby with no gap. See [streams.md](streams.md).

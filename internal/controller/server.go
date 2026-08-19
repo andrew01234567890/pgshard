@@ -21,6 +21,8 @@ type Server struct {
 	Resolver *Resolver
 	// Barrier serves CreateBarrier; nil answers Unimplemented.
 	Barrier *Barrier
+	// Streams serves CreateStream/DropStream; nil answers Unimplemented.
+	Streams *StreamAdmin
 }
 
 // CreateBarrier runs one barrier to completion.

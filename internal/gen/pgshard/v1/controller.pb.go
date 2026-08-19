@@ -1550,6 +1550,283 @@ func (x *ListRoleStatusResponse) GetStatuses() []*RoleStatus {
 	return nil
 }
 
+// CreateStreamRequest registers a change stream.
+type CreateStreamRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Stream name: [a-z][a-z0-9_]{0,31}.
+	Stream string `protobuf:"bytes,1,opt,name=stream,proto3" json:"stream,omitempty"`
+	// Logical database the slots decode.
+	Database string `protobuf:"bytes,2,opt,name=database,proto3" json:"database,omitempty"`
+	TwoPhase bool   `protobuf:"varint,3,opt,name=two_phase,json=twoPhase,proto3" json:"two_phase,omitempty"`
+	// Shard set whose shards get a slot; empty means default.
+	ShardSet      string `protobuf:"bytes,4,opt,name=shard_set,json=shardSet,proto3" json:"shard_set,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CreateStreamRequest) Reset() {
+	*x = CreateStreamRequest{}
+	mi := &file_pgshard_v1_controller_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CreateStreamRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CreateStreamRequest) ProtoMessage() {}
+
+func (x *CreateStreamRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_controller_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CreateStreamRequest.ProtoReflect.Descriptor instead.
+func (*CreateStreamRequest) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_controller_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *CreateStreamRequest) GetStream() string {
+	if x != nil {
+		return x.Stream
+	}
+	return ""
+}
+
+func (x *CreateStreamRequest) GetDatabase() string {
+	if x != nil {
+		return x.Database
+	}
+	return ""
+}
+
+func (x *CreateStreamRequest) GetTwoPhase() bool {
+	if x != nil {
+		return x.TwoPhase
+	}
+	return false
+}
+
+func (x *CreateStreamRequest) GetShardSet() string {
+	if x != nil {
+		return x.ShardSet
+	}
+	return ""
+}
+
+// CreateStreamResponse reports the slot of every shard.
+type CreateStreamResponse struct {
+	state         protoimpl.MessageState       `protogen:"open.v1"`
+	Slots         []*CreateStreamResponse_Slot `protobuf:"bytes,1,rep,name=slots,proto3" json:"slots,omitempty"`
+	Error         *Error                       `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CreateStreamResponse) Reset() {
+	*x = CreateStreamResponse{}
+	mi := &file_pgshard_v1_controller_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CreateStreamResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CreateStreamResponse) ProtoMessage() {}
+
+func (x *CreateStreamResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_controller_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CreateStreamResponse.ProtoReflect.Descriptor instead.
+func (*CreateStreamResponse) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_controller_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *CreateStreamResponse) GetSlots() []*CreateStreamResponse_Slot {
+	if x != nil {
+		return x.Slots
+	}
+	return nil
+}
+
+func (x *CreateStreamResponse) GetError() *Error {
+	if x != nil {
+		return x.Error
+	}
+	return nil
+}
+
+// DropStreamRequest drops a change stream.
+type DropStreamRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Stream        string                 `protobuf:"bytes,1,opt,name=stream,proto3" json:"stream,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DropStreamRequest) Reset() {
+	*x = DropStreamRequest{}
+	mi := &file_pgshard_v1_controller_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DropStreamRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DropStreamRequest) ProtoMessage() {}
+
+func (x *DropStreamRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_controller_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DropStreamRequest.ProtoReflect.Descriptor instead.
+func (*DropStreamRequest) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_controller_proto_rawDescGZIP(), []int{25}
+}
+
+func (x *DropStreamRequest) GetStream() string {
+	if x != nil {
+		return x.Stream
+	}
+	return ""
+}
+
+// DropStreamResponse reports the outcome.
+type DropStreamResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Error         *Error                 `protobuf:"bytes,1,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DropStreamResponse) Reset() {
+	*x = DropStreamResponse{}
+	mi := &file_pgshard_v1_controller_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DropStreamResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DropStreamResponse) ProtoMessage() {}
+
+func (x *DropStreamResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_controller_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DropStreamResponse.ProtoReflect.Descriptor instead.
+func (*DropStreamResponse) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_controller_proto_rawDescGZIP(), []int{26}
+}
+
+func (x *DropStreamResponse) GetError() *Error {
+	if x != nil {
+		return x.Error
+	}
+	return nil
+}
+
+// Slot created on one shard.
+type CreateStreamResponse_Slot struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Shard *ShardRef              `protobuf:"bytes,1,opt,name=shard,proto3" json:"shard,omitempty"`
+	Slot  string                 `protobuf:"bytes,2,opt,name=slot,proto3" json:"slot,omitempty"`
+	// LSN the slot starts at.
+	Lsn           uint64 `protobuf:"varint,3,opt,name=lsn,proto3" json:"lsn,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CreateStreamResponse_Slot) Reset() {
+	*x = CreateStreamResponse_Slot{}
+	mi := &file_pgshard_v1_controller_proto_msgTypes[27]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CreateStreamResponse_Slot) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CreateStreamResponse_Slot) ProtoMessage() {}
+
+func (x *CreateStreamResponse_Slot) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_controller_proto_msgTypes[27]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CreateStreamResponse_Slot.ProtoReflect.Descriptor instead.
+func (*CreateStreamResponse_Slot) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_controller_proto_rawDescGZIP(), []int{24, 0}
+}
+
+func (x *CreateStreamResponse_Slot) GetShard() *ShardRef {
+	if x != nil {
+		return x.Shard
+	}
+	return nil
+}
+
+func (x *CreateStreamResponse_Slot) GetSlot() string {
+	if x != nil {
+		return x.Slot
+	}
+	return ""
+}
+
+func (x *CreateStreamResponse_Slot) GetLsn() uint64 {
+	if x != nil {
+		return x.Lsn
+	}
+	return 0
+}
+
 var File_pgshard_v1_controller_proto protoreflect.FileDescriptor
 
 const file_pgshard_v1_controller_proto_rawDesc = "" +
@@ -1649,7 +1926,23 @@ const file_pgshard_v1_controller_proto_rawDesc = "" +
 	"\x15ListRoleStatusRequest\x12\x12\n" +
 	"\x04role\x18\x01 \x01(\tR\x04role\"L\n" +
 	"\x16ListRoleStatusResponse\x122\n" +
-	"\bstatuses\x18\x01 \x03(\v2\x16.pgshard.v1.RoleStatusR\bstatuses*\x9d\x01\n" +
+	"\bstatuses\x18\x01 \x03(\v2\x16.pgshard.v1.RoleStatusR\bstatuses\"\x83\x01\n" +
+	"\x13CreateStreamRequest\x12\x16\n" +
+	"\x06stream\x18\x01 \x01(\tR\x06stream\x12\x1a\n" +
+	"\bdatabase\x18\x02 \x01(\tR\bdatabase\x12\x1b\n" +
+	"\ttwo_phase\x18\x03 \x01(\bR\btwoPhase\x12\x1b\n" +
+	"\tshard_set\x18\x04 \x01(\tR\bshardSet\"\xd6\x01\n" +
+	"\x14CreateStreamResponse\x12;\n" +
+	"\x05slots\x18\x01 \x03(\v2%.pgshard.v1.CreateStreamResponse.SlotR\x05slots\x12'\n" +
+	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\x1aX\n" +
+	"\x04Slot\x12*\n" +
+	"\x05shard\x18\x01 \x01(\v2\x14.pgshard.v1.ShardRefR\x05shard\x12\x12\n" +
+	"\x04slot\x18\x02 \x01(\tR\x04slot\x12\x10\n" +
+	"\x03lsn\x18\x03 \x01(\x04R\x03lsn\"+\n" +
+	"\x11DropStreamRequest\x12\x16\n" +
+	"\x06stream\x18\x01 \x01(\tR\x06stream\"=\n" +
+	"\x12DropStreamResponse\x12'\n" +
+	"\x05error\x18\x01 \x01(\v2\x11.pgshard.v1.ErrorR\x05error*\x9d\x01\n" +
 	"\fWorkflowKind\x12\x1d\n" +
 	"\x19WORKFLOW_KIND_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15WORKFLOW_KIND_RESHARD\x10\x01\x12\x17\n" +
@@ -1663,7 +1956,7 @@ const file_pgshard_v1_controller_proto_rawDesc = "" +
 	"\x15WORKFLOW_STATE_PAUSED\x10\x03\x12\x1c\n" +
 	"\x18WORKFLOW_STATE_COMPLETED\x10\x04\x12\x19\n" +
 	"\x15WORKFLOW_STATE_FAILED\x10\x05\x12\x1c\n" +
-	"\x18WORKFLOW_STATE_CANCELLED\x10\x062\x94\x06\n" +
+	"\x18WORKFLOW_STATE_CANCELLED\x10\x062\xb4\a\n" +
 	"\n" +
 	"Controller\x12T\n" +
 	"\rListWorkflows\x12 .pgshard.v1.ListWorkflowsRequest\x1a!.pgshard.v1.ListWorkflowsResponse\x12N\n" +
@@ -1674,7 +1967,10 @@ const file_pgshard_v1_controller_proto_rawDesc = "" +
 	"\bApplyDDL\x12\x1b.pgshard.v1.ApplyDDLRequest\x1a\x1c.pgshard.v1.ApplyDDLResponse0\x01\x12T\n" +
 	"\rCreateBarrier\x12 .pgshard.v1.CreateBarrierRequest\x1a!.pgshard.v1.CreateBarrierResponse\x12Q\n" +
 	"\fListBarriers\x12\x1f.pgshard.v1.ListBarriersRequest\x1a .pgshard.v1.ListBarriersResponse\x12W\n" +
-	"\x0eListRoleStatus\x12!.pgshard.v1.ListRoleStatusRequest\x1a\".pgshard.v1.ListRoleStatusResponseB\xb2\x01\n" +
+	"\x0eListRoleStatus\x12!.pgshard.v1.ListRoleStatusRequest\x1a\".pgshard.v1.ListRoleStatusResponse\x12Q\n" +
+	"\fCreateStream\x12\x1f.pgshard.v1.CreateStreamRequest\x1a .pgshard.v1.CreateStreamResponse\x12K\n" +
+	"\n" +
+	"DropStream\x12\x1d.pgshard.v1.DropStreamRequest\x1a\x1e.pgshard.v1.DropStreamResponseB\xb2\x01\n" +
 	"\x0ecom.pgshard.v1B\x0fControllerProtoP\x01ZFgithub.com/andrew01234567890/pgshard/internal/gen/pgshard/v1;pgshardv1\xa2\x02\x03PXX\xaa\x02\n" +
 	"Pgshard.V1\xca\x02\n" +
 	"Pgshard\\V1\xe2\x02\x16Pgshard\\V1\\GPBMetadata\xea\x02\vPgshard::V1b\x06proto3"
@@ -1692,7 +1988,7 @@ func file_pgshard_v1_controller_proto_rawDescGZIP() []byte {
 }
 
 var file_pgshard_v1_controller_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
-var file_pgshard_v1_controller_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
+var file_pgshard_v1_controller_proto_msgTypes = make([]protoimpl.MessageInfo, 28)
 var file_pgshard_v1_controller_proto_goTypes = []any{
 	(WorkflowKind)(0),                   // 0: pgshard.v1.WorkflowKind
 	(WorkflowState)(0),                  // 1: pgshard.v1.WorkflowState
@@ -1721,54 +2017,67 @@ var file_pgshard_v1_controller_proto_goTypes = []any{
 	(*RoleStatus)(nil),                  // 24: pgshard.v1.RoleStatus
 	(*ListRoleStatusRequest)(nil),       // 25: pgshard.v1.ListRoleStatusRequest
 	(*ListRoleStatusResponse)(nil),      // 26: pgshard.v1.ListRoleStatusResponse
-	(*ShardRef)(nil),                    // 27: pgshard.v1.ShardRef
-	(*Error)(nil),                       // 28: pgshard.v1.Error
+	(*CreateStreamRequest)(nil),         // 27: pgshard.v1.CreateStreamRequest
+	(*CreateStreamResponse)(nil),        // 28: pgshard.v1.CreateStreamResponse
+	(*DropStreamRequest)(nil),           // 29: pgshard.v1.DropStreamRequest
+	(*DropStreamResponse)(nil),          // 30: pgshard.v1.DropStreamResponse
+	(*CreateStreamResponse_Slot)(nil),   // 31: pgshard.v1.CreateStreamResponse.Slot
+	(*ShardRef)(nil),                    // 32: pgshard.v1.ShardRef
+	(*Error)(nil),                       // 33: pgshard.v1.Error
 }
 var file_pgshard_v1_controller_proto_depIdxs = []int32{
 	0,  // 0: pgshard.v1.Workflow.kind:type_name -> pgshard.v1.WorkflowKind
 	1,  // 1: pgshard.v1.Workflow.state:type_name -> pgshard.v1.WorkflowState
-	27, // 2: pgshard.v1.Workflow.shards:type_name -> pgshard.v1.ShardRef
-	28, // 3: pgshard.v1.Workflow.error:type_name -> pgshard.v1.Error
+	32, // 2: pgshard.v1.Workflow.shards:type_name -> pgshard.v1.ShardRef
+	33, // 3: pgshard.v1.Workflow.error:type_name -> pgshard.v1.Error
 	0,  // 4: pgshard.v1.ListWorkflowsRequest.kind:type_name -> pgshard.v1.WorkflowKind
 	1,  // 5: pgshard.v1.ListWorkflowsRequest.state:type_name -> pgshard.v1.WorkflowState
 	4,  // 6: pgshard.v1.ListWorkflowsResponse.workflows:type_name -> pgshard.v1.Workflow
 	4,  // 7: pgshard.v1.GetWorkflowResponse.workflow:type_name -> pgshard.v1.Workflow
 	4,  // 8: pgshard.v1.PauseWorkflowResponse.workflow:type_name -> pgshard.v1.Workflow
 	4,  // 9: pgshard.v1.ResumeWorkflowResponse.workflow:type_name -> pgshard.v1.Workflow
-	28, // 10: pgshard.v1.ResolveTransactionsResponse.error:type_name -> pgshard.v1.Error
-	27, // 11: pgshard.v1.ShardDDLState.shard:type_name -> pgshard.v1.ShardRef
+	33, // 10: pgshard.v1.ResolveTransactionsResponse.error:type_name -> pgshard.v1.Error
+	32, // 11: pgshard.v1.ShardDDLState.shard:type_name -> pgshard.v1.ShardRef
 	2,  // 12: pgshard.v1.ShardDDLState.state:type_name -> pgshard.v1.ShardDDLState.State
-	28, // 13: pgshard.v1.ShardDDLState.error:type_name -> pgshard.v1.Error
+	33, // 13: pgshard.v1.ShardDDLState.error:type_name -> pgshard.v1.Error
 	16, // 14: pgshard.v1.ApplyDDLResponse.shard_state:type_name -> pgshard.v1.ShardDDLState
 	19, // 15: pgshard.v1.Barrier.groups:type_name -> pgshard.v1.GroupRestorePoint
 	20, // 16: pgshard.v1.CreateBarrierResponse.barrier:type_name -> pgshard.v1.Barrier
-	28, // 17: pgshard.v1.CreateBarrierResponse.error:type_name -> pgshard.v1.Error
+	33, // 17: pgshard.v1.CreateBarrierResponse.error:type_name -> pgshard.v1.Error
 	20, // 18: pgshard.v1.ListBarriersResponse.barriers:type_name -> pgshard.v1.Barrier
 	3,  // 19: pgshard.v1.RoleStatus.state:type_name -> pgshard.v1.RoleStatus.State
 	24, // 20: pgshard.v1.ListRoleStatusResponse.statuses:type_name -> pgshard.v1.RoleStatus
-	5,  // 21: pgshard.v1.Controller.ListWorkflows:input_type -> pgshard.v1.ListWorkflowsRequest
-	7,  // 22: pgshard.v1.Controller.GetWorkflow:input_type -> pgshard.v1.GetWorkflowRequest
-	9,  // 23: pgshard.v1.Controller.PauseWorkflow:input_type -> pgshard.v1.PauseWorkflowRequest
-	11, // 24: pgshard.v1.Controller.ResumeWorkflow:input_type -> pgshard.v1.ResumeWorkflowRequest
-	13, // 25: pgshard.v1.Controller.ResolveTransactions:input_type -> pgshard.v1.ResolveTransactionsRequest
-	15, // 26: pgshard.v1.Controller.ApplyDDL:input_type -> pgshard.v1.ApplyDDLRequest
-	18, // 27: pgshard.v1.Controller.CreateBarrier:input_type -> pgshard.v1.CreateBarrierRequest
-	22, // 28: pgshard.v1.Controller.ListBarriers:input_type -> pgshard.v1.ListBarriersRequest
-	25, // 29: pgshard.v1.Controller.ListRoleStatus:input_type -> pgshard.v1.ListRoleStatusRequest
-	6,  // 30: pgshard.v1.Controller.ListWorkflows:output_type -> pgshard.v1.ListWorkflowsResponse
-	8,  // 31: pgshard.v1.Controller.GetWorkflow:output_type -> pgshard.v1.GetWorkflowResponse
-	10, // 32: pgshard.v1.Controller.PauseWorkflow:output_type -> pgshard.v1.PauseWorkflowResponse
-	12, // 33: pgshard.v1.Controller.ResumeWorkflow:output_type -> pgshard.v1.ResumeWorkflowResponse
-	14, // 34: pgshard.v1.Controller.ResolveTransactions:output_type -> pgshard.v1.ResolveTransactionsResponse
-	17, // 35: pgshard.v1.Controller.ApplyDDL:output_type -> pgshard.v1.ApplyDDLResponse
-	21, // 36: pgshard.v1.Controller.CreateBarrier:output_type -> pgshard.v1.CreateBarrierResponse
-	23, // 37: pgshard.v1.Controller.ListBarriers:output_type -> pgshard.v1.ListBarriersResponse
-	26, // 38: pgshard.v1.Controller.ListRoleStatus:output_type -> pgshard.v1.ListRoleStatusResponse
-	30, // [30:39] is the sub-list for method output_type
-	21, // [21:30] is the sub-list for method input_type
-	21, // [21:21] is the sub-list for extension type_name
-	21, // [21:21] is the sub-list for extension extendee
-	0,  // [0:21] is the sub-list for field type_name
+	31, // 21: pgshard.v1.CreateStreamResponse.slots:type_name -> pgshard.v1.CreateStreamResponse.Slot
+	33, // 22: pgshard.v1.CreateStreamResponse.error:type_name -> pgshard.v1.Error
+	33, // 23: pgshard.v1.DropStreamResponse.error:type_name -> pgshard.v1.Error
+	32, // 24: pgshard.v1.CreateStreamResponse.Slot.shard:type_name -> pgshard.v1.ShardRef
+	5,  // 25: pgshard.v1.Controller.ListWorkflows:input_type -> pgshard.v1.ListWorkflowsRequest
+	7,  // 26: pgshard.v1.Controller.GetWorkflow:input_type -> pgshard.v1.GetWorkflowRequest
+	9,  // 27: pgshard.v1.Controller.PauseWorkflow:input_type -> pgshard.v1.PauseWorkflowRequest
+	11, // 28: pgshard.v1.Controller.ResumeWorkflow:input_type -> pgshard.v1.ResumeWorkflowRequest
+	13, // 29: pgshard.v1.Controller.ResolveTransactions:input_type -> pgshard.v1.ResolveTransactionsRequest
+	15, // 30: pgshard.v1.Controller.ApplyDDL:input_type -> pgshard.v1.ApplyDDLRequest
+	18, // 31: pgshard.v1.Controller.CreateBarrier:input_type -> pgshard.v1.CreateBarrierRequest
+	22, // 32: pgshard.v1.Controller.ListBarriers:input_type -> pgshard.v1.ListBarriersRequest
+	25, // 33: pgshard.v1.Controller.ListRoleStatus:input_type -> pgshard.v1.ListRoleStatusRequest
+	27, // 34: pgshard.v1.Controller.CreateStream:input_type -> pgshard.v1.CreateStreamRequest
+	29, // 35: pgshard.v1.Controller.DropStream:input_type -> pgshard.v1.DropStreamRequest
+	6,  // 36: pgshard.v1.Controller.ListWorkflows:output_type -> pgshard.v1.ListWorkflowsResponse
+	8,  // 37: pgshard.v1.Controller.GetWorkflow:output_type -> pgshard.v1.GetWorkflowResponse
+	10, // 38: pgshard.v1.Controller.PauseWorkflow:output_type -> pgshard.v1.PauseWorkflowResponse
+	12, // 39: pgshard.v1.Controller.ResumeWorkflow:output_type -> pgshard.v1.ResumeWorkflowResponse
+	14, // 40: pgshard.v1.Controller.ResolveTransactions:output_type -> pgshard.v1.ResolveTransactionsResponse
+	17, // 41: pgshard.v1.Controller.ApplyDDL:output_type -> pgshard.v1.ApplyDDLResponse
+	21, // 42: pgshard.v1.Controller.CreateBarrier:output_type -> pgshard.v1.CreateBarrierResponse
+	23, // 43: pgshard.v1.Controller.ListBarriers:output_type -> pgshard.v1.ListBarriersResponse
+	26, // 44: pgshard.v1.Controller.ListRoleStatus:output_type -> pgshard.v1.ListRoleStatusResponse
+	28, // 45: pgshard.v1.Controller.CreateStream:output_type -> pgshard.v1.CreateStreamResponse
+	30, // 46: pgshard.v1.Controller.DropStream:output_type -> pgshard.v1.DropStreamResponse
+	36, // [36:47] is the sub-list for method output_type
+	25, // [25:36] is the sub-list for method input_type
+	25, // [25:25] is the sub-list for extension type_name
+	25, // [25:25] is the sub-list for extension extendee
+	0,  // [0:25] is the sub-list for field type_name
 }
 
 func init() { file_pgshard_v1_controller_proto_init() }
@@ -1783,7 +2092,7 @@ func file_pgshard_v1_controller_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pgshard_v1_controller_proto_rawDesc), len(file_pgshard_v1_controller_proto_rawDesc)),
 			NumEnums:      4,
-			NumMessages:   23,
+			NumMessages:   28,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

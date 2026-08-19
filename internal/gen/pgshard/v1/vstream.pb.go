@@ -31,7 +31,6 @@ const (
 	VEvent_Row_KIND_INSERT      VEvent_Row_Kind = 1
 	VEvent_Row_KIND_UPDATE      VEvent_Row_Kind = 2
 	VEvent_Row_KIND_DELETE      VEvent_Row_Kind = 3
-	VEvent_Row_KIND_TRUNCATE    VEvent_Row_Kind = 4
 )
 
 // Enum value maps for VEvent_Row_Kind.
@@ -41,14 +40,12 @@ var (
 		1: "KIND_INSERT",
 		2: "KIND_UPDATE",
 		3: "KIND_DELETE",
-		4: "KIND_TRUNCATE",
 	}
 	VEvent_Row_Kind_value = map[string]int32{
 		"KIND_UNSPECIFIED": 0,
 		"KIND_INSERT":      1,
 		"KIND_UPDATE":      2,
 		"KIND_DELETE":      3,
-		"KIND_TRUNCATE":    4,
 	}
 )
 
@@ -76,193 +73,97 @@ func (x VEvent_Row_Kind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use VEvent_Row_Kind.Descriptor instead.
 func (VEvent_Row_Kind) EnumDescriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{5, 1, 0}
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{15, 2, 0}
 }
 
-// VStreamRequest is either the initial start or a subsequent ack.
-type VStreamRequest struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// Types that are valid to be assigned to Request:
-	//
-	//	*VStreamRequest_Start
-	//	*VStreamRequest_Ack
-	Request       isVStreamRequest_Request `protobuf_oneof:"request"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
+// Error code.
+type VEvent_Error_Code int32
 
-func (x *VStreamRequest) Reset() {
-	*x = VStreamRequest{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[0]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
+const (
+	VEvent_Error_CODE_UNSPECIFIED VEvent_Error_Code = 0
+	// A shard's slot was invalidated or the requested LSN is no longer
+	// retained; the stream must be recreated.
+	VEvent_Error_CODE_POSITION_TOO_OLD VEvent_Error_Code = 1
+	// The shard map generation changed and the stream cannot follow.
+	VEvent_Error_CODE_RESHARDED VEvent_Error_Code = 2
+	// A shard stream could not be (re)opened in time.
+	VEvent_Error_CODE_SHARD_UNAVAILABLE VEvent_Error_Code = 3
+	VEvent_Error_CODE_INTERNAL          VEvent_Error_Code = 4
+)
 
-func (x *VStreamRequest) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*VStreamRequest) ProtoMessage() {}
-
-func (x *VStreamRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[0]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
+// Enum value maps for VEvent_Error_Code.
+var (
+	VEvent_Error_Code_name = map[int32]string{
+		0: "CODE_UNSPECIFIED",
+		1: "CODE_POSITION_TOO_OLD",
+		2: "CODE_RESHARDED",
+		3: "CODE_SHARD_UNAVAILABLE",
+		4: "CODE_INTERNAL",
 	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use VStreamRequest.ProtoReflect.Descriptor instead.
-func (*VStreamRequest) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{0}
-}
-
-func (x *VStreamRequest) GetRequest() isVStreamRequest_Request {
-	if x != nil {
-		return x.Request
+	VEvent_Error_Code_value = map[string]int32{
+		"CODE_UNSPECIFIED":       0,
+		"CODE_POSITION_TOO_OLD":  1,
+		"CODE_RESHARDED":         2,
+		"CODE_SHARD_UNAVAILABLE": 3,
+		"CODE_INTERNAL":          4,
 	}
-	return nil
+)
+
+func (x VEvent_Error_Code) Enum() *VEvent_Error_Code {
+	p := new(VEvent_Error_Code)
+	*p = x
+	return p
 }
 
-func (x *VStreamRequest) GetStart() *VStreamStart {
-	if x != nil {
-		if x, ok := x.Request.(*VStreamRequest_Start); ok {
-			return x.Start
-		}
-	}
-	return nil
+func (x VEvent_Error_Code) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
 }
 
-func (x *VStreamRequest) GetAck() *Position {
-	if x != nil {
-		if x, ok := x.Request.(*VStreamRequest_Ack); ok {
-			return x.Ack
-		}
-	}
-	return nil
+func (VEvent_Error_Code) Descriptor() protoreflect.EnumDescriptor {
+	return file_pgshard_v1_vstream_proto_enumTypes[1].Descriptor()
 }
 
-type isVStreamRequest_Request interface {
-	isVStreamRequest_Request()
+func (VEvent_Error_Code) Type() protoreflect.EnumType {
+	return &file_pgshard_v1_vstream_proto_enumTypes[1]
 }
 
-type VStreamRequest_Start struct {
-	Start *VStreamStart `protobuf:"bytes,1,opt,name=start,proto3,oneof"`
+func (x VEvent_Error_Code) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
 }
 
-type VStreamRequest_Ack struct {
-	// Consumer has durably processed everything up to this position.
-	Ack *Position `protobuf:"bytes,2,opt,name=ack,proto3,oneof"`
+// Deprecated: Use VEvent_Error_Code.Descriptor instead.
+func (VEvent_Error_Code) EnumDescriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{15, 12, 0}
 }
 
-func (*VStreamRequest_Start) isVStreamRequest_Request() {}
-
-func (*VStreamRequest_Ack) isVStreamRequest_Request() {}
-
-// VStreamStart configures a stream.
-type VStreamStart struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// Position to resume from; empty means the current position.
-	Start *Position `protobuf:"bytes,1,opt,name=start,proto3" json:"start,omitempty"`
-	// True to first copy existing rows before streaming changes.
-	Copy bool `protobuf:"varint,2,opt,name=copy,proto3" json:"copy,omitempty"`
-	// Database to stream.
-	Database string `protobuf:"bytes,3,opt,name=database,proto3" json:"database,omitempty"`
-	// Tables to stream; empty means all.
-	Tables []string `protobuf:"bytes,4,rep,name=tables,proto3" json:"tables,omitempty"`
-	// Stream options.
-	Options       *VStreamOptions `protobuf:"bytes,5,opt,name=options,proto3" json:"options,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *VStreamStart) Reset() {
-	*x = VStreamStart{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[1]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *VStreamStart) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*VStreamStart) ProtoMessage() {}
-
-func (x *VStreamStart) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[1]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use VStreamStart.ProtoReflect.Descriptor instead.
-func (*VStreamStart) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{1}
-}
-
-func (x *VStreamStart) GetStart() *Position {
-	if x != nil {
-		return x.Start
-	}
-	return nil
-}
-
-func (x *VStreamStart) GetCopy() bool {
-	if x != nil {
-		return x.Copy
-	}
-	return false
-}
-
-func (x *VStreamStart) GetDatabase() string {
-	if x != nil {
-		return x.Database
-	}
-	return ""
-}
-
-func (x *VStreamStart) GetTables() []string {
-	if x != nil {
-		return x.Tables
-	}
-	return nil
-}
-
-func (x *VStreamStart) GetOptions() *VStreamOptions {
-	if x != nil {
-		return x.Options
-	}
-	return nil
-}
-
-// VStreamOptions tunes stream behaviour.
+// VStreamOptions tunes one Stream call.
 type VStreamOptions struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Emit Prepare/CommitPrepared/RollbackPrepared for two-phase transactions.
+	// Emit Prepare/CommitPrepared/RollbackPrepared; the stream must have been
+	// created with two_phase.
 	TwoPhase bool `protobuf:"varint,1,opt,name=two_phase,json=twoPhase,proto3" json:"two_phase,omitempty"`
-	// End the stream with a Journal event instead of following resharding.
+	// End with a Journal event once the shard map generation changes instead
+	// of an Error.
 	StopOnReshard bool `protobuf:"varint,2,opt,name=stop_on_reshard,json=stopOnReshard,proto3" json:"stop_on_reshard,omitempty"`
-	// Interval between Heartbeat events in milliseconds; zero disables.
+	// Interval between Heartbeat events while idle, in milliseconds; zero
+	// means 5000.
 	HeartbeatIntervalMs uint32 `protobuf:"varint,3,opt,name=heartbeat_interval_ms,json=heartbeatIntervalMs,proto3" json:"heartbeat_interval_ms,omitempty"`
-	// Prefer to keep shard streams close in time over throughput.
-	MinimizeSkew  bool `protobuf:"varint,4,opt,name=minimize_skew,json=minimizeSkew,proto3" json:"minimize_skew,omitempty"`
+	// Hold back shards whose commit timestamps run ahead of the slowest shard
+	// by more than align_skew_ms, releasing them after align_timeout_ms.
+	AlignSkew bool `protobuf:"varint,4,opt,name=align_skew,json=alignSkew,proto3" json:"align_skew,omitempty"`
+	// Allowed commit-timestamp lead in milliseconds; zero means 1000.
+	AlignSkewMs uint32 `protobuf:"varint,5,opt,name=align_skew_ms,json=alignSkewMs,proto3" json:"align_skew_ms,omitempty"`
+	// Longest hold of a shard in milliseconds; zero means 10000.
+	AlignTimeoutMs uint32 `protobuf:"varint,6,opt,name=align_timeout_ms,json=alignTimeoutMs,proto3" json:"align_timeout_ms,omitempty"`
+	// Shard set to stream; empty means default.
+	ShardSet      string `protobuf:"bytes,7,opt,name=shard_set,json=shardSet,proto3" json:"shard_set,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *VStreamOptions) Reset() {
 	*x = VStreamOptions{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[2]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -274,7 +175,7 @@ func (x *VStreamOptions) String() string {
 func (*VStreamOptions) ProtoMessage() {}
 
 func (x *VStreamOptions) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[2]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -287,7 +188,7 @@ func (x *VStreamOptions) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VStreamOptions.ProtoReflect.Descriptor instead.
 func (*VStreamOptions) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{2}
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *VStreamOptions) GetTwoPhase() bool {
@@ -311,40 +212,181 @@ func (x *VStreamOptions) GetHeartbeatIntervalMs() uint32 {
 	return 0
 }
 
-func (x *VStreamOptions) GetMinimizeSkew() bool {
+func (x *VStreamOptions) GetAlignSkew() bool {
 	if x != nil {
-		return x.MinimizeSkew
+		return x.AlignSkew
 	}
 	return false
 }
 
-// Column is one typed column value.
-type Column struct {
+func (x *VStreamOptions) GetAlignSkewMs() uint32 {
+	if x != nil {
+		return x.AlignSkewMs
+	}
+	return 0
+}
+
+func (x *VStreamOptions) GetAlignTimeoutMs() uint32 {
+	if x != nil {
+		return x.AlignTimeoutMs
+	}
+	return 0
+}
+
+func (x *VStreamOptions) GetShardSet() string {
+	if x != nil {
+		return x.ShardSet
+	}
+	return ""
+}
+
+// CreateVStreamRequest registers a stream.
+type CreateVStreamRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	Name  string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	// PostgreSQL type OID.
-	TypeOid uint32 `protobuf:"varint,2,opt,name=type_oid,json=typeOid,proto3" json:"type_oid,omitempty"`
-	Null    bool   `protobuf:"varint,3,opt,name=null,proto3" json:"null,omitempty"`
-	// Text-format value bytes.
-	Value         []byte `protobuf:"bytes,4,opt,name=value,proto3" json:"value,omitempty"`
+	// Stream name: [a-z][a-z0-9_]{0,31}.
+	Stream string `protobuf:"bytes,1,opt,name=stream,proto3" json:"stream,omitempty"`
+	// Logical database whose tables the stream decodes.
+	Database string `protobuf:"bytes,2,opt,name=database,proto3" json:"database,omitempty"`
+	// Create the slots with two_phase so prepared transactions are decoded at
+	// PREPARE time.
+	TwoPhase      bool `protobuf:"varint,3,opt,name=two_phase,json=twoPhase,proto3" json:"two_phase,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *Column) Reset() {
-	*x = Column{}
+func (x *CreateVStreamRequest) Reset() {
+	*x = CreateVStreamRequest{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CreateVStreamRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CreateVStreamRequest) ProtoMessage() {}
+
+func (x *CreateVStreamRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CreateVStreamRequest.ProtoReflect.Descriptor instead.
+func (*CreateVStreamRequest) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *CreateVStreamRequest) GetStream() string {
+	if x != nil {
+		return x.Stream
+	}
+	return ""
+}
+
+func (x *CreateVStreamRequest) GetDatabase() string {
+	if x != nil {
+		return x.Database
+	}
+	return ""
+}
+
+func (x *CreateVStreamRequest) GetTwoPhase() bool {
+	if x != nil {
+		return x.TwoPhase
+	}
+	return false
+}
+
+// CreateVStreamResponse reports the created slots.
+type CreateVStreamResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Slot name per shard.
+	Slots         []*VStreamSlot `protobuf:"bytes,1,rep,name=slots,proto3" json:"slots,omitempty"`
+	Error         *Error         `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CreateVStreamResponse) Reset() {
+	*x = CreateVStreamResponse{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CreateVStreamResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CreateVStreamResponse) ProtoMessage() {}
+
+func (x *CreateVStreamResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CreateVStreamResponse.ProtoReflect.Descriptor instead.
+func (*CreateVStreamResponse) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *CreateVStreamResponse) GetSlots() []*VStreamSlot {
+	if x != nil {
+		return x.Slots
+	}
+	return nil
+}
+
+func (x *CreateVStreamResponse) GetError() *Error {
+	if x != nil {
+		return x.Error
+	}
+	return nil
+}
+
+// VStreamSlot is one shard's slot of a stream.
+type VStreamSlot struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Shard *ShardRef              `protobuf:"bytes,1,opt,name=shard,proto3" json:"shard,omitempty"`
+	Slot  string                 `protobuf:"bytes,2,opt,name=slot,proto3" json:"slot,omitempty"`
+	// Slot state as seen by the catalog: reserved, extended, unreserved, lost
+	// or missing.
+	WalStatus         string `protobuf:"bytes,3,opt,name=wal_status,json=walStatus,proto3" json:"wal_status,omitempty"`
+	ConfirmedFlushLsn uint64 `protobuf:"varint,4,opt,name=confirmed_flush_lsn,json=confirmedFlushLsn,proto3" json:"confirmed_flush_lsn,omitempty"`
+	Active            bool   `protobuf:"varint,5,opt,name=active,proto3" json:"active,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *VStreamSlot) Reset() {
+	*x = VStreamSlot{}
 	mi := &file_pgshard_v1_vstream_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *Column) String() string {
+func (x *VStreamSlot) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*Column) ProtoMessage() {}
+func (*VStreamSlot) ProtoMessage() {}
 
-func (x *Column) ProtoReflect() protoreflect.Message {
+func (x *VStreamSlot) ProtoReflect() protoreflect.Message {
 	mi := &file_pgshard_v1_vstream_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -356,62 +398,617 @@ func (x *Column) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use Column.ProtoReflect.Descriptor instead.
-func (*Column) Descriptor() ([]byte, []int) {
+// Deprecated: Use VStreamSlot.ProtoReflect.Descriptor instead.
+func (*VStreamSlot) Descriptor() ([]byte, []int) {
 	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{3}
 }
 
-func (x *Column) GetName() string {
+func (x *VStreamSlot) GetShard() *ShardRef {
 	if x != nil {
-		return x.Name
+		return x.Shard
+	}
+	return nil
+}
+
+func (x *VStreamSlot) GetSlot() string {
+	if x != nil {
+		return x.Slot
 	}
 	return ""
 }
 
-func (x *Column) GetTypeOid() uint32 {
+func (x *VStreamSlot) GetWalStatus() string {
 	if x != nil {
-		return x.TypeOid
+		return x.WalStatus
+	}
+	return ""
+}
+
+func (x *VStreamSlot) GetConfirmedFlushLsn() uint64 {
+	if x != nil {
+		return x.ConfirmedFlushLsn
 	}
 	return 0
 }
 
-func (x *Column) GetNull() bool {
+func (x *VStreamSlot) GetActive() bool {
+	if x != nil {
+		return x.Active
+	}
+	return false
+}
+
+// DropVStreamRequest removes a stream.
+type DropVStreamRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Stream        string                 `protobuf:"bytes,1,opt,name=stream,proto3" json:"stream,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DropVStreamRequest) Reset() {
+	*x = DropVStreamRequest{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DropVStreamRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DropVStreamRequest) ProtoMessage() {}
+
+func (x *DropVStreamRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DropVStreamRequest.ProtoReflect.Descriptor instead.
+func (*DropVStreamRequest) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *DropVStreamRequest) GetStream() string {
+	if x != nil {
+		return x.Stream
+	}
+	return ""
+}
+
+// DropVStreamResponse reports the outcome.
+type DropVStreamResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Error         *Error                 `protobuf:"bytes,1,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DropVStreamResponse) Reset() {
+	*x = DropVStreamResponse{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DropVStreamResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DropVStreamResponse) ProtoMessage() {}
+
+func (x *DropVStreamResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DropVStreamResponse.ProtoReflect.Descriptor instead.
+func (*DropVStreamResponse) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *DropVStreamResponse) GetError() *Error {
+	if x != nil {
+		return x.Error
+	}
+	return nil
+}
+
+// ListVStreamsRequest lists streams.
+type ListVStreamsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListVStreamsRequest) Reset() {
+	*x = ListVStreamsRequest{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListVStreamsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListVStreamsRequest) ProtoMessage() {}
+
+func (x *ListVStreamsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListVStreamsRequest.ProtoReflect.Descriptor instead.
+func (*ListVStreamsRequest) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{6}
+}
+
+// VStreamInfo describes one stream.
+type VStreamInfo struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Stream   string                 `protobuf:"bytes,1,opt,name=stream,proto3" json:"stream,omitempty"`
+	Database string                 `protobuf:"bytes,2,opt,name=database,proto3" json:"database,omitempty"`
+	TwoPhase bool                   `protobuf:"varint,3,opt,name=two_phase,json=twoPhase,proto3" json:"two_phase,omitempty"`
+	// creating, active or lost.
+	State         string         `protobuf:"bytes,4,opt,name=state,proto3" json:"state,omitempty"`
+	Slots         []*VStreamSlot `protobuf:"bytes,5,rep,name=slots,proto3" json:"slots,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VStreamInfo) Reset() {
+	*x = VStreamInfo{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VStreamInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VStreamInfo) ProtoMessage() {}
+
+func (x *VStreamInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VStreamInfo.ProtoReflect.Descriptor instead.
+func (*VStreamInfo) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *VStreamInfo) GetStream() string {
+	if x != nil {
+		return x.Stream
+	}
+	return ""
+}
+
+func (x *VStreamInfo) GetDatabase() string {
+	if x != nil {
+		return x.Database
+	}
+	return ""
+}
+
+func (x *VStreamInfo) GetTwoPhase() bool {
+	if x != nil {
+		return x.TwoPhase
+	}
+	return false
+}
+
+func (x *VStreamInfo) GetState() string {
+	if x != nil {
+		return x.State
+	}
+	return ""
+}
+
+func (x *VStreamInfo) GetSlots() []*VStreamSlot {
+	if x != nil {
+		return x.Slots
+	}
+	return nil
+}
+
+// ListVStreamsResponse carries every stream.
+type ListVStreamsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Streams       []*VStreamInfo         `protobuf:"bytes,1,rep,name=streams,proto3" json:"streams,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListVStreamsResponse) Reset() {
+	*x = ListVStreamsResponse{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListVStreamsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListVStreamsResponse) ProtoMessage() {}
+
+func (x *ListVStreamsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListVStreamsResponse.ProtoReflect.Descriptor instead.
+func (*ListVStreamsResponse) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *ListVStreamsResponse) GetStreams() []*VStreamInfo {
+	if x != nil {
+		return x.Streams
+	}
+	return nil
+}
+
+// VPosition is a vector of per-shard LSNs under one shard map generation.
+type VPosition struct {
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	Shards             []*VPosition_Shard     `protobuf:"bytes,1,rep,name=shards,proto3" json:"shards,omitempty"`
+	ShardMapGeneration uint64                 `protobuf:"varint,2,opt,name=shard_map_generation,json=shardMapGeneration,proto3" json:"shard_map_generation,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *VPosition) Reset() {
+	*x = VPosition{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VPosition) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VPosition) ProtoMessage() {}
+
+func (x *VPosition) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VPosition.ProtoReflect.Descriptor instead.
+func (*VPosition) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *VPosition) GetShards() []*VPosition_Shard {
+	if x != nil {
+		return x.Shards
+	}
+	return nil
+}
+
+func (x *VPosition) GetShardMapGeneration() uint64 {
+	if x != nil {
+		return x.ShardMapGeneration
+	}
+	return 0
+}
+
+// VStreamRequest is the start of a stream or an ack.
+type VStreamRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Request:
+	//
+	//	*VStreamRequest_Start_
+	//	*VStreamRequest_Ack
+	Request       isVStreamRequest_Request `protobuf_oneof:"request"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VStreamRequest) Reset() {
+	*x = VStreamRequest{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VStreamRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VStreamRequest) ProtoMessage() {}
+
+func (x *VStreamRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VStreamRequest.ProtoReflect.Descriptor instead.
+func (*VStreamRequest) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *VStreamRequest) GetRequest() isVStreamRequest_Request {
+	if x != nil {
+		return x.Request
+	}
+	return nil
+}
+
+func (x *VStreamRequest) GetStart() *VStreamRequest_Start {
+	if x != nil {
+		if x, ok := x.Request.(*VStreamRequest_Start_); ok {
+			return x.Start
+		}
+	}
+	return nil
+}
+
+func (x *VStreamRequest) GetAck() *VPosition {
+	if x != nil {
+		if x, ok := x.Request.(*VStreamRequest_Ack); ok {
+			return x.Ack
+		}
+	}
+	return nil
+}
+
+type isVStreamRequest_Request interface {
+	isVStreamRequest_Request()
+}
+
+type VStreamRequest_Start_ struct {
+	Start *VStreamRequest_Start `protobuf:"bytes,1,opt,name=start,proto3,oneof"`
+}
+
+type VStreamRequest_Ack struct {
+	// The consumer has durably processed everything up to this position.
+	Ack *VPosition `protobuf:"bytes,2,opt,name=ack,proto3,oneof"`
+}
+
+func (*VStreamRequest_Start_) isVStreamRequest_Request() {}
+
+func (*VStreamRequest_Ack) isVStreamRequest_Request() {}
+
+// VStreamAckRequest acks a position out of band.
+type VStreamAckRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Stream        string                 `protobuf:"bytes,1,opt,name=stream,proto3" json:"stream,omitempty"`
+	Position      *VPosition             `protobuf:"bytes,2,opt,name=position,proto3" json:"position,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VStreamAckRequest) Reset() {
+	*x = VStreamAckRequest{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VStreamAckRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VStreamAckRequest) ProtoMessage() {}
+
+func (x *VStreamAckRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VStreamAckRequest.ProtoReflect.Descriptor instead.
+func (*VStreamAckRequest) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *VStreamAckRequest) GetStream() string {
+	if x != nil {
+		return x.Stream
+	}
+	return ""
+}
+
+func (x *VStreamAckRequest) GetPosition() *VPosition {
+	if x != nil {
+		return x.Position
+	}
+	return nil
+}
+
+// VStreamAckResponse reports the outcome.
+type VStreamAckResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Error         *Error                 `protobuf:"bytes,1,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VStreamAckResponse) Reset() {
+	*x = VStreamAckResponse{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VStreamAckResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VStreamAckResponse) ProtoMessage() {}
+
+func (x *VStreamAckResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VStreamAckResponse.ProtoReflect.Descriptor instead.
+func (*VStreamAckResponse) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *VStreamAckResponse) GetError() *Error {
+	if x != nil {
+		return x.Error
+	}
+	return nil
+}
+
+// VColumn is one typed column value.
+type VColumn struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Null  bool                   `protobuf:"varint,1,opt,name=null,proto3" json:"null,omitempty"`
+	// True when the value is an unchanged TOAST datum pgoutput did not send.
+	UnchangedToast bool `protobuf:"varint,2,opt,name=unchanged_toast,json=unchangedToast,proto3" json:"unchanged_toast,omitempty"`
+	// Text-format value bytes.
+	Value         []byte `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VColumn) Reset() {
+	*x = VColumn{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VColumn) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VColumn) ProtoMessage() {}
+
+func (x *VColumn) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VColumn.ProtoReflect.Descriptor instead.
+func (*VColumn) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *VColumn) GetNull() bool {
 	if x != nil {
 		return x.Null
 	}
 	return false
 }
 
-func (x *Column) GetValue() []byte {
+func (x *VColumn) GetUnchangedToast() bool {
+	if x != nil {
+		return x.UnchangedToast
+	}
+	return false
+}
+
+func (x *VColumn) GetValue() []byte {
 	if x != nil {
 		return x.Value
 	}
 	return nil
 }
 
-// Tuple is one row image.
-type Tuple struct {
+// VTuple is one row image.
+type VTuple struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Columns       []*Column              `protobuf:"bytes,1,rep,name=columns,proto3" json:"columns,omitempty"`
+	Columns       []*VColumn             `protobuf:"bytes,1,rep,name=columns,proto3" json:"columns,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *Tuple) Reset() {
-	*x = Tuple{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[4]
+func (x *VTuple) Reset() {
+	*x = VTuple{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *Tuple) String() string {
+func (x *VTuple) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*Tuple) ProtoMessage() {}
+func (*VTuple) ProtoMessage() {}
 
-func (x *Tuple) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[4]
+func (x *VTuple) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -422,12 +1019,12 @@ func (x *Tuple) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use Tuple.ProtoReflect.Descriptor instead.
-func (*Tuple) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{4}
+// Deprecated: Use VTuple.ProtoReflect.Descriptor instead.
+func (*VTuple) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{14}
 }
 
-func (x *Tuple) GetColumns() []*Column {
+func (x *VTuple) GetColumns() []*VColumn {
 	if x != nil {
 		return x.Columns
 	}
@@ -440,17 +1037,18 @@ type VEvent struct {
 	// Types that are valid to be assigned to Event:
 	//
 	//	*VEvent_Begin_
+	//	*VEvent_Relation_
 	//	*VEvent_Row_
+	//	*VEvent_Truncate_
+	//	*VEvent_Message_
 	//	*VEvent_Commit_
-	//	*VEvent_Position
-	//	*VEvent_Heartbeat_
-	//	*VEvent_Journal_
-	//	*VEvent_CopyCompleted_
-	//	*VEvent_LastPk
-	//	*VEvent_DdlMarker_
 	//	*VEvent_Prepare_
 	//	*VEvent_CommitPrepared_
 	//	*VEvent_RollbackPrepared_
+	//	*VEvent_Vgtid
+	//	*VEvent_Heartbeat_
+	//	*VEvent_Journal_
+	//	*VEvent_Error_
 	Event         isVEvent_Event `protobuf_oneof:"event"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -458,7 +1056,7 @@ type VEvent struct {
 
 func (x *VEvent) Reset() {
 	*x = VEvent{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[5]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -470,7 +1068,7 @@ func (x *VEvent) String() string {
 func (*VEvent) ProtoMessage() {}
 
 func (x *VEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[5]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -483,7 +1081,7 @@ func (x *VEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VEvent.ProtoReflect.Descriptor instead.
 func (*VEvent) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{5}
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *VEvent) GetEvent() isVEvent_Event {
@@ -502,6 +1100,15 @@ func (x *VEvent) GetBegin() *VEvent_Begin {
 	return nil
 }
 
+func (x *VEvent) GetRelation() *VEvent_Relation {
+	if x != nil {
+		if x, ok := x.Event.(*VEvent_Relation_); ok {
+			return x.Relation
+		}
+	}
+	return nil
+}
+
 func (x *VEvent) GetRow() *VEvent_Row {
 	if x != nil {
 		if x, ok := x.Event.(*VEvent_Row_); ok {
@@ -511,64 +1118,28 @@ func (x *VEvent) GetRow() *VEvent_Row {
 	return nil
 }
 
+func (x *VEvent) GetTruncate() *VEvent_Truncate {
+	if x != nil {
+		if x, ok := x.Event.(*VEvent_Truncate_); ok {
+			return x.Truncate
+		}
+	}
+	return nil
+}
+
+func (x *VEvent) GetMessage() *VEvent_Message {
+	if x != nil {
+		if x, ok := x.Event.(*VEvent_Message_); ok {
+			return x.Message
+		}
+	}
+	return nil
+}
+
 func (x *VEvent) GetCommit() *VEvent_Commit {
 	if x != nil {
 		if x, ok := x.Event.(*VEvent_Commit_); ok {
 			return x.Commit
-		}
-	}
-	return nil
-}
-
-func (x *VEvent) GetPosition() *Position {
-	if x != nil {
-		if x, ok := x.Event.(*VEvent_Position); ok {
-			return x.Position
-		}
-	}
-	return nil
-}
-
-func (x *VEvent) GetHeartbeat() *VEvent_Heartbeat {
-	if x != nil {
-		if x, ok := x.Event.(*VEvent_Heartbeat_); ok {
-			return x.Heartbeat
-		}
-	}
-	return nil
-}
-
-func (x *VEvent) GetJournal() *VEvent_Journal {
-	if x != nil {
-		if x, ok := x.Event.(*VEvent_Journal_); ok {
-			return x.Journal
-		}
-	}
-	return nil
-}
-
-func (x *VEvent) GetCopyCompleted() *VEvent_CopyCompleted {
-	if x != nil {
-		if x, ok := x.Event.(*VEvent_CopyCompleted_); ok {
-			return x.CopyCompleted
-		}
-	}
-	return nil
-}
-
-func (x *VEvent) GetLastPk() *VEvent_LastPK {
-	if x != nil {
-		if x, ok := x.Event.(*VEvent_LastPk); ok {
-			return x.LastPk
-		}
-	}
-	return nil
-}
-
-func (x *VEvent) GetDdlMarker() *VEvent_DdlMarker {
-	if x != nil {
-		if x, ok := x.Event.(*VEvent_DdlMarker_); ok {
-			return x.DdlMarker
 		}
 	}
 	return nil
@@ -601,6 +1172,42 @@ func (x *VEvent) GetRollbackPrepared() *VEvent_RollbackPrepared {
 	return nil
 }
 
+func (x *VEvent) GetVgtid() *VEvent_VGtid {
+	if x != nil {
+		if x, ok := x.Event.(*VEvent_Vgtid); ok {
+			return x.Vgtid
+		}
+	}
+	return nil
+}
+
+func (x *VEvent) GetHeartbeat() *VEvent_Heartbeat {
+	if x != nil {
+		if x, ok := x.Event.(*VEvent_Heartbeat_); ok {
+			return x.Heartbeat
+		}
+	}
+	return nil
+}
+
+func (x *VEvent) GetJournal() *VEvent_Journal {
+	if x != nil {
+		if x, ok := x.Event.(*VEvent_Journal_); ok {
+			return x.Journal
+		}
+	}
+	return nil
+}
+
+func (x *VEvent) GetError() *VEvent_Error {
+	if x != nil {
+		if x, ok := x.Event.(*VEvent_Error_); ok {
+			return x.Error
+		}
+	}
+	return nil
+}
+
 type isVEvent_Event interface {
 	isVEvent_Event()
 }
@@ -609,68 +1216,65 @@ type VEvent_Begin_ struct {
 	Begin *VEvent_Begin `protobuf:"bytes,1,opt,name=begin,proto3,oneof"`
 }
 
+type VEvent_Relation_ struct {
+	Relation *VEvent_Relation `protobuf:"bytes,2,opt,name=relation,proto3,oneof"`
+}
+
 type VEvent_Row_ struct {
-	Row *VEvent_Row `protobuf:"bytes,2,opt,name=row,proto3,oneof"`
+	Row *VEvent_Row `protobuf:"bytes,3,opt,name=row,proto3,oneof"`
+}
+
+type VEvent_Truncate_ struct {
+	Truncate *VEvent_Truncate `protobuf:"bytes,4,opt,name=truncate,proto3,oneof"`
+}
+
+type VEvent_Message_ struct {
+	Message *VEvent_Message `protobuf:"bytes,5,opt,name=message,proto3,oneof"`
 }
 
 type VEvent_Commit_ struct {
-	Commit *VEvent_Commit `protobuf:"bytes,3,opt,name=commit,proto3,oneof"`
-}
-
-type VEvent_Position struct {
-	// Position the consumer may ack after processing preceding events.
-	Position *Position `protobuf:"bytes,4,opt,name=position,proto3,oneof"`
-}
-
-type VEvent_Heartbeat_ struct {
-	Heartbeat *VEvent_Heartbeat `protobuf:"bytes,5,opt,name=heartbeat,proto3,oneof"`
-}
-
-type VEvent_Journal_ struct {
-	Journal *VEvent_Journal `protobuf:"bytes,6,opt,name=journal,proto3,oneof"`
-}
-
-type VEvent_CopyCompleted_ struct {
-	CopyCompleted *VEvent_CopyCompleted `protobuf:"bytes,7,opt,name=copy_completed,json=copyCompleted,proto3,oneof"`
-}
-
-type VEvent_LastPk struct {
-	LastPk *VEvent_LastPK `protobuf:"bytes,8,opt,name=last_pk,json=lastPk,proto3,oneof"`
-}
-
-type VEvent_DdlMarker_ struct {
-	DdlMarker *VEvent_DdlMarker `protobuf:"bytes,9,opt,name=ddl_marker,json=ddlMarker,proto3,oneof"`
+	Commit *VEvent_Commit `protobuf:"bytes,6,opt,name=commit,proto3,oneof"`
 }
 
 type VEvent_Prepare_ struct {
-	Prepare *VEvent_Prepare `protobuf:"bytes,10,opt,name=prepare,proto3,oneof"`
+	Prepare *VEvent_Prepare `protobuf:"bytes,7,opt,name=prepare,proto3,oneof"`
 }
 
 type VEvent_CommitPrepared_ struct {
-	CommitPrepared *VEvent_CommitPrepared `protobuf:"bytes,11,opt,name=commit_prepared,json=commitPrepared,proto3,oneof"`
+	CommitPrepared *VEvent_CommitPrepared `protobuf:"bytes,8,opt,name=commit_prepared,json=commitPrepared,proto3,oneof"`
 }
 
 type VEvent_RollbackPrepared_ struct {
-	RollbackPrepared *VEvent_RollbackPrepared `protobuf:"bytes,12,opt,name=rollback_prepared,json=rollbackPrepared,proto3,oneof"`
+	RollbackPrepared *VEvent_RollbackPrepared `protobuf:"bytes,9,opt,name=rollback_prepared,json=rollbackPrepared,proto3,oneof"`
+}
+
+type VEvent_Vgtid struct {
+	Vgtid *VEvent_VGtid `protobuf:"bytes,10,opt,name=vgtid,proto3,oneof"`
+}
+
+type VEvent_Heartbeat_ struct {
+	Heartbeat *VEvent_Heartbeat `protobuf:"bytes,11,opt,name=heartbeat,proto3,oneof"`
+}
+
+type VEvent_Journal_ struct {
+	Journal *VEvent_Journal `protobuf:"bytes,12,opt,name=journal,proto3,oneof"`
+}
+
+type VEvent_Error_ struct {
+	Error *VEvent_Error `protobuf:"bytes,13,opt,name=error,proto3,oneof"`
 }
 
 func (*VEvent_Begin_) isVEvent_Event() {}
 
+func (*VEvent_Relation_) isVEvent_Event() {}
+
 func (*VEvent_Row_) isVEvent_Event() {}
 
+func (*VEvent_Truncate_) isVEvent_Event() {}
+
+func (*VEvent_Message_) isVEvent_Event() {}
+
 func (*VEvent_Commit_) isVEvent_Event() {}
-
-func (*VEvent_Position) isVEvent_Event() {}
-
-func (*VEvent_Heartbeat_) isVEvent_Event() {}
-
-func (*VEvent_Journal_) isVEvent_Event() {}
-
-func (*VEvent_CopyCompleted_) isVEvent_Event() {}
-
-func (*VEvent_LastPk) isVEvent_Event() {}
-
-func (*VEvent_DdlMarker_) isVEvent_Event() {}
 
 func (*VEvent_Prepare_) isVEvent_Event() {}
 
@@ -678,20 +1282,147 @@ func (*VEvent_CommitPrepared_) isVEvent_Event() {}
 
 func (*VEvent_RollbackPrepared_) isVEvent_Event() {}
 
-// Transaction begins on a shard.
+func (*VEvent_Vgtid) isVEvent_Event() {}
+
+func (*VEvent_Heartbeat_) isVEvent_Event() {}
+
+func (*VEvent_Journal_) isVEvent_Event() {}
+
+func (*VEvent_Error_) isVEvent_Event() {}
+
+// One shard's position.
+type VPosition_Shard struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Shard *ShardRef              `protobuf:"bytes,1,opt,name=shard,proto3" json:"shard,omitempty"`
+	// End LSN of the last delivered transaction; a shard missing from the
+	// vector resumes from its slot's confirmed position.
+	Lsn           uint64 `protobuf:"varint,2,opt,name=lsn,proto3" json:"lsn,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VPosition_Shard) Reset() {
+	*x = VPosition_Shard{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VPosition_Shard) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VPosition_Shard) ProtoMessage() {}
+
+func (x *VPosition_Shard) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VPosition_Shard.ProtoReflect.Descriptor instead.
+func (*VPosition_Shard) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{9, 0}
+}
+
+func (x *VPosition_Shard) GetShard() *ShardRef {
+	if x != nil {
+		return x.Shard
+	}
+	return nil
+}
+
+func (x *VPosition_Shard) GetLsn() uint64 {
+	if x != nil {
+		return x.Lsn
+	}
+	return 0
+}
+
+// VStreamStart opens the stream.
+type VStreamRequest_Start struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Stream string                 `protobuf:"bytes,1,opt,name=stream,proto3" json:"stream,omitempty"`
+	// Position to resume from; empty resumes every shard from its slot.
+	Position      *VPosition      `protobuf:"bytes,2,opt,name=position,proto3" json:"position,omitempty"`
+	Options       *VStreamOptions `protobuf:"bytes,3,opt,name=options,proto3" json:"options,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VStreamRequest_Start) Reset() {
+	*x = VStreamRequest_Start{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VStreamRequest_Start) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VStreamRequest_Start) ProtoMessage() {}
+
+func (x *VStreamRequest_Start) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VStreamRequest_Start.ProtoReflect.Descriptor instead.
+func (*VStreamRequest_Start) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{10, 0}
+}
+
+func (x *VStreamRequest_Start) GetStream() string {
+	if x != nil {
+		return x.Stream
+	}
+	return ""
+}
+
+func (x *VStreamRequest_Start) GetPosition() *VPosition {
+	if x != nil {
+		return x.Position
+	}
+	return nil
+}
+
+func (x *VStreamRequest_Start) GetOptions() *VStreamOptions {
+	if x != nil {
+		return x.Options
+	}
+	return nil
+}
+
+// Begin opens a shard transaction.
 type VEvent_Begin struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Shard *ShardRef              `protobuf:"bytes,1,opt,name=shard,proto3" json:"shard,omitempty"`
 	Xid   uint32                 `protobuf:"varint,2,opt,name=xid,proto3" json:"xid,omitempty"`
-	// Commit timestamp in microseconds since the PostgreSQL epoch, when known.
-	CommitTs      *int64 `protobuf:"varint,3,opt,name=commit_ts,json=commitTs,proto3,oneof" json:"commit_ts,omitempty"`
+	// Commit (or prepare) timestamp in microseconds since 2000-01-01 UTC.
+	CommitTs int64 `protobuf:"varint,3,opt,name=commit_ts,json=commitTs,proto3" json:"commit_ts,omitempty"`
+	// Global identifier of a two-phase transaction being prepared.
+	Gid           string `protobuf:"bytes,4,opt,name=gid,proto3" json:"gid,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *VEvent_Begin) Reset() {
 	*x = VEvent_Begin{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[6]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -703,7 +1434,7 @@ func (x *VEvent_Begin) String() string {
 func (*VEvent_Begin) ProtoMessage() {}
 
 func (x *VEvent_Begin) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[6]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -716,7 +1447,7 @@ func (x *VEvent_Begin) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VEvent_Begin.ProtoReflect.Descriptor instead.
 func (*VEvent_Begin) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{5, 0}
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{15, 0}
 }
 
 func (x *VEvent_Begin) GetShard() *ShardRef {
@@ -734,28 +1465,112 @@ func (x *VEvent_Begin) GetXid() uint32 {
 }
 
 func (x *VEvent_Begin) GetCommitTs() int64 {
-	if x != nil && x.CommitTs != nil {
-		return *x.CommitTs
+	if x != nil {
+		return x.CommitTs
 	}
 	return 0
 }
 
-// One row change.
+func (x *VEvent_Begin) GetGid() string {
+	if x != nil {
+		return x.Gid
+	}
+	return ""
+}
+
+// Relation describes a table before its first row in the stream and again
+// whenever its columns change. Relation ids are not exposed: a table is
+// named by schema and table so the same table on different shards, or
+// after a rewrite, maps to one relation.
+type VEvent_Relation struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Schema string                 `protobuf:"bytes,1,opt,name=schema,proto3" json:"schema,omitempty"`
+	Table  string                 `protobuf:"bytes,2,opt,name=table,proto3" json:"table,omitempty"`
+	// d default, n nothing, f full, i index.
+	ReplicaIdentity string                    `protobuf:"bytes,3,opt,name=replica_identity,json=replicaIdentity,proto3" json:"replica_identity,omitempty"`
+	Columns         []*VEvent_Relation_Column `protobuf:"bytes,4,rep,name=columns,proto3" json:"columns,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *VEvent_Relation) Reset() {
+	*x = VEvent_Relation{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VEvent_Relation) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VEvent_Relation) ProtoMessage() {}
+
+func (x *VEvent_Relation) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VEvent_Relation.ProtoReflect.Descriptor instead.
+func (*VEvent_Relation) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{15, 1}
+}
+
+func (x *VEvent_Relation) GetSchema() string {
+	if x != nil {
+		return x.Schema
+	}
+	return ""
+}
+
+func (x *VEvent_Relation) GetTable() string {
+	if x != nil {
+		return x.Table
+	}
+	return ""
+}
+
+func (x *VEvent_Relation) GetReplicaIdentity() string {
+	if x != nil {
+		return x.ReplicaIdentity
+	}
+	return ""
+}
+
+func (x *VEvent_Relation) GetColumns() []*VEvent_Relation_Column {
+	if x != nil {
+		return x.Columns
+	}
+	return nil
+}
+
+// Row is one row change.
 type VEvent_Row struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	Table string                 `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"`
-	Kind  VEvent_Row_Kind        `protobuf:"varint,2,opt,name=kind,proto3,enum=pgshard.v1.VEvent_Row_Kind" json:"kind,omitempty"`
-	// Old image; present for UPDATE/DELETE when replica identity allows.
-	Old *Tuple `protobuf:"bytes,3,opt,name=old,proto3" json:"old,omitempty"`
-	// New image; present for INSERT/UPDATE.
-	New           *Tuple `protobuf:"bytes,4,opt,name=new,proto3" json:"new,omitempty"`
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Shard  *ShardRef              `protobuf:"bytes,1,opt,name=shard,proto3" json:"shard,omitempty"`
+	Schema string                 `protobuf:"bytes,2,opt,name=schema,proto3" json:"schema,omitempty"`
+	Table  string                 `protobuf:"bytes,3,opt,name=table,proto3" json:"table,omitempty"`
+	Kind   VEvent_Row_Kind        `protobuf:"varint,4,opt,name=kind,proto3,enum=pgshard.v1.VEvent_Row_Kind" json:"kind,omitempty"`
+	// Old image for UPDATE/DELETE when the replica identity provides one.
+	Old *VTuple `protobuf:"bytes,5,opt,name=old,proto3" json:"old,omitempty"`
+	// True when old holds the key columns only.
+	OldIsKey bool `protobuf:"varint,6,opt,name=old_is_key,json=oldIsKey,proto3" json:"old_is_key,omitempty"`
+	// New image for INSERT/UPDATE.
+	New           *VTuple `protobuf:"bytes,7,opt,name=new,proto3" json:"new,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *VEvent_Row) Reset() {
 	*x = VEvent_Row{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[7]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -767,7 +1582,7 @@ func (x *VEvent_Row) String() string {
 func (*VEvent_Row) ProtoMessage() {}
 
 func (x *VEvent_Row) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[7]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -780,7 +1595,21 @@ func (x *VEvent_Row) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VEvent_Row.ProtoReflect.Descriptor instead.
 func (*VEvent_Row) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{5, 1}
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{15, 2}
+}
+
+func (x *VEvent_Row) GetShard() *ShardRef {
+	if x != nil {
+		return x.Shard
+	}
+	return nil
+}
+
+func (x *VEvent_Row) GetSchema() string {
+	if x != nil {
+		return x.Schema
+	}
+	return ""
 }
 
 func (x *VEvent_Row) GetTable() string {
@@ -797,32 +1626,180 @@ func (x *VEvent_Row) GetKind() VEvent_Row_Kind {
 	return VEvent_Row_KIND_UNSPECIFIED
 }
 
-func (x *VEvent_Row) GetOld() *Tuple {
+func (x *VEvent_Row) GetOld() *VTuple {
 	if x != nil {
 		return x.Old
 	}
 	return nil
 }
 
-func (x *VEvent_Row) GetNew() *Tuple {
+func (x *VEvent_Row) GetOldIsKey() bool {
+	if x != nil {
+		return x.OldIsKey
+	}
+	return false
+}
+
+func (x *VEvent_Row) GetNew() *VTuple {
 	if x != nil {
 		return x.New
 	}
 	return nil
 }
 
-// Transaction commits on a shard.
-type VEvent_Commit struct {
+// Truncate of one or more tables.
+type VEvent_Truncate struct {
+	state           protoimpl.MessageState   `protogen:"open.v1"`
+	Shard           *ShardRef                `protobuf:"bytes,1,opt,name=shard,proto3" json:"shard,omitempty"`
+	Tables          []*VEvent_Truncate_Table `protobuf:"bytes,2,rep,name=tables,proto3" json:"tables,omitempty"`
+	Cascade         bool                     `protobuf:"varint,3,opt,name=cascade,proto3" json:"cascade,omitempty"`
+	RestartIdentity bool                     `protobuf:"varint,4,opt,name=restart_identity,json=restartIdentity,proto3" json:"restart_identity,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *VEvent_Truncate) Reset() {
+	*x = VEvent_Truncate{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VEvent_Truncate) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VEvent_Truncate) ProtoMessage() {}
+
+func (x *VEvent_Truncate) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VEvent_Truncate.ProtoReflect.Descriptor instead.
+func (*VEvent_Truncate) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{15, 3}
+}
+
+func (x *VEvent_Truncate) GetShard() *ShardRef {
+	if x != nil {
+		return x.Shard
+	}
+	return nil
+}
+
+func (x *VEvent_Truncate) GetTables() []*VEvent_Truncate_Table {
+	if x != nil {
+		return x.Tables
+	}
+	return nil
+}
+
+func (x *VEvent_Truncate) GetCascade() bool {
+	if x != nil {
+		return x.Cascade
+	}
+	return false
+}
+
+func (x *VEvent_Truncate) GetRestartIdentity() bool {
+	if x != nil {
+		return x.RestartIdentity
+	}
+	return false
+}
+
+// Message is a logical decoding message (pg_logical_emit_message).
+type VEvent_Message struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Shard         *ShardRef              `protobuf:"bytes,1,opt,name=shard,proto3" json:"shard,omitempty"`
-	Lsn           uint64                 `protobuf:"varint,2,opt,name=lsn,proto3" json:"lsn,omitempty"`
+	Prefix        string                 `protobuf:"bytes,2,opt,name=prefix,proto3" json:"prefix,omitempty"`
+	Content       []byte                 `protobuf:"bytes,3,opt,name=content,proto3" json:"content,omitempty"`
+	Transactional bool                   `protobuf:"varint,4,opt,name=transactional,proto3" json:"transactional,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VEvent_Message) Reset() {
+	*x = VEvent_Message{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VEvent_Message) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VEvent_Message) ProtoMessage() {}
+
+func (x *VEvent_Message) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VEvent_Message.ProtoReflect.Descriptor instead.
+func (*VEvent_Message) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{15, 4}
+}
+
+func (x *VEvent_Message) GetShard() *ShardRef {
+	if x != nil {
+		return x.Shard
+	}
+	return nil
+}
+
+func (x *VEvent_Message) GetPrefix() string {
+	if x != nil {
+		return x.Prefix
+	}
+	return ""
+}
+
+func (x *VEvent_Message) GetContent() []byte {
+	if x != nil {
+		return x.Content
+	}
+	return nil
+}
+
+func (x *VEvent_Message) GetTransactional() bool {
+	if x != nil {
+		return x.Transactional
+	}
+	return false
+}
+
+// Commit closes a shard transaction.
+type VEvent_Commit struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Shard *ShardRef              `protobuf:"bytes,1,opt,name=shard,proto3" json:"shard,omitempty"`
+	// Commit LSN.
+	Lsn uint64 `protobuf:"varint,2,opt,name=lsn,proto3" json:"lsn,omitempty"`
+	// End LSN; the shard's position after this transaction.
+	EndLsn        uint64 `protobuf:"varint,3,opt,name=end_lsn,json=endLsn,proto3" json:"end_lsn,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *VEvent_Commit) Reset() {
 	*x = VEvent_Commit{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[8]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -834,7 +1811,7 @@ func (x *VEvent_Commit) String() string {
 func (*VEvent_Commit) ProtoMessage() {}
 
 func (x *VEvent_Commit) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[8]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -847,7 +1824,7 @@ func (x *VEvent_Commit) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VEvent_Commit.ProtoReflect.Descriptor instead.
 func (*VEvent_Commit) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{5, 2}
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{15, 5}
 }
 
 func (x *VEvent_Commit) GetShard() *ShardRef {
@@ -864,16 +1841,252 @@ func (x *VEvent_Commit) GetLsn() uint64 {
 	return 0
 }
 
-// Heartbeat proves liveness while no changes flow.
+func (x *VEvent_Commit) GetEndLsn() uint64 {
+	if x != nil {
+		return x.EndLsn
+	}
+	return 0
+}
+
+// Prepare closes the changes of a two-phase transaction at PREPARE time.
+type VEvent_Prepare struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Shard         *ShardRef              `protobuf:"bytes,1,opt,name=shard,proto3" json:"shard,omitempty"`
+	Gid           string                 `protobuf:"bytes,2,opt,name=gid,proto3" json:"gid,omitempty"`
+	Lsn           uint64                 `protobuf:"varint,3,opt,name=lsn,proto3" json:"lsn,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VEvent_Prepare) Reset() {
+	*x = VEvent_Prepare{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VEvent_Prepare) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VEvent_Prepare) ProtoMessage() {}
+
+func (x *VEvent_Prepare) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VEvent_Prepare.ProtoReflect.Descriptor instead.
+func (*VEvent_Prepare) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{15, 6}
+}
+
+func (x *VEvent_Prepare) GetShard() *ShardRef {
+	if x != nil {
+		return x.Shard
+	}
+	return nil
+}
+
+func (x *VEvent_Prepare) GetGid() string {
+	if x != nil {
+		return x.Gid
+	}
+	return ""
+}
+
+func (x *VEvent_Prepare) GetLsn() uint64 {
+	if x != nil {
+		return x.Lsn
+	}
+	return 0
+}
+
+// CommitPrepared commits an earlier Prepare.
+type VEvent_CommitPrepared struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Shard         *ShardRef              `protobuf:"bytes,1,opt,name=shard,proto3" json:"shard,omitempty"`
+	Gid           string                 `protobuf:"bytes,2,opt,name=gid,proto3" json:"gid,omitempty"`
+	Lsn           uint64                 `protobuf:"varint,3,opt,name=lsn,proto3" json:"lsn,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VEvent_CommitPrepared) Reset() {
+	*x = VEvent_CommitPrepared{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VEvent_CommitPrepared) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VEvent_CommitPrepared) ProtoMessage() {}
+
+func (x *VEvent_CommitPrepared) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VEvent_CommitPrepared.ProtoReflect.Descriptor instead.
+func (*VEvent_CommitPrepared) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{15, 7}
+}
+
+func (x *VEvent_CommitPrepared) GetShard() *ShardRef {
+	if x != nil {
+		return x.Shard
+	}
+	return nil
+}
+
+func (x *VEvent_CommitPrepared) GetGid() string {
+	if x != nil {
+		return x.Gid
+	}
+	return ""
+}
+
+func (x *VEvent_CommitPrepared) GetLsn() uint64 {
+	if x != nil {
+		return x.Lsn
+	}
+	return 0
+}
+
+// RollbackPrepared rolls back an earlier Prepare.
+type VEvent_RollbackPrepared struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Shard         *ShardRef              `protobuf:"bytes,1,opt,name=shard,proto3" json:"shard,omitempty"`
+	Gid           string                 `protobuf:"bytes,2,opt,name=gid,proto3" json:"gid,omitempty"`
+	Lsn           uint64                 `protobuf:"varint,3,opt,name=lsn,proto3" json:"lsn,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VEvent_RollbackPrepared) Reset() {
+	*x = VEvent_RollbackPrepared{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VEvent_RollbackPrepared) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VEvent_RollbackPrepared) ProtoMessage() {}
+
+func (x *VEvent_RollbackPrepared) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VEvent_RollbackPrepared.ProtoReflect.Descriptor instead.
+func (*VEvent_RollbackPrepared) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{15, 8}
+}
+
+func (x *VEvent_RollbackPrepared) GetShard() *ShardRef {
+	if x != nil {
+		return x.Shard
+	}
+	return nil
+}
+
+func (x *VEvent_RollbackPrepared) GetGid() string {
+	if x != nil {
+		return x.Gid
+	}
+	return ""
+}
+
+func (x *VEvent_RollbackPrepared) GetLsn() uint64 {
+	if x != nil {
+		return x.Lsn
+	}
+	return 0
+}
+
+// VGtid snapshots the vector after every transaction boundary.
+type VEvent_VGtid struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Position      *VPosition             `protobuf:"bytes,1,opt,name=position,proto3" json:"position,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VEvent_VGtid) Reset() {
+	*x = VEvent_VGtid{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[27]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VEvent_VGtid) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VEvent_VGtid) ProtoMessage() {}
+
+func (x *VEvent_VGtid) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[27]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VEvent_VGtid.ProtoReflect.Descriptor instead.
+func (*VEvent_VGtid) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{15, 9}
+}
+
+func (x *VEvent_VGtid) GetPosition() *VPosition {
+	if x != nil {
+		return x.Position
+	}
+	return nil
+}
+
+// Heartbeat proves liveness while idle and carries the vector.
 type VEvent_Heartbeat struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
+	Position      *VPosition             `protobuf:"bytes,1,opt,name=position,proto3" json:"position,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *VEvent_Heartbeat) Reset() {
 	*x = VEvent_Heartbeat{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[9]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -885,7 +2098,7 @@ func (x *VEvent_Heartbeat) String() string {
 func (*VEvent_Heartbeat) ProtoMessage() {}
 
 func (x *VEvent_Heartbeat) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[9]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -898,7 +2111,14 @@ func (x *VEvent_Heartbeat) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VEvent_Heartbeat.ProtoReflect.Descriptor instead.
 func (*VEvent_Heartbeat) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{5, 3}
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{15, 10}
+}
+
+func (x *VEvent_Heartbeat) GetPosition() *VPosition {
+	if x != nil {
+		return x.Position
+	}
+	return nil
 }
 
 // Journal announces a resharding event and where the stream continues.
@@ -906,15 +2126,16 @@ type VEvent_Journal struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	JournalId string                 `protobuf:"bytes,1,opt,name=journal_id,json=journalId,proto3" json:"journal_id,omitempty"`
 	// Source shards participating in the reshard.
-	Participants  []*ShardRef              `protobuf:"bytes,2,rep,name=participants,proto3" json:"participants,omitempty"`
-	Targets       []*VEvent_Journal_Target `protobuf:"bytes,3,rep,name=targets,proto3" json:"targets,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Participants       []*ShardRef              `protobuf:"bytes,2,rep,name=participants,proto3" json:"participants,omitempty"`
+	Targets            []*VEvent_Journal_Target `protobuf:"bytes,3,rep,name=targets,proto3" json:"targets,omitempty"`
+	ShardMapGeneration uint64                   `protobuf:"varint,4,opt,name=shard_map_generation,json=shardMapGeneration,proto3" json:"shard_map_generation,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *VEvent_Journal) Reset() {
 	*x = VEvent_Journal{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[10]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -926,7 +2147,7 @@ func (x *VEvent_Journal) String() string {
 func (*VEvent_Journal) ProtoMessage() {}
 
 func (x *VEvent_Journal) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[10]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -939,7 +2160,7 @@ func (x *VEvent_Journal) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VEvent_Journal.ProtoReflect.Descriptor instead.
 func (*VEvent_Journal) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{5, 4}
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{15, 11}
 }
 
 func (x *VEvent_Journal) GetJournalId() string {
@@ -963,29 +2184,38 @@ func (x *VEvent_Journal) GetTargets() []*VEvent_Journal_Target {
 	return nil
 }
 
-// CopyCompleted marks the end of the initial copy phase for a table.
-type VEvent_CopyCompleted struct {
+func (x *VEvent_Journal) GetShardMapGeneration() uint64 {
+	if x != nil {
+		return x.ShardMapGeneration
+	}
+	return 0
+}
+
+// Error ends the stream.
+type VEvent_Error struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Table         string                 `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"`
+	Code          VEvent_Error_Code      `protobuf:"varint,1,opt,name=code,proto3,enum=pgshard.v1.VEvent_Error_Code" json:"code,omitempty"`
+	Message       string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	Shard         *ShardRef              `protobuf:"bytes,3,opt,name=shard,proto3" json:"shard,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *VEvent_CopyCompleted) Reset() {
-	*x = VEvent_CopyCompleted{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[11]
+func (x *VEvent_Error) Reset() {
+	*x = VEvent_Error{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *VEvent_CopyCompleted) String() string {
+func (x *VEvent_Error) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*VEvent_CopyCompleted) ProtoMessage() {}
+func (*VEvent_Error) ProtoMessage() {}
 
-func (x *VEvent_CopyCompleted) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[11]
+func (x *VEvent_Error) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -996,279 +2226,150 @@ func (x *VEvent_CopyCompleted) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use VEvent_CopyCompleted.ProtoReflect.Descriptor instead.
-func (*VEvent_CopyCompleted) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{5, 5}
+// Deprecated: Use VEvent_Error.ProtoReflect.Descriptor instead.
+func (*VEvent_Error) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{15, 12}
 }
 
-func (x *VEvent_CopyCompleted) GetTable() string {
+func (x *VEvent_Error) GetCode() VEvent_Error_Code {
+	if x != nil {
+		return x.Code
+	}
+	return VEvent_Error_CODE_UNSPECIFIED
+}
+
+func (x *VEvent_Error) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *VEvent_Error) GetShard() *ShardRef {
+	if x != nil {
+		return x.Shard
+	}
+	return nil
+}
+
+// Column of a relation.
+type VEvent_Relation_Column struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	TypeOid       uint32                 `protobuf:"varint,2,opt,name=type_oid,json=typeOid,proto3" json:"type_oid,omitempty"`
+	TypeModifier  int32                  `protobuf:"varint,3,opt,name=type_modifier,json=typeModifier,proto3" json:"type_modifier,omitempty"`
+	Key           bool                   `protobuf:"varint,4,opt,name=key,proto3" json:"key,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VEvent_Relation_Column) Reset() {
+	*x = VEvent_Relation_Column{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[31]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VEvent_Relation_Column) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VEvent_Relation_Column) ProtoMessage() {}
+
+func (x *VEvent_Relation_Column) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[31]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VEvent_Relation_Column.ProtoReflect.Descriptor instead.
+func (*VEvent_Relation_Column) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{15, 1, 0}
+}
+
+func (x *VEvent_Relation_Column) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *VEvent_Relation_Column) GetTypeOid() uint32 {
+	if x != nil {
+		return x.TypeOid
+	}
+	return 0
+}
+
+func (x *VEvent_Relation_Column) GetTypeModifier() int32 {
+	if x != nil {
+		return x.TypeModifier
+	}
+	return 0
+}
+
+func (x *VEvent_Relation_Column) GetKey() bool {
+	if x != nil {
+		return x.Key
+	}
+	return false
+}
+
+// One truncated table.
+type VEvent_Truncate_Table struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Schema        string                 `protobuf:"bytes,1,opt,name=schema,proto3" json:"schema,omitempty"`
+	Table         string                 `protobuf:"bytes,2,opt,name=table,proto3" json:"table,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VEvent_Truncate_Table) Reset() {
+	*x = VEvent_Truncate_Table{}
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[32]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VEvent_Truncate_Table) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VEvent_Truncate_Table) ProtoMessage() {}
+
+func (x *VEvent_Truncate_Table) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[32]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VEvent_Truncate_Table.ProtoReflect.Descriptor instead.
+func (*VEvent_Truncate_Table) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{15, 3, 0}
+}
+
+func (x *VEvent_Truncate_Table) GetSchema() string {
+	if x != nil {
+		return x.Schema
+	}
+	return ""
+}
+
+func (x *VEvent_Truncate_Table) GetTable() string {
 	if x != nil {
 		return x.Table
-	}
-	return ""
-}
-
-// LastPK reports copy progress so a consumer can resume the copy.
-type VEvent_LastPK struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Table         string                 `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"`
-	Pk            *Tuple                 `protobuf:"bytes,2,opt,name=pk,proto3" json:"pk,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *VEvent_LastPK) Reset() {
-	*x = VEvent_LastPK{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[12]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *VEvent_LastPK) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*VEvent_LastPK) ProtoMessage() {}
-
-func (x *VEvent_LastPK) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[12]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use VEvent_LastPK.ProtoReflect.Descriptor instead.
-func (*VEvent_LastPK) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{5, 6}
-}
-
-func (x *VEvent_LastPK) GetTable() string {
-	if x != nil {
-		return x.Table
-	}
-	return ""
-}
-
-func (x *VEvent_LastPK) GetPk() *Tuple {
-	if x != nil {
-		return x.Pk
-	}
-	return nil
-}
-
-// DdlMarker records a DDL statement applied at this point.
-type VEvent_DdlMarker struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Database      string                 `protobuf:"bytes,1,opt,name=database,proto3" json:"database,omitempty"`
-	Statement     string                 `protobuf:"bytes,2,opt,name=statement,proto3" json:"statement,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *VEvent_DdlMarker) Reset() {
-	*x = VEvent_DdlMarker{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[13]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *VEvent_DdlMarker) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*VEvent_DdlMarker) ProtoMessage() {}
-
-func (x *VEvent_DdlMarker) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[13]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use VEvent_DdlMarker.ProtoReflect.Descriptor instead.
-func (*VEvent_DdlMarker) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{5, 7}
-}
-
-func (x *VEvent_DdlMarker) GetDatabase() string {
-	if x != nil {
-		return x.Database
-	}
-	return ""
-}
-
-func (x *VEvent_DdlMarker) GetStatement() string {
-	if x != nil {
-		return x.Statement
-	}
-	return ""
-}
-
-// Prepare marks a two-phase transaction prepared.
-type VEvent_Prepare struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Shard         *ShardRef              `protobuf:"bytes,1,opt,name=shard,proto3" json:"shard,omitempty"`
-	Gid           string                 `protobuf:"bytes,2,opt,name=gid,proto3" json:"gid,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *VEvent_Prepare) Reset() {
-	*x = VEvent_Prepare{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[14]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *VEvent_Prepare) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*VEvent_Prepare) ProtoMessage() {}
-
-func (x *VEvent_Prepare) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[14]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use VEvent_Prepare.ProtoReflect.Descriptor instead.
-func (*VEvent_Prepare) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{5, 8}
-}
-
-func (x *VEvent_Prepare) GetShard() *ShardRef {
-	if x != nil {
-		return x.Shard
-	}
-	return nil
-}
-
-func (x *VEvent_Prepare) GetGid() string {
-	if x != nil {
-		return x.Gid
-	}
-	return ""
-}
-
-// CommitPrepared marks a prepared transaction committed.
-type VEvent_CommitPrepared struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Shard         *ShardRef              `protobuf:"bytes,1,opt,name=shard,proto3" json:"shard,omitempty"`
-	Gid           string                 `protobuf:"bytes,2,opt,name=gid,proto3" json:"gid,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *VEvent_CommitPrepared) Reset() {
-	*x = VEvent_CommitPrepared{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[15]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *VEvent_CommitPrepared) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*VEvent_CommitPrepared) ProtoMessage() {}
-
-func (x *VEvent_CommitPrepared) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[15]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use VEvent_CommitPrepared.ProtoReflect.Descriptor instead.
-func (*VEvent_CommitPrepared) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{5, 9}
-}
-
-func (x *VEvent_CommitPrepared) GetShard() *ShardRef {
-	if x != nil {
-		return x.Shard
-	}
-	return nil
-}
-
-func (x *VEvent_CommitPrepared) GetGid() string {
-	if x != nil {
-		return x.Gid
-	}
-	return ""
-}
-
-// RollbackPrepared marks a prepared transaction rolled back.
-type VEvent_RollbackPrepared struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Shard         *ShardRef              `protobuf:"bytes,1,opt,name=shard,proto3" json:"shard,omitempty"`
-	Gid           string                 `protobuf:"bytes,2,opt,name=gid,proto3" json:"gid,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *VEvent_RollbackPrepared) Reset() {
-	*x = VEvent_RollbackPrepared{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[16]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *VEvent_RollbackPrepared) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*VEvent_RollbackPrepared) ProtoMessage() {}
-
-func (x *VEvent_RollbackPrepared) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[16]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use VEvent_RollbackPrepared.ProtoReflect.Descriptor instead.
-func (*VEvent_RollbackPrepared) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{5, 10}
-}
-
-func (x *VEvent_RollbackPrepared) GetShard() *ShardRef {
-	if x != nil {
-		return x.Shard
-	}
-	return nil
-}
-
-func (x *VEvent_RollbackPrepared) GetGid() string {
-	if x != nil {
-		return x.Gid
 	}
 	return ""
 }
@@ -1284,7 +2385,7 @@ type VEvent_Journal_Target struct {
 
 func (x *VEvent_Journal_Target) Reset() {
 	*x = VEvent_Journal_Target{}
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[17]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1296,7 +2397,7 @@ func (x *VEvent_Journal_Target) String() string {
 func (*VEvent_Journal_Target) ProtoMessage() {}
 
 func (x *VEvent_Journal_Target) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_vstream_proto_msgTypes[17]
+	mi := &file_pgshard_v1_vstream_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1309,7 +2410,7 @@ func (x *VEvent_Journal_Target) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VEvent_Journal_Target.ProtoReflect.Descriptor instead.
 func (*VEvent_Journal_Target) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{5, 4, 0}
+	return file_pgshard_v1_vstream_proto_rawDescGZIP(), []int{15, 11, 0}
 }
 
 func (x *VEvent_Journal_Target) GetShard() *ShardRef {
@@ -1331,93 +2432,171 @@ var File_pgshard_v1_vstream_proto protoreflect.FileDescriptor
 const file_pgshard_v1_vstream_proto_rawDesc = "" +
 	"\n" +
 	"\x18pgshard/v1/vstream.proto\x12\n" +
-	"pgshard.v1\x1a\x17pgshard/v1/common.proto\"w\n" +
-	"\x0eVStreamRequest\x120\n" +
-	"\x05start\x18\x01 \x01(\v2\x18.pgshard.v1.VStreamStartH\x00R\x05start\x12(\n" +
-	"\x03ack\x18\x02 \x01(\v2\x14.pgshard.v1.PositionH\x00R\x03ackB\t\n" +
-	"\arequest\"\xb8\x01\n" +
-	"\fVStreamStart\x12*\n" +
-	"\x05start\x18\x01 \x01(\v2\x14.pgshard.v1.PositionR\x05start\x12\x12\n" +
-	"\x04copy\x18\x02 \x01(\bR\x04copy\x12\x1a\n" +
-	"\bdatabase\x18\x03 \x01(\tR\bdatabase\x12\x16\n" +
-	"\x06tables\x18\x04 \x03(\tR\x06tables\x124\n" +
-	"\aoptions\x18\x05 \x01(\v2\x1a.pgshard.v1.VStreamOptionsR\aoptions\"\xae\x01\n" +
+	"pgshard.v1\x1a\x17pgshard/v1/common.proto\"\x93\x02\n" +
 	"\x0eVStreamOptions\x12\x1b\n" +
 	"\ttwo_phase\x18\x01 \x01(\bR\btwoPhase\x12&\n" +
 	"\x0fstop_on_reshard\x18\x02 \x01(\bR\rstopOnReshard\x122\n" +
-	"\x15heartbeat_interval_ms\x18\x03 \x01(\rR\x13heartbeatIntervalMs\x12#\n" +
-	"\rminimize_skew\x18\x04 \x01(\bR\fminimizeSkew\"a\n" +
-	"\x06Column\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12\x19\n" +
-	"\btype_oid\x18\x02 \x01(\rR\atypeOid\x12\x12\n" +
-	"\x04null\x18\x03 \x01(\bR\x04null\x12\x14\n" +
-	"\x05value\x18\x04 \x01(\fR\x05value\"5\n" +
-	"\x05Tuple\x12,\n" +
-	"\acolumns\x18\x01 \x03(\v2\x12.pgshard.v1.ColumnR\acolumns\"\xb7\x0e\n" +
-	"\x06VEvent\x120\n" +
-	"\x05begin\x18\x01 \x01(\v2\x18.pgshard.v1.VEvent.BeginH\x00R\x05begin\x12*\n" +
-	"\x03row\x18\x02 \x01(\v2\x16.pgshard.v1.VEvent.RowH\x00R\x03row\x123\n" +
-	"\x06commit\x18\x03 \x01(\v2\x19.pgshard.v1.VEvent.CommitH\x00R\x06commit\x122\n" +
-	"\bposition\x18\x04 \x01(\v2\x14.pgshard.v1.PositionH\x00R\bposition\x12<\n" +
-	"\theartbeat\x18\x05 \x01(\v2\x1c.pgshard.v1.VEvent.HeartbeatH\x00R\theartbeat\x126\n" +
-	"\ajournal\x18\x06 \x01(\v2\x1a.pgshard.v1.VEvent.JournalH\x00R\ajournal\x12I\n" +
-	"\x0ecopy_completed\x18\a \x01(\v2 .pgshard.v1.VEvent.CopyCompletedH\x00R\rcopyCompleted\x124\n" +
-	"\alast_pk\x18\b \x01(\v2\x19.pgshard.v1.VEvent.LastPKH\x00R\x06lastPk\x12=\n" +
+	"\x15heartbeat_interval_ms\x18\x03 \x01(\rR\x13heartbeatIntervalMs\x12\x1d\n" +
 	"\n" +
-	"ddl_marker\x18\t \x01(\v2\x1c.pgshard.v1.VEvent.DdlMarkerH\x00R\tddlMarker\x126\n" +
-	"\aprepare\x18\n" +
-	" \x01(\v2\x1a.pgshard.v1.VEvent.PrepareH\x00R\aprepare\x12L\n" +
-	"\x0fcommit_prepared\x18\v \x01(\v2!.pgshard.v1.VEvent.CommitPreparedH\x00R\x0ecommitPrepared\x12R\n" +
-	"\x11rollback_prepared\x18\f \x01(\v2#.pgshard.v1.VEvent.RollbackPreparedH\x00R\x10rollbackPrepared\x1au\n" +
+	"align_skew\x18\x04 \x01(\bR\talignSkew\x12\"\n" +
+	"\ralign_skew_ms\x18\x05 \x01(\rR\valignSkewMs\x12(\n" +
+	"\x10align_timeout_ms\x18\x06 \x01(\rR\x0ealignTimeoutMs\x12\x1b\n" +
+	"\tshard_set\x18\a \x01(\tR\bshardSet\"g\n" +
+	"\x14CreateVStreamRequest\x12\x16\n" +
+	"\x06stream\x18\x01 \x01(\tR\x06stream\x12\x1a\n" +
+	"\bdatabase\x18\x02 \x01(\tR\bdatabase\x12\x1b\n" +
+	"\ttwo_phase\x18\x03 \x01(\bR\btwoPhase\"o\n" +
+	"\x15CreateVStreamResponse\x12-\n" +
+	"\x05slots\x18\x01 \x03(\v2\x17.pgshard.v1.VStreamSlotR\x05slots\x12'\n" +
+	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"\xb4\x01\n" +
+	"\vVStreamSlot\x12*\n" +
+	"\x05shard\x18\x01 \x01(\v2\x14.pgshard.v1.ShardRefR\x05shard\x12\x12\n" +
+	"\x04slot\x18\x02 \x01(\tR\x04slot\x12\x1d\n" +
+	"\n" +
+	"wal_status\x18\x03 \x01(\tR\twalStatus\x12.\n" +
+	"\x13confirmed_flush_lsn\x18\x04 \x01(\x04R\x11confirmedFlushLsn\x12\x16\n" +
+	"\x06active\x18\x05 \x01(\bR\x06active\",\n" +
+	"\x12DropVStreamRequest\x12\x16\n" +
+	"\x06stream\x18\x01 \x01(\tR\x06stream\">\n" +
+	"\x13DropVStreamResponse\x12'\n" +
+	"\x05error\x18\x01 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"\x15\n" +
+	"\x13ListVStreamsRequest\"\xa3\x01\n" +
+	"\vVStreamInfo\x12\x16\n" +
+	"\x06stream\x18\x01 \x01(\tR\x06stream\x12\x1a\n" +
+	"\bdatabase\x18\x02 \x01(\tR\bdatabase\x12\x1b\n" +
+	"\ttwo_phase\x18\x03 \x01(\bR\btwoPhase\x12\x14\n" +
+	"\x05state\x18\x04 \x01(\tR\x05state\x12-\n" +
+	"\x05slots\x18\x05 \x03(\v2\x17.pgshard.v1.VStreamSlotR\x05slots\"I\n" +
+	"\x14ListVStreamsResponse\x121\n" +
+	"\astreams\x18\x01 \x03(\v2\x17.pgshard.v1.VStreamInfoR\astreams\"\xb9\x01\n" +
+	"\tVPosition\x123\n" +
+	"\x06shards\x18\x01 \x03(\v2\x1b.pgshard.v1.VPosition.ShardR\x06shards\x120\n" +
+	"\x14shard_map_generation\x18\x02 \x01(\x04R\x12shardMapGeneration\x1aE\n" +
+	"\x05Shard\x12*\n" +
+	"\x05shard\x18\x01 \x01(\v2\x14.pgshard.v1.ShardRefR\x05shard\x12\x10\n" +
+	"\x03lsn\x18\x02 \x01(\x04R\x03lsn\"\x8b\x02\n" +
+	"\x0eVStreamRequest\x128\n" +
+	"\x05start\x18\x01 \x01(\v2 .pgshard.v1.VStreamRequest.StartH\x00R\x05start\x12)\n" +
+	"\x03ack\x18\x02 \x01(\v2\x15.pgshard.v1.VPositionH\x00R\x03ack\x1a\x88\x01\n" +
+	"\x05Start\x12\x16\n" +
+	"\x06stream\x18\x01 \x01(\tR\x06stream\x121\n" +
+	"\bposition\x18\x02 \x01(\v2\x15.pgshard.v1.VPositionR\bposition\x124\n" +
+	"\aoptions\x18\x03 \x01(\v2\x1a.pgshard.v1.VStreamOptionsR\aoptionsB\t\n" +
+	"\arequest\"^\n" +
+	"\x11VStreamAckRequest\x12\x16\n" +
+	"\x06stream\x18\x01 \x01(\tR\x06stream\x121\n" +
+	"\bposition\x18\x02 \x01(\v2\x15.pgshard.v1.VPositionR\bposition\"=\n" +
+	"\x12VStreamAckResponse\x12'\n" +
+	"\x05error\x18\x01 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"\\\n" +
+	"\aVColumn\x12\x12\n" +
+	"\x04null\x18\x01 \x01(\bR\x04null\x12'\n" +
+	"\x0funchanged_toast\x18\x02 \x01(\bR\x0eunchangedToast\x12\x14\n" +
+	"\x05value\x18\x03 \x01(\fR\x05value\"7\n" +
+	"\x06VTuple\x12-\n" +
+	"\acolumns\x18\x01 \x03(\v2\x13.pgshard.v1.VColumnR\acolumns\"\xf7\x16\n" +
+	"\x06VEvent\x120\n" +
+	"\x05begin\x18\x01 \x01(\v2\x18.pgshard.v1.VEvent.BeginH\x00R\x05begin\x129\n" +
+	"\brelation\x18\x02 \x01(\v2\x1b.pgshard.v1.VEvent.RelationH\x00R\brelation\x12*\n" +
+	"\x03row\x18\x03 \x01(\v2\x16.pgshard.v1.VEvent.RowH\x00R\x03row\x129\n" +
+	"\btruncate\x18\x04 \x01(\v2\x1b.pgshard.v1.VEvent.TruncateH\x00R\btruncate\x126\n" +
+	"\amessage\x18\x05 \x01(\v2\x1a.pgshard.v1.VEvent.MessageH\x00R\amessage\x123\n" +
+	"\x06commit\x18\x06 \x01(\v2\x19.pgshard.v1.VEvent.CommitH\x00R\x06commit\x126\n" +
+	"\aprepare\x18\a \x01(\v2\x1a.pgshard.v1.VEvent.PrepareH\x00R\aprepare\x12L\n" +
+	"\x0fcommit_prepared\x18\b \x01(\v2!.pgshard.v1.VEvent.CommitPreparedH\x00R\x0ecommitPrepared\x12R\n" +
+	"\x11rollback_prepared\x18\t \x01(\v2#.pgshard.v1.VEvent.RollbackPreparedH\x00R\x10rollbackPrepared\x120\n" +
+	"\x05vgtid\x18\n" +
+	" \x01(\v2\x18.pgshard.v1.VEvent.VGtidH\x00R\x05vgtid\x12<\n" +
+	"\theartbeat\x18\v \x01(\v2\x1c.pgshard.v1.VEvent.HeartbeatH\x00R\theartbeat\x126\n" +
+	"\ajournal\x18\f \x01(\v2\x1a.pgshard.v1.VEvent.JournalH\x00R\ajournal\x120\n" +
+	"\x05error\x18\r \x01(\v2\x18.pgshard.v1.VEvent.ErrorH\x00R\x05error\x1at\n" +
 	"\x05Begin\x12*\n" +
 	"\x05shard\x18\x01 \x01(\v2\x14.pgshard.v1.ShardRefR\x05shard\x12\x10\n" +
-	"\x03xid\x18\x02 \x01(\rR\x03xid\x12 \n" +
-	"\tcommit_ts\x18\x03 \x01(\x03H\x00R\bcommitTs\x88\x01\x01B\f\n" +
+	"\x03xid\x18\x02 \x01(\rR\x03xid\x12\x1b\n" +
+	"\tcommit_ts\x18\x03 \x01(\x03R\bcommitTs\x12\x10\n" +
+	"\x03gid\x18\x04 \x01(\tR\x03gid\x1a\x91\x02\n" +
+	"\bRelation\x12\x16\n" +
+	"\x06schema\x18\x01 \x01(\tR\x06schema\x12\x14\n" +
+	"\x05table\x18\x02 \x01(\tR\x05table\x12)\n" +
+	"\x10replica_identity\x18\x03 \x01(\tR\x0freplicaIdentity\x12<\n" +
+	"\acolumns\x18\x04 \x03(\v2\".pgshard.v1.VEvent.Relation.ColumnR\acolumns\x1an\n" +
+	"\x06Column\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x19\n" +
+	"\btype_oid\x18\x02 \x01(\rR\atypeOid\x12#\n" +
+	"\rtype_modifier\x18\x03 \x01(\x05R\ftypeModifier\x12\x10\n" +
+	"\x03key\x18\x04 \x01(\bR\x03key\x1a\xcb\x02\n" +
+	"\x03Row\x12*\n" +
+	"\x05shard\x18\x01 \x01(\v2\x14.pgshard.v1.ShardRefR\x05shard\x12\x16\n" +
+	"\x06schema\x18\x02 \x01(\tR\x06schema\x12\x14\n" +
+	"\x05table\x18\x03 \x01(\tR\x05table\x12/\n" +
+	"\x04kind\x18\x04 \x01(\x0e2\x1b.pgshard.v1.VEvent.Row.KindR\x04kind\x12$\n" +
+	"\x03old\x18\x05 \x01(\v2\x12.pgshard.v1.VTupleR\x03old\x12\x1c\n" +
 	"\n" +
-	"_commit_ts\x1a\xfa\x01\n" +
-	"\x03Row\x12\x14\n" +
-	"\x05table\x18\x01 \x01(\tR\x05table\x12/\n" +
-	"\x04kind\x18\x02 \x01(\x0e2\x1b.pgshard.v1.VEvent.Row.KindR\x04kind\x12#\n" +
-	"\x03old\x18\x03 \x01(\v2\x11.pgshard.v1.TupleR\x03old\x12#\n" +
-	"\x03new\x18\x04 \x01(\v2\x11.pgshard.v1.TupleR\x03new\"b\n" +
+	"old_is_key\x18\x06 \x01(\bR\boldIsKey\x12$\n" +
+	"\x03new\x18\a \x01(\v2\x12.pgshard.v1.VTupleR\x03new\"O\n" +
 	"\x04Kind\x12\x14\n" +
 	"\x10KIND_UNSPECIFIED\x10\x00\x12\x0f\n" +
 	"\vKIND_INSERT\x10\x01\x12\x0f\n" +
 	"\vKIND_UPDATE\x10\x02\x12\x0f\n" +
-	"\vKIND_DELETE\x10\x03\x12\x11\n" +
-	"\rKIND_TRUNCATE\x10\x04\x1aF\n" +
+	"\vKIND_DELETE\x10\x03\x1a\xed\x01\n" +
+	"\bTruncate\x12*\n" +
+	"\x05shard\x18\x01 \x01(\v2\x14.pgshard.v1.ShardRefR\x05shard\x129\n" +
+	"\x06tables\x18\x02 \x03(\v2!.pgshard.v1.VEvent.Truncate.TableR\x06tables\x12\x18\n" +
+	"\acascade\x18\x03 \x01(\bR\acascade\x12)\n" +
+	"\x10restart_identity\x18\x04 \x01(\bR\x0frestartIdentity\x1a5\n" +
+	"\x05Table\x12\x16\n" +
+	"\x06schema\x18\x01 \x01(\tR\x06schema\x12\x14\n" +
+	"\x05table\x18\x02 \x01(\tR\x05table\x1a\x8d\x01\n" +
+	"\aMessage\x12*\n" +
+	"\x05shard\x18\x01 \x01(\v2\x14.pgshard.v1.ShardRefR\x05shard\x12\x16\n" +
+	"\x06prefix\x18\x02 \x01(\tR\x06prefix\x12\x18\n" +
+	"\acontent\x18\x03 \x01(\fR\acontent\x12$\n" +
+	"\rtransactional\x18\x04 \x01(\bR\rtransactional\x1a_\n" +
 	"\x06Commit\x12*\n" +
 	"\x05shard\x18\x01 \x01(\v2\x14.pgshard.v1.ShardRefR\x05shard\x12\x10\n" +
-	"\x03lsn\x18\x02 \x01(\x04R\x03lsn\x1a\v\n" +
-	"\tHeartbeat\x1a\xe7\x01\n" +
+	"\x03lsn\x18\x02 \x01(\x04R\x03lsn\x12\x17\n" +
+	"\aend_lsn\x18\x03 \x01(\x04R\x06endLsn\x1aY\n" +
+	"\aPrepare\x12*\n" +
+	"\x05shard\x18\x01 \x01(\v2\x14.pgshard.v1.ShardRefR\x05shard\x12\x10\n" +
+	"\x03gid\x18\x02 \x01(\tR\x03gid\x12\x10\n" +
+	"\x03lsn\x18\x03 \x01(\x04R\x03lsn\x1a`\n" +
+	"\x0eCommitPrepared\x12*\n" +
+	"\x05shard\x18\x01 \x01(\v2\x14.pgshard.v1.ShardRefR\x05shard\x12\x10\n" +
+	"\x03gid\x18\x02 \x01(\tR\x03gid\x12\x10\n" +
+	"\x03lsn\x18\x03 \x01(\x04R\x03lsn\x1ab\n" +
+	"\x10RollbackPrepared\x12*\n" +
+	"\x05shard\x18\x01 \x01(\v2\x14.pgshard.v1.ShardRefR\x05shard\x12\x10\n" +
+	"\x03gid\x18\x02 \x01(\tR\x03gid\x12\x10\n" +
+	"\x03lsn\x18\x03 \x01(\x04R\x03lsn\x1a:\n" +
+	"\x05VGtid\x121\n" +
+	"\bposition\x18\x01 \x01(\v2\x15.pgshard.v1.VPositionR\bposition\x1a>\n" +
+	"\tHeartbeat\x121\n" +
+	"\bposition\x18\x01 \x01(\v2\x15.pgshard.v1.VPositionR\bposition\x1a\x99\x02\n" +
 	"\aJournal\x12\x1d\n" +
 	"\n" +
 	"journal_id\x18\x01 \x01(\tR\tjournalId\x128\n" +
 	"\fparticipants\x18\x02 \x03(\v2\x14.pgshard.v1.ShardRefR\fparticipants\x12;\n" +
-	"\atargets\x18\x03 \x03(\v2!.pgshard.v1.VEvent.Journal.TargetR\atargets\x1aF\n" +
+	"\atargets\x18\x03 \x03(\v2!.pgshard.v1.VEvent.Journal.TargetR\atargets\x120\n" +
+	"\x14shard_map_generation\x18\x04 \x01(\x04R\x12shardMapGeneration\x1aF\n" +
 	"\x06Target\x12*\n" +
 	"\x05shard\x18\x01 \x01(\v2\x14.pgshard.v1.ShardRefR\x05shard\x12\x10\n" +
-	"\x03lsn\x18\x02 \x01(\x04R\x03lsn\x1a%\n" +
-	"\rCopyCompleted\x12\x14\n" +
-	"\x05table\x18\x01 \x01(\tR\x05table\x1aA\n" +
-	"\x06LastPK\x12\x14\n" +
-	"\x05table\x18\x01 \x01(\tR\x05table\x12!\n" +
-	"\x02pk\x18\x02 \x01(\v2\x11.pgshard.v1.TupleR\x02pk\x1aE\n" +
-	"\tDdlMarker\x12\x1a\n" +
-	"\bdatabase\x18\x01 \x01(\tR\bdatabase\x12\x1c\n" +
-	"\tstatement\x18\x02 \x01(\tR\tstatement\x1aG\n" +
-	"\aPrepare\x12*\n" +
-	"\x05shard\x18\x01 \x01(\v2\x14.pgshard.v1.ShardRefR\x05shard\x12\x10\n" +
-	"\x03gid\x18\x02 \x01(\tR\x03gid\x1aN\n" +
-	"\x0eCommitPrepared\x12*\n" +
-	"\x05shard\x18\x01 \x01(\v2\x14.pgshard.v1.ShardRefR\x05shard\x12\x10\n" +
-	"\x03gid\x18\x02 \x01(\tR\x03gid\x1aP\n" +
-	"\x10RollbackPrepared\x12*\n" +
-	"\x05shard\x18\x01 \x01(\v2\x14.pgshard.v1.ShardRefR\x05shard\x12\x10\n" +
-	"\x03gid\x18\x02 \x01(\tR\x03gidB\a\n" +
-	"\x05event2G\n" +
-	"\aVStream\x12<\n" +
-	"\x06Stream\x12\x1a.pgshard.v1.VStreamRequest\x1a\x12.pgshard.v1.VEvent(\x010\x01B\xaf\x01\n" +
+	"\x03lsn\x18\x02 \x01(\x04R\x03lsn\x1a\xfc\x01\n" +
+	"\x05Error\x121\n" +
+	"\x04code\x18\x01 \x01(\x0e2\x1d.pgshard.v1.VEvent.Error.CodeR\x04code\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\x12*\n" +
+	"\x05shard\x18\x03 \x01(\v2\x14.pgshard.v1.ShardRefR\x05shard\"z\n" +
+	"\x04Code\x12\x14\n" +
+	"\x10CODE_UNSPECIFIED\x10\x00\x12\x19\n" +
+	"\x15CODE_POSITION_TOO_OLD\x10\x01\x12\x12\n" +
+	"\x0eCODE_RESHARDED\x10\x02\x12\x1a\n" +
+	"\x16CODE_SHARD_UNAVAILABLE\x10\x03\x12\x11\n" +
+	"\rCODE_INTERNAL\x10\x04B\a\n" +
+	"\x05event2\xf0\x02\n" +
+	"\aVStream\x12M\n" +
+	"\x06Create\x12 .pgshard.v1.CreateVStreamRequest\x1a!.pgshard.v1.CreateVStreamResponse\x12G\n" +
+	"\x04Drop\x12\x1e.pgshard.v1.DropVStreamRequest\x1a\x1f.pgshard.v1.DropVStreamResponse\x12I\n" +
+	"\x04List\x12\x1f.pgshard.v1.ListVStreamsRequest\x1a .pgshard.v1.ListVStreamsResponse\x12<\n" +
+	"\x06Stream\x12\x1a.pgshard.v1.VStreamRequest\x1a\x12.pgshard.v1.VEvent(\x010\x01\x12D\n" +
+	"\x03Ack\x12\x1d.pgshard.v1.VStreamAckRequest\x1a\x1e.pgshard.v1.VStreamAckResponseB\xaf\x01\n" +
 	"\x0ecom.pgshard.v1B\fVstreamProtoP\x01ZFgithub.com/andrew01234567890/pgshard/internal/gen/pgshard/v1;pgshardv1\xa2\x02\x03PXX\xaa\x02\n" +
 	"Pgshard.V1\xca\x02\n" +
 	"Pgshard\\V1\xe2\x02\x16Pgshard\\V1\\GPBMetadata\xea\x02\vPgshard::V1b\x06proto3"
@@ -1434,68 +2613,112 @@ func file_pgshard_v1_vstream_proto_rawDescGZIP() []byte {
 	return file_pgshard_v1_vstream_proto_rawDescData
 }
 
-var file_pgshard_v1_vstream_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_pgshard_v1_vstream_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
+var file_pgshard_v1_vstream_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_pgshard_v1_vstream_proto_msgTypes = make([]protoimpl.MessageInfo, 34)
 var file_pgshard_v1_vstream_proto_goTypes = []any{
 	(VEvent_Row_Kind)(0),            // 0: pgshard.v1.VEvent.Row.Kind
-	(*VStreamRequest)(nil),          // 1: pgshard.v1.VStreamRequest
-	(*VStreamStart)(nil),            // 2: pgshard.v1.VStreamStart
-	(*VStreamOptions)(nil),          // 3: pgshard.v1.VStreamOptions
-	(*Column)(nil),                  // 4: pgshard.v1.Column
-	(*Tuple)(nil),                   // 5: pgshard.v1.Tuple
-	(*VEvent)(nil),                  // 6: pgshard.v1.VEvent
-	(*VEvent_Begin)(nil),            // 7: pgshard.v1.VEvent.Begin
-	(*VEvent_Row)(nil),              // 8: pgshard.v1.VEvent.Row
-	(*VEvent_Commit)(nil),           // 9: pgshard.v1.VEvent.Commit
-	(*VEvent_Heartbeat)(nil),        // 10: pgshard.v1.VEvent.Heartbeat
-	(*VEvent_Journal)(nil),          // 11: pgshard.v1.VEvent.Journal
-	(*VEvent_CopyCompleted)(nil),    // 12: pgshard.v1.VEvent.CopyCompleted
-	(*VEvent_LastPK)(nil),           // 13: pgshard.v1.VEvent.LastPK
-	(*VEvent_DdlMarker)(nil),        // 14: pgshard.v1.VEvent.DdlMarker
-	(*VEvent_Prepare)(nil),          // 15: pgshard.v1.VEvent.Prepare
-	(*VEvent_CommitPrepared)(nil),   // 16: pgshard.v1.VEvent.CommitPrepared
-	(*VEvent_RollbackPrepared)(nil), // 17: pgshard.v1.VEvent.RollbackPrepared
-	(*VEvent_Journal_Target)(nil),   // 18: pgshard.v1.VEvent.Journal.Target
-	(*Position)(nil),                // 19: pgshard.v1.Position
-	(*ShardRef)(nil),                // 20: pgshard.v1.ShardRef
+	(VEvent_Error_Code)(0),          // 1: pgshard.v1.VEvent.Error.Code
+	(*VStreamOptions)(nil),          // 2: pgshard.v1.VStreamOptions
+	(*CreateVStreamRequest)(nil),    // 3: pgshard.v1.CreateVStreamRequest
+	(*CreateVStreamResponse)(nil),   // 4: pgshard.v1.CreateVStreamResponse
+	(*VStreamSlot)(nil),             // 5: pgshard.v1.VStreamSlot
+	(*DropVStreamRequest)(nil),      // 6: pgshard.v1.DropVStreamRequest
+	(*DropVStreamResponse)(nil),     // 7: pgshard.v1.DropVStreamResponse
+	(*ListVStreamsRequest)(nil),     // 8: pgshard.v1.ListVStreamsRequest
+	(*VStreamInfo)(nil),             // 9: pgshard.v1.VStreamInfo
+	(*ListVStreamsResponse)(nil),    // 10: pgshard.v1.ListVStreamsResponse
+	(*VPosition)(nil),               // 11: pgshard.v1.VPosition
+	(*VStreamRequest)(nil),          // 12: pgshard.v1.VStreamRequest
+	(*VStreamAckRequest)(nil),       // 13: pgshard.v1.VStreamAckRequest
+	(*VStreamAckResponse)(nil),      // 14: pgshard.v1.VStreamAckResponse
+	(*VColumn)(nil),                 // 15: pgshard.v1.VColumn
+	(*VTuple)(nil),                  // 16: pgshard.v1.VTuple
+	(*VEvent)(nil),                  // 17: pgshard.v1.VEvent
+	(*VPosition_Shard)(nil),         // 18: pgshard.v1.VPosition.Shard
+	(*VStreamRequest_Start)(nil),    // 19: pgshard.v1.VStreamRequest.Start
+	(*VEvent_Begin)(nil),            // 20: pgshard.v1.VEvent.Begin
+	(*VEvent_Relation)(nil),         // 21: pgshard.v1.VEvent.Relation
+	(*VEvent_Row)(nil),              // 22: pgshard.v1.VEvent.Row
+	(*VEvent_Truncate)(nil),         // 23: pgshard.v1.VEvent.Truncate
+	(*VEvent_Message)(nil),          // 24: pgshard.v1.VEvent.Message
+	(*VEvent_Commit)(nil),           // 25: pgshard.v1.VEvent.Commit
+	(*VEvent_Prepare)(nil),          // 26: pgshard.v1.VEvent.Prepare
+	(*VEvent_CommitPrepared)(nil),   // 27: pgshard.v1.VEvent.CommitPrepared
+	(*VEvent_RollbackPrepared)(nil), // 28: pgshard.v1.VEvent.RollbackPrepared
+	(*VEvent_VGtid)(nil),            // 29: pgshard.v1.VEvent.VGtid
+	(*VEvent_Heartbeat)(nil),        // 30: pgshard.v1.VEvent.Heartbeat
+	(*VEvent_Journal)(nil),          // 31: pgshard.v1.VEvent.Journal
+	(*VEvent_Error)(nil),            // 32: pgshard.v1.VEvent.Error
+	(*VEvent_Relation_Column)(nil),  // 33: pgshard.v1.VEvent.Relation.Column
+	(*VEvent_Truncate_Table)(nil),   // 34: pgshard.v1.VEvent.Truncate.Table
+	(*VEvent_Journal_Target)(nil),   // 35: pgshard.v1.VEvent.Journal.Target
+	(*Error)(nil),                   // 36: pgshard.v1.Error
+	(*ShardRef)(nil),                // 37: pgshard.v1.ShardRef
 }
 var file_pgshard_v1_vstream_proto_depIdxs = []int32{
-	2,  // 0: pgshard.v1.VStreamRequest.start:type_name -> pgshard.v1.VStreamStart
-	19, // 1: pgshard.v1.VStreamRequest.ack:type_name -> pgshard.v1.Position
-	19, // 2: pgshard.v1.VStreamStart.start:type_name -> pgshard.v1.Position
-	3,  // 3: pgshard.v1.VStreamStart.options:type_name -> pgshard.v1.VStreamOptions
-	4,  // 4: pgshard.v1.Tuple.columns:type_name -> pgshard.v1.Column
-	7,  // 5: pgshard.v1.VEvent.begin:type_name -> pgshard.v1.VEvent.Begin
-	8,  // 6: pgshard.v1.VEvent.row:type_name -> pgshard.v1.VEvent.Row
-	9,  // 7: pgshard.v1.VEvent.commit:type_name -> pgshard.v1.VEvent.Commit
-	19, // 8: pgshard.v1.VEvent.position:type_name -> pgshard.v1.Position
-	10, // 9: pgshard.v1.VEvent.heartbeat:type_name -> pgshard.v1.VEvent.Heartbeat
-	11, // 10: pgshard.v1.VEvent.journal:type_name -> pgshard.v1.VEvent.Journal
-	12, // 11: pgshard.v1.VEvent.copy_completed:type_name -> pgshard.v1.VEvent.CopyCompleted
-	13, // 12: pgshard.v1.VEvent.last_pk:type_name -> pgshard.v1.VEvent.LastPK
-	14, // 13: pgshard.v1.VEvent.ddl_marker:type_name -> pgshard.v1.VEvent.DdlMarker
-	15, // 14: pgshard.v1.VEvent.prepare:type_name -> pgshard.v1.VEvent.Prepare
-	16, // 15: pgshard.v1.VEvent.commit_prepared:type_name -> pgshard.v1.VEvent.CommitPrepared
-	17, // 16: pgshard.v1.VEvent.rollback_prepared:type_name -> pgshard.v1.VEvent.RollbackPrepared
-	20, // 17: pgshard.v1.VEvent.Begin.shard:type_name -> pgshard.v1.ShardRef
-	0,  // 18: pgshard.v1.VEvent.Row.kind:type_name -> pgshard.v1.VEvent.Row.Kind
-	5,  // 19: pgshard.v1.VEvent.Row.old:type_name -> pgshard.v1.Tuple
-	5,  // 20: pgshard.v1.VEvent.Row.new:type_name -> pgshard.v1.Tuple
-	20, // 21: pgshard.v1.VEvent.Commit.shard:type_name -> pgshard.v1.ShardRef
-	20, // 22: pgshard.v1.VEvent.Journal.participants:type_name -> pgshard.v1.ShardRef
-	18, // 23: pgshard.v1.VEvent.Journal.targets:type_name -> pgshard.v1.VEvent.Journal.Target
-	5,  // 24: pgshard.v1.VEvent.LastPK.pk:type_name -> pgshard.v1.Tuple
-	20, // 25: pgshard.v1.VEvent.Prepare.shard:type_name -> pgshard.v1.ShardRef
-	20, // 26: pgshard.v1.VEvent.CommitPrepared.shard:type_name -> pgshard.v1.ShardRef
-	20, // 27: pgshard.v1.VEvent.RollbackPrepared.shard:type_name -> pgshard.v1.ShardRef
-	20, // 28: pgshard.v1.VEvent.Journal.Target.shard:type_name -> pgshard.v1.ShardRef
-	1,  // 29: pgshard.v1.VStream.Stream:input_type -> pgshard.v1.VStreamRequest
-	6,  // 30: pgshard.v1.VStream.Stream:output_type -> pgshard.v1.VEvent
-	30, // [30:31] is the sub-list for method output_type
-	29, // [29:30] is the sub-list for method input_type
-	29, // [29:29] is the sub-list for extension type_name
-	29, // [29:29] is the sub-list for extension extendee
-	0,  // [0:29] is the sub-list for field type_name
+	5,  // 0: pgshard.v1.CreateVStreamResponse.slots:type_name -> pgshard.v1.VStreamSlot
+	36, // 1: pgshard.v1.CreateVStreamResponse.error:type_name -> pgshard.v1.Error
+	37, // 2: pgshard.v1.VStreamSlot.shard:type_name -> pgshard.v1.ShardRef
+	36, // 3: pgshard.v1.DropVStreamResponse.error:type_name -> pgshard.v1.Error
+	5,  // 4: pgshard.v1.VStreamInfo.slots:type_name -> pgshard.v1.VStreamSlot
+	9,  // 5: pgshard.v1.ListVStreamsResponse.streams:type_name -> pgshard.v1.VStreamInfo
+	18, // 6: pgshard.v1.VPosition.shards:type_name -> pgshard.v1.VPosition.Shard
+	19, // 7: pgshard.v1.VStreamRequest.start:type_name -> pgshard.v1.VStreamRequest.Start
+	11, // 8: pgshard.v1.VStreamRequest.ack:type_name -> pgshard.v1.VPosition
+	11, // 9: pgshard.v1.VStreamAckRequest.position:type_name -> pgshard.v1.VPosition
+	36, // 10: pgshard.v1.VStreamAckResponse.error:type_name -> pgshard.v1.Error
+	15, // 11: pgshard.v1.VTuple.columns:type_name -> pgshard.v1.VColumn
+	20, // 12: pgshard.v1.VEvent.begin:type_name -> pgshard.v1.VEvent.Begin
+	21, // 13: pgshard.v1.VEvent.relation:type_name -> pgshard.v1.VEvent.Relation
+	22, // 14: pgshard.v1.VEvent.row:type_name -> pgshard.v1.VEvent.Row
+	23, // 15: pgshard.v1.VEvent.truncate:type_name -> pgshard.v1.VEvent.Truncate
+	24, // 16: pgshard.v1.VEvent.message:type_name -> pgshard.v1.VEvent.Message
+	25, // 17: pgshard.v1.VEvent.commit:type_name -> pgshard.v1.VEvent.Commit
+	26, // 18: pgshard.v1.VEvent.prepare:type_name -> pgshard.v1.VEvent.Prepare
+	27, // 19: pgshard.v1.VEvent.commit_prepared:type_name -> pgshard.v1.VEvent.CommitPrepared
+	28, // 20: pgshard.v1.VEvent.rollback_prepared:type_name -> pgshard.v1.VEvent.RollbackPrepared
+	29, // 21: pgshard.v1.VEvent.vgtid:type_name -> pgshard.v1.VEvent.VGtid
+	30, // 22: pgshard.v1.VEvent.heartbeat:type_name -> pgshard.v1.VEvent.Heartbeat
+	31, // 23: pgshard.v1.VEvent.journal:type_name -> pgshard.v1.VEvent.Journal
+	32, // 24: pgshard.v1.VEvent.error:type_name -> pgshard.v1.VEvent.Error
+	37, // 25: pgshard.v1.VPosition.Shard.shard:type_name -> pgshard.v1.ShardRef
+	11, // 26: pgshard.v1.VStreamRequest.Start.position:type_name -> pgshard.v1.VPosition
+	2,  // 27: pgshard.v1.VStreamRequest.Start.options:type_name -> pgshard.v1.VStreamOptions
+	37, // 28: pgshard.v1.VEvent.Begin.shard:type_name -> pgshard.v1.ShardRef
+	33, // 29: pgshard.v1.VEvent.Relation.columns:type_name -> pgshard.v1.VEvent.Relation.Column
+	37, // 30: pgshard.v1.VEvent.Row.shard:type_name -> pgshard.v1.ShardRef
+	0,  // 31: pgshard.v1.VEvent.Row.kind:type_name -> pgshard.v1.VEvent.Row.Kind
+	16, // 32: pgshard.v1.VEvent.Row.old:type_name -> pgshard.v1.VTuple
+	16, // 33: pgshard.v1.VEvent.Row.new:type_name -> pgshard.v1.VTuple
+	37, // 34: pgshard.v1.VEvent.Truncate.shard:type_name -> pgshard.v1.ShardRef
+	34, // 35: pgshard.v1.VEvent.Truncate.tables:type_name -> pgshard.v1.VEvent.Truncate.Table
+	37, // 36: pgshard.v1.VEvent.Message.shard:type_name -> pgshard.v1.ShardRef
+	37, // 37: pgshard.v1.VEvent.Commit.shard:type_name -> pgshard.v1.ShardRef
+	37, // 38: pgshard.v1.VEvent.Prepare.shard:type_name -> pgshard.v1.ShardRef
+	37, // 39: pgshard.v1.VEvent.CommitPrepared.shard:type_name -> pgshard.v1.ShardRef
+	37, // 40: pgshard.v1.VEvent.RollbackPrepared.shard:type_name -> pgshard.v1.ShardRef
+	11, // 41: pgshard.v1.VEvent.VGtid.position:type_name -> pgshard.v1.VPosition
+	11, // 42: pgshard.v1.VEvent.Heartbeat.position:type_name -> pgshard.v1.VPosition
+	37, // 43: pgshard.v1.VEvent.Journal.participants:type_name -> pgshard.v1.ShardRef
+	35, // 44: pgshard.v1.VEvent.Journal.targets:type_name -> pgshard.v1.VEvent.Journal.Target
+	1,  // 45: pgshard.v1.VEvent.Error.code:type_name -> pgshard.v1.VEvent.Error.Code
+	37, // 46: pgshard.v1.VEvent.Error.shard:type_name -> pgshard.v1.ShardRef
+	37, // 47: pgshard.v1.VEvent.Journal.Target.shard:type_name -> pgshard.v1.ShardRef
+	3,  // 48: pgshard.v1.VStream.Create:input_type -> pgshard.v1.CreateVStreamRequest
+	6,  // 49: pgshard.v1.VStream.Drop:input_type -> pgshard.v1.DropVStreamRequest
+	8,  // 50: pgshard.v1.VStream.List:input_type -> pgshard.v1.ListVStreamsRequest
+	12, // 51: pgshard.v1.VStream.Stream:input_type -> pgshard.v1.VStreamRequest
+	13, // 52: pgshard.v1.VStream.Ack:input_type -> pgshard.v1.VStreamAckRequest
+	4,  // 53: pgshard.v1.VStream.Create:output_type -> pgshard.v1.CreateVStreamResponse
+	7,  // 54: pgshard.v1.VStream.Drop:output_type -> pgshard.v1.DropVStreamResponse
+	10, // 55: pgshard.v1.VStream.List:output_type -> pgshard.v1.ListVStreamsResponse
+	17, // 56: pgshard.v1.VStream.Stream:output_type -> pgshard.v1.VEvent
+	14, // 57: pgshard.v1.VStream.Ack:output_type -> pgshard.v1.VStreamAckResponse
+	53, // [53:58] is the sub-list for method output_type
+	48, // [48:53] is the sub-list for method input_type
+	48, // [48:48] is the sub-list for extension type_name
+	48, // [48:48] is the sub-list for extension extendee
+	0,  // [0:48] is the sub-list for field type_name
 }
 
 func init() { file_pgshard_v1_vstream_proto_init() }
@@ -1504,32 +2727,32 @@ func file_pgshard_v1_vstream_proto_init() {
 		return
 	}
 	file_pgshard_v1_common_proto_init()
-	file_pgshard_v1_vstream_proto_msgTypes[0].OneofWrappers = []any{
-		(*VStreamRequest_Start)(nil),
+	file_pgshard_v1_vstream_proto_msgTypes[10].OneofWrappers = []any{
+		(*VStreamRequest_Start_)(nil),
 		(*VStreamRequest_Ack)(nil),
 	}
-	file_pgshard_v1_vstream_proto_msgTypes[5].OneofWrappers = []any{
+	file_pgshard_v1_vstream_proto_msgTypes[15].OneofWrappers = []any{
 		(*VEvent_Begin_)(nil),
+		(*VEvent_Relation_)(nil),
 		(*VEvent_Row_)(nil),
+		(*VEvent_Truncate_)(nil),
+		(*VEvent_Message_)(nil),
 		(*VEvent_Commit_)(nil),
-		(*VEvent_Position)(nil),
-		(*VEvent_Heartbeat_)(nil),
-		(*VEvent_Journal_)(nil),
-		(*VEvent_CopyCompleted_)(nil),
-		(*VEvent_LastPk)(nil),
-		(*VEvent_DdlMarker_)(nil),
 		(*VEvent_Prepare_)(nil),
 		(*VEvent_CommitPrepared_)(nil),
 		(*VEvent_RollbackPrepared_)(nil),
+		(*VEvent_Vgtid)(nil),
+		(*VEvent_Heartbeat_)(nil),
+		(*VEvent_Journal_)(nil),
+		(*VEvent_Error_)(nil),
 	}
-	file_pgshard_v1_vstream_proto_msgTypes[6].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pgshard_v1_vstream_proto_rawDesc), len(file_pgshard_v1_vstream_proto_rawDesc)),
-			NumEnums:      1,
-			NumMessages:   18,
+			NumEnums:      2,
+			NumMessages:   34,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

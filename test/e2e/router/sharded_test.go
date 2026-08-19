@@ -51,7 +51,7 @@ func startShardedStackFull(tb testing.TB, catalogOpts, shard0Opts, shard1Opts []
 	}
 	host, port, _ := net.SplitHostPort(shard1Addr)
 	startProcess(tb, &logBuffer{}, "listening on", poolerBin, "run", "--insecure-dev", "--listen", pooler1,
-		"--pg-host", host, "--pg-port", port, "--pg-database", appDatabase,
+		"--pg-host", host, "--pg-port", port, "--pg-database", appDatabase, "--stream-dsn", streamDSN(s.shard1DSN),
 		"--catalog-dsn", s.catalogDSN, "--shard-set", router.DefaultShardSet, "--shard-id", "1", "--drain-timeout", "5s")
 	s.shardDSNs[1] = s.shard1DSN
 	s.startController(tb)

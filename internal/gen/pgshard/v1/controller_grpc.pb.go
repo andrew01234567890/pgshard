@@ -30,6 +30,8 @@ const (
 	Controller_CreateBarrier_FullMethodName       = "/pgshard.v1.Controller/CreateBarrier"
 	Controller_ListBarriers_FullMethodName        = "/pgshard.v1.Controller/ListBarriers"
 	Controller_ListRoleStatus_FullMethodName      = "/pgshard.v1.Controller/ListRoleStatus"
+	Controller_CreateStream_FullMethodName        = "/pgshard.v1.Controller/CreateStream"
+	Controller_DropStream_FullMethodName          = "/pgshard.v1.Controller/DropStream"
 )
 
 // ControllerClient is the client API for Controller service.
@@ -59,6 +61,11 @@ type ControllerClient interface {
 	// ListRoleStatus reports, per managed role and group, whether the group
 	// matches the catalog's desired role state.
 	ListRoleStatus(ctx context.Context, in *ListRoleStatusRequest, opts ...grpc.CallOption) (*ListRoleStatusResponse, error)
+	// CreateStream registers a change stream and creates its failover slot
+	// on every shard of the stream's shard set.
+	CreateStream(ctx context.Context, in *CreateStreamRequest, opts ...grpc.CallOption) (*CreateStreamResponse, error)
+	// DropStream drops a change stream's slots and its catalog rows.
+	DropStream(ctx context.Context, in *DropStreamRequest, opts ...grpc.CallOption) (*DropStreamResponse, error)
 }
 
 type controllerClient struct {
@@ -168,6 +175,26 @@ func (c *controllerClient) ListRoleStatus(ctx context.Context, in *ListRoleStatu
 	return out, nil
 }
 
+func (c *controllerClient) CreateStream(ctx context.Context, in *CreateStreamRequest, opts ...grpc.CallOption) (*CreateStreamResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CreateStreamResponse)
+	err := c.cc.Invoke(ctx, Controller_CreateStream_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controllerClient) DropStream(ctx context.Context, in *DropStreamRequest, opts ...grpc.CallOption) (*DropStreamResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DropStreamResponse)
+	err := c.cc.Invoke(ctx, Controller_DropStream_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ControllerServer is the server API for Controller service.
 // All implementations must embed UnimplementedControllerServer
 // for forward compatibility.
@@ -195,6 +222,11 @@ type ControllerServer interface {
 	// ListRoleStatus reports, per managed role and group, whether the group
 	// matches the catalog's desired role state.
 	ListRoleStatus(context.Context, *ListRoleStatusRequest) (*ListRoleStatusResponse, error)
+	// CreateStream registers a change stream and creates its failover slot
+	// on every shard of the stream's shard set.
+	CreateStream(context.Context, *CreateStreamRequest) (*CreateStreamResponse, error)
+	// DropStream drops a change stream's slots and its catalog rows.
+	DropStream(context.Context, *DropStreamRequest) (*DropStreamResponse, error)
 	mustEmbedUnimplementedControllerServer()
 }
 
@@ -231,6 +263,12 @@ func (UnimplementedControllerServer) ListBarriers(context.Context, *ListBarriers
 }
 func (UnimplementedControllerServer) ListRoleStatus(context.Context, *ListRoleStatusRequest) (*ListRoleStatusResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListRoleStatus not implemented")
+}
+func (UnimplementedControllerServer) CreateStream(context.Context, *CreateStreamRequest) (*CreateStreamResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CreateStream not implemented")
+}
+func (UnimplementedControllerServer) DropStream(context.Context, *DropStreamRequest) (*DropStreamResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DropStream not implemented")
 }
 func (UnimplementedControllerServer) mustEmbedUnimplementedControllerServer() {}
 func (UnimplementedControllerServer) testEmbeddedByValue()                    {}
@@ -408,6 +446,42 @@ func _Controller_ListRoleStatus_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Controller_CreateStream_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateStreamRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControllerServer).CreateStream(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Controller_CreateStream_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControllerServer).CreateStream(ctx, req.(*CreateStreamRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Controller_DropStream_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DropStreamRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControllerServer).DropStream(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Controller_DropStream_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControllerServer).DropStream(ctx, req.(*DropStreamRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Controller_ServiceDesc is the grpc.ServiceDesc for Controller service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -446,6 +520,14 @@ var Controller_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListRoleStatus",
 			Handler:    _Controller_ListRoleStatus_Handler,
+		},
+		{
+			MethodName: "CreateStream",
+			Handler:    _Controller_CreateStream_Handler,
+		},
+		{
+			MethodName: "DropStream",
+			Handler:    _Controller_DropStream_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

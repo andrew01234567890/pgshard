@@ -99,9 +99,11 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	go func() { _ = rec.Run(ctx) }()
 	var resolver *controller.Resolver
 	var barrier *controller.Barrier
+	var streams *controller.StreamAdmin
 	if *shardDSNTemplate != "" || len(shardDSNs) > 0 {
 		dialer := &controller.PgxShardDialer{Pool: pool, DSNs: shardDSNs, Template: *shardDSNTemplate}
 		resolver = &controller.Resolver{Pool: pool, Logger: logger, Shards: dialer}
+		streams = &controller.StreamAdmin{Pool: pool, Shards: dialer}
 		go resolver.Run(ctx, *resolveEvery)
 		barrier = &controller.Barrier{Store: &controller.PGBarrierStore{Pool: pool}, Groups: &controller.SQLBarrierGroups{Pool: pool, Shards: dialer},
 			Resolver: resolver, Logger: logger, DrainTimeout: *barrierDrain, ArchiveTimeout: *barrierArchive}
@@ -124,7 +126,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return cli.ExitNotReady
 	}
 	g := grpc.NewServer(grpc.Creds(creds))
-	pgshardv1.RegisterControllerServer(g, &controller.Server{Pool: pool, Resolver: resolver, Barrier: barrier})
+	pgshardv1.RegisterControllerServer(g, &controller.Server{Pool: pool, Resolver: resolver, Barrier: barrier, Streams: streams})
 	mode := "mTLS"
 	if *insecureDev {
 		mode = "INSECURE plaintext"

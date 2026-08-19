@@ -3235,9 +3235,11 @@ func (*ChangeEvent_Origin_) isChangeEvent_Event() {}
 
 // Transaction begins.
 type ChangeEvent_Begin struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Xid           uint32                 `protobuf:"varint,1,opt,name=xid,proto3" json:"xid,omitempty"`
-	FinalLsn      uint64                 `protobuf:"varint,2,opt,name=final_lsn,json=finalLsn,proto3" json:"final_lsn,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Xid      uint32                 `protobuf:"varint,1,opt,name=xid,proto3" json:"xid,omitempty"`
+	FinalLsn uint64                 `protobuf:"varint,2,opt,name=final_lsn,json=finalLsn,proto3" json:"final_lsn,omitempty"`
+	// Commit timestamp in microseconds since 2000-01-01 UTC.
+	CommitTs      int64 `protobuf:"varint,3,opt,name=commit_ts,json=commitTs,proto3" json:"commit_ts,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3282,6 +3284,13 @@ func (x *ChangeEvent_Begin) GetXid() uint32 {
 func (x *ChangeEvent_Begin) GetFinalLsn() uint64 {
 	if x != nil {
 		return x.FinalLsn
+	}
+	return 0
+}
+
+func (x *ChangeEvent_Begin) GetCommitTs() int64 {
+	if x != nil {
+		return x.CommitTs
 	}
 	return 0
 }
@@ -3505,6 +3514,7 @@ type ChangeEvent_Prepare struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Gid           string                 `protobuf:"bytes,1,opt,name=gid,proto3" json:"gid,omitempty"`
 	PrepareLsn    uint64                 `protobuf:"varint,2,opt,name=prepare_lsn,json=prepareLsn,proto3" json:"prepare_lsn,omitempty"`
+	EndLsn        uint64                 `protobuf:"varint,3,opt,name=end_lsn,json=endLsn,proto3" json:"end_lsn,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3553,11 +3563,19 @@ func (x *ChangeEvent_Prepare) GetPrepareLsn() uint64 {
 	return 0
 }
 
+func (x *ChangeEvent_Prepare) GetEndLsn() uint64 {
+	if x != nil {
+		return x.EndLsn
+	}
+	return 0
+}
+
 // COMMIT PREPARED of an earlier Prepare.
 type ChangeEvent_CommitPrepared struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Gid           string                 `protobuf:"bytes,1,opt,name=gid,proto3" json:"gid,omitempty"`
 	CommitLsn     uint64                 `protobuf:"varint,2,opt,name=commit_lsn,json=commitLsn,proto3" json:"commit_lsn,omitempty"`
+	EndLsn        uint64                 `protobuf:"varint,3,opt,name=end_lsn,json=endLsn,proto3" json:"end_lsn,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3606,11 +3624,19 @@ func (x *ChangeEvent_CommitPrepared) GetCommitLsn() uint64 {
 	return 0
 }
 
+func (x *ChangeEvent_CommitPrepared) GetEndLsn() uint64 {
+	if x != nil {
+		return x.EndLsn
+	}
+	return 0
+}
+
 // ROLLBACK PREPARED of an earlier Prepare.
 type ChangeEvent_RollbackPrepared struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Gid           string                 `protobuf:"bytes,1,opt,name=gid,proto3" json:"gid,omitempty"`
 	RollbackLsn   uint64                 `protobuf:"varint,2,opt,name=rollback_lsn,json=rollbackLsn,proto3" json:"rollback_lsn,omitempty"`
+	EndLsn        uint64                 `protobuf:"varint,3,opt,name=end_lsn,json=endLsn,proto3" json:"end_lsn,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3655,6 +3681,13 @@ func (x *ChangeEvent_RollbackPrepared) GetGid() string {
 func (x *ChangeEvent_RollbackPrepared) GetRollbackLsn() uint64 {
 	if x != nil {
 		return x.RollbackLsn
+	}
+	return 0
+}
+
+func (x *ChangeEvent_RollbackPrepared) GetEndLsn() uint64 {
+	if x != nil {
+		return x.EndLsn
 	}
 	return 0
 }
@@ -3952,10 +3985,12 @@ func (*ChangeEvent_StreamStop) Descriptor() ([]byte, []int) {
 
 // StreamCommit commits a streamed transaction.
 type ChangeEvent_StreamCommit struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Xid           uint32                 `protobuf:"varint,1,opt,name=xid,proto3" json:"xid,omitempty"`
-	CommitLsn     uint64                 `protobuf:"varint,2,opt,name=commit_lsn,json=commitLsn,proto3" json:"commit_lsn,omitempty"`
-	EndLsn        uint64                 `protobuf:"varint,3,opt,name=end_lsn,json=endLsn,proto3" json:"end_lsn,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Xid       uint32                 `protobuf:"varint,1,opt,name=xid,proto3" json:"xid,omitempty"`
+	CommitLsn uint64                 `protobuf:"varint,2,opt,name=commit_lsn,json=commitLsn,proto3" json:"commit_lsn,omitempty"`
+	EndLsn    uint64                 `protobuf:"varint,3,opt,name=end_lsn,json=endLsn,proto3" json:"end_lsn,omitempty"`
+	// Commit timestamp in microseconds since 2000-01-01 UTC.
+	CommitTs      int64 `protobuf:"varint,4,opt,name=commit_ts,json=commitTs,proto3" json:"commit_ts,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4007,6 +4042,13 @@ func (x *ChangeEvent_StreamCommit) GetCommitLsn() uint64 {
 func (x *ChangeEvent_StreamCommit) GetEndLsn() uint64 {
 	if x != nil {
 		return x.EndLsn
+	}
+	return 0
+}
+
+func (x *ChangeEvent_StreamCommit) GetCommitTs() int64 {
+	if x != nil {
+		return x.CommitTs
 	}
 	return 0
 }
@@ -4074,10 +4116,12 @@ func (x *ChangeEvent_StreamAbort) GetAbortLsn() uint64 {
 
 // BeginPrepare opens a two-phase transaction.
 type ChangeEvent_BeginPrepare struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Gid           string                 `protobuf:"bytes,1,opt,name=gid,proto3" json:"gid,omitempty"`
-	Xid           uint32                 `protobuf:"varint,2,opt,name=xid,proto3" json:"xid,omitempty"`
-	PrepareLsn    uint64                 `protobuf:"varint,3,opt,name=prepare_lsn,json=prepareLsn,proto3" json:"prepare_lsn,omitempty"`
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Gid        string                 `protobuf:"bytes,1,opt,name=gid,proto3" json:"gid,omitempty"`
+	Xid        uint32                 `protobuf:"varint,2,opt,name=xid,proto3" json:"xid,omitempty"`
+	PrepareLsn uint64                 `protobuf:"varint,3,opt,name=prepare_lsn,json=prepareLsn,proto3" json:"prepare_lsn,omitempty"`
+	// Prepare timestamp in microseconds since 2000-01-01 UTC.
+	PrepareTs     int64 `protobuf:"varint,4,opt,name=prepare_ts,json=prepareTs,proto3" json:"prepare_ts,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4133,12 +4177,22 @@ func (x *ChangeEvent_BeginPrepare) GetPrepareLsn() uint64 {
 	return 0
 }
 
+func (x *ChangeEvent_BeginPrepare) GetPrepareTs() int64 {
+	if x != nil {
+		return x.PrepareTs
+	}
+	return 0
+}
+
 // StreamPrepare prepares a streamed transaction.
 type ChangeEvent_StreamPrepare struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Gid           string                 `protobuf:"bytes,1,opt,name=gid,proto3" json:"gid,omitempty"`
-	Xid           uint32                 `protobuf:"varint,2,opt,name=xid,proto3" json:"xid,omitempty"`
-	PrepareLsn    uint64                 `protobuf:"varint,3,opt,name=prepare_lsn,json=prepareLsn,proto3" json:"prepare_lsn,omitempty"`
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Gid        string                 `protobuf:"bytes,1,opt,name=gid,proto3" json:"gid,omitempty"`
+	Xid        uint32                 `protobuf:"varint,2,opt,name=xid,proto3" json:"xid,omitempty"`
+	PrepareLsn uint64                 `protobuf:"varint,3,opt,name=prepare_lsn,json=prepareLsn,proto3" json:"prepare_lsn,omitempty"`
+	EndLsn     uint64                 `protobuf:"varint,4,opt,name=end_lsn,json=endLsn,proto3" json:"end_lsn,omitempty"`
+	// Prepare timestamp in microseconds since 2000-01-01 UTC.
+	PrepareTs     int64 `protobuf:"varint,5,opt,name=prepare_ts,json=prepareTs,proto3" json:"prepare_ts,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4190,6 +4244,20 @@ func (x *ChangeEvent_StreamPrepare) GetXid() uint32 {
 func (x *ChangeEvent_StreamPrepare) GetPrepareLsn() uint64 {
 	if x != nil {
 		return x.PrepareLsn
+	}
+	return 0
+}
+
+func (x *ChangeEvent_StreamPrepare) GetEndLsn() uint64 {
+	if x != nil {
+		return x.EndLsn
+	}
+	return 0
+}
+
+func (x *ChangeEvent_StreamPrepare) GetPrepareTs() int64 {
+	if x != nil {
+		return x.PrepareTs
 	}
 	return 0
 }
@@ -4506,7 +4574,7 @@ const file_pgshard_v1_pooler_proto_rawDesc = "" +
 	"\x05error\x18\x01 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"W\n" +
 	"\vChangeBatch\x12/\n" +
 	"\x06events\x18\x01 \x03(\v2\x17.pgshard.v1.ChangeEventR\x06events\x12\x17\n" +
-	"\aend_lsn\x18\x02 \x01(\x04R\x06endLsn\"\xd6\x17\n" +
+	"\aend_lsn\x18\x02 \x01(\x04R\x06endLsn\"\xb3\x19\n" +
 	"\vChangeEvent\x12\x10\n" +
 	"\x03lsn\x18\x01 \x01(\x04R\x03lsn\x12\x10\n" +
 	"\x03xid\x18\x02 \x01(\rR\x03xid\x125\n" +
@@ -4528,10 +4596,11 @@ const file_pgshard_v1_pooler_proto_rawDesc = "" +
 	"\fstream_abort\x18\x17 \x01(\v2#.pgshard.v1.ChangeEvent.StreamAbortH\x00R\vstreamAbort\x12K\n" +
 	"\rbegin_prepare\x18\x18 \x01(\v2$.pgshard.v1.ChangeEvent.BeginPrepareH\x00R\fbeginPrepare\x12N\n" +
 	"\x0estream_prepare\x18\x19 \x01(\v2%.pgshard.v1.ChangeEvent.StreamPrepareH\x00R\rstreamPrepare\x128\n" +
-	"\x06origin\x18\x1a \x01(\v2\x1e.pgshard.v1.ChangeEvent.OriginH\x00R\x06origin\x1a6\n" +
+	"\x06origin\x18\x1a \x01(\v2\x1e.pgshard.v1.ChangeEvent.OriginH\x00R\x06origin\x1aS\n" +
 	"\x05Begin\x12\x10\n" +
 	"\x03xid\x18\x01 \x01(\rR\x03xid\x12\x1b\n" +
-	"\tfinal_lsn\x18\x02 \x01(\x04R\bfinalLsn\x1a\xff\x02\n" +
+	"\tfinal_lsn\x18\x02 \x01(\x04R\bfinalLsn\x12\x1b\n" +
+	"\tcommit_ts\x18\x03 \x01(\x03R\bcommitTs\x1a\xff\x02\n" +
 	"\x03Row\x12\x16\n" +
 	"\x06schema\x18\x01 \x01(\tR\x06schema\x12\x14\n" +
 	"\x05table\x18\x02 \x01(\tR\x05table\x124\n" +
@@ -4555,18 +4624,21 @@ const file_pgshard_v1_pooler_proto_rawDesc = "" +
 	"\aend_lsn\x18\x02 \x01(\x04R\x06endLsn\x1aM\n" +
 	"\tKeepalive\x12\x17\n" +
 	"\awal_end\x18\x01 \x01(\x04R\x06walEnd\x12'\n" +
-	"\x0freply_requested\x18\x02 \x01(\bR\x0ereplyRequested\x1a<\n" +
+	"\x0freply_requested\x18\x02 \x01(\bR\x0ereplyRequested\x1aU\n" +
 	"\aPrepare\x12\x10\n" +
 	"\x03gid\x18\x01 \x01(\tR\x03gid\x12\x1f\n" +
 	"\vprepare_lsn\x18\x02 \x01(\x04R\n" +
-	"prepareLsn\x1aA\n" +
+	"prepareLsn\x12\x17\n" +
+	"\aend_lsn\x18\x03 \x01(\x04R\x06endLsn\x1aZ\n" +
 	"\x0eCommitPrepared\x12\x10\n" +
 	"\x03gid\x18\x01 \x01(\tR\x03gid\x12\x1d\n" +
 	"\n" +
-	"commit_lsn\x18\x02 \x01(\x04R\tcommitLsn\x1aG\n" +
+	"commit_lsn\x18\x02 \x01(\x04R\tcommitLsn\x12\x17\n" +
+	"\aend_lsn\x18\x03 \x01(\x04R\x06endLsn\x1a`\n" +
 	"\x10RollbackPrepared\x12\x10\n" +
 	"\x03gid\x18\x01 \x01(\tR\x03gid\x12!\n" +
-	"\frollback_lsn\x18\x02 \x01(\x04R\vrollbackLsn\x1aa\n" +
+	"\frollback_lsn\x18\x02 \x01(\x04R\vrollbackLsn\x12\x17\n" +
+	"\aend_lsn\x18\x03 \x01(\x04R\x06endLsn\x1aa\n" +
 	"\aMessage\x12\x16\n" +
 	"\x06prefix\x18\x01 \x01(\tR\x06prefix\x12\x18\n" +
 	"\acontent\x18\x02 \x01(\fR\acontent\x12$\n" +
@@ -4591,26 +4663,32 @@ const file_pgshard_v1_pooler_proto_rawDesc = "" +
 	"\x03xid\x18\x01 \x01(\rR\x03xid\x12#\n" +
 	"\rfirst_segment\x18\x02 \x01(\bR\ffirstSegment\x1a\f\n" +
 	"\n" +
-	"StreamStop\x1aX\n" +
+	"StreamStop\x1au\n" +
 	"\fStreamCommit\x12\x10\n" +
 	"\x03xid\x18\x01 \x01(\rR\x03xid\x12\x1d\n" +
 	"\n" +
 	"commit_lsn\x18\x02 \x01(\x04R\tcommitLsn\x12\x17\n" +
-	"\aend_lsn\x18\x03 \x01(\x04R\x06endLsn\x1aT\n" +
+	"\aend_lsn\x18\x03 \x01(\x04R\x06endLsn\x12\x1b\n" +
+	"\tcommit_ts\x18\x04 \x01(\x03R\bcommitTs\x1aT\n" +
 	"\vStreamAbort\x12\x10\n" +
 	"\x03xid\x18\x01 \x01(\rR\x03xid\x12\x16\n" +
 	"\x06subxid\x18\x02 \x01(\rR\x06subxid\x12\x1b\n" +
-	"\tabort_lsn\x18\x03 \x01(\x04R\babortLsn\x1aS\n" +
+	"\tabort_lsn\x18\x03 \x01(\x04R\babortLsn\x1ar\n" +
 	"\fBeginPrepare\x12\x10\n" +
 	"\x03gid\x18\x01 \x01(\tR\x03gid\x12\x10\n" +
 	"\x03xid\x18\x02 \x01(\rR\x03xid\x12\x1f\n" +
 	"\vprepare_lsn\x18\x03 \x01(\x04R\n" +
-	"prepareLsn\x1aT\n" +
+	"prepareLsn\x12\x1d\n" +
+	"\n" +
+	"prepare_ts\x18\x04 \x01(\x03R\tprepareTs\x1a\x8c\x01\n" +
 	"\rStreamPrepare\x12\x10\n" +
 	"\x03gid\x18\x01 \x01(\tR\x03gid\x12\x10\n" +
 	"\x03xid\x18\x02 \x01(\rR\x03xid\x12\x1f\n" +
 	"\vprepare_lsn\x18\x03 \x01(\x04R\n" +
-	"prepareLsn\x1a;\n" +
+	"prepareLsn\x12\x17\n" +
+	"\aend_lsn\x18\x04 \x01(\x04R\x06endLsn\x12\x1d\n" +
+	"\n" +
+	"prepare_ts\x18\x05 \x01(\x03R\tprepareTs\x1a;\n" +
 	"\x06Origin\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
