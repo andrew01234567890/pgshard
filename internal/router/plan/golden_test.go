@@ -20,6 +20,11 @@ type want struct {
 	// deferred plans carry parameters; values resolves them at "bind".
 	values map[int32]any
 	sql    string
+	// fill is "<rewritten sql>|<sequence names>" for an INSERT whose
+	// sequence columns the router fills; "" asserts no rewrite.
+	fill string
+	// nextval is the sequence a SELECT nextval() is answered from.
+	nextval string
 }
 
 func golden() []want {
@@ -75,9 +80,34 @@ func golden() []want {
 		{sql: "select r.name from regions r where r.id = 1", kind: Reference, shards: "ref"},
 		{sql: "select * from regions r join regions s on r.id = s.parent", kind: Reference, shards: "ref"},
 		{sql: "select * from items i join regions r on i.region = r.id", kind: Unsharded, shards: "0"},
-		{sql: "insert into regions values (1, 'eu')", kind: Refuse, msg: "writes to reference tables are not available yet"},
-		{sql: "update regions set name = 'x'", kind: Refuse, msg: "writes to reference tables are not available yet"},
-		{sql: "delete from regions where id = 1", kind: Refuse, msg: "writes to reference tables are not available yet"},
+		{sql: "insert into regions values (1, 'eu')", kind: Reference, shards: "all"},
+		{sql: "insert into regions (id, name) values ($1, $2) returning id", kind: Reference, shards: "all"},
+		{sql: "update regions set name = 'x'", kind: Reference, shards: "all"},
+		{sql: "delete from regions where id = 1", kind: Reference, shards: "all"},
+		{sql: "delete from regions where id in (select parent from regions)", kind: Reference, shards: "all"},
+		{sql: "insert into regions values (1, now())", kind: Refuse, msg: "a write to reference table \"regions\" cannot call now()"},
+		{sql: "insert into regions values (1, current_timestamp)", kind: Refuse, msg: "a write to reference table \"regions\" cannot call"},
+		{sql: "insert into regions (id) values (nextval('s'))", kind: Refuse, msg: "a write to reference table \"regions\" cannot call nextval()"},
+		{sql: "update regions set name = gen_random_uuid()::text", kind: Refuse, msg: "a write to reference table \"regions\" cannot call gen_random_uuid()"},
+		{sql: "delete from regions where random() < 0.5", kind: Refuse, msg: "a write to reference table \"regions\" cannot call random()"},
+		{sql: "insert into regions select id, name from items", kind: Refuse, msg: "a write to reference table \"regions\" cannot read sharded or unsharded tables"},
+		{sql: "insert into regions select tenant_id, 'x' from orders where tenant_id = 1", kind: Refuse, msg: "a write to reference table \"regions\" cannot read sharded or unsharded tables"},
+		{sql: "update regions r set name = i.name from items i where i.id = r.id", kind: Refuse, msg: "a write to reference table \"regions\" cannot read sharded or unsharded tables"},
+		{sql: "insert into orders (tenant_id, region) select 1, id from regions", kind: Refuse, msg: "INSERT ... SELECT into a sharded table is not available yet"},
+		// Sequence columns of a sharded table are filled by the router.
+		{sql: "insert into tickets (tenant_id, body) values (1, 'x')", kind: EqualUnique, shards: "k:1", fill: "insert into tickets (tenant_id, body, id) values (1, 'x', $1)|app.public.tickets.id"},
+		{sql: "insert into tickets (tenant_id, body) values ($1, $2)", kind: EqualUnique, shards: "k:1", values: map[int32]any{1: int64(1)}, fill: "insert into tickets (tenant_id, body, id) values ($1, $2, $3)|app.public.tickets.id"},
+		{sql: "insert into tickets (tenant_id, id, body) values (1, default, 'x'), (1, nextval('tickets_id_seq'), 'y')", kind: EqualUnique, shards: "k:1", fill: "insert into tickets (tenant_id, id, body) values (1, $1, 'x'), (1, $2, 'y')|app.public.tickets.id,app.public.tickets.id"},
+		{sql: "insert into tickets (tenant_id, id, body) values (1, 5, 'x')", kind: EqualUnique, shards: "k:1", fill: ""},
+		{sql: "insert into tickets (tenant_id, id, body) values (1, 5, 'x'), (1, default, 'y')", kind: EqualUnique, shards: "k:1", fill: "insert into tickets (tenant_id, id, body) values (1, 5, 'x'), (1, $1, 'y')|app.public.tickets.id"},
+		{sql: "insert into events (body) values ('x')", kind: EqualUnique, shards: "seq:1", values: map[int32]any{1: int64(1)}, fill: "insert into events (body, event_id) values ('x', $1)|app.public.events.event_id"},
+		{sql: "insert into events (event_id, body) values (default, 'x')", kind: EqualUnique, shards: "seq:1", values: map[int32]any{1: int64(1)}, fill: "insert into events (event_id, body) values ($1, 'x')|app.public.events.event_id"},
+		{sql: "insert into events (body) values ('x'), ('y')", values: map[int32]any{1: int64(1), 2: int64(2)}, kind: Refuse, msg: "multi-row INSERT spanning shards is not available yet"},
+		{sql: "select nextval('tickets.id')", kind: SessionLocal, nextval: "app.public.tickets.id"},
+		{sql: "select nextval('public.tickets.id'::regclass)", kind: SessionLocal, nextval: "app.public.tickets.id"},
+		{sql: "select nextval('invoice_numbers')", kind: SessionLocal, nextval: "invoice_numbers"},
+		{sql: "select nextval('tickets.body')", kind: Unsharded, shards: "0"},
+		{sql: "select nextval('items_id_seq')", kind: Unsharded, shards: "0"},
 		{sql: "copy regions from stdin", kind: Refuse, msg: "COPY on sharded and reference tables is not available yet"},
 		{sql: "create table regions (id int primary key)", kind: Refuse, msg: "DDL fan-out is not available yet"},
 		{sql: "drop table regions", kind: Refuse, msg: "DDL fan-out is not available yet"},
@@ -371,6 +401,16 @@ func TestGoldenPlans(t *testing.T) {
 			if pl.Generation != snap.ShardMapGeneration {
 				t.Fatalf("generation = %d, want %d", pl.Generation, snap.ShardMapGeneration)
 			}
+			if pl.NextVal != c.nextval {
+				t.Fatalf("nextval = %q, want %q", pl.NextVal, c.nextval)
+			}
+			got := ""
+			if pl.Sequences != nil {
+				got = pl.Sequences.SQL + "|" + strings.Join(pl.Sequences.Names, ",")
+			}
+			if !strings.EqualFold(got, c.fill) {
+				t.Fatalf("sequence fill = %q, want %q", got, c.fill)
+			}
 		})
 	}
 }
@@ -411,6 +451,9 @@ func expectShards(t *testing.T, spec string) []int32 {
 	for _, part := range strings.Split(spec, ",") {
 		var id int32
 		switch {
+		case strings.HasPrefix(part, "seq:"):
+			i, _ := parseInt(strings.TrimPrefix(part, "seq:"))
+			id = shardOf(t, s, i)
 		case strings.HasPrefix(part, "k:"):
 			key := strings.TrimPrefix(part, "k:")
 			var v any = key

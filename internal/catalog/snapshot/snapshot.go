@@ -43,6 +43,9 @@ type Placement struct {
 	Placement  string
 	ShardKey   string
 	Generation int64
+	// SequenceColumns are the columns of a sharded table the router fills
+	// from the catalog's global sequences.
+	SequenceColumns []string
 }
 
 // Snapshot is an immutable view of the catalog taken in one transaction.
@@ -55,6 +58,9 @@ type Snapshot struct {
 	Serving            map[ShardKey]Serving
 	Databases          map[string]catalog.Database
 	Tables             map[TableKey]Placement
+	// Sequences names the rows of pgshard.sequences, the global sequences
+	// the router answers nextval() for.
+	Sequences map[string]bool
 }
 
 // Roles holds credential verifiers keyed by role name. Its String and

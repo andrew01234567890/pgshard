@@ -52,7 +52,7 @@ func (p *Planner) Plan(ctx context.Context, sess Session, sql string) (Plan, err
 	if err := classify(raw.GetStmt(), &pl.Class); err != nil {
 		return refusalErr(err)
 	}
-	w := &walker{sess: sess, plan: pl, tree: res.Tree}
+	w := &walker{sess: sess, plan: pl, tree: res.Tree, root: raw.GetStmt()}
 	if err := w.statement(raw.GetStmt()); err != nil {
 		return refusalErr(err)
 	}
@@ -202,8 +202,11 @@ const (
 type rel struct {
 	alias    string
 	name     string
+	schema   string
 	kind     placementKind
 	shardKey string
+	// seqCols are the registered sequence columns of a sharded table.
+	seqCols []string
 	// terms are the key predicates found for this relation.
 	terms []keyTerm
 	// scatter marks a sharded relation without any key predicate.
@@ -236,6 +239,10 @@ type walker struct {
 	tree    proto.Message
 	// outer is the outermost SELECT, the one a multi-shard merge is built for.
 	outer *pgquerypb.SelectStmt
+	// target is the relation an INSERT, UPDATE or DELETE writes.
+	target *rel
+	// root is the statement being planned.
+	root *pgquerypb.Node
 }
 
 func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
@@ -257,6 +264,7 @@ func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
 		schemas = []string{"public"}
 	}
 	snap := w.sess.Snapshot
+	r.schema = schemas[0]
 	for _, schema := range schemas {
 		if schema == "pg_catalog" || schema == "information_schema" || schema == "pg_temp" {
 			// System schemas never hold pgshard tables. An explicit qualifier
@@ -274,9 +282,10 @@ func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
 		if !ok {
 			continue
 		}
+		r.schema = schema
 		switch pl.Placement {
 		case "sharded":
-			r.kind, r.shardKey = placeSharded, pl.ShardKey
+			r.kind, r.shardKey, r.seqCols = placeSharded, pl.ShardKey, pl.SequenceColumns
 		case "reference":
 			r.kind = placeReference
 		}
@@ -305,6 +314,10 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 	switch n := node.GetNode().(type) {
 	case *pgquerypb.Node_SelectStmt:
 		w.stmt = "SELECT"
+		if name := w.nextvalName(n.SelectStmt); name != "" {
+			w.plan.Kind, w.plan.Shards, w.plan.NextVal = SessionLocal, nil, name
+			return nil
+		}
 		if err := w.selectStmt(n.SelectStmt); err != nil {
 			return err
 		}
@@ -969,9 +982,8 @@ func (w *walker) decide(write bool) error {
 			unsharded++
 		}
 	}
-	if write && reference > 0 && sharded == 0 && unsharded == 0 {
-		return notYet("writes to reference tables are not available yet (planned for M3.5)",
-			"reference tables are read-only through the router until every-shard writes land")
+	if write && w.target != nil && w.target.kind == placeReference {
+		return w.referenceWrite(sharded + unsharded)
 	}
 	if sharded == 0 {
 		if unsharded == 0 && reference > 0 {
@@ -1030,6 +1042,26 @@ func (w *walker) decide(write bool) error {
 		values[i] = t.values
 	}
 	return p.finish(values)
+}
+
+// referenceWrite plans a write to a reference table onto every shard of
+// the set: the same statement runs on each, so nothing in it may read
+// rows that live on one shard only or evaluate differently per shard.
+func (w *walker) referenceWrite(otherRels int) error {
+	p := w.plan
+	if otherRels > 0 {
+		return notYet("a write to reference table \""+w.target.name+"\" cannot read sharded or unsharded tables",
+			"the statement runs on every shard; a sharded or unsharded table is present on one shard only")
+	}
+	if fn := volatileCall(w.root); fn != "" {
+		return notYet("a write to reference table \""+w.target.name+"\" cannot call "+fn+"(): its value would differ between shards",
+			"compute the value in the client and pass it as a literal or parameter")
+	}
+	p.Kind, p.Shards = Reference, w.allShards()
+	if len(p.Shards) == 0 {
+		p.Shards = []int32{w.sess.HomeShard}
+	}
+	return nil
 }
 
 // scatter refuses or, for a plain single-table read, produces a Scatter plan.
@@ -1095,22 +1127,39 @@ func (w *walker) insert(s *pgquerypb.InsertStmt) error {
 		return notYet("INSERT into a CTE is not supported", "")
 	}
 	w.add(r)
+	w.target = r
 	sel := s.GetSelectStmt().GetSelectStmt()
 	if r.kind == placeSharded {
-		keyIdx := -1
-		for i, c := range s.GetCols() {
-			if c.GetResTarget().GetName() == r.shardKey {
-				keyIdx = i
-			}
-		}
-		if keyIdx < 0 {
+		if len(s.GetCols()) == 0 {
 			return notYet("insert requires the shard key: column \""+r.shardKey+"\" of \""+r.name+"\" is not in the column list",
 				"list the columns explicitly and include \""+r.shardKey+"\"")
 		}
 		if sel == nil || len(sel.GetValuesLists()) == 0 {
 			return notYet("INSERT ... SELECT into a sharded table is not available yet", "insert with VALUES so each row's shard key is visible")
 		}
-		for _, row := range sel.GetValuesLists() {
+		fill, injected, err := w.rewriteInsert(s, r)
+		if err != nil {
+			return err
+		}
+		w.plan.Sequences = fill
+		keyIdx := -1
+		for i, c := range s.GetCols() {
+			if c.GetResTarget().GetName() == r.shardKey {
+				keyIdx = i
+			}
+		}
+		keyParams := injected[r.shardKey]
+		if keyIdx < 0 && len(keyParams) == 0 {
+			return notYet("insert requires the shard key: column \""+r.shardKey+"\" of \""+r.name+"\" is not in the column list",
+				"list the columns explicitly and include \""+r.shardKey+"\"")
+		}
+		for i, row := range sel.GetValuesLists() {
+			if len(keyParams) > 0 {
+				// The key column is a sequence column filled by the router:
+				// keyParams has one parameter per row.
+				r.terms = append(r.terms, keyTerm{params: []ParamRef{{Number: keyParams[i], Hint: HintInt}}})
+				continue
+			}
 			items := row.GetList().GetItems()
 			if keyIdx >= len(items) {
 				return notYet("insert requires the shard key: VALUES row has fewer values than columns", "")
@@ -1166,6 +1215,7 @@ func (w *walker) update(s *pgquerypb.UpdateStmt) error {
 		return notYet("UPDATE of a CTE is not supported", "")
 	}
 	w.add(r)
+	w.target = r
 	if r.kind == placeSharded {
 		for _, t := range s.GetTargetList() {
 			if t.GetResTarget().GetName() == r.shardKey {
@@ -1202,6 +1252,7 @@ func (w *walker) delete(s *pgquerypb.DeleteStmt) error {
 		return notYet("DELETE from a CTE is not supported", "")
 	}
 	w.add(r)
+	w.target = r
 	scope := len(w.rels) - 1
 	for _, item := range s.GetUsingClause() {
 		w.blocker("joins")

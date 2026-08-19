@@ -63,12 +63,15 @@ func newShardedHarnessWith(t *testing.T, cfg Config) *shardedHarness {
 	tbl("orders", "sharded", "tenant_id")
 	tbl("docs", "sharded", "slug")
 	snap.Tables[snapshot.TableKey{Database: "app", SchemaName: "audit", TableName: "events"}] = snapshot.Placement{Placement: "sharded", ShardKey: "tenant_id"}
+	snap.Tables[snapshot.TableKey{Database: "app", SchemaName: "public", TableName: "tickets"}] = snapshot.Placement{Placement: "sharded", ShardKey: "tenant_id", SequenceColumns: []string{"id"}}
+	snap.Tables[snapshot.TableKey{Database: "app", SchemaName: "public", TableName: "eventlog"}] = snapshot.Placement{Placement: "sharded", ShardKey: "event_id", SequenceColumns: []string{"event_id"}}
+	snap.Sequences = map[string]bool{"invoice_numbers": true}
 	h := &harness{subs: map[chan snapshot.Change]struct{}{}}
 	h.snapp.Store(snap)
 	pl := NewPoolers(nil, h.snap, insecure.NewCredentials())
 	t.Cleanup(pl.Close)
 	sh := &shardedHarness{harness: h, poolers: poolers, snap: snap}
-	startHarness(t, h, Config{Snapshot: h.snap, Poolers: pl, Logger: slog.New(slog.DiscardHandler), Scatter: cfg.Scatter, Decisions: cfg.Decisions,
+	startHarness(t, h, Config{Snapshot: h.snap, Poolers: pl, Logger: slog.New(slog.DiscardHandler), Scatter: cfg.Scatter, Decisions: cfg.Decisions, Sequences: cfg.Sequences,
 		Buffering: Buffering{Window: 700 * time.Millisecond, Poll: 20 * time.Millisecond, PerShardCap: 2, Changes: h.subscribe}})
 	return sh
 }
@@ -392,7 +395,7 @@ func TestShardedRefusalsThroughTheWire(t *testing.T) {
 		{sql: "insert into orders values (1, 2)", msg: "insert requires the shard key", hint: "tenant_id"},
 		{sql: "update orders set tenant_id = 2 where tenant_id = 1", msg: "shard key is immutable"},
 		{sql: "delete from orders", msg: "scatter DELETE without a shard key predicate is not available yet"},
-		{sql: "insert into regions values (1)", msg: "writes to reference tables are not available yet (planned for M3.5)"},
+		{sql: "insert into regions values (1)", msg: "two-phase commit is not available: the router has no decision log"},
 		{sql: "create table orders (id int primary key, tenant_id int8)", msg: "primary key or unique constraint (id) on sharded table \"orders\" must include the shard key \"tenant_id\""},
 		{sql: "create table orders (id int, tenant_id int8, primary key (tenant_id, id))", msg: "DDL fan-out is not available yet"},
 		{sql: "select * from orders o join docs d on o.id = d.id where o.tenant_id = " + itoa(farFrom(t, h, "acme")) + " and d.slug = $1", args: []any{"acme"}, msg: "cross-shard join is not available yet"},

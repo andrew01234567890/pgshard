@@ -32,6 +32,9 @@ type Table struct {
 	HashVersion       int32
 	DesiredGeneration int64
 	UpdatedAt         time.Time
+	// SequenceColumns are the columns the router fills from
+	// pgshard.sequences on INSERT; nil when the table has none.
+	SequenceColumns []string
 }
 
 // ShardRange is a row of pgshard.shard_ranges. Lower is inclusive, Upper is
@@ -84,7 +87,7 @@ func ListDatabases(ctx context.Context, q Querier) ([]Database, error) {
 // ListTables returns the desired tables of one database.
 func ListTables(ctx context.Context, q Querier, database string) ([]Table, error) {
 	rows, err := q.Query(ctx, `
-		SELECT database, schema_name, table_name, placement, shard_key, hash_version, desired_generation, updated_at
+		SELECT database, schema_name, table_name, placement, shard_key, hash_version, desired_generation, updated_at, sequence_columns
 		FROM pgshard.tables WHERE database = $1 ORDER BY schema_name, table_name`, database)
 	if err != nil {
 		return nil, err
@@ -133,12 +136,21 @@ func ListShardStatus(ctx context.Context, q Querier, shardSet string) ([]ShardSt
 // ListAllTables returns every desired table ordered by database, schema and name.
 func ListAllTables(ctx context.Context, q Querier) ([]Table, error) {
 	rows, err := q.Query(ctx, `
-		SELECT database, schema_name, table_name, placement, shard_key, hash_version, desired_generation, updated_at
+		SELECT database, schema_name, table_name, placement, shard_key, hash_version, desired_generation, updated_at, sequence_columns
 		FROM pgshard.tables ORDER BY database, schema_name, table_name`)
 	if err != nil {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, pgx.RowToStructByPos[Table])
+}
+
+// ListSequenceNames returns the names of every global sequence.
+func ListSequenceNames(ctx context.Context, q Querier) ([]string, error) {
+	rows, err := q.Query(ctx, `SELECT name FROM pgshard.sequences ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
 // ListAllShardRanges returns the ranges of every shard set ordered by set and key space.

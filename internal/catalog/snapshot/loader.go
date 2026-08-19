@@ -28,6 +28,7 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 		Serving:   map[ShardKey]Serving{},
 		Databases: map[string]catalog.Database{},
 		Tables:    map[TableKey]Placement{},
+		Sequences: map[string]bool{},
 	}
 	if s.ShardMapGeneration, s.DesiredGeneration, err = catalog.Generations(ctx, tx); err != nil {
 		return nil, fmt.Errorf("snapshot: generations: %w", err)
@@ -76,12 +77,20 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 			if ts.EffectiveShardKey != nil {
 				p.ShardKey = *ts.EffectiveShardKey
 			}
+			p.SequenceColumns = t.SequenceColumns
 			s.Tables[key] = p
 			continue
 		}
 		if t.Placement == "unsharded" {
 			s.Tables[key] = Placement{Placement: t.Placement, Generation: t.DesiredGeneration}
 		}
+	}
+	names, err := catalog.ListSequenceNames(ctx, tx)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot: sequences: %w", err)
+	}
+	for _, n := range names {
+		s.Sequences[n] = true
 	}
 	return s, tx.Commit(ctx)
 }

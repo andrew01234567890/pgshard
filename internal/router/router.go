@@ -32,6 +32,9 @@ type Config struct {
 	// Decisions is the durable log two-phase commit decides through; nil
 	// refuses transactions that write to more than one shard.
 	Decisions DecisionLog
+	// Sequences serves the global sequences of sharded tables; nil refuses
+	// statements that need one.
+	Sequences *SequenceAllocator
 }
 
 // CancelForwarder delivers a cancel key to the router instances it may

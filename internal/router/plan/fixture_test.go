@@ -35,6 +35,9 @@ func fixture(t testing.TB) *snapshot.Snapshot {
 	tbl("orders", "sharded", "tenant_id")
 	tbl("order_lines", "sharded", "tenant_id")
 	tbl("docs", "sharded", "slug")
+	s.Tables[snapshot.TableKey{Database: fixtureDB, SchemaName: "public", TableName: "tickets"}] = snapshot.Placement{Placement: "sharded", ShardKey: "tenant_id", SequenceColumns: []string{"id"}}
+	s.Tables[snapshot.TableKey{Database: fixtureDB, SchemaName: "public", TableName: "events"}] = snapshot.Placement{Placement: "sharded", ShardKey: "event_id", SequenceColumns: []string{"event_id"}}
+	s.Sequences = map[string]bool{"invoice_numbers": true}
 	s.Tables[snapshot.TableKey{Database: fixtureDB, SchemaName: "audit", TableName: "events"}] = snapshot.Placement{Placement: "sharded", ShardKey: "tenant_id"}
 	return s
 }
