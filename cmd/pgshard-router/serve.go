@@ -199,6 +199,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		Peers:     peersOrNil(forwarder),
 		Buffering: router.Buffering{Window: *bufferWindow, PerShardCap: *bufferCap, Changes: w.Subscribe},
 		Scatter:   router.ScatterConfig{MaxShards: *scatterMaxShards, MaxStreams: *scatterMaxStreams},
+		Decisions: &router.PGDecisionLog{Pool: pool},
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
@@ -242,7 +243,10 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 			fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
 			return cli.ExitNotReady
 		}
-		hs := &http.Server{Handler: drainer.Handler(), ReadHeaderTimeout: 5 * time.Second}
+		mux := http.NewServeMux()
+		mux.Handle("/", drainer.Handler())
+		mux.Handle("/metrics", rt.MetricsHandler())
+		hs := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 		go func() { _ = hs.Serve(hl) }()
 		defer func() { _ = hs.Close() }()
 		fmt.Fprintf(stdout, "pgshard-router serve: health on %s\n", hl.Addr())

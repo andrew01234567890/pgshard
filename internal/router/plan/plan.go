@@ -51,14 +51,36 @@ const DefaultShardSet = "default"
 // needs to track beyond routing.
 type StmtClass struct {
 	// SetGUC is set for a session-level SET/RESET; GUCName is the GUC (""
-	// for RESET ALL).
-	SetGUC  bool
-	GUCName string
+	// for RESET ALL) and GUCValue its first literal argument, when any.
+	SetGUC   bool
+	GUCName  string
+	GUCValue string
 	// SearchPath is the schema list a session-level SET search_path names;
 	// nil with GUCName "search_path" (or "" for RESET ALL) restores the
 	// session default.
 	SearchPath []string
+	// Write is set for every statement that is not a plain read: DML, DDL,
+	// COPY, SELECT with a locking clause and anything the router does not
+	// recognise. Session-local statements are never writes.
+	Write bool
+	// Txn is the transaction control statement this is, if any.
+	Txn TxnKind
+	// Chain marks COMMIT/ROLLBACK AND CHAIN.
+	Chain bool
 }
+
+// TxnKind classifies transaction control statements.
+type TxnKind int
+
+// Transaction control statement kinds.
+const (
+	TxnNone TxnKind = iota
+	TxnBegin
+	TxnCommit
+	TxnRollback
+	// TxnSavepoint covers SAVEPOINT, RELEASE and ROLLBACK TO.
+	TxnSavepoint
+)
 
 // Plan is the routing decision for one statement.
 type Plan struct {

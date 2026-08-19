@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"sync"
+	"sync/atomic"
 
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
 )
@@ -27,6 +29,9 @@ type Config struct {
 	Buffering Buffering
 	// Scatter bounds multi-shard reads; zero values pick defaults.
 	Scatter ScatterConfig
+	// Decisions is the durable log two-phase commit decides through; nil
+	// refuses transactions that write to more than one shard.
+	Decisions DecisionLog
 }
 
 // CancelForwarder delivers a cancel key to the router instances it may
@@ -43,9 +48,16 @@ type Router struct {
 
 	scatter *scatterSlots
 
+	// inDoubt counts transactions whose commit decision is durable but
+	// whose participants the router could not finish itself.
+	inDoubt atomic.Int64
+
 	mu       sync.Mutex
 	sessions map[uint64]*Executor
 	buffered map[Shard]int
+	// prepared caches whether a shard's PostgreSQL accepts prepared
+	// transactions.
+	prepared map[Shard]bool
 }
 
 // New validates cfg and returns a Router.
@@ -69,7 +81,33 @@ func New(cfg Config) (*Router, error) {
 		return nil, err
 	}
 	return &Router{cfg: cfg, prefix: hex.EncodeToString(b[:]), scatter: newScatterSlots(cfg.Scatter.MaxStreams),
-		sessions: map[uint64]*Executor{}, buffered: map[Shard]int{}}, nil
+		sessions: map[uint64]*Executor{}, buffered: map[Shard]int{}, prepared: map[Shard]bool{}}, nil
+}
+
+func (r *Router) preparedCapacity(sh Shard) (ok, known bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ok, known = r.prepared[sh]
+	return ok, known
+}
+
+func (r *Router) setPreparedCapacity(sh Shard, ok bool) {
+	r.mu.Lock()
+	r.prepared[sh] = ok
+	r.mu.Unlock()
+}
+
+// InDoubt reports how many two-phase commits this router left to the
+// resolver since it started.
+func (r *Router) InDoubt() int64 { return r.inDoubt.Load() }
+
+// MetricsHandler serves the router's counters in the Prometheus text format.
+func (r *Router) MetricsHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		fmt.Fprintf(w, "# TYPE pgshard_router_in_doubt_transactions_total counter\npgshard_router_in_doubt_transactions_total %d\n", r.InDoubt())
+		fmt.Fprintf(w, "# TYPE pgshard_router_sessions gauge\npgshard_router_sessions %d\n", r.Sessions())
+	})
 }
 
 // NewExecutor implements pgwire.Config.NewExecutor: it resolves the session's

@@ -24,6 +24,12 @@ const pgImage = "ghcr.io/andrew01234567890/pgshard-postgres:18"
 
 func startPostgres(t *testing.T) string {
 	t.Helper()
+	return startPostgresWith(t)
+}
+
+// startPostgresWith starts PostgreSQL with extra server options.
+func startPostgresWith(t *testing.T, opts ...string) string {
+	t.Helper()
 	if err := exec.Command("docker", "info").Run(); err != nil {
 		t.Skip("docker unavailable; skipping controller integration tests")
 	}
@@ -42,7 +48,7 @@ func startPostgres(t *testing.T) string {
 		"--entrypoint", "sh", pgImage, "-ec",
 		`initdb -D /tmp/pgdata --auth=trust -U postgres >/dev/null &&
 		 echo "host all all all trust" >> /tmp/pgdata/pg_hba.conf &&
-		 exec postgres -D /tmp/pgdata -c listen_addresses='*'`).CombinedOutput()
+		 exec postgres -D /tmp/pgdata -c listen_addresses='*' `+strings.Join(opts, " ")).CombinedOutput()
 	if err != nil {
 		t.Fatalf("docker run: %v: %s", err, out)
 	}

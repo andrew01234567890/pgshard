@@ -32,7 +32,8 @@ func newShardedHarness(t *testing.T) *shardedHarness {
 	return newShardedHarnessWith(t, Config{})
 }
 
-// newShardedHarnessWith is newShardedHarness with cfg's Scatter settings.
+// newShardedHarnessWith is newShardedHarness with cfg's Scatter and
+// Decisions settings.
 func newShardedHarnessWith(t *testing.T, cfg Config) *shardedHarness {
 	t.Helper()
 	ranges, err := placement.Split(4)
@@ -67,7 +68,7 @@ func newShardedHarnessWith(t *testing.T, cfg Config) *shardedHarness {
 	pl := NewPoolers(nil, h.snap, insecure.NewCredentials())
 	t.Cleanup(pl.Close)
 	sh := &shardedHarness{harness: h, poolers: poolers, snap: snap}
-	startHarness(t, h, Config{Snapshot: h.snap, Poolers: pl, Logger: slog.New(slog.DiscardHandler), Scatter: cfg.Scatter,
+	startHarness(t, h, Config{Snapshot: h.snap, Poolers: pl, Logger: slog.New(slog.DiscardHandler), Scatter: cfg.Scatter, Decisions: cfg.Decisions,
 		Buffering: Buffering{Window: 700 * time.Millisecond, Poll: 20 * time.Millisecond, PerShardCap: 2, Changes: h.subscribe}})
 	return sh
 }
@@ -353,9 +354,9 @@ func TestShardedTransactionMovesBeforeTouchingAShard(t *testing.T) {
 		t.Fatalf("shard %d backend is not in a transaction", shard)
 	}
 	_, err = tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 2)", b)
-	pe := expectRefusal(t, err, "multi-shard transactions are not available yet")
-	if !strings.Contains(pe.Message, "needs shard default/"+itoa(int64(h.shardOf(t, b)))) {
-		t.Fatalf("refusal must name the second shard: %q", pe.Message)
+	pe := expectRefusal(t, err, "two-phase commit is not available: the router has no decision log")
+	if pe.Code != "0A000" {
+		t.Fatalf("code %s", pe.Code)
 	}
 	if err := tx.Rollback(ctx); err != nil {
 		t.Fatal(err)
@@ -559,7 +560,7 @@ func TestShardedInTransactionCannotLeaveTouchedShard(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := conn.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 1)", a)
-	_ = expectRefusal(t, err, "multi-shard transactions are not available yet: transaction is on shard default/0")
+	_ = expectRefusal(t, err, "two-phase commit is not available: the router has no decision log")
 	if _, err := conn.Exec(ctx, "commit"); err != nil {
 		t.Fatal(err)
 	}

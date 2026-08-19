@@ -99,12 +99,12 @@ func freePort(tb testing.TB) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
-func startPostgres(tb testing.TB, name string) (addr, adminDSN string) {
+func startPostgres(tb testing.TB, name string, opts ...string) (addr, adminDSN string) {
 	tb.Helper()
 	port := freePort(tb)
 	script := `initdb -D /tmp/pgdata --auth=trust -U postgres >/dev/null &&
 		 printf 'host all postgres all trust\nhost all all all scram-sha-256\n' >> /tmp/pgdata/pg_hba.conf &&
-		 exec postgres -D /tmp/pgdata -c listen_addresses='*' -c wal_level=logical`
+		 exec postgres -D /tmp/pgdata -c listen_addresses='*' -c wal_level=logical ` + strings.Join(opts, " ")
 	cname := fmt.Sprintf("pgshard-router-e2e-%s-%d", name, port)
 	out, err := exec.Command("docker", "run", "-d", "--rm", "--name", cname, "-p", fmt.Sprintf("127.0.0.1:%d:5432", port), "--entrypoint", "sh", pgImage(), "-ec", script).CombinedOutput()
 	if err != nil {
@@ -131,13 +131,20 @@ func startPostgres(tb testing.TB, name string) (addr, adminDSN string) {
 
 func buildBinaries(tb testing.TB) (pooler, rtr string) {
 	tb.Helper()
+	return buildBinariesTagged(tb, "")
+}
+
+// buildBinariesTagged builds the pooler and a router with the given build
+// tags.
+func buildBinariesTagged(tb testing.TB, tags string) (pooler, rtr string) {
+	tb.Helper()
 	dir := tb.TempDir()
 	root, err := filepath.Abs("../../..")
 	if err != nil {
 		tb.Fatal(err)
 	}
 	for _, c := range []string{"pgshard-pooler", "pgshard-router"} {
-		cmd := exec.Command("go", "build", "-o", filepath.Join(dir, c), "./cmd/"+c)
+		cmd := exec.Command("go", "build", "-tags", tags, "-o", filepath.Join(dir, c), "./cmd/"+c)
 		cmd.Dir = root
 		if out, err := cmd.CombinedOutput(); err != nil {
 			tb.Fatalf("build %s: %v: %s", c, err, out)
@@ -148,7 +155,14 @@ func buildBinaries(tb testing.TB) (pooler, rtr string) {
 
 func startProcess(tb testing.TB, log *logBuffer, ready string, bin string, args ...string) (*exec.Cmd, <-chan struct{}) {
 	tb.Helper()
+	return startProcessEnv(tb, log, ready, nil, bin, args...)
+}
+
+// startProcessEnv is startProcess with extra environment variables.
+func startProcessEnv(tb testing.TB, log *logBuffer, ready string, env []string, bin string, args ...string) (*exec.Cmd, <-chan struct{}) {
+	tb.Helper()
 	cmd := exec.Command(bin, args...)
+	cmd.Env = append(os.Environ(), env...)
 	cmd.Stdout, cmd.Stderr = log, log
 	if err := cmd.Start(); err != nil {
 		tb.Fatal(err)
@@ -196,13 +210,19 @@ func (s *stack) startRouter(tb testing.TB, instanceID int, peers map[int]string,
 
 func startStack(tb testing.TB) *stack {
 	tb.Helper()
+	return startStackWith(tb, nil)
+}
+
+// startStackWith is startStack with extra PostgreSQL options for shard 0.
+func startStackWith(tb testing.TB, shardOpts []string) *stack {
+	tb.Helper()
 	requireDocker(tb)
 	poolerBin, routerBin := buildBinaries(tb)
 	s := &stack{routerLog: &logBuffer{}, poolerLog: &logBuffer{}}
 	var catalogAddr string
 	catalogAddr, s.catalogDSN = startPostgres(tb, "catalog")
 	_ = catalogAddr
-	s.shardAddr, s.shardDSN = startPostgres(tb, "shard0")
+	s.shardAddr, s.shardDSN = startPostgres(tb, "shard0", shardOpts...)
 	s.poolerAddr = fmt.Sprintf("127.0.0.1:%d", freePort(tb))
 	err := router.DevBootstrap{CatalogDSN: s.catalogDSN, ShardDSN: s.shardDSN, Database: appDatabase, Role: appRole,
 		Password: appPassword, PoolerEndpoint: s.poolerAddr, Epoch: 1}.Run(context.Background())

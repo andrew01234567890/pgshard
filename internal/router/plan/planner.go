@@ -52,9 +52,11 @@ func (p *Planner) Plan(ctx context.Context, sess Session, sql string) (Plan, err
 	if err := classify(raw.GetStmt(), &pl.Class); err != nil {
 		return refusalErr(err)
 	}
-	if err := (&walker{sess: sess, plan: pl, tree: res.Tree}).statement(raw.GetStmt()); err != nil {
+	w := &walker{sess: sess, plan: pl, tree: res.Tree}
+	if err := w.statement(raw.GetStmt()); err != nil {
 		return refusalErr(err)
 	}
+	pl.Class.Write = pl.Kind != SessionLocal && (w.stmt != "SELECT" || w.locking)
 	if pl.merge != nil && raw.GetStmt().GetSelectStmt() == nil {
 		pl.merge, pl.mergeErr = nil, notYet("only a plain SELECT can run on multiple shards", "filter on one shard key value")
 		if pl.Kind == Scatter {
@@ -72,7 +74,7 @@ func (s Session) generation() int64 {
 }
 
 func (s Session) unsharded() Plan {
-	return Plan{Kind: Unsharded, Shards: []int32{s.HomeShard}, Generation: s.generation()}
+	return Plan{Kind: Unsharded, Shards: []int32{s.HomeShard}, Generation: s.generation(), Class: StmtClass{Write: true}}
 }
 
 func (s Session) session() Plan { return Plan{Kind: SessionLocal, Generation: s.generation()} }
@@ -99,6 +101,24 @@ func classify(node *pgquerypb.Node, c *StmtClass) error {
 		if n.CreateTableAsStmt.GetInto().GetRel().GetRelpersistence() == "t" {
 			return notYet("temporary tables are not supported through the router", "")
 		}
+	case *pgquerypb.Node_TransactionStmt:
+		t := n.TransactionStmt
+		c.Chain = t.GetChain()
+		switch t.GetKind() {
+		case pgquerypb.TransactionStmtKind_TRANS_STMT_BEGIN, pgquerypb.TransactionStmtKind_TRANS_STMT_START:
+			c.Txn = TxnBegin
+		case pgquerypb.TransactionStmtKind_TRANS_STMT_COMMIT:
+			c.Txn = TxnCommit
+		case pgquerypb.TransactionStmtKind_TRANS_STMT_ROLLBACK:
+			c.Txn = TxnRollback
+		case pgquerypb.TransactionStmtKind_TRANS_STMT_SAVEPOINT, pgquerypb.TransactionStmtKind_TRANS_STMT_RELEASE,
+			pgquerypb.TransactionStmtKind_TRANS_STMT_ROLLBACK_TO:
+			c.Txn = TxnSavepoint
+		case pgquerypb.TransactionStmtKind_TRANS_STMT_PREPARE, pgquerypb.TransactionStmtKind_TRANS_STMT_COMMIT_PREPARED,
+			pgquerypb.TransactionStmtKind_TRANS_STMT_ROLLBACK_PREPARED:
+			return notYet("PREPARE TRANSACTION, COMMIT PREPARED and ROLLBACK PREPARED are reserved for the router's transaction coordinator",
+				"use COMMIT; the router runs two-phase commit itself when a transaction writes to several shards")
+		}
 	case *pgquerypb.Node_VariableSetStmt:
 		s := n.VariableSetStmt
 		if s.GetIsLocal() {
@@ -111,6 +131,9 @@ func classify(node *pgquerypb.Node, c *StmtClass) error {
 		case pgquerypb.VariableSetKind_VAR_SET_VALUE, pgquerypb.VariableSetKind_VAR_SET_DEFAULT,
 			pgquerypb.VariableSetKind_VAR_SET_CURRENT, pgquerypb.VariableSetKind_VAR_RESET:
 			c.SetGUC, c.GUCName = true, strings.ToLower(s.GetName())
+			if args := s.GetArgs(); len(args) == 1 {
+				c.GUCValue = args[0].GetAConst().GetSval().GetSval()
+			}
 			if c.GUCName == "search_path" {
 				if s.GetKind() == pgquerypb.VariableSetKind_VAR_SET_CURRENT {
 					return notYet("SET search_path FROM CURRENT is not available yet", "")
@@ -207,7 +230,10 @@ type walker struct {
 	// outerQuals is set while walking the ON clause of an outer join: a key
 	// literal there filters only the inner side, so it must not pin the query.
 	outerQuals bool
-	tree       proto.Message
+	// locking marks a SELECT with FOR UPDATE/SHARE, which holds row locks
+	// until the transaction ends and so counts as a write participant.
+	locking bool
+	tree    proto.Message
 	// outer is the outermost SELECT, the one a multi-shard merge is built for.
 	outer *pgquerypb.SelectStmt
 }
@@ -496,6 +522,9 @@ func (w *walker) selectStmt(s *pgquerypb.SelectStmt) error {
 			return err
 		}
 		return w.selectStmt(s.GetRarg())
+	}
+	if len(s.GetLockingClause()) > 0 {
+		w.locking = true
 	}
 	if !w.nested {
 		w.outer = s

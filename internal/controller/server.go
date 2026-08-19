@@ -17,6 +17,21 @@ import (
 type Server struct {
 	pgshardv1.UnimplementedControllerServer
 	Pool *pgxpool.Pool
+	// Resolver serves ResolveTransactions; nil answers Unimplemented.
+	Resolver *Resolver
+}
+
+// ResolveTransactions runs one resolver pass on demand.
+func (s *Server) ResolveTransactions(ctx context.Context, req *pgshardv1.ResolveTransactionsRequest) (*pgshardv1.ResolveTransactionsResponse, error) {
+	if s.Resolver == nil {
+		return nil, status.Error(codes.Unimplemented, "the controller has no shard access configured for the resolver")
+	}
+	out, err := s.Resolver.Resolve(ctx, req.GetShardSet())
+	resp := &pgshardv1.ResolveTransactionsResponse{Committed: uint32(out.Committed), RolledBack: uint32(out.RolledBack), Unresolved: uint32(out.Unresolved)}
+	if err != nil {
+		resp.Error = &pgshardv1.Error{Message: err.Error()}
+	}
+	return resp, nil
 }
 
 var kindToProto = map[string]pgshardv1.WorkflowKind{

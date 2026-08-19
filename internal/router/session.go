@@ -61,6 +61,7 @@ func (p prepared) paramOIDs() []uint32 {
 type execItem struct {
 	sql   string
 	local bool
+	class StmtClass
 }
 
 type gucEntry struct {
@@ -128,6 +129,12 @@ type Executor struct {
 	// startupSearchPath is the search_path the client asked for at startup
 	// (options=-c search_path=...); nil means the server default.
 	startupSearchPath []string
+	// parked holds the streams of the other shards an open transaction has
+	// touched; wroteHere says whether the current shard was written to.
+	parked    map[Shard]*txnPart
+	wroteHere bool
+	gid       string
+	gidSeq    uint64
 }
 
 func newExecutor(r *Router, info pgwire.SessionInfo, home Shard) *Executor {
@@ -240,10 +247,7 @@ func (e *Executor) moveTo(target Shard) error {
 		return nil
 	}
 	if e.tx != pgwire.TxIdle && e.txnTouched {
-		err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "multi-shard transactions are not available yet: transaction is on shard %s/%d, statement needs shard %s/%d",
-			e.shard.Set, e.shard.ID, target.Set, target.ID)
-		err.Hint = "commit or roll back first; two-phase commit across shards is planned for M3.4"
-		return err
+		return e.switchPart(target)
 	}
 	e.dropStream()
 	e.shard = target
@@ -301,6 +305,12 @@ func (e *Executor) SimpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 	if multiShard(pl) {
 		return e.afterBatch(ctx, e.scatterSimple(ctx, pl, sql, w))
 	}
+	if err := checkTransactionMode(pl.Class); err != nil {
+		return err
+	}
+	if handled, err := e.txnControl(ctx, pl.Class, w); handled {
+		return e.afterBatch(ctx, err)
+	}
 	target, err := e.target(pl)
 	if err != nil {
 		return err
@@ -311,6 +321,11 @@ func (e *Executor) SimpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 	return e.withFailover(ctx, w, func(cw pgwire.ResultWriter) error {
 		if err := e.acquire(ctx, nil); err != nil {
 			return err
+		}
+		if pl.Class.Write {
+			if err := e.noteWrite(ctx); err != nil {
+				return err
+			}
 		}
 		if pl.Class.SetGUC {
 			if err := e.ensurePinned(ctx); err != nil {
@@ -380,6 +395,7 @@ func (e *Executor) bufferFull() error { return bufferFullError(e.shard) }
 // dropStream discards the pooler stream so the retry reacquires a backend
 // from the refreshed endpoint and replays session state.
 func (e *Executor) dropStream() {
+	e.dropParked()
 	if e.conn != nil {
 		e.conn.abort()
 		e.conn = nil
@@ -407,6 +423,9 @@ func (e *Executor) Parse(ctx context.Context, name, sql string, paramOIDs []uint
 		return nil
 	}
 	pl, err := e.r.cfg.Planner.Plan(ctx, e.planSession(), sql)
+	if err == nil {
+		err = checkTransactionMode(pl.Class)
+	}
 	if err != nil {
 		e.failBatch()
 		return err
@@ -545,7 +564,7 @@ func (e *Executor) Execute(_ context.Context, portal string, maxRows int32, w pg
 		if st.class.SetGUC {
 			e.staged = append(e.staged, gucEntry{name: st.class.GUCName, sql: st.sql, searchPath: st.class.SearchPath})
 		}
-		e.batchExec = append(e.batchExec, execItem{sql: st.sql, local: st.plan.Kind == plan.SessionLocal})
+		e.batchExec = append(e.batchExec, execItem{sql: st.sql, local: st.plan.Kind == plan.SessionLocal, class: st.class})
 	}
 	e.batch = append(e.batch, executeReq(portal, maxRows))
 	return nil
@@ -609,6 +628,10 @@ func (e *Executor) Sync(ctx context.Context) error {
 		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
 		return e.afterBatch(ctx, e.scatterBatch(ctx, *scatterPlan, scatterStmt, batch, w))
 	}
+	if handled, err := e.txnControlBatch(ctx, batch, executed, w); handled {
+		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
+		return e.afterBatch(ctx, err)
+	}
 	if err := e.moveTo(target); err != nil {
 		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
 		return e.afterBatch(ctx, err)
@@ -622,6 +645,15 @@ func (e *Executor) Sync(ctx context.Context) error {
 			if err := e.ensurePinned(ctx); err != nil {
 				e.staged = e.staged[:e.stagedMark]
 				return err
+			}
+		}
+		for _, item := range executed {
+			if item.class.Write {
+				if err := e.noteWrite(ctx); err != nil {
+					e.staged = e.staged[:e.stagedMark]
+					return err
+				}
+				break
 			}
 		}
 		for _, req := range batch {
@@ -647,6 +679,8 @@ func (e *Executor) Sync(ctx context.Context) error {
 func (e *Executor) afterBatch(ctx context.Context, err error) error {
 	if e.tx == pgwire.TxIdle {
 		e.txnPrelude, e.txnTouched = nil, false
+		e.wroteHere, e.gid = false, ""
+		e.dropParked()
 		switch {
 		case err != nil || strings.HasPrefix(e.lastTag, "ROLLBACK"):
 			e.staged = nil
@@ -796,6 +830,7 @@ func (e *Executor) send(req *pgshardv1.ExecuteRequest) error {
 // poolerLost drops the stream and reports 08006; the next statement
 // reacquires a backend and replays session state.
 func (e *Executor) poolerLost(cause error) error {
+	e.dropParked()
 	if e.conn != nil {
 		e.conn.abort()
 		e.conn = nil
@@ -973,6 +1008,7 @@ func releaseRPC(ctx context.Context, client pgshardv1.PoolerClient, sid string) 
 // Release implements pgwire.Executor: the session is over.
 func (e *Executor) Release() {
 	e.r.forget(e)
+	e.dropParked()
 	pinned := e.pinned
 	if e.conn != nil {
 		e.conn.close()
