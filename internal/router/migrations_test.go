@@ -208,15 +208,15 @@ func TestDDLRefusedInTransactionAndRewriteClass(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = tx.Exec(ctx, "create table orders (tenant_id int8, id int, primary key (tenant_id, id))")
-	expectRefusal(t, err, "CREATE TABLE inside a transaction block is not available through the router")
+	_ = expectRefusal(t, err, "CREATE TABLE inside a transaction block is not available through the router")
 	_ = tx.Rollback(ctx)
 	if len(q.queued) != 0 {
 		t.Fatal("refused DDL was queued")
 	}
 	_, err = conn.Exec(ctx, "alter table orders alter column id type bigint")
-	expectRefusal(t, err, "rewrite-class DDL is not available yet")
+	_ = expectRefusal(t, err, "rewrite-class DDL is not available yet")
 	_, err = conn.Exec(ctx, "drop table items, orders")
-	expectRefusal(t, err, "one DDL statement cannot touch both sharded and unsharded tables")
+	_ = expectRefusal(t, err, "one DDL statement cannot touch both sharded and unsharded tables")
 	if len(q.queued) != 0 {
 		t.Fatal("refused DDL was queued")
 	}

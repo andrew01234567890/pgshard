@@ -306,7 +306,7 @@ func TestApplierRunsOnEveryTargetInsideATransaction(t *testing.T) {
 func TestApplierRetriesLockTimeoutsWithBackoff(t *testing.T) {
 	f := newApplierFixture(t)
 	fails := 3
-	f.shards.exec = func(shard int32, sql string) error {
+	f.shards.exec = func(shard int32, _ string) error {
 		if shard == 1 && fails > 0 {
 			fails--
 			return pgErr("55P03", "canceling statement due to lock timeout")
@@ -332,7 +332,7 @@ func TestApplierRetriesLockTimeoutsWithBackoff(t *testing.T) {
 
 func TestApplierGivesUpAfterTheBackoffBudget(t *testing.T) {
 	f := newApplierFixture(t)
-	f.shards.exec = func(shard int32, sql string) error {
+	f.shards.exec = func(shard int32, _ string) error {
 		if shard == 0 {
 			return pgErr("55P03", "canceling statement due to lock timeout")
 		}
@@ -376,7 +376,7 @@ func TestApplierRetriesUnreachableShards(t *testing.T) {
 
 func TestApplierHardFailureLeavesOtherShardsApplied(t *testing.T) {
 	f := newApplierFixture(t)
-	f.shards.exec = func(shard int32, sql string) error {
+	f.shards.exec = func(shard int32, _ string) error {
 		if shard == 1 {
 			return pgErr("42P07", `relation "t" already exists`)
 		}
@@ -431,7 +431,7 @@ func TestApplierResumesARunningMigrationIdempotently(t *testing.T) {
 	// A pending shard is never guarded by the existence check: an object
 	// created out of band is a hard failure, not a silent success.
 	f.shards.exists = func(int32, string, string) bool { return true }
-	f.shards.exec = func(shard int32, sql string) error { return pgErr("42P07", "exists") }
+	f.shards.exec = func(_ int32, _ string) error { return pgErr("42P07", "exists") }
 	id2 := f.queue(catalog.DDLMigration{Statement: "create table t (id int)", Kind: "CREATE TABLE", Scope: "home",
 		Meta: catalog.MigrationMeta{Object: catalog.MigrationObject{Kind: "relation", Name: "t", Expect: "present"}}})
 	f.run(t)
@@ -442,7 +442,7 @@ func TestApplierResumesARunningMigrationIdempotently(t *testing.T) {
 
 func TestApplierSkipsShardsWithoutTheObjectUnderExistingScope(t *testing.T) {
 	f := newApplierFixture(t)
-	f.shards.exec = func(shard int32, sql string) error {
+	f.shards.exec = func(shard int32, _ string) error {
 		if shard != 0 {
 			return pgErr("42704", `index "i" does not exist`)
 		}
@@ -493,7 +493,7 @@ func TestApplierRebuildsAnInvalidConcurrentIndexOnce(t *testing.T) {
 		t.Fatal("CONCURRENTLY ran inside a transaction")
 	}
 	// A second failure is final.
-	f.shards.exec = func(shard int32, sql string) error { return pgErr("23505", "duplicate key") }
+	f.shards.exec = func(_ int32, _ string) error { return pgErr("23505", "duplicate key") }
 	id = f.queue(catalog.DDLMigration{Statement: "create index concurrently i on t (x)", Kind: "CREATE INDEX", Scope: "home", Strategy: "concurrent",
 		Meta: catalog.MigrationMeta{Object: catalog.MigrationObject{Kind: "relation", Name: "i", Expect: "present"}}})
 	f.run(t)
