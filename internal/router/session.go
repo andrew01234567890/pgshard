@@ -66,6 +66,9 @@ type execItem struct {
 type gucEntry struct {
 	name string
 	sql  string
+	// searchPath is the schema list a search_path entry set; nil restores
+	// the startup default.
+	searchPath []string
 }
 
 // Executor is the router's pgwire.Executor: one client session relayed to
@@ -117,6 +120,10 @@ type Executor struct {
 	// statement.
 	txnPrelude []string
 	txnTouched bool
+
+	// startupSearchPath is the search_path the client asked for at startup
+	// (options=-c search_path=...); nil means the server default.
+	startupSearchPath []string
 }
 
 func newExecutor(r *Router, info pgwire.SessionInfo, home Shard) *Executor {
@@ -128,7 +135,61 @@ func newExecutor(r *Router, info pgwire.SessionInfo, home Shard) *Executor {
 			ScramClientKey: append([]byte(nil), keys.ClientKey...), ScramServerKey: append([]byte(nil), keys.ServerKey...)},
 		ctx: ctx, cancel: cancel, tx: pgwire.TxIdle,
 		stmts: map[string]prepared{}, portals: map[string]string{},
+		startupSearchPath: startupSearchPath(info.Params["options"]),
 	}
+}
+
+// startupSearchPath extracts search_path from a startup "options" parameter
+// (-c search_path=a,b or --search_path=a,b); other options are left alone.
+func startupSearchPath(options string) []string {
+	fields := strings.Fields(options)
+	var path []string
+	for i := 0; i < len(fields); i++ {
+		f := fields[i]
+		switch {
+		case f == "-c" && i+1 < len(fields):
+			i++
+			f = fields[i]
+		case strings.HasPrefix(f, "-c"):
+			f = f[2:]
+		case strings.HasPrefix(f, "--"):
+			f = f[2:]
+		default:
+			continue
+		}
+		name, value, ok := strings.Cut(f, "=")
+		if !ok || !strings.EqualFold(strings.TrimSpace(name), "search_path") {
+			continue
+		}
+		path = []string{}
+		for _, part := range strings.Split(value, ",") {
+			part = strings.Trim(strings.TrimSpace(part), `"`)
+			if part != "" {
+				path = append(path, part)
+			}
+		}
+	}
+	return path
+}
+
+// searchPath is the schema list in force for the next statement: the
+// startup default, then every settled and staged SET/RESET in order.
+func (e *Executor) searchPath() []string {
+	path := e.startupSearchPath
+	for _, list := range [][]gucEntry{e.gucs, e.staged} {
+		for _, g := range list {
+			switch g.name {
+			case "":
+				path = e.startupSearchPath
+			case "search_path":
+				path = g.searchPath
+				if path == nil {
+					path = e.startupSearchPath
+				}
+			}
+		}
+	}
+	return path
 }
 
 // Home reports the home shard of the session's database.
@@ -141,7 +202,7 @@ func (e *Executor) Shard() Shard { return e.shard }
 // catalog shard set see no table placement and plan everything onto their
 // home shard.
 func (e *Executor) planSession() plan.Session {
-	sess := plan.Session{Database: e.info.Database, HomeShard: e.home.ID, ID: e.info.ID}
+	sess := plan.Session{Database: e.info.Database, HomeShard: e.home.ID, ID: e.info.ID, SearchPath: e.searchPath()}
 	if e.home.Set == DefaultShardSet {
 		sess.Snapshot = e.r.cfg.Snapshot()
 	}
@@ -259,7 +320,7 @@ func (e *Executor) SimpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 			e.noteExecuted(sql, pl.Kind == plan.SessionLocal)
 		}
 		if pl.Class.SetGUC && err == nil {
-			e.staged = append(e.staged, gucEntry{name: pl.Class.GUCName, sql: sql})
+			e.staged = append(e.staged, gucEntry{name: pl.Class.GUCName, sql: sql, searchPath: pl.Class.SearchPath})
 		}
 		return err
 	})
@@ -441,7 +502,7 @@ func (e *Executor) Execute(_ context.Context, portal string, maxRows int32, w pg
 	e.batchWriter = w
 	if st, ok := e.stmts[e.portals[portal]]; ok {
 		if st.class.SetGUC {
-			e.staged = append(e.staged, gucEntry{name: st.class.GUCName, sql: st.sql})
+			e.staged = append(e.staged, gucEntry{name: st.class.GUCName, sql: st.sql, searchPath: st.class.SearchPath})
 		}
 		e.batchExec = append(e.batchExec, execItem{sql: st.sql, local: st.plan.Kind == plan.SessionLocal})
 	}

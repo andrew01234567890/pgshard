@@ -95,12 +95,23 @@ func classify(node *pgquerypb.Node, c *StmtClass) error {
 	case *pgquerypb.Node_VariableSetStmt:
 		s := n.VariableSetStmt
 		if s.GetIsLocal() {
+			if strings.EqualFold(s.GetName(), "search_path") {
+				return notYet("SET LOCAL search_path is not available yet", "use SET search_path or schema-qualify table names")
+			}
 			return nil
 		}
 		switch s.GetKind() {
 		case pgquerypb.VariableSetKind_VAR_SET_VALUE, pgquerypb.VariableSetKind_VAR_SET_DEFAULT,
 			pgquerypb.VariableSetKind_VAR_SET_CURRENT, pgquerypb.VariableSetKind_VAR_RESET:
 			c.SetGUC, c.GUCName = true, strings.ToLower(s.GetName())
+			if c.GUCName == "search_path" {
+				if s.GetKind() == pgquerypb.VariableSetKind_VAR_SET_CURRENT {
+					return notYet("SET search_path FROM CURRENT is not available yet", "")
+				}
+				if s.GetKind() == pgquerypb.VariableSetKind_VAR_SET_VALUE {
+					c.SearchPath = searchPathArgs(s.GetArgs())
+				}
+			}
 		case pgquerypb.VariableSetKind_VAR_RESET_ALL:
 			c.SetGUC, c.GUCName = true, ""
 		case pgquerypb.VariableSetKind_VAR_SET_MULTI:
@@ -110,6 +121,39 @@ func classify(node *pgquerypb.Node, c *StmtClass) error {
 		}
 	}
 	return nil
+}
+
+// searchPathArgs turns the arguments of SET search_path into a schema
+// list, splitting comma-separated string values the way PostgreSQL does
+// (identifiers arrive already case-folded from the parser).
+// A parse failure yields an empty, non-nil list: nothing resolves rather
+// than everything resolving in the default schemas.
+func searchPathArgs(args []*pgquerypb.Node) []string {
+	out := []string{}
+	for _, a := range args {
+		c := a.GetAConst()
+		if c == nil {
+			continue
+		}
+		var raw string
+		switch v := c.GetVal().(type) {
+		case *pgquerypb.A_Const_Sval:
+			raw = v.Sval.GetSval()
+		default:
+			continue
+		}
+		for _, part := range strings.Split(raw, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if strings.HasPrefix(part, `"`) && strings.HasSuffix(part, `"`) && len(part) >= 2 {
+				part = strings.ReplaceAll(part[1:len(part)-1], `""`, `"`)
+			}
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 // placementKind is what the catalog says about one relation.

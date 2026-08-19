@@ -54,6 +54,10 @@ type StmtClass struct {
 	// for RESET ALL).
 	SetGUC  bool
 	GUCName string
+	// SearchPath is the schema list a session-level SET search_path names;
+	// nil with GUCName "search_path" (or "" for RESET ALL) restores the
+	// session default.
+	SearchPath []string
 }
 
 // Plan is the routing decision for one statement.

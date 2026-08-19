@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -177,5 +179,37 @@ func TestSearchPathAndReferenceSpread(t *testing.T) {
 func TestKindString(t *testing.T) {
 	if Scatter.String() != "Scatter" || Kind(99).String() != "Kind(99)" {
 		t.Fatal("Kind.String")
+	}
+}
+
+func TestSearchPathClassification(t *testing.T) {
+	snap := fixture(t)
+	cases := []struct {
+		sql  string
+		want []string
+		err  string
+	}{
+		{sql: "set search_path = audit, public", want: []string{"audit", "public"}},
+		{sql: `set search_path to "Audit", 'x, y'`, want: []string{"Audit", "x", "y"}},
+		{sql: "set search_path to default", want: nil},
+		{sql: "reset search_path", want: nil},
+		{sql: "reset all", want: nil},
+		{sql: "set local search_path = audit", err: "SET LOCAL search_path"},
+		{sql: "set search_path from current", err: "FROM CURRENT"},
+	}
+	for _, c := range cases {
+		pl, err := New().Plan(context.Background(), session(snap), c.sql)
+		if c.err != "" {
+			if err == nil || !strings.Contains(err.Error(), c.err) {
+				t.Fatalf("%s: err = %v, want %q", c.sql, err, c.err)
+			}
+			continue
+		}
+		if err != nil || !pl.Class.SetGUC {
+			t.Fatalf("%s: %+v %v", c.sql, pl, err)
+		}
+		if !slices.Equal(pl.Class.SearchPath, c.want) || (pl.Class.SearchPath == nil) != (c.want == nil) {
+			t.Fatalf("%s: search path %q, want %q", c.sql, pl.Class.SearchPath, c.want)
+		}
 	}
 }

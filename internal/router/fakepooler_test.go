@@ -209,6 +209,12 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 		}
 		b.gucs[strings.TrimSpace(name)] = strings.Trim(strings.TrimSpace(val), "'")
 		return true, s.complete("SET")
+	case q == "reset all":
+		b.gucs = map[string]string{}
+		return true, s.complete("RESET")
+	case strings.HasPrefix(q, "reset "):
+		delete(b.gucs, strings.TrimSpace(strings.TrimPrefix(q, "reset ")))
+		return true, s.complete("RESET")
 	case strings.HasPrefix(q, "select current_setting('"):
 		name := strings.TrimSuffix(strings.TrimPrefix(q, "select current_setting('"), "')")
 		if err := s.rowDesc("current_setting", 25); err != nil {

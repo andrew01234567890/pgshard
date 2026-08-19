@@ -77,8 +77,14 @@ multi-shard writes (M3.5) land. See *Routing* below.
 The planner parses each statement with the bound PostgreSQL 18 grammar and
 looks up every relation it references in the snapshot: `(database, schema,
 table)` where an unqualified name is searched along the session's search
-path (`public` unless the statement qualifies it; `pg_catalog`,
-`information_schema` and `pg_temp` are always home-shard). The effective
+path: `public` by default, a startup `options=-c search_path=…`, then every
+session-level `SET search_path` / `RESET search_path` / `RESET ALL` in order
+(staged ones included, so a `SET` inside a transaction takes effect for the
+next statement and is dropped on rollback). `pg_catalog`, `information_schema`
+and `pg_temp` are always home-shard. `SET LOCAL search_path` and `SET
+search_path FROM CURRENT` are refused, as is a shard-key literal in the ON
+clause of an outer join (it filters one side only and does not pin the
+statement). The effective
 placement in `pgshard.table_status` decides:
 
 | Placement | Reads | Writes | DDL |
@@ -146,6 +152,7 @@ and session GUCs are replayed on every shard the session moves to.
 | DDL, `TRUNCATE`, `VACUUM`, `LOCK`, `COPY` on sharded or reference tables | DDL fan-out is not available yet; COPY on sharded and reference tables is not available yet |
 | `CREATE TABLE` of a declared sharded table without the key column, or with a PRIMARY KEY/UNIQUE that omits it | sharded table must define its shard key column; primary key or unique constraint (…) must include the shard key |
 | `CREATE VIEW`/`CREATE TABLE AS` over sharded or reference tables | CREATE VIEW over sharded or reference tables is not available yet |
+| `SET LOCAL search_path`, `SET search_path FROM CURRENT` | SET LOCAL search_path is not available yet; SET search_path FROM CURRENT is not available yet |
 | SQL-level `PREPARE` touching sharded or reference tables; data-modifying CTEs | SQL-level PREPARE … is not available yet; data-modifying statements in WITH are not available yet |
 | undeclared table in a database whose default placement is `sharded` | table is not declared in the catalog and the database defaults to sharded placement |
 

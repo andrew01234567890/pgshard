@@ -56,6 +56,7 @@ func newShardedHarness(t *testing.T) *shardedHarness {
 	tbl("regions", "reference", "")
 	tbl("orders", "sharded", "tenant_id")
 	tbl("docs", "sharded", "slug")
+	snap.Tables[snapshot.TableKey{Database: "app", SchemaName: "audit", TableName: "events"}] = snapshot.Placement{Placement: "sharded", ShardKey: "tenant_id"}
 	h := &harness{subs: map[chan snapshot.Change]struct{}{}}
 	h.snapp.Store(snap)
 	pl := NewPoolers(nil, h.snap, insecure.NewCredentials())
@@ -192,6 +193,93 @@ func TestShardedRoutingSimpleAndExtended(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.onlyShardRunning(t, "select * from regions")
+}
+
+func TestSearchPathRoutesUnqualifiedNames(t *testing.T) {
+	h := newShardedHarness(t)
+	ctx := context.Background()
+	a, _ := h.twoTenants(t)
+	conn := h.connect(t, h.dsn())
+
+	if _, err := conn.Exec(ctx, "insert into events (tenant_id, id) values ("+itoa(a)+", 1)"); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.onlyShardRunning(t, "values ("+itoa(a)+", 1)"); got != 0 {
+		t.Fatalf("public.events is undeclared and must run on home shard 0, ran on %d", got)
+	}
+	if _, err := conn.Exec(ctx, "set search_path = audit, public"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "insert into events (tenant_id, id) values ($1, 2)", a); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.onlyShardRunning(t, "values ($1, 2)"); got != h.shardOf(t, a) {
+		t.Fatalf("audit.events insert ran on shard %d, want %d", got, h.shardOf(t, a))
+	}
+	if _, err := conn.Exec(ctx, "insert into events (tenant_id, id) values ("+itoa(a)+", 3)"); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.onlyShardRunning(t, "values ("+itoa(a)+", 3)"); got != h.shardOf(t, a) {
+		t.Fatalf("simple-protocol audit.events insert ran on shard %d, want %d", got, h.shardOf(t, a))
+	}
+	if _, err := conn.Exec(ctx, "reset search_path"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "insert into events (tenant_id, id) values ("+itoa(a)+", 4)"); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.onlyShardRunning(t, "values ("+itoa(a)+", 4)"); got != 0 {
+		t.Fatalf("after RESET the insert must run on home shard 0, ran on %d", got)
+	}
+	if _, err := conn.Exec(ctx, "set search_path = audit"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "reset all"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "insert into events (tenant_id, id) values ("+itoa(a)+", 5)"); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.onlyShardRunning(t, "values ("+itoa(a)+", 5)"); got != 0 {
+		t.Fatalf("after RESET ALL the insert must run on home shard 0, ran on %d", got)
+	}
+	if _, err := conn.Exec(ctx, "begin"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := conn.Exec(ctx, "set local search_path = audit")
+	_ = expectRefusal(t, err, "SET LOCAL search_path")
+}
+
+func TestStartupOptionsSearchPath(t *testing.T) {
+	h := newShardedHarness(t)
+	ctx := context.Background()
+	a, _ := h.twoTenants(t)
+	conn := h.connect(t, h.dsn()+"&options=-c%20search_path%3Daudit,public")
+
+	if _, err := conn.Exec(ctx, "insert into events (tenant_id, id) values ("+itoa(a)+", 1)"); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.onlyShardRunning(t, "values ("+itoa(a)+", 1)"); got != h.shardOf(t, a) {
+		t.Fatalf("startup search_path insert ran on shard %d, want %d", got, h.shardOf(t, a))
+	}
+	if _, err := conn.Exec(ctx, "set search_path = public"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "insert into events (tenant_id, id) values ("+itoa(a)+", 2)"); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.onlyShardRunning(t, "values ("+itoa(a)+", 2)"); got != 0 {
+		t.Fatalf("after SET the insert must run on home shard 0, ran on %d", got)
+	}
+	if _, err := conn.Exec(ctx, "reset search_path"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "insert into events (tenant_id, id) values ("+itoa(a)+", 3)"); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.onlyShardRunning(t, "values ("+itoa(a)+", 3)"); got != h.shardOf(t, a) {
+		t.Fatalf("RESET must restore the startup search_path; ran on shard %d, want %d", got, h.shardOf(t, a))
+	}
 }
 
 func TestShardedPreparedStatementFollowsTheKey(t *testing.T) {
