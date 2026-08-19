@@ -385,3 +385,32 @@ func value(s Settings, name string) string {
 	}
 	return ""
 }
+
+func TestDecodingTermBreaksBudget(t *testing.T) {
+	in := baseInput(4000, 16*GiB, ProfileOLTP)
+	in.LogicalSlots = 4
+	s, err := Derive(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkBudget(s, 16*GiB, 4); err != nil {
+		t.Fatalf("budget must hold for the derived slot count: %v", err)
+	}
+	if err := checkBudget(s, 16*GiB, 4096); !errors.Is(err, ErrOverCommitted) {
+		t.Fatalf("decoding × slots alone must exceed memory: err = %v", err)
+	}
+	if err := checkBudget(s, 16*GiB, 0); err != nil {
+		t.Fatalf("dropping the decoding term must be the only difference: %v", err)
+	}
+
+	small := baseInput(2000, 1*GiB, ProfileOLTP)
+	small.MaxBackends = 60
+	small.LogicalSlots = 0
+	if _, err := Derive(small); err != nil {
+		t.Fatalf("no slots must fit: %v", err)
+	}
+	small.LogicalSlots = 4
+	if _, err := Derive(small); !errors.Is(err, ErrOverCommitted) {
+		t.Fatalf("4 slots on 1GiB must overcommit: err = %v", err)
+	}
+}
