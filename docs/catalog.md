@@ -104,9 +104,47 @@ Status tables are written by `pgshard_system`; `pgshard_admin` and
 | `serving` | `shard_set`, `generation`, `published_at` |
 | `shard_map_generation` | Single row: `generation`, `updated_at` |
 
+### Serving notifications
+
+Migration `0004_status_notify` adds a statement-level trigger on
+`shard_status`, `table_status` and `shard_map_generation` that sends
+`NOTIFY pgshard_serving` with the table name as payload, so routers learn of
+effective-map changes without polling.
+
+## Router snapshots
+
+`internal/catalog/snapshot` gives the router an immutable view of the catalog.
+
+- `snapshot.Load` reads one `Snapshot` in a single `REPEATABLE READ` read-only
+  transaction: shard-map and desired generations, every shard set's ranges
+  (inclusive `int64` bounds, unbounded ends mapped to `MinInt64`/`MaxInt64`),
+  the serving primary of every shard from `shard_status`, the databases and
+  the effective table placement. Placement comes from `table_status`; a table
+  with no status row is only visible when its desired placement is
+  `unsharded`.
+- `snapshot.LoadRoles` reads SCRAM verifiers into a separate `Roles` value
+  whose `String`/`GoString` print only a count. Verifiers never enter a
+  `Snapshot`.
+- `Snapshot.Locate(shardSet, keyspaceID)` binary-searches the ranges.
+- `snapshot.CheckGeneration(routed, observed)` returns `*StaleGeneration`
+  when a pooler reports a different shard-map generation than the snapshot
+  the request was routed with.
+- `snapshot.Watcher` LISTENs on `pgshard_desired` and `pgshard_serving`,
+  reloads on every notification, every 30 s (configurable) and after each
+  reconnect; `Current()` returns the latest snapshot and `Subscribe()` a
+  channel of generation changes.
+- `snapshot.ConsistencyWatcher.Observe` reports `Consistent`/`Inconsistent`
+  transitions per shard set; a shard blocks consistency while its
+  `serving_state` is `migrating` or `fenced` or it has no status row.
+
+`pgshard-router catalog-watch DSN` follows a catalog and prints each
+generation change and consistency transition.
+
 ## Go API
 
 `internal/catalog` exposes `Migrate`, `Migrations`, the constants
 `Schema`, `DesiredChannel`, `RoleSystem`, `RoleAdmin`, `RoleReader`, and
-typed readers `ListDatabases`, `ListTables`, `ListShardRanges`,
-`ListTableStatus`, `ListShardStatus`.
+`ServingChannel`, typed readers `ListDatabases`, `ListTables`,
+`ListShardRanges`, `ListTableStatus`, `ListShardStatus`, their cluster-wide
+variants `ListAllTables`, `ListAllShardRanges`, `ListAllTableStatus`,
+`ListAllShardStatus`, and `Generations`.

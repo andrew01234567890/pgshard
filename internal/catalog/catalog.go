@@ -23,6 +23,11 @@ const Schema = "pgshard"
 // changes a desired-state table. The payload is "<table>:<generation>".
 const DesiredChannel = "pgshard_desired"
 
+// ServingChannel is the NOTIFY channel fired after every statement that
+// changes shard_status, table_status or shard_map_generation. The payload is
+// the table name.
+const ServingChannel = "pgshard_serving"
+
 // Role names created by the first migration.
 const (
 	RoleSystem = "pgshard_system"

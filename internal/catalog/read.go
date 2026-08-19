@@ -129,3 +129,76 @@ func ListShardStatus(ctx context.Context, q Querier, shardSet string) ([]ShardSt
 	}
 	return pgx.CollectRows(rows, pgx.RowToStructByPos[ShardStatus])
 }
+
+// ListAllTables returns every desired table ordered by database, schema and name.
+func ListAllTables(ctx context.Context, q Querier) ([]Table, error) {
+	rows, err := q.Query(ctx, `
+		SELECT database, schema_name, table_name, placement, shard_key, hash_version, desired_generation, updated_at
+		FROM pgshard.tables ORDER BY database, schema_name, table_name`)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[Table])
+}
+
+// ListAllShardRanges returns the ranges of every shard set ordered by set and key space.
+func ListAllShardRanges(ctx context.Context, q Querier) ([]ShardRange, error) {
+	rows, err := q.Query(ctx, `
+		SELECT shard_set, shard_id,
+		       CASE WHEN lower_inf(range) THEN NULL ELSE lower(range) END,
+		       CASE WHEN upper_inf(range) THEN NULL ELSE upper(range) END,
+		       desired_generation, updated_at
+		FROM pgshard.shard_ranges ORDER BY shard_set, range`)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[ShardRange])
+}
+
+// ListAllTableStatus returns the observed status of every table.
+func ListAllTableStatus(ctx context.Context, q Querier) ([]TableStatus, error) {
+	rows, err := q.Query(ctx, `
+		SELECT database, schema_name, table_name, effective_placement, effective_shard_key,
+		       effective_generation, workflow_id::text, progress, updated_at
+		FROM pgshard.table_status ORDER BY database, schema_name, table_name`)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[TableStatus])
+}
+
+// ListAllShardStatus returns the observed status of every shard.
+func ListAllShardStatus(ctx context.Context, q Querier) ([]ShardStatus, error) {
+	rows, err := q.Query(ctx, `
+		SELECT shard_set, shard_id, group_name, serving_state, primary_epoch,
+		       primary_endpoint, replay_lag_bytes, updated_at
+		FROM pgshard.shard_status ORDER BY shard_set, shard_id`)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[ShardStatus])
+}
+
+// Generations returns the shard-map generation and the highest desired
+// generation stamped on any desired-state row.
+func Generations(ctx context.Context, q Querier) (shardMap, desired int64, err error) {
+	rows, err := q.Query(ctx, `
+		SELECT (SELECT generation FROM pgshard.shard_map_generation),
+		       (SELECT coalesce(max(g), 0) FROM (
+		            SELECT max(desired_generation) g FROM pgshard.databases
+		            UNION ALL SELECT max(desired_generation) FROM pgshard.tables
+		            UNION ALL SELECT max(desired_generation) FROM pgshard.shard_ranges
+		            UNION ALL SELECT max(desired_generation) FROM pgshard.roles
+		            UNION ALL SELECT max(desired_generation) FROM pgshard.grants) m)`)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return 0, 0, rows.Err()
+	}
+	if err := rows.Scan(&shardMap, &desired); err != nil {
+		return 0, 0, err
+	}
+	return shardMap, desired, rows.Err()
+}
