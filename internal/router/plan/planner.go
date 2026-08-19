@@ -10,6 +10,7 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/pgparser"
 	"github.com/andrew01234567890/pgshard/internal/pgparser/pg18/pgquerypb"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
+	"google.golang.org/protobuf/proto"
 )
 
 // Planner plans statements against catalog snapshots.
@@ -51,8 +52,14 @@ func (p *Planner) Plan(ctx context.Context, sess Session, sql string) (Plan, err
 	if err := classify(raw.GetStmt(), &pl.Class); err != nil {
 		return refusalErr(err)
 	}
-	if err := (&walker{sess: sess, plan: pl}).statement(raw.GetStmt()); err != nil {
+	if err := (&walker{sess: sess, plan: pl, tree: res.Tree}).statement(raw.GetStmt()); err != nil {
 		return refusalErr(err)
+	}
+	if pl.merge != nil && raw.GetStmt().GetSelectStmt() == nil {
+		pl.merge, pl.mergeErr = nil, notYet("only a plain SELECT can run on multiple shards", "filter on one shard key value")
+		if pl.Kind == Scatter {
+			return refusalErr(pl.mergeErr)
+		}
 	}
 	return *pl, nil
 }
@@ -200,6 +207,9 @@ type walker struct {
 	// outerQuals is set while walking the ON clause of an outer join: a key
 	// literal there filters only the inner side, so it must not pin the query.
 	outerQuals bool
+	tree       proto.Message
+	// outer is the outermost SELECT, the one a multi-shard merge is built for.
+	outer *pgquerypb.SelectStmt
 }
 
 func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
@@ -488,6 +498,7 @@ func (w *walker) selectStmt(s *pgquerypb.SelectStmt) error {
 		return w.selectStmt(s.GetRarg())
 	}
 	if !w.nested {
+		w.outer = s
 		w.outerFeatures(s)
 	}
 	scope := len(w.rels)
@@ -521,20 +532,14 @@ func (w *walker) blocker(name string) {
 }
 
 func (w *walker) outerFeatures(s *pgquerypb.SelectStmt) {
-	if len(s.GetSortClause()) > 0 {
-		w.blocker("ORDER BY")
-	}
-	if s.GetLimitCount() != nil || s.GetLimitOffset() != nil {
-		w.blocker("LIMIT/OFFSET")
-	}
-	if len(s.GetGroupClause()) > 0 || s.GetHavingClause() != nil {
-		w.blocker("GROUP BY/HAVING")
-	}
-	if len(s.GetDistinctClause()) > 0 {
-		w.blocker("DISTINCT")
-	}
 	if len(s.GetWindowClause()) > 0 {
 		w.blocker("window functions")
+	}
+	for _, t := range s.GetTargetList() {
+		if hasWindow(t) {
+			w.blocker("window functions")
+			break
+		}
 	}
 	if len(s.GetLockingClause()) > 0 {
 		w.blocker("FOR UPDATE/SHARE")
@@ -542,12 +547,17 @@ func (w *walker) outerFeatures(s *pgquerypb.SelectStmt) {
 	if s.GetIntoClause() != nil {
 		w.blocker("SELECT INTO")
 	}
-	for _, t := range s.GetTargetList() {
-		if hasAggregate(t) {
-			w.blocker("aggregates")
-			break
+}
+
+func hasWindow(node *pgquerypb.Node) bool {
+	found := false
+	visit(node, func(n *pgquerypb.Node) bool {
+		if fc := n.GetFuncCall(); fc != nil && fc.GetOver() != nil {
+			found = true
 		}
-	}
+		return !found
+	})
+	return found
 }
 
 var aggregateNames = map[string]bool{
@@ -959,6 +969,9 @@ func (w *walker) decide(write bool) error {
 	if len(scatter) > 0 {
 		return w.scatter(write, sharded+unsharded+reference)
 	}
+	if !write {
+		w.mergeSpec()
+	}
 	p.touches = Unsharded
 	if unsharded == 0 {
 		p.touches = EqualUnique
@@ -1000,14 +1013,25 @@ func (w *walker) scatter(write bool, rels int) error {
 		return notYet("cross-shard join is not available yet",
 			"join sharded tables on equal shard keys and filter on one key value")
 	}
-	if len(w.scatterBlockers) > 0 {
-		return notYet("scatter SELECT with "+strings.Join(w.scatterBlockers, ", ")+" is not available yet",
-			"filter on the shard key, or wait for scatter-gather execution")
-	}
 	p := w.plan
+	w.mergeSpec()
+	if p.mergeErr != nil {
+		return p.mergeErr
+	}
 	p.Kind = Scatter
 	p.Shards = w.allShards()
 	return nil
+}
+
+// mergeSpec records how a single-table read merges across shards, or why
+// it cannot.
+func (w *walker) mergeSpec() {
+	p := w.plan
+	if w.outer == nil || len(w.rels) != 1 || w.rels[0].kind != placeSharded {
+		p.mergeErr = notYet("cross-shard join is not available yet", "join sharded tables on equal shard keys and filter on one key value")
+		return
+	}
+	p.merge, p.mergeErr = buildMerge(w.tree, w.outer, w.rels[0].shardKey, w.scatterBlockers)
 }
 
 func (w *walker) allShards() []int32 {

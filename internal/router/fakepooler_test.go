@@ -2,10 +2,12 @@ package router
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -33,6 +35,82 @@ type fakePooler struct {
 	dropped   int
 	// executed records every statement text this shard ran, in order.
 	executed []string
+	// scripts answers exact (lowercased) statements with canned results.
+	scripts map[string]script
+}
+
+// script is a canned answer: an error, or typed columns and rows where the
+// value "NULL" is a NULL.
+type script struct {
+	cols []scriptCol
+	rows [][]string
+	err  string
+}
+
+type scriptCol struct {
+	name string
+	oid  uint32
+}
+
+func (f *fakePooler) script(sql string, sc script) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.scripts == nil {
+		f.scripts = map[string]script{}
+	}
+	f.scripts[strings.ToLower(sql)] = sc
+}
+
+func (s *fakeStream) scriptedDesc(sc script) error {
+	fields := make([]*pgshardv1.FieldDescription, len(sc.cols))
+	for i, c := range sc.cols {
+		fields[i] = &pgshardv1.FieldDescription{Name: c.name, TypeOid: c.oid, TypeSize: -1, TypeModifier: -1}
+		if s.binaryCol(i) {
+			fields[i].Format = 1
+		}
+	}
+	return s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_RowDescription{RowDescription: &pgshardv1.RowDescription{Fields: fields}}})
+}
+
+// scripted answers with the canned result; described says whether a
+// portal Describe already sent the RowDescription (as PostgreSQL then omits
+// it on Execute).
+func (s *fakeStream) scripted(sc script, described bool) error {
+	if sc.err != "" {
+		return s.errorf("42P01", sc.err)
+	}
+	if !described {
+		if err := s.scriptedDesc(sc); err != nil {
+			return err
+		}
+	}
+	for _, r := range sc.rows {
+		cols := make([]*pgshardv1.Value, len(r))
+		for i, v := range r {
+			switch {
+			case v == "NULL":
+				cols[i] = &pgshardv1.Value{Null: true}
+			case s.binaryCol(i) && (sc.cols[i].oid == 23 || sc.cols[i].oid == 20):
+				n, err := strconv.ParseInt(v, 10, 64)
+				if err != nil {
+					return err
+				}
+				var buf [8]byte
+				binary.BigEndian.PutUint64(buf[:], uint64(n))
+				if sc.cols[i].oid == 23 {
+					cols[i] = &pgshardv1.Value{Data: buf[4:]}
+				} else {
+					cols[i] = &pgshardv1.Value{Data: buf[:]}
+				}
+			default:
+				cols[i] = &pgshardv1.Value{Data: []byte(v)}
+			}
+		}
+		if err := s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_DataRow{DataRow: &pgshardv1.DataRow{Columns: cols}}}); err != nil {
+			return err
+		}
+	}
+	return s.complete(fmt.Sprintf("SELECT %d", len(sc.rows)))
 }
 
 type fakeBackend struct {
@@ -116,6 +194,21 @@ type fakeStream struct {
 	batch  []*pgshardv1.ExecuteRequest
 	copyIn []byte
 	inCopy bool
+	// binary is set while a Bind asked for binary results; described while
+	// the portal was described before Execute.
+	formats   []int32
+	described bool
+}
+
+// binaryCol reports whether the last Bind asked for column i in binary.
+func (s *fakeStream) binaryCol(i int) bool {
+	switch len(s.formats) {
+	case 0:
+		return false
+	case 1:
+		return s.formats[0] == 1
+	}
+	return i < len(s.formats) && s.formats[i] == 1
 }
 
 func (s *fakeStream) send(m *pgshardv1.ExecuteResponse) error {
@@ -184,12 +277,16 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 	q := strings.ToLower(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(sql), ";")))
 	s.f.mu.Lock()
 	s.f.executed = append(s.f.executed, q)
+	sc, scripted := s.f.scripts[q]
 	s.f.mu.Unlock()
+	if scripted {
+		return true, s.scripted(sc, s.described)
+	}
 	if b.tx == 'E' && q != "rollback" && q != "commit" {
 		return true, s.errorf("25P02", "current transaction is aborted")
 	}
 	switch {
-	case q == "begin":
+	case q == "begin", strings.HasPrefix(q, "begin isolation level "):
 		b.tx = 'T'
 		return true, s.complete("BEGIN")
 	case q == "commit":
@@ -232,7 +329,7 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 			return true, err
 		}
 		return true, s.complete("SELECT 1")
-	case q == "select pg_sleep(10)":
+	case strings.HasPrefix(q, "select pg_sleep(10)"):
 		ch := make(chan struct{})
 		s.f.mu.Lock()
 		s.f.sleeping[s.sid] = ch
@@ -377,6 +474,8 @@ func (s *fakeStream) runBatch(ctx context.Context) error {
 				continue
 			}
 			portals[m.Bind.Portal] = m.Bind.Statement
+			s.formats = m.Bind.ResultFormats
+			s.described = false
 			if err := s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_BindComplete{BindComplete: &pgshardv1.BindComplete{}}}); err != nil {
 				return err
 			}
@@ -390,6 +489,18 @@ func (s *fakeStream) runBatch(ctx context.Context) error {
 			} else {
 				sql = b.stmts[portals[m.Describe.Name]]
 			}
+			s.f.mu.Lock()
+			sc, scripted := s.f.scripts[strings.ToLower(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(sql), ";")))]
+			s.f.mu.Unlock()
+			if scripted && sc.err == "" {
+				if err := s.scriptedDesc(sc); err != nil {
+					return err
+				}
+				if m.Describe.Kind == pgshardv1.Describe_KIND_PORTAL {
+					s.described = true
+				}
+				continue
+			}
 			if strings.HasPrefix(strings.ToLower(sql), "select") {
 				if err := s.rowDesc("?column?", 23); err != nil {
 					return err
@@ -400,6 +511,7 @@ func (s *fakeStream) runBatch(ctx context.Context) error {
 		case *pgshardv1.ExecuteRequest_Execute:
 			sql := b.stmts[portals[m.Execute.Portal]]
 			ready, err := s.query(ctx, sql)
+			s.described, s.formats = false, nil
 			if err != nil {
 				return err
 			}

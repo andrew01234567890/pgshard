@@ -5,9 +5,10 @@ connect to it as they would to PostgreSQL; the router authenticates them from
 the catalog, plans each statement onto a shard and executes it through that
 shard's `pgshard-pooler` over gRPC. The planner (`internal/router/plan`)
 resolves every statement to the shards it touches from the catalog snapshot;
-the executor runs plans that need **one** shard and refuses the rest with
-`0A000` until scatter-gather (M3.3), cross-shard transactions (M3.4) and
-multi-shard writes (M3.5) land. See *Routing* below.
+the executor runs plans that need one shard directly, fans read-only
+`SELECT`s over several shards out through a streaming merge (*Scatter*
+below) and refuses the rest with `0A000` until cross-shard transactions
+(M3.4) and multi-shard writes (M3.5) land. See *Routing* below.
 
 ## Startup and authentication
 
@@ -136,12 +137,68 @@ transaction's *prelude* and replayed on the shard of the first real
 statement (`BEGIN; INSERT INTO sharded …` works). Named prepared statements
 and session GUCs are replayed on every shard the session moves to.
 
+**Scatter (multi-shard reads).** A read-only `SELECT` over **one sharded
+table** whose plan needs several shards (no key predicate, or `IN` spanning
+shards) runs on every target shard at once: the router opens one pooler
+stream per shard (session id `<sid>-x<shard>`, stamped with the shard's
+generation, on a fresh unpinned backend), sends the same statement — possibly
+rewritten as described below — and streams the merged rows to the client
+with `SELECT <total>` as the command tag. The `RowDescription` comes from the
+first shard and every other shard's must match it (name, type, typmod,
+format), else `XX000` "shards … disagree on the result shape". The first
+shard error cancels the other participants (pooler `Cancel`) and is
+reported once every stream has drained; a client cancel cancels every
+participant (each reports `57014`). Supported shapes:
+
+| Shape | Shard statement | Router |
+|---|---|---|
+| plain scan (`WHERE` on non-key columns allowed) | unchanged | streams are concatenated in shard order; the interleave between shards is arbitrary, as it is for an unordered PostgreSQL scan |
+| `ORDER BY` | unchanged, or with the sort expressions appended as hidden columns (`… AS __pgshard_sort_N`) when they are not in the select list; hidden columns are stripped before the client sees the row | streaming k-way merge on the text-format values: `int2/4/8`, `oid`, `float4/8` (NaN last), `numeric` (exact), `bool`, `date`, `timestamp`, `timestamptz` (±infinity, BC), `uuid`, `bytea`, `"char"`; `text`/`varchar`/`bpchar`/`name` **only with an explicit `COLLATE "C"` or `"POSIX"`** on the key (the router orders bytewise and cannot apply another collation) — else `0A000` "multi-shard ORDER BY on a text column needs an explicit COLLATE "C""; `ASC`/`DESC`, `NULLS FIRST`/`LAST` (PostgreSQL defaults), ties keep shard order |
+| `LIMIT n [OFFSET k]` | `LIMIT n+k`, no `OFFSET` (saturating at `int8` max) | `OFFSET k` then `LIMIT n` after the merge; a bare `OFFSET` is removed from the shard statement and applied at the router |
+| `count(*)`, `count(x)`, `sum(x)`, `min(x)`, `max(x)` without `GROUP BY` — every select-list entry must be one of these, unadorned | unchanged (`LIMIT`/`OFFSET` removed) | one row per shard is combined: counts and sums are added (`int8` and `numeric` exactly, `numeric` keeps the widest scale, `float4/8` in float arithmetic with PostgreSQL's shortest output format), `min`/`max` use the ORDER BY comparators; NULL inputs are skipped and an all-NULL input stays NULL; `LIMIT`/`OFFSET` then apply to the single row |
+| `GROUP BY` including the shard key, `DISTINCT` (or `DISTINCT ON`) including the shard key | unchanged | every group or distinct row lives on one shard, so the streams are concatenated (or merged for `ORDER BY`); aggregates in such a query are computed on the shards |
+
+Refused with `0A000` (message names the reason): `avg()` and every other
+aggregate ("multi-shard avg() is not available yet" — compute `sum(x)` and
+`count(x)`), aggregates with `DISTINCT`/`FILTER`/`ORDER BY`/`OVER`,
+expressions around or beside an aggregate (`count(*) + 1`, `id, count(*)`),
+`GROUP BY`/`DISTINCT` without the shard key, `HAVING` without such a
+`GROUP BY`, `LIMIT`/`OFFSET` that are not integer constants (`$1`,
+expressions), `FETCH … WITH TIES`, `ORDER BY … USING`, `ORDER BY` on a
+type without a comparator (`jsonb`, arrays, …), `min()`/`max()` over a text
+column, `sum()` over a non-numeric type, `SELECT DISTINCT` ordered by an
+expression outside the select list, window functions, `FOR UPDATE/SHARE`,
+`SELECT INTO`, set operations, CTEs, subqueries, joins (including with
+reference tables) and function scans, and `EXPLAIN`/`DECLARE CURSOR` of a
+scatter. `ORDER BY 3` past the select list is `42P10`, a negative `LIMIT`
+`2201W`, as in PostgreSQL.
+
+Session rules: a scatter runs on autocommit backends outside the session's
+transaction, so it is allowed inside a transaction block only while the
+transaction has **not touched a shard** yet (it does not pin the transaction
+either), and refused ("multi-shard read inside a transaction pinned to shard
+…") after the first write or keyed read; `BEGIN ISOLATION LEVEL REPEATABLE
+READ`/`SERIALIZABLE`, `SET TRANSACTION …` in the prelude, or a session
+`default_transaction_isolation`/`SESSION CHARACTERISTICS` of those levels
+refuse every scatter ("multi-shard reads under REPEATABLE READ or
+SERIALIZABLE isolation are not available yet"): the shards take independent
+snapshots. Session GUCs (`SET`) are **not** replayed on the scatter backends.
+Through the extended protocol a scatter statement must be the only statement
+of its batch (`Bind` and `Execute` before one `Sync`; a `Parse`+`Describe`
+round trip on its own runs on the session's shard, so drivers that prepare
+first work), is rewritten onto the unnamed statement and portal on every
+shard, and `Execute` with a row limit (partial portal fetch) is refused
+("partial fetches … from a multi-shard portal are not available yet").
+`--scatter-max-shards` (default 0 = all) caps the shards one statement may
+touch and `--scatter-max-streams` (4096) the scatter streams open across
+the router; a statement waits for capacity and a client cancel while
+waiting is honoured.
+
 **Refusals (all `0A000`).**
 
 | Statement shape | Message |
 |---|---|
-| plan over several shards (`Scatter`, `IN` spanning shards) | scatter execution is not available yet (… plan over N shards) — M3.3 |
-| scatter `SELECT` with ORDER BY, LIMIT/OFFSET, GROUP BY/HAVING, DISTINCT, aggregates, window functions, FOR UPDATE, set operations, CTEs, subqueries or joins | scatter SELECT with … is not available yet |
+| multi-shard `SELECT` outside the *Scatter* shapes below (window functions, FOR UPDATE/SHARE, SELECT INTO, set operations, CTEs, subqueries, joins, function scans; `EXPLAIN`/`DECLARE` of one) | multi-shard SELECT with … is not available yet; cross-shard join is not available yet; only a plain SELECT can run on multiple shards |
 | `UPDATE`/`DELETE` without a key predicate | scatter UPDATE/DELETE without a shard key predicate is not available yet |
 | tables that do not resolve to one shard (joins, subqueries, set operations, an unsharded table joined to a sharded row off the home shard) | cross-shard join is not available yet |
 | `INSERT` without the key in the column list | insert requires the shard key |
@@ -260,12 +317,22 @@ of them for the sharded tests: keyed inserts and selects reach the key's
 shard through the simple and extended protocols, prepared statements follow
 the key across shards and are re-planned when the snapshot changes,
 transactions move on their prelude and refuse a second shard, one batch is
-refused for two shards, and each refusal leaves the session usable —
+refused for two shards, and each refusal leaves the session usable; scatter
+reads concatenate every shard, merge ordered streams with the pushed-down
+`LIMIT` observed on each shard, combine `count`/`sum`/`min`/`max`,
+refuse text ordering without `COLLATE "C"`, surface one shard's error and a
+shape mismatch, cancel every participant on a client cancel, and refuse
+mixed batches, partial fetches, pinned transactions and strict isolation —
 plus SCRAM auth, `3D000`, refusals, error
 and notice relay, transactions, GUC staging across rollback/commit, prepared
 statement replay after release, cancel, COPY, stale generation and stream
 loss; two routers on one pooler with cancels forwarded through `RouterPeer`;
-the drain sequence against a fake listener and its `/readyz` handler; the
+the drain sequence against a fake listener and its `/readyz` handler;
+`go test ./internal/router/scatter/` covers the typed comparators, NULLS
+ordering and ties, the k-way merge with LIMIT/OFFSET and hidden columns,
+the aggregate combiners and PostgreSQL float/numeric formatting, and
+`internal/router/plan`'s merge tests the ORDER BY column resolution, the
+LIMIT+OFFSET pushdown arithmetic and every scatter refusal; the
 buffering decision table (no output / in transaction / output sent / window
 expiry / cap) and each outcome end to end (held select, `40001`, `53300`,
 `08006`, `57014` while buffered); and the peer target selection and rate
@@ -278,7 +345,14 @@ and pooler, declares a sharded table in the catalog and proves through
 direct connections to each PostgreSQL that keyed inserts, selects, updates
 and deletes land on the key's shard only, that a transaction pins to its
 first shard, that the refusal list holds end to end and that unsharded
-tables stay on the home shard. `TestRouterOps` adds a second router that cancels a
+tables stay on the home shard. `TestRouterScatterDifferential` starts an
+oracle PostgreSQL and three shards, loads the same 5,000 rows into the
+oracle and hash-partitioned into the shards, and runs a corpus of scatter
+queries (ORDER BY asc/desc/nulls/multi-key, LIMIT/OFFSET, count/sum/min/max,
+GROUP BY and DISTINCT on the key, plain scans compared as multisets)
+through the router and against the oracle, requiring identical results in
+both protocols; it also cancels a `pg_sleep` scatter and checks that every
+shard reported `57014`. `TestRouterOps` adds a second router that cancels a
 session owned by the first, `SIGTERM`s a third with an open transaction
 (readiness flips, listener stays open for the delay, the transaction commits,
 new connections are refused, the process exits) and fences shard 0 in the

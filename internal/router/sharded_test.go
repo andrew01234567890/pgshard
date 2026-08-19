@@ -17,7 +17,6 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 	"github.com/andrew01234567890/pgshard/internal/placement"
-	"github.com/andrew01234567890/pgshard/internal/router/plan"
 )
 
 // shardedHarness runs the router in front of four fake poolers, one per
@@ -29,6 +28,12 @@ type shardedHarness struct {
 }
 
 func newShardedHarness(t *testing.T) *shardedHarness {
+	t.Helper()
+	return newShardedHarnessWith(t, Config{})
+}
+
+// newShardedHarnessWith is newShardedHarness with cfg's Scatter settings.
+func newShardedHarnessWith(t *testing.T, cfg Config) *shardedHarness {
 	t.Helper()
 	ranges, err := placement.Split(4)
 	if err != nil {
@@ -62,7 +67,7 @@ func newShardedHarness(t *testing.T) *shardedHarness {
 	pl := NewPoolers(nil, h.snap, insecure.NewCredentials())
 	t.Cleanup(pl.Close)
 	sh := &shardedHarness{harness: h, poolers: poolers, snap: snap}
-	startHarness(t, h, Config{Snapshot: h.snap, Poolers: pl, Logger: slog.New(slog.DiscardHandler),
+	startHarness(t, h, Config{Snapshot: h.snap, Poolers: pl, Logger: slog.New(slog.DiscardHandler), Scatter: cfg.Scatter,
 		Buffering: Buffering{Window: 700 * time.Millisecond, Poll: 20 * time.Millisecond, PerShardCap: 2, Changes: h.subscribe}})
 	return sh
 }
@@ -382,8 +387,7 @@ func TestShardedRefusalsThroughTheWire(t *testing.T) {
 		msg  string
 		hint string
 	}{
-		{sql: "select * from orders", msg: "scatter execution is not available yet (Scatter plan over 4 shards)", hint: "M3.3"},
-		{sql: "select * from orders where tenant_id in ($1, $2)", args: []any{a, b}, msg: "scatter execution is not available yet (In plan over 2 shards)"},
+		{sql: "select * from orders where tenant_id in ($1, $2) for update", args: []any{a, b}, msg: "multi-shard SELECT with FOR UPDATE/SHARE is not available yet"},
 		{sql: "insert into orders values (1, 2)", msg: "insert requires the shard key", hint: "tenant_id"},
 		{sql: "update orders set tenant_id = 2 where tenant_id = 1", msg: "shard key is immutable"},
 		{sql: "delete from orders", msg: "scatter DELETE without a shard key predicate is not available yet"},
@@ -571,21 +575,6 @@ func TestShardedInTransactionCannotLeaveTouchedShard(t *testing.T) {
 }
 
 func itoa(v int64) string { return strconv.FormatInt(v, 10) }
-
-func TestPlannerRefusesScatterKindWithoutExecutor(t *testing.T) {
-	// The type system represents scatter reads; the executor refuses them
-	// until scatter-gather lands.
-	h := newShardedHarness(t)
-	sess := plan.Session{Database: "app", HomeShard: 0, Snapshot: h.snap}
-	pl, err := NewPlanner().Plan(context.Background(), sess, "select * from orders")
-	if err != nil || pl.Kind != plan.Scatter || len(pl.Shards) != 4 {
-		t.Fatalf("plan: %+v %v", pl, err)
-	}
-	e := &Executor{home: Shard{Set: DefaultShardSet}, shard: Shard{Set: DefaultShardSet}}
-	if _, err := e.target(pl); err == nil {
-		t.Fatal("scatter plan must be refused by the executor")
-	}
-}
 
 func TestPreparedStatementReplansOnNewSnapshot(t *testing.T) {
 	h := newShardedHarness(t)

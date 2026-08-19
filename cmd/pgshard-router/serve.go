@@ -92,6 +92,8 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	peerRate := fs.Float64("peer-cancel-rate", 50, "forwarded cancels per second (burst equal)")
 	bufferWindow := fs.Duration("buffer-window", 10*time.Second, "how long a statement waits for a shard failover")
 	bufferCap := fs.Int("buffer-cap", 256, "statements buffered per shard during failover")
+	scatterMaxShards := fs.Int("scatter-max-shards", 0, "most shards one SELECT may fan out to (0 = all)")
+	scatterMaxStreams := fs.Int("scatter-max-streams", 4096, "shard streams open for multi-shard reads across this router")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return cli.ExitOK
@@ -196,6 +198,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		Logger:    logger,
 		Peers:     peersOrNil(forwarder),
 		Buffering: router.Buffering{Window: *bufferWindow, PerShardCap: *bufferCap, Changes: w.Subscribe},
+		Scatter:   router.ScatterConfig{MaxShards: *scatterMaxShards, MaxStreams: *scatterMaxStreams},
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)

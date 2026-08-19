@@ -47,3 +47,26 @@ func visitChild(m protoreflect.Message, fn func(*pgquerypb.Node) bool) {
 var _ proto.Message = (*pgquerypb.Node)(nil)
 
 func parseInt(s string) (int64, error) { return strconv.ParseInt(s, 10, 64) }
+
+// clearLocations zeroes every "location" field beneath m.
+func clearLocations(m protoreflect.Message) {
+	fields := m.Descriptor().Fields()
+	for i := 0; i < fields.Len(); i++ {
+		fd := fields.Get(i)
+		if fd.Name() == "location" && fd.Kind() == protoreflect.Int32Kind {
+			m.Clear(fd)
+		}
+	}
+	m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+		switch {
+		case fd.IsList() && fd.Kind() == protoreflect.MessageKind:
+			l := v.List()
+			for i := 0; i < l.Len(); i++ {
+				clearLocations(l.Get(i).Message())
+			}
+		case fd.Kind() == protoreflect.MessageKind && !fd.IsMap():
+			clearLocations(v.Message())
+		}
+		return true
+	})
+}
