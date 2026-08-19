@@ -302,8 +302,14 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	if r, err := s.grpc.Promote(ctx, &pgshardv1.PromoteRequest{Epoch: 1}); err != nil || r.GetError() == nil {
 		t.Fatalf("epoch 1 replayed: %v %v", r, err)
 	}
-	if r, err := s.grpc.Reload(ctx, &pgshardv1.ReloadRequest{Epoch: 1}); err != nil || r.GetError() == nil {
+	if r, err := s.grpc.Reload(ctx, &pgshardv1.ReloadRequest{Epoch: 0}); err != nil || r.GetError() == nil {
 		t.Fatalf("reload with stale epoch accepted: %v %v", r, err)
+	}
+	if r, err := s.grpc.Reload(ctx, &pgshardv1.ReloadRequest{Epoch: 2}); err != nil || r.GetError() == nil {
+		t.Fatalf("reload with a future epoch accepted: %v %v", r, err)
+	}
+	if r, err := s.grpc.Reload(ctx, &pgshardv1.ReloadRequest{Epoch: 1}); err != nil || r.GetError() != nil {
+		t.Fatalf("reload with the current epoch refused: %v %v", r, err)
 	}
 
 	t.Log("old primary diverges, then demotes via pg_rewind")
@@ -340,9 +346,9 @@ func runAgentSuite(t *testing.T, image, bin string) {
 
 	t.Log("reclone rebuilds the standby from the primary")
 	rctx, rcancel := context.WithTimeout(ctx, 5*time.Minute)
-	rresp, err := p.grpc.Reclone(rctx, &pgshardv1.RecloneRequest{Epoch: 2, SourceKind: pgshardv1.RecloneRequest_SOURCE_KIND_PRIMARY})
+	rresp, err := p.grpc.Reclone(rctx, &pgshardv1.RecloneRequest{Epoch: 1, SourceKind: pgshardv1.RecloneRequest_SOURCE_KIND_PRIMARY})
 	rcancel()
-	if err != nil || rresp.GetError() != nil || rresp.GetEpoch() != 2 {
+	if err != nil || rresp.GetError() != nil || rresp.GetEpoch() != 1 {
 		t.Fatalf("reclone: err=%v resp=%v\n%s", err, rresp, p.logs())
 	}
 	if !strings.Contains(p.logs(), "cloning from primary") {
@@ -356,7 +362,7 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	}
 
 	t.Log("slot RPCs and unimplemented RPCs")
-	cs, err := s.grpc.CreateSlot(ctx, &pgshardv1.CreateSlotRequest{Epoch: 2, Name: "extra", Kind: pgshardv1.SlotKind_SLOT_KIND_PHYSICAL})
+	cs, err := s.grpc.CreateSlot(ctx, &pgshardv1.CreateSlotRequest{Epoch: 1, Name: "extra", Kind: pgshardv1.SlotKind_SLOT_KIND_PHYSICAL})
 	if err != nil || cs.GetError() != nil {
 		t.Fatalf("create slot: %v %v", cs, err)
 	}
@@ -364,25 +370,25 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	if err != nil || len(ls.GetSlots()) != 2 || ls.GetSlots()[0].GetName() != "extra" || ls.GetSlots()[1].GetName() != "pgshard_s0_0" || !ls.GetSlots()[1].GetActive() {
 		t.Fatalf("list slots: %v %v", ls, err)
 	}
-	if ds, err := s.grpc.DropSlot(ctx, &pgshardv1.DropSlotRequest{Epoch: 3, Name: "extra"}); err != nil || ds.GetError() != nil {
+	if ds, err := s.grpc.DropSlot(ctx, &pgshardv1.DropSlotRequest{Epoch: 1, Name: "extra"}); err != nil || ds.GetError() != nil {
 		t.Fatalf("drop slot: %v %v", ds, err)
 	}
-	rp, err := s.grpc.CreateRestorePoint(ctx, &pgshardv1.CreateRestorePointRequest{Epoch: 4, Name: "rp1"})
+	rp, err := s.grpc.CreateRestorePoint(ctx, &pgshardv1.CreateRestorePointRequest{Epoch: 1, Name: "rp1"})
 	if err != nil || rp.GetError() != nil || rp.GetLsn() == 0 {
 		t.Fatalf("restore point: %v %v", rp, err)
 	}
-	if _, err := s.grpc.Backup(ctx, &pgshardv1.BackupRequest{Epoch: 5}); status.Code(err) != codes.Unimplemented {
+	if _, err := s.grpc.Backup(ctx, &pgshardv1.BackupRequest{Epoch: 1}); status.Code(err) != codes.Unimplemented {
 		t.Fatalf("backup: %v", err)
 	}
 	if _, err := s.grpc.RestoreInfo(ctx, &pgshardv1.RestoreInfoRequest{}); status.Code(err) != codes.Unimplemented {
 		t.Fatalf("restore info: %v", err)
 	}
-	if s.status().GetEpoch() != 4 {
+	if s.status().GetEpoch() != 1 {
 		t.Fatalf("epoch after unimplemented backup: %d", s.status().GetEpoch())
 	}
 
 	t.Log("restart RPC")
-	rs, err := s.grpc.Restart(ctx, &pgshardv1.RestartRequest{Epoch: 5, Mode: pgshardv1.RestartRequest_MODE_FAST})
+	rs, err := s.grpc.Restart(ctx, &pgshardv1.RestartRequest{Epoch: 1, Mode: pgshardv1.RestartRequest_MODE_FAST})
 	if err != nil || rs.GetError() != nil {
 		t.Fatalf("restart: %v %v\n%s", rs, err, s.logs())
 	}
