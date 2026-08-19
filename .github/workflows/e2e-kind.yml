@@ -39,7 +39,7 @@ jobs:
         if: matrix.suite == 'operator'
       - name: Build PostgreSQL image
         if: matrix.suite == 'operator'
-        uses: docker/bake-action@5be5f02ff8819ecd3092ea6b2e6261c31774f2b4 # v6
+        uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7.3.0
         with:
           source: .
           targets: postgres-${{ matrix.pg }}
