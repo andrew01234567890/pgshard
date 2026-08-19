@@ -89,3 +89,22 @@ func TestBarrierOnPostgres(t *testing.T) {
 		t.Fatalf("foreign and live prepared transactions must survive: %v", got)
 	}
 }
+
+func TestDecisionWatermarkSurvivesDeletedRows(t *testing.T) {
+	f := newResolverFixtureWith(t)
+	ctx := context.Background()
+	store := &PGBarrierStore{Pool: f.pool}
+	before, err := store.DecisionWatermark(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExecPool(t, f.pool, `INSERT INTO pgshard.xact_decisions (gid, state, participants) VALUES ('pgshard-gone', 'commit', '{0}')`)
+	mustExecPool(t, f.pool, `DELETE FROM pgshard.xact_decisions WHERE gid = 'pgshard-gone'`)
+	after, err := store.DecisionWatermark(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after <= before {
+		t.Fatalf("watermark did not advance for a deleted row: before=%d after=%d", before, after)
+	}
+}

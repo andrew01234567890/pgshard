@@ -10,7 +10,8 @@ ALTER TABLE pgshard.shard_map_generation
     ADD COLUMN write_fenced_at timestamptz;
 
 ALTER TABLE pgshard.xact_decisions
-    ADD COLUMN participant_xids text[] NOT NULL DEFAULT '{}';
+    ADD COLUMN participant_xids text[] NOT NULL DEFAULT '{}',
+    ADD COLUMN seq bigint GENERATED ALWAYS AS IDENTITY;
 
 ALTER TABLE pgshard.restore_points
     ADD COLUMN certified boolean NOT NULL DEFAULT false,

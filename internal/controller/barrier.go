@@ -69,10 +69,11 @@ type BarrierStore interface {
 	Fence(ctx context.Context, active bool, reason string) error
 	// FencedAt returns when the current fence was raised.
 	FencedAt(ctx context.Context) (time.Time, error)
+	// DecisionWatermark returns a value that grows with every decision row
+	// ever inserted, whether or not the row still exists.
+	DecisionWatermark(ctx context.Context) (int64, error)
 	// PreparingCount counts decision rows still preparing.
 	PreparingCount(ctx context.Context) (int, error)
-	// DecisionsSince counts decision rows created after t.
-	DecisionsSince(ctx context.Context, t time.Time) (int, error)
 	// Exists reports whether a restore point of that name is recorded.
 	Exists(ctx context.Context, name string) (bool, error)
 	// Record inserts the restore point and returns its id.
@@ -188,7 +189,12 @@ func (b *Barrier) Run(ctx context.Context, name string) (RestorePoint, error) {
 
 // fenced runs the steps between raising and releasing the fence.
 func (b *Barrier) fenced(ctx context.Context, name string, groups []GroupRef) (RestorePoint, error) {
-	fencedAt, err := b.Store.FencedAt(ctx)
+	if _, err := b.Store.FencedAt(ctx); err != nil {
+		return RestorePoint{}, fmt.Errorf("barrier %s: %w", name, err)
+	}
+	// Decision rows are deleted once a transaction finishes, so a row count
+	// cannot prove nothing started under the fence; the watermark can.
+	before, err := b.Store.DecisionWatermark(ctx)
 	if err != nil {
 		return RestorePoint{}, fmt.Errorf("barrier %s: %w", name, err)
 	}
@@ -206,11 +212,11 @@ func (b *Barrier) fenced(ctx context.Context, name string, groups []GroupRef) (R
 	if err := b.awaitArchived(ctx, name, groups, rp.Groups); err != nil {
 		return RestorePoint{}, err
 	}
-	n, err := b.Store.DecisionsSince(ctx, fencedAt)
+	after, err := b.Store.DecisionWatermark(ctx)
 	if err != nil {
 		return RestorePoint{}, fmt.Errorf("barrier %s: %w", name, err)
 	}
-	if n > 0 {
+	if n := after - before; n > 0 {
 		return RestorePoint{}, fmt.Errorf("barrier %s: %d two-phase transaction(s) started while the fence was up; the restore points are not consistent, retry", name, n)
 	}
 	if rp.ShardMapGeneration, err = b.Store.ShardMapGeneration(ctx); err != nil {
@@ -335,10 +341,10 @@ func (s *PGBarrierStore) PreparingCount(ctx context.Context) (int, error) {
 	return n, err
 }
 
-// DecisionsSince implements BarrierStore.
-func (s *PGBarrierStore) DecisionsSince(ctx context.Context, t time.Time) (int, error) {
-	var n int
-	err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM pgshard.xact_decisions WHERE created_at > $1`, t).Scan(&n)
+// DecisionWatermark implements BarrierStore.
+func (s *PGBarrierStore) DecisionWatermark(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.Pool.QueryRow(ctx, `SELECT coalesce(pg_sequence_last_value('pgshard.xact_decisions_seq_seq'), 0)`).Scan(&n)
 	return n, err
 }
 

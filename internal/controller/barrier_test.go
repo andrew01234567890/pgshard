@@ -18,11 +18,12 @@ type fakeBarrierStore struct {
 	fencedAt  time.Time
 	preparing int
 	// lateDecisions is the number of decision rows created after the fence.
-	lateDecisions int
-	recorded      []RestorePoint
-	journal       *[]string
-	fail          map[string]error
-	now           func() time.Time
+	lateDecisions  int
+	watermarkReads int
+	recorded       []RestorePoint
+	journal        *[]string
+	fail           map[string]error
+	now            func() time.Time
 }
 
 func (s *fakeBarrierStore) log(step string) {
@@ -67,10 +68,14 @@ func (s *fakeBarrierStore) PreparingCount(context.Context) (int, error) {
 	return s.preparing, nil
 }
 
-func (s *fakeBarrierStore) DecisionsSince(context.Context, time.Time) (int, error) {
+func (s *fakeBarrierStore) DecisionWatermark(context.Context) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.lateDecisions, nil
+	s.watermarkReads++
+	if s.watermarkReads == 1 {
+		return 0, nil
+	}
+	return int64(s.lateDecisions), nil
 }
 
 func (s *fakeBarrierStore) Exists(_ context.Context, name string) (bool, error) {
