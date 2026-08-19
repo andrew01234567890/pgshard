@@ -161,6 +161,17 @@ func TestSearchPathAndReferenceSpread(t *testing.T) {
 	if err != nil || pl.Kind != EqualUnique {
 		t.Fatalf("search_path lookup: %+v %v", pl, err)
 	}
+	// System schemas ahead of user schemas must be skipped, not treated as
+	// "found on the home shard": a common hardening search_path.
+	sess.SearchPath = []string{"pg_catalog", "public"}
+	pl, err = New().Plan(context.Background(), sess, "insert into orders (tenant_id, id) values (7, 1)")
+	if err != nil || pl.Kind != EqualUnique {
+		t.Fatalf("pg_catalog first in search_path must still find public.orders: %+v %v", pl, err)
+	}
+	pl, err = New().Plan(context.Background(), sess, "select * from pg_catalog.pg_class")
+	if err != nil || pl.Kind != Unsharded {
+		t.Fatalf("explicit pg_catalog qualifier resolves to the home shard: %+v %v", pl, err)
+	}
 	seen := map[int32]bool{}
 	for id := uint64(0); id < 8; id++ {
 		sess := session(snap)

@@ -110,6 +110,9 @@ func classify(node *pgquerypb.Node, c *StmtClass) error {
 				}
 				if s.GetKind() == pgquerypb.VariableSetKind_VAR_SET_VALUE {
 					c.SearchPath = searchPathArgs(s.GetArgs())
+					if len(c.SearchPath) == 0 {
+						return notYet("SET search_path with an unrecognised argument list is not available yet", "use a comma-separated list of schema names")
+					}
 				}
 			}
 		case pgquerypb.VariableSetKind_VAR_RESET_ALL:
@@ -220,7 +223,13 @@ func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
 	snap := w.sess.Snapshot
 	for _, schema := range schemas {
 		if schema == "pg_catalog" || schema == "information_schema" || schema == "pg_temp" {
-			return r, nil
+			// System schemas never hold pgshard tables. An explicit qualifier
+			// means a catalog relation on the home shard; inside a search path
+			// they are simply skipped so later schemas are still searched.
+			if rv.GetSchemaname() != "" {
+				return r, nil
+			}
+			continue
 		}
 		if snap == nil {
 			continue

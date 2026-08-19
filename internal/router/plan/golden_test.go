@@ -59,6 +59,7 @@ func golden() []want {
 		{sql: "savepoint a", kind: SessionLocal},
 		{sql: "set application_name to 'x'", kind: SessionLocal},
 		{sql: "set local search_path to app", kind: Refuse, msg: "SET LOCAL search_path"},
+		{sql: "set search_path = 1", kind: Refuse, msg: "SET search_path with an unrecognised argument list"},
 		{sql: "set local work_mem to '1MB'", kind: SessionLocal},
 		{sql: "reset all", kind: SessionLocal},
 		{sql: "show search_path", kind: SessionLocal},
