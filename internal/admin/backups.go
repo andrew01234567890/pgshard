@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"sort"
 	"time"
 
@@ -289,7 +290,7 @@ func GetRestore(ctx context.Context, c client.Reader, namespace, name string) (*
 func summarizePolicy(p *pgshardv1alpha1.PgShardBackupPolicy, cluster string) *PolicySummary {
 	st := p.Spec.ObjectStore
 	s := &PolicySummary{
-		Name: p.Name, StoreType: st.Type, Bucket: st.Bucket, Container: st.Container, Endpoint: st.Endpoint, Prefix: st.Prefix,
+		Name: p.Name, StoreType: st.Type, Bucket: st.Bucket, Container: st.Container, Endpoint: displayEndpoint(st.Endpoint), Prefix: st.Prefix,
 		CredentialType:  st.CredentialType,
 		FullSchedule:    p.Spec.Schedules.Full,
 		DiffSchedule:    p.Spec.Schedules.Differential,
@@ -417,4 +418,14 @@ func humanAge(d time.Duration) string {
 		return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
 	}
 	return fmt.Sprintf("%dd%dh", int(d.Hours())/24, int(d.Hours())%24)
+}
+
+// displayEndpoint drops any userinfo an operator embedded in the endpoint URL.
+func displayEndpoint(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.User == nil {
+		return raw
+	}
+	u.User = nil
+	return u.String()
 }

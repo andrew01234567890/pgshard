@@ -207,3 +207,12 @@ func TestDescribeTarget(t *testing.T) {
 		}
 	}
 }
+
+func TestDisplayEndpointStripsUserinfo(t *testing.T) {
+	if got := displayEndpoint("https://user:pw@minio.example.org:9000"); got != "https://minio.example.org:9000" {
+		t.Fatalf("got %q", got)
+	}
+	if got := displayEndpoint("minio:9000"); got != "minio:9000" {
+		t.Fatalf("plain endpoint changed: %q", got)
+	}
+}
