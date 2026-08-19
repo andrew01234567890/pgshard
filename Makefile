@@ -86,4 +86,28 @@ envtest-assets:
 		hack/envtest/setup-envtest.sh $(ENVTEST_ASSETS_DIR)
 
 envtest: envtest-assets
-	KUBEBUILDER_ASSETS="$$(hack/envtest/setup-envtest.sh $(ENVTEST_ASSETS_DIR))" go test -race -count=1 ./api/...
+	KUBEBUILDER_ASSETS="$$(hack/envtest/setup-envtest.sh $(ENVTEST_ASSETS_DIR))" go test -race -count=1 ./api/... ./internal/operator/...
+
+IMG ?= ghcr.io/andrew01234567890/pgshard-operator:latest
+
+.PHONY: install uninstall deploy undeploy operator-image
+
+install:
+	kubectl apply -f config/crd/bases
+
+uninstall:
+	kubectl delete --ignore-not-found -f config/crd/bases
+
+operator-image:
+	docker build -f Dockerfile.control --build-arg CMD=pgshard-operator \
+		--build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg DATE=$(DATE) -t $(IMG) .
+
+deploy: install
+	kubectl apply -f config/manager/namespace.yaml
+	kubectl apply -f config/rbac
+	sed 's|image: ghcr.io/andrew01234567890/pgshard-operator:latest|image: $(IMG)|' config/manager/manager.yaml | kubectl apply -f -
+
+undeploy:
+	kubectl delete --ignore-not-found -f config/manager/manager.yaml
+	kubectl delete --ignore-not-found -f config/rbac
+	kubectl delete --ignore-not-found -f config/manager/namespace.yaml

@@ -1,0 +1,3 @@
+// Package operator holds the kind end-to-end suite for the pgshard operator.
+// Run with: go test -tags e2e -count=1 -v ./test/e2e/operator/...
+package operator

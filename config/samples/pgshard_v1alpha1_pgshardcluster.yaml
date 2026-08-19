@@ -1,0 +1,19 @@
+apiVersion: pgshard.io/v1alpha1
+kind: PgShardCluster
+metadata:
+  name: demo
+spec:
+  postgresql:
+    major: 18
+  catalog:
+    replicas: 3
+    storage:
+      size: 1Gi
+  shards: 1
+  replicasPerShard: 3
+  storage:
+    size: 1Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi

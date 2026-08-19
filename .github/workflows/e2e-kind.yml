@@ -16,12 +16,12 @@ jobs:
   e2e:
     name: e2e (pg${{ matrix.pg }}, ${{ matrix.suite }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         pg: [18, 19]
-        suite: [smoke]
+        suite: [smoke, operator]
     env:
       PG_MAJOR: ${{ matrix.pg }}
       E2E_ARTIFACTS: ${{ github.workspace }}/artifacts/e2e-pg${{ matrix.pg }}-${{ matrix.suite }}
@@ -35,15 +35,37 @@ jobs:
         with:
           version: v0.32.0
           install_only: true
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        if: matrix.suite == 'operator'
+      - name: Build PostgreSQL image
+        if: matrix.suite == 'operator'
+        uses: docker/bake-action@5be5f02ff8819ecd3092ea6b2e6261c31774f2b4 # v6
+        with:
+          source: .
+          targets: postgres-${{ matrix.pg }}
+          load: true
+        env:
+          CI: "true"
+      - name: Build operator image
+        if: matrix.suite == 'operator'
+        run: docker build -f Dockerfile.control --build-arg CMD=pgshard-operator -t pgshard-operator:e2e .
       - name: Create kind cluster
         run: hack/kind/up.sh
+      - name: Load images into kind
+        if: matrix.suite == 'operator'
+        run: hack/kind/load-images.sh pgshard-operator:e2e "ghcr.io/andrew01234567890/pgshard-postgres:${PG_MAJOR}"
       - name: Run e2e suite
         run: |
           set -o pipefail
           mkdir -p "$E2E_ARTIFACTS"
-          go test -tags e2e -count=1 -v -run 'Smoke' ./test/e2e/... 2>&1 | tee "$E2E_ARTIFACTS/go-test.log"
+          case "$E2E_SUITE" in
+            smoke) go test -tags e2e -count=1 -v -run 'Smoke' ./test/e2e/... 2>&1 | tee "$E2E_ARTIFACTS/go-test.log" ;;
+            operator) go test -tags e2e -count=1 -v -timeout 40m ./test/e2e/operator/... 2>&1 | tee "$E2E_ARTIFACTS/go-test.log" ;;
+            *) echo "unknown suite $E2E_SUITE" >&2; exit 1 ;;
+          esac
         env:
           E2E_SUITE: ${{ matrix.suite }}
+          OPERATOR_IMAGE: pgshard-operator:e2e
       - name: Collect cluster state on failure
         if: failure()
         run: |
