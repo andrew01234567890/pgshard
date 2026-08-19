@@ -8,5 +8,7 @@ import (
 )
 
 func main() {
-	os.Exit(cli.Run("pgshard-controller", os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(cli.RunWith("pgshard-controller", os.Args[1:], os.Stdout, os.Stderr, map[string]cli.Subcommand{
+		"run": run,
+	}))
 }
