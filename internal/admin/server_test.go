@@ -19,6 +19,7 @@ import (
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/internal/catalog"
+	"github.com/andrew01234567890/pgshard/internal/controller"
 	"github.com/andrew01234567890/pgshard/internal/operator"
 )
 
@@ -126,8 +127,14 @@ func TestTopologyJSONReflectsGroupStatus(t *testing.T) {
 }
 
 type fakeCatalog struct {
-	rows []catalog.ShardStatus
-	err  error
+	rows   []catalog.ShardStatus
+	err    error
+	points []controller.RestorePoint
+	rpErr  error
+}
+
+func (f fakeCatalog) RestorePoints(context.Context) ([]controller.RestorePoint, error) {
+	return f.points, f.rpErr
 }
 
 func (f fakeCatalog) ShardStatus(context.Context) ([]catalog.ShardStatus, error) {

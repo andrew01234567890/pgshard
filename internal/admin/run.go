@@ -130,7 +130,8 @@ func Run(ctx context.Context, o Options) error {
 	return mgr.Start(ctx)
 }
 
-// RegisterWatches wires informers on PgShardCluster, PgShardGroup and Pod so
+// RegisterWatches wires informers on PgShardCluster, PgShardGroup, the backup
+// objects and Pod so
 // every create/update/delete calls notifier.Notify.
 func RegisterWatches(mgr ctrl.Manager, notifier *Notifier) error {
 	_, err := ctrl.NewControllerManagedBy(mgr).
@@ -138,6 +139,9 @@ func RegisterWatches(mgr ctrl.Manager, notifier *Notifier) error {
 		WithOptions(controller.Options{SkipNameValidation: &skipNameValidation}).
 		WatchesRawSource(source.Kind(mgr.GetCache(), &pgshardv1alpha1.PgShardCluster{}, notifyHandler[*pgshardv1alpha1.PgShardCluster]())).
 		WatchesRawSource(source.Kind(mgr.GetCache(), &pgshardv1alpha1.PgShardGroup{}, notifyHandler[*pgshardv1alpha1.PgShardGroup]())).
+		WatchesRawSource(source.Kind(mgr.GetCache(), &pgshardv1alpha1.PgShardBackupPolicy{}, notifyHandler[*pgshardv1alpha1.PgShardBackupPolicy]())).
+		WatchesRawSource(source.Kind(mgr.GetCache(), &pgshardv1alpha1.PgShardBackup{}, notifyHandler[*pgshardv1alpha1.PgShardBackup]())).
+		WatchesRawSource(source.Kind(mgr.GetCache(), &pgshardv1alpha1.PgShardRestore{}, notifyHandler[*pgshardv1alpha1.PgShardRestore]())).
 		WatchesRawSource(source.Kind(mgr.GetCache(), &corev1.Pod{}, notifyHandler[*corev1.Pod](), predicate.NewTypedPredicateFuncs(func(p *corev1.Pod) bool {
 			_, ok := p.Labels[operator.LabelCluster]
 			return ok

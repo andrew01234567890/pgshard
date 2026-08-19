@@ -3,7 +3,7 @@
 <h1><a href="/">clusters</a> / {{.Namespace}} / {{.Name}}</h1>
 <span class="meta">PostgreSQL {{.PostgresMajor}} · shard map generation <span id="shard-map-generation">{{.ShardMapGeneration}}</span></span>
 </header>
-<div id="topology" hx-get="/clusters/{{.Namespace}}/{{.Name}}/topology" hx-trigger="topology" hx-swap="innerHTML">
+<div id="topology" data-live hx-get="/clusters/{{.Namespace}}/{{.Name}}/topology" hx-trigger="topology" hx-swap="innerHTML">
 {{template "topology.html" .}}
 </div>
 <p class="notice"><a href="/api/v1/clusters/{{.Namespace}}/{{.Name}}">JSON</a></p>

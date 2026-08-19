@@ -49,7 +49,7 @@ func NewServer(c client.Reader, catalogSrc CatalogSource, n *Notifier, namespace
 	if n == nil {
 		n = NewNotifier()
 	}
-	tmpl, err := template.New("").Funcs(template.FuncMap{"bytes": humanBytes, "bytesp": humanBytesPtr}).ParseFS(assets, "templates/*.html")
+	tmpl, err := template.New("").Funcs(template.FuncMap{"bytes": humanBytes, "bytesp": humanBytesPtr, "when": humanTime}).ParseFS(assets, "templates/*.html")
 	if err != nil {
 		return nil, err
 	}
@@ -63,6 +63,13 @@ func NewServer(c client.Reader, catalogSrc CatalogSource, n *Notifier, namespace
 	mux.HandleFunc("GET /{$}", s.handleIndex)
 	mux.HandleFunc("GET /clusters/{ns}/{name}", s.handleCluster)
 	mux.HandleFunc("GET /clusters/{ns}/{name}/topology", s.handleTopologyFragment)
+	mux.HandleFunc("GET /backups", s.handleBackups)
+	mux.HandleFunc("GET /backups/panel", s.handleBackupsFragment)
+	mux.HandleFunc("GET /backups/{ns}/{name}", s.handleBackup)
+	mux.HandleFunc("GET /restores/{ns}/{name}", s.handleRestore)
+	mux.HandleFunc("GET /api/v1/backups", s.handleAPIBackups)
+	mux.HandleFunc("GET /api/v1/restores", s.handleAPIRestores)
+	mux.HandleFunc("GET /api/v1/restore-points", s.handleAPIRestorePoints)
 	mux.HandleFunc("GET /api/v1/clusters", s.handleAPIClusters)
 	mux.HandleFunc("GET /api/v1/clusters/{ns}/{name}", s.handleAPICluster)
 	mux.HandleFunc("GET /events", s.handleEvents)
@@ -106,7 +113,81 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	s.render(w, "index.html", map[string]any{"Clusters": clusters, "Namespace": s.Namespace})
+	cards, err := BuildBackupCards(r.Context(), s.Client, s.Namespace, time.Now())
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.render(w, "index.html", map[string]any{"Clusters": clusters, "Namespace": s.Namespace, "Cards": cards})
+}
+
+func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request) {
+	page, err := BuildBackupsPage(r.Context(), s.Client, s.Catalog, s.Namespace)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.render(w, "backups.html", page)
+}
+
+func (s *Server) handleBackupsFragment(w http.ResponseWriter, r *http.Request) {
+	page, err := BuildBackupsPage(r.Context(), s.Client, s.Catalog, s.Namespace)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.render(w, "backups_panel.html", page)
+}
+
+func (s *Server) handleBackup(w http.ResponseWriter, r *http.Request) {
+	b, err := GetBackup(r.Context(), s.Client, r.PathValue("ns"), r.PathValue("name"))
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.render(w, "backup.html", b)
+}
+
+func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
+	rs, err := GetRestore(r.Context(), s.Client, r.PathValue("ns"), r.PathValue("name"))
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.render(w, "restore.html", rs)
+}
+
+func (s *Server) handleAPIBackups(w http.ResponseWriter, r *http.Request) {
+	list, err := ListBackups(r.Context(), s.Client, s.Namespace)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, list)
+}
+
+func (s *Server) handleAPIRestores(w http.ResponseWriter, r *http.Request) {
+	list, err := ListRestores(r.Context(), s.Client, s.Namespace)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, list)
+}
+
+func (s *Server) handleAPIRestorePoints(w http.ResponseWriter, r *http.Request) {
+	out := []RestorePoint{}
+	if s.Catalog != nil {
+		points, err := s.Catalog.RestorePoints(r.Context())
+		if err != nil {
+			s.fail(w, err)
+			return
+		}
+		for _, rp := range points {
+			out = append(out, convertRestorePoint(rp))
+		}
+	}
+	writeJSON(w, out)
 }
 
 func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
@@ -240,4 +321,11 @@ func humanBytesPtr(n *int64) string {
 		return "\u2014"
 	}
 	return humanBytes(*n)
+}
+
+func humanTime(t *time.Time) string {
+	if t == nil {
+		return "\u2014"
+	}
+	return t.UTC().Format(time.RFC3339)
 }
