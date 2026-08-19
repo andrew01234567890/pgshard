@@ -18,6 +18,9 @@ spec:
     - jsonPath: .spec.objectStore.type
       name: Store
       type: string
+    - jsonPath: .status.conditions[?(@.type=="BackupHealthy")].status
+      name: Healthy
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -45,17 +48,48 @@ spec:
           metadata:
             type: object
           spec:
-            description: PgShardBackupPolicySpec is the desired backup policy.
+            description: |-
+              PgShardBackupPolicySpec is the desired backup policy. Clusters bind to it
+              through spec.backup.policyRef.
             properties:
+              logLevel:
+                description: |-
+                  LogLevel is the pgBackRest log level (off, error, warn, info, detail,
+                  debug, trace).
+                enum:
+                - "off"
+                - error
+                - warn
+                - info
+                - detail
+                - debug
+                - trace
+                type: string
               objectStore:
                 description: ObjectStoreSpec locates a backup repository.
                 properties:
                   bucket:
+                    description: Bucket is the S3 or GCS bucket.
                     type: string
                   container:
+                    description: Container is the Azure blob container.
+                    type: string
+                  credentialType:
+                    description: |-
+                      CredentialType selects how pgBackRest authenticates:
+                      s3 shared|web-id|auto, azure shared|sas, gcs service|token|auto.
+                    enum:
+                    - shared
+                    - web-id
+                    - auto
+                    - sas
+                    - service
+                    - token
                     type: string
                   credentials:
-                    description: SecretRefSpec wraps an optional Secret reference.
+                    description: |-
+                      Credentials names the Secret whose keys hold the store credentials:
+                      s3 key/keySecret, azure account/key, gcs key.json, sftp privateKey.
                     properties:
                       secretRef:
                         description: |-
@@ -75,7 +109,9 @@ spec:
                         x-kubernetes-map-type: atomic
                     type: object
                   encryption:
-                    description: SecretRefSpec wraps an optional Secret reference.
+                    description: |-
+                      Encryption names the Secret whose passphrase key encrypts the
+                      repository with aes-256-cbc.
                     properties:
                       secretRef:
                         description: |-
@@ -95,11 +131,36 @@ spec:
                         x-kubernetes-map-type: atomic
                     type: object
                   endpoint:
+                    description: |-
+                      Endpoint overrides the store endpoint; an http:// or https:// URL or a
+                      host[:port].
                     type: string
                   prefix:
+                    description: Prefix is the path inside the store the repository
+                      lives under.
                     type: string
                   region:
                     type: string
+                  sftp:
+                    description: SFTP holds the host settings of an sftp store.
+                    properties:
+                      host:
+                        type: string
+                      hostKeyCheck:
+                        enum:
+                        - strict
+                        - accept-new
+                        - fingerprint
+                        - none
+                        type: string
+                      port:
+                        type: integer
+                      user:
+                        type: string
+                    required:
+                    - host
+                    - user
+                    type: object
                   type:
                     enum:
                     - s3
@@ -108,9 +169,23 @@ spec:
                     - posix
                     - sftp
                     type: string
+                  uriStyle:
+                    description: URIStyle is host or path addressing for S3 and Azure.
+                    enum:
+                    - host
+                    - path
+                    type: string
+                  verifyTLS:
+                    description: VerifyTLS defaults to true; false accepts self-signed
+                      store certificates.
+                    type: boolean
                 required:
                 - type
                 type: object
+              processMax:
+                description: ProcessMax bounds pgBackRest parallelism per member.
+                minimum: 1
+                type: integer
               retention:
                 description: BackupRetention counts backups to keep per type.
                 properties:
@@ -134,9 +209,101 @@ spec:
             required:
             - objectStore
             type: object
+          status:
+            description: PgShardBackupPolicyStatus is the observed state of a policy.
+            properties:
+              clusters:
+                description: |-
+                  Clusters lists every cluster whose spec.backup.policyRef names this
+                  policy with its last successful backups.
+                items:
+                  description: ClusterBackupStatus is the backup health of one cluster
+                    bound to a policy.
+                  properties:
+                    healthy:
+                      type: boolean
+                    lastDifferentialTime:
+                      format: date-time
+                      type: string
+                    lastFullTime:
+                      format: date-time
+                      type: string
+                    lastIncrementalTime:
+                      format: date-time
+                      type: string
+                    message:
+                      type: string
+                    name:
+                      type: string
+                  required:
+                  - healthy
+                  - name
+                  type: object
+                type: array
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              observedGeneration:
+                format: int64
+                type: integer
+            type: object
         required:
         - spec
         type: object
     served: true
     storage: true
-    subresources: {}
+    subresources:
+      status: {}

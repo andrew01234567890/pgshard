@@ -29,11 +29,17 @@ type Server struct {
 	mu        sync.Mutex
 	holdStop  context.CancelFunc
 	opTimeout time.Duration
+	// bgCtx bounds background work started by RPCs (stanza creation after a
+	// promotion); it is the agent's run context.
+	bgCtx context.Context
 }
+
+// stanzaRetry is the pause between attempts to create the pgbackrest stanza.
+const stanzaRetry = 30 * time.Second
 
 // NewServer wires the RPC surface. lease may be nil when leasing is disabled.
 func NewServer(inst *Instance, epoch *EpochStore, lease *Lease, log *slog.Logger, fatal func(error)) *Server {
-	return &Server{inst: inst, epoch: epoch, lease: lease, log: log, fatal: fatal, opTimeout: 10 * time.Minute}
+	return &Server{inst: inst, epoch: epoch, lease: lease, log: log, fatal: fatal, opTimeout: 10 * time.Minute, bgCtx: context.Background()}
 }
 
 func pgErr(err error) *pgshardv1.Error {
@@ -107,6 +113,7 @@ func (s *Server) Promote(ctx context.Context, req *pgshardv1.PromoteRequest) (*p
 		return resp, nil
 	}
 	s.startHold()
+	go s.inst.ensureStanzaLoop(s.bgCtx, stanzaRetry)
 	st, _ := s.Status(ctx, nil)
 	resp.Timeline = st.GetTimeline()
 	return resp, nil
@@ -339,14 +346,4 @@ func (s *Server) ListSlots(ctx context.Context, _ *pgshardv1.ListSlotsRequest) (
 	})
 	resp.Error = pgErr(err)
 	return resp, nil
-}
-
-// Backup is not implemented until the backup layer lands.
-func (s *Server) Backup(context.Context, *pgshardv1.BackupRequest) (*pgshardv1.BackupResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "backup is not implemented")
-}
-
-// RestoreInfo is not implemented until the backup layer lands.
-func (s *Server) RestoreInfo(context.Context, *pgshardv1.RestoreInfoRequest) (*pgshardv1.RestoreInfoResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "restore info is not implemented")
 }

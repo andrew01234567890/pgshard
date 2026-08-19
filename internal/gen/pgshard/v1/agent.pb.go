@@ -1668,20 +1668,154 @@ func (x *BackupRequest) GetType() BackupRequest_Type {
 	return BackupRequest_TYPE_UNSPECIFIED
 }
 
+// BackupInfo describes one backup set in the repository.
+type BackupInfo struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// pgBackRest backup label, e.g. 20260101-120000F.
+	Label string `protobuf:"bytes,1,opt,name=label,proto3" json:"label,omitempty"`
+	// full, diff or incr.
+	Type     string `protobuf:"bytes,2,opt,name=type,proto3" json:"type,omitempty"`
+	StartLsn uint64 `protobuf:"varint,3,opt,name=start_lsn,json=startLsn,proto3" json:"start_lsn,omitempty"`
+	StopLsn  uint64 `protobuf:"varint,4,opt,name=stop_lsn,json=stopLsn,proto3" json:"stop_lsn,omitempty"`
+	// First and last WAL segment the backup needs.
+	ArchiveStart string `protobuf:"bytes,5,opt,name=archive_start,json=archiveStart,proto3" json:"archive_start,omitempty"`
+	ArchiveStop  string `protobuf:"bytes,6,opt,name=archive_stop,json=archiveStop,proto3" json:"archive_stop,omitempty"`
+	// Database size and the size stored in the repository (bytes).
+	SizeBytes     uint64 `protobuf:"varint,7,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
+	RepoSizeBytes uint64 `protobuf:"varint,8,opt,name=repo_size_bytes,json=repoSizeBytes,proto3" json:"repo_size_bytes,omitempty"`
+	// Unix seconds.
+	StartedAt  int64 `protobuf:"varint,9,opt,name=started_at,json=startedAt,proto3" json:"started_at,omitempty"`
+	FinishedAt int64 `protobuf:"varint,10,opt,name=finished_at,json=finishedAt,proto3" json:"finished_at,omitempty"`
+	// Prior backup this one depends on; empty for a full backup.
+	Prior         string `protobuf:"bytes,11,opt,name=prior,proto3" json:"prior,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BackupInfo) Reset() {
+	*x = BackupInfo{}
+	mi := &file_pgshard_v1_agent_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BackupInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BackupInfo) ProtoMessage() {}
+
+func (x *BackupInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_agent_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BackupInfo.ProtoReflect.Descriptor instead.
+func (*BackupInfo) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *BackupInfo) GetLabel() string {
+	if x != nil {
+		return x.Label
+	}
+	return ""
+}
+
+func (x *BackupInfo) GetType() string {
+	if x != nil {
+		return x.Type
+	}
+	return ""
+}
+
+func (x *BackupInfo) GetStartLsn() uint64 {
+	if x != nil {
+		return x.StartLsn
+	}
+	return 0
+}
+
+func (x *BackupInfo) GetStopLsn() uint64 {
+	if x != nil {
+		return x.StopLsn
+	}
+	return 0
+}
+
+func (x *BackupInfo) GetArchiveStart() string {
+	if x != nil {
+		return x.ArchiveStart
+	}
+	return ""
+}
+
+func (x *BackupInfo) GetArchiveStop() string {
+	if x != nil {
+		return x.ArchiveStop
+	}
+	return ""
+}
+
+func (x *BackupInfo) GetSizeBytes() uint64 {
+	if x != nil {
+		return x.SizeBytes
+	}
+	return 0
+}
+
+func (x *BackupInfo) GetRepoSizeBytes() uint64 {
+	if x != nil {
+		return x.RepoSizeBytes
+	}
+	return 0
+}
+
+func (x *BackupInfo) GetStartedAt() int64 {
+	if x != nil {
+		return x.StartedAt
+	}
+	return 0
+}
+
+func (x *BackupInfo) GetFinishedAt() int64 {
+	if x != nil {
+		return x.FinishedAt
+	}
+	return 0
+}
+
+func (x *BackupInfo) GetPrior() string {
+	if x != nil {
+		return x.Prior
+	}
+	return ""
+}
+
 // BackupResponse reports the backup reference.
 type BackupResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Epoch uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
 	// Identifier usable as RecloneRequest.backup_ref.
-	BackupRef     string `protobuf:"bytes,2,opt,name=backup_ref,json=backupRef,proto3" json:"backup_ref,omitempty"`
-	Error         *Error `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
+	BackupRef string      `protobuf:"bytes,2,opt,name=backup_ref,json=backupRef,proto3" json:"backup_ref,omitempty"`
+	Error     *Error      `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
+	Info      *BackupInfo `protobuf:"bytes,4,opt,name=info,proto3" json:"info,omitempty"`
+	// Tail of the pgbackrest console log.
+	Log           []string `protobuf:"bytes,5,rep,name=log,proto3" json:"log,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *BackupResponse) Reset() {
 	*x = BackupResponse{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[24]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1693,7 +1827,7 @@ func (x *BackupResponse) String() string {
 func (*BackupResponse) ProtoMessage() {}
 
 func (x *BackupResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[24]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1706,7 +1840,7 @@ func (x *BackupResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackupResponse.ProtoReflect.Descriptor instead.
 func (*BackupResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{24}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *BackupResponse) GetEpoch() uint64 {
@@ -1730,7 +1864,21 @@ func (x *BackupResponse) GetError() *Error {
 	return nil
 }
 
-// RestoreInfoRequest asks for restore provenance.
+func (x *BackupResponse) GetInfo() *BackupInfo {
+	if x != nil {
+		return x.Info
+	}
+	return nil
+}
+
+func (x *BackupResponse) GetLog() []string {
+	if x != nil {
+		return x.Log
+	}
+	return nil
+}
+
+// RestoreInfoRequest asks for the repository contents.
 type RestoreInfoRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -1739,7 +1887,7 @@ type RestoreInfoRequest struct {
 
 func (x *RestoreInfoRequest) Reset() {
 	*x = RestoreInfoRequest{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[25]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1751,7 +1899,7 @@ func (x *RestoreInfoRequest) String() string {
 func (*RestoreInfoRequest) ProtoMessage() {}
 
 func (x *RestoreInfoRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[25]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1764,10 +1912,10 @@ func (x *RestoreInfoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreInfoRequest.ProtoReflect.Descriptor instead.
 func (*RestoreInfoRequest) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{25}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{26}
 }
 
-// RestoreInfoResponse describes the last restore.
+// RestoreInfoResponse describes the stanza in the repository.
 type RestoreInfoResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Epoch uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
@@ -1776,13 +1924,21 @@ type RestoreInfoResponse struct {
 	// LSN at which recovery ended.
 	RecoveryEndLsn uint64 `protobuf:"varint,3,opt,name=recovery_end_lsn,json=recoveryEndLsn,proto3" json:"recovery_end_lsn,omitempty"`
 	Error          *Error `protobuf:"bytes,4,opt,name=error,proto3" json:"error,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	Stanza         string `protobuf:"bytes,5,opt,name=stanza,proto3" json:"stanza,omitempty"`
+	// pgBackRest stanza status code and message (0 = ok).
+	StatusCode    int64  `protobuf:"varint,6,opt,name=status_code,json=statusCode,proto3" json:"status_code,omitempty"`
+	StatusMessage string `protobuf:"bytes,7,opt,name=status_message,json=statusMessage,proto3" json:"status_message,omitempty"`
+	// Oldest and newest archived WAL segment.
+	ArchiveMin    string        `protobuf:"bytes,8,opt,name=archive_min,json=archiveMin,proto3" json:"archive_min,omitempty"`
+	ArchiveMax    string        `protobuf:"bytes,9,opt,name=archive_max,json=archiveMax,proto3" json:"archive_max,omitempty"`
+	Backups       []*BackupInfo `protobuf:"bytes,10,rep,name=backups,proto3" json:"backups,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RestoreInfoResponse) Reset() {
 	*x = RestoreInfoResponse{}
-	mi := &file_pgshard_v1_agent_proto_msgTypes[26]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1794,7 +1950,7 @@ func (x *RestoreInfoResponse) String() string {
 func (*RestoreInfoResponse) ProtoMessage() {}
 
 func (x *RestoreInfoResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pgshard_v1_agent_proto_msgTypes[26]
+	mi := &file_pgshard_v1_agent_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1807,7 +1963,7 @@ func (x *RestoreInfoResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreInfoResponse.ProtoReflect.Descriptor instead.
 func (*RestoreInfoResponse) Descriptor() ([]byte, []int) {
-	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{26}
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *RestoreInfoResponse) GetEpoch() uint64 {
@@ -1834,6 +1990,253 @@ func (x *RestoreInfoResponse) GetRecoveryEndLsn() uint64 {
 func (x *RestoreInfoResponse) GetError() *Error {
 	if x != nil {
 		return x.Error
+	}
+	return nil
+}
+
+func (x *RestoreInfoResponse) GetStanza() string {
+	if x != nil {
+		return x.Stanza
+	}
+	return ""
+}
+
+func (x *RestoreInfoResponse) GetStatusCode() int64 {
+	if x != nil {
+		return x.StatusCode
+	}
+	return 0
+}
+
+func (x *RestoreInfoResponse) GetStatusMessage() string {
+	if x != nil {
+		return x.StatusMessage
+	}
+	return ""
+}
+
+func (x *RestoreInfoResponse) GetArchiveMin() string {
+	if x != nil {
+		return x.ArchiveMin
+	}
+	return ""
+}
+
+func (x *RestoreInfoResponse) GetArchiveMax() string {
+	if x != nil {
+		return x.ArchiveMax
+	}
+	return ""
+}
+
+func (x *RestoreInfoResponse) GetBackups() []*BackupInfo {
+	if x != nil {
+		return x.Backups
+	}
+	return nil
+}
+
+// ExpireRequest applies retention.
+type ExpireRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Caller's view of the current epoch; must EQUAL the last accepted epoch.
+	Epoch         uint64 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExpireRequest) Reset() {
+	*x = ExpireRequest{}
+	mi := &file_pgshard_v1_agent_proto_msgTypes[28]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExpireRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExpireRequest) ProtoMessage() {}
+
+func (x *ExpireRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_agent_proto_msgTypes[28]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExpireRequest.ProtoReflect.Descriptor instead.
+func (*ExpireRequest) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{28}
+}
+
+func (x *ExpireRequest) GetEpoch() uint64 {
+	if x != nil {
+		return x.Epoch
+	}
+	return 0
+}
+
+// ExpireResponse reports the outcome.
+type ExpireResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Epoch         uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	Error         *Error                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	Log           []string               `protobuf:"bytes,3,rep,name=log,proto3" json:"log,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExpireResponse) Reset() {
+	*x = ExpireResponse{}
+	mi := &file_pgshard_v1_agent_proto_msgTypes[29]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExpireResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExpireResponse) ProtoMessage() {}
+
+func (x *ExpireResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_agent_proto_msgTypes[29]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExpireResponse.ProtoReflect.Descriptor instead.
+func (*ExpireResponse) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{29}
+}
+
+func (x *ExpireResponse) GetEpoch() uint64 {
+	if x != nil {
+		return x.Epoch
+	}
+	return 0
+}
+
+func (x *ExpireResponse) GetError() *Error {
+	if x != nil {
+		return x.Error
+	}
+	return nil
+}
+
+func (x *ExpireResponse) GetLog() []string {
+	if x != nil {
+		return x.Log
+	}
+	return nil
+}
+
+// VerifyRequest checks the repository.
+type VerifyRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VerifyRequest) Reset() {
+	*x = VerifyRequest{}
+	mi := &file_pgshard_v1_agent_proto_msgTypes[30]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VerifyRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VerifyRequest) ProtoMessage() {}
+
+func (x *VerifyRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_agent_proto_msgTypes[30]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VerifyRequest.ProtoReflect.Descriptor instead.
+func (*VerifyRequest) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{30}
+}
+
+// VerifyResponse reports the outcome.
+type VerifyResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Epoch         uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	Error         *Error                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	Log           []string               `protobuf:"bytes,3,rep,name=log,proto3" json:"log,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VerifyResponse) Reset() {
+	*x = VerifyResponse{}
+	mi := &file_pgshard_v1_agent_proto_msgTypes[31]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VerifyResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VerifyResponse) ProtoMessage() {}
+
+func (x *VerifyResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_agent_proto_msgTypes[31]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VerifyResponse.ProtoReflect.Descriptor instead.
+func (*VerifyResponse) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{31}
+}
+
+func (x *VerifyResponse) GetEpoch() uint64 {
+	if x != nil {
+		return x.Epoch
+	}
+	return 0
+}
+
+func (x *VerifyResponse) GetError() *Error {
+	if x != nil {
+		return x.Error
+	}
+	return nil
+}
+
+func (x *VerifyResponse) GetLog() []string {
+	if x != nil {
+		return x.Log
 	}
 	return nil
 }
@@ -1950,23 +2353,63 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\x10TYPE_UNSPECIFIED\x10\x00\x12\r\n" +
 	"\tTYPE_FULL\x10\x01\x12\r\n" +
 	"\tTYPE_DIFF\x10\x02\x12\r\n" +
-	"\tTYPE_INCR\x10\x03\"n\n" +
+	"\tTYPE_INCR\x10\x03\"\xd3\x02\n" +
+	"\n" +
+	"BackupInfo\x12\x14\n" +
+	"\x05label\x18\x01 \x01(\tR\x05label\x12\x12\n" +
+	"\x04type\x18\x02 \x01(\tR\x04type\x12\x1b\n" +
+	"\tstart_lsn\x18\x03 \x01(\x04R\bstartLsn\x12\x19\n" +
+	"\bstop_lsn\x18\x04 \x01(\x04R\astopLsn\x12#\n" +
+	"\rarchive_start\x18\x05 \x01(\tR\farchiveStart\x12!\n" +
+	"\farchive_stop\x18\x06 \x01(\tR\varchiveStop\x12\x1d\n" +
+	"\n" +
+	"size_bytes\x18\a \x01(\x04R\tsizeBytes\x12&\n" +
+	"\x0frepo_size_bytes\x18\b \x01(\x04R\rrepoSizeBytes\x12\x1d\n" +
+	"\n" +
+	"started_at\x18\t \x01(\x03R\tstartedAt\x12\x1f\n" +
+	"\vfinished_at\x18\n" +
+	" \x01(\x03R\n" +
+	"finishedAt\x12\x14\n" +
+	"\x05prior\x18\v \x01(\tR\x05prior\"\xac\x01\n" +
 	"\x0eBackupResponse\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x1d\n" +
 	"\n" +
 	"backup_ref\x18\x02 \x01(\tR\tbackupRef\x12'\n" +
-	"\x05error\x18\x03 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"\x14\n" +
-	"\x12RestoreInfoRequest\"\x9d\x01\n" +
+	"\x05error\x18\x03 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\x12*\n" +
+	"\x04info\x18\x04 \x01(\v2\x16.pgshard.v1.BackupInfoR\x04info\x12\x10\n" +
+	"\x03log\x18\x05 \x03(\tR\x03log\"\x14\n" +
+	"\x12RestoreInfoRequest\"\xf1\x02\n" +
 	"\x13RestoreInfoResponse\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x1d\n" +
 	"\n" +
 	"backup_ref\x18\x02 \x01(\tR\tbackupRef\x12(\n" +
 	"\x10recovery_end_lsn\x18\x03 \x01(\x04R\x0erecoveryEndLsn\x12'\n" +
-	"\x05error\x18\x04 \x01(\v2\x11.pgshard.v1.ErrorR\x05error*T\n" +
+	"\x05error\x18\x04 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\x12\x16\n" +
+	"\x06stanza\x18\x05 \x01(\tR\x06stanza\x12\x1f\n" +
+	"\vstatus_code\x18\x06 \x01(\x03R\n" +
+	"statusCode\x12%\n" +
+	"\x0estatus_message\x18\a \x01(\tR\rstatusMessage\x12\x1f\n" +
+	"\varchive_min\x18\b \x01(\tR\n" +
+	"archiveMin\x12\x1f\n" +
+	"\varchive_max\x18\t \x01(\tR\n" +
+	"archiveMax\x120\n" +
+	"\abackups\x18\n" +
+	" \x03(\v2\x16.pgshard.v1.BackupInfoR\abackups\"%\n" +
+	"\rExpireRequest\x12\x14\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\"a\n" +
+	"\x0eExpireResponse\x12\x14\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12'\n" +
+	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\x12\x10\n" +
+	"\x03log\x18\x03 \x03(\tR\x03log\"\x0f\n" +
+	"\rVerifyRequest\"a\n" +
+	"\x0eVerifyResponse\x12\x14\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12'\n" +
+	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\x12\x10\n" +
+	"\x03log\x18\x03 \x03(\tR\x03log*T\n" +
 	"\bSlotKind\x12\x19\n" +
 	"\x15SLOT_KIND_UNSPECIFIED\x10\x00\x12\x16\n" +
 	"\x12SLOT_KIND_PHYSICAL\x10\x01\x12\x15\n" +
-	"\x11SLOT_KIND_LOGICAL\x10\x022\xab\a\n" +
+	"\x11SLOT_KIND_LOGICAL\x10\x022\xad\b\n" +
 	"\x05Agent\x12?\n" +
 	"\x06Status\x12\x19.pgshard.v1.StatusRequest\x1a\x1a.pgshard.v1.StatusResponse\x12B\n" +
 	"\aPromote\x12\x1a.pgshard.v1.PromoteRequest\x1a\x1b.pgshard.v1.PromoteResponse\x12?\n" +
@@ -1981,7 +2424,9 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\bDropSlot\x12\x1b.pgshard.v1.DropSlotRequest\x1a\x1c.pgshard.v1.DropSlotResponse\x12H\n" +
 	"\tListSlots\x12\x1c.pgshard.v1.ListSlotsRequest\x1a\x1d.pgshard.v1.ListSlotsResponse\x12?\n" +
 	"\x06Backup\x12\x19.pgshard.v1.BackupRequest\x1a\x1a.pgshard.v1.BackupResponse\x12N\n" +
-	"\vRestoreInfo\x12\x1e.pgshard.v1.RestoreInfoRequest\x1a\x1f.pgshard.v1.RestoreInfoResponseB\xad\x01\n" +
+	"\vRestoreInfo\x12\x1e.pgshard.v1.RestoreInfoRequest\x1a\x1f.pgshard.v1.RestoreInfoResponse\x12?\n" +
+	"\x06Expire\x12\x19.pgshard.v1.ExpireRequest\x1a\x1a.pgshard.v1.ExpireResponse\x12?\n" +
+	"\x06Verify\x12\x19.pgshard.v1.VerifyRequest\x1a\x1a.pgshard.v1.VerifyResponseB\xad\x01\n" +
 	"\x0ecom.pgshard.v1B\n" +
 	"AgentProtoP\x01ZFgithub.com/andrew01234567890/pgshard/internal/gen/pgshard/v1;pgshardv1\xa2\x02\x03PXX\xaa\x02\n" +
 	"Pgshard.V1\xca\x02\n" +
@@ -2000,7 +2445,7 @@ func file_pgshard_v1_agent_proto_rawDescGZIP() []byte {
 }
 
 var file_pgshard_v1_agent_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
-var file_pgshard_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 27)
+var file_pgshard_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 32)
 var file_pgshard_v1_agent_proto_goTypes = []any{
 	(SlotKind)(0),                      // 0: pgshard.v1.SlotKind
 	(StatusResponse_Role)(0),           // 1: pgshard.v1.StatusResponse.Role
@@ -2031,63 +2476,76 @@ var file_pgshard_v1_agent_proto_goTypes = []any{
 	(*Slot)(nil),                       // 26: pgshard.v1.Slot
 	(*ListSlotsResponse)(nil),          // 27: pgshard.v1.ListSlotsResponse
 	(*BackupRequest)(nil),              // 28: pgshard.v1.BackupRequest
-	(*BackupResponse)(nil),             // 29: pgshard.v1.BackupResponse
-	(*RestoreInfoRequest)(nil),         // 30: pgshard.v1.RestoreInfoRequest
-	(*RestoreInfoResponse)(nil),        // 31: pgshard.v1.RestoreInfoResponse
-	(*Error)(nil),                      // 32: pgshard.v1.Error
+	(*BackupInfo)(nil),                 // 29: pgshard.v1.BackupInfo
+	(*BackupResponse)(nil),             // 30: pgshard.v1.BackupResponse
+	(*RestoreInfoRequest)(nil),         // 31: pgshard.v1.RestoreInfoRequest
+	(*RestoreInfoResponse)(nil),        // 32: pgshard.v1.RestoreInfoResponse
+	(*ExpireRequest)(nil),              // 33: pgshard.v1.ExpireRequest
+	(*ExpireResponse)(nil),             // 34: pgshard.v1.ExpireResponse
+	(*VerifyRequest)(nil),              // 35: pgshard.v1.VerifyRequest
+	(*VerifyResponse)(nil),             // 36: pgshard.v1.VerifyResponse
+	(*Error)(nil),                      // 37: pgshard.v1.Error
 }
 var file_pgshard_v1_agent_proto_depIdxs = []int32{
 	1,  // 0: pgshard.v1.StatusResponse.role:type_name -> pgshard.v1.StatusResponse.Role
-	32, // 1: pgshard.v1.StatusResponse.error:type_name -> pgshard.v1.Error
-	32, // 2: pgshard.v1.PromoteResponse.error:type_name -> pgshard.v1.Error
-	32, // 3: pgshard.v1.DemoteResponse.error:type_name -> pgshard.v1.Error
-	32, // 4: pgshard.v1.RewindResponse.error:type_name -> pgshard.v1.Error
+	37, // 1: pgshard.v1.StatusResponse.error:type_name -> pgshard.v1.Error
+	37, // 2: pgshard.v1.PromoteResponse.error:type_name -> pgshard.v1.Error
+	37, // 3: pgshard.v1.DemoteResponse.error:type_name -> pgshard.v1.Error
+	37, // 4: pgshard.v1.RewindResponse.error:type_name -> pgshard.v1.Error
 	2,  // 5: pgshard.v1.RecloneRequest.source_kind:type_name -> pgshard.v1.RecloneRequest.SourceKind
-	32, // 6: pgshard.v1.RecloneResponse.error:type_name -> pgshard.v1.Error
-	32, // 7: pgshard.v1.ReloadResponse.error:type_name -> pgshard.v1.Error
+	37, // 6: pgshard.v1.RecloneResponse.error:type_name -> pgshard.v1.Error
+	37, // 7: pgshard.v1.ReloadResponse.error:type_name -> pgshard.v1.Error
 	3,  // 8: pgshard.v1.RestartRequest.mode:type_name -> pgshard.v1.RestartRequest.Mode
-	32, // 9: pgshard.v1.RestartResponse.error:type_name -> pgshard.v1.Error
-	32, // 10: pgshard.v1.CreateRestorePointResponse.error:type_name -> pgshard.v1.Error
+	37, // 9: pgshard.v1.RestartResponse.error:type_name -> pgshard.v1.Error
+	37, // 10: pgshard.v1.CreateRestorePointResponse.error:type_name -> pgshard.v1.Error
 	0,  // 11: pgshard.v1.CreateSlotRequest.kind:type_name -> pgshard.v1.SlotKind
-	32, // 12: pgshard.v1.CreateSlotResponse.error:type_name -> pgshard.v1.Error
-	32, // 13: pgshard.v1.DropSlotResponse.error:type_name -> pgshard.v1.Error
+	37, // 12: pgshard.v1.CreateSlotResponse.error:type_name -> pgshard.v1.Error
+	37, // 13: pgshard.v1.DropSlotResponse.error:type_name -> pgshard.v1.Error
 	0,  // 14: pgshard.v1.Slot.kind:type_name -> pgshard.v1.SlotKind
 	26, // 15: pgshard.v1.ListSlotsResponse.slots:type_name -> pgshard.v1.Slot
-	32, // 16: pgshard.v1.ListSlotsResponse.error:type_name -> pgshard.v1.Error
+	37, // 16: pgshard.v1.ListSlotsResponse.error:type_name -> pgshard.v1.Error
 	4,  // 17: pgshard.v1.BackupRequest.type:type_name -> pgshard.v1.BackupRequest.Type
-	32, // 18: pgshard.v1.BackupResponse.error:type_name -> pgshard.v1.Error
-	32, // 19: pgshard.v1.RestoreInfoResponse.error:type_name -> pgshard.v1.Error
-	5,  // 20: pgshard.v1.Agent.Status:input_type -> pgshard.v1.StatusRequest
-	7,  // 21: pgshard.v1.Agent.Promote:input_type -> pgshard.v1.PromoteRequest
-	9,  // 22: pgshard.v1.Agent.Demote:input_type -> pgshard.v1.DemoteRequest
-	11, // 23: pgshard.v1.Agent.Rewind:input_type -> pgshard.v1.RewindRequest
-	13, // 24: pgshard.v1.Agent.Reclone:input_type -> pgshard.v1.RecloneRequest
-	15, // 25: pgshard.v1.Agent.Reload:input_type -> pgshard.v1.ReloadRequest
-	17, // 26: pgshard.v1.Agent.Restart:input_type -> pgshard.v1.RestartRequest
-	19, // 27: pgshard.v1.Agent.CreateRestorePoint:input_type -> pgshard.v1.CreateRestorePointRequest
-	21, // 28: pgshard.v1.Agent.CreateSlot:input_type -> pgshard.v1.CreateSlotRequest
-	23, // 29: pgshard.v1.Agent.DropSlot:input_type -> pgshard.v1.DropSlotRequest
-	25, // 30: pgshard.v1.Agent.ListSlots:input_type -> pgshard.v1.ListSlotsRequest
-	28, // 31: pgshard.v1.Agent.Backup:input_type -> pgshard.v1.BackupRequest
-	30, // 32: pgshard.v1.Agent.RestoreInfo:input_type -> pgshard.v1.RestoreInfoRequest
-	6,  // 33: pgshard.v1.Agent.Status:output_type -> pgshard.v1.StatusResponse
-	8,  // 34: pgshard.v1.Agent.Promote:output_type -> pgshard.v1.PromoteResponse
-	10, // 35: pgshard.v1.Agent.Demote:output_type -> pgshard.v1.DemoteResponse
-	12, // 36: pgshard.v1.Agent.Rewind:output_type -> pgshard.v1.RewindResponse
-	14, // 37: pgshard.v1.Agent.Reclone:output_type -> pgshard.v1.RecloneResponse
-	16, // 38: pgshard.v1.Agent.Reload:output_type -> pgshard.v1.ReloadResponse
-	18, // 39: pgshard.v1.Agent.Restart:output_type -> pgshard.v1.RestartResponse
-	20, // 40: pgshard.v1.Agent.CreateRestorePoint:output_type -> pgshard.v1.CreateRestorePointResponse
-	22, // 41: pgshard.v1.Agent.CreateSlot:output_type -> pgshard.v1.CreateSlotResponse
-	24, // 42: pgshard.v1.Agent.DropSlot:output_type -> pgshard.v1.DropSlotResponse
-	27, // 43: pgshard.v1.Agent.ListSlots:output_type -> pgshard.v1.ListSlotsResponse
-	29, // 44: pgshard.v1.Agent.Backup:output_type -> pgshard.v1.BackupResponse
-	31, // 45: pgshard.v1.Agent.RestoreInfo:output_type -> pgshard.v1.RestoreInfoResponse
-	33, // [33:46] is the sub-list for method output_type
-	20, // [20:33] is the sub-list for method input_type
-	20, // [20:20] is the sub-list for extension type_name
-	20, // [20:20] is the sub-list for extension extendee
-	0,  // [0:20] is the sub-list for field type_name
+	37, // 18: pgshard.v1.BackupResponse.error:type_name -> pgshard.v1.Error
+	29, // 19: pgshard.v1.BackupResponse.info:type_name -> pgshard.v1.BackupInfo
+	37, // 20: pgshard.v1.RestoreInfoResponse.error:type_name -> pgshard.v1.Error
+	29, // 21: pgshard.v1.RestoreInfoResponse.backups:type_name -> pgshard.v1.BackupInfo
+	37, // 22: pgshard.v1.ExpireResponse.error:type_name -> pgshard.v1.Error
+	37, // 23: pgshard.v1.VerifyResponse.error:type_name -> pgshard.v1.Error
+	5,  // 24: pgshard.v1.Agent.Status:input_type -> pgshard.v1.StatusRequest
+	7,  // 25: pgshard.v1.Agent.Promote:input_type -> pgshard.v1.PromoteRequest
+	9,  // 26: pgshard.v1.Agent.Demote:input_type -> pgshard.v1.DemoteRequest
+	11, // 27: pgshard.v1.Agent.Rewind:input_type -> pgshard.v1.RewindRequest
+	13, // 28: pgshard.v1.Agent.Reclone:input_type -> pgshard.v1.RecloneRequest
+	15, // 29: pgshard.v1.Agent.Reload:input_type -> pgshard.v1.ReloadRequest
+	17, // 30: pgshard.v1.Agent.Restart:input_type -> pgshard.v1.RestartRequest
+	19, // 31: pgshard.v1.Agent.CreateRestorePoint:input_type -> pgshard.v1.CreateRestorePointRequest
+	21, // 32: pgshard.v1.Agent.CreateSlot:input_type -> pgshard.v1.CreateSlotRequest
+	23, // 33: pgshard.v1.Agent.DropSlot:input_type -> pgshard.v1.DropSlotRequest
+	25, // 34: pgshard.v1.Agent.ListSlots:input_type -> pgshard.v1.ListSlotsRequest
+	28, // 35: pgshard.v1.Agent.Backup:input_type -> pgshard.v1.BackupRequest
+	31, // 36: pgshard.v1.Agent.RestoreInfo:input_type -> pgshard.v1.RestoreInfoRequest
+	33, // 37: pgshard.v1.Agent.Expire:input_type -> pgshard.v1.ExpireRequest
+	35, // 38: pgshard.v1.Agent.Verify:input_type -> pgshard.v1.VerifyRequest
+	6,  // 39: pgshard.v1.Agent.Status:output_type -> pgshard.v1.StatusResponse
+	8,  // 40: pgshard.v1.Agent.Promote:output_type -> pgshard.v1.PromoteResponse
+	10, // 41: pgshard.v1.Agent.Demote:output_type -> pgshard.v1.DemoteResponse
+	12, // 42: pgshard.v1.Agent.Rewind:output_type -> pgshard.v1.RewindResponse
+	14, // 43: pgshard.v1.Agent.Reclone:output_type -> pgshard.v1.RecloneResponse
+	16, // 44: pgshard.v1.Agent.Reload:output_type -> pgshard.v1.ReloadResponse
+	18, // 45: pgshard.v1.Agent.Restart:output_type -> pgshard.v1.RestartResponse
+	20, // 46: pgshard.v1.Agent.CreateRestorePoint:output_type -> pgshard.v1.CreateRestorePointResponse
+	22, // 47: pgshard.v1.Agent.CreateSlot:output_type -> pgshard.v1.CreateSlotResponse
+	24, // 48: pgshard.v1.Agent.DropSlot:output_type -> pgshard.v1.DropSlotResponse
+	27, // 49: pgshard.v1.Agent.ListSlots:output_type -> pgshard.v1.ListSlotsResponse
+	30, // 50: pgshard.v1.Agent.Backup:output_type -> pgshard.v1.BackupResponse
+	32, // 51: pgshard.v1.Agent.RestoreInfo:output_type -> pgshard.v1.RestoreInfoResponse
+	34, // 52: pgshard.v1.Agent.Expire:output_type -> pgshard.v1.ExpireResponse
+	36, // 53: pgshard.v1.Agent.Verify:output_type -> pgshard.v1.VerifyResponse
+	39, // [39:54] is the sub-list for method output_type
+	24, // [24:39] is the sub-list for method input_type
+	24, // [24:24] is the sub-list for extension type_name
+	24, // [24:24] is the sub-list for extension extendee
+	0,  // [0:24] is the sub-list for field type_name
 }
 
 func init() { file_pgshard_v1_agent_proto_init() }
@@ -2102,7 +2560,7 @@ func file_pgshard_v1_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pgshard_v1_agent_proto_rawDesc), len(file_pgshard_v1_agent_proto_rawDesc)),
 			NumEnums:      5,
-			NumMessages:   27,
+			NumMessages:   32,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

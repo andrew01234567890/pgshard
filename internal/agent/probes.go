@@ -34,8 +34,18 @@ type Probes struct {
 	Client        *http.Client
 	// Fenced is called when a primary decides it is isolated.
 	Fenced func()
+	// IsolationGrace is how long a primary must stay isolated (kube API and
+	// every peer unreachable on consecutive probes) before it fences; a
+	// single slow probe under load must not take the primary down. Zero
+	// means DefaultIsolationGrace.
+	IsolationGrace time.Duration
+	// now is the clock; nil means time.Now.
+	now func() time.Time
+
+	isolatedSince time.Time
 
 	once sync.Once
+	mu   sync.Mutex
 }
 
 // Handler returns the probe mux.
@@ -79,15 +89,40 @@ func (p *Probes) livez(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 	err := p.Live(ctx)
-	if err != nil && p.Fenced != nil {
+	if p.isolatedLongEnough(err != nil) && p.Fenced != nil {
 		p.once.Do(p.Fenced)
 	}
 	respond(w, err)
 }
 
+// DefaultIsolationGrace is the isolation window before a primary fences.
+const DefaultIsolationGrace = 30 * time.Second
+
+func (p *Probes) isolatedLongEnough(isolated bool) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !isolated {
+		p.isolatedSince = time.Time{}
+		return false
+	}
+	now := time.Now
+	if p.now != nil {
+		now = p.now
+	}
+	if p.isolatedSince.IsZero() {
+		p.isolatedSince = now()
+		return false
+	}
+	grace := p.IsolationGrace
+	if grace == 0 {
+		grace = DefaultIsolationGrace
+	}
+	return now().Sub(p.isolatedSince) >= grace
+}
+
 // Live implements /livez. A standby is always live. A primary is live when
-// the kube API answers; without it, only when every peer's /failsafe
-// answers, so an isolated primary fences itself.
+// the kube API answers or, without it, when at least one peer's /failsafe
+// answers; a primary that reaches nothing is isolated.
 func (p *Probes) Live(ctx context.Context) error {
 	if !p.Health.IsPrimary() {
 		return nil
@@ -104,6 +139,7 @@ func (p *Probes) Live(ctx context.Context) error {
 	if client == nil {
 		client = &http.Client{Timeout: 2 * time.Second}
 	}
+	var errs []error
 	for _, peer := range p.Peers {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, peer, nil)
 		if err != nil {
@@ -111,14 +147,20 @@ func (p *Probes) Live(ctx context.Context) error {
 		}
 		resp, err := client.Do(req)
 		if err != nil {
-			return fmt.Errorf("peer %s unreachable: %w", peer, err)
+			errs = append(errs, fmt.Errorf("peer %s unreachable: %w", peer, err))
+			continue
 		}
 		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("peer %s returned %d", peer, resp.StatusCode)
+			errs = append(errs, fmt.Errorf("peer %s returned %d", peer, resp.StatusCode))
+			continue
 		}
+		return nil
 	}
-	return nil
+	if len(errs) == 0 {
+		return errors.New("kube API unreachable and no peers configured")
+	}
+	return fmt.Errorf("kube API unreachable and every peer failed: %w", errors.Join(errs...))
 }
 
 func respond(w http.ResponseWriter, err error) {

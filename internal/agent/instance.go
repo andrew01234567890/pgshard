@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/andrew01234567890/pgshard/internal/agent/backup"
 )
 
 // Instance drives one PostgreSQL data directory through its lifecycle.
@@ -27,6 +29,8 @@ type Instance struct {
 	waitSourceFn func(ctx context.Context, source string) error
 	// cloneRetry is the pause between bootstrap clone attempts.
 	cloneRetry time.Duration
+	// newRunner overrides the pgbackrest runner in tests.
+	newRunner func(backup.Settings) *backup.Runner
 }
 
 // NewInstance wires an Instance from its parts.

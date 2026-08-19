@@ -9,6 +9,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/andrew01234567890/pgshard/internal/agent/backup"
 )
 
 // Role is the bootstrap role of an instance.
@@ -58,6 +60,9 @@ type Config struct {
 	// SettingsHash identifies the operator-rendered settings; Reload reports
 	// it back so the operator can tell a stale volume from an applied change.
 	SettingsHash string `json:"settingsHash,omitempty"`
+	// Backup, when set, turns on WAL archiving to the pgBackRest repository
+	// and lets the primary take backups.
+	Backup *backup.Settings `json:"backup,omitempty"`
 
 	// path is where the config was loaded from; Refresh rereads it.
 	path string
@@ -150,6 +155,7 @@ func (c *Config) Refresh() error {
 	c.Postgres.Parameters = fresh.Postgres.Parameters
 	c.OverrideFile = fresh.OverrideFile
 	c.SettingsHash = fresh.SettingsHash
+	c.Backup = fresh.Backup
 	return nil
 }
 
@@ -226,6 +232,11 @@ func (c *Config) Validate() error {
 	}
 	if c.Lease.Enabled && c.Lease.Namespace == "" {
 		errs = append(errs, errors.New("lease.namespace is required when lease.enabled"))
+	}
+	if c.Backup != nil {
+		if err := c.Backup.WithDefaults().Validate(); err != nil {
+			errs = append(errs, fmt.Errorf("backup: %w", err))
+		}
 	}
 	return errors.Join(errs...)
 }

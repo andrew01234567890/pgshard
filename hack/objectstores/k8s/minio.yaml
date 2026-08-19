@@ -18,7 +18,7 @@ spec:
     spec:
       containers:
         - name: minio
-          image: minio/minio:RELEASE.2025-10-15T17-29-55Z
+          image: minio/minio:RELEASE.2025-09-07T16-13-09Z
           args: ["server", "/data", "--console-address", ":9001"]
           env:
             - {name: MINIO_ROOT_USER, value: minioadmin}
@@ -37,3 +37,20 @@ spec:
   ports:
     - {name: api, port: 9000, targetPort: 9000}
     - {name: console, port: 9001, targetPort: 9001}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-create-bucket
+  namespace: objectstores
+spec:
+  backoffLimit: 20
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+          command: ["/bin/sh", "-c"]
+          args:
+            - mc alias set store http://minio.objectstores.svc:9000 minioadmin minioadmin && mc mb --ignore-existing store/pgshard

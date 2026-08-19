@@ -7,6 +7,7 @@ toolchain go1.26.6
 require github.com/jackc/pgx/v5 v5.10.0
 
 require (
+	github.com/robfig/cron/v3 v3.0.1
 	google.golang.org/grpc v1.83.0
 	google.golang.org/protobuf v1.36.12
 	k8s.io/api v0.36.3

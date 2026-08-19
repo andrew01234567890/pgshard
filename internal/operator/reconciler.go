@@ -22,6 +22,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
@@ -70,6 +71,8 @@ func (r *ClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&policyv1.PodDisruptionBudget{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
+		Watches(&pgshardv1alpha1.PgShardBackupPolicy{}, handler.EnqueueRequestsFromMapFunc(r.policyToClusters)).
+		Watches(&pgshardv1alpha1.PgShardBackup{}, handler.EnqueueRequestsFromMapFunc(backupToCluster)).
 		Named("pgshardcluster").
 		Complete(r)
 }
@@ -116,6 +119,8 @@ type groupObservation struct {
 	tuningErr error
 	// rollout is the rolling step in flight or held, nil when idle.
 	rollout *pgshardv1alpha1.GroupRollout
+	// policy is the backup policy bound to the cluster, nil when none.
+	policy *pgshardv1alpha1.PgShardBackupPolicy
 }
 
 func (o groupObservation) streamingCount() int {
@@ -151,9 +156,13 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
+	policy, backupCond, err := r.backupState(ctx, &cluster)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	var observations []groupObservation
 	for _, g := range Groups(&cluster) {
-		obs, err := r.reconcileGroup(ctx, &cluster, g, password)
+		obs, err := r.reconcileGroup(ctx, &cluster, g, password, policy)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("group %s: %w", g.Name(), err)
 		}
@@ -167,7 +176,7 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, fmt.Errorf("router: %w", err)
 	}
 	catalogReady := r.reconcileCatalogSchema(ctx, &cluster, observations, password)
-	if err := r.updateStatus(ctx, &cluster, observations, catalogReady); err != nil {
+	if err := r.updateStatus(ctx, &cluster, observations, catalogReady, backupCond); err != nil {
 		return ctrl.Result{}, err
 	}
 	requeue := requeueReady
@@ -296,8 +305,8 @@ func (r *ClusterReconciler) loadState(ctx context.Context, c *pgshardv1alpha1.Pg
 	return st, nil
 }
 
-func (r *ClusterReconciler) ensureConfigMap(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, primary string, tuning pgtune.Settings) error {
-	desired := r.Renderer.ConfigMap(c, g, primary, tuning)
+func (r *ClusterReconciler) ensureConfigMap(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, primary string, tuning pgtune.Settings, pol *pgshardv1alpha1.PgShardBackupPolicy) error {
+	desired := r.Renderer.ConfigMap(c, g, primary, tuning, pol)
 	cm := &corev1.ConfigMap{ObjectMeta: desired.ObjectMeta}
 	return r.ensureOwned(ctx, c, cm, func() error {
 		cm.Labels = desired.Labels
@@ -306,8 +315,8 @@ func (r *ClusterReconciler) ensureConfigMap(ctx context.Context, c *pgshardv1alp
 	})
 }
 
-func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, password string) (groupObservation, error) {
-	obs := groupObservation{group: g, streaming: map[string]bool{}, replicasWant: g.Replicas - 1}
+func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, password string, pol *pgshardv1alpha1.PgShardBackupPolicy) (groupObservation, error) {
+	obs := groupObservation{group: g, streaming: map[string]bool{}, replicasWant: g.Replicas - 1, policy: pol}
 
 	state, err := r.loadState(ctx, c, g)
 	if err != nil {
@@ -315,7 +324,7 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 	}
 	obs.state = state
 	obs.tuning, obs.tuningErr = Tuning(c, g)
-	obs.template = Template(c, obs.tuning)
+	obs.template = Template(c, obs.tuning, pol)
 	if err := r.ensureSettings(ctx, c, g, &obs, password); err != nil {
 		return obs, err
 	}
@@ -400,7 +409,7 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 			if err != nil {
 				return obs, err
 			}
-			if err := r.ensureConfigMap(ctx, c, g, state.primary, obs.tuning); err != nil {
+			if err := r.ensureConfigMap(ctx, c, g, state.primary, obs.tuning, obs.policy); err != nil {
 				return obs, err
 			}
 		}
@@ -472,7 +481,7 @@ func (r *ClusterReconciler) ensureSettings(ctx context.Context, c *pgshardv1alph
 			return err
 		}
 	}
-	return r.ensureConfigMap(ctx, c, g, obs.state.primary, obs.tuning)
+	return r.ensureConfigMap(ctx, c, g, obs.state.primary, obs.tuning, obs.policy)
 }
 
 func ordinalOf(g Group, member string) int {
@@ -542,7 +551,7 @@ func (r *ClusterReconciler) switchover(ctx context.Context, c *pgshardv1alpha1.P
 	if err != nil {
 		return obs, err
 	}
-	if err := r.ensureConfigMap(ctx, c, g, state.primary, obs.tuning); err != nil {
+	if err := r.ensureConfigMap(ctx, c, g, state.primary, obs.tuning, obs.policy); err != nil {
 		return obs, err
 	}
 	obs = r.finishGroup(ctx, c, g, obs, members)
@@ -644,7 +653,7 @@ func (r *ClusterReconciler) reconcileCatalogSchema(ctx context.Context, c *pgsha
 	return cond
 }
 
-func (r *ClusterReconciler) updateStatus(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, obs []groupObservation, catalogReady metav1.Condition) error {
+func (r *ClusterReconciler) updateStatus(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, obs []groupObservation, catalogReady, backupCond metav1.Condition) error {
 	ready := true
 	primaryOK := true
 	replOK := true
@@ -696,6 +705,7 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, c *pgshardv1alpha1
 	set(pgshardv1alpha1.ConditionReplicationHealthy, replOK, boolReason(replOK, "AllStreaming", "ReplicasMissing"), "")
 	set(pgshardv1alpha1.ConditionProgressing, !ready, boolReason(!ready, "Reconciling", "Stable"), "")
 	meta.SetStatusCondition(&c.Status.Conditions, catalogReady)
+	meta.SetStatusCondition(&c.Status.Conditions, backupCond)
 	r.setRolloutStatus(c, obs, set)
 	c.Status.ObservedGeneration = c.Generation
 	c.Status.Shards = shards

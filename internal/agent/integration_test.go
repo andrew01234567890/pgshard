@@ -15,9 +15,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/status"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 )
@@ -73,6 +71,8 @@ type harness struct {
 	cfgDir string
 	suffix string
 	nodes  map[string]*node
+	// extra is merged into every member config (backup settings and the like).
+	extra map[string]any
 }
 
 func docker(t *testing.T, args ...string) string {
@@ -118,6 +118,9 @@ func (h *harness) writeConfig(member string, role Role, source string, peers []s
 		"podCIDR":         "0.0.0.0/0", "peerFailsafeURLs": peers,
 		"lease":           map[string]any{"enabled": false},
 		"shutdownTimeout": "20s",
+	}
+	for k, v := range h.extra {
+		cfg[k] = v
 	}
 	b, _ := json.Marshal(cfg)
 	path := filepath.Join(h.cfgDir, member+".json")
@@ -361,7 +364,7 @@ func runAgentSuite(t *testing.T, image, bin string) {
 		t.Fatalf("recloned standby rows: %s", got)
 	}
 
-	t.Log("slot RPCs and unimplemented RPCs")
+	t.Log("slot RPCs and backup RPCs without a policy")
 	cs, err := s.grpc.CreateSlot(ctx, &pgshardv1.CreateSlotRequest{Epoch: 1, Name: "extra", Kind: pgshardv1.SlotKind_SLOT_KIND_PHYSICAL})
 	if err != nil || cs.GetError() != nil {
 		t.Fatalf("create slot: %v %v", cs, err)
@@ -377,14 +380,14 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	if err != nil || rp.GetError() != nil || rp.GetLsn() == 0 {
 		t.Fatalf("restore point: %v %v", rp, err)
 	}
-	if _, err := s.grpc.Backup(ctx, &pgshardv1.BackupRequest{Epoch: 1}); status.Code(err) != codes.Unimplemented {
-		t.Fatalf("backup: %v", err)
+	if bk, err := s.grpc.Backup(ctx, &pgshardv1.BackupRequest{Epoch: 1}); err != nil || !strings.Contains(bk.GetError().GetMessage(), "no backup policy") {
+		t.Fatalf("backup without policy: %v %v", bk, err)
 	}
-	if _, err := s.grpc.RestoreInfo(ctx, &pgshardv1.RestoreInfoRequest{}); status.Code(err) != codes.Unimplemented {
-		t.Fatalf("restore info: %v", err)
+	if ri, err := s.grpc.RestoreInfo(ctx, &pgshardv1.RestoreInfoRequest{}); err != nil || !strings.Contains(ri.GetError().GetMessage(), "no backup policy") {
+		t.Fatalf("restore info without policy: %v %v", ri, err)
 	}
 	if s.status().GetEpoch() != 1 {
-		t.Fatalf("epoch after unimplemented backup: %d", s.status().GetEpoch())
+		t.Fatalf("epoch after refused backup: %d", s.status().GetEpoch())
 	}
 
 	t.Log("restart RPC")

@@ -21,7 +21,7 @@ jobs:
       fail-fast: false
       matrix:
         pg: [18, 19]
-        suite: [smoke, operator]
+        suite: [smoke, operator, backup]
     env:
       PG_MAJOR: ${{ matrix.pg }}
       E2E_ARTIFACTS: ${{ github.workspace }}/artifacts/e2e-pg${{ matrix.pg }}-${{ matrix.suite }}
@@ -36,9 +36,9 @@ jobs:
           version: v0.32.0
           install_only: true
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-        if: matrix.suite == 'operator'
+        if: matrix.suite != 'smoke'
       - name: Build PostgreSQL image
-        if: matrix.suite == 'operator'
+        if: matrix.suite != 'smoke'
         uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7.3.0
         with:
           source: .
@@ -47,14 +47,14 @@ jobs:
         env:
           CI: "true"
       - name: Build operator and admin images
-        if: matrix.suite == 'operator'
+        if: matrix.suite != 'smoke'
         run: |
           docker build -f Dockerfile.control --build-arg CMD=pgshard-operator -t pgshard-operator:e2e .
           docker build -f Dockerfile.control --build-arg CMD=pgshard-admin -t pgshard-admin:e2e .
       - name: Create kind cluster
         run: hack/kind/up.sh
       - name: Load images into kind
-        if: matrix.suite == 'operator'
+        if: matrix.suite != 'smoke'
         run: hack/kind/load-images.sh pgshard-operator:e2e pgshard-admin:e2e "ghcr.io/andrew01234567890/pgshard-postgres:${PG_MAJOR}"
       - name: Run e2e suite
         run: |
@@ -63,6 +63,7 @@ jobs:
           case "$E2E_SUITE" in
             smoke) go test -tags e2e -count=1 -v -run 'Smoke' ./test/e2e/... 2>&1 | tee "$E2E_ARTIFACTS/go-test.log" ;;
             operator) go test -tags e2e -count=1 -v -timeout 40m ./test/e2e/operator/... 2>&1 | tee "$E2E_ARTIFACTS/go-test.log" ;;
+            backup) go test -tags e2e -count=1 -v -timeout 40m ./test/e2e/backup/... 2>&1 | tee "$E2E_ARTIFACTS/go-test.log" ;;
             *) echo "unknown suite $E2E_SUITE" >&2; exit 1 ;;
           esac
         env:

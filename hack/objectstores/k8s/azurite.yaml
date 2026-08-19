@@ -19,7 +19,7 @@ spec:
       containers:
         - name: azurite
           image: mcr.microsoft.com/azure-storage/azurite:3.36.0
-          args: ["azurite-blob", "--blobHost", "0.0.0.0", "--blobPort", "10000"]
+          args: ["azurite-blob", "--blobHost", "0.0.0.0", "--blobPort", "10000", "--disableProductStyleUrl"]
           ports:
             - {containerPort: 10000, name: blob}
 ---

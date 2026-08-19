@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type fakeHealth struct {
@@ -98,12 +99,33 @@ func TestLivezPrimaryFallsBackToPeersAndSelfFences(t *testing.T) {
 		t.Fatal("all peers reachable: primary should be live")
 	}
 	p.Peers = append(p.Peers, down.URL+"/failsafe")
-	if get(t, p.Handler(), "/livez") != 500 {
-		t.Fatal("a failing peer must make the primary not live")
+	if get(t, p.Handler(), "/livez") != 200 {
+		t.Fatal("one reachable peer keeps the primary live")
 	}
+	p.Peers = []string{down.URL + "/failsafe"}
+	clock := time.Unix(0, 0)
+	p.now = func() time.Time { return clock }
+	if get(t, p.Handler(), "/livez") != 500 || fenced.Load() != 0 {
+		t.Fatal("first isolated probe must fail but not fence")
+	}
+	clock = clock.Add(DefaultIsolationGrace - time.Second)
+	get(t, p.Handler(), "/livez")
+	if fenced.Load() != 0 {
+		t.Fatal("isolation shorter than the grace must not fence")
+	}
+	p.Peers = []string{up.URL + "/failsafe"}
+	get(t, p.Handler(), "/livez")
+	p.Peers = []string{down.URL + "/failsafe"}
+	clock = clock.Add(DefaultIsolationGrace)
+	get(t, p.Handler(), "/livez")
+	if fenced.Load() != 0 {
+		t.Fatal("a recovered probe resets the isolation window")
+	}
+	clock = clock.Add(DefaultIsolationGrace)
+	get(t, p.Handler(), "/livez")
 	get(t, p.Handler(), "/livez")
 	if fenced.Load() != 1 {
-		t.Fatalf("fenced %d times, want exactly once", fenced.Load())
+		t.Fatalf("fenced %d times, want exactly once after the grace", fenced.Load())
 	}
 	p2 := &Probes{Health: &fakeHealth{primary: true}, KubeReachable: func(context.Context) bool { return false }}
 	if get(t, p2.Handler(), "/livez") != 500 {

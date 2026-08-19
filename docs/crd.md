@@ -41,15 +41,17 @@ Fenced, BackupHealthy, Resharding, ServingWrites, RouterReady, TuningApplied), `
 Status-only mirror of one replication group. `spec{clusterRef, kind: catalog|shard, shardId}`;
 `status{primary, epoch, members[]}`.
 
-## PgShardBackupPolicy
+## PgShardBackupPolicy (status subresource)
 
-`spec.objectStore{type: s3|azure|gcs|posix|sftp, bucket, container, endpoint, region, prefix, credentials.secretRef, encryption.secretRef}`,
-`spec.schedules{full, differential, incremental}` (cron), `spec.retention{full, differential}`.
+`spec.objectStore{type: s3|azure|gcs|posix|sftp, bucket, container, endpoint, region, prefix, uriStyle: host|path, verifyTLS, credentialType, credentials.secretRef, encryption.secretRef, sftp{host, user, port, hostKeyCheck}}`,
+`spec.schedules{full, differential, incremental}` (five-field cron), `spec.retention{full, differential}`, `spec.logLevel`, `spec.processMax`.
+Clusters bind through `spec.backup.policyRef`. `status{observedGeneration, clusters[]{name, lastFullTime, lastDifferentialTime, lastIncrementalTime, healthy, message}, conditions: Valid, BackupHealthy}`.
+See [backup.md](backup.md).
 
 ## PgShardBackup (status subresource)
 
 `spec{clusterName, type: full|differential|incremental (default full)}`;
-`status{phase, backupId, startedAt, completedAt, conditions}`.
+`status{phase: Pending|Running|Completed|Failed, backupId, startedAt, completedAt, groups[]{group, stanza, backupId, startLSN, stopLSN, walStart, walStop, sizeBytes, repoSizeBytes, startedAt, completedAt, duration, error}, error, conditions: Progressing, RetentionApplied}`.
 
 ## PgShardRestore (status subresource)
 
