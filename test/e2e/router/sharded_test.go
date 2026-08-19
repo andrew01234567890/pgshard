@@ -25,10 +25,17 @@ type shardedStack struct {
 
 func startShardedStack(tb testing.TB) *shardedStack {
 	tb.Helper()
-	s := &shardedStack{stack: startStack(tb)}
+	return startShardedStackWith(tb, nil, nil)
+}
+
+// startShardedStackWith is startShardedStack with PostgreSQL options per
+// shard.
+func startShardedStackWith(tb testing.TB, shard0Opts, shard1Opts []string) *shardedStack {
+	tb.Helper()
+	s := &shardedStack{stack: startStackWith(tb, shard0Opts)}
 	poolerBin, _ := buildBinaries(tb)
 	var shard1Addr string
-	shard1Addr, s.shard1DSN = startPostgres(tb, "shard1")
+	shard1Addr, s.shard1DSN = startPostgres(tb, "shard1", shard1Opts...)
 	pooler1 := fmt.Sprintf("127.0.0.1:%d", freePort(tb))
 	err := router.DevBootstrap{CatalogDSN: s.catalogDSN, ShardDSN: s.shard1DSN, ShardID: 1, Database: appDatabase, Role: appRole,
 		Password: appPassword, PoolerEndpoint: pooler1, Epoch: 1}.Run(context.Background())
@@ -72,6 +79,25 @@ func startShardedStack(tb testing.TB) *shardedStack {
 		_ = conn.Close(ctx)
 	}
 	return s
+}
+
+// awaitSharded waits until the router's snapshot follows the catalog
+// through LISTEN/NOTIFY and knows the table as sharded (a locking scatter is
+// then refused).
+func (s *shardedStack) awaitSharded(tb testing.TB, conn *pgx.Conn) {
+	tb.Helper()
+	ctx := context.Background()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		_, err := conn.Exec(ctx, "select * from orders for update", pgx.QueryExecModeSimpleProtocol)
+		if sqlstate(err) == "0A000" {
+			return
+		}
+		if time.Now().After(deadline) {
+			tb.Fatalf("router never learned the sharded placement (last: %v)\nrouter log:\n%s", err, s.routerLog.String())
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 // shardOf maps a tenant to the shard of the two-way split above.
@@ -118,19 +144,7 @@ func TestRouterShardedRouting(t *testing.T) {
 			t1 = i
 		}
 	}
-	// The router's snapshot follows the catalog through LISTEN/NOTIFY; wait
-	// until the table is known as sharded (a locking scatter is then refused).
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		_, err := conn.Exec(ctx, "select * from orders for update", pgx.QueryExecModeSimpleProtocol)
-		if sqlstate(err) == "0A000" {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("router never learned the sharded placement (last: %v)\nrouter log:\n%s", err, s.routerLog.String())
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
+	s.awaitSharded(t, conn)
 	if _, err := conn.Exec(ctx, "insert into orders (tenant_id, id) values ($1, $2)", t1, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +193,7 @@ func TestRouterShardedRouting(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, err = tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 201)", t1)
-		if sqlstate(err) != "0A000" || !strings.Contains(err.Error(), "multi-shard transactions are not available yet") {
+		if sqlstate(err) != "0A000" || !strings.Contains(err.Error(), "cannot take part in a multi-shard transaction") {
 			t.Fatalf("second shard inside a transaction: %v", err)
 		}
 		if err := tx.Commit(ctx); err != nil {

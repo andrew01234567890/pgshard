@@ -37,6 +37,30 @@ type fakePooler struct {
 	executed []string
 	// scripts answers exact (lowercased) statements with canned results.
 	scripts map[string]script
+	// maxPrepared answers SHOW max_prepared_transactions ("64" when empty);
+	// failPrepare makes PREPARE TRANSACTION fail; prepared lists the gids
+	// currently prepared on the shard.
+	maxPrepared string
+	failPrepare bool
+	prepared    []string
+}
+
+func (f *fakePooler) preparedGIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.prepared...)
+}
+
+func (f *fakePooler) dropPrepared(gid string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, g := range f.prepared {
+		if g == gid {
+			f.prepared = append(f.prepared[:i], f.prepared[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
 // script is a canned answer: an error, or typed columns and rows where the
@@ -299,6 +323,35 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 	case q == "rollback":
 		b.tx = 'I'
 		return true, s.complete("ROLLBACK")
+	case q == "show max_prepared_transactions":
+		v := s.f.maxPrepared
+		if v == "" {
+			v = "64"
+		}
+		if err := s.rowDesc("max_prepared_transactions", 25); err != nil {
+			return true, err
+		}
+		if err := s.row(v); err != nil {
+			return true, err
+		}
+		return true, s.complete("SHOW")
+	case strings.HasPrefix(q, "prepare transaction '"):
+		gid := strings.TrimSuffix(strings.TrimPrefix(q, "prepare transaction '"), "'")
+		b.tx = 'I'
+		if s.f.failPrepare {
+			return true, s.errorf("55000", "prepare refused by the fake shard")
+		}
+		s.f.mu.Lock()
+		s.f.prepared = append(s.f.prepared, gid)
+		s.f.mu.Unlock()
+		return true, s.complete("PREPARE TRANSACTION")
+	case strings.HasPrefix(q, "commit prepared '"), strings.HasPrefix(q, "rollback prepared '"):
+		verb, rest, _ := strings.Cut(q, " prepared '")
+		gid := strings.TrimSuffix(rest, "'")
+		if !s.f.dropPrepared(gid) {
+			return true, s.errorf("42704", "prepared transaction with identifier \""+gid+"\" does not exist")
+		}
+		return true, s.complete(strings.ToUpper(verb) + " PREPARED")
 	case strings.HasPrefix(q, "set "):
 		name, val, _ := strings.Cut(strings.TrimPrefix(q, "set "), " to ")
 		if !strings.Contains(q, " to ") {

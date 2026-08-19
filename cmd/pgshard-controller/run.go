@@ -12,6 +12,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -46,6 +48,10 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	interval := fs.Duration("reconcile-interval", 30*time.Second, "longest time between reconcile passes without a catalog notification")
 	retry := fs.Duration("election-retry", 5*time.Second, "time between leadership attempts")
 	lockKey := fs.Int64("leader-lock-key", controller.LeaderLockKey, "pg_advisory_lock key that elects the leader")
+	resolveEvery := fs.Duration("resolve-interval", 5*time.Second, "time between in-doubt transaction resolution passes")
+	shardDSNTemplate := fs.String("shard-dsn-template", "", "superuser DSN for shard primaries with {set}, {id} and {group} placeholders (enables the resolver)")
+	var shardDSNs shardDSNFlag
+	fs.Var(&shardDSNs, "shard-dsn", "explicit shard DSN as <set>/<id>=<dsn>; repeatable")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return cli.ExitOK
@@ -83,6 +89,12 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 
 	rec := &controller.Reconciler{DSN: *catalogDSN, Logger: logger, LockKey: *lockKey, Interval: *interval, RetryInterval: *retry}
 	go func() { _ = rec.Run(ctx) }()
+	var resolver *controller.Resolver
+	if *shardDSNTemplate != "" || len(shardDSNs) > 0 {
+		resolver = &controller.Resolver{Pool: pool, Logger: logger,
+			Shards: &controller.PgxShardDialer{Pool: pool, DSNs: shardDSNs, Template: *shardDSNTemplate}}
+		go resolver.Run(ctx, *resolveEvery)
+	}
 
 	if *listen == "" {
 		fmt.Fprintln(stdout, "pgshard-controller run: reconciling without a gRPC listener")
@@ -95,7 +107,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return cli.ExitNotReady
 	}
 	g := grpc.NewServer(grpc.Creds(creds))
-	pgshardv1.RegisterControllerServer(g, &controller.Server{Pool: pool})
+	pgshardv1.RegisterControllerServer(g, &controller.Server{Pool: pool, Resolver: resolver})
 	mode := "mTLS"
 	if *insecureDev {
 		mode = "INSECURE plaintext"
@@ -138,4 +150,29 @@ func listenerCredentials(certFile, keyFile, caFile string, insecureDev bool) (cr
 	}
 	return credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}, ClientCAs: pool,
 		ClientAuth: tls.RequireAndVerifyClientCert, MinVersion: tls.VersionTLS13}), nil
+}
+
+// shardDSNFlag collects --shard-dsn <set>/<id>=<dsn> values.
+type shardDSNFlag map[controller.ShardRef]string
+
+func (f *shardDSNFlag) String() string { return fmt.Sprint(len(*f), " shard DSNs") }
+
+func (f *shardDSNFlag) Set(v string) error {
+	key, dsn, ok := strings.Cut(v, "=")
+	if !ok {
+		return errors.New("expected <set>/<id>=<dsn>")
+	}
+	set, idText, ok := strings.Cut(key, "/")
+	if !ok {
+		return errors.New("expected <set>/<id>=<dsn>")
+	}
+	id, err := strconv.ParseInt(idText, 10, 32)
+	if err != nil {
+		return fmt.Errorf("shard id %q: %w", idText, err)
+	}
+	if *f == nil {
+		*f = shardDSNFlag{}
+	}
+	(*f)[controller.ShardRef{Set: set, ID: int32(id)}] = dsn
+	return nil
 }

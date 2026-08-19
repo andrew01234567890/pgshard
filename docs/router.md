@@ -7,8 +7,9 @@ shard's `pgshard-pooler` over gRPC. The planner (`internal/router/plan`)
 resolves every statement to the shards it touches from the catalog snapshot;
 the executor runs plans that need one shard directly, fans read-only
 `SELECT`s over several shards out through a streaming merge (*Scatter*
-below) and refuses the rest with `0A000` until cross-shard transactions
-(M3.4) and multi-shard writes (M3.5) land. See *Routing* below.
+below), coordinates transactions that write to several shards with
+two-phase commit (*Transactions* below) and refuses the rest with `0A000`
+until multi-shard writes (M3.5) land. See *Routing* below.
 
 ## Startup and authentication
 
@@ -52,7 +53,8 @@ below) and refuses the rest with `0A000` until cross-shard transactions
   parse is forwarded to the home shard so the backend reports it.
 - **Transactions.** `BEGIN` … `COMMIT`/`ROLLBACK` are forwarded; the pooler
   keeps the backend while its `ReadyForQuery` status is not idle. The
-  router's own status indicator is the pooler's.
+  router's own status indicator is the pooler's. A transaction that touches
+  several shards is coordinated by the router; see *Transactions* below.
 - **Session state.** Session-level `SET`/`RESET` (not `SET LOCAL`) and named
   prepared statements make the session *pinned*: the router calls `Reserve`
   and the pooler dedicates a backend. When a transaction ends the router
@@ -128,14 +130,12 @@ batch (everything up to `Sync`) must target one shard, else `0A000`
 "statements of one batch target different shards".
 
 **Transactions.** A session moves between shards freely while idle. Inside
-a transaction block the session is pinned to the first shard a statement
-touched; a statement for another shard is refused with `0A000` "multi-shard
-transactions are not available yet: transaction is on shard default/0,
-statement needs shard default/3" and the transaction stays open. `BEGIN` and
-other session-local statements do not pin: they are recorded as the
-transaction's *prelude* and replayed on the shard of the first real
-statement (`BEGIN; INSERT INTO sharded …` works). Named prepared statements
-and session GUCs are replayed on every shard the session moves to.
+a transaction block the session opens one backend per shard it touches
+(see *Transactions*). `BEGIN` and other session-local statements do not
+pin: they are recorded as the transaction's *prelude* and replayed on the
+shard of the first real statement and on every further participant
+(`BEGIN; INSERT INTO sharded …` works). Named prepared statements and
+session GUCs are replayed on every shard the session moves to.
 
 **Scatter (multi-shard reads).** A read-only `SELECT` over **one sharded
 table** whose plan needs several shards (no key predicate, or `IN` spanning
@@ -216,6 +216,102 @@ waiting is honoured.
 DDL on unsharded tables goes to the home shard, an interim until DDL
 fan-out (M4). Reference reads pick a shard from the session id so they
 spread across the shard set.
+
+## Transactions
+
+A transaction starts on the shard of its first real statement (session-local
+statements such as `BEGIN` and `SET` are replayed there). Every further shard
+it touches gets its own backend, on which the router replays the session's
+GUCs and the transaction prelude (`BEGIN`, `SET LOCAL`, ...), and is tracked
+as a *participant* with a read/write flag. A read on another shard is always
+allowed and needs no prepare. Reads run at READ COMMITTED on independent
+snapshots per shard; there is no cross-shard snapshot.
+
+### Modes
+
+`SET pgshard.transaction_mode = twopc | single` (session GUC, default
+`twopc`; also replayed with the session's other GUCs):
+
+- **twopc.** The first write to a *second* shard escalates the transaction:
+  the router allocates a global identifier
+  `pgshard-<router instance>-<session id>-<seq>` and checks, once per shard
+  and cached, that the shard's PostgreSQL has `max_prepared_transactions > 0`
+  (`0A000` otherwise, naming the shard). Nothing else changes until
+  `COMMIT`.
+- **single.** The second writable shard is refused with `0A000`; the
+  transaction stays open on its shards and can be rolled back or committed.
+
+`SAVEPOINT`/`RELEASE`/`ROLLBACK TO` and `COMMIT`/`ROLLBACK AND CHAIN` are
+refused (`0A000`) once a transaction spans several shards. Client-issued
+`PREPARE TRANSACTION`, `COMMIT PREPARED` and `ROLLBACK PREPARED` are always
+refused: those statements belong to the coordinator.
+
+### Commit
+
+`COMMIT` on a transaction with **at most one writing participant** commits
+that shard plainly and rolls back the read-only participants; the decision
+log is never touched. This is the common path.
+
+With **two or more writers** the router runs two-phase commit against the
+catalog table `pgshard.xact_decisions`:
+
+1. `INSERT` a decision row `state = preparing` with the writer shard ids,
+   committed synchronously (`synchronous_commit = on`) so it is durable on
+   the catalog before anything is prepared. Failure here rolls the
+   transaction back on every shard and reports `08006`.
+2. `PREPARE TRANSACTION '<gid>'` on every writer in parallel; readers roll
+   back. PostgreSQL itself waits for the shard's synchronous standbys. Any
+   failure: `ROLLBACK PREPARED` where prepared, `ROLLBACK` elsewhere, the
+   row is marked `abort` and deleted, the client gets the shard's error.
+3. **The decision.** `UPDATE ... SET state = 'commit' WHERE gid = $1 AND
+   state = 'preparing'`, again synchronously committed. This single-row
+   update is the point of no return. If it updates no row the resolver
+   already aborted the transaction (a router presumed dead): the router
+   rolls the prepared transactions back and reports `40000`. If the update
+   *fails* (catalog unreachable) the router does not know whether the
+   decision landed: it reports `08007` (`transaction_resolution_unknown`),
+   leaves the participants prepared and increments the in-doubt counter;
+   the resolver finishes the transaction either way.
+4. `COMMIT PREPARED '<gid>'` on every writer. A failure here is logged and
+   counted as in-doubt but does **not** fail the client: the decision is
+   durable and the resolver commits the remaining participants.
+5. When every participant committed the decision row is deleted.
+
+**What success means.** The client sees `COMMIT` only after step 3 is
+durable, so a successful `COMMIT` is committed on every shard eventually,
+even if the router dies right afterwards. An error from `COMMIT` other than
+`08007` means the transaction rolled back everywhere. `ROLLBACK` rolls back
+every participant and never touches the decision log.
+
+The `/metrics` endpoint on the health listener exposes
+`pgshard_router_in_doubt_transactions_total`.
+
+### Resolver
+
+The controller (`pgshard-controller run --shard-dsn-template ...` or
+repeated `--shard-dsn <set>/<id>=<dsn>`) runs a resolution pass every
+`--resolve-interval` (default 5s) and on demand through the
+`ResolveTransactions` RPC. A pass is idempotent and safe to run beside a
+live router because every step is guarded by the row's state:
+
+- a `preparing` row older than 10s belongs to a router that died before
+  deciding: it is moved to `abort` (guarded `UPDATE ... WHERE state =
+  'preparing'`, so a router that is merely slow and decides commit first
+  wins), and its prepared transactions are rolled back;
+- a `commit` row: `COMMIT PREPARED` on every participant that still holds
+  the gid, then the row is deleted;
+- an `abort` row: `ROLLBACK PREPARED` likewise, then the row is deleted;
+- every shard's `pg_prepared_xacts` is swept for `pgshard-` gids: one with
+  no decision row is an orphan and is rolled back (a row is written before
+  any prepare, so a missing row means the transaction was never decided);
+  one whose row says `commit` is committed. A commit-decided gid is never
+  rolled back. Prepared transactions with other gids are left alone.
+
+The crash matrix in `test/e2e/router` (`TestRouterCrashMatrix`) kills a
+router built with `-tags pgshard_crashpoints` (`PGSHARD_TEST_CRASH_POINT`
+= `before_prepare`, `after_prepare`, `after_decision`,
+`during_commit_prepared`) and checks that the resolver brings both shards to
+the recorded decision with no prepared transaction left.
 
 ## Operations
 
@@ -316,8 +412,10 @@ pgwire server and pgx client against an in-process scripted pooler — four
 of them for the sharded tests: keyed inserts and selects reach the key's
 shard through the simple and extended protocols, prepared statements follow
 the key across shards and are re-planned when the snapshot changes,
-transactions move on their prelude and refuse a second shard, one batch is
-refused for two shards, and each refusal leaves the session usable; scatter
+transactions move on their prelude, escalate to two-phase commit on a second
+writable shard (decision recorded before any prepare, decided before any
+commit prepared, prepare failure aborts everywhere, single mode and missing
+prepared-transaction capacity refuse), one batch is refused for two shards, and each refusal leaves the session usable; scatter
 reads concatenate every shard, merge ordered streams with the pushed-down
 `LIMIT` observed on each shard, combine `count`/`sum`/`min`/`max`,
 refuse text ordering without `COLLATE "C"`, surface one shard's error and a
