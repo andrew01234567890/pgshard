@@ -45,29 +45,54 @@ var (
 // memberView is what candidate selection knows about one member.
 type memberView struct {
 	Name string
-	// InSyncSet is true when the member was in synchronous_standby_names at
-	// the last healthy observation, so an acknowledged commit may only be on it.
-	InSyncSet  bool
+	// Listed is true when the member appears in synchronous_standby_names,
+	// i.e. it may hold the only copy of an acknowledged commit. The operator
+	// lists every non-primary member (healthy first), so a lagging or
+	// not-yet-Ready standby is still Listed and must not be skipped.
+	Listed     bool
 	Reachable  bool
 	InRecovery bool
 	Streaming  bool
 	FlushLSN   uint64
 }
 
-// chooseCandidate picks the standby with the highest flushed LSN among the
-// reachable sync-set members other than exclude. preferred wins when it is
-// eligible and holds the maximum LSN. Ties break by name so the choice is
-// deterministic.
-func chooseCandidate(members []memberView, exclude, preferred string) (string, error) {
+// errQuorum is returned when unreachable listed standbys could hold an
+// acknowledged commit that no reachable standby has: promoting anyway could
+// lose it, so automatic failover refuses.
+var errQuorum = fmt.Errorf("%w: unreachable synchronous standbys may hold acknowledged commits", errNoCandidate)
+
+// chooseCandidate picks the reachable in-recovery member with the highest
+// flushed LSN, excluding exclude. Any standby in the synchronous list may have
+// acknowledged a commit, so all reachable standbys are eligible; if a listed
+// standby is unreachable and the reachable ones do not outnumber the acks
+// (reachable + numSync <= listed), no candidate is admissible. preferred wins
+// when it holds the maximum LSN. Ties break by name.
+func chooseCandidate(members []memberView, exclude, preferred string, numSync int) (string, error) {
+	if numSync < 1 {
+		numSync = 1
+	}
 	var eligible []memberView
+	listed, reachableListed := 0, 0
 	for _, m := range members {
-		if m.Name == exclude || !m.Reachable || !m.InRecovery || !m.InSyncSet {
+		if m.Name == exclude {
+			continue
+		}
+		if m.Listed {
+			listed++
+			if m.Reachable {
+				reachableListed++
+			}
+		}
+		if !m.Reachable || !m.InRecovery {
 			continue
 		}
 		eligible = append(eligible, m)
 	}
 	if len(eligible) == 0 {
 		return "", errNoCandidate
+	}
+	if reachableListed < listed && reachableListed+numSync <= listed {
+		return "", errQuorum
 	}
 	sort.Slice(eligible, func(i, j int) bool {
 		if eligible[i].FlushLSN != eligible[j].FlushLSN {
@@ -82,6 +107,15 @@ func chooseCandidate(members []memberView, exclude, preferred string) (string, e
 		}
 	}
 	return best.Name, nil
+}
+
+// minSyncStandbys is the number of synchronous acknowledgements the cluster
+// requires (ANY n); at least one.
+func minSyncStandbys(c *pgshardv1alpha1.PgShardCluster) int {
+	if c.Spec.Durability.MinSyncStandbys > 0 {
+		return c.Spec.Durability.MinSyncStandbys
+	}
+	return 1
 }
 
 // nextEpoch is the epoch a promotion must carry: above the group's epoch and
@@ -260,6 +294,8 @@ func (r *ClusterReconciler) patchRole(ctx context.Context, pod *corev1.Pod, role
 func (r *ClusterReconciler) failover(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, state groupState, members map[string]*memberInfo, password, preferred string) (groupState, error) {
 	log := logf.FromContext(ctx).WithValues("group", g.Name(), "oldPrimary", state.primary)
 	old := state.primary
+	// With no standby ever observed streaming there is nothing that can hold
+	// an acknowledged commit; refuse rather than promote an empty clone.
 	if len(state.syncSet) == 0 {
 		return state, errNoCandidate
 	}
@@ -278,9 +314,10 @@ func (r *ClusterReconciler) failover(ctx context.Context, c *pgshardv1alpha1.PgS
 		return state, err
 	}
 	for i := range views {
-		views[i].InSyncSet = state.syncSet[views[i].Name]
+		// Every non-primary member is in synchronous_standby_names.
+		views[i].Listed = views[i].Name != old
 	}
-	candidate, err := chooseCandidate(views, old, preferred)
+	candidate, err := chooseCandidate(views, old, preferred, minSyncStandbys(c))
 	if err != nil {
 		log.Info("no failover candidate; releasing the fence", "views", fmt.Sprintf("%+v", views))
 		return state, errors.Join(err, r.releaseLease(ctx, c, g))

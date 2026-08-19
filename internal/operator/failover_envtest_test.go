@@ -170,7 +170,7 @@ func TestFailoverPromotesHighestFlushedSyncStandbyAndPublishesFenceFirst(t *test
 	}
 }
 
-func TestFailoverExcludesStandbysOutsideTheSyncSet(t *testing.T) {
+func TestFailoverPromotesHighestFlushedReachableStandby(t *testing.T) {
 	r, fp, fa, c := healthyCluster(t, "sync-ex")
 	fp.streaming["sync-ex-shard-0-2"] = false
 	reconcile(t, r, c)
@@ -184,8 +184,12 @@ func TestFailoverExcludesStandbysOutsideTheSyncSet(t *testing.T) {
 	fp.standbys[podIP(1, 2)] = StandbyState{InRecovery: true, FlushLSN: 999}
 	fp.err = errors.New("no primary")
 	reconcile(t, r, c)
-	if len(fa.promotes) != 1 || !strings.HasSuffix(fa.promotes[0], ":1:sync-ex-shard-0-1") {
-		t.Fatalf("only the sync-set member may be promoted even with a lower LSN, got %v", fa.promotes)
+	// Member 2 is not Ready (not streaming at the last observation) but it is
+	// listed in synchronous_standby_names and reachable with the highest
+	// flushed LSN, so it may hold the only copy of an acknowledged commit and
+	// must be the one promoted.
+	if len(fa.promotes) != 1 || !strings.HasSuffix(fa.promotes[0], ":1:sync-ex-shard-0-2") {
+		t.Fatalf("the reachable standby with the highest flushed LSN must be promoted, got %v", fa.promotes)
 	}
 }
 

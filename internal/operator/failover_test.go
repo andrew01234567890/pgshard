@@ -11,42 +11,54 @@ import (
 	"k8s.io/utils/ptr"
 )
 
-func TestChooseCandidatePrefersHighestFlushedSyncMember(t *testing.T) {
+func TestChooseCandidatePrefersHighestFlushedReachableStandby(t *testing.T) {
 	members := []memberView{
-		{Name: "g-0", InSyncSet: true, Reachable: true, InRecovery: false, FlushLSN: 900},
-		{Name: "g-1", InSyncSet: true, Reachable: true, InRecovery: true, FlushLSN: 100},
-		{Name: "g-2", InSyncSet: true, Reachable: true, InRecovery: true, FlushLSN: 200},
-		{Name: "g-3", InSyncSet: false, Reachable: true, InRecovery: true, FlushLSN: 300},
-		{Name: "g-4", InSyncSet: true, Reachable: false, InRecovery: true, FlushLSN: 400},
+		{Name: "g-0", Listed: false, Reachable: true, InRecovery: false, FlushLSN: 900}, // old primary
+		{Name: "g-1", Listed: true, Reachable: true, InRecovery: true, FlushLSN: 100},
+		{Name: "g-2", Listed: true, Reachable: true, InRecovery: true, FlushLSN: 200},
+		// Listed but not Ready (lagging replay): still eligible, it may hold the only ack.
+		{Name: "g-3", Listed: true, Reachable: true, InRecovery: true, FlushLSN: 300},
 	}
-	got, err := chooseCandidate(members, "g-0", "")
-	if err != nil || got != "g-2" {
-		t.Fatalf("got %q err %v; want g-2 (highest LSN among reachable sync-set standbys)", got, err)
+	got, err := chooseCandidate(members, "g-0", "", 1)
+	if err != nil || got != "g-3" {
+		t.Fatalf("got %q err %v; want g-3 (highest flushed LSN among reachable standbys)", got, err)
 	}
-	if got, _ := chooseCandidate(members, "g-0", "g-1"); got != "g-2" {
+	if got, _ := chooseCandidate(members, "g-0", "g-1", 1); got != "g-3" {
 		t.Fatalf("preferred member with a lower LSN must not win, got %q", got)
 	}
-	members[1].FlushLSN = 200
-	if got, _ := chooseCandidate(members, "g-0", "g-2"); got != "g-2" {
+	members[1].FlushLSN = 300
+	if got, _ := chooseCandidate(members, "g-0", "g-1", 1); got != "g-1" {
 		t.Fatalf("preferred member at the maximum LSN must win, got %q", got)
 	}
-	if got, _ := chooseCandidate(members, "g-0", ""); got != "g-1" {
+	if got, _ := chooseCandidate(members, "g-0", "", 1); got != "g-1" {
 		t.Fatalf("ties break by name, got %q", got)
 	}
 }
 
-func TestChooseCandidateExcludesUnreadyAndNonSyncMembers(t *testing.T) {
+func TestChooseCandidateRefusesWhenUnreachableListedStandbysMayHoldAcks(t *testing.T) {
+	// ANY 1 over two listed standbys: one unreachable ⇒ 1 reachable + 1 <= 2 ⇒ refuse.
 	members := []memberView{
-		{Name: "g-0", InSyncSet: true, Reachable: true, InRecovery: true, FlushLSN: 999},
-		{Name: "g-1", InSyncSet: false, Reachable: true, InRecovery: true, FlushLSN: 999},
-		{Name: "g-2", InSyncSet: true, Reachable: false, InRecovery: true, FlushLSN: 999},
-		{Name: "g-3", InSyncSet: true, Reachable: true, InRecovery: false, FlushLSN: 999},
+		{Name: "g-0", Reachable: true, InRecovery: false, FlushLSN: 999},
+		{Name: "g-1", Listed: true, Reachable: true, InRecovery: true, FlushLSN: 999},
+		{Name: "g-2", Listed: true, Reachable: false, InRecovery: true, FlushLSN: 999},
 	}
-	got, err := chooseCandidate(members, "g-0", "")
-	if !errors.Is(err, errNoCandidate) || got != "" {
+	if got, err := chooseCandidate(members, "g-0", "", 1); !errors.Is(err, errQuorum) || got != "" {
+		t.Fatalf("got %q err %v; want errQuorum", got, err)
+	}
+	// ANY 2 over the same list: the reachable one must hold every ack ⇒ eligible.
+	if got, err := chooseCandidate(members, "g-0", "", 2); err != nil || got != "g-1" {
+		t.Fatalf("got %q err %v; want g-1 under ANY 2", got, err)
+	}
+	// Nothing reachable in recovery ⇒ no candidate.
+	none := []memberView{
+		{Name: "g-0", Reachable: true, InRecovery: true, FlushLSN: 999},
+		{Name: "g-1", Listed: true, Reachable: false, InRecovery: true, FlushLSN: 999},
+		{Name: "g-2", Listed: true, Reachable: true, InRecovery: false, FlushLSN: 999},
+	}
+	if got, err := chooseCandidate(none, "g-0", "", 1); !errors.Is(err, errNoCandidate) || got != "" {
 		t.Fatalf("got %q err %v; want errNoCandidate", got, err)
 	}
-	if _, err := chooseCandidate(nil, "g-0", ""); !errors.Is(err, errNoCandidate) {
+	if _, err := chooseCandidate(nil, "g-0", "", 1); !errors.Is(err, errNoCandidate) {
 		t.Fatalf("empty member list: %v", err)
 	}
 }
