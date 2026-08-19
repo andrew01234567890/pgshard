@@ -1,0 +1,39 @@
+<h2>Conditions</h2>
+{{if .Conditions}}<table>
+<thead><tr><th>Type</th><th>Status</th><th>Reason</th><th>Message</th></tr></thead>
+<tbody>{{range .Conditions}}<tr>
+<td>{{.Type}}</td><td class="{{if eq .Status "True"}}ok{{else}}bad{{end}}">{{.Status}}</td><td>{{.Reason}}</td><td>{{.Message}}</td>
+</tr>{{end}}</tbody></table>
+{{else}}<p class="notice">No conditions reported yet.</p>{{end}}
+
+<h2>Groups</h2>
+{{if not .Groups}}<p class="notice">No groups reported yet.</p>{{end}}
+{{range .Groups}}
+<h3>{{.Name}} <span class="pill">{{.Kind}}</span> <span class="meta">primary {{if .Primary}}{{.Primary}}{{else}}—{{end}} · epoch {{.Epoch}}</span></h3>
+<table>
+<thead><tr><th>Member</th><th>Role</th><th>Ready</th><th>Epoch</th><th>Replay lag</th><th>Pod phase</th><th>Node</th></tr></thead>
+<tbody>{{range .Members}}<tr>
+<td>{{.Name}}</td><td>{{.Role}}</td>
+<td class="{{if .Ready}}ok{{else}}bad{{end}}">{{.Ready}}</td>
+<td>{{.Epoch}}</td><td>{{bytes .ReplayLagBytes}}</td><td>{{.PodPhase}}</td><td>{{.Node}}</td>
+</tr>{{else}}<tr><td colspan="7" class="notice">no members reported</td></tr>{{end}}</tbody>
+</table>
+{{end}}
+
+<h2>Shard map <span class="meta">generation {{.ShardMapGeneration}}</span></h2>
+{{if .Shards}}<table>
+<thead><tr><th>Shard</th><th>Range start</th><th>Range end</th><th>Primary</th><th>Epoch</th></tr></thead>
+<tbody>{{range .Shards}}<tr>
+<td>{{.ID}}</td><td>{{.RangeStart}}</td><td>{{.RangeEnd}}</td><td>{{.Primary}}</td><td>{{.Epoch}}</td>
+</tr>{{end}}</tbody></table>
+{{else}}<p class="notice">No shards in status yet.</p>{{end}}
+
+{{if .CatalogError}}<p class="bad">catalog: {{.CatalogError}}</p>{{end}}
+{{if .Catalog}}
+<h2>Catalog shard status</h2>
+<table>
+<thead><tr><th>Shard</th><th>Group</th><th>Serving state</th><th>Primary epoch</th><th>Replay lag</th></tr></thead>
+<tbody>{{range .Catalog}}<tr>
+<td>{{.ShardID}}</td><td>{{.GroupName}}</td><td>{{.ServingState}}</td><td>{{.PrimaryEpoch}}</td><td>{{bytesp .ReplayLagBytes}}</td>
+</tr>{{end}}</tbody></table>
+{{end}}

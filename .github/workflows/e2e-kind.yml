@@ -46,14 +46,16 @@ jobs:
           load: true
         env:
           CI: "true"
-      - name: Build operator image
+      - name: Build operator and admin images
         if: matrix.suite == 'operator'
-        run: docker build -f Dockerfile.control --build-arg CMD=pgshard-operator -t pgshard-operator:e2e .
+        run: |
+          docker build -f Dockerfile.control --build-arg CMD=pgshard-operator -t pgshard-operator:e2e .
+          docker build -f Dockerfile.control --build-arg CMD=pgshard-admin -t pgshard-admin:e2e .
       - name: Create kind cluster
         run: hack/kind/up.sh
       - name: Load images into kind
         if: matrix.suite == 'operator'
-        run: hack/kind/load-images.sh pgshard-operator:e2e "ghcr.io/andrew01234567890/pgshard-postgres:${PG_MAJOR}"
+        run: hack/kind/load-images.sh pgshard-operator:e2e pgshard-admin:e2e "ghcr.io/andrew01234567890/pgshard-postgres:${PG_MAJOR}"
       - name: Run e2e suite
         run: |
           set -o pipefail
@@ -66,6 +68,7 @@ jobs:
         env:
           E2E_SUITE: ${{ matrix.suite }}
           OPERATOR_IMAGE: pgshard-operator:e2e
+          ADMIN_IMAGE: pgshard-admin:e2e
       - name: Collect cluster state on failure
         if: failure()
         run: |

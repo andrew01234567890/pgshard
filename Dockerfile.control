@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # Builds one control-plane binary (operator, controller or admin) into a distroless image.
+# Example: docker build -f Dockerfile.control --build-arg CMD=pgshard-admin -t pgshard-admin:dev .
 ARG CMD=pgshard-operator
 
 FROM golang:1.26-bookworm AS build

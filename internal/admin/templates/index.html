@@ -1,0 +1,17 @@
+{{template "head" "Clusters"}}
+<header><h1>pgshard clusters</h1><span class="meta">{{if .Namespace}}namespace {{.Namespace}}{{else}}all namespaces{{end}}</span></header>
+{{if .Clusters}}
+<table>
+<thead><tr><th>Namespace</th><th>Name</th><th>PostgreSQL</th><th>Shards</th><th>Ready</th></tr></thead>
+<tbody>
+{{range .Clusters}}<tr>
+<td>{{.Namespace}}</td>
+<td><a href="/clusters/{{.Namespace}}/{{.Name}}">{{.Name}}</a></td>
+<td>{{.Major}}</td>
+<td>{{.Shards}}</td>
+<td class="{{if eq .Ready "True"}}ok{{else}}bad{{end}}">{{.Ready}}</td>
+</tr>{{end}}
+</tbody>
+</table>
+{{else}}<p>No PgShardCluster objects found.</p>{{end}}
+{{template "foot"}}

@@ -5,6 +5,8 @@ package operator
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -85,6 +87,7 @@ func deployOperator(ctx context.Context, t *testing.T, c *e2e.Cluster, root, ima
 		t.Fatal(err)
 	}
 	manifest := strings.Replace(string(raw), "image: ghcr.io/andrew01234567890/pgshard-operator:latest", "image: "+image, 1)
+	manifest = strings.Replace(manifest, "            - run\n", "            - run\n            - --admin-image="+env("ADMIN_IMAGE", "pgshard-admin:e2e")+"\n", 1)
 	if err := c.Apply(ctx, manifest); err != nil {
 		t.Fatal(err)
 	}
@@ -274,14 +277,14 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 	}
 
 	sel := "pgshard.io/cluster=" + clusterName
-	if n := count(ctx, t, c, "pods", sel); n != 6 {
-		t.Errorf("pods: got %d want 6", n)
+	if n := count(ctx, t, c, "pods", sel+",pgshard.io/group"); n != 6 {
+		t.Errorf("member pods: got %d want 6", n)
 	}
 	if n := count(ctx, t, c, "pvc", sel); n != 6 {
 		t.Errorf("pvcs: got %d want 6", n)
 	}
-	if n := count(ctx, t, c, "svc", sel); n != 6 {
-		t.Errorf("services: got %d want 6", n)
+	if n := count(ctx, t, c, "svc", sel+",pgshard.io/group"); n != 6 {
+		t.Errorf("group services: got %d want 6", n)
 	}
 	if n := count(ctx, t, c, "pdb", sel); n != 4 {
 		t.Errorf("pdbs: got %d want 4", n)
@@ -311,6 +314,39 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 	if out, err := psql(ctx, c, clusterName+"-catalog-rw", "SELECT to_regclass('pgshard.databases') IS NOT NULL"); err != nil || out != "t" {
 		t.Errorf("catalog tables: %q %v", out, err)
 	}
+
+	t.Run("AdminUIServesTopology", func(t *testing.T) {
+		if err := c.WaitPodsReady(ctx, testNamespace, "pgshard.io/cluster="+clusterName+",pgshard.io/component=admin", 3*time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		if n := count(ctx, t, c, "svc", "pgshard.io/cluster="+clusterName+",pgshard.io/component=admin"); n != 1 {
+			t.Errorf("admin services: got %d want 1", n)
+		}
+		base, stop, err := c.PortForward(ctx, testNamespace, clusterName+"-admin", 8081)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer stop()
+		httpGet := func(path string) (int, string) {
+			resp, err := http.Get(base + path)
+			if err != nil {
+				t.Fatalf("GET %s: %v", path, err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			body, _ := io.ReadAll(resp.Body)
+			return resp.StatusCode, string(body)
+		}
+		if code, body := httpGet("/"); code != http.StatusOK || !strings.Contains(body, clusterName) {
+			t.Errorf("GET /: %d %.400s", code, body)
+		}
+		if code, body := httpGet("/clusters/" + testNamespace + "/" + clusterName); code != http.StatusOK || !strings.Contains(body, clusterName+"-shard-0-0") {
+			t.Errorf("GET cluster page: %d %.400s", code, body)
+		}
+		if code, body := httpGet("/api/v1/clusters/" + testNamespace + "/" + clusterName); code != http.StatusOK ||
+			!strings.Contains(body, `"name": "`+clusterName+`"`) || !strings.Contains(body, `"primary": "`+clusterName+`-shard-0-0"`) {
+			t.Errorf("GET admin JSON: %d %.400s", code, body)
+		}
+	})
 
 	t.Run("ReplicaPodRecreatedWithSamePVC", func(t *testing.T) {
 		victim := clusterName + "-shard-0-2"
