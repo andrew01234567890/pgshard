@@ -1,0 +1,23 @@
+{{if .Lost}}<div role="alert" class="alert">LOST: {{if .LostSlots}}{{.LostSlots}} slot{{if ne .LostSlots 1}}s{{end}} invalidated{{else}}stream marked lost{{end}}; WAL was removed and the stream must be recreated.</div>{{end}}
+<p>State <span class="{{if .Lost}}bad{{else}}ok{{end}}">{{.State}}</span> · slots {{.ActiveSlots}} active / {{.InactiveSlots}} inactive · max retained {{bytes .MaxRetainedBytes}} · synced on standbys {{if .Synced}}yes{{else}}no{{end}}</p>
+{{if .Slots}}
+<table>
+<caption class="sr-only">Slots of stream {{.Name}} per shard</caption>
+<thead><tr><th scope="col">Shard</th><th scope="col">Slot</th><th scope="col">Active</th><th scope="col">Restart LSN</th><th scope="col">Confirmed LSN</th><th scope="col">Retained</th><th scope="col">WAL status</th><th scope="col">Invalidation</th><th scope="col">Synced</th><th scope="col">Failover</th><th scope="col">Updated</th></tr></thead>
+<tbody>
+{{range .Slots}}<tr>
+<th scope="row">{{.ShardSet}}/{{.ShardID}}</th>
+<td><code>{{.Slot}}</code></td>
+<td class="{{if .Active}}ok{{end}}">{{if .Active}}yes{{else}}no{{end}}</td>
+<td><code>{{.RestartLSN}}</code></td>
+<td><code>{{.ConfirmedFlushLSN}}</code></td>
+<td>{{bytes .RetainedBytes}}</td>
+<td class="{{if .Lost}}bad{{end}}">{{.WALStatus}}</td>
+<td>{{.InvalidationReason}}</td>
+<td>{{if .Synced}}yes{{else}}no{{end}}</td>
+<td>{{if .Failover}}yes{{else}}no{{end}}</td>
+<td><time datetime="{{.UpdatedAt.UTC.Format "2006-01-02T15:04:05Z07:00"}}">{{.UpdatedAt.UTC.Format "2006-01-02 15:04:05"}}</time></td>
+</tr>{{end}}
+</tbody>
+</table>
+{{else}}<p>No slot status recorded yet.</p>{{end}}

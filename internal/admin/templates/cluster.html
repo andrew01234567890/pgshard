@@ -1,7 +1,7 @@
 {{template "head" .Name}}
 <header>
 <h1><a href="/">clusters</a> / {{.Namespace}} / {{.Name}}</h1>
-<nav class="tabs" aria-label="Sections"><a href="/">Clusters</a><a href="/backups">Backups</a><a href="/migrations">Migrations</a></nav>
+<nav class="tabs" aria-label="Sections"><a href="/">Clusters</a><a href="/backups">Backups</a><a href="/migrations">Migrations</a><a href="/streams">Streams</a></nav>
 <span class="meta">PostgreSQL {{.PostgresMajor}} · shard map generation <span id="shard-map-generation">{{.ShardMapGeneration}}</span></span>
 </header>
 <div id="topology" data-live hx-get="/clusters/{{.Namespace}}/{{.Name}}/topology" hx-trigger="topology" hx-swap="innerHTML">

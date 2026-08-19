@@ -47,7 +47,7 @@ func ParseFlags(args []string, stderr io.Writer) (Options, error) {
 	fs.StringVar(&o.Listen, "listen", ":8081", "HTTP listen address")
 	fs.StringVar(&o.Kubeconfig, "kubeconfig", "", "path to a kubeconfig; empty uses the in-cluster configuration")
 	fs.StringVar(&o.Namespace, "namespace", "", "namespace to watch; empty watches all namespaces")
-	fs.StringVar(&o.CatalogDSN, "catalog-dsn", "", "optional PostgreSQL DSN of the catalog database for the shard status snapshot")
+	fs.StringVar(&o.CatalogDSN, "catalog-dsn", "", "optional PostgreSQL DSN of the catalog database for the shard status snapshot and the streams pages")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}

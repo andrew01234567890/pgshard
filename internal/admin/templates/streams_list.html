@@ -1,0 +1,20 @@
+{{if .Lost}}<div role="alert" class="alert">{{.Lost}} stream{{if ne .Lost 1}}s have{{else}} has{{end}} a LOST slot; recreate before the consumer resumes.</div>{{end}}
+{{if .Streams}}
+<table>
+<caption class="sr-only">Change streams</caption>
+<thead><tr><th scope="col">Name</th><th scope="col">Database</th><th scope="col">Two-phase</th><th scope="col">State</th><th scope="col">Created</th><th scope="col">Slots active / inactive</th><th scope="col">Lost</th><th scope="col">Max retained</th><th scope="col">Synced on standbys</th></tr></thead>
+<tbody>
+{{range .Streams}}<tr>
+<th scope="row"><a href="/streams/{{.Name}}">{{.Name}}</a></th>
+<td>{{.Database}}</td>
+<td>{{if .TwoPhase}}yes{{else}}no{{end}}</td>
+<td class="{{if .Lost}}bad{{else}}ok{{end}}">{{.State}}</td>
+<td><time datetime="{{.CreatedAt.UTC.Format "2006-01-02T15:04:05Z07:00"}}">{{.CreatedAt.UTC.Format "2006-01-02 15:04"}}</time></td>
+<td>{{.ActiveSlots}} / {{.InactiveSlots}}</td>
+<td class="{{if .LostSlots}}bad{{end}}">{{.LostSlots}}</td>
+<td>{{bytes .MaxRetainedBytes}}</td>
+<td>{{if .Synced}}yes{{else}}no{{end}}</td>
+</tr>{{end}}
+</tbody>
+</table>
+{{else}}<p>No change streams.</p>{{end}}

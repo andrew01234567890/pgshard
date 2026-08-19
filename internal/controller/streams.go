@@ -90,7 +90,9 @@ func (m *StreamMonitor) groupNames(ctx context.Context) (map[ShardRef]string, er
 func slotStatus(ctx context.Context, conn ShardConn, slot string) (catalog.StreamStatus, error) {
 	st := catalog.StreamStatus{Slot: slot, WALStatus: "missing"}
 	rows, err := conn.Query(ctx, `SELECT coalesce(wal_status, ''), coalesce(invalidation_reason, ''),
-		coalesce(confirmed_flush_lsn - '0/0'::pg_lsn, 0), coalesce(restart_lsn - '0/0'::pg_lsn, 0), active
+		coalesce(confirmed_flush_lsn - '0/0'::pg_lsn, 0), coalesce(restart_lsn - '0/0'::pg_lsn, 0),
+		greatest(coalesce(CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() ELSE pg_current_wal_lsn() END - restart_lsn, 0), 0),
+		active, synced, failover
 		FROM pg_replication_slots WHERE slot_name = $1`, slot)
 	if err != nil {
 		return st, err
@@ -98,7 +100,7 @@ func slotStatus(ctx context.Context, conn ShardConn, slot string) (catalog.Strea
 	defer rows.Close()
 	if rows.Next() {
 		var confirmed, restart int64
-		if err := rows.Scan(&st.WALStatus, &st.InvalidationReason, &confirmed, &restart, &st.Active); err != nil {
+		if err := rows.Scan(&st.WALStatus, &st.InvalidationReason, &confirmed, &restart, &st.RetainedBytes, &st.Active, &st.Synced, &st.Failover); err != nil {
 			return st, err
 		}
 		st.ConfirmedFlushLSN, st.RestartLSN = uint64(confirmed), uint64(restart)

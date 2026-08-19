@@ -17,7 +17,7 @@ pgshard-admin serve [--listen :8081] [--kubeconfig PATH] [--namespace NS] [--cat
 | `--listen` | `:8081` | HTTP listen address. |
 | `--kubeconfig` | in-cluster | Kubeconfig to use outside a pod. |
 | `--namespace` | all namespaces | Restrict the watch and the clusters list to one namespace. |
-| `--catalog-dsn` | none | PostgreSQL DSN of a catalog database; adds the catalog's `pgshard.shard_status` snapshot and a DDL card to the topology page, the certified restore points (`pgshard.restore_points`) to the backups page, and enables the migrations panel. |
+| `--catalog-dsn` | none | PostgreSQL DSN of a catalog database; adds the catalog's `pgshard.shard_status` snapshot and a DDL card to the topology page, the certified restore points (`pgshard.restore_points`) to the backups page, and enables the migrations and streams panels. |
 
 `--help` and `--version` behave as in every pgshard command.
 
@@ -39,15 +39,23 @@ pgshard-admin serve [--listen :8081] [--kubeconfig PATH] [--namespace NS] [--cat
 | `/migrations/{id}` | One migration: statement, steps with status (`pending`, `partial`, `running`, `failed`, `done`), per-shard table (state, step, attempts, last error). A DEGRADED banner appears when the statement applied on some shards and failed on another. |
 | `/migrations/table`, `/migrations/{id}/detail` | The fragments htmx swaps in on refresh. |
 | `/api/v1/migrations`, `/api/v1/migrations/{id}` | JSON documents the pages are rendered from. |
+| `/streams` | Change streams (needs `--catalog-dsn`, otherwise 503): name, database, two-phase, state, created, active/inactive slot counts, lost slot count, largest WAL retained behind a slot, whether every slot is synced on the standbys. A `role="alert"` banner names the streams with a lost slot. |
+| `/streams/{name}` | One stream: per-shard slot (shard, slot name, active, restart and confirmed LSNs, retained bytes, `wal_status`, invalidation reason, synced, failover, last update) and a LOST banner when any slot was invalidated. 404 for an unknown stream. |
+| `/api/v1/streams`, `/api/v1/streams/{name}` | JSON documents the streams pages are rendered from. |
 | `/api/v1/clusters` | JSON clusters list. |
 | `/api/v1/clusters/{ns}/{name}` | JSON topology document the page is rendered from. |
 | `/events` | Server-sent events. A `topology` event is sent on every PgShardCluster, PgShardGroup, PgShardBackupPolicy, PgShardBackup, PgShardRestore or member Pod change seen by the informers, and at least every 2 seconds. |
 | `/healthz` | Liveness and readiness. |
 
-The topology, backups and migrations pages open `/events` and reload their
-fragment on each event, so the view follows the cluster without a full page
-reload. The catalog has no notify channel for migrations; the 2 second tick is
-what keeps the migrations panel current.
+The topology, backups, migrations and streams pages open `/events` and reload
+their fragment on each event (streams requests carrying `HX-Request` get the
+fragment only), so the view follows the cluster without a full page reload.
+The catalog has no notify channel for migrations; the 2 second tick is what
+keeps the migrations panel current. The clusters page shows a streams card
+(count and lost count) when a catalog DSN is configured. Stream rows come from
+`pgshard.streams` and `pgshard.stream_status`, which the controller's stream
+monitor refreshes; `retained_bytes` is `pg_current_wal_lsn() - restart_lsn` on
+the primary.
 
 The backups panel never reads Secrets: policies are shown with the Secret
 *names* their `credentials` and `encryption` references point at, and the

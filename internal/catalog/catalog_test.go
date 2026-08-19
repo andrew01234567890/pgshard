@@ -538,6 +538,38 @@ func runSuite(t *testing.T, img pgImage) {
 		_, err = reader.Exec(ctx, `SELECT * FROM pgshard.allocate_sequence_block('by_reader')`)
 		expectPgError(t, err, "42501", "allocate_sequence_block")
 	})
+
+	t.Run("stream_status_slot_health", func(t *testing.T) {
+		if err := CreateStream(ctx, conn, Stream{Name: "health", Database: "app"}); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = DeleteStream(ctx, conn, "health") })
+		want := StreamStatus{Stream: "health", ShardSet: "default", ShardID: 3, Slot: "pgshard_health_shard3", WALStatus: "reserved",
+			ConfirmedFlushLSN: 0x100000020, RestartLSN: 0x100000010, RetainedBytes: 123456, Active: true, Synced: true, Failover: true}
+		if err := UpsertStreamStatus(ctx, conn, want); err != nil {
+			t.Fatal(err)
+		}
+		rows, err := ListStreamStatus(ctx, conn, "health")
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("rows %+v %v", rows, err)
+		}
+		got := rows[0]
+		if got.UpdatedAt.IsZero() {
+			t.Fatal("updated_at not read")
+		}
+		got.UpdatedAt = time.Time{}
+		if got != want {
+			t.Fatalf("round trip\n got %+v\nwant %+v", got, want)
+		}
+		want.RetainedBytes, want.Synced, want.Failover = 0, false, false
+		if err := UpsertStreamStatus(ctx, conn, want); err != nil {
+			t.Fatal(err)
+		}
+		rows, _ = ListStreamStatus(ctx, conn, "health")
+		if rows[0].RetainedBytes != 0 || rows[0].Synced || rows[0].Failover {
+			t.Fatalf("upsert must overwrite slot health: %+v", rows[0])
+		}
+	})
 }
 
 func mustTx(t *testing.T, tx pgx.Tx, sql string) {

@@ -36,8 +36,16 @@ func TestStreamMonitor(t *testing.T) {
 	if err != nil || len(rows) != 2 {
 		t.Fatalf("status rows: %+v %v", rows, err)
 	}
-	if r := rows[0]; r.ShardID != 0 || r.Slot != "pgshard_orders_g0" || r.WALStatus != "reserved" || r.Active || r.ConfirmedFlushLSN == 0 || r.RestartLSN == 0 || r.InvalidationReason != "" {
+	if r := rows[0]; r.ShardID != 0 || r.Slot != "pgshard_orders_g0" || r.WALStatus != "reserved" || r.Active || r.ConfirmedFlushLSN == 0 || r.RestartLSN == 0 || r.InvalidationReason != "" || !r.Failover || r.Synced || r.UpdatedAt.IsZero() {
 		t.Fatalf("shard 0 status: %+v", r)
+	}
+	mustExec(t, connect(t, f.shardDSN(0)), "INSERT INTO t SELECT repeat('x', 1000) FROM generate_series(1, 100)")
+	if _, err := m.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ = catalog.ListStreamStatus(ctx, f.pool, "orders")
+	if r := rows[0]; r.RetainedBytes < 100000 {
+		t.Fatalf("retained bytes must grow behind an unread slot: %+v", r)
 	}
 	if r := rows[1]; r.ShardID != 1 || r.Slot != "pgshard_orders_g1" || r.WALStatus != "missing" || r.ConfirmedFlushLSN != 0 {
 		t.Fatalf("shard 1 status: %+v", r)
