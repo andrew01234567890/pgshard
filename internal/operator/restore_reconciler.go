@@ -3,6 +3,8 @@ package operator
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -265,6 +267,7 @@ func (r *RestoreReconciler) observe(ctx context.Context, rs *pgshardv1alpha1.PgS
 	case all && ready:
 		rs.Status.Phase = pgshardv1alpha1.RestorePhaseRecovered
 		rs.Status.Error = ""
+		r.reportPrepared(ctx, rs, c)
 	}
 	inProgress := rs.Status.Phase == pgshardv1alpha1.RestorePhaseRestoring || rs.Status.Phase == pgshardv1alpha1.RestorePhaseReconciling
 	if !inProgress {
@@ -296,6 +299,48 @@ func (r *RestoreReconciler) observe(ctx context.Context, rs *pgshardv1alpha1.PgS
 		return ctrl.Result{}, nil
 	}
 	return ctrl.Result{RequeueAfter: restorePollInterval}, nil
+}
+
+// reportPrepared surfaces the pgshard prepared transactions each group
+// still holds after a non-barrier restore as the
+// PreparedTransactionsPending condition. Such a target is applied per
+// group and is not cluster-consistent, so the operator only reports; it
+// never finishes them without a decision log.
+func (r *RestoreReconciler) reportPrepared(ctx context.Context, rs *pgshardv1alpha1.PgShardRestore, c *pgshardv1alpha1.PgShardCluster) {
+	cond := metav1.Condition{Type: pgshardv1alpha1.ConditionPreparedTransactionsPending, Status: metav1.ConditionFalse, Reason: "NonePending",
+		Message: "no pgshard prepared transactions are left on the recovered groups", ObservedGeneration: rs.Generation}
+	var pending, problems []string
+	for i, g := range Groups(c) {
+		rs.Status.Groups[i].PreparedTransactions = nil
+		if r.TwoPC == nil {
+			problems = append(problems, g.Name()+": no two-phase agent client")
+			continue
+		}
+		addr, _, err := r.primaryAgent(ctx, c, g)
+		if err == nil {
+			var prepared map[string]string
+			prepared, err = r.TwoPC.ListPrepared(ctx, addr)
+			for _, gid := range slices.Sorted(maps.Keys(prepared)) {
+				rs.Status.Groups[i].PreparedTransactions = append(rs.Status.Groups[i].PreparedTransactions, gid)
+				pending = append(pending, g.Name()+": "+gid)
+			}
+		}
+		if err != nil {
+			problems = append(problems, g.Name()+": "+err.Error())
+		}
+	}
+	switch {
+	case len(pending) > 0:
+		cond.Status, cond.Reason = metav1.ConditionTrue, "PreparedTransactionsPending"
+		cond.Message = fmt.Sprintf("%d pgshard prepared transaction(s) left by the per-group target, finish them by hand: %s", len(pending), strings.Join(pending, "; "))
+		if len(problems) > 0 {
+			cond.Message += "; not checked: " + strings.Join(problems, "; ")
+		}
+	case len(problems) > 0:
+		cond.Status, cond.Reason = metav1.ConditionUnknown, "CheckFailed"
+		cond.Message = "could not list prepared transactions: " + strings.Join(problems, "; ")
+	}
+	meta.SetStatusCondition(&rs.Status.Conditions, cond)
 }
 
 // clearRestoreSource drops the restore annotation once the cluster has

@@ -87,7 +87,9 @@ behind the primary. Only the primary archives (`archive_mode=on`, not
   decisions}` finishes the instance's `pgshard-*` prepared transactions
   against that log (each from the database it was prepared in) and reports
   committed, rolled back and contradictions; `SetWriteFence{epoch, active,
-  reason}` raises or releases the catalog write fence. See
+  reason}` raises or releases the catalog write fence;
+  `ListPreparedTransactions` (read-only) lists the `pgshard-*` transactions
+  the instance still holds prepared. See
   [Barrier restore](#barrier-restore).
 
 ## Objects
@@ -308,6 +310,25 @@ contradictions and unfenced. The decision table lives in
 `TestRestoreReconciliationMatrix` (agent, `-tags integration`)
 restores a shard to points before PREPARE, between PREPARE and the decision
 and after it, and checks each outcome.
+
+### Non-barrier restores are not cluster-consistent
+
+A time, LSN, xid, name or immediate target is applied to every group
+independently: each group stops at its own point, and nothing proves the
+points agree on which two-phase transactions had committed. Such a restore
+is per-group PITR, not a cluster snapshot. After it reaches `Recovered`
+the operator asks every primary's agent for the `pgshard-*` transactions it
+still holds prepared (`Agent.ListPreparedTransactions`) and reports them:
+the condition `PreparedTransactionsPending` is `True` with the `group: gid`
+pairs and each group lists them in `status.groups[].preparedTransactions`;
+`Unknown` when a primary could not be asked; `False` when none are left.
+Leftover prepared transactions hold their locks and pin the vacuum horizon
+until finished by hand (`COMMIT PREPARED` / `ROLLBACK PREPARED` in the
+database they were prepared in), and if the target lies inside a barrier
+window the restored catalog may still carry that barrier's write fence
+(`Agent.SetWriteFence` releases it). The operator never finishes them
+itself without a decision log: use a barrier target for a consistent
+restore.
 
 ## Not yet covered
 

@@ -25,6 +25,30 @@ type TwoPCAgentClient interface {
 	// SetWriteFence raises or releases the write fence through the catalog
 	// primary's agent at addr.
 	SetWriteFence(ctx context.Context, addr string, epoch uint64, active bool, reason string) error
+	// ListPrepared lists the pgshard prepared transactions (gid to
+	// database) the primary at addr still holds.
+	ListPrepared(ctx context.Context, addr string) (map[string]string, error)
+}
+
+// ListPrepared calls Agent.ListPreparedTransactions.
+func (c GRPCAgentClient) ListPrepared(ctx context.Context, addr string) (map[string]string, error) {
+	conn, cl, err := c.dial(ctx, addr)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close() }()
+	resp, err := cl.ListPreparedTransactions(ctx, &pgshardv1.ListPreparedTransactionsRequest{})
+	if err != nil {
+		return nil, err
+	}
+	if e := resp.GetError(); e != nil {
+		return nil, fmt.Errorf("list prepared transactions: %s", e.GetMessage())
+	}
+	out := make(map[string]string, len(resp.GetPrepared()))
+	for _, p := range resp.GetPrepared() {
+		out[p.GetGid()] = p.GetDatabase()
+	}
+	return out, nil
 }
 
 // ListTransactionDecisions calls Agent.ListTransactionDecisions.
