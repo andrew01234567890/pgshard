@@ -65,7 +65,7 @@ func startPostgres(t *testing.T, image string) (addr, adminDSN string) {
 	script := `initdb -D /tmp/pgdata --auth=trust -U postgres >/dev/null &&
 		 printf 'host all postgres all trust\nhost all all all scram-sha-256\n' >> /tmp/pgdata/pg_hba.conf &&
 		 exec postgres -D /tmp/pgdata -c listen_addresses='*'`
-	out, err := exec.Command("docker", "run", "-d", "--rm", "-p", fmt.Sprintf("127.0.0.1:%d:5432", port), "--entrypoint", "sh", image, "-ec", script).CombinedOutput()
+	out, err := exec.Command("docker", "run", "-d", "--rm", "-p", fmt.Sprintf("127.0.0.1:%d:5432", port), "--user", "postgres", "--entrypoint", "sh", image, "-ec", script).CombinedOutput()
 	if err != nil {
 		t.Fatalf("docker run: %v: %s", err, out)
 	}
