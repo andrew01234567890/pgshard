@@ -1,10 +1,10 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 ARG PG_MAJOR
 ARG PG_VERSION
 ARG PG_SHA256
 ARG PGBACKREST_VERSION=2.59.1
 
-FROM debian:bookworm-slim AS pg-build
+FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS pg-build
 ARG PG_MAJOR
 ARG PG_VERSION
 ARG PG_SHA256
@@ -31,7 +31,7 @@ RUN ./configure --prefix=/usr/local/pgsql --with-openssl --with-icu --with-lz4 -
       --with-llvm=no --enable-debug=no \
     && make -j"$(nproc)" world-bin && make install-world-bin
 
-FROM debian:bookworm-slim AS pgbackrest-build
+FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS pgbackrest-build
 ARG PGBACKREST_VERSION
 ARG PGBACKREST_SHA256
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -46,7 +46,7 @@ RUN curl -fsSLo pgbackrest.tar.gz "https://github.com/pgbackrest/pgbackrest/arch
     && ninja -C build \
     && install -m 0755 build/src/pgbackrest /usr/local/bin/pgbackrest
 
-FROM golang:1.26-bookworm AS agent-build
+FROM golang:1.26-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36 AS agent-build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
@@ -55,7 +55,7 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
     CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/pgshard-agent ./cmd/pgshard-agent \
     && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/pgshard-pooler ./cmd/pgshard-pooler
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
 ARG PG_MAJOR
 ARG PG_VERSION
 ARG PGBACKREST_VERSION

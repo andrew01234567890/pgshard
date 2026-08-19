@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 # Builds one control-plane binary (operator, controller or admin) into a distroless image.
 # Example: docker build -f Dockerfile.control --build-arg CMD=pgshard-admin -t pgshard-admin:dev .
 ARG CMD=pgshard-operator
