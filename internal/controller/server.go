@@ -19,6 +19,45 @@ type Server struct {
 	Pool *pgxpool.Pool
 	// Resolver serves ResolveTransactions; nil answers Unimplemented.
 	Resolver *Resolver
+	// Barrier serves CreateBarrier; nil answers Unimplemented.
+	Barrier *Barrier
+}
+
+// CreateBarrier runs one barrier to completion.
+func (s *Server) CreateBarrier(ctx context.Context, req *pgshardv1.CreateBarrierRequest) (*pgshardv1.CreateBarrierResponse, error) {
+	if s.Barrier == nil {
+		return nil, status.Error(codes.Unimplemented, "the controller has no shard access configured for barriers")
+	}
+	rp, err := s.Barrier.Run(ctx, req.GetName())
+	switch {
+	case errors.Is(err, ErrBarrierName), errors.Is(err, ErrBarrierExists):
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	case err != nil:
+		return &pgshardv1.CreateBarrierResponse{Error: &pgshardv1.Error{Message: err.Error()}}, nil
+	}
+	return &pgshardv1.CreateBarrierResponse{Barrier: restorePointProto(rp)}, nil
+}
+
+// ListBarriers lists recorded restore points, newest first.
+func (s *Server) ListBarriers(ctx context.Context, req *pgshardv1.ListBarriersRequest) (*pgshardv1.ListBarriersResponse, error) {
+	points, err := ListRestorePoints(ctx, s.Pool, req.GetCertifiedOnly())
+	if err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
+	resp := &pgshardv1.ListBarriersResponse{}
+	for _, rp := range points {
+		resp.Barriers = append(resp.Barriers, restorePointProto(rp))
+	}
+	return resp, nil
+}
+
+func restorePointProto(rp RestorePoint) *pgshardv1.Barrier {
+	out := &pgshardv1.Barrier{Id: rp.ID, Name: rp.Name, RestorePoint: RestorePointName(rp.Name), ShardMapGeneration: rp.ShardMapGeneration,
+		Certified: rp.Certified, CreatedAt: rp.CreatedAt.Unix()}
+	for _, g := range rp.Groups {
+		out.Groups = append(out.Groups, &pgshardv1.GroupRestorePoint{Group: g.Group, Lsn: g.LSN, Timeline: g.Timeline, WalSegment: g.WALSegment})
+	}
+	return out
 }
 
 // ResolveTransactions runs one resolver pass on demand.

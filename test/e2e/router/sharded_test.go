@@ -32,7 +32,14 @@ func startShardedStack(tb testing.TB) *shardedStack {
 // shard.
 func startShardedStackWith(tb testing.TB, shard0Opts, shard1Opts []string) *shardedStack {
 	tb.Helper()
-	s := &shardedStack{stack: startStackWith(tb, shard0Opts)}
+	return startShardedStackFull(tb, nil, shard0Opts, shard1Opts)
+}
+
+// startShardedStackFull is startShardedStackWith with PostgreSQL options
+// for the catalog too.
+func startShardedStackFull(tb testing.TB, catalogOpts, shard0Opts, shard1Opts []string) *shardedStack {
+	tb.Helper()
+	s := &shardedStack{stack: startStackFull(tb, catalogOpts, shard0Opts)}
 	poolerBin, _ := buildBinaries(tb)
 	var shard1Addr string
 	shard1Addr, s.shard1DSN = startPostgres(tb, "shard1", shard1Opts...)

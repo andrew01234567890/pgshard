@@ -189,12 +189,22 @@ func (in *Instance) password() (string, error) {
 
 // Connect opens a superuser connection over the local socket.
 func (in *Instance) Connect(ctx context.Context) (*pgx.Conn, error) {
+	return in.ConnectDB(ctx, "postgres")
+}
+
+// ConnectDB opens a superuser connection to database over the local socket.
+func (in *Instance) ConnectDB(ctx context.Context, database string) (*pgx.Conn, error) {
 	pw, err := in.password()
 	if err != nil {
 		return nil, err
 	}
-	dsn := fmt.Sprintf("host=/tmp port=%d user=postgres dbname=postgres password=%s connect_timeout=3", in.cfg.Port, pw)
-	return pgx.Connect(ctx, dsn)
+	cfg, err := pgx.ParseConfig(fmt.Sprintf("host=/tmp port=%d user=postgres dbname=postgres connect_timeout=3", in.cfg.Port))
+	if err != nil {
+		return nil, err
+	}
+	cfg.Password = pw
+	cfg.Database = database
+	return pgx.ConnectConfig(ctx, cfg)
 }
 
 // Start launches postgres and waits until it accepts connections or ctx ends.

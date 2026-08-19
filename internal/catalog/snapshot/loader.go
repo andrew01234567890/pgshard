@@ -85,6 +85,11 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 			s.Tables[key] = Placement{Placement: t.Placement, Generation: t.DesiredGeneration}
 		}
 	}
+	fence, err := catalog.ReadWriteFence(ctx, tx)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot: write fence: %w", err)
+	}
+	s.WriteFence = fence.Active
 	names, err := catalog.ListSequenceNames(ctx, tx)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot: sequences: %w", err)

@@ -48,6 +48,17 @@ service Agent {
   rpc Expire(ExpireRequest) returns (ExpireResponse);
   // Verify checks the backup repository for corruption. Read-only.
   rpc Verify(VerifyRequest) returns (VerifyResponse);
+  // ListTransactionDecisions reads the two-phase commit decision log of the
+  // pgshard catalog this instance serves. Read-only.
+  rpc ListTransactionDecisions(ListTransactionDecisionsRequest) returns (ListTransactionDecisionsResponse);
+  // ReconcilePreparedTransactions finishes prepared transactions on this
+  // instance against a decision log: commit-decided ones are committed,
+  // every other one rolled back, and commit-decided transactions that are
+  // neither prepared nor committed are reported as contradictions.
+  rpc ReconcilePreparedTransactions(ReconcilePreparedTransactionsRequest) returns (ReconcilePreparedTransactionsResponse);
+  // SetWriteFence raises or releases the cluster write fence in the pgshard
+  // catalog this instance serves.
+  rpc SetWriteFence(SetWriteFenceRequest) returns (SetWriteFenceResponse);
 }
 
 // StatusRequest asks for the instance status.
@@ -332,4 +343,57 @@ message VerifyResponse {
   uint64 epoch = 1;
   Error error = 2;
   repeated string log = 3;
+}
+
+// TransactionDecision is one row of the decision log.
+message TransactionDecision {
+  string gid = 1;
+  // preparing, commit or abort.
+  string state = 2;
+  // Participant shard ids and, in the same order, their transaction ids.
+  repeated int32 participants = 3;
+  repeated string participant_xids = 4;
+}
+
+// ListTransactionDecisionsRequest reads the decision log.
+message ListTransactionDecisionsRequest {}
+
+// ListTransactionDecisionsResponse returns the decision log.
+message ListTransactionDecisionsResponse {
+  uint64 epoch = 1;
+  repeated TransactionDecision decisions = 2;
+  Error error = 3;
+}
+
+// ReconcilePreparedTransactionsRequest carries the decision log to apply.
+message ReconcilePreparedTransactionsRequest {
+  // Caller's view of the current epoch; must EQUAL the last accepted epoch.
+  uint64 epoch = 1;
+  repeated TransactionDecision decisions = 2;
+  // Shard id of this instance in the decision log's participant lists.
+  int32 shard_id = 3;
+}
+
+// ReconcilePreparedTransactionsResponse reports the outcome.
+message ReconcilePreparedTransactionsResponse {
+  uint64 epoch = 1;
+  uint32 committed = 2;
+  uint32 rolled_back = 3;
+  // Commit-decided gids that are neither prepared nor committed here.
+  repeated string contradictions = 4;
+  Error error = 5;
+}
+
+// SetWriteFenceRequest raises (active) or releases the fence.
+message SetWriteFenceRequest {
+  // Caller's view of the current epoch; must EQUAL the last accepted epoch.
+  uint64 epoch = 1;
+  bool active = 2;
+  string reason = 3;
+}
+
+// SetWriteFenceResponse reports the outcome.
+message SetWriteFenceResponse {
+  uint64 epoch = 1;
+  Error error = 2;
 }

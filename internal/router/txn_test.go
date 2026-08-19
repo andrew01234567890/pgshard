@@ -21,6 +21,8 @@ type fakeDecisionLog struct {
 	events []string
 	rows   map[string]string
 	fail   map[string]error
+	// xids collects the participant transaction ids Begin was given.
+	xids []string
 	// abortAfterBegin models the resolver deciding abort right after the
 	// row was written.
 	abortAfterBegin bool
@@ -40,7 +42,7 @@ func (l *fakeDecisionLog) record(op string) {
 	l.events = append(l.events, fmt.Sprintf("%s(prepared=%d)", op, l.preparedCount()))
 }
 
-func (l *fakeDecisionLog) Begin(_ context.Context, gid string, participants []int32) error {
+func (l *fakeDecisionLog) Begin(_ context.Context, gid string, participants []int32, xids []string) error {
 	if err := l.fail["begin"]; err != nil {
 		return err
 	}
@@ -48,6 +50,7 @@ func (l *fakeDecisionLog) Begin(_ context.Context, gid string, participants []in
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.rows[gid] = fmt.Sprintf("preparing%v", participants)
+	l.xids = append(l.xids, xids...)
 	if l.abortAfterBegin {
 		l.rows[gid] = "abort"
 	}

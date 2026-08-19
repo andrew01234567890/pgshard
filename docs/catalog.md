@@ -98,12 +98,12 @@ Status tables are written by `pgshard_system`; `pgshard_admin` and
 | `role_status` | `rolname`, `effective_generation`, `per_shard` (jsonb), `updated_at` |
 | `workflows` | `id` (uuid), `kind`, `state`, `spec`, `status`, `journal_ids`, `created_at`, `updated_at`, `error` |
 | `migrations` | DDL migrations: `id` (uuid), `database`, `statement`, `strategy`, `state`, `per_shard` (jsonb), `created_at`, `updated_at` |
-| `xact_decisions` | Two-phase commit outcomes: `gid`, `state` (`preparing`, `commit`, `abort`), `participants`, `created_at`, `decided_at` |
+| `xact_decisions` | Two-phase commit outcomes: `gid`, `state` (`preparing`, `commit`, `abort`), `participants`, `participant_xids` (since `0006`: the participants' `pg_current_xact_id()` in the same order, so a restore can tell a committed transaction from one that never happened), `created_at`, `decided_at` |
 | `streams` | `name`, `spec`, `position`, `state` |
 | `sequences` | Global sequences: `name`, `next_value`, `block_size`. Since migration `0005` `pgshard_admin` may also insert, update and delete rows (declaring a sequence or changing its block size), and routers allocate through `pgshard.allocate_sequence_block(name, n)`, a `SECURITY DEFINER` function (executable by `pgshard_admin`) that creates the row on first use, moves `next_value` past a block of `n` values (`block_size` when `n` is `NULL`) in one `UPDATE … RETURNING` and returns `(block_start, block_end)`. |
-| `restore_points` | `id` (uuid), `name`, `shard_map_generation`, `per_group` (jsonb), `created_at` |
+| `restore_points` | `id` (uuid), `name` (unique), `shard_map_generation`, `per_group` (jsonb: `{group: {lsn, timeline, wal_segment}}`), `certified` (since `0006`: writes were paused and two-phase commits drained when the points were taken), `created_at` |
 | `serving` | `shard_set`, `generation`, `published_at` |
-| `shard_map_generation` | Single row: `generation`, `updated_at` |
+| `shard_map_generation` | Single row: `generation`, `updated_at`, and since `0006` the cluster write fence: `write_fence`, `write_fence_reason`, `write_fenced_at`. Routers hold new writes while `write_fence` is set (see [router.md](router.md#write-fence)); the barrier workflow raises it and a restored catalog carries it until the restore is reconciled. |
 
 ### Serving notifications
 

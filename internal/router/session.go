@@ -353,6 +353,11 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 	if pl.NextVal != "" {
 		return e.afterBatch(ctx, e.answerNextval(ctx, pl.NextVal, true, true, false, w))
 	}
+	if pl.Class.Write {
+		if err := e.gateWrite(ctx); err != nil {
+			return e.afterBatch(ctx, err)
+		}
+	}
 	if isReferenceWrite(pl) {
 		return e.afterBatch(ctx, e.referenceWrite(ctx, pl, []*pgshardv1.ExecuteRequest{simpleQuery(sql)}, w))
 	}
@@ -754,6 +759,15 @@ func (e *Executor) sync(ctx context.Context) error {
 	}
 	if w == nil {
 		w = discardWriter{}
+	}
+	for _, item := range executed {
+		if item.class.Write {
+			if err := e.gateWrite(ctx); err != nil {
+				e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
+				return e.afterBatch(ctx, err)
+			}
+			break
+		}
 	}
 	if handled, err := e.nextvalBatch(ctx, batch, parsed, w); handled {
 		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]

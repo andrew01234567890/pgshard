@@ -3,6 +3,7 @@ package operator
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -27,7 +28,10 @@ const restorePollInterval = 5 * time.Second
 type RestoreReconciler struct {
 	client.Client
 	Agents AgentClient
-	Now    func() time.Time
+	// TwoPC finishes prepared transactions and lifts the write fence after a
+	// barrier restore; nil fails barrier restores with a clear reason.
+	TwoPC TwoPCAgentClient
+	Now   func() time.Time
 }
 
 // SetupWithManager registers the reconciler; clusters created by a restore
@@ -246,6 +250,7 @@ func (r *RestoreReconciler) observe(ctx context.Context, rs *pgshardv1alpha1.PgS
 	}
 	rs.Status.Groups = groups
 	ready := meta.IsStatusConditionTrue(c.Status.Conditions, pgshardv1alpha1.ConditionReady)
+	var reconcileErr error
 	switch {
 	case failed != "":
 		rs.Status.Phase = pgshardv1alpha1.RestorePhaseFailed
@@ -253,26 +258,109 @@ func (r *RestoreReconciler) observe(ctx context.Context, rs *pgshardv1alpha1.PgS
 	case r.now().Sub(rs.Status.StartedAt.Time) > restoreTimeout:
 		rs.Status.Phase = pgshardv1alpha1.RestorePhaseFailed
 		rs.Status.Error = fmt.Sprintf("cluster %s did not recover within %s", c.Name, restoreTimeout)
+	case all && ready && isBarrierRestore(rs):
+		rs.Status.Phase = pgshardv1alpha1.RestorePhaseReconciling
+		rs.Status.Error = ""
+		reconcileErr = r.reconcileTwoPhase(ctx, rs, c)
 	case all && ready:
 		rs.Status.Phase = pgshardv1alpha1.RestorePhaseRecovered
 		rs.Status.Error = ""
 	}
-	if rs.Status.Phase != pgshardv1alpha1.RestorePhaseRestoring {
+	inProgress := rs.Status.Phase == pgshardv1alpha1.RestorePhaseRestoring || rs.Status.Phase == pgshardv1alpha1.RestorePhaseReconciling
+	if !inProgress {
 		rs.Status.CompletedAt = ptrTime(r.now())
 	}
 	msg := fmt.Sprintf("cluster %s: %d/%d groups recovered, ready=%v", c.Name, countReached(groups), len(groups), ready)
-	if rs.Status.Error != "" {
+	switch {
+	case rs.Status.Error != "":
 		msg = rs.Status.Error
+	case rs.Status.Phase == pgshardv1alpha1.RestorePhaseReconciling && reconcileErr != nil:
+		msg = fmt.Sprintf("cluster %s recovered to the barrier; reconciling prepared transactions: %v", c.Name, reconcileErr)
+	case rs.Status.Phase == pgshardv1alpha1.RestorePhaseRecovered && rs.Status.Reconciliation != nil:
+		msg = fmt.Sprintf("cluster %s recovered to the barrier and unfenced: %d committed, %d rolled back", c.Name, rs.Status.Reconciliation.Committed, rs.Status.Reconciliation.RolledBack)
 	}
-	meta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{Type: "Progressing", Status: boolCondition(rs.Status.Phase == pgshardv1alpha1.RestorePhaseRestoring),
+	meta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{Type: "Progressing", Status: boolCondition(inProgress),
 		Reason: rs.Status.Phase, Message: msg, ObservedGeneration: rs.Generation})
 	if err := r.Status().Patch(ctx, rs, client.MergeFrom(base)); err != nil {
 		return ctrl.Result{}, err
 	}
-	if rs.Status.Phase != pgshardv1alpha1.RestorePhaseRestoring {
+	if reconcileErr != nil {
+		return ctrl.Result{}, reconcileErr
+	}
+	if !inProgress {
 		return ctrl.Result{}, nil
 	}
 	return ctrl.Result{RequeueAfter: restorePollInterval}, nil
+}
+
+// reconcileTwoPhase finishes the new cluster's prepared transactions
+// against its restored decision log and, when nothing contradicts it,
+// releases the write fence the barrier left in the restored catalog. It
+// sets the phase to Recovered or Failed on rs; an error means a step could
+// not run yet and the caller retries with the phase still Reconciling.
+func (r *RestoreReconciler) reconcileTwoPhase(ctx context.Context, rs *pgshardv1alpha1.PgShardRestore, c *pgshardv1alpha1.PgShardCluster) error {
+	if r.TwoPC == nil {
+		rs.Status.Phase = pgshardv1alpha1.RestorePhaseFailed
+		rs.Status.Error = "barrier restore needs the two-phase agent client; the new cluster stays fenced"
+		return nil
+	}
+	groups := Groups(c)
+	catalogAddr, catalogEpoch, err := r.primaryAgent(ctx, c, groups[0])
+	if err != nil {
+		return err
+	}
+	decisions, err := r.TwoPC.ListTransactionDecisions(ctx, catalogAddr)
+	if err != nil {
+		return fmt.Errorf("catalog decision log: %w", err)
+	}
+	st := &pgshardv1alpha1.RestoreReconciliationStatus{Decisions: int32(len(decisions))}
+	for _, g := range groups[1:] {
+		addr, epoch, err := r.primaryAgent(ctx, c, g)
+		if err != nil {
+			return err
+		}
+		out, err := r.TwoPC.ReconcilePrepared(ctx, addr, epoch, int32(g.ShardID), decisions)
+		if err != nil {
+			return fmt.Errorf("group %s: %w", g.Name(), err)
+		}
+		st.Committed += int32(out.Committed)
+		st.RolledBack += int32(out.RolledBack)
+		for _, gid := range out.Contradictions {
+			st.Contradictions = append(st.Contradictions, g.Name()+": "+gid)
+		}
+	}
+	rs.Status.Reconciliation = st
+	if len(st.Contradictions) > 0 {
+		rs.Status.Phase = pgshardv1alpha1.RestorePhaseFailed
+		rs.Status.Error = fmt.Sprintf("two-phase reconciliation found %d contradiction(s), the cluster stays fenced: %s", len(st.Contradictions), strings.Join(st.Contradictions, "; "))
+		return nil
+	}
+	if err := r.TwoPC.SetWriteFence(ctx, catalogAddr, catalogEpoch, false, ""); err != nil {
+		return fmt.Errorf("release write fence: %w", err)
+	}
+	st.Unfenced = true
+	rs.Status.Phase = pgshardv1alpha1.RestorePhaseRecovered
+	rs.Status.Error = ""
+	logf.FromContext(ctx).Info("barrier restore reconciled and unfenced", "cluster", c.Name, "committed", st.Committed, "rolledBack", st.RolledBack)
+	return nil
+}
+
+// primaryAgent returns the agent address and epoch of a group's primary.
+func (r *RestoreReconciler) primaryAgent(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group) (string, uint64, error) {
+	var pg pgshardv1alpha1.PgShardGroup
+	if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: g.Prefix()}, &pg); err != nil {
+		return "", 0, err
+	}
+	var pod corev1.Pod
+	if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: pg.Status.Primary}, &pod); err != nil {
+		return "", 0, err
+	}
+	addr := agentAddr(pod.Status.PodIP)
+	st, err := r.Agents.Status(ctx, addr)
+	if err != nil {
+		return "", 0, fmt.Errorf("group %s primary %s: %w", g.Name(), pod.Name, err)
+	}
+	return addr, st.Epoch, nil
 }
 
 const crashLoopPrefix = "primary pod is crash looping"

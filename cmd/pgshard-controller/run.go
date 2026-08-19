@@ -50,6 +50,8 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	lockKey := fs.Int64("leader-lock-key", controller.LeaderLockKey, "pg_advisory_lock key that elects the leader")
 	resolveEvery := fs.Duration("resolve-interval", 5*time.Second, "time between in-doubt transaction resolution passes")
 	shardDSNTemplate := fs.String("shard-dsn-template", "", "superuser DSN for shard primaries with {set}, {id} and {group} placeholders (enables the resolver)")
+	barrierDrain := fs.Duration("barrier-drain-timeout", controller.DefaultDrainTimeout, "how long a barrier waits for in-flight two-phase commits")
+	barrierArchive := fs.Duration("barrier-archive-timeout", controller.DefaultArchiveTimeout, "how long a barrier waits for every group's restore point to be archived")
 	var shardDSNs shardDSNFlag
 	fs.Var(&shardDSNs, "shard-dsn", "explicit shard DSN as <set>/<id>=<dsn>; repeatable")
 	if err := fs.Parse(args); err != nil {
@@ -90,10 +92,13 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	rec := &controller.Reconciler{DSN: *catalogDSN, Logger: logger, LockKey: *lockKey, Interval: *interval, RetryInterval: *retry}
 	go func() { _ = rec.Run(ctx) }()
 	var resolver *controller.Resolver
+	var barrier *controller.Barrier
 	if *shardDSNTemplate != "" || len(shardDSNs) > 0 {
-		resolver = &controller.Resolver{Pool: pool, Logger: logger,
-			Shards: &controller.PgxShardDialer{Pool: pool, DSNs: shardDSNs, Template: *shardDSNTemplate}}
+		dialer := &controller.PgxShardDialer{Pool: pool, DSNs: shardDSNs, Template: *shardDSNTemplate}
+		resolver = &controller.Resolver{Pool: pool, Logger: logger, Shards: dialer}
 		go resolver.Run(ctx, *resolveEvery)
+		barrier = &controller.Barrier{Store: &controller.PGBarrierStore{Pool: pool}, Groups: &controller.SQLBarrierGroups{Pool: pool, Shards: dialer},
+			Resolver: resolver, Logger: logger, DrainTimeout: *barrierDrain, ArchiveTimeout: *barrierArchive}
 	}
 
 	if *listen == "" {
@@ -107,7 +112,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return cli.ExitNotReady
 	}
 	g := grpc.NewServer(grpc.Creds(creds))
-	pgshardv1.RegisterControllerServer(g, &controller.Server{Pool: pool, Resolver: resolver})
+	pgshardv1.RegisterControllerServer(g, &controller.Server{Pool: pool, Resolver: resolver, Barrier: barrier})
 	mode := "mTLS"
 	if *insecureDev {
 		mode = "INSECURE plaintext"

@@ -52,6 +52,18 @@ spec:
               PgShardBackupPolicySpec is the desired backup policy. Clusters bind to it
               through spec.backup.policyRef.
             properties:
+              barrierSchedule:
+                description: |-
+                  BarrierSchedule is a cron expression on which the operator asks each
+                  bound cluster's controller for a certified barrier: a cluster-wide
+                  restore point taken with writes paused and two-phase commits drained.
+                type: string
+              controllerEndpoint:
+                description: |-
+                  ControllerEndpoint is the host:port of a cluster's Controller gRPC
+                  service, with {cluster} and {namespace} substituted; the default is
+                  {cluster}-controller.{namespace}.svc:15500.
+                type: string
               logLevel:
                 description: |-
                   LogLevel is the pgBackRest log level (off, error, warn, info, detail,

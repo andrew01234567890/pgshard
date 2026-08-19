@@ -58,6 +58,8 @@ type Router struct {
 	mu       sync.Mutex
 	sessions map[uint64]*Executor
 	buffered map[Shard]int
+	// fenceWaiting counts statements held by the cluster write fence.
+	fenceWaiting int
 	// prepared caches whether a shard's PostgreSQL accepts prepared
 	// transactions.
 	prepared map[Shard]bool

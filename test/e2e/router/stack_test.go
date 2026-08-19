@@ -216,12 +216,17 @@ func startStack(tb testing.TB) *stack {
 // startStackWith is startStack with extra PostgreSQL options for shard 0.
 func startStackWith(tb testing.TB, shardOpts []string) *stack {
 	tb.Helper()
+	return startStackFull(tb, nil, shardOpts)
+}
+
+// startStackFull is startStack with extra PostgreSQL options for the
+// catalog and for shard 0.
+func startStackFull(tb testing.TB, catalogOpts, shardOpts []string) *stack {
+	tb.Helper()
 	requireDocker(tb)
 	poolerBin, routerBin := buildBinaries(tb)
 	s := &stack{routerLog: &logBuffer{}, poolerLog: &logBuffer{}}
-	var catalogAddr string
-	catalogAddr, s.catalogDSN = startPostgres(tb, "catalog")
-	_ = catalogAddr
+	_, s.catalogDSN = startPostgres(tb, "catalog", catalogOpts...)
 	s.shardAddr, s.shardDSN = startPostgres(tb, "shard0", shardOpts...)
 	s.poolerAddr = fmt.Sprintf("127.0.0.1:%d", freePort(tb))
 	err := router.DevBootstrap{CatalogDSN: s.catalogDSN, ShardDSN: s.shardDSN, Database: appDatabase, Role: appRole,

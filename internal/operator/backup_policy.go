@@ -63,6 +63,9 @@ func (r *BackupPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Scheduler == nil {
 		r.Scheduler = NewBackupScheduler(mgr.GetClient())
 	}
+	if r.Scheduler.Barriers == nil {
+		r.Scheduler.Barriers = GRPCBarrierClient{}
+	}
 	if err := mgr.Add(r.Scheduler); err != nil {
 		return err
 	}
@@ -126,6 +129,10 @@ func (r *BackupPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		valid.Status = metav1.ConditionFalse
 		valid.Reason = "InvalidSchedule"
 		valid.Message = err.Error()
+	} else if err := r.Scheduler.SetBarrier(req.NamespacedName, pol.Spec.BarrierSchedule); err != nil {
+		valid.Status = metav1.ConditionFalse
+		valid.Reason = "InvalidSchedule"
+		valid.Message = err.Error()
 	}
 	meta.SetStatusCondition(&pol.Status.Conditions, valid)
 
@@ -174,6 +181,11 @@ func (r *BackupPolicyReconciler) validate(pol *pgshardv1alpha1.PgShardBackupPoli
 	for typ, expr := range scheduleTypes(pol.Spec.Schedules) {
 		if _, err := ParseSchedule(expr); err != nil {
 			return fmt.Errorf("schedules.%s %q: %w", typ, expr, err)
+		}
+	}
+	if pol.Spec.BarrierSchedule != "" {
+		if _, err := ParseSchedule(pol.Spec.BarrierSchedule); err != nil {
+			return fmt.Errorf("barrierSchedule %q: %w", pol.Spec.BarrierSchedule, err)
 		}
 	}
 	return nil
@@ -263,21 +275,105 @@ func BackupHealth(now time.Time, schedules pgshardv1alpha1.BackupSchedules, last
 	return cond
 }
 
-// BackupScheduler fires PgShardBackup objects from policy cron schedules.
+// BackupScheduler fires PgShardBackup objects and controller barriers from
+// policy cron schedules.
 type BackupScheduler struct {
 	client client.Client
 	cron   *cron.Cron
 	now    func() time.Time
+	// Barriers asks controllers for barriers; nil disables barrier ticks.
+	Barriers BarrierClient
 
 	mu      sync.Mutex
 	entries map[types.NamespacedName][]cron.EntryID
 	specs   map[types.NamespacedName]pgshardv1alpha1.BackupSchedules
+	// barriers holds the barrier entry and cron expression per policy.
+	barriers map[types.NamespacedName]barrierEntry
+}
+
+type barrierEntry struct {
+	id   cron.EntryID
+	expr string
 }
 
 // NewBackupScheduler builds a scheduler that creates backups through cl.
 func NewBackupScheduler(cl client.Client) *BackupScheduler {
 	return &BackupScheduler{client: cl, cron: cron.New(cron.WithParser(cronParser), cron.WithLocation(time.UTC)), now: time.Now,
-		entries: map[types.NamespacedName][]cron.EntryID{}, specs: map[types.NamespacedName]pgshardv1alpha1.BackupSchedules{}}
+		entries: map[types.NamespacedName][]cron.EntryID{}, specs: map[types.NamespacedName]pgshardv1alpha1.BackupSchedules{},
+		barriers: map[types.NamespacedName]barrierEntry{}}
+}
+
+// SetBarrier arms (or, with "", disarms) the barrier schedule of a policy;
+// an unchanged expression keeps its entry.
+func (s *BackupScheduler) SetBarrier(key types.NamespacedName, expr string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cur, ok := s.barriers[key]; ok && cur.expr == expr {
+		return nil
+	}
+	s.removeBarrierLocked(key)
+	if expr == "" {
+		return nil
+	}
+	id, err := s.cron.AddFunc(expr, func() { s.fireBarrier(key) })
+	if err != nil {
+		return fmt.Errorf("barrierSchedule %q: %w", expr, err)
+	}
+	s.barriers[key] = barrierEntry{id: id, expr: expr}
+	return nil
+}
+
+func (s *BackupScheduler) removeBarrierLocked(key types.NamespacedName) {
+	if e, ok := s.barriers[key]; ok {
+		s.cron.Remove(e.id)
+		delete(s.barriers, key)
+	}
+}
+
+// BarrierArmed reports whether a policy has a barrier schedule armed.
+func (s *BackupScheduler) BarrierArmed(key types.NamespacedName) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.barriers[key]
+	return ok
+}
+
+func (s *BackupScheduler) fireBarrier(key types.NamespacedName) {
+	ctx, cancel := context.WithTimeout(context.Background(), barrierRPCTimeout+30*time.Second)
+	defer cancel()
+	if err := s.FireBarrier(ctx, key); err != nil {
+		logf.Log.WithName("backup-scheduler").Error(err, "scheduled barrier failed", "policy", key.String())
+	}
+}
+
+// FireBarrier asks the controller of every cluster bound to the policy for
+// a barrier named after the tick. Clusters are taken one after another so
+// their write pauses never overlap; one failure does not stop the others.
+func (s *BackupScheduler) FireBarrier(ctx context.Context, key types.NamespacedName) error {
+	if s.Barriers == nil {
+		return errors.New("no barrier client configured")
+	}
+	var pol pgshardv1alpha1.PgShardBackupPolicy
+	if err := s.client.Get(ctx, key, &pol); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	clusters, err := clustersOfPolicy(ctx, s.client, key)
+	if err != nil {
+		return err
+	}
+	at := s.now()
+	var errs []error
+	for i := range clusters {
+		c := &clusters[i]
+		addr := ControllerEndpoint(pol.Spec.ControllerEndpoint, c.Name, c.Namespace)
+		name := ScheduledBarrierName(key.Name, c.Name, at)
+		if err := s.Barriers.CreateBarrier(ctx, addr, name); err != nil {
+			errs = append(errs, fmt.Errorf("cluster %s (%s): barrier %s: %w", c.Name, addr, name, err))
+			continue
+		}
+		logf.Log.WithName("backup-scheduler").Info("certified barrier recorded", "policy", key.String(), "cluster", c.Name, "barrier", name)
+	}
+	return errors.Join(errs...)
 }
 
 // Start runs the cron loop until ctx ends.
@@ -336,6 +432,7 @@ func (s *BackupScheduler) removeLocked(key types.NamespacedName) {
 	}
 	delete(s.entries, key)
 	delete(s.specs, key)
+	s.removeBarrierLocked(key)
 }
 
 // Entries reports how many cron entries a policy has armed.

@@ -26,7 +26,14 @@ type resolverFixture struct {
 
 func newResolverFixture(t *testing.T) *resolverFixture {
 	t.Helper()
-	dsn := startPostgres(t)
+	return newResolverFixtureWith(t)
+}
+
+// newResolverFixtureWith starts the catalog and shards with extra server
+// options.
+func newResolverFixtureWith(t *testing.T, opts ...string) *resolverFixture {
+	t.Helper()
+	dsn := startPostgresWith(t, opts...)
 	ctx := context.Background()
 	conn := connect(t, dsn)
 	if err := catalog.Migrate(ctx, conn); err != nil {
@@ -40,7 +47,7 @@ func newResolverFixture(t *testing.T) *resolverFixture {
 	f := &resolverFixture{t: t, pool: pool}
 	dsns := map[ShardRef]string{}
 	for _, id := range []int{0, 1} {
-		sdsn := startPostgresWith(t, "-c max_prepared_transactions=16")
+		sdsn := startPostgresWith(t, append([]string{"-c max_prepared_transactions=16"}, opts...)...)
 		f.shards = append(f.shards, sdsn)
 		dsns[ShardRef{Set: "default", ID: int32(id)}] = sdsn
 		mustExec(t, conn, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch)

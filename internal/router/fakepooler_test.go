@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"google.golang.org/grpc"
@@ -145,6 +146,9 @@ type fakeBackend struct {
 	tx    byte
 	rows  int
 }
+
+// fakeXIDs hands out distinct transaction ids across every fake shard.
+var fakeXIDs atomic.Int64
 
 func newFakePooler(gen, epoch uint64) *fakePooler {
 	return &fakePooler{gen: gen, epoch: epoch, backends: map[string]*fakeBackend{}, reserved: map[string]bool{}, sleeping: map[string]chan struct{}{}}
@@ -345,6 +349,14 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 			return true, err
 		}
 		return true, s.complete("SHOW")
+	case q == "select pg_current_xact_id()::text":
+		if err := s.rowDesc("pg_current_xact_id", 25); err != nil {
+			return true, err
+		}
+		if err := s.row(fmt.Sprint(1000 + fakeXIDs.Add(1))); err != nil {
+			return true, err
+		}
+		return true, s.complete("SELECT 1")
 	case strings.HasPrefix(q, "prepare transaction '"):
 		gid := strings.TrimSuffix(strings.TrimPrefix(q, "prepare transaction '"), "'")
 		b.tx = 'I'
