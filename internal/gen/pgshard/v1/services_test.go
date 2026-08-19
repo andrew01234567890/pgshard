@@ -13,6 +13,7 @@ func TestDescriptorSetIncludesServices(t *testing.T) {
 		"pgshard.v1.Agent",
 		"pgshard.v1.Controller",
 		"pgshard.v1.Pooler",
+		"pgshard.v1.RouterPeer",
 		"pgshard.v1.VStream",
 	}
 	var got []string

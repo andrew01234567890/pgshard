@@ -1,0 +1,26 @@
+// Router to router contract: cancel requests forwarded between instances.
+syntax = "proto3";
+
+package pgshard.v1;
+
+option go_package = "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1;pgshardv1";
+
+// RouterPeer lets one router instance act on a client CancelRequest whose
+// key was minted by another instance.
+service RouterPeer {
+  // Cancel interrupts the local session identified by the cancel key, if
+  // any. Delivery is best effort, as with PostgreSQL's own cancel protocol.
+  rpc Cancel(RouterCancelRequest) returns (RouterCancelResponse);
+}
+
+// RouterCancelRequest carries the client-supplied cancel key verbatim.
+message RouterCancelRequest {
+  // BackendKeyData process id (the session id on the minting instance).
+  uint32 pid = 1;
+  // Secret key bytes; protocol 3.2 keys embed the minting instance id.
+  bytes secret = 2;
+}
+
+// RouterCancelResponse acknowledges receipt; it does not report whether a
+// session matched, so a caller cannot probe for live keys.
+message RouterCancelResponse {}

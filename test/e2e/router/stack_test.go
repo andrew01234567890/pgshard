@@ -40,8 +40,21 @@ type stack struct {
 	routerAddr string
 	routerPort string
 	poolerAddr string
+	routerBin  string
+	peerAddr   string
+	healthAddr string
 	routerLog  *logBuffer
 	poolerLog  *logBuffer
+}
+
+// routerProc is one extra router process on the stack.
+type routerProc struct {
+	cmd        *exec.Cmd
+	exited     <-chan struct{}
+	addr       string
+	peerAddr   string
+	healthAddr string
+	log        *logBuffer
 }
 
 type logBuffer struct {
@@ -133,21 +146,22 @@ func buildBinaries(tb testing.TB) (pooler, rtr string) {
 	return filepath.Join(dir, "pgshard-pooler"), filepath.Join(dir, "pgshard-router")
 }
 
-func startProcess(tb testing.TB, log *logBuffer, ready string, bin string, args ...string) {
+func startProcess(tb testing.TB, log *logBuffer, ready string, bin string, args ...string) (*exec.Cmd, <-chan struct{}) {
 	tb.Helper()
 	cmd := exec.Command(bin, args...)
 	cmd.Stdout, cmd.Stderr = log, log
 	if err := cmd.Start(); err != nil {
 		tb.Fatal(err)
 	}
+	waited := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(waited) }()
 	tb.Cleanup(func() {
 		_ = cmd.Process.Signal(os.Interrupt)
-		done := make(chan struct{})
-		go func() { _, _ = cmd.Process.Wait(); close(done) }()
 		select {
-		case <-done:
+		case <-waited:
 		case <-time.After(15 * time.Second):
 			_ = cmd.Process.Kill()
+			<-waited
 		}
 	})
 	deadline := time.Now().Add(60 * time.Second)
@@ -157,6 +171,27 @@ func startProcess(tb testing.TB, log *logBuffer, ready string, bin string, args 
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	return cmd, waited
+}
+
+// startRouter launches another router on the stack with the given instance
+// id, forwarding cancels it does not own to peers.
+func (s *stack) startRouter(tb testing.TB, instanceID int, peers map[int]string, extra ...string) *routerProc {
+	tb.Helper()
+	p := &routerProc{log: &logBuffer{}}
+	port := freePort(tb)
+	p.addr = fmt.Sprintf("127.0.0.1:%d", port)
+	p.peerAddr = fmt.Sprintf("127.0.0.1:%d", freePort(tb))
+	p.healthAddr = fmt.Sprintf("127.0.0.1:%d", freePort(tb))
+	args := []string{"serve", "--insecure-dev", "--listen", "0.0.0.0:" + fmt.Sprint(port), "--catalog-dsn", s.catalogDSN,
+		"--instance-id", fmt.Sprint(instanceID), "--peer-cancel-listen", p.peerAddr, "--health-listen", p.healthAddr,
+		"--drain-timeout", "5s", "--drain-delay", "1s", "--buffer-window", "10s"}
+	for id, addr := range peers {
+		args = append(args, "--peer", fmt.Sprintf("%d=%s", id, addr))
+	}
+	args = append(args, extra...)
+	p.cmd, p.exited = startProcess(tb, p.log, "listening on", s.routerBin, args...)
+	return p
 }
 
 func startStack(tb testing.TB) *stack {
@@ -178,11 +213,25 @@ func startStack(tb testing.TB) *stack {
 	startProcess(tb, s.poolerLog, "listening on", poolerBin, "run", "--insecure-dev", "--listen", s.poolerAddr,
 		"--pg-host", host, "--pg-port", port, "--pg-database", appDatabase,
 		"--catalog-dsn", s.catalogDSN, "--shard-set", router.DefaultShardSet, "--shard-id", "0", "--drain-timeout", "5s")
+	s.routerBin = routerBin
 	s.routerPort = fmt.Sprint(freePort(tb))
 	s.routerAddr = "127.0.0.1:" + s.routerPort
+	s.peerAddr = fmt.Sprintf("127.0.0.1:%d", freePort(tb))
+	s.healthAddr = fmt.Sprintf("127.0.0.1:%d", freePort(tb))
 	startProcess(tb, s.routerLog, "listening on", routerBin, "serve", "--insecure-dev", "--listen", "0.0.0.0:"+s.routerPort,
-		"--catalog-dsn", s.catalogDSN, "--drain-timeout", "5s")
+		"--catalog-dsn", s.catalogDSN, "--drain-timeout", "5s", "--drain-delay", "1s",
+		"--instance-id", "1", "--peer-cancel-listen", s.peerAddr, "--health-listen", s.healthAddr)
 	return s
+}
+
+func (s *stack) connectTo(tb testing.TB, addr string) *pgx.Conn {
+	tb.Helper()
+	conn, err := pgx.Connect(context.Background(), fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", appRole, appPassword, addr, appDatabase))
+	if err != nil {
+		tb.Fatalf("connect to %s: %v", addr, err)
+	}
+	tb.Cleanup(func() { _ = conn.Close(context.Background()) })
+	return conn
 }
 
 func (s *stack) dsn(user, password, db string) string {

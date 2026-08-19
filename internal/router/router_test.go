@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,25 +21,69 @@ import (
 )
 
 type harness struct {
-	fp   *fakePooler
-	addr string
-	r    *Router
-	snap *snapshot.Snapshot
+	fp         *fakePooler
+	poolerAddr string
+	addr       string
+	r          *Router
+	srv        *pgwire.Server
+	snapp      atomic.Pointer[snapshot.Snapshot]
+	subsMu     sync.Mutex
+	subs       map[chan snapshot.Change]struct{}
+}
+
+func (h *harness) snap() *snapshot.Snapshot { return h.snapp.Load() }
+
+// setSnap publishes s and wakes buffered statements.
+func (h *harness) setSnap(s *snapshot.Snapshot) {
+	h.snapp.Store(s)
+	h.subsMu.Lock()
+	defer h.subsMu.Unlock()
+	for ch := range h.subs {
+		select {
+		case ch <- snapshot.Change{ShardMapGeneration: s.ShardMapGeneration}:
+		default:
+		}
+	}
+}
+
+func (h *harness) subscribe() (<-chan snapshot.Change, func()) {
+	ch := make(chan snapshot.Change, 1)
+	h.subsMu.Lock()
+	h.subs[ch] = struct{}{}
+	h.subsMu.Unlock()
+	return ch, func() {
+		h.subsMu.Lock()
+		delete(h.subs, ch)
+		h.subsMu.Unlock()
+	}
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	fp := newFakePooler(7, 2)
-	poolerAddr := startFakePooler(t, fp)
+	return newHarnessWith(t, fp, startFakePooler(t, fp), nil)
+}
+
+// newHarnessWith runs a router in front of the fake pooler at poolerAddr;
+// mutate may adjust the router configuration.
+func newHarnessWith(t *testing.T, fp *fakePooler, poolerAddr string, mutate func(*Config)) *harness {
+	t.Helper()
 	snap := &snapshot.Snapshot{
 		ShardMapGeneration: 7,
-		Serving:            map[snapshot.ShardKey]snapshot.Serving{{ShardSet: DefaultShardSet, ShardID: 0}: {Epoch: 2, PrimaryEndpoint: poolerAddr}},
+		Serving:            map[snapshot.ShardKey]snapshot.Serving{{ShardSet: DefaultShardSet, ShardID: 0}: {Epoch: 2, PrimaryEndpoint: poolerAddr, State: "serving"}},
 		Databases:          map[string]catalog.Database{"app": {Name: "app", HomeShard: 0}},
 	}
-	h := &harness{fp: fp, snap: snap}
-	poolers := NewPoolers(nil, func() *snapshot.Snapshot { return h.snap }, insecure.NewCredentials())
+	h := &harness{fp: fp, poolerAddr: poolerAddr, subs: map[chan snapshot.Change]struct{}{}}
+	h.snapp.Store(snap)
+	poolers := NewPoolers(nil, h.snap, insecure.NewCredentials())
 	t.Cleanup(poolers.Close)
-	r, err := New(Config{Snapshot: func() *snapshot.Snapshot { return h.snap }, Poolers: poolers, Logger: slog.New(slog.DiscardHandler)})
+	cfg := Config{Snapshot: h.snap, Poolers: poolers, Logger: slog.New(slog.DiscardHandler),
+		Buffering: Buffering{Window: 700 * time.Millisecond, Poll: 20 * time.Millisecond, PerShardCap: 2,
+			Changes: h.subscribe}}
+	if mutate != nil {
+		mutate(&cfg)
+	}
+	r, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,13 +98,14 @@ func newHarness(t *testing.T) *harness {
 		}
 		return "", ErrUnknownRole
 	}
-	cfg := pgwire.Config{Authenticator: pgwire.SCRAMAuthenticator{Lookup: lookup}, NewExecutor: r.NewExecutor}
+	pcfg := pgwire.Config{Authenticator: pgwire.SCRAMAuthenticator{Lookup: lookup}, NewExecutor: r.NewExecutor}
 	var srv *pgwire.Server
-	cfg.CancelHandler = func(ctx context.Context, key pgwire.CancelKey) { r.CancelHandler(srv)(ctx, key) }
-	srv, err = pgwire.NewServer(cfg)
+	pcfg.CancelHandler = func(ctx context.Context, key pgwire.CancelKey) { r.CancelHandler(srv)(ctx, key) }
+	srv, err = pgwire.NewServer(pcfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	h.srv = srv
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -363,15 +410,18 @@ func TestStaleGenerationSurfaces(t *testing.T) {
 	h := newHarness(t)
 	conn := h.connect(t, h.dsn("app", "secret", "app"))
 	ctx := context.Background()
-	stale := *h.snap
+	fresh := h.snap()
+	stale := *fresh
 	stale.ShardMapGeneration = 6
-	h.snap = &stale
+	h.setSnap(&stale)
+	start := time.Now()
 	if _, err := conn.Exec(ctx, "select 1"); sqlstate(err) != "55000" {
 		t.Fatalf("stale generation: %v", err)
 	}
-	fresh := stale
-	fresh.ShardMapGeneration = 7
-	h.snap = &fresh
+	if time.Since(start) < 700*time.Millisecond {
+		t.Fatalf("stale generation was reported after %s without waiting for the buffer window", time.Since(start))
+	}
+	h.setSnap(fresh)
 	var n int
 	if err := conn.QueryRow(ctx, "select 1").Scan(&n); err != nil || n != 1 {
 		t.Fatalf("after reload: %v", err)

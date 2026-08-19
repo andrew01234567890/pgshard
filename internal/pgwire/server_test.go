@@ -810,3 +810,54 @@ func TestExecutorFactoryErrorIsFatal(t *testing.T) {
 		t.Fatalf("got %+v", res.errResp)
 	}
 }
+
+func TestShutdownLetsOpenTransactionFinish(t *testing.T) {
+	ts := startServer(t, Config{})
+	c := dialRaw(t, ts.addr)
+	c.startup(ProtocolVersion30)
+	c.send(&pgproto3.Query{String: "begin"})
+	c.recv() // CommandComplete
+	if rfq, ok := c.recv().(*pgproto3.ReadyForQuery); !ok || rfq.TxStatus != 'T' {
+		t.Fatalf("expected in-block ReadyForQuery, got %+v", rfq)
+	}
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		shutdownDone <- ts.Shutdown(ctx)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.Dial("tcp", ts.addr)
+		if err != nil {
+			break
+		}
+		_ = conn.Close()
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("shutdown returned %v while a transaction was open", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	c.send(&pgproto3.Query{String: "select 1"})
+	if _, ok := c.recv().(*pgproto3.RowDescription); !ok {
+		t.Fatal("statement inside an open transaction must still run during drain")
+	}
+	c.recv()
+	c.recv()
+	c.recv()
+	c.send(&pgproto3.Query{String: "commit"})
+	if cc, ok := c.recv().(*pgproto3.CommandComplete); !ok || string(cc.CommandTag) != "COMMIT" {
+		t.Fatalf("commit during drain got %+v", cc)
+	}
+	c.recv()
+	if er, ok := c.recv().(*pgproto3.ErrorResponse); !ok || er.Code != CodeAdminShutdown {
+		t.Fatalf("session should be terminated once the transaction ends, got %+v", er)
+	}
+	if err := <-shutdownDone; err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+}

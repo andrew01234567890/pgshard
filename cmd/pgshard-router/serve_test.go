@@ -22,6 +22,10 @@ func TestServeUsageErrors(t *testing.T) {
 		{"--catalog-dsn", "postgres://x/y", "--insecure-dev", "--pooler", "nonsense"},
 		{"--catalog-dsn", "postgres://x/y", "--pooler-tls-cert", "/nonexistent/c", "--pooler-tls-key", "/nonexistent/k", "--pooler-tls-ca", "/nonexistent/ca"},
 		{"--catalog-dsn", "not a dsn", "--insecure-dev"},
+		{"--catalog-dsn", "postgres://x/y", "--insecure-dev", "--peer", "2=h:1"},
+		{"--catalog-dsn", "postgres://x/y", "--insecure-dev", "--peer-service", "h:1"},
+		{"--catalog-dsn", "postgres://x/y", "--insecure-dev", "--peer-cancel-listen", "127.0.0.1:0", "--peer", "zero=h:1"},
+		{"--catalog-dsn", "postgres://x/y", "--insecure-dev", "--instance-id", "4294967296"},
 	}
 	for _, args := range cases {
 		var out, errb bytes.Buffer
@@ -72,5 +76,20 @@ func TestListenNetwork(t *testing.T) {
 		if got := listenNetwork(addr); got != want {
 			t.Errorf("%s: got %s want %s", addr, got, want)
 		}
+	}
+}
+
+func TestPeerFlags(t *testing.T) {
+	p := peerFlags{}
+	if err := p.Set("7=10.0.0.1:9000"); err != nil || p[7] != "10.0.0.1:9000" {
+		t.Fatalf("%v %v", p, err)
+	}
+	for _, bad := range []string{"", "7", "7=", "=h:1", "0=h:1", "4294967296=h:1", "x=h:1"} {
+		if err := (peerFlags{}).Set(bad); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+	if !strings.Contains(p.String(), "10.0.0.1:9000") {
+		t.Fatalf("String %q", p.String())
 	}
 }

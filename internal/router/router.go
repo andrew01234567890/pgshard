@@ -21,6 +21,16 @@ type Config struct {
 	// sessions opening it are routed to the catalog shard set. Default
 	// "pgshard".
 	CatalogDatabase string
+	// Peers receives cancel keys no local session owns; nil drops them.
+	Peers CancelForwarder
+	// Buffering tunes failover buffering; zero values pick defaults.
+	Buffering Buffering
+}
+
+// CancelForwarder delivers a cancel key to the router instances it may
+// belong to.
+type CancelForwarder interface {
+	Forward(ctx context.Context, key pgwire.CancelKey)
 }
 
 // Router creates executors for authenticated sessions and dispatches cancel
@@ -31,6 +41,7 @@ type Router struct {
 
 	mu       sync.Mutex
 	sessions map[uint64]*Executor
+	buffered map[Shard]int
 }
 
 // New validates cfg and returns a Router.
@@ -47,11 +58,12 @@ func New(cfg Config) (*Router, error) {
 	if cfg.CatalogDatabase == "" {
 		cfg.CatalogDatabase = "pgshard"
 	}
+	cfg.Buffering = cfg.Buffering.withDefaults()
 	var b [4]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return nil, err
 	}
-	return &Router{cfg: cfg, prefix: hex.EncodeToString(b[:]), sessions: map[uint64]*Executor{}}, nil
+	return &Router{cfg: cfg, prefix: hex.EncodeToString(b[:]), sessions: map[uint64]*Executor{}, buffered: map[Shard]int{}}, nil
 }
 
 // NewExecutor implements pgwire.Config.NewExecutor: it resolves the session's
@@ -96,19 +108,30 @@ func (r *Router) forget(e *Executor) {
 }
 
 // CancelHandler returns a pgwire.CancelHandler that verifies the key with
-// srv and then interrupts the session's backend through its pooler.
+// srv and then interrupts the session's backend through its pooler. Keys no
+// local session owns go to Config.Peers, when set.
 func (r *Router) CancelHandler(srv *pgwire.Server) pgwire.CancelHandler {
 	return func(ctx context.Context, key pgwire.CancelKey) {
-		if !srv.CancelLocal(key) {
+		if r.CancelLocal(ctx, srv, key) || r.cfg.Peers == nil {
 			return
 		}
-		r.mu.Lock()
-		e := r.sessions[uint64(key.PID)]
-		r.mu.Unlock()
-		if e != nil {
-			e.cancelBackend(ctx)
-		}
+		r.cfg.Peers.Forward(ctx, key)
 	}
+}
+
+// CancelLocal cancels the local session key names, if any, and reports
+// whether one matched. Peer routers call this for forwarded keys.
+func (r *Router) CancelLocal(ctx context.Context, srv *pgwire.Server, key pgwire.CancelKey) bool {
+	if !srv.CancelLocal(key) {
+		return false
+	}
+	r.mu.Lock()
+	e := r.sessions[uint64(key.PID)]
+	r.mu.Unlock()
+	if e != nil {
+		e.cancelBackend(ctx)
+	}
+	return true
 }
 
 // Sessions reports the number of live executors.
