@@ -53,6 +53,8 @@ func startShardedStackFull(tb testing.TB, catalogOpts, shard0Opts, shard1Opts []
 	startProcess(tb, &logBuffer{}, "listening on", poolerBin, "run", "--insecure-dev", "--listen", pooler1,
 		"--pg-host", host, "--pg-port", port, "--pg-database", appDatabase,
 		"--catalog-dsn", s.catalogDSN, "--shard-set", router.DefaultShardSet, "--shard-id", "1", "--drain-timeout", "5s")
+	s.shardDSNs[1] = s.shard1DSN
+	s.startController(tb)
 	ctx := context.Background()
 	cat, err := pgx.Connect(ctx, s.catalogDSN)
 	if err != nil {
@@ -218,7 +220,7 @@ func TestRouterShardedRouting(t *testing.T) {
 			{"insert into orders values (1, 2)", "insert requires the shard key"},
 			{"update orders set tenant_id = 1 where tenant_id = 2", "shard key is immutable"},
 			{"delete from orders", "scatter DELETE without a shard key predicate is not available yet"},
-			{"create index on orders (id)", "DDL fan-out is not available yet"},
+			{"alter table orders alter column id type bigint", "rewrite-class DDL is not available yet"},
 			{"create table orders (id int primary key, tenant_id int8)", "primary key or unique constraint (id) on sharded table \"orders\" must include the shard key \"tenant_id\""},
 		} {
 			_, err := conn.Exec(ctx, c.sql)

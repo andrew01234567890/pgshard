@@ -35,6 +35,8 @@ type Config struct {
 	// Sequences serves the global sequences of sharded tables; nil refuses
 	// statements that need one.
 	Sequences *SequenceAllocator
+	// Migrations queues DDL for the controller's applier; nil refuses DDL.
+	Migrations MigrationQueue
 }
 
 // CancelForwarder delivers a cancel key to the router instances it may

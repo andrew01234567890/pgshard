@@ -273,22 +273,22 @@ type PgxShardDialer struct {
 
 // Dial implements ShardDialer.
 func (d *PgxShardDialer) Dial(ctx context.Context, shardSet string, shardID int32) (ShardConn, error) {
+	return d.DialDatabase(ctx, shardSet, shardID, "")
+}
+
+func (d *PgxShardDialer) dsn(ctx context.Context, shardSet string, shardID int32) (string, error) {
 	dsn, ok := d.DSNs[ShardRef{Set: shardSet, ID: shardID}]
-	if !ok {
-		if d.Template == "" {
-			return nil, fmt.Errorf("no DSN for shard %s/%d", shardSet, shardID)
-		}
-		var group string
-		if err := d.Pool.QueryRow(ctx, `SELECT group_name FROM pgshard.shard_status WHERE shard_set = $1 AND shard_id = $2`, shardSet, shardID).Scan(&group); err != nil {
-			return nil, fmt.Errorf("shard %s/%d: %w", shardSet, shardID, err)
-		}
-		dsn = strings.NewReplacer("{set}", shardSet, "{id}", fmt.Sprint(shardID), "{group}", group).Replace(d.Template)
+	if ok {
+		return dsn, nil
 	}
-	conn, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		return nil, fmt.Errorf("shard %s/%d: %w", shardSet, shardID, err)
+	if d.Template == "" {
+		return "", fmt.Errorf("no DSN for shard %s/%d", shardSet, shardID)
 	}
-	return pgxShardConn{conn}, nil
+	var group string
+	if err := d.Pool.QueryRow(ctx, `SELECT group_name FROM pgshard.shard_status WHERE shard_set = $1 AND shard_id = $2`, shardSet, shardID).Scan(&group); err != nil {
+		return "", fmt.Errorf("shard %s/%d: %w", shardSet, shardID, err)
+	}
+	return strings.NewReplacer("{set}", shardSet, "{id}", fmt.Sprint(shardID), "{group}", group).Replace(d.Template), nil
 }
 
 type pgxShardConn struct{ *pgx.Conn }

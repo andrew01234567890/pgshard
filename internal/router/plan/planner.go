@@ -52,7 +52,7 @@ func (p *Planner) Plan(ctx context.Context, sess Session, sql string) (Plan, err
 	if err := classify(raw.GetStmt(), &pl.Class); err != nil {
 		return refusalErr(err)
 	}
-	w := &walker{sess: sess, plan: pl, tree: res.Tree, root: raw.GetStmt()}
+	w := &walker{sess: sess, plan: pl, tree: res.Tree, root: raw.GetStmt(), raw: raw, sql: sql}
 	if err := w.statement(raw.GetStmt()); err != nil {
 		return refusalErr(err)
 	}
@@ -241,8 +241,10 @@ type walker struct {
 	outer *pgquerypb.SelectStmt
 	// target is the relation an INSERT, UPDATE or DELETE writes.
 	target *rel
-	// root is the statement being planned.
+	// root is the statement being planned; raw wraps it and sql is its text.
 	root *pgquerypb.Node
+	raw  *pgquerypb.RawStmt
+	sql  string
 }
 
 func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
@@ -359,26 +361,62 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 	case *pgquerypb.Node_CreateStmt:
 		return w.createTable(n.CreateStmt)
 	case *pgquerypb.Node_IndexStmt:
-		return w.ddl(n.IndexStmt.GetRelation())
+		return w.createIndex(n.IndexStmt)
 	case *pgquerypb.Node_AlterTableStmt:
-		return w.ddl(n.AlterTableStmt.GetRelation())
+		return w.alterTable(n.AlterTableStmt)
 	case *pgquerypb.Node_RenameStmt:
-		return w.ddl(n.RenameStmt.GetRelation())
+		return w.rename(n.RenameStmt)
 	case *pgquerypb.Node_ViewStmt:
-		return w.derived(n.ViewStmt.GetView(), n.ViewStmt.GetQuery(), "CREATE VIEW")
+		return w.createView(n.ViewStmt)
 	case *pgquerypb.Node_CreateTableAsStmt:
 		return w.derived(n.CreateTableAsStmt.GetInto().GetRel(), n.CreateTableAsStmt.GetQuery(), "CREATE TABLE AS")
 	case *pgquerypb.Node_TruncateStmt:
-		return w.ddlList(n.TruncateStmt.GetRelations())
+		return w.maintenanceList("TRUNCATE", n.TruncateStmt.GetRelations())
 	case *pgquerypb.Node_LockStmt:
-		return w.ddlList(n.LockStmt.GetRelations())
+		return w.maintenanceList("LOCK TABLE", n.LockStmt.GetRelations())
 	case *pgquerypb.Node_VacuumStmt:
 		for _, item := range n.VacuumStmt.GetRels() {
-			if err := w.ddl(item.GetVacuumRelation().GetRelation()); err != nil {
+			if err := w.maintenance("VACUUM and ANALYZE", item.GetVacuumRelation().GetRelation()); err != nil {
 				return err
 			}
 		}
 		return nil
+	case *pgquerypb.Node_CreateSchemaStmt:
+		return w.migration(Migration{Kind: "CREATE SCHEMA", Scope: ScopeAll,
+			Object: ObjectRef{Kind: "schema", Name: n.CreateSchemaStmt.GetSchemaname(), Expect: objectPresent}})
+	case *pgquerypb.Node_CreateSeqStmt:
+		return w.migration(Migration{Kind: "CREATE SEQUENCE", Scope: ScopeAll, Object: relationRef(n.CreateSeqStmt.GetSequence(), objectPresent)})
+	case *pgquerypb.Node_AlterSeqStmt:
+		return w.migration(Migration{Kind: "ALTER SEQUENCE", Scope: ScopeAll})
+	case *pgquerypb.Node_CompositeTypeStmt, *pgquerypb.Node_CreateEnumStmt, *pgquerypb.Node_CreateRangeStmt:
+		return w.migration(Migration{Kind: "CREATE TYPE", Scope: ScopeAll})
+	case *pgquerypb.Node_AlterEnumStmt:
+		return w.migration(Migration{Kind: "ALTER TYPE", Scope: ScopeAll})
+	case *pgquerypb.Node_ReindexStmt:
+		return w.reindex(n.ReindexStmt)
+	case *pgquerypb.Node_GrantStmt:
+		return w.grant(n.GrantStmt)
+	case *pgquerypb.Node_GrantRoleStmt:
+		if n.GrantRoleStmt.GetIsGrant() {
+			return w.migration(Migration{Kind: "GRANT ROLE", Scope: ScopeAll})
+		}
+		return w.migration(Migration{Kind: "REVOKE ROLE", Scope: ScopeAll})
+	case *pgquerypb.Node_CreateRoleStmt:
+		return w.createRole(w.raw, n.CreateRoleStmt)
+	case *pgquerypb.Node_AlterRoleStmt:
+		return w.alterRole(w.raw, n.AlterRoleStmt)
+	case *pgquerypb.Node_AlterRoleSetStmt:
+		return w.migration(Migration{Kind: "ALTER ROLE", Scope: ScopeAll})
+	case *pgquerypb.Node_DropRoleStmt:
+		return w.dropRole(n.DropRoleStmt)
+	case *pgquerypb.Node_CreatedbStmt:
+		return w.createDatabase(n.CreatedbStmt)
+	case *pgquerypb.Node_DropdbStmt:
+		return w.dropDatabase(n.DropdbStmt)
+	case *pgquerypb.Node_AlterObjectSchemaStmt:
+		return w.alterObject("ALTER TABLE SET SCHEMA", n.AlterObjectSchemaStmt.GetObjectType(), n.AlterObjectSchemaStmt.GetRelation())
+	case *pgquerypb.Node_AlterOwnerStmt:
+		return w.alterObject("ALTER TABLE OWNER", n.AlterOwnerStmt.GetObjectType(), n.AlterOwnerStmt.GetRelation())
 	case *pgquerypb.Node_DropStmt:
 		return w.drop(n.DropStmt)
 	case *pgquerypb.Node_TransactionStmt, *pgquerypb.Node_VariableSetStmt, *pgquerypb.Node_VariableShowStmt,
@@ -397,18 +435,18 @@ func (w *walker) unshardedOnly() error {
 	return nil
 }
 
-func (w *walker) ddlList(nodes []*pgquerypb.Node) error {
+func (w *walker) maintenanceList(what string, nodes []*pgquerypb.Node) error {
 	for _, n := range nodes {
-		if err := w.ddl(n.GetRangeVar()); err != nil {
+		if err := w.maintenance(what, n.GetRangeVar()); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// ddl lets DDL on unsharded tables through to the home shard and refuses
-// DDL that would have to fan out.
-func (w *walker) ddl(rv *pgquerypb.RangeVar) error {
+// maintenance lets TRUNCATE, LOCK and VACUUM of unsharded tables through to
+// the home shard and refuses them for tables that live on every shard.
+func (w *walker) maintenance(what string, rv *pgquerypb.RangeVar) error {
 	if rv == nil {
 		return w.unshardedOnly()
 	}
@@ -417,17 +455,22 @@ func (w *walker) ddl(rv *pgquerypb.RangeVar) error {
 		return err
 	}
 	if r != nil && r.kind != placeUnsharded {
-		return notYet("DDL fan-out is not available yet: \""+r.name+"\" is a sharded or reference table",
-			"run the DDL on every shard through the operator until DDL fan-out lands")
+		return notYet(what+" on sharded and reference tables is not available yet: \""+r.name+"\" lives on every shard",
+			"run it on every shard through the operator")
 	}
 	return w.unshardedOnly()
 }
 
-// derived handles DDL that creates an object on the home shard from a
-// query: the query must itself be home-shard only.
+// derived handles CREATE TABLE AS on the home shard: the query must itself
+// be home-shard only.
 func (w *walker) derived(rv *pgquerypb.RangeVar, query *pgquerypb.Node, what string) error {
-	if err := w.ddl(rv); err != nil {
+	r, err := w.lookup(rv)
+	if err != nil {
 		return err
+	}
+	if r != nil && r.kind != placeUnsharded {
+		return notYet(what+" cannot create the sharded or reference table \""+r.name+"\"",
+			"CREATE TABLE it through the migration model, then INSERT ... SELECT the rows")
 	}
 	if err := w.statement(query); err != nil {
 		return err
@@ -437,61 +480,6 @@ func (w *walker) derived(rv *pgquerypb.RangeVar, query *pgquerypb.Node, what str
 			"the object would exist on the home shard only; create it through the operator on every shard")
 	}
 	return nil
-}
-
-func (w *walker) drop(d *pgquerypb.DropStmt) error {
-	if d.GetRemoveType() != pgquerypb.ObjectType_OBJECT_TABLE && d.GetRemoveType() != pgquerypb.ObjectType_OBJECT_VIEW {
-		return w.unshardedOnly()
-	}
-	for _, obj := range d.GetObjects() {
-		names := stringList(obj.GetList().GetItems())
-		if len(names) == 0 {
-			continue
-		}
-		rv := &pgquerypb.RangeVar{Relname: names[len(names)-1]}
-		if len(names) >= 2 {
-			rv.Schemaname = names[len(names)-2]
-		}
-		if err := w.ddl(rv); err != nil {
-			return err
-		}
-	}
-	return w.unshardedOnly()
-}
-
-// createTable enforces the sharded-table constraints before refusing the
-// fan-out itself.
-func (w *walker) createTable(c *pgquerypb.CreateStmt) error {
-	r, err := w.lookup(c.GetRelation())
-	if err != nil {
-		return err
-	}
-	if r == nil || r.kind != placeSharded {
-		return w.ddl(c.GetRelation())
-	}
-	haveKey := false
-	for _, elt := range c.GetTableElts() {
-		switch e := elt.GetNode().(type) {
-		case *pgquerypb.Node_ColumnDef:
-			if e.ColumnDef.GetColname() == r.shardKey {
-				haveKey = true
-			}
-			for _, con := range e.ColumnDef.GetConstraints() {
-				if isUniqueConstraint(con.GetConstraint()) && e.ColumnDef.GetColname() != r.shardKey {
-					return keyConstraintError(r, e.ColumnDef.GetColname())
-				}
-			}
-		case *pgquerypb.Node_Constraint:
-			if isUniqueConstraint(e.Constraint) && !contains(stringList(e.Constraint.GetKeys()), r.shardKey) {
-				return keyConstraintError(r, strings.Join(stringList(e.Constraint.GetKeys()), ", "))
-			}
-		}
-	}
-	if !haveKey {
-		return notYet("sharded table \""+r.name+"\" must define its shard key column \""+r.shardKey+"\"",
-			"add the column, or change the shard key in pgshard.tables")
-	}
-	return w.ddl(c.GetRelation())
 }
 
 func keyConstraintError(r *rel, cols string) error {

@@ -83,8 +83,9 @@ type execItem struct {
 }
 
 type gucEntry struct {
-	name string
-	sql  string
+	name  string
+	sql   string
+	value string
 	// searchPath is the schema list a search_path entry set; nil restores
 	// the startup default.
 	searchPath []string
@@ -241,6 +242,17 @@ func (e *Executor) planSession() plan.Session {
 	return sess
 }
 
+// plan plans sql for this session. Sessions on the catalog shard set run
+// DDL directly on their home shard: the migration model covers the
+// databases of the default shard set only.
+func (e *Executor) plan(ctx context.Context, sql string) (plan.Plan, error) {
+	pl, err := e.r.cfg.Planner.Plan(ctx, e.planSession(), sql)
+	if err == nil && pl.Kind == plan.MigrationKind && e.home.Set != DefaultShardSet {
+		pl.Kind, pl.Shards, pl.Migration = plan.Unsharded, []int32{e.home.ID}, nil
+	}
+	return pl, err
+}
+
 // target turns a resolved plan into the one shard the executor can run it
 // on, refusing what needs more than one shard.
 func (e *Executor) target(pl plan.Plan) (Shard, error) {
@@ -346,9 +358,12 @@ func (e *Executor) SimpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 }
 
 func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultWriter) error {
-	pl, err := e.r.cfg.Planner.Plan(ctx, e.planSession(), sql)
+	pl, err := e.plan(ctx, sql)
 	if err != nil {
 		return err
+	}
+	if pl.Kind == plan.MigrationKind {
+		return e.afterBatch(ctx, e.runMigration(ctx, pl, w))
 	}
 	if pl.NextVal != "" {
 		return e.afterBatch(ctx, e.answerNextval(ctx, pl.NextVal, true, true, false, w))
@@ -416,7 +431,7 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 			e.noteExecuted(sql, pl.Kind == plan.SessionLocal)
 		}
 		if pl.Class.SetGUC && err == nil {
-			e.staged = append(e.staged, gucEntry{name: pl.Class.GUCName, sql: sql, searchPath: pl.Class.SearchPath})
+			e.staged = append(e.staged, gucEntry{name: pl.Class.GUCName, sql: sql, value: pl.Class.GUCValue, searchPath: pl.Class.SearchPath})
 		}
 		return err
 	})
@@ -502,7 +517,7 @@ func (e *Executor) parse(ctx context.Context, name, sql string, paramOIDs []uint
 	if e.batchFailed {
 		return nil
 	}
-	pl, err := e.r.cfg.Planner.Plan(ctx, e.planSession(), sql)
+	pl, err := e.plan(ctx, sql)
 	if err == nil {
 		err = checkTransactionMode(pl.Class)
 	}
@@ -510,7 +525,7 @@ func (e *Executor) parse(ctx context.Context, name, sql string, paramOIDs []uint
 		e.failBatch()
 		return err
 	}
-	if !pl.Deferred && pl.Kind != plan.SessionLocal {
+	if !pl.Deferred && pl.Kind != plan.SessionLocal && pl.Kind != plan.MigrationKind {
 		var err error
 		if multiShard(pl) && !isReferenceWrite(pl) {
 			_, err = pl.MultiShard()
@@ -609,7 +624,7 @@ func (e *Executor) bind(ctx context.Context, portal, statement string, paramForm
 		return nil
 	}
 	if st, ok := e.stmts[statement]; ok && st.snap != e.currentSnapshot() {
-		pl, err := e.r.cfg.Planner.Plan(ctx, e.planSession(), st.sql)
+		pl, err := e.plan(ctx, st.sql)
 		if err == nil && sequenceShape(pl) != sequenceShape(st.plan) {
 			perr := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "the sequence columns of the table changed since statement %q was prepared", statement)
 			perr.Hint = "prepare the statement again"
@@ -622,7 +637,7 @@ func (e *Executor) bind(ctx context.Context, portal, statement string, paramForm
 		st.plan, st.class, st.snap = pl, pl.Class, e.currentSnapshot()
 		e.stmts[statement] = st
 	}
-	if st, ok := e.stmts[statement]; ok && st.plan.Kind != plan.SessionLocal {
+	if st, ok := e.stmts[statement]; ok && st.plan.Kind != plan.SessionLocal && st.plan.Kind != plan.MigrationKind {
 		pl := st.plan
 		var keys plan.Params = plan.BindParams{OIDs: st.paramOIDs(), Formats: paramFormats, Values: params}
 		if fill := pl.Sequences; fill != nil {
@@ -688,7 +703,7 @@ func (e *Executor) execute(portal string, maxRows int32, w pgwire.ResultWriter) 
 			return err
 		}
 		if st.class.SetGUC {
-			e.staged = append(e.staged, gucEntry{name: st.class.GUCName, sql: st.sql, searchPath: st.class.SearchPath})
+			e.staged = append(e.staged, gucEntry{name: st.class.GUCName, sql: st.sql, value: st.class.GUCValue, searchPath: st.class.SearchPath})
 		}
 		e.batchExec = append(e.batchExec, execItem{sql: st.sql, local: st.plan.Kind == plan.SessionLocal, class: st.class})
 	}
@@ -770,6 +785,10 @@ func (e *Executor) sync(ctx context.Context) error {
 		}
 	}
 	if handled, err := e.nextvalBatch(ctx, batch, parsed, w); handled {
+		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
+		return e.afterBatch(ctx, err)
+	}
+	if handled, err := e.migrationBatch(ctx, batch, parsed, w); handled {
 		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
 		return e.afterBatch(ctx, err)
 	}
