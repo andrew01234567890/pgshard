@@ -35,6 +35,33 @@ jobs:
       - run: make test
       - run: make build
 
+  proto:
+    name: Proto lint and generated code drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install buf and protoc plugins
+        run: |
+          set -euo pipefail
+          go install github.com/bufbuild/buf/cmd/buf@v1.71.0
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - run: make proto-lint
+      - run: make proto
+      - name: Fail on generated code drift
+        run: |
+          set -euo pipefail
+          if ! git diff --exit-code -- internal/gen; then
+            echo "::error::internal/gen is out of date; run 'make proto' and commit the result"
+            exit 1
+          fi
+          git status --porcelain -- internal/gen | grep -q . && { echo "::error::untracked generated files under internal/gen"; exit 1; } || true
+
   govulncheck:
     name: govulncheck
     runs-on: ubuntu-latest
