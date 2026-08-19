@@ -160,6 +160,7 @@ func (s *Server) Stream(srv pgshardv1.VStream_StreamServer) error {
 		return m.resharded()
 	}
 	startPos := positionFrom(start.GetPosition())
+	copying := copyStateFrom(start.GetPosition())
 	buffer := s.BufferUnits
 	if buffer <= 0 {
 		buffer = 16
@@ -176,6 +177,12 @@ func (s *Server) Stream(srv pgshardv1.VStream_StreamServer) error {
 		inputs[sh] = ch
 		r := &reader{shard: sh, stream: def.Name, database: def.Database, twoPhase: opts.twoPhase, topo: s.Topology,
 			out: ch, ready: ready, window: window, delivered: startPos[sh]}
+		if st, ok := copying[sh]; ok {
+			r.copy = copyPhaseFrom(st, opts.copyBatch)
+		} else if opts.copy && startPos[sh] == 0 {
+			r.copy = copyPhaseFrom(nil, opts.copyBatch)
+			copying[sh] = r.copy.state(sh)
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -203,7 +210,7 @@ func (s *Server) Stream(srv pgshardv1.VStream_StreamServer) error {
 		}
 	}()
 	m := &merger{shards: shards, inputs: inputs, ready: ready, acks: acks, acker: ackers.request, send: send,
-		topo: s.Topology, generation: gen, opts: opts, position: startPos}
+		topo: s.Topology, generation: gen, opts: opts, position: startPos, copying: copying}
 	err = m.run(ctx)
 	cancel()
 	wg.Wait()

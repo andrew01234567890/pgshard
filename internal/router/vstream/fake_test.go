@@ -7,7 +7,9 @@ import (
 	"testing"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
@@ -25,6 +27,80 @@ type fakePooler struct {
 	acks    map[string][]uint64
 	ackWake chan struct{}
 	client  pgshardv1.PoolerClient
+	// copyPlan answers CopyTables: the messages to send and an error to end
+	// with after failAfter messages (failAfter < 0 sends everything).
+	copyPlan  func(req *pgshardv1.CopyTablesRequest) copyScript
+	copyReqs  []*pgshardv1.CopyTablesRequest
+	copyStart chan struct{}
+}
+
+type copyScript struct {
+	msgs      []*pgshardv1.CopyTablesResponse
+	failAfter int
+	err       error
+}
+
+func (f *fakePooler) CopyTables(req *pgshardv1.CopyTablesRequest, srv pgshardv1.Pooler_CopyTablesServer) error {
+	f.mu.Lock()
+	f.copyReqs = append(f.copyReqs, req)
+	plan := f.copyPlan
+	f.mu.Unlock()
+	select {
+	case f.copyStart <- struct{}{}:
+	default:
+	}
+	if plan == nil {
+		return status.Error(codes.Unimplemented, "no copy plan")
+	}
+	sc := plan(req)
+	for i, m := range sc.msgs {
+		if sc.failAfter >= 0 && i == sc.failAfter {
+			return sc.err
+		}
+		if err := srv.Send(m); err != nil {
+			return err
+		}
+	}
+	if sc.failAfter >= len(sc.msgs) {
+		return sc.err
+	}
+	return nil
+}
+
+func (f *fakePooler) copyRequests() []*pgshardv1.CopyTablesRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*pgshardv1.CopyTablesRequest(nil), f.copyReqs...)
+}
+
+// Copy message builders.
+
+func cpSnapshot(lsn uint64, streamSlot bool) *pgshardv1.CopyTablesResponse {
+	return &pgshardv1.CopyTablesResponse{Response: &pgshardv1.CopyTablesResponse_Snapshot_{Snapshot: &pgshardv1.CopyTablesResponse_Snapshot{Slot: "s", StreamSlot: streamSlot, ConsistentPoint: lsn, SnapshotName: "snap"}}}
+}
+
+func cpTable(table string, cols ...string) *pgshardv1.CopyTablesResponse {
+	return &pgshardv1.CopyTablesResponse{Response: &pgshardv1.CopyTablesResponse_TableBegin_{TableBegin: &pgshardv1.CopyTablesResponse_TableBegin{Relation: evRelation(0, table, cols...).GetRelation()}}}
+}
+
+func cpRows(lastpk string, ids ...string) *pgshardv1.CopyTablesResponse {
+	rows := &pgshardv1.CopyTablesResponse_Rows{Lastpk: []byte(lastpk)}
+	for _, id := range ids {
+		rows.Rows = append(rows.Rows, &pgshardv1.CopyTablesResponse_Row{Values: []*pgshardv1.Value{{Data: []byte(id)}, {Null: true}}})
+	}
+	return &pgshardv1.CopyTablesResponse{Response: &pgshardv1.CopyTablesResponse_Rows_{Rows: rows}}
+}
+
+func cpTableDone(table string) *pgshardv1.CopyTablesResponse {
+	return &pgshardv1.CopyTablesResponse{Response: &pgshardv1.CopyTablesResponse_TableDone_{TableDone: &pgshardv1.CopyTablesResponse_TableDone{Schema: "public", Table: table}}}
+}
+
+func cpDone() *pgshardv1.CopyTablesResponse {
+	return &pgshardv1.CopyTablesResponse{Response: &pgshardv1.CopyTablesResponse_Done_{Done: &pgshardv1.CopyTablesResponse_Done{}}}
+}
+
+func script(msgs ...*pgshardv1.CopyTablesResponse) copyScript {
+	return copyScript{msgs: msgs, failAfter: -1}
 }
 
 type feedItem struct {
@@ -34,7 +110,7 @@ type feedItem struct {
 
 func newFakePooler(t *testing.T) *fakePooler {
 	t.Helper()
-	f := &fakePooler{feeds: map[string]chan feedItem{}, acks: map[string][]uint64{}, ackWake: make(chan struct{}, 64)}
+	f := &fakePooler{feeds: map[string]chan feedItem{}, acks: map[string][]uint64{}, ackWake: make(chan struct{}, 64), copyStart: make(chan struct{}, 64)}
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

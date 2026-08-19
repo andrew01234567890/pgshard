@@ -35,6 +35,11 @@ service Pooler {
   // Ack advances the slot's confirmed position; events up to and including
   // lsn are never resent after a restart.
   rpc Ack(AckRequest) returns (AckResponse);
+  // CopyTables exports a snapshot from a logical slot (the stream's slot
+  // when it does not exist yet, a temporary one otherwise) and streams the
+  // rows of every table of the publication as seen by that snapshot, in
+  // primary-key order with a checkpoint per batch.
+  rpc CopyTables(CopyTablesRequest) returns (stream CopyTablesResponse);
 }
 
 // UserIdentity carries the SCRAM verifier material for the client user.
@@ -372,6 +377,73 @@ message AckRequest {
 // AckResponse reports the outcome.
 message AckResponse {
   Error error = 1;
+}
+
+// CopyTablesRequest starts or resumes the initial copy of a shard.
+message CopyTablesRequest {
+  // Change stream whose slot pgshard_<stream>_<shard> is created with the
+  // exported snapshot when missing.
+  string stream = 1;
+  // Database to copy.
+  string database = 2;
+  // Publication whose tables are copied; pgshard_all when empty.
+  string publication = 3;
+  // Create the stream slot with two_phase when it has to be created.
+  bool two_phase = 4;
+  // Rows per batch; zero means 1000.
+  uint32 batch_rows = 5;
+  // Tables already copied (schema.table), skipped.
+  repeated string done_tables = 6;
+  // Table to continue after its last delivered key; empty starts with the
+  // first table not done.
+  string resume_schema = 7;
+  string resume_table = 8;
+  // Last key delivered for the resumed table, as sent in Rows.lastpk.
+  bytes resume_lastpk = 9;
+}
+
+// CopyTablesResponse is one message of the copy.
+message CopyTablesResponse {
+  // Snapshot reports the slot and the consistent point the snapshot was
+  // exported at; it is the first message.
+  message Snapshot {
+    string slot = 1;
+    // True when the stream's own slot was created for this snapshot;
+    // false when a temporary slot was used because it already existed.
+    bool stream_slot = 2;
+    uint64 consistent_point = 3;
+    string snapshot_name = 4;
+  }
+  // TableBegin precedes the rows of one table and describes its columns;
+  // key marks the primary key columns (none for a table copied by ctid).
+  message TableBegin {
+    ChangeEvent.Relation relation = 1;
+    // True when the table has no primary key and is walked by ctid.
+    bool by_ctid = 2;
+  }
+  // Row is one copied row in text format.
+  message Row {
+    repeated Value values = 1;
+  }
+  // Rows is one batch of a table; lastpk is the checkpoint after it.
+  message Rows {
+    repeated Row rows = 1;
+    bytes lastpk = 2;
+  }
+  // TableDone closes a table.
+  message TableDone {
+    string schema = 1;
+    string table = 2;
+  }
+  // Done closes the copy once every table was sent.
+  message Done {}
+  oneof response {
+    Snapshot snapshot = 1;
+    TableBegin table_begin = 2;
+    Rows rows = 3;
+    TableDone table_done = 4;
+    Done done = 5;
+  }
 }
 
 // ChangeBatch groups consecutive events of one slot.

@@ -27,6 +27,10 @@ type unit struct {
 	// position is true when endLSN may become the shard's position once the
 	// events were delivered.
 	position bool
+	// copy is the shard's copy state after this unit; copyDone marks the
+	// end of the shard's copy phase.
+	copy     *pgshardv1.VCopyState
+	copyDone bool
 	err      *pgshardv1.VEvent_Error
 }
 
@@ -61,6 +65,8 @@ type reader struct {
 	ready     chan<- struct{}
 	window    time.Duration
 	delivered uint64
+	// copy is the pending initial copy; nil once streaming.
+	copy *copyPhase
 
 	asm assembler
 }
@@ -72,9 +78,19 @@ func (r *reader) run(ctx context.Context) {
 	backoff := 200 * time.Millisecond
 	var firstFailure time.Time
 	for {
-		err := r.once(ctx)
+		var err error
+		if r.copy != nil {
+			err = r.copyOnce(ctx)
+		} else {
+			err = r.once(ctx)
+		}
 		if ctx.Err() != nil {
 			return
+		}
+		if err == nil {
+			firstFailure = time.Time{}
+			backoff = 200 * time.Millisecond
+			continue
 		}
 		if ev := fatal(err, r.shard); ev != nil {
 			r.push(ctx, &unit{shard: r.shard, err: ev})
@@ -104,7 +120,7 @@ func (r *reader) run(ctx context.Context) {
 // fatal maps a pooler failure that no reconnect can cure to an Error event.
 func fatal(err error, sh router.Shard) *pgshardv1.VEvent_Error {
 	st, ok := status.FromError(err)
-	if !ok || st.Code() != codes.FailedPrecondition || strings.Contains(st.Message(), "active reader") {
+	if !ok || (st.Code() != codes.FailedPrecondition && st.Code() != codes.InvalidArgument) || strings.Contains(st.Message(), "active reader") {
 		return nil
 	}
 	code := pgshardv1.VEvent_Error_CODE_INTERNAL
@@ -254,16 +270,7 @@ func (a *assembler) add(ev *pgshardv1.ChangeEvent) (*unit, error) {
 		u.endLSN = e.RollbackPrepared.GetEndLsn()
 		return u, nil
 	case *pgshardv1.ChangeEvent_Relation_:
-		rel := e.Relation
-		m := &relMeta{schema: rel.GetSchema(), table: rel.GetTable(), identity: rel.GetReplicaIdentity()}
-		var sig strings.Builder
-		sig.WriteString(m.identity)
-		for _, c := range rel.GetColumns() {
-			m.columns = append(m.columns, &pgshardv1.VEvent_Relation_Column{Name: c.GetName(), TypeOid: c.GetTypeOid(), TypeModifier: c.GetTypeModifier(), Key: c.GetKey()})
-			fmt.Fprintf(&sig, "|%s:%d:%d:%t", c.GetName(), c.GetTypeOid(), c.GetTypeModifier(), c.GetKey())
-		}
-		m.signature = sig.String()
-		a.relations[rel.GetRelationId()] = m
+		a.relations[e.Relation.GetRelationId()] = relMetaOf(e.Relation)
 	case *pgshardv1.ChangeEvent_Row_:
 		rel, ok := a.relations[e.Row.GetRelationId()]
 		if !ok {

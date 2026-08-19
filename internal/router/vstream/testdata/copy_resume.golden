@@ -1,0 +1,9 @@
+copy_begin shard=0 public.t
+vgtid gen=7 {0:1000 1:4242} copy[0 done=public.a cur=public.t@["2"]]
+relation public.t identity=d cols=id:23:true,v:23:false
+row shard=0 INSERT public.t new=[3,NULL] copy
+row shard=0 INSERT public.t new=[4,NULL] copy
+vgtid gen=7 {0:1000 1:4242} copy[0 done=public.a cur=public.t@["4"]]
+copy_completed shard=0 public.t
+vgtid gen=7 {0:1000 1:4242} copy[0 done=public.a,public.t cur=-]
+copy_completed shard=0

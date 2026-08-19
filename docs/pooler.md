@@ -51,6 +51,11 @@
   `confirmed_flush_lsn` through the reader's standby status update and
   returns once the server has it. `StreamChanges` is the same stream one
   event per message. See [streams.md](streams.md).
+- **CopyTables.** The copy phase of an initial copy: exports a snapshot
+  from the stream's slot (created on the spot) or a temporary one, and
+  streams every table of the publication as seen by that snapshot in
+  primary-key (or ctid) order with a `lastpk` checkpoint per batch; resumes
+  after a checkpoint. See [streams.md](streams.md).
 
 ## Drain
 
