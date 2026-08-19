@@ -10,6 +10,10 @@ regexes = [
   '''CHANGE_ME''',
   '''example\.com''',
   '''example\.org''',
+  # SCRAM protocol strings and test vectors (mechanism names, channel-binding
+  # headers, RFC 7677 vectors) are not credentials.
+  '''SCRAM-SHA-256''',
+  '''p=tls-server-end-point''',
 ]
 paths = [
   '''go\.sum$''',

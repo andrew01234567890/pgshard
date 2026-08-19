@@ -3,9 +3,12 @@ package cli
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -111,5 +114,23 @@ func TestRealBinary(t *testing.T) {
 		if code != c.code || out.String() != c.out || errb.String() != c.err {
 			t.Errorf("args=%v: code=%d out=%q err=%q", c.args, code, out.String(), errb.String())
 		}
+	}
+}
+
+func TestSubcommandDispatch(t *testing.T) {
+	var out, errb bytes.Buffer
+	sub := map[string]Subcommand{"serve": func(args []string, stdout, _ io.Writer) int {
+		fmt.Fprintf(stdout, "serve %v", args)
+		return 7
+	}}
+	if code := RunWith(name, []string{"serve", "--x", "1"}, &out, &errb, sub); code != 7 || out.String() != "serve [--x 1]" {
+		t.Fatalf("code=%d out=%q", code, out.String())
+	}
+	out.Reset()
+	if code := RunWith(name, []string{"--help"}, &out, &errb, sub); code != 0 || !strings.HasPrefix(out.String(), descriptions[name]) {
+		t.Fatalf("--help with subcommands: code=%d out=%q", code, out.String())
+	}
+	if code := RunWith(name, []string{"other"}, &out, &errb, sub); code != 2 {
+		t.Fatalf("unknown subcommand code=%d", code)
 	}
 }
