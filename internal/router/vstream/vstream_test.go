@@ -192,8 +192,9 @@ func TestFanInKeepsTransactionsWholeAndPositionsVectors(t *testing.T) {
 	if relations != 1 {
 		t.Fatalf("relation public.t must be sent once across shards, got %d:\n%s", relations, strings.Join(lines(got), "\n"))
 	}
+	// Shard 1's keepalive at 6000 may land before or after shard 0's commit.
 	last := describe(got[len(got)-1])
-	if !strings.Contains(last, "0:2000") || !strings.Contains(last, "1:5100") {
+	if !strings.Contains(last, "0:2000") || (!strings.Contains(last, "1:5100") && !strings.Contains(last, "1:6000")) {
 		t.Fatalf("final vgtid must carry both shards: %s", last)
 	}
 
