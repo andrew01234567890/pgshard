@@ -379,6 +379,16 @@ refused: those statements belong to the coordinator.
 that shard plainly and rolls back the read-only participants; the decision
 log is never touched. This is the common path.
 
+A participant counts as a writer when the planner classified one of its
+statements as a write, **or** when its backend assigned a transaction id
+anyway: before `COMMIT` the router runs
+`SELECT pg_current_xact_id_if_assigned() IS NOT NULL` on every
+planner-classified reader (in parallel, one round trip), so a `SELECT` that
+called a function which inserted or updated rows is promoted to a writer and
+takes part in two-phase commit instead of being rolled back behind a
+successful `COMMIT`. In `single` mode such a promotion that produces a
+second writer makes `COMMIT` fail with `0A000` and roll back everywhere.
+
 With **two or more writers** the router runs two-phase commit against the
 catalog table `pgshard.xact_decisions`:
 

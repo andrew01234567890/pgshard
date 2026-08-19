@@ -312,6 +312,14 @@ func (e *Executor) endTxn(ctx context.Context, commit bool, w pgwire.ResultWrite
 		return pgwire.Errorf(pgwire.CodeInternalError, "router: endTxn on a single-shard transaction")
 	}
 	parts := e.parts()
+	defer e.dropParked()
+	if commit {
+		if err := e.promoteHiddenWriters(ctx, parts); err != nil {
+			e.each(parts, func(p *txnPart) error { return e.runOn(ctx, p, "ROLLBACK", discardWriter{}) })
+			e.finishTxn("ROLLBACK")
+			return err
+		}
+	}
 	var writers, readers []*txnPart
 	for _, p := range parts {
 		if p.wrote {
@@ -320,7 +328,6 @@ func (e *Executor) endTxn(ctx context.Context, commit bool, w pgwire.ResultWrite
 			readers = append(readers, p)
 		}
 	}
-	defer e.dropParked()
 	if !commit || len(writers) <= 1 {
 		final := e.current()
 		if commit && len(writers) == 1 {
@@ -345,6 +352,72 @@ func (e *Executor) endTxn(ctx context.Context, commit bool, w pgwire.ResultWrite
 		return firstError(others)
 	}
 	return e.twoPhaseCommit(ctx, writers, readers, w)
+}
+
+// hiddenWriteProbe asks a shard whether the transaction took a transaction
+// id there, which a plain SELECT cannot do: only a write (or a function it
+// called) does.
+const hiddenWriteProbe = "SELECT pg_current_xact_id_if_assigned() IS NOT NULL"
+
+// promoteHiddenWriters reclassifies parts the planner saw as readers whose
+// backend nonetheless assigned a transaction id: a SELECT calling a function
+// that writes must take part in two-phase commit instead of being rolled
+// back behind a successful COMMIT. It applies the same gates as noteWrite.
+func (e *Executor) promoteHiddenWriters(ctx context.Context, parts []*txnPart) error {
+	var readers []*txnPart
+	for _, p := range parts {
+		if !p.wrote {
+			readers = append(readers, p)
+		}
+	}
+	if len(readers) == 0 {
+		return nil
+	}
+	answers := make([]string, len(readers))
+	e.each(readers, func(p *txnPart) error {
+		v, err := e.queryOne(ctx, p, hiddenWriteProbe)
+		answers[slices.Index(readers, p)] = v
+		return err
+	})
+	if err := firstError(readers); err != nil {
+		return err
+	}
+	var writers []*txnPart
+	for _, p := range parts {
+		if p.wrote {
+			writers = append(writers, p)
+		}
+	}
+	promoted := false
+	for i, p := range readers {
+		if answers[i] == "t" {
+			p.wrote = true
+			promoted = true
+			writers = append(writers, p)
+		}
+	}
+	if !promoted || len(writers) <= 1 {
+		return nil
+	}
+	if e.transactionMode() == txnModeSingle {
+		err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "transaction wrote on shard %s/%d through a function call while %s is single: it cannot commit with the write on shard %s/%d",
+			writers[len(writers)-1].shard.Set, writers[len(writers)-1].shard.ID, TransactionModeGUC, writers[0].shard.Set, writers[0].shard.ID)
+		err.Hint = "SET pgshard.transaction_mode = twopc to commit across shards with two-phase commit"
+		return err
+	}
+	if e.r.cfg.Decisions == nil {
+		return pgwire.Errorf(pgwire.CodeFeatureNotSupported, "two-phase commit is not available: the router has no decision log")
+	}
+	if e.gid == "" {
+		for _, p := range writers {
+			if err := e.checkPreparedCapacity(ctx, p); err != nil {
+				return err
+			}
+		}
+		e.gidSeq++
+		e.gid = "pgshard-" + e.sid + "-" + strconv.FormatUint(e.gidSeq, 10)
+	}
+	return nil
 }
 
 // twoPhaseCommit is the coordinator: decision row, PREPARE everywhere, the

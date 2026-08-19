@@ -145,6 +145,9 @@ type fakeBackend struct {
 	stmts map[string]string
 	tx    byte
 	rows  int
+	// xidAssigned mirrors pg_current_xact_id_if_assigned(): set by DML and
+	// by "select write_fn()".
+	xidAssigned bool
 }
 
 // fakeXIDs hands out distinct transaction ids across every fake shard.
@@ -332,11 +335,33 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 		if b.tx == 'E' {
 			tag = "ROLLBACK"
 		}
-		b.tx = 'I'
+		b.tx, b.xidAssigned = 'I', false
 		return true, s.complete(tag)
 	case q == "rollback":
-		b.tx = 'I'
+		b.tx, b.xidAssigned = 'I', false
 		return true, s.complete("ROLLBACK")
+	case q == "select pg_current_xact_id_if_assigned() is not null":
+		if err := s.rowDesc("?column?", 16); err != nil {
+			return true, err
+		}
+		v := "f"
+		if b.xidAssigned {
+			v = "t"
+		}
+		if err := s.row(v); err != nil {
+			return true, err
+		}
+		return true, s.complete("SELECT 1")
+	case strings.HasPrefix(q, "select write_fn()"):
+		b.rows++
+		b.xidAssigned = true
+		if err := s.rowDesc("write_fn", 23); err != nil {
+			return true, err
+		}
+		if err := s.row("1"); err != nil {
+			return true, err
+		}
+		return true, s.complete("SELECT 1")
 	case q == "show max_prepared_transactions":
 		v := s.f.maxPrepared
 		if v == "" {
@@ -359,7 +384,7 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 		return true, s.complete("SELECT 1")
 	case strings.HasPrefix(q, "prepare transaction '"):
 		gid := strings.TrimSuffix(strings.TrimPrefix(q, "prepare transaction '"), "'")
-		b.tx = 'I'
+		b.tx, b.xidAssigned = 'I', false
 		if s.f.failPrepare {
 			return true, s.errorf("55000", "prepare refused by the fake shard")
 		}
@@ -443,10 +468,13 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 		return true, s.complete("SELECT 1")
 	case strings.HasPrefix(q, "insert into "):
 		b.rows++
+		b.xidAssigned = true
 		return true, s.complete("INSERT 0 1")
 	case strings.HasPrefix(q, "update "):
+		b.xidAssigned = true
 		return true, s.complete("UPDATE 1")
 	case strings.HasPrefix(q, "delete from "):
+		b.xidAssigned = true
 		return true, s.complete("DELETE 1")
 	case strings.HasPrefix(q, "select * from "):
 		if err := s.rowDesc("id", 23); err != nil {
