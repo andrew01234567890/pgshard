@@ -1,0 +1,29 @@
+{{template "head" .Name}}
+<header><h1><a href="/">clusters</a> / <a href="/backups">backups</a> / restores / {{.Namespace}} / {{.Name}}</h1>
+<span class="meta">{{.Cluster}} → {{.NewCluster}}</span></header>
+{{if eq .Phase "Failed"}}<div class="alert" role="alert">restore failed: {{or .Error "no reason reported"}}</div>{{end}}
+<dl class="kv">
+<dt>Phase</dt><dd class="{{if eq .Phase "Recovered"}}ok{{else if eq .Phase "Failed"}}bad{{end}}">{{.Phase}}</dd>
+<dt>Target</dt><dd>{{.TargetKind}}{{if .Target}} {{.Target}}{{end}}</dd>
+<dt>Backup</dt><dd>{{or .BackupID "—"}}</dd>
+<dt>Started</dt><dd>{{when .StartedAt}}</dd>
+<dt>Finished</dt><dd>{{when .CompletedAt}}</dd>
+</dl>
+<h2>Groups</h2>
+{{if .Groups}}<table>
+<thead><tr><th>Group</th><th>Source stanza</th><th>Backup label</th><th>Timeline</th><th>Reached target</th><th>Message</th></tr></thead>
+<tbody>{{range .Groups}}<tr>
+<td>{{.Group}}</td><td>{{.SourceStanza}}</td><td>{{.BackupID}}</td><td>{{if .Timeline}}{{.Timeline}}{{end}}</td>
+<td class="{{if .ReachedTarget}}ok{{end}}">{{.ReachedTarget}}</td><td>{{.Message}}</td>
+</tr>{{end}}</tbody></table>
+{{else}}<p class="notice">No group progress yet.</p>{{end}}
+<h2>Reconciliation</h2>
+{{with .Reconciliation}}
+<dl class="kv">
+<dt>Fence</dt><dd>{{if .Unfenced}}<span class="ok">released</span>{{else}}write-fenced{{end}}</dd>
+<dt>Decisions</dt><dd>{{.Decisions}} ({{.Committed}} committed, {{.RolledBack}} rolled back)</dd>
+<dt>Contradictions</dt><dd class="{{if .Contradictions}}bad{{end}}">{{len .Contradictions}}</dd>
+</dl>
+{{if .Contradictions}}<ul>{{range .Contradictions}}<li>{{.}}</li>{{end}}</ul>{{end}}
+{{else}}<p class="notice">Not a barrier restore, or reconciliation not started.</p>{{end}}
+{{template "foot"}}

@@ -1,0 +1,56 @@
+{{if not .Clusters}}<p>No PgShardCluster objects found.</p>{{end}}
+{{range .Clusters}}
+<section aria-labelledby="cluster-{{.Namespace}}-{{.Name}}">
+<h2 id="cluster-{{.Namespace}}-{{.Name}}"><a href="/clusters/{{.Namespace}}/{{.Name}}">{{.Namespace}}/{{.Name}}</a></h2>
+<h3>Policy</h3>
+{{with .Policy}}
+<dl class="kv">
+<dt>Name</dt><dd>{{.Name}}</dd>
+<dt>Store</dt><dd>{{.StoreType}}{{if .Bucket}} · bucket {{.Bucket}}{{end}}{{if .Container}} · container {{.Container}}{{end}}{{if .Prefix}} · prefix {{.Prefix}}{{end}}{{if .Endpoint}} · endpoint {{.Endpoint}}{{end}}</dd>
+<dt>Credentials</dt><dd>{{if .CredentialSecret}}secret {{.CredentialSecret}}{{else}}none{{end}}{{if .CredentialType}} ({{.CredentialType}}){{end}}</dd>
+{{if .EncryptionSecret}}<dt>Encryption</dt><dd>secret {{.EncryptionSecret}}</dd>{{end}}
+<dt>Schedules</dt><dd>full {{or .FullSchedule "—"}} · differential {{or .DiffSchedule "—"}} · incremental {{or .IncrSchedule "—"}}</dd>
+<dt>Retention</dt><dd>full {{or .RetainFull "—"}} · differential {{or .RetainDiff "—"}}</dd>
+<dt>Barrier schedule</dt><dd>{{or .BarrierSchedule "—"}}</dd>
+<dt>Healthy</dt><dd class="{{if eq .Healthy "True"}}ok{{else}}bad{{end}}">{{.Healthy}}</dd>
+</dl>
+{{else}}<p class="notice">{{if .PolicyRef}}policy {{.PolicyRef}} not found{{else}}no backup policy bound{{end}}</p>{{end}}
+
+<h3>Backups</h3>
+{{if .Backups}}<table>
+<thead><tr><th>Name</th><th>Kind</th><th>Phase</th><th>Started</th><th>Finished</th><th>Duration</th><th>Groups</th><th>Error</th></tr></thead>
+<tbody>{{range .Backups}}<tr>
+<td><a href="/backups/{{.Namespace}}/{{.Name}}">{{.Name}}</a></td><td>{{.Kind}}</td>
+<td class="{{if eq .Phase "Completed"}}ok{{else if eq .Phase "Failed"}}bad{{end}}">{{.Phase}}</td>
+<td>{{when .StartedAt}}</td><td>{{when .CompletedAt}}</td><td>{{.Duration}}</td>
+<td>{{range .Groups}}<div>{{.Group}} · {{.Stanza}}{{if .BackupID}} · {{.BackupID}}{{end}}{{if .SizeBytes}} · {{bytes .SizeBytes}}{{end}}{{if .Error}} · <span class="bad">{{.Error}}</span>{{end}}</div>{{end}}</td>
+<td class="bad">{{.Error}}</td>
+</tr>{{end}}</tbody></table>
+{{else}}<p class="notice">No backups.</p>{{end}}
+
+<h3>Restores</h3>
+{{if .Restores}}{{range .Restores}}
+{{if eq .Phase "Failed"}}<div class="alert" role="alert">restore {{.Name}} failed: {{or .Error "no reason reported"}}</div>{{end}}
+{{end}}<table>
+<thead><tr><th>Name</th><th>New cluster</th><th>Target</th><th>Phase</th><th>Started</th><th>Finished</th><th>Groups</th><th>Reconciliation</th></tr></thead>
+<tbody>{{range .Restores}}<tr>
+<td><a href="/restores/{{.Namespace}}/{{.Name}}">{{.Name}}</a></td><td>{{.NewCluster}}</td>
+<td>{{.TargetKind}}{{if .Target}} {{.Target}}{{end}}</td>
+<td class="{{if eq .Phase "Recovered"}}ok{{else if eq .Phase "Failed"}}bad{{end}}">{{.Phase}}</td>
+<td>{{when .StartedAt}}</td><td>{{when .CompletedAt}}</td>
+<td>{{range .Groups}}<div>{{.Group}}{{if .Timeline}} · tli {{.Timeline}}{{end}} · {{if .ReachedTarget}}<span class="ok">reached</span>{{else}}pending{{end}}{{if .Message}} · {{.Message}}{{end}}</div>{{end}}</td>
+<td>{{with .Reconciliation}}{{if .Unfenced}}<span class="ok">unfenced</span>{{else}}fenced{{end}} · {{.Decisions}} decisions · {{len .Contradictions}} contradictions{{else}}—{{end}}</td>
+</tr>{{end}}</tbody></table>
+{{else}}<p class="notice">No restores.</p>{{end}}
+</section>
+{{end}}
+
+<h2>Certified restore points</h2>
+{{if .RestorePointError}}<p class="bad">catalog: {{.RestorePointError}}</p>{{end}}
+{{if .RestorePoints}}<table>
+<thead><tr><th>Name</th><th>Created</th><th>Shard map generation</th><th>Groups</th></tr></thead>
+<tbody>{{range .RestorePoints}}<tr>
+<td>{{.Name}}</td><td>{{.CreatedAt.UTC.Format "2006-01-02T15:04:05Z07:00"}}</td><td>{{.ShardMapGeneration}}</td>
+<td>{{range .Groups}}<div>{{.Group}} · {{.LSN}} · tli {{.Timeline}}</div>{{end}}</td>
+</tr>{{end}}</tbody></table>
+{{else}}<p class="notice">No certified restore points{{if not .RestorePointError}} (none recorded, or no catalog DSN configured){{end}}.</p>{{end}}

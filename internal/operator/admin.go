@@ -44,7 +44,7 @@ func adminMeta(c *pgshardv1alpha1.PgShardCluster) metav1.ObjectMeta {
 
 // AdminRules are the read-only permissions the admin UI needs in the cluster's namespace.
 var AdminRules = []rbacv1.PolicyRule{
-	{APIGroups: []string{pgshardv1alpha1.GroupVersion.Group}, Resources: []string{"pgshardclusters", "pgshardgroups"}, Verbs: []string{"get", "list", "watch"}},
+	{APIGroups: []string{pgshardv1alpha1.GroupVersion.Group}, Resources: []string{"pgshardclusters", "pgshardgroups", "pgshardbackuppolicies", "pgshardbackups", "pgshardrestores"}, Verbs: []string{"get", "list", "watch"}},
 	{APIGroups: []string{""}, Resources: []string{"pods", "persistentvolumeclaims", "services"}, Verbs: []string{"get", "list", "watch"}},
 	{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{"get", "list", "watch"}},
 }

@@ -7,6 +7,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
+	"github.com/andrew01234567890/pgshard/internal/controller"
 )
 
 // DefaultShardSet is the shard set the topology page shows from the catalog.
@@ -21,6 +22,24 @@ type PgxCatalog struct {
 
 // ShardStatus implements CatalogSource.
 func (p PgxCatalog) ShardStatus(ctx context.Context) ([]catalog.ShardStatus, error) {
+	set := p.ShardSet
+	if set == "" {
+		set = DefaultShardSet
+	}
+	return withConn(ctx, p, func(ctx context.Context, conn *pgx.Conn) ([]catalog.ShardStatus, error) {
+		return catalog.ListShardStatus(ctx, conn, set)
+	})
+}
+
+// RestorePoints implements CatalogSource.
+func (p PgxCatalog) RestorePoints(ctx context.Context) ([]controller.RestorePoint, error) {
+	return withConn(ctx, p, func(ctx context.Context, conn *pgx.Conn) ([]controller.RestorePoint, error) {
+		return controller.ListRestorePoints(ctx, conn, true)
+	})
+}
+
+func withConn[T any](ctx context.Context, p PgxCatalog, fn func(context.Context, *pgx.Conn) (T, error)) (T, error) {
+	var zero T
 	timeout := p.Timeout
 	if timeout <= 0 {
 		timeout = 5 * time.Second
@@ -29,12 +48,8 @@ func (p PgxCatalog) ShardStatus(ctx context.Context) ([]catalog.ShardStatus, err
 	defer cancel()
 	conn, err := pgx.Connect(ctx, p.DSN)
 	if err != nil {
-		return nil, err
+		return zero, err
 	}
 	defer func() { _ = conn.Close(ctx) }()
-	set := p.ShardSet
-	if set == "" {
-		set = DefaultShardSet
-	}
-	return catalog.ListShardStatus(ctx, conn, set)
+	return fn(ctx, conn)
 }

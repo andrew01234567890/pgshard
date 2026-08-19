@@ -1,0 +1,19 @@
+{{template "head" .Name}}
+<header><h1><a href="/">clusters</a> / <a href="/backups">backups</a> / {{.Namespace}} / {{.Name}}</h1>
+<span class="meta">cluster {{.Cluster}} · {{.Kind}}</span></header>
+<dl class="kv">
+<dt>Phase</dt><dd class="{{if eq .Phase "Completed"}}ok{{else if eq .Phase "Failed"}}bad{{end}}">{{.Phase}}</dd>
+<dt>Backup label</dt><dd>{{or .BackupID "—"}}</dd>
+<dt>Started</dt><dd>{{when .StartedAt}}</dd>
+<dt>Finished</dt><dd>{{when .CompletedAt}}</dd>
+<dt>Duration</dt><dd>{{or .Duration "—"}}</dd>
+</dl>
+{{if .Error}}<div class="alert" role="alert">{{.Error}}</div>{{end}}
+<h2>Groups</h2>
+{{if .Groups}}<table>
+<thead><tr><th>Group</th><th>Stanza</th><th>Backup label</th><th>Size</th><th>Repo size</th><th>Duration</th><th>Error</th></tr></thead>
+<tbody>{{range .Groups}}<tr>
+<td>{{.Group}}</td><td>{{.Stanza}}</td><td>{{.BackupID}}</td><td>{{if .SizeBytes}}{{bytes .SizeBytes}}{{end}}</td><td>{{if .RepoSizeBytes}}{{bytes .RepoSizeBytes}}{{end}}</td><td>{{.Duration}}</td><td class="bad">{{.Error}}</td>
+</tr>{{end}}</tbody></table>
+{{else}}<p class="notice">No group results yet.</p>{{end}}
+{{template "foot"}}

@@ -1,0 +1,9 @@
+{{template "head" "Backups"}}
+<header><h1><a href="/">clusters</a> / backups</h1></header>
+<nav class="tabs" aria-label="Sections"><a href="/">Clusters</a><a href="/backups" aria-current="page">Backups</a></nav>
+<div id="backups" data-live hx-get="/backups/panel" hx-trigger="topology" hx-swap="innerHTML">
+{{template "backups_panel.html" .}}
+</div>
+<p class="notice"><a href="/api/v1/backups">backups JSON</a> · <a href="/api/v1/restores">restores JSON</a> · <a href="/api/v1/restore-points">restore points JSON</a></p>
+<script src="/static/app.js" defer></script>
+{{template "foot"}}

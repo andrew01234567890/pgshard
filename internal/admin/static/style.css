@@ -13,3 +13,13 @@ h3 { font-size: 1rem; margin: 1rem 0 0.3rem; }
 .pill { display: inline-block; padding: 0 0.4rem; border-radius: 0.6rem; background: color-mix(in srgb, GrayText 25%, transparent); font-size: 0.8rem; }
 .notice { color: GrayText; font-size: 0.85rem; }
 a { color: LinkText; }
+nav.tabs { display: flex; gap: 1rem; margin: 0 0 1rem; font-size: 0.95rem; }
+.cards { display: flex; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.5rem; }
+.card { border: 1px solid color-mix(in srgb, GrayText 40%, transparent); border-radius: 0.4rem; padding: 0.6rem 1rem; min-width: 10rem; }
+.card .label { color: GrayText; font-size: 0.8rem; }
+.card .value { font-size: 1.3rem; font-weight: 600; }
+.card ul { margin: 0.3rem 0 0; padding-left: 1rem; font-size: 0.85rem; }
+.alert { border: 1px solid #cf222e; color: #cf222e; padding: 0.5rem 0.8rem; border-radius: 0.3rem; margin: 0.5rem 0; }
+dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 0.2rem 1rem; font-size: 0.92rem; }
+dl.kv dt { color: GrayText; }
+dl.kv dd { margin: 0; }

@@ -11,6 +11,7 @@ import (
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/internal/catalog"
+	"github.com/andrew01234567890/pgshard/internal/controller"
 	"github.com/andrew01234567890/pgshard/internal/operator"
 )
 
@@ -88,6 +89,8 @@ type Topology struct {
 // CatalogSource reads the shard status snapshot from the catalog database.
 type CatalogSource interface {
 	ShardStatus(ctx context.Context) ([]catalog.ShardStatus, error)
+	// RestorePoints lists the certified barriers, newest first.
+	RestorePoints(ctx context.Context) ([]controller.RestorePoint, error)
 }
 
 // ListClusters summarizes every PgShardCluster in namespace (all if empty).

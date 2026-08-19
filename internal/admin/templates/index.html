@@ -1,5 +1,14 @@
 {{template "head" "Clusters"}}
 <header><h1>pgshard clusters</h1><span class="meta">{{if .Namespace}}namespace {{.Namespace}}{{else}}all namespaces{{end}}</span></header>
+<nav class="tabs" aria-label="Sections"><a href="/" aria-current="page">Clusters</a><a href="/backups">Backups</a></nav>
+{{with .Cards}}
+<section class="cards" aria-label="Backup overview">
+<div class="card"><div class="label">Last successful backup</div>
+{{if .LastSuccess}}<ul>{{range $k, $v := .LastSuccess}}<li>{{$k}}: {{$v}} ago</li>{{end}}</ul>{{else}}<div class="value">—</div>{{end}}</div>
+<div class="card"><div class="label">Failed backups</div><div class="value {{if .FailedBackups}}bad{{else}}ok{{end}}">{{.FailedBackups}}</div></div>
+<div class="card"><div class="label">Restores in progress</div><div class="value">{{.RestoresInProgress}}</div></div>
+</section>
+{{end}}
 {{if .Clusters}}
 <table>
 <thead><tr><th>Namespace</th><th>Name</th><th>PostgreSQL</th><th>Shards</th><th>Ready</th></tr></thead>
