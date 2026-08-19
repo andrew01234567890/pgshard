@@ -36,7 +36,7 @@ func TestRoleVerifierWithPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustExec(t, conn, `INSERT INTO pgshard.roles (rolname, verifier, login, connection_limit, valid_until) VALUES ('app', $1, true, 5, '2031-01-01T00:00:00Z'), ('readers', NULL, false, -1, NULL)`, verifier.String())
+	mustExec(t, conn, `INSERT INTO pgshard.roles (rolname, verifier, login, connection_limit, valid_until) VALUES ('app', $1, true, 5, '2031-01-01T00:00:00Z'), ('readers', NULL, false, -1, NULL), ('postgres', NULL, true, -1, NULL)`, verifier.String())
 	mustExec(t, conn, `INSERT INTO pgshard.role_members (rolname, member, admin_option) VALUES ('readers', 'app', true)`)
 	mustExec(t, conn, `INSERT INTO pgshard.grants (rolname, database, object_kind, object_name, privileges, grant_option) VALUES ('app', 'postgres', 'table', 'orders', '{SELECT,UPDATE}', false)`)
 	mustExec(t, conn, `INSERT INTO pgshard.role_settings (rolname, database, name, value) VALUES ('app', '', 'work_mem', '64MB')`)
@@ -72,6 +72,12 @@ func TestRoleVerifierWithPostgres(t *testing.T) {
 		}
 		if got["stranger@default/0"] != "unmanaged note=not in pgshard.roles; left alone" {
 			t.Fatalf("unmanaged: %v", got)
+		}
+		if got := got["postgres@default/0"]; !strings.HasPrefix(got, "unmanaged_superuser ") || !strings.Contains(got, "superuser=true") {
+			t.Fatalf("a listed superuser is reported, never altered: %q", got)
+		}
+		if !queryOne[bool](t, conn, `SELECT rolsuper AND rolcreaterole FROM pg_authid WHERE rolname = 'postgres'`) {
+			t.Fatal("the listed superuser was demoted")
 		}
 		if got := queryOne[string](t, conn, `SELECT rolpassword FROM pg_authid WHERE rolname = 'app'`); got != verifier.String() {
 			t.Fatalf("verifier %q", got)

@@ -44,7 +44,7 @@ DROP TABLE pgshard.role_status;
 CREATE TABLE pgshard.role_status (
     rolname          text        NOT NULL,
     group_name       text        NOT NULL,
-    state            text        NOT NULL CHECK (state IN ('in_sync', 'drifted', 'missing', 'unmanaged')),
+    state            text        NOT NULL CHECK (state IN ('in_sync', 'drifted', 'missing', 'unmanaged', 'unmanaged_superuser')),
     details          jsonb       NOT NULL DEFAULT '{}'::jsonb,
     roles_generation bigint      NOT NULL DEFAULT 0,
     checked_at       timestamptz NOT NULL DEFAULT now(),

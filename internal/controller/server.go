@@ -247,7 +247,7 @@ func roleState(s string) pgshardv1.RoleStatus_State {
 		return pgshardv1.RoleStatus_STATE_DRIFTED
 	case RoleMissing:
 		return pgshardv1.RoleStatus_STATE_MISSING
-	case RoleUnmanaged:
+	case RoleUnmanaged, RoleUnmanagedSuperuser:
 		return pgshardv1.RoleStatus_STATE_UNMANAGED
 	}
 	return pgshardv1.RoleStatus_STATE_UNSPECIFIED

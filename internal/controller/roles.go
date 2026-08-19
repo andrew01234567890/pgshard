@@ -24,6 +24,9 @@ const (
 	RoleDrifted   = "drifted"
 	RoleMissing   = "missing"
 	RoleUnmanaged = "unmanaged"
+	// RoleUnmanagedSuperuser marks a role listed in pgshard.roles that is a
+	// superuser on the group: it is reported and never altered.
+	RoleUnmanagedSuperuser = "unmanaged_superuser"
 )
 
 // RoleStatus is a row of pgshard.role_status.
@@ -387,24 +390,33 @@ func MaterializeRoles(ctx context.Context, dial func(ctx context.Context, databa
 		return &dialError{err}
 	}
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	superusers := map[string]bool{}
 	for _, r := range d.Roles {
-		rows, err := conn.Query(ctx, `SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)`, r.Name)
+		rows, err := conn.Query(ctx, `SELECT rolsuper FROM pg_roles WHERE rolname = $1`, r.Name)
 		if err != nil {
 			return err
 		}
-		exists, err := pgx.CollectOneRow(rows, pgx.RowTo[bool])
-		if err != nil {
+		super, err := pgx.CollectOneRow(rows, pgx.RowTo[bool])
+		exists := err == nil
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
-		verb := "CREATE ROLE "
+		if exists && super {
+			superusers[r.Name] = true
+			continue
+		}
+		sql := "CREATE ROLE " + pgx.Identifier{r.Name}.Sanitize() + " " + RoleOptionsSQL(r) + " NOSUPERUSER NOREPLICATION NOBYPASSRLS"
 		if exists {
-			verb = "ALTER ROLE "
+			sql = "ALTER ROLE " + pgx.Identifier{r.Name}.Sanitize() + " " + RoleOptionsSQL(r)
 		}
-		if _, err := conn.Exec(ctx, verb+pgx.Identifier{r.Name}.Sanitize()+" "+RoleOptionsSQL(r)); err != nil {
+		if _, err := conn.Exec(ctx, sql); err != nil {
 			return fmt.Errorf("role %s: %w", r.Name, err)
 		}
 	}
 	for _, m := range d.Members {
+		if superusers[m.Member] {
+			continue
+		}
 		sql := "GRANT " + pgx.Identifier{m.Role}.Sanitize() + " TO " + pgx.Identifier{m.Member}.Sanitize()
 		if m.Admin {
 			sql += " WITH ADMIN OPTION"
@@ -414,6 +426,9 @@ func MaterializeRoles(ctx context.Context, dial func(ctx context.Context, databa
 		}
 	}
 	for _, s := range d.Settings {
+		if superusers[s.Role] {
+			continue
+		}
 		sql := "ALTER ROLE " + pgx.Identifier{s.Role}.Sanitize()
 		if s.Database != "" {
 			sql += " IN DATABASE " + pgx.Identifier{s.Database}.Sanitize()
@@ -460,7 +475,9 @@ func grantDatabases(grants []catalog.DesiredGrant) []string {
 }
 
 // RoleOptionsSQL renders the attribute and password options of a desired
-// role for CREATE/ALTER ROLE.
+// role for CREATE/ALTER ROLE. NOSUPERUSER, NOREPLICATION and NOBYPASSRLS
+// are not among them: a role observed as superuser is never altered, and
+// CREATE ROLE adds them itself.
 func RoleOptionsSQL(r catalog.DesiredRole) string {
 	opt := func(on bool, yes, no string) string {
 		if on {
@@ -473,7 +490,6 @@ func RoleOptionsSQL(r catalog.DesiredRole) string {
 		opt(r.CreateDB, "CREATEDB", "NOCREATEDB"),
 		opt(r.CreateRole, "CREATEROLE", "NOCREATEROLE"),
 		opt(r.Inherit, "INHERIT", "NOINHERIT"),
-		"NOSUPERUSER", "NOREPLICATION", "NOBYPASSRLS",
 		fmt.Sprintf("CONNECTION LIMIT %d", r.ConnectionLimit),
 	}
 	if r.ValidUntil != nil {
@@ -683,6 +699,13 @@ func diffGroup(group string, d *catalog.DesiredRoles, obs *observedGroup, withGr
 			rows = append(rows, st)
 			continue
 		}
+		if o.Super {
+			st.State = RoleUnmanagedSuperuser
+			st.Details["superuser"] = true
+			st.Details["note"] = "superuser on this group; never altered"
+			rows = append(rows, st)
+			continue
+		}
 		var attrs []string
 		if o.Login != r.Login {
 			attrs = append(attrs, "login")
@@ -836,7 +859,12 @@ func (c poolShardConn) Exec(ctx context.Context, sql string, args ...any) (pgcon
 	return c.Conn.Exec(ctx, sql, args...)
 }
 
-func (c poolShardConn) Close(context.Context) error {
+// Close resets the session settings a step set (lock_timeout, role) so the
+// pooled connection returns clean.
+func (c poolShardConn) Close(ctx context.Context) error {
+	if _, err := c.Conn.Exec(ctx, "RESET ALL"); err != nil {
+		_ = c.Conn.Conn().Close(ctx)
+	}
 	c.Release()
 	return nil
 }

@@ -8,6 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
 )
@@ -38,10 +41,10 @@ func TestSameVerifier(t *testing.T) {
 func TestRoleOptionsAndGrantSQL(t *testing.T) {
 	until := time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)
 	r := catalog.DesiredRole{Name: "r", Verifier: "SCRAM-SHA-256$x", Login: true, CreateDB: true, Inherit: true, ConnectionLimit: 7, ValidUntil: &until}
-	if got := RoleOptionsSQL(r); got != "LOGIN CREATEDB NOCREATEROLE INHERIT NOSUPERUSER NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 7 VALID UNTIL '2030-01-02T03:04:05Z' PASSWORD 'SCRAM-SHA-256$x'" {
+	if got := RoleOptionsSQL(r); got != "LOGIN CREATEDB NOCREATEROLE INHERIT CONNECTION LIMIT 7 VALID UNTIL '2030-01-02T03:04:05Z' PASSWORD 'SCRAM-SHA-256$x'" {
 		t.Fatalf("options %q", got)
 	}
-	if got := RoleOptionsSQL(catalog.DesiredRole{Name: "g"}); got != "NOLOGIN NOCREATEDB NOCREATEROLE NOINHERIT NOSUPERUSER NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 0 VALID UNTIL 'infinity'" {
+	if got := RoleOptionsSQL(catalog.DesiredRole{Name: "g"}); got != "NOLOGIN NOCREATEDB NOCREATEROLE NOINHERIT CONNECTION LIMIT 0 VALID UNTIL 'infinity'" {
 		t.Fatalf("bare options %q", got)
 	}
 	cases := []struct {
@@ -172,5 +175,57 @@ func TestApplierFansRoleStatementsToTheCatalogLast(t *testing.T) {
 	}
 	if len(f.store.execs) != before {
 		t.Fatalf("a failed migration must not change the desired verifier: %v", f.store.execs[before:])
+	}
+}
+
+// roleGroupConn fakes a group for MaterializeRoles: roles maps an existing
+// role to whether it is a superuser.
+type roleGroupConn struct {
+	roles map[string]bool
+	ran   []string
+}
+
+func (c *roleGroupConn) Exec(_ context.Context, sql string, _ ...any) (pgconnTag, error) {
+	c.ran = append(c.ran, sql)
+	return pgconn.CommandTag{}, nil
+}
+
+func (c *roleGroupConn) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
+	if !strings.Contains(sql, "rolsuper") {
+		return nil, fmt.Errorf("unexpected query %q", sql)
+	}
+	super, ok := c.roles[args[0].(string)]
+	if !ok {
+		return &boolRows{}, nil
+	}
+	return &boolRows{vals: []bool{super}}, nil
+}
+
+func (c *roleGroupConn) Close(context.Context) error { return nil }
+
+func TestMaterializeRolesNeverAltersASuperuser(t *testing.T) {
+	conn := &roleGroupConn{roles: map[string]bool{"postgres": true, "app": false}}
+	d := &catalog.DesiredRoles{
+		Roles:    []catalog.DesiredRole{{Name: "postgres", Login: true}, {Name: "app", Login: true}, {Name: "fresh"}},
+		Members:  []catalog.RoleMembership{{Role: "app", Member: "postgres"}, {Role: "app", Member: "fresh"}},
+		Settings: []catalog.RoleSetting{{Role: "postgres", Name: "work_mem", Value: "1MB"}, {Role: "app", Name: "work_mem", Value: "2MB"}},
+	}
+	err := MaterializeRoles(context.Background(), func(context.Context, string) (ShardConn, error) { return conn, nil }, d, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(conn.ran, ";")
+	if strings.Contains(got, `"postgres"`) {
+		t.Fatalf("a superuser was touched: %q", got)
+	}
+	want := `ALTER ROLE "app" LOGIN NOCREATEDB NOCREATEROLE NOINHERIT CONNECTION LIMIT 0 VALID UNTIL 'infinity';` +
+		`CREATE ROLE "fresh" NOLOGIN NOCREATEDB NOCREATEROLE NOINHERIT CONNECTION LIMIT 0 VALID UNTIL 'infinity' NOSUPERUSER NOREPLICATION NOBYPASSRLS;` +
+		`GRANT "app" TO "fresh";ALTER ROLE "app" SET "work_mem" TO '2MB'`
+	if got != want {
+		t.Fatalf("ran %q\nwant %q", got, want)
+	}
+	st := diffGroup("g", d, &observedGroup{Roles: map[string]observedRole{"postgres": {Name: "postgres", Super: true, Login: true}}, Members: map[membershipKey]bool{}}, false)
+	if st[0].State != RoleUnmanagedSuperuser || st[0].Details["superuser"] != true {
+		t.Fatalf("superuser status %+v", st[0])
 	}
 }

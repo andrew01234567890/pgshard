@@ -106,7 +106,7 @@ Status tables are written by `pgshard_system`; `pgshard_admin` and
 | `database_status` | `database`, `state`, `effective_generation`, `updated_at` |
 | `table_status` | `database`, `schema_name`, `table_name`, `effective_placement`, `effective_shard_key`, `effective_generation`, `workflow_id`, `progress` (jsonb), `updated_at` |
 | `shard_status` | `shard_set`, `shard_id`, `group_name`, `serving_state`, `primary_epoch`, `primary_endpoint`, `replay_lag_bytes`, `updated_at` |
-| `role_status` | per `(rolname, group_name)`: `state` (`in_sync`, `drifted`, `missing`, `unmanaged`), `details` (jsonb), `roles_generation`, `checked_at` (`docs/roles.md`) |
+| `role_status` | per `(rolname, group_name)`: `state` (`in_sync`, `drifted`, `missing`, `unmanaged`, `unmanaged_superuser`), `details` (jsonb), `roles_generation`, `checked_at` (`docs/roles.md`) |
 | `role_group_status` | `group_name`, `roles_generation` the group was last materialized at, `materialized_at` |
 | `workflows` | `id` (uuid), `kind`, `state`, `spec`, `status`, `journal_ids`, `created_at`, `updated_at`, `error` |
 | `migrations` | DDL/DCL migrations (`docs/ddl.md`): `id` (uuid), `database`, `statement`, `kind`, `strategy` (`direct`, `concurrent`), `scope` (`all`, `home`, `existing`), `home_shard`, `state` (`queued`, `running`, `complete`, `failed`), `meta` (jsonb: run_as, object, role/verifier, roles delta, database), `per_shard` (jsonb per shard: state, attempts, error, sqlstate), `error`, `created_at`, `updated_at`, `finished_at` |

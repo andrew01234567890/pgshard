@@ -72,9 +72,10 @@ passes between migrations:
    `pgshard.shard_status` (a resharding target), the catalog, or every group
    after a role migration completed — are *materialized*:
    `MaterializeRoles` creates or alters every desired role with its
-   attributes and verifier (`CREATE ROLE`/`ALTER ROLE … NOSUPERUSER
-   NOREPLICATION NOBYPASSRLS … PASSWORD '<verifier>'`), grants every
-   membership, sets every setting and, per database, re-grants every grant
+   attributes and verifier (`CREATE ROLE … NOSUPERUSER NOREPLICATION
+   NOBYPASSRLS … PASSWORD '<verifier>'`; `ALTER ROLE` re-applies only the
+   managed attributes, never `NOSUPERUSER`), grants every membership, sets
+   every setting and, per database, re-grants every grant
    (idempotent; a grant whose object is missing on that group is reported,
    the rest applied). `pgshard.role_group_status` records the generation
    the group reached. `NewRolesMaterializer(dsn)` is the same step for a
@@ -88,7 +89,11 @@ passes between migrations:
    `pgshard.role_status`: `in_sync`, `drifted` (details: `attributes`,
    `verifier`, `missing_memberships`, `missing_grants`), `missing`, or
    `unmanaged` for a non-superuser role on the group that is not in
-   `pgshard.roles` (reported, never touched). Drifted and missing managed
+   `pgshard.roles` (reported, never touched), or `unmanaged_superuser`
+   (`details.superuser = true`) for a role listed in `pgshard.roles` that is
+   a superuser on the group — `postgres`, the controller's own login — which
+   is reported and never altered, granted or given settings, so a listing
+   can never demote it. Drifted and missing managed
    roles are repaired at once by re-materializing just those roles; the row
    stays `drifted` with `details.repaired = true` until the next pass sees
    it in sync (`repair_error` names a failed repair).
