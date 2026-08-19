@@ -2,9 +2,9 @@
 
 Resharding changes the number of shards (or the ranges they own) without
 touching the serving groups until the new ones are ready. This document
-covers the model, naming, the phases implemented so far and cancellation.
-The copy, verify and switch stages are later milestones; their extension
-points are named below.
+covers the model, naming, the phases implemented so far (provisioning and
+the copy phase) and cancellation. The verify and switch stages are later
+milestones; their extension points are named below.
 
 ## Model
 
@@ -86,13 +86,86 @@ rollouts apply) with these differences:
 |-------|--------|---------|
 | `Pending` | operator | Pending set and record exist; no workflow yet. |
 | `Provisioning` | controller | The desired-state reconciler created a `pgshard.workflows` row (`kind=reshard`, `state=provisioning`, `status.stage=provisioning`, `spec{shard_set, generation, ranges}`) and moved the set to `provisioning`. The operator reports target readiness on the record. |
-| `Copying` | controller | Every target shard has a `shard_status` row with a primary endpoint; the workflow moved to `state=running`, `status.stage=ready_for_copy`. The copy stage is the first extension point (later milestone): today it is a no-op marker. |
+| `Copying` | controller | Every target shard has a `shard_status` row with a primary endpoint; the workflow moved to `state=running`, `status.stage=ready_for_copy`. The copier takes over: `copying` while schemas, publications and subscriptions are set up and the initial copy streams, `catch_up_done` once every table is ready and the apply lag is under `--copy-lag-bytes`. The record stays `Copying` through both stages; the verify step (later milestone) starts from `catch_up_done`. |
 | `Verifying`, `Switching`, `Completed` | later milestones | Verification, the write switch (`spec.resharding.pauseBefore` holds before `switchWrites` or `complete`), stanza creation for the new groups and retirement of the old ones. |
 | `Cancelled` | operator | See below. |
 | `Failed` | controller | The workflow failed. |
 
 The controller state machine is in `internal/controller/reshard.go`; the
 operator side in `internal/operator/reshard.go`.
+
+## Copy phase
+
+The copier (`internal/controller/copy.go`, one pass every
+`--copy-interval`) drives every `kind=reshard` workflow in a copy stage.
+Each pass re-derives what is missing from the shards' own catalogs
+(`pg_database`, `pg_publication`, `pg_subscription`), so a restarted
+controller continues wherever the previous one stopped, and the per-step
+record under `status.copy` is informational except for the schema flags.
+
+1. **Schema materialization.** For every row of `pgshard.databases` and
+   every target the controller creates the database on the target and asks
+   the agent of the target primary (`Agent.MaterializeSchema`, address =
+   `shard_status.primary_endpoint` host + `--agent-port`) to run
+   `pg_dump --schema-only --no-publications --no-subscriptions` against the
+   database's home shard piped into `psql -v ON_ERROR_STOP=1`. Tables,
+   indexes, constraints, sequences, types, views and grants come across;
+   roles already exist on every group. `status.copy.schema[db][target]`
+   records success; a database without the flag is dropped and recreated
+   before the next attempt so a half-applied dump never survives. With
+   `--pg-bin` (or `PGSHARD_PG_BIN`) the controller runs the binaries
+   itself instead of calling agents.
+2. **Publications on every source**, per database, publishing
+   `insert, update, delete` (never TRUNCATE: the router refuses `TRUNCATE`
+   on every table while a shard set is provisioning):
+   - `pgshard_reshard_g<gen>_t<target>` for every target: every sharded
+     table `FOR TABLE t WHERE (<hash>(key) >= lo AND <hash>(key) <= hi)`
+     with the target's range. The hash expression is the one the router's
+     placement port mirrors: `hashint8extended(key::int8, seed)` for
+     integer keys, `hashtextextended(key::text, seed)` for character keys,
+     `uuid_hash_extended(key, seed)` for uuid, seed =
+     `HASH_PARTITION_SEED`. Other key types fail the workflow.
+   - `pgshard_reshard_g<gen>_ref` on the database's home shard only:
+     every reference table, unfiltered; every target subscribes to it.
+   - `pgshard_reshard_g<gen>_home` on the home shard only: every other
+     table of the database (registered unsharded tables and unregistered
+     ones), unfiltered; only the **home target** subscribes to it. The
+     home target is the target whose range contains keyspace id 0: the
+     successor of the home shard for unsharded data.
+
+   Publishing UPDATE and DELETE requires a replica identity that covers
+   the row-filter columns. Tables without a primary key, and sharded
+   tables whose primary key does not include the shard key, get
+   `REPLICA IDENTITY FULL` on the source before the publication is
+   created; `status.copy.replica_identity_full` lists them so a later
+   stage can revert it.
+3. **Subscriptions on every target**, per database, one per
+   (target, source) pair named `pgshard_reshard_g<gen>_t<target>_s<source>`
+   (also the slot name on the source) with
+   `copy_data=true, create_slot=true, streaming=parallel, two_phase=false,
+   origin=any` and the source's direct conninfo
+   (`--subscription-dsn-template`, placeholders `{set} {id} {group} {db}`).
+   Slot creation waits for every running transaction on the source, so
+   before creating one the controller lists `pg_prepared_xacts` there,
+   runs the resolver once, and retries next pass while any remain
+   (`status.copy.blocked_by`); after `--copy-prepared-wait` the workflow
+   fails.
+4. **Progress.** `pg_subscription_rel` states and
+   `pg_stat_subscription.latest_end_lsn` against the source's
+   `pg_current_wal_lsn()` are aggregated into `status.progress`
+   (`subscriptions, tables_total, tables_ready, lag_bytes, paused`) and
+   `status.message`; the operator copies the message onto the record.
+5. **Throttling.** The largest physical standby lag over the sources
+   (`pg_stat_replication` minus the reshard walsenders) pauses every
+   subscription (`ALTER SUBSCRIPTION ... DISABLE`) above
+   `--copy-throttle-high-bytes` and resumes them below
+   `--copy-throttle-low-bytes` (hysteresis). Target bloat is not measured
+   yet.
+
+Tables registered or created after the publications exist are not picked
+up (the M4 DDL applier runs its own migrations; resharding under DDL is a
+later step). Sequences come across with their definitions only; values
+are not replicated.
 
 ## Cancel
 
@@ -103,8 +176,13 @@ object of the target groups (pods, PVCs, Services, ConfigMaps, PDBs,
 Leases, `PgShardGroup`s) and marks the record `Cancelled`; the controller
 sees the set vanish and cancels the workflow. Catalog-sourced runs are
 cancelled by deleting the set's rows in SQL; the operator then tears the
-targets down the same way. Once a run reached `Copying` a revert is
-refused (`ReshardActive`) until the later stages can roll it back safely.
+targets down the same way. A run in `Copying` cancels the same way: the
+reconciler moves the workflow to `state=cancelled, stage=cancelling`
+and the copier drops the subscriptions on the targets it can still
+reach, then every `pgshard_reshard_g<gen>_*` slot (terminating its
+walsender) and publication on the sources, and ends at
+`stage=cancelled`. Targets the operator already deleted are skipped.
+Runs past `Copying` cannot be cancelled yet.
 
 The `Cancelled` record stays for the audit trail; the next reshard gets the
 next generation and a new record.

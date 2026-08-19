@@ -52,11 +52,17 @@ jobs:
           docker build -f Dockerfile.control --build-arg CMD=pgshard-operator -t pgshard-operator:e2e .
           docker build -f Dockerfile.control --build-arg CMD=pgshard-admin -t pgshard-admin:e2e .
           docker build -f Dockerfile.router -t pgshard-router:e2e .
+      - name: Build controller image
+        if: matrix.suite == 'reshard'
+        run: docker build -f Dockerfile.control --build-arg CMD=pgshard-controller -t pgshard-controller:e2e .
       - name: Create kind cluster
         run: hack/kind/up.sh
       - name: Load images into kind
         if: matrix.suite != 'smoke'
         run: hack/kind/load-images.sh pgshard-operator:e2e pgshard-admin:e2e pgshard-router:e2e "ghcr.io/andrew01234567890/pgshard-postgres:${PG_MAJOR}"
+      - name: Load controller image into kind
+        if: matrix.suite == 'reshard'
+        run: hack/kind/load-images.sh pgshard-controller:e2e
       - name: Run e2e suite
         run: |
           set -o pipefail
@@ -73,6 +79,7 @@ jobs:
           ROUTER_IMAGE: pgshard-router:e2e
           OPERATOR_IMAGE: pgshard-operator:e2e
           ADMIN_IMAGE: pgshard-admin:e2e
+          CONTROLLER_IMAGE: pgshard-controller:e2e
       - name: Collect cluster state on failure
         if: failure()
         run: |

@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -57,6 +58,14 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	shardDSNTemplate := fs.String("shard-dsn-template", "", "superuser DSN for shard primaries with {set}, {id} and {group} placeholders (enables the resolver)")
 	barrierDrain := fs.Duration("barrier-drain-timeout", controller.DefaultDrainTimeout, "how long a barrier waits for in-flight two-phase commits")
 	barrierArchive := fs.Duration("barrier-archive-timeout", controller.DefaultArchiveTimeout, "how long a barrier waits for every group's restore point to be archived")
+	subscriptionTemplate := fs.String("subscription-dsn-template", "", "libpq connection string targets use to subscribe to a source database, with {set}, {id}, {group} and {db} placeholders (defaults to --shard-dsn-template with the database replaced)")
+	copyEvery := fs.Duration("copy-interval", 5*time.Second, "time between reshard copy passes")
+	copyLag := fs.Int64("copy-lag-bytes", controller.DefaultLagBytes, "apply lag under which a reshard copy counts as caught up")
+	throttleHigh := fs.Int64("copy-throttle-high-bytes", controller.DefaultThrottleHi, "source standby lag that pauses reshard subscriptions")
+	throttleLow := fs.Int64("copy-throttle-low-bytes", controller.DefaultThrottleLo, "source standby lag under which paused reshard subscriptions resume")
+	preparedWait := fs.Duration("copy-prepared-wait", controller.DefaultPreparedWait, "how long slot creation waits for in-doubt prepared transactions before the reshard fails")
+	agentPort := fs.Int("agent-port", controller.DefaultAgentPort, "gRPC port of member agents (schema materialization)")
+	pgBin := fs.String("pg-bin", os.Getenv("PGSHARD_PG_BIN"), "directory with pg_dump and psql; when set, schemas are materialized from the controller host instead of through agents (PGSHARD_PG_BIN)")
 	var shardDSNs shardDSNFlag
 	fs.Var(&shardDSNs, "shard-dsn", "explicit shard DSN as <set>/<id>=<dsn>; repeatable")
 	ddlRole := fs.String("ddl-role", controller.DefaultDDLRole, "non-superuser login the applier provisions on every shard and runs client DDL through")
@@ -126,6 +135,20 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 			Catalog: controller.CatalogDialer(pool), Roles: roles}
 		go applier.Run(ctx, *applyEvery, leader.Load)
 		go (&controller.StreamMonitor{Pool: pool, Logger: logger, Shards: dialer}).Run(ctx, *resolveEvery)
+		subTemplate := *subscriptionTemplate
+		if subTemplate == "" {
+			subTemplate = *shardDSNTemplate
+		}
+		connInfo := func(ctx context.Context, ref controller.ShardRef, database string) (string, error) {
+			return shardConnInfo(ctx, pool, shardDSNs, subTemplate, ref, database)
+		}
+		var schema controller.SchemaMaterializer = &controller.AgentMaterializer{Pool: pool, Port: *agentPort}
+		if *pgBin != "" {
+			schema = &controller.ExecMaterializer{BinDir: *pgBin, TargetConnInfo: connInfo}
+		}
+		copier := &controller.Copier{Pool: pool, Shards: dialer, Schema: schema, SourceConnInfo: connInfo, Resolver: resolver, Logger: logger,
+			LagBytes: *copyLag, ThrottleHigh: *throttleHigh, ThrottleLow: *throttleLow, PreparedWait: *preparedWait}
+		go copier.Run(ctx, *copyEvery)
 	}
 
 	if *listen == "" {
@@ -182,6 +205,48 @@ func listenerCredentials(certFile, keyFile, caFile string, insecureDev bool) (cr
 	}
 	return credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}, ClientCAs: pool,
 		ClientAuth: tls.RequireAndVerifyClientCert, MinVersion: tls.VersionTLS13}), nil
+}
+
+// shardConnInfo renders the connection string of one shard database:
+// an explicit --shard-dsn entry with its database replaced, else the
+// template expanded ({db} or, without the placeholder, the database
+// replaced in the expanded DSN).
+func shardConnInfo(ctx context.Context, pool *pgxpool.Pool, dsns shardDSNFlag, template string, ref controller.ShardRef, database string) (string, error) {
+	if dsn, ok := dsns[ref]; ok {
+		return withDatabase(dsn, database)
+	}
+	if template == "" {
+		return "", fmt.Errorf("no DSN for shard %s/%d", ref.Set, ref.ID)
+	}
+	group, err := controller.GroupName(ctx, pool, ref.Set, ref.ID)
+	if err != nil {
+		return "", err
+	}
+	dsn := controller.ExpandShardTemplate(template, ref.Set, ref.ID, group, database)
+	if strings.Contains(template, "{db}") {
+		return dsn, nil
+	}
+	return withDatabase(dsn, database)
+}
+
+// withDatabase rewrites the database of a DSN as a keyword/value string.
+func withDatabase(dsn, database string) (string, error) {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return "", err
+	}
+	parts := []string{"host=" + cfg.Host, "port=" + fmt.Sprint(cfg.Port), "user=" + cfg.User, "dbname=" + database}
+	if cfg.Password != "" {
+		parts = append(parts, "password="+pqEscape(cfg.Password))
+	}
+	if cfg.TLSConfig == nil {
+		parts = append(parts, "sslmode=disable")
+	}
+	return strings.Join(parts, " "), nil
+}
+
+func pqEscape(v string) string {
+	return "'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(v) + "'"
 }
 
 // shardDSNFlag collects --shard-dsn <set>/<id>=<dsn> values.

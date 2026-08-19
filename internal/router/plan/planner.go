@@ -393,6 +393,10 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 	case *pgquerypb.Node_CreateTableAsStmt:
 		return w.derived(n.CreateTableAsStmt.GetInto().GetRel(), n.CreateTableAsStmt.GetQuery(), "CREATE TABLE AS")
 	case *pgquerypb.Node_TruncateStmt:
+		if w.sess.Snapshot != nil && w.sess.Snapshot.Resharding() {
+			return notYet("TRUNCATE is not available while a reshard is active: the copy streams row changes only",
+				"DELETE the rows, or wait for the reshard to complete")
+		}
 		return w.maintenanceList("TRUNCATE", n.TruncateStmt.GetRelations())
 	case *pgquerypb.Node_LockStmt:
 		return w.maintenanceList("LOCK TABLE", n.LockStmt.GetRelations())

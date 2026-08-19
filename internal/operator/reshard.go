@@ -153,7 +153,7 @@ func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1al
 	revert := want != nil && *want == effective && specSourced
 
 	switch {
-	case revert && (phase == pgshardv1alpha1.ReshardPhasePending || phase == pgshardv1alpha1.ReshardPhaseProvisioning):
+	case revert && (phase == pgshardv1alpha1.ReshardPhasePending || phase == pgshardv1alpha1.ReshardPhaseProvisioning || phase == pgshardv1alpha1.ReshardPhaseCopying):
 		log.Info("cancelling reshard: spec.shards reverted", "set", pending.Name)
 		if err := r.Prober.DropShardSet(ctx, dsn, pending.Name); err != nil {
 			return plan, fmt.Errorf("drop pending shard set: %w", err)
@@ -216,7 +216,7 @@ func reshardPhase(wf WorkflowInfo) string {
 		return pgshardv1alpha1.ReshardPhaseFailed
 	case wf.State == "completed":
 		return pgshardv1alpha1.ReshardPhaseCompleted
-	case wf.Stage == "ready_for_copy":
+	case wf.Stage == "ready_for_copy", wf.Stage == "copying", wf.Stage == "catch_up_done":
 		return pgshardv1alpha1.ReshardPhaseCopying
 	}
 	return pgshardv1alpha1.ReshardPhaseProvisioning
@@ -282,6 +282,9 @@ func (r *ClusterReconciler) updateReshardStatus(ctx context.Context, plan reshar
 		st.Message = fmt.Sprintf("%s: %d/%d target groups ready", st.Phase, ready, len(targets))
 		if plan.workflow.Stage != "" {
 			st.Message += "; workflow stage " + plan.workflow.Stage
+		}
+		if plan.workflow.Message != "" {
+			st.Message += "; " + plan.workflow.Message
 		}
 	})
 }

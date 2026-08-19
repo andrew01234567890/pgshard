@@ -44,15 +44,27 @@ func reconcileReshards(ctx context.Context, tx pgx.Tx, res *Result) error {
 	wfBySet := map[string]reshardWorkflow{}
 	for _, w := range workflows {
 		wfBySet[w.ShardSet] = w
-		if _, ok := setByName[w.ShardSet]; !ok && w.State == StateProvisioning {
-			if err := setWorkflowState(ctx, tx, w.ID, StateCancelled, map[string]any{"stage": "cancelled", "reason": "shard set removed"}); err != nil {
-				return err
-			}
-			if _, err := tx.Exec(ctx, `DELETE FROM pgshard.shard_status WHERE shard_set = $1`, w.ShardSet); err != nil {
-				return err
-			}
-			res.ReshardsCancelled++
+		if _, ok := setByName[w.ShardSet]; ok {
+			continue
 		}
+		switch w.State {
+		case StateProvisioning:
+			if err := setWorkflowState(ctx, tx, w.ID, StateCancelled, map[string]any{"stage": StageCancelled, "reason": "shard set removed"}); err != nil {
+				return err
+			}
+		case StateRunning, StatePaused:
+			// The copier drops subscriptions, slots and publications, then
+			// moves the stage to cancelled.
+			if err := setWorkflowState(ctx, tx, w.ID, StateCancelled, map[string]any{"stage": StageCancelling, "reason": "shard set removed"}); err != nil {
+				return err
+			}
+		default:
+			continue
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM pgshard.shard_status WHERE shard_set = $1`, w.ShardSet); err != nil {
+			return err
+		}
+		res.ReshardsCancelled++
 	}
 	for _, ss := range sets {
 		switch ss.State {

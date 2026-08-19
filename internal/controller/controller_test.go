@@ -30,12 +30,19 @@ func startPostgres(t *testing.T) string {
 // startPostgresWith starts PostgreSQL with extra server options.
 func startPostgresWith(t *testing.T, opts ...string) string {
 	t.Helper()
+	return startPostgresImage(t, pgImage, nil, opts...)
+}
+
+// startPostgresImage starts image with extra docker run arguments and
+// server options and returns the host-side DSN.
+func startPostgresImage(t *testing.T, image string, dockerArgs []string, opts ...string) string {
+	t.Helper()
 	if err := exec.Command("docker", "info").Run(); err != nil {
 		t.Skip("docker unavailable; skipping controller integration tests")
 	}
-	if exec.Command("docker", "image", "inspect", pgImage).Run() != nil {
-		if out, err := exec.Command("docker", "pull", pgImage).CombinedOutput(); err != nil {
-			t.Skipf("image %s unavailable: %v: %s", pgImage, err, out)
+	if exec.Command("docker", "image", "inspect", image).Run() != nil {
+		if out, err := exec.Command("docker", "pull", image).CombinedOutput(); err != nil {
+			t.Skipf("image %s unavailable: %v: %s", image, err, out)
 		}
 	}
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -44,11 +51,12 @@ func startPostgresWith(t *testing.T, opts ...string) string {
 	}
 	port := l.Addr().(*net.TCPAddr).Port
 	_ = l.Close()
-	out, err := exec.Command("docker", "run", "-d", "--rm", "-p", fmt.Sprintf("127.0.0.1:%d:5432", port),
-		"--entrypoint", "sh", pgImage, "-ec",
+	args := append([]string{"run", "-d", "--rm", "-p", fmt.Sprintf("127.0.0.1:%d:5432", port)}, dockerArgs...)
+	args = append(args, "--entrypoint", "sh", image, "-ec",
 		`initdb -D /tmp/pgdata --auth=trust -U postgres >/dev/null &&
 		 echo "host all all all trust" >> /tmp/pgdata/pg_hba.conf &&
-		 exec postgres -D /tmp/pgdata -c listen_addresses='*' `+strings.Join(opts, " ")).CombinedOutput()
+		 exec postgres -D /tmp/pgdata -c listen_addresses='*' `+strings.Join(opts, " "))
+	out, err := exec.Command("docker", args...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("docker run: %v: %s", err, out)
 	}

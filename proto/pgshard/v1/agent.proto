@@ -70,6 +70,10 @@ service Agent {
   // SetWriteFence raises or releases the cluster write fence in the pgshard
   // catalog this instance serves.
   rpc SetWriteFence(SetWriteFenceRequest) returns (SetWriteFenceResponse);
+  // MaterializeSchema copies the schema of one database from a source
+  // (pg_dump --schema-only piped into psql) into the same-named local
+  // database, which must already exist and be empty.
+  rpc MaterializeSchema(MaterializeSchemaRequest) returns (MaterializeSchemaResponse);
 }
 
 // StatusRequest asks for the instance status.
@@ -488,4 +492,17 @@ message SetWriteFenceRequest {
 message SetWriteFenceResponse {
   uint64 epoch = 1;
   Error error = 2;
+}
+
+// MaterializeSchemaRequest names the source and the database to copy.
+message MaterializeSchemaRequest {
+  // libpq connection string of the source database.
+  string source_conninfo = 1;
+  // Database name on both sides.
+  string database = 2;
+}
+
+// MaterializeSchemaResponse reports the outcome.
+message MaterializeSchemaResponse {
+  Error error = 1;
 }
