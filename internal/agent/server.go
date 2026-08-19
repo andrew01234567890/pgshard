@@ -1,0 +1,343 @@
+package agent
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
+)
+
+// Server implements pgshard.v1.Agent over an Instance.
+type Server struct {
+	pgshardv1.UnimplementedAgentServer
+
+	inst  *Instance
+	epoch *EpochStore
+	lease *Lease
+	log   *slog.Logger
+	// fatal stops the whole agent; used when the lease is lost.
+	fatal func(error)
+
+	mu        sync.Mutex
+	holdStop  context.CancelFunc
+	opTimeout time.Duration
+}
+
+// NewServer wires the RPC surface. lease may be nil when leasing is disabled.
+func NewServer(inst *Instance, epoch *EpochStore, lease *Lease, log *slog.Logger, fatal func(error)) *Server {
+	return &Server{inst: inst, epoch: epoch, lease: lease, log: log, fatal: fatal, opTimeout: 10 * time.Minute}
+}
+
+func pgErr(err error) *pgshardv1.Error {
+	if err == nil {
+		return nil
+	}
+	code := "XX000"
+	if errors.Is(err, ErrStaleEpoch) {
+		code = "55000"
+	}
+	return &pgshardv1.Error{Sqlstate: code, Message: err.Error()}
+}
+
+// fence accepts a strictly greater epoch (role changes) or returns the
+// stale-epoch error to embed.
+func (s *Server) fence(epoch uint64) error {
+	return s.epoch.Accept(epoch)
+}
+
+// fenceCurrent accepts only the current epoch (same-term operations).
+func (s *Server) fenceCurrent(epoch uint64) error {
+	return s.epoch.RequireCurrent(epoch)
+}
+
+// Status is read-only.
+func (s *Server) Status(ctx context.Context, _ *pgshardv1.StatusRequest) (*pgshardv1.StatusResponse, error) {
+	resp := &pgshardv1.StatusResponse{Epoch: s.epoch.Current(), Role: pgshardv1.StatusResponse_ROLE_PRIMARY}
+	if s.inst.IsStandby() {
+		resp.Role = pgshardv1.StatusResponse_ROLE_STANDBY
+	}
+	conn, err := s.inst.Connect(ctx)
+	if err != nil {
+		resp.Error = pgErr(err)
+		return resp, nil
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	resp.Running = true
+	var lsn uint64
+	var tl int64
+	q := `SELECT CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() ELSE pg_current_wal_lsn() END - '0/0'::pg_lsn,
+	             coalesce((SELECT received_tli FROM pg_stat_wal_receiver), (pg_control_checkpoint()).timeline_id)`
+	if err := conn.QueryRow(ctx, q).Scan(&lsn, &tl); err != nil {
+		resp.Error = pgErr(err)
+		return resp, nil
+	}
+	resp.Lsn = lsn
+	resp.Timeline = uint32(tl)
+	return resp, nil
+}
+
+// Promote fences, acquires the lease, promotes and starts renewing.
+func (s *Server) Promote(ctx context.Context, req *pgshardv1.PromoteRequest) (*pgshardv1.PromoteResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	resp := &pgshardv1.PromoteResponse{Epoch: s.epoch.Current()}
+	if err := s.fence(req.GetEpoch()); err != nil {
+		resp.Error = pgErr(err)
+		return resp, nil
+	}
+	resp.Epoch = req.GetEpoch()
+	ctx, cancel := context.WithTimeout(ctx, s.opTimeout)
+	defer cancel()
+	if s.lease != nil {
+		if err := s.lease.Acquire(ctx); err != nil {
+			resp.Error = pgErr(fmt.Errorf("acquire lease: %w", err))
+			return resp, nil
+		}
+	}
+	if err := s.inst.Promote(ctx); err != nil {
+		resp.Error = pgErr(err)
+		return resp, nil
+	}
+	s.startHold()
+	st, _ := s.Status(ctx, nil)
+	resp.Timeline = st.GetTimeline()
+	return resp, nil
+}
+
+func (s *Server) startHold() {
+	if s.lease == nil || s.holdStop != nil {
+		return
+	}
+	hctx, cancel := context.WithCancel(context.Background())
+	s.holdStop = cancel
+	go func() {
+		if err := s.lease.Hold(hctx); err != nil {
+			s.log.Error("primary lease lost; fencing", "err", err)
+			s.fatal(fmt.Errorf("primary lease lost: %w", err))
+		}
+	}()
+}
+
+func (s *Server) stopHold(ctx context.Context) {
+	if s.holdStop != nil {
+		s.holdStop()
+		s.holdStop = nil
+	}
+	if s.lease != nil {
+		if err := s.lease.Release(ctx); err != nil {
+			s.log.Warn("lease release failed", "err", err)
+		}
+	}
+}
+
+// Demote fences, releases the lease and follows the current lease holder.
+func (s *Server) Demote(ctx context.Context, req *pgshardv1.DemoteRequest) (*pgshardv1.DemoteResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	resp := &pgshardv1.DemoteResponse{Epoch: s.epoch.Current()}
+	if err := s.fence(req.GetEpoch()); err != nil {
+		resp.Error = pgErr(err)
+		return resp, nil
+	}
+	resp.Epoch = req.GetEpoch()
+	ctx, cancel := context.WithTimeout(ctx, s.opTimeout)
+	defer cancel()
+	s.stopHold(ctx)
+	if err := s.inst.Demote(ctx, ""); err != nil {
+		resp.Error = pgErr(err)
+	}
+	return resp, nil
+}
+
+// Rewind fences and rewinds against req.Source.
+func (s *Server) Rewind(ctx context.Context, req *pgshardv1.RewindRequest) (*pgshardv1.RewindResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	resp := &pgshardv1.RewindResponse{Epoch: s.epoch.Current()}
+	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
+		resp.Error = pgErr(err)
+		return resp, nil
+	}
+	resp.Epoch = req.GetEpoch()
+	ctx, cancel := context.WithTimeout(ctx, s.opTimeout)
+	defer cancel()
+	s.stopHold(ctx)
+	if err := s.inst.Rewind(ctx, req.GetSource()); err != nil {
+		resp.Error = pgErr(err)
+	}
+	return resp, nil
+}
+
+// Reclone fences and rebuilds from the primary; backup sources are not
+// implemented yet.
+func (s *Server) Reclone(ctx context.Context, req *pgshardv1.RecloneRequest) (*pgshardv1.RecloneResponse, error) {
+	if req.GetSourceKind() == pgshardv1.RecloneRequest_SOURCE_KIND_BACKUP {
+		return nil, status.Error(codes.Unimplemented, "reclone from backup is not implemented")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	resp := &pgshardv1.RecloneResponse{Epoch: s.epoch.Current()}
+	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
+		resp.Error = pgErr(err)
+		return resp, nil
+	}
+	resp.Epoch = req.GetEpoch()
+	ctx, cancel := context.WithTimeout(ctx, s.opTimeout)
+	defer cancel()
+	s.stopHold(ctx)
+	if err := s.inst.Reclone(ctx); err != nil {
+		resp.Error = pgErr(err)
+	}
+	return resp, nil
+}
+
+// Reload fences and reloads configuration.
+func (s *Server) Reload(ctx context.Context, req *pgshardv1.ReloadRequest) (*pgshardv1.ReloadResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	resp := &pgshardv1.ReloadResponse{Epoch: s.epoch.Current()}
+	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
+		resp.Error = pgErr(err)
+		return resp, nil
+	}
+	resp.Epoch = req.GetEpoch()
+	if err := s.inst.Reload(ctx); err != nil {
+		resp.Error = pgErr(err)
+	}
+	return resp, nil
+}
+
+// Restart fences and restarts with the requested shutdown mode.
+func (s *Server) Restart(ctx context.Context, req *pgshardv1.RestartRequest) (*pgshardv1.RestartResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	resp := &pgshardv1.RestartResponse{Epoch: s.epoch.Current()}
+	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
+		resp.Error = pgErr(err)
+		return resp, nil
+	}
+	resp.Epoch = req.GetEpoch()
+	mode := ShutdownFast
+	switch req.GetMode() {
+	case pgshardv1.RestartRequest_MODE_SMART:
+		mode = ShutdownSmart
+	case pgshardv1.RestartRequest_MODE_IMMEDIATE:
+		mode = ShutdownImmediate
+	}
+	ctx, cancel := context.WithTimeout(ctx, s.opTimeout)
+	defer cancel()
+	if err := s.inst.Restart(ctx, mode); err != nil {
+		resp.Error = pgErr(err)
+	}
+	return resp, nil
+}
+
+// CreateRestorePoint fences and creates a named restore point.
+func (s *Server) CreateRestorePoint(ctx context.Context, req *pgshardv1.CreateRestorePointRequest) (*pgshardv1.CreateRestorePointResponse, error) {
+	resp := &pgshardv1.CreateRestorePointResponse{Epoch: s.epoch.Current()}
+	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
+		resp.Error = pgErr(err)
+		return resp, nil
+	}
+	resp.Epoch = req.GetEpoch()
+	err := s.withConn(ctx, func(q querier) error {
+		return q.QueryRow(ctx, "SELECT pg_create_restore_point($1) - '0/0'::pg_lsn", req.GetName()).Scan(&resp.Lsn)
+	})
+	resp.Error = pgErr(err)
+	return resp, nil
+}
+
+// CreateSlot fences and creates a physical or logical slot.
+func (s *Server) CreateSlot(ctx context.Context, req *pgshardv1.CreateSlotRequest) (*pgshardv1.CreateSlotResponse, error) {
+	resp := &pgshardv1.CreateSlotResponse{Epoch: s.epoch.Current()}
+	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
+		resp.Error = pgErr(err)
+		return resp, nil
+	}
+	resp.Epoch = req.GetEpoch()
+	err := s.withConn(ctx, func(q querier) error {
+		var lsn *uint64
+		var err error
+		switch req.GetKind() {
+		case pgshardv1.SlotKind_SLOT_KIND_PHYSICAL:
+			err = q.QueryRow(ctx, "SELECT lsn - '0/0'::pg_lsn FROM pg_create_physical_replication_slot($1, true)", req.GetName()).Scan(&lsn)
+		case pgshardv1.SlotKind_SLOT_KIND_LOGICAL:
+			err = q.QueryRow(ctx, "SELECT lsn - '0/0'::pg_lsn FROM pg_create_logical_replication_slot($1, $2, false, false, $3)",
+				req.GetName(), req.GetPlugin(), req.GetFailover()).Scan(&lsn)
+		default:
+			return errors.New("slot kind must be physical or logical")
+		}
+		if err != nil {
+			return err
+		}
+		if lsn != nil {
+			resp.Lsn = *lsn
+		}
+		return nil
+	})
+	resp.Error = pgErr(err)
+	return resp, nil
+}
+
+// DropSlot fences and drops a slot.
+func (s *Server) DropSlot(ctx context.Context, req *pgshardv1.DropSlotRequest) (*pgshardv1.DropSlotResponse, error) {
+	resp := &pgshardv1.DropSlotResponse{Epoch: s.epoch.Current()}
+	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
+		resp.Error = pgErr(err)
+		return resp, nil
+	}
+	resp.Epoch = req.GetEpoch()
+	err := s.withConn(ctx, func(q querier) error {
+		_, err := q.Exec(ctx, "SELECT pg_drop_replication_slot($1)", req.GetName())
+		return err
+	})
+	resp.Error = pgErr(err)
+	return resp, nil
+}
+
+// ListSlots is read-only.
+func (s *Server) ListSlots(ctx context.Context, _ *pgshardv1.ListSlotsRequest) (*pgshardv1.ListSlotsResponse, error) {
+	resp := &pgshardv1.ListSlotsResponse{Epoch: s.epoch.Current()}
+	err := s.withConn(ctx, func(q querier) error {
+		rows, err := q.Query(ctx, `SELECT slot_name, slot_type, coalesce(plugin, ''), failover, active,
+			coalesce(restart_lsn - '0/0'::pg_lsn, 0), coalesce(confirmed_flush_lsn - '0/0'::pg_lsn, 0)
+			FROM pg_replication_slots ORDER BY slot_name`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var sl pgshardv1.Slot
+			var kind string
+			if err := rows.Scan(&sl.Name, &kind, &sl.Plugin, &sl.Failover, &sl.Active, &sl.RestartLsn, &sl.ConfirmedFlushLsn); err != nil {
+				return err
+			}
+			sl.Kind = pgshardv1.SlotKind_SLOT_KIND_PHYSICAL
+			if strings.EqualFold(kind, "logical") {
+				sl.Kind = pgshardv1.SlotKind_SLOT_KIND_LOGICAL
+			}
+			resp.Slots = append(resp.Slots, &sl)
+		}
+		return rows.Err()
+	})
+	resp.Error = pgErr(err)
+	return resp, nil
+}
+
+// Backup is not implemented until the backup layer lands.
+func (s *Server) Backup(context.Context, *pgshardv1.BackupRequest) (*pgshardv1.BackupResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "backup is not implemented")
+}
+
+// RestoreInfo is not implemented until the backup layer lands.
+func (s *Server) RestoreInfo(context.Context, *pgshardv1.RestoreInfoRequest) (*pgshardv1.RestoreInfoResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "restore info is not implemented")
+}
