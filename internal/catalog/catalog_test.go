@@ -371,6 +371,35 @@ func runSuite(t *testing.T, img pgImage) {
 		}
 	})
 
+	t.Run("multistep_migration_round_trips_through_meta", func(t *testing.T) {
+		steps := []MigrationStep{
+			{SQL: "ALTER TABLE t ADD CONSTRAINT c CHECK (x > 0) NOT VALID", Skip: MigrationCheck{Kind: "constraint", Table: "t", Name: "c"}},
+			{SQL: "ALTER TABLE t VALIDATE CONSTRAINT c", Skip: MigrationCheck{Kind: "constraint_valid", Table: "t", Name: "c"}, OnFail: "ALTER TABLE t DROP CONSTRAINT IF EXISTS c"},
+		}
+		id, err := EnqueueMigration(ctx, conn, DDLMigration{Database: "app", Statement: "alter table t add check (x > 0)", Kind: "ALTER TABLE",
+			Strategy: StrategyMultistep, Scope: "all", Meta: MigrationMeta{RunAs: "app", Steps: steps}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, err := LoadMigration(ctx, conn, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.Strategy != StrategyMultistep || len(m.Meta.Steps) != 2 || m.Meta.Steps[1].OnFail != steps[1].OnFail || m.Meta.Steps[0].Skip != steps[0].Skip {
+			t.Fatalf("round trip %+v", m)
+		}
+		m.State, m.PerShard = MigrationRunning, map[string]ShardMigration{"0": {State: ShardRunning, Attempts: 1, Step: 1}}
+		if err := SaveMigrationProgress(ctx, conn, m); err != nil {
+			t.Fatal(err)
+		}
+		if m, err = LoadMigration(ctx, conn, id); err != nil || m.PerShard["0"].Step != 1 {
+			t.Fatalf("step did not round-trip: %+v %v", m.PerShard, err)
+		}
+		if _, err := EnqueueMigration(ctx, conn, DDLMigration{Database: "app", Statement: "x", Kind: "ALTER TABLE", Strategy: StrategyMultistep, Scope: "all"}); err == nil {
+			t.Fatal("multistep without steps was accepted")
+		}
+	})
+
 	t.Run("sequence_blocks", func(t *testing.T) {
 		mustExec(t, conn, `UPDATE pgshard.tables SET sequence_columns = '{id}' WHERE database = 'app' AND table_name = 'orders'`)
 		tables, err := ListTables(ctx, conn, "app")

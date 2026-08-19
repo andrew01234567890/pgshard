@@ -93,6 +93,7 @@ type fakeShards struct {
 	exists   func(shard int32, kind, name string) bool
 	invalid  func(shard int32, name string) bool
 	rolsuper func(shard int32, name string) bool
+	check    func(shard int32, kind, table, name string) bool
 	dialErr  func(shard int32) error
 }
 
@@ -168,6 +169,22 @@ func (c *fakeConn) Exec(_ context.Context, sql string, _ ...any) (pgconnTag, err
 
 func (c *fakeConn) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
 	name, _ := args[0].(string)
+	if strings.Contains(sql, "WHERE i.indisvalid") {
+		c.f.mu.Lock()
+		c.f.ran[c.id] = append(c.f.ran[c.id], "check index_valid "+name)
+		c.f.mu.Unlock()
+		v := c.f.check != nil && c.f.check(c.id, "index_valid", "", name)
+		return &boolRows{vals: []bool{v}}, nil
+	}
+	if len(args) == 3 {
+		table, _ := args[0].(string)
+		obj, _ := args[2].(string)
+		c.f.mu.Lock()
+		c.f.ran[c.id] = append(c.f.ran[c.id], "check "+checkKind(sql)+" "+table+" "+obj)
+		c.f.mu.Unlock()
+		v := c.f.check != nil && c.f.check(c.id, checkKind(sql), table, obj)
+		return &boolRows{vals: []bool{v}}, nil
+	}
 	switch {
 	case strings.Contains(sql, "rolsuper"):
 		v := c.f.rolsuper != nil && c.f.rolsuper(c.id, name)
@@ -193,6 +210,25 @@ func (c *fakeConn) Query(_ context.Context, sql string, args ...any) (pgx.Rows, 
 }
 
 func (c *fakeConn) Close(context.Context) error { return nil }
+
+// checkKind names a step-check query by its shape.
+func checkKind(sql string) string {
+	switch {
+	case strings.Contains(sql, "contype = 'n' AND k.convalidated"):
+		return "notnull_valid"
+	case strings.Contains(sql, "contype = 'n'"):
+		return "notnull"
+	case strings.Contains(sql, "conname = $3 AND convalidated"):
+		return "constraint_valid"
+	case strings.Contains(sql, "conname = $3"):
+		return "constraint"
+	case strings.Contains(sql, "inhdetachpending"):
+		return "detach_pending"
+	case strings.Contains(sql, "pg_inherits"):
+		return "detached"
+	}
+	return "?"
+}
 
 // boolRows is a one-column pgx.Rows of booleans.
 type boolRows struct {
@@ -650,5 +686,181 @@ func TestApplierResumeRebuildsAnInvalidIndexAndSkipsAValidOne(t *testing.T) {
 	}
 	if got := strings.Join(f.shards.statements(2), ";"); strings.Contains(got, "create index") || strings.Contains(got, "DROP INDEX") {
 		t.Fatalf("valid index on shard 2 was touched: %q", got)
+	}
+}
+
+func pkSteps() []catalog.MigrationStep {
+	return []catalog.MigrationStep{
+		{SQL: `ALTER TABLE t ADD CONSTRAINT t_id_not_null NOT NULL id NOT VALID`, Skip: catalog.MigrationCheck{Kind: "notnull", Table: "t", Name: "id"}},
+		{SQL: `ALTER TABLE t VALIDATE CONSTRAINT t_id_not_null`, Skip: catalog.MigrationCheck{Kind: "notnull_valid", Table: "t", Name: "id"},
+			OnFail: `ALTER TABLE t DROP CONSTRAINT IF EXISTS t_id_not_null`},
+		{SQL: `CREATE UNIQUE INDEX CONCURRENTLY t_pkey ON t (id)`, Concurrent: true, Index: "t_pkey", Skip: catalog.MigrationCheck{Kind: "index_valid", Table: "t", Name: "t_pkey"}},
+		{SQL: `ALTER TABLE t ADD CONSTRAINT t_pkey PRIMARY KEY USING INDEX t_pkey`, Skip: catalog.MigrationCheck{Kind: "constraint", Table: "t", Name: "t_pkey"}},
+	}
+}
+
+func multistep(steps []catalog.MigrationStep) catalog.DDLMigration {
+	return catalog.DDLMigration{Statement: "alter table t add primary key (id)", Kind: "ALTER TABLE", Scope: "all", Strategy: "multistep",
+		Meta: catalog.MigrationMeta{Steps: steps, RunAs: "app"}}
+}
+
+func TestApplierRunsMultistepStepsInOrderEachUnderItsOwnTransaction(t *testing.T) {
+	f := newApplierFixture(t)
+	f.store.shards = []int32{0}
+	id := f.queue(multistep(pkSteps()))
+	f.run(t)
+	m := f.store.get(t, id)
+	if m.State != catalog.MigrationComplete || states(m) != "0=applied/4" || m.PerShard["0"].Step != 4 {
+		t.Fatalf("%s %s step=%d", m.State, states(m), m.PerShard["0"].Step)
+	}
+	got := strings.Join(f.shards.statements(0), "\n")
+	want := strings.Join([]string{
+		"SET lock_timeout = '2000ms'", "SET ROLE \"app\"", "check notnull t id",
+		"BEGIN", pkSteps()[0].SQL, "COMMIT",
+		"SET lock_timeout = '2000ms'", "SET ROLE \"app\"", "check notnull_valid t id",
+		"BEGIN", pkSteps()[1].SQL, "COMMIT",
+		"SET lock_timeout = '2000ms'", "SET ROLE \"app\"", "check index_valid t_pkey",
+		pkSteps()[2].SQL,
+		"SET lock_timeout = '2000ms'", "SET ROLE \"app\"", "check constraint t t_pkey",
+		"BEGIN", pkSteps()[3].SQL, "COMMIT",
+	}, "\n")
+	if got != want {
+		t.Fatalf("statements:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestApplierResumesAMultistepMigrationAtItsStep(t *testing.T) {
+	f := newApplierFixture(t)
+	f.store.shards = []int32{0}
+	m := multistep(pkSteps())
+	m.State = catalog.MigrationRunning
+	m.PerShard = map[string]catalog.ShardMigration{"0": {State: catalog.ShardRunning, Attempts: 2, Step: 2}}
+	id := f.queue(m)
+	f.shards.check = func(_ int32, kind, _, name string) bool { return kind == "index_valid" && name == "t_pkey" }
+	f.run(t)
+	m = f.store.get(t, id)
+	if m.State != catalog.MigrationComplete || states(m) != "0=applied/4" {
+		t.Fatalf("%s %s", m.State, states(m))
+	}
+	got := strings.Join(f.shards.statements(0), "\n")
+	if strings.Contains(got, "NOT NULL") || strings.Contains(got, "CREATE UNIQUE INDEX") || !strings.Contains(got, "PRIMARY KEY USING INDEX") {
+		t.Fatalf("resume ran earlier steps again or skipped the last:\n%s", got)
+	}
+}
+
+func TestApplierMultistepRetriesALockedStepAndKeepsTheStep(t *testing.T) {
+	f := newApplierFixture(t)
+	f.store.shards = []int32{0}
+	locked := 2
+	f.shards.exec = func(_ int32, sql string) error {
+		if strings.HasPrefix(sql, "ALTER TABLE t VALIDATE") && locked > 0 {
+			locked--
+			return pgErr("55P03", "canceling statement due to lock timeout")
+		}
+		return nil
+	}
+	id := f.queue(multistep(pkSteps()))
+	f.run(t)
+	m := f.store.get(t, id)
+	if m.State != catalog.MigrationComplete || states(m) != "0=applied/6" || len(f.sleeps) != 2 {
+		t.Fatalf("%s %s sleeps=%v", m.State, states(m), f.sleeps)
+	}
+	if n := strings.Count(strings.Join(f.shards.statements(0), "\n"), "VALIDATE CONSTRAINT"); n != 3 {
+		t.Fatalf("validate ran %d times", n)
+	}
+}
+
+func TestApplierMultistepValidateFailureDropsTheConstraintAndFailsTheShard(t *testing.T) {
+	f := newApplierFixture(t)
+	f.shards.exec = func(shard int32, sql string) error {
+		if shard == 1 && strings.HasPrefix(sql, "ALTER TABLE t VALIDATE") {
+			return pgErr("23502", `column "id" of relation "t" contains null values`)
+		}
+		return nil
+	}
+	id := f.queue(multistep(pkSteps()))
+	f.run(t)
+	m := f.store.get(t, id)
+	if m.State != catalog.MigrationFailed || states(m) != "0=applied/4 1=failed/2 2=applied/4" {
+		t.Fatalf("%s %s", m.State, states(m))
+	}
+	if s := m.PerShard["1"]; s.Step != 1 || s.SQLState != "23502" || !strings.Contains(m.Error, "shard 1: ") {
+		t.Fatalf("shard 1 %+v error %q", s, m.Error)
+	}
+	got := strings.Join(f.shards.statements(1), "\n")
+	if !strings.Contains(got, "ROLLBACK\nALTER TABLE t DROP CONSTRAINT IF EXISTS t_id_not_null") || strings.Contains(got, "CREATE UNIQUE INDEX") {
+		t.Fatalf("shard 1 statements:\n%s", got)
+	}
+}
+
+func TestApplierMultistepIndexFailureRebuildsOnceThenDropsTheInvalidIndex(t *testing.T) {
+	f := newApplierFixture(t)
+	f.store.shards = []int32{0}
+	f.shards.exec = func(_ int32, sql string) error {
+		if strings.HasPrefix(sql, "CREATE UNIQUE INDEX") {
+			return pgErr("23505", "duplicate key")
+		}
+		return nil
+	}
+	f.shards.invalid = func(_ int32, name string) bool { return name == "t_pkey" }
+	id := f.queue(multistep(pkSteps()))
+	f.run(t)
+	m := f.store.get(t, id)
+	if m.State != catalog.MigrationFailed || m.PerShard["0"].Step != 2 || m.PerShard["0"].SQLState != "23505" {
+		t.Fatalf("%s %+v", m.State, m.PerShard["0"])
+	}
+	got := strings.Join(f.shards.statements(0), "\n")
+	if strings.Count(got, "CREATE UNIQUE INDEX") != 2 || strings.Count(got, `DROP INDEX CONCURRENTLY IF EXISTS "t_pkey"`) != 3 || strings.Contains(got, "PRIMARY KEY") {
+		t.Fatalf("statements:\n%s", got)
+	}
+}
+
+func TestApplierMultistepSkipsStepsAlreadyDone(t *testing.T) {
+	f := newApplierFixture(t)
+	f.store.shards = []int32{0}
+	f.shards.check = func(_ int32, kind, _, _ string) bool {
+		return kind == "notnull" || kind == "notnull_valid" || kind == "constraint"
+	}
+	id := f.queue(multistep(pkSteps()))
+	f.run(t)
+	m := f.store.get(t, id)
+	if m.State != catalog.MigrationComplete || states(m) != "0=applied/4" {
+		t.Fatalf("%s %s", m.State, states(m))
+	}
+	got := strings.Join(f.shards.statements(0), "\n")
+	if strings.Contains(got, "NOT NULL") || strings.Contains(got, "PRIMARY KEY") || strings.Count(got, "CREATE UNIQUE INDEX") != 1 || strings.Contains(got, "BEGIN") {
+		t.Fatalf("statements:\n%s", got)
+	}
+}
+
+func TestApplierStepChecksCoverEveryKind(t *testing.T) {
+	f := newApplierFixture(t)
+	f.store.shards = []int32{0}
+	kinds := []string{"constraint", "constraint_valid", "notnull", "notnull_valid", "index_valid", "detached", "detach_pending"}
+	var steps []catalog.MigrationStep
+	for _, k := range kinds {
+		steps = append(steps, catalog.MigrationStep{SQL: "select 1 -- " + k, Skip: catalog.MigrationCheck{Kind: k, Table: "t", Name: "x"}})
+	}
+	f.shards.check = func(_ int32, kind, _, _ string) bool { return kind != "?" }
+	id := f.queue(multistep(steps))
+	f.run(t)
+	m := f.store.get(t, id)
+	if m.State != catalog.MigrationComplete || m.PerShard["0"].Step != len(kinds) {
+		t.Fatalf("%s %+v", m.State, m.PerShard["0"])
+	}
+	got := strings.Join(f.shards.statements(0), "\n")
+	for _, k := range kinds {
+		if !strings.Contains(got, "check "+k+" ") {
+			t.Fatalf("check %s never ran:\n%s", k, got)
+		}
+	}
+	if strings.Contains(got, "select 1") {
+		t.Fatalf("a step ran although its check held:\n%s", got)
+	}
+	bad := multistep([]catalog.MigrationStep{{SQL: "select 1", Skip: catalog.MigrationCheck{Kind: "bogus"}}})
+	id = f.queue(bad)
+	f.run(t)
+	if m := f.store.get(t, id); m.State != catalog.MigrationFailed || !strings.Contains(m.Error, "unknown step check") {
+		t.Fatalf("bogus check: %s %q", m.State, m.Error)
 	}
 }

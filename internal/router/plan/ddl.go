@@ -27,6 +27,9 @@ const (
 const (
 	StrategyDirect     = "direct"
 	StrategyConcurrent = "concurrent"
+	// StrategyMultistep runs Migration.Steps per shard, each under its
+	// own lock_timeout retry, so no step takes a long strong lock.
+	StrategyMultistep = "multistep"
 )
 
 // Migration is a DDL/DCL statement the router hands to the migration queue
@@ -56,6 +59,25 @@ type Migration struct {
 	// pgshard.databases.
 	Database   string
 	DatabaseOp string
+	// Steps is the plan of a StrategyMultistep migration.
+	Steps []Step
+}
+
+// Step is one statement of a multistep migration.
+type Step struct {
+	SQL        string
+	Concurrent bool
+	Skip       Check
+	Index      string
+	OnFail     string
+}
+
+// Check is the shard-side predicate under which a Step is already done.
+type Check struct {
+	Kind   string
+	Schema string
+	Table  string
+	Name   string
 }
 
 // ObjectRef names the object a migration creates or drops.
@@ -226,6 +248,13 @@ func (w *walker) alterTable(a *pgquerypb.AlterTableStmt) error {
 	if err != nil {
 		return err
 	}
+	steps, err := w.alterSteps(a, r)
+	if err != nil {
+		return err
+	}
+	if steps != nil {
+		return w.migration(Migration{Kind: "ALTER TABLE", Scope: scope, Strategy: StrategyMultistep, Steps: steps})
+	}
 	return w.migration(Migration{Kind: "ALTER TABLE", Scope: scope})
 }
 
@@ -269,7 +298,7 @@ func checkAlterCmd(r *rel, c *pgquerypb.AlterTableCmd) error {
 		}
 	case pgquerypb.AlterTableType_AT_AddConstraint, pgquerypb.AlterTableType_AT_AddIndex:
 		cs := c.GetDef().GetConstraint()
-		if sharded && isUniqueConstraint(cs) && !contains(stringList(cs.GetKeys()), r.shardKey) {
+		if sharded && isUniqueConstraint(cs) && cs.GetIndexname() == "" && !contains(stringList(cs.GetKeys()), r.shardKey) {
 			return keyConstraintError(r, strings.Join(stringList(cs.GetKeys()), ", "))
 		}
 	}
@@ -400,6 +429,13 @@ func (w *walker) drop(d *pgquerypb.DropStmt) error {
 				m.Object = relationRef(rv, objectAbsent)
 			}
 		}
+		if d.GetRemoveType() == pgquerypb.ObjectType_OBJECT_INDEX && !d.GetConcurrent() && len(d.GetObjects()) == 1 && d.GetBehavior() != pgquerypb.DropBehavior_DROP_CASCADE {
+			sql, err := w.deparse(func(n *pgquerypb.Node) { n.GetDropStmt().Concurrent = true })
+			if err != nil {
+				return err
+			}
+			m.Strategy, m.Statement = StrategyConcurrent, sql
+		}
 		return w.migration(m)
 	case pgquerypb.ObjectType_OBJECT_SCHEMA:
 		m := Migration{Kind: kind, Scope: ScopeAll}
@@ -448,6 +484,16 @@ func (w *walker) reindex(s *pgquerypb.ReindexStmt) error {
 		if strings.EqualFold(p.GetDefElem().GetDefname(), "concurrently") {
 			m.Strategy = StrategyConcurrent
 		}
+	}
+	if m.Strategy == "" && s.GetKind() != pgquerypb.ReindexObjectType_REINDEX_OBJECT_SYSTEM {
+		sql, err := w.deparse(func(n *pgquerypb.Node) {
+			r := n.GetReindexStmt()
+			r.Params = append(r.Params, &pgquerypb.Node{Node: &pgquerypb.Node_DefElem{DefElem: &pgquerypb.DefElem{Defname: "concurrently"}}})
+		})
+		if err != nil {
+			return err
+		}
+		m.Strategy, m.Statement = StrategyConcurrent, sql
 	}
 	switch s.GetKind() {
 	case pgquerypb.ReindexObjectType_REINDEX_OBJECT_TABLE:

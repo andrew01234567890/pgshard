@@ -112,7 +112,7 @@ func (e *Executor) runMigration(ctx context.Context, pl plan.Plan, w pgwire.Resu
 			RoleOp:   m.RoleOp,
 			Verifier: m.Verifier,
 			Roles:    m.Roles,
-			Database: m.Database, DatabaseOp: m.DatabaseOp}}
+			Database: m.Database, DatabaseOp: m.DatabaseOp, Steps: migrationSteps(m.Steps)}}
 	id, err := e.r.cfg.Migrations.Enqueue(ctx, req)
 	if err != nil {
 		return pgwire.Errorf(codeConnectionFailure, "queueing the migration in the catalog failed: %v", err)
@@ -225,4 +225,16 @@ func (e *Executor) migrationBatch(ctx context.Context, batch []*pgshardv1.Execut
 		}
 	}
 	return true, nil
+}
+
+func migrationSteps(steps []plan.Step) []catalog.MigrationStep {
+	if len(steps) == 0 {
+		return nil
+	}
+	out := make([]catalog.MigrationStep, len(steps))
+	for i, s := range steps {
+		out[i] = catalog.MigrationStep{SQL: s.SQL, Concurrent: s.Concurrent, Index: s.Index, OnFail: s.OnFail,
+			Skip: catalog.MigrationCheck{Kind: s.Skip.Kind, Schema: s.Skip.Schema, Table: s.Skip.Table, Name: s.Skip.Name}}
+	}
+	return out
 }

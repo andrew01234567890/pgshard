@@ -101,13 +101,21 @@ func TestDDLIsQueuedAndAnsweredWhenComplete(t *testing.T) {
 		if m := q.last(t); m.Kind != "GRANT" || m.Scope != "home" {
 			t.Fatalf("queued %+v", m)
 		}
+		if _, err := conn.Exec(ctx, "alter table orders alter column note set not null"); err != nil {
+			t.Fatal(err)
+		}
+		if m := q.last(t); m.Strategy != "multistep" || len(m.Meta.Steps) != 2 || m.Meta.Steps[1].Skip.Kind != "notnull_valid" ||
+			m.Meta.Steps[1].Skip.Table != "orders" || m.Meta.Steps[1].Skip.Name != "note" || m.Meta.Steps[1].OnFail == "" ||
+			!strings.HasPrefix(m.Meta.Steps[0].SQL, `ALTER TABLE "orders" ADD CONSTRAINT "orders_note_not_null" NOT NULL`) {
+			t.Fatalf("queued steps %+v", m.Meta.Steps)
+		}
 		var n int
 		if err := conn.QueryRow(ctx, "select 1").Scan(&n); err != nil || n != 1 {
 			t.Fatalf("session after DDL: %v", err)
 		}
 	}
-	if q.waited < 4 {
-		t.Fatalf("router waited %d times, want 4", q.waited)
+	if q.waited < 6 {
+		t.Fatalf("router waited %d times, want 6", q.waited)
 	}
 	for i := range h.poolers {
 		for _, sql := range h.poolers[i].ran() {
