@@ -392,7 +392,7 @@ spec:
                 require backupId
               rule: '!(has(self.target) && (has(self.target.name) || has(self.target.xid)
                 || has(self.target.barrier) || (has(self.target.immediate) && self.target.immediate)))
-                || (has(self.backupId) && self.backupId != ”)'
+                || (has(self.backupId) && self.backupId.size() > 0)'
           status:
             description: PgShardRestoreStatus is the observed state of a restore.
             properties:

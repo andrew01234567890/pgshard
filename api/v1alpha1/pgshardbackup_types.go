@@ -276,7 +276,7 @@ type RestoreTarget struct {
 // source cluster's repository and every group recovers to the same target.
 // A barrier target is the only cluster-consistent one.
 // +kubebuilder:validation:XValidation:rule="self.newClusterName != self.clusterName",message="newClusterName must differ from clusterName"
-// +kubebuilder:validation:XValidation:rule="!(has(self.target) && (has(self.target.name) || has(self.target.xid) || has(self.target.barrier) || (has(self.target.immediate) && self.target.immediate))) || (has(self.backupId) && self.backupId != ”)",message="target.name, target.xid, target.barrier and target.immediate require backupId"
+// +kubebuilder:validation:XValidation:rule="!(has(self.target) && (has(self.target.name) || has(self.target.xid) || has(self.target.barrier) || (has(self.target.immediate) && self.target.immediate))) || (has(self.backupId) && self.backupId.size() > 0)",message="target.name, target.xid, target.barrier and target.immediate require backupId"
 type PgShardRestoreSpec struct {
 	// ClusterName is the source cluster whose repository is restored from.
 	ClusterName string `json:"clusterName"`
