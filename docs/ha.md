@@ -43,8 +43,8 @@ primary and the fencing epoch (member 0 at epoch 0 for a new group). Pod labels
 `pgshard.io/role` = `primary` | `replica` | `unhealthy` drive the `-rw` and
 `-ro` Services; `unhealthy` is a fenced former primary that has not rejoined.
 `status.members[].ready` for standbys records whether they were streaming at
-the last healthy observation: this is the sync set failover selects from, and
-it is preserved (not overwritten) while the primary cannot be probed.
+the last healthy observation; it is preserved (not overwritten) while the primary
+cannot be probed and gates whether a failover may start at all.
 
 ## Failover
 
@@ -61,10 +61,14 @@ The primary is unhealthy when its pod is missing, or the pod is not Ready and
 2. waits (30s bound, 1s poll) until the old primary no longer answers
    `Status` as a running primary and every other reachable member reports no
    streaming WAL receiver; on timeout it proceeds only if the old primary is gone.
-3. picks the candidate: highest `pg_last_wal_receive_lsn()` among reachable
-   in-recovery members that were in the sync set; ties break by name. No
-   candidate: the fence is released and the primary pod is recreated as
-   primary (same PVC).
+3. picks the candidate: highest `pg_last_wal_receive_lsn()` among **all**
+   reachable in-recovery members — every non-primary member is in
+   `synchronous_standby_names`, so even a lagging or not-yet-Ready standby may
+   hold the only copy of an acknowledged commit; ties break by name. If a
+   listed standby is unreachable and the reachable ones cannot be proven to
+   hold every acknowledgement (`reachable + minSyncStandbys <= listed`), no
+   candidate is admissible: the fence is released and the primary pod is
+   recreated as primary (same PVC) — durability over availability.
 4. computes `epoch = max(group epoch, candidate agent epoch) + 1` and **writes
    the fence first**: `pgshard.shard_status` (`primary_epoch`,
    `primary_endpoint`, never lowered) for shard groups, then
