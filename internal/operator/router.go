@@ -72,7 +72,7 @@ func (r Renderer) RouterDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.De
 	var mounts []corev1.VolumeMount
 	var volumes []corev1.Volume
 	if ref := c.Spec.Router.TLS.SecretRef; ref != nil && ref.Name != "" {
-		args = append(args, "--tls-dir="+routerTLSMountDir)
+		args = append(args, "--tls-cert="+routerTLSMountDir+"/tls.crt", "--tls-key="+routerTLSMountDir+"/tls.key")
 		mounts = append(mounts, corev1.VolumeMount{Name: "tls", MountPath: routerTLSMountDir, ReadOnly: true})
 		volumes = append(volumes, corev1.Volume{Name: "tls", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: ref.Name}}})
 	}

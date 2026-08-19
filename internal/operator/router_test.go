@@ -71,7 +71,7 @@ func TestRouterDeploymentMountsTLSSecret(t *testing.T) {
 	c.Spec.Router.TLS.SecretRef = &corev1.LocalObjectReference{Name: "router-tls"}
 	dep := Renderer{}.RouterDeployment(c)
 	ctr := dep.Spec.Template.Spec.Containers[0]
-	if ctr.Args[len(ctr.Args)-1] != "--tls-dir=/etc/pgshard-tls" {
+	if ctr.Args[len(ctr.Args)-2] != "--tls-cert=/etc/pgshard-tls/tls.crt" || ctr.Args[len(ctr.Args)-1] != "--tls-key=/etc/pgshard-tls/tls.key" {
 		t.Errorf("args %v", ctr.Args)
 	}
 	if len(ctr.VolumeMounts) != 1 || ctr.VolumeMounts[0].MountPath != "/etc/pgshard-tls" || !ctr.VolumeMounts[0].ReadOnly {
