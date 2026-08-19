@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -62,19 +63,82 @@ func TestCatalog(t *testing.T) {
 	if err := exec.Command("docker", "info").Run(); err != nil {
 		t.Skip("docker daemon unavailable; skipping catalog integration tests")
 	}
+	selected, err := selectImages(candidateImages, os.Getenv(requireProjectImagesEnv) != "", func(name string) bool { return imageAvailable(t, name) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, img := range selected {
+		t.Run(img.label, func(t *testing.T) { runSuite(t, img) })
+	}
+}
+
+// requireProjectImagesEnv makes the suite fail instead of silently falling back
+// to Docker Hub images when a project image is missing for any major.
+const requireProjectImagesEnv = "PGSHARD_REQUIRE_PROJECT_IMAGES"
+
+func selectImages(candidates []pgImage, requireProject bool, available func(string) bool) ([]pgImage, error) {
+	var selected []pgImage
 	seen := map[string]bool{}
-	ran := 0
-	for _, img := range candidateImages {
-		if seen[img.label] || !imageAvailable(t, img.name) {
+	for _, img := range candidates {
+		if seen[img.label] {
+			continue
+		}
+		if requireProject && !img.bare {
+			return nil, fmt.Errorf("%s: project image for %s unavailable", requireProjectImagesEnv, img.label)
+		}
+		if !available(img.name) {
 			continue
 		}
 		seen[img.label] = true
-		ran++
-		t.Run(img.label, func(t *testing.T) { runSuite(t, img) })
+		selected = append(selected, img)
 	}
-	if ran == 0 {
-		t.Fatal("no PostgreSQL image available")
+	if requireProject {
+		for _, img := range candidates {
+			if img.bare && !seen[img.label] {
+				return nil, fmt.Errorf("%s: project image for %s unavailable", requireProjectImagesEnv, img.label)
+			}
+		}
 	}
+	if len(selected) == 0 {
+		return nil, errors.New("no PostgreSQL image available")
+	}
+	return selected, nil
+}
+
+func TestSelectImages(t *testing.T) {
+	avail := func(names ...string) func(string) bool {
+		return func(n string) bool {
+			for _, x := range names {
+				if x == n {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	project18, project19 := candidateImages[0].name, candidateImages[2].name
+	t.Run("fallback picks one image per major", func(t *testing.T) {
+		got, err := selectImages(candidateImages, false, avail("postgres:18", "postgres:19beta2"))
+		if err != nil || len(got) != 2 || got[0].name != "postgres:18" || got[1].name != "postgres:19beta2" {
+			t.Fatalf("got %+v err %v", got, err)
+		}
+	})
+	t.Run("fallback fails only with no image at all", func(t *testing.T) {
+		if _, err := selectImages(candidateImages, false, avail()); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+	t.Run("require rejects a missing project major even when hub image exists", func(t *testing.T) {
+		if _, err := selectImages(candidateImages, true, avail(project18, "postgres:19")); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+	t.Run("require accepts both project images", func(t *testing.T) {
+		got, err := selectImages(candidateImages, true, avail(project18, project19))
+		if err != nil || len(got) != 2 || !got[0].bare || !got[1].bare {
+			t.Fatalf("got %+v err %v", got, err)
+		}
+	})
 }
 
 func imageAvailable(t *testing.T, name string) bool {
