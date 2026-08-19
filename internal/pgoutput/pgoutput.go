@@ -378,6 +378,9 @@ var pgEpoch = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 // PGTime converts microseconds since the PostgreSQL epoch to time.Time.
 func PGTime(micros int64) time.Time { return pgEpoch.Add(time.Duration(micros) * time.Microsecond) }
 
+// PGMicros is the inverse of PGTime.
+func PGMicros(t time.Time) int64 { return t.Sub(pgEpoch).Microseconds() }
+
 type reader struct {
 	buf []byte
 	err error

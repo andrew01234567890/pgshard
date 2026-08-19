@@ -357,7 +357,7 @@ func convert(dec *pgoutput.Decoder, m pgoutput.Message, lsn uint64) (*pgshardv1.
 	switch v := m.(type) {
 	case *pgoutput.Begin:
 		ev.Xid = v.Xid
-		ev.Event = &pgshardv1.ChangeEvent_Begin_{Begin: &pgshardv1.ChangeEvent_Begin{Xid: v.Xid, FinalLsn: v.FinalLSN}}
+		ev.Event = &pgshardv1.ChangeEvent_Begin_{Begin: &pgshardv1.ChangeEvent_Begin{Xid: v.Xid, FinalLsn: v.FinalLSN, CommitTs: pgoutput.PGMicros(v.CommitTime)}}
 	case *pgoutput.Commit:
 		ev.Event = &pgshardv1.ChangeEvent_Commit_{Commit: &pgshardv1.ChangeEvent_Commit{CommitLsn: v.CommitLSN, EndLsn: v.EndLSN}}
 		return ev, true, nil
@@ -416,7 +416,7 @@ func convert(dec *pgoutput.Decoder, m pgoutput.Message, lsn uint64) (*pgshardv1.
 		return ev, true, nil
 	case *pgoutput.StreamCommit:
 		ev.Xid = v.Xid
-		ev.Event = &pgshardv1.ChangeEvent_StreamCommit_{StreamCommit: &pgshardv1.ChangeEvent_StreamCommit{Xid: v.Xid, CommitLsn: v.CommitLSN, EndLsn: v.EndLSN}}
+		ev.Event = &pgshardv1.ChangeEvent_StreamCommit_{StreamCommit: &pgshardv1.ChangeEvent_StreamCommit{Xid: v.Xid, CommitLsn: v.CommitLSN, EndLsn: v.EndLSN, CommitTs: pgoutput.PGMicros(v.CommitTime)}}
 		return ev, true, nil
 	case *pgoutput.StreamAbort:
 		ev.Xid = v.Xid
@@ -424,22 +424,22 @@ func convert(dec *pgoutput.Decoder, m pgoutput.Message, lsn uint64) (*pgshardv1.
 		return ev, true, nil
 	case *pgoutput.BeginPrepare:
 		ev.Xid = v.Xid
-		ev.Event = &pgshardv1.ChangeEvent_BeginPrepare_{BeginPrepare: &pgshardv1.ChangeEvent_BeginPrepare{Gid: v.Gid, Xid: v.Xid, PrepareLsn: v.PrepareLSN}}
+		ev.Event = &pgshardv1.ChangeEvent_BeginPrepare_{BeginPrepare: &pgshardv1.ChangeEvent_BeginPrepare{Gid: v.Gid, Xid: v.Xid, PrepareLsn: v.PrepareLSN, PrepareTs: pgoutput.PGMicros(v.PrepareTime)}}
 	case *pgoutput.Prepare:
 		ev.Xid = v.Xid
-		ev.Event = &pgshardv1.ChangeEvent_Prepare_{Prepare: &pgshardv1.ChangeEvent_Prepare{Gid: v.Gid, PrepareLsn: v.PrepareLSN}}
+		ev.Event = &pgshardv1.ChangeEvent_Prepare_{Prepare: &pgshardv1.ChangeEvent_Prepare{Gid: v.Gid, PrepareLsn: v.PrepareLSN, EndLsn: v.EndLSN}}
 		return ev, true, nil
 	case *pgoutput.CommitPrepared:
 		ev.Xid = v.Xid
-		ev.Event = &pgshardv1.ChangeEvent_CommitPrepared_{CommitPrepared: &pgshardv1.ChangeEvent_CommitPrepared{Gid: v.Gid, CommitLsn: v.CommitLSN}}
+		ev.Event = &pgshardv1.ChangeEvent_CommitPrepared_{CommitPrepared: &pgshardv1.ChangeEvent_CommitPrepared{Gid: v.Gid, CommitLsn: v.CommitLSN, EndLsn: v.EndLSN}}
 		return ev, true, nil
 	case *pgoutput.RollbackPrepared:
 		ev.Xid = v.Xid
-		ev.Event = &pgshardv1.ChangeEvent_RollbackPrepared_{RollbackPrepared: &pgshardv1.ChangeEvent_RollbackPrepared{Gid: v.Gid, RollbackLsn: v.RollbackEndLSN}}
+		ev.Event = &pgshardv1.ChangeEvent_RollbackPrepared_{RollbackPrepared: &pgshardv1.ChangeEvent_RollbackPrepared{Gid: v.Gid, RollbackLsn: v.RollbackEndLSN, EndLsn: v.RollbackEndLSN}}
 		return ev, true, nil
 	case *pgoutput.StreamPrepare:
 		ev.Xid = v.Xid
-		ev.Event = &pgshardv1.ChangeEvent_StreamPrepare_{StreamPrepare: &pgshardv1.ChangeEvent_StreamPrepare{Gid: v.Gid, Xid: v.Xid, PrepareLsn: v.PrepareLSN}}
+		ev.Event = &pgshardv1.ChangeEvent_StreamPrepare_{StreamPrepare: &pgshardv1.ChangeEvent_StreamPrepare{Gid: v.Gid, Xid: v.Xid, PrepareLsn: v.PrepareLSN, EndLsn: v.EndLSN, PrepareTs: pgoutput.PGMicros(v.PrepareTime)}}
 		return ev, true, nil
 	default:
 		return nil, false, fmt.Errorf("unhandled pgoutput message %T", m)

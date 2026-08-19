@@ -7,74 +7,188 @@ import "pgshard/v1/common.proto";
 
 option go_package = "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1;pgshardv1";
 
-// VStream merges per-shard change streams into one ordered event stream that
-// survives resharding.
+// VStream fans the per-shard change streams of one named stream into a
+// single positioned event stream served by the router. Every shard
+// transaction is delivered whole and contiguous; no ordering is promised
+// between transactions of different shards.
 service VStream {
-  // Stream opens a change stream. The first request must carry start; later
-  // requests carry ack so the server may advance retained positions.
+  // Create registers a stream and creates its failover slot on every shard.
+  rpc Create(CreateVStreamRequest) returns (CreateVStreamResponse);
+  // Drop removes the stream and its slots.
+  rpc Drop(DropVStreamRequest) returns (DropVStreamResponse);
+  // List reports every stream and the state of its slots.
+  rpc List(ListVStreamsRequest) returns (ListVStreamsResponse);
+  // Stream opens the fan-in. The first request must be a start; later
+  // requests carry acks that advance each shard's confirmed position.
   rpc Stream(stream VStreamRequest) returns (stream VEvent);
+  // Ack advances a stream's confirmed position without a Stream message;
+  // it needs an open Stream on the same shards.
+  rpc Ack(VStreamAckRequest) returns (VStreamAckResponse);
 }
 
-// VStreamRequest is either the initial start or a subsequent ack.
+// VStreamOptions tunes one Stream call.
+message VStreamOptions {
+  // Emit Prepare/CommitPrepared/RollbackPrepared; the stream must have been
+  // created with two_phase.
+  bool two_phase = 1;
+  // End with a Journal event once the shard map generation changes instead
+  // of an Error.
+  bool stop_on_reshard = 2;
+  // Interval between Heartbeat events while idle, in milliseconds; zero
+  // means 5000.
+  uint32 heartbeat_interval_ms = 3;
+  // Hold back shards whose commit timestamps run ahead of the slowest shard
+  // by more than align_skew_ms, releasing them after align_timeout_ms.
+  bool align_skew = 4;
+  // Allowed commit-timestamp lead in milliseconds; zero means 1000.
+  uint32 align_skew_ms = 5;
+  // Longest hold of a shard in milliseconds; zero means 10000.
+  uint32 align_timeout_ms = 6;
+  // Shard set to stream; empty means default.
+  string shard_set = 7;
+}
+
+// CreateVStreamRequest registers a stream.
+message CreateVStreamRequest {
+  // Stream name: [a-z][a-z0-9_]{0,31}.
+  string stream = 1;
+  // Logical database whose tables the stream decodes.
+  string database = 2;
+  // Create the slots with two_phase so prepared transactions are decoded at
+  // PREPARE time.
+  bool two_phase = 3;
+}
+
+// CreateVStreamResponse reports the created slots.
+message CreateVStreamResponse {
+  // Slot name per shard.
+  repeated VStreamSlot slots = 1;
+  Error error = 2;
+}
+
+// VStreamSlot is one shard's slot of a stream.
+message VStreamSlot {
+  ShardRef shard = 1;
+  string slot = 2;
+  // Slot state as seen by the catalog: reserved, extended, unreserved, lost
+  // or missing.
+  string wal_status = 3;
+  uint64 confirmed_flush_lsn = 4;
+  bool active = 5;
+}
+
+// DropVStreamRequest removes a stream.
+message DropVStreamRequest {
+  string stream = 1;
+}
+
+// DropVStreamResponse reports the outcome.
+message DropVStreamResponse {
+  Error error = 1;
+}
+
+// ListVStreamsRequest lists streams.
+message ListVStreamsRequest {}
+
+// VStreamInfo describes one stream.
+message VStreamInfo {
+  string stream = 1;
+  string database = 2;
+  bool two_phase = 3;
+  // creating, active or lost.
+  string state = 4;
+  repeated VStreamSlot slots = 5;
+}
+
+// ListVStreamsResponse carries every stream.
+message ListVStreamsResponse {
+  repeated VStreamInfo streams = 1;
+}
+
+// VPosition is a vector of per-shard LSNs under one shard map generation.
+message VPosition {
+  // One shard's position.
+  message Shard {
+    ShardRef shard = 1;
+    // End LSN of the last delivered transaction; a shard missing from the
+    // vector resumes from its slot's confirmed position.
+    uint64 lsn = 2;
+  }
+  repeated Shard shards = 1;
+  uint64 shard_map_generation = 2;
+}
+
+// VStreamRequest is the start of a stream or an ack.
 message VStreamRequest {
+  // VStreamStart opens the stream.
+  message Start {
+    string stream = 1;
+    // Position to resume from; empty resumes every shard from its slot.
+    VPosition position = 2;
+    VStreamOptions options = 3;
+  }
   oneof request {
-    VStreamStart start = 1;
-    // Consumer has durably processed everything up to this position.
-    Position ack = 2;
+    Start start = 1;
+    // The consumer has durably processed everything up to this position.
+    VPosition ack = 2;
   }
 }
 
-// VStreamStart configures a stream.
-message VStreamStart {
-  // Position to resume from; empty means the current position.
-  Position start = 1;
-  // True to first copy existing rows before streaming changes.
-  bool copy = 2;
-  // Database to stream.
-  string database = 3;
-  // Tables to stream; empty means all.
-  repeated string tables = 4;
-  // Stream options.
-  VStreamOptions options = 5;
+// VStreamAckRequest acks a position out of band.
+message VStreamAckRequest {
+  string stream = 1;
+  VPosition position = 2;
 }
 
-// VStreamOptions tunes stream behaviour.
-message VStreamOptions {
-  // Emit Prepare/CommitPrepared/RollbackPrepared for two-phase transactions.
-  bool two_phase = 1;
-  // End the stream with a Journal event instead of following resharding.
-  bool stop_on_reshard = 2;
-  // Interval between Heartbeat events in milliseconds; zero disables.
-  uint32 heartbeat_interval_ms = 3;
-  // Prefer to keep shard streams close in time over throughput.
-  bool minimize_skew = 4;
+// VStreamAckResponse reports the outcome.
+message VStreamAckResponse {
+  Error error = 1;
 }
 
-// Column is one typed column value.
-message Column {
-  string name = 1;
-  // PostgreSQL type OID.
-  uint32 type_oid = 2;
-  bool null = 3;
+// VColumn is one typed column value.
+message VColumn {
+  bool null = 1;
+  // True when the value is an unchanged TOAST datum pgoutput did not send.
+  bool unchanged_toast = 2;
   // Text-format value bytes.
-  bytes value = 4;
+  bytes value = 3;
 }
 
-// Tuple is one row image.
-message Tuple {
-  repeated Column columns = 1;
+// VTuple is one row image.
+message VTuple {
+  repeated VColumn columns = 1;
 }
 
 // VEvent is one change-stream event.
 message VEvent {
-  // Transaction begins on a shard.
+  // Begin opens a shard transaction.
   message Begin {
     ShardRef shard = 1;
     uint32 xid = 2;
-    // Commit timestamp in microseconds since the PostgreSQL epoch, when known.
-    optional int64 commit_ts = 3;
+    // Commit (or prepare) timestamp in microseconds since 2000-01-01 UTC.
+    int64 commit_ts = 3;
+    // Global identifier of a two-phase transaction being prepared.
+    string gid = 4;
   }
-  // One row change.
+  // Relation describes a table before its first row in the stream and again
+  // whenever its columns change. Relation ids are not exposed: a table is
+  // named by schema and table so the same table on different shards, or
+  // after a rewrite, maps to one relation.
+  message Relation {
+    // Column of a relation.
+    message Column {
+      string name = 1;
+      uint32 type_oid = 2;
+      int32 type_modifier = 3;
+      bool key = 4;
+    }
+    string schema = 1;
+    string table = 2;
+    // d default, n nothing, f full, i index.
+    string replica_identity = 3;
+    repeated Column columns = 4;
+  }
+  // Row is one row change.
   message Row {
     // Row change kind.
     enum Kind {
@@ -82,22 +196,71 @@ message VEvent {
       KIND_INSERT = 1;
       KIND_UPDATE = 2;
       KIND_DELETE = 3;
-      KIND_TRUNCATE = 4;
     }
-    string table = 1;
-    Kind kind = 2;
-    // Old image; present for UPDATE/DELETE when replica identity allows.
-    Tuple old = 3;
-    // New image; present for INSERT/UPDATE.
-    Tuple new = 4;
+    ShardRef shard = 1;
+    string schema = 2;
+    string table = 3;
+    Kind kind = 4;
+    // Old image for UPDATE/DELETE when the replica identity provides one.
+    VTuple old = 5;
+    // True when old holds the key columns only.
+    bool old_is_key = 6;
+    // New image for INSERT/UPDATE.
+    VTuple new = 7;
   }
-  // Transaction commits on a shard.
+  // Truncate of one or more tables.
+  message Truncate {
+    // One truncated table.
+    message Table {
+      string schema = 1;
+      string table = 2;
+    }
+    ShardRef shard = 1;
+    repeated Table tables = 2;
+    bool cascade = 3;
+    bool restart_identity = 4;
+  }
+  // Message is a logical decoding message (pg_logical_emit_message).
+  message Message {
+    ShardRef shard = 1;
+    string prefix = 2;
+    bytes content = 3;
+    bool transactional = 4;
+  }
+  // Commit closes a shard transaction.
   message Commit {
     ShardRef shard = 1;
+    // Commit LSN.
     uint64 lsn = 2;
+    // End LSN; the shard's position after this transaction.
+    uint64 end_lsn = 3;
   }
-  // Heartbeat proves liveness while no changes flow.
-  message Heartbeat {}
+  // Prepare closes the changes of a two-phase transaction at PREPARE time.
+  message Prepare {
+    ShardRef shard = 1;
+    string gid = 2;
+    uint64 lsn = 3;
+  }
+  // CommitPrepared commits an earlier Prepare.
+  message CommitPrepared {
+    ShardRef shard = 1;
+    string gid = 2;
+    uint64 lsn = 3;
+  }
+  // RollbackPrepared rolls back an earlier Prepare.
+  message RollbackPrepared {
+    ShardRef shard = 1;
+    string gid = 2;
+    uint64 lsn = 3;
+  }
+  // VGtid snapshots the vector after every transaction boundary.
+  message VGtid {
+    VPosition position = 1;
+  }
+  // Heartbeat proves liveness while idle and carries the vector.
+  message Heartbeat {
+    VPosition position = 1;
+  }
   // Journal announces a resharding event and where the stream continues.
   message Journal {
     // Target shard and the LSN to resume from on it.
@@ -109,49 +272,39 @@ message VEvent {
     // Source shards participating in the reshard.
     repeated ShardRef participants = 2;
     repeated Target targets = 3;
+    uint64 shard_map_generation = 4;
   }
-  // CopyCompleted marks the end of the initial copy phase for a table.
-  message CopyCompleted {
-    string table = 1;
-  }
-  // LastPK reports copy progress so a consumer can resume the copy.
-  message LastPK {
-    string table = 1;
-    Tuple pk = 2;
-  }
-  // DdlMarker records a DDL statement applied at this point.
-  message DdlMarker {
-    string database = 1;
-    string statement = 2;
-  }
-  // Prepare marks a two-phase transaction prepared.
-  message Prepare {
-    ShardRef shard = 1;
-    string gid = 2;
-  }
-  // CommitPrepared marks a prepared transaction committed.
-  message CommitPrepared {
-    ShardRef shard = 1;
-    string gid = 2;
-  }
-  // RollbackPrepared marks a prepared transaction rolled back.
-  message RollbackPrepared {
-    ShardRef shard = 1;
-    string gid = 2;
+  // Error ends the stream.
+  message Error {
+    // Error code.
+    enum Code {
+      CODE_UNSPECIFIED = 0;
+      // A shard's slot was invalidated or the requested LSN is no longer
+      // retained; the stream must be recreated.
+      CODE_POSITION_TOO_OLD = 1;
+      // The shard map generation changed and the stream cannot follow.
+      CODE_RESHARDED = 2;
+      // A shard stream could not be (re)opened in time.
+      CODE_SHARD_UNAVAILABLE = 3;
+      CODE_INTERNAL = 4;
+    }
+    Code code = 1;
+    string message = 2;
+    ShardRef shard = 3;
   }
   oneof event {
     Begin begin = 1;
-    Row row = 2;
-    Commit commit = 3;
-    // Position the consumer may ack after processing preceding events.
-    Position position = 4;
-    Heartbeat heartbeat = 5;
-    Journal journal = 6;
-    CopyCompleted copy_completed = 7;
-    LastPK last_pk = 8;
-    DdlMarker ddl_marker = 9;
-    Prepare prepare = 10;
-    CommitPrepared commit_prepared = 11;
-    RollbackPrepared rollback_prepared = 12;
+    Relation relation = 2;
+    Row row = 3;
+    Truncate truncate = 4;
+    Message message = 5;
+    Commit commit = 6;
+    Prepare prepare = 7;
+    CommitPrepared commit_prepared = 8;
+    RollbackPrepared rollback_prepared = 9;
+    VGtid vgtid = 10;
+    Heartbeat heartbeat = 11;
+    Journal journal = 12;
+    Error error = 13;
   }
 }

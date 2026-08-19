@@ -286,7 +286,7 @@ func startStackFull(tb testing.TB, catalogOpts, shardOpts []string) *stack {
 	}
 	host, port, _ := net.SplitHostPort(s.shardAddr)
 	startProcess(tb, s.poolerLog, "listening on", poolerBin, "run", "--insecure-dev", "--listen", s.poolerAddr,
-		"--pg-host", host, "--pg-port", port, "--pg-database", appDatabase,
+		"--pg-host", host, "--pg-port", port, "--pg-database", appDatabase, "--stream-dsn", streamDSN(s.shardDSN),
 		"--catalog-dsn", s.catalogDSN, "--shard-set", router.DefaultShardSet, "--shard-id", "0", "--drain-timeout", "5s")
 	s.routerBin = routerBin
 	s.controllerBin = controllerBinary(routerBin)
@@ -300,6 +300,12 @@ func startStackFull(tb testing.TB, catalogOpts, shardOpts []string) *stack {
 		"--catalog-dsn", s.catalogDSN, "--drain-timeout", "5s", "--drain-delay", "1s",
 		"--instance-id", "1", "--peer-cancel-listen", s.peerAddr, "--health-listen", s.healthAddr)
 	return s
+}
+
+// streamDSN is the superuser DSN of a shard's app database, used by the
+// pooler for change-stream replication connections.
+func streamDSN(adminDSN string) string {
+	return strings.Replace(adminDSN, "/postgres?", "/"+appDatabase+"?", 1)
 }
 
 func (s *stack) connectTo(tb testing.TB, addr string) *pgx.Conn {

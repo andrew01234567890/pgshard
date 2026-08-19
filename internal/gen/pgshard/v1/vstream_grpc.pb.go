@@ -21,19 +21,34 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
+	VStream_Create_FullMethodName = "/pgshard.v1.VStream/Create"
+	VStream_Drop_FullMethodName   = "/pgshard.v1.VStream/Drop"
+	VStream_List_FullMethodName   = "/pgshard.v1.VStream/List"
 	VStream_Stream_FullMethodName = "/pgshard.v1.VStream/Stream"
+	VStream_Ack_FullMethodName    = "/pgshard.v1.VStream/Ack"
 )
 
 // VStreamClient is the client API for VStream service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// VStream merges per-shard change streams into one ordered event stream that
-// survives resharding.
+// VStream fans the per-shard change streams of one named stream into a
+// single positioned event stream served by the router. Every shard
+// transaction is delivered whole and contiguous; no ordering is promised
+// between transactions of different shards.
 type VStreamClient interface {
-	// Stream opens a change stream. The first request must carry start; later
-	// requests carry ack so the server may advance retained positions.
+	// Create registers a stream and creates its failover slot on every shard.
+	Create(ctx context.Context, in *CreateVStreamRequest, opts ...grpc.CallOption) (*CreateVStreamResponse, error)
+	// Drop removes the stream and its slots.
+	Drop(ctx context.Context, in *DropVStreamRequest, opts ...grpc.CallOption) (*DropVStreamResponse, error)
+	// List reports every stream and the state of its slots.
+	List(ctx context.Context, in *ListVStreamsRequest, opts ...grpc.CallOption) (*ListVStreamsResponse, error)
+	// Stream opens the fan-in. The first request must be a start; later
+	// requests carry acks that advance each shard's confirmed position.
 	Stream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[VStreamRequest, VEvent], error)
+	// Ack advances a stream's confirmed position without a Stream message;
+	// it needs an open Stream on the same shards.
+	Ack(ctx context.Context, in *VStreamAckRequest, opts ...grpc.CallOption) (*VStreamAckResponse, error)
 }
 
 type vStreamClient struct {
@@ -42,6 +57,36 @@ type vStreamClient struct {
 
 func NewVStreamClient(cc grpc.ClientConnInterface) VStreamClient {
 	return &vStreamClient{cc}
+}
+
+func (c *vStreamClient) Create(ctx context.Context, in *CreateVStreamRequest, opts ...grpc.CallOption) (*CreateVStreamResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CreateVStreamResponse)
+	err := c.cc.Invoke(ctx, VStream_Create_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vStreamClient) Drop(ctx context.Context, in *DropVStreamRequest, opts ...grpc.CallOption) (*DropVStreamResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DropVStreamResponse)
+	err := c.cc.Invoke(ctx, VStream_Drop_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vStreamClient) List(ctx context.Context, in *ListVStreamsRequest, opts ...grpc.CallOption) (*ListVStreamsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListVStreamsResponse)
+	err := c.cc.Invoke(ctx, VStream_List_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *vStreamClient) Stream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[VStreamRequest, VEvent], error) {
@@ -57,16 +102,37 @@ func (c *vStreamClient) Stream(ctx context.Context, opts ...grpc.CallOption) (gr
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type VStream_StreamClient = grpc.BidiStreamingClient[VStreamRequest, VEvent]
 
+func (c *vStreamClient) Ack(ctx context.Context, in *VStreamAckRequest, opts ...grpc.CallOption) (*VStreamAckResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(VStreamAckResponse)
+	err := c.cc.Invoke(ctx, VStream_Ack_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // VStreamServer is the server API for VStream service.
 // All implementations must embed UnimplementedVStreamServer
 // for forward compatibility.
 //
-// VStream merges per-shard change streams into one ordered event stream that
-// survives resharding.
+// VStream fans the per-shard change streams of one named stream into a
+// single positioned event stream served by the router. Every shard
+// transaction is delivered whole and contiguous; no ordering is promised
+// between transactions of different shards.
 type VStreamServer interface {
-	// Stream opens a change stream. The first request must carry start; later
-	// requests carry ack so the server may advance retained positions.
+	// Create registers a stream and creates its failover slot on every shard.
+	Create(context.Context, *CreateVStreamRequest) (*CreateVStreamResponse, error)
+	// Drop removes the stream and its slots.
+	Drop(context.Context, *DropVStreamRequest) (*DropVStreamResponse, error)
+	// List reports every stream and the state of its slots.
+	List(context.Context, *ListVStreamsRequest) (*ListVStreamsResponse, error)
+	// Stream opens the fan-in. The first request must be a start; later
+	// requests carry acks that advance each shard's confirmed position.
 	Stream(grpc.BidiStreamingServer[VStreamRequest, VEvent]) error
+	// Ack advances a stream's confirmed position without a Stream message;
+	// it needs an open Stream on the same shards.
+	Ack(context.Context, *VStreamAckRequest) (*VStreamAckResponse, error)
 	mustEmbedUnimplementedVStreamServer()
 }
 
@@ -77,8 +143,20 @@ type VStreamServer interface {
 // pointer dereference when methods are called.
 type UnimplementedVStreamServer struct{}
 
+func (UnimplementedVStreamServer) Create(context.Context, *CreateVStreamRequest) (*CreateVStreamResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Create not implemented")
+}
+func (UnimplementedVStreamServer) Drop(context.Context, *DropVStreamRequest) (*DropVStreamResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Drop not implemented")
+}
+func (UnimplementedVStreamServer) List(context.Context, *ListVStreamsRequest) (*ListVStreamsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method List not implemented")
+}
 func (UnimplementedVStreamServer) Stream(grpc.BidiStreamingServer[VStreamRequest, VEvent]) error {
 	return status.Errorf(codes.Unimplemented, "method Stream not implemented")
+}
+func (UnimplementedVStreamServer) Ack(context.Context, *VStreamAckRequest) (*VStreamAckResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Ack not implemented")
 }
 func (UnimplementedVStreamServer) mustEmbedUnimplementedVStreamServer() {}
 func (UnimplementedVStreamServer) testEmbeddedByValue()                 {}
@@ -101,6 +179,60 @@ func RegisterVStreamServer(s grpc.ServiceRegistrar, srv VStreamServer) {
 	s.RegisterService(&VStream_ServiceDesc, srv)
 }
 
+func _VStream_Create_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateVStreamRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VStreamServer).Create(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VStream_Create_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VStreamServer).Create(ctx, req.(*CreateVStreamRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _VStream_Drop_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DropVStreamRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VStreamServer).Drop(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VStream_Drop_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VStreamServer).Drop(ctx, req.(*DropVStreamRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _VStream_List_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListVStreamsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VStreamServer).List(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VStream_List_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VStreamServer).List(ctx, req.(*ListVStreamsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _VStream_Stream_Handler(srv interface{}, stream grpc.ServerStream) error {
 	return srv.(VStreamServer).Stream(&grpc.GenericServerStream[VStreamRequest, VEvent]{ServerStream: stream})
 }
@@ -108,13 +240,48 @@ func _VStream_Stream_Handler(srv interface{}, stream grpc.ServerStream) error {
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type VStream_StreamServer = grpc.BidiStreamingServer[VStreamRequest, VEvent]
 
+func _VStream_Ack_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(VStreamAckRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VStreamServer).Ack(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VStream_Ack_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VStreamServer).Ack(ctx, req.(*VStreamAckRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // VStream_ServiceDesc is the grpc.ServiceDesc for VStream service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
 var VStream_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "pgshard.v1.VStream",
 	HandlerType: (*VStreamServer)(nil),
-	Methods:     []grpc.MethodDesc{},
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Create",
+			Handler:    _VStream_Create_Handler,
+		},
+		{
+			MethodName: "Drop",
+			Handler:    _VStream_Drop_Handler,
+		},
+		{
+			MethodName: "List",
+			Handler:    _VStream_List_Handler,
+		},
+		{
+			MethodName: "Ack",
+			Handler:    _VStream_Ack_Handler,
+		},
+	},
 	Streams: []grpc.StreamDesc{
 		{
 			StreamName:    "Stream",

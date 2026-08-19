@@ -32,6 +32,7 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
 	"github.com/andrew01234567890/pgshard/internal/router"
 	"github.com/andrew01234567890/pgshard/internal/router/cancelpeer"
+	"github.com/andrew01234567890/pgshard/internal/router/vstream"
 )
 
 // serve runs the router: a pgwire front end whose sessions are authenticated
@@ -94,6 +95,8 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	bufferCap := fs.Int("buffer-cap", 256, "statements buffered per shard during failover")
 	scatterMaxShards := fs.Int("scatter-max-shards", 0, "most shards one SELECT may fan out to (0 = all)")
 	scatterMaxStreams := fs.Int("scatter-max-streams", 4096, "shard streams open for multi-shard reads across this router")
+	vstreamListen := fs.String("vstream-listen", "", "gRPC address for the VStream change-stream service (empty disables)")
+	controllerAddr := fs.String("controller", "", "controller gRPC endpoint used to create and drop streams (same credentials as poolers)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return cli.ExitOK
@@ -192,9 +195,10 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		}
 		defer forwarder.Close()
 	}
+	poolerClients := router.NewPoolers(poolers, w.Current, creds)
 	rt, err := router.New(router.Config{
 		Snapshot:   w.Current,
-		Poolers:    router.NewPoolers(poolers, w.Current, creds),
+		Poolers:    poolerClients,
 		Logger:     logger,
 		Peers:      peersOrNil(forwarder),
 		Buffering:  router.Buffering{Window: *bufferWindow, PerShardCap: *bufferCap, Changes: w.Subscribe},
@@ -237,6 +241,34 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		go func() { _ = g.Serve(pl) }()
 		defer g.Stop()
 		fmt.Fprintf(stdout, "pgshard-router serve: peer cancels on %s (instance %d)\n", pl.Addr(), srv.InstanceID())
+	}
+	if *vstreamListen != "" {
+		serverCreds, err := peerCredentials(*poolerCert, *poolerKey, *poolerCA, *insecureDev)
+		if err != nil {
+			fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
+			return cli.ExitUsage
+		}
+		vl, err := net.Listen(listenNetwork(*vstreamListen), *vstreamListen)
+		if err != nil {
+			fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
+			return cli.ExitNotReady
+		}
+		vs := &vstream.Server{Topology: vstream.SnapshotTopology{Snapshot: w.Current, Poolers: poolerClients},
+			Catalog: vstream.PGCatalog{Pool: pool}, Logger: logger}
+		if *controllerAddr != "" {
+			cc, err := grpc.NewClient(*controllerAddr, grpc.WithTransportCredentials(creds))
+			if err != nil {
+				fmt.Fprintf(stderr, "pgshard-router serve: controller: %v\n", err)
+				return cli.ExitUsage
+			}
+			defer func() { _ = cc.Close() }()
+			vs.Controller = pgshardv1.NewControllerClient(cc)
+		}
+		g := grpc.NewServer(grpc.Creds(serverCreds))
+		pgshardv1.RegisterVStreamServer(g, vs)
+		go func() { _ = g.Serve(vl) }()
+		defer g.Stop()
+		fmt.Fprintf(stdout, "pgshard-router serve: vstream on %s\n", vl.Addr())
 	}
 	drainer := router.NewDrainer(srv, *drainDelay, *drain)
 	if *healthListen != "" {

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
@@ -65,5 +66,89 @@ func TestStreamMonitor(t *testing.T) {
 	}
 	if rows, _ := catalog.ListStreamStatus(ctx, f.pool, ""); len(rows) != 0 {
 		t.Fatalf("status rows must cascade: %+v", rows)
+	}
+}
+
+func (d *flakyDialer) DialDatabase(ctx context.Context, set string, id int32, database string) (ShardConn, error) {
+	if id == d.down {
+		return nil, fmt.Errorf("shard %s/%d unreachable", set, id)
+	}
+	return d.inner.(*PgxShardDialer).DialDatabase(ctx, set, id, database)
+}
+
+func (d *flakyDialer) DialDatabaseAs(ctx context.Context, set string, id int32, database, user, password string) (ShardConn, error) {
+	if id == d.down {
+		return nil, fmt.Errorf("shard %s/%d unreachable", set, id)
+	}
+	return d.inner.(*PgxShardDialer).DialDatabaseAs(ctx, set, id, database, user, password)
+}
+
+func TestStreamAdminCreatesAndDropsSlotsOnEveryShard(t *testing.T) {
+	f := newResolverFixture(t)
+	ctx := context.Background()
+	a := &StreamAdmin{Pool: f.pool, Shards: f.dialer}
+	if _, err := a.Create(ctx, "orders", "", false, ""); err == nil {
+		t.Fatal("database is required")
+	}
+	if _, err := a.Create(ctx, "orders", "postgres", true, "nope"); err == nil {
+		t.Fatal("unknown shard set must fail")
+	}
+	if err := catalog.DeleteStream(ctx, f.pool, "orders"); err != nil {
+		t.Fatal(err)
+	}
+	slots, err := a.Create(ctx, "orders", "postgres", true, "")
+	if err != nil || len(slots) != 2 || slots[0].Slot != "pgshard_orders_g0" || slots[1].Slot != "pgshard_orders_g1" || slots[0].LSN == 0 {
+		t.Fatalf("create: %+v %v", slots, err)
+	}
+	streams, _ := catalog.ListStreams(ctx, f.pool)
+	if len(streams) != 1 || streams[0].State != catalog.StreamActive {
+		t.Fatalf("streams: %+v", streams)
+	}
+	for id := range 2 {
+		var twoPhase, failover bool
+		var pubs int
+		conn := connect(t, f.shardDSN(id))
+		if err := conn.QueryRow(ctx, "SELECT two_phase, failover FROM pg_replication_slots WHERE slot_name = $1", fmt.Sprintf("pgshard_orders_g%d", id)).Scan(&twoPhase, &failover); err != nil {
+			t.Fatalf("shard %d slot: %v", id, err)
+		}
+		if err := conn.QueryRow(ctx, "SELECT count(*) FROM pg_publication WHERE pubname = 'pgshard_all' AND puballtables").Scan(&pubs); err != nil {
+			t.Fatal(err)
+		}
+		if !twoPhase || !failover || pubs != 1 {
+			t.Fatalf("shard %d: two_phase=%t failover=%t publications=%d", id, twoPhase, failover, pubs)
+		}
+	}
+	if _, err := a.Create(ctx, "orders", "postgres", true, ""); err == nil {
+		t.Fatal("duplicate stream must fail")
+	}
+
+	// A shard that is down leaves the stream creating with the slots made so far.
+	f.dialer.down = 1
+	if _, err := a.Create(ctx, "events", "postgres", false, ""); err == nil {
+		t.Fatal("create with shard 1 down must fail")
+	}
+	streams, _ = catalog.ListStreams(ctx, f.pool)
+	if len(streams) != 2 || streams[0].Name != "events" || streams[0].State != catalog.StreamCreating {
+		t.Fatalf("streams: %+v", streams)
+	}
+	if err := a.Drop(ctx, "events"); err == nil {
+		t.Fatal("drop with shard 1 down must fail")
+	}
+	f.dialer.down = -1
+	if err := a.Drop(ctx, "events"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Drop(ctx, "orders"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Drop(ctx, "orders"); err != nil {
+		t.Fatalf("dropping a missing stream is idempotent: %v", err)
+	}
+	var n int
+	if err := connect(t, f.shardDSN(0)).QueryRow(ctx, "SELECT count(*) FROM pg_replication_slots").Scan(&n); err != nil || n != 0 {
+		t.Fatalf("slots left: %d %v", n, err)
+	}
+	if streams, _ = catalog.ListStreams(ctx, f.pool); len(streams) != 0 {
+		t.Fatalf("streams left: %+v", streams)
 	}
 }

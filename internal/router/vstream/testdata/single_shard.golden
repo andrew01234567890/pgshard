@@ -1,0 +1,27 @@
+begin shard=0 xid=5 ts=10
+relation public.orders identity=d cols=id:23:true,name:23:false
+row shard=0 UPDATE public.orders new=[1,<toast>] old_cols=1 key=true
+row shard=0 DELETE public.orders new=[] old_cols=2 key=false
+message shard=0 p="in" transactional=true
+truncate shard=0 public.orders
+commit shard=0 lsn=90 end=100
+vgtid gen=7 {0:100}
+message shard=0 p="out" transactional=false
+begin shard=0 xid=6 ts=20 gid=g1
+row shard=0 INSERT public.orders new=[3,x]
+prepare shard=0 gid=g1 lsn=190
+vgtid gen=7 {0:200}
+commit_prepared shard=0 gid=g1 lsn=290
+vgtid gen=7 {0:300}
+rollback_prepared shard=0 gid=g2 lsn=390
+vgtid gen=7 {0:400}
+begin shard=0 xid=7 ts=30
+relation public.orders identity=d cols=id:23:true,name:23:false,extra:23:false
+row shard=0 INSERT public.orders new=[4,y,z]
+commit shard=0 lsn=492 end=500
+vgtid gen=7 {0:500}
+begin shard=0 xid=8 ts=40
+row shard=0 INSERT public.orders new=[5,s,s]
+row shard=0 INSERT public.orders new=[7,t,t]
+commit shard=0 lsn=590 end=600
+vgtid gen=7 {0:600}

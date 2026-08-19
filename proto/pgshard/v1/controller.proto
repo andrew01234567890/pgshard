@@ -30,6 +30,11 @@ service Controller {
   // ListRoleStatus reports, per managed role and group, whether the group
   // matches the catalog's desired role state.
   rpc ListRoleStatus(ListRoleStatusRequest) returns (ListRoleStatusResponse);
+  // CreateStream registers a change stream and creates its failover slot
+  // on every shard of the stream's shard set.
+  rpc CreateStream(CreateStreamRequest) returns (CreateStreamResponse);
+  // DropStream drops a change stream's slots and its catalog rows.
+  rpc DropStream(DropStreamRequest) returns (DropStreamResponse);
 }
 
 // WorkflowKind enumerates workflow types.
@@ -240,4 +245,38 @@ message ListRoleStatusRequest {
 // ListRoleStatusResponse lists role status rows ordered by role and group.
 message ListRoleStatusResponse {
   repeated RoleStatus statuses = 1;
+}
+
+// CreateStreamRequest registers a change stream.
+message CreateStreamRequest {
+  // Stream name: [a-z][a-z0-9_]{0,31}.
+  string stream = 1;
+  // Logical database the slots decode.
+  string database = 2;
+  bool two_phase = 3;
+  // Shard set whose shards get a slot; empty means default.
+  string shard_set = 4;
+}
+
+// CreateStreamResponse reports the slot of every shard.
+message CreateStreamResponse {
+  // Slot created on one shard.
+  message Slot {
+    ShardRef shard = 1;
+    string slot = 2;
+    // LSN the slot starts at.
+    uint64 lsn = 3;
+  }
+  repeated Slot slots = 1;
+  Error error = 2;
+}
+
+// DropStreamRequest drops a change stream.
+message DropStreamRequest {
+  string stream = 1;
+}
+
+// DropStreamResponse reports the outcome.
+message DropStreamResponse {
+  Error error = 1;
 }

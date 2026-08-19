@@ -388,6 +388,8 @@ message ChangeEvent {
   message Begin {
     uint32 xid = 1;
     uint64 final_lsn = 2;
+    // Commit timestamp in microseconds since 2000-01-01 UTC.
+    int64 commit_ts = 3;
   }
   // One changed row.
   message Row {
@@ -429,16 +431,19 @@ message ChangeEvent {
   message Prepare {
     string gid = 1;
     uint64 prepare_lsn = 2;
+    uint64 end_lsn = 3;
   }
   // COMMIT PREPARED of an earlier Prepare.
   message CommitPrepared {
     string gid = 1;
     uint64 commit_lsn = 2;
+    uint64 end_lsn = 3;
   }
   // ROLLBACK PREPARED of an earlier Prepare.
   message RollbackPrepared {
     string gid = 1;
     uint64 rollback_lsn = 2;
+    uint64 end_lsn = 3;
   }
   // Logical decoding message (pg_logical_emit_message).
   message Message {
@@ -482,6 +487,8 @@ message ChangeEvent {
     uint32 xid = 1;
     uint64 commit_lsn = 2;
     uint64 end_lsn = 3;
+    // Commit timestamp in microseconds since 2000-01-01 UTC.
+    int64 commit_ts = 4;
   }
   // StreamAbort aborts a streamed transaction or subtransaction.
   message StreamAbort {
@@ -494,12 +501,17 @@ message ChangeEvent {
     string gid = 1;
     uint32 xid = 2;
     uint64 prepare_lsn = 3;
+    // Prepare timestamp in microseconds since 2000-01-01 UTC.
+    int64 prepare_ts = 4;
   }
   // StreamPrepare prepares a streamed transaction.
   message StreamPrepare {
     string gid = 1;
     uint32 xid = 2;
     uint64 prepare_lsn = 3;
+    uint64 end_lsn = 4;
+    // Prepare timestamp in microseconds since 2000-01-01 UTC.
+    int64 prepare_ts = 5;
   }
   // Origin names the replication origin of the transaction.
   message Origin {
