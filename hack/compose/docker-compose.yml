@@ -1,16 +1,21 @@
 # Local development stack: catalog + 3 shard PostgreSQL instances, object-store
 # emulators, and the single-shard data path (pooler for shard0 + router).
 #
-# PG_IMAGE defaults to the project image; if it is not published yet, run with
-#   PG_IMAGE=postgres:18 docker compose -f hack/compose/docker-compose.yml up
+# PG_IMAGE defaults to the official postgres image: these services rely on its
+# entrypoint conventions (initdb on first start, POSTGRES_PASSWORD, a bare
+# "postgres" command). The project image ghcr.io/andrew01234567890/pgshard-postgres
+# runs pgshard-agent as PID 1 from an agent JSON config and does not initialise
+# a cluster by itself, so it is not a drop-in here; use it through the operator
+# (hack/kind) or with an explicit agent config instead.
+#   docker compose -f hack/compose/docker-compose.yml up
 #
 # The data path (catalog-init, pooler-shard0, router) is under the "router"
 # profile so the bare databases can still be started alone:
-#   PG_IMAGE=postgres:18 docker compose -f hack/compose/docker-compose.yml --profile router up --build
+#   docker compose -f hack/compose/docker-compose.yml --profile router up --build
 #   psql "postgres://app:app-secret@localhost:6432/app"
 services:
   catalog:
-    image: ${PG_IMAGE:-ghcr.io/andrew01234567890/pgshard-postgres:18}
+    image: ${PG_IMAGE:-postgres:18}
     command: ["postgres", "-c", "wal_level=logical", "-c", "max_prepared_transactions=64"]
     environment:
       POSTGRES_PASSWORD: pgshard
@@ -22,21 +27,21 @@ services:
       timeout: 3s
       retries: 20
   shard0:
-    image: ${PG_IMAGE:-ghcr.io/andrew01234567890/pgshard-postgres:18}
+    image: ${PG_IMAGE:-postgres:18}
     command: ["postgres", "-c", "wal_level=logical", "-c", "max_prepared_transactions=64"]
     environment:
       POSTGRES_PASSWORD: pgshard
     ports: ["5433:5432"]
     healthcheck: *pghealth
   shard1:
-    image: ${PG_IMAGE:-ghcr.io/andrew01234567890/pgshard-postgres:18}
+    image: ${PG_IMAGE:-postgres:18}
     command: ["postgres", "-c", "wal_level=logical", "-c", "max_prepared_transactions=64"]
     environment:
       POSTGRES_PASSWORD: pgshard
     ports: ["5434:5432"]
     healthcheck: *pghealth
   shard2:
-    image: ${PG_IMAGE:-ghcr.io/andrew01234567890/pgshard-postgres:18}
+    image: ${PG_IMAGE:-postgres:18}
     command: ["postgres", "-c", "wal_level=logical", "-c", "max_prepared_transactions=64"]
     environment:
       POSTGRES_PASSWORD: pgshard
