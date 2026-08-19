@@ -622,9 +622,11 @@ func TestApplierRunsClientStatementsOnANonSuperuserSession(t *testing.T) {
 	}
 	super := strings.Join(f.shards.superuserStatements(1), ";")
 	for _, want := range []string{
-		`CREATE ROLE "pgshard_ddl" LOGIN NOSUPERUSER NOINHERIT NOBYPASSRLS NOREPLICATION CREATEDB CREATEROLE`,
-		`ALTER ROLE "pgshard_ddl" LOGIN NOSUPERUSER NOINHERIT NOBYPASSRLS NOREPLICATION CREATEDB CREATEROLE PASSWORD '`,
+		`CREATE ROLE "pgshard_ddl" LOGIN NOSUPERUSER NOINHERIT NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION`,
+		`ALTER ROLE "pgshard_ddl" LOGIN NOSUPERUSER NOINHERIT NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION PASSWORD '`,
+		`FROM pg_auth_members WHERE member = 'pgshard_ddl'::regrole`,
 		`GRANT "app" TO "pgshard_ddl" WITH SET TRUE, INHERIT FALSE`,
+		`REVOKE "app" FROM "pgshard_ddl"`,
 	} {
 		if !strings.Contains(super, want) {
 			t.Fatalf("superuser session ran %q, want %q", super, want)
@@ -661,6 +663,89 @@ func TestApplierRunsClientStatementsOnANonSuperuserSession(t *testing.T) {
 	}
 	if strings.Contains(strings.Join(f.shards.superuserStatements(1), ";"), `GRANT "postgres"`) {
 		t.Fatal("a superuser was granted to the DDL role")
+	}
+}
+
+// membershipBalanced reports that every GRANT of a role to pgshard_ddl on
+// the superuser session was followed by its REVOKE, and returns how many.
+func membershipBalanced(stmts []string, role string) (int, bool) {
+	grant, revoke := `GRANT "`+role+`" TO "pgshard_ddl" WITH SET TRUE, INHERIT FALSE`, `REVOKE "`+role+`" FROM "pgshard_ddl"`
+	held, n := false, 0
+	for _, st := range stmts {
+		switch st {
+		case grant:
+			if held {
+				return n, false
+			}
+			held = true
+			n++
+		case revoke:
+			if !held {
+				return n, false
+			}
+			held = false
+		}
+	}
+	return n, !held
+}
+
+func TestApplierRevokesTheMembershipAfterEveryShardStep(t *testing.T) {
+	f := newApplierFixture(t)
+	f.shards.exec = func(shard int32, _ string) error {
+		if shard == 2 {
+			return pgErr("42P07", "relation exists")
+		}
+		return nil
+	}
+	steps := []catalog.MigrationStep{{SQL: "alter table t add column x int"}, {SQL: "alter table t add column y int"}}
+	id := f.queue(catalog.DDLMigration{Statement: "alter table t add column x int, add column y int", Kind: "ALTER TABLE", Scope: "all", Strategy: "multistep",
+		Meta: catalog.MigrationMeta{RunAs: "app", Steps: steps}})
+	f.run(t)
+	m := f.store.get(t, id)
+	if m.State != catalog.MigrationFailed || m.PerShard["2"].State != catalog.ShardFailed || m.PerShard["0"].State != catalog.ShardApplied {
+		t.Fatalf("%s %s", m.State, states(m))
+	}
+	for shard, want := range map[int32]int{0: 2, 1: 2, 2: 1} {
+		n, ok := membershipBalanced(f.shards.superuserStatements(shard), "app")
+		if !ok || n != want {
+			t.Fatalf("shard %d: %d grants, balanced=%v: %q", shard, n, ok, f.shards.superuserStatements(shard))
+		}
+	}
+
+	f.shards.exec = nil
+	id = f.queue(catalog.DDLMigration{Statement: "create table u (id int)", Kind: "CREATE TABLE", Scope: "all", Meta: catalog.MigrationMeta{RunAs: "app"}})
+	f.run(t)
+	if m := f.store.get(t, id); m.State != catalog.MigrationComplete {
+		t.Fatalf("%s %s", m.State, states(m))
+	}
+	for shard := int32(0); shard < 3; shard++ {
+		if _, ok := membershipBalanced(f.shards.superuserStatements(shard), "app"); !ok {
+			t.Fatalf("shard %d: %q", shard, f.shards.superuserStatements(shard))
+		}
+	}
+}
+
+func TestApplierRevokesLeftoverMembershipsWhenItStarts(t *testing.T) {
+	f := newApplierFixture(t)
+	f.queue(catalog.DDLMigration{Statement: "create table t (id int)", Kind: "CREATE TABLE", Scope: "home", HomeShard: 1, State: catalog.MigrationRunning,
+		Meta:     catalog.MigrationMeta{RunAs: "app"},
+		PerShard: map[string]catalog.ShardMigration{"1": {State: catalog.ShardRunning, Attempts: 1}}})
+	f.run(t)
+	super := f.shards.superuserStatements(1)
+	sweep, grant := -1, -1
+	for i, st := range super {
+		switch {
+		case strings.Contains(st, `FROM pg_auth_members WHERE member = 'pgshard_ddl'::regrole`):
+			sweep = i
+		case strings.HasPrefix(st, `GRANT "app"`):
+			grant = i
+		}
+	}
+	if sweep < 0 || grant < 0 || sweep > grant {
+		t.Fatalf("leftover memberships are revoked before the first grant: %q", super)
+	}
+	if _, ok := membershipBalanced(super, "app"); !ok {
+		t.Fatalf("resumed step left a membership: %q", super)
 	}
 }
 

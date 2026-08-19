@@ -92,16 +92,24 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
    takes queued and running migrations oldest first, one at a time, and
    runs each on its targets in shard order. Client statements never run on
    a superuser session: the applier logs into the shard's primary as
-   `pgshard_ddl`, a `NOSUPERUSER NOBYPASSRLS CREATEDB CREATEROLE` login it
-   provisions on every shard through the admin DSN
-   (`--shard-dsn`/`--shard-dsn-template`) with a password generated per
-   controller process, grants `<client role> TO pgshard_ddl WITH SET TRUE,
-   INHERIT FALSE` and then `SET ROLE <client role>`, so ownership and
-   privilege checks are the client's. A function the statement evaluates
-   (a `CHECK` or foreign-key validation, a default) that does `RESET ROLE`
-   lands on `pgshard_ddl`, which can neither `ALTER ROLE … SUPERUSER` nor
-   `SET SESSION AUTHORIZATION`. A superuser client role is refused (`42501`):
-   DDL through the router runs as plain roles only.
+   `pgshard_ddl`, a `NOSUPERUSER NOINHERIT NOCREATEDB NOCREATEROLE
+   NOBYPASSRLS` login with no privileges of its own that it provisions on
+   every shard through the admin DSN (`--shard-dsn`/`--shard-dsn-template`)
+   with a password generated per controller process, grants `<client role>
+   TO pgshard_ddl WITH SET TRUE, INHERIT FALSE` and then `SET ROLE <client
+   role>`, so ownership and privilege checks are the client's — `CREATE
+   ROLE` / `CREATE DATABASE` through the router need `CREATEROLE` /
+   `CREATEDB` on the client role, not on `pgshard_ddl`. The membership is
+   revoked (`REVOKE <client role> FROM pgshard_ddl`) as soon as the shard's
+   statement or step ends, whether it applied or failed, and when the
+   controller first touches a shard it revokes every membership
+   `pgshard_ddl` still holds from a process that died mid-step. A function
+   the statement evaluates (a `CHECK` or foreign-key validation, a default)
+   that does `RESET ROLE` therefore lands on a role that owns nothing, can
+   neither `ALTER ROLE … SUPERUSER` nor `SET SESSION AUTHORIZATION`, and
+   can `SET ROLE` only back into the client it is running for — never into
+   another tenant's role (`42501`). A superuser client role is refused
+   (`42501`): DDL through the router runs as plain roles only.
    * `direct`: `SET lock_timeout = '2s'; BEGIN; <statement>; COMMIT`.
    * `concurrent`: `SET lock_timeout = '2s'; <statement>` outside a
      transaction; when `CREATE INDEX CONCURRENTLY` fails and leaves an
