@@ -47,7 +47,7 @@ func newResolverFixtureWith(t *testing.T, opts ...string) *resolverFixture {
 	f := &resolverFixture{t: t, pool: pool}
 	dsns := map[ShardRef]string{}
 	for _, id := range []int{0, 1} {
-		sdsn := startPostgresWith(t, append([]string{"-c max_prepared_transactions=16"}, opts...)...)
+		sdsn := startPostgresWith(t, append([]string{"-c max_prepared_transactions=16", "-c wal_level=logical"}, opts...)...)
 		f.shards = append(f.shards, sdsn)
 		dsns[ShardRef{Set: "default", ID: int32(id)}] = sdsn
 		mustExec(t, conn, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch)

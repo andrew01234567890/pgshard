@@ -111,11 +111,15 @@ Status tables are written by `pgshard_system`; `pgshard_admin` and
 | `workflows` | `id` (uuid), `kind`, `state`, `spec`, `status`, `journal_ids`, `created_at`, `updated_at`, `error` |
 | `migrations` | DDL/DCL migrations (`docs/ddl.md`): `id` (uuid), `database`, `statement`, `kind`, `strategy` (`direct`, `concurrent`), `scope` (`all`, `home`, `existing`), `home_shard`, `state` (`queued`, `running`, `complete`, `failed`), `meta` (jsonb: run_as, object, role/verifier, roles delta, database, steps of a multistep migration), `per_shard` (jsonb per shard: state, attempts, step, error, sqlstate), `error`, `created_at`, `updated_at`, `finished_at` |
 | `xact_decisions` | Two-phase commit outcomes: `gid`, `state` (`preparing`, `commit`, `abort`), `participants`, `participant_xids` (since `0006`: the participants' `pg_current_xact_id()` in the same order, so a restore can tell a committed transaction from one that never happened), `created_at`, `decided_at` |
-| `streams` | `name`, `spec`, `position`, `state` |
+| `streams` | Change streams: `name`, `spec`, `position`, `state` (`creating`, `active`, `lost`), and since migration `0009` `database`, `two_phase`, `created_at`; `pgshard_admin` may insert, update and delete |
+| `stream_status` | Since `0009`: per `(stream, shard_set, shard_id)` the slot name, `wal_status` (`lost` once invalidated, `missing` when absent), `invalidation_reason`, `confirmed_flush_lsn`, `restart_lsn`, `active`, `updated_at`; written by the controller's stream monitor |
 | `sequences` | Global sequences: `name`, `next_value`, `block_size`. Since migration `0005` `pgshard_admin` may also insert, update and delete rows (declaring a sequence or changing its block size), and routers allocate through `pgshard.allocate_sequence_block(name, n)`, a `SECURITY DEFINER` function (executable by `pgshard_admin`) that creates the row on first use, moves `next_value` past a block of `n` values (`block_size` when `n` is `NULL`) in one `UPDATE … RETURNING` and returns `(block_start, block_end)`. |
 | `restore_points` | `id` (uuid), `name` (unique), `shard_map_generation`, `per_group` (jsonb: `{group: {lsn, timeline, wal_segment}}`), `certified` (since `0006`: writes were paused and two-phase commits drained when the points were taken), `created_at` |
 | `serving` | `shard_set`, `generation`, `published_at` |
 | `shard_map_generation` | Single row: `generation`, `updated_at`, and since `0006` the cluster write fence: `write_fence`, `write_fence_reason`, `write_fenced_at`. Routers hold new writes while `write_fence` is set (see [router.md](router.md#write-fence)); the barrier workflow raises it and a restored catalog carries it until the restore is reconciled. |
+
+Migration versions are strictly increasing but need not be contiguous;
+the loader rejects duplicate versions only.
 
 ### Serving notifications
 

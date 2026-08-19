@@ -34,6 +34,9 @@ type AgentClient interface {
 	// fenced at the agent's current epoch, so it never changes roles.
 	// It returns the settings hash the agent loaded.
 	Reload(ctx context.Context, addr string) (string, error)
+	// SetSynchronizedStandbySlots tells the primary's agent which physical
+	// slots failover slots must wait for; it returns the slots applied.
+	SetSynchronizedStandbySlots(ctx context.Context, addr string, slots []string) ([]string, error)
 }
 
 // GRPCAgentClient is the production AgentClient.
@@ -251,4 +254,26 @@ func (c GRPCAgentClient) Info(ctx context.Context, addr string) (RepoInfo, error
 		info.Backups = append(info.Backups, backupResultFromProto(b))
 	}
 	return info, nil
+}
+
+// SetSynchronizedStandbySlots reads the agent's epoch and calls
+// Agent.SetSynchronizedStandbySlots at that epoch.
+func (c GRPCAgentClient) SetSynchronizedStandbySlots(ctx context.Context, addr string, slots []string) ([]string, error) {
+	conn, cl, err := c.dial(ctx, addr)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close() }()
+	st, err := cl.Status(ctx, &pgshardv1.StatusRequest{})
+	if err != nil {
+		return nil, err
+	}
+	resp, err := cl.SetSynchronizedStandbySlots(ctx, &pgshardv1.SetSynchronizedStandbySlotsRequest{Epoch: st.GetEpoch(), Slots: slots})
+	if err != nil {
+		return nil, err
+	}
+	if e := resp.GetError(); e != nil {
+		return nil, fmt.Errorf("set synchronized standby slots: %s (%s)", e.GetMessage(), e.GetSqlstate())
+	}
+	return resp.GetApplied(), nil
 }

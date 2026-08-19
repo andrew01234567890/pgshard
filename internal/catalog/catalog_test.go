@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -35,6 +36,22 @@ func TestMigrations(t *testing.T) {
 	}
 	if len(ms) < 3 || ms[0].Version != 1 || ms[0].Name != "0001_roles_and_schema" {
 		t.Fatalf("unexpected migrations: %+v", ms)
+	}
+}
+
+func TestMigrationsFrom(t *testing.T) {
+	gap := fstest.MapFS{"schema/0001_a.sql": {Data: []byte("a")}, "schema/0003_c.sql": {Data: []byte("c")}, "schema/notes.txt": {Data: []byte("x")}}
+	ms, err := migrationsFrom(gap)
+	if err != nil || len(ms) != 2 || ms[1].Version != 3 || ms[1].Name != "0003_c" {
+		t.Fatalf("gap: %v %+v", err, ms)
+	}
+	dup := fstest.MapFS{"schema/0001_a.sql": {Data: []byte("a")}, "schema/0001_b.sql": {Data: []byte("b")}}
+	if _, err := migrationsFrom(dup); err == nil {
+		t.Fatal("duplicate versions accepted")
+	}
+	bad := fstest.MapFS{"schema/x.sql": {Data: []byte("a")}}
+	if _, err := migrationsFrom(bad); err == nil {
+		t.Fatal("bad name accepted")
 	}
 }
 

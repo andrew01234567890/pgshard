@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 	"github.com/andrew01234567890/pgshard/internal/cli"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
@@ -57,6 +58,8 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	maxLifetime := fs.Duration("backend-max-lifetime", time.Hour, "retire backends older than this")
 	maxIdle := fs.Duration("backend-max-idle", 10*time.Minute, "close backends idle longer than this")
 	drain := fs.Duration("drain-timeout", 30*time.Second, "time to let in-flight transactions finish on shutdown")
+	streamDSN := fs.String("stream-dsn", "", "superuser DSN for change-stream replication connections (enables Stream)")
+	streamShard := fs.String("stream-shard", "", "group name used in stream slot names (default derived from --shard-set/--shard-id)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return cli.ExitOK
@@ -96,7 +99,15 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	}
 	pool := pooler.NewPool(pooler.PoolConfig{MaxBackends: *maxBackends, MaxPerRole: *maxPerRole,
 		MaxLifetime: *maxLifetime, MaxIdleTime: *maxIdle}, dialer)
-	srv := pooler.NewServer(pooler.Config{Pool: pool, Source: source, Dialer: dialer, Database: *database, Logger: logger})
+	if *streamShard == "" {
+		set := *shardSet
+		if set == "" {
+			set = "default"
+		}
+		*streamShard = catalog.GroupName(set, int32(*shardID))
+	}
+	srv := pooler.NewServer(pooler.Config{Pool: pool, Source: source, Dialer: dialer, Database: *database, Logger: logger,
+		Stream: pooler.StreamConfig{DSN: *streamDSN, Shard: *streamShard}})
 
 	l, err := net.Listen("tcp", *listen)
 	if err != nil {

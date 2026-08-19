@@ -40,6 +40,14 @@ service Agent {
   rpc DropSlot(DropSlotRequest) returns (DropSlotResponse);
   // ListSlots lists replication slots. Read-only.
   rpc ListSlots(ListSlotsRequest) returns (ListSlotsResponse);
+  // CreateStreamSlot creates the failover-enabled pgoutput slot of a change
+  // stream on this shard, creating the FOR ALL TABLES publication if needed.
+  rpc CreateStreamSlot(CreateStreamSlotRequest) returns (CreateStreamSlotResponse);
+  // DropStreamSlot drops the slot of a change stream on this shard.
+  rpc DropStreamSlot(DropStreamSlotRequest) returns (DropStreamSlotResponse);
+  // SetSynchronizedStandbySlots sets synchronized_standby_slots to the
+  // given physical slots, keeping only those that exist and are active.
+  rpc SetSynchronizedStandbySlots(SetSynchronizedStandbySlotsRequest) returns (SetSynchronizedStandbySlotsResponse);
   // Backup takes a base or incremental backup.
   rpc Backup(BackupRequest) returns (BackupResponse);
   // RestoreInfo reports the backup repository contents. Read-only.
@@ -247,6 +255,66 @@ message Slot {
   bool active = 5;
   uint64 restart_lsn = 6;
   uint64 confirmed_flush_lsn = 7;
+  // pg_replication_slots.wal_status: reserved, extended, unreserved or lost.
+  string wal_status = 8;
+  // pg_replication_slots.invalidation_reason; empty while valid.
+  string invalidation_reason = 9;
+  // True on a standby when the slot was synchronized from the primary.
+  bool synced = 10;
+  bool temporary = 11;
+  bool two_phase = 12;
+  // Database the logical slot belongs to; empty for physical slots.
+  string database = 13;
+}
+
+// CreateStreamSlotRequest creates a change stream's slot on this shard.
+message CreateStreamSlotRequest {
+  // Caller's view of the current epoch; must EQUAL the last accepted epoch.
+  uint64 epoch = 1;
+  // Stream name; the slot is named pgshard_<stream>_<shard>.
+  string stream = 2;
+  // Database the stream decodes.
+  string database = 3;
+  // Enable two-phase decoding for the slot.
+  bool two_phase = 4;
+}
+
+// CreateStreamSlotResponse reports the created slot.
+message CreateStreamSlotResponse {
+  uint64 epoch = 1;
+  string slot = 2;
+  // Consistent point the slot starts from.
+  uint64 lsn = 3;
+  Error error = 4;
+}
+
+// DropStreamSlotRequest drops a change stream's slot on this shard.
+message DropStreamSlotRequest {
+  // Caller's view of the current epoch; must EQUAL the last accepted epoch.
+  uint64 epoch = 1;
+  string stream = 2;
+}
+
+// DropStreamSlotResponse reports the outcome.
+message DropStreamSlotResponse {
+  uint64 epoch = 1;
+  Error error = 2;
+}
+
+// SetSynchronizedStandbySlotsRequest names the physical slots of the
+// synchronous standbys whose confirmation failover slots must wait for.
+message SetSynchronizedStandbySlotsRequest {
+  // Caller's view of the current epoch; must EQUAL the last accepted epoch.
+  uint64 epoch = 1;
+  repeated string slots = 2;
+}
+
+// SetSynchronizedStandbySlotsResponse reports the slots actually applied.
+message SetSynchronizedStandbySlotsResponse {
+  uint64 epoch = 1;
+  // Subset of the requested slots that exist and are active.
+  repeated string applied = 2;
+  Error error = 3;
 }
 
 // ListSlotsResponse returns the slots.

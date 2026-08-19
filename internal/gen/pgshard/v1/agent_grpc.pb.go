@@ -32,6 +32,9 @@ const (
 	Agent_CreateSlot_FullMethodName                    = "/pgshard.v1.Agent/CreateSlot"
 	Agent_DropSlot_FullMethodName                      = "/pgshard.v1.Agent/DropSlot"
 	Agent_ListSlots_FullMethodName                     = "/pgshard.v1.Agent/ListSlots"
+	Agent_CreateStreamSlot_FullMethodName              = "/pgshard.v1.Agent/CreateStreamSlot"
+	Agent_DropStreamSlot_FullMethodName                = "/pgshard.v1.Agent/DropStreamSlot"
+	Agent_SetSynchronizedStandbySlots_FullMethodName   = "/pgshard.v1.Agent/SetSynchronizedStandbySlots"
 	Agent_Backup_FullMethodName                        = "/pgshard.v1.Agent/Backup"
 	Agent_RestoreInfo_FullMethodName                   = "/pgshard.v1.Agent/RestoreInfo"
 	Agent_Expire_FullMethodName                        = "/pgshard.v1.Agent/Expire"
@@ -78,6 +81,14 @@ type AgentClient interface {
 	DropSlot(ctx context.Context, in *DropSlotRequest, opts ...grpc.CallOption) (*DropSlotResponse, error)
 	// ListSlots lists replication slots. Read-only.
 	ListSlots(ctx context.Context, in *ListSlotsRequest, opts ...grpc.CallOption) (*ListSlotsResponse, error)
+	// CreateStreamSlot creates the failover-enabled pgoutput slot of a change
+	// stream on this shard, creating the FOR ALL TABLES publication if needed.
+	CreateStreamSlot(ctx context.Context, in *CreateStreamSlotRequest, opts ...grpc.CallOption) (*CreateStreamSlotResponse, error)
+	// DropStreamSlot drops the slot of a change stream on this shard.
+	DropStreamSlot(ctx context.Context, in *DropStreamSlotRequest, opts ...grpc.CallOption) (*DropStreamSlotResponse, error)
+	// SetSynchronizedStandbySlots sets synchronized_standby_slots to the
+	// given physical slots, keeping only those that exist and are active.
+	SetSynchronizedStandbySlots(ctx context.Context, in *SetSynchronizedStandbySlotsRequest, opts ...grpc.CallOption) (*SetSynchronizedStandbySlotsResponse, error)
 	// Backup takes a base or incremental backup.
 	Backup(ctx context.Context, in *BackupRequest, opts ...grpc.CallOption) (*BackupResponse, error)
 	// RestoreInfo reports the backup repository contents. Read-only.
@@ -217,6 +228,36 @@ func (c *agentClient) ListSlots(ctx context.Context, in *ListSlotsRequest, opts 
 	return out, nil
 }
 
+func (c *agentClient) CreateStreamSlot(ctx context.Context, in *CreateStreamSlotRequest, opts ...grpc.CallOption) (*CreateStreamSlotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CreateStreamSlotResponse)
+	err := c.cc.Invoke(ctx, Agent_CreateStreamSlot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *agentClient) DropStreamSlot(ctx context.Context, in *DropStreamSlotRequest, opts ...grpc.CallOption) (*DropStreamSlotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DropStreamSlotResponse)
+	err := c.cc.Invoke(ctx, Agent_DropStreamSlot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *agentClient) SetSynchronizedStandbySlots(ctx context.Context, in *SetSynchronizedStandbySlotsRequest, opts ...grpc.CallOption) (*SetSynchronizedStandbySlotsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetSynchronizedStandbySlotsResponse)
+	err := c.cc.Invoke(ctx, Agent_SetSynchronizedStandbySlots_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *agentClient) Backup(ctx context.Context, in *BackupRequest, opts ...grpc.CallOption) (*BackupResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(BackupResponse)
@@ -324,6 +365,14 @@ type AgentServer interface {
 	DropSlot(context.Context, *DropSlotRequest) (*DropSlotResponse, error)
 	// ListSlots lists replication slots. Read-only.
 	ListSlots(context.Context, *ListSlotsRequest) (*ListSlotsResponse, error)
+	// CreateStreamSlot creates the failover-enabled pgoutput slot of a change
+	// stream on this shard, creating the FOR ALL TABLES publication if needed.
+	CreateStreamSlot(context.Context, *CreateStreamSlotRequest) (*CreateStreamSlotResponse, error)
+	// DropStreamSlot drops the slot of a change stream on this shard.
+	DropStreamSlot(context.Context, *DropStreamSlotRequest) (*DropStreamSlotResponse, error)
+	// SetSynchronizedStandbySlots sets synchronized_standby_slots to the
+	// given physical slots, keeping only those that exist and are active.
+	SetSynchronizedStandbySlots(context.Context, *SetSynchronizedStandbySlotsRequest) (*SetSynchronizedStandbySlotsResponse, error)
 	// Backup takes a base or incremental backup.
 	Backup(context.Context, *BackupRequest) (*BackupResponse, error)
 	// RestoreInfo reports the backup repository contents. Read-only.
@@ -385,6 +434,15 @@ func (UnimplementedAgentServer) DropSlot(context.Context, *DropSlotRequest) (*Dr
 }
 func (UnimplementedAgentServer) ListSlots(context.Context, *ListSlotsRequest) (*ListSlotsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListSlots not implemented")
+}
+func (UnimplementedAgentServer) CreateStreamSlot(context.Context, *CreateStreamSlotRequest) (*CreateStreamSlotResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CreateStreamSlot not implemented")
+}
+func (UnimplementedAgentServer) DropStreamSlot(context.Context, *DropStreamSlotRequest) (*DropStreamSlotResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DropStreamSlot not implemented")
+}
+func (UnimplementedAgentServer) SetSynchronizedStandbySlots(context.Context, *SetSynchronizedStandbySlotsRequest) (*SetSynchronizedStandbySlotsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SetSynchronizedStandbySlots not implemented")
 }
 func (UnimplementedAgentServer) Backup(context.Context, *BackupRequest) (*BackupResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Backup not implemented")
@@ -626,6 +684,60 @@ func _Agent_ListSlots_Handler(srv interface{}, ctx context.Context, dec func(int
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Agent_CreateStreamSlot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateStreamSlotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).CreateStreamSlot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_CreateStreamSlot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).CreateStreamSlot(ctx, req.(*CreateStreamSlotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Agent_DropStreamSlot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DropStreamSlotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).DropStreamSlot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_DropStreamSlot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).DropStreamSlot(ctx, req.(*DropStreamSlotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Agent_SetSynchronizedStandbySlots_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetSynchronizedStandbySlotsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).SetSynchronizedStandbySlots(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_SetSynchronizedStandbySlots_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).SetSynchronizedStandbySlots(ctx, req.(*SetSynchronizedStandbySlotsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Agent_Backup_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(BackupRequest)
 	if err := dec(in); err != nil {
@@ -802,6 +914,18 @@ var Agent_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListSlots",
 			Handler:    _Agent_ListSlots_Handler,
+		},
+		{
+			MethodName: "CreateStreamSlot",
+			Handler:    _Agent_CreateStreamSlot_Handler,
+		},
+		{
+			MethodName: "DropStreamSlot",
+			Handler:    _Agent_DropStreamSlot_Handler,
+		},
+		{
+			MethodName: "SetSynchronizedStandbySlots",
+			Handler:    _Agent_SetSynchronizedStandbySlots_Handler,
 		},
 		{
 			MethodName: "Backup",

@@ -51,8 +51,10 @@ type Migration struct {
 }
 
 // Migrations returns the embedded migrations in version order.
-func Migrations() ([]Migration, error) {
-	entries, err := fs.ReadDir(schemaFS, "schema")
+func Migrations() ([]Migration, error) { return migrationsFrom(schemaFS) }
+
+func migrationsFrom(fsys fs.FS) ([]Migration, error) {
+	entries, err := fs.ReadDir(fsys, "schema")
 	if err != nil {
 		return nil, err
 	}
@@ -66,7 +68,7 @@ func Migrations() ([]Migration, error) {
 		if _, err := fmt.Sscanf(name, "%04d_", &version); err != nil || version <= 0 {
 			return nil, fmt.Errorf("catalog: bad migration file name %q", name)
 		}
-		body, err := schemaFS.ReadFile("schema/" + name)
+		body, err := fs.ReadFile(fsys, "schema/"+name)
 		if err != nil {
 			return nil, err
 		}
@@ -80,8 +82,8 @@ func Migrations() ([]Migration, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Version < out[j].Version })
 	for i := range out {
-		if out[i].Version != i+1 {
-			return nil, fmt.Errorf("catalog: migration versions are not contiguous at %d", out[i].Version)
+		if i > 0 && out[i].Version == out[i-1].Version {
+			return nil, fmt.Errorf("catalog: duplicate migration version %d", out[i].Version)
 		}
 	}
 	return out, nil

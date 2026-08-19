@@ -30,6 +30,8 @@ type Config struct {
 	Logger   *slog.Logger
 	// HealthInterval spaces Health stream updates; zero means 1s.
 	HealthInterval time.Duration
+	// Stream configures the change-stream RPCs.
+	Stream StreamConfig
 }
 
 // Server implements the Pooler gRPC service.
@@ -39,6 +41,8 @@ type Server struct {
 
 	mu       sync.Mutex
 	sessions map[string]*session
+	// readers holds the one admitted change-stream reader per slot.
+	readers  map[string]*streamReader
 	draining atomic.Bool
 	closed   atomic.Bool
 }

@@ -40,6 +40,17 @@
   `CopyDone` and `CopyFail` are relayed; COPY OUT data is streamed back.
 - **Health.** `Health` streams role, lag, epoch, generation and `serving`
   (false once draining) from the `Source`.
+- **Stream / Ack.** `Stream` opens the shard's logical slot (`slot`, or
+  `pgshard_<stream>_<group>` derived from `stream` and `--stream-shard`) over
+  a replication connection (`--stream-dsn`) and streams decoded pgoutput v4
+  events in `ChangeBatch`es, one per transaction boundary (commit, prepare,
+  streamed segment, non-transactional message) or per `batch_bytes`
+  (64 KiB cap). `start_lsn` zero resumes from the slot's confirmed position;
+  a `Keepalive` batch is sent when idle; a second reader on the same slot is
+  refused with `FAILED_PRECONDITION`. `Ack(lsn)` advances the slot's
+  `confirmed_flush_lsn` through the reader's standby status update and
+  returns once the server has it. `StreamChanges` is the same stream one
+  event per message. See [streams.md](streams.md).
 
 ## Drain
 

@@ -63,8 +63,8 @@ func startPostgres(t *testing.T, image string) (addr, adminDSN string) {
 	t.Helper()
 	port := freePort(t)
 	script := `initdb -D /tmp/pgdata --auth=trust -U postgres >/dev/null &&
-		 printf 'host all postgres all trust\nhost all all all scram-sha-256\n' >> /tmp/pgdata/pg_hba.conf &&
-		 exec postgres -D /tmp/pgdata -c listen_addresses='*'`
+		 printf 'host all postgres all trust\nhost replication postgres all trust\nhost all all all scram-sha-256\n' >> /tmp/pgdata/pg_hba.conf &&
+		 exec postgres -D /tmp/pgdata -c listen_addresses='*' -c wal_level=logical -c max_prepared_transactions=16`
 	out, err := exec.Command("docker", "run", "-d", "--rm", "-p", fmt.Sprintf("127.0.0.1:%d:5432", port), "--user", "postgres", "--entrypoint", "sh", image, "-ec", script).CombinedOutput()
 	if err != nil {
 		t.Fatalf("docker run: %v: %s", err, out)
@@ -160,7 +160,8 @@ func runPGSuite(t *testing.T, image string) {
 	src := NewStaticSource(View{Generation: 3, Epoch: 1, Role: pgshardv1.HealthStatus_ROLE_PRIMARY, Serving: true})
 	dialer := Dialer{Address: addr, Timeout: 5 * time.Second}
 	srv := NewServer(Config{Pool: NewPool(PoolConfig{MaxBackends: 4}, dialer), Source: src, Dialer: dialer, Database: "postgres",
-		Logger: slog.New(slog.NewTextHandler(&strings.Builder{}, nil))})
+		Logger: slog.New(slog.NewTextHandler(&strings.Builder{}, nil)),
+		Stream: StreamConfig{DSN: adminDSN, Shard: "shard0", Heartbeat: 300 * time.Millisecond}})
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -182,6 +183,7 @@ func runPGSuite(t *testing.T, image string) {
 	t.Run("copy_in", h.testCopyIn)
 	t.Run("stale_generation", h.testStaleGeneration)
 	t.Run("cancel", h.testCancel)
+	t.Run("change_stream", h.testStream)
 	t.Run("drain_lets_txn_commit", h.testDrain)
 }
 
