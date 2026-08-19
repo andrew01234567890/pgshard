@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -30,12 +31,14 @@ const contentSecurityPolicy = "default-src 'none'; script-src 'self'; style-src 
 
 // Server is the admin HTTP handler.
 type Server struct {
-	Client    client.Reader
-	Catalog   CatalogSource
-	Notifier  *Notifier
-	Namespace string
-	Logger    *slog.Logger
-	Tick      time.Duration
+	Client  client.Reader
+	Catalog CatalogSource
+	// Migrations is set when Catalog also reads migrations; nil hides the panel.
+	Migrations MigrationSource
+	Notifier   *Notifier
+	Namespace  string
+	Logger     *slog.Logger
+	Tick       time.Duration
 
 	tmpl *template.Template
 	mux  *http.ServeMux
@@ -49,11 +52,14 @@ func NewServer(c client.Reader, catalogSrc CatalogSource, n *Notifier, namespace
 	if n == nil {
 		n = NewNotifier()
 	}
-	tmpl, err := template.New("").Funcs(template.FuncMap{"bytes": humanBytes, "bytesp": humanBytesPtr, "when": humanTime}).ParseFS(assets, "templates/*.html")
+	tmpl, err := template.New("").Funcs(template.FuncMap{"bytes": humanBytes, "bytesp": humanBytesPtr, "when": humanTime, "whenp": humanTimePtr}).ParseFS(assets, "templates/*.html")
 	if err != nil {
 		return nil, err
 	}
 	s := &Server{Client: c, Catalog: catalogSrc, Notifier: n, Namespace: namespace, Logger: logger, Tick: RefreshInterval, tmpl: tmpl}
+	if ms, ok := catalogSrc.(MigrationSource); ok {
+		s.Migrations = ms
+	}
 	static, err := fs.Sub(assets, "static")
 	if err != nil {
 		return nil, err
@@ -70,6 +76,12 @@ func NewServer(c client.Reader, catalogSrc CatalogSource, n *Notifier, namespace
 	mux.HandleFunc("GET /api/v1/backups", s.handleAPIBackups)
 	mux.HandleFunc("GET /api/v1/restores", s.handleAPIRestores)
 	mux.HandleFunc("GET /api/v1/restore-points", s.handleAPIRestorePoints)
+	mux.HandleFunc("GET /migrations", s.handleMigrations)
+	mux.HandleFunc("GET /migrations/table", s.handleMigrationsFragment)
+	mux.HandleFunc("GET /migrations/{id}", s.handleMigration)
+	mux.HandleFunc("GET /migrations/{id}/detail", s.handleMigrationFragment)
+	mux.HandleFunc("GET /api/v1/migrations", s.handleAPIMigrations)
+	mux.HandleFunc("GET /api/v1/migrations/{id}", s.handleAPIMigration)
 	mux.HandleFunc("GET /api/v1/clusters", s.handleAPIClusters)
 	mux.HandleFunc("GET /api/v1/clusters/{ns}/{name}", s.handleAPICluster)
 	mux.HandleFunc("GET /events", s.handleEvents)
@@ -190,8 +202,17 @@ func (s *Server) handleAPIRestorePoints(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, out)
 }
 
-func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
+func (s *Server) topology(r *http.Request) (*Topology, error) {
 	t, err := BuildTopology(r.Context(), s.Client, s.Catalog, r.PathValue("ns"), r.PathValue("name"))
+	if err != nil {
+		return nil, err
+	}
+	t.DDL = s.ddlSummary(r.Context())
+	return t, nil
+}
+
+func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
+	t, err := s.topology(r)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -200,7 +221,7 @@ func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTopologyFragment(w http.ResponseWriter, r *http.Request) {
-	t, err := BuildTopology(r.Context(), s.Client, s.Catalog, r.PathValue("ns"), r.PathValue("name"))
+	t, err := s.topology(r)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -218,7 +239,7 @@ func (s *Server) handleAPIClusters(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAPICluster(w http.ResponseWriter, r *http.Request) {
-	t, err := BuildTopology(r.Context(), s.Client, s.Catalog, r.PathValue("ns"), r.PathValue("name"))
+	t, err := s.topology(r)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -287,7 +308,7 @@ func (s *Server) render(w http.ResponseWriter, name string, data any) {
 
 func (s *Server) fail(w http.ResponseWriter, err error) {
 	code := http.StatusInternalServerError
-	if apierrors.IsNotFound(err) {
+	if apierrors.IsNotFound(err) || errors.Is(err, pgx.ErrNoRows) {
 		code = http.StatusNotFound
 	} else if errors.Is(err, context.Canceled) {
 		code = 499
@@ -323,9 +344,19 @@ func humanBytesPtr(n *int64) string {
 	return humanBytes(*n)
 }
 
-func humanTime(t *time.Time) string {
+func humanTime(t any) string {
+	switch v := t.(type) {
+	case time.Time:
+		return v.UTC().Format("2006-01-02 15:04:05")
+	case *time.Time:
+		return humanTimePtr(v)
+	}
+	return "\u2014"
+}
+
+func humanTimePtr(t *time.Time) string {
 	if t == nil {
 		return "\u2014"
 	}
-	return t.UTC().Format(time.RFC3339)
+	return humanTime(*t)
 }

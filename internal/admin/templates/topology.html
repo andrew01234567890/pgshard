@@ -1,3 +1,7 @@
+{{with .DDL}}<section class="card" aria-labelledby="ddl-card">
+<h2 id="ddl-card"><a href="/migrations">DDL</a></h2>
+{{if .Error}}<p class="bad">catalog: {{.Error}}</p>{{else}}<p><span class="state-running">{{.Counts.Running}}</span> running · <span class="state-queued">{{.Counts.Queued}}</span> queued · <span class="state-failed">{{.Counts.Failed}}</span> failed</p>{{end}}
+</section>{{end}}
 <h2>Conditions</h2>
 {{if .Conditions}}<table>
 <thead><tr><th>Type</th><th>Status</th><th>Reason</th><th>Message</th></tr></thead>

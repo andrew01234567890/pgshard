@@ -113,6 +113,8 @@ type DDLMigration struct {
 	PerShard  map[string]ShardMigration
 	Error     string
 	CreatedAt time.Time
+	// FinishedAt is set once the migration is complete or failed.
+	FinishedAt *time.Time
 }
 
 // RowQuerier is satisfied by *pgx.Conn, pgx.Tx and *pgxpool.Pool.
@@ -150,7 +152,7 @@ func EnqueueMigration(ctx context.Context, db RowQuerier, m DDLMigration) (strin
 	return id, nil
 }
 
-const migrationColumns = `id::text, database, statement, kind, strategy, scope, home_shard, state, meta, per_shard, coalesce(error, ''), created_at`
+const migrationColumns = `id::text, database, statement, kind, strategy, scope, home_shard, state, meta, per_shard, coalesce(error, ''), created_at, finished_at`
 
 // LoadMigration reads one migration by id.
 func LoadMigration(ctx context.Context, db RowQuerier, id string) (DDLMigration, error) {
@@ -177,13 +179,75 @@ func PendingMigrations(ctx context.Context, db Querier) ([]DDLMigration, error) 
 	return collectMigrations(rows)
 }
 
+// MigrationFilter narrows ListMigrations; empty fields match everything.
+type MigrationFilter struct {
+	Database string
+	State    string
+	Limit    int
+	Offset   int
+}
+
+// ListMigrations returns the newest migrations matching f and the total count
+// of matching rows, for paging.
+func ListMigrations(ctx context.Context, db RowQuerier, f MigrationFilter) ([]DDLMigration, int, error) {
+	where := `WHERE ($1 = '' OR database = $1) AND ($2 = '' OR state = $2)`
+	var total int
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM pgshard.migrations `+where, f.Database, f.State).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := db.Query(ctx, `SELECT `+migrationColumns+` FROM pgshard.migrations `+where+` ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4`,
+		f.Database, f.State, limit, f.Offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	ms, err := collectMigrations(rows)
+	return ms, total, err
+}
+
+// MigrationCounts is the number of migrations per state.
+type MigrationCounts struct {
+	Queued  int
+	Running int
+	Failed  int
+}
+
+// CountMigrations tallies queued, running and failed migrations.
+func CountMigrations(ctx context.Context, db Querier) (MigrationCounts, error) {
+	rows, err := db.Query(ctx, `SELECT state, count(*) FROM pgshard.migrations WHERE state IN ('queued', 'running', 'failed') GROUP BY state`)
+	if err != nil {
+		return MigrationCounts{}, err
+	}
+	defer rows.Close()
+	var c MigrationCounts
+	for rows.Next() {
+		var state string
+		var n int
+		if err := rows.Scan(&state, &n); err != nil {
+			return MigrationCounts{}, err
+		}
+		switch state {
+		case MigrationQueued:
+			c.Queued = n
+		case MigrationRunning:
+			c.Running = n
+		case MigrationFailed:
+			c.Failed = n
+		}
+	}
+	return c, rows.Err()
+}
+
 func collectMigrations(rows pgx.Rows) ([]DDLMigration, error) {
 	defer rows.Close()
 	var out []DDLMigration
 	for rows.Next() {
 		var m DDLMigration
 		var meta, perShard []byte
-		if err := rows.Scan(&m.ID, &m.Database, &m.Statement, &m.Kind, &m.Strategy, &m.Scope, &m.HomeShard, &m.State, &meta, &perShard, &m.Error, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.Database, &m.Statement, &m.Kind, &m.Strategy, &m.Scope, &m.HomeShard, &m.State, &meta, &perShard, &m.Error, &m.CreatedAt, &m.FinishedAt); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal(meta, &m.Meta); err != nil {

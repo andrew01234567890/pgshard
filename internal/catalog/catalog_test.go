@@ -400,6 +400,34 @@ func runSuite(t *testing.T, img pgImage) {
 		}
 	})
 
+	t.Run("list_and_count_migrations", func(t *testing.T) {
+		failedID, err := EnqueueMigration(ctx, conn, DDLMigration{Database: "other", Statement: "create table z (id int)", Kind: "CREATE TABLE", Strategy: "direct", Scope: "all"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		failed, _ := LoadMigration(ctx, conn, failedID)
+		failed.State, failed.Error = MigrationFailed, "boom"
+		if err := SaveMigrationProgress(ctx, conn, failed); err != nil {
+			t.Fatal(err)
+		}
+		all, total, err := ListMigrations(ctx, conn, MigrationFilter{})
+		if err != nil || total < 2 || len(all) != total || all[0].ID != failedID || all[0].FinishedAt == nil {
+			t.Fatalf("list all: total=%d len=%d first=%v err=%v", total, len(all), all, err)
+		}
+		page, total2, err := ListMigrations(ctx, conn, MigrationFilter{Limit: 1, Offset: 1})
+		if err != nil || total2 != total || len(page) != 1 || page[0].ID == failedID {
+			t.Fatalf("paging: %v %d %v", page, total2, err)
+		}
+		byDB, _, err := ListMigrations(ctx, conn, MigrationFilter{Database: "other", State: MigrationFailed})
+		if err != nil || len(byDB) != 1 || byDB[0].ID != failedID {
+			t.Fatalf("filter: %v %v", byDB, err)
+		}
+		counts, err := CountMigrations(ctx, conn)
+		if err != nil || counts.Failed != 1 || counts.Running != 1 {
+			t.Fatalf("counts: %+v %v", counts, err)
+		}
+	})
+
 	t.Run("sequence_blocks", func(t *testing.T) {
 		mustExec(t, conn, `UPDATE pgshard.tables SET sequence_columns = '{id}' WHERE database = 'app' AND table_name = 'orders'`)
 		tables, err := ListTables(ctx, conn, "app")

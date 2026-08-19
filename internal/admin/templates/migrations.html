@@ -1,0 +1,22 @@
+{{template "head" "Migrations"}}
+<header>
+<h1><a href="/">clusters</a> / migrations</h1>
+<span class="meta">DDL and DCL migrations from the catalog</span>
+<nav class="tabs" aria-label="Sections"><a href="/">Clusters</a><a href="/backups">Backups</a><a href="/migrations" aria-current="page">Migrations</a></nav>
+</header>
+<form method="get" action="/migrations" class="filters">
+<label for="f-database">Database</label>
+<input id="f-database" name="database" type="text" value="{{.Database}}" placeholder="any">
+<label for="f-state">State</label>
+<select id="f-state" name="state">
+<option value="">any</option>
+{{$sel := .State}}{{range .States}}<option value="{{.}}"{{if eq . $sel}} selected{{end}}>{{.}}</option>{{end}}
+</select>
+<button type="submit">Filter</button>
+</form>
+<div id="migrations" data-live hx-get="{{.FragmentURL}}" hx-trigger="topology" hx-swap="innerHTML">
+{{template "migrations_table.html" .}}
+</div>
+<p class="notice"><a href="/api/v1/migrations?{{if .Database}}database={{.Database}}&amp;{{end}}{{if .State}}state={{.State}}{{end}}">JSON</a></p>
+<script src="/static/app.js" defer></script>
+{{template "foot"}}

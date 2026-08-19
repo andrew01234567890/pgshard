@@ -84,6 +84,7 @@ type Topology struct {
 	Shards             []Shard        `json:"shards"`
 	Catalog            []CatalogShard `json:"catalog,omitempty"`
 	CatalogError       string         `json:"catalogError,omitempty"`
+	DDL                *DDLSummary    `json:"ddl,omitempty"`
 }
 
 // CatalogSource reads the shard status snapshot from the catalog database.

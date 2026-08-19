@@ -17,7 +17,7 @@ pgshard-admin serve [--listen :8081] [--kubeconfig PATH] [--namespace NS] [--cat
 | `--listen` | `:8081` | HTTP listen address. |
 | `--kubeconfig` | in-cluster | Kubeconfig to use outside a pod. |
 | `--namespace` | all namespaces | Restrict the watch and the clusters list to one namespace. |
-| `--catalog-dsn` | none | PostgreSQL DSN of a catalog database; adds the catalog's `pgshard.shard_status` snapshot to the topology page and the certified restore points (`pgshard.restore_points`) to the backups page. |
+| `--catalog-dsn` | none | PostgreSQL DSN of a catalog database; adds the catalog's `pgshard.shard_status` snapshot and a DDL card to the topology page, the certified restore points (`pgshard.restore_points`) to the backups page, and enables the migrations panel. |
 
 `--help` and `--version` behave as in every pgshard command.
 
@@ -35,13 +35,19 @@ pgshard-admin serve [--listen :8081] [--kubeconfig PATH] [--namespace NS] [--cat
 | `/api/v1/backups` | JSON list of backups, newest first. |
 | `/api/v1/restores` | JSON list of restores, newest first. |
 | `/api/v1/restore-points` | JSON list of certified restore points (empty without `--catalog-dsn`). |
+| `/migrations` | DDL migrations panel (needs `--catalog-dsn`): newest first, `?database=` and `?state=` filters, 25 per page (`?page=`). Columns: id, database, kind, strategy, state, created, finished, duration, statement (truncated, expand for the full text), per-shard progress bar (applied/retrying/failed/pending) and the current step of a multistep migration. |
+| `/migrations/{id}` | One migration: statement, steps with status (`pending`, `partial`, `running`, `failed`, `done`), per-shard table (state, step, attempts, last error). A DEGRADED banner appears when the statement applied on some shards and failed on another. |
+| `/migrations/table`, `/migrations/{id}/detail` | The fragments htmx swaps in on refresh. |
+| `/api/v1/migrations`, `/api/v1/migrations/{id}` | JSON documents the pages are rendered from. |
 | `/api/v1/clusters` | JSON clusters list. |
 | `/api/v1/clusters/{ns}/{name}` | JSON topology document the page is rendered from. |
 | `/events` | Server-sent events. A `topology` event is sent on every PgShardCluster, PgShardGroup, PgShardBackupPolicy, PgShardBackup, PgShardRestore or member Pod change seen by the informers, and at least every 2 seconds. |
 | `/healthz` | Liveness and readiness. |
 
-The topology and backups pages open `/events` and reload their fragment on
-each event, so the view follows the cluster without a full page reload.
+The topology, backups and migrations pages open `/events` and reload their
+fragment on each event, so the view follows the cluster without a full page
+reload. The catalog has no notify channel for migrations; the 2 second tick is
+what keeps the migrations panel current.
 
 The backups panel never reads Secrets: policies are shown with the Secret
 *names* their `credentials` and `encryption` references point at, and the
