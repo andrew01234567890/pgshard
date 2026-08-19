@@ -68,7 +68,8 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	go inst.ensureStanzaLoop(ctx, stanzaRetry)
 
 	probes := &Probes{Health: inst, MaxLagBytes: cfg.MaxLagBytes, Peers: cfg.PeerFailsafeURLs,
-		Fenced: func() { fatal(errors.New("primary isolated: self-fencing")) }}
+		IsolationGrace: time.Duration(cfg.IsolationGrace),
+		Fenced:         func() { fatal(errors.New("primary isolated: self-fencing")) }}
 	if lease != nil {
 		probes.KubeReachable = lease.Reachable
 	}

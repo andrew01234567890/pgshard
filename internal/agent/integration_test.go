@@ -115,7 +115,7 @@ func (h *harness) writeConfig(member string, role Role, source string, peers []s
 		"cluster": "it", "shard": "s0", "member": member, "role": string(role),
 		"pgdata": "/var/lib/postgresql/data", "passwordFile": "/cfg/pw",
 		"primaryConninfo": "host=" + h.containerName(source) + " port=5432 user=postgres",
-		"podCIDR":         "0.0.0.0/0", "peerFailsafeURLs": peers,
+		"podCIDR":         "0.0.0.0/0", "peerFailsafeURLs": peers, "isolationGrace": "5s",
 		"lease":           map[string]any{"enabled": false},
 		"shutdownTimeout": "20s",
 	}
@@ -467,6 +467,11 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	for time.Now().Before(deadline) {
 		if docker(t, "inspect", "-f", "{{.State.Running}}", s.container) == "false" {
 			break
+		}
+		// The kubelet keeps probing an unhealthy pod; the grace window only
+		// elapses across probes.
+		if resp, err := http.Get(s.http + "/livez"); err == nil {
+			_ = resp.Body.Close()
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
