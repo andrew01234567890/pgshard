@@ -99,6 +99,13 @@ type Plan struct {
 	Class    StmtClass
 	// Err carries the refusal for Kind Refuse.
 	Err error
+	// Sequences is set for an INSERT into a sharded table whose registered
+	// sequence columns the router fills; the executor runs Sequences.SQL
+	// with the allocated values bound as extra parameters.
+	Sequences *SequenceFill
+	// NextVal names the global sequence a `SELECT nextval('...')` reads;
+	// the router answers it without visiting a shard (Kind SessionLocal).
+	NextVal string
 
 	// merge is how the executor combines shard streams when the plan runs
 	// on more than one shard; mergeErr says why it cannot.

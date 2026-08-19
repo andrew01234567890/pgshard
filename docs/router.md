@@ -8,8 +8,10 @@ resolves every statement to the shards it touches from the catalog snapshot;
 the executor runs plans that need one shard directly, fans read-only
 `SELECT`s over several shards out through a streaming merge (*Scatter*
 below), coordinates transactions that write to several shards with
-two-phase commit (*Transactions* below) and refuses the rest with `0A000`
-until multi-shard writes (M3.5) land. See *Routing* below.
+two-phase commit (*Transactions* below), replicates reference-table writes
+to every shard (*Reference tables* below), fills the global sequence
+columns of sharded tables from the catalog (*Sequences* below) and refuses
+the rest with `0A000`. See *Routing* below.
 
 ## Startup and authentication
 
@@ -93,7 +95,7 @@ placement in `pgshard.table_status` decides:
 | Placement | Reads | Writes | DDL |
 |---|---|---|---|
 | unsharded (or undeclared, database default `unsharded`) | home shard | home shard | home shard |
-| reference | any shard (chosen per session) | refused, `0A000` "writes to reference tables are not available yet (planned for M3.5)" | refused, "DDL fan-out is not available yet" |
+| reference | any shard (chosen per session) | every shard of the set, in the session's transaction (see *Reference tables*) | refused, "DDL fan-out is not available yet" |
 | sharded | shard of the key | shard of the key | refused, "DDL fan-out is not available yet" |
 
 A plan has a `Kind`: `Unsharded`, `EqualUnique` (every sharded table pinned
@@ -203,9 +205,9 @@ waiting is honoured.
 | tables that do not resolve to one shard (joins, subqueries, set operations, an unsharded table joined to a sharded row off the home shard) | cross-shard join is not available yet |
 | `INSERT` without the key in the column list | insert requires the shard key |
 | `INSERT` key that is not a constant or parameter; `INSERT … SELECT` | shard key of an INSERT must be a constant or a parameter; INSERT … SELECT into a sharded table is not available yet |
-| multi-row `INSERT` whose rows hash to different shards | multi-row INSERT spanning shards is not available yet — M3.5 |
+| multi-row `INSERT` whose rows hash to different shards | multi-row INSERT spanning shards is not available yet |
 | `UPDATE … SET key`, `ON CONFLICT DO UPDATE SET key` | shard key is immutable |
-| writes to reference tables | writes to reference tables are not available yet (planned for M3.5) |
+| reference-table write that reads a sharded or unsharded table, or calls a volatile function | a write to reference table … cannot read sharded or unsharded tables; … cannot call now() (see *Reference tables*) |
 | DDL, `TRUNCATE`, `VACUUM`, `LOCK`, `COPY` on sharded or reference tables | DDL fan-out is not available yet; COPY on sharded and reference tables is not available yet |
 | `CREATE TABLE` of a declared sharded table without the key column, or with a PRIMARY KEY/UNIQUE that omits it | sharded table must define its shard key column; primary key or unique constraint (…) must include the shard key |
 | `CREATE VIEW`/`CREATE TABLE AS` over sharded or reference tables | CREATE VIEW over sharded or reference tables is not available yet |
@@ -216,6 +218,100 @@ waiting is honoured.
 DDL on unsharded tables goes to the home shard, an interim until DDL
 fan-out (M4). Reference reads pick a shard from the session id so they
 spread across the shard set.
+
+### Reference tables
+
+A reference table exists on every shard, so `INSERT`, `UPDATE` and `DELETE`
+on one run **the same statement with the same parameters on every shard of
+the set**, inside the session's transaction. Every shard becomes a writing
+participant, so `COMMIT` is two-phase (*Transactions* below); outside a
+transaction the router opens one around the statement and commits it the
+same way before reporting the statement complete. `RETURNING` rows and the
+command tag come from the lowest shard (all shards produce the same). If
+the statement fails on any shard, the shards where it succeeded are put
+into the aborted state as well (an explicit transaction can only be rolled
+back; an implicit one is rolled back by the router), so a reference table
+never diverges. In `pgshard.transaction_mode = single` a reference write on
+a set of two or more shards is refused like any second writable shard.
+
+Because the statement is evaluated independently per shard, the planner
+refuses what would produce different rows on different shards:
+
+- volatile function calls anywhere in the statement — `now()`,
+  `clock_timestamp()`, `statement_timestamp()`, `transaction_timestamp()`,
+  `timeofday()`, `random()`, `random_normal()`, `gen_random_uuid()`,
+  `uuidv4()`, `uuidv7()`, `nextval()`, `currval()`, `lastval()`,
+  `setval()`, `pg_backend_pid()`, `txid_current()`, `pg_current_xact_id()`,
+  `pg_current_wal_lsn()`, `inet_server_addr()`, and `CURRENT_DATE`,
+  `CURRENT_TIME`, `CURRENT_TIMESTAMP`, `LOCALTIME`, `LOCALTIMESTAMP`
+  (`0A000` "a write to reference table … cannot call now(): its value would
+  differ between shards"; compute the value in the client and pass it as a
+  literal or parameter);
+- reading a sharded or unsharded table (`INSERT … SELECT`, `UPDATE … FROM`,
+  a subquery): those rows live on one shard only. Reading other reference
+  tables is fine.
+
+This rule is conservative and only covers what the router can see. Column
+defaults are evaluated by each shard: a reference table whose column
+default is volatile (`DEFAULT now()`, `DEFAULT gen_random_uuid()`, a
+per-shard `serial`) diverges when an `INSERT` omits that column, and the
+router cannot detect it because it does not read the shards' catalogs.
+Declare defaults on reference tables as constants, or always supply the
+column. DDL on reference tables (including such checks at `CREATE TABLE`)
+is M4. `SELECT … FOR UPDATE` on a reference table locks the row on the
+session's shard only.
+
+### Sequences
+
+A `serial`, `bigserial` or `GENERATED … AS IDENTITY` column on a sharded
+table is a per-shard sequence: two shards hand out the same numbers. For
+global uniqueness the router owns the allocation instead. A sharded table
+declares its sequence columns in `pgshard.tables.sequence_columns` (a text
+array, desired state, user-editable), for example
+
+```sql
+UPDATE pgshard.tables SET sequence_columns = '{id}'
+ WHERE database = 'app' AND schema_name = 'public' AND table_name = 'tickets';
+```
+
+Each column is backed by a row of `pgshard.sequences` named
+`<database>.<schema>.<table>.<column>` (`app.public.tickets.id`), created
+on first use with `next_value = 1` and `block_size = 1000`; both fields can
+be edited (`UPDATE pgshard.sequences SET block_size = 100 WHERE name = …`)
+and a sequence can also be declared ahead of time with an `INSERT`. Routers
+allocate through `pgshard.allocate_sequence_block(name, n)` (migration
+0005): one `UPDATE … RETURNING` that moves `next_value` past a block of `n`
+values (the row's `block_size` when `n` is `NULL`) and returns
+`[block_start, block_end]`, so concurrent routers always get disjoint
+blocks. Every router caches one block per sequence and hands values out
+from it in order; a block is never reused, so a router restart or an
+aborted `INSERT` leaves gaps, exactly as PostgreSQL sequences do. Values
+are increasing within one router; across routers they interleave by block.
+
+On an `INSERT … VALUES` into such a table the router fills every registered
+column that is absent from the column list, or given as `DEFAULT` or
+`nextval(...)`: the statement is rewritten with one extra bind parameter
+per row and column (`INSERT INTO tickets (tenant_id, body) VALUES ($1,
+$2)` becomes `… (tenant_id, body, id) VALUES ($1, $2, $3)`) and the
+allocated values are bound as `int8`. `RETURNING id` therefore works, the
+client's parameter description is unchanged (the injected parameters are
+stripped from `ParameterDescription`), and when the sequence column **is
+the shard key** the injected value routes the row. An `INSERT` that supplies
+the column itself is not touched. Simple-protocol statements are executed
+as an unnamed extended-protocol batch for the same reason.
+
+`SELECT nextval('<name>')` with a literal name is answered by the router
+from its block, without visiting a shard, when the name is a registered
+column sequence (`nextval('tickets.id')`, `nextval('public.tickets.id')`;
+an unqualified table is resolved along the search path) or a row of
+`pgshard.sequences` known to the snapshot (`nextval('invoice_numbers')`).
+The result is one `int8` row. Any other `nextval` (a native sequence such
+as `items_id_seq`) goes to the shard as usual — native sequences on sharded
+tables are **not** global. In the extended protocol such a statement must
+be alone in its batch. Both features need the router's catalog connection
+to be allowed to execute `pgshard.allocate_sequence_block` (`pgshard_system`
+or `pgshard_admin`); otherwise they are refused with `0A000` "global
+sequences are not available".
 
 ## Transactions
 

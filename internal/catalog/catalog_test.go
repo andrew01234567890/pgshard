@@ -370,6 +370,100 @@ func runSuite(t *testing.T, img pgImage) {
 			t.Fatalf("unexpected databases %+v", dbs)
 		}
 	})
+
+	t.Run("sequence_blocks", func(t *testing.T) {
+		mustExec(t, conn, `UPDATE pgshard.tables SET sequence_columns = '{id}' WHERE database = 'app' AND table_name = 'orders'`)
+		tables, err := ListTables(ctx, conn, "app")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var orders *Table
+		for i := range tables {
+			if tables[i].TableName == "orders" {
+				orders = &tables[i]
+			}
+		}
+		if orders == nil || len(orders.SequenceColumns) != 1 || orders.SequenceColumns[0] != "id" {
+			t.Fatalf("sequence_columns did not round-trip: %+v", tables)
+		}
+		var start, end int64
+		if err := conn.QueryRow(ctx, `SELECT * FROM pgshard.allocate_sequence_block('app.public.orders.id')`).Scan(&start, &end); err != nil {
+			t.Fatal(err)
+		}
+		if start != 1 || end != 1000 {
+			t.Fatalf("first block [%d, %d], want [1, 1000] (auto-created row, default block_size)", start, end)
+		}
+		if err := conn.QueryRow(ctx, `SELECT * FROM pgshard.allocate_sequence_block('app.public.orders.id', 5)`).Scan(&start, &end); err != nil {
+			t.Fatal(err)
+		}
+		if start != 1001 || end != 1005 {
+			t.Fatalf("second block [%d, %d], want [1001, 1005]", start, end)
+		}
+		_, err = conn.Exec(ctx, `SELECT * FROM pgshard.allocate_sequence_block('app.public.orders.id', 0)`)
+		expectPgError(t, err, "22023", "block size")
+		names, err := ListSequenceNames(ctx, conn)
+		if err != nil || len(names) != 1 || names[0] != "app.public.orders.id" {
+			t.Fatalf("sequence names %v %v", names, err)
+		}
+		// Concurrent callers get disjoint blocks.
+		const workers, per = 8, 25
+		type block struct{ start, end int64 }
+		results := make(chan block, workers*per)
+		errs := make(chan error, workers)
+		for w := 0; w < workers; w++ {
+			go func() {
+				c, err := pgx.Connect(ctx, dsn)
+				if err != nil {
+					errs <- err
+					return
+				}
+				defer func() { _ = c.Close(ctx) }()
+				for i := 0; i < per; i++ {
+					var b block
+					if err := c.QueryRow(ctx, `SELECT * FROM pgshard.allocate_sequence_block('app.public.orders.id', 3)`).Scan(&b.start, &b.end); err != nil {
+						errs <- err
+						return
+					}
+					results <- b
+				}
+				errs <- nil
+			}()
+		}
+		for w := 0; w < workers; w++ {
+			if err := <-errs; err != nil {
+				t.Fatal(err)
+			}
+		}
+		close(results)
+		seen := map[int64]bool{}
+		for b := range results {
+			if b.end-b.start != 2 {
+				t.Fatalf("block %+v is not 3 wide", b)
+			}
+			for v := b.start; v <= b.end; v++ {
+				if seen[v] {
+					t.Fatalf("value %d handed out twice", v)
+				}
+				seen[v] = true
+			}
+		}
+		if len(seen) != workers*per*3 {
+			t.Fatalf("%d distinct values, want %d", len(seen), workers*per*3)
+		}
+		admin := connect(t, dsn)
+		mustExec(t, admin, `SET ROLE `+RoleAdmin)
+		if err := admin.QueryRow(ctx, `SELECT * FROM pgshard.allocate_sequence_block('by_admin')`).Scan(&start, &end); err != nil {
+			t.Fatalf("admin must be able to allocate: %v", err)
+		}
+		mustExec(t, admin, `INSERT INTO pgshard.sequences (name, next_value, block_size) VALUES ('declared', 100, 10)`)
+		if err := admin.QueryRow(ctx, `SELECT * FROM pgshard.allocate_sequence_block('declared')`).Scan(&start, &end); err != nil || start != 100 || end != 109 {
+			t.Fatalf("declared sequence block [%d, %d] %v, want [100, 109]", start, end, err)
+		}
+		reader := connect(t, dsn)
+		mustExec(t, reader, `SET ROLE `+RoleReader)
+		_, err = reader.Exec(ctx, `SELECT * FROM pgshard.allocate_sequence_block('by_reader')`)
+		expectPgError(t, err, "42501", "allocate_sequence_block")
+	})
 }
 
 func mustTx(t *testing.T, tx pgx.Tx, sql string) {

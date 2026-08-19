@@ -200,6 +200,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		Buffering: router.Buffering{Window: *bufferWindow, PerShardCap: *bufferCap, Changes: w.Subscribe},
 		Scatter:   router.ScatterConfig{MaxShards: *scatterMaxShards, MaxStreams: *scatterMaxStreams},
 		Decisions: &router.PGDecisionLog{Pool: pool},
+		Sequences: router.NewSequenceAllocator(&router.PGBlockSource{Pool: pool}),
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -40,6 +41,23 @@ type prepared struct {
 	// snap is the snapshot the plan was made against; a newer snapshot
 	// replans the statement at Bind.
 	snap *snapshot.Snapshot
+}
+
+// shardSQL is the text the shards run: the client's, or the sequence-filled
+// rewrite of an INSERT.
+func (p prepared) shardSQL() string {
+	if p.plan.Sequences != nil {
+		return p.plan.Sequences.SQL
+	}
+	return p.sql
+}
+
+// shardOIDs are the parameter types declared to the shards.
+func (p prepared) shardOIDs() []uint32 {
+	if f := p.plan.Sequences; f != nil {
+		return extendOIDs(p.oids, f.Base, len(f.Names))
+	}
+	return p.oids
 }
 
 // paramOIDs merges the declared and backend-inferred parameter types.
@@ -131,6 +149,9 @@ type Executor struct {
 	startupSearchPath []string
 	// parked holds the streams of the other shards an open transaction has
 	// touched; wroteHere says whether the current shard was written to.
+	// unsent names the statements of the batch being placed, which no
+	// backend has parsed yet.
+	unsent    map[string]bool
 	parked    map[Shard]*txnPart
 	wroteHere bool
 	gid       string
@@ -238,7 +259,7 @@ func (e *Executor) target(pl plan.Plan) (Shard, error) {
 
 // moveTo points the session at target, dropping the stream on the previous
 // shard. A transaction that already touched a shard cannot move.
-func (e *Executor) moveTo(target Shard) error {
+func (e *Executor) moveTo(ctx context.Context, target Shard) error {
 	if target == e.shard {
 		return nil
 	}
@@ -247,7 +268,7 @@ func (e *Executor) moveTo(target Shard) error {
 		return nil
 	}
 	if e.tx != pgwire.TxIdle && e.txnTouched {
-		return e.switchPart(target)
+		return e.switchPart(ctx, target)
 	}
 	e.dropStream()
 	e.shard = target
@@ -296,11 +317,44 @@ func (e *Executor) needsPin() bool {
 	return false
 }
 
+// guard confines a panic in planning or execution to the calling session:
+// it is logged, the session's shard stream is dropped and the client gets an
+// XX000 error instead of the router process dying.
+func (e *Executor) guard(op string, run func() error) (err error) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		e.r.cfg.Logger.Error("router: panic in session", "op", op, "session", e.sid, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+		e.failBatch()
+		// Between Parse and Sync the pgwire layer skips to Sync, where the
+		// failed batch is cleared; a simple query or Sync itself has no
+		// batch left to skip.
+		e.batchFailed = op == "Parse" || op == "Bind" || op == "Execute"
+		e.dropStream()
+		e.staged, e.stagedMark = nil, 0
+		e.txnPrelude, e.txnTouched = nil, false
+		err = pgwire.Errorf(pgwire.CodeInternalError, "internal error while processing the statement; the session state was reset")
+	}()
+	return run()
+}
+
 // SimpleQuery implements pgwire.Executor.
 func (e *Executor) SimpleQuery(ctx context.Context, sql string, w pgwire.ResultWriter) error {
+	return e.guard("SimpleQuery", func() error { return e.simpleQuery(ctx, sql, w) })
+}
+
+func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultWriter) error {
 	pl, err := e.r.cfg.Planner.Plan(ctx, e.planSession(), sql)
 	if err != nil {
 		return err
+	}
+	if pl.NextVal != "" {
+		return e.afterBatch(ctx, e.answerNextval(ctx, pl.NextVal, true, true, false, w))
+	}
+	if isReferenceWrite(pl) {
+		return e.afterBatch(ctx, e.referenceWrite(ctx, pl, []*pgshardv1.ExecuteRequest{simpleQuery(sql)}, w))
 	}
 	if multiShard(pl) {
 		return e.afterBatch(ctx, e.scatterSimple(ctx, pl, sql, w))
@@ -311,11 +365,26 @@ func (e *Executor) SimpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 	if handled, err := e.txnControl(ctx, pl.Class, w); handled {
 		return e.afterBatch(ctx, err)
 	}
+	reqs := []*pgshardv1.ExecuteRequest{simpleQuery(sql)}
+	if fill := pl.Sequences; fill != nil {
+		params, values, err := e.sequenceValues(ctx, fill)
+		if err != nil {
+			return err
+		}
+		if pl.Deferred {
+			if pl, err = pl.Resolve(injectedParams{base: fill.Base, values: values}); err != nil {
+				return err
+			}
+		}
+		reqs = []*pgshardv1.ExecuteRequest{parseReq("", fill.SQL, extendOIDs(nil, fill.Base, len(fill.Names))),
+			bindReq("", "", nil, params, nil), describeReq(pgwire.DescribePortal, ""), executeReq("", 0), syncReq()}
+		w = noDataFilter{w}
+	}
 	target, err := e.target(pl)
 	if err != nil {
 		return err
 	}
-	if err := e.moveTo(target); err != nil {
+	if err := e.moveTo(ctx, target); err != nil {
 		return err
 	}
 	return e.withFailover(ctx, w, func(cw pgwire.ResultWriter) error {
@@ -332,8 +401,10 @@ func (e *Executor) SimpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 				return err
 			}
 		}
-		if err := e.send(simpleQuery(sql)); err != nil {
-			return err
+		for _, req := range reqs {
+			if err := e.send(req); err != nil {
+				return err
+			}
 		}
 		err := e.pump(ctx, cw)
 		if err == nil {
@@ -419,6 +490,10 @@ func (e *Executor) releaseAsync() {
 
 // Parse implements pgwire.Executor: the message is buffered until Sync.
 func (e *Executor) Parse(ctx context.Context, name, sql string, paramOIDs []uint32) error {
+	return e.guard("Parse", func() error { return e.parse(ctx, name, sql, paramOIDs) })
+}
+
+func (e *Executor) parse(ctx context.Context, name, sql string, paramOIDs []uint32) error {
 	if e.batchFailed {
 		return nil
 	}
@@ -432,7 +507,7 @@ func (e *Executor) Parse(ctx context.Context, name, sql string, paramOIDs []uint
 	}
 	if !pl.Deferred && pl.Kind != plan.SessionLocal {
 		var err error
-		if multiShard(pl) {
+		if multiShard(pl) && !isReferenceWrite(pl) {
 			_, err = pl.MultiShard()
 		} else {
 			err = e.aimBatch(pl, name)
@@ -442,9 +517,10 @@ func (e *Executor) Parse(ctx context.Context, name, sql string, paramOIDs []uint
 			return err
 		}
 	}
-	e.stmts[name] = prepared{sql: sql, oids: paramOIDs, class: pl.Class, plan: pl, snap: e.currentSnapshot()}
+	st := prepared{sql: sql, oids: paramOIDs, class: pl.Class, plan: pl, snap: e.currentSnapshot()}
+	e.stmts[name] = st
 	e.batchStmts = append(e.batchStmts, name)
-	e.batch = append(e.batch, parseReq(e.physical(name), sql, paramOIDs))
+	e.batch = append(e.batch, parseReq(e.physical(name), st.shardSQL(), st.shardOIDs()))
 	return nil
 }
 
@@ -457,7 +533,7 @@ func multiShard(pl plan.Plan) bool {
 // target one shard, or carry one multi-shard statement.
 func (e *Executor) aimBatch(pl plan.Plan, stmt string) error {
 	if multiShard(pl) {
-		if _, err := pl.MultiShard(); err != nil {
+		if _, err := pl.MultiShard(); err != nil && !isReferenceWrite(pl) {
 			return err
 		}
 		if e.batchTarget != nil || e.batchScatter != nil && e.batchScatterStmt != stmt {
@@ -489,6 +565,24 @@ func mixedBatchError() error {
 	return err
 }
 
+func hasExecute(batch []*pgshardv1.ExecuteRequest) bool {
+	for _, req := range batch {
+		if _, ok := req.Message.(*pgshardv1.ExecuteRequest_Execute); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// sequenceShape identifies the sequence rewrite of a plan, so a replan can
+// tell whether the shards' prepared statement still matches.
+func sequenceShape(pl plan.Plan) string {
+	if pl.Sequences == nil {
+		return ""
+	}
+	return pl.Sequences.SQL
+}
+
 // currentSnapshot is the snapshot plans of this session are made against;
 // nil on the catalog shard set, whose plans never depend on one.
 func (e *Executor) currentSnapshot() *snapshot.Snapshot {
@@ -502,11 +596,20 @@ func (e *Executor) currentSnapshot() *snapshot.Snapshot {
 // the shard key parameters are known. A statement prepared against an
 // older snapshot is planned again first.
 func (e *Executor) Bind(ctx context.Context, portal, statement string, paramFormats []int16, params [][]byte, resultFormats []int16) error {
+	return e.guard("Bind", func() error { return e.bind(ctx, portal, statement, paramFormats, params, resultFormats) })
+}
+
+func (e *Executor) bind(ctx context.Context, portal, statement string, paramFormats []int16, params [][]byte, resultFormats []int16) error {
 	if e.batchFailed {
 		return nil
 	}
 	if st, ok := e.stmts[statement]; ok && st.snap != e.currentSnapshot() {
 		pl, err := e.r.cfg.Planner.Plan(ctx, e.planSession(), st.sql)
+		if err == nil && sequenceShape(pl) != sequenceShape(st.plan) {
+			perr := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "the sequence columns of the table changed since statement %q was prepared", statement)
+			perr.Hint = "prepare the statement again"
+			err = perr
+		}
 		if err != nil {
 			e.failBatch()
 			return err
@@ -516,9 +619,23 @@ func (e *Executor) Bind(ctx context.Context, portal, statement string, paramForm
 	}
 	if st, ok := e.stmts[statement]; ok && st.plan.Kind != plan.SessionLocal {
 		pl := st.plan
+		var keys plan.Params = plan.BindParams{OIDs: st.paramOIDs(), Formats: paramFormats, Values: params}
+		if fill := pl.Sequences; fill != nil {
+			injected, values, err := e.sequenceValues(ctx, fill)
+			if err != nil {
+				e.failBatch()
+				return err
+			}
+			for len(params) < fill.Base {
+				params = append(params, nil)
+			}
+			keys = injectedParams{client: keys, base: fill.Base, values: values}
+			paramFormats = extendFormats(paramFormats, fill.Base, len(fill.Names))
+			params = append(params[:fill.Base:fill.Base], injected...)
+		}
 		if pl.Deferred {
 			var err error
-			pl, err = pl.Resolve(plan.BindParams{OIDs: st.paramOIDs(), Formats: paramFormats, Values: params})
+			pl, err = pl.Resolve(keys)
 			if err != nil {
 				e.failBatch()
 				return err
@@ -550,6 +667,10 @@ func (e *Executor) Describe(_ context.Context, kind pgwire.DescribeKind, name st
 
 // Execute implements pgwire.Executor.
 func (e *Executor) Execute(_ context.Context, portal string, maxRows int32, w pgwire.ResultWriter) error {
+	return e.guard("Execute", func() error { return e.execute(portal, maxRows, w) })
+}
+
+func (e *Executor) execute(portal string, maxRows int32, w pgwire.ResultWriter) error {
 	if e.batchFailed {
 		return nil
 	}
@@ -598,6 +719,10 @@ func (e *Executor) failBatch() {
 // Sync implements pgwire.Executor: it ships the buffered batch followed by
 // Sync and relays every response.
 func (e *Executor) Sync(ctx context.Context) error {
+	return e.guard("Sync", func() error { return e.sync(ctx) })
+}
+
+func (e *Executor) sync(ctx context.Context) error {
 	if e.batchFailed {
 		e.batchFailed = false
 		return nil
@@ -609,10 +734,16 @@ func (e *Executor) Sync(ctx context.Context) error {
 	}
 	scatterPlan, scatterStmt := e.batchScatter, e.batchScatterStmt
 	e.batchScatter, e.batchScatterStmt = nil, ""
+	if scatterPlan != nil && isReferenceWrite(*scatterPlan) && !hasExecute(e.batch) {
+		// Parse/Describe of a reference write is answered by the current
+		// shard alone; the fan-out starts with Execute.
+		scatterPlan = nil
+	}
 
 	pin := false
 	fresh := map[string]bool{}
-	for _, name := range e.batchStmts {
+	parsed := e.batchStmts
+	for _, name := range parsed {
 		pin = pin || name != ""
 		fresh[name] = true
 	}
@@ -624,15 +755,29 @@ func (e *Executor) Sync(ctx context.Context) error {
 	if w == nil {
 		w = discardWriter{}
 	}
+	if handled, err := e.nextvalBatch(ctx, batch, parsed, w); handled {
+		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
+		return e.afterBatch(ctx, err)
+	}
 	if scatterPlan != nil {
 		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
+		if isReferenceWrite(*scatterPlan) {
+			st, ok := e.stmts[scatterStmt]
+			if !ok {
+				return e.afterBatch(ctx, pgwire.Errorf("26000", "prepared statement %q does not exist", scatterStmt))
+			}
+			return e.afterBatch(ctx, e.referenceWrite(ctx, *scatterPlan, unnamedBatch(st.sql, st.oids, batch), w))
+		}
 		return e.afterBatch(ctx, e.scatterBatch(ctx, *scatterPlan, scatterStmt, batch, w))
 	}
 	if handled, err := e.txnControlBatch(ctx, batch, executed, w); handled {
 		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
 		return e.afterBatch(ctx, err)
 	}
-	if err := e.moveTo(target); err != nil {
+	e.unsent = fresh
+	err := e.moveTo(ctx, target)
+	e.unsent = nil
+	if err != nil {
 		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
 		return e.afterBatch(ctx, err)
 	}
@@ -798,12 +943,18 @@ func (e *Executor) replay(ctx context.Context, skip map[string]bool) error {
 			return fmt.Errorf("router: replaying session settings: %w", err)
 		}
 	}
+	return e.replayStatements(ctx, skip)
+}
+
+// replayStatements parses the named statements the current backend lacks;
+// skip names those it already has.
+func (e *Executor) replayStatements(ctx context.Context, skip map[string]bool) error {
 	n := 0
 	for name, st := range e.stmts {
 		if name == "" || skip[name] {
 			continue
 		}
-		if err := e.send(parseReq(e.physical(name), st.sql, st.oids)); err != nil {
+		if err := e.send(parseReq(e.physical(name), st.shardSQL(), st.shardOIDs())); err != nil {
 			return err
 		}
 		n++
@@ -892,8 +1043,9 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 		case *pgshardv1.ExecuteResponse_Notice:
 			werr = w.Notice(toNotice(m.Notice.GetNotice()))
 		case *pgshardv1.ExecuteResponse_ParameterDescription:
+			oids := e.clientOIDs(m.ParameterDescription.ParamOids)
 			e.inferParams(m.ParameterDescription.ParamOids)
-			werr = w.ParameterDescription(m.ParameterDescription.ParamOids)
+			werr = w.ParameterDescription(oids)
 		case *pgshardv1.ExecuteResponse_NoData:
 			werr = w.NoData()
 		case *pgshardv1.ExecuteResponse_CopyInResponse:
@@ -920,6 +1072,19 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 			return werr
 		}
 	}
+}
+
+// clientOIDs strips the parameters the router injected for sequence values
+// from the description of the statement being described.
+func (e *Executor) clientOIDs(oids []uint32) []uint32 {
+	if len(e.pendingDescribes) == 0 {
+		return oids
+	}
+	st, ok := e.stmts[e.pendingDescribes[0]]
+	if !ok || st.plan.Sequences == nil || len(oids) < st.plan.Sequences.Base {
+		return oids
+	}
+	return oids[:st.plan.Sequences.Base]
 }
 
 // inferParams attributes a ParameterDescription to the next described

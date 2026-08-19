@@ -40,23 +40,38 @@ type txnPart struct {
 	prepared bool
 	tag      string
 	err      error
+	// known names the prepared statements the backend held when the part
+	// was parked; statements prepared since are parsed on revival.
+	known map[string]bool
 }
 
 // switchPart parks the stream of the current shard and makes target the
 // current one, reviving its parked stream or leaving the session to open a
 // fresh one (acquire replays the transaction prelude on it).
-func (e *Executor) switchPart(target Shard) error {
+func (e *Executor) switchPart(ctx context.Context, target Shard) error {
 	if e.home.Set != DefaultShardSet {
 		return pgwire.Errorf(pgwire.CodeFeatureNotSupported, "transactions on the catalog shard set cannot span shards")
 	}
 	if e.parked == nil {
 		e.parked = map[Shard]*txnPart{}
 	}
-	e.parked[e.shard] = &txnPart{shard: e.shard, ps: e.conn, pinned: e.pinned, tx: e.tx, wrote: e.wroteHere}
+	known := make(map[string]bool, len(e.stmts))
+	for name := range e.stmts {
+		if !e.unsent[name] {
+			known[name] = true
+		}
+	}
+	e.parked[e.shard] = &txnPart{shard: e.shard, ps: e.conn, pinned: e.pinned, tx: e.tx, wrote: e.wroteHere, known: known}
 	e.shard = target
 	if p, ok := e.parked[target]; ok {
 		delete(e.parked, target)
 		e.conn, e.pinned, e.tx, e.wroteHere = p.ps, p.pinned, p.tx, p.wrote
+		if e.conn != nil && e.needsPin() {
+			if err := e.ensurePinned(ctx); err != nil {
+				return err
+			}
+			return e.replayStatements(ctx, p.known)
+		}
 		return nil
 	}
 	e.conn, e.pinned, e.tx, e.wroteHere = nil, false, pgwire.TxIdle, false
@@ -215,11 +230,19 @@ func (e *Executor) queryOne(ctx context.Context, p *txnPart, sql string) (string
 // updating p's transaction status. It touches no executor state, so several
 // parts can run concurrently.
 func (e *Executor) runOn(ctx context.Context, p *txnPart, sql string, w pgwire.ResultWriter) error {
+	return e.runReqsOn(ctx, p, []*pgshardv1.ExecuteRequest{simpleQuery(sql)}, w)
+}
+
+// runReqsOn sends reqs (a simple query, or an extended batch ending in
+// Sync) on p's stream and relays the answer into w until ReadyForQuery.
+func (e *Executor) runReqsOn(ctx context.Context, p *txnPart, reqs []*pgshardv1.ExecuteRequest, w pgwire.ResultWriter) error {
 	if p.ps == nil {
 		return pgwire.Errorf(codeConnectionFailure, "shard %s/%d: no stream", p.shard.Set, p.shard.ID)
 	}
-	if err := p.ps.send(simpleQuery(sql), e.sid, e.r.cfg.Poolers.Generation(p.shard), e.ident); err != nil {
-		return pgwire.Errorf(codeConnectionFailure, "shard %s/%d: pooler connection lost: %v", p.shard.Set, p.shard.ID, err)
+	for _, req := range reqs {
+		if err := p.ps.send(cloneRequest(req), e.sid, e.r.cfg.Poolers.Generation(p.shard), e.ident); err != nil {
+			return pgwire.Errorf(codeConnectionFailure, "shard %s/%d: pooler connection lost: %v", p.shard.Set, p.shard.ID, err)
+		}
 	}
 	var firstErr error
 	for {
@@ -236,12 +259,18 @@ func (e *Executor) runOn(ctx context.Context, p *txnPart, sql string, w pgwire.R
 		case *pgshardv1.ExecuteResponse_CommandComplete:
 			p.tag = m.CommandComplete.Tag
 			werr = w.CommandComplete(m.CommandComplete.Tag)
+		case *pgshardv1.ExecuteResponse_EmptyQuery:
+			werr = w.EmptyQueryResponse()
 		case *pgshardv1.ExecuteResponse_Error:
 			if firstErr == nil {
 				firstErr = toPgwireError(m.Error.GetError())
 			}
 		case *pgshardv1.ExecuteResponse_Notice:
 			werr = w.Notice(toNotice(m.Notice.GetNotice()))
+		case *pgshardv1.ExecuteResponse_ParameterDescription:
+			werr = w.ParameterDescription(m.ParameterDescription.ParamOids)
+		case *pgshardv1.ExecuteResponse_NoData:
+			werr = w.NoData()
 		case *pgshardv1.ExecuteResponse_ReadyForQuery:
 			p.tx = txStatus(m.ReadyForQuery.TxnStatus)
 			return firstErr

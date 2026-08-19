@@ -33,8 +33,10 @@ type fakePooler struct {
 	sleeping  map[string]chan struct{}
 	dropAfter string
 	dropped   int
-	// executed records every statement text this shard ran, in order.
+	// executed records every statement text this shard ran, in order;
+	// bound records each extended-protocol execution with its parameters.
 	executed []string
+	bound    []string
 	// scripts answers exact (lowercased) statements with canned results.
 	scripts map[string]script
 	// maxPrepared answers SHOW max_prepared_transactions ("64" when empty);
@@ -222,6 +224,14 @@ type fakeStream struct {
 	// the portal was described before Execute.
 	formats   []int32
 	described bool
+	// params renders the parameters bound to each portal.
+	params map[string]string
+}
+
+func (f *fakePooler) boundExecs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.bound...)
 }
 
 // binaryCol reports whether the last Bind asked for column i in binary.
@@ -527,6 +537,18 @@ func (s *fakeStream) runBatch(ctx context.Context) error {
 				continue
 			}
 			portals[m.Bind.Portal] = m.Bind.Statement
+			var vals []string
+			for _, p := range m.Bind.Params {
+				if p.Null {
+					vals = append(vals, "NULL")
+				} else {
+					vals = append(vals, string(p.Data))
+				}
+			}
+			if s.params == nil {
+				s.params = map[string]string{}
+			}
+			s.params[m.Bind.Portal] = strings.Join(vals, ",")
 			s.formats = m.Bind.ResultFormats
 			s.described = false
 			if err := s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_BindComplete{BindComplete: &pgshardv1.BindComplete{}}}); err != nil {
@@ -563,6 +585,9 @@ func (s *fakeStream) runBatch(ctx context.Context) error {
 			}
 		case *pgshardv1.ExecuteRequest_Execute:
 			sql := b.stmts[portals[m.Execute.Portal]]
+			s.f.mu.Lock()
+			s.f.bound = append(s.f.bound, strings.ToLower(sql)+" <- "+s.params[m.Execute.Portal])
+			s.f.mu.Unlock()
 			ready, err := s.query(ctx, sql)
 			s.described, s.formats = false, nil
 			if err != nil {

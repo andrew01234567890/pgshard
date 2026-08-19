@@ -52,6 +52,7 @@ statement a trigger sends `NOTIFY pgshard_desired` with payload
 | `placement` | `sharded`, `reference` or `unsharded`. |
 | `shard_key` | Column the hash is computed over; required when `placement = 'sharded'`. |
 | `hash_version` | References `pgshard.hash_versions`. |
+| `sequence_columns` | Columns of a sharded table the router fills from `pgshard.sequences` on `INSERT` (migration `0005`); `NULL` for none. See *Sequences* in `docs/router.md`. |
 
 ### `pgshard.shard_ranges`
 
@@ -99,7 +100,7 @@ Status tables are written by `pgshard_system`; `pgshard_admin` and
 | `migrations` | DDL migrations: `id` (uuid), `database`, `statement`, `strategy`, `state`, `per_shard` (jsonb), `created_at`, `updated_at` |
 | `xact_decisions` | Two-phase commit outcomes: `gid`, `state` (`preparing`, `commit`, `abort`), `participants`, `created_at`, `decided_at` |
 | `streams` | `name`, `spec`, `position`, `state` |
-| `sequences` | `name`, `next_value`, `block_size` |
+| `sequences` | Global sequences: `name`, `next_value`, `block_size`. Since migration `0005` `pgshard_admin` may also insert, update and delete rows (declaring a sequence or changing its block size), and routers allocate through `pgshard.allocate_sequence_block(name, n)`, a `SECURITY DEFINER` function (executable by `pgshard_admin`) that creates the row on first use, moves `next_value` past a block of `n` values (`block_size` when `n` is `NULL`) in one `UPDATE … RETURNING` and returns `(block_start, block_end)`. |
 | `restore_points` | `id` (uuid), `name`, `shard_map_generation`, `per_group` (jsonb), `created_at` |
 | `serving` | `shard_set`, `generation`, `published_at` |
 | `shard_map_generation` | Single row: `generation`, `updated_at` |
