@@ -26,7 +26,7 @@ JSON config per member into the group ConfigMap (`<member>.json`) and runs
 Probes: startup `/startz`, readiness `/readyz`, liveness `/livez` on the agent
 HTTP port 8080. A primary's `/livez` fails only when the kube API and every
 peer `/failsafe` are unreachable; the agent self-fences (fast shutdown, exit)
-once that isolation has lasted 30 s of consecutive probes, so one slow probe
+once that isolation has lasted `isolationGrace` (default 30 s) of consecutive probes, so one slow probe
 under load never takes a primary down. The agent gRPC (`pgshard.v1.Agent`)
 listens on 9090. Members run
 under the `<cluster>-member` ServiceAccount whose Role allows Lease

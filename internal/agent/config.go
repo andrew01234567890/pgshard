@@ -52,6 +52,9 @@ type Config struct {
 
 	// MaxLagBytes is the replay lag above which a standby reports not ready.
 	MaxLagBytes int64 `json:"maxLagBytes"`
+	// IsolationGrace is how long a primary must reach neither the kube API
+	// nor any peer before it self-fences; zero means 30s.
+	IsolationGrace Duration `json:"isolationGrace"`
 	// ShutdownTimeout bounds a smart shutdown before falling back to fast.
 	ShutdownTimeout Duration `json:"shutdownTimeout"`
 	// OverrideFile is a rendered postgresql.conf fragment (the operator's
