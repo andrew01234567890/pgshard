@@ -194,6 +194,11 @@ func TestRouterDDLMigrations(t *testing.T) {
 		if got := s.onShards(t, "select not rolsuper and not rolbypassrls from pg_roles where rolname = 'pgshard_ddl'"); !allTrue(got) {
 			t.Fatalf("pgshard_ddl is a plain login per shard: %v", got)
 		}
+		for tenant := 2; tenant <= 12; tenant++ {
+			if _, err := conn.Exec(ctx, "delete from orders where tenant_id = $1", tenant); err != nil {
+				t.Fatal(err)
+			}
+		}
 	})
 
 	t.Run("create_index_concurrently_valid_everywhere", func(t *testing.T) {
