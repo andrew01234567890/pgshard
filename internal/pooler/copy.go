@@ -172,7 +172,7 @@ func (s *Server) runCopy(ctx context.Context, req *pgshardv1.CopyTablesRequest, 
 const publicationTablesSQL = `
 SELECT pt.schemaname, pt.tablename, c.oid, c.relreplident::text,
        a.attname, a.atttypid, a.atttypmod, format_type(a.atttypid, a.atttypmod),
-       COALESCE(array_position((SELECT array_agg(k) FROM unnest(i.indkey[0:i.indnkeyatts-1]) k), a.attnum), 0) AS pkpos
+       COALESCE((SELECT k.ord FROM unnest(i.indkey[0:i.indnkeyatts-1]) WITH ORDINALITY AS k(attnum, ord) WHERE k.attnum = a.attnum), 0) AS pkpos
 FROM pg_publication_tables pt
 JOIN pg_namespace n ON n.nspname = pt.schemaname
 JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = pt.tablename

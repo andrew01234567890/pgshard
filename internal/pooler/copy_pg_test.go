@@ -69,7 +69,7 @@ func (h *pgHarness) testCopyTables(t *testing.T) {
 	for _, sql := range []string{
 		"CREATE PUBLICATION pgshard_all FOR ALL TABLES",
 		"CREATE TABLE citems (id int primary key, name text)",
-		"CREATE TABLE pairs (a int, b text, primary key (a, b))",
+		"CREATE TABLE pairs (a int, b text, primary key (b, a))",
 		"CREATE TABLE nopk (x int, y text)",
 		"INSERT INTO citems SELECT g, 'item ' || g FROM generate_series(1, 25) g",
 		"INSERT INTO pairs SELECT g / 3, 'k' || (g % 3) FROM generate_series(1, 10) g",
@@ -108,10 +108,10 @@ func (h *pgHarness) testCopyTables(t *testing.T) {
 	if b := full.batches["public.citems"]; len(b) != 3 || string(b[0]) != `["10"]` || string(b[1]) != `["20"]` || string(b[2]) != `["25"]` {
 		t.Fatalf("items batches: %q", b)
 	}
-	if r := full.rows["public.pairs"]; len(r) != 10 || r[0] != "0|k1" || r[1] != "0|k2" || r[2] != "1|k0" || r[9] != "3|k1" {
+	if r := full.rows["public.pairs"]; len(r) != 10 || r[0] != "1|k0" || r[1] != "2|k0" || r[2] != "3|k0" || r[3] != "0|k1" || r[9] != "2|k2" {
 		t.Fatalf("pairs: %v", r)
 	}
-	if b := full.batches["public.pairs"]; len(b) != 1 || string(b[0]) != `["3","k1"]` {
+	if b := full.batches["public.pairs"]; len(b) != 1 || string(b[0]) != `["k2","2"]` {
 		t.Fatalf("pairs batches: %q", b)
 	}
 	if r := full.rows["public.nopk"]; len(r) != 7 || r[0] != "1|n1" || r[1] != "2|NULL" || !full.byCtid["public.nopk"] || full.byCtid["public.pairs"] {
