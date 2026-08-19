@@ -3,10 +3,11 @@
 `pgshard-router serve` is the PostgreSQL wire-protocol front door. Clients
 connect to it as they would to PostgreSQL; the router authenticates them from
 the catalog, plans each statement onto a shard and executes it through that
-shard's `pgshard-pooler` over gRPC. This layer implements **single-shard
-sessions for unsharded databases**: every statement of a session goes to the
-database's home shard. The planner is a seam (`router.Planner.Plan`) so
-sharded planning can replace it without touching the executor.
+shard's `pgshard-pooler` over gRPC. The planner (`internal/router/plan`)
+resolves every statement to the shards it touches from the catalog snapshot;
+the executor runs plans that need **one** shard and refuses the rest with
+`0A000` until scatter-gather (M3.3), cross-shard transactions (M3.4) and
+multi-shard writes (M3.5) land. See *Routing* below.
 
 ## Startup and authentication
 
@@ -22,7 +23,9 @@ sharded planning can replace it without touching the executor.
   the first message of each stream, so no password ever leaves the client.
 - **Database.** The startup `database` must exist in `pgshard.databases`
   (else `3D000`). Its `home_shard` in shard set `default` is the session's
-  shard. The catalog database itself (`pgshard`) is routable: it maps to
+  home shard, where unsharded tables live; sharded and reference tables
+  take the session to other shards of the set (see *Routing*). The catalog
+  database itself (`pgshard`) is routable: it maps to
   shard set `catalog`, shard 0, whose pooler is given with
   `--catalog-pooler`.
 - **Poolers.** Endpoints come from `pgshard.shard_status.primary_endpoint`
@@ -42,9 +45,10 @@ sharded planning can replace it without touching the executor.
   statements are created on the backend as `pgshard_<session>_<name>` (long
   names are hashed).
 - **Refused.** `LISTEN`/`NOTIFY`/`UNLISTEN`, `WITH HOLD` cursors and
-  temporary tables are refused with `0A000` before reaching a shard; multi-
-  statement simple queries are refused by the wire layer. Text the bound
-  PostgreSQL 18 grammar cannot parse is forwarded so the backend reports it.
+  temporary tables are refused with `0A000` before reaching a shard, as are
+  the shapes listed under *Routing*; multi-statement simple queries are
+  refused by the wire layer. Text the bound PostgreSQL 18 grammar cannot
+  parse is forwarded to the home shard so the backend reports it.
 - **Transactions.** `BEGIN` … `COMMIT`/`ROLLBACK` are forwarded; the pooler
   keeps the backend while its `ReadyForQuery` status is not idle. The
   router's own status indicator is the pooler's.
@@ -67,6 +71,87 @@ sharded planning can replace it without touching the executor.
 - **Not yet.** `Flush`-driven pipelining (results before `Sync`),
   `PortalSuspended` (`Execute` with a row limit) and `ParameterStatus`
   forwarding are not supported by the pooler contract in this layer.
+
+## Routing
+
+The planner parses each statement with the bound PostgreSQL 18 grammar and
+looks up every relation it references in the snapshot: `(database, schema,
+table)` where an unqualified name is searched along the session's search
+path (`public` unless the statement qualifies it; `pg_catalog`,
+`information_schema` and `pg_temp` are always home-shard). The effective
+placement in `pgshard.table_status` decides:
+
+| Placement | Reads | Writes | DDL |
+|---|---|---|---|
+| unsharded (or undeclared, database default `unsharded`) | home shard | home shard | home shard |
+| reference | any shard (chosen per session) | refused, `0A000` "writes to reference tables are not available yet (planned for M3.5)" | refused, "DDL fan-out is not available yet" |
+| sharded | shard of the key | shard of the key | refused, "DDL fan-out is not available yet" |
+
+A plan has a `Kind`: `Unsharded`, `EqualUnique` (every sharded table pinned
+to one key value), `In` (key in a list of values), `Scatter` (a sharded
+table with no key predicate), `Reference`, `SessionLocal` (`BEGIN`, `SET`,
+`SHOW`, … — runs wherever the session is) or `Refuse`. It carries the
+shard ids, the resolved key values and the shard map generation it was
+made against. Statements are refused before anything reaches a shard; every
+refusal is `0A000` with a message naming the rule and a hint.
+
+**Shard keys.** The key value comes from `WHERE` conjunctions of the form
+`key = <const|$n>` or `key IN (<const|$n>, …)` (also `t.key`, casts, and
+`USING (key)`/`NATURAL` joins); `OR`, ranges, expressions and subqueries do
+not route and make the table a scatter. `INSERT` needs the key column in
+its column list with a constant or parameter per `VALUES` row. Values are
+hashed with the PostgreSQL extended hash (`internal/placement`) and located
+in the `default` shard set's ranges. Because the catalog does not record the
+key's type, the router types the value from the statement: integer literals
+and `::int8` casts hash as `int8`, string literals and `::text` casts as
+`text`; a **string literal that looks numeric is refused** ("shard key
+literal '1' is untyped and looks numeric") until it is cast. Bind parameters
+take the type the client declared at `Parse`, else the type the backend
+reported in `ParameterDescription` for that statement (drivers that
+prepare-and-describe, such as pgx's default mode and JDBC, therefore always
+carry the right type), else a cast in the statement text; an undeclared
+text-format value that looks numeric is refused with the same hint (`$1::int8`
+or `$1::text`), never guessed.
+
+**Bind-time routing.** A statement whose key is a parameter is planned at
+`Parse` as *deferred*; the shard is computed at `Bind`, when the router also
+switches the session's pooler stream to that shard. A statement prepared
+against an older catalog snapshot is planned again at `Bind`. One extended
+batch (everything up to `Sync`) must target one shard, else `0A000`
+"statements of one batch target different shards".
+
+**Transactions.** A session moves between shards freely while idle. Inside
+a transaction block the session is pinned to the first shard a statement
+touched; a statement for another shard is refused with `0A000` "multi-shard
+transactions are not available yet: transaction is on shard default/0,
+statement needs shard default/3" and the transaction stays open. `BEGIN` and
+other session-local statements do not pin: they are recorded as the
+transaction's *prelude* and replayed on the shard of the first real
+statement (`BEGIN; INSERT INTO sharded …` works). Named prepared statements
+and session GUCs are replayed on every shard the session moves to.
+
+**Refusals (all `0A000`).**
+
+| Statement shape | Message |
+|---|---|
+| plan over several shards (`Scatter`, `IN` spanning shards) | scatter execution is not available yet (… plan over N shards) — M3.3 |
+| scatter `SELECT` with ORDER BY, LIMIT/OFFSET, GROUP BY/HAVING, DISTINCT, aggregates, window functions, FOR UPDATE, set operations, CTEs, subqueries or joins | scatter SELECT with … is not available yet |
+| `UPDATE`/`DELETE` without a key predicate | scatter UPDATE/DELETE without a shard key predicate is not available yet |
+| tables that do not resolve to one shard (joins, subqueries, set operations, an unsharded table joined to a sharded row off the home shard) | cross-shard join is not available yet |
+| `INSERT` without the key in the column list | insert requires the shard key |
+| `INSERT` key that is not a constant or parameter; `INSERT … SELECT` | shard key of an INSERT must be a constant or a parameter; INSERT … SELECT into a sharded table is not available yet |
+| multi-row `INSERT` whose rows hash to different shards | multi-row INSERT spanning shards is not available yet — M3.5 |
+| `UPDATE … SET key`, `ON CONFLICT DO UPDATE SET key` | shard key is immutable |
+| writes to reference tables | writes to reference tables are not available yet (planned for M3.5) |
+| DDL, `TRUNCATE`, `VACUUM`, `LOCK`, `COPY` on sharded or reference tables | DDL fan-out is not available yet; COPY on sharded and reference tables is not available yet |
+| `CREATE TABLE` of a declared sharded table without the key column, or with a PRIMARY KEY/UNIQUE that omits it | sharded table must define its shard key column; primary key or unique constraint (…) must include the shard key |
+| `CREATE VIEW`/`CREATE TABLE AS` over sharded or reference tables | CREATE VIEW over sharded or reference tables is not available yet |
+| SQL-level `PREPARE` touching sharded or reference tables; data-modifying CTEs | SQL-level PREPARE … is not available yet; data-modifying statements in WITH are not available yet |
+| undeclared table in a database whose default placement is `sharded` | table is not declared in the catalog and the database defaults to sharded placement |
+
+DDL on unsharded tables goes to the home shard, an interim until DDL
+fan-out (M4). Reference reads pick a shard from the session id so they
+spread across the shard set.
 
 ## Operations
 
@@ -148,16 +233,28 @@ pgshard-router serve --listen 0.0.0.0:5432 --tls-cert router.crt --tls-key route
 ```
 
 For a local stack, `pgshard-router dev-bootstrap` migrates the catalog and
-registers a database, a role (password from `PGSHARD_DEV_PASSWORD`) and shard
-0's pooler endpoint, and creates the same role and database on the shard.
+registers a database, a role (password from `PGSHARD_DEV_PASSWORD`) and one
+shard's pooler endpoint (`--shard-id`, default 0), and creates the same role
+and database on that shard; run it once per shard, the role keeps one SCRAM
+verifier across runs.
 `hack/compose/docker-compose.yml --profile router` wires catalog, shard0,
 `catalog-init`, `pooler-shard0` and `router` (port 6432) using
 `Dockerfile.router`.
 
 ## Testing
 
-`go test ./internal/router/...` drives a real pgwire server and pgx client
-against an in-process scripted pooler: SCRAM auth, `3D000`, refusals, error
+`go test ./internal/router/plan/` runs the golden plan table (over 200
+statements against a fixture of four shards, an unsharded table, a reference
+table and two sharded tables with an int8 and a text key: kind, shards,
+deferred resolution and every refusal's SQLSTATE and message) and the
+parameter decoding rules. `go test ./internal/router/...` drives a real
+pgwire server and pgx client against an in-process scripted pooler — four
+of them for the sharded tests: keyed inserts and selects reach the key's
+shard through the simple and extended protocols, prepared statements follow
+the key across shards and are re-planned when the snapshot changes,
+transactions move on their prelude and refuse a second shard, one batch is
+refused for two shards, and each refusal leaves the session usable —
+plus SCRAM auth, `3D000`, refusals, error
 and notice relay, transactions, GUC staging across rollback/commit, prepared
 statement replay after release, cancel, COPY, stale generation and stream
 loss; two routers on one pooler with cancels forwarded through `RouterPeer`;
@@ -169,7 +266,12 @@ limit in `cancelpeer`. `go test -tags integration ./test/e2e/router/` builds the
 router, starts a catalog and a shard in Docker, bootstraps them and runs
 DDL/DML, prepared statements, rollback, replay-after-release (proved with an
 advisory lock the release drops), COPY, cancel (`57014`), `28P01`, `3D000`,
-`0A000` and psql. `TestRouterOps` adds a second router that cancels a
+`0A000` and psql. `TestRouterShardedRouting` adds a second shard container
+and pooler, declares a sharded table in the catalog and proves through
+direct connections to each PostgreSQL that keyed inserts, selects, updates
+and deletes land on the key's shard only, that a transaction pins to its
+first shard, that the refusal list holds end to end and that unsharded
+tables stay on the home shard. `TestRouterOps` adds a second router that cancels a
 session owned by the first, `SIGTERM`s a third with an open transaction
 (readiness flips, listener stays open for the delay, the transaction commits,
 new connections are refused, the process exits) and fences shard 0 in the

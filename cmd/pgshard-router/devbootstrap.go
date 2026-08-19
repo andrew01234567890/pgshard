@@ -20,17 +20,19 @@ func runDevBootstrap(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	b := router.DevBootstrap{Password: os.Getenv("PGSHARD_DEV_PASSWORD")}
 	fs.StringVar(&b.CatalogDSN, "catalog-dsn", "", "superuser DSN of the catalog")
-	fs.StringVar(&b.ShardDSN, "shard-dsn", "", "superuser DSN of shard 0")
+	fs.StringVar(&b.ShardDSN, "shard-dsn", "", "superuser DSN of the shard")
+	shardID := fs.Int("shard-id", 0, "shard id in the default shard set the DSN and pooler describe")
 	fs.StringVar(&b.Database, "database", "app", "database to register and create")
 	fs.StringVar(&b.Role, "role", "app", "login role to register and create")
-	fs.StringVar(&b.PoolerEndpoint, "pooler-endpoint", "", "shard 0 pooler address published in shard_status")
-	fs.Int64Var(&b.Epoch, "epoch", 1, "primary epoch to publish for shard 0")
+	fs.StringVar(&b.PoolerEndpoint, "pooler-endpoint", "", "the shard's pooler address published in shard_status")
+	fs.Int64Var(&b.Epoch, "epoch", 1, "primary epoch to publish for the shard")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return cli.ExitOK
 		}
 		return cli.ExitUsage
 	}
+	b.ShardID = int32(*shardID)
 	if fs.NArg() != 0 || b.CatalogDSN == "" || b.ShardDSN == "" || b.PoolerEndpoint == "" {
 		fmt.Fprintln(stderr, "pgshard-router dev-bootstrap: --catalog-dsn, --shard-dsn and --pooler-endpoint are required")
 		return cli.ExitUsage
