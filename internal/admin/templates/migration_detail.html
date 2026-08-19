@@ -1,0 +1,17 @@
+{{if .Degraded}}<p class="banner bad" role="alert">DEGRADED: the statement applied on {{.Progress.Applied}} shard{{if ne .Progress.Applied 1}}s{{end}} and failed on {{.Progress.Failed}}; the schema differs across shards until it is re-run or reverted.</p>{{end}}
+<p>State <span class="state-{{.State}}">{{.State}}</span> · created {{when .CreatedAt}} · finished {{whenp .FinishedAt}} · duration {{.Duration}}</p>
+{{if .Error}}<p class="bad">{{.Error}}</p>{{end}}
+<h2>Statement</h2>
+<pre>{{.Statement}}</pre>
+{{if .Steps}}
+<h2>Steps</h2>
+<ol class="steps">{{range .Steps}}<li class="step-{{.Status}}"><span class="pill">{{.Status}}</span> <code>{{.SQL}}</code></li>{{end}}</ol>
+{{end}}
+<h2>Shards</h2>
+{{template "progress" .}}
+{{if .Shards}}<table>
+<thead><tr><th>Shard</th><th>State</th><th>Step</th><th>Attempts</th><th>Last error</th></tr></thead>
+<tbody>{{range .Shards}}<tr>
+<td>{{.Shard}}</td><td class="state-{{.State}}">{{.State}}</td><td>{{.Step}}</td><td>{{.Attempts}}</td><td>{{if .Error}}<span class="bad">{{.Error}}</span>{{else}}—{{end}}</td>
+</tr>{{end}}</tbody></table>
+{{else}}<p class="notice">No shard has started yet.</p>{{end}}

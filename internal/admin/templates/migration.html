@@ -1,0 +1,11 @@
+{{template "head" "Migration"}}
+<header>
+<h1><a href="/">clusters</a> / <a href="/migrations">migrations</a> / <code>{{.ID}}</code></h1>
+<span class="meta">{{.Database}} · {{.Kind}} · {{.Strategy}}</span>
+</header>
+<div id="migration" data-live hx-get="/migrations/{{.ID}}/detail" hx-trigger="topology" hx-swap="innerHTML">
+{{template "migration_detail.html" .}}
+</div>
+<p class="notice"><a href="/api/v1/migrations/{{.ID}}">JSON</a></p>
+<script src="/static/app.js" defer></script>
+{{template "foot"}}

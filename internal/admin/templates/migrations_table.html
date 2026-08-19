@@ -1,0 +1,19 @@
+{{if .Error}}<p class="bad">catalog: {{.Error}}</p>{{end}}
+{{if .Rows}}
+<table>
+<thead><tr><th>ID</th><th>Database</th><th>Kind</th><th>Strategy</th><th>State</th><th>Created</th><th>Finished</th><th>Duration</th><th>Statement</th><th>Shards</th></tr></thead>
+<tbody>{{range .Rows}}<tr>
+<td><a href="/migrations/{{.ID}}"><code>{{.ID}}</code></a></td>
+<td>{{.Database}}</td><td>{{.Kind}}</td><td>{{.Strategy}}</td>
+<td class="state-{{.State}}">{{.State}}{{if .Degraded}} <span class="pill bad">DEGRADED</span>{{end}}</td>
+<td>{{when .CreatedAt}}</td><td>{{whenp .FinishedAt}}</td><td>{{.Duration}}</td>
+<td>{{if .Truncated}}<details><summary><code>{{.Short}}</code></summary><pre>{{.Statement}}</pre></details>{{else}}<code>{{.Statement}}</code>{{end}}</td>
+<td>{{template "progress" .}}</td>
+</tr>{{end}}</tbody>
+</table>
+<p class="meta">{{.Total}} migration{{if ne .Total 1}}s{{end}} · page {{.Page}} of {{.Pages}}
+{{with .PrevURL}} · <a href="{{.}}">previous</a>{{end}}{{with .NextURL}} · <a href="{{.}}">next</a>{{end}}</p>
+{{else}}{{if not .Error}}<p class="notice">No migrations match.</p>{{end}}{{end}}
+{{define "progress"}}{{with .Progress}}{{if .Total}}<div class="progress" role="img" aria-label="{{.Applied}} applied, {{.Retrying}} retrying, {{.Failed}} failed, {{.Pending}} pending of {{.Total}} shards">
+<svg viewBox="0 0 100 10" preserveAspectRatio="none" width="128" height="10" aria-hidden="true"><rect class="seg applied" x="0" width="{{.Percent .Applied}}" height="10"/><rect class="seg retrying" x="{{.Percent .Applied}}" width="{{.Percent .Retrying}}" height="10"/><rect class="seg failed" x="{{.FailedOffset}}" width="{{.Percent .Failed}}" height="10"/></svg>
+</div><span class="meta">{{.Applied}}/{{.Total}} applied{{if .Retrying}} · {{.Retrying}} retrying{{end}}{{if .Failed}} · {{.Failed}} failed{{end}}{{if .Pending}} · {{.Pending}} pending{{end}}</span>{{else}}<span class="meta">no shards yet</span>{{end}}{{end}}{{if .CurrentStep}} <span class="pill">step {{.CurrentStep}}</span>{{end}}{{end}}

@@ -53,3 +53,30 @@ func withConn[T any](ctx context.Context, p PgxCatalog, fn func(context.Context,
 	defer func() { _ = conn.Close(ctx) }()
 	return fn(ctx, conn)
 }
+
+// ListMigrations implements MigrationSource.
+func (p PgxCatalog) ListMigrations(ctx context.Context, f catalog.MigrationFilter) ([]catalog.DDLMigration, int, error) {
+	type page struct {
+		rows  []catalog.DDLMigration
+		total int
+	}
+	out, err := withConn(ctx, p, func(ctx context.Context, conn *pgx.Conn) (page, error) {
+		rows, total, err := catalog.ListMigrations(ctx, conn, f)
+		return page{rows, total}, err
+	})
+	return out.rows, out.total, err
+}
+
+// LoadMigration implements MigrationSource.
+func (p PgxCatalog) LoadMigration(ctx context.Context, id string) (catalog.DDLMigration, error) {
+	return withConn(ctx, p, func(ctx context.Context, conn *pgx.Conn) (catalog.DDLMigration, error) {
+		return catalog.LoadMigration(ctx, conn, id)
+	})
+}
+
+// CountMigrations implements MigrationSource.
+func (p PgxCatalog) CountMigrations(ctx context.Context) (catalog.MigrationCounts, error) {
+	return withConn(ctx, p, func(ctx context.Context, conn *pgx.Conn) (catalog.MigrationCounts, error) {
+		return catalog.CountMigrations(ctx, conn)
+	})
+}
