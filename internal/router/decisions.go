@@ -13,8 +13,10 @@ import (
 // coordinates: a row is written before any participant prepares, and the
 // commit/abort decision is one atomic row update.
 type DecisionLog interface {
-	// Begin records gid as preparing on the given participant shards.
-	Begin(ctx context.Context, gid string, participants []int32) error
+	// Begin records gid as preparing on the given participant shards; xids
+	// are the participants' transaction ids in the same order, which a
+	// restore uses to tell a committed transaction from a lost one.
+	Begin(ctx context.Context, gid string, participants []int32, xids []string) error
 	// Commit decides commit; false means the row was no longer preparing
 	// (the resolver aborted the transaction first).
 	Commit(ctx context.Context, gid string) (bool, error)
@@ -46,8 +48,8 @@ func (l *PGDecisionLog) durable(ctx context.Context, sql string, args ...any) (i
 }
 
 // Begin implements DecisionLog.
-func (l *PGDecisionLog) Begin(ctx context.Context, gid string, participants []int32) error {
-	_, err := l.durable(ctx, `INSERT INTO pgshard.xact_decisions (gid, state, participants) VALUES ($1, 'preparing', $2)`, gid, participants)
+func (l *PGDecisionLog) Begin(ctx context.Context, gid string, participants []int32, xids []string) error {
+	_, err := l.durable(ctx, `INSERT INTO pgshard.xact_decisions (gid, state, participants, participant_xids) VALUES ($1, 'preparing', $2, $3)`, gid, participants, xids)
 	return err
 }
 

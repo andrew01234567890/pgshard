@@ -326,6 +326,13 @@ func TestRestoreSpecRules(t *testing.T) {
 	mustReject(t, r, "require backupId")
 	r.Spec.Target = pgshardv1alpha1.RestoreTarget{Immediate: &imm}
 	mustReject(t, r, "require backupId")
+	barrier := "nightly-1"
+	r.Spec.Target = pgshardv1alpha1.RestoreTarget{Barrier: &barrier}
+	mustReject(t, r, "require backupId")
+	r.Spec.Target = pgshardv1alpha1.RestoreTarget{Barrier: &barrier, Name: &name}
+	r.Spec.BackupID = "x"
+	mustReject(t, r, "at most one of target.time")
+	r.Spec.BackupID = ""
 	r.Spec.Target = pgshardv1alpha1.RestoreTarget{Time: &metav1.Time{Time: time.Now()}}
 	if err := create(t, r); err != nil {
 		t.Fatalf("time target without backupId: %v", err)
@@ -336,6 +343,13 @@ func TestRestoreSpecRules(t *testing.T) {
 	}
 	if err := create(t, r4); err != nil {
 		t.Fatalf("name target with backupId: %v", err)
+	}
+	r6 := &pgshardv1alpha1.PgShardRestore{
+		ObjectMeta: metav1.ObjectMeta{Name: "r6", Namespace: "default"},
+		Spec:       pgshardv1alpha1.PgShardRestoreSpec{ClusterName: "c", NewClusterName: "c4", Target: pgshardv1alpha1.RestoreTarget{Barrier: &barrier}, BackupID: "b1"},
+	}
+	if err := create(t, r6); err != nil {
+		t.Fatalf("barrier target with backupId: %v", err)
 	}
 	r5 := &pgshardv1alpha1.PgShardRestore{
 		ObjectMeta: metav1.ObjectMeta{Name: "r5", Namespace: "default"},

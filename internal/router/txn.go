@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -357,8 +358,26 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 	for i, p := range writers {
 		ids[i] = p.shard.ID
 	}
+	if err := e.r.awaitWriteFence(ctx); err != nil {
+		e.each(append(writers, readers...), func(p *txnPart) error { return e.runOn(ctx, p, "ROLLBACK", discardWriter{}) })
+		e.finishTxn("ROLLBACK")
+		return err
+	}
 	e.each(readers, func(p *txnPart) error { return e.runOn(ctx, p, "ROLLBACK", discardWriter{}) })
-	if err := log.Begin(ctx, gid, ids); err != nil {
+	xids := make([]string, len(writers))
+	e.each(writers, func(p *txnPart) error {
+		xid, err := e.queryOne(ctx, p, "SELECT pg_current_xact_id()::text")
+		if err == nil {
+			xids[slices.Index(writers, p)] = xid
+		}
+		return err
+	})
+	if err := firstError(writers); err != nil {
+		e.each(writers, func(p *txnPart) error { return e.runOn(ctx, p, "ROLLBACK", discardWriter{}) })
+		e.finishTxn("ROLLBACK")
+		return err
+	}
+	if err := log.Begin(ctx, gid, ids, xids); err != nil {
 		e.each(writers, func(p *txnPart) error { return e.runOn(ctx, p, "ROLLBACK", discardWriter{}) })
 		e.finishTxn("ROLLBACK")
 		return pgwire.Errorf(codeConnectionFailure, "two-phase commit: writing the decision log failed, transaction rolled back: %v", err)

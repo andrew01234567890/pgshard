@@ -71,7 +71,7 @@ func Run(ctx context.Context, o Options) error {
 	if err := (&BackupPolicyReconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup backup policy reconciler: %w", err)
 	}
-	if err := (&RestoreReconciler{Client: mgr.GetClient(), Agents: GRPCAgentClient{}}).SetupWithManager(mgr); err != nil {
+	if err := (&RestoreReconciler{Client: mgr.GetClient(), Agents: GRPCAgentClient{}, TwoPC: GRPCAgentClient{}}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup restore reconciler: %w", err)
 	}
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

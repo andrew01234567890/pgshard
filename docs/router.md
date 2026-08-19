@@ -480,6 +480,27 @@ hides short failovers from clients where it can do so safely:
   refused with `53300`. A client cancel while buffered is honoured with
   `57014`.
 
+### Write fence
+
+`pgshard.shard_map_generation.write_fence` is the cluster-wide write pause
+the controller raises while it takes a certified barrier (see
+[backup.md](backup.md#certified-barriers)). The snapshot carries it as
+`WriteFence`; while it is set:
+
+- A statement the planner classes as a write (DML, DDL, COPY, locking
+  SELECT) that starts a new write, or the first write of an open transaction,
+  waits like a buffered statement: until the fence clears (notification or the
+  200ms poll) or `--buffer-window` elapses, then is refused with **`57P03`
+  (cannot_connect_now) "cluster write pause for a certified restore point"**.
+  Nothing of it reaches a shard. Reads pass.
+- Later statements of a transaction that already wrote before the fence are
+  not held, so open transactions finish; a single-shard COMMIT is never held.
+- A two-phase COMMIT waits the same way and, if the window passes, rolls the
+  transaction back with `57P03` before any participant prepares, so no
+  distributed transaction straddles the barrier's restore points.
+- At most `--buffer-cap` statements wait behind the fence cluster-wide; the
+  next is refused with `53300`.
+
 ## Running
 
 ```

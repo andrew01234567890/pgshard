@@ -17,6 +17,66 @@ import (
 
 const minioImage = "minio/minio:RELEASE.2025-09-07T16-13-09Z"
 
+// startMinIO runs MinIO on the harness network with the pgshard bucket and
+// returns the agent's backup settings for stanza against it.
+func (h *harness) startMinIO(stanza string) map[string]any {
+	t := h.t
+	t.Helper()
+	minio := "pgshard-minio-" + h.suffix
+	docker(t, "run", "-d", "--name", minio, "--network", h.net,
+		"-e", "MINIO_ROOT_USER=minioadmin", "-e", "MINIO_ROOT_PASSWORD=minioadmin", minioImage, "server", "/data")
+	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", minio).Run() })
+	for name, content := range map[string]string{"key": "minioadmin\n", "keySecret": "minioadmin\n", "passphrase": "integration-cipher\n"} {
+		if err := os.WriteFile(filepath.Join(h.cfgDir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The bucket must exist before the stanza can be created; a throwaway
+	// mc-style call through the MinIO image does it without another image.
+	docker(t, "run", "--rm", "--network", h.net, "--entrypoint", "sh", minioImage, "-c",
+		"for i in $(seq 1 30); do mc alias set store http://"+minio+":9000 minioadmin minioadmin >/dev/null 2>&1 && mc mb --ignore-existing store/pgshard && exit 0; sleep 1; done; exit 1")
+	return map[string]any{
+		"stanza": stanza,
+		"repo": map[string]any{
+			"type": "s3", "bucket": "pgshard", "endpoint": "http://" + minio + ":9000", "region": "us-east-1",
+			"path": "/it", "uriStyle": "path", "verifyTLS": false, "credentialsDir": "/cfg",
+		},
+		"cipherPassFile": "/cfg/passphrase",
+		"retentionFull":  2,
+	}
+}
+
+// restoreFrom starts member as a fresh primary restored from the harness
+// backup settings with the given restore spec and waits until it promoted.
+func (h *harness) restoreFrom(member string, spec map[string]any) *node {
+	t := h.t
+	t.Helper()
+	bk := map[string]any{}
+	for k, v := range h.extra["backup"].(map[string]any) {
+		bk[k] = v
+	}
+	bk["stanza"] = member + "-pg18"
+	saved := h.extra
+	restoreExtra := map[string]any{"backup": bk, "restore": spec}
+	for k, v := range saved {
+		if k != "backup" && k != "restore" {
+			restoreExtra[k] = v
+		}
+	}
+	h.extra = restoreExtra
+	n := h.start(member, RolePrimary, member, nil)
+	h.extra = saved
+	n.waitHTTP("/startz", 200, 4*time.Minute)
+	n.waitHTTP("/readyz", 200, 60*time.Second)
+	if got := n.psql("SELECT pg_is_in_recovery()"); got != "f" {
+		t.Fatalf("%s still in recovery\n%s", member, n.logs())
+	}
+	if got := n.psql("SELECT timeline_id FROM pg_control_checkpoint()"); got == "1" {
+		t.Fatalf("%s stayed on timeline 1\n%s", member, n.logs())
+	}
+	return n
+}
+
 // TestBackupIntegration drives pgBackRest through the agent against MinIO:
 // archive_command wiring, stanza creation, full/diff/incr backups, info,
 // verify and the primary-only rule.
@@ -33,32 +93,7 @@ func TestBackupIntegration(t *testing.T) {
 	}
 	bin := buildAgent(t)
 	h := newHarness(t, image, bin)
-	minio := "pgshard-minio-" + h.suffix
-	docker(t, "run", "-d", "--name", minio, "--network", h.net,
-		"-e", "MINIO_ROOT_USER=minioadmin", "-e", "MINIO_ROOT_PASSWORD=minioadmin", minioImage, "server", "/data")
-	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", minio).Run() })
-	if err := os.WriteFile(filepath.Join(h.cfgDir, "key"), []byte("minioadmin\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(h.cfgDir, "keySecret"), []byte("minioadmin\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(h.cfgDir, "passphrase"), []byte("integration-cipher\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// The bucket must exist before the stanza can be created; a throwaway
-	// mc-style call through the MinIO image does it without another image.
-	docker(t, "run", "--rm", "--network", h.net, "--entrypoint", "sh", minioImage, "-c",
-		"for i in $(seq 1 30); do mc alias set store http://"+minio+":9000 minioadmin minioadmin >/dev/null 2>&1 && mc mb --ignore-existing store/pgshard && exit 0; sleep 1; done; exit 1")
-	h.extra = map[string]any{"backup": map[string]any{
-		"stanza": "it-s0-pg18",
-		"repo": map[string]any{
-			"type": "s3", "bucket": "pgshard", "endpoint": "http://" + minio + ":9000", "region": "us-east-1",
-			"path": "/it", "uriStyle": "path", "verifyTLS": false, "credentialsDir": "/cfg",
-		},
-		"cipherPassFile": "/cfg/passphrase",
-		"retentionFull":  2,
-	}}
+	h.extra = map[string]any{"backup": h.startMinIO("it-s0-pg18")}
 	peersOf := func(members ...string) []string {
 		var out []string
 		for _, m := range members {
@@ -180,23 +215,7 @@ func TestBackupIntegration(t *testing.T) {
 
 	restore := func(member string, spec map[string]any) *node {
 		t.Helper()
-		bk := map[string]any{}
-		for k, v := range h.extra["backup"].(map[string]any) {
-			bk[k] = v
-		}
-		bk["stanza"] = member + "-pg18"
-		saved := h.extra
-		h.extra = map[string]any{"backup": bk, "restore": spec}
-		n := h.start(member, RolePrimary, member, nil)
-		h.extra = saved
-		n.waitHTTP("/startz", 200, 4*time.Minute)
-		n.waitHTTP("/readyz", 200, 60*time.Second)
-		if got := n.psql("SELECT pg_is_in_recovery()"); got != "f" {
-			t.Fatalf("%s still in recovery\n%s", member, n.logs())
-		}
-		if got := n.psql("SELECT timeline_id FROM pg_control_checkpoint()"); got == "1" {
-			t.Fatalf("%s stayed on timeline 1\n%s", member, n.logs())
-		}
+		n := h.restoreFrom(member, spec)
 		if got := n.psql("SHOW archive_command"); !strings.Contains(got, "--stanza="+member+"-pg18 archive-push") {
 			t.Fatalf("%s archive_command=%s", member, got)
 		}

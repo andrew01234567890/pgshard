@@ -436,6 +436,7 @@ func runStore(ctx context.Context, t *testing.T, c *e2e.Cluster, s store, major 
 		return false
 	})
 	runRestores(ctx, t, c, s, major, incr)
+	runBarrierRestore(ctx, t, c, s, major, incr)
 }
 
 // runRestores restores the cluster into two new ones: to a named restore

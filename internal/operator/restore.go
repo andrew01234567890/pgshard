@@ -3,6 +3,7 @@ package operator
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"time"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
@@ -97,6 +98,13 @@ func restoreTargetOptions(spec *pgshardv1alpha1.PgShardRestoreSpec) (backup.Rest
 		set++
 		o.Type = backup.TargetImmediate
 	}
+	if t.Barrier != nil {
+		set++
+		if !barrierNameRE.MatchString(*t.Barrier) {
+			return o, fmt.Errorf("target.barrier %q is not a barrier name", *t.Barrier)
+		}
+		o.Type, o.Target = backup.TargetName, BarrierRestorePoint(*t.Barrier)
+	}
 	if set > 1 {
 		return o, fmt.Errorf("at most one restore target may be set")
 	}
@@ -111,3 +119,13 @@ func restoreTargetOptions(spec *pgshardv1alpha1.PgShardRestoreSpec) (backup.Rest
 
 // restoreTimeout bounds a restore before it is reported failed.
 const restoreTimeout = 4 * time.Hour
+
+var barrierNameRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+// BarrierRestorePoint is the WAL restore point name of a barrier, as the
+// controller records it on every group.
+func BarrierRestorePoint(barrier string) string { return "pgshard-" + barrier }
+
+// isBarrierRestore reports whether the restore targets a certified barrier
+// and so ends with two-phase reconciliation and unfencing.
+func isBarrierRestore(rs *pgshardv1alpha1.PgShardRestore) bool { return rs.Spec.Target.Barrier != nil }

@@ -22,6 +22,11 @@ service Controller {
   rpc ResolveTransactions(ResolveTransactionsRequest) returns (ResolveTransactionsResponse);
   // ApplyDDL starts a DDL migration and streams per-shard progress.
   rpc ApplyDDL(ApplyDDLRequest) returns (stream ApplyDDLResponse);
+  // CreateBarrier pauses writes, drains two-phase commits, creates a named
+  // restore point on every group and records a certified restore point.
+  rpc CreateBarrier(CreateBarrierRequest) returns (CreateBarrierResponse);
+  // ListBarriers lists recorded restore points, newest first.
+  rpc ListBarriers(ListBarriersRequest) returns (ListBarriersResponse);
 }
 
 // WorkflowKind enumerates workflow types.
@@ -148,4 +153,51 @@ message ShardDDLState {
 message ApplyDDLResponse {
   string migration_id = 1;
   ShardDDLState shard_state = 2;
+}
+
+// CreateBarrierRequest names the barrier; the restore point on every group
+// is "pgshard-<name>".
+message CreateBarrierRequest {
+  string name = 1;
+}
+
+// GroupRestorePoint is where one group's restore point landed.
+message GroupRestorePoint {
+  string group = 1;
+  uint64 lsn = 2;
+  int64 timeline = 3;
+  string wal_segment = 4;
+}
+
+// Barrier is one recorded restore point.
+message Barrier {
+  string id = 1;
+  string name = 2;
+  // Restore point name to recover every group to.
+  string restore_point = 3;
+  int64 shard_map_generation = 4;
+  // Certified means writes were paused and two-phase commits drained when
+  // the restore points were created, so restoring every group to it is
+  // cluster-consistent.
+  bool certified = 5;
+  repeated GroupRestorePoint groups = 6;
+  // Unix seconds.
+  int64 created_at = 7;
+}
+
+// CreateBarrierResponse returns the recorded barrier.
+message CreateBarrierResponse {
+  Barrier barrier = 1;
+  Error error = 2;
+}
+
+// ListBarriersRequest lists barriers.
+message ListBarriersRequest {
+  // True returns only certified barriers.
+  bool certified_only = 1;
+}
+
+// ListBarriersResponse returns barriers, newest first.
+message ListBarriersResponse {
+  repeated Barrier barriers = 1;
 }

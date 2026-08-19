@@ -103,6 +103,16 @@ type PgShardBackupPolicySpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	ProcessMax int `json:"processMax,omitempty"`
+	// BarrierSchedule is a cron expression on which the operator asks each
+	// bound cluster's controller for a certified barrier: a cluster-wide
+	// restore point taken with writes paused and two-phase commits drained.
+	// +optional
+	BarrierSchedule string `json:"barrierSchedule,omitempty"`
+	// ControllerEndpoint is the host:port of a cluster's Controller gRPC
+	// service, with {cluster} and {namespace} substituted; the default is
+	// {cluster}-controller.{namespace}.svc:15500.
+	// +optional
+	ControllerEndpoint string `json:"controllerEndpoint,omitempty"`
 }
 
 // ClusterBackupStatus is the backup health of one cluster bound to a policy.
@@ -242,7 +252,7 @@ type PgShardBackupList struct {
 }
 
 // RestoreTarget selects the recovery point.
-// +kubebuilder:validation:XValidation:rule="[has(self.time), has(self.lsn), has(self.name), has(self.xid), has(self.immediate) && self.immediate].filter(x, x).size() <= 1",message="at most one of target.time, target.lsn, target.name, target.xid, target.immediate may be set"
+// +kubebuilder:validation:XValidation:rule="[has(self.time), has(self.lsn), has(self.name), has(self.xid), has(self.immediate) && self.immediate, has(self.barrier)].filter(x, x).size() <= 1",message="at most one of target.time, target.lsn, target.name, target.xid, target.immediate, target.barrier may be set"
 type RestoreTarget struct {
 	// +optional
 	Time *metav1.Time `json:"time,omitempty"`
@@ -254,12 +264,19 @@ type RestoreTarget struct {
 	XID *string `json:"xid,omitempty"`
 	// +optional
 	Immediate *bool `json:"immediate,omitempty"`
+	// Barrier names a certified barrier: every group recovers to the WAL
+	// restore point pgshard-<barrier>, the new cluster stays write-fenced
+	// until its prepared transactions are reconciled against the restored
+	// decision log, and the restore fails on any contradiction.
+	// +optional
+	Barrier *string `json:"barrier,omitempty"`
 }
 
 // PgShardRestoreSpec requests a restore: a new cluster is created from the
 // source cluster's repository and every group recovers to the same target.
+// A barrier target is the only cluster-consistent one.
 // +kubebuilder:validation:XValidation:rule="self.newClusterName != self.clusterName",message="newClusterName must differ from clusterName"
-// +kubebuilder:validation:XValidation:rule="!(has(self.target) && (has(self.target.name) || has(self.target.xid) || (has(self.target.immediate) && self.target.immediate))) || (has(self.backupId) && self.backupId != ”)",message="target.name, target.xid and target.immediate require backupId"
+// +kubebuilder:validation:XValidation:rule="!(has(self.target) && (has(self.target.name) || has(self.target.xid) || has(self.target.barrier) || (has(self.target.immediate) && self.target.immediate))) || (has(self.backupId) && self.backupId != ”)",message="target.name, target.xid, target.barrier and target.immediate require backupId"
 type PgShardRestoreSpec struct {
 	// ClusterName is the source cluster whose repository is restored from.
 	ClusterName string `json:"clusterName"`
@@ -274,8 +291,9 @@ type PgShardRestoreSpec struct {
 	ClusterSpec *PgShardClusterSpec `json:"clusterSpec,omitempty"`
 	// BackupID pins the backup set: the name of a completed PgShardBackup of
 	// the source cluster (each group restores its own set), or a raw
-	// pgBackRest label applied to every group. Required for name, xid and
-	// immediate targets; time and lsn targets select the set automatically.
+	// pgBackRest label applied to every group. Required for name, xid,
+	// barrier and immediate targets (pick a backup taken before the
+	// barrier); time and lsn targets select the set automatically.
 	// +optional
 	BackupID string `json:"backupId,omitempty"`
 	// Target selects the recovery point; unset recovers to the end of the
@@ -295,9 +313,28 @@ type PgShardRestoreSpec struct {
 const (
 	RestorePhasePending   = "Pending"
 	RestorePhaseRestoring = "Restoring"
-	RestorePhaseRecovered = "Recovered"
-	RestorePhaseFailed    = "Failed"
+	// RestorePhaseReconciling: every group recovered to the barrier; the
+	// prepared transactions are being finished against the decision log
+	// while the cluster stays write-fenced.
+	RestorePhaseReconciling = "Reconciling"
+	RestorePhaseRecovered   = "Recovered"
+	RestorePhaseFailed      = "Failed"
 )
+
+// RestoreReconciliationStatus is the outcome of finishing prepared
+// transactions after a barrier restore.
+type RestoreReconciliationStatus struct {
+	// Decisions is the number of decision log rows applied.
+	Decisions  int32 `json:"decisions"`
+	Committed  int32 `json:"committed"`
+	RolledBack int32 `json:"rolledBack"`
+	// Contradictions lists "group: gid" pairs decided commit that the group
+	// neither holds prepared nor committed; any entry fails the restore.
+	// +optional
+	Contradictions []string `json:"contradictions,omitempty"`
+	// Unfenced is true once the write fence of the new cluster was released.
+	Unfenced bool `json:"unfenced"`
+}
 
 // GroupRestoreStatus is the progress of one group of the new cluster.
 type GroupRestoreStatus struct {
@@ -326,6 +363,8 @@ type PgShardRestoreStatus struct {
 	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
 	// +optional
 	Groups []GroupRestoreStatus `json:"groups,omitempty"`
+	// +optional
+	Reconciliation *RestoreReconciliationStatus `json:"reconciliation,omitempty"`
 	// +optional
 	Error string `json:"error,omitempty"`
 	// +optional

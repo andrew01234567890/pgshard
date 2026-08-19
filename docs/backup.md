@@ -82,6 +82,13 @@ behind the primary. Only the primary archives (`archive_mode=on`, not
 * `RestoreInfo` parses `pgbackrest info --output=json` for the member's stanza:
   status, archived WAL range and every backup set.
 * `Expire{epoch}` applies retention; `Verify` checks the repository.
+* `ListTransactionDecisions` (catalog primary, read-only) returns
+  `pgshard.xact_decisions`; `ReconcilePreparedTransactions{epoch, shard_id,
+  decisions}` finishes the instance's `pgshard-*` prepared transactions
+  against that log (each from the database it was prepared in) and reports
+  committed, rolled back and contradictions; `SetWriteFence{epoch, active,
+  reason}` raises or releases the catalog write fence. See
+  [Barrier restore](#barrier-restore).
 
 ## Objects
 
@@ -115,6 +122,8 @@ spec:
   schedules:
     full: "0 2 * * *"
     incremental: "*/30 * * * *"
+  barrierSchedule: "0 * * * *"
+  # controllerEndpoint: "{cluster}-controller.{namespace}.svc:15500"
   retention:
     full: 7
     differential: 4
@@ -126,6 +135,9 @@ reference it. Schedules are standard five-field cron expressions (plus
 creates one `PgShardBackup` per bound cluster, named
 `<policy>-<cluster>-<full|diff|incr>-<yyyymmdd-hhmm>` and owned by the policy,
 unless that cluster's previous scheduled backup is still pending or running.
+`barrierSchedule` ticks instead ask each bound cluster's controller for a
+[certified barrier](#certified-barriers) named
+`<policy>-<cluster>-<yyyymmdd-hhmm>`.
 
 Policy status: `Valid` (store settings and cron expressions parse),
 `BackupHealthy` aggregated over the bound clusters, and `status.clusters[]`
@@ -239,10 +251,64 @@ completed backup exists for the cluster; a rejoining former primary whose
 `pg_rewind` fails then restores from the repository and only falls back to
 `pg_basebackup` when the repository cannot serve it.
 
+## Certified barriers
+
+A barrier is a cluster-consistent restore point. `Controller.CreateBarrier`
+(and `PgShardBackupPolicy.spec.barrierSchedule`, a cron expression the
+operator turns into `CreateBarrier` calls against
+`spec.controllerEndpoint`, default `{cluster}-controller.{namespace}.svc:15500`,
+one bound cluster after another) runs `controller.Barrier`:
+
+1. raise `pgshard.shard_map_generation.write_fence` — routers hold new writes
+   and two-phase commits (see [router.md](router.md#write-fence));
+2. drain: run a resolver pass and wait until no `xact_decisions` row is
+   `preparing` and no group holds a `pgshard-*` prepared transaction
+   (`--barrier-drain-timeout`, 30s);
+3. `pg_create_restore_point('pgshard-<name>')` on the catalog and every shard
+   primary (through the resolver's shard DSNs), followed by `pg_switch_wal()`,
+   recording LSN, timeline and WAL segment;
+4. wait until `pg_stat_archiver.last_archived_wal` of every group covers its
+   segment (`--barrier-archive-timeout`, 2m; a group with `archive_mode=off`
+   fails the barrier);
+5. verify no decision row was created since the fence was raised (a router
+   that had not yet seen the fence), then insert `pgshard.restore_points`
+   `{name, shard_map_generation, per_group, certified: true}`;
+6. release the fence — on every failure path too, and nothing is recorded.
+
+`Controller.ListBarriers` (`certified_only`) lists them newest first; the
+restore point name every group shares is `pgshard-<name>`.
+
+### Barrier restore
+
+`PgShardRestore.spec.target.barrier: <name>` (with `backupId` naming a backup
+taken before the barrier) restores every group to `recovery_target_name
+pgshard-<name>` and then, once every primary promoted and the cluster is
+Ready, enters phase `Reconciling`: the restored catalog still carries the
+write fence the barrier raised, so routers of the new cluster refuse writes
+until the operator has
+
+1. read `pgshard.xact_decisions` through the catalog primary's agent
+   (`Agent.ListTransactionDecisions`);
+2. run `Agent.ReconcilePreparedTransactions` on every shard primary: a
+   prepared `pgshard-*` transaction is committed when the log says commit
+   and rolled back otherwise (abort, still preparing, or no row); a
+   commit-decided transaction the shard does not hold prepared must read
+   `committed` in `pg_xact_status(participant_xid)` — anything else is a
+   contradiction;
+3. released the fence (`Agent.SetWriteFence`) — only when there is no
+   contradiction. Any contradiction sets phase `Failed` with the offending
+   `group: gid` pairs in `status.error` and `status.reconciliation` and leaves
+   the cluster fenced; nothing proceeds silently.
+
+`status.reconciliation` reports decisions, committed, rolledBack,
+contradictions and unfenced. The decision table lives in
+`internal/twopc` (unit-tested against a fake `pg_prepared_xacts` view);
+`TestRestoreReconciliationMatrix` (agent, `-tags integration`)
+restores a shard to points before PREPARE, between PREPARE and the decision
+and after it, and checks each outcome.
+
 ## Not yet covered
 
-* Cluster-consistent barrier targets across groups (a per-group target from a
-  catalog restore point).
 * Backups from a standby (`backup-standby`).
 * A persistent spool volume for `archive-async` (the spool is on the container
   filesystem, so a pod restart re-pushes the pending segments).

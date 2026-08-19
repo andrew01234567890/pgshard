@@ -61,6 +61,9 @@ type Snapshot struct {
 	// Sequences names the rows of pgshard.sequences, the global sequences
 	// the router answers nextval() for.
 	Sequences map[string]bool
+	// WriteFence is set while the cluster pauses writes for a certified
+	// restore point; routers hold new writes until it clears.
+	WriteFence bool
 }
 
 // Roles holds credential verifiers keyed by role name. Its String and

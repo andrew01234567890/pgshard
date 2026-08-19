@@ -21,21 +21,24 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Agent_Status_FullMethodName             = "/pgshard.v1.Agent/Status"
-	Agent_Promote_FullMethodName            = "/pgshard.v1.Agent/Promote"
-	Agent_Demote_FullMethodName             = "/pgshard.v1.Agent/Demote"
-	Agent_Rewind_FullMethodName             = "/pgshard.v1.Agent/Rewind"
-	Agent_Reclone_FullMethodName            = "/pgshard.v1.Agent/Reclone"
-	Agent_Reload_FullMethodName             = "/pgshard.v1.Agent/Reload"
-	Agent_Restart_FullMethodName            = "/pgshard.v1.Agent/Restart"
-	Agent_CreateRestorePoint_FullMethodName = "/pgshard.v1.Agent/CreateRestorePoint"
-	Agent_CreateSlot_FullMethodName         = "/pgshard.v1.Agent/CreateSlot"
-	Agent_DropSlot_FullMethodName           = "/pgshard.v1.Agent/DropSlot"
-	Agent_ListSlots_FullMethodName          = "/pgshard.v1.Agent/ListSlots"
-	Agent_Backup_FullMethodName             = "/pgshard.v1.Agent/Backup"
-	Agent_RestoreInfo_FullMethodName        = "/pgshard.v1.Agent/RestoreInfo"
-	Agent_Expire_FullMethodName             = "/pgshard.v1.Agent/Expire"
-	Agent_Verify_FullMethodName             = "/pgshard.v1.Agent/Verify"
+	Agent_Status_FullMethodName                        = "/pgshard.v1.Agent/Status"
+	Agent_Promote_FullMethodName                       = "/pgshard.v1.Agent/Promote"
+	Agent_Demote_FullMethodName                        = "/pgshard.v1.Agent/Demote"
+	Agent_Rewind_FullMethodName                        = "/pgshard.v1.Agent/Rewind"
+	Agent_Reclone_FullMethodName                       = "/pgshard.v1.Agent/Reclone"
+	Agent_Reload_FullMethodName                        = "/pgshard.v1.Agent/Reload"
+	Agent_Restart_FullMethodName                       = "/pgshard.v1.Agent/Restart"
+	Agent_CreateRestorePoint_FullMethodName            = "/pgshard.v1.Agent/CreateRestorePoint"
+	Agent_CreateSlot_FullMethodName                    = "/pgshard.v1.Agent/CreateSlot"
+	Agent_DropSlot_FullMethodName                      = "/pgshard.v1.Agent/DropSlot"
+	Agent_ListSlots_FullMethodName                     = "/pgshard.v1.Agent/ListSlots"
+	Agent_Backup_FullMethodName                        = "/pgshard.v1.Agent/Backup"
+	Agent_RestoreInfo_FullMethodName                   = "/pgshard.v1.Agent/RestoreInfo"
+	Agent_Expire_FullMethodName                        = "/pgshard.v1.Agent/Expire"
+	Agent_Verify_FullMethodName                        = "/pgshard.v1.Agent/Verify"
+	Agent_ListTransactionDecisions_FullMethodName      = "/pgshard.v1.Agent/ListTransactionDecisions"
+	Agent_ReconcilePreparedTransactions_FullMethodName = "/pgshard.v1.Agent/ReconcilePreparedTransactions"
+	Agent_SetWriteFence_FullMethodName                 = "/pgshard.v1.Agent/SetWriteFence"
 )
 
 // AgentClient is the client API for Agent service.
@@ -83,6 +86,17 @@ type AgentClient interface {
 	Expire(ctx context.Context, in *ExpireRequest, opts ...grpc.CallOption) (*ExpireResponse, error)
 	// Verify checks the backup repository for corruption. Read-only.
 	Verify(ctx context.Context, in *VerifyRequest, opts ...grpc.CallOption) (*VerifyResponse, error)
+	// ListTransactionDecisions reads the two-phase commit decision log of the
+	// pgshard catalog this instance serves. Read-only.
+	ListTransactionDecisions(ctx context.Context, in *ListTransactionDecisionsRequest, opts ...grpc.CallOption) (*ListTransactionDecisionsResponse, error)
+	// ReconcilePreparedTransactions finishes prepared transactions on this
+	// instance against a decision log: commit-decided ones are committed,
+	// every other one rolled back, and commit-decided transactions that are
+	// neither prepared nor committed are reported as contradictions.
+	ReconcilePreparedTransactions(ctx context.Context, in *ReconcilePreparedTransactionsRequest, opts ...grpc.CallOption) (*ReconcilePreparedTransactionsResponse, error)
+	// SetWriteFence raises or releases the cluster write fence in the pgshard
+	// catalog this instance serves.
+	SetWriteFence(ctx context.Context, in *SetWriteFenceRequest, opts ...grpc.CallOption) (*SetWriteFenceResponse, error)
 }
 
 type agentClient struct {
@@ -243,6 +257,36 @@ func (c *agentClient) Verify(ctx context.Context, in *VerifyRequest, opts ...grp
 	return out, nil
 }
 
+func (c *agentClient) ListTransactionDecisions(ctx context.Context, in *ListTransactionDecisionsRequest, opts ...grpc.CallOption) (*ListTransactionDecisionsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListTransactionDecisionsResponse)
+	err := c.cc.Invoke(ctx, Agent_ListTransactionDecisions_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *agentClient) ReconcilePreparedTransactions(ctx context.Context, in *ReconcilePreparedTransactionsRequest, opts ...grpc.CallOption) (*ReconcilePreparedTransactionsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReconcilePreparedTransactionsResponse)
+	err := c.cc.Invoke(ctx, Agent_ReconcilePreparedTransactions_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *agentClient) SetWriteFence(ctx context.Context, in *SetWriteFenceRequest, opts ...grpc.CallOption) (*SetWriteFenceResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetWriteFenceResponse)
+	err := c.cc.Invoke(ctx, Agent_SetWriteFence_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AgentServer is the server API for Agent service.
 // All implementations must embed UnimplementedAgentServer
 // for forward compatibility.
@@ -288,6 +332,17 @@ type AgentServer interface {
 	Expire(context.Context, *ExpireRequest) (*ExpireResponse, error)
 	// Verify checks the backup repository for corruption. Read-only.
 	Verify(context.Context, *VerifyRequest) (*VerifyResponse, error)
+	// ListTransactionDecisions reads the two-phase commit decision log of the
+	// pgshard catalog this instance serves. Read-only.
+	ListTransactionDecisions(context.Context, *ListTransactionDecisionsRequest) (*ListTransactionDecisionsResponse, error)
+	// ReconcilePreparedTransactions finishes prepared transactions on this
+	// instance against a decision log: commit-decided ones are committed,
+	// every other one rolled back, and commit-decided transactions that are
+	// neither prepared nor committed are reported as contradictions.
+	ReconcilePreparedTransactions(context.Context, *ReconcilePreparedTransactionsRequest) (*ReconcilePreparedTransactionsResponse, error)
+	// SetWriteFence raises or releases the cluster write fence in the pgshard
+	// catalog this instance serves.
+	SetWriteFence(context.Context, *SetWriteFenceRequest) (*SetWriteFenceResponse, error)
 	mustEmbedUnimplementedAgentServer()
 }
 
@@ -342,6 +397,15 @@ func (UnimplementedAgentServer) Expire(context.Context, *ExpireRequest) (*Expire
 }
 func (UnimplementedAgentServer) Verify(context.Context, *VerifyRequest) (*VerifyResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Verify not implemented")
+}
+func (UnimplementedAgentServer) ListTransactionDecisions(context.Context, *ListTransactionDecisionsRequest) (*ListTransactionDecisionsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListTransactionDecisions not implemented")
+}
+func (UnimplementedAgentServer) ReconcilePreparedTransactions(context.Context, *ReconcilePreparedTransactionsRequest) (*ReconcilePreparedTransactionsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ReconcilePreparedTransactions not implemented")
+}
+func (UnimplementedAgentServer) SetWriteFence(context.Context, *SetWriteFenceRequest) (*SetWriteFenceResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SetWriteFence not implemented")
 }
 func (UnimplementedAgentServer) mustEmbedUnimplementedAgentServer() {}
 func (UnimplementedAgentServer) testEmbeddedByValue()               {}
@@ -634,6 +698,60 @@ func _Agent_Verify_Handler(srv interface{}, ctx context.Context, dec func(interf
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Agent_ListTransactionDecisions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListTransactionDecisionsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).ListTransactionDecisions(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_ListTransactionDecisions_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).ListTransactionDecisions(ctx, req.(*ListTransactionDecisionsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Agent_ReconcilePreparedTransactions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReconcilePreparedTransactionsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).ReconcilePreparedTransactions(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_ReconcilePreparedTransactions_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).ReconcilePreparedTransactions(ctx, req.(*ReconcilePreparedTransactionsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Agent_SetWriteFence_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetWriteFenceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).SetWriteFence(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_SetWriteFence_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).SetWriteFence(ctx, req.(*SetWriteFenceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Agent_ServiceDesc is the grpc.ServiceDesc for Agent service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -700,6 +818,18 @@ var Agent_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Verify",
 			Handler:    _Agent_Verify_Handler,
+		},
+		{
+			MethodName: "ListTransactionDecisions",
+			Handler:    _Agent_ListTransactionDecisions_Handler,
+		},
+		{
+			MethodName: "ReconcilePreparedTransactions",
+			Handler:    _Agent_ReconcilePreparedTransactions_Handler,
+		},
+		{
+			MethodName: "SetWriteFence",
+			Handler:    _Agent_SetWriteFence_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

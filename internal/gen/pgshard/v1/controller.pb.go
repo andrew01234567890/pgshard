@@ -953,6 +953,363 @@ func (x *ApplyDDLResponse) GetShardState() *ShardDDLState {
 	return nil
 }
 
+// CreateBarrierRequest names the barrier; the restore point on every group
+// is "pgshard-<name>".
+type CreateBarrierRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CreateBarrierRequest) Reset() {
+	*x = CreateBarrierRequest{}
+	mi := &file_pgshard_v1_controller_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CreateBarrierRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CreateBarrierRequest) ProtoMessage() {}
+
+func (x *CreateBarrierRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_controller_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CreateBarrierRequest.ProtoReflect.Descriptor instead.
+func (*CreateBarrierRequest) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_controller_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *CreateBarrierRequest) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+// GroupRestorePoint is where one group's restore point landed.
+type GroupRestorePoint struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Group         string                 `protobuf:"bytes,1,opt,name=group,proto3" json:"group,omitempty"`
+	Lsn           uint64                 `protobuf:"varint,2,opt,name=lsn,proto3" json:"lsn,omitempty"`
+	Timeline      int64                  `protobuf:"varint,3,opt,name=timeline,proto3" json:"timeline,omitempty"`
+	WalSegment    string                 `protobuf:"bytes,4,opt,name=wal_segment,json=walSegment,proto3" json:"wal_segment,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GroupRestorePoint) Reset() {
+	*x = GroupRestorePoint{}
+	mi := &file_pgshard_v1_controller_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GroupRestorePoint) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GroupRestorePoint) ProtoMessage() {}
+
+func (x *GroupRestorePoint) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_controller_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GroupRestorePoint.ProtoReflect.Descriptor instead.
+func (*GroupRestorePoint) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_controller_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *GroupRestorePoint) GetGroup() string {
+	if x != nil {
+		return x.Group
+	}
+	return ""
+}
+
+func (x *GroupRestorePoint) GetLsn() uint64 {
+	if x != nil {
+		return x.Lsn
+	}
+	return 0
+}
+
+func (x *GroupRestorePoint) GetTimeline() int64 {
+	if x != nil {
+		return x.Timeline
+	}
+	return 0
+}
+
+func (x *GroupRestorePoint) GetWalSegment() string {
+	if x != nil {
+		return x.WalSegment
+	}
+	return ""
+}
+
+// Barrier is one recorded restore point.
+type Barrier struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Id    string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Name  string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	// Restore point name to recover every group to.
+	RestorePoint       string `protobuf:"bytes,3,opt,name=restore_point,json=restorePoint,proto3" json:"restore_point,omitempty"`
+	ShardMapGeneration int64  `protobuf:"varint,4,opt,name=shard_map_generation,json=shardMapGeneration,proto3" json:"shard_map_generation,omitempty"`
+	// Certified means writes were paused and two-phase commits drained when
+	// the restore points were created, so restoring every group to it is
+	// cluster-consistent.
+	Certified bool                 `protobuf:"varint,5,opt,name=certified,proto3" json:"certified,omitempty"`
+	Groups    []*GroupRestorePoint `protobuf:"bytes,6,rep,name=groups,proto3" json:"groups,omitempty"`
+	// Unix seconds.
+	CreatedAt     int64 `protobuf:"varint,7,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Barrier) Reset() {
+	*x = Barrier{}
+	mi := &file_pgshard_v1_controller_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Barrier) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Barrier) ProtoMessage() {}
+
+func (x *Barrier) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_controller_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Barrier.ProtoReflect.Descriptor instead.
+func (*Barrier) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_controller_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *Barrier) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *Barrier) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *Barrier) GetRestorePoint() string {
+	if x != nil {
+		return x.RestorePoint
+	}
+	return ""
+}
+
+func (x *Barrier) GetShardMapGeneration() int64 {
+	if x != nil {
+		return x.ShardMapGeneration
+	}
+	return 0
+}
+
+func (x *Barrier) GetCertified() bool {
+	if x != nil {
+		return x.Certified
+	}
+	return false
+}
+
+func (x *Barrier) GetGroups() []*GroupRestorePoint {
+	if x != nil {
+		return x.Groups
+	}
+	return nil
+}
+
+func (x *Barrier) GetCreatedAt() int64 {
+	if x != nil {
+		return x.CreatedAt
+	}
+	return 0
+}
+
+// CreateBarrierResponse returns the recorded barrier.
+type CreateBarrierResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Barrier       *Barrier               `protobuf:"bytes,1,opt,name=barrier,proto3" json:"barrier,omitempty"`
+	Error         *Error                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CreateBarrierResponse) Reset() {
+	*x = CreateBarrierResponse{}
+	mi := &file_pgshard_v1_controller_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CreateBarrierResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CreateBarrierResponse) ProtoMessage() {}
+
+func (x *CreateBarrierResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_controller_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CreateBarrierResponse.ProtoReflect.Descriptor instead.
+func (*CreateBarrierResponse) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_controller_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *CreateBarrierResponse) GetBarrier() *Barrier {
+	if x != nil {
+		return x.Barrier
+	}
+	return nil
+}
+
+func (x *CreateBarrierResponse) GetError() *Error {
+	if x != nil {
+		return x.Error
+	}
+	return nil
+}
+
+// ListBarriersRequest lists barriers.
+type ListBarriersRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// True returns only certified barriers.
+	CertifiedOnly bool `protobuf:"varint,1,opt,name=certified_only,json=certifiedOnly,proto3" json:"certified_only,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListBarriersRequest) Reset() {
+	*x = ListBarriersRequest{}
+	mi := &file_pgshard_v1_controller_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListBarriersRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListBarriersRequest) ProtoMessage() {}
+
+func (x *ListBarriersRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_controller_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListBarriersRequest.ProtoReflect.Descriptor instead.
+func (*ListBarriersRequest) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_controller_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *ListBarriersRequest) GetCertifiedOnly() bool {
+	if x != nil {
+		return x.CertifiedOnly
+	}
+	return false
+}
+
+// ListBarriersResponse returns barriers, newest first.
+type ListBarriersResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Barriers      []*Barrier             `protobuf:"bytes,1,rep,name=barriers,proto3" json:"barriers,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListBarriersResponse) Reset() {
+	*x = ListBarriersResponse{}
+	mi := &file_pgshard_v1_controller_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListBarriersResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListBarriersResponse) ProtoMessage() {}
+
+func (x *ListBarriersResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_controller_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListBarriersResponse.ProtoReflect.Descriptor instead.
+func (*ListBarriersResponse) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_controller_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *ListBarriersResponse) GetBarriers() []*Barrier {
+	if x != nil {
+		return x.Barriers
+	}
+	return nil
+}
+
 var File_pgshard_v1_controller_proto protoreflect.FileDescriptor
 
 const file_pgshard_v1_controller_proto_rawDesc = "" +
@@ -1010,7 +1367,31 @@ const file_pgshard_v1_controller_proto_rawDesc = "" +
 	"\x10ApplyDDLResponse\x12!\n" +
 	"\fmigration_id\x18\x01 \x01(\tR\vmigrationId\x12:\n" +
 	"\vshard_state\x18\x02 \x01(\v2\x19.pgshard.v1.ShardDDLStateR\n" +
-	"shardState*\x9d\x01\n" +
+	"shardState\"*\n" +
+	"\x14CreateBarrierRequest\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\"x\n" +
+	"\x11GroupRestorePoint\x12\x14\n" +
+	"\x05group\x18\x01 \x01(\tR\x05group\x12\x10\n" +
+	"\x03lsn\x18\x02 \x01(\x04R\x03lsn\x12\x1a\n" +
+	"\btimeline\x18\x03 \x01(\x03R\btimeline\x12\x1f\n" +
+	"\vwal_segment\x18\x04 \x01(\tR\n" +
+	"walSegment\"\xf8\x01\n" +
+	"\aBarrier\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\x12#\n" +
+	"\rrestore_point\x18\x03 \x01(\tR\frestorePoint\x120\n" +
+	"\x14shard_map_generation\x18\x04 \x01(\x03R\x12shardMapGeneration\x12\x1c\n" +
+	"\tcertified\x18\x05 \x01(\bR\tcertified\x125\n" +
+	"\x06groups\x18\x06 \x03(\v2\x1d.pgshard.v1.GroupRestorePointR\x06groups\x12\x1d\n" +
+	"\n" +
+	"created_at\x18\a \x01(\x03R\tcreatedAt\"o\n" +
+	"\x15CreateBarrierResponse\x12-\n" +
+	"\abarrier\x18\x01 \x01(\v2\x13.pgshard.v1.BarrierR\abarrier\x12'\n" +
+	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"<\n" +
+	"\x13ListBarriersRequest\x12%\n" +
+	"\x0ecertified_only\x18\x01 \x01(\bR\rcertifiedOnly\"G\n" +
+	"\x14ListBarriersResponse\x12/\n" +
+	"\bbarriers\x18\x01 \x03(\v2\x13.pgshard.v1.BarrierR\bbarriers*\x9d\x01\n" +
 	"\fWorkflowKind\x12\x1d\n" +
 	"\x19WORKFLOW_KIND_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15WORKFLOW_KIND_RESHARD\x10\x01\x12\x17\n" +
@@ -1024,7 +1405,7 @@ const file_pgshard_v1_controller_proto_rawDesc = "" +
 	"\x15WORKFLOW_STATE_PAUSED\x10\x03\x12\x1c\n" +
 	"\x18WORKFLOW_STATE_COMPLETED\x10\x04\x12\x19\n" +
 	"\x15WORKFLOW_STATE_FAILED\x10\x05\x12\x1c\n" +
-	"\x18WORKFLOW_STATE_CANCELLED\x10\x062\x92\x04\n" +
+	"\x18WORKFLOW_STATE_CANCELLED\x10\x062\xbb\x05\n" +
 	"\n" +
 	"Controller\x12T\n" +
 	"\rListWorkflows\x12 .pgshard.v1.ListWorkflowsRequest\x1a!.pgshard.v1.ListWorkflowsResponse\x12N\n" +
@@ -1032,7 +1413,9 @@ const file_pgshard_v1_controller_proto_rawDesc = "" +
 	"\rPauseWorkflow\x12 .pgshard.v1.PauseWorkflowRequest\x1a!.pgshard.v1.PauseWorkflowResponse\x12W\n" +
 	"\x0eResumeWorkflow\x12!.pgshard.v1.ResumeWorkflowRequest\x1a\".pgshard.v1.ResumeWorkflowResponse\x12f\n" +
 	"\x13ResolveTransactions\x12&.pgshard.v1.ResolveTransactionsRequest\x1a'.pgshard.v1.ResolveTransactionsResponse\x12G\n" +
-	"\bApplyDDL\x12\x1b.pgshard.v1.ApplyDDLRequest\x1a\x1c.pgshard.v1.ApplyDDLResponse0\x01B\xb2\x01\n" +
+	"\bApplyDDL\x12\x1b.pgshard.v1.ApplyDDLRequest\x1a\x1c.pgshard.v1.ApplyDDLResponse0\x01\x12T\n" +
+	"\rCreateBarrier\x12 .pgshard.v1.CreateBarrierRequest\x1a!.pgshard.v1.CreateBarrierResponse\x12Q\n" +
+	"\fListBarriers\x12\x1f.pgshard.v1.ListBarriersRequest\x1a .pgshard.v1.ListBarriersResponseB\xb2\x01\n" +
 	"\x0ecom.pgshard.v1B\x0fControllerProtoP\x01ZFgithub.com/andrew01234567890/pgshard/internal/gen/pgshard/v1;pgshardv1\xa2\x02\x03PXX\xaa\x02\n" +
 	"Pgshard.V1\xca\x02\n" +
 	"Pgshard\\V1\xe2\x02\x16Pgshard\\V1\\GPBMetadata\xea\x02\vPgshard::V1b\x06proto3"
@@ -1050,7 +1433,7 @@ func file_pgshard_v1_controller_proto_rawDescGZIP() []byte {
 }
 
 var file_pgshard_v1_controller_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_pgshard_v1_controller_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
+var file_pgshard_v1_controller_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
 var file_pgshard_v1_controller_proto_goTypes = []any{
 	(WorkflowKind)(0),                   // 0: pgshard.v1.WorkflowKind
 	(WorkflowState)(0),                  // 1: pgshard.v1.WorkflowState
@@ -1069,42 +1452,56 @@ var file_pgshard_v1_controller_proto_goTypes = []any{
 	(*ApplyDDLRequest)(nil),             // 14: pgshard.v1.ApplyDDLRequest
 	(*ShardDDLState)(nil),               // 15: pgshard.v1.ShardDDLState
 	(*ApplyDDLResponse)(nil),            // 16: pgshard.v1.ApplyDDLResponse
-	(*ShardRef)(nil),                    // 17: pgshard.v1.ShardRef
-	(*Error)(nil),                       // 18: pgshard.v1.Error
+	(*CreateBarrierRequest)(nil),        // 17: pgshard.v1.CreateBarrierRequest
+	(*GroupRestorePoint)(nil),           // 18: pgshard.v1.GroupRestorePoint
+	(*Barrier)(nil),                     // 19: pgshard.v1.Barrier
+	(*CreateBarrierResponse)(nil),       // 20: pgshard.v1.CreateBarrierResponse
+	(*ListBarriersRequest)(nil),         // 21: pgshard.v1.ListBarriersRequest
+	(*ListBarriersResponse)(nil),        // 22: pgshard.v1.ListBarriersResponse
+	(*ShardRef)(nil),                    // 23: pgshard.v1.ShardRef
+	(*Error)(nil),                       // 24: pgshard.v1.Error
 }
 var file_pgshard_v1_controller_proto_depIdxs = []int32{
 	0,  // 0: pgshard.v1.Workflow.kind:type_name -> pgshard.v1.WorkflowKind
 	1,  // 1: pgshard.v1.Workflow.state:type_name -> pgshard.v1.WorkflowState
-	17, // 2: pgshard.v1.Workflow.shards:type_name -> pgshard.v1.ShardRef
-	18, // 3: pgshard.v1.Workflow.error:type_name -> pgshard.v1.Error
+	23, // 2: pgshard.v1.Workflow.shards:type_name -> pgshard.v1.ShardRef
+	24, // 3: pgshard.v1.Workflow.error:type_name -> pgshard.v1.Error
 	0,  // 4: pgshard.v1.ListWorkflowsRequest.kind:type_name -> pgshard.v1.WorkflowKind
 	1,  // 5: pgshard.v1.ListWorkflowsRequest.state:type_name -> pgshard.v1.WorkflowState
 	3,  // 6: pgshard.v1.ListWorkflowsResponse.workflows:type_name -> pgshard.v1.Workflow
 	3,  // 7: pgshard.v1.GetWorkflowResponse.workflow:type_name -> pgshard.v1.Workflow
 	3,  // 8: pgshard.v1.PauseWorkflowResponse.workflow:type_name -> pgshard.v1.Workflow
 	3,  // 9: pgshard.v1.ResumeWorkflowResponse.workflow:type_name -> pgshard.v1.Workflow
-	18, // 10: pgshard.v1.ResolveTransactionsResponse.error:type_name -> pgshard.v1.Error
-	17, // 11: pgshard.v1.ShardDDLState.shard:type_name -> pgshard.v1.ShardRef
+	24, // 10: pgshard.v1.ResolveTransactionsResponse.error:type_name -> pgshard.v1.Error
+	23, // 11: pgshard.v1.ShardDDLState.shard:type_name -> pgshard.v1.ShardRef
 	2,  // 12: pgshard.v1.ShardDDLState.state:type_name -> pgshard.v1.ShardDDLState.State
-	18, // 13: pgshard.v1.ShardDDLState.error:type_name -> pgshard.v1.Error
+	24, // 13: pgshard.v1.ShardDDLState.error:type_name -> pgshard.v1.Error
 	15, // 14: pgshard.v1.ApplyDDLResponse.shard_state:type_name -> pgshard.v1.ShardDDLState
-	4,  // 15: pgshard.v1.Controller.ListWorkflows:input_type -> pgshard.v1.ListWorkflowsRequest
-	6,  // 16: pgshard.v1.Controller.GetWorkflow:input_type -> pgshard.v1.GetWorkflowRequest
-	8,  // 17: pgshard.v1.Controller.PauseWorkflow:input_type -> pgshard.v1.PauseWorkflowRequest
-	10, // 18: pgshard.v1.Controller.ResumeWorkflow:input_type -> pgshard.v1.ResumeWorkflowRequest
-	12, // 19: pgshard.v1.Controller.ResolveTransactions:input_type -> pgshard.v1.ResolveTransactionsRequest
-	14, // 20: pgshard.v1.Controller.ApplyDDL:input_type -> pgshard.v1.ApplyDDLRequest
-	5,  // 21: pgshard.v1.Controller.ListWorkflows:output_type -> pgshard.v1.ListWorkflowsResponse
-	7,  // 22: pgshard.v1.Controller.GetWorkflow:output_type -> pgshard.v1.GetWorkflowResponse
-	9,  // 23: pgshard.v1.Controller.PauseWorkflow:output_type -> pgshard.v1.PauseWorkflowResponse
-	11, // 24: pgshard.v1.Controller.ResumeWorkflow:output_type -> pgshard.v1.ResumeWorkflowResponse
-	13, // 25: pgshard.v1.Controller.ResolveTransactions:output_type -> pgshard.v1.ResolveTransactionsResponse
-	16, // 26: pgshard.v1.Controller.ApplyDDL:output_type -> pgshard.v1.ApplyDDLResponse
-	21, // [21:27] is the sub-list for method output_type
-	15, // [15:21] is the sub-list for method input_type
-	15, // [15:15] is the sub-list for extension type_name
-	15, // [15:15] is the sub-list for extension extendee
-	0,  // [0:15] is the sub-list for field type_name
+	18, // 15: pgshard.v1.Barrier.groups:type_name -> pgshard.v1.GroupRestorePoint
+	19, // 16: pgshard.v1.CreateBarrierResponse.barrier:type_name -> pgshard.v1.Barrier
+	24, // 17: pgshard.v1.CreateBarrierResponse.error:type_name -> pgshard.v1.Error
+	19, // 18: pgshard.v1.ListBarriersResponse.barriers:type_name -> pgshard.v1.Barrier
+	4,  // 19: pgshard.v1.Controller.ListWorkflows:input_type -> pgshard.v1.ListWorkflowsRequest
+	6,  // 20: pgshard.v1.Controller.GetWorkflow:input_type -> pgshard.v1.GetWorkflowRequest
+	8,  // 21: pgshard.v1.Controller.PauseWorkflow:input_type -> pgshard.v1.PauseWorkflowRequest
+	10, // 22: pgshard.v1.Controller.ResumeWorkflow:input_type -> pgshard.v1.ResumeWorkflowRequest
+	12, // 23: pgshard.v1.Controller.ResolveTransactions:input_type -> pgshard.v1.ResolveTransactionsRequest
+	14, // 24: pgshard.v1.Controller.ApplyDDL:input_type -> pgshard.v1.ApplyDDLRequest
+	17, // 25: pgshard.v1.Controller.CreateBarrier:input_type -> pgshard.v1.CreateBarrierRequest
+	21, // 26: pgshard.v1.Controller.ListBarriers:input_type -> pgshard.v1.ListBarriersRequest
+	5,  // 27: pgshard.v1.Controller.ListWorkflows:output_type -> pgshard.v1.ListWorkflowsResponse
+	7,  // 28: pgshard.v1.Controller.GetWorkflow:output_type -> pgshard.v1.GetWorkflowResponse
+	9,  // 29: pgshard.v1.Controller.PauseWorkflow:output_type -> pgshard.v1.PauseWorkflowResponse
+	11, // 30: pgshard.v1.Controller.ResumeWorkflow:output_type -> pgshard.v1.ResumeWorkflowResponse
+	13, // 31: pgshard.v1.Controller.ResolveTransactions:output_type -> pgshard.v1.ResolveTransactionsResponse
+	16, // 32: pgshard.v1.Controller.ApplyDDL:output_type -> pgshard.v1.ApplyDDLResponse
+	20, // 33: pgshard.v1.Controller.CreateBarrier:output_type -> pgshard.v1.CreateBarrierResponse
+	22, // 34: pgshard.v1.Controller.ListBarriers:output_type -> pgshard.v1.ListBarriersResponse
+	27, // [27:35] is the sub-list for method output_type
+	19, // [19:27] is the sub-list for method input_type
+	19, // [19:19] is the sub-list for extension type_name
+	19, // [19:19] is the sub-list for extension extendee
+	0,  // [0:19] is the sub-list for field type_name
 }
 
 func init() { file_pgshard_v1_controller_proto_init() }
@@ -1119,7 +1516,7 @@ func file_pgshard_v1_controller_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pgshard_v1_controller_proto_rawDesc), len(file_pgshard_v1_controller_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   14,
+			NumMessages:   20,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -53,13 +53,15 @@ spec:
             description: |-
               PgShardRestoreSpec requests a restore: a new cluster is created from the
               source cluster's repository and every group recovers to the same target.
+              A barrier target is the only cluster-consistent one.
             properties:
               backupId:
                 description: |-
                   BackupID pins the backup set: the name of a completed PgShardBackup of
                   the source cluster (each group restores its own set), or a raw
-                  pgBackRest label applied to every group. Required for name, xid and
-                  immediate targets; time and lsn targets select the set automatically.
+                  pgBackRest label applied to every group. Required for name, xid,
+                  barrier and immediate targets (pick a backup taken before the
+                  barrier); time and lsn targets select the set automatically.
                 type: string
               clusterName:
                 description: ClusterName is the source cluster whose repository is
@@ -349,6 +351,13 @@ spec:
                   Target selects the recovery point; unset recovers to the end of the
                   archived WAL. The same target applies to every group.
                 properties:
+                  barrier:
+                    description: |-
+                      Barrier names a certified barrier: every group recovers to the WAL
+                      restore point pgshard-<barrier>, the new cluster stays write-fenced
+                      until its prepared transactions are reconciled against the restored
+                      decision log, and the restore fails on any contradiction.
+                    type: string
                   immediate:
                     type: boolean
                   lsn:
@@ -363,10 +372,10 @@ spec:
                 type: object
                 x-kubernetes-validations:
                 - message: at most one of target.time, target.lsn, target.name, target.xid,
-                    target.immediate may be set
+                    target.immediate, target.barrier may be set
                   rule: '[has(self.time), has(self.lsn), has(self.name), has(self.xid),
-                    has(self.immediate) && self.immediate].filter(x, x).size() <=
-                    1'
+                    has(self.immediate) && self.immediate, has(self.barrier)].filter(x,
+                    x).size() <= 1'
               targetTLI:
                 description: TargetTLI is the timeline to follow (recovery_target_timeline).
                 format: int64
@@ -379,10 +388,11 @@ spec:
             x-kubernetes-validations:
             - message: newClusterName must differ from clusterName
               rule: self.newClusterName != self.clusterName
-            - message: target.name, target.xid and target.immediate require backupId
+            - message: target.name, target.xid, target.barrier and target.immediate
+                require backupId
               rule: '!(has(self.target) && (has(self.target.name) || has(self.target.xid)
-                || (has(self.target.immediate) && self.target.immediate))) || (has(self.backupId)
-                && self.backupId != '''')'
+                || has(self.target.barrier) || (has(self.target.immediate) && self.target.immediate)))
+                || (has(self.backupId) && self.backupId != ”)'
           status:
             description: PgShardRestoreStatus is the observed state of a restore.
             properties:
@@ -480,6 +490,38 @@ spec:
                 type: array
               phase:
                 type: string
+              reconciliation:
+                description: |-
+                  RestoreReconciliationStatus is the outcome of finishing prepared
+                  transactions after a barrier restore.
+                properties:
+                  committed:
+                    format: int32
+                    type: integer
+                  contradictions:
+                    description: |-
+                      Contradictions lists "group: gid" pairs decided commit that the group
+                      neither holds prepared nor committed; any entry fails the restore.
+                    items:
+                      type: string
+                    type: array
+                  decisions:
+                    description: Decisions is the number of decision log rows applied.
+                    format: int32
+                    type: integer
+                  rolledBack:
+                    format: int32
+                    type: integer
+                  unfenced:
+                    description: Unfenced is true once the write fence of the new
+                      cluster was released.
+                    type: boolean
+                required:
+                - committed
+                - decisions
+                - rolledBack
+                - unfenced
+                type: object
               startedAt:
                 format: date-time
                 type: string

@@ -5,11 +5,17 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Querier is satisfied by *pgx.Conn, pgx.Tx and *pgxpool.Pool.
 type Querier interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+// Execer is satisfied by *pgx.Conn, pgx.Tx and *pgxpool.Pool.
+type Execer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 
 // Database is a row of pgshard.databases.
@@ -213,4 +219,29 @@ func Generations(ctx context.Context, q Querier) (shardMap, desired int64, err e
 		return 0, 0, err
 	}
 	return shardMap, desired, rows.Err()
+}
+
+// WriteFence is the cluster-wide write pause routers observe.
+type WriteFence struct {
+	Active   bool
+	Reason   string
+	FencedAt *time.Time
+}
+
+// ReadWriteFence returns the current write fence.
+func ReadWriteFence(ctx context.Context, q Querier) (WriteFence, error) {
+	rows, err := q.Query(ctx, `SELECT write_fence, write_fence_reason, write_fenced_at FROM pgshard.shard_map_generation`)
+	if err != nil {
+		return WriteFence{}, err
+	}
+	return pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[WriteFence])
+}
+
+// SetWriteFence raises or releases the write fence; the change notifies
+// routers through ServingChannel.
+func SetWriteFence(ctx context.Context, q Execer, active bool, reason string) error {
+	_, err := q.Exec(ctx, `UPDATE pgshard.shard_map_generation
+		SET write_fence = $1, write_fence_reason = CASE WHEN $1 THEN $2 ELSE '' END,
+		    write_fenced_at = CASE WHEN $1 THEN now() ELSE NULL END, updated_at = now()`, active, reason)
+	return err
 }

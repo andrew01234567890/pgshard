@@ -27,6 +27,8 @@ const (
 	Controller_ResumeWorkflow_FullMethodName      = "/pgshard.v1.Controller/ResumeWorkflow"
 	Controller_ResolveTransactions_FullMethodName = "/pgshard.v1.Controller/ResolveTransactions"
 	Controller_ApplyDDL_FullMethodName            = "/pgshard.v1.Controller/ApplyDDL"
+	Controller_CreateBarrier_FullMethodName       = "/pgshard.v1.Controller/CreateBarrier"
+	Controller_ListBarriers_FullMethodName        = "/pgshard.v1.Controller/ListBarriers"
 )
 
 // ControllerClient is the client API for Controller service.
@@ -48,6 +50,11 @@ type ControllerClient interface {
 	ResolveTransactions(ctx context.Context, in *ResolveTransactionsRequest, opts ...grpc.CallOption) (*ResolveTransactionsResponse, error)
 	// ApplyDDL starts a DDL migration and streams per-shard progress.
 	ApplyDDL(ctx context.Context, in *ApplyDDLRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ApplyDDLResponse], error)
+	// CreateBarrier pauses writes, drains two-phase commits, creates a named
+	// restore point on every group and records a certified restore point.
+	CreateBarrier(ctx context.Context, in *CreateBarrierRequest, opts ...grpc.CallOption) (*CreateBarrierResponse, error)
+	// ListBarriers lists recorded restore points, newest first.
+	ListBarriers(ctx context.Context, in *ListBarriersRequest, opts ...grpc.CallOption) (*ListBarriersResponse, error)
 }
 
 type controllerClient struct {
@@ -127,6 +134,26 @@ func (c *controllerClient) ApplyDDL(ctx context.Context, in *ApplyDDLRequest, op
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Controller_ApplyDDLClient = grpc.ServerStreamingClient[ApplyDDLResponse]
 
+func (c *controllerClient) CreateBarrier(ctx context.Context, in *CreateBarrierRequest, opts ...grpc.CallOption) (*CreateBarrierResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CreateBarrierResponse)
+	err := c.cc.Invoke(ctx, Controller_CreateBarrier_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controllerClient) ListBarriers(ctx context.Context, in *ListBarriersRequest, opts ...grpc.CallOption) (*ListBarriersResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListBarriersResponse)
+	err := c.cc.Invoke(ctx, Controller_ListBarriers_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ControllerServer is the server API for Controller service.
 // All implementations must embed UnimplementedControllerServer
 // for forward compatibility.
@@ -146,6 +173,11 @@ type ControllerServer interface {
 	ResolveTransactions(context.Context, *ResolveTransactionsRequest) (*ResolveTransactionsResponse, error)
 	// ApplyDDL starts a DDL migration and streams per-shard progress.
 	ApplyDDL(*ApplyDDLRequest, grpc.ServerStreamingServer[ApplyDDLResponse]) error
+	// CreateBarrier pauses writes, drains two-phase commits, creates a named
+	// restore point on every group and records a certified restore point.
+	CreateBarrier(context.Context, *CreateBarrierRequest) (*CreateBarrierResponse, error)
+	// ListBarriers lists recorded restore points, newest first.
+	ListBarriers(context.Context, *ListBarriersRequest) (*ListBarriersResponse, error)
 	mustEmbedUnimplementedControllerServer()
 }
 
@@ -173,6 +205,12 @@ func (UnimplementedControllerServer) ResolveTransactions(context.Context, *Resol
 }
 func (UnimplementedControllerServer) ApplyDDL(*ApplyDDLRequest, grpc.ServerStreamingServer[ApplyDDLResponse]) error {
 	return status.Errorf(codes.Unimplemented, "method ApplyDDL not implemented")
+}
+func (UnimplementedControllerServer) CreateBarrier(context.Context, *CreateBarrierRequest) (*CreateBarrierResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CreateBarrier not implemented")
+}
+func (UnimplementedControllerServer) ListBarriers(context.Context, *ListBarriersRequest) (*ListBarriersResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListBarriers not implemented")
 }
 func (UnimplementedControllerServer) mustEmbedUnimplementedControllerServer() {}
 func (UnimplementedControllerServer) testEmbeddedByValue()                    {}
@@ -296,6 +334,42 @@ func _Controller_ApplyDDL_Handler(srv interface{}, stream grpc.ServerStream) err
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Controller_ApplyDDLServer = grpc.ServerStreamingServer[ApplyDDLResponse]
 
+func _Controller_CreateBarrier_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateBarrierRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControllerServer).CreateBarrier(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Controller_CreateBarrier_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControllerServer).CreateBarrier(ctx, req.(*CreateBarrierRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Controller_ListBarriers_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListBarriersRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControllerServer).ListBarriers(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Controller_ListBarriers_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControllerServer).ListBarriers(ctx, req.(*ListBarriersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Controller_ServiceDesc is the grpc.ServiceDesc for Controller service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -322,6 +396,14 @@ var Controller_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ResolveTransactions",
 			Handler:    _Controller_ResolveTransactions_Handler,
+		},
+		{
+			MethodName: "CreateBarrier",
+			Handler:    _Controller_CreateBarrier_Handler,
+		},
+		{
+			MethodName: "ListBarriers",
+			Handler:    _Controller_ListBarriers_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
