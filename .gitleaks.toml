@@ -17,4 +17,6 @@ regexes = [
 ]
 paths = [
   '''go\.sum$''',
+  # Vendored upstream C sources (PostgreSQL parser); constants there are not credentials.
+  '''third_party/libpg_query/''',
 ]
