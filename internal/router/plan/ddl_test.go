@@ -2,10 +2,12 @@ package plan
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
 )
 
@@ -93,6 +95,19 @@ func TestDDLClassification(t *testing.T) {
 		{sql: "grant all on all tables in schema public to analyst", mig: "GRANT all"},
 		{sql: "grant analyst to app", mig: "GRANT ROLE all"},
 		{sql: "revoke analyst from app", mig: "REVOKE ROLE all"},
+		{sql: "create role boss superuser", refuse: "roles with the SUPERUSER attribute are not available through the router"},
+		{sql: "alter role analyst replication", refuse: "roles with the REPLICATION attribute are not available through the router"},
+		{sql: "create user x bypassrls", refuse: "roles with the BYPASSRLS attribute are not available through the router"},
+		{sql: "create user x nosuperuser", mig: "CREATE ROLE all", object: "role:x:present"},
+		{sql: "alter default privileges in schema public grant select on tables to analyst", refuse: "ALTER DEFAULT PRIVILEGES is not available through the router"},
+		{sql: "reassign owned by analyst to app", refuse: "REASSIGN OWNED is not available through the router"},
+		{sql: "drop owned by analyst", refuse: "DROP OWNED is not available through the router"},
+		{sql: "alter role analyst rename to analyst2", refuse: "renaming a role is not available through the router"},
+		{sql: "alter role analyst set work_mem from current", refuse: "ALTER ROLE ... SET ... FROM CURRENT is not available"},
+		{sql: "alter role analyst in database app set work_mem = '64MB'", mig: "ALTER ROLE all"},
+		{sql: "grant usage on schema public to analyst", mig: "GRANT all"},
+		{sql: "grant select (id), update (name) on items to analyst, public", mig: "GRANT home"},
+		{sql: "revoke grant option for select on orders from analyst", mig: "REVOKE all"},
 	}
 	if len(cases) < 30 {
 		t.Fatalf("only %d cases", len(cases))
@@ -175,5 +190,60 @@ func TestDDLRolePasswordBecomesVerifier(t *testing.T) {
 	pl, err = p.Plan(context.Background(), session(snap), "create role r3 password '"+pre+"'")
 	if err != nil || pl.Migration.Verifier != pre {
 		t.Fatalf("pre-hashed verifier: %+v %v", pl.Migration, err)
+	}
+}
+
+func TestRoleAndGrantNormalization(t *testing.T) {
+	p := New()
+	snap := fixture(t)
+	plan := func(sql string) *catalog.RoleChanges {
+		t.Helper()
+		pl, err := p.Plan(context.Background(), session(snap), sql)
+		if err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		return pl.Migration.Roles
+	}
+	js := func(v any) string {
+		b, _ := json.Marshal(v)
+		return string(b)
+	}
+	cases := []struct{ sql, want string }{
+		{"create role analyst", `{"attributes":{"login":false}}`},
+		{"create user analyst connection limit 5 valid until '2030-01-01' in role readers, writers admin boss", `{"attributes":{"connection_limit":5,"valid_until":"2030-01-01"},"grant_members":[{"role":"readers","member":"analyst"},{"role":"writers","member":"analyst"},{"role":"analyst","member":"boss","admin":true}]}`},
+		{"create role g nologin nocreatedb createrole noinherit valid until 'infinity'", `{"attributes":{"login":false,"createdb":false,"createrole":true,"inherit":false,"valid_until":""}}`},
+		{"alter role analyst password 'pw'", `null`},
+		{"alter role analyst login", `{"attributes":{"login":true}}`},
+		{"drop role a, b", `{"drop_roles":["a","b"]}`},
+		{"grant readers to analyst with admin option", `{"grant_members":[{"role":"readers","member":"analyst","admin":true}]}`},
+		{"grant readers, writers to a, b", `{"grant_members":[{"role":"readers","member":"a"},{"role":"readers","member":"b"},{"role":"writers","member":"a"},{"role":"writers","member":"b"}]}`},
+		{"revoke admin option for readers from analyst", `{"revoke_members":[{"role":"readers","member":"analyst","admin_only":true}]}`},
+		{"revoke readers from analyst", `{"revoke_members":[{"role":"readers","member":"analyst"}]}`},
+		{"grant select on orders to analyst", `{"grants":[{"kind":"table","name":"orders","grantee":"analyst","privileges":["SELECT"]}]}`},
+		{"grant all on table public.orders to analyst with grant option", `{"grants":[{"kind":"table","schema":"public","name":"orders","grantee":"analyst","privileges":["DELETE","INSERT","MAINTAIN","REFERENCES","SELECT","TRIGGER","TRUNCATE","UPDATE"],"grant_option":true}]}`},
+		{"grant select, insert on orders, docs to analyst, public", `{"grants":[{"kind":"table","name":"orders","grantee":"analyst","privileges":["INSERT","SELECT"]},{"kind":"table","name":"docs","grantee":"analyst","privileges":["INSERT","SELECT"]}]}`},
+		{"grant select (id), update (id, name) on items to analyst", `{"grants":[{"kind":"table","name":"items","column":"id","grantee":"analyst","privileges":["SELECT","UPDATE"]},{"kind":"table","name":"items","column":"name","grantee":"analyst","privileges":["UPDATE"]}]}`},
+		{"grant all (name) on items to analyst", `{"grants":[{"kind":"table","name":"items","column":"name","grantee":"analyst","privileges":["INSERT","REFERENCES","SELECT","UPDATE"]}]}`},
+		{"grant usage, create on schema audit to analyst", `{"grants":[{"kind":"schema","name":"audit","grantee":"analyst","privileges":["CREATE","USAGE"]}]}`},
+		{"grant all on database app to analyst", `{"grants":[{"kind":"database","name":"app","grantee":"analyst","privileges":["CONNECT","CREATE","TEMPORARY"]}]}`},
+		{"grant usage on sequence invoice_no to analyst", `{"grants":[{"kind":"sequence","name":"invoice_no","grantee":"analyst","privileges":["USAGE"]}]}`},
+		{"grant execute on function audit.f(int) to analyst", `{"grants":[{"kind":"function","schema":"audit","name":"f","grantee":"analyst","privileges":["EXECUTE"]}]}`},
+		{"grant usage on type mood to analyst", `{"grants":[{"kind":"type","name":"mood","grantee":"analyst","privileges":["USAGE"]}]}`},
+		{"grant select on all tables in schema public to analyst", `null`},
+		{"grant select on orders to public", `null`},
+		{"revoke select, update on orders from analyst cascade", `{"revokes":[{"kind":"table","name":"orders","grantee":"analyst","privileges":["SELECT","UPDATE"]}]}`},
+		{"revoke grant option for select on orders from analyst", `{"revokes":[{"kind":"table","name":"orders","grantee":"analyst","privileges":["SELECT"],"grant_option":true}]}`},
+		{"alter role analyst set search_path = app, public", `{"settings":[{"role":"analyst","name":"search_path","value":"app, public"}]}`},
+		{"alter role analyst in database app set work_mem to '64MB'", `{"settings":[{"role":"analyst","database":"app","name":"work_mem","value":"64MB"}]}`},
+		{"alter role analyst set statement_timeout = 5000", `{"settings":[{"role":"analyst","name":"statement_timeout","value":"5000"}]}`},
+		{"alter role analyst reset work_mem", `{"settings":[{"role":"analyst","name":"work_mem","reset":true}]}`},
+		{"alter role analyst set work_mem to default", `{"settings":[{"role":"analyst","name":"work_mem","reset":true}]}`},
+		{"alter role analyst reset all", `{"settings":[{"role":"analyst","reset_all":true}]}`},
+		{"alter role all set work_mem = '1MB'", `null`},
+	}
+	for _, c := range cases {
+		if got := js(plan(c.sql)); got != c.want {
+			t.Errorf("%s:\n got %s\nwant %s", c.sql, got, c.want)
+		}
 	}
 }

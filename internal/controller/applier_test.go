@@ -516,7 +516,8 @@ func TestApplierMirrorsRolesAndDatabases(t *testing.T) {
 	f.run(t)
 	got := strings.Join(f.store.execs, "\n")
 	for _, want := range []string{
-		"INSERT INTO pgshard.roles (rolname, verifier) VALUES ($1, nullif($2, '')) ON CONFLICT (rolname) DO UPDATE SET verifier = coalesce(nullif(EXCLUDED.verifier, ''), pgshard.roles.verifier), updated_at = now() [r SCRAM-SHA-256$x]",
+		"INSERT INTO pgshard.roles (rolname, verifier, login, createdb, createrole, inherit, connection_limit, valid_until) VALUES ($1, nullif($2, ''), coalesce($3, true),",
+		"[r SCRAM-SHA-256$x <nil> <nil> <nil> <nil> <nil> <nil>]",
 		"INSERT INTO pgshard.databases (name) VALUES ($1) ON CONFLICT (name) DO NOTHING [d]",
 		"DELETE FROM pgshard.databases WHERE name = $1 [d]",
 		"DELETE FROM pgshard.roles WHERE rolname = $1 [r]",

@@ -223,3 +223,32 @@ func (s *Server) transition(ctx context.Context, id, sql string, args ...any) er
 	}
 	return nil
 }
+
+// ListRoleStatus implements pgshardv1.ControllerServer.
+func (s *Server) ListRoleStatus(ctx context.Context, req *pgshardv1.ListRoleStatusRequest) (*pgshardv1.ListRoleStatusResponse, error) {
+	rows, err := ListRoleStatus(ctx, s.Pool, req.GetRole())
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "role status: %v", err)
+	}
+	resp := &pgshardv1.ListRoleStatusResponse{}
+	for _, r := range rows {
+		details, _ := json.Marshal(r.Details)
+		resp.Statuses = append(resp.Statuses, &pgshardv1.RoleStatus{Role: r.Role, Group: r.Group, State: roleState(r.State),
+			DetailsJson: string(details), RolesGeneration: r.Generation, CheckedAtUnix: r.CheckedAt.Unix()})
+	}
+	return resp, nil
+}
+
+func roleState(s string) pgshardv1.RoleStatus_State {
+	switch s {
+	case RoleInSync:
+		return pgshardv1.RoleStatus_STATE_IN_SYNC
+	case RoleDrifted:
+		return pgshardv1.RoleStatus_STATE_DRIFTED
+	case RoleMissing:
+		return pgshardv1.RoleStatus_STATE_MISSING
+	case RoleUnmanaged, RoleUnmanagedSuperuser:
+		return pgshardv1.RoleStatus_STATE_UNMANAGED
+	}
+	return pgshardv1.RoleStatus_STATE_UNSPECIFIED
+}

@@ -111,6 +111,7 @@ func (e *Executor) runMigration(ctx context.Context, pl plan.Plan, w pgwire.Resu
 			Role:     m.Role,
 			RoleOp:   m.RoleOp,
 			Verifier: m.Verifier,
+			Roles:    m.Roles,
 			Database: m.Database, DatabaseOp: m.DatabaseOp}}
 	id, err := e.r.cfg.Migrations.Enqueue(ctx, req)
 	if err != nil {

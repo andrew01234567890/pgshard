@@ -5,6 +5,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/pgparser"
 	"github.com/andrew01234567890/pgshard/internal/pgparser/pg18/pgquerypb"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
@@ -46,8 +47,11 @@ type Migration struct {
 	// mirrors the desired row in pgshard.roles.
 	Role     string
 	Verifier string
-	// RoleOp is "create", "alter" or "drop" when Role is set.
+	// RoleOp is "create", "alter", "set" or "drop" when Role is set.
 	RoleOp string
+	// Roles is the desired-state delta of a role, membership, grant or
+	// setting statement.
+	Roles *catalog.RoleChanges
 	// Database and DatabaseOp mirror CREATE/DROP DATABASE into
 	// pgshard.databases.
 	Database   string
@@ -349,8 +353,11 @@ func (w *walker) rename(s *pgquerypb.RenameStmt) error {
 		return w.migration(Migration{Kind: "ALTER TABLE", Scope: scope})
 	case pgquerypb.ObjectType_OBJECT_INDEX, pgquerypb.ObjectType_OBJECT_VIEW:
 		return w.migration(Migration{Kind: "ALTER " + objectWord(s.GetRenameType()), Scope: ScopeExisting})
+	case pgquerypb.ObjectType_OBJECT_ROLE:
+		return notYet("renaming a role is not available through the router",
+			"the catalog records roles, memberships and grants by name; create the new role and drop the old one")
 	case pgquerypb.ObjectType_OBJECT_SCHEMA, pgquerypb.ObjectType_OBJECT_SEQUENCE, pgquerypb.ObjectType_OBJECT_TYPE,
-		pgquerypb.ObjectType_OBJECT_ROLE, pgquerypb.ObjectType_OBJECT_DATABASE:
+		pgquerypb.ObjectType_OBJECT_DATABASE:
 		return w.migration(Migration{Kind: "ALTER " + objectWord(s.GetRenameType()), Scope: ScopeAll})
 	}
 	return w.unshardedOnly()
@@ -464,6 +471,19 @@ func (w *walker) grant(g *pgquerypb.GrantStmt) error {
 	if !g.GetIsGrant() {
 		kind = "REVOKE"
 	}
+	if g.GetTargtype() == pgquerypb.GrantTargetType_ACL_TARGET_DEFAULTS {
+		return notYet("ALTER DEFAULT PRIVILEGES is not available through the router",
+			"default ACLs are recorded per creating role and schema; GRANT on the objects after creating them")
+	}
+	rc := &catalog.RoleChanges{}
+	if g.GetIsGrant() {
+		rc.Grants = grantChanges(g)
+	} else {
+		rc.Revokes = grantChanges(g)
+	}
+	if len(rc.Grants) == 0 && len(rc.Revokes) == 0 {
+		rc = nil
+	}
 	if g.GetTargtype() == pgquerypb.GrantTargetType_ACL_TARGET_OBJECT && g.GetObjtype() == pgquerypb.ObjectType_OBJECT_TABLE {
 		var rvs []*pgquerypb.RangeVar
 		for _, obj := range g.GetObjects() {
@@ -479,9 +499,9 @@ func (w *walker) grant(g *pgquerypb.GrantStmt) error {
 		if err != nil {
 			return err
 		}
-		return w.migration(Migration{Kind: kind, Scope: scope})
+		return w.migration(Migration{Kind: kind, Scope: scope, Roles: rc})
 	}
-	return w.migration(Migration{Kind: kind, Scope: ScopeAll})
+	return w.migration(Migration{Kind: kind, Scope: ScopeAll, Roles: rc})
 }
 
 // createRole replaces a plaintext PASSWORD by its SCRAM verifier so every
@@ -489,28 +509,52 @@ func (w *walker) grant(g *pgquerypb.GrantStmt) error {
 func (w *walker) createRole(raw *pgquerypb.RawStmt, s *pgquerypb.CreateRoleStmt) error {
 	m := Migration{Kind: "CREATE ROLE", Scope: ScopeAll, Role: s.GetRole(), RoleOp: "create",
 		Object: ObjectRef{Kind: "role", Name: s.GetRole(), Expect: objectPresent}}
+	attrs, err := roleAttributes(s.GetOptions())
+	if err != nil {
+		return err
+	}
 	verifier, stmt, err := w.hashPassword(raw, s.GetOptions())
 	if err != nil {
 		return err
 	}
 	m.Verifier, m.Statement = verifier, stmt
+	m.Roles = &catalog.RoleChanges{Attributes: attrs, GrantMembers: createRoleMembers(s.GetRole(), s.GetOptions())}
+	if s.GetStmtType() == pgquerypb.RoleStmtType_ROLESTMT_ROLE || s.GetStmtType() == pgquerypb.RoleStmtType_ROLESTMT_GROUP {
+		if attrs == nil || attrs.Login == nil {
+			if m.Roles.Attributes == nil {
+				m.Roles.Attributes = &catalog.RoleAttributes{}
+			}
+			login := false
+			m.Roles.Attributes.Login = &login
+		}
+	}
 	return w.migration(m)
 }
 
 func (w *walker) alterRole(raw *pgquerypb.RawStmt, s *pgquerypb.AlterRoleStmt) error {
 	m := Migration{Kind: "ALTER ROLE", Scope: ScopeAll, Role: s.GetRole().GetRolename(), RoleOp: "alter"}
+	attrs, err := roleAttributes(s.GetOptions())
+	if err != nil {
+		return err
+	}
 	verifier, stmt, err := w.hashPassword(raw, s.GetOptions())
 	if err != nil {
 		return err
 	}
 	m.Verifier, m.Statement = verifier, stmt
+	if attrs != nil {
+		m.Roles = &catalog.RoleChanges{Attributes: attrs}
+	}
 	return w.migration(m)
 }
 
 func (w *walker) dropRole(s *pgquerypb.DropRoleStmt) error {
-	m := Migration{Kind: "DROP ROLE", Scope: ScopeAll, RoleOp: "drop"}
-	if roles := s.GetRoles(); len(roles) == 1 {
-		m.Role = roles[0].GetRoleSpec().GetRolename()
+	m := Migration{Kind: "DROP ROLE", Scope: ScopeAll, RoleOp: "drop", Roles: &catalog.RoleChanges{}}
+	for _, r := range s.GetRoles() {
+		m.Roles.DropRoles = append(m.Roles.DropRoles, r.GetRoleSpec().GetRolename())
+	}
+	if len(m.Roles.DropRoles) == 1 {
+		m.Role = m.Roles.DropRoles[0]
 		m.Object = ObjectRef{Kind: "role", Name: m.Role, Expect: objectAbsent}
 	}
 	return w.migration(m)

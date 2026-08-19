@@ -172,7 +172,7 @@ func (s *stack) startController(tb testing.TB) {
 	tb.Helper()
 	s.stopController()
 	s.controllerLog = &logBuffer{}
-	args := []string{"run", "--catalog-dsn", s.catalogDSN, "--listen", "", "--election-retry", "500ms", "--apply-interval", "200ms"}
+	args := []string{"run", "--catalog-dsn", s.catalogDSN, "--listen", "", "--election-retry", "500ms", "--apply-interval", "200ms", "--verify-roles-interval", "1s"}
 	for id, dsn := range s.shardDSNs {
 		args = append(args, "--shard-dsn", fmt.Sprintf("default/%d=%s", id, dsn))
 	}

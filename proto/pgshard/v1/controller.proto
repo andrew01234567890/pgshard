@@ -27,6 +27,9 @@ service Controller {
   rpc CreateBarrier(CreateBarrierRequest) returns (CreateBarrierResponse);
   // ListBarriers lists recorded restore points, newest first.
   rpc ListBarriers(ListBarriersRequest) returns (ListBarriersResponse);
+  // ListRoleStatus reports, per managed role and group, whether the group
+  // matches the catalog's desired role state.
+  rpc ListRoleStatus(ListRoleStatusRequest) returns (ListRoleStatusResponse);
 }
 
 // WorkflowKind enumerates workflow types.
@@ -200,4 +203,41 @@ message ListBarriersRequest {
 // ListBarriersResponse returns barriers, newest first.
 message ListBarriersResponse {
   repeated Barrier barriers = 1;
+}
+
+// RoleStatus is the drift state of one role on one group.
+message RoleStatus {
+  // Drift state of a role on a group.
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    // The group matches the desired role.
+    STATE_IN_SYNC = 1;
+    // Attributes, verifier, memberships or grants differ; details say what.
+    STATE_DRIFTED = 2;
+    // The role does not exist on the group.
+    STATE_MISSING = 3;
+    // The role exists on the group but is not in pgshard.roles; left alone.
+    STATE_UNMANAGED = 4;
+  }
+  string role = 1;
+  // Group name: "<shard set>/<shard id>" or "catalog".
+  string group = 2;
+  State state = 3;
+  // JSON object with the differences found and repair outcome.
+  string details_json = 4;
+  // Desired-state generation the group was last materialized at.
+  int64 roles_generation = 5;
+  // Unix seconds of the last check.
+  int64 checked_at_unix = 6;
+}
+
+// ListRoleStatusRequest filters role status rows.
+message ListRoleStatusRequest {
+  // Empty means every role.
+  string role = 1;
+}
+
+// ListRoleStatusResponse lists role status rows ordered by role and group.
+message ListRoleStatusResponse {
+  repeated RoleStatus statuses = 1;
 }

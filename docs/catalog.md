@@ -73,17 +73,28 @@ be written as several statements in one transaction.
 |--------|---------|
 | `rolname` | Role name (primary key). |
 | `verifier` | SCRAM verifier string. |
-| `attributes` | Role attributes as JSON. |
+| `login`, `createdb`, `createrole`, `inherit`, `connection_limit`, `valid_until` | Role attributes (`docs/roles.md`). |
+| `attributes` | Reserved JSON for further attributes. |
+
+### `pgshard.role_members`
+
+`(rolname, member, admin_option)` — role memberships; both sides reference
+`pgshard.roles`.
 
 ### `pgshard.grants`
 
 | Column | Meaning |
 |--------|---------|
 | `id` | Identity primary key. |
-| `rolname` | References `pgshard.roles`. |
+| `rolname` | Grantee; references `pgshard.roles`. |
 | `database` | References `pgshard.databases`. |
-| `object_kind`, `object_name` | What the privileges apply to. |
-| `privileges` | Privilege names. |
+| `object_kind`, `object_schema`, `object_name`, `column_name` | What the privileges apply to (unique with `rolname`, `database`). |
+| `privileges` | Privilege names, `ALL` expanded per kind. |
+| `grant_option` | `WITH GRANT OPTION`. |
+
+### `pgshard.role_settings`
+
+`(rolname, database, name, value)` — `ALTER ROLE … [IN DATABASE] SET`.
 
 ## Status tables
 
@@ -95,9 +106,10 @@ Status tables are written by `pgshard_system`; `pgshard_admin` and
 | `database_status` | `database`, `state`, `effective_generation`, `updated_at` |
 | `table_status` | `database`, `schema_name`, `table_name`, `effective_placement`, `effective_shard_key`, `effective_generation`, `workflow_id`, `progress` (jsonb), `updated_at` |
 | `shard_status` | `shard_set`, `shard_id`, `group_name`, `serving_state`, `primary_epoch`, `primary_endpoint`, `replay_lag_bytes`, `updated_at` |
-| `role_status` | `rolname`, `effective_generation`, `per_shard` (jsonb), `updated_at` |
+| `role_status` | per `(rolname, group_name)`: `state` (`in_sync`, `drifted`, `missing`, `unmanaged`, `unmanaged_superuser`), `details` (jsonb), `roles_generation`, `checked_at` (`docs/roles.md`) |
+| `role_group_status` | `group_name`, `roles_generation` the group was last materialized at, `materialized_at` |
 | `workflows` | `id` (uuid), `kind`, `state`, `spec`, `status`, `journal_ids`, `created_at`, `updated_at`, `error` |
-| `migrations` | DDL/DCL migrations (`docs/ddl.md`): `id` (uuid), `database`, `statement`, `kind`, `strategy` (`direct`, `concurrent`), `scope` (`all`, `home`, `existing`), `home_shard`, `state` (`queued`, `running`, `complete`, `failed`), `meta` (jsonb: run_as, object, role/verifier, database), `per_shard` (jsonb per shard: state, attempts, error, sqlstate), `error`, `created_at`, `updated_at`, `finished_at` |
+| `migrations` | DDL/DCL migrations (`docs/ddl.md`): `id` (uuid), `database`, `statement`, `kind`, `strategy` (`direct`, `concurrent`), `scope` (`all`, `home`, `existing`), `home_shard`, `state` (`queued`, `running`, `complete`, `failed`), `meta` (jsonb: run_as, object, role/verifier, roles delta, database), `per_shard` (jsonb per shard: state, attempts, error, sqlstate), `error`, `created_at`, `updated_at`, `finished_at` |
 | `xact_decisions` | Two-phase commit outcomes: `gid`, `state` (`preparing`, `commit`, `abort`), `participants`, `participant_xids` (since `0006`: the participants' `pg_current_xact_id()` in the same order, so a restore can tell a committed transaction from one that never happened), `created_at`, `decided_at` |
 | `streams` | `name`, `spec`, `position`, `state` |
 | `sequences` | Global sequences: `name`, `next_value`, `block_size`. Since migration `0005` `pgshard_admin` may also insert, update and delete rows (declaring a sequence or changing its block size), and routers allocate through `pgshard.allocate_sequence_block(name, n)`, a `SECURITY DEFINER` function (executable by `pgshard_admin`) that creates the row on first use, moves `next_value` past a block of `n` values (`block_size` when `n` is `NULL`) in one `UPDATE … RETURNING` and returns `(block_start, block_end)`. |

@@ -95,6 +95,13 @@ type Applier struct {
 	// Shards dials shard primaries as a superuser; it only provisions the
 	// DDL role, never runs client statements.
 	Shards DatabaseDialer
+	// Catalog, when set, dials the catalog group so role statements also
+	// apply there (the router authenticates against catalog verifiers and
+	// the pooler dials shards as the real user).
+	Catalog func(ctx context.Context) (ShardConn, error)
+	// Roles, when set, materializes the desired roles on groups that are
+	// behind before migrations run.
+	Roles  *RoleVerifier
 	Logger *slog.Logger
 	// DDLRole is the non-superuser login every client statement runs
 	// through (SET ROLE into the client role from there), so a function a
@@ -204,6 +211,11 @@ func (a *Applier) RunOnce(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("applier: pending migrations: %w", err)
 	}
+	if a.Roles != nil && len(pending) == 0 {
+		if err := a.Roles.MaterializeStale(ctx); err != nil {
+			a.logger().Warn("materializing roles on stale groups failed", "err", err)
+		}
+	}
 	done := 0
 	for _, m := range pending {
 		if err := a.drive(ctx, m); err != nil {
@@ -226,6 +238,9 @@ func (a *Applier) drive(ctx context.Context, m catalog.DDLMigration) error {
 		for _, id := range targets {
 			m.PerShard[shardKey(id)] = catalog.ShardMigration{State: catalog.ShardPending}
 		}
+		if a.Catalog != nil && roleStatement(m.Kind) {
+			m.PerShard[catalogKey] = catalog.ShardMigration{State: catalog.ShardPending}
+		}
 		m.State = catalog.MigrationRunning
 		if err := a.Store.Save(ctx, m); err != nil {
 			return err
@@ -237,11 +252,16 @@ func (a *Applier) drive(ctx context.Context, m catalog.DDLMigration) error {
 		if s.State == catalog.ShardApplied || s.State == catalog.ShardSkipped || s.State == catalog.ShardFailed {
 			continue
 		}
+		if key == catalogKey && anyFailed(m.PerShard) {
+			s.State, s.Error = catalog.ShardFailed, "not applied: a shard failed"
+			m.PerShard[key] = s
+			continue
+		}
 		if a.lostLeadership() {
 			return errNotLeader
 		}
 		id, _ := strconv.ParseInt(key, 10, 32)
-		s = a.applyOn(ctx, logger, &m, int32(id), s)
+		s = a.applyOn(ctx, logger, &m, key, int32(id), s)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -288,14 +308,42 @@ func (a *Applier) drive(ctx context.Context, m catalog.DDLMigration) error {
 
 func shardKey(id int32) string { return strconv.FormatInt(int64(id), 10) }
 
+// catalogKey is the per_shard entry of the catalog group; it sorts last so
+// the catalog is touched only after every shard applied.
+const catalogKey = "catalog"
+
+// roleStatement reports the kinds that must reach the catalog group too.
+func roleStatement(kind string) bool {
+	switch kind {
+	case "CREATE ROLE", "ALTER ROLE", "DROP ROLE", "GRANT ROLE", "REVOKE ROLE":
+		return true
+	}
+	return false
+}
+
+func anyFailed(per map[string]catalog.ShardMigration) bool {
+	for _, s := range per {
+		if s.State == catalog.ShardFailed {
+			return true
+		}
+	}
+	return false
+}
+
 func sortedShardKeys(per map[string]catalog.ShardMigration) []string {
 	keys := make([]string, 0, len(per))
 	for k := range per {
 		keys = append(keys, k)
 	}
 	sort.Slice(keys, func(i, j int) bool {
-		a, _ := strconv.Atoi(keys[i])
-		b, _ := strconv.Atoi(keys[j])
+		a, aerr := strconv.Atoi(keys[i])
+		b, berr := strconv.Atoi(keys[j])
+		if (aerr == nil) != (berr == nil) {
+			return aerr == nil
+		}
+		if aerr != nil {
+			return keys[i] < keys[j]
+		}
 		return a < b
 	})
 	return keys
@@ -318,18 +366,18 @@ func (a *Applier) targets(ctx context.Context, m catalog.DDLMigration) ([]int32,
 
 // applyOn runs one shard step, retrying lock and connection failures with
 // backoff, and returns the shard's final entry.
-func (a *Applier) applyOn(ctx context.Context, logger *slog.Logger, m *catalog.DDLMigration, id int32, s catalog.ShardMigration) catalog.ShardMigration {
+func (a *Applier) applyOn(ctx context.Context, logger *slog.Logger, m *catalog.DDLMigration, key string, id int32, s catalog.ShardMigration) catalog.ShardMigration {
 	resumed := s.State == catalog.ShardRunning || s.State == catalog.ShardRetrying
 	b := a.backoff()
 	start, wait := a.now(), b.Min
 	for {
 		s.Attempts++
 		s.State = catalog.ShardRunning
-		m.PerShard[shardKey(id)] = s
+		m.PerShard[key] = s
 		if err := a.Store.Save(ctx, *m); err != nil {
 			logger.Warn("progress not saved", "err", err)
 		}
-		outcome, err := a.step(ctx, m, id, resumed)
+		outcome, err := a.step(ctx, m, key, id, resumed)
 		resumed = true
 		if err == nil {
 			s.State, s.Error, s.SQLState = outcome, "", ""
@@ -355,7 +403,7 @@ func (a *Applier) applyOn(ctx context.Context, logger *slog.Logger, m *catalog.D
 			return s
 		}
 		s.State = catalog.ShardRetrying
-		m.PerShard[shardKey(id)] = s
+		m.PerShard[key] = s
 		if err := a.Store.Save(ctx, *m); err != nil {
 			logger.Warn("progress not saved", "err", err)
 		}
@@ -373,17 +421,27 @@ func (a *Applier) applyOn(ctx context.Context, logger *slog.Logger, m *catalog.D
 	}
 }
 
-// prepare opens the non-superuser session a client statement runs on:
-// the DDL role logged into the target database with lock_timeout set and
-// the client's role assumed.
-func (a *Applier) prepare(ctx context.Context, m *catalog.DDLMigration, id int32, db string) (ShardConn, error) {
-	password, err := a.provisionDDLRole(ctx, id, m.Meta.RunAs)
-	if err != nil {
-		return nil, err
-	}
-	conn, err := a.Shards.DialDatabaseAs(ctx, a.shardSet(), id, db, a.ddlRole(), password)
-	if err != nil {
-		return nil, &dialError{err}
+// prepare opens the session a statement runs on: for a shard, the DDL
+// role logged into the target database with the client's role assumed;
+// for the catalog group, a catalog connection as is. lock_timeout is set
+// on both.
+func (a *Applier) prepare(ctx context.Context, m *catalog.DDLMigration, key string, id int32, db string) (ShardConn, error) {
+	var conn ShardConn
+	if key == catalogKey {
+		c, err := a.Catalog(ctx)
+		if err != nil {
+			return nil, &dialError{err}
+		}
+		conn = c
+	} else {
+		password, err := a.provisionDDLRole(ctx, id, m.Meta.RunAs)
+		if err != nil {
+			return nil, err
+		}
+		conn, err = a.Shards.DialDatabaseAs(ctx, a.shardSet(), id, db, a.ddlRole(), password)
+		if err != nil {
+			return nil, &dialError{err}
+		}
 	}
 	timeout := a.LockTimeout
 	if timeout <= 0 {
@@ -393,13 +451,67 @@ func (a *Applier) prepare(ctx context.Context, m *catalog.DDLMigration, id int32
 		_ = conn.Close(context.WithoutCancel(ctx))
 		return nil, err
 	}
-	if m.Meta.RunAs != "" {
+	if m.Meta.RunAs != "" && key != catalogKey {
 		if _, err := conn.Exec(ctx, "SET ROLE "+pgx.Identifier{m.Meta.RunAs}.Sanitize()); err != nil {
 			_ = conn.Close(context.WithoutCancel(ctx))
 			return nil, err
 		}
 	}
 	return conn, nil
+}
+
+// step executes the statement on one shard once. A resumed step first
+// checks whether the object already matches (the previous attempt may have
+// committed before its progress was saved); an index left invalid by an
+// interrupted CREATE INDEX CONCURRENTLY is dropped and built again.
+func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, key string, id int32, resumed bool) (string, error) {
+	db := m.Database
+	if m.Meta.Object.Kind == "role" || m.Meta.Object.Kind == "database" || strings.HasSuffix(m.Kind, "ROLE") {
+		db = ""
+	}
+	conn, err := a.prepare(ctx, m, key, id, db)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	if resumed && m.Meta.Object.Kind != "" {
+		switch {
+		case m.Kind == "CREATE INDEX" && m.Meta.Object.Name != "":
+			dropped, err := dropInvalidIndex(ctx, conn, m.Meta.Object)
+			if err != nil {
+				return "", err
+			}
+			if !dropped {
+				matches, err := objectMatches(ctx, conn, m.Meta.Object)
+				if err != nil {
+					return "", err
+				}
+				if matches {
+					return catalog.ShardApplied, nil
+				}
+			}
+		default:
+			matches, err := objectMatches(ctx, conn, m.Meta.Object)
+			if err != nil {
+				return "", err
+			}
+			if matches {
+				return catalog.ShardApplied, nil
+			}
+		}
+	}
+	if m.Strategy == "concurrent" || outsideTransaction(m.Kind) {
+		err = a.concurrently(ctx, conn, m)
+	} else {
+		err = inTransaction(ctx, conn, m.Statement)
+	}
+	if err != nil {
+		if m.Scope == "existing" && missingObject(err) {
+			return "", &skippedError{err}
+		}
+		return "", err
+	}
+	return catalog.ShardApplied, nil
 }
 
 // provisionDDLRole makes sure the DDL role exists on shard id with this
@@ -459,60 +571,6 @@ func (a *Applier) provisionDDLRole(ctx context.Context, id int32, runAs string) 
 		return "", fmt.Errorf("granting %s to %s: %w", runAs, a.ddlRole(), err)
 	}
 	return a.ddlPassword, nil
-}
-
-// step executes the statement on one shard once. A resumed step first
-// checks whether the object already matches (the previous attempt may have
-// committed before its progress was saved); an index left invalid by an
-// interrupted CREATE INDEX CONCURRENTLY is dropped and built again.
-func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, id int32, resumed bool) (string, error) {
-	db := m.Database
-	if m.Meta.Object.Kind == "role" || m.Meta.Object.Kind == "database" || strings.HasSuffix(m.Kind, "ROLE") {
-		db = ""
-	}
-	conn, err := a.prepare(ctx, m, id, db)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
-	if resumed && m.Meta.Object.Kind != "" {
-		switch {
-		case m.Kind == "CREATE INDEX" && m.Meta.Object.Name != "":
-			dropped, err := dropInvalidIndex(ctx, conn, m.Meta.Object)
-			if err != nil {
-				return "", err
-			}
-			if !dropped {
-				matches, err := objectMatches(ctx, conn, m.Meta.Object)
-				if err != nil {
-					return "", err
-				}
-				if matches {
-					return catalog.ShardApplied, nil
-				}
-			}
-		default:
-			matches, err := objectMatches(ctx, conn, m.Meta.Object)
-			if err != nil {
-				return "", err
-			}
-			if matches {
-				return catalog.ShardApplied, nil
-			}
-		}
-	}
-	if m.Strategy == "concurrent" || outsideTransaction(m.Kind) {
-		err = a.concurrently(ctx, conn, m)
-	} else {
-		err = inTransaction(ctx, conn, m.Statement)
-	}
-	if err != nil {
-		if m.Scope == "existing" && missingObject(err) {
-			return "", &skippedError{err}
-		}
-		return "", err
-	}
-	return catalog.ShardApplied, nil
 }
 
 // outsideTransaction lists the kinds PostgreSQL refuses inside a
@@ -623,20 +681,17 @@ func objectMatches(ctx context.Context, conn ShardConn, o catalog.MigrationObjec
 // mirror writes the desired-state rows a completed DCL statement implies.
 func (a *Applier) mirror(ctx context.Context, m catalog.DDLMigration) error {
 	meta := m.Meta
-	var err error
-	switch {
-	case meta.RoleOp == "create" || meta.RoleOp == "alter" && meta.Verifier != "":
-		err = a.Store.Exec(ctx, `INSERT INTO pgshard.roles (rolname, verifier) VALUES ($1, nullif($2, ''))
-			ON CONFLICT (rolname) DO UPDATE SET verifier = coalesce(nullif(EXCLUDED.verifier, ''), pgshard.roles.verifier), updated_at = now()`, meta.Role, meta.Verifier)
-	case meta.RoleOp == "drop" && meta.Role != "":
-		err = a.Store.Exec(ctx, `DELETE FROM pgshard.roles WHERE rolname = $1`, meta.Role)
-	case meta.DatabaseOp == "create":
-		err = a.Store.Exec(ctx, `INSERT INTO pgshard.databases (name) VALUES ($1) ON CONFLICT (name) DO NOTHING`, meta.Database)
-	case meta.DatabaseOp == "drop":
-		err = a.Store.Exec(ctx, `DELETE FROM pgshard.databases WHERE name = $1`, meta.Database)
+	stmts := catalog.RoleMirrorStatements(m.Database, meta)
+	switch meta.DatabaseOp {
+	case "create":
+		stmts = append(stmts, catalog.Statement{SQL: `INSERT INTO pgshard.databases (name) VALUES ($1) ON CONFLICT (name) DO NOTHING`, Args: []any{meta.Database}})
+	case "drop":
+		stmts = append(stmts, catalog.Statement{SQL: `DELETE FROM pgshard.databases WHERE name = $1`, Args: []any{meta.Database}})
 	}
-	if err != nil {
-		return fmt.Errorf("applier: mirroring %s into the catalog: %w", m.Kind, err)
+	for _, st := range stmts {
+		if err := a.Store.Exec(ctx, st.SQL, st.Args...); err != nil {
+			return fmt.Errorf("applier: mirroring %s into the catalog: %w", m.Kind, err)
+		}
 	}
 	return nil
 }
