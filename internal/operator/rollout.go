@@ -352,14 +352,17 @@ func (r *ClusterReconciler) stepAwayFromPrimary(ctx context.Context, c *pgshardv
 	return nil
 }
 
-// freshestStandby picks the sync-set standby with the highest flushed LSN.
+// freshestStandby picks the reachable standby with the highest flushed LSN
+// (planned switchover target); unlike failover it only considers standbys that
+// were streaming, since the primary is alive and no acknowledgement can be
+// lost by the choice.
 func (r *ClusterReconciler) freshestStandby(ctx context.Context, g Group, state groupState, members map[string]*memberInfo, password string) string {
 	var views []memberView
 	for _, name := range g.MemberNames() {
 		if name == state.primary || !state.syncSet[name] {
 			continue
 		}
-		v := memberView{Name: name, InSyncSet: true}
+		v := memberView{Name: name, Listed: true}
 		if m := members[name]; m != nil && m.ip != "" {
 			if st, err := r.Prober.ProbeStandby(ctx, HostDSN(m.ip, password)); err == nil {
 				v.Reachable, v.InRecovery, v.FlushLSN = true, st.InRecovery, st.FlushLSN
@@ -367,7 +370,7 @@ func (r *ClusterReconciler) freshestStandby(ctx context.Context, g Group, state 
 		}
 		views = append(views, v)
 	}
-	best, err := chooseCandidate(views, state.primary, "")
+	best, err := chooseCandidate(views, state.primary, "", 1)
 	if err != nil {
 		return ""
 	}
