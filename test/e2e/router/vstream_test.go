@@ -82,6 +82,21 @@ func (s *vstreamStack) confirmedFlush(tb testing.TB, shard int) uint64 {
 	return uint64(lsn)
 }
 
+func (s *vstreamStack) walEnd(tb testing.TB, shard int) uint64 {
+	tb.Helper()
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, s.appDSN(shard))
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	var lsn int64
+	if err := conn.QueryRow(ctx, "select pg_current_wal_lsn() - '0/0'::pg_lsn").Scan(&lsn); err != nil {
+		tb.Fatal(err)
+	}
+	return uint64(lsn)
+}
+
 // consumed is what one Stream call delivered: row ids per transaction in
 // delivery order, the gids seen in Prepare/CommitPrepared events and the
 // last VGtid.
@@ -276,6 +291,23 @@ func TestRouterVStream(t *testing.T) {
 			t.Fatalf("confirmed_flush_lsn did not reach %v (shard0 %d, shard1 %d)", final.GetShards(), s.confirmedFlush(t, 0), s.confirmedFlush(t, 1))
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+
+	// An ack past what was delivered is clamped at the pooler: confirmed_flush
+	// stays at or below the WAL end, never at the bogus position.
+	const overAck = uint64(1) << 62
+	var overPos pgshardv1.VPosition
+	for _, p := range final.GetShards() {
+		overPos.Shards = append(overPos.Shards, &pgshardv1.VPosition_Shard{Shard: p.GetShard(), Lsn: overAck})
+	}
+	if ack, err := s.client.Ack(ctx, &pgshardv1.VStreamAckRequest{Stream: "orders", Position: &overPos}); err != nil || ack.GetError() != nil {
+		t.Fatalf("over-ack through the router: %v %v", ack, err)
+	}
+	for _, p := range final.GetShards() {
+		id := int(p.GetShard().GetShardId())
+		if got := s.confirmedFlush(t, id); got >= overAck || got > s.walEnd(t, id) {
+			t.Fatalf("shard %d: over-ack moved confirmed_flush_lsn to %d", id, got)
+		}
 	}
 	cancel()
 

@@ -84,15 +84,32 @@ func (a *StreamAdmin) createSlot(ctx context.Context, sh ShardRef, database, slo
 	err = scanOne(ctx, conn, `SELECT lsn - '0/0'::pg_lsn FROM pg_create_logical_replication_slot($1, 'pgoutput', false, $2, true)`, &lsn, slot, twoPhase)
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "42710" {
-		return queryExisting(ctx, conn, slot)
+		return queryExisting(ctx, conn, slot, twoPhase)
 	}
 	return uint64(lsn), err
 }
 
-func queryExisting(ctx context.Context, conn ShardConn, slot string) (uint64, error) {
+func queryExisting(ctx context.Context, conn ShardConn, slot string, twoPhase bool) (uint64, error) {
+	rows, err := conn.Query(ctx, `SELECT two_phase, coalesce(confirmed_flush_lsn - '0/0'::pg_lsn, 0) FROM pg_replication_slots WHERE slot_name = $1`, slot)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if rows.Err() != nil {
+			return 0, rows.Err()
+		}
+		return 0, fmt.Errorf("slot %s vanished", slot)
+	}
+	var have bool
 	var lsn int64
-	err := scanOne(ctx, conn, `SELECT coalesce(confirmed_flush_lsn - '0/0'::pg_lsn, 0) FROM pg_replication_slots WHERE slot_name = $1`, &lsn, slot)
-	return uint64(lsn), err
+	if err := rows.Scan(&have, &lsn); err != nil {
+		return 0, err
+	}
+	if have != twoPhase {
+		return 0, fmt.Errorf("slot %s exists with two_phase=%t, requested %t", slot, have, twoPhase)
+	}
+	return uint64(lsn), nil
 }
 
 func ensurePublication(ctx context.Context, conn ShardConn) error {

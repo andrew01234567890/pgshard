@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
@@ -120,6 +121,13 @@ func TestStreamAdminCreatesAndDropsSlotsOnEveryShard(t *testing.T) {
 	}
 	if _, err := a.Create(ctx, "orders", "postgres", true, ""); err == nil {
 		t.Fatal("duplicate stream must fail")
+	}
+	g0 := ShardRef{Set: slots[0].Shard.Set, ID: slots[0].Shard.ID}
+	if lsn, err := a.createSlot(ctx, g0, "postgres", "pgshard_orders_g0", true); err != nil || lsn == 0 {
+		t.Fatalf("existing slot with matching two_phase must be reused: %d %v", lsn, err)
+	}
+	if _, err := a.createSlot(ctx, g0, "postgres", "pgshard_orders_g0", false); err == nil || !strings.Contains(err.Error(), "two_phase") {
+		t.Fatalf("existing slot with different two_phase must fail: %v", err)
 	}
 
 	// A shard that is down leaves the stream creating with the slots made so far.
