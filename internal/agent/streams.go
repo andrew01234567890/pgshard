@@ -2,11 +2,13 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
@@ -16,7 +18,8 @@ import (
 const StreamPublication = "pgshard_all"
 
 // CreateStreamSlot fences, ensures the publication exists in the stream's
-// database and creates the failover-enabled pgoutput slot there.
+// database and creates the failover-enabled pgoutput slot there. An existing
+// slot is reused when its two_phase setting matches the request.
 func (s *Server) CreateStreamSlot(ctx context.Context, req *pgshardv1.CreateStreamSlotRequest) (*pgshardv1.CreateStreamSlotResponse, error) {
 	resp := &pgshardv1.CreateStreamSlotResponse{Epoch: s.epoch.Current()}
 	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
@@ -40,6 +43,10 @@ func (s *Server) CreateStreamSlot(ctx context.Context, req *pgshardv1.CreateStre
 		var lsn *uint64
 		err := q.QueryRow(ctx, `SELECT lsn - '0/0'::pg_lsn FROM pg_create_logical_replication_slot($1, 'pgoutput', false, $2, true)`,
 			resp.Slot, req.GetTwoPhase()).Scan(&lsn)
+		var pe *pgconn.PgError
+		if errors.As(err, &pe) && pe.Code == "42710" {
+			return existingStreamSlot(ctx, q, resp.Slot, req.GetTwoPhase(), &resp.Lsn)
+		}
 		if err != nil {
 			return err
 		}
@@ -50,6 +57,18 @@ func (s *Server) CreateStreamSlot(ctx context.Context, req *pgshardv1.CreateStre
 	})
 	resp.Error = pgErr(err)
 	return resp, nil
+}
+
+func existingStreamSlot(ctx context.Context, q querier, slot string, twoPhase bool, lsn *uint64) error {
+	var have bool
+	err := q.QueryRow(ctx, `SELECT two_phase, coalesce(confirmed_flush_lsn - '0/0'::pg_lsn, 0) FROM pg_replication_slots WHERE slot_name = $1`, slot).Scan(&have, lsn)
+	if err != nil {
+		return err
+	}
+	if have != twoPhase {
+		return fmt.Errorf("slot %s exists with two_phase=%t, requested %t", slot, have, twoPhase)
+	}
+	return nil
 }
 
 func ensurePublication(ctx context.Context, q querier) error {

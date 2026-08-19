@@ -35,9 +35,10 @@ type StreamConfig struct {
 
 // streamReader is the one admitted reader of a slot.
 type streamReader struct {
-	acked   atomic.Uint64
-	flushed atomic.Uint64
-	wake    chan struct{}
+	acked     atomic.Uint64
+	flushed   atomic.Uint64
+	delivered atomic.Uint64
+	wake      chan struct{}
 }
 
 func (s *Server) streamDefaults() StreamConfig {
@@ -105,7 +106,9 @@ func (s *Server) StreamChanges(req *pgshardv1.StreamRequest, srv pgshardv1.Poole
 }
 
 // Ack implements Pooler.Ack: it hands the position to the slot's reader and
-// waits until the reader has reported it to the server.
+// waits until the reader has reported it to the server. Positions beyond the
+// last delivered batch end are clamped so confirmed_flush never overtakes
+// what the client has actually seen.
 func (s *Server) Ack(ctx context.Context, req *pgshardv1.AckRequest) (*pgshardv1.AckResponse, error) {
 	slot, err := s.slotOf(req.GetSlot(), req.GetStream())
 	if err != nil {
@@ -117,9 +120,10 @@ func (s *Server) Ack(ctx context.Context, req *pgshardv1.AckRequest) (*pgshardv1
 	if r == nil {
 		return &pgshardv1.AckResponse{Error: &pgshardv1.Error{Sqlstate: "55000", Message: "slot " + slot + " has no active reader"}}, nil
 	}
+	lsn := min(req.GetLsn(), r.delivered.Load())
 	for {
 		cur := r.acked.Load()
-		if req.GetLsn() <= cur || r.acked.CompareAndSwap(cur, req.GetLsn()) {
+		if lsn <= cur || r.acked.CompareAndSwap(cur, lsn) {
 			break
 		}
 	}
@@ -128,7 +132,7 @@ func (s *Server) Ack(ctx context.Context, req *pgshardv1.AckRequest) (*pgshardv1
 	default:
 	}
 	deadline := time.Now().Add(10 * time.Second)
-	for r.flushed.Load() < req.GetLsn() {
+	for r.flushed.Load() < lsn {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -193,7 +197,18 @@ func (s *Server) runStream(ctx context.Context, req *pgshardv1.StreamRequest, em
 		}
 		return status.Errorf(codes.Unavailable, "start replication: %v", err)
 	}
-	b := &batcher{emit: emit, perEvent: perEvent, max: cfg.MaxBatchBytes}
+	deliver := func(batch *pgshardv1.ChangeBatch) error {
+		if err := emit(batch); err != nil {
+			return err
+		}
+		for {
+			cur := reader.delivered.Load()
+			if batch.GetEndLsn() <= cur || reader.delivered.CompareAndSwap(cur, batch.GetEndLsn()) {
+				return nil
+			}
+		}
+	}
+	b := &batcher{emit: deliver, perEvent: perEvent, max: cfg.MaxBatchBytes}
 	if req.GetBatchBytes() > 0 && int(req.GetBatchBytes()) < b.max {
 		b.max = int(req.GetBatchBytes())
 	}

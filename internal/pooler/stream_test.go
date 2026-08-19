@@ -188,10 +188,37 @@ func TestStreamRefusals(t *testing.T) {
 	if _, err := s.Ack(ctx, &pgshardv1.AckRequest{}); status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("ack without slot: %v", err)
 	}
+	unconfirmed := &streamReader{wake: make(chan struct{}, 1)}
+	unconfirmed.delivered.Store(5)
 	s.mu.Lock()
-	s.readers["b"] = &streamReader{wake: make(chan struct{}, 1)}
+	s.readers["b"] = unconfirmed
 	s.mu.Unlock()
 	if _, err := s.Ack(ctx, &pgshardv1.AckRequest{Slot: "b", Lsn: 5}); err == nil {
 		t.Fatal("ack must give up when no reader confirms")
+	}
+}
+
+func TestAckClampsToDelivered(t *testing.T) {
+	s := NewServer(Config{Source: NewStaticSource(View{})})
+	r := &streamReader{wake: make(chan struct{}, 1)}
+	r.delivered.Store(100)
+	r.flushed.Store(100)
+	s.mu.Lock()
+	s.readers = map[string]*streamReader{"b": r}
+	s.mu.Unlock()
+	resp, err := s.Ack(context.Background(), &pgshardv1.AckRequest{Slot: "b", Lsn: 250})
+	if err != nil || resp.GetError() != nil {
+		t.Fatalf("over-ack: %v %v", resp, err)
+	}
+	if got := r.acked.Load(); got != 100 {
+		t.Fatalf("acked %d, want clamped to delivered 100", got)
+	}
+	r.delivered.Store(300)
+	r.flushed.Store(300)
+	if _, err := s.Ack(context.Background(), &pgshardv1.AckRequest{Slot: "b", Lsn: 250}); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.acked.Load(); got != 250 {
+		t.Fatalf("acked %d, want 250", got)
 	}
 }

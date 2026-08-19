@@ -387,6 +387,12 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	if err != nil || css.GetError() != nil || css.GetSlot() != "pgshard_orders_s0" || css.GetLsn() == 0 {
 		t.Fatalf("create stream slot: %v %v", css, err)
 	}
+	if again, err := s.grpc.CreateStreamSlot(ctx, &pgshardv1.CreateStreamSlotRequest{Epoch: 1, Stream: "orders", Database: "postgres", TwoPhase: true}); err != nil || again.GetError() != nil || again.GetSlot() != css.GetSlot() || again.GetLsn() == 0 {
+		t.Fatalf("recreate with same two_phase must be idempotent: %v %v", again, err)
+	}
+	if again, err := s.grpc.CreateStreamSlot(ctx, &pgshardv1.CreateStreamSlotRequest{Epoch: 1, Stream: "orders", Database: "postgres", TwoPhase: false}); err != nil || again.GetError() == nil {
+		t.Fatalf("recreate with different two_phase must fail: %v %v", again, err)
+	}
 	if got := s.psql("SELECT puballtables FROM pg_publication WHERE pubname = 'pgshard_all'"); got != "t" {
 		t.Fatalf("publication: %q", got)
 	}
