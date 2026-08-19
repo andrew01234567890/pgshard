@@ -18,8 +18,10 @@ import (
 // It is idempotent. Not for production: the operator owns these records.
 type DevBootstrap struct {
 	CatalogDSN string
-	// ShardDSN is a superuser DSN of shard 0 of the default shard set.
+	// ShardDSN is a superuser DSN of shard ShardID of the default shard set.
 	ShardDSN string
+	// ShardID is the shard the DSN and PoolerEndpoint describe; 0 by default.
+	ShardID  int32
 	Database string
 	Role     string
 	Password string
@@ -33,10 +35,6 @@ func (b DevBootstrap) Run(ctx context.Context) error {
 	if b.Database == "" || b.Role == "" || b.Password == "" {
 		return errors.New("router: dev bootstrap needs Database, Role and Password")
 	}
-	verifier, err := pgwire.BuildSCRAMVerifier(b.Password, nil, pgwire.DefaultSCRAMIterations)
-	if err != nil {
-		return err
-	}
 	cat, err := pgx.Connect(ctx, b.CatalogDSN)
 	if err != nil {
 		return fmt.Errorf("router: catalog: %w", err)
@@ -45,17 +43,21 @@ func (b DevBootstrap) Run(ctx context.Context) error {
 	if err := catalog.Migrate(ctx, cat); err != nil {
 		return err
 	}
+	verifier, err := b.verifier(ctx, cat)
+	if err != nil {
+		return err
+	}
 	stmts := []struct {
 		sql  string
 		args []any
 	}{
 		{`INSERT INTO pgshard.databases (name) VALUES ($1) ON CONFLICT (name) DO NOTHING`, []any{b.Database}},
 		{`INSERT INTO pgshard.roles (rolname, verifier) VALUES ($1, $2)
-		  ON CONFLICT (rolname) DO UPDATE SET verifier = EXCLUDED.verifier, updated_at = now()`, []any{b.Role, verifier.String()}},
+		  ON CONFLICT (rolname) DO UPDATE SET verifier = EXCLUDED.verifier, updated_at = now()`, []any{b.Role, verifier}},
 		{`INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch, primary_endpoint)
-		  VALUES ($1, 0, 'shard0', 'serving', $2, $3)
+		  VALUES ($1, $2, 'shard' || $2::integer, 'serving', $3, $4)
 		  ON CONFLICT (shard_set, shard_id) DO UPDATE SET primary_epoch = EXCLUDED.primary_epoch,
-		    primary_endpoint = EXCLUDED.primary_endpoint, updated_at = now()`, []any{DefaultShardSet, b.Epoch, b.PoolerEndpoint}},
+		    primary_endpoint = EXCLUDED.primary_endpoint, updated_at = now()`, []any{DefaultShardSet, b.ShardID, b.Epoch, b.PoolerEndpoint}},
 	}
 	for _, s := range stmts {
 		if _, err := cat.Exec(ctx, s.sql, s.args...); err != nil {
@@ -77,7 +79,7 @@ func (b DevBootstrap) Run(ctx context.Context) error {
 	if exists {
 		verb = "ALTER ROLE " + role + " LOGIN PASSWORD "
 	}
-	if _, err := shard.Exec(ctx, verb+quoteLiteral(verifier.String())); err != nil {
+	if _, err := shard.Exec(ctx, verb+quoteLiteral(verifier)); err != nil {
 		return fmt.Errorf("router: shard role: %w", err)
 	}
 	if err := shard.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)`, b.Database).Scan(&exists); err != nil {
@@ -102,6 +104,30 @@ func (b DevBootstrap) Run(ctx context.Context) error {
 		return fmt.Errorf("router: shard grants: %w", err)
 	}
 	return nil
+}
+
+// verifier reuses the verifier already registered for the role when it
+// matches the password, so every shard bootstrapped with the same password
+// shares one SCRAM salt; otherwise a fresh one is built.
+func (b DevBootstrap) verifier(ctx context.Context, cat *pgx.Conn) (string, error) {
+	var existing string
+	err := cat.QueryRow(ctx, `SELECT coalesce(verifier, '') FROM pgshard.roles WHERE rolname = $1`, b.Role).Scan(&existing)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("router: catalog role: %w", err)
+	}
+	if existing != "" {
+		if old, err := pgwire.ParseSCRAMVerifier(existing); err == nil {
+			same, err := pgwire.BuildSCRAMVerifier(b.Password, old.Salt, old.Iterations)
+			if err == nil && same.String() == existing {
+				return existing, nil
+			}
+		}
+	}
+	v, err := pgwire.BuildSCRAMVerifier(b.Password, nil, pgwire.DefaultSCRAMIterations)
+	if err != nil {
+		return "", err
+	}
+	return v.String(), nil
 }
 
 func quoteLiteral(s string) string {

@@ -83,6 +83,13 @@ func newHarnessWith(t *testing.T, fp *fakePooler, poolerAddr string, mutate func
 	if mutate != nil {
 		mutate(&cfg)
 	}
+	startHarness(t, h, cfg)
+	return h
+}
+
+// startHarness builds the router from cfg and serves it on a loopback port.
+func startHarness(t *testing.T, h *harness, cfg Config) {
+	t.Helper()
 	r, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -117,7 +124,6 @@ func newHarnessWith(t *testing.T, fp *fakePooler, poolerAddr string, mutate func
 		_ = srv.Shutdown(ctx)
 	})
 	h.addr = l.Addr().String()
-	return h
 }
 
 func (h *harness) connect(t *testing.T, dsn string) *pgx.Conn {

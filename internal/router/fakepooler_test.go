@@ -31,6 +31,8 @@ type fakePooler struct {
 	sleeping  map[string]chan struct{}
 	dropAfter string
 	dropped   int
+	// executed records every statement text this shard ran, in order.
+	executed []string
 }
 
 type fakeBackend struct {
@@ -141,6 +143,13 @@ func (s *fakeStream) rfq() error {
 	return nil
 }
 
+// ran reports the statements this shard executed.
+func (f *fakePooler) ran() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.executed...)
+}
+
 func (f *fakePooler) isReserved(sid string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -173,6 +182,9 @@ func (s *fakeStream) row(v string) error {
 func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err error) {
 	b := s.f.backend(s.sid)
 	q := strings.ToLower(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(sql), ";")))
+	s.f.mu.Lock()
+	s.f.executed = append(s.f.executed, q)
+	s.f.mu.Unlock()
 	if b.tx == 'E' && q != "rollback" && q != "commit" {
 		return true, s.errorf("25P02", "current transaction is aborted")
 	}
@@ -197,6 +209,12 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 		}
 		b.gucs[strings.TrimSpace(name)] = strings.Trim(strings.TrimSpace(val), "'")
 		return true, s.complete("SET")
+	case q == "reset all":
+		b.gucs = map[string]string{}
+		return true, s.complete("RESET")
+	case strings.HasPrefix(q, "reset "):
+		delete(b.gucs, strings.TrimSpace(strings.TrimPrefix(q, "reset ")))
+		return true, s.complete("RESET")
 	case strings.HasPrefix(q, "select current_setting('"):
 		name := strings.TrimSuffix(strings.TrimPrefix(q, "select current_setting('"), "')")
 		if err := s.rowDesc("current_setting", 25); err != nil {
@@ -245,6 +263,21 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 		return true, s.complete("SELECT 0")
 	case q == "select rows":
 		if err := s.rowDesc("n", 23); err != nil {
+			return true, err
+		}
+		if err := s.row(fmt.Sprint(b.rows)); err != nil {
+			return true, err
+		}
+		return true, s.complete("SELECT 1")
+	case strings.HasPrefix(q, "insert into "):
+		b.rows++
+		return true, s.complete("INSERT 0 1")
+	case strings.HasPrefix(q, "update "):
+		return true, s.complete("UPDATE 1")
+	case strings.HasPrefix(q, "delete from "):
+		return true, s.complete("DELETE 1")
+	case strings.HasPrefix(q, "select * from "):
+		if err := s.rowDesc("id", 23); err != nil {
 			return true, err
 		}
 		if err := s.row(fmt.Sprint(b.rows)); err != nil {
@@ -351,7 +384,7 @@ func (s *fakeStream) runBatch(ctx context.Context) error {
 			var sql string
 			if m.Describe.Kind == pgshardv1.Describe_KIND_STATEMENT {
 				sql = b.stmts[m.Describe.Name]
-				if err := s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_ParameterDescription{ParameterDescription: &pgshardv1.ParameterDescription{}}}); err != nil {
+				if err := s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_ParameterDescription{ParameterDescription: &pgshardv1.ParameterDescription{ParamOids: paramOIDs(sql)}}}); err != nil {
 					return err
 				}
 			} else {
@@ -383,6 +416,21 @@ func (s *fakeStream) runBatch(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// paramOIDs mimics the backend's parameter inference: statements over the
+// text-keyed docs table take text parameters, everything else int8.
+func paramOIDs(sql string) []uint32 {
+	n := strings.Count(sql, "$")
+	oid := uint32(20)
+	if strings.Contains(sql, "docs") {
+		oid = 25
+	}
+	out := make([]uint32, n)
+	for i := range out {
+		out[i] = oid
+	}
+	return out
 }
 
 func (f *fakePooler) Execute(stream pgshardv1.Pooler_ExecuteServer) error {
