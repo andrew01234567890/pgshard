@@ -13,7 +13,7 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
                    │                              ▲
                    └───── waits for state ────────┘
                                                   │
-                     controller leader ── applier ─┘── SET ROLE <client>; BEGIN; SET LOCAL lock_timeout; DDL; COMMIT ──▶ shard 0..n
+                     controller leader ── applier ─┘── login pgshard_ddl; SET lock_timeout; SET ROLE <client>; BEGIN; DDL; COMMIT ──▶ shard 0..n
 ```
 
 1. **Classify.** The router parses the statement (`internal/router/plan/ddl.go`)
@@ -40,11 +40,13 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
    * DDL inside a transaction block — each shard commits its own
      transaction; the fan-out cannot be rolled back with the client's.
    * Rewrite class (`ALTER COLUMN … TYPE`, `SET LOGGED`/`UNLOGGED`,
-     `SET TABLESPACE`, `ADD COLUMN … DEFAULT <volatile expression>`): these
-     rewrite the table under an exclusive lock and wait for online schema
-     change (M8). Metadata-only and weaker-lock forms (`ADD COLUMN` with a
-     constant default, `DROP COLUMN`, `ADD CONSTRAINT`, `SET NOT NULL`, …)
-     are applied.
+     `SET TABLESPACE`, `ADD COLUMN … DEFAULT <volatile expression>`,
+     `ADD COLUMN … GENERATED AS IDENTITY`, `ADD COLUMN … serial`,
+     `ADD COLUMN … GENERATED … STORED`): these rewrite the table under an
+     exclusive lock and wait for online schema change (M8). Metadata-only
+     and weaker-lock forms (`ADD COLUMN` with a constant or stable default
+     such as `now()`/`CURRENT_TIMESTAMP`, `DROP COLUMN`, `ADD CONSTRAINT`,
+     `SET NOT NULL`, …) are applied.
    * `TRUNCATE`, `LOCK`, `VACUUM`, `COPY` on sharded/reference tables and
      `CREATE TABLE AS` over them (not migrations; still refused).
 
@@ -59,11 +61,19 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
 
 4. **Apply.** The controller leader's applier (`internal/controller/applier.go`)
    takes queued and running migrations oldest first, one at a time, and
-   runs each on its targets in shard order through an admin connection to
-   the shard's primary (`--shard-dsn`/`--shard-dsn-template`) as
-   `SET ROLE <client role>`, so ownership and privilege checks are the
-   client's:
-   * `direct`: `BEGIN; SET LOCAL lock_timeout = '2s'; <statement>; COMMIT`.
+   runs each on its targets in shard order. Client statements never run on
+   a superuser session: the applier logs into the shard's primary as
+   `pgshard_ddl`, a `NOSUPERUSER NOBYPASSRLS CREATEDB CREATEROLE` login it
+   provisions on every shard through the admin DSN
+   (`--shard-dsn`/`--shard-dsn-template`) with a password generated per
+   controller process, grants `<client role> TO pgshard_ddl WITH SET TRUE,
+   INHERIT FALSE` and then `SET ROLE <client role>`, so ownership and
+   privilege checks are the client's. A function the statement evaluates
+   (a `CHECK` or foreign-key validation, a default) that does `RESET ROLE`
+   lands on `pgshard_ddl`, which can neither `ALTER ROLE … SUPERUSER` nor
+   `SET SESSION AUTHORIZATION`. A superuser client role is refused (`42501`):
+   DDL through the router runs as plain roles only.
+   * `direct`: `SET lock_timeout = '2s'; BEGIN; <statement>; COMMIT`.
    * `concurrent`: `SET lock_timeout = '2s'; <statement>` outside a
      transaction; when `CREATE INDEX CONCURRENTLY` fails and leaves an
      invalid index (`pg_index.indisvalid = false`) the index is dropped
@@ -127,5 +137,7 @@ FROM pgshard.migrations ORDER BY created_at DESC LIMIT 20;
 ```
 
 The controller applies migrations only when started with `--shard-dsn` or
-`--shard-dsn-template` (the same DSNs the transaction resolver uses);
+`--shard-dsn-template` (the same DSNs the transaction resolver uses); those
+admin DSNs only provision `pgshard_ddl` (`--ddl-role`) and its membership,
+every client statement runs on a `pgshard_ddl` session.
 `--apply-interval` (1s) bounds how quickly a queued migration is picked up.

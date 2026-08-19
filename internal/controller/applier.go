@@ -2,12 +2,15 @@ package controller
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -18,10 +21,15 @@ import (
 )
 
 // DatabaseDialer opens a connection to one database of a shard's primary;
-// database "" means the maintenance database of the DSN.
+// database "" means the maintenance database of the DSN. DialDatabaseAs
+// opens it with different login credentials than the DSN carries.
 type DatabaseDialer interface {
 	DialDatabase(ctx context.Context, shardSet string, shardID int32, database string) (ShardConn, error)
+	DialDatabaseAs(ctx context.Context, shardSet string, shardID int32, database, user, password string) (ShardConn, error)
 }
+
+// DefaultDDLRole is the non-superuser login client statements run through.
+const DefaultDDLRole = "pgshard_ddl"
 
 // MigrationStore is the catalog side of the applier.
 type MigrationStore interface {
@@ -83,9 +91,17 @@ const DefaultLockTimeout = 2 * time.Second
 // per-shard progress is in the migration row and every step is re-driven
 // idempotently.
 type Applier struct {
-	Store  MigrationStore
+	Store MigrationStore
+	// Shards dials shard primaries as a superuser; it only provisions the
+	// DDL role, never runs client statements.
 	Shards DatabaseDialer
 	Logger *slog.Logger
+	// DDLRole is the non-superuser login every client statement runs
+	// through (SET ROLE into the client role from there), so a function a
+	// statement evaluates can RESET ROLE only into a plain role. It
+	// defaults to DefaultDDLRole; the applier creates it on every shard and
+	// sets a fresh password per process before first use.
+	DDLRole string
 	// ShardSet defaults to "default".
 	ShardSet string
 	// LockTimeout defaults to DefaultLockTimeout.
@@ -96,6 +112,20 @@ type Applier struct {
 	Sleep func(ctx context.Context, d time.Duration) error
 	// Now overrides the clock in tests.
 	Now func() time.Time
+
+	ddlMu       sync.Mutex
+	ddlPassword string
+	ddlReady    map[int32]bool
+	leader      func() bool
+}
+
+func (a *Applier) lostLeadership() bool { return a.leader != nil && !a.leader() }
+
+func (a *Applier) ddlRole() string {
+	if a.DDLRole == "" {
+		return DefaultDDLRole
+	}
+	return a.DDLRole
 }
 
 func (a *Applier) logger() *slog.Logger {
@@ -149,6 +179,7 @@ func (a *Applier) now() time.Time {
 
 // Run drives pending migrations every interval while leader() is true.
 func (a *Applier) Run(ctx context.Context, interval time.Duration, leader func() bool) {
+	a.leader = leader
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -205,6 +236,9 @@ func (a *Applier) drive(ctx context.Context, m catalog.DDLMigration) error {
 		s := m.PerShard[key]
 		if s.State == catalog.ShardApplied || s.State == catalog.ShardSkipped || s.State == catalog.ShardFailed {
 			continue
+		}
+		if a.lostLeadership() {
+			return errNotLeader
 		}
 		id, _ := strconv.ParseInt(key, 10, 32)
 		s = a.applyOn(ctx, logger, &m, int32(id), s)
@@ -329,6 +363,9 @@ func (a *Applier) applyOn(ctx context.Context, logger *slog.Logger, m *catalog.D
 		if err := a.sleep(ctx, wait); err != nil {
 			return s
 		}
+		if a.lostLeadership() {
+			return s
+		}
 		wait *= 2
 		if wait > b.Max {
 			wait = b.Max
@@ -336,38 +373,132 @@ func (a *Applier) applyOn(ctx context.Context, logger *slog.Logger, m *catalog.D
 	}
 }
 
-// step executes the statement on one shard once. A resumed step first
-// checks whether the object already matches (the previous attempt may have
-// committed before its progress was saved).
-func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, id int32, resumed bool) (string, error) {
-	db := m.Database
-	if m.Meta.Object.Kind == "role" || m.Meta.Object.Kind == "database" || strings.HasSuffix(m.Kind, "ROLE") {
-		db = ""
-	}
-	conn, err := a.Shards.DialDatabase(ctx, a.shardSet(), id, db)
+// prepare opens the non-superuser session a client statement runs on:
+// the DDL role logged into the target database with lock_timeout set and
+// the client's role assumed.
+func (a *Applier) prepare(ctx context.Context, m *catalog.DDLMigration, id int32, db string) (ShardConn, error) {
+	password, err := a.provisionDDLRole(ctx, id, m.Meta.RunAs)
 	if err != nil {
-		return "", &dialError{err}
+		return nil, err
 	}
-	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
-	if resumed && m.Meta.Object.Kind != "" {
-		matches, err := objectMatches(ctx, conn, m.Meta.Object)
-		if err != nil {
-			return "", err
-		}
-		if matches {
-			return catalog.ShardApplied, nil
-		}
+	conn, err := a.Shards.DialDatabaseAs(ctx, a.shardSet(), id, db, a.ddlRole(), password)
+	if err != nil {
+		return nil, &dialError{err}
 	}
 	timeout := a.LockTimeout
 	if timeout <= 0 {
 		timeout = DefaultLockTimeout
 	}
 	if _, err := conn.Exec(ctx, "SET lock_timeout = "+quoteLiteral(fmt.Sprint(timeout.Milliseconds())+"ms")); err != nil {
-		return "", err
+		_ = conn.Close(context.WithoutCancel(ctx))
+		return nil, err
 	}
 	if m.Meta.RunAs != "" {
 		if _, err := conn.Exec(ctx, "SET ROLE "+pgx.Identifier{m.Meta.RunAs}.Sanitize()); err != nil {
+			_ = conn.Close(context.WithoutCancel(ctx))
+			return nil, err
+		}
+	}
+	return conn, nil
+}
+
+// provisionDDLRole makes sure the DDL role exists on shard id with this
+// process's password (once per shard) and may SET ROLE into runAs, then
+// returns the password. A superuser runAs is refused: the DDL session must
+// never be able to become one.
+func (a *Applier) provisionDDLRole(ctx context.Context, id int32, runAs string) (string, error) {
+	a.ddlMu.Lock()
+	defer a.ddlMu.Unlock()
+	if a.ddlPassword == "" {
+		buf := make([]byte, 24)
+		if _, err := rand.Read(buf); err != nil {
 			return "", err
+		}
+		a.ddlPassword = hex.EncodeToString(buf)
+		a.ddlReady = map[int32]bool{}
+	}
+	if a.ddlReady[id] && runAs == "" {
+		return a.ddlPassword, nil
+	}
+	conn, err := a.Shards.DialDatabase(ctx, a.shardSet(), id, "")
+	if err != nil {
+		return "", &dialError{err}
+	}
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	role := pgx.Identifier{a.ddlRole()}.Sanitize()
+	if !a.ddlReady[id] {
+		for _, sql := range []string{
+			fmt.Sprintf(`DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s) THEN
+				CREATE ROLE %s LOGIN NOSUPERUSER NOINHERIT NOBYPASSRLS NOREPLICATION CREATEDB CREATEROLE; END IF; END $$`, quoteLiteral(a.ddlRole()), role),
+			"ALTER ROLE " + role + " LOGIN NOSUPERUSER NOINHERIT NOBYPASSRLS NOREPLICATION CREATEDB CREATEROLE PASSWORD " + quoteLiteral(a.ddlPassword),
+		} {
+			if _, err := conn.Exec(ctx, sql); err != nil {
+				return "", fmt.Errorf("provisioning %s: %w", a.ddlRole(), err)
+			}
+		}
+		a.ddlReady[id] = true
+	}
+	if runAs == "" {
+		return a.ddlPassword, nil
+	}
+	rows, err := conn.Query(ctx, `SELECT rolsuper FROM pg_roles WHERE rolname = $1`, runAs)
+	if err != nil {
+		return "", err
+	}
+	super, err := pgx.CollectOneRow(rows, pgx.RowTo[bool])
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", &pgconn.PgError{Severity: "ERROR", Code: "42704", Message: fmt.Sprintf("role %q does not exist on the shard", runAs)}
+		}
+		return "", err
+	}
+	if super {
+		return "", &pgconn.PgError{Severity: "ERROR", Code: "42501", Message: fmt.Sprintf("role %q is a superuser: DDL through the router runs as a plain role only", runAs)}
+	}
+	if _, err := conn.Exec(ctx, "GRANT "+pgx.Identifier{runAs}.Sanitize()+" TO "+role+" WITH SET TRUE, INHERIT FALSE"); err != nil {
+		return "", fmt.Errorf("granting %s to %s: %w", runAs, a.ddlRole(), err)
+	}
+	return a.ddlPassword, nil
+}
+
+// step executes the statement on one shard once. A resumed step first
+// checks whether the object already matches (the previous attempt may have
+// committed before its progress was saved); an index left invalid by an
+// interrupted CREATE INDEX CONCURRENTLY is dropped and built again.
+func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, id int32, resumed bool) (string, error) {
+	db := m.Database
+	if m.Meta.Object.Kind == "role" || m.Meta.Object.Kind == "database" || strings.HasSuffix(m.Kind, "ROLE") {
+		db = ""
+	}
+	conn, err := a.prepare(ctx, m, id, db)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	if resumed && m.Meta.Object.Kind != "" {
+		switch {
+		case m.Kind == "CREATE INDEX" && m.Meta.Object.Name != "":
+			dropped, err := dropInvalidIndex(ctx, conn, m.Meta.Object)
+			if err != nil {
+				return "", err
+			}
+			if !dropped {
+				matches, err := objectMatches(ctx, conn, m.Meta.Object)
+				if err != nil {
+					return "", err
+				}
+				if matches {
+					return catalog.ShardApplied, nil
+				}
+			}
+		default:
+			matches, err := objectMatches(ctx, conn, m.Meta.Object)
+			if err != nil {
+				return "", err
+			}
+			if matches {
+				return catalog.ShardApplied, nil
+			}
 		}
 	}
 	if m.Strategy == "concurrent" || outsideTransaction(m.Kind) {
@@ -414,15 +545,29 @@ func (a *Applier) concurrently(ctx context.Context, conn ShardConn, m *catalog.D
 	if ierr != nil || !invalid {
 		return err
 	}
-	name := pgx.Identifier{m.Meta.Object.Name}.Sanitize()
-	if m.Meta.Object.Schema != "" {
-		name = pgx.Identifier{m.Meta.Object.Schema, m.Meta.Object.Name}.Sanitize()
-	}
-	if _, derr := conn.Exec(context.WithoutCancel(ctx), "DROP INDEX CONCURRENTLY IF EXISTS "+name); derr != nil {
+	if _, derr := conn.Exec(context.WithoutCancel(ctx), "DROP INDEX CONCURRENTLY IF EXISTS "+qualified(m.Meta.Object.Schema, m.Meta.Object.Name)); derr != nil {
 		return err
 	}
 	_, err = conn.Exec(ctx, m.Statement)
 	return err
+}
+
+// dropInvalidIndex removes idx when it exists but is invalid and reports
+// whether it did.
+func dropInvalidIndex(ctx context.Context, conn ShardConn, idx catalog.MigrationObject) (bool, error) {
+	invalid, err := invalidIndex(ctx, conn, idx)
+	if err != nil || !invalid {
+		return false, err
+	}
+	_, err = conn.Exec(ctx, "DROP INDEX CONCURRENTLY IF EXISTS "+qualified(idx.Schema, idx.Name))
+	return err == nil, err
+}
+
+func qualified(schema, name string) string {
+	if schema != "" {
+		return pgx.Identifier{schema, name}.Sanitize()
+	}
+	return pgx.Identifier{name}.Sanitize()
 }
 
 func invalidIndex(ctx context.Context, conn ShardConn, o catalog.MigrationObject) (bool, error) {
@@ -547,6 +692,12 @@ func missingObject(err error) bool {
 
 // DialDatabase implements DatabaseDialer over the shard DSNs.
 func (d *PgxShardDialer) DialDatabase(ctx context.Context, shardSet string, shardID int32, database string) (ShardConn, error) {
+	return d.DialDatabaseAs(ctx, shardSet, shardID, database, "", "")
+}
+
+// DialDatabaseAs implements DatabaseDialer; an empty user keeps the DSN's
+// credentials.
+func (d *PgxShardDialer) DialDatabaseAs(ctx context.Context, shardSet string, shardID int32, database, user, password string) (ShardConn, error) {
 	dsn, err := d.dsn(ctx, shardSet, shardID)
 	if err != nil {
 		return nil, err
@@ -557,6 +708,9 @@ func (d *PgxShardDialer) DialDatabase(ctx context.Context, shardSet string, shar
 	}
 	if database != "" {
 		cfg.Database = database
+	}
+	if user != "" {
+		cfg.User, cfg.Password = user, password
 	}
 	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {

@@ -84,22 +84,35 @@ func (s *memStore) get(t *testing.T, id string) catalog.DDLMigration {
 // fakeShards scripts every shard: exec decides the outcome of a statement,
 // exists answers object checks, invalid answers invalid-index checks.
 type fakeShards struct {
-	mu      sync.Mutex
-	ran     map[int32][]string
-	dbs     map[int32][]string
-	exec    func(shard int32, sql string) error
-	exists  func(shard int32, kind, name string) bool
-	invalid func(shard int32, name string) bool
-	dialErr func(shard int32) error
+	mu       sync.Mutex
+	ran      map[int32][]string
+	super    map[int32][]string
+	dbs      map[int32][]string
+	logins   map[int32][]string
+	exec     func(shard int32, sql string) error
+	exists   func(shard int32, kind, name string) bool
+	invalid  func(shard int32, name string) bool
+	rolsuper func(shard int32, name string) bool
+	dialErr  func(shard int32) error
 }
 
 func newFakeShards() *fakeShards {
-	return &fakeShards{ran: map[int32][]string{}, dbs: map[int32][]string{}}
+	return &fakeShards{ran: map[int32][]string{}, super: map[int32][]string{}, dbs: map[int32][]string{}, logins: map[int32][]string{}}
 }
 
-func (f *fakeShards) DialDatabase(_ context.Context, _ string, id int32, db string) (ShardConn, error) {
+func (f *fakeShards) DialDatabase(_ context.Context, _ string, id int32, _ string) (ShardConn, error) {
+	if f.dialErr != nil {
+		if err := f.dialErr(id); err != nil {
+			return nil, err
+		}
+	}
+	return &fakeConn{f: f, id: id, superuser: true}, nil
+}
+
+func (f *fakeShards) DialDatabaseAs(_ context.Context, _ string, id int32, db, user, password string) (ShardConn, error) {
 	f.mu.Lock()
 	f.dbs[id] = append(f.dbs[id], db)
+	f.logins[id] = append(f.logins[id], user+"/"+password)
 	f.mu.Unlock()
 	if f.dialErr != nil {
 		if err := f.dialErr(id); err != nil {
@@ -109,22 +122,38 @@ func (f *fakeShards) DialDatabase(_ context.Context, _ string, id int32, db stri
 	return &fakeConn{f: f, id: id}, nil
 }
 
+// statements lists what ran on the DDL session of a shard.
 func (f *fakeShards) statements(id int32) []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.ran[id]...)
 }
 
+// superuserStatements lists what ran on the superuser session of a shard.
+func (f *fakeShards) superuserStatements(id int32) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.super[id]...)
+}
+
 type fakeConn struct {
-	f  *fakeShards
-	id int32
+	f         *fakeShards
+	id        int32
+	superuser bool
 }
 
 func (c *fakeConn) Exec(_ context.Context, sql string, _ ...any) (pgconnTag, error) {
 	c.f.mu.Lock()
-	c.f.ran[c.id] = append(c.f.ran[c.id], sql)
+	if c.superuser {
+		c.f.super[c.id] = append(c.f.super[c.id], sql)
+	} else {
+		c.f.ran[c.id] = append(c.f.ran[c.id], sql)
+	}
 	exec := c.f.exec
 	c.f.mu.Unlock()
+	if c.superuser {
+		return pgconn.CommandTag{}, nil
+	}
 	switch {
 	case sql == "BEGIN", sql == "COMMIT", sql == "ROLLBACK", strings.HasPrefix(sql, "SET lock_timeout"), strings.HasPrefix(sql, "SET ROLE"):
 		return pgconn.CommandTag{}, nil
@@ -140,6 +169,9 @@ func (c *fakeConn) Exec(_ context.Context, sql string, _ ...any) (pgconnTag, err
 func (c *fakeConn) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
 	name, _ := args[0].(string)
 	switch {
+	case strings.Contains(sql, "rolsuper"):
+		v := c.f.rolsuper != nil && c.f.rolsuper(c.id, name)
+		return &boolRows{vals: []bool{v}}, nil
 	case strings.Contains(sql, "indisvalid"):
 		v := c.f.invalid != nil && c.f.invalid(c.id, name)
 		return &boolRows{vals: []bool{v}}, nil
@@ -540,5 +572,82 @@ func TestApplierStopsWhenTheContextEnds(t *testing.T) {
 	m := f.store.get(t, id)
 	if m.State != catalog.MigrationRunning || m.PerShard["0"].State != catalog.ShardRetrying {
 		t.Fatalf("a cancelled pass must leave the migration resumable: %s %s", m.State, states(m))
+	}
+}
+
+func TestApplierRunsClientStatementsOnANonSuperuserSession(t *testing.T) {
+	f := newApplierFixture(t)
+	id := f.queue(catalog.DDLMigration{Statement: "create table t (id int)", Kind: "CREATE TABLE", Scope: "home", HomeShard: 1,
+		Meta: catalog.MigrationMeta{RunAs: "app"}})
+	f.run(t)
+	if m := f.store.get(t, id); m.State != catalog.MigrationComplete {
+		t.Fatalf("%s %s", m.State, states(m))
+	}
+	super := strings.Join(f.shards.superuserStatements(1), ";")
+	for _, want := range []string{
+		`CREATE ROLE "pgshard_ddl" LOGIN NOSUPERUSER NOINHERIT NOBYPASSRLS NOREPLICATION CREATEDB CREATEROLE`,
+		`ALTER ROLE "pgshard_ddl" LOGIN NOSUPERUSER NOINHERIT NOBYPASSRLS NOREPLICATION CREATEDB CREATEROLE PASSWORD '`,
+		`GRANT "app" TO "pgshard_ddl" WITH SET TRUE, INHERIT FALSE`,
+	} {
+		if !strings.Contains(super, want) {
+			t.Fatalf("superuser session ran %q, want %q", super, want)
+		}
+	}
+	if strings.Contains(super, "create table") {
+		t.Fatalf("client DDL ran on the superuser session: %q", super)
+	}
+	login := f.shards.logins[1][0]
+	if !strings.HasPrefix(login, "pgshard_ddl/") || len(login) < len("pgshard_ddl/")+32 {
+		t.Fatalf("DDL session logged in as %q", login)
+	}
+	if got := strings.Join(f.shards.statements(1), ";"); !strings.Contains(got, `SET ROLE "app";BEGIN;create table t (id int);COMMIT`) {
+		t.Fatalf("DDL session ran %q", got)
+	}
+	// The role is provisioned once per shard; membership is granted on every step.
+	id = f.queue(catalog.DDLMigration{Statement: "create table u (id int)", Kind: "CREATE TABLE", Scope: "home", HomeShard: 1,
+		Meta: catalog.MigrationMeta{RunAs: "app"}})
+	f.run(t)
+	if n := strings.Count(strings.Join(f.shards.superuserStatements(1), ";"), "CREATE ROLE"); n != 1 {
+		t.Fatalf("role provisioned %d times", n)
+	}
+	if f.shards.logins[1][0] != f.shards.logins[1][1] {
+		t.Fatalf("password changed between steps: %v", f.shards.logins[1])
+	}
+
+	f.shards.rolsuper = func(_ int32, name string) bool { return name == "postgres" }
+	id = f.queue(catalog.DDLMigration{Statement: "create table v (id int)", Kind: "CREATE TABLE", Scope: "home", HomeShard: 1,
+		Meta: catalog.MigrationMeta{RunAs: "postgres"}})
+	f.run(t)
+	m := f.store.get(t, id)
+	if m.State != catalog.MigrationFailed || m.PerShard["1"].SQLState != "42501" {
+		t.Fatalf("superuser client: %s %+v", m.State, m.PerShard)
+	}
+	if strings.Contains(strings.Join(f.shards.superuserStatements(1), ";"), `GRANT "postgres"`) {
+		t.Fatal("a superuser was granted to the DDL role")
+	}
+}
+
+func TestApplierResumeRebuildsAnInvalidIndexAndSkipsAValidOne(t *testing.T) {
+	f := newApplierFixture(t)
+	f.shards.exists = func(_ int32, kind, name string) bool { return kind == "relation" && name == "i" }
+	f.shards.invalid = func(shard int32, name string) bool { return shard == 1 && name == "i" }
+	id := f.queue(catalog.DDLMigration{Statement: "create index concurrently i on t (x)", Kind: "CREATE INDEX", Scope: "all", Strategy: "concurrent", State: catalog.MigrationRunning,
+		Meta: catalog.MigrationMeta{Object: catalog.MigrationObject{Kind: "relation", Name: "i", Expect: "present"}},
+		PerShard: map[string]catalog.ShardMigration{
+			"0": {State: catalog.ShardApplied, Attempts: 1},
+			"1": {State: catalog.ShardRunning, Attempts: 1},
+			"2": {State: catalog.ShardRunning, Attempts: 1},
+		}})
+	f.run(t)
+	m := f.store.get(t, id)
+	if m.State != catalog.MigrationComplete || states(m) != "0=applied/1 1=applied/2 2=applied/2" {
+		t.Fatalf("%s %s", m.State, states(m))
+	}
+	got := strings.Join(f.shards.statements(1), ";")
+	if !strings.Contains(got, `DROP INDEX CONCURRENTLY IF EXISTS "i";create index concurrently i on t (x)`) {
+		t.Fatalf("invalid index on shard 1 was not rebuilt: %q", got)
+	}
+	if got := strings.Join(f.shards.statements(2), ";"); strings.Contains(got, "create index") || strings.Contains(got, "DROP INDEX") {
+		t.Fatalf("valid index on shard 2 was touched: %q", got)
 	}
 }

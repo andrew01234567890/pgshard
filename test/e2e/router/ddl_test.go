@@ -166,6 +166,36 @@ func TestRouterDDLMigrations(t *testing.T) {
 		}
 	})
 
+	t.Run("client_function_cannot_escalate_through_the_applier", func(t *testing.T) {
+		for id := 0; id < 3; id++ {
+			shard := s.shardConn(t, id)
+			if _, err := shard.Exec(ctx, `create or replace function public.escalate(int) returns bool language plpgsql as $$
+				begin reset role; execute format('alter role %I superuser', '`+appRole+`'); return true; end $$`); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for tenant := 2; tenant <= 12; tenant++ {
+			if _, err := conn.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 1)", tenant); err != nil {
+				t.Fatal(err)
+			}
+		}
+		_, err := conn.Exec(ctx, "alter table orders add constraint orders_escalate check (public.escalate(id))")
+		if err == nil {
+			t.Fatalf("a CHECK that resets the role and grants superuser was accepted\nmigration: %+v\ncontroller log:\n%s",
+				s.migration(t, "statement like '%orders_escalate%'"), s.controllerLog.String())
+		}
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "42501" {
+			t.Fatalf("expected 42501, got %v\nmigration: %+v", err, s.migration(t, "statement like '%orders_escalate%'"))
+		}
+		if got := s.onShards(t, "select not rolsuper from pg_roles where rolname = $1", appRole); !allTrue(got) {
+			t.Fatalf("client role stayed a plain role per shard: %v", got)
+		}
+		if got := s.onShards(t, "select not rolsuper and not rolbypassrls from pg_roles where rolname = 'pgshard_ddl'"); !allTrue(got) {
+			t.Fatalf("pgshard_ddl is a plain login per shard: %v", got)
+		}
+	})
+
 	t.Run("create_index_concurrently_valid_everywhere", func(t *testing.T) {
 		if _, err := conn.Exec(ctx, "create index concurrently orders_id on orders (id)"); err != nil {
 			t.Fatal(err)

@@ -56,6 +56,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	barrierArchive := fs.Duration("barrier-archive-timeout", controller.DefaultArchiveTimeout, "how long a barrier waits for every group's restore point to be archived")
 	var shardDSNs shardDSNFlag
 	fs.Var(&shardDSNs, "shard-dsn", "explicit shard DSN as <set>/<id>=<dsn>; repeatable")
+	ddlRole := fs.String("ddl-role", controller.DefaultDDLRole, "non-superuser login the applier provisions on every shard and runs client DDL through")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return cli.ExitOK
@@ -103,7 +104,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		go resolver.Run(ctx, *resolveEvery)
 		barrier = &controller.Barrier{Store: &controller.PGBarrierStore{Pool: pool}, Groups: &controller.SQLBarrierGroups{Pool: pool, Shards: dialer},
 			Resolver: resolver, Logger: logger, DrainTimeout: *barrierDrain, ArchiveTimeout: *barrierArchive}
-		applier := &controller.Applier{Store: &controller.PGMigrationStore{Pool: pool}, Logger: logger, Shards: dialer}
+		applier := &controller.Applier{Store: &controller.PGMigrationStore{Pool: pool}, Logger: logger, Shards: dialer, DDLRole: *ddlRole}
 		go applier.Run(ctx, *applyEvery, leader.Load)
 	}
 

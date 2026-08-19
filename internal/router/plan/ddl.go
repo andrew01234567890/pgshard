@@ -238,10 +238,20 @@ func checkAlterCmd(r *rel, c *pgquerypb.AlterTableCmd) error {
 		return rewriteClass("SET TABLESPACE")
 	case pgquerypb.AlterTableType_AT_AddColumn:
 		col := c.GetDef().GetColumnDef()
+		if names := stringList(col.GetTypeName().GetNames()); len(names) > 0 && serialType(names[len(names)-1]) {
+			return rewriteClass("ADD COLUMN of a serial type")
+		}
 		for _, con := range col.GetConstraints() {
 			cs := con.GetConstraint()
-			if cs.GetContype() == pgquerypb.ConstrType_CONSTR_DEFAULT && !constantExpr(cs.GetRawExpr()) {
-				return rewriteClass("ADD COLUMN with a volatile DEFAULT")
+			switch cs.GetContype() {
+			case pgquerypb.ConstrType_CONSTR_DEFAULT:
+				if !stableDefault(cs.GetRawExpr()) {
+					return rewriteClass("ADD COLUMN with a volatile DEFAULT")
+				}
+			case pgquerypb.ConstrType_CONSTR_IDENTITY:
+				return rewriteClass("ADD COLUMN ... GENERATED AS IDENTITY")
+			case pgquerypb.ConstrType_CONSTR_GENERATED:
+				return rewriteClass("ADD COLUMN ... GENERATED ... STORED")
 			}
 			if sharded && isUniqueConstraint(cs) && col.GetColname() != r.shardKey {
 				return keyConstraintError(r, col.GetColname())
@@ -260,16 +270,39 @@ func checkAlterCmd(r *rel, c *pgquerypb.AlterTableCmd) error {
 	return nil
 }
 
-// constantExpr reports whether a DEFAULT expression is a literal (possibly
-// cast), which PostgreSQL stores as a metadata-only default.
-func constantExpr(n *pgquerypb.Node) bool {
+func serialType(name string) bool {
+	switch name {
+	case "serial", "serial2", "serial4", "serial8", "smallserial", "bigserial":
+		return true
+	}
+	return false
+}
+
+// stableDefaults are the functions whose DEFAULT PostgreSQL evaluates once
+// at ALTER time and stores as a metadata-only default (no rewrite).
+var stableDefaults = map[string]bool{"now": true, "transaction_timestamp": true, "statement_timestamp": true,
+	"current_timestamp": true, "localtimestamp": true, "current_date": true, "current_time": true, "localtime": true,
+	"current_user": true, "session_user": true, "current_schema": true, "current_database": true}
+
+// stableDefault reports whether a DEFAULT expression is a literal (possibly
+// cast) or a stable timestamp/session function, which PostgreSQL stores as
+// a metadata-only default; volatile defaults rewrite the table.
+func stableDefault(n *pgquerypb.Node) bool {
 	switch e := n.GetNode().(type) {
 	case nil:
 		return true
 	case *pgquerypb.Node_AConst:
 		return true
 	case *pgquerypb.Node_TypeCast:
-		return constantExpr(e.TypeCast.GetArg())
+		return stableDefault(e.TypeCast.GetArg())
+	case *pgquerypb.Node_SqlvalueFunction:
+		return true
+	case *pgquerypb.Node_FuncCall:
+		names := stringList(e.FuncCall.GetFuncname())
+		if len(names) == 0 || len(e.FuncCall.GetArgs()) != 0 {
+			return false
+		}
+		return stableDefaults[strings.ToLower(names[len(names)-1])]
 	}
 	return false
 }
