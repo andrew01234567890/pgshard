@@ -57,8 +57,17 @@ spec:
                 - catalog
                 - shard
                 type: string
+              nonServing:
+                description: |-
+                  NonServing marks a reshard target: routers never route to it and its
+                  members do not archive WAL until the set becomes serving.
+                type: boolean
               shardId:
                 type: integer
+              shardSet:
+                description: ShardSet is the catalog shard set the group serves; empty
+                  means default.
+                type: string
             required:
             - clusterRef
             - kind

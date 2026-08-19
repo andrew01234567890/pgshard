@@ -1,0 +1,307 @@
+package operator
+
+import (
+	"context"
+	"fmt"
+	"sort"
+
+	coordinationv1 "k8s.io/api/coordination/v1"
+	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/internal/catalog"
+	"github.com/andrew01234567890/pgshard/internal/placement"
+)
+
+// LabelReshardSource on a PgShardReshard tells whether spec.shards or a
+// catalog edit created the pending shard set; only spec-sourced runs are
+// cancelled by reverting spec.shards.
+const (
+	LabelReshardSource   = "pgshard.io/reshard-source"
+	ReshardSourceSpec    = "spec"
+	ReshardSourceCatalog = "catalog"
+)
+
+// ReshardName names the PgShardReshard record of one target generation.
+func ReshardName(cluster string, generation int64) string {
+	return fmt.Sprintf("%s-reshard-g%d", cluster, generation)
+}
+
+// reshardPlan is what reconcileReshard decided for this pass.
+type reshardPlan struct {
+	cond     metav1.Condition
+	pending  *ShardSetInfo
+	workflow WorkflowInfo
+	record   *pgshardv1alpha1.PgShardReshard
+}
+
+// reconcileReshard keeps the catalog's shard sets, the cluster spec and the
+// PgShardReshard record in step. It materializes the serving set on first
+// contact, turns a spec.shards change into a pending set, adopts pending
+// sets created by SQL, and cancels a spec-sourced run when spec.shards is
+// reverted while targets are still provisioning. status.effectiveShards and
+// status.reshard are patched before returning so the group loop sees them.
+func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, dsn string) (reshardPlan, error) {
+	log := logf.FromContext(ctx)
+	plan := reshardPlan{cond: metav1.Condition{Type: pgshardv1alpha1.ConditionResharding, Status: metav1.ConditionFalse, Reason: "Idle", Message: "", ObservedGeneration: c.Generation}}
+	base := c.DeepCopy()
+	sets, err := r.Prober.ShardSets(ctx, dsn)
+	if err != nil {
+		return plan, fmt.Errorf("shard sets: %w", err)
+	}
+	var serving *ShardSetInfo
+	var pending *ShardSetInfo
+	var maxGen int64
+	for i := range sets {
+		s := &sets[i]
+		maxGen = max(maxGen, s.Generation)
+		switch s.State {
+		case catalog.ShardSetServing:
+			if serving == nil || s.Generation > serving.Generation {
+				serving = s
+			}
+		case catalog.ShardSetDesired, catalog.ShardSetProvisioning:
+			if pending == nil {
+				pending = s
+			}
+		}
+	}
+	if serving == nil || len(serving.Ranges) == 0 {
+		n := ServingShards(c)
+		ranges, err := placement.Split(n)
+		if err != nil {
+			return plan, err
+		}
+		gen := int64(1)
+		if serving != nil {
+			gen = serving.Generation
+		}
+		if err := r.Prober.MaterializeShardSet(ctx, dsn, catalog.ShardSetName(gen), gen, catalog.ShardSetServing, ranges); err != nil {
+			return plan, fmt.Errorf("materialize serving shard set: %w", err)
+		}
+		log.Info("materialized serving shard set", "shards", n)
+		serving = &ShardSetInfo{Name: catalog.ShardSetName(gen), Generation: gen, State: catalog.ShardSetServing, Ranges: ranges}
+		maxGen = max(maxGen, gen)
+	}
+	effective := len(serving.Ranges)
+	c.Status.EffectiveShards = effective
+	want := c.Spec.Shards
+
+	if pending == nil && want != nil && *want != effective {
+		gen := maxGen + 1
+		ranges, err := placement.Split(*want)
+		if err != nil {
+			return plan, err
+		}
+		name := catalog.ShardSetName(gen)
+		if err := r.Prober.MaterializeShardSet(ctx, dsn, name, gen, catalog.ShardSetDesired, ranges); err != nil {
+			return plan, fmt.Errorf("materialize pending shard set: %w", err)
+		}
+		log.Info("materialized pending shard set", "set", name, "shards", *want)
+		pending = &ShardSetInfo{Name: name, Generation: gen, State: catalog.ShardSetDesired, Ranges: ranges}
+		if err := r.ensureReshardRecord(ctx, c, serving, pending, ReshardSourceSpec); err != nil {
+			return plan, err
+		}
+	}
+
+	if pending == nil {
+		if prev := c.Status.Reshard; prev != nil {
+			log.Info("pending shard set vanished from the catalog; tearing targets down", "set", prev.ShardSet)
+			if err := r.deleteTargetGroups(ctx, c, prev.ShardSet); err != nil {
+				return plan, err
+			}
+			record := &pgshardv1alpha1.PgShardReshard{}
+			if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: prev.Name}, record); err == nil {
+				if err := r.patchReshardStatus(ctx, record, func(st *pgshardv1alpha1.PgShardReshardStatus) {
+					st.Phase = pgshardv1alpha1.ReshardPhaseCancelled
+					st.Message = "shard set " + prev.ShardSet + " removed from the catalog; target groups deleted"
+					st.Targets = nil
+				}); err != nil {
+					return plan, err
+				}
+			} else if !apierrors.IsNotFound(err) {
+				return plan, err
+			}
+			plan.cond.Reason = "Cancelled"
+			plan.cond.Message = "reshard " + prev.Name + " cancelled: shard set removed"
+		}
+		c.Status.Reshard = nil
+		return plan, r.patchClusterStatus(ctx, c, base)
+	}
+
+	if err := r.ensureReshardRecord(ctx, c, serving, pending, ReshardSourceCatalog); err != nil {
+		return plan, err
+	}
+	record := &pgshardv1alpha1.PgShardReshard{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: ReshardName(c.Name, pending.Generation)}, record); err != nil {
+		return plan, err
+	}
+	wf, err := r.Prober.ReshardWorkflow(ctx, dsn, pending.Name)
+	if err != nil {
+		return plan, fmt.Errorf("reshard workflow: %w", err)
+	}
+	phase := reshardPhase(wf)
+	specSourced := record.Labels[LabelReshardSource] == ReshardSourceSpec
+	revert := want != nil && *want == effective && specSourced
+
+	switch {
+	case revert && (phase == pgshardv1alpha1.ReshardPhasePending || phase == pgshardv1alpha1.ReshardPhaseProvisioning):
+		log.Info("cancelling reshard: spec.shards reverted", "set", pending.Name)
+		if err := r.Prober.DropShardSet(ctx, dsn, pending.Name); err != nil {
+			return plan, fmt.Errorf("drop pending shard set: %w", err)
+		}
+		if err := r.deleteTargetGroups(ctx, c, pending.Name); err != nil {
+			return plan, err
+		}
+		if err := r.patchReshardStatus(ctx, record, func(st *pgshardv1alpha1.PgShardReshardStatus) {
+			st.Phase = pgshardv1alpha1.ReshardPhaseCancelled
+			st.Message = "spec.shards reverted to the serving shard count; target groups deleted"
+			st.Targets = nil
+		}); err != nil {
+			return plan, err
+		}
+		c.Status.Reshard = nil
+		plan.cond.Reason = "Cancelled"
+		plan.cond.Message = "reshard " + record.Name + " cancelled"
+		return plan, r.patchClusterStatus(ctx, c, base)
+	case want != nil && *want != effective && *want != len(pending.Ranges):
+		plan.cond.Status = metav1.ConditionTrue
+		plan.cond.Reason = "ReshardActive"
+		plan.cond.Message = fmt.Sprintf("spec.shards=%d refused: reshard %s to %d shards is %s; wait for it or revert spec.shards to %d",
+			*want, record.Name, len(pending.Ranges), phase, effective)
+	default:
+		plan.cond.Status = metav1.ConditionTrue
+		plan.cond.Reason = phase
+		plan.cond.Message = fmt.Sprintf("reshard %s: %d -> %d shards", record.Name, effective, len(pending.Ranges))
+	}
+	c.Status.Reshard = &pgshardv1alpha1.ClusterReshardStatus{
+		Name: record.Name, ShardSet: pending.Name, Generation: pending.Generation, Shards: len(pending.Ranges), Phase: phase,
+	}
+	plan.pending, plan.workflow, plan.record = pending, wf, record
+	return plan, r.patchClusterStatus(ctx, c, base)
+}
+
+func (r *ClusterReconciler) patchClusterStatus(ctx context.Context, c, base *pgshardv1alpha1.PgShardCluster) error {
+	if c.Status.EffectiveShards == base.Status.EffectiveShards && equalReshard(c.Status.Reshard, base.Status.Reshard) {
+		return nil
+	}
+	return r.Status().Patch(ctx, c, client.MergeFrom(base))
+}
+
+func equalReshard(a, b *pgshardv1alpha1.ClusterReshardStatus) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+// reshardPhase maps the catalog workflow onto the record's phase.
+func reshardPhase(wf WorkflowInfo) string {
+	switch {
+	case wf.ID == "":
+		return pgshardv1alpha1.ReshardPhasePending
+	case wf.State == "provisioning":
+		return pgshardv1alpha1.ReshardPhaseProvisioning
+	case wf.State == "cancelled":
+		return pgshardv1alpha1.ReshardPhaseCancelled
+	case wf.State == "failed":
+		return pgshardv1alpha1.ReshardPhaseFailed
+	case wf.State == "completed":
+		return pgshardv1alpha1.ReshardPhaseCompleted
+	case wf.Stage == "ready_for_copy":
+		return pgshardv1alpha1.ReshardPhaseCopying
+	}
+	return pgshardv1alpha1.ReshardPhaseProvisioning
+}
+
+func (r *ClusterReconciler) ensureReshardRecord(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, serving, pending *ShardSetInfo, source string) error {
+	ranges := make([]pgshardv1alpha1.ReshardRange, 0, len(pending.Ranges))
+	for i, rg := range pending.Ranges {
+		ranges = append(ranges, pgshardv1alpha1.ReshardRange{ShardID: i, RangeStart: rg.Start, RangeEnd: rg.End})
+	}
+	rec := &pgshardv1alpha1.PgShardReshard{ObjectMeta: metav1.ObjectMeta{
+		Name: ReshardName(c.Name, pending.Generation), Namespace: c.Namespace,
+		Labels: map[string]string{LabelCluster: c.Name, LabelShardSet: pending.Name, LabelReshardSource: source},
+	}}
+	rec.Spec = pgshardv1alpha1.PgShardReshardSpec{
+		ClusterName: c.Name, FromGeneration: serving.Generation, TargetGeneration: pending.Generation,
+		TargetShardSet: pending.Name, TargetShards: len(pending.Ranges), TargetRanges: ranges,
+	}
+	if err := controllerutil.SetControllerReference(c, rec, r.Scheme()); err != nil {
+		return err
+	}
+	err := r.Create(ctx, rec)
+	if apierrors.IsAlreadyExists(err) {
+		return nil
+	}
+	return err
+}
+
+func (r *ClusterReconciler) patchReshardStatus(ctx context.Context, rec *pgshardv1alpha1.PgShardReshard, mutate func(*pgshardv1alpha1.PgShardReshardStatus)) error {
+	base := rec.DeepCopy()
+	mutate(&rec.Status)
+	return r.Status().Patch(ctx, rec, client.MergeFrom(base))
+}
+
+// updateReshardStatus reports target readiness and the workflow on the record.
+func (r *ClusterReconciler) updateReshardStatus(ctx context.Context, plan reshardPlan, targets []groupObservation) error {
+	if plan.record == nil {
+		return nil
+	}
+	return r.patchReshardStatus(ctx, plan.record, func(st *pgshardv1alpha1.PgShardReshardStatus) {
+		st.Phase = reshardPhase(plan.workflow)
+		st.WorkflowID = plan.workflow.ID
+		st.Targets = st.Targets[:0]
+		ready := 0
+		for _, o := range targets {
+			ok := o.ready()
+			if ok {
+				ready++
+			}
+			st.Targets = append(st.Targets, pgshardv1alpha1.ReshardTargetStatus{ShardID: o.group.ShardID, Group: o.group.Name(), Ready: ok, Primary: o.state.primary})
+		}
+		sort.Slice(st.Targets, func(i, j int) bool { return st.Targets[i].ShardID < st.Targets[j].ShardID })
+		allReady := ready == len(targets) && len(targets) > 0
+		set := func(t string, ok bool, reason, msg string) {
+			s := metav1.ConditionFalse
+			if ok {
+				s = metav1.ConditionTrue
+			}
+			meta.SetStatusCondition(&st.Conditions, metav1.Condition{Type: t, Status: s, Reason: reason, Message: msg, ObservedGeneration: plan.record.Generation})
+		}
+		set(pgshardv1alpha1.ReshardConditionTargetsReady, allReady, boolReason(allReady, "AllReady", "Provisioning"), fmt.Sprintf("%d/%d target groups ready", ready, len(targets)))
+		set(pgshardv1alpha1.ReshardConditionWorkflow, plan.workflow.ID != "", boolReason(plan.workflow.ID != "", "Created", "Waiting"), plan.workflow.ID)
+		st.Message = fmt.Sprintf("%s: %d/%d target groups ready", st.Phase, ready, len(targets))
+		if plan.workflow.Stage != "" {
+			st.Message += "; workflow stage " + plan.workflow.Stage
+		}
+	})
+}
+
+// deleteTargetGroups removes every object of the target groups of set.
+func (r *ClusterReconciler) deleteTargetGroups(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, set string) error {
+	sel := client.MatchingLabels{LabelCluster: c.Name, LabelShardSet: set}
+	ns := client.InNamespace(c.Namespace)
+	for _, obj := range []client.Object{&corev1.Pod{}, &corev1.PersistentVolumeClaim{}, &corev1.Service{}, &corev1.ConfigMap{},
+		&policyv1.PodDisruptionBudget{}, &pgshardv1alpha1.PgShardGroup{}} {
+		if err := r.DeleteAllOf(ctx, obj, ns, sel); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete targets of %s: %w", set, err)
+		}
+	}
+	// Leases are created by the agents without the group labels.
+	for _, g := range TargetGroups(c) {
+		lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: g.LeaseName(), Namespace: c.Namespace}}
+		if err := r.Delete(ctx, lease); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	return nil
+}

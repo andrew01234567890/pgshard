@@ -18,6 +18,9 @@ spec:
     - jsonPath: .spec.clusterName
       name: Cluster
       type: string
+    - jsonPath: .spec.targetShards
+      name: Shards
+      type: integer
     - jsonPath: .status.phase
       name: Phase
       type: string
@@ -27,7 +30,7 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: PgShardReshard is a resharding run.
+        description: PgShardReshard is the record of one resharding run.
         properties:
           apiVersion:
             description: |-
@@ -47,17 +50,67 @@ spec:
           metadata:
             type: object
           spec:
-            description: PgShardReshardSpec requests a change in shard count.
+            description: |-
+              PgShardReshardSpec records one change of the shard map: the generation it
+              starts from and the target ranges of the pending shard set. The catalog
+              table pgshard.shard_ranges is the source of truth; this object mirrors it.
             properties:
               clusterName:
+                type: string
+              fromGeneration:
+                description: FromGeneration is the serving shard set generation being
+                  replaced.
+                format: int64
+                minimum: 1
+                type: integer
+              targetGeneration:
+                description: |-
+                  TargetGeneration is the pending shard set generation; its catalog
+                  name is targetShardSet.
+                format: int64
+                minimum: 2
+                type: integer
+              targetRanges:
+                items:
+                  description: |-
+                    ReshardRange is one target shard and the inclusive keyspace interval it
+                    will own.
+                  properties:
+                    rangeEnd:
+                      format: int64
+                      type: integer
+                    rangeStart:
+                      format: int64
+                      type: integer
+                    shardId:
+                      minimum: 0
+                      type: integer
+                  required:
+                  - rangeEnd
+                  - rangeStart
+                  - shardId
+                  type: object
+                minItems: 1
+                type: array
+              targetShardSet:
+                minLength: 1
                 type: string
               targetShards:
                 minimum: 1
                 type: integer
             required:
             - clusterName
+            - fromGeneration
+            - targetGeneration
+            - targetRanges
+            - targetShardSet
             - targetShards
             type: object
+            x-kubernetes-validations:
+            - message: targetRanges must list exactly targetShards ranges
+              rule: size(self.targetRanges) == self.targetShards
+            - message: targetGeneration must be greater than fromGeneration
+              rule: self.targetGeneration > self.fromGeneration
           status:
             description: PgShardReshardStatus is the observed state of a reshard.
             properties:
@@ -117,25 +170,47 @@ spec:
                   - type
                   type: object
                 type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
               journalIds:
                 items:
                   type: string
                 type: array
-              phase:
+              message:
                 type: string
-              progress:
-                description: ReshardProgress reports copy and catch-up progress.
-                properties:
-                  replicationLagBytes:
-                    format: int64
-                    type: integer
-                  rowsCopied:
-                    format: int64
-                    type: integer
-                  rowsTotal:
-                    format: int64
-                    type: integer
-                type: object
+              phase:
+                enum:
+                - Pending
+                - Provisioning
+                - Copying
+                - Verifying
+                - Switching
+                - Completed
+                - Cancelled
+                - Failed
+                type: string
+              targets:
+                items:
+                  description: ReshardTargetStatus is the readiness of one target
+                    group.
+                  properties:
+                    group:
+                      type: string
+                    primary:
+                      type: string
+                    ready:
+                      type: boolean
+                    shardId:
+                      type: integer
+                  required:
+                  - group
+                  - shardId
+                  type: object
+                type: array
+              workflowId:
+                description: WorkflowID is the pgshard.workflows row driving the reshard.
+                type: string
             type: object
         required:
         - spec

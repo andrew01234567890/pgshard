@@ -58,7 +58,7 @@ func patchSpec(t *testing.T, c *pgshardv1alpha1.PgShardCluster, mutate func(*pgs
 // streaming standby.
 func memberBack(t *testing.T, fp *fakeProber, fa *fakeAgents, name, ip string) {
 	t.Helper()
-	markPodRunning(t, name, ip, true)
+	markPodRunning(t, name, ip)
 	fa.set(ip, AgentStatus{Running: true}, nil)
 	fp.mu.Lock()
 	fp.streaming[name] = true

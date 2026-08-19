@@ -300,6 +300,65 @@ func TestController(t *testing.T) {
 		mustExec(t, conn, `UPDATE pgshard.workflows SET state = 'pending' WHERE id::text = $1`, id)
 	})
 
+	t.Run("reshard_pending_set_state_machine", func(t *testing.T) {
+		mustExec(t, conn, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES ('g2', 0, '[,0)'), ('g2', 1, '[0,)')`)
+		res := reconcile(t, conn)
+		if res.WorkflowsCreated != 1 || res.ShardSetsPopulated != 0 || res.GenerationBumped {
+			t.Fatalf("pending set must only create a provisioning workflow: %+v", res)
+		}
+		if n := queryOne[int64](t, conn, `SELECT count(*) FROM pgshard.shard_status WHERE shard_set = 'g2'`); n != 0 {
+			t.Fatalf("%d shard_status rows for the pending set; the operator publishes them", n)
+		}
+		if st := queryOne[string](t, conn, `SELECT state FROM pgshard.shard_sets WHERE shard_set = 'g2'`); st != catalog.ShardSetProvisioning {
+			t.Fatalf("shard set state %s", st)
+		}
+		wf := queryOne[string](t, conn, `SELECT state || ':' || (status->>'stage') || ':' || (spec->>'shard_set') || ':' || jsonb_array_length(spec->'ranges')
+			FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = 'g2'`)
+		if wf != "provisioning:provisioning:g2:2" {
+			t.Fatalf("workflow %s", wf)
+		}
+		if res := reconcile(t, conn); res.WorkflowsCreated != 0 || res.ReshardsAdvanced != 0 {
+			t.Fatalf("idempotent pass: %+v", res)
+		}
+		if n := queryOne[int64](t, conn, `SELECT count(*) FROM pgshard.serving WHERE shard_set = 'g2'`); n != 0 {
+			t.Fatal("a pending set must never be published as serving")
+		}
+		mustExec(t, conn, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_endpoint)
+			VALUES ('g2', 0, 'shard-0-g2', 'provisioning', 'shard-0-g2:5432')`)
+		if res := reconcile(t, conn); res.ReshardsAdvanced != 0 || res.ShardsMadeServing != 0 {
+			t.Fatalf("one target of two must not advance nor become serving: %+v", res)
+		}
+		mustExec(t, conn, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_endpoint)
+			VALUES ('g2', 1, 'shard-1-g2', 'provisioning', 'shard-1-g2:5432')`)
+		res = reconcile(t, conn)
+		if res.ReshardsAdvanced != 1 || res.ShardsMadeServing != 0 || res.GenerationBumped {
+			t.Fatalf("all targets ready must hand over to the copy stage: %+v", res)
+		}
+		wf = queryOne[string](t, conn, `SELECT state || ':' || (status->>'stage') FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = 'g2'`)
+		if wf != "running:ready_for_copy" {
+			t.Fatalf("workflow %s", wf)
+		}
+		states := queryOne[string](t, conn, `SELECT string_agg(DISTINCT serving_state, ',') FROM pgshard.shard_status WHERE shard_set = 'g2'`)
+		if states != "provisioning" {
+			t.Fatalf("target shard_status must stay provisioning, got %s", states)
+		}
+
+		mustExec(t, conn, `UPDATE pgshard.workflows SET state = 'provisioning' WHERE kind = 'reshard' AND spec->>'shard_set' = 'g2'`)
+		mustExec(t, conn, `BEGIN; DELETE FROM pgshard.shard_ranges WHERE shard_set = 'g2'; DELETE FROM pgshard.shard_sets WHERE shard_set = 'g2'; COMMIT`)
+		res = reconcile(t, conn)
+		if res.ReshardsCancelled != 1 {
+			t.Fatalf("vanished set must cancel: %+v", res)
+		}
+		wf = queryOne[string](t, conn, `SELECT state || ':' || (status->>'stage') FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = 'g2'`)
+		if wf != "cancelled:cancelled" {
+			t.Fatalf("workflow %s", wf)
+		}
+		if n := queryOne[int64](t, conn, `SELECT count(*) FROM pgshard.shard_status WHERE shard_set = 'g2'`); n != 0 {
+			t.Fatalf("%d stale status rows after cancel", n)
+		}
+		mustExec(t, conn, `DELETE FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = 'g2'`)
+	})
+
 	t.Run("leader_election_and_notify", func(t *testing.T) {
 		mustExec(t, conn, `DELETE FROM pgshard.tables; DELETE FROM pgshard.table_status; DELETE FROM pgshard.workflows`)
 		type event struct {

@@ -15,6 +15,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/andrew01234567890/pgshard/internal/placement"
 )
 
 type pgImage struct {
@@ -583,6 +585,74 @@ func runSuite(t *testing.T, img pgImage) {
 		}
 	})
 
+	t.Run("shard_sets", func(t *testing.T) {
+		sets, err := ListShardSets(ctx, conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(sets) == 0 || sets[0].Name != DefaultShardSet || sets[0].Generation != 1 || sets[0].State != ShardSetServing {
+			t.Fatalf("default set must be serving generation 1: %+v", sets)
+		}
+		before := len(sets)
+		admin := connect(t, dsn)
+		mustExec(t, admin, `SET ROLE `+RoleAdmin)
+		mustExec(t, admin, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES ('gnew', 0, '[,0)'), ('gnew', 1, '[0,)')`)
+		sets, err = ListShardSets(ctx, conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		last := sets[len(sets)-1]
+		if len(sets) != before+1 || last.Name != "gnew" || last.State != ShardSetDesired || last.Generation <= sets[len(sets)-2].Generation || last.DesiredGeneration == 0 {
+			t.Fatalf("inserting ranges into a new set must register it as desired with the next generation: %+v", sets)
+		}
+		_, err = admin.Exec(ctx, `UPDATE pgshard.shard_sets SET state = 'bogus' WHERE shard_set = 'gnew'`)
+		expectPgError(t, err, "23514", "state")
+		_, err = admin.Exec(ctx, `INSERT INTO pgshard.shard_sets (shard_set, generation, state) VALUES ('dup', $1, 'desired')`, last.Generation)
+		expectPgError(t, err, "23505", "generation")
+
+		tx, err := conn.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ranges, _ := placement.Split(4)
+		if err := MaterializeShardSet(ctx, tx, "g7", 7, ShardSetDesired, ranges); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		rows, err := ListShardRanges(ctx, conn, "g7")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 4 || rows[0].Lower != nil || rows[3].Upper != nil || *rows[1].Lower != ranges[1].Start || *rows[1].Upper != ranges[1].End+1 {
+			t.Fatalf("materialized ranges round-trip: %+v", rows)
+		}
+		if got := RangeSet(rows); got.Validate() != nil || got[2] != ranges[2] {
+			t.Fatalf("RangeSet: %v", got)
+		}
+		tx, _ = conn.Begin(ctx)
+		if err := MaterializeShardSet(ctx, tx, "g7", 7, ShardSetDesired, ranges); err == nil {
+			t.Fatal("materializing an existing set must fail")
+		}
+		_ = tx.Rollback(ctx)
+		tx, _ = conn.Begin(ctx)
+		if err := DropShardSet(ctx, tx, "g7"); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if n := queryOne[int64](t, conn, `SELECT count(*) FROM pgshard.shard_ranges WHERE shard_set = 'g7'`); n != 0 {
+			t.Fatalf("%d ranges left after drop", n)
+		}
+		if n := queryOne[int64](t, conn, `SELECT count(*) FROM pgshard.shard_sets WHERE shard_set = 'g7'`); n != 0 {
+			t.Fatalf("%d sets left after drop", n)
+		}
+		mustExec(t, conn, `DELETE FROM pgshard.shard_ranges WHERE shard_set = 'gnew'`)
+		mustExec(t, conn, `DELETE FROM pgshard.shard_sets WHERE shard_set = 'gnew'`)
+	})
+
 	t.Run("sequence_blocks", func(t *testing.T) {
 		mustExec(t, conn, `UPDATE pgshard.tables SET sequence_columns = '{id}' WHERE database = 'app' AND table_name = 'orders'`)
 		tables, err := ListTables(ctx, conn, "app")
@@ -708,6 +778,15 @@ func runSuite(t *testing.T, img pgImage) {
 			t.Fatalf("upsert must overwrite slot health: %+v", rows[0])
 		}
 	})
+}
+
+func queryOne[T any](t *testing.T, conn *pgx.Conn, sql string, args ...any) T {
+	t.Helper()
+	var v T
+	if err := conn.QueryRow(context.Background(), sql, args...).Scan(&v); err != nil {
+		t.Fatalf("%s: %v", sql, err)
+	}
+	return v
 }
 
 func mustTx(t *testing.T, tx pgx.Tx, sql string) {

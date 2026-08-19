@@ -75,6 +75,7 @@ func (r *ClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&policyv1.PodDisruptionBudget{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
+		Owns(&pgshardv1alpha1.PgShardReshard{}).
 		Watches(&pgshardv1alpha1.PgShardBackupPolicy{}, handler.EnqueueRequestsFromMapFunc(r.policyToClusters)).
 		Watches(&pgshardv1alpha1.PgShardBackup{}, handler.EnqueueRequestsFromMapFunc(backupToCluster)).
 		Named("pgshardcluster").
@@ -167,13 +168,37 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	var observations []groupObservation
-	for _, g := range Groups(&cluster) {
+	catalogGroup := Groups(&cluster)[0]
+	catalogObs, err := r.reconcileGroup(ctx, &cluster, catalogGroup, password, policy, repoReady)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("group %s: %w", catalogGroup.Name(), err)
+	}
+	catalogReady, dsn := r.reconcileCatalogSchema(ctx, &cluster, catalogObs, password)
+	var plan reshardPlan
+	if catalogReady.Status == metav1.ConditionTrue {
+		plan, err = r.reconcileReshard(ctx, &cluster, dsn)
+		if err != nil {
+			log.Error(err, "reshard reconciliation failed; groups keep reconciling")
+			plan.cond = metav1.Condition{Type: pgshardv1alpha1.ConditionResharding, Status: metav1.ConditionUnknown, Reason: "Error", Message: err.Error(), ObservedGeneration: cluster.Generation}
+		}
+	} else {
+		plan.cond = metav1.Condition{Type: pgshardv1alpha1.ConditionResharding, Status: metav1.ConditionUnknown, Reason: "CatalogNotReady", Message: catalogReady.Message, ObservedGeneration: cluster.Generation}
+	}
+	observations := []groupObservation{catalogObs}
+	for _, g := range Groups(&cluster)[1:] {
 		obs, err := r.reconcileGroup(ctx, &cluster, g, password, policy, repoReady)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("group %s: %w", g.Name(), err)
 		}
 		observations = append(observations, obs)
+	}
+	var targets []groupObservation
+	for _, g := range TargetGroups(&cluster) {
+		obs, err := r.reconcileGroup(ctx, &cluster, g, password, policy, repoReady)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("target group %s: %w", g.Name(), err)
+		}
+		targets = append(targets, obs)
 	}
 
 	if err := r.reconcileAdmin(ctx, &cluster); err != nil {
@@ -182,12 +207,17 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.reconcileRouter(ctx, &cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("router: %w", err)
 	}
-	catalogReady := r.reconcileCatalogSchema(ctx, &cluster, observations, password)
-	if err := r.updateStatus(ctx, &cluster, observations, catalogReady, backupCond); err != nil {
+	if catalogReady.Status == metav1.ConditionTrue {
+		catalogReady = r.publishShardStatus(ctx, &cluster, dsn, append(observations[1:], targets...))
+	}
+	if err := r.updateReshardStatus(ctx, plan, targets); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.updateStatus(ctx, &cluster, observations, catalogReady, backupCond, plan.cond); err != nil {
 		return ctrl.Result{}, err
 	}
 	requeue := requeueReady
-	for _, o := range observations {
+	for _, o := range append(observations, targets...) {
 		if o.failing {
 			return ctrl.Result{RequeueAfter: requeueFailover}, nil
 		}
@@ -639,34 +669,41 @@ func podReady(p *corev1.Pod) bool {
 	return false
 }
 
-func (r *ClusterReconciler) reconcileCatalogSchema(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, obs []groupObservation, password string) metav1.Condition {
+func (r *ClusterReconciler) reconcileCatalogSchema(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, catalog groupObservation, password string) (metav1.Condition, string) {
 	cond := metav1.Condition{Type: ConditionCatalogReady, Status: metav1.ConditionFalse, ObservedGeneration: c.Generation}
-	catalog := obs[0]
 	if !catalog.ready() {
 		cond.Reason = "CatalogGroupNotReady"
 		cond.Message = "catalog group is not ready"
-		return cond
+		return cond, ""
 	}
 	dsn := DSN(catalog.group.ServiceRW(), c.Namespace, password)
 	if err := r.Prober.MigrateCatalog(ctx, dsn); err != nil {
 		cond.Reason = "MigrationFailed"
 		cond.Message = err.Error()
-		return cond
+		return cond, ""
 	}
-	for _, o := range obs[1:] {
-		if err := r.Prober.PublishShardStatus(ctx, dsn, o.group.ShardID, o.group.Name(), o.state.epoch, r.memberEndpoint(c, o.group, o.state.primary)); err != nil {
+	cond.Status = metav1.ConditionTrue
+	cond.Reason = "Migrated"
+	cond.Message = "catalog schema is current"
+	return cond, dsn
+}
+
+// publishShardStatus upserts the fence of every shard group into the
+// catalog; target groups stay provisioning until their set is serving.
+func (r *ClusterReconciler) publishShardStatus(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, dsn string, shards []groupObservation) metav1.Condition {
+	cond := metav1.Condition{Type: ConditionCatalogReady, Status: metav1.ConditionTrue, Reason: "Migrated", Message: "catalog schema is current", ObservedGeneration: c.Generation}
+	for _, o := range shards {
+		if err := r.Prober.PublishShardStatus(ctx, dsn, o.group, o.state.epoch, r.memberEndpoint(c, o.group, o.state.primary)); err != nil {
+			cond.Status = metav1.ConditionFalse
 			cond.Reason = "PublishFailed"
 			cond.Message = err.Error()
 			return cond
 		}
 	}
-	cond.Status = metav1.ConditionTrue
-	cond.Reason = "Migrated"
-	cond.Message = "catalog schema is current"
 	return cond
 }
 
-func (r *ClusterReconciler) updateStatus(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, obs []groupObservation, catalogReady, backupCond metav1.Condition) error {
+func (r *ClusterReconciler) updateStatus(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, obs []groupObservation, catalogReady, backupCond, reshardCond metav1.Condition) error {
 	ready := true
 	primaryOK := true
 	replOK := true
@@ -719,6 +756,7 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, c *pgshardv1alpha1
 	set(pgshardv1alpha1.ConditionProgressing, !ready, boolReason(!ready, "Reconciling", "Stable"), "")
 	meta.SetStatusCondition(&c.Status.Conditions, catalogReady)
 	meta.SetStatusCondition(&c.Status.Conditions, backupCond)
+	meta.SetStatusCondition(&c.Status.Conditions, reshardCond)
 	r.setRolloutStatus(c, obs, set)
 	c.Status.ObservedGeneration = c.Generation
 	c.Status.Shards = shards

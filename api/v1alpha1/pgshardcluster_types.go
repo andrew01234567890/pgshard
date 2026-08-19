@@ -246,6 +246,19 @@ type RolloutStatus struct {
 	LastRestartToken string `json:"lastRestartToken,omitempty"`
 }
 
+// ClusterReshardStatus points at the reshard in flight.
+type ClusterReshardStatus struct {
+	// Name is the PgShardReshard object.
+	Name string `json:"name"`
+	// ShardSet is the pending catalog shard set; Generation its generation.
+	ShardSet   string `json:"shardSet"`
+	Generation int64  `json:"generation"`
+	// Shards is the number of target groups being provisioned.
+	Shards int `json:"shards"`
+	// +optional
+	Phase string `json:"phase,omitempty"`
+}
+
 // PgShardClusterStatus is the observed state of a PgShardCluster.
 type PgShardClusterStatus struct {
 	// +optional
@@ -258,6 +271,13 @@ type PgShardClusterStatus struct {
 	ShardMapGeneration int64 `json:"shardMapGeneration,omitempty"`
 	// +optional
 	Shards []ShardStatus `json:"shards,omitempty"`
+	// EffectiveShards is the shard count of the serving shard set as
+	// materialized in the catalog; zero until the catalog exists.
+	// +optional
+	EffectiveShards int `json:"effectiveShards,omitempty"`
+	// Reshard is the resharding run in flight, if any.
+	// +optional
+	Reshard *ClusterReshardStatus `json:"reshard,omitempty"`
 	// +optional
 	Tuning TuningStatus `json:"tuning,omitempty"`
 	// +optional
