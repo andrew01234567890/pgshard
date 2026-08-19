@@ -103,6 +103,68 @@ candidate; it wins when it holds the maximum flushed LSN, otherwise the
 highest one does. The annotation is removed when the switchover finished (or
 was refused). Writes fail only between the shutdown and the promotion.
 
+## Rolling operations
+
+Every change to a member's shape is applied one member per group at a time,
+groups in parallel, and never while a group is unhealthy or a failover is in
+flight. `status.rollout` (`phase`, `member`, `reason`, `lastRestartToken`) and
+the `RolloutInProgress` condition report progress; each `PgShardGroup` carries
+its own `status.rollout` step and the claim every member runs on
+(`status.members[].pvc`).
+
+### What a change is classified as
+
+The operator renders a `MemberTemplate` per group: image, resources, restart
+token, and the effective settings (`spec.postgresql.parameters` plus the
+`pgshard.override.conf` derived by pgtune, see [tuning.md](tuning.md)). Two
+hashes are stamped on every member pod: `pgshard.io/template-hash` (image,
+resources, token) and `pgshard.io/settings-hash`.
+
+| Change | Action |
+| --- | --- |
+| Settings whose `pg_settings.context` is `sighup`, `superuser`, `user` or `backend` | ConfigMap update + `Agent.Reload` on every member; no pod restart. The pod is stamped once the agent reports back the new settings hash (the ConfigMap volume can lag the API by a minute). |
+| Any setting with context `postmaster` (or an unknown name) | rolling restart. The group remembers `settingsRestartPending` until every member restarted, so a later reload-only change cannot skip the pending restart. |
+| Image, resources, `pgshard.io/restart=<token>` annotation | rolling restart; the token is recorded in `status.rollout.lastRestartToken` once every member carries it. |
+| `storage.size` grows and the StorageClass has `allowVolumeExpansion` | the claim is patched in place; nothing restarts. |
+| `storage.storageClassName` changes, or the size grows on a class that cannot expand | member rebuild onto a new claim. A shrink is ignored. |
+
+The context is read from `pg_settings` on the primary before the ConfigMap is
+rewritten; while the primary is unreachable the ConfigMap is left as it is.
+
+### Rolling restart
+
+For each group: every stale standby in name order — delete the pod (the claim
+stays), wait until it is Running, Ready (the agent's readiness includes the
+replay-lag check) and streaming again, and the sync set is re-applied — then
+the primary: a switchover to the sync-set standby with the highest flushed
+LSN is requested through the ordinary `pgshard.io/switchover` path, the old
+primary pod is recreated as a standby with the new template by the same step,
+and the group is settled again once it streams. One switchover per group,
+writes pause only for its shutdown-to-promotion window. Only one switchover
+runs per cluster at a time; groups otherwise proceed independently.
+
+### Storage rebuild
+
+For each stale member: create the successor claim `<member>-v<n>` on the new
+class (labelled `pgshard.io/member=<member>`), record it in the group status,
+delete the pod. The recreated pod mounts the new, empty claim and the agent
+clones it with `pg_basebackup` from `-rw`. Once the member is Ready and
+streaming the retired claim is deleted; it is never deleted while a pod still
+mounts it and never before the successor streams. A primary is switched over
+first, then rebuilt as a standby.
+
+### Gates and holds
+
+- Nothing is deleted while the group is not Ready, a switchover annotation is
+  set or a failover timer is running.
+- A standby is only taken down while `streaming - 1 >= minSyncStandbys`.
+- The replica and primary PDBs describe the same budget for evictions; the
+  operator's own deletions honour it through the one-at-a-time rule.
+- A step that has not completed within `DefaultRolloutTimeout` (15 minutes)
+  sets `Degraded=True/RolloutHeld` and `status.rollout.phase=Held`; nothing
+  further is deleted. The missing member is still recreated and the rollout
+  resumes by itself when it is back.
+
 ## Invariants
 
 - The agent refuses `Promote`/`Demote` unless the epoch is strictly greater

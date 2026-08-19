@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,6 +22,39 @@ const (
 // standby is true the recovery settings pointing at PrimaryConninfo are
 // included.
 func RenderPostgresqlConf(c *Config, standby bool) string {
+	set := ownedSettings(c, standby)
+	for k, v := range c.Postgres.Parameters {
+		if _, owned := set[k]; !owned {
+			set[k] = quote(v)
+		}
+	}
+	keys := make([]string, 0, len(set))
+	for k := range set {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteString("# Managed by pgshard-agent. Edits are overwritten.\n")
+	for _, k := range keys {
+		fmt.Fprintf(&b, "%s = %s\n", k, set[k])
+	}
+	fmt.Fprintf(&b, "include_if_exists = %s\n", quote(overrideConf))
+	return b.String()
+}
+
+// OwnedSettings lists the postgresql.conf names the agent fixes itself; a
+// value for one of them from any other source is ignored.
+func OwnedSettings() []string {
+	set := ownedSettings(&Config{TLS: TLSFiles{CertFile: "x", KeyFile: "x", CAFile: "x"}, Postgres: PostgresSettings{RestoreCommand: "x"}}, true)
+	keys := make([]string, 0, len(set))
+	for k := range set {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func ownedSettings(c *Config, standby bool) map[string]string {
 	set := map[string]string{
 		"listen_addresses":               quote("*"),
 		"port":                           fmt.Sprint(c.Port),
@@ -58,23 +92,7 @@ func RenderPostgresqlConf(c *Config, standby bool) string {
 		set["primary_conninfo"] = quote(PrimaryConninfo(c))
 		set["primary_slot_name"] = quote(c.SlotName())
 	}
-	for k, v := range c.Postgres.Parameters {
-		if _, owned := set[k]; !owned {
-			set[k] = quote(v)
-		}
-	}
-	keys := make([]string, 0, len(set))
-	for k := range set {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var b strings.Builder
-	b.WriteString("# Managed by pgshard-agent. Edits are overwritten.\n")
-	for _, k := range keys {
-		fmt.Fprintf(&b, "%s = %s\n", k, set[k])
-	}
-	fmt.Fprintf(&b, "include_if_exists = %s\n", quote(overrideConf))
-	return b.String()
+	return set
 }
 
 // PrimaryConninfo derives the standby's connection string from the
@@ -132,6 +150,13 @@ func WriteConfig(c *Config, standby bool) error {
 		postgresqlConf: RenderPostgresqlConf(c, standby),
 		pgHBAConf:      RenderPgHBAConf(c),
 		autoConf:       "# Managed by pgshard-agent; runtime ALTER SYSTEM is not supported.\n",
+	}
+	if c.OverrideFile != "" {
+		body, err := os.ReadFile(c.OverrideFile)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		files[overrideConf] = string(body)
 	}
 	for name, body := range files {
 		if err := writeFileSync(filepath.Join(c.PGData, name), []byte(body)); err != nil {

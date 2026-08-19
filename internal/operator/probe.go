@@ -28,6 +28,15 @@ type StandbyState struct {
 	FlushLSN uint64
 }
 
+// SettingState is one row of pg_settings the operator cares about.
+type SettingState struct {
+	Value string
+	// Context is the GUC context: postmaster values need a restart, the
+	// rest apply on reload.
+	Context        string
+	PendingRestart bool
+}
+
 // Prober talks SQL to group members. It is an interface so envtest can
 // substitute a fake; the real one dials with pgx.
 type Prober interface {
@@ -42,6 +51,8 @@ type Prober interface {
 	// and drops an inactive slot named drop (the primary's own, inherited
 	// from its time as a standby, which would otherwise pin WAL forever).
 	EnsureSlots(ctx context.Context, dsn string, want []string, drop string) error
+	// Settings reads pg_settings for names.
+	Settings(ctx context.Context, dsn string, names []string) (map[string]SettingState, error)
 }
 
 // DSN builds the connection URL for a group's -rw Service.
@@ -162,6 +173,30 @@ func (PgxProber) EnsureSlots(ctx context.Context, dsn string, want []string, dro
 	_, err = conn.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
 		WHERE slot_name = $1 AND NOT active`, drop)
 	return err
+}
+
+// Settings reads the named rows of pg_settings.
+func (PgxProber) Settings(ctx context.Context, dsn string, names []string) (map[string]SettingState, error) {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	rows, err := conn.Query(ctx, "SELECT name, setting, context, pending_restart FROM pg_settings WHERE name = ANY($1)", names)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]SettingState{}
+	for rows.Next() {
+		var name string
+		var st SettingState
+		if err := rows.Scan(&name, &st.Value, &st.Context, &st.PendingRestart); err != nil {
+			return nil, err
+		}
+		out[name] = st
+	}
+	return out, rows.Err()
 }
 
 // SetSyncStandbyNames applies synchronous_standby_names via ALTER SYSTEM and reloads.

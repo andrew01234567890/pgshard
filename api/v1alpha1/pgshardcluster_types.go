@@ -19,6 +19,18 @@ const (
 	ConditionServingWrites      = "ServingWrites"
 	ConditionRouterReady        = "RouterReady"
 	ConditionTuningApplied      = "TuningApplied"
+	ConditionRolloutInProgress  = "RolloutInProgress"
+)
+
+// Rollout phases reported in status.rollout.phase.
+const (
+	RolloutPhaseIdle       = "Idle"
+	RolloutPhaseReloading  = "Reloading"
+	RolloutPhaseRestarting = "Restarting"
+	RolloutPhaseSwitchover = "Switchover"
+	RolloutPhaseRebuilding = "Rebuilding"
+	RolloutPhaseExpanding  = "Expanding"
+	RolloutPhaseHeld       = "Held"
 )
 
 // PostgreSQLSpec selects the PostgreSQL build and its base configuration.
@@ -185,6 +197,9 @@ type MemberStatus struct {
 	Ready bool `json:"ready,omitempty"`
 	// +optional
 	ReplayLagBytes int64 `json:"replayLagBytes,omitempty"`
+	// PVC is the claim the member's data directory lives on.
+	// +optional
+	PVC string `json:"pvc,omitempty"`
 }
 
 // ShardStatus reports one shard and its members.
@@ -216,6 +231,21 @@ type TuningStatus struct {
 	Derived []DerivedSetting `json:"derived,omitempty"`
 }
 
+// RolloutStatus summarises the rolling operation in flight across groups.
+type RolloutStatus struct {
+	// +optional
+	Phase string `json:"phase,omitempty"`
+	// Member is the member being reloaded, restarted or rebuilt.
+	// +optional
+	Member string `json:"member,omitempty"`
+	// +optional
+	Reason string `json:"reason,omitempty"`
+	// LastRestartToken is the pgshard.io/restart value the last completed
+	// whole-cluster restart carried.
+	// +optional
+	LastRestartToken string `json:"lastRestartToken,omitempty"`
+}
+
 // PgShardClusterStatus is the observed state of a PgShardCluster.
 type PgShardClusterStatus struct {
 	// +optional
@@ -230,6 +260,8 @@ type PgShardClusterStatus struct {
 	Shards []ShardStatus `json:"shards,omitempty"`
 	// +optional
 	Tuning TuningStatus `json:"tuning,omitempty"`
+	// +optional
+	Rollout RolloutStatus `json:"rollout,omitempty"`
 }
 
 // PgShardCluster is a sharded PostgreSQL cluster.

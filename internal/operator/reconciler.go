@@ -25,6 +25,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/internal/pgtune"
 )
 
 const (
@@ -45,6 +46,7 @@ type ClusterReconciler struct {
 	FailoverDelay  time.Duration
 	PollInterval   time.Duration
 	QuiesceTimeout time.Duration
+	RolloutTimeout time.Duration
 	Now            func() time.Time
 
 	mu             sync.Mutex
@@ -80,6 +82,8 @@ type groupState struct {
 	// syncSet holds the standbys that were streaming at the last healthy
 	// observation: the members an acknowledged commit may only exist on.
 	syncSet map[string]bool
+	// pvcs maps each member to the claim its data directory lives on.
+	pvcs map[string]string
 }
 
 // memberInfo is one member's pod as observed this pass.
@@ -105,6 +109,13 @@ type groupObservation struct {
 	replicasWant int
 	// failing is set while the primary is unhealthy or a failover is pending.
 	failing bool
+	// template is the desired member template; tuning the derived settings
+	// behind it (tuningErr when they could not be derived).
+	template  MemberTemplate
+	tuning    pgtune.Settings
+	tuningErr error
+	// rollout is the rolling step in flight or held, nil when idle.
+	rollout *pgshardv1alpha1.GroupRollout
 }
 
 func (o groupObservation) streamingCount() int {
@@ -164,8 +175,8 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if o.failing {
 			return ctrl.Result{RequeueAfter: requeueFailover}, nil
 		}
-		if !o.ready() {
-			log.V(1).Info("group not ready", "group", o.group.Name(), "running", o.podsRunning, "streaming", o.streamingCount(), "primaryOK", o.primaryOK)
+		if !o.ready() || o.rollout != nil {
+			log.V(1).Info("group not settled", "group", o.group.Name(), "running", o.podsRunning, "streaming", o.streamingCount(), "primaryOK", o.primaryOK)
 			requeue = requeueNotReady
 		}
 	}
@@ -261,10 +272,16 @@ func (r *ClusterReconciler) loadState(ctx context.Context, c *pgshardv1alpha1.Pg
 	if err := r.Get(ctx, client.ObjectKeyFromObject(pg), pg); err != nil {
 		return groupState{}, err
 	}
-	st := groupState{primary: pg.Status.Primary, epoch: pg.Status.Epoch, syncSet: map[string]bool{}}
+	st := groupState{primary: pg.Status.Primary, epoch: pg.Status.Epoch, syncSet: map[string]bool{}, pvcs: map[string]string{}}
+	for _, name := range g.MemberNames() {
+		st.pvcs[name] = name
+	}
 	for _, m := range pg.Status.Members {
 		if m.Name != st.primary && m.Ready {
 			st.syncSet[m.Name] = true
+		}
+		if m.PVC != "" {
+			st.pvcs[m.Name] = m.PVC
 		}
 	}
 	if st.primary == "" {
@@ -279,8 +296,8 @@ func (r *ClusterReconciler) loadState(ctx context.Context, c *pgshardv1alpha1.Pg
 	return st, nil
 }
 
-func (r *ClusterReconciler) ensureConfigMap(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, primary string) error {
-	desired := r.Renderer.ConfigMap(c, g, primary)
+func (r *ClusterReconciler) ensureConfigMap(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, primary string, tuning pgtune.Settings) error {
+	desired := r.Renderer.ConfigMap(c, g, primary, tuning)
 	cm := &corev1.ConfigMap{ObjectMeta: desired.ObjectMeta}
 	return r.ensureOwned(ctx, c, cm, func() error {
 		cm.Labels = desired.Labels
@@ -297,7 +314,9 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 		return obs, err
 	}
 	obs.state = state
-	if err := r.ensureConfigMap(ctx, c, g, state.primary); err != nil {
+	obs.tuning, obs.tuningErr = Tuning(c, g)
+	obs.template = Template(c, obs.tuning)
+	if err := r.ensureSettings(ctx, c, g, &obs, password); err != nil {
 		return obs, err
 	}
 	for _, desired := range r.Renderer.Services(c, g) {
@@ -328,16 +347,16 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 
 	members := map[string]*memberInfo{}
 	for i := 0; i < g.Replicas; i++ {
-		if err := r.ensureOwned(ctx, c, r.Renderer.PVC(c, g, i), nil); err != nil {
+		name := g.MemberName(i)
+		if err := r.ensureOwned(ctx, c, r.Renderer.PVC(c, g, i, state.pvcs[name]), nil); err != nil {
 			return obs, err
 		}
-		name := g.MemberName(i)
 		// A missing primary pod is a failover trigger, not something to
 		// recreate: a fresh pod would take the Lease back and no promotion
 		// would happen. It is recreated as a replica once the group moved on,
 		// or as the primary when no candidate exists.
 		createIfMissing := name != state.primary || len(state.syncSet) == 0
-		m, err := r.observePod(ctx, c, g, i, state.primary, createIfMissing)
+		m, err := r.observePod(ctx, c, g, i, state, obs.template, createIfMissing)
 		if err != nil {
 			return obs, err
 		}
@@ -372,7 +391,7 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 				logf.FromContext(ctx).Info("primary unhealthy but no candidate; keeping the current primary", "group", g.Name(), "primary", state.primary)
 				r.unhealthyFor(g.Prefix(), false)
 				if primary.pod == nil {
-					if _, err := r.observePod(ctx, c, g, ordinalOf(g, state.primary), state.primary, true); err != nil {
+					if _, err := r.observePod(ctx, c, g, ordinalOf(g, state.primary), state, obs.template, true); err != nil {
 						return obs, err
 					}
 				}
@@ -381,7 +400,7 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 			if err != nil {
 				return obs, err
 			}
-			if err := r.ensureConfigMap(ctx, c, g, state.primary); err != nil {
+			if err := r.ensureConfigMap(ctx, c, g, state.primary, obs.tuning); err != nil {
 				return obs, err
 			}
 		}
@@ -424,7 +443,36 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 		}
 	}
 	obs.syncApplied = true
+	if err := r.rollout(ctx, c, g, &obs, members, password); err != nil {
+		return obs, fmt.Errorf("rollout: %w", err)
+	}
 	return obs, nil
+}
+
+// ensureSettings classifies a settings change against the primary before
+// the ConfigMap is rewritten, so the group knows whether the change needs a
+// restart; when the primary cannot answer the ConfigMap is left as it is.
+func (r *ClusterReconciler) ensureSettings(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, obs *groupObservation, password string) error {
+	primaryIP := ""
+	var pod corev1.Pod
+	if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: obs.state.primary}, &pod); err == nil {
+		primaryIP = pod.Status.PodIP
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+	restart, known, err := r.classifySettingsChange(ctx, c, g, obs.template, primaryIP, password)
+	if err != nil {
+		return err
+	}
+	if !known {
+		return nil
+	}
+	if restart {
+		if err := r.patchGroupStatus(ctx, c, g, func(pg *pgshardv1alpha1.PgShardGroup) { pg.Status.SettingsRestartPending = true }); err != nil {
+			return err
+		}
+	}
+	return r.ensureConfigMap(ctx, c, g, obs.state.primary, obs.tuning)
 }
 
 func ordinalOf(g Group, member string) int {
@@ -441,7 +489,7 @@ func (r *ClusterReconciler) finishGroup(_ context.Context, _ *pgshardv1alpha1.Pg
 	obs.podsRunning, obs.podsReady, obs.members = 0, 0, nil
 	for _, name := range g.MemberNames() {
 		m := members[name]
-		ms := pgshardv1alpha1.MemberStatus{Name: name}
+		ms := pgshardv1alpha1.MemberStatus{Name: name, PVC: obs.state.pvcs[name]}
 		if m != nil && m.pod != nil {
 			ms.Role = m.pod.Labels[LabelRole]
 			if m.running {
@@ -494,7 +542,7 @@ func (r *ClusterReconciler) switchover(ctx context.Context, c *pgshardv1alpha1.P
 	if err != nil {
 		return obs, err
 	}
-	if err := r.ensureConfigMap(ctx, c, g, state.primary); err != nil {
+	if err := r.ensureConfigMap(ctx, c, g, state.primary, obs.tuning); err != nil {
 		return obs, err
 	}
 	obs = r.finishGroup(ctx, c, g, obs, members)
@@ -525,10 +573,10 @@ func (r *ClusterReconciler) waitPodGone(ctx context.Context, pod *corev1.Pod) er
 
 // observePod fetches member ordinal's pod, creating it when absent and
 // createIfMissing is set. Finished pods are deleted so they come back.
-func (r *ClusterReconciler) observePod(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, primary string, createIfMissing bool) (*memberInfo, error) {
+func (r *ClusterReconciler) observePod(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, state groupState, tpl MemberTemplate, createIfMissing bool) (*memberInfo, error) {
 	name := g.MemberName(ordinal)
 	role := RoleReplica
-	if name == primary {
+	if name == state.primary {
 		role = RolePrimary
 	}
 	m := &memberInfo{name: name}
@@ -539,7 +587,7 @@ func (r *ClusterReconciler) observePod(ctx context.Context, c *pgshardv1alpha1.P
 		if !createIfMissing {
 			return m, nil
 		}
-		desired := r.Renderer.Pod(c, g, ordinal, role)
+		desired := r.Renderer.Pod(c, g, ordinal, role, state.pvcs[name], tpl)
 		if err := r.ensureOwned(ctx, c, desired, nil); err != nil {
 			return nil, err
 		}
@@ -648,9 +696,49 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, c *pgshardv1alpha1
 	set(pgshardv1alpha1.ConditionReplicationHealthy, replOK, boolReason(replOK, "AllStreaming", "ReplicasMissing"), "")
 	set(pgshardv1alpha1.ConditionProgressing, !ready, boolReason(!ready, "Reconciling", "Stable"), "")
 	meta.SetStatusCondition(&c.Status.Conditions, catalogReady)
+	r.setRolloutStatus(c, obs, set)
 	c.Status.ObservedGeneration = c.Generation
 	c.Status.Shards = shards
 	return r.Status().Patch(ctx, c, client.MergeFrom(base))
+}
+
+// setRolloutStatus summarises the groups' rolling steps into status.rollout
+// and the RolloutInProgress, Degraded and TuningApplied conditions.
+func (r *ClusterReconciler) setRolloutStatus(c *pgshardv1alpha1.PgShardCluster, obs []groupObservation, set func(t string, ok bool, reason, message string)) {
+	rollout := pgshardv1alpha1.RolloutStatus{Phase: pgshardv1alpha1.RolloutPhaseIdle, LastRestartToken: c.Status.Rollout.LastRestartToken}
+	held := ""
+	tuningErr := ""
+	var tuned []pgshardv1alpha1.DerivedSetting
+	for _, o := range obs {
+		if o.rollout != nil && rollout.Phase == pgshardv1alpha1.RolloutPhaseIdle {
+			rollout.Phase, rollout.Member, rollout.Reason = o.rollout.Phase, o.rollout.Member, o.group.Name()+": "+o.rollout.Reason
+		}
+		if o.rollout != nil && o.rollout.Phase == pgshardv1alpha1.RolloutPhaseHeld && held == "" {
+			held = o.group.Name() + ": " + o.rollout.Reason
+		}
+		if o.tuningErr != nil && tuningErr == "" {
+			tuningErr = o.group.Name() + ": " + o.tuningErr.Error()
+		}
+		if o.group.Kind == "shard" || tuned == nil {
+			tuned = o.tuning.Derived()
+		}
+	}
+	if rollout.Phase == pgshardv1alpha1.RolloutPhaseIdle {
+		rollout.LastRestartToken = c.Annotations[AnnotationRestart]
+	}
+	c.Status.Rollout = rollout
+	c.Status.Tuning.Derived = tuned
+	inProgress := rollout.Phase != pgshardv1alpha1.RolloutPhaseIdle
+	set(pgshardv1alpha1.ConditionRolloutInProgress, inProgress, boolReason(inProgress, "Rolling", "Idle"), rollout.Reason)
+	set(pgshardv1alpha1.ConditionDegraded, held != "", boolReason(held != "", "RolloutHeld", "Healthy"), held)
+	switch {
+	case tuningErr != "":
+		set(pgshardv1alpha1.ConditionTuningApplied, false, "DeriveFailed", tuningErr)
+	case len(tuned) == 0:
+		set(pgshardv1alpha1.ConditionTuningApplied, false, "NoMemoryBudget", "spec.resources sets no memory; nothing was derived")
+	default:
+		set(pgshardv1alpha1.ConditionTuningApplied, true, "Derived", fmt.Sprintf("%d settings derived from the pod resources", len(tuned)))
+	}
 }
 
 func boolReason(ok bool, yes, no string) string {

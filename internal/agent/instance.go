@@ -387,6 +387,9 @@ func (in *Instance) Restart(ctx context.Context, mode ShutdownMode) error {
 
 // Reload asks the postmaster to reread its configuration.
 func (in *Instance) Reload(ctx context.Context) error {
+	if err := in.cfg.Refresh(); err != nil {
+		return err
+	}
 	if err := WriteConfig(in.cfg, in.IsStandby()); err != nil {
 		return err
 	}

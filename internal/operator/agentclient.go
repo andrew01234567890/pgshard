@@ -28,6 +28,10 @@ type AgentClient interface {
 	Status(ctx context.Context, addr string) (AgentStatus, error)
 	Promote(ctx context.Context, addr string, epoch uint64, holder string) error
 	Demote(ctx context.Context, addr string, epoch uint64) error
+	// Reload makes the agent reread its config and signal postgres; it is
+	// fenced at the agent's current epoch, so it never changes roles.
+	// It returns the settings hash the agent loaded.
+	Reload(ctx context.Context, addr string) (string, error)
 }
 
 // GRPCAgentClient is the production AgentClient.
@@ -106,4 +110,25 @@ func (c GRPCAgentClient) Demote(ctx context.Context, addr string, epoch uint64) 
 		return fmt.Errorf("demote: %s (%s)", e.GetMessage(), e.GetSqlstate())
 	}
 	return nil
+}
+
+// Reload reads the agent's epoch and calls Agent.Reload at that epoch.
+func (c GRPCAgentClient) Reload(ctx context.Context, addr string) (string, error) {
+	conn, cl, err := c.dial(ctx, addr)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = conn.Close() }()
+	st, err := cl.Status(ctx, &pgshardv1.StatusRequest{})
+	if err != nil {
+		return "", err
+	}
+	resp, err := cl.Reload(ctx, &pgshardv1.ReloadRequest{Epoch: st.GetEpoch()})
+	if err != nil {
+		return "", err
+	}
+	if e := resp.GetError(); e != nil {
+		return resp.GetSettingsHash(), fmt.Errorf("reload: %s (%s)", e.GetMessage(), e.GetSqlstate())
+	}
+	return resp.GetSettingsHash(), nil
 }

@@ -1,6 +1,8 @@
 package operator
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -14,6 +16,7 @@ import (
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/internal/agent"
+	"github.com/andrew01234567890/pgshard/internal/pgtune"
 )
 
 const (
@@ -59,9 +62,58 @@ func (Renderer) PgShardGroup(c *pgshardv1alpha1.PgShardCluster, g Group) *pgshar
 	return obj
 }
 
+// MemberTemplate is everything about a member pod that a change to the
+// spec can alter without changing the member's identity. Its hash is
+// stamped on the pod; a different hash means the member must be reloaded or
+// restarted to match the spec.
+type MemberTemplate struct {
+	Image        string                      `json:"image"`
+	Resources    corev1.ResourceRequirements `json:"resources"`
+	Settings     map[string]string           `json:"settings"`
+	RestartToken string                      `json:"restartToken,omitempty"`
+}
+
+// Template computes the desired member template of a group. tuning is the
+// derived override for the group (nil when none applies).
+func Template(c *pgshardv1alpha1.PgShardCluster, tuning pgtune.Settings) MemberTemplate {
+	return MemberTemplate{
+		Image:        Image(c),
+		Resources:    c.Spec.Resources,
+		Settings:     effectiveSettings(c.Spec.PostgreSQL.Parameters, tuning),
+		RestartToken: c.Annotations[AnnotationRestart],
+	}
+}
+
+// Hash is the pod-shaped part of the template (image, resources, restart
+// token) as stamped on pods; a difference always means a pod restart.
+func (t MemberTemplate) Hash() string {
+	t.Settings = nil
+	b, err := json.Marshal(t)
+	if err != nil {
+		panic(err)
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:8])
+}
+
+// SettingsHash identifies the settings alone: it is what the agent echoes
+// back from Reload so a live reload can be confirmed applied.
+func (t MemberTemplate) SettingsHash() string {
+	b, err := json.Marshal(t.Settings)
+	if err != nil {
+		panic(err)
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:8])
+}
+
 // AgentConfig renders the pgshard-agent JSON config for one member given
 // the group's current primary.
 func AgentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary string) agent.Config {
+	return agentConfig(c, g, member, primary, Template(c, nil).SettingsHash(), false)
+}
+
+func agentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary, settingsHash string, override bool) agent.Config {
 	role := agent.RoleStandby
 	if member == primary {
 		role = agent.RolePrimary
@@ -72,7 +124,7 @@ func AgentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary str
 			peers = append(peers, fmt.Sprintf("http://%s:%d/failsafe", g.MemberHost(m, c.Namespace), agentHTTPPort))
 		}
 	}
-	return agent.Config{
+	cfg := agent.Config{
 		Cluster:          c.Name,
 		Shard:            g.Name(),
 		Member:           member,
@@ -91,26 +143,55 @@ func AgentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary str
 		},
 		Lease:           agent.LeaseConfig{Enabled: true, Namespace: c.Namespace},
 		ShutdownTimeout: agent.Duration(agentShutdownTimeout),
+		SettingsHash:    settingsHash,
 	}
+	if override {
+		cfg.OverrideFile = configMountPath + "/" + overrideConfKey
+	}
+	return cfg
 }
 
 func agentConfigKey(member string) string { return member + ".json" }
 
-// ConfigMap renders the per-member agent configs; primary decides which
-// member bootstraps with initdb and which ones clone.
-func (Renderer) ConfigMap(c *pgshardv1alpha1.PgShardCluster, g Group, primary string) *corev1.ConfigMap {
+// ConfigMap renders the per-member agent configs and the derived override;
+// primary decides which member bootstraps with initdb and which ones clone.
+func (Renderer) ConfigMap(c *pgshardv1alpha1.PgShardCluster, g Group, primary string, tuning pgtune.Settings) *corev1.ConfigMap {
+	tpl := Template(c, tuning)
 	data := map[string]string{}
+	override := OverrideConf(tuning)
+	if override != "" {
+		data[overrideConfKey] = override
+	}
 	for _, m := range g.MemberNames() {
-		b, err := json.MarshalIndent(AgentConfig(c, g, m, primary), "", "  ")
+		b, err := json.MarshalIndent(agentConfig(c, g, m, primary, tpl.SettingsHash(), override != ""), "", "  ")
 		if err != nil {
 			panic(err)
 		}
 		data[agentConfigKey(m)] = string(b) + "\n"
 	}
+	settings, err := json.Marshal(tpl.Settings)
+	if err != nil {
+		panic(err)
+	}
+	data[settingsKey] = string(settings)
 	return &corev1.ConfigMap{
 		ObjectMeta: objectMeta(g, g.ConfigMapName(), c.Namespace, nil),
 		Data:       data,
 	}
+}
+
+// settingsKey holds the effective settings map in the ConfigMap so the next
+// reconcile can tell which GUCs a spec change touched.
+const settingsKey = "settings.json"
+
+// ConfigMapSettings reads the settings map a ConfigMap was rendered with.
+func ConfigMapSettings(cm *corev1.ConfigMap) map[string]string {
+	out := map[string]string{}
+	if cm == nil || cm.Data[settingsKey] == "" {
+		return out
+	}
+	_ = json.Unmarshal([]byte(cm.Data[settingsKey]), &out)
+	return out
 }
 
 // MemberRBAC renders the ServiceAccount, Role and RoleBinding the member
@@ -186,10 +267,11 @@ func (Renderer) PDBs(c *pgshardv1alpha1.PgShardCluster, g Group) []*policyv1.Pod
 	return out
 }
 
-// PVC renders the member's data volume claim.
-func (Renderer) PVC(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int) *corev1.PersistentVolumeClaim {
+// PVC renders the member's data volume claim under name (the member name,
+// or a -v<n> successor after a storage rebuild).
+func (Renderer) PVC(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, name string) *corev1.PersistentVolumeClaim {
 	return &corev1.PersistentVolumeClaim{
-		ObjectMeta: objectMeta(g, g.MemberName(ordinal), c.Namespace, map[string]string{LabelOrdinal: strconv.Itoa(ordinal)}),
+		ObjectMeta: objectMeta(g, name, c.Namespace, map[string]string{LabelOrdinal: strconv.Itoa(ordinal), LabelMember: g.MemberName(ordinal)}),
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 			StorageClassName: g.Storage.StorageClassName,
@@ -206,13 +288,16 @@ func httpProbe(path string, period, failures int32) *corev1.Probe {
 	}
 }
 
-// Pod renders member ordinal of the group with the given role label; the
-// agent is PID 1 and reads its config from the group ConfigMap.
-func (Renderer) Pod(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, role string) *corev1.Pod {
+// Pod renders member ordinal of the group with the given role label, bound
+// to the pvc claim and stamped with the template hash; the agent is PID 1
+// and reads its config from the group ConfigMap.
+func (Renderer) Pod(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, role, pvc string, tpl MemberTemplate) *corev1.Pod {
 	name := g.MemberName(ordinal)
 	uid := postgresUID
+	meta := objectMeta(g, name, c.Namespace, map[string]string{LabelOrdinal: strconv.Itoa(ordinal), LabelRole: role})
+	meta.Annotations = map[string]string{AnnotationTemplateHash: tpl.Hash(), AnnotationSettingsHash: tpl.SettingsHash()}
 	return &corev1.Pod{
-		ObjectMeta: objectMeta(g, name, c.Namespace, map[string]string{LabelOrdinal: strconv.Itoa(ordinal), LabelRole: role}),
+		ObjectMeta: meta,
 		Spec: corev1.PodSpec{
 			Hostname:           name,
 			Subdomain:          g.ServiceHeadless(),
@@ -243,7 +328,7 @@ func (Renderer) Pod(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, rol
 				},
 			}, poolerSidecar(c, g)},
 			Volumes: []corev1.Volume{
-				{Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: name}}},
+				{Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvc}}},
 				{Name: "config", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
 					LocalObjectReference: corev1.LocalObjectReference{Name: g.ConfigMapName()}}}},
 				{Name: "secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: SecretName(c.Name)}}},

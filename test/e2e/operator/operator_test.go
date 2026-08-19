@@ -108,10 +108,48 @@ func deployOperator(ctx context.Context, t *testing.T, c *e2e.Cluster, root, ima
 	}
 }
 
-// psql runs sql against host from inside the catalog-0 pod, authenticating
-// with the pgpass file the agent writes next to PGDATA.
+const clientPod = "psql-client"
+
+// clientManifest is a long-lived pod with psql from the member image; the
+// tests drive SQL through it so member restarts never take the client down.
+func clientManifest(image string) string {
+	return fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %[1]s
+  namespace: %[2]s
+  labels:
+    app: %[1]s
+spec:
+  securityContext:
+    runAsUser: 999
+    runAsGroup: 999
+  containers:
+    - name: psql
+      image: %[3]s
+      command: ["sleep", "infinity"]
+      env:
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: %[4]s-superuser
+              key: password
+        - name: PGCONNECT_TIMEOUT
+          value: "5"
+`, clientPod, testNamespace, image, clusterName)
+}
+
+func memberImage(major string) string {
+	if img := os.Getenv("PGSHARD_POSTGRES_IMAGE"); img != "" {
+		return img
+	}
+	return "ghcr.io/andrew01234567890/pgshard-postgres:" + major
+}
+
+// psql runs sql against host from the client pod.
 func psql(ctx context.Context, c *e2e.Cluster, host, sql string) (string, error) {
-	out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "exec", clusterName+"-catalog-0", "--", "env", "PGPASSFILE=/var/lib/postgresql/data/.pgshard-pgpass", "PGCONNECT_TIMEOUT=5",
+	out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "exec", clientPod, "--",
 		"psql", "-h", host, "-U", "postgres", "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-tAc", sql)
 	return strings.TrimSpace(out), err
 }
@@ -250,7 +288,7 @@ func count(ctx context.Context, t *testing.T, c *e2e.Cluster, kind, selector str
 func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 	c := e2e.NewCluster(t)
 	c.GatherOnFailure(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 70*time.Minute)
 	defer cancel()
 	root := repoRoot(t)
 	major := env("PG_MAJOR", "18")
@@ -259,6 +297,9 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 
 	manifest := clusterManifest(major, os.Getenv("PGSHARD_POSTGRES_IMAGE"))
 	if err := c.Apply(ctx, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Apply(ctx, clientManifest(memberImage(major))); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -277,6 +318,9 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := waitCondition(ctx, c, "CatalogReady", 2*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.WaitPodsReady(ctx, testNamespace, "app="+clientPod, 3*time.Minute); err != nil {
 		t.Fatal(err)
 	}
 
@@ -585,6 +629,211 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 			out, err := psql(ctx, c, rw, "SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming' AND application_name = '"+oldPrimary+"'")
 			return err == nil && out == "1"
 		})
+	})
+
+	memberSel := "pgshard.io/cluster=" + clusterName + ",pgshard.io/group"
+	podUIDs := func() map[string]string {
+		out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pods", "-l", memberSel, "-o", `jsonpath={range .items[*]}{.metadata.name}={.metadata.uid}{"\n"}{end}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		uids := map[string]string{}
+		for _, l := range strings.Fields(out) {
+			name, uid, _ := strings.Cut(l, "=")
+			uids[name] = uid
+		}
+		return uids
+	}
+	patchCluster := func(patch string) {
+		t.Helper()
+		if _, err := c.Kubectl(ctx, nil, "-n", testNamespace, "patch", "pgshardcluster", clusterName, "--type=merge", "-p", patch); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rolloutIdle := func() bool {
+		return jsonpath(ctx, t, c, "pgshardcluster", clusterName, `{.status.conditions[?(@.type=="RolloutInProgress")].status}`) == "False" &&
+			jsonpath(ctx, t, c, "pgshardcluster", clusterName, `{.status.conditions[?(@.type=="Ready")].status}`) == "True"
+	}
+	ro := group + "-ro"
+
+	t.Run("SighupParameterChangeReloadsWithoutRestart", func(t *testing.T) {
+		before := podUIDs()
+		if len(before) != 6 {
+			t.Fatalf("member pods: %v", before)
+		}
+		patchCluster(`{"spec":{"postgresql":{"parameters":{"log_min_duration_statement":"250ms"}}}}`)
+		waitFor(ctx, t, "log_min_duration_statement to reach the primary and a standby", 6*time.Minute, func() bool {
+			p, err1 := psql(ctx, c, rw, "SHOW log_min_duration_statement")
+			s, err2 := psql(ctx, c, ro, "SHOW log_min_duration_statement")
+			return err1 == nil && err2 == nil && p == "250ms" && s == "250ms"
+		})
+		waitFor(ctx, t, "rollout to go idle", 4*time.Minute, rolloutIdle)
+		after := podUIDs()
+		for name, uid := range before {
+			if after[name] != uid {
+				t.Errorf("pod %s was restarted for a sighup setting", name)
+			}
+		}
+		if got := jsonpath(ctx, t, c, "pgshardcluster", clusterName, "{.status.rollout.phase}"); got != "Idle" {
+			t.Errorf("status.rollout.phase %q", got)
+		}
+	})
+
+	t.Run("RestartRequiredParameterChangeRollsMembersWithOneSwitchover", func(t *testing.T) {
+		before := podUIDs()
+		oldEpoch := epochOf()
+		oldPrimary := primaryOf()
+		w := startWriter(ctx, c, rw, lastID)
+		// Sample how many shard members are being restarted at once (pod
+		// missing, or replaced and its agent not yet past the startup probe);
+		// a rolling restart must never have more than one in that state. A
+		// member that briefly reports not-Ready while it reconnects to a new
+		// primary has long passed startup and does not count.
+		maxAway := 0
+		stopSampling := make(chan struct{})
+		sampled := make(chan struct{})
+		go func() {
+			defer close(sampled)
+			for {
+				select {
+				case <-stopSampling:
+					return
+				case <-time.After(2 * time.Second):
+				}
+				out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pods", "-l", "pgshard.io/cluster="+clusterName+",pgshard.io/group=shard-0", "-o",
+					`jsonpath={range .items[*]}{.metadata.name}={.metadata.uid}:{.status.containerStatuses[?(@.name=="postgres")].started}{" "}{end}`)
+				if err != nil {
+					continue
+				}
+				fields := strings.Fields(out)
+				away := 3 - len(fields)
+				for _, f := range fields {
+					name, rest, _ := strings.Cut(f, "=")
+					uid, started, _ := strings.Cut(rest, ":")
+					if uid != before[name] && started != "true" {
+						away++
+					}
+				}
+				if away > maxAway {
+					maxAway = away
+				}
+			}
+		}()
+		time.Sleep(5 * time.Second)
+		started := time.Now()
+		patchCluster(`{"spec":{"postgresql":{"parameters":{"max_connections":"150"}}}}`)
+		waitFor(ctx, t, "every member to restart with max_connections=150", 20*time.Minute, func() bool {
+			after := podUIDs()
+			if len(after) != 6 {
+				return false
+			}
+			for name, uid := range before {
+				if after[name] == uid {
+					return false
+				}
+			}
+			p, err := psql(ctx, c, rw, "SHOW max_connections")
+			return err == nil && p == "150" && rolloutIdle()
+		})
+		time.Sleep(5 * time.Second)
+		close(stopSampling)
+		<-sampled
+		acked, failures, pause := w.finish()
+		t.Logf("rolling restart took %s; writer: %d acknowledged, %d failed, unavailability window %s; max shard members away at once %d",
+			time.Since(started).Round(time.Second), len(acked), failures, pause, maxAway)
+		if len(acked) > 0 {
+			lastID = acked[len(acked)-1]
+		}
+		if len(acked) == 0 {
+			t.Fatal("writer acknowledged nothing")
+		}
+		if got := epochOf(); got != oldEpoch+1 {
+			t.Fatalf("exactly one switchover: epoch %d -> %d", oldEpoch, got)
+		}
+		if primaryOf() == oldPrimary {
+			t.Fatalf("primary must have moved off %s", oldPrimary)
+		}
+		if failures > 0 && pause > 90*time.Second {
+			t.Fatalf("write failures must be confined to the switchover pause, got %s", pause)
+		}
+		if maxAway > 1 {
+			t.Fatalf("members must restart one at a time, saw %d away", maxAway)
+		}
+		if n := primaryPods(); n != 1 {
+			t.Fatalf("exactly one pod may carry role=primary, got %d", n)
+		}
+		assertAllAcked(ctx, t, c, rw, acked)
+		if s, err := psql(ctx, c, ro, "SHOW max_connections"); err != nil || s != "150" {
+			t.Errorf("standby max_connections: %q %v", s, err)
+		}
+		if out, err := psql(ctx, c, rw, "SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming'"); err != nil || out != "2" {
+			t.Errorf("streaming replicas after the rolling restart: %q %v", out, err)
+		}
+	})
+
+	t.Run("StorageClassChangeRebuildsMembersOneByOne", func(t *testing.T) {
+		alt := `
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: pgshard-e2e-alt
+provisioner: rancher.io/local-path
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+`
+		if err := c.Apply(ctx, alt); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = c.Delete(context.Background(), alt) })
+		rows, err := psql(ctx, c, rw, "SELECT count(*) FROM ha_writes")
+		if err != nil {
+			t.Fatal(err)
+		}
+		oldEpoch := epochOf()
+		patchCluster(`{"spec":{"storage":{"storageClassName":"pgshard-e2e-alt"}}}`)
+		pvcs := func() (string, error) {
+			return c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pvc", "-l", "pgshard.io/cluster="+clusterName+",pgshard.io/group=shard-0", "-o",
+				`jsonpath={range .items[*]}{.metadata.name}:{.spec.storageClassName}{" "}{end}`)
+		}
+		waitFor(ctx, t, "every shard member to move onto the new class", 25*time.Minute, func() bool {
+			out, err := pvcs()
+			if err != nil {
+				return false
+			}
+			fields := strings.Fields(out)
+			if len(fields) != 3 {
+				return false
+			}
+			for _, f := range fields {
+				if !strings.HasSuffix(f, "-v2:pgshard-e2e-alt") {
+					return false
+				}
+			}
+			return rolloutIdle()
+		})
+		out, _ := pvcs()
+		t.Logf("shard claims after the rebuild: %s; epoch %d -> %d", out, oldEpoch, epochOf())
+		if got := epochOf(); got != oldEpoch+1 {
+			t.Errorf("rebuilding the primary needs exactly one switchover: epoch %d -> %d", oldEpoch, got)
+		}
+		for i := 0; i < 3; i++ {
+			pod := fmt.Sprintf("%s-%d", group, i)
+			if got := jsonpath(ctx, t, c, "pod", pod, "{.spec.volumes[0].persistentVolumeClaim.claimName}"); got != pod+"-v2" {
+				t.Errorf("pod %s mounts %q", pod, got)
+			}
+		}
+		if got := jsonpath(ctx, t, c, "pgshardgroup", group, "{.status.members[*].pvc}"); got != group+"-0-v2 "+group+"-1-v2 "+group+"-2-v2" {
+			t.Errorf("group status claims: %q", got)
+		}
+		if after, err := psql(ctx, c, rw, "SELECT count(*) FROM ha_writes"); err != nil || after != rows {
+			t.Errorf("data after the rebuild: %q (before %q) %v", after, rows, err)
+		}
+		if out, err := psql(ctx, c, ro, "SELECT count(*) FROM ha_writes"); err != nil || out != rows {
+			t.Errorf("standby data after the rebuild: %q (before %q) %v", out, rows, err)
+		}
+		if n := count(ctx, t, c, "pvc", "pgshard.io/cluster="+clusterName+",pgshard.io/group=catalog"); n != 3 {
+			t.Errorf("catalog claims untouched: got %d", n)
+		}
 	})
 }
 
