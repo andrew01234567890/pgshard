@@ -4,13 +4,13 @@ metadata:
   name: pgshard-operator
 rules:
   - apiGroups: ["pgshard.io"]
-    resources: ["pgshardclusters", "pgshardgroups", "pgshardbackups"]
+    resources: ["pgshardclusters", "pgshardgroups", "pgshardbackups", "pgshardrestores"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
   - apiGroups: ["pgshard.io"]
     resources: ["pgshardbackuppolicies"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["pgshard.io"]
-    resources: ["pgshardclusters/status", "pgshardgroups/status", "pgshardbackups/status", "pgshardbackuppolicies/status"]
+    resources: ["pgshardclusters/status", "pgshardgroups/status", "pgshardbackups/status", "pgshardbackuppolicies/status", "pgshardrestores/status"]
     verbs: ["get", "update", "patch"]
   - apiGroups: [""]
     resources: ["pods", "persistentvolumeclaims", "services", "configmaps", "secrets"]

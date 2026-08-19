@@ -55,8 +55,11 @@ See [backup.md](backup.md).
 
 ## PgShardRestore (status subresource)
 
-`spec{clusterName, backupId, target{time|lsn|name|xid|immediate}, targetTLI, exclusive}`.
-CEL: at most one recovery target may be set. `status{phase, conditions}`.
+`spec{clusterName, newClusterName, clusterSpec (optional PgShardCluster spec; defaults to the source's), backupId, target{time|lsn|name|xid|immediate}, targetTLI, exclusive}`.
+CEL: at most one recovery target may be set; `newClusterName` differs from
+`clusterName`; `target.name`, `target.xid` and `target.immediate` require
+`backupId`. `status{phase: Pending|Restoring|Recovered|Failed, startedAt, completedAt, groups[]{group, sourceStanza, backupId, timeline, reachedTarget, message}, error, conditions: Progressing}`.
+See [backup.md](backup.md#restore).
 
 ## PgShardReshard (status subresource)
 

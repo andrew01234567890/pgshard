@@ -1,0 +1,15 @@
+NAME                            READY   STATUS      RESTARTS      AGE   IP            NODE                  NOMINATED NODE   READINESS GATES
+pod/minio-964b7b97b-sdfd9       1/1     Running     0             20m   10.244.1.13   pgshard-e2e-worker2   <none>           <none>
+pod/minio-create-bucket-bf457   0/1     Completed   1 (20m ago)   20m   10.244.2.16   pgshard-e2e-worker    <none>           <none>
+
+NAME            TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)             AGE   SELECTOR
+service/minio   ClusterIP   10.96.182.151   <none>        9000/TCP,9001/TCP   20m   app=minio
+
+NAME                    READY   UP-TO-DATE   AVAILABLE   AGE   CONTAINERS   IMAGES                                     SELECTOR
+deployment.apps/minio   1/1     1            1           20m   minio        minio/minio:RELEASE.2025-09-07T16-13-09Z   app=minio
+
+NAME                              DESIRED   CURRENT   READY   AGE   CONTAINERS   IMAGES                                     SELECTOR
+replicaset.apps/minio-964b7b97b   1         1         1       20m   minio        minio/minio:RELEASE.2025-09-07T16-13-09Z   app=minio,pod-template-hash=964b7b97b
+
+NAME                            STATUS     COMPLETIONS   DURATION   AGE   CONTAINERS   IMAGES                                  SELECTOR
+job.batch/minio-create-bucket   Complete   1/1           5s         20m   mc           minio/mc:RELEASE.2025-08-13T08-35-41Z   batch.kubernetes.io/controller-uid=bb3fd94c-54ab-4354-b9ac-76ee3ebfb910

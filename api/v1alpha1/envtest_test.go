@@ -291,7 +291,7 @@ func TestRestoreTargetMutuallyExclusive(t *testing.T) {
 	lsn := "0/1000000"
 	r := &pgshardv1alpha1.PgShardRestore{
 		ObjectMeta: metav1.ObjectMeta{Name: "r1", Namespace: "default"},
-		Spec: pgshardv1alpha1.PgShardRestoreSpec{ClusterName: "c", BackupID: "x", Target: pgshardv1alpha1.RestoreTarget{
+		Spec: pgshardv1alpha1.PgShardRestoreSpec{ClusterName: "c", NewClusterName: "c2", BackupID: "x", Target: pgshardv1alpha1.RestoreTarget{
 			LSN: &lsn, Time: &metav1.Time{Time: time.Now()},
 		}},
 	}
@@ -303,10 +303,46 @@ func TestRestoreTargetMutuallyExclusive(t *testing.T) {
 	imm := false
 	r2 := &pgshardv1alpha1.PgShardRestore{
 		ObjectMeta: metav1.ObjectMeta{Name: "r2", Namespace: "default"},
-		Spec:       pgshardv1alpha1.PgShardRestoreSpec{ClusterName: "c", Target: pgshardv1alpha1.RestoreTarget{LSN: &lsn, Immediate: &imm}},
+		Spec:       pgshardv1alpha1.PgShardRestoreSpec{ClusterName: "c", NewClusterName: "c2", Target: pgshardv1alpha1.RestoreTarget{LSN: &lsn, Immediate: &imm}},
 	}
 	if err := create(t, r2); err != nil {
 		t.Fatalf("immediate=false should not count as a target: %v", err)
+	}
+}
+
+func TestRestoreSpecRules(t *testing.T) {
+	name := "rp"
+	xid := "42"
+	imm := true
+	r := &pgshardv1alpha1.PgShardRestore{
+		ObjectMeta: metav1.ObjectMeta{Name: "r3", Namespace: "default"},
+		Spec:       pgshardv1alpha1.PgShardRestoreSpec{ClusterName: "c", NewClusterName: "c", Target: pgshardv1alpha1.RestoreTarget{Name: &name}, BackupID: "x"},
+	}
+	mustReject(t, r, "newClusterName must differ")
+	r.Spec.NewClusterName = "c2"
+	r.Spec.BackupID = ""
+	mustReject(t, r, "require backupId")
+	r.Spec.Target = pgshardv1alpha1.RestoreTarget{XID: &xid}
+	mustReject(t, r, "require backupId")
+	r.Spec.Target = pgshardv1alpha1.RestoreTarget{Immediate: &imm}
+	mustReject(t, r, "require backupId")
+	r.Spec.Target = pgshardv1alpha1.RestoreTarget{Time: &metav1.Time{Time: time.Now()}}
+	if err := create(t, r); err != nil {
+		t.Fatalf("time target without backupId: %v", err)
+	}
+	r4 := &pgshardv1alpha1.PgShardRestore{
+		ObjectMeta: metav1.ObjectMeta{Name: "r4", Namespace: "default"},
+		Spec:       pgshardv1alpha1.PgShardRestoreSpec{ClusterName: "c", NewClusterName: "c3", Target: pgshardv1alpha1.RestoreTarget{Name: &name}, BackupID: "b1"},
+	}
+	if err := create(t, r4); err != nil {
+		t.Fatalf("name target with backupId: %v", err)
+	}
+	r5 := &pgshardv1alpha1.PgShardRestore{
+		ObjectMeta: metav1.ObjectMeta{Name: "r5", Namespace: "default"},
+		Spec:       pgshardv1alpha1.PgShardRestoreSpec{ClusterName: "c"},
+	}
+	if err := create(t, r5); err == nil || !apierrors.IsInvalid(err) {
+		t.Fatalf("missing newClusterName: %v", err)
 	}
 }
 

@@ -119,10 +119,10 @@ func (t MemberTemplate) SettingsHash() string {
 // AgentConfig renders the pgshard-agent JSON config for one member given
 // the group's current primary.
 func AgentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary string) agent.Config {
-	return agentConfig(c, g, member, primary, Template(c, nil, nil), false)
+	return agentConfig(c, g, member, primary, Template(c, nil, nil), false, false)
 }
 
-func agentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary string, tpl MemberTemplate, override bool) agent.Config {
+func agentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary string, tpl MemberTemplate, override, repoReady bool) agent.Config {
 	role := agent.RoleStandby
 	if member == primary {
 		role = agent.RolePrimary
@@ -160,6 +160,11 @@ func agentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary str
 	if tpl.Backup != nil {
 		bs := BackupSettings(c, g, tpl.Backup)
 		cfg.Backup = &bs
+		cfg.RecloneFromRepo = repoReady
+		if src, ok := RestoreSourceOf(c); ok {
+			opts := src.Options(g)
+			cfg.Restore = &opts
+		}
 	}
 	return cfg
 }
@@ -168,7 +173,7 @@ func agentConfigKey(member string) string { return member + ".json" }
 
 // ConfigMap renders the per-member agent configs and the derived override;
 // primary decides which member bootstraps with initdb and which ones clone.
-func (Renderer) ConfigMap(c *pgshardv1alpha1.PgShardCluster, g Group, primary string, tuning pgtune.Settings, pol *pgshardv1alpha1.PgShardBackupPolicy) *corev1.ConfigMap {
+func (Renderer) ConfigMap(c *pgshardv1alpha1.PgShardCluster, g Group, primary string, tuning pgtune.Settings, pol *pgshardv1alpha1.PgShardBackupPolicy, repoReady bool) *corev1.ConfigMap {
 	tpl := Template(c, tuning, pol)
 	data := map[string]string{}
 	override := OverrideConf(tuning)
@@ -176,7 +181,7 @@ func (Renderer) ConfigMap(c *pgshardv1alpha1.PgShardCluster, g Group, primary st
 		data[overrideConfKey] = override
 	}
 	for _, m := range g.MemberNames() {
-		b, err := json.MarshalIndent(agentConfig(c, g, m, primary, tpl, override != ""), "", "  ")
+		b, err := json.MarshalIndent(agentConfig(c, g, m, primary, tpl, override != "", repoReady), "", "  ")
 		if err != nil {
 			panic(err)
 		}

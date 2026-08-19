@@ -9,9 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 )
 
@@ -191,12 +188,11 @@ func (s *Server) Rewind(ctx context.Context, req *pgshardv1.RewindRequest) (*pgs
 	return resp, nil
 }
 
-// Reclone fences and rebuilds from the primary; backup sources are not
-// implemented yet.
+// Reclone fences and rebuilds the data directory from the primary
+// (pg_basebackup) or from the member's backup stanza (pgbackrest delta
+// restore as a standby).
 func (s *Server) Reclone(ctx context.Context, req *pgshardv1.RecloneRequest) (*pgshardv1.RecloneResponse, error) {
-	if req.GetSourceKind() == pgshardv1.RecloneRequest_SOURCE_KIND_BACKUP {
-		return nil, status.Error(codes.Unimplemented, "reclone from backup is not implemented")
-	}
+	fromRepo := req.GetSourceKind() == pgshardv1.RecloneRequest_SOURCE_KIND_BACKUP
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	resp := &pgshardv1.RecloneResponse{Epoch: s.epoch.Current()}
@@ -208,7 +204,7 @@ func (s *Server) Reclone(ctx context.Context, req *pgshardv1.RecloneRequest) (*p
 	ctx, cancel := context.WithTimeout(ctx, s.opTimeout)
 	defer cancel()
 	s.stopHold(ctx)
-	if err := s.inst.Reclone(ctx); err != nil {
+	if err := s.inst.Reclone(ctx, fromRepo); err != nil {
 		resp.Error = pgErr(err)
 	}
 	return resp, nil

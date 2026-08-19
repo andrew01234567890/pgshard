@@ -4,6 +4,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -148,4 +149,93 @@ func TestBackupIntegration(t *testing.T) {
 	if out, err := exec.Command("docker", "exec", p.container, "grep", "-c", "repo1-cipher-type=aes-256-cbc", "/etc/pgbackrest/pgbackrest.conf").CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "1" {
 		t.Fatalf("pgbackrest.conf cipher: %v %s", err, out)
 	}
+
+	// Replica re-clone from the repository: rows written after the last
+	// backup arrive through the archive and the stream.
+	p.psql("INSERT INTO b SELECT generate_series(6001, 6500)")
+	rc, err := s.grpc.Reclone(ctx, &pgshardv1.RecloneRequest{SourceKind: pgshardv1.RecloneRequest_SOURCE_KIND_BACKUP})
+	if err != nil || rc.GetError() != nil {
+		t.Fatalf("reclone from backup: %v %v\n%s", err, rc.GetError(), s.logs())
+	}
+	if !strings.Contains(s.logs(), "recloning from the repository") {
+		t.Fatalf("standby did not restore from the repository:\n%s", s.logs())
+	}
+	s.waitHTTP("/readyz", 200, 120*time.Second)
+	waitCount(t, s, "b", 6500)
+	if got := s.psql("SELECT pg_is_in_recovery()"); got != "t" {
+		t.Fatalf("recloned standby in recovery = %s", got)
+	}
+	if got := s.psql("SELECT status FROM pg_stat_wal_receiver"); got != "streaming" {
+		t.Fatalf("recloned standby wal receiver = %q", got)
+	}
+
+	// Restore points and a time between two states of the table.
+	p.psql("SELECT pg_create_restore_point('rp1')")
+	p.psql("INSERT INTO b SELECT generate_series(6501, 7000)")
+	tAfter := p.psql("SELECT clock_timestamp()")
+	time.Sleep(1100 * time.Millisecond)
+	p.psql("DELETE FROM b WHERE id > 5000")
+	seg2 := p.psql("SELECT pg_walfile_name(pg_switch_wal())")
+	waitInfo(func(r *pgshardv1.RestoreInfoResponse) bool { return r.GetArchiveMax() >= seg2 }, "archived WAL "+seg2)
+
+	restore := func(member string, spec map[string]any) *node {
+		t.Helper()
+		bk := map[string]any{}
+		for k, v := range h.extra["backup"].(map[string]any) {
+			bk[k] = v
+		}
+		bk["stanza"] = member + "-pg18"
+		saved := h.extra
+		h.extra = map[string]any{"backup": bk, "restore": spec}
+		n := h.start(member, RolePrimary, member, nil)
+		h.extra = saved
+		n.waitHTTP("/startz", 200, 4*time.Minute)
+		n.waitHTTP("/readyz", 200, 60*time.Second)
+		if got := n.psql("SELECT pg_is_in_recovery()"); got != "f" {
+			t.Fatalf("%s still in recovery\n%s", member, n.logs())
+		}
+		if got := n.psql("SELECT timeline_id FROM pg_control_checkpoint()"); got == "1" {
+			t.Fatalf("%s stayed on timeline 1\n%s", member, n.logs())
+		}
+		if got := n.psql("SHOW archive_command"); !strings.Contains(got, "--stanza="+member+"-pg18 archive-push") {
+			t.Fatalf("%s archive_command=%s", member, got)
+		}
+		if got := n.psql("SHOW archive_mode"); got != "on" {
+			t.Fatalf("%s archive_mode=%s", member, got)
+		}
+		if got := n.psql("SHOW restore_command"); !strings.Contains(got, "--stanza="+member+"-pg18 archive-get") {
+			t.Fatalf("%s restore_command=%s", member, got)
+		}
+		return n
+	}
+	byName := restore("rp", map[string]any{"stanza": "it-s0-pg18", "type": "name", "target": "rp1", "backupId": incr.GetBackupRef()})
+	if got := byName.psql("SELECT count(*) FROM b"); got != "6500" {
+		t.Fatalf("restore to rp1: %s rows\n%s", got, byName.logs())
+	}
+	byTime := restore("rt", map[string]any{"stanza": "it-s0-pg18", "type": "time", "target": tAfter})
+	if got := byTime.psql("SELECT count(*) FROM b"); got != "7000" {
+		t.Fatalf("restore to %s: %s rows\n%s", tAfter, got, byTime.logs())
+	}
+	if got := p.psql("SELECT count(*) FROM b"); got != "5000" {
+		t.Fatalf("source rows changed: %s", got)
+	}
+	// The source stanza only ever holds the source's WAL: its own history
+	// stops at timeline 1.
+	if info := waitInfo(func(*pgshardv1.RestoreInfoResponse) bool { return true }, "info"); len(info.GetBackups()) != 3 {
+		t.Fatalf("source stanza changed by restores: %v", info)
+	}
+}
+
+func waitCount(t *testing.T, n *node, table string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Minute)
+	var got string
+	for time.Now().Before(deadline) {
+		got = n.psql("SELECT count(*) FROM " + table)
+		if got == fmt.Sprint(want) {
+			return
+		}
+		time.Sleep(time.Second)
+	}
+	t.Fatalf("%s: %s has %s rows, want %d\n%s", n.name, table, got, want, n.logs())
 }

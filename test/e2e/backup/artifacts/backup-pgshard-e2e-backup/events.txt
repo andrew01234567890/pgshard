@@ -1,0 +1,208 @@
+LAST SEEN   TYPE      REASON                         OBJECT                                       MESSAGE
+20m         Normal    WaitForFirstConsumer           persistentvolumeclaim/s3-catalog-1           waiting for first consumer to be created before binding
+20m         Normal    Provisioning                   persistentvolumeclaim/s3-catalog-2           External provisioner is provisioning volume for claim "pgshard-e2e-backup/s3-catalog-2"
+20m         Normal    ExternalProvisioning           persistentvolumeclaim/s3-catalog-2           Waiting for a volume to be created either by the external provisioner 'rancher.io/local-path' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+20m         Normal    WaitForFirstConsumer           persistentvolumeclaim/s3-catalog-2           waiting for first consumer to be created before binding
+20m         Normal    NoPods                         poddisruptionbudget/s3-shard-0-replicas      No matching pods found
+20m         Normal    NoPods                         poddisruptionbudget/s3-catalog-primary       No matching pods found
+20m         Normal    NoPods                         poddisruptionbudget/s3-catalog-replicas      No matching pods found
+20m         Normal    WaitForFirstConsumer           persistentvolumeclaim/s3-catalog-0           waiting for first consumer to be created before binding
+20m         Normal    ExternalProvisioning           persistentvolumeclaim/s3-catalog-0           Waiting for a volume to be created either by the external provisioner 'rancher.io/local-path' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+20m         Normal    Provisioning                   persistentvolumeclaim/s3-catalog-0           External provisioner is provisioning volume for claim "pgshard-e2e-backup/s3-catalog-0"
+20m         Normal    NoPods                         poddisruptionbudget/s3-shard-0-primary       No matching pods found
+20m         Normal    WaitForFirstConsumer           persistentvolumeclaim/s3-shard-0-0           waiting for first consumer to be created before binding
+20m         Normal    WaitForFirstConsumer           persistentvolumeclaim/s3-shard-0-1           waiting for first consumer to be created before binding
+20m         Normal    WaitForFirstConsumer           persistentvolumeclaim/s3-shard-0-2           waiting for first consumer to be created before binding
+20m         Normal    Provisioning                   persistentvolumeclaim/s3-catalog-1           External provisioner is provisioning volume for claim "pgshard-e2e-backup/s3-catalog-1"
+20m         Normal    ExternalProvisioning           persistentvolumeclaim/s3-catalog-1           Waiting for a volume to be created either by the external provisioner 'rancher.io/local-path' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+20m         Normal    ExternalProvisioning           persistentvolumeclaim/s3-shard-0-1           Waiting for a volume to be created either by the external provisioner 'rancher.io/local-path' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+20m         Normal    Scheduled                      pod/s3-admin-fd655c9c4-phncw                 Successfully assigned pgshard-e2e-backup/s3-admin-fd655c9c4-phncw to pgshard-e2e-worker
+20m         Normal    ScalingReplicaSet              deployment/s3-router                         Scaled up replica set s3-router-79cd9865d7 from 0 to 2
+20m         Normal    ExternalProvisioning           persistentvolumeclaim/s3-shard-0-0           Waiting for a volume to be created either by the external provisioner 'rancher.io/local-path' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+20m         Normal    Provisioning                   persistentvolumeclaim/s3-shard-0-0           External provisioner is provisioning volume for claim "pgshard-e2e-backup/s3-shard-0-0"
+20m         Normal    ExternalProvisioning           persistentvolumeclaim/s3-shard-0-2           Waiting for a volume to be created either by the external provisioner 'rancher.io/local-path' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+20m         Normal    SuccessfulCreate               replicaset/s3-router-79cd9865d7              Created pod: s3-router-79cd9865d7-5jsdq
+20m         Normal    Started                        pod/s3-admin-fd655c9c4-phncw                 Container started
+20m         Normal    Scheduled                      pod/s3-router-79cd9865d7-sqqg8               Successfully assigned pgshard-e2e-backup/s3-router-79cd9865d7-sqqg8 to pgshard-e2e-worker
+20m         Normal    Pulled                         pod/s3-admin-fd655c9c4-phncw                 Container image "pgshard-admin:e2e" already present on machine and can be accessed by the pod
+20m         Normal    Scheduled                      pod/s3-router-79cd9865d7-5jsdq               Successfully assigned pgshard-e2e-backup/s3-router-79cd9865d7-5jsdq to pgshard-e2e-worker2
+20m         Normal    ScalingReplicaSet              deployment/s3-admin                          Scaled up replica set s3-admin-fd655c9c4 from 0 to 1
+20m         Normal    SuccessfulCreate               replicaset/s3-admin-fd655c9c4                Created pod: s3-admin-fd655c9c4-phncw
+20m         Normal    SuccessfulCreate               replicaset/s3-router-79cd9865d7              Created pod: s3-router-79cd9865d7-sqqg8
+20m         Normal    Created                        pod/s3-admin-fd655c9c4-phncw                 Container created
+20m         Warning   Unhealthy                      pod/s3-admin-fd655c9c4-phncw                 Readiness probe failed: Get "http://10.244.2.19:8081/healthz": dial tcp 10.244.2.19:8081: connect: connection refused
+20m         Normal    Provisioning                   persistentvolumeclaim/s3-shard-0-1           External provisioner is provisioning volume for claim "pgshard-e2e-backup/s3-shard-0-1"
+20m         Normal    ProvisioningSucceeded          persistentvolumeclaim/s3-catalog-2           Successfully provisioned volume pvc-0cc4cc87-e5d4-4cb0-b483-6dd4e450e4c2
+20m         Normal    Scheduled                      pod/s3-catalog-2                             Successfully assigned pgshard-e2e-backup/s3-catalog-2 to pgshard-e2e-worker
+20m         Normal    Started                        pod/s3-catalog-2                             Container started
+20m         Normal    Created                        pod/s3-catalog-2                             Container created
+20m         Normal    Pulled                         pod/s3-catalog-2                             Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+20m         Normal    Created                        pod/s3-catalog-2                             Container created
+20m         Normal    Started                        pod/s3-catalog-2                             Container started
+20m         Normal    Pulled                         pod/s3-catalog-2                             Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+20m         Normal    ProvisioningSucceeded          persistentvolumeclaim/s3-catalog-1           Successfully provisioned volume pvc-232c798b-14b7-4ffa-a045-44f6d5783ec9
+20m         Normal    ProvisioningSucceeded          persistentvolumeclaim/s3-catalog-0           Successfully provisioned volume pvc-e4d04caf-c283-4ea9-882d-d1652df72590
+20m         Normal    Provisioning                   persistentvolumeclaim/s3-shard-0-2           External provisioner is provisioning volume for claim "pgshard-e2e-backup/s3-shard-0-2"
+20m         Normal    Scheduled                      pod/s3-catalog-1                             Successfully assigned pgshard-e2e-backup/s3-catalog-1 to pgshard-e2e-worker2
+20m         Normal    Scheduled                      pod/s3-catalog-0                             Successfully assigned pgshard-e2e-backup/s3-catalog-0 to pgshard-e2e-worker
+20m         Normal    Pulled                         pod/s3-catalog-1                             Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+20m         Warning   Unhealthy                      pod/s3-catalog-1                             Readiness probe failed: dial tcp 10.244.1.18:9091: connect: connection refused
+20m         Normal    Pulled                         pod/s3-catalog-1                             Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+20m         Normal    Started                        pod/s3-catalog-0                             Container started
+20m         Normal    Started                        pod/s3-catalog-1                             Container started
+20m         Normal    Created                        pod/s3-catalog-1                             Container created
+20m         Normal    Created                        pod/s3-catalog-1                             Container created
+20m         Normal    Pulled                         pod/s3-catalog-0                             Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+20m         Normal    ProvisioningSucceeded          persistentvolumeclaim/s3-shard-0-0           Successfully provisioned volume pvc-f141c84b-84ed-4c69-b124-2480e2967ed1
+20m         Normal    Created                        pod/s3-catalog-0                             Container created
+20m         Normal    Pulled                         pod/s3-catalog-0                             Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+20m         Normal    Created                        pod/s3-catalog-0                             Container created
+20m         Normal    Started                        pod/s3-catalog-1                             Container started
+20m         Normal    Started                        pod/s3-catalog-0                             Container started
+20m         Normal    Created                        pod/s3-shard-0-0                             Container created
+20m         Normal    Pulled                         pod/s3-shard-0-0                             Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+20m         Normal    Started                        pod/s3-shard-0-0                             Container started
+20m         Normal    Pulled                         pod/s3-shard-0-0                             Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+20m         Normal    Created                        pod/s3-shard-0-0                             Container created
+20m         Normal    Scheduled                      pod/s3-shard-0-0                             Successfully assigned pgshard-e2e-backup/s3-shard-0-0 to pgshard-e2e-worker2
+20m         Normal    Started                        pod/s3-shard-0-0                             Container started
+20m         Normal    ProvisioningSucceeded          persistentvolumeclaim/s3-shard-0-1           Successfully provisioned volume pvc-97cc17f6-98ca-446a-9ff1-3a2054d55ec0
+20m         Normal    Created                        pod/s3-shard-0-1                             Container created
+20m         Normal    Started                        pod/s3-shard-0-1                             Container started
+20m         Normal    Started                        pod/s3-shard-0-1                             Container started
+20m         Normal    Created                        pod/s3-shard-0-1                             Container created
+20m         Normal    Pulled                         pod/s3-shard-0-1                             Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+20m         Normal    ProvisioningSucceeded          persistentvolumeclaim/s3-shard-0-2           Successfully provisioned volume pvc-c465a733-a7d5-4aa2-83aa-f325e96ab3ce
+20m         Normal    Scheduled                      pod/s3-shard-0-1                             Successfully assigned pgshard-e2e-backup/s3-shard-0-1 to pgshard-e2e-worker2
+20m         Normal    Pulled                         pod/s3-shard-0-1                             Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+20m         Normal    Created                        pod/s3-shard-0-2                             Container created
+20m         Normal    Started                        pod/s3-shard-0-2                             Container started
+20m         Normal    Pulled                         pod/s3-shard-0-2                             Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+20m         Normal    Started                        pod/s3-shard-0-2                             Container started
+20m         Normal    Created                        pod/s3-shard-0-2                             Container created
+20m         Normal    Pulled                         pod/s3-shard-0-2                             Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+20m         Normal    Scheduled                      pod/s3-shard-0-2                             Successfully assigned pgshard-e2e-backup/s3-shard-0-2 to pgshard-e2e-worker
+20m         Warning   Unhealthy                      pod/s3-catalog-2                             Startup probe failed: Get "http://10.244.2.21:8080/startz": dial tcp 10.244.2.21:8080: connect: connection refused
+20m         Warning   Unhealthy                      pod/s3-shard-0-1                             Startup probe failed: Get "http://10.244.1.20:8080/startz": dial tcp 10.244.1.20:8080: connect: connection refused
+20m         Warning   Unhealthy                      pod/s3-shard-0-2                             Startup probe failed: Get "http://10.244.2.24:8080/startz": dial tcp 10.244.2.24:8080: connect: connection refused
+20m         Warning   Unhealthy                      pod/s3-catalog-1                             Startup probe failed: Get "http://10.244.1.18:8080/startz": dial tcp 10.244.1.18:8080: connect: connection refused
+19m         Normal    Scheduled                      pod/s3-rp-admin-59fc4f9499-tf5wc             Successfully assigned pgshard-e2e-backup/s3-rp-admin-59fc4f9499-tf5wc to pgshard-e2e-worker2
+19m         Normal    WaitForFirstConsumer           persistentvolumeclaim/s3-rp-shard-0-0        waiting for first consumer to be created before binding
+19m         Normal    Scheduled                      pod/s3-rp-router-6f5d8b6c68-r9d6v            Successfully assigned pgshard-e2e-backup/s3-rp-router-6f5d8b6c68-r9d6v to pgshard-e2e-worker
+19m         Normal    Provisioning                   persistentvolumeclaim/s3-rp-catalog-1        External provisioner is provisioning volume for claim "pgshard-e2e-backup/s3-rp-catalog-1"
+19m         Normal    WaitForFirstConsumer           persistentvolumeclaim/s3-rp-shard-0-1        waiting for first consumer to be created before binding
+19m         Normal    SuccessfulCreate               replicaset/s3-rp-router-6f5d8b6c68           Created pod: s3-rp-router-6f5d8b6c68-7x6dx
+19m         Normal    WaitForFirstConsumer           persistentvolumeclaim/s3-rp-shard-0-2        waiting for first consumer to be created before binding
+19m         Normal    NoPods                         poddisruptionbudget/s3-rp-shard-0-replicas   No matching pods found
+19m         Normal    Scheduled                      pod/s3-rp-router-6f5d8b6c68-7x6dx            Successfully assigned pgshard-e2e-backup/s3-rp-router-6f5d8b6c68-7x6dx to pgshard-e2e-worker2
+19m         Normal    WaitForFirstConsumer           persistentvolumeclaim/s3-rp-catalog-2        waiting for first consumer to be created before binding
+19m         Normal    NoPods                         poddisruptionbudget/s3-rp-catalog-replicas   No matching pods found
+19m         Normal    Provisioning                   persistentvolumeclaim/s3-rp-catalog-2        External provisioner is provisioning volume for claim "pgshard-e2e-backup/s3-rp-catalog-2"
+19m         Normal    SuccessfulCreate               replicaset/s3-rp-admin-59fc4f9499            Created pod: s3-rp-admin-59fc4f9499-tf5wc
+19m         Normal    ScalingReplicaSet              deployment/s3-rp-admin                       Scaled up replica set s3-rp-admin-59fc4f9499 from 0 to 1
+19m         Normal    Provisioning                   persistentvolumeclaim/s3-rp-shard-0-0        External provisioner is provisioning volume for claim "pgshard-e2e-backup/s3-rp-shard-0-0"
+19m         Normal    NoPods                         poddisruptionbudget/s3-rp-catalog-primary    No matching pods found
+19m         Normal    NoPods                         poddisruptionbudget/s3-rp-shard-0-primary    No matching pods found
+19m         Normal    Provisioning                   persistentvolumeclaim/s3-rp-catalog-0        External provisioner is provisioning volume for claim "pgshard-e2e-backup/s3-rp-catalog-0"
+19m         Normal    WaitForFirstConsumer           persistentvolumeclaim/s3-rp-catalog-0        waiting for first consumer to be created before binding
+19m         Normal    ScalingReplicaSet              deployment/s3-rp-router                      Scaled up replica set s3-rp-router-6f5d8b6c68 from 0 to 2
+19m         Normal    WaitForFirstConsumer           persistentvolumeclaim/s3-rp-catalog-1        waiting for first consumer to be created before binding
+19m         Normal    SuccessfulCreate               replicaset/s3-rp-router-6f5d8b6c68           Created pod: s3-rp-router-6f5d8b6c68-r9d6v
+19m         Normal    ExternalProvisioning           persistentvolumeclaim/s3-rp-shard-0-0        Waiting for a volume to be created either by the external provisioner 'rancher.io/local-path' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+19m         Normal    ExternalProvisioning           persistentvolumeclaim/s3-rp-catalog-2        Waiting for a volume to be created either by the external provisioner 'rancher.io/local-path' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+19m         Warning   Unhealthy                      pod/s3-rp-admin-59fc4f9499-tf5wc             Readiness probe failed: Get "http://10.244.1.22:8081/healthz": dial tcp 10.244.1.22:8081: connect: connection refused
+19m         Normal    ExternalProvisioning           persistentvolumeclaim/s3-rp-shard-0-2        Waiting for a volume to be created either by the external provisioner 'rancher.io/local-path' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+19m         Normal    Started                        pod/s3-rp-admin-59fc4f9499-tf5wc             Container started
+19m         Normal    Created                        pod/s3-rp-admin-59fc4f9499-tf5wc             Container created
+19m         Normal    ExternalProvisioning           persistentvolumeclaim/s3-rp-catalog-0        Waiting for a volume to be created either by the external provisioner 'rancher.io/local-path' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+19m         Normal    ExternalProvisioning           persistentvolumeclaim/s3-rp-shard-0-1        Waiting for a volume to be created either by the external provisioner 'rancher.io/local-path' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+19m         Normal    ExternalProvisioning           persistentvolumeclaim/s3-rp-catalog-1        Waiting for a volume to be created either by the external provisioner 'rancher.io/local-path' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+19m         Normal    Pulled                         pod/s3-rp-admin-59fc4f9499-tf5wc             Container image "pgshard-admin:e2e" already present on machine and can be accessed by the pod
+19m         Normal    ProvisioningSucceeded          persistentvolumeclaim/s3-rp-catalog-0        Successfully provisioned volume pvc-45345f78-0e30-4cc8-a1cf-fea7bef19cfb
+19m         Normal    Scheduled                      pod/s3-rp-catalog-0                          Successfully assigned pgshard-e2e-backup/s3-rp-catalog-0 to pgshard-e2e-worker
+19m         Normal    Provisioning                   persistentvolumeclaim/s3-rp-shard-0-1        External provisioner is provisioning volume for claim "pgshard-e2e-backup/s3-rp-shard-0-1"
+19m         Normal    Created                        pod/s3-rp-catalog-0                          Container created
+19m         Normal    ProvisioningSucceeded          persistentvolumeclaim/s3-rp-catalog-1        Successfully provisioned volume pvc-66eafac0-828e-45bf-9c34-4d9573526b0b
+19m         Normal    Started                        pod/s3-rp-catalog-0                          Container started
+19m         Normal    Pulled                         pod/s3-rp-catalog-0                          Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+19m         Normal    Scheduled                      pod/s3-rp-catalog-1                          Successfully assigned pgshard-e2e-backup/s3-rp-catalog-1 to pgshard-e2e-worker
+19m         Normal    Provisioning                   persistentvolumeclaim/s3-rp-shard-0-2        External provisioner is provisioning volume for claim "pgshard-e2e-backup/s3-rp-shard-0-2"
+19m         Normal    ProvisioningSucceeded          persistentvolumeclaim/s3-rp-catalog-2        Successfully provisioned volume pvc-8f3b3658-b180-4c36-b676-c7ce48c619aa
+19m         Normal    Scheduled                      pod/s3-rp-catalog-2                          Successfully assigned pgshard-e2e-backup/s3-rp-catalog-2 to pgshard-e2e-worker2
+19m         Normal    ProvisioningSucceeded          persistentvolumeclaim/s3-rp-shard-0-0        Successfully provisioned volume pvc-794642b9-7d34-4b1b-9b4d-a51e7b0e0b6e
+19m         Normal    Scheduled                      pod/s3-rp-shard-0-0                          Successfully assigned pgshard-e2e-backup/s3-rp-shard-0-0 to pgshard-e2e-worker2
+19m         Normal    Pulled                         pod/s3-rp-catalog-2                          Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+19m         Normal    Created                        pod/s3-rp-catalog-2                          Container created
+19m         Normal    Started                        pod/s3-rp-catalog-1                          Container started
+19m         Normal    Created                        pod/s3-rp-catalog-1                          Container created
+19m         Normal    Pulled                         pod/s3-rp-catalog-1                          Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+19m         Normal    Started                        pod/s3-rp-catalog-2                          Container started
+19m         Normal    ProvisioningSucceeded          persistentvolumeclaim/s3-rp-shard-0-1        Successfully provisioned volume pvc-bae5fedf-d478-468b-bb17-4eea5b8cb810
+19m         Normal    Pulled                         pod/s3-rp-shard-0-0                          Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+19m         Normal    Created                        pod/s3-rp-shard-0-0                          Container created
+19m         Normal    Started                        pod/s3-rp-shard-0-0                          Container started
+19m         Normal    Scheduled                      pod/s3-rp-shard-0-1                          Successfully assigned pgshard-e2e-backup/s3-rp-shard-0-1 to pgshard-e2e-worker2
+19m         Normal    Pulled                         pod/s3-rp-shard-0-1                          Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+19m         Normal    Created                        pod/s3-rp-shard-0-1                          Container created
+19m         Normal    Scheduled                      pod/s3-rp-shard-0-2                          Successfully assigned pgshard-e2e-backup/s3-rp-shard-0-2 to pgshard-e2e-worker
+19m         Normal    ProvisioningSucceeded          persistentvolumeclaim/s3-rp-shard-0-2        Successfully provisioned volume pvc-5107ccda-2837-43a8-ac41-d9ad5ca22e44
+19m         Normal    Started                        pod/s3-rp-shard-0-1                          Container started
+19m         Normal    Pulled                         pod/s3-rp-shard-0-2                          Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+19m         Warning   Unhealthy                      pod/s3-rp-shard-0-2                          Readiness probe failed: dial tcp 10.244.2.31:9091: connect: connection refused
+19m         Normal    Started                        pod/s3-rp-shard-0-2                          Container started
+19m         Normal    Created                        pod/s3-rp-shard-0-2                          Container created
+17m         Warning   Failed                         pod/s3-router-79cd9865d7-5jsdq               Error: ErrImagePull
+17m         Normal    Pulling                        pod/s3-router-79cd9865d7-5jsdq               Pulling image "ghcr.io/andrew01234567890/pgshard-router:latest"
+17m         Warning   Failed                         pod/s3-router-79cd9865d7-5jsdq               Failed to pull image "ghcr.io/andrew01234567890/pgshard-router:latest": failed to pull and unpack image "ghcr.io/andrew01234567890/pgshard-router:latest": failed to resolve reference "ghcr.io/andrew01234567890/pgshard-router:latest": failed to authorize: failed to fetch anonymous token: unexpected status from GET request to https://ghcr.io/token?scope=repository%3Aandrew01234567890%2Fpgshard-router%3Apull&service=ghcr.io: 403 Forbidden
+17m         Warning   FailedComputeMetricsReplicas   horizontalpodautoscaler/s3-router            invalid metrics (1 invalid out of 1), first error is: failed to get cpu resource metric value: failed to get cpu utilization: unable to get metrics for resource cpu: unable to fetch metrics from resource metrics API: the server could not find the requested resource (get pods.metrics.k8s.io)
+17m         Normal    Pulling                        pod/s3-router-79cd9865d7-sqqg8               Pulling image "ghcr.io/andrew01234567890/pgshard-router:latest"
+17m         Warning   Failed                         pod/s3-router-79cd9865d7-sqqg8               Error: ErrImagePull
+17m         Warning   Failed                         pod/s3-router-79cd9865d7-sqqg8               Failed to pull image "ghcr.io/andrew01234567890/pgshard-router:latest": failed to pull and unpack image "ghcr.io/andrew01234567890/pgshard-router:latest": failed to resolve reference "ghcr.io/andrew01234567890/pgshard-router:latest": failed to authorize: failed to fetch anonymous token: unexpected status from GET request to https://ghcr.io/token?scope=repository%3Aandrew01234567890%2Fpgshard-router%3Apull&service=ghcr.io: 403 Forbidden
+16m         Normal    Pulling                        pod/s3-rp-router-6f5d8b6c68-7x6dx            Pulling image "ghcr.io/andrew01234567890/pgshard-router:latest"
+16m         Normal    Pulling                        pod/s3-rp-router-6f5d8b6c68-r9d6v            Pulling image "ghcr.io/andrew01234567890/pgshard-router:latest"
+16m         Warning   Failed                         pod/s3-rp-router-6f5d8b6c68-7x6dx            Failed to pull image "ghcr.io/andrew01234567890/pgshard-router:latest": failed to pull and unpack image "ghcr.io/andrew01234567890/pgshard-router:latest": failed to resolve reference "ghcr.io/andrew01234567890/pgshard-router:latest": failed to authorize: failed to fetch anonymous token: unexpected status from GET request to https://ghcr.io/token?scope=repository%3Aandrew01234567890%2Fpgshard-router%3Apull&service=ghcr.io: 403 Forbidden
+16m         Warning   Failed                         pod/s3-rp-router-6f5d8b6c68-7x6dx            Error: ErrImagePull
+16m         Warning   Failed                         pod/s3-rp-router-6f5d8b6c68-r9d6v            Error: ErrImagePull
+16m         Warning   Failed                         pod/s3-rp-router-6f5d8b6c68-r9d6v            Failed to pull image "ghcr.io/andrew01234567890/pgshard-router:latest": failed to pull and unpack image "ghcr.io/andrew01234567890/pgshard-router:latest": failed to resolve reference "ghcr.io/andrew01234567890/pgshard-router:latest": failed to authorize: failed to fetch anonymous token: unexpected status from GET request to https://ghcr.io/token?scope=repository%3Aandrew01234567890%2Fpgshard-router%3Apull&service=ghcr.io: 403 Forbidden
+16m         Warning   FailedComputeMetricsReplicas   horizontalpodautoscaler/s3-rp-router         invalid metrics (1 invalid out of 1), first error is: failed to get cpu resource metric value: failed to get cpu utilization: unable to get metrics for resource cpu: unable to fetch metrics from resource metrics API: the server could not find the requested resource (get pods.metrics.k8s.io)
+8m59s       Normal    Pulled                         pod/s3-rp-catalog-0                          Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+8m59s       Normal    Created                        pod/s3-rp-catalog-0                          Container created
+8m59s       Normal    Started                        pod/s3-rp-catalog-0                          Container started
+8m59s       Normal    Killing                        pod/s3-rp-catalog-0                          Container postgres failed startup probe, will be restarted
+8m57s       Normal    Created                        pod/s3-rp-catalog-1                          Container created
+8m57s       Normal    Killing                        pod/s3-rp-catalog-2                          Container postgres failed startup probe, will be restarted
+8m57s       Normal    Started                        pod/s3-rp-catalog-2                          Container started
+8m57s       Normal    Created                        pod/s3-rp-catalog-2                          Container created
+8m57s       Normal    Pulled                         pod/s3-rp-catalog-2                          Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+8m57s       Normal    Killing                        pod/s3-rp-catalog-1                          Container postgres failed startup probe, will be restarted
+8m57s       Normal    Started                        pod/s3-rp-catalog-1                          Container started
+8m57s       Normal    Pulled                         pod/s3-rp-catalog-1                          Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+8m56s       Normal    Killing                        pod/s3-rp-shard-0-0                          Container postgres failed startup probe, will be restarted
+8m56s       Normal    Started                        pod/s3-rp-shard-0-0                          Container started
+8m56s       Normal    Created                        pod/s3-rp-shard-0-0                          Container created
+8m56s       Normal    Pulled                         pod/s3-rp-shard-0-0                          Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+8m54s       Normal    Killing                        pod/s3-rp-shard-0-1                          Container postgres failed startup probe, will be restarted
+8m54s       Normal    Started                        pod/s3-rp-shard-0-1                          Container started
+8m54s       Normal    Created                        pod/s3-rp-shard-0-1                          Container created
+8m54s       Normal    Pulled                         pod/s3-rp-shard-0-1                          Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+8m53s       Normal    Killing                        pod/s3-rp-shard-0-2                          Container postgres failed startup probe, will be restarted
+8m53s       Normal    Started                        pod/s3-rp-shard-0-2                          Container started
+8m53s       Normal    Created                        pod/s3-rp-shard-0-2                          Container created
+8m53s       Normal    Pulled                         pod/s3-rp-shard-0-2                          Container image "ghcr.io/andrew01234567890/pgshard-postgres:18" already present on machine and can be accessed by the pod
+4m11s       Normal    BackOff                        pod/s3-router-79cd9865d7-5jsdq               Back-off pulling image "ghcr.io/andrew01234567890/pgshard-router:latest"
+4m11s       Warning   Failed                         pod/s3-router-79cd9865d7-5jsdq               Error: ImagePullBackOff
+4m8s        Normal    BackOff                        pod/s3-router-79cd9865d7-sqqg8               Back-off pulling image "ghcr.io/andrew01234567890/pgshard-router:latest"
+4m8s        Warning   Failed                         pod/s3-router-79cd9865d7-sqqg8               Error: ImagePullBackOff
+4m4s        Warning   FailedGetResourceMetric        horizontalpodautoscaler/s3-router            failed to get cpu utilization: unable to get metrics for resource cpu: unable to fetch metrics from resource metrics API: the server could not find the requested resource (get pods.metrics.k8s.io)
+3m25s       Warning   Failed                         pod/s3-rp-router-6f5d8b6c68-7x6dx            Error: ImagePullBackOff
+3m25s       Normal    BackOff                        pod/s3-rp-router-6f5d8b6c68-7x6dx            Back-off pulling image "ghcr.io/andrew01234567890/pgshard-router:latest"
+3m25s       Warning   Unhealthy                      pod/s3-rp-catalog-2                          Startup probe failed: Get "http://10.244.1.26:8080/startz": dial tcp 10.244.1.26:8080: connect: connection refused
+3m21s       Normal    BackOff                        pod/s3-rp-router-6f5d8b6c68-r9d6v            Back-off pulling image "ghcr.io/andrew01234567890/pgshard-router:latest"
+3m21s       Warning   Failed                         pod/s3-rp-router-6f5d8b6c68-r9d6v            Error: ImagePullBackOff
+3m19s       Warning   Unhealthy                      pod/s3-rp-catalog-0                          Startup probe failed: Get "http://10.244.2.28:8080/startz": dial tcp 10.244.2.28:8080: connect: connection refused
+3m19s       Warning   Unhealthy                      pod/s3-rp-shard-0-1                          Startup probe failed: Get "http://10.244.1.28:8080/startz": dial tcp 10.244.1.28:8080: connect: connection refused
+3m18s       Warning   FailedGetResourceMetric        horizontalpodautoscaler/s3-rp-router         failed to get cpu utilization: unable to get metrics for resource cpu: unable to fetch metrics from resource metrics API: the server could not find the requested resource (get pods.metrics.k8s.io)
+3m18s       Warning   Unhealthy                      pod/s3-rp-shard-0-2                          Startup probe failed: Get "http://10.244.2.31:8080/startz": dial tcp 10.244.2.31:8080: connect: connection refused
+3m17s       Warning   Unhealthy                      pod/s3-rp-catalog-1                          Startup probe failed: Get "http://10.244.2.29:8080/startz": dial tcp 10.244.2.29:8080: connect: connection refused
+3m16s       Warning   Unhealthy                      pod/s3-rp-shard-0-0                          Startup probe failed: Get "http://10.244.1.27:8080/startz": dial tcp 10.244.1.27:8080: connect: connection refused
+2m16s       Warning   Unhealthy                      pod/s3-catalog-1                             Readiness probe failed: HTTP probe failed with statuscode: 500

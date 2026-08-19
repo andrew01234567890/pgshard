@@ -319,7 +319,7 @@ func gatherNamespace(ctx context.Context, c *e2e.Cluster) {
 func TestBackupsToObjectStores(t *testing.T) {
 	c := e2e.NewCluster(t)
 	c.GatherOnFailure(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 70*time.Minute)
 	defer cancel()
 	root := repoRoot(t)
 	major := env("PG_MAJOR", "18")
@@ -339,7 +339,7 @@ func TestBackupsToObjectStores(t *testing.T) {
 		if t.Failed() {
 			gatherNamespace(ctx, c)
 		}
-		_, _ = c.Kubectl(ctx, nil, "delete", "pgshardclusters,pgshardbackuppolicies", "-n", testNamespace, "--all", "--wait=true", "--timeout=4m")
+		_, _ = c.Kubectl(ctx, nil, "delete", "pgshardrestores,pgshardclusters,pgshardbackuppolicies", "-n", testNamespace, "--all", "--wait=true", "--timeout=4m")
 		_, _ = c.Kubectl(ctx, nil, "delete", "namespace", testNamespace, "--ignore-not-found", "--wait=true", "--timeout=4m")
 	})
 	for _, s := range selected {
@@ -435,6 +435,175 @@ func runStore(ctx context.Context, t *testing.T, c *e2e.Cluster, s store, major 
 		}
 		return false
 	})
+	runRestores(ctx, t, c, s, major, incr)
+}
+
+// runRestores restores the cluster into two new ones: to a named restore
+// point pinned to the incremental backup, and to a point in time.
+func runRestores(ctx context.Context, t *testing.T, c *e2e.Cluster, s store, major, backupName string) {
+	cluster := s.name
+	primaries := map[string]string{}
+	for _, g := range []string{"catalog", "shard-0"} {
+		primaries[g] = jsonpath(ctx, t, c, "pgshardgroup", cluster+"-"+g, "{.status.primary}")
+	}
+	onPrimaries := func(sql string) map[string]string {
+		t.Helper()
+		out := map[string]string{}
+		for g, pod := range primaries {
+			res, err := c.Kubectl(ctx, nil, "-n", testNamespace, "exec", pod, "-c", "postgres", "--", "env", pgpassEnv, "psql", "-h", "/tmp", "-U", "postgres", "-tAc", sql)
+			if err != nil {
+				t.Fatalf("%s: %v\n%s", pod, err, res)
+			}
+			out[g] = strings.TrimSpace(res)
+		}
+		return out
+	}
+	onPrimaries("CREATE TABLE restore_e2e (id int, note text); INSERT INTO restore_e2e SELECT i, 'keep' FROM generate_series(1, 100) i")
+	onPrimaries("SELECT pg_create_restore_point('e2e-" + cluster + "')")
+	onPrimaries("INSERT INTO restore_e2e SELECT i, 'later' FROM generate_series(101, 200) i")
+	time.Sleep(1500 * time.Millisecond)
+	target := onPrimaries("SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')")["catalog"]
+	time.Sleep(1500 * time.Millisecond)
+	onPrimaries("DELETE FROM restore_e2e")
+	segs := onPrimaries("SELECT pg_walfile_name(pg_switch_wal())")
+	for g, seg := range segs {
+		stanza := backup.StanzaName(cluster, g, atoi(major))
+		pod := primaries[g]
+		waitFor(ctx, t, "WAL "+seg+" archived for "+stanza, 5*time.Minute, func() bool {
+			out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "exec", pod, "-c", "postgres", "--",
+				"pgbackrest", "--config=/etc/pgbackrest/pgbackrest.conf", "--stanza="+stanza, "--log-level-console=off", "info", "--output=json")
+			if err != nil {
+				return false
+			}
+			info, err := backup.ParseInfo([]byte(out), stanza)
+			return err == nil && info.ArchiveMax >= seg
+		})
+	}
+
+	image := os.Getenv("PGSHARD_POSTGRES_IMAGE")
+	byName := cluster + "-rp"
+	if err := c.Apply(ctx, restoreManifest(cluster, byName, major, image, 3, `
+  backupId: `+backupName+`
+  target:
+    name: e2e-`+cluster)); err != nil {
+		t.Fatal(err)
+	}
+	rp := waitRestore(ctx, t, c, byName, 25*time.Minute)
+	checkRestored(ctx, t, c, byName, rp, "100", "keep")
+	if _, err := c.Kubectl(ctx, nil, "-n", testNamespace, "wait", "--for=condition=Ready", "pod", "-l", "pgshard.io/cluster="+byName+",pgshard.io/group=shard-0", "--timeout=10m"); err != nil {
+		t.Fatalf("restored replicas not ready: %v", err)
+	}
+	if got := jsonpath(ctx, t, c, "pgshardgroup", byName+"-shard-0", "{.status.members[*].role}"); strings.Count(got, "replica") != 2 {
+		t.Fatalf("restored shard-0 members: %q", got)
+	}
+
+	byTime := cluster + "-pitr"
+	if err := c.Apply(ctx, restoreManifest(cluster, byTime, major, image, 3, `
+  target:
+    time: "`+target+`"`)); err != nil {
+		t.Fatal(err)
+	}
+	pitr := waitRestore(ctx, t, c, byTime, 25*time.Minute)
+	checkRestored(ctx, t, c, byTime, pitr, "200", "later")
+	for _, name := range []string{byName, byTime} {
+		if _, err := c.Kubectl(ctx, nil, "-n", testNamespace, "delete", "pgshardcluster", name, "--wait=true", "--timeout=4m"); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func restoreManifest(cluster, name, major, image string, replicas int, target string) string {
+	img := ""
+	if image != "" {
+		img = "      image: " + image + "\n"
+	}
+	return fmt.Sprintf(`
+apiVersion: pgshard.io/v1alpha1
+kind: PgShardRestore
+metadata:
+  name: %[1]s
+  namespace: %[2]s
+spec:
+  clusterName: %[3]s
+  newClusterName: %[1]s
+  clusterSpec:
+    postgresql:
+      major: %[4]s
+%[5]s    catalog:
+      replicas: %[6]d
+      storage:
+        size: 512Mi
+    shards: 1
+    replicasPerShard: %[6]d
+    storage:
+      size: 512Mi
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+    backup:
+      policyRef: %[3]s-policy%[7]s
+`, name, testNamespace, cluster, major, img, replicas, target)
+}
+
+func waitRestore(ctx context.Context, t *testing.T, c *e2e.Cluster, name string, timeout time.Duration) *pgshardv1alpha1.PgShardRestore {
+	t.Helper()
+	var r pgshardv1alpha1.PgShardRestore
+	waitFor(ctx, t, "restore "+name+" to finish", timeout, func() bool {
+		if err := getJSON(ctx, c, "pgshardrestore", name, &r); err != nil {
+			return false
+		}
+		return r.Status.Phase == pgshardv1alpha1.RestorePhaseRecovered || r.Status.Phase == pgshardv1alpha1.RestorePhaseFailed
+	})
+	if r.Status.Phase != pgshardv1alpha1.RestorePhaseRecovered {
+		t.Fatalf("restore %s: phase %s: %s\n%+v", name, r.Status.Phase, r.Status.Error, r.Status.Groups)
+	}
+	return &r
+}
+
+// checkRestored verifies the new cluster is Ready on a new timeline, that its
+// data matches the target and that it archives to its own stanzas.
+func checkRestored(ctx context.Context, t *testing.T, c *e2e.Cluster, name string, r *pgshardv1alpha1.PgShardRestore, wantRows, wantNote string) {
+	t.Helper()
+	if got := jsonpath(ctx, t, c, "pgshardcluster", name, `{.status.conditions[?(@.type=="Ready")].status}`); got != "True" {
+		t.Fatalf("%s Ready=%q", name, got)
+	}
+	if len(r.Status.Groups) != 2 {
+		t.Fatalf("%s groups: %+v", name, r.Status.Groups)
+	}
+	for _, g := range r.Status.Groups {
+		if !g.ReachedTarget || g.Timeline < 2 || !strings.HasPrefix(g.SourceStanza, r.Spec.ClusterName+"-"+g.Group+"-pg") {
+			t.Fatalf("%s group %s: %+v", name, g.Group, g)
+		}
+	}
+	for _, g := range []string{"catalog", "shard-0"} {
+		pod := jsonpath(ctx, t, c, "pgshardgroup", name+"-"+g, "{.status.primary}")
+		psql := func(sql string) string {
+			out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "exec", pod, "-c", "postgres", "--", "env", pgpassEnv, "psql", "-h", "/tmp", "-U", "postgres", "-tAc", sql)
+			if err != nil {
+				t.Fatalf("%s: %v\n%s", pod, err, out)
+			}
+			return strings.TrimSpace(out)
+		}
+		if got := psql("SELECT count(*) FROM restore_e2e"); got != wantRows {
+			t.Fatalf("%s %s: %s rows, want %s", name, g, got, wantRows)
+		}
+		if got := psql("SELECT count(DISTINCT note) FROM restore_e2e WHERE note = '" + wantNote + "'"); got != "1" {
+			t.Fatalf("%s %s: note %s missing", name, g, wantNote)
+		}
+		if got := psql("SELECT pg_is_in_recovery()"); got != "f" {
+			t.Fatalf("%s %s primary in recovery", name, g)
+		}
+		if got := psql("SHOW archive_command"); !strings.Contains(got, "--stanza="+name+"-"+g+"-pg") {
+			t.Fatalf("%s %s archive_command=%q", name, g, got)
+		}
+		if got := psql("SHOW archive_mode"); got != "on" {
+			t.Fatalf("%s %s archive_mode=%q", name, g, got)
+		}
+	}
+	if got := jsonpath(ctx, t, c, "pgshardcluster", name, `{.metadata.labels.pgshard\.io/restored-from}`); got != name {
+		t.Fatalf("%s restored-from label=%q", name, got)
+	}
 }
 
 func waitBackup(ctx context.Context, t *testing.T, c *e2e.Cluster, name string, timeout time.Duration) *pgshardv1alpha1.PgShardBackup {

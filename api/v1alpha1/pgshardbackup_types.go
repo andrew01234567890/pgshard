@@ -256,17 +256,64 @@ type RestoreTarget struct {
 	Immediate *bool `json:"immediate,omitempty"`
 }
 
-// PgShardRestoreSpec requests a restore.
+// PgShardRestoreSpec requests a restore: a new cluster is created from the
+// source cluster's repository and every group recovers to the same target.
+// +kubebuilder:validation:XValidation:rule="self.newClusterName != self.clusterName",message="newClusterName must differ from clusterName"
+// +kubebuilder:validation:XValidation:rule="!(has(self.target) && (has(self.target.name) || has(self.target.xid) || (has(self.target.immediate) && self.target.immediate))) || (has(self.backupId) && self.backupId != ”)",message="target.name, target.xid and target.immediate require backupId"
 type PgShardRestoreSpec struct {
+	// ClusterName is the source cluster whose repository is restored from.
 	ClusterName string `json:"clusterName"`
+	// NewClusterName names the PgShardCluster the restore creates.
+	// +kubebuilder:validation:MinLength=1
+	NewClusterName string `json:"newClusterName"`
+	// ClusterSpec is the spec of the new cluster; when unset the source
+	// cluster's spec is copied. It must keep the source's shard count and
+	// PostgreSQL major, and it must bind a backup policy that reaches the
+	// source repository (the source policy when unset).
+	// +optional
+	ClusterSpec *PgShardClusterSpec `json:"clusterSpec,omitempty"`
+	// BackupID pins the backup set: the name of a completed PgShardBackup of
+	// the source cluster (each group restores its own set), or a raw
+	// pgBackRest label applied to every group. Required for name, xid and
+	// immediate targets; time and lsn targets select the set automatically.
 	// +optional
 	BackupID string `json:"backupId,omitempty"`
+	// Target selects the recovery point; unset recovers to the end of the
+	// archived WAL. The same target applies to every group.
 	// +optional
 	Target RestoreTarget `json:"target,omitempty"`
+	// TargetTLI is the timeline to follow (recovery_target_timeline).
+	// +kubebuilder:validation:Minimum=1
 	// +optional
 	TargetTLI *int64 `json:"targetTLI,omitempty"`
+	// Exclusive stops recovery just before the target.
 	// +optional
 	Exclusive bool `json:"exclusive,omitempty"`
+}
+
+// Restore phases.
+const (
+	RestorePhasePending   = "Pending"
+	RestorePhaseRestoring = "Restoring"
+	RestorePhaseRecovered = "Recovered"
+	RestorePhaseFailed    = "Failed"
+)
+
+// GroupRestoreStatus is the progress of one group of the new cluster.
+type GroupRestoreStatus struct {
+	Group string `json:"group"`
+	// SourceStanza is the repository stanza the group restored from.
+	SourceStanza string `json:"sourceStanza"`
+	// +optional
+	BackupID string `json:"backupId,omitempty"`
+	// Timeline is the new primary's timeline once it left recovery.
+	// +optional
+	Timeline int64 `json:"timeline,omitempty"`
+	// ReachedTarget is true once the group's primary finished recovery and
+	// promoted; PostgreSQL refuses to promote before the target is reached.
+	ReachedTarget bool `json:"reachedTarget"`
+	// +optional
+	Message string `json:"message,omitempty"`
 }
 
 // PgShardRestoreStatus is the observed state of a restore.
@@ -274,13 +321,22 @@ type PgShardRestoreStatus struct {
 	// +optional
 	Phase string `json:"phase,omitempty"`
 	// +optional
+	StartedAt *metav1.Time `json:"startedAt,omitempty"`
+	// +optional
+	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
+	// +optional
+	Groups []GroupRestoreStatus `json:"groups,omitempty"`
+	// +optional
+	Error string `json:"error,omitempty"`
+	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // PgShardRestore is a restore run.
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:printcolumn:name="Cluster",type=string,JSONPath=`.spec.clusterName`
+// +kubebuilder:printcolumn:name="Source",type=string,JSONPath=`.spec.clusterName`
+// +kubebuilder:printcolumn:name="New",type=string,JSONPath=`.spec.newClusterName`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 type PgShardRestore struct {

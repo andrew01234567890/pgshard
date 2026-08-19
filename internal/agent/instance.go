@@ -24,6 +24,8 @@ type Instance struct {
 	// pgctl and basebackup hooks are swappable for unit tests.
 	rewindFn     func(ctx context.Context, source string) error
 	recloneFn    func(ctx context.Context) error
+	repoCloneFn  func(ctx context.Context) error
+	restoreFn    func(ctx context.Context) error
 	startFn      func(ctx context.Context) error
 	slotFn       func(ctx context.Context, source string) error
 	waitSourceFn func(ctx context.Context, source string) error
@@ -38,6 +40,8 @@ func NewInstance(cfg *Config, sup *Supervisor, epoch *EpochStore, log *slog.Logg
 	in := &Instance{cfg: cfg, sup: sup, epoch: epoch, log: log, cloneRetry: 5 * time.Second}
 	in.rewindFn = in.pgRewind
 	in.recloneFn = in.baseBackup
+	in.repoCloneFn = in.repoClone
+	in.restoreFn = in.restoreBootstrap
 	in.startFn = in.Start
 	in.slotFn = in.ensureSlotOnSource
 	in.waitSourceFn = in.waitSource
@@ -75,7 +79,18 @@ func (in *Instance) Bootstrap(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if in.restorePending() {
+		in.log.Warn("an earlier restore from the repository did not finish; starting over")
+		if err := clearDir(in.cfg.PGData); err != nil {
+			return err
+		}
+		empty = true
+	}
 	switch {
+	case empty && in.cfg.Role == RolePrimary && in.cfg.Restore != nil:
+		if err := in.restoreFn(ctx); err != nil {
+			return err
+		}
 	case empty && in.cfg.Role == RolePrimary:
 		if err := in.initdb(ctx); err != nil {
 			return err
@@ -295,7 +310,7 @@ func (in *Instance) Demote(ctx context.Context, source string) error {
 func (in *Instance) follow(ctx context.Context, source string) error {
 	if err := in.rewindFn(ctx, source); err != nil {
 		in.log.Warn("pg_rewind failed; recloning", "err", err)
-		if err := in.recloneFn(ctx); err != nil {
+		if err := in.rebuild(ctx); err != nil {
 			return fmt.Errorf("reclone after failed rewind: %w", err)
 		}
 	} else if err := in.slotFn(ctx, source); err != nil {
@@ -308,6 +323,20 @@ func (in *Instance) follow(ctx context.Context, source string) error {
 		return err
 	}
 	return WriteConfig(in.cfg, true)
+}
+
+// rebuild replaces PGDATA for a rejoin: from the repository when the
+// operator prefers it (a completed backup exists), falling back to a
+// pg_basebackup from the primary.
+func (in *Instance) rebuild(ctx context.Context) error {
+	if in.cfg.RecloneFromRepo {
+		err := in.repoCloneFn(ctx)
+		if err == nil {
+			return nil
+		}
+		in.log.Warn("restore from the repository failed; cloning from the primary", "err", err)
+	}
+	return in.recloneFn(ctx)
 }
 
 // waitSource blocks until the source primary accepts connections, so a
@@ -350,12 +379,17 @@ func (in *Instance) ensureSlotOnSource(ctx context.Context, source string) error
 	return err
 }
 
-// Reclone rebuilds PGDATA from the primary and starts it as a standby.
-func (in *Instance) Reclone(ctx context.Context) error {
+// Reclone rebuilds PGDATA and starts it as a standby: from the primary
+// with pg_basebackup, or from the repository when fromRepo is set.
+func (in *Instance) Reclone(ctx context.Context, fromRepo bool) error {
 	if err := in.sup.Stop(ctx, ShutdownFast, time.Duration(in.cfg.ShutdownTimeout)); err != nil {
 		return err
 	}
-	if err := in.recloneFn(ctx); err != nil {
+	clone := in.recloneFn
+	if fromRepo {
+		clone = in.repoCloneFn
+	}
+	if err := clone(ctx); err != nil {
 		return err
 	}
 	return in.startFn(ctx)

@@ -201,7 +201,7 @@ func TestConfigMapCarriesOverrideAndSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cm := Renderer{}.ConfigMap(c, g, g.MemberName(0), tuning, nil)
+	cm := Renderer{}.ConfigMap(c, g, g.MemberName(0), tuning, nil, false)
 	if !contains(cm.Data[overrideConfKey], "shared_buffers = '512MB'") {
 		t.Fatalf("override missing: %q", cm.Data[overrideConfKey])
 	}
@@ -215,7 +215,7 @@ func TestConfigMapCarriesOverrideAndSettings(t *testing.T) {
 	if got["shared_buffers"] != "512MB" || got["log_min_duration_statement"] != "250ms" {
 		t.Fatalf("settings map %v", got)
 	}
-	plain := Renderer{}.ConfigMap(c, g, g.MemberName(0), nil, nil)
+	plain := Renderer{}.ConfigMap(c, g, g.MemberName(0), nil, nil, false)
 	if _, ok := plain.Data[overrideConfKey]; ok {
 		t.Fatal("no override key without derived settings")
 	}

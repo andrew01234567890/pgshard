@@ -16,7 +16,10 @@ spec:
   versions:
   - additionalPrinterColumns:
     - jsonPath: .spec.clusterName
-      name: Cluster
+      name: Source
+      type: string
+    - jsonPath: .spec.newClusterName
+      name: New
       type: string
     - jsonPath: .status.phase
       name: Phase
@@ -47,16 +50,304 @@ spec:
           metadata:
             type: object
           spec:
-            description: PgShardRestoreSpec requests a restore.
+            description: |-
+              PgShardRestoreSpec requests a restore: a new cluster is created from the
+              source cluster's repository and every group recovers to the same target.
             properties:
               backupId:
+                description: |-
+                  BackupID pins the backup set: the name of a completed PgShardBackup of
+                  the source cluster (each group restores its own set), or a raw
+                  pgBackRest label applied to every group. Required for name, xid and
+                  immediate targets; time and lsn targets select the set automatically.
                 type: string
               clusterName:
+                description: ClusterName is the source cluster whose repository is
+                  restored from.
                 type: string
+              clusterSpec:
+                description: |-
+                  ClusterSpec is the spec of the new cluster; when unset the source
+                  cluster's spec is copied. It must keep the source's shard count and
+                  PostgreSQL major, and it must bind a backup policy that reaches the
+                  source repository (the source policy when unset).
+                properties:
+                  admin:
+                    default: {}
+                    description: AdminSpec toggles the admin API.
+                    properties:
+                      enabled:
+                        default: true
+                        type: boolean
+                    type: object
+                  backup:
+                    description: BackupSpec links the cluster to a PgShardBackupPolicy.
+                    properties:
+                      policyRef:
+                        type: string
+                    type: object
+                  catalog:
+                    description: CatalogSpec configures the control-plane catalog
+                      group.
+                    properties:
+                      replicas:
+                        default: 3
+                        minimum: 1
+                        type: integer
+                      storage:
+                        description: StorageSpec describes a persistent volume request.
+                        properties:
+                          size:
+                            anyOf:
+                            - type: integer
+                            - type: string
+                            pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                            x-kubernetes-int-or-string: true
+                          storageClassName:
+                            type: string
+                        required:
+                        - size
+                        type: object
+                    required:
+                    - storage
+                    type: object
+                  durability:
+                    default: {}
+                    description: DurabilitySpec configures synchronous replication.
+                    properties:
+                      minSyncStandbys:
+                        default: 1
+                        minimum: 0
+                        type: integer
+                      synchronousCommit:
+                        default: "on"
+                        enum:
+                        - "on"
+                        - remote_apply
+                        type: string
+                    type: object
+                  postgresql:
+                    description: PostgreSQLSpec selects the PostgreSQL build and its
+                      base configuration.
+                    properties:
+                      image:
+                        type: string
+                      major:
+                        enum:
+                        - 18
+                        - 19
+                        type: integer
+                      parameters:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          Parameters are extra postgresql.conf settings. Keys that pgshard owns
+                          (fsync, full_page_writes, wal_level, max_prepared_transactions, ssl,
+                          synchronous_commit) are rejected.
+                        type: object
+                        x-kubernetes-validations:
+                        - message: parameters must not set fsync
+                          rule: '!(''fsync'' in self)'
+                        - message: parameters must not set full_page_writes
+                          rule: '!(''full_page_writes'' in self)'
+                        - message: parameters must not set wal_level
+                          rule: '!(''wal_level'' in self)'
+                        - message: parameters must not set max_prepared_transactions
+                          rule: '!(''max_prepared_transactions'' in self)'
+                        - message: parameters must not set ssl
+                          rule: '!(''ssl'' in self)'
+                        - message: parameters must not set synchronous_commit
+                          rule: '!(''synchronous_commit'' in self)'
+                      profile:
+                        default: oltp
+                        enum:
+                        - oltp
+                        - mixed
+                        - analytics
+                        type: string
+                    required:
+                    - major
+                    type: object
+                  replicasPerShard:
+                    default: 3
+                    minimum: 1
+                    type: integer
+                  resharding:
+                    default: {}
+                    description: ReshardingSpec controls resharding behaviour.
+                    properties:
+                      pauseBefore:
+                        default: none
+                        enum:
+                        - none
+                        - switchWrites
+                        - complete
+                        type: string
+                      retireOldGroupsAfter:
+                        default: 24h
+                        type: string
+                    type: object
+                  resources:
+                    description: ResourceRequirements describes the compute resource
+                      requirements.
+                    properties:
+                      claims:
+                        description: |-
+                          Claims lists the names of resources, defined in spec.resourceClaims,
+                          that are used by this container.
+
+                          This field depends on the
+                          DynamicResourceAllocation feature gate.
+
+                          This field is immutable. It can only be set for containers.
+                        items:
+                          description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                          properties:
+                            name:
+                              description: |-
+                                Name must match the name of one entry in pod.spec.resourceClaims of
+                                the Pod where this field is used. It makes that resource available
+                                inside a container.
+                              type: string
+                            request:
+                              description: |-
+                                Request is the name chosen for a request in the referenced claim.
+                                If empty, everything from the claim is made available, otherwise
+                                only the result of this request.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                      limits:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Limits describes the maximum amount of compute resources allowed.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                      requests:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Requests describes the minimum amount of compute resources required.
+                          If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                          otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                    type: object
+                  router:
+                    default:
+                      maxReplicas: 10
+                      minReplicas: 2
+                    description: RouterSpec configures the stateless router deployment.
+                    properties:
+                      hpa:
+                        default: {}
+                        description: HPASpec configures router autoscaling.
+                        properties:
+                          cpuUtilization:
+                            default: 70
+                            maximum: 100
+                            minimum: 1
+                            type: integer
+                        type: object
+                      maxReplicas:
+                        default: 10
+                        minimum: 1
+                        type: integer
+                      minReplicas:
+                        default: 2
+                        minimum: 1
+                        type: integer
+                      tls:
+                        description: TLSSpec references a TLS Secret.
+                        properties:
+                          secretRef:
+                            description: |-
+                              LocalObjectReference contains enough information to let you locate the
+                              referenced object inside the same namespace.
+                            properties:
+                              name:
+                                default: ""
+                                description: |-
+                                  Name of the referent.
+                                  This field is effectively required, but due to backwards compatibility is
+                                  allowed to be empty. Instances of this type with an empty value here are
+                                  almost certainly wrong.
+                                  More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                type: string
+                            type: object
+                            x-kubernetes-map-type: atomic
+                        type: object
+                    type: object
+                    x-kubernetes-validations:
+                    - message: router.maxReplicas must be >= router.minReplicas
+                      rule: self.maxReplicas >= self.minReplicas
+                  shards:
+                    minimum: 1
+                    type: integer
+                  storage:
+                    description: StorageSpec describes a persistent volume request.
+                    properties:
+                      size:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      storageClassName:
+                        type: string
+                    required:
+                    - size
+                    type: object
+                  upgrade:
+                    default: {}
+                    description: UpgradeSpec controls major-version upgrades.
+                    properties:
+                      maxParallelGroups:
+                        default: 1
+                        minimum: 1
+                        type: integer
+                      strategy:
+                        default: online
+                        enum:
+                        - online
+                        - offline
+                        type: string
+                    type: object
+                required:
+                - catalog
+                - postgresql
+                - storage
+                type: object
+                x-kubernetes-validations:
+                - message: replicasPerShard must be >= 3
+                  rule: self.replicasPerShard >= 3
+                - message: catalog.replicas must be >= 3 for HA
+                  rule: self.catalog.replicas >= 3
               exclusive:
+                description: Exclusive stops recovery just before the target.
                 type: boolean
+              newClusterName:
+                description: NewClusterName names the PgShardCluster the restore creates.
+                minLength: 1
+                type: string
               target:
-                description: RestoreTarget selects the recovery point.
+                description: |-
+                  Target selects the recovery point; unset recovers to the end of the
+                  archived WAL. The same target applies to every group.
                 properties:
                   immediate:
                     type: boolean
@@ -77,14 +368,27 @@ spec:
                     has(self.immediate) && self.immediate].filter(x, x).size() <=
                     1'
               targetTLI:
+                description: TargetTLI is the timeline to follow (recovery_target_timeline).
                 format: int64
+                minimum: 1
                 type: integer
             required:
             - clusterName
+            - newClusterName
             type: object
+            x-kubernetes-validations:
+            - message: newClusterName must differ from clusterName
+              rule: self.newClusterName != self.clusterName
+            - message: target.name, target.xid and target.immediate require backupId
+              rule: '!(has(self.target) && (has(self.target.name) || has(self.target.xid)
+                || (has(self.target.immediate) && self.target.immediate))) || (has(self.backupId)
+                && self.backupId != '''')'
           status:
             description: PgShardRestoreStatus is the observed state of a restore.
             properties:
+              completedAt:
+                format: date-time
+                type: string
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
@@ -141,7 +445,43 @@ spec:
                   - type
                   type: object
                 type: array
+              error:
+                type: string
+              groups:
+                items:
+                  description: GroupRestoreStatus is the progress of one group of
+                    the new cluster.
+                  properties:
+                    backupId:
+                      type: string
+                    group:
+                      type: string
+                    message:
+                      type: string
+                    reachedTarget:
+                      description: |-
+                        ReachedTarget is true once the group's primary finished recovery and
+                        promoted; PostgreSQL refuses to promote before the target is reached.
+                      type: boolean
+                    sourceStanza:
+                      description: SourceStanza is the repository stanza the group
+                        restored from.
+                      type: string
+                    timeline:
+                      description: Timeline is the new primary's timeline once it
+                        left recovery.
+                      format: int64
+                      type: integer
+                  required:
+                  - group
+                  - reachedTarget
+                  - sourceStanza
+                  type: object
+                type: array
               phase:
+                type: string
+              startedAt:
+                format: date-time
                 type: string
             type: object
         required:

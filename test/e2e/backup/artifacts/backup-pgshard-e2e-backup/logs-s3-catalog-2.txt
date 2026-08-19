@@ -1,0 +1,111 @@
+time=2026-08-19T04:53:04.573Z level=INFO msg="cloning from primary" slot=pgshard_s3_catalog_2
+time=2026-08-19T04:53:04.578Z level=WARN msg="clone failed; retrying" err="connect to source: failed to connect to `user=postgres database=`:\n\t10.96.169.118:5432 (s3-catalog-rw.pgshard-e2e-backup.svc): dial error: dial tcp 10.96.169.118:5432: connect: connection refused\n\t10.96.169.118:5432 (s3-catalog-rw.pgshard-e2e-backup.svc): dial error: dial tcp 10.96.169.118:5432: connect: connection refused" in=5s
+time=2026-08-19T04:53:09.578Z level=INFO msg="cloning from primary" slot=pgshard_s3_catalog_2
+time=2026-08-19T04:53:09.581Z level=WARN msg="clone failed; retrying" err="connect to source: failed to connect to `user=postgres database=`:\n\t10.96.169.118:5432 (s3-catalog-rw.pgshard-e2e-backup.svc): dial error: dial tcp 10.96.169.118:5432: connect: connection refused\n\t10.96.169.118:5432 (s3-catalog-rw.pgshard-e2e-backup.svc): dial error: dial tcp 10.96.169.118:5432: connect: connection refused" in=5s
+time=2026-08-19T04:53:14.582Z level=INFO msg="cloning from primary" slot=pgshard_s3_catalog_2
+time=2026-08-19T04:53:15.204Z level=INFO msg="postgres started" pid=30
+2026-08-19 04:53:15.213 GMT [30] LOG:  skipping missing configuration file "/var/lib/postgresql/data/pgdata/pgshard.override.conf"
+2026-08-19 04:53:15.213 GMT [30] LOG:  skipping missing configuration file "/var/lib/postgresql/data/pgdata/pgshard.override.conf"
+2026-08-19 04:53:15.236 GMT [30] LOG:  starting PostgreSQL 18.6 on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit
+2026-08-19 04:53:15.236 GMT [30] LOG:  listening on IPv4 address "0.0.0.0", port 5432
+2026-08-19 04:53:15.236 GMT [30] LOG:  listening on IPv6 address "::", port 5432
+2026-08-19 04:53:15.239 GMT [30] LOG:  listening on Unix socket "/tmp/.s.PGSQL.5432"
+2026-08-19 04:53:15.246 GMT [36] LOG:  database system was interrupted; last known up at 2026-08-19 04:53:14 GMT
+2026-08-19 04:53:15.457 GMT [37] FATAL:  the database system is starting up
+2026-08-19 04:53:15.507 P00   INFO: archive-get command begin 2.59.1: [00000002.history, pg_wal/RECOVERYHISTORY] --archive-async --config=/etc/pgbackrest/pgbackrest.conf --exec-id=39-32b1deba --log-level-console=info --log-level-file=info --log-path=/var/log/pgbackrest --pg1-path=/var/lib/postgresql/data/pgdata --process-max=2 --repo1-cipher-pass=<redacted> --repo1-cipher-type=aes-256-cbc --repo1-path=/s3 --repo1-s3-bucket=pgshard --repo1-s3-endpoint=http://minio.objectstores.svc:9000 --repo1-s3-key=<redacted> --repo1-s3-key-secret=<redacted> --repo1-s3-key-type=shared --repo1-s3-region=us-east-1 --repo1-s3-uri-style=path --no-repo1-storage-verify-tls --repo1-type=s3 --spool-path=/var/lib/pgbackrest/spool --stanza=s3-catalog-pg18
+2026-08-19 04:53:15.510 P00   INFO: unable to find 00000002.history in the archive
+2026-08-19 04:53:15.510 P00   INFO: archive-get command end: completed successfully (5ms)
+2026-08-19 04:53:15.511 GMT [36] LOG:  starting backup recovery with redo LSN 0/2000028, checkpoint LSN 0/2000080, on timeline ID 1
+2026-08-19 04:53:15.520 P00   INFO: archive-get command begin 2.59.1: [000000010000000000000002, pg_wal/RECOVERYXLOG] --archive-async --config=/etc/pgbackrest/pgbackrest.conf --exec-id=41-7815c82c --log-level-console=info --log-level-file=info --log-path=/var/log/pgbackrest --pg1-path=/var/lib/postgresql/data/pgdata --process-max=2 --repo1-cipher-pass=<redacted> --repo1-cipher-type=aes-256-cbc --repo1-path=/s3 --repo1-s3-bucket=pgshard --repo1-s3-endpoint=http://minio.objectstores.svc:9000 --repo1-s3-key=<redacted> --repo1-s3-key-secret=<redacted> --repo1-s3-key-type=shared --repo1-s3-region=us-east-1 --repo1-s3-uri-style=path --no-repo1-storage-verify-tls --repo1-type=s3 --spool-path=/var/lib/pgbackrest/spool --stanza=s3-catalog-pg18
+2026-08-19 04:53:15.709 GMT [46] FATAL:  the database system is starting up
+time=2026-08-19T04:53:15.854Z level=INFO msg="reaped orphan" pid=43 status=0
+2026-08-19 04:53:15.866 P00   INFO: found 000000010000000000000002 in the archive asynchronously
+2026-08-19 04:53:15.866 P00   INFO: archive-get command end: completed successfully (348ms)
+2026-08-19 04:53:15.868 GMT [36] LOG:  restored log file "000000010000000000000002" from archive
+2026-08-19 04:53:15.886 GMT [36] LOG:  entering standby mode
+2026-08-19 04:53:15.892 GMT [36] LOG:  redo starts at 0/2000028
+2026-08-19 04:53:15.901 P00   INFO: archive-get command begin 2.59.1: [000000010000000000000003, pg_wal/RECOVERYXLOG] --archive-async --config=/etc/pgbackrest/pgbackrest.conf --exec-id=48-e66f9eac --log-level-console=info --log-level-file=info --log-path=/var/log/pgbackrest --pg1-path=/var/lib/postgresql/data/pgdata --process-max=2 --repo1-cipher-pass=<redacted> --repo1-cipher-type=aes-256-cbc --repo1-path=/s3 --repo1-s3-bucket=pgshard --repo1-s3-endpoint=http://minio.objectstores.svc:9000 --repo1-s3-key=<redacted> --repo1-s3-key-secret=<redacted> --repo1-s3-key-type=shared --repo1-s3-region=us-east-1 --repo1-s3-uri-style=path --no-repo1-storage-verify-tls --repo1-type=s3 --spool-path=/var/lib/pgbackrest/spool --stanza=s3-catalog-pg18
+2026-08-19 04:53:15.928 P00   INFO: found 000000010000000000000003 in the archive asynchronously
+2026-08-19 04:53:15.932 P00   INFO: archive-get command end: completed successfully (32ms)
+2026-08-19 04:53:15.933 GMT [36] LOG:  restored log file "000000010000000000000003" from archive
+time=2026-08-19T04:53:15.951Z level=INFO msg="reaped orphan" pid=50 status=0
+2026-08-19 04:53:15.954 P00   INFO: archive-get command begin 2.59.1: [000000010000000000000004, pg_wal/RECOVERYXLOG] --archive-async --config=/etc/pgbackrest/pgbackrest.conf --exec-id=52-e79c9802 --log-level-console=info --log-level-file=info --log-path=/var/log/pgbackrest --pg1-path=/var/lib/postgresql/data/pgdata --process-max=2 --repo1-cipher-pass=<redacted> --repo1-cipher-type=aes-256-cbc --repo1-path=/s3 --repo1-s3-bucket=pgshard --repo1-s3-endpoint=http://minio.objectstores.svc:9000 --repo1-s3-key=<redacted> --repo1-s3-key-secret=<redacted> --repo1-s3-key-type=shared --repo1-s3-region=us-east-1 --repo1-s3-uri-style=path --no-repo1-storage-verify-tls --repo1-type=s3 --spool-path=/var/lib/pgbackrest/spool --stanza=s3-catalog-pg18
+2026-08-19 04:53:15.961 GMT [55] FATAL:  the database system is not yet accepting connections
+2026-08-19 04:53:15.961 GMT [55] DETAIL:  Consistent recovery state has not been yet reached.
+time=2026-08-19T04:53:15.974Z level=INFO msg="reaped orphan" pid=54 status=0
+2026-08-19 04:53:16.058 P00   INFO: unable to find 000000010000000000000004 in the archive asynchronously
+2026-08-19 04:53:16.058 P00   INFO: archive-get command end: completed successfully (106ms)
+2026-08-19 04:53:16.062 GMT [36] LOG:  completed backup recovery with redo LSN 0/2000028 and end LSN 0/2000120
+2026-08-19 04:53:16.062 GMT [36] LOG:  consistent recovery state reached at 0/2000120
+2026-08-19 04:53:16.062 GMT [30] LOG:  database system is ready to accept read-only connections
+2026-08-19 04:53:16.070 P00   INFO: archive-get command begin 2.59.1: [000000010000000000000004, pg_wal/RECOVERYXLOG] --archive-async --config=/etc/pgbackrest/pgbackrest.conf --exec-id=57-4e6ee98b --log-level-console=info --log-level-file=info --log-path=/var/log/pgbackrest --pg1-path=/var/lib/postgresql/data/pgdata --process-max=2 --repo1-cipher-pass=<redacted> --repo1-cipher-type=aes-256-cbc --repo1-path=/s3 --repo1-s3-bucket=pgshard --repo1-s3-endpoint=http://minio.objectstores.svc:9000 --repo1-s3-key=<redacted> --repo1-s3-key-secret=<redacted> --repo1-s3-key-type=shared --repo1-s3-region=us-east-1 --repo1-s3-uri-style=path --no-repo1-storage-verify-tls --repo1-type=s3 --spool-path=/var/lib/pgbackrest/spool --stanza=s3-catalog-pg18
+time=2026-08-19T04:53:16.091Z level=INFO msg="reaped orphan" pid=59 status=0
+2026-08-19 04:53:16.173 P00   INFO: unable to find 000000010000000000000004 in the archive asynchronously
+2026-08-19 04:53:16.173 P00   INFO: archive-get command end: completed successfully (105ms)
+2026-08-19 04:53:16.185 GMT [60] LOG:  started streaming WAL from primary at 0/4000000 on timeline 1
+time=2026-08-19T04:53:16.223Z level=INFO msg="agent ready" http=[::]:8080 grpc=[::]:9090 standby=true
+2026-08-19 04:56:05.550 GMT [60] FATAL:  could not send data to WAL stream: server closed the connection unexpectedly
+		This probably means the server terminated abnormally
+		before or while processing the request.
+2026-08-19 04:56:05.560 P00   INFO: archive-get command begin 2.59.1: [00000002.history, pg_wal/RECOVERYHISTORY] --archive-async --config=/etc/pgbackrest/pgbackrest.conf --exec-id=119-5a9925e0 --log-level-console=info --log-level-file=info --log-path=/var/log/pgbackrest --pg1-path=/var/lib/postgresql/data/pgdata --process-max=2 --repo1-cipher-pass=<redacted> --repo1-cipher-type=aes-256-cbc --repo1-path=/s3 --repo1-s3-bucket=pgshard --repo1-s3-endpoint=http://minio.objectstores.svc:9000 --repo1-s3-key=<redacted> --repo1-s3-key-secret=<redacted> --repo1-s3-key-type=shared --repo1-s3-region=us-east-1 --repo1-s3-uri-style=path --no-repo1-storage-verify-tls --repo1-type=s3 --spool-path=/var/lib/pgbackrest/spool --stanza=s3-catalog-pg18
+2026-08-19 04:56:05.564 P00   INFO: unable to find 00000002.history in the archive
+2026-08-19 04:56:05.564 P00   INFO: archive-get command end: completed successfully (6ms)
+2026-08-19 04:56:05.575 P00   INFO: archive-get command begin 2.59.1: [000000010000000000000011, pg_wal/RECOVERYXLOG] --archive-async --config=/etc/pgbackrest/pgbackrest.conf --exec-id=121-8089f723 --log-level-console=info --log-level-file=info --log-path=/var/log/pgbackrest --pg1-path=/var/lib/postgresql/data/pgdata --process-max=2 --repo1-cipher-pass=<redacted> --repo1-cipher-type=aes-256-cbc --repo1-path=/s3 --repo1-s3-bucket=pgshard --repo1-s3-endpoint=http://minio.objectstores.svc:9000 --repo1-s3-key=<redacted> --repo1-s3-key-secret=<redacted> --repo1-s3-key-type=shared --repo1-s3-region=us-east-1 --repo1-s3-uri-style=path --no-repo1-storage-verify-tls --repo1-type=s3 --spool-path=/var/lib/pgbackrest/spool --stanza=s3-catalog-pg18
+time=2026-08-19T04:56:05.598Z level=INFO msg="reaped orphan" pid=123 status=0
+2026-08-19 04:56:05.679 P00   INFO: unable to find 000000010000000000000011 in the archive asynchronously
+2026-08-19 04:56:05.679 P00   INFO: archive-get command end: completed successfully (106ms)
+2026-08-19 04:56:05.699 GMT [124] LOG:  started streaming WAL from primary at 0/11000000 on timeline 1
+2026-08-19 04:58:39.706 GMT [34] LOG:  restartpoint starting: time
+2026-08-19 04:59:29.061 GMT [34] LOG:  restartpoint complete: wrote 437 buffers (2.7%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=49.168 s, sync=0.178 s, total=49.355 s; sync files=198, longest=0.073 s, average=0.001 s; distance=311296 kB, estimate=311296 kB; lsn=0/15000080, redo lsn=0/15000028
+2026-08-19 04:59:29.061 GMT [34] LOG:  recovery restart point at 0/15000028
+2026-08-19 04:59:29.061 GMT [34] DETAIL:  Last completed transaction was at log time 2026-08-19 04:59:12.429096+00.
+2026-08-19 05:04:00.989 GMT [34] LOG:  restartpoint starting: time
+2026-08-19 05:04:02.214 GMT [34] LOG:  restartpoint complete: wrote 12 buffers (0.1%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=1.207 s, sync=0.007 s, total=1.225 s; sync files=10, longest=0.003 s, average=0.001 s; distance=163840 kB, estimate=296550 kB; lsn=0/1F000080, redo lsn=0/1F000028
+2026-08-19 05:04:02.214 GMT [34] LOG:  recovery restart point at 0/1F000028
+2026-08-19 05:04:02.214 GMT [34] DETAIL:  Last completed transaction was at log time 2026-08-19 05:03:55.474446+00.
+2026-08-19 05:05:54.776 GMT [124] FATAL:  terminating walreceiver due to timeout
+2026-08-19 05:05:54.829 P00   INFO: archive-get command begin 2.59.1: [00000002.history, pg_wal/RECOVERYHISTORY] --archive-async --config=/etc/pgbackrest/pgbackrest.conf --exec-id=276-1f079494 --log-level-console=info --log-level-file=info --log-path=/var/log/pgbackrest --pg1-path=/var/lib/postgresql/data/pgdata --process-max=2 --repo1-cipher-pass=<redacted> --repo1-cipher-type=aes-256-cbc --repo1-path=/s3 --repo1-s3-bucket=pgshard --repo1-s3-endpoint=http://minio.objectstores.svc:9000 --repo1-s3-key=<redacted> --repo1-s3-key-secret=<redacted> --repo1-s3-key-type=shared --repo1-s3-region=us-east-1 --repo1-s3-uri-style=path --no-repo1-storage-verify-tls --repo1-type=s3 --spool-path=/var/lib/pgbackrest/spool --stanza=s3-catalog-pg18
+2026-08-19 05:05:54.832 P00   INFO: unable to find 00000002.history in the archive
+2026-08-19 05:05:54.832 P00   INFO: archive-get command end: completed successfully (5ms)
+2026-08-19 05:05:54.840 P00   INFO: archive-get command begin 2.59.1: [000000010000000000000024, pg_wal/RECOVERYXLOG] --archive-async --config=/etc/pgbackrest/pgbackrest.conf --exec-id=278-4902e149 --log-level-console=info --log-level-file=info --log-path=/var/log/pgbackrest --pg1-path=/var/lib/postgresql/data/pgdata --process-max=2 --repo1-cipher-pass=<redacted> --repo1-cipher-type=aes-256-cbc --repo1-path=/s3 --repo1-s3-bucket=pgshard --repo1-s3-endpoint=http://minio.objectstores.svc:9000 --repo1-s3-key=<redacted> --repo1-s3-key-secret=<redacted> --repo1-s3-key-type=shared --repo1-s3-region=us-east-1 --repo1-s3-uri-style=path --no-repo1-storage-verify-tls --repo1-type=s3 --spool-path=/var/lib/pgbackrest/spool --stanza=s3-catalog-pg18
+time=2026-08-19T05:05:54.861Z level=INFO msg="reaped orphan" pid=280 status=0
+2026-08-19 05:05:54.944 P00   INFO: unable to find 000000010000000000000024 in the archive asynchronously
+2026-08-19 05:05:54.944 P00   INFO: archive-get command end: completed successfully (105ms)
+2026-08-19 05:05:54.945 GMT [36] LOG:  invalid record length at 0/240002A0: expected at least 24, got 0
+2026-08-19 05:05:54.955 GMT [281] LOG:  started streaming WAL from primary at 0/24000000 on timeline 1
+2026-08-19 05:07:32.934 GMT [281] FATAL:  terminating walreceiver due to timeout
+2026-08-19 05:07:32.943 P00   INFO: archive-get command begin 2.59.1: [00000002.history, pg_wal/RECOVERYHISTORY] --archive-async --config=/etc/pgbackrest/pgbackrest.conf --exec-id=306-46fed477 --log-level-console=info --log-level-file=info --log-path=/var/log/pgbackrest --pg1-path=/var/lib/postgresql/data/pgdata --process-max=2 --repo1-cipher-pass=<redacted> --repo1-cipher-type=aes-256-cbc --repo1-path=/s3 --repo1-s3-bucket=pgshard --repo1-s3-endpoint=http://minio.objectstores.svc:9000 --repo1-s3-key=<redacted> --repo1-s3-key-secret=<redacted> --repo1-s3-key-type=shared --repo1-s3-region=us-east-1 --repo1-s3-uri-style=path --no-repo1-storage-verify-tls --repo1-type=s3 --spool-path=/var/lib/pgbackrest/spool --stanza=s3-catalog-pg18
+2026-08-19 05:07:32.946 P00   INFO: unable to find 00000002.history in the archive
+2026-08-19 05:07:32.946 P00   INFO: archive-get command end: completed successfully (4ms)
+2026-08-19 05:07:32.956 P00   INFO: archive-get command begin 2.59.1: [000000010000000000000028, pg_wal/RECOVERYXLOG] --archive-async --config=/etc/pgbackrest/pgbackrest.conf --exec-id=308-00bc7a1d --log-level-console=info --log-level-file=info --log-path=/var/log/pgbackrest --pg1-path=/var/lib/postgresql/data/pgdata --process-max=2 --repo1-cipher-pass=<redacted> --repo1-cipher-type=aes-256-cbc --repo1-path=/s3 --repo1-s3-bucket=pgshard --repo1-s3-endpoint=http://minio.objectstores.svc:9000 --repo1-s3-key=<redacted> --repo1-s3-key-secret=<redacted> --repo1-s3-key-type=shared --repo1-s3-region=us-east-1 --repo1-s3-uri-style=path --no-repo1-storage-verify-tls --repo1-type=s3 --spool-path=/var/lib/pgbackrest/spool --stanza=s3-catalog-pg18
+time=2026-08-19T05:07:32.981Z level=INFO msg="reaped orphan" pid=310 status=0
+2026-08-19 05:07:33.060 P00   INFO: unable to find 000000010000000000000028 in the archive asynchronously
+2026-08-19 05:07:33.060 P00   INFO: archive-get command end: completed successfully (105ms)
+2026-08-19 05:07:33.062 GMT [36] LOG:  invalid record length at 0/28000BB8: expected at least 24, got 0
+2026-08-19 05:07:33.071 GMT [311] LOG:  started streaming WAL from primary at 0/28000000 on timeline 1
+2026-08-19 05:09:27.545 GMT [34] LOG:  restartpoint starting: time
+2026-08-19 05:09:27.681 GMT [34] LOG:  restartpoint complete: wrote 1 buffers (0.0%), wrote 2 SLRU buffers; 0 WAL file(s) added, 0 removed, 10 recycled; write=0.105 s, sync=0.004 s, total=0.136 s; sync files=3, longest=0.003 s, average=0.002 s; distance=196608 kB, estimate=286556 kB; lsn=0/2B000080, redo lsn=0/2B000028
+2026-08-19 05:09:27.681 GMT [34] LOG:  recovery restart point at 0/2B000028
+2026-08-19 05:09:27.681 GMT [34] DETAIL:  Last completed transaction was at log time 2026-08-19 05:09:15.108944+00.
+2026-08-19 05:11:22.086 GMT [311] FATAL:  terminating walreceiver due to timeout
+2026-08-19 05:11:22.096 P00   INFO: archive-get command begin 2.59.1: [00000002.history, pg_wal/RECOVERYHISTORY] --archive-async --config=/etc/pgbackrest/pgbackrest.conf --exec-id=370-ead0658f --log-level-console=info --log-level-file=info --log-path=/var/log/pgbackrest --pg1-path=/var/lib/postgresql/data/pgdata --process-max=2 --repo1-cipher-pass=<redacted> --repo1-cipher-type=aes-256-cbc --repo1-path=/s3 --repo1-s3-bucket=pgshard --repo1-s3-endpoint=http://minio.objectstores.svc:9000 --repo1-s3-key=<redacted> --repo1-s3-key-secret=<redacted> --repo1-s3-key-type=shared --repo1-s3-region=us-east-1 --repo1-s3-uri-style=path --no-repo1-storage-verify-tls --repo1-type=s3 --spool-path=/var/lib/pgbackrest/spool --stanza=s3-catalog-pg18
+2026-08-19 05:11:22.116 P00   INFO: unable to find 00000002.history in the archive
+2026-08-19 05:11:22.116 P00   INFO: archive-get command end: completed successfully (22ms)
+2026-08-19 05:11:22.127 P00   INFO: archive-get command begin 2.59.1: [000000010000000000000031, pg_wal/RECOVERYXLOG] --archive-async --config=/etc/pgbackrest/pgbackrest.conf --exec-id=372-302fbbf4 --log-level-console=info --log-level-file=info --log-path=/var/log/pgbackrest --pg1-path=/var/lib/postgresql/data/pgdata --process-max=2 --repo1-cipher-pass=<redacted> --repo1-cipher-type=aes-256-cbc --repo1-path=/s3 --repo1-s3-bucket=pgshard --repo1-s3-endpoint=http://minio.objectstores.svc:9000 --repo1-s3-key=<redacted> --repo1-s3-key-secret=<redacted> --repo1-s3-key-type=shared --repo1-s3-region=us-east-1 --repo1-s3-uri-style=path --no-repo1-storage-verify-tls --repo1-type=s3 --spool-path=/var/lib/pgbackrest/spool --stanza=s3-catalog-pg18
+time=2026-08-19T05:11:22.154Z level=INFO msg="reaped orphan" pid=374 status=0
+2026-08-19 05:11:22.230 P00   INFO: unable to find 000000010000000000000031 in the archive asynchronously
+2026-08-19 05:11:22.231 P00   INFO: archive-get command end: completed successfully (105ms)
+2026-08-19 05:11:22.232 GMT [36] LOG:  invalid record length at 0/31000180: expected at least 24, got 0
+2026-08-19 05:11:22.244 GMT [375] LOG:  started streaming WAL from primary at 0/31000000 on timeline 1
+2026-08-19 05:11:54.981 GMT [375] FATAL:  terminating walreceiver due to timeout
+2026-08-19 05:11:54.989 P00   INFO: archive-get command begin 2.59.1: [00000002.history, pg_wal/RECOVERYHISTORY] --archive-async --config=/etc/pgbackrest/pgbackrest.conf --exec-id=389-b5eaa4a7 --log-level-console=info --log-level-file=info --log-path=/var/log/pgbackrest --pg1-path=/var/lib/postgresql/data/pgdata --process-max=2 --repo1-cipher-pass=<redacted> --repo1-cipher-type=aes-256-cbc --repo1-path=/s3 --repo1-s3-bucket=pgshard --repo1-s3-endpoint=http://minio.objectstores.svc:9000 --repo1-s3-key=<redacted> --repo1-s3-key-secret=<redacted> --repo1-s3-key-type=shared --repo1-s3-region=us-east-1 --repo1-s3-uri-style=path --no-repo1-storage-verify-tls --repo1-type=s3 --spool-path=/var/lib/pgbackrest/spool --stanza=s3-catalog-pg18
+2026-08-19 05:11:54.993 P00   INFO: unable to find 00000002.history in the archive
+2026-08-19 05:11:54.993 P00   INFO: archive-get command end: completed successfully (5ms)
+2026-08-19 05:11:55.003 P00   INFO: archive-get command begin 2.59.1: [000000010000000000000031, pg_wal/RECOVERYXLOG] --archive-async --config=/etc/pgbackrest/pgbackrest.conf --exec-id=391-87a4f0e1 --log-level-console=info --log-level-file=info --log-path=/var/log/pgbackrest --pg1-path=/var/lib/postgresql/data/pgdata --process-max=2 --repo1-cipher-pass=<redacted> --repo1-cipher-type=aes-256-cbc --repo1-path=/s3 --repo1-s3-bucket=pgshard --repo1-s3-endpoint=http://minio.objectstores.svc:9000 --repo1-s3-key=<redacted> --repo1-s3-key-secret=<redacted> --repo1-s3-key-type=shared --repo1-s3-region=us-east-1 --repo1-s3-uri-style=path --no-repo1-storage-verify-tls --repo1-type=s3 --spool-path=/var/lib/pgbackrest/spool --stanza=s3-catalog-pg18
+time=2026-08-19T05:11:55.025Z level=INFO msg="reaped orphan" pid=393 status=0
+2026-08-19 05:11:55.106 P00   INFO: unable to find 000000010000000000000031 in the archive asynchronously
+2026-08-19 05:11:55.106 P00   INFO: archive-get command end: completed successfully (105ms)
+2026-08-19 05:11:55.108 GMT [36] LOG:  invalid record length at 0/31000878: expected at least 24, got 0
+2026-08-19 05:11:55.117 GMT [394] LOG:  started streaming WAL from primary at 0/31000000 on timeline 1
+pgshard-pooler run: listening on [::]:9091 (INSECURE plaintext), postgres at /tmp/.s.PGSQL.5432
+time=2026-08-19T04:53:04.680Z level=ERROR msg="catalog watcher stopped" err="failed to connect to `user=postgres database=postgres`:\n\t10.96.169.118:5432 (s3-catalog-rw.pgshard-e2e-backup.svc): dial error: dial tcp 10.96.169.118:5432: connect: connection refused\n\t10.96.169.118:5432 (s3-catalog-rw.pgshard-e2e-backup.svc): dial error: dial tcp 10.96.169.118:5432: connect: connection refused"

@@ -118,7 +118,7 @@ func TestTemplateAndPodCarryBackupPolicy(t *testing.T) {
 	if len(Renderer{}.Pod(c, g, 0, RolePrimary, "pvc", plain).Spec.Volumes) != 4 {
 		t.Error("pod without policy must not mount backup secrets")
 	}
-	cm := Renderer{}.ConfigMap(c, g, g.MemberName(0), nil, pol)
+	cm := Renderer{}.ConfigMap(c, g, g.MemberName(0), nil, pol, false)
 	var cfg agent.Config
 	if err := json.Unmarshal([]byte(cm.Data[agentConfigKey(g.MemberName(1))]), &cfg); err != nil {
 		t.Fatal(err)
@@ -129,7 +129,7 @@ func TestTemplateAndPodCarryBackupPolicy(t *testing.T) {
 	if got, err := backup.Render(cfg.Backup.WithDefaults(), "/pgdata", 5432); err == nil || !strings.Contains(err.Error(), backupEncryptionMountPath+"/passphrase") {
 		t.Errorf("rendering must look for the mounted credentials: %q %v", got, err)
 	}
-	plainCM := Renderer{}.ConfigMap(c, g, g.MemberName(0), nil, nil)
+	plainCM := Renderer{}.ConfigMap(c, g, g.MemberName(0), nil, nil, false)
 	if strings.Contains(plainCM.Data[agentConfigKey(g.MemberName(1))], `"backup"`) {
 		t.Error("no policy must render no backup section")
 	}
@@ -666,13 +666,13 @@ func TestPolicyBindingAndWatches(t *testing.T) {
 	}
 	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 	cr := &ClusterReconciler{Client: cl, Now: func() time.Time { return now }}
-	if _, cond, err := cr.backupState(ctx, unbound); err != nil || cond.Status != metav1.ConditionFalse || cond.Reason != "NoPolicy" {
+	if _, _, cond, err := cr.backupState(ctx, unbound); err != nil || cond.Status != metav1.ConditionFalse || cond.Reason != "NoPolicy" {
 		t.Errorf("unbound state: %+v %v", cond, err)
 	}
-	if _, cond, err := cr.backupState(ctx, dangling); err != nil || cond.Status != metav1.ConditionFalse || cond.Reason != "PolicyMissing" {
+	if _, _, cond, err := cr.backupState(ctx, dangling); err != nil || cond.Status != metav1.ConditionFalse || cond.Reason != "PolicyMissing" {
 		t.Errorf("dangling state: %+v %v", cond, err)
 	}
-	if p, cond, err := cr.backupState(ctx, bound); err != nil || p == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "Overdue" || !strings.Contains(cond.Message, "policy nightly (s3)") {
+	if p, _, cond, err := cr.backupState(ctx, bound); err != nil || p == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "Overdue" || !strings.Contains(cond.Message, "policy nightly (s3)") {
 		t.Errorf("bound state without backups: %+v %v", cond, err)
 	}
 	done := metav1.NewTime(now.Add(-5 * time.Minute))
@@ -681,7 +681,7 @@ func TestPolicyBindingAndWatches(t *testing.T) {
 	if err := cl.Create(ctx, full); err != nil {
 		t.Fatal(err)
 	}
-	if _, cond, err := cr.backupState(ctx, bound); err != nil || cond.Status != metav1.ConditionTrue || cond.Reason != "Current" {
+	if _, _, cond, err := cr.backupState(ctx, bound); err != nil || cond.Status != metav1.ConditionTrue || cond.Reason != "Current" {
 		t.Errorf("bound state with fresh full: %+v %v", cond, err)
 	}
 	pol.Finalizers = []string{"pgshard.io/test"}
@@ -691,7 +691,7 @@ func TestPolicyBindingAndWatches(t *testing.T) {
 	if err := cl.Delete(ctx, pol); err != nil {
 		t.Fatal(err)
 	}
-	if _, cond, err := cr.backupState(ctx, bound); err != nil || cond.Reason != "PolicyMissing" || !strings.Contains(cond.Message, "being deleted") {
+	if _, _, cond, err := cr.backupState(ctx, bound); err != nil || cond.Reason != "PolicyMissing" || !strings.Contains(cond.Message, "being deleted") {
 		t.Errorf("policy being deleted: %+v %v", cond, err)
 	}
 	if reqs := r.policyToClusters(ctx, pol); len(reqs) != 1 {

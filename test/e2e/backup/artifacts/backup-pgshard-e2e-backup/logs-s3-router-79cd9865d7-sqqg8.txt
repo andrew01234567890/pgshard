@@ -1,0 +1,2 @@
+
+# error: kubectl -n pgshard-e2e-backup logs --all-containers pod/s3-router-79cd9865d7-sqqg8: exit status 1: Error from server (BadRequest): container "router" in pod "s3-router-79cd9865d7-sqqg8" is waiting to start: trying and failing to pull image
