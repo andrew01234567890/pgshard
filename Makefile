@@ -66,3 +66,24 @@ pgparser-sync:
 
 pgparser-proto:
 	buf generate --template buf.gen.pgparser.yaml
+
+CONTROLLER_GEN_VERSION ?= v0.21.0
+SETUP_ENVTEST_VERSION  ?= v0.24.1
+ENVTEST_K8S_VERSION    ?= 1.34
+ENVTEST_ASSETS_DIR     ?= $(CURDIR)/bin/k8s
+CONTROLLER_GEN          = go run sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION)
+
+.PHONY: generate manifests envtest-assets envtest
+
+generate:
+	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./api/..."
+
+manifests:
+	$(CONTROLLER_GEN) crd paths="./api/..." output:crd:artifacts:config=config/crd/bases
+
+envtest-assets:
+	SETUP_ENVTEST_VERSION=$(SETUP_ENVTEST_VERSION) ENVTEST_K8S_VERSION=$(ENVTEST_K8S_VERSION) \
+		hack/envtest/setup-envtest.sh $(ENVTEST_ASSETS_DIR)
+
+envtest: envtest-assets
+	KUBEBUILDER_ASSETS="$$(hack/envtest/setup-envtest.sh $(ENVTEST_ASSETS_DIR))" go test -race -count=1 ./api/...
