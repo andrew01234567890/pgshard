@@ -234,7 +234,9 @@ func (p *Pool) expired(b *Backend) bool {
 func (p *Pool) Release(b *Backend) {
 	p.mu.Lock()
 	rp := p.role(b.role)
-	keep := !p.closed && !b.broken && b.idle() && !p.expired(b)
+	// A backend with buffered, unflushed messages is never reused: the next
+	// user's flush would push another session's pipeline into PostgreSQL.
+	keep := !p.closed && !b.broken && !b.hasUnflushed() && b.idle() && !p.expired(b)
 	if keep {
 		rp.idle = append(rp.idle, b)
 		p.notify()

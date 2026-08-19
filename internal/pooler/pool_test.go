@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 func TestPoolBudgetCapsBackends(t *testing.T) {
@@ -110,5 +112,30 @@ func TestPoolExpiryAndClose(t *testing.T) {
 	}
 	if b.conn != nil || c.conn != nil {
 		t.Fatal("released backends must be closed after Close")
+	}
+}
+
+func TestPoolNeverReusesBackendWithUnflushedMessages(t *testing.T) {
+	pg := newFakePG()
+	p := newPool(PoolConfig{MaxBackends: 2}, pg.dial)
+	ctx := context.Background()
+	a, err := p.Acquire(ctx, "db", "alice", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.send(&pgproto3.Sync{}) // buffered, never flushed
+	p.Release(a)
+	if _, idle := p.Stats(); idle != 0 {
+		t.Fatal("a backend holding unflushed messages must not return to the idle set")
+	}
+	b, err := p.Acquire(ctx, "db", "alice", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b == a {
+		t.Fatal("backend with unflushed messages was reused")
+	}
+	if pg.dials.Load() != 2 {
+		t.Fatalf("dials = %d, want 2 (a fresh backend)", pg.dials.Load())
 	}
 }
