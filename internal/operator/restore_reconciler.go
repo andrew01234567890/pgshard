@@ -281,6 +281,11 @@ func (r *RestoreReconciler) observe(ctx context.Context, rs *pgshardv1alpha1.PgS
 	}
 	meta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{Type: "Progressing", Status: boolCondition(inProgress),
 		Reason: rs.Status.Phase, Message: msg, ObservedGeneration: rs.Generation})
+	if rs.Status.Phase == pgshardv1alpha1.RestorePhaseRecovered {
+		if err := r.clearRestoreSource(ctx, c); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	if err := r.Status().Patch(ctx, rs, client.MergeFrom(base)); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -291,6 +296,21 @@ func (r *RestoreReconciler) observe(ctx context.Context, rs *pgshardv1alpha1.PgS
 		return ctrl.Result{}, nil
 	}
 	return ctrl.Result{RequeueAfter: restorePollInterval}, nil
+}
+
+// clearRestoreSource drops the restore annotation once the cluster has
+// recovered, so a member that later bootstraps with an empty PGDATA does
+// not restore the source's old data over the group again.
+func (r *RestoreReconciler) clearRestoreSource(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) error {
+	if _, ok := c.Annotations[AnnotationRestoreSource]; !ok {
+		return nil
+	}
+	base := c.DeepCopy()
+	delete(c.Annotations, AnnotationRestoreSource)
+	if err := r.Patch(ctx, c, client.MergeFrom(base)); err != nil {
+		return fmt.Errorf("clear restore source of cluster %s: %w", c.Name, err)
+	}
+	return nil
 }
 
 // reconcileTwoPhase finishes the new cluster's prepared transactions

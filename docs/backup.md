@@ -235,7 +235,9 @@ and immediate targets need `backupId`. When `backupId` names a completed
 value is used as the pgBackRest label for every group.
 
 Status: `Pending` → `Restoring` (cluster created) → `Recovered` when every
-primary left recovery and the cluster is `Ready`, with per-group
+primary left recovery and the cluster is `Ready` (the operator then removes
+the `pgshard.io/restore-source` annotation, so a member that later starts
+with an empty PGDATA does not restore the source's old data again), with per-group
 `sourceStanza`, `backupId`, `timeline` and `reachedTarget`; `Failed` on
 invalid specs, a missing source, an incomplete backup, an existing cluster of
 that name, a primary that crash-loops (PostgreSQL refuses to start when the WAL

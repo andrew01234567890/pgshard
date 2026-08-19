@@ -209,9 +209,21 @@ func TestRestoreReconcilerCreatesClusterAndFollowsRecovery(t *testing.T) {
 	if err := cl.Status().Update(context.Background(), &created); err != nil {
 		t.Fatal(err)
 	}
+	if cfg := agentConfig(&created, Groups(&created)[1], "new-shard-0-0", "new-shard-0-0", Template(&created, nil, newPolicy()), false, true); cfg.Restore == nil {
+		t.Fatal("restoring cluster renders no restore config")
+	}
 	res, got = reconcileRestore(t, r, "r1")
 	if got.Status.Phase != pgshardv1alpha1.RestorePhaseRecovered || got.Status.CompletedAt == nil || res.RequeueAfter != 0 || got.Status.Error != "" {
 		t.Fatalf("recovered: %+v res=%v", got.Status, res)
+	}
+	if err := cl.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "new"}, &created); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := created.Annotations[AnnotationRestoreSource]; ok || created.Labels[LabelRestoredFrom] != "r1" {
+		t.Fatalf("recovered cluster keeps restore source: annotations=%v labels=%v", created.Annotations, created.Labels)
+	}
+	if cfg := agentConfig(&created, Groups(&created)[1], "new-shard-0-0", "new-shard-0-0", Template(&created, nil, newPolicy()), false, true); cfg.Restore != nil || !cfg.RecloneFromRepo {
+		t.Fatalf("recovered cluster still renders restore config: %+v", cfg.Restore)
 	}
 	if cond := meta.FindStatusCondition(got.Status.Conditions, "Progressing"); cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "Recovered" {
 		t.Fatalf("condition: %+v", cond)

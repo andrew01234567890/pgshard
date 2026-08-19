@@ -202,7 +202,7 @@ func recoveredBarrierRestore(t *testing.T, name string) (*RestoreReconciler, cli
 }
 
 func TestBarrierRestoreReconcilesPreparedTransactionsThenUnfences(t *testing.T) {
-	r, _, twoPC := recoveredBarrierRestore(t, "r1")
+	r, cl, twoPC := recoveredBarrierRestore(t, "r1")
 	twoPC.decisions = []twopc.Decision{{GID: "pgshard-a", State: "commit", Participants: []int32{0, 1}}, {GID: "pgshard-b", State: "abort", Participants: []int32{1}}}
 	twoPC.outcomes["10.1.0.2:9090"] = twopc.Outcome{Committed: 1}
 	twoPC.outcomes["10.1.0.3:9090"] = twopc.Outcome{Committed: 1, RolledBack: 1}
@@ -225,6 +225,13 @@ func TestBarrierRestoreReconcilesPreparedTransactionsThenUnfences(t *testing.T) 
 	}
 	if cond := meta.FindStatusCondition(got.Status.Conditions, "Progressing"); cond == nil || cond.Status != metav1.ConditionFalse || !strings.Contains(cond.Message, "unfenced: 2 committed, 1 rolled back") {
 		t.Fatalf("condition %+v", cond)
+	}
+	var created pgshardv1alpha1.PgShardCluster
+	if err := cl.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "new"}, &created); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := RestoreSourceOf(&created); ok {
+		t.Fatal("recovered barrier restore keeps the restore source annotation")
 	}
 	// Terminal: another reconcile changes nothing and calls no agent.
 	reconcileRestore(t, r, "r1")
