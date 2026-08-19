@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -100,9 +101,120 @@ func deployOperator(ctx context.Context, t *testing.T, c *e2e.Cluster, root, ima
 	}
 }
 
+// psql runs sql against host from inside the catalog-0 pod, authenticating
+// with the pgpass file the agent writes next to PGDATA.
 func psql(ctx context.Context, c *e2e.Cluster, host, sql string) (string, error) {
-	out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "exec", clusterName+"-catalog-0", "--", "psql", "-h", host, "-U", "postgres", "-d", "postgres", "-tAc", sql)
+	out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "exec", clusterName+"-catalog-0", "--", "env", "PGPASSFILE=/var/lib/postgresql/data/.pgshard-pgpass", "PGCONNECT_TIMEOUT=5",
+		"psql", "-h", host, "-U", "postgres", "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-tAc", sql)
 	return strings.TrimSpace(out), err
+}
+
+// writer inserts sequential ids through the shard -rw Service and keeps
+// every acknowledged id plus the window in which writes failed.
+type writer struct {
+	c    *e2e.Cluster
+	rw   string
+	stop chan struct{}
+	done chan struct{}
+
+	mu         sync.Mutex
+	acked      []int64
+	failures   int
+	firstFail  time.Time
+	lastFail   time.Time
+	lastAckAt  time.Time
+	firstAckAf time.Time
+}
+
+func startWriter(ctx context.Context, c *e2e.Cluster, rw string, start int64) *writer {
+	w := &writer{c: c, rw: rw, stop: make(chan struct{}), done: make(chan struct{})}
+	go func() {
+		defer close(w.done)
+		id := start
+		for {
+			select {
+			case <-w.stop:
+				return
+			case <-ctx.Done():
+				return
+			default:
+			}
+			id++
+			out, err := psql(ctx, c, rw, fmt.Sprintf("INSERT INTO ha_writes (id) VALUES (%d)", id))
+			w.mu.Lock()
+			if err == nil && strings.Contains(out, "INSERT 0 1") {
+				w.acked = append(w.acked, id)
+				w.lastAckAt = time.Now()
+				if !w.firstFail.IsZero() && w.firstAckAf.IsZero() {
+					w.firstAckAf = time.Now()
+				}
+			} else {
+				w.failures++
+				if w.firstFail.IsZero() {
+					w.firstFail = time.Now()
+				}
+				w.lastFail = time.Now()
+			}
+			w.mu.Unlock()
+		}
+	}()
+	return w
+}
+
+func (w *writer) finish() ([]int64, int, time.Duration) {
+	close(w.stop)
+	<-w.done
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var pause time.Duration
+	if !w.firstFail.IsZero() {
+		end := w.lastFail
+		if !w.firstAckAf.IsZero() {
+			end = w.firstAckAf
+		}
+		pause = end.Sub(w.firstFail)
+	}
+	return append([]int64(nil), w.acked...), w.failures, pause
+}
+
+func waitFor(ctx context.Context, t *testing.T, what string, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if cond() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+func assertAllAcked(ctx context.Context, t *testing.T, c *e2e.Cluster, rw string, acked []int64) {
+	t.Helper()
+	out, err := psql(ctx, c, rw, "SELECT string_agg(id::text, ',' ORDER BY id) FROM ha_writes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	present := map[string]bool{}
+	for _, id := range strings.Split(out, ",") {
+		present[id] = true
+	}
+	var missing []int64
+	for _, id := range acked {
+		if !present[strconv.FormatInt(id, 10)] {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) > 0 {
+		t.Fatalf("%d acknowledged commits lost: %v", len(missing), missing)
+	}
+	t.Logf("%d acknowledged commits, all present after the role change", len(acked))
 }
 
 func waitCondition(ctx context.Context, c *e2e.Cluster, cond string, timeout time.Duration) error {
@@ -254,6 +366,143 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 		if _, err := strconv.Atoi(numSync.FindStringSubmatch(before)[1]); err != nil {
 			t.Fatal(err)
 		}
+	})
+
+	group := clusterName + "-shard-0"
+	rw := group + "-rw"
+	epochOf := func() int64 {
+		v := jsonpath(ctx, t, c, "pgshardgroup", group, "{.status.epoch}")
+		if v == "" {
+			return 0
+		}
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	primaryOf := func() string { return jsonpath(ctx, t, c, "pgshardgroup", group, "{.status.primary}") }
+	primaryPods := func() int {
+		return count(ctx, t, c, "pods", "pgshard.io/cluster="+clusterName+",pgshard.io/group=shard-0,pgshard.io/role=primary")
+	}
+	assertAgentPID1 := func(pod string) {
+		t.Helper()
+		if got := jsonpath(ctx, t, c, "pod", pod, "{.spec.containers[0].command[0]} {.spec.containers[0].readinessProbe.httpGet.path} {.spec.containers[0].startupProbe.httpGet.path} {.spec.containers[0].livenessProbe.httpGet.path}"); got != "pgshard-agent /readyz /startz /livez" {
+			t.Fatalf("pod %s must run the agent as PID 1 with HTTP probes, got %q", pod, got)
+		}
+	}
+	assertAgentPID1(group + "-0")
+	if _, err := psql(ctx, c, rw, "CREATE TABLE IF NOT EXISTS ha_writes (id bigint PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	var lastID int64
+
+	t.Run("PrimaryPodDeletionFailsOverWithoutLosingAcknowledgedCommits", func(t *testing.T) {
+		oldPrimary := primaryOf()
+		oldEpoch := epochOf()
+		if oldPrimary != group+"-0" || oldEpoch != 0 {
+			t.Fatalf("precondition: primary=%s epoch=%d", oldPrimary, oldEpoch)
+		}
+		w := startWriter(ctx, c, rw, lastID)
+		time.Sleep(5 * time.Second)
+		if _, err := c.Kubectl(ctx, nil, "-n", testNamespace, "delete", "pod", oldPrimary, "--wait=false"); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(ctx, t, "promotion of a standby", 4*time.Minute, func() bool {
+			return primaryOf() != oldPrimary && epochOf() == oldEpoch+1
+		})
+		newPrimary := primaryOf()
+		t.Logf("failover: %s -> %s at epoch %d", oldPrimary, newPrimary, epochOf())
+		waitFor(ctx, t, "writes to resume on the new primary", 3*time.Minute, func() bool {
+			out, err := psql(ctx, c, rw, "SELECT pg_is_in_recovery()")
+			return err == nil && out == "f"
+		})
+		time.Sleep(5 * time.Second)
+		acked, failures, pause := w.finish()
+		t.Logf("writer: %d acknowledged, %d failed, unavailability window %s", len(acked), failures, pause)
+		if len(acked) > 0 {
+			lastID = acked[len(acked)-1]
+		}
+		if len(acked) == 0 {
+			t.Fatal("writer acknowledged nothing")
+		}
+		if got := epochOf(); got != oldEpoch+1 {
+			t.Fatalf("epoch must increase by exactly one, got %d", got)
+		}
+		if err := waitCondition(ctx, c, "Ready", 8*time.Minute); err != nil {
+			gatherNamespace(ctx, c)
+			t.Fatal(err)
+		}
+		if n := primaryPods(); n != 1 {
+			t.Fatalf("exactly one pod may carry role=primary, got %d", n)
+		}
+		if got := jsonpath(ctx, t, c, "pod", newPrimary, "{.metadata.labels.pgshard\\.io/role}"); got != "primary" {
+			t.Fatalf("new primary pod label %q", got)
+		}
+		if got := jsonpath(ctx, t, c, "lease", group+"-primary", "{.spec.holderIdentity} {.metadata.annotations.pgshard\\.io/primary-epoch}"); got != newPrimary+" 1" {
+			t.Fatalf("lease must be held by the new primary with the epoch published, got %q", got)
+		}
+		assertAllAcked(ctx, t, c, rw, acked)
+		if out, err := psql(ctx, c, clusterName+"-catalog-rw", "SELECT primary_epoch, primary_endpoint FROM pgshard.shard_status WHERE shard_set = 'default' AND shard_id = 0"); err != nil || !strings.HasPrefix(out, "1|"+newPrimary+".") {
+			t.Fatalf("catalog shard_status fence: %q %v", out, err)
+		}
+		waitFor(ctx, t, "old primary to rejoin as a streaming standby", 5*time.Minute, func() bool {
+			out, err := psql(ctx, c, rw, "SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming' AND application_name = '"+oldPrimary+"'")
+			return err == nil && out == "1"
+		})
+		if got := jsonpath(ctx, t, c, "pod", oldPrimary, "{.metadata.labels.pgshard\\.io/role}"); got != "replica" {
+			t.Fatalf("old primary must be relabelled replica once it streams, got %q", got)
+		}
+		assertAgentPID1(oldPrimary)
+		if out, err := psql(ctx, c, rw, "SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming'"); err != nil || out != "2" {
+			t.Fatalf("streaming replicas after failover: %q %v", out, err)
+		}
+	})
+
+	t.Run("SwitchoverAnnotationPromotesTargetWithZeroLostCommits", func(t *testing.T) {
+		oldPrimary := primaryOf()
+		oldEpoch := epochOf()
+		target := group + "-0"
+		if oldPrimary == target {
+			target = group + "-1"
+		}
+		w := startWriter(ctx, c, rw, lastID)
+		time.Sleep(5 * time.Second)
+		started := time.Now()
+		if _, err := c.Kubectl(ctx, nil, "-n", testNamespace, "annotate", "pgshardcluster", clusterName, "pgshard.io/switchover="+target); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(ctx, t, "switchover to "+target, 4*time.Minute, func() bool {
+			return primaryOf() == target && epochOf() == oldEpoch+1
+		})
+		waitFor(ctx, t, "writes to resume on the target", 3*time.Minute, func() bool {
+			out, err := psql(ctx, c, rw, "SELECT pg_is_in_recovery()")
+			return err == nil && out == "f"
+		})
+		time.Sleep(5 * time.Second)
+		acked, failures, pause := w.finish()
+		t.Logf("switchover %s -> %s took %s from annotation to promotion; writer: %d acknowledged, %d failed, unavailability window %s", oldPrimary, target, time.Since(started).Round(time.Second), len(acked), failures, pause)
+		if len(acked) > 0 {
+			lastID = acked[len(acked)-1]
+		}
+		if failures > 0 && pause > 90*time.Second {
+			t.Fatalf("write failures must be confined to a short pause, got %s", pause)
+		}
+		if got := jsonpath(ctx, t, c, "pgshardcluster", clusterName, "{.metadata.annotations.pgshard\\.io/switchover}"); got != "" {
+			t.Fatalf("switchover annotation must be cleared, got %q", got)
+		}
+		if err := waitCondition(ctx, c, "Ready", 8*time.Minute); err != nil {
+			gatherNamespace(ctx, c)
+			t.Fatal(err)
+		}
+		if n := primaryPods(); n != 1 {
+			t.Fatalf("exactly one pod may carry role=primary, got %d", n)
+		}
+		assertAllAcked(ctx, t, c, rw, acked)
+		waitFor(ctx, t, "old primary to rejoin as a streaming standby", 5*time.Minute, func() bool {
+			out, err := psql(ctx, c, rw, "SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming' AND application_name = '"+oldPrimary+"'")
+			return err == nil && out == "1"
+		})
 	})
 }
 

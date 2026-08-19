@@ -25,13 +25,16 @@ func TestSyncStandbyNamesOrdersStreamingFirst(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := SyncStandbyNames(g, tc.numSync, tc.streaming); got != tc.want {
+			if got := SyncStandbyNames(g, "c-catalog-0", tc.numSync, tc.streaming); got != tc.want {
 				t.Fatalf("got %q want %q", got, tc.want)
 			}
 		})
 	}
-	if got := SyncStandbyNames(Group{Cluster: "c", Kind: "catalog", Replicas: 1}, 1, nil); got != "" {
+	if got := SyncStandbyNames(Group{Cluster: "c", Kind: "catalog", Replicas: 1}, "c-catalog-0", 1, nil); got != "" {
 		t.Fatalf("single member group must have no sync standbys, got %q", got)
+	}
+	if got := SyncStandbyNames(g, "c-catalog-2", 1, nil); got != `ANY 1 ("c-catalog-0", "c-catalog-1", "c-catalog-3")` {
+		t.Fatalf("after failover the old primary must be listed and the new one excluded, got %q", got)
 	}
 }
 

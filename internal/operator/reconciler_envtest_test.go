@@ -13,6 +13,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -60,6 +61,111 @@ type fakeProber struct {
 	syncNames map[string]string
 	setCalls  []string
 	migrated  int
+	// standbys is keyed by pod IP; missing IPs are unreachable.
+	standbys map[string]StandbyState
+	// published records shard_status upserts as "shard-<id>:<epoch>:<endpoint>".
+	published []string
+	// slots records EnsureSlots calls as "<dsn host>:<want>:-<drop>".
+	slots []string
+	// journal records fence writes and promotions in order.
+	journal *[]string
+}
+
+func (f *fakeProber) ProbeStandby(_ context.Context, dsn string) (StandbyState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for ip, st := range f.standbys {
+		if strings.Contains(dsn, "@"+ip+":") {
+			return st, nil
+		}
+	}
+	return StandbyState{}, errors.New("unreachable")
+}
+
+func (f *fakeProber) PublishShardStatus(_ context.Context, _ string, shardID int, _ string, epoch int64, endpoint string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.published = append(f.published, fmt.Sprintf("shard-%d:%d:%s", shardID, epoch, endpoint))
+	if f.journal != nil {
+		*f.journal = append(*f.journal, fmt.Sprintf("publish:%d", epoch))
+	}
+	return nil
+}
+
+func (f *fakeProber) EnsureSlots(_ context.Context, dsn string, want []string, drop string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.slots = append(f.slots, fmt.Sprintf("%s:%s:-%s", dsn[strings.Index(dsn, "@")+1:], strings.Join(want, ","), drop))
+	return nil
+}
+
+type fakeAgents struct {
+	mu       sync.Mutex
+	status   map[string]AgentStatus
+	errs     map[string]error
+	promotes []string
+	demotes  []string
+	journal  *[]string
+}
+
+func newFakeAgents(journal *[]string) *fakeAgents {
+	return &fakeAgents{status: map[string]AgentStatus{}, errs: map[string]error{}, journal: journal}
+}
+
+func (f *fakeAgents) set(ip string, st AgentStatus, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.status[agentAddr(ip)] = st
+	if err != nil {
+		f.errs[agentAddr(ip)] = err
+	} else {
+		delete(f.errs, agentAddr(ip))
+	}
+}
+
+func (f *fakeAgents) Status(_ context.Context, addr string) (AgentStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.errs[addr]; err != nil {
+		return AgentStatus{}, err
+	}
+	st, ok := f.status[addr]
+	if !ok {
+		return AgentStatus{}, errors.New("unknown agent " + addr)
+	}
+	return st, nil
+}
+
+func (f *fakeAgents) Promote(_ context.Context, addr string, epoch uint64, holder string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.errs[addr]; err != nil {
+		return err
+	}
+	st := f.status[addr]
+	if epoch <= st.Epoch {
+		return fmt.Errorf("stale epoch %d <= %d", epoch, st.Epoch)
+	}
+	st.Epoch, st.Primary, st.Running = epoch, true, true
+	f.status[addr] = st
+	f.promotes = append(f.promotes, fmt.Sprintf("%s:%d:%s", addr, epoch, holder))
+	if f.journal != nil {
+		*f.journal = append(*f.journal, fmt.Sprintf("promote:%d", epoch))
+	}
+	return nil
+}
+
+func (f *fakeAgents) Demote(_ context.Context, addr string, epoch uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st := f.status[addr]
+	if epoch <= st.Epoch {
+		return fmt.Errorf("stale epoch %d <= %d", epoch, st.Epoch)
+	}
+	st.Epoch, st.Primary = epoch, false
+	f.status[addr] = st
+	f.demotes = append(f.demotes, fmt.Sprintf("%s:%d", addr, epoch))
+	return nil
 }
 
 func (f *fakeProber) Probe(_ context.Context, dsn string) (PrimaryState, error) {
@@ -114,6 +220,12 @@ func newCluster(name string) *pgshardv1alpha1.PgShardCluster {
 
 func setup(t *testing.T, name string) (*ClusterReconciler, *fakeProber, *pgshardv1alpha1.PgShardCluster) {
 	t.Helper()
+	r, fp, _, c := setupWithAgents(t, name)
+	return r, fp, c
+}
+
+func setupWithAgents(t *testing.T, name string) (*ClusterReconciler, *fakeProber, *fakeAgents, *pgshardv1alpha1.PgShardCluster) {
+	t.Helper()
 	requireEnvtest(t)
 	ctx := context.Background()
 	c := newCluster(name)
@@ -121,9 +233,11 @@ func setup(t *testing.T, name string) (*ClusterReconciler, *fakeProber, *pgshard
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = k8sClient.Delete(context.Background(), c) })
-	fp := &fakeProber{err: errors.New("dial: refused")}
-	r := &ClusterReconciler{Client: k8sClient, Renderer: Renderer{}, Prober: fp}
-	return r, fp, c
+	journal := &[]string{}
+	fp := &fakeProber{err: errors.New("dial: refused"), standbys: map[string]StandbyState{}, journal: journal}
+	fa := newFakeAgents(journal)
+	r := &ClusterReconciler{Client: k8sClient, Renderer: Renderer{}, Prober: fp, Agents: fa, FailoverDelay: time.Nanosecond, PollInterval: time.Millisecond, QuiesceTimeout: 200 * time.Millisecond}
+	return r, fp, fa, c
 }
 
 func reconcile(t *testing.T, r *ClusterReconciler, c *pgshardv1alpha1.PgShardCluster) ctrl.Result {
@@ -184,16 +298,17 @@ func TestReconcileGeneratesGroupObjects(t *testing.T) {
 		var cm corev1.ConfigMap
 		get(t, g.ConfigMapName(), &cm)
 		ownedBy(t, &cm, c)
-		for _, want := range []string{"wal_level = replica", "synchronous_commit = on", "ssl = off", "work_mem = '8MB'"} {
-			if !strings.Contains(cm.Data["pgshard.conf"], want) {
-				t.Errorf("pgshard.conf missing %q:\n%s", want, cm.Data["pgshard.conf"])
+		for i := 0; i < g.Replicas; i++ {
+			cfg := cm.Data[g.MemberName(i)+".json"]
+			wantRole := `"role": "standby"`
+			if i == 0 {
+				wantRole = `"role": "primary"`
 			}
-		}
-		if _, ok := cm.Data["pgshard.override.conf"]; !ok {
-			t.Error("override placeholder missing")
-		}
-		if !strings.Contains(cm.Data["bootstrap.sh"], "pg_basebackup") {
-			t.Error("bootstrap script missing")
+			for _, want := range []string{wantRole, `"member": "` + g.MemberName(i) + `"`, `"work_mem": "8MB"`, `"enabled": true`, `"namespace": "default"`, g.ServiceRW() + ".default.svc"} {
+				if !strings.Contains(cfg, want) {
+					t.Errorf("agent config for %s missing %q:\n%s", g.MemberName(i), want, cfg)
+				}
+			}
 		}
 		for _, svcName := range []string{g.ServiceRW(), g.ServiceRO(), g.ServiceHeadless()} {
 			var svc corev1.Service
@@ -236,8 +351,14 @@ func TestReconcileGeneratesGroupObjects(t *testing.T) {
 				t.Errorf("pod %s labels: %v", pod.Name, pod.Labels)
 			}
 			ctr := pod.Spec.Containers[0]
-			if ctr.Image != "ghcr.io/andrew01234567890/pgshard-postgres:18" || strings.Join(ctr.Command, " ") != "bash /etc/pgshard/bootstrap.sh" {
-				t.Errorf("pod %s container: image=%s command=%v", pod.Name, ctr.Image, ctr.Command)
+			if ctr.Image != "ghcr.io/andrew01234567890/pgshard-postgres:18" || strings.Join(ctr.Command, " ") != "pgshard-agent" || strings.Join(ctr.Args, " ") != "run --config /etc/pgshard/"+pod.Name+".json" {
+				t.Errorf("pod %s container: image=%s command=%v args=%v", pod.Name, ctr.Image, ctr.Command, ctr.Args)
+			}
+			if ctr.ReadinessProbe.HTTPGet == nil || ctr.ReadinessProbe.HTTPGet.Path != "/readyz" || ctr.StartupProbe.HTTPGet.Path != "/startz" || ctr.LivenessProbe.HTTPGet.Path != "/livez" {
+				t.Errorf("pod %s probes must hit the agent endpoints: %+v", pod.Name, ctr)
+			}
+			if pod.Spec.ServiceAccountName != MemberServiceAccount(c.Name) {
+				t.Errorf("pod %s service account %q", pod.Name, pod.Spec.ServiceAccountName)
 			}
 			if pod.Spec.Volumes[0].PersistentVolumeClaim.ClaimName != pod.Name {
 				t.Errorf("pod %s must mount its own PVC: %+v", pod.Name, pod.Spec.Volumes[0])
@@ -250,11 +371,22 @@ func TestReconcileGeneratesGroupObjects(t *testing.T) {
 			}
 		}
 	}
-	if cond := condition(t, "gen", pgshardv1alpha1.ConditionReady); cond.Status != metav1.ConditionFalse || !strings.Contains(cond.Message, "dial: refused") {
+	if cond := condition(t, "gen", pgshardv1alpha1.ConditionReady); cond.Status != metav1.ConditionFalse || !strings.Contains(cond.Message, "primary unhealthy: pod has no IP yet") {
 		t.Errorf("Ready must be False with the probe error while pods are not running: %+v", cond)
 	}
 	if cond := condition(t, "gen", ConditionCatalogReady); cond.Status != metav1.ConditionFalse {
 		t.Errorf("CatalogReady must be False: %+v", cond)
+	}
+	var role rbacv1.Role
+	get(t, MemberServiceAccount("gen"), &role)
+	ownedBy(t, &role, c)
+	if len(role.Rules) != 2 || role.Rules[0].Resources[0] != "leases" {
+		t.Errorf("member role rules: %+v", role.Rules)
+	}
+	var rb rbacv1.RoleBinding
+	get(t, MemberServiceAccount("gen"), &rb)
+	if rb.RoleRef.Name != role.Name || rb.Subjects[0].Name != MemberServiceAccount("gen") {
+		t.Errorf("member role binding: %+v", rb)
 	}
 }
 
@@ -272,18 +404,30 @@ func TestReplicaPDBOmittedBelowThreeMembers(t *testing.T) {
 	}
 }
 
+// podIP is the deterministic fake IP of member i of group index gi.
+func podIP(gi, i int) string { return fmt.Sprintf("10.%d.0.%d", gi+1, i+1) }
+
+func markPodRunning(t *testing.T, name, ip string, ready bool) {
+	t.Helper()
+	var pod corev1.Pod
+	get(t, name, &pod)
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.PodIP = ip
+	st := corev1.ConditionFalse
+	if ready {
+		st = corev1.ConditionTrue
+	}
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: st}}
+	if err := k8sClient.Status().Update(context.Background(), &pod); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func markPodsRunning(t *testing.T, c *pgshardv1alpha1.PgShardCluster) {
 	t.Helper()
-	ctx := context.Background()
-	for _, g := range Groups(c) {
+	for gi, g := range Groups(c) {
 		for i := 0; i < g.Replicas; i++ {
-			var pod corev1.Pod
-			get(t, g.MemberName(i), &pod)
-			pod.Status.Phase = corev1.PodRunning
-			pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
-			if err := k8sClient.Status().Update(ctx, &pod); err != nil {
-				t.Fatal(err)
-			}
+			markPodRunning(t, g.MemberName(i), podIP(gi, i), true)
 		}
 	}
 }
@@ -354,13 +498,15 @@ func TestReadinessRequiresProbeAndStreaming(t *testing.T) {
 		t.Errorf("PrimaryHealthy must be False: %+v", cond)
 	}
 	get(t, "ready-shard-0", &pg)
-	if pg.Status.Primary != "" {
-		t.Errorf("group primary must be cleared while the probe fails: %+v", pg.Status)
+	if pg.Status.Primary != "ready-shard-0-0" || !pg.Status.Members[1].Ready || pg.Status.Members[2].Ready {
+		t.Errorf("designated primary and the last-known sync set (member 1 only) must survive a failed probe: %+v", pg.Status)
 	}
 }
 
 func TestSyncStandbyNamesAppliedHealthyFirst(t *testing.T) {
 	r, fp, c := setup(t, "sync")
+	reconcile(t, r, c)
+	markPodsRunning(t, c)
 	fp.err = nil
 	fp.streaming = map[string]bool{"sync-catalog-2": true}
 	reconcile(t, r, c)

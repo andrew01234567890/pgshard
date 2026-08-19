@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func newTestInstance(t *testing.T) *Instance {
@@ -27,6 +28,7 @@ func newTestInstance(t *testing.T) *Instance {
 	in := NewInstance(c, sup, ep, log)
 	in.startFn = func(context.Context) error { return nil }
 	in.slotFn = func(context.Context, string) error { return nil }
+	in.waitSourceFn = func(context.Context, string) error { return nil }
 	return in
 }
 
@@ -102,5 +104,77 @@ func TestBootstrapNoopOnExistingClusterRendersConfig(t *testing.T) {
 	pgpass, err := os.ReadFile(in.pgpassPath())
 	if err != nil || string(pgpass) != "*:*:*:postgres:secret\n" {
 		t.Fatalf("pgpass=%q err=%v", pgpass, err)
+	}
+}
+
+func TestBootstrapRejoinsFormerPrimaryAsStandby(t *testing.T) {
+	in := newTestInstance(t)
+	in.cfg.Role = RoleStandby
+	_ = os.WriteFile(filepath.Join(in.cfg.PGData, "PG_VERSION"), []byte("18\n"), 0o600)
+	var rewound, waited string
+	in.waitSourceFn = func(_ context.Context, src string) error {
+		if rewound != "" {
+			t.Fatal("must wait for the source before rewinding")
+		}
+		waited = src
+		return nil
+	}
+	in.rewindFn = func(_ context.Context, src string) error { rewound = src; return nil }
+	in.recloneFn = func(context.Context) error { t.Fatal("reclone must not run when rewind succeeds"); return nil }
+	if err := in.Bootstrap(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if rewound != in.cfg.PrimaryConninfo || waited != rewound {
+		t.Fatalf("rewound against %q waited %q", rewound, waited)
+	}
+	if !in.IsStandby() {
+		t.Fatal("standby.signal missing after rejoin")
+	}
+	if entries, _ := os.ReadDir(filepath.Join(in.cfg.PGData, "pg_replslot")); len(entries) != 0 {
+		t.Fatalf("stale slots not dropped: %v", entries)
+	}
+	pg, _ := os.ReadFile(filepath.Join(in.cfg.PGData, postgresqlConf))
+	if string(pg) != RenderPostgresqlConf(in.cfg, true) {
+		t.Fatal("standby config not rendered")
+	}
+}
+
+func TestBootstrapKeepsExistingPrimaryWhenRolePrimary(t *testing.T) {
+	in := newTestInstance(t)
+	in.cfg.Role = RolePrimary
+	_ = os.WriteFile(filepath.Join(in.cfg.PGData, "PG_VERSION"), []byte("18\n"), 0o600)
+	in.rewindFn = func(context.Context, string) error { t.Fatal("rewind must not run"); return nil }
+	if err := in.Bootstrap(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if in.IsStandby() {
+		t.Fatal("primary must stay a primary")
+	}
+}
+
+func TestBootstrapRetriesCloneUntilPrimaryAnswers(t *testing.T) {
+	in := newTestInstance(t)
+	in.cfg.Role = RoleStandby
+	in.cloneRetry = time.Millisecond
+	attempts := 0
+	in.recloneFn = func(context.Context) error {
+		attempts++
+		if attempts < 3 {
+			return errors.New("connection refused")
+		}
+		return os.WriteFile(filepath.Join(in.cfg.PGData, standbySignal), nil, 0o600)
+	}
+	if err := in.Bootstrap(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts=%d", attempts)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	in.recloneFn = func(context.Context) error { return errors.New("still refused") }
+	_ = os.Remove(filepath.Join(in.cfg.PGData, "PG_VERSION"))
+	if err := in.Bootstrap(ctx); err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled bootstrap must stop retrying: %v", err)
 	}
 }

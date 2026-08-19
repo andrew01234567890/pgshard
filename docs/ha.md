@@ -1,0 +1,125 @@
+# High availability: failover and switchover
+
+Every replication group (the catalog and each shard) is a set of pods whose
+PID 1 is `pgshard-agent`. The operator is the single decision maker: it
+watches health, picks the candidate, publishes the fence and asks the agent to
+promote. Agents refuse anything that is not properly fenced.
+
+## Members
+
+The PostgreSQL image ships the agent (`ENTRYPOINT ["pgshard-agent"]`,
+`CMD ["run", "--config", "/etc/pgshard/agent.json"]`). The operator renders one
+JSON config per member into the group ConfigMap (`<member>.json`) and runs
+`pgshard-agent run --config /etc/pgshard/<member>.json`:
+
+| Field | Value |
+|---|---|
+| `role` | `primary` for the designated primary, `standby` otherwise |
+| `primaryConninfo` | `host=<cluster>-<group>-rw.<ns>.svc port=5432 user=postgres` (clone, rewind and streaming source) |
+| `peerFailsafeURLs` | every other member's `http://<member>.<group>-peers.<ns>.svc:8080/failsafe` |
+| `lease` | `{enabled: true, namespace: <ns>}`; the Lease is `<cluster>-<group>-primary` |
+| `postgres.synchronousStandbyNames` | initial value; the operator maintains it afterwards |
+| `postgres.parameters` | `spec.postgresql.parameters`; agent-owned settings win |
+| `shutdownTimeout` | `5s` (smart shutdown bound before fast) |
+| `passwordFile` | `/etc/pgshard-secret/password` from the superuser Secret |
+
+Probes: startup `/startz`, readiness `/readyz`, liveness `/livez` on the agent
+HTTP port 8080; the agent gRPC (`pgshard.v1.Agent`) listens on 9090. Members run
+under the `<cluster>-member` ServiceAccount whose Role allows Lease
+get/create/update and Pod reads in the namespace.
+
+Agent bootstrap: an empty data directory is initialised (`initdb`) or cloned
+(`pg_basebackup` with a physical slot) according to `role`; an existing data
+directory that belongs to a former primary while `role` is `standby` is
+rewound against the `-rw` Service (falling back to a full reclone) and
+restarted as a standby, so a failed primary rejoins on its own once its pod
+comes back. A primary acquires its Lease before postgres starts and releases
+it after a clean shutdown; a standby never touches it.
+
+## State
+
+Per group, `PgShardGroup.status.primary` and `.status.epoch` are the designated
+primary and the fencing epoch (member 0 at epoch 0 for a new group). Pod labels
+`pgshard.io/role` = `primary` | `replica` | `unhealthy` drive the `-rw` and
+`-ro` Services; `unhealthy` is a fenced former primary that has not rejoined.
+`status.members[].ready` for standbys records whether they were streaming at
+the last healthy observation; it is preserved (not overwritten) while the primary
+cannot be probed and gates whether a failover may start at all.
+
+## Failover
+
+The primary is unhealthy when its pod is missing, or the pod is not Ready and
+`Agent.Status` fails or answers as a standby. After `DefaultFailoverDelay`
+(10s) of continuous unhealthiness the operator, inside one reconcile:
+
+1. relabels the old primary pod `role=unhealthy` (out of `-rw`) and **fences the
+   Lease**: holder `pgshard-operator`, annotations
+   `pgshard.io/primary-epoch` and `pgshard.io/primary` cleared. It refuses
+   (`ErrLeaseHeldByOther`) when the Lease is renewed by any identity other than
+   the old primary or the operator. A still-running old primary sees the
+   foreign holder on its next renewal and self-fences (fast shutdown, exit).
+2. waits (30s bound, 1s poll) until the old primary no longer answers
+   `Status` as a running primary and every other reachable member reports no
+   streaming WAL receiver; on timeout it proceeds only if the old primary is gone.
+3. picks the candidate: highest `pg_last_wal_receive_lsn()` among **all**
+   reachable in-recovery members — every non-primary member is in
+   `synchronous_standby_names`, so even a lagging or not-yet-Ready standby may
+   hold the only copy of an acknowledged commit; ties break by name. If a
+   listed standby is unreachable and the reachable ones cannot be proven to
+   hold every acknowledgement (`reachable + minSyncStandbys <= listed`), no
+   candidate is admissible: the fence is released and the primary pod is
+   recreated as primary (same PVC) — durability over availability.
+4. computes `epoch = max(group epoch, candidate agent epoch) + 1` and **writes
+   the fence first**: `pgshard.shard_status` (`primary_epoch`,
+   `primary_endpoint`, never lowered) for shard groups, then
+   `PgShardGroup.status`, then the Lease (holder handed to the candidate,
+   annotations set). The catalog group is fenced by its status and Lease only.
+5. `Agent.Promote{epoch, lease_holder}` on the candidate: the agent accepts only
+   a strictly greater epoch, takes the Lease (already its own), disconnects
+   its WAL receiver, runs `pg_ctl promote` and checkpoints.
+6. relabels the candidate `role=primary`, re-renders the ConfigMap so the old
+   primary's config says `standby`, and requeues.
+
+The next passes recreate the old primary pod as a `replica` (it rejoins via
+`pg_rewind`), create the other members' physical slots on the new primary
+(slots do not replicate; the primary's own inherited slot is dropped so it
+cannot pin WAL), recompute `synchronous_standby_names` around the new
+primary, and publish `pgshard.shard_status` again. Convergence rules run every pass:
+a designated primary answering as a standby is (re)promoted with an epoch
+above whatever it accepted; a non-designated member answering as a primary is
+labelled `unhealthy` and sent `Agent.Demote{group epoch}`.
+
+A missing primary pod is never recreated while a candidate may exist: a fresh
+pod would take the Lease back and no promotion would happen.
+
+## Switchover
+
+`kubectl annotate pgshardcluster <name> pgshard.io/switchover=<member>` moves
+the member's group. The target must have been a streaming standby at the last
+observation. The operator relabels the current primary `unhealthy`, deletes
+its pod (the agent shuts postgres down: smart for 5s, then fast, then releases
+the Lease) and runs the failover path with the target as the preferred
+candidate; it wins when it holds the maximum flushed LSN, otherwise the
+highest one does. The annotation is removed when the switchover finished (or
+was refused). Writes fail only between the shutdown and the promotion.
+
+## Invariants
+
+- The agent refuses `Promote`/`Demote` unless the epoch is strictly greater
+  than the last accepted one, and `Promote` unless it holds the Lease.
+- The operator never promotes while the Lease is renewed by another live
+  holder; it fences the Lease before choosing a candidate and hands it to the
+  candidate before `Promote`.
+- Epochs only increase; the catalog row and Lease annotation are written
+  before the promotion, so a router that reads `shard_status.primary_epoch`
+  sees the new epoch no later than the new primary.
+- Standbys' local epochs may lag the group epoch (only role changes bump them);
+  same-term RPCs to them must use their own epoch.
+
+## Not yet
+
+- Operator-to-agent gRPC is plaintext inside the cluster; mTLS is a later layer.
+- A postgres crash inside a running pod is a container restart, not a failover,
+  until the pod stops being Ready and `Status` fails for the failover delay.
+- `synchronous_standby_names` set via `ALTER SYSTEM` is dropped by an agent
+  `Reload`/`Promote` and re-applied by the operator on its next probe.

@@ -2,10 +2,10 @@ package operator
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/internal/agent"
 )
 
 // Labels applied to every object the operator manages.
@@ -18,6 +18,17 @@ const (
 
 	RolePrimary = "primary"
 	RoleReplica = "replica"
+	// RoleUnhealthy marks a member the operator has taken out of every
+	// Service: a fenced former primary that has not rejoined yet.
+	RoleUnhealthy = "unhealthy"
+
+	// AnnotationSwitchover on a PgShardCluster names the member to promote;
+	// the operator removes it once the switchover ran.
+	AnnotationSwitchover = "pgshard.io/switchover"
+	// AnnotationPrimaryEpoch and AnnotationPrimary on the group Lease publish
+	// the fence for readers that cannot reach the catalog.
+	AnnotationPrimaryEpoch = "pgshard.io/primary-epoch"
+	AnnotationPrimary      = "pgshard.io/primary"
 
 	// ConditionCatalogReady is set once the catalog schema migrations ran on
 	// the catalog primary.
@@ -27,8 +38,13 @@ const (
 	DefaultImageRepository = "ghcr.io/andrew01234567890/pgshard-postgres"
 
 	postgresPort  = 5432
+	agentHTTPPort = 8080
+	agentGRPCPort = 9090
 	superuserName = "postgres"
 	secretKey     = "password"
+	// shardSet is the shard map every shard group belongs to until databases
+	// can choose their own.
+	shardSet = "default"
 )
 
 // Group is one replication group derived from the cluster spec.
@@ -72,6 +88,38 @@ func (g Group) PDBPrimary() string { return g.Prefix() + "-primary" }
 // PDBReplicas names the replicas' PodDisruptionBudget.
 func (g Group) PDBReplicas() string { return g.Prefix() + "-replicas" }
 
+// SlotName is the physical replication slot member streams from, as the
+// agent derives it.
+func SlotName(member string) string { return (&agent.Config{Member: member}).SlotName() }
+
+// LeaseName names the Lease the group primary holds; it matches the agent's
+// <cluster>-<shard>-primary.
+func (g Group) LeaseName() string { return g.Prefix() + "-primary" }
+
+// MemberHost is the stable DNS name of a member through the headless Service.
+func (g Group) MemberHost(member, namespace string) string {
+	return fmt.Sprintf("%s.%s.%s.svc", member, g.ServiceHeadless(), namespace)
+}
+
+// MemberNames lists every member in ordinal order.
+func (g Group) MemberNames() []string {
+	out := make([]string, g.Replicas)
+	for i := range out {
+		out[i] = g.MemberName(i)
+	}
+	return out
+}
+
+// HasMember reports whether name is one of the group's members.
+func (g Group) HasMember(name string) bool {
+	for _, m := range g.MemberNames() {
+		if m == name {
+			return true
+		}
+	}
+	return false
+}
+
 // Labels returns the selector labels shared by the group's objects.
 func (g Group) Labels() map[string]string {
 	return map[string]string{
@@ -105,6 +153,10 @@ func Groups(c *pgshardv1alpha1.PgShardCluster) []Group {
 // SecretName is the Secret holding the superuser password.
 func SecretName(cluster string) string { return cluster + "-superuser" }
 
+// MemberServiceAccount names the ServiceAccount (and Role, RoleBinding) the
+// member agents run under.
+func MemberServiceAccount(cluster string) string { return cluster + "-member" }
+
 // Image returns the PostgreSQL image for the cluster.
 func Image(c *pgshardv1alpha1.PgShardCluster) string {
 	if c.Spec.PostgreSQL.Image != "" {
@@ -122,17 +174,18 @@ func ReplicaMinAvailable(replicas int) int {
 	return 0
 }
 
-// SyncStandbyNames renders synchronous_standby_names for a group: every
-// standby, streaming ones first, each list in ordinal order. numSync is
-// clamped to the number of standbys; zero means asynchronous replication.
-// An empty string means "no synchronous standbys".
-func SyncStandbyNames(g Group, numSync int, streaming map[string]bool) string {
+// SyncStandbyNames renders synchronous_standby_names for a group whose
+// primary is primary: every other member, streaming ones first, each list in
+// ordinal order. numSync is clamped to the number of standbys; zero means
+// asynchronous replication. An empty string means "no synchronous standbys".
+func SyncStandbyNames(g Group, primary string, numSync int, streaming map[string]bool) string {
 	var healthy, other []string
-	for i := 1; i < g.Replicas; i++ {
-		name := g.MemberName(i)
-		if streaming[name] {
+	for _, name := range g.MemberNames() {
+		switch {
+		case name == primary:
+		case streaming[name]:
 			healthy = append(healthy, name)
-		} else {
+		default:
 			other = append(other, name)
 		}
 	}
@@ -150,13 +203,4 @@ func SyncStandbyNames(g Group, numSync int, streaming map[string]bool) string {
 		quoted[i] = `"` + n + `"`
 	}
 	return fmt.Sprintf("ANY %d (%s)", numSync, strings.Join(quoted, ", "))
-}
-
-func sortedKeys(m map[string]string) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
 }
