@@ -40,6 +40,10 @@ type Backend struct {
 	broken   bool
 	// unflushed counts messages buffered in fe but not yet written.
 	unflushed int
+	// prepared names the statements this connection may hold; the set
+	// outlives the session that parsed them so a reused backend is never
+	// asked to PREPARE a name it already has.
+	prepared preparedSet
 }
 
 // dialBackend performs startup and SCRAM-SHA-256 with forwarded keys. It

@@ -54,6 +54,9 @@ type session struct {
 	role     string
 	reserved bool
 	attached bool
+	// detached is closed when the current Execute stream ends; Release
+	// waits on it when it arrives while the stream is still attached.
+	detached chan struct{}
 	// b is the backend currently held; nil when the session is between
 	// stateless batches.
 	b *Backend
@@ -127,6 +130,7 @@ func (s *Server) Execute(stream pgshardv1.Pooler_ExecuteServer) error {
 		return status.Error(codes.FailedPrecondition, "session already has an Execute stream")
 	}
 	se.attached = true
+	se.detached = make(chan struct{})
 	se.role = first.User.Username
 	se.database = s.cfg.Database
 	s.mu.Unlock()
@@ -156,14 +160,39 @@ func (s *Server) detach(se *session) {
 	if !keep {
 		se.b = nil
 	}
+	detached := se.detached
 	s.mu.Unlock()
-	if keep {
+	if !keep {
+		if b != nil {
+			s.recycle(b)
+		}
+		s.forget(se)
+	}
+	close(detached)
+}
+
+// recycle returns b to the pool clean: an open transaction is rolled back
+// and statements it still holds are discarded, so the next session finds
+// neither. A backend that cannot be cleaned is discarded.
+func (s *Server) recycle(b *Backend) {
+	if b.hasUnflushed() {
+		s.cfg.Pool.Discard(b)
 		return
 	}
-	if b != nil {
-		s.cfg.Pool.Release(b)
+	if !b.idle() {
+		if err := b.simpleQuery("ROLLBACK"); err != nil {
+			s.cfg.Pool.Discard(b)
+			return
+		}
 	}
-	s.forget(se)
+	if len(b.prepared) > 0 {
+		if err := b.simpleQuery("DISCARD ALL"); err != nil {
+			s.cfg.Pool.Discard(b)
+			return
+		}
+		b.prepared = nil
+	}
+	s.cfg.Pool.Release(b)
 }
 
 type relay struct {
@@ -171,6 +200,13 @@ type relay struct {
 	se     *session
 	stream pgshardv1.Pooler_ExecuteServer
 	ck, sk []byte
+	// closes queues, in order, what to do with each CloseComplete the
+	// backend will send for the current batch.
+	closes []closeAction
+	// parsed names the statements the current batch parsed; they become
+	// certain when the batch ends without an error.
+	parsed   []string
+	batchErr bool
 }
 
 func (r *relay) send(msg *pgshardv1.ExecuteResponse) error {
@@ -254,7 +290,7 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 		}
 		r.setBackend(b)
 	}
-	b.send(fm)
+	r.forward(b, fm)
 	if !flushesBackend(req) {
 		return nil
 	}
@@ -262,6 +298,59 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 		return r.backendLost(b, err)
 	}
 	return r.pump(b)
+}
+
+// forward buffers fm on b, keeping the backend's prepared-statement set in
+// step: a Parse of a name the backend certainly holds with the same SQL is
+// answered without reaching PostgreSQL, a name it may hold is closed first,
+// and a Close or a DEALLOCATE-like simple query leaves the name in doubt.
+func (r *relay) forward(b *Backend, fm pgproto3.FrontendMessage) {
+	switch m := fm.(type) {
+	case *pgproto3.Parse:
+		if m.Name == "" {
+			break
+		}
+		fp := statementFingerprint(m)
+		if b.prepared.holds(m.Name, fp) {
+			b.send(&pgproto3.Close{ObjectType: 'P', Name: noopPortal})
+			r.closes = append(r.closes, closeAsParse)
+			return
+		}
+		if b.prepared.mayHold(m.Name) {
+			b.send(&pgproto3.Close{ObjectType: 'S', Name: m.Name})
+			r.closes = append(r.closes, closeInjected)
+		}
+		if b.prepared == nil {
+			b.prepared = preparedSet{}
+		}
+		b.prepared[m.Name] = preparedState{fingerprint: fp}
+		r.parsed = append(r.parsed, m.Name)
+	case *pgproto3.Close:
+		if m.ObjectType == 'S' && m.Name != "" {
+			if _, ok := b.prepared[m.Name]; ok {
+				b.prepared[m.Name] = preparedState{}
+			}
+		}
+		r.closes = append(r.closes, closeForwarded)
+	case *pgproto3.Query:
+		if touchesPrepared(m.String) {
+			b.prepared.doubtAll()
+		}
+	}
+	b.send(fm)
+}
+
+// endBatch settles the batch's bookkeeping at ReadyForQuery.
+func (r *relay) endBatch(b *Backend) {
+	if !r.batchErr {
+		for _, name := range r.parsed {
+			if st, ok := b.prepared[name]; ok && st.fingerprint != "" {
+				st.certain = true
+				b.prepared[name] = st
+			}
+		}
+	}
+	r.closes, r.parsed, r.batchErr = r.closes[:0], r.parsed[:0], false
 }
 
 // pump forwards backend responses until the batch ends: ReadyForQuery, or a
@@ -272,6 +361,21 @@ func (r *relay) pump(b *Backend) error {
 		if err != nil {
 			return r.backendLost(b, err)
 		}
+		switch msg.(type) {
+		case *pgproto3.ErrorResponse:
+			r.batchErr = true
+		case *pgproto3.CloseComplete:
+			if len(r.closes) > 0 {
+				kind := r.closes[0]
+				r.closes = r.closes[1:]
+				switch kind {
+				case closeInjected:
+					continue
+				case closeAsParse:
+					msg = &pgproto3.ParseComplete{}
+				}
+			}
+		}
 		if resp := toResponse(msg); resp != nil {
 			if err := r.send(resp); err != nil {
 				return err
@@ -279,9 +383,10 @@ func (r *relay) pump(b *Backend) error {
 		}
 		switch msg.(type) {
 		case *pgproto3.ReadyForQuery:
+			r.endBatch(b)
 			if !r.reserved() && b.idle() {
 				r.setBackend(nil)
-				r.srv.cfg.Pool.Release(b)
+				r.srv.recycle(b)
 			}
 			return nil
 		case *pgproto3.CopyInResponse, *pgproto3.CopyBothResponse:
@@ -291,6 +396,7 @@ func (r *relay) pump(b *Backend) error {
 }
 
 func (r *relay) backendLost(b *Backend, cause error) error {
+	r.closes, r.parsed, r.batchErr = nil, nil, false
 	r.setBackend(nil)
 	r.srv.cfg.Pool.Discard(b)
 	r.srv.cfg.Logger.Warn("backend connection lost", "session", r.se.id, "err", cause)
@@ -322,15 +428,25 @@ func (s *Server) Reserve(_ context.Context, req *pgshardv1.ReserveRequest) (*pgs
 
 // Release unpins a reserved session: any open transaction is rolled back,
 // session state is discarded, and the backend returns to its pool.
-func (s *Server) Release(_ context.Context, req *pgshardv1.ReleaseRequest) (*pgshardv1.ReleaseResponse, error) {
+func (s *Server) Release(ctx context.Context, req *pgshardv1.ReleaseRequest) (*pgshardv1.ReleaseResponse, error) {
 	se := s.lookup(req.SessionId)
 	if se == nil {
 		return &pgshardv1.ReleaseResponse{}, nil
 	}
 	s.mu.Lock()
 	if se.attached {
+		// The router tore its stream down without waiting; the backend is
+		// recycled when that stream detaches, and the caller waits for it
+		// so a following Reserve never finds the old backend still held.
+		se.reserved = false
+		detached := se.detached
 		s.mu.Unlock()
-		return nil, status.Error(codes.FailedPrecondition, "session still has an Execute stream")
+		select {
+		case <-detached:
+			return &pgshardv1.ReleaseResponse{}, nil
+		case <-ctx.Done():
+			return nil, status.FromContextError(ctx.Err()).Err()
+		}
 	}
 	b := se.b
 	se.b, se.reserved = nil, false
@@ -353,6 +469,7 @@ func (s *Server) Release(_ context.Context, req *pgshardv1.ReleaseRequest) (*pgs
 		s.cfg.Pool.Discard(b)
 		return &pgshardv1.ReleaseResponse{}, nil
 	}
+	b.prepared = nil
 	s.cfg.Pool.Release(b)
 	return &pgshardv1.ReleaseResponse{}, nil
 }

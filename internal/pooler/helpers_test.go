@@ -50,12 +50,48 @@ func (f *fakePG) serve(conn net.Conn) {
 	defer func() { _ = conn.Close() }()
 	be := pgproto3.NewBackend(bufio.NewReader(conn), conn)
 	tx := byte('I')
+	prepared := map[string]bool{}
+	failed := false
 	for {
 		msg, err := be.Receive()
 		if err != nil {
 			return
 		}
 		switch m := msg.(type) {
+		case *pgproto3.Parse:
+			f.mu.Lock()
+			f.seen = append(f.seen, "PARSE "+m.Name+" "+m.Query)
+			f.mu.Unlock()
+			if failed {
+				continue
+			}
+			if m.Name != "" && prepared[m.Name] {
+				failed = true
+				be.Send(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "42P05", Message: "prepared statement \"" + m.Name + "\" already exists"})
+				continue
+			}
+			if strings.Contains(m.Query, "syntax error") {
+				failed = true
+				be.Send(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "42601", Message: "syntax error"})
+				continue
+			}
+			prepared[m.Name] = true
+			be.Send(&pgproto3.ParseComplete{})
+		case *pgproto3.Close:
+			f.mu.Lock()
+			f.seen = append(f.seen, "CLOSE "+string(m.ObjectType)+" "+m.Name)
+			f.mu.Unlock()
+			if failed {
+				continue
+			}
+			if m.ObjectType == 'S' {
+				delete(prepared, m.Name)
+			}
+			be.Send(&pgproto3.CloseComplete{})
+		case *pgproto3.Sync:
+			failed = false
+			be.Send(&pgproto3.ReadyForQuery{TxStatus: tx})
+			_ = be.Flush()
 		case *pgproto3.Query:
 			f.queries.Add(1)
 			f.mu.Lock()
@@ -63,6 +99,8 @@ func (f *fakePG) serve(conn net.Conn) {
 			f.mu.Unlock()
 			q := strings.ToUpper(strings.TrimSpace(m.String))
 			switch {
+			case q == "DISCARD ALL":
+				clear(prepared)
 			case q == "BEGIN":
 				tx = 'T'
 			case q == "COMMIT" || q == "ROLLBACK":
@@ -82,6 +120,20 @@ func (f *fakePG) serve(conn net.Conn) {
 		}
 	}
 }
+
+func (f *fakePG) count(prefix string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, q := range f.seen {
+		if strings.HasPrefix(q, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+func (f *fakePG) sawQueryFn(sql string) func() bool { return func() bool { return f.sawQuery(sql) } }
 
 func (f *fakePG) sawQuery(sql string) bool {
 	f.mu.Lock()
