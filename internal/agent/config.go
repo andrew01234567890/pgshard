@@ -63,6 +63,14 @@ type Config struct {
 	// Backup, when set, turns on WAL archiving to the pgBackRest repository
 	// and lets the primary take backups.
 	Backup *backup.Settings `json:"backup,omitempty"`
+	// Restore, on a primary with an empty data directory, bootstraps from
+	// the repository (Backup must be set) instead of initdb.
+	Restore *backup.RestoreOptions `json:"restore,omitempty"`
+	// RecloneFromRepo makes a member that must be rebuilt (a rejoin whose
+	// pg_rewind failed) restore from the repository instead of running
+	// pg_basebackup against the primary; the operator sets it once a
+	// completed backup exists.
+	RecloneFromRepo bool `json:"recloneFromRepo,omitempty"`
 
 	// path is where the config was loaded from; Refresh rereads it.
 	path string
@@ -156,6 +164,7 @@ func (c *Config) Refresh() error {
 	c.OverrideFile = fresh.OverrideFile
 	c.SettingsHash = fresh.SettingsHash
 	c.Backup = fresh.Backup
+	c.RecloneFromRepo = fresh.RecloneFromRepo
 	return nil
 }
 
@@ -237,6 +246,23 @@ func (c *Config) Validate() error {
 		if err := c.Backup.WithDefaults().Validate(); err != nil {
 			errs = append(errs, fmt.Errorf("backup: %w", err))
 		}
+	}
+	if c.Restore != nil {
+		if c.Backup == nil {
+			errs = append(errs, errors.New("restore requires backup (the repository settings)"))
+		}
+		if c.Restore.Stanza == "" {
+			errs = append(errs, errors.New("restore.stanza is required"))
+		}
+		if c.Restore.Type == backup.TargetStandby {
+			errs = append(errs, errors.New("restore.type standby is not a bootstrap target"))
+		}
+		if err := c.Restore.Validate(); err != nil {
+			errs = append(errs, fmt.Errorf("restore: %w", err))
+		}
+	}
+	if c.RecloneFromRepo && c.Backup == nil {
+		errs = append(errs, errors.New("recloneFromRepo requires backup"))
 	}
 	return errors.Join(errs...)
 }

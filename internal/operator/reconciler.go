@@ -119,6 +119,9 @@ type groupObservation struct {
 	tuningErr error
 	// rollout is the rolling step in flight or held, nil when idle.
 	rollout *pgshardv1alpha1.GroupRollout
+	// repoReady is true when the repository holds a completed backup, so
+	// members that must be rebuilt restore from it instead of the primary.
+	repoReady bool
 	// policy is the backup policy bound to the cluster, nil when none.
 	policy *pgshardv1alpha1.PgShardBackupPolicy
 }
@@ -156,13 +159,13 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
-	policy, backupCond, err := r.backupState(ctx, &cluster)
+	policy, repoReady, backupCond, err := r.backupState(ctx, &cluster)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	var observations []groupObservation
 	for _, g := range Groups(&cluster) {
-		obs, err := r.reconcileGroup(ctx, &cluster, g, password, policy)
+		obs, err := r.reconcileGroup(ctx, &cluster, g, password, policy, repoReady)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("group %s: %w", g.Name(), err)
 		}
@@ -305,8 +308,8 @@ func (r *ClusterReconciler) loadState(ctx context.Context, c *pgshardv1alpha1.Pg
 	return st, nil
 }
 
-func (r *ClusterReconciler) ensureConfigMap(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, primary string, tuning pgtune.Settings, pol *pgshardv1alpha1.PgShardBackupPolicy) error {
-	desired := r.Renderer.ConfigMap(c, g, primary, tuning, pol)
+func (r *ClusterReconciler) ensureConfigMap(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, primary string, tuning pgtune.Settings, pol *pgshardv1alpha1.PgShardBackupPolicy, repoReady bool) error {
+	desired := r.Renderer.ConfigMap(c, g, primary, tuning, pol, repoReady)
 	cm := &corev1.ConfigMap{ObjectMeta: desired.ObjectMeta}
 	return r.ensureOwned(ctx, c, cm, func() error {
 		cm.Labels = desired.Labels
@@ -315,8 +318,8 @@ func (r *ClusterReconciler) ensureConfigMap(ctx context.Context, c *pgshardv1alp
 	})
 }
 
-func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, password string, pol *pgshardv1alpha1.PgShardBackupPolicy) (groupObservation, error) {
-	obs := groupObservation{group: g, streaming: map[string]bool{}, replicasWant: g.Replicas - 1, policy: pol}
+func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, password string, pol *pgshardv1alpha1.PgShardBackupPolicy, repoReady bool) (groupObservation, error) {
+	obs := groupObservation{group: g, streaming: map[string]bool{}, replicasWant: g.Replicas - 1, policy: pol, repoReady: repoReady}
 
 	state, err := r.loadState(ctx, c, g)
 	if err != nil {
@@ -409,7 +412,7 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 			if err != nil {
 				return obs, err
 			}
-			if err := r.ensureConfigMap(ctx, c, g, state.primary, obs.tuning, obs.policy); err != nil {
+			if err := r.ensureConfigMap(ctx, c, g, state.primary, obs.tuning, obs.policy, obs.repoReady); err != nil {
 				return obs, err
 			}
 		}
@@ -481,7 +484,7 @@ func (r *ClusterReconciler) ensureSettings(ctx context.Context, c *pgshardv1alph
 			return err
 		}
 	}
-	return r.ensureConfigMap(ctx, c, g, obs.state.primary, obs.tuning, obs.policy)
+	return r.ensureConfigMap(ctx, c, g, obs.state.primary, obs.tuning, obs.policy, obs.repoReady)
 }
 
 func ordinalOf(g Group, member string) int {
@@ -551,7 +554,7 @@ func (r *ClusterReconciler) switchover(ctx context.Context, c *pgshardv1alpha1.P
 	if err != nil {
 		return obs, err
 	}
-	if err := r.ensureConfigMap(ctx, c, g, state.primary, obs.tuning, obs.policy); err != nil {
+	if err := r.ensureConfigMap(ctx, c, g, state.primary, obs.tuning, obs.policy, obs.repoReady); err != nil {
 		return obs, err
 	}
 	obs = r.finishGroup(ctx, c, g, obs, members)

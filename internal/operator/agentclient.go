@@ -19,6 +19,8 @@ type AgentStatus struct {
 	Epoch   uint64
 	// LSN is the write LSN on a primary, the replay LSN on a standby.
 	LSN uint64
+	// Timeline is the current timeline id.
+	Timeline uint32
 }
 
 // AgentClient drives member agents over pgshard.v1.Agent. addr is host:port
@@ -71,7 +73,7 @@ func (c GRPCAgentClient) Status(ctx context.Context, addr string) (AgentStatus, 
 	if err != nil {
 		return AgentStatus{}, err
 	}
-	st := AgentStatus{Running: resp.GetRunning(), Primary: resp.GetRole() == pgshardv1.StatusResponse_ROLE_PRIMARY, Epoch: resp.GetEpoch(), LSN: resp.GetLsn()}
+	st := AgentStatus{Running: resp.GetRunning(), Primary: resp.GetRole() == pgshardv1.StatusResponse_ROLE_PRIMARY, Epoch: resp.GetEpoch(), LSN: resp.GetLsn(), Timeline: resp.GetTimeline()}
 	if e := resp.GetError(); e != nil {
 		return st, errors.New(e.GetMessage())
 	}

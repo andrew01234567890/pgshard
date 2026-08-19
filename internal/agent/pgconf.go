@@ -24,7 +24,17 @@ const (
 // standby is true the recovery settings pointing at PrimaryConninfo are
 // included.
 func RenderPostgresqlConf(c *Config, standby bool) string {
-	set := ownedSettings(c, standby)
+	return renderPostgresqlConf(c, standby, false)
+}
+
+// RenderRecoveryConf renders postgresql.conf for the archive recovery that
+// follows a restore from c.Restore: WAL comes from the source stanza, the
+// recovery target settings are set, and nothing is archived until the
+// instance is a normal primary again.
+func RenderRecoveryConf(c *Config) string { return renderPostgresqlConf(c, false, true) }
+
+func renderPostgresqlConf(c *Config, standby, recovering bool) string {
+	set := ownedSettings(c, standby, recovering)
 	for k, v := range c.Postgres.Parameters {
 		if _, owned := set[k]; !owned {
 			set[k] = quote(v)
@@ -47,7 +57,10 @@ func RenderPostgresqlConf(c *Config, standby bool) string {
 // OwnedSettings lists the postgresql.conf names the agent fixes itself; a
 // value for one of them from any other source is ignored.
 func OwnedSettings() []string {
-	set := ownedSettings(&Config{TLS: TLSFiles{CertFile: "x", KeyFile: "x", CAFile: "x"}, Postgres: PostgresSettings{RestoreCommand: "x"}, Backup: &backup.Settings{}}, true)
+	set := ownedSettings(&Config{TLS: TLSFiles{CertFile: "x", KeyFile: "x", CAFile: "x"}, Postgres: PostgresSettings{RestoreCommand: "x"}, Backup: &backup.Settings{}}, true, false)
+	for _, k := range backup.RecoverySettingNames {
+		set[k] = ""
+	}
 	keys := make([]string, 0, len(set))
 	for k := range set {
 		keys = append(keys, k)
@@ -56,7 +69,7 @@ func OwnedSettings() []string {
 	return keys
 }
 
-func ownedSettings(c *Config, standby bool) map[string]string {
+func ownedSettings(c *Config, standby, recovering bool) map[string]string {
 	set := map[string]string{
 		"listen_addresses":               quote("*"),
 		"port":                           fmt.Sprint(c.Port),
@@ -98,6 +111,14 @@ func ownedSettings(c *Config, standby bool) map[string]string {
 	if standby {
 		set["primary_conninfo"] = quote(PrimaryConninfo(c))
 		set["primary_slot_name"] = quote(c.SlotName())
+	}
+	if recovering && c.Restore != nil && c.Backup != nil {
+		set["archive_mode"] = "off"
+		delete(set, "archive_command")
+		set["restore_command"] = quote(backup.RestoreCommandFor(*c.Backup, c.Restore.Stanza))
+		for k, v := range backup.RecoverySettings(*c.Restore) {
+			set[k] = quote(v)
+		}
 	}
 	return set
 }
@@ -152,9 +173,15 @@ func hostKeyword(h string) string {
 // WriteConfig writes postgresql.conf and pg_hba.conf into PGDATA and clears
 // any settings a clone tool left in postgresql.auto.conf so the rendered
 // file is authoritative.
-func WriteConfig(c *Config, standby bool) error {
+func WriteConfig(c *Config, standby bool) error { return writeConfig(c, standby, false) }
+
+// WriteRecoveryConfig writes the configuration for the recovery that follows
+// a restore from the repository.
+func WriteRecoveryConfig(c *Config) error { return writeConfig(c, false, true) }
+
+func writeConfig(c *Config, standby, recovering bool) error {
 	files := map[string]string{
-		postgresqlConf: RenderPostgresqlConf(c, standby),
+		postgresqlConf: renderPostgresqlConf(c, standby, recovering),
 		pgHBAConf:      RenderPgHBAConf(c),
 		autoConf:       "# Managed by pgshard-agent; runtime ALTER SYSTEM is not supported.\n",
 	}
@@ -171,7 +198,11 @@ func WriteConfig(c *Config, standby bool) error {
 		}
 	}
 	if c.Backup != nil {
-		if err := backup.WriteConfig(*c.Backup, c.PGData, c.Port); err != nil {
+		var extra []string
+		if c.Restore != nil && c.Restore.Stanza != c.Backup.Stanza {
+			extra = append(extra, c.Restore.Stanza)
+		}
+		if err := backup.WriteConfig(*c.Backup, c.PGData, c.Port, extra...); err != nil {
 			return fmt.Errorf("pgbackrest config: %w", err)
 		}
 	}

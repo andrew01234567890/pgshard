@@ -152,28 +152,29 @@ func backupToCluster(_ context.Context, obj client.Object) []ctrl.Request {
 }
 
 // backupState resolves the cluster's policy and derives its BackupHealthy
-// condition from the completed PgShardBackups.
-func (r *ClusterReconciler) backupState(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) (*pgshardv1alpha1.PgShardBackupPolicy, metav1.Condition, error) {
-	cond := metav1.Condition{Type: pgshardv1alpha1.ConditionBackupHealthy, Status: metav1.ConditionFalse, ObservedGeneration: c.Generation}
-	policy, err := findBackupPolicy(ctx, r.Client, c)
+// condition from the completed PgShardBackups. repoReady reports that the
+// repository holds a completed backup, so members may be rebuilt from it.
+func (r *ClusterReconciler) backupState(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) (policy *pgshardv1alpha1.PgShardBackupPolicy, repoReady bool, cond metav1.Condition, err error) {
+	cond = metav1.Condition{Type: pgshardv1alpha1.ConditionBackupHealthy, Status: metav1.ConditionFalse, ObservedGeneration: c.Generation}
+	policy, err = findBackupPolicy(ctx, r.Client, c)
 	switch {
 	case errors.Is(err, ErrBackupPolicyMissing):
 		cond.Reason, cond.Message = "PolicyMissing", err.Error()
-		return nil, cond, nil
+		return nil, false, cond, nil
 	case err != nil:
-		return nil, cond, err
+		return nil, false, cond, err
 	case policy == nil:
 		cond.Reason, cond.Message = "NoPolicy", "spec.backup.policyRef is empty; WAL is not archived"
-		return nil, cond, nil
+		return nil, false, cond, nil
 	}
 	backups, err := backupsOfCluster(ctx, r.Client, c.Namespace, c.Name)
 	if err != nil {
-		return nil, cond, err
+		return nil, false, cond, err
 	}
 	health := BackupHealth(r.now(), policy.Spec.Schedules, lastSuccessful(backups))
 	cond.Status, cond.Reason = health.Status, health.Reason
 	cond.Message = fmt.Sprintf("policy %s (%s): %s", policy.Name, policy.Spec.ObjectStore.Type, health.Message)
-	return policy, cond, nil
+	return policy, len(lastSuccessful(backups)) > 0, cond, nil
 }
 
 // backupsOfCluster lists the PgShardBackups naming the cluster.

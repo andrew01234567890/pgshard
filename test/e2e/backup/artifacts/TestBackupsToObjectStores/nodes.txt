@@ -1,0 +1,229 @@
+Name:               pgshard-e2e-control-plane
+Roles:              control-plane
+Labels:             beta.kubernetes.io/arch=amd64
+                    beta.kubernetes.io/os=linux
+                    kubernetes.io/arch=amd64
+                    kubernetes.io/hostname=pgshard-e2e-control-plane
+                    kubernetes.io/os=linux
+                    node-role.kubernetes.io/control-plane=
+                    node.kubernetes.io/exclude-from-external-load-balancers=
+Annotations:        node.alpha.kubernetes.io/ttl: 0
+                    volumes.kubernetes.io/controller-managed-attach-detach: true
+CreationTimestamp:  Wed, 19 Aug 2026 05:26:56 +0100
+Taints:             node-role.kubernetes.io/control-plane:NoSchedule
+Unschedulable:      false
+Lease:
+  HolderIdentity:  pgshard-e2e-control-plane
+  AcquireTime:     <unset>
+  RenewTime:       Wed, 19 Aug 2026 06:14:00 +0100
+Conditions:
+  Type             Status  LastHeartbeatTime                 LastTransitionTime                Reason                       Message
+  ----             ------  -----------------                 ------------------                ------                       -------
+  MemoryPressure   False   Wed, 19 Aug 2026 06:09:53 +0100   Wed, 19 Aug 2026 05:26:56 +0100   KubeletHasSufficientMemory   kubelet has sufficient memory available
+  DiskPressure     False   Wed, 19 Aug 2026 06:09:53 +0100   Wed, 19 Aug 2026 05:26:56 +0100   KubeletHasNoDiskPressure     kubelet has no disk pressure
+  PIDPressure      False   Wed, 19 Aug 2026 06:09:53 +0100   Wed, 19 Aug 2026 05:26:56 +0100   KubeletHasSufficientPID      kubelet has sufficient PID available
+  Ready            True    Wed, 19 Aug 2026 06:09:53 +0100   Wed, 19 Aug 2026 05:27:21 +0100   KubeletReady                 kubelet is posting ready status
+Addresses:
+  InternalIP:  172.18.0.4
+  Hostname:    pgshard-e2e-control-plane
+Capacity:
+  cpu:                32
+  ephemeral-storage:  1055762868Ki
+  hugepages-1Gi:      0
+  hugepages-2Mi:      0
+  memory:             16343164Ki
+  pods:               110
+Allocatable:
+  cpu:                32
+  ephemeral-storage:  1055762868Ki
+  hugepages-1Gi:      0
+  hugepages-2Mi:      0
+  memory:             16343164Ki
+  pods:               110
+System Info:
+  Machine ID:                 efc788453a3a481bbf5652874ed97f5c
+  System UUID:                efc788453a3a481bbf5652874ed97f5c
+  Boot ID:                    d9f98df8-d067-4318-a7c2-a4c896091f7d
+  Kernel Version:             6.6.87.2-microsoft-standard-WSL2
+  OS Image:                   Debian GNU/Linux 13 (trixie)
+  Operating System:           linux
+  Architecture:               amd64
+  Container Runtime Version:  containerd://2.3.1
+  Kubelet Version:            v1.36.1
+  Kube-Proxy Version:         
+PodCIDR:                      10.244.0.0/24
+PodCIDRs:                     10.244.0.0/24
+ProviderID:                   kind://docker/pgshard-e2e/pgshard-e2e-control-plane
+Non-terminated Pods:          (9 in total)
+  Namespace                   Name                                                 CPU Requests  CPU Limits  Memory Requests  Memory Limits  Age
+  ---------                   ----                                                 ------------  ----------  ---------------  -------------  ---
+  kube-system                 coredns-589f44dc88-6fnkw                             100m (0%)     0 (0%)      70Mi (0%)        170Mi (1%)     47m
+  kube-system                 coredns-589f44dc88-lqqf5                             100m (0%)     0 (0%)      70Mi (0%)        170Mi (1%)     47m
+  kube-system                 etcd-pgshard-e2e-control-plane                       100m (0%)     0 (0%)      100Mi (0%)       0 (0%)         47m
+  kube-system                 kindnet-47nr2                                        100m (0%)     100m (0%)   50Mi (0%)        50Mi (0%)      47m
+  kube-system                 kube-apiserver-pgshard-e2e-control-plane             250m (0%)     0 (0%)      0 (0%)           0 (0%)         47m
+  kube-system                 kube-controller-manager-pgshard-e2e-control-plane    200m (0%)     0 (0%)      0 (0%)           0 (0%)         47m
+  kube-system                 kube-proxy-m752m                                     0 (0%)        0 (0%)      0 (0%)           0 (0%)         47m
+  kube-system                 kube-scheduler-pgshard-e2e-control-plane             100m (0%)     0 (0%)      0 (0%)           0 (0%)         47m
+  local-path-storage          local-path-provisioner-855c7b7774-944mx              0 (0%)        0 (0%)      0 (0%)           0 (0%)         47m
+Allocated resources:
+  (Total limits may be over 100 percent, i.e., overcommitted.)
+  Resource           Requests    Limits
+  --------           --------    ------
+  cpu                950m (2%)   100m (0%)
+  memory             290Mi (1%)  390Mi (2%)
+  ephemeral-storage  0 (0%)      0 (0%)
+  hugepages-1Gi      0 (0%)      0 (0%)
+  hugepages-2Mi      0 (0%)      0 (0%)
+Events:
+  Type    Reason          Age   From             Message
+  ----    ------          ----  ----             -------
+  Normal  RegisteredNode  47m   node-controller  Node pgshard-e2e-control-plane event: Registered Node pgshard-e2e-control-plane in Controller
+
+
+Name:               pgshard-e2e-worker
+Roles:              <none>
+Labels:             beta.kubernetes.io/arch=amd64
+                    beta.kubernetes.io/os=linux
+                    kubernetes.io/arch=amd64
+                    kubernetes.io/hostname=pgshard-e2e-worker
+                    kubernetes.io/os=linux
+Annotations:        node.alpha.kubernetes.io/ttl: 0
+                    volumes.kubernetes.io/controller-managed-attach-detach: true
+CreationTimestamp:  Wed, 19 Aug 2026 05:27:12 +0100
+Taints:             <none>
+Unschedulable:      false
+Lease:
+  HolderIdentity:  pgshard-e2e-worker
+  AcquireTime:     <unset>
+  RenewTime:       Wed, 19 Aug 2026 06:14:06 +0100
+Conditions:
+  Type             Status  LastHeartbeatTime                 LastTransitionTime                Reason                       Message
+  ----             ------  -----------------                 ------------------                ------                       -------
+  MemoryPressure   False   Wed, 19 Aug 2026 06:12:31 +0100   Wed, 19 Aug 2026 05:27:12 +0100   KubeletHasSufficientMemory   kubelet has sufficient memory available
+  DiskPressure     False   Wed, 19 Aug 2026 06:12:31 +0100   Wed, 19 Aug 2026 05:27:12 +0100   KubeletHasNoDiskPressure     kubelet has no disk pressure
+  PIDPressure      False   Wed, 19 Aug 2026 06:12:31 +0100   Wed, 19 Aug 2026 05:27:12 +0100   KubeletHasSufficientPID      kubelet has sufficient PID available
+  Ready            True    Wed, 19 Aug 2026 06:12:31 +0100   Wed, 19 Aug 2026 05:27:27 +0100   KubeletReady                 kubelet is posting ready status
+Addresses:
+  InternalIP:  172.18.0.2
+  Hostname:    pgshard-e2e-worker
+Capacity:
+  cpu:                32
+  ephemeral-storage:  1055762868Ki
+  hugepages-1Gi:      0
+  hugepages-2Mi:      0
+  memory:             16343164Ki
+  pods:               110
+Allocatable:
+  cpu:                32
+  ephemeral-storage:  1055762868Ki
+  hugepages-1Gi:      0
+  hugepages-2Mi:      0
+  memory:             16343164Ki
+  pods:               110
+System Info:
+  Machine ID:                 3d52be6d0f9d47be894655c139387d1e
+  System UUID:                3d52be6d0f9d47be894655c139387d1e
+  Boot ID:                    d9f98df8-d067-4318-a7c2-a4c896091f7d
+  Kernel Version:             6.6.87.2-microsoft-standard-WSL2
+  OS Image:                   Debian GNU/Linux 13 (trixie)
+  Operating System:           linux
+  Architecture:               amd64
+  Container Runtime Version:  containerd://2.3.1
+  Kubelet Version:            v1.36.1
+  Kube-Proxy Version:         
+PodCIDR:                      10.244.2.0/24
+PodCIDRs:                     10.244.2.0/24
+ProviderID:                   kind://docker/pgshard-e2e/pgshard-e2e-worker
+Non-terminated Pods:          (2 in total)
+  Namespace                   Name                CPU Requests  CPU Limits  Memory Requests  Memory Limits  Age
+  ---------                   ----                ------------  ----------  ---------------  -------------  ---
+  kube-system                 kindnet-pp4xz       100m (0%)     100m (0%)   50Mi (0%)        50Mi (0%)      46m
+  kube-system                 kube-proxy-gzknt    0 (0%)        0 (0%)      0 (0%)           0 (0%)         46m
+Allocated resources:
+  (Total limits may be over 100 percent, i.e., overcommitted.)
+  Resource           Requests   Limits
+  --------           --------   ------
+  cpu                100m (0%)  100m (0%)
+  memory             50Mi (0%)  50Mi (0%)
+  ephemeral-storage  0 (0%)     0 (0%)
+  hugepages-1Gi      0 (0%)     0 (0%)
+  hugepages-2Mi      0 (0%)     0 (0%)
+Events:
+  Type    Reason          Age   From             Message
+  ----    ------          ----  ----             -------
+  Normal  RegisteredNode  46m   node-controller  Node pgshard-e2e-worker event: Registered Node pgshard-e2e-worker in Controller
+
+
+Name:               pgshard-e2e-worker2
+Roles:              <none>
+Labels:             beta.kubernetes.io/arch=amd64
+                    beta.kubernetes.io/os=linux
+                    kubernetes.io/arch=amd64
+                    kubernetes.io/hostname=pgshard-e2e-worker2
+                    kubernetes.io/os=linux
+Annotations:        node.alpha.kubernetes.io/ttl: 0
+                    volumes.kubernetes.io/controller-managed-attach-detach: true
+CreationTimestamp:  Wed, 19 Aug 2026 05:27:12 +0100
+Taints:             <none>
+Unschedulable:      false
+Lease:
+  HolderIdentity:  pgshard-e2e-worker2
+  AcquireTime:     <unset>
+  RenewTime:       Wed, 19 Aug 2026 06:14:08 +0100
+Conditions:
+  Type             Status  LastHeartbeatTime                 LastTransitionTime                Reason                       Message
+  ----             ------  -----------------                 ------------------                ------                       -------
+  MemoryPressure   False   Wed, 19 Aug 2026 06:12:09 +0100   Wed, 19 Aug 2026 05:27:12 +0100   KubeletHasSufficientMemory   kubelet has sufficient memory available
+  DiskPressure     False   Wed, 19 Aug 2026 06:12:09 +0100   Wed, 19 Aug 2026 05:27:12 +0100   KubeletHasNoDiskPressure     kubelet has no disk pressure
+  PIDPressure      False   Wed, 19 Aug 2026 06:12:09 +0100   Wed, 19 Aug 2026 05:27:12 +0100   KubeletHasSufficientPID      kubelet has sufficient PID available
+  Ready            True    Wed, 19 Aug 2026 06:12:09 +0100   Wed, 19 Aug 2026 05:27:27 +0100   KubeletReady                 kubelet is posting ready status
+Addresses:
+  InternalIP:  172.18.0.3
+  Hostname:    pgshard-e2e-worker2
+Capacity:
+  cpu:                32
+  ephemeral-storage:  1055762868Ki
+  hugepages-1Gi:      0
+  hugepages-2Mi:      0
+  memory:             16343164Ki
+  pods:               110
+Allocatable:
+  cpu:                32
+  ephemeral-storage:  1055762868Ki
+  hugepages-1Gi:      0
+  hugepages-2Mi:      0
+  memory:             16343164Ki
+  pods:               110
+System Info:
+  Machine ID:                 97ee70ff957b413aa1d53b67d4cd41f8
+  System UUID:                97ee70ff957b413aa1d53b67d4cd41f8
+  Boot ID:                    d9f98df8-d067-4318-a7c2-a4c896091f7d
+  Kernel Version:             6.6.87.2-microsoft-standard-WSL2
+  OS Image:                   Debian GNU/Linux 13 (trixie)
+  Operating System:           linux
+  Architecture:               amd64
+  Container Runtime Version:  containerd://2.3.1
+  Kubelet Version:            v1.36.1
+  Kube-Proxy Version:         
+PodCIDR:                      10.244.1.0/24
+PodCIDRs:                     10.244.1.0/24
+ProviderID:                   kind://docker/pgshard-e2e/pgshard-e2e-worker2
+Non-terminated Pods:          (2 in total)
+  Namespace                   Name                CPU Requests  CPU Limits  Memory Requests  Memory Limits  Age
+  ---------                   ----                ------------  ----------  ---------------  -------------  ---
+  kube-system                 kindnet-fhghc       100m (0%)     100m (0%)   50Mi (0%)        50Mi (0%)      46m
+  kube-system                 kube-proxy-vjzqx    0 (0%)        0 (0%)      0 (0%)           0 (0%)         46m
+Allocated resources:
+  (Total limits may be over 100 percent, i.e., overcommitted.)
+  Resource           Requests   Limits
+  --------           --------   ------
+  cpu                100m (0%)  100m (0%)
+  memory             50Mi (0%)  50Mi (0%)
+  ephemeral-storage  0 (0%)     0 (0%)
+  hugepages-1Gi      0 (0%)     0 (0%)
+  hugepages-2Mi      0 (0%)     0 (0%)
+Events:
+  Type    Reason          Age   From             Message
+  ----    ------          ----  ----             -------
+  Normal  RegisteredNode  46m   node-controller  Node pgshard-e2e-worker2 event: Registered Node pgshard-e2e-worker2 in Controller

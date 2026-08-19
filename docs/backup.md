@@ -169,12 +169,80 @@ explicit message; create a new one.
 `objectstores` namespace with bucket-creation Jobs; the `backup` e2e suite
 (`go test -tags e2e ./test/e2e/backup/...`) runs one small cluster per store,
 takes a full and an incremental backup, checks the archived WAL range through
-`pgbackrest info` and waits for a scheduled incremental and `BackupHealthy`.
+`pgbackrest info`, waits for a scheduled incremental and `BackupHealthy`, then
+restores the cluster twice: to a named restore point pinned to the incremental
+backup and to a point in time, checking rows and timelines on the new clusters.
 `E2E_BACKUP_STORES=s3` restricts the suite to one store.
+
+## Restore
+
+A `PgShardRestore` builds a **new** cluster from the repository; the source
+cluster is never touched:
+
+```yaml
+apiVersion: pgshard.io/v1alpha1
+kind: PgShardRestore
+metadata: {name: before-purge, namespace: prod}
+spec:
+  clusterName: orders           # source; its stanzas are read
+  newClusterName: orders-pitr   # created by the operator
+  backupId: orders-full-1       # a PgShardBackup name (per-group sets) or a raw label
+  target: {name: before-purge}  # or time / lsn / xid / immediate; unset = end of WAL
+  # clusterSpec: {...}          # optional; defaults to the source spec
+```
+
+The operator creates `PgShardCluster/orders-pitr` (spec copied from the
+source unless `clusterSpec` is given, `spec.backup.policyRef` defaulting to
+the source's so the repository is reachable) with the label
+`pgshard.io/restored-from` and the annotation `pgshard.io/restore-source`
+(source cluster, PostgreSQL major, per-group backup labels and the target).
+The new cluster must keep the source's shard count and major; replica counts
+and resources may change. The source's superuser Secret is copied to
+`<newCluster>-superuser`, because the restored catalog carries the source's
+roles and passwords.
+
+Each group's designated primary bootstraps from the repository instead of
+`initdb`: `pgbackrest restore --stanza=<source stanza> [--set <label>]
+--type=<default|time|lsn|name|xid|immediate> [--target ...] [--target-timeline]
+[--target-exclusive]` into the empty PGDATA, then archive recovery with
+`restore_command` fetching WAL from the source stanza and the
+`recovery_target_*` settings rendered by the agent (`recovery_target_action =
+promote`). Once `pg_is_in_recovery()` is false the instance is stopped and
+started again as a normal primary; the standbys clone from it as usual. While
+recovering `archive_mode` is `off`, and afterwards the group archives to its
+**own new stanza** (`<newCluster>-<group>-pg<major>`); the source stanza is
+only ever read. A marker beside PGDATA makes an interrupted restore start over
+from an empty directory rather than run a half-restored instance.
+
+The same target applies to every group; because a restore point or a
+timestamp is only meaningful where it exists in the WAL, create restore
+points on every group (`Agent.CreateRestorePoint`) before relying on a name
+target. Time and LSN targets let pgBackRest select the backup set; name, xid
+and immediate targets need `backupId`. When `backupId` names a completed
+`PgShardBackup` each group restores its own set from that run; any other
+value is used as the pgBackRest label for every group.
+
+Status: `Pending` → `Restoring` (cluster created) → `Recovered` when every
+primary left recovery and the cluster is `Ready`, with per-group
+`sourceStanza`, `backupId`, `timeline` and `reachedTarget`; `Failed` on
+invalid specs, a missing source, an incomplete backup, an existing cluster of
+that name, a primary that crash-loops (PostgreSQL refuses to start when the WAL
+ends before the target) or after four hours.
+
+### Replica re-clone from the repository
+
+`Agent.Reclone{source_kind: BACKUP}` rebuilds a standby with `pgbackrest
+restore --delta --type=standby` from its own stanza (files that match the
+backup are kept), drops stale slots, writes `standby.signal` and streams from
+the primary. The operator sets `recloneFromRepo` in the agent config once a
+completed backup exists for the cluster; a rejoining former primary whose
+`pg_rewind` fails then restores from the repository and only falls back to
+`pg_basebackup` when the repository cannot serve it.
 
 ## Not yet covered
 
-* Restore (`PgShardRestore`) and point-in-time recovery.
+* Cluster-consistent barrier targets across groups (a per-group target from a
+  catalog restore point).
 * Backups from a standby (`backup-standby`).
 * A persistent spool volume for `archive-async` (the spool is on the container
   filesystem, so a pod restart re-pushes the pending segments).

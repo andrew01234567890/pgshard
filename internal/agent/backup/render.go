@@ -9,8 +9,10 @@ import (
 
 // Render produces pgbackrest.conf for the instance at pgdata listening on
 // port. Credential values are read from the credentials directory so the
-// rendered file is self-contained for archive_command.
-func Render(s Settings, pgdata string, port int) (string, error) {
+// rendered file is self-contained for archive_command. extraStanzas adds
+// sections for other stanzas in the same repository (a restore source)
+// pointing at the same data directory.
+func Render(s Settings, pgdata string, port int, extraStanzas ...string) (string, error) {
 	s = s.WithDefaults()
 	if err := s.Validate(); err != nil {
 		return "", err
@@ -52,7 +54,9 @@ func Render(s Settings, pgdata string, port int) (string, error) {
 	for _, e := range g {
 		fmt.Fprintf(&b, "%s=%s\n", e.k, e.v)
 	}
-	fmt.Fprintf(&b, "\n[%s]\npg1-path=%s\npg1-port=%d\npg1-socket-path=/tmp\npg1-user=postgres\n", s.Stanza, pgdata, port)
+	for _, stanza := range append([]string{s.Stanza}, extraStanzas...) {
+		fmt.Fprintf(&b, "\n[%s]\npg1-path=%s\npg1-port=%d\npg1-socket-path=/tmp\npg1-user=postgres\n", stanza, pgdata, port)
+	}
 	return b.String(), nil
 }
 
@@ -162,9 +166,9 @@ func RestoreCommand(s Settings) string {
 
 // WriteConfig renders the file to s.ConfigPath (mode 0600) and creates the
 // spool and log directories.
-func WriteConfig(s Settings, pgdata string, port int) error {
+func WriteConfig(s Settings, pgdata string, port int, extraStanzas ...string) error {
 	s = s.WithDefaults()
-	body, err := Render(s, pgdata, port)
+	body, err := Render(s, pgdata, port, extraStanzas...)
 	if err != nil {
 		return err
 	}
