@@ -29,6 +29,7 @@ const (
 	Controller_ApplyDDL_FullMethodName            = "/pgshard.v1.Controller/ApplyDDL"
 	Controller_CreateBarrier_FullMethodName       = "/pgshard.v1.Controller/CreateBarrier"
 	Controller_ListBarriers_FullMethodName        = "/pgshard.v1.Controller/ListBarriers"
+	Controller_ListRoleStatus_FullMethodName      = "/pgshard.v1.Controller/ListRoleStatus"
 )
 
 // ControllerClient is the client API for Controller service.
@@ -55,6 +56,9 @@ type ControllerClient interface {
 	CreateBarrier(ctx context.Context, in *CreateBarrierRequest, opts ...grpc.CallOption) (*CreateBarrierResponse, error)
 	// ListBarriers lists recorded restore points, newest first.
 	ListBarriers(ctx context.Context, in *ListBarriersRequest, opts ...grpc.CallOption) (*ListBarriersResponse, error)
+	// ListRoleStatus reports, per managed role and group, whether the group
+	// matches the catalog's desired role state.
+	ListRoleStatus(ctx context.Context, in *ListRoleStatusRequest, opts ...grpc.CallOption) (*ListRoleStatusResponse, error)
 }
 
 type controllerClient struct {
@@ -154,6 +158,16 @@ func (c *controllerClient) ListBarriers(ctx context.Context, in *ListBarriersReq
 	return out, nil
 }
 
+func (c *controllerClient) ListRoleStatus(ctx context.Context, in *ListRoleStatusRequest, opts ...grpc.CallOption) (*ListRoleStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListRoleStatusResponse)
+	err := c.cc.Invoke(ctx, Controller_ListRoleStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ControllerServer is the server API for Controller service.
 // All implementations must embed UnimplementedControllerServer
 // for forward compatibility.
@@ -178,6 +192,9 @@ type ControllerServer interface {
 	CreateBarrier(context.Context, *CreateBarrierRequest) (*CreateBarrierResponse, error)
 	// ListBarriers lists recorded restore points, newest first.
 	ListBarriers(context.Context, *ListBarriersRequest) (*ListBarriersResponse, error)
+	// ListRoleStatus reports, per managed role and group, whether the group
+	// matches the catalog's desired role state.
+	ListRoleStatus(context.Context, *ListRoleStatusRequest) (*ListRoleStatusResponse, error)
 	mustEmbedUnimplementedControllerServer()
 }
 
@@ -211,6 +228,9 @@ func (UnimplementedControllerServer) CreateBarrier(context.Context, *CreateBarri
 }
 func (UnimplementedControllerServer) ListBarriers(context.Context, *ListBarriersRequest) (*ListBarriersResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListBarriers not implemented")
+}
+func (UnimplementedControllerServer) ListRoleStatus(context.Context, *ListRoleStatusRequest) (*ListRoleStatusResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListRoleStatus not implemented")
 }
 func (UnimplementedControllerServer) mustEmbedUnimplementedControllerServer() {}
 func (UnimplementedControllerServer) testEmbeddedByValue()                    {}
@@ -370,6 +390,24 @@ func _Controller_ListBarriers_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Controller_ListRoleStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListRoleStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControllerServer).ListRoleStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Controller_ListRoleStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControllerServer).ListRoleStatus(ctx, req.(*ListRoleStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Controller_ServiceDesc is the grpc.ServiceDesc for Controller service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -404,6 +442,10 @@ var Controller_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListBarriers",
 			Handler:    _Controller_ListBarriers_Handler,
+		},
+		{
+			MethodName: "ListRoleStatus",
+			Handler:    _Controller_ListRoleStatus_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

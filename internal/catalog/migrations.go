@@ -53,6 +53,9 @@ type MigrationMeta struct {
 	// pgshard.databases.
 	Database   string `json:"database,omitempty"`
 	DatabaseOp string `json:"database_op,omitempty"`
+	// Roles carries the desired-state delta of role, membership, grant and
+	// setting statements.
+	Roles *RoleChanges `json:"roles,omitempty"`
 }
 
 // ShardMigration is one shard's entry in migrations.per_shard.

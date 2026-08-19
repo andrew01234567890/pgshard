@@ -49,6 +49,10 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
      `SET NOT NULL`, …) are applied.
    * `TRUNCATE`, `LOCK`, `VACUUM`, `COPY` on sharded/reference tables and
      `CREATE TABLE AS` over them (not migrations; still refused).
+   * Roles with `SUPERUSER`, `REPLICATION` or `BYPASSRLS` (they would apply
+     on every shard's server), `ALTER ROLE … RENAME`, `ALTER ROLE … SET …
+     FROM CURRENT`, `ALTER DEFAULT PRIVILEGES`, `REASSIGN OWNED` and `DROP
+     OWNED` — see [roles.md](roles.md).
 
 3. **Queue and wait.** The router inserts the row (`state = queued`) with
    the statement text, the client's role (`meta.run_as`) and the object it
@@ -81,6 +85,12 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
    * `CREATE`/`DROP DATABASE` and role statements run outside a transaction
      against the maintenance database; everything else against the
      migration's database.
+   * Role statements (`CREATE`/`ALTER`/`DROP ROLE`, `GRANT`/`REVOKE` of a
+     role, `ALTER ROLE … SET`) also run on the **catalog group** — last,
+     only when every shard applied, as the controller's own catalog role
+     (no `SET ROLE`) — because the router authenticates against catalog
+     verifiers and the pooler dials shards as the real user. Object grants
+     stay on the shards. See [roles.md](roles.md).
    * `55P03` (lock timeout), deadlocks, connection failures and unreachable
      shards are retried with backoff 0.5 s → 30 s for up to 5 minutes; the
      shard is `retrying` meanwhile. Because the DDL waits at most 2 s for its
@@ -92,9 +102,14 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
    The migration is `complete` when every shard is `applied` (or `skipped`
    under scope `existing`, with at least one applied) and `failed` as soon as
    one shard fails hard or exhausts its retries; `error` names the first
-   failed shard. On completion `CREATE/ALTER ROLE … PASSWORD` upserts
-   `pgshard.roles` with the SCRAM verifier, `DROP ROLE` deletes the row,
-   `CREATE`/`DROP DATABASE` inserts or deletes `pgshard.databases`.
+   failed shard. On completion the statement's desired-state delta is
+   recorded: `CREATE/ALTER ROLE` upserts `pgshard.roles` (verifier and
+   attributes), `DROP ROLE` deletes the row, `GRANT/REVOKE` of a role edits
+   `pgshard.role_members`, object `GRANT/REVOKE` edits `pgshard.grants`,
+   `ALTER ROLE … SET/RESET` edits `pgshard.role_settings` and
+   `CREATE`/`DROP DATABASE` inserts or deletes `pgshard.databases`. The
+   router's verifier cache therefore serves a new password only once every
+   shard and the catalog accepted it.
 
 ## Guarantees
 

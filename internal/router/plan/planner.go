@@ -397,16 +397,20 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 	case *pgquerypb.Node_GrantStmt:
 		return w.grant(n.GrantStmt)
 	case *pgquerypb.Node_GrantRoleStmt:
-		if n.GrantRoleStmt.GetIsGrant() {
-			return w.migration(Migration{Kind: "GRANT ROLE", Scope: ScopeAll})
-		}
-		return w.migration(Migration{Kind: "REVOKE ROLE", Scope: ScopeAll})
+		return w.grantRole(n.GrantRoleStmt)
+	case *pgquerypb.Node_AlterDefaultPrivilegesStmt:
+		return notYet("ALTER DEFAULT PRIVILEGES is not available through the router",
+			"default ACLs are recorded per creating role and schema; GRANT on the objects after creating them")
+	case *pgquerypb.Node_ReassignOwnedStmt:
+		return refuseOwned("REASSIGN OWNED")
+	case *pgquerypb.Node_DropOwnedStmt:
+		return refuseOwned("DROP OWNED")
 	case *pgquerypb.Node_CreateRoleStmt:
 		return w.createRole(w.raw, n.CreateRoleStmt)
 	case *pgquerypb.Node_AlterRoleStmt:
 		return w.alterRole(w.raw, n.AlterRoleStmt)
 	case *pgquerypb.Node_AlterRoleSetStmt:
-		return w.migration(Migration{Kind: "ALTER ROLE", Scope: ScopeAll})
+		return w.alterRoleSet(n.AlterRoleSetStmt)
 	case *pgquerypb.Node_DropRoleStmt:
 		return w.dropRole(n.DropRoleStmt)
 	case *pgquerypb.Node_CreatedbStmt:
