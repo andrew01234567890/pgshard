@@ -88,7 +88,7 @@ func runBarrierRestore(ctx context.Context, t *testing.T, c *e2e.Cluster, s stor
 
 	image := os.Getenv("PGSHARD_POSTGRES_IMAGE")
 	name := cluster + "-barrier"
-	if err := c.Apply(ctx, restoreManifest(cluster, name, major, image, 1, `
+	if err := c.Apply(ctx, restoreManifest(cluster, name, major, image, 3, `
   backupId: `+backupName+`
   target:
     barrier: e2e-`+cluster)); err != nil {
