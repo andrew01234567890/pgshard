@@ -155,6 +155,13 @@ func golden() []want {
 		{sql: "select * from orders where tenant_id = '1'", kind: Refuse, msg: "shard key literal '1' is untyped and looks numeric"},
 		{sql: "select * from docs where slug = 'a' or slug = 'b'", kind: Scatter, shards: "all"},
 
+		// Casts on the key column would change the hashed type.
+		{sql: "select * from orders where tenant_id::text = '7'::text", kind: Refuse, msg: "shard key column tenant_id is compared through a cast"},
+		{sql: "select * from orders where '7'::text = tenant_id::text", kind: Refuse, msg: "shard key column tenant_id is compared through a cast"},
+		{sql: "select * from orders where tenant_id::int8 = 7", kind: Refuse, msg: "shard key column tenant_id is compared through a cast"},
+		{sql: "select * from orders where (tenant_id::int4)::text in ('7')", kind: Refuse, msg: "shard key column tenant_id is compared through a cast"},
+		{sql: "select * from orders where tenant_id = 1 and status::text = 'x'", kind: EqualUnique, shards: "k:1"},
+
 		// IN lists.
 		{sql: "select * from orders where tenant_id in (1)", kind: In, shards: "k:1"},
 		{sql: "select * from orders where tenant_id in (1, 42)", kind: In, shards: "k:1"},

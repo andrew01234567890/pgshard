@@ -781,6 +781,12 @@ func (w *walker) conjunct(node *pgquerypb.Node, scope []*rel) error {
 	op := strings.Join(stringList(ae.GetName()), ".")
 	switch {
 	case ae.GetKind() == pgquerypb.A_Expr_Kind_AEXPR_OP && op == "=":
+		if err := w.refuseCastKey(ae.GetLexpr(), scope); err != nil {
+			return err
+		}
+		if err := w.refuseCastKey(ae.GetRexpr(), scope); err != nil {
+			return err
+		}
 		l, lok := w.keyColumn(ae.GetLexpr(), scope)
 		r, rok := w.keyColumn(ae.GetRexpr(), scope)
 		switch {
@@ -795,6 +801,9 @@ func (w *walker) conjunct(node *pgquerypb.Node, scope []*rel) error {
 			return w.term(r, ae.GetLexpr(), false)
 		}
 	case ae.GetKind() == pgquerypb.A_Expr_Kind_AEXPR_IN && op == "=" && !w.outerQuals:
+		if err := w.refuseCastKey(ae.GetLexpr(), scope); err != nil {
+			return err
+		}
 		if l, ok := w.keyColumn(ae.GetLexpr(), scope); ok {
 			return w.term(l, ae.GetRexpr(), true)
 		}
@@ -837,9 +846,6 @@ func (w *walker) term(r *rel, value *pgquerypb.Node, list bool) error {
 func (w *walker) keyColumn(expr *pgquerypb.Node, scope []*rel) (*rel, bool) {
 	cr := expr.GetColumnRef()
 	if cr == nil {
-		if tc := expr.GetTypeCast(); tc != nil {
-			return w.keyColumn(tc.GetArg(), scope)
-		}
 		return nil, false
 	}
 	fields := stringList(cr.GetFields())
@@ -869,6 +875,28 @@ func (w *walker) keyColumn(expr *pgquerypb.Node, scope []*rel) (*rel, bool) {
 		}
 	}
 	return match, match != nil
+}
+
+// refuseCastKey rejects a cast applied to the shard key column: the router
+// hashes the literal's type, so `tenant_id::text = '7'::text` would route
+// to the text hash of '7' while the row lives under the int8 hash.
+func (w *walker) refuseCastKey(expr *pgquerypb.Node, scope []*rel) error {
+	tc := expr.GetTypeCast()
+	if tc == nil {
+		return nil
+	}
+	for inner := tc.GetArg(); inner != nil; {
+		if r, ok := w.keyColumn(inner, scope); ok {
+			return notYet("shard key column "+r.shardKey+" is compared through a cast",
+				"compare the bare column and cast the literal instead")
+		}
+		next := inner.GetTypeCast()
+		if next == nil {
+			break
+		}
+		inner = next.GetArg()
+	}
+	return nil
 }
 
 // keyItem is one shard key operand: a typed literal or a parameter.
