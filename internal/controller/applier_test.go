@@ -604,7 +604,7 @@ func TestApplierRunsClientStatementsOnANonSuperuserSession(t *testing.T) {
 		t.Fatalf("DDL session ran %q", got)
 	}
 	// The role is provisioned once per shard; membership is granted on every step.
-	id = f.queue(catalog.DDLMigration{Statement: "create table u (id int)", Kind: "CREATE TABLE", Scope: "home", HomeShard: 1,
+	f.queue(catalog.DDLMigration{Statement: "create table u (id int)", Kind: "CREATE TABLE", Scope: "home", HomeShard: 1,
 		Meta: catalog.MigrationMeta{RunAs: "app"}})
 	f.run(t)
 	if n := strings.Count(strings.Join(f.shards.superuserStatements(1), ";"), "CREATE ROLE"); n != 1 {

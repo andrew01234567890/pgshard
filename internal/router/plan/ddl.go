@@ -251,7 +251,9 @@ func checkAlterCmd(r *rel, c *pgquerypb.AlterTableCmd) error {
 			case pgquerypb.ConstrType_CONSTR_IDENTITY:
 				return rewriteClass("ADD COLUMN ... GENERATED AS IDENTITY")
 			case pgquerypb.ConstrType_CONSTR_GENERATED:
-				return rewriteClass("ADD COLUMN ... GENERATED ... STORED")
+				if cs.GetGeneratedKind() != "v" {
+					return rewriteClass("ADD COLUMN ... GENERATED ... STORED")
+				}
 			}
 			if sharded && isUniqueConstraint(cs) && col.GetColname() != r.shardKey {
 				return keyConstraintError(r, col.GetColname())

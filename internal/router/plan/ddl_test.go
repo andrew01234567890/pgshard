@@ -45,6 +45,7 @@ func TestDDLClassification(t *testing.T) {
 		{sql: "alter table orders add column n bigint generated always as identity", refuse: "rewrite-class DDL is not available yet: ADD COLUMN ... GENERATED AS IDENTITY"},
 		{sql: "alter table orders add column n serial", refuse: "rewrite-class DDL is not available yet: ADD COLUMN of a serial type"},
 		{sql: "alter table orders add column total numeric generated always as (qty * price) stored", refuse: "rewrite-class DDL is not available yet: ADD COLUMN ... GENERATED ... STORED"},
+		{sql: "alter table orders add column total numeric generated always as (qty * price) virtual", mig: "ALTER TABLE all"},
 		{sql: "alter table orders alter column id type bigint", refuse: "rewrite-class DDL is not available yet: ALTER COLUMN ... TYPE"},
 		{sql: "alter table items set unlogged", refuse: "rewrite-class DDL is not available yet: SET LOGGED / SET UNLOGGED"},
 		{sql: "alter table items set tablespace fast", refuse: "rewrite-class DDL is not available yet: SET TABLESPACE"},
