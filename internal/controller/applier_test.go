@@ -1,0 +1,544 @@
+package controller
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/andrew01234567890/pgshard/internal/catalog"
+)
+
+// memStore keeps migrations in memory.
+type memStore struct {
+	mu         sync.Mutex
+	migrations []catalog.DDLMigration
+	shards     []int32
+	execs      []string
+	saves      int
+}
+
+func (s *memStore) Pending(context.Context) ([]catalog.DDLMigration, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []catalog.DDLMigration
+	for _, m := range s.migrations {
+		if m.State == catalog.MigrationQueued || m.State == catalog.MigrationRunning {
+			out = append(out, cloneMigration(m))
+		}
+	}
+	return out, nil
+}
+
+func cloneMigration(m catalog.DDLMigration) catalog.DDLMigration {
+	per := map[string]catalog.ShardMigration{}
+	for k, v := range m.PerShard {
+		per[k] = v
+	}
+	m.PerShard = per
+	return m
+}
+
+func (s *memStore) Save(_ context.Context, m catalog.DDLMigration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.saves++
+	for i := range s.migrations {
+		if s.migrations[i].ID == m.ID {
+			s.migrations[i] = cloneMigration(m)
+			return nil
+		}
+	}
+	return fmt.Errorf("unknown migration %s", m.ID)
+}
+
+func (s *memStore) Shards(context.Context, string) ([]int32, error) { return s.shards, nil }
+
+func (s *memStore) Exec(_ context.Context, sql string, args ...any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.execs = append(s.execs, fmt.Sprintf("%s %v", strings.Join(strings.Fields(sql), " "), args))
+	return nil
+}
+
+func (s *memStore) get(t *testing.T, id string) catalog.DDLMigration {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, m := range s.migrations {
+		if m.ID == id {
+			return cloneMigration(m)
+		}
+	}
+	t.Fatalf("migration %s missing", id)
+	return catalog.DDLMigration{}
+}
+
+// fakeShards scripts every shard: exec decides the outcome of a statement,
+// exists answers object checks, invalid answers invalid-index checks.
+type fakeShards struct {
+	mu      sync.Mutex
+	ran     map[int32][]string
+	dbs     map[int32][]string
+	exec    func(shard int32, sql string) error
+	exists  func(shard int32, kind, name string) bool
+	invalid func(shard int32, name string) bool
+	dialErr func(shard int32) error
+}
+
+func newFakeShards() *fakeShards {
+	return &fakeShards{ran: map[int32][]string{}, dbs: map[int32][]string{}}
+}
+
+func (f *fakeShards) DialDatabase(_ context.Context, _ string, id int32, db string) (ShardConn, error) {
+	f.mu.Lock()
+	f.dbs[id] = append(f.dbs[id], db)
+	f.mu.Unlock()
+	if f.dialErr != nil {
+		if err := f.dialErr(id); err != nil {
+			return nil, err
+		}
+	}
+	return &fakeConn{f: f, id: id}, nil
+}
+
+func (f *fakeShards) statements(id int32) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.ran[id]...)
+}
+
+type fakeConn struct {
+	f  *fakeShards
+	id int32
+}
+
+func (c *fakeConn) Exec(_ context.Context, sql string, _ ...any) (pgconnTag, error) {
+	c.f.mu.Lock()
+	c.f.ran[c.id] = append(c.f.ran[c.id], sql)
+	exec := c.f.exec
+	c.f.mu.Unlock()
+	switch {
+	case sql == "BEGIN", sql == "COMMIT", sql == "ROLLBACK", strings.HasPrefix(sql, "SET lock_timeout"), strings.HasPrefix(sql, "SET ROLE"):
+		return pgconn.CommandTag{}, nil
+	}
+	if exec != nil {
+		if err := exec(c.id, sql); err != nil {
+			return pgconn.CommandTag{}, err
+		}
+	}
+	return pgconn.CommandTag{}, nil
+}
+
+func (c *fakeConn) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
+	name, _ := args[0].(string)
+	switch {
+	case strings.Contains(sql, "indisvalid"):
+		v := c.f.invalid != nil && c.f.invalid(c.id, name)
+		return &boolRows{vals: []bool{v}}, nil
+	case strings.Contains(sql, "pg_class"), strings.Contains(sql, "pg_namespace"), strings.Contains(sql, "pg_roles"),
+		strings.Contains(sql, "pg_database"), strings.Contains(sql, "pg_type"):
+		kind := "relation"
+		switch {
+		case strings.Contains(sql, "pg_roles"):
+			kind = "role"
+		case strings.Contains(sql, "pg_database"):
+			kind = "database"
+		case strings.Contains(sql, "FROM pg_namespace"):
+			kind = "schema"
+		}
+		v := c.f.exists != nil && c.f.exists(c.id, kind, name)
+		return &boolRows{vals: []bool{v}}, nil
+	}
+	return nil, fmt.Errorf("unexpected query %q", sql)
+}
+
+func (c *fakeConn) Close(context.Context) error { return nil }
+
+// boolRows is a one-column pgx.Rows of booleans.
+type boolRows struct {
+	vals []bool
+	i    int
+}
+
+func (r *boolRows) Close()                                       {}
+func (r *boolRows) Err() error                                   { return nil }
+func (r *boolRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (r *boolRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (r *boolRows) Next() bool                                   { r.i++; return r.i <= len(r.vals) }
+func (r *boolRows) Scan(dest ...any) error {
+	*(dest[0].(*bool)) = r.vals[r.i-1]
+	return nil
+}
+func (r *boolRows) Values() ([]any, error) { return []any{r.vals[r.i-1]}, nil }
+func (r *boolRows) RawValues() [][]byte    { return nil }
+func (r *boolRows) Conn() *pgx.Conn        { return nil }
+
+func pgErr(code, msg string) error {
+	return &pgconn.PgError{Severity: "ERROR", Code: code, Message: msg}
+}
+
+type applierFixture struct {
+	store  *memStore
+	shards *fakeShards
+	app    *Applier
+	sleeps []time.Duration
+	clock  time.Time
+}
+
+func newApplierFixture(t *testing.T) *applierFixture {
+	t.Helper()
+	f := &applierFixture{store: &memStore{shards: []int32{0, 1, 2}}, shards: newFakeShards(), clock: time.Unix(1_700_000_000, 0)}
+	f.app = &Applier{Store: f.store, Shards: f.shards, Logger: slog.New(slog.DiscardHandler),
+		Backoff: Backoff{Min: 500 * time.Millisecond, Max: 4 * time.Second, Total: 30 * time.Second},
+		Sleep: func(_ context.Context, d time.Duration) error {
+			f.sleeps = append(f.sleeps, d)
+			f.clock = f.clock.Add(d)
+			return nil
+		},
+		Now: func() time.Time { return f.clock }}
+	return f
+}
+
+func (f *applierFixture) queue(m catalog.DDLMigration) string {
+	f.store.mu.Lock()
+	defer f.store.mu.Unlock()
+	m.ID = fmt.Sprintf("m%d", len(f.store.migrations)+1)
+	if m.State == "" {
+		m.State = catalog.MigrationQueued
+	}
+	if m.Strategy == "" {
+		m.Strategy = "direct"
+	}
+	if m.Database == "" {
+		m.Database = "app"
+	}
+	f.store.migrations = append(f.store.migrations, m)
+	return m.ID
+}
+
+func (f *applierFixture) run(t *testing.T) {
+	t.Helper()
+	if _, err := f.app.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func states(m catalog.DDLMigration) string {
+	var parts []string
+	for _, k := range sortedShardKeys(m.PerShard) {
+		s := m.PerShard[k]
+		parts = append(parts, fmt.Sprintf("%s=%s/%d", k, s.State, s.Attempts))
+	}
+	return strings.Join(parts, " ")
+}
+
+func TestApplierRunsOnEveryTargetInsideATransaction(t *testing.T) {
+	f := newApplierFixture(t)
+	all := f.queue(catalog.DDLMigration{Statement: "create table t (id int)", Kind: "CREATE TABLE", Scope: "all",
+		Meta: catalog.MigrationMeta{RunAs: "app", Object: catalog.MigrationObject{Kind: "relation", Name: "t", Expect: "present"}}})
+	home := f.queue(catalog.DDLMigration{Statement: "create table u (id int)", Kind: "CREATE TABLE", Scope: "home", HomeShard: 1})
+	f.run(t)
+	m := f.store.get(t, all)
+	if m.State != catalog.MigrationComplete || states(m) != "0=applied/1 1=applied/1 2=applied/1" {
+		t.Fatalf("all: %s %s", m.State, states(m))
+	}
+	for id := int32(0); id < 3; id++ {
+		got := strings.Join(f.shards.statements(id), ";")
+		if !strings.Contains(got, "SET lock_timeout = '2000ms';SET ROLE \"app\";BEGIN;create table t (id int);COMMIT") {
+			t.Fatalf("shard %d ran %q", id, got)
+		}
+		if f.shards.dbs[id][0] != "app" {
+			t.Fatalf("shard %d dialed database %q", id, f.shards.dbs[id][0])
+		}
+	}
+	m = f.store.get(t, home)
+	if m.State != catalog.MigrationComplete || states(m) != "1=applied/1" {
+		t.Fatalf("home: %s %s", m.State, states(m))
+	}
+	if n := len(f.shards.statements(0)); n != 5 {
+		t.Fatalf("home-scoped DDL reached shard 0: %v", f.shards.statements(0))
+	}
+	if len(f.sleeps) != 0 {
+		t.Fatalf("slept %v", f.sleeps)
+	}
+}
+
+func TestApplierRetriesLockTimeoutsWithBackoff(t *testing.T) {
+	f := newApplierFixture(t)
+	fails := 3
+	f.shards.exec = func(shard int32, sql string) error {
+		if shard == 1 && fails > 0 {
+			fails--
+			return pgErr("55P03", "canceling statement due to lock timeout")
+		}
+		return nil
+	}
+	id := f.queue(catalog.DDLMigration{Statement: "alter table t add column x int", Kind: "ALTER TABLE", Scope: "all"})
+	f.run(t)
+	m := f.store.get(t, id)
+	if m.State != catalog.MigrationComplete || states(m) != "0=applied/1 1=applied/4 2=applied/1" {
+		t.Fatalf("%s %s %+v", m.State, states(m), m.PerShard)
+	}
+	if fmt.Sprint(f.sleeps) != "[500ms 1s 2s]" {
+		t.Fatalf("backoff %v", f.sleeps)
+	}
+	if s := f.shards.statements(1); strings.Count(strings.Join(s, ";"), "ROLLBACK") != 3 {
+		t.Fatalf("shard 1 ran %v", s)
+	}
+	if m.PerShard["1"].Error != "" {
+		t.Fatalf("applied shard keeps error %q", m.PerShard["1"].Error)
+	}
+}
+
+func TestApplierGivesUpAfterTheBackoffBudget(t *testing.T) {
+	f := newApplierFixture(t)
+	f.shards.exec = func(shard int32, sql string) error {
+		if shard == 0 {
+			return pgErr("55P03", "canceling statement due to lock timeout")
+		}
+		return nil
+	}
+	id := f.queue(catalog.DDLMigration{Statement: "alter table t add column x int", Kind: "ALTER TABLE", Scope: "all"})
+	f.run(t)
+	m := f.store.get(t, id)
+	if m.State != catalog.MigrationFailed || m.PerShard["0"].State != catalog.ShardFailed || m.PerShard["0"].SQLState != "55P03" {
+		t.Fatalf("%s %s %+v", m.State, states(m), m.PerShard)
+	}
+	// 0.5+1+2+4+4+4+4+4+4 = 27.5s is still inside the 30s budget; the
+	// attempt after the next 4s wait is the last.
+	if fmt.Sprint(f.sleeps) != "[500ms 1s 2s 4s 4s 4s 4s 4s 4s 4s]" || m.PerShard["0"].Attempts != 11 {
+		t.Fatalf("backoff %v attempts %d", f.sleeps, m.PerShard["0"].Attempts)
+	}
+	if !strings.HasPrefix(m.Error, "shard 0: ") {
+		t.Fatalf("error %q", m.Error)
+	}
+	if states(m) != "0=failed/11 1=applied/1 2=applied/1" {
+		t.Fatalf("other shards must still be applied: %s", states(m))
+	}
+}
+
+func TestApplierRetriesUnreachableShards(t *testing.T) {
+	f := newApplierFixture(t)
+	down := 2
+	f.shards.dialErr = func(shard int32) error {
+		if shard == 2 && down > 0 {
+			down--
+			return errors.New("connection refused")
+		}
+		return nil
+	}
+	id := f.queue(catalog.DDLMigration{Statement: "create schema s", Kind: "CREATE SCHEMA", Scope: "all"})
+	f.run(t)
+	if m := f.store.get(t, id); m.State != catalog.MigrationComplete || m.PerShard["2"].Attempts != 3 {
+		t.Fatalf("%s %s", m.State, states(m))
+	}
+}
+
+func TestApplierHardFailureLeavesOtherShardsApplied(t *testing.T) {
+	f := newApplierFixture(t)
+	f.shards.exec = func(shard int32, sql string) error {
+		if shard == 1 {
+			return pgErr("42P07", `relation "t" already exists`)
+		}
+		return nil
+	}
+	id := f.queue(catalog.DDLMigration{Statement: "create table t (id int)", Kind: "CREATE TABLE", Scope: "all",
+		Meta: catalog.MigrationMeta{Object: catalog.MigrationObject{Kind: "relation", Name: "t", Expect: "present"}}})
+	f.run(t)
+	m := f.store.get(t, id)
+	if m.State != catalog.MigrationFailed || states(m) != "0=applied/1 1=failed/1 2=applied/1" {
+		t.Fatalf("%s %s", m.State, states(m))
+	}
+	if s := m.PerShard["1"]; s.SQLState != "42P07" || !strings.Contains(s.Error, "already exists") {
+		t.Fatalf("shard 1: %+v", s)
+	}
+	if m.Error != `shard 1: ERROR: relation "t" already exists (SQLSTATE 42P07)` {
+		t.Fatalf("error %q", m.Error)
+	}
+	if len(f.sleeps) != 0 {
+		t.Fatalf("hard failures must not be retried: %v", f.sleeps)
+	}
+	f.run(t)
+	if m2 := f.store.get(t, id); m2.PerShard["1"].Attempts != 1 {
+		t.Fatal("a failed migration was driven again")
+	}
+}
+
+func TestApplierResumesARunningMigrationIdempotently(t *testing.T) {
+	f := newApplierFixture(t)
+	f.shards.exists = func(shard int32, kind, name string) bool { return shard == 1 && kind == "relation" && name == "t" }
+	id := f.queue(catalog.DDLMigration{Statement: "create table t (id int)", Kind: "CREATE TABLE", Scope: "all", State: catalog.MigrationRunning,
+		Meta: catalog.MigrationMeta{Object: catalog.MigrationObject{Kind: "relation", Name: "t", Expect: "present"}},
+		PerShard: map[string]catalog.ShardMigration{
+			"0": {State: catalog.ShardApplied, Attempts: 1},
+			"1": {State: catalog.ShardRunning, Attempts: 1},
+			"2": {State: catalog.ShardPending},
+		}})
+	f.run(t)
+	m := f.store.get(t, id)
+	if m.State != catalog.MigrationComplete || states(m) != "0=applied/1 1=applied/2 2=applied/1" {
+		t.Fatalf("%s %s", m.State, states(m))
+	}
+	if s := f.shards.statements(0); len(s) != 0 {
+		t.Fatalf("applied shard 0 was touched: %v", s)
+	}
+	if s := strings.Join(f.shards.statements(1), ";"); strings.Contains(s, "create table") {
+		t.Fatalf("shard 1 already had the table but ran %q", s)
+	}
+	if s := strings.Join(f.shards.statements(2), ";"); !strings.Contains(s, "create table") {
+		t.Fatalf("shard 2 ran %q", s)
+	}
+	// A pending shard is never guarded by the existence check: an object
+	// created out of band is a hard failure, not a silent success.
+	f.shards.exists = func(int32, string, string) bool { return true }
+	f.shards.exec = func(shard int32, sql string) error { return pgErr("42P07", "exists") }
+	id2 := f.queue(catalog.DDLMigration{Statement: "create table t (id int)", Kind: "CREATE TABLE", Scope: "home",
+		Meta: catalog.MigrationMeta{Object: catalog.MigrationObject{Kind: "relation", Name: "t", Expect: "present"}}})
+	f.run(t)
+	if m := f.store.get(t, id2); m.State != catalog.MigrationFailed {
+		t.Fatalf("out-of-band duplicate: %s %s", m.State, states(m))
+	}
+}
+
+func TestApplierSkipsShardsWithoutTheObjectUnderExistingScope(t *testing.T) {
+	f := newApplierFixture(t)
+	f.shards.exec = func(shard int32, sql string) error {
+		if shard != 0 {
+			return pgErr("42704", `index "i" does not exist`)
+		}
+		return nil
+	}
+	id := f.queue(catalog.DDLMigration{Statement: "drop index i", Kind: "DROP INDEX", Scope: "existing"})
+	f.run(t)
+	m := f.store.get(t, id)
+	if m.State != catalog.MigrationComplete || states(m) != "0=applied/1 1=skipped/1 2=skipped/1" {
+		t.Fatalf("%s %s", m.State, states(m))
+	}
+	if !strings.Contains(m.PerShard["1"].Error, "does not exist") {
+		t.Fatalf("skipped shard keeps the reason: %+v", m.PerShard["1"])
+	}
+	f.shards.exec = func(int32, string) error { return pgErr("42704", `index "j" does not exist`) }
+	id = f.queue(catalog.DDLMigration{Statement: "drop index j", Kind: "DROP INDEX", Scope: "existing"})
+	f.run(t)
+	m = f.store.get(t, id)
+	if m.State != catalog.MigrationFailed || m.PerShard["0"].State != catalog.ShardFailed || !strings.Contains(m.Error, "does not exist") {
+		t.Fatalf("missing everywhere: %s %s %q", m.State, states(m), m.Error)
+	}
+}
+
+func TestApplierRebuildsAnInvalidConcurrentIndexOnce(t *testing.T) {
+	f := newApplierFixture(t)
+	first := true
+	f.shards.exec = func(shard int32, sql string) error {
+		if shard == 0 && strings.HasPrefix(sql, "create index concurrently") && first {
+			first = false
+			return pgErr("23505", "duplicate key")
+		}
+		return nil
+	}
+	f.shards.invalid = func(shard int32, name string) bool { return shard == 0 && name == "i" }
+	id := f.queue(catalog.DDLMigration{Statement: "create index concurrently i on t (x)", Kind: "CREATE INDEX", Scope: "all", Strategy: "concurrent",
+		Meta: catalog.MigrationMeta{Object: catalog.MigrationObject{Kind: "relation", Name: "i", Expect: "present"}}})
+	f.run(t)
+	m := f.store.get(t, id)
+	if m.State != catalog.MigrationComplete || states(m) != "0=applied/1 1=applied/1 2=applied/1" {
+		t.Fatalf("%s %s %+v", m.State, states(m), m.PerShard)
+	}
+	got := strings.Join(f.shards.statements(0), ";")
+	want := "SET lock_timeout = '2000ms';create index concurrently i on t (x);DROP INDEX CONCURRENTLY IF EXISTS \"i\";create index concurrently i on t (x)"
+	if got != want {
+		t.Fatalf("shard 0 ran %q", got)
+	}
+	if strings.Contains(strings.Join(f.shards.statements(1), ";"), "BEGIN") {
+		t.Fatal("CONCURRENTLY ran inside a transaction")
+	}
+	// A second failure is final.
+	f.shards.exec = func(shard int32, sql string) error { return pgErr("23505", "duplicate key") }
+	id = f.queue(catalog.DDLMigration{Statement: "create index concurrently i on t (x)", Kind: "CREATE INDEX", Scope: "home", Strategy: "concurrent",
+		Meta: catalog.MigrationMeta{Object: catalog.MigrationObject{Kind: "relation", Name: "i", Expect: "present"}}})
+	f.run(t)
+	if m := f.store.get(t, id); m.State != catalog.MigrationFailed || m.PerShard["0"].SQLState != "23505" {
+		t.Fatalf("%s %+v", m.State, m.PerShard)
+	}
+}
+
+func TestApplierMirrorsRolesAndDatabases(t *testing.T) {
+	f := newApplierFixture(t)
+	f.queue(catalog.DDLMigration{Statement: "create role r password 'SCRAM-SHA-256$x'", Kind: "CREATE ROLE", Scope: "all",
+		Meta: catalog.MigrationMeta{Role: "r", RoleOp: "create", Verifier: "SCRAM-SHA-256$x", Object: catalog.MigrationObject{Kind: "role", Name: "r", Expect: "present"}}})
+	f.queue(catalog.DDLMigration{Statement: "alter role r login", Kind: "ALTER ROLE", Scope: "all", Meta: catalog.MigrationMeta{Role: "r", RoleOp: "alter"}})
+	f.queue(catalog.DDLMigration{Statement: "create database d", Kind: "CREATE DATABASE", Scope: "all",
+		Meta: catalog.MigrationMeta{RunAs: "app", Database: "d", DatabaseOp: "create", Object: catalog.MigrationObject{Kind: "database", Name: "d", Expect: "present"}}})
+	f.queue(catalog.DDLMigration{Statement: "drop database d", Kind: "DROP DATABASE", Scope: "all",
+		Meta: catalog.MigrationMeta{Database: "d", DatabaseOp: "drop", Object: catalog.MigrationObject{Kind: "database", Name: "d", Expect: "absent"}}})
+	f.queue(catalog.DDLMigration{Statement: "drop role r", Kind: "DROP ROLE", Scope: "all",
+		Meta: catalog.MigrationMeta{Role: "r", RoleOp: "drop", Object: catalog.MigrationObject{Kind: "role", Name: "r", Expect: "absent"}}})
+	f.run(t)
+	got := strings.Join(f.store.execs, "\n")
+	for _, want := range []string{
+		"INSERT INTO pgshard.roles (rolname, verifier) VALUES ($1, nullif($2, '')) ON CONFLICT (rolname) DO UPDATE SET verifier = coalesce(nullif(EXCLUDED.verifier, ''), pgshard.roles.verifier), updated_at = now() [r SCRAM-SHA-256$x]",
+		"INSERT INTO pgshard.databases (name) VALUES ($1) ON CONFLICT (name) DO NOTHING [d]",
+		"DELETE FROM pgshard.databases WHERE name = $1 [d]",
+		"DELETE FROM pgshard.roles WHERE rolname = $1 [r]",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("catalog statements:\n%s\nmissing %q", got, want)
+		}
+	}
+	if len(f.store.execs) != 4 {
+		t.Fatalf("ALTER ROLE without a password must not touch the catalog: %v", f.store.execs)
+	}
+	for id := int32(0); id < 3; id++ {
+		for _, db := range f.shards.dbs[id] {
+			if db != "" {
+				t.Fatalf("role/database DDL dialed database %q on shard %d", db, id)
+			}
+		}
+	}
+	if got := strings.Join(f.shards.statements(0), ";"); !strings.Contains(got, "SET ROLE \"app\";create database d;SET lock_timeout = '2000ms';drop database d") {
+		t.Fatalf("CREATE DATABASE must run outside a transaction as the client role: %q", got)
+	}
+}
+
+func TestApplierRunsMigrationsOldestFirstAndFailedOnesNeverAgain(t *testing.T) {
+	f := newApplierFixture(t)
+	a := f.queue(catalog.DDLMigration{Statement: "create table a (id int)", Kind: "CREATE TABLE", Scope: "home"})
+	b := f.queue(catalog.DDLMigration{Statement: "create table b (id int)", Kind: "CREATE TABLE", Scope: "home"})
+	f.run(t)
+	if s := f.shards.statements(0); !strings.Contains(strings.Join(s, ";"), "create table a (id int);COMMIT;SET lock_timeout = '2000ms';BEGIN;create table b") {
+		t.Fatalf("order %v", s)
+	}
+	for _, id := range []string{a, b} {
+		if f.store.get(t, id).State != catalog.MigrationComplete {
+			t.Fatal(id)
+		}
+	}
+	saves := f.store.saves
+	f.run(t)
+	if f.store.saves != saves {
+		t.Fatal("finished migrations were saved again")
+	}
+}
+
+func TestApplierStopsWhenTheContextEnds(t *testing.T) {
+	f := newApplierFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	f.app.Sleep = func(context.Context, time.Duration) error { cancel(); return ctx.Err() }
+	f.shards.exec = func(int32, string) error { return pgErr("55P03", "lock timeout") }
+	id := f.queue(catalog.DDLMigration{Statement: "alter table t add column x int", Kind: "ALTER TABLE", Scope: "all"})
+	if _, err := f.app.RunOnce(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err %v", err)
+	}
+	m := f.store.get(t, id)
+	if m.State != catalog.MigrationRunning || m.PerShard["0"].State != catalog.ShardRetrying {
+		t.Fatalf("a cancelled pass must leave the migration resumable: %s %s", m.State, states(m))
+	}
+}

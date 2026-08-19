@@ -25,6 +25,8 @@ type want struct {
 	fill string
 	// nextval is the sequence a SELECT nextval() is answered from.
 	nextval string
+	// mig is "<kind> <scope>[ concurrent]" for a Migration plan.
+	mig string
 }
 
 func golden() []want {
@@ -41,19 +43,19 @@ func golden() []want {
 		{sql: "select * from information_schema.tables", kind: Unsharded, shards: "0"},
 		{sql: "select * from undeclared_table", kind: Unsharded, shards: "0"},
 		{sql: "select * from other.orders where tenant_id = 1", kind: Unsharded, shards: "0"},
-		{sql: "create table items (id int primary key, name text)", kind: Unsharded, shards: "0"},
-		{sql: "create table newtab (id int primary key)", kind: Unsharded, shards: "0"},
-		{sql: "create index on items (name)", kind: Unsharded, shards: "0"},
-		{sql: "alter table items add column x int", kind: Unsharded, shards: "0"},
-		{sql: "drop table items", kind: Unsharded, shards: "0"},
-		{sql: "drop table if exists nothing_here", kind: Unsharded, shards: "0"},
+		{sql: "create table items (id int primary key, name text)", kind: MigrationKind, mig: "CREATE TABLE home"},
+		{sql: "create table newtab (id int primary key)", kind: MigrationKind, mig: "CREATE TABLE home"},
+		{sql: "create index on items (name)", kind: MigrationKind, mig: "CREATE INDEX home"},
+		{sql: "alter table items add column x int", kind: MigrationKind, mig: "ALTER TABLE home"},
+		{sql: "drop table items", kind: MigrationKind, mig: "DROP TABLE home"},
+		{sql: "drop table if exists nothing_here", kind: MigrationKind, mig: "DROP TABLE home"},
 		{sql: "truncate items", kind: Unsharded, shards: "0"},
 		{sql: "copy items from stdin", kind: Unsharded, shards: "0"},
 		{sql: "copy items to stdout", kind: Unsharded, shards: "0"},
 		{sql: "copy (select * from items) to stdout", kind: Unsharded, shards: "0"},
 		{sql: "explain select * from items", kind: Unsharded, shards: "0"},
 		{sql: "prepare p as select * from items where id = $1", kind: Unsharded, shards: "0"},
-		{sql: "create view v as select * from items", kind: Unsharded, shards: "0"},
+		{sql: "create view v as select * from items", kind: MigrationKind, mig: "CREATE VIEW home"},
 		{sql: "vacuum items", kind: Unsharded, shards: "0"},
 		{sql: "lock table items", kind: Unsharded, shards: "0"},
 		{sql: "select nextval('s')", kind: Unsharded, shards: "0"},
@@ -112,8 +114,8 @@ func golden() []want {
 		{sql: "select nextval('tickets.body')", kind: Unsharded, shards: "0"},
 		{sql: "select nextval('items_id_seq')", kind: Unsharded, shards: "0"},
 		{sql: "copy regions from stdin", kind: Refuse, msg: "COPY on sharded and reference tables is not available yet"},
-		{sql: "create table regions (id int primary key)", kind: Refuse, msg: "DDL fan-out is not available yet"},
-		{sql: "drop table regions", kind: Refuse, msg: "DDL fan-out is not available yet"},
+		{sql: "create table regions (id int primary key)", kind: MigrationKind, mig: "CREATE TABLE all"},
+		{sql: "drop table regions", kind: MigrationKind, mig: "DROP TABLE all"},
 
 		// Sharded: equality on the int8 key.
 		{sql: "select * from orders where tenant_id = 1", kind: EqualUnique, shards: "k:1"},
@@ -296,9 +298,9 @@ func golden() []want {
 		{sql: "select * from orders o join order_lines l on o.tenant_id = l.tenant_id where o.tenant_id = 1 order by o.id limit 3", kind: EqualUnique, shards: "k:1"},
 
 		// DDL.
-		{sql: "create table orders (id int, tenant_id int8, primary key (tenant_id, id))", kind: Refuse, msg: "DDL fan-out is not available yet"},
-		{sql: "create table orders (id int, tenant_id int8 primary key)", kind: Refuse, msg: "DDL fan-out is not available yet"},
-		{sql: "create table orders (id int, tenant_id int8, unique (id, tenant_id))", kind: Refuse, msg: "DDL fan-out is not available yet"},
+		{sql: "create table orders (id int, tenant_id int8, primary key (tenant_id, id))", kind: MigrationKind, mig: "CREATE TABLE all"},
+		{sql: "create table orders (id int, tenant_id int8 primary key)", kind: MigrationKind, mig: "CREATE TABLE all"},
+		{sql: "create table orders (id int, tenant_id int8, unique (id, tenant_id))", kind: MigrationKind, mig: "CREATE TABLE all"},
 		{sql: "create table orders (id int primary key, tenant_id int8)", kind: Refuse, msg: "primary key or unique constraint (id) on sharded table \"orders\" must include the shard key \"tenant_id\""},
 		{sql: "create table orders (id int, tenant_id int8, primary key (id))", kind: Refuse, msg: "primary key or unique constraint (id) on sharded table \"orders\" must include the shard key \"tenant_id\""},
 		{sql: "create table orders (id int, tenant_id int8, unique (id))", kind: Refuse, msg: "primary key or unique constraint (id) on sharded table \"orders\" must include the shard key"},
@@ -306,31 +308,31 @@ func golden() []want {
 		{sql: "create table orders (id int, tenant_id int8, primary key (tenant_id, id), unique (sku))", kind: Refuse, msg: "primary key or unique constraint (sku) on sharded table"},
 		{sql: "create table orders (id int primary key)", kind: Refuse, msg: "primary key or unique constraint (id) on sharded table"},
 		{sql: "create table orders (id int)", kind: Refuse, msg: "sharded table \"orders\" must define its shard key column \"tenant_id\""},
-		{sql: "create table docs (id int, slug text, primary key (slug))", kind: Refuse, msg: "DDL fan-out is not available yet"},
+		{sql: "create table docs (id int, slug text, primary key (slug))", kind: MigrationKind, mig: "CREATE TABLE all"},
 		{sql: "create table docs (id int primary key, slug text)", kind: Refuse, msg: "primary key or unique constraint (id) on sharded table \"docs\" must include the shard key \"slug\""},
-		{sql: "create table if not exists orders (id int, tenant_id int8)", kind: Refuse, msg: "DDL fan-out is not available yet"},
-		{sql: "create table public.orders (id int, tenant_id int8)", kind: Refuse, msg: "DDL fan-out is not available yet"},
-		{sql: "create table audit.events (id int, tenant_id int8)", kind: Refuse, msg: "DDL fan-out is not available yet"},
-		{sql: "create table other.orders (id int primary key)", kind: Unsharded, shards: "0"},
+		{sql: "create table if not exists orders (id int, tenant_id int8)", kind: MigrationKind, mig: "CREATE TABLE all"},
+		{sql: "create table public.orders (id int, tenant_id int8)", kind: MigrationKind, mig: "CREATE TABLE all"},
+		{sql: "create table audit.events (id int, tenant_id int8)", kind: MigrationKind, mig: "CREATE TABLE all"},
+		{sql: "create table other.orders (id int primary key)", kind: MigrationKind, mig: "CREATE TABLE home"},
 		{sql: "create temporary table orders (id int, tenant_id int8)", kind: Refuse, msg: "temporary tables are not supported through the router"},
-		{sql: "create index on orders (id)", kind: Refuse, msg: "DDL fan-out is not available yet"},
-		{sql: "create unique index on orders (id)", kind: Refuse, msg: "DDL fan-out is not available yet"},
-		{sql: "alter table orders add column x int", kind: Refuse, msg: "DDL fan-out is not available yet"},
-		{sql: "alter table orders rename to orders2", kind: Refuse, msg: "DDL fan-out is not available yet"},
-		{sql: "drop table orders", kind: Refuse, msg: "DDL fan-out is not available yet"},
-		{sql: "drop table public.orders, items", kind: Refuse, msg: "DDL fan-out is not available yet"},
-		{sql: "drop table items, docs", kind: Refuse, msg: "DDL fan-out is not available yet"},
-		{sql: "drop index orders_idx", kind: Unsharded, shards: "0"},
-		{sql: "truncate orders", kind: Refuse, msg: "DDL fan-out is not available yet"},
-		{sql: "truncate items, orders", kind: Refuse, msg: "DDL fan-out is not available yet"},
-		{sql: "vacuum orders", kind: Refuse, msg: "DDL fan-out is not available yet"},
-		{sql: "lock table orders", kind: Refuse, msg: "DDL fan-out is not available yet"},
+		{sql: "create index on orders (id)", kind: MigrationKind, mig: "CREATE INDEX all"},
+		{sql: "create unique index on orders (id)", kind: Refuse, msg: "primary key or unique constraint (id) on sharded table \"orders\" must include the shard key"},
+		{sql: "alter table orders add column x int", kind: MigrationKind, mig: "ALTER TABLE all"},
+		{sql: "alter table orders rename to orders2", kind: Refuse, msg: "renaming the sharded or reference table \"orders\" is not available yet"},
+		{sql: "drop table orders", kind: MigrationKind, mig: "DROP TABLE all"},
+		{sql: "drop table public.orders, items", kind: Refuse, msg: "one DDL statement cannot touch both sharded and unsharded tables"},
+		{sql: "drop table items, docs", kind: Refuse, msg: "one DDL statement cannot touch both sharded and unsharded tables"},
+		{sql: "drop index orders_idx", kind: MigrationKind, mig: "DROP INDEX existing"},
+		{sql: "truncate orders", kind: Refuse, msg: "TRUNCATE on sharded and reference tables is not available yet"},
+		{sql: "truncate items, orders", kind: Refuse, msg: "TRUNCATE on sharded and reference tables is not available yet"},
+		{sql: "vacuum orders", kind: Refuse, msg: "VACUUM and ANALYZE on sharded and reference tables is not available yet"},
+		{sql: "lock table orders", kind: Refuse, msg: "LOCK TABLE on sharded and reference tables is not available yet"},
 		{sql: "create table t2 as select * from orders where tenant_id = 1", kind: Refuse, msg: "CREATE TABLE AS over sharded or reference tables is not available yet"},
 		{sql: "create table t2 as select * from items", kind: Unsharded, shards: "0"},
-		{sql: "create table orders as select 1", kind: Refuse, msg: "DDL fan-out is not available yet"},
-		{sql: "create view v as select * from orders where tenant_id = 1", kind: Refuse, msg: "CREATE VIEW over sharded or reference tables is not available yet"},
-		{sql: "create view v as select * from regions", kind: Refuse, msg: "CREATE VIEW over sharded or reference tables is not available yet"},
-		{sql: "create view orders as select 1", kind: Refuse, msg: "DDL fan-out is not available yet"},
+		{sql: "create table orders as select 1", kind: Refuse, msg: "CREATE TABLE AS cannot create the sharded or reference table \"orders\""},
+		{sql: "create view v as select * from orders where tenant_id = 1", kind: MigrationKind, mig: "CREATE VIEW all"},
+		{sql: "create view v as select * from regions", kind: MigrationKind, mig: "CREATE VIEW all"},
+		{sql: "create view orders as select 1", kind: MigrationKind, mig: "CREATE VIEW home"},
 		{sql: "copy orders from stdin", kind: Refuse, msg: "COPY on sharded and reference tables is not available yet"},
 		{sql: "copy orders to stdout", kind: Refuse, msg: "COPY on sharded and reference tables is not available yet"},
 		{sql: "copy (select * from orders where tenant_id = 1) to stdout", kind: EqualUnique, shards: "k:1"},
@@ -407,6 +409,9 @@ func TestGoldenPlans(t *testing.T) {
 			if pl.NextVal != c.nextval {
 				t.Fatalf("nextval = %q, want %q", pl.NextVal, c.nextval)
 			}
+			if got := migrationShape(pl); got != c.mig {
+				t.Fatalf("migration = %q, want %q", got, c.mig)
+			}
 			got := ""
 			if pl.Sequences != nil {
 				got = pl.Sequences.SQL + "|" + strings.Join(pl.Sequences.Names, ",")
@@ -416,6 +421,19 @@ func TestGoldenPlans(t *testing.T) {
 			}
 		})
 	}
+}
+
+// migrationShape renders a Migration plan as "<kind> <scope>[ concurrent]".
+func migrationShape(pl Plan) string {
+	m := pl.Migration
+	if m == nil {
+		return ""
+	}
+	out := m.Kind + " " + m.Scope
+	if m.Strategy == StrategyConcurrent {
+		out += " concurrent"
+	}
+	return out
 }
 
 func checkRefusal(t *testing.T, pl Plan, err error, msg string) {

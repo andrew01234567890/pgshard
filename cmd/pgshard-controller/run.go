@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -49,6 +50,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	retry := fs.Duration("election-retry", 5*time.Second, "time between leadership attempts")
 	lockKey := fs.Int64("leader-lock-key", controller.LeaderLockKey, "pg_advisory_lock key that elects the leader")
 	resolveEvery := fs.Duration("resolve-interval", 5*time.Second, "time between in-doubt transaction resolution passes")
+	applyEvery := fs.Duration("apply-interval", time.Second, "time between DDL migration applier passes while leader")
 	shardDSNTemplate := fs.String("shard-dsn-template", "", "superuser DSN for shard primaries with {set}, {id} and {group} placeholders (enables the resolver)")
 	barrierDrain := fs.Duration("barrier-drain-timeout", controller.DefaultDrainTimeout, "how long a barrier waits for in-flight two-phase commits")
 	barrierArchive := fs.Duration("barrier-archive-timeout", controller.DefaultArchiveTimeout, "how long a barrier waits for every group's restore point to be archived")
@@ -89,7 +91,9 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return cli.ExitNotReady
 	}
 
-	rec := &controller.Reconciler{DSN: *catalogDSN, Logger: logger, LockKey: *lockKey, Interval: *interval, RetryInterval: *retry}
+	var leader atomic.Bool
+	rec := &controller.Reconciler{DSN: *catalogDSN, Logger: logger, LockKey: *lockKey, Interval: *interval, RetryInterval: *retry,
+		OnLeader: leader.Store}
 	go func() { _ = rec.Run(ctx) }()
 	var resolver *controller.Resolver
 	var barrier *controller.Barrier
@@ -99,6 +103,8 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		go resolver.Run(ctx, *resolveEvery)
 		barrier = &controller.Barrier{Store: &controller.PGBarrierStore{Pool: pool}, Groups: &controller.SQLBarrierGroups{Pool: pool, Shards: dialer},
 			Resolver: resolver, Logger: logger, DrainTimeout: *barrierDrain, ArchiveTimeout: *barrierArchive}
+		applier := &controller.Applier{Store: &controller.PGMigrationStore{Pool: pool}, Logger: logger, Shards: dialer}
+		go applier.Run(ctx, *applyEvery, leader.Load)
 	}
 
 	if *listen == "" {

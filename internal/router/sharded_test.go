@@ -71,7 +71,7 @@ func newShardedHarnessWith(t *testing.T, cfg Config) *shardedHarness {
 	pl := NewPoolers(nil, h.snap, insecure.NewCredentials())
 	t.Cleanup(pl.Close)
 	sh := &shardedHarness{harness: h, poolers: poolers, snap: snap}
-	startHarness(t, h, Config{Snapshot: h.snap, Poolers: pl, Logger: slog.New(slog.DiscardHandler), Scatter: cfg.Scatter, Decisions: cfg.Decisions, Sequences: cfg.Sequences, Planner: cfg.Planner,
+	startHarness(t, h, Config{Snapshot: h.snap, Poolers: pl, Logger: slog.New(slog.DiscardHandler), Scatter: cfg.Scatter, Decisions: cfg.Decisions, Sequences: cfg.Sequences, Planner: cfg.Planner, Migrations: cfg.Migrations,
 		Buffering: Buffering{Window: 700 * time.Millisecond, Poll: 20 * time.Millisecond, PerShardCap: 2, Changes: h.subscribe}})
 	return sh
 }
@@ -397,7 +397,7 @@ func TestShardedRefusalsThroughTheWire(t *testing.T) {
 		{sql: "delete from orders", msg: "scatter DELETE without a shard key predicate is not available yet"},
 		{sql: "insert into regions values (1)", msg: "two-phase commit is not available: the router has no decision log"},
 		{sql: "create table orders (id int primary key, tenant_id int8)", msg: "primary key or unique constraint (id) on sharded table \"orders\" must include the shard key \"tenant_id\""},
-		{sql: "create table orders (id int, tenant_id int8, primary key (tenant_id, id))", msg: "DDL fan-out is not available yet"},
+		{sql: "create table orders (id int, tenant_id int8, primary key (tenant_id, id))", msg: "DDL is not available: the router has no migration queue"},
 		{sql: "select * from orders o join docs d on o.id = d.id where o.tenant_id = " + itoa(farFrom(t, h, "acme")) + " and d.slug = $1", args: []any{"acme"}, msg: "cross-shard join is not available yet"},
 	}
 	for _, c := range cases {

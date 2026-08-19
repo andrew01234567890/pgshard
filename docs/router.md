@@ -94,9 +94,9 @@ placement in `pgshard.table_status` decides:
 
 | Placement | Reads | Writes | DDL |
 |---|---|---|---|
-| unsharded (or undeclared, database default `unsharded`) | home shard | home shard | home shard |
-| reference | any shard (chosen per session) | every shard of the set, in the session's transaction (see *Reference tables*) | refused, "DDL fan-out is not available yet" |
-| sharded | shard of the key | shard of the key | refused, "DDL fan-out is not available yet" |
+| unsharded (or undeclared, database default `unsharded`) | home shard | home shard | migration, home shard (see *DDL*) |
+| reference | any shard (chosen per session) | every shard of the set, in the session's transaction (see *Reference tables*) | migration, every shard |
+| sharded | shard of the key | shard of the key | migration, every shard |
 
 A plan has a `Kind`: `Unsharded`, `EqualUnique` (every sharded table pinned
 to one key value), `In` (key in a list of values), `Scatter` (a sharded
@@ -208,16 +208,47 @@ waiting is honoured.
 | multi-row `INSERT` whose rows hash to different shards | multi-row INSERT spanning shards is not available yet |
 | `UPDATE … SET key`, `ON CONFLICT DO UPDATE SET key` | shard key is immutable |
 | reference-table write that reads a sharded or unsharded table, or calls a volatile function | a write to reference table … cannot read sharded or unsharded tables; … cannot call now() (see *Reference tables*) |
-| DDL, `TRUNCATE`, `VACUUM`, `LOCK`, `COPY` on sharded or reference tables | DDL fan-out is not available yet; COPY on sharded and reference tables is not available yet |
-| `CREATE TABLE` of a declared sharded table without the key column, or with a PRIMARY KEY/UNIQUE that omits it | sharded table must define its shard key column; primary key or unique constraint (…) must include the shard key |
-| `CREATE VIEW`/`CREATE TABLE AS` over sharded or reference tables | CREATE VIEW over sharded or reference tables is not available yet |
+| `TRUNCATE`, `VACUUM`, `LOCK`, `COPY` on sharded or reference tables | TRUNCATE/LOCK TABLE/VACUUM and ANALYZE on sharded and reference tables is not available yet; COPY on sharded and reference tables is not available yet |
+| `CREATE TABLE`, `CREATE UNIQUE INDEX`, `ALTER TABLE ADD PRIMARY KEY/UNIQUE` on a declared sharded table without the key column, or with a PRIMARY KEY/UNIQUE that omits it | sharded table must define its shard key column; primary key or unique constraint (…) must include the shard key |
+| DDL forms the migration model refuses (transaction block, rewrite class, shard key changes, mixed sharded/unsharded objects, `CREATE TABLE AS` over sharded tables) | see *DDL* |
 | `SET LOCAL search_path`, `SET search_path FROM CURRENT` | SET LOCAL search_path is not available yet; SET search_path FROM CURRENT is not available yet |
 | SQL-level `PREPARE` touching sharded or reference tables; data-modifying CTEs | SQL-level PREPARE … is not available yet; data-modifying statements in WITH are not available yet |
 | undeclared table in a database whose default placement is `sharded` | table is not declared in the catalog and the database defaults to sharded placement |
 
-DDL on unsharded tables goes to the home shard, an interim until DDL
-fan-out (M4). Reference reads pick a shard from the session id so they
-spread across the shard set.
+Reference reads pick a shard from the session id so they spread across the
+shard set.
+
+### DDL
+
+The session never runs DDL or DCL itself. `CREATE`/`ALTER`/`DROP` of tables,
+indexes, schemas, views, sequences and types, `CREATE`/`DROP DATABASE`,
+`CREATE`/`ALTER`/`DROP ROLE|USER`, `GRANT`/`REVOKE`, `REINDEX` and
+`ALTER … RENAME|SET SCHEMA|OWNER TO` are validated by the planner, written to
+`pgshard.migrations` as a *migration* and applied on every target shard by
+the controller's applier (`docs/ddl.md`). The client waits, as with
+PostgreSQL, until the statement is done everywhere and gets the command tag,
+or the error of the shard that failed. `SET pgshard.ddl_async = on` makes the
+session return at once with a NOTICE that names the migration id.
+
+The planner decides the *scope* from the catalog: a statement on sharded or
+reference tables, and every schema/type/sequence/database/role/grant
+statement, targets every shard; a statement on unsharded tables the home
+shard; `DROP`/`ALTER`/`REINDEX INDEX` and `DROP`/`ALTER VIEW`, whose owning
+table the router cannot resolve, target every shard and skip the shards where
+the object does not exist. `CREATE INDEX CONCURRENTLY`, `DROP INDEX
+CONCURRENTLY` and `REINDEX … CONCURRENTLY` run outside a transaction with
+invalid-index detection. `CREATE ROLE … PASSWORD 'plain'` and `ALTER ROLE …
+PASSWORD` are rewritten so every shard receives the same SCRAM verifier, which
+the applier also mirrors into `pgshard.roles`.
+
+Refused (`0A000`): DDL inside a transaction block (the fan-out cannot be
+rolled back with the transaction); rewrite-class `ALTER TABLE` (`ALTER COLUMN
+… TYPE`, `SET LOGGED/UNLOGGED`, `SET TABLESPACE`, `ADD COLUMN` with a
+volatile `DEFAULT`) until online schema change; dropping, renaming or retyping
+the shard key column; renaming or moving a sharded/reference table to another
+schema (the catalog declares it by name); one statement touching both sharded
+and unsharded tables; `CREATE TABLE AS` over sharded or reference tables.
+Sessions on the catalog database run DDL on the catalog directly.
 
 ### Reference tables
 
@@ -257,8 +288,8 @@ default is volatile (`DEFAULT now()`, `DEFAULT gen_random_uuid()`, a
 per-shard `serial`) diverges when an `INSERT` omits that column, and the
 router cannot detect it because it does not read the shards' catalogs.
 Declare defaults on reference tables as constants, or always supply the
-column. DDL on reference tables (including such checks at `CREATE TABLE`)
-is M4. `SELECT … FOR UPDATE` on a reference table locks the row on the
+column. DDL on reference tables goes through the migration model (see *DDL*).
+`SELECT … FOR UPDATE` on a reference table locks the row on the
 session's shard only.
 
 ### Sequences

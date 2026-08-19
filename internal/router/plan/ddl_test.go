@@ -1,0 +1,172 @@
+package plan
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/andrew01234567890/pgshard/internal/pgwire"
+)
+
+// TestDDLClassification pins the migration shape (kind, scope, strategy)
+// or the refusal of every DDL/DCL form the router accepts.
+func TestDDLClassification(t *testing.T) {
+	cases := []struct {
+		sql string
+		// mig is "<kind> <scope>[ concurrent]"; refuse is the refusal
+		// message prefix instead.
+		mig    string
+		refuse string
+		object string
+	}{
+		{sql: "create table t1 (id int primary key)", mig: "CREATE TABLE home", object: "relation:t1:present"},
+		{sql: "create table if not exists orders (tenant_id int8, id int, primary key (tenant_id, id))", mig: "CREATE TABLE all", object: "relation:orders:present"},
+		{sql: "create table regions (id int primary key)", mig: "CREATE TABLE all", object: "relation:regions:present"},
+		{sql: "create table orders (id int primary key, tenant_id int8)", refuse: "primary key or unique constraint (id) on sharded table"},
+		{sql: "create table orders (id int)", refuse: "sharded table \"orders\" must define its shard key column"},
+		{sql: "create unlogged table t2 (id int)", mig: "CREATE TABLE home", object: "relation:t2:present"},
+		{sql: "create index items_name on items (name)", mig: "CREATE INDEX home", object: "relation:items_name:present"},
+		{sql: "create index concurrently orders_id on orders (id)", mig: "CREATE INDEX all concurrent", object: "relation:orders_id:present"},
+		{sql: "create unique index on orders (tenant_id, id)", mig: "CREATE INDEX all"},
+		{sql: "create unique index on orders (id)", refuse: "primary key or unique constraint (id) on sharded table"},
+		{sql: "create index on regions (name)", mig: "CREATE INDEX all"},
+		{sql: "drop index concurrently orders_id", mig: "DROP INDEX existing concurrent", object: "relation:orders_id:absent"},
+		{sql: "drop index if exists items_name", mig: "DROP INDEX existing", object: "relation:items_name:absent"},
+		{sql: "reindex index orders_id", mig: "REINDEX existing"},
+		{sql: "reindex table concurrently orders", mig: "REINDEX all concurrent"},
+		{sql: "reindex table items", mig: "REINDEX home"},
+		{sql: "reindex schema public", mig: "REINDEX all"},
+		{sql: "alter table orders add column note text default 'x'", mig: "ALTER TABLE all"},
+		{sql: "alter table orders add column note text default now()", refuse: "rewrite-class DDL is not available yet: ADD COLUMN with a volatile DEFAULT"},
+		{sql: "alter table orders alter column id type bigint", refuse: "rewrite-class DDL is not available yet: ALTER COLUMN ... TYPE"},
+		{sql: "alter table items set unlogged", refuse: "rewrite-class DDL is not available yet: SET LOGGED / SET UNLOGGED"},
+		{sql: "alter table items set tablespace fast", refuse: "rewrite-class DDL is not available yet: SET TABLESPACE"},
+		{sql: "alter table orders drop column tenant_id", refuse: "the shard key column \"tenant_id\" of sharded table \"orders\" cannot be dropped"},
+		{sql: "alter table orders drop column note", mig: "ALTER TABLE all"},
+		{sql: "alter table orders rename column tenant_id to t", refuse: "the shard key column \"tenant_id\" of sharded table \"orders\" cannot be dropped"},
+		{sql: "alter table orders rename column note to memo", mig: "ALTER TABLE all"},
+		{sql: "alter table orders add primary key (id)", refuse: "primary key or unique constraint (id) on sharded table"},
+		{sql: "alter table orders add constraint u unique (tenant_id, sku)", mig: "ALTER TABLE all"},
+		{sql: "alter table orders add column sku text unique", refuse: "primary key or unique constraint (sku) on sharded table"},
+		{sql: "alter table items add column sku text unique", mig: "ALTER TABLE home"},
+		{sql: "alter table items rename to stock", mig: "ALTER TABLE home"},
+		{sql: "alter table orders rename to o2", refuse: "renaming the sharded or reference table \"orders\""},
+		{sql: "alter table orders set schema archive", refuse: "moving the sharded or reference table \"orders\" to another schema"},
+		{sql: "alter table items set schema archive", mig: "ALTER TABLE home"},
+		{sql: "alter table orders owner to app", mig: "ALTER TABLE all"},
+		{sql: "alter index orders_id rename to orders_id2", mig: "ALTER INDEX existing"},
+		{sql: "alter sequence s restart", mig: "ALTER SEQUENCE all"},
+		{sql: "drop table orders, docs", mig: "DROP TABLE all"},
+		{sql: "drop table items, orders", refuse: "one DDL statement cannot touch both sharded and unsharded tables"},
+		{sql: "drop table if exists gone", mig: "DROP TABLE home", object: "relation:gone:absent"},
+		{sql: "create schema audit", mig: "CREATE SCHEMA all", object: "schema:audit:present"},
+		{sql: "drop schema audit cascade", mig: "DROP SCHEMA all", object: "schema:audit:absent"},
+		{sql: "create sequence invoice_no", mig: "CREATE SEQUENCE all", object: "relation:invoice_no:present"},
+		{sql: "drop sequence invoice_no", mig: "DROP SEQUENCE all"},
+		{sql: "create type mood as enum ('sad', 'ok')", mig: "CREATE TYPE all"},
+		{sql: "create type pair as (a int, b int)", mig: "CREATE TYPE all"},
+		{sql: "alter type mood add value 'happy'", mig: "ALTER TYPE all"},
+		{sql: "drop type mood", mig: "DROP TYPE all"},
+		{sql: "create view v as select * from items", mig: "CREATE VIEW home", object: "relation:v:present"},
+		{sql: "create or replace view v as select * from orders where tenant_id = 1", mig: "CREATE VIEW all", object: "relation:v:present"},
+		{sql: "drop view v", mig: "DROP VIEW existing", object: "relation:v:absent"},
+		{sql: "create database shop", mig: "CREATE DATABASE all", object: "database:shop:present"},
+		{sql: "drop database shop", mig: "DROP DATABASE all", object: "database:shop:absent"},
+		{sql: "drop database app", refuse: "cannot drop the currently open database"},
+		{sql: "create role analyst login", mig: "CREATE ROLE all", object: "role:analyst:present"},
+		{sql: "create user analyst password 'secret'", mig: "CREATE ROLE all", object: "role:analyst:present"},
+		{sql: "alter role analyst password 'other'", mig: "ALTER ROLE all"},
+		{sql: "alter role analyst set search_path = app", mig: "ALTER ROLE all"},
+		{sql: "drop role analyst", mig: "DROP ROLE all", object: "role:analyst:absent"},
+		{sql: "grant select on orders to analyst", mig: "GRANT all"},
+		{sql: "grant select on items to analyst", mig: "GRANT home"},
+		{sql: "grant select on items, orders to analyst", refuse: "one DDL statement cannot touch both sharded and unsharded tables"},
+		{sql: "revoke all on schema public from analyst", mig: "REVOKE all"},
+		{sql: "grant all on all tables in schema public to analyst", mig: "GRANT all"},
+		{sql: "grant analyst to app", mig: "GRANT ROLE all"},
+		{sql: "revoke analyst from app", mig: "REVOKE ROLE all"},
+	}
+	if len(cases) < 30 {
+		t.Fatalf("only %d cases", len(cases))
+	}
+	p := New()
+	snap := fixture(t)
+	for _, c := range cases {
+		t.Run(c.sql, func(t *testing.T) {
+			pl, err := p.Plan(context.Background(), session(snap), c.sql)
+			if c.refuse != "" {
+				if err == nil {
+					t.Fatalf("expected refusal %q, got %+v", c.refuse, pl.Migration)
+				}
+				var pe *pgwire.Error
+				if !errors.As(err, &pe) || !strings.HasPrefix(pe.Message, c.refuse) {
+					t.Fatalf("refusal = %v, want prefix %q", err, c.refuse)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("plan: %v", err)
+			}
+			if pl.Kind != MigrationKind || len(pl.Shards) != 0 || !pl.Class.Write {
+				t.Fatalf("plan = %+v, want a migration write plan", pl)
+			}
+			if got := migrationShape(pl); got != c.mig {
+				t.Fatalf("migration = %q, want %q", got, c.mig)
+			}
+			if pl.Migration.Statement == "" {
+				t.Fatal("migration has no statement")
+			}
+			o := pl.Migration.Object
+			got := ""
+			if o.Kind != "" {
+				got = o.Kind + ":" + o.Name + ":" + o.Expect
+			}
+			if got != c.object {
+				t.Fatalf("object = %q, want %q", got, c.object)
+			}
+		})
+	}
+}
+
+func TestDDLRolePasswordBecomesVerifier(t *testing.T) {
+	p := New()
+	snap := fixture(t)
+	for _, sql := range []string{"create user analyst password 'secret'", "alter role analyst with password 'secret' login"} {
+		pl, err := p.Plan(context.Background(), session(snap), sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := pl.Migration
+		if m.Role != "analyst" || m.Verifier == "" {
+			t.Fatalf("%s: role %q verifier %q", sql, m.Role, m.Verifier)
+		}
+		v, err := pgwire.ParseSCRAMVerifier(m.Verifier)
+		if err != nil {
+			t.Fatalf("%s: verifier %q: %v", sql, m.Verifier, err)
+		}
+		same, err := pgwire.BuildSCRAMVerifier("secret", v.Salt, v.Iterations)
+		if err != nil || same.String() != m.Verifier {
+			t.Fatalf("%s: verifier does not match the password", sql)
+		}
+		if strings.Contains(m.Statement, "'secret'") || !strings.Contains(m.Statement, m.Verifier) {
+			t.Fatalf("%s: statement %q still carries the plaintext password", sql, m.Statement)
+		}
+		if _, err := p.Plan(context.Background(), session(snap), m.Statement); err != nil {
+			t.Fatalf("rewritten statement %q does not parse: %v", m.Statement, err)
+		}
+	}
+	pl, err := p.Plan(context.Background(), session(snap), "create role r2 login")
+	if err != nil || pl.Migration.Verifier != "" || pl.Migration.Statement != "create role r2 login" {
+		t.Fatalf("no password: %+v %v", pl.Migration, err)
+	}
+	built, err := pgwire.BuildSCRAMVerifier("x", nil, pgwire.DefaultSCRAMIterations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pre := built.String()
+	pl, err = p.Plan(context.Background(), session(snap), "create role r3 password '"+pre+"'")
+	if err != nil || pl.Migration.Verifier != pre {
+		t.Fatalf("pre-hashed verifier: %+v %v", pl.Migration, err)
+	}
+}

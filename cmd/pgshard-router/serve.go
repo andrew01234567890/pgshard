@@ -193,14 +193,15 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		defer forwarder.Close()
 	}
 	rt, err := router.New(router.Config{
-		Snapshot:  w.Current,
-		Poolers:   router.NewPoolers(poolers, w.Current, creds),
-		Logger:    logger,
-		Peers:     peersOrNil(forwarder),
-		Buffering: router.Buffering{Window: *bufferWindow, PerShardCap: *bufferCap, Changes: w.Subscribe},
-		Scatter:   router.ScatterConfig{MaxShards: *scatterMaxShards, MaxStreams: *scatterMaxStreams},
-		Decisions: &router.PGDecisionLog{Pool: pool},
-		Sequences: router.NewSequenceAllocator(&router.PGBlockSource{Pool: pool}),
+		Snapshot:   w.Current,
+		Poolers:    router.NewPoolers(poolers, w.Current, creds),
+		Logger:     logger,
+		Peers:      peersOrNil(forwarder),
+		Buffering:  router.Buffering{Window: *bufferWindow, PerShardCap: *bufferCap, Changes: w.Subscribe},
+		Scatter:    router.ScatterConfig{MaxShards: *scatterMaxShards, MaxStreams: *scatterMaxStreams},
+		Decisions:  &router.PGDecisionLog{Pool: pool},
+		Sequences:  router.NewSequenceAllocator(&router.PGBlockSource{Pool: pool}),
+		Migrations: &router.PGMigrationQueue{Pool: pool},
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)

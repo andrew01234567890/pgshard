@@ -33,9 +33,13 @@ const (
 	// SessionLocal statements (SET, BEGIN, SHOW, ...) run wherever the session
 	// currently is and never choose a shard.
 	SessionLocal
+	// MigrationKind statements are DDL/DCL the router queues as a migration
+	// for the controller to apply on every target shard; Plan.Migration
+	// says how.
+	MigrationKind
 )
 
-var kindNames = [...]string{"Unsharded", "EqualUnique", "In", "Scatter", "Reference", "Refuse", "SessionLocal"}
+var kindNames = [...]string{"Unsharded", "EqualUnique", "In", "Scatter", "Reference", "Refuse", "SessionLocal", "Migration"}
 
 func (k Kind) String() string {
 	if int(k) < len(kindNames) {
@@ -106,6 +110,8 @@ type Plan struct {
 	// NextVal names the global sequence a `SELECT nextval('...')` reads;
 	// the router answers it without visiting a shard (Kind SessionLocal).
 	NextVal string
+	// Migration describes a DDL/DCL statement of Kind MigrationKind.
+	Migration *Migration
 
 	// merge is how the executor combines shard streams when the plan runs
 	// on more than one shard; mergeErr says why it cannot.

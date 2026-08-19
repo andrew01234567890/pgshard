@@ -45,6 +45,14 @@ type stack struct {
 	healthAddr string
 	routerLog  *logBuffer
 	poolerLog  *logBuffer
+
+	controllerBin string
+	controllerLog *logBuffer
+	controller    *exec.Cmd
+	controllerRun <-chan struct{}
+	// shardDSNs are the superuser DSNs of the shards by id, for the
+	// controller's resolver and DDL applier.
+	shardDSNs map[int]string
 }
 
 // routerProc is one extra router process on the stack.
@@ -143,7 +151,7 @@ func buildBinariesTagged(tb testing.TB, tags string) (pooler, rtr string) {
 	if err != nil {
 		tb.Fatal(err)
 	}
-	for _, c := range []string{"pgshard-pooler", "pgshard-router"} {
+	for _, c := range []string{"pgshard-pooler", "pgshard-router", "pgshard-controller"} {
 		cmd := exec.Command("go", "build", "-tags", tags, "-o", filepath.Join(dir, c), "./cmd/"+c)
 		cmd.Dir = root
 		if out, err := cmd.CombinedOutput(); err != nil {
@@ -151,6 +159,48 @@ func buildBinariesTagged(tb testing.TB, tags string) (pooler, rtr string) {
 		}
 	}
 	return filepath.Join(dir, "pgshard-pooler"), filepath.Join(dir, "pgshard-router")
+}
+
+// controllerBinary is the controller built next to the router.
+func controllerBinary(rtr string) string {
+	return filepath.Join(filepath.Dir(rtr), "pgshard-controller")
+}
+
+// startController (re)starts the stack's controller with the shard DSNs
+// known so far; the previous instance, if any, is stopped first.
+func (s *stack) startController(tb testing.TB) {
+	tb.Helper()
+	s.stopController()
+	s.controllerLog = &logBuffer{}
+	args := []string{"run", "--catalog-dsn", s.catalogDSN, "--listen", "", "--election-retry", "500ms", "--apply-interval", "200ms"}
+	for id, dsn := range s.shardDSNs {
+		args = append(args, "--shard-dsn", fmt.Sprintf("default/%d=%s", id, dsn))
+	}
+	s.controller, s.controllerRun = startProcess(tb, s.controllerLog, "reconciling without a gRPC listener", s.controllerBin, args...)
+}
+
+func (s *stack) stopController() {
+	if s.controller == nil {
+		return
+	}
+	_ = s.controller.Process.Signal(os.Interrupt)
+	select {
+	case <-s.controllerRun:
+	case <-time.After(15 * time.Second):
+		_ = s.controller.Process.Kill()
+		<-s.controllerRun
+	}
+	s.controller = nil
+}
+
+// killController stops the controller without warning.
+func (s *stack) killController() {
+	if s.controller == nil {
+		return
+	}
+	_ = s.controller.Process.Kill()
+	<-s.controllerRun
+	s.controller = nil
 }
 
 func startProcess(tb testing.TB, log *logBuffer, ready string, bin string, args ...string) (*exec.Cmd, <-chan struct{}) {
@@ -239,6 +289,9 @@ func startStackFull(tb testing.TB, catalogOpts, shardOpts []string) *stack {
 		"--pg-host", host, "--pg-port", port, "--pg-database", appDatabase,
 		"--catalog-dsn", s.catalogDSN, "--shard-set", router.DefaultShardSet, "--shard-id", "0", "--drain-timeout", "5s")
 	s.routerBin = routerBin
+	s.controllerBin = controllerBinary(routerBin)
+	s.shardDSNs = map[int]string{0: s.shardDSN}
+	s.startController(tb)
 	s.routerPort = fmt.Sprint(freePort(tb))
 	s.routerAddr = "127.0.0.1:" + s.routerPort
 	s.peerAddr = fmt.Sprintf("127.0.0.1:%d", freePort(tb))
