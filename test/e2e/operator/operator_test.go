@@ -240,7 +240,9 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 		if !strings.Contains(during, `"`+victim+`"`) {
 			t.Errorf("dead replica must stay listed: %q", during)
 		}
-		if err := c.WaitPodsReady(ctx, testNamespace, "pgshard.io/cluster="+clusterName, 5*time.Minute); err != nil {
+		// Member pods only: router pods are covered by their own subtest and may
+		// lack an image in some environments.
+		if err := c.WaitPodsReady(ctx, testNamespace, "pgshard.io/cluster="+clusterName+",pgshard.io/group", 5*time.Minute); err != nil {
 			t.Fatal(err)
 		}
 		if err := waitCondition(ctx, c, "Ready", 5*time.Minute); err != nil {
