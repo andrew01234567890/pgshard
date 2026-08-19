@@ -73,6 +73,22 @@ func sampleMigrations() []catalog.DDLMigration {
 	}
 }
 
+func TestBuildMigrationRowRedactsPasswords(t *testing.T) {
+	m := catalog.DDLMigration{ID: "r1", Kind: "CREATE ROLE", State: catalog.MigrationFailed, CreatedAt: t0,
+		Statement: "CREATE ROLE app LOGIN password 'SCRAM-SHA-256$4096:abc$def:ghi'",
+		Error:     `shard 0: role "app" already exists in CREATE ROLE app LOGIN password 'SCRAM-SHA-256$x'`}
+	r := BuildMigrationRow(m, t0)
+	if r.Statement != "CREATE ROLE app LOGIN password '[redacted]'" || r.Short != r.Statement {
+		t.Errorf("statement %q short %q", r.Statement, r.Short)
+	}
+	if strings.Contains(r.Error, "SCRAM") {
+		t.Errorf("error %q", r.Error)
+	}
+	if got := RedactStatement("alter role r password 'it''s' valid until 'infinity'"); got != "alter role r password '[redacted]' valid until 'infinity'" {
+		t.Errorf("escaped quote: %q", got)
+	}
+}
+
 func TestBuildMigrationRowProgressAndDegraded(t *testing.T) {
 	ms := sampleMigrations()
 	now := t0.Add(10 * time.Second)

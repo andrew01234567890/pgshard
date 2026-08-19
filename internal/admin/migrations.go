@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"time"
@@ -124,12 +125,22 @@ var migrationStates = []string{catalog.MigrationQueued, catalog.MigrationRunning
 
 const statementPreview = 80
 
+// passwordOption matches the PASSWORD '<verifier>' option of role
+// statements so neither the page nor its JSON shows a verifier.
+var passwordOption = regexp.MustCompile(`(?i)(PASSWORD\s+)'(?:[^']|'')*'`)
+
+// RedactStatement hides password verifiers in a statement shown to users.
+func RedactStatement(sql string) string {
+	return passwordOption.ReplaceAllString(sql, "${1}'[redacted]'")
+}
+
 // BuildMigrationRow converts a catalog row into the UI's shape.
 func BuildMigrationRow(m catalog.DDLMigration, now time.Time) MigrationRow {
-	r := MigrationRow{ID: m.ID, Database: m.Database, Kind: m.Kind, Strategy: m.Strategy, State: m.State, Statement: m.Statement,
-		Short: m.Statement, CreatedAt: m.CreatedAt, FinishedAt: m.FinishedAt, Error: m.Error, Shards: []ShardRow{}}
-	if len([]rune(m.Statement)) > statementPreview {
-		r.Short, r.Truncated = string([]rune(m.Statement)[:statementPreview])+"…", true
+	statement := RedactStatement(m.Statement)
+	r := MigrationRow{ID: m.ID, Database: m.Database, Kind: m.Kind, Strategy: m.Strategy, State: m.State, Statement: statement,
+		Short: statement, CreatedAt: m.CreatedAt, FinishedAt: m.FinishedAt, Error: RedactStatement(m.Error), Shards: []ShardRow{}}
+	if len([]rune(statement)) > statementPreview {
+		r.Short, r.Truncated = string([]rune(statement)[:statementPreview])+"…", true
 	}
 	end := now
 	if m.FinishedAt != nil {
