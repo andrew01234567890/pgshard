@@ -78,7 +78,7 @@ func startPostgres(t *testing.T, img pgImage) string {
 	port := freePort(t)
 	args := []string{"run", "-d", "--rm", "-p", fmt.Sprintf("127.0.0.1:%d:5432", port)}
 	if img.bare {
-		args = append(args, img.name, "sh", "-ec",
+		args = append(args, "--entrypoint", "sh", img.name, "-ec",
 			`initdb -D /tmp/pgdata --auth=trust -U postgres >/dev/null &&
 			 echo "host all all all trust" >> /tmp/pgdata/pg_hba.conf &&
 			 exec postgres -D /tmp/pgdata -c listen_addresses='*'`)

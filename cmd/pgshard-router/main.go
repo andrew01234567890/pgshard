@@ -12,5 +12,6 @@ func main() {
 		"serve":         serve,
 		"parse":         runParse,
 		"catalog-watch": runCatalogWatch,
+		"dev-bootstrap": runDevBootstrap,
 	}))
 }

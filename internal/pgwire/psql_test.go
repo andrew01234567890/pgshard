@@ -46,7 +46,7 @@ func TestPsqlConformance(t *testing.T) {
 		name := "pgwire-psql-" + strings.ReplaceAll(t.Name(), "/", "-")
 		full := append([]string{"run", "--rm", "--name", name, "--add-host", "host.docker.internal:host-gateway",
 			"-e", "PGPASSWORD=" + password, "-e", "PGCONNECT_TIMEOUT=10",
-			psqlImage, "psql", "-h", "host.docker.internal", "-p", port, "-U", "alice", "-d", "db", "-X", "-v", "ON_ERROR_STOP=1"}, args...)
+			"--entrypoint", "psql", psqlImage, "-h", "host.docker.internal", "-p", port, "-U", "alice", "-d", "db", "-X", "-v", "ON_ERROR_STOP=1"}, args...)
 		t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", name).Run() })
 		// Docker Desktop publishes new host listeners to host-gateway lazily,
 		// so a first attempt can be refused; retry a few times.

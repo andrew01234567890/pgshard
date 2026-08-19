@@ -1,0 +1,200 @@
+//go:build integration
+
+package router
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/andrew01234567890/pgshard/internal/router"
+)
+
+const (
+	appDatabase = "app"
+	appRole     = "app"
+	appPassword = "app-secret"
+)
+
+func pgImage() string {
+	if v := os.Getenv("PGSHARD_PG_IMAGE"); v != "" {
+		return v
+	}
+	return "ghcr.io/andrew01234567890/pgshard-postgres:18"
+}
+
+// stack is one catalog, one shard, a pooler and a router.
+type stack struct {
+	catalogDSN string
+	shardAddr  string
+	shardDSN   string
+	routerAddr string
+	routerPort string
+	poolerAddr string
+	routerLog  *logBuffer
+	poolerLog  *logBuffer
+}
+
+type logBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *logBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *logBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+func requireDocker(tb testing.TB) {
+	tb.Helper()
+	if _, err := exec.LookPath("docker"); err != nil {
+		tb.Skip("docker not on PATH")
+	}
+	if err := exec.Command("docker", "info").Run(); err != nil {
+		tb.Skip("docker daemon unavailable")
+	}
+	if exec.Command("docker", "image", "inspect", pgImage()).Run() != nil {
+		if out, err := exec.Command("docker", "pull", pgImage()).CombinedOutput(); err != nil {
+			tb.Skipf("image %s unavailable: %v: %s", pgImage(), err, out)
+		}
+	}
+}
+
+func freePort(tb testing.TB) int {
+	tb.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer func() { _ = l.Close() }()
+	return l.Addr().(*net.TCPAddr).Port
+}
+
+func startPostgres(tb testing.TB, name string) (addr, adminDSN string) {
+	tb.Helper()
+	port := freePort(tb)
+	script := `initdb -D /tmp/pgdata --auth=trust -U postgres >/dev/null &&
+		 printf 'host all postgres all trust\nhost all all all scram-sha-256\n' >> /tmp/pgdata/pg_hba.conf &&
+		 exec postgres -D /tmp/pgdata -c listen_addresses='*' -c wal_level=logical`
+	cname := fmt.Sprintf("pgshard-router-e2e-%s-%d", name, port)
+	out, err := exec.Command("docker", "run", "-d", "--rm", "--name", cname, "-p", fmt.Sprintf("127.0.0.1:%d:5432", port), "--entrypoint", "sh", pgImage(), "-ec", script).CombinedOutput()
+	if err != nil {
+		tb.Fatalf("docker run: %v: %s", err, out)
+	}
+	tb.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", cname).Run() })
+	addr = fmt.Sprintf("127.0.0.1:%d", port)
+	adminDSN = fmt.Sprintf("postgres://postgres@%s/postgres?sslmode=disable", addr)
+	deadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		conn, err := pgx.Connect(ctx, adminDSN)
+		cancel()
+		if err == nil {
+			_ = conn.Close(context.Background())
+			return addr, adminDSN
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	logs, _ := exec.Command("docker", "logs", cname).CombinedOutput()
+	tb.Fatalf("%s did not become ready:\n%s", name, logs)
+	return "", ""
+}
+
+func buildBinaries(tb testing.TB) (pooler, rtr string) {
+	tb.Helper()
+	dir := tb.TempDir()
+	root, err := filepath.Abs("../../..")
+	if err != nil {
+		tb.Fatal(err)
+	}
+	for _, c := range []string{"pgshard-pooler", "pgshard-router"} {
+		cmd := exec.Command("go", "build", "-o", filepath.Join(dir, c), "./cmd/"+c)
+		cmd.Dir = root
+		if out, err := cmd.CombinedOutput(); err != nil {
+			tb.Fatalf("build %s: %v: %s", c, err, out)
+		}
+	}
+	return filepath.Join(dir, "pgshard-pooler"), filepath.Join(dir, "pgshard-router")
+}
+
+func startProcess(tb testing.TB, log *logBuffer, ready string, bin string, args ...string) {
+	tb.Helper()
+	cmd := exec.Command(bin, args...)
+	cmd.Stdout, cmd.Stderr = log, log
+	if err := cmd.Start(); err != nil {
+		tb.Fatal(err)
+	}
+	tb.Cleanup(func() {
+		_ = cmd.Process.Signal(os.Interrupt)
+		done := make(chan struct{})
+		go func() { _, _ = cmd.Process.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			_ = cmd.Process.Kill()
+		}
+	})
+	deadline := time.Now().Add(60 * time.Second)
+	for !strings.Contains(log.String(), ready) {
+		if time.Now().After(deadline) {
+			tb.Fatalf("%s did not report %q:\n%s", filepath.Base(bin), ready, log.String())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func startStack(tb testing.TB) *stack {
+	tb.Helper()
+	requireDocker(tb)
+	poolerBin, routerBin := buildBinaries(tb)
+	s := &stack{routerLog: &logBuffer{}, poolerLog: &logBuffer{}}
+	var catalogAddr string
+	catalogAddr, s.catalogDSN = startPostgres(tb, "catalog")
+	_ = catalogAddr
+	s.shardAddr, s.shardDSN = startPostgres(tb, "shard0")
+	s.poolerAddr = fmt.Sprintf("127.0.0.1:%d", freePort(tb))
+	err := router.DevBootstrap{CatalogDSN: s.catalogDSN, ShardDSN: s.shardDSN, Database: appDatabase, Role: appRole,
+		Password: appPassword, PoolerEndpoint: s.poolerAddr, Epoch: 1}.Run(context.Background())
+	if err != nil {
+		tb.Fatalf("bootstrap: %v", err)
+	}
+	host, port, _ := net.SplitHostPort(s.shardAddr)
+	startProcess(tb, s.poolerLog, "listening on", poolerBin, "run", "--insecure-dev", "--listen", s.poolerAddr,
+		"--pg-host", host, "--pg-port", port, "--pg-database", appDatabase,
+		"--catalog-dsn", s.catalogDSN, "--shard-set", router.DefaultShardSet, "--shard-id", "0", "--drain-timeout", "5s")
+	s.routerPort = fmt.Sprint(freePort(tb))
+	s.routerAddr = "127.0.0.1:" + s.routerPort
+	startProcess(tb, s.routerLog, "listening on", routerBin, "serve", "--insecure-dev", "--listen", "0.0.0.0:"+s.routerPort,
+		"--catalog-dsn", s.catalogDSN, "--drain-timeout", "5s")
+	return s
+}
+
+func (s *stack) dsn(user, password, db string) string {
+	return fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", user, password, s.routerAddr, db)
+}
+
+func (s *stack) connect(tb testing.TB) *pgx.Conn {
+	tb.Helper()
+	conn, err := pgx.Connect(context.Background(), s.dsn(appRole, appPassword, appDatabase))
+	if err != nil {
+		tb.Fatalf("connect through router: %v\nrouter log:\n%s\npooler log:\n%s", err, s.routerLog.String(), s.poolerLog.String())
+	}
+	tb.Cleanup(func() { _ = conn.Close(context.Background()) })
+	return conn
+}
