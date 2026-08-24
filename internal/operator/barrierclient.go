@@ -2,12 +2,16 @@ package operator
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
@@ -117,13 +121,46 @@ type BarrierClient interface {
 }
 
 // GRPCBarrierClient is the production BarrierClient over pgshard.v1.Controller.
-type GRPCBarrierClient struct{}
+type GRPCBarrierClient struct {
+	// Creds secures the controller connection; nil dials plaintext, which
+	// only a controller run with --insecure-dev accepts.
+	Creds credentials.TransportCredentials
+}
+
+// NewGRPCBarrierClient builds the barrier client from the operator's
+// --controller-tls-* files: all three set dials mTLS, none set dials
+// plaintext, anything else is an error.
+func NewGRPCBarrierClient(certFile, keyFile, caFile string) (GRPCBarrierClient, error) {
+	if certFile == "" && keyFile == "" && caFile == "" {
+		return GRPCBarrierClient{}, nil
+	}
+	if certFile == "" || keyFile == "" || caFile == "" {
+		return GRPCBarrierClient{}, errors.New("--controller-tls-cert, --controller-tls-key and --controller-tls-ca must be set together")
+	}
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return GRPCBarrierClient{}, err
+	}
+	pem, err := os.ReadFile(caFile)
+	if err != nil {
+		return GRPCBarrierClient{}, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return GRPCBarrierClient{}, fmt.Errorf("%s: no certificates found", caFile)
+	}
+	return GRPCBarrierClient{Creds: credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: pool, MinVersion: tls.VersionTLS13})}, nil
+}
 
 const barrierRPCTimeout = 5 * time.Minute
 
 // CreateBarrier implements BarrierClient.
-func (GRPCBarrierClient) CreateBarrier(ctx context.Context, addr, name string) error {
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+func (c GRPCBarrierClient) CreateBarrier(ctx context.Context, addr, name string) error {
+	creds := c.Creds
+	if creds == nil {
+		creds = insecure.NewCredentials()
+	}
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(creds))
 	if err != nil {
 		return err
 	}

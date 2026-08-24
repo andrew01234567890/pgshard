@@ -93,6 +93,46 @@ func TestSchedulerFiresBarriersPerBoundCluster(t *testing.T) {
 	if want := []string{"beta.default:1 nightly-beta-20260819-0200", "demo.default:1 nightly-demo-20260819-0200"}; strings.Join(fb.calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("calls %v", fb.calls)
 	}
+	if last, ok := s.LastBarrier(key); !ok || !last.At.Equal(tick) || !strings.Contains(last.Error, "cluster beta") {
+		t.Fatalf("last barrier %+v ok=%v", last, ok)
+	}
+	r := &BackupPolicyReconciler{Client: cl, Scheduler: s, Now: func() time.Time { return tick }}
+	barrierCondition := func() *metav1.Condition {
+		t.Helper()
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+			t.Fatal(err)
+		}
+		var got pgshardv1alpha1.PgShardBackupPolicy
+		if err := cl.Get(context.Background(), key, &got); err != nil {
+			t.Fatal(err)
+		}
+		return meta.FindStatusCondition(got.Status.Conditions, ConditionBarrierHealthy)
+	}
+	if cond := barrierCondition(); cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "BarrierFailed" || !strings.Contains(cond.Message, "2026-08-19T02:00:00Z: cluster beta (beta.default:1): barrier nightly-beta-20260819-0200: drain: still in flight") {
+		t.Fatalf("failed barrier condition %+v", cond)
+	}
+	delete(fb.fail, "beta.default:1")
+	if err := s.FireBarrier(context.Background(), key); err != nil {
+		t.Fatal(err)
+	}
+	if cond := barrierCondition(); cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != "Recorded" {
+		t.Fatalf("recorded barrier condition %+v", cond)
+	}
+	s.Remove(key)
+	if cond := barrierCondition(); cond == nil || cond.Status != metav1.ConditionUnknown || cond.Reason != "NotFiredYet" {
+		t.Fatalf("fresh condition %+v", cond)
+	}
+	var stored pgshardv1alpha1.PgShardBackupPolicy
+	if err := cl.Get(context.Background(), key, &stored); err != nil {
+		t.Fatal(err)
+	}
+	stored.Spec.BarrierSchedule = ""
+	if err := cl.Update(context.Background(), &stored); err != nil {
+		t.Fatal(err)
+	}
+	if cond := barrierCondition(); cond != nil {
+		t.Fatalf("policy without barrier schedule carries %+v", cond)
+	}
 	if err := s.FireBarrier(context.Background(), types.NamespacedName{Namespace: "default", Name: "gone"}); err != nil {
 		t.Fatal("missing policy must be ignored:", err)
 	}

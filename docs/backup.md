@@ -139,10 +139,16 @@ creates one `PgShardBackup` per bound cluster, named
 unless that cluster's previous scheduled backup is still pending or running.
 `barrierSchedule` ticks instead ask each bound cluster's controller for a
 [certified barrier](#certified-barriers) named
-`<policy>-<cluster>-<yyyymmdd-hhmm>`.
+`<policy>-<cluster>-<yyyymmdd-hhmm>`. The operator dials that controller
+with the client certificate given by its `--controller-tls-cert`,
+`--controller-tls-key` and `--controller-tls-ca` flags; without them it
+dials plaintext, which only a controller run with `--insecure-dev` accepts.
 
 Policy status: `Valid` (store settings and cron expressions parse),
-`BackupHealthy` aggregated over the bound clusters, and `status.clusters[]`
+`BackupHealthy` aggregated over the bound clusters, `BarrierHealthy` (only
+with a `barrierSchedule`: `True` once the last tick reached every bound
+controller, `False` with the joined errors, `Unknown` before the first
+tick), and `status.clusters[]`
 with each cluster's `lastFullTime`/`lastDifferentialTime`/
 `lastIncrementalTime`, `healthy` and message. The cluster carries its own
 `BackupHealthy` condition (`NoPolicy` when `spec.backup.policyRef` is empty,
