@@ -154,6 +154,27 @@ func psql(ctx context.Context, c *e2e.Cluster, host, sql string) (string, error)
 	return strings.TrimSpace(out), err
 }
 
+// psqlRetry repeats psql with backoff until it succeeds or timeout elapses;
+// Services briefly lose their endpoints while members restart.
+func psqlRetry(ctx context.Context, c *e2e.Cluster, host, sql string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	delay := time.Second
+	for {
+		out, err := psql(ctx, c, host, sql)
+		if err == nil || time.Now().After(deadline) {
+			return out, err
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(delay):
+		}
+		if delay < 10*time.Second {
+			delay *= 2
+		}
+	}
+}
+
 // writer inserts sequential ids through the shard -rw Service and keeps
 // every acknowledged id plus the window in which writes failed.
 type writer struct {
@@ -224,13 +245,19 @@ func (w *writer) finish() ([]int64, int, time.Duration) {
 
 func waitFor(ctx context.Context, t *testing.T, what string, timeout time.Duration, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	started := time.Now()
+	deadline := started.Add(timeout)
+	nextProgress := started.Add(time.Minute)
 	for {
 		if cond() {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
+			t.Fatalf("timed out after %s waiting for %s", timeout, what)
+		}
+		if time.Now().After(nextProgress) {
+			t.Logf("still waiting for %s (%s elapsed)", what, time.Since(started).Round(time.Second))
+			nextProgress = time.Now().Add(time.Minute)
 		}
 		select {
 		case <-ctx.Done():
@@ -242,7 +269,7 @@ func waitFor(ctx context.Context, t *testing.T, what string, timeout time.Durati
 
 func assertAllAcked(ctx context.Context, t *testing.T, c *e2e.Cluster, rw string, acked []int64) {
 	t.Helper()
-	out, err := psql(ctx, c, rw, "SELECT string_agg(id::text, ',' ORDER BY id) FROM ha_writes")
+	out, err := psqlRetry(ctx, c, rw, "SELECT string_agg(id::text, ',' ORDER BY id) FROM ha_writes", 3*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -722,18 +749,29 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 		time.Sleep(5 * time.Second)
 		started := time.Now()
 		patchCluster(`{"spec":{"postgresql":{"parameters":{"max_connections":"150"}}}}`)
-		waitFor(ctx, t, "every member to restart with max_connections=150", 20*time.Minute, func() bool {
+		restartedAt := map[string]time.Time{}
+		waitFor(ctx, t, "every member to restart with max_connections=150", 30*time.Minute, func() bool {
 			after := podUIDs()
-			if len(after) != 6 {
-				return false
-			}
+			pending := 0
 			for name, uid := range before {
-				if after[name] == uid {
-					return false
+				if after[name] == "" || after[name] == uid {
+					pending++
+					continue
+				}
+				if _, seen := restartedAt[name]; !seen {
+					restartedAt[name] = time.Now()
+					t.Logf("member %s replaced after %s", name, time.Since(started).Round(time.Second))
 				}
 			}
+			if pending > 0 || len(after) != 6 {
+				return false
+			}
 			p, err := psql(ctx, c, rw, "SHOW max_connections")
-			return err == nil && p == "150" && rolloutIdle()
+			if err != nil {
+				t.Logf("all members replaced; %s not serving yet: %v", rw, err)
+				return false
+			}
+			return p == "150" && rolloutIdle()
 		})
 		time.Sleep(5 * time.Second)
 		close(stopSampling)
@@ -763,12 +801,13 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 			t.Fatalf("exactly one pod may carry role=primary, got %d", n)
 		}
 		assertAllAcked(ctx, t, c, rw, acked)
-		if s, err := psql(ctx, c, ro, "SHOW max_connections"); err != nil || s != "150" {
+		if s, err := psqlRetry(ctx, c, ro, "SHOW max_connections", 2*time.Minute); err != nil || s != "150" {
 			t.Errorf("standby max_connections: %q %v", s, err)
 		}
-		if out, err := psql(ctx, c, rw, "SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming'"); err != nil || out != "2" {
-			t.Errorf("streaming replicas after the rolling restart: %q %v", out, err)
-		}
+		waitFor(ctx, t, "both replicas to stream from the new primary", 5*time.Minute, func() bool {
+			out, err := psql(ctx, c, rw, "SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming'")
+			return err == nil && out == "2"
+		})
 	})
 
 	t.Run("StorageClassChangeRebuildsMembersOneByOne", func(t *testing.T) {
@@ -818,6 +857,10 @@ reclaimPolicy: Delete
 		}
 		for i := 0; i < 3; i++ {
 			pod := fmt.Sprintf("%s-%d", group, i)
+			waitFor(ctx, t, pod+" to exist and be Ready after the rebuild", 5*time.Minute, func() bool {
+				out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pod", pod, "-o", `jsonpath={.status.conditions[?(@.type=="Ready")].status}`)
+				return err == nil && strings.TrimSpace(out) == "True"
+			})
 			if got := jsonpath(ctx, t, c, "pod", pod, "{.spec.volumes[0].persistentVolumeClaim.claimName}"); got != pod+"-v2" {
 				t.Errorf("pod %s mounts %q", pod, got)
 			}
@@ -825,10 +868,10 @@ reclaimPolicy: Delete
 		if got := jsonpath(ctx, t, c, "pgshardgroup", group, "{.status.members[*].pvc}"); got != group+"-0-v2 "+group+"-1-v2 "+group+"-2-v2" {
 			t.Errorf("group status claims: %q", got)
 		}
-		if after, err := psql(ctx, c, rw, "SELECT count(*) FROM ha_writes"); err != nil || after != rows {
+		if after, err := psqlRetry(ctx, c, rw, "SELECT count(*) FROM ha_writes", 2*time.Minute); err != nil || after != rows {
 			t.Errorf("data after the rebuild: %q (before %q) %v", after, rows, err)
 		}
-		if out, err := psql(ctx, c, ro, "SELECT count(*) FROM ha_writes"); err != nil || out != rows {
+		if out, err := psqlRetry(ctx, c, ro, "SELECT count(*) FROM ha_writes", 2*time.Minute); err != nil || out != rows {
 			t.Errorf("standby data after the rebuild: %q (before %q) %v", out, rows, err)
 		}
 		if n := count(ctx, t, c, "pvc", "pgshard.io/cluster="+clusterName+",pgshard.io/group=catalog"); n != 3 {

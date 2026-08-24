@@ -21,8 +21,19 @@ except ImportError:
 
 SHA_RE = re.compile(r"^[^@]+@[0-9a-f]{40}$")
 INTERP_RE = re.compile(
-    r"\$\{\{\s*github\.event\.(pull_request\.(title|body|head\.ref)|issue\.(title|body)|comment\.body)\s*\}\}"
+    r"\$\{\{\s*github\.(event\.(pull_request\.(title|body|head\.ref|head\.repo\.full_name)|issue\.(title|body)|comment\.body)|head_ref)\s*\}\}"
 )
+DOCKER_DIGEST_RE = re.compile(r"^docker://[^@]+@sha256:[0-9a-f]{64}$")
+
+def walk_strings(v):
+    if isinstance(v, str):
+        yield v
+    elif isinstance(v, dict):
+        for x in v.values():
+            yield from walk_strings(x)
+    elif isinstance(v, list):
+        for x in v:
+            yield from walk_strings(x)
 
 def norm_perms(p):
     return {k.lower(): (v.lower() if isinstance(v, str) else v) for k, v in p.items()} if isinstance(p, dict) else p
@@ -66,12 +77,17 @@ for path in sys.argv[1:]:
                 continue
             swhere = f"{where} step {i + 1}"
             uses = step.get("uses")
-            if isinstance(uses, str) and not uses.startswith("./") and not uses.startswith("docker://"):
+            if isinstance(uses, str) and uses.startswith("docker://"):
+                if not DOCKER_DIGEST_RE.match(uses):
+                    errs.append(f"{swhere}: docker:// action not pinned by sha256 digest: {uses}")
+            elif isinstance(uses, str) and not uses.startswith("./"):
                 if not SHA_RE.match(uses):
                     errs.append(f"{swhere}: action not pinned to a 40-hex SHA: {uses}")
             run = step.get("run")
             if isinstance(run, str) and INTERP_RE.search(run):
                 errs.append(f"{swhere}: untrusted event field interpolated into run block")
+            if any(INTERP_RE.search(v) for v in walk_strings(step.get("with"))):
+                errs.append(f"{swhere}: untrusted event field interpolated into with: input")
 
 if errs:
     print("check-actions: FAIL")

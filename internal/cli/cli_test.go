@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -132,5 +133,28 @@ func TestSubcommandDispatch(t *testing.T) {
 	}
 	if code := RunWith(name, []string{"other"}, &out, &errb, sub); code != 2 {
 		t.Fatalf("unknown subcommand code=%d", code)
+	}
+}
+
+func TestEveryMainPassesItsOwnName(t *testing.T) {
+	entries, err := os.ReadDir(filepath.Join("..", "..", "cmd"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile(`cli\.Run(?:With)?\("([^"]+)"`)
+	for _, e := range entries {
+		src, err := os.ReadFile(filepath.Join("..", "..", "cmd", e.Name(), "main.go"))
+		if err != nil {
+			t.Errorf("cmd/%s: %v", e.Name(), err)
+			continue
+		}
+		m := re.FindSubmatch(src)
+		if m == nil {
+			t.Errorf("cmd/%s/main.go does not call cli.Run/RunWith with a string literal", e.Name())
+			continue
+		}
+		if got := string(m[1]); got != e.Name() {
+			t.Errorf("cmd/%s/main.go passes name %q", e.Name(), got)
+		}
 	}
 }

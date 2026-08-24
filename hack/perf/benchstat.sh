@@ -5,7 +5,6 @@ set -euo pipefail
 base_ref="${1:-${PERF_BASE_REF:-origin/main}}"
 out="${2:-${PERF_OUT_DIR:-perf-out}}"
 count="${PERF_COUNT:-10}"
-threshold="${PERF_THRESHOLD_PCT:-20}"
 pkgs="${PERF_PKGS:-./test/perf/...}"
 BENCHSTAT_VERSION="${BENCHSTAT_VERSION:-v0.0.0-20260813145340-fd4a688df892}"
 
@@ -41,19 +40,8 @@ run_bench "$root" > "$out/head.txt"
   echo '```'
 } > "$out/summary.md"
 
-# CSV rows: name, base-center, base-ci, head-center, head-ci, delta, p-value, ...
-# A "~" delta means no statistically significant change.
 fail=0
-while IFS=, read -r name _ _ _ _ delta pval _; do
-  [ -z "$name" ] && continue
-  case "$name" in name*|goos*|goarch*|pkg*|cpu*|geomean*|"") continue ;; esac
-  case "$delta" in ~|"") continue ;; esac
-  d="${delta//[+%\"]/}"
-  if awk -v d="$d" -v t="$threshold" 'BEGIN{exit !(d+0 > t+0)}'; then
-    echo "REGRESSION: $name $delta ($pval)" >> "$out/summary.md"
-    fail=1
-  fi
-done < "$out/compare.csv"
+"$root/hack/perf/gate.sh" "$out/compare.csv" >> "$out/summary.md" || fail=1
 
 cat "$out/summary.md"
 exit "$fail"
