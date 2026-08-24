@@ -270,31 +270,31 @@ func (a *Applier) backfill(ctx context.Context, conn ShardConn, rw *catalog.Rewr
 		sql := "WITH batch AS (SELECT " + pk + " FROM " + table + " WHERE " + pred +
 			" ORDER BY " + pk + " LIMIT " + fmt.Sprint(batch) + ")" +
 			" UPDATE " + table + " t SET " + set + " FROM batch WHERE t." + pk + " = batch." + pk
-		// A volatile DEFAULT that yields NULL (add) or an unstable USING
-		// (type change) leaves updated rows still matching pred, so the
-		// keyset never advances: fail on a stalled minimum instead of
-		// looping forever.
-		probe := "SELECT coalesce(min(" + pk + ")::text, '') FROM " + table + " WHERE " + pred
+		// RowsAffected undercounts when a concurrent DELETE or PK change
+		// removes a selected row before the UPDATE reaches it, so a short
+		// batch does not prove the backfill finished: only a probe that
+		// finds no matching row does. The probe returns zero rows when
+		// done and the minimum matching key otherwise; a stalled minimum
+		// after an update means a volatile DEFAULT yielding NULL or an
+		// unstable USING keeps rows matching pred forever.
+		probe := "SELECT " + pk + "::text FROM " + table + " WHERE " + pred + " ORDER BY " + pk + " LIMIT 1"
 		lastMin, haveMin := "", false
 		for {
-			tag, err := conn.Exec(ctx, sql)
-			if err != nil {
+			if _, err := conn.Exec(ctx, sql); err != nil {
 				return err
-			}
-			if tag == nil || tag.RowsAffected() < int64(batch) {
-				return nil
 			}
 			rows, err := conn.Query(ctx, probe)
 			if err != nil {
 				return err
 			}
-			minKey, err := pgx.CollectOneRow(rows, pgx.RowTo[string])
+			mins, err := pgx.CollectRows(rows, pgx.RowTo[string])
 			if err != nil {
 				return err
 			}
-			if minKey == "" {
+			if len(mins) == 0 {
 				return nil
 			}
+			minKey := mins[0]
 			if haveMin && minKey == lastMin {
 				return fmt.Errorf("backfill of %s is not converging: rows keep matching %q after being updated (a volatile DEFAULT returning NULL or an unstable USING expression cannot be backfilled); fix the expression and run the migration again", table, pred)
 			}

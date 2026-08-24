@@ -119,9 +119,12 @@ type fakeShards struct {
 	nnPending    bool
 	version      int
 	affected     func(shard int32, sql string) int64
-	backfillMin  func(shard int32) string
-	probe        int
-	sweepDrops   []string
+	// backfillProbe scripts the remaining-rows probe: the returned slice
+	// is empty when no rows match the backfill predicate. call counts
+	// probes per shard from 0. nil means every probe finds nothing left.
+	backfillProbe func(shard int32, call int) []string
+	probeCalls    map[int32]int
+	sweepDrops    []string
 }
 
 func newFakeShards() *fakeShards {
@@ -206,15 +209,19 @@ func (c *fakeConn) Query(_ context.Context, sql string, args ...any) (pgx.Rows, 
 		return &stringRows{vals: c.f.columns}, nil
 	case strings.Contains(sql, "indisprimary"):
 		return &stringRows{vals: c.f.pks}, nil
-	case strings.Contains(sql, "coalesce(min("):
-		if c.f.backfillMin != nil {
-			return &stringRows{vals: []string{c.f.backfillMin(c.id)}}, nil
-		}
+	case strings.Contains(sql, "::text FROM") && strings.Contains(sql, "LIMIT 1"):
 		c.f.mu.Lock()
-		c.f.probe++
-		v := fmt.Sprint(c.f.probe)
+		if c.f.probeCalls == nil {
+			c.f.probeCalls = map[int32]int{}
+		}
+		call := c.f.probeCalls[c.id]
+		c.f.probeCalls[c.id] = call + 1
+		probe := c.f.backfillProbe
 		c.f.mu.Unlock()
-		return &stringRows{vals: []string{v}}, nil
+		if probe == nil {
+			return &stringRows{}, nil
+		}
+		return &stringRows{vals: probe(c.id, call)}, nil
 	case strings.Contains(sql, "pg_get_expr"):
 		return &factsRows{def: c.f.oldDefault, notNull: c.f.oldNotNull}, nil
 	case strings.Contains(sql, "NOT convalidated"):
