@@ -27,6 +27,7 @@ import (
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/metrics"
 	"github.com/andrew01234567890/pgshard/internal/pooler"
+	"github.com/andrew01234567890/pgshard/internal/pprofserve"
 )
 
 func run(args []string, stdout, stderr io.Writer) int {
@@ -65,6 +66,7 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	streamDSN := fs.String("stream-dsn", "", "superuser DSN for change-stream replication connections (enables Stream)")
 	streamShard := fs.String("stream-shard", "", "group name used in stream slot names (default derived from --shard-set/--shard-id)")
 	metricsListen := fs.String("metrics-listen", "", "HTTP address for /metrics (empty disables)")
+	pprofListen := fs.String("pprof-listen", "", "HTTP address for /debug/pprof (empty disables; profiling runs only)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return cli.ExitOK
@@ -124,6 +126,14 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	}
 	poolCfg.OnWait = func() { pm.PoolWaits.Inc() }
 	pool = pooler.NewPool(poolCfg, dialer)
+	if *pprofListen != "" {
+		pa, err := pprofserve.Serve(ctx, *pprofListen)
+		if err != nil {
+			fmt.Fprintf(stderr, "pgshard-pooler run: %v\n", err)
+			return cli.ExitNotReady
+		}
+		fmt.Fprintf(stdout, "pgshard-pooler run: pprof on %s\n", pa)
+	}
 	if *metricsListen != "" {
 		go func() {
 			if err := metrics.Serve(ctx, *metricsListen, reg); err != nil {
