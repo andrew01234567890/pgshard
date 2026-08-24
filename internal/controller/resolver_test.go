@@ -92,7 +92,7 @@ func (f *resolverFixture) prepare(id int, gid, v string) {
 
 func (f *resolverFixture) decide(gid, state string, age time.Duration, participants ...int32) {
 	f.t.Helper()
-	mustExecPool(f.t, f.pool, `INSERT INTO pgshard.xact_decisions (gid, state, participants, created_at) VALUES ($1, $2, $3, now() - $4::interval)`,
+	mustExecPool(f.t, f.pool, `INSERT INTO pgshard.xact_decisions (gid, state, participants, created_at, heartbeat_at) VALUES ($1, $2, $3, now() - $4::interval, now() - $4::interval)`,
 		gid, state, participants, age)
 }
 
@@ -331,5 +331,39 @@ func TestResolverFinishesOtherDatabase(t *testing.T) {
 	}
 	if strings.Join(vs, ",") != "db-commit" {
 		t.Fatalf("appdb values %v", vs)
+	}
+}
+
+func TestResolverSparesPreparingRowWithLiveHeartbeat(t *testing.T) {
+	f := newResolverFixture(t)
+	ctx := context.Background()
+	// The row is far older than the preparing timeout, but its coordinator
+	// heartbeat is fresh: the router is alive and merely slow between
+	// PREPARE and the commit decision, so the resolver must not abort it.
+	f.prepare(1, "pgshard-h-1-1", "slow-live")
+	mustExecPool(t, f.pool, `INSERT INTO pgshard.xact_decisions (gid, state, participants, created_at, heartbeat_at)
+		VALUES ('pgshard-h-1-1', 'preparing', '{1}', now() - interval '10 minutes', now())`)
+	out, err := f.res.Resolve(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != (Outcome{}) {
+		t.Fatalf("outcome %+v: a live coordinator's transaction was resolved", out)
+	}
+	if got := f.prepared(1); strings.Join(got, ",") != "pgshard-h-1-1" {
+		t.Fatalf("shard 1 prepared %v: the transaction must stay for its coordinator", got)
+	}
+	if got := f.decisions(); strings.Join(got, ",") != "pgshard-h-1-1:preparing" {
+		t.Fatalf("decisions %v", got)
+	}
+	// Once the heartbeat goes stale the coordinator is presumed dead and
+	// the undecided transaction is aborted.
+	mustExecPool(t, f.pool, `UPDATE pgshard.xact_decisions SET heartbeat_at = now() - interval '10 minutes' WHERE gid = 'pgshard-h-1-1'`)
+	out, err = f.res.Resolve(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.RolledBack != 1 || len(f.prepared(1)) != 0 || len(f.decisions()) != 0 {
+		t.Fatalf("outcome %+v prepared %v decisions %v", out, f.prepared(1), f.decisions())
 	}
 }

@@ -22,9 +22,10 @@ const GIDPrefix = "pgshard-"
 // router only escalates transactions of routable databases.
 const decisionShardSet = "default"
 
-// DefaultPreparingTimeout is how long a decision row may stay preparing
-// before the resolver decides abort for it: the router that owned it is
-// presumed dead.
+// DefaultPreparingTimeout is how long a preparing decision row may go
+// without a coordinator heartbeat before the resolver decides abort for
+// it: the router that owned it is presumed dead. Live coordinators beat
+// far more often than this, so only a dead one ages out.
 const DefaultPreparingTimeout = 10 * time.Second
 
 // ShardConn is a connection to one shard's primary with the privileges to
@@ -80,7 +81,9 @@ type decision struct {
 	GID          string
 	State        string
 	Participants []int32
-	CreatedAt    time.Time
+	// LastAlive is the later of the row's creation and its coordinator's
+	// last heartbeat.
+	LastAlive time.Time
 }
 
 // holder is one place a prepared transaction sits: a shard's primary and
@@ -97,7 +100,7 @@ func (r *Resolver) Resolve(ctx context.Context, shardSet string) (Outcome, error
 		logger = slog.Default()
 	}
 	var out Outcome
-	rows, err := r.Pool.Query(ctx, `SELECT gid, state, participants, created_at FROM pgshard.xact_decisions ORDER BY created_at`)
+	rows, err := r.Pool.Query(ctx, `SELECT gid, state, participants, greatest(created_at, heartbeat_at) FROM pgshard.xact_decisions ORDER BY created_at`)
 	if err != nil {
 		return out, fmt.Errorf("resolver: decisions: %w", err)
 	}
@@ -196,7 +199,7 @@ func (r *Resolver) preparingTimeout() time.Duration {
 // deleted only once every shard was searched and none still holds the gid.
 func (r *Resolver) resolveDecision(ctx context.Context, d decision, holders map[string][]holder, complete bool, out *Outcome) error {
 	if d.State == "preparing" {
-		if r.now().Sub(d.CreatedAt) < r.preparingTimeout() {
+		if r.now().Sub(d.LastAlive) < r.preparingTimeout() {
 			return nil
 		}
 		tag, err := r.Pool.Exec(ctx, `UPDATE pgshard.xact_decisions SET state = 'abort', decided_at = now() WHERE gid = $1 AND state = 'preparing'`, d.GID)
