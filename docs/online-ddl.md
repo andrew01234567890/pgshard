@@ -55,11 +55,14 @@ is already gone is recognised as done).
 While the migration is queued or running, `internal/router/plan/hide.go`
 keeps the table looking unchanged:
 
-* `SELECT *` (and `alias.*`) over the table is expanded to the recorded
-  visible columns, so the working column never reaches a client. A star
-  that would also span other tables is refused (`0A000`): list the
-  columns. Until the column list is published (a brief window) `SELECT *`
-  is refused with `55000` and a retry hint.
+* `SELECT *` (and `alias.*`) over the table — and `RETURNING *` on
+  `INSERT`/`UPDATE`/`DELETE` — is expanded to the recorded visible
+  columns, so the working column never reaches a client. A star that
+  would also span other tables is refused (`0A000`): list the columns.
+  Whole-row references (`to_jsonb(t)`, `t::text`, `count(t.*)`) cannot be
+  expanded in place and are refused (`0A000`) while the rewrite runs.
+  Until the column list is published (a brief window) `SELECT *` is
+  refused with `55000` and a retry hint.
 * An `INSERT` without a column list gets the first *N* visible columns as
   its list (*N* = the VALUES row width); `INSERT … SELECT` without a list
   is refused. (Sharded tables already require an explicit column list.)
