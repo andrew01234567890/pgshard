@@ -176,18 +176,16 @@ func (s *Server) detach(se *session) {
 	detached := se.detached
 	s.mu.Unlock()
 	if !keep {
-		if b != nil {
-			s.recycle(b)
-		}
+		s.recycle(b, true)
 		s.forget(se)
 	}
 	close(detached)
 }
 
-// recycle returns b to the pool clean: an open transaction is rolled back
-// and statements it still holds are discarded, so the next session finds
-// neither. A backend that cannot be cleaned is discarded.
-func (s *Server) recycle(b *Backend) {
+// recycle returns b to the pool clean: an open transaction is rolled back,
+// and DISCARD ALL resets it when a session held it (GUCs may be staged) or
+// it still holds statements. A backend that cannot be cleaned is discarded.
+func (s *Server) recycle(b *Backend, resetSession bool) {
 	if b == nil {
 		return
 	}
@@ -201,7 +199,7 @@ func (s *Server) recycle(b *Backend) {
 			return
 		}
 	}
-	if len(b.prepared) > 0 {
+	if resetSession || len(b.prepared) > 0 {
 		if err := b.simpleQuery("DISCARD ALL"); err != nil {
 			s.cfg.Pool.Discard(b)
 			return
@@ -419,7 +417,7 @@ func (r *relay) pump(b *Backend) error {
 			r.endBatch(b)
 			if !r.reserved() && b.idle() {
 				r.setBackend(nil)
-				r.srv.recycle(b)
+				r.srv.recycle(b, false)
 			}
 			return nil
 		case *pgproto3.CopyInResponse, *pgproto3.CopyBothResponse:
@@ -488,7 +486,7 @@ func (s *Server) Release(ctx context.Context, req *pgshardv1.ReleaseRequest) (*p
 	se.b, se.reserved = nil, false
 	s.mu.Unlock()
 	s.forget(se)
-	s.recycle(b)
+	s.recycle(b, true)
 	return &pgshardv1.ReleaseResponse{}, nil
 }
 
@@ -507,7 +505,7 @@ func (s *Server) expireReservations(now time.Time) {
 	s.mu.Unlock()
 	for _, se := range expired {
 		s.cfg.Logger.Warn("releasing reservation with no stream", "session", se.id, "role", se.role)
-		s.recycle(se.b)
+		s.recycle(se.b, true)
 	}
 }
 

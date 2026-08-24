@@ -64,7 +64,7 @@ func TestFencingRefusesBeforeBackend(t *testing.T) {
 		t.Fatalf("matching generation refused: %v", e)
 	}
 	if h.pg.queries.Load() != 1 {
-		t.Fatal("matching generation must reach PostgreSQL")
+		t.Fatalf("matching generation must reach PostgreSQL: %v", h.pg.seen)
 	}
 	h.src.Set(View{Generation: 8, Epoch: 3})
 	rs = roundTrip(t, stream, queryReq("ok", "select 2", gen(7, 3), nil))
@@ -127,7 +127,7 @@ func TestReserveAndRelease(t *testing.T) {
 		t.Fatalf("pid = %d", res.BackendPid)
 	}
 	_ = stream.CloseSend()
-	waitFor(t, func() bool { return !h.attached("s") })
+	waitFor(t, func() bool { return !h.attached() })
 	if h.srv.held() != 1 {
 		t.Fatal("reserved backend must survive the stream")
 	}
@@ -350,7 +350,7 @@ func TestReusedBackendNeverReparsesAHeldStatement(t *testing.T) {
 	// The stream is dropped without Release; the session keeps its backend
 	// and the replay re-parses the same name with the same SQL.
 	_ = stream.CloseSend()
-	waitFor(t, func() bool { return !h.attached("s") })
+	waitFor(t, func() bool { return !h.attached() })
 	stream, _ = h.client.Execute(ctx)
 	rs = parseBatch(t, stream, parseReq("s", "select 1", identity("alice")), syncReq("s"))
 	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
@@ -386,7 +386,7 @@ func TestReusedBackendNeverReparsesAHeldStatement(t *testing.T) {
 	// Release hands the backend to the pool clean; the next session parses
 	// the same name afresh.
 	_ = stream.CloseSend()
-	waitFor(t, func() bool { return !h.attached("s") })
+	waitFor(t, func() bool { return !h.attached() })
 	if _, err := h.client.Release(ctx, &pgshardv1.ReleaseRequest{SessionId: "s"}); err != nil {
 		t.Fatal(err)
 	}
@@ -468,7 +468,7 @@ func TestReservationWithoutStreamExpires(t *testing.T) {
 	stream, _ := h.client.Execute(ctx)
 	roundTrip(t, stream, queryReq("s", "begin", gen(7, 3), identity("alice")))
 	_ = stream.CloseSend()
-	waitFor(t, func() bool { return !h.attached("s") })
+	waitFor(t, func() bool { return !h.attached() })
 	h.srv.expireReservations(time.Now().Add(h.srv.cfg.ReserveTimeout / 2))
 	if h.srv.lookup("s") == nil || h.srv.held() != 1 {
 		t.Fatal("a reservation younger than the timeout must be kept")
