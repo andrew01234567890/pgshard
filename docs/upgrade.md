@@ -34,9 +34,14 @@ name:
    `spec.resharding.retireOldGroupsAfter` with reverse replication
    flowing, then the run completes and they are deleted.
 
-`spec.upgrade.maxParallelGroups` bounds provisioning parallelism. The
-current implementation replaces the whole shard set through one workflow
-(one fence, one flip), the same shape as a reshard.
+`spec.upgrade.maxParallelGroups` bounds provisioning parallelism: at most
+that many new-major target groups are brought up at a time, the next one
+starting as earlier ones become ready. The cutover itself is not staged:
+the implementation replaces the whole shard set through one workflow (one
+fence, one flip), the same shape as a reshard, so the flip is
+all-groups-at-once regardless of the setting. Bounding provisioning keeps
+the pod and I/O surge of a wide cluster in check; a per-group rolling flip
+is not available.
 
 ### Preconditions
 
@@ -68,11 +73,38 @@ gone and rollback is a restore, not a flip.
 
 ### Catalog group
 
-The catalog group is not part of a shard set, so the blue/green replacement
-above does not cover it yet; upgrading it (and re-pointing routers through
-the catalog endpoint) is tracked for the kind e2e milestone. Routers
-reconnect through the catalog Service, so a catalog group replaced under
-the same Service name re-points them.
+The catalog group is not part of a shard set, so the reshard machinery
+does not cover it; it goes **last** in the upgrade's group iteration. Once
+every shard set runs the new major (`status.servingPGMajor` equals
+`spec.postgresql.major`, no reshard in flight), the operator drives its
+own blue/green replacement, tracked in `status.catalogUpgrade`:
+
+1. **provisioning** — a new-major catalog group (`catalog-g<n>`) comes up
+   next to the old one and gets the catalog schema migrations.
+2. **copying / catching_up** — the `pgshard` catalog is copied over native
+   logical replication (`FOR TABLES IN SCHEMA pgshard` publication,
+   subscription with the initial copy) until the subscription drained the
+   source's WAL position.
+3. **cutover** — the old primary is fenced (`default_transaction_read_only`
+   plus backend termination), the subscription drains to the fence LSN,
+   sequence positions are carried over with `setval`, the subscription is
+   dropped and the **stable catalog Service** (`<cluster>-catalog-rw`) is
+   repointed at the new group's primary. Routers and the controller dial
+   that Service name, so the flip re-points them without a redeploy; a
+   severed connection reconnects to the new primary. Writes that land in
+   the fence window fail read-only and are retried by their callers.
+4. **retiring** — the old group stays (fenced) for
+   `spec.resharding.retireOldGroupsAfter`, then it is deleted. Annotating
+   the cluster with `pgshard.io/catalog-upgrade=rollback` inside that
+   window repoints the Service back, lifts the fence and deletes the
+   new-major group. The old catalog is frozen from the cutover on, so
+   catalog changes made after the flip (workflow progress, serving-map
+   bumps) are lost on rollback — roll back only from a quiet cluster,
+   which the trigger conditions (no reshard or placement in flight)
+   enforce at the start.
+
+A serving catalog whose major was never probed is stamped on the first
+reconcile (`status.catalogPGMajor`).
 
 ## Offline strategy
 
@@ -96,6 +128,21 @@ per-run majors appear on `PgShardCluster.status` (`servingPGMajor`,
 PostgreSQL 18 (`internal/pgparser/pg18`); PG19-only syntax is refused
 until a libpg_query 19 binding lands, at which point the effective major
 flips once every group runs 19.
+
+## Continuous integration
+
+`.github/workflows/e2e-kind.yml` carries an `upgrade` suite
+(`test/e2e/upgrade`): it builds **both** the pg18 and pg19 images, loads
+them into kind and runs `TestUpgrade18To19UnderLoad` — a one-shard cluster
+upgraded 18 → 19 under a ledger workload, asserting no acknowledged write
+is lost or duplicated, the cutover pause is recorded, rollback before
+retirement returns serving to the old groups, the re-run completes, and
+the catalog group follows onto 19 behind the stable Service — plus
+`TestUpgrade18To19ChaosControllerAndPrimaryKill`, which kills the
+controller mid-copy and the promoted primary after the switch and asserts
+convergence. The `reshard-scale` suite runs the 1 → 2 → 4 → 2 reshard
+under the same ledger oracle. Both run on a single small shard to stay
+inside the runner budget.
 
 ## After the upgrade
 

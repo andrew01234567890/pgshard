@@ -72,6 +72,9 @@ func NewServer(c client.Reader, catalogSrc CatalogSource, n *Notifier, namespace
 	mux.HandleFunc("GET /clusters/{ns}/{name}", s.handleCluster)
 	mux.HandleFunc("GET /clusters/{ns}/{name}/topology", s.handleTopologyFragment)
 	mux.HandleFunc("GET /backups", s.handleBackups)
+	mux.HandleFunc("GET /upgrades", s.handleUpgrades)
+	mux.HandleFunc("GET /upgrades/panel", s.handleUpgradesFragment)
+	mux.HandleFunc("GET /api/v1/upgrades", s.handleAPIUpgrades)
 	mux.HandleFunc("GET /backups/panel", s.handleBackupsFragment)
 	mux.HandleFunc("GET /backups/{ns}/{name}", s.handleBackup)
 	mux.HandleFunc("GET /restores/{ns}/{name}", s.handleRestore)
@@ -167,6 +170,33 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	data["ReshardCards"] = reshardCards
 	s.render(w, "index.html", data)
+}
+
+func (s *Server) handleUpgrades(w http.ResponseWriter, r *http.Request) {
+	page, err := BuildUpgradesPage(r.Context(), s.Client, s.Namespace)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.render(w, "upgrades.html", page)
+}
+
+func (s *Server) handleUpgradesFragment(w http.ResponseWriter, r *http.Request) {
+	page, err := BuildUpgradesPage(r.Context(), s.Client, s.Namespace)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.render(w, "upgrades_panel.html", page)
+}
+
+func (s *Server) handleAPIUpgrades(w http.ResponseWriter, r *http.Request) {
+	page, err := BuildUpgradesPage(r.Context(), s.Client, s.Namespace)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, page)
 }
 
 func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request) {

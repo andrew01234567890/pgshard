@@ -246,6 +246,35 @@ type RolloutStatus struct {
 	LastRestartToken string `json:"lastRestartToken,omitempty"`
 }
 
+// ClusterCatalogUpgradeStatus is the catalog group's blue/green major
+// upgrade in flight: it runs after every shard set reached the new major.
+type ClusterCatalogUpgradeStatus struct {
+	FromMajor int `json:"fromMajor"`
+	ToMajor   int `json:"toMajor"`
+	// Generation names the new-major catalog group (catalog-g<n>).
+	Generation int64 `json:"generation"`
+	// Stage is one of provisioning, copying, catching_up, cutover, retiring.
+	// +optional
+	Stage string `json:"stage,omitempty"`
+	// +optional
+	Message string `json:"message,omitempty"`
+	// Blockers lists the preconditions holding the upgrade back.
+	// +optional
+	Blockers []string `json:"blockers,omitempty"`
+	// RetiredGeneration is the old catalog group kept up for rollback
+	// after the cutover, until retirement deletes it.
+	// +optional
+	RetiredGeneration int64 `json:"retiredGeneration,omitempty"`
+	// +optional
+	RetiredMajor int `json:"retiredMajor,omitempty"`
+	// +optional
+	SwitchedAt *metav1.Time `json:"switchedAt,omitempty"`
+	// RollbackRequested mirrors the pgshard.io/catalog-upgrade=rollback
+	// annotation.
+	// +optional
+	RollbackRequested bool `json:"rollbackRequested,omitempty"`
+}
+
 // ClusterReshardStatus points at the reshard in flight.
 type ClusterReshardStatus struct {
 	// Name is the PgShardReshard object.
@@ -324,6 +353,17 @@ type PgShardClusterStatus struct {
 	// Reshard is the resharding run in flight, if any.
 	// +optional
 	Reshard *ClusterReshardStatus `json:"reshard,omitempty"`
+	// CatalogGeneration names the active catalog group (catalog for 0 or
+	// 1, catalog-g<n> after a catalog major upgrade).
+	// +optional
+	CatalogGeneration int64 `json:"catalogGeneration,omitempty"`
+	// CatalogPGMajor is the PostgreSQL major the active catalog group
+	// runs, probed from the server; zero until first probed.
+	// +optional
+	CatalogPGMajor int `json:"catalogPGMajor,omitempty"`
+	// CatalogUpgrade is the catalog group upgrade in flight, if any.
+	// +optional
+	CatalogUpgrade *ClusterCatalogUpgradeStatus `json:"catalogUpgrade,omitempty"`
 	// PlacementWorkflows lists the table placement workflows that are
 	// active or ended since the last completed one was observed.
 	// +optional

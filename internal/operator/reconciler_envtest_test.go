@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -86,9 +87,66 @@ type fakeProber struct {
 	// cutoverSpecs records SetReshardCutoverSpec calls as
 	// "<id>:<pause>:<proceed>:<retire>".
 	cutoverSpecs []string
+	// serverMajor is what ServerMajor reports (18 when zero); catalogLag a
+	// non-empty catch-up lag; the rest record catalog upgrade calls.
+	serverMajor     int
+	catalogLag      string
+	catalogCopies   []string
+	catalogCutovers []string
+	catalogReleases []string
 }
 
-func (f *fakeProber) SetShardSetMajor(context.Context, string, string, int) error { return nil }
+func (f *fakeProber) SetShardSetMajor(_ context.Context, _ string, name string, major int) error {
+	f.setShardSetMajor(name, major)
+	return nil
+}
+
+func hostOf(dsn string) string {
+	u, err := url.Parse(dsn)
+	if err != nil || u.Host == "" {
+		return dsn
+	}
+	return u.Hostname()
+}
+
+func (f *fakeProber) ServerMajor(context.Context, string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.serverMajor != 0 {
+		return f.serverMajor, nil
+	}
+	return 18, nil
+}
+
+func (f *fakeProber) EnsureCatalogCopy(_ context.Context, srcDSN, tgtDSN string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.catalogCopies = append(f.catalogCopies, hostOf(srcDSN)+">"+hostOf(tgtDSN))
+	return nil
+}
+
+func (f *fakeProber) CatalogCopyCaughtUp(context.Context, string) (bool, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.catalogLag != "" {
+		return false, f.catalogLag, nil
+	}
+	return true, "", nil
+}
+
+func (f *fakeProber) CutoverCatalog(_ context.Context, srcDSN, tgtDSN string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.catalogCutovers = append(f.catalogCutovers, hostOf(srcDSN)+">"+hostOf(tgtDSN))
+	return nil
+}
+
+func (f *fakeProber) ReleaseCatalog(_ context.Context, dsn string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.catalogReleases = append(f.catalogReleases, hostOf(dsn))
+	return nil
+}
 
 func (f *fakeProber) SetWorkflowRollback(context.Context, string, string) error { return nil }
 

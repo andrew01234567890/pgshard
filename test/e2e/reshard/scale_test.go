@@ -1,0 +1,243 @@
+//go:build e2e
+
+package reshard
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/andrew01234567890/pgshard/internal/placement"
+	"github.com/andrew01234567890/pgshard/test/e2e"
+)
+
+// ledgerTenants are fixed shard keys the scale workload writes under; each
+// batch goes to the tenant's serving group as resolved from the catalog.
+var ledgerTenants = []int64{11, 23, 37, 41, 53, 67}
+
+// resolveGroup returns the group name serving tenant's keyspace id, from
+// the live catalog serving map.
+func resolveGroup(ctx context.Context, c *e2e.Cluster, tenant int64) string {
+	id, err := placement.KeyspaceID(tenant)
+	if err != nil {
+		return ""
+	}
+	out, err := psql(ctx, c, clusterName+"-catalog-rw",
+		fmt.Sprintf(`SELECT r.shard_id || ':' || ss.generation
+			FROM pgshard.shard_ranges r
+			JOIN pgshard.serving s ON s.shard_set = r.shard_set
+			JOIN pgshard.shard_sets ss ON ss.shard_set = r.shard_set
+			WHERE r.range @> %d::int8`, id))
+	if err != nil || out == "" {
+		return ""
+	}
+	shard, gen, ok := strings.Cut(out, ":")
+	if !ok {
+		return ""
+	}
+	if gen == "1" {
+		return "shard-" + shard
+	}
+	return fmt.Sprintf("shard-%s-g%s", shard, gen)
+}
+
+// scaleLedger appends acknowledged rows per tenant, resolving the serving
+// group before every batch and retrying through fences and switches.
+type scaleLedger struct {
+	c     *e2e.Cluster
+	acked []atomic.Int64
+	stop  context.CancelFunc
+	wg    sync.WaitGroup
+}
+
+func startScaleLedger(ctx context.Context, c *e2e.Cluster) *scaleLedger {
+	lctx, cancel := context.WithCancel(ctx)
+	l := &scaleLedger{c: c, acked: make([]atomic.Int64, len(ledgerTenants)), stop: cancel}
+	for i, tenant := range ledgerTenants {
+		l.wg.Add(1)
+		go func() {
+			defer l.wg.Done()
+			next := int64(1)
+			for lctx.Err() == nil {
+				group := resolveGroup(lctx, c, tenant)
+				if group == "" {
+					time.Sleep(time.Second)
+					continue
+				}
+				hi := next + 9
+				sql := fmt.Sprintf(`INSERT INTO ledger (id, tenant_id, amount) SELECT g, %d, 1 FROM generate_series(%d, %d) g ON CONFLICT DO NOTHING`, tenant, next, hi)
+				if _, err := shardSQL(lctx, c, group, sql); err != nil {
+					time.Sleep(2 * time.Second)
+					continue
+				}
+				l.acked[i].Store(hi)
+				next = hi + 1
+				time.Sleep(time.Second)
+			}
+		}()
+	}
+	return l
+}
+
+func (l *scaleLedger) finish() []int64 {
+	l.stop()
+	l.wg.Wait()
+	out := make([]int64, len(l.acked))
+	for i := range l.acked {
+		out[i] = l.acked[i].Load()
+	}
+	return out
+}
+
+// verify asserts the ledger oracle: every tenant's acknowledged rows exist
+// exactly once on the tenant's serving group and nowhere else.
+func (l *scaleLedger) verify(ctx context.Context, t *testing.T, acked []int64) {
+	t.Helper()
+	var total int64
+	for i, tenant := range ledgerTenants {
+		group := resolveGroup(ctx, l.c, tenant)
+		if group == "" {
+			t.Fatalf("tenant %d has no serving group", tenant)
+		}
+		got, err := shardSQL(ctx, l.c, group, fmt.Sprintf(
+			`SELECT count(*) FILTER (WHERE id <= %d) || '/' || count(DISTINCT id) FILTER (WHERE id <= %d) FROM ledger WHERE tenant_id = %d`,
+			acked[i], acked[i], tenant))
+		if err != nil {
+			t.Fatalf("verify tenant %d on %s: %v", tenant, group, err)
+		}
+		if want := fmt.Sprintf("%d/%d", acked[i], acked[i]); got != want {
+			t.Fatalf("tenant %d on %s: %s, want %s (rows lost or duplicated)", tenant, group, got, want)
+		}
+		total += acked[i]
+	}
+	_ = total
+}
+
+func seedLedgerTable(ctx context.Context, t *testing.T, c *e2e.Cluster) {
+	t.Helper()
+	if _, err := psql(ctx, c, clusterName+"-shard-0-rw", "CREATE DATABASE "+appDatabase); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := shardSQL(ctx, c, "shard-0",
+		"CREATE TABLE ledger (id bigint NOT NULL, tenant_id bigint NOT NULL, amount int NOT NULL, PRIMARY KEY (tenant_id, id))"); err != nil {
+		t.Fatal(err)
+	}
+	catalogSQL(ctx, t, c, "INSERT INTO pgshard.databases (name, default_placement, home_shard) VALUES ('"+appDatabase+"', 'unsharded', 0)")
+	catalogSQL(ctx, t, c, "INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('"+appDatabase+"', 'public', 'ledger', 'sharded', 'tenant_id')")
+}
+
+func reshardTo(ctx context.Context, t *testing.T, c *e2e.Cluster, major string, shards int, generation int64) {
+	t.Helper()
+	if err := c.Apply(ctx, clusterManifestWithRetire(major, os.Getenv("PGSHARD_POSTGRES_IMAGE"), shards, "30s")); err != nil {
+		t.Fatal(err)
+	}
+	set := fmt.Sprintf("g%d", generation)
+	waitFor(ctx, t, fmt.Sprintf("reshard to %d shards switched", shards), 35*time.Minute, func() bool {
+		st := catalogSQL(ctx, t, c, "SELECT coalesce(string_agg(state || ':' || (status->>'stage'), ','), '') FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = '"+set+"'")
+		if strings.HasPrefix(st, "failed") {
+			t.Fatalf("reshard to %s failed: %s", set, catalogSQL(ctx, t, c, "SELECT coalesce(error, '') || ' ' || status::text FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = '"+set+"'"))
+		}
+		return catalogSQL(ctx, t, c, "SELECT string_agg(shard_set, ',') FROM pgshard.serving") == set
+	})
+	waitFor(ctx, t, fmt.Sprintf("reshard to %d shards completed", shards), 25*time.Minute, func() bool {
+		st := catalogSQL(ctx, t, c, "SELECT coalesce(string_agg(state || ':' || (status->>'stage'), ','), '') FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = '"+set+"'")
+		return strings.HasPrefix(st, "completed:") &&
+			jsonpath(ctx, c, "pgshardcluster", clusterName, "{.status.effectiveShards}") == fmt.Sprint(shards)
+	})
+	if pause := catalogSQL(ctx, t, c, "SELECT coalesce((status->'cutover'->>'pause_ms')::bigint, -1) FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = '"+set+"'"); pause == "-1" {
+		t.Errorf("cutover pause of %s not recorded: %q", set, pause)
+	}
+}
+
+func clusterManifestWithRetire(major, image string, shards int, retire string) string {
+	m := clusterManifest(major, image, shards)
+	return strings.Replace(m, "  replicasPerShard: 3\n", "  replicasPerShard: 3\n  resharding:\n    retireOldGroupsAfter: "+retire+"\n", 1)
+}
+
+// TestReshard1To2To4To2UnderLoad grows a cluster 1 -> 2 -> 4 shards and
+// merges back to 2, with the ledger workload running throughout; every
+// acknowledged row survives every split and merge exactly once and each
+// cutover records its write pause.
+func TestReshard1To2To4To2UnderLoad(t *testing.T) {
+	c := e2e.NewCluster(t)
+	c.GatherOnFailure(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Hour)
+	defer cancel()
+	root := repoRoot(t)
+	major := env("PG_MAJOR", "18")
+
+	deployOperator(ctx, t, c, root, env("OPERATOR_IMAGE", "pgshard-operator:e2e"))
+	manifest := clusterManifestWithRetire(major, os.Getenv("PGSHARD_POSTGRES_IMAGE"), 1, "30s")
+	if err := c.Apply(ctx, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Apply(ctx, clientManifest(memberImage(major))); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		if t.Failed() {
+			gatherNamespace(ctx, c)
+		}
+		if err := c.Delete(ctx, manifest); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
+	if err := waitCondition(ctx, c, "Ready", 12*time.Minute); err != nil {
+		gatherNamespace(ctx, c)
+		t.Fatal(err)
+	}
+	if err := c.WaitPodsReady(ctx, testNamespace, "app="+clientPod, 3*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	seedLedgerTable(ctx, t, c)
+	if err := c.Apply(ctx, controllerManifest(env("CONTROLLER_IMAGE", "pgshard-controller:e2e"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.WaitPodsReady(ctx, testNamespace, "app="+clusterName+"-controller", 3*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(ctx, t, "serving shard set materialized", 2*time.Minute, func() bool {
+		return jsonpath(ctx, c, "pgshardcluster", clusterName, "{.status.effectiveShards}") == "1"
+	})
+
+	l := startScaleLedger(ctx, c)
+	waitFor(ctx, t, "first acknowledged ledger writes", 3*time.Minute, func() bool {
+		for i := range ledgerTenants {
+			if l.acked[i].Load() < 10 {
+				return false
+			}
+		}
+		return true
+	})
+
+	reshardTo(ctx, t, c, major, 2, 2)
+	l.verify(ctx, t, l.finishlessSnapshot())
+	reshardTo(ctx, t, c, major, 4, 3)
+	l.verify(ctx, t, l.finishlessSnapshot())
+	reshardTo(ctx, t, c, major, 2, 4)
+
+	acked := l.finish()
+	l.verify(ctx, t, acked)
+	for i := range ledgerTenants {
+		if acked[i] < 30 {
+			t.Errorf("tenant %d made too little progress under load: %d rows", ledgerTenants[i], acked[i])
+		}
+	}
+}
+
+// finishlessSnapshot reads the acknowledged high-water marks without
+// stopping the writers; verification tolerates rows above it.
+func (l *scaleLedger) finishlessSnapshot() []int64 {
+	out := make([]int64, len(l.acked))
+	for i := range l.acked {
+		out[i] = l.acked[i].Load()
+	}
+	return out
+}

@@ -14,3 +14,4 @@ test/e2e/**/artifacts/
 /pgshard-operator
 /pgshard-admin
 /pgshard-controller
+.envtest-assets/

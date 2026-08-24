@@ -1,6 +1,6 @@
 {{template "head" "Clusters"}}
 <header><h1>pgshard clusters</h1><span class="meta">{{if .Namespace}}namespace {{.Namespace}}{{else}}all namespaces{{end}}</span></header>
-<nav class="tabs" aria-label="Sections"><a href="/" aria-current="page">Clusters</a><a href="/backups">Backups</a><a href="/migrations">Migrations</a><a href="/streams">Streams</a><a href="/twopc">2PC</a><a href="/alerts">Alerts</a><a href="/reshards">Reshards</a></nav>
+<nav class="tabs" aria-label="Sections"><a href="/" aria-current="page">Clusters</a><a href="/backups">Backups</a><a href="/migrations">Migrations</a><a href="/streams">Streams</a><a href="/twopc">2PC</a><a href="/alerts">Alerts</a><a href="/reshards">Reshards</a><a href="/upgrades">Upgrades</a></nav>
 {{with .Cards}}
 <section class="cards" aria-label="Backup overview">
 <div class="card"><div class="label">Last successful backup</div>

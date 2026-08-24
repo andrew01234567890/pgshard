@@ -1,0 +1,7 @@
+{{template "head" "Upgrades"}}
+<header><h1>Major upgrades</h1><span class="meta">{{if .Namespace}}namespace {{.Namespace}}{{else}}all namespaces{{end}}</span></header>
+<nav class="tabs" aria-label="Sections"><a href="/">Clusters</a><a href="/backups">Backups</a><a href="/upgrades" aria-current="page">Upgrades</a></nav>
+<div id="upgrades" hx-get="/upgrades/panel" hx-trigger="every 5s" hx-swap="innerHTML">
+{{template "upgrades_panel.html" .}}
+</div>
+{{template "foot"}}
