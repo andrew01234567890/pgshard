@@ -142,6 +142,7 @@ func RegisterWatches(mgr ctrl.Manager, notifier *Notifier) error {
 		WatchesRawSource(source.Kind(mgr.GetCache(), &pgshardv1alpha1.PgShardBackupPolicy{}, notifyHandler[*pgshardv1alpha1.PgShardBackupPolicy]())).
 		WatchesRawSource(source.Kind(mgr.GetCache(), &pgshardv1alpha1.PgShardBackup{}, notifyHandler[*pgshardv1alpha1.PgShardBackup]())).
 		WatchesRawSource(source.Kind(mgr.GetCache(), &pgshardv1alpha1.PgShardRestore{}, notifyHandler[*pgshardv1alpha1.PgShardRestore]())).
+		WatchesRawSource(source.Kind(mgr.GetCache(), &pgshardv1alpha1.PgShardReshard{}, notifyHandler[*pgshardv1alpha1.PgShardReshard]())).
 		WatchesRawSource(source.Kind(mgr.GetCache(), &corev1.Pod{}, notifyHandler[*corev1.Pod](), predicate.NewTypedPredicateFuncs(func(p *corev1.Pod) bool {
 			_, ok := p.Labels[operator.LabelCluster]
 			return ok

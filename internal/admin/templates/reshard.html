@@ -1,0 +1,58 @@
+{{template "head" .Name}}
+<header><h1><a href="/">clusters</a> / <a href="/reshards">reshards</a> / {{.Namespace}} / {{.Name}}</h1>
+<span class="meta">{{.Cluster}} · g{{.FromGen}} → g{{.ToGen}} ({{.ToShards}} shards, {{.TargetSet}})</span></header>
+{{if eq .Phase "Failed"}}<div class="alert" role="alert">reshard failed: {{or .Error .Message "no reason reported"}}</div>{{end}}
+<dl class="kv">
+<dt>Phase</dt><dd class="{{if eq .Phase "Completed"}}ok{{else if or (eq .Phase "Failed") (eq .Phase "Cancelled")}}bad{{end}}">{{.Phase}}</dd>
+<dt>Stage</dt><dd>{{or .Stage "—"}}{{if .State}} (workflow {{.State}}){{end}}</dd>
+<dt>Workflow</dt><dd>{{if .WorkflowID}}<code>{{.WorkflowID}}</code>{{if not .WorkflowFound}} · not in catalog{{end}}{{else}}—{{end}}</dd>
+<dt>Started</dt><dd>{{iso .StartedAt}}</dd>
+<dt>Updated</dt><dd>{{iso .UpdatedAt}}</dd>
+<dt>Cutover pause</dt><dd>{{or .CutoverPause "—"}}</dd>
+<dt>Journal ids</dt><dd>{{if .JournalIDs}}{{range .JournalIDs}}<code>{{.}}</code> {{end}}{{else}}—{{end}}</dd>
+<dt>Message</dt><dd>{{or .Message "—"}}</dd>
+{{if .Error}}<dt>Error</dt><dd class="bad">{{.Error}}</dd>{{end}}
+{{if .CancelledAt}}<dt>Cancelled</dt><dd>{{iso .CancelledAt}}{{if .CancelReason}} · {{.CancelReason}}{{end}}</dd>{{end}}
+</dl>
+{{with .Progress}}<h2>Copy progress</h2>{{template "copyprogress" .}}{{end}}
+<h2>Targets</h2>
+{{if .Targets}}<table>
+<thead><tr><th>Shard</th><th>Range</th><th>Group</th><th>Ready</th><th>Primary</th><th>Subscriptions</th><th>Progress</th></tr></thead>
+<tbody>{{range .Targets}}<tr>
+<td>{{.ShardID}}</td><td>[{{.RangeStart}}, {{.RangeEnd}}]</td><td>{{or .Group "—"}}</td>
+<td class="{{if .Ready}}ok{{end}}">{{.Ready}}</td><td>{{or .Primary "—"}}</td>
+<td>{{if .Progress}}{{.Progress.Subscriptions}}{{else}}—{{end}}</td>
+<td>{{if .Progress}}{{template "copyprogress" .Progress}}{{else}}—{{end}}</td>
+</tr>{{end}}</tbody></table>
+{{else}}<p class="notice">No targets recorded.</p>{{end}}
+<h2>Stage timeline</h2>
+{{if .Timeline}}<ol class="timeline">{{range .Timeline}}<li><time datetime="{{.At.UTC.Format "2006-01-02T15:04:05Z07:00"}}">{{.At.UTC.Format "2006-01-02T15:04:05Z07:00"}}</time> · {{.Stage}}{{if .Note}} · {{.Note}}{{end}}</li>{{end}}</ol>
+{{else}}<p class="notice">No stage transitions recorded.</p>{{end}}
+<h2>Cutover</h2>
+{{with .Cutover}}
+<dl class="kv">
+<dt>Source set</dt><dd>{{or .SourceSet "—"}}</dd>
+<dt>Step</dt><dd>{{or .Step "—"}} · attempt {{.Attempts}}</dd>
+{{if .Gate}}<dt>Gate</dt><dd>{{.Gate}}</dd>{{end}}
+<dt>Pause before</dt><dd>{{or .PauseBefore "none"}}{{if .Proceed}} · proceed {{range .Proceed}}{{.}} {{end}}{{end}}</dd>
+<dt>Fenced</dt><dd>{{iso .FencedAt}}</dd>
+<dt>Flipped</dt><dd>{{iso .FlippedAt}}</dd>
+<dt>Released</dt><dd>{{iso .ReleasedAt}}</dd>
+<dt>Switched</dt><dd>{{iso .SwitchedAt}}</dd>
+<dt>Write pause</dt><dd>{{or .Pause "—"}}{{if .Fence}} (fence held {{.Fence}}){{end}}</dd>
+<dt>Old groups retire</dt><dd>{{iso .RetireAt}}</dd>
+{{if .Aborts}}<dt>Undone attempts</dt><dd>{{range .Aborts}}<div class="bad">{{.}}</div>{{end}}</dd>{{end}}
+</dl>
+<h3>Verify</h3>
+{{with .Verify}}
+<dl class="kv">
+<dt>Checked</dt><dd>{{.CheckedAt.UTC.Format "2006-01-02T15:04:05Z07:00"}}</dd>
+<dt>Tables</dt><dd>{{.Tables}}</dd>
+<dt>Rows</dt><dd>{{.Rows}}</dd>
+<dt>Mismatches</dt><dd class="{{if .Mismatches}}bad{{else}}ok{{end}}">{{len .Mismatches}}</dd>
+</dl>
+{{if .Mismatches}}<ul>{{range .Mismatches}}<li>{{.}}</li>{{end}}</ul>{{end}}
+{{else}}<p class="notice">Not verified yet.</p>{{end}}
+{{else}}<p class="notice">Cutover not started.</p>{{end}}
+<p class="notice"><a href="/api/v1/reshards/{{.Namespace}}/{{.Name}}">JSON</a></p>
+{{template "foot"}}

@@ -54,7 +54,7 @@ func NewServer(c client.Reader, catalogSrc CatalogSource, n *Notifier, namespace
 	if n == nil {
 		n = NewNotifier()
 	}
-	tmpl, err := template.New("").Funcs(template.FuncMap{"bytes": humanBytes, "bytesp": humanBytesPtr, "when": humanTime, "whenp": humanTimePtr}).ParseFS(assets, "templates/*.html")
+	tmpl, err := template.New("").Funcs(template.FuncMap{"bytes": humanBytes, "bytesp": humanBytesPtr, "when": humanTime, "whenp": humanTimePtr, "iso": isoTime}).ParseFS(assets, "templates/*.html")
 	if err != nil {
 		return nil, err
 	}
@@ -75,6 +75,11 @@ func NewServer(c client.Reader, catalogSrc CatalogSource, n *Notifier, namespace
 	mux.HandleFunc("GET /backups/panel", s.handleBackupsFragment)
 	mux.HandleFunc("GET /backups/{ns}/{name}", s.handleBackup)
 	mux.HandleFunc("GET /restores/{ns}/{name}", s.handleRestore)
+	mux.HandleFunc("GET /reshards", s.handleReshards)
+	mux.HandleFunc("GET /reshards/panel", s.handleReshardsFragment)
+	mux.HandleFunc("GET /reshards/{ns}/{name}", s.handleReshard)
+	mux.HandleFunc("GET /api/v1/reshards", s.handleAPIReshards)
+	mux.HandleFunc("GET /api/v1/reshards/{ns}/{name}", s.handleAPIReshard)
 	mux.HandleFunc("GET /api/v1/backups", s.handleAPIBackups)
 	mux.HandleFunc("GET /api/v1/restores", s.handleAPIRestores)
 	mux.HandleFunc("GET /api/v1/restore-points", s.handleAPIRestorePoints)
@@ -155,6 +160,12 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 			data["Streams"] = overview
 		}
 	}
+	reshardCards, err := BuildReshardCards(r.Context(), s.Client, s.Namespace)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	data["ReshardCards"] = reshardCards
 	s.render(w, "index.html", data)
 }
 
@@ -192,6 +203,51 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.render(w, "restore.html", rs)
+}
+
+func (s *Server) handleReshards(w http.ResponseWriter, r *http.Request) {
+	page, err := BuildReshardsPage(r.Context(), s.Client, s.Catalog, s.Namespace)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.render(w, "reshards.html", page)
+}
+
+func (s *Server) handleReshardsFragment(w http.ResponseWriter, r *http.Request) {
+	page, err := BuildReshardsPage(r.Context(), s.Client, s.Catalog, s.Namespace)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.render(w, "reshards_panel.html", page)
+}
+
+func (s *Server) handleReshard(w http.ResponseWriter, r *http.Request) {
+	rs, err := GetReshard(r.Context(), s.Client, s.Catalog, r.PathValue("ns"), r.PathValue("name"))
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.render(w, "reshard.html", rs)
+}
+
+func (s *Server) handleAPIReshards(w http.ResponseWriter, r *http.Request) {
+	page, err := BuildReshardsPage(r.Context(), s.Client, s.Catalog, s.Namespace)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, page)
+}
+
+func (s *Server) handleAPIReshard(w http.ResponseWriter, r *http.Request) {
+	rs, err := GetReshard(r.Context(), s.Client, s.Catalog, r.PathValue("ns"), r.PathValue("name"))
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, rs)
 }
 
 func (s *Server) handleAPIBackups(w http.ResponseWriter, r *http.Request) {
@@ -424,6 +480,13 @@ func humanTime(t any) string {
 		return humanTimePtr(v)
 	}
 	return "\u2014"
+}
+
+func isoTime(t *time.Time) string {
+	if t == nil {
+		return "\u2014"
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 func humanTimePtr(t *time.Time) string {

@@ -1,0 +1,9 @@
+{{template "head" "Reshards"}}
+<header><h1><a href="/">clusters</a> / reshards</h1></header>
+<nav class="tabs" aria-label="Sections"><a href="/">Clusters</a><a href="/backups">Backups</a><a href="/migrations">Migrations</a><a href="/streams">Streams</a><a href="/twopc">2PC</a><a href="/alerts">Alerts</a><a href="/reshards" aria-current="page">Reshards</a></nav>
+<div id="reshards" data-live hx-get="/reshards/panel" hx-trigger="topology" hx-swap="innerHTML">
+{{template "reshards_panel.html" .}}
+</div>
+<p class="notice"><a href="/api/v1/reshards">reshards JSON</a></p>
+<script src="/static/app.js" defer></script>
+{{template "foot"}}

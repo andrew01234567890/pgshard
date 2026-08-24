@@ -38,6 +38,21 @@ func (p PgxCatalog) RestorePoints(ctx context.Context) ([]controller.RestorePoin
 	})
 }
 
+// Workflows implements WorkflowSource: newest first, capped at WorkflowsLimit.
+func (p PgxCatalog) Workflows(ctx context.Context) ([]WorkflowRecord, error) {
+	return withConn(ctx, p, func(ctx context.Context, conn *pgx.Conn) ([]WorkflowRecord, error) {
+		rows, err := conn.Query(ctx, `SELECT id::text, kind, state, spec, status, journal_ids, created_at, updated_at, coalesce(error, '')
+			FROM pgshard.workflows ORDER BY created_at DESC LIMIT $1`, WorkflowsLimit)
+		if err != nil {
+			return nil, err
+		}
+		return pgx.CollectRows(rows, pgx.RowToStructByPos[WorkflowRecord])
+	})
+}
+
+// WorkflowsLimit caps the workflows the reshards panel reads.
+const WorkflowsLimit = 200
+
 func withConn[T any](ctx context.Context, p PgxCatalog, fn func(context.Context, *pgx.Conn) (T, error)) (T, error) {
 	var zero T
 	timeout := p.Timeout

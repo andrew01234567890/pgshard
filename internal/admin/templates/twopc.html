@@ -1,6 +1,6 @@
 {{template "head" "Two-phase commits"}}
 <header><h1><a href="/">clusters</a> / two-phase commits</h1><span class="meta">{{.Count}} logged · {{.InDoubt}} in doubt{{if .OldestAge}} · oldest {{.OldestAge}}{{end}}</span></header>
-<nav class="tabs" aria-label="Sections"><a href="/">Clusters</a><a href="/backups">Backups</a><a href="/migrations">Migrations</a><a href="/streams">Streams</a><a href="/twopc" aria-current="page">2PC</a><a href="/alerts">Alerts</a></nav>
+<nav class="tabs" aria-label="Sections"><a href="/">Clusters</a><a href="/backups">Backups</a><a href="/migrations">Migrations</a><a href="/streams">Streams</a><a href="/twopc" aria-current="page">2PC</a><a href="/alerts">Alerts</a><a href="/reshards">Reshards</a></nav>
 <div id="twopc" data-live hx-get="/twopc" hx-trigger="topology" hx-swap="innerHTML" aria-live="polite">
 {{template "twopc_table.html" .}}
 </div>
