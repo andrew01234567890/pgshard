@@ -15,9 +15,20 @@ Multigres (for PostgreSQL). It aims to provide:
 - zero-downtime resharding, online DDL and PostgreSQL major upgrades;
 - an admin web UI showing topology and the progress of long-running operations.
 
+## Documentation
+
+- [User guide](docs/guide/getting-started.md) — install, define sharding, query, back up, restore.
+- [Runbooks](docs/README.md#runbooks) — failover, rollouts, backup failures, in-doubt
+  transactions, slot invalidation, disk pressure, barrier restores.
+- [Capability matrix](docs/capability-matrix.md) — implemented / partial / planned per feature,
+  with pointers to code and tests.
+- [Documentation index](docs/README.md) — everything, including the component references.
+
 ## Status
 
-**Early development — not yet suitable for production data.** What exists today:
+**Early development — not yet suitable for production data.** The
+[capability matrix](docs/capability-matrix.md) is the per-feature status of record; in short, what
+exists today:
 
 - PostgreSQL 18 and 19 images (`postgres/`) built from source with pgBackRest, `pgshard-agent` as
   PID 1 and `pgshard-pooler`, plus the router/control images.
@@ -34,10 +45,14 @@ Multigres (for PostgreSQL). It aims to provide:
 - Change streams over logical decoding (`docs/streams.md`) and the admin UI (`docs/admin.md`).
 - e2e (kind), chaos and perf harnesses under `test/`.
 
-Not there yet: resharding and re-keying workflows (placement is designed in `docs/placement.md`), online
-major upgrades, and most chaos experiments
-(`test/chaos/README.md` lists the planned catalogue). Design documents describe intended behaviour;
-where a document and the code disagree, the code and its tests are authoritative.
+- Backups to object stores with PITR restore, certified cross-shard restore points and fenced
+  barrier restores with two-phase reconciliation (`docs/backup.md`).
+
+Not there yet: the resharding and re-keying workflow executors (edits are detected and recorded as
+pending workflows, `docs/guide/resharding.md`), online major upgrades (`docs/guide/upgrades.md`),
+and most chaos experiments (`test/chaos/README.md` lists the planned catalogue). Design documents
+describe intended behaviour; where a document and the code disagree, the code and its tests are
+authoritative — `docs/capability-matrix.md` is the summary.
 
 Target PostgreSQL versions: 18 and 19.
 
