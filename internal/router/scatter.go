@@ -216,6 +216,9 @@ type participant struct {
 	err     error
 	done    chan struct{}
 	stop    chan struct{}
+	// reserved is set once the pooler pinned the backend so the session's
+	// search_path could be applied; finish releases it.
+	reserved bool
 }
 
 // runScatter opens one pooler stream per shard, sends reqs on each and
@@ -232,7 +235,7 @@ func (e *Executor) runScatter(ctx context.Context, shards []int32, m *plan.Merge
 	parts := make([]*participant, 0, len(shards))
 	defer func() {
 		for _, p := range parts {
-			p.finish()
+			p.finish(e.r)
 		}
 	}()
 	for _, id := range shards {
@@ -256,6 +259,25 @@ func (e *Executor) runScatter(ctx context.Context, shards []int32, m *plan.Merge
 			header: make(chan struct{}), rows: make(chan [][]byte, 64), done: make(chan struct{}), stop: make(chan struct{})}
 		parts = append(parts, p)
 		gen := e.r.cfg.Poolers.Generation(sh)
+		// The planner resolved relations under the session's search_path;
+		// a fresh scatter backend starts on the server default, so pin it
+		// and apply the path before the routed statement runs.
+		if path := e.searchPath(); path != nil {
+			resp, rerr := client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: p.sid, Generation: gen})
+			if rerr != nil {
+				return pgwire.Errorf(codeConnectionFailure, "pooler of shard %s/%d refused the connection: %v", sh.Set, sh.ID, rerr)
+			}
+			if resp.Error != nil {
+				return toPgwireError(resp.Error)
+			}
+			p.reserved = true
+			if err := ps.send(simpleQuery(searchPathSQL(path)), p.sid, gen, e.ident, e.info.Database); err != nil {
+				return pgwire.Errorf(codeConnectionFailure, "pooler connection lost: %v", err)
+			}
+			if err := p.drain(ctx); err != nil {
+				return err
+			}
+		}
 		for _, req := range reqs {
 			if err := ps.send(cloneRequest(req), p.sid, gen, e.ident, e.info.Database); err != nil {
 				return pgwire.Errorf(codeConnectionFailure, "pooler connection lost: %v", err)
@@ -408,6 +430,26 @@ func descMismatch(a, b *participant, what string) error {
 	return err
 }
 
+// drain consumes the responses of the search_path application up to
+// ReadyForQuery, surfacing any error the backend reported.
+func (p *participant) drain(ctx context.Context) error {
+	var failed error
+	for {
+		resp, err := p.ps.recv(ctx, nil)
+		if err != nil {
+			return pgwire.Errorf(codeConnectionFailure, "pooler connection lost: %v", err)
+		}
+		switch m := resp.Message.(type) {
+		case *pgshardv1.ExecuteResponse_Error:
+			if failed == nil {
+				failed = toPgwireError(m.Error.GetError())
+			}
+		case *pgshardv1.ExecuteResponse_ReadyForQuery:
+			return failed
+		}
+	}
+}
+
 // pump reads one participant's stream to ReadyForQuery, publishing the
 // prelude, then rows, then the outcome. onError interrupts the others.
 func (p *participant) pump(onError func()) {
@@ -496,12 +538,24 @@ func (p *participant) cancel(r *Router) {
 	}
 }
 
-// finish releases the participant's stream once its pump has ended.
-func (p *participant) finish() {
+// finish releases the participant's stream once its pump has ended and
+// unpins the backend a search_path application reserved.
+func (p *participant) finish(r *Router) {
 	select {
 	case <-p.done:
 		p.ps.close()
 	default:
 		p.ps.abort()
+	}
+	if p.reserved {
+		go p.release(r)
+	}
+}
+
+func (p *participant) release(r *Router) {
+	rctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
+	defer cancel()
+	if _, err := p.client.Release(rctx, &pgshardv1.ReleaseRequest{SessionId: p.sid}); err != nil {
+		r.cfg.Logger.Warn("scatter release failed", "session", p.sid, "shard", p.shard, "err", err)
 	}
 }

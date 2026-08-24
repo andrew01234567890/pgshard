@@ -362,3 +362,64 @@ func TestScatterHonoursTheShardLimit(t *testing.T) {
 	_, err := conn.Exec(context.Background(), "select * from orders")
 	_ = expectRefusal(t, err, "statement fans out to 4 shards, more than the router's limit of 2")
 }
+
+func TestScatterAppliesTheSessionSearchPath(t *testing.T) {
+	h := newShardedHarness(t)
+	ctx := context.Background()
+	conn := h.connect(t, h.dsn()+"&options=-c%20search_path%3Daudit,public&default_query_exec_mode=simple_protocol")
+
+	pathApplied := func(want string) {
+		t.Helper()
+		for i, fp := range h.poolers {
+			setAt, selAt := -1, -1
+			for j, q := range fp.ran() {
+				if strings.HasPrefix(q, "select set_config('search_path', '"+want+"'") && setAt < 0 {
+					setAt = j
+				}
+				if strings.HasPrefix(q, "select * from events") {
+					selAt = j
+				}
+			}
+			if selAt < 0 {
+				t.Fatalf("shard %d did not run the scatter", i)
+			}
+			if setAt < 0 || setAt > selAt {
+				t.Fatalf("shard %d must apply search_path %q before the scatter statement (set at %d, select at %d)", i, want, setAt, selAt)
+			}
+		}
+	}
+	if _, err := conn.Exec(ctx, "select * from events"); err != nil {
+		t.Fatal(err)
+	}
+	pathApplied(`"audit", "public"`)
+
+	if _, err := conn.Exec(ctx, "set search_path = audit"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "select * from events"); err != nil {
+		t.Fatal(err)
+	}
+	pathApplied(`"audit"`)
+
+	if _, err := conn.Exec(ctx, "reset search_path"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "select * from events"); err != nil {
+		t.Fatal(err)
+	}
+	pathApplied(`"audit", "public"`)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		h.poolers[1].mu.Lock()
+		reserves, releases := len(h.poolers[1].reserves), len(h.poolers[1].releases)
+		h.poolers[1].mu.Unlock()
+		if reserves > 0 && releases >= reserves {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("scatter backends must be released after the read: reserves=%d releases=%d", reserves, releases)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
