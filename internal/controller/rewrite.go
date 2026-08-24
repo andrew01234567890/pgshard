@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
+	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 )
 
 // Rewrite phases, tracked per shard in ShardMigration.Step.
@@ -27,8 +28,11 @@ const DefaultRewriteBatch = 1000
 
 // DefaultRewriteSettle is how long the applier waits after publishing the
 // visible column list before adding the hidden column, so every router has
-// reloaded its snapshot and hides the column from the first moment.
-const DefaultRewriteSettle = 2 * time.Second
+// reloaded its snapshot and hides the column from the first moment. It
+// must cover the snapshot watcher's fallback reload: a router whose LISTEN
+// dropped only notices the column list on its periodic reload, and a
+// shorter settle would let its SELECT * leak the hidden column.
+const DefaultRewriteSettle = snapshot.DefaultReloadInterval + 5*time.Second
 
 // driveRewrite runs an online rewrite migration: per phase across every
 // shard, so no shard cuts over before all shards finished their backfill.
@@ -266,6 +270,12 @@ func (a *Applier) backfill(ctx context.Context, conn ShardConn, rw *catalog.Rewr
 		sql := "WITH batch AS (SELECT " + pk + " FROM " + table + " WHERE " + pred +
 			" ORDER BY " + pk + " LIMIT " + fmt.Sprint(batch) + ")" +
 			" UPDATE " + table + " t SET " + set + " FROM batch WHERE t." + pk + " = batch." + pk
+		// A volatile DEFAULT that yields NULL (add) or an unstable USING
+		// (type change) leaves updated rows still matching pred, so the
+		// keyset never advances: fail on a stalled minimum instead of
+		// looping forever.
+		probe := "SELECT coalesce(min(" + pk + ")::text, '') FROM " + table + " WHERE " + pred
+		lastMin, haveMin := "", false
 		for {
 			tag, err := conn.Exec(ctx, sql)
 			if err != nil {
@@ -274,6 +284,21 @@ func (a *Applier) backfill(ctx context.Context, conn ShardConn, rw *catalog.Rewr
 			if tag == nil || tag.RowsAffected() < int64(batch) {
 				return nil
 			}
+			rows, err := conn.Query(ctx, probe)
+			if err != nil {
+				return err
+			}
+			minKey, err := pgx.CollectOneRow(rows, pgx.RowTo[string])
+			if err != nil {
+				return err
+			}
+			if minKey == "" {
+				return nil
+			}
+			if haveMin && minKey == lastMin {
+				return fmt.Errorf("backfill of %s is not converging: rows keep matching %q after being updated (a volatile DEFAULT returning NULL or an unstable USING expression cannot be backfilled); fix the expression and run the migration again", table, pred)
+			}
+			lastMin, haveMin = minKey, true
 		}
 	}
 	_, err = conn.Exec(ctx, "UPDATE "+table+" SET "+set+" WHERE "+pred)

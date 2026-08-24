@@ -119,6 +119,8 @@ type fakeShards struct {
 	nnPending    bool
 	version      int
 	affected     func(shard int32, sql string) int64
+	backfillMin  func(shard int32) string
+	probe        int
 	sweepDrops   []string
 }
 
@@ -204,6 +206,15 @@ func (c *fakeConn) Query(_ context.Context, sql string, args ...any) (pgx.Rows, 
 		return &stringRows{vals: c.f.columns}, nil
 	case strings.Contains(sql, "indisprimary"):
 		return &stringRows{vals: c.f.pks}, nil
+	case strings.Contains(sql, "coalesce(min("):
+		if c.f.backfillMin != nil {
+			return &stringRows{vals: []string{c.f.backfillMin(c.id)}}, nil
+		}
+		c.f.mu.Lock()
+		c.f.probe++
+		v := fmt.Sprint(c.f.probe)
+		c.f.mu.Unlock()
+		return &stringRows{vals: []string{v}}, nil
 	case strings.Contains(sql, "pg_get_expr"):
 		return &factsRows{def: c.f.oldDefault, notNull: c.f.oldNotNull}, nil
 	case strings.Contains(sql, "NOT convalidated"):

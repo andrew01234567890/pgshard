@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
+	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 )
 
 func rewriteMigration(id string) catalog.DDLMigration {
@@ -220,5 +221,35 @@ func TestRewriteTriggerSQLShapes(t *testing.T) {
 	add := &catalog.RewriteChange{Table: "orders", Column: "token", NewType: "uuid", Default: "gen_random_uuid()", Add: true}
 	if got := backfillPredicate(add, "_pgshard_token_00000000"); got != `"_pgshard_token_00000000" IS NULL` {
 		t.Fatalf("add predicate %q", got)
+	}
+}
+
+func TestRewriteSettleCoversTheSnapshotFallbackReload(t *testing.T) {
+	if DefaultRewriteSettle < snapshot.DefaultReloadInterval {
+		t.Fatalf("settle %s is shorter than the snapshot fallback reload %s: a router whose LISTEN dropped could leak the hidden column",
+			DefaultRewriteSettle, snapshot.DefaultReloadInterval)
+	}
+}
+
+func TestBackfillFailsWhenItDoesNotConverge(t *testing.T) {
+	store := &memStore{migrations: []catalog.DDLMigration{rewriteMigration("00000000-0000-0000-0000-00000000ab09")},
+		shards: []int32{0}}
+	shards := newFakeShards()
+	shards.columns = []string{"tenant_id", "id", "amount"}
+	shards.pks = []string{"id"}
+	shards.affected = func(_ int32, sql string) int64 {
+		if strings.Contains(sql, "WITH batch AS") {
+			return 2
+		}
+		return 0
+	}
+	shards.backfillMin = func(int32) string { return "42" }
+	a := newRewriteApplier(store, shards)
+	if _, err := a.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m := store.get(t, "00000000-0000-0000-0000-00000000ab09")
+	if m.State != catalog.MigrationFailed || !strings.Contains(m.Error, "not converging") {
+		t.Fatalf("state %s error %q", m.State, m.Error)
 	}
 }
