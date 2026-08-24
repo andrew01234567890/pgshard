@@ -378,3 +378,21 @@ func TestAutoNameIsDeterministicAndFits(t *testing.T) {
 		t.Fatalf("multibyte name %q (%d bytes)", u, len(u))
 	}
 }
+
+func TestDetachStepsCarryThePartitionSchema(t *testing.T) {
+	p := New()
+	snap := fixture(t)
+	pl, err := p.Plan(context.Background(), session(snap), "alter table orders detach partition public.orders_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps := pl.Migration.Steps
+	if len(steps) != 2 {
+		t.Fatalf("steps: %+v", steps)
+	}
+	for _, s := range steps {
+		if s.Skip.Name != "orders_1" || s.Skip.NameSchema != "public" {
+			t.Fatalf("%s check ignores the partition schema: %+v", s.Skip.Kind, s.Skip)
+		}
+	}
+}

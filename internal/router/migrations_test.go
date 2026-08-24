@@ -235,3 +235,26 @@ func TestDDLRefusedInTransactionAndRewriteClass(t *testing.T) {
 		t.Fatalf("message %q", pe.Message)
 	}
 }
+
+func TestPGMigrationQueueWaitIsBounded(t *testing.T) {
+	q := &PGMigrationQueue{Poll: time.Millisecond, MaxWait: 20 * time.Millisecond,
+		load: func(context.Context, string) (catalog.DDLMigration, error) {
+			return catalog.DDLMigration{State: catalog.MigrationQueued}, nil
+		}}
+	type result struct {
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		_, err := q.Wait(context.Background(), "m1")
+		done <- result{err}
+	}()
+	select {
+	case r := <-done:
+		if r.err == nil || !strings.Contains(r.err.Error(), "controller") {
+			t.Fatalf("bounded wait names the controller: %v", r.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait did not return without an applier")
+	}
+}

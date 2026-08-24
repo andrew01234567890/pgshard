@@ -35,7 +35,16 @@ type PGMigrationQueue struct {
 	Pool *pgxpool.Pool
 	// Poll is the wait between state reads; default 200ms.
 	Poll time.Duration
+	// MaxWait bounds Wait so a deployment without a running applier does
+	// not block the client forever; default DefaultMigrationMaxWait.
+	MaxWait time.Duration
+	// load overrides the catalog read in tests.
+	load func(ctx context.Context, id string) (catalog.DDLMigration, error)
 }
+
+// DefaultMigrationMaxWait is how long Wait polls a migration before giving
+// up when no applier finishes it.
+const DefaultMigrationMaxWait = 10 * time.Minute
 
 // Enqueue implements MigrationQueue.
 func (q *PGMigrationQueue) Enqueue(ctx context.Context, m catalog.DDLMigration) (string, error) {
@@ -48,15 +57,29 @@ func (q *PGMigrationQueue) Wait(ctx context.Context, id string) (catalog.DDLMigr
 	if poll <= 0 {
 		poll = 200 * time.Millisecond
 	}
+	maxWait := q.MaxWait
+	if maxWait <= 0 {
+		maxWait = DefaultMigrationMaxWait
+	}
+	deadline := time.Now().Add(maxWait)
 	t := time.NewTicker(poll)
 	defer t.Stop()
+	load := q.load
+	if load == nil {
+		load = func(ctx context.Context, id string) (catalog.DDLMigration, error) {
+			return catalog.LoadMigration(ctx, q.Pool, id)
+		}
+	}
 	for {
-		m, err := catalog.LoadMigration(ctx, q.Pool, id)
+		m, err := load(ctx, id)
 		if err != nil {
 			return m, err
 		}
 		if m.State == catalog.MigrationComplete || m.State == catalog.MigrationFailed {
 			return m, nil
+		}
+		if time.Now().After(deadline) {
+			return m, fmt.Errorf("migration %s is still %s after %s: is a pgshard controller running the DDL applier?", id, m.State, maxWait)
 		}
 		select {
 		case <-ctx.Done():
@@ -234,7 +257,7 @@ func migrationSteps(steps []plan.Step) []catalog.MigrationStep {
 	out := make([]catalog.MigrationStep, len(steps))
 	for i, s := range steps {
 		out[i] = catalog.MigrationStep{SQL: s.SQL, Concurrent: s.Concurrent, Index: s.Index, OnFail: s.OnFail,
-			Skip: catalog.MigrationCheck{Kind: s.Skip.Kind, Schema: s.Skip.Schema, Table: s.Skip.Table, Name: s.Skip.Name}}
+			Skip: catalog.MigrationCheck{Kind: s.Skip.Kind, Schema: s.Skip.Schema, Table: s.Skip.Table, Name: s.Skip.Name, NameSchema: s.Skip.NameSchema}}
 	}
 	return out
 }

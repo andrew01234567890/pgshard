@@ -222,9 +222,14 @@ func (c *fakeConn) Query(_ context.Context, sql string, args ...any) (pgx.Rows, 
 		v := c.f.check != nil && c.f.check(c.id, "index_valid", "", name)
 		return &boolRows{vals: []bool{v}}, nil
 	}
-	if len(args) == 3 {
+	if len(args) == 3 || len(args) == 4 {
 		table, _ := args[0].(string)
 		obj, _ := args[2].(string)
+		if len(args) == 4 {
+			if ns, _ := args[3].(string); ns != "" {
+				obj = ns + "." + obj
+			}
+		}
 		c.f.mu.Lock()
 		c.f.ran[c.id] = append(c.f.ran[c.id], "check "+checkKind(sql)+" "+table+" "+obj)
 		c.f.mu.Unlock()
@@ -1062,5 +1067,59 @@ func TestApplierStepChecksCoverEveryKind(t *testing.T) {
 	f.run(t)
 	if m := f.store.get(t, id); m.State != catalog.MigrationFailed || !strings.Contains(m.Error, "unknown step check") {
 		t.Fatalf("bogus check: %s %q", m.State, m.Error)
+	}
+}
+
+func TestApplierResumedDropUnderExistingScopeCountsAMissingObjectSkipped(t *testing.T) {
+	f := newApplierFixture(t)
+	f.shards.exists = func(int32, string, string) bool { return false }
+	f.shards.exec = func(int32, string) error { return pgErr("42P01", `relation "t" does not exist`) }
+	resumed := func() catalog.DDLMigration {
+		return catalog.DDLMigration{Statement: "drop table t", Kind: "DROP TABLE", Scope: "existing", State: catalog.MigrationRunning,
+			Meta: catalog.MigrationMeta{Object: catalog.MigrationObject{Kind: "relation", Name: "t", Expect: "absent"}},
+			PerShard: map[string]catalog.ShardMigration{
+				"0": {State: catalog.ShardRunning, Attempts: 1},
+				"1": {State: catalog.ShardPending},
+				"2": {State: catalog.ShardPending},
+			}}
+	}
+	id := f.queue(resumed())
+	f.run(t)
+	m := f.store.get(t, id)
+	if m.State != catalog.MigrationFailed {
+		t.Fatalf("no shard had the object but the migration ended %s %s", m.State, states(m))
+	}
+
+	f.shards.exec = nil
+	id = f.queue(resumed())
+	f.run(t)
+	m = f.store.get(t, id)
+	if m.State != catalog.MigrationComplete || states(m) != "0=skipped/2 1=applied/1 2=applied/1" {
+		t.Fatalf("resumed shard without the object is skipped, not applied: %s %s", m.State, states(m))
+	}
+}
+
+func TestApplierDetachChecksAreSchemaQualified(t *testing.T) {
+	f := newApplierFixture(t)
+	f.store.shards = []int32{0}
+	steps := []catalog.MigrationStep{
+		{SQL: "select 1 -- detach", Skip: catalog.MigrationCheck{Kind: "detach_pending", Table: "orders", Name: "orders_1", NameSchema: "other"}},
+		{SQL: "select 2 -- finalize", Skip: catalog.MigrationCheck{Kind: "detached", Table: "orders", Name: "orders_1", NameSchema: "other"}},
+	}
+	f.shards.check = func(_ int32, _, _, obj string) bool { return obj == "other.orders_1" }
+	id := f.queue(multistep(steps))
+	f.run(t)
+	m := f.store.get(t, id)
+	if m.State != catalog.MigrationComplete {
+		t.Fatalf("%s %+v", m.State, m.PerShard["0"])
+	}
+	got := strings.Join(f.shards.statements(0), "\n")
+	for _, want := range []string{"check detach_pending orders other.orders_1", "check detached orders other.orders_1"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("partition check is not schema-qualified:\n%s", got)
+		}
+	}
+	if strings.Contains(got, "select 1") || strings.Contains(got, "select 2") {
+		t.Fatalf("a step ran although its schema-qualified check held:\n%s", got)
 	}
 }

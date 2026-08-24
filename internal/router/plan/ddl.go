@@ -80,6 +80,9 @@ type Check struct {
 	Schema string
 	Table  string
 	Name   string
+	// NameSchema qualifies Name when it is a partition with an explicit
+	// schema; empty matches any schema.
+	NameSchema string
 }
 
 // ObjectRef names the object a migration creates or drops.
