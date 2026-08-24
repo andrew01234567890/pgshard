@@ -291,6 +291,35 @@ func TestStartupOptionsSearchPath(t *testing.T) {
 	}
 }
 
+func TestStartupSearchPathIsAppliedOnTheBackend(t *testing.T) {
+	h := newShardedHarness(t)
+	ctx := context.Background()
+	conn := h.connect(t, h.dsn()+"&options=-c%20search_path%3Daudit,public")
+
+	setting := func() string {
+		var v string
+		if err := conn.QueryRow(ctx, "select current_setting('search_path')").Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	if got := setting(); got != `"audit", "public"` {
+		t.Fatalf("backend search_path = %q, want the startup path the planner routes with", got)
+	}
+	if _, err := conn.Exec(ctx, "set search_path = public"); err != nil {
+		t.Fatal(err)
+	}
+	if got := setting(); got != "public" {
+		t.Fatalf("backend search_path after SET = %q, want public", got)
+	}
+	if _, err := conn.Exec(ctx, "reset search_path"); err != nil {
+		t.Fatal(err)
+	}
+	if got := setting(); got != `"audit", "public"` {
+		t.Fatalf("backend search_path after RESET = %q, want the startup path back", got)
+	}
+}
+
 func TestShardedPreparedStatementFollowsTheKey(t *testing.T) {
 	h := newShardedHarness(t)
 	ctx := context.Background()

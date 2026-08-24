@@ -167,11 +167,11 @@ type Executor struct {
 	txnPrelude []string
 	txnTouched bool
 
+	// parked holds the streams of the other shards an open transaction has
+	// touched; wroteHere says whether the current shard was written to.
 	// startupSearchPath is the search_path the client asked for at startup
 	// (options=-c search_path=...); nil means the server default.
 	startupSearchPath []string
-	// parked holds the streams of the other shards an open transaction has
-	// touched; wroteHere says whether the current shard was written to.
 	// unsent names the statements of the batch being placed, which no
 	// backend has parsed yet.
 	unsent    map[string]bool
@@ -188,14 +188,31 @@ type Executor struct {
 func newExecutor(r *Router, info pgwire.SessionInfo, home Shard) *Executor {
 	ctx, cancel := context.WithCancel(context.Background())
 	keys := info.Auth.SCRAM
-	return &Executor{
+	e := &Executor{
 		r: r, info: info, sid: r.prefix + "-" + strconv.FormatUint(info.ID, 10), home: home, shard: home,
 		ident: &pgshardv1.UserIdentity{Username: info.User,
 			ScramClientKey: append([]byte(nil), keys.ClientKey...), ScramServerKey: append([]byte(nil), keys.ServerKey...)},
 		ctx: ctx, cancel: cancel, tx: pgwire.TxIdle,
 		stmts: map[string]prepared{}, portals: map[string]string{},
-		startupSearchPath: startupSearchPath(info.Params["options"]),
 	}
+	e.startupSearchPath = startupSearchPath(info.Params["options"])
+	return e
+}
+
+// resetsSearchPath reports whether g restores the search_path default
+// (RESET search_path, SET search_path TO DEFAULT, or RESET ALL).
+func resetsSearchPath(g gucEntry) bool {
+	return g.name == "" || (g.name == "search_path" && g.searchPath == nil)
+}
+
+// searchPathSQL renders the statement that applies path on a backend.
+func searchPathSQL(path []string) string {
+	quoted := make([]string, len(path))
+	for i, s := range path {
+		quoted[i] = `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+	}
+	value := strings.Join(quoted, ", ")
+	return "SELECT set_config('search_path', '" + strings.ReplaceAll(value, "'", "''") + "', false)"
 }
 
 // startupSearchPath extracts search_path from a startup "options" parameter
@@ -374,7 +391,7 @@ func (e *Executor) physical(name string) string {
 }
 
 func (e *Executor) needsPin() bool {
-	if len(e.gucs) > 0 || len(e.staged) > 0 || len(e.sqlPrepared) > 0 {
+	if e.startupSearchPath != nil || len(e.gucs) > 0 || len(e.staged) > 0 || len(e.sqlPrepared) > 0 {
 		return true
 	}
 	for name := range e.stmts {
@@ -503,7 +520,11 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 			e.noteExecuted(sql, pl.Kind == plan.SessionLocal)
 		}
 		if pl.Class.SetGUC && err == nil {
-			e.staged = append(e.staged, gucEntry{name: pl.Class.GUCName, sql: sql, value: pl.Class.GUCValue, searchPath: pl.Class.SearchPath})
+			g := gucEntry{name: pl.Class.GUCName, sql: sql, value: pl.Class.GUCValue, searchPath: pl.Class.SearchPath}
+			e.staged = append(e.staged, g)
+			if err := e.reapplyStartupSearchPath(ctx, g); err != nil {
+				return err
+			}
 		}
 		if err == nil {
 			e.noteSessionEffect(pl.Class, sql)
@@ -1065,9 +1086,31 @@ func (e *Executor) sync(ctx context.Context) error {
 				e.noteExecuted(item.sql, item.local)
 				e.noteSessionEffect(item.class, item.sql)
 			}
+			for _, g := range e.staged[min(e.stagedMark, len(e.staged)):] {
+				if err := e.reapplyStartupSearchPath(ctx, g); err != nil {
+					return err
+				}
+			}
 		}
 		return err
 	})
+}
+
+// reapplyStartupSearchPath keeps the executing backend's search_path in step
+// with routing after g ran: a RESET restores the startup search_path on this
+// session, while the backend — which never saw the startup options — would
+// fall back to the server default the planner did not route with.
+func (e *Executor) reapplyStartupSearchPath(ctx context.Context, g gucEntry) error {
+	if e.startupSearchPath == nil || !resetsSearchPath(g) {
+		return nil
+	}
+	if err := e.send(simpleQuery(searchPathSQL(e.startupSearchPath))); err != nil {
+		return err
+	}
+	if err := e.pump(ctx, discardWriter{}); err != nil {
+		return fmt.Errorf("router: reapplying the startup search_path: %w", err)
+	}
+	return nil
 }
 
 // afterBatch settles staged GUCs and releases the pinned backend when a
@@ -1186,11 +1229,22 @@ func (e *Executor) ensurePinned(ctx context.Context) error {
 // replay re-establishes session GUCs and named prepared statements on a
 // freshly pinned backend.
 func (e *Executor) replay(ctx context.Context, skip map[string]bool) error {
-	if len(e.gucs) > 0 {
-		parts := make([]string, len(e.gucs))
-		for i, g := range e.gucs {
-			parts[i] = strings.TrimRight(strings.TrimSpace(g.sql), ";")
+	var parts []string
+	// The backend never saw the client's startup options, so a startup
+	// search_path is applied first, and re-applied after every replayed
+	// RESET: on this session RESET restores the startup value, while on
+	// the backend it would restore the server default the planner did not
+	// route with.
+	if e.startupSearchPath != nil {
+		parts = append(parts, searchPathSQL(e.startupSearchPath))
+	}
+	for _, g := range e.gucs {
+		parts = append(parts, strings.TrimRight(strings.TrimSpace(g.sql), ";"))
+		if e.startupSearchPath != nil && resetsSearchPath(g) {
+			parts = append(parts, searchPathSQL(e.startupSearchPath))
 		}
+	}
+	if len(parts) > 0 {
 		if err := e.send(simpleQuery(strings.Join(parts, "; "))); err != nil {
 			return err
 		}
