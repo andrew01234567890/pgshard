@@ -342,6 +342,19 @@ func (r *ClusterReconciler) failover(ctx context.Context, c *pgshardv1alpha1.PgS
 	if err := r.patchRole(ctx, members[candidate].pod, RolePrimary); err != nil {
 		return state, err
 	}
+	// Standbys stream through named slots; the new primary only inherits the
+	// slots that slot sync copied while it was a standby. Create the rest now
+	// so sync-rep commits against it cannot wait on a standby that can never
+	// reconnect.
+	var slots []string
+	for _, name := range g.MemberNames() {
+		if name != candidate {
+			slots = append(slots, SlotName(name))
+		}
+	}
+	if err := r.Prober.EnsureSlots(ctx, HostDSN(members[candidate].ip, password), slots, SlotName(candidate)); err != nil {
+		log.Error(err, "ensure slots on the new primary; retried next reconcile")
+	}
 	r.unhealthyFor(g.Prefix(), false)
 	log.Info("failover complete", "primary", candidate, "epoch", epoch)
 	return state, nil
@@ -352,6 +365,7 @@ func (r *ClusterReconciler) failover(ctx context.Context, c *pgshardv1alpha1.PgS
 // members' views. After standbyQuiesceTimeout it proceeds with whatever is
 // reachable, unless the old primary is still live.
 func (r *ClusterReconciler) quiesce(ctx context.Context, g Group, old string, members map[string]*memberInfo, password string) ([]memberView, error) {
+	log := logf.FromContext(ctx).WithValues("group", g.Name(), "oldPrimary", old)
 	deadline := r.now().Add(r.quiesceTimeout())
 	for {
 		oldGone := true
@@ -380,6 +394,7 @@ func (r *ClusterReconciler) quiesce(ctx context.Context, g Group, old string, me
 		if oldGone && allStopped {
 			return views, nil
 		}
+		log.V(1).Info("quiesce: waiting", "oldGone", oldGone, "views", fmt.Sprintf("%+v", views))
 		if r.now().After(deadline) {
 			if !oldGone {
 				return nil, errPrimaryStillLive
