@@ -367,3 +367,52 @@ func TestResolverSparesPreparingRowWithLiveHeartbeat(t *testing.T) {
 		t.Fatalf("outcome %+v prepared %v decisions %v", out, f.prepared(1), f.decisions())
 	}
 }
+
+func TestResolverSparesPreparingRefreshedBetweenScanAndAbort(t *testing.T) {
+	f := newResolverFixture(t)
+	ctx := context.Background()
+	f.prepare(1, "pgshard-c-1-1", "raced-live")
+	f.decide("pgshard-c-1-1", "preparing", 10*time.Minute, 1)
+	f.prepare(1, "pgshard-c-1-2", "raced-dead")
+	f.decide("pgshard-c-1-2", "preparing", 10*time.Minute, 1)
+	shards, err := f.res.listShards(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	holders, scanErrs := f.res.scanPrepared(ctx, shards)
+	if len(scanErrs) != 0 {
+		t.Fatalf("scan errors %v", scanErrs)
+	}
+	// The coordinator heartbeats after the staleness snapshot was taken but
+	// before the resolver aborts: the abort must land on zero rows and the
+	// pass must leave the transaction alone.
+	mustExecPool(t, f.pool, `UPDATE pgshard.xact_decisions SET heartbeat_at = now() WHERE gid = 'pgshard-c-1-1'`)
+	stale := time.Now().Add(-10 * time.Minute)
+	var out Outcome
+	if err := f.res.resolveDecision(ctx, decision{GID: "pgshard-c-1-1", State: "preparing", Participants: []int32{1}, LastAlive: stale}, holders, true, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out != (Outcome{}) {
+		t.Fatalf("outcome %+v: a freshly heartbeaten transaction was resolved", out)
+	}
+	if got := f.decisions(); strings.Join(got, ",") != "pgshard-c-1-1:preparing,pgshard-c-1-2:preparing" {
+		t.Fatalf("decisions %v", got)
+	}
+	if got := f.prepared(1); strings.Join(got, ",") != "pgshard-c-1-1,pgshard-c-1-2" {
+		t.Fatalf("shard 1 prepared %v", got)
+	}
+	// The genuinely stale sibling still ages out on the same pass shape.
+	if err := f.res.resolveDecision(ctx, decision{GID: "pgshard-c-1-2", State: "preparing", Participants: []int32{1}, LastAlive: stale}, holders, true, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.RolledBack != 1 {
+		t.Fatalf("outcome %+v", out)
+	}
+	if got := f.prepared(1); strings.Join(got, ",") != "pgshard-c-1-1" {
+		t.Fatalf("shard 1 prepared %v", got)
+	}
+	if got := f.decisions(); strings.Join(got, ",") != "pgshard-c-1-1:preparing" {
+		t.Fatalf("decisions %v", got)
+	}
+}
+

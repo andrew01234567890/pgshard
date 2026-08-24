@@ -202,7 +202,11 @@ func (r *Resolver) resolveDecision(ctx context.Context, d decision, holders map[
 		if r.now().Sub(d.LastAlive) < r.preparingTimeout() {
 			return nil
 		}
-		tag, err := r.Pool.Exec(ctx, `UPDATE pgshard.xact_decisions SET state = 'abort', decided_at = now() WHERE gid = $1 AND state = 'preparing'`, d.GID)
+		// The staleness check re-runs inside the UPDATE against the same
+		// cutoff: a coordinator heartbeat landing after the scan snapshot
+		// makes it match zero rows instead of aborting a live transaction.
+		cutoff := r.now().Add(-r.preparingTimeout())
+		tag, err := r.Pool.Exec(ctx, `UPDATE pgshard.xact_decisions SET state = 'abort', decided_at = now() WHERE gid = $1 AND state = 'preparing' AND greatest(created_at, heartbeat_at) <= $2`, d.GID, cutoff)
 		if err != nil {
 			return err
 		}
@@ -212,6 +216,9 @@ func (r *Resolver) resolveDecision(ctx context.Context, d decision, holders map[
 					return nil
 				}
 				return err
+			}
+			if d.State == "preparing" {
+				return nil
 			}
 		} else {
 			d.State = "abort"
