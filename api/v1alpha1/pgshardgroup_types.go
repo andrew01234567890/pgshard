@@ -4,7 +4,8 @@ import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 // GroupRollout is the rolling operation in flight on one group.
 type GroupRollout struct {
-	Phase string `json:"phase"`
+	// +optional
+	Phase string `json:"phase,omitempty"`
 	// +optional
 	Member string `json:"member,omitempty"`
 	// +optional

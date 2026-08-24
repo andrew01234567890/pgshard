@@ -407,3 +407,33 @@ func retiredClaimAlive(t *testing.T, name string) {
 		t.Fatalf("retired claim %s deleted before the successor settled", name)
 	}
 }
+
+func TestGroupRolloutStatusWithoutPhasePassesValidation(t *testing.T) {
+	if k8sClient == nil {
+		t.Skip("KUBEBUILDER_ASSETS not set")
+	}
+	ctx := context.Background()
+	pg := &pgshardv1alpha1.PgShardGroup{
+		ObjectMeta: metav1.ObjectMeta{Name: "rollout-phase-clear", Namespace: "default"},
+		Spec:       pgshardv1alpha1.PgShardGroupSpec{ClusterRef: "demo", Kind: "catalog"},
+	}
+	if err := k8sClient.Create(ctx, pg); err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	defer func() { _ = k8sClient.Delete(ctx, pg) }()
+	base := pg.DeepCopy()
+	pg.Status.Rollout = &pgshardv1alpha1.GroupRollout{Phase: pgshardv1alpha1.RolloutPhaseRestarting, Member: "m0", Since: ptr.To(metav1.Now())}
+	if err := k8sClient.Status().Patch(ctx, pg, client.MergeFrom(base)); err != nil {
+		t.Fatalf("set rollout: %v", err)
+	}
+	base = pg.DeepCopy()
+	pg.Status.Rollout = &pgshardv1alpha1.GroupRollout{Member: "m0"}
+	if err := k8sClient.Status().Patch(ctx, pg, client.MergeFrom(base)); err != nil {
+		t.Fatalf("rollout without a phase must pass CRD validation: %v", err)
+	}
+	base = pg.DeepCopy()
+	pg.Status.Rollout = nil
+	if err := k8sClient.Status().Patch(ctx, pg, client.MergeFrom(base)); err != nil {
+		t.Fatalf("clear rollout: %v", err)
+	}
+}

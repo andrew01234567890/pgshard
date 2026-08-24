@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -233,4 +234,65 @@ func quoteLiteral(s string) string {
 		b = append(b, s[i])
 	}
 	return string(append(b, '\''))
+}
+
+// proberCallTimeout bounds every SQL call a reconcile makes. A wedged server
+// (for example a commit stuck waiting for a synchronous standby that cannot
+// reconnect) must fail the call and requeue, never block a reconcile forever.
+const proberCallTimeout = 15 * time.Second
+
+// boundedProber caps each call on the wrapped Prober at Timeout.
+type boundedProber struct {
+	Inner   Prober
+	Timeout time.Duration
+}
+
+func (b boundedProber) bound(ctx context.Context) (context.Context, context.CancelFunc) {
+	d := b.Timeout
+	if d <= 0 {
+		d = proberCallTimeout
+	}
+	return context.WithTimeout(ctx, d)
+}
+
+func (b boundedProber) Probe(ctx context.Context, dsn string) (PrimaryState, error) {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.Probe(ctx, dsn)
+}
+
+func (b boundedProber) ProbeStandby(ctx context.Context, dsn string) (StandbyState, error) {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.ProbeStandby(ctx, dsn)
+}
+
+func (b boundedProber) SetSyncStandbyNames(ctx context.Context, dsn, value string) error {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.SetSyncStandbyNames(ctx, dsn, value)
+}
+
+func (b boundedProber) MigrateCatalog(ctx context.Context, dsn string) error {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.MigrateCatalog(ctx, dsn)
+}
+
+func (b boundedProber) PublishShardStatus(ctx context.Context, dsn string, shardID int, groupName string, epoch int64, endpoint string) error {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.PublishShardStatus(ctx, dsn, shardID, groupName, epoch, endpoint)
+}
+
+func (b boundedProber) EnsureSlots(ctx context.Context, dsn string, want []string, drop string) error {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.EnsureSlots(ctx, dsn, want, drop)
+}
+
+func (b boundedProber) Settings(ctx context.Context, dsn string, names []string) (map[string]SettingState, error) {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.Settings(ctx, dsn, names)
 }
