@@ -916,3 +916,34 @@ func TestStartupTimeoutClosesHalfOpenConns(t *testing.T) {
 	}
 	waitNoSessions(t, ts.Server)
 }
+
+func TestStartupDeadlineCancelsStalledLookup(t *testing.T) {
+	lookupCancelled := make(chan error, 1)
+	auth := CleartextAuthenticator{Lookup: func(ctx context.Context, _ string) (string, error) {
+		<-ctx.Done()
+		lookupCancelled <- ctx.Err()
+		return "", ctx.Err()
+	}}
+	ts := startServer(t, Config{Authenticator: auth, StartupTimeout: 200 * time.Millisecond, MaxStartupConns: 1})
+	c := dialRaw(t, ts.addr)
+	c.send(&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: map[string]string{"user": "alice"}})
+	if _, ok := c.recv().(*pgproto3.AuthenticationCleartextPassword); !ok {
+		t.Fatal("expected cleartext password request")
+	}
+	c.send(&pgproto3.PasswordMessage{Password: "pw"})
+	select {
+	case err := <-lookupCancelled:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("lookup context ended with %v, want deadline", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stalled Lookup was never cancelled by the startup deadline")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for len(ts.startupSem) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("startup slot was never released after the stalled Lookup")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}

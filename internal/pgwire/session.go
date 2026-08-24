@@ -169,11 +169,27 @@ func (s *session) run() {
 		s.terminate(Errorf(CodeTooManyConnections, "sorry, too many clients already (startup)"))
 		return
 	}
-	if d := s.server.cfg.StartupTimeout; d > 0 {
-		_ = s.conn.SetDeadline(time.Now().Add(d))
-	}
-	err := s.startup(ctx)
-	s.server.releaseStartup()
+	err := func() error {
+		defer s.server.releaseStartup()
+		sctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		if d := s.server.cfg.StartupTimeout; d > 0 {
+			var tcancel context.CancelFunc
+			sctx, tcancel = context.WithTimeout(sctx, d)
+			defer tcancel()
+			_ = s.conn.SetDeadline(time.Now().Add(d))
+		}
+		// Shutdown must cancel blocking pre-auth work (catalog lookups),
+		// not just idle sockets.
+		go func() {
+			select {
+			case <-s.server.shutdownCh:
+				cancel()
+			case <-sctx.Done():
+			}
+		}()
+		return s.startup(sctx)
+	}()
 	if err == nil {
 		// s.conn may have been replaced by the TLS upgrade; clearing the
 		// deadline through it reaches the underlying connection.

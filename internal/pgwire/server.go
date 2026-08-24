@@ -69,6 +69,10 @@ type Server struct {
 	logger     *slog.Logger
 
 	startupSem chan struct{}
+	// shutdownCh is closed by Shutdown so blocking pre-auth work (catalog
+	// lookups) is cancelled instead of holding startup slots.
+	shutdownCh   chan struct{}
+	shutdownOnce sync.Once
 
 	mu       sync.Mutex
 	sessions map[uint64]*session
@@ -112,7 +116,7 @@ func NewServer(cfg Config) (*Server, error) {
 	if cfg.MaxStartupConns == 0 {
 		cfg.MaxStartupConns = 100
 	}
-	srv := &Server{cfg: cfg, instanceID: id, logger: cfg.Logger, sessions: map[uint64]*session{}}
+	srv := &Server{cfg: cfg, instanceID: id, logger: cfg.Logger, sessions: map[uint64]*session{}, shutdownCh: make(chan struct{})}
 	if cfg.MaxStartupConns > 0 {
 		srv.startupSem = make(chan struct{}, cfg.MaxStartupConns)
 	}
@@ -199,6 +203,7 @@ func (s *Server) unregister(sess *session) {
 // Shutdown stops accepting, terminates idle sessions with 57P01 and waits for
 // active queries to finish until ctx expires, then closes everything.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.shutdownOnce.Do(func() { close(s.shutdownCh) })
 	s.mu.Lock()
 	s.closing = true
 	l := s.listener
