@@ -232,6 +232,11 @@ func (e *Executor) runScatter(ctx context.Context, shards []int32, m *plan.Merge
 	}
 	defer e.r.scatter.release(len(shards))
 	e.r.metrics.ScatterFanout.Observe(float64(len(shards)))
+	// Each scatter numbers its pooler sessions: releasing a reserved
+	// participant is asynchronous, and a reused sid could be unpinned by
+	// the previous scatter's late Release.
+	e.scatterSeq++
+	seq := strconv.FormatUint(e.scatterSeq, 10)
 	parts := make([]*participant, 0, len(shards))
 	defer func() {
 		for _, p := range parts {
@@ -255,7 +260,7 @@ func (e *Executor) runScatter(ctx context.Context, shards []int32, m *plan.Merge
 		if err != nil {
 			return pgwire.Errorf(codeConnectionFailure, "pooler of shard %s/%d refused the connection: %v", sh.Set, sh.ID, err)
 		}
-		p := &participant{shard: sh, sid: e.sid + "-x" + strconv.FormatInt(int64(id), 10), client: client, ps: ps,
+		p := &participant{shard: sh, sid: e.sid + "-x" + seq + "-" + strconv.FormatInt(int64(id), 10), client: client, ps: ps,
 			header: make(chan struct{}), rows: make(chan [][]byte, 64), done: make(chan struct{}), stop: make(chan struct{})}
 		parts = append(parts, p)
 		gen := e.r.cfg.Poolers.Generation(sh)

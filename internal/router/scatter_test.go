@@ -238,7 +238,13 @@ func TestScatterClientCancelReachesEveryShard(t *testing.T) {
 		fp.mu.Lock()
 		cancels := append([]string(nil), fp.cancels...)
 		fp.mu.Unlock()
-		if !contains(cancels, h.sidOf(t)+"-x"+itoa(int64(i))) {
+		found := false
+		for _, c := range cancels {
+			if strings.HasPrefix(c, h.sidOf(t)+"-x") && strings.HasSuffix(c, "-"+itoa(int64(i))) {
+				found = true
+			}
+		}
+		if !found {
 			t.Fatalf("shard %d cancels %v, want the scatter participant", i, cancels)
 		}
 	}

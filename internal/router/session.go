@@ -185,6 +185,9 @@ type Executor struct {
 	wroteHere bool
 	gid       string
 	gidSeq    uint64
+	// scatterSeq numbers this session's scatter reads so their pooler
+	// session ids are never reused.
+	scatterSeq uint64
 	// releasing holds, per shard, the completion of a Release the session
 	// fired without waiting; the next stream on that shard waits for it so
 	// Reserve never pins the backend the release is still cleaning.
