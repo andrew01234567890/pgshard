@@ -482,6 +482,11 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 		return true, s.errorf("55000", "stale routing generation")
 	case q == "select bad":
 		return true, s.errorf("42P01", "relation \"bad\" does not exist")
+	case q == "select notify":
+		if err := s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_Notification{Notification: &pgshardv1.NotificationResponse{Pid: 9, Channel: "events", Payload: "hello"}}}); err != nil {
+			return true, err
+		}
+		return true, s.complete("SELECT 0")
 	case q == "select notice":
 		if err := s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_Notice{Notice: &pgshardv1.NoticeResponse{Notice: &pgshardv1.Error{Sqlstate: "00000", Message: "hello"}}}}); err != nil {
 			return true, err

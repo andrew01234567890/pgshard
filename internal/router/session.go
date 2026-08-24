@@ -1201,6 +1201,9 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 			}
 		case *pgshardv1.ExecuteResponse_Notice:
 			werr = w.Notice(toNotice(m.Notice.GetNotice()))
+		case *pgshardv1.ExecuteResponse_Notification:
+			n := m.Notification
+			werr = w.Notification(&pgproto3.NotificationResponse{PID: n.GetPid(), Channel: n.GetChannel(), Payload: n.GetPayload()})
 		case *pgshardv1.ExecuteResponse_ParameterDescription:
 			oids := e.clientOIDs(m.ParameterDescription.ParamOids)
 			e.inferParams(m.ParameterDescription.ParamOids)
@@ -1356,14 +1359,15 @@ func zero(b []byte) {
 
 type discardWriter struct{}
 
-func (discardWriter) RowDescription([]pgproto3.FieldDescription) error { return nil }
-func (discardWriter) DataRow([][]byte) error                           { return nil }
-func (discardWriter) CommandComplete(string) error                     { return nil }
-func (discardWriter) EmptyQueryResponse() error                        { return nil }
-func (discardWriter) ParameterDescription([]uint32) error              { return nil }
-func (discardWriter) NoData() error                                    { return nil }
-func (discardWriter) PortalSuspended() error                           { return nil }
-func (discardWriter) Notice(*pgproto3.NoticeResponse) error            { return nil }
+func (discardWriter) RowDescription([]pgproto3.FieldDescription) error  { return nil }
+func (discardWriter) DataRow([][]byte) error                            { return nil }
+func (discardWriter) CommandComplete(string) error                      { return nil }
+func (discardWriter) EmptyQueryResponse() error                         { return nil }
+func (discardWriter) ParameterDescription([]uint32) error               { return nil }
+func (discardWriter) NoData() error                                     { return nil }
+func (discardWriter) PortalSuspended() error                            { return nil }
+func (discardWriter) Notice(*pgproto3.NoticeResponse) error             { return nil }
+func (discardWriter) Notification(*pgproto3.NotificationResponse) error { return nil }
 func (discardWriter) CopyIn(byte, []uint16) (pgwire.CopyInStream, error) {
 	return nil, pgwire.Errorf(pgwire.CodeProtocolViolation, "unexpected COPY while replaying session state")
 }

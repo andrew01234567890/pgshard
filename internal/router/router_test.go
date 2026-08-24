@@ -616,7 +616,9 @@ func TestDeallocateOfProtocolStatementStopsItsReplay(t *testing.T) {
 	if _, err := conn.Exec(ctx, "deallocate q1"); err != nil {
 		t.Fatalf("deallocate must address the physical statement: %v", err)
 	}
-	if !slices.ContainsFunc(h.fp.executedQueries(), func(q string) bool { return strings.HasPrefix(q, `deallocate "pgshard_`) && strings.HasSuffix(q, `_q1"`) }) {
+	if !slices.ContainsFunc(h.fp.executedQueries(), func(q string) bool {
+		return strings.HasPrefix(q, `deallocate "pgshard_`) && strings.HasSuffix(q, `_q1"`)
+	}) {
 		t.Fatalf("deallocate was not rewritten to the physical name: %v", h.fp.executedQueries())
 	}
 	for _, sql := range []string{"begin", "commit", "select 1"} {
@@ -647,4 +649,25 @@ func (f *fakePooler) namedStatements() []string {
 		}
 	}
 	return names
+}
+
+func TestNotificationsReachTheClient(t *testing.T) {
+	h := newHarness(t)
+	cfg, err := pgx.ParseConfig(h.dsn("app", "secret", "app"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []*pgconn.Notification
+	cfg.OnNotification = func(_ *pgconn.PgConn, n *pgconn.Notification) { got = append(got, n) }
+	conn, err := pgx.ConnectConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(context.Background()) }()
+	if _, err := conn.Exec(context.Background(), "select notify"); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].PID != 9 || got[0].Channel != "events" || got[0].Payload != "hello" {
+		t.Fatalf("notifications %+v", got)
+	}
 }

@@ -50,6 +50,7 @@ type ResultWriter interface {
 	// PortalSuspended reports that Execute stopped at its row limit.
 	PortalSuspended() error
 	Notice(*pgproto3.NoticeResponse) error
+	Notification(*pgproto3.NotificationResponse) error
 	// CopyIn starts a COPY FROM STDIN transfer; the returned stream yields
 	// CopyData payloads until CopyDone (io.EOF) or CopyFail (ErrCopyFail).
 	CopyIn(overallFormat byte, columnFormats []uint16) (CopyInStream, error)

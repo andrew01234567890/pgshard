@@ -234,6 +234,10 @@ func (c *countingWriter) Notice(n *pgproto3.NoticeResponse) error {
 	c.wrote = true
 	return c.w.Notice(n)
 }
+func (c *countingWriter) Notification(n *pgproto3.NotificationResponse) error {
+	c.wrote = true
+	return c.w.Notification(n)
+}
 func (c *countingWriter) CopyIn(f byte, cf []uint16) (pgwire.CopyInStream, error) {
 	c.wrote = true
 	return c.w.CopyIn(f, cf)

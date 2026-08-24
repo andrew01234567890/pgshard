@@ -20,7 +20,13 @@
   message of a batch until PostgreSQL reports `ReadyForQuery` with status
   `I`; a transaction (`T`/`E`) keeps it. `Reserve` pins the session's backend
   (or the next one it acquires) until `Release`, which rolls back any open
-  transaction, runs `DISCARD ALL`, and returns it to the pool.
+  transaction, runs `DISCARD ALL`, and returns it to the pool. A reserved
+  session whose `Execute` stream has been gone for `--reserve-timeout`
+  (5m) is released the same way, so a router that died without `Release`
+  cannot hold a backend forever.
+- **Asynchronous messages.** `NoticeResponse`, `ParameterStatus` and
+  `NotificationResponse` (LISTEN payloads) from the backend are forwarded on
+  the session's stream in order.
 - **Budget.** `--max-backends` caps the shard; `--max-per-role` caps each
   role so a hot role cannot starve others. When the shard budget is full of
   idle backends of other roles one is evicted. Backends retire after

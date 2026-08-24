@@ -57,6 +57,7 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	maxPerRole := fs.Int("max-per-role", 0, "backend budget per role (0 = same as --max-backends)")
 	maxLifetime := fs.Duration("backend-max-lifetime", time.Hour, "retire backends older than this")
 	maxIdle := fs.Duration("backend-max-idle", 10*time.Minute, "close backends idle longer than this")
+	reserveTimeout := fs.Duration("reserve-timeout", 5*time.Minute, "release a reserved session whose Execute stream has been gone this long")
 	drain := fs.Duration("drain-timeout", 30*time.Second, "time to let in-flight transactions finish on shutdown")
 	streamDSN := fs.String("stream-dsn", "", "superuser DSN for change-stream replication connections (enables Stream)")
 	streamShard := fs.String("stream-shard", "", "group name used in stream slot names (default derived from --shard-set/--shard-id)")
@@ -106,7 +107,7 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		}
 		*streamShard = catalog.GroupName(set, int32(*shardID))
 	}
-	srv := pooler.NewServer(pooler.Config{Pool: pool, Source: source, Dialer: dialer, Database: *database, Logger: logger,
+	srv := pooler.NewServer(pooler.Config{Pool: pool, Source: source, Dialer: dialer, Database: *database, Logger: logger, ReserveTimeout: *reserveTimeout,
 		Stream: pooler.StreamConfig{DSN: *streamDSN, Shard: *streamShard}})
 
 	l, err := net.Listen("tcp", *listen)

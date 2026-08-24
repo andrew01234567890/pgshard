@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgproto3"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -455,5 +456,46 @@ func TestDrainStartedDuringAcquireIsNotAdopted(t *testing.T) {
 	}
 	if srv.held() != 0 || pg.queries.Load() != 0 {
 		t.Fatalf("held %d, queries %d: the backend ran after Drain", srv.held(), pg.queries.Load())
+	}
+}
+
+func TestReservationWithoutStreamExpires(t *testing.T) {
+	h := startHarness(t, PoolConfig{})
+	ctx := context.Background()
+	if _, err := h.client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: "s", Generation: gen(7, 3)}); err != nil {
+		t.Fatal(err)
+	}
+	stream, _ := h.client.Execute(ctx)
+	roundTrip(t, stream, queryReq("s", "begin", gen(7, 3), identity("alice")))
+	_ = stream.CloseSend()
+	waitFor(t, func() bool { return !h.attached("s") })
+	h.srv.expireReservations(time.Now().Add(h.srv.cfg.ReserveTimeout / 2))
+	if h.srv.lookup("s") == nil || h.srv.held() != 1 {
+		t.Fatal("a reservation younger than the timeout must be kept")
+	}
+	h.srv.expireReservations(time.Now().Add(h.srv.cfg.ReserveTimeout))
+	if h.srv.lookup("s") != nil || h.srv.held() != 0 {
+		t.Fatal("expired reservation must be released")
+	}
+	if !h.pg.sawQuery("ROLLBACK") || !h.pg.sawQuery("DISCARD ALL") {
+		t.Fatalf("expiry must roll back and discard: %v", h.pg.seen)
+	}
+	if _, idle := h.srv.cfg.Pool.Stats(); idle != 1 {
+		t.Fatalf("idle = %d, want the backend back in the pool", idle)
+	}
+	if _, err := h.client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: "n", Generation: gen(7, 3)}); err != nil {
+		t.Fatal(err)
+	}
+	h.srv.expireReservations(time.Now().Add(h.srv.cfg.ReserveTimeout))
+	if h.srv.lookup("n") != nil {
+		t.Fatal("a reservation whose stream never came must expire too")
+	}
+}
+
+func TestNotificationsAreForwarded(t *testing.T) {
+	msg := toResponse(&pgproto3.NotificationResponse{PID: 7, Channel: "events", Payload: "hello"})
+	n := msg.GetNotification()
+	if n == nil || n.Pid != 7 || n.Channel != "events" || n.Payload != "hello" {
+		t.Fatalf("notification = %v", msg)
 	}
 }

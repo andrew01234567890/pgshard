@@ -129,6 +129,9 @@ func toResponse(msg pgproto3.BackendMessage) *pgshardv1.ExecuteResponse {
 	case *pgproto3.NoticeResponse:
 		r.Message = &pgshardv1.ExecuteResponse_Notice{Notice: &pgshardv1.NoticeResponse{Notice: &pgshardv1.Error{
 			Sqlstate: m.Code, Message: m.Message, Detail: m.Detail, Hint: m.Hint}}}
+	case *pgproto3.NotificationResponse:
+		r.Message = &pgshardv1.ExecuteResponse_Notification{Notification: &pgshardv1.NotificationResponse{
+			Pid: m.PID, Channel: m.Channel, Payload: m.Payload}}
 	case *pgproto3.ReadyForQuery:
 		r.Message = &pgshardv1.ExecuteResponse_ReadyForQuery{ReadyForQuery: &pgshardv1.ReadyForQuery{TxnStatus: txnStatus(m.TxStatus)}}
 	case *pgproto3.ParseComplete:
