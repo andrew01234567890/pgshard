@@ -29,7 +29,11 @@ const restorePollInterval = 5 * time.Second
 // the recovery until every group promoted on a new timeline.
 type RestoreReconciler struct {
 	client.Client
-	Agents AgentClient
+	// APIReader is an uncached reader used to confirm a cluster is truly
+	// gone before failing a restore, since the cached client can briefly
+	// miss a just-created cluster. nil skips the confirmation (unit tests).
+	APIReader client.Reader
+	Agents    AgentClient
 	// TwoPC finishes prepared transactions and lifts the write fence after a
 	// barrier restore; nil fails barrier restores with a clear reason.
 	TwoPC TwoPCAgentClient
@@ -83,6 +87,16 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	switch {
 	case apierrors.IsNotFound(err):
 		if rs.Status.Phase == pgshardv1alpha1.RestorePhaseRestoring {
+			// The cached client can lag behind the API server just after the
+			// cluster is created; confirm with an uncached read before
+			// declaring it gone, and requeue if it is actually still there.
+			if r.APIReader != nil {
+				if err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: rs.Namespace, Name: rs.Spec.NewClusterName}, &newCluster); err == nil {
+					return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+				} else if !apierrors.IsNotFound(err) {
+					return ctrl.Result{}, err
+				}
+			}
 			return ctrl.Result{}, r.fail(ctx, &rs, fmt.Sprintf("cluster %q disappeared during the restore", rs.Spec.NewClusterName))
 		}
 		return r.create(ctx, &rs, target)
