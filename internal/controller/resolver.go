@@ -9,7 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/andrew01234567890/pgshard/internal/metrics"
@@ -280,6 +282,7 @@ func (r *Resolver) sweepOrphans(ctx context.Context, holders map[string][]holder
 		gids = append(gids, gid)
 	}
 	slices.Sort(gids)
+	var errs []error
 	for _, gid := range gids {
 		var state string
 		err := r.Pool.QueryRow(ctx, `SELECT state FROM pgshard.xact_decisions WHERE gid = $1`, gid).Scan(&state)
@@ -287,14 +290,23 @@ func (r *Resolver) sweepOrphans(ctx context.Context, holders map[string][]holder
 		case errors.Is(err, pgx.ErrNoRows):
 			state = "abort"
 		case err != nil:
-			return err
+			errs = append(errs, fmt.Errorf("%s: %w", gid, err))
+			continue
 		}
 		if state == "preparing" {
 			continue
 		}
 		for _, h := range holders[gid] {
-			if err := r.finishOn(ctx, h, state == "commit", gid); err != nil {
-				return err
+			err := r.finishOn(ctx, h, state == "commit", gid)
+			switch {
+			// The live coordinator can finish gid and delete its row between
+			// the scan snapshot and this sweep: a gone prepared transaction
+			// is already resolved, not a failure of this pass.
+			case isGonePreparedXact(err):
+				continue
+			case err != nil:
+				errs = append(errs, fmt.Errorf("%s on %s/%d: %w", gid, h.Shard.Set, h.Shard.ID, err))
+				continue
 			}
 			if state == "commit" {
 				out.Committed++
@@ -303,7 +315,18 @@ func (r *Resolver) sweepOrphans(ctx context.Context, holders map[string][]holder
 			}
 		}
 	}
-	return nil
+	return errors.Join(errs...)
+}
+
+func isGonePreparedXact(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UndefinedObject {
+		return true
+	}
+	return strings.Contains(err.Error(), "does not exist")
 }
 
 func (r *Resolver) listShards(ctx context.Context, shardSet string) ([]ShardRef, error) {

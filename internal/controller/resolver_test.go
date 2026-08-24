@@ -416,3 +416,28 @@ func TestResolverSparesPreparingRefreshedBetweenScanAndAbort(t *testing.T) {
 	}
 }
 
+func TestResolverSweepContinuesPastGonePreparedXact(t *testing.T) {
+	f := newResolverFixture(t)
+	ctx := context.Background()
+	// "a" was scanned as prepared but its coordinator finished it (and
+	// deleted its row) before the sweep: ROLLBACK PREPARED finds nothing.
+	// It sorts before the real orphan, which must still be swept.
+	f.prepare(0, "pgshard-s-1-b", "real-orphan")
+	holders := map[string][]holder{
+		"pgshard-s-1-a": {{Shard: ShardRef{Set: "default", ID: 0}}},
+		"pgshard-s-1-b": {{Shard: ShardRef{Set: "default", ID: 0}}},
+	}
+	var out Outcome
+	if err := f.res.sweepOrphans(ctx, holders, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.RolledBack != 1 || out.Committed != 0 {
+		t.Fatalf("outcome %+v", out)
+	}
+	if got := f.prepared(0); len(got) != 0 {
+		t.Fatalf("shard 0 prepared %v: the orphan after the gone gid must be swept", got)
+	}
+	if got := f.values(0); len(got) != 0 {
+		t.Fatalf("shard 0 values %v", got)
+	}
+}
