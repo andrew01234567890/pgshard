@@ -236,9 +236,17 @@ func (r *Resolver) resolveDecision(ctx context.Context, d decision, holders map[
 	return nil
 }
 
-// finishOn commits or rolls back gid where h holds it.
+// finishOn commits or rolls back gid where h holds it. PostgreSQL only
+// finishes a prepared transaction from the database it was prepared in, so
+// the connection targets h's database, not the DSN's default one.
 func (r *Resolver) finishOn(ctx context.Context, h holder, commit bool, gid string) error {
-	conn, err := r.Shards.Dial(ctx, h.Shard.Set, h.Shard.ID)
+	var conn ShardConn
+	var err error
+	if d, ok := r.Shards.(ShardDBDialer); ok {
+		conn, err = d.DialDatabase(ctx, h.Shard.Set, h.Shard.ID, h.Database)
+	} else {
+		conn, err = r.Shards.Dial(ctx, h.Shard.Set, h.Shard.ID)
+	}
 	if err != nil {
 		return err
 	}

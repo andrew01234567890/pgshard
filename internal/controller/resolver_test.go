@@ -274,3 +274,62 @@ func TestResolverCommitsMovedParticipant(t *testing.T) {
 		t.Fatalf("shard 0 values %v", got)
 	}
 }
+
+// prepareIn leaves a prepared transaction in database db on shard id.
+func (f *resolverFixture) prepareIn(id int, db, gid, v string) {
+	f.t.Helper()
+	ctx := context.Background()
+	cfg, err := pgx.ParseConfig(f.shardDSN(id))
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	cfg.Database = db
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	for _, sql := range []string{"CREATE TABLE IF NOT EXISTS t (v text)", "BEGIN", "INSERT INTO t VALUES (" + quoteLiteral(v) + ")", "PREPARE TRANSACTION " + quoteLiteral(gid)} {
+		if _, err := conn.Exec(ctx, sql); err != nil {
+			f.t.Fatalf("%s: %v", sql, err)
+		}
+	}
+}
+
+func TestResolverFinishesOtherDatabase(t *testing.T) {
+	f := newResolverFixture(t)
+	ctx := context.Background()
+	mustExec(t, connect(t, f.shardDSN(0)), "CREATE DATABASE appdb")
+	f.prepareIn(0, "appdb", "pgshard-d-1-1", "db-commit")
+	f.decide("pgshard-d-1-1", "commit", 0, 0)
+	f.prepareIn(0, "appdb", "pgshard-d-1-2", "db-orphan")
+	out, err := f.res.Resolve(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Committed != 1 || out.RolledBack != 1 || out.Unresolved != 0 {
+		t.Fatalf("outcome %+v; prepared %v; decisions %v", out, f.prepared(0), f.decisions())
+	}
+	if got := f.prepared(0); len(got) != 0 {
+		t.Fatalf("shard 0 prepared %v", got)
+	}
+	if got := f.decisions(); len(got) != 0 {
+		t.Fatalf("decisions left %v", got)
+	}
+	conn, err := f.res.Shards.(ShardDBDialer).DialDatabase(ctx, "default", 0, "appdb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	rows, err := conn.Query(ctx, "SELECT v FROM t ORDER BY v")
+	if err != nil {
+		t.Fatal(err)
+	}
+	vs, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(vs, ",") != "db-commit" {
+		t.Fatalf("appdb values %v", vs)
+	}
+}
