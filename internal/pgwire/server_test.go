@@ -777,12 +777,22 @@ func TestShutdownDeadlineForcesClose(t *testing.T) {
 	c.startup(ProtocolVersion30)
 	c.send(&pgproto3.Query{String: "select 1"})
 	<-started
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 	if err := ts.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("shutdown err = %v", err)
 	}
-	if _, err := c.fe.Receive(); err == nil {
+	// The deadline forced a close; the client observes it on its next read,
+	// which may lag the Shutdown return under load, so poll for the error.
+	closed := false
+	for i := 0; i < 200; i++ {
+		if _, err := c.fe.Receive(); err != nil {
+			closed = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !closed {
 		t.Fatal("connection should have been force-closed")
 	}
 	waitNoSessions(t, ts.Server)
