@@ -2,6 +2,8 @@ package pooler
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
@@ -85,6 +87,11 @@ type session struct {
 	role     string
 	reserved bool
 	attached bool
+	// cred pins the SCRAM credential digest and role that first attached;
+	// every later attach must present the same pair before it may reach a
+	// retained backend.
+	cred    [32]byte
+	credSet bool
 	// detached is closed when the current Execute stream ends; Release
 	// waits on it when it arrives while the stream is still attached.
 	detached chan struct{}
@@ -130,15 +137,34 @@ func (s *Server) session(id string) *session {
 // critical section: a lookup that released the lock before attaching could
 // hold a session a concurrent detach has already forgotten while a new
 // Execute registers a fresh one under the same id.
-func (s *Server) attachSession(id, role, database string) (*session, error) {
+func (s *Server) attachSession(id, role, database string, cred [32]byte) (*session, error) {
 	s.expireReservations(time.Now())
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	se, ok := s.sessions[id]
 	if !ok {
 		se = &session{id: id}
 		s.sessions[id] = se
 	}
+	if se.credSet {
+		roleOK := subtle.ConstantTimeCompare([]byte(role), []byte(se.role))
+		credOK := subtle.ConstantTimeCompare(cred[:], se.cred[:])
+		if roleOK&credOK != 1 {
+			// Reject and tear the session down: a caller holding only the
+			// session id must never reach the backend the real credentials
+			// authenticated.
+			b := se.b
+			se.b, se.reserved = nil, false
+			if s.sessions[se.id] == se {
+				delete(s.sessions, se.id)
+			}
+			s.mu.Unlock()
+			if b != nil {
+				s.cfg.Pool.Discard(b)
+			}
+			return nil, status.Error(codes.PermissionDenied, "session credentials do not match")
+		}
+	}
+	defer s.mu.Unlock()
 	if se.attached {
 		return nil, status.Error(codes.FailedPrecondition, "session already has an Execute stream")
 	}
@@ -148,6 +174,7 @@ func (s *Server) attachSession(id, role, database string) (*session, error) {
 	if se.b != nil && se.database != database {
 		return nil, status.Error(codes.FailedPrecondition, "session already holds a backend for another database")
 	}
+	se.cred, se.credSet = cred, true
 	se.attached = true
 	se.detached = make(chan struct{})
 	se.detachedAt = time.Time{}
@@ -177,11 +204,18 @@ func (s *Server) Execute(stream pgshardv1.Pooler_ExecuteServer) error {
 	ck, sk := append([]byte(nil), first.User.ScramClientKey...), append([]byte(nil), first.User.ScramServerKey...)
 	zero(first.User.ScramClientKey)
 	zero(first.User.ScramServerKey)
+	if len(ck) != 32 || len(sk) != 32 {
+		zero(ck)
+		zero(sk)
+		return status.Error(codes.InvalidArgument, "SCRAM client and server keys must be 32 bytes")
+	}
 	if s.draining.Load() {
 		return errUnavailable
 	}
-	se, err := s.attachSession(first.SessionId, first.User.Username, first.Database)
+	se, err := s.attachSession(first.SessionId, first.User.Username, first.Database, sessionCred(first.User.Username, ck, sk))
 	if err != nil {
+		zero(ck)
+		zero(sk)
 		return err
 	}
 	defer s.detach(se)
@@ -666,6 +700,19 @@ func (s *Server) held() int {
 		}
 	}
 	return n
+}
+
+// sessionCred binds a session to the role and SCRAM keys that attached it.
+func sessionCred(role string, ck, sk []byte) [32]byte {
+	h := sha256.New()
+	h.Write([]byte(role))
+	h.Write([]byte{0})
+	h.Write(ck)
+	h.Write([]byte{0})
+	h.Write(sk)
+	var d [32]byte
+	h.Sum(d[:0])
+	return d
 }
 
 func zero(b []byte) {
