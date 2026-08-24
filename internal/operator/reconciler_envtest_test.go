@@ -82,6 +82,16 @@ type fakeProber struct {
 	shardSets []ShardSetInfo
 	endpoints map[string]string
 	workflows map[string]WorkflowInfo
+	// cutoverSpecs records SetReshardCutoverSpec calls as
+	// "<id>:<pause>:<proceed>:<retire>".
+	cutoverSpecs []string
+}
+
+func (f *fakeProber) SetReshardCutoverSpec(_ context.Context, _ string, id, pause string, proceed []string, retire int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cutoverSpecs = append(f.cutoverSpecs, fmt.Sprintf("%s:%s:%s:%d", id, pause, strings.Join(proceed, "+"), retire))
+	return nil
 }
 
 func (f *fakeProber) ShardSets(_ context.Context, _ string) ([]ShardSetInfo, error) {

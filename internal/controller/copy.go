@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -60,8 +61,16 @@ type Copier struct {
 	PreparedWait time.Duration
 	// SlotFailover requests failover slots (PG 17+ subscription option).
 	SlotFailover bool
+	// CutoverTimeout bounds the fence of one switch attempt; CutoverAttempts
+	// how many undone attempts fail the workflow.
+	CutoverTimeout  time.Duration
+	CutoverAttempts int
+	// LockTimeout bounds each SHARE lock of the sweep.
+	LockTimeout time.Duration
 	// Now overrides the clock in tests.
 	Now func() time.Time
+
+	cutoverStore cutoverStore
 }
 
 // CopyOutcome counts one pass.
@@ -84,15 +93,30 @@ type copyState struct {
 }
 
 type copyWorkflow struct {
-	id     string
-	state  string
-	stage  string
-	set    string
-	gen    int64
-	ranges placement.RangeSet
-	ids    []int32
-	copy   copyState
+	id      string
+	state   string
+	stage   string
+	set     string
+	gen     int64
+	ranges  placement.RangeSet
+	ids     []int32
+	copy    copyState
+	spec    cutoverSpec
+	cutover cutoverState
 }
+
+// sourceSet is the shard set the workflow copies from: recorded in the
+// spec at creation, or the serving set of the first cutover pass for
+// older workflows.
+func (wf *copyWorkflow) sourceSet() string {
+	if wf.spec.SourceSet != "" {
+		return wf.spec.SourceSet
+	}
+	return wf.cutover.SourceSet
+}
+
+var copyStages = []string{StageReadyForCopy, StageCopying, StageCatchUpDone}
+var cutoverStages = []string{StageCatchUpDone, StageAwaitingSwitch, StageSwitching, StageSwitched, StageCompleting}
 
 // Run drives every interval until ctx ends.
 func (c *Copier) Run(ctx context.Context, interval time.Duration) {
@@ -174,7 +198,14 @@ func (c *Copier) Pass(ctx context.Context) (CopyOutcome, error) {
 			}
 		} else {
 			var advanced bool
-			advanced, err = c.drive(ctx, wf)
+			if slices.Contains(copyStages, wf.stage) {
+				advanced, err = c.drive(ctx, wf)
+			}
+			if err == nil && slices.Contains(cutoverStages, wf.stage) {
+				var more bool
+				more, err = c.driveCutover(ctx, wf)
+				advanced = advanced || more
+			}
 			if advanced {
 				out.Advanced++
 			}
@@ -207,10 +238,10 @@ func (e *fatalError) Unwrap() error { return e.err }
 func fatal(format string, args ...any) error { return &fatalError{fmt.Errorf(format, args...)} }
 
 func (c *Copier) listCopyWorkflows(ctx context.Context) ([]copyWorkflow, error) {
-	rows, err := c.Pool.Query(ctx, `SELECT id::text, state, coalesce(status->>'stage', ''), spec, coalesce(status->'copy', '{}'::jsonb)
+	rows, err := c.Pool.Query(ctx, `SELECT id::text, state, coalesce(status->>'stage', ''), spec, coalesce(status->'copy', '{}'::jsonb), coalesce(status->'cutover', '{}'::jsonb)
 		FROM pgshard.workflows
 		WHERE kind = $1 AND ((state = $2 AND status->>'stage' = ANY($3)) OR status->>'stage' = $4)
-		ORDER BY created_at`, KindReshard, StateRunning, []string{StageReadyForCopy, StageCopying, StageCatchUpDone}, StageCancelling)
+		ORDER BY created_at`, KindReshard, StateRunning, slices.Concat(copyStages, cutoverStages), StageCancelling)
 	if err != nil {
 		return nil, err
 	}
@@ -218,8 +249,8 @@ func (c *Copier) listCopyWorkflows(ctx context.Context) ([]copyWorkflow, error) 
 	var out []copyWorkflow
 	for rows.Next() {
 		var wf copyWorkflow
-		var spec, cp []byte
-		if err := rows.Scan(&wf.id, &wf.state, &wf.stage, &spec, &cp); err != nil {
+		var spec, cp, co []byte
+		if err := rows.Scan(&wf.id, &wf.state, &wf.stage, &spec, &cp, &co); err != nil {
 			return nil, err
 		}
 		var s struct {
@@ -236,6 +267,12 @@ func (c *Copier) listCopyWorkflows(ctx context.Context) ([]copyWorkflow, error) 
 		}
 		if err := json.Unmarshal(cp, &wf.copy); err != nil {
 			return nil, fmt.Errorf("workflow %s copy state: %w", wf.id, err)
+		}
+		if err := json.Unmarshal(co, &wf.cutover); err != nil {
+			return nil, fmt.Errorf("workflow %s cutover state: %w", wf.id, err)
+		}
+		if err := json.Unmarshal(spec, &wf.spec); err != nil {
+			return nil, fmt.Errorf("workflow %s cutover spec: %w", wf.id, err)
 		}
 		if wf.copy.Schema == nil {
 			wf.copy.Schema = map[string]map[string]bool{}
@@ -946,7 +983,11 @@ func (c *Copier) cancel(ctx context.Context, wf *copyWorkflow) error {
 }
 
 func dropSubscriptions(ctx context.Context, conn ShardConn, gen int64, t int32) error {
-	rows, err := conn.Query(ctx, `SELECT subname FROM pg_subscription WHERE subname LIKE $1`, fmt.Sprintf("pgshard\\_reshard\\_g%d\\_t%d\\_%%", gen, t))
+	return dropSubscriptionsLike(ctx, conn, fmt.Sprintf("pgshard\\_reshard\\_g%d\\_t%d\\_%%", gen, t))
+}
+
+func dropSubscriptionsLike(ctx context.Context, conn ShardConn, pattern string) error {
+	rows, err := conn.Query(ctx, `SELECT subname FROM pg_subscription WHERE subname LIKE $1`, pattern)
 	if err != nil {
 		return err
 	}

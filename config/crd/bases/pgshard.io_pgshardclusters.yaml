@@ -395,6 +395,16 @@ spec:
                     type: string
                   phase:
                     type: string
+                  retiredGeneration:
+                    format: int64
+                    type: integer
+                  retiredShardSet:
+                    description: |-
+                      RetiredShardSet, RetiredGeneration and RetiredShards describe the
+                      old set kept up for reverse replication after the write switch.
+                    type: string
+                  retiredShards:
+                    type: integer
                   shardSet:
                     description: ShardSet is the pending catalog shard set; Generation
                       its generation.
@@ -426,6 +436,13 @@ spec:
                   reason:
                     type: string
                 type: object
+              servingGeneration:
+                description: |-
+                  ServingGeneration is the generation of the serving shard set; it
+                  names the serving shard groups (shard-<id> for 1, shard-<id>-g<n>
+                  after).
+                format: int64
+                type: integer
               shardMapGeneration:
                 format: int64
                 type: integer

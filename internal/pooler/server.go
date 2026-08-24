@@ -312,7 +312,11 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 	if req.SessionId != r.se.id {
 		return status.Error(codes.InvalidArgument, "session_id changed mid-stream")
 	}
-	if e := fence(r.srv.cfg.Source.View(), req.Generation); e != nil {
+	view := r.srv.cfg.Source.View()
+	if e := fence(view, req.Generation); e != nil {
+		return r.refuse(e)
+	}
+	if e := fenceMigrating(view, req); e != nil {
 		return r.refuse(e)
 	}
 	if _, ok := req.Message.(*pgshardv1.ExecuteRequest_Cancel); ok {

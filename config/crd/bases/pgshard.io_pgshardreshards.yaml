@@ -173,6 +173,11 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              cutoverPause:
+                description: |-
+                  CutoverPause is how long routers held writes: fence raised to new
+                  map published.
+                type: string
               journalIds:
                 items:
                   type: string
@@ -186,6 +191,7 @@ spec:
                 - Copying
                 - Verifying
                 - Switching
+                - Completing
                 - Completed
                 - Cancelled
                 - Failed

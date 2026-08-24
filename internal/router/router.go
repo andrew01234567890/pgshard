@@ -149,7 +149,7 @@ func (r *Router) homeShard(database string) (Shard, error) {
 	if !ok {
 		return Shard{}, pgwire.Errorf("3D000", "database %q does not exist", database)
 	}
-	return Shard{Set: DefaultShardSet, ID: d.HomeShard}, nil
+	return Shard{Set: snap.ServingShardSet(), ID: d.HomeShard}, nil
 }
 
 func (r *Router) forget(e *Executor) {

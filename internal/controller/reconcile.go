@@ -33,6 +33,7 @@ const (
 const (
 	ServingProvisioning = "provisioning"
 	ServingServing      = "serving"
+	ServingRetired      = "retired"
 )
 
 // Result summarises one reconciliation pass.
@@ -226,9 +227,11 @@ func reconcileShardSets(ctx context.Context, tx pgx.Tx, res *Result) error {
 	if err != nil {
 		return err
 	}
+	// Only serving sets get shard_status rows here: pending sets are the
+	// reshard workflow's, retired sets keep whatever the cutover left.
 	pending := map[string]bool{}
 	for _, ss := range sets {
-		if ss.State == catalog.ShardSetDesired || ss.State == catalog.ShardSetProvisioning {
+		if ss.State != catalog.ShardSetServing {
 			pending[ss.Name] = true
 		}
 	}

@@ -51,7 +51,7 @@ func (p *Planner) Plan(ctx context.Context, sess Session, sql string) (Plan, err
 	if !ok {
 		return sess.unsharded(), nil
 	}
-	pl := &Plan{Generation: sess.generation(), home: sess.HomeShard, set: DefaultShardSet, snap: sess.Snapshot}
+	pl := &Plan{Generation: sess.generation(), home: sess.HomeShard, set: sess.shardSet(), snap: sess.Snapshot}
 	if err := classify(raw.GetStmt(), &pl.Class); err != nil {
 		return refusalErr(err)
 	}
@@ -77,6 +77,15 @@ func (s Session) generation() int64 {
 		return 0
 	}
 	return s.Snapshot.ShardMapGeneration
+}
+
+// shardSet is the shard set plans locate keys in: the serving set of the
+// snapshot, or DefaultShardSet without one.
+func (s Session) shardSet() string {
+	if s.Snapshot == nil {
+		return DefaultShardSet
+	}
+	return s.Snapshot.ServingShardSet()
 }
 
 func (s Session) unsharded() Plan {
@@ -1139,7 +1148,7 @@ func (w *walker) mergeSpec() {
 func (w *walker) allShards() []int32 {
 	var out []int32
 	if w.sess.Snapshot != nil {
-		for _, r := range w.sess.Snapshot.ShardSets[DefaultShardSet] {
+		for _, r := range w.sess.Snapshot.ShardSets[w.sess.shardSet()] {
 			out = appendUnique(out, r.ShardID)
 		}
 	}

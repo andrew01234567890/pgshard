@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -200,6 +201,14 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		targets = append(targets, obs)
 	}
+	var retired []groupObservation
+	for _, g := range RetiredGroups(&cluster) {
+		obs, err := r.reconcileGroup(ctx, &cluster, g, password, policy, repoReady)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("retired group %s: %w", g.Name(), err)
+		}
+		retired = append(retired, obs)
+	}
 
 	if err := r.reconcileAdmin(ctx, &cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("admin: %w", err)
@@ -208,7 +217,7 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, fmt.Errorf("router: %w", err)
 	}
 	if catalogReady.Status == metav1.ConditionTrue {
-		catalogReady = r.publishShardStatus(ctx, &cluster, dsn, append(observations[1:], targets...))
+		catalogReady = r.publishShardStatus(ctx, &cluster, dsn, slices.Concat(observations[1:], targets, retired))
 	}
 	if err := r.updateReshardStatus(ctx, plan, targets); err != nil {
 		return ctrl.Result{}, err
@@ -217,7 +226,7 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 	requeue := requeueReady
-	for _, o := range append(observations, targets...) {
+	for _, o := range slices.Concat(observations, targets, retired) {
 		if o.failing {
 			return ctrl.Result{RequeueAfter: requeueFailover}, nil
 		}
@@ -317,6 +326,13 @@ func (r *ClusterReconciler) loadState(ctx context.Context, c *pgshardv1alpha1.Pg
 	}
 	if err := r.Get(ctx, client.ObjectKeyFromObject(pg), pg); err != nil {
 		return groupState{}, err
+	}
+	if pg.Spec.NonServing != g.NonServing {
+		base := pg.DeepCopy()
+		pg.Spec.NonServing = g.NonServing
+		if err := r.Patch(ctx, pg, client.MergeFrom(base)); err != nil {
+			return groupState{}, err
+		}
 	}
 	st := groupState{primary: pg.Status.Primary, epoch: pg.Status.Epoch, syncSet: map[string]bool{}, pvcs: map[string]string{}}
 	for _, name := range g.MemberNames() {

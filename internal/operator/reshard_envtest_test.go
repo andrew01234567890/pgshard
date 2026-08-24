@@ -5,6 +5,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -231,4 +232,102 @@ func TestReshardAdoptsCatalogEditedShardSet(t *testing.T) {
 
 func splitAt(r placement.Range, at int64) placement.RangeSet {
 	return placement.RangeSet{{Start: r.Start, End: at - 1}, {Start: at, End: r.End}}
+}
+
+func TestReshardRetiresOldGroupsAfterSwitch(t *testing.T) {
+	r, fp, c := setup(t, "rsw")
+	bringUp(t, r, fp, c)
+	get(t, "rsw", c)
+	two := 2
+	c.Spec.Shards = &two
+	c.Spec.Resharding.PauseBefore = "switchWrites"
+	if err := k8sClient.Update(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, r, c)
+	fp.mu.Lock()
+	fp.workflows = map[string]WorkflowInfo{"g2": {ID: "wf-2", State: "running", Stage: "awaiting_switch_writes"}}
+	fp.mu.Unlock()
+	fp.setShardSetState("g2", catalog.ShardSetProvisioning)
+	markTargetsRunning(t, fp, c)
+	reconcile(t, r, c)
+	var rec pgshardv1alpha1.PgShardReshard
+	get(t, "rsw-reshard-g2", &rec)
+	if rec.Status.Phase != pgshardv1alpha1.ReshardPhaseVerifying {
+		t.Fatalf("phase at the gate: %+v", rec.Status)
+	}
+	fp.mu.Lock()
+	last := fp.cutoverSpecs[len(fp.cutoverSpecs)-1]
+	fp.mu.Unlock()
+	if last != "wf-2:switchWrites::86400" {
+		t.Fatalf("mirrored spec: %q", last)
+	}
+
+	rec.Annotations = map[string]string{pgshardv1alpha1.AnnotationProceed: "switchWrites, complete"}
+	if err := k8sClient.Update(context.Background(), &rec); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, r, c)
+	fp.mu.Lock()
+	last = fp.cutoverSpecs[len(fp.cutoverSpecs)-1]
+	fp.mu.Unlock()
+	if last != "wf-2:switchWrites:switchWrites+complete:86400" {
+		t.Fatalf("proceed annotation must reach the workflow: %q", last)
+	}
+
+	fp.setShardSetState(catalog.DefaultShardSet, catalog.ShardSetRetired)
+	fp.setShardSetState("g2", catalog.ShardSetServing)
+	fp.mu.Lock()
+	fp.workflows["g2"] = WorkflowInfo{ID: "wf-2", State: "running", Stage: "switched", Message: "old groups retire in 24h", CutoverPauseMS: 800}
+	fp.mu.Unlock()
+	reconcile(t, r, c)
+	reconcile(t, r, c)
+	get(t, "rsw", c)
+	if c.Status.ServingGeneration != 2 || c.Status.EffectiveShards != 2 || c.Status.Reshard == nil ||
+		c.Status.Reshard.RetiredShardSet != "default" || c.Status.Reshard.RetiredShards != 1 || c.Status.Reshard.Phase != pgshardv1alpha1.ReshardPhaseCompleting {
+		t.Fatalf("cluster status after the switch: gen=%d effective=%d reshard=%+v", c.Status.ServingGeneration, c.Status.EffectiveShards, c.Status.Reshard)
+	}
+	if got := len(Groups(c)); got != 3 {
+		t.Fatalf("serving groups after the switch: %d", got)
+	}
+	for _, name := range []string{"rsw-shard-0-g2", "rsw-shard-1-g2", "rsw-shard-0"} {
+		var pg pgshardv1alpha1.PgShardGroup
+		get(t, name, &pg)
+		if pg.Spec.NonServing {
+			t.Errorf("%s must serve after the switch: %+v", name, pg.Spec)
+		}
+	}
+	get(t, "rsw-reshard-g2", &rec)
+	if rec.Status.Phase != pgshardv1alpha1.ReshardPhaseCompleting || rec.Status.CutoverPause == nil || rec.Status.CutoverPause.Duration != 800*time.Millisecond {
+		t.Fatalf("record after the switch: %+v", rec.Status)
+	}
+	if cond := meta.FindStatusCondition(rec.Status.Conditions, pgshardv1alpha1.ReshardConditionSwitched); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("WritesSwitched: %+v", cond)
+	}
+	if len(c.Status.Shards) != 2 {
+		t.Errorf("status.shards must list the new serving shards: %+v", c.Status.Shards)
+	}
+
+	fp.mu.Lock()
+	fp.workflows["g2"] = WorkflowInfo{ID: "wf-2", State: "completed", Stage: "completed", CutoverPauseMS: 800}
+	fp.mu.Unlock()
+	reconcile(t, r, c)
+	reconcile(t, r, c)
+	get(t, "rsw-reshard-g2", &rec)
+	if rec.Status.Phase != pgshardv1alpha1.ReshardPhaseCompleted || rec.Status.CutoverPause == nil {
+		t.Fatalf("record after completion: %+v", rec.Status)
+	}
+	if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "rsw-shard-0"}, &pgshardv1alpha1.PgShardGroup{}); !apierrors.IsNotFound(err) {
+		t.Errorf("retired group must be deleted: %v", err)
+	}
+	var pods corev1.PodList
+	if err := k8sClient.List(context.Background(), &pods, client.InNamespace("default"), client.MatchingLabels{LabelCluster: "rsw", LabelGroup: "shard-0"}); err != nil || len(pods.Items) != 0 {
+		t.Errorf("retired pods must be deleted: %d %v", len(pods.Items), err)
+	}
+	get(t, "rsw", c)
+	if c.Status.Reshard != nil || c.Status.ServingGeneration != 2 || c.Status.EffectiveShards != 2 {
+		t.Fatalf("cluster status after completion: %+v", c.Status)
+	}
+	reconcile(t, r, c)
+	get(t, "rsw-shard-0-g2", &pgshardv1alpha1.PgShardGroup{})
 }

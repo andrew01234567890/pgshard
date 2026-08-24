@@ -80,7 +80,11 @@ func reconcileReshards(ctx context.Context, tx pgx.Tx, res *Result) error {
 				res.Invalid = append(res.Invalid, fmt.Sprintf("shard set %s: %v", ss.Name, err))
 				continue
 			}
-			spec := map[string]any{"shard_set": ss.Name, "generation": ss.Generation, "desired_generation": ss.DesiredGeneration, "ranges": specRanges(ranges)}
+			source, err := catalog.ServingShardSet(ctx, tx)
+			if err != nil {
+				return err
+			}
+			spec := map[string]any{"shard_set": ss.Name, "generation": ss.Generation, "desired_generation": ss.DesiredGeneration, "ranges": specRanges(ranges), "source_set": source}
 			body, err := json.Marshal(spec)
 			if err != nil {
 				return err

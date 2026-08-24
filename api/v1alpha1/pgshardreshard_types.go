@@ -9,6 +9,7 @@ const (
 	ReshardPhaseCopying      = "Copying"
 	ReshardPhaseVerifying    = "Verifying"
 	ReshardPhaseSwitching    = "Switching"
+	ReshardPhaseCompleting   = "Completing"
 	ReshardPhaseCompleted    = "Completed"
 	ReshardPhaseCancelled    = "Cancelled"
 	ReshardPhaseFailed       = "Failed"
@@ -18,7 +19,12 @@ const (
 const (
 	ReshardConditionTargetsReady = "TargetsReady"
 	ReshardConditionWorkflow     = "WorkflowCreated"
+	ReshardConditionSwitched     = "WritesSwitched"
 )
+
+// AnnotationProceed on a PgShardReshard lists the pause points
+// (switchWrites, complete) the operator may pass; comma-separated.
+const AnnotationProceed = "pgshard.io/proceed"
 
 // ReshardRange is one target shard and the inclusive keyspace interval it
 // will own.
@@ -63,7 +69,7 @@ type ReshardTargetStatus struct {
 
 // PgShardReshardStatus is the observed state of a reshard.
 type PgShardReshardStatus struct {
-	// +kubebuilder:validation:Enum=Pending;Provisioning;Copying;Verifying;Switching;Completed;Cancelled;Failed
+	// +kubebuilder:validation:Enum=Pending;Provisioning;Copying;Verifying;Switching;Completing;Completed;Cancelled;Failed
 	// +optional
 	Phase string `json:"phase,omitempty"`
 	// WorkflowID is the pgshard.workflows row driving the reshard.
@@ -73,6 +79,10 @@ type PgShardReshardStatus struct {
 	Targets []ReshardTargetStatus `json:"targets,omitempty"`
 	// +optional
 	JournalIDs []string `json:"journalIds,omitempty"`
+	// CutoverPause is how long routers held writes: fence raised to new
+	// map published.
+	// +optional
+	CutoverPause *metav1.Duration `json:"cutoverPause,omitempty"`
 	// +optional
 	Message string `json:"message,omitempty"`
 	// +optional

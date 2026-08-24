@@ -78,6 +78,9 @@ type Group struct {
 	Generation int64
 	// NonServing marks a reshard target that routers must not see yet.
 	NonServing bool
+	// Retired marks a source of a switched reshard, kept up only for
+	// reverse replication until the old groups are deleted.
+	Retired bool
 }
 
 // Name is the group's short name, unique within the cluster.
@@ -179,7 +182,7 @@ func ServingShards(c *pgshardv1alpha1.PgShardCluster) int {
 // status.reshard; nil when no reshard is in flight.
 func TargetGroups(c *pgshardv1alpha1.PgShardCluster) []Group {
 	rs := c.Status.Reshard
-	if rs == nil {
+	if rs == nil || rs.Generation == ServingGeneration(c) {
 		return nil
 	}
 	var out []Group
@@ -197,17 +200,42 @@ func shardReplicas(c *pgshardv1alpha1.PgShardCluster) int {
 	return c.Spec.ReplicasPerShard
 }
 
+// RetiredGroups derives the old shard groups kept up for reverse
+// replication after a write switch; nil outside that window.
+func RetiredGroups(c *pgshardv1alpha1.PgShardCluster) []Group {
+	rs := c.Status.Reshard
+	if rs == nil || rs.RetiredShardSet == "" {
+		return nil
+	}
+	var out []Group
+	for i := 0; i < rs.RetiredShards; i++ {
+		out = append(out, Group{Cluster: c.Name, Kind: "shard", ShardID: i, Replicas: shardReplicas(c), Storage: c.Spec.Storage,
+			Generation: rs.RetiredGeneration, Retired: true})
+	}
+	return out
+}
+
+// ServingGeneration is the generation of the serving shard set (1 before
+// the first reshard completed).
+func ServingGeneration(c *pgshardv1alpha1.PgShardCluster) int64 {
+	if c.Status.ServingGeneration > 0 {
+		return c.Status.ServingGeneration
+	}
+	return 1
+}
+
 // Groups derives the catalog group and the serving shard groups from a
 // cluster spec and status.
 func Groups(c *pgshardv1alpha1.PgShardCluster) []Group {
 	shards := ServingShards(c)
+	gen := ServingGeneration(c)
 	catalogReplicas := c.Spec.Catalog.Replicas
 	if catalogReplicas < 1 {
 		catalogReplicas = 3
 	}
 	out := []Group{{Cluster: c.Name, Kind: "catalog", Replicas: catalogReplicas, Storage: c.Spec.Catalog.Storage}}
 	for i := 0; i < shards; i++ {
-		out = append(out, Group{Cluster: c.Name, Kind: "shard", ShardID: i, Replicas: shardReplicas(c), Storage: c.Spec.Storage, Generation: 1})
+		out = append(out, Group{Cluster: c.Name, Kind: "shard", ShardID: i, Replicas: shardReplicas(c), Storage: c.Spec.Storage, Generation: gen})
 	}
 	return out
 }

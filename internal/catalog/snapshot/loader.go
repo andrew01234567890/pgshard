@@ -33,6 +33,9 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 	if s.ShardMapGeneration, s.DesiredGeneration, err = catalog.Generations(ctx, tx); err != nil {
 		return nil, fmt.Errorf("snapshot: generations: %w", err)
 	}
+	if s.ServingSet, err = catalog.ServingShardSet(ctx, tx); err != nil {
+		return nil, fmt.Errorf("snapshot: serving shard set: %w", err)
+	}
 	ranges, err := catalog.ListAllShardRanges(ctx, tx)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot: shard ranges: %w", err)
@@ -45,7 +48,7 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 		return nil, fmt.Errorf("snapshot: shard status: %w", err)
 	}
 	for _, st := range statuses {
-		sv := Serving{Epoch: st.PrimaryEpoch, State: st.ServingState}
+		sv := Serving{Epoch: st.PrimaryEpoch, State: st.ServingState, Migrating: st.Migrating}
 		if st.PrimaryEndpoint != nil {
 			sv.PrimaryEndpoint = *st.PrimaryEndpoint
 		}

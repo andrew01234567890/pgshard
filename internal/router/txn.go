@@ -50,7 +50,7 @@ type txnPart struct {
 // current one, reviving its parked stream or leaving the session to open a
 // fresh one (acquire replays the transaction prelude on it).
 func (e *Executor) switchPart(ctx context.Context, target Shard) error {
-	if e.home.Set != DefaultShardSet {
+	if e.catalogSession() {
 		return pgwire.Errorf(pgwire.CodeFeatureNotSupported, "transactions on the catalog shard set cannot span shards")
 	}
 	if e.parked == nil {

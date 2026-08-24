@@ -257,6 +257,14 @@ type ClusterReshardStatus struct {
 	Shards int `json:"shards"`
 	// +optional
 	Phase string `json:"phase,omitempty"`
+	// RetiredShardSet, RetiredGeneration and RetiredShards describe the
+	// old set kept up for reverse replication after the write switch.
+	// +optional
+	RetiredShardSet string `json:"retiredShardSet,omitempty"`
+	// +optional
+	RetiredGeneration int64 `json:"retiredGeneration,omitempty"`
+	// +optional
+	RetiredShards int `json:"retiredShards,omitempty"`
 }
 
 // PgShardClusterStatus is the observed state of a PgShardCluster.
@@ -275,6 +283,11 @@ type PgShardClusterStatus struct {
 	// materialized in the catalog; zero until the catalog exists.
 	// +optional
 	EffectiveShards int `json:"effectiveShards,omitempty"`
+	// ServingGeneration is the generation of the serving shard set; it
+	// names the serving shard groups (shard-<id> for 1, shard-<id>-g<n>
+	// after).
+	// +optional
+	ServingGeneration int64 `json:"servingGeneration,omitempty"`
 	// Reshard is the resharding run in flight, if any.
 	// +optional
 	Reshard *ClusterReshardStatus `json:"reshard,omitempty"`

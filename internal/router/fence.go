@@ -8,12 +8,17 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
 )
 
-// codeWriteFence is cannot_connect_now: the cluster is pausing writes for
-// a certified restore point and the statement waited out the buffering
-// window.
+// codeWriteFence is cannot_connect_now: the cluster is pausing writes (for
+// a certified restore point, or a reshard cutover fenced the serving
+// shards) and the statement waited out the buffering window.
 const codeWriteFence = "57P03"
 
-func writeFenceError() error {
+func writeFenceError(migrating bool) error {
+	if migrating {
+		err := pgwire.Errorf(codeWriteFence, "cluster write pause for a reshard cutover")
+		err.Hint = "the pause ends when the new shard map is published; retry the statement"
+		return err
+	}
 	err := pgwire.Errorf(codeWriteFence, "cluster write pause for a certified restore point")
 	err.Hint = "the pause ends when the barrier's restore points are recorded; retry the statement"
 	return err
@@ -23,10 +28,17 @@ func fenceBufferFullError() error {
 	return pgwire.Errorf(codeBufferFull, "too many statements waiting for the cluster write pause to end")
 }
 
-// writeFenced reports whether the current snapshot pauses writes.
+// writeFenced reports whether the current snapshot pauses writes: the
+// cluster-wide barrier fence, or a reshard cutover fencing the serving
+// shards (migrating). Reads never wait.
 func (r *Router) writeFenced() bool {
 	snap := r.cfg.Snapshot()
-	return snap != nil && snap.WriteFence
+	return snap != nil && (snap.WriteFence || snap.Migrating())
+}
+
+func (r *Router) migrating() bool {
+	snap := r.cfg.Snapshot()
+	return snap != nil && snap.Migrating()
 }
 
 // FenceWaiting reports how many statements are held by the write fence.
@@ -82,7 +94,7 @@ func (r *Router) awaitWriteFence(ctx context.Context) error {
 		case <-poll.C:
 		case <-deadline.C:
 			if r.writeFenced() {
-				return writeFenceError()
+				return writeFenceError(r.migrating())
 			}
 			return nil
 		case <-ctx.Done():

@@ -29,7 +29,7 @@ func isReferenceWrite(pl plan.Plan) bool {
 // transaction the write is wrapped in one, committed with two-phase commit
 // before the statement is reported complete.
 func (e *Executor) referenceWrite(ctx context.Context, pl plan.Plan, reqs []*pgshardv1.ExecuteRequest, w pgwire.ResultWriter) error {
-	if e.home.Set != DefaultShardSet {
+	if e.catalogSession() {
 		return pgwire.Errorf(pgwire.CodeInternalError, "router: reference write on the catalog shard set")
 	}
 	implicit := e.tx == pgwire.TxIdle
@@ -47,7 +47,7 @@ func (e *Executor) referenceWrite(ctx context.Context, pl plan.Plan, reqs []*pgs
 	}
 	e.txnTouched = true
 	for _, id := range pl.Shards {
-		if err := e.moveTo(ctx, Shard{Set: e.home.Set, ID: id}); err != nil {
+		if err := e.moveTo(ctx, Shard{Set: e.userSet(), ID: id}); err != nil {
 			return e.referenceFailed(ctx, implicit, err)
 		}
 		if err := e.acquire(ctx, nil); err != nil {

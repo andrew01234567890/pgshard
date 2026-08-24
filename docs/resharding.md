@@ -87,7 +87,10 @@ rollouts apply) with these differences:
 | `Pending` | operator | Pending set and record exist; no workflow yet. |
 | `Provisioning` | controller | The desired-state reconciler created a `pgshard.workflows` row (`kind=reshard`, `state=provisioning`, `status.stage=provisioning`, `spec{shard_set, generation, ranges}`) and moved the set to `provisioning`. The operator reports target readiness on the record. |
 | `Copying` | controller | Every target shard has a `shard_status` row with a primary endpoint; the workflow moved to `state=running`, `status.stage=ready_for_copy`. The copier takes over: `copying` while schemas, publications and subscriptions are set up and the initial copy streams, `catch_up_done` once every table is ready and the apply lag is under `--copy-lag-bytes`. The record stays `Copying` through both stages; the verify step (later milestone) starts from `catch_up_done`. |
-| `Verifying`, `Switching`, `Completed` | later milestones | Verification, the write switch (`spec.resharding.pauseBefore` holds before `switchWrites` or `complete`), stanza creation for the new groups and retirement of the old ones. |
+| `Verifying` | controller | `stage=awaiting_switch_writes`: the switch gate is evaluated every pass (see below). |
+| `Switching` | controller | `stage=switching`: the write switch steps run; `status.cutover.step` names the one in flight. |
+| `Completing` | controller | `stage=switched` then `completing`: the new map serves, the old groups stay up with reverse replication until `retireOldGroupsAfter` elapses. |
+| `Completed` | controller | Replication objects dropped, old set retired, old groups deleted by the operator. |
 | `Cancelled` | operator | See below. |
 | `Failed` | controller | The workflow failed. |
 
@@ -182,7 +185,97 @@ and the copier drops the subscriptions on the targets it can still
 reach, then every `pgshard_reshard_g<gen>_*` slot (terminating its
 walsender) and publication on the sources, and ends at
 `stage=cancelled`. Targets the operator already deleted are skipped.
-Runs past `Copying` cannot be cancelled yet.
+Runs past `Copying` cannot be cancelled: once the journal row exists the
+switch is the point of no return (see Cutover).
 
 The `Cancelled` record stays for the audit trail; the next reshard gets the
 next generation and a new record.
+
+## Cutover
+
+After `catch_up_done` the copier (`internal/controller/cutover.go`, the SQL
+side in `cutoverpg.go`) moves the workflow to `awaiting_switch_writes`.
+There is no separate read switch: the router has no read-replica routing,
+so reads stay on the sources until the flip.
+
+### Gate
+
+The stage waits until, on every target subscription, the apply lag is
+under `--copy-lag-bytes`, every relation in `pg_subscription_rel` is `r`,
+no subscription worker is stalled, and — when
+`spec.resharding.pauseBefore` is `switchWrites` — the record carries
+`pgshard.io/proceed: switchWrites` (comma-separated; the operator mirrors
+`spec.resharding` and the annotation into the workflow spec every pass).
+
+### Switch steps
+
+`status.cutover.step` records the step in flight; every step is
+idempotent, so a controller crash anywhere repeats at most one step:
+
+1. `fence` — `shard_status.migrating=true` on the source shards and a
+   `pgshard.workflow_locks(kind=reshard)` row. Routers see the flag in the
+   next snapshot and hold new writes to those shards in the failover
+   buffer; poolers refuse new `PREPARE TRANSACTION` on fenced shards with
+   `57P03` and a retry hint. In-flight transactions finish.
+2. `drain` — waits until `pg_prepared_xacts` is empty on every source (the
+   resolver drives the outcome).
+3. `sweep` — `LOCK TABLE ... IN SHARE MODE` per sharded table on each
+   source in a short transaction under `lock_timeout`.
+4. `positions` — `pg_current_wal_lsn()` per source, kept in the record.
+5. `catch_up` — every forward subscription's `latest_end_lsn` reaches its
+   source position.
+6. `verify` — per table, range and target: `count(*)` and
+   `sum(hashtext(row::text))` under the source position vs the target. A
+   mismatch aborts the switch (fence released, workflow `failed`) before
+   anything irreversible.
+7. `reverse` — publications on the targets (`pgshard_reshard_g<gen>_rev_s<src>`,
+   same row filters, target -> source direction) and disabled subscriptions
+   on the sources (`origin=none, copy_data=false, create_slot=true`),
+   created while the targets are still non-serving.
+8. `journal` — the point of no return. A row keyed by a uuid allocated
+   before the first attempt goes into
+   `pgshard_journal.resharding_journal` in every user database of every
+   source (the replicated stream) and into the catalog's
+   `pgshard.resharding_journal`; `workflows.journal_ids` records it.
+   Stream consumers following JOURNAL rows are wired in a follow-up task.
+9. `flip` — one catalog transaction: targets `serving`, sources `retired`,
+   `pgshard.serving` published for the new set, database home shards
+   moved, `shard_map_generation` bumped so poolers reject the old
+   generation.
+10. `swap_replication` — forward subscriptions disabled (dropped on
+    complete), reverse subscriptions enabled.
+11. `release` — `migrating=false`, lock row removed. Routers replay the
+    buffered writes against the new map.
+
+The pause (`fence` raised to `flip` committed) is written to
+`status.cutover.pause_ms` and mirrored to
+`PgShardReshard.status.cutoverPause`. A switch that has not reached the
+journal within `--cutover-timeout` (default 60s) is undone (fence
+released) and retried; after `--cutover-attempts` (default 3) the
+workflow fails. Steps after the journal retry until they succeed.
+
+Global sequences live in the catalog, so nothing moves with the data.
+The M4 DDL applier must honor `pgshard.workflow_locks` (kind `reshard`)
+and defer migrations of affected tables while a row exists.
+
+## Complete
+
+`switched` holds for `spec.resharding.retireOldGroupsAfter` (default 24h)
+and, when `pauseBefore` is `complete`, for `pgshard.io/proceed: complete`.
+`completing` drops the forward and reverse subscriptions, slots and
+publications on both sides and ends the workflow at `completed`. The
+operator then deletes the retired groups' pods, PVCs and Services; their
+stanzas stay under the backup retention. `PgShardCluster.status.reshard`
+reports `retiredShardSet` during the window.
+
+## Limitations
+
+- No cancel after the journal; a reverse flip (`switch_back`) is not
+  implemented.
+- Archiving and stanza creation for the new groups are not switched on
+  by the cutover; the operator's backup reconciliation covers groups it
+  considers serving on its next pass.
+- Reads have no separate switch (no read-replica routing).
+- Writes to fenced ranges wait in the router's failover buffer for at
+  most the buffering window; a pause longer than that surfaces as
+  `57P03` to clients.
