@@ -198,9 +198,11 @@ func (c GRPCAgentClient) Backup(ctx context.Context, addr string, t string) (Bac
 		return BackupResult{}, err
 	}
 	defer func() { _ = conn.Close() }()
-	ctx, cancel := context.WithTimeout(ctx, agentCallTimeout)
-	defer cancel()
-	st, err := cl.Status(ctx, &pgshardv1.StatusRequest{})
+	// The backup itself runs pgbackrest synchronously and is bounded by the
+	// caller (backupRunTimeout); only the epoch probe gets a short deadline.
+	sctx, scancel := context.WithTimeout(ctx, agentCallTimeout)
+	st, err := cl.Status(sctx, &pgshardv1.StatusRequest{})
+	scancel()
 	if err != nil {
 		return BackupResult{}, err
 	}
@@ -234,9 +236,11 @@ func (c GRPCAgentClient) Expire(ctx context.Context, addr string) error {
 		return err
 	}
 	defer func() { _ = conn.Close() }()
-	ctx, cancel := context.WithTimeout(ctx, agentCallTimeout)
-	defer cancel()
-	st, err := cl.Status(ctx, &pgshardv1.StatusRequest{})
+	// Expire can run long on a large repo; bound only the epoch probe, not
+	// the Expire RPC (the caller bounds the overall run).
+	sctx, scancel := context.WithTimeout(ctx, agentCallTimeout)
+	st, err := cl.Status(sctx, &pgshardv1.StatusRequest{})
+	scancel()
 	if err != nil {
 		return err
 	}
