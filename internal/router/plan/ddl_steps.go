@@ -203,7 +203,7 @@ func uniqueSteps(rv *pgquerypb.RangeVar, cs *pgquerypb.Constraint) []Step {
 // crash left pending.
 func detachSteps(rv, part *pgquerypb.RangeVar) []Step {
 	table, p := tableName(rv), tableName(part)
-	check := Check{Schema: rv.GetSchemaname(), Table: rv.GetRelname(), Name: part.GetRelname()}
+	check := Check{Schema: rv.GetSchemaname(), Table: rv.GetRelname(), Name: part.GetRelname(), NameSchema: part.GetSchemaname()}
 	return []Step{
 		{SQL: "ALTER TABLE " + table + " DETACH PARTITION " + p + " CONCURRENTLY", Concurrent: true, Skip: withKind(check, CheckDetachPending)},
 		{SQL: "ALTER TABLE " + table + " DETACH PARTITION " + p + " FINALIZE", Skip: withKind(check, CheckDetached)},

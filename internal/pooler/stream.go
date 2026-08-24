@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -16,6 +17,13 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/pgoutput"
 	"github.com/andrew01234567890/pgshard/internal/pgrepl"
 )
+
+// ErrorDomain marks structured error details produced by the pooler.
+const ErrorDomain = "pgshard-pooler"
+
+// ReasonPositionTooOld is the ErrorInfo reason attached when replication
+// cannot start from the requested position (the slot or WAL is gone).
+const ReasonPositionTooOld = "POSITION_TOO_OLD"
 
 // StreamConfig wires the change-stream RPCs of a Server.
 type StreamConfig struct {
@@ -193,7 +201,11 @@ func (s *Server) runStream(ctx context.Context, req *pgshardv1.StreamRequest, em
 	if err := conn.StartReplication(ctx, slot, pgrepl.LSN(req.GetStartLsn()), options); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) {
-			return status.Errorf(codes.FailedPrecondition, "start replication: %s (%s)", pgErr.Message, pgErr.Code)
+			st := status.Newf(codes.FailedPrecondition, "start replication: %s (%s)", pgErr.Message, pgErr.Code)
+			if detailed, derr := st.WithDetails(&errdetails.ErrorInfo{Reason: ReasonPositionTooOld, Domain: ErrorDomain}); derr == nil {
+				st = detailed
+			}
+			return st.Err()
 		}
 		return status.Errorf(codes.Unavailable, "start replication: %v", err)
 	}

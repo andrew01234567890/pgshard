@@ -146,6 +146,9 @@ type MigrationCheck struct {
 	Table  string `json:"table,omitempty"`
 	// Name is the constraint, column, index or partition the check is on.
 	Name string `json:"name,omitempty"`
+	// NameSchema is the schema of Name when it is a partition named with
+	// an explicit schema; empty matches any schema.
+	NameSchema string `json:"name_schema,omitempty"`
 }
 
 // ShardMigration is one shard's entry in migrations.per_shard.

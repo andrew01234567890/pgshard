@@ -235,3 +235,55 @@ func TestDDLRefusedInTransactionAndRewriteClass(t *testing.T) {
 		t.Fatalf("message %q", pe.Message)
 	}
 }
+
+func TestPGMigrationQueueWaitIsBounded(t *testing.T) {
+	q := &PGMigrationQueue{Poll: time.Millisecond, MaxWait: 20 * time.Millisecond,
+		load: func(context.Context, string) (catalog.DDLMigration, error) {
+			return catalog.DDLMigration{State: catalog.MigrationQueued}, nil
+		}}
+	type result struct {
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		_, err := q.Wait(context.Background(), "m1")
+		done <- result{err}
+	}()
+	select {
+	case r := <-done:
+		if r.err == nil || !strings.Contains(r.err.Error(), "controller") {
+			t.Fatalf("bounded wait names the controller: %v", r.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait did not return without an applier")
+	}
+}
+
+func TestPGMigrationQueueWaitResetsOnProgress(t *testing.T) {
+	calls := 0
+	q := &PGMigrationQueue{Poll: time.Millisecond, MaxWait: 25 * time.Millisecond,
+		load: func(context.Context, string) (catalog.DDLMigration, error) {
+			calls++
+			if calls >= 80 {
+				return catalog.DDLMigration{State: catalog.MigrationComplete}, nil
+			}
+			return catalog.DDLMigration{State: catalog.MigrationRunning,
+				PerShard: map[string]catalog.ShardMigration{"0": {State: catalog.ShardRunning, Attempts: calls}}}, nil
+		}}
+	done := make(chan error, 1)
+	go func() {
+		m, err := q.Wait(context.Background(), "m1")
+		if err == nil && m.State != catalog.MigrationComplete {
+			err = fmt.Errorf("state %s", m.State)
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("a migration progressing past MaxWait was aborted: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Wait never finished")
+	}
+}

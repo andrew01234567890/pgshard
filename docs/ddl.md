@@ -60,8 +60,10 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
    with the same name. An `ALTER TABLE` with several actions of which one
    needs steps is refused (`0A000`): run that action as its own statement.
 
-2. **Rewrite class runs online.** `ALTER COLUMN … TYPE` (any change, with
-   or without `USING`) and `ADD COLUMN … DEFAULT <volatile expression>`
+2. **Rewrite class runs online.** `ALTER COLUMN … TYPE` (with or without
+   `USING`; not the shard key column, not `CASCADE`, not with a `COLLATE`
+   clause) and `ADD COLUMN … DEFAULT <volatile expression>` (with no
+   other constraint and no `NOT NULL` in the same column definition)
    would rewrite the table under an exclusive lock; the router instead
    classifies them as strategy `rewrite` — an OID-preserving in-place
    column duplication driven by the applier. See
@@ -77,10 +79,13 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
 3. **Refuse what cannot be applied online.** `0A000`:
    * DDL inside a transaction block — each shard commits its own
      transaction; the fan-out cannot be rolled back with the client's.
-   * Remaining rewrite class (`SET LOGGED`/`UNLOGGED`, `SET TABLESPACE`,
-     `ADD COLUMN … GENERATED AS IDENTITY`, `ADD COLUMN … serial`,
-     `ADD COLUMN … GENERATED … STORED`, `ALTER COLUMN … TYPE` combined
-     with other actions or `COLLATE`): create a new table and copy the
+   * Remaining rewrite class (`SET LOGGED`/`SET UNLOGGED`,
+     `SET TABLESPACE`, `ADD COLUMN … GENERATED AS IDENTITY`,
+     `ADD COLUMN` of a serial type, `ADD COLUMN … GENERATED … STORED`,
+     `ALTER COLUMN … TYPE` combined with other actions in the same
+     `ALTER TABLE`, with `CASCADE` or with a `COLLATE` clause, and
+     `ADD COLUMN … DEFAULT <volatile expression>` combined with
+     `NOT NULL` or another constraint): create a new table and copy the
      rows.
    * `TRUNCATE`, `LOCK`, plain `VACUUM`/`ANALYZE`, `COPY` on
      sharded/reference tables and `CREATE TABLE AS` over them (not

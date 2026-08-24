@@ -553,6 +553,13 @@ func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, key string,
 				return "", err
 			}
 			if matches {
+				// A resumed DROP under scope "existing" cannot tell "we
+				// dropped it" from "it never existed on this shard": count
+				// it skipped so a migration where no shard had the object
+				// still fails instead of reporting applied.
+				if m.Scope == "existing" && m.Meta.Object.Expect == "absent" {
+					return "", &skippedError{fmt.Errorf("%s %q is not present on this shard", m.Meta.Object.Kind, m.Meta.Object.Name)}
+				}
 				return catalog.ShardApplied, nil
 			}
 		}
@@ -738,13 +745,19 @@ func checkHolds(ctx context.Context, conn ShardConn, c catalog.MigrationCheck) (
 		}
 		return pgx.CollectOneRow(rows, pgx.RowTo[bool])
 	case "detached":
-		sql = `SELECT NOT EXISTS (SELECT 1 FROM pg_inherits h JOIN pg_class p ON p.oid = h.inhrelid WHERE p.relname = $3 AND h.inhparent = (` + rel + `))`
+		sql = `SELECT NOT EXISTS (SELECT 1 FROM pg_inherits h JOIN pg_class p ON p.oid = h.inhrelid JOIN pg_namespace pn ON pn.oid = p.relnamespace
+			WHERE p.relname = $3 AND ($4 = '' OR pn.nspname = $4) AND h.inhparent = (` + rel + `))`
 	case "detach_pending":
-		sql = `SELECT NOT EXISTS (SELECT 1 FROM pg_inherits h JOIN pg_class p ON p.oid = h.inhrelid WHERE p.relname = $3 AND NOT h.inhdetachpending AND h.inhparent = (` + rel + `))`
+		sql = `SELECT NOT EXISTS (SELECT 1 FROM pg_inherits h JOIN pg_class p ON p.oid = h.inhrelid JOIN pg_namespace pn ON pn.oid = p.relnamespace
+			WHERE p.relname = $3 AND ($4 = '' OR pn.nspname = $4) AND NOT h.inhdetachpending AND h.inhparent = (` + rel + `))`
 	default:
 		return false, fmt.Errorf("unknown step check %q", c.Kind)
 	}
-	rows, err := conn.Query(ctx, sql, c.Table, c.Schema, c.Name)
+	args := []any{c.Table, c.Schema, c.Name}
+	if c.Kind == "detached" || c.Kind == "detach_pending" {
+		args = append(args, c.NameSchema)
+	}
+	rows, err := conn.Query(ctx, sql, args...)
 	if err != nil {
 		return false, err
 	}

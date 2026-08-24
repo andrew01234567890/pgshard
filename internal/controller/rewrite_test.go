@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
+	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 )
 
 func rewriteMigration(id string) catalog.DDLMigration {
@@ -49,6 +50,12 @@ func TestRewriteMigrationRunsAllPhases(t *testing.T) {
 			return 2
 		}
 		return 1
+	}
+	shards.backfillProbe = func(_ int32, call int) []string {
+		if call == 0 {
+			return []string{"3"}
+		}
+		return nil
 	}
 	a := newRewriteApplier(store, shards)
 	if _, err := a.RunOnce(context.Background()); err != nil {
@@ -220,5 +227,74 @@ func TestRewriteTriggerSQLShapes(t *testing.T) {
 	add := &catalog.RewriteChange{Table: "orders", Column: "token", NewType: "uuid", Default: "gen_random_uuid()", Add: true}
 	if got := backfillPredicate(add, "_pgshard_token_00000000"); got != `"_pgshard_token_00000000" IS NULL` {
 		t.Fatalf("add predicate %q", got)
+	}
+}
+
+func TestRewriteSettleCoversTheSnapshotFallbackReload(t *testing.T) {
+	if DefaultRewriteSettle < snapshot.DefaultReloadInterval {
+		t.Fatalf("settle %s is shorter than the snapshot fallback reload %s: a router whose LISTEN dropped could leak the hidden column",
+			DefaultRewriteSettle, snapshot.DefaultReloadInterval)
+	}
+}
+
+func TestBackfillStopsOnlyWhenNoRowsMatchThePredicate(t *testing.T) {
+	store := &memStore{migrations: []catalog.DDLMigration{rewriteMigration("00000000-0000-0000-0000-00000000ab0a")},
+		shards: []int32{0}}
+	shards := newFakeShards()
+	shards.columns = []string{"tenant_id", "id", "amount"}
+	shards.pks = []string{"id"}
+	shards.oldNotNull = true
+	shards.nnPending = true
+	batches := 0
+	shards.affected = func(_ int32, sql string) int64 {
+		if !strings.Contains(sql, "WITH batch AS") {
+			return 0
+		}
+		batches++
+		// Fewer rows than the batch selected, as a concurrent DELETE or
+		// PK change produces; rows above the keyset still match.
+		return 1
+	}
+	shards.backfillProbe = func(_ int32, call int) []string {
+		if call == 0 {
+			// An empty-string text PK still matching must not read as
+			// "no rows remain".
+			return []string{""}
+		}
+		return nil
+	}
+	a := newRewriteApplier(store, shards)
+	if _, err := a.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m := store.get(t, "00000000-0000-0000-0000-00000000ab0a")
+	if m.State != catalog.MigrationComplete {
+		t.Fatalf("state = %s error %q", m.State, m.Error)
+	}
+	if batches != 2 {
+		t.Fatalf("ran %d backfill batches, want 2: a short batch with rows remaining was declared done", batches)
+	}
+}
+
+func TestBackfillFailsWhenItDoesNotConverge(t *testing.T) {
+	store := &memStore{migrations: []catalog.DDLMigration{rewriteMigration("00000000-0000-0000-0000-00000000ab09")},
+		shards: []int32{0}}
+	shards := newFakeShards()
+	shards.columns = []string{"tenant_id", "id", "amount"}
+	shards.pks = []string{"id"}
+	shards.affected = func(_ int32, sql string) int64 {
+		if strings.Contains(sql, "WITH batch AS") {
+			return 2
+		}
+		return 0
+	}
+	shards.backfillProbe = func(int32, int) []string { return []string{"42"} }
+	a := newRewriteApplier(store, shards)
+	if _, err := a.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m := store.get(t, "00000000-0000-0000-0000-00000000ab09")
+	if m.State != catalog.MigrationFailed || !strings.Contains(m.Error, "not converging") {
+		t.Fatalf("state %s error %q", m.State, m.Error)
 	}
 }

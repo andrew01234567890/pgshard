@@ -1,6 +1,7 @@
 package pooler
 
 import (
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -56,6 +57,21 @@ func (ps preparedSet) doubtAll() {
 func touchesPrepared(sql string) bool {
 	u := strings.ToUpper(sql)
 	return strings.Contains(u, "DEALLOCATE") || strings.Contains(u, "DISCARD")
+}
+
+var sqlPrepareRE = regexp.MustCompile(`(?i)\bPREPARE\s+(?:TRANSACTION\b)?`)
+
+// createsPrepared reports whether the SQL may create a statement with a
+// SQL-level PREPARE the pooler cannot name. PREPARE TRANSACTION creates
+// none, but a conservative match only costs an extra Close and a DISCARD
+// ALL on reuse.
+func createsPrepared(sql string) bool {
+	for _, m := range sqlPrepareRE.FindAllString(sql, -1) {
+		if !strings.Contains(strings.ToUpper(m), "TRANSACTION") {
+			return true
+		}
+	}
+	return false
 }
 
 // closeAction says what the relay does with the CloseComplete answering a

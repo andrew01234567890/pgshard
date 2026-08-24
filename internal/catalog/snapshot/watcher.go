@@ -34,9 +34,13 @@ type Change struct {
 	DesiredGeneration  int64
 }
 
+// DefaultReloadInterval is the fallback full reload period when LISTEN
+// delivers nothing (or its connection is down).
+const DefaultReloadInterval = 30 * time.Second
+
 // Options tunes a Watcher. Zero values pick defaults.
 type Options struct {
-	ReloadInterval time.Duration                    // default 30s
+	ReloadInterval time.Duration                    // default DefaultReloadInterval
 	DisableListen  bool                             // periodic reload only
 	Logf           func(format string, args ...any) // nil discards
 }
@@ -44,7 +48,7 @@ type Options struct {
 // NewWatcher builds a Watcher for the catalog at dsn; Run starts it.
 func NewWatcher(dsn string, opts Options) *Watcher {
 	if opts.ReloadInterval <= 0 {
-		opts.ReloadInterval = 30 * time.Second
+		opts.ReloadInterval = DefaultReloadInterval
 	}
 	if opts.Logf == nil {
 		opts.Logf = func(string, ...any) {}

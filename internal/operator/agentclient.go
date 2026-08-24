@@ -47,6 +47,10 @@ const (
 	// agentCallTimeout bounds every RPC after the dial; a wedged agent must
 	// fail the reconcile, not hang it.
 	agentCallTimeout = 30 * time.Second
+	// agentPromoteTimeout bounds Promote and Demote: pg_ctl promote -w plus
+	// the post-promote CHECKPOINT can legitimately take minutes, and
+	// aborting at 30s caused needless failover churn.
+	agentPromoteTimeout = 2 * time.Minute
 )
 
 func (GRPCAgentClient) dial(ctx context.Context, addr string) (*grpc.ClientConn, pgshardv1.AgentClient, error) {
@@ -95,7 +99,7 @@ func (c GRPCAgentClient) Promote(ctx context.Context, addr string, epoch uint64,
 		return err
 	}
 	defer func() { _ = conn.Close() }()
-	ctx, cancel := context.WithTimeout(ctx, agentCallTimeout)
+	ctx, cancel := context.WithTimeout(ctx, agentPromoteTimeout)
 	defer cancel()
 	resp, err := cl.Promote(ctx, &pgshardv1.PromoteRequest{Epoch: epoch, LeaseHolder: holder})
 	if err != nil {
@@ -114,7 +118,7 @@ func (c GRPCAgentClient) Demote(ctx context.Context, addr string, epoch uint64) 
 		return err
 	}
 	defer func() { _ = conn.Close() }()
-	ctx, cancel := context.WithTimeout(ctx, agentCallTimeout)
+	ctx, cancel := context.WithTimeout(ctx, agentPromoteTimeout)
 	defer cancel()
 	resp, err := cl.Demote(ctx, &pgshardv1.DemoteRequest{Epoch: epoch})
 	if err != nil {

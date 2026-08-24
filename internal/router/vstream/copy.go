@@ -102,7 +102,7 @@ func (r *reader) copyOnce(ctx context.Context) error {
 			}
 			u = &unit{shard: r.shard, copy: r.copy.state(r.shard),
 				events: []*pgshardv1.VEvent{{Event: &pgshardv1.VEvent_CopyBegin_{CopyBegin: &pgshardv1.VEvent_CopyBegin{Shard: sh, Schema: rel.schema, Table: rel.table}}}},
-				rels:   []*relMeta{nil}, xids: []uint32{0}}
+				rels:   [][]*relMeta{nil}, xids: []uint32{0}}
 		case *pgshardv1.CopyTablesResponse_Rows_:
 			if rel == nil || r.copy.current == nil {
 				return status.Error(codes.FailedPrecondition, "copy: rows before a table")
@@ -112,7 +112,7 @@ func (r *reader) copyOnce(ctx context.Context) error {
 				ev := &pgshardv1.VEvent{Event: &pgshardv1.VEvent_Row_{Row: &pgshardv1.VEvent_Row{Shard: sh, Schema: rel.schema, Table: rel.table,
 					Kind: pgshardv1.VEvent_Row_KIND_INSERT, New: tuple(row.GetValues(), nil), Copy: true}}}
 				u.events = append(u.events, ev)
-				u.rels = append(u.rels, rel)
+				u.rels = append(u.rels, []*relMeta{rel})
 				u.xids = append(u.xids, 0)
 			}
 			r.copy.current.Lastpk = append([]byte(nil), m.Rows.GetLastpk()...)
@@ -124,11 +124,11 @@ func (r *reader) copyOnce(ctx context.Context) error {
 			rel = nil
 			u = &unit{shard: r.shard, copy: r.copy.state(r.shard),
 				events: []*pgshardv1.VEvent{{Event: &pgshardv1.VEvent_CopyCompleted_{CopyCompleted: &pgshardv1.VEvent_CopyCompleted{Shard: sh, Schema: m.TableDone.GetSchema(), Table: m.TableDone.GetTable()}}}},
-				rels:   []*relMeta{nil}, xids: []uint32{0}}
+				rels:   [][]*relMeta{nil}, xids: []uint32{0}}
 		case *pgshardv1.CopyTablesResponse_Done_:
 			u = &unit{shard: r.shard, copyDone: true,
 				events: []*pgshardv1.VEvent{{Event: &pgshardv1.VEvent_CopyCompleted_{CopyCompleted: &pgshardv1.VEvent_CopyCompleted{Shard: sh}}}},
-				rels:   []*relMeta{nil}, xids: []uint32{0}}
+				rels:   [][]*relMeta{nil}, xids: []uint32{0}}
 			if !r.push(ctx, u) {
 				return ctx.Err()
 			}

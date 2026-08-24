@@ -72,6 +72,10 @@ type Server struct {
 	readers  map[string]*streamReader
 	draining atomic.Bool
 	closed   atomic.Bool
+
+	// detachUnlocked runs in tests between detach releasing the lock and
+	// recycling the backend.
+	detachUnlocked func()
 }
 
 // session is the pooler-side state for one router session.
@@ -122,18 +126,34 @@ func (s *Server) session(id string) *session {
 	return se
 }
 
+// attachSession finds or creates the session and marks it attached in one
+// critical section: a lookup that released the lock before attaching could
+// hold a session a concurrent detach has already forgotten while a new
+// Execute registers a fresh one under the same id.
+func (s *Server) attachSession(id, role string) (*session, error) {
+	s.expireReservations(time.Now())
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	se, ok := s.sessions[id]
+	if !ok {
+		se = &session{id: id}
+		s.sessions[id] = se
+	}
+	if se.attached {
+		return nil, status.Error(codes.FailedPrecondition, "session already has an Execute stream")
+	}
+	se.attached = true
+	se.detached = make(chan struct{})
+	se.detachedAt = time.Time{}
+	se.role = role
+	se.database = s.cfg.Database
+	return se, nil
+}
+
 func (s *Server) lookup(id string) *session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.sessions[id]
-}
-
-func (s *Server) forget(se *session) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.sessions[se.id] == se {
-		delete(s.sessions, se.id)
-	}
 }
 
 // Execute relays pgwire-shaped messages for one router session.
@@ -154,18 +174,10 @@ func (s *Server) Execute(stream pgshardv1.Pooler_ExecuteServer) error {
 	if s.draining.Load() {
 		return errUnavailable
 	}
-	se := s.session(first.SessionId)
-	s.mu.Lock()
-	if se.attached {
-		s.mu.Unlock()
-		return status.Error(codes.FailedPrecondition, "session already has an Execute stream")
+	se, err := s.attachSession(first.SessionId, first.User.Username)
+	if err != nil {
+		return err
 	}
-	se.attached = true
-	se.detached = make(chan struct{})
-	se.detachedAt = time.Time{}
-	se.role = first.User.Username
-	se.database = s.cfg.Database
-	s.mu.Unlock()
 	defer s.detach(se)
 	// Zeroise the working key copies before the session is detached, so a
 	// caller that observes the session gone also observes the zeroed keys.
@@ -196,12 +208,20 @@ func (s *Server) detach(se *session) {
 		se.detachedAt = time.Now()
 	} else {
 		se.b = nil
+		// Forget under the same lock: dropping it after unlocking would
+		// let a new Execute for the same session id attach to this entry
+		// and then be forgotten with it.
+		if s.sessions[se.id] == se {
+			delete(s.sessions, se.id)
+		}
 	}
 	detached := se.detached
 	s.mu.Unlock()
+	if s.detachUnlocked != nil {
+		s.detachUnlocked()
+	}
 	if !keep {
 		s.recycle(b, true)
-		s.forget(se)
 	}
 	close(detached)
 }
@@ -223,12 +243,13 @@ func (s *Server) recycle(b *Backend, resetSession bool) {
 			return
 		}
 	}
-	if resetSession || len(b.prepared) > 0 {
+	if resetSession || len(b.prepared) > 0 || b.sqlPrepared {
 		if err := b.simpleQuery("DISCARD ALL"); err != nil {
 			s.cfg.Pool.Discard(b)
 			return
 		}
 		b.prepared = nil
+		b.sqlPrepared = false
 	}
 	s.cfg.Pool.Release(b)
 }
@@ -366,18 +387,21 @@ func (r *relay) forward(b *Backend, fm pgproto3.FrontendMessage) {
 		if touchesPrepared(m.Query) {
 			b.prepared.doubtAll()
 		}
+		if createsPrepared(m.Query) {
+			b.sqlPrepared = true
+		}
 		if m.Name == "" {
 			break
 		}
 		fp := statementFingerprint(m)
-		if b.prepared.holds(m.Name, fp) {
+		if !b.sqlPrepared && b.prepared.holds(m.Name, fp) {
 			r.srv.notePrepared(true)
 			b.send(&pgproto3.Close{ObjectType: 'P', Name: noopPortal})
 			r.closes = append(r.closes, closeAsParse)
 			return
 		}
 		r.srv.notePrepared(false)
-		if b.prepared.mayHold(m.Name) {
+		if b.prepared.mayHold(m.Name) || b.sqlPrepared {
 			b.send(&pgproto3.Close{ObjectType: 'S', Name: m.Name})
 			r.closes = append(r.closes, closeInjected)
 		}
@@ -396,6 +420,9 @@ func (r *relay) forward(b *Backend, fm pgproto3.FrontendMessage) {
 	case *pgproto3.Query:
 		if touchesPrepared(m.String) {
 			b.prepared.doubtAll()
+		}
+		if createsPrepared(m.String) {
+			b.sqlPrepared = true
 		}
 	}
 	b.send(fm)
@@ -514,8 +541,10 @@ func (s *Server) Release(ctx context.Context, req *pgshardv1.ReleaseRequest) (*p
 	}
 	b := se.b
 	se.b, se.reserved = nil, false
+	if s.sessions[se.id] == se {
+		delete(s.sessions, se.id)
+	}
 	s.mu.Unlock()
-	s.forget(se)
 	s.recycle(b, true)
 	return &pgshardv1.ReleaseResponse{}, nil
 }
@@ -524,18 +553,25 @@ func (s *Server) Release(ctx context.Context, req *pgshardv1.ReleaseRequest) (*p
 // been gone for ReserveTimeout: their router died without Release and
 // would otherwise hold the backend and the session entry forever.
 func (s *Server) expireReservations(now time.Time) {
-	var expired []*session
+	type claim struct {
+		se *session
+		b  *Backend
+	}
+	var expired []claim
 	s.mu.Lock()
 	for id, se := range s.sessions {
 		if se.reserved && !se.attached && !se.detachedAt.IsZero() && now.Sub(se.detachedAt) >= s.cfg.ReserveTimeout {
 			delete(s.sessions, id)
-			expired = append(expired, se)
+			// Claim the backend under the lock so a Release racing this
+			// expiry finds nothing left to recycle.
+			expired = append(expired, claim{se: se, b: se.b})
+			se.b, se.reserved = nil, false
 		}
 	}
 	s.mu.Unlock()
-	for _, se := range expired {
-		s.cfg.Logger.Warn("releasing reservation with no stream", "session", se.id, "role", se.role)
-		s.recycle(se.b, true)
+	for _, c := range expired {
+		s.cfg.Logger.Warn("releasing reservation with no stream", "session", c.se.id, "role", c.se.role)
+		s.recycle(c.b, true)
 	}
 }
 

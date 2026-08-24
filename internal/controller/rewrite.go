@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
+	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 )
 
 // Rewrite phases, tracked per shard in ShardMigration.Step.
@@ -27,8 +28,11 @@ const DefaultRewriteBatch = 1000
 
 // DefaultRewriteSettle is how long the applier waits after publishing the
 // visible column list before adding the hidden column, so every router has
-// reloaded its snapshot and hides the column from the first moment.
-const DefaultRewriteSettle = 2 * time.Second
+// reloaded its snapshot and hides the column from the first moment. It
+// must cover the snapshot watcher's fallback reload: a router whose LISTEN
+// dropped only notices the column list on its periodic reload, and a
+// shorter settle would let its SELECT * leak the hidden column.
+const DefaultRewriteSettle = snapshot.DefaultReloadInterval + 5*time.Second
 
 // driveRewrite runs an online rewrite migration: per phase across every
 // shard, so no shard cuts over before all shards finished their backfill.
@@ -266,14 +270,35 @@ func (a *Applier) backfill(ctx context.Context, conn ShardConn, rw *catalog.Rewr
 		sql := "WITH batch AS (SELECT " + pk + " FROM " + table + " WHERE " + pred +
 			" ORDER BY " + pk + " LIMIT " + fmt.Sprint(batch) + ")" +
 			" UPDATE " + table + " t SET " + set + " FROM batch WHERE t." + pk + " = batch." + pk
+		// RowsAffected undercounts when a concurrent DELETE or PK change
+		// removes a selected row before the UPDATE reaches it, so a short
+		// batch does not prove the backfill finished: only a probe that
+		// finds no matching row does. The probe returns zero rows when
+		// done and the minimum matching key otherwise; a stalled minimum
+		// after an update means a volatile DEFAULT yielding NULL or an
+		// unstable USING keeps rows matching pred forever.
+		probe := "SELECT " + pk + "::text FROM " + table + " WHERE " + pred + " ORDER BY " + pk + " LIMIT 1"
+		lastMin, haveMin := "", false
 		for {
-			tag, err := conn.Exec(ctx, sql)
+			if _, err := conn.Exec(ctx, sql); err != nil {
+				return err
+			}
+			rows, err := conn.Query(ctx, probe)
 			if err != nil {
 				return err
 			}
-			if tag == nil || tag.RowsAffected() < int64(batch) {
+			mins, err := pgx.CollectRows(rows, pgx.RowTo[string])
+			if err != nil {
+				return err
+			}
+			if len(mins) == 0 {
 				return nil
 			}
+			minKey := mins[0]
+			if haveMin && minKey == lastMin {
+				return fmt.Errorf("backfill of %s is not converging: rows keep matching %q after being updated (a volatile DEFAULT returning NULL or an unstable USING expression cannot be backfilled); fix the expression and run the migration again", table, pred)
+			}
+			lastMin, haveMin = minKey, true
 		}
 	}
 	_, err = conn.Exec(ctx, "UPDATE "+table+" SET "+set+" WHERE "+pred)

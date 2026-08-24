@@ -85,6 +85,11 @@ type Backend struct {
 	// outlives the session that parsed them so a reused backend is never
 	// asked to PREPARE a name it already has.
 	prepared preparedSet
+	// sqlPrepared is set when the backend may hold statements created by a
+	// SQL-level PREPARE the pooler did not parse the name out of; every
+	// extended-protocol Parse then closes its name first, and the backend
+	// is reset with DISCARD ALL before reuse.
+	sqlPrepared bool
 }
 
 // dialBackend performs startup and SCRAM-SHA-256 with forwarded keys. It
