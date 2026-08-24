@@ -69,9 +69,19 @@ func (r Renderer) RouterDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.De
 	}
 	labels := routerLabels(c)
 	minReplicas, _ := RouterReplicas(c)
-	args := []string{"serve", fmt.Sprintf("--listen=:%d", postgresPort), fmt.Sprintf("--health-listen=:%d", routerHTTPPort), "--catalog-dsn=" + CatalogDSN(c), "--catalog-pooler=" + CatalogPoolerEndpoint(c), "--insecure-dev"}
+	args := []string{"serve", fmt.Sprintf("--listen=:%d", postgresPort), fmt.Sprintf("--health-listen=:%d", routerHTTPPort), "--catalog-dsn=" + CatalogDSN(c), "--catalog-pooler=" + CatalogPoolerEndpoint(c)}
 	var mounts []corev1.VolumeMount
 	var volumes []corev1.Volume
+	if ref := internalTLSRef(c); ref != nil {
+		args = append(args,
+			"--pooler-tls-cert="+internalTLSMountPath+"/tls.crt",
+			"--pooler-tls-key="+internalTLSMountPath+"/tls.key",
+			"--pooler-tls-ca="+internalTLSMountPath+"/ca.crt")
+		mounts = append(mounts, corev1.VolumeMount{Name: internalTLSVolume, MountPath: internalTLSMountPath, ReadOnly: true})
+		volumes = append(volumes, corev1.Volume{Name: internalTLSVolume, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: ref.Name}}})
+	} else {
+		args = append(args, "--insecure-dev")
+	}
 	if ref := c.Spec.Router.TLS.SecretRef; ref != nil && ref.Name != "" {
 		args = append(args, "--tls-cert="+routerTLSMountDir+"/tls.crt", "--tls-key="+routerTLSMountDir+"/tls.key")
 		mounts = append(mounts, corev1.VolumeMount{Name: "tls", MountPath: routerTLSMountDir, ReadOnly: true})

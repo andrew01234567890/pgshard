@@ -128,6 +128,31 @@ spec:
                         - remote_apply
                         type: string
                     type: object
+                  internalTLS:
+                    description: |-
+                      InternalTLS references a Secret with tls.crt, tls.key and ca.crt used
+                      for mutual TLS between routers and the pooler sidecars. When set, the
+                      poolers refuse clients whose certificate does not chain to ca.crt and
+                      the routers dial with the certificate; when unset the pooler port
+                      speaks plaintext gRPC and must be protected by network policy.
+                    properties:
+                      secretRef:
+                        description: |-
+                          LocalObjectReference contains enough information to let you locate the
+                          referenced object inside the same namespace.
+                        properties:
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
+                    type: object
                   postgresql:
                     description: PostgreSQLSpec selects the PostgreSQL build and its
                       base configuration.

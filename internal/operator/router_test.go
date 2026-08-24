@@ -160,3 +160,59 @@ func TestPoolerSidecarInMemberPod(t *testing.T) {
 		t.Errorf("data volume position changed: %+v", pod.Spec.Volumes)
 	}
 }
+
+func TestInternalTLSEnablesRouterPoolerMTLS(t *testing.T) {
+	c := routerCluster()
+	c.Spec.PostgreSQL.Major = 18
+	c.Spec.InternalTLS.SecretRef = &corev1.LocalObjectReference{Name: "internal-tls"}
+
+	dep := Renderer{}.RouterDeployment(c)
+	ctr := dep.Spec.Template.Spec.Containers[0]
+	args := strings.Join(ctr.Args, " ")
+	if strings.Contains(args, "--insecure-dev") {
+		t.Errorf("router args still plaintext: %q", args)
+	}
+	for _, want := range []string{
+		"--pooler-tls-cert=/etc/pgshard-internal-tls/tls.crt",
+		"--pooler-tls-key=/etc/pgshard-internal-tls/tls.key",
+		"--pooler-tls-ca=/etc/pgshard-internal-tls/ca.crt",
+	} {
+		if !strings.Contains(args, want) {
+			t.Errorf("router args %q lack %q", args, want)
+		}
+	}
+	if v := dep.Spec.Template.Spec.Volumes; len(v) != 1 || v[0].Secret == nil || v[0].Secret.SecretName != "internal-tls" {
+		t.Errorf("router volumes %+v", v)
+	}
+
+	g := Groups(c)[0]
+	pod := Renderer{}.Pod(c, g, 0, RolePrimary, g.MemberName(0), Template(c, Group{}, nil, nil))
+	pooler := pod.Spec.Containers[1]
+	pargs := strings.Join(pooler.Args, " ")
+	if strings.Contains(pargs, "--insecure-dev") {
+		t.Errorf("pooler args still plaintext: %q", pargs)
+	}
+	for _, want := range []string{
+		"--tls-cert /etc/pgshard-internal-tls/tls.crt",
+		"--tls-key /etc/pgshard-internal-tls/tls.key",
+		"--tls-ca /etc/pgshard-internal-tls/ca.crt",
+	} {
+		if !strings.Contains(pargs, want) {
+			t.Errorf("pooler args %q lack %q", pargs, want)
+		}
+	}
+	var mounted, volumed bool
+	for _, m := range pooler.VolumeMounts {
+		if m.Name == "internal-tls" && m.MountPath == "/etc/pgshard-internal-tls" && m.ReadOnly {
+			mounted = true
+		}
+	}
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == "internal-tls" && v.Secret != nil && v.Secret.SecretName == "internal-tls" {
+			volumed = true
+		}
+	}
+	if !mounted || !volumed {
+		t.Errorf("pooler TLS not mounted (mount=%v volume=%v)", mounted, volumed)
+	}
+}

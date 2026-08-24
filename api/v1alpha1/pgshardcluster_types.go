@@ -192,6 +192,13 @@ type PgShardClusterSpec struct {
 	// +kubebuilder:default={}
 	// +optional
 	Upgrade UpgradeSpec `json:"upgrade,omitempty"`
+	// InternalTLS references a Secret with tls.crt, tls.key and ca.crt used
+	// for mutual TLS between routers and the pooler sidecars. When set, the
+	// poolers refuse clients whose certificate does not chain to ca.crt and
+	// the routers dial with the certificate; when unset the pooler port
+	// speaks plaintext gRPC and must be protected by network policy.
+	// +optional
+	InternalTLS TLSSpec `json:"internalTLS,omitempty"`
 }
 
 // MemberStatus reports one PostgreSQL instance in a group.

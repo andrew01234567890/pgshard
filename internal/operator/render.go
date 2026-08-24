@@ -22,9 +22,12 @@ import (
 const (
 	configMountPath = "/etc/pgshard"
 	secretMountPath = "/etc/pgshard-secret"
-	dataMountPath   = "/var/lib/postgresql/data"
-	pgdataPath      = dataMountPath + "/pgdata"
-	postgresUID     = int64(999)
+	// internalTLSMountPath holds the router<->pooler mTLS material.
+	internalTLSMountPath = "/etc/pgshard-internal-tls"
+	internalTLSVolume    = "internal-tls"
+	dataMountPath        = "/var/lib/postgresql/data"
+	pgdataPath           = dataMountPath + "/pgdata"
+	postgresUID          = int64(999)
 	// pgSocketDir is the agent's fixed unix_socket_directories; the pooler
 	// sidecar reaches the local server through it over a shared emptyDir.
 	pgSocketDir    = "/tmp"
@@ -389,6 +392,10 @@ func (Renderer) Pod(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, rol
 			},
 		},
 	}
+	if ref := internalTLSRef(c); ref != nil {
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{Name: internalTLSVolume,
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: ref.Name}}})
+	}
 	if tpl.Backup != nil {
 		mountBackupSecrets(pod, tpl.Backup)
 	}
@@ -403,19 +410,32 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 	if g.Kind == "catalog" {
 		shardSet = "catalog"
 	}
+	args := []string{"run",
+		"--listen", fmt.Sprintf(":%d", poolerGRPCPort),
+		"--metrics-listen", fmt.Sprintf(":%d", poolerMetricsPort),
+		"--pg-socket-dir", pgSocketDir,
+		"--catalog-dsn", CatalogDSN(c),
+		"--shard-set", shardSet,
+		"--shard-id", fmt.Sprint(g.ShardID),
+	}
+	mounts := []corev1.VolumeMount{
+		{Name: "pg-socket", MountPath: pgSocketDir},
+		{Name: "secret", MountPath: secretMountPath, ReadOnly: true},
+	}
+	if internalTLSRef(c) != nil {
+		args = append(args,
+			"--tls-cert", internalTLSMountPath+"/tls.crt",
+			"--tls-key", internalTLSMountPath+"/tls.key",
+			"--tls-ca", internalTLSMountPath+"/ca.crt")
+		mounts = append(mounts, corev1.VolumeMount{Name: internalTLSVolume, MountPath: internalTLSMountPath, ReadOnly: true})
+	} else {
+		args = append(args, "--insecure-dev")
+	}
 	return corev1.Container{
 		Name:    poolerContainer,
 		Image:   Image(c),
 		Command: []string{"pgshard-pooler"},
-		Args: []string{"run",
-			"--listen", fmt.Sprintf(":%d", poolerGRPCPort),
-			"--metrics-listen", fmt.Sprintf(":%d", poolerMetricsPort),
-			"--pg-socket-dir", pgSocketDir,
-			"--catalog-dsn", CatalogDSN(c),
-			"--shard-set", shardSet,
-			"--shard-id", fmt.Sprint(g.ShardID),
-			"--insecure-dev",
-		},
+		Args:    args,
 		Env: []corev1.EnvVar{{Name: "PGPASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
 			LocalObjectReference: corev1.LocalObjectReference{Name: SecretName(c.Name)}, Key: secretKey}}}},
 		Ports: []corev1.ContainerPort{
@@ -426,9 +446,14 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 			ProbeHandler:  corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt32(poolerGRPCPort)}},
 			PeriodSeconds: 5,
 		},
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: "pg-socket", MountPath: pgSocketDir},
-			{Name: "secret", MountPath: secretMountPath, ReadOnly: true},
-		},
+		VolumeMounts: mounts,
 	}
+}
+
+// internalTLSRef returns the router/pooler mTLS secret reference, if any.
+func internalTLSRef(c *pgshardv1alpha1.PgShardCluster) *corev1.LocalObjectReference {
+	if ref := c.Spec.InternalTLS.SecretRef; ref != nil && ref.Name != "" {
+		return ref
+	}
+	return nil
 }
