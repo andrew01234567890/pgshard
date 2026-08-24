@@ -59,11 +59,12 @@ spec:
   postgresql:
     major: %[3]s
 %[4]s  catalog:
-    replicas: 3
+    replicas: 1
     storage:
       size: 512Mi
   shards: %[5]d
-  replicasPerShard: 3
+  replicasPerShard: 1
+  unsafeSingleReplica: true
   storage:
     size: 512Mi
   resources:
@@ -378,8 +379,8 @@ func TestReshardProvisionsTargetsAndCancels(t *testing.T) {
 		ready := jsonpath(ctx, c, "pgshardreshard", record, `{.status.conditions[?(@.type=="TargetsReady")].status}`)
 		return ready == "True" && (phase == "Provisioning" || phase == "Copying")
 	})
-	if n := count(ctx, t, c, "pods", sel); n != 6 {
-		t.Errorf("target pods: got %d want 6", n)
+	if n := count(ctx, t, c, "pods", sel); n != 2 {
+		t.Errorf("target pods: got %d want 2", n)
 	}
 	if got := catalogSQL(ctx, t, c, "SELECT string_agg(shard_set || ':' || shard_id || ':' || serving_state, ',' ORDER BY shard_set, shard_id) FROM pgshard.shard_status"); got != "default:0:serving,g2:0:provisioning,g2:1:provisioning" {
 		t.Fatalf("shard_status must keep routing on the old shard only: %q", got)

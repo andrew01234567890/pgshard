@@ -10,7 +10,7 @@ runs the checker against the fixtures under `hack/testdata`.
 | --- | --- |
 | `ci.yml` | gofmt, vet, golangci-lint, `go test -race`, build; `buf lint` plus a drift check that fails when `make proto` changes `internal/gen`; govulncheck; gitleaks; actionlint and the policy checker; PR title check |
 | `images.yml` | builds the PostgreSQL 18 and 19 images with `docker buildx bake` and pushes them to GHCR on `main` |
-| `e2e-kind.yml` | kind-based smoke, operator and backup suites for both majors |
+| `e2e-kind.yml` | kind-based smoke, operator, backup and reshard suites for both majors, plus upgrade and reshard-scale on pg18 |
 | `perf.yml` | benchstat comparison against the base branch; only benchmarks tagged `Gate` can fail a PR (see `hack/perf/gate.sh`) |
 | `chaos.yml` | Chaos Mesh experiments (`test/chaos`) |
 | `dependency-review.yml`, `dependabot-automerge.yml` | dependency hygiene |
@@ -35,3 +35,12 @@ works anonymously. The catalog integration test then runs against the project
 images for both majors; set `PGSHARD_REQUIRE_PROJECT_IMAGES=1` (planned for
 `ci.yml` after the bootstrap) to fail instead of falling back to Docker Hub
 `postgres:*` tags when a project image is missing.
+
+## Required checks
+
+The reshard and upgrade e2e suites run single-replica clusters
+(`unsafeSingleReplica: true`, see [crd.md](crd.md)) so their pods fit the
+hosted runner. Once `e2e (pg18, reshard)`, `e2e (pg19, reshard)` and
+`e2e (pg18, upgrade)` have been observed green on `main` after this lands,
+add those contexts to the branch-protection required checks alongside the
+existing ones.

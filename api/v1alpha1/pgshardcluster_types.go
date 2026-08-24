@@ -154,8 +154,8 @@ type UpgradeSpec struct {
 }
 
 // PgShardClusterSpec is the desired state of a PgShardCluster.
-// +kubebuilder:validation:XValidation:rule="self.replicasPerShard >= 3",message="replicasPerShard must be >= 3"
-// +kubebuilder:validation:XValidation:rule="self.catalog.replicas >= 3",message="catalog.replicas must be >= 3 for HA"
+// +kubebuilder:validation:XValidation:rule="self.replicasPerShard >= 3 || (has(self.unsafeSingleReplica) && self.unsafeSingleReplica)",message="replicasPerShard must be >= 3"
+// +kubebuilder:validation:XValidation:rule="self.catalog.replicas >= 3 || (has(self.unsafeSingleReplica) && self.unsafeSingleReplica)",message="catalog.replicas must be >= 3 for HA"
 type PgShardClusterSpec struct {
 	PostgreSQL PostgreSQLSpec `json:"postgresql"`
 	// +optional
@@ -167,8 +167,14 @@ type PgShardClusterSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=3
 	// +optional
-	ReplicasPerShard int         `json:"replicasPerShard,omitempty"`
-	Storage          StorageSpec `json:"storage"`
+	ReplicasPerShard int `json:"replicasPerShard,omitempty"`
+	// UnsafeSingleReplica relaxes the replicasPerShard and catalog.replicas
+	// >= 3 requirement so test and development clusters can run one member
+	// per group. Single-member groups have no synchronous standby and no
+	// failover candidate: unsupported for production.
+	// +optional
+	UnsafeSingleReplica bool        `json:"unsafeSingleReplica,omitempty"`
+	Storage             StorageSpec `json:"storage"`
 	// +kubebuilder:default={}
 	// +optional
 	Durability DurabilitySpec `json:"durability,omitempty"`

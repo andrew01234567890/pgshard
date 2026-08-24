@@ -289,6 +289,13 @@ spec:
                 required:
                 - size
                 type: object
+              unsafeSingleReplica:
+                description: |-
+                  UnsafeSingleReplica relaxes the replicasPerShard and catalog.replicas
+                  >= 3 requirement so test and development clusters can run one member
+                  per group. Single-member groups have no synchronous standby and no
+                  failover candidate: unsupported for production.
+                type: boolean
               upgrade:
                 default: {}
                 description: UpgradeSpec controls major-version upgrades.
@@ -311,9 +318,11 @@ spec:
             type: object
             x-kubernetes-validations:
             - message: replicasPerShard must be >= 3
-              rule: self.replicasPerShard >= 3
+              rule: self.replicasPerShard >= 3 || (has(self.unsafeSingleReplica) &&
+                self.unsafeSingleReplica)
             - message: catalog.replicas must be >= 3 for HA
-              rule: self.catalog.replicas >= 3
+              rule: self.catalog.replicas >= 3 || (has(self.unsafeSingleReplica) &&
+                self.unsafeSingleReplica)
           status:
             description: PgShardClusterStatus is the observed state of a PgShardCluster.
             properties:

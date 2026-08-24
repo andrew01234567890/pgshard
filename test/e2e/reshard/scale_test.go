@@ -156,7 +156,7 @@ func reshardTo(ctx context.Context, t *testing.T, c *e2e.Cluster, major string, 
 
 func clusterManifestWithRetire(major, image string, shards int, retire string) string {
 	m := clusterManifest(major, image, shards)
-	return strings.Replace(m, "  replicasPerShard: 3\n", "  replicasPerShard: 3\n  resharding:\n    retireOldGroupsAfter: "+retire+"\n", 1)
+	return strings.Replace(m, "  unsafeSingleReplica: true\n", "  unsafeSingleReplica: true\n  resharding:\n    retireOldGroupsAfter: "+retire+"\n", 1)
 }
 
 // TestReshard1To2To4To2UnderLoad grows a cluster 1 -> 2 -> 4 shards and
