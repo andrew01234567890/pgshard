@@ -354,6 +354,15 @@ func golden() []want {
 		{sql: "listen ch", kind: Refuse, msg: "LISTEN is not supported through the router"},
 		{sql: "notify ch", kind: Refuse, msg: "NOTIFY is not supported through the router"},
 		{sql: "declare c cursor with hold for select 1", kind: Refuse, msg: "WITH HOLD cursors are not supported through the router"},
+		// Unrecognised statement shapes fail closed instead of running on
+		// the home shard: a write the planner does not understand must
+		// never execute on one shard silently.
+		{sql: "merge into orders o using orders_src s on o.id = s.id when matched then delete", kind: Refuse, msg: "MERGE is not supported through the router"},
+		{sql: "do $$ begin delete from orders; end $$", kind: Refuse, msg: "DO is not supported through the router"},
+		{sql: "call cleanup_orders()", kind: Refuse, msg: "CALL is not supported through the router"},
+		{sql: "create function f() returns int language sql as 'select 1'", kind: Refuse, msg: "CREATE FUNCTION is not supported through the router"},
+		{sql: "refresh materialized view mv", kind: Refuse, msg: "REFRESH MATERIALIZED VIEW is not supported through the router"},
+		{sql: "security label on table orders is 'x'", kind: Refuse, msg: "SECURITY LABEL is not supported through the router"},
 		{sql: "select 1; select 2", kind: Refuse, msg: "multi-statement queries are not supported through the router"},
 	}
 }

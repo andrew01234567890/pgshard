@@ -3,6 +3,7 @@ package plan
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -462,7 +463,32 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 		w.plan.Shards = nil
 		return nil
 	}
-	return w.unshardedOnly()
+	// Fail closed: a statement shape the planner does not recognise could
+	// write, and routing it to the home shard would run it on one shard
+	// silently. Everything the router supports is listed above.
+	return notYet(statementName(node)+" is not supported through the router", "")
+}
+
+// statementName renders the human-readable name of an unrecognised
+// statement node for the refusal message.
+func statementName(node *pgquerypb.Node) string {
+	inner := node.GetNode()
+	if inner == nil {
+		return "an empty statement"
+	}
+	name := strings.TrimPrefix(fmt.Sprintf("%T", inner), "*pgquerypb.Node_")
+	name = strings.TrimSuffix(name, "Stmt")
+	var out []byte
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if i > 0 && c >= 'A' && c <= 'Z' {
+			out = append(out, ' ')
+		}
+		out = append(out, c)
+	}
+	name = strings.ToUpper(string(out))
+	r := strings.NewReplacer("MAT VIEW", "MATERIALIZED VIEW", "SEC LABEL", "SECURITY LABEL", "SEQ ", "SEQUENCE ", "TRIG ", "TRIGGER ")
+	return r.Replace(name)
 }
 
 // unshardedOnly pins the plan to the home shard.
