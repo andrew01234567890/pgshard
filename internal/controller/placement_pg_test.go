@@ -543,9 +543,10 @@ func TestPlacementBackslashKeysAndLateWriteOnPostgres(t *testing.T) {
 // TestPlacementVerifyHolderShadowsOnPostgres: verification is keyed to the
 // holders of the new placement, not the sources. A sharded-to-unsharded
 // move (where a source holds no shadow) must still verify and flag a
-// short shadow, and a resume after a crash mid-swap (some holder already
-// renamed its shadow) must skip the check instead of erroring on the
-// missing shadow.
+// short shadow. A holder shadow missing before any swap began must fail
+// closed — never publish the home shard's old slice as the whole table —
+// and only the durable swap marker lets a resumed run skip the holders it
+// covers.
 func TestPlacementVerifyHolderShadowsOnPostgres(t *testing.T) {
 	f := newPlacementFixture(t)
 	ctx := context.Background()
@@ -572,15 +573,41 @@ func TestPlacementVerifyHolderShadowsOnPostgres(t *testing.T) {
 		t.Fatalf("repaired shadow must verify: %v", err)
 	}
 
-	// Crash mid-swap: the holder already renamed its shadow; a resumed
-	// verify must skip, not error.
+	// A missing holder shadow with no swap marker is a lost shadow, not a
+	// resumed swap: both the verification and the swap must fail closed
+	// instead of publishing the old table as the new placement.
 	mustExec(t, home, `ALTER TABLE gear`+ShadowSuffix+` RENAME TO gear__renamed_by_swap`)
-	if err := f.placer.verifyPlacement(ctx, wf); err != nil {
-		t.Fatalf("already-swapped holder must skip verification: %v", err)
+	if err := f.placer.verifyPlacement(ctx, wf); err == nil || !isFatal(err) {
+		t.Fatalf("a missing holder shadow before any swap must fail closed: %v", err)
+	}
+	if err := f.placer.swapAll(ctx, wf); err == nil || !isFatal(err) {
+		t.Fatalf("swapAll without the shadow or a marker must fail closed: %v", err)
 	}
 	mustExec(t, home, `ALTER TABLE gear__renamed_by_swap RENAME TO gear`+ShadowSuffix)
+
+	// A genuine crash mid-swap: the marker is persisted before the first
+	// rename, so a resume skips only the holders it covers and completes.
+	holder := wf.rt.Holders()[0]
+	renameShadowAsSwapWould(t, f, wf, holder)
+	wf.st.Swapped = append(wf.st.Swapped, holder)
+	if err := f.placer.save(ctx, wf, "test: marker persisted before the rename"); err != nil {
+		t.Fatal(err)
+	}
+	wf = f.load(id)
+	if err := f.placer.verifyPlacement(ctx, wf); err != nil {
+		t.Fatalf("a marker-covered holder must skip verification: %v", err)
+	}
 	if err := f.placer.swapAll(ctx, wf); err != nil {
-		t.Fatalf("swapAll: %v", err)
+		t.Fatalf("swapAll resume: %v", err)
 	}
 	f.driveUntil("gear", 2*time.Minute, StagePlacementRetiring, StageCompleted)
+}
+
+// renameShadowAsSwapWould replays the renames of swapOn on one shard, as a
+// swap interrupted after its commit would leave them.
+func renameShadowAsSwapWould(t *testing.T, f *placementFixture, wf *placementWorkflow, shard int32) {
+	t.Helper()
+	c := f.app(shard)
+	mustExec(t, c, `ALTER TABLE `+wf.spec.TableName+` RENAME TO `+wf.old())
+	mustExec(t, c, `ALTER TABLE `+wf.shadow()+` RENAME TO `+wf.spec.TableName)
 }
