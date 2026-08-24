@@ -498,13 +498,19 @@ While a shard changes primaries the catalog's `shard_status` shows it as
 answer `55000` to a stamp with a stale generation or epoch. The router
 hides short failovers from clients where it can do so safely:
 
-- A statement whose shard is blocking, or that came back `55000`, or whose
-  pooler refused the connection outright, is **buffered** if nothing of it
-  has reached the client yet and no transaction block is open: it waits
-  until the snapshot shows the shard serving again (LISTEN/NOTIFY wakes it;
-  status-only edits are picked up by a 200ms poll) or `--buffer-window`
-  (10s) elapses, then runs once more against the refreshed endpoint. A
-  window that expires with the shard still blocking is `08006`.
+- A statement whose shard is blocking, or that came back `55000`, is
+  **buffered** if nothing of it has reached the client yet and no
+  transaction block is open: it waits until the snapshot shows the shard
+  serving again (LISTEN/NOTIFY wakes it; status-only edits are picked up by
+  a 200ms poll) or `--buffer-window` (10s) elapses, then runs once more
+  against the refreshed endpoint. A window that expires with the shard
+  still blocking is `08006`.
+- A pooler that refused the connection outright (gRPC `Unavailable`) while
+  the snapshot still shows the shard serving is a transport fault, not a
+  failover: the statement is retried once after a new snapshot or
+  `--buffer-transport-window` (1s), whichever comes first, and fails with
+  `08006` if the pooler still refuses. The refusal takes the full
+  `--buffer-window` only when the snapshot has meanwhile fenced the shard.
 - Inside a transaction block the earlier statements ran on the old primary
   and cannot be replayed, so the statement fails with **`40001`
   (serialization_failure) "shard failover; retry the transaction"**, the

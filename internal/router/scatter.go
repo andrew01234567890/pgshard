@@ -237,7 +237,7 @@ func (e *Executor) runScatter(ctx context.Context, shards []int32, m *plan.Merge
 	for _, id := range shards {
 		sh := Shard{Set: e.home.Set, ID: id}
 		if e.r.blocking(sh) {
-			if ok, err := e.r.awaitConsistent(ctx, sh, false); err != nil {
+			if ok, err := e.r.awaitConsistent(ctx, sh, false, e.r.cfg.Buffering.Window); err != nil {
 				return err
 			} else if !ok {
 				return pgwire.Errorf(codeConnectionFailure, "shard %s/%d has no serving primary", sh.Set, sh.ID)

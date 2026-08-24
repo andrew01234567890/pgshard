@@ -456,7 +456,7 @@ func (e *Executor) withFailover(ctx context.Context, w pgwire.ResultWriter, run 
 		case failoverRefuse:
 			return e.afterBatch(ctx, e.bufferFull())
 		case failoverWait:
-			if ok, err := e.r.awaitConsistent(ctx, e.shard, false); err != nil {
+			if ok, err := e.r.awaitConsistent(ctx, e.shard, false, e.r.cfg.Buffering.Window); err != nil {
 				return e.afterBatch(ctx, err)
 			} else if !ok {
 				return e.afterBatch(ctx, pgwire.Errorf(codeConnectionFailure, "shard %s/%d has no serving primary", e.shard.Set, e.shard.ID))
@@ -473,7 +473,7 @@ func (e *Executor) withFailover(ctx context.Context, w pgwire.ResultWriter, run 
 		err = e.bufferFull()
 	case failoverWait:
 		e.dropStream()
-		ok, werr := e.r.awaitConsistent(ctx, e.shard, true)
+		ok, werr := e.r.awaitConsistent(ctx, e.shard, true, e.r.retryWindow(e.shard, err))
 		switch {
 		case werr != nil:
 			err = werr

@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"errors"
+	"net"
 	"testing"
 	"time"
 
@@ -234,5 +235,40 @@ func TestOutputAlreadySentPassesFailoverErrorThrough(t *testing.T) {
 	}
 	if d := time.Since(start); d > 300*time.Millisecond {
 		t.Fatalf("statement with output was buffered for %s", d)
+	}
+}
+
+func TestRefusedPoolerWhileServingUsesTransportWindow(t *testing.T) {
+	dead, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadAddr := dead.Addr().String()
+	_ = dead.Close()
+	h := newHarnessWith(t, newFakePooler(7, 2), deadAddr, func(c *Config) { c.Buffering.TransportWindow = 100 * time.Millisecond })
+	conn := h.connect(t, h.dsn("app", "secret", "app"))
+	start := time.Now()
+	_, err = conn.Exec(context.Background(), "select 1")
+	if sqlstate(err) != "08006" {
+		t.Fatalf("refused pooler: %v", err)
+	}
+	if d := time.Since(start); d < 100*time.Millisecond || d > 500*time.Millisecond {
+		t.Fatalf("waited %s; want the transport window, not the failover window", d)
+	}
+}
+
+func TestRetryWindowTable(t *testing.T) {
+	h := newHarness(t)
+	sh := Shard{Set: DefaultShardSet}
+	refused := &refusedError{pgwire.Errorf("08006", "refused")}
+	if got := h.r.retryWindow(sh, refused); got != h.r.cfg.Buffering.TransportWindow {
+		t.Fatalf("refused while serving: %s", got)
+	}
+	if got := h.r.retryWindow(sh, pgwire.Errorf(codeStaleGeneration, "stale")); got != h.r.cfg.Buffering.Window {
+		t.Fatalf("stale generation: %s", got)
+	}
+	h.fence("fenced")
+	if got := h.r.retryWindow(sh, refused); got != h.r.cfg.Buffering.Window {
+		t.Fatalf("refused while fenced: %s", got)
 	}
 }

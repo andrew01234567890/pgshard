@@ -92,6 +92,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	peerService := fs.String("peer-service", "", "host:port whose DNS records enumerate peer routers (headless Service)")
 	peerRate := fs.Float64("peer-cancel-rate", 50, "forwarded cancels per second (burst equal)")
 	bufferWindow := fs.Duration("buffer-window", 10*time.Second, "how long a statement waits for a shard failover")
+	bufferTransportWindow := fs.Duration("buffer-transport-window", time.Second, "how long a statement waits after a pooler refused the connection while the shard is still serving")
 	bufferCap := fs.Int("buffer-cap", 256, "statements buffered per shard during failover")
 	scatterMaxShards := fs.Int("scatter-max-shards", 0, "most shards one SELECT may fan out to (0 = all)")
 	scatterMaxStreams := fs.Int("scatter-max-streams", 4096, "shard streams open for multi-shard reads across this router")
@@ -201,7 +202,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		Poolers:    poolerClients,
 		Logger:     logger,
 		Peers:      peersOrNil(forwarder),
-		Buffering:  router.Buffering{Window: *bufferWindow, PerShardCap: *bufferCap, Changes: w.Subscribe},
+		Buffering:  router.Buffering{Window: *bufferWindow, TransportWindow: *bufferTransportWindow, PerShardCap: *bufferCap, Changes: w.Subscribe},
 		Scatter:    router.ScatterConfig{MaxShards: *scatterMaxShards, MaxStreams: *scatterMaxStreams},
 		Decisions:  &router.PGDecisionLog{Pool: pool},
 		Sequences:  router.NewSequenceAllocator(&router.PGBlockSource{Pool: pool}),
