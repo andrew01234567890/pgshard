@@ -80,6 +80,10 @@ type Backend struct {
 	lastUsed time.Time
 	txStatus byte
 	broken   bool
+	// credDigest fingerprints the SCRAM keys that authenticated this
+	// backend; an idle backend is only handed to a session presenting the
+	// same keys.
+	credDigest [32]byte
 	// unflushed counts messages buffered in fe but not yet written.
 	unflushed int
 	// prepared names the statements this connection may hold; the set
