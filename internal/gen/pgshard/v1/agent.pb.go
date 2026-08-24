@@ -3053,8 +3053,12 @@ type ReconcilePreparedTransactionsResponse struct {
 	// Commit-decided gids that are neither prepared nor committed here.
 	Contradictions []string `protobuf:"bytes,4,rep,name=contradictions,proto3" json:"contradictions,omitempty"`
 	Error          *Error   `protobuf:"bytes,5,opt,name=error,proto3" json:"error,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Commit-decided gids that are not prepared here and whose recorded
+	// transaction id no longer resolves (frozen, unrecorded or in the
+	// future), so the commit cannot be verified.
+	Unverifiable  []string `protobuf:"bytes,6,rep,name=unverifiable,proto3" json:"unverifiable,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ReconcilePreparedTransactionsResponse) Reset() {
@@ -3118,6 +3122,13 @@ func (x *ReconcilePreparedTransactionsResponse) GetContradictions() []string {
 func (x *ReconcilePreparedTransactionsResponse) GetError() *Error {
 	if x != nil {
 		return x.Error
+	}
+	return nil
+}
+
+func (x *ReconcilePreparedTransactionsResponse) GetUnverifiable() []string {
+	if x != nil {
+		return x.Unverifiable
 	}
 	return nil
 }
@@ -3454,14 +3465,15 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"$ReconcilePreparedTransactionsRequest\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12=\n" +
 	"\tdecisions\x18\x02 \x03(\v2\x1f.pgshard.v1.TransactionDecisionR\tdecisions\x12\x19\n" +
-	"\bshard_id\x18\x03 \x01(\x05R\ashardId\"\xcd\x01\n" +
+	"\bshard_id\x18\x03 \x01(\x05R\ashardId\"\xf1\x01\n" +
 	"%ReconcilePreparedTransactionsResponse\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x1c\n" +
 	"\tcommitted\x18\x02 \x01(\rR\tcommitted\x12\x1f\n" +
 	"\vrolled_back\x18\x03 \x01(\rR\n" +
 	"rolledBack\x12&\n" +
 	"\x0econtradictions\x18\x04 \x03(\tR\x0econtradictions\x12'\n" +
-	"\x05error\x18\x05 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"\\\n" +
+	"\x05error\x18\x05 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\x12\"\n" +
+	"\funverifiable\x18\x06 \x03(\tR\funverifiable\"\\\n" +
 	"\x14SetWriteFenceRequest\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x16\n" +
 	"\x06active\x18\x02 \x01(\bR\x06active\x12\x16\n" +

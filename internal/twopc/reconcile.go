@@ -38,9 +38,14 @@ const (
 	// Contradiction: the log says commit but the participant neither holds
 	// the transaction prepared nor committed it. The restore is inconsistent.
 	Contradiction
+	// Unverifiable: the log says commit, the participant does not hold the
+	// transaction prepared and its transaction id no longer resolves
+	// (frozen past the clog horizon, unrecorded or in the future). Treated
+	// like a contradiction, reported apart.
+	Unverifiable
 )
 
-var actionNames = [...]string{"nothing", "commit", "rollback", "contradiction"}
+var actionNames = [...]string{"nothing", "commit", "rollback", "contradiction", "unverifiable"}
 
 func (a Action) String() string {
 	if int(a) < len(actionNames) {
@@ -49,15 +54,17 @@ func (a Action) String() string {
 	return fmt.Sprintf("Action(%d)", int(a))
 }
 
-// XactStatus is pg_xact_status of the participant's transaction id; empty
-// when the id is unknown or no longer resolvable.
+// XactStatus is pg_xact_status of the participant's transaction id;
+// StatusUnavailable when the id is unknown or no longer resolvable.
 type XactStatus string
 
-// Statuses pg_xact_status reports.
+// Statuses pg_xact_status reports, plus StatusUnavailable for a NULL answer
+// (xid frozen past the clog horizon), a future or an unrecorded id.
 const (
-	StatusCommitted  XactStatus = "committed"
-	StatusAborted    XactStatus = "aborted"
-	StatusInProgress XactStatus = "in progress"
+	StatusCommitted   XactStatus = "committed"
+	StatusAborted     XactStatus = "aborted"
+	StatusInProgress  XactStatus = "in progress"
+	StatusUnavailable XactStatus = ""
 )
 
 // Decide is the decision table. state is the log's decision ("" when the
@@ -72,6 +79,8 @@ func Decide(state string, prepared bool, status XactStatus) Action {
 		return Rollback
 	case state == StateCommit && status == StatusCommitted:
 		return Nothing
+	case state == StateCommit && status == StatusUnavailable:
+		return Unverifiable
 	case state == StateCommit:
 		return Contradiction
 	}
@@ -187,6 +196,9 @@ type Outcome struct {
 	RolledBack int
 	// Contradictions lists the gids the participant cannot honour.
 	Contradictions []string
+	// Unverifiable lists commit-decided gids whose outcome the participant
+	// can neither confirm nor deny (see Unverifiable).
+	Unverifiable []string
 }
 
 // Reconcile applies the decision log to participant shard p. Every
@@ -244,15 +256,17 @@ func apply(ctx context.Context, p Participant, db, gid string, a Action, out *Ou
 		out.RolledBack++
 	case Contradiction:
 		out.Contradictions = append(out.Contradictions, gid)
+	case Unverifiable:
+		out.Unverifiable = append(out.Unverifiable, gid)
 	}
 	return nil
 }
 
 // QueryXactStatus asks conn what became of xid; an unknown, future or
-// frozen id yields "" so the caller treats it as not committed.
+// frozen id yields StatusUnavailable.
 func QueryXactStatus(ctx context.Context, conn Conn, xid string) (XactStatus, error) {
 	if xid == "" {
-		return "", nil
+		return StatusUnavailable, nil
 	}
 	rows, err := conn.Query(ctx, `SELECT coalesce(pg_xact_status($1::xid8), '')`, xid)
 	var s string
@@ -261,7 +275,7 @@ func QueryXactStatus(ctx context.Context, conn Conn, xid string) (XactStatus, er
 	}
 	switch {
 	case isFutureXID(err):
-		return "", nil
+		return StatusUnavailable, nil
 	case err != nil:
 		return "", fmt.Errorf("pg_xact_status(%s): %w", xid, err)
 	}
@@ -272,14 +286,17 @@ func isFutureXID(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "is in the future")
 }
 
-// Contradictions collects the contradictions of several participants as
-// one error, nil when there are none.
+// Contradictions collects the contradictions and unverifiable outcomes of
+// several participants as one error, nil when there are none.
 func Contradictions(byShard map[int32]Outcome) error {
 	shards := slices.Sorted(maps.Keys(byShard))
 	var parts []string
 	for _, shard := range shards {
 		for _, gid := range byShard[shard].Contradictions {
 			parts = append(parts, fmt.Sprintf("shard %d: %s is decided commit but is neither prepared nor committed", shard, gid))
+		}
+		for _, gid := range byShard[shard].Unverifiable {
+			parts = append(parts, fmt.Sprintf("shard %d: %s is decided commit and not prepared, and its transaction id's status is unavailable (frozen, unrecorded or in the future): the commit cannot be verified", shard, gid))
 		}
 	}
 	if len(parts) == 0 {

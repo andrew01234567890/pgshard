@@ -147,13 +147,14 @@ func TestRestoreReconciliationMatrix(t *testing.T) {
 	}
 
 	// Before PREPARE: nothing is prepared and the commit-decided x never
-	// happened here; w never committed either.
+	// happened here; w never committed either. Both ids lie in this
+	// restore's future, so their status is unavailable rather than aborted.
 	b0 := restore("b0", "pgshard-b0")
 	if got := b0.psql("SELECT count(*) FROM pg_prepared_xacts"); got != "0" {
 		t.Fatalf("b0 prepared: %s", got)
 	}
 	r0 := reconcile(b0)
-	if r0.GetCommitted() != 0 || r0.GetRolledBack() != 0 || !slices.Equal(r0.GetContradictions(), []string{"pgshard-x", "pgshard-w"}) {
+	if r0.GetCommitted() != 0 || r0.GetRolledBack() != 0 || len(r0.GetContradictions()) != 0 || !slices.Equal(r0.GetUnverifiable(), []string{"pgshard-x", "pgshard-w"}) {
 		t.Fatalf("b0 outcome %v", r0)
 	}
 	if got := b0.psql("SELECT count(*) FROM t"); got != "0" {

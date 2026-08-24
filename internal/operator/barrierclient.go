@@ -91,7 +91,7 @@ func (c GRPCAgentClient) ReconcilePrepared(ctx context.Context, addr string, epo
 	if err != nil {
 		return twopc.Outcome{}, err
 	}
-	out := twopc.Outcome{Committed: int(resp.GetCommitted()), RolledBack: int(resp.GetRolledBack()), Contradictions: resp.GetContradictions()}
+	out := twopc.Outcome{Committed: int(resp.GetCommitted()), RolledBack: int(resp.GetRolledBack()), Contradictions: resp.GetContradictions(), Unverifiable: resp.GetUnverifiable()}
 	if e := resp.GetError(); e != nil {
 		return out, fmt.Errorf("reconcile prepared transactions: %s", e.GetMessage())
 	}
