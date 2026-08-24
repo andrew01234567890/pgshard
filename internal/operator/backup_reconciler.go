@@ -125,6 +125,7 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 		return ctrl.Result{}, err
 	}
+	ctx = withClusterAgentToken(ctx, r.Client, cluster.Namespace, cluster.Name)
 	pol, err := findBackupPolicy(ctx, r.Client, &cluster)
 	if errors.Is(err, ErrBackupPolicyMissing) {
 		return ctrl.Result{}, r.fail(ctx, &b, err.Error())
@@ -255,6 +256,7 @@ func (r *BackupReconciler) start(ctx context.Context, b *pgshardv1alpha1.PgShard
 		defer close(run.done)
 		runCtx, cancel := context.WithTimeout(baseCtx, backupRunTimeout)
 		defer cancel()
+		runCtx = withClusterAgentToken(runCtx, r.Client, c.Namespace, c.Name)
 		for _, t := range targets {
 			st := pgshardv1alpha1.GroupBackupStatus{Group: t.group.Name(), Stanza: t.stanza, StartedAt: ptrTime(r.now())}
 			res, err := r.Agents.Backup(runCtx, t.addr, typ)

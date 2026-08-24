@@ -27,6 +27,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/internal/agentauth"
 	"github.com/andrew01234567890/pgshard/internal/pgtune"
 
 	"github.com/andrew01234567890/pgshard/internal/metrics"
@@ -164,6 +165,7 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	ctx = agentauth.WithToken(ctx, agentauth.Token(password))
 	if err := r.ensureMemberRBAC(ctx, &cluster); err != nil {
 		return ctrl.Result{}, err
 	}

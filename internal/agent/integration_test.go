@@ -15,8 +15,11 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
+	"github.com/andrew01234567890/pgshard/internal/agentauth"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 )
 
@@ -148,7 +151,10 @@ func (h *harness) start(member string, role Role, source string, peers []string)
 func (n *node) connect() {
 	n.t.Helper()
 	n.http = "http://" + docker(n.t, "port", n.container, "8080/tcp")
-	conn, err := grpc.NewClient(docker(n.t, "port", n.container, "9090/tcp"), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(docker(n.t, "port", n.container, "9090/tcp"), grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+			return invoker(agentauth.WithToken(ctx, agentauth.Token("pgshard-test")), method, req, reply, cc, opts...)
+		}))
 	if err != nil {
 		n.t.Fatal(err)
 	}
@@ -248,6 +254,14 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	if got := p.psql("SHOW wal_log_hints"); got != "on" {
 		t.Fatalf("wal_log_hints=%s", got)
 	}
+	rawConn, err := grpc.NewClient(docker(t, "port", p.container, "9090/tcp"), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pgshardv1.NewAgentClient(rawConn).Status(context.Background(), &pgshardv1.StatusRequest{}); status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("tokenless agent RPC must be rejected, got %v", err)
+	}
+	_ = rawConn.Close()
 	p.psql("CREATE TABLE t (id int primary key, note text)")
 	p.psql("INSERT INTO t VALUES (1, 'first')")
 

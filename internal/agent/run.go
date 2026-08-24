@@ -14,6 +14,7 @@ import (
 
 	"google.golang.org/grpc"
 
+	"github.com/andrew01234567890/pgshard/internal/agentauth"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/metrics"
 )
@@ -112,7 +113,11 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 		}
 	}()
 
-	grpcSrv := grpc.NewServer()
+	password, err := inst.password()
+	if err != nil {
+		return fmt.Errorf("agent auth token: %w", err)
+	}
+	grpcSrv := grpc.NewServer(grpc.UnaryInterceptor(agentauth.UnaryServerInterceptor(agentauth.Token(password))))
 	pgshardv1.RegisterAgentServer(grpcSrv, srv)
 	grpcLn, err := net.Listen("tcp", cfg.GRPCAddr)
 	if err != nil {

@@ -82,6 +82,9 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err != nil {
 		return ctrl.Result{}, r.fail(ctx, &rs, err.Error())
 	}
+	// The new cluster's secret is a copy of the source's, so either yields
+	// the token the restored agents expect.
+	ctx = withClusterAgentToken(ctx, r.Client, rs.Namespace, rs.Spec.ClusterName)
 	var newCluster pgshardv1alpha1.PgShardCluster
 	err = r.Get(ctx, types.NamespacedName{Namespace: rs.Namespace, Name: rs.Spec.NewClusterName}, &newCluster)
 	switch {
