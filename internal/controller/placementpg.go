@@ -312,11 +312,7 @@ func (p *Placer) copySource(ctx context.Context, wf *placementWorkflow, s int32)
 	for {
 		sql := fmt.Sprintf("SELECT %s FROM %s AS src", strings.Join(selectCols, ", "), wf.shape.qualified(wf.spec.TableName))
 		if last != nil {
-			var bounds []string
-			for _, i := range pkIdx {
-				bounds = append(bounds, QuoteLiteral(last.Values[i])+"::"+typeOf[wf.st.Columns[i]])
-			}
-			sql += fmt.Sprintf(" WHERE (%s) > (%s)", strings.Join(pkCols, ", "), strings.Join(bounds, ", "))
+			sql += fmt.Sprintf(" WHERE (%s) > (%s)", strings.Join(pkCols, ", "), strings.Join(keysetBounds(last, pkIdx, wf.st.Columns, typeOf), ", "))
 		}
 		sql += fmt.Sprintf(" ORDER BY %s LIMIT %d", strings.Join(pkCols, ", "), p.copyBatch())
 		rows, err := conn.Query(ctx, sql)
@@ -349,6 +345,18 @@ func (p *Placer) copySource(ctx context.Context, wf *placementWorkflow, s int32)
 		}
 		last = batch[len(batch)-1]
 	}
+}
+
+// keysetBounds renders the typed literals of the resume bound. The values
+// arrive as text; quoteLiteralE keeps a backslash a backslash under
+// standard_conforming_strings=on, or the bound lands past rows and skips
+// them.
+func keysetBounds(last *Tuple, pkIdx []int, columns []string, typeOf map[string]string) []string {
+	var bounds []string
+	for _, i := range pkIdx {
+		bounds = append(bounds, quoteLiteralE(last.Values[i])+"::"+typeOf[columns[i]])
+	}
+	return bounds
 }
 
 func colNames(cols []tableColumn) []string {
@@ -588,6 +596,73 @@ func (p *Placer) unlock(ctx context.Context, wf *placementWorkflow) error {
 	return err
 }
 
+// verifyPlacement compares what the sources hold with what the shadow
+// tables received, before the swap makes the shadows live. Every reference
+// holder must match the source exactly; under any other placement the
+// shadow slices must add up to the source. It runs under the fence after
+// the drain, so both sides are still. A run whose shadows were already
+// renamed (crash between swap and publish) skips the check.
+func (p *Placer) verifyPlacement(ctx context.Context, wf *placementWorkflow) error {
+	var src rowDigest
+	for _, s := range wf.from.Sources() {
+		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, s, wf.spec.Database)
+		if err != nil {
+			return err
+		}
+		hasShadow, err := tableExists(ctx, conn, wf.spec.SchemaName, wf.shadow())
+		if err == nil && !hasShadow {
+			_ = conn.Close(ctx)
+			return nil
+		}
+		var d rowDigest
+		if err == nil {
+			d, err = digest(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, "")
+		}
+		_ = conn.Close(ctx)
+		if err != nil {
+			return err
+		}
+		src = src.add(d)
+	}
+	targets := map[int32]rowDigest{}
+	for _, t := range wf.rt.Holders() {
+		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
+		if err != nil {
+			return err
+		}
+		d, err := digest(ctx, conn, wf.spec.SchemaName, wf.shadow(), "")
+		_ = conn.Close(ctx)
+		if err != nil {
+			return err
+		}
+		targets[t] = d
+	}
+	if mismatches := placementMismatches(wf.spec.To.Placement, src, targets); len(mismatches) > 0 {
+		return fatal("placement verification of %s failed: %s", wf.spec.table(), strings.Join(mismatches, "; "))
+	}
+	return nil
+}
+
+func placementMismatches(placement string, src rowDigest, targets map[int32]rowDigest) []string {
+	var out []string
+	if placement == "reference" {
+		for _, t := range sortedInt32Keys(targets) {
+			if targets[t] != src {
+				out = append(out, fmt.Sprintf("shard %d holds %d rows hash %d, source %d rows hash %d", t, targets[t].Rows, targets[t].Hash, src.Rows, src.Hash))
+			}
+		}
+		return out
+	}
+	var sum rowDigest
+	for _, t := range sortedInt32Keys(targets) {
+		sum = sum.add(targets[t])
+	}
+	if sum != src {
+		out = append(out, fmt.Sprintf("targets hold %d rows hash %d, sources %d rows hash %d", sum.Rows, sum.Hash, src.Rows, src.Hash))
+	}
+	return out
+}
+
 // swapAll renames the tables on every serving shard in one transaction per
 // shard: the shadow becomes the table where the new placement holds it,
 // the previous table becomes <table>__pgshard_old wherever it existed.
@@ -595,20 +670,40 @@ func (p *Placer) unlock(ctx context.Context, wf *placementWorkflow) error {
 // old table's drop does not take them along.
 func (p *Placer) swapAll(ctx context.Context, wf *placementWorkflow) error {
 	for _, t := range wf.rt.ids {
-		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
-		if err != nil {
-			return err
+		slot := ""
+		if slices.Contains(wf.from.Sources(), t) {
+			slot = wf.slotName(t)
 		}
-		err = p.swapOn(ctx, wf, conn, slices.Contains(wf.rt.Holders(), t))
-		_ = conn.Close(ctx)
-		if err != nil {
-			return fmt.Errorf("swap on %s/%d: %w", wf.st.SourceSet, t, err)
+		for attempt := 0; ; attempt++ {
+			conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
+			if err != nil {
+				return err
+			}
+			err = p.swapOn(ctx, wf, conn, slices.Contains(wf.rt.Holders(), t), slot)
+			_ = conn.Close(ctx)
+			if errors.Is(err, errSwapLagged) {
+				if attempt >= 5 {
+					return fmt.Errorf("swap on %s/%d: %w after %d catch-up passes", wf.st.SourceSet, t, err, attempt)
+				}
+				if _, _, cerr := p.catchUp(ctx, wf, true); cerr != nil {
+					return cerr
+				}
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("swap on %s/%d: %w", wf.st.SourceSet, t, err)
+			}
+			break
 		}
 	}
 	return nil
 }
 
-func (p *Placer) swapOn(ctx context.Context, wf *placementWorkflow, conn ShardConn, holder bool) error {
+// errSwapLagged: the slot still held changes for the table when the swap
+// transaction took its lock; the caller applies them and retries.
+var errSwapLagged = errors.New("replication slot still holds changes under the swap lock")
+
+func (p *Placer) swapOn(ctx context.Context, wf *placementWorkflow, conn ShardConn, holder bool, slot string) error {
 	table, shadow, old := wf.shape.qualified(wf.spec.TableName), wf.shape.qualified(wf.shadow()), wf.shape.qualified(wf.old())
 	if _, err := conn.Exec(ctx, "BEGIN"); err != nil {
 		return err
@@ -636,6 +731,26 @@ func (p *Placer) swapOn(ctx context.Context, wf *placementWorkflow, conn ShardCo
 		return nil
 	}
 	if hasTable {
+		if _, err := conn.Exec(ctx, "LOCK TABLE "+table+" IN ACCESS EXCLUSIVE MODE"); err != nil {
+			return err
+		}
+		// The renamed table keeps its OID, so the publication would keep
+		// streaming it: under the lock (no writer can slip in any more)
+		// the slot must hold nothing for this table before the rename.
+		if slot != "" {
+			rows, err := conn.Query(ctx, `SELECT count(*) FROM pg_logical_slot_peek_binary_changes($1, NULL, NULL, 'proto_version', '1', 'publication_names', $2)`,
+				slot, wf.publicationName())
+			if err != nil {
+				return err
+			}
+			pending, err := pgx.CollectExactlyOneRow(rows, pgx.RowTo[int64])
+			if err != nil {
+				return err
+			}
+			if pending > 0 {
+				return fmt.Errorf("%w: %d pending message(s)", errSwapLagged, pending)
+			}
+		}
 		if hasOld {
 			if _, err := conn.Exec(ctx, "DROP TABLE "+old); err != nil {
 				return err

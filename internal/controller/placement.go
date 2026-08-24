@@ -345,6 +345,12 @@ func (p *Placer) drive(ctx context.Context, wf *placementWorkflow) (bool, error)
 	case StagePlacementBuffering:
 		return p.buffer(ctx, wf)
 	case StagePlacementSwapping:
+		if _, _, err := p.catchUp(ctx, wf, true); err != nil {
+			return false, err
+		}
+		if err := p.verifyPlacement(ctx, wf); err != nil {
+			return false, err
+		}
 		if err := p.swapAll(ctx, wf); err != nil {
 			return false, err
 		}

@@ -495,3 +495,47 @@ func TestPlacementMovesOnPostgres(t *testing.T) {
 		t.Fatalf("locks after failures: %d", n)
 	}
 }
+
+// TestPlacementBackslashKeysAndLateWriteOnPostgres moves a table with
+// backslash-bearing text keys to reference placement: the keyset resume
+// bound must not mangle the backslash (skipped rows fail the pre-swap
+// verification), and a write that lands on the source after the drain but
+// before the swap lock must be carried into the shadow before the rename.
+func TestPlacementBackslashKeysAndLateWriteOnPostgres(t *testing.T) {
+	f := newPlacementFixture(t)
+	ctx := context.Background()
+	f.placer.CopyBatch = 7
+	src := f.app(0)
+	mustExec(t, src, `CREATE TABLE notes (id text PRIMARY KEY, v text)`)
+	for i := range 60 {
+		mustExec(t, src, `INSERT INTO notes VALUES ($1, $2)`, fmt.Sprintf(`k\%03d`, i), fmt.Sprintf("v%d", i))
+	}
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement) VALUES ('app', 'public', 'notes', 'unsharded')`)
+	if res := f.reconcile(); res.TablesMadeEffective != 1 {
+		t.Fatalf("%+v", res)
+	}
+	mustExec(t, f.catalog, `UPDATE pgshard.tables SET placement = 'reference' WHERE table_name = 'notes'`)
+	if res := f.reconcile(); res.WorkflowsCreated != 1 {
+		t.Fatalf("%+v", res)
+	}
+
+	id, _ := f.driveUntil("notes", 2*time.Minute, StagePlacementSwapping)
+	wf := f.load(id)
+	mustExec(t, src, `INSERT INTO notes VALUES ('late', 'after-drain')`)
+	if err := f.placer.verifyPlacement(ctx, wf); err == nil || !isFatal(err) {
+		t.Fatalf("verification must flag the shadow behind the source: %v", err)
+	}
+	if err := f.placer.swapAll(ctx, wf); err != nil {
+		t.Fatalf("swapAll: %v", err)
+	}
+	for id := range int32(2) {
+		c := f.app(id)
+		if n := queryOne[int64](t, c, `SELECT count(*) FROM notes WHERE id = 'late'`); n != 1 {
+			t.Fatalf("shard %d: late write lost by the swap", id)
+		}
+		if n := queryOne[int64](t, c, `SELECT count(*) FROM notes WHERE id LIKE 'k%'`); n != 60 {
+			t.Fatalf("shard %d holds %d of 60 backslash-keyed rows", id, n)
+		}
+	}
+	f.driveUntil("notes", time.Minute, StagePlacementRetiring)
+}
