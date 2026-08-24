@@ -200,3 +200,33 @@ func waitFor(t *testing.T, d time.Duration, cond func() bool, msg string) {
 		time.Sleep(500 * time.Millisecond)
 	}
 }
+
+// TestCollectSequencesHeadroomOnPostgres: the carried value covers what a
+// session cache or the WAL pre-log window may already have handed out
+// without moving pg_current_wal_lsn(), clamped to the sequence maximum.
+func TestCollectSequencesHeadroomOnPostgres(t *testing.T) {
+	dsn := startPostgresWith(t)
+	conn := connect(t, dsn)
+	ctx := context.Background()
+	mustExec(t, conn, `CREATE SEQUENCE app_seq CACHE 5`)
+	mustExec(t, conn, `CREATE SEQUENCE tiny_seq MAXVALUE 10`)
+	queryOne[int64](t, conn, `SELECT nextval('app_seq')`)
+	queryOne[int64](t, conn, `SELECT nextval('tiny_seq')`)
+	last := queryOne[int64](t, conn, `SELECT last_value FROM pg_sequences WHERE sequencename = 'app_seq'`)
+	values := map[string]int64{}
+	if err := collectSequences(ctx, pgxShardConn{conn}, values); err != nil {
+		t.Fatal(err)
+	}
+	if got := values["public.app_seq"]; got != last+32 {
+		t.Fatalf("app_seq carried as %d, want last_value %d + 32 headroom", got, last)
+	}
+	if got := values["public.tiny_seq"]; got != 10 {
+		t.Fatalf("tiny_seq carried as %d, want the clamp at max_value 10", got)
+	}
+	if err := applySequences(ctx, pgxShardConn{conn}, values); err != nil {
+		t.Fatal(err)
+	}
+	if next := queryOne[int64](t, conn, `SELECT nextval('app_seq')`); next <= last+32 {
+		t.Fatalf("nextval after the carry: %d, want past %d", next, last+32)
+	}
+}

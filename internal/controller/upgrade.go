@@ -162,9 +162,15 @@ func (o *pgCutover) syncSequences(ctx context.Context, fromSet string, fromIDs [
 }
 
 // collectSequences merges the called sequences of conn into values, keeping
-// the maximum last_value per qualified name.
+// the maximum last_value per qualified name plus a safety headroom: a
+// session may hold up to cache_size values and PostgreSQL pre-logs 32
+// (SEQ_LOG_VALS) per fetch, so nextval calls that consume that headroom
+// move neither pg_current_wal_lsn() nor the on-disk value; without the
+// bump a stale-router nextval between the carry and the flip could hand
+// the target duplicates.
 func collectSequences(ctx context.Context, conn ShardConn, values map[string]int64) error {
-	rows, err := conn.Query(ctx, `SELECT quote_ident(schemaname) || '.' || quote_ident(sequencename), last_value
+	rows, err := conn.Query(ctx, `SELECT quote_ident(schemaname) || '.' || quote_ident(sequencename),
+			least(last_value + greatest(cache_size, 32), max_value)
 		FROM pg_sequences WHERE last_value IS NOT NULL AND schemaname NOT IN ('pgshard', $1) ORDER BY 1`, JournalSchema)
 	if err != nil {
 		return err

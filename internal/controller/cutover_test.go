@@ -350,14 +350,18 @@ func TestCutoverFlipWaitsForLateSourceWrites(t *testing.T) {
 		if err == nil || isFatal(err) {
 			t.Fatalf("pass %d: err %v", i, err)
 		}
-		if h.wf.cutover.Step != StepFlip || strings.Contains(strings.Join(h.ops.calls, ","), StepFlip) {
-			t.Fatalf("pass %d: flip must not run while the sources move (step %s, calls %v)", i, h.wf.cutover.Step, h.ops.calls)
+		if h.wf.cutover.Step != StepSequences || strings.Contains(strings.Join(h.ops.calls, ","), StepFlip) {
+			t.Fatalf("pass %d: movement at the flip must jump back to the sequence carry (step %s, calls %v)", i, h.wf.cutover.Step, h.ops.calls)
 		}
 	}
+	sequenceRuns := strings.Count(strings.Join(h.ops.calls, ","), StepSequences)
 	h.ops.advance = 0
 	h.runUntil(t, StageSwitched)
 	if h.wf.cutover.Positions["0"] != h.ops.lsn {
 		t.Fatalf("positions %v, source at %d", h.wf.cutover.Positions, h.ops.lsn)
+	}
+	if got := strings.Count(strings.Join(h.ops.calls, ","), StepSequences); got <= sequenceRuns {
+		t.Fatalf("sequences must be re-carried after the sources moved: %d runs before settling, %d after", sequenceRuns, got)
 	}
 }
 
