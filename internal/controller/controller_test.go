@@ -20,7 +20,10 @@ import (
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 )
 
-const pgImage = "ghcr.io/andrew01234567890/pgshard-postgres:18"
+const (
+	pgImage   = "ghcr.io/andrew01234567890/pgshard-postgres:18"
+	pgImage19 = "ghcr.io/andrew01234567890/pgshard-postgres:19"
+)
 
 func startPostgres(t *testing.T) string {
 	t.Helper()

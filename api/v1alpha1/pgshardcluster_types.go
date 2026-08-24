@@ -255,6 +255,10 @@ type ClusterReshardStatus struct {
 	Generation int64  `json:"generation"`
 	// Shards is the number of target groups being provisioned.
 	Shards int `json:"shards"`
+	// PGMajor is the PostgreSQL major of the pending set when the run is a
+	// blue/green major upgrade; zero for a topology reshard.
+	// +optional
+	PGMajor int `json:"pgMajor,omitempty"`
 	// +optional
 	Phase string `json:"phase,omitempty"`
 	// RetiredShardSet, RetiredGeneration and RetiredShards describe the
@@ -263,6 +267,9 @@ type ClusterReshardStatus struct {
 	RetiredShardSet string `json:"retiredShardSet,omitempty"`
 	// +optional
 	RetiredGeneration int64 `json:"retiredGeneration,omitempty"`
+	// RetiredPGMajor is the major the retired groups still run.
+	// +optional
+	RetiredPGMajor int `json:"retiredPGMajor,omitempty"`
 	// +optional
 	RetiredShards int `json:"retiredShards,omitempty"`
 }
@@ -310,6 +317,10 @@ type PgShardClusterStatus struct {
 	// after).
 	// +optional
 	ServingGeneration int64 `json:"servingGeneration,omitempty"`
+	// ServingPGMajor is the PostgreSQL major the serving set's groups run,
+	// as stamped in the catalog; zero when the catalog predates upgrades.
+	// +optional
+	ServingPGMajor int `json:"servingPGMajor,omitempty"`
 	// Reshard is the resharding run in flight, if any.
 	// +optional
 	Reshard *ClusterReshardStatus `json:"reshard,omitempty"`

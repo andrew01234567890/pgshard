@@ -101,13 +101,17 @@ func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1al
 		if err := r.Prober.MaterializeShardSet(ctx, dsn, catalog.ShardSetName(gen), gen, catalog.ShardSetServing, ranges); err != nil {
 			return plan, fmt.Errorf("materialize serving shard set: %w", err)
 		}
-		log.Info("materialized serving shard set", "shards", n)
-		serving = &ShardSetInfo{Name: catalog.ShardSetName(gen), Generation: gen, State: catalog.ShardSetServing, Ranges: ranges}
+		if err := r.Prober.SetShardSetMajor(ctx, dsn, catalog.ShardSetName(gen), c.Spec.PostgreSQL.Major); err != nil {
+			return plan, fmt.Errorf("stamp serving shard set major: %w", err)
+		}
+		log.Info("materialized serving shard set", "shards", n, "major", c.Spec.PostgreSQL.Major)
+		serving = &ShardSetInfo{Name: catalog.ShardSetName(gen), Generation: gen, State: catalog.ShardSetServing, Ranges: ranges, PGMajor: c.Spec.PostgreSQL.Major}
 		maxGen = max(maxGen, gen)
 	}
 	effective := len(serving.Ranges)
 	c.Status.EffectiveShards = effective
 	c.Status.ServingGeneration = serving.Generation
+	c.Status.ServingPGMajor = serving.PGMajor
 	want := c.Spec.Shards
 
 	if pending == nil && retired != nil {
@@ -126,10 +130,38 @@ func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1al
 		if err := r.Prober.MaterializeShardSet(ctx, dsn, name, gen, catalog.ShardSetDesired, ranges); err != nil {
 			return plan, fmt.Errorf("materialize pending shard set: %w", err)
 		}
+		if serving.PGMajor != 0 {
+			if err := r.Prober.SetShardSetMajor(ctx, dsn, name, serving.PGMajor); err != nil {
+				return plan, fmt.Errorf("stamp pending shard set major: %w", err)
+			}
+		}
 		log.Info("materialized pending shard set", "set", name, "shards", *want)
-		pending = &ShardSetInfo{Name: name, Generation: gen, State: catalog.ShardSetDesired, Ranges: ranges}
+		pending = &ShardSetInfo{Name: name, Generation: gen, State: catalog.ShardSetDesired, Ranges: ranges, PGMajor: serving.PGMajor}
 		if err := r.ensureReshardRecord(ctx, c, serving, pending, ReshardSourceSpec); err != nil {
 			return plan, err
+		}
+	}
+
+	if pending == nil && (want == nil || *want == effective) && UpgradeRequested(c, serving) {
+		if blockers := UpgradeBlockers(c, nil, plan.placements); len(blockers) > 0 {
+			plan.cond.Status = metav1.ConditionTrue
+			plan.cond.Reason = "UpgradeBlocked"
+			plan.cond.Message = fmt.Sprintf("upgrade to major %d blocked: %s", c.Spec.PostgreSQL.Major, strings.Join(blockers, "; "))
+			log.Info("upgrade blocked", "blockers", blockers)
+		} else {
+			gen := maxGen + 1
+			name := catalog.ShardSetName(gen)
+			if err := r.Prober.MaterializeShardSet(ctx, dsn, name, gen, catalog.ShardSetDesired, serving.Ranges); err != nil {
+				return plan, fmt.Errorf("materialize upgrade shard set: %w", err)
+			}
+			if err := r.Prober.SetShardSetMajor(ctx, dsn, name, c.Spec.PostgreSQL.Major); err != nil {
+				return plan, fmt.Errorf("stamp upgrade shard set major: %w", err)
+			}
+			log.Info("materialized upgrade shard set", "set", name, "from", serving.PGMajor, "to", c.Spec.PostgreSQL.Major)
+			pending = &ShardSetInfo{Name: name, Generation: gen, State: catalog.ShardSetDesired, Ranges: serving.Ranges, PGMajor: c.Spec.PostgreSQL.Major}
+			if err := r.ensureReshardRecord(ctx, c, serving, pending, ReshardSourceSpec); err != nil {
+				return plan, err
+			}
 		}
 	}
 
@@ -205,13 +237,14 @@ func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1al
 	}
 	c.Status.Reshard = &pgshardv1alpha1.ClusterReshardStatus{
 		Name: record.Name, ShardSet: pending.Name, Generation: pending.Generation, Shards: len(pending.Ranges), Phase: phase,
+		PGMajor: pending.PGMajor,
 	}
 	plan.pending, plan.workflow, plan.record = pending, wf, record
 	return plan, r.patchClusterStatus(ctx, c, base)
 }
 
 func (r *ClusterReconciler) patchClusterStatus(ctx context.Context, c, base *pgshardv1alpha1.PgShardCluster) error {
-	if c.Status.EffectiveShards == base.Status.EffectiveShards && c.Status.ServingGeneration == base.Status.ServingGeneration && equalReshard(c.Status.Reshard, base.Status.Reshard) {
+	if c.Status.EffectiveShards == base.Status.EffectiveShards && c.Status.ServingGeneration == base.Status.ServingGeneration && c.Status.ServingPGMajor == base.Status.ServingPGMajor && equalReshard(c.Status.Reshard, base.Status.Reshard) {
 		return nil
 	}
 	return r.Status().Patch(ctx, c, client.MergeFrom(base))
@@ -246,6 +279,11 @@ func (r *ClusterReconciler) mirrorCutoverSpec(ctx context.Context, c *pgshardv1a
 	}
 	if err := r.Prober.SetReshardCutoverSpec(ctx, dsn, wf.ID, c.Spec.Resharding.PauseBefore, proceed, retire); err != nil {
 		return wf, fmt.Errorf("mirror cutover spec: %w", err)
+	}
+	if record.Spec.Mode == pgshardv1alpha1.ReshardModeUpgrade && record.Annotations[pgshardv1alpha1.AnnotationUpgrade] == pgshardv1alpha1.UpgradeActionRollback {
+		if err := r.Prober.SetWorkflowRollback(ctx, dsn, wf.ID); err != nil {
+			return wf, fmt.Errorf("mirror upgrade rollback: %w", err)
+		}
 	}
 	return wf, nil
 }
@@ -295,7 +333,8 @@ func (r *ClusterReconciler) reconcileRetirement(ctx context.Context, c, base *pg
 	plan.cond.Message = fmt.Sprintf("reshard %s: writes switched to %s; %s retiring", record.Name, serving.Name, retired.Name)
 	c.Status.Reshard = &pgshardv1alpha1.ClusterReshardStatus{
 		Name: record.Name, ShardSet: serving.Name, Generation: serving.Generation, Shards: len(serving.Ranges), Phase: phase,
-		RetiredShardSet: retired.Name, RetiredGeneration: retired.Generation, RetiredShards: len(retired.Ranges),
+		PGMajor: serving.PGMajor, RetiredShardSet: retired.Name, RetiredGeneration: retired.Generation, RetiredShards: len(retired.Ranges),
+		RetiredPGMajor: retired.PGMajor,
 	}
 	plan.workflow, plan.record = wf, record
 	return false, r.patchClusterStatus(ctx, c, base)
@@ -345,6 +384,11 @@ func (r *ClusterReconciler) ensureReshardRecord(ctx context.Context, c *pgshardv
 	rec.Spec = pgshardv1alpha1.PgShardReshardSpec{
 		ClusterName: c.Name, FromGeneration: serving.Generation, TargetGeneration: pending.Generation,
 		TargetShardSet: pending.Name, TargetShards: len(pending.Ranges), TargetRanges: ranges,
+		Mode: pgshardv1alpha1.ReshardModeReshard,
+	}
+	if pending.PGMajor != 0 && pending.PGMajor != serving.PGMajor {
+		rec.Spec.Mode = pgshardv1alpha1.ReshardModeUpgrade
+		rec.Spec.TargetMajor = pending.PGMajor
 	}
 	if err := controllerutil.SetControllerReference(c, rec, r.Scheme()); err != nil {
 		return err

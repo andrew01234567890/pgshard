@@ -51,14 +51,14 @@ func TestRolloutOrderPutsStandbysFirstAndPrimaryLast(t *testing.T) {
 func TestClassifyPodDistinguishesReloadFromRestart(t *testing.T) {
 	c := newCluster("cp")
 	g := Groups(c)[1]
-	tpl := Template(c, nil, nil)
+	tpl := Template(c, Group{}, nil, nil)
 	pod := Renderer{}.Pod(c, g, 1, RoleReplica, "cp-shard-0-1", tpl)
 	if s := classifyPod(pod, tpl, false); s.restart || s.reload {
 		t.Fatalf("fresh pod must not be stale: %+v", s)
 	}
 	c2 := c.DeepCopy()
 	c2.Spec.PostgreSQL.Parameters = map[string]string{"work_mem": "16MB"}
-	tpl2 := Template(c2, nil, nil)
+	tpl2 := Template(c2, Group{}, nil, nil)
 	if s := classifyPod(pod, tpl2, false); !s.reload || s.restart {
 		t.Fatalf("settings-only change without the restart flag must reload: %+v", s)
 	}
@@ -67,17 +67,17 @@ func TestClassifyPodDistinguishesReloadFromRestart(t *testing.T) {
 	}
 	c3 := c.DeepCopy()
 	c3.Spec.PostgreSQL.Image = "example.invalid/pg:19"
-	if s := classifyPod(pod, Template(c3, nil, nil), false); !s.restart {
+	if s := classifyPod(pod, Template(c3, Group{}, nil, nil), false); !s.restart {
 		t.Fatalf("image change must restart: %+v", s)
 	}
 	c4 := c.DeepCopy()
 	c4.Annotations = map[string]string{AnnotationRestart: "now"}
-	if s := classifyPod(pod, Template(c4, nil, nil), false); !s.restart {
+	if s := classifyPod(pod, Template(c4, Group{}, nil, nil), false); !s.restart {
 		t.Fatalf("restart token must restart: %+v", s)
 	}
 	c5 := c.DeepCopy()
 	c5.Spec.Resources = corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")}}
-	if s := classifyPod(pod, Template(c5, nil, nil), false); !s.restart {
+	if s := classifyPod(pod, Template(c5, Group{}, nil, nil), false); !s.restart {
 		t.Fatalf("resources change must restart: %+v", s)
 	}
 	if classifyPod(nil, tpl2, true) != (memberStaleness{}) {
@@ -87,20 +87,20 @@ func TestClassifyPodDistinguishesReloadFromRestart(t *testing.T) {
 
 func TestTemplateHashesSplitPodShapeFromSettings(t *testing.T) {
 	c := newCluster("th")
-	first := Template(c, nil, nil).Hash()
-	if Template(c.DeepCopy(), nil, nil).Hash() != first {
+	first := Template(c, Group{}, nil, nil).Hash()
+	if Template(c.DeepCopy(), Group{}, nil, nil).Hash() != first {
 		t.Fatal("hash must be deterministic")
 	}
 	tuned := pgtune.Settings{{Name: "shared_buffers", Value: "1GB"}}
-	if Template(c, nil, nil).Hash() != Template(c, tuned, nil).Hash() {
+	if Template(c, Group{}, nil, nil).Hash() != Template(c, Group{}, tuned, nil).Hash() {
 		t.Fatal("settings must not move the pod hash; their own hash tracks them")
 	}
-	if Template(c, tuned, nil).SettingsHash() == Template(c, nil, nil).SettingsHash() {
+	if Template(c, Group{}, tuned, nil).SettingsHash() == Template(c, Group{}, nil, nil).SettingsHash() {
 		t.Fatal("settings hash must follow the derived settings")
 	}
 	// Overrides win over parameters, as the include order in postgresql.conf does.
 	c.Spec.PostgreSQL.Parameters = map[string]string{"shared_buffers": "64MB"}
-	if got := Template(c, tuned, nil).Settings["shared_buffers"]; got != "1GB" {
+	if got := Template(c, Group{}, tuned, nil).Settings["shared_buffers"]; got != "1GB" {
 		t.Fatalf("override must win: %q", got)
 	}
 }
@@ -208,7 +208,7 @@ func TestConfigMapCarriesOverrideAndSettings(t *testing.T) {
 	if !contains(cm.Data[agentConfigKey(g.MemberName(1))], `"overrideFile": "/etc/pgshard/pgshard.override.conf"`) {
 		t.Fatalf("agent config must point at the override: %s", cm.Data[agentConfigKey(g.MemberName(1))])
 	}
-	if !contains(cm.Data[agentConfigKey(g.MemberName(1))], `"settingsHash": "`+Template(c, tuning, nil).SettingsHash()+`"`) {
+	if !contains(cm.Data[agentConfigKey(g.MemberName(1))], `"settingsHash": "`+Template(c, Group{}, tuning, nil).SettingsHash()+`"`) {
 		t.Fatalf("agent config must carry the settings hash: %s", cm.Data[agentConfigKey(g.MemberName(1))])
 	}
 	got := ConfigMapSettings(cm)

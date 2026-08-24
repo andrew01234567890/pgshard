@@ -88,6 +88,10 @@ type fakeProber struct {
 	cutoverSpecs []string
 }
 
+func (f *fakeProber) SetShardSetMajor(context.Context, string, string, int) error { return nil }
+
+func (f *fakeProber) SetWorkflowRollback(context.Context, string, string) error { return nil }
+
 func (f *fakeProber) SetReshardCutoverSpec(_ context.Context, _ string, id, pause string, proceed []string, retire int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

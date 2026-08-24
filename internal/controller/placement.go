@@ -391,7 +391,7 @@ func (p *Placer) advance(ctx context.Context, wf *placementWorkflow, stage, mess
 // takes the per-table lock and records the routing plan.
 func (p *Placer) prepare(ctx context.Context, wf *placementWorkflow) (bool, error) {
 	var reshards int
-	if err := p.Pool.QueryRow(ctx, `SELECT count(*) FROM pgshard.workflows WHERE kind = $1 AND state = ANY($2)`, KindReshard, activeStates).Scan(&reshards); err != nil {
+	if err := p.Pool.QueryRow(ctx, `SELECT count(*) FROM pgshard.workflows WHERE kind = ANY($1) AND state = ANY($2)`, copyKinds, activeStates).Scan(&reshards); err != nil {
 		return false, err
 	}
 	if reshards > 0 {

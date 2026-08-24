@@ -85,8 +85,8 @@ func TestTemplateAndPodCarryBackupPolicy(t *testing.T) {
 	c := newCluster("demo")
 	g := Groups(c)[1]
 	pol := newPolicy()
-	plain := Template(c, nil, nil)
-	withPol := Template(c, nil, pol)
+	plain := Template(c, Group{}, nil, nil)
+	withPol := Template(c, Group{}, nil, pol)
 	if plain.Hash() == withPol.Hash() {
 		t.Fatal("attaching a policy must change the pod hash (archive_mode needs a restart)")
 	}
@@ -95,7 +95,7 @@ func TestTemplateAndPodCarryBackupPolicy(t *testing.T) {
 	}
 	pol2 := pol.DeepCopy()
 	pol2.Spec.Retention.Full = 9
-	if Template(c, nil, pol2).Hash() == withPol.Hash() {
+	if Template(c, Group{}, nil, pol2).Hash() == withPol.Hash() {
 		t.Fatal("policy change must change the pod hash")
 	}
 	pod := Renderer{}.Pod(c, g, 0, RolePrimary, "pvc", withPol)

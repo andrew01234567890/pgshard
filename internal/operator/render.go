@@ -83,9 +83,9 @@ type MemberTemplate struct {
 // Template computes the desired member template of a group. tuning is the
 // derived override for the group (nil when none applies); pol the backup
 // policy bound to the cluster (nil when none).
-func Template(c *pgshardv1alpha1.PgShardCluster, tuning pgtune.Settings, pol *pgshardv1alpha1.PgShardBackupPolicy) MemberTemplate {
+func Template(c *pgshardv1alpha1.PgShardCluster, g Group, tuning pgtune.Settings, pol *pgshardv1alpha1.PgShardBackupPolicy) MemberTemplate {
 	tpl := MemberTemplate{
-		Image:        Image(c),
+		Image:        ImageFor(c, g),
 		Resources:    c.Spec.Resources,
 		Settings:     effectiveSettings(c.Spec.PostgreSQL.Parameters, tuning),
 		RestartToken: c.Annotations[AnnotationRestart],
@@ -123,7 +123,7 @@ func (t MemberTemplate) SettingsHash() string {
 // AgentConfig renders the pgshard-agent JSON config for one member given
 // the group's current primary.
 func AgentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary string) agent.Config {
-	return agentConfig(c, g, member, primary, Template(c, nil, nil), false, false)
+	return agentConfig(c, g, member, primary, Template(c, g, nil, nil), false, false)
 }
 
 func agentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary string, tpl MemberTemplate, override, repoReady bool) agent.Config {
@@ -179,7 +179,7 @@ func agentConfigKey(member string) string { return member + ".json" }
 // ConfigMap renders the per-member agent configs and the derived override;
 // primary decides which member bootstraps with initdb and which ones clone.
 func (Renderer) ConfigMap(c *pgshardv1alpha1.PgShardCluster, g Group, primary string, tuning pgtune.Settings, pol *pgshardv1alpha1.PgShardBackupPolicy, repoReady bool) *corev1.ConfigMap {
-	tpl := Template(c, tuning, pol)
+	tpl := Template(c, g, tuning, pol)
 	data := map[string]string{}
 	override := OverrideConf(tuning)
 	if override != "" {

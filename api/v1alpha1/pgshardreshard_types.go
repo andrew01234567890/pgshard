@@ -26,6 +26,20 @@ const (
 // (switchWrites, complete) the operator may pass; comma-separated.
 const AnnotationProceed = "pgshard.io/proceed"
 
+// AnnotationUpgrade on a PgShardReshard controls an upgrade-mode run;
+// "rollback" returns serving to the old-major groups while they are still
+// current over reverse replication (before retirement).
+const (
+	AnnotationUpgrade     = "pgshard.io/upgrade"
+	UpgradeActionRollback = "rollback"
+)
+
+// Reshard modes.
+const (
+	ReshardModeReshard = "reshard"
+	ReshardModeUpgrade = "upgrade"
+)
+
 // ReshardRange is one target shard and the inclusive keyspace interval it
 // will own.
 type ReshardRange struct {
@@ -55,6 +69,16 @@ type PgShardReshardSpec struct {
 	TargetShards int `json:"targetShards"`
 	// +kubebuilder:validation:MinItems=1
 	TargetRanges []ReshardRange `json:"targetRanges"`
+	// Mode is reshard (topology change) or upgrade (blue/green major
+	// replacement with a 1:1 range map).
+	// +kubebuilder:validation:Enum=reshard;upgrade
+	// +kubebuilder:default=reshard
+	// +optional
+	Mode string `json:"mode,omitempty"`
+	// TargetMajor is the PostgreSQL major the target groups run; set in
+	// upgrade mode.
+	// +optional
+	TargetMajor int `json:"targetMajor,omitempty"`
 }
 
 // ReshardTargetStatus is the readiness of one target group.

@@ -10,6 +10,7 @@ import (
 
 func main() {
 	os.Exit(cli.RunWith("pgshard-agent", os.Args[1:], os.Stdout, os.Stderr, map[string]cli.Subcommand{
-		"run": agent.RunCommand,
+		"run":     agent.RunCommand,
+		"upgrade": agent.UpgradeCommand,
 	}))
 }

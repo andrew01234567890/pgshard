@@ -57,6 +57,11 @@ type Prober interface {
 	MaterializeShardSet(ctx context.Context, dsn, name string, generation int64, state string, ranges placement.RangeSet) error
 	// DropShardSet removes a shard set with its ranges and status rows.
 	DropShardSet(ctx context.Context, dsn, name string) error
+	// SetShardSetMajor stamps the PostgreSQL major a set's groups run.
+	SetShardSetMajor(ctx context.Context, dsn, name string, major int) error
+	// SetWorkflowRollback asks a switched upgrade workflow to return
+	// serving to the old groups.
+	SetWorkflowRollback(ctx context.Context, dsn, workflowID string) error
 	// ReshardWorkflow returns the active reshard workflow of a shard set;
 	// an empty ID means none exists.
 	ReshardWorkflow(ctx context.Context, dsn, shardSet string) (WorkflowInfo, error)
@@ -186,6 +191,9 @@ type ShardSetInfo struct {
 	Generation int64
 	State      string
 	Ranges     placement.RangeSet
+	// PGMajor is the PostgreSQL major stamped on the set; zero when the
+	// catalog predates upgrades.
+	PGMajor int
 }
 
 // WorkflowInfo is the catalog workflow row of a reshard.
@@ -272,7 +280,11 @@ func (PgxProber) ShardSets(ctx context.Context, dsn string) ([]ShardSetInfo, err
 	}
 	out := make([]ShardSetInfo, 0, len(sets))
 	for _, s := range sets {
-		out = append(out, ShardSetInfo{Name: s.Name, Generation: s.Generation, State: s.State, Ranges: catalog.RangeSet(bySet[s.Name])})
+		info := ShardSetInfo{Name: s.Name, Generation: s.Generation, State: s.State, Ranges: catalog.RangeSet(bySet[s.Name])}
+		if s.PGMajor != nil {
+			info.PGMajor = *s.PGMajor
+		}
+		out = append(out, info)
 	}
 	return out, nil
 }
@@ -304,6 +316,27 @@ func (PgxProber) ReshardWorkflow(ctx context.Context, dsn, shardSet string) (Wor
 		return WorkflowInfo{}, nil
 	}
 	return w, err
+}
+
+// SetShardSetMajor stamps the PostgreSQL major of one shard set.
+func (PgxProber) SetShardSetMajor(ctx context.Context, dsn, name string, major int) error {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	return catalog.SetShardSetMajor(ctx, conn, name, major)
+}
+
+// SetWorkflowRollback asks a switched upgrade workflow to roll back.
+func (PgxProber) SetWorkflowRollback(ctx context.Context, dsn, workflowID string) error {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	_, err = conn.Exec(ctx, `UPDATE pgshard.workflows SET spec = spec || '{"rollback": true}'::jsonb, updated_at = now() WHERE id = $1::uuid`, workflowID)
+	return err
 }
 
 // SetReshardCutoverSpec merges the cutover keys into the workflow spec.
@@ -490,6 +523,18 @@ func (b boundedProber) DropShardSet(ctx context.Context, dsn, name string) error
 	ctx, cancel := b.bound(ctx)
 	defer cancel()
 	return b.Inner.DropShardSet(ctx, dsn, name)
+}
+
+func (b boundedProber) SetShardSetMajor(ctx context.Context, dsn, name string, major int) error {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.SetShardSetMajor(ctx, dsn, name, major)
+}
+
+func (b boundedProber) SetWorkflowRollback(ctx context.Context, dsn, workflowID string) error {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.SetWorkflowRollback(ctx, dsn, workflowID)
 }
 
 func (b boundedProber) ReshardWorkflow(ctx context.Context, dsn, shardSet string) (WorkflowInfo, error) {

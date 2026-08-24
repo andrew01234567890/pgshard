@@ -31,18 +31,19 @@ func (m *cutoverMemStore) NewJournalID(context.Context) (string, error) {
 }
 
 type fakeOps struct {
-	calls     []string
-	gateOpen  bool
-	gateWhy   string
-	drain     []string
-	sweepErr  error
-	caughtUp  bool
-	verify    VerifyReport
-	fail      map[string]error
-	fenced    bool
-	journaled map[string]int
-	lsn       int64
-	advance   int64
+	calls           []string
+	reverseCaughtUp bool
+	gateOpen        bool
+	gateWhy         string
+	drain           []string
+	sweepErr        error
+	caughtUp        bool
+	verify          VerifyReport
+	fail            map[string]error
+	fenced          bool
+	journaled       map[string]int
+	lsn             int64
+	advance         int64
 }
 
 func newFakeOps() *fakeOps {
@@ -82,6 +83,7 @@ func (f *fakeOps) CaughtUp(_ context.Context, pos map[string]int64) (bool, strin
 	return f.caughtUp, "lagging", f.step(StepCatchUp)
 }
 func (f *fakeOps) Verify(context.Context) (VerifyReport, error) { return f.verify, f.step(StepVerify) }
+func (f *fakeOps) Sequences(context.Context) error              { return f.step(StepSequences) }
 func (f *fakeOps) Reverse(context.Context) error                { return f.step(StepReverse) }
 func (f *fakeOps) Journal(_ context.Context, id string) error {
 	f.journaled[id]++
@@ -91,6 +93,15 @@ func (f *fakeOps) Flip(context.Context, string) error { return f.step(StepFlip) 
 func (f *fakeOps) Swap(context.Context) error         { return f.step(StepSwap) }
 func (f *fakeOps) Release(context.Context) error      { f.fenced = false; return f.step(StepRelease) }
 func (f *fakeOps) Complete(context.Context) error     { return f.step("complete") }
+func (f *fakeOps) Rollback(context.Context) error {
+	if err := f.step("rollback"); err != nil {
+		return err
+	}
+	if !f.reverseCaughtUp {
+		return retryf("reverse replication behind")
+	}
+	return nil
+}
 
 type cutoverHarness struct {
 	c     *Copier
@@ -131,7 +142,7 @@ func (h *cutoverHarness) runUntil(t *testing.T, stage string) {
 func TestCutoverHappyPath(t *testing.T) {
 	h := newCutoverHarness(t)
 	h.runUntil(t, StageSwitched)
-	want := []string{"gate", StepFence, StepDrain, StepSweep, StepPositions, StepCatchUp, StepPositions, StepVerify, StepReverse, StepJournal,
+	want := []string{"gate", StepFence, StepDrain, StepSweep, StepPositions, StepCatchUp, StepPositions, StepVerify, StepSequences, StepReverse, StepJournal,
 		StepPositions, StepCatchUp, StepFlip, StepPositions, StepCatchUp, StepSwap, StepRelease}
 	if got := strings.Join(h.ops.calls, ","); got != strings.Join(want, ",") {
 		t.Fatalf("calls %s", got)

@@ -81,6 +81,9 @@ type Group struct {
 	// Retired marks a source of a switched reshard, kept up only for
 	// reverse replication until the old groups are deleted.
 	Retired bool
+	// PGMajor is the PostgreSQL major the group's set runs; zero means the
+	// cluster spec's major.
+	PGMajor int
 }
 
 // Name is the group's short name, unique within the cluster.
@@ -188,7 +191,7 @@ func TargetGroups(c *pgshardv1alpha1.PgShardCluster) []Group {
 	var out []Group
 	for i := 0; i < rs.Shards; i++ {
 		out = append(out, Group{Cluster: c.Name, Kind: "shard", ShardID: i, Replicas: shardReplicas(c), Storage: c.Spec.Storage,
-			Generation: rs.Generation, NonServing: true})
+			Generation: rs.Generation, NonServing: true, PGMajor: rs.PGMajor})
 	}
 	return out
 }
@@ -210,7 +213,7 @@ func RetiredGroups(c *pgshardv1alpha1.PgShardCluster) []Group {
 	var out []Group
 	for i := 0; i < rs.RetiredShards; i++ {
 		out = append(out, Group{Cluster: c.Name, Kind: "shard", ShardID: i, Replicas: shardReplicas(c), Storage: c.Spec.Storage,
-			Generation: rs.RetiredGeneration, Retired: true})
+			Generation: rs.RetiredGeneration, Retired: true, PGMajor: rs.RetiredPGMajor})
 	}
 	return out
 }
@@ -233,9 +236,9 @@ func Groups(c *pgshardv1alpha1.PgShardCluster) []Group {
 	if catalogReplicas < 1 {
 		catalogReplicas = 3
 	}
-	out := []Group{{Cluster: c.Name, Kind: "catalog", Replicas: catalogReplicas, Storage: c.Spec.Catalog.Storage}}
+	out := []Group{{Cluster: c.Name, Kind: "catalog", Replicas: catalogReplicas, Storage: c.Spec.Catalog.Storage, PGMajor: c.Status.ServingPGMajor}}
 	for i := 0; i < shards; i++ {
-		out = append(out, Group{Cluster: c.Name, Kind: "shard", ShardID: i, Replicas: shardReplicas(c), Storage: c.Spec.Storage, Generation: gen})
+		out = append(out, Group{Cluster: c.Name, Kind: "shard", ShardID: i, Replicas: shardReplicas(c), Storage: c.Spec.Storage, Generation: gen, PGMajor: c.Status.ServingPGMajor})
 	}
 	return out
 }
@@ -253,6 +256,27 @@ func Image(c *pgshardv1alpha1.PgShardCluster) string {
 		return c.Spec.PostgreSQL.Image
 	}
 	return fmt.Sprintf("%s:%d", DefaultImageRepository, c.Spec.PostgreSQL.Major)
+}
+
+// MajorFor is the PostgreSQL major a group runs: its own stamp during an
+// upgrade window, the spec's otherwise.
+func MajorFor(c *pgshardv1alpha1.PgShardCluster, g Group) int {
+	if g.PGMajor != 0 {
+		return g.PGMajor
+	}
+	return c.Spec.PostgreSQL.Major
+}
+
+// ImageFor returns the PostgreSQL image for one group: a group stamped
+// with a major other than the spec's (the old side of a blue/green major
+// upgrade, or its targets before the spec flips) runs the default image of
+// its own major, so a spec.postgresql change never restarts groups of the
+// other major mid-upgrade.
+func ImageFor(c *pgshardv1alpha1.PgShardCluster, g Group) string {
+	if g.PGMajor != 0 && g.PGMajor != c.Spec.PostgreSQL.Major {
+		return fmt.Sprintf("%s:%d", DefaultImageRepository, g.PGMajor)
+	}
+	return Image(c)
 }
 
 // ReplicaMinAvailable is the replica PDB's minAvailable: replicas-2 when

@@ -63,12 +63,26 @@ spec:
                 format: int64
                 minimum: 1
                 type: integer
+              mode:
+                default: reshard
+                description: |-
+                  Mode is reshard (topology change) or upgrade (blue/green major
+                  replacement with a 1:1 range map).
+                enum:
+                - reshard
+                - upgrade
+                type: string
               targetGeneration:
                 description: |-
                   TargetGeneration is the pending shard set generation; its catalog
                   name is targetShardSet.
                 format: int64
                 minimum: 2
+                type: integer
+              targetMajor:
+                description: |-
+                  TargetMajor is the PostgreSQL major the target groups run; set in
+                  upgrade mode.
                 type: integer
               targetRanges:
                 items:
