@@ -267,17 +267,36 @@ func (o *pgCutover) CaughtUp(ctx context.Context, positions map[string]int64) (b
 		if err != nil {
 			return false, "", err
 		}
-		want := positions[fmt.Sprint(s)]
-		for _, name := range sortedKeys(flushed) {
-			if flushed[name] < want {
-				behind = append(behind, fmt.Sprintf("%s/%d %s at %d of %d", o.srcSet, s, name, flushed[name], want))
-			}
+		expected := make([]string, 0, len(o.wf.ids))
+		for _, t := range o.wf.ids {
+			expected = append(expected, SubscriptionName(o.wf.gen, t, s))
 		}
+		behind = append(behind, slotsBehind(expected, flushed, positions[fmt.Sprint(s)], fmt.Sprintf("%s/%d", o.srcSet, s))...)
 	}
 	if len(behind) > 0 {
 		return false, "subscriptions behind the source position: " + strings.Join(behind, ", "), nil
 	}
 	return true, "", nil
+}
+
+// slotsBehind lists the expected publisher slots that are missing,
+// unconfirmed, or behind want. Every expected slot must be present with a
+// non-NULL confirmed_flush_lsn at or past want: a slot the query did not
+// return means the subscription (or its slot) is gone, not that nothing is
+// left to apply, so its absence must never read as caught-up.
+func slotsBehind(expected []string, flushed map[string]int64, want int64, at string) []string {
+	var out []string
+	for _, name := range expected {
+		switch v, ok := flushed[name]; {
+		case !ok:
+			out = append(out, fmt.Sprintf("%s %s missing", at, name))
+		case v < 0:
+			out = append(out, fmt.Sprintf("%s %s has no confirmed flush position", at, name))
+		case v < want:
+			out = append(out, fmt.Sprintf("%s %s at %d of %d", at, name, v, want))
+		}
+	}
+	return out
 }
 
 // slotFlushPositions reads confirmed_flush_lsn of every replication slot
