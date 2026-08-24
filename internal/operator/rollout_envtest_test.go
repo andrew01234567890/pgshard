@@ -296,7 +296,7 @@ func TestStorageClassChangeRebuildsMembersOntoNewClaims(t *testing.T) {
 	if cat := groupStatus(t, "sc-catalog"); cat.Rollout != nil {
 		t.Fatalf("catalog storage is unchanged: %+v", cat.Rollout)
 	}
-	get(t, "sc-shard-0-1", &corev1.PersistentVolumeClaim{})
+	retiredClaimAlive(t, "sc-shard-0-1")
 
 	reconcile(t, r, c)
 	var pod corev1.Pod
@@ -313,7 +313,7 @@ func TestStorageClassChangeRebuildsMembersOntoNewClaims(t *testing.T) {
 	if !found {
 		t.Fatalf("group status must track the claim: %+v", groupStatus(t, "sc-shard-0").Members)
 	}
-	get(t, "sc-shard-0-1", &corev1.PersistentVolumeClaim{})
+	retiredClaimAlive(t, "sc-shard-0-1")
 
 	memberBack(t, fp, fa, "sc-shard-0-1", podIP(1, 1))
 	reconcile(t, r, c)
@@ -394,4 +394,16 @@ func setupHealthy(t *testing.T, r *ClusterReconciler, c *pgshardv1alpha1.PgShard
 		t.Fatalf("cluster must be Ready before the scenario: %+v", cond)
 	}
 	return r, fp, fa, c
+}
+
+// retiredClaimAlive asserts the old claim is neither gone nor marked for
+// deletion: envtest keeps deleted PVCs around with a DeletionTimestamp, so
+// a plain Get would not notice an early delete.
+func retiredClaimAlive(t *testing.T, name string) {
+	t.Helper()
+	var pvc corev1.PersistentVolumeClaim
+	get(t, name, &pvc)
+	if pvc.DeletionTimestamp != nil {
+		t.Fatalf("retired claim %s deleted before the successor settled", name)
+	}
 }
