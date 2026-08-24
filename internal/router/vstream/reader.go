@@ -7,10 +7,12 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
+	"github.com/andrew01234567890/pgshard/internal/pooler"
 	"github.com/andrew01234567890/pgshard/internal/router"
 )
 
@@ -18,9 +20,11 @@ import (
 // standalone event (commit/rollback of a prepared transaction or a
 // non-transactional message), a bare position advance, or a terminal error.
 type unit struct {
-	shard    router.Shard
-	events   []*pgshardv1.VEvent
-	rels     []*relMeta
+	shard  router.Shard
+	events []*pgshardv1.VEvent
+	// rels[i] is the relation metadata a consumer must have seen before
+	// events[i]; a Row carries one, a Truncate one per truncated table.
+	rels     [][]*relMeta
 	xids     []uint32
 	endLSN   uint64
 	commitTS int64
@@ -124,7 +128,13 @@ func fatal(err error, sh router.Shard) *pgshardv1.VEvent_Error {
 		return nil
 	}
 	code := pgshardv1.VEvent_Error_CODE_INTERNAL
-	if strings.Contains(st.Message(), "start replication") {
+	for _, d := range st.Details() {
+		if info, ok := d.(*errdetails.ErrorInfo); ok && info.GetReason() == pooler.ReasonPositionTooOld {
+			code = pgshardv1.VEvent_Error_CODE_POSITION_TOO_OLD
+		}
+	}
+	// Poolers from before the structured detail only carry the text.
+	if code == pgshardv1.VEvent_Error_CODE_INTERNAL && strings.Contains(st.Message(), "start replication") {
 		code = pgshardv1.VEvent_Error_CODE_POSITION_TOO_OLD
 	}
 	return &pgshardv1.VEvent_Error{Code: code, Message: fmt.Sprintf("shard %s/%d: %s", sh.Set, sh.ID, st.Message()), Shard: shardRef(sh)}
@@ -210,7 +220,7 @@ func (a *assembler) reset() {
 }
 
 func (a *assembler) open(ev *pgshardv1.VEvent, ts int64) *unit {
-	return &unit{shard: a.shard, events: []*pgshardv1.VEvent{ev}, rels: []*relMeta{nil}, xids: []uint32{0}, commitTS: ts, position: true}
+	return &unit{shard: a.shard, events: []*pgshardv1.VEvent{ev}, rels: [][]*relMeta{nil}, xids: []uint32{0}, commitTS: ts, position: true}
 }
 
 func (a *assembler) target() *unit {
@@ -220,12 +230,12 @@ func (a *assembler) target() *unit {
 	return a.cur
 }
 
-func (a *assembler) append(u *unit, ev *pgshardv1.VEvent, rel *relMeta, xid uint32) {
+func (a *assembler) append(u *unit, ev *pgshardv1.VEvent, xid uint32, rels ...*relMeta) {
 	if u == nil {
 		return
 	}
 	u.events = append(u.events, ev)
-	u.rels = append(u.rels, rel)
+	u.rels = append(u.rels, rels)
 	u.xids = append(u.xids, xid)
 }
 
@@ -247,7 +257,7 @@ func (a *assembler) add(ev *pgshardv1.ChangeEvent) (*unit, error) {
 		if u == nil {
 			return nil, nil
 		}
-		a.append(u, &pgshardv1.VEvent{Event: &pgshardv1.VEvent_Commit_{Commit: &pgshardv1.VEvent_Commit{Shard: sh, Lsn: e.Commit.GetCommitLsn(), EndLsn: e.Commit.GetEndLsn()}}}, nil, 0)
+		a.append(u, &pgshardv1.VEvent{Event: &pgshardv1.VEvent_Commit_{Commit: &pgshardv1.VEvent_Commit{Shard: sh, Lsn: e.Commit.GetCommitLsn(), EndLsn: e.Commit.GetEndLsn()}}}, 0)
 		u.endLSN = e.Commit.GetEndLsn()
 		return u, nil
 	case *pgshardv1.ChangeEvent_BeginPrepare_:
@@ -258,7 +268,7 @@ func (a *assembler) add(ev *pgshardv1.ChangeEvent) (*unit, error) {
 		if u == nil {
 			return nil, nil
 		}
-		a.append(u, &pgshardv1.VEvent{Event: &pgshardv1.VEvent_Prepare_{Prepare: &pgshardv1.VEvent_Prepare{Shard: sh, Gid: e.Prepare.GetGid(), Lsn: e.Prepare.GetPrepareLsn()}}}, nil, 0)
+		a.append(u, &pgshardv1.VEvent{Event: &pgshardv1.VEvent_Prepare_{Prepare: &pgshardv1.VEvent_Prepare{Shard: sh, Gid: e.Prepare.GetGid(), Lsn: e.Prepare.GetPrepareLsn()}}}, 0)
 		u.endLSN = e.Prepare.GetEndLsn()
 		return u, nil
 	case *pgshardv1.ChangeEvent_CommitPrepared_:
@@ -283,21 +293,23 @@ func (a *assembler) add(ev *pgshardv1.ChangeEvent) (*unit, error) {
 		if e.Row.GetNew() != nil {
 			row.New = tuple(e.Row.GetNew(), e.Row.GetUnchangedToast())
 		}
-		a.append(a.target(), &pgshardv1.VEvent{Event: &pgshardv1.VEvent_Row_{Row: row}}, rel, ev.GetXid())
+		a.append(a.target(), &pgshardv1.VEvent{Event: &pgshardv1.VEvent_Row_{Row: row}}, ev.GetXid(), rel)
 	case *pgshardv1.ChangeEvent_Truncate_:
 		t := &pgshardv1.VEvent_Truncate{Shard: sh, Cascade: e.Truncate.GetCascade(), RestartIdentity: e.Truncate.GetRestartIdentity()}
+		var rels []*relMeta
 		for _, id := range e.Truncate.GetRelationIds() {
 			if rel, ok := a.relations[id]; ok {
 				t.Tables = append(t.Tables, &pgshardv1.VEvent_Truncate_Table{Schema: rel.schema, Table: rel.table})
+				rels = append(rels, rel)
 			}
 		}
-		a.append(a.target(), &pgshardv1.VEvent{Event: &pgshardv1.VEvent_Truncate_{Truncate: t}}, nil, ev.GetXid())
+		a.append(a.target(), &pgshardv1.VEvent{Event: &pgshardv1.VEvent_Truncate_{Truncate: t}}, ev.GetXid(), rels...)
 	case *pgshardv1.ChangeEvent_Message_:
 		msg := &pgshardv1.VEvent{Event: &pgshardv1.VEvent_Message_{Message: &pgshardv1.VEvent_Message{Shard: sh, Prefix: e.Message.GetPrefix(), Content: e.Message.GetContent(), Transactional: e.Message.GetTransactional()}}}
 		if !e.Message.GetTransactional() {
-			return &unit{shard: a.shard, events: []*pgshardv1.VEvent{msg}, rels: []*relMeta{nil}, xids: []uint32{0}}, nil
+			return &unit{shard: a.shard, events: []*pgshardv1.VEvent{msg}, rels: [][]*relMeta{nil}, xids: []uint32{0}}, nil
 		}
-		a.append(a.target(), msg, nil, ev.GetXid())
+		a.append(a.target(), msg, ev.GetXid())
 	case *pgshardv1.ChangeEvent_Keepalive_:
 		if a.idle() && e.Keepalive.GetWalEnd() > 0 {
 			return &unit{shard: a.shard, endLSN: e.Keepalive.GetWalEnd(), position: true}, nil
@@ -318,7 +330,7 @@ func (a *assembler) add(ev *pgshardv1.ChangeEvent) (*unit, error) {
 		}
 		u.events[0].GetBegin().CommitTs = e.StreamCommit.GetCommitTs()
 		u.commitTS = e.StreamCommit.GetCommitTs()
-		a.append(u, &pgshardv1.VEvent{Event: &pgshardv1.VEvent_Commit_{Commit: &pgshardv1.VEvent_Commit{Shard: sh, Lsn: e.StreamCommit.GetCommitLsn(), EndLsn: e.StreamCommit.GetEndLsn()}}}, nil, 0)
+		a.append(u, &pgshardv1.VEvent{Event: &pgshardv1.VEvent_Commit_{Commit: &pgshardv1.VEvent_Commit{Shard: sh, Lsn: e.StreamCommit.GetCommitLsn(), EndLsn: e.StreamCommit.GetEndLsn()}}}, 0)
 		u.endLSN = e.StreamCommit.GetEndLsn()
 		return u, nil
 	case *pgshardv1.ChangeEvent_StreamPrepare_:
@@ -330,7 +342,7 @@ func (a *assembler) add(ev *pgshardv1.ChangeEvent) (*unit, error) {
 		u.events[0].GetBegin().CommitTs = e.StreamPrepare.GetPrepareTs()
 		u.events[0].GetBegin().Gid = e.StreamPrepare.GetGid()
 		u.commitTS = e.StreamPrepare.GetPrepareTs()
-		a.append(u, &pgshardv1.VEvent{Event: &pgshardv1.VEvent_Prepare_{Prepare: &pgshardv1.VEvent_Prepare{Shard: sh, Gid: e.StreamPrepare.GetGid(), Lsn: e.StreamPrepare.GetPrepareLsn()}}}, nil, 0)
+		a.append(u, &pgshardv1.VEvent{Event: &pgshardv1.VEvent_Prepare_{Prepare: &pgshardv1.VEvent_Prepare{Shard: sh, Gid: e.StreamPrepare.GetGid(), Lsn: e.StreamPrepare.GetPrepareLsn()}}}, 0)
 		u.endLSN = e.StreamPrepare.GetEndLsn()
 		return u, nil
 	case *pgshardv1.ChangeEvent_StreamAbort_:

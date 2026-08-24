@@ -264,7 +264,10 @@ func (m *merger) slowestOther(self router.Shard) (int64, bool) {
 
 func (m *merger) emit(u *unit) error {
 	for i, ev := range u.events {
-		if rel := u.rels[i]; rel != nil {
+		for _, rel := range u.rels[i] {
+			if rel == nil {
+				continue
+			}
 			key := rel.schema + "." + rel.table
 			if m.sentRel[key] != rel.signature {
 				if err := m.send(rel.event()); err != nil {

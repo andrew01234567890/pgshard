@@ -11,10 +11,12 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
+	"github.com/andrew01234567890/pgshard/internal/pooler"
 )
 
 var update = os.Getenv("UPDATE_GOLDEN") != ""
@@ -373,6 +375,15 @@ func TestGenerationChangeMidStream(t *testing.T) {
 	}
 }
 
+func positionTooOldStatus() error {
+	st, err := status.Newf(codes.FailedPrecondition, "replication cannot resume from the requested LSN (58P01)").
+		WithDetails(&errdetails.ErrorInfo{Reason: pooler.ReasonPositionTooOld, Domain: pooler.ErrorDomain})
+	if err != nil {
+		panic(err)
+	}
+	return st.Err()
+}
+
 func TestShardStreamErrors(t *testing.T) {
 	cases := []struct {
 		name string
@@ -380,6 +391,7 @@ func TestShardStreamErrors(t *testing.T) {
 		want string
 	}{
 		{"slot invalidated", status.Error(codes.FailedPrecondition, "start replication: can no longer get changes from replication slot (55000)"), "error POSITION_TOO_OLD shard=0"},
+		{"structured position too old", positionTooOldStatus(), "error POSITION_TOO_OLD shard=0"},
 		{"not configured", status.Error(codes.FailedPrecondition, "change streams are not configured on this pooler"), "error INTERNAL shard=0"},
 		{"unavailable past the window", status.Error(codes.Unavailable, "replication connection: refused"), "error SHARD_UNAVAILABLE shard=0"},
 	}
@@ -577,5 +589,30 @@ func TestBackpressureBoundsShardBuffering(t *testing.T) {
 	got := recvN(t, st, 1+200*4, 20*time.Second)
 	if describe(got[len(got)-1]) != "vgtid gen=7 {0:2000}" {
 		t.Fatalf("last = %s", describe(got[len(got)-1]))
+	}
+}
+
+func TestTruncateIsPrecededByItsRelation(t *testing.T) {
+	h := newHarness(t, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st := h.open(ctx, &pgshardv1.VStreamRequest_Start{Stream: "orders"})
+	p := h.pool[0]
+	p.feed("orders", batch(0, evRelation(1, "orders", "id", "name")))
+	p.feed("orders", batch(100, evBegin(5, 10),
+		&pgshardv1.ChangeEvent{Event: &pgshardv1.ChangeEvent_Truncate_{Truncate: &pgshardv1.ChangeEvent_Truncate{RelationIds: []uint32{1}}}},
+		evCommit(90, 100)))
+	got := lines(recvN(t, st, 5, 5*time.Second))
+	relAt, truncAt := -1, -1
+	for i, l := range got {
+		if strings.HasPrefix(l, "relation public.orders") && relAt == -1 {
+			relAt = i
+		}
+		if strings.HasPrefix(l, "truncate") {
+			truncAt = i
+		}
+	}
+	if relAt == -1 || truncAt == -1 || relAt > truncAt {
+		t.Fatalf("truncate without a prior relation:\n%s", strings.Join(got, "\n"))
 	}
 }
