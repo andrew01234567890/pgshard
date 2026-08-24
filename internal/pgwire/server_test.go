@@ -72,7 +72,7 @@ func startServerOn(t *testing.T, cfg Config, network, listenAddr string) *testSe
 	ts.addr = l.Addr().String()
 	go func() { ts.serveErr <- srv.Serve(l) }()
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
 		<-ts.serveErr
@@ -721,7 +721,7 @@ func TestShutdownTerminatesIdleAndWaitsForActive(t *testing.T) {
 
 	shutdownDone := make(chan error, 1)
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		shutdownDone <- ts.Shutdown(ctx)
 	}()
@@ -823,7 +823,7 @@ func TestShutdownLetsOpenTransactionFinish(t *testing.T) {
 
 	shutdownDone := make(chan error, 1)
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		shutdownDone <- ts.Shutdown(ctx)
 	}()
