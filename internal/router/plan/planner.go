@@ -59,6 +59,9 @@ func (p *Planner) Plan(ctx context.Context, sess Session, sql string) (Plan, err
 	if err := w.statement(raw.GetStmt()); err != nil {
 		return refusalErr(err)
 	}
+	if err := w.hideRewriteColumns(); err != nil {
+		return refusalErr(err)
+	}
 	pl.Class.Write = pl.Kind != SessionLocal && (w.stmt != "SELECT" || w.locking)
 	if pl.merge != nil && raw.GetStmt().GetSelectStmt() == nil {
 		pl.merge, pl.mergeErr = nil, notYet("only a plain SELECT can run on multiple shards", "filter on one shard key value")
@@ -221,6 +224,10 @@ type rel struct {
 	shardKey string
 	// seqCols are the registered sequence columns of a sharded table.
 	seqCols []string
+	// hidden and visible are the migration working columns and the
+	// client-visible column list of a table under an online rewrite.
+	hidden  []string
+	visible []string
 	// terms are the key predicates found for this relation.
 	terms []keyTerm
 	// scatter marks a sharded relation without any key predicate.
@@ -305,6 +312,7 @@ func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
 		case "reference":
 			r.kind = placeReference
 		}
+		r.hidden, r.visible = pl.HiddenColumns, pl.VisibleColumns
 		return r, nil
 	}
 	if snap != nil {
@@ -389,12 +397,7 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 	case *pgquerypb.Node_LockStmt:
 		return w.maintenanceList("LOCK TABLE", n.LockStmt.GetRelations())
 	case *pgquerypb.Node_VacuumStmt:
-		for _, item := range n.VacuumStmt.GetRels() {
-			if err := w.maintenance("VACUUM and ANALYZE", item.GetVacuumRelation().GetRelation()); err != nil {
-				return err
-			}
-		}
-		return nil
+		return w.vacuum(n.VacuumStmt)
 	case *pgquerypb.Node_CreateSchemaStmt:
 		return w.migration(Migration{Kind: "CREATE SCHEMA", Scope: ScopeAll,
 			Object: ObjectRef{Kind: "schema", Name: n.CreateSchemaStmt.GetSchemaname(), Expect: objectPresent}})

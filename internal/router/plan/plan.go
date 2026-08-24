@@ -136,6 +136,10 @@ type Plan struct {
 	NextVal string
 	// Migration describes a DDL/DCL statement of Kind MigrationKind.
 	Migration *Migration
+	// Rewritten, when set, is the statement text the shards run instead of
+	// the client's: stars and column lists expanded so the working column
+	// of an online rewrite migration stays invisible.
+	Rewritten string
 
 	// merge is how the executor combines shard streams when the plan runs
 	// on more than one shard; mergeErr says why it cannot.

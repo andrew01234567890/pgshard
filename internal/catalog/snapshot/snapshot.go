@@ -46,6 +46,13 @@ type Placement struct {
 	// SequenceColumns are the columns of a sharded table the router fills
 	// from the catalog's global sequences.
 	SequenceColumns []string
+	// HiddenColumns are the working columns of an in-flight rewrite
+	// migration; the router never lets clients see or name them.
+	HiddenColumns []string
+	// VisibleColumns is the client-visible column list of a table under
+	// rewrite, recorded by the applier, in attribute order. Empty until
+	// the applier records it (before any hidden column exists).
+	VisibleColumns []string
 }
 
 // Snapshot is an immutable view of the catalog taken in one transaction.

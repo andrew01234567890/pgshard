@@ -21,6 +21,7 @@ type memStore struct {
 	mu         sync.Mutex
 	migrations []catalog.DDLMigration
 	shards     []int32
+	dbs        []string
 	execs      []string
 	saves      int
 }
@@ -35,6 +36,20 @@ func (s *memStore) Pending(context.Context) ([]catalog.DDLMigration, error) {
 		}
 	}
 	return out, nil
+}
+
+func (s *memStore) Databases(context.Context) ([]string, error) { return s.dbs, nil }
+
+func (s *memStore) SaveMeta(_ context.Context, id string, meta catalog.MigrationMeta) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.migrations {
+		if s.migrations[i].ID == id {
+			s.migrations[i].Meta = meta
+			return nil
+		}
+	}
+	return fmt.Errorf("unknown migration %s", id)
 }
 
 func cloneMigration(m catalog.DDLMigration) catalog.DDLMigration {
@@ -95,6 +110,16 @@ type fakeShards struct {
 	rolsuper func(shard int32, name string) bool
 	check    func(shard int32, kind, table, name string) bool
 	dialErr  func(shard int32) error
+	// rewrite scripting
+	columns      []string
+	pks          []string
+	hiddenExists func(shard int32) bool
+	oldDefault   string
+	oldNotNull   bool
+	nnPending    bool
+	version      int
+	affected     func(shard int32, sql string) int64
+	sweepDrops   []string
 }
 
 func newFakeShards() *fakeShards {
@@ -164,10 +189,31 @@ func (c *fakeConn) Exec(_ context.Context, sql string, _ ...any) (pgconnTag, err
 			return pgconn.CommandTag{}, err
 		}
 	}
+	if c.f.affected != nil {
+		return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", c.f.affected(c.id, sql))), nil
+	}
 	return pgconn.CommandTag{}, nil
 }
 
 func (c *fakeConn) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
+	switch {
+	case strings.Contains(sql, "server_version_num"):
+		return &intRows{vals: []int{c.f.version}}, nil
+	case strings.Contains(sql, "attname NOT LIKE"):
+		c.log("read columns")
+		return &stringRows{vals: c.f.columns}, nil
+	case strings.Contains(sql, "indisprimary"):
+		return &stringRows{vals: c.f.pks}, nil
+	case strings.Contains(sql, "pg_get_expr"):
+		return &factsRows{def: c.f.oldDefault, notNull: c.f.oldNotNull}, nil
+	case strings.Contains(sql, "NOT convalidated"):
+		return &boolRows{vals: []bool{c.f.nnPending}}, nil
+	case strings.Contains(sql, "attisdropped)"):
+		v := c.f.hiddenExists == nil || c.f.hiddenExists(c.id)
+		return &boolRows{vals: []bool{v}}, nil
+	case strings.Contains(sql, "DROP TRIGGER IF EXISTS %I"):
+		return &stringRows{vals: c.f.sweepDrops}, nil
+	}
 	name, _ := args[0].(string)
 	if strings.Contains(sql, "WHERE i.indisvalid") {
 		c.f.mu.Lock()
@@ -248,6 +294,75 @@ func (r *boolRows) Scan(dest ...any) error {
 func (r *boolRows) Values() ([]any, error) { return []any{r.vals[r.i-1]}, nil }
 func (r *boolRows) RawValues() [][]byte    { return nil }
 func (r *boolRows) Conn() *pgx.Conn        { return nil }
+
+func (c *fakeConn) log(what string) {
+	c.f.mu.Lock()
+	defer c.f.mu.Unlock()
+	if c.superuser {
+		c.f.super[c.id] = append(c.f.super[c.id], what)
+	} else {
+		c.f.ran[c.id] = append(c.f.ran[c.id], what)
+	}
+}
+
+// stringRows is a one-column pgx.Rows of strings.
+type stringRows struct {
+	vals []string
+	i    int
+}
+
+func (r *stringRows) Close()                                       {}
+func (r *stringRows) Err() error                                   { return nil }
+func (r *stringRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (r *stringRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (r *stringRows) Next() bool                                   { r.i++; return r.i <= len(r.vals) }
+func (r *stringRows) Scan(dest ...any) error {
+	*(dest[0].(*string)) = r.vals[r.i-1]
+	return nil
+}
+func (r *stringRows) Values() ([]any, error) { return []any{r.vals[r.i-1]}, nil }
+func (r *stringRows) RawValues() [][]byte    { return nil }
+func (r *stringRows) Conn() *pgx.Conn        { return nil }
+
+// intRows is a one-column pgx.Rows of ints.
+type intRows struct {
+	vals []int
+	i    int
+}
+
+func (r *intRows) Close()                                       {}
+func (r *intRows) Err() error                                   { return nil }
+func (r *intRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (r *intRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (r *intRows) Next() bool                                   { r.i++; return r.i <= len(r.vals) }
+func (r *intRows) Scan(dest ...any) error {
+	*(dest[0].(*int)) = r.vals[r.i-1]
+	return nil
+}
+func (r *intRows) Values() ([]any, error) { return []any{r.vals[r.i-1]}, nil }
+func (r *intRows) RawValues() [][]byte    { return nil }
+func (r *intRows) Conn() *pgx.Conn        { return nil }
+
+// factsRows is the (default, not null) row of columnFacts.
+type factsRows struct {
+	def     string
+	notNull bool
+	i       int
+}
+
+func (r *factsRows) Close()                                       {}
+func (r *factsRows) Err() error                                   { return nil }
+func (r *factsRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (r *factsRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (r *factsRows) Next() bool                                   { r.i++; return r.i <= 1 }
+func (r *factsRows) Scan(dest ...any) error {
+	*(dest[0].(*string)) = r.def
+	*(dest[1].(*bool)) = r.notNull
+	return nil
+}
+func (r *factsRows) Values() ([]any, error) { return []any{r.def, r.notNull}, nil }
+func (r *factsRows) RawValues() [][]byte    { return nil }
+func (r *factsRows) Conn() *pgx.Conn        { return nil }
 
 func pgErr(code, msg string) error {
 	return &pgconn.PgError{Severity: "ERROR", Code: code, Message: msg}

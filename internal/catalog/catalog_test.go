@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"reflect"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -449,6 +450,79 @@ func runSuite(t *testing.T, img pgImage) {
 		}
 		if len(dbs) != 2 || dbs[0].Name != "app" {
 			t.Fatalf("unexpected databases %+v", dbs)
+		}
+	})
+
+	t.Run("rewrite_migration_round_trips_and_lists_as_pending", func(t *testing.T) {
+		rw := &RewriteChange{Schema: "public", Table: "orders", Column: "amount", NewType: "bigint",
+			Using: "amount::bigint", BatchSize: 500}
+		id, err := EnqueueMigration(ctx, conn, DDLMigration{Database: "app", Statement: "alter table orders alter column amount type bigint",
+			Kind: "ALTER TABLE", Strategy: StrategyRewrite, Scope: "all", Meta: MigrationMeta{RunAs: "app", Rewrite: rw}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, err := LoadMigration(ctx, conn, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.Strategy != StrategyRewrite || m.Meta.Rewrite == nil || !reflect.DeepEqual(m.Meta.Rewrite, rw) {
+			t.Fatalf("round trip %+v", m)
+		}
+		if _, err := EnqueueMigration(ctx, conn, DDLMigration{Database: "app", Statement: "x", Kind: "ALTER TABLE", Strategy: StrategyRewrite, Scope: "all"}); err == nil {
+			t.Fatal("a rewrite migration without meta.rewrite must be refused")
+		}
+		pending, err := PendingRewrites(ctx, conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, p := range pending {
+			if p.ID == id && p.Database == "app" && p.Rewrite.Column == "amount" {
+				found = true
+				if got := p.Rewrite.HiddenColumn(p.ID); !strings.HasPrefix(got, "_pgshard_amount_") || len(got) != len("_pgshard_amount_")+8 {
+					t.Fatalf("hidden column %q", got)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("pending rewrites: %+v", pending)
+		}
+		m.Meta.Rewrite.Columns = []string{"id", "amount"}
+		if err := SaveMigrationMeta(ctx, conn, id, m.Meta); err != nil {
+			t.Fatal(err)
+		}
+		again, err := LoadMigration(ctx, conn, id)
+		if err != nil || len(again.Meta.Rewrite.Columns) != 2 {
+			t.Fatalf("meta not saved: %+v %v", again.Meta.Rewrite, err)
+		}
+		m.State = MigrationComplete
+		if err := SaveMigrationProgress(ctx, conn, m); err != nil {
+			t.Fatal(err)
+		}
+		pending, err = PendingRewrites(ctx, conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range pending {
+			if p.ID == id {
+				t.Fatal("a complete rewrite must not be pending")
+			}
+		}
+	})
+
+	t.Run("repack_migration_round_trips_as_concurrent", func(t *testing.T) {
+		id, err := EnqueueMigration(ctx, conn, DDLMigration{Database: "app", Statement: "vacuum (full) orders",
+			Kind: "VACUUM", Strategy: StrategyRepack, Scope: "all",
+			Meta: MigrationMeta{Object: MigrationObject{Kind: "relation", Name: "orders", Expect: "present"}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, err := LoadMigration(ctx, conn, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.Strategy != StrategyRepack || !m.Meta.Repack {
+			t.Fatalf("round trip %+v", m)
 		}
 	})
 

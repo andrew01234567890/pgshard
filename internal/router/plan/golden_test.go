@@ -326,7 +326,7 @@ func golden() []want {
 		{sql: "create unique index on orders (id)", kind: Refuse, msg: "primary key or unique constraint (id) on sharded table \"orders\" must include the shard key"},
 		{sql: "alter table orders add column x int", kind: MigrationKind, mig: "ALTER TABLE all"},
 		{sql: "alter table orders add column created timestamptz default now()", kind: MigrationKind, mig: "ALTER TABLE all"},
-		{sql: "alter table orders add column token uuid default gen_random_uuid()", kind: Refuse, msg: "rewrite-class DDL is not available yet: ADD COLUMN with a volatile DEFAULT rewrites the table"},
+		{sql: "alter table orders add column token uuid default gen_random_uuid()", kind: MigrationKind, mig: "ALTER TABLE all rewrite"},
 		{sql: "alter table orders add column n bigint generated always as identity", kind: Refuse, msg: "rewrite-class DDL is not available yet: ADD COLUMN ... GENERATED AS IDENTITY rewrites the table"},
 		{sql: "alter table orders add column n serial", kind: Refuse, msg: "rewrite-class DDL is not available yet: ADD COLUMN of a serial type rewrites the table"},
 		{sql: "alter table orders add column total numeric generated always as (x * 2) stored", kind: Refuse, msg: "rewrite-class DDL is not available yet: ADD COLUMN ... GENERATED ... STORED rewrites the table"},

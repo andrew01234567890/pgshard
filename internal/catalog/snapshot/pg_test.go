@@ -134,6 +134,43 @@ func TestSnapshotWithPostgres(t *testing.T) {
 		}
 	})
 
+	t.Run("pending_rewrite_hides_columns", func(t *testing.T) {
+		id, err := catalog.EnqueueMigration(ctx, conn, catalog.DDLMigration{Database: "app",
+			Statement: "alter table orders alter column amount type bigint", Kind: "ALTER TABLE",
+			Strategy: catalog.StrategyRewrite, Scope: "all",
+			Meta: catalog.MigrationMeta{Rewrite: &catalog.RewriteChange{Schema: "public", Table: "orders",
+				Column: "amount", NewType: "bigint", Using: "amount::bigint", Columns: []string{"customer_id", "id", "amount"}}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s, err := Load(ctx, conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := s.Tables[TableKey{"app", "public", "orders"}]
+		if len(got.HiddenColumns) != 1 || !strings.HasPrefix(got.HiddenColumns[0], "_pgshard_amount_") {
+			t.Fatalf("hidden columns: %+v", got)
+		}
+		if len(got.VisibleColumns) != 3 || got.VisibleColumns[2] != "amount" {
+			t.Fatalf("visible columns: %+v", got)
+		}
+		m, err := catalog.LoadMigration(ctx, conn, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.State = catalog.MigrationFailed
+		if err := catalog.SaveMigrationProgress(ctx, conn, m); err != nil {
+			t.Fatal(err)
+		}
+		s, err = Load(ctx, conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := s.Tables[TableKey{"app", "public", "orders"}]; len(got.HiddenColumns) != 0 || len(got.VisibleColumns) != 0 {
+			t.Fatalf("finished rewrite still hides columns: %+v", got)
+		}
+	})
+
 	t.Run("consistency_from_catalog", func(t *testing.T) {
 		s, err := Load(ctx, conn)
 		if err != nil {

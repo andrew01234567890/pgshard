@@ -112,7 +112,7 @@ func (e *Executor) runMigration(ctx context.Context, pl plan.Plan, w pgwire.Resu
 			RoleOp:   m.RoleOp,
 			Verifier: m.Verifier,
 			Roles:    m.Roles,
-			Database: m.Database, DatabaseOp: m.DatabaseOp, Steps: migrationSteps(m.Steps)}}
+			Database: m.Database, DatabaseOp: m.DatabaseOp, Steps: migrationSteps(m.Steps), Rewrite: m.Rewrite}}
 	id, err := e.r.cfg.Migrations.Enqueue(ctx, req)
 	if err != nil {
 		return pgwire.Errorf(codeConnectionFailure, "queueing the migration in the catalog failed: %v", err)
