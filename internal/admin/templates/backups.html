@@ -1,6 +1,6 @@
 {{template "head" "Backups"}}
 <header><h1><a href="/">clusters</a> / backups</h1></header>
-<nav class="tabs" aria-label="Sections"><a href="/">Clusters</a><a href="/backups" aria-current="page">Backups</a><a href="/migrations">Migrations</a><a href="/streams">Streams</a><a href="/twopc">2PC</a><a href="/alerts">Alerts</a><a href="/reshards">Reshards</a></nav>
+<nav class="tabs" aria-label="Sections"><a href="/">Clusters</a><a href="/backups" aria-current="page">Backups</a><a href="/migrations">Migrations</a><a href="/streams">Streams</a><a href="/twopc">2PC</a><a href="/alerts">Alerts</a><a href="/reshards">Reshards</a><a href="/upgrades">Upgrades</a></nav>
 <div id="backups" data-live hx-get="/backups/panel" hx-trigger="topology" hx-swap="innerHTML">
 {{template "backups_panel.html" .}}
 </div>

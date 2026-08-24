@@ -16,12 +16,21 @@ jobs:
   e2e:
     name: e2e (pg${{ matrix.pg }}, ${{ matrix.suite }})
     runs-on: ubuntu-latest
-    timeout-minutes: 80
+    timeout-minutes: ${{ (matrix.suite == 'upgrade' || matrix.suite == 'reshard-scale') && 120 || 80 }}
     strategy:
       fail-fast: false
       matrix:
         pg: [18, 19]
         suite: [smoke, operator, backup, reshard]
+        include:
+          # The upgrade suite runs the online 18 -> 19 major upgrade, so it
+          # needs both majors' images; the scale suite drives the
+          # 1 -> 2 -> 4 -> 2 reshard under load. One major each keeps the
+          # matrix inside the runner budget.
+          - pg: 18
+            suite: upgrade
+          - pg: 18
+            suite: reshard-scale
     env:
       PG_MAJOR: ${{ matrix.pg }}
       E2E_ARTIFACTS: ${{ github.workspace }}/artifacts/e2e-pg${{ matrix.pg }}-${{ matrix.suite }}
@@ -53,16 +62,28 @@ jobs:
           docker build -f Dockerfile.control --build-arg CMD=pgshard-admin -t pgshard-admin:e2e .
           docker build -f Dockerfile.router -t pgshard-router:e2e .
       - name: Build controller image
-        if: matrix.suite == 'reshard'
+        if: matrix.suite == 'reshard' || matrix.suite == 'reshard-scale' || matrix.suite == 'upgrade'
         run: docker build -f Dockerfile.control --build-arg CMD=pgshard-controller -t pgshard-controller:e2e .
+      - name: Build the target-major PostgreSQL image
+        if: matrix.suite == 'upgrade'
+        uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7.3.0
+        with:
+          source: .
+          targets: postgres-19
+          load: true
+        env:
+          CI: "true"
       - name: Create kind cluster
         run: hack/kind/up.sh
       - name: Load images into kind
         if: matrix.suite != 'smoke'
         run: hack/kind/load-images.sh pgshard-operator:e2e pgshard-admin:e2e pgshard-router:e2e "ghcr.io/andrew01234567890/pgshard-postgres:${PG_MAJOR}"
       - name: Load controller image into kind
-        if: matrix.suite == 'reshard'
+        if: matrix.suite == 'reshard' || matrix.suite == 'reshard-scale' || matrix.suite == 'upgrade'
         run: hack/kind/load-images.sh pgshard-controller:e2e
+      - name: Load the target-major image into kind
+        if: matrix.suite == 'upgrade'
+        run: hack/kind/load-images.sh "ghcr.io/andrew01234567890/pgshard-postgres:19"
       - name: Run e2e suite
         run: |
           set -o pipefail
@@ -71,7 +92,9 @@ jobs:
             smoke) go test -tags e2e -count=1 -v -run 'Smoke' ./test/e2e/... 2>&1 | tee "$E2E_ARTIFACTS/go-test.log" ;;
             operator) go test -tags e2e -count=1 -v -timeout 70m ./test/e2e/operator/... 2>&1 | tee "$E2E_ARTIFACTS/go-test.log" ;;
             backup) go test -tags e2e -count=1 -v -timeout 70m ./test/e2e/backup/... 2>&1 | tee "$E2E_ARTIFACTS/go-test.log" ;;
-            reshard) go test -tags e2e -count=1 -v -timeout 50m ./test/e2e/reshard/... 2>&1 | tee "$E2E_ARTIFACTS/go-test.log" ;;
+            reshard) go test -tags e2e -count=1 -v -timeout 50m -skip 'TestReshard1To2To4To2UnderLoad' ./test/e2e/reshard/... 2>&1 | tee "$E2E_ARTIFACTS/go-test.log" ;;
+            reshard-scale) go test -tags e2e -count=1 -v -timeout 110m -run 'TestReshard1To2To4To2UnderLoad' ./test/e2e/reshard/... 2>&1 | tee "$E2E_ARTIFACTS/go-test.log" ;;
+            upgrade) go test -tags e2e -count=1 -v -timeout 110m ./test/e2e/upgrade/... 2>&1 | tee "$E2E_ARTIFACTS/go-test.log" ;;
             *) echo "unknown suite $E2E_SUITE" >&2; exit 1 ;;
           esac
         env:

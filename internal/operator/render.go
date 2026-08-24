@@ -275,11 +275,27 @@ func (Renderer) Services(c *pgshardv1alpha1.PgShardCluster, g Group) []*corev1.S
 	rw[LabelRole] = RolePrimary
 	ro := g.Labels()
 	ro[LabelRole] = RoleReplica
-	return []*corev1.Service{
-		service(c, g, g.ServiceRW(), rw, false),
+	out := []*corev1.Service{
 		service(c, g, g.ServiceRO(), ro, false),
 		service(c, g, g.ServiceHeadless(), g.Labels(), true),
 	}
+	// A retired catalog group must not touch its own -rw Service: for the
+	// first generation that name IS the stable catalog endpoint, already
+	// repointed at the new-major group by the cutover.
+	if g.Kind != "catalog" || !g.Retired {
+		out = append(out, service(c, g, g.ServiceRW(), rw, false))
+	}
+	return out
+}
+
+// CatalogEndpointService renders the stable catalog endpoint pointing at
+// the active catalog group's primary. It shares its name with the first
+// catalog generation's own -rw Service, so it only needs rendering
+// explicitly once the active generation moved past 1.
+func (Renderer) CatalogEndpointService(c *pgshardv1alpha1.PgShardCluster, active Group) *corev1.Service {
+	sel := active.Labels()
+	sel[LabelRole] = RolePrimary
+	return service(c, active, CatalogServiceRW(c.Name), sel, false)
 }
 
 // PDBs renders the primary PDB and, when the group is large enough, the replica PDB.

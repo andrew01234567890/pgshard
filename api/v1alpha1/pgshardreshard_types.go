@@ -34,6 +34,11 @@ const (
 	UpgradeActionRollback = "rollback"
 )
 
+// AnnotationCatalogUpgrade on a PgShardCluster controls the catalog
+// group's major upgrade; "rollback" returns serving to the old-major
+// catalog group before its retirement deletes it.
+const AnnotationCatalogUpgrade = "pgshard.io/catalog-upgrade"
+
 // Reshard modes.
 const (
 	ReshardModeReshard = "reshard"

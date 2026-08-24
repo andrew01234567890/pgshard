@@ -89,6 +89,9 @@ type Group struct {
 // Name is the group's short name, unique within the cluster.
 func (g Group) Name() string {
 	if g.Kind == "catalog" {
+		if g.Generation > 1 {
+			return fmt.Sprintf("catalog-g%d", g.Generation)
+		}
 		return "catalog"
 	}
 	if g.Generation > 1 {
@@ -236,11 +239,68 @@ func Groups(c *pgshardv1alpha1.PgShardCluster) []Group {
 	if catalogReplicas < 1 {
 		catalogReplicas = 3
 	}
-	out := []Group{{Cluster: c.Name, Kind: "catalog", Replicas: catalogReplicas, Storage: c.Spec.Catalog.Storage, PGMajor: c.Status.ServingPGMajor}}
+	out := []Group{{Cluster: c.Name, Kind: "catalog", Replicas: catalogReplicas, Storage: c.Spec.Catalog.Storage,
+		Generation: CatalogGeneration(c), PGMajor: CatalogMajor(c)}}
 	for i := 0; i < shards; i++ {
 		out = append(out, Group{Cluster: c.Name, Kind: "shard", ShardID: i, Replicas: shardReplicas(c), Storage: c.Spec.Storage, Generation: gen, PGMajor: c.Status.ServingPGMajor})
 	}
 	return out
+}
+
+// CatalogGeneration is the generation of the active catalog group (1
+// before the first catalog major upgrade completed).
+func CatalogGeneration(c *pgshardv1alpha1.PgShardCluster) int64 {
+	if c.Status.CatalogGeneration > 0 {
+		return c.Status.CatalogGeneration
+	}
+	return 1
+}
+
+// CatalogMajor is the PostgreSQL major the active catalog group runs: its
+// probed stamp during and after an upgrade window, the serving shard
+// major otherwise.
+func CatalogMajor(c *pgshardv1alpha1.PgShardCluster) int {
+	if c.Status.CatalogPGMajor != 0 {
+		return c.Status.CatalogPGMajor
+	}
+	return c.Status.ServingPGMajor
+}
+
+// CatalogServiceRW is the stable catalog endpoint routers and the
+// controller dial. It equals the first catalog group's own -rw Service;
+// after a catalog upgrade the operator repoints it at the new group's
+// primary, so a replacement under the same name re-points every client.
+func CatalogServiceRW(cluster string) string { return cluster + "-catalog-rw" }
+
+// CatalogTargetGroup is the new-major catalog group of the catalog
+// upgrade in flight; nil outside that window.
+func CatalogTargetGroup(c *pgshardv1alpha1.PgShardCluster) *Group {
+	up := c.Status.CatalogUpgrade
+	if up == nil || up.Generation == 0 || up.Generation == CatalogGeneration(c) {
+		return nil
+	}
+	g := catalogGroupAt(c, up.Generation, up.ToMajor)
+	g.NonServing = true
+	return &g
+}
+
+// RetiredCatalogGroup is the old catalog group kept up for rollback after
+// a catalog cutover; nil outside the retirement window.
+func RetiredCatalogGroup(c *pgshardv1alpha1.PgShardCluster) *Group {
+	up := c.Status.CatalogUpgrade
+	if up == nil || up.RetiredGeneration == 0 {
+		return nil
+	}
+	g := catalogGroupAt(c, up.RetiredGeneration, up.RetiredMajor)
+	g.Retired = true
+	return &g
+}
+
+func catalogGroupAt(c *pgshardv1alpha1.PgShardCluster, gen int64, major int) Group {
+	base := Groups(c)[0]
+	base.Generation = gen
+	base.PGMajor = major
+	return base
 }
 
 // SecretName is the Secret holding the superuser password.

@@ -194,10 +194,24 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		observations = append(observations, obs)
 	}
 	var targets []groupObservation
+	inflight := 0
+	budget := ProvisionBudget(&cluster)
 	for _, g := range TargetGroups(&cluster) {
+		if budget > 0 && inflight >= budget {
+			started, err := r.groupStarted(ctx, &cluster, g)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if !started {
+				continue
+			}
+		}
 		obs, err := r.reconcileGroup(ctx, &cluster, g, password, policy, repoReady)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("target group %s: %w", g.Name(), err)
+		}
+		if !obs.ready() {
+			inflight++
 		}
 		targets = append(targets, obs)
 	}
@@ -208,6 +222,17 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, fmt.Errorf("retired group %s: %w", g.Name(), err)
 		}
 		retired = append(retired, obs)
+	}
+
+	if catalogReady.Status == metav1.ConditionTrue {
+		if err := r.ensureCatalogEndpoint(ctx, &cluster); err != nil {
+			return ctrl.Result{}, fmt.Errorf("catalog endpoint: %w", err)
+		}
+		catObs, err := r.reconcileCatalogUpgrade(ctx, &cluster, dsn, password, policy, repoReady)
+		if err != nil {
+			log.Error(err, "catalog upgrade reconciliation failed; groups keep reconciling")
+		}
+		retired = append(retired, catObs...)
 	}
 
 	if err := r.reconcileAdmin(ctx, &cluster); err != nil {
@@ -832,6 +857,11 @@ func boolReason(ok bool, yes, no string) string {
 func (r *ClusterReconciler) updateGroupStatus(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, o groupObservation) ([]pgshardv1alpha1.MemberStatus, error) {
 	var pg pgshardv1alpha1.PgShardGroup
 	if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: o.group.Prefix()}, &pg); err != nil {
+		// A group deleted later in the same pass (a rolled-back catalog
+		// upgrade target) has no record left to update.
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
 		return nil, err
 	}
 	base := pg.DeepCopy()
@@ -854,4 +884,28 @@ func (r *ClusterReconciler) updateGroupStatus(ctx context.Context, c *pgshardv1a
 		}
 	}
 	return pg.Status.Members, r.Status().Patch(ctx, &pg, client.MergeFrom(base))
+}
+
+// ProvisionBudget is spec.upgrade.maxParallelGroups when an upgrade run is
+// provisioning targets: how many new-major groups may be brought up at
+// once. Zero means unbounded (topology reshards, or the field unset). The
+// cutover itself still flips the whole set at once (docs/upgrade.md).
+func ProvisionBudget(c *pgshardv1alpha1.PgShardCluster) int {
+	rs := c.Status.Reshard
+	if rs == nil || rs.PGMajor == 0 || rs.PGMajor == c.Status.ServingPGMajor {
+		return 0
+	}
+	return c.Spec.Upgrade.MaxParallelGroups
+}
+
+// groupStarted reports whether a target group's PgShardGroup record
+// already exists: a started group keeps reconciling even over the
+// provisioning budget, so it can finish.
+func (r *ClusterReconciler) groupStarted(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group) (bool, error) {
+	pg := r.Renderer.PgShardGroup(c, g)
+	err := r.Get(ctx, client.ObjectKeyFromObject(pg), pg)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	return err == nil, err
 }

@@ -57,7 +57,7 @@ func RouterReplicas(c *pgshardv1alpha1.PgShardCluster) (minReplicas, maxReplicas
 // CatalogDSN is the libpq connection string the router uses to reach the
 // catalog primary; the password comes from PGPASSWORD.
 func CatalogDSN(c *pgshardv1alpha1.PgShardCluster) string {
-	return fmt.Sprintf("host=%s.%s.svc port=%d user=%s dbname=postgres", Groups(c)[0].ServiceRW(), c.Namespace, postgresPort, superuserName)
+	return fmt.Sprintf("host=%s.%s.svc port=%d user=%s dbname=postgres", CatalogServiceRW(c.Name), c.Namespace, postgresPort, superuserName)
 }
 
 // RouterDeployment renders the router Deployment; the HPA owns the replica

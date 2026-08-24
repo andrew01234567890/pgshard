@@ -317,6 +317,62 @@ spec:
           status:
             description: PgShardClusterStatus is the observed state of a PgShardCluster.
             properties:
+              catalogGeneration:
+                description: |-
+                  CatalogGeneration names the active catalog group (catalog for 0 or
+                  1, catalog-g<n> after a catalog major upgrade).
+                format: int64
+                type: integer
+              catalogPGMajor:
+                description: |-
+                  CatalogPGMajor is the PostgreSQL major the active catalog group
+                  runs, probed from the server; zero until first probed.
+                type: integer
+              catalogUpgrade:
+                description: CatalogUpgrade is the catalog group upgrade in flight,
+                  if any.
+                properties:
+                  blockers:
+                    description: Blockers lists the preconditions holding the upgrade
+                      back.
+                    items:
+                      type: string
+                    type: array
+                  fromMajor:
+                    type: integer
+                  generation:
+                    description: Generation names the new-major catalog group (catalog-g<n>).
+                    format: int64
+                    type: integer
+                  message:
+                    type: string
+                  retiredGeneration:
+                    description: |-
+                      RetiredGeneration is the old catalog group kept up for rollback
+                      after the cutover, until retirement deletes it.
+                    format: int64
+                    type: integer
+                  retiredMajor:
+                    type: integer
+                  rollbackRequested:
+                    description: |-
+                      RollbackRequested mirrors the pgshard.io/catalog-upgrade=rollback
+                      annotation.
+                    type: boolean
+                  stage:
+                    description: Stage is one of provisioning, copying, catching_up,
+                      cutover, retiring.
+                    type: string
+                  switchedAt:
+                    format: date-time
+                    type: string
+                  toMajor:
+                    type: integer
+                required:
+                - fromMajor
+                - generation
+                - toMajor
+                type: object
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current

@@ -1,0 +1,22 @@
+{{if .Clusters}}
+{{range .Clusters}}
+<section aria-label="Upgrade of {{.Namespace}}/{{.Name}}">
+<h2><a href="/clusters/{{.Namespace}}/{{.Name}}">{{.Namespace}}/{{.Name}}</a>
+<span class="meta">spec {{.SpecMajor}}{{if .ServingMajor}} · shards on {{.ServingMajor}}{{end}}{{if .CatalogMajor}} · catalog on {{.CatalogMajor}}{{end}} · {{.State}}</span></h2>
+{{if .Rows}}
+<table>
+<thead><tr><th>Scope</th><th>Major</th><th>Stage</th><th>Rollback</th><th>Detail</th></tr></thead>
+<tbody>
+{{range .Rows}}<tr>
+<td>{{.Scope}}</td>
+<td>{{.FromMajor}} → {{.ToMajor}}</td>
+<td class="{{if eq .Stage "blocked"}}bad{{else}}ok{{end}}">{{.Stage}}</td>
+<td>{{if .Rollback}}{{.Rollback}}{{else}}—{{end}}</td>
+<td>{{if .Blockers}}<ul>{{range .Blockers}}<li>{{.}}</li>{{end}}</ul>{{else}}{{.Message}}{{end}}</td>
+</tr>{{end}}
+</tbody>
+</table>
+{{else}}<p>No upgrade in flight.</p>{{end}}
+</section>
+{{end}}
+{{else}}<p>No PgShardCluster objects found.</p>{{end}}

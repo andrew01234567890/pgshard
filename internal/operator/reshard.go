@@ -203,7 +203,11 @@ func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1al
 	}
 	phase := reshardPhase(wf)
 	specSourced := record.Labels[LabelReshardSource] == ReshardSourceSpec
-	revert := want != nil && *want == effective && specSourced
+	// An upgrade run keeps the shard count, so spec.shards matching the
+	// serving count is its normal state, not a revert; upgrades are undone
+	// by the rollback annotation (or lowering spec.postgresql.major before
+	// provisioning finished, which drops the pending set itself).
+	revert := want != nil && *want == effective && specSourced && record.Spec.Mode != pgshardv1alpha1.ReshardModeUpgrade
 
 	switch {
 	case revert && (phase == pgshardv1alpha1.ReshardPhasePending || phase == pgshardv1alpha1.ReshardPhaseProvisioning || phase == pgshardv1alpha1.ReshardPhaseCopying):

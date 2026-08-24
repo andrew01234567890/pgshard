@@ -77,6 +77,23 @@ type Prober interface {
 	EnsureSlots(ctx context.Context, dsn string, want []string, drop string) error
 	// Settings reads pg_settings for names.
 	Settings(ctx context.Context, dsn string, names []string) (map[string]SettingState, error)
+	// ServerMajor reads the server's PostgreSQL major version.
+	ServerMajor(ctx context.Context, dsn string) (int, error)
+	// EnsureCatalogCopy sets up the logical copy of the catalog schema
+	// from the old-major to the new-major catalog primary: publication on
+	// the source, truncate plus subscription with the initial copy on the
+	// target. Idempotent.
+	EnsureCatalogCopy(ctx context.Context, srcDSN, tgtDSN string) error
+	// CatalogCopyCaughtUp reports whether the catalog copy subscription
+	// consumed the source's current WAL position; lag describes the rest.
+	CatalogCopyCaughtUp(ctx context.Context, srcDSN string) (bool, string, error)
+	// CutoverCatalog fences the old catalog primary (read-only default,
+	// backends terminated), waits for the subscription to drain, carries
+	// the sequence positions over and drops the subscription so the new
+	// primary owns the catalog.
+	CutoverCatalog(ctx context.Context, srcDSN, tgtDSN string) error
+	// ReleaseCatalog undoes the cutover fence for a rollback.
+	ReleaseCatalog(ctx context.Context, dsn string) error
 }
 
 // DSN builds the connection URL for a group's -rw Service.
@@ -535,6 +552,36 @@ func (b boundedProber) SetWorkflowRollback(ctx context.Context, dsn, workflowID 
 	ctx, cancel := b.bound(ctx)
 	defer cancel()
 	return b.Inner.SetWorkflowRollback(ctx, dsn, workflowID)
+}
+
+func (b boundedProber) ServerMajor(ctx context.Context, dsn string) (int, error) {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.ServerMajor(ctx, dsn)
+}
+
+func (b boundedProber) EnsureCatalogCopy(ctx context.Context, srcDSN, tgtDSN string) error {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.EnsureCatalogCopy(ctx, srcDSN, tgtDSN)
+}
+
+func (b boundedProber) CatalogCopyCaughtUp(ctx context.Context, srcDSN string) (bool, string, error) {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.CatalogCopyCaughtUp(ctx, srcDSN)
+}
+
+func (b boundedProber) CutoverCatalog(ctx context.Context, srcDSN, tgtDSN string) error {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.CutoverCatalog(ctx, srcDSN, tgtDSN)
+}
+
+func (b boundedProber) ReleaseCatalog(ctx context.Context, dsn string) error {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.ReleaseCatalog(ctx, dsn)
 }
 
 func (b boundedProber) ReshardWorkflow(ctx context.Context, dsn, shardSet string) (WorkflowInfo, error) {
