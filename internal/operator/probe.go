@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
+	"github.com/andrew01234567890/pgshard/internal/placement"
 )
 
 // PrimaryState is what the operator learned from one probe of a group primary.
@@ -46,8 +48,17 @@ type Prober interface {
 	SetSyncStandbyNames(ctx context.Context, dsn, value string) error
 	MigrateCatalog(ctx context.Context, dsn string) error
 	// PublishShardStatus upserts pgshard.shard_status for one shard group;
-	// it never lowers primary_epoch.
-	PublishShardStatus(ctx context.Context, dsn string, shardID int, groupName string, epoch int64, endpoint string) error
+	// it never lowers primary_epoch. Non-serving groups stay provisioning.
+	PublishShardStatus(ctx context.Context, dsn string, g Group, epoch int64, endpoint string) error
+	// ShardSets lists the catalog shard sets with their ranges.
+	ShardSets(ctx context.Context, dsn string) ([]ShardSetInfo, error)
+	// MaterializeShardSet writes a new shard set of equal ranges in state.
+	MaterializeShardSet(ctx context.Context, dsn, name string, generation int64, state string, ranges placement.RangeSet) error
+	// DropShardSet removes a shard set with its ranges and status rows.
+	DropShardSet(ctx context.Context, dsn, name string) error
+	// ReshardWorkflow returns the active reshard workflow of a shard set;
+	// an empty ID means none exists.
+	ReshardWorkflow(ctx context.Context, dsn, shardSet string) (WorkflowInfo, error)
 	// EnsureSlots creates the missing physical slots in want on the primary
 	// and drops an inactive slot named drop (the primary's own, inherited
 	// from its time as a standby, which would otherwise pin WAL forever).
@@ -139,20 +150,110 @@ func (PgxProber) ProbeStandby(ctx context.Context, dsn string) (StandbyState, er
 }
 
 // PublishShardStatus upserts the shard's fence into pgshard.shard_status.
-func (PgxProber) PublishShardStatus(ctx context.Context, dsn string, shardID int, groupName string, epoch int64, endpoint string) error {
+func (PgxProber) PublishShardStatus(ctx context.Context, dsn string, g Group, epoch int64, endpoint string) error {
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = conn.Close(ctx) }()
+	state := "serving"
+	if g.NonServing {
+		state = "provisioning"
+	}
 	_, err = conn.Exec(ctx, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch, primary_endpoint)
-		VALUES ($1, $2, $3, 'serving', $4, $5)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (shard_set, shard_id) DO UPDATE
 		SET group_name = EXCLUDED.group_name, primary_epoch = EXCLUDED.primary_epoch,
 		    primary_endpoint = EXCLUDED.primary_endpoint, updated_at = now()
 		WHERE pgshard.shard_status.primary_epoch <= EXCLUDED.primary_epoch`,
-		shardSet, shardID, groupName, epoch, endpoint)
+		g.ShardSet(), g.ShardID, g.Name(), state, epoch, endpoint)
 	return err
+}
+
+// ShardSetInfo is one catalog shard set with its ranges in key order.
+type ShardSetInfo struct {
+	Name       string
+	Generation int64
+	State      string
+	Ranges     placement.RangeSet
+}
+
+// WorkflowInfo is the catalog workflow row of a reshard.
+type WorkflowInfo struct {
+	ID    string
+	State string
+	Stage string
+}
+
+// ShardSets lists the catalog shard sets and their ranges.
+func (PgxProber) ShardSets(ctx context.Context, dsn string) ([]ShardSetInfo, error) {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	sets, err := catalog.ListShardSets(ctx, conn)
+	if err != nil {
+		return nil, err
+	}
+	ranges, err := catalog.ListAllShardRanges(ctx, conn)
+	if err != nil {
+		return nil, err
+	}
+	bySet := map[string][]catalog.ShardRange{}
+	for _, r := range ranges {
+		bySet[r.ShardSet] = append(bySet[r.ShardSet], r)
+	}
+	out := make([]ShardSetInfo, 0, len(sets))
+	for _, s := range sets {
+		out = append(out, ShardSetInfo{Name: s.Name, Generation: s.Generation, State: s.State, Ranges: catalog.RangeSet(bySet[s.Name])})
+	}
+	return out, nil
+}
+
+// MaterializeShardSet writes a new shard set in one transaction.
+func (PgxProber) MaterializeShardSet(ctx context.Context, dsn, name string, generation int64, state string, ranges placement.RangeSet) error {
+	return inTx(ctx, dsn, func(tx pgx.Tx) error {
+		return catalog.MaterializeShardSet(ctx, tx, name, generation, state, ranges)
+	})
+}
+
+// DropShardSet removes a shard set in one transaction.
+func (PgxProber) DropShardSet(ctx context.Context, dsn, name string) error {
+	return inTx(ctx, dsn, func(tx pgx.Tx) error { return catalog.DropShardSet(ctx, tx, name) })
+}
+
+// ReshardWorkflow reads the newest active reshard workflow of shardSet.
+func (PgxProber) ReshardWorkflow(ctx context.Context, dsn, shardSet string) (WorkflowInfo, error) {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return WorkflowInfo{}, err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	var w WorkflowInfo
+	err = conn.QueryRow(ctx, `SELECT id::text, state, coalesce(status->>'stage', '') FROM pgshard.workflows
+		WHERE kind = 'reshard' AND spec->>'shard_set' = $1 ORDER BY created_at DESC LIMIT 1`, shardSet).Scan(&w.ID, &w.State, &w.Stage)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return WorkflowInfo{}, nil
+	}
+	return w, err
+}
+
+func inTx(ctx context.Context, dsn string, fn func(pgx.Tx) error) error {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // EnsureSlots creates missing physical slots and drops the primary's own.
@@ -279,10 +380,34 @@ func (b boundedProber) MigrateCatalog(ctx context.Context, dsn string) error {
 	return b.Inner.MigrateCatalog(ctx, dsn)
 }
 
-func (b boundedProber) PublishShardStatus(ctx context.Context, dsn string, shardID int, groupName string, epoch int64, endpoint string) error {
+func (b boundedProber) PublishShardStatus(ctx context.Context, dsn string, g Group, epoch int64, endpoint string) error {
 	ctx, cancel := b.bound(ctx)
 	defer cancel()
-	return b.Inner.PublishShardStatus(ctx, dsn, shardID, groupName, epoch, endpoint)
+	return b.Inner.PublishShardStatus(ctx, dsn, g, epoch, endpoint)
+}
+
+func (b boundedProber) ShardSets(ctx context.Context, dsn string) ([]ShardSetInfo, error) {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.ShardSets(ctx, dsn)
+}
+
+func (b boundedProber) MaterializeShardSet(ctx context.Context, dsn, name string, generation int64, state string, ranges placement.RangeSet) error {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.MaterializeShardSet(ctx, dsn, name, generation, state, ranges)
+}
+
+func (b boundedProber) DropShardSet(ctx context.Context, dsn, name string) error {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.DropShardSet(ctx, dsn, name)
+}
+
+func (b boundedProber) ReshardWorkflow(ctx context.Context, dsn, shardSet string) (WorkflowInfo, error) {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.ReshardWorkflow(ctx, dsn, shardSet)
 }
 
 func (b boundedProber) EnsureSlots(ctx context.Context, dsn string, want []string, drop string) error {

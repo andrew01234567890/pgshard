@@ -376,9 +376,38 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              effectiveShards:
+                description: |-
+                  EffectiveShards is the shard count of the serving shard set as
+                  materialized in the catalog; zero until the catalog exists.
+                type: integer
               observedGeneration:
                 format: int64
                 type: integer
+              reshard:
+                description: Reshard is the resharding run in flight, if any.
+                properties:
+                  generation:
+                    format: int64
+                    type: integer
+                  name:
+                    description: Name is the PgShardReshard object.
+                    type: string
+                  phase:
+                    type: string
+                  shardSet:
+                    description: ShardSet is the pending catalog shard set; Generation
+                      its generation.
+                    type: string
+                  shards:
+                    description: Shards is the number of target groups being provisioned.
+                    type: integer
+                required:
+                - generation
+                - name
+                - shardSet
+                - shards
+                type: object
               rollout:
                 description: RolloutStatus summarises the rolling operation in flight
                   across groups.

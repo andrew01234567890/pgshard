@@ -138,7 +138,7 @@ func TestFailoverPromotesHighestFlushedSyncStandbyAndPublishesFenceFirst(t *test
 		t.Errorf("cluster shard status: %+v", cl.Status.Shards)
 	}
 
-	markPodRunning(t, "fo-shard-0-0", podIP(1, 0), true)
+	markPodRunning(t, "fo-shard-0-0", podIP(1, 0))
 	fa.set(podIP(1, 0), AgentStatus{Running: true, Primary: false}, nil)
 	fp.err = nil
 	fp.streaming = map[string]bool{"fo-catalog-1": true, "fo-catalog-2": true, "fo-shard-0-0": true, "fo-shard-0-1": true}

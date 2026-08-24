@@ -28,6 +28,15 @@ Unix socket. The pooler's readiness probe is a TCP check on 9091, so a pod
 is Ready only when both the agent and the pooler are. `--insecure-dev` is the
 plaintext development mode; mTLS between router and pooler is a later step.
 
+## Shard groups and resharding
+
+The serving shard groups are `shard-<id>` for the shard count the catalog
+holds (`status.effectiveShards`; `spec.shards` only until the catalog
+exists). Once the catalog group is ready and migrated the operator
+materializes the serving shard set, and a different `spec.shards` becomes a
+reshard: a pending shard set, a `PgShardReshard` record and non-serving
+target groups `shard-<id>-g<generation>`. See [resharding.md](resharding.md).
+
 ## Router
 
 For every cluster the operator owns `<cluster>-router`:

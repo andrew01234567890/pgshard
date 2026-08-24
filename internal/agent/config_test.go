@@ -71,6 +71,11 @@ func TestRenderPostgresqlConfBackupGolden(t *testing.T) {
 	if !strings.Contains(RenderPostgresqlConf(c, false), "restore_command = 'custom'\n") {
 		t.Error("explicit restore_command must win over the pgbackrest one")
 	}
+	c.NonServing = true
+	if !strings.Contains(RenderPostgresqlConf(c, false), "archive_mode = off\n") {
+		t.Error("a non-serving reshard target must not archive even with a backup policy")
+	}
+	c.NonServing = false
 	c.Backup = nil
 	if !strings.Contains(RenderPostgresqlConf(c, false), "archive_mode = off\n") {
 		t.Error("archive_mode must be off without a backup policy")

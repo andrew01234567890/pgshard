@@ -8,7 +8,7 @@ import (
 
 type blockingProber struct{ Prober }
 
-func (blockingProber) PublishShardStatus(ctx context.Context, _ string, _ int, _ string, _ int64, _ string) error {
+func (blockingProber) PublishShardStatus(ctx context.Context, _ string, _ Group, _ int64, _ string) error {
 	<-ctx.Done()
 	return ctx.Err()
 }
@@ -21,7 +21,7 @@ func (blockingProber) ProbeStandby(ctx context.Context, _ string) (StandbyState,
 func TestBoundedProberNeverBlocksIndefinitely(t *testing.T) {
 	b := boundedProber{Inner: blockingProber{}, Timeout: 50 * time.Millisecond}
 	start := time.Now()
-	if err := b.PublishShardStatus(context.Background(), "dsn", 0, "g", 1, "ep"); err == nil {
+	if err := b.PublishShardStatus(context.Background(), "dsn", Group{}, 1, "ep"); err == nil {
 		t.Fatal("want timeout error")
 	}
 	if _, err := b.ProbeStandby(context.Background(), "dsn"); err == nil {

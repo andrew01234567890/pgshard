@@ -104,3 +104,43 @@ func TestSynchronizedStandbySlotsListsStreamingSyncCandidatesOnly(t *testing.T) 
 		t.Fatalf("nothing streaming must list no slots, got %v", got)
 	}
 }
+
+func TestServingShardsPrefersCatalogOverSpec(t *testing.T) {
+	four := 4
+	c := &pgshardv1alpha1.PgShardCluster{ObjectMeta: metav1.ObjectMeta{Name: "c"}}
+	if ServingShards(c) != 1 {
+		t.Fatalf("default must be 1, got %d", ServingShards(c))
+	}
+	c.Spec.Shards = &four
+	if ServingShards(c) != 4 {
+		t.Fatalf("spec.shards before the catalog exists, got %d", ServingShards(c))
+	}
+	c.Status.EffectiveShards = 2
+	if ServingShards(c) != 2 || len(Groups(c)) != 3 {
+		t.Fatalf("effective shards must win once materialized: %d groups=%d", ServingShards(c), len(Groups(c)))
+	}
+	for _, g := range Groups(c)[1:] {
+		if g.Generation != 1 || g.NonServing || g.ShardSet() != "default" || g.Labels()[LabelShardSet] != "default" {
+			t.Errorf("serving group: %+v", g)
+		}
+	}
+	if TargetGroups(c) != nil {
+		t.Fatal("no targets without status.reshard")
+	}
+	c.Status.Reshard = &pgshardv1alpha1.ClusterReshardStatus{Name: "c-reshard-g3", ShardSet: "g3", Generation: 3, Shards: 4}
+	targets := TargetGroups(c)
+	if len(targets) != 4 {
+		t.Fatalf("targets: %d", len(targets))
+	}
+	g := targets[3]
+	if g.Name() != "shard-3-g3" || g.Prefix() != "c-shard-3-g3" || g.MemberName(0) != "c-shard-3-g3-0" || g.ShardSet() != "g3" ||
+		!g.NonServing || g.Replicas != 3 || g.Labels()[LabelShardSet] != "g3" || g.Labels()[LabelGroup] != "shard-3-g3" {
+		t.Errorf("target group: %+v name=%s", g, g.Name())
+	}
+	if Groups(c)[1].Name() == targets[0].Name() {
+		t.Error("generation 1 and 3 of shard 0 must not collide")
+	}
+	if ReshardName("c", 3) != "c-reshard-g3" {
+		t.Errorf("ReshardName: %s", ReshardName("c", 3))
+	}
+}

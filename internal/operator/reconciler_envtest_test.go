@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/internal/placement"
 )
 
 var k8sClient client.Client
@@ -75,6 +76,83 @@ type fakeProber struct {
 	// settings is the pg_settings view of every member; contexts default to
 	// "sighup" for names not listed.
 	settings map[string]SettingState
+	// shardSets is the fake catalog's pgshard.shard_sets with ranges;
+	// endpoints the published primary endpoints keyed by "<set>/<group>";
+	// workflows the reshard workflow per shard set.
+	shardSets []ShardSetInfo
+	endpoints map[string]string
+	workflows map[string]WorkflowInfo
+}
+
+func (f *fakeProber) ShardSets(_ context.Context, _ string) ([]ShardSetInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]ShardSetInfo, len(f.shardSets))
+	copy(out, f.shardSets)
+	return out, nil
+}
+
+func (f *fakeProber) MaterializeShardSet(_ context.Context, _ string, name string, generation int64, state string, ranges placement.RangeSet) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, s := range f.shardSets {
+		if s.Name == name {
+			if len(s.Ranges) > 0 {
+				return fmt.Errorf("shard set %s already has ranges", name)
+			}
+			f.shardSets[i].Ranges = ranges
+			f.shardSets[i].State = state
+			return nil
+		}
+	}
+	f.shardSets = append(f.shardSets, ShardSetInfo{Name: name, Generation: generation, State: state, Ranges: ranges})
+	return nil
+}
+
+func (f *fakeProber) DropShardSet(_ context.Context, _ string, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	kept := f.shardSets[:0]
+	for _, s := range f.shardSets {
+		if s.Name != name {
+			kept = append(kept, s)
+		}
+	}
+	f.shardSets = kept
+	for k := range f.endpoints {
+		if strings.HasPrefix(k, name+"/") {
+			delete(f.endpoints, k)
+		}
+	}
+	return nil
+}
+
+func (f *fakeProber) ReshardWorkflow(_ context.Context, _ string, set string) (WorkflowInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.workflows[set], nil
+}
+
+// setShardSetState mimics the controller moving a pending set along.
+func (f *fakeProber) setShardSetState(name, state string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.shardSets {
+		if f.shardSets[i].Name == name {
+			f.shardSets[i].State = state
+		}
+	}
+}
+
+func (f *fakeProber) shardSet(name string) (ShardSetInfo, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, s := range f.shardSets {
+		if s.Name == name {
+			return s, true
+		}
+	}
+	return ShardSetInfo{}, false
 }
 
 func (f *fakeProber) Settings(_ context.Context, _ string, names []string) (map[string]SettingState, error) {
@@ -102,10 +180,14 @@ func (f *fakeProber) ProbeStandby(_ context.Context, dsn string) (StandbyState, 
 	return StandbyState{}, errors.New("unreachable")
 }
 
-func (f *fakeProber) PublishShardStatus(_ context.Context, _ string, shardID int, _ string, epoch int64, endpoint string) error {
+func (f *fakeProber) PublishShardStatus(_ context.Context, _ string, g Group, epoch int64, endpoint string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.published = append(f.published, fmt.Sprintf("shard-%d:%d:%s", shardID, epoch, endpoint))
+	f.published = append(f.published, fmt.Sprintf("%s:%d:%s", g.Name(), epoch, endpoint))
+	if f.endpoints == nil {
+		f.endpoints = map[string]string{}
+	}
+	f.endpoints[g.ShardSet()+"/"+g.Name()] = endpoint
 	if f.journal != nil {
 		*f.journal = append(*f.journal, fmt.Sprintf("publish:%d", epoch))
 	}
@@ -496,17 +578,13 @@ func TestReplicaPDBOmittedBelowThreeMembers(t *testing.T) {
 // podIP is the deterministic fake IP of member i of group index gi.
 func podIP(gi, i int) string { return fmt.Sprintf("10.%d.0.%d", gi+1, i+1) }
 
-func markPodRunning(t *testing.T, name, ip string, ready bool) {
+func markPodRunning(t *testing.T, name, ip string) {
 	t.Helper()
 	var pod corev1.Pod
 	get(t, name, &pod)
 	pod.Status.Phase = corev1.PodRunning
 	pod.Status.PodIP = ip
-	st := corev1.ConditionFalse
-	if ready {
-		st = corev1.ConditionTrue
-	}
-	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: st}}
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
 	if err := k8sClient.Status().Update(context.Background(), &pod); err != nil {
 		t.Fatal(err)
 	}
@@ -516,7 +594,7 @@ func markPodsRunning(t *testing.T, c *pgshardv1alpha1.PgShardCluster) {
 	t.Helper()
 	for gi, g := range Groups(c) {
 		for i := 0; i < g.Replicas; i++ {
-			markPodRunning(t, g.MemberName(i), podIP(gi, i), true)
+			markPodRunning(t, g.MemberName(i), podIP(gi, i))
 		}
 	}
 }

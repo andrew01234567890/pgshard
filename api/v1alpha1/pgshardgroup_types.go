@@ -22,6 +22,13 @@ type PgShardGroupSpec struct {
 	Kind string `json:"kind"`
 	// +optional
 	ShardID *int `json:"shardId,omitempty"`
+	// ShardSet is the catalog shard set the group serves; empty means default.
+	// +optional
+	ShardSet string `json:"shardSet,omitempty"`
+	// NonServing marks a reshard target: routers never route to it and its
+	// members do not archive WAL until the set becomes serving.
+	// +optional
+	NonServing bool `json:"nonServing,omitempty"`
 }
 
 // PgShardGroupStatus is the observed state of a replication group.

@@ -34,12 +34,15 @@ Print columns: Shards, Ready, Age.
 Status: `conditions` (types Ready, Progressing, Degraded, PrimaryHealthy, ReplicationHealthy,
 Fenced, BackupHealthy, Resharding, ServingWrites, RouterReady, TuningApplied), `observedGeneration`,
 `shardMapGeneration`, `shards[]{id, rangeStart, rangeEnd, primary, epoch, members[]{name, role, ready, replayLagBytes}}`,
-`tuning.derived[]{name, value, reason}`.
+`effectiveShards` (shard count of the serving catalog shard set), `reshard{name, shardSet, generation, shards, phase}`
+(the run in flight), `tuning.derived[]{name, value, reason}`. See [resharding.md](resharding.md) for how
+`spec.shards` becomes a reshard.
 
 ## PgShardGroup (status subresource)
 
-Status-only mirror of one replication group. `spec{clusterRef, kind: catalog|shard, shardId}`;
-`status{primary, epoch, members[]}`.
+Status-only mirror of one replication group. `spec{clusterRef, kind: catalog|shard, shardId, shardSet, nonServing}`;
+`status{primary, epoch, members[]}`. `nonServing` marks a reshard target group: routers never see it and
+its members keep `archive_mode=off` until its shard set becomes serving.
 
 ## PgShardBackupPolicy (status subresource)
 
@@ -63,4 +66,8 @@ See [backup.md](backup.md#restore).
 
 ## PgShardReshard (status subresource)
 
-`spec{clusterName, targetShards (min 1)}`; `status{phase, journalIds[], progress{rowsCopied, rowsTotal, replicationLagBytes}, conditions}`.
+Generated record of one resharding run; the catalog table `pgshard.shard_ranges` is the source of truth.
+`spec{clusterName, fromGeneration (min 1), targetGeneration (min 2), targetShardSet, targetShards (min 1), targetRanges[]{shardId, rangeStart, rangeEnd}}`.
+CEL: `targetRanges` has exactly `targetShards` entries; `targetGeneration > fromGeneration`.
+`status{phase: Pending|Provisioning|Copying|Verifying|Switching|Completed|Cancelled|Failed, workflowId, targets[]{shardId, group, ready, primary}, journalIds[], message, conditions: TargetsReady, WorkflowCreated}`.
+Label `pgshard.io/reshard-source` is `spec` or `catalog`. See [resharding.md](resharding.md).

@@ -360,21 +360,74 @@ func TestRestoreSpecRules(t *testing.T) {
 	}
 }
 
-func TestReshardTargetShardsMinimum(t *testing.T) {
-	r := &pgshardv1alpha1.PgShardReshard{
-		ObjectMeta: metav1.ObjectMeta{Name: "rs1", Namespace: "default"},
-		Spec:       pgshardv1alpha1.PgShardReshardSpec{ClusterName: "c", TargetShards: 0},
+func TestReshardSpecValidation(t *testing.T) {
+	valid := func(name string) *pgshardv1alpha1.PgShardReshard {
+		return &pgshardv1alpha1.PgShardReshard{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec: pgshardv1alpha1.PgShardReshardSpec{
+				ClusterName: "c", FromGeneration: 1, TargetGeneration: 2, TargetShardSet: "g2", TargetShards: 2,
+				TargetRanges: []pgshardv1alpha1.ReshardRange{{ShardID: 0, RangeStart: -9223372036854775808, RangeEnd: -1}, {ShardID: 1, RangeStart: 0, RangeEnd: 9223372036854775807}},
+			},
+		}
 	}
-	if err := create(t, r); err == nil || !apierrors.IsInvalid(err) {
-		t.Fatalf("expected Invalid, got %v", err)
+	cases := map[string]func(*pgshardv1alpha1.PgShardReshard){
+		"zero_target_shards":          func(r *pgshardv1alpha1.PgShardReshard) { r.Spec.TargetShards = 0 },
+		"ranges_count_mismatch":       func(r *pgshardv1alpha1.PgShardReshard) { r.Spec.TargetShards = 3 },
+		"target_not_after_from":       func(r *pgshardv1alpha1.PgShardReshard) { r.Spec.FromGeneration = 2 },
+		"empty_target_set":            func(r *pgshardv1alpha1.PgShardReshard) { r.Spec.TargetShardSet = "" },
+		"negative_shard_id":           func(r *pgshardv1alpha1.PgShardReshard) { r.Spec.TargetRanges[0].ShardID = -1 },
+		"no_ranges":                   func(r *pgshardv1alpha1.PgShardReshard) { r.Spec.TargetRanges = nil; r.Spec.TargetShards = 0 },
+		"target_generation_below_two": func(r *pgshardv1alpha1.PgShardReshard) { r.Spec.TargetGeneration = 1; r.Spec.FromGeneration = 1 },
 	}
-	r.Spec.TargetShards = 8
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := valid("rs-" + name)
+			mutate(r)
+			if err := create(t, r); err == nil || !apierrors.IsInvalid(err) {
+				t.Fatalf("expected Invalid, got %v", err)
+			}
+		})
+	}
+	r := valid("rs-ok")
 	if err := create(t, r); err != nil {
 		t.Fatal(err)
 	}
 	r.Status.Phase = "Copying"
 	r.Status.JournalIDs = []string{"j1"}
+	r.Status.Targets = []pgshardv1alpha1.ReshardTargetStatus{{ShardID: 0, Group: "shard-0-g2", Ready: true}}
 	if err := k8sClient.Status().Update(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	r.Status.Phase = "Bogus"
+	if err := k8sClient.Status().Update(context.Background(), r); err == nil || !apierrors.IsInvalid(err) {
+		t.Fatalf("expected Invalid phase, got %v", err)
+	}
+}
+
+func TestClusterShardsAndReshardingValidation(t *testing.T) {
+	c := validCluster("shards-zero")
+	zero := 0
+	c.Spec.Shards = &zero
+	if err := create(t, c); err == nil || !apierrors.IsInvalid(err) {
+		t.Fatalf("expected Invalid, got %v", err)
+	}
+	c = validCluster("pause-bogus")
+	c.Spec.Resharding.PauseBefore = "later"
+	if err := create(t, c); err == nil || !apierrors.IsInvalid(err) {
+		t.Fatalf("expected Invalid, got %v", err)
+	}
+	c = validCluster("reshard-defaults")
+	two := 2
+	c.Spec.Shards = &two
+	if err := create(t, c); err != nil {
+		t.Fatal(err)
+	}
+	if c.Spec.Resharding.PauseBefore != "none" || c.Spec.Resharding.RetireOldGroupsAfter == nil || c.Spec.Resharding.RetireOldGroupsAfter.Duration != 24*time.Hour {
+		t.Fatalf("resharding defaults %+v", c.Spec.Resharding)
+	}
+	c.Status.EffectiveShards = 2
+	c.Status.Reshard = &pgshardv1alpha1.ClusterReshardStatus{Name: "x", ShardSet: "g2", Generation: 2, Shards: 4, Phase: "Provisioning"}
+	if err := k8sClient.Status().Update(context.Background(), c); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -8,12 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
-	"github.com/andrew01234567890/pgshard/internal/placement"
 )
 
 // Workflow kinds and states written to pgshard.workflows.
@@ -21,12 +19,14 @@ const (
 	KindTableRekey = "table_rekey"
 	KindReshard    = "reshard"
 
-	StatePending   = "pending"
-	StateRunning   = "running"
-	StatePaused    = "paused"
-	StateCompleted = "completed"
-	StateFailed    = "failed"
-	StateCancelled = "cancelled"
+	StatePending = "pending"
+	// StateProvisioning is a reshard whose target groups are being created.
+	StateProvisioning = "provisioning"
+	StateRunning      = "running"
+	StatePaused       = "paused"
+	StateCompleted    = "completed"
+	StateFailed       = "failed"
+	StateCancelled    = "cancelled"
 )
 
 // Serving states the controller writes to pgshard.shard_status.
@@ -41,6 +41,8 @@ type Result struct {
 	WorkflowsCreated    int
 	ShardSetsPopulated  int
 	ShardsMadeServing   int
+	ReshardsAdvanced    int
+	ReshardsCancelled   int
 	GenerationBumped    bool
 	Invalid             []string
 }
@@ -61,6 +63,9 @@ func Reconcile(ctx context.Context, conn *pgx.Conn, logger *slog.Logger) (Result
 	}
 	if err := reconcileShardSets(ctx, tx, &res); err != nil {
 		return Result{}, fmt.Errorf("controller: shard sets: %w", err)
+	}
+	if err := reconcileReshards(ctx, tx, &res); err != nil {
+		return Result{}, fmt.Errorf("controller: reshards: %w", err)
 	}
 	if res.GenerationBumped {
 		if _, err := tx.Exec(ctx, `UPDATE pgshard.shard_map_generation SET generation = generation + 1, updated_at = now()`); err != nil {
@@ -175,10 +180,13 @@ func equalPtr(a, b *string) bool {
 	return *a == *b
 }
 
+// activeStates are the workflow states that still have work to do.
+var activeStates = []string{StatePending, StateProvisioning, StateRunning, StatePaused}
+
 func workflowActive(ctx context.Context, tx pgx.Tx, id string) (bool, error) {
 	var active bool
-	err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pgshard.workflows WHERE id = $1::uuid AND state IN ($2, $3, $4))`,
-		id, StatePending, StateRunning, StatePaused).Scan(&active)
+	err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pgshard.workflows WHERE id = $1::uuid AND state = ANY($2))`,
+		id, activeStates).Scan(&active)
 	return active, err
 }
 
@@ -191,21 +199,6 @@ func createWorkflow(ctx context.Context, tx pgx.Tx, kind string, spec map[string
 	err = tx.QueryRow(ctx, `INSERT INTO pgshard.workflows (id, kind, state, spec) VALUES (gen_random_uuid(), $1, $2, $3) RETURNING id::text`,
 		kind, StatePending, body).Scan(&id)
 	return id, err
-}
-
-func rangeSet(ranges []catalog.ShardRange) placement.RangeSet {
-	out := make(placement.RangeSet, 0, len(ranges))
-	for _, r := range ranges {
-		start, end := int64(math.MinInt64), int64(math.MaxInt64)
-		if r.Lower != nil {
-			start = *r.Lower
-		}
-		if r.Upper != nil {
-			end = *r.Upper - 1
-		}
-		out = append(out, placement.Range{Start: start, End: end})
-	}
-	return out
 }
 
 func reconcileShardSets(ctx context.Context, tx pgx.Tx, res *Result) error {
@@ -229,9 +222,22 @@ func reconcileShardSets(ctx context.Context, tx pgx.Tx, res *Result) error {
 	for _, s := range statuses {
 		statusBySet[s.ShardSet] = append(statusBySet[s.ShardSet], s)
 	}
+	sets, err := catalog.ListShardSets(ctx, tx)
+	if err != nil {
+		return err
+	}
+	pending := map[string]bool{}
+	for _, ss := range sets {
+		if ss.State == catalog.ShardSetDesired || ss.State == catalog.ShardSetProvisioning {
+			pending[ss.Name] = true
+		}
+	}
 	for _, set := range order {
+		if pending[set] {
+			continue
+		}
 		desired := bySet[set]
-		if err := rangeSet(desired).Validate(); err != nil {
+		if err := catalog.RangeSet(desired).Validate(); err != nil {
 			res.Invalid = append(res.Invalid, fmt.Sprintf("shard set %s: %v", set, err))
 			continue
 		}
@@ -276,8 +282,8 @@ func reconcileShardSets(ctx context.Context, tx pgx.Tx, res *Result) error {
 		}
 		var active bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pgshard.workflows
-			WHERE kind = $1 AND spec->>'shard_set' = $2 AND state IN ($3, $4, $5))`,
-			KindReshard, set, StatePending, StateRunning, StatePaused).Scan(&active); err != nil {
+			WHERE kind = $1 AND spec->>'shard_set' = $2 AND state = ANY($3))`,
+			KindReshard, set, activeStates).Scan(&active); err != nil {
 			return err
 		}
 		if active {

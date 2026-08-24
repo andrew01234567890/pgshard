@@ -67,6 +67,21 @@ deferred constraint trigger checks at commit that the ranges of a shard set
 are contiguous and cover the whole `int8` key space, so splits and merges can
 be written as several statements in one transaction.
 
+### `pgshard.shard_sets`
+
+Since migration `0012`. One row per shard set, i.e. per generation of the
+shard map: `shard_set` (primary key), `generation` (unique, >= 1), `state`
+(`desired`, `provisioning`, `serving`, `retired`), `desired_generation`,
+`created_at`, `updated_at`. The migration inserts `('default', 1,
+'serving')` and registers any other set that already has ranges as
+`desired`. A `BEFORE INSERT` trigger on `shard_ranges` registers an unknown
+`shard_set` as `desired` with the next generation, so a split or merge
+written by SQL into a new set name is enough to start a reshard
+(see [resharding.md](resharding.md)). The operator materializes the
+serving set on first contact and pending sets from `spec.shards`; the
+controller moves `desired` to `provisioning` when it opens the reshard
+workflow. Later generations are named `g<generation>`.
+
 ### `pgshard.roles`
 
 | Column | Meaning |
@@ -108,7 +123,7 @@ Status tables are written by `pgshard_system`; `pgshard_admin` and
 | `shard_status` | `shard_set`, `shard_id`, `group_name`, `serving_state`, `primary_epoch`, `primary_endpoint`, `replay_lag_bytes`, `updated_at` |
 | `role_status` | per `(rolname, group_name)`: `state` (`in_sync`, `drifted`, `missing`, `unmanaged`, `unmanaged_superuser`), `details` (jsonb), `roles_generation`, `checked_at` (`docs/roles.md`) |
 | `role_group_status` | `group_name`, `roles_generation` the group was last materialized at, `materialized_at` |
-| `workflows` | `id` (uuid), `kind`, `state`, `spec`, `status`, `journal_ids`, `created_at`, `updated_at`, `error` |
+| `workflows` | `id` (uuid), `kind`, `state` (`pending`, `provisioning`, `running`, `paused`, `completed`, `failed`, `cancelled`), `spec`, `status`, `journal_ids`, `created_at`, `updated_at`, `error` |
 | `migrations` | DDL/DCL migrations (`docs/ddl.md`): `id` (uuid), `database`, `statement`, `kind`, `strategy` (`direct`, `concurrent`), `scope` (`all`, `home`, `existing`), `home_shard`, `state` (`queued`, `running`, `complete`, `failed`), `meta` (jsonb: run_as, object, role/verifier, roles delta, database, steps of a multistep migration), `per_shard` (jsonb per shard: state, attempts, step, error, sqlstate), `error`, `created_at`, `updated_at`, `finished_at` |
 | `xact_decisions` | Two-phase commit outcomes: `gid`, `state` (`preparing`, `commit`, `abort`), `participants`, `participant_xids` (since `0006`: the participants' `pg_current_xact_id()` in the same order, so a restore can tell a committed transaction from one that never happened), `created_at`, `decided_at` |
 | `streams` | Change streams: `name`, `spec`, `position`, `state` (`creating`, `active`, `lost`), and since migration `0009` `database`, `two_phase`, `created_at`; `pgshard_admin` may insert, update and delete |

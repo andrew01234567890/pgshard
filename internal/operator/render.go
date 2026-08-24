@@ -60,6 +60,8 @@ func (Renderer) PgShardGroup(c *pgshardv1alpha1.PgShardCluster, g Group) *pgshar
 	if g.Kind == "shard" {
 		id := g.ShardID
 		obj.Spec.ShardID = &id
+		obj.Spec.ShardSet = g.ShardSet()
+		obj.Spec.NonServing = g.NonServing
 	}
 	return obj
 }
@@ -155,6 +157,7 @@ func agentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary str
 		Lease:           agent.LeaseConfig{Enabled: true, Namespace: c.Namespace},
 		ShutdownTimeout: agent.Duration(agentShutdownTimeout),
 		SettingsHash:    tpl.SettingsHash(),
+		NonServing:      g.NonServing,
 	}
 	if override {
 		cfg.OverrideFile = configMountPath + "/" + overrideConfKey

@@ -89,6 +89,15 @@ var stateToProto = map[string]pgshardv1.WorkflowState{
 	StateCancelled: pgshardv1.WorkflowState_WORKFLOW_STATE_CANCELLED,
 }
 
+// protoState maps catalog states onto the API; provisioning is a running
+// reshard whose targets are still being created.
+func protoState(state string) pgshardv1.WorkflowState {
+	if state == StateProvisioning {
+		return pgshardv1.WorkflowState_WORKFLOW_STATE_RUNNING
+	}
+	return stateToProto[state]
+}
+
 func lookupKey[K comparable, V comparable](m map[K]V, want V) (K, bool) {
 	for k, v := range m {
 		if v == want {
@@ -108,7 +117,7 @@ type workflowRow struct {
 }
 
 func (w workflowRow) proto() *pgshardv1.Workflow {
-	out := &pgshardv1.Workflow{Id: w.ID, Kind: kindToProto[w.Kind], State: stateToProto[w.State]}
+	out := &pgshardv1.Workflow{Id: w.ID, Kind: kindToProto[w.Kind], State: protoState(w.State)}
 	var st struct {
 		Message string `json:"message"`
 	}

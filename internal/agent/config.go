@@ -74,6 +74,9 @@ type Config struct {
 	// pg_basebackup against the primary; the operator sets it once a
 	// completed backup exists.
 	RecloneFromRepo bool `json:"recloneFromRepo,omitempty"`
+	// NonServing marks a reshard target that is not part of the serving
+	// shard map yet: WAL archiving stays off until it is.
+	NonServing bool `json:"nonServing,omitempty"`
 
 	// path is where the config was loaded from; Refresh rereads it.
 	path string

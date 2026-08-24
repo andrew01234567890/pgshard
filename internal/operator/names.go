@@ -6,6 +6,7 @@ import (
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/internal/agent"
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 )
 
 // Labels applied to every object the operator manages.
@@ -59,9 +60,9 @@ const (
 	agentGRPCPort  = 9090
 	superuserName  = "postgres"
 	secretKey      = "password"
-	// shardSet is the shard map every shard group belongs to until databases
-	// can choose their own.
-	shardSet = "default"
+	// LabelShardSet on a shard group's objects names the catalog shard set
+	// it belongs to.
+	LabelShardSet = "pgshard.io/shard-set"
 )
 
 // Group is one replication group derived from the cluster spec.
@@ -71,6 +72,12 @@ type Group struct {
 	ShardID  int
 	Replicas int
 	Storage  pgshardv1alpha1.StorageSpec
+	// Generation is the shard set generation a shard group belongs to; the
+	// first generation's groups are named shard-<id>, later ones
+	// shard-<id>-g<generation> so generations never collide.
+	Generation int64
+	// NonServing marks a reshard target that routers must not see yet.
+	NonServing bool
 }
 
 // Name is the group's short name, unique within the cluster.
@@ -78,8 +85,14 @@ func (g Group) Name() string {
 	if g.Kind == "catalog" {
 		return "catalog"
 	}
+	if g.Generation > 1 {
+		return fmt.Sprintf("shard-%d-g%d", g.ShardID, g.Generation)
+	}
 	return fmt.Sprintf("shard-%d", g.ShardID)
 }
+
+// ShardSet is the catalog shard set the group's shard belongs to.
+func (g Group) ShardSet() string { return catalog.ShardSetName(g.Generation) }
 
 // Prefix is <cluster>-<group>, the stem of every child object name.
 func (g Group) Prefix() string { return g.Cluster + "-" + g.Name() }
@@ -139,30 +152,62 @@ func (g Group) HasMember(name string) bool {
 
 // Labels returns the selector labels shared by the group's objects.
 func (g Group) Labels() map[string]string {
-	return map[string]string{
+	l := map[string]string{
 		LabelCluster: g.Cluster,
 		LabelGroup:   g.Name(),
 		LabelKind:    g.Kind,
 	}
+	if g.Kind == "shard" {
+		l[LabelShardSet] = g.ShardSet()
+	}
+	return l
 }
 
-// Groups derives the catalog group and the shard groups from a cluster spec.
-func Groups(c *pgshardv1alpha1.PgShardCluster) []Group {
-	shards := 1
-	if c.Spec.Shards != nil {
-		shards = *c.Spec.Shards
+// ServingShards is the shard count of the serving shard set: what the
+// catalog materialized, or spec.shards (default 1) before the catalog exists.
+func ServingShards(c *pgshardv1alpha1.PgShardCluster) int {
+	if c.Status.EffectiveShards > 0 {
+		return c.Status.EffectiveShards
 	}
+	if c.Spec.Shards != nil {
+		return *c.Spec.Shards
+	}
+	return 1
+}
+
+// TargetGroups derives the non-serving reshard target groups from
+// status.reshard; nil when no reshard is in flight.
+func TargetGroups(c *pgshardv1alpha1.PgShardCluster) []Group {
+	rs := c.Status.Reshard
+	if rs == nil {
+		return nil
+	}
+	var out []Group
+	for i := 0; i < rs.Shards; i++ {
+		out = append(out, Group{Cluster: c.Name, Kind: "shard", ShardID: i, Replicas: shardReplicas(c), Storage: c.Spec.Storage,
+			Generation: rs.Generation, NonServing: true})
+	}
+	return out
+}
+
+func shardReplicas(c *pgshardv1alpha1.PgShardCluster) int {
+	if c.Spec.ReplicasPerShard < 1 {
+		return 3
+	}
+	return c.Spec.ReplicasPerShard
+}
+
+// Groups derives the catalog group and the serving shard groups from a
+// cluster spec and status.
+func Groups(c *pgshardv1alpha1.PgShardCluster) []Group {
+	shards := ServingShards(c)
 	catalogReplicas := c.Spec.Catalog.Replicas
 	if catalogReplicas < 1 {
 		catalogReplicas = 3
 	}
-	shardReplicas := c.Spec.ReplicasPerShard
-	if shardReplicas < 1 {
-		shardReplicas = 3
-	}
 	out := []Group{{Cluster: c.Name, Kind: "catalog", Replicas: catalogReplicas, Storage: c.Spec.Catalog.Storage}}
 	for i := 0; i < shards; i++ {
-		out = append(out, Group{Cluster: c.Name, Kind: "shard", ShardID: i, Replicas: shardReplicas, Storage: c.Spec.Storage})
+		out = append(out, Group{Cluster: c.Name, Kind: "shard", ShardID: i, Replicas: shardReplicas(c), Storage: c.Spec.Storage, Generation: 1})
 	}
 	return out
 }

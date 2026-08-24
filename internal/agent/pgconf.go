@@ -104,7 +104,7 @@ func ownedSettings(c *Config, standby, recovering bool) map[string]string {
 			set["ssl_ca_file"] = quote(c.TLS.CAFile)
 		}
 	}
-	set["archive_mode"] = onOff(c.Backup != nil)
+	set["archive_mode"] = onOff(c.Backup != nil && !c.NonServing)
 	if c.Backup != nil {
 		set["archive_command"] = quote(backup.ArchiveCommand(*c.Backup))
 		set["restore_command"] = quote(backup.RestoreCommand(*c.Backup))
