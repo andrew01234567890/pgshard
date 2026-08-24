@@ -113,6 +113,23 @@ func (PgxProber) CatalogCopyCaughtUp(ctx context.Context, srcDSN string) (bool, 
 	return true, "", nil
 }
 
+// catalogCutoverResume decides what a (re)run of the catalog cutover still
+// has to do: with the slot on the source and the subscription on the
+// target the drain proceeds; with both gone a previous run finished and
+// the cutover is a no-op; anything in between is broken state to surface.
+func catalogCutoverResume(slotOnSource, subOnTarget bool) (alreadyCutOver bool, err error) {
+	switch {
+	case slotOnSource && subOnTarget:
+		return false, nil
+	case !slotOnSource && !subOnTarget:
+		return true, nil
+	case !slotOnSource:
+		return false, fmt.Errorf("catalog subscription present on the target but its slot is gone on the source")
+	default:
+		return false, fmt.Errorf("catalog slot present on the source but the subscription is gone on the target")
+	}
+}
+
 // CutoverCatalog implements Prober.
 func (p PgxProber) CutoverCatalog(ctx context.Context, srcDSN, tgtDSN string) error {
 	src, err := pgx.Connect(ctx, srcDSN)
@@ -121,6 +138,9 @@ func (p PgxProber) CutoverCatalog(ctx context.Context, srcDSN, tgtDSN string) er
 	}
 	defer func() { _ = src.Close(ctx) }()
 	for _, q := range []string{
+		// A re-run connects to an already fenced source whose default is
+		// read-only; lift it session-locally or ALTER SYSTEM is refused.
+		`SET default_transaction_read_only = off`,
 		`ALTER SYSTEM SET default_transaction_read_only = on`,
 		`SELECT pg_reload_conf()`,
 		`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
@@ -129,6 +149,28 @@ func (p PgxProber) CutoverCatalog(ctx context.Context, srcDSN, tgtDSN string) er
 		if _, err := src.Exec(ctx, q); err != nil {
 			return fmt.Errorf("fence catalog source: %w", err)
 		}
+	}
+	tgt, err := pgx.Connect(ctx, tgtDSN)
+	if err != nil {
+		return fmt.Errorf("catalog target: %w", err)
+	}
+	defer func() { _ = tgt.Close(ctx) }()
+	var slotOnSource, subOnTarget bool
+	if err := src.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)`, CatalogUpgradeSubscription).Scan(&slotOnSource); err != nil {
+		return err
+	}
+	if err := tgt.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_subscription WHERE subname = $1)`, CatalogUpgradeSubscription).Scan(&subOnTarget); err != nil {
+		return err
+	}
+	alreadyCutOver, err := catalogCutoverResume(slotOnSource, subOnTarget)
+	if err != nil {
+		return err
+	}
+	if alreadyCutOver {
+		// The previous run dropped the subscription (and its slot) after
+		// carrying the sequences: nothing to drain, and the live target's
+		// sequences must not be rewound to the fenced source's values.
+		return nil
 	}
 	var fence string
 	if err := src.QueryRow(ctx, `SELECT pg_current_wal_lsn()::text`).Scan(&fence); err != nil {
@@ -172,11 +214,6 @@ func (p PgxProber) CutoverCatalog(ctx context.Context, srcDSN, tgtDSN string) er
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	tgt, err := pgx.Connect(ctx, tgtDSN)
-	if err != nil {
-		return fmt.Errorf("catalog target: %w", err)
-	}
-	defer func() { _ = tgt.Close(ctx) }()
 	for name, v := range sequences {
 		if _, err := tgt.Exec(ctx, `SELECT pg_catalog.setval(oid, $2, true) FROM pg_class WHERE oid = to_regclass($1) AND relkind = 'S'`, name, v); err != nil {
 			return fmt.Errorf("carry sequence %s: %w", name, err)
