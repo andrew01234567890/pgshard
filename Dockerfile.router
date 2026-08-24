@@ -14,6 +14,6 @@ FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin pgshard
 COPY --from=build /out/pgshard-router /out/pgshard-pooler /usr/local/bin/
-USER pgshard
+USER 10001:10001
 ENTRYPOINT ["pgshard-router"]
 CMD ["serve"]
