@@ -181,10 +181,10 @@ func TestResolver(t *testing.T) {
 	if got := f.decisions(); strings.Join(got, ",") != "pgshard-r-1-4:preparing" {
 		t.Fatalf("decisions left %v", got)
 	}
-	// A commit-decided gid is committed by the orphan sweep too, never
-	// rolled back: here the decision row cannot be finished because a
-	// participant is unreachable, and the sweep of the reachable shard
-	// still applies the recorded decision.
+	// A commit decision is applied on every reachable holder even while a
+	// participant is unreachable, and the row survives until the whole
+	// topology could be searched; the decision counts as committed on the
+	// pass that retires it.
 	f.prepare(1, "pgshard-r-2-1", "late-commit")
 	f.decide("pgshard-r-2-1", "commit", 0, 0, 1)
 	f.dialer.down = 0
@@ -192,7 +192,7 @@ func TestResolver(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Committed != 1 || out.RolledBack != 0 || out.Unresolved != 2 {
+	if out.Committed != 0 || out.RolledBack != 0 || out.Unresolved != 2 {
 		t.Fatalf("outcome %+v", out)
 	}
 	if got := f.values(1); strings.Join(got, ",") != "committed,late-commit" {
@@ -222,5 +222,55 @@ func TestResolver(t *testing.T) {
 	out, err = f.res.Resolve(ctx, "")
 	if err != nil || out != (Outcome{}) {
 		t.Fatalf("outcome %+v err %v", out, err)
+	}
+}
+
+func TestResolverCommitsMovedParticipant(t *testing.T) {
+	f := newResolverFixture(t)
+	ctx := context.Background()
+	// After a reshard the decision's participant id maps to a group that no
+	// longer holds the prepared transaction: it sits on another group. The
+	// commit decision must be committed where the transaction actually is.
+	f.prepare(0, "pgshard-m-1-1", "moved-commit")
+	f.decide("pgshard-m-1-1", "commit", 0, 1)
+	out, err := f.res.Resolve(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Committed != 1 || out.RolledBack != 0 || out.Unresolved != 0 {
+		t.Fatalf("outcome %+v; decisions %v", out, f.decisions())
+	}
+	if got := f.values(0); strings.Join(got, ",") != "moved-commit" {
+		t.Fatalf("shard 0 values %v: the moved participant must be committed, not rolled back", got)
+	}
+	if got := f.prepared(0); len(got) != 0 {
+		t.Fatalf("shard 0 prepared %v", got)
+	}
+	if got := f.decisions(); len(got) != 0 {
+		t.Fatalf("decisions left %v", got)
+	}
+	// While any shard of the topology cannot be searched, a decision whose
+	// listed participants show nothing prepared is kept, never deleted: the
+	// transaction may sit on the unreachable group.
+	f.prepare(0, "pgshard-m-2-1", "hidden-commit")
+	f.decide("pgshard-m-2-1", "commit", 0, 1)
+	f.dialer.down = 0
+	out, err = f.res.Resolve(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Committed != 0 || out.RolledBack != 0 {
+		t.Fatalf("outcome %+v", out)
+	}
+	if got := f.decisions(); strings.Join(got, ",") != "pgshard-m-2-1:commit" {
+		t.Fatalf("decisions %v: the row must survive an incomplete topology search", got)
+	}
+	f.dialer.down = -1
+	out, err = f.res.Resolve(ctx, "")
+	if err != nil || out.Committed != 1 || out.Unresolved != 0 {
+		t.Fatalf("outcome %+v err %v", out, err)
+	}
+	if got := f.values(0); strings.Join(got, ",") != "hidden-commit,moved-commit" {
+		t.Fatalf("shard 0 values %v", got)
 	}
 }
