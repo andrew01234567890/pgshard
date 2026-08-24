@@ -23,6 +23,7 @@ awk -F, -v pattern="$pattern" -v threshold="$threshold" -v min_base="$min_base_n
   $1 == "" || $1 ~ /^(goos|goarch|pkg|cpu|geomean)/ { next }
   metric != "sec/op" { next }
   $1 !~ pattern { next }
+  { matched++ }
   $6 == "~" || $6 == "" { next }
   {
     base_ns = $2 * 1e9; head_ns = $4 * 1e9
@@ -33,5 +34,8 @@ awk -F, -v pattern="$pattern" -v threshold="$threshold" -v min_base="$min_base_n
       fail = 1
     }
   }
-  END { exit fail }
+  END {
+    if (!matched) { printf "PERF GATE: no benchmark matched pattern %s; the gate guards nothing\n", pattern; exit 1 }
+    exit fail
+  }
 ' "$csv"

@@ -26,8 +26,11 @@ expect() { # expect <exit-code> <description>
   echo "ok: $desc"
 }
 
-csv "Noop-32,4e-10,1%,7e-10,1%,+64.00%,p=0.002 n=10" ""
+csv "GateNoop-32,4e-10,1%,7e-10,1%,+64.00%,p=0.002 n=10" ""
 expect 0 "sub-threshold no-op benchmark is ignored even when significant"
+
+csv "Noop-32,4e-10,1%,7e-10,1%,+64.00%,p=0.002 n=10" ""
+expect 1 "a run where no gated benchmark exists fails loudly"
 
 csv "GateNoop-32,5e-08,1%,2e-07,1%,+300.00%,p=0.000 n=10" ""
 expect 0 "gated benchmark below the minimum base ns/op is ignored"
