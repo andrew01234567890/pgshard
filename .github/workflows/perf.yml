@@ -48,3 +48,37 @@ jobs:
         run: |
           go test -run '^$' -bench . -benchmem -count 10 ./test/perf/... | tee bench.txt
           { echo '## Nightly benchmarks'; echo '```'; cat bench.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  # Pooling parity: PgBouncer vs pgshard router+pooler vs direct on one
+  # unsharded PostgreSQL 18 backend. Baseline collection only - does not gate.
+  parity:
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'perf')
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Build router image
+        run: docker build -f Dockerfile.router -t pgshard-router:dev .
+      - name: Run short parity matrix
+        run: |
+          PARITY_DURATION=3 PARITY_SCALE=10 PARITY_CLIENTS="1 10 100 1000" \
+            PARITY_RESULTS="$PWD/parity-out" test/perf/parity/run.sh matrix
+      - name: Comparison table
+        if: always()
+        run: |
+          if [ -f parity-out/results.csv ]; then
+            go run ./test/perf/parity/analyze parity-out/results.csv | tee parity-out/table.txt
+            { echo '## Pooling parity (short run, non-gating)'; echo '```'
+              cat parity-out/table.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: parity
+          path: parity-out/
+          if-no-files-found: ignore
