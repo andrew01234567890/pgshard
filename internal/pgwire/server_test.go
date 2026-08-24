@@ -871,3 +871,12 @@ func TestShutdownLetsOpenTransactionFinish(t *testing.T) {
 		t.Fatalf("shutdown: %v", err)
 	}
 }
+
+func TestLookupRefusalIsRelayedAs28000(t *testing.T) {
+	auth := SCRAMAuthenticator{Lookup: func(_ context.Context, user string) (string, error) {
+		return "", Errorf(CodeInvalidAuthorization, "role %q is not permitted to log in", user)
+	}}
+	ts := startServer(t, Config{Authenticator: auth})
+	_, err := pgxConnect(t, ts.addr, "batch", "pw", "")
+	assertAuthFailure(t, err, CodeInvalidAuthorization)
+}

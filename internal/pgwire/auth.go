@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	"errors"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -121,6 +122,12 @@ func (a SCRAMAuthenticator) Authenticate(ctx context.Context, startup map[string
 		return nil, Errorf(CodeInvalidAuthorization, "client selected an invalid SASL authentication mechanism %q", initial.AuthMechanism)
 	}
 	secret, err := a.Lookup(ctx, user)
+	var refusal *Error
+	if errors.As(err, &refusal) {
+		// A deliberate refusal (NOLOGIN, expired password) is relayed as-is;
+		// only unknown roles get the mock exchange below.
+		return nil, refusal
+	}
 	verifier, perr := ParseSCRAMVerifier(secret)
 	if err != nil || perr != nil {
 		// Run a throwaway exchange so a missing user is indistinguishable
