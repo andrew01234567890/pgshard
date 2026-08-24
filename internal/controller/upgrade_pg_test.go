@@ -151,6 +151,12 @@ func TestUpgradeRollbackOnPostgres(t *testing.T) {
 	mustExec(t, tgt, `INSERT INTO orders (tenant_id, note) VALUES ($1, 'written-on-19')`, tenant)
 
 	mustExec(t, f.catalog, `UPDATE pgshard.workflows SET spec = spec || '{"rollback": true}' WHERE id = $1::uuid`, id)
+	f.pass()
+	lateWritten := false
+	if _, stage, _ := f.workflow(id); stage != StageRolledBack {
+		mustExec(t, tgt, `INSERT INTO orders (tenant_id, note) VALUES ($1, 'late-write-on-19')`, tenant)
+		lateWritten = true
+	}
 	for {
 		f.pass()
 		state, stage, msg = f.workflow(id)
@@ -173,6 +179,9 @@ func TestUpgradeRollbackOnPostgres(t *testing.T) {
 	waitFor(t, 30*time.Second, func() bool {
 		return queryOne[int64](t, src, `SELECT count(*) FROM orders WHERE note = 'written-on-19'`) == 1
 	}, "post-switch write must flow back to the source")
+	if n := queryOne[int64](t, src, `SELECT count(*) FROM orders WHERE note = 'late-write-on-19'`); lateWritten && n != 1 {
+		t.Fatalf("write during the rollback catch-up lost: %d", n)
+	}
 	for sid := range 2 {
 		c := connect(t, f.appDSN("default", int32(sid)))
 		if n := queryOne[int64](t, c, `SELECT count(*) FROM pg_subscription`); n != 0 {

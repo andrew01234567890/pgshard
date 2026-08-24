@@ -224,6 +224,19 @@ func (o *pgCutover) Rollback(ctx context.Context) error {
 	if len(behind) > 0 {
 		return retryf("reverse subscriptions behind the target position: %s", strings.Join(behind, ", "))
 	}
+	// A router that missed the fence may have written on the new-major set
+	// after the positions were read; the flip back only happens once the
+	// targets stood still through a whole reverse catch-up, so that write
+	// is replicated back instead of lost.
+	for _, t := range o.wf.ids {
+		lsn, err := o.currentLSN(ctx, o.wf.set, t)
+		if err != nil {
+			return err
+		}
+		if lsn != positions[t] {
+			return retryf("target %s/%d advanced from %d to %d during the rollback catch-up", o.wf.set, t, positions[t], lsn)
+		}
+	}
 	if err := o.syncSequences(ctx, o.wf.set, o.wf.ids, o.srcSet, o.srcIDs); err != nil {
 		return err
 	}
