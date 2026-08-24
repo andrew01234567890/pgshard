@@ -3,6 +3,7 @@ package plan
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -29,17 +30,21 @@ func NewWithMetrics(m pgparser.Metrics) *Planner {
 const cursorOptHold = 0x0020
 
 // Plan parses sql and resolves the shards it touches for sess. Text the
-// bound grammar cannot parse is planned onto the home shard so the backend
-// reports the syntax error itself.
+// bound grammar rejects is refused outright: forwarding it would run it on
+// the home shard alone, silently skipping the shards a newer server's
+// grammar would have targeted.
 func (p *Planner) Plan(ctx context.Context, sess Session, sql string) (Plan, error) {
 	res, err := p.parser.Parse(ctx, sql)
 	if err != nil {
 		var perr *pgparser.Error
-		if errors.As(err, &perr) && perr.SQLState != pgparser.SyntaxErrorSQLState {
+		if errors.As(err, &perr) {
 			e := pgwire.Errorf(perr.SQLState, "%s", perr.Message)
+			if perr.SQLState == pgparser.SyntaxErrorSQLState {
+				e.Hint = "the router only forwards SQL the PostgreSQL 18 grammar accepts"
+			}
 			return Plan{Kind: Refuse, Err: e}, e
 		}
-		return sess.unsharded(), nil
+		return Plan{}, err
 	}
 	if len(res.Stmts) == 0 {
 		return sess.session(), nil
@@ -462,7 +467,32 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 		w.plan.Shards = nil
 		return nil
 	}
-	return w.unshardedOnly()
+	// Fail closed: a statement shape the planner does not recognise could
+	// write, and routing it to the home shard would run it on one shard
+	// silently. Everything the router supports is listed above.
+	return notYet(statementName(node)+" is not supported through the router", "")
+}
+
+// statementName renders the human-readable name of an unrecognised
+// statement node for the refusal message.
+func statementName(node *pgquerypb.Node) string {
+	inner := node.GetNode()
+	if inner == nil {
+		return "an empty statement"
+	}
+	name := strings.TrimPrefix(fmt.Sprintf("%T", inner), "*pgquerypb.Node_")
+	name = strings.TrimSuffix(name, "Stmt")
+	var out []byte
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if i > 0 && c >= 'A' && c <= 'Z' {
+			out = append(out, ' ')
+		}
+		out = append(out, c)
+	}
+	name = strings.ToUpper(string(out))
+	r := strings.NewReplacer("MAT VIEW", "MATERIALIZED VIEW", "SEC LABEL", "SECURITY LABEL", "SEQ ", "SEQUENCE ", "TRIG ", "TRIGGER ")
+	return r.Replace(name)
 }
 
 // unshardedOnly pins the plan to the home shard.

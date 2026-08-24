@@ -177,6 +177,7 @@ func runPGSuite(t *testing.T, image string) {
 	h := &pgHarness{addr: addr, admin: admin, src: src, srv: srv, client: pgshardv1.NewPoolerClient(conn), ck: ck, sk: sk}
 
 	t.Run("wrong_keys_rejected", h.testWrongKeys)
+	t.Run("per_database_routing", h.testPerDatabase)
 	t.Run("current_user", h.testCurrentUser)
 	t.Run("permission_denied", h.testPermissionDenied)
 	t.Run("prepared_statement", h.testPrepared)
@@ -215,6 +216,54 @@ func rows(rs []*pgshardv1.ExecuteResponse) []string {
 	return out
 }
 
+func (h *pgHarness) execDB(t *testing.T, sid, database, sql string, ident *pgshardv1.UserIdentity) []*pgshardv1.ExecuteResponse {
+	t.Helper()
+	stream, err := h.client.Execute(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := queryReq(sid, sql, gen(3, 1), ident)
+	req.Database = database
+	return roundTrip(t, stream, req)
+}
+
+func (h *pgHarness) testPerDatabase(t *testing.T) {
+	ctx := context.Background()
+	for _, sql := range []string{
+		"create database db_a owner appuser",
+		"create database db_b owner appuser",
+	} {
+		if _, err := h.admin.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	for _, db := range []string{"db_a", "db_b"} {
+		dsn := fmt.Sprintf("postgres://postgres@%s/%s?sslmode=disable", h.addr, db)
+		c, err := pgx.Connect(ctx, dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Exec(ctx, fmt.Sprintf("create table marker (v text); insert into marker values ('%s'); grant select on marker to appuser", db)); err != nil {
+			t.Fatal(err)
+		}
+		_ = c.Close(ctx)
+	}
+	for i, db := range []string{"db_a", "db_b", "db_a"} {
+		sid := fmt.Sprintf("pdb%d", i)
+		rs := h.execDB(t, sid, db, "select current_database(), v from marker", h.identity())
+		if e := firstError(rs); e != nil {
+			t.Fatalf("%s: %v", db, e)
+		}
+		if got := rows(rs); len(got) != 1 || got[0] != db+"|"+db {
+			t.Fatalf("%s: rows = %v", db, got)
+		}
+	}
+	rs := h.execDB(t, "pdbmissing", "db_missing", "select 1", h.identity())
+	if e := firstError(rs); e == nil || e.Sqlstate != "3D000" {
+		t.Fatalf("missing database must be refused with 3D000: %v", e)
+	}
+}
+
 func (h *pgHarness) testCurrentUser(t *testing.T) {
 	rs := h.exec(t, "cu", "select current_user", h.identity())
 	if e := firstError(rs); e != nil {
@@ -241,7 +290,7 @@ func (h *pgHarness) testWrongKeys(t *testing.T) {
 	ident.ScramClientKey[0] ^= 0xff
 	rs := h.exec(t, "wk", "select 1", ident)
 	e := firstError(rs)
-	if e == nil || e.Sqlstate != "53300" || !strings.Contains(e.Message, "28P01") {
+	if e == nil || e.Sqlstate != "28P01" {
 		t.Fatalf("want authentication failure surfaced, got %v", e)
 	}
 }

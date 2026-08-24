@@ -150,6 +150,12 @@ type Executor struct {
 	batchScatter     *plan.Plan
 	batchScatterStmt string
 	batchExec        []execItem
+	// batchInject maps a batch index to the requests sent right after it:
+	// the search_path reapplication a staged RESET needs before the next
+	// pipelined statement runs. hiddenExec flags, per Execute on the wire,
+	// the ones whose responses are the router's own and not the client's.
+	batchInject map[int][]*pgshardv1.ExecuteRequest
+	hiddenExec  []bool
 	// batchBinds records the binds of the batch so the targets can be
 	// aimed again when the shard map moves while the batch waits out a
 	// write fence.
@@ -167,11 +173,11 @@ type Executor struct {
 	txnPrelude []string
 	txnTouched bool
 
+	// parked holds the streams of the other shards an open transaction has
+	// touched; wroteHere says whether the current shard was written to.
 	// startupSearchPath is the search_path the client asked for at startup
 	// (options=-c search_path=...); nil means the server default.
 	startupSearchPath []string
-	// parked holds the streams of the other shards an open transaction has
-	// touched; wroteHere says whether the current shard was written to.
 	// unsent names the statements of the batch being placed, which no
 	// backend has parsed yet.
 	unsent    map[string]bool
@@ -179,6 +185,9 @@ type Executor struct {
 	wroteHere bool
 	gid       string
 	gidSeq    uint64
+	// scatterSeq numbers this session's scatter reads so their pooler
+	// session ids are never reused.
+	scatterSeq uint64
 	// releasing holds, per shard, the completion of a Release the session
 	// fired without waiting; the next stream on that shard waits for it so
 	// Reserve never pins the backend the release is still cleaning.
@@ -188,14 +197,31 @@ type Executor struct {
 func newExecutor(r *Router, info pgwire.SessionInfo, home Shard) *Executor {
 	ctx, cancel := context.WithCancel(context.Background())
 	keys := info.Auth.SCRAM
-	return &Executor{
+	e := &Executor{
 		r: r, info: info, sid: r.prefix + "-" + strconv.FormatUint(info.ID, 10), home: home, shard: home,
 		ident: &pgshardv1.UserIdentity{Username: info.User,
 			ScramClientKey: append([]byte(nil), keys.ClientKey...), ScramServerKey: append([]byte(nil), keys.ServerKey...)},
 		ctx: ctx, cancel: cancel, tx: pgwire.TxIdle,
 		stmts: map[string]prepared{}, portals: map[string]string{},
-		startupSearchPath: startupSearchPath(info.Params["options"]),
 	}
+	e.startupSearchPath = startupSearchPath(info.Params["options"])
+	return e
+}
+
+// resetsSearchPath reports whether g restores the search_path default
+// (RESET search_path, SET search_path TO DEFAULT, or RESET ALL).
+func resetsSearchPath(g gucEntry) bool {
+	return g.name == "" || (g.name == "search_path" && g.searchPath == nil)
+}
+
+// searchPathSQL renders the statement that applies path on a backend.
+func searchPathSQL(path []string) string {
+	quoted := make([]string, len(path))
+	for i, s := range path {
+		quoted[i] = `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+	}
+	value := strings.Join(quoted, ", ")
+	return "SELECT set_config('search_path', '" + strings.ReplaceAll(value, "'", "''") + "', false)"
 }
 
 // startupSearchPath extracts search_path from a startup "options" parameter
@@ -374,7 +400,7 @@ func (e *Executor) physical(name string) string {
 }
 
 func (e *Executor) needsPin() bool {
-	if len(e.gucs) > 0 || len(e.staged) > 0 || len(e.sqlPrepared) > 0 {
+	if e.startupSearchPath != nil || len(e.gucs) > 0 || len(e.staged) > 0 || len(e.sqlPrepared) > 0 {
 		return true
 	}
 	for name := range e.stmts {
@@ -503,7 +529,11 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 			e.noteExecuted(sql, pl.Kind == plan.SessionLocal)
 		}
 		if pl.Class.SetGUC && err == nil {
-			e.staged = append(e.staged, gucEntry{name: pl.Class.GUCName, sql: sql, value: pl.Class.GUCValue, searchPath: pl.Class.SearchPath})
+			g := gucEntry{name: pl.Class.GUCName, sql: sql, value: pl.Class.GUCValue, searchPath: pl.Class.SearchPath}
+			e.staged = append(e.staged, g)
+			if err := e.reapplyStartupSearchPath(ctx, g); err != nil {
+				return err
+			}
 		}
 		if err == nil {
 			e.noteSessionEffect(pl.Class, sql)
@@ -905,12 +935,37 @@ func (e *Executor) execute(portal string, maxRows int32, w pgwire.ResultWriter) 
 			return err
 		}
 		if st.class.SetGUC {
-			e.staged = append(e.staged, gucEntry{name: st.class.GUCName, sql: st.sql, value: st.class.GUCValue, searchPath: st.class.SearchPath})
+			g := gucEntry{name: st.class.GUCName, sql: st.sql, value: st.class.GUCValue, searchPath: st.class.SearchPath}
+			e.staged = append(e.staged, g)
+			defer e.injectSearchPath(g)
 		}
 		e.batchExec = append(e.batchExec, execItem{sql: st.sql, local: st.plan.Kind == plan.SessionLocal, class: st.class, tables: st.plan.Tables})
 	}
 	e.batch = append(e.batch, executeReq(portal, maxRows))
 	return nil
+}
+
+// routerSearchPathStmt names the statement the router parses to reapply
+// the startup search_path inside a batch; client statement names are
+// namespaced by physical() and cannot collide with it.
+const routerSearchPathStmt = "pgshard_search_path"
+
+// injectSearchPath queues a set_config right after the Execute of a staged
+// RESET, so a statement pipelined behind the RESET in the same Sync runs
+// under the startup search_path the planner routed it with.
+func (e *Executor) injectSearchPath(g gucEntry) {
+	if e.startupSearchPath == nil || !resetsSearchPath(g) {
+		return
+	}
+	if e.batchInject == nil {
+		e.batchInject = map[int][]*pgshardv1.ExecuteRequest{}
+	}
+	e.batchInject[len(e.batch)-1] = []*pgshardv1.ExecuteRequest{
+		parseReq(routerSearchPathStmt, searchPathSQL(e.startupSearchPath), nil),
+		bindReq(routerSearchPathStmt, routerSearchPathStmt, nil, nil, nil),
+		executeReq(routerSearchPathStmt, 0),
+		closeReq(pgwire.DescribeStatement, routerSearchPathStmt),
+	}
 }
 
 // Close implements pgwire.Executor.
@@ -935,6 +990,7 @@ func (e *Executor) failBatch() {
 	e.staged = e.staged[:e.stagedMark]
 	e.batch, e.batchStmts, e.batchFailed, e.batchWriter = nil, nil, true, nil
 	e.batchTarget, e.batchExec, e.describes, e.batchBinds = nil, nil, nil, nil
+	e.batchInject = nil
 	e.batchScatter, e.batchScatterStmt = nil, ""
 }
 
@@ -956,6 +1012,8 @@ func (e *Executor) sync(ctx context.Context) error {
 	}
 	scatterPlan, scatterStmt := e.batchScatter, e.batchScatterStmt
 	e.batchScatter, e.batchScatterStmt = nil, ""
+	inject := e.batchInject
+	e.batchInject = nil
 
 	pin := false
 	fresh := map[string]bool{}
@@ -1051,15 +1109,29 @@ func (e *Executor) sync(ctx context.Context) error {
 				break
 			}
 		}
-		for _, req := range batch {
+		var hidden []bool
+		for i, req := range batch {
 			if err := e.send(req); err != nil {
 				return err
+			}
+			if _, ok := req.Message.(*pgshardv1.ExecuteRequest_Execute); ok {
+				hidden = append(hidden, false)
+			}
+			for _, inj := range inject[i] {
+				if err := e.send(inj); err != nil {
+					return err
+				}
+				if _, ok := inj.Message.(*pgshardv1.ExecuteRequest_Execute); ok {
+					hidden = append(hidden, true)
+				}
 			}
 		}
 		if err := e.send(syncReq()); err != nil {
 			return err
 		}
+		e.hiddenExec = hidden
 		err := e.pump(ctx, cw)
+		e.hiddenExec = nil
 		if err == nil {
 			for _, item := range executed {
 				e.noteExecuted(item.sql, item.local)
@@ -1068,6 +1140,23 @@ func (e *Executor) sync(ctx context.Context) error {
 		}
 		return err
 	})
+}
+
+// reapplyStartupSearchPath keeps the executing backend's search_path in step
+// with routing after g ran: a RESET restores the startup search_path on this
+// session, while the backend — which never saw the startup options — would
+// fall back to the server default the planner did not route with.
+func (e *Executor) reapplyStartupSearchPath(ctx context.Context, g gucEntry) error {
+	if e.startupSearchPath == nil || !resetsSearchPath(g) {
+		return nil
+	}
+	if err := e.send(simpleQuery(searchPathSQL(e.startupSearchPath))); err != nil {
+		return err
+	}
+	if err := e.pump(ctx, discardWriter{}); err != nil {
+		return fmt.Errorf("router: reapplying the startup search_path: %w", err)
+	}
+	return nil
 }
 
 // afterBatch settles staged GUCs and releases the pinned backend when a
@@ -1186,11 +1275,22 @@ func (e *Executor) ensurePinned(ctx context.Context) error {
 // replay re-establishes session GUCs and named prepared statements on a
 // freshly pinned backend.
 func (e *Executor) replay(ctx context.Context, skip map[string]bool) error {
-	if len(e.gucs) > 0 {
-		parts := make([]string, len(e.gucs))
-		for i, g := range e.gucs {
-			parts[i] = strings.TrimRight(strings.TrimSpace(g.sql), ";")
+	var parts []string
+	// The backend never saw the client's startup options, so a startup
+	// search_path is applied first, and re-applied after every replayed
+	// RESET: on this session RESET restores the startup value, while on
+	// the backend it would restore the server default the planner did not
+	// route with.
+	if e.startupSearchPath != nil {
+		parts = append(parts, searchPathSQL(e.startupSearchPath))
+	}
+	for _, g := range e.gucs {
+		parts = append(parts, strings.TrimRight(strings.TrimSpace(g.sql), ";"))
+		if e.startupSearchPath != nil && resetsSearchPath(g) {
+			parts = append(parts, searchPathSQL(e.startupSearchPath))
 		}
+	}
+	if len(parts) > 0 {
 		if err := e.send(simpleQuery(strings.Join(parts, "; "))); err != nil {
 			return err
 		}
@@ -1235,7 +1335,7 @@ func (e *Executor) replayStatements(ctx context.Context, skip map[string]bool) e
 }
 
 func (e *Executor) send(req *pgshardv1.ExecuteRequest) error {
-	if err := e.conn.send(req, e.sid, e.generation(), e.ident); err != nil {
+	if err := e.conn.send(req, e.sid, e.generation(), e.ident, e.info.Database); err != nil {
 		return e.poolerLost(err)
 	}
 	return nil
@@ -1297,12 +1397,18 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 		case *pgshardv1.ExecuteResponse_RowDescription:
 			werr = w.RowDescription(fieldDescriptions(m.RowDescription.Fields))
 		case *pgshardv1.ExecuteResponse_DataRow:
-			werr = w.DataRow(rowValues(m.DataRow.Columns))
+			if !e.hiddenNow() {
+				werr = w.DataRow(rowValues(m.DataRow.Columns))
+			}
 		case *pgshardv1.ExecuteResponse_CommandComplete:
-			e.lastTag = m.CommandComplete.Tag
-			werr = w.CommandComplete(m.CommandComplete.Tag)
+			if !e.popHidden() {
+				e.lastTag = m.CommandComplete.Tag
+				werr = w.CommandComplete(m.CommandComplete.Tag)
+			}
 		case *pgshardv1.ExecuteResponse_EmptyQuery:
-			werr = w.EmptyQueryResponse()
+			if !e.popHidden() {
+				werr = w.EmptyQueryResponse()
+			}
 		case *pgshardv1.ExecuteResponse_Error:
 			if firstErr == nil {
 				firstErr = toPgwireError(m.Error.GetError())
@@ -1342,6 +1448,23 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 			return werr
 		}
 	}
+}
+
+// hiddenNow reports whether the responses arriving belong to a request the
+// router injected into the batch rather than to the client's.
+func (e *Executor) hiddenNow() bool {
+	return len(e.hiddenExec) > 0 && e.hiddenExec[0]
+}
+
+// popHidden advances past the Execute whose CommandComplete just arrived
+// and reports whether it was an injected one.
+func (e *Executor) popHidden() bool {
+	if len(e.hiddenExec) == 0 {
+		return false
+	}
+	h := e.hiddenExec[0]
+	e.hiddenExec = e.hiddenExec[1:]
+	return h
 }
 
 // clientOIDs strips the parameters the router injected for sequence values

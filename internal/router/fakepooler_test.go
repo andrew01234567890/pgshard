@@ -443,6 +443,17 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 	case strings.HasPrefix(q, "reset "):
 		delete(b.gucs, strings.TrimSpace(strings.TrimPrefix(q, "reset ")))
 		return true, s.complete("RESET")
+	case strings.HasPrefix(q, "select set_config('search_path', '"):
+		val := strings.TrimPrefix(q, "select set_config('search_path', '")
+		val, _, _ = strings.Cut(val, "', false)")
+		b.gucs["search_path"] = strings.ReplaceAll(val, "''", "'")
+		if err := s.rowDesc("set_config", 25); err != nil {
+			return true, err
+		}
+		if err := s.row(b.gucs["search_path"]); err != nil {
+			return true, err
+		}
+		return true, s.complete("SELECT 1")
 	case strings.HasPrefix(q, "select current_setting('"):
 		name := strings.TrimSuffix(strings.TrimPrefix(q, "select current_setting('"), "')")
 		if err := s.rowDesc("current_setting", 25); err != nil {
@@ -474,7 +485,7 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 	case q == "copy t from stdin":
 		s.inCopy = true
 		return false, s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_CopyInResponse{CopyInResponse: &pgshardv1.CopyInResponse{}}})
-	case q == "select then stale":
+	case q == "select midrow_stale":
 		if err := s.rowDesc("n", 23); err != nil {
 			return true, err
 		}

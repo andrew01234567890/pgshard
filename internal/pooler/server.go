@@ -26,8 +26,8 @@ type Config struct {
 	Source Source
 	// Dialer is used for out-of-band CancelRequest connections.
 	Dialer Dialer
-	// Database is the PostgreSQL database every backend connects to; the
-	// wire identity carries only the role, so the shard has one database.
+	// Database is the default PostgreSQL database for sessions whose first
+	// Execute message does not name one.
 	Database string
 	Logger   *slog.Logger
 	// HealthInterval spaces Health stream updates; zero means 1s.
@@ -130,7 +130,7 @@ func (s *Server) session(id string) *session {
 // critical section: a lookup that released the lock before attaching could
 // hold a session a concurrent detach has already forgotten while a new
 // Execute registers a fresh one under the same id.
-func (s *Server) attachSession(id, role string) (*session, error) {
+func (s *Server) attachSession(id, role, database string) (*session, error) {
 	s.expireReservations(time.Now())
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -142,11 +142,17 @@ func (s *Server) attachSession(id, role string) (*session, error) {
 	if se.attached {
 		return nil, status.Error(codes.FailedPrecondition, "session already has an Execute stream")
 	}
+	if database == "" {
+		database = s.cfg.Database
+	}
+	if se.b != nil && se.database != database {
+		return nil, status.Error(codes.FailedPrecondition, "session already holds a backend for another database")
+	}
 	se.attached = true
 	se.detached = make(chan struct{})
 	se.detachedAt = time.Time{}
 	se.role = role
-	se.database = s.cfg.Database
+	se.database = database
 	return se, nil
 }
 
@@ -174,7 +180,7 @@ func (s *Server) Execute(stream pgshardv1.Pooler_ExecuteServer) error {
 	if s.draining.Load() {
 		return errUnavailable
 	}
-	se, err := s.attachSession(first.SessionId, first.User.Username)
+	se, err := s.attachSession(first.SessionId, first.User.Username, first.Database)
 	if err != nil {
 		return err
 	}
@@ -359,7 +365,11 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 		}
 		b, err = r.srv.cfg.Pool.Acquire(ctx, r.se.database, r.se.role, r.ck, r.sk)
 		if err != nil {
-			r.srv.cfg.Logger.Warn("acquire failed", "session", r.se.id, "role", r.se.role, "err", err)
+			r.srv.cfg.Logger.Warn("acquire failed", "session", r.se.id, "role", r.se.role, "database", r.se.database, "err", err)
+			var se *startupError
+			if errors.As(err, &se) {
+				return r.refuse(&pgshardv1.Error{Sqlstate: se.code, Message: se.message})
+			}
 			return r.refuse(&pgshardv1.Error{Sqlstate: "53300", Message: "no backend available: " + err.Error()})
 		}
 		if !r.setBackend(b) {

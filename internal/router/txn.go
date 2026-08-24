@@ -241,7 +241,7 @@ func (e *Executor) runReqsOn(ctx context.Context, p *txnPart, reqs []*pgshardv1.
 		return pgwire.Errorf(codeConnectionFailure, "shard %s/%d: no stream", p.shard.Set, p.shard.ID)
 	}
 	for _, req := range reqs {
-		if err := p.ps.send(cloneRequest(req), e.sid, e.r.cfg.Poolers.Generation(p.shard), e.ident); err != nil {
+		if err := p.ps.send(cloneRequest(req), e.sid, e.r.cfg.Poolers.Generation(p.shard), e.ident, e.info.Database); err != nil {
 			return pgwire.Errorf(codeConnectionFailure, "shard %s/%d: pooler connection lost: %v", p.shard.Set, p.shard.ID, err)
 		}
 	}

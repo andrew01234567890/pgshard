@@ -56,11 +56,21 @@ type Pool struct {
 	total chan struct{}
 
 	mu      sync.Mutex
-	roles   map[string]*rolePool
+	roles   map[poolKey]*rolePool
+	sems    map[string]chan struct{}
 	closed  bool
 	changed chan struct{}
 }
 
+// poolKey identifies one backend pool: backends are only interchangeable
+// within the same database and role.
+type poolKey struct {
+	database string
+	role     string
+}
+
+// rolePool holds the idle backends of one (database, role); sem is the
+// role's shard-wide quota, shared by every database the role connects to.
 type rolePool struct {
 	sem  chan struct{}
 	idle []*Backend
@@ -75,14 +85,20 @@ func NewPool(cfg PoolConfig, d Dialer) *Pool {
 
 func newPool(cfg PoolConfig, dial dialFunc) *Pool {
 	cfg = cfg.withDefaults()
-	return &Pool{cfg: cfg, dial: dial, total: make(chan struct{}, cfg.MaxBackends), roles: map[string]*rolePool{}, changed: make(chan struct{})}
+	return &Pool{cfg: cfg, dial: dial, total: make(chan struct{}, cfg.MaxBackends), roles: map[poolKey]*rolePool{}, sems: map[string]chan struct{}{}, changed: make(chan struct{})}
 }
 
-func (p *Pool) role(name string) *rolePool {
-	rp, ok := p.roles[name]
+func (p *Pool) role(database, role string) *rolePool {
+	k := poolKey{database: database, role: role}
+	rp, ok := p.roles[k]
 	if !ok {
-		rp = &rolePool{sem: make(chan struct{}, p.cfg.MaxPerRole)}
-		p.roles[name] = rp
+		sem, ok := p.sems[role]
+		if !ok {
+			sem = make(chan struct{}, p.cfg.MaxPerRole)
+			p.sems[role] = sem
+		}
+		rp = &rolePool{sem: sem}
+		p.roles[k] = rp
 	}
 	return rp
 }
@@ -98,7 +114,7 @@ func (p *Pool) Acquire(ctx context.Context, database, role string, clientKey, se
 		p.mu.Unlock()
 		return nil, ErrPoolClosed
 	}
-	rp := p.role(role)
+	rp := p.role(database, role)
 	p.mu.Unlock()
 
 	if b := p.popIdle(rp); b != nil {
@@ -248,7 +264,7 @@ func (p *Pool) expired(b *Backend) bool {
 // latter cases.
 func (p *Pool) Release(b *Backend) {
 	p.mu.Lock()
-	rp := p.role(b.role)
+	rp := p.role(b.database, b.role)
 	// A backend with buffered, unflushed messages is never reused: the next
 	// user's flush would push another session's pipeline into PostgreSQL.
 	keep := !p.closed && !b.broken && !b.hasUnflushed() && b.idle() && !p.expired(b)

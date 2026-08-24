@@ -160,6 +160,10 @@ message ExecuteRequest {
   Generation generation = 2;
   // Authenticated user; sent on the first message of a session.
   UserIdentity user = 3;
+  // Logical database the session executes against; sent on the first
+  // message of a session. Empty falls back to the pooler's configured
+  // default database.
+  string database = 4;
   // Exactly one pgwire-shaped message.
   oneof message {
     SimpleQuery simple_query = 10;

@@ -291,6 +291,35 @@ func TestStartupOptionsSearchPath(t *testing.T) {
 	}
 }
 
+func TestStartupSearchPathIsAppliedOnTheBackend(t *testing.T) {
+	h := newShardedHarness(t)
+	ctx := context.Background()
+	conn := h.connect(t, h.dsn()+"&options=-c%20search_path%3Daudit,public")
+
+	setting := func() string {
+		var v string
+		if err := conn.QueryRow(ctx, "select current_setting('search_path')").Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	if got := setting(); got != `"audit", "public"` {
+		t.Fatalf("backend search_path = %q, want the startup path the planner routes with", got)
+	}
+	if _, err := conn.Exec(ctx, "set search_path = public"); err != nil {
+		t.Fatal(err)
+	}
+	if got := setting(); got != "public" {
+		t.Fatalf("backend search_path after SET = %q, want public", got)
+	}
+	if _, err := conn.Exec(ctx, "reset search_path"); err != nil {
+		t.Fatal(err)
+	}
+	if got := setting(); got != `"audit", "public"` {
+		t.Fatalf("backend search_path after RESET = %q, want the startup path back", got)
+	}
+}
+
 func TestShardedPreparedStatementFollowsTheKey(t *testing.T) {
 	h := newShardedHarness(t)
 	ctx := context.Background()
@@ -634,5 +663,46 @@ func TestPanicInPlanningIsConfinedToTheSession(t *testing.T) {
 	var n int
 	if err := other.QueryRow(ctx, "select 1").Scan(&n); err != nil {
 		t.Fatalf("server did not survive the panic: %v", err)
+	}
+}
+
+func TestUnparseableWriteIsRefusedNotHomeRouted(t *testing.T) {
+	h := newShardedHarness(t)
+	ctx := context.Background()
+	conn := h.connect(t, h.dsn())
+
+	_, err := conn.Exec(ctx, "repack table orders", pgx.QueryExecModeSimpleProtocol)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "42601" {
+		t.Fatalf("PG19-only write must be refused with a syntax error, got %v", err)
+	}
+	for i := range h.poolers {
+		if h.ranOn(i, "repack") {
+			t.Fatalf("shard %d ran the statement the router could not parse", i)
+		}
+	}
+}
+
+func TestPipelinedResetRestoresTheStartupSearchPathInTheSameSync(t *testing.T) {
+	h := newShardedHarness(t)
+	ctx := context.Background()
+	conn := h.connect(t, h.dsn()+"&options=-c%20search_path%3Daudit,public&default_query_exec_mode=exec")
+
+	b := &pgx.Batch{}
+	b.Queue("reset search_path")
+	b.Queue("select current_setting('search_path')")
+	br := conn.SendBatch(ctx, b)
+	if _, err := br.Exec(); err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	if err := br.QueryRow().Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if err := br.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got != `"audit", "public"` {
+		t.Fatalf("statement pipelined behind RESET ran with search_path = %q, want the startup path the planner routed with", got)
 	}
 }

@@ -27,6 +27,7 @@ type fakePG struct {
 	dials   atomic.Int64
 	mu      sync.Mutex
 	seen    []string
+	dialed  []string
 	block   chan struct{}
 	// lastCK/lastSK alias the key slices handed to the most recent dial.
 	lastCK, lastSK []byte
@@ -34,14 +35,15 @@ type fakePG struct {
 
 func newFakePG() *fakePG { return &fakePG{block: make(chan struct{})} }
 
-func (f *fakePG) dial(_ context.Context, _, role string, ck, sk []byte) (*Backend, error) {
+func (f *fakePG) dial(_ context.Context, database, role string, ck, sk []byte) (*Backend, error) {
 	f.dials.Add(1)
 	f.mu.Lock()
 	f.lastCK, f.lastSK = ck, sk
+	f.dialed = append(f.dialed, database)
 	f.mu.Unlock()
 	client, server := net.Pipe()
 	go f.serve(server)
-	b := &Backend{conn: client, role: role, born: time.Now(), lastUsed: time.Now(), txStatus: 'I', pid: 4242, secret: []byte{1, 2, 3, 4}}
+	b := &Backend{conn: client, role: role, database: database, born: time.Now(), lastUsed: time.Now(), txStatus: 'I', pid: 4242, secret: []byte{1, 2, 3, 4}}
 	b.fe = pgproto3.NewFrontend(bufio.NewReader(client), client)
 	return b, nil
 }

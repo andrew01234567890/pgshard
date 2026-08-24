@@ -15,8 +15,10 @@ import (
 type want struct {
 	kind   Kind
 	shards string
-	// msg is the refusal message prefix for kind Refuse.
-	msg string
+	// msg is the refusal message prefix for kind Refuse; code overrides
+	// the expected SQLSTATE (default 0A000).
+	msg  string
+	code string
 	// deferred plans carry parameters; values resolves them at "bind".
 	values map[int32]any
 	sql    string
@@ -59,7 +61,8 @@ func golden() []want {
 		{sql: "vacuum items", kind: Unsharded, shards: "0"},
 		{sql: "lock table items", kind: Unsharded, shards: "0"},
 		{sql: "select nextval('s')", kind: Unsharded, shards: "0"},
-		{sql: "this is not sql", kind: Unsharded, shards: "0"},
+		{sql: "this is not sql", kind: Refuse, msg: "syntax error at or near", code: "42601"},
+		{sql: "repack table orders", kind: Refuse, msg: "syntax error at or near", code: "42601"},
 		{sql: "begin", kind: SessionLocal},
 		{sql: "commit", kind: SessionLocal},
 		{sql: "rollback", kind: SessionLocal},
@@ -354,6 +357,15 @@ func golden() []want {
 		{sql: "listen ch", kind: Refuse, msg: "LISTEN is not supported through the router"},
 		{sql: "notify ch", kind: Refuse, msg: "NOTIFY is not supported through the router"},
 		{sql: "declare c cursor with hold for select 1", kind: Refuse, msg: "WITH HOLD cursors are not supported through the router"},
+		// Unrecognised statement shapes fail closed instead of running on
+		// the home shard: a write the planner does not understand must
+		// never execute on one shard silently.
+		{sql: "merge into orders o using orders_src s on o.id = s.id when matched then delete", kind: Refuse, msg: "MERGE is not supported through the router"},
+		{sql: "do $$ begin delete from orders; end $$", kind: Refuse, msg: "DO is not supported through the router"},
+		{sql: "call cleanup_orders()", kind: Refuse, msg: "CALL is not supported through the router"},
+		{sql: "create function f() returns int language sql as 'select 1'", kind: Refuse, msg: "CREATE FUNCTION is not supported through the router"},
+		{sql: "refresh materialized view mv", kind: Refuse, msg: "REFRESH MATERIALIZED VIEW is not supported through the router"},
+		{sql: "security label on table orders is 'x'", kind: Refuse, msg: "SECURITY LABEL is not supported through the router"},
 		{sql: "select 1; select 2", kind: Refuse, msg: "multi-statement queries are not supported through the router"},
 	}
 }
@@ -400,7 +412,7 @@ func TestGoldenPlans(t *testing.T) {
 				pl, err = pl.Resolve(staticParams(c.values))
 			}
 			if c.kind == Refuse {
-				checkRefusal(t, pl, err, c.msg)
+				checkRefusal(t, pl, err, c.msg, c.code)
 				return
 			}
 			if err != nil {
@@ -448,8 +460,14 @@ func migrationShape(pl Plan) string {
 	return out
 }
 
-func checkRefusal(t *testing.T, pl Plan, err error, msg string) {
+func checkRefusal(t *testing.T, pl Plan, err error, msg string, codes ...string) {
 	t.Helper()
+	code := pgwire.CodeFeatureNotSupported
+	for _, c := range codes {
+		if c != "" {
+			code = c
+		}
+	}
 	if err == nil {
 		t.Fatalf("expected refusal %q, got plan %+v", msg, pl)
 	}
@@ -457,8 +475,8 @@ func checkRefusal(t *testing.T, pl Plan, err error, msg string) {
 	if !errors.As(err, &pe) {
 		t.Fatalf("refusal is not a pgwire error: %v", err)
 	}
-	if pe.Code != pgwire.CodeFeatureNotSupported {
-		t.Fatalf("SQLSTATE = %s, want 0A000 (%v)", pe.Code, err)
+	if pe.Code != code {
+		t.Fatalf("SQLSTATE = %s, want %s (%v)", pe.Code, code, err)
 	}
 	if !strings.HasPrefix(pe.Message, msg) {
 		t.Fatalf("message = %q, want prefix %q", pe.Message, msg)

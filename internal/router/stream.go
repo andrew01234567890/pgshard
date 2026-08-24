@@ -57,12 +57,14 @@ func (ps *poolerStream) reader() {
 	}
 }
 
-// send stamps req and writes it; the identity travels on the first message.
-func (ps *poolerStream) send(req *pgshardv1.ExecuteRequest, sid string, gen *pgshardv1.Generation, ident *pgshardv1.UserIdentity) error {
+// send stamps req and writes it; the identity and database travel on the
+// first message.
+func (ps *poolerStream) send(req *pgshardv1.ExecuteRequest, sid string, gen *pgshardv1.Generation, ident *pgshardv1.UserIdentity, database string) error {
 	req.SessionId = sid
 	req.Generation = gen
 	if ps.first {
 		req.User = ident
+		req.Database = database
 		ps.first = false
 	}
 	return ps.stream.Send(req)
