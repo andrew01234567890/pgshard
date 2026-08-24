@@ -243,6 +243,10 @@ func (c *Copier) switchWrites(ctx context.Context, wf *copyWorkflow, ops cutover
 					if rerr := ops.Release(ctx); rerr != nil {
 						return false, rerr
 					}
+					return false, err
+				}
+				if wf.cutover.FencedAt != nil && c.now().Sub(*wf.cutover.FencedAt) > c.cutoverTimeout() {
+					return c.abortSwitch(ctx, wf, ops, fmt.Sprintf("step %s did not finish within %s: %s", step, c.cutoverTimeout(), err))
 				}
 				return false, err
 			}
@@ -349,6 +353,28 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 			return false, err
 		}
 	case StepFlip:
+		// Last check before the flip: a router that missed the fence may
+		// have written (or called nextval) after the recorded positions;
+		// the flip only happens once the targets applied everything the
+		// sources hold and the sources stood still through the check.
+		pos, err := ops.Positions(ctx)
+		if err != nil {
+			return false, err
+		}
+		ok, why, err := ops.CaughtUp(ctx, pos)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return true, retryf("%s", why)
+		}
+		if !maps.Equal(pos, wf.cutover.Positions) {
+			wf.cutover.Positions = pos
+			if err := c.saveCutover(ctx, wf, "switching: sources advanced before the flip; positions re-recorded"); err != nil {
+				return false, err
+			}
+			return true, retryf("sources advanced past the recorded positions before the flip")
+		}
 		if err := ops.Flip(ctx, wf.cutover.JournalID); err != nil {
 			return false, err
 		}
@@ -360,6 +386,21 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 			}
 		}
 	case StepSwap:
+		// The forward subscriptions stay enabled until here; before they
+		// are disabled the targets must have applied everything the (now
+		// fenced and retired) sources wrote, or a last write acked on a
+		// source would be dropped.
+		pos, err := ops.Positions(ctx)
+		if err != nil {
+			return false, err
+		}
+		ok, why, err := ops.CaughtUp(ctx, pos)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return true, retryf("%s", why)
+		}
 		if err := ops.Swap(ctx); err != nil {
 			return false, err
 		}

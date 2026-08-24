@@ -131,7 +131,8 @@ func (h *cutoverHarness) runUntil(t *testing.T, stage string) {
 func TestCutoverHappyPath(t *testing.T) {
 	h := newCutoverHarness(t)
 	h.runUntil(t, StageSwitched)
-	want := []string{"gate", StepFence, StepDrain, StepSweep, StepPositions, StepCatchUp, StepPositions, StepVerify, StepReverse, StepJournal, StepFlip, StepSwap, StepRelease}
+	want := []string{"gate", StepFence, StepDrain, StepSweep, StepPositions, StepCatchUp, StepPositions, StepVerify, StepReverse, StepJournal,
+		StepPositions, StepCatchUp, StepFlip, StepPositions, StepCatchUp, StepSwap, StepRelease}
 	if got := strings.Join(h.ops.calls, ","); got != strings.Join(want, ",") {
 		t.Fatalf("calls %s", got)
 	}
@@ -321,5 +322,75 @@ func TestCutoverSpecDefaults(t *testing.T) {
 	s = cutoverSpec{PauseBefore: PauseComplete, RetireAfterSeconds: 5}
 	if !s.paused(PauseComplete) || s.paused(PauseSwitchWrites) || s.retireAfter() != 5*time.Second {
 		t.Fatal("spec")
+	}
+}
+
+func TestCutoverFlipWaitsForLateSourceWrites(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.runUntil(t, StageSwitching)
+	boom := errors.New("boom")
+	h.ops.fail[StepJournal] = boom
+	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); !errors.Is(err, boom) {
+		t.Fatalf("err %v", err)
+	}
+	h.ops.advance = 10
+	for i := 0; i < 3; i++ {
+		_, err := h.c.cutover(context.Background(), h.wf, h.ops)
+		if err == nil || isFatal(err) {
+			t.Fatalf("pass %d: err %v", i, err)
+		}
+		if h.wf.cutover.Step != StepFlip || strings.Contains(strings.Join(h.ops.calls, ","), StepFlip) {
+			t.Fatalf("pass %d: flip must not run while the sources move (step %s, calls %v)", i, h.wf.cutover.Step, h.ops.calls)
+		}
+	}
+	h.ops.advance = 0
+	h.runUntil(t, StageSwitched)
+	if h.wf.cutover.Positions["0"] != h.ops.lsn {
+		t.Fatalf("positions %v, source at %d", h.wf.cutover.Positions, h.ops.lsn)
+	}
+}
+
+func TestCutoverSwapWaitsUntilTargetsCaughtUp(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.runUntil(t, StageSwitching)
+	boom := errors.New("boom")
+	h.ops.fail[StepSwap] = boom
+	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); !errors.Is(err, boom) {
+		t.Fatalf("err %v", err)
+	}
+	if n := strings.Count(strings.Join(h.ops.calls, ","), StepSwap); n != 1 {
+		t.Fatalf("swap called %d times", n)
+	}
+	h.ops.caughtUp = false
+	for i := 0; i < 3; i++ {
+		_, err := h.c.cutover(context.Background(), h.wf, h.ops)
+		if err == nil || isFatal(err) {
+			t.Fatalf("pass %d: err %v", i, err)
+		}
+		if n := strings.Count(strings.Join(h.ops.calls, ","), StepSwap); n != 1 {
+			t.Fatalf("pass %d: swap ran again while the targets lag (%d calls)", i, n)
+		}
+	}
+	h.ops.caughtUp = true
+	h.runUntil(t, StageSwitched)
+}
+
+func TestCutoverErroringStepBeforeJournalHitsTimeout(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.c.CutoverTimeout, h.c.CutoverAttempts = time.Second, 2
+	h.ops.sweepErr = errors.New("shard unreachable")
+	h.runUntil(t, StageSwitching)
+	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); err == nil {
+		t.Fatal("sweep error must surface")
+	}
+	if !h.ops.fenced || h.wf.cutover.Step != StepSweep {
+		t.Fatalf("step %s fenced=%t", h.wf.cutover.Step, h.ops.fenced)
+	}
+	h.clock = h.clock.Add(2 * time.Second)
+	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); err != nil {
+		t.Fatalf("timeout must abort, not error: %v", err)
+	}
+	if h.wf.stage != StageAwaitingSwitch || h.ops.fenced || h.wf.cutover.Attempts != 1 {
+		t.Fatalf("erroring step must undo the fence after the timeout: %s fenced=%t %+v", h.wf.stage, h.ops.fenced, h.wf.cutover)
 	}
 }
