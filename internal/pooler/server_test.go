@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -432,5 +433,27 @@ func TestDeallocateThroughExtendedProtocolDoubtsHeldStatements(t *testing.T) {
 	}
 	if h.pg.count("PARSE st1") != 2 {
 		t.Fatalf("a statement deallocated through the extended protocol must be parsed again: %v", h.pg.seen)
+	}
+}
+
+func TestDrainStartedDuringAcquireIsNotAdopted(t *testing.T) {
+	pg := newFakePG()
+	var srv *Server
+	dial := func(ctx context.Context, db, role string, ck, sk []byte) (*Backend, error) {
+		b, err := pg.dial(ctx, db, role, ck, sk)
+		srv.draining.Store(true)
+		return b, err
+	}
+	src := NewStaticSource(View{Generation: 7, Epoch: 3, Role: pgshardv1.HealthStatus_ROLE_PRIMARY, Serving: true})
+	srv = NewServer(Config{Pool: newPool(PoolConfig{}, dial), Source: src, Database: "app", Logger: slog.New(slog.DiscardHandler)})
+	stream := &recordingStream{ctx: context.Background(), in: []*pgshardv1.ExecuteRequest{queryReq("s", "select 1", gen(7, 3), identity("alice"))}}
+	if err := srv.Execute(stream); err != nil {
+		t.Fatal(err)
+	}
+	if e := firstError(stream.out); e == nil || e.Sqlstate != "57P03" {
+		t.Fatalf("statement adopted a backend after drain began: %v", e)
+	}
+	if srv.held() != 0 || pg.queries.Load() != 0 {
+		t.Fatalf("held %d, queries %d: the backend ran after Drain", srv.held(), pg.queries.Load())
 	}
 }

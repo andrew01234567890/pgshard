@@ -256,10 +256,18 @@ func (r *relay) reserved() bool {
 	return r.se.reserved
 }
 
-func (r *relay) setBackend(b *Backend) {
+// setBackend hands b to the session. It reports false, leaving the session
+// empty, when a Drain began after b was acquired: Drain releases only what
+// sessions held when it looked, so a backend adopted afterwards would run
+// on a pool that is closing.
+func (r *relay) setBackend(b *Backend) bool {
 	r.srv.mu.Lock()
 	defer r.srv.mu.Unlock()
+	if b != nil && r.srv.draining.Load() {
+		return false
+	}
 	r.se.b = b
+	return true
 }
 
 func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error {
@@ -291,7 +299,10 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 			r.srv.cfg.Logger.Warn("acquire failed", "session", r.se.id, "role", r.se.role, "err", err)
 			return r.refuse(&pgshardv1.Error{Sqlstate: "53300", Message: "no backend available: " + err.Error()})
 		}
-		r.setBackend(b)
+		if !r.setBackend(b) {
+			r.srv.cfg.Pool.Discard(b)
+			return r.refuse(&pgshardv1.Error{Sqlstate: "57P03", Message: "pooler is draining"})
+		}
 	}
 	r.forward(b, fm)
 	if !flushesBackend(req) {
