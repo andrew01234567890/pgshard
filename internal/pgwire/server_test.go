@@ -15,6 +15,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -879,4 +880,39 @@ func TestLookupRefusalIsRelayedAs28000(t *testing.T) {
 	ts := startServer(t, Config{Authenticator: auth})
 	_, err := pgxConnect(t, ts.addr, "batch", "pw", "")
 	assertAuthFailure(t, err, CodeInvalidAuthorization)
+}
+
+func TestStartupConnCapRefusesPolitely(t *testing.T) {
+	ts := startServer(t, Config{MaxStartupConns: 1, StartupTimeout: time.Minute})
+	stalled, err := net.Dial("tcp", ts.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stalled.Close() }()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(ts.startupSem) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("stalled connection never claimed the startup slot")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	c := dialRaw(t, ts.addr)
+	msg, ok := c.recv().(*pgproto3.ErrorResponse)
+	if !ok || msg.Code != CodeTooManyConnections {
+		t.Fatalf("got %+v, want SQLSTATE %s", msg, CodeTooManyConnections)
+	}
+}
+
+func TestStartupTimeoutClosesHalfOpenConns(t *testing.T) {
+	ts := startServer(t, Config{StartupTimeout: 100 * time.Millisecond})
+	conn, err := net.Dial("tcp", ts.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("half-open startup was not closed by the server: %v", err)
+	}
+	waitNoSessions(t, ts.Server)
 }

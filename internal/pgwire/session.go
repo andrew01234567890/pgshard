@@ -10,6 +10,7 @@ import (
 	"net"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -163,7 +164,21 @@ func (s *session) run() {
 	if !s.beginMessage() {
 		return
 	}
+	if !s.server.acquireStartup() {
+		s.endMessage()
+		s.terminate(Errorf(CodeTooManyConnections, "sorry, too many clients already (startup)"))
+		return
+	}
+	if d := s.server.cfg.StartupTimeout; d > 0 {
+		_ = s.conn.SetDeadline(time.Now().Add(d))
+	}
 	err := s.startup(ctx)
+	s.server.releaseStartup()
+	if err == nil {
+		// s.conn may have been replaced by the TLS upgrade; clearing the
+		// deadline through it reaches the underlying connection.
+		_ = s.conn.SetDeadline(time.Time{})
+	}
 	s.endMessage()
 	if err != nil {
 		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, errCancelRequest) {

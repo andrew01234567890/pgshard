@@ -83,6 +83,8 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	insecureDev := fs.Bool("insecure-dev", false, "talk plaintext gRPC to poolers (development only)")
 	rolesTTL := fs.Duration("roles-ttl", 5*time.Second, "how long catalog role verifiers are cached")
 	snapshotWait := fs.Duration("snapshot-wait", 30*time.Second, "time to wait for the first catalog snapshot")
+	startupTimeout := fs.Duration("startup-timeout", 10*time.Second, "time a connection may spend before authentication completes")
+	maxStartupConns := fs.Int("max-startup-conns", 100, "concurrent connections allowed in the pre-authentication phase (refused with 53300 past the cap)")
 	drain := fs.Duration("drain-timeout", 30*time.Second, "time to wait for open transactions and active queries on shutdown")
 	drainDelay := fs.Duration("drain-delay", 5*time.Second, "time between readiness turning false and closing the listener")
 	healthListen := fs.String("health-listen", "", "HTTP address for /readyz and /healthz (empty disables)")
@@ -182,11 +184,13 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	}
 	var srv *pgwire.Server
 	srvCfg := pgwire.Config{
-		Authenticator: pgwire.SCRAMAuthenticator{Lookup: roles.Lookup},
-		TLSConfig:     tlsCfg,
-		ServerVersion: "18.6 (pgshard)",
-		InstanceID:    uint32(*instanceID),
-		Logger:        logger,
+		Authenticator:   pgwire.SCRAMAuthenticator{Lookup: roles.Lookup},
+		TLSConfig:       tlsCfg,
+		ServerVersion:   "18.6 (pgshard)",
+		InstanceID:      uint32(*instanceID),
+		StartupTimeout:  *startupTimeout,
+		MaxStartupConns: *maxStartupConns,
+		Logger:          logger,
 	}
 	var forwarder *cancelpeer.Forwarder
 	if *peerListen != "" {

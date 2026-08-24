@@ -11,6 +11,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Cancel-key layouts. Protocol 3.2 keys carry the router instance prefix and
@@ -49,7 +50,16 @@ type Config struct {
 	CancelHandler CancelHandler
 	// InstanceID prefixes protocol 3.2 cancel keys; zero draws a random one.
 	InstanceID uint32
-	Logger     *slog.Logger
+	// StartupTimeout bounds the pre-authentication phase (TLS negotiation,
+	// startup packet, authentication exchange); zero means 10s, negative
+	// disables the bound.
+	StartupTimeout time.Duration
+	// MaxStartupConns caps connections in the pre-authentication phase so a
+	// flood of half-open startups cannot exhaust the server; connections
+	// past the cap are refused with 53300. Zero means 100, negative
+	// disables the cap.
+	MaxStartupConns int
+	Logger          *slog.Logger
 }
 
 // Server accepts PostgreSQL client connections.
@@ -57,6 +67,8 @@ type Server struct {
 	cfg        Config
 	instanceID uint32
 	logger     *slog.Logger
+
+	startupSem chan struct{}
 
 	mu       sync.Mutex
 	sessions map[uint64]*session
@@ -94,7 +106,37 @@ func NewServer(cfg Config) (*Server, error) {
 		}
 		id = binary.BigEndian.Uint32(b[:])
 	}
-	return &Server{cfg: cfg, instanceID: id, logger: cfg.Logger, sessions: map[uint64]*session{}}, nil
+	if cfg.StartupTimeout == 0 {
+		cfg.StartupTimeout = 10 * time.Second
+	}
+	if cfg.MaxStartupConns == 0 {
+		cfg.MaxStartupConns = 100
+	}
+	srv := &Server{cfg: cfg, instanceID: id, logger: cfg.Logger, sessions: map[uint64]*session{}}
+	if cfg.MaxStartupConns > 0 {
+		srv.startupSem = make(chan struct{}, cfg.MaxStartupConns)
+	}
+	return srv, nil
+}
+
+// acquireStartup claims a pre-authentication slot; false means the cap is
+// reached and the connection must be refused.
+func (s *Server) acquireStartup() bool {
+	if s.startupSem == nil {
+		return true
+	}
+	select {
+	case s.startupSem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) releaseStartup() {
+	if s.startupSem != nil {
+		<-s.startupSem
+	}
 }
 
 // InstanceID returns the prefix embedded in protocol 3.2 cancel keys.

@@ -13,6 +13,7 @@ const (
 	CodeFeatureNotSupported  = "0A000"
 	CodeInvalidPassword      = "28P01"
 	CodeInvalidAuthorization = "28000"
+	CodeTooManyConnections   = "53300"
 	CodeAdminShutdown        = "57P01"
 	CodeQueryCanceled        = "57014"
 	CodeSyntaxError          = "42601"
