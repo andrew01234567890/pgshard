@@ -64,7 +64,7 @@ tests are authoritative.
 |---|---|---|
 | Online DDL/DCL fan-out as migrations; idempotent per-shard resume; sync + async wait | Implemented | `internal/controller/applier.go`, [ddl.md](ddl.md) |
 | Weaker-lock strategies (NOT VALID+VALIDATE, concurrent index PK/UNIQUE, DETACH CONCURRENTLY) | Implemented | [ddl.md](ddl.md) |
-| Rewrite-class DDL (`ALTER COLUMN ... TYPE`, volatile-default ADD COLUMN, ...) — online schema change | Planned | refused with `0A000` |
+| Rewrite-class DDL (`ALTER COLUMN ... TYPE`, volatile-default ADD COLUMN, ...) — online schema change | Implemented | OID-preserving column duplication with trigger backfill; router hides the working column; [online-ddl.md](online-ddl.md), `internal/controller/rewrite.go`, `internal/router/plan/hide.go` |
 | Cluster-wide roles/grants with one SCRAM verifier, drift detection and repair | Implemented | `internal/controller/roles.go`, [roles.md](roles.md) |
 | Superuser/replication/BYPASSRLS role management through the router | Planned | refused by design; manage on the shards directly |
 
@@ -104,7 +104,7 @@ tests are authoritative.
 |---|---|---|
 | Admin UI: topology, backups/restores/restore points, migrations, streams; JSON APIs; SSE live updates | Implemented | `internal/admin`, [admin.md](admin.md) |
 | Admin UI authentication | Planned | front with an authenticating proxy |
-| Router metrics endpoint (in-doubt counter) | Partial | `/metrics` exists; broader metric coverage across components pending |
+| Router metrics endpoint | Implemented | Prometheus metrics across router, pooler, controller and agent; [observability.md](observability.md), `internal/metrics` |
 
 ## Testing and CI
 
