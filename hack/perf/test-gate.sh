@@ -41,7 +41,8 @@ expect 1 "gated significant large regression fails"
 csv "GateParse-32,1e-06,1%,1.5e-06,1%,~,p=0.300 n=10" ""
 expect 0 "gated but not significant passes"
 
-csv "Parse-32,1e-06,1%,1.5e-06,1%,+50.00%,p=0.000 n=10" ""
+csv "Parse-32,1e-06,1%,1.5e-06,1%,+50.00%,p=0.000 n=10
+GateParse-32,1e-06,1%,1.0e-06,1%,~,p=0.900 n=10" ""
 expect 0 "untagged benchmark is not gated"
 
 csv "GateParse-32,1e-06,1%,1.1e-06,1%,+10.00%,p=0.000 n=10" ""
