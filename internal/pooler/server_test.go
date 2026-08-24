@@ -499,3 +499,91 @@ func TestNotificationsAreForwarded(t *testing.T) {
 		t.Fatalf("notification = %v", msg)
 	}
 }
+
+func TestDetachForgetsTheSessionBeforeANewExecuteCanReattach(t *testing.T) {
+	s := NewServer(Config{Logger: slog.New(slog.DiscardHandler)})
+	se := s.session("x")
+	s.mu.Lock()
+	se.attached = true
+	se.detached = make(chan struct{})
+	s.mu.Unlock()
+	var se2 *session
+	s.detachUnlocked = func() {
+		se2 = s.session("x")
+		s.mu.Lock()
+		se2.attached = true
+		se2.detached = make(chan struct{})
+		s.mu.Unlock()
+	}
+	s.detach(se)
+	if se2 == se {
+		t.Fatal("a new Execute reattached to the detaching session")
+	}
+	if got := s.lookup("x"); got != se2 {
+		t.Fatalf("the reattached session was forgotten: lookup returned %p, want %p", got, se2)
+	}
+}
+
+func TestSQLLevelPrepareIsClosedBeforeAParseAndResetsTheBackend(t *testing.T) {
+	h := startHarness(t, PoolConfig{})
+	ctx := context.Background()
+	if _, err := h.client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: "s", Generation: gen(7, 3)}); err != nil {
+		t.Fatal(err)
+	}
+	stream, _ := h.client.Execute(ctx)
+	unnamed := &pgshardv1.ExecuteRequest{SessionId: "s", Generation: gen(7, 3), User: identity("alice"),
+		Message: &pgshardv1.ExecuteRequest_Parse{Parse: &pgshardv1.Parse{Name: "", Sql: "PREPARE st1 AS SELECT 1"}}}
+	rs := parseBatch(t, stream, unnamed, syncReq("s"))
+	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
+		t.Fatalf("sql-level prepare: %s", got)
+	}
+	rs = parseBatch(t, stream, parseReq("s", "select 1", nil), syncReq("s"))
+	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
+		t.Fatalf("parse after sql-level prepare: %s (%v)", got, h.pg.seen)
+	}
+	if h.pg.count("CLOSE S st1") != 1 {
+		t.Fatalf("a name a SQL-level PREPARE may hold must be closed before parsing: %v", h.pg.seen)
+	}
+	_ = stream.CloseSend()
+	waitFor(t, func() bool { return !h.attached() })
+	if _, err := h.client.Release(ctx, &pgshardv1.ReleaseRequest{SessionId: "s"}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, h.pg.sawQueryFn("DISCARD ALL"))
+}
+
+func TestUnreservedSQLLevelPrepareLeavesNoStatementsInThePool(t *testing.T) {
+	h := startHarness(t, PoolConfig{})
+	ctx := context.Background()
+	stream, _ := h.client.Execute(ctx)
+	unnamed := &pgshardv1.ExecuteRequest{SessionId: "s", Generation: gen(7, 3), User: identity("alice"),
+		Message: &pgshardv1.ExecuteRequest_Parse{Parse: &pgshardv1.Parse{Name: "", Sql: "PREPARE plan1 AS SELECT 1"}}}
+	rs := parseBatch(t, stream, unnamed, syncReq("s"))
+	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
+		t.Fatalf("parse: %s", got)
+	}
+	waitFor(t, h.pg.sawQueryFn("DISCARD ALL"))
+	if _, idle := h.srv.cfg.Pool.Stats(); idle != 1 {
+		t.Fatalf("idle = %d", idle)
+	}
+}
+
+func TestCreatesPrepared(t *testing.T) {
+	cases := []struct {
+		sql  string
+		want bool
+	}{
+		{"PREPARE plan1 AS SELECT 1", true},
+		{"prepare plan1 (int) as select $1", true},
+		{"PREPARE TRANSACTION 'gid'", false},
+		{"prepare  transaction 'gid'", false},
+		{"BEGIN; PREPARE plan1 AS SELECT 1; PREPARE TRANSACTION 'gid'", true},
+		{"SELECT 'prepared'", false},
+		{"SELECT 1", false},
+	}
+	for _, c := range cases {
+		if got := createsPrepared(c.sql); got != c.want {
+			t.Errorf("createsPrepared(%q) = %v, want %v", c.sql, got, c.want)
+		}
+	}
+}

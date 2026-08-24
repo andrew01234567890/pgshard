@@ -72,6 +72,10 @@ type Server struct {
 	readers  map[string]*streamReader
 	draining atomic.Bool
 	closed   atomic.Bool
+
+	// detachUnlocked runs in tests between detach releasing the lock and
+	// recycling the backend.
+	detachUnlocked func()
 }
 
 // session is the pooler-side state for one router session.
@@ -126,14 +130,6 @@ func (s *Server) lookup(id string) *session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.sessions[id]
-}
-
-func (s *Server) forget(se *session) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.sessions[se.id] == se {
-		delete(s.sessions, se.id)
-	}
 }
 
 // Execute relays pgwire-shaped messages for one router session.
@@ -196,12 +192,20 @@ func (s *Server) detach(se *session) {
 		se.detachedAt = time.Now()
 	} else {
 		se.b = nil
+		// Forget under the same lock: dropping it after unlocking would
+		// let a new Execute for the same session id attach to this entry
+		// and then be forgotten with it.
+		if s.sessions[se.id] == se {
+			delete(s.sessions, se.id)
+		}
 	}
 	detached := se.detached
 	s.mu.Unlock()
+	if s.detachUnlocked != nil {
+		s.detachUnlocked()
+	}
 	if !keep {
 		s.recycle(b, true)
-		s.forget(se)
 	}
 	close(detached)
 }
@@ -223,12 +227,13 @@ func (s *Server) recycle(b *Backend, resetSession bool) {
 			return
 		}
 	}
-	if resetSession || len(b.prepared) > 0 {
+	if resetSession || len(b.prepared) > 0 || b.sqlPrepared {
 		if err := b.simpleQuery("DISCARD ALL"); err != nil {
 			s.cfg.Pool.Discard(b)
 			return
 		}
 		b.prepared = nil
+		b.sqlPrepared = false
 	}
 	s.cfg.Pool.Release(b)
 }
@@ -366,18 +371,21 @@ func (r *relay) forward(b *Backend, fm pgproto3.FrontendMessage) {
 		if touchesPrepared(m.Query) {
 			b.prepared.doubtAll()
 		}
+		if createsPrepared(m.Query) {
+			b.sqlPrepared = true
+		}
 		if m.Name == "" {
 			break
 		}
 		fp := statementFingerprint(m)
-		if b.prepared.holds(m.Name, fp) {
+		if !b.sqlPrepared && b.prepared.holds(m.Name, fp) {
 			r.srv.notePrepared(true)
 			b.send(&pgproto3.Close{ObjectType: 'P', Name: noopPortal})
 			r.closes = append(r.closes, closeAsParse)
 			return
 		}
 		r.srv.notePrepared(false)
-		if b.prepared.mayHold(m.Name) {
+		if b.prepared.mayHold(m.Name) || b.sqlPrepared {
 			b.send(&pgproto3.Close{ObjectType: 'S', Name: m.Name})
 			r.closes = append(r.closes, closeInjected)
 		}
@@ -396,6 +404,9 @@ func (r *relay) forward(b *Backend, fm pgproto3.FrontendMessage) {
 	case *pgproto3.Query:
 		if touchesPrepared(m.String) {
 			b.prepared.doubtAll()
+		}
+		if createsPrepared(m.String) {
+			b.sqlPrepared = true
 		}
 	}
 	b.send(fm)
@@ -514,8 +525,10 @@ func (s *Server) Release(ctx context.Context, req *pgshardv1.ReleaseRequest) (*p
 	}
 	b := se.b
 	se.b, se.reserved = nil, false
+	if s.sessions[se.id] == se {
+		delete(s.sessions, se.id)
+	}
 	s.mu.Unlock()
-	s.forget(se)
 	s.recycle(b, true)
 	return &pgshardv1.ReleaseResponse{}, nil
 }
