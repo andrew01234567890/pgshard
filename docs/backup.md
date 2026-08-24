@@ -87,7 +87,9 @@ behind the primary. Only the primary archives (`archive_mode=on`, not
   decisions}` finishes the instance's `pgshard-*` prepared transactions
   against that log (each from the database it was prepared in) and reports
   committed, rolled back and contradictions; `SetWriteFence{epoch, active,
-  reason}` raises or releases the catalog write fence. See
+  reason}` raises or releases the catalog write fence;
+  `ListPreparedTransactions` (read-only) lists the `pgshard-*` transactions
+  the instance still holds prepared. See
   [Barrier restore](#barrier-restore).
 
 ## Objects
@@ -137,10 +139,16 @@ creates one `PgShardBackup` per bound cluster, named
 unless that cluster's previous scheduled backup is still pending or running.
 `barrierSchedule` ticks instead ask each bound cluster's controller for a
 [certified barrier](#certified-barriers) named
-`<policy>-<cluster>-<yyyymmdd-hhmm>`.
+`<policy>-<cluster>-<yyyymmdd-hhmm>`. The operator dials that controller
+with the client certificate given by its `--controller-tls-cert`,
+`--controller-tls-key` and `--controller-tls-ca` flags; without them it
+dials plaintext, which only a controller run with `--insecure-dev` accepts.
 
 Policy status: `Valid` (store settings and cron expressions parse),
-`BackupHealthy` aggregated over the bound clusters, and `status.clusters[]`
+`BackupHealthy` aggregated over the bound clusters, `BarrierHealthy` (only
+with a `barrierSchedule`: `True` once the last tick reached every bound
+controller, `False` with the joined errors, `Unknown` before the first
+tick), and `status.clusters[]`
 with each cluster's `lastFullTime`/`lastDifferentialTime`/
 `lastIncrementalTime`, `healthy` and message. The cluster carries its own
 `BackupHealthy` condition (`NoPolicy` when `spec.backup.policyRef` is empty,
@@ -235,7 +243,9 @@ and immediate targets need `backupId`. When `backupId` names a completed
 value is used as the pgBackRest label for every group.
 
 Status: `Pending` → `Restoring` (cluster created) → `Recovered` when every
-primary left recovery and the cluster is `Ready`, with per-group
+primary left recovery and the cluster is `Ready` (the operator then removes
+the `pgshard.io/restore-source` annotation, so a member that later starts
+with an empty PGDATA does not restore the source's old data again), with per-group
 `sourceStanza`, `backupId`, `timeline` and `reachedTarget`; `Failed` on
 invalid specs, a missing source, an incomplete backup, an existing cluster of
 that name, a primary that crash-loops (PostgreSQL refuses to start when the WAL
@@ -306,6 +316,25 @@ contradictions and unfenced. The decision table lives in
 `TestRestoreReconciliationMatrix` (agent, `-tags integration`)
 restores a shard to points before PREPARE, between PREPARE and the decision
 and after it, and checks each outcome.
+
+### Non-barrier restores are not cluster-consistent
+
+A time, LSN, xid, name or immediate target is applied to every group
+independently: each group stops at its own point, and nothing proves the
+points agree on which two-phase transactions had committed. Such a restore
+is per-group PITR, not a cluster snapshot. After it reaches `Recovered`
+the operator asks every primary's agent for the `pgshard-*` transactions it
+still holds prepared (`Agent.ListPreparedTransactions`) and reports them:
+the condition `PreparedTransactionsPending` is `True` with the `group: gid`
+pairs and each group lists them in `status.groups[].preparedTransactions`;
+`Unknown` when a primary could not be asked; `False` when none are left.
+Leftover prepared transactions hold their locks and pin the vacuum horizon
+until finished by hand (`COMMIT PREPARED` / `ROLLBACK PREPARED` in the
+database they were prepared in), and if the target lies inside a barrier
+window the restored catalog may still carry that barrier's write fence
+(`Agent.SetWriteFence` releases it). The operator never finishes them
+itself without a decision log: use a barrier target for a consistent
+restore.
 
 ## Not yet covered
 

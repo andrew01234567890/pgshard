@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -175,5 +176,60 @@ func TestEnsureStanzaLoopRetriesAndSkipsStandby(t *testing.T) {
 	s2, f2 := newBackupServer(t, true)
 	if err := s2.inst.EnsureStanza(context.Background()); err != nil || len(f2.calls) != 0 {
 		t.Fatalf("standby must not touch the stanza: %v %v", err, f2.calls)
+	}
+}
+
+func lockBusyError(t *testing.T) error {
+	t.Helper()
+	err := exec.Command("sh", "-c", "exit 50").Run()
+	if !backup.LockBusy(err) {
+		t.Fatalf("exit 50 must read as a busy lock: %v", err)
+	}
+	if other := exec.Command("sh", "-c", "exit 28").Run(); backup.LockBusy(other) || backup.LockBusy(errors.New("exit status 50")) {
+		t.Fatal("only exit code 50 is a busy lock")
+	}
+	return err
+}
+
+func TestEnsureStanzaLoopRetriesFastWhileTheLockIsBusy(t *testing.T) {
+	s, f := newBackupServer(t, false)
+	busy := lockBusyError(t)
+	f.fail["stanza-create"] = busy
+	f.fail["stanza-upgrade"] = busy
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { s.inst.ensureStanzaLoop(ctx, time.Hour); close(done) }()
+	deadline := time.After(5 * time.Second)
+	for f.count() < 4 {
+		select {
+		case <-deadline:
+			t.Fatalf("busy lock must retry well before the slow retry: %v", f.calls)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	cancel()
+	<-done
+}
+
+func TestStanzaWaitBoundsTheFastRetries(t *testing.T) {
+	busy := lockBusyError(t)
+	n := 0
+	for i := 0; i < stanzaLockRetries; i++ {
+		if wait, fast := stanzaWait(busy, time.Hour, &n); wait != stanzaLockRetry || !fast {
+			t.Fatalf("attempt %d: wait %v fast %v", i, wait, fast)
+		}
+	}
+	if wait, fast := stanzaWait(busy, time.Hour, &n); wait != time.Hour || fast || n != 0 {
+		t.Fatalf("after %d busy attempts: wait %v fast %v n %d", stanzaLockRetries, wait, fast, n)
+	}
+	if wait, fast := stanzaWait(busy, time.Hour, &n); wait != stanzaLockRetry || !fast || n != 1 {
+		t.Fatalf("budget must reset: wait %v fast %v n %d", wait, fast, n)
+	}
+	if wait, fast := stanzaWait(errors.New("exit status 28"), time.Hour, &n); wait != time.Hour || fast || n != 0 {
+		t.Fatalf("other errors take the slow path: wait %v fast %v n %d", wait, fast, n)
+	}
+	if wait, _ := stanzaWait(busy, time.Millisecond, &n); wait != time.Millisecond {
+		t.Fatalf("fast retry never exceeds the slow one: %v", wait)
 	}
 }

@@ -468,6 +468,13 @@ spec:
                       type: string
                     message:
                       type: string
+                    preparedTransactions:
+                      description: |-
+                        PreparedTransactions are the pgshard transaction ids the group still
+                        holds prepared after recovery; only filled for non-barrier targets.
+                      items:
+                        type: string
+                      type: array
                     reachedTarget:
                       description: |-
                         ReachedTarget is true once the group's primary finished recovery and

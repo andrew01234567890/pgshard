@@ -40,6 +40,7 @@ const (
 	Agent_Expire_FullMethodName                        = "/pgshard.v1.Agent/Expire"
 	Agent_Verify_FullMethodName                        = "/pgshard.v1.Agent/Verify"
 	Agent_ListTransactionDecisions_FullMethodName      = "/pgshard.v1.Agent/ListTransactionDecisions"
+	Agent_ListPreparedTransactions_FullMethodName      = "/pgshard.v1.Agent/ListPreparedTransactions"
 	Agent_ReconcilePreparedTransactions_FullMethodName = "/pgshard.v1.Agent/ReconcilePreparedTransactions"
 	Agent_SetWriteFence_FullMethodName                 = "/pgshard.v1.Agent/SetWriteFence"
 )
@@ -100,6 +101,9 @@ type AgentClient interface {
 	// ListTransactionDecisions reads the two-phase commit decision log of the
 	// pgshard catalog this instance serves. Read-only.
 	ListTransactionDecisions(ctx context.Context, in *ListTransactionDecisionsRequest, opts ...grpc.CallOption) (*ListTransactionDecisionsResponse, error)
+	// ListPreparedTransactions lists the router-coordinated prepared
+	// transactions this instance still holds. Read-only.
+	ListPreparedTransactions(ctx context.Context, in *ListPreparedTransactionsRequest, opts ...grpc.CallOption) (*ListPreparedTransactionsResponse, error)
 	// ReconcilePreparedTransactions finishes prepared transactions on this
 	// instance against a decision log: commit-decided ones are committed,
 	// every other one rolled back, and commit-decided transactions that are
@@ -308,6 +312,16 @@ func (c *agentClient) ListTransactionDecisions(ctx context.Context, in *ListTran
 	return out, nil
 }
 
+func (c *agentClient) ListPreparedTransactions(ctx context.Context, in *ListPreparedTransactionsRequest, opts ...grpc.CallOption) (*ListPreparedTransactionsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListPreparedTransactionsResponse)
+	err := c.cc.Invoke(ctx, Agent_ListPreparedTransactions_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *agentClient) ReconcilePreparedTransactions(ctx context.Context, in *ReconcilePreparedTransactionsRequest, opts ...grpc.CallOption) (*ReconcilePreparedTransactionsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ReconcilePreparedTransactionsResponse)
@@ -384,6 +398,9 @@ type AgentServer interface {
 	// ListTransactionDecisions reads the two-phase commit decision log of the
 	// pgshard catalog this instance serves. Read-only.
 	ListTransactionDecisions(context.Context, *ListTransactionDecisionsRequest) (*ListTransactionDecisionsResponse, error)
+	// ListPreparedTransactions lists the router-coordinated prepared
+	// transactions this instance still holds. Read-only.
+	ListPreparedTransactions(context.Context, *ListPreparedTransactionsRequest) (*ListPreparedTransactionsResponse, error)
 	// ReconcilePreparedTransactions finishes prepared transactions on this
 	// instance against a decision log: commit-decided ones are committed,
 	// every other one rolled back, and commit-decided transactions that are
@@ -458,6 +475,9 @@ func (UnimplementedAgentServer) Verify(context.Context, *VerifyRequest) (*Verify
 }
 func (UnimplementedAgentServer) ListTransactionDecisions(context.Context, *ListTransactionDecisionsRequest) (*ListTransactionDecisionsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListTransactionDecisions not implemented")
+}
+func (UnimplementedAgentServer) ListPreparedTransactions(context.Context, *ListPreparedTransactionsRequest) (*ListPreparedTransactionsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListPreparedTransactions not implemented")
 }
 func (UnimplementedAgentServer) ReconcilePreparedTransactions(context.Context, *ReconcilePreparedTransactionsRequest) (*ReconcilePreparedTransactionsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ReconcilePreparedTransactions not implemented")
@@ -828,6 +848,24 @@ func _Agent_ListTransactionDecisions_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Agent_ListPreparedTransactions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListPreparedTransactionsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).ListPreparedTransactions(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_ListPreparedTransactions_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).ListPreparedTransactions(ctx, req.(*ListPreparedTransactionsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Agent_ReconcilePreparedTransactions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ReconcilePreparedTransactionsRequest)
 	if err := dec(in); err != nil {
@@ -946,6 +984,10 @@ var Agent_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListTransactionDecisions",
 			Handler:    _Agent_ListTransactionDecisions_Handler,
+		},
+		{
+			MethodName: "ListPreparedTransactions",
+			Handler:    _Agent_ListPreparedTransactions_Handler,
 		},
 		{
 			MethodName: "ReconcilePreparedTransactions",

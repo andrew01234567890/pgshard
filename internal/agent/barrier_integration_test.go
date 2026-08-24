@@ -90,6 +90,10 @@ func TestRestoreReconciliationMatrix(t *testing.T) {
 	xidW := p.psql("BEGIN; INSERT INTO t VALUES ('w'); SELECT pg_current_xact_id()")
 	xidW = xidW[strings.LastIndex(xidW, "\n")+1:]
 	p.psql("SELECT pg_create_restore_point('pgshard-b1')")
+	listed, err := p.grpc.ListPreparedTransactions(ctx, &pgshardv1.ListPreparedTransactionsRequest{})
+	if err != nil || listed.GetError() != nil || len(listed.GetPrepared()) != 3 || listed.GetPrepared()[0].GetGid() != "pgshard-x" || listed.GetPrepared()[0].GetDatabase() != "postgres" || listed.GetPrepared()[2].GetGid() != "pgshard-z" {
+		t.Fatalf("ListPreparedTransactions: %v %v", err, listed)
+	}
 	p.psql("COMMIT PREPARED 'pgshard-x'")
 	p.psql("ROLLBACK PREPARED 'pgshard-y'")
 	p.psql("ROLLBACK PREPARED 'pgshard-z'")

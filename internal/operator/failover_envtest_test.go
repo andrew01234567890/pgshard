@@ -114,7 +114,7 @@ func TestFailoverPromotesHighestFlushedSyncStandbyAndPublishesFenceFirst(t *test
 	if err := k8sClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "fo-shard-0-0"}, &corev1.Pod{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("old primary pod must not be recreated before the failover decided: %v", err)
 	}
-	if got := strings.Join(fp.published, ","); !strings.Contains(got, "shard-0:1:fo-shard-0-2.fo-shard-0-peers.default.svc:5432") {
+	if got := strings.Join(fp.published, ","); !strings.Contains(got, "shard-0:1:fo-shard-0-2.fo-shard-0-peers.default.svc:9091") {
 		t.Errorf("shard_status publication: %q", got)
 	}
 	if st := groupStatus(t, "fo-catalog"); st.Epoch != 0 || st.Primary != "fo-catalog-0" || len(fa.demotes) != 0 {

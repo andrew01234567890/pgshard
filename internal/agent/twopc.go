@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 
 	"github.com/jackc/pgx/v5"
 
@@ -37,6 +39,21 @@ func (s *Server) ListTransactionDecisions(ctx context.Context, _ *pgshardv1.List
 	}
 	for _, d := range decisions {
 		resp.Decisions = append(resp.Decisions, &pgshardv1.TransactionDecision{Gid: d.GID, State: d.State, Participants: d.Participants, ParticipantXids: d.ParticipantXIDs})
+	}
+	return resp, nil
+}
+
+// ListPreparedTransactions lists the pgshard-coordinated prepared
+// transactions of this instance. Read-only.
+func (s *Server) ListPreparedTransactions(ctx context.Context, _ *pgshardv1.ListPreparedTransactionsRequest) (*pgshardv1.ListPreparedTransactionsResponse, error) {
+	resp := &pgshardv1.ListPreparedTransactionsResponse{Epoch: s.epoch.Current()}
+	prepared, err := (&instanceParticipant{inst: s.inst}).Prepared(ctx)
+	if err != nil {
+		resp.Error = pgErr(err)
+		return resp, nil
+	}
+	for _, gid := range slices.Sorted(maps.Keys(prepared)) {
+		resp.Prepared = append(resp.Prepared, &pgshardv1.PreparedTransaction{Gid: gid, Database: prepared[gid]})
 	}
 	return resp, nil
 }

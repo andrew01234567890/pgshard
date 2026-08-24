@@ -219,7 +219,7 @@ func (Renderer) MemberRBAC(c *pgshardv1alpha1.PgShardCluster) (*corev1.ServiceAc
 	labels := map[string]string{LabelCluster: c.Name}
 	meta := metav1.ObjectMeta{Name: name, Namespace: c.Namespace, Labels: labels}
 	sa := &corev1.ServiceAccount{ObjectMeta: meta}
-	role := &rbacv1.Role{ObjectMeta: meta, Rules: MemberRules()}
+	role := &rbacv1.Role{ObjectMeta: meta, Rules: MemberRules(c)}
 	rb := &rbacv1.RoleBinding{
 		ObjectMeta: meta,
 		Subjects:   []rbacv1.Subject{{Kind: "ServiceAccount", Name: name, Namespace: c.Namespace}},
@@ -228,10 +228,18 @@ func (Renderer) MemberRBAC(c *pgshardv1alpha1.PgShardCluster) (*corev1.ServiceAc
 	return sa, role, rb
 }
 
-// MemberRules are the namespace permissions a member agent needs.
-func MemberRules() []rbacv1.PolicyRule {
+// MemberRules are the namespace permissions a member agent needs. Lease
+// writes are pinned to this cluster's own primary Leases so a compromised
+// member cannot steal or fence another cluster's primary; create cannot be
+// name-scoped in RBAC, so it stays namespace-wide.
+func MemberRules(c *pgshardv1alpha1.PgShardCluster) []rbacv1.PolicyRule {
+	var leases []string
+	for _, g := range Groups(c) {
+		leases = append(leases, g.LeaseName())
+	}
 	return []rbacv1.PolicyRule{
-		{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{"get", "list", "watch", "create", "update", "patch"}},
+		{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{"get", "list", "watch", "create"}},
+		{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, ResourceNames: leases, Verbs: []string{"get", "update", "patch"}},
 		{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"get", "list", "watch"}},
 	}
 }
@@ -241,8 +249,13 @@ func service(c *pgshardv1alpha1.PgShardCluster, g Group, name string, selector m
 		ObjectMeta: objectMeta(g, name, c.Namespace, nil),
 		Spec: corev1.ServiceSpec{
 			Selector: selector,
-			Ports:    []corev1.ServicePort{{Name: "postgres", Port: postgresPort, TargetPort: intstr.FromInt32(postgresPort)}},
+			Ports: []corev1.ServicePort{
+				{Name: "postgres", Port: postgresPort, TargetPort: intstr.FromInt32(postgresPort)},
+			},
 		},
+	}
+	if name == g.ServiceRW() {
+		svc.Spec.Ports = append(svc.Spec.Ports, corev1.ServicePort{Name: "pooler-grpc", Port: poolerGRPCPort, TargetPort: intstr.FromInt32(poolerGRPCPort)})
 	}
 	if headless {
 		svc.Spec.ClusterIP = corev1.ClusterIPNone

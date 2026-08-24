@@ -59,6 +59,9 @@ service Agent {
   // ListTransactionDecisions reads the two-phase commit decision log of the
   // pgshard catalog this instance serves. Read-only.
   rpc ListTransactionDecisions(ListTransactionDecisionsRequest) returns (ListTransactionDecisionsResponse);
+  // ListPreparedTransactions lists the router-coordinated prepared
+  // transactions this instance still holds. Read-only.
+  rpc ListPreparedTransactions(ListPreparedTransactionsRequest) returns (ListPreparedTransactionsResponse);
   // ReconcilePreparedTransactions finishes prepared transactions on this
   // instance against a decision log: commit-decided ones are committed,
   // every other one rolled back, and commit-decided transactions that are
@@ -430,6 +433,23 @@ message ListTransactionDecisionsRequest {}
 message ListTransactionDecisionsResponse {
   uint64 epoch = 1;
   repeated TransactionDecision decisions = 2;
+  Error error = 3;
+}
+
+// ListPreparedTransactionsRequest lists the pgshard prepared transactions.
+message ListPreparedTransactionsRequest {}
+
+// PreparedTransaction is one pgshard prepared transaction on this instance.
+message PreparedTransaction {
+  string gid = 1;
+  // Database the transaction was prepared in.
+  string database = 2;
+}
+
+// ListPreparedTransactionsResponse returns the prepared transactions.
+message ListPreparedTransactionsResponse {
+  uint64 epoch = 1;
+  repeated PreparedTransaction prepared = 2;
   Error error = 3;
 }
 

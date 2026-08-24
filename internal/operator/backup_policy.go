@@ -135,6 +135,7 @@ func (r *BackupPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		valid.Message = err.Error()
 	}
 	meta.SetStatusCondition(&pol.Status.Conditions, valid)
+	r.setBarrierHealthy(&pol)
 
 	clusters, err := clustersOfPolicy(ctx, r.Client, req.NamespacedName)
 	if err != nil {
@@ -208,6 +209,29 @@ func lastSuccessful(backups []pgshardv1alpha1.PgShardBackup) map[string]*metav1.
 		}
 	}
 	return out
+}
+
+// ConditionBarrierHealthy reports whether the last scheduled barrier of a
+// policy with a barrierSchedule reached every bound cluster's controller.
+const ConditionBarrierHealthy = "BarrierHealthy"
+
+// setBarrierHealthy derives BarrierHealthy from the scheduler's last tick;
+// a policy without a barrier schedule carries no such condition.
+func (r *BackupPolicyReconciler) setBarrierHealthy(pol *pgshardv1alpha1.PgShardBackupPolicy) {
+	if pol.Spec.BarrierSchedule == "" {
+		meta.RemoveStatusCondition(&pol.Status.Conditions, ConditionBarrierHealthy)
+		return
+	}
+	cond := metav1.Condition{Type: ConditionBarrierHealthy, Status: metav1.ConditionUnknown, Reason: "NotFiredYet", Message: "no scheduled barrier has run yet", ObservedGeneration: pol.Generation}
+	if last, ok := r.Scheduler.LastBarrier(client.ObjectKeyFromObject(pol)); ok {
+		cond.Status, cond.Reason = metav1.ConditionTrue, "Recorded"
+		cond.Message = fmt.Sprintf("barrier tick at %s reached every bound cluster", last.At.UTC().Format(time.RFC3339))
+		if last.Error != "" {
+			cond.Status, cond.Reason = metav1.ConditionFalse, "BarrierFailed"
+			cond.Message = fmt.Sprintf("barrier tick at %s: %s", last.At.UTC().Format(time.RFC3339), last.Error)
+		}
+	}
+	meta.SetStatusCondition(&pol.Status.Conditions, cond)
 }
 
 // BackupHealth derives the BackupHealthy condition: every scheduled type
@@ -289,6 +313,24 @@ type BackupScheduler struct {
 	specs   map[types.NamespacedName]pgshardv1alpha1.BackupSchedules
 	// barriers holds the barrier entry and cron expression per policy.
 	barriers map[types.NamespacedName]barrierEntry
+	// lastBarriers remembers how the last scheduled barrier tick of each
+	// policy went, for the BarrierHealthy condition.
+	lastBarriers map[types.NamespacedName]BarrierResult
+}
+
+// BarrierResult is the outcome of the last scheduled barrier tick of a
+// policy: the tick time and the joined errors, empty on success.
+type BarrierResult struct {
+	At    time.Time
+	Error string
+}
+
+// LastBarrier reports the last scheduled barrier outcome of a policy.
+func (s *BackupScheduler) LastBarrier(key types.NamespacedName) (BarrierResult, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.lastBarriers[key]
+	return r, ok
 }
 
 type barrierEntry struct {
@@ -300,7 +342,7 @@ type barrierEntry struct {
 func NewBackupScheduler(cl client.Client) *BackupScheduler {
 	return &BackupScheduler{client: cl, cron: cron.New(cron.WithParser(cronParser), cron.WithLocation(time.UTC)), now: time.Now,
 		entries: map[types.NamespacedName][]cron.EntryID{}, specs: map[types.NamespacedName]pgshardv1alpha1.BackupSchedules{},
-		barriers: map[types.NamespacedName]barrierEntry{}}
+		barriers: map[types.NamespacedName]barrierEntry{}, lastBarriers: map[types.NamespacedName]BarrierResult{}}
 }
 
 // SetBarrier arms (or, with "", disarms) the barrier schedule of a policy;
@@ -373,7 +415,15 @@ func (s *BackupScheduler) FireBarrier(ctx context.Context, key types.NamespacedN
 		}
 		logf.Log.WithName("backup-scheduler").Info("certified barrier recorded", "policy", key.String(), "cluster", c.Name, "barrier", name)
 	}
-	return errors.Join(errs...)
+	err = errors.Join(errs...)
+	result := BarrierResult{At: at}
+	if err != nil {
+		result.Error = err.Error()
+	}
+	s.mu.Lock()
+	s.lastBarriers[key] = result
+	s.mu.Unlock()
+	return err
 }
 
 // Start runs the cron loop until ctx ends.
@@ -424,6 +474,7 @@ func (s *BackupScheduler) Remove(key types.NamespacedName) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.removeLocked(key)
+	delete(s.lastBarriers, key)
 }
 
 func (s *BackupScheduler) removeLocked(key types.NamespacedName) {

@@ -45,7 +45,7 @@ func TestRouterDeployment(t *testing.T) {
 		t.Errorf("custom image %q", got)
 	}
 	args := strings.Join(ctr.Args, " ")
-	want := "serve --listen=:5432 --catalog-dsn=host=demo-catalog-rw.ns1.svc port=5432 user=postgres dbname=postgres --insecure-dev"
+	want := "serve --listen=:5432 --catalog-dsn=host=demo-catalog-rw.ns1.svc port=5432 user=postgres dbname=postgres --catalog-pooler=demo-catalog-rw.ns1.svc:9091 --insecure-dev"
 	if args != want {
 		t.Errorf("args\n got %q\nwant %q", args, want)
 	}

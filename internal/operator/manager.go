@@ -21,6 +21,12 @@ type Options struct {
 	AdminImage    string
 	RouterImage   string
 	Development   bool
+	// ControllerTLSCert, ControllerTLSKey and ControllerTLSCA are the
+	// client certificate and CA the operator presents to cluster
+	// controllers (scheduled barriers); unset dials plaintext.
+	ControllerTLSCert string
+	ControllerTLSKey  string
+	ControllerTLSCA   string
 }
 
 // ParseFlags parses the `run` subcommand's flags.
@@ -35,6 +41,9 @@ func ParseFlags(args []string, stderr io.Writer) (Options, error) {
 	fs.StringVar(&o.AdminImage, "admin-image", DefaultAdminImage, "image of the admin UI deployed for clusters with spec.admin.enabled")
 	fs.StringVar(&o.RouterImage, "router-image", DefaultRouterImage, "image of the router Deployment created for every cluster")
 	fs.BoolVar(&o.Development, "development", false, "human-readable logs")
+	fs.StringVar(&o.ControllerTLSCert, "controller-tls-cert", "", "client certificate for Controller gRPC calls (scheduled barriers); unset dials plaintext")
+	fs.StringVar(&o.ControllerTLSKey, "controller-tls-key", "", "client private key for Controller gRPC calls")
+	fs.StringVar(&o.ControllerTLSCA, "controller-tls-ca", "", "CA bundle controller certificates must chain to")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}
@@ -68,7 +77,13 @@ func Run(ctx context.Context, o Options) error {
 	if err := (&BackupReconciler{Client: mgr.GetClient(), Agents: GRPCAgentClient{}}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup backup reconciler: %w", err)
 	}
-	if err := (&BackupPolicyReconciler{Client: mgr.GetClient()}).SetupWithManager(mgr); err != nil {
+	barriers, err := NewGRPCBarrierClient(o.ControllerTLSCert, o.ControllerTLSKey, o.ControllerTLSCA)
+	if err != nil {
+		return fmt.Errorf("controller credentials: %w", err)
+	}
+	scheduler := NewBackupScheduler(mgr.GetClient())
+	scheduler.Barriers = barriers
+	if err := (&BackupPolicyReconciler{Client: mgr.GetClient(), Scheduler: scheduler}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup backup policy reconciler: %w", err)
 	}
 	if err := (&RestoreReconciler{Client: mgr.GetClient(), Agents: GRPCAgentClient{}, TwoPC: GRPCAgentClient{}}).SetupWithManager(mgr); err != nil {

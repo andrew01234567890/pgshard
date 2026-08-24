@@ -336,9 +336,20 @@ type RestoreReconciliationStatus struct {
 	Unfenced bool `json:"unfenced"`
 }
 
+// ConditionPreparedTransactionsPending on a PgShardRestore is True when a
+// recovered group still holds pgshard prepared transactions: a time, LSN,
+// xid, immediate or name target is applied per group and is not
+// cluster-consistent, so transactions prepared around it stay pending
+// (locks held, vacuum horizon pinned) until an operator finishes them.
+const ConditionPreparedTransactionsPending = "PreparedTransactionsPending"
+
 // GroupRestoreStatus is the progress of one group of the new cluster.
 type GroupRestoreStatus struct {
 	Group string `json:"group"`
+	// PreparedTransactions are the pgshard transaction ids the group still
+	// holds prepared after recovery; only filled for non-barrier targets.
+	// +optional
+	PreparedTransactions []string `json:"preparedTransactions,omitempty"`
 	// SourceStanza is the repository stanza the group restored from.
 	SourceStanza string `json:"sourceStanza"`
 	// +optional

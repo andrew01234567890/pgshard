@@ -93,6 +93,46 @@ func TestSchedulerFiresBarriersPerBoundCluster(t *testing.T) {
 	if want := []string{"beta.default:1 nightly-beta-20260819-0200", "demo.default:1 nightly-demo-20260819-0200"}; strings.Join(fb.calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("calls %v", fb.calls)
 	}
+	if last, ok := s.LastBarrier(key); !ok || !last.At.Equal(tick) || !strings.Contains(last.Error, "cluster beta") {
+		t.Fatalf("last barrier %+v ok=%v", last, ok)
+	}
+	r := &BackupPolicyReconciler{Client: cl, Scheduler: s, Now: func() time.Time { return tick }}
+	barrierCondition := func() *metav1.Condition {
+		t.Helper()
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+			t.Fatal(err)
+		}
+		var got pgshardv1alpha1.PgShardBackupPolicy
+		if err := cl.Get(context.Background(), key, &got); err != nil {
+			t.Fatal(err)
+		}
+		return meta.FindStatusCondition(got.Status.Conditions, ConditionBarrierHealthy)
+	}
+	if cond := barrierCondition(); cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "BarrierFailed" || !strings.Contains(cond.Message, "2026-08-19T02:00:00Z: cluster beta (beta.default:1): barrier nightly-beta-20260819-0200: drain: still in flight") {
+		t.Fatalf("failed barrier condition %+v", cond)
+	}
+	delete(fb.fail, "beta.default:1")
+	if err := s.FireBarrier(context.Background(), key); err != nil {
+		t.Fatal(err)
+	}
+	if cond := barrierCondition(); cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != "Recorded" {
+		t.Fatalf("recorded barrier condition %+v", cond)
+	}
+	s.Remove(key)
+	if cond := barrierCondition(); cond == nil || cond.Status != metav1.ConditionUnknown || cond.Reason != "NotFiredYet" {
+		t.Fatalf("fresh condition %+v", cond)
+	}
+	var stored pgshardv1alpha1.PgShardBackupPolicy
+	if err := cl.Get(context.Background(), key, &stored); err != nil {
+		t.Fatal(err)
+	}
+	stored.Spec.BarrierSchedule = ""
+	if err := cl.Update(context.Background(), &stored); err != nil {
+		t.Fatal(err)
+	}
+	if cond := barrierCondition(); cond != nil {
+		t.Fatalf("policy without barrier schedule carries %+v", cond)
+	}
 	if err := s.FireBarrier(context.Background(), types.NamespacedName{Namespace: "default", Name: "gone"}); err != nil {
 		t.Fatal("missing policy must be ignored:", err)
 	}
@@ -134,6 +174,7 @@ func TestPolicyValidateRejectsBadBarrierSchedule(t *testing.T) {
 type fakeTwoPC struct {
 	decisions []twopc.Decision
 	outcomes  map[string]twopc.Outcome
+	prepared  map[string]map[string]string
 	fail      map[string]error
 	fenceErr  error
 	calls     []string
@@ -149,6 +190,11 @@ func (f *fakeTwoPC) ReconcilePrepared(_ context.Context, addr string, epoch uint
 	return f.outcomes[addr], f.fail[addr]
 }
 
+func (f *fakeTwoPC) ListPrepared(_ context.Context, addr string) (map[string]string, error) {
+	f.calls = append(f.calls, "prepared "+addr)
+	return f.prepared[addr], f.fail[addr]
+}
+
 func (f *fakeTwoPC) SetWriteFence(_ context.Context, addr string, epoch uint64, active bool, _ string) error {
 	f.calls = append(f.calls, fmt.Sprintf("fence %s epoch=%d active=%v", addr, epoch, active))
 	return f.fenceErr
@@ -158,11 +204,16 @@ func (f *fakeTwoPC) SetWriteFence(_ context.Context, addr string, epoch uint64, 
 // primary promoted and Ready, one reconcile away from reconciliation.
 func recoveredBarrierRestore(t *testing.T, name string) (*RestoreReconciler, client.Client, *fakeTwoPC) {
 	t.Helper()
+	barrier := "b1"
+	return recoveredRestore(t, name, pgshardv1alpha1.RestoreTarget{Barrier: &barrier})
+}
+
+func recoveredRestore(t *testing.T, name string, target pgshardv1alpha1.RestoreTarget) (*RestoreReconciler, client.Client, *fakeTwoPC) {
+	t.Helper()
 	source := boundCluster("old")
 	two := 2
 	source.Spec.Shards = &two
-	barrier := "b1"
-	rs := newRestore(name, pgshardv1alpha1.PgShardRestoreSpec{ClusterName: "old", NewClusterName: "new", BackupID: "b1", Target: pgshardv1alpha1.RestoreTarget{Barrier: &barrier}})
+	rs := newRestore(name, pgshardv1alpha1.PgShardRestoreSpec{ClusterName: "old", NewClusterName: "new", BackupID: "b1", Target: target})
 	bk := completedBackup("b1", "old")
 	bk.Status.Groups = append(bk.Status.Groups, pgshardv1alpha1.GroupBackupStatus{Group: "shard-1", Stanza: "old-shard-1-pg18", BackupID: "20260819-100004F"})
 	cl := restoreClient(t, source, newPolicy(), bk, rs, superuserSecret("old"))
@@ -176,7 +227,7 @@ func recoveredBarrierRestore(t *testing.T, name string) (*RestoreReconciler, cli
 	if err := cl.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "new"}, &created); err != nil {
 		t.Fatal(err)
 	}
-	if src, _ := RestoreSourceOf(&created); src.Type != backup.TargetName || src.Target != "pgshard-b1" || src.BackupIDs["shard-1"] != "20260819-100004F" {
+	if src, _ := RestoreSourceOf(&created); target.Barrier != nil && (src.Type != backup.TargetName || src.Target != "pgshard-b1" || src.BackupIDs["shard-1"] != "20260819-100004F") {
 		t.Fatalf("restore source %+v", src)
 	}
 	for i, g := range Groups(&created) {
@@ -202,7 +253,7 @@ func recoveredBarrierRestore(t *testing.T, name string) (*RestoreReconciler, cli
 }
 
 func TestBarrierRestoreReconcilesPreparedTransactionsThenUnfences(t *testing.T) {
-	r, _, twoPC := recoveredBarrierRestore(t, "r1")
+	r, cl, twoPC := recoveredBarrierRestore(t, "r1")
 	twoPC.decisions = []twopc.Decision{{GID: "pgshard-a", State: "commit", Participants: []int32{0, 1}}, {GID: "pgshard-b", State: "abort", Participants: []int32{1}}}
 	twoPC.outcomes["10.1.0.2:9090"] = twopc.Outcome{Committed: 1}
 	twoPC.outcomes["10.1.0.3:9090"] = twopc.Outcome{Committed: 1, RolledBack: 1}
@@ -225,6 +276,13 @@ func TestBarrierRestoreReconcilesPreparedTransactionsThenUnfences(t *testing.T) 
 	}
 	if cond := meta.FindStatusCondition(got.Status.Conditions, "Progressing"); cond == nil || cond.Status != metav1.ConditionFalse || !strings.Contains(cond.Message, "unfenced: 2 committed, 1 rolled back") {
 		t.Fatalf("condition %+v", cond)
+	}
+	var created pgshardv1alpha1.PgShardCluster
+	if err := cl.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "new"}, &created); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := RestoreSourceOf(&created); ok {
+		t.Fatal("recovered barrier restore keeps the restore source annotation")
 	}
 	// Terminal: another reconcile changes nothing and calls no agent.
 	reconcileRestore(t, r, "r1")
@@ -321,3 +379,59 @@ func TestBarrierRestoreNeedsPrimaryPods(t *testing.T) {
 }
 
 func reconcileReq(key client.ObjectKey) ctrl.Request { return ctrl.Request{NamespacedName: key} }
+
+func TestNonBarrierRestoreReportsLeftoverPreparedTransactions(t *testing.T) {
+	immediate := true
+	r, _, twoPC := recoveredRestore(t, "r1", pgshardv1alpha1.RestoreTarget{Immediate: &immediate})
+	twoPC.prepared = map[string]map[string]string{"10.1.0.2:9090": {"pgshard-b": "app", "pgshard-a": "app"}}
+	res, got := reconcileRestore(t, r, "r1")
+	if got.Status.Phase != pgshardv1alpha1.RestorePhaseRecovered || res.RequeueAfter != 0 || got.Status.Error != "" || got.Status.Reconciliation != nil {
+		t.Fatalf("status %+v res %v", got.Status, res)
+	}
+	want := []string{"prepared 10.1.0.1:9090", "prepared 10.1.0.2:9090", "prepared 10.1.0.3:9090"}
+	if strings.Join(twoPC.calls, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("calls:\n%s", strings.Join(twoPC.calls, "\n"))
+	}
+	cond := meta.FindStatusCondition(got.Status.Conditions, pgshardv1alpha1.ConditionPreparedTransactionsPending)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != "PreparedTransactionsPending" || !strings.Contains(cond.Message, "2 pgshard prepared transaction(s)") || !strings.Contains(cond.Message, "shard-0: pgshard-a; shard-0: pgshard-b") {
+		t.Fatalf("condition %+v", cond)
+	}
+	if g := got.Status.Groups[1]; g.Group != "shard-0" || strings.Join(g.PreparedTransactions, ",") != "pgshard-a,pgshard-b" || got.Status.Groups[2].PreparedTransactions != nil {
+		t.Fatalf("groups %+v", got.Status.Groups)
+	}
+	if _, ok := RestoreSourceOf(mustCluster(t, r.Client, "new")); ok {
+		t.Fatal("recovered restore keeps the restore source annotation")
+	}
+
+	r, _, twoPC = recoveredRestore(t, "r2", pgshardv1alpha1.RestoreTarget{Immediate: &immediate})
+	twoPC.fail["10.1.0.3:9090"] = errors.New("agent down")
+	_, got = reconcileRestore(t, r, "r2")
+	cond = meta.FindStatusCondition(got.Status.Conditions, pgshardv1alpha1.ConditionPreparedTransactionsPending)
+	if got.Status.Phase != pgshardv1alpha1.RestorePhaseRecovered || cond == nil || cond.Status != metav1.ConditionUnknown || cond.Reason != "CheckFailed" || !strings.Contains(cond.Message, "shard-1: agent down") {
+		t.Fatalf("phase %s condition %+v", got.Status.Phase, cond)
+	}
+
+	r, _, _ = recoveredRestore(t, "r3", pgshardv1alpha1.RestoreTarget{Immediate: &immediate})
+	_, got = reconcileRestore(t, r, "r3")
+	cond = meta.FindStatusCondition(got.Status.Conditions, pgshardv1alpha1.ConditionPreparedTransactionsPending)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "NonePending" {
+		t.Fatalf("condition %+v", cond)
+	}
+
+	r, _, _ = recoveredRestore(t, "r4", pgshardv1alpha1.RestoreTarget{Immediate: &immediate})
+	r.TwoPC = nil
+	_, got = reconcileRestore(t, r, "r4")
+	cond = meta.FindStatusCondition(got.Status.Conditions, pgshardv1alpha1.ConditionPreparedTransactionsPending)
+	if got.Status.Phase != pgshardv1alpha1.RestorePhaseRecovered || cond == nil || cond.Status != metav1.ConditionUnknown || !strings.Contains(cond.Message, "no two-phase agent client") {
+		t.Fatalf("phase %s condition %+v", got.Status.Phase, cond)
+	}
+}
+
+func mustCluster(t *testing.T, cl client.Client, name string) *pgshardv1alpha1.PgShardCluster {
+	t.Helper()
+	var c pgshardv1alpha1.PgShardCluster
+	if err := cl.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: name}, &c); err != nil {
+		t.Fatal(err)
+	}
+	return &c
+}
