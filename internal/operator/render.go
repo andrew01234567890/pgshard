@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
@@ -81,6 +82,10 @@ type MemberTemplate struct {
 	// Backup is the policy the members archive to; it changes the pod
 	// (mounted Secrets) and archive_mode, so it is part of the pod hash.
 	Backup *pgshardv1alpha1.PgShardBackupPolicySpec `json:"backup,omitempty"`
+	// InternalTLS is the router<->pooler transport mode plus, when TLS is
+	// on, a checksum of the referenced Secret's content; enabling TLS or
+	// rotating the certificate must roll the immutable member pods.
+	InternalTLS string `json:"internalTLS,omitempty"`
 }
 
 // Template computes the desired member template of a group. tuning is the
@@ -92,6 +97,7 @@ func Template(c *pgshardv1alpha1.PgShardCluster, g Group, tuning pgtune.Settings
 		Resources:    c.Spec.Resources,
 		Settings:     effectiveSettings(c.Spec.PostgreSQL.Parameters, tuning),
 		RestartToken: c.Annotations[AnnotationRestart],
+		InternalTLS:  internalTLSMode(c),
 	}
 	if pol != nil {
 		spec := pol.Spec.DeepCopy()
@@ -448,6 +454,35 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 		},
 		VolumeMounts: mounts,
 	}
+}
+
+// internalTLSMode names the router<->pooler transport the spec asks for.
+func internalTLSMode(c *pgshardv1alpha1.PgShardCluster) string {
+	if ref := internalTLSRef(c); ref != nil {
+		return "secret:" + ref.Name
+	}
+	if c.Spec.InternalTLS.Insecure {
+		return "insecure"
+	}
+	return ""
+}
+
+// internalTLSDataChecksum digests a TLS Secret's content so certificate
+// rotation changes the member template hash.
+func internalTLSDataChecksum(data map[string][]byte) string {
+	keys := make([]string, 0, len(data))
+	for k := range data {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	h := sha256.New()
+	for _, k := range keys {
+		h.Write([]byte(k))
+		h.Write([]byte{0})
+		h.Write(data[k])
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil)[:8])
 }
 
 // internalTLSRef returns the router/pooler mTLS secret reference, if any.

@@ -408,6 +408,11 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 	obs.state = state
 	obs.tuning, obs.tuningErr = Tuning(c, g)
 	obs.template = Template(c, g, obs.tuning, pol)
+	if sum, err := r.internalTLSChecksum(ctx, c); err != nil {
+		return obs, err
+	} else if sum != "" {
+		obs.template.InternalTLS += ":" + sum
+	}
 	if err := r.ensureSettings(ctx, c, g, &obs, password); err != nil {
 		return obs, err
 	}

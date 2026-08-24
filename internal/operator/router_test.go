@@ -243,3 +243,30 @@ func TestInternalTLSFailsClosedWithoutExplicitInsecure(t *testing.T) {
 		t.Errorf("explicit insecure opt-in must render --insecure-dev: %q", args)
 	}
 }
+
+func TestMemberTemplateHashTracksInternalTLS(t *testing.T) {
+	c := routerCluster()
+	g := Groups(c)[0]
+	insecure := Template(c, g, nil, nil).Hash()
+
+	c.Spec.InternalTLS = pgshardv1alpha1.InternalTLSSpec{SecretRef: &corev1.LocalObjectReference{Name: "internal-tls"}}
+	secure := Template(c, g, nil, nil)
+	if secure.Hash() == insecure {
+		t.Fatal("enabling internal TLS must change the member template hash")
+	}
+
+	v1, v2 := secure, secure
+	v1.InternalTLS += ":" + internalTLSDataChecksum(map[string][]byte{"tls.crt": []byte("cert-a"), "tls.key": []byte("key-a")})
+	v2.InternalTLS += ":" + internalTLSDataChecksum(map[string][]byte{"tls.crt": []byte("cert-b"), "tls.key": []byte("key-a")})
+	if v1.Hash() == secure.Hash() {
+		t.Fatal("the secret checksum must be part of the member template hash")
+	}
+	if v1.Hash() == v2.Hash() {
+		t.Fatal("rotating the secret content must change the member template hash")
+	}
+	same := secure
+	same.InternalTLS += ":" + internalTLSDataChecksum(map[string][]byte{"tls.key": []byte("key-a"), "tls.crt": []byte("cert-a")})
+	if same.Hash() != v1.Hash() {
+		t.Fatal("the checksum must not depend on map iteration order")
+	}
+}
