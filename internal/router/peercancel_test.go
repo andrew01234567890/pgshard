@@ -35,7 +35,7 @@ func servePeer(t *testing.T, h *harness) string {
 // it does not own to A.
 func twoRouters(t *testing.T) (a, b *harness) {
 	t.Helper()
-	fp := newFakePooler(7, 2)
+	fp := newFakePooler()
 	poolerAddr := startFakePooler(t, fp)
 	a = newHarnessWith(t, fp, poolerAddr, nil)
 	peerA := servePeer(t, a)

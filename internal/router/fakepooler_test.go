@@ -153,8 +153,10 @@ type fakeBackend struct {
 // fakeXIDs hands out distinct transaction ids across every fake shard.
 var fakeXIDs atomic.Int64
 
-func newFakePooler(gen, epoch uint64) *fakePooler {
-	return &fakePooler{gen: gen, epoch: epoch, backends: map[string]*fakeBackend{}, reserved: map[string]bool{}, sleeping: map[string]chan struct{}{}}
+// The fake pooler serves shard map generation 7 at primary epoch 2, the
+// pair every harness snapshot starts from.
+func newFakePooler() *fakePooler {
+	return &fakePooler{gen: 7, epoch: 2, backends: map[string]*fakeBackend{}, reserved: map[string]bool{}, sleeping: map[string]chan struct{}{}}
 }
 
 func startFakePooler(t *testing.T, fp *fakePooler) string {

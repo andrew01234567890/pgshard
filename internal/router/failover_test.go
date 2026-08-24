@@ -245,7 +245,7 @@ func TestRefusedPoolerWhileServingUsesTransportWindow(t *testing.T) {
 	}
 	deadAddr := dead.Addr().String()
 	_ = dead.Close()
-	h := newHarnessWith(t, newFakePooler(7, 2), deadAddr, func(c *Config) { c.Buffering.TransportWindow = 100 * time.Millisecond })
+	h := newHarnessWith(t, newFakePooler(), deadAddr, func(c *Config) { c.Buffering.TransportWindow = 100 * time.Millisecond })
 	conn := h.connect(t, h.dsn("app", "secret", "app"))
 	start := time.Now()
 	_, err = conn.Exec(context.Background(), "select 1")

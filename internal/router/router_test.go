@@ -61,7 +61,7 @@ func (h *harness) subscribe() (<-chan snapshot.Change, func()) {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	fp := newFakePooler(7, 2)
+	fp := newFakePooler()
 	return newHarnessWith(t, fp, startFakePooler(t, fp), nil)
 }
 

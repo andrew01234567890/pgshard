@@ -554,7 +554,7 @@ func TestSingleModeRefusesCommitAfterHiddenWrite(t *testing.T) {
 	}
 	rows.Close()
 	err = tx.Commit(ctx)
-	expectRefusal(t, err, "transaction wrote on shard")
+	_ = expectRefusal(t, err, "transaction wrote on shard")
 	if got := h.allRan("prepare transaction"); len(got) != 0 {
 		t.Fatalf("prepared in single mode: %v", got)
 	}
