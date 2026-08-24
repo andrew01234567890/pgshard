@@ -420,15 +420,9 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 		if got := jsonpath(ctx, t, c, "deployment", clusterName+"-router", "{.spec.replicas}"); got != "2" {
 			t.Errorf("router deployment replicas: %q", got)
 		}
-		// The router image is built on its own track and may be absent from
-		// the kind node; readiness is asserted only when the pods pull it.
-		if err := c.WaitPodsReady(ctx, testNamespace, rsel, 3*time.Minute); err != nil {
+		if err := c.WaitPodsReady(ctx, testNamespace, rsel, 5*time.Minute); err != nil {
 			reasons, _ := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pods", "-l", rsel, "-o", "jsonpath={.items[*].status.containerStatuses[*].state.waiting.reason}")
-			if strings.Contains(reasons, "ImagePullBackOff") || strings.Contains(reasons, "ErrImagePull") {
-				t.Logf("router image unavailable, skipping pod readiness: %s", reasons)
-				return
-			}
-			t.Fatal(err)
+			t.Fatalf("router pods not ready (%s): %v", reasons, err)
 		}
 	})
 
