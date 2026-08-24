@@ -116,6 +116,18 @@ func lastLine(tail []string) string {
 	return last
 }
 
+// lockExitCode is pgbackrest's LockAcquireError (050): another command,
+// typically the asynchronous archive-push started by archive_command,
+// holds the stanza lock.
+const lockExitCode = 50
+
+// LockBusy reports whether err is a pgbackrest command that lost the race
+// for the stanza lock, a transient condition worth an immediate retry.
+func LockBusy(err error) bool {
+	var exit *exec.ExitError
+	return errors.As(err, &exit) && exit.ExitCode() == lockExitCode
+}
+
 // EnsureStanza creates the stanza, upgrading it when the repository already
 // holds one for a previous PostgreSQL system identifier.
 func (r *Runner) EnsureStanza(ctx context.Context) error {

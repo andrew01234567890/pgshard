@@ -41,21 +41,47 @@ func (in *Instance) EnsureStanza(ctx context.Context) error {
 	return r.EnsureStanza(ctx)
 }
 
+// stanzaLockRetry is the pause after stanza-create lost the stanza lock to
+// archive-push; bounded by stanzaLockRetries before falling back to the
+// slow retry so a wedged lock file cannot spin the loop.
+const (
+	stanzaLockRetry   = time.Second
+	stanzaLockRetries = 30
+)
+
 // ensureStanzaLoop retries EnsureStanza until it succeeds or ctx ends, so a
 // repository that is unreachable at start does not keep the primary down.
 func (in *Instance) ensureStanzaLoop(ctx context.Context, retry time.Duration) {
+	busy := 0
 	for {
 		err := in.EnsureStanza(ctx)
 		if err == nil {
 			return
 		}
-		in.log.Warn("pgbackrest stanza not ready; retrying", "err", err, "in", retry)
+		wait, fast := stanzaWait(err, retry, &busy)
+		if fast {
+			in.log.Info("pgbackrest stanza lock busy; retrying", "err", err, "in", wait, "attempt", busy)
+		} else {
+			in.log.Warn("pgbackrest stanza not ready; retrying", "err", err, "in", wait)
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(retry):
+		case <-time.After(wait):
 		}
 	}
+}
+
+// stanzaWait picks the pause before the next EnsureStanza attempt: a lost
+// stanza lock retries fast for up to stanzaLockRetries consecutive times,
+// anything else (or a lock still busy after that) waits the slow retry.
+func stanzaWait(err error, retry time.Duration, busy *int) (time.Duration, bool) {
+	if backup.LockBusy(err) && *busy < stanzaLockRetries {
+		*busy++
+		return min(stanzaLockRetry, retry), true
+	}
+	*busy = 0
+	return retry, false
 }
 
 // Backup takes a backup of the given type; the primary only.
