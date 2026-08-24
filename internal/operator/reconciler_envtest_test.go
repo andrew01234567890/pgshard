@@ -368,6 +368,9 @@ func TestReconcileGeneratesGroupObjects(t *testing.T) {
 				if svc.Spec.Selector[LabelRole] != RolePrimary {
 					t.Errorf("-rw selector: %v", svc.Spec.Selector)
 				}
+				if len(svc.Spec.Ports) != 2 || svc.Spec.Ports[1].Name != "pooler-grpc" || svc.Spec.Ports[1].Port != 9091 || svc.Spec.Ports[1].TargetPort.IntValue() != 9091 {
+					t.Errorf("-rw must expose the pooler: %+v", svc.Spec.Ports)
+				}
 			case g.ServiceRO():
 				if svc.Spec.Selector[LabelRole] != RoleReplica {
 					t.Errorf("-ro selector: %v", svc.Spec.Selector)

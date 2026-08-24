@@ -68,7 +68,7 @@ func (r Renderer) RouterDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.De
 	}
 	labels := routerLabels(c)
 	minReplicas, _ := RouterReplicas(c)
-	args := []string{"serve", fmt.Sprintf("--listen=:%d", postgresPort), "--catalog-dsn=" + CatalogDSN(c), "--insecure-dev"}
+	args := []string{"serve", fmt.Sprintf("--listen=:%d", postgresPort), "--catalog-dsn=" + CatalogDSN(c), "--catalog-pooler=" + CatalogPoolerEndpoint(c), "--insecure-dev"}
 	var mounts []corev1.VolumeMount
 	var volumes []corev1.Volume
 	if ref := c.Spec.Router.TLS.SecretRef; ref != nil && ref.Name != "" {
@@ -206,4 +206,10 @@ func (r *ClusterReconciler) reconcileRouter(ctx context.Context, c *pgshardv1alp
 		hpa.Spec = desiredHPA.Spec
 		return nil
 	})
+}
+
+// CatalogPoolerEndpoint is the pooler fronting the catalog group, reached
+// through its -rw Service.
+func CatalogPoolerEndpoint(c *pgshardv1alpha1.PgShardCluster) string {
+	return fmt.Sprintf("%s.%s.svc:%d", Groups(c)[0].ServiceRW(), c.Namespace, poolerGRPCPort)
 }

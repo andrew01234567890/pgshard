@@ -273,8 +273,10 @@ func (r *ClusterReconciler) publishFence(ctx context.Context, c *pgshardv1alpha1
 	return r.fenceLease(ctx, c, g, oldPrimary, primary, epoch, primary)
 }
 
+// memberEndpoint is what shard_status.primary_endpoint carries: the pooler
+// sidecar of the primary, which is what the router dials.
 func (r *ClusterReconciler) memberEndpoint(c *pgshardv1alpha1.PgShardCluster, g Group, member string) string {
-	return fmt.Sprintf("%s:%d", g.MemberHost(member, c.Namespace), postgresPort)
+	return fmt.Sprintf("%s:%d", g.MemberHost(member, c.Namespace), poolerGRPCPort)
 }
 
 func agentAddr(ip string) string { return fmt.Sprintf("%s:%d", ip, agentGRPCPort) }

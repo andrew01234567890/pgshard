@@ -249,7 +249,10 @@ func service(c *pgshardv1alpha1.PgShardCluster, g Group, name string, selector m
 		ObjectMeta: objectMeta(g, name, c.Namespace, nil),
 		Spec: corev1.ServiceSpec{
 			Selector: selector,
-			Ports:    []corev1.ServicePort{{Name: "postgres", Port: postgresPort, TargetPort: intstr.FromInt32(postgresPort)}},
+			Ports: []corev1.ServicePort{
+				{Name: "postgres", Port: postgresPort, TargetPort: intstr.FromInt32(postgresPort)},
+				{Name: "pooler-grpc", Port: poolerGRPCPort, TargetPort: intstr.FromInt32(poolerGRPCPort)},
+			},
 		},
 	}
 	if headless {

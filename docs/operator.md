@@ -35,7 +35,7 @@ For every cluster the operator owns `<cluster>-router`:
 | Object | Content |
 |--------|---------|
 | ServiceAccount | Identity of the router pods. |
-| Deployment | `serve --listen=:5432 --catalog-dsn=host=<cluster>-catalog-rw.<ns>.svc port=5432 user=postgres dbname=postgres --insecure-dev`; the superuser password arrives as `PGPASSWORD` from the `<cluster>-superuser` Secret. Replicas start at `spec.router.minReplicas` and are then owned by the HPA. |
+| Deployment | `serve --listen=:5432 --catalog-dsn=host=<cluster>-catalog-rw.<ns>.svc port=5432 user=postgres dbname=postgres --catalog-pooler=<cluster>-catalog-rw.<ns>.svc:9091 --insecure-dev`; the superuser password arrives as `PGPASSWORD` from the `<cluster>-superuser` Secret. Replicas start at `spec.router.minReplicas` and are then owned by the HPA. |
 | Service | ClusterIP on 5432, the endpoint applications connect to. |
 | HorizontalPodAutoscaler | `autoscaling/v2`, CPU utilization target `spec.router.hpa.cpuUtilization` (default 70) between `minReplicas` and `maxReplicas`. |
 | PodDisruptionBudget | `minAvailable: 1`. |
@@ -43,5 +43,10 @@ For every cluster the operator owns `<cluster>-router`:
 When `spec.router.tls.secretRef` is set the Secret is mounted read-only at
 `/etc/pgshard-tls` and `--tls-dir=/etc/pgshard-tls` is appended to the args.
 
-The router discovers poolers through the catalog it is pointed at; the
-operator does not pass pooler endpoints explicitly.
+The router reaches the catalog pooler through `--catalog-pooler
+<cluster>-catalog-rw.<namespace>.svc:9091` and discovers every shard's pooler
+through `pgshard.shard_status.primary_endpoint`, which the operator publishes
+as the primary member's pooler (`<member>.<group>-peers.<namespace>.svc:9091`),
+not its PostgreSQL port. Every `-rw` Service exposes both 5432 (`postgres`)
+and 9091 (`pooler-grpc`). Router and poolers still speak plaintext
+(`--insecure-dev`); mTLS between them is a later step.
