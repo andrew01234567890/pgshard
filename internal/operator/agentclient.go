@@ -42,7 +42,12 @@ type AgentClient interface {
 // GRPCAgentClient is the production AgentClient.
 type GRPCAgentClient struct{}
 
-const agentDialTimeout = 3 * time.Second
+const (
+	agentDialTimeout = 3 * time.Second
+	// agentCallTimeout bounds every RPC after the dial; a wedged agent must
+	// fail the reconcile, not hang it.
+	agentCallTimeout = 30 * time.Second
+)
 
 func (GRPCAgentClient) dial(ctx context.Context, addr string) (*grpc.ClientConn, pgshardv1.AgentClient, error) {
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -90,6 +95,8 @@ func (c GRPCAgentClient) Promote(ctx context.Context, addr string, epoch uint64,
 		return err
 	}
 	defer func() { _ = conn.Close() }()
+	ctx, cancel := context.WithTimeout(ctx, agentCallTimeout)
+	defer cancel()
 	resp, err := cl.Promote(ctx, &pgshardv1.PromoteRequest{Epoch: epoch, LeaseHolder: holder})
 	if err != nil {
 		return err
@@ -107,6 +114,8 @@ func (c GRPCAgentClient) Demote(ctx context.Context, addr string, epoch uint64) 
 		return err
 	}
 	defer func() { _ = conn.Close() }()
+	ctx, cancel := context.WithTimeout(ctx, agentCallTimeout)
+	defer cancel()
 	resp, err := cl.Demote(ctx, &pgshardv1.DemoteRequest{Epoch: epoch})
 	if err != nil {
 		return err
@@ -124,6 +133,8 @@ func (c GRPCAgentClient) Reload(ctx context.Context, addr string) (string, error
 		return "", err
 	}
 	defer func() { _ = conn.Close() }()
+	ctx, cancel := context.WithTimeout(ctx, agentCallTimeout)
+	defer cancel()
 	st, err := cl.Status(ctx, &pgshardv1.StatusRequest{})
 	if err != nil {
 		return "", err
@@ -187,6 +198,8 @@ func (c GRPCAgentClient) Backup(ctx context.Context, addr string, t string) (Bac
 		return BackupResult{}, err
 	}
 	defer func() { _ = conn.Close() }()
+	ctx, cancel := context.WithTimeout(ctx, agentCallTimeout)
+	defer cancel()
 	st, err := cl.Status(ctx, &pgshardv1.StatusRequest{})
 	if err != nil {
 		return BackupResult{}, err
@@ -221,6 +234,8 @@ func (c GRPCAgentClient) Expire(ctx context.Context, addr string) error {
 		return err
 	}
 	defer func() { _ = conn.Close() }()
+	ctx, cancel := context.WithTimeout(ctx, agentCallTimeout)
+	defer cancel()
 	st, err := cl.Status(ctx, &pgshardv1.StatusRequest{})
 	if err != nil {
 		return err
@@ -264,6 +279,8 @@ func (c GRPCAgentClient) SetSynchronizedStandbySlots(ctx context.Context, addr s
 		return nil, err
 	}
 	defer func() { _ = conn.Close() }()
+	ctx, cancel := context.WithTimeout(ctx, agentCallTimeout)
+	defer cancel()
 	st, err := cl.Status(ctx, &pgshardv1.StatusRequest{})
 	if err != nil {
 		return nil, err
