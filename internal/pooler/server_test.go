@@ -587,3 +587,61 @@ func TestCreatesPrepared(t *testing.T) {
 		}
 	}
 }
+
+func TestAttachSessionIsAtomicWithLookup(t *testing.T) {
+	s := NewServer(Config{Logger: slog.New(slog.DiscardHandler)})
+	se, err := s.attachSession("x", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.lookup("x"); got != se {
+		t.Fatal("attachSession returned a session that is not the registered one")
+	}
+	if _, err := s.attachSession("x", "alice"); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("second attach = %v, want FailedPrecondition", err)
+	}
+	var se2 *session
+	var err2 error
+	s.detachUnlocked = func() {
+		se2, err2 = s.attachSession("x", "alice")
+	}
+	s.detach(se)
+	if err2 != nil {
+		t.Fatal(err2)
+	}
+	if se2 == se {
+		t.Fatal("a new Execute reattached to the detaching session")
+	}
+	if got := s.lookup("x"); got != se2 || !se2.attached {
+		t.Fatalf("the session attached mid-detach is not the registered attached one: lookup %p, attached %p", got, se2)
+	}
+}
+
+func TestExpiryClaimsTheBackendUnderTheLock(t *testing.T) {
+	h := startHarness(t, PoolConfig{})
+	ctx := context.Background()
+	if _, err := h.client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: "s", Generation: gen(7, 3)}); err != nil {
+		t.Fatal(err)
+	}
+	stream, _ := h.client.Execute(ctx)
+	roundTrip(t, stream, queryReq("s", "begin", gen(7, 3), identity("alice")))
+	_ = stream.CloseSend()
+	waitFor(t, func() bool { return !h.attached() })
+	se := h.srv.lookup("s")
+	if se == nil {
+		t.Fatal("reserved session gone before expiry")
+	}
+	h.srv.expireReservations(time.Now().Add(h.srv.cfg.ReserveTimeout))
+	h.srv.mu.Lock()
+	held := se.b
+	h.srv.mu.Unlock()
+	if held != nil {
+		t.Fatal("expiry recycled the backend without claiming it: a racing Release would recycle it again")
+	}
+	if _, err := h.client.Release(ctx, &pgshardv1.ReleaseRequest{SessionId: "s"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, idle := h.srv.cfg.Pool.Stats(); idle != 1 {
+		t.Fatalf("idle = %d, want exactly one backend back in the pool", idle)
+	}
+}

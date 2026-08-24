@@ -126,6 +126,30 @@ func (s *Server) session(id string) *session {
 	return se
 }
 
+// attachSession finds or creates the session and marks it attached in one
+// critical section: a lookup that released the lock before attaching could
+// hold a session a concurrent detach has already forgotten while a new
+// Execute registers a fresh one under the same id.
+func (s *Server) attachSession(id, role string) (*session, error) {
+	s.expireReservations(time.Now())
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	se, ok := s.sessions[id]
+	if !ok {
+		se = &session{id: id}
+		s.sessions[id] = se
+	}
+	if se.attached {
+		return nil, status.Error(codes.FailedPrecondition, "session already has an Execute stream")
+	}
+	se.attached = true
+	se.detached = make(chan struct{})
+	se.detachedAt = time.Time{}
+	se.role = role
+	se.database = s.cfg.Database
+	return se, nil
+}
+
 func (s *Server) lookup(id string) *session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -150,18 +174,10 @@ func (s *Server) Execute(stream pgshardv1.Pooler_ExecuteServer) error {
 	if s.draining.Load() {
 		return errUnavailable
 	}
-	se := s.session(first.SessionId)
-	s.mu.Lock()
-	if se.attached {
-		s.mu.Unlock()
-		return status.Error(codes.FailedPrecondition, "session already has an Execute stream")
+	se, err := s.attachSession(first.SessionId, first.User.Username)
+	if err != nil {
+		return err
 	}
-	se.attached = true
-	se.detached = make(chan struct{})
-	se.detachedAt = time.Time{}
-	se.role = first.User.Username
-	se.database = s.cfg.Database
-	s.mu.Unlock()
 	defer s.detach(se)
 	// Zeroise the working key copies before the session is detached, so a
 	// caller that observes the session gone also observes the zeroed keys.
@@ -537,18 +553,25 @@ func (s *Server) Release(ctx context.Context, req *pgshardv1.ReleaseRequest) (*p
 // been gone for ReserveTimeout: their router died without Release and
 // would otherwise hold the backend and the session entry forever.
 func (s *Server) expireReservations(now time.Time) {
-	var expired []*session
+	type claim struct {
+		se *session
+		b  *Backend
+	}
+	var expired []claim
 	s.mu.Lock()
 	for id, se := range s.sessions {
 		if se.reserved && !se.attached && !se.detachedAt.IsZero() && now.Sub(se.detachedAt) >= s.cfg.ReserveTimeout {
 			delete(s.sessions, id)
-			expired = append(expired, se)
+			// Claim the backend under the lock so a Release racing this
+			// expiry finds nothing left to recycle.
+			expired = append(expired, claim{se: se, b: se.b})
+			se.b, se.reserved = nil, false
 		}
 	}
 	s.mu.Unlock()
-	for _, se := range expired {
-		s.cfg.Logger.Warn("releasing reservation with no stream", "session", se.id, "role", se.role)
-		s.recycle(se.b, true)
+	for _, c := range expired {
+		s.cfg.Logger.Warn("releasing reservation with no stream", "session", c.se.id, "role", c.se.role)
+		s.recycle(c.b, true)
 	}
 }
 
