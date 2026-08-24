@@ -54,6 +54,7 @@ expect 0 "gated regression under the absolute ns threshold passes"
 csv "GateParse-32,1e-06,1%,1e-06,1%,~,p=1.000 n=10" "GateParse-32,100,1%,900,1%,+800.00%,p=0.000 n=10"
 expect 0 "B/op section is not gated"
 
-csv "GateParse-32,1e-06,1%,1.5e-06,1%,+50.00%,p=0.000 n=10" ""
-PERF_GATE_PATTERN='^Nothing' expect 0 "PERF_GATE_PATTERN narrows the gate"
+csv "GateParse-32,1e-06,1%,1.5e-06,1%,+50.00%,p=0.000 n=10
+HotPath-32,1e-06,1%,1.0e-06,1%,~,p=0.900 n=10" ""
+PERF_GATE_PATTERN='^HotPath' expect 0 "PERF_GATE_PATTERN narrows the gate"
 echo "gate self-test: OK"
