@@ -252,43 +252,22 @@ func (o *pgCutover) Rollback(ctx context.Context) error {
 	return o.releaseRollback(ctx)
 }
 
-// reverseBehind lists the reverse subscriptions whose apply position has
-// not passed the recorded position of the target they subscribe to.
+// reverseBehind lists the reverse subscriptions whose confirmed flush
+// position has not passed the recorded position of the target they
+// subscribe to. The rollback path has no verify backstop, so it reads the
+// publisher slot's confirmed_flush_lsn on the targets, which survives
+// apply-worker restarts and advances over keepalives.
 func (o *pgCutover) reverseBehind(ctx context.Context, positions map[int32]int64) ([]string, error) {
 	var behind []string
-	for _, db := range o.dbs {
-		for _, s := range o.srcIDs {
-			conn, err := o.c.Shards.DialDatabase(ctx, o.srcSet, s, db.name)
-			if err != nil {
-				return nil, err
-			}
-			rows, err := conn.Query(ctx, `SELECT s.subname, coalesce((st.latest_end_lsn - '0/0'::pg_lsn)::bigint, -1)
-				FROM pg_subscription s LEFT JOIN pg_stat_subscription st ON st.subid = s.oid AND st.relid IS NULL
-				WHERE s.subname LIKE $1 AND s.subenabled ORDER BY 1`, o.reversePattern(s))
-			if err == nil {
-				err = func() error {
-					defer rows.Close()
-					for rows.Next() {
-						var name string
-						var applied int64
-						if err := rows.Scan(&name, &applied); err != nil {
-							return err
-						}
-						var gen int64
-						var src, tgt int32
-						if _, err := fmt.Sscanf(name, "pgshard_reshard_g%d_rev_s%d_t%d", &gen, &src, &tgt); err != nil {
-							continue
-						}
-						if applied < positions[tgt] {
-							behind = append(behind, fmt.Sprintf("%s/%d %s at %d of %d", db.name, s, name, applied, positions[tgt]))
-						}
-					}
-					return rows.Err()
-				}()
-			}
-			_ = conn.Close(ctx)
-			if err != nil {
-				return nil, err
+	for _, t := range o.wf.ids {
+		flushed, err := slotFlushPositions(ctx, o.c.Shards, o.wf.set, t,
+			fmt.Sprintf("pgshard\\_reshard\\_g%d\\_rev\\_s%%\\_t%d", o.wf.gen, t))
+		if err != nil {
+			return nil, err
+		}
+		for _, name := range sortedKeys(flushed) {
+			if flushed[name] < positions[t] {
+				behind = append(behind, fmt.Sprintf("%s/%d %s at %d of %d", o.wf.set, t, name, flushed[name], positions[t]))
 			}
 		}
 	}
