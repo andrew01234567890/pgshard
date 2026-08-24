@@ -258,3 +258,32 @@ func TestPGMigrationQueueWaitIsBounded(t *testing.T) {
 		t.Fatal("Wait did not return without an applier")
 	}
 }
+
+func TestPGMigrationQueueWaitResetsOnProgress(t *testing.T) {
+	calls := 0
+	q := &PGMigrationQueue{Poll: time.Millisecond, MaxWait: 25 * time.Millisecond,
+		load: func(context.Context, string) (catalog.DDLMigration, error) {
+			calls++
+			if calls >= 80 {
+				return catalog.DDLMigration{State: catalog.MigrationComplete}, nil
+			}
+			return catalog.DDLMigration{State: catalog.MigrationRunning,
+				PerShard: map[string]catalog.ShardMigration{"0": {State: catalog.ShardRunning, Attempts: calls}}}, nil
+		}}
+	done := make(chan error, 1)
+	go func() {
+		m, err := q.Wait(context.Background(), "m1")
+		if err == nil && m.State != catalog.MigrationComplete {
+			err = fmt.Errorf("state %s", m.State)
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("a migration progressing past MaxWait was aborted: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Wait never finished")
+	}
+}

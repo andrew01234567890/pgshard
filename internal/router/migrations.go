@@ -35,16 +35,37 @@ type PGMigrationQueue struct {
 	Pool *pgxpool.Pool
 	// Poll is the wait between state reads; default 200ms.
 	Poll time.Duration
-	// MaxWait bounds Wait so a deployment without a running applier does
-	// not block the client forever; default DefaultMigrationMaxWait.
+	// MaxWait bounds how long Wait tolerates a migration making no
+	// observable progress, so a deployment without a running applier does
+	// not block the client forever; any state change resets it. Default
+	// DefaultMigrationMaxWait.
 	MaxWait time.Duration
 	// load overrides the catalog read in tests.
 	load func(ctx context.Context, id string) (catalog.DDLMigration, error)
 }
 
-// DefaultMigrationMaxWait is how long Wait polls a migration before giving
-// up when no applier finishes it.
+// DefaultMigrationMaxWait is how long Wait tolerates a migration whose
+// state does not change before giving up: a flat overall deadline would
+// abort a legitimately-progressing rewrite or CREATE INDEX CONCURRENTLY
+// that simply takes longer.
 const DefaultMigrationMaxWait = 10 * time.Minute
+
+// migrationProgress fingerprints the durable state of m: Wait resets its
+// inactivity deadline whenever this changes.
+func migrationProgress(m catalog.DDLMigration) string {
+	keys := make([]string, 0, len(m.PerShard))
+	for k := range m.PerShard {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteString(m.State)
+	for _, k := range keys {
+		s := m.PerShard[k]
+		fmt.Fprintf(&b, "|%s=%s/%d/%d", k, s.State, s.Attempts, s.Step)
+	}
+	return b.String()
+}
 
 // Enqueue implements MigrationQueue.
 func (q *PGMigrationQueue) Enqueue(ctx context.Context, m catalog.DDLMigration) (string, error) {
@@ -62,6 +83,7 @@ func (q *PGMigrationQueue) Wait(ctx context.Context, id string) (catalog.DDLMigr
 		maxWait = DefaultMigrationMaxWait
 	}
 	deadline := time.Now().Add(maxWait)
+	last := ""
 	t := time.NewTicker(poll)
 	defer t.Stop()
 	load := q.load
@@ -78,8 +100,11 @@ func (q *PGMigrationQueue) Wait(ctx context.Context, id string) (catalog.DDLMigr
 		if m.State == catalog.MigrationComplete || m.State == catalog.MigrationFailed {
 			return m, nil
 		}
-		if time.Now().After(deadline) {
-			return m, fmt.Errorf("migration %s is still %s after %s: is a pgshard controller running the DDL applier?", id, m.State, maxWait)
+		if cur := migrationProgress(m); cur != last {
+			last = cur
+			deadline = time.Now().Add(maxWait)
+		} else if time.Now().After(deadline) {
+			return m, fmt.Errorf("migration %s is still %s with no progress observed for %s; it continues in the background: is a pgshard controller running the DDL applier?", id, m.State, maxWait)
 		}
 		select {
 		case <-ctx.Done():
