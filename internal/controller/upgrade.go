@@ -131,7 +131,7 @@ func (o *pgCutover) Sequences(ctx context.Context) error {
 
 func (o *pgCutover) syncSequences(ctx context.Context, fromSet string, fromIDs []int32, toSet string, toIDs []int32) error {
 	for _, db := range o.dbs {
-		values := map[string]int64{}
+		values := map[string]seqCarry{}
 		for _, s := range fromIDs {
 			conn, err := o.c.Shards.DialDatabase(ctx, fromSet, s, db.name)
 			if err != nil {
@@ -161,16 +161,34 @@ func (o *pgCutover) syncSequences(ctx context.Context, fromSet string, fromIDs [
 	return nil
 }
 
+// seqCarry is the value carried for one sequence and the direction it
+// advances in, so the merge across sources keeps the furthest value in
+// that direction.
+type seqCarry struct {
+	Value     int64
+	Ascending bool
+}
+
 // collectSequences merges the called sequences of conn into values, keeping
-// the maximum last_value per qualified name plus a safety headroom: a
-// session may hold up to cache_size values and PostgreSQL pre-logs 32
-// (SEQ_LOG_VALS) per fetch, so nextval calls that consume that headroom
-// move neither pg_current_wal_lsn() nor the on-disk value; without the
-// bump a stale-router nextval between the carry and the flip could hand
-// the target duplicates.
-func collectSequences(ctx context.Context, conn ShardConn, values map[string]int64) error {
+// per qualified name the last_value furthest in the direction of
+// increment_by plus a safety headroom: a session may hold up to cache_size
+// values and PostgreSQL pre-logs 32 (SEQ_LOG_VALS) per fetch, so nextval
+// calls that consume that headroom move neither pg_current_wal_lsn() nor
+// the on-disk value; without the bump a stale-router nextval between the
+// carry and the flip could hand the target duplicates. The headroom is
+// signed (greatest(cache_size, 32) * increment_by), computed in numeric so
+// it cannot overflow bigint, and clamped to max_value (ascending) or
+// min_value (descending) before the cast back. A CYCLE sequence clamps at
+// its boundary instead of simulating the wrap: the carried value is never
+// out of range, and values reused past a wrap are inherent to CYCLE, not
+// introduced here.
+func collectSequences(ctx context.Context, conn ShardConn, values map[string]seqCarry) error {
 	rows, err := conn.Query(ctx, `SELECT quote_ident(schemaname) || '.' || quote_ident(sequencename),
-			least(last_value + greatest(cache_size, 32), max_value)
+			(CASE WHEN increment_by > 0
+				THEN least(last_value::numeric + greatest(cache_size, 32)::numeric * increment_by::numeric, max_value::numeric)
+				ELSE greatest(last_value::numeric + greatest(cache_size, 32)::numeric * increment_by::numeric, min_value::numeric)
+			END)::bigint,
+			increment_by > 0
 		FROM pg_sequences WHERE last_value IS NOT NULL AND schemaname NOT IN ('pgshard', $1) ORDER BY 1`, JournalSchema)
 	if err != nil {
 		return err
@@ -179,19 +197,27 @@ func collectSequences(ctx context.Context, conn ShardConn, values map[string]int
 	for rows.Next() {
 		var name string
 		var v int64
-		if err := rows.Scan(&name, &v); err != nil {
+		var asc bool
+		if err := rows.Scan(&name, &v, &asc); err != nil {
 			return err
 		}
-		values[name] = max(values[name], v)
+		if prev, ok := values[name]; ok {
+			if asc {
+				v = max(prev.Value, v)
+			} else {
+				v = min(prev.Value, v)
+			}
+		}
+		values[name] = seqCarry{Value: v, Ascending: asc}
 	}
 	return rows.Err()
 }
 
 // applySequences sets every sequence conn holds to the recorded value; a
 // sequence the target does not have (never materialized) is skipped.
-func applySequences(ctx context.Context, conn ShardConn, values map[string]int64) error {
+func applySequences(ctx context.Context, conn ShardConn, values map[string]seqCarry) error {
 	for _, name := range sortedKeys(values) {
-		if _, err := conn.Exec(ctx, `SELECT pg_catalog.setval(oid, $2, true) FROM pg_class WHERE oid = to_regclass($1) AND relkind = 'S'`, name, values[name]); err != nil {
+		if _, err := conn.Exec(ctx, `SELECT pg_catalog.setval(oid, $2, true) FROM pg_class WHERE oid = to_regclass($1) AND relkind = 'S'`, name, values[name].Value); err != nil {
 			return err
 		}
 	}
@@ -265,11 +291,11 @@ func (o *pgCutover) reverseBehind(ctx context.Context, positions map[int32]int64
 		if err != nil {
 			return nil, err
 		}
-		for _, name := range sortedKeys(flushed) {
-			if flushed[name] < positions[t] {
-				behind = append(behind, fmt.Sprintf("%s/%d %s at %d of %d", o.wf.set, t, name, flushed[name], positions[t]))
-			}
+		expected := make([]string, 0, len(o.srcIDs))
+		for _, s := range o.srcIDs {
+			expected = append(expected, ReverseSubscriptionName(o.wf.gen, s, t))
 		}
+		behind = append(behind, slotsBehind(expected, flushed, positions[t], fmt.Sprintf("%s/%d", o.wf.set, t))...)
 	}
 	return behind, nil
 }
