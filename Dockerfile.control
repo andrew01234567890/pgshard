@@ -3,7 +3,7 @@
 # Example: docker build -f Dockerfile.control --build-arg CMD=pgshard-admin -t pgshard-admin:dev .
 ARG CMD=pgshard-operator
 
-FROM golang:1.26-bookworm AS build
+FROM golang:1.27-bookworm AS build
 ARG CMD
 ARG VERSION=dev
 ARG COMMIT=none

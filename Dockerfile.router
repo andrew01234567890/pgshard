@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Router and pooler binaries for the local compose stack. The router links the
 # PostgreSQL parser through cgo, so the build stage needs a C toolchain and a glibc with strlcpy (Debian trixie or newer).
-FROM golang:1.26-trixie AS build
+FROM golang:1.27-trixie AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
