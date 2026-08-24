@@ -3,6 +3,7 @@ package pooler
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -16,6 +17,11 @@ import (
 type Dialer struct {
 	Address string
 	Timeout time.Duration
+	// TLS, when set, upgrades TCP connections with SSLRequest before the
+	// startup message (sslmode require, or verify-full when the config
+	// verifies the server). A backend that declines TLS is refused. Unix
+	// socket connections are never upgraded.
+	TLS *tls.Config
 }
 
 func (d Dialer) dial(ctx context.Context) (net.Conn, error) {
@@ -24,7 +30,42 @@ func (d Dialer) dial(ctx context.Context) (net.Conn, error) {
 		network = "unix"
 	}
 	nd := net.Dialer{Timeout: d.Timeout}
-	return nd.DialContext(ctx, network, d.Address)
+	conn, err := nd.DialContext(ctx, network, d.Address)
+	if err != nil || network != "tcp" || d.TLS == nil {
+		return conn, err
+	}
+	tc, err := upgradeTLS(ctx, conn, d.TLS)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return tc, nil
+}
+
+// upgradeTLS sends SSLRequest and starts TLS on conn once the backend
+// answers 'S'.
+func upgradeTLS(ctx context.Context, conn net.Conn, cfg *tls.Config) (net.Conn, error) {
+	if dl, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(dl)
+	}
+	fe := pgproto3.NewFrontend(bufio.NewReader(conn), conn)
+	fe.Send(&pgproto3.SSLRequest{})
+	if err := fe.Flush(); err != nil {
+		return nil, err
+	}
+	var answer [1]byte
+	if _, err := conn.Read(answer[:]); err != nil {
+		return nil, fmt.Errorf("backend SSLRequest: %w", err)
+	}
+	if answer[0] != 'S' {
+		return nil, errors.New("backend declined TLS")
+	}
+	tc := tls.Client(conn, cfg)
+	if err := tc.HandshakeContext(ctx); err != nil {
+		return nil, fmt.Errorf("backend TLS handshake: %w", err)
+	}
+	_ = conn.SetDeadline(time.Time{})
+	return tc, nil
 }
 
 // Backend is one authenticated PostgreSQL connection driven over pgproto3.
@@ -74,6 +115,7 @@ func (b *Backend) authenticate(database, role string, clientKey, serverKey []byt
 		return err
 	}
 	var sc *scramClient
+	verified := false
 	for {
 		msg, err := b.fe.Receive()
 		if err != nil {
@@ -81,6 +123,9 @@ func (b *Backend) authenticate(database, role string, clientKey, serverKey []byt
 		}
 		switch m := msg.(type) {
 		case *pgproto3.AuthenticationOk:
+			if !verified {
+				return errors.New("backend accepted the connection without a verified SCRAM-SHA-256 exchange")
+			}
 		case *pgproto3.AuthenticationSASL:
 			if !contains(m.AuthMechanisms, "SCRAM-SHA-256") {
 				return fmt.Errorf("backend offers %v, want SCRAM-SHA-256", m.AuthMechanisms)
@@ -112,6 +157,7 @@ func (b *Backend) authenticate(database, role string, clientKey, serverKey []byt
 			if err := sc.verifyServerFinal(m.Data); err != nil {
 				return err
 			}
+			verified = true
 		case *pgproto3.AuthenticationCleartextPassword, *pgproto3.AuthenticationMD5Password:
 			return errors.New("backend requested password authentication; only SCRAM-SHA-256 is supported")
 		case *pgproto3.BackendKeyData:

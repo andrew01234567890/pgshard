@@ -16,6 +16,12 @@
   session that names a role with an idle pooled backend reuses it without
   re-proving keys. Consequently the gRPC listener refuses to start without
   `--tls-cert/--tls-key/--tls-ca` unless `--insecure-dev` is passed.
+- **Backend authentication.** A backend connection is accepted only after
+  a complete SCRAM-SHA-256 exchange whose server signature verified against
+  the forwarded ServerKey; an `AuthenticationOk` without it (trust or
+  password authentication in `pg_hba.conf`) is refused. TCP backends can be
+  upgraded to TLS with `--pg-sslmode require|verify-full` (the latter with
+  `--pg-sslrootcert`); unix sockets are never upgraded.
 - **Regular vs reserved.** By default a backend is held only from the first
   message of a batch until PostgreSQL reports `ReadyForQuery` with status
   `I`; a transaction (`T`/`E`) keeps it. `Reserve` pins the session's backend
