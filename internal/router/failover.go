@@ -165,7 +165,12 @@ func (r *Router) awaitConsistent(ctx context.Context, sh Shard, afterError bool,
 	if !r.reserveBuffer(sh) {
 		return false, bufferFullError(sh)
 	}
-	defer r.releaseBuffer(sh)
+	r.metrics.BufferEvents.Inc()
+	bufferStart := time.Now()
+	defer func() {
+		r.metrics.BufferSeconds.Observe(time.Since(bufferStart).Seconds())
+		r.releaseBuffer(sh)
+	}()
 	var changes <-chan snapshot.Change
 	if r.cfg.Buffering.Changes != nil {
 		ch, unsubscribe := r.cfg.Buffering.Changes()

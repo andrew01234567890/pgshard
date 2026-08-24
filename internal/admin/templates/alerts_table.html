@@ -1,0 +1,6 @@
+{{if .Alerts}}<table>
+<thead><tr><th>Alert</th><th>Severity</th><th>Detail</th></tr></thead>
+<tbody>
+{{range .Alerts}}<tr><td>{{.Name}}</td><td>{{.Severity}}</td><td>{{.Detail}}</td></tr>
+{{end}}</tbody>
+</table>{{else}}<p class="notice">Nothing is firing.</p>{{end}}

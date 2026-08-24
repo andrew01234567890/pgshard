@@ -1,0 +1,103 @@
+# PrometheusRule-style alert definitions for pgshard. Apply with a
+# Prometheus Operator (kubectl apply -f alerts.yaml) or copy the groups into
+# a plain Prometheus rule_files entry. See docs/observability.md.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: pgshard
+  labels:
+    app.kubernetes.io/part-of: pgshard
+spec:
+  groups:
+    - name: pgshard-transactions
+      rules:
+        - alert: PgshardTwoPCInDoubtAged
+          expr: pgshard_controller_in_doubt_oldest_age_seconds > 300
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: In-doubt two-phase commits are not resolving
+            description: >-
+              The oldest undecided row in pgshard.xact_decisions is older
+              than 5 minutes; the resolver is stuck or cannot reach a
+              participant. Prepared transactions pin WAL and vacuum on the
+              participants until resolved.
+        - alert: PgshardPreparedTransactionsHigh
+          expr: pgshard_controller_in_doubt_transactions > 100
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: The 2PC decision log is unusually large
+            description: >-
+              More than 100 undecided decision-log rows; commit throughput
+              may be limited by prepared-transaction cleanup.
+    - name: pgshard-replication
+      rules:
+        - alert: PgshardReplicationLagHigh
+          expr: pgshard_agent_replication_lag_bytes > 128 * 1024 * 1024
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: A standby is far behind its primary
+            description: Replay lag exceeded 128 MiB for 5 minutes.
+        - alert: PgshardSlotWALRetention
+          expr: pgshard_agent_slot_wal_status{wal_status=~"unreserved|lost"} == 1
+          labels:
+            severity: critical
+          annotations:
+            summary: A replication slot is losing WAL
+            description: >-
+              A slot's wal_status left "reserved"/"extended": WAL retention
+              is beyond max_slot_wal_keep_size and the slot is about to be
+              (or was) invalidated. Change streams and standbys using it
+              will need a rebuild once it is lost.
+        - alert: PgshardStreamLagHigh
+          expr: pgshard_pooler_stream_lag_bytes > 256 * 1024 * 1024
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: A change-stream consumer is far behind
+            description: The stream reader acked position trails the server WAL end by more than 256 MiB.
+    - name: pgshard-backups
+      rules:
+        - alert: PgshardBackupStale
+          expr: pgshard_agent_backup_last_age_seconds > 26 * 3600
+          labels:
+            severity: critical
+          annotations:
+            summary: Backups are stale
+            description: The newest completed pgBackRest backup is older than 26 hours.
+        - alert: PgshardBackupFailed
+          expr: pgshard_agent_backup_last_result{result="error"} == 1
+          labels:
+            severity: critical
+          annotations:
+            summary: The last backup attempt failed
+            description: >-
+              pgBackRest reported an error (including ArchiveDuplicateError
+              after a timeline mix-up); check the agent logs and the stanza
+              with pgbackrest info/verify.
+    - name: pgshard-control-plane
+      rules:
+        - alert: PgshardOperatorReconcileErrors
+          expr: rate(controller_runtime_reconcile_errors_total[5m]) > 0.2
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: The operator is failing to reconcile
+            description: controller-runtime reconcile errors are persistent; check the operator logs.
+        - alert: PgshardCutoverPaused
+          expr: pgshard_controller_cutover_paused > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: A workflow is paused at cutover
+            description: >-
+              A reshard/placement/upgrade workflow has been paused for more
+              than 30 minutes and is waiting for an operator to resume it.

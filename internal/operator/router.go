@@ -3,6 +3,7 @@ package operator
 import (
 	"context"
 	"fmt"
+	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
@@ -68,7 +69,7 @@ func (r Renderer) RouterDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.De
 	}
 	labels := routerLabels(c)
 	minReplicas, _ := RouterReplicas(c)
-	args := []string{"serve", fmt.Sprintf("--listen=:%d", postgresPort), "--catalog-dsn=" + CatalogDSN(c), "--catalog-pooler=" + CatalogPoolerEndpoint(c), "--insecure-dev"}
+	args := []string{"serve", fmt.Sprintf("--listen=:%d", postgresPort), fmt.Sprintf("--health-listen=:%d", routerHTTPPort), "--catalog-dsn=" + CatalogDSN(c), "--catalog-pooler=" + CatalogPoolerEndpoint(c), "--insecure-dev"}
 	var mounts []corev1.VolumeMount
 	var volumes []corev1.Volume
 	if ref := c.Spec.Router.TLS.SecretRef; ref != nil && ref.Name != "" {
@@ -82,7 +83,8 @@ func (r Renderer) RouterDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.De
 			Replicas: ptr.To(minReplicas),
 			Selector: &metav1.LabelSelector{MatchLabels: labels},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				ObjectMeta: metav1.ObjectMeta{Labels: labels, Annotations: map[string]string{
+					AnnotationScrape: "true", AnnotationScrapePort: strconv.Itoa(routerHTTPPort), AnnotationScrapePath: "/metrics"}},
 				Spec: corev1.PodSpec{
 					ServiceAccountName: RouterName(c.Name),
 					SecurityContext:    &corev1.PodSecurityContext{RunAsNonRoot: ptr.To(true), SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}},
@@ -93,7 +95,7 @@ func (r Renderer) RouterDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.De
 						Args:            args,
 						Env: []corev1.EnvVar{{Name: "PGPASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
 							LocalObjectReference: corev1.LocalObjectReference{Name: SecretName(c.Name)}, Key: secretKey}}}},
-						Ports: []corev1.ContainerPort{{Name: "postgres", ContainerPort: postgresPort}},
+						Ports: []corev1.ContainerPort{{Name: "postgres", ContainerPort: postgresPort}, {Name: "http", ContainerPort: routerHTTPPort}},
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler:  corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString("postgres")}},
 							PeriodSeconds: 10,

@@ -139,3 +139,36 @@ func TestPoolNeverReusesBackendWithUnflushedMessages(t *testing.T) {
 		t.Fatalf("dials = %d, want 2 (a fresh backend)", pg.dials.Load())
 	}
 }
+
+func TestPoolHooksObserveDialsAndWaits(t *testing.T) {
+	pg := newFakePG()
+	var dials, dialErrs, waits int
+	cfg := PoolConfig{MaxBackends: 1, MaxPerRole: 1, AcquireTimeout: 50 * time.Millisecond,
+		OnDial: func(err error) {
+			if err != nil {
+				dialErrs++
+			} else {
+				dials++
+			}
+		},
+		OnWait: func() { waits++ }}
+	p := newPool(cfg, pg.dial)
+	ctx := context.Background()
+	a, err := p.Acquire(ctx, "db", "alice", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dials != 1 || waits != 0 {
+		t.Fatalf("dials=%d waits=%d after first acquire", dials, waits)
+	}
+	if _, err := p.Acquire(ctx, "db", "alice", nil, nil); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("full pool must exhaust the budget: %v", err)
+	}
+	if waits != 1 {
+		t.Fatalf("waits = %d, want 1", waits)
+	}
+	p.Release(a)
+	if dialErrs != 0 {
+		t.Fatalf("dialErrs = %d", dialErrs)
+	}
+}

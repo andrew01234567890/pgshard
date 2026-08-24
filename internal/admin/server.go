@@ -16,6 +16,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/andrew01234567890/pgshard/internal/metrics"
 )
 
 // htmx.min.js is htmx 2.0.8 (https://htmx.org), licensed under the
@@ -88,6 +90,11 @@ func NewServer(c client.Reader, catalogSrc CatalogSource, n *Notifier, namespace
 	mux.HandleFunc("GET /api/v1/streams/{name}", s.handleAPIStream)
 	mux.HandleFunc("GET /api/v1/clusters", s.handleAPIClusters)
 	mux.HandleFunc("GET /api/v1/clusters/{ns}/{name}", s.handleAPICluster)
+	mux.HandleFunc("GET /twopc", s.handleTwoPC)
+	mux.HandleFunc("GET /api/v1/twopc", s.handleAPITwoPC)
+	mux.HandleFunc("GET /alerts", s.handleAlerts)
+	mux.HandleFunc("GET /api/v1/alerts", s.handleAPIAlerts)
+	mux.Handle("GET /metrics", metrics.Handler(metrics.NewRegistry("admin")))
 	mux.HandleFunc("GET /events", s.handleEvents)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	s.mux = mux
@@ -373,7 +380,7 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 	switch {
 	case apierrors.IsNotFound(err), errors.Is(err, pgx.ErrNoRows), errors.Is(err, ErrStreamNotFound):
 		code = http.StatusNotFound
-	case errors.Is(err, ErrNoStreamSource):
+	case errors.Is(err, ErrNoStreamSource), errors.Is(err, ErrNoTwoPCSource):
 		code = http.StatusServiceUnavailable
 	case errors.Is(err, context.Canceled):
 		code = 499

@@ -1,0 +1,6 @@
+{{if .Entries}}<table>
+<thead><tr><th>GID</th><th>State</th><th>Participants</th><th>Age</th><th>Decision</th></tr></thead>
+<tbody>
+{{range .Entries}}<tr><td><code>{{.GID}}</code></td><td>{{.State}}</td><td>{{range $i, $p := .Participants}}{{if $i}}, {{end}}{{$p}}{{end}}</td><td>{{.AgeText}}</td><td>{{.Decision}}</td></tr>
+{{end}}</tbody>
+</table>{{else}}<p class="notice">The decision log is empty: no two-phase commit is in flight or in doubt.</p>{{end}}

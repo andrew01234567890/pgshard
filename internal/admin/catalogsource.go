@@ -80,3 +80,27 @@ func (p PgxCatalog) CountMigrations(ctx context.Context) (catalog.MigrationCount
 		return catalog.CountMigrations(ctx, conn)
 	})
 }
+
+// ListDecisions implements TwoPCSource.
+func (p PgxCatalog) ListDecisions(ctx context.Context) ([]TwoPCRow, error) {
+	return withConn(ctx, p, func(ctx context.Context, conn *pgx.Conn) ([]TwoPCRow, error) {
+		rows, err := conn.Query(ctx, `SELECT gid, state, participants, created_at, decided_at
+			FROM pgshard.xact_decisions ORDER BY created_at, gid`)
+		if err != nil {
+			return nil, err
+		}
+		return pgx.CollectRows(rows, pgx.RowToStructByPos[TwoPCRow])
+	})
+}
+
+// ListPausedWorkflows implements TwoPCSource.
+func (p PgxCatalog) ListPausedWorkflows(ctx context.Context) ([]WorkflowRow, error) {
+	return withConn(ctx, p, func(ctx context.Context, conn *pgx.Conn) ([]WorkflowRow, error) {
+		rows, err := conn.Query(ctx, `SELECT id::text, kind, state, updated_at
+			FROM pgshard.workflows WHERE state = 'paused' ORDER BY updated_at`)
+		if err != nil {
+			return nil, err
+		}
+		return pgx.CollectRows(rows, pgx.RowToStructByPos[WorkflowRow])
+	})
+}

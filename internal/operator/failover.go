@@ -310,6 +310,9 @@ func (r *ClusterReconciler) failover(ctx context.Context, c *pgshardv1alpha1.PgS
 		return state, err
 	}
 	log.Info("failover started: lease fenced, waiting for the old primary to stop and standbys to disconnect")
+	if r.Metrics != nil {
+		r.Metrics.Failovers.Inc()
+	}
 
 	views, err := r.quiesce(ctx, g, old, members, password)
 	if err != nil {

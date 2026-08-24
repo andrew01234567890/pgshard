@@ -268,6 +268,7 @@ func (s *Server) runStream(ctx context.Context, req *pgshardv1.StreamRequest, em
 		switch m := msg.(type) {
 		case *pgrepl.PrimaryKeepalive:
 			serverEnd = m.ServerWALEnd
+			s.noteStreamEnd(serverEnd, reader)
 			if m.ReplyRequested {
 				if err := sendStatus(); err != nil {
 					return status.Errorf(codes.Unavailable, "standby status: %v", err)
@@ -275,6 +276,7 @@ func (s *Server) runStream(ctx context.Context, req *pgshardv1.StreamRequest, em
 			}
 		case *pgrepl.XLogData:
 			serverEnd = m.ServerWALEnd
+			s.noteStreamEnd(serverEnd, reader)
 			d, err := dec.Decode(m.Data)
 			if err != nil {
 				return status.Errorf(codes.Internal, "decode at %s: %v", m.WALStart, err)

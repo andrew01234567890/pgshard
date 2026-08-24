@@ -1,0 +1,9 @@
+{{template "head" "Alerts"}}
+<header><h1><a href="/">clusters</a> / alerts</h1><span class="meta">{{.Firing}} firing · checked {{.CheckedAt}}</span></header>
+<nav class="tabs" aria-label="Sections"><a href="/">Clusters</a><a href="/backups">Backups</a><a href="/migrations">Migrations</a><a href="/streams">Streams</a><a href="/twopc">2PC</a><a href="/alerts" aria-current="page">Alerts</a></nav>
+<div id="alerts" data-live hx-get="/alerts" hx-trigger="topology" hx-swap="innerHTML" aria-live="polite">
+{{template "alerts_table.html" .}}
+</div>
+<p class="notice"><a href="/api/v1/alerts">JSON</a></p>
+<script src="/static/app.js" defer></script>
+{{template "foot"}}

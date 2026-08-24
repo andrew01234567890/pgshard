@@ -19,8 +19,11 @@ type Planner struct {
 }
 
 // New builds a Planner with a bounded parse cache.
-func New() *Planner {
-	return &Planner{parser: pgparser.New(pgparser.Options{CacheEntries: 4096, CacheBytes: 32 << 20})}
+func New() *Planner { return NewWithMetrics(nil) }
+
+// NewWithMetrics builds a Planner whose parse cache reports to m.
+func NewWithMetrics(m pgparser.Metrics) *Planner {
+	return &Planner{parser: pgparser.New(pgparser.Options{CacheEntries: 4096, CacheBytes: 32 << 20, Metrics: m})}
 }
 
 const cursorOptHold = 0x0020

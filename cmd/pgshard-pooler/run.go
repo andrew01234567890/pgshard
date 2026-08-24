@@ -25,6 +25,7 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 	"github.com/andrew01234567890/pgshard/internal/cli"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
+	"github.com/andrew01234567890/pgshard/internal/metrics"
 	"github.com/andrew01234567890/pgshard/internal/pooler"
 )
 
@@ -63,6 +64,7 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	drain := fs.Duration("drain-timeout", 30*time.Second, "time to let in-flight transactions finish on shutdown")
 	streamDSN := fs.String("stream-dsn", "", "superuser DSN for change-stream replication connections (enables Stream)")
 	streamShard := fs.String("stream-shard", "", "group name used in stream slot names (default derived from --shard-set/--shard-id)")
+	metricsListen := fs.String("metrics-listen", "", "HTTP address for /metrics (empty disables)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return cli.ExitOK
@@ -105,8 +107,30 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		}()
 		source = &pooler.SnapshotSource{Watcher: w, Shard: snapshot.ShardKey{ShardSet: *shardSet, ShardID: int32(*shardID)}, Base: base}
 	}
-	pool := pooler.NewPool(pooler.PoolConfig{MaxBackends: *maxBackends, MaxPerRole: *maxPerRole,
-		MaxLifetime: *maxLifetime, MaxIdleTime: *maxIdle}, dialer)
+	reg := metrics.NewRegistry("pooler")
+	var pm *metrics.Pooler
+	poolCfg := pooler.PoolConfig{MaxBackends: *maxBackends, MaxPerRole: *maxPerRole,
+		MaxLifetime: *maxLifetime, MaxIdleTime: *maxIdle}
+	var pool *pooler.Pool
+	pm = metrics.NewPooler(reg,
+		func() float64 { live, _ := pool.Stats(); return float64(live) },
+		func() float64 { _, idle := pool.Stats(); return float64(idle) })
+	poolCfg.OnDial = func(err error) {
+		result := "ok"
+		if err != nil {
+			result = "error"
+		}
+		pm.BackendDials.WithLabelValues(result).Inc()
+	}
+	poolCfg.OnWait = func() { pm.PoolWaits.Inc() }
+	pool = pooler.NewPool(poolCfg, dialer)
+	if *metricsListen != "" {
+		go func() {
+			if err := metrics.Serve(ctx, *metricsListen, reg); err != nil {
+				logger.Error("metrics listener stopped", "err", err)
+			}
+		}()
+	}
 	if *streamShard == "" {
 		set := *shardSet
 		if set == "" {
@@ -115,7 +139,7 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		*streamShard = catalog.GroupName(set, int32(*shardID))
 	}
 	srv := pooler.NewServer(pooler.Config{Pool: pool, Source: source, Dialer: dialer, Database: *database, Logger: logger, ReserveTimeout: *reserveTimeout,
-		Stream: pooler.StreamConfig{DSN: *streamDSN, Shard: *streamShard}})
+		Stream: pooler.StreamConfig{DSN: *streamDSN, Shard: *streamShard}, Metrics: pm})
 
 	l, err := net.Listen("tcp", *listen)
 	if err != nil {

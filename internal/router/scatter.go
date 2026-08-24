@@ -228,6 +228,7 @@ func (e *Executor) runScatter(ctx context.Context, shards []int32, m *plan.Merge
 		return err
 	}
 	defer e.r.scatter.release(len(shards))
+	e.r.metrics.ScatterFanout.Observe(float64(len(shards)))
 	parts := make([]*participant, 0, len(shards))
 	defer func() {
 		for _, p := range parts {

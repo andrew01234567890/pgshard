@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
+	"github.com/andrew01234567890/pgshard/internal/metrics"
 )
 
 // Run bootstraps and supervises the instance until ctx ends or a fatal
@@ -67,13 +68,40 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	}
 	go inst.ensureStanzaLoop(ctx, stanzaRetry)
 
+	reg := metrics.NewRegistry("agent")
+	am := metrics.NewAgent(reg,
+		func() float64 {
+			if inst.IsPrimary() {
+				return 1
+			}
+			return 0
+		},
+		func() float64 {
+			if inst.IsPrimary() {
+				return 0
+			}
+			lctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			lag, err := inst.ReplayLagBytes(lctx)
+			if err != nil {
+				return -1
+			}
+			return float64(lag)
+		})
+	go pollMetrics(ctx, inst, am)
 	probes := &Probes{Health: inst, MaxLagBytes: cfg.MaxLagBytes, Peers: cfg.PeerFailsafeURLs,
 		IsolationGrace: time.Duration(cfg.IsolationGrace),
-		Fenced:         func() { fatal(errors.New("primary isolated: self-fencing")) }}
+		Fenced: func() {
+			am.FenceEvents.Inc()
+			fatal(errors.New("primary isolated: self-fencing"))
+		}}
 	if lease != nil {
 		probes.KubeReachable = lease.Reachable
 	}
-	httpSrv := &http.Server{Addr: cfg.HTTPAddr, Handler: probes.Handler(), ReadHeaderTimeout: 5 * time.Second}
+	mux := http.NewServeMux()
+	mux.Handle("/", probes.Handler())
+	mux.Handle("/metrics", metrics.Handler(reg))
+	httpSrv := &http.Server{Addr: cfg.HTTPAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	httpLn, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {
 		return err

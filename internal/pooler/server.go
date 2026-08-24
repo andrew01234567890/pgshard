@@ -16,6 +16,8 @@ import (
 	"google.golang.org/grpc/status"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
+	"github.com/andrew01234567890/pgshard/internal/metrics"
+	"github.com/andrew01234567890/pgshard/internal/pgrepl"
 )
 
 // Config wires a Server.
@@ -36,6 +38,27 @@ type Config struct {
 	ReserveTimeout time.Duration
 	// Stream configures the change-stream RPCs.
 	Stream StreamConfig
+	// Metrics receives pooler metric events; nil disables them.
+	Metrics *metrics.Pooler
+}
+
+func (s *Server) notePrepared(hit bool) {
+	if s.cfg.Metrics == nil {
+		return
+	}
+	if hit {
+		s.cfg.Metrics.PreparedHits.Inc()
+	} else {
+		s.cfg.Metrics.PreparedMisses.Inc()
+	}
+}
+
+func (s *Server) noteStreamEnd(end pgrepl.LSN, r *streamReader) {
+	if s.cfg.Metrics == nil {
+		return
+	}
+	lag := uint64(end) - min(uint64(end), r.acked.Load())
+	s.cfg.Metrics.StreamLagBytes.Set(float64(lag))
 }
 
 // Server implements the Pooler gRPC service.
@@ -344,10 +367,12 @@ func (r *relay) forward(b *Backend, fm pgproto3.FrontendMessage) {
 		}
 		fp := statementFingerprint(m)
 		if b.prepared.holds(m.Name, fp) {
+			r.srv.notePrepared(true)
 			b.send(&pgproto3.Close{ObjectType: 'P', Name: noopPortal})
 			r.closes = append(r.closes, closeAsParse)
 			return
 		}
+		r.srv.notePrepared(false)
 		if b.prepared.mayHold(m.Name) {
 			b.send(&pgproto3.Close{ObjectType: 'S', Name: m.Name})
 			r.closes = append(r.closes, closeInjected)

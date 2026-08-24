@@ -10,6 +10,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/andrew01234567890/pgshard/internal/metrics"
 )
 
 // GIDPrefix starts every transaction identifier the router coordinates.
@@ -56,6 +58,8 @@ type Resolver struct {
 	PreparingTimeout time.Duration
 	// Now overrides the clock in tests.
 	Now func() time.Time
+	// Metrics counts resolved transactions; nil disables it.
+	Metrics *metrics.Controller
 }
 
 // Outcome counts one resolution pass.
@@ -254,8 +258,13 @@ func (r *Resolver) Run(ctx context.Context, interval time.Duration) {
 			return
 		case <-t.C:
 		}
-		if _, err := r.Resolve(ctx, ""); err != nil && r.Logger != nil {
+		out, err := r.Resolve(ctx, "")
+		if err != nil && r.Logger != nil {
 			r.Logger.Warn("resolver pass failed", "err", err)
+		}
+		if r.Metrics != nil {
+			r.Metrics.ResolvedTxns.WithLabelValues("committed").Add(float64(out.Committed))
+			r.Metrics.ResolvedTxns.WithLabelValues("rolled_back").Add(float64(out.RolledBack))
 		}
 	}
 }

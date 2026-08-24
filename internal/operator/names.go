@@ -19,6 +19,12 @@ const (
 	// itself gains a -v<n> suffix after a storage rebuild.
 	LabelMember = "pgshard.io/member"
 
+	// AnnotationScrape, AnnotationScrapePort and AnnotationScrapePath mark
+	// a pod for Prometheus service discovery.
+	AnnotationScrape     = "prometheus.io/scrape"
+	AnnotationScrapePort = "prometheus.io/port"
+	AnnotationScrapePath = "prometheus.io/path"
+
 	RolePrimary = "primary"
 	RoleReplica = "replica"
 	// RoleUnhealthy marks a member the operator has taken out of every
@@ -48,9 +54,11 @@ const (
 
 	postgresPort  = 5432
 	agentHTTPPort = 8080
-	agentGRPCPort = 9090
-	superuserName = "postgres"
-	secretKey     = "password"
+	// routerHTTPPort serves the router's /metrics, /readyz and /healthz.
+	routerHTTPPort = 8080
+	agentGRPCPort  = 9090
+	superuserName  = "postgres"
+	secretKey      = "password"
 	// shardSet is the shard map every shard group belongs to until databases
 	// can choose their own.
 	shardSet = "default"

@@ -44,6 +44,10 @@ pgshard-admin serve [--listen :8081] [--kubeconfig PATH] [--namespace NS] [--cat
 | `/api/v1/streams`, `/api/v1/streams/{name}` | JSON documents the streams pages are rendered from. |
 | `/api/v1/clusters` | JSON clusters list. |
 | `/api/v1/clusters/{ns}/{name}` | JSON topology document the page is rendered from. |
+| `/twopc` | Two-phase commit decision log (needs `--catalog-dsn`, otherwise 503): every `pgshard.xact_decisions` row with gid, state, participants, age and decision (`undecided` while preparing). The header counts logged and in-doubt rows and shows the oldest in-doubt age. Read-only. |
+| `/alerts` | Currently firing conditions derived from the catalog and the Kubernetes API, without needing Prometheus: aged in-doubt 2PC (over 5 minutes), an oversized decision log, lost stream slots, workflows paused at cutover for over 30 minutes, and backup staleness (no completed backup, or the newest older than 26 hours). Read-only. |
+| `/api/v1/twopc`, `/api/v1/alerts` | JSON documents the two pages are rendered from. |
+| `/metrics` | Prometheus metrics of the admin process itself. |
 | `/events` | Server-sent events. A `topology` event is sent on every PgShardCluster, PgShardGroup, PgShardBackupPolicy, PgShardBackup, PgShardRestore or member Pod change seen by the informers, and at least every 2 seconds. |
 | `/healthz` | Liveness and readiness. |
 

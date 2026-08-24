@@ -27,6 +27,8 @@ import (
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/internal/pgtune"
+
+	"github.com/andrew01234567890/pgshard/internal/metrics"
 )
 
 const (
@@ -49,6 +51,8 @@ type ClusterReconciler struct {
 	QuiesceTimeout time.Duration
 	RolloutTimeout time.Duration
 	Now            func() time.Time
+	// Metrics counts failovers and rolling-update progress; nil disables it.
+	Metrics *metrics.Operator
 
 	mu             sync.Mutex
 	unhealthySince map[string]time.Time
