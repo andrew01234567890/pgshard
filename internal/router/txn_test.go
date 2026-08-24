@@ -472,3 +472,98 @@ func expectRefusalCode(t *testing.T, err error, code string) *pgconn.PgError {
 	}
 	return pe
 }
+
+func TestReaderThatWroteThroughAFunctionJoinsTwoPhaseCommit(t *testing.T) {
+	h := newTxnHarness(t)
+	ctx := context.Background()
+	a, b := h.twoTenants(t)
+	sa, sb := h.shardOf(t, a), h.shardOf(t, b)
+	conn := h.connect(t, h.dsn())
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 1)", a); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := tx.Query(ctx, "select write_fn() from orders where tenant_id = $1", b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit must escalate to two-phase, not roll the function's write back: %v", err)
+	}
+	for _, s := range []int{sa, sb} {
+		if !h.ranOn(s, "prepare transaction 'pgshard-") || !h.ranOn(s, "commit prepared 'pgshard-") {
+			t.Fatalf("shard %d did not prepare and commit: %v", s, h.poolers[s].ran())
+		}
+	}
+	if h.ranOn(sb, "rollback") {
+		t.Fatalf("hidden writer was rolled back: %v", h.poolers[sb].ran())
+	}
+	if got := h.log.log(); len(got) != 3 {
+		t.Fatalf("decision log %v", got)
+	}
+	if h.prepared() != 0 {
+		t.Fatalf("%d prepared transactions left behind", h.prepared())
+	}
+
+	// A plain reader is still probed and still not prepared.
+	tx, err = conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 2)", a); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = tx.Query(ctx, "select * from orders where tenant_id = $1", b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.allRan("prepare transaction"); len(got) != 2 {
+		t.Fatalf("prepares after a plain read: %v", got)
+	}
+	if !h.ranOn(sb, strings.ToLower(hiddenWriteProbe)) {
+		t.Fatalf("reader not probed for a hidden write: %v", h.poolers[sb].ran())
+	}
+}
+
+func TestSingleModeRefusesCommitAfterHiddenWrite(t *testing.T) {
+	h := newTxnHarness(t)
+	ctx := context.Background()
+	a, b := h.twoTenants(t)
+	conn := h.connect(t, h.dsn())
+	if _, err := conn.Exec(ctx, "set pgshard.transaction_mode = single"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 1)", a); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := tx.Query(ctx, "select write_fn() from orders where tenant_id = $1", b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+	err = tx.Commit(ctx)
+	_ = expectRefusal(t, err, "transaction wrote on shard")
+	if got := h.allRan("prepare transaction"); len(got) != 0 {
+		t.Fatalf("prepared in single mode: %v", got)
+	}
+	for _, s := range []int{h.shardOf(t, a), h.shardOf(t, b)} {
+		if !h.ranOn(s, "rollback") || h.ranOn(s, "commit") {
+			t.Fatalf("shard %d must roll back: %v", s, h.poolers[s].ran())
+		}
+	}
+	if _, err := conn.Exec(ctx, "select 1"); err != nil {
+		t.Fatalf("session unusable after refused commit: %v", err)
+	}
+}

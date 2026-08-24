@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -60,7 +61,7 @@ func (h *harness) subscribe() (<-chan snapshot.Change, func()) {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	fp := newFakePooler(7, 2)
+	fp := newFakePooler()
 	return newHarnessWith(t, fp, startFakePooler(t, fp), nil)
 }
 
@@ -541,5 +542,132 @@ func TestExtendedSetIsStaged(t *testing.T) {
 	var v string
 	if err := conn.QueryRow(ctx, "select current_setting('application_name')").Scan(&v); err != nil || v != "ext" {
 		t.Fatalf("extended SET not replayed: %q %v", v, err)
+	}
+}
+
+func TestRollbackToSavepointDropsSettingsStagedAfterIt(t *testing.T) {
+	h := newHarness(t)
+	conn := h.connect(t, h.dsn("app", "secret", "app"))
+	ctx := context.Background()
+	for _, sql := range []string{"begin", "set application_name to 'before'", "savepoint sp", "set application_name to 'after'", "rollback to savepoint sp", "commit"} {
+		if _, err := conn.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	var v string
+	if err := conn.QueryRow(ctx, "select current_setting('application_name')").Scan(&v); err != nil || v != "before" {
+		t.Fatalf("replayed after rollback to savepoint: %q %v", v, err)
+	}
+	for _, sql := range []string{"begin", "savepoint sp", "set application_name to 'released'", "release savepoint sp", "commit"} {
+		if _, err := conn.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	if err := conn.QueryRow(ctx, "select current_setting('application_name')").Scan(&v); err != nil || v != "released" {
+		t.Fatalf("replayed after release: %q %v", v, err)
+	}
+}
+
+func TestSQLPrepareIsPinnedAndReplayed(t *testing.T) {
+	h := newHarness(t)
+	conn := h.connect(t, h.dsn("app", "secret", "app"))
+	ctx := context.Background()
+	if _, err := conn.Exec(ctx, "prepare one as select 1"); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.fp.reserves) != 1 {
+		t.Fatalf("SQL PREPARE must pin: %v", h.fp.reserves)
+	}
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.fp.releases) != 1 {
+		t.Fatalf("transaction end must release: %v", h.fp.releases)
+	}
+	var n int
+	if err := conn.QueryRow(ctx, "execute one").Scan(&n); err != nil || n != 1 {
+		t.Fatalf("execute after replay: %d %v", n, err)
+	}
+	if _, err := conn.Exec(ctx, "deallocate one"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "prepare one as select 1"); err != nil {
+		t.Fatalf("re-prepare after deallocate: %v", err)
+	}
+	if _, err := conn.Exec(ctx, "discard all"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "prepare one as select 1"); err != nil {
+		t.Fatalf("re-prepare after discard all: %v", err)
+	}
+}
+
+func TestDeallocateOfProtocolStatementStopsItsReplay(t *testing.T) {
+	h := newHarness(t)
+	conn := h.connect(t, h.dsn("app", "secret", "app"))
+	ctx := context.Background()
+	if _, err := conn.Prepare(ctx, "q1", "select 1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "deallocate q1"); err != nil {
+		t.Fatalf("deallocate must address the physical statement: %v", err)
+	}
+	if !slices.ContainsFunc(h.fp.executedQueries(), func(q string) bool {
+		return strings.HasPrefix(q, `deallocate "pgshard_`) && strings.HasSuffix(q, `_q1"`)
+	}) {
+		t.Fatalf("deallocate was not rewritten to the physical name: %v", h.fp.executedQueries())
+	}
+	for _, sql := range []string{"begin", "commit", "select 1"} {
+		if _, err := conn.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if names := h.fp.namedStatements(); len(names) != 0 {
+		t.Fatalf("deallocated statement was replayed: %v", names)
+	}
+}
+
+func (f *fakePooler) executedQueries() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.executed)
+}
+
+func (f *fakePooler) namedStatements() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var names []string
+	for _, b := range f.backends {
+		for name := range b.stmts {
+			if name != "" {
+				names = append(names, name)
+			}
+		}
+	}
+	return names
+}
+
+func TestNotificationsReachTheClient(t *testing.T) {
+	h := newHarness(t)
+	cfg, err := pgx.ParseConfig(h.dsn("app", "secret", "app"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []*pgconn.Notification
+	cfg.OnNotification = func(_ *pgconn.PgConn, n *pgconn.Notification) { got = append(got, n) }
+	conn, err := pgx.ConnectConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(context.Background()) }()
+	if _, err := conn.Exec(context.Background(), "select notify"); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].PID != 9 || got[0].Channel != "events" || got[0].Payload != "hello" {
+		t.Fatalf("notifications %+v", got)
 	}
 }

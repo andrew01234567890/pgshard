@@ -63,9 +63,20 @@ the rest with `0A000`. See *Routing* below.
   releases the pin (`Release`, which rolls back and `DISCARD ALL`s) so the
   backend returns to the pool; the next statement re-pins and **replays** the
   committed GUCs and prepared statements onto whatever backend it gets. GUCs
-  set inside a transaction that rolls back are not replayed. A lost pooler
-  stream is reported as `08006` and the next statement reacquires and
-  replays too.
+  set inside a transaction that rolls back are not replayed, nor are those
+  set after a savepoint the transaction rolled back to. SQL-level
+  `PREPARE` pins and is replayed like a named protocol statement;
+  `DEALLOCATE` (of either kind of statement, protocol names are rewritten
+  to their physical name) and `DEALLOCATE ALL`/`DISCARD ALL` stop the
+  replay of what they dropped. A lost pooler stream is reported as `08006`
+  and the next statement reacquires and replays too.
+- **Transaction-mode caveats.** As with PgBouncer in transaction mode,
+  state that the router does not track is lost when the backend changes:
+  the unnamed prepared statement lives only until the next `Sync` (a
+  `Parse` of `""` in one batch and a `Bind` of it in a later one may land on
+  different backends), `SET LOCAL` is honoured only within its transaction,
+  and advisory locks, `LISTEN` (refused) and temporary tables (refused) do
+  not survive a release.
 - **Cancel.** A `CancelRequest` is verified against the session's key and
   forwarded as the pooler `Cancel` RPC; a query context that ends while a
   batch is in flight (drain) does the same. The batch is always drained to
@@ -379,6 +390,16 @@ refused: those statements belong to the coordinator.
 that shard plainly and rolls back the read-only participants; the decision
 log is never touched. This is the common path.
 
+A participant counts as a writer when the planner classified one of its
+statements as a write, **or** when its backend assigned a transaction id
+anyway: before `COMMIT` the router runs
+`SELECT pg_current_xact_id_if_assigned() IS NOT NULL` on every
+planner-classified reader (in parallel, one round trip), so a `SELECT` that
+called a function which inserted or updated rows is promoted to a writer and
+takes part in two-phase commit instead of being rolled back behind a
+successful `COMMIT`. In `single` mode such a promotion that produces a
+second writer makes `COMMIT` fail with `0A000` and roll back everywhere.
+
 With **two or more writers** the router runs two-phase commit against the
 catalog table `pgshard.xact_decisions`:
 
@@ -488,13 +509,19 @@ While a shard changes primaries the catalog's `shard_status` shows it as
 answer `55000` to a stamp with a stale generation or epoch. The router
 hides short failovers from clients where it can do so safely:
 
-- A statement whose shard is blocking, or that came back `55000`, or whose
-  pooler refused the connection outright, is **buffered** if nothing of it
-  has reached the client yet and no transaction block is open: it waits
-  until the snapshot shows the shard serving again (LISTEN/NOTIFY wakes it;
-  status-only edits are picked up by a 200ms poll) or `--buffer-window`
-  (10s) elapses, then runs once more against the refreshed endpoint. A
-  window that expires with the shard still blocking is `08006`.
+- A statement whose shard is blocking, or that came back `55000`, is
+  **buffered** if nothing of it has reached the client yet and no
+  transaction block is open: it waits until the snapshot shows the shard
+  serving again (LISTEN/NOTIFY wakes it; status-only edits are picked up by
+  a 200ms poll) or `--buffer-window` (10s) elapses, then runs once more
+  against the refreshed endpoint. A window that expires with the shard
+  still blocking is `08006`.
+- A pooler that refused the connection outright (gRPC `Unavailable`) while
+  the snapshot still shows the shard serving is a transport fault, not a
+  failover: the statement is retried once after a new snapshot or
+  `--buffer-transport-window` (1s), whichever comes first, and fails with
+  `08006` if the pooler still refuses. The refusal takes the full
+  `--buffer-window` only when the snapshot has meanwhile fenced the shard.
 - Inside a transaction block the earlier statements ran on the old primary
   and cannot be replayed, so the statement fails with **`40001`
   (serialization_failure) "shard failover; retry the transaction"**, the

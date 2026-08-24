@@ -29,6 +29,10 @@ type Buffering struct {
 	// Window bounds how long a statement waits for the shard to become
 	// consistent again. Default 10s.
 	Window time.Duration
+	// TransportWindow bounds how long a statement waits after a pooler
+	// refused the connection while the snapshot still shows the shard
+	// serving: a transport fault rather than a failover. Default 1s.
+	TransportWindow time.Duration
 	// PerShardCap bounds statements waiting on one shard; the next one is
 	// refused with 53300. Default 256.
 	PerShardCap int
@@ -42,6 +46,9 @@ type Buffering struct {
 func (b Buffering) withDefaults() Buffering {
 	if b.Window <= 0 {
 		b.Window = 10 * time.Second
+	}
+	if b.TransportWindow <= 0 {
+		b.TransportWindow = time.Second
 	}
 	if b.PerShardCap <= 0 {
 		b.PerShardCap = 256
@@ -84,16 +91,29 @@ func decideFailover(trigger, inTxn, outputSent bool, buffered, capacity int) fai
 }
 
 // isFailover reports whether err is a stale-generation refusal from a
-// pooler or a lost connection to it.
-func isFailover(err error) bool {
-	if err == nil {
-		return false
-	}
-	if pe, ok := errors.AsType[*pgwire.Error](err); ok && pe.Code == codeStaleGeneration {
-		return true
-	}
+// pooler or a refused connection to it.
+func isFailover(err error) bool { return isStaleGeneration(err) || isRefused(err) }
+
+func isStaleGeneration(err error) bool {
+	pe, ok := errors.AsType[*pgwire.Error](err)
+	return ok && pe.Code == codeStaleGeneration
+}
+
+func isRefused(err error) bool {
 	_, refused := errors.AsType[*refusedError](err)
 	return refused
+}
+
+// retryWindow picks how long a failed statement on sh waits before its
+// retry. A refused pooler connection while the snapshot still shows the
+// shard serving is a transport fault, not a failover, and gets the short
+// transport window; a fence signal (stale generation, or a shard that is
+// blocking in the snapshot) gets the full failover window.
+func (r *Router) retryWindow(sh Shard, err error) time.Duration {
+	if isRefused(err) && !isStaleGeneration(err) && !r.blocking(sh) {
+		return r.cfg.Buffering.TransportWindow
+	}
+	return r.cfg.Buffering.Window
 }
 
 // blocking reports whether sh has no usable primary in the current
@@ -140,7 +160,8 @@ func (r *Router) Buffered(sh Shard) int {
 // additionally waits for a new snapshot, since the one that produced the
 // error is by definition stale; if none arrives within the window the
 // statement is still retried once, against whatever endpoint is current.
-func (r *Router) awaitConsistent(ctx context.Context, sh Shard, afterError bool) (bool, error) {
+// window bounds the wait.
+func (r *Router) awaitConsistent(ctx context.Context, sh Shard, afterError bool, window time.Duration) (bool, error) {
 	if !r.reserveBuffer(sh) {
 		return false, bufferFullError(sh)
 	}
@@ -151,7 +172,7 @@ func (r *Router) awaitConsistent(ctx context.Context, sh Shard, afterError bool)
 		defer unsubscribe()
 		changes = ch
 	}
-	deadline := time.NewTimer(r.cfg.Buffering.Window)
+	deadline := time.NewTimer(window)
 	defer deadline.Stop()
 	poll := time.NewTicker(r.cfg.Buffering.Poll)
 	defer poll.Stop()
@@ -212,6 +233,10 @@ func (c *countingWriter) PortalSuspended() error { c.wrote = true; return c.w.Po
 func (c *countingWriter) Notice(n *pgproto3.NoticeResponse) error {
 	c.wrote = true
 	return c.w.Notice(n)
+}
+func (c *countingWriter) Notification(n *pgproto3.NotificationResponse) error {
+	c.wrote = true
+	return c.w.Notification(n)
 }
 func (c *countingWriter) CopyIn(f byte, cf []uint16) (pgwire.CopyInStream, error) {
 	c.wrote = true

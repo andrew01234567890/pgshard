@@ -7,3 +7,10 @@ coverage*
 .vscode/
 .env
 test/e2e/**/artifacts/
+
+/pgshard-router
+/pgshard-pooler
+/pgshard-agent
+/pgshard-operator
+/pgshard-admin
+/pgshard-controller

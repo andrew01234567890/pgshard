@@ -44,6 +44,8 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	pgHost := fs.String("pg-host", "127.0.0.1", "PostgreSQL host")
 	pgPort := fs.Int("pg-port", 5432, "PostgreSQL port")
 	database := fs.String("pg-database", "postgres", "PostgreSQL database every backend connects to")
+	pgSSLMode := fs.String("pg-sslmode", "disable", "TLS to PostgreSQL over TCP: disable, require or verify-full (unix sockets are never upgraded)")
+	pgSSLRootCert := fs.String("pg-sslrootcert", "", "CA bundle the PostgreSQL server certificate must chain to (verify-full)")
 	certFile := fs.String("tls-cert", "", "server certificate for the gRPC listener (mTLS)")
 	keyFile := fs.String("tls-key", "", "server private key")
 	caFile := fs.String("tls-ca", "", "CA bundle that client (router) certificates must chain to")
@@ -57,6 +59,7 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	maxPerRole := fs.Int("max-per-role", 0, "backend budget per role (0 = same as --max-backends)")
 	maxLifetime := fs.Duration("backend-max-lifetime", time.Hour, "retire backends older than this")
 	maxIdle := fs.Duration("backend-max-idle", 10*time.Minute, "close backends idle longer than this")
+	reserveTimeout := fs.Duration("reserve-timeout", 5*time.Minute, "release a reserved session whose Execute stream has been gone this long")
 	drain := fs.Duration("drain-timeout", 30*time.Second, "time to let in-flight transactions finish on shutdown")
 	streamDSN := fs.String("stream-dsn", "", "superuser DSN for change-stream replication connections (enables Stream)")
 	streamShard := fs.String("stream-shard", "", "group name used in stream slot names (default derived from --shard-set/--shard-id)")
@@ -85,7 +88,12 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	if *socketDir != "" {
 		addr = filepath.Join(*socketDir, ".s.PGSQL."+strconv.Itoa(*pgPort))
 	}
-	dialer := pooler.Dialer{Address: addr, Timeout: 5 * time.Second}
+	backendTLS, err := backendTLSConfig(*pgSSLMode, *pgSSLRootCert, *pgHost)
+	if err != nil {
+		fmt.Fprintf(stderr, "pgshard-pooler run: %v\n", err)
+		return cli.ExitUsage
+	}
+	dialer := pooler.Dialer{Address: addr, Timeout: 5 * time.Second, TLS: backendTLS}
 	base := pooler.View{Generation: *generation, Epoch: *epoch, Role: pgshardv1.HealthStatus_ROLE_PRIMARY, Serving: true}
 	var source pooler.Source = pooler.NewStaticSource(base)
 	if *catalogDSN != "" {
@@ -106,7 +114,7 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		}
 		*streamShard = catalog.GroupName(set, int32(*shardID))
 	}
-	srv := pooler.NewServer(pooler.Config{Pool: pool, Source: source, Dialer: dialer, Database: *database, Logger: logger,
+	srv := pooler.NewServer(pooler.Config{Pool: pool, Source: source, Dialer: dialer, Database: *database, Logger: logger, ReserveTimeout: *reserveTimeout,
 		Stream: pooler.StreamConfig{DSN: *streamDSN, Shard: *streamShard}})
 
 	l, err := net.Listen("tcp", *listen)
@@ -137,6 +145,32 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	g.Stop()
 	<-errc
 	return cli.ExitOK
+}
+
+// backendTLSConfig maps libpq-style sslmode onto a client TLS config: nil
+// for disable, an unverified handshake for require, and a config that
+// verifies the chain and host name for verify-full.
+func backendTLSConfig(mode, rootCert, host string) (*tls.Config, error) {
+	switch mode {
+	case "disable":
+		return nil, nil
+	case "require":
+		return &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}, nil //nolint:gosec // sslmode=require verifies nothing by definition
+	case "verify-full":
+		if rootCert == "" {
+			return nil, errors.New("--pg-sslmode verify-full requires --pg-sslrootcert")
+		}
+		pem, err := os.ReadFile(rootCert)
+		if err != nil {
+			return nil, err
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("%s: no certificates found", rootCert)
+		}
+		return &tls.Config{RootCAs: pool, ServerName: host, MinVersion: tls.VersionTLS12}, nil
+	}
+	return nil, fmt.Errorf("--pg-sslmode %q: want disable, require or verify-full", mode)
 }
 
 func listenerCredentials(certFile, keyFile, caFile string, insecureDev bool) (credentials.TransportCredentials, error) {

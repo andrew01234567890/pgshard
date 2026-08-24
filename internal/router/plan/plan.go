@@ -71,7 +71,30 @@ type StmtClass struct {
 	Txn TxnKind
 	// Chain marks COMMIT/ROLLBACK AND CHAIN.
 	Chain bool
+	// Savepoint names the savepoint of a SAVEPOINT, RELEASE or ROLLBACK TO.
+	Savepoint string
+	// Session is the session-state statement this is, if any.
+	Session SessionKind
+	// SessionName is the statement name of an SQL-level PREPARE or
+	// DEALLOCATE; empty for DEALLOCATE ALL.
+	SessionName string
 }
+
+// SessionKind classifies statements that create, drop or reset session
+// state the router replays.
+type SessionKind int
+
+// Session-state statement kinds.
+const (
+	SessionNone SessionKind = iota
+	// SessionPrepare is an SQL-level PREPARE name AS ....
+	SessionPrepare
+	// SessionDeallocate is DEALLOCATE name or DEALLOCATE ALL.
+	SessionDeallocate
+	// SessionDiscardAll is DISCARD ALL, which drops every setting and
+	// prepared statement; DISCARD PLANS/SEQUENCES/TEMP are plain forwards.
+	SessionDiscardAll
+)
 
 // TxnKind classifies transaction control statements.
 type TxnKind int
@@ -82,8 +105,9 @@ const (
 	TxnBegin
 	TxnCommit
 	TxnRollback
-	// TxnSavepoint covers SAVEPOINT, RELEASE and ROLLBACK TO.
 	TxnSavepoint
+	TxnRelease
+	TxnRollbackTo
 )
 
 // Plan is the routing decision for one statement.

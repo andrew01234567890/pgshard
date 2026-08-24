@@ -72,7 +72,8 @@ func (s *Server) ReconcilePreparedTransactions(ctx context.Context, req *pgshard
 		decisions = append(decisions, twopc.Decision{GID: d.GetGid(), State: d.GetState(), Participants: d.GetParticipants(), ParticipantXIDs: d.GetParticipantXids()})
 	}
 	out, err := twopc.Reconcile(ctx, &instanceParticipant{inst: s.inst}, req.GetShardId(), decisions)
-	resp.Committed, resp.RolledBack, resp.Contradictions = uint32(out.Committed), uint32(out.RolledBack), out.Contradictions
+	resp.Committed, resp.RolledBack = uint32(out.Committed), uint32(out.RolledBack)
+	resp.Contradictions, resp.Unverifiable = out.Contradictions, out.Unverifiable
 	resp.Error = pgErr(err)
 	return resp, nil
 }

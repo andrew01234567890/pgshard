@@ -6,10 +6,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgproto3"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -62,7 +64,7 @@ func TestFencingRefusesBeforeBackend(t *testing.T) {
 		t.Fatalf("matching generation refused: %v", e)
 	}
 	if h.pg.queries.Load() != 1 {
-		t.Fatal("matching generation must reach PostgreSQL")
+		t.Fatalf("matching generation must reach PostgreSQL: %v", h.pg.seen)
 	}
 	h.src.Set(View{Generation: 8, Epoch: 3})
 	rs = roundTrip(t, stream, queryReq("ok", "select 2", gen(7, 3), nil))
@@ -125,7 +127,7 @@ func TestReserveAndRelease(t *testing.T) {
 		t.Fatalf("pid = %d", res.BackendPid)
 	}
 	_ = stream.CloseSend()
-	waitFor(t, func() bool { return !h.attached("s") })
+	waitFor(t, func() bool { return !h.attached() })
 	if h.srv.held() != 1 {
 		t.Fatal("reserved backend must survive the stream")
 	}
@@ -348,7 +350,7 @@ func TestReusedBackendNeverReparsesAHeldStatement(t *testing.T) {
 	// The stream is dropped without Release; the session keeps its backend
 	// and the replay re-parses the same name with the same SQL.
 	_ = stream.CloseSend()
-	waitFor(t, func() bool { return !h.attached("s") })
+	waitFor(t, func() bool { return !h.attached() })
 	stream, _ = h.client.Execute(ctx)
 	rs = parseBatch(t, stream, parseReq("s", "select 1", identity("alice")), syncReq("s"))
 	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
@@ -384,7 +386,7 @@ func TestReusedBackendNeverReparsesAHeldStatement(t *testing.T) {
 	// Release hands the backend to the pool clean; the next session parses
 	// the same name afresh.
 	_ = stream.CloseSend()
-	waitFor(t, func() bool { return !h.attached("s") })
+	waitFor(t, func() bool { return !h.attached() })
 	if _, err := h.client.Release(ctx, &pgshardv1.ReleaseRequest{SessionId: "s"}); err != nil {
 		t.Fatal(err)
 	}
@@ -432,5 +434,68 @@ func TestDeallocateThroughExtendedProtocolDoubtsHeldStatements(t *testing.T) {
 	}
 	if h.pg.count("PARSE st1") != 2 {
 		t.Fatalf("a statement deallocated through the extended protocol must be parsed again: %v", h.pg.seen)
+	}
+}
+
+func TestDrainStartedDuringAcquireIsNotAdopted(t *testing.T) {
+	pg := newFakePG()
+	var srv *Server
+	dial := func(ctx context.Context, db, role string, ck, sk []byte) (*Backend, error) {
+		b, err := pg.dial(ctx, db, role, ck, sk)
+		srv.draining.Store(true)
+		return b, err
+	}
+	src := NewStaticSource(View{Generation: 7, Epoch: 3, Role: pgshardv1.HealthStatus_ROLE_PRIMARY, Serving: true})
+	srv = NewServer(Config{Pool: newPool(PoolConfig{}, dial), Source: src, Database: "app", Logger: slog.New(slog.DiscardHandler)})
+	stream := &recordingStream{ctx: context.Background(), in: []*pgshardv1.ExecuteRequest{queryReq("s", "select 1", gen(7, 3), identity("alice"))}}
+	if err := srv.Execute(stream); err != nil {
+		t.Fatal(err)
+	}
+	if e := firstError(stream.out); e == nil || e.Sqlstate != "57P03" {
+		t.Fatalf("statement adopted a backend after drain began: %v", e)
+	}
+	if srv.held() != 0 || pg.queries.Load() != 0 {
+		t.Fatalf("held %d, queries %d: the backend ran after Drain", srv.held(), pg.queries.Load())
+	}
+}
+
+func TestReservationWithoutStreamExpires(t *testing.T) {
+	h := startHarness(t, PoolConfig{})
+	ctx := context.Background()
+	if _, err := h.client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: "s", Generation: gen(7, 3)}); err != nil {
+		t.Fatal(err)
+	}
+	stream, _ := h.client.Execute(ctx)
+	roundTrip(t, stream, queryReq("s", "begin", gen(7, 3), identity("alice")))
+	_ = stream.CloseSend()
+	waitFor(t, func() bool { return !h.attached() })
+	h.srv.expireReservations(time.Now().Add(h.srv.cfg.ReserveTimeout / 2))
+	if h.srv.lookup("s") == nil || h.srv.held() != 1 {
+		t.Fatal("a reservation younger than the timeout must be kept")
+	}
+	h.srv.expireReservations(time.Now().Add(h.srv.cfg.ReserveTimeout))
+	if h.srv.lookup("s") != nil || h.srv.held() != 0 {
+		t.Fatal("expired reservation must be released")
+	}
+	if !h.pg.sawQuery("ROLLBACK") || !h.pg.sawQuery("DISCARD ALL") {
+		t.Fatalf("expiry must roll back and discard: %v", h.pg.seen)
+	}
+	if _, idle := h.srv.cfg.Pool.Stats(); idle != 1 {
+		t.Fatalf("idle = %d, want the backend back in the pool", idle)
+	}
+	if _, err := h.client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: "n", Generation: gen(7, 3)}); err != nil {
+		t.Fatal(err)
+	}
+	h.srv.expireReservations(time.Now().Add(h.srv.cfg.ReserveTimeout))
+	if h.srv.lookup("n") != nil {
+		t.Fatal("a reservation whose stream never came must expire too")
+	}
+}
+
+func TestNotificationsAreForwarded(t *testing.T) {
+	msg := toResponse(&pgproto3.NotificationResponse{PID: 7, Channel: "events", Payload: "hello"})
+	n := msg.GetNotification()
+	if n == nil || n.Pid != 7 || n.Channel != "events" || n.Payload != "hello" {
+		t.Fatalf("notification = %v", msg)
 	}
 }

@@ -30,6 +30,10 @@ type Config struct {
 	Logger   *slog.Logger
 	// HealthInterval spaces Health stream updates; zero means 1s.
 	HealthInterval time.Duration
+	// ReserveTimeout releases a reserved session that has had no Execute
+	// stream for this long (its router went away without Release); zero
+	// means 5m.
+	ReserveTimeout time.Duration
 	// Stream configures the change-stream RPCs.
 	Stream StreamConfig
 }
@@ -57,6 +61,8 @@ type session struct {
 	// detached is closed when the current Execute stream ends; Release
 	// waits on it when it arrives while the stream is still attached.
 	detached chan struct{}
+	// detachedAt is when a reserved session lost its Execute stream.
+	detachedAt time.Time
 	// b is the backend currently held; nil when the session is between
 	// stateless batches.
 	b *Backend
@@ -70,6 +76,9 @@ func NewServer(cfg Config) *Server {
 	if cfg.HealthInterval <= 0 {
 		cfg.HealthInterval = time.Second
 	}
+	if cfg.ReserveTimeout <= 0 {
+		cfg.ReserveTimeout = 5 * time.Minute
+	}
 	return &Server{cfg: cfg, sessions: map[string]*session{}}
 }
 
@@ -79,6 +88,7 @@ func (s *Server) Register(g *grpc.Server) { pgshardv1.RegisterPoolerServer(g, s)
 var errUnavailable = status.Error(codes.Unavailable, "pooler is draining")
 
 func (s *Server) session(id string) *session {
+	s.expireReservations(time.Now())
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if se, ok := s.sessions[id]; ok {
@@ -118,8 +128,6 @@ func (s *Server) Execute(stream pgshardv1.Pooler_ExecuteServer) error {
 	ck, sk := append([]byte(nil), first.User.ScramClientKey...), append([]byte(nil), first.User.ScramServerKey...)
 	zero(first.User.ScramClientKey)
 	zero(first.User.ScramServerKey)
-	defer zero(ck)
-	defer zero(sk)
 	if s.draining.Load() {
 		return errUnavailable
 	}
@@ -131,10 +139,14 @@ func (s *Server) Execute(stream pgshardv1.Pooler_ExecuteServer) error {
 	}
 	se.attached = true
 	se.detached = make(chan struct{})
+	se.detachedAt = time.Time{}
 	se.role = first.User.Username
 	se.database = s.cfg.Database
 	s.mu.Unlock()
 	defer s.detach(se)
+	// Zeroise the working key copies before the session is detached, so a
+	// caller that observes the session gone also observes the zeroed keys.
+	defer func() { zero(ck); zero(sk) }()
 
 	rs := &relay{srv: s, se: se, stream: stream, ck: ck, sk: sk}
 	req := first
@@ -157,24 +169,27 @@ func (s *Server) detach(se *session) {
 	se.attached = false
 	b := se.b
 	keep := se.reserved
-	if !keep {
+	if keep {
+		se.detachedAt = time.Now()
+	} else {
 		se.b = nil
 	}
 	detached := se.detached
 	s.mu.Unlock()
 	if !keep {
-		if b != nil {
-			s.recycle(b)
-		}
+		s.recycle(b, true)
 		s.forget(se)
 	}
 	close(detached)
 }
 
-// recycle returns b to the pool clean: an open transaction is rolled back
-// and statements it still holds are discarded, so the next session finds
-// neither. A backend that cannot be cleaned is discarded.
-func (s *Server) recycle(b *Backend) {
+// recycle returns b to the pool clean: an open transaction is rolled back,
+// and DISCARD ALL resets it when a session held it (GUCs may be staged) or
+// it still holds statements. A backend that cannot be cleaned is discarded.
+func (s *Server) recycle(b *Backend, resetSession bool) {
+	if b == nil {
+		return
+	}
 	if b.hasUnflushed() {
 		s.cfg.Pool.Discard(b)
 		return
@@ -185,7 +200,7 @@ func (s *Server) recycle(b *Backend) {
 			return
 		}
 	}
-	if len(b.prepared) > 0 {
+	if resetSession || len(b.prepared) > 0 {
 		if err := b.simpleQuery("DISCARD ALL"); err != nil {
 			s.cfg.Pool.Discard(b)
 			return
@@ -256,10 +271,18 @@ func (r *relay) reserved() bool {
 	return r.se.reserved
 }
 
-func (r *relay) setBackend(b *Backend) {
+// setBackend hands b to the session. It reports false, leaving the session
+// empty, when a Drain began after b was acquired: Drain releases only what
+// sessions held when it looked, so a backend adopted afterwards would run
+// on a pool that is closing.
+func (r *relay) setBackend(b *Backend) bool {
 	r.srv.mu.Lock()
 	defer r.srv.mu.Unlock()
+	if b != nil && r.srv.draining.Load() {
+		return false
+	}
 	r.se.b = b
+	return true
 }
 
 func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error {
@@ -291,7 +314,10 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 			r.srv.cfg.Logger.Warn("acquire failed", "session", r.se.id, "role", r.se.role, "err", err)
 			return r.refuse(&pgshardv1.Error{Sqlstate: "53300", Message: "no backend available: " + err.Error()})
 		}
-		r.setBackend(b)
+		if !r.setBackend(b) {
+			r.srv.cfg.Pool.Discard(b)
+			return r.refuse(&pgshardv1.Error{Sqlstate: "57P03", Message: "pooler is draining"})
+		}
 	}
 	r.forward(b, fm)
 	if !flushesBackend(req) {
@@ -392,7 +418,7 @@ func (r *relay) pump(b *Backend) error {
 			r.endBatch(b)
 			if !r.reserved() && b.idle() {
 				r.setBackend(nil)
-				r.srv.recycle(b)
+				r.srv.recycle(b, false)
 			}
 			return nil
 		case *pgproto3.CopyInResponse, *pgproto3.CopyBothResponse:
@@ -425,6 +451,9 @@ func (s *Server) Reserve(_ context.Context, req *pgshardv1.ReserveRequest) (*pgs
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	se.reserved = true
+	if !se.attached {
+		se.detachedAt = time.Now()
+	}
 	var pid int32
 	if se.b != nil {
 		pid = int32(se.b.pid)
@@ -458,26 +487,27 @@ func (s *Server) Release(ctx context.Context, req *pgshardv1.ReleaseRequest) (*p
 	se.b, se.reserved = nil, false
 	s.mu.Unlock()
 	s.forget(se)
-	if b == nil {
-		return &pgshardv1.ReleaseResponse{}, nil
-	}
-	if b.hasUnflushed() {
-		s.cfg.Pool.Discard(b)
-		return &pgshardv1.ReleaseResponse{}, nil
-	}
-	if !b.idle() {
-		if err := b.simpleQuery("ROLLBACK"); err != nil {
-			s.cfg.Pool.Discard(b)
-			return &pgshardv1.ReleaseResponse{}, nil
+	s.recycle(b, true)
+	return &pgshardv1.ReleaseResponse{}, nil
+}
+
+// expireReservations releases reserved sessions whose Execute stream has
+// been gone for ReserveTimeout: their router died without Release and
+// would otherwise hold the backend and the session entry forever.
+func (s *Server) expireReservations(now time.Time) {
+	var expired []*session
+	s.mu.Lock()
+	for id, se := range s.sessions {
+		if se.reserved && !se.attached && !se.detachedAt.IsZero() && now.Sub(se.detachedAt) >= s.cfg.ReserveTimeout {
+			delete(s.sessions, id)
+			expired = append(expired, se)
 		}
 	}
-	if err := b.simpleQuery("DISCARD ALL"); err != nil {
-		s.cfg.Pool.Discard(b)
-		return &pgshardv1.ReleaseResponse{}, nil
+	s.mu.Unlock()
+	for _, se := range expired {
+		s.cfg.Logger.Warn("releasing reservation with no stream", "session", se.id, "role", se.role)
+		s.recycle(se.b, true)
 	}
-	b.prepared = nil
-	s.cfg.Pool.Release(b)
-	return &pgshardv1.ReleaseResponse{}, nil
 }
 
 // Cancel interrupts the statement running on the session's backend.
@@ -502,6 +532,7 @@ func (s *Server) Health(_ *pgshardv1.HealthRequest, stream pgshardv1.Pooler_Heal
 	t := time.NewTicker(s.cfg.HealthInterval)
 	defer t.Stop()
 	for {
+		s.expireReservations(time.Now())
 		v := s.cfg.Source.View()
 		if err := stream.Send(&pgshardv1.HealthStatus{Role: v.Role, ReplayLagBytes: v.LagBytes,
 			Epoch: v.Epoch, Generation: v.Generation, Serving: v.Serving && !s.draining.Load()}); err != nil {

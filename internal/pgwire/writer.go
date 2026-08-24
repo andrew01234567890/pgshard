@@ -60,6 +60,9 @@ func (w *resultWriter) NoData() error { return w.send(&pgproto3.NoData{}) }
 func (w *resultWriter) PortalSuspended() error { return w.send(&pgproto3.PortalSuspended{}) }
 
 func (w *resultWriter) Notice(n *pgproto3.NoticeResponse) error { return w.send(n) }
+func (w *resultWriter) Notification(n *pgproto3.NotificationResponse) error {
+	return w.send(n)
+}
 
 func (w *resultWriter) CopyIn(overallFormat byte, columnFormats []uint16) (CopyInStream, error) {
 	if err := w.send(&pgproto3.CopyInResponse{OverallFormat: overallFormat, ColumnFormatCodes: columnFormats}); err != nil {

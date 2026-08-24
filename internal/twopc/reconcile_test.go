@@ -25,7 +25,7 @@ func TestDecide(t *testing.T) {
 		{StateCommit, false, StatusCommitted, Nothing},
 		{StateCommit, false, StatusAborted, Contradiction},
 		{StateCommit, false, StatusInProgress, Contradiction},
-		{StateCommit, false, "", Contradiction},
+		{StateCommit, false, StatusUnavailable, Unverifiable},
 		{StateAbort, false, "", Nothing},
 		{StatePreparing, false, "", Nothing},
 		{"", false, StatusCommitted, Nothing},
@@ -126,8 +126,11 @@ func TestReconcileAppliesTheTable(t *testing.T) {
 	if out.Committed != 1 || out.RolledBack != 3 {
 		t.Fatalf("outcome %+v", out)
 	}
-	if want := []string{"pgshard-lost", "pgshard-noxid", "pgshard-future"}; !slices.Equal(out.Contradictions, want) {
+	if want := []string{"pgshard-lost"}; !slices.Equal(out.Contradictions, want) {
 		t.Fatalf("contradictions %v, want %v", out.Contradictions, want)
+	}
+	if want := []string{"pgshard-noxid", "pgshard-future"}; !slices.Equal(out.Unverifiable, want) {
+		t.Fatalf("unverifiable %v, want %v", out.Unverifiable, want)
 	}
 	if len(conn.prepared) != 0 {
 		t.Fatalf("left prepared: %v", conn.prepared)
@@ -136,8 +139,11 @@ func TestReconcileAppliesTheTable(t *testing.T) {
 		t.Fatalf("ran %v", conn.ran)
 	}
 	err = Contradictions(map[int32]Outcome{1: {Contradictions: []string{"pgshard-z"}}, 0: out})
-	if err == nil || !strings.HasPrefix(err.Error(), "two-phase reconciliation contradictions: shard 0: pgshard-lost is decided commit but is neither prepared nor committed; shard 0: pgshard-noxid") || !strings.HasSuffix(err.Error(), "shard 1: pgshard-z is decided commit but is neither prepared nor committed") {
+	if err == nil || !strings.HasPrefix(err.Error(), "two-phase reconciliation contradictions: shard 0: pgshard-lost is decided commit but is neither prepared nor committed; shard 0: pgshard-noxid is decided commit and not prepared, and its transaction id's status is unavailable (frozen, unrecorded or in the future): the commit cannot be verified; shard 0: pgshard-future is decided commit and not prepared") || !strings.HasSuffix(err.Error(), "shard 1: pgshard-z is decided commit but is neither prepared nor committed") {
 		t.Fatalf("contradictions error %v", err)
+	}
+	if Contradictions(map[int32]Outcome{0: {Unverifiable: []string{"pgshard-u"}}}) == nil {
+		t.Fatal("unverifiable outcome must still be an error")
 	}
 	if Contradictions(map[int32]Outcome{0: {Committed: 2}}) != nil {
 		t.Fatal("clean outcome must not be an error")

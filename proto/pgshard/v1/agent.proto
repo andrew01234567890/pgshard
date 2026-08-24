@@ -470,6 +470,10 @@ message ReconcilePreparedTransactionsResponse {
   // Commit-decided gids that are neither prepared nor committed here.
   repeated string contradictions = 4;
   Error error = 5;
+  // Commit-decided gids that are not prepared here and whose recorded
+  // transaction id no longer resolves (frozen, unrecorded or in the
+  // future), so the commit cannot be verified.
+  repeated string unverifiable = 6;
 }
 
 // SetWriteFenceRequest raises (active) or releases the fence.

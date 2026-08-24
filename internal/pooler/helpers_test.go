@@ -259,9 +259,9 @@ func (r *recordingStream) Recv() (*pgshardv1.ExecuteRequest, error) {
 	return m, nil
 }
 
-func (h *harness) attached(id string) bool {
+func (h *harness) attached() bool {
 	h.srv.mu.Lock()
 	defer h.srv.mu.Unlock()
-	se := h.srv.sessions[id]
+	se := h.srv.sessions["s"]
 	return se != nil && se.attached
 }

@@ -271,6 +271,13 @@ message ParameterStatus {
   string value = 2;
 }
 
+// NotificationResponse mirrors pgwire NotificationResponse (LISTEN payloads).
+message NotificationResponse {
+  uint32 pid = 1;
+  string channel = 2;
+  string payload = 3;
+}
+
 // EmptyQuery mirrors pgwire EmptyQueryResponse.
 message EmptyQuery {}
 
@@ -296,6 +303,7 @@ message ExecuteResponse {
     NoticeResponse notice = 23;
     ParameterStatus parameter_status = 24;
     EmptyQuery empty_query = 25;
+    NotificationResponse notification = 26;
   }
 }
 

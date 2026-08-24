@@ -49,7 +49,7 @@ func newShardedHarnessWith(t *testing.T, cfg Config) *shardedHarness {
 	}
 	var poolers []*fakePooler
 	for i, r := range ranges {
-		fp := newFakePooler(7, 2)
+		fp := newFakePooler()
 		addr := startFakePooler(t, fp)
 		poolers = append(poolers, fp)
 		snap.ShardSets[DefaultShardSet] = append(snap.ShardSets[DefaultShardSet], snapshot.Range{ShardID: int32(i), Start: r.Start, End: r.End})

@@ -16,11 +16,23 @@
   session that names a role with an idle pooled backend reuses it without
   re-proving keys. Consequently the gRPC listener refuses to start without
   `--tls-cert/--tls-key/--tls-ca` unless `--insecure-dev` is passed.
+- **Backend authentication.** A backend connection is accepted only after
+  a complete SCRAM-SHA-256 exchange whose server signature verified against
+  the forwarded ServerKey; an `AuthenticationOk` without it (trust or
+  password authentication in `pg_hba.conf`) is refused. TCP backends can be
+  upgraded to TLS with `--pg-sslmode require|verify-full` (the latter with
+  `--pg-sslrootcert`); unix sockets are never upgraded.
 - **Regular vs reserved.** By default a backend is held only from the first
   message of a batch until PostgreSQL reports `ReadyForQuery` with status
   `I`; a transaction (`T`/`E`) keeps it. `Reserve` pins the session's backend
   (or the next one it acquires) until `Release`, which rolls back any open
-  transaction, runs `DISCARD ALL`, and returns it to the pool.
+  transaction, runs `DISCARD ALL`, and returns it to the pool. A reserved
+  session whose `Execute` stream has been gone for `--reserve-timeout`
+  (5m) is released the same way, so a router that died without `Release`
+  cannot hold a backend forever.
+- **Asynchronous messages.** `NoticeResponse`, `ParameterStatus` and
+  `NotificationResponse` (LISTEN payloads) from the backend are forwarded on
+  the session's stream in order.
 - **Budget.** `--max-backends` caps the shard; `--max-per-role` caps each
   role so a hot role cannot starve others. When the shard budget is full of
   idle backends of other roles one is evicted. Backends retire after
