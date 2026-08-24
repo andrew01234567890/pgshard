@@ -113,7 +113,7 @@ func TestPoolerSidecarInMemberPod(t *testing.T) {
 	c := routerCluster()
 	c.Spec.PostgreSQL.Major = 18
 	g := Groups(c)[0]
-	pod := Renderer{}.Pod(c, g, 0, RolePrimary, g.MemberName(0), Template(c, nil, nil))
+	pod := Renderer{}.Pod(c, g, 0, RolePrimary, g.MemberName(0), Template(c, Group{}, nil, nil))
 	if len(pod.Spec.Containers) != 2 {
 		t.Fatalf("containers %d", len(pod.Spec.Containers))
 	}

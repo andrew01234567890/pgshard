@@ -32,7 +32,7 @@ const (
 func BackupSettings(c *pgshardv1alpha1.PgShardCluster, g Group, spec *pgshardv1alpha1.PgShardBackupPolicySpec) backup.Settings {
 	st := spec.ObjectStore
 	s := backup.Settings{
-		Stanza:        backup.StanzaName(c.Name, g.Name(), c.Spec.PostgreSQL.Major),
+		Stanza:        backup.StanzaName(c.Name, g.Name(), MajorFor(c, g)),
 		RetentionFull: spec.Retention.Full,
 		RetentionDiff: spec.Retention.Differential,
 		LogLevel:      spec.LogLevel,

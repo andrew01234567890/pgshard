@@ -24,6 +24,20 @@ type reshardWorkflow struct {
 	ShardSet string
 }
 
+// upgradeSet reports whether the pending set ss is a major-version
+// replacement of the serving set: its pg_major is set and differs from the
+// serving set's (a serving set without one predates upgrades and counts as
+// the pending major's predecessor only when the pending major is set).
+func upgradeSet(ss catalog.ShardSet, serving *catalog.ShardSet) bool {
+	if ss.PGMajor == nil {
+		return false
+	}
+	if serving == nil || serving.PGMajor == nil {
+		return true
+	}
+	return *ss.PGMajor != *serving.PGMajor
+}
+
 // reconcileReshards drives pending shard sets through the reshard workflow:
 // a desired set gets a provisioning workflow, a provisioning set whose
 // targets all have a primary endpoint hands over to the copy stage, and a
@@ -84,14 +98,20 @@ func reconcileReshards(ctx context.Context, tx pgx.Tx, res *Result) error {
 			if err != nil {
 				return err
 			}
+			kind := KindReshard
 			spec := map[string]any{"shard_set": ss.Name, "generation": ss.Generation, "desired_generation": ss.DesiredGeneration, "ranges": specRanges(ranges), "source_set": source}
+			srv := setByName[source]
+			if upgradeSet(ss, &srv) {
+				kind = KindUpgrade
+				spec["pg_major"] = *ss.PGMajor
+			}
 			body, err := json.Marshal(spec)
 			if err != nil {
 				return err
 			}
 			if _, err := tx.Exec(ctx, `INSERT INTO pgshard.workflows (id, kind, state, spec, status)
 				VALUES (gen_random_uuid(), $1, $2, $3, $4)`,
-				KindReshard, StateProvisioning, body, mustJSON(map[string]any{"stage": StageProvisioning})); err != nil {
+				kind, StateProvisioning, body, mustJSON(map[string]any{"stage": StageProvisioning})); err != nil {
 				return err
 			}
 			if _, err := tx.Exec(ctx, `UPDATE pgshard.shard_sets SET state = $2 WHERE shard_set = $1`, ss.Name, catalog.ShardSetProvisioning); err != nil {
@@ -133,7 +153,7 @@ func targetsReady(ctx context.Context, tx pgx.Tx, set string) (bool, error) {
 
 func activeReshards(ctx context.Context, tx pgx.Tx) ([]reshardWorkflow, error) {
 	rows, err := tx.Query(ctx, `SELECT id::text, state, coalesce(spec->>'shard_set', '') FROM pgshard.workflows
-		WHERE kind = $1 AND state = ANY($2) ORDER BY created_at`, KindReshard, activeStates)
+		WHERE kind = ANY($1) AND state = ANY($2) ORDER BY created_at`, copyKinds, activeStates)
 	if err != nil {
 		return nil, err
 	}

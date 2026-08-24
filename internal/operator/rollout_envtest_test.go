@@ -76,7 +76,7 @@ func TestSighupSettingChangeReloadsWithoutRestart(t *testing.T) {
 	patchSpec(t, c, func(c *pgshardv1alpha1.PgShardCluster) {
 		c.Spec.PostgreSQL.Parameters["log_min_duration_statement"] = "250ms"
 	})
-	want := Template(c, nil, nil).SettingsHash()
+	want := Template(c, Group{}, nil, nil).SettingsHash()
 
 	// The agents have not seen the new volume yet: nothing is stamped.
 	reconcile(t, r, c)
@@ -159,7 +159,7 @@ func TestPostmasterSettingChangeRollsStandbysThenSwitchesOver(t *testing.T) {
 	if !podExists(t, "rr-shard-0-1") || podExists(t, "rr-shard-0-2") && podUID(t, "rr-shard-0-2") != uid["rr-shard-0-2"] {
 		t.Fatal("pass 2 recreates -1 and leaves -2 alone")
 	}
-	if got := settingsStamp(t, "rr-shard-0-1"); got != Template(c, nil, nil).SettingsHash() {
+	if got := settingsStamp(t, "rr-shard-0-1"); got != Template(c, Group{}, nil, nil).SettingsHash() {
 		t.Fatalf("recreated pod must carry the new settings stamp, got %q", got)
 	}
 	if got := condition(t, "rr", pgshardv1alpha1.ConditionRolloutInProgress); got.Status != metav1.ConditionTrue {
@@ -215,7 +215,7 @@ func TestPostmasterSettingChangeRollsStandbysThenSwitchesOver(t *testing.T) {
 	if podUID(t, oldPrimary) == uid[oldPrimary] {
 		t.Fatal("old primary must come back as a new pod")
 	}
-	if got := settingsStamp(t, oldPrimary); got != Template(c, nil, nil).SettingsHash() {
+	if got := settingsStamp(t, oldPrimary); got != Template(c, Group{}, nil, nil).SettingsHash() {
 		t.Fatalf("old primary must carry the new stamp, got %q", got)
 	}
 }

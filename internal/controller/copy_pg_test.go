@@ -46,6 +46,17 @@ func newCopyFixture(t *testing.T) *copyFixture { return newCopyFixtureN(t, 2) }
 // newCopyFixtureN starts two sources and targets non-serving target shards:
 // two with shifted ranges, or one holding the whole key space (a merge).
 func newCopyFixtureN(t *testing.T, targets int) *copyFixture {
+	return newCopyFixtureOpts(t, targets, "")
+}
+
+// newUpgradeFixture starts pg18 sources and pg19 targets with a 1:1 range
+// map: the blue/green shape of a major upgrade.
+func newUpgradeFixture(t *testing.T) *copyFixture {
+	f := newCopyFixtureOpts(t, 2, pgImage19)
+	return f
+}
+
+func newCopyFixtureOpts(t *testing.T, targets int, tgtImage string) *copyFixture {
 	t.Helper()
 	if err := exec.Command("docker", "info").Run(); err != nil {
 		t.Skip("docker unavailable; skipping reshard copy integration test")
@@ -71,7 +82,11 @@ func newCopyFixtureN(t *testing.T, targets int) *copyFixture {
 	for _, role := range []string{"src", "tgt"} {
 		for id := range f.count(role, targets) {
 			name := f.container(role, id)
-			dsn := startPostgresImage(t, pgImage, []string{"--network", f.net, "--name", name}, logicalOpts...)
+			img := pgImage
+			if role == "tgt" && tgtImage != "" {
+				img = tgtImage
+			}
+			dsn := startPostgresImage(t, img, []string{"--network", f.net, "--name", name}, logicalOpts...)
 			set := "default"
 			if role == "tgt" {
 				set = "g2"
@@ -84,6 +99,9 @@ func newCopyFixtureN(t *testing.T, targets int) *copyFixture {
 	f.tgtRng = placement.RangeSet{{Start: math.MinInt64, End: -1_000_000_000_000}, {Start: -1_000_000_000_000 + 1, End: math.MaxInt64}}
 	if targets == 1 {
 		f.tgtRng, _ = placement.Split(1)
+	}
+	if tgtImage != "" {
+		f.tgtRng = f.srcRng
 	}
 
 	tx, err := f.catalog.Begin(ctx)
@@ -195,7 +213,9 @@ func (f *copyFixture) seed(start, n int) {
 	}
 }
 
-func (f *copyFixture) startWorkflow() string {
+func (f *copyFixture) startWorkflow() string { return f.startWorkflowKind(KindReshard) }
+
+func (f *copyFixture) startWorkflowKind(kind string) string {
 	f.t.Helper()
 	ranges, err := catalog.ListShardRanges(context.Background(), f.catalog, "g2")
 	if err != nil {
@@ -203,8 +223,8 @@ func (f *copyFixture) startWorkflow() string {
 	}
 	spec := map[string]any{"shard_set": "g2", "generation": 2, "ranges": specRanges(ranges)}
 	mustExec(f.t, f.catalog, `INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES (gen_random_uuid(), $1, $2, $3, $4)`,
-		KindReshard, StateRunning, mustJSON(spec), mustJSON(map[string]any{"stage": StageReadyForCopy}))
-	return queryOne[string](f.t, f.catalog, `SELECT id::text FROM pgshard.workflows WHERE kind = 'reshard'`)
+		kind, StateRunning, mustJSON(spec), mustJSON(map[string]any{"stage": StageReadyForCopy}))
+	return queryOne[string](f.t, f.catalog, fmt.Sprintf(`SELECT id::text FROM pgshard.workflows WHERE kind = '%s'`, kind))
 }
 
 func (f *copyFixture) workflow(id string) (state, stage, message string) {

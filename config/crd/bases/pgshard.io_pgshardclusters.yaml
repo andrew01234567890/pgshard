@@ -437,10 +437,19 @@ spec:
                   name:
                     description: Name is the PgShardReshard object.
                     type: string
+                  pgMajor:
+                    description: |-
+                      PGMajor is the PostgreSQL major of the pending set when the run is a
+                      blue/green major upgrade; zero for a topology reshard.
+                    type: integer
                   phase:
                     type: string
                   retiredGeneration:
                     format: int64
+                    type: integer
+                  retiredPGMajor:
+                    description: RetiredPGMajor is the major the retired groups still
+                      run.
                     type: integer
                   retiredShardSet:
                     description: |-
@@ -486,6 +495,11 @@ spec:
                   names the serving shard groups (shard-<id> for 1, shard-<id>-g<n>
                   after).
                 format: int64
+                type: integer
+              servingPGMajor:
+                description: |-
+                  ServingPGMajor is the PostgreSQL major the serving set's groups run,
+                  as stamped in the catalog; zero when the catalog predates upgrades.
                 type: integer
               shardMapGeneration:
                 format: int64

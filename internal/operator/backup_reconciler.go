@@ -207,7 +207,7 @@ func (r *BackupReconciler) primaries(ctx context.Context, c *pgshardv1alpha1.PgS
 		if !podReady(&pod) || pod.Status.PodIP == "" {
 			return nil, fmt.Sprintf("primary %s of group %s is not ready", pg.Status.Primary, g.Name()), nil
 		}
-		out = append(out, backupTarget{group: g, stanza: backup.StanzaName(c.Name, g.Name(), c.Spec.PostgreSQL.Major), addr: agentAddr(pod.Status.PodIP)})
+		out = append(out, backupTarget{group: g, stanza: backup.StanzaName(c.Name, g.Name(), MajorFor(c, g)), addr: agentAddr(pod.Status.PodIP)})
 	}
 	return out, "", nil
 }

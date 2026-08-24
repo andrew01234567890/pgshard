@@ -1,5 +1,8 @@
 # Resharding
 
+> Major-version upgrades reuse this machinery with a 1:1 range map and
+> new-major target groups; see [upgrade](upgrade.md).
+
 Resharding changes the number of shards (or the ranges they own) without
 touching the serving groups until the new ones are ready. This document
 covers the model, naming, the phases implemented so far (provisioning and

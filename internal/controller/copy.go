@@ -94,6 +94,7 @@ type copyState struct {
 
 type copyWorkflow struct {
 	id      string
+	kind    string
 	state   string
 	stage   string
 	set     string
@@ -116,7 +117,7 @@ func (wf *copyWorkflow) sourceSet() string {
 }
 
 var copyStages = []string{StageReadyForCopy, StageCopying, StageCatchUpDone}
-var cutoverStages = []string{StageCatchUpDone, StageAwaitingSwitch, StageSwitching, StageSwitched, StageCompleting}
+var cutoverStages = []string{StageCatchUpDone, StageAwaitingSwitch, StageSwitching, StageSwitched, StageRollingBack, StageCompleting}
 
 // Run drives every interval until ctx ends.
 func (c *Copier) Run(ctx context.Context, interval time.Duration) {
@@ -238,10 +239,10 @@ func (e *fatalError) Unwrap() error { return e.err }
 func fatal(format string, args ...any) error { return &fatalError{fmt.Errorf(format, args...)} }
 
 func (c *Copier) listCopyWorkflows(ctx context.Context) ([]copyWorkflow, error) {
-	rows, err := c.Pool.Query(ctx, `SELECT id::text, state, coalesce(status->>'stage', ''), spec, coalesce(status->'copy', '{}'::jsonb), coalesce(status->'cutover', '{}'::jsonb)
+	rows, err := c.Pool.Query(ctx, `SELECT id::text, kind, state, coalesce(status->>'stage', ''), spec, coalesce(status->'copy', '{}'::jsonb), coalesce(status->'cutover', '{}'::jsonb)
 		FROM pgshard.workflows
-		WHERE kind = $1 AND ((state = $2 AND status->>'stage' = ANY($3)) OR status->>'stage' = $4)
-		ORDER BY created_at`, KindReshard, StateRunning, slices.Concat(copyStages, cutoverStages), StageCancelling)
+		WHERE kind = ANY($1) AND ((state = $2 AND status->>'stage' = ANY($3)) OR status->>'stage' = $4)
+		ORDER BY created_at`, copyKinds, StateRunning, slices.Concat(copyStages, cutoverStages), StageCancelling)
 	if err != nil {
 		return nil, err
 	}
@@ -250,7 +251,7 @@ func (c *Copier) listCopyWorkflows(ctx context.Context) ([]copyWorkflow, error) 
 	for rows.Next() {
 		var wf copyWorkflow
 		var spec, cp, co []byte
-		if err := rows.Scan(&wf.id, &wf.state, &wf.stage, &spec, &cp, &co); err != nil {
+		if err := rows.Scan(&wf.id, &wf.kind, &wf.state, &wf.stage, &spec, &cp, &co); err != nil {
 			return nil, err
 		}
 		var s struct {
@@ -376,6 +377,11 @@ func (c *Copier) drive(ctx context.Context, wf *copyWorkflow) (bool, error) {
 		}
 		if placements > 0 {
 			return false, fmt.Errorf("waiting for %d active table placement workflow(s)", placements)
+		}
+		if wf.kind == KindUpgrade {
+			if err := c.upgradePreconditions(ctx, wf, srcSet, srcIDs, dbs); err != nil {
+				return false, err
+			}
 		}
 		wf.stage = StageCopying
 		advanced = true

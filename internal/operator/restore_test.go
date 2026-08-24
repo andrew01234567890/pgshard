@@ -108,17 +108,17 @@ func TestRestoreSourceRoundTripAndAgentConfig(t *testing.T) {
 		t.Fatal("cluster without annotation reported a source")
 	}
 	g := Groups(c)[1]
-	cfg := agentConfig(c, g, g.MemberName(0), g.MemberName(0), Template(c, nil, newPolicy()), false, true)
+	cfg := agentConfig(c, g, g.MemberName(0), g.MemberName(0), Template(c, Group{}, nil, newPolicy()), false, true)
 	if cfg.Restore == nil || cfg.Restore.Stanza != "old-shard-0-pg18" || cfg.Restore.BackupID != "B" || cfg.Restore.Type != backup.TargetName || !cfg.RecloneFromRepo {
 		t.Fatalf("agent config restore = %+v reclone=%v", cfg.Restore, cfg.RecloneFromRepo)
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if plain := agentConfig(c, g, g.MemberName(0), g.MemberName(0), Template(c, nil, nil), false, true); plain.Restore != nil || plain.RecloneFromRepo {
+	if plain := agentConfig(c, g, g.MemberName(0), g.MemberName(0), Template(c, Group{}, nil, nil), false, true); plain.Restore != nil || plain.RecloneFromRepo {
 		t.Fatal("restore and reclone settings need a policy")
 	}
-	if noRepo := agentConfig(c, g, g.MemberName(0), g.MemberName(0), Template(c, nil, newPolicy()), false, false); noRepo.RecloneFromRepo {
+	if noRepo := agentConfig(c, g, g.MemberName(0), g.MemberName(0), Template(c, Group{}, nil, newPolicy()), false, false); noRepo.RecloneFromRepo {
 		t.Fatal("recloneFromRepo set without a completed backup")
 	}
 	cm := Renderer{}.ConfigMap(c, g, g.MemberName(0), nil, newPolicy(), true)
@@ -209,7 +209,7 @@ func TestRestoreReconcilerCreatesClusterAndFollowsRecovery(t *testing.T) {
 	if err := cl.Status().Update(context.Background(), &created); err != nil {
 		t.Fatal(err)
 	}
-	if cfg := agentConfig(&created, Groups(&created)[1], "new-shard-0-0", "new-shard-0-0", Template(&created, nil, newPolicy()), false, true); cfg.Restore == nil {
+	if cfg := agentConfig(&created, Groups(&created)[1], "new-shard-0-0", "new-shard-0-0", Template(&created, Groups(&created)[1], nil, newPolicy()), false, true); cfg.Restore == nil {
 		t.Fatal("restoring cluster renders no restore config")
 	}
 	res, got = reconcileRestore(t, r, "r1")
@@ -222,7 +222,7 @@ func TestRestoreReconcilerCreatesClusterAndFollowsRecovery(t *testing.T) {
 	if _, ok := created.Annotations[AnnotationRestoreSource]; ok || created.Labels[LabelRestoredFrom] != "r1" {
 		t.Fatalf("recovered cluster keeps restore source: annotations=%v labels=%v", created.Annotations, created.Labels)
 	}
-	if cfg := agentConfig(&created, Groups(&created)[1], "new-shard-0-0", "new-shard-0-0", Template(&created, nil, newPolicy()), false, true); cfg.Restore != nil || !cfg.RecloneFromRepo {
+	if cfg := agentConfig(&created, Groups(&created)[1], "new-shard-0-0", "new-shard-0-0", Template(&created, Groups(&created)[1], nil, newPolicy()), false, true); cfg.Restore != nil || !cfg.RecloneFromRepo {
 		t.Fatalf("recovered cluster still renders restore config: %+v", cfg.Restore)
 	}
 	if cond := meta.FindStatusCondition(got.Status.Conditions, "Progressing"); cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "Recovered" {

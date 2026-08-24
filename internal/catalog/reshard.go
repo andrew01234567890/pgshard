@@ -31,6 +31,9 @@ type ShardSet struct {
 	DesiredGeneration int64
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
+	// PGMajor is the PostgreSQL major the set's groups run; nil for sets
+	// created before upgrades existed (treated as the cluster default).
+	PGMajor *int
 }
 
 // ShardSetName names the shard set of one generation: "default" for the
@@ -45,7 +48,7 @@ func ShardSetName(generation int64) string {
 // ListShardSets returns every shard set ordered by generation.
 func ListShardSets(ctx context.Context, q Querier) ([]ShardSet, error) {
 	rows, err := q.Query(ctx, `
-		SELECT shard_set, generation, state, desired_generation, created_at, updated_at
+		SELECT shard_set, generation, state, desired_generation, created_at, updated_at, pg_major
 		FROM pgshard.shard_sets ORDER BY generation`)
 	if err != nil {
 		return nil, err
@@ -103,6 +106,12 @@ func MaterializeShardSet(ctx context.Context, tx pgx.Tx, name string, generation
 		}
 	}
 	return nil
+}
+
+// SetShardSetMajor stamps the PostgreSQL major a shard set's groups run.
+func SetShardSetMajor(ctx context.Context, q Execer, name string, major int) error {
+	_, err := q.Exec(ctx, `UPDATE pgshard.shard_sets SET pg_major = $2 WHERE shard_set = $1`, name, major)
+	return err
 }
 
 // DropShardSet removes a shard set, its ranges and its status rows.

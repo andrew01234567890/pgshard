@@ -18,6 +18,9 @@ import (
 const (
 	KindTablePlacement = "table_placement"
 	KindReshard        = "reshard"
+	// KindUpgrade is a blue/green major-version replacement: the reshard
+	// machinery with a 1:1 range map onto groups of the new major.
+	KindUpgrade = "upgrade"
 
 	StatePending = "pending"
 	// StateProvisioning is a reshard whose target groups are being created.
@@ -28,6 +31,9 @@ const (
 	StateFailed       = "failed"
 	StateCancelled    = "cancelled"
 )
+
+// copyKinds are the workflow kinds the copier and cutover drive.
+var copyKinds = []string{KindReshard, KindUpgrade}
 
 // Serving states the controller writes to pgshard.shard_status.
 const (
@@ -311,8 +317,8 @@ func reconcileShardSets(ctx context.Context, tx pgx.Tx, res *Result) error {
 		}
 		var active bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pgshard.workflows
-			WHERE kind = $1 AND spec->>'shard_set' = $2 AND state = ANY($3))`,
-			KindReshard, set, activeStates).Scan(&active); err != nil {
+			WHERE kind = ANY($1) AND spec->>'shard_set' = $2 AND state = ANY($3))`,
+			copyKinds, set, activeStates).Scan(&active); err != nil {
 			return err
 		}
 		if active {

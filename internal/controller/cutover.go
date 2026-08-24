@@ -22,6 +22,11 @@ const (
 	// StageSwitched is the new map serving, the old groups kept for
 	// retireOldGroupsAfter with reverse replication flowing.
 	StageSwitched = "switched"
+	// StageRollingBack undoes a switched run: the serving map returns to
+	// the sources once reverse replication caught up.
+	StageRollingBack = "rolling_back"
+	// StageRolledBack ends a rolled-back workflow (state cancelled).
+	StageRolledBack = "rolled_back"
 	// StageCompleting drops the replication objects of the run.
 	StageCompleting = "completing"
 	// StageCompleted ends the workflow (state completed).
@@ -40,6 +45,7 @@ const (
 	StepPositions = "positions"
 	StepCatchUp   = "catch_up"
 	StepVerify    = "verify"
+	StepSequences = "sequences"
 	StepReverse   = "reverse"
 	StepJournal   = "journal"
 	StepFlip      = "flip"
@@ -47,7 +53,7 @@ const (
 	StepRelease   = "release"
 )
 
-var switchSteps = []string{StepFence, StepDrain, StepSweep, StepPositions, StepCatchUp, StepVerify, StepReverse, StepJournal, StepFlip, StepSwap, StepRelease}
+var switchSteps = []string{StepFence, StepDrain, StepSweep, StepPositions, StepCatchUp, StepVerify, StepSequences, StepReverse, StepJournal, StepFlip, StepSwap, StepRelease}
 
 // Pause points of spec.resharding.pauseBefore, mirrored into the workflow
 // spec by the operator together with the proceed list.
@@ -93,6 +99,9 @@ type cutoverSpec struct {
 	PauseBefore        string   `json:"pause_before"`
 	Proceed            []string `json:"proceed"`
 	RetireAfterSeconds int64    `json:"retire_after_seconds"`
+	// Rollback asks a switched run to return serving to the sources while
+	// the retirement window keeps them current over reverse replication.
+	Rollback bool `json:"rollback"`
 }
 
 func (s cutoverSpec) paused(point string) bool {
@@ -138,6 +147,9 @@ type cutoverOps interface {
 	CaughtUp(ctx context.Context, positions map[string]int64) (bool, string, error)
 	// Verify compares sources and targets.
 	Verify(ctx context.Context) (VerifyReport, error)
+	// Sequences carries every user-database sequence position from the
+	// sources to the targets inside the fence.
+	Sequences(ctx context.Context) error
 	// Reverse creates the reverse publications and disabled subscriptions.
 	Reverse(ctx context.Context) error
 	// Journal writes the journal rows (idempotent by id).
@@ -150,6 +162,10 @@ type cutoverOps interface {
 	Release(ctx context.Context) error
 	// Complete drops every replication object of the run.
 	Complete(ctx context.Context) error
+	// Rollback returns serving to the sources: fence the targets, wait for
+	// reverse replication (errRetry while behind), carry the sequences
+	// back and flip the serving map to the source set.
+	Rollback(ctx context.Context) error
 }
 
 func isFatal(err error) bool {
@@ -190,7 +206,13 @@ func (c *Copier) cutover(ctx context.Context, wf *copyWorkflow, ops cutoverOps) 
 	case StageSwitching:
 		return c.switchWrites(ctx, wf, ops)
 	case StageSwitched:
+		if wf.spec.Rollback {
+			wf.stage = StageRollingBack
+			return true, c.saveCutover(ctx, wf, "rollback requested: returning serving to "+wf.sourceSet())
+		}
 		return c.retire(ctx, wf)
+	case StageRollingBack:
+		return c.rollback(ctx, wf, ops)
 	case StageCompleting:
 		if err := ops.Complete(ctx); err != nil {
 			return false, err
@@ -218,6 +240,24 @@ func (c *Copier) gate(ctx context.Context, wf *copyWorkflow, ops cutoverOps) (bo
 	wf.cutover.Step = StepFence
 	wf.stage = StageSwitching
 	return true, c.saveCutover(ctx, wf, "switch gate open: switching writes")
+}
+
+// rollback undoes a switched run: once reverse replication caught up the
+// serving map returns to the sources, every replication object of the run
+// is dropped and the workflow ends cancelled. The target set stays retired
+// for the operator to tear down.
+func (c *Copier) rollback(ctx context.Context, wf *copyWorkflow, ops cutoverOps) (bool, error) {
+	if err := ops.Rollback(ctx); err != nil {
+		if errors.Is(err, errRetry) {
+			return false, c.saveCutover(ctx, wf, "rolling back: "+err.Error())
+		}
+		return false, err
+	}
+	if err := ops.Complete(ctx); err != nil {
+		return false, err
+	}
+	wf.stage = StageRolledBack
+	return true, c.finishCutover(ctx, wf, StateCancelled, "rolled back: serving returned to "+wf.sourceSet())
 }
 
 // switchWrites runs the switch steps from the recorded one. Before the
@@ -333,6 +373,10 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 		wf.cutover.Verify = &report
 		if len(report.Mismatches) > 0 {
 			return false, fatal("verification failed: %s", strings.Join(report.Mismatches, "; "))
+		}
+	case StepSequences:
+		if err := ops.Sequences(ctx); err != nil {
+			return false, err
 		}
 	case StepReverse:
 		if err := ops.Reverse(ctx); err != nil {
