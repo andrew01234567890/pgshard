@@ -38,3 +38,7 @@ dl.kv dd { margin: 0; }
 pre { white-space: pre-wrap; word-break: break-word; }
 .steps li { margin: 0.2rem 0; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+.bar { position: relative; height: 0.8rem; min-width: 8rem; border-radius: 0.4rem; background: color-mix(in srgb, GrayText 25%, transparent); overflow: hidden; }
+.bar span { display: block; height: 100%; background: #1a7f37; }
+ol.timeline { padding-left: 1.2rem; font-size: 0.92rem; }
+ol.timeline li { margin: 0.2rem 0; }

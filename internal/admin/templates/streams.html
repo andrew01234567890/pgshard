@@ -1,6 +1,6 @@
 {{template "head" "Streams"}}
 <header><h1><a href="/">clusters</a> / streams</h1><span class="meta">{{.Count}} streams · {{.Lost}} lost</span></header>
-<nav class="tabs" aria-label="Sections"><a href="/">Clusters</a><a href="/backups">Backups</a><a href="/migrations">Migrations</a><a href="/streams" aria-current="page">Streams</a></nav>
+<nav class="tabs" aria-label="Sections"><a href="/">Clusters</a><a href="/backups">Backups</a><a href="/migrations">Migrations</a><a href="/streams" aria-current="page">Streams</a><a href="/twopc">2PC</a><a href="/alerts">Alerts</a><a href="/reshards">Reshards</a></nav>
 <div id="streams" data-live hx-get="/streams" hx-trigger="topology" hx-swap="innerHTML" aria-live="polite">
 {{template "streams_list.html" .}}
 </div>

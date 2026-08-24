@@ -4,7 +4,7 @@ metadata:
   name: pgshard-admin
 rules:
   - apiGroups: ["pgshard.io"]
-    resources: ["pgshardclusters", "pgshardgroups", "pgshardbackuppolicies", "pgshardbackups", "pgshardrestores"]
+    resources: ["pgshardclusters", "pgshardgroups", "pgshardbackuppolicies", "pgshardbackups", "pgshardrestores", "pgshardreshards"]
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["pods", "persistentvolumeclaims", "services"]

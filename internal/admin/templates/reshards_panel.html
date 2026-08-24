@@ -1,0 +1,52 @@
+{{if .CatalogError}}<p class="bad">catalog: {{.CatalogError}}</p>{{end}}
+{{if not .Clusters}}<p>No PgShardCluster objects found.</p>{{end}}
+{{range .Clusters}}
+<section aria-labelledby="reshards-{{.Namespace}}-{{.Name}}">
+<h2 id="reshards-{{.Namespace}}-{{.Name}}"><a href="/clusters/{{.Namespace}}/{{.Name}}">{{.Namespace}}/{{.Name}}</a> <span class="meta">spec.shards {{.Shards}}{{if .Active}} · active {{.Active}}{{end}}</span></h2>
+{{if .Reshards}}{{range .Reshards}}
+{{if eq .Phase "Failed"}}<div class="alert" role="alert">reshard {{.Name}} failed: {{or .Error .Message "no reason reported"}}</div>{{end}}
+{{end}}<table>
+<thead><tr><th>Name</th><th>Shards</th><th>Phase</th><th>Stage</th><th>Started</th><th>Targets ready</th><th>Copy progress</th><th>Cutover pause</th><th>Journal</th><th>Message</th></tr></thead>
+<tbody>{{range .Reshards}}<tr>
+<td><a href="/reshards/{{.Namespace}}/{{.Name}}">{{.Name}}</a></td>
+<td>g{{.FromGen}} → g{{.ToGen}} ({{.ToShards}} shards, {{.TargetSet}})</td>
+<td class="{{if eq .Phase "Completed"}}ok{{else if or (eq .Phase "Failed") (eq .Phase "Cancelled")}}bad{{end}}">{{.Phase}}</td>
+<td>{{or .Stage "—"}}</td>
+<td>{{iso .StartedAt}}</td>
+<td>{{.TargetsReady}}/{{len .Targets}}</td>
+<td>{{if .Progress}}{{template "copyprogress" .Progress}}{{end}}{{range .Targets}}{{if .Progress}}<div>shard {{.ShardID}}: {{template "copyprogress" .Progress}}</div>{{end}}{{end}}</td>
+<td>{{or .CutoverPause "—"}}</td>
+<td>{{range .JournalIDs}}<div><code>{{.}}</code></div>{{end}}</td>
+<td>{{.Message}}</td>
+</tr>{{end}}</tbody></table>
+{{else}}<p class="notice">No reshards.</p>{{end}}
+</section>
+{{end}}
+
+<h2>Placement changes</h2>
+{{if .Placements}}<table>
+<thead><tr><th>Database</th><th>Table</th><th>Placement</th><th>State</th><th>Stage</th><th>Progress</th><th>Created</th><th>Message</th></tr></thead>
+<tbody>{{range .Placements}}<tr>
+<td>{{.Database}}</td><td>{{.Table}}</td><td>{{.From}} → {{.To}}</td>
+<td class="{{if eq .State "completed"}}ok{{else if or (eq .State "failed") (eq .State "cancelled")}}bad{{end}}">{{.State}}</td>
+<td>{{or .Stage "—"}}</td>
+<td>{{if .Progress}}{{template "copyprogress" .Progress}}{{else}}—{{end}}</td>
+<td>{{.CreatedAt.UTC.Format "2006-01-02T15:04:05Z07:00"}}</td>
+<td>{{.Message}}{{if .Error}} <span class="bad">{{.Error}}</span>{{end}}</td>
+</tr>{{end}}</tbody></table>
+{{else}}<p class="notice">No placement workflows{{if not .CatalogError}} (none recorded, or no catalog DSN configured){{end}}.</p>{{end}}
+
+<h2>Major upgrades</h2>
+{{if .Upgrades}}<table>
+<thead><tr><th>Workflow</th><th>Versions</th><th>State</th><th>Stage</th><th>Created</th><th>Message</th></tr></thead>
+<tbody>{{range .Upgrades}}<tr>
+<td><code>{{.ID}}</code></td><td>{{or .From "?"}} → {{or .To "?"}}</td>
+<td class="{{if eq .State "completed"}}ok{{else if eq .State "failed"}}bad{{end}}">{{.State}}</td>
+<td>{{or .Stage "—"}}</td>
+<td>{{.CreatedAt.UTC.Format "2006-01-02T15:04:05Z07:00"}}</td>
+<td>{{.Message}}{{if .Error}} <span class="bad">{{.Error}}</span>{{end}}</td>
+</tr>{{end}}</tbody></table>
+{{else}}<p class="notice">No major upgrade workflows recorded.</p>{{end}}
+
+{{define "copyprogress"}}<div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{.Percent}}" aria-label="tables ready"><span style="width: {{.Percent}}%"></span></div>
+<span class="notice">{{.TablesReady}}/{{.TablesTotal}} rels · lag {{if .LagKnown}}{{bytes .LagBytes}}{{else}}unknown{{end}}{{if .Paused}} · {{.Paused}} paused{{end}}</span>{{end}}
