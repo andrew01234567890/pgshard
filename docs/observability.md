@@ -5,6 +5,9 @@ built on one shared package (`internal/metrics`): a per-process registry
 carrying the Go runtime and process collectors plus a
 `pgshard_build_info{process,version}` gauge.
 
+The `/metrics` listeners are unauthenticated; keep them off untrusted
+networks (an authenticating admin proxy is planned).
+
 ## Endpoints
 
 | Process    | Where `/metrics` lives                                                        |
