@@ -72,9 +72,11 @@ One pass runs in a single `REPEATABLE READ` transaction:
   and generation, because a table that was never materialised needs no data
   movement. A change of placement or shard key on a table that already has an
   effective placement needs movement: the effective values stay as they are and
-  one `table_rekey` workflow is created in state `pending`; `table_status.workflow_id`
+  one `table_placement` workflow is created in state `pending`; `table_status.workflow_id`
   points at it and no second workflow is created while it is pending, running
-  or paused.
+  or paused, nor after it failed for the same desired generation. Reverting
+  the row cancels the workflow before its swap. See
+  [resharding.md](resharding.md#table-placement-workflows) for the run.
 * **Shard sets.** The ranges of each shard set are validated as a
   `RangeSet`. A shard set with no `pgshard.shard_status` rows is populated:
   every shard gets a status row in state `provisioning`, `pgshard.serving`

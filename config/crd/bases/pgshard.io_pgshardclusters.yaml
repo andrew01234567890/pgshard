@@ -384,6 +384,50 @@ spec:
               observedGeneration:
                 format: int64
                 type: integer
+              placementWorkflows:
+                description: |-
+                  PlacementWorkflows lists the table placement workflows that are
+                  active or ended since the last completed one was observed.
+                items:
+                  description: |-
+                    ClusterPlacementWorkflowStatus is one table placement workflow the
+                    controller runs (a shard key change, or a move between unsharded,
+                    sharded and reference placement).
+                  properties:
+                    from:
+                      description: From and To describe the placements, e.g. "sharded(tenant_id)".
+                      type: string
+                    message:
+                      type: string
+                    pauseMs:
+                      description: PauseMS is the table-scoped write pause of the
+                        swap, once done.
+                      format: int64
+                      type: integer
+                    phase:
+                      type: string
+                    state:
+                      description: State is the workflow state; Phase its stage.
+                      type: string
+                    table:
+                      description: 'Table is the qualified table: database.schema.table.'
+                      type: string
+                    to:
+                      type: string
+                    workflowId:
+                      description: WorkflowID is the pgshard.workflows row.
+                      type: string
+                  required:
+                  - from
+                  - state
+                  - table
+                  - to
+                  - workflowId
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - workflowId
+                x-kubernetes-list-type: map
               reshard:
                 description: Reshard is the resharding run in flight, if any.
                 properties:

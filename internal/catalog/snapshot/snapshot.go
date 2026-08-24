@@ -56,6 +56,9 @@ type Placement struct {
 	// rewrite, recorded by the applier, in attribute order. Empty until
 	// the applier records it (before any hidden column exists).
 	VisibleColumns []string
+	// Migrating is set while a placement workflow moves the table: routers
+	// hold new writes to it until the swap publishes the new placement.
+	Migrating bool
 }
 
 // Snapshot is an immutable view of the catalog taken in one transaction.
@@ -104,6 +107,17 @@ func (s *Snapshot) ServingShardSet() string {
 func (s *Snapshot) Migrating() bool {
 	for k, sv := range s.Serving {
 		if k.ShardSet == s.ServingShardSet() && sv.Migrating {
+			return true
+		}
+	}
+	return false
+}
+
+// TableMigrating reports whether any of keys is fenced by a placement
+// workflow.
+func (s *Snapshot) TableMigrating(keys []TableKey) bool {
+	for _, k := range keys {
+		if s.Tables[k].Migrating {
 			return true
 		}
 	}

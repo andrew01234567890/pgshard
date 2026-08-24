@@ -60,6 +60,9 @@ type Prober interface {
 	// ReshardWorkflow returns the active reshard workflow of a shard set;
 	// an empty ID means none exists.
 	ReshardWorkflow(ctx context.Context, dsn, shardSet string) (WorkflowInfo, error)
+	// PlacementWorkflows lists the table placement workflows that are
+	// active, plus the ones that ended in the last day.
+	PlacementWorkflows(ctx context.Context, dsn string) ([]PlacementWorkflowInfo, error)
 	// SetReshardCutoverSpec mirrors spec.resharding and the proceed
 	// annotation into the workflow spec the controller's cutover reads.
 	SetReshardCutoverSpec(ctx context.Context, dsn, workflowID, pauseBefore string, proceed []string, retireAfterSeconds int64) error
@@ -194,6 +197,58 @@ type WorkflowInfo struct {
 	// CutoverPauseMS is status.cutover.pause_ms: fence raised to new map
 	// published; zero before the switch.
 	CutoverPauseMS int64
+}
+
+// PlacementWorkflowInfo is one pgshard.workflows row of kind
+// table_placement.
+type PlacementWorkflowInfo struct {
+	ID            string
+	Table         string
+	From, To      string
+	State         string
+	Stage         string
+	Message       string
+	PauseMS       int64
+	FromPlacement string
+}
+
+// PlacementWorkflows implements Prober.
+func (PgxProber) PlacementWorkflows(ctx context.Context, dsn string) ([]PlacementWorkflowInfo, error) {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	rows, err := conn.Query(ctx, `SELECT id::text,
+			spec->>'database' || '.' || (spec->>'schema_name') || '.' || (spec->>'table_name'),
+			spec->'from'->>'placement', coalesce(spec->'from'->>'shard_key', ''),
+			spec->'to'->>'placement', coalesce(spec->'to'->>'shard_key', ''),
+			state, coalesce(status->>'stage', ''), coalesce(status->>'message', ''), coalesce((status->'placement'->>'pause_ms')::bigint, 0)
+		FROM pgshard.workflows
+		WHERE kind = 'table_placement' AND (state IN ('pending', 'running', 'paused') OR updated_at > now() - interval '1 day')
+		ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PlacementWorkflowInfo
+	for rows.Next() {
+		var w PlacementWorkflowInfo
+		var fromP, fromK, toP, toK string
+		if err := rows.Scan(&w.ID, &w.Table, &fromP, &fromK, &toP, &toK, &w.State, &w.Stage, &w.Message, &w.PauseMS); err != nil {
+			return nil, err
+		}
+		w.From, w.To = describePlacement(fromP, fromK), describePlacement(toP, toK)
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
+func describePlacement(placement, key string) string {
+	if placement == "sharded" {
+		return "sharded(" + key + ")"
+	}
+	return placement
 }
 
 // ShardSets lists the catalog shard sets and their ranges.
@@ -441,6 +496,12 @@ func (b boundedProber) ReshardWorkflow(ctx context.Context, dsn, shardSet string
 	ctx, cancel := b.bound(ctx)
 	defer cancel()
 	return b.Inner.ReshardWorkflow(ctx, dsn, shardSet)
+}
+
+func (b boundedProber) PlacementWorkflows(ctx context.Context, dsn string) ([]PlacementWorkflowInfo, error) {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.PlacementWorkflows(ctx, dsn)
 }
 
 func (b boundedProber) SetReshardCutoverSpec(ctx context.Context, dsn, workflowID, pauseBefore string, proceed []string, retireAfterSeconds int64) error {

@@ -32,3 +32,35 @@ func TestTruncateRefusedWhileResharding(t *testing.T) {
 		t.Fatal("a serving set is not a reshard")
 	}
 }
+
+// TestPlanListsResolvedTables: the executor holds writes to a table a
+// placement workflow is swapping, so every plan names the catalog tables
+// it resolved.
+func TestPlanListsResolvedTables(t *testing.T) {
+	snap := fixture(t)
+	p := New()
+	pl, err := p.Plan(context.Background(), session(snap), "update orders set note = 'x' where tenant_id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pl.Tables) != 1 || pl.Tables[0] != (snapshot.TableKey{Database: fixtureDB, SchemaName: "public", TableName: "orders"}) {
+		t.Fatalf("tables: %+v", pl.Tables)
+	}
+	pl, err = p.Plan(context.Background(), session(snap), "select 1")
+	if err != nil || len(pl.Tables) != 0 {
+		t.Fatalf("select 1: %+v %v", pl.Tables, err)
+	}
+	if snap.TableMigrating(pl.Tables) {
+		t.Fatal("no tables, no fence")
+	}
+	key := snapshot.TableKey{Database: fixtureDB, SchemaName: "public", TableName: "orders"}
+	placement := snap.Tables[key]
+	placement.Migrating = true
+	snap.Tables[key] = placement
+	if !snap.TableMigrating([]snapshot.TableKey{key}) {
+		t.Fatal("a migrating table must fence its writes")
+	}
+	if snap.TableMigrating([]snapshot.TableKey{{Database: fixtureDB, SchemaName: "public", TableName: "regions"}}) {
+		t.Fatal("another table must not be fenced")
+	}
+}

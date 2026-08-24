@@ -431,7 +431,7 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 	for i, p := range writers {
 		ids[i] = p.shard.ID
 	}
-	if err := e.r.awaitWriteFence(ctx); err != nil {
+	if err := e.r.awaitWriteFence(ctx, nil); err != nil {
 		e.each(append(writers, readers...), func(p *txnPart) error { return e.runOn(ctx, p, "ROLLBACK", discardWriter{}) })
 		e.finishTxn("ROLLBACK")
 		return err

@@ -88,9 +88,10 @@ type savepointMark struct {
 }
 
 type execItem struct {
-	sql   string
-	local bool
-	class StmtClass
+	sql    string
+	local  bool
+	class  StmtClass
+	tables []snapshot.TableKey
 }
 
 type gucEntry struct {
@@ -425,7 +426,7 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 	}
 	if pl.Class.Write {
 		before := e.currentSnapshot()
-		if err := e.gateWrite(ctx); err != nil {
+		if err := e.gateWrite(ctx, pl.Tables); err != nil {
 			return e.afterBatch(ctx, err)
 		}
 		if e.currentSnapshot() != before {
@@ -906,7 +907,7 @@ func (e *Executor) execute(portal string, maxRows int32, w pgwire.ResultWriter) 
 		if st.class.SetGUC {
 			e.staged = append(e.staged, gucEntry{name: st.class.GUCName, sql: st.sql, value: st.class.GUCValue, searchPath: st.class.SearchPath})
 		}
-		e.batchExec = append(e.batchExec, execItem{sql: st.sql, local: st.plan.Kind == plan.SessionLocal, class: st.class})
+		e.batchExec = append(e.batchExec, execItem{sql: st.sql, local: st.plan.Kind == plan.SessionLocal, class: st.class, tables: st.plan.Tables})
 	}
 	e.batch = append(e.batch, executeReq(portal, maxRows))
 	return nil
@@ -977,7 +978,7 @@ func (e *Executor) sync(ctx context.Context) error {
 	for _, item := range executed {
 		if item.class.Write {
 			before := e.currentSnapshot()
-			if err := e.gateWrite(ctx); err != nil {
+			if err := e.gateWrite(ctx, item.tables); err != nil {
 				e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
 				return e.afterBatch(ctx, err)
 			}

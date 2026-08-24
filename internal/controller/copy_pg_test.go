@@ -41,7 +41,11 @@ func (f *copyFixture) container(role string, id int) string {
 	return fmt.Sprintf("%s-%s%d", f.net, role, id)
 }
 
-func newCopyFixture(t *testing.T) *copyFixture {
+func newCopyFixture(t *testing.T) *copyFixture { return newCopyFixtureN(t, 2) }
+
+// newCopyFixtureN starts two sources and targets non-serving target shards:
+// two with shifted ranges, or one holding the whole key space (a merge).
+func newCopyFixtureN(t *testing.T, targets int) *copyFixture {
 	t.Helper()
 	if err := exec.Command("docker", "info").Run(); err != nil {
 		t.Skip("docker unavailable; skipping reshard copy integration test")
@@ -65,7 +69,7 @@ func newCopyFixture(t *testing.T) *copyFixture {
 	f.pool = pool
 	f.dsns = map[ShardRef]string{}
 	for _, role := range []string{"src", "tgt"} {
-		for id := range 2 {
+		for id := range f.count(role, targets) {
 			name := f.container(role, id)
 			dsn := startPostgresImage(t, pgImage, []string{"--network", f.net, "--name", name}, logicalOpts...)
 			set := "default"
@@ -78,6 +82,9 @@ func newCopyFixture(t *testing.T) *copyFixture {
 	f.dialer = &PgxShardDialer{Pool: pool, DSNs: f.dsns}
 	f.srcRng, _ = placement.Split(2)
 	f.tgtRng = placement.RangeSet{{Start: math.MinInt64, End: -1_000_000_000_000}, {Start: -1_000_000_000_000 + 1, End: math.MaxInt64}}
+	if targets == 1 {
+		f.tgtRng, _ = placement.Split(1)
+	}
 
 	tx, err := f.catalog.Begin(ctx)
 	if err != nil {
@@ -93,7 +100,7 @@ func newCopyFixture(t *testing.T) *copyFixture {
 		t.Fatal(err)
 	}
 	for _, role := range []string{"src", "tgt"} {
-		for id := range 2 {
+		for id := range f.count(role, targets) {
 			set, state := "default", "serving"
 			if role == "tgt" {
 				set, state = "g2", "provisioning"
@@ -103,7 +110,7 @@ func newCopyFixture(t *testing.T) *copyFixture {
 		}
 	}
 	mustExec(t, f.catalog, `INSERT INTO pgshard.databases (name, default_placement, home_shard) VALUES ('app', 'unsharded', 0)`)
-	for _, row := range [][3]string{{"orders", "sharded", "tenant_id"}, {"docs", "sharded", "slug"}, {"regions", "reference", ""}, {"items", "unsharded", ""}} {
+	for _, row := range [][3]string{{"orders", "sharded", "tenant_id"}, {"docs", "sharded", "slug"}, {"accounts", "sharded", "id"}, {"regions", "reference", ""}, {"items", "unsharded", ""}} {
 		var key *string
 		if row[2] != "" {
 			key = &row[2]
@@ -118,6 +125,7 @@ func newCopyFixture(t *testing.T) *copyFixture {
 			`CREATE TABLE orders (id bigserial, tenant_id bigint NOT NULL, note text, PRIMARY KEY (tenant_id, id))`,
 			`CREATE INDEX orders_note_idx ON orders (note)`,
 			`CREATE TABLE docs (slug text PRIMARY KEY, body text)`,
+			`CREATE TABLE accounts (id bigint PRIMARY KEY, balance bigint NOT NULL)`,
 			`CREATE TABLE regions (code text PRIMARY KEY, name text)`,
 			`CREATE TABLE items (id serial PRIMARY KEY, v text)`,
 			`CREATE TABLE notes (v text)`,
@@ -136,6 +144,13 @@ func newCopyFixture(t *testing.T) *copyFixture {
 
 	f.copier = &Copier{Pool: pool, Shards: f.dialer, Schema: f.materializer(), SourceConnInfo: f.connInfo, LagBytes: 1 << 20, PreparedWait: time.Hour}
 	return f
+}
+
+func (f *copyFixture) count(role string, targets int) int {
+	if role == "tgt" {
+		return targets
+	}
+	return 2
 }
 
 func (f *copyFixture) appDSN(set string, id int32) string {

@@ -559,6 +559,12 @@ the controller raises while it takes a certified barrier (see
 - At most `--buffer-cap` statements wait behind the fence cluster-wide; the
   next is refused with `53300`.
 
+`pgshard.table_status.migrating` is the same pause scoped to one table: a
+placement workflow raises it while it swaps the table's shadow in. Only
+statements whose plan resolved that table wait (the plan lists every
+catalog table it touched); after the window they are refused with
+**`57P03` "write pause for a table placement change"**.
+
 ## Running
 
 ```

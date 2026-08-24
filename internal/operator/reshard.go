@@ -39,10 +39,11 @@ func ReshardName(cluster string, generation int64) string {
 
 // reshardPlan is what reconcileReshard decided for this pass.
 type reshardPlan struct {
-	cond     metav1.Condition
-	pending  *ShardSetInfo
-	workflow WorkflowInfo
-	record   *pgshardv1alpha1.PgShardReshard
+	cond       metav1.Condition
+	placements []pgshardv1alpha1.ClusterPlacementWorkflowStatus
+	pending    *ShardSetInfo
+	workflow   WorkflowInfo
+	record     *pgshardv1alpha1.PgShardReshard
 }
 
 // reconcileReshard keeps the catalog's shard sets, the cluster spec and the
@@ -55,6 +56,14 @@ func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1al
 	log := logf.FromContext(ctx)
 	plan := reshardPlan{cond: metav1.Condition{Type: pgshardv1alpha1.ConditionResharding, Status: metav1.ConditionFalse, Reason: "Idle", Message: "", ObservedGeneration: c.Generation}}
 	base := c.DeepCopy()
+	placements, err := r.Prober.PlacementWorkflows(ctx, dsn)
+	if err != nil {
+		return plan, fmt.Errorf("placement workflows: %w", err)
+	}
+	for _, w := range placements {
+		plan.placements = append(plan.placements, pgshardv1alpha1.ClusterPlacementWorkflowStatus{
+			WorkflowID: w.ID, Table: w.Table, From: w.From, To: w.To, State: w.State, Phase: w.Stage, Message: w.Message, PauseMS: w.PauseMS})
+	}
 	sets, err := r.Prober.ShardSets(ctx, dsn)
 	if err != nil {
 		return plan, fmt.Errorf("shard sets: %w", err)

@@ -310,10 +310,12 @@ func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
 		if snap == nil {
 			continue
 		}
-		pl, ok := snap.Tables[snapshot.TableKey{Database: w.sess.Database, SchemaName: schema, TableName: name}]
+		key := snapshot.TableKey{Database: w.sess.Database, SchemaName: schema, TableName: name}
+		pl, ok := snap.Tables[key]
 		if !ok {
 			continue
 		}
+		w.plan.Tables = append(w.plan.Tables, key)
 		r.schema = schema
 		switch pl.Placement {
 		case "sharded":

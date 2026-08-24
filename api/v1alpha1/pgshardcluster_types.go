@@ -267,6 +267,28 @@ type ClusterReshardStatus struct {
 	RetiredShards int `json:"retiredShards,omitempty"`
 }
 
+// ClusterPlacementWorkflowStatus is one table placement workflow the
+// controller runs (a shard key change, or a move between unsharded,
+// sharded and reference placement).
+type ClusterPlacementWorkflowStatus struct {
+	// WorkflowID is the pgshard.workflows row.
+	WorkflowID string `json:"workflowId"`
+	// Table is the qualified table: database.schema.table.
+	Table string `json:"table"`
+	// From and To describe the placements, e.g. "sharded(tenant_id)".
+	From string `json:"from"`
+	To   string `json:"to"`
+	// State is the workflow state; Phase its stage.
+	State string `json:"state"`
+	// +optional
+	Phase string `json:"phase,omitempty"`
+	// +optional
+	Message string `json:"message,omitempty"`
+	// PauseMS is the table-scoped write pause of the swap, once done.
+	// +optional
+	PauseMS int64 `json:"pauseMs,omitempty"`
+}
+
 // PgShardClusterStatus is the observed state of a PgShardCluster.
 type PgShardClusterStatus struct {
 	// +optional
@@ -291,6 +313,12 @@ type PgShardClusterStatus struct {
 	// Reshard is the resharding run in flight, if any.
 	// +optional
 	Reshard *ClusterReshardStatus `json:"reshard,omitempty"`
+	// PlacementWorkflows lists the table placement workflows that are
+	// active or ended since the last completed one was observed.
+	// +optional
+	// +listType=map
+	// +listMapKey=workflowId
+	PlacementWorkflows []ClusterPlacementWorkflowStatus `json:"placementWorkflows,omitempty"`
 	// +optional
 	Tuning TuningStatus `json:"tuning,omitempty"`
 	// +optional
