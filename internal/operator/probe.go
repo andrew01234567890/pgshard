@@ -180,9 +180,10 @@ type ShardSetInfo struct {
 
 // WorkflowInfo is the catalog workflow row of a reshard.
 type WorkflowInfo struct {
-	ID    string
-	State string
-	Stage string
+	ID      string
+	State   string
+	Stage   string
+	Message string
 }
 
 // ShardSets lists the catalog shard sets and their ranges.
@@ -231,8 +232,8 @@ func (PgxProber) ReshardWorkflow(ctx context.Context, dsn, shardSet string) (Wor
 	}
 	defer func() { _ = conn.Close(ctx) }()
 	var w WorkflowInfo
-	err = conn.QueryRow(ctx, `SELECT id::text, state, coalesce(status->>'stage', '') FROM pgshard.workflows
-		WHERE kind = 'reshard' AND spec->>'shard_set' = $1 ORDER BY created_at DESC LIMIT 1`, shardSet).Scan(&w.ID, &w.State, &w.Stage)
+	err = conn.QueryRow(ctx, `SELECT id::text, state, coalesce(status->>'stage', ''), coalesce(status->>'message', '') FROM pgshard.workflows
+		WHERE kind = 'reshard' AND spec->>'shard_set' = $1 ORDER BY created_at DESC LIMIT 1`, shardSet).Scan(&w.ID, &w.State, &w.Stage, &w.Message)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return WorkflowInfo{}, nil
 	}

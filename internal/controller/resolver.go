@@ -41,6 +41,12 @@ type ShardDialer interface {
 	Dial(ctx context.Context, shardSet string, shardID int32) (ShardConn, error)
 }
 
+// ShardDBDialer opens a connection to one database of a shard's primary.
+type ShardDBDialer interface {
+	ShardDialer
+	DialDatabase(ctx context.Context, shardSet string, shardID int32, database string) (ShardConn, error)
+}
+
 // ShardRef names one shard.
 type ShardRef struct {
 	Set string
@@ -286,18 +292,32 @@ func (d *PgxShardDialer) Dial(ctx context.Context, shardSet string, shardID int3
 }
 
 func (d *PgxShardDialer) dsn(ctx context.Context, shardSet string, shardID int32) (string, error) {
-	dsn, ok := d.DSNs[ShardRef{Set: shardSet, ID: shardID}]
-	if ok {
+	if dsn, ok := d.DSNs[ShardRef{Set: shardSet, ID: shardID}]; ok {
 		return dsn, nil
 	}
 	if d.Template == "" {
 		return "", fmt.Errorf("no DSN for shard %s/%d", shardSet, shardID)
 	}
+	group, err := GroupName(ctx, d.Pool, shardSet, shardID)
+	if err != nil {
+		return "", err
+	}
+	return ExpandShardTemplate(d.Template, shardSet, shardID, group, ""), nil
+}
+
+// GroupName reads the shard_status group name of one shard.
+func GroupName(ctx context.Context, pool *pgxpool.Pool, shardSet string, shardID int32) (string, error) {
 	var group string
-	if err := d.Pool.QueryRow(ctx, `SELECT group_name FROM pgshard.shard_status WHERE shard_set = $1 AND shard_id = $2`, shardSet, shardID).Scan(&group); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT group_name FROM pgshard.shard_status WHERE shard_set = $1 AND shard_id = $2`, shardSet, shardID).Scan(&group); err != nil {
 		return "", fmt.Errorf("shard %s/%d: %w", shardSet, shardID, err)
 	}
-	return strings.NewReplacer("{set}", shardSet, "{id}", fmt.Sprint(shardID), "{group}", group).Replace(d.Template), nil
+	return group, nil
+}
+
+// ExpandShardTemplate substitutes {set}, {id}, {group} and {db} in a DSN
+// template.
+func ExpandShardTemplate(template, shardSet string, shardID int32, group, database string) string {
+	return strings.NewReplacer("{set}", shardSet, "{id}", fmt.Sprint(shardID), "{group}", group, "{db}", database).Replace(template)
 }
 
 type pgxShardConn struct{ *pgx.Conn }

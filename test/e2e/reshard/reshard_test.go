@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andrew01234567890/pgshard/internal/controller"
+	"github.com/andrew01234567890/pgshard/internal/placement"
 	"github.com/andrew01234567890/pgshard/test/e2e"
 )
 
@@ -97,6 +99,86 @@ spec:
         - name: PGCONNECT_TIMEOUT
           value: "5"
 `, clientPod, testNamespace, image, clusterName)
+}
+
+// controllerManifest runs pgshard-controller against the cluster's catalog
+// and shards: the reconciler, the resolver and the reshard copier. The
+// superuser password comes from the cluster's Secret; schema
+// materialization goes through the member agents.
+func controllerManifest(image string) string {
+	ns := testNamespace
+	return fmt.Sprintf(`
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: %[1]s-controller
+  namespace: %[2]s
+  labels:
+    app: %[1]s-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: %[1]s-controller
+  template:
+    metadata:
+      labels:
+        app: %[1]s-controller
+    spec:
+      containers:
+        - name: controller
+          image: %[3]s
+          imagePullPolicy: IfNotPresent
+          args:
+            - run
+            - --listen=
+            - --catalog-dsn=postgres://postgres:$(PGPASSWORD)@%[1]s-catalog-rw.%[2]s.svc:5432/postgres?sslmode=disable
+            - --shard-dsn-template=postgres://postgres:$(PGPASSWORD)@%[1]s-{group}-rw.%[2]s.svc:5432/postgres?sslmode=disable
+            - --subscription-dsn-template=host=%[1]s-{group}-rw.%[2]s.svc port=5432 user=postgres password=$(PGPASSWORD) dbname={db} sslmode=disable
+            - --reconcile-interval=5s
+            - --copy-interval=5s
+            - --resolve-interval=5s
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: %[1]s-superuser
+                  key: password
+`, clusterName, ns, image)
+}
+
+// shardSQL runs sql on the primary of one shard group's app database.
+func shardSQL(ctx context.Context, c *e2e.Cluster, group, sql string) (string, error) {
+	out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "exec", clientPod, "--",
+		"psql", "-h", clusterName+"-"+group+"-rw", "-U", "postgres", "-d", appDatabase, "-v", "ON_ERROR_STOP=1", "-tAc", sql)
+	return strings.TrimSpace(out), err
+}
+
+const appDatabase = "app"
+
+// seedApp creates the app database with a sharded, a reference and an
+// unsharded table on shard 0 and registers them in the catalog.
+func seedApp(ctx context.Context, t *testing.T, c *e2e.Cluster) {
+	t.Helper()
+	if _, err := psql(ctx, c, clusterName+"-shard-0-rw", "CREATE DATABASE "+appDatabase); err != nil {
+		t.Fatal(err)
+	}
+	for _, sql := range []string{
+		"CREATE TABLE orders (id bigserial, tenant_id bigint NOT NULL, note text, PRIMARY KEY (tenant_id, id))",
+		"CREATE INDEX orders_note_idx ON orders (note)",
+		"CREATE TABLE regions (code text PRIMARY KEY, name text)",
+		"CREATE TABLE items (id serial PRIMARY KEY, v text)",
+		"INSERT INTO orders (tenant_id, note) SELECT g * 7919 + 13, 'n' || g FROM generate_series(1, 1000) g",
+		"INSERT INTO regions VALUES ('eu', 'Europe'), ('us', 'United States')",
+		"INSERT INTO items (v) SELECT 'item-' || g FROM generate_series(1, 50) g",
+	} {
+		if _, err := shardSQL(ctx, c, "shard-0", sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	catalogSQL(ctx, t, c, "INSERT INTO pgshard.databases (name, default_placement, home_shard) VALUES ('"+appDatabase+"', 'unsharded', 0)")
+	catalogSQL(ctx, t, c, "INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES "+
+		"('"+appDatabase+"', 'public', 'orders', 'sharded', 'tenant_id'), ('"+appDatabase+"', 'public', 'regions', 'reference', NULL), ('"+appDatabase+"', 'public', 'items', 'unsharded', NULL)")
 }
 
 func memberImage(major string) string {
@@ -254,6 +336,13 @@ func TestReshardProvisionsTargetsAndCancels(t *testing.T) {
 	if err := c.WaitPodsReady(ctx, testNamespace, "app="+clientPod, 3*time.Minute); err != nil {
 		t.Fatal(err)
 	}
+	seedApp(ctx, t, c)
+	if err := c.Apply(ctx, controllerManifest(env("CONTROLLER_IMAGE", "pgshard-controller:e2e"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.WaitPodsReady(ctx, testNamespace, "app="+clusterName+"-controller", 3*time.Minute); err != nil {
+		t.Fatal(err)
+	}
 
 	waitFor(ctx, t, "serving shard set materialized", 2*time.Minute, func() bool {
 		return jsonpath(ctx, c, "pgshardcluster", clusterName, "{.status.effectiveShards}") == "1"
@@ -284,12 +373,10 @@ func TestReshardProvisionsTargetsAndCancels(t *testing.T) {
 			t.Errorf("target group %s: %q", g, got)
 		}
 	}
-	// The kind suite runs no pgshard-controller, so the record stays Pending
-	// (no workflow) unless one is deployed alongside; both are accepted.
 	waitFor(ctx, t, "targets Ready", 15*time.Minute, func() bool {
 		phase := jsonpath(ctx, c, "pgshardreshard", record, "{.status.phase}")
 		ready := jsonpath(ctx, c, "pgshardreshard", record, `{.status.conditions[?(@.type=="TargetsReady")].status}`)
-		return ready == "True" && (phase == "Pending" || phase == "Provisioning" || phase == "Copying")
+		return ready == "True" && (phase == "Provisioning" || phase == "Copying")
 	})
 	if n := count(ctx, t, c, "pods", sel); n != 6 {
 		t.Errorf("target pods: got %d want 6", n)
@@ -300,8 +387,65 @@ func TestReshardProvisionsTargetsAndCancels(t *testing.T) {
 	if got := catalogSQL(ctx, t, c, "SELECT string_agg(shard_set, ',' ORDER BY shard_set) FROM pgshard.serving"); got != "default" {
 		t.Fatalf("serving sets: %q", got)
 	}
-	if got := catalogSQL(ctx, t, c, "SELECT coalesce(string_agg(state || ':' || (status->>'stage'), ','), '') FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = 'g2'"); got != "" && got != "running:ready_for_copy" && got != "provisioning:provisioning" {
-		t.Fatalf("reshard workflow: %q", got)
+	waitFor(ctx, t, "copy caught up", 15*time.Minute, func() bool {
+		got := catalogSQL(ctx, t, c, "SELECT coalesce(string_agg(state || ':' || (status->>'stage'), ','), '') FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = 'g2'")
+		if strings.HasPrefix(got, "failed") {
+			t.Fatalf("reshard workflow failed: %s", catalogSQL(ctx, t, c, "SELECT coalesce(error, '') || ' ' || status::text FROM pgshard.workflows WHERE kind = 'reshard'"))
+		}
+		return got == "running:catch_up_done"
+	})
+	if got := jsonpath(ctx, c, "pgshardreshard", record, "{.status.phase}"); got != "Copying" {
+		t.Errorf("record phase during copy: %q", got)
+	}
+	if _, err := shardSQL(ctx, c, "shard-0", "INSERT INTO orders (tenant_id, note) SELECT g * 7919 + 13, 'late' FROM generate_series(1001, 1100) g"); err != nil {
+		t.Fatal(err)
+	}
+	ranges, err := placement.Split(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, err := controller.KeyHashExpr("tenant_id", "bigint")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(ctx, t, "rows on the targets", 5*time.Minute, func() bool {
+		total := 0
+		for i := range 2 {
+			group := fmt.Sprintf("shard-%d-g2", i)
+			n, err := shardSQL(ctx, c, group, "SELECT count(*) FROM orders")
+			if err != nil {
+				return false
+			}
+			stray, err := shardSQL(ctx, c, group, "SELECT count(*) FROM orders WHERE NOT ("+controller.RangeFilter(hash, ranges[i])+")")
+			if err != nil || stray != "0" {
+				t.Fatalf("target %s holds rows outside its range: %q %v", group, stray, err)
+			}
+			var v int
+			fmt.Sscan(n, &v)
+			total += v
+		}
+		return total == 1100
+	})
+	for i := range 2 {
+		group := fmt.Sprintf("shard-%d-g2", i)
+		if got, err := shardSQL(ctx, c, group, "SELECT count(*) FROM regions"); err != nil || got != "2" {
+			t.Errorf("%s regions: %q %v", group, got, err)
+		}
+		idx, err := shardSQL(ctx, c, group, "SELECT count(*) FROM pg_indexes WHERE indexname = 'orders_note_idx'")
+		if err != nil || idx != "1" {
+			t.Errorf("%s index: %q %v", group, idx, err)
+		}
+		items, err := shardSQL(ctx, c, group, "SELECT count(*) FROM items")
+		want := "0"
+		if i == controller.HomeTarget(ranges) {
+			want = "50"
+		}
+		if err != nil || items != want {
+			t.Errorf("%s items: %q %v (want %s)", group, items, err, want)
+		}
+	}
+	if got, err := psql(ctx, c, clusterName+"-shard-0-rw", "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pgshard\\_reshard\\_%'"); err != nil || got != "2" {
+		t.Errorf("source slots: %q %v", got, err)
 	}
 	if got, err := psql(ctx, c, clusterName+"-shard-0-g2-rw", "SHOW archive_mode"); err != nil || got != "off" {
 		t.Errorf("target archive_mode: %q %v", got, err)
@@ -325,6 +469,15 @@ func TestReshardProvisionsTargetsAndCancels(t *testing.T) {
 	if got := catalogSQL(ctx, t, c, "SELECT string_agg(shard_set || ':' || shard_id || ':' || serving_state, ',') FROM pgshard.shard_status"); got != "default:0:serving" {
 		t.Fatalf("shard_status after cancel: %q", got)
 	}
+	waitFor(ctx, t, "copy cleaned up on the source", 5*time.Minute, func() bool {
+		wf := catalogSQL(ctx, t, c, "SELECT coalesce(string_agg(state || ':' || (status->>'stage'), ','), '') FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = 'g2'")
+		slots, err := psql(ctx, c, clusterName+"-shard-0-rw", "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pgshard\\_reshard\\_%'")
+		if err != nil {
+			return false
+		}
+		pubs, err := shardSQL(ctx, c, "shard-0", "SELECT count(*) FROM pg_publication")
+		return err == nil && wf == "cancelled:cancelled" && slots == "0" && pubs == "0"
+	})
 	if err := waitCondition(ctx, c, "Ready", 5*time.Minute); err != nil {
 		t.Fatal(err)
 	}

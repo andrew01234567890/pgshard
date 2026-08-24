@@ -73,6 +73,18 @@ type Snapshot struct {
 	WriteFence bool
 }
 
+// Resharding reports whether a non-serving shard set is being provisioned
+// or copied into: statements logical replication cannot carry (TRUNCATE)
+// are refused meanwhile.
+func (s *Snapshot) Resharding() bool {
+	for _, sv := range s.Serving {
+		if sv.State == "provisioning" {
+			return true
+		}
+	}
+	return false
+}
+
 // Roles holds credential verifiers keyed by role name. Its String and
 // GoString methods print only a count so a Roles can never leak into logs.
 type Roles struct {

@@ -43,6 +43,7 @@ const (
 	Agent_ListPreparedTransactions_FullMethodName      = "/pgshard.v1.Agent/ListPreparedTransactions"
 	Agent_ReconcilePreparedTransactions_FullMethodName = "/pgshard.v1.Agent/ReconcilePreparedTransactions"
 	Agent_SetWriteFence_FullMethodName                 = "/pgshard.v1.Agent/SetWriteFence"
+	Agent_MaterializeSchema_FullMethodName             = "/pgshard.v1.Agent/MaterializeSchema"
 )
 
 // AgentClient is the client API for Agent service.
@@ -112,6 +113,10 @@ type AgentClient interface {
 	// SetWriteFence raises or releases the cluster write fence in the pgshard
 	// catalog this instance serves.
 	SetWriteFence(ctx context.Context, in *SetWriteFenceRequest, opts ...grpc.CallOption) (*SetWriteFenceResponse, error)
+	// MaterializeSchema copies the schema of one database from a source
+	// (pg_dump --schema-only piped into psql) into the same-named local
+	// database, which must already exist and be empty.
+	MaterializeSchema(ctx context.Context, in *MaterializeSchemaRequest, opts ...grpc.CallOption) (*MaterializeSchemaResponse, error)
 }
 
 type agentClient struct {
@@ -342,6 +347,16 @@ func (c *agentClient) SetWriteFence(ctx context.Context, in *SetWriteFenceReques
 	return out, nil
 }
 
+func (c *agentClient) MaterializeSchema(ctx context.Context, in *MaterializeSchemaRequest, opts ...grpc.CallOption) (*MaterializeSchemaResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MaterializeSchemaResponse)
+	err := c.cc.Invoke(ctx, Agent_MaterializeSchema_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AgentServer is the server API for Agent service.
 // All implementations must embed UnimplementedAgentServer
 // for forward compatibility.
@@ -409,6 +424,10 @@ type AgentServer interface {
 	// SetWriteFence raises or releases the cluster write fence in the pgshard
 	// catalog this instance serves.
 	SetWriteFence(context.Context, *SetWriteFenceRequest) (*SetWriteFenceResponse, error)
+	// MaterializeSchema copies the schema of one database from a source
+	// (pg_dump --schema-only piped into psql) into the same-named local
+	// database, which must already exist and be empty.
+	MaterializeSchema(context.Context, *MaterializeSchemaRequest) (*MaterializeSchemaResponse, error)
 	mustEmbedUnimplementedAgentServer()
 }
 
@@ -484,6 +503,9 @@ func (UnimplementedAgentServer) ReconcilePreparedTransactions(context.Context, *
 }
 func (UnimplementedAgentServer) SetWriteFence(context.Context, *SetWriteFenceRequest) (*SetWriteFenceResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method SetWriteFence not implemented")
+}
+func (UnimplementedAgentServer) MaterializeSchema(context.Context, *MaterializeSchemaRequest) (*MaterializeSchemaResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method MaterializeSchema not implemented")
 }
 func (UnimplementedAgentServer) mustEmbedUnimplementedAgentServer() {}
 func (UnimplementedAgentServer) testEmbeddedByValue()               {}
@@ -902,6 +924,24 @@ func _Agent_SetWriteFence_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Agent_MaterializeSchema_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MaterializeSchemaRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServer).MaterializeSchema(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Agent_MaterializeSchema_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServer).MaterializeSchema(ctx, req.(*MaterializeSchemaRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Agent_ServiceDesc is the grpc.ServiceDesc for Agent service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -996,6 +1036,10 @@ var Agent_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SetWriteFence",
 			Handler:    _Agent_SetWriteFence_Handler,
+		},
+		{
+			MethodName: "MaterializeSchema",
+			Handler:    _Agent_MaterializeSchema_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

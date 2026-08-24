@@ -1,0 +1,180 @@
+package controller
+
+import (
+	"math"
+	"testing"
+
+	"github.com/andrew01234567890/pgshard/internal/placement"
+)
+
+func TestKeyHashExprMirrorsPlacement(t *testing.T) {
+	seed := "8816678312871386365::int8"
+	cases := []struct{ col, typ, want string }{
+		{"tenant_id", "bigint", `hashint8extended("tenant_id"::int8, ` + seed + `)`},
+		{"id", "integer", `hashint8extended("id"::int8, ` + seed + `)`},
+		{"id", "smallint", `hashint8extended("id"::int8, ` + seed + `)`},
+		{"slug", "text", `hashtextextended("slug"::text, ` + seed + `)`},
+		{"code", "character varying(20)", `hashtextextended("code"::text, ` + seed + `)`},
+		{"code", "character(3)", `hashtextextended("code"::text, ` + seed + `)`},
+		{"ref", "uuid", `uuid_hash_extended("ref", ` + seed + `)`},
+		{`we"ird`, "text", `hashtextextended("we""ird"::text, ` + seed + `)`},
+	}
+	for _, c := range cases {
+		got, err := KeyHashExpr(c.col, c.typ)
+		if err != nil || got != c.want {
+			t.Errorf("KeyHashExpr(%q, %q) = %q, %v; want %q", c.col, c.typ, got, err, c.want)
+		}
+	}
+	for _, typ := range []string{"numeric", "double precision", "timestamp with time zone", "bytea"} {
+		if _, err := KeyHashExpr("k", typ); err == nil {
+			t.Errorf("%s must be refused", typ)
+		}
+	}
+}
+
+func TestRangeFilterDropsKeySpaceBounds(t *testing.T) {
+	h := "h(k)"
+	cases := []struct {
+		r    placement.Range
+		want string
+	}{
+		{placement.Range{Start: math.MinInt64, End: math.MaxInt64}, "true"},
+		{placement.Range{Start: math.MinInt64, End: -1}, "h(k) <= -1"},
+		{placement.Range{Start: 0, End: math.MaxInt64}, "h(k) >= 0"},
+		{placement.Range{Start: -5, End: 7}, "h(k) >= -5 AND h(k) <= 7"},
+	}
+	for _, c := range cases {
+		if got := RangeFilter(h, c.r); got != c.want {
+			t.Errorf("RangeFilter(%v) = %q, want %q", c.r, got, c.want)
+		}
+	}
+}
+
+func TestCreatePublicationSQL(t *testing.T) {
+	got := CreatePublicationSQL("pgshard_reshard_g2_t1", []PublishedTable{
+		{Schema: "public", Name: "orders", Filter: `hashint8extended("tenant_id"::int8, 1::int8) >= 0`},
+		{Schema: "audit", Name: "ev ents"},
+	})
+	want := `CREATE PUBLICATION "pgshard_reshard_g2_t1" FOR TABLE "public"."orders" WHERE (hashint8extended("tenant_id"::int8, 1::int8) >= 0), "audit"."ev ents" WITH (publish = 'insert, update, delete')`
+	if got != want {
+		t.Fatalf("got  %s\nwant %s", got, want)
+	}
+	if got := CreatePublicationSQL("pgshard_reshard_g2_ref", nil); got != `CREATE PUBLICATION "pgshard_reshard_g2_ref" WITH (publish = 'insert, update, delete')` {
+		t.Fatalf("empty publication: %s", got)
+	}
+}
+
+func TestCreateSubscriptionSQL(t *testing.T) {
+	got := CreateSubscriptionSQL("pgshard_reshard_g2_t1_s0", "host=src dbname=app password='p''w'", []string{"pgshard_reshard_g2_t1", "pgshard_reshard_g2_ref"}, SubscriptionOptions{Slot: "pgshard_reshard_g2_t1_s0"})
+	want := `CREATE SUBSCRIPTION "pgshard_reshard_g2_t1_s0" CONNECTION 'host=src dbname=app password=''p''''w''' PUBLICATION "pgshard_reshard_g2_t1", "pgshard_reshard_g2_ref" WITH (copy_data = true, create_slot = true, enabled = true, streaming = parallel, two_phase = false, origin = any, slot_name = 'pgshard_reshard_g2_t1_s0')`
+	if got != want {
+		t.Fatalf("got  %s\nwant %s", got, want)
+	}
+	if got := CreateSubscriptionSQL("s", "c", []string{"p"}, SubscriptionOptions{Slot: "s", Failover: true}); got[len(got)-len("failover = true)"):] != "failover = true)" {
+		t.Fatalf("failover option missing: %s", got)
+	}
+}
+
+func TestNames(t *testing.T) {
+	if PublicationName(2, 1) != "pgshard_reshard_g2_t1" || ReferencePublicationName(3) != "pgshard_reshard_g3_ref" ||
+		HomePublicationName(3) != "pgshard_reshard_g3_home" || SubscriptionName(2, 1, 0) != "pgshard_reshard_g2_t1_s0" {
+		t.Fatal("names changed")
+	}
+}
+
+func TestAggregateAndCaughtUp(t *testing.T) {
+	if Aggregate(nil).CaughtUp(1) {
+		t.Fatal("no subscriptions is not caught up")
+	}
+	reports := []SubscriptionProgress{
+		{Rels: map[RelState]int{'r': 3}, LagBytes: 100, Enabled: true},
+		{Rels: map[RelState]int{'r': 1, 'd': 2}, LagBytes: 5000, Enabled: true},
+		{Rels: map[RelState]int{}, LagBytes: 0, Enabled: false},
+	}
+	p := Aggregate(reports)
+	if p.Subscriptions != 3 || p.TablesTotal != 6 || p.TablesReady != 4 || p.LagBytes != 5000 || p.Paused != 1 {
+		t.Fatalf("aggregate %+v", p)
+	}
+	if p.CaughtUp(1 << 20) {
+		t.Fatal("tables still copying")
+	}
+	reports[1].Rels = map[RelState]int{'r': 3}
+	p = Aggregate(reports)
+	if !p.CaughtUp(5001) || p.CaughtUp(5000) {
+		t.Fatalf("lag threshold: %+v", p)
+	}
+	reports[2].LagBytes = LagUnknown
+	p = Aggregate(reports)
+	if p.LagBytes != LagUnknown || p.CaughtUp(math.MaxInt64) {
+		t.Fatalf("unknown lag must win: %+v", p)
+	}
+	p = Aggregate([]SubscriptionProgress{{LagBytes: LagUnknown, Enabled: true}, {LagBytes: 7, Enabled: true}})
+	if p.LagBytes != LagUnknown {
+		t.Fatalf("unknown lag must stick: %+v", p)
+	}
+}
+
+func TestThrottleHysteresis(t *testing.T) {
+	const hi, lo = 100, 40
+	cases := []struct {
+		paused bool
+		lag    int64
+		want   bool
+	}{
+		{false, 0, false}, {false, 40, false}, {false, 41, false}, {false, 99, false}, {false, 100, true},
+		{true, 150, true}, {true, 99, true}, {true, 41, true}, {true, 40, false}, {true, 0, false},
+	}
+	for _, c := range cases {
+		if got := Throttle(c.paused, c.lag, hi, lo); got != c.want {
+			t.Errorf("Throttle(%v, %d) = %v, want %v", c.paused, c.lag, got, c.want)
+		}
+	}
+	c := &Copier{ThrottleHigh: 100}
+	if hi, lo := c.watermarks(); hi != 100 || lo != 25 {
+		t.Fatalf("watermarks %d %d", hi, lo)
+	}
+	c = &Copier{}
+	if hi, lo := c.watermarks(); hi != DefaultThrottleHi || lo != DefaultThrottleLo {
+		t.Fatalf("default watermarks %d %d", hi, lo)
+	}
+	c = &Copier{ThrottleHigh: 10, ThrottleLow: 50}
+	if hi, lo := c.watermarks(); hi != 10 || lo != 2 {
+		t.Fatalf("inverted watermarks %d %d", hi, lo)
+	}
+}
+
+func TestHomeTarget(t *testing.T) {
+	ranges, _ := placement.Split(4)
+	if HomeTarget(ranges) != 2 {
+		t.Fatalf("keyspace id 0 lies in the third quarter, got %d", HomeTarget(ranges))
+	}
+	one, _ := placement.Split(1)
+	if HomeTarget(one) != 0 {
+		t.Fatal("single range")
+	}
+	exact := placement.RangeSet{{Start: math.MinInt64, End: -1}, {Start: 0, End: 0}, {Start: 1, End: math.MaxInt64}}
+	if HomeTarget(exact) != 1 {
+		t.Fatalf("keyspace id 0 exactly: got %d", HomeTarget(exact))
+	}
+}
+
+func TestAgentAddr(t *testing.T) {
+	for in, want := range map[string]string{"host:5432": "host:9090", "10.0.0.1:5432": "10.0.0.1:9090", "host": "host:9090", "[::1]:5432": "[::1]:9090"} {
+		if got, err := AgentAddr(in, 0); err != nil || got != want {
+			t.Errorf("AgentAddr(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	if got, _ := AgentAddr("h:5432", 7000); got != "h:7000" {
+		t.Fatalf("custom port: %s", got)
+	}
+	if _, err := AgentAddr("", 0); err == nil {
+		t.Fatal("empty endpoint")
+	}
+}
+
+func TestExpandShardTemplate(t *testing.T) {
+	got := ExpandShardTemplate("postgres://u:p@c-{group}-rw:5432/{db}?set={set}&id={id}", "g2", 1, "shard-1-g2", "app")
+	if got != "postgres://u:p@c-shard-1-g2-rw:5432/app?set=g2&id=1" {
+		t.Fatal(got)
+	}
+}
