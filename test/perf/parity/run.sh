@@ -6,12 +6,17 @@
 #   pgbouncer-txn     pgbench -> PgBouncer (pool_mode=transaction) -> postgres
 #   pgshard           pgbench -> pgshard-router -> pgshard-pooler -> postgres
 #
-# Usage: run.sh [smoke|matrix|up|down]
-#   smoke  - stand up, SELECT 1 through every front-end, tear down
-#   matrix - full workload matrix, CSV under $PARITY_RESULTS
+# Usage: run.sh [smoke|matrix|profile|up|down]
+#   smoke   - stand up, SELECT 1 through every front-end, tear down
+#   matrix  - full workload matrix, CSV under $PARITY_RESULTS
+#   profile - pgbench select/prepared against pgshard while capturing CPU,
+#             allocs and mutex pprof profiles from router+pooler
+#             (PARITY_PROFILE_CLIENTS=10, PARITY_PROFILE_SECONDS=30)
 # Env: PARITY_DURATION (s/run, default 3), PARITY_SCALE (pgbench scale, 10),
 #      PARITY_CLIENTS ("1 10 100 1000"), PARITY_RESULTS (dir),
-#      PARITY_KEEP=1 keeps the stack up after the run.
+#      PARITY_KEEP=1 keeps the stack up after the run,
+#      PARITY_PPROF=1 serves /debug/pprof from router (127.0.0.1:16060) and
+#      pooler (127.0.0.1:16061); profile implies it.
 set -euo pipefail
 
 cmd=${1:-matrix}
@@ -58,13 +63,18 @@ up() {
     --catalog-dsn="postgres://postgres:$pw@pgparity-catalog:5432/catalog?sslmode=disable" \
     --shard-dsn="postgres://postgres:$pw@pgparity-backend:5432/postgres?sslmode=disable" \
     --pooler-endpoint=pgparity-pooler:15432 >/dev/null
-  docker run -d --name pgparity-pooler --network "$net" --entrypoint pgshard-pooler "$router_image" run \
-    --insecure-dev --listen=0.0.0.0:15432 --pg-host=pgparity-backend --pg-port=5432 --pg-database=app \
+  local pooler_pprof=() router_pprof=()
+  if [ "${PARITY_PPROF:-0}" = 1 ]; then
+    pooler_pprof=(-p 127.0.0.1:16061:6060)
+    router_pprof=(-p 127.0.0.1:16060:6060)
+  fi
+  docker run -d --name pgparity-pooler --network "$net" --entrypoint pgshard-pooler "${pooler_pprof[@]}" "$router_image" run \
+    --insecure-dev --listen=0.0.0.0:15432 ${PARITY_PPROF:+--pprof-listen=0.0.0.0:6060} --pg-host=pgparity-backend --pg-port=5432 --pg-database=app \
     --max-backends=200 --max-per-role=200 \
     --catalog-dsn="postgres://postgres:$pw@pgparity-catalog:5432/catalog?sslmode=disable" \
     --shard-set=default --shard-id=0 >/dev/null
-  docker run -d --name pgparity-router --network "$net" "$router_image" serve \
-    --insecure-dev --listen=0.0.0.0:6432 \
+  docker run -d --name pgparity-router --network "$net" "${router_pprof[@]}" "$router_image" serve \
+    --insecure-dev --listen=0.0.0.0:6432 ${PARITY_PPROF:+--pprof-listen=0.0.0.0:6060} \
     --catalog-dsn="postgres://postgres:$pw@pgparity-catalog:5432/catalog?sslmode=disable" >/dev/null
 
   for mode in session transaction; do
@@ -252,6 +262,42 @@ matrix() {
   log "results: $results/results.csv"
 }
 
+
+profile() { # capture CPU/allocs/mutex profiles from router+pooler under load
+  local secs=${PARITY_PROFILE_SECONDS:-30} clients=${PARITY_PROFILE_CLIENTS:-10}
+  local dir="$results/profiles"
+  mkdir -p "$dir"
+  log "profile: pgbench select prepared c=$clients for ${secs}s"
+  docker exec -e PGPASSWORD=app-secret pgparity-client \
+    pgbench -h pgparity-router -p 6432 -U app -d app -n -S -M prepared \
+    -c "$clients" -j "$clients" -T "$secs" >"$dir/pgbench.txt" 2>&1 &
+  local bench=$!
+  sleep 2
+  local cpusecs=$(( secs - 10 )); [ "$cpusecs" -lt 5 ] && cpusecs=5
+  local side port
+  local curls=()
+  for side in router:16060 pooler:16061; do
+    port=${side##*:}; side=${side%%:*}
+    curl -fsS "http://127.0.0.1:$port/debug/pprof/profile?seconds=$cpusecs" -o "$dir/$side.cpu.pb.gz" &
+    curls+=($!)
+  done
+  wait "${curls[@]}"
+  for side in router:16060 pooler:16061; do
+    port=${side##*:}; side=${side%%:*}
+    curl -fsS "http://127.0.0.1:$port/debug/pprof/allocs?seconds=5" -o "$dir/$side.allocs.pb.gz"
+    curl -fsS "http://127.0.0.1:$port/debug/pprof/mutex" -o "$dir/$side.mutex.pb.gz"
+  done
+  wait "$bench" || { log "profile: pgbench failed"; cat "$dir/pgbench.txt" >&2; return 1; }
+  if command -v go >/dev/null; then
+    local prof
+    for prof in "$dir"/*.pb.gz; do
+      go tool pprof -top -nodecount=30 "$prof" > "${prof%.pb.gz}.top.txt" 2>/dev/null || true
+    done
+  fi
+  grep -E "tps|latency average" "$dir/pgbench.txt" >&2 || true
+  log "profiles: $dir"
+}
+
 smoke() {
   for arm in direct pgbouncer-session pgbouncer-txn pgshard; do
     read -r host port <<<"$(frontend_host "$arm")"
@@ -271,5 +317,9 @@ case "$cmd" in
   matrix)
     trap '[ "${PARITY_KEEP:-0}" = 1 ] || teardown' EXIT
     up; smoke; matrix ;;
-  *) echo "usage: $0 [smoke|matrix|up|down]" >&2; exit 2 ;;
+  profile)
+    export PARITY_PPROF=1
+    trap '[ "${PARITY_KEEP:-0}" = 1 ] || teardown' EXIT
+    up; profile ;;
+  *) echo "usage: $0 [smoke|matrix|profile|up|down]" >&2; exit 2 ;;
 esac

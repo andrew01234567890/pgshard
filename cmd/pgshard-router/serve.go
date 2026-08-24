@@ -30,6 +30,7 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/cli"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
+	"github.com/andrew01234567890/pgshard/internal/pprofserve"
 	"github.com/andrew01234567890/pgshard/internal/router"
 	"github.com/andrew01234567890/pgshard/internal/router/cancelpeer"
 	"github.com/andrew01234567890/pgshard/internal/router/vstream"
@@ -85,6 +86,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	drain := fs.Duration("drain-timeout", 30*time.Second, "time to wait for open transactions and active queries on shutdown")
 	drainDelay := fs.Duration("drain-delay", 5*time.Second, "time between readiness turning false and closing the listener")
 	healthListen := fs.String("health-listen", "", "HTTP address for /readyz and /healthz (empty disables)")
+	pprofListen := fs.String("pprof-listen", "", "HTTP address for /debug/pprof (empty disables; profiling runs only)")
 	instanceID := fs.Uint("instance-id", 0, "router instance id embedded in protocol 3.2 cancel keys (0 draws a random one)")
 	peerListen := fs.String("peer-cancel-listen", "", "gRPC address for cancels forwarded by peer routers (empty disables)")
 	peers := peerFlags{}
@@ -270,6 +272,14 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		go func() { _ = g.Serve(vl) }()
 		defer g.Stop()
 		fmt.Fprintf(stdout, "pgshard-router serve: vstream on %s\n", vl.Addr())
+	}
+	if *pprofListen != "" {
+		pa, err := pprofserve.Serve(ctx, *pprofListen)
+		if err != nil {
+			fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
+			return cli.ExitNotReady
+		}
+		fmt.Fprintf(stdout, "pgshard-router serve: pprof on %s\n", pa)
 	}
 	drainer := router.NewDrainer(srv, *drainDelay, *drain)
 	if *healthListen != "" {
