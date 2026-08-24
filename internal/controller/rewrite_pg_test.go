@@ -16,6 +16,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
+	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
+	"github.com/andrew01234567890/pgshard/internal/router/plan"
 )
 
 const rewriteRows = 10000
@@ -350,4 +352,66 @@ func startPostgres19(t *testing.T) string {
 	}
 	t.Fatal("postgres 19 did not become ready")
 	return ""
+}
+
+// TestRewriteReturningStarHidesWorkingColumnOnPostgres executes the router's
+// rewritten RETURNING * against a shard that carries a rewrite working
+// column: the raw statement would leak it, the rewritten one must not.
+func TestRewriteReturningStarHidesWorkingColumnOnPostgres(t *testing.T) {
+	dsn := startPostgres(t)
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	mustExecSQL(t, pool, `CREATE TABLE accounts (id bigint PRIMARY KEY, tenant_id bigint NOT NULL, amount text NOT NULL DEFAULT '0')`)
+	mustExecSQL(t, pool, `ALTER TABLE accounts ADD COLUMN _pgshard_amount_deadbeef bigint`)
+	mustExecSQL(t, pool, `INSERT INTO accounts (id, tenant_id, amount) VALUES (1, 1, '10')`)
+
+	snap := &snapshot.Snapshot{
+		Databases: map[string]catalog.Database{"postgres": {Name: "postgres", DefaultPlacement: "unsharded", HomeShard: 0}},
+		Tables: map[snapshot.TableKey]snapshot.Placement{
+			{Database: "postgres", SchemaName: "public", TableName: "accounts"}: {
+				Placement:      "unsharded",
+				HiddenColumns:  []string{"_pgshard_amount_deadbeef"},
+				VisibleColumns: []string{"id", "tenant_id", "amount"},
+			},
+		},
+	}
+	sess := plan.Session{Database: "postgres", Snapshot: snap}
+	planner := plan.New()
+
+	leaks := func(sql string) bool {
+		rows, err := pool.Query(ctx, sql)
+		if err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		defer rows.Close()
+		for _, fd := range rows.FieldDescriptions() {
+			if strings.HasPrefix(fd.Name, "_pgshard_") {
+				return true
+			}
+		}
+		return false
+	}
+	if !leaks(`UPDATE accounts SET amount = '20' WHERE id = 1 RETURNING *`) {
+		t.Fatal("raw RETURNING * did not include the working column; fixture is wrong")
+	}
+	for _, sql := range []string{
+		`UPDATE accounts SET amount = '30' WHERE id = 1 RETURNING *`,
+		`INSERT INTO accounts (id, tenant_id, amount) VALUES (2, 1, '5') RETURNING *`,
+		`DELETE FROM accounts WHERE id = 2 RETURNING *`,
+	} {
+		pl, err := planner.Plan(ctx, sess, sql)
+		if err != nil {
+			t.Fatalf("plan %s: %v", sql, err)
+		}
+		if pl.Rewritten == "" {
+			t.Fatalf("%s was not rewritten", sql)
+		}
+		if leaks(pl.Rewritten) {
+			t.Fatalf("rewritten %q leaked the working column", pl.Rewritten)
+		}
+	}
 }

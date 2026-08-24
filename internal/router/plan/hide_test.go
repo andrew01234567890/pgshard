@@ -41,6 +41,20 @@ func TestHiddenColumnExpansion(t *testing.T) {
 		{sql: "insert into orders (tenant_id, _pgshard_amount_deadbeef) values (1, 2)", refuse: "column \"_pgshard_amount_deadbeef\" does not exist"},
 		{sql: "select * from orders o join order_lines l on o.tenant_id = l.tenant_id where o.tenant_id = 1",
 			refuse: "cannot span other tables"},
+		{sql: "update orders set amount = 2 where tenant_id = 1 returning *",
+			rewritten: "UPDATE orders SET amount = 2 WHERE tenant_id = 1 RETURNING tenant_id, id, amount"},
+		{sql: "update orders o set amount = 2 where o.tenant_id = 1 returning o.*",
+			rewritten: "UPDATE orders o SET amount = 2 WHERE o.tenant_id = 1 RETURNING o.tenant_id, o.id, o.amount"},
+		{sql: "insert into orders (tenant_id, id, amount) values (1, 2, 3) returning *",
+			rewritten: "INSERT INTO orders (tenant_id, id, amount) VALUES (1, 2, 3) RETURNING tenant_id, id, amount"},
+		{sql: "delete from orders where tenant_id = 1 returning *",
+			rewritten: "DELETE FROM orders WHERE tenant_id = 1 RETURNING tenant_id, id, amount"},
+		{sql: "update orders set amount = 2 where tenant_id = 1 returning id, amount", rewritten: ""},
+		{sql: "select to_jsonb(o) from orders o where o.tenant_id = 1", refuse: "whole-row reference"},
+		{sql: "select row_to_json(orders) from orders where tenant_id = 1", refuse: "whole-row reference"},
+		{sql: "select count(o.*) from orders o where o.tenant_id = 1", refuse: "whole-row reference"},
+		{sql: "select o::text from orders o where o.tenant_id = 1", refuse: "whole-row reference"},
+		{sql: "update orders o set amount = 2 where o.tenant_id = 1 returning to_jsonb(o)", refuse: "whole-row reference"},
 	}
 	for _, c := range cases {
 		t.Run(c.sql, func(t *testing.T) {

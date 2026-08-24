@@ -33,6 +33,9 @@ func (w *walker) hideRewriteColumns() error {
 	if len(under) == 0 {
 		return nil
 	}
+	if err := w.refuseWholeRows(under); err != nil {
+		return err
+	}
 	needStar, err := w.starPlan(under)
 	if err != nil {
 		return err
@@ -159,40 +162,130 @@ func (w *walker) starPlan(under []*rel) (bool, error) {
 }
 
 // expandStars replaces every star that resolves to target with target's
-// visible columns, qualified the way the star was.
+// visible columns, qualified the way the star was, in SELECT target lists
+// and in the RETURNING list of INSERT, UPDATE, DELETE and MERGE.
 func expandStars(root *pgquerypb.Node, target *rel) {
 	visit(root, func(n *pgquerypb.Node) bool {
-		s := n.GetSelectStmt()
-		if s == nil {
-			return true
+		if s := n.GetSelectStmt(); s != nil {
+			s.TargetList = expandStarList(s.GetTargetList(), target)
 		}
-		var out []*pgquerypb.Node
-		for _, t := range s.GetTargetList() {
-			rt := t.GetResTarget()
-			fields := rt.GetVal().GetColumnRef().GetFields()
-			if len(fields) == 0 || fields[len(fields)-1].GetAStar() == nil || rt.GetName() != "" {
-				out = append(out, t)
-				continue
-			}
-			var prefix []string
-			for _, f := range fields[:len(fields)-1] {
-				prefix = append(prefix, f.GetString_().GetSval())
-			}
-			if len(prefix) > 0 && prefix[len(prefix)-1] != target.alias {
-				out = append(out, t)
-				continue
-			}
-			for _, col := range target.visible {
-				var fs []*pgquerypb.Node
-				for _, p := range prefix {
-					fs = append(fs, &pgquerypb.Node{Node: &pgquerypb.Node_String_{String_: &pgquerypb.String{Sval: p}}})
-				}
-				fs = append(fs, &pgquerypb.Node{Node: &pgquerypb.Node_String_{String_: &pgquerypb.String{Sval: col}}})
-				out = append(out, &pgquerypb.Node{Node: &pgquerypb.Node_ResTarget{ResTarget: &pgquerypb.ResTarget{
-					Val: &pgquerypb.Node{Node: &pgquerypb.Node_ColumnRef{ColumnRef: &pgquerypb.ColumnRef{Fields: fs}}}}}})
-			}
+		if rc := returningClause(n); rc != nil {
+			rc.Exprs = expandStarList(rc.GetExprs(), target)
 		}
-		s.TargetList = out
 		return true
 	})
+}
+
+func returningClause(n *pgquerypb.Node) *pgquerypb.ReturningClause {
+	switch {
+	case n.GetInsertStmt() != nil:
+		return n.GetInsertStmt().GetReturningClause()
+	case n.GetUpdateStmt() != nil:
+		return n.GetUpdateStmt().GetReturningClause()
+	case n.GetDeleteStmt() != nil:
+		return n.GetDeleteStmt().GetReturningClause()
+	case n.GetMergeStmt() != nil:
+		return n.GetMergeStmt().GetReturningClause()
+	}
+	return nil
+}
+
+func expandStarList(list []*pgquerypb.Node, target *rel) []*pgquerypb.Node {
+	var out []*pgquerypb.Node
+	for _, t := range list {
+		rt := t.GetResTarget()
+		fields := rt.GetVal().GetColumnRef().GetFields()
+		if len(fields) == 0 || fields[len(fields)-1].GetAStar() == nil || rt.GetName() != "" {
+			out = append(out, t)
+			continue
+		}
+		var prefix []string
+		for _, f := range fields[:len(fields)-1] {
+			prefix = append(prefix, f.GetString_().GetSval())
+		}
+		if len(prefix) > 0 && prefix[len(prefix)-1] != target.alias {
+			out = append(out, t)
+			continue
+		}
+		for _, col := range target.visible {
+			var fs []*pgquerypb.Node
+			for _, p := range prefix {
+				fs = append(fs, &pgquerypb.Node{Node: &pgquerypb.Node_String_{String_: &pgquerypb.String{Sval: p}}})
+			}
+			fs = append(fs, &pgquerypb.Node{Node: &pgquerypb.Node_String_{String_: &pgquerypb.String{Sval: col}}})
+			out = append(out, &pgquerypb.Node{Node: &pgquerypb.Node_ResTarget{ResTarget: &pgquerypb.ResTarget{
+				Val: &pgquerypb.Node{Node: &pgquerypb.Node_ColumnRef{ColumnRef: &pgquerypb.ColumnRef{Fields: fs}}}}}})
+		}
+	}
+	return out
+}
+
+// refuseWholeRows refuses whole-row references to a table under rewrite:
+// a bare alias reference (to_jsonb(o), o::text) and a star that is not a
+// direct SELECT or RETURNING entry (count(o.*), (o.*)::text) would carry
+// the hidden working column to the client, and the router cannot expand
+// them in place.
+func (w *walker) refuseWholeRows(under []*rel) error {
+	byAlias := map[string]*rel{}
+	for _, r := range under {
+		byAlias[r.alias] = r
+	}
+	direct := map[*pgquerypb.ColumnRef]bool{}
+	visit(w.root, func(n *pgquerypb.Node) bool {
+		var lists [][]*pgquerypb.Node
+		if s := n.GetSelectStmt(); s != nil {
+			lists = append(lists, s.GetTargetList())
+		}
+		if rc := returningClause(n); rc != nil {
+			lists = append(lists, rc.GetExprs())
+		}
+		for _, list := range lists {
+			for _, t := range list {
+				if cr := t.GetResTarget().GetVal().GetColumnRef(); cr != nil {
+					direct[cr] = true
+				}
+			}
+		}
+		return true
+	})
+	var err error
+	visit(w.root, func(n *pgquerypb.Node) bool {
+		cr := n.GetColumnRef()
+		if cr == nil || err != nil {
+			return err == nil
+		}
+		fields := cr.GetFields()
+		star := len(fields) > 0 && fields[len(fields)-1].GetAStar() != nil
+		if star && len(fields) > 1 && !direct[cr] {
+			if r, ok := byAlias[fields[len(fields)-2].GetString_().GetSval()]; ok {
+				err = wholeRowErr(r)
+			}
+		}
+		if !star && len(fields) == 1 {
+			if r, ok := byAlias[fields[0].GetString_().GetSval()]; ok && !hasColumn(r, fields[0].GetString_().GetSval()) {
+				err = wholeRowErr(r)
+			}
+		}
+		return err == nil
+	})
+	return err
+}
+
+func hasColumn(r *rel, name string) bool {
+	for _, c := range r.visible {
+		if c == name {
+			return true
+		}
+	}
+	for _, c := range r.hidden {
+		if c == name {
+			return true
+		}
+	}
+	return false
+}
+
+func wholeRowErr(r *rel) *pgwire.Error {
+	return notYet("a whole-row reference to table \""+r.name+"\" while it is under an online schema migration is not available",
+		"list the columns explicitly while the online change is in progress")
 }
