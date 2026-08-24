@@ -251,9 +251,11 @@ func service(c *pgshardv1alpha1.PgShardCluster, g Group, name string, selector m
 			Selector: selector,
 			Ports: []corev1.ServicePort{
 				{Name: "postgres", Port: postgresPort, TargetPort: intstr.FromInt32(postgresPort)},
-				{Name: "pooler-grpc", Port: poolerGRPCPort, TargetPort: intstr.FromInt32(poolerGRPCPort)},
 			},
 		},
+	}
+	if name == g.ServiceRW() {
+		svc.Spec.Ports = append(svc.Spec.Ports, corev1.ServicePort{Name: "pooler-grpc", Port: poolerGRPCPort, TargetPort: intstr.FromInt32(poolerGRPCPort)})
 	}
 	if headless {
 		svc.Spec.ClusterIP = corev1.ClusterIPNone

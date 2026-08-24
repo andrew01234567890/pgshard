@@ -284,13 +284,13 @@ func (r *RestoreReconciler) observe(ctx context.Context, rs *pgshardv1alpha1.PgS
 	}
 	meta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{Type: "Progressing", Status: boolCondition(inProgress),
 		Reason: rs.Status.Phase, Message: msg, ObservedGeneration: rs.Generation})
+	if err := r.Status().Patch(ctx, rs, client.MergeFrom(base)); err != nil {
+		return ctrl.Result{}, err
+	}
 	if rs.Status.Phase == pgshardv1alpha1.RestorePhaseRecovered {
 		if err := r.clearRestoreSource(ctx, c); err != nil {
 			return ctrl.Result{}, err
 		}
-	}
-	if err := r.Status().Patch(ctx, rs, client.MergeFrom(base)); err != nil {
-		return ctrl.Result{}, err
 	}
 	if reconcileErr != nil {
 		return ctrl.Result{}, reconcileErr
