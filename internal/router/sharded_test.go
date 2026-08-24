@@ -682,3 +682,27 @@ func TestUnparseableWriteIsRefusedNotHomeRouted(t *testing.T) {
 		}
 	}
 }
+
+func TestPipelinedResetRestoresTheStartupSearchPathInTheSameSync(t *testing.T) {
+	h := newShardedHarness(t)
+	ctx := context.Background()
+	conn := h.connect(t, h.dsn()+"&options=-c%20search_path%3Daudit,public&default_query_exec_mode=exec")
+
+	b := &pgx.Batch{}
+	b.Queue("reset search_path")
+	b.Queue("select current_setting('search_path')")
+	br := conn.SendBatch(ctx, b)
+	if _, err := br.Exec(); err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	if err := br.QueryRow().Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if err := br.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got != `"audit", "public"` {
+		t.Fatalf("statement pipelined behind RESET ran with search_path = %q, want the startup path the planner routed with", got)
+	}
+}
