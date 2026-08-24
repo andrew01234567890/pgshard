@@ -539,3 +539,48 @@ func TestPlacementBackslashKeysAndLateWriteOnPostgres(t *testing.T) {
 	}
 	f.driveUntil("notes", time.Minute, StagePlacementRetiring)
 }
+
+// TestPlacementVerifyHolderShadowsOnPostgres: verification is keyed to the
+// holders of the new placement, not the sources. A sharded-to-unsharded
+// move (where a source holds no shadow) must still verify and flag a
+// short shadow, and a resume after a crash mid-swap (some holder already
+// renamed its shadow) must skip the check instead of erroring on the
+// missing shadow.
+func TestPlacementVerifyHolderShadowsOnPostgres(t *testing.T) {
+	f := newPlacementFixture(t)
+	ctx := context.Background()
+	home := f.app(0)
+	mustExec(t, home, `CREATE TABLE gear (id bigint PRIMARY KEY, v text)`)
+	mustExec(t, home, `INSERT INTO gear SELECT g, 'g' || g FROM generate_series(1, 40) g`)
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('app', 'public', 'gear', 'unsharded', NULL)`)
+	f.reconcile()
+	mustExec(t, f.catalog, `UPDATE pgshard.tables SET placement = 'sharded', shard_key = 'id' WHERE table_name = 'gear'`)
+	f.reconcile()
+	mustExec(t, f.catalog, `UPDATE pgshard.workflows SET spec = spec || '{"drop_old_after_seconds": 0}'`)
+	f.driveUntil("gear", 2*time.Minute, StageCompleted)
+
+	mustExec(t, f.catalog, `UPDATE pgshard.tables SET placement = 'unsharded', shard_key = NULL WHERE table_name = 'gear'`)
+	f.reconcile()
+	id, _ := f.driveUntil("gear", 2*time.Minute, StagePlacementSwapping)
+	wf := f.load(id)
+	mustExec(t, home, `DELETE FROM gear`+ShadowSuffix+` WHERE id = 7`)
+	if err := f.placer.verifyPlacement(ctx, wf); err == nil || !isFatal(err) {
+		t.Fatalf("a short shadow on the sole holder must fail verification: %v", err)
+	}
+	mustExec(t, home, `INSERT INTO gear`+ShadowSuffix+` VALUES (7, 'g7')`)
+	if err := f.placer.verifyPlacement(ctx, wf); err != nil {
+		t.Fatalf("repaired shadow must verify: %v", err)
+	}
+
+	// Crash mid-swap: the holder already renamed its shadow; a resumed
+	// verify must skip, not error.
+	mustExec(t, home, `ALTER TABLE gear`+ShadowSuffix+` RENAME TO gear__renamed_by_swap`)
+	if err := f.placer.verifyPlacement(ctx, wf); err != nil {
+		t.Fatalf("already-swapped holder must skip verification: %v", err)
+	}
+	mustExec(t, home, `ALTER TABLE gear__renamed_by_swap RENAME TO gear`+ShadowSuffix)
+	if err := f.placer.swapAll(ctx, wf); err != nil {
+		t.Fatalf("swapAll: %v", err)
+	}
+	f.driveUntil("gear", 2*time.Minute, StagePlacementRetiring, StageCompleted)
+}

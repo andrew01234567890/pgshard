@@ -600,12 +600,14 @@ func (p *Placer) unlock(ctx context.Context, wf *placementWorkflow) error {
 // tables received, before the swap makes the shadows live. Every reference
 // holder must match the source exactly; under any other placement the
 // shadow slices must add up to the source. It runs under the fence after
-// the drain, so both sides are still. A run whose shadows were already
-// renamed (crash between swap and publish) skips the check.
+// the drain, so both sides are still. Shadows live on the new placement's
+// holders, so the crash-resume skip checks those: any holder whose shadow
+// was already renamed means the swap began (verify passed before it), and
+// the check is skipped rather than hard-erroring under the fence.
 func (p *Placer) verifyPlacement(ctx context.Context, wf *placementWorkflow) error {
-	var src rowDigest
-	for _, s := range wf.from.Sources() {
-		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, s, wf.spec.Database)
+	targets := map[int32]rowDigest{}
+	for _, t := range wf.rt.Holders() {
+		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
 		if err != nil {
 			return err
 		}
@@ -616,26 +618,26 @@ func (p *Placer) verifyPlacement(ctx context.Context, wf *placementWorkflow) err
 		}
 		var d rowDigest
 		if err == nil {
-			d, err = digest(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, "")
+			d, err = digest(ctx, conn, wf.spec.SchemaName, wf.shadow(), "")
 		}
-		_ = conn.Close(ctx)
-		if err != nil {
-			return err
-		}
-		src = src.add(d)
-	}
-	targets := map[int32]rowDigest{}
-	for _, t := range wf.rt.Holders() {
-		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
-		if err != nil {
-			return err
-		}
-		d, err := digest(ctx, conn, wf.spec.SchemaName, wf.shadow(), "")
 		_ = conn.Close(ctx)
 		if err != nil {
 			return err
 		}
 		targets[t] = d
+	}
+	var src rowDigest
+	for _, s := range wf.from.Sources() {
+		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, s, wf.spec.Database)
+		if err != nil {
+			return err
+		}
+		d, err := digest(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, "")
+		_ = conn.Close(ctx)
+		if err != nil {
+			return err
+		}
+		src = src.add(d)
 	}
 	if mismatches := placementMismatches(wf.spec.To.Placement, src, targets); len(mismatches) > 0 {
 		return fatal("placement verification of %s failed: %s", wf.spec.table(), strings.Join(mismatches, "; "))
