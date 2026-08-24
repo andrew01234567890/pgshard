@@ -61,6 +61,8 @@ type Migration struct {
 	DatabaseOp string
 	// Steps is the plan of a StrategyMultistep migration.
 	Steps []Step
+	// Rewrite is the plan of a StrategyRewrite migration.
+	Rewrite *catalog.RewriteChange
 }
 
 // Step is one statement of a multistep migration.
@@ -248,6 +250,13 @@ func (w *walker) alterTable(a *pgquerypb.AlterTableStmt) error {
 	if err != nil {
 		return err
 	}
+	rw, err := w.rewriteChange(a, r)
+	if err != nil {
+		return err
+	}
+	if rw != nil {
+		return w.migration(Migration{Kind: "ALTER TABLE", Scope: scope, Strategy: StrategyRewrite, Rewrite: rw})
+	}
 	steps, err := w.alterSteps(a, r)
 	if err != nil {
 		return err
@@ -264,7 +273,9 @@ func checkAlterCmd(r *rel, c *pgquerypb.AlterTableCmd) error {
 	sharded := r != nil && r.kind == placeSharded
 	switch c.GetSubtype() {
 	case pgquerypb.AlterTableType_AT_AlterColumnType:
-		return rewriteClass("ALTER COLUMN ... TYPE")
+		if sharded && c.GetName() == r.shardKey {
+			return shardKeyChangeError(r)
+		}
 	case pgquerypb.AlterTableType_AT_SetLogged, pgquerypb.AlterTableType_AT_SetUnLogged:
 		return rewriteClass("SET LOGGED / SET UNLOGGED")
 	case pgquerypb.AlterTableType_AT_SetTableSpace:
@@ -277,10 +288,6 @@ func checkAlterCmd(r *rel, c *pgquerypb.AlterTableCmd) error {
 		for _, con := range col.GetConstraints() {
 			cs := con.GetConstraint()
 			switch cs.GetContype() {
-			case pgquerypb.ConstrType_CONSTR_DEFAULT:
-				if !stableDefault(cs.GetRawExpr()) {
-					return rewriteClass("ADD COLUMN with a volatile DEFAULT")
-				}
 			case pgquerypb.ConstrType_CONSTR_IDENTITY:
 				return rewriteClass("ADD COLUMN ... GENERATED AS IDENTITY")
 			case pgquerypb.ConstrType_CONSTR_GENERATED:
@@ -344,7 +351,7 @@ func stableDefault(n *pgquerypb.Node) bool {
 
 func rewriteClass(form string) error {
 	return notYet("rewrite-class DDL is not available yet: "+form+" rewrites the table",
-		"rewrite-class changes land with online schema change; create a new table and copy the rows instead")
+		"column type changes and volatile-default ADD COLUMN run online; this form still needs a new table and a copy of the rows")
 }
 
 func shardKeyChangeError(r *rel) error {
@@ -701,4 +708,49 @@ func (w *walker) alterObject(kind string, objType pgquerypb.ObjectType, rv *pgqu
 		return w.migration(Migration{Kind: "ALTER " + objectWord(objType), Scope: ScopeAll})
 	}
 	return w.unshardedOnly()
+}
+
+// vacuumFull reports whether a VACUUM statement carries the FULL option.
+func vacuumFull(v *pgquerypb.VacuumStmt) bool {
+	if !v.GetIsVacuumcmd() {
+		return false
+	}
+	for _, o := range v.GetOptions() {
+		d := o.GetDefElem()
+		if strings.EqualFold(d.GetDefname(), "full") {
+			arg := d.GetArg()
+			if arg == nil {
+				return true
+			}
+			switch strings.ToLower(arg.GetString_().GetSval()) {
+			case "", "on", "true", "yes", "1":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// vacuum routes VACUUM: a VACUUM (FULL) of one sharded or reference table
+// becomes a repack migration the applier runs as REPACK (CONCURRENTLY) on
+// PostgreSQL 19+; everything else keeps the maintenance rules.
+func (w *walker) vacuum(v *pgquerypb.VacuumStmt) error {
+	rels := v.GetRels()
+	if vacuumFull(v) && len(rels) == 1 {
+		rv := rels[0].GetVacuumRelation().GetRelation()
+		r, err := w.lookup(rv)
+		if err != nil {
+			return err
+		}
+		if r != nil && r.kind != placeUnsharded {
+			return w.migration(Migration{Kind: "VACUUM", Scope: ScopeAll, Strategy: StrategyRepack,
+				Object: relationRef(rv, objectPresent)})
+		}
+	}
+	for _, item := range rels {
+		if err := w.maintenance("VACUUM and ANALYZE", item.GetVacuumRelation().GetRelation()); err != nil {
+			return err
+		}
+	}
+	return nil
 }

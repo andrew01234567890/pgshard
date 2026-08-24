@@ -60,26 +60,37 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
    with the same name. An `ALTER TABLE` with several actions of which one
    needs steps is refused (`0A000`): run that action as its own statement.
 
-2. **Refuse what cannot be applied online.** `0A000`:
+2. **Rewrite class runs online.** `ALTER COLUMN … TYPE` (any change, with
+   or without `USING`) and `ADD COLUMN … DEFAULT <volatile expression>`
+   would rewrite the table under an exclusive lock; the router instead
+   classifies them as strategy `rewrite` — an OID-preserving in-place
+   column duplication driven by the applier. See
+   [online-ddl.md](online-ddl.md) for the mechanism, the router's column
+   hiding and the limitations. `VACUUM (FULL) <sharded or reference
+   table>` becomes strategy `repack`: `REPACK (CONCURRENTLY)` on
+   PostgreSQL 19+, the plain (locking) `VACUUM FULL` on 18. Metadata-only
+   forms (`ADD COLUMN` with a constant or stable default such as
+   `now()`/`CURRENT_TIMESTAMP`, `DROP COLUMN`, …) are applied as written;
+   constraint, index and partition work takes the weaker-lock strategies
+   above.
+
+3. **Refuse what cannot be applied online.** `0A000`:
    * DDL inside a transaction block — each shard commits its own
      transaction; the fan-out cannot be rolled back with the client's.
-   * Rewrite class (`ALTER COLUMN … TYPE`, `SET LOGGED`/`UNLOGGED`,
-     `SET TABLESPACE`, `ADD COLUMN … DEFAULT <volatile expression>`,
+   * Remaining rewrite class (`SET LOGGED`/`UNLOGGED`, `SET TABLESPACE`,
      `ADD COLUMN … GENERATED AS IDENTITY`, `ADD COLUMN … serial`,
-     `ADD COLUMN … GENERATED … STORED`): these rewrite the table under an
-     exclusive lock and wait for online schema change (M8). Metadata-only
-     forms (`ADD COLUMN` with a constant or stable default such as
-     `now()`/`CURRENT_TIMESTAMP`, `DROP COLUMN`, …) are applied as written;
-     constraint, index and partition work takes the weaker-lock strategies
-     above.
-   * `TRUNCATE`, `LOCK`, `VACUUM`, `COPY` on sharded/reference tables and
-     `CREATE TABLE AS` over them (not migrations; still refused).
+     `ADD COLUMN … GENERATED … STORED`, `ALTER COLUMN … TYPE` combined
+     with other actions or `COLLATE`): create a new table and copy the
+     rows.
+   * `TRUNCATE`, `LOCK`, plain `VACUUM`/`ANALYZE`, `COPY` on
+     sharded/reference tables and `CREATE TABLE AS` over them (not
+     migrations; still refused).
    * Roles with `SUPERUSER`, `REPLICATION` or `BYPASSRLS` (they would apply
      on every shard's server), `ALTER ROLE … RENAME`, `ALTER ROLE … SET …
      FROM CURRENT`, `ALTER DEFAULT PRIVILEGES`, `REASSIGN OWNED` and `DROP
      OWNED` — see [roles.md](roles.md).
 
-3. **Queue and wait.** The router inserts the row (`state = queued`) with
+4. **Queue and wait.** The router inserts the row (`state = queued`) with
    the statement text, the client's role (`meta.run_as`) and the object it
    creates or drops (`meta.object`), then polls the row until it is
    `complete` or `failed` and answers the client with the command tag or the
@@ -88,7 +99,7 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
    synchronous DDL. Cancelling a waiting statement leaves the migration
    running in the background (`57014` names the id).
 
-4. **Apply.** The controller leader's applier (`internal/controller/applier.go`)
+5. **Apply.** The controller leader's applier (`internal/controller/applier.go`)
    takes queued and running migrations oldest first, one at a time, and
    runs each on its targets in shard order. Client statements never run on
    a superuser session: the applier logs into the shard's primary as
@@ -145,7 +156,7 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
      lock, readers and writers arriving behind it wait at most that long.
    * Any other error is a hard failure of that shard.
 
-5. **Record.** `per_shard` holds one entry per target,
+6. **Record.** `per_shard` holds one entry per target,
    `{"<shard>": {"state": pending|running|retrying|applied|skipped|failed, "attempts": n, "error": "...", "sqlstate": "..."}}`.
    The migration is `complete` when every shard is `applied` (or `skipped`
    under scope `existing`, with at least one applied) and `failed` as soon as

@@ -390,7 +390,6 @@ func TestRouterDDLMigrations(t *testing.T) {
 		}
 		_ = tx.Rollback(ctx)
 		for _, c := range []struct{ sql, msg string }{
-			{"alter table orders alter column id type bigint", "rewrite-class DDL is not available yet"},
 			{"alter table orders set unlogged", "rewrite-class DDL is not available yet"},
 			{"alter table orders drop column tenant_id", "cannot be dropped, renamed or retyped"},
 			{"drop table orders, notes", "one DDL statement cannot touch both sharded and unsharded tables"},

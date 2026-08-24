@@ -1,0 +1,224 @@
+package controller
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/andrew01234567890/pgshard/internal/catalog"
+)
+
+func rewriteMigration(id string) catalog.DDLMigration {
+	return catalog.DDLMigration{ID: id, Database: "app", Statement: "alter table orders alter column amount type bigint",
+		Kind: "ALTER TABLE", Strategy: catalog.StrategyRewrite, Scope: "all", State: catalog.MigrationQueued,
+		Meta: catalog.MigrationMeta{Rewrite: &catalog.RewriteChange{Schema: "public", Table: "orders", Column: "amount",
+			NewType: "bigint", Using: `CAST("amount" AS bigint)`, BatchSize: 2}}}
+}
+
+func newRewriteApplier(store *memStore, shards *fakeShards) *Applier {
+	return &Applier{Store: store, Shards: shards, RewriteSettle: -1,
+		Sleep:   func(context.Context, time.Duration) error { return nil },
+		Backoff: Backoff{Min: time.Millisecond, Max: time.Millisecond, Total: 5 * time.Millisecond}}
+}
+
+func has(list []string, substr string) bool {
+	for _, s := range list {
+		if strings.Contains(s, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRewriteMigrationRunsAllPhases(t *testing.T) {
+	store := &memStore{migrations: []catalog.DDLMigration{rewriteMigration("00000000-0000-0000-0000-00000000ab01")},
+		shards: []int32{0, 1}}
+	shards := newFakeShards()
+	shards.columns = []string{"tenant_id", "id", "amount"}
+	shards.pks = []string{"id"}
+	shards.oldNotNull = true
+	shards.nnPending = true
+	batches := map[int32]int{}
+	shards.affected = func(id int32, sql string) int64 {
+		if !strings.Contains(sql, "WITH batch AS") {
+			return 0
+		}
+		batches[id]++
+		if batches[id] == 1 {
+			return 2
+		}
+		return 1
+	}
+	a := newRewriteApplier(store, shards)
+	if _, err := a.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m := store.get(t, "00000000-0000-0000-0000-00000000ab01")
+	if m.State != catalog.MigrationComplete {
+		t.Fatalf("state = %s error %q", m.State, m.Error)
+	}
+	if len(m.Meta.Rewrite.Columns) != 3 {
+		t.Fatalf("columns not recorded: %+v", m.Meta.Rewrite.Columns)
+	}
+	hidden := m.Meta.Rewrite.HiddenColumn(m.ID)
+	if hidden != "_pgshard_amount_00000000" {
+		t.Fatalf("hidden column %q", hidden)
+	}
+	for _, id := range []int32{0, 1} {
+		ran := shards.statements(id)
+		for _, want := range []string{
+			`ADD COLUMN IF NOT EXISTS "` + hidden + `" bigint`,
+			"CREATE OR REPLACE FUNCTION", "CREATE TRIGGER",
+			"WITH batch AS",
+			`DROP COLUMN "amount"`, `RENAME COLUMN "` + hidden + `" TO "amount"`,
+			"NOT NULL \"amount\" NOT VALID", "VALIDATE CONSTRAINT",
+			"DROP FUNCTION IF EXISTS",
+		} {
+			if !has(ran, want) {
+				t.Fatalf("shard %d never ran %q:\n%s", id, want, strings.Join(ran, "\n"))
+			}
+		}
+		if batches[id] != 2 {
+			t.Fatalf("shard %d ran %d backfill batches, want 2", id, batches[id])
+		}
+		if got := m.PerShard[shardKey(id)]; got.State != catalog.ShardApplied {
+			t.Fatalf("shard %d state %+v", id, got)
+		}
+	}
+}
+
+func TestRewriteAddFormAppliesDefault(t *testing.T) {
+	m := rewriteMigration("00000000-0000-0000-0000-00000000ab02")
+	m.Meta.Rewrite = &catalog.RewriteChange{Schema: "public", Table: "orders", Column: "token",
+		NewType: "uuid", Default: "gen_random_uuid()", Add: true}
+	store := &memStore{migrations: []catalog.DDLMigration{m}, shards: []int32{0}}
+	shards := newFakeShards()
+	shards.columns = []string{"tenant_id", "id"}
+	a := newRewriteApplier(store, shards)
+	if _, err := a.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := store.get(t, m.ID)
+	if got.State != catalog.MigrationComplete {
+		t.Fatalf("state = %s error %q", got.State, got.Error)
+	}
+	ran := shards.statements(0)
+	if !has(ran, "BEFORE INSERT ON") || has(ran, "INSERT OR UPDATE") {
+		t.Fatalf("add-form trigger must fire on INSERT only:\n%s", strings.Join(ran, "\n"))
+	}
+	if !has(ran, `SET DEFAULT (gen_random_uuid())`) || has(ran, "DROP COLUMN \"token\"") {
+		t.Fatalf("cutover:\n%s", strings.Join(ran, "\n"))
+	}
+}
+
+func TestRewriteFailureRevertsEveryShard(t *testing.T) {
+	store := &memStore{migrations: []catalog.DDLMigration{rewriteMigration("00000000-0000-0000-0000-00000000ab03")},
+		shards: []int32{0, 1}}
+	shards := newFakeShards()
+	shards.columns = []string{"tenant_id", "id", "amount"}
+	shards.pks = []string{"id"}
+	shards.exec = func(id int32, sql string) error {
+		if id == 1 && strings.Contains(sql, "WITH batch AS") {
+			return pgErr("22P02", "invalid input syntax")
+		}
+		return nil
+	}
+	a := newRewriteApplier(store, shards)
+	if _, err := a.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m := store.get(t, "00000000-0000-0000-0000-00000000ab03")
+	if m.State != catalog.MigrationFailed || !strings.Contains(m.Error, "invalid input syntax") {
+		t.Fatalf("state = %s error %q", m.State, m.Error)
+	}
+	hidden := m.Meta.Rewrite.HiddenColumn(m.ID)
+	for _, id := range []int32{0, 1} {
+		sup := shards.superuserStatements(id)
+		if !has(sup, `DROP COLUMN IF EXISTS "`+hidden+`"`) || !has(sup, "DROP TRIGGER IF EXISTS") {
+			t.Fatalf("shard %d not reverted:\n%s", id, strings.Join(sup, "\n"))
+		}
+		if has(shards.statements(id), "RENAME COLUMN") {
+			t.Fatalf("shard %d cut over despite the failure", id)
+		}
+	}
+}
+
+func TestRewriteCutoverIsIdempotent(t *testing.T) {
+	store := &memStore{migrations: []catalog.DDLMigration{rewriteMigration("00000000-0000-0000-0000-00000000ab04")},
+		shards: []int32{0}}
+	shards := newFakeShards()
+	shards.columns = []string{"tenant_id", "id", "amount"}
+	shards.hiddenExists = func(int32) bool { return false }
+	a := newRewriteApplier(store, shards)
+	if _, err := a.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m := store.get(t, "00000000-0000-0000-0000-00000000ab04")
+	if m.State != catalog.MigrationComplete {
+		t.Fatalf("state = %s error %q", m.State, m.Error)
+	}
+	if has(shards.statements(0), "RENAME COLUMN") {
+		t.Fatal("cutover ran again although the hidden column is gone")
+	}
+}
+
+func TestRepackStepPicksRepackOn19(t *testing.T) {
+	m := catalog.DDLMigration{ID: "00000000-0000-0000-0000-00000000ab05", Database: "app",
+		Statement: "vacuum (full) orders", Kind: "VACUUM", Strategy: catalog.StrategyRepack, Scope: "all",
+		State: catalog.MigrationQueued, Meta: catalog.MigrationMeta{Repack: true,
+			Object: catalog.MigrationObject{Kind: "relation", Schema: "public", Name: "orders", Expect: "present"}}}
+	for version, want := range map[int]string{190001: `REPACK (CONCURRENTLY) "public"."orders"`, 180004: "vacuum (full) orders"} {
+		store := &memStore{migrations: []catalog.DDLMigration{m}, shards: []int32{0}}
+		shards := newFakeShards()
+		shards.version = version
+		a := newRewriteApplier(store, shards)
+		if _, err := a.RunOnce(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		got := store.get(t, m.ID)
+		if got.State != catalog.MigrationComplete {
+			t.Fatalf("v%d: state = %s error %q", version, got.State, got.Error)
+		}
+		if !has(shards.statements(0), want) {
+			t.Fatalf("v%d: never ran %q:\n%s", version, want, strings.Join(shards.statements(0), "\n"))
+		}
+	}
+}
+
+func TestSweepDropsRewriteArtifacts(t *testing.T) {
+	store := &memStore{shards: []int32{0}, dbs: []string{"app"}}
+	shards := newFakeShards()
+	shards.sweepDrops = []string{`DROP TRIGGER IF EXISTS "_pgshard_rw_deadbeef" ON "public"."orders"`,
+		`ALTER TABLE "public"."orders" DROP COLUMN IF EXISTS "_pgshard_amount_deadbeef"`}
+	a := newRewriteApplier(store, shards)
+	if _, err := a.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	sup := shards.superuserStatements(0)
+	for _, want := range shards.sweepDrops {
+		if !has(sup, want) {
+			t.Fatalf("sweep never ran %q:\n%s", want, strings.Join(sup, "\n"))
+		}
+	}
+}
+
+func TestRewriteTriggerSQLShapes(t *testing.T) {
+	rw := &catalog.RewriteChange{Schema: "public", Table: "orders", Column: "amount", NewType: "bigint",
+		Using: `CAST("amount" AS bigint)`}
+	stmts := rewriteTriggerSQL(rw, "00000000-0000-0000-0000-00000000ab06")
+	joined := strings.Join(stmts, "\n")
+	if !strings.Contains(joined, `NEW."_pgshard_amount_00000000" := (SELECT (CAST("amount" AS bigint)) FROM (SELECT (NEW).*) AS pgshard_row)`) {
+		t.Fatalf("type-form trigger body:\n%s", joined)
+	}
+	if !strings.Contains(joined, "BEFORE INSERT OR UPDATE ON") {
+		t.Fatalf("type-form events:\n%s", joined)
+	}
+	if got := backfillPredicate(rw, "_pgshard_amount_00000000"); got != `"_pgshard_amount_00000000" IS DISTINCT FROM (CAST("amount" AS bigint))` {
+		t.Fatalf("predicate %q", got)
+	}
+	add := &catalog.RewriteChange{Table: "orders", Column: "token", NewType: "uuid", Default: "gen_random_uuid()", Add: true}
+	if got := backfillPredicate(add, "_pgshard_token_00000000"); got != `"_pgshard_token_00000000" IS NULL` {
+		t.Fatalf("add predicate %q", got)
+	}
+}

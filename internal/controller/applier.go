@@ -39,6 +39,10 @@ type MigrationStore interface {
 	Save(ctx context.Context, m catalog.DDLMigration) error
 	// Shards lists the shard ids of a shard set.
 	Shards(ctx context.Context, shardSet string) ([]int32, error)
+	// Databases lists the logical databases of the catalog.
+	Databases(ctx context.Context) ([]string, error)
+	// SaveMeta rewrites the meta of a migration.
+	SaveMeta(ctx context.Context, id string, meta catalog.MigrationMeta) error
 	// Exec runs a catalog statement (desired-state mirroring).
 	Exec(ctx context.Context, sql string, args ...any) error
 }
@@ -65,6 +69,20 @@ func (s *PGMigrationStore) Shards(ctx context.Context, shardSet string) ([]int32
 		return nil, err
 	}
 	return pgx.CollectRows(rows, pgx.RowTo[int32])
+}
+
+// Databases implements MigrationStore.
+func (s *PGMigrationStore) Databases(ctx context.Context) ([]string, error) {
+	rows, err := s.Pool.Query(ctx, `SELECT name FROM pgshard.databases ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
+// SaveMeta implements MigrationStore.
+func (s *PGMigrationStore) SaveMeta(ctx context.Context, id string, meta catalog.MigrationMeta) error {
+	return catalog.SaveMigrationMeta(ctx, s.Pool, id, meta)
 }
 
 // Exec implements MigrationStore.
@@ -115,6 +133,9 @@ type Applier struct {
 	LockTimeout time.Duration
 	// Backoff defaults to DefaultBackoff.
 	Backoff Backoff
+	// RewriteSettle overrides DefaultRewriteSettle; negative disables the
+	// wait (tests).
+	RewriteSettle time.Duration
 	// Sleep overrides waiting between retries in tests.
 	Sleep func(ctx context.Context, d time.Duration) error
 	// Now overrides the clock in tests.
@@ -216,6 +237,11 @@ func (a *Applier) RunOnce(ctx context.Context) (int, error) {
 			a.logger().Warn("materializing roles on stale groups failed", "err", err)
 		}
 	}
+	if len(pending) == 0 {
+		if err := a.SweepRewriteArtifacts(ctx); err != nil && ctx.Err() == nil {
+			a.logger().Warn("sweeping rewrite artifacts failed", "err", err)
+		}
+	}
 	done := 0
 	for _, m := range pending {
 		if err := a.drive(ctx, m); err != nil {
@@ -246,6 +272,9 @@ func (a *Applier) drive(ctx context.Context, m catalog.DDLMigration) error {
 			return err
 		}
 		logger.Info("migration started", "shards", len(targets))
+	}
+	if m.Strategy == catalog.StrategyRewrite {
+		return a.driveRewrite(ctx, logger, &m)
 	}
 	for _, key := range sortedShardKeys(m.PerShard) {
 		s := m.PerShard[key]
@@ -528,9 +557,12 @@ func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, key string,
 			}
 		}
 	}
-	if m.Strategy == "concurrent" || outsideTransaction(m.Kind) {
+	switch {
+	case m.Meta.Repack:
+		err = a.repackStep(ctx, conn, m)
+	case m.Strategy == "concurrent" || outsideTransaction(m.Kind):
 		err = a.concurrently(ctx, conn, m)
-	} else {
+	default:
 		err = inTransaction(ctx, conn, m.Statement)
 	}
 	if err != nil {

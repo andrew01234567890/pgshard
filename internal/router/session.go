@@ -50,6 +50,9 @@ func (p prepared) shardSQL() string {
 	if p.plan.Sequences != nil {
 		return p.plan.Sequences.SQL
 	}
+	if p.plan.Rewritten != "" {
+		return p.plan.Rewritten
+	}
 	return p.sql
 }
 
@@ -402,6 +405,9 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 		if err := e.gateWrite(ctx); err != nil {
 			return e.afterBatch(ctx, err)
 		}
+	}
+	if pl.Rewritten != "" {
+		sql = pl.Rewritten
 	}
 	if isReferenceWrite(pl) {
 		return e.afterBatch(ctx, e.referenceWrite(ctx, pl, []*pgshardv1.ExecuteRequest{simpleQuery(sql)}, w))

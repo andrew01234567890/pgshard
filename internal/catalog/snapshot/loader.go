@@ -85,6 +85,26 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 			s.Tables[key] = Placement{Placement: t.Placement, Generation: t.DesiredGeneration}
 		}
 	}
+	rewrites, err := catalog.PendingRewrites(ctx, tx)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot: rewrites: %w", err)
+	}
+	for _, rw := range rewrites {
+		schema := rw.Rewrite.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		key := TableKey{rw.Database, schema, rw.Rewrite.Table}
+		p, ok := s.Tables[key]
+		if !ok {
+			continue
+		}
+		p.HiddenColumns = append(p.HiddenColumns, rw.Rewrite.HiddenColumn(rw.ID))
+		if len(rw.Rewrite.Columns) > 0 {
+			p.VisibleColumns = rw.Rewrite.Columns
+		}
+		s.Tables[key] = p
+	}
 	fence, err := catalog.ReadWriteFence(ctx, tx)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot: write fence: %w", err)
