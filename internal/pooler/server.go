@@ -128,8 +128,6 @@ func (s *Server) Execute(stream pgshardv1.Pooler_ExecuteServer) error {
 	ck, sk := append([]byte(nil), first.User.ScramClientKey...), append([]byte(nil), first.User.ScramServerKey...)
 	zero(first.User.ScramClientKey)
 	zero(first.User.ScramServerKey)
-	defer zero(ck)
-	defer zero(sk)
 	if s.draining.Load() {
 		return errUnavailable
 	}
@@ -146,6 +144,9 @@ func (s *Server) Execute(stream pgshardv1.Pooler_ExecuteServer) error {
 	se.database = s.cfg.Database
 	s.mu.Unlock()
 	defer s.detach(se)
+	// Zeroise the working key copies before the session is detached, so a
+	// caller that observes the session gone also observes the zeroed keys.
+	defer func() { zero(ck); zero(sk) }()
 
 	rs := &relay{srv: s, se: se, stream: stream, ck: ck, sk: sk}
 	req := first
