@@ -27,9 +27,11 @@ const (
 	postgresUID     = int64(999)
 	// pgSocketDir is the agent's fixed unix_socket_directories; the pooler
 	// sidecar reaches the local server through it over a shared emptyDir.
-	pgSocketDir     = "/tmp"
-	poolerGRPCPort  = int32(9091)
-	poolerContainer = "pooler"
+	pgSocketDir    = "/tmp"
+	poolerGRPCPort = int32(9091)
+	// poolerMetricsPort serves the pooler sidecar's /metrics.
+	poolerMetricsPort = int32(9127)
+	poolerContainer   = "pooler"
 	// agentShutdownTimeout bounds the smart shutdown on SIGTERM so a planned
 	// switchover pauses for seconds, not the pod grace period.
 	agentShutdownTimeout = 5 * time.Second
@@ -326,7 +328,8 @@ func (Renderer) Pod(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, rol
 	name := g.MemberName(ordinal)
 	uid := postgresUID
 	meta := objectMeta(g, name, c.Namespace, map[string]string{LabelOrdinal: strconv.Itoa(ordinal), LabelRole: role})
-	meta.Annotations = map[string]string{AnnotationTemplateHash: tpl.Hash(), AnnotationSettingsHash: tpl.SettingsHash()}
+	meta.Annotations = map[string]string{AnnotationTemplateHash: tpl.Hash(), AnnotationSettingsHash: tpl.SettingsHash(),
+		AnnotationScrape: "true", AnnotationScrapePort: strconv.Itoa(agentHTTPPort), AnnotationScrapePath: "/metrics"}
 	pod := &corev1.Pod{
 		ObjectMeta: meta,
 		Spec: corev1.PodSpec{
@@ -387,6 +390,7 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 		Command: []string{"pgshard-pooler"},
 		Args: []string{"run",
 			"--listen", fmt.Sprintf(":%d", poolerGRPCPort),
+			"--metrics-listen", fmt.Sprintf(":%d", poolerMetricsPort),
 			"--pg-socket-dir", pgSocketDir,
 			"--catalog-dsn", CatalogDSN(c),
 			"--shard-set", shardSet,
@@ -397,6 +401,7 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 			LocalObjectReference: corev1.LocalObjectReference{Name: SecretName(c.Name)}, Key: secretKey}}}},
 		Ports: []corev1.ContainerPort{
 			{Name: "pooler-grpc", ContainerPort: poolerGRPCPort},
+			{Name: "pooler-metrics", ContainerPort: poolerMetricsPort},
 		},
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler:  corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt32(poolerGRPCPort)}},

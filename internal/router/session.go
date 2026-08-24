@@ -264,11 +264,23 @@ func (e *Executor) planSession() plan.Session {
 // DDL directly on their home shard: the migration model covers the
 // databases of the default shard set only.
 func (e *Executor) plan(ctx context.Context, sql string) (plan.Plan, error) {
+	return e.planOp(ctx, sql, "simple")
+}
+
+func (e *Executor) planOp(ctx context.Context, sql, opcode string) (plan.Plan, error) {
 	pl, err := e.r.cfg.Planner.Plan(ctx, e.planSession(), sql)
 	if err == nil && pl.Kind == plan.MigrationKind && e.home.Set != DefaultShardSet {
 		pl.Kind, pl.Shards, pl.Migration = plan.Unsharded, []int32{e.home.ID}, nil
 	}
-	return pl, err
+	if err != nil {
+		var perr *pgwire.Error
+		if errors.As(err, &perr) {
+			e.r.metrics.Refusals.WithLabelValues(perr.Code).Inc()
+		}
+		return pl, err
+	}
+	e.r.metrics.Queries.WithLabelValues(pl.Kind.String(), opcode).Inc()
+	return pl, nil
 }
 
 // target turns a resolved plan into the one shard the executor can run it
@@ -627,7 +639,7 @@ func (e *Executor) parse(ctx context.Context, name, sql string, paramOIDs []uint
 	if e.batchFailed {
 		return nil
 	}
-	pl, err := e.plan(ctx, sql)
+	pl, err := e.planOp(ctx, sql, "parse")
 	if err == nil {
 		err = checkTransactionMode(pl.Class)
 	}
@@ -734,7 +746,7 @@ func (e *Executor) bind(ctx context.Context, portal, statement string, paramForm
 		return nil
 	}
 	if st, ok := e.stmts[statement]; ok && st.snap != e.currentSnapshot() {
-		pl, err := e.plan(ctx, st.sql)
+		pl, err := e.planOp(ctx, st.sql, "parse")
 		if err == nil && sequenceShape(pl) != sequenceShape(st.plan) {
 			perr := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "the sequence columns of the table changed since statement %q was prepared", statement)
 			perr.Hint = "prepare the statement again"
@@ -1176,6 +1188,10 @@ func (r *refusedError) Unwrap() error { return r.error }
 // pump relays responses until ReadyForQuery. Errors from the backend are
 // returned after the batch is drained so pgwire reports them itself.
 func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
+	start := time.Now()
+	defer func() {
+		e.r.metrics.ShardLatency.WithLabelValues(fmt.Sprintf("%s/%d", e.shard.Set, e.shard.ID)).Observe(time.Since(start).Seconds())
+	}()
 	var firstErr error
 	e.cancelSent.Store(false)
 	onCancel := func() { e.cancelBackend(context.Background()) }

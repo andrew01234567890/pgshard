@@ -195,6 +195,9 @@ func (r *ClusterReconciler) rollout(ctx context.Context, c *pgshardv1alpha1.PgSh
 			reloadList = append(reloadList, name)
 		}
 	}
+	if r.Metrics != nil {
+		r.Metrics.RollingUpdates.WithLabelValues(c.Namespace + "/" + c.Name).Set(float64(len(restartList)))
+	}
 	storage, err := r.classifyMemberStorage(ctx, c, g, obs.state)
 	if err != nil {
 		return err

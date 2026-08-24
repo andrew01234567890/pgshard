@@ -468,6 +468,7 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 			}
 			return e.runOn(ctx, p, "ROLLBACK", discardWriter{})
 		})
+		e.r.metrics.TwoPCAborts.Inc()
 		if aerr := log.Abort(ctx, gid); aerr != nil {
 			e.r.cfg.Logger.Warn("two-phase commit: recording abort failed; the resolver will finish it", "gid", gid, "err", aerr)
 		} else if firstError(writers) == nil {
@@ -480,6 +481,7 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 	decided, err := log.Commit(ctx, gid)
 	if err != nil {
 		e.r.inDoubt.Add(1)
+		e.r.metrics.TwoPCInDoubt.Inc()
 		e.finishTxn("")
 		e.r.cfg.Logger.Warn("two-phase commit: decision unknown, participants left prepared for the resolver", "gid", gid, "err", err)
 		perr := pgwire.Errorf(codeInDoubt, "two-phase commit: the outcome of transaction %s is unknown: %v", gid, err)
@@ -491,9 +493,11 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 			return e.runOn(ctx, p, "ROLLBACK PREPARED "+quoteLiteral(gid), discardWriter{})
 		})
 		e.finishTxn("ROLLBACK")
+		e.r.metrics.TwoPCAborts.Inc()
 		return pgwire.Errorf(codeTxnRollback, "two-phase commit: transaction %s was aborted by the resolver before it was decided", gid)
 	}
 	crashpoint.Hit("after_decision")
+	e.r.metrics.TwoPCCommits.Inc()
 	commitPrepared := func(p *txnPart) error {
 		return e.runOn(ctx, p, "COMMIT PREPARED "+quoteLiteral(gid), discardWriter{})
 	}
@@ -502,6 +506,7 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 	e.each(writers[1:], commitPrepared)
 	if err := firstError(writers); err != nil {
 		e.r.inDoubt.Add(1)
+		e.r.metrics.TwoPCInDoubt.Inc()
 		e.r.cfg.Logger.Warn("two-phase commit: COMMIT PREPARED failed after the commit decision; the resolver will finish it", "gid", gid, "err", err)
 	} else if err := log.Delete(ctx, gid); err != nil {
 		e.r.cfg.Logger.Warn("two-phase commit: deleting the decision row failed", "gid", gid, "err", err)

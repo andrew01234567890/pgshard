@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 
+	"github.com/andrew01234567890/pgshard/internal/pgparser"
 	"github.com/andrew01234567890/pgshard/internal/router/plan"
 )
 
@@ -32,6 +33,12 @@ type Planner struct {
 
 // NewPlanner builds a Planner with a bounded parse cache.
 func NewPlanner() *Planner { return &Planner{inner: plan.New()} }
+
+// NewPlannerWithMetrics builds a Planner whose parse cache reports hits and
+// misses to m.
+func NewPlannerWithMetrics(m pgparser.Metrics) *Planner {
+	return &Planner{inner: plan.NewWithMetrics(m)}
+}
 
 // Plan plans sql for a session of the router; sessions on the catalog shard
 // set plan every statement onto the catalog shard.

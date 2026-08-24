@@ -18,6 +18,11 @@ type PoolConfig struct {
 	MaxLifetime time.Duration
 	// MaxIdleTime closes an idle backend after this long unused; zero means never.
 	MaxIdleTime time.Duration
+	// OnDial observes every backend dial attempt and its outcome.
+	OnDial func(err error)
+	// OnWait observes acquires that could not use an idle backend or a
+	// free budget slot immediately.
+	OnWait func()
 	// AcquireTimeout bounds waiting for a budget slot; zero means 5s.
 	AcquireTimeout time.Duration
 }
@@ -101,8 +106,15 @@ func (p *Pool) Acquire(ctx context.Context, database, role string, clientKey, se
 	}
 	ctx, cancel := context.WithTimeout(ctx, p.cfg.AcquireTimeout)
 	defer cancel()
-	if err := acquireSlot(ctx, rp.sem); err != nil {
-		return nil, err
+	select {
+	case rp.sem <- struct{}{}:
+	default:
+		if p.cfg.OnWait != nil {
+			p.cfg.OnWait()
+		}
+		if err := acquireSlot(ctx, rp.sem); err != nil {
+			return nil, err
+		}
 	}
 	if err := p.acquireTotal(ctx); err != nil {
 		<-rp.sem
@@ -116,6 +128,9 @@ func (p *Pool) Acquire(ctx context.Context, database, role string, clientKey, se
 		return nil, ErrPoolClosed
 	}
 	b, err := p.dial(ctx, database, role, clientKey, serverKey)
+	if p.cfg.OnDial != nil {
+		p.cfg.OnDial(err)
+	}
 	if err != nil {
 		p.free(rp)
 		return nil, err

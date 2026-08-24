@@ -9,7 +9,10 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+
+	"github.com/andrew01234567890/pgshard/internal/metrics"
 )
 
 // Options configures the operator manager.
@@ -70,7 +73,8 @@ func Run(ctx context.Context, o Options) error {
 	if err != nil {
 		return fmt.Errorf("new manager: %w", err)
 	}
-	r := &ClusterReconciler{Client: mgr.GetClient(), Renderer: Renderer{AdminImage: o.AdminImage, RouterImage: o.RouterImage}, Prober: boundedProber{Inner: PgxProber{}}, Agents: GRPCAgentClient{}}
+	r := &ClusterReconciler{Client: mgr.GetClient(), Renderer: Renderer{AdminImage: o.AdminImage, RouterImage: o.RouterImage}, Prober: boundedProber{Inner: PgxProber{}}, Agents: GRPCAgentClient{},
+		Metrics: metrics.NewOperator(ctrlmetrics.Registry)}
 	if err := r.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup reconciler: %w", err)
 	}

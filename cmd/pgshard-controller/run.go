@@ -26,6 +26,7 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/cli"
 	"github.com/andrew01234567890/pgshard/internal/controller"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
+	pgmetrics "github.com/andrew01234567890/pgshard/internal/metrics"
 )
 
 func run(args []string, stdout, stderr io.Writer) int {
@@ -42,6 +43,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	fs.SetOutput(stderr)
 	catalogDSN := fs.String("catalog-dsn", "", "catalog DSN with pgshard_system privileges (required)")
 	listen := fs.String("listen", "127.0.0.1:15500", "gRPC address for the Controller service (empty disables)")
+	metricsListen := fs.String("metrics-listen", "", "HTTP address for /metrics (empty disables)")
 	certFile := fs.String("tls-cert", "", "server certificate for the gRPC listener (mTLS)")
 	keyFile := fs.String("tls-key", "", "server private key")
 	caFile := fs.String("tls-ca", "", "CA bundle that client certificates must chain to")
@@ -93,6 +95,17 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return cli.ExitNotReady
 	}
 
+	reg := pgmetrics.NewRegistry("controller")
+	cm := pgmetrics.NewController(reg)
+	if *metricsListen != "" {
+		go func() {
+			if err := pgmetrics.Serve(ctx, *metricsListen, reg); err != nil {
+				logger.Error("metrics listener stopped", "err", err)
+			}
+		}()
+	}
+	go (&controller.MetricsPoller{Pool: pool, Metrics: cm, Logger: logger}).Run(ctx, *interval)
+
 	var leader atomic.Bool
 	rec := &controller.Reconciler{DSN: *catalogDSN, Logger: logger, LockKey: *lockKey, Interval: *interval, RetryInterval: *retry,
 		OnLeader: leader.Store}
@@ -102,7 +115,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	var streams *controller.StreamAdmin
 	if *shardDSNTemplate != "" || len(shardDSNs) > 0 {
 		dialer := &controller.PgxShardDialer{Pool: pool, DSNs: shardDSNs, Template: *shardDSNTemplate}
-		resolver = &controller.Resolver{Pool: pool, Logger: logger, Shards: dialer}
+		resolver = &controller.Resolver{Pool: pool, Logger: logger, Shards: dialer, Metrics: cm}
 		streams = &controller.StreamAdmin{Pool: pool, Shards: dialer}
 		go resolver.Run(ctx, *resolveEvery)
 		barrier = &controller.Barrier{Store: &controller.PGBarrierStore{Pool: pool}, Groups: &controller.SQLBarrierGroups{Pool: pool, Shards: dialer},

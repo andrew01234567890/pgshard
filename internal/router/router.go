@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/andrew01234567890/pgshard/internal/metrics"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
 )
 
@@ -48,8 +49,10 @@ type CancelForwarder interface {
 // Router creates executors for authenticated sessions and dispatches cancel
 // requests to the pooler serving each session.
 type Router struct {
-	cfg    Config
-	prefix string
+	cfg      Config
+	prefix   string
+	metrics  *metrics.Router
+	mhandler http.Handler
 
 	scatter *scatterSlots
 
@@ -72,9 +75,6 @@ func New(cfg Config) (*Router, error) {
 	if cfg.Snapshot == nil || cfg.Poolers == nil {
 		return nil, fmt.Errorf("router: Snapshot and Poolers are required")
 	}
-	if cfg.Planner == nil {
-		cfg.Planner = NewPlanner()
-	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
 	}
@@ -87,8 +87,15 @@ func New(cfg Config) (*Router, error) {
 	if _, err := rand.Read(b[:]); err != nil {
 		return nil, err
 	}
-	return &Router{cfg: cfg, prefix: hex.EncodeToString(b[:]), scatter: newScatterSlots(cfg.Scatter.MaxStreams),
-		sessions: map[uint64]*Executor{}, buffered: map[Shard]int{}, prepared: map[Shard]bool{}}, nil
+	rt := &Router{cfg: cfg, prefix: hex.EncodeToString(b[:]), scatter: newScatterSlots(cfg.Scatter.MaxStreams),
+		sessions: map[uint64]*Executor{}, buffered: map[Shard]int{}, prepared: map[Shard]bool{}}
+	reg := metrics.NewRegistry("router")
+	rt.metrics = metrics.NewRouter(reg, func() float64 { return float64(rt.Sessions()) })
+	rt.mhandler = metrics.Handler(reg)
+	if rt.cfg.Planner == nil {
+		rt.cfg.Planner = NewPlannerWithMetrics(rt.metrics)
+	}
+	return rt, nil
 }
 
 func (r *Router) preparedCapacity(sh Shard) (ok, known bool) {
@@ -108,14 +115,8 @@ func (r *Router) setPreparedCapacity(sh Shard, ok bool) {
 // resolver since it started.
 func (r *Router) InDoubt() int64 { return r.inDoubt.Load() }
 
-// MetricsHandler serves the router's counters in the Prometheus text format.
-func (r *Router) MetricsHandler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-		fmt.Fprintf(w, "# TYPE pgshard_router_in_doubt_transactions_total counter\npgshard_router_in_doubt_transactions_total %d\n", r.InDoubt())
-		fmt.Fprintf(w, "# TYPE pgshard_router_sessions gauge\npgshard_router_sessions %d\n", r.Sessions())
-	})
-}
+// MetricsHandler serves the router's registry in the Prometheus text format.
+func (r *Router) MetricsHandler() http.Handler { return r.mhandler }
 
 // NewExecutor implements pgwire.Config.NewExecutor: it resolves the session's
 // database to its home shard and refuses databases the catalog does not know
@@ -129,6 +130,7 @@ func (r *Router) NewExecutor(info pgwire.SessionInfo) (pgwire.Executor, error) {
 		return nil, err
 	}
 	e := newExecutor(r, info, home)
+	r.metrics.Connections.Inc()
 	r.mu.Lock()
 	r.sessions[info.ID] = e
 	r.mu.Unlock()

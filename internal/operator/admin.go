@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -63,7 +64,8 @@ func (r Renderer) AdminDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.Dep
 			Replicas: &replicas,
 			Selector: &metav1.LabelSelector{MatchLabels: labels},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				ObjectMeta: metav1.ObjectMeta{Labels: labels, Annotations: map[string]string{
+					AnnotationScrape: "true", AnnotationScrapePort: strconv.Itoa(adminPort), AnnotationScrapePath: "/metrics"}},
 				Spec: corev1.PodSpec{
 					ServiceAccountName: AdminName(c.Name),
 					SecurityContext:    &corev1.PodSecurityContext{RunAsNonRoot: ptr.To(true), SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}},
