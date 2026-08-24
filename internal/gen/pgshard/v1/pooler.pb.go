@@ -1018,6 +1018,10 @@ type ExecuteRequest struct {
 	Generation *Generation `protobuf:"bytes,2,opt,name=generation,proto3" json:"generation,omitempty"`
 	// Authenticated user; sent on the first message of a session.
 	User *UserIdentity `protobuf:"bytes,3,opt,name=user,proto3" json:"user,omitempty"`
+	// Logical database the session executes against; sent on the first
+	// message of a session. Empty falls back to the pooler's configured
+	// default database.
+	Database string `protobuf:"bytes,4,opt,name=database,proto3" json:"database,omitempty"`
 	// Exactly one pgwire-shaped message.
 	//
 	// Types that are valid to be assigned to Message:
@@ -1087,6 +1091,13 @@ func (x *ExecuteRequest) GetUser() *UserIdentity {
 		return x.User
 	}
 	return nil
+}
+
+func (x *ExecuteRequest) GetDatabase() string {
+	if x != nil {
+		return x.Database
+	}
+	return ""
 }
 
 func (x *ExecuteRequest) GetMessage() isExecuteRequest_Message {
@@ -5080,14 +5091,15 @@ const file_pgshard_v1_pooler_proto_rawDesc = "" +
 	"\rCancelRequest\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\"\x10\n" +
-	"\x0eCancelResponse\"\xc3\x05\n" +
+	"\x0eCancelResponse\"\xdf\x05\n" +
 	"\x0eExecuteRequest\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x126\n" +
 	"\n" +
 	"generation\x18\x02 \x01(\v2\x16.pgshard.v1.GenerationR\n" +
 	"generation\x12,\n" +
-	"\x04user\x18\x03 \x01(\v2\x18.pgshard.v1.UserIdentityR\x04user\x12<\n" +
+	"\x04user\x18\x03 \x01(\v2\x18.pgshard.v1.UserIdentityR\x04user\x12\x1a\n" +
+	"\bdatabase\x18\x04 \x01(\tR\bdatabase\x12<\n" +
 	"\fsimple_query\x18\n" +
 	" \x01(\v2\x17.pgshard.v1.SimpleQueryH\x00R\vsimpleQuery\x12)\n" +
 	"\x05parse\x18\v \x01(\v2\x11.pgshard.v1.ParseH\x00R\x05parse\x12&\n" +

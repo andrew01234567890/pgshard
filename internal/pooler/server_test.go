@@ -590,20 +590,20 @@ func TestCreatesPrepared(t *testing.T) {
 
 func TestAttachSessionIsAtomicWithLookup(t *testing.T) {
 	s := NewServer(Config{Logger: slog.New(slog.DiscardHandler)})
-	se, err := s.attachSession("x", "alice")
+	se, err := s.attachSession("x", "alice", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := s.lookup("x"); got != se {
 		t.Fatal("attachSession returned a session that is not the registered one")
 	}
-	if _, err := s.attachSession("x", "alice"); status.Code(err) != codes.FailedPrecondition {
+	if _, err := s.attachSession("x", "alice", ""); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("second attach = %v, want FailedPrecondition", err)
 	}
 	var se2 *session
 	var err2 error
 	s.detachUnlocked = func() {
-		se2, err2 = s.attachSession("x", "alice")
+		se2, err2 = s.attachSession("x", "alice", "")
 	}
 	s.detach(se)
 	if err2 != nil {
@@ -643,5 +643,49 @@ func TestExpiryClaimsTheBackendUnderTheLock(t *testing.T) {
 	}
 	if _, idle := h.srv.cfg.Pool.Stats(); idle != 1 {
 		t.Fatalf("idle = %d, want exactly one backend back in the pool", idle)
+	}
+}
+
+func databaseQueryReq(session, database string, g *pgshardv1.Generation, user *pgshardv1.UserIdentity) *pgshardv1.ExecuteRequest {
+	req := queryReq(session, "select 1", g, user)
+	req.Database = database
+	return req
+}
+
+func TestSessionsDialTheirOwnDatabase(t *testing.T) {
+	h := startHarness(t, PoolConfig{})
+	ctx := context.Background()
+	a, _ := h.client.Execute(ctx)
+	b, _ := h.client.Execute(ctx)
+	c, _ := h.client.Execute(ctx)
+	roundTrip(t, a, databaseQueryReq("a", "db1", gen(7, 3), identity("alice")))
+	roundTrip(t, b, databaseQueryReq("b", "db2", gen(7, 3), identity("alice")))
+	roundTrip(t, c, queryReq("c", "select 1", gen(7, 3), identity("alice")))
+	h.pg.mu.Lock()
+	dialed := append([]string(nil), h.pg.dialed...)
+	h.pg.mu.Unlock()
+	want := []string{"db1", "db2", "app"}
+	if len(dialed) != 3 || dialed[0] != want[0] || dialed[1] != want[1] || dialed[2] != want[2] {
+		t.Fatalf("dialed = %v, want %v", dialed, want)
+	}
+}
+
+func TestIdleBackendIsNeverReusedAcrossDatabases(t *testing.T) {
+	h := startHarness(t, PoolConfig{})
+	ctx := context.Background()
+	a, _ := h.client.Execute(ctx)
+	roundTrip(t, a, databaseQueryReq("a", "db1", gen(7, 3), identity("alice")))
+	_ = a.CloseSend()
+	waitFor(t, func() bool { return !h.attached() })
+	b, _ := h.client.Execute(ctx)
+	roundTrip(t, b, databaseQueryReq("b", "db2", gen(7, 3), identity("alice")))
+	if d := h.pg.dials.Load(); d != 2 {
+		t.Fatalf("dials = %d, want 2 (a db1 backend must not serve db2)", d)
+	}
+	h.pg.mu.Lock()
+	second := h.pg.dialed[1]
+	h.pg.mu.Unlock()
+	if second != "db2" {
+		t.Fatalf("second dial went to %q, want db2", second)
 	}
 }

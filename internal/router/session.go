@@ -1235,7 +1235,7 @@ func (e *Executor) replayStatements(ctx context.Context, skip map[string]bool) e
 }
 
 func (e *Executor) send(req *pgshardv1.ExecuteRequest) error {
-	if err := e.conn.send(req, e.sid, e.generation(), e.ident); err != nil {
+	if err := e.conn.send(req, e.sid, e.generation(), e.ident, e.info.Database); err != nil {
 		return e.poolerLost(err)
 	}
 	return nil

@@ -257,7 +257,7 @@ func (e *Executor) runScatter(ctx context.Context, shards []int32, m *plan.Merge
 		parts = append(parts, p)
 		gen := e.r.cfg.Poolers.Generation(sh)
 		for _, req := range reqs {
-			if err := ps.send(cloneRequest(req), p.sid, gen, e.ident); err != nil {
+			if err := ps.send(cloneRequest(req), p.sid, gen, e.ident, e.info.Database); err != nil {
 				return pgwire.Errorf(codeConnectionFailure, "pooler connection lost: %v", err)
 			}
 		}

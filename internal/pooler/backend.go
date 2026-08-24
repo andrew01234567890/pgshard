@@ -73,6 +73,7 @@ type Backend struct {
 	conn     net.Conn
 	fe       *pgproto3.Frontend
 	role     string
+	database string
 	pid      uint32
 	secret   []byte
 	born     time.Time
@@ -99,7 +100,7 @@ func dialBackend(ctx context.Context, d Dialer, database, role string, clientKey
 	if err != nil {
 		return nil, err
 	}
-	b := &Backend{conn: conn, role: role, born: time.Now(), txStatus: 'I'}
+	b := &Backend{conn: conn, role: role, database: database, born: time.Now(), txStatus: 'I'}
 	b.fe = pgproto3.NewFrontend(bufio.NewReader(conn), conn)
 	if dl, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(dl)
@@ -172,11 +173,23 @@ func (b *Backend) authenticate(database, role string, clientKey, serverKey []byt
 			b.txStatus = m.TxStatus
 			return nil
 		case *pgproto3.ErrorResponse:
-			return fmt.Errorf("backend refused connection: %s: %s", m.Code, m.Message)
+			return &startupError{code: m.Code, message: m.Message}
 		default:
 			return fmt.Errorf("unexpected startup message %T", msg)
 		}
 	}
+}
+
+// startupError is a refusal PostgreSQL sent during connection startup, such
+// as 3D000 for a database that does not exist; it keeps the SQLSTATE so the
+// pooler can report it to the router verbatim.
+type startupError struct {
+	code    string
+	message string
+}
+
+func (e *startupError) Error() string {
+	return fmt.Sprintf("backend refused connection: %s: %s", e.code, e.message)
 }
 
 func contains(xs []string, s string) bool {
