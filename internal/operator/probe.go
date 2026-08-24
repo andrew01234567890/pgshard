@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -59,6 +60,9 @@ type Prober interface {
 	// ReshardWorkflow returns the active reshard workflow of a shard set;
 	// an empty ID means none exists.
 	ReshardWorkflow(ctx context.Context, dsn, shardSet string) (WorkflowInfo, error)
+	// SetReshardCutoverSpec mirrors spec.resharding and the proceed
+	// annotation into the workflow spec the controller's cutover reads.
+	SetReshardCutoverSpec(ctx context.Context, dsn, workflowID, pauseBefore string, proceed []string, retireAfterSeconds int64) error
 	// EnsureSlots creates the missing physical slots in want on the primary
 	// and drops an inactive slot named drop (the primary's own, inherited
 	// from its time as a standby, which would otherwise pin WAL forever).
@@ -160,6 +164,9 @@ func (PgxProber) PublishShardStatus(ctx context.Context, dsn string, g Group, ep
 	if g.NonServing {
 		state = "provisioning"
 	}
+	if g.Retired {
+		state = "retired"
+	}
 	_, err = conn.Exec(ctx, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch, primary_endpoint)
 		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (shard_set, shard_id) DO UPDATE
@@ -184,6 +191,9 @@ type WorkflowInfo struct {
 	State   string
 	Stage   string
 	Message string
+	// CutoverPauseMS is status.cutover.pause_ms: fence raised to new map
+	// published; zero before the switch.
+	CutoverPauseMS int64
 }
 
 // ShardSets lists the catalog shard sets and their ranges.
@@ -232,12 +242,34 @@ func (PgxProber) ReshardWorkflow(ctx context.Context, dsn, shardSet string) (Wor
 	}
 	defer func() { _ = conn.Close(ctx) }()
 	var w WorkflowInfo
-	err = conn.QueryRow(ctx, `SELECT id::text, state, coalesce(status->>'stage', ''), coalesce(status->>'message', '') FROM pgshard.workflows
-		WHERE kind = 'reshard' AND spec->>'shard_set' = $1 ORDER BY created_at DESC LIMIT 1`, shardSet).Scan(&w.ID, &w.State, &w.Stage, &w.Message)
+	err = conn.QueryRow(ctx, `SELECT id::text, state, coalesce(status->>'stage', ''), coalesce(status->>'message', ''),
+			coalesce((status->'cutover'->>'pause_ms')::bigint, 0) FROM pgshard.workflows
+		WHERE kind = 'reshard' AND spec->>'shard_set' = $1 ORDER BY created_at DESC LIMIT 1`, shardSet).Scan(&w.ID, &w.State, &w.Stage, &w.Message, &w.CutoverPauseMS)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return WorkflowInfo{}, nil
 	}
 	return w, err
+}
+
+// SetReshardCutoverSpec merges the cutover keys into the workflow spec.
+func (PgxProber) SetReshardCutoverSpec(ctx context.Context, dsn, workflowID, pauseBefore string, proceed []string, retireAfterSeconds int64) error {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if pauseBefore == "none" {
+		pauseBefore = ""
+	}
+	if proceed == nil {
+		proceed = []string{}
+	}
+	body, err := json.Marshal(map[string]any{"pause_before": pauseBefore, "proceed": proceed, "retire_after_seconds": retireAfterSeconds})
+	if err != nil {
+		return err
+	}
+	_, err = conn.Exec(ctx, `UPDATE pgshard.workflows SET spec = spec || $2::jsonb, updated_at = now() WHERE id = $1::uuid`, workflowID, body)
+	return err
 }
 
 func inTx(ctx context.Context, dsn string, fn func(pgx.Tx) error) error {
@@ -409,6 +441,12 @@ func (b boundedProber) ReshardWorkflow(ctx context.Context, dsn, shardSet string
 	ctx, cancel := b.bound(ctx)
 	defer cancel()
 	return b.Inner.ReshardWorkflow(ctx, dsn, shardSet)
+}
+
+func (b boundedProber) SetReshardCutoverSpec(ctx context.Context, dsn, workflowID, pauseBefore string, proceed []string, retireAfterSeconds int64) error {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.SetReshardCutoverSpec(ctx, dsn, workflowID, pauseBefore, proceed, retireAfterSeconds)
 }
 
 func (b boundedProber) EnsureSlots(ctx context.Context, dsn string, want []string, drop string) error {

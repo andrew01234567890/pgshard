@@ -118,3 +118,21 @@ func DropShardSet(ctx context.Context, tx pgx.Tx, name string) error {
 	}
 	return nil
 }
+
+// ServingShardSet returns the name of the serving shard set with the highest
+// generation: the map routers route by. Before any set is materialized it
+// is DefaultShardSet.
+func ServingShardSet(ctx context.Context, q Querier) (string, error) {
+	rows, err := q.Query(ctx, `SELECT shard_set FROM pgshard.shard_sets WHERE state = $1 ORDER BY generation DESC LIMIT 1`, ShardSetServing)
+	if err != nil {
+		return "", err
+	}
+	names, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return "", err
+	}
+	if len(names) == 0 {
+		return DefaultShardSet, nil
+	}
+	return names[0], nil
+}

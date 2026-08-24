@@ -1,6 +1,7 @@
 package pooler
 
 import (
+	"strings"
 	"sync/atomic"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
@@ -15,6 +16,9 @@ type View struct {
 	Role       pgshardv1.HealthStatus_Role
 	LagBytes   uint64
 	Serving    bool
+	// Migrating is set while a reshard cutover fences the shard's ranges:
+	// new PREPARE TRANSACTIONs are refused so the sources drain.
+	Migrating bool
 }
 
 // Source supplies the View. The agent/operator will drive it later; today it
@@ -59,8 +63,36 @@ func (s *SnapshotSource) View() View {
 	v.Generation = uint64(snap.ShardMapGeneration)
 	if sv, ok := snap.Serving[s.Shard]; ok {
 		v.Epoch = uint64(sv.Epoch)
+		v.Migrating = sv.Migrating
 	}
 	return v
+}
+
+// migratingSQLState is cannot_connect_now: the request must be retried once
+// the cutover released the fence.
+const migratingSQLState = "57P03"
+
+// fenceMigrating refuses a new PREPARE TRANSACTION on a migrating shard; every
+// other statement (reads, the commit or rollback of an already prepared
+// transaction, the writes of a transaction the router let finish) passes.
+func fenceMigrating(v View, req *pgshardv1.ExecuteRequest) *pgshardv1.Error {
+	if !v.Migrating {
+		return nil
+	}
+	q, ok := req.Message.(*pgshardv1.ExecuteRequest_SimpleQuery)
+	if !ok || !isPrepareTransaction(q.SimpleQuery.Sql) {
+		return nil
+	}
+	return &pgshardv1.Error{Sqlstate: migratingSQLState, Message: "shard is migrating: new prepared transactions are refused",
+		Hint: "retry the transaction once the reshard cutover published the new shard map"}
+}
+
+func isPrepareTransaction(sql string) bool {
+	s := strings.TrimLeft(sql, " \t\r\n(")
+	if len(s) < len("PREPARE TRANSACTION") {
+		return false
+	}
+	return strings.EqualFold(s[:len("PREPARE TRANSACTION")], "PREPARE TRANSACTION")
 }
 
 // SQLSTATE 55000 (object_not_in_prerequisite_state) marks fencing refusals.

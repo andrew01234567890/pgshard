@@ -236,7 +236,7 @@ func (e *Executor) runScatter(ctx context.Context, shards []int32, m *plan.Merge
 		}
 	}()
 	for _, id := range shards {
-		sh := Shard{Set: e.home.Set, ID: id}
+		sh := Shard{Set: e.userSet(), ID: id}
 		if e.r.blocking(sh) {
 			if ok, err := e.r.awaitConsistent(ctx, sh, false, e.r.cfg.Buffering.Window); err != nil {
 				return err

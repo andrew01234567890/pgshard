@@ -820,6 +820,11 @@ func (in *PgShardReshardStatus) DeepCopyInto(out *PgShardReshardStatus) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
+	if in.CutoverPause != nil {
+		in, out := &in.CutoverPause, &out.CutoverPause
+		*out = new(metav1.Duration)
+		**out = **in
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]metav1.Condition, len(*in))

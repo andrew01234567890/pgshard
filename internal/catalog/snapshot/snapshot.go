@@ -29,6 +29,9 @@ type Serving struct {
 	PrimaryEndpoint string
 	Epoch           int64
 	State           string
+	// Migrating is set on a source shard while a reshard cutover fences
+	// its ranges: routers hold new writes, poolers refuse new PREPAREs.
+	Migrating bool
 }
 
 // TableKey identifies a table within a logical database.
@@ -61,10 +64,12 @@ type Placement struct {
 type Snapshot struct {
 	ShardMapGeneration int64
 	DesiredGeneration  int64
-	ShardSets          map[string][]Range
-	Serving            map[ShardKey]Serving
-	Databases          map[string]catalog.Database
-	Tables             map[TableKey]Placement
+	// ServingSet names the shard set routers route user data by.
+	ServingSet string
+	ShardSets  map[string][]Range
+	Serving    map[ShardKey]Serving
+	Databases  map[string]catalog.Database
+	Tables     map[TableKey]Placement
 	// Sequences names the rows of pgshard.sequences, the global sequences
 	// the router answers nextval() for.
 	Sequences map[string]bool
@@ -79,6 +84,26 @@ type Snapshot struct {
 func (s *Snapshot) Resharding() bool {
 	for _, sv := range s.Serving {
 		if sv.State == "provisioning" {
+			return true
+		}
+	}
+	return false
+}
+
+// ServingShardSet is ServingSet, or the default set when the snapshot was
+// built without one.
+func (s *Snapshot) ServingShardSet() string {
+	if s.ServingSet == "" {
+		return catalog.DefaultShardSet
+	}
+	return s.ServingSet
+}
+
+// Migrating reports whether any shard of the serving set is fenced by a
+// reshard cutover; routers hold new writes meanwhile.
+func (s *Snapshot) Migrating() bool {
+	for k, sv := range s.Serving {
+		if k.ShardSet == s.ServingShardSet() && sv.Migrating {
 			return true
 		}
 	}

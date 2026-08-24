@@ -113,3 +113,23 @@ func TestConsistencyWatcher(t *testing.T) {
 		t.Fatalf("back to consistent: %+v", tr)
 	}
 }
+
+func TestMigratingConsidersServingSetOnly(t *testing.T) {
+	s := testSnapshot()
+	if s.ServingShardSet() != "default" {
+		t.Fatalf("empty ServingSet must fall back to default, got %q", s.ServingShardSet())
+	}
+	s.Serving[ShardKey{"g2", 0}] = Serving{Migrating: true}
+	if s.Migrating() {
+		t.Fatal("a migrating shard outside the serving set must not fence writes")
+	}
+	s.Serving[ShardKey{"default", 1}] = Serving{Migrating: true}
+	if !s.Migrating() {
+		t.Fatal("a migrating serving shard must fence writes")
+	}
+	s.ServingSet = "g2"
+	s.Serving[ShardKey{"g2", 0}] = Serving{}
+	if s.Migrating() {
+		t.Fatal("after the flip the retired set's fence is irrelevant")
+	}
+}

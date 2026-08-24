@@ -78,6 +78,9 @@ type ShardStatus struct {
 	PrimaryEndpoint *string
 	ReplayLagBytes  *int64
 	UpdatedAt       time.Time
+	// Migrating marks a source shard whose ranges are write-fenced by a
+	// reshard cutover.
+	Migrating bool
 }
 
 // ListDatabases returns every desired database ordered by name.
@@ -132,7 +135,7 @@ func ListTableStatus(ctx context.Context, q Querier, database string) ([]TableSt
 func ListShardStatus(ctx context.Context, q Querier, shardSet string) ([]ShardStatus, error) {
 	rows, err := q.Query(ctx, `
 		SELECT shard_set, shard_id, group_name, serving_state, primary_epoch,
-		       primary_endpoint, replay_lag_bytes, updated_at
+		       primary_endpoint, replay_lag_bytes, updated_at, migrating
 		FROM pgshard.shard_status WHERE shard_set = $1 ORDER BY shard_id`, shardSet)
 	if err != nil {
 		return nil, err
@@ -190,7 +193,7 @@ func ListAllTableStatus(ctx context.Context, q Querier) ([]TableStatus, error) {
 func ListAllShardStatus(ctx context.Context, q Querier) ([]ShardStatus, error) {
 	rows, err := q.Query(ctx, `
 		SELECT shard_set, shard_id, group_name, serving_state, primary_epoch,
-		       primary_endpoint, replay_lag_bytes, updated_at
+		       primary_endpoint, replay_lag_bytes, updated_at, migrating
 		FROM pgshard.shard_status ORDER BY shard_set, shard_id`)
 	if err != nil {
 		return nil, err

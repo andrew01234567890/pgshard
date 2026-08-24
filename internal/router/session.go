@@ -149,6 +149,10 @@ type Executor struct {
 	batchScatter     *plan.Plan
 	batchScatterStmt string
 	batchExec        []execItem
+	// batchBinds records the binds of the batch so the targets can be
+	// aimed again when the shard map moves while the batch waits out a
+	// write fence.
+	batchBinds []batchBind
 	// describes lists the statements a batch asked to Describe, in order,
 	// so ParameterDescription replies can be attributed.
 	describes []string
@@ -246,8 +250,26 @@ func (e *Executor) searchPath() []string {
 	return path
 }
 
-// Home reports the home shard of the session's database.
-func (e *Executor) Home() Shard { return e.home }
+// Home reports the home shard of the session's database in the serving
+// shard set: a reshard cutover moves both the set and the home shard id.
+func (e *Executor) Home() Shard {
+	if e.catalogSession() {
+		return e.home
+	}
+	if snap := e.r.cfg.Snapshot(); snap != nil {
+		if d, ok := snap.Databases[e.info.Database]; ok {
+			return Shard{Set: snap.ServingShardSet(), ID: d.HomeShard}
+		}
+	}
+	return e.home
+}
+
+// catalogSession reports whether the session fronts the catalog database,
+// whose plans never depend on the shard map.
+func (e *Executor) catalogSession() bool { return e.home.Set == CatalogShardSet }
+
+// userSet is the shard set the session's user data lives in right now.
+func (e *Executor) userSet() string { return e.Home().Set }
 
 // Shard reports the shard the session's stream is on.
 func (e *Executor) Shard() Shard { return e.shard }
@@ -256,8 +278,8 @@ func (e *Executor) Shard() Shard { return e.shard }
 // catalog shard set see no table placement and plan everything onto their
 // home shard.
 func (e *Executor) planSession() plan.Session {
-	sess := plan.Session{Database: e.info.Database, HomeShard: e.home.ID, ID: e.info.ID, SearchPath: e.searchPath()}
-	if e.home.Set == DefaultShardSet {
+	sess := plan.Session{Database: e.info.Database, HomeShard: e.Home().ID, ID: e.info.ID, SearchPath: e.searchPath()}
+	if !e.catalogSession() {
 		sess.Snapshot = e.r.cfg.Snapshot()
 	}
 	return sess
@@ -299,7 +321,7 @@ func (e *Executor) target(pl plan.Plan) (Shard, error) {
 	case len(pl.Shards) != 1:
 		return Shard{}, pgwire.Errorf(pgwire.CodeInternalError, "router: %s plan over %d shards has no single target", pl.Kind, len(pl.Shards))
 	}
-	return Shard{Set: e.home.Set, ID: pl.Shards[0]}, nil
+	return Shard{Set: e.userSet(), ID: pl.Shards[0]}, nil
 }
 
 // moveTo points the session at target, dropping the stream on the previous
@@ -402,8 +424,16 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 		return e.afterBatch(ctx, e.answerNextval(ctx, pl.NextVal, true, true, false, w))
 	}
 	if pl.Class.Write {
+		before := e.currentSnapshot()
 		if err := e.gateWrite(ctx); err != nil {
 			return e.afterBatch(ctx, err)
+		}
+		if e.currentSnapshot() != before {
+			// The shard map moved while the statement waited: plan it
+			// against the map it will run on.
+			if pl, err = e.r.cfg.Planner.Plan(ctx, e.planSession(), sql); err != nil {
+				return err
+			}
 		}
 	}
 	if pl.Rewritten != "" {
@@ -734,7 +764,7 @@ func sequenceShape(pl plan.Plan) string {
 // currentSnapshot is the snapshot plans of this session are made against;
 // nil on the catalog shard set, whose plans never depend on one.
 func (e *Executor) currentSnapshot() *snapshot.Snapshot {
-	if e.home.Set != DefaultShardSet {
+	if e.catalogSession() {
 		return nil
 	}
 	return e.r.cfg.Snapshot()
@@ -751,19 +781,9 @@ func (e *Executor) bind(ctx context.Context, portal, statement string, paramForm
 	if e.batchFailed {
 		return nil
 	}
-	if st, ok := e.stmts[statement]; ok && st.snap != e.currentSnapshot() {
-		pl, err := e.planOp(ctx, st.sql, "parse")
-		if err == nil && sequenceShape(pl) != sequenceShape(st.plan) {
-			perr := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "the sequence columns of the table changed since statement %q was prepared", statement)
-			perr.Hint = "prepare the statement again"
-			err = perr
-		}
-		if err != nil {
-			e.failBatch()
-			return err
-		}
-		st.plan, st.class, st.snap = pl, pl.Class, e.currentSnapshot()
-		e.stmts[statement] = st
+	if err := e.replanStale(ctx, statement); err != nil {
+		e.failBatch()
+		return err
 	}
 	if st, ok := e.stmts[statement]; ok && st.plan.Kind != plan.SessionLocal && st.plan.Kind != plan.MigrationKind {
 		pl := st.plan
@@ -781,15 +801,8 @@ func (e *Executor) bind(ctx context.Context, portal, statement string, paramForm
 			paramFormats = extendFormats(paramFormats, fill.Base, len(fill.Names))
 			params = append(params[:fill.Base:fill.Base], injected...)
 		}
-		if pl.Deferred {
-			var err error
-			pl, err = pl.Resolve(keys)
-			if err != nil {
-				e.failBatch()
-				return err
-			}
-		}
-		if err := e.aimBatch(pl, statement); err != nil {
+		e.batchBinds = append(e.batchBinds, batchBind{statement: statement, keys: keys})
+		if err := e.aimBound(pl, statement, keys); err != nil {
 			e.failBatch()
 			return err
 		}
@@ -797,6 +810,66 @@ func (e *Executor) bind(ctx context.Context, portal, statement string, paramForm
 	e.portals[portal] = statement
 	e.batch = append(e.batch, bindReq(portal, e.physical(statement), paramFormats, params, resultFormats))
 	return nil
+}
+
+// replanStale plans statement again when it was prepared against an older
+// snapshot than the current one.
+func (e *Executor) replanStale(ctx context.Context, statement string) error {
+	st, ok := e.stmts[statement]
+	if !ok || st.snap == e.currentSnapshot() {
+		return nil
+	}
+	pl, err := e.planOp(ctx, st.sql, "parse")
+	if err == nil && sequenceShape(pl) != sequenceShape(st.plan) {
+		perr := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "the sequence columns of the table changed since statement %q was prepared", statement)
+		perr.Hint = "prepare the statement again"
+		err = perr
+	}
+	if err != nil {
+		return err
+	}
+	st.plan, st.class, st.snap = pl, pl.Class, e.currentSnapshot()
+	e.stmts[statement] = st
+	return nil
+}
+
+// batchBind is one Bind of the batch in flight: what aimBound needs to
+// target the statement again against a newer snapshot.
+type batchBind struct {
+	statement string
+	keys      plan.Params
+}
+
+// aimBound resolves a deferred plan with the bound keys and aims the batch.
+func (e *Executor) aimBound(pl plan.Plan, statement string, keys plan.Params) error {
+	if pl.Deferred {
+		var err error
+		if pl, err = pl.Resolve(keys); err != nil {
+			return err
+		}
+	}
+	return e.aimBatch(pl, statement)
+}
+
+// reaim targets the batch again after the shard map moved while it waited
+// out a write fence: every bound statement is planned against the current
+// snapshot and resolved with its recorded keys.
+func (e *Executor) reaim(ctx context.Context, binds []batchBind) (*Shard, *plan.Plan, string, error) {
+	e.batchTarget, e.batchScatter, e.batchScatterStmt = nil, nil, ""
+	defer func() { e.batchTarget, e.batchScatter, e.batchScatterStmt = nil, nil, "" }()
+	for _, b := range binds {
+		if err := e.replanStale(ctx, b.statement); err != nil {
+			return nil, nil, "", err
+		}
+		st, ok := e.stmts[b.statement]
+		if !ok || st.plan.Kind == plan.SessionLocal {
+			continue
+		}
+		if err := e.aimBound(st.plan, b.statement, b.keys); err != nil {
+			return nil, nil, "", err
+		}
+	}
+	return e.batchTarget, e.batchScatter, e.batchScatterStmt, nil
 }
 
 // Describe implements pgwire.Executor.
@@ -860,7 +933,7 @@ func (e *Executor) failBatch() {
 	}
 	e.staged = e.staged[:e.stagedMark]
 	e.batch, e.batchStmts, e.batchFailed, e.batchWriter = nil, nil, true, nil
-	e.batchTarget, e.batchExec, e.describes = nil, nil, nil
+	e.batchTarget, e.batchExec, e.describes, e.batchBinds = nil, nil, nil, nil
 	e.batchScatter, e.batchScatterStmt = nil, ""
 }
 
@@ -875,18 +948,13 @@ func (e *Executor) sync(ctx context.Context) error {
 		e.batchFailed = false
 		return nil
 	}
-	batch, w, executed := e.batch, e.batchWriter, e.batchExec
+	batch, w, executed, binds := e.batch, e.batchWriter, e.batchExec, e.batchBinds
 	target := e.shard
 	if e.batchTarget != nil {
 		target = *e.batchTarget
 	}
 	scatterPlan, scatterStmt := e.batchScatter, e.batchScatterStmt
 	e.batchScatter, e.batchScatterStmt = nil, ""
-	if scatterPlan != nil && isReferenceWrite(*scatterPlan) && !hasExecute(e.batch) {
-		// Parse/Describe of a reference write is answered by the current
-		// shard alone; the fan-out starts with Execute.
-		scatterPlan = nil
-	}
 
 	pin := false
 	fresh := map[string]bool{}
@@ -898,7 +966,7 @@ func (e *Executor) sync(ctx context.Context) error {
 	for _, item := range executed {
 		pin = pin || item.class.Session == plan.SessionPrepare
 	}
-	e.batch, e.batchStmts, e.batchWriter, e.batchTarget, e.batchExec = nil, nil, nil, nil, nil
+	e.batch, e.batchStmts, e.batchWriter, e.batchTarget, e.batchExec, e.batchBinds = nil, nil, nil, nil, nil, nil
 	e.pendingDescribes, e.describes = e.describes, nil
 	if len(batch) == 0 {
 		return nil
@@ -908,12 +976,29 @@ func (e *Executor) sync(ctx context.Context) error {
 	}
 	for _, item := range executed {
 		if item.class.Write {
+			before := e.currentSnapshot()
 			if err := e.gateWrite(ctx); err != nil {
 				e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
 				return e.afterBatch(ctx, err)
 			}
+			if e.currentSnapshot() != before && len(binds) > 0 {
+				var batchTarget *Shard
+				var err error
+				if batchTarget, scatterPlan, scatterStmt, err = e.reaim(ctx, binds); err != nil {
+					e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
+					return e.afterBatch(ctx, err)
+				}
+				if batchTarget != nil {
+					target = *batchTarget
+				}
+			}
 			break
 		}
+	}
+	if scatterPlan != nil && isReferenceWrite(*scatterPlan) && !hasExecute(batch) {
+		// Parse/Describe of a reference write is answered by the current
+		// shard alone; the fan-out starts with Execute.
+		scatterPlan = nil
 	}
 	if handled, err := e.nextvalBatch(ctx, batch, parsed, w); handled {
 		e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
