@@ -424,6 +424,7 @@ func newCluster(name string) *pgshardv1alpha1.PgShardCluster {
 			ReplicasPerShard: 3,
 			Storage:          pgshardv1alpha1.StorageSpec{Size: resource.MustParse("2Gi")},
 			Router:           pgshardv1alpha1.RouterSpec{MinReplicas: 2, MaxReplicas: 5},
+			InternalTLS:      pgshardv1alpha1.InternalTLSSpec{Insecure: true},
 		},
 	}
 }
@@ -835,4 +836,39 @@ func ownLeases(c *pgshardv1alpha1.PgShardCluster) []string {
 		out = append(out, g.LeaseName())
 	}
 	return out
+}
+
+func TestInternalTLSValidationFailsClosed(t *testing.T) {
+	requireEnvtest(t)
+	ctx := context.Background()
+
+	missing := newCluster("tls-missing")
+	missing.Spec.InternalTLS = pgshardv1alpha1.InternalTLSSpec{}
+	if err := k8sClient.Create(ctx, missing); err == nil {
+		t.Fatal("cluster with neither secretRef nor insecure must be rejected")
+	} else if !strings.Contains(err.Error(), "internalTLS requires secretRef") {
+		t.Fatalf("unexpected rejection: %v", err)
+	}
+
+	both := newCluster("tls-both")
+	both.Spec.InternalTLS = pgshardv1alpha1.InternalTLSSpec{
+		SecretRef: &corev1.LocalObjectReference{Name: "internal-tls"}, Insecure: true}
+	if err := k8sClient.Create(ctx, both); err == nil {
+		t.Fatal("secretRef combined with insecure must be rejected")
+	} else if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("unexpected rejection: %v", err)
+	}
+
+	secure := newCluster("tls-secure")
+	secure.Spec.InternalTLS = pgshardv1alpha1.InternalTLSSpec{SecretRef: &corev1.LocalObjectReference{Name: "internal-tls"}}
+	if err := k8sClient.Create(ctx, secure); err != nil {
+		t.Fatalf("secretRef alone must be accepted: %v", err)
+	}
+	t.Cleanup(func() { _ = k8sClient.Delete(context.Background(), secure) })
+
+	insecure := newCluster("tls-insecure")
+	if err := k8sClient.Create(ctx, insecure); err != nil {
+		t.Fatalf("explicit insecure opt-in must be accepted: %v", err)
+	}
+	t.Cleanup(func() { _ = k8sClient.Delete(context.Background(), insecure) })
 }

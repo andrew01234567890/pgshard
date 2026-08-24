@@ -9,6 +9,9 @@ metadata:
   # annotations:
   #   pgshard.io/restart: "2026-08-18T10:00Z"
 spec:
+  internalTLS:
+    # Unsupported outside development; use secretRef with real TLS material.
+    insecure: true
   postgresql:
     major: 18
     profile: oltp

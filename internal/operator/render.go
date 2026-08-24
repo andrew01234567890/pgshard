@@ -428,7 +428,7 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 			"--tls-key", internalTLSMountPath+"/tls.key",
 			"--tls-ca", internalTLSMountPath+"/ca.crt")
 		mounts = append(mounts, corev1.VolumeMount{Name: internalTLSVolume, MountPath: internalTLSMountPath, ReadOnly: true})
-	} else {
+	} else if c.Spec.InternalTLS.Insecure {
 		args = append(args, "--insecure-dev")
 	}
 	return corev1.Container{

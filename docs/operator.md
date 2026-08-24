@@ -31,8 +31,10 @@ Setting `spec.internalTLS.secretRef` to a Secret holding `tls.crt`,
 `tls.key` and `ca.crt` turns on mutual TLS between routers and poolers: the
 pooler serves with the certificate and refuses any client whose certificate
 does not chain to `ca.crt`, and the router dials with the same material.
-Without it the pooler falls back to `--insecure-dev` plaintext, which must
-then be protected by a NetworkPolicy restricting port 9091 to router pods.
+Plaintext is never a fallback: without a `secretRef` the spec must set
+`spec.internalTLS.insecure: true` (unsupported outside development, and only
+tolerable behind a NetworkPolicy restricting port 9091 to router pods) or
+the API server rejects the cluster.
 The agent's own gRPC port (9090) requires a per-cluster token derived from
 the superuser Secret on every RPC, so reaching the port is not enough to
 drive failovers.
@@ -67,4 +69,5 @@ through `pgshard.shard_status.primary_endpoint`, which the operator publishes
 as the primary member's pooler (`<member>.<group>-peers.<namespace>.svc:9091`),
 not its PostgreSQL port. Every `-rw` Service exposes both 5432 (`postgres`)
 and 9091 (`pooler-grpc`). Router and poolers speak mutual TLS when
-`spec.internalTLS.secretRef` is set, plaintext (`--insecure-dev`) otherwise.
+`spec.internalTLS.secretRef` is set; plaintext (`--insecure-dev`) is rendered
+only under the explicit `spec.internalTLS.insecure: true` opt-in.

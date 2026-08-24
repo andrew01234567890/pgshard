@@ -13,6 +13,7 @@ import (
 func routerCluster() *pgshardv1alpha1.PgShardCluster {
 	c := &pgshardv1alpha1.PgShardCluster{ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "ns1"}}
 	c.Spec.Router = pgshardv1alpha1.RouterSpec{MinReplicas: 3, MaxReplicas: 7, HPA: pgshardv1alpha1.HPASpec{CPUUtilization: 55}}
+	c.Spec.InternalTLS.Insecure = true
 	return c
 }
 
@@ -214,5 +215,31 @@ func TestInternalTLSEnablesRouterPoolerMTLS(t *testing.T) {
 	}
 	if !mounted || !volumed {
 		t.Errorf("pooler TLS not mounted (mount=%v volume=%v)", mounted, volumed)
+	}
+}
+
+func TestInternalTLSFailsClosedWithoutExplicitInsecure(t *testing.T) {
+	c := routerCluster()
+	c.Spec.InternalTLS = pgshardv1alpha1.InternalTLSSpec{}
+	dep := Renderer{}.RouterDeployment(c)
+	args := strings.Join(dep.Spec.Template.Spec.Containers[0].Args, " ")
+	if strings.Contains(args, "--insecure-dev") {
+		t.Errorf("router args must not fall back to --insecure-dev: %q", args)
+	}
+	if strings.Contains(args, "--pooler-tls-cert") {
+		t.Errorf("router args must not claim TLS material that was never referenced: %q", args)
+	}
+	c.Spec.PostgreSQL.Major = 18
+	g := Groups(c)[0]
+	pod := Renderer{}.Pod(c, g, 0, RolePrimary, g.MemberName(0), Template(c, Group{}, nil, nil))
+	got := strings.Join(pod.Spec.Containers[1].Args, " ")
+	if strings.Contains(got, "--insecure-dev") || strings.Contains(got, "--tls-cert") {
+		t.Errorf("pooler args must carry neither plaintext nor phantom TLS flags: %q", got)
+	}
+
+	c.Spec.InternalTLS = pgshardv1alpha1.InternalTLSSpec{Insecure: true}
+	args = strings.Join(Renderer{}.RouterDeployment(c).Spec.Template.Spec.Containers[0].Args, " ")
+	if !strings.Contains(args, "--insecure-dev") {
+		t.Errorf("explicit insecure opt-in must render --insecure-dev: %q", args)
 	}
 }

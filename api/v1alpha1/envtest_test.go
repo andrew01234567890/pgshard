@@ -58,9 +58,10 @@ func validCluster(name string) *pgshardv1alpha1.PgShardCluster {
 	return &pgshardv1alpha1.PgShardCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
 		Spec: pgshardv1alpha1.PgShardClusterSpec{
-			PostgreSQL: pgshardv1alpha1.PostgreSQLSpec{Major: 18},
-			Catalog:    pgshardv1alpha1.CatalogSpec{Storage: pgshardv1alpha1.StorageSpec{Size: resource.MustParse("1Gi")}},
-			Storage:    pgshardv1alpha1.StorageSpec{Size: resource.MustParse("10Gi")},
+			PostgreSQL:  pgshardv1alpha1.PostgreSQLSpec{Major: 18},
+			Catalog:     pgshardv1alpha1.CatalogSpec{Storage: pgshardv1alpha1.StorageSpec{Size: resource.MustParse("1Gi")}},
+			Storage:     pgshardv1alpha1.StorageSpec{Size: resource.MustParse("10Gi")},
+			InternalTLS: pgshardv1alpha1.InternalTLSSpec{Insecure: true},
 		},
 	}
 }
