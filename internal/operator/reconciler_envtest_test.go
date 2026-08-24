@@ -460,8 +460,14 @@ func TestReconcileGeneratesGroupObjects(t *testing.T) {
 	var role rbacv1.Role
 	get(t, MemberServiceAccount("gen"), &role)
 	ownedBy(t, &role, c)
-	if len(role.Rules) != 2 || role.Rules[0].Resources[0] != "leases" {
+	if len(role.Rules) != 3 || role.Rules[0].Resources[0] != "leases" {
 		t.Errorf("member role rules: %+v", role.Rules)
+	}
+	if strings.Join(role.Rules[0].Verbs, ",") != "get,list,watch,create" || len(role.Rules[0].ResourceNames) != 0 {
+		t.Errorf("unscoped lease rule must not write: %+v", role.Rules[0])
+	}
+	if strings.Join(role.Rules[1].Verbs, ",") != "get,update,patch" || strings.Join(role.Rules[1].ResourceNames, ",") != strings.Join(ownLeases(c), ",") {
+		t.Errorf("scoped lease rule: %+v want %v", role.Rules[1], ownLeases(c))
 	}
 	var rb rbacv1.RoleBinding
 	get(t, MemberServiceAccount("gen"), &rb)
@@ -661,4 +667,12 @@ func TestSecretIsReusedAcrossReconciles(t *testing.T) {
 	if currentPassword(t, "secret") != first {
 		t.Fatal("password rotated on a plain reconcile")
 	}
+}
+
+func ownLeases(c *pgshardv1alpha1.PgShardCluster) []string {
+	var out []string
+	for _, g := range Groups(c) {
+		out = append(out, g.LeaseName())
+	}
+	return out
 }
