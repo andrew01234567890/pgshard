@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -110,8 +111,11 @@ func TestReserveAndRelease(t *testing.T) {
 	stream, _ := h.client.Execute(ctx)
 	roundTrip(t, stream, queryReq("s", "set x = 1", gen(7, 3), identity("alice")))
 	roundTrip(t, stream, queryReq("s", "begin", gen(7, 3), nil))
-	if _, err := h.client.Release(ctx, &pgshardv1.ReleaseRequest{SessionId: "s"}); status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("Release with a live stream must be refused: %v", err)
+	shortCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	_, err = h.client.Release(shortCtx, &pgshardv1.ReleaseRequest{SessionId: "s"})
+	cancel()
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("Release with a live stream must wait for it to detach: %v", err)
 	}
 	if h.srv.held() != 1 {
 		t.Fatal("reserved session must hold its backend between batches")
@@ -287,4 +291,146 @@ func waitFor(t *testing.T, cond func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("condition not met")
+}
+
+func parseReq(session, sql string, user *pgshardv1.UserIdentity) *pgshardv1.ExecuteRequest {
+	return &pgshardv1.ExecuteRequest{SessionId: session, Generation: gen(7, 3), User: user,
+		Message: &pgshardv1.ExecuteRequest_Parse{Parse: &pgshardv1.Parse{Name: "st1", Sql: sql}}}
+}
+
+func syncReq(session string) *pgshardv1.ExecuteRequest {
+	return &pgshardv1.ExecuteRequest{SessionId: session, Generation: gen(7, 3),
+		Message: &pgshardv1.ExecuteRequest_Sync{Sync: &pgshardv1.Sync{}}}
+}
+
+func closeReq(session, name string) *pgshardv1.ExecuteRequest {
+	return &pgshardv1.ExecuteRequest{SessionId: session, Generation: gen(7, 3),
+		Message: &pgshardv1.ExecuteRequest_Close{Close: &pgshardv1.Close{Kind: pgshardv1.Close_KIND_STATEMENT, Name: name}}}
+}
+
+func parseBatch(t *testing.T, stream pgshardv1.Pooler_ExecuteClient, reqs ...*pgshardv1.ExecuteRequest) []*pgshardv1.ExecuteResponse {
+	t.Helper()
+	for _, req := range reqs {
+		if err := stream.Send(req); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return collect(t, stream)
+}
+
+func kinds(rs []*pgshardv1.ExecuteResponse) []string {
+	var out []string
+	for _, r := range rs {
+		switch {
+		case r.GetParseComplete() != nil:
+			out = append(out, "parse")
+		case r.GetError() != nil:
+			out = append(out, "error "+r.GetError().Error.Sqlstate)
+		case r.GetReadyForQuery() != nil:
+			out = append(out, "ready")
+		}
+	}
+	return out
+}
+
+func TestReusedBackendNeverReparsesAHeldStatement(t *testing.T) {
+	h := startHarness(t, PoolConfig{})
+	ctx := context.Background()
+	if _, err := h.client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: "s", Generation: gen(7, 3)}); err != nil {
+		t.Fatal(err)
+	}
+	stream, _ := h.client.Execute(ctx)
+	rs := parseBatch(t, stream, parseReq("s", "select 1", identity("alice")), syncReq("s"))
+	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
+		t.Fatalf("first parse: %s", got)
+	}
+
+	// The stream is dropped without Release; the session keeps its backend
+	// and the replay re-parses the same name with the same SQL.
+	_ = stream.CloseSend()
+	waitFor(t, func() bool { return !h.attached("s") })
+	stream, _ = h.client.Execute(ctx)
+	rs = parseBatch(t, stream, parseReq("s", "select 1", identity("alice")), syncReq("s"))
+	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
+		t.Fatalf("identical re-parse must be answered, got %s (%v)", got, h.pg.seen)
+	}
+	if n := h.pg.count("PARSE st1"); n != 1 {
+		t.Fatalf("PostgreSQL saw %d parses of st1, want 1 (identical statement is skipped)", n)
+	}
+
+	// Same name, different SQL: the old statement is closed first.
+	rs = parseBatch(t, stream, parseReq("s", "select 2", nil), syncReq("s"))
+	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
+		t.Fatalf("re-parse with new SQL: %s (%v)", got, h.pg.seen)
+	}
+	if h.pg.count("CLOSE S st1") != 1 || h.pg.count("PARSE st1") != 2 {
+		t.Fatalf("expected one Close and a second Parse: %v", h.pg.seen)
+	}
+
+	// A router Close is relayed as-is; a failed parse leaves the name in
+	// doubt and the next parse closes before parsing.
+	rs = parseBatch(t, stream, closeReq("s", "st1"), parseReq("s", "select syntax error", nil), syncReq("s"))
+	if got := fmt.Sprint(kinds(rs)); got != "[error 42601 ready]" {
+		t.Fatalf("close then failed parse: %s", got)
+	}
+	rs = parseBatch(t, stream, parseReq("s", "select 3", nil), syncReq("s"))
+	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
+		t.Fatalf("parse after doubt: %s (%v)", got, h.pg.seen)
+	}
+	if h.pg.count("CLOSE S st1") != 4 {
+		t.Fatalf("uncertain name must be closed before parsing: %v", h.pg.seen)
+	}
+
+	// Release hands the backend to the pool clean; the next session parses
+	// the same name afresh.
+	_ = stream.CloseSend()
+	waitFor(t, func() bool { return !h.attached("s") })
+	if _, err := h.client.Release(ctx, &pgshardv1.ReleaseRequest{SessionId: "s"}); err != nil {
+		t.Fatal(err)
+	}
+	stream, _ = h.client.Execute(ctx)
+	rs = parseBatch(t, stream, parseReq("t", "select 1", identity("alice")), syncReq("t"))
+	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" || h.pg.dials.Load() != 1 {
+		t.Fatalf("fresh session on the recycled backend: %s dials=%d", got, h.pg.dials.Load())
+	}
+}
+
+func TestUnreservedBatchLeavesNoStatementsInThePool(t *testing.T) {
+	h := startHarness(t, PoolConfig{})
+	ctx := context.Background()
+	stream, _ := h.client.Execute(ctx)
+	rs := parseBatch(t, stream, parseReq("s", "select 1", identity("alice")), syncReq("s"))
+	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
+		t.Fatalf("parse: %s", got)
+	}
+	waitFor(t, h.pg.sawQueryFn("DISCARD ALL"))
+	if _, idle := h.srv.cfg.Pool.Stats(); idle != 1 {
+		t.Fatalf("idle = %d", idle)
+	}
+}
+
+func TestDeallocateThroughExtendedProtocolDoubtsHeldStatements(t *testing.T) {
+	h := startHarness(t, PoolConfig{})
+	ctx := context.Background()
+	if _, err := h.client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: "s", Generation: gen(7, 3)}); err != nil {
+		t.Fatal(err)
+	}
+	stream, _ := h.client.Execute(ctx)
+	rs := parseBatch(t, stream, parseReq("s", "select 1", identity("alice")), syncReq("s"))
+	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
+		t.Fatalf("first parse: %s", got)
+	}
+	unnamed := &pgshardv1.ExecuteRequest{SessionId: "s", Generation: gen(7, 3),
+		Message: &pgshardv1.ExecuteRequest_Parse{Parse: &pgshardv1.Parse{Name: "", Sql: "DEALLOCATE ALL"}}}
+	rs = parseBatch(t, stream, unnamed, syncReq("s"))
+	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
+		t.Fatalf("deallocate parse: %s", got)
+	}
+	rs = parseBatch(t, stream, parseReq("s", "select 1", nil), syncReq("s"))
+	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
+		t.Fatalf("parse after deallocate: %s (%v)", got, h.pg.seen)
+	}
+	if h.pg.count("PARSE st1") != 2 {
+		t.Fatalf("a statement deallocated through the extended protocol must be parsed again: %v", h.pg.seen)
+	}
 }

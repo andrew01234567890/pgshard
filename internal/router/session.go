@@ -157,6 +157,10 @@ type Executor struct {
 	wroteHere bool
 	gid       string
 	gidSeq    uint64
+	// releasing holds, per shard, the completion of a Release the session
+	// fired without waiting; the next stream on that shard waits for it so
+	// Reserve never pins the backend the release is still cleaning.
+	releasing map[Shard]chan struct{}
 }
 
 func newExecutor(r *Router, info pgwire.SessionInfo, home Shard) *Executor {
@@ -499,13 +503,41 @@ func (e *Executor) dropStream() {
 }
 
 // releaseAsync returns the pinned backend of the current shard without
-// waiting for the pooler.
+// waiting for the pooler; acquire on the same shard waits for it.
 func (e *Executor) releaseAsync() {
 	client, err := e.client()
 	if err != nil {
 		return
 	}
-	go func() { _ = releaseRPC(context.Background(), client, e.sid) }()
+	if e.releasing == nil {
+		e.releasing = map[Shard]chan struct{}{}
+	}
+	done := make(chan struct{})
+	prev := e.releasing[e.shard]
+	e.releasing[e.shard] = done
+	go func() {
+		defer close(done)
+		if prev != nil {
+			<-prev
+		}
+		_ = releaseRPC(context.Background(), client, e.sid)
+	}()
+}
+
+// awaitRelease blocks until the async release of the current shard, if
+// any, has finished.
+func (e *Executor) awaitRelease(ctx context.Context) error {
+	done, ok := e.releasing[e.shard]
+	if !ok {
+		return nil
+	}
+	select {
+	case <-done:
+		delete(e.releasing, e.shard)
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Parse implements pgwire.Executor: the message is buffered until Sync.
@@ -907,6 +939,9 @@ func (e *Executor) acquire(ctx context.Context, fresh map[string]bool) error {
 	}
 	client, err := e.client()
 	if err != nil {
+		return err
+	}
+	if err := e.awaitRelease(ctx); err != nil {
 		return err
 	}
 	ps, err := openStream(e.ctx, client)
