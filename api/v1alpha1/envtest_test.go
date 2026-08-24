@@ -156,6 +156,23 @@ func TestClusterCatalogReplicasBelowThreeRejected(t *testing.T) {
 	mustReject(t, c, "catalog.replicas must be >= 3 for HA")
 }
 
+func TestClusterSingleReplicaAcceptedWithUnsafeGate(t *testing.T) {
+	c := validCluster("unsafe-single")
+	c.Spec.ReplicasPerShard = 1
+	c.Spec.Catalog.Replicas = 1
+	c.Spec.UnsafeSingleReplica = true
+	if err := create(t, c); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClusterUnsafeGateFalseStillRejected(t *testing.T) {
+	c := validCluster("unsafe-off")
+	c.Spec.ReplicasPerShard = 1
+	c.Spec.UnsafeSingleReplica = false
+	mustReject(t, c, "replicasPerShard must be >= 3")
+}
+
 func TestClusterRouterMaxBelowMinRejected(t *testing.T) {
 	c := validCluster("router")
 	c.Spec.Router = pgshardv1alpha1.RouterSpec{MinReplicas: 5, MaxReplicas: 4}

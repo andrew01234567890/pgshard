@@ -18,6 +18,7 @@ Print columns: Shards, Ready, Age.
 | `spec.catalog.storage.size` / `.storageClassName` | Quantity / *string | size required |
 | `spec.shards` | *int | optional, min 1 |
 | `spec.replicasPerShard` | int | default 3, min 1; CEL: `>= 3` ("replicasPerShard must be >= 3") |
+| `spec.unsafeSingleReplica` | bool | relaxes both `>= 3` rules so test/dev clusters can run one member per group; single-member groups have no synchronous standby and no failover candidate — unsupported for production (the operator logs a warning) |
 | `spec.storage.size` / `.storageClassName` | Quantity / *string | size required |
 | `spec.durability.synchronousCommit` | enum | `on` (default), `remote_apply` |
 | `spec.durability.minSyncStandbys` | int | default 1 |

@@ -156,6 +156,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if !cluster.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
 	}
+	if cluster.Spec.UnsafeSingleReplica {
+		log.Info("unsafeSingleReplica is set: groups may run without synchronous standbys or failover candidates; unsupported for production")
+	}
 
 	password, err := r.ensureSecret(ctx, &cluster)
 	if err != nil {

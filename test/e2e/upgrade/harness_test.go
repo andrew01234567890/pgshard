@@ -58,11 +58,12 @@ spec:
   postgresql:
     major: %[3]d
   catalog:
-    replicas: 3
+    replicas: 1
     storage:
       size: 512Mi
   shards: 1
-  replicasPerShard: 3
+  replicasPerShard: 1
+  unsafeSingleReplica: true
   storage:
     size: 512Mi
   resharding:
