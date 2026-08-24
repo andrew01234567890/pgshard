@@ -370,6 +370,13 @@ func (c *Copier) drive(ctx context.Context, wf *copyWorkflow) (bool, error) {
 	}
 	advanced := false
 	if wf.stage == StageReadyForCopy {
+		var placements int
+		if err := c.Pool.QueryRow(ctx, `SELECT count(*) FROM pgshard.workflows WHERE kind = $1 AND state = ANY($2)`, KindTablePlacement, activeStates).Scan(&placements); err != nil {
+			return false, err
+		}
+		if placements > 0 {
+			return false, fmt.Errorf("waiting for %d active table placement workflow(s)", placements)
+		}
 		wf.stage = StageCopying
 		advanced = true
 		if err := c.save(ctx, wf, StageCopying, "copy started"); err != nil {

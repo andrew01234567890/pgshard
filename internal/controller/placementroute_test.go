@@ -1,0 +1,207 @@
+package controller
+
+import (
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/andrew01234567890/pgshard/internal/placement"
+)
+
+func twoShardRouter(p TablePlacement, cols []string) *placementRouter {
+	rs, _ := placement.Split(2)
+	r := &placementRouter{placement: p, home: 0, ids: []int32{0, 1}, ranges: rs, keyIndex: -1, keyType: "bigint"}
+	for i, c := range cols {
+		if c == p.key() {
+			r.keyIndex = i
+		}
+	}
+	return r
+}
+
+func shardOf(t *testing.T, v any) int32 {
+	t.Helper()
+	id, err := placement.KeyspaceID(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs, _ := placement.Split(2)
+	return int32(rs.Locate(id))
+}
+
+func TestPlacementRouterRoutes(t *testing.T) {
+	cols := []string{"id", "tenant_id", "region_id"}
+	sharded := twoShardRouter(TablePlacement{Placement: "sharded", ShardKey: s("region_id")}, cols)
+	row := []*string{s("1"), s("10"), s("77")}
+	got, err := sharded.Route(row)
+	if err != nil || len(got) != 1 || got[0] != shardOf(t, int64(77)) {
+		t.Fatalf("sharded: %v %v", got, err)
+	}
+	if _, err := sharded.Route([]*string{s("1"), s("10"), nil}); err == nil {
+		t.Error("null key routed")
+	}
+	if _, err := sharded.Route([]*string{s("1")}); err == nil {
+		t.Error("short row routed")
+	}
+	sharded.keyType = "text"
+	if _, err := sharded.Route(row); err != nil || len(sharded.Sources()) != 2 || len(sharded.Holders()) != 2 {
+		t.Fatalf("text key: %v", err)
+	}
+	unsharded := twoShardRouter(TablePlacement{Placement: "unsharded"}, cols)
+	if got, _ := unsharded.Route(row); len(got) != 1 || got[0] != 0 {
+		t.Fatalf("unsharded: %v", got)
+	}
+	if h := unsharded.Holders(); len(h) != 1 || h[0] != 0 || len(unsharded.Sources()) != 1 {
+		t.Fatalf("unsharded holders %v", h)
+	}
+	ref := twoShardRouter(TablePlacement{Placement: "reference"}, cols)
+	if got, _ := ref.Route(row); len(got) != 2 {
+		t.Fatalf("reference: %v", got)
+	}
+	if src := ref.Sources(); len(src) != 1 || src[0] != 0 || len(ref.Holders()) != 2 {
+		t.Fatalf("reference sources %v", src)
+	}
+}
+
+func TestKeyspaceIDOfTextMatchesPlacement(t *testing.T) {
+	want, _ := placement.KeyspaceID(int64(-42))
+	if got, err := KeyspaceIDOfText("-42", "integer"); err != nil || got != want {
+		t.Fatalf("int: %d %v", got, err)
+	}
+	want, _ = placement.KeyspaceID("doc-1")
+	if got, err := KeyspaceIDOfText("doc-1", "character varying(20)"); err != nil || got != want {
+		t.Fatalf("text: %d %v", got, err)
+	}
+	var u [16]byte
+	for i := range u {
+		u[i] = byte(i)
+	}
+	want, _ = placement.KeyspaceID(u)
+	if got, err := KeyspaceIDOfText("00010203-0405-0607-0809-0a0b0c0d0e0f", "uuid"); err != nil || got != want {
+		t.Fatalf("uuid: %d %v", got, err)
+	}
+	for _, bad := range [][2]string{{"x", "bigint"}, {"nope", "uuid"}, {"1.5", "numeric"}} {
+		if _, err := KeyspaceIDOfText(bad[0], bad[1]); err == nil {
+			t.Errorf("%v accepted", bad)
+		}
+	}
+}
+
+func TestQuoteLiteral(t *testing.T) {
+	if got := QuoteLiteral(nil); got != "NULL" {
+		t.Fatal(got)
+	}
+	if got := QuoteLiteral(s("it's")); got != `'it''s'` {
+		t.Fatal(got)
+	}
+	if got := quoteLiteralE(s(`a\b`)); got != `E'a\\b'` {
+		t.Fatal(got)
+	}
+	if got := quoteLiteralE(s("plain")); got != "'plain'" {
+		t.Fatal(got)
+	}
+}
+
+func TestUpsertAndDeleteSQL(t *testing.T) {
+	shape := rowShape{Schema: "public", Name: "orders", Columns: []string{"id", "tenant_id", "note"}, PK: []string{"id", "tenant_id"}}
+	rows := []*Tuple{
+		{Values: []*string{s("1"), s("10"), s("a")}, Unchanged: []bool{false, false, false}},
+		{Values: []*string{s("2"), s("10"), nil}, Unchanged: []bool{false, false, false}},
+		{Values: []*string{s("3"), s("11"), nil}, Unchanged: []bool{false, false, true}},
+	}
+	got := shape.UpsertSQL("orders__pgshard_new", rows)
+	if len(got) != 2 {
+		t.Fatalf("%d statements: %v", len(got), got)
+	}
+	if got[0] != `INSERT INTO "public"."orders__pgshard_new" ("id", "tenant_id") VALUES ('3', '11') ON CONFLICT ("id", "tenant_id") DO UPDATE SET "id" = EXCLUDED."id", "tenant_id" = EXCLUDED."tenant_id"` {
+		t.Errorf("unchanged column statement: %s", got[0])
+	}
+	if got[1] != `INSERT INTO "public"."orders__pgshard_new" ("id", "tenant_id", "note") VALUES ('1', '10', 'a'), ('2', '10', NULL) ON CONFLICT ("id", "tenant_id") DO UPDATE SET "id" = EXCLUDED."id", "tenant_id" = EXCLUDED."tenant_id", "note" = EXCLUDED."note"` {
+		t.Errorf("batch statement: %s", got[1])
+	}
+	if one := shape.UpsertSQL("orders", rows[:1]); len(one) != 1 || !strings.Contains(one[0], "VALUES ('1', '10', 'a') ON CONFLICT") {
+		t.Errorf("single row: %v", one)
+	}
+	if del := shape.DeleteSQL("orders", rows[1]); del != `DELETE FROM "public"."orders" WHERE "id" = '2' AND "tenant_id" = '10'` {
+		t.Errorf("delete: %s", del)
+	}
+}
+
+func TestRouteChange(t *testing.T) {
+	cols := []string{"id", "tenant_id", "region_id", "note"}
+	shape := rowShape{Schema: "public", Name: "orders", Columns: cols, PK: []string{"id"}}
+	r := twoShardRouter(TablePlacement{Placement: "sharded", ShardKey: s("region_id")}, cols)
+	a, b := int64(0), int64(0)
+	for v := int64(1); ; v++ {
+		if shardOf(t, v) == 0 && a == 0 {
+			a = v
+		}
+		if shardOf(t, v) == 1 && b == 0 {
+			b = v
+		}
+		if a != 0 && b != 0 {
+			break
+		}
+	}
+	as, bs := s(itoa(a)), s(itoa(b))
+	tup := func(id, region *string, note *string, unchanged ...int) *Tuple {
+		t := &Tuple{Values: []*string{id, s("1"), region, note}, Unchanged: make([]bool, 4)}
+		for _, i := range unchanged {
+			t.Unchanged[i] = true
+		}
+		return t
+	}
+	rel := &Relation{Schema: "public", Name: "orders", Columns: cols}
+
+	ops, err := routeChange(r, shape, "orders__pgshard_new", &Change{Op: OpInsert, Relation: rel, New: tup(s("1"), as, s("n"))})
+	if err != nil || len(ops) != 1 || ops[0].shard != 0 || !strings.HasPrefix(ops[0].sql, "INSERT") {
+		t.Fatalf("insert: %+v %v", ops, err)
+	}
+	ops, err = routeChange(r, shape, "orders__pgshard_new", &Change{Op: OpDelete, Relation: rel, Old: tup(s("1"), bs, nil)})
+	if err != nil || len(ops) != 1 || ops[0].shard != 1 || !strings.HasPrefix(ops[0].sql, "DELETE") {
+		t.Fatalf("delete: %+v %v", ops, err)
+	}
+	// A delete whose old row cannot be routed (null key) goes to every holder.
+	ops, err = routeChange(r, shape, "orders__pgshard_new", &Change{Op: OpDelete, Relation: rel, Old: tup(s("1"), nil, nil)})
+	if err != nil || len(ops) != 2 {
+		t.Fatalf("unroutable delete: %+v %v", ops, err)
+	}
+	// Same shard, same key: one upsert.
+	ops, err = routeChange(r, shape, "orders__pgshard_new", &Change{Op: OpUpdate, Relation: rel, Old: tup(s("1"), as, s("n")), New: tup(s("1"), as, s("m"))})
+	if err != nil || len(ops) != 1 || ops[0].shard != 0 || !strings.HasPrefix(ops[0].sql, "INSERT") {
+		t.Fatalf("in-place update: %+v %v", ops, err)
+	}
+	// Key change across shards: delete on the old shard, insert on the new.
+	ops, err = routeChange(r, shape, "orders__pgshard_new", &Change{Op: OpUpdate, Relation: rel, Old: tup(s("1"), as, s("n")), New: tup(s("1"), bs, s("n"))})
+	if err != nil || len(ops) != 2 || ops[0].shard != 0 || !strings.HasPrefix(ops[0].sql, "DELETE") || ops[1].shard != 1 || !strings.HasPrefix(ops[1].sql, "INSERT") {
+		t.Fatalf("moved update: %+v %v", ops, err)
+	}
+	// Primary key change on one shard: delete the old row, insert the new.
+	ops, err = routeChange(r, shape, "orders__pgshard_new", &Change{Op: OpUpdate, Relation: rel, Old: tup(s("1"), as, s("n")), New: tup(s("2"), as, s("n"))})
+	if err != nil || len(ops) != 2 || !strings.HasPrefix(ops[0].sql, "DELETE") || !strings.Contains(ops[0].sql, `"id" = '1'`) || !strings.HasPrefix(ops[1].sql, "INSERT") {
+		t.Fatalf("pk update: %+v %v", ops, err)
+	}
+	// An unchanged TOAST column of a moved row is filled from the old row.
+	ops, err = routeChange(r, shape, "orders__pgshard_new", &Change{Op: OpUpdate, Relation: rel, Old: tup(s("1"), as, s("big")), New: tup(s("1"), bs, nil, 3)})
+	if err != nil || len(ops) != 2 || !strings.Contains(ops[1].sql, "'big'") {
+		t.Fatalf("toast fill: %+v %v", ops, err)
+	}
+	// Without an old row the update identifies the row by its new key.
+	ops, err = routeChange(r, shape, "orders__pgshard_new", &Change{Op: OpUpdate, Relation: rel, New: tup(s("1"), as, s("n"))})
+	if err != nil || len(ops) != 1 || ops[0].shard != 0 {
+		t.Fatalf("keyless update: %+v %v", ops, err)
+	}
+	if _, err := routeChange(r, shape, "x", &Change{Op: OpInsert, Relation: rel, New: tup(s("1"), nil, nil)}); err == nil {
+		t.Error("insert with a null key routed")
+	}
+	if _, err := routeChange(r, shape, "x", &Change{Op: OpUpdate, Relation: rel, New: tup(s("1"), nil, nil)}); err == nil {
+		t.Error("update with a null new key routed")
+	}
+	ref := twoShardRouter(TablePlacement{Placement: "reference"}, cols)
+	ops, err = routeChange(ref, shape, "orders__pgshard_new", &Change{Op: OpUpdate, Relation: rel, Old: tup(s("1"), as, s("n")), New: tup(s("1"), bs, s("n"))})
+	if err != nil || len(ops) != 2 || ops[0].shard != 0 || ops[1].shard != 1 {
+		t.Fatalf("reference update: %+v %v", ops, err)
+	}
+}
+
+func itoa(v int64) string { return strconv.FormatInt(v, 10) }

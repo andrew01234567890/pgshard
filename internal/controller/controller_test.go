@@ -157,7 +157,7 @@ func TestController(t *testing.T) {
 			t.Fatalf("table_status %+v", st[0])
 		}
 		kind := queryOne[string](t, conn, `SELECT kind || ':' || state || ':' || (spec->'to'->>'shard_key') FROM pgshard.workflows WHERE id = $1::uuid`, *st[0].WorkflowID)
-		if kind != "table_rekey:pending:region_id" {
+		if kind != "table_placement:pending:region_id" {
 			t.Fatalf("workflow %s", kind)
 		}
 		if res := reconcile(t, conn); res.WorkflowsCreated != 0 {

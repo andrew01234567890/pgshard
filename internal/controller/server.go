@@ -76,8 +76,8 @@ func (s *Server) ResolveTransactions(ctx context.Context, req *pgshardv1.Resolve
 }
 
 var kindToProto = map[string]pgshardv1.WorkflowKind{
-	KindReshard:    pgshardv1.WorkflowKind_WORKFLOW_KIND_RESHARD,
-	KindTableRekey: pgshardv1.WorkflowKind_WORKFLOW_KIND_REKEY,
+	KindReshard:        pgshardv1.WorkflowKind_WORKFLOW_KIND_RESHARD,
+	KindTablePlacement: pgshardv1.WorkflowKind_WORKFLOW_KIND_REKEY,
 }
 
 var stateToProto = map[string]pgshardv1.WorkflowState{

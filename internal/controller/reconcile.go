@@ -16,8 +16,8 @@ import (
 
 // Workflow kinds and states written to pgshard.workflows.
 const (
-	KindTableRekey = "table_rekey"
-	KindReshard    = "reshard"
+	KindTablePlacement = "table_placement"
+	KindReshard        = "reshard"
 
 	StatePending = "pending"
 	// StateProvisioning is a reshard whose target groups are being created.
@@ -44,6 +44,7 @@ type Result struct {
 	ShardsMadeServing   int
 	ReshardsAdvanced    int
 	ReshardsCancelled   int
+	PlacementsCancelled int
 	GenerationBumped    bool
 	Invalid             []string
 }
@@ -136,6 +137,15 @@ func reconcileTables(ctx context.Context, tx pgx.Tx, res *Result) error {
 			}
 			res.TablesMadeEffective++
 		case *s.EffectivePlacement == t.Placement && equalPtr(s.EffectiveShardKey, t.ShardKey):
+			if s.WorkflowID != nil {
+				cancelled, err := cancelPlacement(ctx, tx, *s.WorkflowID)
+				if err != nil {
+					return err
+				}
+				if cancelled {
+					res.PlacementsCancelled++
+				}
+			}
 			if s.EffectiveGeneration != t.DesiredGeneration {
 				if _, err := tx.Exec(ctx, `UPDATE pgshard.table_status SET effective_generation = $4, updated_at = now()
 					WHERE database = $1 AND schema_name = $2 AND table_name = $3`,
@@ -152,6 +162,13 @@ func reconcileTables(ctx context.Context, tx pgx.Tx, res *Result) error {
 				if active {
 					continue
 				}
+				failed, err := placementFailed(ctx, tx, *s.WorkflowID, t.DesiredGeneration)
+				if err != nil {
+					return err
+				}
+				if failed {
+					continue
+				}
 			}
 			spec := map[string]any{
 				"database": t.Database, "schema_name": t.SchemaName, "table_name": t.TableName,
@@ -159,7 +176,7 @@ func reconcileTables(ctx context.Context, tx pgx.Tx, res *Result) error {
 				"to":                 map[string]any{"placement": t.Placement, "shard_key": t.ShardKey},
 				"desired_generation": t.DesiredGeneration,
 			}
-			id, err := createWorkflow(ctx, tx, KindTableRekey, spec)
+			id, err := createWorkflow(ctx, tx, KindTablePlacement, spec)
 			if err != nil {
 				return err
 			}
@@ -189,6 +206,15 @@ func workflowActive(ctx context.Context, tx pgx.Tx, id string) (bool, error) {
 	err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pgshard.workflows WHERE id = $1::uuid AND state = ANY($2))`,
 		id, activeStates).Scan(&active)
 	return active, err
+}
+
+// placementFailed reports whether workflow id failed for the same desired
+// generation: the change is not retried until the row is edited again.
+func placementFailed(ctx context.Context, tx pgx.Tx, id string, generation int64) (bool, error) {
+	var failed bool
+	err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pgshard.workflows WHERE id = $1::uuid AND state = $2 AND (spec->>'desired_generation')::bigint = $3)`,
+		id, StateFailed, generation).Scan(&failed)
+	return failed, err
 }
 
 func createWorkflow(ctx context.Context, tx pgx.Tx, kind string, spec map[string]any) (string, error) {

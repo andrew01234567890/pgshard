@@ -268,6 +268,65 @@ operator then deletes the retired groups' pods, PVCs and Services; their
 stanzas stay under the backup retention. `PgShardCluster.status.reshard`
 reports `retiredShardSet` during the window.
 
+## Merges
+
+A merge is a reshard whose pending set has fewer shards than the serving
+one: `spec.shards` decreased, or ranges of the serving set written as one
+new set with fewer, wider ranges. Nothing in the workflow is specific to
+the direction. Every source publishes one `pgshard_reshard_g<gen>_t<target>`
+publication per target with the target's range as the row filter, so a
+target whose range spans several old shards receives the union of their
+rows; every target subscribes once per (target, source) pair, so a merge
+2 -> 1 runs two subscriptions on the single target. The verify step digests
+per (table, range, target) over every source. `TestReshardMergeOnPostgres`
+drives a 2 -> 1 merge through copy and cutover under a ledger of transfers.
+
+## Table placement workflows
+
+Editing a `pgshard.tables` row of a table that already has an effective
+placement (`shard_key` change, `unsharded` <-> `sharded`, either ->
+`reference`, `reference` -> `sharded`) creates one `kind=table_placement`
+workflow (state `pending`, `spec{database, schema_name, table_name, from,
+to, desired_generation}`); `table_status.workflow_id` points at it. The
+placer (`internal/controller/placement.go`, one pass every
+`--placement-interval`) moves the rows within the serving shard set; no
+group is provisioned. Reshards and placement workflows never run together:
+a placement waits at `preparing` while a reshard is active, and a reshard
+waits at `ready_for_copy` while a placement is active. Concurrent
+placements of different tables are serialized per table through
+`pgshard.workflow_locks(kind=table, key=database.schema.table)`.
+
+Where a placement holds a table: `sharded` on every shard, by the hash of
+its key over the serving ranges; `unsharded` on the database's home
+shard; `reference` on every shard, copied from the home shard.
+
+| Stage | Meaning |
+|-------|---------|
+| `preparing` | Waits for reshards; reads the table on the first source: it needs a primary key (rows are applied by it), the new shard key must exist, hash as a row-filter type and be part of the primary key or a unique constraint. A violation fails the workflow with the reason in `error`. Takes the lock. |
+| `shadow` | `<table>__pgshard_new` on every shard of the new placement: `CREATE TABLE ... (LIKE <table> INCLUDING ALL)` where the shard has the table, else built from the source's columns, defaults (sequences created as needed), identity, constraints and indexes. |
+| `copying` | Per source: `REPLICA IDENTITY FULL`, a `pgshard_place_<id8>` publication of the table and a `pgshard_place_<id8>_s<source>` pgoutput slot (`pg_create_logical_replication_slot`), then a keyset walk by primary key under one `REPEATABLE READ` snapshot, every row upserted into the shadow of the shard the new placement assigns. The snapshot is taken after the slot exists, so changes in between are replayed by the catch-up; the upserts make the overlap harmless. |
+| `catch_up` | The slots are read with `pg_logical_slot_peek_binary_changes` (pgoutput protocol 1, text tuples, decoded by `internal/controller/pgoutput.go`), each transaction applied to the shadows by the new placement (`routeChange`: insert -> upsert; delete -> delete by key; an update whose row moves shard, or whose key changed -> delete on the old shard + upsert on the new), then the slot is advanced past the commit. The stage ends when the slot lag is under `--copy-lag-bytes`. |
+| `buffering` | `table_status.migrating=true`: routers hold new writes to the table (statements resolving it) in the failover buffer for at most the buffering window, then refuse with `57P03`. The placer drains the slots until two consecutive passes (200ms apart) applied nothing with no lag; a drain longer than `--placement-buffer-timeout` releases the fence and returns to `catch_up` (three times, then the workflow fails). |
+| `swapping` | One transaction per shard: `<table>` -> `<table>__pgshard_old` where it existed, `<table>__pgshard_new` -> `<table>` where the new placement holds it; sequences owned by the old table's columns move to the new one. Then one catalog transaction publishes the placement (`table_status.effective_placement/effective_shard_key/effective_generation`, `migrating=false`, lock removed, `shard_map_generation` bumped); routers reload and release the buffer. `status.placement.pause_ms` is fence to publish. Slots and publications are dropped. |
+| `retiring` | After `--placement-drop-old-after` (or `spec.drop_old_after_seconds`) the old tables drop and the new table's indexes and constraints lose the `__pgshard_new` infix. |
+| `completed` / `failed` / `cancelled` | Terminal. |
+
+Every stage re-derives its work from the shards (shadow present, slot
+present, source copied, table renamed), so a restarted controller resumes
+where the previous one stopped and a step that ran twice changes nothing.
+Reverting the `pgshard.tables` row before `swapping` cancels the run: the
+placer drops the shadows, slots and publications, restores the replica
+identity, releases fence and lock (`cancelled`). After the swap the run
+cannot be cancelled; edit the row again for a new run. A failed change is
+not retried until the row is edited again.
+
+The swapped table keeps its name but gets a new relation OID. Publications
+`FOR ALL TABLES` keep publishing it; logical consumers that follow the
+stream see a new Relation message under the same name and continue. The
+cluster status reports the runs as `status.placementWorkflows[]{workflowId,
+table, from, to, state, phase, message, pauseMs}` (active runs and those
+that ended within a day).
+
 ## Limitations
 
 - No cancel after the journal; a reverse flip (`switch_back`) is not
@@ -279,3 +338,6 @@ reports `retiredShardSet` during the window.
 - Writes to fenced ranges wait in the router's failover buffer for at
   most the buffering window; a pause longer than that surfaces as
   `57P03` to clients.
+- Placement workflows need a primary key and refuse TRUNCATE in the
+  stream; DDL on the table during a run fails it (the columns changed).
+  Rows with a NULL new shard key fail the run.

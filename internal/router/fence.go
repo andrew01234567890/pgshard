@@ -13,7 +13,12 @@ import (
 // shards) and the statement waited out the buffering window.
 const codeWriteFence = "57P03"
 
-func writeFenceError(migrating bool) error {
+func writeFenceError(migrating, table bool) error {
+	if table {
+		err := pgwire.Errorf(codeWriteFence, "write pause for a table placement change")
+		err.Hint = "the pause ends when the table's new placement is published; retry the statement"
+		return err
+	}
 	if migrating {
 		err := pgwire.Errorf(codeWriteFence, "cluster write pause for a reshard cutover")
 		err.Hint = "the pause ends when the new shard map is published; retry the statement"
@@ -31,9 +36,14 @@ func fenceBufferFullError() error {
 // writeFenced reports whether the current snapshot pauses writes: the
 // cluster-wide barrier fence, or a reshard cutover fencing the serving
 // shards (migrating). Reads never wait.
-func (r *Router) writeFenced() bool {
+func (r *Router) writeFenced(tables []snapshot.TableKey) bool {
 	snap := r.cfg.Snapshot()
-	return snap != nil && (snap.WriteFence || snap.Migrating())
+	return snap != nil && (snap.WriteFence || snap.Migrating() || snap.TableMigrating(tables))
+}
+
+func (r *Router) tableMigrating(tables []snapshot.TableKey) bool {
+	snap := r.cfg.Snapshot()
+	return snap != nil && snap.TableMigrating(tables)
 }
 
 func (r *Router) migrating() bool {
@@ -64,11 +74,12 @@ func (r *Router) releaseFenceSlot() {
 	r.mu.Unlock()
 }
 
-// awaitWriteFence holds a new write while the cluster is fenced, for at
-// most the buffering window; a fence still up afterwards refuses the
-// statement with 57P03. Reads never wait.
-func (r *Router) awaitWriteFence(ctx context.Context) error {
-	if !r.writeFenced() {
+// awaitWriteFence holds a new write while the cluster, or one of the tables
+// the statement touches, is fenced, for at most the buffering window; a
+// fence still up afterwards refuses the statement with 57P03. Reads never
+// wait.
+func (r *Router) awaitWriteFence(ctx context.Context, tables []snapshot.TableKey) error {
+	if !r.writeFenced(tables) {
 		return nil
 	}
 	if !r.reserveFenceSlot() {
@@ -86,15 +97,15 @@ func (r *Router) awaitWriteFence(ctx context.Context) error {
 	poll := time.NewTicker(r.cfg.Buffering.Poll)
 	defer poll.Stop()
 	for {
-		if !r.writeFenced() {
+		if !r.writeFenced(tables) {
 			return nil
 		}
 		select {
 		case <-changes:
 		case <-poll.C:
 		case <-deadline.C:
-			if r.writeFenced() {
-				return writeFenceError(r.migrating())
+			if r.writeFenced(tables) {
+				return writeFenceError(r.migrating(), r.tableMigrating(tables))
 			}
 			return nil
 		case <-ctx.Done():
@@ -107,11 +118,11 @@ func (r *Router) awaitWriteFence(ctx context.Context) error {
 // session's transaction already wrote before the fence: open transactions
 // may finish, and holding their later statements would only make them
 // linger.
-func (e *Executor) gateWrite(ctx context.Context) error {
+func (e *Executor) gateWrite(ctx context.Context, tables []snapshot.TableKey) error {
 	if e.txnWrote() {
 		return nil
 	}
-	return e.r.awaitWriteFence(ctx)
+	return e.r.awaitWriteFence(ctx, tables)
 }
 
 // txnWrote reports whether the current transaction wrote on any shard.

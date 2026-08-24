@@ -70,7 +70,8 @@ type fakeProber struct {
 	// published records shard_status upserts as "shard-<id>:<epoch>:<endpoint>".
 	published []string
 	// slots records EnsureSlots calls as "<dsn host>:<want>:-<drop>".
-	slots []string
+	slots      []string
+	placements []PlacementWorkflowInfo
 	// journal records fence writes and promotions in order.
 	journal *[]string
 	// settings is the pg_settings view of every member; contexts default to
@@ -135,6 +136,12 @@ func (f *fakeProber) DropShardSet(_ context.Context, _ string, name string) erro
 		}
 	}
 	return nil
+}
+
+func (f *fakeProber) PlacementWorkflows(context.Context, string) ([]PlacementWorkflowInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.placements, nil
 }
 
 func (f *fakeProber) ReshardWorkflow(_ context.Context, _ string, set string) (WorkflowInfo, error) {

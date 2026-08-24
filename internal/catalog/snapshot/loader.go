@@ -76,7 +76,7 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 	for _, t := range tables {
 		key := TableKey{t.Database, t.SchemaName, t.TableName}
 		if ts, ok := effective[key]; ok && ts.EffectivePlacement != nil {
-			p := Placement{Placement: *ts.EffectivePlacement, Generation: ts.EffectiveGeneration}
+			p := Placement{Placement: *ts.EffectivePlacement, Generation: ts.EffectiveGeneration, Migrating: ts.Migrating}
 			if ts.EffectiveShardKey != nil {
 				p.ShardKey = *ts.EffectiveShardKey
 			}

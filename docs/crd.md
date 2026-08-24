@@ -35,8 +35,10 @@ Status: `conditions` (types Ready, Progressing, Degraded, PrimaryHealthy, Replic
 Fenced, BackupHealthy, Resharding, ServingWrites, RouterReady, TuningApplied), `observedGeneration`,
 `shardMapGeneration`, `shards[]{id, rangeStart, rangeEnd, primary, epoch, members[]{name, role, ready, replayLagBytes}}`,
 `effectiveShards` (shard count of the serving catalog shard set), `reshard{name, shardSet, generation, shards, phase}`
-(the run in flight), `tuning.derived[]{name, value, reason}`. See [resharding.md](resharding.md) for how
-`spec.shards` becomes a reshard.
+(the run in flight), `placementWorkflows[]{workflowId, table, from, to, state, phase, message, pauseMs}`
+(table placement workflows active or ended within a day), `tuning.derived[]{name, value, reason}`. See
+[resharding.md](resharding.md) for how `spec.shards` becomes a reshard and how a `pgshard.tables` edit
+becomes a placement workflow.
 
 ## PgShardGroup (status subresource)
 

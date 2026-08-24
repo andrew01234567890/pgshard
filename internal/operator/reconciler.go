@@ -222,7 +222,7 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.updateReshardStatus(ctx, plan, targets); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.updateStatus(ctx, &cluster, observations, catalogReady, backupCond, plan.cond); err != nil {
+	if err := r.updateStatus(ctx, &cluster, observations, catalogReady, backupCond, plan.cond, plan.placements); err != nil {
 		return ctrl.Result{}, err
 	}
 	requeue := requeueReady
@@ -719,7 +719,7 @@ func (r *ClusterReconciler) publishShardStatus(ctx context.Context, c *pgshardv1
 	return cond
 }
 
-func (r *ClusterReconciler) updateStatus(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, obs []groupObservation, catalogReady, backupCond, reshardCond metav1.Condition) error {
+func (r *ClusterReconciler) updateStatus(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, obs []groupObservation, catalogReady, backupCond, reshardCond metav1.Condition, placements []pgshardv1alpha1.ClusterPlacementWorkflowStatus) error {
 	ready := true
 	primaryOK := true
 	replOK := true
@@ -776,6 +776,7 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, c *pgshardv1alpha1
 	r.setRolloutStatus(c, obs, set)
 	c.Status.ObservedGeneration = c.Generation
 	c.Status.Shards = shards
+	c.Status.PlacementWorkflows = placements
 	return r.Status().Patch(ctx, c, client.MergeFrom(base))
 }
 
