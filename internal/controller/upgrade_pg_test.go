@@ -200,3 +200,82 @@ func waitFor(t *testing.T, d time.Duration, cond func() bool, msg string) {
 		time.Sleep(500 * time.Millisecond)
 	}
 }
+
+// TestCollectSequencesHeadroomOnPostgres: the carried value covers what a
+// session cache or the WAL pre-log window may already have handed out
+// without moving pg_current_wal_lsn(), applied in the direction of
+// increment_by, clamped to the boundary in that direction, and safe at the
+// bigint edges.
+func TestCollectSequencesHeadroomOnPostgres(t *testing.T) {
+	dsn := startPostgresWith(t)
+	conn := connect(t, dsn)
+	ctx := context.Background()
+	mustExec(t, conn, `CREATE SEQUENCE app_seq CACHE 5`)
+	mustExec(t, conn, `CREATE SEQUENCE tiny_seq MAXVALUE 10`)
+	mustExec(t, conn, `CREATE SEQUENCE down_seq INCREMENT -3 START -10 MINVALUE -1000000 MAXVALUE -1`)
+	mustExec(t, conn, `CREATE SEQUENCE wide_seq INCREMENT 7`)
+	mustExec(t, conn, `CREATE SEQUENCE edge_seq START 9223372036854775800`)
+	mustExec(t, conn, `CREATE SEQUENCE edge_down_seq INCREMENT -5 START -9223372036854775800 MINVALUE -9223372036854775807 MAXVALUE -1`)
+	mustExec(t, conn, `CREATE SEQUENCE cycle_seq MAXVALUE 20 START 19 CYCLE`)
+	for _, seq := range []string{"app_seq", "tiny_seq", "down_seq", "wide_seq", "edge_seq", "edge_down_seq", "cycle_seq"} {
+		queryOne[int64](t, conn, `SELECT nextval('`+seq+`')`)
+	}
+	last := queryOne[int64](t, conn, `SELECT last_value FROM pg_sequences WHERE sequencename = 'app_seq'`)
+	values := map[string]seqCarry{}
+	if err := collectSequences(ctx, pgxShardConn{conn}, values); err != nil {
+		t.Fatal(err)
+	}
+	if got := values["public.app_seq"]; got.Value != last+32 || !got.Ascending {
+		t.Fatalf("app_seq carried as %+v, want last_value %d + 32 headroom, ascending", got, last)
+	}
+	if got := values["public.tiny_seq"]; got.Value != 10 {
+		t.Fatalf("tiny_seq carried as %+v, want the clamp at max_value 10", got)
+	}
+	if got := values["public.down_seq"]; got.Value != -10-32*3 || got.Ascending {
+		t.Fatalf("down_seq carried as %+v, want start -10 minus 32*3 headroom, descending", got)
+	}
+	if got := values["public.wide_seq"]; got.Value != 1+32*7 {
+		t.Fatalf("wide_seq carried as %+v, want start 1 plus 32*7 headroom", got)
+	}
+	if got := values["public.edge_seq"]; got.Value != 9223372036854775807 {
+		t.Fatalf("edge_seq carried as %+v, want the clamp at the bigint maximum", got)
+	}
+	if got := values["public.edge_down_seq"]; got.Value != -9223372036854775807 {
+		t.Fatalf("edge_down_seq carried as %+v, want the clamp at min_value", got)
+	}
+	if got := values["public.cycle_seq"]; got.Value != 20 {
+		t.Fatalf("cycle_seq carried as %+v, want the clamp at max_value 20, never a wrapped value", got)
+	}
+
+	// The merge across sources keeps the furthest value per direction: a
+	// later source further along must win, an earlier one must not regress
+	// the carry.
+	merged := map[string]seqCarry{
+		"public.app_seq":  {Value: last + 1000, Ascending: true},
+		"public.down_seq": {Value: -5000, Ascending: false},
+	}
+	if err := collectSequences(ctx, pgxShardConn{conn}, merged); err != nil {
+		t.Fatal(err)
+	}
+	if got := merged["public.app_seq"]; got.Value != last+1000 {
+		t.Fatalf("ascending merge regressed to %+v", got)
+	}
+	if got := merged["public.down_seq"]; got.Value != -5000 {
+		t.Fatalf("descending merge regressed to %+v", got)
+	}
+
+	if err := applySequences(ctx, pgxShardConn{conn}, values); err != nil {
+		t.Fatal(err)
+	}
+	if next := queryOne[int64](t, conn, `SELECT nextval('app_seq')`); next <= last+32 {
+		t.Fatalf("nextval after the carry: %d, want past %d", next, last+32)
+	}
+	if next := queryOne[int64](t, conn, `SELECT nextval('down_seq')`); next >= -10-32*3 {
+		t.Fatalf("descending nextval after the carry: %d, want below %d", next, -10-32*3)
+	}
+	// edge_seq was clamped to the bigint maximum: the target must refuse
+	// further values rather than wrap into duplicates.
+	if _, err := conn.Exec(ctx, `SELECT nextval('edge_seq')`); err == nil {
+		t.Fatal("nextval past the clamped bigint maximum must error, not hand out a duplicate")
+	}
+}

@@ -264,3 +264,62 @@ func waitEnv(t *testing.T, cond func() bool, step func(), what string) {
 		t.Fatalf("gave up waiting for %s", what)
 	}
 }
+
+// TestCatalogUpgradeSteadyStatePatchesStatusOnlyOnChange: a retiring
+// upgrade waiting out the retention window must not patch the cluster
+// status on every pass.
+func TestCatalogUpgradeSteadyStatePatchesStatusOnlyOnChange(t *testing.T) {
+	r, fp, c := setup(t, "cu-steady")
+	cur := startCatalogUpgrade(t, r, fp, c)
+	base := cur.DeepCopy()
+	cur.Spec.Resharding.RetireOldGroupsAfter = &metav1.Duration{Duration: time.Hour}
+	if err := k8sClient.Patch(context.Background(), cur, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 8 && catalogStage(t, c.Name) != CatalogUpgradeRetiring; i++ {
+		reconcile(t, r, c)
+	}
+	if got := catalogStage(t, c.Name); got != CatalogUpgradeRetiring {
+		t.Fatalf("stage %s, want retiring", got)
+	}
+
+	patches := 0
+	r2 := &ClusterReconciler{Client: statusPatchCounter{Client: k8sClient, patches: &patches},
+		Renderer: r.Renderer, Prober: r.Prober, Agents: r.Agents,
+		FailoverDelay: r.FailoverDelay, PollInterval: r.PollInterval, QuiesceTimeout: r.QuiesceTimeout}
+	pass := func() {
+		t.Helper()
+		fresh := getCluster(t, c.Name)
+		if _, err := r2.reconcileCatalogUpgrade(context.Background(), fresh, CatalogDSN(fresh), "pw", nil, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pass()
+	settled := patches
+	pass()
+	pass()
+	if patches != settled {
+		t.Fatalf("steady retiring passes patched the cluster status %d more time(s)", patches-settled)
+	}
+}
+
+type statusPatchCounter struct {
+	client.Client
+	patches *int
+}
+
+func (c statusPatchCounter) Status() client.SubResourceWriter {
+	return countingStatusWriter{c.Client.Status(), c.patches}
+}
+
+type countingStatusWriter struct {
+	client.SubResourceWriter
+	patches *int
+}
+
+func (w countingStatusWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+	if _, ok := obj.(*pgshardv1alpha1.PgShardCluster); ok {
+		*w.patches++
+	}
+	return w.SubResourceWriter.Patch(ctx, obj, patch, opts...)
+}

@@ -8,6 +8,7 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -64,9 +65,8 @@ func CatalogUpgradeBlockers(c *pgshardv1alpha1.PgShardCluster) []string {
 func (r *ClusterReconciler) reconcileCatalogUpgrade(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, dsn, password string, pol *pgshardv1alpha1.PgShardBackupPolicy, repoReady bool) ([]groupObservation, error) {
 	log := logf.FromContext(ctx)
 	base := c.DeepCopy()
-	changed := false
 	patch := func() error {
-		if !changed {
+		if equality.Semantic.DeepEqual(base.Status, c.Status) {
 			return nil
 		}
 		return r.Status().Patch(ctx, c, client.MergeFrom(base))
@@ -80,7 +80,6 @@ func (r *ClusterReconciler) reconcileCatalogUpgrade(ctx context.Context, c *pgsh
 		if c.Status.CatalogGeneration == 0 {
 			c.Status.CatalogGeneration = 1
 		}
-		changed = true
 	}
 	up := c.Status.CatalogUpgrade
 	if up == nil {
@@ -97,12 +96,10 @@ func (r *ClusterReconciler) reconcileCatalogUpgrade(ctx context.Context, c *pgsh
 			Generation: CatalogGeneration(c) + 1,
 			Stage:      CatalogUpgradeProvisioning,
 		}
-		changed = true
 		log.Info("catalog upgrade started", "from", c.Status.CatalogPGMajor, "to", c.Spec.PostgreSQL.Major)
 		return nil, patch()
 	}
 	up.RollbackRequested = c.Annotations[pgshardv1alpha1.AnnotationCatalogUpgrade] == pgshardv1alpha1.UpgradeActionRollback
-	changed = true
 
 	var obs []groupObservation
 	target := CatalogTargetGroup(c)

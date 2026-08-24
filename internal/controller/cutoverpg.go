@@ -254,46 +254,75 @@ func (o *pgCutover) currentLSN(ctx context.Context, set string, id int32) (int64
 	return pgx.CollectExactlyOneRow(rows, pgx.RowTo[int64])
 }
 
-// CaughtUp: the apply worker of every forward subscription reported a
-// position at or past its source's.
+// CaughtUp: every forward subscription confirmed a flush position at or
+// past its source's. The check reads the publisher slot's
+// confirmed_flush_lsn: it survives apply-worker restarts (unlike the
+// in-memory pg_stat_subscription.latest_end_lsn) and still advances over
+// keepalives on an idle source.
 func (o *pgCutover) CaughtUp(ctx context.Context, positions map[string]int64) (bool, string, error) {
 	var behind []string
-	for _, db := range o.dbs {
-		for _, t := range o.wf.ids {
-			conn, err := o.c.Shards.DialDatabase(ctx, o.wf.set, t, db.name)
-			if err != nil {
-				return false, "", err
-			}
-			rows, err := conn.Query(ctx, `SELECT s.subname, coalesce((st.latest_end_lsn - '0/0'::pg_lsn)::bigint, -1)
-				FROM pg_subscription s LEFT JOIN pg_stat_subscription st ON st.subid = s.oid AND st.relid IS NULL
-				WHERE s.subname LIKE $1 ORDER BY 1`, o.forwardPattern(t))
-			if err == nil {
-				err = func() error {
-					defer rows.Close()
-					for rows.Next() {
-						var name string
-						var applied int64
-						if err := rows.Scan(&name, &applied); err != nil {
-							return err
-						}
-						want := positions[fmt.Sprint(sourceOf(name, o.wf.gen, t, o.srcIDs))]
-						if applied < want {
-							behind = append(behind, fmt.Sprintf("%s/%d %s at %d of %d", db.name, t, name, applied, want))
-						}
-					}
-					return rows.Err()
-				}()
-			}
-			_ = conn.Close(ctx)
-			if err != nil {
-				return false, "", err
-			}
+	for _, s := range o.srcIDs {
+		flushed, err := slotFlushPositions(ctx, o.c.Shards, o.srcSet, s,
+			fmt.Sprintf("pgshard\\_reshard\\_g%d\\_t%%\\_s%d", o.wf.gen, s))
+		if err != nil {
+			return false, "", err
 		}
+		expected := make([]string, 0, len(o.wf.ids))
+		for _, t := range o.wf.ids {
+			expected = append(expected, SubscriptionName(o.wf.gen, t, s))
+		}
+		behind = append(behind, slotsBehind(expected, flushed, positions[fmt.Sprint(s)], fmt.Sprintf("%s/%d", o.srcSet, s))...)
 	}
 	if len(behind) > 0 {
 		return false, "subscriptions behind the source position: " + strings.Join(behind, ", "), nil
 	}
 	return true, "", nil
+}
+
+// slotsBehind lists the expected publisher slots that are missing,
+// unconfirmed, or behind want. Every expected slot must be present with a
+// non-NULL confirmed_flush_lsn at or past want: a slot the query did not
+// return means the subscription (or its slot) is gone, not that nothing is
+// left to apply, so its absence must never read as caught-up.
+func slotsBehind(expected []string, flushed map[string]int64, want int64, at string) []string {
+	var out []string
+	for _, name := range expected {
+		switch v, ok := flushed[name]; {
+		case !ok:
+			out = append(out, fmt.Sprintf("%s %s missing", at, name))
+		case v < 0:
+			out = append(out, fmt.Sprintf("%s %s has no confirmed flush position", at, name))
+		case v < want:
+			out = append(out, fmt.Sprintf("%s %s at %d of %d", at, name, v, want))
+		}
+	}
+	return out
+}
+
+// slotFlushPositions reads confirmed_flush_lsn of every replication slot
+// on the shard whose name matches pattern.
+func slotFlushPositions(ctx context.Context, dialer ShardDialer, set string, id int32, pattern string) (map[string]int64, error) {
+	conn, err := dialer.Dial(ctx, set, id)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	rows, err := conn.Query(ctx, `SELECT slot_name, coalesce((confirmed_flush_lsn - '0/0'::pg_lsn)::bigint, -1)
+		FROM pg_replication_slots WHERE slot_name LIKE $1 ORDER BY 1`, pattern)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int64{}
+	for rows.Next() {
+		var name string
+		var v int64
+		if err := rows.Scan(&name, &v); err != nil {
+			return nil, err
+		}
+		out[name] = v
+	}
+	return out, rows.Err()
 }
 
 // rowDigest is count(*) and the sum of per-row text hashes of one table

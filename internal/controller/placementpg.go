@@ -600,42 +600,49 @@ func (p *Placer) unlock(ctx context.Context, wf *placementWorkflow) error {
 // tables received, before the swap makes the shadows live. Every reference
 // holder must match the source exactly; under any other placement the
 // shadow slices must add up to the source. It runs under the fence after
-// the drain, so both sides are still. A run whose shadows were already
-// renamed (crash between swap and publish) skips the check.
+// the drain, so both sides are still. Shadows live on the new placement's
+// holders. A holder whose shadow is missing fails the verification closed
+// unless the durable swap marker (placementState.Swapped, persisted before
+// the first rename on that shard) covers it: only that marker proves the
+// swap began after a verification that already passed, so a shadow lost to
+// anything else can never publish a stale placement.
 func (p *Placer) verifyPlacement(ctx context.Context, wf *placementWorkflow) error {
-	var src rowDigest
-	for _, s := range wf.from.Sources() {
-		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, s, wf.spec.Database)
-		if err != nil {
-			return err
-		}
-		hasShadow, err := tableExists(ctx, conn, wf.spec.SchemaName, wf.shadow())
-		if err == nil && !hasShadow {
-			_ = conn.Close(ctx)
-			return nil
-		}
-		var d rowDigest
-		if err == nil {
-			d, err = digest(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, "")
-		}
-		_ = conn.Close(ctx)
-		if err != nil {
-			return err
-		}
-		src = src.add(d)
-	}
 	targets := map[int32]rowDigest{}
 	for _, t := range wf.rt.Holders() {
 		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
 		if err != nil {
 			return err
 		}
-		d, err := digest(ctx, conn, wf.spec.SchemaName, wf.shadow(), "")
+		hasShadow, err := tableExists(ctx, conn, wf.spec.SchemaName, wf.shadow())
+		if err == nil && !hasShadow {
+			_ = conn.Close(ctx)
+			if slices.Contains(wf.st.Swapped, t) {
+				return nil
+			}
+			return fatal("shadow of %s missing on shard %d before the swap began", wf.spec.table(), t)
+		}
+		var d rowDigest
+		if err == nil {
+			d, err = digest(ctx, conn, wf.spec.SchemaName, wf.shadow(), "")
+		}
 		_ = conn.Close(ctx)
 		if err != nil {
 			return err
 		}
 		targets[t] = d
+	}
+	var src rowDigest
+	for _, s := range wf.from.Sources() {
+		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, s, wf.spec.Database)
+		if err != nil {
+			return err
+		}
+		d, err := digest(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, "")
+		_ = conn.Close(ctx)
+		if err != nil {
+			return err
+		}
+		src = src.add(d)
 	}
 	if mismatches := placementMismatches(wf.spec.To.Placement, src, targets); len(mismatches) > 0 {
 		return fatal("placement verification of %s failed: %s", wf.spec.table(), strings.Join(mismatches, "; "))
@@ -674,12 +681,19 @@ func (p *Placer) swapAll(ctx context.Context, wf *placementWorkflow) error {
 		if slices.Contains(wf.from.Sources(), t) {
 			slot = wf.slotName(t)
 		}
+		resumed := slices.Contains(wf.st.Swapped, t)
+		if !resumed {
+			wf.st.Swapped = append(wf.st.Swapped, t)
+			if err := p.save(ctx, wf, fmt.Sprintf("swapping on shard %d", t)); err != nil {
+				return err
+			}
+		}
 		for attempt := 0; ; attempt++ {
 			conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
 			if err != nil {
 				return err
 			}
-			err = p.swapOn(ctx, wf, conn, slices.Contains(wf.rt.Holders(), t), slot)
+			err = p.swapOn(ctx, wf, conn, slices.Contains(wf.rt.Holders(), t), slot, resumed)
 			_ = conn.Close(ctx)
 			if errors.Is(err, errSwapLagged) {
 				if attempt >= 5 {
@@ -703,7 +717,7 @@ func (p *Placer) swapAll(ctx context.Context, wf *placementWorkflow) error {
 // transaction took its lock; the caller applies them and retries.
 var errSwapLagged = errors.New("replication slot still holds changes under the swap lock")
 
-func (p *Placer) swapOn(ctx context.Context, wf *placementWorkflow, conn ShardConn, holder bool, slot string) error {
+func (p *Placer) swapOn(ctx context.Context, wf *placementWorkflow, conn ShardConn, holder bool, slot string, resumed bool) error {
 	table, shadow, old := wf.shape.qualified(wf.spec.TableName), wf.shape.qualified(wf.shadow()), wf.shape.qualified(wf.old())
 	if _, err := conn.Exec(ctx, "BEGIN"); err != nil {
 		return err
@@ -724,6 +738,12 @@ func (p *Placer) swapOn(ctx context.Context, wf *placementWorkflow, conn ShardCo
 	if holder && !hasShadow {
 		if !hasTable {
 			return fatal("neither %s nor its shadow exists", table)
+		}
+		// Only the durable marker proves the live table is the renamed
+		// shadow of an interrupted swap; without it the table is the old
+		// data and the shadow is lost, so the swap must not proceed.
+		if !resumed {
+			return fatal("shadow of %s missing before the swap began", table)
 		}
 		return nil
 	}

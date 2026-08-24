@@ -17,13 +17,11 @@ type fakeBarrierStore struct {
 	fenced    bool
 	fencedAt  time.Time
 	preparing int
-	// lateDecisions is the number of decision rows created after the fence.
-	lateDecisions  int
-	watermarkReads int
-	recorded       []RestorePoint
-	journal        *[]string
-	fail           map[string]error
-	now            func() time.Time
+	watermark int64
+	recorded  []RestorePoint
+	journal   *[]string
+	fail      map[string]error
+	now       func() time.Time
 }
 
 func (s *fakeBarrierStore) log(step string) {
@@ -71,11 +69,7 @@ func (s *fakeBarrierStore) PreparingCount(context.Context) (int, error) {
 func (s *fakeBarrierStore) DecisionWatermark(context.Context) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.watermarkReads++
-	if s.watermarkReads == 1 {
-		return 0, nil
-	}
-	return int64(s.lateDecisions), nil
+	return s.watermark, nil
 }
 
 func (s *fakeBarrierStore) Exists(_ context.Context, name string) (bool, error) {
@@ -118,6 +112,8 @@ type fakeGroups struct {
 	archiveAfter map[string]int
 	polls        map[string]int
 	store        *fakeBarrierStore
+	// onRestorePoint runs on every CreateRestorePoint, before the point.
+	onRestorePoint func()
 }
 
 func (g *fakeGroups) List(context.Context) ([]GroupRef, error) {
@@ -145,6 +141,9 @@ func (g *fakeGroups) CreateRestorePoint(_ context.Context, ref GroupRef, name st
 	}
 	if g.store != nil && !g.store.fenced {
 		return RestorePointResult{}, errors.New("restore point created without the fence")
+	}
+	if g.onRestorePoint != nil {
+		g.onRestorePoint()
 	}
 	g.points[ref.Name] = append(g.points[ref.Name], name)
 	n := len(g.points[ref.Name])
@@ -197,6 +196,7 @@ func TestBarrierHappyPathStepOrder(t *testing.T) {
 	}
 	want := []string{
 		"fence barrier nightly-1",
+		"preparing=0", "prepared catalog=0", "prepared shard0=0", "prepared shard1=0",
 		"preparing=0", "prepared catalog=0", "prepared shard0=0", "prepared shard1=0",
 		"restorepoint catalog pgshard-nightly-1", "restorepoint shard0 pgshard-nightly-1", "restorepoint shard1 pgshard-nightly-1",
 		"archived catalog", "archived shard0", "archive-wait shard1", "archive-wait shard1", "archived shard1",
@@ -264,7 +264,12 @@ func TestBarrierFailuresReleaseTheFence(t *testing.T) {
 		{"restore point error", func(f *barrierFixture) { f.groups.fail["restorepoint:shard1"] = errors.New("read only") }, "restore point on shard1: read only"},
 		{"archive error", func(f *barrierFixture) { f.groups.fail["archive:catalog"] = errors.New("archive_mode is off") }, "archive of catalog: archive_mode is off"},
 		{"archive timeout", func(f *barrierFixture) { f.groups.archiveAfter["shard0"] = 1 << 20 }, "archive of shard0: 000000010000000000000001 not archived after 50ms"},
-		{"late transactions", func(f *barrierFixture) { f.store.lateDecisions = 2 }, "2 two-phase transaction(s) started while the fence was up"},
+		{"late transactions", func(f *barrierFixture) {
+			var once sync.Once
+			f.groups.onRestorePoint = func() {
+				once.Do(func() { f.store.mu.Lock(); f.store.watermark += 2; f.store.mu.Unlock() })
+			}
+		}, "2 two-phase transaction(s) started while the fence was up"},
 		{"record error", func(f *barrierFixture) { f.store.fail["record"] = errors.New("disk full") }, "record: disk full"},
 	}
 	for _, c := range cases {
@@ -331,5 +336,24 @@ func TestBarrierCancellationReleasesTheFence(t *testing.T) {
 	}
 	if f.store.fenced {
 		t.Fatal("fence left raised after cancellation")
+	}
+}
+
+// TestBarrierToleratesDecisionsSettledDuringDrain: two-phase commits that
+// began before every router observed the fence and finished during the
+// drain must not invalidate the restore points.
+func TestBarrierToleratesDecisionsSettledDuringDrain(t *testing.T) {
+	f := newBarrierFixture()
+	f.store.preparing = 1
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		f.store.mu.Lock()
+		f.store.watermark += 5
+		f.store.preparing = 0
+		f.store.mu.Unlock()
+	}()
+	f.b.DrainTimeout = 2 * time.Second
+	if _, err := f.b.Run(context.Background(), "settled"); err != nil {
+		t.Fatalf("decisions that settled during the drain must not fail the barrier: %v\n%s", err, strings.Join(f.journal, "\n"))
 	}
 }

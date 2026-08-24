@@ -413,8 +413,12 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 			return true, retryf("%s", why)
 		}
 		if !maps.Equal(pos, wf.cutover.Positions) {
+			// The movement may carry sequence advances the earlier
+			// StepSequences did not see, so the switch jumps back there
+			// and re-carries them before another flip attempt.
 			wf.cutover.Positions = pos
-			if err := c.saveCutover(ctx, wf, "switching: sources advanced before the flip; positions re-recorded"); err != nil {
+			wf.cutover.Step = StepSequences
+			if err := c.saveCutover(ctx, wf, "switching: sources advanced before the flip; re-carrying sequences"); err != nil {
 				return false, err
 			}
 			return true, retryf("sources advanced past the recorded positions before the flip")

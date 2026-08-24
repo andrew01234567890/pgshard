@@ -75,9 +75,13 @@ type placementState struct {
 	LagBytes  int64            `json:"lag_bytes"`
 	FencedAt  *time.Time       `json:"fenced_at,omitempty"`
 	SwappedAt *time.Time       `json:"swapped_at,omitempty"`
-	PauseMS   int64            `json:"pause_ms,omitempty"`
-	Attempts  int              `json:"attempts,omitempty"`
-	Aborts    []string         `json:"aborts,omitempty"`
+	// Swapped lists the shards whose swap transaction was started; the
+	// marker is persisted before the first rename on a shard, so only a
+	// resume that finds it may treat a missing shadow as already swapped.
+	Swapped  []int32  `json:"swapped,omitempty"`
+	PauseMS  int64    `json:"pause_ms,omitempty"`
+	Attempts int      `json:"attempts,omitempty"`
+	Aborts   []string `json:"aborts,omitempty"`
 	// ReplicaIdentityFull lists the sources whose table got REPLICA
 	// IDENTITY FULL for the run.
 	ReplicaIdentityFull []int32 `json:"replica_identity_full,omitempty"`
