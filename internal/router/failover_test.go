@@ -229,7 +229,7 @@ func TestOutputAlreadySentPassesFailoverErrorThrough(t *testing.T) {
 	h := newHarness(t)
 	conn := h.connect(t, h.dsn("app", "secret", "app"))
 	start := time.Now()
-	_, err := conn.Exec(context.Background(), "select then stale", pgx.QueryExecModeSimpleProtocol)
+	_, err := conn.Exec(context.Background(), "select midrow_stale", pgx.QueryExecModeSimpleProtocol)
 	if sqlstate(err) != "55000" {
 		t.Fatalf("stale after output: %v", err)
 	}

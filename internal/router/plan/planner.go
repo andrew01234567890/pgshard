@@ -30,17 +30,21 @@ func NewWithMetrics(m pgparser.Metrics) *Planner {
 const cursorOptHold = 0x0020
 
 // Plan parses sql and resolves the shards it touches for sess. Text the
-// bound grammar cannot parse is planned onto the home shard so the backend
-// reports the syntax error itself.
+// bound grammar rejects is refused outright: forwarding it would run it on
+// the home shard alone, silently skipping the shards a newer server's
+// grammar would have targeted.
 func (p *Planner) Plan(ctx context.Context, sess Session, sql string) (Plan, error) {
 	res, err := p.parser.Parse(ctx, sql)
 	if err != nil {
 		var perr *pgparser.Error
-		if errors.As(err, &perr) && perr.SQLState != pgparser.SyntaxErrorSQLState {
+		if errors.As(err, &perr) {
 			e := pgwire.Errorf(perr.SQLState, "%s", perr.Message)
+			if perr.SQLState == pgparser.SyntaxErrorSQLState {
+				e.Hint = "the router only forwards SQL the PostgreSQL 18 grammar accepts"
+			}
 			return Plan{Kind: Refuse, Err: e}, e
 		}
-		return sess.unsharded(), nil
+		return Plan{}, err
 	}
 	if len(res.Stmts) == 0 {
 		return sess.session(), nil

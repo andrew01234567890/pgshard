@@ -665,3 +665,20 @@ func TestPanicInPlanningIsConfinedToTheSession(t *testing.T) {
 		t.Fatalf("server did not survive the panic: %v", err)
 	}
 }
+
+func TestUnparseableWriteIsRefusedNotHomeRouted(t *testing.T) {
+	h := newShardedHarness(t)
+	ctx := context.Background()
+	conn := h.connect(t, h.dsn())
+
+	_, err := conn.Exec(ctx, "repack table orders", pgx.QueryExecModeSimpleProtocol)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "42601" {
+		t.Fatalf("PG19-only write must be refused with a syntax error, got %v", err)
+	}
+	for i := range h.poolers {
+		if h.ranOn(i, "repack") {
+			t.Fatalf("shard %d ran the statement the router could not parse", i)
+		}
+	}
+}

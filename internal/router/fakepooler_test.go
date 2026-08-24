@@ -485,7 +485,7 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 	case q == "copy t from stdin":
 		s.inCopy = true
 		return false, s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_CopyInResponse{CopyInResponse: &pgshardv1.CopyInResponse{}}})
-	case q == "select then stale":
+	case q == "select midrow_stale":
 		if err := s.rowDesc("n", 23); err != nil {
 			return true, err
 		}
