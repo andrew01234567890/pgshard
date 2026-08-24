@@ -57,6 +57,7 @@ type Pool struct {
 
 	mu      sync.Mutex
 	roles   map[poolKey]*rolePool
+	sems    map[string]chan struct{}
 	closed  bool
 	changed chan struct{}
 }
@@ -68,6 +69,8 @@ type poolKey struct {
 	role     string
 }
 
+// rolePool holds the idle backends of one (database, role); sem is the
+// role's shard-wide quota, shared by every database the role connects to.
 type rolePool struct {
 	sem  chan struct{}
 	idle []*Backend
@@ -82,14 +85,19 @@ func NewPool(cfg PoolConfig, d Dialer) *Pool {
 
 func newPool(cfg PoolConfig, dial dialFunc) *Pool {
 	cfg = cfg.withDefaults()
-	return &Pool{cfg: cfg, dial: dial, total: make(chan struct{}, cfg.MaxBackends), roles: map[poolKey]*rolePool{}, changed: make(chan struct{})}
+	return &Pool{cfg: cfg, dial: dial, total: make(chan struct{}, cfg.MaxBackends), roles: map[poolKey]*rolePool{}, sems: map[string]chan struct{}{}, changed: make(chan struct{})}
 }
 
 func (p *Pool) role(database, role string) *rolePool {
 	k := poolKey{database: database, role: role}
 	rp, ok := p.roles[k]
 	if !ok {
-		rp = &rolePool{sem: make(chan struct{}, p.cfg.MaxPerRole)}
+		sem, ok := p.sems[role]
+		if !ok {
+			sem = make(chan struct{}, p.cfg.MaxPerRole)
+			p.sems[role] = sem
+		}
+		rp = &rolePool{sem: sem}
 		p.roles[k] = rp
 	}
 	return rp

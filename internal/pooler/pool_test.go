@@ -61,6 +61,27 @@ func TestPoolPerRoleCapPreventsStarvation(t *testing.T) {
 	}
 }
 
+func TestPoolPerRoleCapIsGlobalAcrossDatabases(t *testing.T) {
+	pg := newFakePG()
+	p := newPool(PoolConfig{MaxBackends: 8, MaxPerRole: 2, AcquireTimeout: 100 * time.Millisecond}, pg.dial)
+	ctx := context.Background()
+	if _, err := p.Acquire(ctx, "db1", "hot", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Acquire(ctx, "db2", "hot", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Acquire(ctx, "db3", "hot", nil, nil); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("a role must not get MaxPerRole backends per database: %v", err)
+	}
+	if _, err := p.Acquire(ctx, "db3", "quiet", nil, nil); err != nil {
+		t.Fatalf("quiet role must still get a backend: %v", err)
+	}
+	if live, _ := p.Stats(); live != 3 {
+		t.Fatalf("live = %d", live)
+	}
+}
+
 func TestPoolWaitsForSlotThenProceeds(t *testing.T) {
 	pg := newFakePG()
 	p := newPool(PoolConfig{MaxBackends: 1, AcquireTimeout: 2 * time.Second}, pg.dial)
