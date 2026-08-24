@@ -60,7 +60,10 @@ jobs:
             echo "::error::internal/gen is out of date; run 'make proto' and commit the result"
             exit 1
           fi
-          git status --porcelain -- internal/gen | grep -q . && { echo "::error::untracked generated files under internal/gen"; exit 1; } || true
+          if git status --porcelain -- internal/gen | grep -q .; then
+            echo "::error::untracked generated files under internal/gen"
+            exit 1
+          fi
 
   govulncheck:
     name: govulncheck
