@@ -340,6 +340,35 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 	case q == "rollback":
 		b.tx, b.xidAssigned = 'I', false
 		return true, s.complete("ROLLBACK")
+	case strings.HasPrefix(q, "savepoint "):
+		return true, s.complete("SAVEPOINT")
+	case strings.HasPrefix(q, "rollback to "):
+		return true, s.complete("ROLLBACK")
+	case strings.HasPrefix(q, "release "):
+		return true, s.complete("RELEASE")
+	case strings.HasPrefix(q, "prepare ") && strings.Contains(q, " as "):
+		name, body, _ := strings.Cut(strings.TrimPrefix(q, "prepare "), " as ")
+		b.stmts[strings.TrimSpace(name)] = strings.TrimSpace(body)
+		return true, s.complete("PREPARE")
+	case strings.HasPrefix(q, "execute "):
+		body, ok := b.stmts[strings.TrimSpace(strings.TrimPrefix(q, "execute "))]
+		if !ok {
+			return true, s.errorf("26000", "prepared statement does not exist")
+		}
+		return s.query(ctx, body)
+	case q == "deallocate all":
+		b.stmts = map[string]string{}
+		return true, s.complete("DEALLOCATE ALL")
+	case strings.HasPrefix(q, "deallocate "):
+		name := strings.Trim(strings.TrimSpace(strings.TrimPrefix(q, "deallocate ")), `"`)
+		if _, ok := b.stmts[name]; !ok {
+			return true, s.errorf("26000", "prepared statement \""+name+"\" does not exist")
+		}
+		delete(b.stmts, name)
+		return true, s.complete("DEALLOCATE")
+	case q == "discard all":
+		b.gucs, b.stmts = map[string]string{}, map[string]string{}
+		return true, s.complete("DISCARD ALL")
 	case q == "select pg_current_xact_id_if_assigned() is not null":
 		if err := s.rowDesc("?column?", 16); err != nil {
 			return true, err

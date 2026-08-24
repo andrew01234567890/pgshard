@@ -111,13 +111,24 @@ func classify(node *pgquerypb.Node, c *StmtClass) error {
 			c.Txn = TxnCommit
 		case pgquerypb.TransactionStmtKind_TRANS_STMT_ROLLBACK:
 			c.Txn = TxnRollback
-		case pgquerypb.TransactionStmtKind_TRANS_STMT_SAVEPOINT, pgquerypb.TransactionStmtKind_TRANS_STMT_RELEASE,
-			pgquerypb.TransactionStmtKind_TRANS_STMT_ROLLBACK_TO:
-			c.Txn = TxnSavepoint
+		case pgquerypb.TransactionStmtKind_TRANS_STMT_SAVEPOINT:
+			c.Txn, c.Savepoint = TxnSavepoint, t.GetSavepointName()
+		case pgquerypb.TransactionStmtKind_TRANS_STMT_RELEASE:
+			c.Txn, c.Savepoint = TxnRelease, t.GetSavepointName()
+		case pgquerypb.TransactionStmtKind_TRANS_STMT_ROLLBACK_TO:
+			c.Txn, c.Savepoint = TxnRollbackTo, t.GetSavepointName()
 		case pgquerypb.TransactionStmtKind_TRANS_STMT_PREPARE, pgquerypb.TransactionStmtKind_TRANS_STMT_COMMIT_PREPARED,
 			pgquerypb.TransactionStmtKind_TRANS_STMT_ROLLBACK_PREPARED:
 			return notYet("PREPARE TRANSACTION, COMMIT PREPARED and ROLLBACK PREPARED are reserved for the router's transaction coordinator",
 				"use COMMIT; the router runs two-phase commit itself when a transaction writes to several shards")
+		}
+	case *pgquerypb.Node_PrepareStmt:
+		c.Session, c.SessionName = SessionPrepare, n.PrepareStmt.GetName()
+	case *pgquerypb.Node_DeallocateStmt:
+		c.Session, c.SessionName = SessionDeallocate, n.DeallocateStmt.GetName()
+	case *pgquerypb.Node_DiscardStmt:
+		if n.DiscardStmt.GetTarget() == pgquerypb.DiscardMode_DISCARD_ALL {
+			c.Session = SessionDiscardAll
 		}
 	case *pgquerypb.Node_VariableSetStmt:
 		s := n.VariableSetStmt

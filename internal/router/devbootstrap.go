@@ -133,3 +133,5 @@ func (b DevBootstrap) verifier(ctx context.Context, cat *pgx.Conn) (string, erro
 func quoteLiteral(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
+
+func quoteIdent(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"` }

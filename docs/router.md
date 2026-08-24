@@ -63,9 +63,20 @@ the rest with `0A000`. See *Routing* below.
   releases the pin (`Release`, which rolls back and `DISCARD ALL`s) so the
   backend returns to the pool; the next statement re-pins and **replays** the
   committed GUCs and prepared statements onto whatever backend it gets. GUCs
-  set inside a transaction that rolls back are not replayed. A lost pooler
-  stream is reported as `08006` and the next statement reacquires and
-  replays too.
+  set inside a transaction that rolls back are not replayed, nor are those
+  set after a savepoint the transaction rolled back to. SQL-level
+  `PREPARE` pins and is replayed like a named protocol statement;
+  `DEALLOCATE` (of either kind of statement, protocol names are rewritten
+  to their physical name) and `DEALLOCATE ALL`/`DISCARD ALL` stop the
+  replay of what they dropped. A lost pooler stream is reported as `08006`
+  and the next statement reacquires and replays too.
+- **Transaction-mode caveats.** As with PgBouncer in transaction mode,
+  state that the router does not track is lost when the backend changes:
+  the unnamed prepared statement lives only until the next `Sync` (a
+  `Parse` of `""` in one batch and a `Bind` of it in a later one may land on
+  different backends), `SET LOCAL` is honoured only within its transaction,
+  and advisory locks, `LISTEN` (refused) and temporary tables (refused) do
+  not survive a release.
 - **Cancel.** A `CancelRequest` is verified against the session's key and
   forwarded as the pooler `Cancel` RPC; a query context that ends while a
   batch is in flight (drain) does the same. The batch is always drained to

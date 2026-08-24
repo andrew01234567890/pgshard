@@ -552,7 +552,7 @@ func (e *Executor) txnControl(ctx context.Context, class StmtClass, w pgwire.Res
 			return true, pgwire.Errorf(pgwire.CodeFeatureNotSupported, "COMMIT/ROLLBACK AND CHAIN is not available in a multi-shard transaction")
 		}
 		return true, e.endTxn(ctx, class.Txn == plan.TxnCommit, w)
-	case plan.TxnSavepoint:
+	case plan.TxnSavepoint, plan.TxnRelease, plan.TxnRollbackTo:
 		return true, pgwire.Errorf(pgwire.CodeFeatureNotSupported, "savepoints are not available once a transaction spans several shards")
 	}
 	return false, nil

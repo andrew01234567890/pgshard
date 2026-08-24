@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -76,6 +77,13 @@ func (p prepared) paramOIDs() []uint32 {
 }
 
 // execItem is one statement a batch executed, for the transaction prelude.
+type sqlPreparedStmt struct{ name, sql string }
+
+type savepointMark struct {
+	name   string
+	staged int
+}
+
 type execItem struct {
 	sql   string
 	local bool
@@ -118,6 +126,12 @@ type Executor struct {
 	// stagedMark is the staged length before the current extended batch.
 	stagedMark int
 	stmts      map[string]prepared
+	// sqlPrepared are the SQL-level PREPAREd statements, in creation
+	// order, replayed like named protocol statements.
+	sqlPrepared []sqlPreparedStmt
+	// savepoints marks the staged length at each open savepoint so
+	// ROLLBACK TO drops the settings staged after it.
+	savepoints []savepointMark
 	// portals maps portal names to logical statement names.
 	portals map[string]string
 
@@ -322,7 +336,7 @@ func (e *Executor) physical(name string) string {
 }
 
 func (e *Executor) needsPin() bool {
-	if len(e.gucs) > 0 || len(e.staged) > 0 {
+	if len(e.gucs) > 0 || len(e.staged) > 0 || len(e.sqlPrepared) > 0 {
 		return true
 	}
 	for name := range e.stmts {
@@ -389,6 +403,11 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 	if handled, err := e.txnControl(ctx, pl.Class, w); handled {
 		return e.afterBatch(ctx, err)
 	}
+	if pl.Class.Session == plan.SessionDeallocate {
+		if _, protocol := e.stmts[pl.Class.SessionName]; protocol && pl.Class.SessionName != "" {
+			sql = "DEALLOCATE " + quoteIdent(e.physical(pl.Class.SessionName))
+		}
+	}
 	reqs := []*pgshardv1.ExecuteRequest{simpleQuery(sql)}
 	if fill := pl.Sequences; fill != nil {
 		params, values, err := e.sequenceValues(ctx, fill)
@@ -420,7 +439,7 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 				return err
 			}
 		}
-		if pl.Class.SetGUC {
+		if pl.Class.SetGUC || pl.Class.Session == plan.SessionPrepare {
 			if err := e.ensurePinned(ctx); err != nil {
 				return err
 			}
@@ -437,8 +456,67 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 		if pl.Class.SetGUC && err == nil {
 			e.staged = append(e.staged, gucEntry{name: pl.Class.GUCName, sql: sql, value: pl.Class.GUCValue, searchPath: pl.Class.SearchPath})
 		}
+		if err == nil {
+			e.noteSessionEffect(pl.Class, sql)
+		}
 		return err
 	})
+}
+
+// noteSessionEffect records what a completed statement did to the session
+// state the router replays: savepoints scope staged settings, SQL PREPARE
+// adds a replayed statement, DEALLOCATE and DISCARD ALL drop them.
+func (e *Executor) noteSessionEffect(class StmtClass, sql string) {
+	switch class.Txn {
+	case plan.TxnSavepoint:
+		e.savepoints = append(e.savepoints, savepointMark{name: class.Savepoint, staged: len(e.staged)})
+	case plan.TxnRollbackTo:
+		if i := e.savepointIndex(class.Savepoint); i >= 0 {
+			e.staged = e.staged[:min(e.savepoints[i].staged, len(e.staged))]
+			e.savepoints = e.savepoints[:i+1]
+		}
+	case plan.TxnRelease:
+		if i := e.savepointIndex(class.Savepoint); i >= 0 {
+			e.savepoints = e.savepoints[:i]
+		}
+	}
+	switch class.Session {
+	case plan.SessionPrepare:
+		e.forgetSQLPrepared(class.SessionName)
+		e.sqlPrepared = append(e.sqlPrepared, sqlPreparedStmt{name: class.SessionName, sql: sql})
+	case plan.SessionDeallocate:
+		if class.SessionName == "" {
+			e.sqlPrepared = nil
+			e.forgetNamedStatements()
+			return
+		}
+		e.forgetSQLPrepared(class.SessionName)
+		delete(e.stmts, class.SessionName)
+	case plan.SessionDiscardAll:
+		e.gucs, e.staged, e.savepoints, e.sqlPrepared = nil, nil, nil, nil
+		e.forgetNamedStatements()
+	}
+}
+
+func (e *Executor) savepointIndex(name string) int {
+	for i := len(e.savepoints) - 1; i >= 0; i-- {
+		if e.savepoints[i].name == name {
+			return i
+		}
+	}
+	return -1
+}
+
+func (e *Executor) forgetSQLPrepared(name string) {
+	e.sqlPrepared = slices.DeleteFunc(e.sqlPrepared, func(p sqlPreparedStmt) bool { return p.name == name })
+}
+
+func (e *Executor) forgetNamedStatements() {
+	for name := range e.stmts {
+		if name != "" {
+			delete(e.stmts, name)
+		}
+	}
 }
 
 // withFailover runs one statement through run, buffering it while its shard
@@ -799,6 +877,9 @@ func (e *Executor) sync(ctx context.Context) error {
 		pin = pin || name != ""
 		fresh[name] = true
 	}
+	for _, item := range executed {
+		pin = pin || item.class.Session == plan.SessionPrepare
+	}
 	e.batch, e.batchStmts, e.batchWriter, e.batchTarget, e.batchExec = nil, nil, nil, nil, nil
 	e.pendingDescribes, e.describes = e.describes, nil
 	if len(batch) == 0 {
@@ -878,6 +959,7 @@ func (e *Executor) sync(ctx context.Context) error {
 		if err == nil {
 			for _, item := range executed {
 				e.noteExecuted(item.sql, item.local)
+				e.noteSessionEffect(item.class, item.sql)
 			}
 		}
 		return err
@@ -890,6 +972,7 @@ func (e *Executor) afterBatch(ctx context.Context, err error) error {
 	if e.tx == pgwire.TxIdle {
 		e.txnPrelude, e.txnTouched = nil, false
 		e.wroteHere, e.gid = false, ""
+		e.savepoints = nil
 		e.dropParked()
 		switch {
 		case err != nil || strings.HasPrefix(e.lastTag, "ROLLBACK"):
@@ -1009,6 +1092,14 @@ func (e *Executor) replay(ctx context.Context, skip map[string]bool) error {
 		}
 		if err := e.pump(ctx, discardWriter{}); err != nil {
 			return fmt.Errorf("router: replaying session settings: %w", err)
+		}
+	}
+	for _, p := range e.sqlPrepared {
+		if err := e.send(simpleQuery(p.sql)); err != nil {
+			return err
+		}
+		if err := e.pump(ctx, discardWriter{}); err != nil {
+			return fmt.Errorf("router: replaying prepared statement %q: %w", p.name, err)
 		}
 	}
 	return e.replayStatements(ctx, skip)
