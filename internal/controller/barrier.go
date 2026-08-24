@@ -192,12 +192,21 @@ func (b *Barrier) fenced(ctx context.Context, name string, groups []GroupRef) (R
 	if _, err := b.Store.FencedAt(ctx); err != nil {
 		return RestorePoint{}, fmt.Errorf("barrier %s: %w", name, err)
 	}
+	if err := b.drain(ctx, name, groups); err != nil {
+		return RestorePoint{}, err
+	}
 	// Decision rows are deleted once a transaction finishes, so a row count
-	// cannot prove nothing started under the fence; the watermark can.
+	// cannot prove nothing started under the fence; the watermark can. It is
+	// read only after the drain: a two-phase commit that began before every
+	// router observed the fence and settled during the drain does not
+	// invalidate the points.
 	before, err := b.Store.DecisionWatermark(ctx)
 	if err != nil {
 		return RestorePoint{}, fmt.Errorf("barrier %s: %w", name, err)
 	}
+	// A decision begun between the last drain poll and the watermark read
+	// would evade both checks; drain again so everything at or under the
+	// watermark has settled before the points are taken.
 	if err := b.drain(ctx, name, groups); err != nil {
 		return RestorePoint{}, err
 	}
