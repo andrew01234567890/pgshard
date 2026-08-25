@@ -30,7 +30,7 @@ func (s *fakeBarrierStore) log(step string) {
 
 func (s *fakeBarrierStore) Lock(context.Context) (func(), error) { return func() {}, nil }
 
-func (s *fakeBarrierStore) Fence(_ context.Context, active bool, reason string) error {
+func (s *fakeBarrierStore) Fence(_ context.Context, active bool, reason, _ string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.fail["fence"]; err != nil && active {

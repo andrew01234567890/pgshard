@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 )
 
@@ -133,4 +134,39 @@ func TestBarrierLockSerializesOnPostgres(t *testing.T) {
 		t.Fatalf("lock after release: %v", err)
 	}
 	unlock2()
+}
+
+// TestWriteFenceOwnerCASOnPostgres: the fence is cleared only by its owner, so
+// a barrier that lost its lock session cannot clear a fence a later barrier
+// has raised.
+func TestWriteFenceOwnerCASOnPostgres(t *testing.T) {
+	f := newResolverFixtureWith(t)
+	ctx := context.Background()
+	fenced := func() bool {
+		var v bool
+		if err := f.pool.QueryRow(ctx, `SELECT write_fence FROM pgshard.shard_map_generation`).Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	if err := catalog.RaiseWriteFence(ctx, f.pool, "run A", "owner-A"); err != nil {
+		t.Fatal(err)
+	}
+	if !fenced() {
+		t.Fatal("fence not raised")
+	}
+	// A stale release from a different owner must not clear it.
+	if cleared, err := catalog.ReleaseWriteFence(ctx, f.pool, "owner-B"); err != nil || cleared {
+		t.Fatalf("foreign owner cleared the fence: cleared=%v err=%v", cleared, err)
+	}
+	if !fenced() {
+		t.Fatal("fence dropped by a non-owner")
+	}
+	// The owner clears it.
+	if cleared, err := catalog.ReleaseWriteFence(ctx, f.pool, "owner-A"); err != nil || !cleared {
+		t.Fatalf("owner failed to clear: cleared=%v err=%v", cleared, err)
+	}
+	if fenced() {
+		t.Fatal("fence still up after owner release")
+	}
 }
