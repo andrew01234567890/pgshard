@@ -63,17 +63,29 @@ type BarrierGroups interface {
 	// ArchivedThrough reports the newest WAL segment g archived. A group
 	// that does not archive WAL returns an error.
 	ArchivedThrough(ctx context.Context, g GroupRef) (string, error)
-	// PauseWrites makes g's primary refuse new writing transactions, so the
-	// pause a certified barrier promises is enforced by PostgreSQL itself
-	// rather than by routers that may not have observed the fence yet. It is
-	// only ever called for shard groups: user data lives there, while the
-	// barrier itself, its resolver and the recording of the point must keep
-	// writing to the catalog.
-	PauseWrites(ctx context.Context, g GroupRef, pause bool) error
-	// WriterCount counts client backends on g holding a write transaction:
-	// ordinary writes that started before the pause and must finish before
-	// the restore points are taken.
-	WriterCount(ctx context.Context, g GroupRef) (int, error)
+	// PauseWrites makes g's primary refuse new writing transactions and, when
+	// pausing, returns the primary's clock once the pause is confirmed
+	// effective on a fresh connection. It is only ever called for shard
+	// groups: user data lives there, while the barrier itself, its resolver
+	// and the recording of the point must keep writing to the catalog.
+	//
+	// The pause is a strong default, not an unbypassable fence: a session can
+	// still opt out of it. Certification therefore never rests on the pause
+	// alone — Verify re-checks it, and the writers it did keep out, before
+	// anything is recorded.
+	PauseWrites(ctx context.Context, g GroupRef, pause bool) (time.Time, error)
+	// WritersSince counts backends on g that could still write into the
+	// window: any with an assigned transaction id, and any whose transaction
+	// began at or before the pause landed and is therefore still read-write
+	// however the pause was set afterwards.
+	WritersSince(ctx context.Context, g GroupRef, since time.Time) (int, error)
+	// PauseEffective reports, on a fresh connection, whether new transactions
+	// on g still default to read only.
+	PauseEffective(ctx context.Context, g GroupRef) (bool, error)
+	// SubscriptionCount counts enabled logical replication subscriptions on
+	// g. Their apply workers write outside the pause and outside the drain,
+	// so a barrier cannot certify a group that is applying a copy.
+	SubscriptionCount(ctx context.Context, g GroupRef) (int, error)
 }
 
 // BarrierStore is the catalog side of a barrier.
@@ -90,9 +102,9 @@ type BarrierStore interface {
 	Fence(ctx context.Context, active bool, reason, owner string) error
 	// FenceRaised reports whether the cluster write fence is up.
 	FenceRaised(ctx context.Context) (bool, error)
-	// ForceFence clears the fence regardless of its owner token, for
-	// recovering a fence whose barrier died.
-	ForceFence(ctx context.Context, active bool) error
+	// FenceOwnedBy reports whether the raised fence still carries owner, so a
+	// run can prove it still owns the pause it is about to certify.
+	FenceOwnedBy(ctx context.Context, owner string) (bool, error)
 	// FencedAt returns when the current fence was raised.
 	FencedAt(ctx context.Context) (time.Time, error)
 	// DecisionWatermark returns a value that grows with every decision row
@@ -251,15 +263,23 @@ func (b *Barrier) run(ctx context.Context, name string) (RestorePoint, error) {
 	// until the last restore point is archived: that, not the catalog flag,
 	// is what makes the points a common commit barrier.
 	var rp RestorePoint
-	err = b.pauseAll(ctx, name, groups)
+	at, err := b.pauseAll(ctx, name, groups)
 	if err == nil {
-		rp, err = b.fenced(ctx, name, groups)
+		rp, err = b.fenced(ctx, name, owner, groups, at)
 	}
 	// The pause and the fence are lifted even when ctx is done.
 	release, cancel := context.WithTimeout(context.WithoutCancel(ctx), pauseReleaseTimeout)
 	defer cancel()
-	if rerr := b.resumeAll(release, name, groups); rerr != nil && err == nil {
-		err = rerr
+	rerr := b.resumeAll(release, name, groups)
+	if rerr != nil {
+		// Leave the fence raised: it is the only durable trace that shards
+		// are still paused, and the recovery pass keeps retrying the resume
+		// while it is up. Clearing it here would strand them silently.
+		if err == nil {
+			err = rerr
+		}
+		b.logger().Error("barrier: shards left paused; keeping the write fence raised so recovery retries", "barrier", name)
+		return RestorePoint{}, err
 	}
 	if rerr := b.Store.Fence(release, false, "", owner); rerr != nil {
 		b.logger().Error("barrier: releasing the write fence failed; routers keep refusing writes", "barrier", name, "err", rerr)
@@ -276,14 +296,14 @@ func (b *Barrier) run(ctx context.Context, name string) (RestorePoint, error) {
 }
 
 // fenced runs the steps between raising and releasing the fence.
-func (b *Barrier) fenced(ctx context.Context, name string, groups []GroupRef) (RestorePoint, error) {
+func (b *Barrier) fenced(ctx context.Context, name, owner string, groups []GroupRef, at map[string]time.Time) (RestorePoint, error) {
 	if _, err := b.Store.FencedAt(ctx); err != nil {
 		return RestorePoint{}, fmt.Errorf("barrier %s: %w", name, err)
 	}
 	if err := b.drain(ctx, name, groups); err != nil {
 		return RestorePoint{}, err
 	}
-	if err := b.drainWriters(ctx, name, groups); err != nil {
+	if err := b.drainWriters(ctx, name, groups, at); err != nil {
 		return RestorePoint{}, err
 	}
 	// Decision rows are deleted once a transaction finishes, so a row count
@@ -301,7 +321,7 @@ func (b *Barrier) fenced(ctx context.Context, name string, groups []GroupRef) (R
 	if err := b.drain(ctx, name, groups); err != nil {
 		return RestorePoint{}, err
 	}
-	if err := b.drainWriters(ctx, name, groups); err != nil {
+	if err := b.drainWriters(ctx, name, groups, at); err != nil {
 		return RestorePoint{}, err
 	}
 	rp := RestorePoint{Name: name, Certified: true}
@@ -325,6 +345,11 @@ func (b *Barrier) fenced(ctx context.Context, name string, groups []GroupRef) (R
 	if rp.ShardMapGeneration, err = b.Store.ShardMapGeneration(ctx); err != nil {
 		return RestorePoint{}, fmt.Errorf("barrier %s: shard map generation: %w", name, err)
 	}
+	// Everything above rests on the pause having held for the whole window;
+	// prove that before the point is called certified.
+	if err := b.verify(ctx, name, owner, groups, at); err != nil {
+		return RestorePoint{}, err
+	}
 	rp.CreatedAt = b.now()
 	if rp.ID, err = b.Store.Record(ctx, rp); err != nil {
 		return RestorePoint{}, fmt.Errorf("barrier %s: record: %w", name, err)
@@ -343,16 +368,70 @@ const pauseReleaseTimeout = 30 * time.Second
 // never paused — the barrier, its resolver and the recorded point all write
 // there, and 2PC activity in the window is caught by the decision watermark
 // instead.
-func (b *Barrier) pauseAll(ctx context.Context, name string, groups []GroupRef) error {
+func (b *Barrier) pauseAll(ctx context.Context, name string, groups []GroupRef) (map[string]time.Time, error) {
+	// An enabled subscription applies rows through workers that neither the
+	// pause nor the drain can see, so a group receiving a copy cannot be part
+	// of a consistent point at all.
 	for _, g := range groups {
 		if g.Catalog() {
 			continue
 		}
-		if err := b.Groups.PauseWrites(ctx, g, true); err != nil {
-			return fmt.Errorf("barrier %s: pause writes on %s: %w", name, g.Name, err)
+		n, err := b.Groups.SubscriptionCount(ctx, g)
+		if err != nil {
+			return nil, fmt.Errorf("barrier %s: subscriptions on %s: %w", name, g.Name, err)
+		}
+		if n > 0 {
+			return nil, fmt.Errorf("barrier %s: %s is applying %d logical replication subscription(s); a copy in flight writes outside the pause, so the point cannot be certified", name, g.Name, n)
 		}
 	}
-	b.logger().Info("barrier: writes paused on every shard group", "barrier", name, "groups", len(groups))
+	at := map[string]time.Time{}
+	for _, g := range groups {
+		if g.Catalog() {
+			continue
+		}
+		t, err := b.Groups.PauseWrites(ctx, g, true)
+		if err != nil {
+			return at, fmt.Errorf("barrier %s: pause writes on %s: %w", name, g.Name, err)
+		}
+		at[g.Name] = t
+	}
+	b.logger().Info("barrier: writes paused on every shard group", "barrier", name, "groups", len(at))
+	return at, nil
+}
+
+// verify re-checks, immediately before the point is certified, that the pause
+// the barrier relies on still held for the whole window: the fence is still
+// this run's, every shard still refuses new writes, and nothing that could
+// have written since the pause is still open. A primary that restarted, was
+// promoted, or was resumed underneath the run fails here instead of
+// certifying a point that is not consistent.
+func (b *Barrier) verify(ctx context.Context, name, owner string, groups []GroupRef, at map[string]time.Time) error {
+	ours, err := b.Store.FenceOwnedBy(ctx, owner)
+	if err != nil {
+		return fmt.Errorf("barrier %s: verify fence: %w", name, err)
+	}
+	if !ours {
+		return fmt.Errorf("barrier %s: the write fence is no longer this barrier's; the point is not certifiable", name)
+	}
+	for _, g := range groups {
+		if g.Catalog() {
+			continue
+		}
+		on, err := b.Groups.PauseEffective(ctx, g)
+		if err != nil {
+			return fmt.Errorf("barrier %s: verify pause on %s: %w", name, g.Name, err)
+		}
+		if !on {
+			return fmt.Errorf("barrier %s: %s stopped refusing writes during the barrier; the point is not certifiable", name, g.Name)
+		}
+		n, err := b.Groups.WritersSince(ctx, g, at[g.Name])
+		if err != nil {
+			return fmt.Errorf("barrier %s: verify writers on %s: %w", name, g.Name, err)
+		}
+		if n > 0 {
+			return fmt.Errorf("barrier %s: %s had %d transaction(s) able to write during the barrier; the point is not certifiable", name, g.Name, n)
+		}
+	}
 	return nil
 }
 
@@ -364,7 +443,7 @@ func (b *Barrier) resumeAll(ctx context.Context, name string, groups []GroupRef)
 		if g.Catalog() {
 			continue
 		}
-		if err := b.Groups.PauseWrites(ctx, g, false); err != nil {
+		if _, err := b.Groups.PauseWrites(ctx, g, false); err != nil {
 			b.logger().Error("barrier: resuming writes failed; the group keeps refusing writes", "barrier", name, "group", g.Name, "err", err)
 			if first == nil {
 				first = fmt.Errorf("barrier %s: resume writes on %s: %w", name, g.Name, err)
@@ -380,7 +459,7 @@ func (b *Barrier) resumeAll(ctx context.Context, name string, groups []GroupRef)
 // drainWriters waits until no group has a client backend in a write
 // transaction. Those writes started before the pause; the restore points must
 // not be taken while one of them can still commit.
-func (b *Barrier) drainWriters(ctx context.Context, name string, groups []GroupRef) error {
+func (b *Barrier) drainWriters(ctx context.Context, name string, groups []GroupRef, at map[string]time.Time) error {
 	deadline := b.now().Add(orDefault(b.DrainTimeout, DefaultDrainTimeout))
 	for {
 		busy := ""
@@ -388,12 +467,12 @@ func (b *Barrier) drainWriters(ctx context.Context, name string, groups []GroupR
 			if g.Catalog() {
 				continue
 			}
-			n, err := b.Groups.WriterCount(ctx, g)
+			n, err := b.Groups.WritersSince(ctx, g, at[g.Name])
 			if err != nil {
 				return fmt.Errorf("barrier %s: writers on %s: %w", name, g.Name, err)
 			}
 			if n > 0 {
-				busy = fmt.Sprintf("%s has %d writing transaction(s)", g.Name, n)
+				busy = fmt.Sprintf("%s has %d transaction(s) that can still write", g.Name, n)
 				break
 			}
 		}
@@ -409,18 +488,32 @@ func (b *Barrier) drainWriters(ctx context.Context, name string, groups []GroupR
 	}
 }
 
-// Recover lifts a pause and fence left behind by a barrier whose controller
-// died mid-run. It is safe to call at any time: it does nothing unless the
-// fence is raised and no barrier holds the barrier lock, which together mean
-// no run is in flight.
+// Recover lifts a pause left behind by a barrier whose controller died. It
+// never touches the write fence: a fence is also raised deliberately by a
+// barrier restore, which keeps it up until two-phase reconciliation finishes,
+// and clearing that would unfence a cluster that must stay fenced. The fence
+// of a dead barrier is cleared by the next barrier, which takes it over.
+//
+// It acts only when no run can still be in flight: the barrier lock is free
+// (so no live run holds it) and the fence has been up longer than the longest
+// a run can take. Even so, a run whose lock session died could in principle
+// still be going, which is why certification re-verifies the pause rather
+// than trusting it.
 func (b *Barrier) Recover(ctx context.Context) error {
 	fenced, err := b.Store.FenceRaised(ctx)
 	if err != nil || !fenced {
 		return err
 	}
+	since, err := b.Store.FencedAt(ctx)
+	if err != nil {
+		return err
+	}
+	if age := b.now().Sub(since); age < b.maxRunTime() {
+		return nil
+	}
 	unlock, err := b.Store.Lock(ctx)
 	if err != nil {
-		// Another barrier holds the lock: it owns the fence, leave it alone.
+		// A live barrier holds the lock and owns the pause; leave it alone.
 		if errors.Is(err, ErrBarrierBusy) {
 			return nil
 		}
@@ -431,15 +524,34 @@ func (b *Barrier) Recover(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	b.logger().Warn("barrier: fence left raised by an interrupted run; lifting it", "groups", len(groups))
-	rerr := b.resumeAll(ctx, "recovery", groups)
-	if err := b.Store.ForceFence(ctx, false); err != nil {
-		return err
+	paused := false
+	for _, g := range groups {
+		if g.Catalog() {
+			continue
+		}
+		on, err := b.Groups.PauseEffective(ctx, g)
+		if err != nil {
+			return err
+		}
+		if on {
+			paused = true
+			break
+		}
 	}
-	return rerr
+	if !paused {
+		return nil
+	}
+	b.logger().Warn("barrier: shards left paused by an interrupted run; resuming writes")
+	return b.resumeAll(ctx, "recovery", groups)
 }
 
-// RunRecovery lifts a stranded fence every interval until ctx is done.
+// maxRunTime is the longest a barrier can take before recovery may assume no
+// run is in flight.
+func (b *Barrier) maxRunTime() time.Duration {
+	return 2*orDefault(b.DrainTimeout, DefaultDrainTimeout) + orDefault(b.ArchiveTimeout, DefaultArchiveTimeout) + time.Minute
+}
+
+// RunRecovery lifts a stranded pause every interval until ctx is done.
 func (b *Barrier) RunRecovery(ctx context.Context, every time.Duration) {
 	if every <= 0 {
 		every = time.Minute
@@ -609,9 +721,11 @@ func (s *PGBarrierStore) FenceRaised(ctx context.Context) (bool, error) {
 	return f.Active, err
 }
 
-// ForceFence implements BarrierStore.
-func (s *PGBarrierStore) ForceFence(ctx context.Context, active bool) error {
-	return catalog.SetWriteFence(ctx, s.Pool, active, "")
+// FenceOwnedBy implements BarrierStore.
+func (s *PGBarrierStore) FenceOwnedBy(ctx context.Context, owner string) (bool, error) {
+	var mine bool
+	err := s.Pool.QueryRow(ctx, `SELECT write_fence AND write_fence_owner = $1 FROM pgshard.shard_map_generation`, owner).Scan(&mine)
+	return mine, err
 }
 
 // FencedAt implements BarrierStore.
@@ -816,31 +930,108 @@ func (s *SQLBarrierGroups) CreateRestorePoint(ctx context.Context, g GroupRef, n
 // fail in PostgreSQL, so a router that has not yet observed the catalog fence
 // cannot slip a write in between two groups' restore points. Reading, and the
 // barrier's own pg_create_restore_point and pg_switch_wal, are unaffected.
-func (s *SQLBarrierGroups) PauseWrites(ctx context.Context, g GroupRef, pause bool) error {
+func (s *SQLBarrierGroups) PauseWrites(ctx context.Context, g GroupRef, pause bool) (time.Time, error) {
 	stmt := `ALTER SYSTEM RESET default_transaction_read_only`
 	if pause {
 		stmt = `ALTER SYSTEM SET default_transaction_read_only = on`
 	}
-	return s.with(ctx, g, func(c groupConn) error {
+	err := s.with(ctx, g, func(c groupConn) error {
 		// ALTER SYSTEM cannot run inside a transaction block, so both
 		// statements are sent on their own.
 		if _, err := c.Exec(ctx, stmt); err != nil {
 			return err
 		}
-		_, err := c.Exec(ctx, `SELECT pg_reload_conf()`)
-		return err
+		// pg_reload_conf reports whether the signal could be sent at all;
+		// a false there means the setting is certainly not in force.
+		ok, err := scalar[bool](ctx, c, `SELECT pg_reload_conf()`)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("pg_reload_conf() refused to signal the postmaster")
+		}
+		return nil
 	})
+	if err != nil || !pause {
+		return time.Time{}, err
+	}
+	// The reload is asynchronous, so wait until a fresh backend really starts
+	// read only, and take that backend's clock as the moment from which no
+	// new writing transaction can begin.
+	deadline := time.Now().Add(pauseConfirmTimeout)
+	for {
+		var at time.Time
+		err := s.with(ctx, g, func(c groupConn) error {
+			rows, err := c.Query(ctx, `SELECT current_setting('default_transaction_read_only') = 'on', now()`)
+			if err != nil {
+				return err
+			}
+			row, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[pauseState])
+			if err != nil {
+				return err
+			}
+			if !row.On {
+				return errPauseNotYetEffective
+			}
+			at = row.Now
+			return nil
+		})
+		if err == nil {
+			return at, nil
+		}
+		if !errors.Is(err, errPauseNotYetEffective) {
+			return time.Time{}, err
+		}
+		if time.Now().After(deadline) {
+			return time.Time{}, fmt.Errorf("%s did not start refusing writes within %s", g.Name, pauseConfirmTimeout)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
-// WriterCount implements BarrierGroups. A backend has an assigned transaction
-// id exactly when it has written in its current transaction, so this counts
-// the ordinary writers still to finish; the barrier's own session never has
-// one.
-func (s *SQLBarrierGroups) WriterCount(ctx context.Context, g GroupRef) (int, error) {
+// pauseConfirmTimeout bounds the wait for a reloaded read-only default to
+// reach a newly started backend.
+const pauseConfirmTimeout = 15 * time.Second
+
+var errPauseNotYetEffective = errors.New("pause not yet effective")
+
+type pauseState struct {
+	On  bool
+	Now time.Time
+}
+
+// PauseEffective implements BarrierGroups.
+func (s *SQLBarrierGroups) PauseEffective(ctx context.Context, g GroupRef) (bool, error) {
+	var on bool
+	err := s.with(ctx, g, func(c groupConn) (err error) {
+		on, err = scalar[bool](ctx, c, `SELECT current_setting('default_transaction_read_only') = 'on'`)
+		return err
+	})
+	return on, err
+}
+
+// SubscriptionCount implements BarrierGroups. pg_subscription is a shared
+// catalog, so one query covers every database on the group.
+func (s *SQLBarrierGroups) SubscriptionCount(ctx context.Context, g GroupRef) (int, error) {
+	var n int
+	err := s.with(ctx, g, func(c groupConn) (err error) {
+		n, err = scalar[int](ctx, c, `SELECT count(*)::int FROM pg_subscription WHERE subenabled`)
+		return err
+	})
+	return n, err
+}
+
+// WritersSince implements BarrierGroups. A backend has an assigned
+// transaction id exactly when it has already written, and a transaction that
+// began before the pause landed keeps the read-write mode it was started
+// with, so it can still write however the default was changed afterwards:
+// both must be gone before any restore point is taken.
+func (s *SQLBarrierGroups) WritersSince(ctx context.Context, g GroupRef, since time.Time) (int, error) {
 	var n int
 	err := s.with(ctx, g, func(c groupConn) (err error) {
 		n, err = scalar[int](ctx, c, `SELECT count(*)::int FROM pg_stat_activity
-			WHERE backend_xid IS NOT NULL AND backend_type = 'client backend' AND pid <> pg_backend_pid()`)
+			WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()
+			AND (backend_xid IS NOT NULL OR (xact_start IS NOT NULL AND xact_start <= $1))`, since)
 		return err
 	})
 	return n, err
