@@ -413,6 +413,12 @@ spec:
                       RollbackRequested mirrors the pgshard.io/catalog-upgrade=rollback
                       annotation.
                     type: boolean
+                  rollbackStarted:
+                    description: |-
+                      RollbackStarted records that a rollback has already fenced the
+                      catalog that is serving. Abandoning it then has to put that fence
+                      back, or the cluster stays read-only.
+                    type: boolean
                   stage:
                     description: Stage is one of provisioning, copying, catching_up,
                       cutover, retiring.

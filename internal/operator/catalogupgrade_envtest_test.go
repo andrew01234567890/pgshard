@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -179,9 +180,24 @@ func TestCatalogUpgradeRollbackBeforeRetirement(t *testing.T) {
 	}
 	fp.mu.Lock()
 	releases := len(fp.catalogReleases)
+	rollbacks := append([]string(nil), fp.catalogRollbacks...)
 	fp.mu.Unlock()
 	if releases == 0 {
 		t.Fatal("rollback must release the old catalog's fence")
+	}
+	// The old end must NOT be the stable cr-catalog-rw endpoint: after the
+	// cutover that name selects the new group, so a rollback addressed
+	// through it would talk to the new catalog on both connections and
+	// replay nothing.
+	if len(rollbacks) != 1 || rollbacks[0] != "cr-catalog-g2-rw.default.svc>cr-catalog-g1-rw.default.svc" {
+		t.Fatalf("rollback must replay the new catalog back into the old one: %v", rollbacks)
+	}
+	var gen1 corev1.Service
+	if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "cr-catalog-g1-rw"}, &gen1); err != nil {
+		t.Fatalf("the old generation needs an address of its own: %v", err)
+	}
+	if gen1.Spec.Selector[LabelGroup] == "catalog-g2" {
+		t.Fatalf("the generation-1 Service must not select the new group: %v", gen1.Spec.Selector)
 	}
 	var pod corev1.Pod
 	err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "cr-catalog-g2-0"}, &pod)
@@ -189,6 +205,129 @@ func TestCatalogUpgradeRollbackBeforeRetirement(t *testing.T) {
 		t.Fatal("new-major catalog pod must be deleted on rollback")
 	} else if err != nil && !apierrors.IsNotFound(err) {
 		t.Fatal(err)
+	}
+}
+
+// TestCatalogRollbackKeepsTheEndpointUntilTheReplaySucceeds: everything the
+// new catalog accepted after the cutover - roles, topology, workflows, 2PC
+// decisions - only exists there, so a rollback that cannot replay it must
+// leave the endpoint alone rather than serve a catalog missing those writes.
+func TestCatalogRollbackKeepsTheEndpointUntilTheReplaySucceeds(t *testing.T) {
+	r, fp, c := setup(t, "ck")
+	cur := startCatalogUpgrade(t, r, fp, c)
+	base := cur.DeepCopy()
+	cur.Spec.Resharding.RetireOldGroupsAfter = &metav1.Duration{Duration: time.Hour}
+	if err := k8sClient.Patch(context.Background(), cur, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4 && catalogStage(t, c.Name) != CatalogUpgradeRetiring; i++ {
+		reconcile(t, r, c)
+	}
+	if got := catalogStage(t, c.Name); got != CatalogUpgradeRetiring {
+		t.Fatalf("stage %s, want retiring", got)
+	}
+	fp.mu.Lock()
+	fp.catalogRollbackErr = "reverse subscription is behind"
+	fp.mu.Unlock()
+
+	cur = getCluster(t, c.Name)
+	base = cur.DeepCopy()
+	if cur.Annotations == nil {
+		cur.Annotations = map[string]string{}
+	}
+	cur.Annotations[pgshardv1alpha1.AnnotationCatalogUpgrade] = pgshardv1alpha1.UpgradeActionRollback
+	if err := k8sClient.Patch(context.Background(), cur, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, r, c)
+	cur = getCluster(t, c.Name)
+	if cur.Status.CatalogUpgrade == nil {
+		t.Fatal("a rollback that could not replay must stay in progress")
+	}
+	if !strings.Contains(cur.Status.CatalogUpgrade.Message, "reverse subscription is behind") {
+		t.Fatalf("message %q must report why the rollback did not proceed", cur.Status.CatalogUpgrade.Message)
+	}
+	if cur.Status.CatalogGeneration != 2 || cur.Status.CatalogPGMajor != 19 {
+		t.Fatalf("catalog must keep serving the new group: gen=%d major=%d", cur.Status.CatalogGeneration, cur.Status.CatalogPGMajor)
+	}
+	var pod corev1.Pod
+	if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "ck-catalog-g2-0"}, &pod); err != nil {
+		t.Fatalf("new-major catalog pod must survive a failed rollback: %v", err)
+	}
+	if pod.DeletionTimestamp != nil {
+		t.Fatal("new-major catalog pod must not be deleted by a failed rollback")
+	}
+
+	// Once the replay succeeds the rollback completes as usual.
+	fp.mu.Lock()
+	fp.catalogRollbackErr = ""
+	fp.mu.Unlock()
+	reconcile(t, r, c)
+	cur = getCluster(t, c.Name)
+	if cur.Status.CatalogUpgrade != nil {
+		t.Fatalf("rollback must clear the upgrade once the replay succeeds: %+v", cur.Status.CatalogUpgrade)
+	}
+	if cur.Status.CatalogGeneration != 1 || cur.Status.CatalogPGMajor != 18 {
+		t.Fatalf("rollback must restore generation 1 major 18: gen=%d major=%d", cur.Status.CatalogGeneration, cur.Status.CatalogPGMajor)
+	}
+}
+
+// TestAbandonedCatalogRollbackPutsTheCatalogBack: a rollback fences the
+// catalog that is serving before it replays. If the request is withdrawn
+// while that is in flight, retirement must lift the fence again instead of
+// completing the upgrade on a catalog nobody can write to.
+func TestAbandonedCatalogRollbackPutsTheCatalogBack(t *testing.T) {
+	r, fp, c := setup(t, "ca")
+	cur := startCatalogUpgrade(t, r, fp, c)
+	base := cur.DeepCopy()
+	cur.Spec.Resharding.RetireOldGroupsAfter = &metav1.Duration{Duration: time.Hour}
+	if err := k8sClient.Patch(context.Background(), cur, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4 && catalogStage(t, c.Name) != CatalogUpgradeRetiring; i++ {
+		reconcile(t, r, c)
+	}
+	fp.mu.Lock()
+	fp.catalogRollbackErr = "still draining"
+	fp.mu.Unlock()
+
+	cur = getCluster(t, c.Name)
+	base = cur.DeepCopy()
+	if cur.Annotations == nil {
+		cur.Annotations = map[string]string{}
+	}
+	cur.Annotations[pgshardv1alpha1.AnnotationCatalogUpgrade] = pgshardv1alpha1.UpgradeActionRollback
+	if err := k8sClient.Patch(context.Background(), cur, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, r, c)
+	if cur = getCluster(t, c.Name); cur.Status.CatalogUpgrade == nil || !cur.Status.CatalogUpgrade.RollbackStarted {
+		t.Fatal("a rollback that fenced the serving catalog must record that it started")
+	}
+
+	// The operator withdraws the request while the replay is still stuck.
+	base = cur.DeepCopy()
+	delete(cur.Annotations, pgshardv1alpha1.AnnotationCatalogUpgrade)
+	if err := k8sClient.Patch(context.Background(), cur, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, r, c)
+	cur = getCluster(t, c.Name)
+	if cur.Status.CatalogUpgrade == nil || cur.Status.CatalogUpgrade.RollbackStarted {
+		t.Fatalf("abandoning the rollback must clear the started flag: %+v", cur.Status.CatalogUpgrade)
+	}
+	fp.mu.Lock()
+	releases := append([]string(nil), fp.catalogReleases...)
+	disables := append([]string(nil), fp.catalogRollbackDisables...)
+	fp.mu.Unlock()
+	if len(releases) == 0 || releases[len(releases)-1] != "ca-catalog-g2-rw.default.svc" {
+		t.Fatalf("the serving catalog must be unfenced again: %v", releases)
+	}
+	if len(disables) != 1 || disables[0] != "ca-catalog-g1-rw.default.svc" {
+		t.Fatalf("the reverse stream must be stopped on the old group: %v", disables)
+	}
+	if cur.Status.CatalogGeneration != 2 || cur.Status.CatalogPGMajor != 19 {
+		t.Fatalf("the catalog must still be the new group: gen=%d major=%d", cur.Status.CatalogGeneration, cur.Status.CatalogPGMajor)
 	}
 }
 

@@ -89,11 +89,15 @@ type fakeProber struct {
 	cutoverSpecs []string
 	// serverMajor is what ServerMajor reports (18 when zero); catalogLag a
 	// non-empty catch-up lag; the rest record catalog upgrade calls.
-	serverMajor     int
-	catalogLag      string
-	catalogCopies   []string
-	catalogCutovers []string
-	catalogReleases []string
+	serverMajor             int
+	catalogLag              string
+	catalogCopies           []string
+	catalogCutovers         []string
+	catalogReleases         []string
+	catalogRollbacks        []string
+	catalogRollbackDrops    []string
+	catalogRollbackErr      string
+	catalogRollbackDisables []string
 }
 
 func (f *fakeProber) SetShardSetMajor(_ context.Context, _ string, name string, major int) error {
@@ -138,6 +142,30 @@ func (f *fakeProber) CutoverCatalog(_ context.Context, srcDSN, tgtDSN string) er
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.catalogCutovers = append(f.catalogCutovers, hostOf(srcDSN)+">"+hostOf(tgtDSN))
+	return nil
+}
+
+func (f *fakeProber) RollbackCatalog(_ context.Context, oldDSN, newDSN string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.catalogRollbackErr != "" {
+		return errors.New(f.catalogRollbackErr)
+	}
+	f.catalogRollbacks = append(f.catalogRollbacks, hostOf(newDSN)+">"+hostOf(oldDSN))
+	return nil
+}
+
+func (f *fakeProber) DropCatalogRollback(_ context.Context, dsn string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.catalogRollbackDrops = append(f.catalogRollbackDrops, hostOf(dsn))
+	return nil
+}
+
+func (f *fakeProber) DisableCatalogRollback(_ context.Context, dsn string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.catalogRollbackDisables = append(f.catalogRollbackDisables, hostOf(dsn))
 	return nil
 }
 

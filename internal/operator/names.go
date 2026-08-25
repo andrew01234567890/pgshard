@@ -272,6 +272,15 @@ func CatalogMajor(c *pgshardv1alpha1.PgShardCluster) int {
 // primary, so a replacement under the same name re-points every client.
 func CatalogServiceRW(cluster string) string { return cluster + "-catalog-rw" }
 
+// CatalogGenerationServiceRW names a Service that always selects one
+// catalog generation's primary. The stable endpoint shares its name with
+// generation 1's own -rw Service and its selector follows whichever
+// generation is active, so during an upgrade the old group needs an address
+// of its own or both ends of the rollback resolve to the same server.
+func CatalogGenerationServiceRW(cluster string, gen int64) string {
+	return fmt.Sprintf("%s-catalog-g%d-rw", cluster, gen)
+}
+
 // CatalogTargetGroup is the new-major catalog group of the catalog
 // upgrade in flight; nil outside that window.
 func CatalogTargetGroup(c *pgshardv1alpha1.PgShardCluster) *Group {
