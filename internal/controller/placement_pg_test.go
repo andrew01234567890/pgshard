@@ -676,6 +676,8 @@ func TestPlacementIdentityColumnsOnPostgres(t *testing.T) {
 		note text,
 		PRIMARY KEY (tenant, seq))`)
 	mustExec(t, home, `INSERT INTO things (tenant, note) SELECT g, 'n' || g FROM generate_series(1, 60) g`)
+	const thingsComment = `path C:\x and an ' apostrophe`
+	mustExec(t, home, `COMMENT ON TABLE things IS `+quoteLiteralE(s(thingsComment)))
 	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('app', 'public', 'things', 'unsharded', NULL)`)
 	f.reconcile()
 
@@ -716,6 +718,12 @@ func TestPlacementIdentityColumnsOnPostgres(t *testing.T) {
 	if total != 60 {
 		t.Fatalf("things across shards: %d", total)
 	}
+	for id := range int32(2) {
+		got := queryOne[string](t, f.app(id), `SELECT obj_description('public.things'::regclass, 'pg_class')`)
+		if got != thingsComment {
+			t.Errorf("shard %d: table comment not restored: %q", id, got)
+		}
+	}
 }
 
 // TestPlacementRefusesUserArtifactTableOnPostgres: a user table that happens
@@ -748,7 +756,7 @@ func TestPlacementRefusesUserArtifactTableOnPostgres(t *testing.T) {
 			t.Fatalf("move completed despite a conflicting user table")
 		}
 	}
-	if state != StateFailed || !strings.Contains(msg, "not a pgshard shadow") {
+	if state != StateFailed || !strings.Contains(msg, "not this workflow's shadow") {
 		t.Fatalf("expected refusal, got %s %q", state, msg)
 	}
 	// The user's table and its row must be untouched.

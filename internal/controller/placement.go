@@ -536,7 +536,7 @@ func (p *Placer) cleanup(ctx context.Context, wf *placementWorkflow) error {
 		if err != nil {
 			return err
 		}
-		err = dropArtifactTable(ctx, conn, wf.spec.SchemaName, wf.shadow())
+		err = dropArtifactTable(ctx, conn, wf.spec.SchemaName, wf.shadow(), wf.placementMarker())
 		_ = conn.Close(ctx)
 		if err != nil {
 			return err
