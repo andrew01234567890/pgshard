@@ -20,10 +20,6 @@ import (
 // GIDPrefix starts every transaction identifier the router coordinates.
 const GIDPrefix = "pgshard-"
 
-// decisionShardSet is the shard set decision participants live in: the
-// router only escalates transactions of routable databases.
-const decisionShardSet = "default"
-
 // DefaultPreparingTimeout is how long a preparing decision row may go
 // without a coordinator heartbeat before the resolver decides abort for
 // it: the router that owned it is presumed dead. Live coordinators beat

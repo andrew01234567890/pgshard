@@ -51,6 +51,10 @@ type RoleStore interface {
 	// RoleMigrationsPending reports whether a role or grant migration is
 	// queued or running, in which case the verifier waits.
 	RoleMigrationsPending(ctx context.Context) (bool, error)
+	// ServingShardSet names the shard set currently serving; roles must be
+	// materialized on the groups that are actually serving, not on a set a
+	// reshard retired.
+	ServingShardSet(ctx context.Context) (string, error)
 }
 
 // PGRoleStore is the RoleStore over the catalog pool.
@@ -66,6 +70,11 @@ func (s *PGRoleStore) Desired(ctx context.Context) (*catalog.DesiredRoles, error
 // Shards implements RoleStore.
 func (s *PGRoleStore) Shards(ctx context.Context, shardSet string) ([]int32, error) {
 	return (&PGMigrationStore{Pool: s.Pool}).Shards(ctx, shardSet)
+}
+
+// ServingShardSet implements RoleStore.
+func (s *PGRoleStore) ServingShardSet(ctx context.Context) (string, error) {
+	return catalog.ServingShardSet(ctx, s.Pool)
 }
 
 // GroupGenerations implements RoleStore.
@@ -181,22 +190,28 @@ func (v *RoleVerifier) logger() *slog.Logger {
 	return v.Logger
 }
 
-func (v *RoleVerifier) shardSet() string {
-	if v.ShardSet == "" {
-		return decisionShardSet
+// shardSet is the configured override when there is one, otherwise
+// whichever set is serving now.
+func (v *RoleVerifier) shardSet(ctx context.Context) (string, error) {
+	if v.ShardSet != "" {
+		return v.ShardSet, nil
 	}
-	return v.ShardSet
+	return v.Store.ServingShardSet(ctx)
 }
 
 func (v *RoleVerifier) groups(ctx context.Context) ([]roleGroup, error) {
-	ids, err := v.Store.Shards(ctx, v.shardSet())
+	set, err := v.shardSet(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ids, err := v.Store.Shards(ctx, set)
 	if err != nil {
 		return nil, fmt.Errorf("roles: shards: %w", err)
 	}
 	var out []roleGroup
 	for _, id := range ids {
-		out = append(out, roleGroup{name: fmt.Sprintf("%s/%d", v.shardSet(), id), dial: func(ctx context.Context, db string) (ShardConn, error) {
-			return v.Shards.DialDatabase(ctx, v.shardSet(), id, db)
+		out = append(out, roleGroup{name: fmt.Sprintf("%s/%d", set, id), dial: func(ctx context.Context, db string) (ShardConn, error) {
+			return v.Shards.DialDatabase(ctx, set, id, db)
 		}})
 	}
 	if v.Catalog != nil {
