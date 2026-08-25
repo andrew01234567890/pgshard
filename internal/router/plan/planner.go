@@ -1125,9 +1125,12 @@ func castItem(item keyItem, tn *pgquerypb.TypeName) (keyItem, bool) {
 	switch strings.ToLower(names[len(names)-1]) {
 	case "int8", "int4", "int2", "bigint", "integer", "int", "smallint":
 		hint = HintInt
-	case "text", "varchar", "bpchar", "char", "character", "name":
+	case "text", "varchar", "name":
 		hint = HintText
 	default:
+		// bpchar/char/character are refused too: their equality ignores
+		// trailing spaces, so a raw-byte hash of the operand may not match
+		// the shard the row was placed on.
 		return keyItem{}, false
 	}
 	if item.param != 0 {
