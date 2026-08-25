@@ -181,13 +181,25 @@ func (r *ClusterReconciler) reconcileCatalogUpgrade(ctx context.Context, c *pgsh
 		log.Info("catalog upgrade switched", "generation", up.Generation, "major", up.ToMajor)
 	case CatalogUpgradeRetiring:
 		if up.RollbackRequested {
+			// Replay first: the endpoint must not move back to the old
+			// group until everything the new catalog accepted since the
+			// cutover has been applied to it.
+			// Address both groups explicitly: Groups(c)[0] follows the
+			// status generation, which still names the new group until the
+			// endpoint moves below.
+			oldDSN := r.catalogTargetDSN(c, catalogGroupAt(c, up.RetiredGeneration, up.RetiredMajor), password)
+			newDSN := r.catalogTargetDSN(c, catalogGroupAt(c, up.Generation, up.ToMajor), password)
+			if err := r.Prober.RollbackCatalog(ctx, oldDSN, newDSN); err != nil {
+				up.Message = "catalog rollback: " + err.Error()
+				break
+			}
 			log.Info("catalog upgrade rollback: repointing the catalog endpoint at the old group")
 			c.Status.CatalogGeneration = up.RetiredGeneration
 			c.Status.CatalogPGMajor = up.RetiredMajor
 			if err := r.ensureCatalogEndpoint(ctx, c); err != nil {
 				return obs, err
 			}
-			if err := r.Prober.ReleaseCatalog(ctx, r.catalogTargetDSN(c, Groups(c)[0], password)); err != nil {
+			if err := r.Prober.ReleaseCatalog(ctx, oldDSN); err != nil {
 				up.Message = "release old catalog: " + err.Error()
 				break
 			}
@@ -203,6 +215,12 @@ func (r *ClusterReconciler) reconcileCatalogUpgrade(ctx context.Context, c *pgsh
 		}
 		if up.SwitchedAt != nil && time.Since(up.SwitchedAt.Time) < retireAfter {
 			up.Message = fmt.Sprintf("old catalog group retained for rollback until %s", up.SwitchedAt.Add(retireAfter).Format(time.RFC3339))
+			break
+		}
+		// The reverse slot lives on the catalog that is now serving and
+		// pins its WAL; nothing will read it once the old group is gone.
+		if err := r.Prober.DropCatalogRollback(ctx, r.catalogTargetDSN(c, catalogGroupAt(c, up.Generation, up.ToMajor), password)); err != nil {
+			up.Message = "drop catalog rollback stream: " + err.Error()
 			break
 		}
 		if retiredGroup != nil {

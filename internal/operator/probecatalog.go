@@ -14,7 +14,102 @@ import (
 const (
 	CatalogUpgradePublication  = "pgshard_catalog_upgrade"
 	CatalogUpgradeSubscription = "pgshard_catalog_upgrade"
+	// CatalogRollbackPublication and CatalogRollbackSubscription name the
+	// reverse pair, new catalog back to old, that keeps a rollback from
+	// losing everything written after the cutover.
+	CatalogRollbackPublication  = "pgshard_catalog_rollback"
+	CatalogRollbackSubscription = "pgshard_catalog_rollback"
+	// catalogFenceTimeout bounds a drain in either direction.
+	catalogFenceTimeout = 2 * time.Minute
 )
+
+// fenceCatalog makes conn's database refuse writes and disconnects the
+// clients that were writing. A re-run connects to an already fenced server
+// whose default is read-only, so the fence is lifted session-locally first
+// or ALTER SYSTEM is refused.
+func fenceCatalog(ctx context.Context, conn *pgx.Conn) error {
+	for _, q := range []string{
+		`SET default_transaction_read_only = off`,
+		`ALTER SYSTEM SET default_transaction_read_only = on`,
+		`SELECT pg_reload_conf()`,
+		`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+			WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'`,
+	} {
+		if _, err := conn.Exec(ctx, q); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// unfenceCatalog lets the database accept writes again.
+func unfenceCatalog(ctx context.Context, conn *pgx.Conn) error {
+	for _, q := range []string{
+		`SET default_transaction_read_only = off`,
+		`ALTER SYSTEM RESET default_transaction_read_only`,
+		`SELECT pg_reload_conf()`,
+	} {
+		if _, err := conn.Exec(ctx, q); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// drainSlot waits until slot on conn has confirmed everything written up to
+// lsn, so the subscriber that reads it has applied the whole fenced history.
+func drainSlot(ctx context.Context, conn *pgx.Conn, slot, lsn string, now func() time.Time) error {
+	deadline := now().Add(catalogFenceTimeout)
+	for {
+		var drained bool
+		if err := conn.QueryRow(ctx, `SELECT confirmed_flush_lsn >= $2::pg_lsn FROM pg_replication_slots WHERE slot_name = $1`,
+			slot, lsn).Scan(&drained); err != nil {
+			return fmt.Errorf("drain %s: %w", slot, err)
+		}
+		if drained {
+			return nil
+		}
+		if now().After(deadline) {
+			return fmt.Errorf("%s did not drain to %s in time", slot, lsn)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+// carrySequences copies every sequence position from one catalog to the
+// other. Logical replication does not replicate sequences, so whichever
+// side is about to serve has to be told where they got to.
+func carrySequences(ctx context.Context, from, to *pgx.Conn) error {
+	sequences := map[string]int64{}
+	rows, err := from.Query(ctx, `SELECT quote_ident(schemaname) || '.' || quote_ident(sequencename), last_value
+		FROM pg_sequences WHERE last_value IS NOT NULL`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var name string
+		var v int64
+		if err := rows.Scan(&name, &v); err != nil {
+			rows.Close()
+			return err
+		}
+		sequences[name] = v
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for name, v := range sequences {
+		if _, err := to.Exec(ctx, `SELECT pg_catalog.setval(oid, $2, true) FROM pg_class WHERE oid = to_regclass($1) AND relkind = 'S'`, name, v); err != nil {
+			return fmt.Errorf("carry sequence %s: %w", name, err)
+		}
+	}
+	return nil
+}
 
 // ServerMajor implements Prober.
 func (PgxProber) ServerMajor(ctx context.Context, dsn string) (int, error) {
@@ -137,18 +232,8 @@ func (p PgxProber) CutoverCatalog(ctx context.Context, srcDSN, tgtDSN string) er
 		return fmt.Errorf("catalog source: %w", err)
 	}
 	defer func() { _ = src.Close(ctx) }()
-	for _, q := range []string{
-		// A re-run connects to an already fenced source whose default is
-		// read-only; lift it session-locally or ALTER SYSTEM is refused.
-		`SET default_transaction_read_only = off`,
-		`ALTER SYSTEM SET default_transaction_read_only = on`,
-		`SELECT pg_reload_conf()`,
-		`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-			WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'`,
-	} {
-		if _, err := src.Exec(ctx, q); err != nil {
-			return fmt.Errorf("fence catalog source: %w", err)
-		}
+	if err := fenceCatalog(ctx, src); err != nil {
+		return fmt.Errorf("fence catalog source: %w", err)
 	}
 	tgt, err := pgx.Connect(ctx, tgtDSN)
 	if err != nil {
@@ -176,51 +261,129 @@ func (p PgxProber) CutoverCatalog(ctx context.Context, srcDSN, tgtDSN string) er
 	if err := src.QueryRow(ctx, `SELECT pg_current_wal_lsn()::text`).Scan(&fence); err != nil {
 		return err
 	}
-	deadline := time.Now().Add(2 * time.Minute)
-	for {
-		var drained bool
-		if err := src.QueryRow(ctx, `SELECT confirmed_flush_lsn >= $2::pg_lsn FROM pg_replication_slots WHERE slot_name = $1`,
-			CatalogUpgradeSubscription, fence).Scan(&drained); err != nil {
-			return fmt.Errorf("catalog drain: %w", err)
-		}
-		if drained {
-			break
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("catalog subscription did not drain to %s in time", fence)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(500 * time.Millisecond):
-		}
-	}
-	sequences := map[string]int64{}
-	rows, err := src.Query(ctx, `SELECT quote_ident(schemaname) || '.' || quote_ident(sequencename), last_value
-		FROM pg_sequences WHERE last_value IS NOT NULL`)
-	if err != nil {
+	if err := drainSlot(ctx, src, CatalogUpgradeSubscription, fence, time.Now); err != nil {
 		return err
 	}
-	for rows.Next() {
-		var name string
-		var v int64
-		if err := rows.Scan(&name, &v); err != nil {
-			rows.Close()
-			return err
-		}
-		sequences[name] = v
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+	if err := carrySequences(ctx, src, tgt); err != nil {
 		return err
-	}
-	for name, v := range sequences {
-		if _, err := tgt.Exec(ctx, `SELECT pg_catalog.setval(oid, $2, true) FROM pg_class WHERE oid = to_regclass($1) AND relkind = 'S'`, name, v); err != nil {
-			return fmt.Errorf("carry sequence %s: %w", name, err)
-		}
 	}
 	if _, err := tgt.Exec(ctx, `DROP SUBSCRIPTION IF EXISTS `+CatalogUpgradeSubscription); err != nil {
 		return fmt.Errorf("drop subscription: %w", err)
+	}
+	// Arm the reverse pair before the new catalog serves a single write. It
+	// stays disabled while the old group is fenced - an apply worker cannot
+	// write to a read-only database - but its slot is created now, so a
+	// rollback replays everything the new catalog accepted rather than
+	// throwing it away.
+	if err := ensureCatalogRollback(ctx, src, tgt, tgtDSN); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ensureCatalogRollback publishes the new catalog and subscribes the old one
+// to it, disabled. currentConninfo is the new catalog's DSN as the old
+// group's pod resolves it, because the old group is the subscriber.
+func ensureCatalogRollback(ctx context.Context, old, current *pgx.Conn, currentConninfo string) error {
+	var pubExists bool
+	if err := current.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)`, CatalogRollbackPublication).Scan(&pubExists); err != nil {
+		return err
+	}
+	if !pubExists {
+		if _, err := current.Exec(ctx, `CREATE PUBLICATION `+CatalogRollbackPublication+` FOR TABLES IN SCHEMA pgshard`); err != nil {
+			return fmt.Errorf("create rollback publication: %w", err)
+		}
+	}
+	var subExists bool
+	if err := old.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_subscription WHERE subname = $1)`, CatalogRollbackSubscription).Scan(&subExists); err != nil {
+		return err
+	}
+	if subExists {
+		return nil
+	}
+	// The old catalog is fenced read-only; DDL needs the session default off.
+	if _, err := old.Exec(ctx, `SET default_transaction_read_only = off`); err != nil {
+		return err
+	}
+	if _, err := old.Exec(ctx, fmt.Sprintf(
+		`CREATE SUBSCRIPTION %s CONNECTION %s PUBLICATION %s WITH (copy_data = false, enabled = false, origin = none, two_phase = false)`,
+		CatalogRollbackSubscription, quoteLiteral(currentConninfo), CatalogRollbackPublication)); err != nil {
+		return fmt.Errorf("create rollback subscription: %w", err)
+	}
+	return nil
+}
+
+// RollbackCatalog implements Prober. It reverses a cutover without losing
+// what the new catalog accepted: the new group is fenced, the reverse
+// subscription replays every write it took since the cutover into the old
+// group, sequences are carried back, and only then does the old group start
+// serving again. Idempotent: a re-run finds the subscription already gone
+// and just makes sure the old group accepts writes.
+func (PgxProber) RollbackCatalog(ctx context.Context, oldDSN, newDSN string) error {
+	old, err := pgx.Connect(ctx, oldDSN)
+	if err != nil {
+		return fmt.Errorf("old catalog: %w", err)
+	}
+	defer func() { _ = old.Close(ctx) }()
+	var subExists bool
+	if err := old.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_subscription WHERE subname = $1)`, CatalogRollbackSubscription).Scan(&subExists); err != nil {
+		return err
+	}
+	if !subExists {
+		// Either the replay already finished on an earlier attempt, or this
+		// cutover predates the reverse pair. Refusing here would strand the
+		// cluster on a catalog the operator is trying to delete, so let the
+		// old group serve; the caller reports what was replayed.
+		return unfenceCatalog(ctx, old)
+	}
+	current, err := pgx.Connect(ctx, newDSN)
+	if err != nil {
+		return fmt.Errorf("new catalog: %w", err)
+	}
+	defer func() { _ = current.Close(ctx) }()
+	if err := fenceCatalog(ctx, current); err != nil {
+		return fmt.Errorf("fence new catalog: %w", err)
+	}
+	var fence string
+	if err := current.QueryRow(ctx, `SELECT pg_current_wal_lsn()::text`).Scan(&fence); err != nil {
+		return err
+	}
+	// The apply worker writes, so the old group cannot stay read-only. It
+	// is not serving yet - the endpoint still points at the new group - so
+	// nothing else can write to it in the meantime.
+	if err := unfenceCatalog(ctx, old); err != nil {
+		return fmt.Errorf("unfence old catalog: %w", err)
+	}
+	if _, err := old.Exec(ctx, `ALTER SUBSCRIPTION `+CatalogRollbackSubscription+` ENABLE`); err != nil {
+		return fmt.Errorf("enable rollback subscription: %w", err)
+	}
+	if err := drainSlot(ctx, current, CatalogRollbackSubscription, fence, time.Now); err != nil {
+		return err
+	}
+	if err := carrySequences(ctx, current, old); err != nil {
+		return err
+	}
+	if _, err := old.Exec(ctx, `DROP SUBSCRIPTION IF EXISTS `+CatalogRollbackSubscription); err != nil {
+		return fmt.Errorf("drop rollback subscription: %w", err)
+	}
+	return nil
+}
+
+// DropCatalogRollback implements Prober. Retiring the old group leaves the
+// reverse slot behind on the catalog that is now serving, and an unused
+// slot pins WAL forever, so it is dropped when the rollback window closes.
+func (PgxProber) DropCatalogRollback(ctx context.Context, dsn string) error {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if _, err := conn.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
+		WHERE slot_name = $1 AND NOT active`, CatalogRollbackSubscription); err != nil {
+		return fmt.Errorf("drop rollback slot: %w", err)
+	}
+	if _, err := conn.Exec(ctx, `DROP PUBLICATION IF EXISTS `+CatalogRollbackPublication); err != nil {
+		return fmt.Errorf("drop rollback publication: %w", err)
 	}
 	return nil
 }
