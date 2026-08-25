@@ -141,10 +141,19 @@ func (s *session) endRevoked() {
 	er := toErrorResponse(Errorf(CodeAdminShutdown, "terminating connection because the role may no longer log in"))
 	er.Severity, er.SeverityUnlocalized = "FATAL", "FATAL"
 	if buf, err := er.Encode(nil); err == nil {
+		// Bounded: the session goroutine may be blocked flushing to a
+		// client that has stopped reading, and this write would queue
+		// behind it. One refresh goroutine revokes every session, so it
+		// must never wait on one of them.
+		_ = s.conn.SetWriteDeadline(time.Now().Add(revokeWriteTimeout))
 		_, _ = s.conn.Write(buf)
+		_ = s.conn.SetWriteDeadline(time.Time{})
 	}
 	_ = s.conn.Close()
 }
+
+// revokeWriteTimeout bounds the courtesy FATAL a revocation sends.
+const revokeWriteTimeout = 2 * time.Second
 
 // revokedNow reports whether a revocation landed on this session, so a
 // startup that was in flight hands its executor straight back instead of
@@ -187,7 +196,10 @@ func (s *session) terminate(err error) {
 func (s *session) beginMessage() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if (s.draining && !s.inTxn) || s.closed {
+	// A revoked session takes nothing further, transaction or not: a drain
+	// lets an open transaction finish, but a role that may no longer log in
+	// does not get to keep working through one.
+	if s.revoked || (s.draining && !s.inTxn) || s.closed {
 		return false
 	}
 	s.active = true
@@ -205,7 +217,14 @@ func (s *session) queryContext(parent context.Context) (context.Context, context
 	ctx, cancel := context.WithCancel(parent)
 	s.mu.Lock()
 	s.queryCancel = cancel
+	revoked := s.revoked
 	s.mu.Unlock()
+	if revoked {
+		// Revoked between the message starting and the context being
+		// installed: revoke had no cancel to call, so this one would
+		// otherwise run to completion on a session that is already gone.
+		cancel()
+	}
 	return ctx, cancel
 }
 
