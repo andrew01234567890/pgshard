@@ -320,13 +320,13 @@ func runSuite(t *testing.T, img pgImage) {
 
 		t.Run("move_between_shard_sets_checks_source", func(t *testing.T) {
 			mustExec(t, conn, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES
-				('src', 0, '[,0)'), ('src', 1, '[0,)'), ('dst', 0, '[,0)'), ('dst', 9, '[0,)')`)
+				('src', 0, '[,0)'), ('src', 1, '[0,)'), ('dst', 0, '[,0)'), ('dst', 1, '[0,)')`)
 			tx, err := conn.Begin(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer func() { _ = tx.Rollback(ctx) }()
-			mustTx(t, tx, `DELETE FROM pgshard.shard_ranges WHERE shard_set = 'dst' AND shard_id = 9`)
+			mustTx(t, tx, `DELETE FROM pgshard.shard_ranges WHERE shard_set = 'dst' AND shard_id = 1`)
 			mustTx(t, tx, `UPDATE pgshard.shard_ranges SET shard_set = 'dst', shard_id = 1 WHERE shard_set = 'src' AND shard_id = 1`)
 			err = tx.Commit(ctx)
 			if err == nil {
@@ -335,6 +335,27 @@ func runSuite(t *testing.T, img pgImage) {
 			var pgErr *pgconn.PgError
 			if !errors.As(err, &pgErr) || pgErr.Code != "23514" || !strings.Contains(pgErr.Message, "src") {
 				t.Fatalf("expected check violation naming the source shard set, got %v", err)
+			}
+		})
+
+		t.Run("shard_ids_must_be_key_ordinals", func(t *testing.T) {
+			for name, values := range map[string]string{
+				"not_dense":       `('sparse', 10, '[,0)'), ('sparse', 20, '[0,)')`,
+				"wrong_key_order": `('unordered', 1, '[,0)'), ('unordered', 0, '[0,)')`,
+			} {
+				t.Run(name, func(t *testing.T) {
+					tx, err := conn.Begin(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = tx.Rollback(ctx) }()
+					mustTx(t, tx, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES `+values)
+					err = tx.Commit(ctx)
+					if err == nil {
+						t.Fatal("commit succeeded although routing would silently renumber the shards")
+					}
+					expectPgError(t, err, "23514", "0..N-1")
+				})
 			}
 		})
 

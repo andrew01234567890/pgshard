@@ -90,7 +90,7 @@ func reconcileReshards(ctx context.Context, tx pgx.Tx, res *Result) error {
 			if err != nil {
 				return err
 			}
-			if err := catalog.RangeSet(ranges).Validate(); err != nil {
+			if err := catalog.ValidateShardRanges(ranges); err != nil {
 				res.Invalid = append(res.Invalid, fmt.Sprintf("shard set %s: %v", ss.Name, err))
 				continue
 			}
