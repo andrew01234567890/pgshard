@@ -831,3 +831,53 @@ func TestPlacementRefusesCrossSchemaSerialOnPostgres(t *testing.T) {
 		t.Fatalf("expected refusal, got %s %q", state, msg)
 	}
 }
+
+// TestPlacementRefusesUnsupportedFeaturesOnPostgres: a table carrying a
+// row-level security policy, a user trigger or a foreign key is refused at
+// preflight, because the shadow build recreates none of them and the swap
+// would silently drop enforcement.
+func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
+	f := newPlacementFixture(t)
+	ctx := context.Background()
+	home := f.app(0)
+	mustExec(t, home, `CREATE TABLE guarded (id bigint PRIMARY KEY, owner text)`)
+	mustExec(t, home, `ALTER TABLE guarded ENABLE ROW LEVEL SECURITY`)
+	mustExec(t, home, `CREATE POLICY own_rows ON guarded USING (owner = current_user)`)
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('app', 'public', 'guarded', 'unsharded', NULL)`)
+	f.reconcile()
+
+	mustExec(t, f.catalog, `UPDATE pgshard.tables SET placement = 'sharded', shard_key = 'id' WHERE table_name = 'guarded'`)
+	f.reconcile()
+	var state, msg string
+	for i := 0; i < 40; i++ {
+		if _, err := f.placer.Pass(ctx); err != nil {
+			t.Fatal(err)
+		}
+		_, state, _, msg = f.workflow("guarded")
+		if state == StateFailed {
+			break
+		}
+		if state == StateCompleted {
+			t.Fatal("move of an RLS table completed instead of being refused")
+		}
+	}
+	if state != StateFailed || !strings.Contains(msg, "row-level security policy own_rows") {
+		t.Fatalf("expected refusal naming the policy, got %s %q", state, msg)
+	}
+	// The policy is untouched.
+	if n := queryOne[int64](t, home, `SELECT count(*) FROM pg_policy WHERE polname = 'own_rows'`); n != 1 {
+		t.Fatal("the RLS policy was dropped")
+	}
+	// The pure-feature detector covers each unsupported shape.
+	mustExec(t, home, `CREATE TABLE parent (pid bigint PRIMARY KEY)`)
+	mustExec(t, home, `CREATE TABLE child (id bigint PRIMARY KEY, pid bigint REFERENCES parent(pid))`)
+	for _, c := range []struct{ table, want string }{{"child", "foreign key"}, {"parent", "foreign key"}} {
+		got, err := unsupportedTableFeatures(ctx, pgxShardConn{home}, "public", c.table)
+		if err != nil || len(got) != 1 || !strings.HasPrefix(got[0], c.want) {
+			t.Fatalf("%s: unsupported = %v (%v), want one %q", c.table, got, err, c.want)
+		}
+	}
+	if got, err := unsupportedTableFeatures(ctx, pgxShardConn{home}, "public", "parent"); err != nil || len(got) != 1 {
+		t.Fatalf("parent inbound fk: %v %v", got, err)
+	}
+}

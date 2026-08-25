@@ -36,6 +36,19 @@ func (p *Placer) describe(ctx context.Context, wf *placementWorkflow) error {
 	if len(pk) == 0 {
 		return fatal("table %s has no primary key; placement workflows apply rows by primary key", wf.spec.table())
 	}
+	// The shadow table is rebuilt from columns, constraints and indexes only:
+	// neither CREATE TABLE LIKE nor the remote DDL carries row-level security
+	// policies, triggers or foreign keys, and the swap would silently drop
+	// them (and leave inbound foreign keys bound to the retired table's OID).
+	// Refuse rather than lose enforcement.
+	unsupported, err := unsupportedTableFeatures(ctx, conn, wf.spec.SchemaName, wf.spec.TableName)
+	if err != nil {
+		return err
+	}
+	if len(unsupported) > 0 {
+		return fatal("table %s has features a placement move cannot yet preserve (%s); drop them before moving or keep the table where it is",
+			wf.spec.table(), strings.Join(unsupported, ", "))
+	}
 	comment, err := tableComment(ctx, conn, wf.spec.SchemaName, wf.spec.TableName)
 	if err != nil {
 		return err
@@ -161,6 +174,24 @@ func uniqueConstraintsMissingKey(ctx context.Context, conn ShardConn, schema, na
 					JOIN pg_opclass oc ON oc.oid = icl.cls
 					WHERE icl.clord = k.ord AND oc.opcdefault)))
 		ORDER BY ix.relname`, schema, name, key)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
+// unsupportedTableFeatures lists the row-level security policies, user
+// triggers and foreign keys (in either direction) on a table; the placement
+// shadow build does not recreate any of them.
+func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name string) ([]string, error) {
+	rows, err := conn.Query(ctx, `WITH t AS (
+			SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = $1 AND c.relname = $2)
+		SELECT f FROM (
+			SELECT 'row-level security policy ' || polname AS f FROM pg_policy, t WHERE polrelid = t.oid
+			UNION ALL SELECT 'trigger ' || tgname FROM pg_trigger, t WHERE tgrelid = t.oid AND NOT tgisinternal
+			UNION ALL SELECT 'foreign key ' || conname FROM pg_constraint, t WHERE contype = 'f' AND (conrelid = t.oid OR confrelid = t.oid)
+		) x ORDER BY f`, schema, name)
 	if err != nil {
 		return nil, err
 	}
