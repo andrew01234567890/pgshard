@@ -39,7 +39,7 @@ var (
 	// errAsyncFailover refuses automatic failover under asynchronous
 	// durability, where no standby was required to acknowledge commits, so
 	// promoting a reachable standby could silently lose acknowledged writes.
-	errAsyncFailover    = fmt.Errorf("%w: minSyncStandbys=0 (asynchronous durability) has no standby guaranteed to hold acknowledged commits; automatic failover is refused to avoid data loss", errNoCandidate)
+	errAsyncFailover    = fmt.Errorf("%w: minSyncStandbys=0 (asynchronous durability) has no standby guaranteed to hold acknowledged commits; promotion is refused to avoid data loss", errNoCandidate)
 	errPrimaryStillLive = errors.New("old primary still reports itself primary")
 	// ErrLeaseHeldByOther is returned when the group Lease is renewed by an
 	// identity that is neither the old primary nor the operator's fence.
@@ -122,14 +122,14 @@ func minSyncStandbys(c *pgshardv1alpha1.PgShardCluster) int {
 	return 1
 }
 
-// refuseAsyncFailover refuses an automatic failover under asynchronous
-// durability (minSyncStandbys=0), where no standby was required to acknowledge
-// commits, so promoting a reachable standby could silently lose acknowledged
-// writes. An operator-initiated switchover (preferred set) is exempt: it waits
-// for the target to catch up before promoting. The CRD forbids
-// minSyncStandbys=0 today, so this is defence in depth.
-func refuseAsyncFailover(c *pgshardv1alpha1.PgShardCluster, preferred string) error {
-	if preferred == "" && c.Spec.Durability.MinSyncStandbys == 0 {
+// refuseAsyncFailover refuses any promotion (automatic failover or
+// operator-initiated switchover) under asynchronous durability
+// (minSyncStandbys=0). No standby was required to acknowledge commits, so even
+// the highest-flushed reachable standby may lag the old primary's acknowledged
+// writes; promoting it would lose them. The CRD forbids minSyncStandbys=0
+// today, so this is defence in depth.
+func refuseAsyncFailover(c *pgshardv1alpha1.PgShardCluster) error {
+	if c.Spec.Durability.MinSyncStandbys == 0 {
 		return errAsyncFailover
 	}
 	return nil
@@ -313,7 +313,7 @@ func (r *ClusterReconciler) patchRole(ctx context.Context, pod *corev1.Pod, role
 func (r *ClusterReconciler) failover(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, state groupState, members map[string]*memberInfo, password, preferred string) (groupState, error) {
 	log := logf.FromContext(ctx).WithValues("group", g.Name(), "oldPrimary", state.primary)
 	old := state.primary
-	if err := refuseAsyncFailover(c, preferred); err != nil {
+	if err := refuseAsyncFailover(c); err != nil {
 		return state, err
 	}
 	// With no standby ever observed streaming there is nothing that can hold

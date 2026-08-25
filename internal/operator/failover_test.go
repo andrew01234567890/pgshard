@@ -149,19 +149,14 @@ func TestPrimaryHealthy(t *testing.T) {
 
 func TestRefuseAsyncFailover(t *testing.T) {
 	c := &pgshardv1alpha1.PgShardCluster{}
-	// Automatic failover (no preferred) under async durability is refused.
+	// Any promotion under async durability is refused (wrapping errNoCandidate).
 	c.Spec.Durability.MinSyncStandbys = 0
-	if err := refuseAsyncFailover(c, ""); !errors.Is(err, errAsyncFailover) || !errors.Is(err, errNoCandidate) {
-		t.Fatalf("async auto-failover must be refused (and wrap errNoCandidate): %v", err)
+	if err := refuseAsyncFailover(c); !errors.Is(err, errAsyncFailover) || !errors.Is(err, errNoCandidate) {
+		t.Fatalf("async promotion must be refused (and wrap errNoCandidate): %v", err)
 	}
 	// A synchronous cluster proceeds.
 	c.Spec.Durability.MinSyncStandbys = 1
-	if err := refuseAsyncFailover(c, ""); err != nil {
-		t.Fatalf("sync auto-failover must proceed: %v", err)
-	}
-	// An operator-initiated switchover is exempt even under async durability.
-	c.Spec.Durability.MinSyncStandbys = 0
-	if err := refuseAsyncFailover(c, "g-1"); err != nil {
-		t.Fatalf("switchover must be exempt: %v", err)
+	if err := refuseAsyncFailover(c); err != nil {
+		t.Fatalf("sync failover must proceed: %v", err)
 	}
 }
