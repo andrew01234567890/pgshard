@@ -36,6 +36,11 @@ func (p *Placer) describe(ctx context.Context, wf *placementWorkflow) error {
 	if len(pk) == 0 {
 		return fatal("table %s has no primary key; placement workflows apply rows by primary key", wf.spec.table())
 	}
+	comment, err := tableComment(ctx, conn, wf.spec.SchemaName, wf.spec.TableName)
+	if err != nil {
+		return err
+	}
+	wf.st.TableComment = comment
 	wf.st.Columns, wf.st.Identity, wf.st.PK = nil, nil, pk
 	for _, c := range cols {
 		wf.st.Columns = append(wf.st.Columns, c.name)
@@ -155,9 +160,92 @@ func tableExists(ctx context.Context, conn ShardConn, schema, name string) (bool
 	return pgx.CollectExactlyOneRow(rows, pgx.RowTo[bool])
 }
 
+// placementMarker is the table comment that stamps a shadow or retired table as
+// this workflow's own artifact. Including the workflow id makes it unguessable,
+// so a user table that merely shares the __pgshard_new / __pgshard_old name (or
+// even carries the bare prefix) is never adopted, overwritten or dropped.
+func (wf *placementWorkflow) placementMarker() string {
+	return "pgshard:placement:" + wf.id
+}
+
 // ensureShadows creates the shadow table on every shard of the new
 // placement: LIKE the local table when the shard has one, else from the
 // definition read on a source.
+
+func markPlacementArtifact(ctx context.Context, conn ShardConn, schema, name, marker string) error {
+	_, err := conn.Exec(ctx, fmt.Sprintf("COMMENT ON TABLE %s.%s IS %s",
+		QuoteIdent(schema), QuoteIdent(name), QuoteLiteral(&marker)))
+	return err
+}
+
+// isPlacementArtifact reports whether schema.name carries this workflow's exact
+// marker. A missing table, a user table, and an artifact left by a different
+// workflow all return false (the latter must be resolved by an operator rather
+// than clobbered).
+func isPlacementArtifact(ctx context.Context, conn ShardConn, schema, name, marker string) (bool, error) {
+	rows, err := conn.Query(ctx, `SELECT obj_description((quote_ident($1) || '.' || quote_ident($2))::regclass, 'pg_class')`, schema, name)
+	if err != nil {
+		return false, err
+	}
+	comment, err := pgx.CollectExactlyOneRow(rows, pgx.RowTo[*string])
+	if err != nil {
+		return false, err
+	}
+	return comment != nil && *comment == marker, nil
+}
+
+// tableComment returns the table's comment, or nil when it has none.
+func tableComment(ctx context.Context, conn ShardConn, schema, name string) (*string, error) {
+	rows, err := conn.Query(ctx, `SELECT obj_description((quote_ident($1) || '.' || quote_ident($2))::regclass, 'pg_class')`, schema, name)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectExactlyOneRow(rows, pgx.RowTo[*string])
+}
+
+// restoreComment sets (or clears) a table's comment, used to put the user's
+// original comment back after the shadow that carried the pgshard marker is
+// renamed into place.
+func restoreComment(ctx context.Context, conn ShardConn, schema, name string, comment *string) error {
+	lit := "NULL"
+	if comment != nil {
+		// quoteLiteralE, not QuoteLiteral: under standard_conforming_strings a
+		// plain '...' keeps backslashes literal, so a comment with a backslash
+		// must use the E'...' form to round-trip unchanged.
+		lit = quoteLiteralE(comment)
+	}
+	_, err := conn.Exec(ctx, fmt.Sprintf("COMMENT ON TABLE %s.%s IS %s", QuoteIdent(schema), QuoteIdent(name), lit))
+	return err
+}
+
+// dropArtifactTable drops schema.name only if it exists and carries this
+// workflow's marker, so a same-named user table is never dropped. The lock,
+// marker re-check and DROP run in one transaction so a concurrent rename
+// cannot slip an unmarked table under the name between the check and the drop.
+func dropArtifactTable(ctx context.Context, conn ShardConn, schema, name, marker string) error {
+	exists, err := tableExists(ctx, conn, schema, name)
+	if err != nil || !exists {
+		return err
+	}
+	if _, err := conn.Exec(ctx, "BEGIN"); err != nil {
+		return err
+	}
+	defer func() { _, _ = conn.Exec(ctx, "ROLLBACK") }()
+	qual := QuoteIdent(schema) + "." + QuoteIdent(name)
+	if _, err := conn.Exec(ctx, "LOCK TABLE "+qual+" IN ACCESS EXCLUSIVE MODE"); err != nil {
+		return err
+	}
+	ours, err := isPlacementArtifact(ctx, conn, schema, name, marker)
+	if err != nil || !ours {
+		return err
+	}
+	if _, err := conn.Exec(ctx, "DROP TABLE "+qual); err != nil {
+		return err
+	}
+	_, err = conn.Exec(ctx, "COMMIT")
+	return err
+}
+
 func (p *Placer) ensureShadows(ctx context.Context, wf *placementWorkflow) error {
 	var ddl []string
 	for _, t := range wf.rt.Holders() {
@@ -165,30 +253,58 @@ func (p *Placer) ensureShadows(ctx context.Context, wf *placementWorkflow) error
 		if err != nil {
 			return err
 		}
+		marker := wf.placementMarker()
 		err = func() error {
 			exists, err := tableExists(ctx, conn, wf.spec.SchemaName, wf.shadow())
-			if err != nil || exists {
+			if err != nil {
 				return err
+			}
+			if exists {
+				// Adopt a shadow only if a prior pass of THIS workflow created
+				// it; a same-named user table, or an artifact left by another
+				// workflow, does not match the marker and must not be written
+				// into.
+				ours, err := isPlacementArtifact(ctx, conn, wf.spec.SchemaName, wf.shadow(), marker)
+				if err != nil {
+					return err
+				}
+				if !ours {
+					return fatal("a table named %s already exists and is not this workflow's shadow; rename it before sharding %s", wf.shape.qualified(wf.shadow()), wf.spec.table())
+				}
+				return nil
 			}
 			local, err := tableExists(ctx, conn, wf.spec.SchemaName, wf.spec.TableName)
 			if err != nil {
 				return err
 			}
+			// Create and mark the shadow in one transaction so a crash never
+			// leaves an unmarked pgshard shadow that a retry would reject and
+			// cancellation would refuse to clean up.
+			var stmts []string
 			if local {
-				_, err := conn.Exec(ctx, fmt.Sprintf("CREATE TABLE %s (LIKE %s INCLUDING ALL)", wf.shape.qualified(wf.shadow()), wf.shape.qualified(wf.spec.TableName)))
+				stmts = []string{fmt.Sprintf("CREATE TABLE %s (LIKE %s INCLUDING ALL)", wf.shape.qualified(wf.shadow()), wf.shape.qualified(wf.spec.TableName))}
+			} else {
+				if ddl == nil {
+					if ddl, err = p.shadowDDL(ctx, wf); err != nil {
+						return err
+					}
+				}
+				stmts = ddl
+			}
+			if _, err := conn.Exec(ctx, "BEGIN"); err != nil {
 				return err
 			}
-			if ddl == nil {
-				if ddl, err = p.shadowDDL(ctx, wf); err != nil {
-					return err
-				}
-			}
-			for _, stmt := range ddl {
+			defer func() { _, _ = conn.Exec(ctx, "ROLLBACK") }()
+			for _, stmt := range stmts {
 				if _, err := conn.Exec(ctx, stmt); err != nil {
 					return fmt.Errorf("%s: %w", stmt, err)
 				}
 			}
-			return nil
+			if err := markPlacementArtifact(ctx, conn, wf.spec.SchemaName, wf.shadow(), marker); err != nil {
+				return err
+			}
+			_, err = conn.Exec(ctx, "COMMIT")
+			return err
 		}()
 		_ = conn.Close(ctx)
 		if err != nil {
@@ -809,6 +925,18 @@ func (p *Placer) swapOn(ctx context.Context, wf *placementWorkflow, conn ShardCo
 			}
 		}
 		if hasOld {
+			// Lock before the marker check so a concurrent rename cannot swap
+			// an unmarked table under the name between the check and the drop.
+			if _, err := conn.Exec(ctx, "LOCK TABLE "+old+" IN ACCESS EXCLUSIVE MODE"); err != nil {
+				return err
+			}
+			ours, err := isPlacementArtifact(ctx, conn, wf.spec.SchemaName, wf.old(), wf.placementMarker())
+			if err != nil {
+				return err
+			}
+			if !ours {
+				return fatal("a table named %s already exists and is not a pgshard retired table; rename it before sharding %s", old, wf.spec.table())
+			}
 			if _, err := conn.Exec(ctx, "DROP TABLE "+old); err != nil {
 				return err
 			}
@@ -816,9 +944,19 @@ func (p *Placer) swapOn(ctx context.Context, wf *placementWorkflow, conn ShardCo
 		if _, err := conn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s RENAME TO %s", table, QuoteIdent(wf.old()))); err != nil {
 			return err
 		}
+		// Tag the retired table so a later drop-old pass (or an interrupted
+		// retry) only ever drops pgshard's own renamed original.
+		if err := markPlacementArtifact(ctx, conn, wf.spec.SchemaName, wf.old(), wf.placementMarker()); err != nil {
+			return err
+		}
 	}
 	if holder {
 		if _, err := conn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s RENAME TO %s", shadow, QuoteIdent(wf.spec.TableName))); err != nil {
+			return err
+		}
+		// Clear the pgshard marker and restore the original table's comment,
+		// which LIKE INCLUDING ALL copied onto the shadow before marking.
+		if err := restoreComment(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, wf.st.TableComment); err != nil {
 			return err
 		}
 		if hasTable {
@@ -968,7 +1106,7 @@ func (p *Placer) dropOld(ctx context.Context, wf *placementWorkflow) error {
 			return err
 		}
 		err = func() error {
-			if _, err := conn.Exec(ctx, "DROP TABLE IF EXISTS "+wf.shape.qualified(wf.old())); err != nil {
+			if err := dropArtifactTable(ctx, conn, wf.spec.SchemaName, wf.old(), wf.placementMarker()); err != nil {
 				return err
 			}
 			if !slices.Contains(wf.rt.Holders(), t) {
