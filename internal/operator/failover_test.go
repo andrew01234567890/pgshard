@@ -8,6 +8,8 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
 	"k8s.io/utils/ptr"
 )
 
@@ -142,5 +144,19 @@ func TestPrimaryHealthy(t *testing.T) {
 	}
 	if primaryHealthy(pod, false, AgentStatus{}, errors.New("rpc")) {
 		t.Error("not Ready and Status failing is unhealthy")
+	}
+}
+
+func TestRefuseAsyncFailover(t *testing.T) {
+	c := &pgshardv1alpha1.PgShardCluster{}
+	// Any promotion under async durability is refused (wrapping errNoCandidate).
+	c.Spec.Durability.MinSyncStandbys = 0
+	if err := refuseAsyncFailover(c); !errors.Is(err, errAsyncFailover) || !errors.Is(err, errNoCandidate) {
+		t.Fatalf("async promotion must be refused (and wrap errNoCandidate): %v", err)
+	}
+	// A synchronous cluster proceeds.
+	c.Spec.Durability.MinSyncStandbys = 1
+	if err := refuseAsyncFailover(c); err != nil {
+		t.Fatalf("sync failover must proceed: %v", err)
 	}
 }
