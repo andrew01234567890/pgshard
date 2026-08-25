@@ -331,10 +331,28 @@ func runSuite(t *testing.T, img pgImage) {
 			t.Fatal("migration 20 recorded itself despite failing")
 		}
 
+		// Renumbering the ranges is not enough on its own: a workflow created
+		// before the migration holds its own snapshot of the old IDs, and the
+		// copier dials the shards that snapshot names.
+		mustExec(t, old, `INSERT INTO pgshard.workflows (id, kind, state, spec) VALUES
+			('33333333-3333-3333-3333-333333333333', 'reshard', 'running',
+			 '{"shard_set": "default", "ranges": [{"shard_id": 10}, {"shard_id": 20}]}'::jsonb)`)
 		mustExec(t, old, `UPDATE pgshard.shard_ranges SET shard_id = 0 WHERE shard_id = 10`)
 		mustExec(t, old, `UPDATE pgshard.shard_ranges SET shard_id = 1 WHERE shard_id = 20`)
+
+		err = applyMigration(ctx, old, last)
+		if err == nil {
+			t.Fatal("migration 20 accepted a repair that left an in-flight workflow addressing shards that no longer exist")
+		}
+		for _, want := range []string{"mis-numbered shard ranges", "default", "shard 10"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("migration error must name the offending workflow and IDs; got %v", err)
+			}
+		}
+
+		mustExec(t, old, `UPDATE pgshard.workflows SET state = 'cancelled' WHERE id = '33333333-3333-3333-3333-333333333333'`)
 		if err := applyMigration(ctx, old, last); err != nil {
-			t.Fatalf("migration 20 rejected a renumbered catalog: %v", err)
+			t.Fatalf("migration 20 rejected a renumbered catalog with no workflow in flight: %v", err)
 		}
 	})
 
@@ -420,25 +438,72 @@ func runSuite(t *testing.T, img pgImage) {
 			}
 		})
 
-		t.Run("frozen_while_provisioning", func(t *testing.T) {
-			mustExec(t, conn, `INSERT INTO pgshard.shard_sets (shard_set, generation, state) VALUES ('gfrozen', 30, 'desired')`)
+		t.Run("frozen_while_a_workflow_owns_them", func(t *testing.T) {
+			// The set is serving, not provisioning: a cutover flips it well
+			// before its workflow finishes, and the workflow keeps the reverse
+			// subscription open for the whole rollback window.
+			mustExec(t, conn, `INSERT INTO pgshard.shard_sets (shard_set, generation, state) VALUES ('gowned', 30, 'serving')`)
 			mustExec(t, conn, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES
-				('gfrozen', 0, '[,0)'), ('gfrozen', 1, '[0,)')`)
-			mustExec(t, conn, `UPDATE pgshard.shard_sets SET state = 'provisioning' WHERE shard_set = 'gfrozen'`)
+				('gowned', 0, '[,0)'), ('gowned', 1, '[0,)')`)
+			mustExec(t, conn, `INSERT INTO pgshard.workflows (id, kind, state, spec) VALUES
+				('11111111-1111-1111-1111-111111111111', 'reshard', 'running',
+				 '{"shard_set": "gowned", "ranges": [{"shard_id": 0}, {"shard_id": 1}]}'::jsonb)`)
 
-			t.Run("merge_refused", func(t *testing.T) {
+			refused := func(t *testing.T, stmts ...string) {
+				t.Helper()
 				tx, err := conn.Begin(ctx)
 				if err != nil {
 					t.Fatal(err)
 				}
 				defer func() { _ = tx.Rollback(ctx) }()
-				mustTx(t, tx, `DELETE FROM pgshard.shard_ranges WHERE shard_set = 'gfrozen' AND shard_id = 1`)
-				mustTx(t, tx, `UPDATE pgshard.shard_ranges SET range = '[,)' WHERE shard_set = 'gfrozen' AND shard_id = 0`)
+				for _, stmt := range stmts {
+					mustTx(t, tx, stmt)
+				}
 				err = tx.Commit(ctx)
 				if err == nil {
 					t.Fatal("ranges were rewritten under a workflow that had already snapshotted them")
 				}
-				expectPgError(t, err, "23514", "provisioned")
+				expectPgError(t, err, "23514", "owned by workflow")
+			}
+
+			t.Run("merge_refused", func(t *testing.T) {
+				refused(t,
+					`DELETE FROM pgshard.shard_ranges WHERE shard_set = 'gowned' AND shard_id = 1`,
+					`UPDATE pgshard.shard_ranges SET range = '[,)' WHERE shard_set = 'gowned' AND shard_id = 0`)
+			})
+
+			t.Run("split_refused", func(t *testing.T) {
+				refused(t,
+					`UPDATE pgshard.shard_ranges SET range = '[0,100)' WHERE shard_set = 'gowned' AND shard_id = 1`,
+					`INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES ('gowned', 2, '[100,)')`)
+			})
+
+			// Moving a range between sets always breaks the coverage of both,
+			// so either guard may be the one that refuses it; what matters is
+			// that a set a workflow owns cannot be emptied out from under it.
+			t.Run("moving_a_range_out_refused", func(t *testing.T) {
+				tx, err := conn.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				mustTx(t, tx, `UPDATE pgshard.shard_ranges SET shard_set = 'gelsewhere' WHERE shard_set = 'gowned' AND shard_id = 1`)
+				err = tx.Commit(ctx)
+				if err == nil {
+					t.Fatal("a range was moved out of a set a workflow owns")
+				}
+				expectPgError(t, err, "23514", "gowned")
+			})
+
+			t.Run("an_insert_alone_cannot_reshape_a_covered_set", func(t *testing.T) {
+				_, err := conn.Exec(ctx, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES ('gowned', 2, '[100,200)')`)
+				if err == nil {
+					t.Fatal("an insert into a set that already covers the key space must overlap")
+				}
+				var pgErr *pgconn.PgError
+				if !errors.As(err, &pgErr) || pgErr.Code != "23P01" {
+					t.Fatalf("expected an exclusion violation, got %v", err)
+				}
 			})
 
 			t.Run("dropping_the_whole_set_is_allowed", func(t *testing.T) {
@@ -447,11 +512,34 @@ func runSuite(t *testing.T, img pgImage) {
 					t.Fatal(err)
 				}
 				defer func() { _ = tx.Rollback(ctx) }()
-				if err := DropShardSet(ctx, tx, "gfrozen"); err != nil {
+				if err := DropShardSet(ctx, tx, "gowned"); err != nil {
 					t.Fatal(err)
 				}
 				if err := tx.Commit(ctx); err != nil {
-					t.Fatalf("retiring a provisioning set was refused: %v", err)
+					t.Fatalf("cancelling a reshard by dropping its target set was refused: %v", err)
+				}
+			})
+
+			t.Run("a_finished_workflow_releases_the_set", func(t *testing.T) {
+				mustExec(t, conn, `INSERT INTO pgshard.shard_sets (shard_set, generation, state) VALUES ('gdone', 31, 'serving')`)
+				mustExec(t, conn, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES
+					('gdone', 0, '[,0)'), ('gdone', 1, '[0,)')`)
+				mustExec(t, conn, `INSERT INTO pgshard.workflows (id, kind, state, spec) VALUES
+					('22222222-2222-2222-2222-222222222222', 'reshard', 'completed',
+					 '{"shard_set": "gdone", "ranges": [{"shard_id": 0}, {"shard_id": 1}]}'::jsonb)`)
+				t.Cleanup(func() {
+					mustExec(t, conn, `DELETE FROM pgshard.shard_ranges WHERE shard_set = 'gdone'`)
+					mustExec(t, conn, `DELETE FROM pgshard.shard_sets WHERE shard_set = 'gdone'`)
+				})
+				tx, err := conn.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				mustTx(t, tx, `UPDATE pgshard.shard_ranges SET range = '[0,100)' WHERE shard_set = 'gdone' AND shard_id = 1`)
+				mustTx(t, tx, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES ('gdone', 2, '[100,)')`)
+				if err := tx.Commit(ctx); err != nil {
+					t.Fatalf("a set whose workflow has finished must be editable again: %v", err)
 				}
 			})
 		})
