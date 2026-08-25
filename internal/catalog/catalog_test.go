@@ -277,6 +277,67 @@ func runSuite(t *testing.T, img pgImage) {
 		}
 	})
 
+	t.Run("upgrade_refuses_a_mis_numbered_catalog", func(t *testing.T) {
+		mustExec(t, conn, `CREATE DATABASE pgshard_pre_0020`)
+		t.Cleanup(func() { mustExec(t, conn, `DROP DATABASE pgshard_pre_0020 WITH (FORCE)`) })
+		old := connect(t, strings.Replace(dsn, "/postgres?", "/pgshard_pre_0020?", 1))
+
+		ms, err := Migrations()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := old.Exec(ctx, `
+			CREATE SCHEMA IF NOT EXISTS pgshard;
+			CREATE TABLE IF NOT EXISTS pgshard.schema_migrations (
+				version    integer     PRIMARY KEY,
+				applied_at timestamptz NOT NULL DEFAULT now(),
+				checksum   text        NOT NULL
+			)`); err != nil {
+			t.Fatal(err)
+		}
+		var last Migration
+		for _, m := range ms {
+			if m.Version == 20 {
+				last = m
+				break
+			}
+			if err := applyMigration(ctx, old, m); err != nil {
+				t.Fatalf("migration %d: %v", m.Version, err)
+			}
+		}
+		if last.Version != 20 {
+			t.Fatal("migration 20 not found")
+		}
+
+		// The exact state PGS-268 describes: full key coverage, IDs the router
+		// never used.
+		mustExec(t, old, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES
+			('default', 10, '[,0)'), ('default', 20, '[0,)')`)
+
+		err = applyMigration(ctx, old, last)
+		if err == nil {
+			t.Fatal("migration 20 accepted a catalog whose shard IDs routing had been ignoring")
+		}
+		for _, want := range []string{"not numbered 0..N-1", "shard 10", "shard 20"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("migration error must name the offending set and IDs; got %v", err)
+			}
+		}
+		var applied bool
+		if err := old.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pgshard.schema_migrations WHERE version = 20)`).Scan(&applied); err != nil {
+			t.Fatal(err)
+		}
+		if applied {
+			t.Fatal("migration 20 recorded itself despite failing")
+		}
+
+		mustExec(t, old, `UPDATE pgshard.shard_ranges SET shard_id = 0 WHERE shard_id = 10`)
+		mustExec(t, old, `UPDATE pgshard.shard_ranges SET shard_id = 1 WHERE shard_id = 20`)
+		if err := applyMigration(ctx, old, last); err != nil {
+			t.Fatalf("migration 20 rejected a renumbered catalog: %v", err)
+		}
+	})
+
 	t.Run("shard_ranges", func(t *testing.T) {
 		mustExec(t, conn, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES
 			('default', 0, '[,0)'), ('default', 1, '[0,)')`)
@@ -357,6 +418,42 @@ func runSuite(t *testing.T, img pgImage) {
 					expectPgError(t, err, "23514", "0..N-1")
 				})
 			}
+		})
+
+		t.Run("frozen_while_provisioning", func(t *testing.T) {
+			mustExec(t, conn, `INSERT INTO pgshard.shard_sets (shard_set, generation, state) VALUES ('gfrozen', 30, 'desired')`)
+			mustExec(t, conn, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES
+				('gfrozen', 0, '[,0)'), ('gfrozen', 1, '[0,)')`)
+			mustExec(t, conn, `UPDATE pgshard.shard_sets SET state = 'provisioning' WHERE shard_set = 'gfrozen'`)
+
+			t.Run("merge_refused", func(t *testing.T) {
+				tx, err := conn.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				mustTx(t, tx, `DELETE FROM pgshard.shard_ranges WHERE shard_set = 'gfrozen' AND shard_id = 1`)
+				mustTx(t, tx, `UPDATE pgshard.shard_ranges SET range = '[,)' WHERE shard_set = 'gfrozen' AND shard_id = 0`)
+				err = tx.Commit(ctx)
+				if err == nil {
+					t.Fatal("ranges were rewritten under a workflow that had already snapshotted them")
+				}
+				expectPgError(t, err, "23514", "provisioned")
+			})
+
+			t.Run("dropping_the_whole_set_is_allowed", func(t *testing.T) {
+				tx, err := conn.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				if err := DropShardSet(ctx, tx, "gfrozen"); err != nil {
+					t.Fatal(err)
+				}
+				if err := tx.Commit(ctx); err != nil {
+					t.Fatalf("retiring a provisioning set was refused: %v", err)
+				}
+			})
 		})
 
 		t.Run("negative_shard_id_rejected", func(t *testing.T) {
