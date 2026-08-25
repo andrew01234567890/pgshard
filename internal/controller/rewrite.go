@@ -122,6 +122,41 @@ func (a *Applier) failRewrite(ctx context.Context, logger *slog.Logger, m *catal
 // recordRewriteColumns publishes the table's visible column list into the
 // migration meta so routers hide the working column, then waits for
 // snapshots to reload before any hidden column exists.
+// rewriteColumnDependents lists the objects a DROP COLUMN of schema.table.column
+// would cascade away: standalone indexes on the column, PRIMARY KEY/UNIQUE/
+// CHECK/foreign-key constraints that include it, inbound foreign keys that
+// reference it, and generated columns computed from it. The online rewrite
+// recreates none of these, so any result means the rewrite must be refused.
+func rewriteColumnDependents(ctx context.Context, conn ShardConn, schema, table, column string) ([]string, error) {
+	rows, err := conn.Query(ctx, `
+		WITH t AS (
+			SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE c.relname = $1 AND ($2 = '' AND n.nspname = ANY (current_schemas(false)) OR n.nspname = $2)
+			LIMIT 1),
+		col AS (SELECT a.attnum FROM pg_attribute a, t WHERE a.attrelid = t.oid AND a.attname = $3 AND NOT a.attisdropped)
+		SELECT 'index ' || c.relname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid, t, col
+			WHERE i.indrelid = t.oid AND col.attnum = ANY (i.indkey)
+			AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid)
+		UNION ALL
+		SELECT 'constraint ' || con.conname FROM pg_constraint con, t, col
+			WHERE con.conrelid = t.oid AND col.attnum = ANY (con.conkey) AND con.contype <> 'n'
+		UNION ALL
+		SELECT 'inbound foreign key ' || con.conname FROM pg_constraint con, t, col
+			WHERE con.confrelid = t.oid AND col.attnum = ANY (con.confkey)
+		UNION ALL
+		SELECT 'generated column ' || a.attname
+			FROM pg_depend d
+			JOIN pg_attrdef ad ON ad.oid = d.objid
+			JOIN pg_attribute a ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum AND a.attgenerated <> '', t, col
+			WHERE d.classid = 'pg_attrdef'::regclass AND d.refclassid = 'pg_class'::regclass
+			AND d.refobjid = t.oid AND d.refobjsubid = col.attnum AND ad.adrelid = t.oid
+		ORDER BY 1`, table, schema, column)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
 func (a *Applier) recordRewriteColumns(ctx context.Context, m *catalog.DDLMigration) error {
 	rw := m.Meta.Rewrite
 	if len(rw.Columns) > 0 {
@@ -136,6 +171,21 @@ func (a *Applier) recordRewriteColumns(ctx context.Context, m *catalog.DDLMigrat
 		return err
 	}
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	// Fail closed: the OID-preserving cutover drops the old column, which
+	// silently cascades away every index and PRIMARY KEY/UNIQUE/CHECK/FK
+	// constraint and generated column that depends on it, and the cutover
+	// never recreates them. Refuse the rewrite before any schema change when
+	// the target column carries such dependents (the add form has no old
+	// column to drop).
+	if !rw.Add && rw.Column != "" {
+		deps, err := rewriteColumnDependents(ctx, conn, rw.Schema, rw.Table, rw.Column)
+		if err != nil {
+			return err
+		}
+		if len(deps) > 0 {
+			return fmt.Errorf("online rewrite of column %q on %s cannot proceed: it has dependent objects the cutover would drop without recreating: %s", rw.Column, rw.Table, strings.Join(deps, ", "))
+		}
+	}
 	rows, err := conn.Query(ctx, `SELECT a.attname FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
 		JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE c.relname = $1 AND ($2 = '' AND n.nspname = ANY (current_schemas(false)) OR n.nspname = $2)
