@@ -45,8 +45,9 @@ because a set is already `serving` while its workflow still holds the reverse
 subscription open for the rollback window.
 
 Dropping a whole set stays allowed — that is how a cancelled reshard clears its
-target — but only as a whole: removing the set's row while keeping its ranges is
-refused.
+target — but only as a whole. The rules live on `pgshard.shard_ranges`, so
+deleting a set's row on its own commits; what is refused is editing the ranges
+it left behind.
 
 A workflow that never started owns nothing, so a set with only such a workflow
 against it stays editable. That covers one still `pending`, and one paused

@@ -40,6 +40,24 @@ BEGIN
             USING ERRCODE = 'check_violation',
                   HINT = 'cancel these workflows before applying this migration; renumbering pgshard.shard_ranges alone would leave them addressing shards that no longer exist';
     END IF;
+    -- A workflow records the set it copies from before it takes its first
+    -- side effect, so ownership can name that set exactly. One created before
+    -- that was true may have publications and subscriptions against a set it
+    -- never recorded, and there is no way to recover which set that was: the
+    -- serving set today is not necessarily the one it built them against.
+    SELECT string_agg(format('%s (%s)', id, kind), ', ' ORDER BY id)
+      INTO bad
+      FROM pgshard.workflows
+     WHERE kind IN ('reshard', 'upgrade')
+       AND (state IN ('provisioning', 'running')
+            OR (state = 'paused' AND coalesce(status->>'paused_from', 'pending') <> 'pending'))
+       AND spec->>'source_set' IS NULL
+       AND status->'cutover'->>'source_set' IS NULL;
+    IF bad IS NOT NULL THEN
+        RAISE EXCEPTION 'workflows in flight have not recorded the shard set they copy from: %', bad
+            USING ERRCODE = 'check_violation',
+                  HINT = 'cancel these workflows before applying this migration; their source cannot be determined after the fact, so their source set cannot be protected from being reshaped';
+    END IF;
 END
 $$;
 
@@ -138,13 +156,7 @@ BEGIN
                 OR spec->>'source_set' = target
                 -- A workflow created before the source was recorded in the spec
                 -- resolves it on its first cutover pass and keeps it here.
-                OR status->'cutover'->>'source_set' = target
-                -- Before either is recorded, the workflow copies from whichever
-                -- set is serving, which is what it will resolve the source to.
-                OR (spec->>'source_set' IS NULL
-                    AND status->'cutover'->>'source_set' IS NULL
-                    AND target = (SELECT shard_set FROM pgshard.shard_sets
-                                   WHERE state = 'serving' ORDER BY generation DESC LIMIT 1)))
+                OR status->'cutover'->>'source_set' = target)
            AND (state IN ('provisioning', 'running')
                 -- A workflow paused out of 'pending' never started, so pausing
                 -- one must not be a way to freeze a set that was editable.

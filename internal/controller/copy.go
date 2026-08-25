@@ -306,6 +306,46 @@ func (c *Copier) fail(ctx context.Context, wf *copyWorkflow, cause error) error 
 }
 
 // sources are the shards of the serving set the copy reads from.
+// pinSource resolves the set a workflow copies from once and records it before
+// the workflow takes its first side effect, so later passes cannot drift onto a
+// different set. Resolving it live on every pass is not safe: a workflow that
+// has already built publications and subscriptions against one set would
+// rediscover whichever set is serving now, leaving its replication attached to
+// the old one, and would let the old one be reshaped underneath it.
+func (c *Copier) pinSource(ctx context.Context, wf *copyWorkflow) (string, []int32, error) {
+	if set := wf.sourceSet(); set != "" {
+		ids, err := c.sourceIDs(ctx, set)
+		return set, ids, err
+	}
+	set, ids, err := c.sources(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+	if _, err := c.Pool.Exec(ctx, `UPDATE pgshard.workflows
+		SET status = status || jsonb_build_object('cutover', coalesce(status->'cutover', '{}'::jsonb) || jsonb_build_object('source_set', $2::text)),
+		    updated_at = now()
+		WHERE id = $1::uuid`, wf.id, set); err != nil {
+		return "", nil, fmt.Errorf("record copy source: %w", err)
+	}
+	wf.cutover.SourceSet = set
+	return set, ids, nil
+}
+
+func (c *Copier) sourceIDs(ctx context.Context, set string) ([]int32, error) {
+	rows, err := c.Pool.Query(ctx, `SELECT shard_id FROM pgshard.shard_status WHERE shard_set = $1 ORDER BY shard_id`, set)
+	if err != nil {
+		return nil, err
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[int32])
+	if err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("shard set %s has no shards in shard_status", set)
+	}
+	return ids, nil
+}
+
 func (c *Copier) sources(ctx context.Context) (string, []int32, error) {
 	var set string
 	err := c.Pool.QueryRow(ctx, `SELECT shard_set FROM pgshard.shard_sets WHERE state = $1 ORDER BY generation DESC LIMIT 1`, catalog.ShardSetServing).Scan(&set)
@@ -361,7 +401,7 @@ func (c *Copier) databases(ctx context.Context) ([]dbPlan, error) {
 // drive advances one workflow through the copy phase; it reports whether
 // the stage changed.
 func (c *Copier) drive(ctx context.Context, wf *copyWorkflow) (bool, error) {
-	srcSet, srcIDs, err := c.sources(ctx)
+	srcSet, srcIDs, err := c.pinSource(ctx, wf)
 	if err != nil {
 		return false, err
 	}

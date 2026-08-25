@@ -54,12 +54,8 @@ type pgCutover struct {
 
 // driveCutover builds the PostgreSQL ops of one workflow and advances it.
 func (c *Copier) driveCutover(ctx context.Context, wf *copyWorkflow) (bool, error) {
-	if wf.sourceSet() == "" {
-		set, _, err := c.sources(ctx)
-		if err != nil {
-			return false, err
-		}
-		wf.cutover.SourceSet = set
+	if _, _, err := c.pinSource(ctx, wf); err != nil {
+		return false, err
 	}
 	ops, err := c.pgCutover(ctx, wf)
 	if err != nil {
