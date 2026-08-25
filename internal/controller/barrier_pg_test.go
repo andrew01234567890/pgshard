@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -107,4 +108,29 @@ func TestDecisionWatermarkSurvivesDeletedRows(t *testing.T) {
 	if after <= before {
 		t.Fatalf("watermark did not advance for a deleted row: before=%d after=%d", before, after)
 	}
+}
+
+// TestBarrierLockSerializesOnPostgres: the barrier advisory lock admits one
+// holder at a time, so two barriers can never raise and clear the shared
+// write fence concurrently.
+func TestBarrierLockSerializesOnPostgres(t *testing.T) {
+	f := newResolverFixtureWith(t)
+	ctx := context.Background()
+	store := &PGBarrierStore{Pool: f.pool}
+
+	unlock, err := store.Lock(ctx)
+	if err != nil {
+		t.Fatalf("first lock: %v", err)
+	}
+	// A second barrier cannot acquire the lock while the first holds it.
+	if _, err := store.Lock(ctx); !errors.Is(err, ErrBarrierBusy) {
+		t.Fatalf("second lock: err = %v, want ErrBarrierBusy", err)
+	}
+	unlock()
+	// After release, a new barrier can take it.
+	unlock2, err := store.Lock(ctx)
+	if err != nil {
+		t.Fatalf("lock after release: %v", err)
+	}
+	unlock2()
 }

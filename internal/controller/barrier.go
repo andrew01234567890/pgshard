@@ -65,6 +65,11 @@ type BarrierGroups interface {
 
 // BarrierStore is the catalog side of a barrier.
 type BarrierStore interface {
+	// Lock serializes barriers cluster-wide: it acquires the barrier
+	// advisory lock and returns a release function, or ErrBarrierBusy if
+	// another barrier already holds it. The lock is held for the whole run
+	// so two barriers can never raise and clear the shared fence at once.
+	Lock(ctx context.Context) (func(), error)
 	// Fence raises or releases the cluster write fence.
 	Fence(ctx context.Context, active bool, reason string) error
 	// FencedAt returns when the current fence was raised.
@@ -153,6 +158,11 @@ func (b *Barrier) Run(ctx context.Context, name string) (RestorePoint, error) {
 	if !barrierName.MatchString(name) {
 		return RestorePoint{}, ErrBarrierName
 	}
+	unlock, err := b.Store.Lock(ctx)
+	if err != nil {
+		return RestorePoint{}, fmt.Errorf("barrier %s: %w", name, err)
+	}
+	defer unlock()
 	if exists, err := b.Store.Exists(ctx, name); err != nil {
 		return RestorePoint{}, fmt.Errorf("barrier %s: %w", name, err)
 	} else if exists {
@@ -324,6 +334,38 @@ func (b *Barrier) sleep(ctx context.Context) error {
 // PGBarrierStore is the BarrierStore over the catalog.
 type PGBarrierStore struct {
 	Pool *pgxpool.Pool
+}
+
+// BarrierLockKey is the pg_advisory_lock key held for the duration of a
+// barrier so only one runs cluster-wide.
+const BarrierLockKey int64 = 0x7067736861726242
+
+// ErrBarrierBusy is returned when another barrier already holds the lock.
+var ErrBarrierBusy = errors.New("barrier: another barrier is already running")
+
+// Lock implements BarrierStore: it holds a session advisory lock on a
+// dedicated connection for the whole barrier.
+func (s *PGBarrierStore) Lock(ctx context.Context) (func(), error) {
+	conn, err := s.Pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var locked bool
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, BarrierLockKey).Scan(&locked); err != nil {
+		conn.Release()
+		return nil, err
+	}
+	if !locked {
+		conn.Release()
+		return nil, ErrBarrierBusy
+	}
+	return func() {
+		// Release the lock on the same connection, then return it.
+		rel, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		_, _ = conn.Exec(rel, `SELECT pg_advisory_unlock($1)`, BarrierLockKey)
+		conn.Release()
+	}, nil
 }
 
 // Fence implements BarrierStore.

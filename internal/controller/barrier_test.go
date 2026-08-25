@@ -28,6 +28,8 @@ func (s *fakeBarrierStore) log(step string) {
 	*s.journal = append(*s.journal, step)
 }
 
+func (s *fakeBarrierStore) Lock(context.Context) (func(), error) { return func() {}, nil }
+
 func (s *fakeBarrierStore) Fence(_ context.Context, active bool, reason string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
