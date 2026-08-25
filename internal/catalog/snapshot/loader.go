@@ -126,7 +126,7 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 // LoadRoles reads role verifiers and login gates. The connection must be
 // allowed to read pgshard.roles.verifier (pgshard_system or pgshard_admin).
 func LoadRoles(ctx context.Context, q catalog.Querier) (*Roles, error) {
-	rows, err := q.Query(ctx, `SELECT rolname, coalesce(verifier, ''), login, valid_until FROM pgshard.roles`)
+	rows, err := q.Query(ctx, `SELECT rolname, coalesce(verifier, ''), login, valid_until, connection_limit FROM pgshard.roles`)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot: roles: %w", err)
 	}
@@ -135,7 +135,7 @@ func LoadRoles(ctx context.Context, q catalog.Querier) (*Roles, error) {
 	for rows.Next() {
 		var name string
 		var cred RoleCred
-		if err := rows.Scan(&name, &cred.Verifier, &cred.CanLogin, &cred.ValidUntil); err != nil {
+		if err := rows.Scan(&name, &cred.Verifier, &cred.CanLogin, &cred.ValidUntil, &cred.ConnectionLimit); err != nil {
 			return nil, err
 		}
 		r.verifiers[name] = cred

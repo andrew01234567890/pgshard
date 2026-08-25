@@ -130,6 +130,9 @@ type RoleCred struct {
 	Verifier   string
 	CanLogin   bool
 	ValidUntil *time.Time
+	// ConnectionLimit is how many sessions the role may hold open at once;
+	// -1 means unlimited, matching pg_roles.rolconnlimit.
+	ConnectionLimit int32
 }
 
 // Roles holds credential verifiers keyed by role name. Its String and

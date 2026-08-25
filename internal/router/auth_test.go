@@ -132,3 +132,48 @@ func TestRoleCacheRefusesNologinAndExpired(t *testing.T) {
 	now = future
 	assert28000("current", "expired")
 }
+
+// TestConnectionLimitRefusesBeyondTheRolesAllowance: a role's
+// connection_limit is a cluster setting, not documentation - once the role
+// holds as many sessions as it may, the next one is refused rather than
+// quietly admitted.
+func TestConnectionLimitRefusesBeyondTheRolesAllowance(t *testing.T) {
+	h := newHarness(t)
+	h.r.cfg.RoleLimits = limiter(func(user string) (int32, bool) {
+		if user == "app" {
+			return 2, true
+		}
+		return 0, false
+	})
+	var open []*pgx.Conn
+	for i := range 2 {
+		c, err := pgx.Connect(context.Background(), h.dsn("app", "secret", "app"))
+		if err != nil {
+			t.Fatalf("session %d of an allowance of 2: %v", i, err)
+		}
+		open = append(open, c)
+	}
+	if _, err := pgx.Connect(context.Background(), h.dsn("app", "secret", "app")); sqlstate(err) != "53300" {
+		t.Fatalf("third session past a limit of 2: %v", err)
+	}
+	// Closing one frees the allowance again.
+	if err := open[0].Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c, err := pgx.Connect(context.Background(), h.dsn("app", "secret", "app"))
+		if err == nil {
+			_ = c.Close(context.Background())
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("a closed session must free its slot: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+type limiter func(string) (int32, bool)
+
+func (f limiter) ConnectionLimit(user string) (int32, bool) { return f(user) }

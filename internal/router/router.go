@@ -38,6 +38,15 @@ type Config struct {
 	Sequences *SequenceAllocator
 	// Migrations queues DDL for the controller's applier; nil refuses DDL.
 	Migrations MigrationQueue
+	// RoleLimits reports a role's connection limit; nil leaves limits
+	// unenforced.
+	RoleLimits RoleLimiter
+}
+
+// RoleLimiter reports how many sessions a role may hold open at once. ok is
+// false when the role has no limit.
+type RoleLimiter interface {
+	ConnectionLimit(user string) (int32, bool)
 }
 
 // CancelForwarder delivers a cancel key to the router instances it may
@@ -62,6 +71,8 @@ type Router struct {
 
 	mu       sync.Mutex
 	sessions map[uint64]*Executor
+	// perUser counts the live sessions of each role, for connection limits.
+	perUser  map[string]int32
 	buffered map[Shard]int
 	// fenceWaiting counts statements held by the cluster write fence.
 	fenceWaiting int
@@ -130,11 +141,27 @@ func (r *Router) NewExecutor(info pgwire.SessionInfo) (pgwire.Executor, error) {
 		return nil, err
 	}
 	e := newExecutor(r, info, home)
-	r.metrics.Connections.Inc()
 	r.mu.Lock()
+	if limit, ok := r.limitFor(info.User); ok && r.perUser[info.User] >= limit {
+		r.mu.Unlock()
+		return nil, pgwire.Errorf(codeBufferFull, "too many connections for role %q", info.User)
+	}
+	if r.perUser == nil {
+		r.perUser = map[string]int32{}
+	}
+	r.perUser[info.User]++
 	r.sessions[info.ID] = e
 	r.mu.Unlock()
+	r.metrics.Connections.Inc()
 	return e, nil
+}
+
+// limitFor is Config.RoleLimits, with nil meaning unlimited.
+func (r *Router) limitFor(user string) (int32, bool) {
+	if r.cfg.RoleLimits == nil {
+		return 0, false
+	}
+	return r.cfg.RoleLimits.ConnectionLimit(user)
 }
 
 func (r *Router) homeShard(database string) (Shard, error) {
@@ -156,6 +183,11 @@ func (r *Router) forget(e *Executor) {
 	r.mu.Lock()
 	if r.sessions[e.info.ID] == e {
 		delete(r.sessions, e.info.ID)
+		if n := r.perUser[e.info.User]; n > 1 {
+			r.perUser[e.info.User] = n - 1
+		} else {
+			delete(r.perUser, e.info.User)
+		}
 	}
 	r.mu.Unlock()
 }
