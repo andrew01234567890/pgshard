@@ -14,6 +14,8 @@ import (
 	"testing"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 )
@@ -32,7 +34,7 @@ type fakePooler struct {
 	cancels   []string
 	users     []string
 	sleeping  map[string]chan struct{}
-	sessions  map[string]*sync.Mutex
+	attached  map[string]bool
 	dropAfter string
 	dropped   int
 	// executed records every statement text this shard ran, in order;
@@ -157,7 +159,7 @@ var fakeXIDs atomic.Int64
 // The fake pooler serves shard map generation 7 at primary epoch 2, the
 // pair every harness snapshot starts from.
 func newFakePooler() *fakePooler {
-	return &fakePooler{gen: 7, epoch: 2, backends: map[string]*fakeBackend{}, reserved: map[string]bool{}, sleeping: map[string]chan struct{}{}, sessions: map[string]*sync.Mutex{}}
+	return &fakePooler{gen: 7, epoch: 2, backends: map[string]*fakeBackend{}, reserved: map[string]bool{}, sleeping: map[string]chan struct{}{}, attached: map[string]bool{}}
 }
 
 func startFakePooler(t *testing.T, fp *fakePooler) string {
@@ -184,18 +186,23 @@ func (f *fakePooler) backend(sid string) *fakeBackend {
 	return b
 }
 
-// session serializes the messages of one session id. A real backend handles one
-// message at a time; a router that opens a second Execute stream for a session
-// before the first has finished otherwise races the fake's per-session state.
-func (f *fakePooler) session(sid string) *sync.Mutex {
+// attach mirrors the real pooler: a session may have only one Execute stream
+// at a time (internal/pooler/server.go attachSession). Serializing instead
+// would let the tests pass on an overlap production rejects.
+func (f *fakePooler) attach(sid string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	m := f.sessions[sid]
-	if m == nil {
-		m = &sync.Mutex{}
-		f.sessions[sid] = m
+	if f.attached[sid] {
+		return status.Error(codes.FailedPrecondition, "session already has an Execute stream")
 	}
-	return m
+	f.attached[sid] = true
+	return nil
+}
+
+func (f *fakePooler) detach(sid string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.attached, sid)
 }
 
 func (f *fakePooler) fence(g *pgshardv1.Generation) *pgshardv1.Error {
@@ -551,9 +558,6 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 }
 
 func (s *fakeStream) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error {
-	m := s.f.session(s.sid)
-	m.Lock()
-	defer m.Unlock()
 	if e := s.f.fence(req.Generation); e != nil {
 		if err := s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_Error{Error: &pgshardv1.ErrorResponse{Error: e}}}); err != nil {
 			return err
@@ -739,6 +743,10 @@ func (f *fakePooler) Execute(stream pgshardv1.Pooler_ExecuteServer) error {
 	f.mu.Lock()
 	f.users = append(f.users, first.User.Username)
 	f.mu.Unlock()
+	if err := f.attach(first.SessionId); err != nil {
+		return err
+	}
+	defer f.detach(first.SessionId)
 	s := &fakeStream{f: f, sid: first.SessionId, stream: stream}
 	req := first
 	for {
