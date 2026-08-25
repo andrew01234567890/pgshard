@@ -422,7 +422,7 @@ func TestRewriteReturningStarHidesWorkingColumnOnPostgres(t *testing.T) {
 func TestRewriteRefusesDependentColumnOnPostgres(t *testing.T) {
 	pool, a, store := rewritePGFixture(t)
 	ctx := context.Background()
-	mustExecSQL(t, pool, `CREATE UNIQUE INDEX accounts_amount_key ON accounts (amount)`)
+	mustExecSQL(t, pool, `CREATE UNIQUE INDEX accounts_amount_key ON accounts (lower(amount))`)
 	oid := tableOID(t, pool)
 	m := catalog.DDLMigration{ID: "10000000-0000-0000-0000-0000000000d1", Database: "postgres",
 		Statement: "alter table accounts alter column amount type bigint using amount::bigint",

@@ -205,7 +205,7 @@ func (c *fakeConn) Query(_ context.Context, sql string, args ...any) (pgx.Rows, 
 	switch {
 	case strings.Contains(sql, "server_version_num"):
 		return &intRows{vals: []int{c.f.version}}, nil
-	case strings.Contains(sql, "inbound foreign key"):
+	case strings.Contains(sql, "d.refobjsubid = col.attnum"):
 		// rewriteColumnDependents: the fake table has no dependents.
 		return &stringRows{vals: c.f.rewriteDependents}, nil
 	case strings.Contains(sql, "attname NOT LIKE"):
