@@ -98,8 +98,10 @@ func KeyspaceIDOfText(v, typ string) (int64, error) {
 			return 0, fmt.Errorf("shard key value %q is not an integer", v)
 		}
 		return placement.KeyspaceID(n)
-	case "text", "character varying", "character", "varchar", "bpchar", "name":
+	case "text", "character varying", "varchar", "name":
 		return placement.KeyspaceID(v)
+	case "character", "bpchar", "char":
+		return 0, fmt.Errorf("shard key of type %s is not supported: blank-padded character equality does not match byte-wise hashing", typ)
 	case "uuid":
 		raw, err := hex.DecodeString(strings.ReplaceAll(v, "-", ""))
 		if err != nil || len(raw) != 16 {

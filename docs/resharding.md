@@ -128,7 +128,7 @@ record under `status.copy` is informational except for the schema flags.
      table `FOR TABLE t WHERE (<hash>(key) >= lo AND <hash>(key) <= hi)`
      with the target's range. The hash expression is the one the router's
      placement port mirrors: `hashint8extended(key::int8, seed)` for
-     integer keys, `hashtextextended(key::text, seed)` for character keys,
+     integer keys, `hashtextextended(key::text, seed)` for text/varchar keys (blank-padded character types are not accepted as shard keys),
      `uuid_hash_extended(key, seed)` for uuid, seed =
      `HASH_PARTITION_SEED`. Other key types fail the workflow.
    - `pgshard_reshard_g<gen>_ref` on the database's home shard only:

@@ -379,7 +379,7 @@ func (o *pgCutover) Verify(ctx context.Context) (VerifyReport, error) {
 							return err
 						}
 						if hashes[key], err = KeyHashExpr(*tb.ShardKey, st.keyType); err != nil {
-							return err
+							return fatal("%s: %w", tb.TableName, err)
 						}
 					}
 					for i, t := range o.wf.ids {
@@ -517,7 +517,7 @@ func (o *pgCutover) reversePublishOn(ctx context.Context, conn ShardConn, db dbP
 		}
 		hash, err := KeyHashExpr(*tb.ShardKey, st.keyType)
 		if err != nil {
-			return err
+			return fatal("%s: %w", tb.TableName, err)
 		}
 		if !st.replIdentOK {
 			if err := setReplicaIdentityFull(ctx, conn, tb.SchemaName, tb.TableName); err != nil {

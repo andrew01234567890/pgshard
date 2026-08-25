@@ -80,7 +80,7 @@ func TestKeyspaceIDOfTextMatchesPlacement(t *testing.T) {
 	if got, err := KeyspaceIDOfText("00010203-0405-0607-0809-0a0b0c0d0e0f", "uuid"); err != nil || got != want {
 		t.Fatalf("uuid: %d %v", got, err)
 	}
-	for _, bad := range [][2]string{{"x", "bigint"}, {"nope", "uuid"}, {"1.5", "numeric"}} {
+	for _, bad := range [][2]string{{"x", "bigint"}, {"nope", "uuid"}, {"1.5", "numeric"}, {"ab", "character(3)"}, {"ab", "bpchar"}} {
 		if _, err := KeyspaceIDOfText(bad[0], bad[1]); err == nil {
 			t.Errorf("%v accepted", bad)
 		}

@@ -60,6 +60,11 @@ func (b BindParams) ShardKey(n int32, hint TypeHint) (any, error) {
 // shard key.
 var ErrAmbiguousKey = errors.New("value is untyped and looks numeric: cast it to int8 or text")
 
+// errBlankPaddedKey refuses a bpchar shard-key parameter: blank-padded
+// equality ignores trailing spaces, so hashing the raw bytes may not match
+// the shard the row was placed on.
+var errBlankPaddedKey = errors.New("bpchar shard key parameters are not supported; cast to text")
+
 // DecodeShardKey turns one bound parameter into an int64 or string shard
 // key. The declared parameter type wins; a cast in the statement text
 // (hint) types an undeclared parameter; an undeclared text-format value
@@ -103,8 +108,10 @@ func DecodeShardKey(oid uint32, hint TypeHint, format int16, raw []byte) (any, e
 				return int64(int16(binary.BigEndian.Uint16(raw))), nil
 			}
 			return nil, ErrAmbiguousKey
-		case oidText, oidVarchar, oidBpchar, oidName:
+		case oidText, oidVarchar, oidName:
 			return string(raw), nil
+		case oidBpchar:
+			return nil, errBlankPaddedKey
 		}
 		return nil, fmt.Errorf("binary parameter of type oid %d is not a supported shard key", oid)
 	}
@@ -116,8 +123,10 @@ func DecodeShardKey(oid uint32, hint TypeHint, format int16, raw []byte) (any, e
 			return nil, fmt.Errorf("integer parameter %q: %w", s, err)
 		}
 		return i, nil
-	case oidText, oidVarchar, oidBpchar, oidName:
+	case oidText, oidVarchar, oidName:
 		return s, nil
+	case oidBpchar:
+		return nil, errBlankPaddedKey
 	case 0, oidUnknown:
 		if _, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64); err == nil {
 			return nil, ErrAmbiguousKey

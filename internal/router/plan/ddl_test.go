@@ -31,6 +31,8 @@ func TestDDLClassification(t *testing.T) {
 		{sql: "create table regions (id int primary key)", mig: "CREATE TABLE all", object: "relation:regions:present"},
 		{sql: "create table orders (id int primary key, tenant_id int8)", refuse: "primary key or unique constraint (id) on sharded table"},
 		{sql: "create table orders (id int)", refuse: "sharded table \"orders\" must define its shard key column"},
+		{sql: "create table orders (tenant_id character(3), id int, primary key (tenant_id, id))", refuse: "shard key column \"tenant_id\" of sharded table \"orders\" cannot be a blank-padded"},
+		{sql: "create table orders (tenant_id bpchar, id int, primary key (tenant_id, id))", refuse: "shard key column \"tenant_id\" of sharded table \"orders\" cannot be a blank-padded"},
 		{sql: "create unlogged table t2 (id int)", mig: "CREATE TABLE home", object: "relation:t2:present"},
 		{sql: "create index items_name on items (name)", mig: "CREATE INDEX home", object: "relation:items_name:present"},
 		{sql: "create index concurrently orders_id on orders (id)", mig: "CREATE INDEX all concurrent", object: "relation:orders_id:present"},
