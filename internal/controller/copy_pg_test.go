@@ -128,7 +128,7 @@ func newCopyFixtureOpts(t *testing.T, targets int, tgtImage string) *copyFixture
 		}
 	}
 	mustExec(t, f.catalog, `INSERT INTO pgshard.databases (name, default_placement, home_shard) VALUES ('app', 'unsharded', 0)`)
-	for _, row := range [][3]string{{"orders", "sharded", "tenant_id"}, {"docs", "sharded", "slug"}, {"accounts", "sharded", "id"}, {"regions", "reference", ""}, {"items", "unsharded", ""}} {
+	for _, row := range [][3]string{{"orders", "sharded", "tenant_id"}, {"docs", "sharded", "slug"}, {"accounts", "sharded", "id"}, {"events", "sharded", "tenant_id"}, {"regions", "reference", ""}, {"items", "unsharded", ""}} {
 		var key *string
 		if row[2] != "" {
 			key = &row[2]
@@ -147,6 +147,9 @@ func newCopyFixtureOpts(t *testing.T, targets int, tgtImage string) *copyFixture
 			`CREATE TABLE regions (code text PRIMARY KEY, name text)`,
 			`CREATE TABLE items (id serial PRIMARY KEY, v text)`,
 			`CREATE TABLE notes (v text)`,
+			`CREATE TABLE events (id bigint, tenant_id bigint NOT NULL, kind text) PARTITION BY LIST (kind)`,
+			`CREATE TABLE events_a PARTITION OF events FOR VALUES IN ('a')`,
+			`CREATE TABLE events_b PARTITION OF events FOR VALUES IN ('b')`,
 			`CREATE SEQUENCE ticket_seq START 500`,
 			`CREATE TYPE mood AS ENUM ('ok', 'meh')`,
 			`CREATE VIEW order_count AS SELECT count(*) FROM orders`,
@@ -208,6 +211,11 @@ func (f *copyFixture) seed(start, n int) {
 		slug := fmt.Sprintf("doc-%d", i)
 		tid, _ := placement.KeyspaceID(tenant)
 		mustExec(f.t, conns[f.srcRng.Locate(tid)], `INSERT INTO orders (tenant_id, note) VALUES ($1, $2)`, tenant, "n"+slug)
+		kind := "a"
+		if i%2 == 1 {
+			kind = "b"
+		}
+		mustExec(f.t, conns[f.srcRng.Locate(tid)], `INSERT INTO events (id, tenant_id, kind) VALUES ($1, $2, $3)`, i, tenant, kind)
 		sid, _ := placement.KeyspaceID(slug)
 		mustExec(f.t, conns[f.srcRng.Locate(sid)], `INSERT INTO docs VALUES ($1, $2)`, slug, "body")
 	}
@@ -323,6 +331,20 @@ func TestReshardCopyOnPostgres(t *testing.T) {
 	if err := src0.QueryRow(ctx, `SELECT relreplident FROM pg_class WHERE relname = 'orders'`).Scan(&ident); err != nil || ident != "d" {
 		t.Fatalf("orders' primary key covers the shard key: %q %v", ident, err)
 	}
+	// A partitioned sharded table without a covering key: the publication
+	// must be created with publish_via_partition_root and every leaf
+	// partition (not just the root) must get REPLICA IDENTITY FULL, else
+	// the via-root filtered publication rejects UPDATE/DELETE on the leaf.
+	if n := queryOne[int64](t, src0, `SELECT count(*) FROM pg_publication WHERE pubviaroot`); n == 0 {
+		t.Fatal("partitioned sharded table did not enable publish_via_partition_root")
+	}
+	for _, leaf := range []string{"events_a", "events_b"} {
+		if err := src0.QueryRow(ctx, `SELECT relreplident FROM pg_class WHERE relname = $1`, leaf).Scan(&ident); err != nil || ident != "f" {
+			t.Fatalf("leaf %s must get REPLICA IDENTITY FULL: %q %v", leaf, ident, err)
+		}
+	}
+	// The via-root filtered publication now accepts writes on the partitioned table.
+	mustExec(t, src0, `UPDATE events SET kind = kind WHERE tenant_id = (SELECT tenant_id FROM events LIMIT 1)`)
 
 	// The resolver (decision: abort) clears the in-doubt transaction and
 	// the copy proceeds.
@@ -367,7 +389,7 @@ func TestReshardCopyOnPostgres(t *testing.T) {
 		t.Fatalf("progress %s", progress)
 	}
 
-	for _, table := range []string{"orders", "docs"} {
+	for _, table := range []string{"orders", "docs", "events"} {
 		want := f.expectedCounts(table, f.tgtRng)
 		for tid := range 2 {
 			tgt := connect(t, f.appDSN("g2", int32(tid)))

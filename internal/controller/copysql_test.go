@@ -2,6 +2,7 @@ package controller
 
 import (
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/andrew01234567890/pgshard/internal/placement"
@@ -61,6 +62,18 @@ func TestCreatePublicationSQL(t *testing.T) {
 	}
 	if got := CreatePublicationSQL("pgshard_reshard_g2_ref", nil); got != `CREATE PUBLICATION "pgshard_reshard_g2_ref" WITH (publish = 'insert, update, delete')` {
 		t.Fatalf("empty publication: %s", got)
+	}
+	// A partitioned sharded table must publish via the partition root so its
+	// root-level row filter applies and its rows are copied, not skipped.
+	part := CreatePublicationSQL("pgshard_reshard_g2_t2", []PublishedTable{
+		{Schema: "public", Name: "orders", Filter: `hashint8extended("tenant_id"::int8, 1::int8) >= 0`, Partitioned: true},
+	})
+	if !strings.Contains(part, "publish_via_partition_root = true") {
+		t.Fatalf("partitioned publication missing via-root: %s", part)
+	}
+	// Non-partitioned publications must NOT add the option.
+	if strings.Contains(want, "publish_via_partition_root") {
+		t.Fatalf("non-partitioned publication should not set via-root: %s", want)
 	}
 }
 
