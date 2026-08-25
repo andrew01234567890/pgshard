@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"slices"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
@@ -956,4 +958,80 @@ func TestPlacementRefusesGeneratedKeyOnPostgres(t *testing.T) {
 	if state != StateFailed || !strings.Contains(msg, "is a generated column") {
 		t.Fatalf("expected generated-key refusal, got %s %q", state, msg)
 	}
+}
+
+// TestPlacementFenceRefusesAStaleRouterOnPostgres is the point of fencing in
+// the database: between the first per-shard swap and the new placement being
+// published, a router still holding the pre-move view is admitted by the
+// routing generation and the primary epoch, because neither has moved yet.
+// The shard has to refuse it itself, and it has to keep refusing after its
+// own swap, or the write lands on the wrong shard and is never replayed.
+func TestPlacementFenceRefusesAStaleRouterOnPostgres(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	ctx := context.Background()
+	for id := range int32(2) {
+		c := f.app(id)
+		mustExec(t, c, `CREATE TABLE moving (id bigint PRIMARY KEY, tenant_id bigint NOT NULL, note text)`)
+	}
+	client := f.app(0)
+	mustExec(t, client, `INSERT INTO moving VALUES (1, 10, 'before')`)
+
+	shape := rowShape{Schema: "public", Name: "moving"}
+	live, shadow := shape.qualified("moving"), shape.qualified("moving_shadow")
+	admin := connect(t, strings.Replace(f.dsns[ShardRef{Set: "default", ID: 0}], "/postgres?", "/app?", 1))
+	mustExec(t, admin, `CREATE TABLE moving_shadow (LIKE moving INCLUDING ALL)`)
+	if _, err := admin.Exec(ctx, `SET `+MaintenanceGUC+` = 'on'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := fenceTables(ctx, pgxShardConn{admin}, "public", live, shadow); err != nil {
+		t.Fatal(err)
+	}
+
+	// A client session is refused on both the live table and the shadow.
+	for _, sql := range []string{
+		`INSERT INTO moving VALUES (2, 20, 'stale')`,
+		`UPDATE moving SET note = 'stale' WHERE id = 1`,
+		`DELETE FROM moving WHERE id = 1`,
+		`INSERT INTO moving_shadow VALUES (3, 30, 'stale')`,
+	} {
+		_, err := client.Exec(ctx, sql)
+		if err == nil {
+			t.Fatalf("the fence admitted %q", sql)
+		}
+		var pge *pgconn.PgError
+		if !errors.As(err, &pge) || pge.Code != "55000" {
+			t.Fatalf("%q: %v, want 55000", sql, err)
+		}
+	}
+	// TRUNCATE never fires a row trigger, so it needs its own.
+	if _, err := client.Exec(ctx, `TRUNCATE moving`); err == nil {
+		t.Fatal("TRUNCATE went straight through the fence")
+	} else {
+		var pge *pgconn.PgError
+		if !errors.As(err, &pge) || pge.Code != "55000" {
+			t.Fatalf("TRUNCATE: %v, want 55000", err)
+		}
+	}
+	// The workflow's own session still works, or it could not catch up.
+	mustExec(t, admin, `INSERT INTO moving_shadow VALUES (4, 40, 'applied')`)
+
+	// After the swap the shadow carries the live name, and its trigger came
+	// with it, so the shard is still fenced.
+	mustExec(t, admin, `ALTER TABLE moving RENAME TO moving_old`)
+	mustExec(t, admin, `ALTER TABLE moving_shadow RENAME TO moving`)
+	if _, err := client.Exec(ctx, `INSERT INTO moving VALUES (5, 50, 'after swap')`); err == nil {
+		t.Fatal("a swapped shard must stay fenced until the placement is published")
+	} else {
+		var pge *pgconn.PgError
+		if !errors.As(err, &pge) || pge.Code != "55000" {
+			t.Fatalf("after swap: %v, want 55000", err)
+		}
+	}
+
+	// Releasing lets the client back in.
+	if err := unfenceTables(ctx, pgxShardConn{admin}, shape.qualified("moving"), shape.qualified("moving_old")); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, client, `INSERT INTO moving VALUES (6, 60, 'after release')`)
 }

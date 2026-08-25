@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 )
 
 // describe reads the table's shape from the first source shard and checks
@@ -957,12 +959,94 @@ func slotLag(ctx context.Context, conn ShardConn, slot string) (int64, error) {
 
 // fence raises the table-scoped write pause routers observe.
 func (p *Placer) fence(ctx context.Context, wf *placementWorkflow) error {
-	_, err := p.Pool.Exec(ctx, `UPDATE pgshard.table_status SET migrating = true, workflow_id = $4::uuid, updated_at = now()
-		WHERE database = $1 AND schema_name = $2 AND table_name = $3 AND NOT migrating`, wf.spec.Database, wf.spec.SchemaName, wf.spec.TableName, wf.id)
-	return err
+	if _, err := p.Pool.Exec(ctx, `UPDATE pgshard.table_status SET migrating = true, workflow_id = $4::uuid, updated_at = now()
+		WHERE database = $1 AND schema_name = $2 AND table_name = $3 AND NOT migrating`, wf.spec.Database, wf.spec.SchemaName, wf.spec.TableName, wf.id); err != nil {
+		return err
+	}
+	return nil
+}
+
+// fenceShards arms the database fence on every shard. The catalog flag only
+// asks routers to hold writes; a router that has not read it yet is refused
+// by the shard itself. It goes on after the drain and immediately before
+// the first swap, so writers that were already in flight finish normally
+// instead of being broken mid-transaction, and it stays on until the new
+// placement is published.
+func (p *Placer) fenceShards(ctx context.Context, wf *placementWorkflow) error {
+	return p.eachShard(ctx, wf, func(ctx context.Context, conn ShardConn) error {
+		return fenceTables(ctx, conn, wf.spec.SchemaName, wf.shape.qualified(wf.spec.TableName), wf.shape.qualified(wf.shadow()))
+	})
+}
+
+// releaseShardFence drops the database fence from every shard. Every shard
+// is tried before the first failure is reported, so one that is unreachable
+// cannot leave the others refusing writes.
+func (p *Placer) releaseShardFence(ctx context.Context, wf *placementWorkflow) error {
+	ids, err := p.fencedShards(ctx, wf)
+	if err != nil {
+		return err
+	}
+	var failed error
+	for _, t := range ids {
+		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
+		if err != nil {
+			failed = errors.Join(failed, err)
+			continue
+		}
+		err = unfenceTables(ctx, conn, wf.shape.qualified(wf.spec.TableName), wf.shape.qualified(wf.shadow()), wf.shape.qualified(wf.old()))
+		_ = conn.Close(ctx)
+		if err != nil {
+			failed = errors.Join(failed, fmt.Errorf("shard %s/%d: %w", wf.st.SourceSet, t, err))
+		}
+	}
+	return failed
+}
+
+// fencedShards is the shard list to fence or release. It falls back to the
+// catalog when the workflow's routing was never built, because a failure
+// raised before that still has to be able to give the table back.
+func (p *Placer) fencedShards(ctx context.Context, wf *placementWorkflow) ([]int32, error) {
+	if wf.rt != nil {
+		return wf.rt.ids, nil
+	}
+	if wf.st.SourceSet == "" {
+		return nil, nil
+	}
+	ranges, err := catalog.ListShardRanges(ctx, p.Pool, wf.st.SourceSet)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]int32, 0, len(ranges))
+	for _, r := range ranges {
+		ids = append(ids, r.ShardID)
+	}
+	return ids, nil
+}
+
+// eachShard runs fn on every shard the workflow touches.
+func (p *Placer) eachShard(ctx context.Context, wf *placementWorkflow, fn func(context.Context, ShardConn) error) error {
+	ids, err := p.fencedShards(ctx, wf)
+	if err != nil {
+		return err
+	}
+	for _, t := range ids {
+		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
+		if err != nil {
+			return err
+		}
+		err = fn(ctx, conn)
+		_ = conn.Close(ctx)
+		if err != nil {
+			return fmt.Errorf("shard %s/%d: %w", wf.st.SourceSet, t, err)
+		}
+	}
+	return nil
 }
 
 func (p *Placer) releaseFence(ctx context.Context, wf *placementWorkflow) error {
+	if err := p.releaseShardFence(ctx, wf); err != nil {
+		return err
+	}
 	_, err := p.Pool.Exec(ctx, `UPDATE pgshard.table_status SET migrating = false, updated_at = now()
 		WHERE database = $1 AND schema_name = $2 AND table_name = $3 AND migrating`, wf.spec.Database, wf.spec.SchemaName, wf.spec.TableName)
 	return err
