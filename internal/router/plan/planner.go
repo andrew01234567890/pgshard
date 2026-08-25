@@ -60,7 +60,7 @@ func (p *Planner) Plan(ctx context.Context, sess Session, sql string) (Plan, err
 	if err := classify(raw.GetStmt(), &pl.Class); err != nil {
 		return refusalErr(err)
 	}
-	if err := refuseProtectedSetConfig(sql, raw.GetStmt()); err != nil {
+	if err := refuseProtectedSetConfig(raw.GetStmt()); err != nil {
 		return refusalErr(err)
 	}
 	w := &walker{sess: sess, plan: pl, tree: res.Tree, root: raw.GetStmt(), raw: raw, sql: sql}
@@ -106,6 +106,15 @@ func (s Session) session() Plan { return Plan{Kind: SessionLocal, Generation: s.
 // refusals that do not depend on the catalog.
 func classify(node *pgquerypb.Node, c *StmtClass) error {
 	switch n := node.GetNode().(type) {
+	case *pgquerypb.Node_UpdateStmt:
+		// pg_catalog.pg_settings is an updatable view whose rule rewrites the
+		// UPDATE into set_config(name, setting, false), so writing to it is a
+		// SET by another route. Refuse it for protected durability GUCs.
+		if targetsPgSettings(n.UpdateStmt.GetRelation()) {
+			err := pgwire.Errorf(pgwire.CodeInsufficientPrivilege, "updating pg_settings is not permitted through pgshard")
+			err.Hint = "durability settings are fixed by the cluster to keep commits recoverable across failover"
+			return err
+		}
 	case *pgquerypb.Node_ListenStmt:
 		return notYet("LISTEN is not supported through the router", "")
 	case *pgquerypb.Node_NotifyStmt:
@@ -210,12 +219,8 @@ var protectedDurabilityGUCs = map[string]bool{
 
 // refuseProtectedSetConfig refuses set_config('<protected>', ...) anywhere in a
 // statement, the expression-level equivalent of SET. A non-constant setting
-// name cannot be checked at plan time, so it fails closed. The SQL text is a
-// cheap prefilter: the reflective walk runs only when set_config is mentioned.
-func refuseProtectedSetConfig(sql string, root *pgquerypb.Node) error {
-	if !strings.Contains(strings.ToLower(sql), "set_config") {
-		return nil
-	}
+// name cannot be checked at plan time, so it fails closed.
+func refuseProtectedSetConfig(root *pgquerypb.Node) error {
 	var refErr error
 	visit(root, func(n *pgquerypb.Node) bool {
 		fc := n.GetFuncCall()
@@ -223,13 +228,17 @@ func refuseProtectedSetConfig(sql string, root *pgquerypb.Node) error {
 			return true
 		}
 		names := stringList(fc.GetFuncname())
-		if len(names) == 0 || !strings.EqualFold(names[len(names)-1], "set_config") {
+		last := len(names) - 1
+		if last < 0 || !strings.EqualFold(names[last], "set_config") {
 			return true
 		}
-		if len(names) == 2 && !strings.EqualFold(names[0], "pg_catalog") {
-			return true
-		}
-		if len(names) > 2 {
+		// The durability built-in is pg_catalog.set_config, reachable
+		// unqualified or with a pg_catalog schema part (optionally preceded
+		// by the current-database name). A set_config in any other schema is
+		// a different function. Match on the parse tree, never the SQL text:
+		// U&"..." escapes and database qualification hide it from a substring
+		// check while still resolving to the built-in.
+		if last >= 1 && !strings.EqualFold(names[last-1], "pg_catalog") {
 			return true
 		}
 		args := fc.GetArgs()
@@ -250,6 +259,15 @@ func refuseProtectedSetConfig(sql string, root *pgquerypb.Node) error {
 		return true
 	})
 	return refErr
+}
+
+// targetsPgSettings reports whether a range var names pg_catalog.pg_settings.
+func targetsPgSettings(rv *pgquerypb.RangeVar) bool {
+	if rv == nil || !strings.EqualFold(rv.GetRelname(), "pg_settings") {
+		return false
+	}
+	sc := rv.GetSchemaname()
+	return sc == "" || strings.EqualFold(sc, "pg_catalog")
 }
 
 // setsProtectedValue reports whether a SET kind assigns an explicit value (as

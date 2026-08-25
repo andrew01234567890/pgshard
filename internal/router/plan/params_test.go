@@ -242,6 +242,10 @@ func TestProtectedDurabilityGUCRefused(t *testing.T) {
 		"update orders set note = set_config('synchronous_commit','off',true) where tenant_id = 1",
 		"select pg_catalog.set_config('synchronous_commit', 'off', false)",
 		"select set_config(note, 'off', true) from orders",
+		`select U&"\0073et_config"('synchronous_commit','off',true)`,
+		"select appdb.pg_catalog.set_config('synchronous_commit','off',true)",
+		"update pg_settings set setting = 'off' where name = 'synchronous_commit'",
+		"update pg_catalog.pg_settings set setting = 'off' where name = 'synchronous_commit'",
 	}
 	for _, sql := range refuse {
 		pl, err := New().Plan(context.Background(), session(snap), sql)
