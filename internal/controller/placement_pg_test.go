@@ -628,11 +628,13 @@ func TestUniqueConstraintsMissingKeyOnPostgres(t *testing.T) {
 	ctx := context.Background()
 	for _, stmt := range []string{
 		`CREATE EXTENSION IF NOT EXISTS btree_gist`,
+		`CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false)`,
 		`CREATE TABLE pk_omits (id int PRIMARY KEY, v int UNIQUE)`,
 		`CREATE TABLE pk_covers (id int, v int, PRIMARY KEY (id, v))`,
-		`CREATE TABLE include_only (id int, v int, UNIQUE (id) INCLUDE (v))`,
-		`CREATE TABLE excl_eq (v int, EXCLUDE USING btree (v WITH =))`,
-		`CREATE TABLE excl_overlap (tsr int4range, EXCLUDE USING gist (tsr WITH &&))`,
+		`CREATE TABLE include_only (id int, v int, PRIMARY KEY (id, v), UNIQUE (id) INCLUDE (v))`,
+		`CREATE TABLE nondet (id int, t text COLLATE ci, PRIMARY KEY (t))`,
+		`CREATE TABLE excl_eq (id int, v int, PRIMARY KEY (v), EXCLUDE USING btree (v WITH =))`,
+		`CREATE TABLE temporal (id int, valid int4range, PRIMARY KEY (id, valid WITHOUT OVERLAPS))`,
 	} {
 		mustExec(t, conn, stmt)
 	}
@@ -640,11 +642,12 @@ func TestUniqueConstraintsMissingKeyOnPostgres(t *testing.T) {
 		table, key string
 		want       []string
 	}{
-		{"pk_omits", "v", []string{"pk_omits_pkey"}},               // PK(id) cannot stay global
-		{"pk_covers", "v", nil},                                    // v is a PK key column
-		{"include_only", "v", []string{"include_only_id_v_key"}},   // v is only covering
-		{"excl_eq", "v", nil},                                      // equality exclusion is per-shard safe
-		{"excl_overlap", "tsr", []string{"excl_overlap_tsr_excl"}}, // && is not equality
+		{"pk_omits", "v", []string{"pk_omits_pkey"}},             // PK(id) cannot stay global
+		{"pk_covers", "v", nil},                                  // v is a PK key column
+		{"include_only", "v", []string{"include_only_id_v_key"}}, // v is only a covering column of the unique index
+		{"nondet", "t", []string{"nondet_pkey"}},                 // nondeterministic collation != raw-hash equality
+		{"excl_eq", "v", []string{"excl_eq_v_excl"}},             // exclusion refused (not recreated on target shadows)
+		{"temporal", "id", []string{"temporal_pkey"}},            // temporal WITHOUT OVERLAPS is an exclusion index
 	}
 	for _, c := range cases {
 		got, err := uniqueConstraintsMissingKey(ctx, pgxShardConn{conn}, "public", c.table, c.key)
