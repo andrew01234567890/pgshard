@@ -180,17 +180,36 @@ func uniqueConstraintsMissingKey(ctx context.Context, conn ShardConn, schema, na
 	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
-// unsupportedTableFeatures lists the row-level security policies, user
-// triggers and foreign keys (in either direction) on a table; the placement
-// shadow build does not recreate any of them.
+// unsupportedTableFeatures lists what a placement move cannot yet preserve on
+// the table. The shadow is rebuilt from columns, constraints and indexes, so
+// everything below would be silently lost at the swap: row-level security
+// (an enabled-but-policy-less table denies all today and would allow all
+// after), the owner and table/column privileges (an outage for application
+// roles, or a privilege leak), user triggers, foreign keys in either direction
+// (inbound ones would keep pointing at the retired table's OID), rewrite
+// rules, inheritance/partition membership, and user publications (downstream
+// subscribers would silently stop receiving).
 func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name string) ([]string, error) {
 	rows, err := conn.Query(ctx, `WITH t AS (
-			SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+			SELECT c.oid, c.relowner, c.relacl, c.relrowsecurity, c.relforcerowsecurity
+			FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 			WHERE n.nspname = $1 AND c.relname = $2)
 		SELECT f FROM (
 			SELECT 'row-level security policy ' || polname AS f FROM pg_policy, t WHERE polrelid = t.oid
+			UNION ALL SELECT 'row-level security enabled' FROM t WHERE t.relrowsecurity OR t.relforcerowsecurity
+			UNION ALL SELECT 'owner ' || pg_get_userbyid(t.relowner) FROM t
+				WHERE t.relowner <> (SELECT oid FROM pg_roles WHERE rolname = current_user)
+			UNION ALL SELECT 'table privileges' FROM t WHERE t.relacl IS NOT NULL
+			UNION ALL SELECT 'column privileges on ' || attname FROM pg_attribute, t
+				WHERE attrelid = t.oid AND attnum > 0 AND NOT attisdropped AND attacl IS NOT NULL
 			UNION ALL SELECT 'trigger ' || tgname FROM pg_trigger, t WHERE tgrelid = t.oid AND NOT tgisinternal
-			UNION ALL SELECT 'foreign key ' || conname FROM pg_constraint, t WHERE contype = 'f' AND (conrelid = t.oid OR confrelid = t.oid)
+			UNION ALL SELECT 'foreign key ' || conname FROM pg_constraint, t
+				WHERE contype = 'f' AND (conrelid = t.oid OR confrelid = t.oid)
+			UNION ALL SELECT 'rule ' || rulename FROM pg_rewrite, t WHERE ev_class = t.oid AND rulename <> '_RETURN'
+			UNION ALL SELECT 'inheritance/partition membership' FROM pg_inherits, t
+				WHERE inhrelid = t.oid OR inhparent = t.oid
+			UNION ALL SELECT 'publication ' || p.pubname FROM pg_publication_rel pr
+				JOIN pg_publication p ON p.oid = pr.prpubid, t WHERE pr.prrelid = t.oid
 		) x ORDER BY f`, schema, name)
 	if err != nil {
 		return nil, err

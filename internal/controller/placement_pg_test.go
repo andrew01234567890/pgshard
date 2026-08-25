@@ -880,4 +880,22 @@ func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 	if got, err := unsupportedTableFeatures(ctx, pgxShardConn{home}, "public", "parent"); err != nil || len(got) != 1 {
 		t.Fatalf("parent inbound fk: %v %v", got, err)
 	}
+	// Shapes lost by both shadow paths that carry no policy/trigger/FK.
+	mustExec(t, home, `CREATE ROLE reader`)
+	for _, c := range []struct{ ddl, table, want string }{
+		{`CREATE TABLE rlsempty (id bigint PRIMARY KEY); ALTER TABLE rlsempty ENABLE ROW LEVEL SECURITY`, "rlsempty", "row-level security enabled"},
+		{`CREATE TABLE granted (id bigint PRIMARY KEY); GRANT SELECT ON granted TO reader`, "granted", "table privileges"},
+		{`CREATE TABLE colgrant (id bigint PRIMARY KEY, v text); GRANT SELECT (v) ON colgrant TO reader`, "colgrant", "column privileges on v"},
+		{`CREATE TABLE ruled (id bigint PRIMARY KEY); CREATE RULE r1 AS ON DELETE TO ruled DO INSTEAD NOTHING`, "ruled", "rule r1"},
+		{`CREATE TABLE base (id bigint PRIMARY KEY); CREATE TABLE inh (x int) INHERITS (base)`, "inh", "inheritance/partition membership"},
+	} {
+		mustExec(t, home, c.ddl)
+		got, err := unsupportedTableFeatures(ctx, pgxShardConn{home}, "public", c.table)
+		if err != nil || !slices.Contains(got, c.want) {
+			t.Fatalf("%s: unsupported = %v (%v), want %q", c.table, got, err, c.want)
+		}
+	}
+	if got, err := unsupportedTableFeatures(ctx, pgxShardConn{home}, "public", "guarded"); err != nil || len(got) < 2 {
+		t.Fatalf("guarded must report both the policy and RLS enabled: %v %v", got, err)
+	}
 }
