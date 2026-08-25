@@ -700,6 +700,12 @@ func (o *pgCutover) Flip(ctx context.Context, _ string) error {
 	if state == catalog.ShardSetServing {
 		return nil
 	}
+	// The workflow froze its source when it was created. Retiring a set
+	// that is no longer the only one serving would publish a second serving
+	// set and drop whatever was committed to the other one.
+	if err := o.sourceStillSoleServing(ctx, tx); err != nil {
+		return err
+	}
 	homeTarget := o.wf.ids[HomeTarget(o.wf.ranges)]
 	for _, q := range []struct {
 		sql  string
@@ -720,6 +726,24 @@ func (o *pgCutover) Flip(ctx context.Context, _ string) error {
 		}
 	}
 	return tx.Commit(ctx)
+}
+
+// sourceStillSoleServing refuses a cutover whose frozen source is no longer
+// the one and only serving set: another workflow flipped underneath it, and
+// this one would be cutting over from data that is already stale.
+func (o *pgCutover) sourceStillSoleServing(ctx context.Context, tx pgx.Tx) error {
+	rows, err := tx.Query(ctx, `SELECT shard_set FROM pgshard.shard_sets WHERE state = $1 ORDER BY shard_set`, catalog.ShardSetServing)
+	if err != nil {
+		return err
+	}
+	serving, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return err
+	}
+	if len(serving) == 1 && serving[0] == o.srcSet {
+		return nil
+	}
+	return fmt.Errorf("cutover source %s is no longer the only serving shard set (serving: %v)", o.srcSet, serving)
 }
 
 // Swap freezes the forward direction (disable; dropped on complete) and
