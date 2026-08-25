@@ -239,6 +239,10 @@ func (s *session) run() {
 	}
 }
 
+// errCancelRequest is returned before requireTLS runs, so a cancel is
+// answered without TLS even on a server that requires it. That matches
+// PostgreSQL: the postmaster handles CancelRequest before any hba or SSL
+// check, and libpq before 17 sends cancels without negotiating.
 var errCancelRequest = errors.New("cancel request handled")
 
 // requireTLS refuses a session that reached the startup message without

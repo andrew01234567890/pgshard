@@ -71,7 +71,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	fs := flag.NewFlagSet("pgshard-router serve", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	listen := fs.String("listen", "127.0.0.1:5432", "address to listen on")
-	certFile := fs.String("tls-cert", "", "TLS certificate file for clients (enables SSLRequest)")
+	certFile := fs.String("tls-cert", "", "TLS certificate file for clients; also requires TLS unless --allow-plaintext")
 	keyFile := fs.String("tls-key", "", "TLS private key file for clients")
 	allowPlaintext := fs.Bool("allow-plaintext", false, "serve clients that never requested TLS even though --tls-cert is set (development only)")
 	catalogDSN := fs.String("catalog-dsn", "", "catalog DSN with access to pgshard.roles verifiers (required)")
