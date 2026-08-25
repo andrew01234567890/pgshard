@@ -109,20 +109,30 @@ func primaryKey(ctx context.Context, conn ShardConn, schema, name string) ([]str
 }
 
 // uniqueConstraintsMissingKey returns the names of every unique or exclusion
-// index on the table whose column set does not plainly contain the shard key.
-// Such a constraint enforces global uniqueness that cannot hold once rows are
-// split across shards, so sharding must be refused. Expression and partial
-// unique indexes are reported too (fail closed): their global safety cannot be
-// proven from indkey alone.
+// index on the table that cannot stay globally enforceable once rows split
+// across shards, so sharding must be refused. For a unique index the shard key
+// must be one of its key columns (equal key tuples then share a shard). For an
+// exclusion constraint the shard key must additionally be compared with
+// equality: a non-equality operator (e.g. && or <>) can conflict across rows
+// with different shard keys, which per-shard enforcement never sees. Only key
+// columns count (ord <= indnkeyatts), never INCLUDE/covering columns.
+// Expression and partial unique indexes are reported too (fail closed): their
+// global safety cannot be proven from the key columns alone.
 func uniqueConstraintsMissingKey(ctx context.Context, conn ShardConn, schema, name, key string) ([]string, error) {
 	rows, err := conn.Query(ctx, `SELECT ix.relname FROM pg_index i
 		JOIN pg_class c ON c.oid = i.indrelid JOIN pg_namespace n ON n.oid = c.relnamespace
 		JOIN pg_class ix ON ix.oid = i.indexrelid
+		LEFT JOIN pg_constraint con ON con.conindid = i.indexrelid AND con.contype = 'x'
 		WHERE n.nspname = $1 AND c.relname = $2 AND (i.indisunique OR i.indisexclusion)
 		AND NOT EXISTS (
 			SELECT 1 FROM unnest(i.indkey) WITH ORDINALITY k(attnum, ord)
 			JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
-			WHERE k.ord <= i.indnkeyatts AND a.attname = $3)
+			WHERE k.ord <= i.indnkeyatts AND a.attname = $3
+			AND (NOT i.indisexclusion OR EXISTS (
+				SELECT 1 FROM unnest(con.conexclop) WITH ORDINALITY e(op, eord)
+				JOIN pg_amop ao ON ao.amopopr = e.op AND ao.amopstrategy = 3
+				JOIN pg_am am ON am.oid = ao.amopmethod AND am.amname = 'btree'
+				WHERE e.eord = k.ord)))
 		ORDER BY ix.relname`, schema, name, key)
 	if err != nil {
 		return nil, err
