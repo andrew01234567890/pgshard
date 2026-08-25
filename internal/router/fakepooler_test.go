@@ -14,6 +14,8 @@ import (
 	"testing"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 )
@@ -24,14 +26,21 @@ type fakePooler struct {
 	pgshardv1.UnimplementedPoolerServer
 	gen, epoch uint64
 
-	mu        sync.Mutex
-	backends  map[string]*fakeBackend
-	reserved  map[string]bool
-	reserves  []string
-	releases  []string
-	cancels   []string
-	users     []string
-	sleeping  map[string]chan struct{}
+	mu       sync.Mutex
+	backends map[string]*fakeBackend
+	reserved map[string]bool
+	reserves []string
+	releases []string
+	cancels  []string
+	users    []string
+	sleeping map[string]chan struct{}
+	attached map[string]chan struct{}
+	// holdDetach, when set, keeps the Execute handler attached until it is
+	// closed, so a test can hold a session across the router's abort.
+	holdDetach chan struct{}
+	// fenced is closed the first time a request is refused for a stale
+	// generation, so a test can wait for the refusal instead of guessing.
+	fenced    chan struct{}
 	dropAfter string
 	dropped   int
 	// executed records every statement text this shard ran, in order;
@@ -156,7 +165,7 @@ var fakeXIDs atomic.Int64
 // The fake pooler serves shard map generation 7 at primary epoch 2, the
 // pair every harness snapshot starts from.
 func newFakePooler() *fakePooler {
-	return &fakePooler{gen: 7, epoch: 2, backends: map[string]*fakeBackend{}, reserved: map[string]bool{}, sleeping: map[string]chan struct{}{}}
+	return &fakePooler{gen: 7, epoch: 2, backends: map[string]*fakeBackend{}, reserved: map[string]bool{}, sleeping: map[string]chan struct{}{}, attached: map[string]chan struct{}{}}
 }
 
 func startFakePooler(t *testing.T, fp *fakePooler) string {
@@ -183,6 +192,35 @@ func (f *fakePooler) backend(sid string) *fakeBackend {
 	return b
 }
 
+// attach mirrors the real pooler: a session may have only one Execute stream
+// at a time (internal/pooler/server.go attachSession). Serializing instead
+// would let the tests pass on an overlap production rejects.
+func (f *fakePooler) attach(sid string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.attached[sid]; ok {
+		return status.Error(codes.FailedPrecondition, "session already has an Execute stream")
+	}
+	f.attached[sid] = make(chan struct{})
+	return nil
+}
+
+func (f *fakePooler) detach(sid string) {
+	f.mu.Lock()
+	ch := f.attached[sid]
+	delete(f.attached, sid)
+	// Like the real detach: a session nobody reserved gives its backend up
+	// when its stream ends, so the next stream starts clean and a missing
+	// replay shows up instead of being served from the old state.
+	if !f.reserved[sid] {
+		delete(f.backends, sid)
+	}
+	f.mu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
+}
+
 func (f *fakePooler) fence(g *pgshardv1.Generation) *pgshardv1.Error {
 	if g == nil || g.ShardMapGeneration != f.gen || g.PrimaryEpoch != f.epoch {
 		return &pgshardv1.Error{Sqlstate: "55000", Message: "stale routing generation"}
@@ -201,10 +239,23 @@ func (f *fakePooler) Reserve(_ context.Context, req *pgshardv1.ReserveRequest) (
 	return &pgshardv1.ReserveResponse{BackendPid: 42}, nil
 }
 
-func (f *fakePooler) Release(_ context.Context, req *pgshardv1.ReleaseRequest) (*pgshardv1.ReleaseResponse, error) {
+func (f *fakePooler) Release(ctx context.Context, req *pgshardv1.ReleaseRequest) (*pgshardv1.ReleaseResponse, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.releases = append(f.releases, req.SessionId)
+	// Like the real Release: while the session still has an Execute stream
+	// the caller waits for it to detach, which is what orders a reacquire
+	// behind the stream the router aborted.
+	if ch, ok := f.attached[req.SessionId]; ok {
+		delete(f.reserved, req.SessionId)
+		f.mu.Unlock()
+		select {
+		case <-ch:
+			return &pgshardv1.ReleaseResponse{}, nil
+		case <-ctx.Done():
+			return nil, status.FromContextError(ctx.Err()).Err()
+		}
+	}
+	defer f.mu.Unlock()
 	delete(f.reserved, req.SessionId)
 	delete(f.backends, req.SessionId)
 	return &pgshardv1.ReleaseResponse{}, nil
@@ -537,6 +588,12 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 
 func (s *fakeStream) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error {
 	if e := s.f.fence(req.Generation); e != nil {
+		s.f.mu.Lock()
+		if s.f.fenced != nil {
+			close(s.f.fenced)
+			s.f.fenced = nil
+		}
+		s.f.mu.Unlock()
 		if err := s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_Error{Error: &pgshardv1.ErrorResponse{Error: e}}}); err != nil {
 			return err
 		}
@@ -721,6 +778,18 @@ func (f *fakePooler) Execute(stream pgshardv1.Pooler_ExecuteServer) error {
 	f.mu.Lock()
 	f.users = append(f.users, first.User.Username)
 	f.mu.Unlock()
+	if err := f.attach(first.SessionId); err != nil {
+		return err
+	}
+	defer func() {
+		f.mu.Lock()
+		hold := f.holdDetach
+		f.mu.Unlock()
+		if hold != nil {
+			<-hold
+		}
+		f.detach(first.SessionId)
+	}()
 	s := &fakeStream{f: f, sid: first.SessionId, stream: stream}
 	req := first
 	for {

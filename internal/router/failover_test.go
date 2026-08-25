@@ -169,6 +169,58 @@ func TestStaleGenerationRetriesAfterSnapshotChange(t *testing.T) {
 	}
 }
 
+// TestReacquireWaitsForThePoolerToDetach covers the window abort leaves open:
+// it cancels this side of the RPC without waiting for the pooler, which
+// refuses a second Execute stream while the session is still attached. The
+// retry must wait for the release instead of reporting a dead connection.
+func TestReacquireWaitsForThePoolerToDetach(t *testing.T) {
+	h := newHarness(t)
+	conn := h.connect(t, h.dsn("app", "secret", "app"))
+	ctx := context.Background()
+	hold := make(chan struct{})
+	h.fp.mu.Lock()
+	h.fp.holdDetach = hold
+	h.fp.mu.Unlock()
+	refused := make(chan struct{})
+	h.fp.mu.Lock()
+	h.fp.fenced = refused
+	h.fp.mu.Unlock()
+	fresh := h.snap()
+	stale := *fresh
+	stale.ShardMapGeneration = 6
+	h.setSnap(&stale)
+	// Publish the fresh map only once the pooler has actually refused the
+	// stale one: a timer could let the statement through before the stream
+	// was ever dropped, and the test would pass without exercising anything.
+	go func() {
+		select {
+		case <-refused:
+		case <-time.After(5 * time.Second):
+		}
+		h.setSnap(fresh)
+	}()
+	// Let the aborted handler finish only once the router has asked for the
+	// release. A router that reacquires without asking gets past this and
+	// the assertion below reports what the client actually saw.
+	go func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			h.fp.mu.Lock()
+			released := len(h.fp.releases) > 0
+			h.fp.mu.Unlock()
+			if released {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		close(hold)
+	}()
+	var n int
+	if err := conn.QueryRow(ctx, "select 1").Scan(&n); err != nil || n != 1 {
+		t.Fatalf("retry across the abort window: %v", err)
+	}
+}
+
 func TestBufferCapRefusesWith53300(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()

@@ -648,22 +648,27 @@ func (e *Executor) bufferFull() error { return bufferFullError(e.shard) }
 // from the refreshed endpoint and replays session state.
 func (e *Executor) dropStream() {
 	e.dropParked()
-	if e.conn != nil {
-		e.conn.abort()
-		e.conn = nil
+	e.pinned = false
+	if e.conn == nil {
+		e.tx = pgwire.TxIdle
+		return
 	}
-	if e.pinned {
-		e.pinned = false
-		e.releaseAsync()
-	}
+	client := e.conn.client
+	e.conn.abort()
+	e.conn = nil
+	// abort only cancels this side of the RPC. The pooler may still have
+	// the session attached, and it refuses a second Execute stream while it
+	// does; Release waits server-side for the old stream to detach, and
+	// awaitRelease orders the next openStream behind it.
+	e.releaseOn(client)
 	e.tx = pgwire.TxIdle
 }
 
 // releaseAsync returns the pinned backend of the current shard without
 // waiting for the pooler; acquire on the same shard waits for it.
-func (e *Executor) releaseAsync() {
-	client, err := e.client()
-	if err != nil {
+// releaseOn releases the session on the pooler that holds it.
+func (e *Executor) releaseOn(client pgshardv1.PoolerClient) {
+	if client == nil {
 		return
 	}
 	if e.releasing == nil {
@@ -1345,13 +1350,12 @@ func (e *Executor) send(req *pgshardv1.ExecuteRequest) error {
 // reacquires a backend and replays session state.
 func (e *Executor) poolerLost(cause error) error {
 	e.dropParked()
+	e.pinned = false
 	if e.conn != nil {
+		client := e.conn.client
 		e.conn.abort()
 		e.conn = nil
-	}
-	if e.pinned {
-		e.pinned = false
-		e.releaseAsync()
+		e.releaseOn(client)
 	}
 	e.tx = pgwire.TxIdle
 	e.staged, e.stagedMark = nil, 0
@@ -1365,10 +1369,20 @@ func (e *Executor) poolerLost(cause error) error {
 // all: nothing was sent, so the statement is safe to retry after failover.
 func (e *Executor) poolerRefused(cause error) error {
 	err := e.poolerLost(cause)
-	if status.Code(cause) == codes.Unavailable {
+	if status.Code(cause) == codes.Unavailable || attachRaced(cause) {
 		return &refusedError{err}
 	}
 	return err
+}
+
+// attachRaced reports the pooler refusing a stream because the session it
+// names is still attached. The release before a reacquire normally orders
+// that away, but the release has its own timeout and can give up first, so
+// the refusal has to stay retryable rather than reach the client as a dead
+// connection.
+func attachRaced(cause error) bool {
+	return status.Code(cause) == codes.FailedPrecondition &&
+		strings.Contains(status.Convert(cause).Message(), "already has an Execute stream")
 }
 
 // refusedError marks a pooler that refused the connection before any
