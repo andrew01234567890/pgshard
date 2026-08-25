@@ -241,6 +241,26 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 }
 
+// TerminateUser ends the sessions of one role and reports how many it
+// asked to end. A role that loses its login, expires or has its allowance
+// cut keeps working otherwise: authentication only gates new connections.
+// Idle sessions go at once, active ones when their statement or transaction
+// finishes, the same way a drain treats them.
+func (s *Server) TerminateUser(user string) int {
+	s.mu.Lock()
+	var doomed []*session
+	for _, sess := range s.sessions {
+		if sess.info.User == user {
+			doomed = append(doomed, sess)
+		}
+	}
+	s.mu.Unlock()
+	for _, sess := range doomed {
+		sess.drain()
+	}
+	return len(doomed)
+}
+
 // Sessions reports the number of live sessions.
 func (s *Server) Sessions() int {
 	s.mu.Lock()

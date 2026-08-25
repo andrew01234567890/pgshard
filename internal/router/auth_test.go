@@ -3,12 +3,15 @@ package router
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
 )
@@ -179,3 +182,37 @@ func TestConnectionLimitRefusesBeyondTheRolesAllowance(t *testing.T) {
 type limiter func(string) (int32, bool)
 
 func (f limiter) ConnectionLimit(user string) (int32, bool) { return f(user) }
+
+// TestRefreshReportsRolesThatMayNoLongerLogIn: authentication only gates
+// new connections, so a role that is dropped, set NOLOGIN or expired keeps
+// whatever sessions it already holds until something ends them.
+func TestRefreshReportsRolesThatMayNoLongerLogIn(t *testing.T) {
+	past := time.Now().Add(-time.Hour)
+	rows := map[string]snapshot.RoleCred{
+		"stays":   {Verifier: "v", CanLogin: true},
+		"nologin": {Verifier: "v", CanLogin: true},
+		"expires": {Verifier: "v", CanLogin: true},
+		"dropped": {Verifier: "v", CanLogin: true},
+		"already": {Verifier: "v", CanLogin: false},
+	}
+	c := &RoleCache{ttl: time.Hour, now: time.Now, load: func(context.Context) (*snapshot.Roles, error) {
+		return snapshot.NewRoles(rows), nil
+	}}
+	if _, err := c.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	rows = map[string]snapshot.RoleCred{
+		"stays":   {Verifier: "v", CanLogin: true},
+		"nologin": {Verifier: "v", CanLogin: false},
+		"expires": {Verifier: "v", CanLogin: true, ValidUntil: &past},
+		"already": {Verifier: "v", CanLogin: false},
+	}
+	revoked, err := c.Refresh(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"dropped", "expires", "nologin"}
+	if !slices.Equal(revoked, want) {
+		t.Fatalf("revoked %v, want %v", revoked, want)
+	}
+}

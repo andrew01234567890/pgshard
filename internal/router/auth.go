@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -21,6 +22,8 @@ type RoleCache struct {
 	q   catalog.Querier
 	ttl time.Duration
 	now func() time.Time
+	// load reads the roles; the catalog by default.
+	load func(context.Context) (*snapshot.Roles, error)
 
 	mu       sync.Mutex
 	roles    *snapshot.Roles
@@ -32,7 +35,9 @@ func NewRoleCache(q catalog.Querier, ttl time.Duration) *RoleCache {
 	if ttl <= 0 {
 		ttl = 5 * time.Second
 	}
-	return &RoleCache{q: q, ttl: ttl, now: time.Now}
+	c := &RoleCache{q: q, ttl: ttl, now: time.Now}
+	c.load = func(ctx context.Context) (*snapshot.Roles, error) { return snapshot.LoadRoles(ctx, c.q) }
+	return c
 }
 
 // Lookup implements pgwire.PasswordLookup.
@@ -81,8 +86,44 @@ func (c *RoleCache) ConnectionLimit(user string) (int32, bool) {
 	return cred.ConnectionLimit, true
 }
 
+// Refresh reloads the roles and reports those that may no longer log in:
+// dropped, set NOLOGIN, or expired since the last look. Authentication only
+// gates new connections, so a caller uses this to end the sessions a
+// revoked role still holds.
+func (c *RoleCache) Refresh(ctx context.Context) ([]string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	before := c.roles
+	if err := c.reload(ctx); err != nil {
+		return nil, err
+	}
+	if before == nil {
+		return nil, nil
+	}
+	var revoked []string
+	for _, name := range before.Names() {
+		cred, ok := before.Cred(name)
+		if !ok {
+			continue
+		}
+		if _, err := c.admit(name, cred); err != nil {
+			continue // already refused before this reload
+		}
+		now, ok := c.roles.Cred(name)
+		if !ok {
+			revoked = append(revoked, name)
+			continue
+		}
+		if _, err := c.admit(name, now); err != nil {
+			revoked = append(revoked, name)
+		}
+	}
+	sort.Strings(revoked)
+	return revoked, nil
+}
+
 func (c *RoleCache) reload(ctx context.Context) error {
-	r, err := snapshot.LoadRoles(ctx, c.q)
+	r, err := c.load(ctx)
 	if err != nil {
 		return err
 	}

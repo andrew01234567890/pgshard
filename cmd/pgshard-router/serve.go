@@ -309,6 +309,29 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	}
 	fmt.Fprintf(stdout, "pgshard-router serve: listening on %s (%s)\n", l.Addr(), mode)
 	errc := make(chan error, 1)
+	// Authentication only gates new connections, so a role that is dropped,
+	// set NOLOGIN or expired would keep the sessions it already holds.
+	go func() {
+		t := time.NewTicker(*rolesTTL)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			revoked, err := roles.Refresh(ctx)
+			if err != nil {
+				logger.Warn("role refresh", "error", err)
+				continue
+			}
+			for _, user := range revoked {
+				if n := srv.TerminateUser(user); n > 0 {
+					logger.Info("terminating sessions of a role that may no longer log in", "role", user, "sessions", n)
+				}
+			}
+		}
+	}()
 	go func() { errc <- srv.Serve(l) }()
 	select {
 	case err := <-errc:
