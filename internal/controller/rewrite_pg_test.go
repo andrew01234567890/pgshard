@@ -89,6 +89,7 @@ func hiddenArtifacts(t *testing.T, pool *pgxpool.Pool) []string {
 // online under concurrent reads and writes: no client error, values
 // preserved and converted, pg_class.oid unchanged, no artifacts left.
 func TestRewriteTypeChangeOnPostgres(t *testing.T) {
+	parallelPG(t)
 	pool, a, store := rewritePGFixture(t)
 	ctx := context.Background()
 	oid := tableOID(t, pool)
@@ -194,6 +195,7 @@ func TestRewriteTypeChangeOnPostgres(t *testing.T) {
 // TestRewriteAddVolatileDefaultOnPostgres adds a uuid column with a
 // volatile default online.
 func TestRewriteAddVolatileDefaultOnPostgres(t *testing.T) {
+	parallelPG(t)
 	pool, a, store := rewritePGFixture(t)
 	ctx := context.Background()
 	m := catalog.DDLMigration{ID: "10000000-0000-0000-0000-0000000000a2", Database: "postgres",
@@ -244,6 +246,7 @@ func TestRewriteAddVolatileDefaultOnPostgres(t *testing.T) {
 // non-convertible value: the migration fails, the table keeps its old
 // column and stays fully usable, and no artifacts remain.
 func TestRewriteFailureRevertsOnPostgres(t *testing.T) {
+	parallelPG(t)
 	pool, a, store := rewritePGFixture(t)
 	ctx := context.Background()
 	mustExecSQL(t, pool, `UPDATE accounts SET amount = 'not a number' WHERE id = 4321`)
@@ -278,6 +281,7 @@ func TestRewriteFailureRevertsOnPostgres(t *testing.T) {
 // TestRepackOnPostgres19 runs the repack step against a PostgreSQL 19
 // server when its image is available.
 func TestRepackOnPostgres19(t *testing.T) {
+	parallelPG(t)
 	dsn := startPostgres19(t)
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, dsn)
@@ -358,6 +362,7 @@ func startPostgres19(t *testing.T) string {
 // rewritten RETURNING * against a shard that carries a rewrite working
 // column: the raw statement would leak it, the rewritten one must not.
 func TestRewriteReturningStarHidesWorkingColumnOnPostgres(t *testing.T) {
+	parallelPG(t)
 	dsn := startPostgres(t)
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, dsn)
@@ -420,6 +425,7 @@ func TestRewriteReturningStarHidesWorkingColumnOnPostgres(t *testing.T) {
 // target column carries a dependent object the cutover cannot recreate (here a
 // UNIQUE index) is refused before any schema change, leaving the table intact.
 func TestRewriteRefusesDependentColumnOnPostgres(t *testing.T) {
+	parallelPG(t)
 	pool, a, store := rewritePGFixture(t)
 	ctx := context.Background()
 	mustExecSQL(t, pool, `CREATE UNIQUE INDEX accounts_amount_key ON accounts (lower(amount))`)

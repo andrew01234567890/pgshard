@@ -287,6 +287,7 @@ func (f *copyFixture) expectedCounts(table string, ranges placement.RangeSet) ma
 // ones written during the copy) land on the targets the placement assigns,
 // and cancel removes subscriptions, slots and publications.
 func TestReshardCopyOnPostgres(t *testing.T) {
+	parallelPG(t)
 	f := newCopyFixture(t)
 	ctx := context.Background()
 	id := f.startWorkflow()

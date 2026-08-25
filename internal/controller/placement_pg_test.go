@@ -164,6 +164,7 @@ func (f *placementFixture) orders(conn *pgx.Conn, table string) []orderRow {
 // the writers pause only while the table fence is up, no write is lost,
 // and every row ends on the shard its new key hashes to.
 func TestPlacementRekeyOnPostgres(t *testing.T) {
+	parallelPG(t)
 	f := newPlacementFixture(t)
 	ctx := context.Background()
 	for id := range int32(2) {
@@ -374,6 +375,7 @@ func TestPlacementRekeyOnPostgres(t *testing.T) {
 // had it), then to reference, cancels a run before its swap, and fails
 // runs whose shard key is missing or not covered by a unique constraint.
 func TestPlacementMovesOnPostgres(t *testing.T) {
+	parallelPG(t)
 	f := newPlacementFixture(t)
 	ctx := context.Background()
 	home := f.app(0)
@@ -507,6 +509,7 @@ func TestPlacementMovesOnPostgres(t *testing.T) {
 // verification), and a write that lands on the source after the drain but
 // before the swap lock must be carried into the shadow before the rename.
 func TestPlacementBackslashKeysAndLateWriteOnPostgres(t *testing.T) {
+	parallelPG(t)
 	f := newPlacementFixture(t)
 	ctx := context.Background()
 	f.placer.CopyBatch = 7
@@ -553,6 +556,7 @@ func TestPlacementBackslashKeysAndLateWriteOnPostgres(t *testing.T) {
 // and only the durable swap marker lets a resumed run skip the holders it
 // covers.
 func TestPlacementVerifyHolderShadowsOnPostgres(t *testing.T) {
+	parallelPG(t)
 	f := newPlacementFixture(t)
 	ctx := context.Background()
 	home := f.app(0)
@@ -623,6 +627,7 @@ func renameShadowAsSwapWould(t *testing.T, f *placementFixture, wf *placementWor
 // INCLUDE-only column does not count, and an exclusion constraint is safe only
 // when the shard key is compared with equality.
 func TestUniqueConstraintsMissingKeyOnPostgres(t *testing.T) {
+	parallelPG(t)
 	dsn := startPostgres(t)
 	conn := connect(t, dsn)
 	ctx := context.Background()
@@ -666,6 +671,7 @@ func TestUniqueConstraintsMissingKeyOnPostgres(t *testing.T) {
 // advanced past the copied rows, so a fresh insert neither collides nor is
 // rejected.
 func TestPlacementIdentityColumnsOnPostgres(t *testing.T) {
+	parallelPG(t)
 	f := newPlacementFixture(t)
 	home := f.app(0)
 	mustExec(t, home, `CREATE TABLE things (
@@ -752,6 +758,7 @@ func TestPlacementIdentityColumnsOnPostgres(t *testing.T) {
 // to share the __pgshard_new shadow name must never be adopted, written into
 // or dropped; the move fails loudly and leaves the table intact.
 func TestPlacementRefusesUserArtifactTableOnPostgres(t *testing.T) {
+	parallelPG(t)
 	f := newPlacementFixture(t)
 	home := f.app(0)
 	other := f.app(1)
@@ -794,6 +801,7 @@ func TestPlacementRefusesUserArtifactTableOnPostgres(t *testing.T) {
 // ALTER SEQUENCE ... OWNED BY for a serial default whose sequence lives in a
 // different schema than the table (PostgreSQL requires them co-schema).
 func TestSequenceInSchemaOnPostgres(t *testing.T) {
+	parallelPG(t)
 	conn := connect(t, startPostgres(t))
 	ctx := context.Background()
 	for _, stmt := range []string{
@@ -819,6 +827,7 @@ func TestSequenceInSchemaOnPostgres(t *testing.T) {
 // rebuilt sequence would not be advanced and is typically shared), so the
 // placement is refused at preflight.
 func TestPlacementRefusesCrossSchemaSerialOnPostgres(t *testing.T) {
+	parallelPG(t)
 	f := newPlacementFixture(t)
 	ctx := context.Background()
 	home := f.app(0)
@@ -853,6 +862,7 @@ func TestPlacementRefusesCrossSchemaSerialOnPostgres(t *testing.T) {
 // preflight, because the shadow build recreates none of them and the swap
 // would silently drop enforcement.
 func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
+	parallelPG(t)
 	f := newPlacementFixture(t)
 	ctx := context.Background()
 	home := f.app(0)
@@ -921,6 +931,7 @@ func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 // of the copied row shape, so a move keyed by it (shard key or primary key)
 // is refused up front instead of failing per row inside the copy.
 func TestPlacementRefusesGeneratedKeyOnPostgres(t *testing.T) {
+	parallelPG(t)
 	f := newPlacementFixture(t)
 	ctx := context.Background()
 	home := f.app(0)

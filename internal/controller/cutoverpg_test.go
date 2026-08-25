@@ -79,6 +79,7 @@ func testCutover(d *slotDialer) *pgCutover {
 // or past the gathered position. A vanished slot, an empty query result or
 // a NULL confirmed_flush_lsn must read as behind, never as caught-up.
 func TestCaughtUpRequiresEveryForwardSlot(t *testing.T) {
+	parallelPG(t)
 	ctx := context.Background()
 	positions := map[string]int64{"0": 100, "1": 100}
 	full := func() map[string]map[string]int64 {
@@ -123,6 +124,7 @@ func TestCaughtUpRequiresEveryForwardSlot(t *testing.T) {
 // exact expected reverse slot of every (source, target) pair; a vanished
 // reverse slot or an empty listing must keep serving away from the sources.
 func TestReverseBehindRequiresEveryReverseSlot(t *testing.T) {
+	parallelPG(t)
 	ctx := context.Background()
 	positions := map[int32]int64{0: 100, 1: 100}
 	full := func() map[string]map[string]int64 {

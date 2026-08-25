@@ -145,6 +145,7 @@ func (f *resolverFixture) decisions() []string {
 }
 
 func TestResolver(t *testing.T) {
+	parallelPG(t)
 	f := newResolverFixture(t)
 	ctx := context.Background()
 	f.prepare(0, "pgshard-r-1-1", "committed")
@@ -226,6 +227,7 @@ func TestResolver(t *testing.T) {
 }
 
 func TestResolverCommitsMovedParticipant(t *testing.T) {
+	parallelPG(t)
 	f := newResolverFixture(t)
 	ctx := context.Background()
 	// After a reshard the decision's participant id maps to a group that no
@@ -297,6 +299,7 @@ func (f *resolverFixture) prepareIn(id int, db, gid, v string) {
 }
 
 func TestResolverFinishesOtherDatabase(t *testing.T) {
+	parallelPG(t)
 	f := newResolverFixture(t)
 	ctx := context.Background()
 	mustExec(t, connect(t, f.shardDSN(0)), "CREATE DATABASE appdb")
@@ -335,6 +338,7 @@ func TestResolverFinishesOtherDatabase(t *testing.T) {
 }
 
 func TestResolverSparesPreparingRowWithLiveHeartbeat(t *testing.T) {
+	parallelPG(t)
 	f := newResolverFixture(t)
 	ctx := context.Background()
 	// The row is far older than the preparing timeout, but its coordinator
@@ -369,6 +373,7 @@ func TestResolverSparesPreparingRowWithLiveHeartbeat(t *testing.T) {
 }
 
 func TestResolverSparesPreparingRefreshedBetweenScanAndAbort(t *testing.T) {
+	parallelPG(t)
 	f := newResolverFixture(t)
 	ctx := context.Background()
 	f.prepare(1, "pgshard-c-1-1", "raced-live")
@@ -417,6 +422,7 @@ func TestResolverSparesPreparingRefreshedBetweenScanAndAbort(t *testing.T) {
 }
 
 func TestResolverSweepContinuesPastGonePreparedXact(t *testing.T) {
+	parallelPG(t)
 	f := newResolverFixture(t)
 	ctx := context.Background()
 	// "a" was scanned as prepared but its coordinator finished it (and

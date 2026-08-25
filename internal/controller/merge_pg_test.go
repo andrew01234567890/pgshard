@@ -20,6 +20,7 @@ import (
 // every source subscribes the single target, the write switch lands, and
 // the ledger total on the target is intact.
 func TestReshardMergeOnPostgres(t *testing.T) {
+	parallelPG(t)
 	f := newCopyFixtureN(t, 1)
 	ctx := context.Background()
 	const accounts, opening = 200, int64(1000)

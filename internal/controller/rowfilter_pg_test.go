@@ -20,6 +20,7 @@ var rowFilterImages = []struct{ label, name string }{
 // checks, for every target range of a 5-way split, that the publication row
 // filter selects exactly the rows placement.KeyspaceID assigns to it.
 func TestRowFilterMatchesPlacement(t *testing.T) {
+	parallelPG(t)
 	for _, img := range rowFilterImages {
 		t.Run(img.label, func(t *testing.T) {
 			conn := connect(t, startPostgresImage(t, img.name, nil))
