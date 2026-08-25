@@ -48,6 +48,11 @@ type MigrationStore interface {
 	// LockedDatabases lists the databases a workflow currently holds the
 	// DDL lock on.
 	LockedDatabases(ctx context.Context) (map[string]string, error)
+	// ServingShardSet names the shard set currently serving. It is read
+	// per pass rather than fixed at start-up: a reshard or major upgrade
+	// retires one set and promotes another, and work aimed at the retired
+	// one reaches shards nobody is reading from.
+	ServingShardSet(ctx context.Context) (string, error)
 }
 
 // PGMigrationStore is the MigrationStore over the catalog pool.
@@ -103,6 +108,11 @@ func (s *PGMigrationStore) LockedDatabases(ctx context.Context) (map[string]stri
 	return held, rows.Err()
 }
 
+// ServingShardSet implements MigrationStore.
+func (s *PGMigrationStore) ServingShardSet(ctx context.Context) (string, error) {
+	return catalog.ServingShardSet(ctx, s.Pool)
+}
+
 // SaveMeta implements MigrationStore.
 func (s *PGMigrationStore) SaveMeta(ctx context.Context, id string, meta catalog.MigrationMeta) error {
 	return catalog.SaveMigrationMeta(ctx, s.Pool, id, meta)
@@ -150,7 +160,8 @@ type Applier struct {
 	// defaults to DefaultDDLRole; the applier creates it on every shard and
 	// sets a fresh password per process before first use.
 	DDLRole string
-	// ShardSet defaults to "default".
+	// ShardSet pins the shard set to apply to; empty means whichever set
+	// is serving at the time of each pass.
 	ShardSet string
 	// LockTimeout defaults to DefaultLockTimeout.
 	LockTimeout time.Duration
@@ -186,11 +197,13 @@ func (a *Applier) logger() *slog.Logger {
 	return a.Logger
 }
 
-func (a *Applier) shardSet() string {
-	if a.ShardSet == "" {
-		return decisionShardSet
+// shardSet is the set to apply to: the configured override when there is
+// one, otherwise whichever set is serving now.
+func (a *Applier) shardSet(ctx context.Context) (string, error) {
+	if a.ShardSet != "" {
+		return a.ShardSet, nil
 	}
-	return a.ShardSet
+	return a.Store.ServingShardSet(ctx)
 }
 
 func (a *Applier) backoff() Backoff {
@@ -420,7 +433,11 @@ func (a *Applier) targets(ctx context.Context, m catalog.DDLMigration) ([]int32,
 	if m.Scope == "home" {
 		return []int32{m.HomeShard}, nil
 	}
-	ids, err := a.Store.Shards(ctx, a.shardSet())
+	set, err := a.shardSet(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("applier: serving shard set: %w", err)
+	}
+	ids, err := a.Store.Shards(ctx, set)
 	if err != nil {
 		return nil, fmt.Errorf("applier: shards: %w", err)
 	}
@@ -529,7 +546,11 @@ func (a *Applier) prepare(ctx context.Context, m *catalog.DDLMigration, key stri
 		if err != nil {
 			return nil, err
 		}
-		conn, err = a.Shards.DialDatabaseAs(ctx, a.shardSet(), id, db, a.ddlRole(), password)
+		set, serr := a.shardSet(ctx)
+		if serr != nil {
+			return nil, serr
+		}
+		conn, err = a.Shards.DialDatabaseAs(ctx, set, id, db, a.ddlRole(), password)
 		if err != nil {
 			return nil, &dialError{err}
 		}
@@ -636,7 +657,11 @@ func (a *Applier) provisionDDLRole(ctx context.Context, id int32, runAs string) 
 	if a.ddlReady[id] && runAs == "" {
 		return a.ddlPassword, nil
 	}
-	conn, err := a.Shards.DialDatabase(ctx, a.shardSet(), id, "")
+	set, serr := a.shardSet(ctx)
+	if serr != nil {
+		return "", serr
+	}
+	conn, err := a.Shards.DialDatabase(ctx, set, id, "")
 	if err != nil {
 		return "", &dialError{err}
 	}
@@ -693,7 +718,12 @@ func (a *Applier) releaseDDLRole(ctx context.Context, id int32, runAs string) {
 		return
 	}
 	ctx = context.WithoutCancel(ctx)
-	conn, err := a.Shards.DialDatabase(ctx, a.shardSet(), id, "")
+	set, serr := a.shardSet(ctx)
+	if serr != nil {
+		a.logger().Warn("revoking DDL role membership: serving shard set", "shard", id, "role", runAs, "err", serr)
+		return
+	}
+	conn, err := a.Shards.DialDatabase(ctx, set, id, "")
 	if err != nil {
 		a.logger().Warn("revoking DDL role membership: connect failed", "shard", id, "role", runAs, "err", err)
 		return
