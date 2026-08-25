@@ -475,11 +475,21 @@ func (h *pgHarness) testDrain(t *testing.T) {
 	if err := h.admin.QueryRow(context.Background(), "select name from items where id = 99").Scan(&name); err != nil || name != "drain" {
 		t.Fatalf("committed row missing: %v %q", err, name)
 	}
-	var n int
-	if err := h.admin.QueryRow(context.Background(), "select count(*) from pg_stat_activity where usename = 'appuser'").Scan(&n); err != nil {
-		t.Fatal(err)
-	}
-	if n != 0 {
-		t.Fatalf("%d appuser backends still connected after drain", n)
+	// Drain returning means the pooler let go of its backends, not that
+	// PostgreSQL has finished reaping them: the backend leaves
+	// pg_stat_activity when its process exits, a moment later.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var n int
+		if err := h.admin.QueryRow(context.Background(), "select count(*) from pg_stat_activity where usename = 'appuser'").Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d appuser backends still connected after drain", n)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
