@@ -3,7 +3,6 @@ package router
 import (
 	"context"
 	"errors"
-	"sort"
 	"sync"
 	"time"
 
@@ -86,40 +85,27 @@ func (c *RoleCache) ConnectionLimit(user string) (int32, bool) {
 	return cred.ConnectionLimit, true
 }
 
-// Refresh reloads the roles and reports those that may no longer log in:
-// dropped, set NOLOGIN, or expired since the last look. Authentication only
-// gates new connections, so a caller uses this to end the sessions a
-// revoked role still holds.
-func (c *RoleCache) Refresh(ctx context.Context) ([]string, error) {
+// Refresh reloads the roles from the catalog.
+func (c *RoleCache) Refresh(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	before := c.roles
-	if err := c.reload(ctx); err != nil {
-		return nil, err
+	return c.reload(ctx)
+}
+
+// MayLogIn reports whether user may open a session right now. It answers
+// from the cache as it stands rather than from what changed since the last
+// look: Lookup reloads the cache on its own TTL and on every miss, so a
+// caller watching for the moment a role flips would simply miss the ones
+// an authentication attempt noticed first.
+func (c *RoleCache) MayLogIn(user string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cred, ok := c.roles.Cred(user)
+	if !ok {
+		return false
 	}
-	if before == nil {
-		return nil, nil
-	}
-	var revoked []string
-	for _, name := range before.Names() {
-		cred, ok := before.Cred(name)
-		if !ok {
-			continue
-		}
-		if _, err := c.admit(name, cred); err != nil {
-			continue // already refused before this reload
-		}
-		now, ok := c.roles.Cred(name)
-		if !ok {
-			revoked = append(revoked, name)
-			continue
-		}
-		if _, err := c.admit(name, now); err != nil {
-			revoked = append(revoked, name)
-		}
-	}
-	sort.Strings(revoked)
-	return revoked, nil
+	_, err := c.admit(user, cred)
+	return err == nil
 }
 
 func (c *RoleCache) reload(ctx context.Context) error {

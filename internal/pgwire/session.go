@@ -83,6 +83,13 @@ func (s *session) close() {
 	}
 }
 
+// user reports the authenticated role, empty until startup has finished.
+func (s *session) user() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.info.User
+}
+
 func (s *session) forceClose() {
 	s.mu.Lock()
 	if s.queryCancel != nil {
@@ -90,6 +97,29 @@ func (s *session) forceClose() {
 	}
 	s.mu.Unlock()
 	_ = s.conn.Close()
+}
+
+// revoke ends the session because its role may no longer log in. Unlike a
+// drain it does not wait for an open transaction: a client that keeps one
+// open would otherwise go on issuing statements after its access was taken
+// away, which is the first thing anyone losing access would try.
+func (s *session) revoke() {
+	s.mu.Lock()
+	s.draining = true
+	if s.queryCancel != nil {
+		s.queryCancel()
+	}
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return
+	}
+	er := toErrorResponse(Errorf(CodeAdminShutdown, "terminating connection because the role may no longer log in"))
+	er.Severity, er.SeverityUnlocalized = "FATAL", "FATAL"
+	if buf, err := er.Encode(nil); err == nil {
+		_, _ = s.conn.Write(buf)
+	}
+	s.close()
 }
 
 // drain asks the session to end: idle sessions are terminated immediately,
@@ -347,11 +377,16 @@ func (s *session) startup(ctx context.Context) error {
 		s.terminate(err)
 		return err
 	}
-	s.info = SessionInfo{
+	info := SessionInfo{
 		ID: s.id, User: user, Database: db, Params: pkt.params,
 		ProtocolVersion: s.protocolVersion, Auth: result, RemoteAddr: s.conn.RemoteAddr().String(),
 	}
-	exec, err := s.server.cfg.NewExecutor(s.info)
+	// The session is already registered on the server, so anything scanning
+	// sessions by role can read this concurrently.
+	s.mu.Lock()
+	s.info = info
+	s.mu.Unlock()
+	exec, err := s.server.cfg.NewExecutor(info)
 	if err != nil {
 		s.terminate(err)
 		return err

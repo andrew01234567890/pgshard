@@ -320,15 +320,15 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 				return
 			case <-t.C:
 			}
-			revoked, err := roles.Refresh(ctx)
+			rctx, cancel := context.WithTimeout(ctx, *rolesTTL)
+			err := roles.Refresh(rctx)
+			cancel()
 			if err != nil {
 				logger.Warn("role refresh", "error", err)
 				continue
 			}
-			for _, user := range revoked {
-				if n := srv.TerminateUser(user); n > 0 {
-					logger.Info("terminating sessions of a role that may no longer log in", "role", user, "sessions", n)
-				}
+			if n := srv.TerminateWhere(func(user string) bool { return !roles.MayLogIn(user) }); n > 0 {
+				logger.Info("terminated sessions of roles that may no longer log in", "sessions", n)
 			}
 		}
 	}()

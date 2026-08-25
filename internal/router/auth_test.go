@@ -3,7 +3,6 @@ package router
 import (
 	"context"
 	"errors"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -183,36 +182,50 @@ type limiter func(string) (int32, bool)
 
 func (f limiter) ConnectionLimit(user string) (int32, bool) { return f(user) }
 
-// TestRefreshReportsRolesThatMayNoLongerLogIn: authentication only gates
-// new connections, so a role that is dropped, set NOLOGIN or expired keeps
-// whatever sessions it already holds until something ends them.
-func TestRefreshReportsRolesThatMayNoLongerLogIn(t *testing.T) {
+// TestMayLogInAnswersFromCurrentState: Lookup reloads the cache on its own
+// TTL and on every miss, so a check that watched for the moment a role
+// flipped would miss every revocation an authentication attempt noticed
+// first. The answer has to come from the roles as they stand.
+func TestMayLogInAnswersFromCurrentState(t *testing.T) {
 	past := time.Now().Add(-time.Hour)
 	rows := map[string]snapshot.RoleCred{
 		"stays":   {Verifier: "v", CanLogin: true},
 		"nologin": {Verifier: "v", CanLogin: true},
 		"expires": {Verifier: "v", CanLogin: true},
 		"dropped": {Verifier: "v", CanLogin: true},
-		"already": {Verifier: "v", CanLogin: false},
 	}
-	c := &RoleCache{ttl: time.Hour, now: time.Now, load: func(context.Context) (*snapshot.Roles, error) {
-		return snapshot.NewRoles(rows), nil
-	}}
-	if _, err := c.Refresh(context.Background()); err != nil {
+	c := &RoleCache{ttl: time.Hour, now: time.Now}
+	c.load = func(context.Context) (*snapshot.Roles, error) { return snapshot.NewRoles(rows), nil }
+	if err := c.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+	for _, user := range []string{"stays", "nologin", "expires", "dropped"} {
+		if !c.MayLogIn(user) {
+			t.Fatalf("%s must be admitted before the change", user)
+		}
 	}
 	rows = map[string]snapshot.RoleCred{
 		"stays":   {Verifier: "v", CanLogin: true},
 		"nologin": {Verifier: "v", CanLogin: false},
 		"expires": {Verifier: "v", CanLogin: true, ValidUntil: &past},
-		"already": {Verifier: "v", CanLogin: false},
 	}
-	revoked, err := c.Refresh(context.Background())
-	if err != nil {
+	// Something else refreshes the cache first - an authentication miss, or
+	// the TTL expiring under Lookup. The verdict must not depend on who did.
+	if err := c.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"dropped", "expires", "nologin"}
-	if !slices.Equal(revoked, want) {
-		t.Fatalf("revoked %v, want %v", revoked, want)
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, user := range []string{"nologin", "expires", "dropped"} {
+		if c.MayLogIn(user) {
+			t.Fatalf("%s may no longer log in", user)
+		}
+	}
+	if !c.MayLogIn("stays") {
+		t.Fatal("an untouched role must still be admitted")
+	}
+	if c.MayLogIn("never-existed") {
+		t.Fatal("an unknown role may not log in")
 	}
 }
