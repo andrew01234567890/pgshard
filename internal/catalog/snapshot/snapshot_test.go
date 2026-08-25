@@ -66,7 +66,7 @@ func TestCheckGeneration(t *testing.T) {
 }
 
 func TestRolesNeverPrinted(t *testing.T) {
-	r := &Roles{verifiers: map[string]string{"alice": "SCRAM-SHA-256$4096:secretsalt$stored:server"}}
+	r := &Roles{verifiers: map[string]RoleCred{"alice": {Verifier: "SCRAM-SHA-256$4096:secretsalt$stored:server", CanLogin: true}}}
 	for _, out := range []string{fmt.Sprint(r), fmt.Sprintf("%v", r), fmt.Sprintf("%+v", r), fmt.Sprintf("%#v", r), r.String()} {
 		if strings.Contains(out, "secretsalt") || strings.Contains(out, "alice") {
 			t.Fatalf("verifier leaked: %s", out)

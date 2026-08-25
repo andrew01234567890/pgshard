@@ -11,6 +11,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 
@@ -69,9 +70,19 @@ func (r Renderer) RouterDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.De
 	}
 	labels := routerLabels(c)
 	minReplicas, _ := RouterReplicas(c)
-	args := []string{"serve", fmt.Sprintf("--listen=:%d", postgresPort), fmt.Sprintf("--health-listen=:%d", routerHTTPPort), "--catalog-dsn=" + CatalogDSN(c), "--catalog-pooler=" + CatalogPoolerEndpoint(c), "--insecure-dev"}
+	args := []string{"serve", fmt.Sprintf("--listen=:%d", postgresPort), fmt.Sprintf("--health-listen=:%d", routerHTTPPort), "--catalog-dsn=" + CatalogDSN(c), "--catalog-pooler=" + CatalogPoolerEndpoint(c)}
 	var mounts []corev1.VolumeMount
 	var volumes []corev1.Volume
+	if ref := internalTLSRef(c); ref != nil {
+		args = append(args,
+			"--pooler-tls-cert="+internalTLSMountPath+"/tls.crt",
+			"--pooler-tls-key="+internalTLSMountPath+"/tls.key",
+			"--pooler-tls-ca="+internalTLSMountPath+"/ca.crt")
+		mounts = append(mounts, corev1.VolumeMount{Name: internalTLSVolume, MountPath: internalTLSMountPath, ReadOnly: true})
+		volumes = append(volumes, corev1.Volume{Name: internalTLSVolume, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: ref.Name}}})
+	} else if c.Spec.InternalTLS.Insecure {
+		args = append(args, "--insecure-dev")
+	}
 	if ref := c.Spec.Router.TLS.SecretRef; ref != nil && ref.Name != "" {
 		args = append(args, "--tls-cert="+routerTLSMountDir+"/tls.crt", "--tls-key="+routerTLSMountDir+"/tls.key")
 		mounts = append(mounts, corev1.VolumeMount{Name: "tls", MountPath: routerTLSMountDir, ReadOnly: true})
@@ -160,6 +171,24 @@ func (Renderer) RouterPDB(c *pgshardv1alpha1.PgShardCluster) *policyv1.PodDisrup
 	}
 }
 
+// AnnotationInternalTLSChecksum on the router pod template digests the
+// internal TLS Secret's content so certificate rotation rolls the routers.
+const AnnotationInternalTLSChecksum = "pgshard.io/internal-tls-checksum"
+
+// internalTLSChecksum digests the referenced internal TLS Secret; empty
+// when the cluster runs with the explicit insecure override.
+func (r *ClusterReconciler) internalTLSChecksum(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) (string, error) {
+	ref := internalTLSRef(c)
+	if ref == nil {
+		return "", nil
+	}
+	var sec corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: ref.Name}, &sec); err != nil {
+		return "", fmt.Errorf("internal TLS secret %q: %w", ref.Name, err)
+	}
+	return internalTLSDataChecksum(sec.Data), nil
+}
+
 // reconcileRouter creates or updates the router ServiceAccount, Deployment,
 // Service, PDB and HPA.
 func (r *ClusterReconciler) reconcileRouter(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) error {
@@ -168,6 +197,14 @@ func (r *ClusterReconciler) reconcileRouter(ctx context.Context, c *pgshardv1alp
 		return err
 	}
 	desiredDep := r.Renderer.RouterDeployment(c)
+	if sum, err := r.internalTLSChecksum(ctx, c); err != nil {
+		return err
+	} else if sum != "" {
+		if desiredDep.Spec.Template.Annotations == nil {
+			desiredDep.Spec.Template.Annotations = map[string]string{}
+		}
+		desiredDep.Spec.Template.Annotations[AnnotationInternalTLSChecksum] = sum
+	}
 	dep := &appsv1.Deployment{ObjectMeta: routerMeta(c)}
 	if err := r.ensureOwned(ctx, c, dep, func() error {
 		dep.Labels = desiredDep.Labels

@@ -27,6 +27,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/internal/agentauth"
 	"github.com/andrew01234567890/pgshard/internal/pgtune"
 
 	"github.com/andrew01234567890/pgshard/internal/metrics"
@@ -164,6 +165,11 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	agentToken, err := agentauth.Token(password)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("agent auth token: %w", err)
+	}
+	ctx = agentauth.WithToken(ctx, agentToken)
 	if err := r.ensureMemberRBAC(ctx, &cluster); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -406,6 +412,11 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 	obs.state = state
 	obs.tuning, obs.tuningErr = Tuning(c, g)
 	obs.template = Template(c, g, obs.tuning, pol)
+	if sum, err := r.internalTLSChecksum(ctx, c); err != nil {
+		return obs, err
+	} else if sum != "" {
+		obs.template.InternalTLS += ":" + sum
+	}
 	if err := r.ensureSettings(ctx, c, g, &obs, password); err != nil {
 		return obs, err
 	}

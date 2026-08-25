@@ -590,20 +590,20 @@ func TestCreatesPrepared(t *testing.T) {
 
 func TestAttachSessionIsAtomicWithLookup(t *testing.T) {
 	s := NewServer(Config{Logger: slog.New(slog.DiscardHandler)})
-	se, err := s.attachSession("x", "alice", "")
+	se, err := s.attachSession("x", "alice", "", sessionCred("alice", testKey(0x11), testKey(0x22)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := s.lookup("x"); got != se {
 		t.Fatal("attachSession returned a session that is not the registered one")
 	}
-	if _, err := s.attachSession("x", "alice", ""); status.Code(err) != codes.FailedPrecondition {
+	if _, err := s.attachSession("x", "alice", "", sessionCred("alice", testKey(0x11), testKey(0x22))); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("second attach = %v, want FailedPrecondition", err)
 	}
 	var se2 *session
 	var err2 error
 	s.detachUnlocked = func() {
-		se2, err2 = s.attachSession("x", "alice", "")
+		se2, err2 = s.attachSession("x", "alice", "", sessionCred("alice", testKey(0x11), testKey(0x22)))
 	}
 	s.detach(se)
 	if err2 != nil {
@@ -688,4 +688,77 @@ func TestIdleBackendIsNeverReusedAcrossDatabases(t *testing.T) {
 	if second != "db2" {
 		t.Fatalf("second dial went to %q, want db2", second)
 	}
+}
+func TestReattachRequiresMatchingCredentials(t *testing.T) {
+	h := startHarness(t, PoolConfig{})
+	ctx := context.Background()
+	if _, err := h.client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: "s", Generation: gen(7, 3)}); err != nil {
+		t.Fatal(err)
+	}
+	stream, _ := h.client.Execute(ctx)
+	roundTrip(t, stream, queryReq("s", "begin", gen(7, 3), identity("alice")))
+	_ = stream.CloseSend()
+	waitFor(t, func() bool { return !h.attached() })
+	if h.srv.held() != 1 {
+		t.Fatal("reserved backend must survive the stream")
+	}
+
+	attach := func(user *pgshardv1.UserIdentity) error {
+		s2, err := h.client.Execute(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s2.Send(queryReq("s", "select 1", gen(7, 3), user)); err != nil {
+			return err
+		}
+		_, err = s2.Recv()
+		return err
+	}
+
+	wrong := identity("alice")
+	wrong.ScramClientKey = testKey(0x99)
+	if err := attach(wrong); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("reattach with different keys: %v", err)
+	}
+	if h.srv.held() != 0 || h.srv.lookup("s") != nil {
+		t.Fatal("mismatched reattach must discard the pinned backend and forget the session")
+	}
+
+	if _, err := h.client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: "r", Generation: gen(7, 3)}); err != nil {
+		t.Fatal(err)
+	}
+	stream, _ = h.client.Execute(ctx)
+	roundTrip(t, stream, queryReq("r", "begin", gen(7, 3), identity("bob")))
+	_ = stream.CloseSend()
+	waitFor(t, func() bool {
+		h.srv.mu.Lock()
+		defer h.srv.mu.Unlock()
+		se := h.srv.sessions["r"]
+		return se != nil && !se.attached
+	})
+
+	empty := &pgshardv1.UserIdentity{Username: "bob"}
+	s3, _ := h.client.Execute(ctx)
+	if err := s3.Send(queryReq("r", "select 1", gen(7, 3), empty)); err == nil {
+		if _, err = s3.Recv(); status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("attach with empty keys: %v", err)
+		}
+	}
+	otherRole := &pgshardv1.UserIdentity{Username: "mallory", ScramClientKey: testKey(0x11), ScramServerKey: testKey(0x22)}
+	if err := attachAs(t, h, "r", otherRole); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("reattach with different role: %v", err)
+	}
+}
+
+func attachAs(t *testing.T, h *harness, session string, user *pgshardv1.UserIdentity) error {
+	t.Helper()
+	s, err := h.client.Execute(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Send(queryReq(session, "select 1", gen(7, 3), user)); err != nil {
+		return err
+	}
+	_, err = s.Recv()
+	return err
 }

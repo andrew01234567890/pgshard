@@ -151,6 +151,8 @@ metadata:
   name: %[1]s
   namespace: %[2]s
 spec:
+  internalTLS:
+    insecure: true
   postgresql:
     major: %[3]s
 %[4]s  catalog:
@@ -528,6 +530,8 @@ spec:
   clusterName: %[3]s
   newClusterName: %[1]s
   clusterSpec:
+    internalTLS:
+      insecure: true
     postgresql:
       major: %[4]s
 %[5]s    catalog:

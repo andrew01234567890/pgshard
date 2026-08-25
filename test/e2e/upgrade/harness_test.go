@@ -55,6 +55,8 @@ metadata:
   name: %[2]s
   namespace: %[1]s
 spec:
+  internalTLS:
+    insecure: true
   postgresql:
     major: %[3]d
   catalog:

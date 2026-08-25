@@ -15,6 +15,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -869,5 +870,80 @@ func TestShutdownLetsOpenTransactionFinish(t *testing.T) {
 	}
 	if err := <-shutdownDone; err != nil {
 		t.Fatalf("shutdown: %v", err)
+	}
+}
+
+func TestLookupRefusalIsRelayedAs28000(t *testing.T) {
+	auth := SCRAMAuthenticator{Lookup: func(_ context.Context, user string) (string, error) {
+		return "", Errorf(CodeInvalidAuthorization, "role %q is not permitted to log in", user)
+	}}
+	ts := startServer(t, Config{Authenticator: auth})
+	_, err := pgxConnect(t, ts.addr, "batch", "pw", "")
+	assertAuthFailure(t, err, CodeInvalidAuthorization)
+}
+
+func TestStartupConnCapRefusesPolitely(t *testing.T) {
+	ts := startServer(t, Config{MaxStartupConns: 1, StartupTimeout: time.Minute})
+	stalled, err := net.Dial("tcp", ts.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stalled.Close() }()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(ts.startupSem) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("stalled connection never claimed the startup slot")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	c := dialRaw(t, ts.addr)
+	msg, ok := c.recv().(*pgproto3.ErrorResponse)
+	if !ok || msg.Code != CodeTooManyConnections {
+		t.Fatalf("got %+v, want SQLSTATE %s", msg, CodeTooManyConnections)
+	}
+}
+
+func TestStartupTimeoutClosesHalfOpenConns(t *testing.T) {
+	ts := startServer(t, Config{StartupTimeout: 100 * time.Millisecond})
+	conn, err := net.Dial("tcp", ts.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("half-open startup was not closed by the server: %v", err)
+	}
+	waitNoSessions(t, ts.Server)
+}
+
+func TestStartupDeadlineCancelsStalledLookup(t *testing.T) {
+	lookupCancelled := make(chan error, 1)
+	auth := CleartextAuthenticator{Lookup: func(ctx context.Context, _ string) (string, error) {
+		<-ctx.Done()
+		lookupCancelled <- ctx.Err()
+		return "", ctx.Err()
+	}}
+	ts := startServer(t, Config{Authenticator: auth, StartupTimeout: 200 * time.Millisecond, MaxStartupConns: 1})
+	c := dialRaw(t, ts.addr)
+	c.send(&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: map[string]string{"user": "alice"}})
+	if _, ok := c.recv().(*pgproto3.AuthenticationCleartextPassword); !ok {
+		t.Fatal("expected cleartext password request")
+	}
+	c.send(&pgproto3.PasswordMessage{Password: "pw"})
+	select {
+	case err := <-lookupCancelled:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("lookup context ended with %v, want deadline", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stalled Lookup was never cancelled by the startup deadline")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for len(ts.startupSem) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("startup slot was never released after the stalled Lookup")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

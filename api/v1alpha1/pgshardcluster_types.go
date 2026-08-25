@@ -99,6 +99,23 @@ type TLSSpec struct {
 	SecretRef *corev1.LocalObjectReference `json:"secretRef,omitempty"`
 }
 
+// InternalTLSSpec configures router<->pooler transport security. Plaintext
+// is never the default: it must be requested with insecure, which is
+// unsupported outside development environments.
+// +kubebuilder:validation:XValidation:rule="(has(self.secretRef) && self.secretRef.name != \"\") || (has(self.insecure) && self.insecure)",message="internalTLS requires secretRef, or insecure: true to explicitly opt into plaintext (unsupported outside development)"
+// +kubebuilder:validation:XValidation:rule="!((has(self.secretRef) && self.secretRef.name != \"\") && has(self.insecure) && self.insecure)",message="internalTLS.secretRef and internalTLS.insecure are mutually exclusive"
+type InternalTLSSpec struct {
+	// SecretRef names a Secret with tls.crt, tls.key and ca.crt; the
+	// poolers refuse clients whose certificate does not chain to ca.crt
+	// and the routers dial with the certificate.
+	// +optional
+	SecretRef *corev1.LocalObjectReference `json:"secretRef,omitempty"`
+	// Insecure runs the pooler port as plaintext gRPC. Unsupported outside
+	// development; the network must be protected by other means.
+	// +optional
+	Insecure bool `json:"insecure,omitempty"`
+}
+
 // RouterSpec configures the stateless router deployment.
 // +kubebuilder:validation:XValidation:rule="self.maxReplicas >= self.minReplicas",message="router.maxReplicas must be >= router.minReplicas"
 type RouterSpec struct {
@@ -192,6 +209,11 @@ type PgShardClusterSpec struct {
 	// +kubebuilder:default={}
 	// +optional
 	Upgrade UpgradeSpec `json:"upgrade,omitempty"`
+	// InternalTLS configures mutual TLS between routers and the pooler
+	// sidecars. Either secretRef (a Secret with tls.crt, tls.key and
+	// ca.crt) or the explicit insecure override must be set; there is no
+	// implicit plaintext fallback.
+	InternalTLS InternalTLSSpec `json:"internalTLS"`
 }
 
 // MemberStatus reports one PostgreSQL instance in a group.

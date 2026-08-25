@@ -128,6 +128,45 @@ spec:
                         - remote_apply
                         type: string
                     type: object
+                  internalTLS:
+                    description: |-
+                      InternalTLS configures mutual TLS between routers and the pooler
+                      sidecars. Either secretRef (a Secret with tls.crt, tls.key and
+                      ca.crt) or the explicit insecure override must be set; there is no
+                      implicit plaintext fallback.
+                    properties:
+                      insecure:
+                        description: |-
+                          Insecure runs the pooler port as plaintext gRPC. Unsupported outside
+                          development; the network must be protected by other means.
+                        type: boolean
+                      secretRef:
+                        description: |-
+                          SecretRef names a Secret with tls.crt, tls.key and ca.crt; the
+                          poolers refuse clients whose certificate does not chain to ca.crt
+                          and the routers dial with the certificate.
+                        properties:
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
+                    type: object
+                    x-kubernetes-validations:
+                    - message: 'internalTLS requires secretRef, or insecure: true
+                        to explicitly opt into plaintext (unsupported outside development)'
+                      rule: (has(self.secretRef) && self.secretRef.name != "") ||
+                        (has(self.insecure) && self.insecure)
+                    - message: internalTLS.secretRef and internalTLS.insecure are
+                        mutually exclusive
+                      rule: '!((has(self.secretRef) && self.secretRef.name != "")
+                        && has(self.insecure) && self.insecure)'
                   postgresql:
                     description: PostgreSQLSpec selects the PostgreSQL build and its
                       base configuration.
@@ -338,6 +377,7 @@ spec:
                     type: object
                 required:
                 - catalog
+                - internalTLS
                 - postgresql
                 - storage
                 type: object

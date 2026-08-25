@@ -3,15 +3,24 @@ package router
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/andrew01234567890/pgshard/internal/pgwire"
 )
 
+type fakeRole struct {
+	name, verifier string
+	nologin        bool
+	validUntil     *time.Time
+}
+
 type fakeRows struct {
-	rows [][2]string
+	rows []fakeRole
 	i    int
 }
 
@@ -24,13 +33,17 @@ func (r *fakeRows) Values() ([]any, error)                       { return nil, n
 func (r *fakeRows) RawValues() [][]byte                          { return nil }
 func (r *fakeRows) Conn() *pgx.Conn                              { return nil }
 func (r *fakeRows) Scan(dest ...any) error {
-	*dest[0].(*string) = r.rows[r.i-1][0]
-	*dest[1].(*string) = r.rows[r.i-1][1]
+	row := r.rows[r.i-1]
+	*dest[0].(*string) = row.name
+	*dest[1].(*string) = row.verifier
+	*dest[2].(*bool) = !row.nologin
+	*dest[3].(**time.Time) = row.validUntil
 	return nil
 }
 
 type fakeQuerier struct {
 	roles map[string]string
+	attrs map[string]fakeRole
 	calls int
 	err   error
 }
@@ -40,9 +53,11 @@ func (q *fakeQuerier) Query(context.Context, string, ...any) (pgx.Rows, error) {
 	if q.err != nil {
 		return nil, q.err
 	}
-	var rows [][2]string
+	var rows []fakeRole
 	for k, v := range q.roles {
-		rows = append(rows, [2]string{k, v})
+		row := q.attrs[k]
+		row.name, row.verifier = k, v
+		rows = append(rows, row)
 	}
 	return &fakeRows{rows: rows}, nil
 }
@@ -79,4 +94,41 @@ func TestRoleCacheReloadsOnMissAndTTL(t *testing.T) {
 	if _, err := c.Lookup(ctx, "alice"); err == nil || errors.Is(err, ErrUnknownRole) {
 		t.Fatalf("catalog failure must surface, got %v", err)
 	}
+}
+
+func TestRoleCacheRefusesNologinAndExpired(t *testing.T) {
+	now := time.Unix(1000, 0)
+	past, future := now.Add(-time.Hour), now.Add(time.Hour)
+	q := &fakeQuerier{
+		roles: map[string]string{"batch": "v1", "expired": "v2", "current": "v3", "eternal": "v4"},
+		attrs: map[string]fakeRole{
+			"batch":   {nologin: true},
+			"expired": {validUntil: &past},
+			"current": {validUntil: &future},
+		},
+	}
+	c := NewRoleCache(q, time.Minute)
+	c.now = func() time.Time { return now }
+	ctx := context.Background()
+	assert28000 := func(user, want string) {
+		t.Helper()
+		_, err := c.Lookup(ctx, user)
+		var pe *pgwire.Error
+		if !errors.As(err, &pe) || pe.Code != pgwire.CodeInvalidAuthorization {
+			t.Fatalf("%s: want 28000 refusal, got %v", user, err)
+		}
+		if !strings.Contains(pe.Message, want) {
+			t.Fatalf("%s: message %q lacks %q", user, pe.Message, want)
+		}
+	}
+	assert28000("batch", "not permitted to log in")
+	assert28000("expired", "expired")
+	if v, err := c.Lookup(ctx, "current"); err != nil || v != "v3" {
+		t.Fatalf("valid_until in the future must pass: %q %v", v, err)
+	}
+	if v, err := c.Lookup(ctx, "eternal"); err != nil || v != "v4" {
+		t.Fatalf("no valid_until must pass: %q %v", v, err)
+	}
+	now = future
+	assert28000("current", "expired")
 }

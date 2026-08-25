@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"time"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 )
@@ -124,19 +125,35 @@ func (s *Snapshot) TableMigrating(keys []TableKey) bool {
 	return false
 }
 
+// RoleCred is one role's credential and login gates.
+type RoleCred struct {
+	Verifier   string
+	CanLogin   bool
+	ValidUntil *time.Time
+}
+
 // Roles holds credential verifiers keyed by role name. Its String and
 // GoString methods print only a count so a Roles can never leak into logs.
 type Roles struct {
-	verifiers map[string]string
+	verifiers map[string]RoleCred
 }
 
 // Verifier returns the SCRAM verifier of a role, if any.
 func (r *Roles) Verifier(rolname string) (string, bool) {
+	c, ok := r.Cred(rolname)
+	return c.Verifier, ok
+}
+
+// Cred returns the credential record of a role with a non-empty verifier.
+func (r *Roles) Cred(rolname string) (RoleCred, bool) {
 	if r == nil {
-		return "", false
+		return RoleCred{}, false
 	}
-	v, ok := r.verifiers[rolname]
-	return v, ok && v != ""
+	c, ok := r.verifiers[rolname]
+	if !ok || c.Verifier == "" {
+		return RoleCred{}, false
+	}
+	return c, true
 }
 
 // String prints only the number of roles.

@@ -2,6 +2,8 @@ package pooler
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"errors"
 	"sync"
 	"time"
@@ -103,9 +105,24 @@ func (p *Pool) role(database, role string) *rolePool {
 	return rp
 }
 
+// credDigest fingerprints SCRAM keys so an idle backend can be bound to the
+// exact credentials that authenticated it; only the digest is retained.
+func credDigest(clientKey, serverKey []byte) [32]byte {
+	h := sha256.New()
+	h.Write(clientKey)
+	h.Write([]byte{0})
+	h.Write(serverKey)
+	var d [32]byte
+	h.Sum(d[:0])
+	return d
+}
+
 // Acquire returns an idle backend for role or dials one within budget. The
-// caller owns it until Release. Keys are used only for a fresh dial and are
-// never retained by the pool. Budget slots count existing backends, idle or
+// caller owns it until Release; an idle backend is reused only when the
+// caller presents the same SCRAM keys that authenticated it, so a session
+// that has not proven the role's credentials cannot ride an already
+// authenticated backend. The keys themselves are never retained by the
+// pool, only their digest. Budget slots count existing backends, idle or
 // held; when the shard budget is full of idle backends of other roles one is
 // evicted so a quiet role is never starved by a hot one's idle set.
 func (p *Pool) Acquire(ctx context.Context, database, role string, clientKey, serverKey []byte) (*Backend, error) {
@@ -117,7 +134,8 @@ func (p *Pool) Acquire(ctx context.Context, database, role string, clientKey, se
 	rp := p.role(database, role)
 	p.mu.Unlock()
 
-	if b := p.popIdle(rp); b != nil {
+	digest := credDigest(clientKey, serverKey)
+	if b := p.popIdle(rp, digest); b != nil {
 		return b, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, p.cfg.AcquireTimeout)
@@ -151,6 +169,7 @@ func (p *Pool) Acquire(ctx context.Context, database, role string, clientKey, se
 		p.free(rp)
 		return nil, err
 	}
+	b.credDigest = digest
 	return b, nil
 }
 
@@ -188,8 +207,11 @@ func (p *Pool) notify() {
 	p.changed = make(chan struct{})
 }
 
-// popIdle returns a live idle backend of rp, closing expired ones on the way.
-func (p *Pool) popIdle(rp *rolePool) *Backend {
+// popIdle returns a live idle backend of rp whose credential digest matches
+// the caller's keys, closing expired or credential-stale ones on the way. A
+// digest mismatch means the role's password changed or the caller never
+// proved these credentials; either way the backend is not reusable by them.
+func (p *Pool) popIdle(rp *rolePool, digest [32]byte) *Backend {
 	for {
 		p.mu.Lock()
 		var b *Backend
@@ -201,7 +223,7 @@ func (p *Pool) popIdle(rp *rolePool) *Backend {
 		if b == nil {
 			return nil
 		}
-		if p.expired(b) {
+		if p.expired(b) || !hmac.Equal(b.credDigest[:], digest[:]) {
 			b.close()
 			p.free(rp)
 			continue

@@ -25,8 +25,19 @@ Every member pod runs two containers from the same `pgshard-postgres` image:
 The agent pins `unix_socket_directories` to `/tmp`; the two containers share
 that directory through an emptyDir so the pooler reaches PostgreSQL over the
 Unix socket. The pooler's readiness probe is a TCP check on 9091, so a pod
-is Ready only when both the agent and the pooler are. `--insecure-dev` is the
-plaintext development mode; mTLS between router and pooler is a later step.
+is Ready only when both the agent and the pooler are.
+
+Setting `spec.internalTLS.secretRef` to a Secret holding `tls.crt`,
+`tls.key` and `ca.crt` turns on mutual TLS between routers and poolers: the
+pooler serves with the certificate and refuses any client whose certificate
+does not chain to `ca.crt`, and the router dials with the same material.
+Plaintext is never a fallback: without a `secretRef` the spec must set
+`spec.internalTLS.insecure: true` (unsupported outside development, and only
+tolerable behind a NetworkPolicy restricting port 9091 to router pods) or
+the API server rejects the cluster.
+The agent's own gRPC port (9090) requires a per-cluster token derived from
+the superuser Secret on every RPC, so reaching the port is not enough to
+drive failovers.
 
 ## Shard groups and resharding
 
@@ -57,5 +68,6 @@ The router reaches the catalog pooler through `--catalog-pooler
 through `pgshard.shard_status.primary_endpoint`, which the operator publishes
 as the primary member's pooler (`<member>.<group>-peers.<namespace>.svc:9091`),
 not its PostgreSQL port. Every `-rw` Service exposes both 5432 (`postgres`)
-and 9091 (`pooler-grpc`). Router and poolers still speak plaintext
-(`--insecure-dev`); mTLS between them is a later step.
+and 9091 (`pooler-grpc`). Router and poolers speak mutual TLS when
+`spec.internalTLS.secretRef` is set; plaintext (`--insecure-dev`) is rendered
+only under the explicit `spec.internalTLS.insecure: true` opt-in.

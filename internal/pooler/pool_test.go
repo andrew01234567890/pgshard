@@ -193,3 +193,38 @@ func TestPoolHooksObserveDialsAndWaits(t *testing.T) {
 		t.Fatalf("dialErrs = %d", dialErrs)
 	}
 }
+
+func TestIdleReuseRequiresMatchingSCRAMKeys(t *testing.T) {
+	pg := newFakePG()
+	p := newPool(PoolConfig{MaxBackends: 4, AcquireTimeout: 100 * time.Millisecond}, pg.dial)
+	ctx := context.Background()
+	keysA := [][]byte{[]byte("client-key-a"), []byte("server-key-a")}
+	a, err := p.Acquire(ctx, "db", "alice", keysA[0], keysA[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Release(a)
+	stolen, err := p.Acquire(ctx, "db", "alice", []byte("client-key-b"), []byte("server-key-b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stolen == a {
+		t.Fatal("idle backend was handed to a session with different SCRAM keys")
+	}
+	if d := pg.dials.Load(); d != 2 {
+		t.Fatalf("dials = %d, want 2 (mismatched keys must dial fresh)", d)
+	}
+	p.Release(stolen)
+	b, err := p.Acquire(ctx, "db", "alice", keysA[0], keysA[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := pg.dials.Load(); d != 3 {
+		t.Fatalf("dials = %d, want 3 (backend for stale keys must not be reused)", d)
+	}
+	p.Release(b)
+	c, err := p.Acquire(ctx, "db", "alice", keysA[0], keysA[1])
+	if err != nil || c != b {
+		t.Fatalf("matching keys must reuse the idle backend: %v %v", c, err)
+	}
+}

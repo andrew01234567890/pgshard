@@ -37,6 +37,8 @@ kind: PgShardCluster
 metadata:
   name: demo
 spec:
+  internalTLS:
+    insecure: true
   postgresql:
     major: 18            # 18 or 19
     profile: oltp        # oltp | mixed | analytics (drives automatic tuning)

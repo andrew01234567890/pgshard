@@ -13,6 +13,7 @@ import (
 func routerCluster() *pgshardv1alpha1.PgShardCluster {
 	c := &pgshardv1alpha1.PgShardCluster{ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "ns1"}}
 	c.Spec.Router = pgshardv1alpha1.RouterSpec{MinReplicas: 3, MaxReplicas: 7, HPA: pgshardv1alpha1.HPASpec{CPUUtilization: 55}}
+	c.Spec.InternalTLS.Insecure = true
 	return c
 }
 
@@ -158,5 +159,114 @@ func TestPoolerSidecarInMemberPod(t *testing.T) {
 	}
 	if pod.Spec.Volumes[0].Name != "data" || pod.Spec.Volumes[0].PersistentVolumeClaim == nil {
 		t.Errorf("data volume position changed: %+v", pod.Spec.Volumes)
+	}
+}
+
+func TestInternalTLSEnablesRouterPoolerMTLS(t *testing.T) {
+	c := routerCluster()
+	c.Spec.PostgreSQL.Major = 18
+	c.Spec.InternalTLS.SecretRef = &corev1.LocalObjectReference{Name: "internal-tls"}
+
+	dep := Renderer{}.RouterDeployment(c)
+	ctr := dep.Spec.Template.Spec.Containers[0]
+	args := strings.Join(ctr.Args, " ")
+	if strings.Contains(args, "--insecure-dev") {
+		t.Errorf("router args still plaintext: %q", args)
+	}
+	for _, want := range []string{
+		"--pooler-tls-cert=/etc/pgshard-internal-tls/tls.crt",
+		"--pooler-tls-key=/etc/pgshard-internal-tls/tls.key",
+		"--pooler-tls-ca=/etc/pgshard-internal-tls/ca.crt",
+	} {
+		if !strings.Contains(args, want) {
+			t.Errorf("router args %q lack %q", args, want)
+		}
+	}
+	if v := dep.Spec.Template.Spec.Volumes; len(v) != 1 || v[0].Secret == nil || v[0].Secret.SecretName != "internal-tls" {
+		t.Errorf("router volumes %+v", v)
+	}
+
+	g := Groups(c)[0]
+	pod := Renderer{}.Pod(c, g, 0, RolePrimary, g.MemberName(0), Template(c, Group{}, nil, nil))
+	pooler := pod.Spec.Containers[1]
+	pargs := strings.Join(pooler.Args, " ")
+	if strings.Contains(pargs, "--insecure-dev") {
+		t.Errorf("pooler args still plaintext: %q", pargs)
+	}
+	for _, want := range []string{
+		"--tls-cert /etc/pgshard-internal-tls/tls.crt",
+		"--tls-key /etc/pgshard-internal-tls/tls.key",
+		"--tls-ca /etc/pgshard-internal-tls/ca.crt",
+	} {
+		if !strings.Contains(pargs, want) {
+			t.Errorf("pooler args %q lack %q", pargs, want)
+		}
+	}
+	var mounted, volumed bool
+	for _, m := range pooler.VolumeMounts {
+		if m.Name == "internal-tls" && m.MountPath == "/etc/pgshard-internal-tls" && m.ReadOnly {
+			mounted = true
+		}
+	}
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == "internal-tls" && v.Secret != nil && v.Secret.SecretName == "internal-tls" {
+			volumed = true
+		}
+	}
+	if !mounted || !volumed {
+		t.Errorf("pooler TLS not mounted (mount=%v volume=%v)", mounted, volumed)
+	}
+}
+
+func TestInternalTLSFailsClosedWithoutExplicitInsecure(t *testing.T) {
+	c := routerCluster()
+	c.Spec.InternalTLS = pgshardv1alpha1.InternalTLSSpec{}
+	dep := Renderer{}.RouterDeployment(c)
+	args := strings.Join(dep.Spec.Template.Spec.Containers[0].Args, " ")
+	if strings.Contains(args, "--insecure-dev") {
+		t.Errorf("router args must not fall back to --insecure-dev: %q", args)
+	}
+	if strings.Contains(args, "--pooler-tls-cert") {
+		t.Errorf("router args must not claim TLS material that was never referenced: %q", args)
+	}
+	c.Spec.PostgreSQL.Major = 18
+	g := Groups(c)[0]
+	pod := Renderer{}.Pod(c, g, 0, RolePrimary, g.MemberName(0), Template(c, Group{}, nil, nil))
+	got := strings.Join(pod.Spec.Containers[1].Args, " ")
+	if strings.Contains(got, "--insecure-dev") || strings.Contains(got, "--tls-cert") {
+		t.Errorf("pooler args must carry neither plaintext nor phantom TLS flags: %q", got)
+	}
+
+	c.Spec.InternalTLS = pgshardv1alpha1.InternalTLSSpec{Insecure: true}
+	args = strings.Join(Renderer{}.RouterDeployment(c).Spec.Template.Spec.Containers[0].Args, " ")
+	if !strings.Contains(args, "--insecure-dev") {
+		t.Errorf("explicit insecure opt-in must render --insecure-dev: %q", args)
+	}
+}
+
+func TestMemberTemplateHashTracksInternalTLS(t *testing.T) {
+	c := routerCluster()
+	g := Groups(c)[0]
+	insecure := Template(c, g, nil, nil).Hash()
+
+	c.Spec.InternalTLS = pgshardv1alpha1.InternalTLSSpec{SecretRef: &corev1.LocalObjectReference{Name: "internal-tls"}}
+	secure := Template(c, g, nil, nil)
+	if secure.Hash() == insecure {
+		t.Fatal("enabling internal TLS must change the member template hash")
+	}
+
+	v1, v2 := secure, secure
+	v1.InternalTLS += ":" + internalTLSDataChecksum(map[string][]byte{"tls.crt": []byte("cert-a"), "tls.key": []byte("key-a")})
+	v2.InternalTLS += ":" + internalTLSDataChecksum(map[string][]byte{"tls.crt": []byte("cert-b"), "tls.key": []byte("key-a")})
+	if v1.Hash() == secure.Hash() {
+		t.Fatal("the secret checksum must be part of the member template hash")
+	}
+	if v1.Hash() == v2.Hash() {
+		t.Fatal("rotating the secret content must change the member template hash")
+	}
+	same := secure
+	same.InternalTLS += ":" + internalTLSDataChecksum(map[string][]byte{"tls.key": []byte("key-a"), "tls.crt": []byte("cert-a")})
+	if same.Hash() != v1.Hash() {
+		t.Fatal("the checksum must not depend on map iteration order")
 	}
 }

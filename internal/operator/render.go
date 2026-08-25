@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
@@ -22,9 +23,12 @@ import (
 const (
 	configMountPath = "/etc/pgshard"
 	secretMountPath = "/etc/pgshard-secret"
-	dataMountPath   = "/var/lib/postgresql/data"
-	pgdataPath      = dataMountPath + "/pgdata"
-	postgresUID     = int64(999)
+	// internalTLSMountPath holds the router<->pooler mTLS material.
+	internalTLSMountPath = "/etc/pgshard-internal-tls"
+	internalTLSVolume    = "internal-tls"
+	dataMountPath        = "/var/lib/postgresql/data"
+	pgdataPath           = dataMountPath + "/pgdata"
+	postgresUID          = int64(999)
 	// pgSocketDir is the agent's fixed unix_socket_directories; the pooler
 	// sidecar reaches the local server through it over a shared emptyDir.
 	pgSocketDir    = "/tmp"
@@ -78,6 +82,10 @@ type MemberTemplate struct {
 	// Backup is the policy the members archive to; it changes the pod
 	// (mounted Secrets) and archive_mode, so it is part of the pod hash.
 	Backup *pgshardv1alpha1.PgShardBackupPolicySpec `json:"backup,omitempty"`
+	// InternalTLS is the router<->pooler transport mode plus, when TLS is
+	// on, a checksum of the referenced Secret's content; enabling TLS or
+	// rotating the certificate must roll the immutable member pods.
+	InternalTLS string `json:"internalTLS,omitempty"`
 }
 
 // Template computes the desired member template of a group. tuning is the
@@ -89,6 +97,7 @@ func Template(c *pgshardv1alpha1.PgShardCluster, g Group, tuning pgtune.Settings
 		Resources:    c.Spec.Resources,
 		Settings:     effectiveSettings(c.Spec.PostgreSQL.Parameters, tuning),
 		RestartToken: c.Annotations[AnnotationRestart],
+		InternalTLS:  internalTLSMode(c),
 	}
 	if pol != nil {
 		spec := pol.Spec.DeepCopy()
@@ -389,6 +398,10 @@ func (Renderer) Pod(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, rol
 			},
 		},
 	}
+	if ref := internalTLSRef(c); ref != nil {
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{Name: internalTLSVolume,
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: ref.Name}}})
+	}
 	if tpl.Backup != nil {
 		mountBackupSecrets(pod, tpl.Backup)
 	}
@@ -403,19 +416,32 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 	if g.Kind == "catalog" {
 		shardSet = "catalog"
 	}
+	args := []string{"run",
+		"--listen", fmt.Sprintf(":%d", poolerGRPCPort),
+		"--metrics-listen", fmt.Sprintf(":%d", poolerMetricsPort),
+		"--pg-socket-dir", pgSocketDir,
+		"--catalog-dsn", CatalogDSN(c),
+		"--shard-set", shardSet,
+		"--shard-id", fmt.Sprint(g.ShardID),
+	}
+	mounts := []corev1.VolumeMount{
+		{Name: "pg-socket", MountPath: pgSocketDir},
+		{Name: "secret", MountPath: secretMountPath, ReadOnly: true},
+	}
+	if internalTLSRef(c) != nil {
+		args = append(args,
+			"--tls-cert", internalTLSMountPath+"/tls.crt",
+			"--tls-key", internalTLSMountPath+"/tls.key",
+			"--tls-ca", internalTLSMountPath+"/ca.crt")
+		mounts = append(mounts, corev1.VolumeMount{Name: internalTLSVolume, MountPath: internalTLSMountPath, ReadOnly: true})
+	} else if c.Spec.InternalTLS.Insecure {
+		args = append(args, "--insecure-dev")
+	}
 	return corev1.Container{
 		Name:    poolerContainer,
 		Image:   Image(c),
 		Command: []string{"pgshard-pooler"},
-		Args: []string{"run",
-			"--listen", fmt.Sprintf(":%d", poolerGRPCPort),
-			"--metrics-listen", fmt.Sprintf(":%d", poolerMetricsPort),
-			"--pg-socket-dir", pgSocketDir,
-			"--catalog-dsn", CatalogDSN(c),
-			"--shard-set", shardSet,
-			"--shard-id", fmt.Sprint(g.ShardID),
-			"--insecure-dev",
-		},
+		Args:    args,
 		Env: []corev1.EnvVar{{Name: "PGPASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
 			LocalObjectReference: corev1.LocalObjectReference{Name: SecretName(c.Name)}, Key: secretKey}}}},
 		Ports: []corev1.ContainerPort{
@@ -426,9 +452,43 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 			ProbeHandler:  corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt32(poolerGRPCPort)}},
 			PeriodSeconds: 5,
 		},
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: "pg-socket", MountPath: pgSocketDir},
-			{Name: "secret", MountPath: secretMountPath, ReadOnly: true},
-		},
+		VolumeMounts: mounts,
 	}
+}
+
+// internalTLSMode names the router<->pooler transport the spec asks for.
+func internalTLSMode(c *pgshardv1alpha1.PgShardCluster) string {
+	if ref := internalTLSRef(c); ref != nil {
+		return "secret:" + ref.Name
+	}
+	if c.Spec.InternalTLS.Insecure {
+		return "insecure"
+	}
+	return ""
+}
+
+// internalTLSDataChecksum digests a TLS Secret's content so certificate
+// rotation changes the member template hash.
+func internalTLSDataChecksum(data map[string][]byte) string {
+	keys := make([]string, 0, len(data))
+	for k := range data {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	h := sha256.New()
+	for _, k := range keys {
+		h.Write([]byte(k))
+		h.Write([]byte{0})
+		h.Write(data[k])
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil)[:8])
+}
+
+// internalTLSRef returns the router/pooler mTLS secret reference, if any.
+func internalTLSRef(c *pgshardv1alpha1.PgShardCluster) *corev1.LocalObjectReference {
+	if ref := c.Spec.InternalTLS.SecretRef; ref != nil && ref.Name != "" {
+		return ref
+	}
+	return nil
 }

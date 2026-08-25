@@ -424,6 +424,7 @@ func newCluster(name string) *pgshardv1alpha1.PgShardCluster {
 			ReplicasPerShard: 3,
 			Storage:          pgshardv1alpha1.StorageSpec{Size: resource.MustParse("2Gi")},
 			Router:           pgshardv1alpha1.RouterSpec{MinReplicas: 2, MaxReplicas: 5},
+			InternalTLS:      pgshardv1alpha1.InternalTLSSpec{Insecure: true},
 		},
 	}
 }
@@ -835,4 +836,81 @@ func ownLeases(c *pgshardv1alpha1.PgShardCluster) []string {
 		out = append(out, g.LeaseName())
 	}
 	return out
+}
+
+func TestInternalTLSValidationFailsClosed(t *testing.T) {
+	requireEnvtest(t)
+	ctx := context.Background()
+
+	missing := newCluster("tls-missing")
+	missing.Spec.InternalTLS = pgshardv1alpha1.InternalTLSSpec{}
+	if err := k8sClient.Create(ctx, missing); err == nil {
+		t.Fatal("cluster with neither secretRef nor insecure must be rejected")
+	} else if !strings.Contains(err.Error(), "internalTLS requires secretRef") {
+		t.Fatalf("unexpected rejection: %v", err)
+	}
+
+	both := newCluster("tls-both")
+	both.Spec.InternalTLS = pgshardv1alpha1.InternalTLSSpec{
+		SecretRef: &corev1.LocalObjectReference{Name: "internal-tls"}, Insecure: true}
+	if err := k8sClient.Create(ctx, both); err == nil {
+		t.Fatal("secretRef combined with insecure must be rejected")
+	} else if !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("unexpected rejection: %v", err)
+	}
+
+	secure := newCluster("tls-secure")
+	secure.Spec.InternalTLS = pgshardv1alpha1.InternalTLSSpec{SecretRef: &corev1.LocalObjectReference{Name: "internal-tls"}}
+	if err := k8sClient.Create(ctx, secure); err != nil {
+		t.Fatalf("secretRef alone must be accepted: %v", err)
+	}
+	t.Cleanup(func() { _ = k8sClient.Delete(context.Background(), secure) })
+
+	insecure := newCluster("tls-insecure")
+	if err := k8sClient.Create(ctx, insecure); err != nil {
+		t.Fatalf("explicit insecure opt-in must be accepted: %v", err)
+	}
+	t.Cleanup(func() { _ = k8sClient.Delete(context.Background(), insecure) })
+}
+
+func TestRouterRollsOnInternalTLSSecretRotation(t *testing.T) {
+	requireEnvtest(t)
+	ctx := context.Background()
+	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "rotate-tls", Namespace: "default"},
+		Data: map[string][]byte{"tls.crt": []byte("cert-a"), "tls.key": []byte("key-a"), "ca.crt": []byte("ca-a")}}
+	if err := k8sClient.Create(ctx, sec); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = k8sClient.Delete(context.Background(), sec) })
+	c := newCluster("tls-rotate")
+	c.Spec.InternalTLS = pgshardv1alpha1.InternalTLSSpec{SecretRef: &corev1.LocalObjectReference{Name: "rotate-tls"}}
+	if err := k8sClient.Create(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = k8sClient.Delete(context.Background(), c) })
+	r := &ClusterReconciler{Client: k8sClient, Renderer: Renderer{RouterImage: "router:test"}}
+	if err := r.reconcileRouter(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	var dep appsv1.Deployment
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: c.Name + "-router"}, &dep); err != nil {
+		t.Fatal(err)
+	}
+	first := dep.Spec.Template.Annotations[AnnotationInternalTLSChecksum]
+	if first == "" {
+		t.Fatal("router pod template must carry the internal TLS secret checksum")
+	}
+	sec.Data["tls.crt"] = []byte("cert-b")
+	if err := k8sClient.Update(ctx, sec); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.reconcileRouter(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: c.Name + "-router"}, &dep); err != nil {
+		t.Fatal(err)
+	}
+	if got := dep.Spec.Template.Annotations[AnnotationInternalTLSChecksum]; got == first {
+		t.Fatal("rotating the internal TLS secret must change the router pod template")
+	}
 }

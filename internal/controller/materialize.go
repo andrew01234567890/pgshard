@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/andrew01234567890/pgshard/internal/agentauth"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/schemacopy"
 )
@@ -62,6 +63,13 @@ func (m *AgentMaterializer) MaterializeSchema(ctx context.Context, target ShardR
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	// The catalog pool authenticates with the superuser password the agents
+	// derive their auth token from.
+	token, err := agentauth.Token(m.Pool.Config().ConnConfig.Password)
+	if err != nil {
+		return fmt.Errorf("agent auth token: %w", err)
+	}
+	ctx = agentauth.WithToken(ctx, token)
 	resp, err := pgshardv1.NewAgentClient(conn).MaterializeSchema(ctx, &pgshardv1.MaterializeSchemaRequest{SourceConninfo: sourceConnInfo, Database: database})
 	if err != nil {
 		return fmt.Errorf("agent %s: %w", addr, err)

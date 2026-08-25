@@ -3,6 +3,9 @@ kind: PgShardCluster
 metadata:
   name: demo
 spec:
+  internalTLS:
+    # Unsupported outside development; use secretRef with real TLS material.
+    insecure: true
   postgresql:
     major: 18
   catalog:

@@ -10,6 +10,7 @@ import (
 	"net"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -163,7 +164,37 @@ func (s *session) run() {
 	if !s.beginMessage() {
 		return
 	}
-	err := s.startup(ctx)
+	if !s.server.acquireStartup() {
+		s.endMessage()
+		s.terminate(Errorf(CodeTooManyConnections, "sorry, too many clients already (startup)"))
+		return
+	}
+	err := func() error {
+		defer s.server.releaseStartup()
+		sctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		if d := s.server.cfg.StartupTimeout; d > 0 {
+			var tcancel context.CancelFunc
+			sctx, tcancel = context.WithTimeout(sctx, d)
+			defer tcancel()
+			_ = s.conn.SetDeadline(time.Now().Add(d))
+		}
+		// Shutdown must cancel blocking pre-auth work (catalog lookups),
+		// not just idle sockets.
+		go func() {
+			select {
+			case <-s.server.shutdownCh:
+				cancel()
+			case <-sctx.Done():
+			}
+		}()
+		return s.startup(sctx)
+	}()
+	if err == nil {
+		// s.conn may have been replaced by the TLS upgrade; clearing the
+		// deadline through it reaches the underlying connection.
+		_ = s.conn.SetDeadline(time.Time{})
+	}
 	s.endMessage()
 	if err != nil {
 		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, errCancelRequest) {
