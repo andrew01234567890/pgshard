@@ -17,6 +17,7 @@ import (
 // TestRoleVerifierWithPostgres runs the verifier against one server that is
 // both the catalog and shard 0 (the catalog group is the same server).
 func TestRoleVerifierWithPostgres(t *testing.T) {
+	parallelPG(t)
 	dsn := startPostgres(t)
 	ctx := context.Background()
 	conn := connect(t, dsn)

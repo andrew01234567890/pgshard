@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"net"
-	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -89,6 +87,7 @@ func hiddenArtifacts(t *testing.T, pool *pgxpool.Pool) []string {
 // online under concurrent reads and writes: no client error, values
 // preserved and converted, pg_class.oid unchanged, no artifacts left.
 func TestRewriteTypeChangeOnPostgres(t *testing.T) {
+	parallelPG(t)
 	pool, a, store := rewritePGFixture(t)
 	ctx := context.Background()
 	oid := tableOID(t, pool)
@@ -194,6 +193,7 @@ func TestRewriteTypeChangeOnPostgres(t *testing.T) {
 // TestRewriteAddVolatileDefaultOnPostgres adds a uuid column with a
 // volatile default online.
 func TestRewriteAddVolatileDefaultOnPostgres(t *testing.T) {
+	parallelPG(t)
 	pool, a, store := rewritePGFixture(t)
 	ctx := context.Background()
 	m := catalog.DDLMigration{ID: "10000000-0000-0000-0000-0000000000a2", Database: "postgres",
@@ -244,6 +244,7 @@ func TestRewriteAddVolatileDefaultOnPostgres(t *testing.T) {
 // non-convertible value: the migration fails, the table keeps its old
 // column and stays fully usable, and no artifacts remain.
 func TestRewriteFailureRevertsOnPostgres(t *testing.T) {
+	parallelPG(t)
 	pool, a, store := rewritePGFixture(t)
 	ctx := context.Background()
 	mustExecSQL(t, pool, `UPDATE accounts SET amount = 'not a number' WHERE id = 4321`)
@@ -278,6 +279,7 @@ func TestRewriteFailureRevertsOnPostgres(t *testing.T) {
 // TestRepackOnPostgres19 runs the repack step against a PostgreSQL 19
 // server when its image is available.
 func TestRepackOnPostgres19(t *testing.T) {
+	parallelPG(t)
 	dsn := startPostgres19(t)
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, dsn)
@@ -314,50 +316,14 @@ const pg19Image = "ghcr.io/andrew01234567890/pgshard-postgres:19"
 
 func startPostgres19(t *testing.T) string {
 	t.Helper()
-	if err := exec.Command("docker", "info").Run(); err != nil {
-		t.Skip("docker unavailable; skipping controller integration tests")
-	}
-	if exec.Command("docker", "image", "inspect", pg19Image).Run() != nil {
-		if out, err := exec.Command("docker", "pull", pg19Image).CombinedOutput(); err != nil {
-			t.Skipf("image %s unavailable: %v: %s", pg19Image, err, out)
-		}
-	}
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-	out, err := exec.Command("docker", "run", "-d", "--rm", "-p", fmt.Sprintf("127.0.0.1:%d:5432", port),
-		"--entrypoint", "sh", pg19Image, "-ec",
-		`initdb -D /tmp/pgdata --auth=trust -U postgres >/dev/null &&
-		 echo "host all all all trust" >> /tmp/pgdata/pg_hba.conf &&
-		 exec postgres -D /tmp/pgdata -c listen_addresses='*'`).CombinedOutput()
-	if err != nil {
-		t.Fatalf("docker run: %v: %s", err, out)
-	}
-	id := strings.TrimSpace(string(out))
-	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", id).Run() })
-	dsn := fmt.Sprintf("postgres://postgres@127.0.0.1:%d/postgres?sslmode=disable", port)
-	deadline := time.Now().Add(90 * time.Second)
-	for time.Now().Before(deadline) {
-		cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		conn, err := pgx.Connect(cctx, dsn)
-		cancel()
-		if err == nil {
-			_ = conn.Close(context.Background())
-			return dsn
-		}
-		time.Sleep(300 * time.Millisecond)
-	}
-	t.Fatal("postgres 19 did not become ready")
-	return ""
+	return startPostgresImage(t, pg19Image, nil)
 }
 
 // TestRewriteReturningStarHidesWorkingColumnOnPostgres executes the router's
 // rewritten RETURNING * against a shard that carries a rewrite working
 // column: the raw statement would leak it, the rewritten one must not.
 func TestRewriteReturningStarHidesWorkingColumnOnPostgres(t *testing.T) {
+	parallelPG(t)
 	dsn := startPostgres(t)
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, dsn)
@@ -420,6 +386,7 @@ func TestRewriteReturningStarHidesWorkingColumnOnPostgres(t *testing.T) {
 // target column carries a dependent object the cutover cannot recreate (here a
 // UNIQUE index) is refused before any schema change, leaving the table intact.
 func TestRewriteRefusesDependentColumnOnPostgres(t *testing.T) {
+	parallelPG(t)
 	pool, a, store := rewritePGFixture(t)
 	ctx := context.Background()
 	mustExecSQL(t, pool, `CREATE UNIQUE INDEX accounts_amount_key ON accounts (lower(amount))`)

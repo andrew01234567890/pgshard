@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
+	"os"
 	"os/exec"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -36,6 +38,57 @@ func startPostgresWith(t *testing.T, opts ...string) string {
 	return startPostgresImage(t, pgImage, nil, opts...)
 }
 
+// pgSlots bounds how many PostgreSQL-backed tests run at once. Admission is
+// per test, not per container: a fixture takes several containers one at a
+// time, so a per-container limit deadlocks as soon as every slot is held by a
+// test still waiting for its next container.
+var pgSlots = make(chan struct{}, pgLimit)
+
+// PGSHARD_TEST_PG_PARALLEL overrides the limit; 1 makes the suite serial
+// again on a runner that cannot afford the containers.
+var pgLimit = func() int {
+	if v, err := strconv.Atoi(os.Getenv("PGSHARD_TEST_PG_PARALLEL")); err == nil && v > 0 {
+		return v
+	}
+	n := runtime.GOMAXPROCS(0)
+	switch {
+	case n <= 2:
+		return 1
+	case n <= 4:
+		return 2
+	case n < 12:
+		return n / 2
+	default:
+		return 6
+	}
+}()
+
+// parallelPG marks a PostgreSQL-backed test parallel and holds a slot for its
+// whole lifetime. The release is registered before any container cleanup so it
+// runs last, after the containers are actually gone.
+func parallelPG(t *testing.T) {
+	t.Helper()
+	t.Parallel()
+	pgSlots <- struct{}{}
+	t.Cleanup(func() { <-pgSlots })
+}
+
+// hostPort reads back the host side of the container's published 5432.
+func hostPort(t *testing.T, id string) string {
+	t.Helper()
+	out, err := exec.Command("docker", "port", id, "5432").Output()
+	if err != nil {
+		t.Fatalf("docker port %s: %v", id, err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if addr := strings.TrimSpace(line); strings.HasPrefix(addr, "127.0.0.1:") {
+			return addr
+		}
+	}
+	t.Fatalf("docker port %s: no 127.0.0.1 mapping in %q", id, out)
+	return ""
+}
+
 // startPostgresImage starts image with extra docker run arguments and
 // server options and returns the host-side DSN.
 func startPostgresImage(t *testing.T, image string, dockerArgs []string, opts ...string) string {
@@ -48,15 +101,11 @@ func startPostgresImage(t *testing.T, image string, dockerArgs []string, opts ..
 			t.Skipf("image %s unavailable: %v: %s", image, err, out)
 		}
 	}
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-	args := append([]string{"run", "-d", "--rm", "-p", fmt.Sprintf("127.0.0.1:%d:5432", port)}, dockerArgs...)
+	// Docker picks the host port: choosing one here and binding it a moment
+	// later races every other test starting a container in the same window.
+	args := append([]string{"run", "-d", "--rm", "-p", "127.0.0.1::5432"}, dockerArgs...)
 	args = append(args, "--entrypoint", "sh", image, "-ec",
-		`initdb -D /tmp/pgdata --auth=trust -U postgres >/dev/null &&
+		`initdb -D /tmp/pgdata --auth=trust -U postgres --no-sync >/dev/null &&
 		 echo "host all all all trust" >> /tmp/pgdata/pg_hba.conf &&
 		 exec postgres -D /tmp/pgdata -c listen_addresses='*' `+strings.Join(opts, " "))
 	out, err := exec.Command("docker", args...).CombinedOutput()
@@ -64,8 +113,10 @@ func startPostgresImage(t *testing.T, image string, dockerArgs []string, opts ..
 		t.Fatalf("docker run: %v: %s", err, out)
 	}
 	id := strings.TrimSpace(string(out))
-	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", id).Run() })
-	dsn := fmt.Sprintf("postgres://postgres@127.0.0.1:%d/postgres?sslmode=disable", port)
+	t.Cleanup(func() {
+		_ = exec.Command("docker", "rm", "-f", id).Run()
+	})
+	dsn := fmt.Sprintf("postgres://postgres@%s/postgres?sslmode=disable", hostPort(t, id))
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -75,7 +126,7 @@ func startPostgresImage(t *testing.T, image string, dockerArgs []string, opts ..
 			_ = conn.Close(context.Background())
 			return dsn
 		}
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("postgres did not become ready")
 	return ""
@@ -117,6 +168,7 @@ func reconcile(t *testing.T, conn *pgx.Conn) Result {
 }
 
 func TestController(t *testing.T) {
+	parallelPG(t)
 	dsn := startPostgres(t)
 	ctx := context.Background()
 	conn := connect(t, dsn)

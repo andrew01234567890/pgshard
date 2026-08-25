@@ -20,6 +20,7 @@ import (
 // every group gets the restore point, the row is certified and the fence is
 // released.
 func TestBarrierOnPostgres(t *testing.T) {
+	parallelPG(t)
 	f := newResolverFixtureWith(t, "-c archive_mode=on", "-c archive_command=/bin/true")
 	ctx := context.Background()
 	f.prepare(0, "pgshard-stale", "stale")
@@ -117,6 +118,7 @@ func TestBarrierOnPostgres(t *testing.T) {
 }
 
 func TestDecisionWatermarkSurvivesDeletedRows(t *testing.T) {
+	parallelPG(t)
 	f := newResolverFixtureWith(t)
 	ctx := context.Background()
 	store := &PGBarrierStore{Pool: f.pool}
@@ -139,6 +141,7 @@ func TestDecisionWatermarkSurvivesDeletedRows(t *testing.T) {
 // holder at a time, so two barriers can never raise and clear the shared
 // write fence concurrently.
 func TestBarrierLockSerializesOnPostgres(t *testing.T) {
+	parallelPG(t)
 	f := newResolverFixtureWith(t)
 	ctx := context.Background()
 	store := &PGBarrierStore{Pool: f.pool}
@@ -164,6 +167,7 @@ func TestBarrierLockSerializesOnPostgres(t *testing.T) {
 // a barrier that lost its lock session cannot clear a fence a later barrier
 // has raised.
 func TestWriteFenceOwnerCASOnPostgres(t *testing.T) {
+	parallelPG(t)
 	f := newResolverFixtureWith(t)
 	ctx := context.Background()
 	fenced := func() bool {
