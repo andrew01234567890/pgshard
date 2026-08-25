@@ -503,8 +503,9 @@ func (o *pgCutover) reversePublishOn(ctx context.Context, conn ShardConn, db dbP
 	}
 	want := map[string][]PublishedTable{}
 	var sharded []struct {
-		table catalog.Table
-		hash  string
+		table       catalog.Table
+		hash        string
+		partitioned bool
 	}
 	for _, tb := range db.sharded {
 		st, err := describeTable(ctx, conn, tb.SchemaName, tb.TableName, *tb.ShardKey)
@@ -519,19 +520,20 @@ func (o *pgCutover) reversePublishOn(ctx context.Context, conn ShardConn, db dbP
 			return err
 		}
 		if !st.replIdentOK {
-			if _, err := conn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s.%s REPLICA IDENTITY FULL", QuoteIdent(tb.SchemaName), QuoteIdent(tb.TableName))); err != nil {
+			if err := setReplicaIdentityFull(ctx, conn, tb.SchemaName, tb.TableName); err != nil {
 				return err
 			}
 		}
 		sharded = append(sharded, struct {
-			table catalog.Table
-			hash  string
-		}{tb, hash})
+			table       catalog.Table
+			hash        string
+			partitioned bool
+		}{tb, hash, st.partitioned})
 	}
 	for i, s := range o.srcIDs {
 		var tables []PublishedTable
 		for _, sp := range sharded {
-			tables = append(tables, PublishedTable{Schema: sp.table.SchemaName, Name: sp.table.TableName, Filter: RangeFilter(sp.hash, o.srcRanges[i])})
+			tables = append(tables, PublishedTable{Schema: sp.table.SchemaName, Name: sp.table.TableName, Filter: RangeFilter(sp.hash, o.srcRanges[i]), Partitioned: sp.partitioned})
 		}
 		want[ReversePublicationName(o.wf.gen, s)] = tables
 	}
@@ -550,11 +552,11 @@ func (o *pgCutover) reversePublishOn(ctx context.Context, conn ShardConn, db dbP
 				continue
 			}
 			if !ot.replIdentOK {
-				if _, err := conn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s.%s REPLICA IDENTITY FULL", QuoteIdent(ot.schema), QuoteIdent(ot.name))); err != nil {
+				if err := setReplicaIdentityFull(ctx, conn, ot.schema, ot.name); err != nil {
 					return err
 				}
 			}
-			tables = append(tables, PublishedTable{Schema: ot.schema, Name: ot.name})
+			tables = append(tables, PublishedTable{Schema: ot.schema, Name: ot.name, Partitioned: ot.partitioned})
 		}
 		want[ReverseHomePublicationName(o.wf.gen)] = tables
 	}

@@ -485,6 +485,7 @@ type sourceTable struct {
 	schema, name string
 	keyType      string
 	replIdentOK  bool
+	partitioned  bool
 }
 
 // ensurePublications creates the publications of every database on every
@@ -521,8 +522,9 @@ func (c *Copier) publishOn(ctx context.Context, wf *copyWorkflow, srcSet string,
 		refNames[t.SchemaName+"."+t.TableName] = true
 	}
 	var shardedPub []struct {
-		table catalog.Table
-		hash  string
+		table       catalog.Table
+		hash        string
+		partitioned bool
 	}
 	for _, t := range db.sharded {
 		st, err := describeTable(ctx, conn, t.SchemaName, t.TableName, *t.ShardKey)
@@ -543,14 +545,15 @@ func (c *Copier) publishOn(ctx context.Context, wf *copyWorkflow, srcSet string,
 			}
 		}
 		shardedPub = append(shardedPub, struct {
-			table catalog.Table
-			hash  string
-		}{t, hash})
+			table       catalog.Table
+			hash        string
+			partitioned bool
+		}{t, hash, st.partitioned})
 	}
 	for i, t := range wf.ids {
 		var tables []PublishedTable
 		for _, sp := range shardedPub {
-			tables = append(tables, PublishedTable{Schema: sp.table.SchemaName, Name: sp.table.TableName, Filter: RangeFilter(sp.hash, wf.ranges[i])})
+			tables = append(tables, PublishedTable{Schema: sp.table.SchemaName, Name: sp.table.TableName, Filter: RangeFilter(sp.hash, wf.ranges[i]), Partitioned: sp.partitioned})
 		}
 		want[PublicationName(wf.gen, t)] = tables
 	}
@@ -570,7 +573,7 @@ func (c *Copier) publishOn(ctx context.Context, wf *copyWorkflow, srcSet string,
 					return err
 				}
 			}
-			pt := PublishedTable{Schema: o.schema, Name: o.name}
+			pt := PublishedTable{Schema: o.schema, Name: o.name, Partitioned: o.partitioned}
 			if refNames[key] {
 				ref = append(ref, pt)
 			} else {
@@ -592,10 +595,49 @@ func (c *Copier) publishOn(ctx context.Context, wf *copyWorkflow, srcSet string,
 }
 
 func (c *Copier) replicaIdentityFull(ctx context.Context, wf *copyWorkflow, conn ShardConn, db, schema, name string) error {
-	if _, err := conn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s.%s REPLICA IDENTITY FULL", QuoteIdent(schema), QuoteIdent(name))); err != nil {
+	if err := setReplicaIdentityFull(ctx, conn, schema, name); err != nil {
 		return err
 	}
 	wf.copy.ReplicaIdentityFull = appendUnique(wf.copy.ReplicaIdentityFull, db+"."+schema+"."+name)
+	return nil
+}
+
+// setReplicaIdentityFull sets REPLICA IDENTITY FULL on a table and, when it is
+// partitioned, on every leaf partition too: ALTER TABLE ... REPLICA IDENTITY
+// never recurses, and a via-root filtered publication validates and encodes
+// changes using each leaf's identity, so leaving leaves at the default breaks
+// UPDATE/DELETE. pg_partition_tree returns the table itself for a plain table,
+// so this also covers the non-partitioned case.
+func setReplicaIdentityFull(ctx context.Context, conn ShardConn, schema, name string) error {
+	if _, err := conn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s.%s REPLICA IDENTITY FULL", QuoteIdent(schema), QuoteIdent(name))); err != nil {
+		return err
+	}
+	// pg_partition_tree returns no rows for a plain table and the full tree
+	// (rooted at $1) for a partitioned one; the root is already handled above,
+	// so ALTER only the leaves it reports.
+	qual := QuoteIdent(schema) + "." + QuoteIdent(name)
+	rows, err := conn.Query(ctx, `
+		SELECT n.nspname, c.relname
+		FROM pg_partition_tree($1::regclass) t
+		JOIN pg_class c ON c.oid = t.relid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE t.isleaf`, qual)
+	if err != nil {
+		return err
+	}
+	type rel struct{ schema, name string }
+	leaves, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (rel, error) {
+		var x rel
+		return x, r.Scan(&x.schema, &x.name)
+	})
+	if err != nil {
+		return err
+	}
+	for _, r := range leaves {
+		if _, err := conn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s.%s REPLICA IDENTITY FULL", QuoteIdent(r.schema), QuoteIdent(r.name))); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -634,10 +676,10 @@ const replicaIdentitySQL = `
 		  AND ($KEY = '' OR EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attnum = ANY (i.indkey) AND a.attname = $KEY)))`
 
 func describeTable(ctx context.Context, conn ShardConn, schema, name, key string) (sourceTable, error) {
-	sql := `SELECT format_type(a.atttypid, a.atttypmod), ` + strings.ReplaceAll(replicaIdentitySQL, "$KEY", "$3") + `
+	sql := `SELECT format_type(a.atttypid, a.atttypmod), c.relkind = 'p', ` + strings.ReplaceAll(replicaIdentitySQL, "$KEY", "$3") + `
 		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 		JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = $3 AND NOT a.attisdropped
-		WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'r'`
+		WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'p')`
 	rows, err := conn.Query(ctx, sql, schema, name, key)
 	if err != nil {
 		return sourceTable{}, err
@@ -650,7 +692,7 @@ func describeTable(ctx context.Context, conn ShardConn, schema, name, key string
 		return sourceTable{}, pgx.ErrNoRows
 	}
 	st := sourceTable{schema: schema, name: name}
-	if err := rows.Scan(&st.keyType, &st.replIdentOK); err != nil {
+	if err := rows.Scan(&st.keyType, &st.partitioned, &st.replIdentOK); err != nil {
 		return sourceTable{}, err
 	}
 	return st, nil
@@ -658,9 +700,9 @@ func describeTable(ctx context.Context, conn ShardConn, schema, name, key string
 
 // listTables lists every ordinary table outside the system schemas.
 func listTables(ctx context.Context, conn ShardConn) ([]sourceTable, error) {
-	sql := `SELECT n.nspname, c.relname, ` + strings.ReplaceAll(replicaIdentitySQL, "$KEY", "''") + `
+	sql := `SELECT n.nspname, c.relname, c.relkind = 'p', ` + strings.ReplaceAll(replicaIdentitySQL, "$KEY", "''") + `
 		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgshard') AND n.nspname NOT LIKE 'pg\_%'
+		WHERE c.relkind IN ('r', 'p') AND c.relispartition = false AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgshard') AND n.nspname NOT LIKE 'pg\_%'
 		ORDER BY 1, 2`
 	rows, err := conn.Query(ctx, sql)
 	if err != nil {
@@ -670,7 +712,7 @@ func listTables(ctx context.Context, conn ShardConn) ([]sourceTable, error) {
 	var out []sourceTable
 	for rows.Next() {
 		var t sourceTable
-		if err := rows.Scan(&t.schema, &t.name, &t.replIdentOK); err != nil {
+		if err := rows.Scan(&t.schema, &t.name, &t.partitioned, &t.replIdentOK); err != nil {
 			return nil, err
 		}
 		out = append(out, t)
