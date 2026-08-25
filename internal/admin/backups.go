@@ -95,6 +95,7 @@ type Reconciliation struct {
 	Committed      int32    `json:"committed"`
 	RolledBack     int32    `json:"rolledBack"`
 	Contradictions []string `json:"contradictions,omitempty"`
+	Unverifiable   []string `json:"unverifiable,omitempty"`
 	Unfenced       bool     `json:"unfenced"`
 }
 
@@ -353,7 +354,7 @@ func convertRestore(r *pgshardv1alpha1.PgShardRestore) Restore {
 		out.Groups = append(out.Groups, GroupRestore{Group: g.Group, SourceStanza: g.SourceStanza, BackupID: g.BackupID, Timeline: g.Timeline, ReachedTarget: g.ReachedTarget, Message: g.Message})
 	}
 	if rc := r.Status.Reconciliation; rc != nil {
-		out.Reconciliation = &Reconciliation{Decisions: rc.Decisions, Committed: rc.Committed, RolledBack: rc.RolledBack, Contradictions: rc.Contradictions, Unfenced: rc.Unfenced}
+		out.Reconciliation = &Reconciliation{Decisions: rc.Decisions, Committed: rc.Committed, RolledBack: rc.RolledBack, Contradictions: rc.Contradictions, Unverifiable: rc.Unverifiable, Unfenced: rc.Unfenced}
 	}
 	return out
 }
