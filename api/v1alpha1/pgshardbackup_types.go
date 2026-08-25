@@ -332,6 +332,12 @@ type RestoreReconciliationStatus struct {
 	// neither holds prepared nor committed; any entry fails the restore.
 	// +optional
 	Contradictions []string `json:"contradictions,omitempty"`
+	// Unverifiable lists "group: gid" pairs decided commit that the group
+	// cannot confirm or deny (its transaction id status is frozen, unrecorded
+	// or in the future); any entry fails the restore exactly like a
+	// contradiction, since the commit's presence cannot be proven.
+	// +optional
+	Unverifiable []string `json:"unverifiable,omitempty"`
 	// Unfenced is true once the write fence of the new cluster was released.
 	Unfenced bool `json:"unfenced"`
 }

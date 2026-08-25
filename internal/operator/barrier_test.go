@@ -300,7 +300,7 @@ func TestBarrierRestoreFailsOnContradictionAndStaysFenced(t *testing.T) {
 	if got.Status.Phase != pgshardv1alpha1.RestorePhaseFailed || res.RequeueAfter != 0 {
 		t.Fatalf("status %+v", got.Status)
 	}
-	if !strings.Contains(got.Status.Error, "1 contradiction(s), the cluster stays fenced: shard-1: pgshard-a") {
+	if !strings.Contains(got.Status.Error, "1 unresolved commit(s), the cluster stays fenced: shard-1: pgshard-a") {
 		t.Fatalf("error %q", got.Status.Error)
 	}
 	if st := got.Status.Reconciliation; st == nil || st.Unfenced || len(st.Contradictions) != 1 || st.Committed != 1 {
@@ -309,6 +309,28 @@ func TestBarrierRestoreFailsOnContradictionAndStaysFenced(t *testing.T) {
 	for _, c := range twoPC.calls {
 		if strings.HasPrefix(c, "fence") {
 			t.Fatalf("fence released despite a contradiction: %v", twoPC.calls)
+		}
+	}
+}
+
+func TestBarrierRestoreFailsOnUnverifiableAndStaysFenced(t *testing.T) {
+	r, _, twoPC := recoveredBarrierRestore(t, "ru")
+	twoPC.decisions = []twopc.Decision{{GID: "pgshard-a", State: "commit", Participants: []int32{0, 1}}}
+	twoPC.outcomes["10.1.0.2:9090"] = twopc.Outcome{Committed: 1}
+	twoPC.outcomes["10.1.0.3:9090"] = twopc.Outcome{Unverifiable: []string{"pgshard-a"}}
+	res, got := reconcileRestore(t, r, "ru")
+	if got.Status.Phase != pgshardv1alpha1.RestorePhaseFailed || res.RequeueAfter != 0 {
+		t.Fatalf("status %+v", got.Status)
+	}
+	if !strings.Contains(got.Status.Error, "1 unresolved commit(s), the cluster stays fenced: shard-1: pgshard-a") {
+		t.Fatalf("error %q", got.Status.Error)
+	}
+	if st := got.Status.Reconciliation; st == nil || st.Unfenced || len(st.Unverifiable) != 1 || len(st.Contradictions) != 0 {
+		t.Fatalf("reconciliation %+v", st)
+	}
+	for _, c := range twoPC.calls {
+		if strings.HasPrefix(c, "fence") {
+			t.Fatalf("fence released despite an unverifiable commit: %v", twoPC.calls)
 		}
 	}
 }
