@@ -17,12 +17,16 @@ func TestArgs(t *testing.T) {
 
 func TestRunPipesDumpIntoRestore(t *testing.T) {
 	var tracked []int
-	started := func(pid int) func() {
+	start := func(cmd *exec.Cmd) (func(), error) {
+		if err := cmd.Start(); err != nil {
+			return nil, err
+		}
+		pid := cmd.Process.Pid
 		tracked = append(tracked, pid)
-		return func() { tracked = append(tracked, -pid) }
+		return func() { tracked = append(tracked, -pid) }, nil
 	}
 	out := t.TempDir() + "/out"
-	if err := Run(exec.Command("sh", "-c", "printf 'CREATE TABLE t ();\\n'"), exec.Command("sh", "-c", "cat > "+out), started); err != nil {
+	if err := Run(exec.Command("sh", "-c", "printf 'CREATE TABLE t ();\\n'"), exec.Command("sh", "-c", "cat > "+out), start); err != nil {
 		t.Fatal(err)
 	}
 	if len(tracked) != 4 || tracked[0] != -tracked[3] || tracked[1] != -tracked[2] {

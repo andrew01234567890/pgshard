@@ -37,6 +37,11 @@ type Runner struct {
 	Env []string
 	// Exec runs the binary; swappable for tests. It returns combined output.
 	Exec func(ctx context.Context, args []string, onLine func(string)) error
+	// Start starts a command and returns a stop function to run after Wait,
+	// letting the agent start and reaper-track the pgbackrest child
+	// atomically so the PID1 reaper cannot reap it before Wait (ECHILD). A
+	// nil Start starts the command directly.
+	Start func(cmd *exec.Cmd) (stop func(), err error)
 }
 
 // NewRunner builds a Runner around the pgbackrest binary on PATH.
@@ -57,10 +62,16 @@ func (r *Runner) execBinary(ctx context.Context, args []string, onLine func(stri
 	pr, pw := io.Pipe()
 	cmd.Stdout = pw
 	cmd.Stderr = pw
-	if err := cmd.Start(); err != nil {
+	start := r.Start
+	if start == nil {
+		start = func(c *exec.Cmd) (func(), error) { return func() {}, c.Start() }
+	}
+	stop, err := start(cmd)
+	if err != nil {
 		_ = pw.Close()
 		return err
 	}
+	defer stop()
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -71,7 +82,7 @@ func (r *Runner) execBinary(ctx context.Context, args []string, onLine func(stri
 			onLine(sc.Text())
 		}
 	}()
-	err := cmd.Wait()
+	err = cmd.Wait()
 	_ = pw.Close()
 	wg.Wait()
 	return err

@@ -162,15 +162,30 @@ func (s *Supervisor) Command(ctx context.Context, name string, args ...string) *
 	return cmd
 }
 
+// StartTracked starts cmd and registers its pid with the reaper atomically
+// under the supervisor lock, which the reaper also takes to snapshot the
+// tracked set. This closes the window in which a child that exited between
+// Start and Track would be seen as an untracked orphan and reaped out from
+// under the caller's Wait (which would then fail with ECHILD). The caller must
+// Wait on cmd and Untrack its pid afterwards.
+func (s *Supervisor) StartTracked(cmd *exec.Cmd) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	s.tracked[cmd.Process.Pid] = struct{}{}
+	return nil
+}
+
 // RunTracked runs cmd to completion while keeping its pid out of the reaper.
 func (s *Supervisor) RunTracked(cmd *exec.Cmd) ([]byte, error) {
 	var out strings.Builder
 	cmd.Stdout = &out
 	cmd.Stderr = &out
-	if err := cmd.Start(); err != nil {
+	if err := s.StartTracked(cmd); err != nil {
 		return nil, err
 	}
-	s.Track(cmd.Process.Pid)
 	err := cmd.Wait()
 	s.Untrack(cmd.Process.Pid)
 	if err != nil {
@@ -189,10 +204,19 @@ func (s *Supervisor) ReapOrphans(ctx context.Context) {
 	defer tick.Stop()
 	for {
 		for _, pid := range s.zombieOrphans() {
-			var ws syscall.WaitStatus
-			if _, err := syscall.Wait4(pid, &ws, syscall.WNOHANG, nil); err == nil {
-				s.log.Info("reaped orphan", "pid", pid, "status", ws.ExitStatus())
+			// Re-check under the lock right before reaping: a pid listed as an
+			// untracked zombie could have been reaped and reused for a new
+			// tracked child since the scan; Wait4 on it would then steal that
+			// child's exit status.
+			s.mu.Lock()
+			_, isTracked := s.tracked[pid]
+			if !isTracked {
+				var ws syscall.WaitStatus
+				if _, err := syscall.Wait4(pid, &ws, syscall.WNOHANG, nil); err == nil {
+					s.log.Info("reaped orphan", "pid", pid, "status", ws.ExitStatus())
+				}
 			}
+			s.mu.Unlock()
 		}
 		select {
 		case <-ctx.Done():
