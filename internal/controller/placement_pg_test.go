@@ -773,3 +773,27 @@ func TestPlacementRefusesUserArtifactTableOnPostgres(t *testing.T) {
 		t.Fatalf("user table schema changed: %d columns", n)
 	}
 }
+
+// TestSequenceInSchemaOnPostgres guards the shadowDDL fix that skips
+// ALTER SEQUENCE ... OWNED BY for a serial default whose sequence lives in a
+// different schema than the table (PostgreSQL requires them co-schema).
+func TestSequenceInSchemaOnPostgres(t *testing.T) {
+	conn := connect(t, startPostgres(t))
+	ctx := context.Background()
+	for _, stmt := range []string{
+		`CREATE SCHEMA app`,
+		`CREATE SCHEMA s2`,
+		`CREATE SEQUENCE app.local_seq`,
+		`CREATE SEQUENCE s2.shared`,
+	} {
+		mustExec(t, conn, stmt)
+	}
+	local, err := sequenceInSchema(ctx, pgxShardConn{conn}, "app.local_seq", "app")
+	if err != nil || !local {
+		t.Fatalf("same-schema sequence: %v %v", local, err)
+	}
+	cross, err := sequenceInSchema(ctx, pgxShardConn{conn}, "s2.shared", "app")
+	if err != nil || cross {
+		t.Fatalf("cross-schema sequence must not be reported in app: %v %v", cross, err)
+	}
+}
