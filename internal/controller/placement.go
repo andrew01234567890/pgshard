@@ -304,6 +304,11 @@ func (p *Placer) fail(ctx context.Context, wf *placementWorkflow, cause error) e
 		if err := p.releaseFence(ctx, wf); err != nil {
 			return err
 		}
+	} else if err := p.releaseShardFence(ctx, wf); err != nil {
+		// A failure raised before the routing was built still has to give
+		// the table back: a failed workflow is never revisited, so a fence
+		// left on would shut the table to every client for good.
+		return err
 	}
 	if err := p.unlock(ctx, wf); err != nil {
 		return err
@@ -354,9 +359,13 @@ func (p *Placer) drive(ctx context.Context, wf *placementWorkflow) (bool, error)
 		// The shards refuse writes from here until publish: the drain is
 		// done, and from the first rename onwards a router still holding
 		// the old view would otherwise write the live name on a shard that
-		// has already swapped.
-		if err := p.fenceShards(ctx, wf); err != nil {
-			return false, err
+		// has already swapped. Once the swap is published there is nothing
+		// left to protect, and re-arming on a retry of a later step would
+		// shut the table to every client over one unreachable shard.
+		if wf.st.SwappedAt == nil {
+			if err := p.fenceShards(ctx, wf); err != nil {
+				return false, err
+			}
 		}
 		if _, _, err := p.catchUp(ctx, wf, true); err != nil {
 			return false, err

@@ -282,7 +282,24 @@ func setsProtectedValue(kind pgquerypb.VariableSetKind) bool {
 // GUC, and nil otherwise. It is applied to SET, SET LOCAL and RESET of a named
 // setting; RESET ALL (empty name) is allowed because it restores the forced
 // server default.
+// clientGUCs are the pgshard settings a client may set for itself.
+var clientGUCs = map[string]bool{
+	"pgshard.ddl_async":        true,
+	"pgshard.transaction_mode": true,
+}
+
 func refuseProtectedGUC(name string) error {
+	// pgshard's own namespace is closed except for the settings that are
+	// deliberately client-facing: the control plane uses it to tell a shard
+	// that a session is its own, and the placement write fence reads one of
+	// them, so a client able to set it would exempt itself from a fence
+	// that exists to refuse it. Closed by default so a control-plane
+	// setting added later is refused without anyone remembering to.
+	if lower := strings.ToLower(name); strings.HasPrefix(lower, "pgshard.") && !clientGUCs[lower] {
+		err := pgwire.Errorf(pgwire.CodeInsufficientPrivilege, "changing %s is not permitted through pgshard", strings.ToLower(name))
+		err.Hint = "settings under the pgshard namespace belong to the control plane"
+		return err
+	}
 	if protectedDurabilityGUCs[strings.ToLower(name)] {
 		err := pgwire.Errorf(pgwire.CodeInsufficientPrivilege, "changing %s is not permitted through pgshard", strings.ToLower(name))
 		err.Hint = "durability settings are fixed by the cluster to keep commits recoverable across failover"

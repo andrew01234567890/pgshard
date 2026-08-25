@@ -25,6 +25,9 @@ func fenceFunctionSQL(schema string) string {
 		RETURNS trigger LANGUAGE plpgsql AS $fence$
 		BEGIN
 			IF coalesce(current_setting('` + MaintenanceGUC + `', true), '') = 'on' THEN
+				IF TG_LEVEL = 'STATEMENT' THEN
+					RETURN NULL;
+				END IF;
 				IF TG_OP = 'DELETE' THEN
 					RETURN OLD;
 				END IF;
@@ -37,16 +40,27 @@ func fenceFunctionSQL(schema string) string {
 		$fence$`
 }
 
-// fenceTriggerSQL arms the fence on one table.
+// placementFenceTruncateTrigger fences TRUNCATE, which never fires a row
+// trigger and would otherwise empty the table straight through the fence.
+const placementFenceTruncateTrigger = "pgshard_placement_fence_truncate"
+
+// fenceTriggerSQL arms the fence on one table. CREATE OR REPLACE is atomic,
+// so re-arming on resume leaves no instant in which the table is open.
 func fenceTriggerSQL(schema, qualified string) string {
-	return `CREATE TRIGGER ` + QuoteIdent(placementFenceTrigger) + `
+	return `CREATE OR REPLACE TRIGGER ` + QuoteIdent(placementFenceTrigger) + `
 		BEFORE INSERT OR UPDATE OR DELETE ON ` + qualified + `
 		FOR EACH ROW EXECUTE FUNCTION ` + QuoteIdent(schema) + `.` + QuoteIdent(placementFenceTrigger) + `()`
 }
 
+func fenceTruncateTriggerSQL(schema, qualified string) string {
+	return `CREATE OR REPLACE TRIGGER ` + QuoteIdent(placementFenceTruncateTrigger) + `
+		BEFORE TRUNCATE ON ` + qualified + `
+		FOR EACH STATEMENT EXECUTE FUNCTION ` + QuoteIdent(schema) + `.` + QuoteIdent(placementFenceTrigger) + `()`
+}
+
 // unfenceTriggerSQL disarms it.
-func unfenceTriggerSQL(qualified string) string {
-	return `DROP TRIGGER IF EXISTS ` + QuoteIdent(placementFenceTrigger) + ` ON ` + qualified
+func unfenceTriggerSQL(name, qualified string) string {
+	return `DROP TRIGGER IF EXISTS ` + QuoteIdent(name) + ` ON ` + qualified
 }
 
 // present reports whether qualified names a relation on this shard. An
@@ -76,21 +90,35 @@ func present(ctx context.Context, conn ShardConn, qualified string) (bool, error
 // fencing only the live one would leave a shard unfenced again the moment
 // it swapped.
 func fenceTables(ctx context.Context, conn ShardConn, schema string, qualified ...string) error {
-	if _, err := conn.Exec(ctx, fenceFunctionSQL(schema)); err != nil {
-		return fmt.Errorf("create placement fence: %w", err)
-	}
+	var here []string
 	for _, q := range qualified {
 		switch there, err := present(ctx, conn, q); {
 		case err != nil:
 			return fmt.Errorf("look for %s: %w", q, err)
-		case !there:
-			continue
+		case there:
+			here = append(here, q)
 		}
-		if _, err := conn.Exec(ctx, unfenceTriggerSQL(q)); err != nil {
-			return fmt.Errorf("re-arm placement fence on %s: %w", q, err)
-		}
+	}
+	if len(here) == 0 {
+		// Nothing of this table lives on this shard, so there is nothing to
+		// fence and no reason to require the schema to exist here.
+		return nil
+	}
+	// Arming takes ShareRowExclusive, and the router-side pause deliberately
+	// lets an open write transaction finish, so wait a bounded time rather
+	// than queueing every other locker behind us.
+	if _, err := conn.Exec(ctx, `SET lock_timeout = '5s'`); err != nil {
+		return err
+	}
+	if _, err := conn.Exec(ctx, fenceFunctionSQL(schema)); err != nil {
+		return fmt.Errorf("create placement fence: %w", err)
+	}
+	for _, q := range here {
 		if _, err := conn.Exec(ctx, fenceTriggerSQL(schema, q)); err != nil {
 			return fmt.Errorf("arm placement fence on %s: %w", q, err)
+		}
+		if _, err := conn.Exec(ctx, fenceTruncateTriggerSQL(schema, q)); err != nil {
+			return fmt.Errorf("arm placement truncate fence on %s: %w", q, err)
 		}
 	}
 	return nil
@@ -105,8 +133,10 @@ func unfenceTables(ctx context.Context, conn ShardConn, qualified ...string) err
 		case !there:
 			continue
 		}
-		if _, err := conn.Exec(ctx, unfenceTriggerSQL(q)); err != nil {
-			return fmt.Errorf("release placement fence on %s: %w", q, err)
+		for _, name := range []string{placementFenceTrigger, placementFenceTruncateTrigger} {
+			if _, err := conn.Exec(ctx, unfenceTriggerSQL(name, q)); err != nil {
+				return fmt.Errorf("release placement fence on %s: %w", q, err)
+			}
 		}
 	}
 	return nil

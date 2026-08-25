@@ -1004,6 +1004,15 @@ func TestPlacementFenceRefusesAStaleRouterOnPostgres(t *testing.T) {
 			t.Fatalf("%q: %v, want 55000", sql, err)
 		}
 	}
+	// TRUNCATE never fires a row trigger, so it needs its own.
+	if _, err := client.Exec(ctx, `TRUNCATE moving`); err == nil {
+		t.Fatal("TRUNCATE went straight through the fence")
+	} else {
+		var pge *pgconn.PgError
+		if !errors.As(err, &pge) || pge.Code != "55000" {
+			t.Fatalf("TRUNCATE: %v, want 55000", err)
+		}
+	}
 	// The workflow's own session still works, or it could not catch up.
 	mustExec(t, admin, `INSERT INTO moving_shadow VALUES (4, 40, 'applied')`)
 

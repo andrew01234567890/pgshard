@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 )
 
 // describe reads the table's shape from the first source shard and checks
@@ -976,17 +978,58 @@ func (p *Placer) fenceShards(ctx context.Context, wf *placementWorkflow) error {
 	})
 }
 
-// releaseShardFence drops the database fence from every shard. It is
-// best-effort per shard so one unreachable shard cannot strand the rest.
+// releaseShardFence drops the database fence from every shard. Every shard
+// is tried before the first failure is reported, so one that is unreachable
+// cannot leave the others refusing writes.
 func (p *Placer) releaseShardFence(ctx context.Context, wf *placementWorkflow) error {
-	return p.eachShard(ctx, wf, func(ctx context.Context, conn ShardConn) error {
-		return unfenceTables(ctx, conn, wf.shape.qualified(wf.spec.TableName), wf.shape.qualified(wf.shadow()), wf.shape.qualified(wf.old()))
-	})
+	ids, err := p.fencedShards(ctx, wf)
+	if err != nil {
+		return err
+	}
+	var failed error
+	for _, t := range ids {
+		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
+		if err != nil {
+			failed = errors.Join(failed, err)
+			continue
+		}
+		err = unfenceTables(ctx, conn, wf.shape.qualified(wf.spec.TableName), wf.shape.qualified(wf.shadow()), wf.shape.qualified(wf.old()))
+		_ = conn.Close(ctx)
+		if err != nil {
+			failed = errors.Join(failed, fmt.Errorf("shard %s/%d: %w", wf.st.SourceSet, t, err))
+		}
+	}
+	return failed
+}
+
+// fencedShards is the shard list to fence or release. It falls back to the
+// catalog when the workflow's routing was never built, because a failure
+// raised before that still has to be able to give the table back.
+func (p *Placer) fencedShards(ctx context.Context, wf *placementWorkflow) ([]int32, error) {
+	if wf.rt != nil {
+		return wf.rt.ids, nil
+	}
+	if wf.st.SourceSet == "" {
+		return nil, nil
+	}
+	ranges, err := catalog.ListShardRanges(ctx, p.Pool, wf.st.SourceSet)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]int32, 0, len(ranges))
+	for _, r := range ranges {
+		ids = append(ids, r.ShardID)
+	}
+	return ids, nil
 }
 
 // eachShard runs fn on every shard the workflow touches.
 func (p *Placer) eachShard(ctx context.Context, wf *placementWorkflow, fn func(context.Context, ShardConn) error) error {
-	for _, t := range wf.rt.ids {
+	ids, err := p.fencedShards(ctx, wf)
+	if err != nil {
+		return err
+	}
+	for _, t := range ids {
 		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
 		if err != nil {
 			return err
