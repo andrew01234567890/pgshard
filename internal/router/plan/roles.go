@@ -232,6 +232,11 @@ func (w *walker) alterRoleSet(s *pgquerypb.AlterRoleSetStmt) error {
 		return w.migration(m)
 	}
 	set := s.GetSetstmt()
+	if set.GetKind() == pgquerypb.VariableSetKind_VAR_SET_VALUE {
+		if err := refuseProtectedGUC(set.GetName()); err != nil {
+			return err
+		}
+	}
 	rs := catalog.RoleSetting{Role: role.GetRolename(), Database: s.GetDatabase(), Name: set.GetName()}
 	switch set.GetKind() {
 	case pgquerypb.VariableSetKind_VAR_SET_VALUE:

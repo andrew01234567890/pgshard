@@ -153,10 +153,20 @@ func classify(node *pgquerypb.Node, c *StmtClass) error {
 	case *pgquerypb.Node_VariableSetStmt:
 		s := n.VariableSetStmt
 		if s.GetIsLocal() {
+			if setsProtectedValue(s.GetKind()) {
+				if err := refuseProtectedGUC(s.GetName()); err != nil {
+					return err
+				}
+			}
 			if strings.EqualFold(s.GetName(), "search_path") {
 				return notYet("SET LOCAL search_path is not available yet", "use SET search_path or schema-qualify table names")
 			}
 			return nil
+		}
+		if setsProtectedValue(s.GetKind()) {
+			if err := refuseProtectedGUC(s.GetName()); err != nil {
+				return err
+			}
 		}
 		switch s.GetKind() {
 		case pgquerypb.VariableSetKind_VAR_SET_VALUE, pgquerypb.VariableSetKind_VAR_SET_DEFAULT,
@@ -183,6 +193,35 @@ func classify(node *pgquerypb.Node, c *StmtClass) error {
 				c.SetGUC, c.GUCName = true, "session characteristics"
 			}
 		}
+	}
+	return nil
+}
+
+// protectedDurabilityGUCs are settings the router never lets a client change:
+// weakening them would let a transaction be acknowledged before its WAL is
+// durable, which silently breaks the durability that failover candidate
+// selection assumes. The safe value is forced as the server default instead.
+var protectedDurabilityGUCs = map[string]bool{
+	"synchronous_commit": true,
+}
+
+// setsProtectedValue reports whether a SET kind assigns an explicit value (as
+// opposed to VAR_SET_DEFAULT/VAR_RESET, which restore the forced-safe server
+// default and are always allowed for a protected GUC).
+func setsProtectedValue(kind pgquerypb.VariableSetKind) bool {
+	return kind == pgquerypb.VariableSetKind_VAR_SET_VALUE ||
+		kind == pgquerypb.VariableSetKind_VAR_SET_CURRENT
+}
+
+// refuseProtectedGUC returns a refusal error if name is a protected durability
+// GUC, and nil otherwise. It is applied to SET, SET LOCAL and RESET of a named
+// setting; RESET ALL (empty name) is allowed because it restores the forced
+// server default.
+func refuseProtectedGUC(name string) error {
+	if protectedDurabilityGUCs[strings.ToLower(name)] {
+		err := pgwire.Errorf(pgwire.CodeInsufficientPrivilege, "changing %s is not permitted through pgshard", strings.ToLower(name))
+		err.Hint = "durability settings are fixed by the cluster to keep commits recoverable across failover"
+		return err
 	}
 	return nil
 }

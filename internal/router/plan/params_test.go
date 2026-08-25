@@ -7,6 +7,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/andrew01234567890/pgshard/internal/pgwire"
 )
 
 func be64(v int64) []byte { b := make([]byte, 8); binary.BigEndian.PutUint64(b, uint64(v)); return b }
@@ -221,6 +223,42 @@ func TestSearchPathClassification(t *testing.T) {
 		}
 		if !slices.Equal(pl.Class.SearchPath, c.want) || (pl.Class.SearchPath == nil) != (c.want == nil) {
 			t.Fatalf("%s: search path %q, want %q", c.sql, pl.Class.SearchPath, c.want)
+		}
+	}
+}
+
+func TestProtectedDurabilityGUCRefused(t *testing.T) {
+	snap := fixture(t)
+	refuse := []string{
+		"set synchronous_commit = off",
+		"set synchronous_commit to remote_write",
+		"set local synchronous_commit = off",
+		"alter role app set synchronous_commit = off",
+		"alter role app in database d set synchronous_commit to off",
+	}
+	for _, sql := range refuse {
+		pl, err := New().Plan(context.Background(), session(snap), sql)
+		if err == nil || pl.Kind != Refuse {
+			t.Fatalf("%s: expected refusal, got %+v %v", sql, pl, err)
+		}
+		var pe *pgwire.Error
+		if !errors.As(err, &pe) || pe.Code != pgwire.CodeInsufficientPrivilege {
+			t.Fatalf("%s: want SQLSTATE %s, got %v", sql, pgwire.CodeInsufficientPrivilege, err)
+		}
+	}
+	// Restoring the forced-safe default, or touching an unprotected GUC, is allowed.
+	allow := []string{
+		"set work_mem = '64MB'",
+		"reset all",
+		"reset synchronous_commit",
+		"set synchronous_commit to default",
+		"set local synchronous_commit to default",
+		"alter role app reset synchronous_commit",
+		"alter role app reset all",
+	}
+	for _, sql := range allow {
+		if _, err := New().Plan(context.Background(), session(snap), sql); err != nil {
+			t.Fatalf("%s: unexpected refusal: %v", sql, err)
 		}
 	}
 }
