@@ -117,8 +117,11 @@ func runBarrierRestore(ctx context.Context, t *testing.T, c *e2e.Cluster, s stor
 	if got := psqlOn(catalogPod, "SELECT write_fence FROM pgshard.shard_map_generation"); got != "f" {
 		t.Fatalf("restored catalog still fenced: %s", got)
 	}
-	if got := psqlOn(catalogPod, "SELECT count(*) FROM pgshard.restore_points WHERE name = 'e2e-"+cluster+"'"); got != "0" {
-		t.Fatalf("the restore point row is written after the barrier and must not be in the restored catalog: %s", got)
+	// The name is reserved before the barrier touches any group, so the row
+	// is inside the restore point; certification happens after it and must
+	// not be.
+	if got := psqlOn(catalogPod, "SELECT count(*) FILTER (WHERE certified) || ':' || count(*) FROM pgshard.restore_points WHERE name = 'e2e-"+cluster+"'"); got != "0:1" {
+		t.Fatalf("restored catalog restore_points certified:total = %s, want 0:1", got)
 	}
 	var restored pgshardv1alpha1.PgShardRestore
 	if err := getJSON(ctx, c, "pgshardrestore", name, &restored); err != nil || restored.Status.Phase != pgshardv1alpha1.RestorePhaseRecovered {
