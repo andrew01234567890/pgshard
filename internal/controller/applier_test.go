@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +25,23 @@ type memStore struct {
 	dbs        []string
 	execs      []string
 	saves      int
+	ddlLocks   map[string]string
+	serving    string
+}
+
+func (s *memStore) ServingShardSet(context.Context) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.serving == "" {
+		return "default", nil
+	}
+	return s.serving, nil
+}
+
+func (s *memStore) LockedDatabases(context.Context) (map[string]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return maps.Clone(s.ddlLocks), nil
 }
 
 func (s *memStore) Pending(context.Context) ([]catalog.DDLMigration, error) {
@@ -111,6 +129,8 @@ type fakeShards struct {
 	rolsuper          func(shard int32, name string) bool
 	check             func(shard int32, kind, table, name string) bool
 	dialErr           func(shard int32) error
+	// dialed records the shard sets the applier actually connected to.
+	dialed []string
 	// rewrite scripting
 	columns      []string
 	pks          []string
@@ -132,7 +152,10 @@ func newFakeShards() *fakeShards {
 	return &fakeShards{ran: map[int32][]string{}, super: map[int32][]string{}, dbs: map[int32][]string{}, logins: map[int32][]string{}}
 }
 
-func (f *fakeShards) DialDatabase(_ context.Context, _ string, id int32, _ string) (ShardConn, error) {
+func (f *fakeShards) DialDatabase(_ context.Context, set string, id int32, _ string) (ShardConn, error) {
+	f.mu.Lock()
+	f.dialed = append(f.dialed, set)
+	f.mu.Unlock()
 	if f.dialErr != nil {
 		if err := f.dialErr(id); err != nil {
 			return nil, err
@@ -1143,5 +1166,65 @@ func TestApplierDetachChecksAreSchemaQualified(t *testing.T) {
 	}
 	if strings.Contains(got, "select 1") || strings.Contains(got, "select 2") {
 		t.Fatalf("a step ran although its schema-qualified check held:\n%s", got)
+	}
+}
+
+// TestApplierHoldsAMigrationWhileACutoverHoldsTheDDLLock: a reshard or
+// upgrade cutover writes a DDL lock per database when it fences, so that
+// the schema cannot move under a copy comparing the two sides. The locks
+// were written and never read, so the migration ran anyway.
+func TestApplierHoldsAMigrationWhileACutoverHoldsTheDDLLock(t *testing.T) {
+	f := newApplierFixture(t)
+	f.store.dbs = []string{"app", "other"}
+	locked := f.queue(catalog.DDLMigration{Statement: "create table t (id int)", Kind: "CREATE TABLE", Scope: "all", Database: "app"})
+	free := f.queue(catalog.DDLMigration{Statement: "create table u (id int)", Kind: "CREATE TABLE", Scope: "all", Database: "other"})
+	f.store.ddlLocks = map[string]string{"app": "11111111-1111-1111-1111-111111111111"}
+
+	f.run(t)
+	if m := f.store.get(t, locked); m.State != catalog.MigrationQueued {
+		t.Fatalf("a migration on a database a cutover has locked ran anyway: %s", m.State)
+	}
+	if m := f.store.get(t, free); m.State == catalog.MigrationQueued {
+		t.Fatal("a migration on an unlocked database must not be held")
+	}
+
+	// Once the cutover releases the lock it proceeds.
+	f.store.mu.Lock()
+	f.store.ddlLocks = nil
+	f.store.mu.Unlock()
+	f.run(t)
+	if m := f.store.get(t, locked); m.State == catalog.MigrationQueued {
+		t.Fatalf("the migration stayed held after the lock was released: %s", m.State)
+	}
+}
+
+// TestApplierFollowsTheServingShardSetAfterACutover: the shard set was a
+// constant, "default", so once a reshard or major upgrade retired that set
+// and promoted another, every later migration was applied to shards nobody
+// was reading from - and never to the ones that were serving.
+func TestApplierFollowsTheServingShardSetAfterACutover(t *testing.T) {
+	f := newApplierFixture(t)
+	f.store.serving = "g2"
+	f.store.shards = []int32{0, 1}
+
+	id := f.queue(catalog.DDLMigration{Statement: "create table t (id int)", Kind: "CREATE TABLE", Scope: "all"})
+	f.run(t)
+
+	m := f.store.get(t, id)
+	if m.State != catalog.MigrationComplete {
+		t.Fatalf("state %s: %s", m.State, m.Error)
+	}
+	for _, ran := range f.shards.dialed {
+		if ran == "default" {
+			t.Fatal("a migration was applied to the retired shard set")
+		}
+	}
+	if len(f.shards.dialed) == 0 {
+		t.Fatal("the migration reached no shard set at all")
+	}
+	for _, ran := range f.shards.dialed {
+		if ran != "g2" {
+			t.Fatalf("migration applied to shard set %q, want the serving set g2", ran)
+		}
 	}
 }

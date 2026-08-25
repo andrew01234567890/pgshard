@@ -506,7 +506,11 @@ func columnFacts(ctx context.Context, conn ShardConn, rw *catalog.RewriteChange,
 // rewrite from one shard, leaving the old column intact.
 func (a *Applier) revertRewrite(ctx context.Context, m *catalog.DDLMigration, id int32) error {
 	ctx = context.WithoutCancel(ctx)
-	conn, err := a.Shards.DialDatabase(ctx, a.shardSet(), id, m.Database)
+	set, serr := a.shardSet(ctx)
+	if serr != nil {
+		return serr
+	}
+	conn, err := a.Shards.DialDatabase(ctx, set, id, m.Database)
 	if err != nil {
 		return err
 	}
@@ -535,7 +539,11 @@ func (a *Applier) SweepRewriteArtifacts(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	ids, err := a.Store.Shards(ctx, a.shardSet())
+	set, serr := a.shardSet(ctx)
+	if serr != nil {
+		return serr
+	}
+	ids, err := a.Store.Shards(ctx, set)
 	if err != nil {
 		return err
 	}
@@ -550,7 +558,11 @@ func (a *Applier) SweepRewriteArtifacts(ctx context.Context) error {
 }
 
 func (a *Applier) sweepShard(ctx context.Context, id int32, db string) error {
-	conn, err := a.Shards.DialDatabase(ctx, a.shardSet(), id, db)
+	set, serr := a.shardSet(ctx)
+	if serr != nil {
+		return serr
+	}
+	conn, err := a.Shards.DialDatabase(ctx, set, id, db)
 	if err != nil {
 		return err
 	}

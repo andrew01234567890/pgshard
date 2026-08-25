@@ -1279,13 +1279,19 @@ func (e *Executor) ensurePinned(ctx context.Context) error {
 
 // replay re-establishes session GUCs and named prepared statements on a
 // freshly pinned backend.
-func (e *Executor) replay(ctx context.Context, skip map[string]bool) error {
+// sessionSettings is the ordered SQL that puts a fresh backend into this
+// session's state: the startup search_path first, then every SET the
+// session has run. Any backend the session's statements reach needs all of
+// it, not a part - SET ROLE decides which grants and row-level security
+// policies apply, and running somewhere that missed it means running as
+// the login role instead.
+//
+// The backend never saw the client's startup options, so a startup
+// search_path is applied first, and re-applied after every replayed RESET:
+// on this session RESET restores the startup value, while on the backend
+// it would restore the server default the planner did not route with.
+func (e *Executor) sessionSettings() []string {
 	var parts []string
-	// The backend never saw the client's startup options, so a startup
-	// search_path is applied first, and re-applied after every replayed
-	// RESET: on this session RESET restores the startup value, while on
-	// the backend it would restore the server default the planner did not
-	// route with.
 	if e.startupSearchPath != nil {
 		parts = append(parts, searchPathSQL(e.startupSearchPath))
 	}
@@ -1295,6 +1301,11 @@ func (e *Executor) replay(ctx context.Context, skip map[string]bool) error {
 			parts = append(parts, searchPathSQL(e.startupSearchPath))
 		}
 	}
+	return parts
+}
+
+func (e *Executor) replay(ctx context.Context, skip map[string]bool) error {
+	parts := e.sessionSettings()
 	if len(parts) > 0 {
 		if err := e.send(simpleQuery(strings.Join(parts, "; "))); err != nil {
 			return err
