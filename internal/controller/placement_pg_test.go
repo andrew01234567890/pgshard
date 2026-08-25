@@ -717,3 +717,45 @@ func TestPlacementIdentityColumnsOnPostgres(t *testing.T) {
 		t.Fatalf("things across shards: %d", total)
 	}
 }
+
+// TestPlacementRefusesUserArtifactTableOnPostgres: a user table that happens
+// to share the __pgshard_new shadow name must never be adopted, written into
+// or dropped; the move fails loudly and leaves the table intact.
+func TestPlacementRefusesUserArtifactTableOnPostgres(t *testing.T) {
+	f := newPlacementFixture(t)
+	home := f.app(0)
+	other := f.app(1)
+	mustExec(t, home, `CREATE TABLE items (id serial PRIMARY KEY, v text)`)
+	mustExec(t, home, `INSERT INTO items (v) SELECT 'x' FROM generate_series(1, 10)`)
+	// A pre-existing, unrelated user table with the reserved shadow name.
+	mustExec(t, other, `CREATE TABLE items__pgshard_new (keep text)`)
+	mustExec(t, other, `INSERT INTO items__pgshard_new VALUES ('precious')`)
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('app', 'public', 'items', 'unsharded', NULL)`)
+	f.reconcile()
+
+	mustExec(t, f.catalog, `UPDATE pgshard.tables SET placement = 'sharded', shard_key = 'id' WHERE table_name = 'items'`)
+	f.reconcile()
+	var state, msg string
+	for i := 0; i < 40; i++ {
+		if _, err := f.placer.Pass(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		_, state, _, msg = f.workflow("items")
+		if state == StateFailed {
+			break
+		}
+		if state == StateCompleted {
+			t.Fatalf("move completed despite a conflicting user table")
+		}
+	}
+	if state != StateFailed || !strings.Contains(msg, "not a pgshard shadow") {
+		t.Fatalf("expected refusal, got %s %q", state, msg)
+	}
+	// The user's table and its row must be untouched.
+	if v := queryOne[string](t, other, `SELECT keep FROM items__pgshard_new`); v != "precious" {
+		t.Fatalf("user table was modified: %q", v)
+	}
+	if n := queryOne[int64](t, other, `SELECT count(*) FROM information_schema.columns WHERE table_name = 'items__pgshard_new'`); n != 1 {
+		t.Fatalf("user table schema changed: %d columns", n)
+	}
+}

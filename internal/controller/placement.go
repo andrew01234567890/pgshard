@@ -63,19 +63,20 @@ func (s placementSpec) table() string { return s.Database + "." + s.SchemaName +
 
 // placementState is the workflow's record under status->'placement'.
 type placementState struct {
-	SourceSet string           `json:"source_set,omitempty"`
-	Sources   []int32          `json:"sources,omitempty"`
-	Targets   []int32          `json:"targets,omitempty"`
-	Holders   []int32          `json:"holders,omitempty"`
-	Columns   []string         `json:"columns,omitempty"`
-	Identity  []string         `json:"identity,omitempty"`
-	PK        []string         `json:"pk,omitempty"`
-	KeyType   string           `json:"key_type,omitempty"`
-	Copied    map[string]bool  `json:"copied,omitempty"`
-	Applied   map[string]int64 `json:"applied,omitempty"`
-	LagBytes  int64            `json:"lag_bytes"`
-	FencedAt  *time.Time       `json:"fenced_at,omitempty"`
-	SwappedAt *time.Time       `json:"swapped_at,omitempty"`
+	SourceSet    string           `json:"source_set,omitempty"`
+	Sources      []int32          `json:"sources,omitempty"`
+	Targets      []int32          `json:"targets,omitempty"`
+	Holders      []int32          `json:"holders,omitempty"`
+	Columns      []string         `json:"columns,omitempty"`
+	Identity     []string         `json:"identity,omitempty"`
+	TableComment *string          `json:"table_comment,omitempty"`
+	PK           []string         `json:"pk,omitempty"`
+	KeyType      string           `json:"key_type,omitempty"`
+	Copied       map[string]bool  `json:"copied,omitempty"`
+	Applied      map[string]int64 `json:"applied,omitempty"`
+	LagBytes     int64            `json:"lag_bytes"`
+	FencedAt     *time.Time       `json:"fenced_at,omitempty"`
+	SwappedAt    *time.Time       `json:"swapped_at,omitempty"`
 	// Swapped lists the shards whose swap transaction was started; the
 	// marker is persisted before the first rename on a shard, so only a
 	// resume that finds it may treat a missing shadow as already swapped.
@@ -535,7 +536,7 @@ func (p *Placer) cleanup(ctx context.Context, wf *placementWorkflow) error {
 		if err != nil {
 			return err
 		}
-		_, err = conn.Exec(ctx, "DROP TABLE IF EXISTS "+wf.shape.qualified(wf.shadow()))
+		err = dropArtifactTable(ctx, conn, wf.spec.SchemaName, wf.shadow())
 		_ = conn.Close(ctx)
 		if err != nil {
 			return err
