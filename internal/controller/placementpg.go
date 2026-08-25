@@ -41,6 +41,22 @@ func (p *Placer) describe(ctx context.Context, wf *placementWorkflow) error {
 		return err
 	}
 	wf.st.TableComment = comment
+	// A column defaulting to a sequence in another schema cannot be moved
+	// safely: the target's rebuilt sequence would not be advanced past the
+	// copied rows (it is not owned, so pg_get_serial_sequence cannot find it),
+	// and such a sequence is typically shared, so per-shard copies collide.
+	// Refuse rather than silently reissue identifiers.
+	for _, c := range cols {
+		for _, m := range nextvalRE.FindAllStringSubmatch(c.def, -1) {
+			same, serr := sequenceInSchema(ctx, conn, m[1], wf.spec.SchemaName)
+			if serr != nil {
+				return serr
+			}
+			if !same {
+				return fatal("column %q of table %s defaults to a sequence in another schema (%s); moving such a table is not supported", c.name, wf.spec.table(), m[1])
+			}
+		}
+	}
 	wf.st.Columns, wf.st.Identity, wf.st.PK = nil, nil, pk
 	for _, c := range cols {
 		wf.st.Columns = append(wf.st.Columns, c.name)
