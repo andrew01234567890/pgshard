@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +25,13 @@ type memStore struct {
 	dbs        []string
 	execs      []string
 	saves      int
+	ddlLocks   map[string]string
+}
+
+func (s *memStore) LockedDatabases(context.Context) (map[string]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return maps.Clone(s.ddlLocks), nil
 }
 
 func (s *memStore) Pending(context.Context) ([]catalog.DDLMigration, error) {
@@ -1143,5 +1151,34 @@ func TestApplierDetachChecksAreSchemaQualified(t *testing.T) {
 	}
 	if strings.Contains(got, "select 1") || strings.Contains(got, "select 2") {
 		t.Fatalf("a step ran although its schema-qualified check held:\n%s", got)
+	}
+}
+
+// TestApplierHoldsAMigrationWhileACutoverHoldsTheDDLLock: a reshard or
+// upgrade cutover writes a DDL lock per database when it fences, so that
+// the schema cannot move under a copy comparing the two sides. The locks
+// were written and never read, so the migration ran anyway.
+func TestApplierHoldsAMigrationWhileACutoverHoldsTheDDLLock(t *testing.T) {
+	f := newApplierFixture(t)
+	f.store.dbs = []string{"app", "other"}
+	locked := f.queue(catalog.DDLMigration{Statement: "create table t (id int)", Kind: "CREATE TABLE", Scope: "all", Database: "app"})
+	free := f.queue(catalog.DDLMigration{Statement: "create table u (id int)", Kind: "CREATE TABLE", Scope: "all", Database: "other"})
+	f.store.ddlLocks = map[string]string{"app": "11111111-1111-1111-1111-111111111111"}
+
+	f.run(t)
+	if m := f.store.get(t, locked); m.State != catalog.MigrationQueued {
+		t.Fatalf("a migration on a database a cutover has locked ran anyway: %s", m.State)
+	}
+	if m := f.store.get(t, free); m.State == catalog.MigrationQueued {
+		t.Fatal("a migration on an unlocked database must not be held")
+	}
+
+	// Once the cutover releases the lock it proceeds.
+	f.store.mu.Lock()
+	f.store.ddlLocks = nil
+	f.store.mu.Unlock()
+	f.run(t)
+	if m := f.store.get(t, locked); m.State == catalog.MigrationQueued {
+		t.Fatalf("the migration stayed held after the lock was released: %s", m.State)
 	}
 }
