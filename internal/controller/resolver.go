@@ -5,10 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/andrew01234567890/pgshard/internal/metrics"
@@ -21,9 +24,10 @@ const GIDPrefix = "pgshard-"
 // router only escalates transactions of routable databases.
 const decisionShardSet = "default"
 
-// DefaultPreparingTimeout is how long a decision row may stay preparing
-// before the resolver decides abort for it: the router that owned it is
-// presumed dead.
+// DefaultPreparingTimeout is how long a preparing decision row may go
+// without a coordinator heartbeat before the resolver decides abort for
+// it: the router that owned it is presumed dead. Live coordinators beat
+// far more often than this, so only a dead one ages out.
 const DefaultPreparingTimeout = 10 * time.Second
 
 // ShardConn is a connection to one shard's primary with the privileges to
@@ -79,7 +83,16 @@ type decision struct {
 	GID          string
 	State        string
 	Participants []int32
-	CreatedAt    time.Time
+	// LastAlive is the later of the row's creation and its coordinator's
+	// last heartbeat.
+	LastAlive time.Time
+}
+
+// holder is one place a prepared transaction sits: a shard's primary and
+// the database it was prepared in.
+type holder struct {
+	Shard    ShardRef
+	Database string
 }
 
 // Resolve runs one pass; shardSet "" means every shard set.
@@ -89,7 +102,7 @@ func (r *Resolver) Resolve(ctx context.Context, shardSet string) (Outcome, error
 		logger = slog.Default()
 	}
 	var out Outcome
-	rows, err := r.Pool.Query(ctx, `SELECT gid, state, participants, created_at FROM pgshard.xact_decisions ORDER BY created_at`)
+	rows, err := r.Pool.Query(ctx, `SELECT gid, state, participants, greatest(created_at, heartbeat_at) FROM pgshard.xact_decisions ORDER BY created_at`)
 	if err != nil {
 		return out, fmt.Errorf("resolver: decisions: %w", err)
 	}
@@ -97,26 +110,72 @@ func (r *Resolver) Resolve(ctx context.Context, shardSet string) (Outcome, error
 	if err != nil {
 		return out, fmt.Errorf("resolver: decisions: %w", err)
 	}
-	for _, d := range decisions {
-		if shardSet != "" && shardSet != decisionShardSet {
-			break
-		}
-		if err := r.resolveDecision(ctx, d, &out); err != nil {
-			out.Unresolved++
-			logger.Warn("resolver: transaction left in doubt", "gid", d.GID, "state", d.State, "err", err)
-		}
-	}
 	shards, err := r.listShards(ctx, shardSet)
 	if err != nil {
 		return out, err
 	}
-	for _, sh := range shards {
-		if err := r.sweepOrphans(ctx, sh, &out); err != nil {
+	holders, scanErrs := r.scanPrepared(ctx, shards)
+	// A decision may only be deleted once every shard of the whole current
+	// topology was searched: a participant can sit on a group its shard id
+	// no longer maps to after a reshard.
+	complete := shardSet == "" && len(scanErrs) == 0
+	for _, d := range decisions {
+		if err := r.resolveDecision(ctx, d, holders, complete, &out); err != nil {
 			out.Unresolved++
-			logger.Warn("resolver: orphan sweep failed", "shard", fmt.Sprintf("%s/%d", sh.Set, sh.ID), "err", err)
+			logger.Warn("resolver: transaction left in doubt", "gid", d.GID, "state", d.State, "err", err)
 		}
 	}
+	for sh, err := range scanErrs {
+		out.Unresolved++
+		logger.Warn("resolver: prepared-transaction scan failed", "shard", fmt.Sprintf("%s/%d", sh.Set, sh.ID), "err", err)
+	}
+	if err := r.sweepOrphans(ctx, holders, &out); err != nil {
+		out.Unresolved++
+		logger.Warn("resolver: orphan sweep failed", "err", err)
+	}
 	return out, nil
+}
+
+// scanPrepared searches every shard's pg_prepared_xacts for
+// router-coordinated gids and returns where each is held, with the scan
+// errors per unreachable shard.
+func (r *Resolver) scanPrepared(ctx context.Context, shards []ShardRef) (map[string][]holder, map[ShardRef]error) {
+	holders := map[string][]holder{}
+	scanErrs := map[ShardRef]error{}
+	for _, sh := range shards {
+		gids, err := r.listPrepared(ctx, sh)
+		if err != nil {
+			scanErrs[sh] = err
+			continue
+		}
+		for gid, db := range gids {
+			holders[gid] = append(holders[gid], holder{Shard: sh, Database: db})
+		}
+	}
+	return holders, scanErrs
+}
+
+// listPrepared reads sh's pg_prepared_xacts: gid to database. The view is
+// cluster-wide, so one connection sees every database's entries.
+func (r *Resolver) listPrepared(ctx context.Context, sh ShardRef) (map[string]string, error) {
+	conn, err := r.Shards.Dial(ctx, sh.Set, sh.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	rows, err := conn.Query(ctx, `SELECT gid, database FROM pg_prepared_xacts WHERE gid LIKE $1 ORDER BY prepared`, GIDPrefix+"%")
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for rows.Next() {
+		var gid, db string
+		if err := rows.Scan(&gid, &db); err != nil {
+			return nil, err
+		}
+		out[gid] = db
+	}
+	return out, rows.Err()
 }
 
 func (r *Resolver) now() time.Time {
@@ -136,14 +195,20 @@ func (r *Resolver) preparingTimeout() time.Duration {
 // resolveDecision finishes one decision row. A preparing row older than the
 // timeout belongs to a dead router that never decided: abort is safe
 // because commit was never recorded. Commit rows are committed on every
-// participant that still holds the prepared transaction; abort rows are
-// rolled back; finished rows are deleted.
-func (r *Resolver) resolveDecision(ctx context.Context, d decision, out *Outcome) error {
+// shard that holds the prepared transaction — searched across the whole
+// topology, never trusted to the recorded participant list, which a
+// reshard can leave pointing at groups that no longer hold it. The row is
+// deleted only once every shard was searched and none still holds the gid.
+func (r *Resolver) resolveDecision(ctx context.Context, d decision, holders map[string][]holder, complete bool, out *Outcome) error {
 	if d.State == "preparing" {
-		if r.now().Sub(d.CreatedAt) < r.preparingTimeout() {
+		if r.now().Sub(d.LastAlive) < r.preparingTimeout() {
 			return nil
 		}
-		tag, err := r.Pool.Exec(ctx, `UPDATE pgshard.xact_decisions SET state = 'abort', decided_at = now() WHERE gid = $1 AND state = 'preparing'`, d.GID)
+		// The staleness check re-runs inside the UPDATE against the same
+		// cutoff: a coordinator heartbeat landing after the scan snapshot
+		// makes it match zero rows instead of aborting a live transaction.
+		cutoff := r.now().Add(-r.preparingTimeout())
+		tag, err := r.Pool.Exec(ctx, `UPDATE pgshard.xact_decisions SET state = 'abort', decided_at = now() WHERE gid = $1 AND state = 'preparing' AND greatest(created_at, heartbeat_at) <= $2`, d.GID, cutoff)
 		if err != nil {
 			return err
 		}
@@ -154,18 +219,23 @@ func (r *Resolver) resolveDecision(ctx context.Context, d decision, out *Outcome
 				}
 				return err
 			}
+			if d.State == "preparing" {
+				return nil
+			}
 		} else {
 			d.State = "abort"
 		}
 	}
-	verb := "ROLLBACK PREPARED"
-	if d.State == "commit" {
-		verb = "COMMIT PREPARED"
-	}
-	for _, id := range d.Participants {
-		if err := r.finishOn(ctx, ShardRef{Set: decisionShardSet, ID: id}, verb, d.GID); err != nil {
+	for len(holders[d.GID]) > 0 {
+		h := holders[d.GID][0]
+		if err := r.finishOn(ctx, h, d.State == "commit", d.GID); err != nil {
 			return err
 		}
+		holders[d.GID] = holders[d.GID][1:]
+	}
+	delete(holders, d.GID)
+	if !complete {
+		return errors.New("not every shard could be searched for the prepared transaction: keeping the decision")
 	}
 	if _, err := r.Pool.Exec(ctx, `DELETE FROM pgshard.xact_decisions WHERE gid = $1 AND state = $2`, d.GID, d.State); err != nil {
 		return err
@@ -178,45 +248,41 @@ func (r *Resolver) resolveDecision(ctx context.Context, d decision, out *Outcome
 	return nil
 }
 
-// finishOn runs verb on gid at sh when the shard still holds it prepared.
-func (r *Resolver) finishOn(ctx context.Context, sh ShardRef, verb, gid string) error {
-	conn, err := r.Shards.Dial(ctx, sh.Set, sh.ID)
+// finishOn commits or rolls back gid where h holds it. PostgreSQL only
+// finishes a prepared transaction from the database it was prepared in, so
+// the connection targets h's database, not the DSN's default one.
+func (r *Resolver) finishOn(ctx context.Context, h holder, commit bool, gid string) error {
+	var conn ShardConn
+	var err error
+	if d, ok := r.Shards.(ShardDBDialer); ok {
+		conn, err = d.DialDatabase(ctx, h.Shard.Set, h.Shard.ID, h.Database)
+	} else {
+		conn, err = r.Shards.Dial(ctx, h.Shard.Set, h.Shard.ID)
+	}
 	if err != nil {
 		return err
 	}
 	defer func() { _ = conn.Close(ctx) }()
-	rows, err := conn.Query(ctx, `SELECT 1 FROM pg_prepared_xacts WHERE gid = $1`, gid)
-	if err != nil {
-		return err
-	}
-	held, err := pgx.CollectRows(rows, pgx.RowTo[int])
-	if err != nil {
-		return err
-	}
-	if len(held) == 0 {
-		return nil
+	verb := "ROLLBACK PREPARED"
+	if commit {
+		verb = "COMMIT PREPARED"
 	}
 	_, err = conn.Exec(ctx, verb+" "+quoteLiteral(gid))
 	return err
 }
 
-// sweepOrphans rolls back router-coordinated prepared transactions on sh
-// that no decision row claims, and finishes those whose row was decided
-// meanwhile. A gid whose row says commit is never rolled back.
-func (r *Resolver) sweepOrphans(ctx context.Context, sh ShardRef, out *Outcome) error {
-	conn, err := r.Shards.Dial(ctx, sh.Set, sh.ID)
-	if err != nil {
-		return err
+// sweepOrphans finishes the remaining prepared transactions no decision
+// pass handled: by the decision row's state when one exists (checked at
+// sweep time, so a commit-decided gid is never rolled back), rolled back
+// when no row claims the gid — the coordinator writes the row before any
+// participant prepares, so a rowless prepared transaction is an orphan.
+func (r *Resolver) sweepOrphans(ctx context.Context, holders map[string][]holder, out *Outcome) error {
+	gids := make([]string, 0, len(holders))
+	for gid := range holders {
+		gids = append(gids, gid)
 	}
-	defer func() { _ = conn.Close(ctx) }()
-	rows, err := conn.Query(ctx, `SELECT gid FROM pg_prepared_xacts WHERE gid LIKE $1 ORDER BY prepared`, GIDPrefix+"%")
-	if err != nil {
-		return err
-	}
-	gids, err := pgx.CollectRows(rows, pgx.RowTo[string])
-	if err != nil {
-		return err
-	}
+	slices.Sort(gids)
+	var errs []error
 	for _, gid := range gids {
 		var state string
 		err := r.Pool.QueryRow(ctx, `SELECT state FROM pgshard.xact_decisions WHERE gid = $1`, gid).Scan(&state)
@@ -224,22 +290,43 @@ func (r *Resolver) sweepOrphans(ctx context.Context, sh ShardRef, out *Outcome) 
 		case errors.Is(err, pgx.ErrNoRows):
 			state = "abort"
 		case err != nil:
-			return err
+			errs = append(errs, fmt.Errorf("%s: %w", gid, err))
+			continue
 		}
-		switch state {
-		case "commit":
-			if _, err := conn.Exec(ctx, "COMMIT PREPARED "+quoteLiteral(gid)); err != nil {
-				return err
+		if state == "preparing" {
+			continue
+		}
+		for _, h := range holders[gid] {
+			err := r.finishOn(ctx, h, state == "commit", gid)
+			switch {
+			// The live coordinator can finish gid and delete its row between
+			// the scan snapshot and this sweep: a gone prepared transaction
+			// is already resolved, not a failure of this pass.
+			case isGonePreparedXact(err):
+				continue
+			case err != nil:
+				errs = append(errs, fmt.Errorf("%s on %s/%d: %w", gid, h.Shard.Set, h.Shard.ID, err))
+				continue
 			}
-			out.Committed++
-		case "abort":
-			if _, err := conn.Exec(ctx, "ROLLBACK PREPARED "+quoteLiteral(gid)); err != nil {
-				return err
+			if state == "commit" {
+				out.Committed++
+			} else {
+				out.RolledBack++
 			}
-			out.RolledBack++
 		}
 	}
-	return nil
+	return errors.Join(errs...)
+}
+
+func isGonePreparedXact(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UndefinedObject {
+		return true
+	}
+	return strings.Contains(err.Error(), "does not exist")
 }
 
 func (r *Resolver) listShards(ctx context.Context, shardSet string) ([]ShardRef, error) {

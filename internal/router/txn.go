@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 
@@ -455,6 +456,9 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 		e.finishTxn("ROLLBACK")
 		return pgwire.Errorf(codeConnectionFailure, "two-phase commit: writing the decision log failed, transaction rolled back: %v", err)
 	}
+	hbCtx, stopHeartbeat := context.WithCancel(ctx)
+	defer stopHeartbeat()
+	go heartbeatUntilDecided(hbCtx, log, gid)
 	crashpoint.Hit("before_prepare")
 	e.each(writers, func(p *txnPart) error {
 		err := e.runOn(ctx, p, "PREPARE TRANSACTION "+quoteLiteral(gid), discardWriter{})
@@ -513,6 +517,28 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 	}
 	e.finishTxn("COMMIT")
 	return w.CommandComplete("COMMIT")
+}
+
+// decisionHeartbeatInterval is how often a coordinator marks its
+// preparing decision row alive; the resolver's preparing timeout spans
+// several missed beats. A variable so tests can shrink it.
+var decisionHeartbeatInterval = 2 * time.Second
+
+// heartbeatUntilDecided keeps the preparing row's heartbeat fresh while
+// the coordinator is between the decision-log write and the decision, so
+// the resolver never mistakes a slow live coordinator for a dead one. A
+// beat after the decision is a no-op: the row is no longer preparing.
+func heartbeatUntilDecided(ctx context.Context, log DecisionLog, gid string) {
+	t := time.NewTicker(decisionHeartbeatInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		_ = log.Heartbeat(ctx, gid)
+	}
 }
 
 // finishTxn marks the multi-shard transaction over on the current stream.
