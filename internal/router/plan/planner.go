@@ -1266,11 +1266,13 @@ func (w *walker) referenceWrite(otherRels int) error {
 	// An unqualified name is only the built-in while pg_catalog is searched
 	// first, which it is by default. A session that puts its own schema
 	// ahead of it can shadow any of them, so the proof no longer holds.
-	for _, schema := range w.sess.SearchPath {
-		if strings.EqualFold(schema, "pg_catalog") {
-			break
+	// pg_catalog is searched first unless the session explicitly puts it
+	// later, and only then can another schema shadow a built-in name.
+	for i, schema := range w.sess.SearchPath {
+		if !strings.EqualFold(schema, "pg_catalog") || i == 0 {
+			continue
 		}
-		return notYet("a write to reference table \""+w.target.name+"\" cannot run with "+schema+" searched before pg_catalog: an unqualified function name could resolve to that schema on one shard",
+		return notYet("a write to reference table \""+w.target.name+"\" cannot run with "+w.sess.SearchPath[0]+" searched before pg_catalog: an unqualified function name could resolve to that schema instead of the built-in",
 			"reset search_path, or qualify the reference write's functions with pg_catalog")
 	}
 	if fn := nonImmutableCall(w.root); fn != "" {
