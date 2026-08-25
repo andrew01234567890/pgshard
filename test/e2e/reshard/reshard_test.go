@@ -241,6 +241,13 @@ func catalogSQL(ctx context.Context, t *testing.T, c *e2e.Cluster, sql string) s
 
 func waitFor(ctx context.Context, t *testing.T, c *e2e.Cluster, what string, timeout time.Duration, cond func() bool) {
 	t.Helper()
+	waitForWhy(ctx, t, c, what, timeout, nil, cond)
+}
+
+// waitForWhy is waitFor with a why that a caller which has been swallowing
+// retryable errors can use to say what kept failing.
+func waitForWhy(ctx context.Context, t *testing.T, c *e2e.Cluster, what string, timeout time.Duration, why func() string, cond func() bool) {
+	t.Helper()
 	started := time.Now()
 	deadline := started.Add(timeout)
 	nextProgress := started.Add(time.Minute)
@@ -249,7 +256,11 @@ func waitFor(ctx context.Context, t *testing.T, c *e2e.Cluster, what string, tim
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out after %s waiting for %s%s", timeout, what, c.Summary(ctx))
+			detail := ""
+			if why != nil {
+				detail = why()
+			}
+			t.Fatalf("timed out after %s waiting for %s%s%s", timeout, what, detail, c.Summary(ctx))
 		}
 		if time.Now().After(nextProgress) {
 			t.Logf("still waiting for %s (%s elapsed)", what, time.Since(started).Round(time.Second))
