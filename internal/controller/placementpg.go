@@ -215,6 +215,8 @@ func (p *Placer) shadowDDL(ctx context.Context, wf *placementWorkflow) ([]string
 	}
 	var out []string
 	var defs []string
+	type ownedSeq struct{ seq, col string }
+	var owned []ownedSeq
 	for _, c := range cols {
 		d := QuoteIdent(c.name) + " " + c.typ
 		if c.notNull {
@@ -229,6 +231,7 @@ func (p *Placer) shadowDDL(ctx context.Context, wf *placementWorkflow) ([]string
 			if c.def != "" {
 				for _, m := range nextvalRE.FindAllStringSubmatch(c.def, -1) {
 					out = append(out, "CREATE SEQUENCE IF NOT EXISTS "+m[1])
+					owned = append(owned, ownedSeq{m[1], c.name})
 				}
 				d += " DEFAULT " + c.def
 			}
@@ -236,6 +239,12 @@ func (p *Placer) shadowDDL(ctx context.Context, wf *placementWorkflow) ([]string
 		defs = append(defs, d)
 	}
 	out = append(out, fmt.Sprintf("CREATE TABLE %s (%s)", wf.shape.qualified(wf.shadow()), strings.Join(defs, ", ")))
+	// Tie each freshly created serial sequence to its column so it is dropped
+	// with the table and, crucially, is discoverable by pg_get_serial_sequence
+	// when the sequence is advanced past the copied rows at swap time.
+	for _, o := range owned {
+		out = append(out, fmt.Sprintf("ALTER SEQUENCE %s OWNED BY %s.%s", o.seq, wf.shape.qualified(wf.shadow()), QuoteIdent(o.col)))
+	}
 	rows, err := conn.Query(ctx, `SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint
 		WHERE conrelid = $1::regclass AND contype IN ('p', 'u', 'c') ORDER BY contype, conname`, wf.shape.qualified(wf.spec.TableName))
 	if err != nil {
@@ -866,8 +875,18 @@ func advanceSequences(ctx context.Context, conn ShardConn, schema, table string)
 		return err
 	}
 	for _, c := range cols {
+		// Ascending sequences advance to the max copied value, descending to
+		// the min; GREATEST/LEAST with last_value never moves a shared
+		// sequence the wrong way. An empty shard advances nothing (the WHERE
+		// yields no row), so a fresh sequence keeps its start value.
 		if _, err := conn.Exec(ctx, fmt.Sprintf(
-			`SELECT setval(%s::regclass, GREATEST(coalesce((SELECT max(%s) FROM %s), 0), (SELECT last_value FROM %s)), true)`,
+			`SELECT setval(%[1]s::regclass,
+				CASE WHEN sq.seqincrement > 0
+					THEN GREATEST(x.v, (SELECT last_value FROM %[4]s))
+					ELSE LEAST(x.v, (SELECT last_value FROM %[4]s)) END, true)
+			FROM pg_sequence sq,
+				LATERAL (SELECT CASE WHEN sq.seqincrement > 0 THEN max(%[2]s) ELSE min(%[2]s) END AS v FROM %[3]s) x
+			WHERE sq.seqrelid = %[1]s::regclass AND x.v IS NOT NULL`,
 			QuoteLiteral(&c.Seq), QuoteIdent(c.Col), qual, c.Seq)); err != nil {
 			return err
 		}
