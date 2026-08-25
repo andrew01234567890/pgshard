@@ -92,6 +92,17 @@ type Prober interface {
 	// the sequence positions over and drops the subscription so the new
 	// primary owns the catalog.
 	CutoverCatalog(ctx context.Context, srcDSN, tgtDSN string) error
+	// RollbackCatalog reverses a cutover: it fences the new catalog,
+	// replays what it accepted back into the old group over the reverse
+	// subscription armed at cutover, carries the sequences back and lets
+	// the old group serve again.
+	RollbackCatalog(ctx context.Context, oldDSN, newDSN string) error
+	// DropCatalogRollback removes the reverse slot and publication from the
+	// serving catalog once the rollback window has closed.
+	DropCatalogRollback(ctx context.Context, dsn string) error
+	// DisableCatalogRollback stops the reverse subscription on the old
+	// group so an abandoned rollback stops applying and frees the slot.
+	DisableCatalogRollback(ctx context.Context, dsn string) error
 	// ReleaseCatalog undoes the cutover fence for a rollback.
 	ReleaseCatalog(ctx context.Context, dsn string) error
 }
@@ -480,6 +491,11 @@ func quoteLiteral(s string) string {
 // reconnect) must fail the call and requeue, never block a reconcile forever.
 const proberCallTimeout = 15 * time.Second
 
+// catalogCallTimeout covers a cutover or rollback, which fences a catalog
+// and then waits for a drain. The generic deadline would cancel it well
+// inside catalogFenceTimeout and leave the catalog fenced between tries.
+const catalogCallTimeout = catalogFenceTimeout + 30*time.Second
+
 // boundedProber caps each call on the wrapped Prober at Timeout.
 type boundedProber struct {
 	Inner   Prober
@@ -487,9 +503,14 @@ type boundedProber struct {
 }
 
 func (b boundedProber) bound(ctx context.Context) (context.Context, context.CancelFunc) {
-	d := b.Timeout
-	if d <= 0 {
-		d = proberCallTimeout
+	return b.boundBy(ctx, proberCallTimeout)
+}
+
+// boundBy applies a per-call deadline, honouring an explicit Timeout when
+// one is configured.
+func (b boundedProber) boundBy(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if b.Timeout > 0 {
+		d = b.Timeout
 	}
 	return context.WithTimeout(ctx, d)
 }
@@ -573,9 +594,27 @@ func (b boundedProber) CatalogCopyCaughtUp(ctx context.Context, srcDSN string) (
 }
 
 func (b boundedProber) CutoverCatalog(ctx context.Context, srcDSN, tgtDSN string) error {
-	ctx, cancel := b.bound(ctx)
+	ctx, cancel := b.boundBy(ctx, catalogCallTimeout)
 	defer cancel()
 	return b.Inner.CutoverCatalog(ctx, srcDSN, tgtDSN)
+}
+
+func (b boundedProber) RollbackCatalog(ctx context.Context, oldDSN, newDSN string) error {
+	ctx, cancel := b.boundBy(ctx, catalogCallTimeout)
+	defer cancel()
+	return b.Inner.RollbackCatalog(ctx, oldDSN, newDSN)
+}
+
+func (b boundedProber) DropCatalogRollback(ctx context.Context, dsn string) error {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.DropCatalogRollback(ctx, dsn)
+}
+
+func (b boundedProber) DisableCatalogRollback(ctx context.Context, dsn string) error {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.DisableCatalogRollback(ctx, dsn)
 }
 
 func (b boundedProber) ReleaseCatalog(ctx context.Context, dsn string) error {

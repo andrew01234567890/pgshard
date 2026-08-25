@@ -305,6 +305,11 @@ type ClusterCatalogUpgradeStatus struct {
 	// annotation.
 	// +optional
 	RollbackRequested bool `json:"rollbackRequested,omitempty"`
+	// RollbackStarted records that a rollback has already fenced the
+	// catalog that is serving. Abandoning it then has to put that fence
+	// back, or the cluster stays read-only.
+	// +optional
+	RollbackStarted bool `json:"rollbackStarted,omitempty"`
 }
 
 // ClusterReshardStatus points at the reshard in flight.

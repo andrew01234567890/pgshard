@@ -307,6 +307,16 @@ func (Renderer) CatalogEndpointService(c *pgshardv1alpha1.PgShardCluster, active
 	return service(c, active, CatalogServiceRW(c.Name), sel, false)
 }
 
+// CatalogGenerationService renders a Service that selects one catalog
+// generation's primary regardless of which generation is active. Only
+// generation 1 needs it - later generations already have an unambiguous
+// -rw Service of their own - and only while an upgrade is in flight.
+func (Renderer) CatalogGenerationService(c *pgshardv1alpha1.PgShardCluster, g Group) *corev1.Service {
+	sel := g.Labels()
+	sel[LabelRole] = RolePrimary
+	return service(c, g, CatalogGenerationServiceRW(c.Name, g.Generation), sel, false)
+}
+
 // PDBs renders the primary PDB and, when the group is large enough, the replica PDB.
 func (Renderer) PDBs(c *pgshardv1alpha1.PgShardCluster, g Group) []*policyv1.PodDisruptionBudget {
 	primary := g.Labels()
