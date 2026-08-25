@@ -167,10 +167,17 @@ func (s *Supervisor) RunTracked(cmd *exec.Cmd) ([]byte, error) {
 	var out strings.Builder
 	cmd.Stdout = &out
 	cmd.Stderr = &out
+	// Start and track under the lock so the reaper, which snapshots the
+	// tracked set under the same lock, can never observe this child as an
+	// untracked orphan between Start and Track and reap it out from under
+	// cmd.Wait() (which would then fail with ECHILD).
+	s.mu.Lock()
 	if err := cmd.Start(); err != nil {
+		s.mu.Unlock()
 		return nil, err
 	}
-	s.Track(cmd.Process.Pid)
+	s.tracked[cmd.Process.Pid] = struct{}{}
+	s.mu.Unlock()
 	err := cmd.Wait()
 	s.Untrack(cmd.Process.Pid)
 	if err != nil {

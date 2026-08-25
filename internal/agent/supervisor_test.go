@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -122,4 +123,20 @@ func contains(xs []int, x int) bool {
 		}
 	}
 	return false
+}
+
+// TestRunTrackedSurvivesConcurrentReaper spawns many fast-exiting tracked
+// children while the reaper runs, so a child that exits in the window between
+// Start and Track would be reaped out from under cmd.Wait() (ECHILD) unless
+// Start and Track are atomic under the supervisor lock.
+func TestRunTrackedSurvivesConcurrentReaper(t *testing.T) {
+	sup := fakePostgres(t, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sup.ReapOrphans(ctx)
+	for i := 0; i < 300; i++ {
+		if _, err := sup.RunTracked(exec.CommandContext(ctx, "/bin/true")); err != nil {
+			t.Fatalf("iteration %d: the reaper stole the tracked child: %v", i, err)
+		}
+	}
 }
