@@ -320,10 +320,25 @@ func TestConvergeRepromotesPendingPrimary(t *testing.T) {
 	if got := fa.promotes[before]; !strings.HasPrefix(got, agentAddr(podIP(1, 0))+":") || !strings.HasSuffix(got, ":pp-shard-0-0") {
 		t.Fatalf("re-promotion must target the designated primary: %s", got)
 	}
-	// Once the agent reports the setup complete, converge stops re-promoting.
-	fa.set(podIP(1, 0), AgentStatus{Running: true, Primary: true, Epoch: 1}, nil)
+	// A still-pending primary is not re-promoted again within the rate limit
+	// (each attempt bumps the epoch and rewrites the fence)...
+	fa.set(podIP(1, 0), AgentStatus{Running: true, Primary: true, Epoch: 1, PromotionPending: true}, nil)
 	reconcile(t, r, c)
 	if len(fa.promotes) != before+1 {
+		t.Fatalf("re-promotion must be rate-limited: %v", fa.promotes[before:])
+	}
+	// ...but is once the interval has passed.
+	base := time.Now()
+	r.Now = func() time.Time { return base.Add(repromoteInterval + time.Second) }
+	reconcile(t, r, c)
+	if len(fa.promotes) != before+2 {
+		t.Fatalf("expected a second re-promotion after the interval: %v", fa.promotes[before:])
+	}
+	// Once the agent reports the setup complete, converge stops re-promoting.
+	r.Now = func() time.Time { return base.Add(2*repromoteInterval + time.Second) }
+	fa.set(podIP(1, 0), AgentStatus{Running: true, Primary: true, Epoch: 2}, nil)
+	reconcile(t, r, c)
+	if len(fa.promotes) != before+2 {
 		t.Fatalf("converge must not keep re-promoting a completed primary: %v", fa.promotes[before:])
 	}
 }

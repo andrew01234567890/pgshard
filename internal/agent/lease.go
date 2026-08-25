@@ -67,11 +67,31 @@ func NewLeaseWithClient(client coordclient.LeaseInterface, cfg *Config, log *slo
 // or already ours. Updates are conditional on resourceVersion so two agents
 // cannot both succeed.
 func (l *Lease) Acquire(ctx context.Context) error {
+	// A conflicting update is retried once from a fresh read: our own hold
+	// loop or the operator's fence write may have bumped the resourceVersion
+	// under us while we still own the lease. Only a lease whose holder is
+	// genuinely someone else is reported as ErrLeaseHeld.
+	for attempt := 0; ; attempt++ {
+		err := l.acquireOnce(ctx)
+		if err == nil || !errors.Is(err, errLeaseConflict) || attempt >= 1 {
+			if errors.Is(err, errLeaseConflict) {
+				return fmt.Errorf("lease update conflicted twice: %w", err)
+			}
+			return err
+		}
+	}
+}
+
+// errLeaseConflict marks an optimistic-concurrency failure whose holder was
+// still ours (or unknown); it is transient, unlike ErrLeaseHeld.
+var errLeaseConflict = errors.New("lease update conflict")
+
+func (l *Lease) acquireOnce(ctx context.Context) error {
 	cur, err := l.client.Get(ctx, l.name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		_, err = l.client.Create(ctx, l.spec(nil), metav1.CreateOptions{})
 		if apierrors.IsAlreadyExists(err) {
-			return ErrLeaseHeld
+			return errLeaseConflict
 		}
 		return err
 	}
@@ -83,7 +103,7 @@ func (l *Lease) Acquire(ctx context.Context) error {
 	}
 	_, err = l.client.Update(ctx, l.spec(cur), metav1.UpdateOptions{})
 	if apierrors.IsConflict(err) {
-		return ErrLeaseHeld
+		return errLeaseConflict
 	}
 	return err
 }

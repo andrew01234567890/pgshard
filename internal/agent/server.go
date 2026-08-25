@@ -104,7 +104,12 @@ func (s *Server) Promote(ctx context.Context, req *pgshardv1.PromoteRequest) (*p
 	resp.Epoch = req.GetEpoch()
 	ctx, cancel := context.WithTimeout(ctx, s.opTimeout)
 	defer cancel()
-	if s.lease != nil {
+	// Acquire the lease only when no hold is renewing it yet: a re-promote of
+	// a node that is already primary (to finish a failed post-promotion
+	// setup) must not race its own hold loop with a second writer, or a
+	// spurious update conflict could read as a lost lease and self-fence a
+	// healthy primary.
+	if s.lease != nil && s.holdStop == nil {
 		if err := s.lease.Acquire(ctx); err != nil {
 			resp.Error = pgErr(fmt.Errorf("acquire lease: %w", err))
 			return resp, nil
