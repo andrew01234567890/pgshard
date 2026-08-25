@@ -888,6 +888,7 @@ func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 		{`CREATE TABLE colgrant (id bigint PRIMARY KEY, v text); GRANT SELECT (v) ON colgrant TO reader`, "colgrant", "column privileges on v"},
 		{`CREATE TABLE ruled (id bigint PRIMARY KEY); CREATE RULE r1 AS ON DELETE TO ruled DO INSTEAD NOTHING`, "ruled", "rule r1"},
 		{`CREATE TABLE base (id bigint PRIMARY KEY); CREATE TABLE inh (x int) INHERITS (base)`, "inh", "inheritance/partition membership"},
+		{`CREATE TABLE ri (id bigint PRIMARY KEY); ALTER TABLE ri REPLICA IDENTITY FULL`, "ri", "replica identity FULL"},
 	} {
 		mustExec(t, home, c.ddl)
 		got, err := unsupportedTableFeatures(ctx, pgxShardConn{home}, "public", c.table)

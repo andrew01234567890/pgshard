@@ -40,14 +40,29 @@ func (p *Placer) describe(ctx context.Context, wf *placementWorkflow) error {
 	// neither CREATE TABLE LIKE nor the remote DDL carries row-level security
 	// policies, triggers or foreign keys, and the swap would silently drop
 	// them (and leave inbound foreign keys bound to the retired table's OID).
-	// Refuse rather than lose enforcement.
-	unsupported, err := unsupportedTableFeatures(ctx, conn, wf.spec.SchemaName, wf.spec.TableName)
-	if err != nil {
-		return err
-	}
-	if len(unsupported) > 0 {
-		return fatal("table %s has features a placement move cannot yet preserve (%s); drop them before moving or keep the table where it is",
-			wf.spec.table(), strings.Join(unsupported, ", "))
+	// Refuse rather than lose enforcement. Every source is checked, not just
+	// the first: DDL is meant to be identical across shards, but a feature
+	// present on any one of them would still be lost there.
+	for _, src := range sources {
+		sconn := conn
+		if src != sources[0] {
+			c2, derr := p.Shards.DialDatabase(ctx, wf.st.SourceSet, src, wf.spec.Database)
+			if derr != nil {
+				return derr
+			}
+			sconn = c2
+		}
+		unsupported, uerr := unsupportedTableFeatures(ctx, sconn, wf.spec.SchemaName, wf.spec.TableName)
+		if src != sources[0] {
+			_ = sconn.Close(ctx)
+		}
+		if uerr != nil {
+			return uerr
+		}
+		if len(unsupported) > 0 {
+			return fatal("table %s on %s/%d has features a placement move cannot yet preserve (%s); drop them before moving or keep the table where it is",
+				wf.spec.table(), wf.st.SourceSet, src, strings.Join(unsupported, ", "))
+		}
 	}
 	comment, err := tableComment(ctx, conn, wf.spec.SchemaName, wf.spec.TableName)
 	if err != nil {
@@ -187,15 +202,19 @@ func uniqueConstraintsMissingKey(ctx context.Context, conn ShardConn, schema, na
 // after), the owner and table/column privileges (an outage for application
 // roles, or a privilege leak), user triggers, foreign keys in either direction
 // (inbound ones would keep pointing at the retired table's OID), rewrite
-// rules, inheritance/partition membership, and user publications (downstream
-// subscribers would silently stop receiving).
+// rules, inheritance/partition membership, user publications (downstream
+// subscribers would silently stop receiving), and a non-default replica
+// identity (the shadow is created with DEFAULT, so downstream logical
+// replication of UPDATE/DELETE would break after the move).
 func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name string) ([]string, error) {
 	rows, err := conn.Query(ctx, `WITH t AS (
-			SELECT c.oid, c.relowner, c.relacl, c.relrowsecurity, c.relforcerowsecurity
+			SELECT c.oid, c.relowner, c.relacl, c.relrowsecurity, c.relforcerowsecurity, c.relreplident
 			FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 			WHERE n.nspname = $1 AND c.relname = $2)
 		SELECT f FROM (
 			SELECT 'row-level security policy ' || polname AS f FROM pg_policy, t WHERE polrelid = t.oid
+			UNION ALL SELECT 'replica identity ' || CASE t.relreplident WHEN 'f' THEN 'FULL' WHEN 'i' THEN 'USING INDEX' ELSE 'NOTHING' END
+				FROM t WHERE t.relreplident <> 'd'
 			UNION ALL SELECT 'row-level security enabled' FROM t WHERE t.relrowsecurity OR t.relforcerowsecurity
 			UNION ALL SELECT 'owner ' || pg_get_userbyid(t.relowner) FROM t
 				WHERE t.relowner <> (SELECT oid FROM pg_roles WHERE rolname = current_user)
