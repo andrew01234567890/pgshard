@@ -32,9 +32,12 @@ type session struct {
 	exec            Executor
 	cancelKey       CancelKey
 
-	mu          sync.Mutex
-	active      bool
-	draining    bool
+	mu       sync.Mutex
+	active   bool
+	draining bool
+	// revoked latches a revocation so a session still authenticating cannot
+	// finish startup and begin serving.
+	revoked     bool
 	closed      bool
 	queryCancel context.CancelFunc
 	// inTxn mirrors the executor's transaction status for drain decisions;
@@ -105,21 +108,34 @@ func (s *session) forceClose() {
 // away, which is the first thing anyone losing access would try.
 func (s *session) revoke() {
 	s.mu.Lock()
-	s.draining = true
+	if s.revoked || s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.revoked, s.draining = true, true
 	if s.queryCancel != nil {
 		s.queryCancel()
 	}
-	closed := s.closed
 	s.mu.Unlock()
-	if closed {
-		return
-	}
 	er := toErrorResponse(Errorf(CodeAdminShutdown, "terminating connection because the role may no longer log in"))
 	er.Severity, er.SeverityUnlocalized = "FATAL", "FATAL"
 	if buf, err := er.Encode(nil); err == nil {
 		_, _ = s.conn.Write(buf)
 	}
-	s.close()
+	// Close the connection only. The executor belongs to the session's own
+	// goroutine and is not safe to touch from here; closing the socket
+	// unblocks that goroutine, and its deferred close releases the executor
+	// once it has unwound.
+	_ = s.conn.Close()
+}
+
+// revokedNow reports whether a revocation landed on this session, so a
+// startup that was in flight hands its executor straight back instead of
+// serving a role that may no longer log in.
+func (s *session) revokedNow() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.revoked
 }
 
 // drain asks the session to end: idle sessions are terminated immediately,
@@ -368,6 +384,14 @@ func (s *session) startup(ctx context.Context) error {
 	if db == "" {
 		db = user
 	}
+	// Publish the claimed role before authenticating. SCRAM reads the
+	// cached verifier up front, so a revocation that lands while the
+	// exchange is still in flight would otherwise skip this session - its
+	// role is not known yet - and it would go on to serve on a verifier
+	// that has since been withdrawn.
+	s.mu.Lock()
+	s.info.User = user
+	s.mu.Unlock()
 	result, err := s.server.cfg.Authenticator.Authenticate(ctx, pkt.params, authExchange{s})
 	if err != nil {
 		var pe *Error
@@ -386,14 +410,26 @@ func (s *session) startup(ctx context.Context) error {
 	s.mu.Lock()
 	s.info = info
 	s.mu.Unlock()
+	if s.revokedNow() {
+		return errors.New("session revoked during authentication")
+	}
 	exec, err := s.server.cfg.NewExecutor(info)
 	if err != nil {
 		s.terminate(err)
 		return err
 	}
 	s.mu.Lock()
-	s.exec = exec
+	revoked := s.revoked
+	if !revoked {
+		s.exec = exec
+	}
 	s.mu.Unlock()
+	if revoked {
+		// The revocation pass ran between the check above and here; hand
+		// the executor back rather than leaking it, and end the session.
+		exec.Release()
+		return errors.New("session revoked during authentication")
+	}
 	key, err := s.server.newCancelKey(s.id, s.protocolVersion)
 	if err != nil {
 		return err
@@ -550,7 +586,14 @@ func (s *session) dispatch(ctx context.Context, msg pgproto3.FrontendMessage) (b
 		return true, s.be.Flush()
 	case *pgproto3.Sync:
 		s.skipToSync = false
-		if err := s.exec.Sync(ctx); err != nil {
+		// Sync is where an extended-protocol batch actually runs, so it
+		// needs the cancellable context the other steps use; otherwise a
+		// cancel or a revocation waits for the statement rather than
+		// stopping it.
+		qctx, cancel := s.queryContext(ctx)
+		err := s.exec.Sync(qctx)
+		cancel()
+		if err != nil {
 			s.reportError(err)
 		}
 		return true, s.readyForQuery()
