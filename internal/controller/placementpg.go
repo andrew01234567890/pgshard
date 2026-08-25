@@ -86,7 +86,7 @@ func (p *Placer) describe(ctx context.Context, wf *placementWorkflow) error {
 		}
 	}
 	wf.st.Columns, wf.st.Identity, wf.st.PK = nil, nil, pk
-	for _, c := range cols {
+	for _, c := range copiedColumns(cols) {
 		wf.st.Columns = append(wf.st.Columns, c.name)
 		wf.st.Identity = append(wf.st.Identity, c.identity)
 	}
@@ -122,12 +122,21 @@ type tableColumn struct {
 	name, typ, def string
 	notNull        bool
 	identity       string
+	// generated is attgenerated: "s" stored, "v" virtual, "" for a plain column.
+	generated string
+	// collate is the qualified collation name when it differs from the
+	// type's default, "" otherwise.
+	collate string
 }
 
 func tableColumns(ctx context.Context, conn ShardConn, schema, name string) ([]tableColumn, error) {
-	rows, err := conn.Query(ctx, `SELECT a.attname, format_type(a.atttypid, a.atttypmod), coalesce(pg_get_expr(d.adbin, d.adrelid), ''), a.attnotnull, a.attidentity::text
+	rows, err := conn.Query(ctx, `SELECT a.attname, format_type(a.atttypid, a.atttypmod), coalesce(pg_get_expr(d.adbin, d.adrelid), ''), a.attnotnull, a.attidentity::text, a.attgenerated::text,
+		CASE WHEN a.attcollation <> 0 AND a.attcollation <> ty.typcollation THEN format('%I.%I', cn.nspname, co.collname) ELSE '' END
 		FROM pg_attribute a
 		JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+		JOIN pg_type ty ON ty.oid = a.atttypid
+		LEFT JOIN pg_collation co ON co.oid = a.attcollation
+		LEFT JOIN pg_namespace cn ON cn.oid = co.collnamespace
 		LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
 		WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped
 		ORDER BY a.attnum`, schema, name)
@@ -138,7 +147,7 @@ func tableColumns(ctx context.Context, conn ShardConn, schema, name string) ([]t
 	var out []tableColumn
 	for rows.Next() {
 		var c tableColumn
-		if err := rows.Scan(&c.name, &c.typ, &c.def, &c.notNull, &c.identity); err != nil {
+		if err := rows.Scan(&c.name, &c.typ, &c.def, &c.notNull, &c.identity, &c.generated, &c.collate); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -470,8 +479,24 @@ func (p *Placer) shadowDDL(ctx context.Context, wf *placementWorkflow) ([]string
 	var owned []ownedSeq
 	for _, c := range cols {
 		d := QuoteIdent(c.name) + " " + c.typ
+		if c.collate != "" {
+			d += " COLLATE " + c.collate
+		}
 		if c.notNull {
 			d += " NOT NULL"
+		}
+		if c.generated != "" {
+			// A generated column carries its expression in pg_attrdef like a
+			// default; render it as the generated column it is, never as a
+			// DEFAULT the copy would then try to insert into.
+			d += " GENERATED ALWAYS AS (" + c.def + ")"
+			if c.generated == "v" {
+				d += " VIRTUAL"
+			} else {
+				d += " STORED"
+			}
+			defs = append(defs, d)
+			continue
 		}
 		switch c.identity {
 		case "a", "d":
@@ -611,6 +636,7 @@ func (p *Placer) copySource(ctx context.Context, wf *placementWorkflow, s int32)
 		return err
 	}
 	typeOf := map[string]string{}
+	cols = copiedColumns(cols)
 	var selectCols []string
 	for _, c := range cols {
 		typeOf[c.name] = c.typ
@@ -680,6 +706,19 @@ func keysetBounds(last *Tuple, pkIdx []int, columns []string, typeOf map[string]
 		bounds = append(bounds, quoteLiteralE(last.Values[i])+"::"+typeOf[columns[i]])
 	}
 	return bounds
+}
+
+// copiedColumns drops generated columns: they are computed on the target
+// from the copied columns, are never inserted, and pgoutput omits them from
+// the relation message by default.
+func copiedColumns(cols []tableColumn) []tableColumn {
+	out := make([]tableColumn, 0, len(cols))
+	for _, c := range cols {
+		if c.generated == "" {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 func colNames(cols []tableColumn) []string {

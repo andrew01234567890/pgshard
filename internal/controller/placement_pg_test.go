@@ -674,6 +674,8 @@ func TestPlacementIdentityColumnsOnPostgres(t *testing.T) {
 		tag bigint GENERATED ALWAYS AS IDENTITY (INCREMENT BY 10),
 		ser bigserial,
 		note text,
+		twice bigint GENERATED ALWAYS AS (tenant * 2) STORED,
+		code text COLLATE "C",
 		PRIMARY KEY (tenant, seq))`)
 	mustExec(t, home, `INSERT INTO things (tenant, note) SELECT g, 'n' || g FROM generate_series(1, 60) g`)
 	const thingsComment = `path C:\x and an ' apostrophe`
@@ -717,6 +719,20 @@ func TestPlacementIdentityColumnsOnPostgres(t *testing.T) {
 	}
 	if total != 60 {
 		t.Fatalf("things across shards: %d", total)
+	}
+	for id := range int32(2) {
+		// The generated column is a real generated column on every shard and
+		// was recomputed from the copied rows, not inserted.
+		gen := queryOne[string](t, f.app(id), `SELECT attgenerated::text FROM pg_attribute WHERE attrelid = 'public.things'::regclass AND attname = 'twice'`)
+		if gen != "s" {
+			t.Errorf("shard %d: twice attgenerated = %q, want stored", id, gen)
+		}
+		if bad := queryOne[int64](t, f.app(id), `SELECT count(*) FROM things WHERE twice <> tenant * 2`); bad != 0 {
+			t.Errorf("shard %d: %d rows with a wrong generated value", id, bad)
+		}
+		if coll := queryOne[string](t, f.app(id), `SELECT co.collname FROM pg_attribute a JOIN pg_collation co ON co.oid = a.attcollation WHERE a.attrelid = 'public.things'::regclass AND a.attname = 'code'`); coll != "C" {
+			t.Errorf("shard %d: code collation = %q, want C (remote shadow dropped COLLATE)", id, coll)
+		}
 	}
 	for id := range int32(2) {
 		inc := queryOne[int64](t, f.app(id), `SELECT seqincrement FROM pg_sequence WHERE seqrelid = pg_get_serial_sequence('public.things', 'tag')::regclass`)
