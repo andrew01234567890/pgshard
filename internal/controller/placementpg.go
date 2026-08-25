@@ -396,7 +396,9 @@ func (p *Placer) shadowDDL(ctx context.Context, wf *placementWorkflow) ([]string
 				if oerr != nil {
 					return nil, oerr
 				}
-				d += " (" + opts + ")"
+				if opts != "" {
+					d += " (" + opts + ")"
+				}
 			}
 		default:
 			if c.def != "" {
@@ -405,7 +407,11 @@ func (p *Placer) shadowDDL(ctx context.Context, wf *placementWorkflow) ([]string
 					if oerr != nil {
 						return nil, oerr
 					}
-					out = append(out, "CREATE SEQUENCE IF NOT EXISTS "+m[1]+" "+opts)
+					stmt := "CREATE SEQUENCE IF NOT EXISTS " + m[1]
+					if opts != "" {
+						stmt += " " + opts
+					}
+					out = append(out, stmt)
 					owned = append(owned, ownedSeq{m[1], c.name})
 				}
 				d += " DEFAULT " + c.def
