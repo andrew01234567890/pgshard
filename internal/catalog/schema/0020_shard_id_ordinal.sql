@@ -32,7 +32,8 @@ BEGIN
       INTO bad
       FROM pgshard.workflows w
      CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(w.spec->'ranges') = 'array' THEN w.spec->'ranges' ELSE '[]'::jsonb END) WITH ORDINALITY AS r(value, ordinality)
-     WHERE w.state IN ('provisioning', 'running', 'paused')
+     WHERE (w.state IN ('provisioning', 'running')
+            OR (w.state = 'paused' AND coalesce(w.status->>'paused_from', 'pending') <> 'pending'))
        AND ((r.value->>'shard_id') IS NULL OR (r.value->>'shard_id')::int <> r.ordinality - 1);
     IF bad IS NOT NULL THEN
         RAISE EXCEPTION 'workflows still in flight hold mis-numbered shard ranges: %', bad
@@ -96,7 +97,7 @@ $$;
 -- after the cutover flips the set to 'serving', because the workflow holds the
 -- reverse subscription open for the whole rollback and retirement window. So
 -- the freeze follows workflow ownership rather than the set's own state.
--- Inserts stay open because that is how a set is first materialized, and an
+--
 -- Dropping a whole set stays open, because a cancelled reshard clears the
 -- shard_sets row and every one of its ranges in the same transaction; both
 -- halves are required, so clearing only the row is not a way in. Inserts are
@@ -137,11 +138,19 @@ BEGIN
                 OR spec->>'source_set' = target
                 -- A workflow created before the source was recorded in the spec
                 -- resolves it on its first cutover pass and keeps it here.
-                OR status->'cutover'->>'source_set' = target)
+                OR status->'cutover'->>'source_set' = target
+                -- Before either is recorded, the workflow copies from whichever
+                -- set is serving, which is what it will resolve the source to.
+                OR (spec->>'source_set' IS NULL
+                    AND status->'cutover'->>'source_set' IS NULL
+                    AND target = (SELECT shard_set FROM pgshard.shard_sets
+                                   WHERE state = 'serving' ORDER BY generation DESC LIMIT 1)))
            AND (state IN ('provisioning', 'running')
                 -- A workflow paused out of 'pending' never started, so pausing
                 -- one must not be a way to freeze a set that was editable.
-                OR (state = 'paused' AND status->>'paused_from' IS DISTINCT FROM 'pending'))
+                -- ResumeWorkflow restores a paused workflow to paused_from, or
+                -- to pending when the marker is missing, so both are inert.
+                OR (state = 'paused' AND coalesce(status->>'paused_from', 'pending') <> 'pending'))
          LIMIT 1;
         IF owner IS NOT NULL THEN
             RAISE EXCEPTION 'shard_set % has its ranges owned by workflow %', target, owner

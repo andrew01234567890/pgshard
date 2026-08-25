@@ -48,8 +48,10 @@ Dropping a whole set stays allowed — that is how a cancelled reshard clears it
 target — but only as a whole: removing the set's row while keeping its ranges is
 refused.
 
-A workflow that is still `pending` owns nothing, so a set with only a pending
-workflow against it stays editable.
+A workflow that never started owns nothing, so a set with only such a workflow
+against it stays editable. That covers one still `pending`, and one paused
+before it started — pausing records the state to resume into, and a workflow
+that would resume to `pending` has not begun.
 
 - **Re-key a table**: change `placement` or `shard_key` in
   `pgshard.tables` for a table that already has an effective placement.
