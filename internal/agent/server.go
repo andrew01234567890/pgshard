@@ -87,7 +87,12 @@ func (s *Server) Status(ctx context.Context, _ *pgshardv1.StatusRequest) (*pgsha
 	return resp, nil
 }
 
-// Promote fences, acquires the lease, promotes and starts renewing.
+// Promote fences, acquires the lease, starts renewing, then promotes. The
+// renewal loop starts immediately after the lease is acquired, before the
+// fallible promote steps, so a failure after pg_ctl promote can never leave a
+// writable primary whose lease is not being renewed (which would let a second
+// member be promoted after it expires — split brain). Instance.Promote is
+// idempotent, so the operator can retry to finish the post-promotion setup.
 func (s *Server) Promote(ctx context.Context, req *pgshardv1.PromoteRequest) (*pgshardv1.PromoteResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -105,11 +110,14 @@ func (s *Server) Promote(ctx context.Context, req *pgshardv1.PromoteRequest) (*p
 			return resp, nil
 		}
 	}
+	// Renew from here on: if a promote step below fails after pg_ctl promote,
+	// the database is already writable and the hold keeps the lease alive so
+	// no other member is promoted while the operator retries.
+	s.startHold()
 	if err := s.inst.Promote(ctx); err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
-	s.startHold()
 	go s.inst.ensureStanzaLoop(s.bgCtx, stanzaRetry)
 	st, _ := s.Status(ctx, nil)
 	resp.Timeline = st.GetTimeline()

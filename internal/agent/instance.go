@@ -237,20 +237,22 @@ func (in *Instance) waitReady(ctx context.Context) error {
 // stop, runs pg_ctl promote, and checkpoints. The epoch must already have
 // been accepted.
 func (in *Instance) Promote(ctx context.Context) error {
-	if !in.IsStandby() {
-		return errors.New("not a standby")
-	}
-	if err := in.waitWALReceiverStopped(ctx); err != nil {
-		return err
-	}
-	if _, err := in.sup.RunTracked(in.sup.Command(ctx, "pg_ctl", "promote", "-w", "-D", in.cfg.PGData)); err != nil {
-		return err
-	}
-	for in.IsStandby() {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("standby.signal still present: %w", ctx.Err())
-		case <-time.After(200 * time.Millisecond):
+	// Idempotent: on a retry after a mid-promotion failure the node is
+	// already a primary, so skip the promote itself and re-run only the
+	// post-promotion setup, which is safe to repeat.
+	if in.IsStandby() {
+		if err := in.waitWALReceiverStopped(ctx); err != nil {
+			return err
+		}
+		if _, err := in.sup.RunTracked(in.sup.Command(ctx, "pg_ctl", "promote", "-w", "-D", in.cfg.PGData)); err != nil {
+			return err
+		}
+		for in.IsStandby() {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("standby.signal still present: %w", ctx.Err())
+			case <-time.After(200 * time.Millisecond):
+			}
 		}
 	}
 	if err := WriteConfig(in.cfg, false); err != nil {
