@@ -77,9 +77,10 @@ func RangeFilter(hashExpr string, r placement.Range) string {
 
 // PublishedTable is one table of a publication with its optional row filter.
 type PublishedTable struct {
-	Schema string
-	Name   string
-	Filter string
+	Schema      string
+	Name        string
+	Filter      string
+	Partitioned bool
 }
 
 // QualifiedName renders the quoted schema.table name.
@@ -105,7 +106,17 @@ func CreatePublicationSQL(name string, tables []PublishedTable) string {
 			}
 		}
 	}
-	b.WriteString(" WITH (publish = 'insert, update, delete')")
+	opts := "publish = 'insert, update, delete'"
+	for _, t := range tables {
+		if t.Partitioned {
+			// A partitioned table's row filter is defined on the root, so
+			// changes and the initial copy must replicate via the root for
+			// the shard-key filter to apply; without this its rows are lost.
+			opts += ", publish_via_partition_root = true"
+			break
+		}
+	}
+	b.WriteString(" WITH (" + opts + ")")
 	return b.String()
 }
 
