@@ -198,15 +198,21 @@ func catalogSQL(ctx context.Context, t *testing.T, c *e2e.Cluster, sql string) s
 	return out
 }
 
-func waitFor(ctx context.Context, t *testing.T, what string, timeout time.Duration, cond func() bool) {
+func waitFor(ctx context.Context, t *testing.T, c *e2e.Cluster, what string, timeout time.Duration, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	started := time.Now()
+	deadline := started.Add(timeout)
+	nextProgress := started.Add(time.Minute)
 	for {
 		if cond() {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
+			t.Fatalf("timed out after %s waiting for %s%s", timeout, what, c.Summary(ctx))
+		}
+		if time.Now().After(nextProgress) {
+			t.Logf("still waiting for %s (%s elapsed)", what, time.Since(started).Round(time.Second))
+			nextProgress = time.Now().Add(time.Minute)
 		}
 		select {
 		case <-ctx.Done():
@@ -382,7 +388,7 @@ func bringUpCluster(ctx context.Context, t *testing.T, c *e2e.Cluster, retire st
 	if err := c.WaitPodsReady(ctx, testNamespace, "app="+clusterName+"-controller", 3*time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(ctx, t, "serving shard set stamped major 18", 3*time.Minute, func() bool {
+	waitFor(ctx, t, c, "serving shard set stamped major 18", 3*time.Minute, func() bool {
 		return catalogSQL(ctx, t, c, "SELECT coalesce(max(pg_major), 0) FROM pgshard.shard_sets WHERE state = 'serving'") == "18"
 	})
 }

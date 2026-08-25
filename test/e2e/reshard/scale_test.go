@@ -137,14 +137,14 @@ func reshardTo(ctx context.Context, t *testing.T, c *e2e.Cluster, major string, 
 		t.Fatal(err)
 	}
 	set := fmt.Sprintf("g%d", generation)
-	waitFor(ctx, t, fmt.Sprintf("reshard to %d shards switched", shards), 35*time.Minute, func() bool {
+	waitFor(ctx, t, c, fmt.Sprintf("reshard to %d shards switched", shards), 35*time.Minute, func() bool {
 		st := catalogSQL(ctx, t, c, "SELECT coalesce(string_agg(state || ':' || (status->>'stage'), ','), '') FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = '"+set+"'")
 		if strings.HasPrefix(st, "failed") {
 			t.Fatalf("reshard to %s failed: %s", set, catalogSQL(ctx, t, c, "SELECT coalesce(error, '') || ' ' || status::text FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = '"+set+"'"))
 		}
 		return catalogSQL(ctx, t, c, "SELECT string_agg(shard_set, ',') FROM pgshard.serving") == set
 	})
-	waitFor(ctx, t, fmt.Sprintf("reshard to %d shards completed", shards), 25*time.Minute, func() bool {
+	waitFor(ctx, t, c, fmt.Sprintf("reshard to %d shards completed", shards), 25*time.Minute, func() bool {
 		st := catalogSQL(ctx, t, c, "SELECT coalesce(string_agg(state || ':' || (status->>'stage'), ','), '') FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = '"+set+"'")
 		return strings.HasPrefix(st, "completed:") &&
 			jsonpath(ctx, c, "pgshardcluster", clusterName, "{.status.effectiveShards}") == fmt.Sprint(shards)
@@ -203,12 +203,12 @@ func TestReshard1To2To4To2UnderLoad(t *testing.T) {
 	if err := c.WaitPodsReady(ctx, testNamespace, "app="+clusterName+"-controller", 3*time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(ctx, t, "serving shard set materialized", 2*time.Minute, func() bool {
+	waitFor(ctx, t, c, "serving shard set materialized", 2*time.Minute, func() bool {
 		return jsonpath(ctx, c, "pgshardcluster", clusterName, "{.status.effectiveShards}") == "1"
 	})
 
 	l := startScaleLedger(ctx, c)
-	waitFor(ctx, t, "first acknowledged ledger writes", 3*time.Minute, func() bool {
+	waitFor(ctx, t, c, "first acknowledged ledger writes", 3*time.Minute, func() bool {
 		for i := range ledgerTenants {
 			if l.acked[i].Load() < 10 {
 				return false
