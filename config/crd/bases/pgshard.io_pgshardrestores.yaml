@@ -119,7 +119,12 @@ spec:
                     properties:
                       minSyncStandbys:
                         default: 1
-                        minimum: 0
+                        description: |-
+                          MinSyncStandbys is the number of synchronous standby acknowledgements
+                          every commit requires (ANY n). It must be at least 1: asynchronous
+                          durability (0) is not supported, because automatic failover could then
+                          promote a standby that never acknowledged a committed write and lose it.
+                        minimum: 1
                         type: integer
                       synchronousCommit:
                         default: "on"

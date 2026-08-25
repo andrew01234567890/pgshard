@@ -78,7 +78,11 @@ type DurabilitySpec struct {
 	// +kubebuilder:default=on
 	// +optional
 	SynchronousCommit string `json:"synchronousCommit,omitempty"`
-	// +kubebuilder:validation:Minimum=0
+	// MinSyncStandbys is the number of synchronous standby acknowledgements
+	// every commit requires (ANY n). It must be at least 1: asynchronous
+	// durability (0) is not supported, because automatic failover could then
+	// promote a standby that never acknowledged a committed write and lose it.
+	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=1
 	// +optional
 	MinSyncStandbys int `json:"minSyncStandbys,omitempty"`

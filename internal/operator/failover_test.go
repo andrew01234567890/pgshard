@@ -8,6 +8,8 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
 	"k8s.io/utils/ptr"
 )
 
@@ -142,5 +144,24 @@ func TestPrimaryHealthy(t *testing.T) {
 	}
 	if primaryHealthy(pod, false, AgentStatus{}, errors.New("rpc")) {
 		t.Error("not Ready and Status failing is unhealthy")
+	}
+}
+
+func TestRefuseAsyncFailover(t *testing.T) {
+	c := &pgshardv1alpha1.PgShardCluster{}
+	// Automatic failover (no preferred) under async durability is refused.
+	c.Spec.Durability.MinSyncStandbys = 0
+	if err := refuseAsyncFailover(c, ""); !errors.Is(err, errAsyncFailover) || !errors.Is(err, errNoCandidate) {
+		t.Fatalf("async auto-failover must be refused (and wrap errNoCandidate): %v", err)
+	}
+	// A synchronous cluster proceeds.
+	c.Spec.Durability.MinSyncStandbys = 1
+	if err := refuseAsyncFailover(c, ""); err != nil {
+		t.Fatalf("sync auto-failover must proceed: %v", err)
+	}
+	// An operator-initiated switchover is exempt even under async durability.
+	c.Spec.Durability.MinSyncStandbys = 0
+	if err := refuseAsyncFailover(c, "g-1"); err != nil {
+		t.Fatalf("switchover must be exempt: %v", err)
 	}
 }

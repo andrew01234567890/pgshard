@@ -35,7 +35,11 @@ const (
 )
 
 var (
-	errNoCandidate      = errors.New("no eligible failover candidate")
+	errNoCandidate = errors.New("no eligible failover candidate")
+	// errAsyncFailover refuses automatic failover under asynchronous
+	// durability, where no standby was required to acknowledge commits, so
+	// promoting a reachable standby could silently lose acknowledged writes.
+	errAsyncFailover    = fmt.Errorf("%w: minSyncStandbys=0 (asynchronous durability) has no standby guaranteed to hold acknowledged commits; automatic failover is refused to avoid data loss", errNoCandidate)
 	errPrimaryStillLive = errors.New("old primary still reports itself primary")
 	// ErrLeaseHeldByOther is returned when the group Lease is renewed by an
 	// identity that is neither the old primary nor the operator's fence.
@@ -116,6 +120,19 @@ func minSyncStandbys(c *pgshardv1alpha1.PgShardCluster) int {
 		return c.Spec.Durability.MinSyncStandbys
 	}
 	return 1
+}
+
+// refuseAsyncFailover refuses an automatic failover under asynchronous
+// durability (minSyncStandbys=0), where no standby was required to acknowledge
+// commits, so promoting a reachable standby could silently lose acknowledged
+// writes. An operator-initiated switchover (preferred set) is exempt: it waits
+// for the target to catch up before promoting. The CRD forbids
+// minSyncStandbys=0 today, so this is defence in depth.
+func refuseAsyncFailover(c *pgshardv1alpha1.PgShardCluster, preferred string) error {
+	if preferred == "" && c.Spec.Durability.MinSyncStandbys == 0 {
+		return errAsyncFailover
+	}
+	return nil
 }
 
 // nextEpoch is the epoch a promotion must carry: above the group's epoch and
@@ -296,6 +313,9 @@ func (r *ClusterReconciler) patchRole(ctx context.Context, pod *corev1.Pod, role
 func (r *ClusterReconciler) failover(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, state groupState, members map[string]*memberInfo, password, preferred string) (groupState, error) {
 	log := logf.FromContext(ctx).WithValues("group", g.Name(), "oldPrimary", state.primary)
 	old := state.primary
+	if err := refuseAsyncFailover(c, preferred); err != nil {
+		return state, err
+	}
 	// With no standby ever observed streaming there is nothing that can hold
 	// an acknowledged commit; refuse rather than promote an empty clone.
 	if len(state.syncSet) == 0 {
