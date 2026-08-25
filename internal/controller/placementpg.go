@@ -49,12 +49,13 @@ func (p *Placer) describe(ctx context.Context, wf *placementWorkflow) error {
 		if _, err := KeyHashExpr(key, cols[i].typ); err != nil {
 			return fatal("%s: %w", wf.spec.table(), err)
 		}
-		covered, err := keyCoveredByUnique(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, key)
+		uncovered, err := uniqueConstraintsMissingKey(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, key)
 		if err != nil {
 			return err
 		}
-		if !covered {
-			return fatal("shard key %q of table %s must be part of the primary key or a unique constraint", key, wf.spec.table())
+		if len(uncovered) > 0 {
+			return fatal("shard key %q of table %s is absent from unique/exclusion constraint(s) %s; every global uniqueness key must contain the shard key",
+				key, wf.spec.table(), strings.Join(uncovered, ", "))
 		}
 		wf.st.KeyType = cols[i].typ
 	} else if wf.spec.From.Placement == "sharded" {
@@ -107,15 +108,25 @@ func primaryKey(ctx context.Context, conn ShardConn, schema, name string) ([]str
 	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
-func keyCoveredByUnique(ctx context.Context, conn ShardConn, schema, name, key string) (bool, error) {
-	rows, err := conn.Query(ctx, `SELECT EXISTS (SELECT 1 FROM pg_index i
+// uniqueConstraintsMissingKey returns the names of every unique or exclusion
+// index on the table whose column set does not plainly contain the shard key.
+// Such a constraint enforces global uniqueness that cannot hold once rows are
+// split across shards, so sharding must be refused. Expression and partial
+// unique indexes are reported too (fail closed): their global safety cannot be
+// proven from indkey alone.
+func uniqueConstraintsMissingKey(ctx context.Context, conn ShardConn, schema, name, key string) ([]string, error) {
+	rows, err := conn.Query(ctx, `SELECT ix.relname FROM pg_index i
 		JOIN pg_class c ON c.oid = i.indrelid JOIN pg_namespace n ON n.oid = c.relnamespace
-		JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY (i.indkey)
-		WHERE n.nspname = $1 AND c.relname = $2 AND (i.indisprimary OR i.indisunique) AND a.attname = $3)`, schema, name, key)
+		JOIN pg_class ix ON ix.oid = i.indexrelid
+		WHERE n.nspname = $1 AND c.relname = $2 AND (i.indisunique OR i.indisexclusion)
+		AND NOT EXISTS (
+			SELECT 1 FROM pg_attribute a
+			WHERE a.attrelid = c.oid AND a.attname = $3 AND a.attnum = ANY (i.indkey))
+		ORDER BY ix.relname`, schema, name, key)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	return pgx.CollectExactlyOneRow(rows, pgx.RowTo[bool])
+	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
 func tableExists(ctx context.Context, conn ShardConn, schema, name string) (bool, error) {

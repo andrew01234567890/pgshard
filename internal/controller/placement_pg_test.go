@@ -483,12 +483,16 @@ func TestPlacementMovesOnPostgres(t *testing.T) {
 	if res := f.reconcile(); res.WorkflowsCreated != 0 {
 		t.Fatalf("failed change retried: %+v", res)
 	}
+	// A shard key covered by SOME unique constraint but absent from the
+	// primary key must still be refused: PRIMARY KEY(id) cannot stay global
+	// once rows split by v, even though UNIQUE(v) contains the shard key.
+	mustExec(t, home, `CREATE UNIQUE INDEX items_v_uq ON items (v)`)
 	mustExec(t, f.catalog, `UPDATE pgshard.tables SET shard_key = 'v' WHERE table_name = 'items'`)
 	f.reconcile()
 	if _, err := f.placer.Pass(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, state, _, msg := f.workflow("items"); state != StateFailed || !strings.Contains(msg, "must be part of the primary key or a unique constraint") {
+	if _, state, _, msg := f.workflow("items"); state != StateFailed || !strings.Contains(msg, "every global uniqueness key must contain the shard key") {
 		t.Fatalf("uncovered key: %s %q", state, msg)
 	}
 	if n := queryOne[int64](t, f.catalog, `SELECT count(*) FROM pgshard.workflow_locks`); n != 0 {
