@@ -49,12 +49,13 @@ func (p *Placer) describe(ctx context.Context, wf *placementWorkflow) error {
 		if _, err := KeyHashExpr(key, cols[i].typ); err != nil {
 			return fatal("%s: %w", wf.spec.table(), err)
 		}
-		covered, err := keyCoveredByUnique(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, key)
+		uncovered, err := uniqueConstraintsMissingKey(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, key)
 		if err != nil {
 			return err
 		}
-		if !covered {
-			return fatal("shard key %q of table %s must be part of the primary key or a unique constraint", key, wf.spec.table())
+		if len(uncovered) > 0 {
+			return fatal("shard key %q of table %s is absent from unique/exclusion constraint(s) %s; every global uniqueness key must contain the shard key",
+				key, wf.spec.table(), strings.Join(uncovered, ", "))
 		}
 		wf.st.KeyType = cols[i].typ
 	} else if wf.spec.From.Placement == "sharded" {
@@ -107,15 +108,41 @@ func primaryKey(ctx context.Context, conn ShardConn, schema, name string) ([]str
 	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
-func keyCoveredByUnique(ctx context.Context, conn ShardConn, schema, name, key string) (bool, error) {
-	rows, err := conn.Query(ctx, `SELECT EXISTS (SELECT 1 FROM pg_index i
+// uniqueConstraintsMissingKey returns the names of every unique or exclusion
+// index on the table that cannot stay globally enforceable once rows split
+// across shards, so sharding must be refused. A unique index is safe only when
+// the shard key is one of its key columns (ord <= indnkeyatts, never an
+// INCLUDE column) AND that column uses a deterministic collation and the
+// default operator class: index equality must match pgshard's raw-hash
+// distribution equality, or two "equal" values could hash to different shards.
+// Exclusion constraints (including PG18 temporal WITHOUT OVERLAPS keys, whose
+// index is indisexclusion) are refused outright: their targets are not yet
+// recreated on shadow shards and their operators are not verified here.
+// Expression and partial unique indexes are reported too (fail closed).
+func uniqueConstraintsMissingKey(ctx context.Context, conn ShardConn, schema, name, key string) ([]string, error) {
+	rows, err := conn.Query(ctx, `SELECT ix.relname FROM pg_index i
 		JOIN pg_class c ON c.oid = i.indrelid JOIN pg_namespace n ON n.oid = c.relnamespace
-		JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY (i.indkey)
-		WHERE n.nspname = $1 AND c.relname = $2 AND (i.indisprimary OR i.indisunique) AND a.attname = $3)`, schema, name, key)
+		JOIN pg_class ix ON ix.oid = i.indexrelid
+		WHERE n.nspname = $1 AND c.relname = $2 AND (i.indisunique OR i.indisexclusion)
+		AND NOT (
+			NOT i.indisexclusion
+			AND EXISTS (
+				SELECT 1 FROM unnest(i.indkey) WITH ORDINALITY k(attnum, ord)
+				JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
+				WHERE k.ord <= i.indnkeyatts AND a.attname = $3
+				AND NOT EXISTS (
+					SELECT 1 FROM unnest(i.indcollation::oid[]) WITH ORDINALITY ic(coll, cord)
+					JOIN pg_collation cl ON cl.oid = ic.coll
+					WHERE ic.cord = k.ord AND NOT cl.collisdeterministic)
+				AND EXISTS (
+					SELECT 1 FROM unnest(i.indclass::oid[]) WITH ORDINALITY icl(cls, clord)
+					JOIN pg_opclass oc ON oc.oid = icl.cls
+					WHERE icl.clord = k.ord AND oc.opcdefault)))
+		ORDER BY ix.relname`, schema, name, key)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	return pgx.CollectExactlyOneRow(rows, pgx.RowTo[bool])
+	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
 func tableExists(ctx context.Context, conn ShardConn, schema, name string) (bool, error) {

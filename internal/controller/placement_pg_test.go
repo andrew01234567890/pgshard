@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -483,12 +484,16 @@ func TestPlacementMovesOnPostgres(t *testing.T) {
 	if res := f.reconcile(); res.WorkflowsCreated != 0 {
 		t.Fatalf("failed change retried: %+v", res)
 	}
+	// A shard key covered by SOME unique constraint but absent from the
+	// primary key must still be refused: PRIMARY KEY(id) cannot stay global
+	// once rows split by v, even though UNIQUE(v) contains the shard key.
+	mustExec(t, home, `CREATE UNIQUE INDEX items_v_uq ON items (v)`)
 	mustExec(t, f.catalog, `UPDATE pgshard.tables SET shard_key = 'v' WHERE table_name = 'items'`)
 	f.reconcile()
 	if _, err := f.placer.Pass(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, state, _, msg := f.workflow("items"); state != StateFailed || !strings.Contains(msg, "must be part of the primary key or a unique constraint") {
+	if _, state, _, msg := f.workflow("items"); state != StateFailed || !strings.Contains(msg, "every global uniqueness key must contain the shard key") {
 		t.Fatalf("uncovered key: %s %q", state, msg)
 	}
 	if n := queryOne[int64](t, f.catalog, `SELECT count(*) FROM pgshard.workflow_locks`); n != 0 {
@@ -610,4 +615,47 @@ func renameShadowAsSwapWould(t *testing.T, f *placementFixture, wf *placementWor
 	c := f.app(shard)
 	mustExec(t, c, `ALTER TABLE `+wf.spec.TableName+` RENAME TO `+wf.old())
 	mustExec(t, c, `ALTER TABLE `+wf.shadow()+` RENAME TO `+wf.spec.TableName)
+}
+
+// TestUniqueConstraintsMissingKeyOnPostgres exercises the sharding-safety
+// check against every constraint shape that must contain the shard key: a
+// covering unique key is safe, a primary key that omits the key is not, an
+// INCLUDE-only column does not count, and an exclusion constraint is safe only
+// when the shard key is compared with equality.
+func TestUniqueConstraintsMissingKeyOnPostgres(t *testing.T) {
+	dsn := startPostgres(t)
+	conn := connect(t, dsn)
+	ctx := context.Background()
+	for _, stmt := range []string{
+		`CREATE EXTENSION IF NOT EXISTS btree_gist`,
+		`CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false)`,
+		`CREATE TABLE pk_omits (id int PRIMARY KEY, v int UNIQUE)`,
+		`CREATE TABLE pk_covers (id int, v int, PRIMARY KEY (id, v))`,
+		`CREATE TABLE include_only (id int, v int, PRIMARY KEY (id, v), UNIQUE (id) INCLUDE (v))`,
+		`CREATE TABLE nondet (id int, t text COLLATE ci, PRIMARY KEY (t))`,
+		`CREATE TABLE excl_eq (id int, v int, PRIMARY KEY (v), EXCLUDE USING btree (v WITH =))`,
+		`CREATE TABLE temporal (id int, valid int4range, PRIMARY KEY (id, valid WITHOUT OVERLAPS))`,
+	} {
+		mustExec(t, conn, stmt)
+	}
+	cases := []struct {
+		table, key string
+		want       []string
+	}{
+		{"pk_omits", "v", []string{"pk_omits_pkey"}},             // PK(id) cannot stay global
+		{"pk_covers", "v", nil},                                  // v is a PK key column
+		{"include_only", "v", []string{"include_only_id_v_key"}}, // v is only a covering column of the unique index
+		{"nondet", "t", []string{"nondet_pkey"}},                 // nondeterministic collation != raw-hash equality
+		{"excl_eq", "v", []string{"excl_eq_v_excl"}},             // exclusion refused (not recreated on target shadows)
+		{"temporal", "id", []string{"temporal_pkey"}},            // temporal WITHOUT OVERLAPS is an exclusion index
+	}
+	for _, c := range cases {
+		got, err := uniqueConstraintsMissingKey(ctx, pgxShardConn{conn}, "public", c.table, c.key)
+		if err != nil {
+			t.Fatalf("%s/%s: %v", c.table, c.key, err)
+		}
+		if !slices.Equal(got, c.want) {
+			t.Errorf("%s sharded by %s: uncovered = %v, want %v", c.table, c.key, got, c.want)
+		}
+	}
 }
