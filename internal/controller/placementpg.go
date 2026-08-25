@@ -41,6 +41,22 @@ func (p *Placer) describe(ctx context.Context, wf *placementWorkflow) error {
 		return err
 	}
 	wf.st.TableComment = comment
+	// A column defaulting to a sequence in another schema cannot be moved
+	// safely: the target's rebuilt sequence would not be advanced past the
+	// copied rows (it is not owned, so pg_get_serial_sequence cannot find it),
+	// and such a sequence is typically shared, so per-shard copies collide.
+	// Refuse rather than silently reissue identifiers.
+	for _, c := range cols {
+		for _, m := range nextvalRE.FindAllStringSubmatch(c.def, -1) {
+			same, serr := sequenceInSchema(ctx, conn, m[1], wf.spec.SchemaName)
+			if serr != nil {
+				return serr
+			}
+			if !same {
+				return fatal("column %q of table %s defaults to a sequence in another schema (%s); moving such a table is not supported", c.name, wf.spec.table(), m[1])
+			}
+		}
+	}
 	wf.st.Columns, wf.st.Identity, wf.st.PK = nil, nil, pk
 	for _, c := range cols {
 		wf.st.Columns = append(wf.st.Columns, c.name)
@@ -330,6 +346,16 @@ func identitySequence(ctx context.Context, conn ShardConn, schema, table, column
 	return *seq, nil
 }
 
+// sequenceInSchema reports whether the sequence at seqRegclass lives in schema.
+func sequenceInSchema(ctx context.Context, conn ShardConn, seqRegclass, schema string) (bool, error) {
+	rows, err := conn.Query(ctx, `SELECT n.nspname = $2 FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = $1::regclass`, seqRegclass, schema)
+	if err != nil {
+		return false, err
+	}
+	return pgx.CollectExactlyOneRow(rows, pgx.RowTo[bool])
+}
+
 // sequenceOptionsClause renders the non-default options of the sequence at
 // seqRegclass so a recreated sequence keeps the same increment, bounds, cache
 // and cycle behaviour instead of silently falling back to the defaults.
@@ -423,7 +449,17 @@ func (p *Placer) shadowDDL(ctx context.Context, wf *placementWorkflow) ([]string
 	// Tie each freshly created serial sequence to its column so it is dropped
 	// with the table and, crucially, is discoverable by pg_get_serial_sequence
 	// when the sequence is advanced past the copied rows at swap time.
+	// PostgreSQL requires an owned sequence to share the table's schema, so a
+	// column defaulting to a sequence in another schema is left unowned rather
+	// than failing the whole shadow build.
 	for _, o := range owned {
+		sameSchema, oerr := sequenceInSchema(ctx, conn, o.seq, wf.spec.SchemaName)
+		if oerr != nil {
+			return nil, oerr
+		}
+		if !sameSchema {
+			continue
+		}
 		out = append(out, fmt.Sprintf("ALTER SEQUENCE %s OWNED BY %s.%s", o.seq, wf.shape.qualified(wf.shadow()), QuoteIdent(o.col)))
 	}
 	rows, err := conn.Query(ctx, `SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint

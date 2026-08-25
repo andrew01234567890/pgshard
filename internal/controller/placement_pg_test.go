@@ -773,3 +773,61 @@ func TestPlacementRefusesUserArtifactTableOnPostgres(t *testing.T) {
 		t.Fatalf("user table schema changed: %d columns", n)
 	}
 }
+
+// TestSequenceInSchemaOnPostgres guards the shadowDDL fix that skips
+// ALTER SEQUENCE ... OWNED BY for a serial default whose sequence lives in a
+// different schema than the table (PostgreSQL requires them co-schema).
+func TestSequenceInSchemaOnPostgres(t *testing.T) {
+	conn := connect(t, startPostgres(t))
+	ctx := context.Background()
+	for _, stmt := range []string{
+		`CREATE SCHEMA app`,
+		`CREATE SCHEMA s2`,
+		`CREATE SEQUENCE app.local_seq`,
+		`CREATE SEQUENCE s2.shared`,
+	} {
+		mustExec(t, conn, stmt)
+	}
+	local, err := sequenceInSchema(ctx, pgxShardConn{conn}, "app.local_seq", "app")
+	if err != nil || !local {
+		t.Fatalf("same-schema sequence: %v %v", local, err)
+	}
+	cross, err := sequenceInSchema(ctx, pgxShardConn{conn}, "s2.shared", "app")
+	if err != nil || cross {
+		t.Fatalf("cross-schema sequence must not be reported in app: %v %v", cross, err)
+	}
+}
+
+// TestPlacementRefusesCrossSchemaSerialOnPostgres: a table whose column
+// defaults to a sequence in another schema cannot be moved safely (the
+// rebuilt sequence would not be advanced and is typically shared), so the
+// placement is refused at preflight.
+func TestPlacementRefusesCrossSchemaSerialOnPostgres(t *testing.T) {
+	f := newPlacementFixture(t)
+	ctx := context.Background()
+	home := f.app(0)
+	mustExec(t, home, `CREATE SCHEMA s2`)
+	mustExec(t, home, `CREATE SEQUENCE s2.shared`)
+	mustExec(t, home, `CREATE TABLE widgets (id bigint NOT NULL DEFAULT nextval('s2.shared'), tenant bigint NOT NULL, PRIMARY KEY (tenant, id))`)
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('app', 'public', 'widgets', 'unsharded', NULL)`)
+	f.reconcile()
+
+	mustExec(t, f.catalog, `UPDATE pgshard.tables SET placement = 'sharded', shard_key = 'tenant' WHERE table_name = 'widgets'`)
+	f.reconcile()
+	var state, msg string
+	for i := 0; i < 40; i++ {
+		if _, err := f.placer.Pass(ctx); err != nil {
+			t.Fatal(err)
+		}
+		_, state, _, msg = f.workflow("widgets")
+		if state == StateFailed {
+			break
+		}
+		if state == StateCompleted {
+			t.Fatal("cross-schema serial move completed instead of being refused")
+		}
+	}
+	if state != StateFailed || !strings.Contains(msg, "another schema") {
+		t.Fatalf("expected refusal, got %s %q", state, msg)
+	}
+}
