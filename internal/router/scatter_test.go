@@ -12,14 +12,6 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 
-func contains(list []string, s string) bool {
-	for _, x := range list {
-		if x == s {
-			return true
-		}
-	}
-	return false
-}
 
 func int4Rows(vals ...string) script {
 	sc := script{cols: []scriptCol{{name: "v", oid: 23}}}
