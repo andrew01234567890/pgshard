@@ -36,6 +36,34 @@ func (p *Placer) describe(ctx context.Context, wf *placementWorkflow) error {
 	if len(pk) == 0 {
 		return fatal("table %s has no primary key; placement workflows apply rows by primary key", wf.spec.table())
 	}
+	// The shadow table is rebuilt from columns, constraints and indexes only:
+	// neither CREATE TABLE LIKE nor the remote DDL carries row-level security
+	// policies, triggers or foreign keys, and the swap would silently drop
+	// them (and leave inbound foreign keys bound to the retired table's OID).
+	// Refuse rather than lose enforcement. Every source is checked, not just
+	// the first: DDL is meant to be identical across shards, but a feature
+	// present on any one of them would still be lost there.
+	for _, src := range sources {
+		sconn := conn
+		if src != sources[0] {
+			c2, derr := p.Shards.DialDatabase(ctx, wf.st.SourceSet, src, wf.spec.Database)
+			if derr != nil {
+				return derr
+			}
+			sconn = c2
+		}
+		unsupported, uerr := unsupportedTableFeatures(ctx, sconn, wf.spec.SchemaName, wf.spec.TableName)
+		if src != sources[0] {
+			_ = sconn.Close(ctx)
+		}
+		if uerr != nil {
+			return uerr
+		}
+		if len(unsupported) > 0 {
+			return fatal("table %s on %s/%d has features a placement move cannot yet preserve (%s); drop them before moving or keep the table where it is",
+				wf.spec.table(), wf.st.SourceSet, src, strings.Join(unsupported, ", "))
+		}
+	}
 	comment, err := tableComment(ctx, conn, wf.spec.SchemaName, wf.spec.TableName)
 	if err != nil {
 		return err
@@ -161,6 +189,47 @@ func uniqueConstraintsMissingKey(ctx context.Context, conn ShardConn, schema, na
 					JOIN pg_opclass oc ON oc.oid = icl.cls
 					WHERE icl.clord = k.ord AND oc.opcdefault)))
 		ORDER BY ix.relname`, schema, name, key)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
+// unsupportedTableFeatures lists what a placement move cannot yet preserve on
+// the table. The shadow is rebuilt from columns, constraints and indexes, so
+// everything below would be silently lost at the swap: row-level security
+// (an enabled-but-policy-less table denies all today and would allow all
+// after), the owner and table/column privileges (an outage for application
+// roles, or a privilege leak), user triggers, foreign keys in either direction
+// (inbound ones would keep pointing at the retired table's OID), rewrite
+// rules, inheritance/partition membership, user publications (downstream
+// subscribers would silently stop receiving), and a non-default replica
+// identity (the shadow is created with DEFAULT, so downstream logical
+// replication of UPDATE/DELETE would break after the move).
+func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name string) ([]string, error) {
+	rows, err := conn.Query(ctx, `WITH t AS (
+			SELECT c.oid, c.relowner, c.relacl, c.relrowsecurity, c.relforcerowsecurity, c.relreplident
+			FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = $1 AND c.relname = $2)
+		SELECT f FROM (
+			SELECT 'row-level security policy ' || polname AS f FROM pg_policy, t WHERE polrelid = t.oid
+			UNION ALL SELECT 'replica identity ' || CASE t.relreplident WHEN 'f' THEN 'FULL' WHEN 'i' THEN 'USING INDEX' ELSE 'NOTHING' END
+				FROM t WHERE t.relreplident <> 'd'
+			UNION ALL SELECT 'row-level security enabled' FROM t WHERE t.relrowsecurity OR t.relforcerowsecurity
+			UNION ALL SELECT 'owner ' || pg_get_userbyid(t.relowner) FROM t
+				WHERE t.relowner <> (SELECT oid FROM pg_roles WHERE rolname = current_user)
+			UNION ALL SELECT 'table privileges' FROM t WHERE t.relacl IS NOT NULL
+			UNION ALL SELECT 'column privileges on ' || attname FROM pg_attribute, t
+				WHERE attrelid = t.oid AND attnum > 0 AND NOT attisdropped AND attacl IS NOT NULL
+			UNION ALL SELECT 'trigger ' || tgname FROM pg_trigger, t WHERE tgrelid = t.oid AND NOT tgisinternal
+			UNION ALL SELECT 'foreign key ' || conname FROM pg_constraint, t
+				WHERE contype = 'f' AND (conrelid = t.oid OR confrelid = t.oid)
+			UNION ALL SELECT 'rule ' || rulename FROM pg_rewrite, t WHERE ev_class = t.oid AND rulename <> '_RETURN'
+			UNION ALL SELECT 'inheritance/partition membership' FROM pg_inherits, t
+				WHERE inhrelid = t.oid OR inhparent = t.oid
+			UNION ALL SELECT 'publication ' || p.pubname FROM pg_publication_rel pr
+				JOIN pg_publication p ON p.oid = pr.prpubid, t WHERE pr.prrelid = t.oid
+		) x ORDER BY f`, schema, name)
 	if err != nil {
 		return nil, err
 	}
