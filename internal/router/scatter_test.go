@@ -12,7 +12,6 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 
-
 func int4Rows(vals ...string) script {
 	sc := script{cols: []scriptCol{{name: "v", oid: 23}}}
 	for _, v := range vals {
