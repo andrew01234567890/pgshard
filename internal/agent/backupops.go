@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"os/exec"
 	"time"
 
 	"github.com/andrew01234567890/pgshard/internal/agent/backup"
@@ -25,6 +26,13 @@ func (in *Instance) backupRunner() (*backup.Runner, error) {
 	}
 	r := backup.NewRunner(*in.cfg.Backup, in.log)
 	r.Env = []string{"PGPASSFILE=" + in.pgpassPath()}
+	r.Start = func(cmd *exec.Cmd) (func(), error) {
+		if err := in.sup.StartTracked(cmd); err != nil {
+			return nil, err
+		}
+		pid := cmd.Process.Pid
+		return func() { in.sup.Untrack(pid) }, nil
+	}
 	return r, nil
 }
 

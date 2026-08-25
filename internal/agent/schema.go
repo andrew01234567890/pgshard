@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"os/exec"
 	"strings"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
@@ -27,8 +28,11 @@ func (in *Instance) MaterializeSchema(ctx context.Context, source, database stri
 	local := fmt.Sprintf("host=/tmp port=%d user=postgres dbname=%s", in.cfg.Port, database)
 	dump := in.sup.Command(ctx, "pg_dump", schemacopy.DumpArgs(source)...)
 	restore := in.sup.Command(ctx, "psql", schemacopy.RestoreArgs(local)...)
-	return schemacopy.Run(dump, restore, func(pid int) func() {
-		in.sup.Track(pid)
-		return func() { in.sup.Untrack(pid) }
+	return schemacopy.Run(dump, restore, func(cmd *exec.Cmd) (func(), error) {
+		if err := in.sup.StartTracked(cmd); err != nil {
+			return nil, err
+		}
+		pid := cmd.Process.Pid
+		return func() { in.sup.Untrack(pid) }, nil
 	})
 }

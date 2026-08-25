@@ -23,13 +23,18 @@ func RestoreArgs(target string) []string {
 	return []string{"-X", "-q", "-v", "ON_ERROR_STOP=1", "--dbname=" + target}
 }
 
-// Started observes the processes once they run; it lets a supervisor keep
-// their pids out of its reaper. It may be nil.
-type Started func(pid int) (untrack func())
+// StartFunc starts a command and returns a stop function to run after Wait.
+// It lets a supervisor start and reaper-track a child atomically, closing the
+// window in which a child that exits before it is tracked would be reaped out
+// from under Wait. A nil StartFunc starts the command directly.
+type StartFunc func(cmd *exec.Cmd) (stop func(), err error)
 
 // Run pipes dump into restore and waits for both. restore's failure wins
 // because a failing psql makes pg_dump fail on the broken pipe.
-func Run(dump, restore *exec.Cmd, started Started) error {
+func Run(dump, restore *exec.Cmd, start StartFunc) error {
+	if start == nil {
+		start = func(cmd *exec.Cmd) (func(), error) { return func() {}, cmd.Start() }
+	}
 	pipe, err := dump.StdoutPipe()
 	if err != nil {
 		return err
@@ -39,20 +44,18 @@ func Run(dump, restore *exec.Cmd, started Started) error {
 	restore.Stdin = pipe
 	restore.Stdout = &restoreOut
 	restore.Stderr = &restoreOut
-	if err := dump.Start(); err != nil {
+	stopDump, err := start(dump)
+	if err != nil {
 		return err
 	}
-	if started != nil {
-		defer started(dump.Process.Pid)()
-	}
-	if err := restore.Start(); err != nil {
+	defer stopDump()
+	stopRestore, err := start(restore)
+	if err != nil {
 		_ = dump.Process.Kill()
 		_ = dump.Wait()
 		return err
 	}
-	if started != nil {
-		defer started(restore.Process.Pid)()
-	}
+	defer stopRestore()
 	restoreErr := restore.Wait()
 	dumpWaitErr := dump.Wait()
 	switch {
