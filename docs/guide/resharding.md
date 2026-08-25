@@ -35,16 +35,21 @@ under different IDs than it declares; the catalog refuses it at `COMMIT`. The
 checks are deferred, so a split or merge may renumber freely inside the
 transaction as long as the committed state satisfies the rule.
 
-Ranges belong to the workflow once a reshard or upgrade starts. From the moment
-a workflow naming a shard set is created until that workflow completes, fails or
-is cancelled, the catalog refuses to change that set's ranges: the workflow
-snapshots them when it starts and the copier addresses the shards that snapshot
-names, so rewriting them would leave it dialling shards that no longer exist.
-The freeze outlasts the cutover — a set is already `serving` while its workflow
-still holds the reverse subscription open for the rollback window — so a second
-direct-SQL edit is refused until the first reshard finishes or is cancelled.
-Dropping the whole set stays allowed, which is how a cancelled reshard clears
-its target.
+Ranges belong to a reshard or upgrade once it is under way. While such a
+workflow is provisioning, running or paused, the catalog refuses to change the
+ranges of either the set it is building or the set it is copying from: the
+workflow snapshots the target's ranges when it starts, and every cutover pass
+rebuilds the source's shard IDs from live rows, so reshaping either would leave
+the run addressing shards that no longer exist. The freeze outlasts the cutover,
+because a set is already `serving` while its workflow still holds the reverse
+subscription open for the rollback window.
+
+Dropping a whole set stays allowed — that is how a cancelled reshard clears its
+target and how retirement removes the old one — but only as a whole: removing
+the set's row while keeping its ranges is refused.
+
+A workflow that is still `pending` owns nothing, so a set with only a pending
+workflow against it stays editable.
 
 - **Re-key a table**: change `placement` or `shard_key` in
   `pgshard.tables` for a table that already has an effective placement.

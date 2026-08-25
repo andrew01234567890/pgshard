@@ -86,7 +86,7 @@ func reconcileReshards(ctx context.Context, tx pgx.Tx, res *Result) error {
 			if _, ok := wfBySet[ss.Name]; ok {
 				continue
 			}
-			ranges, err := catalog.ListShardRanges(ctx, tx, ss.Name)
+			ranges, err := catalog.LockShardRanges(ctx, tx, ss.Name)
 			if err != nil {
 				return err
 			}

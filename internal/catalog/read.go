@@ -108,6 +108,19 @@ func ListTables(ctx context.Context, q Querier, database string) ([]Table, error
 	return pgx.CollectRows(rows, pgx.RowToStructByPos[Table])
 }
 
+// LockShardRanges returns the ranges of one shard set ordered by key space,
+// holding a share lock on the rows until the transaction ends. A caller that is
+// about to persist a snapshot of these ranges needs this: without it a
+// concurrent edit can commit between the read and the snapshot, and the
+// ownership trigger, which only sees the workflow once it is committed, would
+// let that edit through and freeze the divergence in.
+func LockShardRanges(ctx context.Context, tx pgx.Tx, shardSet string) ([]ShardRange, error) {
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM pgshard.shard_ranges WHERE shard_set = $1 ORDER BY range FOR SHARE`, shardSet); err != nil {
+		return nil, err
+	}
+	return ListShardRanges(ctx, tx, shardSet)
+}
+
 // ListShardRanges returns the ranges of one shard set ordered by key space.
 func ListShardRanges(ctx context.Context, q Querier, shardSet string) ([]ShardRange, error) {
 	rows, err := q.Query(ctx, `

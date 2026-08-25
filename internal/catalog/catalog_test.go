@@ -506,6 +506,15 @@ func runSuite(t *testing.T, img pgImage) {
 				}
 			})
 
+			// Clearing only the shard_sets row would otherwise be a way to
+			// reshape the ranges and put the row back afterwards.
+			t.Run("clearing_only_the_set_row_is_not_an_escape", func(t *testing.T) {
+				refused(t,
+					`DELETE FROM pgshard.shard_sets WHERE shard_set = 'gowned'`,
+					`DELETE FROM pgshard.shard_ranges WHERE shard_set = 'gowned' AND shard_id = 1`,
+					`UPDATE pgshard.shard_ranges SET range = '[,)' WHERE shard_set = 'gowned' AND shard_id = 0`)
+			})
+
 			t.Run("dropping_the_whole_set_is_allowed", func(t *testing.T) {
 				tx, err := conn.Begin(ctx)
 				if err != nil {
@@ -518,6 +527,60 @@ func runSuite(t *testing.T, img pgImage) {
 				if err := tx.Commit(ctx); err != nil {
 					t.Fatalf("cancelling a reshard by dropping its target set was refused: %v", err)
 				}
+			})
+
+			// Editing a serving set directly creates a workflow nothing drives
+			// and nothing can terminate, so treating it as an owner would leave
+			// the set unusable for good.
+			t.Run("a_pending_workflow_owns_nothing", func(t *testing.T) {
+				mustExec(t, conn, `INSERT INTO pgshard.shard_sets (shard_set, generation, state) VALUES ('gpending', 32, 'serving')`)
+				mustExec(t, conn, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES
+					('gpending', 0, '[,0)'), ('gpending', 1, '[0,)')`)
+				mustExec(t, conn, `INSERT INTO pgshard.workflows (id, kind, state, spec) VALUES
+					('44444444-4444-4444-4444-444444444444', 'reshard', 'pending',
+					 '{"shard_set": "gpending", "ranges": [{"shard_id": 0}, {"shard_id": 1}]}'::jsonb)`)
+				t.Cleanup(func() {
+					mustExec(t, conn, `DELETE FROM pgshard.shard_ranges WHERE shard_set = 'gpending'`)
+					mustExec(t, conn, `DELETE FROM pgshard.shard_sets WHERE shard_set = 'gpending'`)
+				})
+				tx, err := conn.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				mustTx(t, tx, `UPDATE pgshard.shard_ranges SET range = '[0,100)' WHERE shard_set = 'gpending' AND shard_id = 1`)
+				mustTx(t, tx, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES ('gpending', 2, '[100,)')`)
+				if err := tx.Commit(ctx); err != nil {
+					t.Fatalf("a set whose only workflow is pending must stay editable: %v", err)
+				}
+			})
+
+			// The cutover rebuilds the source shard IDs and ranges from live
+			// rows on every pass, not from the workflow's snapshot.
+			t.Run("the_source_set_is_owned_too", func(t *testing.T) {
+				mustExec(t, conn, `INSERT INTO pgshard.shard_sets (shard_set, generation, state) VALUES ('gsource', 33, 'serving')`)
+				mustExec(t, conn, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES
+					('gsource', 0, '[,0)'), ('gsource', 1, '[0,)')`)
+				mustExec(t, conn, `INSERT INTO pgshard.workflows (id, kind, state, spec) VALUES
+					('55555555-5555-5555-5555-555555555555', 'reshard', 'running',
+					 '{"shard_set": "gtarget", "source_set": "gsource", "ranges": [{"shard_id": 0}]}'::jsonb)`)
+				t.Cleanup(func() {
+					mustExec(t, conn, `DELETE FROM pgshard.workflows WHERE id = '55555555-5555-5555-5555-555555555555'`)
+					mustExec(t, conn, `DELETE FROM pgshard.shard_ranges WHERE shard_set = 'gsource'`)
+					mustExec(t, conn, `DELETE FROM pgshard.shard_sets WHERE shard_set = 'gsource'`)
+				})
+				tx, err := conn.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				mustTx(t, tx, `UPDATE pgshard.shard_ranges SET range = '[0,100)' WHERE shard_set = 'gsource' AND shard_id = 1`)
+				mustTx(t, tx, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES ('gsource', 2, '[100,)')`)
+				err = tx.Commit(ctx)
+				if err == nil {
+					t.Fatal("the source of a running reshard was reshaped while the cutover still reads it")
+				}
+				expectPgError(t, err, "23514", "owned by workflow")
 			})
 
 			t.Run("a_finished_workflow_releases_the_set", func(t *testing.T) {

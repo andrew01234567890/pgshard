@@ -31,9 +31,8 @@ BEGIN
     SELECT string_agg(format('%s (workflow %s names shard %s at position %s)', w.spec->>'shard_set', w.id, r.value->>'shard_id', r.ordinality - 1), ', ' ORDER BY w.id)
       INTO bad
       FROM pgshard.workflows w
-     CROSS JOIN LATERAL jsonb_array_elements(w.spec->'ranges') WITH ORDINALITY AS r(value, ordinality)
-     WHERE w.state NOT IN ('completed', 'failed', 'cancelled')
-       AND jsonb_typeof(w.spec->'ranges') = 'array'
+     CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(w.spec->'ranges') = 'array' THEN w.spec->'ranges' ELSE '[]'::jsonb END) WITH ORDINALITY AS r(value, ordinality)
+     WHERE w.state IN ('provisioning', 'running', 'paused')
        AND ((r.value->>'shard_id') IS NULL OR (r.value->>'shard_id')::int <> r.ordinality - 1);
     IF bad IS NOT NULL THEN
         RAISE EXCEPTION 'workflows still in flight hold mis-numbered shard ranges: %', bad
@@ -101,7 +100,16 @@ $$;
 -- insert alone cannot reshape a set that already covers the key space -- it can
 -- only overlap, which the exclusion constraint refuses. Dropping the whole set
 -- stays open too: a cancelled reshard and a retirement both clear the
--- shard_sets row in the same transaction.
+-- shard_sets row and every one of its ranges in the same transaction.
+--
+-- The source set is owned as well, because every cutover pass rebuilds the
+-- source shard IDs and ranges from live catalog rows rather than from the
+-- snapshot, so reshaping the source mid-run would fence, drain and verify
+-- against shards the copy never established.
+--
+-- A pending workflow owns nothing: nothing reads its snapshot -- the copier
+-- takes only running workflows -- and nothing drives it to a terminal state, so
+-- treating it as an owner would freeze a set with no way to release it.
 CREATE FUNCTION pgshard.check_shard_ranges_owned() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -114,13 +122,17 @@ BEGIN
         targets := targets || NEW.shard_set;
     END IF;
     FOREACH target IN ARRAY targets LOOP
-        -- Dropping the whole set clears its shard_sets row in the same
-        -- transaction; that is how a cancelled reshard and a retirement remove
-        -- a set the workflow still owns, so let it through.
-        CONTINUE WHEN NOT EXISTS (SELECT 1 FROM pgshard.shard_sets WHERE shard_set = target);
+        -- Dropping the whole set clears its shard_sets row and every one of its
+        -- ranges in the same transaction; that is how a cancelled reshard and a
+        -- retirement remove a set the workflow still owns, so let it through.
+        -- Both halves are required: dropping only the shard_sets row would
+        -- otherwise be a way to reshape the ranges and restore the row after.
+        CONTINUE WHEN NOT EXISTS (SELECT 1 FROM pgshard.shard_sets WHERE shard_set = target)
+                  AND NOT EXISTS (SELECT 1 FROM pgshard.shard_ranges WHERE shard_set = target);
         SELECT id INTO owner FROM pgshard.workflows
-         WHERE spec->>'shard_set' = target
-           AND state NOT IN ('completed', 'failed', 'cancelled')
+         WHERE kind IN ('reshard', 'upgrade')
+           AND (spec->>'shard_set' = target OR spec->>'source_set' = target)
+           AND state IN ('provisioning', 'running', 'paused')
          LIMIT 1;
         IF owner IS NOT NULL THEN
             RAISE EXCEPTION 'shard_set % has its ranges owned by workflow %', target, owner
