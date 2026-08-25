@@ -572,6 +572,15 @@ spec:
                     description: Unfenced is true once the write fence of the new
                       cluster was released.
                     type: boolean
+                  unverifiable:
+                    description: |-
+                      Unverifiable lists "group: gid" pairs decided commit that the group
+                      cannot confirm or deny (its transaction id status is frozen, unrecorded
+                      or in the future); any entry fails the restore exactly like a
+                      contradiction, since the commit's presence cannot be proven.
+                    items:
+                      type: string
+                    type: array
                 required:
                 - committed
                 - decisions

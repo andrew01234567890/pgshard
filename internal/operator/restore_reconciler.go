@@ -410,11 +410,14 @@ func (r *RestoreReconciler) reconcileTwoPhase(ctx context.Context, rs *pgshardv1
 		for _, gid := range out.Contradictions {
 			st.Contradictions = append(st.Contradictions, g.Name()+": "+gid)
 		}
+		for _, gid := range out.Unverifiable {
+			st.Unverifiable = append(st.Unverifiable, g.Name()+": "+gid)
+		}
 	}
 	rs.Status.Reconciliation = st
-	if len(st.Contradictions) > 0 {
+	if blockers := append(append([]string{}, st.Contradictions...), st.Unverifiable...); len(blockers) > 0 {
 		rs.Status.Phase = pgshardv1alpha1.RestorePhaseFailed
-		rs.Status.Error = fmt.Sprintf("two-phase reconciliation found %d contradiction(s), the cluster stays fenced: %s", len(st.Contradictions), strings.Join(st.Contradictions, "; "))
+		rs.Status.Error = fmt.Sprintf("two-phase reconciliation found %d unresolved commit(s), the cluster stays fenced: %s", len(blockers), strings.Join(blockers, "; "))
 		return nil
 	}
 	if err := r.TwoPC.SetWriteFence(ctx, catalogAddr, catalogEpoch, false, ""); err != nil {
