@@ -16,7 +16,6 @@ func TestKeyHashExprMirrorsPlacement(t *testing.T) {
 		{"id", "smallint", `hashint8extended("id"::int8, ` + seed + `)`},
 		{"slug", "text", `hashtextextended("slug"::text, ` + seed + `)`},
 		{"code", "character varying(20)", `hashtextextended("code"::text, ` + seed + `)`},
-		{"code", "character(3)", `hashtextextended("code"::text, ` + seed + `)`},
 		{"ref", "uuid", `uuid_hash_extended("ref", ` + seed + `)`},
 		{`we"ird`, "text", `hashtextextended("we""ird"::text, ` + seed + `)`},
 	}
@@ -29,6 +28,14 @@ func TestKeyHashExprMirrorsPlacement(t *testing.T) {
 	for _, typ := range []string{"numeric", "double precision", "timestamp with time zone", "bytea"} {
 		if _, err := KeyHashExpr("k", typ); err == nil {
 			t.Errorf("%s must be refused", typ)
+		}
+	}
+	// Blank-padded character types compare with trailing spaces ignored and
+	// their ::text cast strips them, so the row filter and the router would
+	// hash different bytes for equal keys.
+	for _, typ := range []string{"character(3)", "character", "bpchar", "char(1)"} {
+		if _, err := KeyHashExpr("k", typ); err == nil || !strings.Contains(err.Error(), "blank-padded") {
+			t.Errorf("%s must be refused as blank-padded: %v", typ, err)
 		}
 	}
 }

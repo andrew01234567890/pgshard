@@ -51,10 +51,17 @@ func KeyHashExpr(col, typ string) (string, error) {
 	switch strings.TrimSpace(base) {
 	case "bigint", "integer", "smallint", "int8", "int4", "int2":
 		return fmt.Sprintf("hashint8extended(%s::int8, %s)", QuoteIdent(col), seed), nil
-	case "text", "character varying", "character", "varchar", "bpchar", "name":
+	case "text", "character varying", "varchar", "name":
 		return fmt.Sprintf("hashtextextended(%s::text, %s)", QuoteIdent(col), seed), nil
 	case "uuid":
 		return fmt.Sprintf("uuid_hash_extended(%s, %s)", QuoteIdent(col), seed), nil
+	case "character", "bpchar", "char":
+		// Blank-padded character equality ignores trailing spaces and the
+		// ::text cast strips them, so the row filter would hash a trimmed
+		// value while the router hashes the client's raw bytes: two "equal"
+		// keys could land on different shards. Refuse until the router can
+		// normalise by column type.
+		return "", fmt.Errorf("shard key %s of type %s is not supported: blank-padded character equality does not match byte-wise hashing; use text or varchar", col, typ)
 	}
 	return "", fmt.Errorf("shard key %s of type %s cannot be hashed by a row filter", col, typ)
 }
