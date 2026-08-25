@@ -229,6 +229,42 @@ func TestSearchPathClassification(t *testing.T) {
 	}
 }
 
+// TestControlPlaneGUCRefused: pgshard's own settings are how the control
+// plane tells a shard that a session is its own - the placement write fence
+// reads one. A client able to set them could exempt itself from a fence
+// that exists to refuse it, so the whole namespace is closed.
+func TestControlPlaneGUCRefused(t *testing.T) {
+	snap := fixture(t)
+	for _, sql := range []string{
+		"set pgshard.maintenance = 'on'",
+		"set local pgshard.maintenance = 'on'",
+		"SET PGSHARD.MAINTENANCE TO 'on'",
+		"select set_config('pgshard.maintenance', 'on', false)",
+		"select pg_catalog.set_config('pgshard.maintenance', 'on', true)",
+		"alter role app set pgshard.maintenance = 'on'",
+		"set pgshard.anything = '1'",
+	} {
+		pl, err := New().Plan(context.Background(), session(snap), sql)
+		if err == nil || pl.Kind != Refuse {
+			t.Fatalf("%s: expected refusal, got %+v %v", sql, pl, err)
+		}
+		var pe *pgwire.Error
+		if !errors.As(err, &pe) || pe.Code != pgwire.CodeInsufficientPrivilege {
+			t.Fatalf("%s: want SQLSTATE %s, got %v", sql, pgwire.CodeInsufficientPrivilege, err)
+		}
+	}
+	// The client-facing pgshard settings stay settable.
+	for _, sql := range []string{
+		"set work_mem = '64MB'",
+		"set pgshard.ddl_async = on",
+		"set pgshard.transaction_mode = 'single'",
+	} {
+		if _, err := New().Plan(context.Background(), session(snap), sql); err != nil {
+			t.Fatalf("%s refused: %v", sql, err)
+		}
+	}
+}
+
 func TestProtectedDurabilityGUCRefused(t *testing.T) {
 	snap := fixture(t)
 	refuse := []string{

@@ -128,7 +128,10 @@ func startPostgresImage(t *testing.T, image string, dockerArgs []string, opts ..
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatal("postgres did not become ready")
+	// A bare timeout says nothing about why; the container's own log
+	// usually does, and it is gone as soon as the cleanup removes it.
+	logs, _ := exec.Command("docker", "logs", "--tail", "20", id).CombinedOutput()
+	t.Fatalf("postgres did not become ready; container log:\n%s", logs)
 	return ""
 }
 
