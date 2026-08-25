@@ -656,30 +656,17 @@ func (e *Executor) dropStream() {
 	client := e.conn.client
 	e.conn.abort()
 	e.conn = nil
-	e.detachAsync(client)
-	e.tx = pgwire.TxIdle
-}
-
-// detachAsync releases the session so the next stream cannot race the one
-// just aborted. abort only cancels this side of the RPC; the pooler may
-// still have the session attached, and it refuses a second Execute stream
-// while it does. Release waits server-side for the old stream to detach,
-// and awaitRelease orders the next openStream behind it.
-func (e *Executor) detachAsync(client pgshardv1.PoolerClient) {
+	// abort only cancels this side of the RPC. The pooler may still have
+	// the session attached, and it refuses a second Execute stream while it
+	// does; Release waits server-side for the old stream to detach, and
+	// awaitRelease orders the next openStream behind it.
 	e.releaseOn(client)
+	e.tx = pgwire.TxIdle
 }
 
 // releaseAsync returns the pinned backend of the current shard without
 // waiting for the pooler; acquire on the same shard waits for it.
-func (e *Executor) releaseAsync() {
-	client, err := e.client()
-	if err != nil {
-		return
-	}
-	e.releaseOn(client)
-}
-
-// releaseOn releases the session on a specific pooler.
+// releaseOn releases the session on the pooler that holds it.
 func (e *Executor) releaseOn(client pgshardv1.PoolerClient) {
 	if client == nil {
 		return
@@ -1368,7 +1355,7 @@ func (e *Executor) poolerLost(cause error) error {
 		client := e.conn.client
 		e.conn.abort()
 		e.conn = nil
-		e.detachAsync(client)
+		e.releaseOn(client)
 	}
 	e.tx = pgwire.TxIdle
 	e.staged, e.stagedMark = nil, 0
