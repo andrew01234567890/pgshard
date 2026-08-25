@@ -157,18 +157,6 @@ func NewRoles(creds map[string]RoleCred) *Roles {
 	return r
 }
 
-// Names lists every role the snapshot carries.
-func (r *Roles) Names() []string {
-	if r == nil {
-		return nil
-	}
-	out := make([]string, 0, len(r.verifiers))
-	for name := range r.verifiers {
-		out = append(out, name)
-	}
-	return out
-}
-
 // Cred returns the credential record of a role with a non-empty verifier.
 func (r *Roles) Cred(rolname string) (RoleCred, bool) {
 	if r == nil {

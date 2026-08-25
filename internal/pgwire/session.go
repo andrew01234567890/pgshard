@@ -32,9 +32,17 @@ type session struct {
 	exec            Executor
 	cancelKey       CancelKey
 
-	mu          sync.Mutex
-	active      bool
-	draining    bool
+	mu       sync.Mutex
+	active   bool
+	draining bool
+	// revoked latches a revocation so a session still authenticating cannot
+	// finish startup and begin serving.
+	revoked bool
+	// serving is set once startup has finished. Before that a revocation
+	// only latches: telling a half-authenticated client that its role may
+	// no longer log in would say whether the role exists at all, which the
+	// mock SCRAM exchange goes to some trouble to hide.
+	serving     bool
 	closed      bool
 	queryCancel context.CancelFunc
 	// inTxn mirrors the executor's transaction status for drain decisions;
@@ -105,21 +113,55 @@ func (s *session) forceClose() {
 // away, which is the first thing anyone losing access would try.
 func (s *session) revoke() {
 	s.mu.Lock()
-	s.draining = true
+	if s.revoked || s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.revoked, s.draining = true, true
+	if !s.serving {
+		// Still authenticating: latch only. Startup rechecks this and
+		// fails the exchange the way any other authentication failure
+		// fails, so a client that stalls the exchange cannot tell a role
+		// that does not exist from one that does.
+		s.mu.Unlock()
+		return
+	}
 	if s.queryCancel != nil {
 		s.queryCancel()
 	}
-	closed := s.closed
 	s.mu.Unlock()
-	if closed {
-		return
-	}
+	s.endRevoked()
+}
+
+// endRevoked tells the client why and closes the socket. It closes the
+// connection only: the executor belongs to the session's own goroutine and
+// is not safe to touch from here, and closing the socket unblocks that
+// goroutine, whose deferred close releases it.
+func (s *session) endRevoked() {
 	er := toErrorResponse(Errorf(CodeAdminShutdown, "terminating connection because the role may no longer log in"))
 	er.Severity, er.SeverityUnlocalized = "FATAL", "FATAL"
 	if buf, err := er.Encode(nil); err == nil {
+		// Bounded: the session goroutine may be blocked flushing to a
+		// client that has stopped reading, and this write would queue
+		// behind it. One refresh goroutine revokes every session, so it
+		// must never wait on one of them.
+		_ = s.conn.SetWriteDeadline(time.Now().Add(revokeWriteTimeout))
 		_, _ = s.conn.Write(buf)
+		_ = s.conn.SetWriteDeadline(time.Time{})
 	}
-	s.close()
+	_ = s.conn.Close()
+}
+
+// revokeWriteTimeout bounds the courtesy FATAL a revocation sends.
+const revokeWriteTimeout = 2 * time.Second
+
+// revokedNow reports whether a revocation landed on this session, so a
+// startup that was in flight hands its executor straight back instead of
+// serving a role that may no longer log in.
+func (s *session) revokedNow() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.revoked
 }
 
 // drain asks the session to end: idle sessions are terminated immediately,
@@ -154,7 +196,10 @@ func (s *session) terminate(err error) {
 func (s *session) beginMessage() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if (s.draining && !s.inTxn) || s.closed {
+	// A revoked session takes nothing further, transaction or not: a drain
+	// lets an open transaction finish, but a role that may no longer log in
+	// does not get to keep working through one.
+	if s.revoked || (s.draining && !s.inTxn) || s.closed {
 		return false
 	}
 	s.active = true
@@ -172,7 +217,14 @@ func (s *session) queryContext(parent context.Context) (context.Context, context
 	ctx, cancel := context.WithCancel(parent)
 	s.mu.Lock()
 	s.queryCancel = cancel
+	revoked := s.revoked
 	s.mu.Unlock()
+	if revoked {
+		// Revoked between the message starting and the context being
+		// installed: revoke had no cancel to call, so this one would
+		// otherwise run to completion on a session that is already gone.
+		cancel()
+	}
 	return ctx, cancel
 }
 
@@ -368,6 +420,14 @@ func (s *session) startup(ctx context.Context) error {
 	if db == "" {
 		db = user
 	}
+	// Publish the claimed role before authenticating. SCRAM reads the
+	// cached verifier up front, so a revocation that lands while the
+	// exchange is still in flight would otherwise skip this session - its
+	// role is not known yet - and it would go on to serve on a verifier
+	// that has since been withdrawn.
+	s.mu.Lock()
+	s.info.User = user
+	s.mu.Unlock()
 	result, err := s.server.cfg.Authenticator.Authenticate(ctx, pkt.params, authExchange{s})
 	if err != nil {
 		var pe *Error
@@ -386,14 +446,30 @@ func (s *session) startup(ctx context.Context) error {
 	s.mu.Lock()
 	s.info = info
 	s.mu.Unlock()
+	if s.revokedNow() {
+		// Indistinguishable from any other authentication failure.
+		s.terminate(Errorf(CodeInvalidPassword, "password authentication failed"))
+		return errors.New("session revoked during authentication")
+	}
 	exec, err := s.server.cfg.NewExecutor(info)
 	if err != nil {
 		s.terminate(err)
 		return err
 	}
 	s.mu.Lock()
-	s.exec = exec
+	revoked := s.revoked
+	if !revoked {
+		s.exec = exec
+	}
 	s.mu.Unlock()
+	if revoked {
+		// The revocation pass ran between the check above and here; hand
+		// the executor back rather than leaking it, and end the session
+		// the way a failed authentication ends.
+		exec.Release()
+		s.terminate(Errorf(CodeInvalidPassword, "password authentication failed"))
+		return errors.New("session revoked during authentication")
+	}
 	key, err := s.server.newCancelKey(s.id, s.protocolVersion)
 	if err != nil {
 		return err
@@ -408,7 +484,25 @@ func (s *session) startup(ctx context.Context) error {
 	}
 	s.be.Send(&pgproto3.BackendKeyData{ProcessID: key.PID, SecretKey: key.Secret})
 	s.be.Send(&pgproto3.ReadyForQuery{TxStatus: byte(exec.TransactionStatus())})
-	return s.be.Flush()
+	if err := s.be.Flush(); err != nil {
+		return err
+	}
+	// From here a revocation ends the session outright rather than only
+	// latching: the client is authenticated, so telling it why gives
+	// nothing away.
+	s.mu.Lock()
+	s.serving = true
+	late := s.revoked
+	if late && s.queryCancel != nil {
+		s.queryCancel()
+	}
+	s.mu.Unlock()
+	if late {
+		// Revoked during the last moments of startup: the latch was set
+		// while it could not be acted on, so act on it now.
+		s.endRevoked()
+	}
+	return nil
 }
 
 // bufferedConn lets TLS consume bytes the startup reader already buffered.
@@ -550,7 +644,14 @@ func (s *session) dispatch(ctx context.Context, msg pgproto3.FrontendMessage) (b
 		return true, s.be.Flush()
 	case *pgproto3.Sync:
 		s.skipToSync = false
-		if err := s.exec.Sync(ctx); err != nil {
+		// Sync is where an extended-protocol batch actually runs, so it
+		// needs the cancellable context the other steps use; otherwise a
+		// cancel or a revocation waits for the statement rather than
+		// stopping it.
+		qctx, cancel := s.queryContext(ctx)
+		err := s.exec.Sync(qctx)
+		cancel()
+		if err != nil {
 			s.reportError(err)
 		}
 		return true, s.readyForQuery()
