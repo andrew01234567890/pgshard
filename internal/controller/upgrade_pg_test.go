@@ -14,6 +14,7 @@ import (
 // workflow for a pending set stamped with a different major and a plain
 // reshard workflow for an unstamped one.
 func TestUpgradeWorkflowKindOnPostgres(t *testing.T) {
+	parallelPG(t)
 	dsn := startPostgresWith(t)
 	conn := connect(t, dsn)
 	ctx := context.Background()
@@ -57,6 +58,7 @@ func TestUpgradeWorkflowKindOnPostgres(t *testing.T) {
 // retirement. The targets end up serving every row on the new major with
 // sequences that continue past the source values.
 func TestUpgrade18To19OnPostgres(t *testing.T) {
+	parallelPG(t)
 	f := newUpgradeFixture(t)
 	ctx := context.Background()
 	id := f.startWorkflowKind(KindUpgrade)
@@ -128,6 +130,7 @@ func TestUpgrade18To19OnPostgres(t *testing.T) {
 // carries the post-switch rows to the pg18 sources and the serving map
 // returns to them.
 func TestUpgradeRollbackOnPostgres(t *testing.T) {
+	parallelPG(t)
 	f := newUpgradeFixture(t)
 	id := f.startWorkflowKind(KindUpgrade)
 
@@ -207,6 +210,7 @@ func waitFor(t *testing.T, d time.Duration, cond func() bool, msg string) {
 // increment_by, clamped to the boundary in that direction, and safe at the
 // bigint edges.
 func TestCollectSequencesHeadroomOnPostgres(t *testing.T) {
+	parallelPG(t)
 	dsn := startPostgresWith(t)
 	conn := connect(t, dsn)
 	ctx := context.Background()
