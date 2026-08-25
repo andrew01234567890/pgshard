@@ -181,12 +181,22 @@ func TestReacquireWaitsForThePoolerToDetach(t *testing.T) {
 	h.fp.mu.Lock()
 	h.fp.holdDetach = hold
 	h.fp.mu.Unlock()
+	refused := make(chan struct{})
+	h.fp.mu.Lock()
+	h.fp.fenced = refused
+	h.fp.mu.Unlock()
 	fresh := h.snap()
 	stale := *fresh
 	stale.ShardMapGeneration = 6
 	h.setSnap(&stale)
+	// Publish the fresh map only once the pooler has actually refused the
+	// stale one: a timer could let the statement through before the stream
+	// was ever dropped, and the test would pass without exercising anything.
 	go func() {
-		time.Sleep(150 * time.Millisecond)
+		select {
+		case <-refused:
+		case <-time.After(5 * time.Second):
+		}
 		h.setSnap(fresh)
 	}()
 	// Let the aborted handler finish only once the router has asked for the

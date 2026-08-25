@@ -10,6 +10,10 @@ import (
 // poolerStream is one Execute stream with a reader goroutine so receives can
 // be interleaved with context watching.
 type poolerStream struct {
+	// client is the pooler this stream was opened on. A release must reach
+	// that pooler, not whichever one the current snapshot names: the point
+	// of dropping a stream is that the endpoint may have moved.
+	client pgshardv1.PoolerClient
 	stream pgshardv1.Pooler_ExecuteClient
 	cancel context.CancelFunc
 	recvc  chan recvResult
@@ -31,7 +35,7 @@ func openStream(ctx context.Context, client pgshardv1.PoolerClient) (*poolerStre
 		cancel()
 		return nil, err
 	}
-	ps := &poolerStream{stream: st, cancel: cancel, recvc: make(chan recvResult, 64), done: make(chan struct{}), gone: make(chan struct{}), first: true}
+	ps := &poolerStream{client: client, stream: st, cancel: cancel, recvc: make(chan recvResult, 64), done: make(chan struct{}), gone: make(chan struct{}), first: true}
 	go ps.reader()
 	return ps, nil
 }

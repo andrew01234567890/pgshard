@@ -38,8 +38,11 @@ type fakePooler struct {
 	// holdDetach, when set, keeps the Execute handler attached until it is
 	// closed, so a test can hold a session across the router's abort.
 	holdDetach chan struct{}
-	dropAfter  string
-	dropped    int
+	// fenced is closed the first time a request is refused for a stale
+	// generation, so a test can wait for the refusal instead of guessing.
+	fenced    chan struct{}
+	dropAfter string
+	dropped   int
 	// executed records every statement text this shard ran, in order;
 	// bound records each extended-protocol execution with its parameters.
 	executed []string
@@ -206,6 +209,12 @@ func (f *fakePooler) detach(sid string) {
 	f.mu.Lock()
 	ch := f.attached[sid]
 	delete(f.attached, sid)
+	// Like the real detach: a session nobody reserved gives its backend up
+	// when its stream ends, so the next stream starts clean and a missing
+	// replay shows up instead of being served from the old state.
+	if !f.reserved[sid] {
+		delete(f.backends, sid)
+	}
 	f.mu.Unlock()
 	if ch != nil {
 		close(ch)
@@ -579,6 +588,12 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 
 func (s *fakeStream) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error {
 	if e := s.f.fence(req.Generation); e != nil {
+		s.f.mu.Lock()
+		if s.f.fenced != nil {
+			close(s.f.fenced)
+			s.f.fenced = nil
+		}
+		s.f.mu.Unlock()
 		if err := s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_Error{Error: &pgshardv1.ErrorResponse{Error: e}}}); err != nil {
 			return err
 		}
