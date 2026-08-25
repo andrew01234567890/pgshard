@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -254,8 +255,11 @@ func (p PgxProber) CutoverCatalog(ctx context.Context, srcDSN, tgtDSN string) er
 	if alreadyCutOver {
 		// The previous run dropped the subscription (and its slot) after
 		// carrying the sequences: nothing to drain, and the live target's
-		// sequences must not be rewound to the fenced source's values.
-		return nil
+		// sequences must not be rewound to the fenced source's values. The
+		// reverse pair still has to be armed - a run that died between the
+		// two would otherwise leave no way back, which is the data loss
+		// this whole path exists to prevent.
+		return ensureCatalogRollback(ctx, src, tgt, tgtDSN)
 	}
 	var fence string
 	if err := src.QueryRow(ctx, `SELECT pg_current_wal_lsn()::text`).Scan(&fence); err != nil {
@@ -306,7 +310,7 @@ func ensureCatalogRollback(ctx context.Context, old, current *pgx.Conn, currentC
 		return err
 	}
 	if _, err := old.Exec(ctx, fmt.Sprintf(
-		`CREATE SUBSCRIPTION %s CONNECTION %s PUBLICATION %s WITH (copy_data = false, enabled = false, origin = none, two_phase = false)`,
+		`CREATE SUBSCRIPTION %s CONNECTION %s PUBLICATION %s WITH (copy_data = false, enabled = false, origin = none, two_phase = false, failover = true)`,
 		CatalogRollbackSubscription, quoteLiteral(currentConninfo), CatalogRollbackPublication)); err != nil {
 		return fmt.Errorf("create rollback subscription: %w", err)
 	}
@@ -329,18 +333,38 @@ func (PgxProber) RollbackCatalog(ctx context.Context, oldDSN, newDSN string) err
 	if err := old.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_subscription WHERE subname = $1)`, CatalogRollbackSubscription).Scan(&subExists); err != nil {
 		return err
 	}
-	if !subExists {
-		// Either the replay already finished on an earlier attempt, or this
-		// cutover predates the reverse pair. Refusing here would strand the
-		// cluster on a catalog the operator is trying to delete, so let the
-		// old group serve; the caller reports what was replayed.
-		return unfenceCatalog(ctx, old)
-	}
 	current, err := pgx.Connect(ctx, newDSN)
 	if err != nil {
 		return fmt.Errorf("new catalog: %w", err)
 	}
 	defer func() { _ = current.Close(ctx) }()
+	if !subExists {
+		// Two different states look the same from the old group. Dropping
+		// the subscription is the last thing a finished replay does, and it
+		// leaves the publication behind, so the publication is what tells
+		// them apart: with it, this is a re-run after the replay completed;
+		// without it, the cutover predates the reverse pair and there is no
+		// way to recover what the new catalog took. Refuse rather than
+		// serve a catalog that is missing writes.
+		var pubExists bool
+		if err := current.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)`, CatalogRollbackPublication).Scan(&pubExists); err != nil {
+			return err
+		}
+		if !pubExists {
+			return fmt.Errorf("this catalog was cut over without a rollback stream, so everything written since cannot be recovered; finish the upgrade instead")
+		}
+		return unfenceCatalog(ctx, old)
+	}
+	// A slot the serving catalog invalidated can never be drained, and
+	// fencing before finding that out would leave the catalog read-only
+	// with no way forward.
+	var walStatus string
+	if err := current.QueryRow(ctx, `SELECT coalesce(wal_status, '') FROM pg_replication_slots WHERE slot_name = $1`, CatalogRollbackSubscription).Scan(&walStatus); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	if walStatus == "lost" {
+		return fmt.Errorf("the rollback stream was invalidated (slot %s lost its WAL), so the old catalog cannot be caught up; finish the upgrade instead", CatalogRollbackSubscription)
+	}
 	if err := fenceCatalog(ctx, current); err != nil {
 		return fmt.Errorf("fence new catalog: %w", err)
 	}
@@ -378,14 +402,49 @@ func (PgxProber) DropCatalogRollback(ctx context.Context, dsn string) error {
 		return err
 	}
 	defer func() { _ = conn.Close(ctx) }()
-	if _, err := conn.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
-		WHERE slot_name = $1 AND NOT active`, CatalogRollbackSubscription); err != nil {
-		return fmt.Errorf("drop rollback slot: %w", err)
+	var active bool
+	err = conn.QueryRow(ctx, `SELECT active FROM pg_replication_slots WHERE slot_name = $1`, CatalogRollbackSubscription).Scan(&active)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// Already gone.
+	case err != nil:
+		return err
+	case active:
+		// A rollback is streaming from it. Say so and come back rather than
+		// dropping the publication out from under the walsender.
+		return fmt.Errorf("the rollback stream is still in use")
+	default:
+		if _, err := conn.Exec(ctx, `SELECT pg_drop_replication_slot($1)`, CatalogRollbackSubscription); err != nil {
+			return fmt.Errorf("drop rollback slot: %w", err)
+		}
 	}
 	if _, err := conn.Exec(ctx, `DROP PUBLICATION IF EXISTS `+CatalogRollbackPublication); err != nil {
 		return fmt.Errorf("drop rollback publication: %w", err)
 	}
 	return nil
+}
+
+// DisableCatalogRollback implements Prober. An abandoned rollback leaves
+// the reverse subscription applying into a group that is no longer going to
+// serve; disabling it stops that and releases the slot on the live catalog.
+func (PgxProber) DisableCatalogRollback(ctx context.Context, dsn string) error {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	var exists bool
+	if err := conn.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_subscription WHERE subname = $1)`, CatalogRollbackSubscription).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	if _, err := conn.Exec(ctx, `SET default_transaction_read_only = off`); err != nil {
+		return err
+	}
+	_, err = conn.Exec(ctx, `ALTER SUBSCRIPTION `+CatalogRollbackSubscription+` DISABLE`)
+	return err
 }
 
 // ReleaseCatalog implements Prober.

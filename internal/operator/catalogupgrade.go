@@ -163,6 +163,14 @@ func (r *ClusterReconciler) reconcileCatalogUpgrade(ctx context.Context, c *pgsh
 		up.Stage = CatalogUpgradeCutover
 		up.Message = ""
 	case CatalogUpgradeCutover:
+		// The stable endpoint is about to start selecting the new group,
+		// and for generation 1 that is the same Service object the old
+		// group is reached through. Give the old generation its own
+		// address first, or the rollback would talk to the new catalog on
+		// both connections.
+		if err := r.ensureCatalogGenerationEndpoint(ctx, c, Groups(c)[0]); err != nil {
+			return obs, err
+		}
 		if err := r.Prober.CutoverCatalog(ctx, dsn, r.catalogTargetDSN(c, *target, password)); err != nil {
 			up.Message = "catalog cutover: " + err.Error()
 			break
@@ -187,8 +195,9 @@ func (r *ClusterReconciler) reconcileCatalogUpgrade(ctx context.Context, c *pgsh
 			// Address both groups explicitly: Groups(c)[0] follows the
 			// status generation, which still names the new group until the
 			// endpoint moves below.
-			oldDSN := r.catalogTargetDSN(c, catalogGroupAt(c, up.RetiredGeneration, up.RetiredMajor), password)
+			oldDSN := DSN(CatalogGenerationServiceRW(c.Name, up.RetiredGeneration), c.Namespace, password)
 			newDSN := r.catalogTargetDSN(c, catalogGroupAt(c, up.Generation, up.ToMajor), password)
+			up.RollbackStarted = true
 			if err := r.Prober.RollbackCatalog(ctx, oldDSN, newDSN); err != nil {
 				up.Message = "catalog rollback: " + err.Error()
 				break
@@ -208,6 +217,23 @@ func (r *ClusterReconciler) reconcileCatalogUpgrade(ctx context.Context, c *pgsh
 			}
 			c.Status.CatalogUpgrade = nil
 			break
+		}
+		if up.RollbackStarted {
+			// The rollback was abandoned after it had already fenced the
+			// catalog that is serving. Carrying on to retirement would
+			// leave the cluster read-only for good, so put it back before
+			// anything else.
+			newDSN := r.catalogTargetDSN(c, catalogGroupAt(c, up.Generation, up.ToMajor), password)
+			if err := r.Prober.ReleaseCatalog(ctx, newDSN); err != nil {
+				up.Message = "release the catalog after an abandoned rollback: " + err.Error()
+				break
+			}
+			if err := r.Prober.DisableCatalogRollback(ctx, DSN(CatalogGenerationServiceRW(c.Name, up.RetiredGeneration), c.Namespace, password)); err != nil {
+				up.Message = "quiesce the rollback stream: " + err.Error()
+				break
+			}
+			up.RollbackStarted = false
+			log.Info("catalog upgrade: abandoned rollback undone, catalog serving again")
 		}
 		var retireAfter time.Duration
 		if d := c.Spec.Resharding.RetireOldGroupsAfter; d != nil {
@@ -243,6 +269,19 @@ func (r *ClusterReconciler) catalogTargetDSN(c *pgshardv1alpha1.PgShardCluster, 
 // ensureCatalogEndpoint keeps the stable catalog Service pointing at the
 // active catalog group's primary. Generation 1 needs nothing: the stable
 // name is that group's own -rw Service.
+// ensureCatalogGenerationEndpoint gives one catalog generation an address
+// that does not move when the stable endpoint is repointed.
+func (r *ClusterReconciler) ensureCatalogGenerationEndpoint(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group) error {
+	desired := r.Renderer.CatalogGenerationService(c, g)
+	svc := &corev1.Service{ObjectMeta: desired.ObjectMeta}
+	return r.ensureOwned(ctx, c, svc, func() error {
+		svc.Labels = desired.Labels
+		svc.Spec.Selector = desired.Spec.Selector
+		svc.Spec.Ports = desired.Spec.Ports
+		return nil
+	})
+}
+
 func (r *ClusterReconciler) ensureCatalogEndpoint(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) error {
 	desired := r.Renderer.CatalogEndpointService(c, Groups(c)[0])
 	svc := &corev1.Service{ObjectMeta: desired.ObjectMeta}
