@@ -141,8 +141,12 @@ func (r *Router) NewExecutor(info pgwire.SessionInfo) (pgwire.Executor, error) {
 		return nil, err
 	}
 	e := newExecutor(r, info, home)
+	// Read the limit before taking the lock: RoleCache holds its own mutex
+	// across a catalog reload, and blocking r.mu on that would stall every
+	// session close, cancel and buffer reservation behind catalog latency.
+	limit, limited := r.limitFor(info.User)
 	r.mu.Lock()
-	if limit, ok := r.limitFor(info.User); ok && r.perUser[info.User] >= limit {
+	if limited && r.perUser[info.User] >= limit {
 		r.mu.Unlock()
 		return nil, pgwire.Errorf(codeBufferFull, "too many connections for role %q", info.User)
 	}

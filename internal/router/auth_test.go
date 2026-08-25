@@ -138,12 +138,14 @@ func TestRoleCacheRefusesNologinAndExpired(t *testing.T) {
 // holds as many sessions as it may, the next one is refused rather than
 // quietly admitted.
 func TestConnectionLimitRefusesBeyondTheRolesAllowance(t *testing.T) {
-	h := newHarness(t)
-	h.r.cfg.RoleLimits = limiter(func(user string) (int32, bool) {
-		if user == "app" {
-			return 2, true
-		}
-		return 0, false
+	fp := newFakePooler()
+	h := newHarnessWith(t, fp, startFakePooler(t, fp), func(cfg *Config) {
+		cfg.RoleLimits = limiter(func(user string) (int32, bool) {
+			if user == "app" {
+				return 2, true
+			}
+			return 0, false
+		})
 	})
 	var open []*pgx.Conn
 	for i := range 2 {
