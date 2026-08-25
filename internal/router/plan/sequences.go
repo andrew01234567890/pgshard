@@ -78,7 +78,10 @@ var dateTimeTypes = map[string]bool{
 // pg_catalog: either unqualified, or qualified with pg_catalog itself.
 // Anything else belongs to somebody's own schema, whatever it is called.
 func builtinName(names []string) bool {
-	return len(names) == 1 || (len(names) > 1 && strings.EqualFold(names[len(names)-2], "pg_catalog"))
+	// Case-sensitive on purpose: "PG_CATALOG" in double quotes is a
+	// different schema from pg_catalog, and treating them alike would admit
+	// anything somebody chose to put in it.
+	return len(names) == 1 || (len(names) > 1 && names[len(names)-2] == "pg_catalog")
 }
 
 // unorderedPick names a construct that chooses which rows to use without
@@ -149,6 +152,11 @@ func nonImmutableCall(node *pgquerypb.Node) string {
 				found = "operator " + strings.Join(names, ".")
 				return false
 			}
+		case *pgquerypb.Node_SetToDefault:
+			// DEFAULT stands for whatever the column's default expression
+			// evaluates to on each shard, which the statement does not say.
+			found = "DEFAULT"
+			return false
 		case *pgquerypb.Node_TypeCast:
 			names := stringList(x.TypeCast.GetTypeName().GetNames())
 			if len(names) == 0 {

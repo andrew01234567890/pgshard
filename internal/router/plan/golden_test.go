@@ -118,6 +118,8 @@ func golden() []want {
 		{sql: "update regions set name = name operator(app.###) 'x'", kind: Refuse, msg: "a write to reference table \"regions\" cannot call operator app.###"},
 		{sql: "insert into regions select id, name from regions limit 1", kind: Refuse, msg: "a write to reference table \"regions\" cannot use LIMIT or OFFSET"},
 		{sql: "insert into regions select distinct on (id) id, name from regions", kind: Refuse, msg: "a write to reference table \"regions\" cannot use DISTINCT ON"},
+		{sql: "insert into regions values (1, DEFAULT)", kind: Refuse, msg: "a write to reference table \"regions\" cannot call DEFAULT"},
+		{sql: "update regions set name = DEFAULT", kind: Refuse, msg: "a write to reference table \"regions\" cannot call DEFAULT"},
 		// A literal cast that is genuinely determined stays allowed.
 		{sql: "insert into regions values (1, '2026-01-01'::date::text)", kind: Reference, shards: "all"},
 		{sql: "insert into regions select id, name from items", kind: Refuse, msg: "a write to reference table \"regions\" cannot read sharded or unsharded tables"},
