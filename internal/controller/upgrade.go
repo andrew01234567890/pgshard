@@ -237,9 +237,20 @@ func (o *pgCutover) Rollback(ctx context.Context) error {
 	if state == catalog.ShardSetServing {
 		return o.releaseRollback(ctx)
 	}
-	if _, err := o.c.Pool.Exec(ctx, `UPDATE pgshard.shard_status SET migrating = true, updated_at = now()
-		WHERE shard_set = ANY($1) AND NOT migrating`, []string{o.srcSet, o.wf.set}); err != nil {
+	// Claim the fence on both sets, as the forward cutover does: a fence
+	// with no owner is one any workflow can drop, and the release below
+	// only lifts what this workflow raised.
+	if _, err := o.c.Pool.Exec(ctx, `UPDATE pgshard.shard_status SET migrating = true, migrating_by = $2::uuid, updated_at = now()
+		WHERE shard_set = ANY($1) AND (NOT migrating OR migrating_by = $2::uuid)`, []string{o.srcSet, o.wf.set}, o.wf.id); err != nil {
 		return err
+	}
+	var heldByOther int
+	if err := o.c.Pool.QueryRow(ctx, `SELECT count(*)::int FROM pgshard.shard_status
+		WHERE shard_set = ANY($1) AND migrating AND migrating_by IS DISTINCT FROM $2::uuid`, []string{o.srcSet, o.wf.set}, o.wf.id).Scan(&heldByOther); err != nil {
+		return err
+	}
+	if heldByOther > 0 {
+		return fmt.Errorf("another cutover holds the write fence on %s or %s", o.srcSet, o.wf.set)
 	}
 	positions := map[int32]int64{}
 	for _, t := range o.wf.ids {
