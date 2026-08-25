@@ -185,7 +185,7 @@ func (c *Cluster) MustGather(ctx context.Context, name string) {
 // pgshard pods with their readiness, the cluster's conditions, and the most
 // recent events. It is meant to be embedded in a timeout failure so the CI log
 // says what the test was waiting on without anyone downloading the artifacts.
-func (c *Cluster) Summary(ctx context.Context) string {
+func (c *Cluster) Summary(ctx context.Context, namespace string) string {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	var b strings.Builder
@@ -200,10 +200,10 @@ func (c *Cluster) Summary(ctx context.Context) string {
 		}
 		fmt.Fprintf(&b, "\n--- %s ---\n%s\n", title, out)
 	}
-	section("pods", "-n", SystemNamespace, "get", "pods", "-o", "wide")
-	section("pgshardclusters", "-n", SystemNamespace, "get", "pgshardcluster", "-o",
+	section("pods", "-n", namespace, "get", "pods", "-o", "wide")
+	section("pgshardclusters", "-n", namespace, "get", "pgshardcluster", "-o",
 		`jsonpath={range .items[*]}{.metadata.name}{"\t"}{.status.conditions[*].type}={.status.conditions[*].status}{"\tshards="}{.status.effectiveShards}{"\n"}{end}`)
-	section("recent events", "-n", SystemNamespace, "get", "events", "--sort-by=.lastTimestamp")
+	section("recent events", "-n", namespace, "get", "events", "--sort-by=.lastTimestamp")
 	return b.String()
 }
 

@@ -37,7 +37,7 @@ func resolveGroup(ctx context.Context, c *e2e.Cluster, tenant int64) (string, er
 		return "", err
 	}
 	if out == "" {
-		return "", fmt.Errorf("no shard range covers keyspace id %d", id)
+		return "", fmt.Errorf("no shard range covers keyspace id %d (%s)", id, shardMapState(ctx, c))
 	}
 	shard, gen, ok := strings.Cut(out, ":")
 	if !ok {
@@ -47,6 +47,20 @@ func resolveGroup(ctx context.Context, c *e2e.Cluster, tenant int64) (string, er
 		return "shard-" + shard, nil
 	}
 	return fmt.Sprintf("shard-%s-g%s", shard, gen), nil
+}
+
+// shardMapState reports what the catalog holds when a tenant cannot be routed,
+// so a failure says which of the three preconditions is missing rather than
+// only that the lookup found nothing.
+func shardMapState(ctx context.Context, c *e2e.Cluster) string {
+	out, err := psql(ctx, c, clusterName+"-catalog-rw",
+		`SELECT 'ranges=' || (SELECT count(*) FROM pgshard.shard_ranges)
+			|| ' serving=' || (SELECT count(*) FROM pgshard.serving)
+			|| ' sets=' || (SELECT coalesce(string_agg(shard_set || ':' || state, ','), 'none') FROM pgshard.shard_sets)`)
+	if err != nil {
+		return "catalog unreadable: " + err.Error()
+	}
+	return out
 }
 
 // scaleLedger appends acknowledged rows per tenant, resolving the serving

@@ -208,7 +208,7 @@ func waitFor(ctx context.Context, t *testing.T, c *e2e.Cluster, what string, tim
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out after %s waiting for %s%s", timeout, what, c.Summary(ctx))
+			t.Fatalf("timed out after %s waiting for %s%s", timeout, what, c.Summary(ctx, testNamespace))
 		}
 		if time.Now().After(nextProgress) {
 			t.Logf("still waiting for %s (%s elapsed)", what, time.Since(started).Round(time.Second))

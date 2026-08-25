@@ -260,7 +260,7 @@ func waitForWhy(ctx context.Context, t *testing.T, c *e2e.Cluster, what string, 
 			if why != nil {
 				detail = why()
 			}
-			t.Fatalf("timed out after %s waiting for %s%s%s", timeout, what, detail, c.Summary(ctx))
+			t.Fatalf("timed out after %s waiting for %s%s%s", timeout, what, detail, c.Summary(ctx, testNamespace))
 		}
 		if time.Now().After(nextProgress) {
 			t.Logf("still waiting for %s (%s elapsed)", what, time.Since(started).Round(time.Second))
