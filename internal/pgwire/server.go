@@ -241,6 +241,39 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 }
 
+// TerminateUser ends the sessions of one role and reports how many it
+// asked to end. A role that loses its login, expires or has its allowance
+// cut keeps working otherwise: authentication only gates new connections.
+// Idle sessions go at once, active ones when their statement or transaction
+// finishes, the same way a drain treats them.
+func (s *Server) TerminateUser(user string) int {
+	return s.TerminateWhere(func(u string) bool { return u == user })
+}
+
+// TerminateWhere ends every session whose role revoked reports, and returns
+// how many. The caller decides from the roles it holds now rather than from
+// what changed, so a revocation cannot be missed because something else
+// refreshed the cache first, and running it again is harmless.
+func (s *Server) TerminateWhere(revoked func(user string) bool) int {
+	s.mu.Lock()
+	sessions := make([]*session, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		sessions = append(sessions, sess)
+	}
+	s.mu.Unlock()
+	n := 0
+	for _, sess := range sessions {
+		// A session still authenticating has no role yet; it is caught on
+		// the next pass, and it could not have authenticated as a role that
+		// is already refused.
+		if u := sess.user(); u != "" && revoked(u) {
+			sess.revoke()
+			n++
+		}
+	}
+	return n
+}
+
 // Sessions reports the number of live sessions.
 func (s *Server) Sessions() int {
 	s.mu.Lock()

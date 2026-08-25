@@ -194,7 +194,12 @@ func (c *rawClient) readStartup() startupResult {
 
 func (c *rawClient) startup(version uint32) startupResult {
 	c.t.Helper()
-	c.rawStartup(version, map[string]string{"user": "alice", "database": "db"})
+	return c.startupAs(version, "alice")
+}
+
+func (c *rawClient) startupAs(version uint32, user string) startupResult {
+	c.t.Helper()
+	c.rawStartup(version, map[string]string{"user": user, "database": "db"})
 	return c.readStartup()
 }
 
@@ -972,5 +977,56 @@ func TestPlaintextStartupAllowedByTheDevelopmentOptOut(t *testing.T) {
 	c := dialRaw(t, ts.addr)
 	if res := c.startup(ProtocolVersion30); res.ready == nil {
 		t.Fatalf("opt-out must still serve plaintext: %+v", res)
+	}
+}
+
+// TestTerminateUserEndsOnlyThatRolesSessions: revoking a role has to reach
+// the sessions it already holds, including one sitting inside an open
+// transaction - which is exactly where a client that just lost its access
+// would sit - and must not disturb anyone else's.
+func TestTerminateUserEndsOnlyThatRolesSessions(t *testing.T) {
+	ts := startServer(t, Config{})
+	revoked := dialRaw(t, ts.addr)
+	if res := revoked.startupAs(ProtocolVersion30, "revoked"); res.ready == nil {
+		t.Fatalf("startup: %+v", res)
+	}
+	// Hold a transaction open: a drain would wait for this forever.
+	revoked.send(&pgproto3.Query{String: "begin"})
+	revoked.recv()
+	revoked.recv()
+	inTxn := dialRaw(t, ts.addr)
+	if res := inTxn.startupAs(ProtocolVersion30, "revoked"); res.ready == nil {
+		t.Fatalf("startup: %+v", res)
+	}
+	kept := dialRaw(t, ts.addr)
+	if res := kept.startupAs(ProtocolVersion30, "kept"); res.ready == nil {
+		t.Fatalf("startup: %+v", res)
+	}
+	if n := ts.TerminateUser("revoked"); n != 2 {
+		t.Fatalf("terminated %d sessions, want 2", n)
+	}
+	// Both revoked sessions must receive a FATAL and then end.
+	for _, c := range []*rawClient{revoked, inTxn} {
+		sawFatal, closed := false, false
+		for range 20 {
+			msg, err := c.fe.Receive()
+			if err != nil {
+				closed = true
+				break
+			}
+			if e, ok := msg.(*pgproto3.ErrorResponse); ok && e.Severity == "FATAL" {
+				sawFatal = true
+			}
+		}
+		if !sawFatal {
+			t.Fatal("a revoked session must be told why it ended")
+		}
+		if !closed {
+			t.Fatal("a revoked session must actually be closed, not left open")
+		}
+	}
+	kept.send(&pgproto3.Query{String: "select 1"})
+	if msg := kept.recv(); msg == nil {
+		t.Fatal("an unrelated role's session must keep working")
 	}
 }

@@ -147,6 +147,28 @@ func (r *Roles) Verifier(rolname string) (string, bool) {
 	return c.Verifier, ok
 }
 
+// NewRoles builds a Roles from credentials that did not come from the
+// catalog, for callers that assemble one themselves.
+func NewRoles(creds map[string]RoleCred) *Roles {
+	r := &Roles{verifiers: map[string]RoleCred{}}
+	for name, c := range creds {
+		r.verifiers[name] = c
+	}
+	return r
+}
+
+// Names lists every role the snapshot carries.
+func (r *Roles) Names() []string {
+	if r == nil {
+		return nil
+	}
+	out := make([]string, 0, len(r.verifiers))
+	for name := range r.verifiers {
+		out = append(out, name)
+	}
+	return out
+}
+
 // Cred returns the credential record of a role with a non-empty verifier.
 func (r *Roles) Cred(rolname string) (RoleCred, bool) {
 	if r == nil {

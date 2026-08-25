@@ -10,6 +10,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
+
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
 )
 
@@ -179,3 +181,51 @@ func TestConnectionLimitRefusesBeyondTheRolesAllowance(t *testing.T) {
 type limiter func(string) (int32, bool)
 
 func (f limiter) ConnectionLimit(user string) (int32, bool) { return f(user) }
+
+// TestMayLogInAnswersFromCurrentState: Lookup reloads the cache on its own
+// TTL and on every miss, so a check that watched for the moment a role
+// flipped would miss every revocation an authentication attempt noticed
+// first. The answer has to come from the roles as they stand.
+func TestMayLogInAnswersFromCurrentState(t *testing.T) {
+	past := time.Now().Add(-time.Hour)
+	rows := map[string]snapshot.RoleCred{
+		"stays":   {Verifier: "v", CanLogin: true},
+		"nologin": {Verifier: "v", CanLogin: true},
+		"expires": {Verifier: "v", CanLogin: true},
+		"dropped": {Verifier: "v", CanLogin: true},
+	}
+	c := &RoleCache{ttl: time.Hour, now: time.Now}
+	c.load = func(context.Context) (*snapshot.Roles, error) { return snapshot.NewRoles(rows), nil }
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, user := range []string{"stays", "nologin", "expires", "dropped"} {
+		if !c.MayLogIn(user) {
+			t.Fatalf("%s must be admitted before the change", user)
+		}
+	}
+	rows = map[string]snapshot.RoleCred{
+		"stays":   {Verifier: "v", CanLogin: true},
+		"nologin": {Verifier: "v", CanLogin: false},
+		"expires": {Verifier: "v", CanLogin: true, ValidUntil: &past},
+	}
+	// Something else refreshes the cache first - an authentication miss, or
+	// the TTL expiring under Lookup. The verdict must not depend on who did.
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, user := range []string{"nologin", "expires", "dropped"} {
+		if c.MayLogIn(user) {
+			t.Fatalf("%s may no longer log in", user)
+		}
+	}
+	if !c.MayLogIn("stays") {
+		t.Fatal("an untouched role must still be admitted")
+	}
+	if c.MayLogIn("never-existed") {
+		t.Fatal("an unknown role may not log in")
+	}
+}
