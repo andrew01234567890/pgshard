@@ -45,8 +45,8 @@ because a set is already `serving` while its workflow still holds the reverse
 subscription open for the rollback window.
 
 Dropping a whole set stays allowed — that is how a cancelled reshard clears its
-target and how retirement removes the old one — but only as a whole: removing
-the set's row while keeping its ranges is refused.
+target — but only as a whole: removing the set's row while keeping its ranges is
+refused.
 
 A workflow that is still `pending` owns nothing, so a set with only a pending
 workflow against it stays editable.

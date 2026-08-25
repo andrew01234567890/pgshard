@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -108,17 +109,24 @@ func ListTables(ctx context.Context, q Querier, database string) ([]Table, error
 	return pgx.CollectRows(rows, pgx.RowToStructByPos[Table])
 }
 
-// LockShardRanges returns the ranges of one shard set ordered by key space,
-// holding a share lock on the rows until the transaction ends. A caller that is
-// about to persist a snapshot of these ranges needs this: without it a
-// concurrent edit can commit between the read and the snapshot, and the
-// ownership trigger, which only sees the workflow once it is committed, would
-// let that edit through and freeze the divergence in.
-func LockShardRanges(ctx context.Context, tx pgx.Tx, shardSet string) ([]ShardRange, error) {
-	if _, err := tx.Exec(ctx, `SELECT 1 FROM pgshard.shard_ranges WHERE shard_set = $1 ORDER BY range FOR SHARE`, shardSet); err != nil {
-		return nil, err
+// LockShardRangesOf share-locks the ranges of the named shard sets until the
+// transaction ends, taking them in name order so concurrent callers cannot
+// deadlock. A caller about to create a workflow that will own these sets needs
+// this: without it a concurrent edit can commit between the read and the
+// workflow insert, and the ownership trigger, which only sees the workflow once
+// it is committed, would let that edit through and freeze the divergence in.
+func LockShardRangesOf(ctx context.Context, tx pgx.Tx, shardSets ...string) error {
+	names := slices.Clone(shardSets)
+	slices.Sort(names)
+	for _, name := range slices.Compact(names) {
+		if name == "" {
+			continue
+		}
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM pgshard.shard_ranges WHERE shard_set = $1 ORDER BY range FOR SHARE`, name); err != nil {
+			return err
+		}
 	}
-	return ListShardRanges(ctx, tx, shardSet)
+	return nil
 }
 
 // ListShardRanges returns the ranges of one shard set ordered by key space.

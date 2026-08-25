@@ -97,10 +97,13 @@ $$;
 -- reverse subscription open for the whole rollback and retirement window. So
 -- the freeze follows workflow ownership rather than the set's own state.
 -- Inserts stay open because that is how a set is first materialized, and an
--- insert alone cannot reshape a set that already covers the key space -- it can
--- only overlap, which the exclusion constraint refuses. Dropping the whole set
--- stays open too: a cancelled reshard and a retirement both clear the
--- shard_sets row and every one of its ranges in the same transaction.
+-- Dropping a whole set stays open, because a cancelled reshard clears the
+-- shard_sets row and every one of its ranges in the same transaction; both
+-- halves are required, so clearing only the row is not a way in. Inserts are
+-- covered as well: a set can otherwise be dropped and re-created reshaped under
+-- the same name in two transactions, which would put the workflow back exactly
+-- where this trigger exists to stop it. First materialization is unaffected
+-- because a set's ranges are always written before its workflow exists.
 --
 -- The source set is owned as well, because every cutover pass rebuilds the
 -- source shard IDs and ranges from live catalog rows rather than from the
@@ -117,10 +120,9 @@ DECLARE
     targets text[];
     owner   uuid;
 BEGIN
-    targets := ARRAY[OLD.shard_set];
-    IF TG_OP = 'UPDATE' AND NEW.shard_set IS DISTINCT FROM OLD.shard_set THEN
-        targets := targets || NEW.shard_set;
-    END IF;
+    targets := ARRAY[]::text[];
+    IF TG_OP IN ('DELETE', 'UPDATE') THEN targets := targets || OLD.shard_set; END IF;
+    IF TG_OP = 'INSERT' OR (TG_OP = 'UPDATE' AND OLD.shard_set IS DISTINCT FROM NEW.shard_set) THEN targets := targets || NEW.shard_set; END IF;
     FOREACH target IN ARRAY targets LOOP
         -- Dropping the whole set clears its shard_sets row and every one of its
         -- ranges in the same transaction; that is how a cancelled reshard and a
@@ -131,8 +133,15 @@ BEGIN
                   AND NOT EXISTS (SELECT 1 FROM pgshard.shard_ranges WHERE shard_set = target);
         SELECT id INTO owner FROM pgshard.workflows
          WHERE kind IN ('reshard', 'upgrade')
-           AND (spec->>'shard_set' = target OR spec->>'source_set' = target)
-           AND state IN ('provisioning', 'running', 'paused')
+           AND (spec->>'shard_set' = target
+                OR spec->>'source_set' = target
+                -- A workflow created before the source was recorded in the spec
+                -- resolves it on its first cutover pass and keeps it here.
+                OR status->'cutover'->>'source_set' = target)
+           AND (state IN ('provisioning', 'running')
+                -- A workflow paused out of 'pending' never started, so pausing
+                -- one must not be a way to freeze a set that was editable.
+                OR (state = 'paused' AND status->>'paused_from' IS DISTINCT FROM 'pending'))
          LIMIT 1;
         IF owner IS NOT NULL THEN
             RAISE EXCEPTION 'shard_set % has its ranges owned by workflow %', target, owner
@@ -145,7 +154,7 @@ END
 $$;
 
 CREATE CONSTRAINT TRIGGER shard_ranges_owned_by_workflow
-    AFTER UPDATE OR DELETE ON pgshard.shard_ranges
+    AFTER INSERT OR UPDATE OR DELETE ON pgshard.shard_ranges
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW EXECUTE FUNCTION pgshard.check_shard_ranges_owned();
 

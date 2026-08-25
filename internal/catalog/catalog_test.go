@@ -583,6 +583,102 @@ func runSuite(t *testing.T, img pgImage) {
 				expectPgError(t, err, "23514", "owned by workflow")
 			})
 
+			// A workflow created before the source was recorded in the spec
+			// resolves it on its first cutover pass and keeps it in status.
+			t.Run("a_source_recorded_only_in_status_is_owned", func(t *testing.T) {
+				mustExec(t, conn, `INSERT INTO pgshard.shard_sets (shard_set, generation, state) VALUES ('glegacy', 34, 'serving')`)
+				mustExec(t, conn, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES
+					('glegacy', 0, '[,0)'), ('glegacy', 1, '[0,)')`)
+				mustExec(t, conn, `INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES
+					('66666666-6666-6666-6666-666666666666', 'reshard', 'running',
+					 '{"shard_set": "gtarget2", "ranges": [{"shard_id": 0}]}'::jsonb,
+					 '{"cutover": {"source_set": "glegacy"}}'::jsonb)`)
+				t.Cleanup(func() {
+					mustExec(t, conn, `DELETE FROM pgshard.workflows WHERE id = '66666666-6666-6666-6666-666666666666'`)
+					mustExec(t, conn, `DELETE FROM pgshard.shard_ranges WHERE shard_set = 'glegacy'`)
+					mustExec(t, conn, `DELETE FROM pgshard.shard_sets WHERE shard_set = 'glegacy'`)
+				})
+				tx, err := conn.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				mustTx(t, tx, `UPDATE pgshard.shard_ranges SET range = '[0,100)' WHERE shard_set = 'glegacy' AND shard_id = 1`)
+				mustTx(t, tx, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES ('glegacy', 2, '[100,)')`)
+				err = tx.Commit(ctx)
+				if err == nil {
+					t.Fatal("the source of a running reshard was reshaped because the spec did not name it")
+				}
+				expectPgError(t, err, "23514", "owned by workflow")
+			})
+
+			// Dropping the set and re-creating it reshaped under the same name
+			// would otherwise put the workflow back where it started.
+			t.Run("recreating_a_dropped_set_under_the_same_name_is_refused", func(t *testing.T) {
+				mustExec(t, conn, `INSERT INTO pgshard.shard_sets (shard_set, generation, state) VALUES ('gremade', 35, 'serving')`)
+				mustExec(t, conn, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES
+					('gremade', 0, '[,0)'), ('gremade', 1, '[0,)')`)
+				mustExec(t, conn, `INSERT INTO pgshard.workflows (id, kind, state, spec) VALUES
+					('77777777-7777-7777-7777-777777777777', 'reshard', 'running',
+					 '{"shard_set": "gremade", "ranges": [{"shard_id": 0}, {"shard_id": 1}]}'::jsonb)`)
+				t.Cleanup(func() {
+					mustExec(t, conn, `DELETE FROM pgshard.workflows WHERE id = '77777777-7777-7777-7777-777777777777'`)
+					mustExec(t, conn, `DELETE FROM pgshard.shard_ranges WHERE shard_set = 'gremade'`)
+					mustExec(t, conn, `DELETE FROM pgshard.shard_sets WHERE shard_set = 'gremade'`)
+				})
+				tx, err := conn.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				if err := DropShardSet(ctx, tx, "gremade"); err != nil {
+					t.Fatal(err)
+				}
+				if err := tx.Commit(ctx); err != nil {
+					t.Fatalf("dropping the set was refused: %v", err)
+				}
+
+				tx, err = conn.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				mustTx(t, tx, `INSERT INTO pgshard.shard_sets (shard_set, generation, state) VALUES ('gremade', 35, 'serving')`)
+				mustTx(t, tx, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES ('gremade', 0, '[,)')`)
+				err = tx.Commit(ctx)
+				if err == nil {
+					t.Fatal("a set its workflow still owns was re-created reshaped under the same name")
+				}
+				expectPgError(t, err, "23514", "owned by workflow")
+			})
+
+			// Pausing the workflow an ordinary edit creates must not freeze a
+			// set that was editable a moment earlier.
+			t.Run("pausing_a_pending_workflow_owns_nothing", func(t *testing.T) {
+				mustExec(t, conn, `INSERT INTO pgshard.shard_sets (shard_set, generation, state) VALUES ('gpaused', 36, 'serving')`)
+				mustExec(t, conn, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES
+					('gpaused', 0, '[,0)'), ('gpaused', 1, '[0,)')`)
+				mustExec(t, conn, `INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES
+					('88888888-8888-8888-8888-888888888888', 'reshard', 'paused',
+					 '{"shard_set": "gpaused", "ranges": [{"shard_id": 0}, {"shard_id": 1}]}'::jsonb,
+					 '{"paused_from": "pending"}'::jsonb)`)
+				t.Cleanup(func() {
+					mustExec(t, conn, `DELETE FROM pgshard.workflows WHERE id = '88888888-8888-8888-8888-888888888888'`)
+					mustExec(t, conn, `DELETE FROM pgshard.shard_ranges WHERE shard_set = 'gpaused'`)
+					mustExec(t, conn, `DELETE FROM pgshard.shard_sets WHERE shard_set = 'gpaused'`)
+				})
+				tx, err := conn.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				mustTx(t, tx, `UPDATE pgshard.shard_ranges SET range = '[0,100)' WHERE shard_set = 'gpaused' AND shard_id = 1`)
+				mustTx(t, tx, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES ('gpaused', 2, '[100,)')`)
+				if err := tx.Commit(ctx); err != nil {
+					t.Fatalf("pausing a workflow that never started froze the set: %v", err)
+				}
+			})
+
 			t.Run("a_finished_workflow_releases_the_set", func(t *testing.T) {
 				mustExec(t, conn, `INSERT INTO pgshard.shard_sets (shard_set, generation, state) VALUES ('gdone', 31, 'serving')`)
 				mustExec(t, conn, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES
