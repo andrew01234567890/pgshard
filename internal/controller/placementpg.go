@@ -120,8 +120,9 @@ func uniqueConstraintsMissingKey(ctx context.Context, conn ShardConn, schema, na
 		JOIN pg_class ix ON ix.oid = i.indexrelid
 		WHERE n.nspname = $1 AND c.relname = $2 AND (i.indisunique OR i.indisexclusion)
 		AND NOT EXISTS (
-			SELECT 1 FROM pg_attribute a
-			WHERE a.attrelid = c.oid AND a.attname = $3 AND a.attnum = ANY (i.indkey))
+			SELECT 1 FROM unnest(i.indkey) WITH ORDINALITY k(attnum, ord)
+			JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
+			WHERE k.ord <= i.indnkeyatts AND a.attname = $3)
 		ORDER BY ix.relname`, schema, name, key)
 	if err != nil {
 		return nil, err
