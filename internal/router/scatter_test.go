@@ -420,3 +420,46 @@ func TestScatterAppliesTheSessionSearchPath(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// TestScatterReplaysSetRole: a scatter opens fresh backends, and PostgreSQL
+// decides grants and row-level security from the role that is current on
+// the backend running the query. A session that logs in powerful and then
+// assumes a restricted role would otherwise have its scatter evaluated as
+// the login role, quietly ignoring the restriction it asked for.
+func TestScatterReplaysSetRole(t *testing.T) {
+	h := newShardedHarness(t)
+	ctx := context.Background()
+	conn := h.connect(t, h.dsn()+"&default_query_exec_mode=simple_protocol")
+
+	if _, err := conn.Exec(ctx, "set role tenant_ro"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "select * from orders"); err != nil {
+		t.Fatal(err)
+	}
+	took := 0
+	for i, fp := range h.poolers {
+		sawRole, selAt := -1, -1
+		for j, q := range fp.ran() {
+			if strings.HasPrefix(strings.ToLower(q), "set role tenant_ro") && sawRole < 0 {
+				sawRole = j
+			}
+			if strings.HasPrefix(q, "select * from orders") {
+				selAt = j
+			}
+		}
+		if selAt < 0 {
+			continue // this shard did not take part
+		}
+		took++
+		if sawRole < 0 {
+			t.Fatalf("shard %d ran the scatter without the session's SET ROLE: %v", i, fp.ran())
+		}
+		if sawRole > selAt {
+			t.Fatalf("shard %d applied SET ROLE after the scatter statement (role at %d, select at %d)", i, sawRole, selAt)
+		}
+	}
+	if took < 2 {
+		t.Fatalf("only %d shard(s) took part; the statement did not fan out, so this proves nothing", took)
+	}
+}
