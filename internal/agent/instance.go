@@ -284,7 +284,10 @@ func (in *Instance) Promote(ctx context.Context) error {
 const promotionPendingMarker = "pgshard_promotion_pending"
 
 func (in *Instance) setPromotionPending() error {
-	return os.WriteFile(filepath.Join(in.cfg.PGData, promotionPendingMarker), nil, 0o600)
+	// Synced write plus directory sync: the marker must survive a crash that
+	// follows pg_ctl promote, or a half-promoted primary would come back with
+	// nothing telling the operator to finish its setup.
+	return writeFileSync(filepath.Join(in.cfg.PGData, promotionPendingMarker), nil)
 }
 
 func (in *Instance) clearPromotionPending() error {
@@ -292,7 +295,10 @@ func (in *Instance) clearPromotionPending() error {
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return syncDir(in.cfg.PGData)
 }
 
 // PromotionPending reports whether a promotion ran pg_ctl promote but has
