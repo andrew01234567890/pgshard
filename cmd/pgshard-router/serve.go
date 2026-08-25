@@ -215,6 +215,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		Decisions:  &router.PGDecisionLog{Pool: pool},
 		Sequences:  router.NewSequenceAllocator(&router.PGBlockSource{Pool: pool}),
 		Migrations: &router.PGMigrationQueue{Pool: pool},
+		RoleLimits: roles,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)

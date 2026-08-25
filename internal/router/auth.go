@@ -68,6 +68,19 @@ func (c *RoleCache) admit(user string, cred snapshot.RoleCred) (string, error) {
 	return cred.Verifier, nil
 }
 
+// ConnectionLimit reports how many sessions user may hold open at once from
+// the cache the authentication just populated; ok is false when the role is
+// unknown or the limit is unlimited.
+func (c *RoleCache) ConnectionLimit(user string) (int32, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cred, ok := c.roles.Cred(user)
+	if !ok || cred.ConnectionLimit < 0 {
+		return 0, false
+	}
+	return cred.ConnectionLimit, true
+}
+
 func (c *RoleCache) reload(ctx context.Context) error {
 	r, err := snapshot.LoadRoles(ctx, c.q)
 	if err != nil {
