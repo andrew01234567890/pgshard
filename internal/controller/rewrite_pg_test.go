@@ -415,3 +415,44 @@ func TestRewriteReturningStarHidesWorkingColumnOnPostgres(t *testing.T) {
 		}
 	}
 }
+
+// TestRewriteRefusesDependentColumnOnPostgres: an online type rewrite whose
+// target column carries a dependent object the cutover cannot recreate (here a
+// UNIQUE index) is refused before any schema change, leaving the table intact.
+func TestRewriteRefusesDependentColumnOnPostgres(t *testing.T) {
+	pool, a, store := rewritePGFixture(t)
+	ctx := context.Background()
+	mustExecSQL(t, pool, `CREATE UNIQUE INDEX accounts_amount_key ON accounts (lower(amount))`)
+	oid := tableOID(t, pool)
+	m := catalog.DDLMigration{ID: "10000000-0000-0000-0000-0000000000d1", Database: "postgres",
+		Statement: "alter table accounts alter column amount type bigint using amount::bigint",
+		Kind:      "ALTER TABLE", Strategy: catalog.StrategyRewrite, Scope: "all", State: catalog.MigrationQueued,
+		Meta: catalog.MigrationMeta{RunAs: "appowner", Rewrite: &catalog.RewriteChange{Schema: "public", Table: "accounts",
+			Column: "amount", NewType: "bigint", Using: "amount::bigint", BatchSize: 700}}}
+	store.migrations = []catalog.DDLMigration{m}
+
+	if _, err := a.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got := store.get(t, m.ID)
+	if got.State != catalog.MigrationFailed || !strings.Contains(got.Error, "dependent objects") {
+		t.Fatalf("state = %s error %q; want failed with a dependency refusal", got.State, got.Error)
+	}
+	// The column, its type, the table OID and the unique index are untouched.
+	if typ := columnType(t, pool, "amount"); typ != "text" {
+		t.Fatalf("amount type changed to %s; the rewrite must not have started", typ)
+	}
+	if tableOID(t, pool) != oid {
+		t.Fatal("table OID changed; the rewrite touched the table")
+	}
+	var idx int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_indexes WHERE tablename = 'accounts' AND indexname = 'accounts_amount_key'`).Scan(&idx); err != nil {
+		t.Fatal(err)
+	}
+	if idx != 1 {
+		t.Fatal("the dependent unique index was dropped")
+	}
+	if left := hiddenArtifacts(t, pool); len(left) != 0 {
+		t.Fatalf("artifacts left behind: %v", left)
+	}
+}

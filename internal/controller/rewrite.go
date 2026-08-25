@@ -119,6 +119,55 @@ func (a *Applier) failRewrite(ctx context.Context, logger *slog.Logger, m *catal
 	return nil
 }
 
+// rewriteColumnDependents lists the objects an ALTER TABLE ... DROP COLUMN of
+// the target column would cascade away or be blocked by, which the OID-
+// preserving rewrite cutover does not recreate: indexes (including expression
+// and partial indexes and PRIMARY KEY/UNIQUE/EXCLUSION constraints), CHECK and
+// foreign-key constraints, inbound foreign keys, generated columns, extended
+// statistics, views/rules, and RLS policies, plus identity columns whose owned
+// sequence the drop would take with it. It is a general pg_depend sweep over
+// everything that depends on the column, excluding only what the cutover itself
+// restores (the column's own default and NOT NULL). Any result means the
+// rewrite must be refused. Applies to the type form only (the add form creates
+// a new column and drops nothing).
+func rewriteColumnDependents(ctx context.Context, conn ShardConn, schema, table, column string) ([]string, error) {
+	rows, err := conn.Query(ctx, `WITH t AS (
+  SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+  WHERE c.relname = $1 AND ($2 = '' AND n.nspname = ANY (current_schemas(false)) OR n.nspname = $2)
+  ORDER BY CASE WHEN $2 = '' THEN array_position(current_schemas(false), n.nspname::text) ELSE 0 END
+  LIMIT 1),
+col AS (SELECT a.attnum, a.attidentity FROM pg_attribute a, t WHERE a.attrelid = t.oid AND a.attname = $3 AND NOT a.attisdropped)
+SELECT label FROM (
+  SELECT 'identity column ' || $3 AS label FROM col WHERE col.attidentity <> ''
+  UNION ALL
+  SELECT 'column privileges on ' || $3 FROM col, t WHERE EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = t.oid AND a.attnum = col.attnum AND a.attacl IS NOT NULL)
+  UNION ALL
+  SELECT 'security label on ' || $3 FROM col, t WHERE EXISTS (SELECT 1 FROM pg_seclabel sl WHERE sl.classoid = 'pg_class'::regclass AND sl.objoid = t.oid AND sl.objsubid = col.attnum)
+  UNION ALL
+  SELECT CASE d.classid
+      WHEN 'pg_class'::regclass THEN (SELECT CASE relkind WHEN 'i' THEN 'index ' WHEN 'v' THEN 'view ' WHEN 'm' THEN 'materialized view ' WHEN 'S' THEN 'sequence ' ELSE 'relation ' END || relname FROM pg_class WHERE oid = d.objid)
+      WHEN 'pg_constraint'::regclass THEN 'constraint ' || (SELECT conname FROM pg_constraint WHERE oid = d.objid)
+      WHEN 'pg_attrdef'::regclass THEN 'generated column ' || (SELECT a2.attname FROM pg_attrdef ad JOIN pg_attribute a2 ON a2.attrelid = ad.adrelid AND a2.attnum = ad.adnum WHERE ad.oid = d.objid)
+      WHEN 'pg_statistic_ext'::regclass THEN 'statistics ' || (SELECT stxname FROM pg_statistic_ext WHERE oid = d.objid)
+      WHEN 'pg_rewrite'::regclass THEN 'view/rule ' || (SELECT c2.relname FROM pg_rewrite r JOIN pg_class c2 ON c2.oid = r.ev_class WHERE r.oid = d.objid)
+      WHEN 'pg_policy'::regclass THEN 'policy ' || (SELECT polname FROM pg_policy WHERE oid = d.objid)
+      WHEN 'pg_trigger'::regclass THEN 'trigger ' || (SELECT tgname FROM pg_trigger WHERE oid = d.objid)
+      WHEN 'pg_publication_rel'::regclass THEN 'publication column list'
+      ELSE d.classid::regclass::text
+    END AS label
+  FROM pg_depend d, t, col
+  WHERE d.refclassid = 'pg_class'::regclass AND d.refobjid = t.oid AND d.refobjsubid = col.attnum
+    AND d.deptype IN ('a','n','i')
+    AND NOT (d.classid = 'pg_attrdef'::regclass AND EXISTS (SELECT 1 FROM pg_attrdef ad WHERE ad.oid = d.objid AND ad.adrelid = t.oid AND ad.adnum = col.attnum))
+    AND NOT (d.classid = 'pg_constraint'::regclass AND EXISTS (SELECT 1 FROM pg_constraint con WHERE con.oid = d.objid AND con.contype = 'n' AND con.convalidated AND NOT con.connoinherit AND con.conrelid = t.oid AND con.conkey = ARRAY[col.attnum]::int2[]))
+    AND NOT (d.classid = 'pg_class'::regclass AND EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = d.objid))
+) x WHERE label IS NOT NULL ORDER BY 1`, table, schema, column)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
 // recordRewriteColumns publishes the table's visible column list into the
 // migration meta so routers hide the working column, then waits for
 // snapshots to reload before any hidden column exists.
@@ -136,6 +185,28 @@ func (a *Applier) recordRewriteColumns(ctx context.Context, m *catalog.DDLMigrat
 		return err
 	}
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	// Fail closed: the OID-preserving cutover drops the old column, whose
+	// DROP silently cascades away dependent indexes/constraints/statistics/
+	// generated columns and loses column privileges and identity that the
+	// cutover never recreates. Refuse the rewrite before any schema change if
+	// the target column carries such dependents on ANY shard (the add form
+	// has no old column to drop).
+	if !rw.Add && rw.Column != "" {
+		for _, key := range keys {
+			dc, derr := a.prepare(ctx, m, key, shardID(key), m.Database)
+			if derr != nil {
+				return derr
+			}
+			deps, derr := rewriteColumnDependents(ctx, dc, rw.Schema, rw.Table, rw.Column)
+			_ = dc.Close(context.WithoutCancel(ctx))
+			if derr != nil {
+				return derr
+			}
+			if len(deps) > 0 {
+				return fmt.Errorf("online rewrite of column %q on %s cannot proceed (shard %s): it has dependent objects the cutover would drop or lose without recreating: %s", rw.Column, rw.Table, key, strings.Join(deps, ", "))
+			}
+		}
+	}
 	rows, err := conn.Query(ctx, `SELECT a.attname FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
 		JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE c.relname = $1 AND ($2 = '' AND n.nspname = ANY (current_schemas(false)) OR n.nspname = $2)
@@ -328,6 +399,16 @@ func (a *Applier) cutover(ctx context.Context, conn ShardConn, rw *catalog.Rewri
 			stmts = append(stmts, "ALTER TABLE "+table+" ALTER COLUMN "+ident(rw.Column)+" SET DEFAULT ("+rw.Default+")")
 		}
 	} else {
+		// A dependent added during the (possibly long) backfill would be
+		// cascaded away by the DROP below; re-check under the cutover lock so
+		// the guarantee holds at cutover, not just at preflight.
+		deps, derr := rewriteColumnDependents(ctx, conn, rw.Schema, rw.Table, rw.Column)
+		if derr != nil {
+			return "", derr
+		}
+		if len(deps) > 0 {
+			return "", fmt.Errorf("column %q gained dependent objects during the rewrite that the cutover would drop without recreating: %s", rw.Column, strings.Join(deps, ", "))
+		}
 		oldDefault, notNull, err := columnFacts(ctx, conn, rw, rw.Column)
 		if err != nil {
 			return "", err

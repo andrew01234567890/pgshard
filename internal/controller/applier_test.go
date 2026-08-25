@@ -99,17 +99,18 @@ func (s *memStore) get(t *testing.T, id string) catalog.DDLMigration {
 // fakeShards scripts every shard: exec decides the outcome of a statement,
 // exists answers object checks, invalid answers invalid-index checks.
 type fakeShards struct {
-	mu       sync.Mutex
-	ran      map[int32][]string
-	super    map[int32][]string
-	dbs      map[int32][]string
-	logins   map[int32][]string
-	exec     func(shard int32, sql string) error
-	exists   func(shard int32, kind, name string) bool
-	invalid  func(shard int32, name string) bool
-	rolsuper func(shard int32, name string) bool
-	check    func(shard int32, kind, table, name string) bool
-	dialErr  func(shard int32) error
+	rewriteDependents []string
+	mu                sync.Mutex
+	ran               map[int32][]string
+	super             map[int32][]string
+	dbs               map[int32][]string
+	logins            map[int32][]string
+	exec              func(shard int32, sql string) error
+	exists            func(shard int32, kind, name string) bool
+	invalid           func(shard int32, name string) bool
+	rolsuper          func(shard int32, name string) bool
+	check             func(shard int32, kind, table, name string) bool
+	dialErr           func(shard int32) error
 	// rewrite scripting
 	columns      []string
 	pks          []string
@@ -204,6 +205,9 @@ func (c *fakeConn) Query(_ context.Context, sql string, args ...any) (pgx.Rows, 
 	switch {
 	case strings.Contains(sql, "server_version_num"):
 		return &intRows{vals: []int{c.f.version}}, nil
+	case strings.Contains(sql, "d.refobjsubid = col.attnum"):
+		// rewriteColumnDependents: the fake table has no dependents.
+		return &stringRows{vals: c.f.rewriteDependents}, nil
 	case strings.Contains(sql, "attname NOT LIKE"):
 		c.log("read columns")
 		return &stringRows{vals: c.f.columns}, nil
