@@ -178,3 +178,25 @@ func TestBootstrapRetriesCloneUntilPrimaryAnswers(t *testing.T) {
 		t.Fatalf("cancelled bootstrap must stop retrying: %v", err)
 	}
 }
+
+func TestPromotionPendingMarkerLifecycle(t *testing.T) {
+	in := newTestInstance(t)
+	if in.PromotionPending() {
+		t.Fatal("fresh instance must not report a pending promotion")
+	}
+	if err := in.setPromotionPending(); err != nil {
+		t.Fatal(err)
+	}
+	if !in.PromotionPending() {
+		t.Fatal("marker set but not reported")
+	}
+	// Clearing is idempotent: a second clear on an absent marker is a no-op.
+	for i := 0; i < 2; i++ {
+		if err := in.clearPromotionPending(); err != nil {
+			t.Fatalf("clear %d: %v", i, err)
+		}
+	}
+	if in.PromotionPending() {
+		t.Fatal("marker still reported after clear")
+	}
+}

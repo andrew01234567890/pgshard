@@ -97,6 +97,9 @@ message StatusResponse {
   // True when PostgreSQL accepts connections.
   bool running = 5;
   Error error = 6;
+  // True while a promotion has run pg_ctl promote but not yet finished its
+  // post-promotion setup; the operator re-issues Promote to complete it.
+  bool promotion_pending = 7;
 }
 
 // PromoteRequest promotes the instance.

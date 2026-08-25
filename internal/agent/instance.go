@@ -244,6 +244,12 @@ func (in *Instance) Promote(ctx context.Context) error {
 		if err := in.waitWALReceiverStopped(ctx); err != nil {
 			return err
 		}
+		// Mark the promotion pending before the database becomes writable:
+		// if a later setup step fails, Status keeps reporting the marker so
+		// the operator re-issues Promote until the setup completes.
+		if err := in.setPromotionPending(); err != nil {
+			return err
+		}
 		if _, err := in.sup.RunTracked(in.sup.Command(ctx, "pg_ctl", "promote", "-w", "-D", in.cfg.PGData)); err != nil {
 			return err
 		}
@@ -266,8 +272,34 @@ func (in *Instance) Promote(ctx context.Context) error {
 		return err
 	}
 	defer func() { _ = conn.Close(ctx) }()
-	_, err = conn.Exec(ctx, "CHECKPOINT")
+	if _, err := conn.Exec(ctx, "CHECKPOINT"); err != nil {
+		return err
+	}
+	return in.clearPromotionPending()
+}
+
+// promotionPendingMarker is a file in PGDATA that exists from just before
+// pg_ctl promote until the post-promotion setup has fully succeeded. It is
+// durable so an agent restart mid-promotion still reports the pending state.
+const promotionPendingMarker = "pgshard_promotion_pending"
+
+func (in *Instance) setPromotionPending() error {
+	return os.WriteFile(filepath.Join(in.cfg.PGData, promotionPendingMarker), nil, 0o600)
+}
+
+func (in *Instance) clearPromotionPending() error {
+	err := os.Remove(filepath.Join(in.cfg.PGData, promotionPendingMarker))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
 	return err
+}
+
+// PromotionPending reports whether a promotion ran pg_ctl promote but has
+// not yet completed its post-promotion setup.
+func (in *Instance) PromotionPending() bool {
+	_, err := os.Stat(filepath.Join(in.cfg.PGData, promotionPendingMarker))
+	return err == nil
 }
 
 // waitWALReceiverStopped disconnects the standby from the old primary so no

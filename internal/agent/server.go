@@ -63,7 +63,7 @@ func (s *Server) fenceCurrent(epoch uint64) error {
 
 // Status is read-only.
 func (s *Server) Status(ctx context.Context, _ *pgshardv1.StatusRequest) (*pgshardv1.StatusResponse, error) {
-	resp := &pgshardv1.StatusResponse{Epoch: s.epoch.Current(), Role: pgshardv1.StatusResponse_ROLE_PRIMARY}
+	resp := &pgshardv1.StatusResponse{Epoch: s.epoch.Current(), Role: pgshardv1.StatusResponse_ROLE_PRIMARY, PromotionPending: s.inst.PromotionPending()}
 	if s.inst.IsStandby() {
 		resp.Role = pgshardv1.StatusResponse_ROLE_STANDBY
 	}

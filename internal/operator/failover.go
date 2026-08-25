@@ -461,7 +461,12 @@ func (r *ClusterReconciler) converge(ctx context.Context, c *pgshardv1alpha1.PgS
 			continue
 		}
 		switch {
-		case name == state.primary && !st.Primary:
+		case name == state.primary && (!st.Primary || st.PromotionPending):
+			// A designated primary that is still a standby must be promoted;
+			// one that promoted but whose post-promotion setup failed reports
+			// PromotionPending and is re-promoted (the agent's Promote is
+			// idempotent and only re-runs the setup) so it never stays
+			// half-configured.
 			epoch := promotionEpoch(state.epoch, st.Epoch)
 			if epoch != state.epoch {
 				if err := r.publishFence(ctx, c, g, "", name, epoch, password); err != nil {
@@ -469,7 +474,7 @@ func (r *ClusterReconciler) converge(ctx context.Context, c *pgshardv1alpha1.PgS
 				}
 				state.epoch = epoch
 			}
-			log.Info("designated primary is a standby; promoting", "member", name, "epoch", epoch)
+			log.Info("designated primary needs (re)promotion", "member", name, "epoch", epoch, "standby", !st.Primary, "promotionPending", st.PromotionPending)
 			if err := r.Agents.Promote(ctx, agentAddr(m.ip), uint64(epoch), name); err != nil {
 				return state, fmt.Errorf("promote %s: %w", name, err)
 			}
