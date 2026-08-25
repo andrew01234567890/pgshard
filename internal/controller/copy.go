@@ -595,10 +595,49 @@ func (c *Copier) publishOn(ctx context.Context, wf *copyWorkflow, srcSet string,
 }
 
 func (c *Copier) replicaIdentityFull(ctx context.Context, wf *copyWorkflow, conn ShardConn, db, schema, name string) error {
-	if _, err := conn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s.%s REPLICA IDENTITY FULL", QuoteIdent(schema), QuoteIdent(name))); err != nil {
+	if err := setReplicaIdentityFull(ctx, conn, schema, name); err != nil {
 		return err
 	}
 	wf.copy.ReplicaIdentityFull = appendUnique(wf.copy.ReplicaIdentityFull, db+"."+schema+"."+name)
+	return nil
+}
+
+// setReplicaIdentityFull sets REPLICA IDENTITY FULL on a table and, when it is
+// partitioned, on every leaf partition too: ALTER TABLE ... REPLICA IDENTITY
+// never recurses, and a via-root filtered publication validates and encodes
+// changes using each leaf's identity, so leaving leaves at the default breaks
+// UPDATE/DELETE. pg_partition_tree returns the table itself for a plain table,
+// so this also covers the non-partitioned case.
+func setReplicaIdentityFull(ctx context.Context, conn ShardConn, schema, name string) error {
+	if _, err := conn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s.%s REPLICA IDENTITY FULL", QuoteIdent(schema), QuoteIdent(name))); err != nil {
+		return err
+	}
+	// pg_partition_tree returns no rows for a plain table and the full tree
+	// (rooted at $1) for a partitioned one; the root is already handled above,
+	// so ALTER only the leaves it reports.
+	qual := QuoteIdent(schema) + "." + QuoteIdent(name)
+	rows, err := conn.Query(ctx, `
+		SELECT n.nspname, c.relname
+		FROM pg_partition_tree($1::regclass) t
+		JOIN pg_class c ON c.oid = t.relid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE t.isleaf`, qual)
+	if err != nil {
+		return err
+	}
+	type rel struct{ schema, name string }
+	leaves, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (rel, error) {
+		var x rel
+		return x, r.Scan(&x.schema, &x.name)
+	})
+	if err != nil {
+		return err
+	}
+	for _, r := range leaves {
+		if _, err := conn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s.%s REPLICA IDENTITY FULL", QuoteIdent(r.schema), QuoteIdent(r.name))); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

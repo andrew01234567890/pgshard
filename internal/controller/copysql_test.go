@@ -1,8 +1,8 @@
 package controller
 
 import (
-	"strings"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/andrew01234567890/pgshard/internal/placement"
