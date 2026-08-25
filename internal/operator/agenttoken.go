@@ -17,7 +17,7 @@ func clusterAgentToken(ctx context.Context, c client.Client, namespace, cluster 
 	if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: SecretName(cluster)}, &sec); err != nil {
 		return "", err
 	}
-	return agentauth.Token(string(sec.Data[secretKey])), nil
+	return agentauth.Token(string(sec.Data[secretKey]))
 }
 
 // withClusterAgentToken stamps ctx so agent RPCs authenticate; a missing

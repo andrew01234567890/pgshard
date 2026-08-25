@@ -117,7 +117,18 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("agent auth token: %w", err)
 	}
-	grpcSrv := grpc.NewServer(grpc.UnaryInterceptor(agentauth.UnaryServerInterceptor(agentauth.Token(password))))
+	if _, err := agentauth.Token(password); err != nil {
+		return fmt.Errorf("agent auth token: %w", err)
+	}
+	// Re-derive from the mounted password file on every call so a rotated
+	// superuser Secret is honoured without an agent restart.
+	grpcSrv := grpc.NewServer(grpc.UnaryInterceptor(agentauth.DynamicUnaryServerInterceptor(func() (string, error) {
+		pw, err := inst.password()
+		if err != nil {
+			return "", err
+		}
+		return agentauth.Token(pw)
+	})))
 	pgshardv1.RegisterAgentServer(grpcSrv, srv)
 	grpcLn, err := net.Listen("tcp", cfg.GRPCAddr)
 	if err != nil {

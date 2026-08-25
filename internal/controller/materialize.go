@@ -65,7 +65,11 @@ func (m *AgentMaterializer) MaterializeSchema(ctx context.Context, target ShardR
 	defer cancel()
 	// The catalog pool authenticates with the superuser password the agents
 	// derive their auth token from.
-	ctx = agentauth.WithToken(ctx, agentauth.Token(m.Pool.Config().ConnConfig.Password))
+	token, err := agentauth.Token(m.Pool.Config().ConnConfig.Password)
+	if err != nil {
+		return fmt.Errorf("agent auth token: %w", err)
+	}
+	ctx = agentauth.WithToken(ctx, token)
 	resp, err := pgshardv1.NewAgentClient(conn).MaterializeSchema(ctx, &pgshardv1.MaterializeSchemaRequest{SourceConninfo: sourceConnInfo, Database: database})
 	if err != nil {
 		return fmt.Errorf("agent %s: %w", addr, err)

@@ -153,7 +153,11 @@ func (n *node) connect() {
 	n.http = "http://" + docker(n.t, "port", n.container, "8080/tcp")
 	conn, err := grpc.NewClient(docker(n.t, "port", n.container, "9090/tcp"), grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-			return invoker(agentauth.WithToken(ctx, agentauth.Token("pgshard-test")), method, req, reply, cc, opts...)
+			tok, err := agentauth.Token("pgshard-test")
+			if err != nil {
+				return err
+			}
+			return invoker(agentauth.WithToken(ctx, tok), method, req, reply, cc, opts...)
 		}))
 	if err != nil {
 		n.t.Fatal(err)

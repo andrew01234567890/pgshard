@@ -165,7 +165,11 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	ctx = agentauth.WithToken(ctx, agentauth.Token(password))
+	agentToken, err := agentauth.Token(password)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("agent auth token: %w", err)
+	}
+	ctx = agentauth.WithToken(ctx, agentToken)
 	if err := r.ensureMemberRBAC(ctx, &cluster); err != nil {
 		return ctrl.Result{}, err
 	}
