@@ -32,6 +32,7 @@ type fakePooler struct {
 	cancels   []string
 	users     []string
 	sleeping  map[string]chan struct{}
+	sessions  map[string]*sync.Mutex
 	dropAfter string
 	dropped   int
 	// executed records every statement text this shard ran, in order;
@@ -156,7 +157,7 @@ var fakeXIDs atomic.Int64
 // The fake pooler serves shard map generation 7 at primary epoch 2, the
 // pair every harness snapshot starts from.
 func newFakePooler() *fakePooler {
-	return &fakePooler{gen: 7, epoch: 2, backends: map[string]*fakeBackend{}, reserved: map[string]bool{}, sleeping: map[string]chan struct{}{}}
+	return &fakePooler{gen: 7, epoch: 2, backends: map[string]*fakeBackend{}, reserved: map[string]bool{}, sleeping: map[string]chan struct{}{}, sessions: map[string]*sync.Mutex{}}
 }
 
 func startFakePooler(t *testing.T, fp *fakePooler) string {
@@ -181,6 +182,20 @@ func (f *fakePooler) backend(sid string) *fakeBackend {
 		f.backends[sid] = b
 	}
 	return b
+}
+
+// session serializes the messages of one session id. A real backend handles one
+// message at a time; a router that opens a second Execute stream for a session
+// before the first has finished otherwise races the fake's per-session state.
+func (f *fakePooler) session(sid string) *sync.Mutex {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	m := f.sessions[sid]
+	if m == nil {
+		m = &sync.Mutex{}
+		f.sessions[sid] = m
+	}
+	return m
 }
 
 func (f *fakePooler) fence(g *pgshardv1.Generation) *pgshardv1.Error {
@@ -536,6 +551,9 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 }
 
 func (s *fakeStream) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error {
+	m := s.f.session(s.sid)
+	m.Lock()
+	defer m.Unlock()
 	if e := s.f.fence(req.Generation); e != nil {
 		if err := s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_Error{Error: &pgshardv1.ErrorResponse{Error: e}}}); err != nil {
 			return err
