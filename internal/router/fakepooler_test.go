@@ -26,17 +26,20 @@ type fakePooler struct {
 	pgshardv1.UnimplementedPoolerServer
 	gen, epoch uint64
 
-	mu        sync.Mutex
-	backends  map[string]*fakeBackend
-	reserved  map[string]bool
-	reserves  []string
-	releases  []string
-	cancels   []string
-	users     []string
-	sleeping  map[string]chan struct{}
-	attached  map[string]bool
-	dropAfter string
-	dropped   int
+	mu       sync.Mutex
+	backends map[string]*fakeBackend
+	reserved map[string]bool
+	reserves []string
+	releases []string
+	cancels  []string
+	users    []string
+	sleeping map[string]chan struct{}
+	attached map[string]chan struct{}
+	// holdDetach, when set, keeps the Execute handler attached until it is
+	// closed, so a test can hold a session across the router's abort.
+	holdDetach chan struct{}
+	dropAfter  string
+	dropped    int
 	// executed records every statement text this shard ran, in order;
 	// bound records each extended-protocol execution with its parameters.
 	executed []string
@@ -159,7 +162,7 @@ var fakeXIDs atomic.Int64
 // The fake pooler serves shard map generation 7 at primary epoch 2, the
 // pair every harness snapshot starts from.
 func newFakePooler() *fakePooler {
-	return &fakePooler{gen: 7, epoch: 2, backends: map[string]*fakeBackend{}, reserved: map[string]bool{}, sleeping: map[string]chan struct{}{}, attached: map[string]bool{}}
+	return &fakePooler{gen: 7, epoch: 2, backends: map[string]*fakeBackend{}, reserved: map[string]bool{}, sleeping: map[string]chan struct{}{}, attached: map[string]chan struct{}{}}
 }
 
 func startFakePooler(t *testing.T, fp *fakePooler) string {
@@ -192,17 +195,21 @@ func (f *fakePooler) backend(sid string) *fakeBackend {
 func (f *fakePooler) attach(sid string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.attached[sid] {
+	if _, ok := f.attached[sid]; ok {
 		return status.Error(codes.FailedPrecondition, "session already has an Execute stream")
 	}
-	f.attached[sid] = true
+	f.attached[sid] = make(chan struct{})
 	return nil
 }
 
 func (f *fakePooler) detach(sid string) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	ch := f.attached[sid]
 	delete(f.attached, sid)
+	f.mu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
 }
 
 func (f *fakePooler) fence(g *pgshardv1.Generation) *pgshardv1.Error {
@@ -223,10 +230,23 @@ func (f *fakePooler) Reserve(_ context.Context, req *pgshardv1.ReserveRequest) (
 	return &pgshardv1.ReserveResponse{BackendPid: 42}, nil
 }
 
-func (f *fakePooler) Release(_ context.Context, req *pgshardv1.ReleaseRequest) (*pgshardv1.ReleaseResponse, error) {
+func (f *fakePooler) Release(ctx context.Context, req *pgshardv1.ReleaseRequest) (*pgshardv1.ReleaseResponse, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.releases = append(f.releases, req.SessionId)
+	// Like the real Release: while the session still has an Execute stream
+	// the caller waits for it to detach, which is what orders a reacquire
+	// behind the stream the router aborted.
+	if ch, ok := f.attached[req.SessionId]; ok {
+		delete(f.reserved, req.SessionId)
+		f.mu.Unlock()
+		select {
+		case <-ch:
+			return &pgshardv1.ReleaseResponse{}, nil
+		case <-ctx.Done():
+			return nil, status.FromContextError(ctx.Err()).Err()
+		}
+	}
+	defer f.mu.Unlock()
 	delete(f.reserved, req.SessionId)
 	delete(f.backends, req.SessionId)
 	return &pgshardv1.ReleaseResponse{}, nil
@@ -746,7 +766,15 @@ func (f *fakePooler) Execute(stream pgshardv1.Pooler_ExecuteServer) error {
 	if err := f.attach(first.SessionId); err != nil {
 		return err
 	}
-	defer f.detach(first.SessionId)
+	defer func() {
+		f.mu.Lock()
+		hold := f.holdDetach
+		f.mu.Unlock()
+		if hold != nil {
+			<-hold
+		}
+		f.detach(first.SessionId)
+	}()
 	s := &fakeStream{f: f, sid: first.SessionId, stream: stream}
 	req := first
 	for {

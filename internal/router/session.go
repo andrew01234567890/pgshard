@@ -648,16 +648,23 @@ func (e *Executor) bufferFull() error { return bufferFullError(e.shard) }
 // from the refreshed endpoint and replays session state.
 func (e *Executor) dropStream() {
 	e.dropParked()
-	if e.conn != nil {
-		e.conn.abort()
-		e.conn = nil
+	e.pinned = false
+	if e.conn == nil {
+		e.tx = pgwire.TxIdle
+		return
 	}
-	if e.pinned {
-		e.pinned = false
-		e.releaseAsync()
-	}
+	e.conn.abort()
+	e.conn = nil
+	e.detachAsync()
 	e.tx = pgwire.TxIdle
 }
+
+// detachAsync releases the session so the next stream cannot race the one
+// just aborted. abort only cancels this side of the RPC; the pooler may
+// still have the session attached, and it refuses a second Execute stream
+// while it does. Release waits server-side for the old stream to detach,
+// and awaitRelease orders the next openStream behind it.
+func (e *Executor) detachAsync() { e.releaseAsync() }
 
 // releaseAsync returns the pinned backend of the current shard without
 // waiting for the pooler; acquire on the same shard waits for it.
@@ -1345,13 +1352,11 @@ func (e *Executor) send(req *pgshardv1.ExecuteRequest) error {
 // reacquires a backend and replays session state.
 func (e *Executor) poolerLost(cause error) error {
 	e.dropParked()
+	e.pinned = false
 	if e.conn != nil {
 		e.conn.abort()
 		e.conn = nil
-	}
-	if e.pinned {
-		e.pinned = false
-		e.releaseAsync()
+		e.detachAsync()
 	}
 	e.tx = pgwire.TxIdle
 	e.staged, e.stagedMark = nil, 0
