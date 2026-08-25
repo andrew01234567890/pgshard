@@ -133,10 +133,18 @@ func quoteLiteralE(v *string) string {
 // rowShape names the columns of the moved table in source order and the
 // primary key columns the applier identifies rows by.
 type rowShape struct {
-	Schema  string
-	Name    string
-	Columns []string
-	PK      []string
+	Schema   string
+	Name     string
+	Columns  []string
+	Identity []string // attidentity per column: "a" always, "d" by default, "" none
+	PK       []string
+}
+
+// identityAlways reports whether column index i is a GENERATED ALWAYS identity
+// column, which cannot take an explicit value without OVERRIDING SYSTEM VALUE
+// and cannot be updated to a non-DEFAULT value.
+func (s rowShape) identityAlways(i int) bool {
+	return i < len(s.Identity) && s.Identity[i] == "a"
 }
 
 func (s rowShape) pkIndexes() []int {
@@ -180,8 +188,21 @@ func (s rowShape) upsert(table string, rows []*Tuple, skip []bool) string {
 		cols = append(cols, QuoteIdent(c))
 		idx = append(idx, i)
 	}
+	override := false
+	for _, i := range idx {
+		if s.identityAlways(i) {
+			override = true
+			break
+		}
+	}
 	var b strings.Builder
-	b.WriteString("INSERT INTO " + s.qualified(table) + " (" + strings.Join(cols, ", ") + ") VALUES ")
+	b.WriteString("INSERT INTO " + s.qualified(table) + " (" + strings.Join(cols, ", ") + ") ")
+	if override {
+		// GENERATED ALWAYS identity columns reject an explicit value unless
+		// the copy overrides the system-generated value.
+		b.WriteString("OVERRIDING SYSTEM VALUE ")
+	}
+	b.WriteString("VALUES ")
 	for ri, r := range rows {
 		if ri > 0 {
 			b.WriteString(", ")
@@ -199,11 +220,26 @@ func (s rowShape) upsert(table string, rows []*Tuple, skip []bool) string {
 	for _, k := range s.PK {
 		pk = append(pk, QuoteIdent(k))
 	}
-	b.WriteString(" ON CONFLICT (" + strings.Join(pk, ", ") + ") DO UPDATE SET ")
-	var sets []string
-	for _, c := range cols {
-		sets = append(sets, c+" = EXCLUDED."+c)
+	pkSet := map[string]bool{}
+	for _, k := range s.PK {
+		pkSet[k] = true
 	}
+	var sets []string
+	for j, i := range idx {
+		// The conflict target never needs updating, and a GENERATED ALWAYS
+		// identity column cannot be updated to a non-DEFAULT value at all.
+		if pkSet[s.Columns[i]] || s.identityAlways(i) {
+			continue
+		}
+		sets = append(sets, cols[j]+" = EXCLUDED."+cols[j])
+	}
+	if len(sets) == 0 {
+		// Every non-key column is an identity/PK column: nothing to update on
+		// conflict, so the copied row is already present.
+		b.WriteString(" ON CONFLICT (" + strings.Join(pk, ", ") + ") DO NOTHING")
+		return b.String()
+	}
+	b.WriteString(" ON CONFLICT (" + strings.Join(pk, ", ") + ") DO UPDATE SET ")
 	b.WriteString(strings.Join(sets, ", "))
 	return b.String()
 }

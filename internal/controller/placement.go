@@ -68,6 +68,7 @@ type placementState struct {
 	Targets   []int32          `json:"targets,omitempty"`
 	Holders   []int32          `json:"holders,omitempty"`
 	Columns   []string         `json:"columns,omitempty"`
+	Identity  []string         `json:"identity,omitempty"`
 	PK        []string         `json:"pk,omitempty"`
 	KeyType   string           `json:"key_type,omitempty"`
 	Copied    map[string]bool  `json:"copied,omitempty"`
@@ -457,7 +458,7 @@ func (p *Placer) load(ctx context.Context, wf *placementWorkflow) error {
 	rs := catalog.RangeSet(ranges)
 	wf.rt = &placementRouter{placement: wf.spec.To, home: home, ids: ids, ranges: rs, keyIndex: -1}
 	wf.from = &placementRouter{placement: wf.spec.From, home: home, ids: ids, ranges: rs, keyIndex: -1}
-	wf.shape = rowShape{Schema: wf.spec.SchemaName, Name: wf.spec.TableName, Columns: wf.st.Columns, PK: wf.st.PK}
+	wf.shape = rowShape{Schema: wf.spec.SchemaName, Name: wf.spec.TableName, Columns: wf.st.Columns, Identity: wf.st.Identity, PK: wf.st.PK}
 	wf.rt.keyIndex = slices.Index(wf.st.Columns, wf.spec.To.key())
 	wf.from.keyIndex = slices.Index(wf.st.Columns, wf.spec.From.key())
 	wf.rt.keyType, wf.from.keyType = wf.st.KeyType, wf.st.KeyType

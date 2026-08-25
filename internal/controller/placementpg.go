@@ -36,9 +36,10 @@ func (p *Placer) describe(ctx context.Context, wf *placementWorkflow) error {
 	if len(pk) == 0 {
 		return fatal("table %s has no primary key; placement workflows apply rows by primary key", wf.spec.table())
 	}
-	wf.st.Columns, wf.st.PK = nil, pk
+	wf.st.Columns, wf.st.Identity, wf.st.PK = nil, nil, pk
 	for _, c := range cols {
 		wf.st.Columns = append(wf.st.Columns, c.name)
+		wf.st.Identity = append(wf.st.Identity, c.identity)
 	}
 	if wf.spec.To.Placement == "sharded" {
 		key := wf.spec.To.key()
@@ -816,6 +817,12 @@ func (p *Placer) swapOn(ctx context.Context, wf *placementWorkflow, conn ShardCo
 				return err
 			}
 		}
+		// The shadow's serial/identity sequences start fresh, so advance
+		// each to the greatest value already copied onto this shard; without
+		// it the next implicit insert reuses a copied identifier.
+		if err := advanceSequences(ctx, conn, wf.spec.SchemaName, wf.spec.TableName); err != nil {
+			return err
+		}
 	}
 	_, err = conn.Exec(ctx, "COMMIT")
 	return err
@@ -835,6 +842,33 @@ func moveOwnedSequences(ctx context.Context, conn ShardConn, schema, from, to st
 	}
 	for _, s := range seqs {
 		if _, err := conn.Exec(ctx, fmt.Sprintf("ALTER SEQUENCE %s OWNED BY %s.%s.%s", s.Seq, QuoteIdent(schema), QuoteIdent(to), QuoteIdent(s.Col))); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// advanceSequences sets every serial or identity sequence backing a column of
+// the table to the greatest value present, so a later implicit insert does not
+// reuse an identifier that was copied in. GREATEST with the current last_value
+// never moves a shared sequence backwards.
+func advanceSequences(ctx context.Context, conn ShardConn, schema, table string) error {
+	qual := QuoteIdent(schema) + "." + QuoteIdent(table)
+	rows, err := conn.Query(ctx, `SELECT a.attname, pg_get_serial_sequence($1, a.attname)
+		FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $2 AND c.relname = $3 AND a.attnum > 0 AND NOT a.attisdropped
+		AND pg_get_serial_sequence($1, a.attname) IS NOT NULL`, qual, schema, table)
+	if err != nil {
+		return err
+	}
+	cols, err := pgx.CollectRows(rows, pgx.RowToStructByPos[struct{ Col, Seq string }])
+	if err != nil {
+		return err
+	}
+	for _, c := range cols {
+		if _, err := conn.Exec(ctx, fmt.Sprintf(
+			`SELECT setval(%s::regclass, GREATEST(coalesce((SELECT max(%s) FROM %s), 0), (SELECT last_value FROM %s)), true)`,
+			QuoteLiteral(&c.Seq), QuoteIdent(c.Col), qual, c.Seq)); err != nil {
 			return err
 		}
 	}
