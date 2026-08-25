@@ -95,6 +95,17 @@ func golden() []want {
 		{sql: "insert into regions (id) values (nextval('s'))", kind: Refuse, msg: "a write to reference table \"regions\" cannot call nextval()"},
 		{sql: "update regions set name = gen_random_uuid()::text", kind: Refuse, msg: "a write to reference table \"regions\" cannot call gen_random_uuid()"},
 		{sql: "delete from regions where random() < 0.5", kind: Refuse, msg: "a write to reference table \"regions\" cannot call random()"},
+		// A deny list of known-bad names cannot be complete: volatility is
+		// a catalog property and anyone can add a function. These are the
+		// cases that used to pass straight through.
+		{sql: "insert into regions values (1, uuid_generate_v4()::text)", kind: Refuse, msg: "a write to reference table \"regions\" cannot call uuid_generate_v4()"},
+		{sql: "insert into regions values (1, my_ticket())", kind: Refuse, msg: "a write to reference table \"regions\" cannot call my_ticket()"},
+		{sql: "insert into regions values (1, public.now())", kind: Refuse, msg: "a write to reference table \"regions\" cannot call now()"},
+		{sql: "update regions set name = app.next_code()", kind: Refuse, msg: "a write to reference table \"regions\" cannot call next_code()"},
+		// Proven-immutable built-ins still work, qualified or not.
+		{sql: "insert into regions values (1, upper('eu'))", kind: Reference, shards: "all"},
+		{sql: "insert into regions values (1, pg_catalog.upper('eu'))", kind: Reference, shards: "all"},
+		{sql: "update regions set name = concat(name, '-x')", kind: Reference, shards: "all"},
 		{sql: "insert into regions select id, name from items", kind: Refuse, msg: "a write to reference table \"regions\" cannot read sharded or unsharded tables"},
 		{sql: "insert into regions select tenant_id, 'x' from orders where tenant_id = 1", kind: Refuse, msg: "a write to reference table \"regions\" cannot read sharded or unsharded tables"},
 		{sql: "update regions r set name = i.name from items i where i.id = r.id", kind: Refuse, msg: "a write to reference table \"regions\" cannot read sharded or unsharded tables"},

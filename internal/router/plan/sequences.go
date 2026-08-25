@@ -29,19 +29,50 @@ func SequenceName(database, schema, table, column string) string {
 	return database + "." + schema + "." + table + "." + column
 }
 
-// volatileFuncs are the functions whose value differs between shards (or
-// between calls) and so cannot appear in a statement replicated to every
-// shard of a reference table.
-var volatileFuncs = map[string]bool{
-	"now": true, "clock_timestamp": true, "statement_timestamp": true, "transaction_timestamp": true,
-	"timeofday": true, "random": true, "random_normal": true, "gen_random_uuid": true, "uuidv4": true, "uuidv7": true,
-	"nextval": true, "currval": true, "lastval": true, "setval": true, "pg_backend_pid": true,
-	"txid_current": true, "pg_current_xact_id": true, "pg_current_wal_lsn": true, "inet_server_addr": true,
-	"current_date": true, "current_time": true, "current_timestamp": true, "localtime": true, "localtimestamp": true,
+// immutableFuncs are the built-ins a write replicated to every shard of a
+// reference table may call: given the same arguments each one returns the
+// same answer on every shard, in any session, at any time.
+//
+// This is an allow list on purpose. PostgreSQL's volatility is a catalog
+// property and anyone can define a VOLATILE function, so a deny list of
+// known-bad names cannot be complete: uuid_generate_v4() from uuid-ossp,
+// or any user-defined function, would simply not be on it and would commit
+// a different value on every shard. Anything not proven immutable here is
+// refused, and the client is told to compute the value itself.
+var immutableFuncs = map[string]bool{
+	// text
+	"lower": true, "upper": true, "initcap": true, "length": true, "char_length": true,
+	"character_length": true, "octet_length": true, "bit_length": true,
+	"trim": true, "btrim": true, "ltrim": true, "rtrim": true, "lpad": true, "rpad": true,
+	"substr": true, "substring": true, "left": true, "right": true, "reverse": true,
+	"replace": true, "translate": true, "repeat": true, "concat": true, "concat_ws": true,
+	"split_part": true, "strpos": true, "position": true, "starts_with": true,
+	"md5": true, "sha224": true, "sha256": true, "sha384": true, "sha512": true,
+	"encode": true, "decode": true, "quote_ident": true, "quote_literal": true, "quote_nullable": true,
+	"ascii": true, "chr": true,
+	// numeric
+	"abs": true, "ceil": true, "ceiling": true, "floor": true, "round": true, "trunc": true,
+	"sign": true, "mod": true, "div": true, "power": true, "sqrt": true, "cbrt": true,
+	"exp": true, "ln": true, "log": true, "log10": true, "greatest": true, "least": true,
+	"width_bucket": true,
+	// conditional and null handling
+	"coalesce": true, "nullif": true,
+	// json, arrays and misc structural helpers
+	"array_length": true, "array_lower": true, "array_upper": true, "cardinality": true,
+	"array_position": true, "array_remove": true, "array_replace": true, "array_to_string": true,
+	"string_to_array": true, "unnest": true,
+	"jsonb_build_object": true, "jsonb_build_array": true, "json_build_object": true, "json_build_array": true,
+	"jsonb_extract_path": true, "jsonb_extract_path_text": true, "jsonb_array_length": true,
+	"to_jsonb": true, "to_json": true,
+	// deterministic date arithmetic on values the statement supplies
+	"age": true, "date_part": true, "extract": true, "make_date": true, "make_time": true,
+	"make_interval": true, "make_timestamp": true,
 }
 
-// volatileCall names the first volatile function call under node, "" if none.
-func volatileCall(node *pgquerypb.Node) string {
+// nonImmutableCall names the first call under node that is not proven
+// immutable, "" if every call is. Callers use it to refuse a statement that
+// must evaluate identically on every shard.
+func nonImmutableCall(node *pgquerypb.Node) string {
 	found := ""
 	visit(node, func(n *pgquerypb.Node) bool {
 		if found != "" {
@@ -50,20 +81,23 @@ func volatileCall(node *pgquerypb.Node) string {
 		switch x := n.GetNode().(type) {
 		case *pgquerypb.Node_FuncCall:
 			names := stringList(x.FuncCall.GetFuncname())
-			if len(names) > 0 && volatileFuncs[strings.ToLower(names[len(names)-1])] {
-				found = names[len(names)-1]
+			if len(names) == 0 {
+				return true
+			}
+			name := strings.ToLower(names[len(names)-1])
+			// A schema-qualified call is only the built-in when it is
+			// qualified with pg_catalog; anything else is somebody's own
+			// function, whatever it is named.
+			builtin := len(names) == 1 || strings.EqualFold(names[len(names)-2], "pg_catalog")
+			if !builtin || !immutableFuncs[name] {
+				found = name
 				return false
 			}
 		case *pgquerypb.Node_SqlvalueFunction:
-			switch x.SqlvalueFunction.GetOp() {
-			case pgquerypb.SQLValueFunctionOp_SVFOP_CURRENT_DATE, pgquerypb.SQLValueFunctionOp_SVFOP_CURRENT_TIME,
-				pgquerypb.SQLValueFunctionOp_SVFOP_CURRENT_TIME_N, pgquerypb.SQLValueFunctionOp_SVFOP_CURRENT_TIMESTAMP,
-				pgquerypb.SQLValueFunctionOp_SVFOP_CURRENT_TIMESTAMP_N, pgquerypb.SQLValueFunctionOp_SVFOP_LOCALTIME,
-				pgquerypb.SQLValueFunctionOp_SVFOP_LOCALTIME_N, pgquerypb.SQLValueFunctionOp_SVFOP_LOCALTIMESTAMP,
-				pgquerypb.SQLValueFunctionOp_SVFOP_LOCALTIMESTAMP_N:
-				found = strings.ToLower(strings.TrimPrefix(x.SqlvalueFunction.GetOp().String(), "SVFOP_"))
-				return false
-			}
+			// current_date, current_timestamp, current_user and friends:
+			// none of them is immutable.
+			found = strings.ToLower(strings.TrimPrefix(x.SqlvalueFunction.GetOp().String(), "SVFOP_"))
+			return false
 		}
 		return true
 	})

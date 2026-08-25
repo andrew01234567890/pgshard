@@ -1259,8 +1259,8 @@ func (w *walker) referenceWrite(otherRels int) error {
 		return notYet("a write to reference table \""+w.target.name+"\" cannot read sharded or unsharded tables",
 			"the statement runs on every shard; a sharded or unsharded table is present on one shard only")
 	}
-	if fn := volatileCall(w.root); fn != "" {
-		return notYet("a write to reference table \""+w.target.name+"\" cannot call "+fn+"(): its value would differ between shards",
+	if fn := nonImmutableCall(w.root); fn != "" {
+		return notYet("a write to reference table \""+w.target.name+"\" cannot call "+fn+"(): the statement runs on every shard and only a function proven to return the same answer everywhere may take part",
 			"compute the value in the client and pass it as a literal or parameter")
 	}
 	p.Kind, p.Shards = Reference, w.allShards()
