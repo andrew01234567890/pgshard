@@ -194,3 +194,88 @@ func TestWriteFenceOwnerCASOnPostgres(t *testing.T) {
 		t.Fatal("fence still up after owner release")
 	}
 }
+
+// TestBarrierPauseAndWriterCountOnPostgres exercises the pause and the writer
+// drain against real PostgreSQL: a paused shard refuses writes, an in-flight
+// write transaction is counted, and resuming restores writes.
+func TestBarrierPauseAndWriterCountOnPostgres(t *testing.T) {
+	f := newResolverFixtureWith(t)
+	ctx := context.Background()
+	groups := &SQLBarrierGroups{Pool: f.pool, Shards: f.dialer}
+	g := GroupRef{Name: "shard0", Set: "default", ID: 0}
+	shard := connect(t, f.shardDSN(0))
+	mustExec(t, shard, `CREATE TABLE paused_t (id int)`)
+
+	if n, err := groups.WritersSince(ctx, g, time.Now()); err != nil || n != 0 {
+		t.Fatalf("idle shard writers = %d %v", n, err)
+	}
+	if n, err := groups.SubscriptionCount(ctx, g); err != nil || n != 0 {
+		t.Fatalf("subscriptions on an idle shard = %d %v", n, err)
+	}
+	// An in-flight write transaction is visible to the drain.
+	busy := connect(t, f.shardDSN(0))
+	mustExec(t, busy, `BEGIN`)
+	mustExec(t, busy, `INSERT INTO paused_t VALUES (1)`)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		n, err := groups.WritersSince(ctx, g, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("an open write transaction was never counted")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	mustExec(t, busy, `COMMIT`)
+
+	// A transaction opened BEFORE the pause keeps the read-write mode it
+	// started with, so it can still write afterwards and must keep the drain
+	// busy even though it has not written yet.
+	pre := connect(t, f.shardDSN(0))
+	mustExec(t, pre, `BEGIN`)
+	mustExec(t, pre, `SELECT 1`)
+
+	pausedAt, err := groups.PauseWrites(ctx, g, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pausedAt.IsZero() {
+		t.Fatal("pause did not report when it became effective")
+	}
+	if on, err := groups.PauseEffective(ctx, g); err != nil || !on {
+		t.Fatalf("pause not effective on a fresh connection: %v %v", on, err)
+	}
+	if n, err := groups.WritersSince(ctx, g, pausedAt); err != nil || n < 1 {
+		t.Fatalf("a transaction opened before the pause must block the drain: %d %v", n, err)
+	}
+	// It really can still write, which is why it must be drained.
+	if _, err := pre.Exec(ctx, `INSERT INTO paused_t VALUES (99)`); err != nil {
+		t.Fatalf("a pre-pause transaction should still be read-write: %v", err)
+	}
+	mustExec(t, pre, `ROLLBACK`)
+	if n, err := groups.WritersSince(ctx, g, pausedAt); err != nil || n != 0 {
+		t.Fatalf("drain not clear after the pre-pause transaction ended: %d %v", n, err)
+	}
+	writer := connect(t, f.shardDSN(0))
+	if _, err := writer.Exec(ctx, `INSERT INTO paused_t VALUES (2)`); err == nil || !strings.Contains(err.Error(), "read-only transaction") {
+		t.Fatalf("paused shard accepted a write: %v", err)
+	}
+	// The barrier's own work still runs on a paused group.
+	if _, err := groups.CreateRestorePoint(ctx, g, "pgshard-pause-check"); err != nil {
+		t.Fatalf("restore point on a paused group: %v", err)
+	}
+	if _, err := groups.PauseWrites(ctx, g, false); err != nil {
+		t.Fatal(err)
+	}
+	if on, err := groups.PauseEffective(ctx, g); err != nil || on {
+		t.Fatalf("pause still effective after resume: %v %v", on, err)
+	}
+	resumed := connect(t, f.shardDSN(0))
+	if _, err := resumed.Exec(ctx, `INSERT INTO paused_t VALUES (3)`); err != nil {
+		t.Fatalf("resumed shard still refuses writes: %v", err)
+	}
+}

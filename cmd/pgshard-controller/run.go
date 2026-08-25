@@ -138,6 +138,9 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 			Catalog: controller.CatalogDialer(pool), Roles: roles}
 		go applier.Run(ctx, *applyEvery, leader.Load)
 		go (&controller.StreamMonitor{Pool: pool, Logger: logger, Shards: dialer}).Run(ctx, *resolveEvery)
+		// A barrier whose controller died leaves the cluster fenced and its
+		// shards paused; lift that as soon as no barrier is running.
+		go barrier.RunRecovery(ctx, *resolveEvery)
 		subTemplate := *subscriptionTemplate
 		if subTemplate == "" {
 			subTemplate = *shardDSNTemplate

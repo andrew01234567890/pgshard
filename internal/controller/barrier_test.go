@@ -20,6 +20,7 @@ type fakeBarrierStore struct {
 	preparing int
 	watermark int64
 	recorded  []RestorePoint
+	owner     string
 	reserved  []string
 	failed    map[string]string
 	journal   *[]string
@@ -33,7 +34,7 @@ func (s *fakeBarrierStore) log(step string) {
 
 func (s *fakeBarrierStore) Lock(context.Context) (func(), error) { return func() {}, nil }
 
-func (s *fakeBarrierStore) Fence(_ context.Context, active bool, reason, _ string) error {
+func (s *fakeBarrierStore) Fence(_ context.Context, active bool, reason, owner string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.fail["fence"]; err != nil && active {
@@ -44,6 +45,7 @@ func (s *fakeBarrierStore) Fence(_ context.Context, active bool, reason, _ strin
 	}
 	s.fenced = active
 	if active {
+		s.owner = owner
 		s.fencedAt = s.now()
 		s.log("fence " + reason)
 	} else {
@@ -139,6 +141,18 @@ func (s *fakeBarrierStore) Record(_ context.Context, rp RestorePoint) (string, e
 
 func (s *fakeBarrierStore) ShardMapGeneration(context.Context) (int64, error) { return 42, nil }
 
+func (s *fakeBarrierStore) FenceRaised(context.Context) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fenced, nil
+}
+
+func (s *fakeBarrierStore) FenceOwnedBy(_ context.Context, owner string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fenced && s.owner == owner, nil
+}
+
 // fakeGroups is the catalog and two shards with their prepared transaction
 // counts and archives.
 type fakeGroups struct {
@@ -155,6 +169,11 @@ type fakeGroups struct {
 	store        *fakeBarrierStore
 	// onRestorePoint runs on every CreateRestorePoint, before the point.
 	onRestorePoint func()
+	// paused records which groups currently refuse writes, and writers how
+	// many write transactions each still has in flight.
+	paused  map[string]bool
+	writers map[string]int
+	subs    map[string]int
 }
 
 func (g *fakeGroups) List(context.Context) ([]GroupRef, error) {
@@ -192,6 +211,54 @@ func (g *fakeGroups) CreateRestorePoint(_ context.Context, ref GroupRef, name st
 	return RestorePointResult{LSN: uint64(1000*n + int(ref.ID)), Timeline: 1 + int64(ref.ID), WALSegment: fmt.Sprintf("00000001000000000000000%d", n)}, nil
 }
 
+func (g *fakeGroups) SubscriptionCount(_ context.Context, ref GroupRef) (int, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if err := g.fail["subs:"+ref.Name]; err != nil {
+		return 0, err
+	}
+	return g.subs[ref.Name], nil
+}
+
+func (g *fakeGroups) PauseEffective(_ context.Context, ref GroupRef) (bool, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if err := g.fail["effective:"+ref.Name]; err != nil {
+		return false, err
+	}
+	return g.paused[ref.Name], nil
+}
+
+func (g *fakeGroups) PauseWrites(_ context.Context, ref GroupRef, pause bool) (time.Time, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	key := "pause"
+	if !pause {
+		key = "resume"
+	}
+	if err := g.fail[key+":"+ref.Name]; err != nil {
+		return time.Time{}, err
+	}
+	g.paused[ref.Name] = pause
+	*g.journal = append(*g.journal, key+" "+ref.Name)
+	return time.Unix(0, 0), nil
+}
+
+func (g *fakeGroups) WritersSince(_ context.Context, ref GroupRef, _ time.Time) (int, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if err := g.fail["writers:"+ref.Name]; err != nil {
+		return 0, err
+	}
+	n := g.writers[ref.Name]
+	*g.journal = append(*g.journal, fmt.Sprintf("writers %s=%d", ref.Name, n))
+	// A paused group drains: each poll finishes one writer.
+	if n > 0 {
+		g.writers[ref.Name] = n - 1
+	}
+	return n, nil
+}
+
 func (g *fakeGroups) ArchivedThrough(_ context.Context, ref GroupRef) (string, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -220,7 +287,8 @@ func newBarrierFixture() *barrierFixture {
 	now := func() time.Time { f.clock = f.clock.Add(time.Millisecond); return f.clock }
 	f.store = &fakeBarrierStore{journal: &f.journal, fail: map[string]error{}, now: now}
 	f.groups = &fakeGroups{prepared: map[string]int{}, archived: map[string]string{}, points: map[string][]string{},
-		journal: &f.journal, fail: map[string]error{}, archiveAfter: map[string]int{}, polls: map[string]int{}, store: f.store}
+		journal: &f.journal, fail: map[string]error{}, archiveAfter: map[string]int{}, polls: map[string]int{}, store: f.store,
+		paused: map[string]bool{}, writers: map[string]int{}, subs: map[string]int{}}
 	for _, g := range []string{CatalogGroup, "shard0", "shard1"} {
 		f.groups.archived[g] = "000000010000000000000009"
 	}
@@ -238,11 +306,34 @@ func TestBarrierHappyPathStepOrder(t *testing.T) {
 	want := []string{
 		"reserve nightly-1",
 		"fence barrier nightly-1",
-		"preparing=0", "prepared catalog=0", "prepared shard0=0", "prepared shard1=0",
-		"preparing=0", "prepared catalog=0", "prepared shard0=0", "prepared shard1=0",
-		"restorepoint catalog pgshard-nightly-1", "restorepoint shard0 pgshard-nightly-1", "restorepoint shard1 pgshard-nightly-1",
-		"archived catalog", "archived shard0", "archive-wait shard1", "archive-wait shard1", "archived shard1",
-		"record nightly-1", "release",
+		"pause shard0",
+		"pause shard1",
+		"preparing=0",
+		"prepared catalog=0",
+		"prepared shard0=0",
+		"prepared shard1=0",
+		"writers shard0=0",
+		"writers shard1=0",
+		"preparing=0",
+		"prepared catalog=0",
+		"prepared shard0=0",
+		"prepared shard1=0",
+		"writers shard0=0",
+		"writers shard1=0",
+		"restorepoint catalog pgshard-nightly-1",
+		"restorepoint shard0 pgshard-nightly-1",
+		"restorepoint shard1 pgshard-nightly-1",
+		"archived catalog",
+		"archived shard0",
+		"archive-wait shard1",
+		"archive-wait shard1",
+		"archived shard1",
+		"writers shard0=0",
+		"writers shard1=0",
+		"record nightly-1",
+		"resume shard0",
+		"resume shard1",
+		"release",
 	}
 	if strings.Join(f.journal, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("journal:\n%s\nwant:\n%s", strings.Join(f.journal, "\n"), strings.Join(want, "\n"))
@@ -407,5 +498,167 @@ func TestBarrierToleratesDecisionsSettledDuringDrain(t *testing.T) {
 	f.b.DrainTimeout = 2 * time.Second
 	if _, err := f.b.Run(context.Background(), "settled"); err != nil {
 		t.Fatalf("decisions that settled during the drain must not fail the barrier: %v\n%s", err, strings.Join(f.journal, "\n"))
+	}
+}
+
+// TestBarrierDrainsOrdinaryWriters: writes that started before the pause must
+// finish before any restore point is taken, otherwise a write could commit
+// between two groups' points.
+func TestBarrierDrainsOrdinaryWriters(t *testing.T) {
+	f := newBarrierFixture()
+	f.groups.writers["shard1"] = 2
+	if _, err := f.b.Run(context.Background(), "b"); err != nil {
+		t.Fatal(err)
+	}
+	j := strings.Join(f.journal, "\n")
+	first := strings.Index(j, "restorepoint")
+	if last := strings.LastIndex(j[:first], "writers shard1="); last < 0 {
+		t.Fatalf("writers were never drained before the points:\n%s", j)
+	}
+	// Every writer poll happens before the first restore point.
+	if strings.Contains(j[first:], "writers shard1=2") || strings.Contains(j[first:], "writers shard1=1") {
+		t.Fatalf("restore points taken while a group still had writers:\n%s", j)
+	}
+}
+
+// TestBarrierWriterDrainTimesOut: a writer that never finishes fails the
+// barrier rather than certifying an inconsistent point.
+func TestBarrierWriterDrainTimesOut(t *testing.T) {
+	f := newBarrierFixture()
+	f.groups.writers["shard0"] = 1 << 20
+	_, err := f.b.Run(context.Background(), "b")
+	if err == nil || !strings.Contains(err.Error(), "shard0 has") {
+		t.Fatalf("err %v, want a writer drain timeout", err)
+	}
+	if f.store.fenced {
+		t.Fatal("fence left raised")
+	}
+	if f.groups.paused["shard0"] || f.groups.paused["shard1"] {
+		t.Fatal("groups left paused after a failed barrier")
+	}
+}
+
+// TestBarrierAbortsWhenAGroupCannotBePaused: certifying while one group still
+// accepts writes is the very inconsistency the pause prevents.
+func TestBarrierAbortsWhenAGroupCannotBePaused(t *testing.T) {
+	f := newBarrierFixture()
+	f.groups.fail["pause:shard1"] = errors.New("permission denied")
+	_, err := f.b.Run(context.Background(), "b")
+	if err == nil || !strings.Contains(err.Error(), "pause writes on shard1") {
+		t.Fatalf("err %v", err)
+	}
+	if len(f.groups.points) != 0 {
+		t.Fatalf("restore points taken despite the pause failure: %v", f.groups.points)
+	}
+	if f.groups.paused["shard0"] {
+		t.Fatal("the already-paused group was not resumed")
+	}
+	if f.store.fenced {
+		t.Fatal("fence left raised")
+	}
+}
+
+// TestBarrierRecoveryLiftsAStrandedFence: a barrier whose controller died
+// leaves the cluster fenced and paused; the recovery pass lifts both.
+func TestBarrierRecoveryLiftsAStrandedPause(t *testing.T) {
+	f := newBarrierFixture()
+	f.store.fenced = true
+	f.store.fencedAt = f.clock
+	f.groups.paused["shard0"], f.groups.paused["shard1"] = true, true
+
+	// A fence younger than the longest possible run may belong to a barrier
+	// that is still going, so recovery leaves it alone.
+	if err := f.b.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !f.groups.paused["shard0"] {
+		t.Fatal("recovery resumed a pause that could still belong to a live barrier")
+	}
+
+	// Once no run can still be in flight, the pause is lifted.
+	f.clock = f.clock.Add(2 * f.b.maxRunTime())
+	if err := f.b.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if f.groups.paused["shard0"] || f.groups.paused["shard1"] {
+		t.Fatalf("groups left paused: %v", f.groups.paused)
+	}
+	// The fence is never cleared by recovery: a barrier restore raises it
+	// deliberately and must stay fenced until its reconciliation finishes.
+	if !f.store.fenced {
+		t.Fatal("recovery cleared a fence it does not own")
+	}
+	f.store.fenced = false
+	// With no fence raised it is a no-op.
+	before := len(f.journal)
+	if err := f.b.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.journal) != before {
+		t.Fatalf("recovery touched a healthy cluster: %v", f.journal[before:])
+	}
+}
+
+// TestBarrierRefusesWhileACopyIsApplying: logical replication apply workers
+// write outside both the pause and the drain, so a group receiving a copy
+// cannot be part of a certified point.
+func TestBarrierRefusesWhileACopyIsApplying(t *testing.T) {
+	f := newBarrierFixture()
+	f.groups.subs["shard1"] = 1
+	_, err := f.b.Run(context.Background(), "b")
+	if err == nil || !strings.Contains(err.Error(), "subscription") {
+		t.Fatalf("err %v, want a refusal naming the subscription", err)
+	}
+	if len(f.groups.points) != 0 {
+		t.Fatalf("restore points taken while a copy was applying: %v", f.groups.points)
+	}
+	if f.groups.paused["shard0"] {
+		t.Fatal("a group was left paused after the refusal")
+	}
+	if f.store.fenced {
+		t.Fatal("fence left raised")
+	}
+}
+
+// TestBarrierRefusesToCertifyAfterAPauseIsLost: a primary that restarts, is
+// promoted, or is resumed underneath the run stops refusing writes, so the
+// window is no longer provably quiet and the point must not be certified.
+func TestBarrierRefusesToCertifyAfterAPauseIsLost(t *testing.T) {
+	f := newBarrierFixture()
+	// Resume shard1 underneath the run, just before the points are taken.
+	f.groups.onRestorePoint = func() { f.groups.paused["shard1"] = false }
+	_, err := f.b.Run(context.Background(), "b")
+	if err == nil || !strings.Contains(err.Error(), "stopped refusing writes") {
+		t.Fatalf("err %v, want a refusal to certify", err)
+	}
+	if len(f.store.recorded) != 0 {
+		t.Fatal("a point was certified after the pause was lost")
+	}
+}
+
+// TestBarrierKeepsTheFenceRaisedWhenAResumeFails: the fence is the durable
+// trace that shards are still paused, so it must stay up for recovery to
+// retry rather than stranding them silently.
+func TestBarrierKeepsTheFenceRaisedWhenAResumeFails(t *testing.T) {
+	f := newBarrierFixture()
+	f.groups.fail["resume:shard1"] = errors.New("connection refused")
+	_, err := f.b.Run(context.Background(), "b")
+	if err == nil || !strings.Contains(err.Error(), "resume writes on shard1") {
+		t.Fatalf("err %v", err)
+	}
+	if !f.store.fenced {
+		t.Fatal("fence cleared even though a shard is still paused; recovery can never repair it")
+	}
+	if !f.groups.paused["shard1"] {
+		t.Fatal("test setup: shard1 should still be paused")
+	}
+	// Recovery retries the resume once no run can be in flight.
+	f.groups.fail["resume:shard1"] = nil
+	f.clock = f.clock.Add(2 * f.b.maxRunTime())
+	if err := f.b.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if f.groups.paused["shard1"] {
+		t.Fatal("recovery did not resume the stranded shard")
 	}
 }
