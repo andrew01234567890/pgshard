@@ -323,19 +323,26 @@ func (c *Copier) pinSource(ctx context.Context, wf *copyWorkflow) (string, []int
 		// different serving sets around a flip. Claim the source only if none
 		// is recorded, and take whatever value is stored afterwards, so every
 		// pass agrees on the one that won.
-		if err := c.Pool.QueryRow(ctx, `WITH claim AS (
-			UPDATE pgshard.workflows
+		err = c.Pool.QueryRow(ctx, `UPDATE pgshard.workflows
 			   SET status = status || jsonb_build_object('cutover', coalesce(status->'cutover', '{}'::jsonb) || jsonb_build_object('source_set', $2::text)),
 			       updated_at = now()
 			 WHERE id = $1::uuid AND coalesce(status->'cutover'->>'source_set', '') = ''
-			RETURNING status->'cutover'->>'source_set' AS s)
-			SELECT coalesce((SELECT s FROM claim),
-			                (SELECT status->'cutover'->>'source_set' FROM pgshard.workflows WHERE id = $1::uuid),
-			                '')`, wf.id, candidate).Scan(&set); err != nil {
+			RETURNING status->'cutover'->>'source_set'`, wf.id, candidate).Scan(&set)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Someone else claimed it, or the workflow is gone. Read it back in
+			// a separate statement: a query in the same statement as the update
+			// would share its snapshot and could not see the winner's commit.
+			err = c.Pool.QueryRow(ctx, `SELECT coalesce(status->'cutover'->>'source_set', '')
+				FROM pgshard.workflows WHERE id = $1::uuid`, wf.id).Scan(&set)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return "", nil, fmt.Errorf("record copy source: workflow %s is gone", wf.id)
+			}
+		}
+		if err != nil {
 			return "", nil, fmt.Errorf("record copy source: %w", err)
 		}
 		if set == "" {
-			return "", nil, fmt.Errorf("record copy source: workflow %s is gone", wf.id)
+			return "", nil, fmt.Errorf("record copy source: workflow %s recorded no source", wf.id)
 		}
 		wf.cutover.SourceSet = set
 	}

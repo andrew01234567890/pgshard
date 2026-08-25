@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -83,6 +84,75 @@ func TestPinSourceIsSetOnce(t *testing.T) {
 	}
 	if stored != "default" {
 		t.Fatalf("the recorded source was overwritten with %q", stored)
+	}
+}
+
+// TestPinSourceLoserAdoptsTheWinner covers the overlapping case the sequential
+// test cannot: the loser's claim statement starts while the winner still holds
+// the row, so it blocks, then finds nothing to update. It has to adopt the
+// winner's source rather than report the workflow gone.
+func TestPinSourceLoserAdoptsTheWinner(t *testing.T) {
+	parallelPG(t)
+	dsn := startPostgres(t)
+	ctx := context.Background()
+	conn := connect(t, dsn)
+	if err := catalog.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, `UPDATE pgshard.shard_sets SET generation = 1, state = 'serving' WHERE shard_set = 'default'`)
+	mustExec(t, conn, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES ('default', 0, '[,)')`)
+	mustExec(t, conn, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state) VALUES ('default', 0, 'shard0', 'serving')`)
+	mustExec(t, conn, `INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES
+		('14141414-1414-1414-1414-141414141414', 'reshard', 'running', '{"shard_set": "g2"}'::jsonb, '{}'::jsonb)`)
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	c := &Copier{Pool: pool}
+
+	// The winner records 'default' but holds the row until we say so.
+	winner, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := winner.Exec(ctx, `UPDATE pgshard.workflows
+		SET status = status || jsonb_build_object('cutover', jsonb_build_object('source_set', 'default'))
+		WHERE id = '14141414-1414-1414-1414-141414141414'`); err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		set string
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		set, _, err := c.pinSource(ctx, &copyWorkflow{id: "14141414-1414-1414-1414-141414141414"})
+		done <- result{set, err}
+	}()
+
+	// Give the loser time to block on the row before the winner commits.
+	select {
+	case r := <-done:
+		t.Fatalf("the loser finished before the winner committed: %q %v", r.set, r.err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	if err := winner.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("the loser failed instead of adopting the winner: %v", r.err)
+		}
+		if r.set != "default" {
+			t.Fatalf("the loser used %q, want the winner's default", r.set)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the loser never returned")
 	}
 }
 
