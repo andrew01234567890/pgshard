@@ -41,32 +41,80 @@ func SequenceName(database, schema, table, column string) string {
 // refused, and the client is told to compute the value itself.
 var immutableFuncs = map[string]bool{
 	// text
-	"lower": true, "upper": true, "initcap": true, "length": true, "char_length": true,
+	"lower": true, "upper": true, "initcap": true, "char_length": true,
 	"character_length": true, "octet_length": true, "bit_length": true,
 	"trim": true, "btrim": true, "ltrim": true, "rtrim": true, "lpad": true, "rpad": true,
 	"substr": true, "substring": true, "left": true, "right": true, "reverse": true,
-	"replace": true, "translate": true, "repeat": true, "concat": true, "concat_ws": true,
-	"split_part": true, "strpos": true, "position": true, "starts_with": true,
+	"replace": true, "translate": true, "repeat": true, "split_part": true, "strpos": true, "position": true, "starts_with": true,
 	"md5": true, "sha224": true, "sha256": true, "sha384": true, "sha512": true,
-	"encode": true, "decode": true, "quote_ident": true, "quote_literal": true, "quote_nullable": true,
-	"ascii": true, "chr": true,
+	"encode": true, "decode": true, "quote_ident": true, "ascii": true, "chr": true,
 	// numeric
 	"abs": true, "ceil": true, "ceiling": true, "floor": true, "round": true, "trunc": true,
 	"sign": true, "mod": true, "div": true, "power": true, "sqrt": true, "cbrt": true,
-	"exp": true, "ln": true, "log": true, "log10": true, "greatest": true, "least": true,
-	"width_bucket": true,
-	// conditional and null handling
-	"coalesce": true, "nullif": true,
+	"exp": true, "ln": true, "log": true, "log10": true, "width_bucket": true,
 	// json, arrays and misc structural helpers
 	"array_length": true, "array_lower": true, "array_upper": true, "cardinality": true,
-	"array_position": true, "array_remove": true, "array_replace": true, "array_to_string": true,
-	"string_to_array": true, "unnest": true,
-	"jsonb_build_object": true, "jsonb_build_array": true, "json_build_object": true, "json_build_array": true,
+	"array_position": true, "array_remove": true, "array_replace": true, "string_to_array": true, "unnest": true,
 	"jsonb_extract_path": true, "jsonb_extract_path_text": true, "jsonb_array_length": true,
-	"to_jsonb": true, "to_json": true,
 	// deterministic date arithmetic on values the statement supplies
-	"age": true, "date_part": true, "extract": true, "make_date": true, "make_time": true,
+	"make_date": true, "make_time": true,
 	"make_interval": true, "make_timestamp": true,
+}
+
+// specialDateWords are the inputs PostgreSQL's date and time types resolve
+// when they are parsed rather than when they are written: each shard reads
+// its own clock, so a reference row built from one differs everywhere.
+var specialDateWords = map[string]bool{
+	"now": true, "today": true, "tomorrow": true, "yesterday": true, "allballs": true,
+}
+
+// dateTimeTypes are the types those words mean something to.
+var dateTimeTypes = map[string]bool{
+	"date": true, "time": true, "timetz": true, "timestamp": true, "timestamptz": true,
+	"interval": true, "abstime": true,
+}
+
+// builtinName reports whether a dotted name refers to something in
+// pg_catalog: either unqualified, or qualified with pg_catalog itself.
+// Anything else belongs to somebody's own schema, whatever it is called.
+func builtinName(names []string) bool {
+	return len(names) == 1 || (len(names) > 1 && strings.EqualFold(names[len(names)-2], "pg_catalog"))
+}
+
+// unorderedPick names a construct that chooses which rows to use without
+// fully determining which ones, "" if there is none. Running the same
+// statement on every shard is only safe when every shard picks the same
+// rows, and LIMIT without a total order, TABLESAMPLE and DISTINCT ON do not
+// promise that - no function is involved, so the volatility check cannot
+// see them.
+func unorderedPick(node *pgquerypb.Node) string {
+	found := ""
+	visit(node, func(n *pgquerypb.Node) bool {
+		if found != "" {
+			return false
+		}
+		sel := n.GetSelectStmt()
+		if sel == nil {
+			return true
+		}
+		switch {
+		case sel.GetLimitCount() != nil || sel.GetLimitOffset() != nil:
+			found = "LIMIT or OFFSET"
+		case len(sel.GetDistinctClause()) > 0:
+			found = "DISTINCT ON"
+		}
+		if found != "" {
+			return false
+		}
+		for _, from := range sel.GetFromClause() {
+			if from.GetRangeTableSample() != nil {
+				found = "TABLESAMPLE"
+				return false
+			}
+		}
+		return true
+	})
+	return found
 }
 
 // nonImmutableCall names the first call under node that is not proven
@@ -85,11 +133,7 @@ func nonImmutableCall(node *pgquerypb.Node) string {
 				return true
 			}
 			name := strings.ToLower(names[len(names)-1])
-			// A schema-qualified call is only the built-in when it is
-			// qualified with pg_catalog; anything else is somebody's own
-			// function, whatever it is named.
-			builtin := len(names) == 1 || strings.EqualFold(names[len(names)-2], "pg_catalog")
-			if !builtin || !immutableFuncs[name] {
+			if !builtinName(names) || !immutableFuncs[name] {
 				found = name
 				return false
 			}
@@ -98,6 +142,34 @@ func nonImmutableCall(node *pgquerypb.Node) string {
 			// none of them is immutable.
 			found = strings.ToLower(strings.TrimPrefix(x.SqlvalueFunction.GetOp().String(), "SVFOP_"))
 			return false
+		case *pgquerypb.Node_AExpr:
+			// An operator is a function with punctuation for a name, and
+			// one in somebody's schema can be backed by anything.
+			if names := stringList(x.AExpr.GetName()); len(names) > 0 && !builtinName(names) {
+				found = "operator " + strings.Join(names, ".")
+				return false
+			}
+		case *pgquerypb.Node_TypeCast:
+			names := stringList(x.TypeCast.GetTypeName().GetNames())
+			if len(names) == 0 {
+				return true
+			}
+			typ := strings.ToLower(names[len(names)-1])
+			if !builtinName(names) {
+				// A user-defined cast runs a function of its author's
+				// choosing.
+				found = "cast to " + strings.Join(names, ".")
+				return false
+			}
+			// 'now'::timestamptz and friends read the clock when the shard
+			// parses them, so each shard gets its own answer.
+			if dateTimeTypes[typ] {
+				if lit := x.TypeCast.GetArg().GetAConst().GetSval().GetSval(); lit != "" &&
+					specialDateWords[strings.ToLower(strings.TrimSpace(lit))] {
+					found = "'" + strings.ToLower(strings.TrimSpace(lit)) + "'::" + typ
+					return false
+				}
+			}
 		}
 		return true
 	})
