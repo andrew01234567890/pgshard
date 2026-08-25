@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"net"
-	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -318,44 +316,7 @@ const pg19Image = "ghcr.io/andrew01234567890/pgshard-postgres:19"
 
 func startPostgres19(t *testing.T) string {
 	t.Helper()
-	if err := exec.Command("docker", "info").Run(); err != nil {
-		t.Skip("docker unavailable; skipping controller integration tests")
-	}
-	if exec.Command("docker", "image", "inspect", pg19Image).Run() != nil {
-		if out, err := exec.Command("docker", "pull", pg19Image).CombinedOutput(); err != nil {
-			t.Skipf("image %s unavailable: %v: %s", pg19Image, err, out)
-		}
-	}
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-	out, err := exec.Command("docker", "run", "-d", "--rm", "-p", fmt.Sprintf("127.0.0.1:%d:5432", port),
-		"--entrypoint", "sh", pg19Image, "-ec",
-		`initdb -D /tmp/pgdata --auth=trust -U postgres >/dev/null &&
-		 echo "host all all all trust" >> /tmp/pgdata/pg_hba.conf &&
-		 exec postgres -D /tmp/pgdata -c listen_addresses='*'`).CombinedOutput()
-	if err != nil {
-		t.Fatalf("docker run: %v: %s", err, out)
-	}
-	id := strings.TrimSpace(string(out))
-	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", id).Run() })
-	dsn := fmt.Sprintf("postgres://postgres@127.0.0.1:%d/postgres?sslmode=disable", port)
-	deadline := time.Now().Add(90 * time.Second)
-	for time.Now().Before(deadline) {
-		cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		conn, err := pgx.Connect(cctx, dsn)
-		cancel()
-		if err == nil {
-			_ = conn.Close(context.Background())
-			return dsn
-		}
-		time.Sleep(300 * time.Millisecond)
-	}
-	t.Fatal("postgres 19 did not become ready")
-	return ""
+	return startPostgresImage(t, pg19Image, nil)
 }
 
 // TestRewriteReturningStarHidesWorkingColumnOnPostgres executes the router's

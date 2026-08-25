@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -56,12 +57,14 @@ func newUpgradeFixture(t *testing.T) *copyFixture {
 	return f
 }
 
+var copyFixtureSeq atomic.Int64
+
 func newCopyFixtureOpts(t *testing.T, targets int, tgtImage string) *copyFixture {
 	t.Helper()
 	if err := exec.Command("docker", "info").Run(); err != nil {
 		t.Skip("docker unavailable; skipping reshard copy integration test")
 	}
-	f := &copyFixture{t: t, net: fmt.Sprintf("pgshard-copy-%d", time.Now().UnixNano()%1_000_000)}
+	f := &copyFixture{t: t, net: fmt.Sprintf("pgshard-copy-%d", copyFixtureSeq.Add(1))}
 	if out, err := exec.Command("docker", "network", "create", f.net).CombinedOutput(); err != nil {
 		t.Fatalf("docker network create: %v: %s", err, out)
 	}
@@ -252,6 +255,31 @@ func (f *copyFixture) pass() CopyOutcome {
 	return out
 }
 
+// waitApplied waits until every target carries the rows placement assigns
+// it, driving the copier so apply progress is made.
+func (f *copyFixture) waitApplied(table string, want map[int32]int64, timeout time.Duration) {
+	f.t.Helper()
+	tgts := make([]*pgx.Conn, 2)
+	for tid := range 2 {
+		tgts[tid] = connect(f.t, f.appDSN("g2", int32(tid)))
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		f.pass()
+		got := map[int32]int64{}
+		for tid := range 2 {
+			got[int32(tid)] = queryOne[int64](f.t, tgts[tid], "SELECT count(*) FROM "+table)
+		}
+		if got[0] == want[0] && got[1] == want[1] {
+			return
+		}
+		if time.Now().After(deadline) {
+			f.t.Fatalf("%s not applied: targets carry %v, placement assigns %v", table, got, want)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 func (f *copyFixture) expectedCounts(table string, ranges placement.RangeSet) map[int32]int64 {
 	f.t.Helper()
 	counts := map[int32]int64{}
@@ -380,7 +408,9 @@ func TestReshardCopyOnPostgres(t *testing.T) {
 		time.Sleep(time.Second)
 	}
 	f.seed(2300, 50)
-	time.Sleep(2 * time.Second)
+	// Catch-up completes at a lag threshold, not at zero, so the extra rows
+	// still have to be waited for rather than slept over.
+	f.waitApplied("orders", f.expectedCounts("orders", f.tgtRng), time.Minute)
 	f.pass()
 	var progress string
 	if err := f.catalog.QueryRow(ctx, `SELECT status->'copy'->'progress' FROM pgshard.workflows WHERE id = $1::uuid`, id).Scan(&progress); err != nil {

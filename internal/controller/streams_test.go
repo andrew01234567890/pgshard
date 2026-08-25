@@ -10,6 +10,7 @@ import (
 )
 
 func TestStreamMonitor(t *testing.T) {
+	parallelPG(t)
 	f := newResolverFixture(t)
 	ctx := context.Background()
 	m := &StreamMonitor{Pool: f.pool, Shards: f.dialer}
@@ -93,6 +94,7 @@ func (d *flakyDialer) DialDatabaseAs(ctx context.Context, set string, id int32, 
 }
 
 func TestStreamAdminCreatesAndDropsSlotsOnEveryShard(t *testing.T) {
+	parallelPG(t)
 	f := newResolverFixture(t)
 	ctx := context.Background()
 	a := &StreamAdmin{Pool: f.pool, Shards: f.dialer}
