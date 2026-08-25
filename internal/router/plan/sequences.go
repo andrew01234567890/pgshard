@@ -29,19 +29,101 @@ func SequenceName(database, schema, table, column string) string {
 	return database + "." + schema + "." + table + "." + column
 }
 
-// volatileFuncs are the functions whose value differs between shards (or
-// between calls) and so cannot appear in a statement replicated to every
-// shard of a reference table.
-var volatileFuncs = map[string]bool{
-	"now": true, "clock_timestamp": true, "statement_timestamp": true, "transaction_timestamp": true,
-	"timeofday": true, "random": true, "random_normal": true, "gen_random_uuid": true, "uuidv4": true, "uuidv7": true,
-	"nextval": true, "currval": true, "lastval": true, "setval": true, "pg_backend_pid": true,
-	"txid_current": true, "pg_current_xact_id": true, "pg_current_wal_lsn": true, "inet_server_addr": true,
-	"current_date": true, "current_time": true, "current_timestamp": true, "localtime": true, "localtimestamp": true,
+// immutableFuncs are the built-ins a write replicated to every shard of a
+// reference table may call: given the same arguments each one returns the
+// same answer on every shard, in any session, at any time.
+//
+// This is an allow list on purpose. PostgreSQL's volatility is a catalog
+// property and anyone can define a VOLATILE function, so a deny list of
+// known-bad names cannot be complete: uuid_generate_v4() from uuid-ossp,
+// or any user-defined function, would simply not be on it and would commit
+// a different value on every shard. Anything not proven immutable here is
+// refused, and the client is told to compute the value itself.
+var immutableFuncs = map[string]bool{
+	// text
+	"lower": true, "upper": true, "initcap": true, "char_length": true,
+	"character_length": true, "octet_length": true, "bit_length": true,
+	"trim": true, "btrim": true, "ltrim": true, "rtrim": true, "lpad": true, "rpad": true,
+	"substr": true, "substring": true, "left": true, "right": true, "reverse": true,
+	"replace": true, "translate": true, "repeat": true, "split_part": true, "strpos": true, "position": true, "starts_with": true,
+	"md5": true, "sha224": true, "sha256": true, "sha384": true, "sha512": true,
+	"encode": true, "decode": true, "quote_ident": true, "ascii": true, "chr": true,
+	// numeric
+	"abs": true, "ceil": true, "ceiling": true, "floor": true, "round": true, "trunc": true,
+	"sign": true, "mod": true, "div": true, "power": true, "sqrt": true, "cbrt": true,
+	"exp": true, "ln": true, "log": true, "log10": true, "width_bucket": true,
+	// json, arrays and misc structural helpers
+	"array_length": true, "array_lower": true, "array_upper": true, "cardinality": true,
+	"array_position": true, "array_remove": true, "array_replace": true, "string_to_array": true, "unnest": true,
+	"jsonb_extract_path": true, "jsonb_extract_path_text": true, "jsonb_array_length": true,
+	// deterministic date arithmetic on values the statement supplies
+	"make_date": true, "make_time": true,
+	"make_interval": true, "make_timestamp": true,
 }
 
-// volatileCall names the first volatile function call under node, "" if none.
-func volatileCall(node *pgquerypb.Node) string {
+// specialDateWords are the inputs PostgreSQL's date and time types resolve
+// when they are parsed rather than when they are written: each shard reads
+// its own clock, so a reference row built from one differs everywhere.
+var specialDateWords = map[string]bool{
+	"now": true, "today": true, "tomorrow": true, "yesterday": true, "allballs": true,
+}
+
+// dateTimeTypes are the types those words mean something to.
+var dateTimeTypes = map[string]bool{
+	"date": true, "time": true, "timetz": true, "timestamp": true, "timestamptz": true,
+	"interval": true, "abstime": true,
+}
+
+// builtinName reports whether a dotted name refers to something in
+// pg_catalog: either unqualified, or qualified with pg_catalog itself.
+// Anything else belongs to somebody's own schema, whatever it is called.
+func builtinName(names []string) bool {
+	// Case-sensitive on purpose: "PG_CATALOG" in double quotes is a
+	// different schema from pg_catalog, and treating them alike would admit
+	// anything somebody chose to put in it.
+	return len(names) == 1 || (len(names) > 1 && names[len(names)-2] == "pg_catalog")
+}
+
+// unorderedPick names a construct that chooses which rows to use without
+// fully determining which ones, "" if there is none. Running the same
+// statement on every shard is only safe when every shard picks the same
+// rows, and LIMIT without a total order, TABLESAMPLE and DISTINCT ON do not
+// promise that - no function is involved, so the volatility check cannot
+// see them.
+func unorderedPick(node *pgquerypb.Node) string {
+	found := ""
+	visit(node, func(n *pgquerypb.Node) bool {
+		if found != "" {
+			return false
+		}
+		sel := n.GetSelectStmt()
+		if sel == nil {
+			return true
+		}
+		switch {
+		case sel.GetLimitCount() != nil || sel.GetLimitOffset() != nil:
+			found = "LIMIT or OFFSET"
+		case len(sel.GetDistinctClause()) > 0:
+			found = "DISTINCT ON"
+		}
+		if found != "" {
+			return false
+		}
+		for _, from := range sel.GetFromClause() {
+			if from.GetRangeTableSample() != nil {
+				found = "TABLESAMPLE"
+				return false
+			}
+		}
+		return true
+	})
+	return found
+}
+
+// nonImmutableCall names the first call under node that is not proven
+// immutable, "" if every call is. Callers use it to refuse a statement that
+// must evaluate identically on every shard.
+func nonImmutableCall(node *pgquerypb.Node) string {
 	found := ""
 	visit(node, func(n *pgquerypb.Node) bool {
 		if found != "" {
@@ -50,19 +132,51 @@ func volatileCall(node *pgquerypb.Node) string {
 		switch x := n.GetNode().(type) {
 		case *pgquerypb.Node_FuncCall:
 			names := stringList(x.FuncCall.GetFuncname())
-			if len(names) > 0 && volatileFuncs[strings.ToLower(names[len(names)-1])] {
-				found = names[len(names)-1]
+			if len(names) == 0 {
+				return true
+			}
+			name := strings.ToLower(names[len(names)-1])
+			if !builtinName(names) || !immutableFuncs[name] {
+				found = name
 				return false
 			}
 		case *pgquerypb.Node_SqlvalueFunction:
-			switch x.SqlvalueFunction.GetOp() {
-			case pgquerypb.SQLValueFunctionOp_SVFOP_CURRENT_DATE, pgquerypb.SQLValueFunctionOp_SVFOP_CURRENT_TIME,
-				pgquerypb.SQLValueFunctionOp_SVFOP_CURRENT_TIME_N, pgquerypb.SQLValueFunctionOp_SVFOP_CURRENT_TIMESTAMP,
-				pgquerypb.SQLValueFunctionOp_SVFOP_CURRENT_TIMESTAMP_N, pgquerypb.SQLValueFunctionOp_SVFOP_LOCALTIME,
-				pgquerypb.SQLValueFunctionOp_SVFOP_LOCALTIME_N, pgquerypb.SQLValueFunctionOp_SVFOP_LOCALTIMESTAMP,
-				pgquerypb.SQLValueFunctionOp_SVFOP_LOCALTIMESTAMP_N:
-				found = strings.ToLower(strings.TrimPrefix(x.SqlvalueFunction.GetOp().String(), "SVFOP_"))
+			// current_date, current_timestamp, current_user and friends:
+			// none of them is immutable.
+			found = strings.ToLower(strings.TrimPrefix(x.SqlvalueFunction.GetOp().String(), "SVFOP_"))
+			return false
+		case *pgquerypb.Node_AExpr:
+			// An operator is a function with punctuation for a name, and
+			// one in somebody's schema can be backed by anything.
+			if names := stringList(x.AExpr.GetName()); len(names) > 0 && !builtinName(names) {
+				found = "operator " + strings.Join(names, ".")
 				return false
+			}
+		case *pgquerypb.Node_SetToDefault:
+			// DEFAULT stands for whatever the column's default expression
+			// evaluates to on each shard, which the statement does not say.
+			found = "DEFAULT"
+			return false
+		case *pgquerypb.Node_TypeCast:
+			names := stringList(x.TypeCast.GetTypeName().GetNames())
+			if len(names) == 0 {
+				return true
+			}
+			typ := strings.ToLower(names[len(names)-1])
+			if !builtinName(names) {
+				// A user-defined cast runs a function of its author's
+				// choosing.
+				found = "cast to " + strings.Join(names, ".")
+				return false
+			}
+			// 'now'::timestamptz and friends read the clock when the shard
+			// parses them, so each shard gets its own answer.
+			if dateTimeTypes[typ] {
+				if lit := x.TypeCast.GetArg().GetAConst().GetSval().GetSval(); lit != "" &&
+					specialDateWords[strings.ToLower(strings.TrimSpace(lit))] {
+					found = "'" + strings.ToLower(strings.TrimSpace(lit)) + "'::" + typ
+					return false
+				}
 			}
 		}
 		return true

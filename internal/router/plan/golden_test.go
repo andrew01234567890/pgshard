@@ -95,6 +95,33 @@ func golden() []want {
 		{sql: "insert into regions (id) values (nextval('s'))", kind: Refuse, msg: "a write to reference table \"regions\" cannot call nextval()"},
 		{sql: "update regions set name = gen_random_uuid()::text", kind: Refuse, msg: "a write to reference table \"regions\" cannot call gen_random_uuid()"},
 		{sql: "delete from regions where random() < 0.5", kind: Refuse, msg: "a write to reference table \"regions\" cannot call random()"},
+		// A deny list of known-bad names cannot be complete: volatility is
+		// a catalog property and anyone can add a function. These are the
+		// cases that used to pass straight through.
+		{sql: "insert into regions values (1, uuid_generate_v4()::text)", kind: Refuse, msg: "a write to reference table \"regions\" cannot call uuid_generate_v4()"},
+		{sql: "insert into regions values (1, my_ticket())", kind: Refuse, msg: "a write to reference table \"regions\" cannot call my_ticket()"},
+		{sql: "insert into regions values (1, public.now())", kind: Refuse, msg: "a write to reference table \"regions\" cannot call now()"},
+		{sql: "update regions set name = app.next_code()", kind: Refuse, msg: "a write to reference table \"regions\" cannot call next_code()"},
+		// Proven-immutable built-ins still work, qualified or not.
+		{sql: "insert into regions values (1, upper('eu'))", kind: Reference, shards: "all"},
+		{sql: "insert into regions values (1, pg_catalog.upper('eu'))", kind: Reference, shards: "all"},
+		// concat renders its arguments through their output functions, so
+		// it is STABLE, not immutable: DateStyle or TimeZone differing
+		// between shards is enough to diverge the rows.
+		{sql: "update regions set name = concat(name, '-x')", kind: Refuse, msg: "a write to reference table \"regions\" cannot call concat()"},
+		{sql: "insert into regions values (1, age(now())::text)", kind: Refuse, msg: "a write to reference table \"regions\" cannot call"},
+		{sql: "insert into regions values (1, to_jsonb('x')::text)", kind: Refuse, msg: "a write to reference table \"regions\" cannot call to_jsonb()"},
+		// Nondeterminism that is not a function call at all.
+		{sql: "insert into regions values (1, 'now'::timestamptz::text)", kind: Refuse, msg: "a write to reference table \"regions\" cannot call 'now'::timestamptz"},
+		{sql: "insert into regions values (1, 'today'::date::text)", kind: Refuse, msg: "a write to reference table \"regions\" cannot call 'today'::date"},
+		{sql: "insert into regions values (1, 'x'::app.mytype::text)", kind: Refuse, msg: "a write to reference table \"regions\" cannot call cast to app.mytype"},
+		{sql: "update regions set name = name operator(app.###) 'x'", kind: Refuse, msg: "a write to reference table \"regions\" cannot call operator app.###"},
+		{sql: "insert into regions select id, name from regions limit 1", kind: Refuse, msg: "a write to reference table \"regions\" cannot use LIMIT or OFFSET"},
+		{sql: "insert into regions select distinct on (id) id, name from regions", kind: Refuse, msg: "a write to reference table \"regions\" cannot use DISTINCT ON"},
+		{sql: "insert into regions values (1, DEFAULT)", kind: Refuse, msg: "a write to reference table \"regions\" cannot call DEFAULT"},
+		{sql: "update regions set name = DEFAULT", kind: Refuse, msg: "a write to reference table \"regions\" cannot call DEFAULT"},
+		// A literal cast that is genuinely determined stays allowed.
+		{sql: "insert into regions values (1, '2026-01-01'::date::text)", kind: Reference, shards: "all"},
 		{sql: "insert into regions select id, name from items", kind: Refuse, msg: "a write to reference table \"regions\" cannot read sharded or unsharded tables"},
 		{sql: "insert into regions select tenant_id, 'x' from orders where tenant_id = 1", kind: Refuse, msg: "a write to reference table \"regions\" cannot read sharded or unsharded tables"},
 		{sql: "update regions r set name = i.name from items i where i.id = r.id", kind: Refuse, msg: "a write to reference table \"regions\" cannot read sharded or unsharded tables"},

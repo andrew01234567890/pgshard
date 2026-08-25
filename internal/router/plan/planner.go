@@ -1259,8 +1259,24 @@ func (w *walker) referenceWrite(otherRels int) error {
 		return notYet("a write to reference table \""+w.target.name+"\" cannot read sharded or unsharded tables",
 			"the statement runs on every shard; a sharded or unsharded table is present on one shard only")
 	}
-	if fn := volatileCall(w.root); fn != "" {
-		return notYet("a write to reference table \""+w.target.name+"\" cannot call "+fn+"(): its value would differ between shards",
+	if pick := unorderedPick(w.root); pick != "" {
+		return notYet("a write to reference table \""+w.target.name+"\" cannot use "+pick+": each shard would choose its own rows",
+			"select the rows the write should use with a fully ordered, deterministic condition")
+	}
+	// An unqualified name is only the built-in while pg_catalog is searched
+	// first, which it is by default. A session that puts its own schema
+	// ahead of it can shadow any of them, so the proof no longer holds.
+	// pg_catalog is searched first unless the session explicitly puts it
+	// later, and only then can another schema shadow a built-in name.
+	for i, schema := range w.sess.SearchPath {
+		if !strings.EqualFold(schema, "pg_catalog") || i == 0 {
+			continue
+		}
+		return notYet("a write to reference table \""+w.target.name+"\" cannot run with "+w.sess.SearchPath[0]+" searched before pg_catalog: an unqualified function name could resolve to that schema instead of the built-in",
+			"reset search_path, or qualify the reference write's functions with pg_catalog")
+	}
+	if fn := nonImmutableCall(w.root); fn != "" {
+		return notYet("a write to reference table \""+w.target.name+"\" cannot call "+fn+"(): the statement runs on every shard and only a function proven to return the same answer everywhere may take part",
 			"compute the value in the client and pass it as a literal or parameter")
 	}
 	p.Kind, p.Shards = Reference, w.allShards()
