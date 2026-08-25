@@ -87,7 +87,12 @@ func (s *Server) Status(ctx context.Context, _ *pgshardv1.StatusRequest) (*pgsha
 	return resp, nil
 }
 
-// Promote fences, acquires the lease, promotes and starts renewing.
+// Promote fences, acquires the lease, starts renewing, then promotes. The
+// renewal loop starts immediately after the lease is acquired, before the
+// fallible promote steps, so a failure after pg_ctl promote can never leave a
+// writable primary whose lease is not being renewed (which would let a second
+// member be promoted after it expires — split brain). Instance.Promote is
+// idempotent, so the operator can retry to finish the post-promotion setup.
 func (s *Server) Promote(ctx context.Context, req *pgshardv1.PromoteRequest) (*pgshardv1.PromoteResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -105,15 +110,45 @@ func (s *Server) Promote(ctx context.Context, req *pgshardv1.PromoteRequest) (*p
 			return resp, nil
 		}
 	}
-	if err := s.inst.Promote(ctx); err != nil {
+	// Renew from here on: if a promote step below fails after pg_ctl promote,
+	// the database is already writable and the hold keeps the lease alive so
+	// no other member is promoted.
+	s.startHold()
+	// Instance.Promote is idempotent; a transient failure in the post-
+	// promotion setup (reload, checkpoint) is retried here so the setup
+	// completes and the operator sees a clean success. A persistent failure
+	// still returns an error, but the hold above keeps the lease so there is
+	// no split brain while it is resolved.
+	if err := s.promoteWithRetry(ctx); err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
-	s.startHold()
 	go s.inst.ensureStanzaLoop(s.bgCtx, stanzaRetry)
 	st, _ := s.Status(ctx, nil)
 	resp.Timeline = st.GetTimeline()
 	return resp, nil
+}
+
+// promoteRetries bounds how many times Promote re-runs the idempotent
+// post-promotion setup before returning an error to the operator.
+const promoteRetries = 3
+
+func (s *Server) promoteWithRetry(ctx context.Context) error {
+	var err error
+	for attempt := 0; attempt < promoteRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(attempt) * time.Second):
+			}
+			s.log.Warn("retrying promotion setup", "attempt", attempt, "err", err)
+		}
+		if err = s.inst.Promote(ctx); err == nil {
+			return nil
+		}
+	}
+	return err
 }
 
 func (s *Server) startHold() {
@@ -162,10 +197,15 @@ func (s *Server) Demote(ctx context.Context, req *pgshardv1.DemoteRequest) (*pgs
 	resp.Epoch = req.GetEpoch()
 	ctx, cancel := context.WithTimeout(ctx, s.opTimeout)
 	defer cancel()
-	s.stopHold(ctx)
+	// Stop PostgreSQL before releasing the lease: releasing while the node is
+	// still a writable primary would let a successor acquire the lease and
+	// promote, producing two writable primaries. The hold keeps renewing
+	// until the database is down.
 	if err := s.inst.Demote(ctx, ""); err != nil {
 		resp.Error = pgErr(err)
+		return resp, nil
 	}
+	s.stopHold(ctx)
 	return resp, nil
 }
 
