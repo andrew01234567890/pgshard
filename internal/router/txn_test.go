@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -26,6 +27,12 @@ type fakeDecisionLog struct {
 	// abortAfterBegin models the resolver deciding abort right after the
 	// row was written.
 	abortAfterBegin bool
+	// heartbeats counts Heartbeat calls that found the row preparing.
+	heartbeats int
+	// waitHeartbeat makes Commit wait until a heartbeat arrived, so a test
+	// can observe the coordinator beating while it is between the
+	// decision-log write and the decision.
+	waitHeartbeat bool
 }
 
 func (l *fakeDecisionLog) preparedCount() int {
@@ -57,9 +64,29 @@ func (l *fakeDecisionLog) Begin(_ context.Context, gid string, participants []in
 	return nil
 }
 
+func (l *fakeDecisionLog) Heartbeat(_ context.Context, gid string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if strings.HasPrefix(l.rows[gid], "preparing") {
+		l.heartbeats++
+	}
+	return nil
+}
+
+func (l *fakeDecisionLog) heartbeatCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.heartbeats
+}
+
 func (l *fakeDecisionLog) Commit(_ context.Context, gid string) (bool, error) {
 	if err := l.fail["commit"]; err != nil {
 		return false, err
+	}
+	if l.waitHeartbeat {
+		for i := 0; i < 2000 && l.heartbeatCount() == 0; i++ {
+			time.Sleep(time.Millisecond)
+		}
 	}
 	l.record("commit")
 	l.mu.Lock()
@@ -565,5 +592,31 @@ func TestSingleModeRefusesCommitAfterHiddenWrite(t *testing.T) {
 	}
 	if _, err := conn.Exec(ctx, "select 1"); err != nil {
 		t.Fatalf("session unusable after refused commit: %v", err)
+	}
+}
+
+func TestCoordinatorHeartbeatsWhilePreparing(t *testing.T) {
+	old := decisionHeartbeatInterval
+	decisionHeartbeatInterval = time.Millisecond
+	t.Cleanup(func() { decisionHeartbeatInterval = old })
+	h := newTxnHarness(t)
+	h.log.waitHeartbeat = true
+	ctx := context.Background()
+	a, b := h.twoTenants(t)
+	conn := h.connect(t, h.dsn())
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, tenant := range []int64{a, b} {
+		if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, $2)", tenant, i+1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if h.log.heartbeatCount() == 0 {
+		t.Fatal("coordinator never heartbeat its preparing decision row: the resolver would abort a slow live coordinator")
 	}
 }

@@ -17,6 +17,9 @@ type DecisionLog interface {
 	// are the participants' transaction ids in the same order, which a
 	// restore uses to tell a committed transaction from a lost one.
 	Begin(ctx context.Context, gid string, participants []int32, xids []string) error
+	// Heartbeat marks a preparing row's coordinator alive; the resolver
+	// only aborts a preparing row whose heartbeat has gone stale.
+	Heartbeat(ctx context.Context, gid string) error
 	// Commit decides commit; false means the row was no longer preparing
 	// (the resolver aborted the transaction first).
 	Commit(ctx context.Context, gid string) (bool, error)
@@ -50,6 +53,15 @@ func (l *PGDecisionLog) durable(ctx context.Context, sql string, args ...any) (i
 // Begin implements DecisionLog.
 func (l *PGDecisionLog) Begin(ctx context.Context, gid string, participants []int32, xids []string) error {
 	_, err := l.durable(ctx, `INSERT INTO pgshard.xact_decisions (gid, state, participants, participant_xids) VALUES ($1, 'preparing', $2, $3)`, gid, participants, xids)
+	return err
+}
+
+// Heartbeat implements DecisionLog. It needs no synchronous commit: a
+// lost heartbeat costs at worst a spurious abort of a still-live
+// coordinator, which the commit decision's atomic update turns into a
+// clean rollback.
+func (l *PGDecisionLog) Heartbeat(ctx context.Context, gid string) error {
+	_, err := l.Pool.Exec(ctx, `UPDATE pgshard.xact_decisions SET heartbeat_at = now() WHERE gid = $1 AND state = 'preparing'`, gid)
 	return err
 }
 

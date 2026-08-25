@@ -92,7 +92,7 @@ func (f *resolverFixture) prepare(id int, gid, v string) {
 
 func (f *resolverFixture) decide(gid, state string, age time.Duration, participants ...int32) {
 	f.t.Helper()
-	mustExecPool(f.t, f.pool, `INSERT INTO pgshard.xact_decisions (gid, state, participants, created_at) VALUES ($1, $2, $3, now() - $4::interval)`,
+	mustExecPool(f.t, f.pool, `INSERT INTO pgshard.xact_decisions (gid, state, participants, created_at, heartbeat_at) VALUES ($1, $2, $3, now() - $4::interval, now() - $4::interval)`,
 		gid, state, participants, age)
 }
 
@@ -181,10 +181,10 @@ func TestResolver(t *testing.T) {
 	if got := f.decisions(); strings.Join(got, ",") != "pgshard-r-1-4:preparing" {
 		t.Fatalf("decisions left %v", got)
 	}
-	// A commit-decided gid is committed by the orphan sweep too, never
-	// rolled back: here the decision row cannot be finished because a
-	// participant is unreachable, and the sweep of the reachable shard
-	// still applies the recorded decision.
+	// A commit decision is applied on every reachable holder even while a
+	// participant is unreachable, and the row survives until the whole
+	// topology could be searched; the decision counts as committed on the
+	// pass that retires it.
 	f.prepare(1, "pgshard-r-2-1", "late-commit")
 	f.decide("pgshard-r-2-1", "commit", 0, 0, 1)
 	f.dialer.down = 0
@@ -192,7 +192,7 @@ func TestResolver(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Committed != 1 || out.RolledBack != 0 || out.Unresolved != 2 {
+	if out.Committed != 0 || out.RolledBack != 0 || out.Unresolved != 2 {
 		t.Fatalf("outcome %+v", out)
 	}
 	if got := f.values(1); strings.Join(got, ",") != "committed,late-commit" {
@@ -222,5 +222,222 @@ func TestResolver(t *testing.T) {
 	out, err = f.res.Resolve(ctx, "")
 	if err != nil || out != (Outcome{}) {
 		t.Fatalf("outcome %+v err %v", out, err)
+	}
+}
+
+func TestResolverCommitsMovedParticipant(t *testing.T) {
+	f := newResolverFixture(t)
+	ctx := context.Background()
+	// After a reshard the decision's participant id maps to a group that no
+	// longer holds the prepared transaction: it sits on another group. The
+	// commit decision must be committed where the transaction actually is.
+	f.prepare(0, "pgshard-m-1-1", "moved-commit")
+	f.decide("pgshard-m-1-1", "commit", 0, 1)
+	out, err := f.res.Resolve(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Committed != 1 || out.RolledBack != 0 || out.Unresolved != 0 {
+		t.Fatalf("outcome %+v; decisions %v", out, f.decisions())
+	}
+	if got := f.values(0); strings.Join(got, ",") != "moved-commit" {
+		t.Fatalf("shard 0 values %v: the moved participant must be committed, not rolled back", got)
+	}
+	if got := f.prepared(0); len(got) != 0 {
+		t.Fatalf("shard 0 prepared %v", got)
+	}
+	if got := f.decisions(); len(got) != 0 {
+		t.Fatalf("decisions left %v", got)
+	}
+	// While any shard of the topology cannot be searched, a decision whose
+	// listed participants show nothing prepared is kept, never deleted: the
+	// transaction may sit on the unreachable group.
+	f.prepare(0, "pgshard-m-2-1", "hidden-commit")
+	f.decide("pgshard-m-2-1", "commit", 0, 1)
+	f.dialer.down = 0
+	out, err = f.res.Resolve(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Committed != 0 || out.RolledBack != 0 {
+		t.Fatalf("outcome %+v", out)
+	}
+	if got := f.decisions(); strings.Join(got, ",") != "pgshard-m-2-1:commit" {
+		t.Fatalf("decisions %v: the row must survive an incomplete topology search", got)
+	}
+	f.dialer.down = -1
+	out, err = f.res.Resolve(ctx, "")
+	if err != nil || out.Committed != 1 || out.Unresolved != 0 {
+		t.Fatalf("outcome %+v err %v", out, err)
+	}
+	if got := f.values(0); strings.Join(got, ",") != "hidden-commit,moved-commit" {
+		t.Fatalf("shard 0 values %v", got)
+	}
+}
+
+// prepareIn leaves a prepared transaction in database db on shard id.
+func (f *resolverFixture) prepareIn(id int, db, gid, v string) {
+	f.t.Helper()
+	ctx := context.Background()
+	cfg, err := pgx.ParseConfig(f.shardDSN(id))
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	cfg.Database = db
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	for _, sql := range []string{"CREATE TABLE IF NOT EXISTS t (v text)", "BEGIN", "INSERT INTO t VALUES (" + quoteLiteral(v) + ")", "PREPARE TRANSACTION " + quoteLiteral(gid)} {
+		if _, err := conn.Exec(ctx, sql); err != nil {
+			f.t.Fatalf("%s: %v", sql, err)
+		}
+	}
+}
+
+func TestResolverFinishesOtherDatabase(t *testing.T) {
+	f := newResolverFixture(t)
+	ctx := context.Background()
+	mustExec(t, connect(t, f.shardDSN(0)), "CREATE DATABASE appdb")
+	f.prepareIn(0, "appdb", "pgshard-d-1-1", "db-commit")
+	f.decide("pgshard-d-1-1", "commit", 0, 0)
+	f.prepareIn(0, "appdb", "pgshard-d-1-2", "db-orphan")
+	out, err := f.res.Resolve(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Committed != 1 || out.RolledBack != 1 || out.Unresolved != 0 {
+		t.Fatalf("outcome %+v; prepared %v; decisions %v", out, f.prepared(0), f.decisions())
+	}
+	if got := f.prepared(0); len(got) != 0 {
+		t.Fatalf("shard 0 prepared %v", got)
+	}
+	if got := f.decisions(); len(got) != 0 {
+		t.Fatalf("decisions left %v", got)
+	}
+	conn, err := f.res.Shards.(ShardDBDialer).DialDatabase(ctx, "default", 0, "appdb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	rows, err := conn.Query(ctx, "SELECT v FROM t ORDER BY v")
+	if err != nil {
+		t.Fatal(err)
+	}
+	vs, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(vs, ",") != "db-commit" {
+		t.Fatalf("appdb values %v", vs)
+	}
+}
+
+func TestResolverSparesPreparingRowWithLiveHeartbeat(t *testing.T) {
+	f := newResolverFixture(t)
+	ctx := context.Background()
+	// The row is far older than the preparing timeout, but its coordinator
+	// heartbeat is fresh: the router is alive and merely slow between
+	// PREPARE and the commit decision, so the resolver must not abort it.
+	f.prepare(1, "pgshard-h-1-1", "slow-live")
+	mustExecPool(t, f.pool, `INSERT INTO pgshard.xact_decisions (gid, state, participants, created_at, heartbeat_at)
+		VALUES ('pgshard-h-1-1', 'preparing', '{1}', now() - interval '10 minutes', now())`)
+	out, err := f.res.Resolve(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != (Outcome{}) {
+		t.Fatalf("outcome %+v: a live coordinator's transaction was resolved", out)
+	}
+	if got := f.prepared(1); strings.Join(got, ",") != "pgshard-h-1-1" {
+		t.Fatalf("shard 1 prepared %v: the transaction must stay for its coordinator", got)
+	}
+	if got := f.decisions(); strings.Join(got, ",") != "pgshard-h-1-1:preparing" {
+		t.Fatalf("decisions %v", got)
+	}
+	// Once the heartbeat goes stale the coordinator is presumed dead and
+	// the undecided transaction is aborted.
+	mustExecPool(t, f.pool, `UPDATE pgshard.xact_decisions SET heartbeat_at = now() - interval '10 minutes' WHERE gid = 'pgshard-h-1-1'`)
+	out, err = f.res.Resolve(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.RolledBack != 1 || len(f.prepared(1)) != 0 || len(f.decisions()) != 0 {
+		t.Fatalf("outcome %+v prepared %v decisions %v", out, f.prepared(1), f.decisions())
+	}
+}
+
+func TestResolverSparesPreparingRefreshedBetweenScanAndAbort(t *testing.T) {
+	f := newResolverFixture(t)
+	ctx := context.Background()
+	f.prepare(1, "pgshard-c-1-1", "raced-live")
+	f.decide("pgshard-c-1-1", "preparing", 10*time.Minute, 1)
+	f.prepare(1, "pgshard-c-1-2", "raced-dead")
+	f.decide("pgshard-c-1-2", "preparing", 10*time.Minute, 1)
+	shards, err := f.res.listShards(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	holders, scanErrs := f.res.scanPrepared(ctx, shards)
+	if len(scanErrs) != 0 {
+		t.Fatalf("scan errors %v", scanErrs)
+	}
+	// The coordinator heartbeats after the staleness snapshot was taken but
+	// before the resolver aborts: the abort must land on zero rows and the
+	// pass must leave the transaction alone.
+	mustExecPool(t, f.pool, `UPDATE pgshard.xact_decisions SET heartbeat_at = now() WHERE gid = 'pgshard-c-1-1'`)
+	stale := time.Now().Add(-10 * time.Minute)
+	var out Outcome
+	if err := f.res.resolveDecision(ctx, decision{GID: "pgshard-c-1-1", State: "preparing", Participants: []int32{1}, LastAlive: stale}, holders, true, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out != (Outcome{}) {
+		t.Fatalf("outcome %+v: a freshly heartbeaten transaction was resolved", out)
+	}
+	if got := f.decisions(); strings.Join(got, ",") != "pgshard-c-1-1:preparing,pgshard-c-1-2:preparing" {
+		t.Fatalf("decisions %v", got)
+	}
+	if got := f.prepared(1); strings.Join(got, ",") != "pgshard-c-1-1,pgshard-c-1-2" {
+		t.Fatalf("shard 1 prepared %v", got)
+	}
+	// The genuinely stale sibling still ages out on the same pass shape.
+	if err := f.res.resolveDecision(ctx, decision{GID: "pgshard-c-1-2", State: "preparing", Participants: []int32{1}, LastAlive: stale}, holders, true, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.RolledBack != 1 {
+		t.Fatalf("outcome %+v", out)
+	}
+	if got := f.prepared(1); strings.Join(got, ",") != "pgshard-c-1-1" {
+		t.Fatalf("shard 1 prepared %v", got)
+	}
+	if got := f.decisions(); strings.Join(got, ",") != "pgshard-c-1-1:preparing" {
+		t.Fatalf("decisions %v", got)
+	}
+}
+
+func TestResolverSweepContinuesPastGonePreparedXact(t *testing.T) {
+	f := newResolverFixture(t)
+	ctx := context.Background()
+	// "a" was scanned as prepared but its coordinator finished it (and
+	// deleted its row) before the sweep: ROLLBACK PREPARED finds nothing.
+	// It sorts before the real orphan, which must still be swept.
+	f.prepare(0, "pgshard-s-1-b", "real-orphan")
+	holders := map[string][]holder{
+		"pgshard-s-1-a": {{Shard: ShardRef{Set: "default", ID: 0}}},
+		"pgshard-s-1-b": {{Shard: ShardRef{Set: "default", ID: 0}}},
+	}
+	var out Outcome
+	if err := f.res.sweepOrphans(ctx, holders, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.RolledBack != 1 || out.Committed != 0 {
+		t.Fatalf("outcome %+v", out)
+	}
+	if got := f.prepared(0); len(got) != 0 {
+		t.Fatalf("shard 0 prepared %v: the orphan after the gone gid must be swept", got)
+	}
+	if got := f.values(0); len(got) != 0 {
+		t.Fatalf("shard 0 values %v", got)
 	}
 }
