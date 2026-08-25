@@ -37,7 +37,12 @@ type session struct {
 	draining bool
 	// revoked latches a revocation so a session still authenticating cannot
 	// finish startup and begin serving.
-	revoked     bool
+	revoked bool
+	// serving is set once startup has finished. Before that a revocation
+	// only latches: telling a half-authenticated client that its role may
+	// no longer log in would say whether the role exists at all, which the
+	// mock SCRAM exchange goes to some trouble to hide.
+	serving     bool
 	closed      bool
 	queryCancel context.CancelFunc
 	// inTxn mirrors the executor's transaction status for drain decisions;
@@ -113,19 +118,31 @@ func (s *session) revoke() {
 		return
 	}
 	s.revoked, s.draining = true, true
+	if !s.serving {
+		// Still authenticating: latch only. Startup rechecks this and
+		// fails the exchange the way any other authentication failure
+		// fails, so a client that stalls the exchange cannot tell a role
+		// that does not exist from one that does.
+		s.mu.Unlock()
+		return
+	}
 	if s.queryCancel != nil {
 		s.queryCancel()
 	}
 	s.mu.Unlock()
+	s.endRevoked()
+}
+
+// endRevoked tells the client why and closes the socket. It closes the
+// connection only: the executor belongs to the session's own goroutine and
+// is not safe to touch from here, and closing the socket unblocks that
+// goroutine, whose deferred close releases it.
+func (s *session) endRevoked() {
 	er := toErrorResponse(Errorf(CodeAdminShutdown, "terminating connection because the role may no longer log in"))
 	er.Severity, er.SeverityUnlocalized = "FATAL", "FATAL"
 	if buf, err := er.Encode(nil); err == nil {
 		_, _ = s.conn.Write(buf)
 	}
-	// Close the connection only. The executor belongs to the session's own
-	// goroutine and is not safe to touch from here; closing the socket
-	// unblocks that goroutine, and its deferred close releases the executor
-	// once it has unwound.
 	_ = s.conn.Close()
 }
 
@@ -411,6 +428,8 @@ func (s *session) startup(ctx context.Context) error {
 	s.info = info
 	s.mu.Unlock()
 	if s.revokedNow() {
+		// Indistinguishable from any other authentication failure.
+		s.terminate(Errorf(CodeInvalidPassword, "password authentication failed"))
 		return errors.New("session revoked during authentication")
 	}
 	exec, err := s.server.cfg.NewExecutor(info)
@@ -426,8 +445,10 @@ func (s *session) startup(ctx context.Context) error {
 	s.mu.Unlock()
 	if revoked {
 		// The revocation pass ran between the check above and here; hand
-		// the executor back rather than leaking it, and end the session.
+		// the executor back rather than leaking it, and end the session
+		// the way a failed authentication ends.
 		exec.Release()
+		s.terminate(Errorf(CodeInvalidPassword, "password authentication failed"))
 		return errors.New("session revoked during authentication")
 	}
 	key, err := s.server.newCancelKey(s.id, s.protocolVersion)
@@ -444,7 +465,25 @@ func (s *session) startup(ctx context.Context) error {
 	}
 	s.be.Send(&pgproto3.BackendKeyData{ProcessID: key.PID, SecretKey: key.Secret})
 	s.be.Send(&pgproto3.ReadyForQuery{TxStatus: byte(exec.TransactionStatus())})
-	return s.be.Flush()
+	if err := s.be.Flush(); err != nil {
+		return err
+	}
+	// From here a revocation ends the session outright rather than only
+	// latching: the client is authenticated, so telling it why gives
+	// nothing away.
+	s.mu.Lock()
+	s.serving = true
+	late := s.revoked
+	if late && s.queryCancel != nil {
+		s.queryCancel()
+	}
+	s.mu.Unlock()
+	if late {
+		// Revoked during the last moments of startup: the latch was set
+		// while it could not be acted on, so act on it now.
+		s.endRevoked()
+	}
+	return nil
 }
 
 // bufferedConn lets TLS consume bytes the startup reader already buffered.
