@@ -962,5 +962,15 @@ func (d *PgxShardDialer) DialDatabaseAs(ctx context.Context, shardSet string, sh
 	if err != nil {
 		return nil, fmt.Errorf("shard %s/%d: %w", shardSet, shardID, err)
 	}
+	if user == "" {
+		// The controller's own session, as opposed to one impersonating a
+		// client: mark it so the placement write fence lets it through.
+		// Routers never dial through here, so nothing a client drives can
+		// set this.
+		if _, err := conn.Exec(ctx, `SET `+MaintenanceGUC+` = 'on'`); err != nil {
+			_ = conn.Close(ctx)
+			return nil, fmt.Errorf("shard %s/%d: %w", shardSet, shardID, err)
+		}
+	}
 	return pgxShardConn{conn}, nil
 }

@@ -351,6 +351,13 @@ func (p *Placer) drive(ctx context.Context, wf *placementWorkflow) (bool, error)
 	case StagePlacementBuffering:
 		return p.buffer(ctx, wf)
 	case StagePlacementSwapping:
+		// The shards refuse writes from here until publish: the drain is
+		// done, and from the first rename onwards a router still holding
+		// the old view would otherwise write the live name on a shard that
+		// has already swapped.
+		if err := p.fenceShards(ctx, wf); err != nil {
+			return false, err
+		}
 		if _, _, err := p.catchUp(ctx, wf, true); err != nil {
 			return false, err
 		}
@@ -361,6 +368,11 @@ func (p *Placer) drive(ctx context.Context, wf *placementWorkflow) (bool, error)
 			return false, err
 		}
 		if err := p.publish(ctx, wf); err != nil {
+			return false, err
+		}
+		// publish clears the catalog flag itself; the shards' own fence has
+		// to come off too or every write to the table keeps being refused.
+		if err := p.releaseShardFence(ctx, wf); err != nil {
 			return false, err
 		}
 		if err := p.dropReplication(ctx, wf); err != nil {

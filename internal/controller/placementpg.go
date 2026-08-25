@@ -957,12 +957,53 @@ func slotLag(ctx context.Context, conn ShardConn, slot string) (int64, error) {
 
 // fence raises the table-scoped write pause routers observe.
 func (p *Placer) fence(ctx context.Context, wf *placementWorkflow) error {
-	_, err := p.Pool.Exec(ctx, `UPDATE pgshard.table_status SET migrating = true, workflow_id = $4::uuid, updated_at = now()
-		WHERE database = $1 AND schema_name = $2 AND table_name = $3 AND NOT migrating`, wf.spec.Database, wf.spec.SchemaName, wf.spec.TableName, wf.id)
-	return err
+	if _, err := p.Pool.Exec(ctx, `UPDATE pgshard.table_status SET migrating = true, workflow_id = $4::uuid, updated_at = now()
+		WHERE database = $1 AND schema_name = $2 AND table_name = $3 AND NOT migrating`, wf.spec.Database, wf.spec.SchemaName, wf.spec.TableName, wf.id); err != nil {
+		return err
+	}
+	return nil
+}
+
+// fenceShards arms the database fence on every shard. The catalog flag only
+// asks routers to hold writes; a router that has not read it yet is refused
+// by the shard itself. It goes on after the drain and immediately before
+// the first swap, so writers that were already in flight finish normally
+// instead of being broken mid-transaction, and it stays on until the new
+// placement is published.
+func (p *Placer) fenceShards(ctx context.Context, wf *placementWorkflow) error {
+	return p.eachShard(ctx, wf, func(ctx context.Context, conn ShardConn) error {
+		return fenceTables(ctx, conn, wf.spec.SchemaName, wf.shape.qualified(wf.spec.TableName), wf.shape.qualified(wf.shadow()))
+	})
+}
+
+// releaseShardFence drops the database fence from every shard. It is
+// best-effort per shard so one unreachable shard cannot strand the rest.
+func (p *Placer) releaseShardFence(ctx context.Context, wf *placementWorkflow) error {
+	return p.eachShard(ctx, wf, func(ctx context.Context, conn ShardConn) error {
+		return unfenceTables(ctx, conn, wf.shape.qualified(wf.spec.TableName), wf.shape.qualified(wf.shadow()), wf.shape.qualified(wf.old()))
+	})
+}
+
+// eachShard runs fn on every shard the workflow touches.
+func (p *Placer) eachShard(ctx context.Context, wf *placementWorkflow, fn func(context.Context, ShardConn) error) error {
+	for _, t := range wf.rt.ids {
+		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
+		if err != nil {
+			return err
+		}
+		err = fn(ctx, conn)
+		_ = conn.Close(ctx)
+		if err != nil {
+			return fmt.Errorf("shard %s/%d: %w", wf.st.SourceSet, t, err)
+		}
+	}
+	return nil
 }
 
 func (p *Placer) releaseFence(ctx context.Context, wf *placementWorkflow) error {
+	if err := p.releaseShardFence(ctx, wf); err != nil {
+		return err
+	}
 	_, err := p.Pool.Exec(ctx, `UPDATE pgshard.table_status SET migrating = false, updated_at = now()
 		WHERE database = $1 AND schema_name = $2 AND table_name = $3 AND migrating`, wf.spec.Database, wf.spec.SchemaName, wf.spec.TableName)
 	return err
