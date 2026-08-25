@@ -42,6 +42,12 @@ type Config struct {
 	NewExecutor func(SessionInfo) (Executor, error)
 	// TLSConfig enables SSLRequest and direct TLS when non-nil.
 	TLSConfig *tls.Config
+	// AllowPlaintext keeps accepting startup packets that never negotiated
+	// TLS even though TLSConfig is set. Configuring a certificate means
+	// the deployment expects the wire to be protected, and a client that
+	// simply omits SSLRequest would otherwise send its SCRAM exchange, its
+	// SQL and its results in the clear. Development only.
+	AllowPlaintext bool
 	// ServerVersion is reported as the server_version parameter.
 	ServerVersion string
 	// Parameters overrides or extends the default ParameterStatus set.

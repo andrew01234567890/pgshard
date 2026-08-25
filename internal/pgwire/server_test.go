@@ -947,3 +947,30 @@ func TestStartupDeadlineCancelsStalledLookup(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+// TestPlaintextStartupRefusedWhenTLSIsConfigured: a client that simply
+// omits SSLRequest must not be served in the clear by a deployment that
+// configured a certificate, or the SCRAM exchange and everything after it
+// is downgraded silently.
+func TestPlaintextStartupRefusedWhenTLSIsConfigured(t *testing.T) {
+	ts := startServer(t, Config{TLSConfig: selfSigned(t)})
+	c := dialRaw(t, ts.addr)
+	res := c.startup(ProtocolVersion30)
+	if res.errResp == nil || res.errResp.Code != CodeInvalidAuthorization {
+		t.Fatalf("plaintext startup against a TLS server: %+v", res)
+	}
+	if !strings.Contains(res.errResp.Message, "requires TLS") {
+		t.Fatalf("refusal must say why: %q", res.errResp.Message)
+	}
+}
+
+// TestPlaintextStartupAllowedByTheDevelopmentOptOut keeps the escape hatch
+// honest: it exists, and it is the only thing that lets a plaintext
+// startup through a server holding a certificate.
+func TestPlaintextStartupAllowedByTheDevelopmentOptOut(t *testing.T) {
+	ts := startServer(t, Config{TLSConfig: selfSigned(t), AllowPlaintext: true})
+	c := dialRaw(t, ts.addr)
+	if res := c.startup(ProtocolVersion30); res.ready == nil {
+		t.Fatalf("opt-out must still serve plaintext: %+v", res)
+	}
+}
