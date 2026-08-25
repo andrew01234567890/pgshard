@@ -573,6 +573,13 @@ pgshard-router serve --listen 0.0.0.0:5432 --tls-cert router.crt --tls-key route
   --pooler-tls-cert router-client.crt --pooler-tls-key router-client.key --pooler-tls-ca ca.crt
 ```
 
+`--tls-cert` **requires** TLS: once a certificate is configured, a client that
+never sends `SSLRequest` is refused with `28000` rather than served in the
+clear, so a misconfigured or downgraded client cannot send its SCRAM exchange
+and its SQL in plaintext to a deployment that asked to be protected.
+`--allow-plaintext` lifts that for development. Cancel requests are exempt, as
+they are in PostgreSQL: libpq before 17 sends them without negotiating TLS.
+
 For a local stack, `pgshard-router dev-bootstrap` migrates the catalog and
 registers a database, a role (password from `PGSHARD_DEV_PASSWORD`) and one
 shard's pooler endpoint (`--shard-id`, default 0), and creates the same role
