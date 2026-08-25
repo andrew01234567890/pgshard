@@ -152,8 +152,20 @@ func (o *pgCutover) Fence(ctx context.Context) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx, `UPDATE pgshard.shard_status SET migrating = true, updated_at = now() WHERE shard_set = $1 AND NOT migrating`, o.srcSet); err != nil {
+	// Claim the fence rather than just setting it: a second cutover of the
+	// same source must not join a fence it did not raise, because either
+	// one releasing would open writes the other still believes are held.
+	if _, err := tx.Exec(ctx, `UPDATE pgshard.shard_status SET migrating = true, migrating_by = $2::uuid, updated_at = now()
+		WHERE shard_set = $1 AND (NOT migrating OR migrating_by = $2::uuid)`, o.srcSet, o.wf.id); err != nil {
 		return err
+	}
+	var heldByOther int
+	if err := tx.QueryRow(ctx, `SELECT count(*)::int FROM pgshard.shard_status
+		WHERE shard_set = $1 AND migrating AND migrating_by IS DISTINCT FROM $2::uuid`, o.srcSet, o.wf.id).Scan(&heldByOther); err != nil {
+		return err
+	}
+	if heldByOther > 0 {
+		return fmt.Errorf("another cutover holds the write fence on %s", o.srcSet)
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO pgshard.workflow_locks (kind, key, workflow_id)
 		SELECT 'ddl', name, $1::uuid FROM pgshard.databases ON CONFLICT (kind, key) DO NOTHING`, o.wf.id); err != nil {
@@ -703,7 +715,7 @@ func (o *pgCutover) Flip(ctx context.Context, _ string) error {
 	// The workflow froze its source when it was created. Retiring a set
 	// that is no longer the only one serving would publish a second serving
 	// set and drop whatever was committed to the other one.
-	if err := o.sourceStillSoleServing(ctx, tx); err != nil {
+	if err := o.stillSoleServing(ctx, tx, o.srcSet); err != nil {
 		return err
 	}
 	homeTarget := o.wf.ids[HomeTarget(o.wf.ranges)]
@@ -711,7 +723,7 @@ func (o *pgCutover) Flip(ctx context.Context, _ string) error {
 		sql  string
 		args []any
 	}{
-		{`UPDATE pgshard.shard_status SET serving_state = $2, migrating = false, updated_at = now() WHERE shard_set = $1`, []any{o.wf.set, ServingServing}},
+		{`UPDATE pgshard.shard_status SET serving_state = $2, migrating = false, migrating_by = NULL, updated_at = now() WHERE shard_set = $1`, []any{o.wf.set, ServingServing}},
 		{`UPDATE pgshard.shard_status SET serving_state = $2, updated_at = now() WHERE shard_set = $1`, []any{o.srcSet, ServingRetired}},
 		{`UPDATE pgshard.shard_sets SET state = $2, updated_at = now() WHERE shard_set = $1`, []any{o.wf.set, catalog.ShardSetServing}},
 		{`UPDATE pgshard.shard_sets SET state = $2, updated_at = now() WHERE shard_set = $1`, []any{o.srcSet, catalog.ShardSetRetired}},
@@ -728,10 +740,11 @@ func (o *pgCutover) Flip(ctx context.Context, _ string) error {
 	return tx.Commit(ctx)
 }
 
-// sourceStillSoleServing refuses a cutover whose frozen source is no longer
-// the one and only serving set: another workflow flipped underneath it, and
-// this one would be cutting over from data that is already stale.
-func (o *pgCutover) sourceStillSoleServing(ctx context.Context, tx pgx.Tx) error {
+// stillSoleServing refuses to retire a set on behalf of a workflow whose
+// idea of what is serving is out of date: another workflow flipped
+// underneath it, and publishing on top would leave two serving sets and
+// drop whatever was committed to the other one.
+func (o *pgCutover) stillSoleServing(ctx context.Context, tx pgx.Tx, set string) error {
 	rows, err := tx.Query(ctx, `SELECT shard_set FROM pgshard.shard_sets WHERE state = $1 ORDER BY shard_set`, catalog.ShardSetServing)
 	if err != nil {
 		return err
@@ -740,10 +753,10 @@ func (o *pgCutover) sourceStillSoleServing(ctx context.Context, tx pgx.Tx) error
 	if err != nil {
 		return err
 	}
-	if len(serving) == 1 && serving[0] == o.srcSet {
+	if len(serving) == 1 && serving[0] == set {
 		return nil
 	}
-	return fmt.Errorf("cutover source %s is no longer the only serving shard set (serving: %v)", o.srcSet, serving)
+	return fmt.Errorf("%s is no longer the only serving shard set (serving: %v)", set, serving)
 }
 
 // Swap freezes the forward direction (disable; dropped on complete) and
@@ -802,7 +815,9 @@ func (o *pgCutover) Release(ctx context.Context) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx, `UPDATE pgshard.shard_status SET migrating = false, updated_at = now() WHERE shard_set = $1 AND migrating`, o.srcSet); err != nil {
+	// Only the workflow that raised the fence may lift it.
+	if _, err := tx.Exec(ctx, `UPDATE pgshard.shard_status SET migrating = false, migrating_by = NULL, updated_at = now()
+		WHERE shard_set = $1 AND migrating AND migrating_by = $2::uuid`, o.srcSet, o.wf.id); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM pgshard.workflow_locks WHERE workflow_id = $1::uuid`, o.wf.id); err != nil {

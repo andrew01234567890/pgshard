@@ -316,6 +316,13 @@ func (o *pgCutover) flipBack(ctx context.Context) error {
 	if state == catalog.ShardSetServing {
 		return nil
 	}
+	// The rollback restores the source and retires the target, so it has
+	// the same stale-view hazard as the flip: if another workflow has since
+	// flipped, its set is the one serving and restoring this one on top
+	// would leave two.
+	if err := o.stillSoleServing(ctx, tx, o.wf.set); err != nil {
+		return err
+	}
 	homeSource := o.srcIDs[HomeTarget(o.srcRanges)]
 	for _, q := range []struct {
 		sql  string
@@ -345,8 +352,10 @@ func (o *pgCutover) releaseRollback(ctx context.Context) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx, `UPDATE pgshard.shard_status SET migrating = false, updated_at = now()
-		WHERE shard_set = ANY($1) AND migrating`, []string{o.srcSet, o.wf.set}); err != nil {
+	// Only the fence this workflow raised: another cutover's fence on the
+	// same set is not ours to lift.
+	if _, err := tx.Exec(ctx, `UPDATE pgshard.shard_status SET migrating = false, migrating_by = NULL, updated_at = now()
+		WHERE shard_set = ANY($1) AND migrating AND migrating_by = $2::uuid`, []string{o.srcSet, o.wf.set}, o.wf.id); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM pgshard.workflow_locks WHERE workflow_id = $1::uuid`, o.wf.id); err != nil {
