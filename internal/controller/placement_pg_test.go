@@ -916,3 +916,33 @@ func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 		t.Fatalf("guarded must report both the policy and RLS enabled: %v %v", got, err)
 	}
 }
+
+// TestPlacementRefusesGeneratedKeyOnPostgres: a generated column is not part
+// of the copied row shape, so a move keyed by it (shard key or primary key)
+// is refused up front instead of failing per row inside the copy.
+func TestPlacementRefusesGeneratedKeyOnPostgres(t *testing.T) {
+	f := newPlacementFixture(t)
+	ctx := context.Background()
+	home := f.app(0)
+	mustExec(t, home, `CREATE TABLE gk (id bigint PRIMARY KEY, tenant bigint NOT NULL, dbl bigint GENERATED ALWAYS AS (tenant * 2) STORED)`)
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('app', 'public', 'gk', 'unsharded', NULL)`)
+	f.reconcile()
+	mustExec(t, f.catalog, `UPDATE pgshard.tables SET placement = 'sharded', shard_key = 'dbl' WHERE table_name = 'gk'`)
+	f.reconcile()
+	var state, msg string
+	for i := 0; i < 40; i++ {
+		if _, err := f.placer.Pass(ctx); err != nil {
+			t.Fatal(err)
+		}
+		_, state, _, msg = f.workflow("gk")
+		if state == StateFailed {
+			break
+		}
+		if state == StateCompleted {
+			t.Fatal("move keyed by a generated column completed instead of being refused")
+		}
+	}
+	if state != StateFailed || !strings.Contains(msg, "is a generated column") {
+		t.Fatalf("expected generated-key refusal, got %s %q", state, msg)
+	}
+}

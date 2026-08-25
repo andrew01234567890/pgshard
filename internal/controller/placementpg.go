@@ -85,8 +85,23 @@ func (p *Placer) describe(ctx context.Context, wf *placementWorkflow) error {
 			}
 		}
 	}
+	// A generated column cannot key the move: it is not part of the copied
+	// row shape (it is recomputed on the target), so routing by it or
+	// applying rows by a primary key that contains it has nothing to read.
+	// Refuse up front rather than fail per row deep in the copy.
+	copied := copiedColumns(cols)
+	for _, k := range pk {
+		if !slices.Contains(colNames(copied), k) {
+			return fatal("primary key column %q of table %s is a generated column; placement workflows cannot apply rows by it", k, wf.spec.table())
+		}
+	}
+	if wf.spec.To.Placement == "sharded" && !slices.Contains(colNames(copied), wf.spec.To.key()) {
+		if slices.IndexFunc(cols, func(c tableColumn) bool { return c.name == wf.spec.To.key() }) >= 0 {
+			return fatal("shard key column %q of table %s is a generated column; rows cannot be routed by it", wf.spec.To.key(), wf.spec.table())
+		}
+	}
 	wf.st.Columns, wf.st.Identity, wf.st.PK = nil, nil, pk
-	for _, c := range copiedColumns(cols) {
+	for _, c := range copied {
 		wf.st.Columns = append(wf.st.Columns, c.name)
 		wf.st.Identity = append(wf.st.Identity, c.identity)
 	}
