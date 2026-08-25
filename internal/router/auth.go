@@ -21,6 +21,8 @@ type RoleCache struct {
 	q   catalog.Querier
 	ttl time.Duration
 	now func() time.Time
+	// load reads the roles; the catalog by default.
+	load func(context.Context) (*snapshot.Roles, error)
 
 	mu       sync.Mutex
 	roles    *snapshot.Roles
@@ -32,7 +34,9 @@ func NewRoleCache(q catalog.Querier, ttl time.Duration) *RoleCache {
 	if ttl <= 0 {
 		ttl = 5 * time.Second
 	}
-	return &RoleCache{q: q, ttl: ttl, now: time.Now}
+	c := &RoleCache{q: q, ttl: ttl, now: time.Now}
+	c.load = func(ctx context.Context) (*snapshot.Roles, error) { return snapshot.LoadRoles(ctx, c.q) }
+	return c
 }
 
 // Lookup implements pgwire.PasswordLookup.
@@ -81,8 +85,31 @@ func (c *RoleCache) ConnectionLimit(user string) (int32, bool) {
 	return cred.ConnectionLimit, true
 }
 
+// Refresh reloads the roles from the catalog.
+func (c *RoleCache) Refresh(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reload(ctx)
+}
+
+// MayLogIn reports whether user may open a session right now. It answers
+// from the cache as it stands rather than from what changed since the last
+// look: Lookup reloads the cache on its own TTL and on every miss, so a
+// caller watching for the moment a role flips would simply miss the ones
+// an authentication attempt noticed first.
+func (c *RoleCache) MayLogIn(user string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cred, ok := c.roles.Cred(user)
+	if !ok {
+		return false
+	}
+	_, err := c.admit(user, cred)
+	return err == nil
+}
+
 func (c *RoleCache) reload(ctx context.Context) error {
-	r, err := snapshot.LoadRoles(ctx, c.q)
+	r, err := c.load(ctx)
 	if err != nil {
 		return err
 	}
