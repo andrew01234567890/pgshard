@@ -270,3 +270,29 @@ func TestMemberTemplateHashTracksInternalTLS(t *testing.T) {
 		t.Fatal("the checksum must not depend on map iteration order")
 	}
 }
+
+// TestPoolerSidecarCarriesItsOwnShardSet: a pooler reads its epoch and its
+// migration state under the shard set it is told it belongs to. Every
+// non-catalog group was told "default", so after a reshard promoted g2 its
+// poolers were still watching the retired set's epoch - which matches only
+// until the epochs diverge, and a failover is what makes them diverge.
+func TestPoolerSidecarCarriesItsOwnShardSet(t *testing.T) {
+	c := routerCluster()
+	c.Spec.PostgreSQL.Major = 18
+	for _, tc := range []struct {
+		group Group
+		want  string
+	}{
+		{Group{Cluster: c.Name, Kind: "shard", ShardID: 1, Generation: 1}, "--shard-set default"},
+		{Group{Cluster: c.Name, Kind: "shard", ShardID: 1, Generation: 2}, "--shard-set g2"},
+		{Group{Cluster: c.Name, Kind: "shard", ShardID: 0, Generation: 3}, "--shard-set g3"},
+		{Group{Cluster: c.Name, Kind: "catalog", Generation: 2}, "--shard-set catalog"},
+	} {
+		pod := Renderer{}.Pod(c, tc.group, 0, RolePrimary, tc.group.MemberName(0), Template(c, Group{}, nil, nil))
+		pooler := pod.Spec.Containers[len(pod.Spec.Containers)-1]
+		got := strings.Join(append(pooler.Command, pooler.Args...), " ")
+		if !strings.Contains(got, tc.want) {
+			t.Errorf("generation %d %s group: command lacks %q\n%s", tc.group.Generation, tc.group.Kind, tc.want, got)
+		}
+	}
+}

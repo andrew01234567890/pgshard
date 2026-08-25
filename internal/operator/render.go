@@ -422,7 +422,12 @@ func (Renderer) Pod(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, rol
 // through its Unix socket. It runs from the postgres image so the two
 // binaries always ship together.
 func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container {
-	shardSet := "default"
+	// The pooler's identity is its own group's, not the bootstrap set's: it
+	// reads its epoch and its migration state under this name, and a
+	// generation-2 pooler watching "default" fences against another set's
+	// epoch. Equal epochs hide it until they diverge, which is exactly what
+	// a failover does.
+	shardSet := g.ShardSet()
 	if g.Kind == "catalog" {
 		shardSet = "catalog"
 	}
