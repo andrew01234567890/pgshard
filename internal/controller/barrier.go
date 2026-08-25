@@ -100,19 +100,6 @@ type BarrierStore interface {
 	ShardMapGeneration(ctx context.Context) (int64, error)
 }
 
-// FenceAcker is implemented by stores that can wait until every registered
-// router has observed a newly raised fence. Older in-memory stores do not
-// implement it and therefore have no router acknowledgement to await.
-type FenceAcker interface {
-	AwaitFence(ctx context.Context) error
-}
-
-// WriterCounter is implemented by group drivers that can observe ordinary
-// transactions in addition to router-coordinated prepared transactions.
-type WriterCounter interface {
-	WriterCount(ctx context.Context, g GroupRef) (int, error)
-}
-
 // GroupRestorePoint is the recorded restore point of one group.
 type GroupRestorePoint struct {
 	Group      string `json:"group"`
@@ -123,26 +110,26 @@ type GroupRestorePoint struct {
 
 // RestorePoint is one row of pgshard.restore_points.
 type RestorePoint struct {
-	ID   string
-	Name string
-	// PhysicalName is immutable for the reserved attempt and is the name
-	// passed to pg_create_restore_point on every group.
-	PhysicalName       string
+	ID                 string
+	Name               string
 	ShardMapGeneration int64
 	Certified          bool
 	Groups             []GroupRestorePoint
 	CreatedAt          time.Time
 }
 
-// RestorePointName returns the physical WAL restore-point name for an attempt
-// id. UUID punctuation is removed to keep the PostgreSQL name compact and
-// valid while retaining the complete per-attempt identity.
+// RestorePointName is the WAL restore point name of a barrier. It is derived
+// from the barrier name alone, which is why a name is claimed for good once an
+// attempt starts: two attempts of one name would create two physical restore
+// points that name-based recovery cannot tell apart.
 func RestorePointName(barrier string) string { return RestorePointPrefix + barrier }
 
 // Barrier creates certified restore points: writes are paused, two-phase
 // commits drained, a named restore point created on every group and
-// archived, then the pause is lifted and the point recorded. Any failure
-// lifts the pause and records nothing.
+// archived, then the pause is lifted and the point recorded. The name is
+// claimed before any group is touched; a failure lifts the pause and leaves
+// the claim behind, uncertified and carrying the reason, so the name can
+// never be reused.
 type Barrier struct {
 	Store  BarrierStore
 	Groups BarrierGroups
