@@ -1076,3 +1076,52 @@ func TestRevokingASessionStopsAnExtendedProtocolBatch(t *testing.T) {
 		t.Fatal("revocation waited for the running batch instead of stopping it")
 	}
 }
+
+// TestOneStalledClientDoesNotDelayRevokingTheRest: the courtesy FATAL can
+// wait on a client that has stopped reading, but latching is what actually
+// stops a session executing. A sweep must latch every session first, or the
+// ones behind an unresponsive client keep working for as long as it takes.
+func TestOneStalledClientDoesNotDelayRevokingTheRest(t *testing.T) {
+	ts := startServer(t, Config{})
+	running := make(chan struct{})
+	cancelled := make(chan struct{})
+	ts.newExec = func(info SessionInfo) (Executor, error) {
+		f := NewFakeExecutor()
+		if info.Database == "busy" {
+			f.SyncDelay = func(ctx context.Context) error {
+				close(running)
+				<-ctx.Done()
+				close(cancelled)
+				return ctx.Err()
+			}
+		}
+		return f, nil
+	}
+	// Two sessions of the same role; the second is mid-batch.
+	idle := dialRaw(t, ts.addr)
+	idle.rawStartup(ProtocolVersion30, map[string]string{"user": "revoked", "database": "db"})
+	if res := idle.readStartup(); res.ready == nil {
+		t.Fatalf("startup: %+v", res)
+	}
+	busy := dialRaw(t, ts.addr)
+	busy.rawStartup(ProtocolVersion30, map[string]string{"user": "revoked", "database": "busy"})
+	if res := busy.readStartup(); res.ready == nil {
+		t.Fatalf("startup: %+v", res)
+	}
+	busy.send(&pgproto3.Parse{Query: "select 1"}, &pgproto3.Bind{}, &pgproto3.Execute{}, &pgproto3.Sync{})
+	select {
+	case <-running:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the batch never reached Sync")
+	}
+
+	if n := ts.TerminateUser("revoked"); n != 2 {
+		t.Fatalf("terminated %d sessions, want 2", n)
+	}
+	// Whatever order the sweep took, the running batch was cancelled.
+	select {
+	case <-cancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a session was left executing while the sweep dealt with another")
+	}
+}

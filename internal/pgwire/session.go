@@ -107,30 +107,25 @@ func (s *session) forceClose() {
 	_ = s.conn.Close()
 }
 
-// revoke ends the session because its role may no longer log in. Unlike a
-// drain it does not wait for an open transaction: a client that keeps one
-// open would otherwise go on issuing statements after its access was taken
-// away, which is the first thing anyone losing access would try.
-func (s *session) revoke() {
+// latchRevoked marks the session revoked and stops whatever it is running,
+// without touching the socket. Latching is what actually prevents further
+// work, so a sweep does this to every session first and only then spends
+// time on the courtesy writes; otherwise one unresponsive client delays the
+// latch of every session behind it, and those keep executing meanwhile.
+// It reports whether this call is the one that has to end the session.
+func (s *session) latchRevoked() bool {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.revoked || s.closed {
-		s.mu.Unlock()
-		return
+		return false
 	}
 	s.revoked, s.draining = true, true
-	if !s.serving {
-		// Still authenticating: latch only. Startup rechecks this and
-		// fails the exchange the way any other authentication failure
-		// fails, so a client that stalls the exchange cannot tell a role
-		// that does not exist from one that does.
-		s.mu.Unlock()
-		return
-	}
 	if s.queryCancel != nil {
 		s.queryCancel()
 	}
-	s.mu.Unlock()
-	s.endRevoked()
+	// Still authenticating: startup fails it as a bad credential, so
+	// nothing is written here.
+	return s.serving
 }
 
 // endRevoked tells the client why and closes the socket. It closes the
