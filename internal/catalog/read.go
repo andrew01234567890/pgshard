@@ -252,3 +252,26 @@ func SetWriteFence(ctx context.Context, q Execer, active bool, reason string) er
 		    write_fenced_at = CASE WHEN $1 THEN now() ELSE NULL END, updated_at = now()`, active, reason)
 	return err
 }
+
+// RaiseWriteFence raises the write fence and stamps it with owner, the token
+// that ReleaseWriteFence must present to clear it.
+func RaiseWriteFence(ctx context.Context, q Execer, reason, owner string) error {
+	_, err := q.Exec(ctx, `UPDATE pgshard.shard_map_generation
+		SET write_fence = true, write_fence_reason = $1, write_fence_owner = $2,
+		    write_fenced_at = now(), updated_at = now()`, reason, owner)
+	return err
+}
+
+// ReleaseWriteFence clears the write fence only if owner still holds it, so a
+// barrier that lost its advisory-lock session cannot clear a fence a later
+// barrier has since raised. It returns whether it cleared the fence.
+func ReleaseWriteFence(ctx context.Context, q Execer, owner string) (bool, error) {
+	tag, err := q.Exec(ctx, `UPDATE pgshard.shard_map_generation
+		SET write_fence = false, write_fence_reason = '', write_fence_owner = '',
+		    write_fenced_at = NULL, updated_at = now()
+		WHERE write_fence_owner = $1`, owner)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}

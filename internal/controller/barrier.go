@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -65,8 +67,16 @@ type BarrierGroups interface {
 
 // BarrierStore is the catalog side of a barrier.
 type BarrierStore interface {
-	// Fence raises or releases the cluster write fence.
-	Fence(ctx context.Context, active bool, reason string) error
+	// Lock serializes barriers cluster-wide: it acquires the barrier
+	// advisory lock and returns a release function, or ErrBarrierBusy if
+	// another barrier already holds it. The lock is held for the whole run
+	// so two barriers can never raise and clear the shared fence at once.
+	Lock(ctx context.Context) (func(), error)
+	// Fence raises or releases the cluster write fence. On raise the fence is
+	// stamped with owner; on release it is cleared only if owner still holds
+	// it, so a barrier that lost its lock session cannot clear a fence a
+	// later barrier raised.
+	Fence(ctx context.Context, active bool, reason, owner string) error
 	// FencedAt returns when the current fence was raised.
 	FencedAt(ctx context.Context) (time.Time, error)
 	// DecisionWatermark returns a value that grows with every decision row
@@ -142,6 +152,15 @@ func orDefault(d, def time.Duration) time.Duration {
 	return def
 }
 
+// fenceOwner returns a random token that stamps the write fence for a run.
+func fenceOwner() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
 // ErrBarrierExists is returned for a name that is already recorded.
 var ErrBarrierExists = errors.New("barrier: a restore point of that name exists")
 
@@ -153,6 +172,11 @@ func (b *Barrier) Run(ctx context.Context, name string) (RestorePoint, error) {
 	if !barrierName.MatchString(name) {
 		return RestorePoint{}, ErrBarrierName
 	}
+	unlock, err := b.Store.Lock(ctx)
+	if err != nil {
+		return RestorePoint{}, fmt.Errorf("barrier %s: %w", name, err)
+	}
+	defer unlock()
 	if exists, err := b.Store.Exists(ctx, name); err != nil {
 		return RestorePoint{}, fmt.Errorf("barrier %s: %w", name, err)
 	} else if exists {
@@ -165,7 +189,11 @@ func (b *Barrier) Run(ctx context.Context, name string) (RestorePoint, error) {
 	if len(groups) == 0 {
 		return RestorePoint{}, fmt.Errorf("barrier %s: no groups", name)
 	}
-	if err := b.Store.Fence(ctx, true, "barrier "+name); err != nil {
+	owner, err := fenceOwner()
+	if err != nil {
+		return RestorePoint{}, fmt.Errorf("barrier %s: %w", name, err)
+	}
+	if err := b.Store.Fence(ctx, true, "barrier "+name, owner); err != nil {
 		return RestorePoint{}, fmt.Errorf("barrier %s: fence: %w", name, err)
 	}
 	b.logger().Info("barrier: write fence raised", "barrier", name)
@@ -173,7 +201,7 @@ func (b *Barrier) Run(ctx context.Context, name string) (RestorePoint, error) {
 	// The fence is released even when ctx is done.
 	release, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
-	if rerr := b.Store.Fence(release, false, ""); rerr != nil {
+	if rerr := b.Store.Fence(release, false, "", owner); rerr != nil {
 		b.logger().Error("barrier: releasing the write fence failed; routers keep refusing writes", "barrier", name, "err", rerr)
 		if err == nil {
 			err = fmt.Errorf("barrier %s: release fence: %w", name, rerr)
@@ -326,9 +354,62 @@ type PGBarrierStore struct {
 	Pool *pgxpool.Pool
 }
 
+// BarrierLockKey is the pg_advisory_lock key held for the duration of a
+// barrier so only one runs cluster-wide.
+const BarrierLockKey int64 = 0x7067736861726242
+
+// ErrBarrierBusy is returned when another barrier already holds the lock.
+var ErrBarrierBusy = errors.New("barrier: another barrier is already running")
+
+// Lock implements BarrierStore: it holds a session advisory lock on a
+// dedicated connection for the whole barrier.
+func (s *PGBarrierStore) Lock(ctx context.Context) (func(), error) {
+	conn, err := s.Pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var locked bool
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, BarrierLockKey).Scan(&locked); err != nil {
+		// The lock may have been taken server-side before the reply was lost;
+		// destroy the connection so it cannot return to the pool still holding
+		// the session lock.
+		destroyPoolConn(ctx, conn)
+		return nil, err
+	}
+	if !locked {
+		conn.Release()
+		return nil, ErrBarrierBusy
+	}
+	return func() {
+		// Release the lock on the same connection, then return it. If the
+		// unlock does not confirm, destroy the connection rather than return a
+		// conn that might still hold the lock.
+		rel, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		if _, err := conn.Exec(rel, `SELECT pg_advisory_unlock($1)`, BarrierLockKey); err != nil {
+			destroyPoolConn(rel, conn)
+			return
+		}
+		conn.Release()
+	}, nil
+}
+
+// destroyPoolConn removes conn from the pool and closes the underlying session
+// so any session-level advisory lock it holds is released by PostgreSQL.
+func destroyPoolConn(ctx context.Context, conn *pgxpool.Conn) {
+	raw := conn.Hijack()
+	_ = raw.Close(ctx)
+}
+
 // Fence implements BarrierStore.
-func (s *PGBarrierStore) Fence(ctx context.Context, active bool, reason string) error {
-	return catalog.SetWriteFence(ctx, s.Pool, active, reason)
+func (s *PGBarrierStore) Fence(ctx context.Context, active bool, reason, owner string) error {
+	if active {
+		return catalog.RaiseWriteFence(ctx, s.Pool, reason, owner)
+	}
+	if _, err := catalog.ReleaseWriteFence(ctx, s.Pool, owner); err != nil {
+		return err
+	}
+	return nil
 }
 
 // FencedAt implements BarrierStore.

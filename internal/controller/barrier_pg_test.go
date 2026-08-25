@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 )
 
@@ -106,5 +108,65 @@ func TestDecisionWatermarkSurvivesDeletedRows(t *testing.T) {
 	}
 	if after <= before {
 		t.Fatalf("watermark did not advance for a deleted row: before=%d after=%d", before, after)
+	}
+}
+
+// TestBarrierLockSerializesOnPostgres: the barrier advisory lock admits one
+// holder at a time, so two barriers can never raise and clear the shared
+// write fence concurrently.
+func TestBarrierLockSerializesOnPostgres(t *testing.T) {
+	f := newResolverFixtureWith(t)
+	ctx := context.Background()
+	store := &PGBarrierStore{Pool: f.pool}
+
+	unlock, err := store.Lock(ctx)
+	if err != nil {
+		t.Fatalf("first lock: %v", err)
+	}
+	// A second barrier cannot acquire the lock while the first holds it.
+	if _, err := store.Lock(ctx); !errors.Is(err, ErrBarrierBusy) {
+		t.Fatalf("second lock: err = %v, want ErrBarrierBusy", err)
+	}
+	unlock()
+	// After release, a new barrier can take it.
+	unlock2, err := store.Lock(ctx)
+	if err != nil {
+		t.Fatalf("lock after release: %v", err)
+	}
+	unlock2()
+}
+
+// TestWriteFenceOwnerCASOnPostgres: the fence is cleared only by its owner, so
+// a barrier that lost its lock session cannot clear a fence a later barrier
+// has raised.
+func TestWriteFenceOwnerCASOnPostgres(t *testing.T) {
+	f := newResolverFixtureWith(t)
+	ctx := context.Background()
+	fenced := func() bool {
+		var v bool
+		if err := f.pool.QueryRow(ctx, `SELECT write_fence FROM pgshard.shard_map_generation`).Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	if err := catalog.RaiseWriteFence(ctx, f.pool, "run A", "owner-A"); err != nil {
+		t.Fatal(err)
+	}
+	if !fenced() {
+		t.Fatal("fence not raised")
+	}
+	// A stale release from a different owner must not clear it.
+	if cleared, err := catalog.ReleaseWriteFence(ctx, f.pool, "owner-B"); err != nil || cleared {
+		t.Fatalf("foreign owner cleared the fence: cleared=%v err=%v", cleared, err)
+	}
+	if !fenced() {
+		t.Fatal("fence dropped by a non-owner")
+	}
+	// The owner clears it.
+	if cleared, err := catalog.ReleaseWriteFence(ctx, f.pool, "owner-A"); err != nil || !cleared {
+		t.Fatalf("owner failed to clear: cleared=%v err=%v", cleared, err)
+	}
+	if fenced() {
+		t.Fatal("fence still up after owner release")
 	}
 }
