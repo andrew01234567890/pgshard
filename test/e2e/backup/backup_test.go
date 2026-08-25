@@ -530,6 +530,8 @@ spec:
   clusterName: %[3]s
   newClusterName: %[1]s
   clusterSpec:
+    internalTLS:
+      insecure: true
     postgresql:
       major: %[4]s
 %[5]s    catalog:
