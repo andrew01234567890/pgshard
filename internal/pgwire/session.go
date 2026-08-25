@@ -241,6 +241,21 @@ func (s *session) run() {
 
 var errCancelRequest = errors.New("cancel request handled")
 
+// requireTLS refuses a session that reached the startup message without
+// negotiating TLS on a server that has a certificate. The refusal is worth
+// making explicit rather than trusting every client to ask: a downgrade is
+// silent otherwise.
+func (s *session) requireTLS() error {
+	if s.server.cfg.TLSConfig == nil || s.server.cfg.AllowPlaintext {
+		return nil
+	}
+	if _, isTLS := s.conn.(*tls.Conn); isTLS {
+		return nil
+	}
+	s.terminate(Errorf(CodeInvalidAuthorization, "the server requires TLS; the connection did not request it"))
+	return errors.New("plaintext startup refused: server requires TLS")
+}
+
 func (s *session) startup(ctx context.Context) error {
 	if s.server.cfg.TLSConfig != nil {
 		if b, err := s.reader.Peek(1); err == nil && b[0] == 0x16 {
@@ -285,6 +300,9 @@ func (s *session) startup(ctx context.Context) error {
 		case startupMessage:
 		}
 		break
+	}
+	if err := s.requireTLS(); err != nil {
+		return err
 	}
 	if pkt.major() != 3 {
 		s.terminate(Errorf(CodeProtocolViolation, "unsupported frontend protocol %d.%d: server supports 3.0 to 3.2", pkt.major(), pkt.minor()))
