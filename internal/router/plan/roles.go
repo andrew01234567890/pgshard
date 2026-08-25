@@ -227,11 +227,19 @@ func grantChanges(g *pgquerypb.GrantStmt) []catalog.GrantChange {
 // alterRoleSet fans out ALTER ROLE ... SET/RESET and records the setting.
 func (w *walker) alterRoleSet(s *pgquerypb.AlterRoleSetStmt) error {
 	m := Migration{Kind: "ALTER ROLE", Scope: ScopeAll}
+	set := s.GetSetstmt()
+	// Validate the setting before any role-shape early return: CURRENT_USER,
+	// SESSION_USER and ALL are not ROLESPEC_CSTRING but still persist the
+	// value for a concrete role at apply time.
+	if setsProtectedValue(set.GetKind()) {
+		if err := refuseProtectedGUC(set.GetName()); err != nil {
+			return err
+		}
+	}
 	role := s.GetRole()
 	if role == nil || role.GetRoletype() != pgquerypb.RoleSpecType_ROLESPEC_CSTRING {
 		return w.migration(m)
 	}
-	set := s.GetSetstmt()
 	rs := catalog.RoleSetting{Role: role.GetRolename(), Database: s.GetDatabase(), Name: set.GetName()}
 	switch set.GetKind() {
 	case pgquerypb.VariableSetKind_VAR_SET_VALUE:

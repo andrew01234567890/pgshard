@@ -60,6 +60,9 @@ func (p *Planner) Plan(ctx context.Context, sess Session, sql string) (Plan, err
 	if err := classify(raw.GetStmt(), &pl.Class); err != nil {
 		return refusalErr(err)
 	}
+	if err := refuseProtectedSetConfig(raw.GetStmt()); err != nil {
+		return refusalErr(err)
+	}
 	w := &walker{sess: sess, plan: pl, tree: res.Tree, root: raw.GetStmt(), raw: raw, sql: sql}
 	if err := w.statement(raw.GetStmt()); err != nil {
 		return refusalErr(err)
@@ -103,6 +106,15 @@ func (s Session) session() Plan { return Plan{Kind: SessionLocal, Generation: s.
 // refusals that do not depend on the catalog.
 func classify(node *pgquerypb.Node, c *StmtClass) error {
 	switch n := node.GetNode().(type) {
+	case *pgquerypb.Node_UpdateStmt:
+		// pg_catalog.pg_settings is an updatable view whose rule rewrites the
+		// UPDATE into set_config(name, setting, false), so writing to it is a
+		// SET by another route. Refuse it for protected durability GUCs.
+		if targetsPgSettings(n.UpdateStmt.GetRelation()) {
+			err := pgwire.Errorf(pgwire.CodeInsufficientPrivilege, "updating pg_settings is not permitted through pgshard")
+			err.Hint = "durability settings are fixed by the cluster to keep commits recoverable across failover"
+			return err
+		}
 	case *pgquerypb.Node_ListenStmt:
 		return notYet("LISTEN is not supported through the router", "")
 	case *pgquerypb.Node_NotifyStmt:
@@ -153,10 +165,20 @@ func classify(node *pgquerypb.Node, c *StmtClass) error {
 	case *pgquerypb.Node_VariableSetStmt:
 		s := n.VariableSetStmt
 		if s.GetIsLocal() {
+			if setsProtectedValue(s.GetKind()) {
+				if err := refuseProtectedGUC(s.GetName()); err != nil {
+					return err
+				}
+			}
 			if strings.EqualFold(s.GetName(), "search_path") {
 				return notYet("SET LOCAL search_path is not available yet", "use SET search_path or schema-qualify table names")
 			}
 			return nil
+		}
+		if setsProtectedValue(s.GetKind()) {
+			if err := refuseProtectedGUC(s.GetName()); err != nil {
+				return err
+			}
 		}
 		switch s.GetKind() {
 		case pgquerypb.VariableSetKind_VAR_SET_VALUE, pgquerypb.VariableSetKind_VAR_SET_DEFAULT,
@@ -183,6 +205,88 @@ func classify(node *pgquerypb.Node, c *StmtClass) error {
 				c.SetGUC, c.GUCName = true, "session characteristics"
 			}
 		}
+	}
+	return nil
+}
+
+// protectedDurabilityGUCs are settings the router never lets a client change:
+// weakening them would let a transaction be acknowledged before its WAL is
+// durable, which silently breaks the durability that failover candidate
+// selection assumes. The safe value is forced as the server default instead.
+var protectedDurabilityGUCs = map[string]bool{
+	"synchronous_commit": true,
+}
+
+// refuseProtectedSetConfig refuses set_config('<protected>', ...) anywhere in a
+// statement, the expression-level equivalent of SET. A non-constant setting
+// name cannot be checked at plan time, so it fails closed.
+func refuseProtectedSetConfig(root *pgquerypb.Node) error {
+	var refErr error
+	visit(root, func(n *pgquerypb.Node) bool {
+		fc := n.GetFuncCall()
+		if fc == nil {
+			return true
+		}
+		names := stringList(fc.GetFuncname())
+		last := len(names) - 1
+		if last < 0 || !strings.EqualFold(names[last], "set_config") {
+			return true
+		}
+		// The durability built-in is pg_catalog.set_config, reachable
+		// unqualified or with a pg_catalog schema part (optionally preceded
+		// by the current-database name). A set_config in any other schema is
+		// a different function. Match on the parse tree, never the SQL text:
+		// U&"..." escapes and database qualification hide it from a substring
+		// check while still resolving to the built-in.
+		if last >= 1 && !strings.EqualFold(names[last-1], "pg_catalog") {
+			return true
+		}
+		args := fc.GetArgs()
+		if len(args) == 0 {
+			return true
+		}
+		name := args[0].GetAConst().GetSval().GetSval()
+		if name == "" {
+			err := pgwire.Errorf(pgwire.CodeInsufficientPrivilege, "set_config with a non-constant setting name is not permitted through pgshard")
+			err.Hint = "durability settings are fixed by the cluster to keep commits recoverable across failover"
+			refErr = err
+			return false
+		}
+		if err := refuseProtectedGUC(name); err != nil {
+			refErr = err
+			return false
+		}
+		return true
+	})
+	return refErr
+}
+
+// targetsPgSettings reports whether a range var names pg_catalog.pg_settings.
+func targetsPgSettings(rv *pgquerypb.RangeVar) bool {
+	if rv == nil || !strings.EqualFold(rv.GetRelname(), "pg_settings") {
+		return false
+	}
+	sc := rv.GetSchemaname()
+	return sc == "" || strings.EqualFold(sc, "pg_catalog")
+}
+
+// setsProtectedValue reports whether a SET kind assigns an explicit value (as
+// opposed to VAR_SET_DEFAULT/VAR_RESET, which restore the forced-safe server
+// default and are always allowed for a protected GUC).
+func setsProtectedValue(kind pgquerypb.VariableSetKind) bool {
+	return kind == pgquerypb.VariableSetKind_VAR_SET_VALUE ||
+		kind == pgquerypb.VariableSetKind_VAR_SET_CURRENT
+}
+
+// refuseProtectedGUC returns a refusal error if name is a protected durability
+// GUC, and nil otherwise. It is applied to SET, SET LOCAL and RESET of a named
+// setting; RESET ALL (empty name) is allowed because it restores the forced
+// server default.
+func refuseProtectedGUC(name string) error {
+	if protectedDurabilityGUCs[strings.ToLower(name)] {
+		err := pgwire.Errorf(pgwire.CodeInsufficientPrivilege, "changing %s is not permitted through pgshard", strings.ToLower(name))
+		err.Hint = "durability settings are fixed by the cluster to keep commits recoverable across failover"
+		return err
 	}
 	return nil
 }

@@ -9,15 +9,16 @@ import (
 
 // SQLSTATE codes used by the wire layer itself.
 const (
-	CodeProtocolViolation    = "08P01"
-	CodeFeatureNotSupported  = "0A000"
-	CodeInvalidPassword      = "28P01"
-	CodeInvalidAuthorization = "28000"
-	CodeTooManyConnections   = "53300"
-	CodeAdminShutdown        = "57P01"
-	CodeQueryCanceled        = "57014"
-	CodeSyntaxError          = "42601"
-	CodeInternalError        = "XX000"
+	CodeProtocolViolation     = "08P01"
+	CodeFeatureNotSupported   = "0A000"
+	CodeInvalidPassword       = "28P01"
+	CodeInvalidAuthorization  = "28000"
+	CodeTooManyConnections    = "53300"
+	CodeAdminShutdown         = "57P01"
+	CodeQueryCanceled         = "57014"
+	CodeSyntaxError           = "42601"
+	CodeInsufficientPrivilege = "42501"
+	CodeInternalError         = "XX000"
 )
 
 // Error is a PostgreSQL-style error that is sent to the client as an
