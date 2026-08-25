@@ -151,6 +151,8 @@ metadata:
   name: %[1]s
   namespace: %[2]s
 spec:
+  internalTLS:
+    insecure: true
   postgresql:
     major: %[3]s
 %[4]s  catalog:
