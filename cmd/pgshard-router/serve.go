@@ -154,6 +154,9 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		return cli.ExitUsage
 	}
 	defer pool.Close()
+	if *rolesTTL <= 0 {
+		*rolesTTL = 5 * time.Second
+	}
 	roles := router.NewRoleCache(pool, *rolesTTL)
 	if _, err := roles.Lookup(ctx, ""); err != nil && !errors.Is(err, router.ErrUnknownRole) {
 		fmt.Fprintf(stderr, "pgshard-router serve: catalog roles: %v\n", err)
