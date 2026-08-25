@@ -60,6 +60,9 @@ func (p *Planner) Plan(ctx context.Context, sess Session, sql string) (Plan, err
 	if err := classify(raw.GetStmt(), &pl.Class); err != nil {
 		return refusalErr(err)
 	}
+	if err := refuseProtectedSetConfig(sql, raw.GetStmt()); err != nil {
+		return refusalErr(err)
+	}
 	w := &walker{sess: sess, plan: pl, tree: res.Tree, root: raw.GetStmt(), raw: raw, sql: sql}
 	if err := w.statement(raw.GetStmt()); err != nil {
 		return refusalErr(err)
@@ -203,6 +206,50 @@ func classify(node *pgquerypb.Node, c *StmtClass) error {
 // selection assumes. The safe value is forced as the server default instead.
 var protectedDurabilityGUCs = map[string]bool{
 	"synchronous_commit": true,
+}
+
+// refuseProtectedSetConfig refuses set_config('<protected>', ...) anywhere in a
+// statement, the expression-level equivalent of SET. A non-constant setting
+// name cannot be checked at plan time, so it fails closed. The SQL text is a
+// cheap prefilter: the reflective walk runs only when set_config is mentioned.
+func refuseProtectedSetConfig(sql string, root *pgquerypb.Node) error {
+	if !strings.Contains(strings.ToLower(sql), "set_config") {
+		return nil
+	}
+	var refErr error
+	visit(root, func(n *pgquerypb.Node) bool {
+		fc := n.GetFuncCall()
+		if fc == nil {
+			return true
+		}
+		names := stringList(fc.GetFuncname())
+		if len(names) == 0 || !strings.EqualFold(names[len(names)-1], "set_config") {
+			return true
+		}
+		if len(names) == 2 && !strings.EqualFold(names[0], "pg_catalog") {
+			return true
+		}
+		if len(names) > 2 {
+			return true
+		}
+		args := fc.GetArgs()
+		if len(args) == 0 {
+			return true
+		}
+		name := args[0].GetAConst().GetSval().GetSval()
+		if name == "" {
+			err := pgwire.Errorf(pgwire.CodeInsufficientPrivilege, "set_config with a non-constant setting name is not permitted through pgshard")
+			err.Hint = "durability settings are fixed by the cluster to keep commits recoverable across failover"
+			refErr = err
+			return false
+		}
+		if err := refuseProtectedGUC(name); err != nil {
+			refErr = err
+			return false
+		}
+		return true
+	})
+	return refErr
 }
 
 // setsProtectedValue reports whether a SET kind assigns an explicit value (as

@@ -235,6 +235,13 @@ func TestProtectedDurabilityGUCRefused(t *testing.T) {
 		"set local synchronous_commit = off",
 		"alter role app set synchronous_commit = off",
 		"alter role app in database d set synchronous_commit to off",
+		"alter role current_user set synchronous_commit = off",
+		"alter role session_user set synchronous_commit to remote_write",
+		"alter role all set synchronous_commit = local",
+		"select set_config('synchronous_commit', 'off', true)",
+		"update orders set note = set_config('synchronous_commit','off',true) where tenant_id = 1",
+		"select pg_catalog.set_config('synchronous_commit', 'off', false)",
+		"select set_config(note, 'off', true) from orders",
 	}
 	for _, sql := range refuse {
 		pl, err := New().Plan(context.Background(), session(snap), sql)
@@ -255,6 +262,8 @@ func TestProtectedDurabilityGUCRefused(t *testing.T) {
 		"set local synchronous_commit to default",
 		"alter role app reset synchronous_commit",
 		"alter role app reset all",
+		"select set_config('statement_timeout', '5s', false)",
+		"select set_config('work_mem', '64MB', true)",
 	}
 	for _, sql := range allow {
 		if _, err := New().Plan(context.Background(), session(snap), sql); err != nil {
