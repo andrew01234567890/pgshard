@@ -84,8 +84,32 @@ func TestBarrierOnPostgres(t *testing.T) {
 	if err := f.pool.QueryRow(ctx, `SELECT write_fence FROM pgshard.shard_map_generation`).Scan(&fenced); err != nil || fenced {
 		t.Fatalf("fence after the failed barrier: %v %v", fenced, err)
 	}
-	if list, _ := srv.ListBarriers(ctx, &pgshardv1.ListBarriersRequest{}); len(list.GetBarriers()) != 1 {
-		t.Fatalf("failed barrier recorded: %v", list)
+	// The failed attempt keeps its reserved row so the name can never be
+	// reused, and is listed uncertified; only b1 is certified.
+	list, _ = srv.ListBarriers(ctx, &pgshardv1.ListBarriersRequest{})
+	certified := 0
+	for _, b := range list.GetBarriers() {
+		if b.GetCertified() {
+			certified++
+		}
+	}
+	if len(list.GetBarriers()) != 2 || certified != 1 {
+		t.Fatalf("expected the failed attempt listed uncertified: %v", list)
+	}
+	if only, _ := srv.ListBarriers(ctx, &pgshardv1.ListBarriersRequest{CertifiedOnly: true}); len(only.GetBarriers()) != 1 {
+		t.Fatalf("certified-only list: %v", only)
+	}
+	// Re-running the burnt name is refused rather than creating a second
+	// physical restore point of the same name.
+	again, aerr := srv.CreateBarrier(ctx, &pgshardv1.CreateBarrierRequest{Name: "b2"})
+	msg := ""
+	if aerr != nil {
+		msg = aerr.Error()
+	} else {
+		msg = again.GetError().GetMessage()
+	}
+	if !strings.Contains(msg, "choose a new name") {
+		t.Fatalf("retry of a burnt name: %v %v", aerr, again)
 	}
 	if got := f.prepared(1); len(got) != 2 {
 		t.Fatalf("foreign and live prepared transactions must survive: %v", got)

@@ -84,12 +84,33 @@ type BarrierStore interface {
 	DecisionWatermark(ctx context.Context) (int64, error)
 	// PreparingCount counts decision rows still preparing.
 	PreparingCount(ctx context.Context) (int, error)
-	// Exists reports whether a restore point of that name is recorded.
+	// Exists reports whether a restore point of that name was ever reserved
+	// or recorded, certified or not.
 	Exists(ctx context.Context, name string) (bool, error)
-	// Record inserts the restore point and returns its id.
+	// Reserve durably claims name before any group is touched, so the
+	// physical WAL restore point of that name is created by at most one
+	// attempt ever.
+	Reserve(ctx context.Context, name string) error
+	// Fail records why the reserved attempt did not certify. The name stays
+	// claimed: a retry must use a new one.
+	Fail(ctx context.Context, name, reason string) error
+	// Record certifies the reserved restore point and returns its id.
 	Record(ctx context.Context, rp RestorePoint) (string, error)
 	// ShardMapGeneration reads the current shard map generation.
 	ShardMapGeneration(ctx context.Context) (int64, error)
+}
+
+// FenceAcker is implemented by stores that can wait until every registered
+// router has observed a newly raised fence. Older in-memory stores do not
+// implement it and therefore have no router acknowledgement to await.
+type FenceAcker interface {
+	AwaitFence(ctx context.Context) error
+}
+
+// WriterCounter is implemented by group drivers that can observe ordinary
+// transactions in addition to router-coordinated prepared transactions.
+type WriterCounter interface {
+	WriterCount(ctx context.Context, g GroupRef) (int, error)
 }
 
 // GroupRestorePoint is the recorded restore point of one group.
@@ -102,15 +123,20 @@ type GroupRestorePoint struct {
 
 // RestorePoint is one row of pgshard.restore_points.
 type RestorePoint struct {
-	ID                 string
-	Name               string
+	ID   string
+	Name string
+	// PhysicalName is immutable for the reserved attempt and is the name
+	// passed to pg_create_restore_point on every group.
+	PhysicalName       string
 	ShardMapGeneration int64
 	Certified          bool
 	Groups             []GroupRestorePoint
 	CreatedAt          time.Time
 }
 
-// RestorePointName is the WAL restore point name of a barrier.
+// RestorePointName returns the physical WAL restore-point name for an attempt
+// id. UUID punctuation is removed to keep the PostgreSQL name compact and
+// valid while retaining the complete per-attempt identity.
 func RestorePointName(barrier string) string { return RestorePointPrefix + barrier }
 
 // Barrier creates certified restore points: writes are paused, two-phase
@@ -162,7 +188,7 @@ func fenceOwner() (string, error) {
 }
 
 // ErrBarrierExists is returned for a name that is already recorded.
-var ErrBarrierExists = errors.New("barrier: a restore point of that name exists")
+var ErrBarrierExists = errors.New("barrier: a restore point of that name exists or was used by an earlier attempt; choose a new name")
 
 // ErrBarrierName is returned for a name that is not a DNS-style label.
 var ErrBarrierName = errors.New("barrier: name must be 1-63 lowercase letters, digits and hyphens")
@@ -182,6 +208,27 @@ func (b *Barrier) Run(ctx context.Context, name string) (RestorePoint, error) {
 	} else if exists {
 		return RestorePoint{}, fmt.Errorf("barrier %s: %w", name, ErrBarrierExists)
 	}
+	// Reserve the name before any group gets a restore point: a retry after
+	// a partial failure must use a fresh name, or groups touched by the first
+	// attempt would carry two WAL restore points of the same name and
+	// name-based recovery would stop at the wrong one.
+	if err := b.Store.Reserve(ctx, name); err != nil {
+		return RestorePoint{}, fmt.Errorf("barrier %s: reserve: %w", name, err)
+	}
+	rp, err := b.run(ctx, name)
+	if err != nil {
+		fail, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		if ferr := b.Store.Fail(fail, name, err.Error()); ferr != nil {
+			b.logger().Error("barrier: recording the failed attempt failed", "barrier", name, "err", ferr)
+		}
+		return RestorePoint{}, err
+	}
+	return rp, nil
+}
+
+// run performs a reserved barrier: fence, points, certification.
+func (b *Barrier) run(ctx context.Context, name string) (RestorePoint, error) {
 	groups, err := b.Groups.List(ctx)
 	if err != nil {
 		return RestorePoint{}, fmt.Errorf("barrier %s: groups: %w", name, err)
@@ -445,7 +492,21 @@ func (s *PGBarrierStore) Exists(ctx context.Context, name string) (bool, error) 
 	return exists, err
 }
 
-// Record implements BarrierStore.
+// Reserve implements BarrierStore: the unique name constraint makes a second
+// reservation of the same name fail.
+func (s *PGBarrierStore) Reserve(ctx context.Context, name string) error {
+	_, err := s.Pool.Exec(ctx, `INSERT INTO pgshard.restore_points (id, name, shard_map_generation, per_group, certified)
+		VALUES (gen_random_uuid(), $1, 0, '{}'::jsonb, false)`, name)
+	return err
+}
+
+// Fail implements BarrierStore.
+func (s *PGBarrierStore) Fail(ctx context.Context, name, reason string) error {
+	_, err := s.Pool.Exec(ctx, `UPDATE pgshard.restore_points SET attempt_error = $2 WHERE name = $1 AND NOT certified`, name, reason)
+	return err
+}
+
+// Record implements BarrierStore: it certifies the row reserved for the run.
 func (s *PGBarrierStore) Record(ctx context.Context, rp RestorePoint) (string, error) {
 	perGroup := map[string]GroupRestorePoint{}
 	for _, g := range rp.Groups {
@@ -456,8 +517,9 @@ func (s *PGBarrierStore) Record(ctx context.Context, rp RestorePoint) (string, e
 		return "", err
 	}
 	var id string
-	err = s.Pool.QueryRow(ctx, `INSERT INTO pgshard.restore_points (id, name, shard_map_generation, per_group, certified, created_at)
-		VALUES (gen_random_uuid(), $1, $2, $3, $4, $5) RETURNING id::text`, rp.Name, rp.ShardMapGeneration, body, rp.Certified, rp.CreatedAt).Scan(&id)
+	err = s.Pool.QueryRow(ctx, `UPDATE pgshard.restore_points
+		SET shard_map_generation = $2, per_group = $3, certified = $4, created_at = $5, attempt_error = ''
+		WHERE name = $1 AND NOT certified RETURNING id::text`, rp.Name, rp.ShardMapGeneration, body, rp.Certified, rp.CreatedAt).Scan(&id)
 	return id, err
 }
 

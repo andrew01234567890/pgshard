@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +20,8 @@ type fakeBarrierStore struct {
 	preparing int
 	watermark int64
 	recorded  []RestorePoint
+	reserved  []string
+	failed    map[string]string
 	journal   *[]string
 	fail      map[string]error
 	now       func() time.Time
@@ -75,12 +78,48 @@ func (s *fakeBarrierStore) DecisionWatermark(context.Context) (int64, error) {
 }
 
 func (s *fakeBarrierStore) Exists(_ context.Context, name string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, r := range s.recorded {
 		if r.Name == name {
 			return true, nil
 		}
 	}
+	for _, n := range s.reserved {
+		if n == name {
+			return true, nil
+		}
+	}
 	return false, nil
+}
+
+// Reserve claims the name; a second reservation of a claimed name fails the
+// way the unique constraint does in PostgreSQL.
+func (s *fakeBarrierStore) Reserve(_ context.Context, name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.fail["reserve"]; err != nil {
+		return err
+	}
+	for _, n := range s.reserved {
+		if n == name {
+			return errors.New("duplicate key value violates unique constraint")
+		}
+	}
+	s.reserved = append(s.reserved, name)
+	s.log("reserve " + name)
+	return nil
+}
+
+func (s *fakeBarrierStore) Fail(_ context.Context, name, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failed == nil {
+		s.failed = map[string]string{}
+	}
+	s.failed[name] = reason
+	s.log("fail " + name)
+	return nil
 }
 
 func (s *fakeBarrierStore) Record(_ context.Context, rp RestorePoint) (string, error) {
@@ -197,6 +236,7 @@ func TestBarrierHappyPathStepOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{
+		"reserve nightly-1",
 		"fence barrier nightly-1",
 		"preparing=0", "prepared catalog=0", "prepared shard0=0", "prepared shard1=0",
 		"preparing=0", "prepared catalog=0", "prepared shard0=0", "prepared shard1=0",
@@ -288,8 +328,18 @@ func TestBarrierFailuresReleaseTheFence(t *testing.T) {
 			if len(f.store.recorded) != 0 {
 				t.Fatal("restore point recorded despite the failure")
 			}
-			if f.journal[0] != "fence barrier b" || f.journal[len(f.journal)-1] != "release" {
+			// The name is claimed before anything is touched and the failed
+			// attempt is recorded, with the fence released in between.
+			if f.journal[0] != "reserve b" || f.journal[len(f.journal)-1] != "fail b" {
 				t.Fatalf("journal %v", f.journal)
+			}
+			if !slices.Contains(f.journal, "fence barrier b") || !slices.Contains(f.journal, "release") {
+				t.Fatalf("journal %v", f.journal)
+			}
+			// A retry of the same name is refused: the physical WAL restore
+			// point of that name may already exist on a touched group.
+			if _, err := f.b.Run(context.Background(), "b"); !errors.Is(err, ErrBarrierExists) {
+				t.Fatalf("retry of a burnt name: %v", err)
 			}
 		})
 	}
@@ -301,7 +351,7 @@ func TestBarrierNeverFencesWhenItCannotStart(t *testing.T) {
 	if _, err := f.b.Run(context.Background(), "b"); err == nil || !strings.Contains(err.Error(), "groups: catalog unreachable") {
 		t.Fatalf("err %v", err)
 	}
-	if len(f.journal) != 0 {
+	if slices.Contains(f.journal, "fence barrier b") {
 		t.Fatalf("journal %v", f.journal)
 	}
 	f = newBarrierFixture()
@@ -309,7 +359,7 @@ func TestBarrierNeverFencesWhenItCannotStart(t *testing.T) {
 	if _, err := f.b.Run(context.Background(), "b"); err == nil || !strings.Contains(err.Error(), "fence: read only catalog") {
 		t.Fatalf("err %v", err)
 	}
-	if len(f.journal) != 0 {
+	if slices.Contains(f.journal, "restorepoint") {
 		t.Fatalf("journal %v", f.journal)
 	}
 }
