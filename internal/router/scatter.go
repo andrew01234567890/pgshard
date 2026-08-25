@@ -264,10 +264,19 @@ func (e *Executor) runScatter(ctx context.Context, shards []int32, m *plan.Merge
 			header: make(chan struct{}), rows: make(chan [][]byte, 64), done: make(chan struct{}), stop: make(chan struct{})}
 		parts = append(parts, p)
 		gen := e.r.cfg.Poolers.Generation(sh)
-		// The planner resolved relations under the session's search_path;
-		// a fresh scatter backend starts on the server default, so pin it
-		// and apply the path before the routed statement runs.
+		// A fresh scatter backend starts on the server defaults, so it gets
+		// the same session state a routed backend is replayed: not just the
+		// search_path the planner resolved relations under, but every SET
+		// the session has run. SET ROLE in particular decides which grants
+		// and row-level security policies apply, and a participant that
+		// missed it would evaluate the query as the login role.
+		settings := e.sessionSettings()
 		if path := e.searchPath(); path != nil {
+			// Pin the path the planner actually resolved relations under,
+			// whatever the replayed sequence composed to.
+			settings = append(settings, searchPathSQL(path))
+		}
+		if len(settings) > 0 {
 			resp, rerr := client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: p.sid, Generation: gen})
 			if rerr != nil {
 				return pgwire.Errorf(codeConnectionFailure, "pooler of shard %s/%d refused the connection: %v", sh.Set, sh.ID, rerr)
@@ -276,7 +285,7 @@ func (e *Executor) runScatter(ctx context.Context, shards []int32, m *plan.Merge
 				return toPgwireError(resp.Error)
 			}
 			p.reserved = true
-			if err := ps.send(simpleQuery(searchPathSQL(path)), p.sid, gen, e.ident, e.info.Database); err != nil {
+			if err := ps.send(simpleQuery(strings.Join(settings, "; ")), p.sid, gen, e.ident, e.info.Database); err != nil {
 				return pgwire.Errorf(codeConnectionFailure, "pooler connection lost: %v", err)
 			}
 			if err := p.drain(ctx); err != nil {
