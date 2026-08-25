@@ -45,6 +45,9 @@ type MigrationStore interface {
 	SaveMeta(ctx context.Context, id string, meta catalog.MigrationMeta) error
 	// Exec runs a catalog statement (desired-state mirroring).
 	Exec(ctx context.Context, sql string, args ...any) error
+	// LockedDatabases lists the databases a workflow currently holds the
+	// DDL lock on.
+	LockedDatabases(ctx context.Context) (map[string]string, error)
 }
 
 // PGMigrationStore is the MigrationStore over the catalog pool.
@@ -78,6 +81,26 @@ func (s *PGMigrationStore) Databases(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
+// LockedDatabases implements MigrationStore. A reshard or upgrade cutover
+// takes these when it fences, precisely so that schema does not move under
+// a copy that is comparing the two sides.
+func (s *PGMigrationStore) LockedDatabases(ctx context.Context) (map[string]string, error) {
+	rows, err := s.Pool.Query(ctx, `SELECT key, workflow_id::text FROM pgshard.workflow_locks WHERE kind = 'ddl'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	held := map[string]string{}
+	for rows.Next() {
+		var db, wf string
+		if err := rows.Scan(&db, &wf); err != nil {
+			return nil, err
+		}
+		held[db] = wf
+	}
+	return held, rows.Err()
 }
 
 // SaveMeta implements MigrationStore.
@@ -242,8 +265,22 @@ func (a *Applier) RunOnce(ctx context.Context) (int, error) {
 			a.logger().Warn("sweeping rewrite artifacts failed", "err", err)
 		}
 	}
+	// A cutover writes a DDL lock per database when it fences, so that the
+	// schema cannot move under a copy that is comparing the two sides. The
+	// locks were being written and never read: the migration simply ran.
+	// A migration already part-applied is driven to a final state rather
+	// than abandoned half-way, since stopping there is worse.
+	held, err := a.Store.LockedDatabases(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("applier: ddl locks: %w", err)
+	}
 	done := 0
 	for _, m := range pending {
+		if wf, locked := held[m.Database]; locked && m.State == catalog.MigrationQueued {
+			a.logger().Info("holding a migration while a workflow has the database's DDL lock",
+				"migration", m.ID, "database", m.Database, "workflow", wf)
+			continue
+		}
 		if err := a.drive(ctx, m); err != nil {
 			return done, err
 		}
