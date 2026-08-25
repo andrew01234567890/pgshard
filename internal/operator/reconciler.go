@@ -58,6 +58,7 @@ type ClusterReconciler struct {
 
 	mu             sync.Mutex
 	unhealthySince map[string]time.Time
+	lastRepromote  map[string]time.Time
 }
 
 // SetupWithManager registers the reconciler and its watches.

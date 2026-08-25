@@ -329,10 +329,13 @@ type StatusResponse struct {
 	// Current timeline id.
 	Timeline uint32 `protobuf:"varint,4,opt,name=timeline,proto3" json:"timeline,omitempty"`
 	// True when PostgreSQL accepts connections.
-	Running       bool   `protobuf:"varint,5,opt,name=running,proto3" json:"running,omitempty"`
-	Error         *Error `protobuf:"bytes,6,opt,name=error,proto3" json:"error,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Running bool   `protobuf:"varint,5,opt,name=running,proto3" json:"running,omitempty"`
+	Error   *Error `protobuf:"bytes,6,opt,name=error,proto3" json:"error,omitempty"`
+	// True while a promotion has run pg_ctl promote but not yet finished its
+	// post-promotion setup; the operator re-issues Promote to complete it.
+	PromotionPending bool `protobuf:"varint,7,opt,name=promotion_pending,json=promotionPending,proto3" json:"promotion_pending,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *StatusResponse) Reset() {
@@ -405,6 +408,13 @@ func (x *StatusResponse) GetError() *Error {
 		return x.Error
 	}
 	return nil
+}
+
+func (x *StatusResponse) GetPromotionPending() bool {
+	if x != nil {
+		return x.PromotionPending
+	}
+	return false
 }
 
 // PromoteRequest promotes the instance.
@@ -3354,14 +3364,15 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\n" +
 	"\x16pgshard/v1/agent.proto\x12\n" +
 	"pgshard.v1\x1a\x17pgshard/v1/common.proto\"\x0f\n" +
-	"\rStatusRequest\"\x8e\x02\n" +
+	"\rStatusRequest\"\xbb\x02\n" +
 	"\x0eStatusResponse\x123\n" +
 	"\x04role\x18\x01 \x01(\x0e2\x1f.pgshard.v1.StatusResponse.RoleR\x04role\x12\x14\n" +
 	"\x05epoch\x18\x02 \x01(\x04R\x05epoch\x12\x10\n" +
 	"\x03lsn\x18\x03 \x01(\x04R\x03lsn\x12\x1a\n" +
 	"\btimeline\x18\x04 \x01(\rR\btimeline\x12\x18\n" +
 	"\arunning\x18\x05 \x01(\bR\arunning\x12'\n" +
-	"\x05error\x18\x06 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"@\n" +
+	"\x05error\x18\x06 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\x12+\n" +
+	"\x11promotion_pending\x18\a \x01(\bR\x10promotionPending\"@\n" +
 	"\x04Role\x12\x14\n" +
 	"\x10ROLE_UNSPECIFIED\x10\x00\x12\x10\n" +
 	"\fROLE_PRIMARY\x10\x01\x12\x10\n" +

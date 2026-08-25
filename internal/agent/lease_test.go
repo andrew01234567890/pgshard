@@ -7,8 +7,12 @@ import (
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 func leaseCfg(pod string) *Config {
@@ -107,5 +111,39 @@ func TestLeaseHoldStopsCleanlyOnCancel(t *testing.T) {
 	cancel()
 	if err := <-errc; err != nil {
 		t.Fatalf("hold: %v", err)
+	}
+}
+
+// TestLeaseAcquireRetriesOwnConflict: an optimistic-concurrency conflict on a
+// lease we still hold (our hold loop or the operator's fence bumped the
+// resourceVersion) is retried from a fresh read, not reported as a lost lease.
+func TestLeaseAcquireRetriesOwnConflict(t *testing.T) {
+	cs := fake.NewClientset()
+	client := cs.CoordinationV1().Leases("ns")
+	a := NewLeaseWithClient(client, leaseCfg("pod-a"), slog.New(slog.DiscardHandler))
+	ctx := context.Background()
+	if err := a.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	conflicts := 0
+	cs.PrependReactor("update", "leases", func(_ k8stesting.Action) (bool, runtime.Object, error) {
+		if conflicts < 1 {
+			conflicts++
+			return true, nil, apierrors.NewConflict(schema.GroupResource{Group: "coordination.k8s.io", Resource: "leases"}, "c1-s0-primary", errors.New("stale"))
+		}
+		return false, nil, nil
+	})
+	if err := a.Acquire(ctx); err != nil {
+		t.Fatalf("a single conflict on our own lease must be retried, got %v", err)
+	}
+	if conflicts != 1 {
+		t.Fatalf("conflict reactor fired %d times", conflicts)
+	}
+	// A persistent conflict is a transient error, never ErrLeaseHeld.
+	cs.PrependReactor("update", "leases", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewConflict(schema.GroupResource{Group: "coordination.k8s.io", Resource: "leases"}, "c1-s0-primary", errors.New("stale"))
+	})
+	if err := a.Acquire(ctx); err == nil || errors.Is(err, ErrLeaseHeld) {
+		t.Fatalf("persistent conflict must surface as transient, got %v", err)
 	}
 }

@@ -199,6 +199,25 @@ func (r *ClusterReconciler) failoverDelay() time.Duration {
 	return DefaultFailoverDelay
 }
 
+// repromoteInterval is the least time between re-promotions of a primary
+// whose post-promotion setup keeps failing.
+const repromoteInterval = 30 * time.Second
+
+// repromoteDue reports whether a re-promotion of the group's pending primary
+// may be issued now, recording the attempt when it may.
+func (r *ClusterReconciler) repromoteDue(key string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.lastRepromote == nil {
+		r.lastRepromote = map[string]time.Time{}
+	}
+	if last, ok := r.lastRepromote[key]; ok && r.now().Sub(last) < repromoteInterval {
+		return false
+	}
+	r.lastRepromote[key] = r.now()
+	return true
+}
+
 // unhealthyFor records that the group's primary was unhealthy at now and
 // returns how long it has been continuously so.
 func (r *ClusterReconciler) unhealthyFor(key string, unhealthy bool) time.Duration {
@@ -461,7 +480,18 @@ func (r *ClusterReconciler) converge(ctx context.Context, c *pgshardv1alpha1.PgS
 			continue
 		}
 		switch {
-		case name == state.primary && !st.Primary:
+		case name == state.primary && (!st.Primary || st.PromotionPending):
+			// A designated primary that is still a standby must be promoted;
+			// one that promoted but whose post-promotion setup failed reports
+			// PromotionPending and is re-promoted (the agent's Promote is
+			// idempotent and only re-runs the setup) so it never stays
+			// half-configured. Each re-promote bumps the epoch and rewrites
+			// the fence, so a persistent setup failure is retried no faster
+			// than repromoteInterval instead of on every reconcile.
+			if st.Primary && st.PromotionPending && !r.repromoteDue(g.Prefix()) {
+				log.Info("designated primary still finishing its promotion; waiting before re-promoting", "member", name)
+				continue
+			}
 			epoch := promotionEpoch(state.epoch, st.Epoch)
 			if epoch != state.epoch {
 				if err := r.publishFence(ctx, c, g, "", name, epoch, password); err != nil {
@@ -469,7 +499,7 @@ func (r *ClusterReconciler) converge(ctx context.Context, c *pgshardv1alpha1.PgS
 				}
 				state.epoch = epoch
 			}
-			log.Info("designated primary is a standby; promoting", "member", name, "epoch", epoch)
+			log.Info("designated primary needs (re)promotion", "member", name, "epoch", epoch, "standby", !st.Primary, "promotionPending", st.PromotionPending)
 			if err := r.Agents.Promote(ctx, agentAddr(m.ip), uint64(epoch), name); err != nil {
 				return state, fmt.Errorf("promote %s: %w", name, err)
 			}
