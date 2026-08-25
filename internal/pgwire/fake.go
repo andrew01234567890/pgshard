@@ -23,6 +23,9 @@ type FakeExecutor struct {
 	// Delay, when set, is a hook that runs before every SimpleQuery; tests
 	// use it to hold a query open while exercising cancel and drain.
 	Delay func(ctx context.Context) error
+	// SyncDelay is the same hook for Sync, where an extended-protocol batch
+	// actually runs.
+	SyncDelay func(ctx context.Context) error
 }
 
 // NewFakeExecutor returns a fresh idle FakeExecutor.
@@ -199,7 +202,12 @@ func (f *FakeExecutor) Close(_ context.Context, kind DescribeKind, name string) 
 }
 
 // Sync implements Executor.
-func (f *FakeExecutor) Sync(context.Context) error { return nil }
+func (f *FakeExecutor) Sync(ctx context.Context) error {
+	if f.SyncDelay != nil {
+		return f.SyncDelay(ctx)
+	}
+	return nil
+}
 
 // TransactionStatus implements Executor.
 func (f *FakeExecutor) TransactionStatus() TxStatus {

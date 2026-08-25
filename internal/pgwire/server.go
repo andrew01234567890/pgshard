@@ -261,16 +261,32 @@ func (s *Server) TerminateWhere(revoked func(user string) bool) int {
 		sessions = append(sessions, sess)
 	}
 	s.mu.Unlock()
+	// Latch every match first: that is what stops them executing, and it
+	// never blocks. Only then spend time telling each client why, which
+	// can wait on one that has stopped reading.
+	var ending []*session
 	n := 0
 	for _, sess := range sessions {
 		// A session still authenticating has no role yet; it is caught on
 		// the next pass, and it could not have authenticated as a role that
 		// is already refused.
-		if u := sess.user(); u != "" && revoked(u) {
-			sess.revoke()
-			n++
+		if u := sess.user(); u == "" || !revoked(u) {
+			continue
+		}
+		n++
+		if sess.latchRevoked() {
+			ending = append(ending, sess)
 		}
 	}
+	var wg sync.WaitGroup
+	for _, sess := range ending {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sess.endRevoked()
+		}()
+	}
+	wg.Wait()
 	return n
 }
 
