@@ -51,6 +51,12 @@ type RoleStore interface {
 	// RoleMigrationsPending reports whether a role or grant migration is
 	// queued or running, in which case the verifier waits.
 	RoleMigrationsPending(ctx context.Context) (bool, error)
+	// LiveShardSets names every shard set whose groups are running, not
+	// only the serving one: a reshard or upgrade target has the source's
+	// schema materialized onto it during the copy, and that schema can name
+	// roles, so the target needs them before then rather than after it
+	// starts serving.
+	LiveShardSets(ctx context.Context) ([]string, error)
 	// ServingShardSet names the shard set currently serving; roles must be
 	// materialized on the groups that are actually serving, not on a set a
 	// reshard retired.
@@ -75,6 +81,22 @@ func (s *PGRoleStore) Shards(ctx context.Context, shardSet string) ([]int32, err
 // ServingShardSet implements RoleStore.
 func (s *PGRoleStore) ServingShardSet(ctx context.Context) (string, error) {
 	return catalog.ServingShardSet(ctx, s.Pool)
+}
+
+// LiveShardSets implements RoleStore.
+func (s *PGRoleStore) LiveShardSets(ctx context.Context) ([]string, error) {
+	sets, err := catalog.ListShardSets(ctx, s.Pool)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(sets))
+	for _, set := range sets {
+		if set.State == catalog.ShardSetRetired {
+			continue
+		}
+		out = append(out, set.Name)
+	}
+	return out, nil
 }
 
 // GroupGenerations implements RoleStore.
@@ -192,27 +214,33 @@ func (v *RoleVerifier) logger() *slog.Logger {
 
 // shardSet is the configured override when there is one, otherwise
 // whichever set is serving now.
-func (v *RoleVerifier) shardSet(ctx context.Context) (string, error) {
+// shardSets is every set whose groups are running. A reshard target needs the
+// roles before its schema is materialized, which happens during the copy and so
+// long before it serves; leaving it out meant any schema naming a role could
+// not be materialized there at all.
+func (v *RoleVerifier) shardSets(ctx context.Context) ([]string, error) {
 	if v.ShardSet != "" {
-		return v.ShardSet, nil
+		return []string{v.ShardSet}, nil
 	}
-	return v.Store.ServingShardSet(ctx)
+	return v.Store.LiveShardSets(ctx)
 }
 
 func (v *RoleVerifier) groups(ctx context.Context) ([]roleGroup, error) {
-	set, err := v.shardSet(ctx)
+	sets, err := v.shardSets(ctx)
 	if err != nil {
 		return nil, err
 	}
-	ids, err := v.Store.Shards(ctx, set)
-	if err != nil {
-		return nil, fmt.Errorf("roles: shards: %w", err)
-	}
 	var out []roleGroup
-	for _, id := range ids {
-		out = append(out, roleGroup{name: fmt.Sprintf("%s/%d", set, id), dial: func(ctx context.Context, db string) (ShardConn, error) {
-			return v.Shards.DialDatabase(ctx, set, id, db)
-		}})
+	for _, set := range sets {
+		ids, err := v.Store.Shards(ctx, set)
+		if err != nil {
+			return nil, fmt.Errorf("roles: shards of %s: %w", set, err)
+		}
+		for _, id := range ids {
+			out = append(out, roleGroup{name: fmt.Sprintf("%s/%d", set, id), dial: func(ctx context.Context, db string) (ShardConn, error) {
+				return v.Shards.DialDatabase(ctx, set, id, db)
+			}})
+		}
 	}
 	if v.Catalog != nil {
 		out = append(out, roleGroup{name: CatalogGroup, catalog: true, dial: func(ctx context.Context, _ string) (ShardConn, error) { return v.Catalog(ctx) }})
