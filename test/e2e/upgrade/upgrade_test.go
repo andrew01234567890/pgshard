@@ -39,7 +39,9 @@ func TestUpgrade18To19UnderLoad(t *testing.T) {
 	waitFor(ctx, t, c, "upgrade record in mode upgrade", 5*time.Minute, func() bool {
 		return jsonpath(ctx, c, "pgshardreshard", record, "{.spec.mode}") == "upgrade"
 	})
-	waitFor(ctx, t, c, "kind=upgrade workflow running", 5*time.Minute, func() bool {
+	waitForWhy(ctx, t, c, "kind=upgrade workflow running", 5*time.Minute, func() string {
+		return upgradeWorkflowDetail(ctx, t, c)
+	}, func() bool {
 		return strings.HasPrefix(upgradeWorkflowState(ctx, t, c, "g2"), "provisioning:") ||
 			strings.HasPrefix(upgradeWorkflowState(ctx, t, c, "g2"), "running:")
 	})

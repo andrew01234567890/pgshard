@@ -200,6 +200,14 @@ func catalogSQL(ctx context.Context, t *testing.T, c *e2e.Cluster, sql string) s
 
 func waitFor(ctx context.Context, t *testing.T, c *e2e.Cluster, what string, timeout time.Duration, cond func() bool) {
 	t.Helper()
+	waitForWhy(ctx, t, c, what, timeout, nil, cond)
+}
+
+// waitForWhy is waitFor with a why the caller can use to report what it was
+// waiting on. A wait that reports only that time passed cannot distinguish a
+// workflow that was never created from one that is stuck from one that failed.
+func waitForWhy(ctx context.Context, t *testing.T, c *e2e.Cluster, what string, timeout time.Duration, why func() string, cond func() bool) {
+	t.Helper()
 	started := time.Now()
 	deadline := started.Add(timeout)
 	nextProgress := started.Add(time.Minute)
@@ -208,7 +216,11 @@ func waitFor(ctx context.Context, t *testing.T, c *e2e.Cluster, what string, tim
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out after %s waiting for %s%s", timeout, what, c.Summary(ctx, testNamespace))
+			detail := ""
+			if why != nil {
+				detail = why()
+			}
+			t.Fatalf("timed out after %s waiting for %s%s%s", timeout, what, detail, c.Summary(ctx, testNamespace))
 		}
 		if time.Now().After(nextProgress) {
 			t.Logf("still waiting for %s (%s elapsed)", what, time.Since(started).Round(time.Second))
@@ -391,6 +403,18 @@ func bringUpCluster(ctx context.Context, t *testing.T, c *e2e.Cluster, retire st
 	waitFor(ctx, t, c, "serving shard set stamped major 18", 3*time.Minute, func() bool {
 		return catalogSQL(ctx, t, c, "SELECT coalesce(max(pg_major), 0) FROM pgshard.shard_sets WHERE state = 'serving'") == "18"
 	})
+}
+
+// upgradeWorkflowDetail is what a stuck upgrade needs said about it: whether
+// the workflow row exists at all, and if it does, its state, stage, message and
+// error. Without this a timeout cannot tell "never created" from "stuck" from
+// "failed", which are three different bugs.
+func upgradeWorkflowDetail(ctx context.Context, t *testing.T, c *e2e.Cluster) string {
+	t.Helper()
+	return "\nworkflows: " + catalogSQL(ctx, t, c,
+		"SELECT coalesce(string_agg(kind || ' ' || state || ' set=' || coalesce(spec->>'shard_set', '') || ' stage=' || coalesce(status->>'stage', '') || ' msg=' || coalesce(status->>'message', '') || ' err=' || coalesce(error, ''), '; '), 'none') FROM pgshard.workflows") +
+		"\nshard sets: " + catalogSQL(ctx, t, c,
+		"SELECT coalesce(string_agg(shard_set || '=' || state || ' major=' || coalesce(pg_major::text, '-'), ', ' ORDER BY generation), 'none') FROM pgshard.shard_sets")
 }
 
 func upgradeWorkflowState(ctx context.Context, t *testing.T, c *e2e.Cluster, set string) string {
