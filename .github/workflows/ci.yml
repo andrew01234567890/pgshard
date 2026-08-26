@@ -16,10 +16,25 @@ jobs:
   go:
     name: Go build and test
     runs-on: ubuntu-latest
+    # The PostgreSQL-backed tests pull the project's postgres image, which is
+    # a private GHCR package.
+    permissions:
+      contents: read
+      packages: read
     env:
       CGO_ENABLED: "1"
+      # Turn "image unavailable" from a skip into a failure. Without it a job
+      # that could not pull the image reported green while every
+      # PostgreSQL-backed suite silently skipped.
+      PGSHARD_REQUIRE_DOCKER: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod

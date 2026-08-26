@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
+
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 )
 
@@ -82,7 +84,7 @@ func (h *harness) restoreFrom(member string, spec map[string]any) *node {
 // verify and the primary-only rule.
 func TestBackupIntegration(t *testing.T) {
 	if err := exec.Command("docker", "info").Run(); err != nil {
-		t.Skip("docker unavailable")
+		dockertest.Unavailable(t, "docker unavailable")
 	}
 	image := integrationImages[0]
 	if img := os.Getenv("PGSHARD_POSTGRES_IMAGE"); img != "" {

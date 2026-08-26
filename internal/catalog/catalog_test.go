@@ -13,6 +13,8 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -61,10 +63,10 @@ func TestMigrationsFrom(t *testing.T) {
 
 func TestCatalog(t *testing.T) {
 	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("docker not on PATH; skipping catalog integration tests")
+		dockertest.Unavailable(t, "docker not on PATH; skipping catalog integration tests")
 	}
 	if err := exec.Command("docker", "info").Run(); err != nil {
-		t.Skip("docker daemon unavailable; skipping catalog integration tests")
+		dockertest.Unavailable(t, "docker daemon unavailable; skipping catalog integration tests")
 	}
 	selected, err := selectImages(candidateImages, os.Getenv(requireProjectImagesEnv) != "", func(name string) bool { return imageAvailable(t, name) })
 	if err != nil {

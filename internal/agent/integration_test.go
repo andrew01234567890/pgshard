@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -30,7 +32,7 @@ var integrationImages = []string{
 
 func TestAgentIntegration(t *testing.T) {
 	if err := exec.Command("docker", "info").Run(); err != nil {
-		t.Skip("docker unavailable")
+		dockertest.Unavailable(t, "docker unavailable")
 	}
 	bin := buildAgent(t)
 	ran := 0

@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
+
 	"github.com/jackc/pgx/v5"
 )
 
@@ -21,11 +23,11 @@ var pgImages = []struct{ label, name string }{
 func startPostgres(t *testing.T, image string) *pgx.Conn {
 	t.Helper()
 	if err := exec.Command("docker", "info").Run(); err != nil {
-		t.Skip("docker unavailable; skipping differential hash tests")
+		dockertest.Unavailable(t, "docker unavailable; skipping differential hash tests")
 	}
 	if exec.Command("docker", "image", "inspect", image).Run() != nil {
 		if out, err := exec.Command("docker", "pull", image).CombinedOutput(); err != nil {
-			t.Skipf("image %s unavailable: %v: %s", image, err, out)
+			dockertest.Unavailable(t, "image %s unavailable: %v: %s", image, err, out)
 		}
 	}
 	l, err := net.Listen("tcp", "127.0.0.1:0")
