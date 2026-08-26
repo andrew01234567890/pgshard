@@ -82,10 +82,10 @@ func startCutoverStack(t *testing.T) *cutoverStack {
 		t.Fatal(err)
 	}
 	one, _ := placement.Split(1)
-	if err := catalog.MaterializeShardSet(ctx, tx, "default", 1, catalog.ShardSetServing, one); err != nil {
+	if err := catalog.MaterializeShardSet(ctx, tx, "default", 1, catalog.ShardSetServing, one, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := catalog.MaterializeShardSet(ctx, tx, "g2", 2, catalog.ShardSetProvisioning, tgtRanges); err != nil {
+	if err := catalog.MaterializeShardSet(ctx, tx, "g2", 2, catalog.ShardSetProvisioning, tgtRanges, 0); err != nil {
 		t.Fatal(err)
 	}
 	for _, sql := range []string{
