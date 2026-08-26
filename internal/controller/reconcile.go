@@ -272,7 +272,7 @@ func reconcileShardSets(ctx context.Context, tx pgx.Tx, res *Result) error {
 			continue
 		}
 		desired := bySet[set]
-		if err := catalog.RangeSet(desired).Validate(); err != nil {
+		if err := catalog.ValidateShardRanges(desired); err != nil {
 			res.Invalid = append(res.Invalid, fmt.Sprintf("shard set %s: %v", set, err))
 			continue
 		}

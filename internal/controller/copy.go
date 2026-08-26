@@ -306,6 +306,84 @@ func (c *Copier) fail(ctx context.Context, wf *copyWorkflow, cause error) error 
 }
 
 // sources are the shards of the serving set the copy reads from.
+// pinSource resolves the set a workflow copies from once and records it before
+// the workflow takes its first side effect, so later passes cannot drift onto a
+// different set. Resolving it live on every pass is not safe: a workflow that
+// has already built publications and subscriptions against one set would
+// rediscover whichever set is serving now, leaving its replication attached to
+// the old one, and would let the old one be reshaped underneath it.
+func (c *Copier) pinSource(ctx context.Context, wf *copyWorkflow) (string, []int32, error) {
+	set := wf.sourceSet()
+	if set == "" {
+		candidate, _, err := c.sources(ctx)
+		if err != nil {
+			return "", nil, err
+		}
+		// Copier passes are not leader-gated, so two of them can resolve
+		// different serving sets around a flip. Claim the source only if none
+		// is recorded, and take whatever value is stored afterwards, so every
+		// pass agrees on the one that won.
+		err = c.Pool.QueryRow(ctx, `UPDATE pgshard.workflows
+			   SET status = status || jsonb_build_object('cutover', coalesce(status->'cutover', '{}'::jsonb) || jsonb_build_object('source_set', $2::text)),
+			       updated_at = now()
+			 WHERE id = $1::uuid AND coalesce(status->'cutover'->>'source_set', '') = ''
+			RETURNING status->'cutover'->>'source_set'`, wf.id, candidate).Scan(&set)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Someone else claimed it, or the workflow is gone. Read it back in
+			// a separate statement: a query in the same statement as the update
+			// would share its snapshot and could not see the winner's commit.
+			err = c.Pool.QueryRow(ctx, `SELECT coalesce(status->'cutover'->>'source_set', '')
+				FROM pgshard.workflows WHERE id = $1::uuid`, wf.id).Scan(&set)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return "", nil, fmt.Errorf("record copy source: workflow %s is gone", wf.id)
+			}
+		}
+		if err != nil {
+			return "", nil, fmt.Errorf("record copy source: %w", err)
+		}
+		if set == "" {
+			return "", nil, fmt.Errorf("record copy source: workflow %s recorded no source", wf.id)
+		}
+		wf.cutover.SourceSet = set
+	}
+	ids, err := c.sourceIDs(ctx, set)
+	if err != nil {
+		return "", nil, err
+	}
+	return set, ids, nil
+}
+
+// sourceIDs is the shard IDs of a set, taken from the ranges rather than from
+// shard_status: the ranges are what a workflow owns and cannot be reshaped
+// underneath it, while a status row can be missing for a shard that still
+// exists. Acting on a subset would create replication for some shards only,
+// and restoring the row later would not repair it.
+func (c *Copier) sourceIDs(ctx context.Context, set string) ([]int32, error) {
+	ranges, err := catalog.ListShardRanges(ctx, c.Pool, set)
+	if err != nil {
+		return nil, err
+	}
+	if len(ranges) == 0 {
+		return nil, fmt.Errorf("source shard set %s has no ranges", set)
+	}
+	ids := make([]int32, 0, len(ranges))
+	for _, r := range ranges {
+		ids = append(ids, r.ShardID)
+	}
+	rows, err := c.Pool.Query(ctx, `SELECT shard_id FROM pgshard.shard_status WHERE shard_set = $1 ORDER BY shard_id`, set)
+	if err != nil {
+		return nil, err
+	}
+	status, err := pgx.CollectRows(rows, pgx.RowTo[int32])
+	if err != nil {
+		return nil, err
+	}
+	if !slices.Equal(ids, status) {
+		return nil, fmt.Errorf("source shard set %s has shards %v but status rows %v", set, ids, status)
+	}
+	return ids, nil
+}
+
 func (c *Copier) sources(ctx context.Context) (string, []int32, error) {
 	var set string
 	err := c.Pool.QueryRow(ctx, `SELECT shard_set FROM pgshard.shard_sets WHERE state = $1 ORDER BY generation DESC LIMIT 1`, catalog.ShardSetServing).Scan(&set)
@@ -361,7 +439,7 @@ func (c *Copier) databases(ctx context.Context) ([]dbPlan, error) {
 // drive advances one workflow through the copy phase; it reports whether
 // the stage changed.
 func (c *Copier) drive(ctx context.Context, wf *copyWorkflow) (bool, error) {
-	srcSet, srcIDs, err := c.sources(ctx)
+	srcSet, srcIDs, err := c.pinSource(ctx, wf)
 	if err != nil {
 		return false, err
 	}
@@ -988,7 +1066,10 @@ func (c *Copier) forEachSubscription(ctx context.Context, wf *copyWorkflow, srcI
 // then the slots and publications on the sources, and marks the workflow
 // cancelled. Targets the operator already deleted are skipped.
 func (c *Copier) cancel(ctx context.Context, wf *copyWorkflow) error {
-	srcSet, srcIDs, err := c.sources(ctx)
+	// Cleanup has to run against the source this workflow actually built its
+	// publications and slots on. Asking which set is serving now would leave
+	// them behind on the old one, holding WAL for good.
+	srcSet, srcIDs, err := c.pinSource(ctx, wf)
 	if err != nil {
 		return err
 	}

@@ -19,9 +19,10 @@ const (
 )
 
 type reshardWorkflow struct {
-	ID       string
-	State    string
-	ShardSet string
+	ID        string
+	State     string
+	ShardSet  string
+	SourceSet string
 }
 
 // upgradeSet reports whether the pending set ss is a major-version
@@ -58,25 +59,39 @@ func reconcileReshards(ctx context.Context, tx pgx.Tx, res *Result) error {
 	wfBySet := map[string]reshardWorkflow{}
 	for _, w := range workflows {
 		wfBySet[w.ShardSet] = w
-		if _, ok := setByName[w.ShardSet]; ok {
+		_, targetLives := setByName[w.ShardSet]
+		_, sourceLives := setByName[w.SourceSet]
+		sourceGone := w.SourceSet != "" && !sourceLives
+		if targetLives && !sourceGone {
 			continue
+		}
+		reason := "shard set removed"
+		// Every cutover pass rebuilds the source's shards from its ranges, so
+		// a workflow whose source is gone fails the same way on every pass
+		// with nothing left to clean up there. Terminate it rather than let it
+		// retry forever.
+		stage := StageCancelled
+		if targetLives {
+			reason = "source shard set removed"
 		}
 		switch w.State {
 		case StateProvisioning:
-			if err := setWorkflowState(ctx, tx, w.ID, StateCancelled, map[string]any{"stage": StageCancelled, "reason": "shard set removed"}); err != nil {
-				return err
-			}
 		case StateRunning, StatePaused:
-			// The copier drops subscriptions, slots and publications, then
-			// moves the stage to cancelled.
-			if err := setWorkflowState(ctx, tx, w.ID, StateCancelled, map[string]any{"stage": StageCancelling, "reason": "shard set removed"}); err != nil {
-				return err
+			if !sourceGone {
+				// The copier drops subscriptions, slots and publications, then
+				// moves the stage to cancelled.
+				stage = StageCancelling
 			}
 		default:
 			continue
 		}
-		if _, err := tx.Exec(ctx, `DELETE FROM pgshard.shard_status WHERE shard_set = $1`, w.ShardSet); err != nil {
+		if err := setWorkflowState(ctx, tx, w.ID, StateCancelled, map[string]any{"stage": stage, "reason": reason}); err != nil {
 			return err
+		}
+		if !targetLives {
+			if _, err := tx.Exec(ctx, `DELETE FROM pgshard.shard_status WHERE shard_set = $1`, w.ShardSet); err != nil {
+				return err
+			}
 		}
 		res.ReshardsCancelled++
 	}
@@ -86,17 +101,23 @@ func reconcileReshards(ctx context.Context, tx pgx.Tx, res *Result) error {
 			if _, ok := wfBySet[ss.Name]; ok {
 				continue
 			}
+			source, err := catalog.ServingShardSet(ctx, tx)
+			if err != nil {
+				return err
+			}
+			// The workflow will own both sets, so both have to be locked
+			// before it is inserted, in a fixed order so two reconcilers
+			// cannot deadlock against each other.
+			if err := catalog.LockShardRangesOf(ctx, tx, ss.Name, source); err != nil {
+				return err
+			}
 			ranges, err := catalog.ListShardRanges(ctx, tx, ss.Name)
 			if err != nil {
 				return err
 			}
-			if err := catalog.RangeSet(ranges).Validate(); err != nil {
+			if err := catalog.ValidateShardRanges(ranges); err != nil {
 				res.Invalid = append(res.Invalid, fmt.Sprintf("shard set %s: %v", ss.Name, err))
 				continue
-			}
-			source, err := catalog.ServingShardSet(ctx, tx)
-			if err != nil {
-				return err
 			}
 			kind := KindReshard
 			spec := map[string]any{"shard_set": ss.Name, "generation": ss.Generation, "desired_generation": ss.DesiredGeneration, "ranges": specRanges(ranges), "source_set": source}
@@ -152,7 +173,9 @@ func targetsReady(ctx context.Context, tx pgx.Tx, set string) (bool, error) {
 }
 
 func activeReshards(ctx context.Context, tx pgx.Tx) ([]reshardWorkflow, error) {
-	rows, err := tx.Query(ctx, `SELECT id::text, state, coalesce(spec->>'shard_set', '') FROM pgshard.workflows
+	rows, err := tx.Query(ctx, `SELECT id::text, state, coalesce(spec->>'shard_set', ''),
+			coalesce(spec->>'source_set', status->'cutover'->>'source_set', '')
+		FROM pgshard.workflows
 		WHERE kind = ANY($1) AND state = ANY($2) ORDER BY created_at`, copyKinds, activeStates)
 	if err != nil {
 		return nil, err
