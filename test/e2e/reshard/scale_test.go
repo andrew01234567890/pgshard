@@ -22,10 +22,10 @@ var ledgerTenants = []int64{11, 23, 37, 41, 53, 67}
 
 // resolveGroup returns the group name serving tenant's keyspace id, from
 // the live catalog serving map.
-func resolveGroup(ctx context.Context, c *e2e.Cluster, tenant int64) string {
+func resolveGroup(ctx context.Context, c *e2e.Cluster, tenant int64) (string, error) {
 	id, err := placement.KeyspaceID(tenant)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	out, err := psql(ctx, c, clusterName+"-catalog-rw",
 		fmt.Sprintf(`SELECT r.shard_id || ':' || ss.generation
@@ -33,17 +33,34 @@ func resolveGroup(ctx context.Context, c *e2e.Cluster, tenant int64) string {
 			JOIN pgshard.serving s ON s.shard_set = r.shard_set
 			JOIN pgshard.shard_sets ss ON ss.shard_set = r.shard_set
 			WHERE r.range @> %d::int8`, id))
-	if err != nil || out == "" {
-		return ""
+	if err != nil {
+		return "", err
+	}
+	if out == "" {
+		return "", fmt.Errorf("no shard range covers keyspace id %d (%s)", id, shardMapState(ctx, c))
 	}
 	shard, gen, ok := strings.Cut(out, ":")
 	if !ok {
-		return ""
+		return "", fmt.Errorf("unexpected shard lookup result %q", out)
 	}
 	if gen == "1" {
-		return "shard-" + shard
+		return "shard-" + shard, nil
 	}
-	return fmt.Sprintf("shard-%s-g%s", shard, gen)
+	return fmt.Sprintf("shard-%s-g%s", shard, gen), nil
+}
+
+// shardMapState reports what the catalog holds when a tenant cannot be routed,
+// so a failure says which of the three preconditions is missing rather than
+// only that the lookup found nothing.
+func shardMapState(ctx context.Context, c *e2e.Cluster) string {
+	out, err := psql(ctx, c, clusterName+"-catalog-rw",
+		`SELECT 'ranges=' || (SELECT count(*) FROM pgshard.shard_ranges)
+			|| ' serving=' || (SELECT count(*) FROM pgshard.serving)
+			|| ' sets=' || (SELECT coalesce(string_agg(shard_set || ':' || state, ','), 'none') FROM pgshard.shard_sets)`)
+	if err != nil {
+		return "catalog unreadable: " + err.Error()
+	}
+	return out
 }
 
 // scaleLedger appends acknowledged rows per tenant, resolving the serving
@@ -53,25 +70,61 @@ type scaleLedger struct {
 	acked []atomic.Int64
 	stop  context.CancelFunc
 	wg    sync.WaitGroup
+
+	// The write loop retries through fences and switches, so a persistent
+	// failure looks exactly like one that is about to clear. Keep the last
+	// reason per tenant so a timeout can say why nothing was acknowledged.
+	mu      sync.Mutex
+	lastErr []string
+}
+
+func (l *scaleLedger) note(i int, format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lastErr[i] = fmt.Sprintf(format, args...)
+}
+
+// why reports the last failure seen by each tenant that has acknowledged
+// nothing, for a test that is about to fail on a timeout.
+func (l *scaleLedger) why() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var b strings.Builder
+	for i, tenant := range ledgerTenants {
+		if l.acked[i].Load() > 0 {
+			continue
+		}
+		reason := l.lastErr[i]
+		if reason == "" {
+			reason = "no attempt completed"
+		}
+		fmt.Fprintf(&b, "\n  tenant %d: %s", tenant, reason)
+	}
+	if b.Len() == 0 {
+		return ""
+	}
+	return "\nlast write failure per tenant:" + b.String()
 }
 
 func startScaleLedger(ctx context.Context, c *e2e.Cluster) *scaleLedger {
 	lctx, cancel := context.WithCancel(ctx)
-	l := &scaleLedger{c: c, acked: make([]atomic.Int64, len(ledgerTenants)), stop: cancel}
+	l := &scaleLedger{c: c, acked: make([]atomic.Int64, len(ledgerTenants)), stop: cancel, lastErr: make([]string, len(ledgerTenants))}
 	for i, tenant := range ledgerTenants {
 		l.wg.Add(1)
 		go func() {
 			defer l.wg.Done()
 			next := int64(1)
 			for lctx.Err() == nil {
-				group := resolveGroup(lctx, c, tenant)
+				group, err := resolveGroup(lctx, c, tenant)
 				if group == "" {
+					l.note(i, "no serving group for tenant: %v", err)
 					time.Sleep(time.Second)
 					continue
 				}
 				hi := next + 9
 				sql := fmt.Sprintf(`INSERT INTO ledger (id, tenant_id, amount) SELECT g, %d, 1 FROM generate_series(%d, %d) g ON CONFLICT DO NOTHING`, tenant, next, hi)
 				if _, err := shardSQL(lctx, c, group, sql); err != nil {
+					l.note(i, "insert into %s failed: %v", group, err)
 					time.Sleep(2 * time.Second)
 					continue
 				}
@@ -100,7 +153,10 @@ func (l *scaleLedger) verify(ctx context.Context, t *testing.T, acked []int64) {
 	t.Helper()
 	var total int64
 	for i, tenant := range ledgerTenants {
-		group := resolveGroup(ctx, l.c, tenant)
+		group, err := resolveGroup(ctx, l.c, tenant)
+		if err != nil {
+			t.Fatalf("tenant %d: %v", tenant, err)
+		}
 		if group == "" {
 			t.Fatalf("tenant %d has no serving group", tenant)
 		}
@@ -137,14 +193,14 @@ func reshardTo(ctx context.Context, t *testing.T, c *e2e.Cluster, major string, 
 		t.Fatal(err)
 	}
 	set := fmt.Sprintf("g%d", generation)
-	waitFor(ctx, t, fmt.Sprintf("reshard to %d shards switched", shards), 35*time.Minute, func() bool {
+	waitFor(ctx, t, c, fmt.Sprintf("reshard to %d shards switched", shards), 35*time.Minute, func() bool {
 		st := catalogSQL(ctx, t, c, "SELECT coalesce(string_agg(state || ':' || (status->>'stage'), ','), '') FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = '"+set+"'")
 		if strings.HasPrefix(st, "failed") {
 			t.Fatalf("reshard to %s failed: %s", set, catalogSQL(ctx, t, c, "SELECT coalesce(error, '') || ' ' || status::text FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = '"+set+"'"))
 		}
 		return catalogSQL(ctx, t, c, "SELECT string_agg(shard_set, ',') FROM pgshard.serving") == set
 	})
-	waitFor(ctx, t, fmt.Sprintf("reshard to %d shards completed", shards), 25*time.Minute, func() bool {
+	waitFor(ctx, t, c, fmt.Sprintf("reshard to %d shards completed", shards), 25*time.Minute, func() bool {
 		st := catalogSQL(ctx, t, c, "SELECT coalesce(string_agg(state || ':' || (status->>'stage'), ','), '') FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = '"+set+"'")
 		return strings.HasPrefix(st, "completed:") &&
 			jsonpath(ctx, c, "pgshardcluster", clusterName, "{.status.effectiveShards}") == fmt.Sprint(shards)
@@ -203,12 +259,12 @@ func TestReshard1To2To4To2UnderLoad(t *testing.T) {
 	if err := c.WaitPodsReady(ctx, testNamespace, "app="+clusterName+"-controller", 3*time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(ctx, t, "serving shard set materialized", 2*time.Minute, func() bool {
+	waitFor(ctx, t, c, "serving shard set materialized", 2*time.Minute, func() bool {
 		return jsonpath(ctx, c, "pgshardcluster", clusterName, "{.status.effectiveShards}") == "1"
 	})
 
 	l := startScaleLedger(ctx, c)
-	waitFor(ctx, t, "first acknowledged ledger writes", 3*time.Minute, func() bool {
+	waitForWhy(ctx, t, c, "first acknowledged ledger writes", 3*time.Minute, l.why, func() bool {
 		for i := range ledgerTenants {
 			if l.acked[i].Load() < 10 {
 				return false

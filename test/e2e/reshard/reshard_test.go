@@ -239,15 +239,32 @@ func catalogSQL(ctx context.Context, t *testing.T, c *e2e.Cluster, sql string) s
 	return out
 }
 
-func waitFor(ctx context.Context, t *testing.T, what string, timeout time.Duration, cond func() bool) {
+func waitFor(ctx context.Context, t *testing.T, c *e2e.Cluster, what string, timeout time.Duration, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	waitForWhy(ctx, t, c, what, timeout, nil, cond)
+}
+
+// waitForWhy is waitFor with a why that a caller which has been swallowing
+// retryable errors can use to say what kept failing.
+func waitForWhy(ctx context.Context, t *testing.T, c *e2e.Cluster, what string, timeout time.Duration, why func() string, cond func() bool) {
+	t.Helper()
+	started := time.Now()
+	deadline := started.Add(timeout)
+	nextProgress := started.Add(time.Minute)
 	for {
 		if cond() {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
+			detail := ""
+			if why != nil {
+				detail = why()
+			}
+			t.Fatalf("timed out after %s waiting for %s%s%s", timeout, what, detail, c.Summary(ctx, testNamespace))
+		}
+		if time.Now().After(nextProgress) {
+			t.Logf("still waiting for %s (%s elapsed)", what, time.Since(started).Round(time.Second))
+			nextProgress = time.Now().Add(time.Minute)
 		}
 		select {
 		case <-ctx.Done():
@@ -347,7 +364,7 @@ func TestReshardProvisionsTargetsAndCancels(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	waitFor(ctx, t, "serving shard set materialized", 2*time.Minute, func() bool {
+	waitFor(ctx, t, c, "serving shard set materialized", 2*time.Minute, func() bool {
 		return jsonpath(ctx, c, "pgshardcluster", clusterName, "{.status.effectiveShards}") == "1"
 	})
 	if got := catalogSQL(ctx, t, c, "SELECT shard_set || ':' || generation || ':' || state FROM pgshard.shard_sets ORDER BY generation"); got != "default:1:serving" {
@@ -361,14 +378,14 @@ func TestReshardProvisionsTargetsAndCancels(t *testing.T) {
 		t.Fatal(err)
 	}
 	record := clusterName + "-reshard-g2"
-	waitFor(ctx, t, "PgShardReshard record", 3*time.Minute, func() bool {
+	waitFor(ctx, t, c, "PgShardReshard record", 3*time.Minute, func() bool {
 		return jsonpath(ctx, c, "pgshardreshard", record, "{.spec.targetShards}") == "2"
 	})
 	if got := jsonpath(ctx, c, "pgshardreshard", record, "{.spec.fromGeneration}/{.spec.targetGeneration}/{.spec.targetShardSet}"); got != "1/2/g2" {
 		t.Fatalf("record spec: %q", got)
 	}
 	sel := "pgshard.io/cluster=" + clusterName + ",pgshard.io/shard-set=g2"
-	waitFor(ctx, t, "two non-serving target groups", 3*time.Minute, func() bool {
+	waitFor(ctx, t, c, "two non-serving target groups", 3*time.Minute, func() bool {
 		return count(ctx, t, c, "pgshardgroups", sel) == 2
 	})
 	for _, g := range []string{"shard-0-g2", "shard-1-g2"} {
@@ -376,7 +393,7 @@ func TestReshardProvisionsTargetsAndCancels(t *testing.T) {
 			t.Errorf("target group %s: %q", g, got)
 		}
 	}
-	waitFor(ctx, t, "targets Ready", 15*time.Minute, func() bool {
+	waitFor(ctx, t, c, "targets Ready", 15*time.Minute, func() bool {
 		phase := jsonpath(ctx, c, "pgshardreshard", record, "{.status.phase}")
 		ready := jsonpath(ctx, c, "pgshardreshard", record, `{.status.conditions[?(@.type=="TargetsReady")].status}`)
 		return ready == "True" && (phase == "Provisioning" || phase == "Copying")
@@ -390,7 +407,7 @@ func TestReshardProvisionsTargetsAndCancels(t *testing.T) {
 	if got := catalogSQL(ctx, t, c, "SELECT string_agg(shard_set, ',' ORDER BY shard_set) FROM pgshard.serving"); got != "default" {
 		t.Fatalf("serving sets: %q", got)
 	}
-	waitFor(ctx, t, "copy caught up", 15*time.Minute, func() bool {
+	waitFor(ctx, t, c, "copy caught up", 15*time.Minute, func() bool {
 		got := catalogSQL(ctx, t, c, "SELECT coalesce(string_agg(state || ':' || (status->>'stage'), ','), '') FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = 'g2'")
 		if strings.HasPrefix(got, "failed") {
 			t.Fatalf("reshard workflow failed: %s", catalogSQL(ctx, t, c, "SELECT coalesce(error, '') || ' ' || status::text FROM pgshard.workflows WHERE kind = 'reshard'"))
@@ -411,7 +428,7 @@ func TestReshardProvisionsTargetsAndCancels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitFor(ctx, t, "rows on the targets", 5*time.Minute, func() bool {
+	waitFor(ctx, t, c, "rows on the targets", 5*time.Minute, func() bool {
 		total := 0
 		for i := range 2 {
 			group := fmt.Sprintf("shard-%d-g2", i)
@@ -460,10 +477,10 @@ func TestReshardProvisionsTargetsAndCancels(t *testing.T) {
 	if err := c.Apply(ctx, clusterManifest(major, os.Getenv("PGSHARD_POSTGRES_IMAGE"), 1)); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(ctx, t, "reshard cancelled", 5*time.Minute, func() bool {
+	waitFor(ctx, t, c, "reshard cancelled", 5*time.Minute, func() bool {
 		return jsonpath(ctx, c, "pgshardreshard", record, "{.status.phase}") == "Cancelled"
 	})
-	waitFor(ctx, t, "target groups deleted", 5*time.Minute, func() bool {
+	waitFor(ctx, t, c, "target groups deleted", 5*time.Minute, func() bool {
 		return count(ctx, t, c, "pgshardgroups", sel) == 0 && count(ctx, t, c, "pods", sel) == 0
 	})
 	if got := catalogSQL(ctx, t, c, "SELECT count(*) FROM pgshard.shard_sets WHERE shard_set = 'g2'"); got != "0" {
@@ -472,7 +489,7 @@ func TestReshardProvisionsTargetsAndCancels(t *testing.T) {
 	if got := catalogSQL(ctx, t, c, "SELECT string_agg(shard_set || ':' || shard_id || ':' || serving_state, ',') FROM pgshard.shard_status"); got != "default:0:serving" {
 		t.Fatalf("shard_status after cancel: %q", got)
 	}
-	waitFor(ctx, t, "copy cleaned up on the source", 5*time.Minute, func() bool {
+	waitFor(ctx, t, c, "copy cleaned up on the source", 5*time.Minute, func() bool {
 		wf := catalogSQL(ctx, t, c, "SELECT coalesce(string_agg(state || ':' || (status->>'stage'), ','), '') FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = 'g2'")
 		slots, err := psql(ctx, c, clusterName+"-shard-0-rw", "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pgshard\\_reshard\\_%'")
 		if err != nil {

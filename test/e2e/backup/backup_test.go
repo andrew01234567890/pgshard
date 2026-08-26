@@ -202,15 +202,21 @@ spec:
 `, name, testNamespace, cluster, typ)
 }
 
-func waitFor(ctx context.Context, t *testing.T, what string, timeout time.Duration, cond func() bool) {
+func waitFor(ctx context.Context, t *testing.T, c *e2e.Cluster, what string, timeout time.Duration, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	started := time.Now()
+	deadline := started.Add(timeout)
+	nextProgress := started.Add(time.Minute)
 	for {
 		if cond() {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
+			t.Fatalf("timed out after %s waiting for %s%s", timeout, what, c.Summary(ctx, testNamespace))
+		}
+		if time.Now().After(nextProgress) {
+			t.Logf("still waiting for %s (%s elapsed)", what, time.Since(started).Round(time.Second))
+			nextProgress = time.Now().Add(time.Minute)
 		}
 		select {
 		case <-ctx.Done():
@@ -415,16 +421,16 @@ func runStore(ctx context.Context, t *testing.T, c *e2e.Cluster, s store, major 
 	}
 	t.Logf("%s: WAL archive %s..%s, %d backups", cluster, info.ArchiveMin, info.ArchiveMax, len(info.Backups))
 
-	waitFor(ctx, t, "BackupHealthy on policy "+cluster, 3*time.Minute, func() bool {
+	waitFor(ctx, t, c, "BackupHealthy on policy "+cluster, 3*time.Minute, func() bool {
 		return jsonpath(ctx, t, c, "pgshardbackuppolicy", cluster+"-policy", `{.status.conditions[?(@.type=="BackupHealthy")].status}`) == "True"
 	})
-	waitFor(ctx, t, "BackupHealthy on cluster "+cluster, 3*time.Minute, func() bool {
+	waitFor(ctx, t, c, "BackupHealthy on cluster "+cluster, 3*time.Minute, func() bool {
 		return jsonpath(ctx, t, c, "pgshardcluster", cluster, `{.status.conditions[?(@.type=="BackupHealthy")].status}`) == "True"
 	})
 	if got := jsonpath(ctx, t, c, "pgshardbackuppolicy", cluster+"-policy", "{.status.clusters[0].lastFullTime}"); got == "" {
 		t.Error("policy status.clusters[0].lastFullTime not set")
 	}
-	waitFor(ctx, t, "a scheduled incremental backup on "+cluster, 5*time.Minute, func() bool {
+	waitFor(ctx, t, c, "a scheduled incremental backup on "+cluster, 5*time.Minute, func() bool {
 		var list pgshardv1alpha1.PgShardBackupList
 		outList, err := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pgshardbackups", "-l", "pgshard.io/backup-policy="+cluster+"-policy", "-o", "json")
 		if err != nil || json.Unmarshal([]byte(outList), &list) != nil {
@@ -472,7 +478,7 @@ func runRestores(ctx context.Context, t *testing.T, c *e2e.Cluster, s store, maj
 	for g, seg := range segs {
 		stanza := backup.StanzaName(cluster, g, atoi(major))
 		pod := primaries[g]
-		waitFor(ctx, t, "WAL "+seg+" archived for "+stanza, 5*time.Minute, func() bool {
+		waitFor(ctx, t, c, "WAL "+seg+" archived for "+stanza, 5*time.Minute, func() bool {
 			out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "exec", pod, "-c", "postgres", "--",
 				"pgbackrest", "--config=/etc/pgbackrest/pgbackrest.conf", "--stanza="+stanza, "--log-level-console=off", "info", "--output=json")
 			if err != nil {
@@ -554,7 +560,7 @@ spec:
 func waitRestore(ctx context.Context, t *testing.T, c *e2e.Cluster, name string, timeout time.Duration) *pgshardv1alpha1.PgShardRestore {
 	t.Helper()
 	var r pgshardv1alpha1.PgShardRestore
-	waitFor(ctx, t, "restore "+name+" to finish", timeout, func() bool {
+	waitFor(ctx, t, c, "restore "+name+" to finish", timeout, func() bool {
 		if err := getJSON(ctx, c, "pgshardrestore", name, &r); err != nil {
 			return false
 		}
@@ -614,7 +620,7 @@ func checkRestored(ctx context.Context, t *testing.T, c *e2e.Cluster, name strin
 func waitBackup(ctx context.Context, t *testing.T, c *e2e.Cluster, name string, timeout time.Duration) *pgshardv1alpha1.PgShardBackup {
 	t.Helper()
 	var b pgshardv1alpha1.PgShardBackup
-	waitFor(ctx, t, "backup "+name+" to finish", timeout, func() bool {
+	waitFor(ctx, t, c, "backup "+name+" to finish", timeout, func() bool {
 		if err := getJSON(ctx, c, "pgshardbackup", name, &b); err != nil {
 			return false
 		}
