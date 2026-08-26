@@ -119,8 +119,11 @@ func (wf *copyWorkflow) sourceSet() string {
 var copyStages = []string{StageReadyForCopy, StageCopying, StageCatchUpDone}
 var cutoverStages = []string{StageCatchUpDone, StageAwaitingSwitch, StageSwitching, StageSwitched, StageRollingBack, StageCompleting}
 
-// Run drives every interval until ctx ends.
-func (c *Copier) Run(ctx context.Context, interval time.Duration) {
+// Run drives a copy pass on every tick while this replica is the leader.
+// Only the leader may run one: a pass creates and drops publications and
+// subscriptions and moves data, so two replicas doing it at once produce
+// half-built replication and failed cutovers.
+func (c *Copier) Run(ctx context.Context, interval time.Duration, leader func() bool) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -128,6 +131,9 @@ func (c *Copier) Run(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+		}
+		if leader != nil && !leader() {
+			continue
 		}
 		if _, err := c.Pass(ctx); err != nil {
 			c.logger().Warn("copy pass failed", "err", err)

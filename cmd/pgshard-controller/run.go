@@ -129,7 +129,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		dialer := &controller.PgxShardDialer{Pool: pool, DSNs: shardDSNs, Template: *shardDSNTemplate}
 		resolver = &controller.Resolver{Pool: pool, Logger: logger, Shards: dialer, Metrics: cm}
 		streams = &controller.StreamAdmin{Pool: pool, Shards: dialer}
-		go resolver.Run(ctx, *resolveEvery)
+		go resolver.Run(ctx, *resolveEvery, leader.Load)
 		barrier = &controller.Barrier{Store: &controller.PGBarrierStore{Pool: pool}, Groups: &controller.SQLBarrierGroups{Pool: pool, Shards: dialer},
 			Resolver: resolver, Logger: logger, DrainTimeout: *barrierDrain, ArchiveTimeout: *barrierArchive}
 		roles := &controller.RoleVerifier{Store: &controller.PGRoleStore{Pool: pool}, Shards: dialer, Catalog: controller.CatalogDialer(pool), Logger: logger}
@@ -137,10 +137,10 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		applier := &controller.Applier{Store: &controller.PGMigrationStore{Pool: pool}, Logger: logger, Shards: dialer, DDLRole: *ddlRole,
 			Catalog: controller.CatalogDialer(pool), Roles: roles}
 		go applier.Run(ctx, *applyEvery, leader.Load)
-		go (&controller.StreamMonitor{Pool: pool, Logger: logger, Shards: dialer}).Run(ctx, *resolveEvery)
+		go (&controller.StreamMonitor{Pool: pool, Logger: logger, Shards: dialer}).Run(ctx, *resolveEvery, leader.Load)
 		// A barrier whose controller died leaves the cluster fenced and its
 		// shards paused; lift that as soon as no barrier is running.
-		go barrier.RunRecovery(ctx, *resolveEvery)
+		go barrier.RunRecovery(ctx, *resolveEvery, leader.Load)
 		subTemplate := *subscriptionTemplate
 		if subTemplate == "" {
 			subTemplate = *shardDSNTemplate
@@ -154,9 +154,9 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		}
 		copier := &controller.Copier{Pool: pool, Shards: dialer, Schema: schema, SourceConnInfo: connInfo, Resolver: resolver, Logger: logger,
 			LagBytes: *copyLag, ThrottleHigh: *throttleHigh, ThrottleLow: *throttleLow, PreparedWait: *preparedWait}
-		go copier.Run(ctx, *copyEvery)
+		go copier.Run(ctx, *copyEvery, leader.Load)
 		placer := &controller.Placer{Pool: pool, Shards: dialer, Logger: logger, LagBytes: *copyLag, BufferTimeout: *placementBuffer, DropOldAfter: *placementDropOld}
-		go placer.Run(ctx, *placementEvery)
+		go placer.Run(ctx, *placementEvery, leader.Load)
 	}
 
 	if *listen == "" {
