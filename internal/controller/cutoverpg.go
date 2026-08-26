@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -533,6 +534,113 @@ func (o *pgCutover) Reverse(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// schemaFingerprintSQL hashes the user-visible structure of one database:
+// columns, constraints and indexes outside the system and pgshard schemas.
+// It is only ever compared with an earlier hash of the SAME set, so the two
+// sides of an upgrade never have to render identically across majors.
+const schemaFingerprintSQL = `SELECT coalesce(md5(string_agg(line, E'\n' ORDER BY line)), '')
+FROM (
+    SELECT 'col ' || n.nspname || ' ' || c.relname || ' ' || c.relkind::text || ' ' || a.attname
+        || ' ' || format_type(a.atttypid, a.atttypmod) || ' ' || a.attnotnull::text AS line
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+     WHERE c.relkind IN ('r', 'p', 'm', 'v')
+       AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgshard')
+       AND n.nspname NOT LIKE 'pg\_toast%'
+    UNION ALL
+    SELECT 'con ' || n.nspname || ' ' || r.relname || ' ' || k.conname || ' ' || pg_get_constraintdef(k.oid)
+      FROM pg_constraint k
+      JOIN pg_class r ON r.oid = k.conrelid
+      JOIN pg_namespace n ON n.oid = r.relnamespace
+     WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgshard')
+    UNION ALL
+    SELECT 'idx ' || schemaname || ' ' || indexname || ' ' || indexdef
+      FROM pg_indexes
+     WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pgshard')
+) parts`
+
+// scalarString runs a query that returns exactly one text value.
+func scalarString(ctx context.Context, conn ShardConn, sql string) (string, error) {
+	rows, err := conn.Query(ctx, sql)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return "", err
+		}
+		return "", errors.New("no row")
+	}
+	var out string
+	if err := rows.Scan(&out); err != nil {
+		return "", err
+	}
+	rows.Close()
+	return out, rows.Err()
+}
+
+// schemaKey names one fingerprint: a database on one shard of one set.
+func schemaKey(set string, id int32, db string) string {
+	return fmt.Sprintf("%s/%d/%s", set, id, db)
+}
+
+// SchemaFingerprints hashes every database on both sets. Logical replication
+// does not carry DDL, so an ALTER applied after the switch reaches only the
+// serving set; comparing these at rollback is what stops the sources being
+// switched back structurally stale.
+func (o *pgCutover) SchemaFingerprints(ctx context.Context) (map[string]string, error) {
+	out := map[string]string{}
+	sets := []struct {
+		name string
+		ids  []int32
+	}{{o.srcSet, o.srcIDs}, {o.wf.set, o.wf.ids}}
+	for _, set := range sets {
+		for _, db := range o.dbs {
+			for _, id := range set.ids {
+				conn, err := o.c.Shards.DialDatabase(ctx, set.name, id, db.name)
+				if err != nil {
+					return nil, err
+				}
+				fp, err := scalarString(ctx, conn, schemaFingerprintSQL)
+				_ = conn.Close(ctx)
+				if err != nil {
+					return nil, fmt.Errorf("schema fingerprint of %s on %s/%d: %w", db.name, set.name, id, err)
+				}
+				out[schemaKey(set.name, id, db.name)] = fp
+			}
+		}
+	}
+	return out, nil
+}
+
+// schemaDrift lists the databases whose structure has changed since the
+// switch. A key that was never recorded is not drift: runs switched before
+// fingerprints were captured have nothing to compare against.
+func (o *pgCutover) schemaDrift(ctx context.Context) ([]string, error) {
+	want := o.wf.cutover.Schema
+	if len(want) == 0 {
+		return nil, nil
+	}
+	now, err := o.SchemaFingerprints(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var drifted []string
+	for key, before := range want {
+		after, ok := now[key]
+		if !ok {
+			continue
+		}
+		if after != before {
+			drifted = append(drifted, key)
+		}
+	}
+	sort.Strings(drifted)
+	return drifted, nil
 }
 
 func (o *pgCutover) reversePublishOn(ctx context.Context, conn ShardConn, db dbPlan, home bool) error {
