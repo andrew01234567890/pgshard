@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -943,5 +944,45 @@ func TestRouterRollsOnInternalTLSSecretRotation(t *testing.T) {
 	}
 	if got := dep.Spec.Template.Annotations[AnnotationInternalTLSChecksum]; got == first {
 		t.Fatal("rotating the internal TLS secret must change the router pod template")
+	}
+}
+
+// TestPrimaryOutsideTheMemberSetDoesNotPanic: PgShardGroup.status.primary was
+// trusted as an oracle, so a primary a failover had promoted to a high
+// ordinal -- then scaled out of existence by lowering replicasPerShard --
+// left members[state.primary] nil and reconcileGroup dereferenced it. The
+// panic aborted the whole cluster's reconcile and retried forever, and the
+// only code that could have moved the primary back into range sits
+// downstream of the crash, so it could not self-heal.
+func TestPrimaryOutsideTheMemberSetDoesNotPanic(t *testing.T) {
+	r, _, c := setup(t, "outofrange")
+	reconcile(t, r, c)
+
+	g := Groups(c)[1]
+	var pg pgshardv1alpha1.PgShardGroup
+	get(t, g.Prefix(), &pg)
+	base := pg.DeepCopy()
+	pg.Status.Primary = g.Prefix() + "-9"
+	pg.Status.Epoch = 7
+	if err := k8sClient.Status().Patch(context.Background(), &pg, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Must not panic; controller-runtime would turn a panic into an error
+	// that never clears.
+	reconcile(t, r, c)
+
+	var after pgshardv1alpha1.PgShardGroup
+	get(t, g.Prefix(), &after)
+	if after.Status.Primary == g.Prefix()+"-9" {
+		t.Fatalf("designated primary %q is still outside the member set", after.Status.Primary)
+	}
+	if !slices.Contains(g.MemberNames(), after.Status.Primary) {
+		t.Fatalf("designated primary %q is not a member of the group", after.Status.Primary)
+	}
+	// The epoch fences writes against a primary that may still be running,
+	// so re-designating must never wind it back.
+	if after.Status.Epoch < 7 {
+		t.Fatalf("epoch went backwards: %d, was 7", after.Status.Epoch)
 	}
 }
