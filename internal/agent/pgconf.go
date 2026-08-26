@@ -89,13 +89,20 @@ func ownedSettings(c *Config, standby, recovering bool) map[string]string {
 		"max_replication_slots":          fmt.Sprint(c.Postgres.MaxReplicationSlots),
 		"max_wal_senders":                fmt.Sprint(c.Postgres.MaxWALSenders),
 		"max_active_replication_origins": fmt.Sprint(c.Postgres.MaxActiveReplicationOrigins),
-		"track_commit_timestamp":         "on",
-		"password_encryption":            quote("scram-sha-256"),
-		"synchronous_commit":             "on",
-		"synchronous_standby_names":      quote(c.Postgres.SynchronousStandbyNames),
-		"ssl":                            onOff(c.TLS.CertFile != ""),
-		"unix_socket_directories":        quote("/tmp"),
-		"wal_keep_size":                  quote(c.Postgres.WALKeepSize),
+		// Owned rather than tuned: pgtune refuses to derive anything below a
+		// 512MB budget, so on a small cluster these would fall back to
+		// PostgreSQL's defaults and a reshard merge could never finish its
+		// copy. Replication correctness must not depend on the memory budget.
+		"max_logical_replication_workers":   fmt.Sprint(c.Postgres.MaxLogicalReplicationWorkers),
+		"max_sync_workers_per_subscription": fmt.Sprint(c.Postgres.MaxSyncWorkersPerSubscription),
+		"max_worker_processes":              fmt.Sprint(c.Postgres.MaxWorkerProcesses),
+		"track_commit_timestamp":            "on",
+		"password_encryption":               quote("scram-sha-256"),
+		"synchronous_commit":                "on",
+		"synchronous_standby_names":         quote(c.Postgres.SynchronousStandbyNames),
+		"ssl":                               onOff(c.TLS.CertFile != ""),
+		"unix_socket_directories":           quote("/tmp"),
+		"wal_keep_size":                     quote(c.Postgres.WALKeepSize),
 	}
 	if c.TLS.CertFile != "" {
 		set["ssl_cert_file"] = quote(c.TLS.CertFile)
