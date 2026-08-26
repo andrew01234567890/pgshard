@@ -2,12 +2,13 @@ package pgwire
 
 import (
 	"context"
-	"github.com/andrew01234567890/pgshard/internal/dockertest"
 	"net"
 	"os/exec"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
 )
 
 const psqlImage = "ghcr.io/andrew01234567890/pgshard-postgres:18"

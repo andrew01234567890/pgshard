@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/andrew01234567890/pgshard/internal/dockertest"
 	"net"
 	"os"
 	"os/exec"
@@ -13,6 +12,8 @@ import (
 	"testing"
 	"testing/fstest"
 	"time"
+
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"

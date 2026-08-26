@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
-	"github.com/andrew01234567890/pgshard/internal/dockertest"
 	"net"
 	"os"
 	"os/exec"
@@ -14,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
 
 	"github.com/jackc/pgx/v5"
 

@@ -4,13 +4,14 @@ package pgtune
 
 import (
 	"fmt"
-	"github.com/andrew01234567890/pgshard/internal/dockertest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
 )
 
 var liveImages = []string{

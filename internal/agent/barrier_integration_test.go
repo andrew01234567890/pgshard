@@ -4,13 +4,14 @@ package agent
 
 import (
 	"context"
-	"github.com/andrew01234567890/pgshard/internal/dockertest"
 	"os"
 	"os/exec"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"

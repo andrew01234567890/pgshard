@@ -5,13 +5,14 @@ import (
 	"crypto/pbkdf2"
 	"crypto/sha256"
 	"fmt"
-	"github.com/andrew01234567890/pgshard/internal/dockertest"
 	"log/slog"
 	"net"
 	"os/exec"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
 
 	"github.com/jackc/pgx/v5"
 	"google.golang.org/grpc"

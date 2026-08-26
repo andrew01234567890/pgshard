@@ -5,13 +5,14 @@ package agent
 import (
 	"context"
 	"fmt"
-	"github.com/andrew01234567890/pgshard/internal/dockertest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 )

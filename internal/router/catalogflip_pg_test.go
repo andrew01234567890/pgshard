@@ -3,7 +3,6 @@ package router
 import (
 	"context"
 	"fmt"
-	"github.com/andrew01234567890/pgshard/internal/dockertest"
 	"io"
 	"net"
 	"os/exec"
@@ -11,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
