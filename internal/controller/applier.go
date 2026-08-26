@@ -206,6 +206,16 @@ func (a *Applier) shardSet(ctx context.Context) (string, error) {
 	return a.Store.ServingShardSet(ctx)
 }
 
+// migrationSet is the set a migration runs against: the one pinned when it
+// started, so that a cutover part-way through cannot silently redirect the
+// remaining shards at a different set's databases.
+func (a *Applier) migrationSet(ctx context.Context, m *catalog.DDLMigration) (string, error) {
+	if m != nil && m.Meta.ShardSet != "" {
+		return m.Meta.ShardSet, nil
+	}
+	return a.shardSet(ctx)
+}
+
 func (a *Applier) backoff() Backoff {
 	b := a.Backoff
 	if b.Min <= 0 {
@@ -305,8 +315,24 @@ func (a *Applier) RunOnce(ctx context.Context) (int, error) {
 // drive runs one migration to a final state.
 func (a *Applier) drive(ctx context.Context, m catalog.DDLMigration) error {
 	logger := a.logger().With("migration", m.ID, "kind", m.Kind, "database", m.Database)
+	serving, err := a.shardSet(ctx)
+	if err != nil {
+		return fmt.Errorf("applier: serving shard set: %w", err)
+	}
+	if m.State == catalog.MigrationRunning && m.Meta.ShardSet != "" && m.Meta.ShardSet != serving {
+		if touched(m.PerShard) {
+			m.State = catalog.MigrationFailed
+			m.Error = fmt.Sprintf("planned against shard set %s, which is no longer serving (%s is); "+
+				"per-shard progress cannot be read against another set, so this migration needs reconciling by hand",
+				m.Meta.ShardSet, serving)
+			logger.Error("migration straddled a cutover", "planned", m.Meta.ShardSet, "serving", serving)
+			return a.Store.Save(ctx, m)
+		}
+		logger.Info("replanning migration onto the serving shard set", "planned", m.Meta.ShardSet, "serving", serving)
+		m.State, m.Meta.ShardSet = catalog.MigrationQueued, ""
+	}
 	if m.State == catalog.MigrationQueued {
-		targets, err := a.targets(ctx, m)
+		targets, err := a.targets(ctx, m, serving)
 		if err != nil {
 			return err
 		}
@@ -317,11 +343,11 @@ func (a *Applier) drive(ctx context.Context, m catalog.DDLMigration) error {
 		if a.Catalog != nil && roleStatement(m.Kind) {
 			m.PerShard[catalogKey] = catalog.ShardMigration{State: catalog.ShardPending}
 		}
-		m.State = catalog.MigrationRunning
+		m.State, m.Meta.ShardSet = catalog.MigrationRunning, serving
 		if err := a.Store.Save(ctx, m); err != nil {
 			return err
 		}
-		logger.Info("migration started", "shards", len(targets))
+		logger.Info("migration started", "shards", len(targets), "shard_set", serving)
 	}
 	if m.Strategy == catalog.StrategyRewrite {
 		return a.driveRewrite(ctx, logger, &m)
@@ -428,14 +454,22 @@ func sortedShardKeys(per map[string]catalog.ShardMigration) []string {
 	return keys
 }
 
+// touched reports whether any shard of the migration has been driven past
+// pending, which is what makes its per-shard progress unreadable against a
+// different set.
+func touched(per map[string]catalog.ShardMigration) bool {
+	for _, s := range per {
+		if s.State != catalog.ShardPending {
+			return true
+		}
+	}
+	return false
+}
+
 // targets picks the shards a migration runs on from its scope.
-func (a *Applier) targets(ctx context.Context, m catalog.DDLMigration) ([]int32, error) {
+func (a *Applier) targets(ctx context.Context, m catalog.DDLMigration, set string) ([]int32, error) {
 	if m.Scope == "home" {
 		return []int32{m.HomeShard}, nil
-	}
-	set, err := a.shardSet(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("applier: serving shard set: %w", err)
 	}
 	ids, err := a.Store.Shards(ctx, set)
 	if err != nil {
@@ -542,13 +576,13 @@ func (a *Applier) prepare(ctx context.Context, m *catalog.DDLMigration, key stri
 		}
 		conn = c
 	} else {
-		password, err := a.provisionDDLRole(ctx, id, m.Meta.RunAs)
-		if err != nil {
-			return nil, err
-		}
-		set, serr := a.shardSet(ctx)
+		set, serr := a.migrationSet(ctx, m)
 		if serr != nil {
 			return nil, serr
+		}
+		password, err := a.provisionDDLRole(ctx, set, id, m.Meta.RunAs)
+		if err != nil {
+			return nil, err
 		}
 		conn, err = a.Shards.DialDatabaseAs(ctx, set, id, db, a.ddlRole(), password)
 		if err != nil {
@@ -582,7 +616,7 @@ func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, key string,
 		db = ""
 	}
 	if key != catalogKey {
-		defer a.releaseDDLRole(ctx, id, m.Meta.RunAs)
+		defer a.releaseDDLRole(ctx, m, id, m.Meta.RunAs)
 	}
 	conn, err := a.prepare(ctx, m, key, id, db)
 	if err != nil {
@@ -643,7 +677,7 @@ func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, key string,
 // process's password and no memberships (once per shard) and may SET ROLE
 // into runAs, then returns the password. A superuser runAs is refused: the
 // DDL session must never be able to become one.
-func (a *Applier) provisionDDLRole(ctx context.Context, id int32, runAs string) (string, error) {
+func (a *Applier) provisionDDLRole(ctx context.Context, set string, id int32, runAs string) (string, error) {
 	a.ddlMu.Lock()
 	defer a.ddlMu.Unlock()
 	if a.ddlPassword == "" {
@@ -656,10 +690,6 @@ func (a *Applier) provisionDDLRole(ctx context.Context, id int32, runAs string) 
 	}
 	if a.ddlReady[id] && runAs == "" {
 		return a.ddlPassword, nil
-	}
-	set, serr := a.shardSet(ctx)
-	if serr != nil {
-		return "", serr
 	}
 	conn, err := a.Shards.DialDatabase(ctx, set, id, "")
 	if err != nil {
@@ -713,14 +743,14 @@ func revokeAllMemberships(ddlRole string) string {
 // releaseDDLRole revokes runAs from the DDL role on shard id once the
 // statement that needed it finished, however it ended, so a later session
 // cannot SET ROLE into a tenant it is not running for.
-func (a *Applier) releaseDDLRole(ctx context.Context, id int32, runAs string) {
+func (a *Applier) releaseDDLRole(ctx context.Context, m *catalog.DDLMigration, id int32, runAs string) {
 	if runAs == "" {
 		return
 	}
 	ctx = context.WithoutCancel(ctx)
-	set, serr := a.shardSet(ctx)
+	set, serr := a.migrationSet(ctx, m)
 	if serr != nil {
-		a.logger().Warn("revoking DDL role membership: serving shard set", "shard", id, "role", runAs, "err", serr)
+		a.logger().Warn("revoking DDL role membership: shard set", "shard", id, "role", runAs, "err", serr)
 		return
 	}
 	conn, err := a.Shards.DialDatabase(ctx, set, id, "")
@@ -740,7 +770,7 @@ func (a *Applier) releaseDDLRole(ctx context.Context, id int32, runAs string) {
 // once on failure and leaves no invalid index behind; a step with OnFail
 // runs it after a hard failure so a re-run starts clean.
 func (a *Applier) runStep(ctx context.Context, m *catalog.DDLMigration, id int32, st catalog.MigrationStep) (string, error) {
-	defer a.releaseDDLRole(ctx, id, m.Meta.RunAs)
+	defer a.releaseDDLRole(ctx, m, id, m.Meta.RunAs)
 	conn, err := a.prepare(ctx, m, shardKey(id), id, m.Database)
 	if err != nil {
 		return "", err

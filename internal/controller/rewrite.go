@@ -240,7 +240,7 @@ func (a *Applier) recordRewriteColumns(ctx context.Context, m *catalog.DDLMigrat
 
 // rewritePhase runs one phase of the rewrite on one shard.
 func (a *Applier) rewritePhase(ctx context.Context, m *catalog.DDLMigration, id int32, phase int) (string, error) {
-	defer a.releaseDDLRole(ctx, id, m.Meta.RunAs)
+	defer a.releaseDDLRole(ctx, m, id, m.Meta.RunAs)
 	conn, err := a.prepare(ctx, m, shardKey(id), id, m.Database)
 	if err != nil {
 		return "", err

@@ -551,8 +551,9 @@ func (b *Barrier) maxRunTime() time.Duration {
 	return 2*orDefault(b.DrainTimeout, DefaultDrainTimeout) + orDefault(b.ArchiveTimeout, DefaultArchiveTimeout) + time.Minute
 }
 
-// RunRecovery lifts a stranded pause every interval until ctx is done.
-func (b *Barrier) RunRecovery(ctx context.Context, every time.Duration) {
+// RunRecovery lifts an abandoned barrier fence on every tick while this
+// replica is the leader.
+func (b *Barrier) RunRecovery(ctx context.Context, every time.Duration, leader func() bool) {
 	if every <= 0 {
 		every = time.Minute
 	}
@@ -563,6 +564,9 @@ func (b *Barrier) RunRecovery(ctx context.Context, every time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+		}
+		if leader != nil && !leader() {
+			continue
 		}
 		if err := b.Recover(ctx); err != nil {
 			b.logger().Warn("barrier: fence recovery pass failed", "err", err)

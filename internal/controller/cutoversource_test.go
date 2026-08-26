@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -204,5 +205,70 @@ func TestUnwindLiftsTheFenceWithoutTheTargets(t *testing.T) {
 	}
 	if n := queryOne[int64](t, conn, `SELECT count(*) FROM pgshard.workflow_locks WHERE workflow_id = $1::uuid`, id); n != 0 {
 		t.Errorf("%d lock row(s) left after the cutover was undone", n)
+	}
+}
+
+// TestCutoverFenceWaitsForARunningMigrationOnPostgres: the DDL lock a
+// cutover takes only holds back migrations that have not started, and one
+// already running is driven to completion rather than abandoned. Fencing
+// past it split that migration across both sets -- its recorded per-shard
+// progress described the set it was planned against, while its remaining
+// shards would be applied against the other.
+func TestCutoverFenceWaitsForARunningMigrationOnPostgres(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	dsn := startPostgres(t)
+	conn := connect(t, dsn)
+	if err := catalog.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	rs, _ := placement.Split(2)
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.MaterializeShardSet(ctx, tx, "default", 1, catalog.ShardSetServing, rs, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch)
+		VALUES ('default', 0, 'shard0', 'serving', 1), ('default', 1, 'shard1', 'serving', 1)`)
+	mustExec(t, conn, `INSERT INTO pgshard.databases (name) VALUES ('app')`)
+	mustExec(t, conn, `INSERT INTO pgshard.migrations (id, database, statement, kind, strategy, scope, state)
+		VALUES (gen_random_uuid(), 'app', 'create table t (id int)', 'CREATE TABLE', 'direct', 'all', 'running')`)
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	o := &pgCutover{c: &Copier{Pool: pool}, wf: &copyWorkflow{id: newWorkflowID(t, conn), set: "g2"}, srcSet: "default"}
+
+	err = o.Fence(ctx)
+	if err == nil || !errors.Is(err, errRetry) {
+		t.Fatalf("fence proceeded past a running migration: %v", err)
+	}
+	if !strings.Contains(err.Error(), "app") {
+		t.Fatalf("the wait does not name the database: %v", err)
+	}
+	// Writes must not be fenced while it waits: the pause clients see should
+	// not include the migration.
+	if n := queryOne[int64](t, conn, `SELECT count(*) FROM pgshard.shard_status WHERE migrating`); n != 0 {
+		t.Fatalf("%d shards fenced while waiting for a migration", n)
+	}
+	// The DDL lock must be held through the wait, or a new migration starts
+	// between attempts and the cutover never gets in.
+	if n := queryOne[int64](t, conn, `SELECT count(*) FROM pgshard.workflow_locks WHERE kind = 'ddl'`); n != 1 {
+		t.Fatalf("ddl locks held while waiting: %d, want 1", n)
+	}
+
+	mustExec(t, conn, `UPDATE pgshard.migrations SET state = 'complete'`)
+	if err := o.Fence(ctx); err != nil {
+		t.Fatalf("fence after the migration finished: %v", err)
+	}
+	if n := queryOne[int64](t, conn, `SELECT count(*) FROM pgshard.shard_status WHERE migrating`); n != 2 {
+		t.Fatalf("%d shards fenced after the migration finished, want 2", n)
 	}
 }
