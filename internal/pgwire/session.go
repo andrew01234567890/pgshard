@@ -18,7 +18,14 @@ import (
 // ErrCopyFail is returned by CopyInStream.Next when the client aborts.
 var ErrCopyFail = errors.New("pgwire: COPY failed by client")
 
-const maxMessageBodyLen = 1 << 30
+// DefaultMaxMessageBodyLen bounds one frontend message body when Config
+// leaves it unset. PostgreSQL's own limit is 1 GiB, but a router is not a
+// backend: it never needs to hold a 1 GiB Bind or Query, and pgproto3
+// allocates the whole declared length before a single body byte arrives, so
+// the ceiling is what one authenticated session can make the router allocate
+// from a five-byte header. 64 MiB is far above any realistic Query, Bind or
+// CopyData chunk and three orders of magnitude below the old ceiling.
+const DefaultMaxMessageBodyLen = 64 << 20
 
 type session struct {
 	server *Server
@@ -66,7 +73,11 @@ func (s *session) resetIO(conn net.Conn) {
 	s.conn = conn
 	s.reader = bufio.NewReader(conn)
 	s.be = pgproto3.NewBackend(s.reader, conn)
-	s.be.SetMaxBodyLen(maxMessageBodyLen)
+	maxBody := s.server.cfg.MaxMessageBodyLen
+	if maxBody <= 0 {
+		maxBody = DefaultMaxMessageBodyLen
+	}
+	s.be.SetMaxBodyLen(maxBody)
 }
 
 func (s *session) send(msgs ...pgproto3.BackendMessage) error {
