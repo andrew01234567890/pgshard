@@ -116,16 +116,25 @@ func startScaleLedger(ctx context.Context, c *e2e.Cluster) *scaleLedger {
 			defer l.wg.Done()
 			next := int64(1)
 			for lctx.Err() == nil {
-				group, err := resolveGroup(lctx, c, tenant)
-				if group == "" {
-					l.note(i, "no serving group for tenant: %v", err)
-					time.Sleep(time.Second)
-					continue
-				}
 				hi := next + 9
-				sql := fmt.Sprintf(`INSERT INTO ledger (id, tenant_id, amount) SELECT g, %d, 1 FROM generate_series(%d, %d) g ON CONFLICT DO NOTHING`, tenant, next, hi)
-				if _, err := shardSQL(lctx, c, group, sql); err != nil {
-					l.note(i, "insert into %s failed: %v", group, err)
+				// An explicit VALUES list rather than INSERT ... SELECT: the
+				// router routes an insert by its shard key, and the key has to
+				// be readable from the statement.
+				var rows strings.Builder
+				for id := next; id <= hi; id++ {
+					if id > next {
+						rows.WriteString(", ")
+					}
+					fmt.Fprintf(&rows, "(%d, %d, 1)", id, tenant)
+				}
+				sql := "INSERT INTO ledger (id, tenant_id, amount) VALUES " + rows.String() + " ON CONFLICT DO NOTHING"
+				// Through the router, so the writes meet the write fence a
+				// cutover raises. Writing to a group's PostgreSQL Service
+				// directly goes under the pooler and the router, which is
+				// where the fence lives, and a source written around the
+				// fence never stands still for the switch to proceed.
+				if _, err := routerSQL(lctx, c, sql); err != nil {
+					l.note(i, "insert failed: %v", err)
 					time.Sleep(2 * time.Second)
 					continue
 				}
@@ -193,6 +202,23 @@ func seedLedgerTable(ctx context.Context, t *testing.T, c *e2e.Cluster, shards i
 	}
 	catalogSQL(ctx, t, c, "INSERT INTO pgshard.databases (name, default_placement, home_shard) VALUES ('"+appDatabase+"', 'unsharded', 0)")
 	catalogSQL(ctx, t, c, "INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('"+appDatabase+"', 'public', 'ledger', 'sharded', 'tenant_id')")
+	registerLedgerRole(ctx, t, c)
+}
+
+// waitForLedgerRole waits until the role the workload writes as has reached
+// every group. Writing before it has is indistinguishable from the router
+// refusing the role outright, and the difference matters.
+func waitForLedgerRole(ctx context.Context, t *testing.T, c *e2e.Cluster) {
+	t.Helper()
+	waitForWhy(ctx, t, c, "ledger role applied on every group", 3*time.Minute, func() string {
+		return "\nrole state: " + catalogSQL(ctx, t, c,
+			"SELECT coalesce(string_agg(group_name || '=' || roles_generation, ', ' ORDER BY group_name), 'no rows') FROM pgshard.role_group_status") +
+			"\ndesired: " + catalogSQL(ctx, t, c, "SELECT coalesce(max(desired_generation)::text, 'none') FROM pgshard.roles")
+	}, func() bool {
+		return catalogSQL(ctx, t, c, `SELECT count(*) = 0 FROM pgshard.role_group_status
+			WHERE roles_generation < (SELECT max(desired_generation) FROM pgshard.roles)`) == "t" &&
+			catalogSQL(ctx, t, c, "SELECT count(*) > 0 FROM pgshard.role_group_status") == "t"
+	})
 }
 
 func reshardTo(ctx context.Context, t *testing.T, c *e2e.Cluster, major string, shards int, generation int64) {
@@ -290,6 +316,8 @@ func reshardUnderLoad(t *testing.T, startShards int, steps []reshardStep) {
 	waitFor(ctx, t, c, "serving shard set materialized", 5*time.Minute, func() bool {
 		return jsonpath(ctx, c, "pgshardcluster", clusterName, "{.status.effectiveShards}") == strconv.Itoa(startShards)
 	})
+
+	waitForLedgerRole(ctx, t, c)
 
 	l := startScaleLedger(ctx, c)
 	waitForWhy(ctx, t, c, "first acknowledged ledger writes", 3*time.Minute, l.why, func() bool {
