@@ -38,6 +38,13 @@ type Change struct {
 // delivers nothing (or its connection is down).
 const DefaultReloadInterval = 30 * time.Second
 
+// Backoff for the first reload, which has to keep trying: nothing restarts a
+// watcher that gives up.
+const (
+	firstReloadBackoff    = 250 * time.Millisecond
+	maxFirstReloadBackoff = 5 * time.Second
+)
+
 // Options tunes a Watcher. Zero values pick defaults.
 type Options struct {
 	ReloadInterval time.Duration                    // default DefaultReloadInterval
@@ -84,8 +91,31 @@ func (w *Watcher) Subscribe() (<-chan Change, func()) {
 // Run blocks until ctx is done. It returns after the first snapshot fails to
 // load so callers can fail fast at startup.
 func (w *Watcher) Run(ctx context.Context) error {
-	if err := w.reload(ctx); err != nil {
-		return err
+	// The first reload used to be fatal. A router or pooler that started
+	// before the catalog accepted connections lost its watcher there and then
+	// served for the rest of its life with no snapshot, stamping every request
+	// with generation zero and having each one refused as a stale generation,
+	// with no recovery short of restarting the pod. A pod starting before its
+	// dependencies are up is ordinary, so keep trying until it works or the
+	// context ends. Once the loop below is running a failed reload is already
+	// only logged.
+	for delay := firstReloadBackoff; ; {
+		err := w.reload(ctx)
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		w.logf("snapshot reload: %v; retrying in %s", err, delay)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		if delay *= 2; delay > maxFirstReloadBackoff {
+			delay = maxFirstReloadBackoff
+		}
 	}
 	if w.listen {
 		go w.listenLoop(ctx)
