@@ -21,8 +21,10 @@ import (
 // onto 19 behind the stable catalog Service; and the whole cluster ends on
 // 19. Backup-stanza continuity is covered by the backup suite (the stanza
 // is derived per group, so new-major groups archive into fresh stanzas);
-// VStream continuity is asserted once the M6 stream stack is present after
-// the rebase onto main.
+// VStream continuity across the cutover is NOT asserted here. The stream
+// stack does exist now (internal/router/vstream), so the original reason --
+// waiting for a rebase -- no longer applies; it is simply unwritten, and
+// PGS-351 tracks the gap it would cover.
 func TestUpgrade18To19UnderLoad(t *testing.T) {
 	c := e2e.NewCluster(t)
 	c.GatherOnFailure(t)
