@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
+
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -25,9 +27,8 @@ import (
 var k8sClient client.Client
 
 func TestMain(m *testing.M) {
-	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
-		fmt.Fprint(os.Stderr, "envtest: KUBEBUILDER_ASSETS is not set; run 'make envtest' to download the control-plane binaries. Skipping API tests.\n")
-		os.Exit(0)
+	if !dockertest.EnvtestAvailable() {
+		os.Exit(dockertest.EnvtestMissingMain("the API CRD validation tests"))
 	}
 	env := &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},

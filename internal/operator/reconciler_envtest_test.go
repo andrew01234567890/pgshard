@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
+
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
@@ -34,8 +36,12 @@ import (
 var k8sClient client.Client
 
 func TestMain(m *testing.M) {
-	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
-		fmt.Fprint(os.Stderr, "envtest: KUBEBUILDER_ASSETS is not set; run 'make envtest'. Skipping reconciler envtests.\n")
+	if !dockertest.EnvtestAvailable() {
+		if code := dockertest.EnvtestMissingMain("the reconciler envtests"); code != 0 {
+			os.Exit(code)
+		}
+		// Without the control plane the envtests skip individually; the
+		// rest of the package still runs.
 		os.Exit(m.Run())
 	}
 	env := &envtest.Environment{
@@ -443,7 +449,7 @@ func (f *fakeProber) MigrateCatalog(context.Context, string) error {
 func requireEnvtest(t *testing.T) {
 	t.Helper()
 	if k8sClient == nil {
-		t.Skip("KUBEBUILDER_ASSETS not set")
+		dockertest.EnvtestMissing(t, "this envtest")
 	}
 }
 
