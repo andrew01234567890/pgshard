@@ -59,18 +59,18 @@ func TestTablePlacementRekey(t *testing.T) {
 	if err := c.WaitPodsReady(ctx, testNamespace, "app="+clusterName+"-controller", 3*time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(ctx, t, "orders effective", 2*time.Minute, func() bool {
+	waitFor(ctx, t, c, "orders effective", 2*time.Minute, func() bool {
 		return catalogSQL(ctx, t, c, "SELECT coalesce(effective_shard_key, '') FROM pgshard.table_status WHERE table_name = 'orders'") == "tenant_id"
 	})
 
 	catalogSQL(ctx, t, c, "UPDATE pgshard.tables SET shard_key = 'id' WHERE table_name = 'orders'")
-	waitFor(ctx, t, "placement workflow created", 2*time.Minute, func() bool {
+	waitFor(ctx, t, c, "placement workflow created", 2*time.Minute, func() bool {
 		return catalogSQL(ctx, t, c, "SELECT count(*) FROM pgshard.workflows WHERE kind = 'table_placement'") == "1"
 	})
 	if _, err := shardSQL(ctx, c, "shard-0", "INSERT INTO orders (tenant_id, note) SELECT g * 7919 + 13, 'during' FROM generate_series(1001, 1200) g"); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(ctx, t, "placement workflow completed", 10*time.Minute, func() bool {
+	waitFor(ctx, t, c, "placement workflow completed", 10*time.Minute, func() bool {
 		got := catalogSQL(ctx, t, c, "SELECT state || ':' || coalesce(status->>'stage', '') FROM pgshard.workflows WHERE kind = 'table_placement'")
 		if strings.HasPrefix(got, "failed") {
 			t.Fatalf("placement workflow failed: %s", catalogSQL(ctx, t, c, "SELECT coalesce(error, '') || ' ' || status::text FROM pgshard.workflows WHERE kind = 'table_placement'"))
@@ -95,7 +95,7 @@ func TestTablePlacementRekey(t *testing.T) {
 	if got := catalogSQL(ctx, t, c, "SELECT count(*) FROM pgshard.workflow_locks"); got != "0" {
 		t.Errorf("workflow locks left: %q", got)
 	}
-	waitFor(ctx, t, "cluster status reports the run", 3*time.Minute, func() bool {
+	waitFor(ctx, t, c, "cluster status reports the run", 3*time.Minute, func() bool {
 		return jsonpath(ctx, c, "pgshardcluster", clusterName, "{.status.placementWorkflows[0].state}/{.status.placementWorkflows[0].to}") == "completed/sharded(id)"
 	})
 	if got := jsonpath(ctx, c, "pgshardcluster", clusterName, "{.status.placementWorkflows[0].table}"); got != appDatabase+".public.orders" {

@@ -63,9 +63,13 @@ func (p *MetricsPoller) Refresh(ctx context.Context) error {
 	}
 	m.CutoverPaused.Set(paused)
 
-	rows, err = p.Pool.Query(ctx, `SELECT w.kind, w.id::text, coalesce(avg(ts.progress), 0)
-		FROM pgshard.workflows w LEFT JOIN pgshard.table_status ts ON ts.workflow_id = w.id
-		WHERE w.state IN ($1, $2) GROUP BY w.kind, w.id`, StateRunning, StatePaused)
+	rows, err = p.Pool.Query(ctx, `SELECT kind, id::text,
+		       CASE WHEN coalesce((status->'progress'->>'tables_total')::float8, 0) > 0
+		            THEN least(1, coalesce((status->'progress'->>'tables_ready')::float8, 0)
+		                          / (status->'progress'->>'tables_total')::float8)
+		            ELSE 0 END
+		FROM pgshard.workflows
+		WHERE state IN ($1, $2)`, StateRunning, StatePaused)
 	if err != nil {
 		return err
 	}
