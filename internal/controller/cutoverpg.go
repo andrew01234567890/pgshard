@@ -143,6 +143,32 @@ func (o *pgCutover) GateOpen(ctx context.Context) (bool, string, error) {
 // Fence marks every source shard migrating and takes the DDL lock of every
 // database.
 func (o *pgCutover) Fence(ctx context.Context) error {
+	// Take the DDL locks first and commit them on their own. They stop new
+	// migrations from starting, which is what lets the running ones drain;
+	// taking them in the same transaction as the write fence would roll them
+	// back on every wait below and let a fresh migration in each time.
+	if _, err := o.c.Pool.Exec(ctx, `INSERT INTO pgshard.workflow_locks (kind, key, workflow_id)
+		SELECT 'ddl', name, $1::uuid FROM pgshard.databases ON CONFLICT (kind, key) DO NOTHING`, o.wf.id); err != nil {
+		return err
+	}
+	// A lock only holds back migrations that have not started. One already
+	// running keeps applying -- abandoning it half-way is worse than
+	// finishing it -- so fencing now would split it across both sets: its
+	// per-shard progress describes the set it was planned against while its
+	// remaining shards would be applied against the other. Wait for it, and
+	// wait before raising the write fence rather than after, so the pause
+	// clients see does not include the migration.
+	rows, err := o.c.Pool.Query(ctx, `SELECT DISTINCT database FROM pgshard.migrations WHERE state = 'running' ORDER BY database`)
+	if err != nil {
+		return err
+	}
+	running, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return err
+	}
+	if len(running) > 0 {
+		return retryf("a migration is still applying on %s; fencing now would split it across both sets", strings.Join(running, ", "))
+	}
 	tx, err := o.c.Pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -162,10 +188,6 @@ func (o *pgCutover) Fence(ctx context.Context) error {
 	}
 	if heldByOther > 0 {
 		return fmt.Errorf("another cutover holds the write fence on %s", o.srcSet)
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO pgshard.workflow_locks (kind, key, workflow_id)
-		SELECT 'ddl', name, $1::uuid FROM pgshard.databases ON CONFLICT (kind, key) DO NOTHING`, o.wf.id); err != nil {
-		return err
 	}
 	return tx.Commit(ctx)
 }
