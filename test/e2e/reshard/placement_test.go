@@ -70,7 +70,11 @@ func TestTablePlacementRekey(t *testing.T) {
 	if _, err := shardSQL(ctx, c, "shard-0", "INSERT INTO orders (tenant_id, note) SELECT g * 7919 + 13, 'during' FROM generate_series(1001, 1200) g"); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(ctx, t, c, "placement workflow completed", 10*time.Minute, func() bool {
+	placementState := func() string {
+		return "\nplacement workflow: " + catalogSQL(ctx, t, c,
+			"SELECT state || ' stage=' || coalesce(status->>'stage', '') || ' message=' || coalesce(status->>'message', '') || ' error=' || coalesce(error, '') FROM pgshard.workflows WHERE kind = 'table_placement'")
+	}
+	waitForWhy(ctx, t, c, "placement workflow completed", 10*time.Minute, placementState, func() bool {
 		got := catalogSQL(ctx, t, c, "SELECT state || ':' || coalesce(status->>'stage', '') FROM pgshard.workflows WHERE kind = 'table_placement'")
 		if strings.HasPrefix(got, "failed") {
 			t.Fatalf("placement workflow failed: %s", catalogSQL(ctx, t, c, "SELECT coalesce(error, '') || ' ' || status::text FROM pgshard.workflows WHERE kind = 'table_placement'"))

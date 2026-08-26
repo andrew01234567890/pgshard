@@ -202,7 +202,7 @@ func (c *Cluster) Summary(ctx context.Context, namespace string) string {
 	}
 	section("pods", "-n", namespace, "get", "pods", "-o", "wide")
 	section("pgshardclusters", "-n", namespace, "get", "pgshardcluster", "-o",
-		`jsonpath={range .items[*]}{.metadata.name}{"\t"}{.status.conditions[*].type}={.status.conditions[*].status}{"\tshards="}{.status.effectiveShards}{"\n"}{end}`)
+		`jsonpath={range .items[*]}{.metadata.name}{"\tshards="}{.status.effectiveShards}{"\n"}{range .status.conditions[*]}{"  "}{.type}{"="}{.status}{"\n"}{end}{end}`)
 	section("recent events", "-n", namespace, "get", "events", "--sort-by=.lastTimestamp")
 	return b.String()
 }
