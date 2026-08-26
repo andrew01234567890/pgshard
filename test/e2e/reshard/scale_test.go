@@ -115,16 +115,25 @@ func startScaleLedger(ctx context.Context, c *e2e.Cluster) *scaleLedger {
 			defer l.wg.Done()
 			next := int64(1)
 			for lctx.Err() == nil {
-				group, err := resolveGroup(lctx, c, tenant)
-				if group == "" {
-					l.note(i, "no serving group for tenant: %v", err)
-					time.Sleep(time.Second)
-					continue
-				}
 				hi := next + 9
-				sql := fmt.Sprintf(`INSERT INTO ledger (id, tenant_id, amount) SELECT g, %d, 1 FROM generate_series(%d, %d) g ON CONFLICT DO NOTHING`, tenant, next, hi)
-				if _, err := shardSQL(lctx, c, group, sql); err != nil {
-					l.note(i, "insert into %s failed: %v", group, err)
+				// An explicit VALUES list rather than INSERT ... SELECT: the
+				// router routes an insert by its shard key, and the key has to
+				// be readable from the statement.
+				var rows strings.Builder
+				for id := next; id <= hi; id++ {
+					if id > next {
+						rows.WriteString(", ")
+					}
+					fmt.Fprintf(&rows, "(%d, %d, 1)", id, tenant)
+				}
+				sql := "INSERT INTO ledger (id, tenant_id, amount) VALUES " + rows.String() + " ON CONFLICT DO NOTHING"
+				// Through the router, so the writes meet the write fence a
+				// cutover raises. Writing to a group's PostgreSQL Service
+				// directly goes under the pooler and the router, which is
+				// where the fence lives, and a source written around the
+				// fence never stands still for the switch to proceed.
+				if _, err := routerSQL(lctx, c, sql); err != nil {
+					l.note(i, "insert failed: %v", err)
 					time.Sleep(2 * time.Second)
 					continue
 				}

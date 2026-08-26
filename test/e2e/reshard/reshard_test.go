@@ -156,6 +156,16 @@ spec:
 }
 
 // shardSQL runs sql on the primary of one shard group's app database.
+// routerSQL runs one statement against the app database through the router,
+// which is how a client reaches the cluster: it routes by shard key and it
+// honours the write fence a cutover raises. Reaching a group's PostgreSQL
+// Service directly, as shardSQL does, bypasses both.
+func routerSQL(ctx context.Context, c *e2e.Cluster, sql string) (string, error) {
+	out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "exec", clientPod, "--",
+		"psql", "-h", clusterName+"-router", "-U", "postgres", "-d", appDatabase, "-v", "ON_ERROR_STOP=1", "-tAc", sql)
+	return strings.TrimSpace(out), err
+}
+
 func shardSQL(ctx context.Context, c *e2e.Cluster, group, sql string) (string, error) {
 	out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "exec", clientPod, "--",
 		"psql", "-h", clusterName+"-"+group+"-rw", "-U", "postgres", "-d", appDatabase, "-v", "ON_ERROR_STOP=1", "-tAc", sql)
