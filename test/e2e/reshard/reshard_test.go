@@ -141,6 +141,11 @@ spec:
             - --reconcile-interval=5s
             - --copy-interval=5s
             - --resolve-interval=5s
+            # A table re-key holds the renamed old tables for an hour by
+            # default before dropping them and completing. The suite asserts
+            # the old table is gone, so without this it waits for something
+            # that cannot happen inside its timeout.
+            - --placement-drop-old-after=10s
           env:
             - name: PGPASSWORD
               valueFrom:
