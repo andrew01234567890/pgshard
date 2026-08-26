@@ -756,6 +756,39 @@ func runSuite(t *testing.T, img pgImage) {
 				refusedOn(t, "gpr")
 			})
 
+			// Moving a range between sets normally breaks the coverage of both,
+			// so the coverage trigger answers first and the ownership branch
+			// for NEW.shard_set goes untested. Moving a set's whole map into an
+			// empty set leaves both valid, which isolates it.
+			t.Run("moving_a_map_into_an_owned_set_refused", func(t *testing.T) {
+				mustExec(t, conn, `INSERT INTO pgshard.shard_sets (shard_set, generation, state) VALUES
+					('gmovesrc', 40, 'serving'), ('gmovedst', 41, 'serving')`)
+				mustExec(t, conn, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES
+					('gmovesrc', 0, '[,0)'), ('gmovesrc', 1, '[0,)')`)
+				mustExec(t, conn, `INSERT INTO pgshard.workflows (id, kind, state, spec) VALUES
+					('16161616-1616-1616-1616-161616161616', 'reshard', 'running',
+					 '{"shard_set": "gmovedst", "source_set": "gmovedstsrc", "ranges": [{"shard_id": 0}]}'::jsonb)`)
+				t.Cleanup(func() {
+					mustExec(t, conn, `DELETE FROM pgshard.workflows WHERE id = '16161616-1616-1616-1616-161616161616'`)
+					mustExec(t, conn, `DELETE FROM pgshard.shard_ranges WHERE shard_set IN ('gmovesrc', 'gmovedst')`)
+					mustExec(t, conn, `DELETE FROM pgshard.shard_sets WHERE shard_set IN ('gmovesrc', 'gmovedst')`)
+				})
+
+				tx, err := conn.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				mustTx(t, tx, `UPDATE pgshard.shard_ranges SET shard_set = 'gmovedst' WHERE shard_set = 'gmovesrc'`)
+				err = tx.Commit(ctx)
+				if err == nil {
+					t.Fatal("a map was moved into a set a workflow owns")
+				}
+				// Both sets end up validly covered, so only the ownership rule
+				// can be what refuses this.
+				expectPgError(t, err, "23514", "owned by workflow")
+			})
+
 			t.Run("a_finished_workflow_releases_the_set", func(t *testing.T) {
 				mustExec(t, conn, `INSERT INTO pgshard.shard_sets (shard_set, generation, state) VALUES ('gdone', 31, 'serving')`)
 				mustExec(t, conn, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES
