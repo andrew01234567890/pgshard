@@ -90,7 +90,11 @@ type cutoverState struct {
 	FenceMS    int64      `json:"fence_ms,omitempty"`
 	SwitchedAt *time.Time `json:"switched_at,omitempty"`
 	Gate       string     `json:"gate,omitempty"`
-	Aborts     []string   `json:"aborts,omitempty"`
+	// Schema fingerprints both sets at the switch, keyed set/shard/database.
+	// Logical replication carries no DDL, so a rollback has to prove the
+	// sources were not left structurally behind while they were idle.
+	Schema map[string]string `json:"schema,omitempty"`
+	Aborts []string          `json:"aborts,omitempty"`
 }
 
 // cutoverSpec is what the operator mirrors into the workflow spec.
@@ -152,6 +156,9 @@ type cutoverOps interface {
 	Sequences(ctx context.Context) error
 	// Reverse creates the reverse publications and disabled subscriptions.
 	Reverse(ctx context.Context) error
+	// SchemaFingerprints hashes every database on both sets, keyed
+	// set/shard/database.
+	SchemaFingerprints(ctx context.Context) (map[string]string, error)
 	// Journal writes the journal rows (idempotent by id).
 	Journal(ctx context.Context, id string) error
 	// Flip publishes the new map in one catalog transaction.
@@ -390,6 +397,14 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 		if err := ops.Reverse(ctx); err != nil {
 			return false, err
 		}
+		// Taken here, inside the fence and while the DDL locks still
+		// stand, so both sets are quiet and the hashes describe the
+		// structure a rollback would be returning to.
+		fps, err := ops.SchemaFingerprints(ctx)
+		if err != nil {
+			return false, err
+		}
+		wf.cutover.Schema = fps
 	case StepJournal:
 		if wf.cutover.JournalID == "" {
 			id, err := c.store().NewJournalID(ctx)
