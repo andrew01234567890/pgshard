@@ -1113,9 +1113,34 @@ func (c *Copier) cancel(ctx context.Context, wf *copyWorkflow) error {
 			}
 		}
 	}
+	message := "copy cancelled: subscriptions, slots and publications dropped"
+	// Past the fence the forward cleanup above is not the whole undo: the
+	// write fence is still raised on the sources and the reverse replication
+	// still attached to them, and neither is anyone else's to remove. Without
+	// this the sources stay unwritable with no workflow left to lift them.
+	if fencedStage(wf.stage) {
+		ops, err := c.pgCutover(ctx, wf)
+		if err != nil {
+			return err
+		}
+		if err := ops.Unwind(ctx); err != nil {
+			return fmt.Errorf("cancel: undoing the started cutover: %w", err)
+		}
+		message = "cutover cancelled: fence lifted, reverse replication and forward objects dropped"
+	}
 	_, err = c.Pool.Exec(ctx, `UPDATE pgshard.workflows SET state = $2, status = status || $3::jsonb, updated_at = now() WHERE id = $1::uuid`,
-		wf.id, StateCancelled, mustJSON(map[string]any{"stage": StageCancelled, "message": "copy cancelled: subscriptions, slots and publications dropped"}))
+		wf.id, StateCancelled, mustJSON(map[string]any{"stage": StageCancelled, "message": message}))
 	return err
+}
+
+// fencedStage reports whether a workflow's stage means a cutover has started,
+// so the fence may be raised and reverse replication may exist.
+func fencedStage(stage string) bool {
+	switch stage {
+	case StageSwitching, StageSwitched, StageRollingBack, StageCompleting:
+		return true
+	}
+	return false
 }
 
 func dropSubscriptions(ctx context.Context, conn ShardConn, gen int64, t int32) error {
