@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
@@ -488,6 +489,13 @@ func MaterializeRoles(ctx context.Context, dial func(ctx context.Context, databa
 	for _, db := range grantDatabases(d.Grants) {
 		dbConn, err := dial(ctx, db)
 		if err != nil {
+			// A reshard target has no application database until the copier
+			// creates it, and grants cannot be applied to a database that is
+			// not there yet. Skip quietly rather than report a failure every
+			// pass for something that resolves itself.
+			if absentDatabase(err) {
+				continue
+			}
 			errs = append(errs, fmt.Errorf("database %s: %w", db, err))
 			continue
 		}
@@ -502,6 +510,13 @@ func MaterializeRoles(ctx context.Context, dial func(ctx context.Context, databa
 		_ = dbConn.Close(context.WithoutCancel(ctx))
 	}
 	return errors.Join(errs...)
+}
+
+// absentDatabase reports whether err is PostgreSQL refusing a connection
+// because the database does not exist (3D000, invalid_catalog_name).
+func absentDatabase(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "3D000"
 }
 
 func grantDatabases(grants []catalog.DesiredGrant) []string {
