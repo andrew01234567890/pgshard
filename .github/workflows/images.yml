@@ -6,8 +6,13 @@ on:
     paths:
       - "postgres/**"
       - "docker-bake.hcl"
-      - "cmd/pgshard-agent/**"
-      - "internal/agent/**"
+      # The image builds pgshard-agent AND pgshard-pooler from a COPY of the
+      # whole repository, so anything either binary can import belongs here.
+      # Naming only the agent's own packages meant a merged pooler fix left
+      # the published tags running the old binary.
+      - "cmd/**"
+      - "internal/**"
+      - "proto/**"
       - "go.mod"
       - "go.sum"
       - ".github/workflows/images.yml"
@@ -15,8 +20,13 @@ on:
     paths:
       - "postgres/**"
       - "docker-bake.hcl"
-      - "cmd/pgshard-agent/**"
-      - "internal/agent/**"
+      # The image builds pgshard-agent AND pgshard-pooler from a COPY of the
+      # whole repository, so anything either binary can import belongs here.
+      # Naming only the agent's own packages meant a merged pooler fix left
+      # the published tags running the old binary.
+      - "cmd/**"
+      - "internal/**"
+      - "proto/**"
       - "go.mod"
       - "go.sum"
       - ".github/workflows/images.yml"
@@ -61,3 +71,4 @@ jobs:
           docker run --rm --entrypoint postgres "$image" --version
           docker run --rm --entrypoint pgbackrest "$image" version
           docker run --rm "$image" --version
+          docker run --rm --entrypoint pgshard-pooler "$image" --version
