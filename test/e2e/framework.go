@@ -168,6 +168,14 @@ func (c *Cluster) MustGather(ctx context.Context, name string) {
 	}
 	save("all.yaml", "get", "all", "-A", "-o", "yaml")
 	save("events.txt", "get", "events", "-A", "--sort-by=.lastTimestamp")
+	// Pod identity, so a pod that was REPLACED during the run is visible
+	// rather than inferred. The logs below are whatever pods exist now, plus
+	// a -previous.txt for a container that restarted; a pod whose Deployment
+	// replaced it leaves no trace at all, and its log is the one that had the
+	// history. A UID that does not match the one the suite saw at the start
+	// says that is what happened.
+	save("pod-identity.txt", "get", "pods", "-A", "-o",
+		`custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name,UID:.metadata.uid,RESTARTS:.status.containerStatuses[*].restartCount,START:.status.startTime`)
 	save("nodes.txt", "describe", "nodes")
 	save("describe-"+SystemNamespace+".txt", "-n", SystemNamespace, "describe", "all")
 	pods, err := c.Kubectl(ctx, nil, "-n", SystemNamespace, "get", "pods", "-o", "name")
