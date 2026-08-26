@@ -31,6 +31,7 @@ func (m *cutoverMemStore) NewJournalID(context.Context) (string, error) {
 }
 
 type fakeOps struct {
+	fingerprints    map[string]string
 	calls           []string
 	reverseCaughtUp bool
 	gateOpen        bool
@@ -85,6 +86,12 @@ func (f *fakeOps) CaughtUp(_ context.Context, pos map[string]int64) (bool, strin
 func (f *fakeOps) Verify(context.Context) (VerifyReport, error) { return f.verify, f.step(StepVerify) }
 func (f *fakeOps) Sequences(context.Context) error              { return f.step(StepSequences) }
 func (f *fakeOps) Reverse(context.Context) error                { return f.step(StepReverse) }
+func (f *fakeOps) SchemaFingerprints(context.Context) (map[string]string, error) {
+	if f.fingerprints == nil {
+		return map[string]string{"default/0/app": "before"}, nil
+	}
+	return f.fingerprints, nil
+}
 func (f *fakeOps) Journal(_ context.Context, id string) error {
 	f.journaled[id]++
 	return f.step(StepJournal)

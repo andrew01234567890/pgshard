@@ -147,8 +147,10 @@ type PlacementOutcome struct {
 	Failed    int
 }
 
-// Run drives every interval until ctx ends.
-func (p *Placer) Run(ctx context.Context, interval time.Duration) {
+// Run drives a placement pass on every tick while this replica is the
+// leader. Only the leader may run one: a pass builds shadow tables and
+// renames them into place.
+func (p *Placer) Run(ctx context.Context, interval time.Duration, leader func() bool) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -156,6 +158,9 @@ func (p *Placer) Run(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+		}
+		if leader != nil && !leader() {
+			continue
 		}
 		if _, err := p.Pass(ctx); err != nil {
 			p.logger().Warn("placement pass failed", "err", err)

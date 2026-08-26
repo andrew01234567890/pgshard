@@ -34,6 +34,18 @@ type TwoPCAgentClient interface {
 	ListPrepared(ctx context.Context, addr string) (map[string]string, error)
 }
 
+const (
+	// twopcListTimeout bounds the read-only barrier RPCs. They return what
+	// the primary already holds, so anything slower is a wedged handler.
+	twopcListTimeout = 30 * time.Second
+	// twopcFenceTimeout bounds raising and releasing the write fence.
+	twopcFenceTimeout = 30 * time.Second
+	// twopcReconcileTimeout is longer: reconciling commits or rolls back
+	// every in-doubt transaction on the shard, each waiting on the sync
+	// standbys like any other commit.
+	twopcReconcileTimeout = 5 * time.Minute
+)
+
 // ListPrepared calls Agent.ListPreparedTransactions.
 func (c GRPCAgentClient) ListPrepared(ctx context.Context, addr string) (map[string]string, error) {
 	conn, cl, err := c.dial(ctx, addr)
@@ -41,6 +53,8 @@ func (c GRPCAgentClient) ListPrepared(ctx context.Context, addr string) (map[str
 		return nil, err
 	}
 	defer func() { _ = conn.Close() }()
+	ctx, cancel := context.WithTimeout(ctx, twopcListTimeout)
+	defer cancel()
 	resp, err := cl.ListPreparedTransactions(ctx, &pgshardv1.ListPreparedTransactionsRequest{})
 	if err != nil {
 		return nil, err
@@ -62,6 +76,8 @@ func (c GRPCAgentClient) ListTransactionDecisions(ctx context.Context, addr stri
 		return nil, err
 	}
 	defer func() { _ = conn.Close() }()
+	ctx, cancel := context.WithTimeout(ctx, twopcListTimeout)
+	defer cancel()
 	resp, err := cl.ListTransactionDecisions(ctx, &pgshardv1.ListTransactionDecisionsRequest{})
 	if err != nil {
 		return nil, err
@@ -87,6 +103,8 @@ func (c GRPCAgentClient) ReconcilePrepared(ctx context.Context, addr string, epo
 	for _, d := range decisions {
 		req.Decisions = append(req.Decisions, &pgshardv1.TransactionDecision{Gid: d.GID, State: d.State, Participants: d.Participants, ParticipantXids: d.ParticipantXIDs})
 	}
+	ctx, cancel := context.WithTimeout(ctx, twopcReconcileTimeout)
+	defer cancel()
 	resp, err := cl.ReconcilePreparedTransactions(ctx, req)
 	if err != nil {
 		return twopc.Outcome{}, err
@@ -105,6 +123,8 @@ func (c GRPCAgentClient) SetWriteFence(ctx context.Context, addr string, epoch u
 		return err
 	}
 	defer func() { _ = conn.Close() }()
+	ctx, cancel := context.WithTimeout(ctx, twopcFenceTimeout)
+	defer cancel()
 	resp, err := cl.SetWriteFence(ctx, &pgshardv1.SetWriteFenceRequest{Epoch: epoch, Active: active, Reason: reason})
 	if err != nil {
 		return err
