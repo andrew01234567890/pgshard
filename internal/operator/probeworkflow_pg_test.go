@@ -115,3 +115,68 @@ func startProbePostgres(t *testing.T) string {
 	t.Fatal("postgres did not become ready")
 	return ""
 }
+
+// TestPublishShardStatusIsQuietWhenNothingChanged: a Ready cluster reconciles
+// every 30 seconds and upserts once per shard. The epoch guard was
+// primary_epoch <= EXCLUDED.primary_epoch, which an EQUAL epoch satisfies, so
+// every pass rewrote an unchanged row and bumped updated_at. Each write fires
+// notify_serving, and every router and pooler watcher answers by reloading
+// ranges, statuses, databases, tables, rewrites, fences and sequences.
+func TestPublishShardStatusIsQuietWhenNothingChanged(t *testing.T) {
+	if err := exec.Command("docker", "info").Run(); err != nil {
+		dockertest.Unavailable(t, "docker unavailable")
+	}
+	ctx := context.Background()
+	dsn := startProbePostgres(t)
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if err := catalog.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+
+	g := Group{Cluster: "rs", Kind: "shard", ShardID: 0, Generation: 1}
+	p := PgxProber{}
+	if err := p.PublishShardStatus(ctx, dsn, g, 3, "rs-shard-0-rw:5432"); err != nil {
+		t.Fatal(err)
+	}
+	first := shardStatusUpdatedAt(t, conn, g)
+
+	// Three more identical passes, as a healthy cluster would do.
+	for i := 0; i < 3; i++ {
+		if err := p.PublishShardStatus(ctx, dsn, g, 3, "rs-shard-0-rw:5432"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if again := shardStatusUpdatedAt(t, conn, g); !again.Equal(first) {
+		t.Fatalf("an unchanged reconcile rewrote the row (updated_at %s -> %s), firing a serving notification and a full reload on every watcher", first, again)
+	}
+
+	// A real change must still land.
+	if err := p.PublishShardStatus(ctx, dsn, g, 4, "rs-shard-0-rw:5432"); err != nil {
+		t.Fatal(err)
+	}
+	afterEpoch := shardStatusUpdatedAt(t, conn, g)
+	if afterEpoch.Equal(first) {
+		t.Fatal("an epoch change did not update the row")
+	}
+	if err := p.PublishShardStatus(ctx, dsn, g, 4, "rs-shard-0-other:5432"); err != nil {
+		t.Fatal(err)
+	}
+	if shardStatusUpdatedAt(t, conn, g).Equal(afterEpoch) {
+		t.Fatal("an endpoint change did not update the row")
+	}
+}
+
+func shardStatusUpdatedAt(t *testing.T, conn *pgx.Conn, g Group) time.Time {
+	t.Helper()
+	var at time.Time
+	if err := conn.QueryRow(context.Background(),
+		`SELECT updated_at FROM pgshard.shard_status WHERE shard_set = $1 AND shard_id = $2`,
+		g.ShardSet(), g.ShardID).Scan(&at); err != nil {
+		t.Fatal(err)
+	}
+	return at
+}
