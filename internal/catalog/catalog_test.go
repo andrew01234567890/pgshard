@@ -780,6 +780,36 @@ func runSuite(t *testing.T, img pgImage) {
 			})
 		})
 
+		// A reconcile pass covers every shard set in one transaction, so
+		// waiting on a held row lock holds up work unrelated to the set being
+		// locked.
+		t.Run("locking_ranges_is_bounded", func(t *testing.T) {
+			holder := connect(t, dsn)
+			held, err := holder.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = held.Rollback(ctx) }()
+			mustTx(t, held, `UPDATE pgshard.shard_ranges SET updated_at = now() WHERE shard_set = 'default'`)
+
+			waiter := connect(t, dsn)
+			wtx, err := waiter.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = wtx.Rollback(ctx) }()
+
+			started := time.Now()
+			err = LockShardRangesOf(ctx, wtx, "default")
+			if err == nil {
+				t.Fatal("locking ranges another transaction holds succeeded")
+			}
+			expectPgError(t, err, "55P03", "")
+			if elapsed := time.Since(started); elapsed > 30*time.Second {
+				t.Fatalf("waited %s for a lock that must be bounded", elapsed)
+			}
+		})
+
 		t.Run("negative_shard_id_rejected", func(t *testing.T) {
 			_, err := conn.Exec(ctx, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES ('neg', -1, '[,)')`)
 			expectPgError(t, err, "23514", "shard_id")
