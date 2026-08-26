@@ -98,6 +98,7 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 		}}
 	if lease != nil {
 		probes.KubeReachable = lease.Reachable
+		probes.LeaseStale = lease.Stale
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/", probes.Handler())

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -29,6 +30,9 @@ type Lease struct {
 	retry    time.Duration
 	log      *slog.Logger
 	now      func() time.Time
+
+	mu       sync.Mutex
+	acquired time.Time
 }
 
 // NewLease builds a Lease client from the in-cluster config; it returns
@@ -73,6 +77,9 @@ func (l *Lease) Acquire(ctx context.Context) error {
 	// genuinely someone else is reported as ErrLeaseHeld.
 	for attempt := 0; ; attempt++ {
 		err := l.acquireOnce(ctx)
+		if err == nil {
+			l.markAcquired()
+		}
 		if err == nil || !errors.Is(err, errLeaseConflict) || attempt >= 1 {
 			if errors.Is(err, errLeaseConflict) {
 				return fmt.Errorf("lease update conflicted twice: %w", err)
@@ -134,6 +141,26 @@ func (l *Lease) spec(base *coordinationv1.Lease) *coordinationv1.Lease {
 	out.Spec.LeaseDurationSeconds = ptr.To(int32(l.duration.Seconds()))
 	out.Spec.RenewTime = &now
 	return out
+}
+
+func (l *Lease) markAcquired() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.acquired = l.now()
+}
+
+// Stale reports whether the lease has not been renewed within its duration.
+// The self-fence on losing a lease runs inside Hold's goroutine, so a process
+// that is frozen or wedged never reaches it and keeps its PostgreSQL child
+// writable. Reporting staleness here lets the liveness probe fail instead,
+// which puts the deadline in the kubelet's hands rather than the agent's.
+func (l *Lease) Stale() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.acquired.IsZero() {
+		return false
+	}
+	return l.now().Sub(l.acquired) > l.duration
 }
 
 // Hold renews the lease every renew interval until ctx ends. It returns a
