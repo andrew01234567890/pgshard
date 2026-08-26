@@ -84,6 +84,10 @@ var ErrOverCommitted = errors.New("pgtune: memory budget over-committed")
 // ErrUnsafeOverride reports an override that would weaken durability or security.
 var ErrUnsafeOverride = errors.New("pgtune: unsafe override")
 
+// syncWorkersPerSub bounds the table-sync workers one subscription may take,
+// so a single subscription cannot starve the others of the shared pool.
+const syncWorkersPerSub = 2
+
 // Derive computes the ordered settings for in or returns an error when the
 // input is invalid, an override is unsafe, or the memory budget cannot hold.
 func Derive(in Input) (Settings, error) {
@@ -170,7 +174,8 @@ func Derive(in Input) (Settings, error) {
 	}
 	add("autovacuum_naptime", "15s", "wake often so small hot tables are vacuumed promptly")
 
-	add("max_worker_processes", itoa(max64(8, cpu*2)), "max(8, cpu×2): room for parallel workers, logical workers and extensions")
+	add("max_worker_processes", itoa(max64(max64(8, cpu*2), int64(in.LogicalSlots)*(1+syncWorkersPerSub)+12)),
+		"max(8, cpu×2) but never below the logical replication workers plus room for parallel workers and extensions")
 	add("max_parallel_workers", itoa(cpu), "one parallel worker per core")
 	switch in.Profile {
 	case ProfileAnalytics:
@@ -203,6 +208,18 @@ func Derive(in Input) (Settings, error) {
 	must("max_prepared_transactions", itoa(maxConns), "one prepared transaction per connection for two-phase commit")
 	must("synchronous_commit", "on", "durability floor; the agent raises it via synchronous_standby_names")
 	must("track_commit_timestamp", "on", "commit timestamps are needed for conflict resolution")
+	// A reshard target subscribes to every source it takes range from, and
+	// each subscription holds an apply worker for as long as it exists.
+	// Table sync needs a worker on top of that, from the same pool. A merge
+	// is where this bites: N sources into one target means N apply workers,
+	// so with PostgreSQL's default of 4 the apply workers alone can exhaust
+	// the pool and no table ever finishes its initial sync -- the copy stops
+	// with no error, no lag and no retry. A split has one subscription per
+	// target and so never noticed.
+	logicalWorkers := max64(8, slots*(1+syncWorkersPerSub)+4)
+	add("max_sync_workers_per_subscription", itoa(syncWorkersPerSub), "bounded so one subscription cannot take the whole worker pool")
+	add("max_logical_replication_workers", itoa(logicalWorkers),
+		fmt.Sprintf("%d subscriptions x (1 apply + %d sync) + 4 headroom", slots, syncWorkersPerSub))
 	must("max_slot_wal_keep_size", human(slotKeep), slotReason)
 	must("idle_replication_slot_timeout", "24h", "drop abandoned slots before they fill the disk")
 	must("password_encryption", "scram-sha-256", "no md5 passwords")
