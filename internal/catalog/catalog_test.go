@@ -1134,7 +1134,7 @@ func runSuite(t *testing.T, img pgImage) {
 			t.Fatal(err)
 		}
 		ranges, _ := placement.Split(4)
-		if err := MaterializeShardSet(ctx, tx, "g7", 7, ShardSetDesired, ranges); err != nil {
+		if err := MaterializeShardSet(ctx, tx, "g7", 7, ShardSetDesired, ranges, 0); err != nil {
 			t.Fatal(err)
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -1151,7 +1151,7 @@ func runSuite(t *testing.T, img pgImage) {
 			t.Fatalf("RangeSet: %v", got)
 		}
 		tx, _ = conn.Begin(ctx)
-		if err := MaterializeShardSet(ctx, tx, "g7", 7, ShardSetDesired, ranges); err == nil {
+		if err := MaterializeShardSet(ctx, tx, "g7", 7, ShardSetDesired, ranges, 0); err == nil {
 			t.Fatal("materializing an existing set must fail")
 		}
 		_ = tx.Rollback(ctx)
