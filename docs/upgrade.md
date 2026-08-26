@@ -140,9 +140,10 @@ retirement returns serving to the old groups, the re-run completes, and
 the catalog group follows onto 19 behind the stable Service — plus
 `TestUpgrade18To19ChaosControllerAndPrimaryKill`, which kills the
 controller mid-copy and the promoted primary after the switch and asserts
-convergence. The `reshard-scale` suite runs the 1 → 2 → 4 → 2 reshard
-under the same ledger oracle. Both run on a single small shard to stay
-inside the runner budget.
+convergence. The `reshard-split` and `reshard-merge` suites each run one
+reshard under the same ledger oracle — growing a cluster and shrinking one
+— in separate jobs, so each transition gets a budget it can finish in.
+All run on small clusters to stay inside the runner budget.
 
 ## After the upgrade
 
