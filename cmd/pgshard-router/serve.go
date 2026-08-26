@@ -292,6 +292,9 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		fmt.Fprintf(stdout, "pgshard-router serve: pprof on %s\n", pa)
 	}
 	drainer := router.NewDrainer(srv, *drainDelay, *drain)
+	// A router with no catalog snapshot stamps every request with generation
+	// zero and has each one refused, so it must not be sent traffic.
+	drainer.Routable = func() bool { return w.Current() != nil }
 	if *healthListen != "" {
 		hl, err := net.Listen(listenNetwork(*healthListen), *healthListen)
 		if err != nil {

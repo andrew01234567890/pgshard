@@ -50,6 +50,11 @@ type Drainer struct {
 	delay   time.Duration
 	timeout time.Duration
 	state   atomic.Int32
+	// Routable reports whether the router can actually route: it has a
+	// catalog snapshot. Without one every statement is refused for a stale
+	// generation, so reporting ready would have Kubernetes send traffic
+	// here that cannot be served. Nil means the check does not apply.
+	Routable func() bool
 	// sleep is replaceable so tests need no wall clock.
 	sleep func(ctx context.Context, d time.Duration)
 }
@@ -75,7 +80,12 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 func (d *Drainer) State() DrainState { return DrainState(d.state.Load()) }
 
 // Ready reports whether new connections should be sent here.
-func (d *Drainer) Ready() bool { return d.State() == DrainServing }
+func (d *Drainer) Ready() bool {
+	if d.State() != DrainServing {
+		return false
+	}
+	return d.Routable == nil || d.Routable()
+}
 
 // Drain runs the sequence once; ctx cancellation skips the delay but the
 // session drain still gets its full timeout. It returns Shutdown's error.
@@ -103,6 +113,10 @@ func (d *Drainer) Handler() http.Handler {
 			return
 		}
 		w.WriteHeader(http.StatusServiceUnavailable)
+		if d.State() == DrainServing {
+			_, _ = w.Write([]byte("no catalog snapshot\n"))
+			return
+		}
 		_, _ = w.Write([]byte(d.State().String() + "\n"))
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
