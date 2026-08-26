@@ -356,6 +356,23 @@ func digest(ctx context.Context, conn ShardConn, schema, name, filter string) (r
 	return pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[rowDigest])
 }
 
+// verifyDetail explains a mismatch. The prediction is the sources restricted to
+// one target's range, while got is everything that target holds, so the two can
+// differ either because the target carries rows that are not its own or because
+// the two sides disagree about the range they share. inRange, the target
+// measured inside its own range, separates them.
+func verifyDetail(got, want, inRange rowDigest) string {
+	foreign := got.Rows - inRange.Rows
+	switch {
+	case inRange == want:
+		return fmt.Sprintf("; within its range the target matches, so the difference is %d row(s) it holds outside its range", foreign)
+	case foreign != 0:
+		return fmt.Sprintf("; within its range the target has %d rows hash %d, and holds %d row(s) outside its range", inRange.Rows, inRange.Hash, foreign)
+	default:
+		return "; every row the target holds is within its range, so the two sides disagree about that range"
+	}
+}
+
 // Verify compares, per table and target, what the sources predict for the
 // target's ranges with what the target holds. It runs under the fence
 // after the targets caught up, so both sides are still.
@@ -438,7 +455,7 @@ func (o *pgCutover) Verify(ctx context.Context) (VerifyReport, error) {
 				return report, fmt.Errorf("verify %s on %s/%d: %w", db.name, o.srcSet, s, err)
 			}
 		}
-		for _, t := range o.wf.ids {
+		for i, t := range o.wf.ids {
 			conn, err := o.c.Shards.DialDatabase(ctx, o.wf.set, t, db.name)
 			if err != nil {
 				return report, err
@@ -457,8 +474,22 @@ func (o *pgCutover) Verify(ctx context.Context) (VerifyReport, error) {
 					report.Tables++
 					report.Rows += got.Rows
 					if got != want {
-						report.Mismatches = append(report.Mismatches, fmt.Sprintf("%s.%s on %s/%d: %d rows hash %d, sources predict %d rows hash %d",
-							db.name, key, o.wf.set, t, got.Rows, got.Hash, want.Rows, want.Hash))
+						// The prediction is the sources restricted to this
+						// target's range, while the count above is everything
+						// the target holds. Measuring the target inside its own
+						// range too separates a target carrying rows that are
+						// not its own from the two sides genuinely disagreeing
+						// about the range they share.
+						detail := ""
+						if hashes[key] != "" {
+							inRange, err := digest(ctx, conn, schema, name, RangeFilter(hashes[key], o.wf.ranges[i]))
+							if err != nil {
+								return err
+							}
+							detail = verifyDetail(got, want, inRange)
+						}
+						report.Mismatches = append(report.Mismatches, fmt.Sprintf("%s.%s on %s/%d: %d rows hash %d, sources predict %d rows hash %d%s",
+							db.name, key, o.wf.set, t, got.Rows, got.Hash, want.Rows, want.Hash, detail))
 					}
 				}
 				return nil
