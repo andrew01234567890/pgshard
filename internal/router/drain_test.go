@@ -127,3 +127,30 @@ func TestDrainerHandler(t *testing.T) {
 		t.Fatalf("readyz after drain: %d %q", code, body)
 	}
 }
+
+// TestReadyRequiresACatalogSnapshot guards a router that reports ready while it
+// cannot route. With no snapshot every request carries generation zero and the
+// pooler refuses it, so Kubernetes must be told to keep traffic away rather
+// than sent statements that are certain to fail.
+func TestReadyRequiresACatalogSnapshot(t *testing.T) {
+	d := NewDrainer(&fakeListener{}, 0, 0)
+	if !d.Ready() {
+		t.Fatal("a serving drainer with no Routable check must be ready")
+	}
+
+	routable := false
+	d.Routable = func() bool { return routable }
+	if d.Ready() {
+		t.Error("a router with no catalog snapshot must not be ready")
+	}
+	routable = true
+	if !d.Ready() {
+		t.Error("a router that has loaded a snapshot must be ready")
+	}
+
+	// Draining still wins: a snapshot does not make a draining router ready.
+	d.state.Store(int32(DrainDraining))
+	if d.Ready() {
+		t.Error("a draining router must not be ready whatever its snapshot")
+	}
+}

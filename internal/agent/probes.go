@@ -34,6 +34,14 @@ type Probes struct {
 	Client        *http.Client
 	// Fenced is called when a primary decides it is isolated.
 	Fenced func()
+	// LeaseStale reports whether the primary's lease has gone unrenewed for
+	// longer than its duration. Losing a lease is meant to fence the primary,
+	// but that runs inside the agent's own renew goroutine, so an agent that
+	// is frozen or wedged never gets there and keeps PostgreSQL writable while
+	// the operator promotes someone else. Failing liveness instead hands the
+	// deadline to the kubelet, which is outside anything the agent controls.
+	// Nil when the agent holds no lease.
+	LeaseStale func() bool
 	// IsolationGrace is how long a primary must stay isolated (kube API and
 	// every peer unreachable on consecutive probes) before it fences; a
 	// single slow probe under load must not take the primary down. Zero
@@ -126,6 +134,9 @@ func (p *Probes) isolatedLongEnough(isolated bool) bool {
 func (p *Probes) Live(ctx context.Context) error {
 	if !p.Health.IsPrimary() {
 		return nil
+	}
+	if p.LeaseStale != nil && p.LeaseStale() {
+		return errors.New("primary lease not renewed within its duration")
 	}
 	if p.KubeReachable != nil {
 		if p.KubeReachable(ctx) {

@@ -149,3 +149,60 @@ func newWorkflowID(t *testing.T, conn *pgx.Conn) string {
 	t.Helper()
 	return queryOne[string](t, conn, `SELECT gen_random_uuid()::text`)
 }
+
+// TestUnwindLiftsTheFenceWithoutTheTargets guards the undo a cancelled cutover
+// needs. Complete requires the targets, and a cancelled reshard is usually one
+// whose targets have been deleted, so cancelling past the fence used to drop
+// the forward replication and leave the source write-fenced with no workflow
+// left to lift it.
+func TestUnwindLiftsTheFenceWithoutTheTargets(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	dsn := startPostgres(t)
+	conn := connect(t, dsn)
+	if err := catalog.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	rs, _ := placement.Split(2)
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.MaterializeShardSet(ctx, tx, "default", 1, catalog.ShardSetServing, rs); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch)
+		VALUES ('default', 0, 'shard0', 'serving', 1), ('default', 1, 'shard1', 'serving', 1)`)
+	mustExec(t, conn, `INSERT INTO pgshard.databases (name) VALUES ('app')`)
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	id := newWorkflowID(t, conn)
+	// No dbs and no reachable sources: Unwind must still do the catalog half,
+	// which is the half that strands a cluster.
+	o := &pgCutover{c: &Copier{Pool: pool}, wf: &copyWorkflow{id: id, set: "g2"}, srcSet: "default"}
+
+	if err := o.Fence(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, `INSERT INTO pgshard.workflow_locks (kind, key, workflow_id) VALUES ('table', 'app.public.ledger', $1::uuid)`, id)
+	if n := queryOne[int64](t, conn, `SELECT count(*) FROM pgshard.shard_status WHERE migrating`); n != 2 {
+		t.Fatalf("the fence must be raised before the undo means anything: %d", n)
+	}
+
+	if err := o.Unwind(ctx); err != nil {
+		t.Fatalf("unwind: %v", err)
+	}
+	if n := queryOne[int64](t, conn, `SELECT count(*) FROM pgshard.shard_status WHERE migrating`); n != 0 {
+		t.Errorf("%d shard(s) left write-fenced after the cutover was undone", n)
+	}
+	if n := queryOne[int64](t, conn, `SELECT count(*) FROM pgshard.workflow_locks WHERE workflow_id = $1::uuid`, id); n != 0 {
+		t.Errorf("%d lock row(s) left after the cutover was undone", n)
+	}
+}

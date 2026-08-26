@@ -482,6 +482,12 @@ func TestReshardCopyOnPostgres(t *testing.T) {
 			t.Errorf("target %d subscriptions left: %d", tid, n)
 		}
 	}
+	// This cancel happens at stage switching but before the fence step ran,
+	// so there is nothing fenced to undo here; the undo itself is covered by
+	// TestUnwindLiftsTheFenceWithoutTheTargets, which raises a real fence.
+	if n := queryOne[int64](t, f.catalog, `SELECT count(*) FROM pgshard.shard_status WHERE migrating`); n != 0 {
+		t.Errorf("%d shard(s) left write-fenced by a cancelled cutover", n)
+	}
 	if out := f.pass(); out.Driven != 0 {
 		t.Fatalf("cancelled workflow driven again: %+v", out)
 	}
