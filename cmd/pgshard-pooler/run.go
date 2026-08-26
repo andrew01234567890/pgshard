@@ -46,7 +46,7 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	pgHost := fs.String("pg-host", "127.0.0.1", "PostgreSQL host")
 	pgPort := fs.Int("pg-port", 5432, "PostgreSQL port")
 	database := fs.String("pg-database", "postgres", "default PostgreSQL database for sessions that do not name one")
-	pgSSLMode := fs.String("pg-sslmode", "disable", "TLS to PostgreSQL over TCP: disable, require or verify-full (unix sockets are never upgraded)")
+	pgSSLMode := fs.String("pg-sslmode", "disable", "TLS to PostgreSQL over TCP: disable, require (encrypts but does not authenticate the server), or verify-full (encrypts and authenticates); unix sockets are never upgraded")
 	pgSSLRootCert := fs.String("pg-sslrootcert", "", "CA bundle the PostgreSQL server certificate must chain to (verify-full)")
 	certFile := fs.String("tls-cert", "", "server certificate for the gRPC listener (mTLS)")
 	keyFile := fs.String("tls-key", "", "server private key")
