@@ -128,3 +128,29 @@ jobs:
             echo "::error::PR title must follow Conventional Commits: type(scope)?: description"
             exit 1
           fi
+
+  gate:
+    name: CI gate
+    # One required check that cannot pass while any job above it failed or was
+    # skipped. Requiring the jobs individually meant a new one -- proto drift
+    # was the example -- stayed advisory until somebody remembered to add its
+    # name to branch protection.
+    needs: [go, proto, govulncheck, secret-scan, actionlint, pr-title]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check that every required job succeeded
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$RESULTS"
+          failed=$(echo "$RESULTS" | jq -r 'to_entries
+            | map(select(.value.result != "success"
+                         and not (.key == "pr-title" and .value.result == "skipped")))
+            | map("\(.key)=\(.value.result)") | join(" ")')
+          if [ -n "$failed" ]; then
+            echo "::error::required jobs did not succeed: $failed"
+            exit 1
+          fi
+          echo "all required jobs succeeded"
