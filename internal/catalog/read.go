@@ -109,16 +109,36 @@ func ListTables(ctx context.Context, q Querier, database string) ([]Table, error
 	return pgx.CollectRows(rows, pgx.RowToStructByPos[Table])
 }
 
+// ShardRangeLockTimeout bounds how long a caller waits for the shard ranges it
+// is about to snapshot. A reconcile pass covers every shard set in one
+// transaction, so blocking here holds up work unrelated to the set being
+// locked; failing the pass and retrying on the next tick is cheaper than
+// waiting out whoever holds the rows.
+const ShardRangeLockTimeout = "5s"
+
 // LockShardRangesOf share-locks the ranges of the named shard sets until the
-// transaction ends, taking them in name order so concurrent callers cannot
-// deadlock. A caller about to create a workflow that will own these sets needs
-// this: without it a concurrent edit can commit between the read and the
-// workflow insert, and the ownership trigger, which only sees the workflow once
-// it is committed, would let that edit through and freeze the divergence in.
+// transaction ends. A caller about to create a workflow that will own these
+// sets needs this: without it a concurrent edit can commit between the read and
+// the workflow insert, and the ownership trigger, which only sees the workflow
+// once it is committed, would let that edit through and freeze the divergence
+// in.
+//
+// The sets are locked in name order, so two callers of this function cannot
+// deadlock against each other. That is not a guarantee against every writer: a
+// transaction that edits two shard sets in the opposite order can still form a
+// cycle, which PostgreSQL breaks by aborting one side. The caller retries on a
+// later pass, so the invariant holds either way.
 func LockShardRangesOf(ctx context.Context, tx pgx.Tx, shardSets ...string) error {
 	names := slices.Clone(shardSets)
 	slices.Sort(names)
-	for _, name := range slices.Compact(names) {
+	names = slices.Compact(names)
+	if len(names) == 0 {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '`+ShardRangeLockTimeout+`'`); err != nil {
+		return err
+	}
+	for _, name := range names {
 		if name == "" {
 			continue
 		}

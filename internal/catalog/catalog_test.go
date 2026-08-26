@@ -813,6 +813,36 @@ func runSuite(t *testing.T, img pgImage) {
 			})
 		})
 
+		// A reconcile pass covers every shard set in one transaction, so
+		// waiting on a held row lock holds up work unrelated to the set being
+		// locked.
+		t.Run("locking_ranges_is_bounded", func(t *testing.T) {
+			holder := connect(t, dsn)
+			held, err := holder.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = held.Rollback(ctx) }()
+			mustTx(t, held, `UPDATE pgshard.shard_ranges SET updated_at = now() WHERE shard_set = 'default'`)
+
+			waiter := connect(t, dsn)
+			wtx, err := waiter.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = wtx.Rollback(ctx) }()
+
+			started := time.Now()
+			err = LockShardRangesOf(ctx, wtx, "default")
+			if err == nil {
+				t.Fatal("locking ranges another transaction holds succeeded")
+			}
+			expectPgError(t, err, "55P03", "")
+			if elapsed := time.Since(started); elapsed > 30*time.Second {
+				t.Fatalf("waited %s for a lock that must be bounded", elapsed)
+			}
+		})
+
 		// Row-level constraint triggers do not fire on TRUNCATE, so it would
 		// empty the shard map past every check that guards it.
 		t.Run("truncate_refused", func(t *testing.T) {
