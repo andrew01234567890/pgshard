@@ -283,3 +283,49 @@ func TestCollectSequencesHeadroomOnPostgres(t *testing.T) {
 		t.Fatal("nextval past the clamped bigint maximum must error, not hand out a duplicate")
 	}
 }
+
+// TestUpgradeRollbackRefusesAfterSchemaDrift: logical replication carries no
+// DDL, so an ALTER applied after the switch reaches only the set that is
+// serving. Rolling back to a source that never received it either fails on
+// reverse apply or silently drops the change, and rollback checked only
+// LSNs and sequence positions, so it did neither visibly.
+func TestUpgradeRollbackRefusesAfterSchemaDrift(t *testing.T) {
+	parallelPG(t)
+	f := newUpgradeFixture(t)
+	id := f.startWorkflowKind(KindUpgrade)
+
+	deadline := time.Now().Add(4 * time.Minute)
+	var state, stage, msg string
+	for {
+		f.pass()
+		state, stage, msg = f.workflow(id)
+		if stage == StageSwitched || state == StateFailed || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if stage != StageSwitched {
+		t.Fatalf("upgrade did not switch: %s %s %q", state, stage, msg)
+	}
+
+	for sid := range 2 {
+		c := connect(t, f.appDSN("g2", int32(sid)))
+		mustExec(t, c, `ALTER TABLE orders ADD COLUMN priority integer NOT NULL DEFAULT 0`)
+	}
+
+	mustExec(t, f.catalog, `UPDATE pgshard.workflows SET spec = spec || '{"rollback": true}' WHERE id = $1::uuid`, id)
+	for range 8 {
+		f.pass()
+		state, stage, msg = f.workflow(id)
+		if stage == StageRolledBack {
+			t.Fatalf("rollback completed onto a source that never received the ALTER: %s %s", state, stage)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !strings.Contains(msg, "schema changed since the switch") {
+		t.Fatalf("rollback did not report the drift: %s %s %q", state, stage, msg)
+	}
+	if set := queryOne[string](t, f.catalog, `SELECT shard_set FROM pgshard.shard_sets WHERE state = 'serving'`); set != "g2" {
+		t.Fatalf("serving set moved to %s despite the refusal", set)
+	}
+}
