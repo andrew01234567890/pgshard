@@ -194,6 +194,23 @@ func seedLedgerTable(ctx context.Context, t *testing.T, c *e2e.Cluster) {
 	}
 	catalogSQL(ctx, t, c, "INSERT INTO pgshard.databases (name, default_placement, home_shard) VALUES ('"+appDatabase+"', 'unsharded', 0)")
 	catalogSQL(ctx, t, c, "INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('"+appDatabase+"', 'public', 'ledger', 'sharded', 'tenant_id')")
+	registerLedgerRole(ctx, t, c)
+}
+
+// waitForLedgerRole waits until the role the workload writes as has reached
+// every group. Writing before it has is indistinguishable from the router
+// refusing the role outright, and the difference matters.
+func waitForLedgerRole(ctx context.Context, t *testing.T, c *e2e.Cluster) {
+	t.Helper()
+	waitForWhy(ctx, t, c, "ledger role applied on every group", 3*time.Minute, func() string {
+		return "\nrole state: " + catalogSQL(ctx, t, c,
+			"SELECT coalesce(string_agg(group_name || '=' || roles_generation, ', ' ORDER BY group_name), 'no rows') FROM pgshard.role_group_status") +
+			"\ndesired: " + catalogSQL(ctx, t, c, "SELECT coalesce(max(desired_generation)::text, 'none') FROM pgshard.roles")
+	}, func() bool {
+		return catalogSQL(ctx, t, c, `SELECT count(*) = 0 FROM pgshard.role_group_status
+			WHERE roles_generation < (SELECT max(desired_generation) FROM pgshard.roles)`) == "t" &&
+			catalogSQL(ctx, t, c, "SELECT count(*) > 0 FROM pgshard.role_group_status") == "t"
+	})
 }
 
 func reshardTo(ctx context.Context, t *testing.T, c *e2e.Cluster, major string, shards int, generation int64) {
@@ -271,6 +288,8 @@ func TestReshard1To2To4To2UnderLoad(t *testing.T) {
 	waitFor(ctx, t, c, "serving shard set materialized", 2*time.Minute, func() bool {
 		return jsonpath(ctx, c, "pgshardcluster", clusterName, "{.status.effectiveShards}") == "1"
 	})
+
+	waitForLedgerRole(ctx, t, c)
 
 	l := startScaleLedger(ctx, c)
 	waitForWhy(ctx, t, c, "first acknowledged ledger writes", 3*time.Minute, l.why, func() bool {
