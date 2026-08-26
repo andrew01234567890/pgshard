@@ -423,3 +423,61 @@ func TestRewriteRefusesDependentColumnOnPostgres(t *testing.T) {
 		t.Fatalf("artifacts left behind: %v", left)
 	}
 }
+
+// TestRewriteBackfillBatchesWithoutASinglePrimaryKey: only tables with a
+// single-column primary key were batched. Everything else -- composite keys,
+// and tables with no primary key at all -- fell through to one unbounded
+// UPDATE of the whole table, which is the opposite of what an online rewrite
+// is for: unbounded WAL, row locks held for the length of the rewrite, and a
+// cancellation that has to roll all of it back.
+func TestRewriteBackfillBatchesWithoutASinglePrimaryKey(t *testing.T) {
+	parallelPG(t)
+	pool, a, store := rewritePGFixture(t)
+	ctx := context.Background()
+	// A composite primary key: the single-column keyset path cannot apply.
+	mustExecSQL(t, pool, `CREATE TABLE ledger (tenant_id bigint NOT NULL, id bigint NOT NULL, amount text NOT NULL DEFAULT '0', PRIMARY KEY (tenant_id, id))`)
+	mustExecSQL(t, pool, `ALTER TABLE ledger OWNER TO appowner`)
+	mustExecSQL(t, pool, `INSERT INTO ledger (tenant_id, id, amount) SELECT g % 7, g, g::text FROM generate_series(1, `+fmt.Sprint(rewriteRows)+`) g`)
+
+	m := catalog.DDLMigration{ID: "10000000-0000-0000-0000-0000000000c1", Database: "postgres",
+		Statement: "alter table ledger alter column amount type bigint using amount::bigint",
+		Kind:      "ALTER TABLE", Strategy: catalog.StrategyRewrite, Scope: "all", State: catalog.MigrationQueued,
+		Meta: catalog.MigrationMeta{RunAs: "appowner", Rewrite: &catalog.RewriteChange{Schema: "public", Table: "ledger",
+			Column: "amount", NewType: "bigint", Using: "amount::bigint", BatchSize: 100}}}
+	store.migrations = []catalog.DDLMigration{m}
+
+	if _, err := a.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got := store.get(t, m.ID)
+	if got.State != catalog.MigrationComplete {
+		t.Fatalf("state %s: %s", got.State, got.Error)
+	}
+
+	var typ string
+	if err := pool.QueryRow(ctx, `SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a
+		WHERE a.attrelid = 'public.ledger'::regclass AND a.attname = 'amount'`).Scan(&typ); err != nil {
+		t.Fatal(err)
+	}
+	if typ != "bigint" {
+		t.Fatalf("column type %q after the rewrite, want bigint", typ)
+	}
+	var wrong int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM ledger WHERE amount <> id`).Scan(&wrong); err != nil {
+		t.Fatal(err)
+	}
+	if wrong != 0 {
+		t.Fatalf("%d rows did not carry their value across the rewrite", wrong)
+	}
+	// The end state is identical either way, so correctness alone does not
+	// show the backfill was batched. Each committed batch stamps its rows
+	// with its own transaction id, so a single unbounded UPDATE leaves every
+	// row sharing one xmin and batching leaves many.
+	var versions int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM (SELECT DISTINCT xmin::text FROM ledger) v`).Scan(&versions); err != nil {
+		t.Fatal(err)
+	}
+	if versions < 2 {
+		t.Fatalf("every row shares one transaction id: the backfill ran as a single unbounded UPDATE of all %d rows", rewriteRows)
+	}
+}

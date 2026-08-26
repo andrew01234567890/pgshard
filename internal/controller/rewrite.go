@@ -315,9 +315,10 @@ func backfillExpr(rw *catalog.RewriteChange) string {
 	return rw.Using
 }
 
-// backfill converts existing rows in batches: keyset-paginated over a
-// single-column primary key when the table has one, LIMIT-batched by the
-// remaining-rows predicate otherwise, one committed batch at a time.
+// backfill converts existing rows in batches, one committed batch at a
+// time: keyset-paginated over a single-column primary key when the table
+// has one, ctid-batched otherwise. Both loops stop only when a probe finds
+// no remaining row, and both refuse to spin when the minimum stops moving.
 func (a *Applier) backfill(ctx context.Context, conn ShardConn, rw *catalog.RewriteChange, mid string) error {
 	table := qualified(rw.Schema, rw.Table)
 	hidden := rw.HiddenColumn(mid)
@@ -372,8 +373,37 @@ func (a *Applier) backfill(ctx context.Context, conn ShardConn, rw *catalog.Rewr
 			lastMin, haveMin = minKey, true
 		}
 	}
-	_, err = conn.Exec(ctx, "UPDATE "+table+" SET "+set+" WHERE "+pred)
-	return err
+	// No single-column primary key: batch on ctid instead. The predicate
+	// itself shrinks as rows are converted, so this needs no stable cursor
+	// -- only a bound on how much one transaction rewrites. A composite or
+	// missing primary key is the common case for the tables most worth
+	// batching, so leaving this as one statement made the online path
+	// unavailable precisely where it mattered.
+	sql := "WITH batch AS (SELECT ctid FROM " + table + " WHERE " + pred +
+		" ORDER BY ctid LIMIT " + fmt.Sprint(batch) + ")" +
+		" UPDATE " + table + " t SET " + set + " FROM batch WHERE t.ctid = batch.ctid"
+	probe := "SELECT ctid::text FROM " + table + " WHERE " + pred + " ORDER BY ctid LIMIT 1"
+	lastMin, haveMin := "", false
+	for {
+		if _, err := conn.Exec(ctx, sql); err != nil {
+			return err
+		}
+		rows, err := conn.Query(ctx, probe)
+		if err != nil {
+			return err
+		}
+		mins, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return err
+		}
+		if len(mins) == 0 {
+			return nil
+		}
+		if haveMin && mins[0] == lastMin {
+			return fmt.Errorf("backfill of %s is not converging: rows keep matching %q after being updated (a volatile DEFAULT returning NULL or an unstable USING expression cannot be backfilled); fix the expression and run the migration again", table, pred)
+		}
+		lastMin, haveMin = mins[0], true
+	}
 }
 
 // cutover swaps the working column in for the old one in one transaction
