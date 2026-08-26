@@ -29,6 +29,8 @@ type Reconciler struct {
 	OnResult func(Result)
 	// OnLeader, when set, observes leadership changes.
 	OnLeader func(leader bool)
+	// Now is the clock; nil means time.Now.
+	Now func() time.Time
 }
 
 func (r *Reconciler) settings() (int64, time.Duration, time.Duration, *slog.Logger) {
@@ -50,16 +52,37 @@ func (r *Reconciler) settings() (int64, time.Duration, time.Duration, *slog.Logg
 
 var errNotLeader = errors.New("controller: leader lock held elsewhere")
 
+// leaderWaitLogInterval is how often a controller that cannot take leadership
+// says so. Silence here is indistinguishable from a controller that is working,
+// which has cost real time: a run was read as a stalled reshard when the
+// controller had simply not been leader for the whole window.
+const leaderWaitLogInterval = time.Minute
+
 // Run tries to become leader and reconciles until ctx is done. A lost
-// connection drops leadership; Run then campaigns again.
+// connection drops leadership; Run then campaigns again, saying so
+// periodically rather than waiting in silence.
 func (r *Reconciler) Run(ctx context.Context) error {
 	_, _, retry, logger := r.settings()
+	var waitingSince time.Time
+	var nextWaitLog time.Time
 	for {
 		err := r.lead(ctx)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if !errors.Is(err, errNotLeader) {
+		switch {
+		case errors.Is(err, errNotLeader):
+			now := r.now()
+			if waitingSince.IsZero() {
+				waitingSince, nextWaitLog = now, now
+			}
+			if !now.Before(nextWaitLog) {
+				logger.Info("another controller holds leadership; waiting",
+					"waiting", now.Sub(waitingSince).Round(time.Second))
+				nextWaitLog = now.Add(leaderWaitLogInterval)
+			}
+		default:
+			waitingSince, nextWaitLog = time.Time{}, time.Time{}
 			logger.Warn("controller leadership ended", "err", err)
 		}
 		select {
@@ -68,6 +91,13 @@ func (r *Reconciler) Run(ctx context.Context) error {
 		case <-time.After(retry):
 		}
 	}
+}
+
+func (r *Reconciler) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
 }
 
 func (r *Reconciler) lead(ctx context.Context) error {
