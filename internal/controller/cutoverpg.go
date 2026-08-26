@@ -853,6 +853,33 @@ func (o *pgCutover) Release(ctx context.Context) error {
 	return tx.Commit(ctx)
 }
 
+// Unwind undoes what a started cutover left on the SOURCES, and nothing else:
+// it lifts this workflow's write fence, clears its lock rows, and drops the
+// reverse subscriptions it created. It never touches the targets, so it works
+// when they are gone -- which is exactly when it is needed, because Complete
+// requires them and a cancelled reshard is usually one whose targets have been
+// deleted. Sources that are themselves unreachable are skipped, as Complete
+// does: their objects went with them.
+func (o *pgCutover) Unwind(ctx context.Context) error {
+	for _, db := range o.dbs {
+		for _, s := range o.srcIDs {
+			conn, err := o.c.Shards.DialDatabase(ctx, o.srcSet, s, db.name)
+			if err != nil {
+				o.c.logger().Info("reshard cancel: source unreachable, skipping its reverse subscriptions", "workflow", o.wf.id, "source", s, "err", err)
+				continue
+			}
+			err = dropSubscriptionsLike(ctx, conn, o.reversePattern(s))
+			_ = conn.Close(ctx)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	// Last, so a failure above leaves the fence in place rather than opening
+	// writes onto a source whose reverse replication is still attached.
+	return o.Release(ctx)
+}
+
 // Complete drops the reverse subscriptions on the sources, the reverse
 // slots and publications on the targets, the frozen forward subscriptions
 // on the targets and the forward slots and publications on the sources, and
