@@ -12,6 +12,8 @@ runs the checker against the fixtures under `hack/testdata`.
 | `images.yml` | builds the PostgreSQL 18 and 19 images with `docker buildx bake` and pushes them to GHCR on `main` |
 | `e2e-kind.yml` | kind-based smoke, operator, backup and reshard suites for both majors, plus upgrade, reshard-split and reshard-merge on pg18 |
 | `perf.yml` | benchstat comparison against the base branch; only benchmarks tagged `Gate` can fail a PR (see `hack/perf/gate.sh`) |
+| `repeat.yml` | manual: repeats one Go package up to 50 times and reports the pass rate |
+| `repeat-e2e.yml` | manual: repeats one kind e2e suite up to 12 times, against an optional `ref`, and reports the pass rate |
 | `chaos.yml` | Chaos Mesh experiments (`test/chaos`) |
 | `dependency-review.yml`, `dependabot-automerge.yml` | dependency hygiene |
 
@@ -35,6 +37,19 @@ works anonymously. The catalog integration test then runs against the project
 images for both majors; set `PGSHARD_REQUIRE_PROJECT_IMAGES=1` (planned for
 `ci.yml` after the bootstrap) to fail instead of falling back to Docker Hub
 `postgres:*` tags when a project image is missing.
+
+## Measuring a flake
+
+A test is not flaky until a rate says so, and not fixed until the same run
+says so again: one green run proves nothing about a test that fails one time
+in five. `repeat.yml` repeats a Go package (up to 50 runs); `repeat-e2e.yml`
+repeats one kind e2e suite (up to 12, because each run builds images and
+stands up its own cluster). `repeat-e2e.yml` takes a `ref`, so a suspect
+branch can be compared against `main` on the same suite.
+
+Twelve runs bounds a failure rate at roughly one in twelve. It cannot see a
+rarer flake, so a green twelve is not evidence of zero — the run summary says
+so, and neither number should be reported as more than it is.
 
 ## Required checks
 
