@@ -810,6 +810,20 @@ func runSuite(t *testing.T, img pgImage) {
 			}
 		})
 
+		// Row-level constraint triggers do not fire on TRUNCATE, so it would
+		// empty the shard map past every check that guards it.
+		t.Run("truncate_refused", func(t *testing.T) {
+			for _, table := range []string{"pgshard.shard_ranges", "pgshard.shard_sets"} {
+				t.Run(table, func(t *testing.T) {
+					_, err := conn.Exec(ctx, `TRUNCATE `+table)
+					if err == nil {
+						t.Fatalf("TRUNCATE %s emptied the shard map with no validation", table)
+					}
+					expectPgError(t, err, "0A000", "not supported")
+				})
+			}
+		})
+
 		t.Run("negative_shard_id_rejected", func(t *testing.T) {
 			_, err := conn.Exec(ctx, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES ('neg', -1, '[,)')`)
 			expectPgError(t, err, "23514", "shard_id")
