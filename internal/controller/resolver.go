@@ -337,8 +337,10 @@ func (r *Resolver) listShards(ctx context.Context, shardSet string) ([]ShardRef,
 	return refs, nil
 }
 
-// Run resolves every interval until ctx ends.
-func (r *Resolver) Run(ctx context.Context, interval time.Duration) {
+// Run resolves in-doubt transactions on every tick while this replica is
+// the leader. Only the leader may: a pass commits and rolls back prepared
+// transactions on every group.
+func (r *Resolver) Run(ctx context.Context, interval time.Duration, leader func() bool) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -346,6 +348,9 @@ func (r *Resolver) Run(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+		}
+		if leader != nil && !leader() {
+			continue
 		}
 		out, err := r.Resolve(ctx, "")
 		if err != nil && r.Logger != nil {

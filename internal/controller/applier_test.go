@@ -114,6 +114,19 @@ func (s *memStore) get(t *testing.T, id string) catalog.DDLMigration {
 	return catalog.DDLMigration{}
 }
 
+func (s *memStore) put(t *testing.T, m catalog.DDLMigration) {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.migrations {
+		if s.migrations[i].ID == m.ID {
+			s.migrations[i] = cloneMigration(m)
+			return
+		}
+	}
+	t.Fatalf("migration %s missing", m.ID)
+}
+
 // fakeShards scripts every shard: exec decides the outcome of a statement,
 // exists answers object checks, invalid answers invalid-index checks.
 type fakeShards struct {
@@ -164,8 +177,9 @@ func (f *fakeShards) DialDatabase(_ context.Context, set string, id int32, _ str
 	return &fakeConn{f: f, id: id, superuser: true}, nil
 }
 
-func (f *fakeShards) DialDatabaseAs(_ context.Context, _ string, id int32, db, user, password string) (ShardConn, error) {
+func (f *fakeShards) DialDatabaseAs(_ context.Context, set string, id int32, db, user, password string) (ShardConn, error) {
 	f.mu.Lock()
+	f.dialed = append(f.dialed, set)
 	f.dbs[id] = append(f.dbs[id], db)
 	f.logins[id] = append(f.logins[id], user+"/"+password)
 	f.mu.Unlock()
@@ -1225,6 +1239,116 @@ func TestApplierFollowsTheServingShardSetAfterACutover(t *testing.T) {
 	for _, ran := range f.shards.dialed {
 		if ran != "g2" {
 			t.Fatalf("migration applied to shard set %q, want the serving set g2", ran)
+		}
+	}
+}
+
+// TestApplierRefusesToResumeAPartlyAppliedMigrationOnAnotherShardSet: the
+// per_shard keys are bare shard ids, so resuming a half-applied migration
+// against a set promoted since it started reads shard 0's progress as if it
+// belonged to the new set's shard 0 - a different database, which then
+// never receives the statement.
+func TestApplierRefusesToResumeAPartlyAppliedMigrationOnAnotherShardSet(t *testing.T) {
+	f := newApplierFixture(t)
+	f.store.shards = []int32{0, 1}
+
+	id := f.queue(catalog.DDLMigration{Statement: "create table t (id int)", Kind: "CREATE TABLE", Scope: "all"})
+	f.run(t)
+	if m := f.store.get(t, id); m.State != catalog.MigrationComplete {
+		t.Fatalf("setup: state %s: %s", m.State, m.Error)
+	}
+
+	m := f.store.get(t, id)
+	if m.Meta.ShardSet != "default" {
+		t.Fatalf("the migration did not pin the set it ran against: %q", m.Meta.ShardSet)
+	}
+	m.State, m.Error = catalog.MigrationRunning, ""
+	m.PerShard["1"] = catalog.ShardMigration{State: catalog.ShardPending}
+	f.store.put(t, m)
+
+	f.store.serving = "g2"
+	f.shards.dialed = nil
+	f.run(t)
+
+	got := f.store.get(t, id)
+	if got.State != catalog.MigrationFailed {
+		t.Fatalf("state %s, want failed: a migration that straddled a cutover was resumed", got.State)
+	}
+	if !strings.Contains(got.Error, "default") || !strings.Contains(got.Error, "g2") {
+		t.Fatalf("error does not name both sets: %q", got.Error)
+	}
+	for _, ran := range f.shards.dialed {
+		if ran == "g2" {
+			t.Fatal("the remaining shard was applied against the newly serving set")
+		}
+	}
+}
+
+// TestApplierReplansAnUntouchedMigrationOntoTheServingSet: a migration that
+// was planned but has not run anywhere yet has nothing to misread, so a
+// cutover should move it rather than fail it.
+func TestApplierReplansAnUntouchedMigrationOntoTheServingSet(t *testing.T) {
+	f := newApplierFixture(t)
+	f.store.shards = []int32{0, 1}
+
+	id := f.queue(catalog.DDLMigration{Statement: "create table t (id int)", Kind: "CREATE TABLE", Scope: "all"})
+	f.run(t)
+	m := f.store.get(t, id)
+	m.State, m.Error = catalog.MigrationRunning, ""
+	for k := range m.PerShard {
+		m.PerShard[k] = catalog.ShardMigration{State: catalog.ShardPending}
+	}
+	f.store.put(t, m)
+
+	f.store.serving = "g2"
+	f.shards.dialed = nil
+	f.run(t)
+
+	got := f.store.get(t, id)
+	if got.State != catalog.MigrationComplete {
+		t.Fatalf("state %s: %s", got.State, got.Error)
+	}
+	if got.Meta.ShardSet != "g2" {
+		t.Fatalf("replanned migration pinned %q, want g2", got.Meta.ShardSet)
+	}
+	if len(f.shards.dialed) == 0 {
+		t.Fatal("the replanned migration reached no shard set")
+	}
+	for _, ran := range f.shards.dialed {
+		if ran != "g2" {
+			t.Fatalf("replanned migration applied to %q, want g2", ran)
+		}
+	}
+}
+
+// TestApplierKeepsThePinnedSetWhenACutoverLandsMidMigration: the set was
+// re-resolved for every shard's connection, so a cutover between two shards
+// of the same migration sent the rest of them at the newly promoted set
+// while their per-shard progress still described the old one.
+func TestApplierKeepsThePinnedSetWhenACutoverLandsMidMigration(t *testing.T) {
+	f := newApplierFixture(t)
+	f.store.shards = []int32{0, 1, 2}
+	f.shards.exec = func(shard int32, _ string) error {
+		if shard == 0 {
+			f.store.mu.Lock()
+			f.store.serving = "g2"
+			f.store.mu.Unlock()
+		}
+		return nil
+	}
+
+	id := f.queue(catalog.DDLMigration{Statement: "create table t (id int)", Kind: "CREATE TABLE", Scope: "all"})
+	f.run(t)
+
+	if m := f.store.get(t, id); m.State != catalog.MigrationComplete {
+		t.Fatalf("state %s: %s", m.State, m.Error)
+	}
+	if len(f.shards.dialed) == 0 {
+		t.Fatal("the migration reached no shard set")
+	}
+	for _, ran := range f.shards.dialed {
+		if ran != "default" {
+			t.Fatalf("a shard was applied to %q after a mid-migration cutover; the migration was planned against default", ran)
 		}
 	}
 }

@@ -21,7 +21,14 @@
   the forwarded ServerKey; an `AuthenticationOk` without it (trust or
   password authentication in `pg_hba.conf`) is refused. TCP backends can be
   upgraded to TLS with `--pg-sslmode require|verify-full` (the latter with
-  `--pg-sslrootcert`); unix sockets are never upgraded.
+  `--pg-sslrootcert`); unix sockets are never upgraded. `require` follows
+  libpq's definition: it encrypts the connection but does not authenticate
+  the server, so it does not prevent a man in the middle between the pooler
+  and PostgreSQL. `verify-full` is the setting that authenticates, checking
+  the chain against `--pg-sslrootcert` and the host name, and refusing to
+  start without a root certificate. This choice only arises for a TCP
+  backend: the operator's rendered pods reach PostgreSQL over a unix socket
+  in the same pod, and the flag defaults to `disable`.
 - **Regular vs reserved.** By default a backend is held only from the first
   message of a batch until PostgreSQL reports `ReadyForQuery` with status
   `I`; a transaction (`T`/`E`) keeps it. `Reserve` pins the session's backend

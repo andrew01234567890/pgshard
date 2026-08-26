@@ -227,14 +227,22 @@ func reshardTo(ctx context.Context, t *testing.T, c *e2e.Cluster, major string, 
 		t.Fatal(err)
 	}
 	set := fmt.Sprintf("g%d", generation)
-	waitFor(ctx, t, c, fmt.Sprintf("reshard to %d shards switched", shards), 35*time.Minute, func() bool {
+	// A workflow that has failed is reported below; one that is merely stuck
+	// reported nothing at all, which is the state this wait times out in.
+	switchState := func() string {
+		return "\nworkflow: " + catalogSQL(ctx, t, c,
+			"SELECT coalesce(string_agg(state || ' stage=' || coalesce(status->>'stage', '') || ' step=' || coalesce(status->'cutover'->>'step', '') || ' attempts=' || coalesce(status->'cutover'->>'attempts', '0') || ' aborts=' || coalesce(status->'cutover'->'aborts'->>-1, 'none') || ' msg=' || coalesce(status->>'message', ''), '; '), 'none') FROM pgshard.workflows WHERE spec->>'shard_set' = '"+set+"'") +
+			"\nserving: " + catalogSQL(ctx, t, c, "SELECT coalesce(string_agg(shard_set, ','), 'none') FROM pgshard.serving") +
+			"\nfenced: " + catalogSQL(ctx, t, c, "SELECT coalesce(string_agg(shard_set || '/' || shard_id, ',' ORDER BY shard_set, shard_id), 'none') FROM pgshard.shard_status WHERE migrating")
+	}
+	waitForWhy(ctx, t, c, fmt.Sprintf("reshard to %d shards switched", shards), 35*time.Minute, switchState, func() bool {
 		st := catalogSQL(ctx, t, c, "SELECT coalesce(string_agg(state || ':' || (status->>'stage'), ','), '') FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = '"+set+"'")
 		if strings.HasPrefix(st, "failed") {
 			t.Fatalf("reshard to %s failed: %s", set, catalogSQL(ctx, t, c, "SELECT coalesce(error, '') || ' ' || status::text FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = '"+set+"'"))
 		}
 		return catalogSQL(ctx, t, c, "SELECT string_agg(shard_set, ',') FROM pgshard.serving") == set
 	})
-	waitFor(ctx, t, c, fmt.Sprintf("reshard to %d shards completed", shards), 25*time.Minute, func() bool {
+	waitForWhy(ctx, t, c, fmt.Sprintf("reshard to %d shards completed", shards), 25*time.Minute, switchState, func() bool {
 		st := catalogSQL(ctx, t, c, "SELECT coalesce(string_agg(state || ':' || (status->>'stage'), ','), '') FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = '"+set+"'")
 		return strings.HasPrefix(st, "completed:") &&
 			jsonpath(ctx, c, "pgshardcluster", clusterName, "{.status.effectiveShards}") == fmt.Sprint(shards)

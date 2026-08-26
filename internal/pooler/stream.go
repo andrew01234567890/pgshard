@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"sync/atomic"
 	"time"
 
@@ -63,8 +64,22 @@ func (s *Server) streamDefaults() StreamConfig {
 	return c
 }
 
+// slotNameRE is PostgreSQL's own rule for a replication slot name: lower
+// case letters, digits and underscores. The name cannot be parameterised --
+// START_REPLICATION is a replication-protocol command built as text on a
+// superuser connection -- so a caller-supplied one is checked against the
+// charset rather than escaped.
+var slotNameRE = regexp.MustCompile(`^[a-z0-9_]{1,63}$`)
+
+// optionKeyRE bounds a pgoutput option name for the same reason: the key
+// half of an option is rendered literally, only the value is quoted.
+var optionKeyRE = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
+
 func (s *Server) slotOf(slot, stream string) (string, error) {
 	if slot != "" {
+		if !slotNameRE.MatchString(slot) {
+			return "", status.Errorf(codes.InvalidArgument, "slot name must match [a-z0-9_] and be at most 63 characters")
+		}
 		return slot, nil
 	}
 	if !catalog.ValidStreamName(stream) {
@@ -192,6 +207,9 @@ func (s *Server) runStream(ctx context.Context, req *pgshardv1.StreamRequest, em
 	}
 	options := map[string]string{}
 	for k, v := range req.GetOptions() {
+		if !optionKeyRE.MatchString(k) {
+			return status.Errorf(codes.InvalidArgument, "option name %q must match [a-z0-9_] and start with a letter or underscore", k)
+		}
 		options[k] = v
 	}
 	options["proto_version"] = "4"

@@ -2,6 +2,7 @@ package pooler
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -220,5 +221,43 @@ func TestAckClampsToDelivered(t *testing.T) {
 	}
 	if got := r.acked.Load(); got != 250 {
 		t.Fatalf("acked %d, want 250", got)
+	}
+}
+
+// TestStreamRejectsUnsafeSlotAndOptionNames: START_REPLICATION is a
+// replication-protocol command built as text on the pooler's superuser
+// connection, and neither the slot name nor an option's key can be sent as
+// a parameter. slotOf returned a caller-supplied slot verbatim and the
+// option key half was rendered literally while only the value was quoted,
+// so both were a route into that query.
+func TestStreamRejectsUnsafeSlotAndOptionNames(t *testing.T) {
+	s := NewServer(Config{Source: NewStaticSource(View{})})
+	for _, slot := range []string{
+		"has space", "UPPER", "has-dash", "quote'", "semi;colon", "paren)", "back\\slash", "new\nline", "",
+	} {
+		if slot == "" {
+			continue
+		}
+		if _, err := s.slotOf(slot, ""); status.Code(err) != codes.InvalidArgument {
+			t.Errorf("slot %q was accepted: %v", slot, err)
+		}
+	}
+	for _, slot := range []string{"pgshard_orders_shard0", "a", "s_1", strings.Repeat("a", 63)} {
+		if got, err := s.slotOf(slot, ""); err != nil || got != slot {
+			t.Errorf("slot %q was rejected: %v", slot, err)
+		}
+	}
+	if _, err := s.slotOf(strings.Repeat("a", 64), ""); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("a 64-character slot name was accepted: %v", err)
+	}
+	for _, key := range []string{"has space", "UPPER", "1leading", "quote'", "paren)", "comma,"} {
+		if optionKeyRE.MatchString(key) {
+			t.Errorf("option key %q was accepted", key)
+		}
+	}
+	for _, key := range []string{"proto_version", "publication_names", "streaming", "messages", "_x"} {
+		if !optionKeyRE.MatchString(key) {
+			t.Errorf("option key %q was rejected; the pgoutput options pgshard itself sets must pass", key)
+		}
 	}
 }
