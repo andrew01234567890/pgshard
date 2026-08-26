@@ -346,6 +346,30 @@ func (PgxProber) ReshardWorkflow(ctx context.Context, dsn, shardSet string) (Wor
 	return w, err
 }
 
+// CertifiedBarrier reports whether a restore point of that name exists and
+// was certified. A barrier attempt that created the physical restore point
+// on every group and then failed certification leaves a name that restores
+// cleanly with no error, landing the cluster on a point recorded as NOT
+// two-phase-consistent -- so this has to be asked of the live source before
+// the restore, never of the restored catalog afterwards: certified is
+// WAL-logged after the catalog group's own restore point, so a catalog
+// recovered to that name always reads back uncertified, even for a good
+// barrier.
+func (PgxProber) CertifiedBarrier(ctx context.Context, dsn, name string) (bool, error) {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	var certified bool
+	err = conn.QueryRow(ctx, `SELECT certified FROM pgshard.restore_points
+		WHERE name = $1 ORDER BY created_at DESC LIMIT 1`, name).Scan(&certified)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return certified, err
+}
+
 // SetShardSetMajor stamps the PostgreSQL major of one shard set.
 func (PgxProber) SetShardSetMajor(ctx context.Context, dsn, name string, major int) error {
 	conn, err := pgx.Connect(ctx, dsn)

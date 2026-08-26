@@ -354,3 +354,68 @@ func TestCrashLoopReason(t *testing.T) {
 		t.Fatal("only the postgres container counts")
 	}
 }
+
+// fakeCertifier answers the barrier certification question without a catalog.
+type fakeCertifier struct {
+	certified bool
+	err       error
+	asked     string
+}
+
+func (f *fakeCertifier) CertifiedBarrier(_ context.Context, _, name string) (bool, error) {
+	f.asked = name
+	return f.certified, f.err
+}
+
+// TestRestoreRefusesAnUncertifiedBarrier: a barrier attempt that created the
+// physical restore point on every group and then failed certification leaves
+// a name that restores cleanly on every group with no error, landing the
+// cluster on a point explicitly recorded as not two-phase-consistent. The
+// restore checked only that the CRD field was set, while isBarrierRestore's
+// own comment claimed it "targets a certified barrier".
+func TestRestoreRefusesAnUncertifiedBarrier(t *testing.T) {
+	source := boundCluster("old")
+	one := 1
+	source.Spec.Shards = &one
+	barrier := "nightly-2026"
+	rs := newRestore("r1", pgshardv1alpha1.PgShardRestoreSpec{ClusterName: "old", NewClusterName: "new",
+		BackupID: "b1", Target: pgshardv1alpha1.RestoreTarget{Barrier: &barrier}})
+	cl := restoreClient(t, source, newPolicy(), completedBackup("b1", "old"), rs, superuserSecret("old"))
+	cert := &fakeCertifier{certified: false}
+	r := &RestoreReconciler{Client: cl, Agents: newFakeAgents(nil), Barriers: cert,
+		Now: func() time.Time { return time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC) }}
+
+	_, got := reconcileRestore(t, r, "r1")
+	if got.Status.Phase != pgshardv1alpha1.RestorePhaseFailed {
+		t.Fatalf("phase %s: an uncertified barrier was accepted", got.Status.Phase)
+	}
+	if !strings.Contains(got.Status.Error, "not certified") {
+		t.Fatalf("message %q does not say the barrier was uncertified", got.Status.Error)
+	}
+	if cert.asked != BarrierRestorePoint(barrier) {
+		t.Fatalf("asked about %q, want the restore point name %q", cert.asked, BarrierRestorePoint(barrier))
+	}
+	// The cluster must not exist: the point of the check is to refuse before
+	// any group is created.
+	var created pgshardv1alpha1.PgShardCluster
+	if err := cl.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "new"}, &created); err == nil {
+		t.Fatal("the restore created a cluster despite refusing the barrier")
+	}
+}
+
+func TestRestoreAcceptsACertifiedBarrier(t *testing.T) {
+	source := boundCluster("old")
+	one := 1
+	source.Spec.Shards = &one
+	barrier := "nightly-2026"
+	rs := newRestore("r1", pgshardv1alpha1.PgShardRestoreSpec{ClusterName: "old", NewClusterName: "new",
+		BackupID: "b1", Target: pgshardv1alpha1.RestoreTarget{Barrier: &barrier}})
+	cl := restoreClient(t, source, newPolicy(), completedBackup("b1", "old"), rs, superuserSecret("old"))
+	r := &RestoreReconciler{Client: cl, Agents: newFakeAgents(nil), Barriers: &fakeCertifier{certified: true},
+		Now: func() time.Time { return time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC) }}
+
+	_, got := reconcileRestore(t, r, "r1")
+	if got.Status.Phase == pgshardv1alpha1.RestorePhaseFailed {
+		t.Fatalf("a certified barrier was refused: %s", got.Status.Error)
+	}
+}

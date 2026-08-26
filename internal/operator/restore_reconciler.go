@@ -37,7 +37,15 @@ type RestoreReconciler struct {
 	// TwoPC finishes prepared transactions and lifts the write fence after a
 	// barrier restore; nil fails barrier restores with a clear reason.
 	TwoPC TwoPCAgentClient
-	Now   func() time.Time
+	// Barriers answers whether a named barrier was certified, asked of the
+	// live source cluster before the restore starts. nil skips the check.
+	Barriers BarrierCertifier
+	Now      func() time.Time
+}
+
+// BarrierCertifier reports whether a barrier of that name was certified.
+type BarrierCertifier interface {
+	CertifiedBarrier(ctx context.Context, dsn, name string) (bool, error)
 }
 
 // SetupWithManager registers the reconciler; clusters created by a restore
@@ -179,6 +187,20 @@ func (r *RestoreReconciler) create(ctx context.Context, rs *pgshardv1alpha1.PgSh
 	}
 	if got, want := len(Groups(newCluster)), len(Groups(&source)); got != want || spec.PostgreSQL.Major != source.Spec.PostgreSQL.Major {
 		return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("the new cluster must keep the source's %d groups and PostgreSQL %d", want, source.Spec.PostgreSQL.Major))
+	}
+	// A barrier that failed certification still left its physical restore
+	// point on every group, so restoring to it succeeds and silently lands
+	// the cluster on a point that is not two-phase-consistent. Ask the live
+	// source, which is the only place the answer is knowable.
+	if rs.Spec.Target.Barrier != nil && r.Barriers != nil {
+		name := *rs.Spec.Target.Barrier
+		ok, cerr := r.Barriers.CertifiedBarrier(ctx, CatalogDSN(&source), BarrierRestorePoint(name))
+		if cerr != nil {
+			return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("cannot confirm barrier %q is certified on %s: %v", name, source.Name, cerr))
+		}
+		if !ok {
+			return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("barrier %q is not certified on %s; restoring to it would land on a point that is not two-phase consistent", name, source.Name))
+		}
 	}
 	src := RestoreSource{
 		SourceCluster: source.Name, Major: source.Spec.PostgreSQL.Major, Restore: rs.Name, BackupIDs: ids,
