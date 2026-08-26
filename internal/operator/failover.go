@@ -317,6 +317,54 @@ func (r *ClusterReconciler) memberEndpoint(c *pgshardv1alpha1.PgShardCluster, g 
 
 func agentAddr(ip string) string { return fmt.Sprintf("%s:%d", ip, agentGRPCPort) }
 
+// fencePod deletes the old primary's Pod and waits for it to be gone, so a
+// primary that is alive but unreachable cannot keep writing while a successor
+// is promoted. A Pod that is already absent needs nothing. This is not
+// positive fencing under every failure: a node that is up but partitioned from
+// the API server will not act on the delete, which is why the agent also has a
+// watchdog whose deadline the kubelet enforces.
+func (r *ClusterReconciler) fencePod(ctx context.Context, m *memberInfo) error {
+	if m == nil || m.pod == nil {
+		return nil
+	}
+	if err := r.Delete(ctx, m.pod, client.GracePeriodSeconds(0)); client.IgnoreNotFound(err) != nil {
+		return err
+	}
+	deadline := r.now().Add(r.podFenceTimeout())
+	for {
+		var pod corev1.Pod
+		err := r.Get(ctx, client.ObjectKeyFromObject(m.pod), &pod)
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if pod.UID != m.pod.UID {
+			// Replaced already, so the one that was primary is gone.
+			return nil
+		}
+		if r.now().After(deadline) {
+			return fmt.Errorf("pod %s still present after %s", m.pod.Name, r.podFenceTimeout())
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(r.pollInterval()):
+		}
+	}
+}
+
+// DefaultPodFenceTimeout bounds the wait for the old primary's Pod to go.
+const DefaultPodFenceTimeout = 60 * time.Second
+
+func (r *ClusterReconciler) podFenceTimeout() time.Duration {
+	if r.PodFenceTimeout > 0 {
+		return r.PodFenceTimeout
+	}
+	return DefaultPodFenceTimeout
+}
+
 func (r *ClusterReconciler) patchRole(ctx context.Context, pod *corev1.Pod, role string) error {
 	if pod == nil || pod.Labels[LabelRole] == role {
 		return nil
@@ -371,6 +419,16 @@ func (r *ClusterReconciler) failover(ctx context.Context, c *pgshardv1alpha1.PgS
 		if st, err := r.Agents.Status(ctx, agentAddr(m.ip)); err == nil {
 			candEpoch = st.Epoch
 		}
+	}
+	// quiesce treats an agent it cannot reach as gone, because an unreachable
+	// agent is the common case in a failover and waiting for one that will
+	// never answer would make every partition an outage. That leaves the old
+	// primary possibly alive and writable. Remove its Pod before publishing a
+	// new epoch, so a primary the operator cannot talk to is still stopped by
+	// the kubelet rather than assumed stopped.
+	if err := r.fencePod(ctx, members[old]); err != nil {
+		log.Info("cannot fence the old primary; not promoting", "old", old, "err", err)
+		return state, errors.Join(fmt.Errorf("fencing %s: %w", old, err), r.releaseLease(ctx, c, g))
 	}
 	epoch := nextEpoch(state.epoch, candEpoch)
 	if err := r.publishFence(ctx, c, g, old, candidate, epoch, password); err != nil {
