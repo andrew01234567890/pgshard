@@ -21,12 +21,38 @@ Resharding is declared, not scripted:
 BEGIN;
 UPDATE pgshard.shard_ranges SET range = int8range(NULL, 0)
  WHERE shard_set = 'default' AND shard_id = 0;
-INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range)
- VALUES ('default', 2, int8range(0, 4611686018427387904));
-UPDATE pgshard.shard_ranges SET range = int8range(4611686018427387904, NULL)
+UPDATE pgshard.shard_ranges SET range = int8range(0, 4611686018427387904)
  WHERE shard_set = 'default' AND shard_id = 1;
+INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range)
+ VALUES ('default', 2, int8range(4611686018427387904, NULL));
 COMMIT;
 ```
+
+A shard set must number its shards `0..N-1` in key order: the shard owning the
+lowest range is shard 0, the next is shard 1, and so on. Routing addresses a
+shard by its range's position, so a set numbered any other way would be served
+under different IDs than it declares; the catalog refuses it at `COMMIT`. The
+checks are deferred, so a split or merge may renumber freely inside the
+transaction as long as the committed state satisfies the rule.
+
+Ranges belong to a reshard or upgrade once it is under way. While such a
+workflow is provisioning, running or paused, the catalog refuses to change the
+ranges of either the set it is building or the set it is copying from: the
+workflow snapshots the target's ranges when it starts, and every cutover pass
+rebuilds the source's shard IDs from live rows, so reshaping either would leave
+the run addressing shards that no longer exist. The freeze outlasts the cutover,
+because a set is already `serving` while its workflow still holds the reverse
+subscription open for the rollback window.
+
+Dropping a whole set stays allowed — that is how a cancelled reshard clears its
+target — but only as a whole. The rules live on `pgshard.shard_ranges`, so
+deleting a set's row on its own commits; what is refused is editing the ranges
+it left behind.
+
+A workflow that never started owns nothing, so a set with only such a workflow
+against it stays editable. That covers one still `pending`, and one paused
+before it started — pausing records the state to resume into, and a workflow
+that would resume to `pending` has not begun.
 
 - **Re-key a table**: change `placement` or `shard_key` in
   `pgshard.tables` for a table that already has an effective placement.

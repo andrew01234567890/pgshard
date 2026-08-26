@@ -86,17 +86,23 @@ func reconcileReshards(ctx context.Context, tx pgx.Tx, res *Result) error {
 			if _, ok := wfBySet[ss.Name]; ok {
 				continue
 			}
+			source, err := catalog.ServingShardSet(ctx, tx)
+			if err != nil {
+				return err
+			}
+			// The workflow will own both sets, so both have to be locked
+			// before it is inserted, in a fixed order so two reconcilers
+			// cannot deadlock against each other.
+			if err := catalog.LockShardRangesOf(ctx, tx, ss.Name, source); err != nil {
+				return err
+			}
 			ranges, err := catalog.ListShardRanges(ctx, tx, ss.Name)
 			if err != nil {
 				return err
 			}
-			if err := catalog.RangeSet(ranges).Validate(); err != nil {
+			if err := catalog.ValidateShardRanges(ranges); err != nil {
 				res.Invalid = append(res.Invalid, fmt.Sprintf("shard set %s: %v", ss.Name, err))
 				continue
-			}
-			source, err := catalog.ServingShardSet(ctx, tx)
-			if err != nil {
-				return err
 			}
 			kind := KindReshard
 			spec := map[string]any{"shard_set": ss.Name, "generation": ss.Generation, "desired_generation": ss.DesiredGeneration, "ranges": specRanges(ranges), "source_set": source}

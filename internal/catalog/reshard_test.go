@@ -59,3 +59,27 @@ func TestRangeSetRoundTripsSplit(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateShardRangesRequiresKeyOrdinals(t *testing.T) {
+	zero, hundred := int64(0), int64(100)
+	dense := []ShardRange{
+		{ShardID: 0, Upper: &zero},
+		{ShardID: 1, Lower: &zero, Upper: &hundred},
+		{ShardID: 2, Lower: &hundred},
+	}
+	if err := ValidateShardRanges(dense); err != nil {
+		t.Fatalf("dense IDs rejected: %v", err)
+	}
+
+	sparse := append([]ShardRange(nil), dense...)
+	sparse[1].ShardID = 20
+	if err := ValidateShardRanges(sparse); err == nil {
+		t.Fatal("shard IDs that routing would renumber were accepted")
+	}
+
+	swapped := append([]ShardRange(nil), dense...)
+	swapped[0].ShardID, swapped[2].ShardID = 2, 0
+	if err := ValidateShardRanges(swapped); err == nil {
+		t.Fatal("shard IDs out of key order were accepted")
+	}
+}

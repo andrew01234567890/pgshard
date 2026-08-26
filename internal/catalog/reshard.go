@@ -69,6 +69,21 @@ func Int8Range(r placement.Range) string {
 	return "[" + lo + "," + hi + ")"
 }
 
+// ValidateShardRanges checks the key-space coverage and the rule that routing
+// depends on: shard IDs are the position of their range in key order, because
+// RangeSet is positional and drops the IDs.
+func ValidateShardRanges(ranges []ShardRange) error {
+	if err := RangeSet(ranges).Validate(); err != nil {
+		return err
+	}
+	for i, r := range ranges {
+		if int(r.ShardID) != i {
+			return fmt.Errorf("shard IDs must be 0..N-1 in key order: position %d holds shard %d", i, r.ShardID)
+		}
+	}
+	return nil
+}
+
 // RangeSet converts catalog rows (sorted by key space) to placement ranges.
 func RangeSet(ranges []ShardRange) placement.RangeSet {
 	out := make(placement.RangeSet, 0, len(ranges))
