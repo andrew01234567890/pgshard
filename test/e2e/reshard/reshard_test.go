@@ -156,6 +156,21 @@ spec:
 }
 
 // shardSQL runs sql on the primary of one shard group's app database.
+// routerSQL runs one statement against the app database through the router,
+// which is how a client reaches the cluster: it routes by shard key and it
+// honours the write fence a cutover raises. Reaching a group's PostgreSQL
+// Service directly, as shardSQL does, bypasses both.
+func routerSQL(ctx context.Context, c *e2e.Cluster, sql string) (string, error) {
+	out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "exec", clientPod, "--",
+		"env", "PGPASSWORD="+ledgerPassword,
+		// Verbose so a refusal carries its DETAIL: the fencing errors name the
+		// generation the request carried and the one the pooler holds, and
+		// without them a refusal says only that something was stale.
+		"psql", "-h", clusterName+"-router", "-U", ledgerRole, "-d", appDatabase,
+		"-v", "ON_ERROR_STOP=1", "-v", "VERBOSITY=verbose", "-tAc", sql)
+	return strings.TrimSpace(out), err
+}
+
 func shardSQL(ctx context.Context, c *e2e.Cluster, group, sql string) (string, error) {
 	out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "exec", clientPod, "--",
 		"psql", "-h", clusterName+"-"+group+"-rw", "-U", "postgres", "-d", appDatabase, "-v", "ON_ERROR_STOP=1", "-tAc", sql)
@@ -163,6 +178,41 @@ func shardSQL(ctx context.Context, c *e2e.Cluster, group, sql string) (string, e
 }
 
 const appDatabase = "app"
+
+// ledgerRole is the login the scale suite writes as. The router terminates
+// SCRAM against the verifiers in pgshard.roles, so the workload cannot connect
+// as the superuser: it exists in every PostgreSQL instance but was never
+// created through pgshard and so has no mirrored verifier.
+const (
+	ledgerRole     = "ledger_writer"
+	ledgerPassword = "ledger-writer-password"
+)
+
+// registerLedgerRole gives the workload a role the router will accept. The
+// verifier has to come from PostgreSQL, which has no function to derive one, so
+// the role is created on the catalog to have its rolpassword read back and then
+// registered as desired state for the applier to fan out to every group --
+// including the reshard targets provisioned later.
+func registerLedgerRole(ctx context.Context, t *testing.T, c *e2e.Cluster) {
+	t.Helper()
+	if _, err := psql(ctx, c, clusterName+"-catalog-rw",
+		"SET password_encryption = 'scram-sha-256'; CREATE ROLE "+ledgerRole+" LOGIN PASSWORD '"+ledgerPassword+"'"); err != nil {
+		t.Fatal(err)
+	}
+	verifier, err := psql(ctx, c, clusterName+"-catalog-rw",
+		"SELECT rolpassword FROM pg_authid WHERE rolname = '"+ledgerRole+"'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(verifier, "SCRAM-SHA-256$") {
+		t.Fatalf("verifier for %s is not SCRAM: %q", ledgerRole, verifier)
+	}
+	catalogSQL(ctx, t, c, "INSERT INTO pgshard.roles (rolname, verifier, login) VALUES ('"+ledgerRole+"', '"+verifier+"', true)")
+	catalogSQL(ctx, t, c, "INSERT INTO pgshard.grants (rolname, database, object_kind, object_schema, object_name, privileges) VALUES "+
+		"('"+ledgerRole+"', '"+appDatabase+"', 'database', '', '"+appDatabase+"', ARRAY['CONNECT']), "+
+		"('"+ledgerRole+"', '"+appDatabase+"', 'schema', '', 'public', ARRAY['USAGE']), "+
+		"('"+ledgerRole+"', '"+appDatabase+"', 'table', 'public', 'ledger', ARRAY['SELECT','INSERT'])")
+}
 
 // seedApp creates the app database with a sharded, a reference and an
 // unsharded table on shard 0 and registers them in the catalog.

@@ -35,7 +35,7 @@ func TestFlipRefusesAnObsoleteSourceOnPostgres(t *testing.T) {
 		gen   int64
 		state string
 	}{{"default", 1, catalog.ShardSetServing}, {"g2", 2, catalog.ShardSetProvisioning}} {
-		if err := catalog.MaterializeShardSet(ctx, tx, s.name, s.gen, s.state, rs); err != nil {
+		if err := catalog.MaterializeShardSet(ctx, tx, s.name, s.gen, s.state, rs, 0); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -102,7 +102,7 @@ func TestCutoverFenceIsNotAnotherWorkflowsToLiftOnPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := catalog.MaterializeShardSet(ctx, tx, "default", 1, catalog.ShardSetServing, rs); err != nil {
+	if err := catalog.MaterializeShardSet(ctx, tx, "default", 1, catalog.ShardSetServing, rs, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -168,7 +168,7 @@ func TestUnwindLiftsTheFenceWithoutTheTargets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := catalog.MaterializeShardSet(ctx, tx, "default", 1, catalog.ShardSetServing, rs); err != nil {
+	if err := catalog.MaterializeShardSet(ctx, tx, "default", 1, catalog.ShardSetServing, rs, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(ctx); err != nil {

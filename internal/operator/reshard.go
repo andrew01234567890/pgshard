@@ -98,7 +98,7 @@ func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1al
 		if serving != nil {
 			gen = serving.Generation
 		}
-		if err := r.Prober.MaterializeShardSet(ctx, dsn, catalog.ShardSetName(gen), gen, catalog.ShardSetServing, ranges); err != nil {
+		if err := r.Prober.MaterializeShardSet(ctx, dsn, catalog.ShardSetName(gen), gen, catalog.ShardSetServing, ranges, c.Spec.PostgreSQL.Major); err != nil {
 			return plan, fmt.Errorf("materialize serving shard set: %w", err)
 		}
 		if err := r.Prober.SetShardSetMajor(ctx, dsn, catalog.ShardSetName(gen), c.Spec.PostgreSQL.Major); err != nil {
@@ -127,7 +127,7 @@ func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1al
 			return plan, err
 		}
 		name := catalog.ShardSetName(gen)
-		if err := r.Prober.MaterializeShardSet(ctx, dsn, name, gen, catalog.ShardSetDesired, ranges); err != nil {
+		if err := r.Prober.MaterializeShardSet(ctx, dsn, name, gen, catalog.ShardSetDesired, ranges, serving.PGMajor); err != nil {
 			return plan, fmt.Errorf("materialize pending shard set: %w", err)
 		}
 		if serving.PGMajor != 0 {
@@ -151,7 +151,7 @@ func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1al
 		} else {
 			gen := maxGen + 1
 			name := catalog.ShardSetName(gen)
-			if err := r.Prober.MaterializeShardSet(ctx, dsn, name, gen, catalog.ShardSetDesired, serving.Ranges); err != nil {
+			if err := r.Prober.MaterializeShardSet(ctx, dsn, name, gen, catalog.ShardSetDesired, serving.Ranges, c.Spec.PostgreSQL.Major); err != nil {
 				return plan, fmt.Errorf("materialize upgrade shard set: %w", err)
 			}
 			if err := r.Prober.SetShardSetMajor(ctx, dsn, name, c.Spec.PostgreSQL.Major); err != nil {

@@ -111,10 +111,10 @@ func newCopyFixtureOpts(t *testing.T, targets int, tgtImage string) *copyFixture
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := catalog.MaterializeShardSet(ctx, tx, "default", 1, catalog.ShardSetServing, f.srcRng); err != nil {
+	if err := catalog.MaterializeShardSet(ctx, tx, "default", 1, catalog.ShardSetServing, f.srcRng, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := catalog.MaterializeShardSet(ctx, tx, "g2", 2, catalog.ShardSetProvisioning, f.tgtRng); err != nil {
+	if err := catalog.MaterializeShardSet(ctx, tx, "g2", 2, catalog.ShardSetProvisioning, f.tgtRng, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(ctx); err != nil {
