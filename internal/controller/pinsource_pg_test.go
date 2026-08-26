@@ -133,11 +133,29 @@ func TestPinSourceLoserAdoptsTheWinner(t *testing.T) {
 		done <- result{set, err}
 	}()
 
-	// Give the loser time to block on the row before the winner commits.
-	select {
-	case r := <-done:
-		t.Fatalf("the loser finished before the winner committed: %q %v", r.set, r.err)
-	case <-time.After(500 * time.Millisecond):
+	// Wait until the loser is genuinely blocked on the row rather than merely
+	// slow to start; a sleep here would let a delayed worker pass even the
+	// broken form.
+	observer := connect(t, dsn)
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		var waiting bool
+		if err := observer.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_locks WHERE NOT granted)`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		select {
+		case r := <-done:
+			t.Fatalf("the loser finished before the winner committed: %q %v", r.set, r.err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the loser never blocked on the workflow row")
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 	if err := winner.Commit(ctx); err != nil {
 		t.Fatal(err)
