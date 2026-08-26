@@ -63,6 +63,12 @@ type MigrationMeta struct {
 	Rewrite *RewriteChange `json:"rewrite,omitempty"`
 	// Repack marks a "repack" migration.
 	Repack bool `json:"repack,omitempty"`
+	// ShardSet is the shard set the migration was planned against, pinned
+	// when it starts. per_shard keys are shard ids, which only identify a
+	// database together with a set, so a migration that resumes after a
+	// reshard or upgrade cutover must not read them against the set that
+	// is serving now.
+	ShardSet string `json:"shard_set,omitempty"`
 }
 
 // MigrationStep is one statement of a multistep migration.
