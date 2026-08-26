@@ -71,7 +71,8 @@ jobs:
           fi
           case "${{ inputs.target }}" in
             operator)
-              export KUBEBUILDER_ASSETS="$(hack/envtest/setup-envtest.sh "$PWD/bin/k8s")"
+              KUBEBUILDER_ASSETS="$(hack/envtest/setup-envtest.sh "$PWD/bin/k8s")"
+              export KUBEBUILDER_ASSETS
               go test "${args[@]}" ./api/... ./internal/operator/... ./internal/admin/... ;;
             controller)  go test "${args[@]}" ./internal/controller/... ;;
             catalog)     go test "${args[@]}" ./internal/catalog/... ;;
