@@ -170,7 +170,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return cli.ExitNotReady
 	}
 	g := grpc.NewServer(grpc.Creds(creds))
-	pgshardv1.RegisterControllerServer(g, &controller.Server{Pool: pool, Resolver: resolver, Barrier: barrier, Streams: streams})
+	pgshardv1.RegisterControllerServer(g, &controller.Server{Pool: pool, Resolver: resolver, Barrier: barrier, Streams: streams, Leader: leader.Load})
 	mode := "mTLS"
 	if *insecureDev {
 		mode = "INSECURE plaintext"
