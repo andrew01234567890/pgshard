@@ -307,9 +307,21 @@ func reconcileShardSets(ctx context.Context, tx pgx.Tx, res *Result) error {
 		}
 		var served int64
 		err := tx.QueryRow(ctx, `SELECT generation FROM pgshard.serving WHERE shard_set = $1`, set).Scan(&served)
-		if errors.Is(err, pgx.ErrNoRows) {
-			served = 0
-		} else if err != nil {
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			// Nothing has ever been published for this set, so this is its
+			// first map rather than a change to one. Publishing only in the
+			// branch above assumed this pass was the one that created the
+			// shard_status rows, but the operator writes them as soon as a
+			// group reports its primary; when it got there first, the map was
+			// never published at all and every key failed to route.
+			if err := publishServing(ctx, tx, set, maxGen); err != nil {
+				return err
+			}
+			res.ShardSetsPopulated++
+			res.GenerationBumped = true
+			continue
+		case err != nil:
 			return err
 		}
 		if maxGen <= served {
