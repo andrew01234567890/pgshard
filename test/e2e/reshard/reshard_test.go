@@ -163,7 +163,11 @@ spec:
 func routerSQL(ctx context.Context, c *e2e.Cluster, sql string) (string, error) {
 	out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "exec", clientPod, "--",
 		"env", "PGPASSWORD="+ledgerPassword,
-		"psql", "-h", clusterName+"-router", "-U", ledgerRole, "-d", appDatabase, "-v", "ON_ERROR_STOP=1", "-tAc", sql)
+		// Verbose so a refusal carries its DETAIL: the fencing errors name the
+		// generation the request carried and the one the pooler holds, and
+		// without them a refusal says only that something was stale.
+		"psql", "-h", clusterName+"-router", "-U", ledgerRole, "-d", appDatabase,
+		"-v", "ON_ERROR_STOP=1", "-v", "VERBOSITY=verbose", "-tAc", sql)
 	return strings.TrimSpace(out), err
 }
 
