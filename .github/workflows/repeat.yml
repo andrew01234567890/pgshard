@@ -1,0 +1,113 @@
+# Establishes how often a target actually fails. A test is not flaky until a
+# rate says so, and not fixed until the same run says 50/50: a single green
+# run proves nothing about a test that fails one time in five, and a single
+# red one proves nothing about a test that fails one time in fifty.
+#
+# Run it from the Actions tab, or:
+#   gh workflow run repeat.yml -f target=operator -f runs=50
+name: Repeat
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Which suite to repeat
+        required: true
+        type: choice
+        options: [operator, controller, catalog, router, pooler, pgwire, agent, unit]
+      runs:
+        description: How many times (1-50)
+        required: false
+        default: "50"
+      pattern:
+        description: Optional -run regexp, to repeat one test rather than a package
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Plan ${{ inputs.runs }} runs
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+    steps:
+      - id: build
+        run: |
+          set -euo pipefail
+          n="${{ inputs.runs }}"
+          if ! [[ "$n" =~ ^[0-9]+$ ]] || [ "$n" -lt 1 ] || [ "$n" -gt 50 ]; then
+            echo "::error::runs must be between 1 and 50, got '$n'"
+            exit 1
+          fi
+          echo "matrix=$(seq 1 "$n" | jq -R . | jq -sc '{run: .}')" >> "$GITHUB_OUTPUT"
+
+  repeat:
+    name: ${{ inputs.target }} ${{ matrix.run }}
+    needs: plan
+    runs-on: ubuntu-latest
+    # Every run must report, or the rate is meaningless.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run once
+        run: |
+          set -euo pipefail
+          args=(-count=1 -race)
+          if [ -n "${{ inputs.pattern }}" ]; then
+            args+=(-run "${{ inputs.pattern }}")
+          fi
+          case "${{ inputs.target }}" in
+            operator)
+              KUBEBUILDER_ASSETS="$(hack/envtest/setup-envtest.sh "$PWD/bin/k8s")"
+              export KUBEBUILDER_ASSETS
+              go test "${args[@]}" ./api/... ./internal/operator/... ./internal/admin/... ;;
+            controller)  go test "${args[@]}" ./internal/controller/... ;;
+            catalog)     go test "${args[@]}" ./internal/catalog/... ;;
+            router)      go test "${args[@]}" ./internal/router/... ;;
+            pooler)      go test "${args[@]}" ./internal/pooler/... ;;
+            pgwire)      go test "${args[@]}" ./internal/pgwire/... ;;
+            agent)       go test "${args[@]}" ./internal/agent/... ;;
+            unit)        go test "${args[@]}" ./... ;;
+            *) echo "::error::unknown target"; exit 1 ;;
+          esac
+
+  rate:
+    name: Pass rate
+    needs: [plan, repeat]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          jobs=$(gh api --paginate \
+            "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
+            --jq '.jobs[] | select(.name | startswith("${{ inputs.target }} ")) | .conclusion')
+          total=$(echo "$jobs" | grep -c . || true)
+          passed=$(echo "$jobs" | grep -c '^success$' || true)
+          {
+            echo "## ${{ inputs.target }}: $passed/$total passed"
+            echo
+            if [ "$passed" != "$total" ]; then
+              echo "Failing $((total - passed)) of $total. Record this rate on the ticket before changing anything."
+            else
+              echo "Green $total/$total."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$passed/$total passed"
+          [ "$passed" = "$total" ]
