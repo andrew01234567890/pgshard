@@ -54,7 +54,7 @@ type Prober interface {
 	// ShardSets lists the catalog shard sets with their ranges.
 	ShardSets(ctx context.Context, dsn string) ([]ShardSetInfo, error)
 	// MaterializeShardSet writes a new shard set of equal ranges in state.
-	MaterializeShardSet(ctx context.Context, dsn, name string, generation int64, state string, ranges placement.RangeSet) error
+	MaterializeShardSet(ctx context.Context, dsn, name string, generation int64, state string, ranges placement.RangeSet, major int) error
 	// DropShardSet removes a shard set with its ranges and status rows.
 	DropShardSet(ctx context.Context, dsn, name string) error
 	// SetShardSetMajor stamps the PostgreSQL major a set's groups run.
@@ -318,9 +318,9 @@ func (PgxProber) ShardSets(ctx context.Context, dsn string) ([]ShardSetInfo, err
 }
 
 // MaterializeShardSet writes a new shard set in one transaction.
-func (PgxProber) MaterializeShardSet(ctx context.Context, dsn, name string, generation int64, state string, ranges placement.RangeSet) error {
+func (PgxProber) MaterializeShardSet(ctx context.Context, dsn, name string, generation int64, state string, ranges placement.RangeSet, major int) error {
 	return inTx(ctx, dsn, func(tx pgx.Tx) error {
-		return catalog.MaterializeShardSet(ctx, tx, name, generation, state, ranges)
+		return catalog.MaterializeShardSet(ctx, tx, name, generation, state, ranges, major)
 	})
 }
 
@@ -551,10 +551,10 @@ func (b boundedProber) ShardSets(ctx context.Context, dsn string) ([]ShardSetInf
 	return b.Inner.ShardSets(ctx, dsn)
 }
 
-func (b boundedProber) MaterializeShardSet(ctx context.Context, dsn, name string, generation int64, state string, ranges placement.RangeSet) error {
+func (b boundedProber) MaterializeShardSet(ctx context.Context, dsn, name string, generation int64, state string, ranges placement.RangeSet, major int) error {
 	ctx, cancel := b.bound(ctx)
 	defer cancel()
-	return b.Inner.MaterializeShardSet(ctx, dsn, name, generation, state, ranges)
+	return b.Inner.MaterializeShardSet(ctx, dsn, name, generation, state, ranges, major)
 }
 
 func (b boundedProber) DropShardSet(ctx context.Context, dsn, name string) error {

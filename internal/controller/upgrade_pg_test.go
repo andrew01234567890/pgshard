@@ -26,10 +26,10 @@ func TestUpgradeWorkflowKindOnPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := catalog.MaterializeShardSet(ctx, tx, "default", 1, catalog.ShardSetServing, ranges); err != nil {
+	if err := catalog.MaterializeShardSet(ctx, tx, "default", 1, catalog.ShardSetServing, ranges, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := catalog.MaterializeShardSet(ctx, tx, "g2", 2, catalog.ShardSetDesired, ranges); err != nil {
+	if err := catalog.MaterializeShardSet(ctx, tx, "g2", 2, catalog.ShardSetDesired, ranges, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := catalog.SetShardSetMajor(ctx, tx, "default", 18); err != nil {

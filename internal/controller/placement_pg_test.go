@@ -56,7 +56,7 @@ func newPlacementFixture(t *testing.T) *placementFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := catalog.MaterializeShardSet(ctx, tx, "default", 1, catalog.ShardSetServing, f.ranges); err != nil {
+	if err := catalog.MaterializeShardSet(ctx, tx, "default", 1, catalog.ShardSetServing, f.ranges, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(ctx); err != nil {

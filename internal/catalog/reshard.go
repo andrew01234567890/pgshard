@@ -100,18 +100,29 @@ func RangeSet(ranges []ShardRange) placement.RangeSet {
 	return out
 }
 
-// MaterializeShardSet writes ranges as shard 0..n-1 of a shard set in
-// state. The set must have no ranges yet; the default set's row (created by
-// the schema) is adopted.
-func MaterializeShardSet(ctx context.Context, tx pgx.Tx, name string, generation int64, state string, ranges placement.RangeSet) error {
+// MaterializeShardSet writes ranges as shard 0..n-1 of a shard set in state.
+// The set must have no ranges yet; the default set's row (created by the
+// schema) is adopted.
+//
+// major is stamped in the same statement rather than by a later call, because
+// the controller decides whether a pending set is a major upgrade or a plain
+// reshard from that field the first time it sees the set, and never revisits
+// the decision. A set that appears without its major is taken for a reshard,
+// and an upgrade that loses that race runs without any of its preconditions.
+// Zero leaves it unset, for callers that genuinely have no major to record.
+func MaterializeShardSet(ctx context.Context, tx pgx.Tx, name string, generation int64, state string, ranges placement.RangeSet, major int) error {
 	if err := ranges.Validate(); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO pgshard.shard_sets (shard_set, generation, state) VALUES ($1, $2, $3)
-		ON CONFLICT (shard_set) DO UPDATE SET state = EXCLUDED.state
+	var pgMajor *int
+	if major > 0 {
+		pgMajor = &major
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO pgshard.shard_sets (shard_set, generation, state, pg_major) VALUES ($1, $2, $3, $4)
+		ON CONFLICT (shard_set) DO UPDATE SET state = EXCLUDED.state, pg_major = coalesce(EXCLUDED.pg_major, pgshard.shard_sets.pg_major)
 		WHERE pgshard.shard_sets.generation = EXCLUDED.generation
 		  AND NOT EXISTS (SELECT 1 FROM pgshard.shard_ranges WHERE shard_set = EXCLUDED.shard_set)`,
-		name, generation, state); err != nil {
+		name, generation, state, pgMajor); err != nil {
 		return err
 	}
 	for i, r := range ranges {

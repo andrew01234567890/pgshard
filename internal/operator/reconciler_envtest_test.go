@@ -193,7 +193,7 @@ func (f *fakeProber) ShardSets(_ context.Context, _ string) ([]ShardSetInfo, err
 	return out, nil
 }
 
-func (f *fakeProber) MaterializeShardSet(_ context.Context, _ string, name string, generation int64, state string, ranges placement.RangeSet) error {
+func (f *fakeProber) MaterializeShardSet(_ context.Context, _ string, name string, generation int64, state string, ranges placement.RangeSet, major int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for i, s := range f.shardSets {
@@ -203,10 +203,13 @@ func (f *fakeProber) MaterializeShardSet(_ context.Context, _ string, name strin
 			}
 			f.shardSets[i].Ranges = ranges
 			f.shardSets[i].State = state
+			if major > 0 {
+				f.shardSets[i].PGMajor = major
+			}
 			return nil
 		}
 	}
-	f.shardSets = append(f.shardSets, ShardSetInfo{Name: name, Generation: generation, State: state, Ranges: ranges})
+	f.shardSets = append(f.shardSets, ShardSetInfo{Name: name, Generation: generation, State: state, Ranges: ranges, PGMajor: major})
 	return nil
 }
 
