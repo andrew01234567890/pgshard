@@ -532,7 +532,14 @@ func TestReshardProvisionsTargetsAndCancels(t *testing.T) {
 	if err := c.Apply(ctx, clusterManifest(major, os.Getenv("PGSHARD_POSTGRES_IMAGE"), 1)); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(ctx, t, c, "reshard cancelled", 5*time.Minute, func() bool {
+	cancelState := func() string {
+		return "\npgshardreshard phase: " + jsonpath(ctx, c, "pgshardreshard", record, "{.status.phase}") +
+			"\nworkflows: " + catalogSQL(ctx, t, c,
+			"SELECT coalesce(string_agg(kind || ' ' || state || ' stage=' || coalesce(status->>'stage', '') || ' msg=' || coalesce(status->>'message', '') || ' err=' || coalesce(error, ''), '; '), 'none') FROM pgshard.workflows") +
+			"\nshard sets: " + catalogSQL(ctx, t, c,
+			"SELECT coalesce(string_agg(shard_set || '=' || state, ', ' ORDER BY generation), 'none') FROM pgshard.shard_sets")
+	}
+	waitForWhy(ctx, t, c, "reshard cancelled", 5*time.Minute, cancelState, func() bool {
 		return jsonpath(ctx, c, "pgshardreshard", record, "{.status.phase}") == "Cancelled"
 	})
 	waitFor(ctx, t, c, "target groups deleted", 5*time.Minute, func() bool {
