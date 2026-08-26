@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
 	"net"
 	"os/exec"
 	"strings"
@@ -143,14 +144,14 @@ func serverVerdict(t *testing.T, conn *pgx.Conn, sql string) bool {
 func startPostgres18(t *testing.T) string {
 	t.Helper()
 	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("docker not on PATH; skipping differential test")
+		dockertest.Unavailable(t, "docker not on PATH; skipping differential test")
 	}
 	if err := exec.Command("docker", "info").Run(); err != nil {
-		t.Skip("docker daemon unavailable; skipping differential test")
+		dockertest.Unavailable(t, "docker daemon unavailable; skipping differential test")
 	}
 	if exec.Command("docker", "image", "inspect", pg18Image).Run() != nil {
 		if out, err := exec.Command("docker", "pull", pg18Image).CombinedOutput(); err != nil {
-			t.Skipf("image %s unavailable: %v: %s", pg18Image, err, strings.TrimSpace(string(out)))
+			dockertest.Unavailable(t, "image %s unavailable: %v: %s", pg18Image, err, strings.TrimSpace(string(out)))
 		}
 	}
 	l, err := net.Listen("tcp", "127.0.0.1:0")

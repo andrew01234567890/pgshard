@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
 	"net/http"
 	"os"
 	"os/exec"
@@ -30,7 +31,7 @@ var integrationImages = []string{
 
 func TestAgentIntegration(t *testing.T) {
 	if err := exec.Command("docker", "info").Run(); err != nil {
-		t.Skip("docker unavailable")
+		dockertest.Unavailable(t, "docker unavailable")
 	}
 	bin := buildAgent(t)
 	ran := 0

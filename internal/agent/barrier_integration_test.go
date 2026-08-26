@@ -4,6 +4,7 @@ package agent
 
 import (
 	"context"
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
 	"os"
 	"os/exec"
 	"slices"
@@ -21,7 +22,7 @@ import (
 // decision log at each point. It also exercises the catalog-side RPCs.
 func TestRestoreReconciliationMatrix(t *testing.T) {
 	if err := exec.Command("docker", "info").Run(); err != nil {
-		t.Skip("docker unavailable")
+		dockertest.Unavailable(t, "docker unavailable")
 	}
 	image := integrationImages[0]
 	if img := os.Getenv("PGSHARD_POSTGRES_IMAGE"); img != "" {

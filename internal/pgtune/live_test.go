@@ -4,6 +4,7 @@ package pgtune
 
 import (
 	"fmt"
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,7 +23,7 @@ var liveImages = []string{
 // accepted, sourced from that file, and readable through SHOW.
 func TestLiveEveryGUCExists(t *testing.T) {
 	if exec.Command("docker", "info").Run() != nil {
-		t.Skip("docker unavailable")
+		dockertest.Unavailable(t, "docker unavailable")
 	}
 	ran := 0
 	for _, img := range liveImages {

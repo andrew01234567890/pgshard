@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
 	"math"
 	"os"
 	"os/exec"
@@ -62,7 +63,7 @@ var copyFixtureSeq atomic.Int64
 func newCopyFixtureOpts(t *testing.T, targets int, tgtImage string) *copyFixture {
 	t.Helper()
 	if err := exec.Command("docker", "info").Run(); err != nil {
-		t.Skip("docker unavailable; skipping reshard copy integration test")
+		dockertest.Unavailable(t, "docker unavailable; skipping reshard copy integration test")
 	}
 	f := &copyFixture{t: t, net: fmt.Sprintf("pgshard-copy-%d", copyFixtureSeq.Add(1))}
 	if out, err := exec.Command("docker", "network", "create", f.net).CombinedOutput(); err != nil {

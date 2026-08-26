@@ -5,6 +5,7 @@ import (
 	"crypto/pbkdf2"
 	"crypto/sha256"
 	"fmt"
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
 	"log/slog"
 	"net"
 	"os/exec"
@@ -33,10 +34,10 @@ var pgImages = []struct{ name, label string }{
 
 func TestPostgres(t *testing.T) {
 	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("docker not on PATH")
+		dockertest.Unavailable(t, "docker not on PATH")
 	}
 	if err := exec.Command("docker", "info").Run(); err != nil {
-		t.Skip("docker daemon unavailable")
+		dockertest.Unavailable(t, "docker daemon unavailable")
 	}
 	ran := 0
 	seen := map[string]bool{}
