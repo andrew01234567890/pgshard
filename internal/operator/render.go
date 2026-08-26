@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"time"
@@ -246,11 +247,18 @@ func (Renderer) MemberRBAC(c *pgshardv1alpha1.PgShardCluster) (*corev1.ServiceAc
 // writes are pinned to this cluster's own primary Leases so a compromised
 // member cannot steal or fence another cluster's primary; create cannot be
 // name-scoped in RBAC, so it stays namespace-wide.
+//
+// Reshard and upgrade targets are included: their agents hold a primary Lease
+// of their own from the moment they start, well before their generation is
+// serving, and a name-scoped rule that lists only the serving groups leaves
+// them unable to renew it.
 func MemberRules(c *pgshardv1alpha1.PgShardCluster) []rbacv1.PolicyRule {
 	var leases []string
-	for _, g := range Groups(c) {
+	for _, g := range append(Groups(c), TargetGroups(c)...) {
 		leases = append(leases, g.LeaseName())
 	}
+	slices.Sort(leases)
+	leases = slices.Compact(leases)
 	return []rbacv1.PolicyRule{
 		{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{"get", "list", "watch", "create"}},
 		{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, ResourceNames: leases, Verbs: []string{"get", "update", "patch"}},
