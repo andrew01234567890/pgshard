@@ -97,6 +97,16 @@ func TestRoleVerifierWithPostgres(t *testing.T) {
 		}
 	})
 
+	// Every scenario below starts from materialized roles. The parent body
+	// runs even when -run targets a single subtest, so the baseline has to
+	// be here rather than a side effect of the subtest above: otherwise
+	// running one of them alone fails on roles that were never created,
+	// which reports the wrong scenario as broken. RunOnce is a reconcile, so
+	// repeating it after the subtest above is a no-op.
+	if err := v.RunOnce(ctx); err != nil {
+		t.Fatalf("materializing the baseline the scenarios below start from: %v", err)
+	}
+
 	t.Run("password_changed_out_of_band_is_repaired", func(t *testing.T) {
 		mustExec(t, conn, `ALTER ROLE app PASSWORD 'hijacked' CONNECTION LIMIT 99`)
 		mustExec(t, conn, `REVOKE UPDATE ON orders FROM app`)
