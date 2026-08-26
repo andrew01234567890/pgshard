@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -413,4 +414,48 @@ func TestDecodingTermBreaksBudget(t *testing.T) {
 	if _, err := Derive(small); !errors.Is(err, ErrOverCommitted) {
 		t.Fatalf("4 slots on 1GiB must overcommit: err = %v", err)
 	}
+}
+
+// TestLogicalWorkersCoverEverySubscription: a reshard target subscribes to
+// every source it takes range from, and each subscription holds an apply
+// worker for as long as it lives. Table sync draws from the same pool. With
+// PostgreSQL's default of 4, a merge of four shards into two gave each
+// target four apply workers and nothing left to sync with, so the copy stuck
+// at "5/8 tables ready, lag 0 bytes" forever -- no error, no lag, no retry.
+func TestLogicalWorkersCoverEverySubscription(t *testing.T) {
+	for _, shards := range []int{2, 4, 8, 16} {
+		in := Input{Major: 18, CPUMillicores: 2000, MemoryBytes: 4 << 30, DiskBytes: 100 << 30,
+			Profile: ProfileOLTP, MaxBackends: 100, Replicas: 2, LogicalSlots: shards}
+		s, err := Derive(in)
+		if err != nil {
+			t.Fatalf("shards=%d: %v", shards, err)
+		}
+		workers := atoiSetting(t, s, "max_logical_replication_workers")
+		// Every subscription needs an apply worker, and at least one table
+		// sync must still be able to start or the copy cannot finish.
+		if workers <= shards {
+			t.Errorf("shards=%d: max_logical_replication_workers=%d leaves nothing for table sync after %d apply workers",
+				shards, workers, shards)
+		}
+		procs := atoiSetting(t, s, "max_worker_processes")
+		if procs < workers {
+			t.Errorf("shards=%d: max_worker_processes=%d is below max_logical_replication_workers=%d, so the workers cannot all start",
+				shards, procs, workers)
+		}
+	}
+}
+
+func atoiSetting(t *testing.T, s Settings, name string) int {
+	t.Helper()
+	for _, v := range s {
+		if v.Name == name {
+			n, err := strconv.Atoi(v.Value)
+			if err != nil {
+				t.Fatalf("%s = %q: %v", name, v.Value, err)
+			}
+			return n
+		}
+	}
+	t.Fatalf("%s not emitted", name)
+	return 0
 }
