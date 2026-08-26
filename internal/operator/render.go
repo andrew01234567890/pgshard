@@ -248,13 +248,24 @@ func (Renderer) MemberRBAC(c *pgshardv1alpha1.PgShardCluster) (*corev1.ServiceAc
 // member cannot steal or fence another cluster's primary; create cannot be
 // name-scoped in RBAC, so it stays namespace-wide.
 //
-// Reshard and upgrade targets are included: their agents hold a primary Lease
-// of their own from the moment they start, well before their generation is
-// serving, and a name-scoped rule that lists only the serving groups leaves
-// them unable to renew it.
+// Every generation whose pods are running is included, not just the serving
+// one. A reshard or upgrade target holds a primary Lease from the moment it
+// starts, well before its generation serves, and a retired source keeps holding
+// one for the whole rollback window after the cutover has moved on. A rule
+// naming only the serving groups leaves each of them unable to renew, and an
+// agent that cannot hold its lease refuses to run.
 func MemberRules(c *pgshardv1alpha1.PgShardCluster) []rbacv1.PolicyRule {
+	groups := Groups(c)
+	groups = append(groups, TargetGroups(c)...)
+	groups = append(groups, RetiredGroups(c)...)
+	if g := CatalogTargetGroup(c); g != nil {
+		groups = append(groups, *g)
+	}
+	if g := RetiredCatalogGroup(c); g != nil {
+		groups = append(groups, *g)
+	}
 	var leases []string
-	for _, g := range append(Groups(c), TargetGroups(c)...) {
+	for _, g := range groups {
 		leases = append(leases, g.LeaseName())
 	}
 	slices.Sort(leases)
