@@ -122,3 +122,23 @@ jobs:
       - name: Delete kind cluster
         if: always()
         run: hack/kind/down.sh
+
+  gate:
+    name: e2e gate
+    # Aggregates the whole matrix, so a suite added to it is gated from the
+    # moment it exists rather than when its cell name is added to branch
+    # protection by hand.
+    needs: [e2e]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check that every e2e cell succeeded
+        env:
+          RESULT: ${{ needs.e2e.result }}
+        run: |
+          set -euo pipefail
+          if [ "$RESULT" != "success" ]; then
+            echo "::error::the e2e matrix did not succeed: $RESULT"
+            exit 1
+          fi
+          echo "every e2e cell succeeded"
