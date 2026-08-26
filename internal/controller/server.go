@@ -23,10 +23,31 @@ type Server struct {
 	Barrier *Barrier
 	// Streams serves CreateStream/DropStream; nil answers Unimplemented.
 	Streams *StreamAdmin
+	// Leader reports whether this replica holds the controller lock. The
+	// gRPC service is registered on every replica, so without it a caller
+	// reaching a follower drives mutating work from a second controller --
+	// the same concurrency the background loops are gated against, entered
+	// through the request path instead. nil leaves every RPC accepted, which
+	// is what a single-replica or test deployment wants.
+	Leader func() bool
+}
+
+// requireLeader refuses a mutating RPC on a follower. FailedPrecondition
+// rather than Unavailable: the request was understood and this replica is
+// reachable, it is simply not the one allowed to act, and a caller should
+// retry against the leader rather than treat it as a transport failure.
+func (s *Server) requireLeader() error {
+	if s.Leader == nil || s.Leader() {
+		return nil
+	}
+	return status.Error(codes.FailedPrecondition, "this controller is not the leader; retry against the leader")
 }
 
 // CreateBarrier runs one barrier to completion.
 func (s *Server) CreateBarrier(ctx context.Context, req *pgshardv1.CreateBarrierRequest) (*pgshardv1.CreateBarrierResponse, error) {
+	if err := s.requireLeader(); err != nil {
+		return nil, err
+	}
 	if s.Barrier == nil {
 		return nil, status.Error(codes.Unimplemented, "the controller has no shard access configured for barriers")
 	}
@@ -64,6 +85,9 @@ func restorePointProto(rp RestorePoint) *pgshardv1.Barrier {
 
 // ResolveTransactions runs one resolver pass on demand.
 func (s *Server) ResolveTransactions(ctx context.Context, req *pgshardv1.ResolveTransactionsRequest) (*pgshardv1.ResolveTransactionsResponse, error) {
+	if err := s.requireLeader(); err != nil {
+		return nil, err
+	}
 	if s.Resolver == nil {
 		return nil, status.Error(codes.Unimplemented, "the controller has no shard access configured for the resolver")
 	}
@@ -192,6 +216,9 @@ func (s *Server) GetWorkflow(ctx context.Context, req *pgshardv1.GetWorkflowRequ
 // PauseWorkflow moves a pending or running workflow to paused, remembering
 // the state to resume into.
 func (s *Server) PauseWorkflow(ctx context.Context, req *pgshardv1.PauseWorkflowRequest) (*pgshardv1.PauseWorkflowResponse, error) {
+	if err := s.requireLeader(); err != nil {
+		return nil, err
+	}
 	if err := s.transition(ctx, req.GetId(), `
 		UPDATE pgshard.workflows
 		SET status = status || jsonb_build_object('paused_from', state), state = $2, updated_at = now()
@@ -207,6 +234,9 @@ func (s *Server) PauseWorkflow(ctx context.Context, req *pgshardv1.PauseWorkflow
 
 // ResumeWorkflow returns a paused workflow to the state it was paused from.
 func (s *Server) ResumeWorkflow(ctx context.Context, req *pgshardv1.ResumeWorkflowRequest) (*pgshardv1.ResumeWorkflowResponse, error) {
+	if err := s.requireLeader(); err != nil {
+		return nil, err
+	}
 	if err := s.transition(ctx, req.GetId(), `
 		UPDATE pgshard.workflows
 		SET state = coalesce(status->>'paused_from', $3), status = status - 'paused_from', updated_at = now()
