@@ -294,7 +294,15 @@ func (c *Copier) switchWrites(ctx context.Context, wf *copyWorkflow, ops cutover
 		}
 		if waiting {
 			if beforeJournal(step) && wf.cutover.FencedAt != nil && c.now().Sub(*wf.cutover.FencedAt) > c.cutoverTimeout() {
-				return c.abortSwitch(ctx, wf, ops, fmt.Sprintf("step %s did not finish within %s", step, c.cutoverTimeout()))
+				// The step knows what it is still waiting for; without it an
+				// abort says only that the deadline passed, which does not
+				// distinguish replication that is still catching up from a
+				// subscription whose slot has gone.
+				why := fmt.Sprintf("step %s did not finish within %s", step, c.cutoverTimeout())
+				if err != nil {
+					why += ": " + err.Error()
+				}
+				return c.abortSwitch(ctx, wf, ops, why)
 			}
 			msg := fmt.Sprintf("switching: waiting at step %s", step)
 			if err != nil {

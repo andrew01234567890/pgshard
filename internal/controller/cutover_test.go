@@ -183,6 +183,32 @@ func TestCutoverWaitsUntilSourcesStandStill(t *testing.T) {
 	}
 }
 
+// TestAbortSaysWhatItWasWaitingFor guards the abort message. The catch-up step
+// distinguishes replication that is still applying from a subscription whose
+// slot has gone, and an abort that reports only that the deadline passed throws
+// that away -- which is exactly what a CI failure needs.
+func TestAbortSaysWhatItWasWaitingFor(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.ops.caughtUp = false
+	h.runUntil(t, StageSwitching)
+	for h.wf.cutover.Step != StepCatchUp {
+		h.pass(t)
+	}
+	h.clock = h.clock.Add(2 * DefaultCutoverTimeout)
+	h.pass(t)
+
+	if len(h.wf.cutover.Aborts) == 0 {
+		t.Fatal("the switch must abort once the fence outlives the timeout")
+	}
+	last := h.wf.cutover.Aborts[len(h.wf.cutover.Aborts)-1]
+	if !strings.Contains(last, StepCatchUp) {
+		t.Fatalf("abort %q must name the step", last)
+	}
+	if !strings.Contains(last, "lagging") {
+		t.Fatalf("abort %q must carry what the step was waiting for", last)
+	}
+}
+
 func TestCutoverPauseMeasuresFenceToFlip(t *testing.T) {
 	h := newCutoverHarness(t)
 	h.ops.caughtUp = false
