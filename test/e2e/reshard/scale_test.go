@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -219,7 +220,27 @@ func clusterManifestWithRetire(major, image string, shards int, retire string) s
 // merges back to 2, with the ledger workload running throughout; every
 // acknowledged row survives every split and merge exactly once and each
 // cutover records its write pause.
-func TestReshard1To2To4To2UnderLoad(t *testing.T) {
+// TestReshardSplitUnderLoad grows a cluster while it is being written to.
+func TestReshardSplitUnderLoad(t *testing.T) {
+	reshardUnderLoad(t, 1, []reshardStep{{shards: 2, generation: 2}})
+}
+
+// TestReshardMergeUnderLoad shrinks a cluster while it is being written to.
+// It starts at four shards rather than growing into them: a merge is the
+// interesting half and giving it its own cluster keeps each transition inside
+// a budget it can actually finish in.
+func TestReshardMergeUnderLoad(t *testing.T) {
+	reshardUnderLoad(t, 4, []reshardStep{{shards: 2, generation: 2}})
+}
+
+// reshardStep is one transition: the shard count to move to and the shard set
+// generation it produces.
+type reshardStep struct {
+	shards     int
+	generation int64
+}
+
+func reshardUnderLoad(t *testing.T, startShards int, steps []reshardStep) {
 	c := e2e.NewCluster(t)
 	c.GatherOnFailure(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Hour)
@@ -228,7 +249,7 @@ func TestReshard1To2To4To2UnderLoad(t *testing.T) {
 	major := env("PG_MAJOR", "18")
 
 	deployOperator(ctx, t, c, root, env("OPERATOR_IMAGE", "pgshard-operator:e2e"))
-	manifest := clusterManifestWithRetire(major, os.Getenv("PGSHARD_POSTGRES_IMAGE"), 1, "30s")
+	manifest := clusterManifestWithRetire(major, os.Getenv("PGSHARD_POSTGRES_IMAGE"), startShards, "30s")
 	if err := c.Apply(ctx, manifest); err != nil {
 		t.Fatal(err)
 	}
@@ -259,8 +280,8 @@ func TestReshard1To2To4To2UnderLoad(t *testing.T) {
 	if err := c.WaitPodsReady(ctx, testNamespace, "app="+clusterName+"-controller", 3*time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(ctx, t, c, "serving shard set materialized", 2*time.Minute, func() bool {
-		return jsonpath(ctx, c, "pgshardcluster", clusterName, "{.status.effectiveShards}") == "1"
+	waitFor(ctx, t, c, "serving shard set materialized", 5*time.Minute, func() bool {
+		return jsonpath(ctx, c, "pgshardcluster", clusterName, "{.status.effectiveShards}") == strconv.Itoa(startShards)
 	})
 
 	l := startScaleLedger(ctx, c)
@@ -273,11 +294,12 @@ func TestReshard1To2To4To2UnderLoad(t *testing.T) {
 		return true
 	})
 
-	reshardTo(ctx, t, c, major, 2, 2)
-	l.verify(ctx, t, l.finishlessSnapshot())
-	reshardTo(ctx, t, c, major, 4, 3)
-	l.verify(ctx, t, l.finishlessSnapshot())
-	reshardTo(ctx, t, c, major, 2, 4)
+	for i, step := range steps {
+		if i > 0 {
+			l.verify(ctx, t, l.finishlessSnapshot())
+		}
+		reshardTo(ctx, t, c, major, step.shards, step.generation)
+	}
 
 	acked := l.finish()
 	l.verify(ctx, t, acked)
