@@ -175,14 +175,21 @@ func (l *scaleLedger) verify(ctx context.Context, t *testing.T, acked []int64) {
 	_ = total
 }
 
-func seedLedgerTable(ctx context.Context, t *testing.T, c *e2e.Cluster) {
+// seedLedgerTable creates the sharded ledger on every starting shard. A
+// reshard materializes the schema onto the targets it provisions, but the
+// shards the cluster starts with get nothing, so seeding only shard 0 leaves
+// the rest without the database as soon as a tenant routes to them.
+func seedLedgerTable(ctx context.Context, t *testing.T, c *e2e.Cluster, shards int) {
 	t.Helper()
-	if _, err := psql(ctx, c, clusterName+"-shard-0-rw", "CREATE DATABASE "+appDatabase); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := shardSQL(ctx, c, "shard-0",
-		"CREATE TABLE ledger (id bigint NOT NULL, tenant_id bigint NOT NULL, amount int NOT NULL, PRIMARY KEY (tenant_id, id))"); err != nil {
-		t.Fatal(err)
+	for i := 0; i < shards; i++ {
+		group := fmt.Sprintf("shard-%d", i)
+		if _, err := psql(ctx, c, clusterName+"-"+group+"-rw", "CREATE DATABASE "+appDatabase); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := shardSQL(ctx, c, group,
+			"CREATE TABLE ledger (id bigint NOT NULL, tenant_id bigint NOT NULL, amount int NOT NULL, PRIMARY KEY (tenant_id, id))"); err != nil {
+			t.Fatal(err)
+		}
 	}
 	catalogSQL(ctx, t, c, "INSERT INTO pgshard.databases (name, default_placement, home_shard) VALUES ('"+appDatabase+"', 'unsharded', 0)")
 	catalogSQL(ctx, t, c, "INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('"+appDatabase+"', 'public', 'ledger', 'sharded', 'tenant_id')")
@@ -273,7 +280,7 @@ func reshardUnderLoad(t *testing.T, startShards int, steps []reshardStep) {
 	if err := c.WaitPodsReady(ctx, testNamespace, "app="+clientPod, 3*time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	seedLedgerTable(ctx, t, c)
+	seedLedgerTable(ctx, t, c, startShards)
 	if err := c.Apply(ctx, controllerManifest(env("CONTROLLER_IMAGE", "pgshard-controller:e2e"))); err != nil {
 		t.Fatal(err)
 	}
