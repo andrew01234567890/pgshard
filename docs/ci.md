@@ -38,9 +38,21 @@ images for both majors; set `PGSHARD_REQUIRE_PROJECT_IMAGES=1` (planned for
 
 ## Required checks
 
+Two aggregate jobs stand in for the individual ones: **CI gate** fails
+unless every job in `ci.yml` succeeded, and **e2e gate** fails unless every
+cell of the `e2e-kind.yml` matrix did. Requiring those two, rather than a
+list of job names, is what keeps a newly added job gated from the moment it
+exists: naming jobs individually is how `Proto lint and generated code
+drift` came to run on every PR without ever being able to block one.
+
 The reshard and upgrade e2e suites run single-replica clusters
 (`unsafeSingleReplica: true`, see [crd.md](crd.md)) so their pods fit the
-hosted runner. Once `e2e (pg18, reshard)`, `e2e (pg19, reshard)` and
-`e2e (pg18, upgrade)` have been observed green on `main` after this lands,
-add those contexts to the branch-protection required checks alongside the
-existing ones.
+hosted runner. They are covered by **e2e gate** rather than by name, so
+switching branch protection over to it requires their failure rate to be
+known first — otherwise a flaky suite blocks every merge. That measurement
+is what `repeat.yml` exists for.
+
+Note that the `smoke` cells prove only that kind comes up: they start a
+`busybox` pod and log `PG_MAJOR`, and build no pgshard image. They are not
+evidence that the product works, and should not be read as such when
+looking at a green matrix.
