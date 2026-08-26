@@ -57,7 +57,14 @@ func TestUpgrade18To19UnderLoad(t *testing.T) {
 	if pause := catalogSQL(ctx, t, c, "SELECT coalesce((status->'cutover'->>'pause_ms')::bigint, -1) FROM pgshard.workflows WHERE kind = 'upgrade' AND spec->>'shard_set' = 'g2'"); pause == "-1" || pause == "0" {
 		t.Errorf("cutover pause not recorded: %q", pause)
 	}
-	waitFor(ctx, t, c, "writes flowing on the new major", 3*time.Minute, func() bool { return l.acked.Load() > 0 && servingShardGroup(ctx, c) == "shard-0-g2" })
+	// Snapshot the high-water AFTER the switch is observed. acked > 0 was
+	// already true before the upgrade began -- the writer runs throughout --
+	// so it asserted nothing about the new major. A primary that serves
+	// reads and rejects every write passed this.
+	ackedAfterSwitch := l.acked.Load()
+	waitFor(ctx, t, c, "writes acknowledged on the new major after the switch", 3*time.Minute, func() bool {
+		return l.acked.Load() > ackedAfterSwitch && servingShardGroup(ctx, c) == "shard-0-g2"
+	})
 	l.verify(ctx, t, l.acked.Load())
 
 	// VDiff-lite across the pair while both sets exist: the retired 18
