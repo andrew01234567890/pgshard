@@ -18,14 +18,19 @@ type fakeBarrierStore struct {
 	fenced    bool
 	fencedAt  time.Time
 	preparing int
-	watermark int64
-	recorded  []RestorePoint
-	owner     string
-	reserved  []string
-	failed    map[string]string
-	journal   *[]string
-	fail      map[string]error
-	now       func() time.Time
+	// clearPreparingAfter counts down on each read and zeroes preparing
+	// when it reaches zero, so a test can say "in flight for the first N
+	// polls" rather than "in flight for N milliseconds" and race the
+	// poller on a loaded machine.
+	clearPreparingAfter int
+	watermark           int64
+	recorded            []RestorePoint
+	owner               string
+	reserved            []string
+	failed              map[string]string
+	journal             *[]string
+	fail                map[string]error
+	now                 func() time.Time
 }
 
 func (s *fakeBarrierStore) log(step string) {
@@ -70,7 +75,14 @@ func (s *fakeBarrierStore) PreparingCount(context.Context) (int, error) {
 		return 0, err
 	}
 	s.log(fmt.Sprintf("preparing=%d", s.preparing))
-	return s.preparing, nil
+	n := s.preparing
+	if s.clearPreparingAfter > 0 {
+		s.clearPreparingAfter--
+		if s.clearPreparingAfter == 0 {
+			s.preparing = 0
+		}
+	}
+	return n, nil
 }
 
 func (s *fakeBarrierStore) DecisionWatermark(context.Context) (int64, error) {
@@ -158,10 +170,13 @@ func (s *fakeBarrierStore) FenceOwnedBy(_ context.Context, owner string) (bool, 
 type fakeGroups struct {
 	mu       sync.Mutex
 	prepared map[string]int
-	archived map[string]string
-	points   map[string][]string
-	journal  *[]string
-	fail     map[string]error
+	// clearPreparedAfter counts down per group on each read, so a test can
+	// hold a shard in flight for a number of polls rather than a duration.
+	clearPreparedAfter map[string]int
+	archived           map[string]string
+	points             map[string][]string
+	journal            *[]string
+	fail               map[string]error
 	// archiveAfter is how many ArchivedThrough polls a group answers with
 	// an old segment before the restore point's segment shows up.
 	archiveAfter map[string]int
@@ -190,7 +205,14 @@ func (g *fakeGroups) PreparedCount(_ context.Context, ref GroupRef) (int, error)
 		return 0, err
 	}
 	*g.journal = append(*g.journal, fmt.Sprintf("prepared %s=%d", ref.Name, g.prepared[ref.Name]))
-	return g.prepared[ref.Name], nil
+	n := g.prepared[ref.Name]
+	if g.clearPreparedAfter[ref.Name] > 0 {
+		g.clearPreparedAfter[ref.Name]--
+		if g.clearPreparedAfter[ref.Name] == 0 {
+			g.prepared[ref.Name] = 0
+		}
+	}
+	return n, nil
 }
 
 func (g *fakeGroups) CreateRestorePoint(_ context.Context, ref GroupRef, name string) (RestorePointResult, error) {
@@ -286,7 +308,7 @@ func newBarrierFixture() *barrierFixture {
 	f := &barrierFixture{clock: time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)}
 	now := func() time.Time { f.clock = f.clock.Add(time.Millisecond); return f.clock }
 	f.store = &fakeBarrierStore{journal: &f.journal, fail: map[string]error{}, now: now}
-	f.groups = &fakeGroups{prepared: map[string]int{}, archived: map[string]string{}, points: map[string][]string{},
+	f.groups = &fakeGroups{prepared: map[string]int{}, clearPreparedAfter: map[string]int{}, archived: map[string]string{}, points: map[string][]string{},
 		journal: &f.journal, fail: map[string]error{}, archiveAfter: map[string]int{}, polls: map[string]int{}, store: f.store,
 		paused: map[string]bool{}, writers: map[string]int{}, subs: map[string]int{}}
 	for _, g := range []string{CatalogGroup, "shard0", "shard1"} {
@@ -360,18 +382,12 @@ func TestBarrierHappyPathStepOrder(t *testing.T) {
 
 func TestBarrierDrainWaitsForInFlightTransactions(t *testing.T) {
 	f := newBarrierFixture()
-	f.store.preparing = 1
-	f.groups.prepared["shard0"] = 2
-	go func() {
-		time.Sleep(10 * time.Millisecond)
-		f.store.mu.Lock()
-		f.store.preparing = 0
-		f.store.mu.Unlock()
-		time.Sleep(10 * time.Millisecond)
-		f.groups.mu.Lock()
-		f.groups.prepared["shard0"] = 0
-		f.groups.mu.Unlock()
-	}()
+	// In flight for exactly one poll each, cleared by the read itself. A
+	// goroutine clearing these on a timer raced the poller: on a loaded
+	// machine the first poll could land after the timer, so the journal
+	// never recorded the in-flight state the assertions look for.
+	f.store.preparing, f.store.clearPreparingAfter = 1, 1
+	f.groups.prepared["shard0"], f.groups.clearPreparedAfter["shard0"] = 2, 1
 	f.b.DrainTimeout = 2 * time.Second
 	if _, err := f.b.Run(context.Background(), "b"); err != nil {
 		t.Fatalf("drain: %v\n%s", err, strings.Join(f.journal, "\n"))
