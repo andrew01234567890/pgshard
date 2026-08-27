@@ -185,6 +185,7 @@ func runPGSuite(t *testing.T, image string) {
 	t.Run("prepared_statement", h.testPrepared)
 	t.Run("row_limited_portal_suspends", h.testPortalSuspended)
 	t.Run("flush_answers_without_sync", h.testFlush)
+	t.Run("backend_state_does_not_outlive_a_session", h.testNoStateLeak)
 	t.Run("copy_in", h.testCopyIn)
 	t.Run("stale_generation", h.testStaleGeneration)
 	t.Run("cancel", h.testCancel)
@@ -641,5 +642,45 @@ func (h *pgHarness) testFlush(t *testing.T) {
 	send(req(&pgshardv1.Sync{}))
 	if e := firstError(readTo("*pgshardv1.ExecuteResponse_ReadyForQuery")); e != nil {
 		t.Fatalf("sync after flush: %v", e)
+	}
+}
+
+// testNoStateLeak: the router pins on syntax, and a statement's effect on
+// the backend need not be visible in its syntax. SELECT set_config(...,
+// false) sets a GUC and pg_advisory_lock() takes a lock the backend holds,
+// and both parse as ordinary reads -- so neither pinned the session, and
+// whatever they left was inherited by the next logical session of the same
+// role. That is a leak between clients, not untidiness.
+func (h *pgHarness) testNoStateLeak(t *testing.T) {
+	ctx := context.Background()
+	run := func(session, sql string) []*pgshardv1.ExecuteResponse {
+		t.Helper()
+		stream, err := h.client.Execute(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := stream.Send(&pgshardv1.ExecuteRequest{SessionId: session, Generation: gen(3, 1), User: h.identity(),
+			Message: &pgshardv1.ExecuteRequest_SimpleQuery{SimpleQuery: &pgshardv1.SimpleQuery{Sql: sql}}}); err != nil {
+			t.Fatal(err)
+		}
+		rs := collect(t, stream)
+		if e := firstError(rs); e != nil {
+			t.Fatalf("%s: %v", sql, e)
+		}
+		return rs
+	}
+	// Neither of these looks like a SET to a parser. Each runs on its own
+	// logical session, so the backend goes back to the pool between them --
+	// which is the handoff the state must not survive.
+	run("leak1", "SELECT set_config('application_name', 'left-behind', false)")
+	run("leak2", "SELECT pg_advisory_lock(4242)")
+
+	if got := rows(run("innocent1", "SELECT current_setting('application_name')")); len(got) != 1 || got[0] == "left-behind" {
+		t.Errorf("application_name = %v; a later session inherited the GUC", got)
+	}
+	// pg_try_advisory_lock reports false while another backend holds it, so
+	// this fails if the lock outlived the session that took it.
+	if got := rows(run("innocent2", "SELECT pg_try_advisory_lock(4242)")); len(got) != 1 || got[0] != "t" {
+		t.Errorf("advisory lock still held by a pooled backend: %v", got)
 	}
 }
