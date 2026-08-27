@@ -1230,6 +1230,19 @@ func TestRevocationInTheExecutorInstallGap(t *testing.T) {
 	}
 }
 
+// liveSessions is the server's registered sessions. testServer has a mutex
+// of its own, which shadows the embedded server's, so the lock -- and only
+// the lock -- has to name it; this keeps that asymmetry in one place.
+func (ts *testServer) liveSessions() []*session {
+	ts.Server.mu.Lock()
+	defer ts.Server.mu.Unlock()
+	out := make([]*session, 0, len(ts.sessions))
+	for _, sess := range ts.sessions {
+		out = append(out, sess)
+	}
+	return out
+}
+
 // TestDrainDuringStartupStillTellsTheClientWhy: a session is on the
 // server's registry before startup runs, so a drain can reach one still
 // authenticating. Writing the FATAL straight to its socket then put a
@@ -1246,12 +1259,7 @@ func TestDrainDuringStartupStillTellsTheClientWhy(t *testing.T) {
 			// the session is registered and not yet serving: the window
 			// this test exists for.
 			time.Sleep(2 * time.Millisecond)
-			ts.Server.mu.Lock()
-			var all []*session
-			for _, sess := range ts.Server.sessions {
-				all = append(all, sess)
-			}
-			ts.Server.mu.Unlock()
+			all := ts.liveSessions()
 			for _, sess := range all {
 				sess.drain()
 			}
