@@ -63,7 +63,9 @@ func TestFencingRefusesBeforeBackend(t *testing.T) {
 	if e := firstError(rs); e != nil {
 		t.Fatalf("matching generation refused: %v", e)
 	}
-	if h.pg.queries.Load() != 1 {
+	// The statement plus the DISCARD ALL that resets the backend before it
+	// can be handed to another logical session.
+	if h.pg.queries.Load() != 2 {
 		t.Fatalf("matching generation must reach PostgreSQL: %v", h.pg.seen)
 	}
 	h.src.Set(View{Generation: 8, Epoch: 3})
@@ -71,7 +73,9 @@ func TestFencingRefusesBeforeBackend(t *testing.T) {
 	if e := firstError(rs); e == nil || e.Message != "stale routing generation" {
 		t.Fatalf("mid-stream generation change not fenced: %v", e)
 	}
-	if h.pg.queries.Load() != 1 {
+	// Still the two from the accepted statement: the refused one reached
+	// nothing.
+	if h.pg.queries.Load() != 2 {
 		t.Fatal("stale mid-stream request reached PostgreSQL")
 	}
 	res, err := h.client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: "r", Generation: gen(7, 3)})

@@ -52,6 +52,24 @@ type reshardPlan struct {
 // sets created by SQL, and cancels a spec-sourced run when spec.shards is
 // reverted while targets are still provisioning. status.effectiveShards and
 // status.reshard are patched before returning so the group loop sees them.
+// cancellableOnRevert reports whether a reshard in this phase can still be
+// undone by lowering spec.shards back to the serving count.
+//
+// Everything up to the journal is undoable by design; the journal is a step
+// of the switch, so Switching is the first phase that is not. Verifying is
+// in the list because that is the phase a run reports while it waits at an
+// opt-in pause before the write switch -- leaving it out meant a reshard
+// paused before switchWrites could not be cancelled by reverting
+// spec.shards, which is the one thing that pause exists to allow.
+func cancellableOnRevert(phase string) bool {
+	switch phase {
+	case pgshardv1alpha1.ReshardPhasePending, pgshardv1alpha1.ReshardPhaseProvisioning,
+		pgshardv1alpha1.ReshardPhaseCopying, pgshardv1alpha1.ReshardPhaseVerifying:
+		return true
+	}
+	return false
+}
+
 func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, dsn string) (reshardPlan, error) {
 	log := logf.FromContext(ctx)
 	plan := reshardPlan{cond: metav1.Condition{Type: pgshardv1alpha1.ConditionResharding, Status: metav1.ConditionFalse, Reason: "Idle", Message: "", ObservedGeneration: c.Generation}}
@@ -210,7 +228,7 @@ func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1al
 	revert := want != nil && *want == effective && specSourced && record.Spec.Mode != pgshardv1alpha1.ReshardModeUpgrade
 
 	switch {
-	case revert && (phase == pgshardv1alpha1.ReshardPhasePending || phase == pgshardv1alpha1.ReshardPhaseProvisioning || phase == pgshardv1alpha1.ReshardPhaseCopying):
+	case revert && cancellableOnRevert(phase):
 		log.Info("cancelling reshard: spec.shards reverted", "set", pending.Name)
 		if err := r.Prober.DropShardSet(ctx, dsn, pending.Name); err != nil {
 			return plan, fmt.Errorf("drop pending shard set: %w", err)
