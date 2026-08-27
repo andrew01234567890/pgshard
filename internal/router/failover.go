@@ -16,6 +16,9 @@ const (
 	// codeStaleGeneration is what a pooler answers to a stale generation or
 	// epoch stamp (object_not_in_prerequisite_state).
 	codeStaleGeneration = "55000"
+	// codeRewriteInProgress marks a condition the client should wait out
+	// rather than a fault: the same SQLSTATE a fenced shard answers with.
+	codeRewriteInProgress = "55000"
 	// codeFailoverInTxn is serialization_failure: the statement ran inside a
 	// transaction the router cannot replay, so the client must retry the
 	// whole transaction, exactly as it would after a serialization failure.

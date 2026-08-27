@@ -9,6 +9,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 
@@ -198,6 +200,46 @@ func TestScatterRowDescriptionMismatchIsAnError(t *testing.T) {
 	var pe *pgconn.PgError
 	if !errors.As(err, &pe) || pe.Code != "XX000" || !strings.Contains(pe.Message, "disagree on the result shape") {
 		t.Fatalf("expected a shape mismatch error, got %v", err)
+	}
+}
+
+// TestScatterMismatchMidRewriteNamesTheMigration: a rewrite cuts over one
+// shard at a time, so between the first shard's swap and the last the same
+// column has a different type OID on different shards. Reporting that as
+// XX000 "align the schema on every shard" told the client to undo the
+// migration, and read as a router fault rather than a stage to wait out.
+func TestScatterMismatchMidRewriteNamesTheMigration(t *testing.T) {
+	h := newShardedHarness(t)
+	key := snapshot.TableKey{Database: "app", SchemaName: "public", TableName: "orders"}
+	pl := h.snap.Tables[key]
+	pl.HiddenColumns = []string{"_pgshard_new_v"}
+	h.snap.Tables[key] = pl
+	for i, fp := range h.poolers {
+		sc := int4Rows("1")
+		if i == 3 {
+			sc.cols[0].oid = 20
+		}
+		fp.script("select v from orders", sc)
+	}
+	conn := h.connect(t, h.dsn()+"&default_query_exec_mode=simple_protocol")
+	_, err := conn.Exec(context.Background(), "select v from orders")
+	var pe *pgconn.PgError
+	if !errors.As(err, &pe) {
+		t.Fatalf("expected a PostgreSQL error, got %v", err)
+	}
+	if pe.Code != "55000" {
+		t.Errorf("SQLSTATE %s, want 55000: a rewrite in progress is a condition to retry, not a fault", pe.Code)
+	}
+	if !strings.Contains(pe.Message, "public.orders is being rewritten") {
+		t.Errorf("message %q does not name the table being rewritten", pe.Message)
+	}
+	// The shape detail still has to survive: it is what tells an operator
+	// which column disagrees if the cause turns out not to be the rewrite.
+	if !strings.Contains(pe.Message, "oid 20") {
+		t.Errorf("message %q dropped the shape detail", pe.Message)
+	}
+	if !strings.Contains(pe.Hint, "retry") {
+		t.Errorf("hint %q does not say to retry", pe.Hint)
 	}
 }
 
