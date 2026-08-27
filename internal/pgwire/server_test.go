@@ -1171,3 +1171,61 @@ func TestDefaultMessageBodyCapIsFarBelowAGigabyte(t *testing.T) {
 		t.Fatalf("default cap %d is below 1 MiB and would refuse ordinary large statements", DefaultMaxMessageBodyLen)
 	}
 }
+
+// TestRevocationInTheExecutorInstallGap: between deciding a session is not
+// revoked and installing its executor, NewExecutor runs. A revocation landing
+// in that window must still take effect, and the client must not be able to
+// tell it apart from an ordinary authentication failure -- otherwise the
+// error itself reveals that the role exists and was revoked.
+func TestRevocationInTheExecutorInstallGap(t *testing.T) {
+	ts := startServer(t, Config{})
+	building := make(chan struct{})
+	release := make(chan struct{})
+	ts.newExec = func(info SessionInfo) (Executor, error) {
+		if info.User == "revoked" {
+			close(building)
+			<-release
+		}
+		return NewFakeExecutor(), nil
+	}
+
+	c := dialRaw(t, ts.addr)
+	go func() {
+		c.rawStartup(ProtocolVersion30, map[string]string{"user": "revoked", "database": "db"})
+	}()
+
+	// The session is registered and its role is known, but its executor is
+	// not installed yet: this is the gap.
+	<-building
+	if n := ts.TerminateUser("revoked"); n != 1 {
+		t.Fatalf("revoked %d sessions in the install gap, want 1", n)
+	}
+	close(release)
+
+	if err := c.conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var sawError bool
+	for {
+		msg, err := c.fe.Receive()
+		if err != nil {
+			break
+		}
+		if er, ok := msg.(*pgproto3.ErrorResponse); ok {
+			sawError = true
+			// Indistinguishable from any other authentication failure: a
+			// distinct code or message would disclose that the role exists.
+			if er.Code != CodeInvalidPassword {
+				t.Fatalf("revocation in the install gap reported %s (%q); it must look like an ordinary authentication failure",
+					er.Code, er.Message)
+			}
+			break
+		}
+		if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+			t.Fatal("the session became usable despite being revoked before its executor was installed")
+		}
+	}
+	if !sawError {
+		t.Fatal("no error reported to a session revoked in the install gap")
+	}
+}
