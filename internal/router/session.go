@@ -324,7 +324,34 @@ func (e *Executor) plan(ctx context.Context, sql string) (plan.Plan, error) {
 	return e.planOp(ctx, sql, "simple")
 }
 
+// staleSnapshot refuses to plan against a catalog view the router can no
+// longer trust. A failed reload leaves the previous snapshot in place and
+// the router serving it, so nothing else distinguishes a current view from
+// one whose reloads have been failing for an hour -- and an online rewrite
+// relies on a router either having reloaded or having stopped, never on it
+// quietly serving the view from before the column list was published.
+func (e *Executor) staleSnapshot() error {
+	if e.catalogSession() {
+		return nil
+	}
+	snap := e.r.cfg.Snapshot()
+	if snap == nil || snap.LoadedAt.IsZero() {
+		return nil
+	}
+	age := e.r.now().Sub(snap.LoadedAt)
+	if age <= snapshot.MaxAge {
+		return nil
+	}
+	err := pgwire.Errorf(codeStaleGeneration, "this router last read the catalog %s ago and will not plan against it", age.Round(time.Second))
+	err.Hint = "the router is failing to reload its catalog snapshot; retry, and check the catalog is reachable from it"
+	return err
+}
+
 func (e *Executor) planOp(ctx context.Context, sql, opcode string) (plan.Plan, error) {
+	if err := e.staleSnapshot(); err != nil {
+		e.r.metrics.Refusals.WithLabelValues(codeStaleGeneration).Inc()
+		return plan.Plan{}, err
+	}
 	pl, err := e.r.cfg.Planner.Plan(ctx, e.planSession(), sql)
 	if err == nil && pl.Kind == plan.MigrationKind && e.home.Set != DefaultShardSet {
 		pl.Kind, pl.Shards, pl.Migration = plan.Unsharded, []int32{e.home.ID}, nil
