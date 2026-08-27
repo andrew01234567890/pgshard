@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
+
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -410,7 +412,7 @@ func retiredClaimAlive(t *testing.T, name string) {
 
 func TestGroupRolloutStatusWithoutPhasePassesValidation(t *testing.T) {
 	if k8sClient == nil {
-		t.Skip("KUBEBUILDER_ASSETS not set")
+		dockertest.EnvtestMissing(t, "this envtest")
 	}
 	ctx := context.Background()
 	pg := &pgshardv1alpha1.PgShardGroup{
