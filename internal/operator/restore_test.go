@@ -360,10 +360,11 @@ type fakeCertifier struct {
 	certified bool
 	err       error
 	asked     string
+	password  string
 }
 
-func (f *fakeCertifier) CertifiedBarrier(_ context.Context, _, name string) (bool, error) {
-	f.asked = name
+func (f *fakeCertifier) CertifiedBarrier(_ context.Context, _, password, name string) (bool, error) {
+	f.asked, f.password = name, password
 	return f.certified, f.err
 }
 
@@ -391,6 +392,13 @@ func TestRestoreRefusesAnUncertifiedBarrier(t *testing.T) {
 	}
 	if !strings.Contains(got.Status.Error, "not certified") {
 		t.Fatalf("message %q does not say the barrier was uncertified", got.Status.Error)
+	}
+	// The operator holds no PGPASSWORD for an arbitrary cluster, so the
+	// check has to authenticate from that cluster's own secret. Without
+	// this it reached the catalog and was refused, and every barrier
+	// restore failed as "cannot confirm".
+	if cert.password != "source-pw" {
+		t.Fatalf("certifier password = %q, want the source cluster's superuser secret", cert.password)
 	}
 	if cert.asked != BarrierRestorePoint(barrier) {
 		t.Fatalf("asked about %q, want the restore point name %q", cert.asked, BarrierRestorePoint(barrier))

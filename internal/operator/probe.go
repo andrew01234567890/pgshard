@@ -375,8 +375,17 @@ func (PgxProber) ReshardWorkflow(ctx context.Context, dsn, shardSet string) (Wor
 // WAL-logged after the catalog group's own restore point, so a catalog
 // recovered to that name always reads back uncertified, even for a good
 // barrier.
-func (PgxProber) CertifiedBarrier(ctx context.Context, dsn, name string) (bool, error) {
-	conn, err := pgx.Connect(ctx, dsn)
+func (PgxProber) CertifiedBarrier(ctx context.Context, dsn, password, name string) (bool, error) {
+	// The operator has no PGPASSWORD for an arbitrary cluster's superuser,
+	// so the password comes from that cluster's secret and is set on the
+	// parsed config rather than written into the DSN, which reaches logs
+	// and error messages.
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return false, err
+	}
+	cfg.Password = password
+	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {
 		return false, err
 	}
