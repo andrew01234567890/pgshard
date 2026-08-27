@@ -48,6 +48,14 @@ func Render(s Settings, pgdata string, port int, extraStanzas ...string) (string
 	add("process-max", fmt.Sprint(s.ProcessMax))
 	add("start-fast", "y")
 	add("delta", "y")
+	// A cluster backup is complete only when every group's backup is, and
+	// the groups run one after another. Left on its default, pgBackRest
+	// expires a stanza the moment that group succeeds, so with retention 1
+	// an early group can retire the set the last complete cluster backup
+	// depends on while a later group is still running -- and if that one
+	// fails there is no restorable cluster backup left at all. Expiry is
+	// the operator's to run once the whole cluster has succeeded.
+	add("expire-auto", "n")
 
 	var b strings.Builder
 	b.WriteString("# Managed by pgshard-agent. Edits are overwritten.\n[global]\n")
