@@ -20,6 +20,10 @@ type copyPhase struct {
 	done    []string
 	current *pgshardv1.VCopyState_Table
 	batch   uint32
+	// keyless marks the table in progress as having no unique key the copy
+	// can be resumed from. Nothing is checkpointed for it, so a reconnect
+	// restarts that table.
+	keyless bool
 }
 
 func copyPhaseFrom(st *pgshardv1.VCopyState, batch uint32) *copyPhase {
@@ -97,8 +101,14 @@ func (r *reader) copyOnce(ctx context.Context) error {
 				return status.Errorf(codes.FailedPrecondition, "copy: pooler resent done table %s.%s", relation.GetSchema(), relation.GetTable())
 			}
 			rel = relMetaOf(relation)
+			r.copy.keyless = m.TableBegin.GetByCtid()
 			if r.copy.current == nil || r.copy.current.Schema != rel.schema || r.copy.current.Table != rel.table {
 				r.copy.current = &pgshardv1.VCopyState_Table{Schema: rel.schema, Table: rel.table}
+			}
+			if r.copy.keyless {
+				// Drop any checkpoint carried in from a resume: it is a
+				// ctid, and this table has to start again.
+				r.copy.current.Lastpk = nil
 			}
 			u = &unit{shard: r.shard, copy: r.copy.state(r.shard),
 				events: []*pgshardv1.VEvent{{Event: &pgshardv1.VEvent_CopyBegin_{CopyBegin: &pgshardv1.VEvent_CopyBegin{Shard: sh, Schema: rel.schema, Table: rel.table}}}},
@@ -115,7 +125,19 @@ func (r *reader) copyOnce(ctx context.Context) error {
 				u.rels = append(u.rels, []*relMeta{rel})
 				u.xids = append(u.xids, 0)
 			}
-			r.copy.current.Lastpk = append([]byte(nil), m.Rows.GetLastpk()...)
+			// A table with no unique key paginates on ctid, and ctid does
+			// not survive a heap rewrite: VACUUM FULL or CLUSTER between
+			// the two snapshots can move an untouched row below the
+			// checkpoint, and logical decoding does not report a physical
+			// rewrite as row DML, so the row would be silently missing
+			// from the copy. No ordering of a heap survives a rewrite, so
+			// there is no checkpoint over ctid that can be made correct.
+			// Recording nothing restarts the table on a reconnect, which
+			// re-sends rows -- and the copy is at-least-once, so duplicates
+			// are within the contract while a missing row is not.
+			if !r.copy.keyless {
+				r.copy.current.Lastpk = append([]byte(nil), m.Rows.GetLastpk()...)
+			}
 			u.copy = r.copy.state(r.shard)
 		case *pgshardv1.CopyTablesResponse_TableDone_:
 			name := m.TableDone.GetSchema() + "." + m.TableDone.GetTable()

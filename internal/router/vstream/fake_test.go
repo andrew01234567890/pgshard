@@ -83,6 +83,14 @@ func cpTable(table string, cols ...string) *pgshardv1.CopyTablesResponse {
 	return &pgshardv1.CopyTablesResponse{Response: &pgshardv1.CopyTablesResponse_TableBegin_{TableBegin: &pgshardv1.CopyTablesResponse_TableBegin{Relation: evRelation(0, table, cols...).GetRelation()}}}
 }
 
+// cpKeylessTable is a table the pooler reports as paginated by ctid,
+// because it has no unique key to resume from.
+func cpKeylessTable(table string, cols ...string) *pgshardv1.CopyTablesResponse {
+	m := cpTable(table, cols...)
+	m.GetTableBegin().ByCtid = true
+	return m
+}
+
 func cpRows(lastpk string, ids ...string) *pgshardv1.CopyTablesResponse {
 	rows := &pgshardv1.CopyTablesResponse_Rows{Lastpk: []byte(lastpk)}
 	for _, id := range ids {

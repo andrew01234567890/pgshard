@@ -195,3 +195,56 @@ func TestCopyPhaseStateRoundTrip(t *testing.T) {
 		t.Fatalf("empty phase: %v", empty)
 	}
 }
+
+// TestKeylessCopyRestartsRatherThanResumingFromACtid: a table with no
+// unique key paginates on ctid, and a ctid does not survive a heap rewrite
+// -- VACUUM FULL or CLUSTER between two snapshots can move an untouched row
+// below the checkpoint, and a physical rewrite is not reported as row DML,
+// so resuming there drops the row with no error and nothing for a consumer
+// to detect. No checkpoint over ctid can be made correct, so none is kept
+// and the table starts again.
+func TestKeylessCopyRestartsRatherThanResumingFromACtid(t *testing.T) {
+	h := newHarness(t, 2)
+	h.pool[0].copyPlan = func(*pgshardv1.CopyTablesRequest) copyScript {
+		return script(cpSnapshot(5000, false), cpKeylessTable("t", "id", "v"), cpRows(`["(0,4)"]`, "3", "4"))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st := h.open(ctx, copyStart(nil))
+	// Take the newest position the stream reported, which is what a
+	// consumer would resume from.
+	var pos *pgshardv1.VPosition
+	for _, ev := range recvN(t, st, 6, 5*time.Second) {
+		if p := ev.GetVgtid().GetPosition(); p != nil {
+			pos = p
+		}
+	}
+	if pos == nil {
+		t.Fatal("the stream reported no position to resume from")
+	}
+	for _, cs := range pos.GetCopyState() {
+		if c := cs.GetCurrent(); c != nil && len(c.GetLastpk()) != 0 {
+			t.Fatalf("checkpoint %q kept for a table with no unique key", c.GetLastpk())
+		}
+	}
+	cancel()
+
+	// And resuming from it asks the pooler to start the table again.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	h.open(ctx2, copyStart(pos))
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		reqs := h.pool[0].copyRequests()
+		if len(reqs) >= 2 {
+			if lastpk := reqs[len(reqs)-1].GetResumeLastpk(); len(lastpk) != 0 {
+				t.Fatalf("resume asked to continue from %q; a ctid cannot be resumed from", lastpk)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the resumed stream never reached the pooler: %d requests", len(reqs))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

@@ -155,6 +155,16 @@ func (s *Server) runCopy(ctx context.Context, req *pgshardv1.CopyTablesRequest, 
 			if lastpk, err = DecodeLastPK(req.GetResumeLastpk()); err != nil {
 				return status.Error(codes.InvalidArgument, err.Error())
 			}
+			// A table with no unique key paginates on ctid, and a ctid does
+			// not survive a heap rewrite: VACUUM FULL or CLUSTER between
+			// the snapshot the checkpoint came from and this one can move
+			// an untouched row below it, and logical decoding does not
+			// report a physical rewrite as row DML, so the row would be
+			// silently absent from the copy. The table starts again
+			// instead, whatever checkpoint the caller kept.
+			if t.byCtid {
+				lastpk = nil
+			}
 		}
 		if err := send(&pgshardv1.CopyTablesResponse{Response: &pgshardv1.CopyTablesResponse_TableBegin_{TableBegin: &pgshardv1.CopyTablesResponse_TableBegin{Relation: t.relation, ByCtid: t.byCtid}}}); err != nil {
 			return err
