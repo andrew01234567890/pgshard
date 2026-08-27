@@ -442,3 +442,37 @@ func TestCutoverErroringStepBeforeJournalHitsTimeout(t *testing.T) {
 		t.Fatalf("erroring step must undo the fence after the timeout: %s fenced=%t %+v", h.wf.stage, h.ops.fenced, h.wf.cutover)
 	}
 }
+
+// TestStalledStepReportsItsAge: after the journal every error is retried
+// with no timeout and no attempt limit, and every pass refreshes updated_at.
+// A step that has been failing for hours therefore looks exactly like a
+// healthy running workflow -- which is the state a real upgrade sat in,
+// retrying "sources advanced past the recorded positions" indefinitely.
+func TestStalledStepReportsItsAge(t *testing.T) {
+	base := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	st := &cutoverState{Step: StepSequences}
+	st.stampStep(base)
+
+	// Briefly retrying is normal and says nothing.
+	if got := st.stalledFor(base.Add(10 * time.Second)); got != "" {
+		t.Fatalf("a step retrying for 10s reported %q; that is ordinary", got)
+	}
+	// Past the threshold the age is the signal.
+	got := st.stalledFor(base.Add(37 * time.Minute))
+	if !strings.Contains(got, StepSequences) || !strings.Contains(got, "37m0s") {
+		t.Fatalf("a step stuck for 37 minutes reported %q; it must name the step and the age", got)
+	}
+	// Advancing resets it: the age is per step, not per workflow.
+	st.Step = StepFlip
+	st.stampStep(base.Add(37 * time.Minute))
+	if got := st.stalledFor(base.Add(37*time.Minute + time.Second)); got != "" {
+		t.Fatalf("a freshly entered step reported %q", got)
+	}
+}
+
+func TestStepAgeIsAbsentBeforeAnyStep(t *testing.T) {
+	st := &cutoverState{}
+	if got := st.stalledFor(time.Now()); got != "" {
+		t.Fatalf("unstamped state reported %q", got)
+	}
+}
