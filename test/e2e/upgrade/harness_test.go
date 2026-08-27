@@ -411,10 +411,17 @@ func bringUpCluster(ctx context.Context, t *testing.T, c *e2e.Cluster, retire st
 // "failed", which are three different bugs.
 func upgradeWorkflowDetail(ctx context.Context, t *testing.T, c *e2e.Cluster) string {
 	t.Helper()
+	// The cutover step, attempts and aborts are what distinguish "still
+	// copying" from "stalled at the switch". Without them a timeout says
+	// only that the switch did not happen, which is what the test already
+	// said -- the reshard suite's equivalent gap cost a day of investigating
+	// the wrong stage.
 	return "\nworkflows: " + catalogSQL(ctx, t, c,
-		"SELECT coalesce(string_agg(kind || ' ' || state || ' set=' || coalesce(spec->>'shard_set', '') || ' stage=' || coalesce(status->>'stage', '') || ' msg=' || coalesce(status->>'message', '') || ' err=' || coalesce(error, ''), '; '), 'none') FROM pgshard.workflows") +
+		"SELECT coalesce(string_agg(kind || ' ' || state || ' set=' || coalesce(spec->>'shard_set', '') || ' stage=' || coalesce(status->>'stage', '') || ' step=' || coalesce(status->'cutover'->>'step', '') || ' attempts=' || coalesce(status->'cutover'->>'attempts', '0') || ' aborts=' || coalesce((SELECT count(*)::text FROM jsonb_array_elements(status->'cutover'->'aborts')), '0') || ' msg=' || coalesce(status->>'message', '') || ' err=' || coalesce(error, ''), '; '), 'none') FROM pgshard.workflows") +
 		"\nshard sets: " + catalogSQL(ctx, t, c,
-		"SELECT coalesce(string_agg(shard_set || '=' || state || ' major=' || coalesce(pg_major::text, '-'), ', ' ORDER BY generation), 'none') FROM pgshard.shard_sets")
+		"SELECT coalesce(string_agg(shard_set || '=' || state || ' major=' || coalesce(pg_major::text, '-'), ', ' ORDER BY generation), 'none') FROM pgshard.shard_sets") +
+		"\nfenced: " + catalogSQL(ctx, t, c,
+		"SELECT coalesce(string_agg(shard_set || '/' || shard_id, ', '), 'none') FROM pgshard.shard_status WHERE migrating")
 }
 
 func upgradeWorkflowState(ctx context.Context, t *testing.T, c *e2e.Cluster, set string) string {
