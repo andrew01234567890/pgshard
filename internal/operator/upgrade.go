@@ -33,7 +33,7 @@ func UpgradeRequested(c *pgshardv1alpha1.PgShardCluster, serving *ShardSetInfo) 
 	return c.Spec.PostgreSQL.Major > serving.PGMajor
 }
 
-// UpgradeBlockers are the operator-side preconditions of plan §3.11: the
+// UpgradeBlockers are the operator-side preconditions in docs/upgrade.md: the
 // target image must be built for the new major, backups must be healthy,
 // and no reshard or table placement may be in flight. The data-plane checks
 // (extensions, large objects) run in the controller before the copy starts.
