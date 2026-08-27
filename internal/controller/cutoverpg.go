@@ -107,7 +107,7 @@ func (o *pgCutover) GateOpen(ctx context.Context) (bool, string, error) {
 	}
 	o.wf.copy.Progress = progress
 	if !progress.CaughtUp(o.c.lagBytes()) {
-		return false, fmt.Sprintf("%d/%d tables ready, lag %d bytes", progress.TablesReady, progress.TablesTotal, progress.LagBytes), nil
+		return false, progress.Describe(), nil
 	}
 	if progress.Paused > 0 {
 		return false, fmt.Sprintf("%d subscriptions paused by the throttle", progress.Paused), nil
