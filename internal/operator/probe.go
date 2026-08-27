@@ -203,12 +203,21 @@ func (PgxProber) PublishShardStatus(ctx context.Context, dsn string, g Group, ep
 	if g.Retired {
 		state = "retired"
 	}
+	// The epoch guard alone still rewrote an unchanged row on every pass,
+	// because an EQUAL epoch satisfies <=. Each write fires notify_serving,
+	// and every router and pooler watcher answers it by opening a catalog
+	// connection and reloading ranges, statuses, databases, tables,
+	// rewrites, fences and sequences -- so a healthy cluster reconciling
+	// every 30s paid a full reload wave per shard for no change at all.
 	_, err = conn.Exec(ctx, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch, primary_endpoint)
 		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (shard_set, shard_id) DO UPDATE
 		SET group_name = EXCLUDED.group_name, primary_epoch = EXCLUDED.primary_epoch,
 		    primary_endpoint = EXCLUDED.primary_endpoint, updated_at = now()
-		WHERE pgshard.shard_status.primary_epoch <= EXCLUDED.primary_epoch`,
+		WHERE pgshard.shard_status.primary_epoch <= EXCLUDED.primary_epoch
+		  AND (pgshard.shard_status.group_name IS DISTINCT FROM EXCLUDED.group_name
+		    OR pgshard.shard_status.primary_epoch IS DISTINCT FROM EXCLUDED.primary_epoch
+		    OR pgshard.shard_status.primary_endpoint IS DISTINCT FROM EXCLUDED.primary_endpoint)`,
 		g.ShardSet(), g.ShardID, g.Name(), state, epoch, endpoint)
 	return err
 }
