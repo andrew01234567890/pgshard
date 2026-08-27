@@ -1351,8 +1351,12 @@ func (p *Placer) publish(ctx context.Context, wf *placementWorkflow) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// The inspection belongs to the placement it was made under, so a table
+	// arriving at (or leaving) reference placement is unchecked again until
+	// the next pass has asked the shards.
 	if _, err := tx.Exec(ctx, `UPDATE pgshard.table_status
-		SET effective_placement = $4, effective_shard_key = $5, effective_generation = $6, migrating = false, updated_at = now()
+		SET effective_placement = $4, effective_shard_key = $5, effective_generation = $6, migrating = false,
+		    reference_checked_generation = NULL, reference_hazards = '{}', updated_at = now()
 		WHERE database = $1 AND schema_name = $2 AND table_name = $3`,
 		wf.spec.Database, wf.spec.SchemaName, wf.spec.TableName, wf.spec.To.Placement, wf.spec.To.ShardKey, wf.spec.DesiredGeneration); err != nil {
 		return err
