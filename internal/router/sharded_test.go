@@ -765,3 +765,112 @@ func TestRowLimitedFetchReportsTheSuspendedPortal(t *testing.T) {
 		t.Fatalf("rows = %d, want the row limit", rows)
 	}
 }
+
+// TestFlushAnswersBeforeSync: a pipelined client sends Execute then Flush
+// and waits for its rows. pgwire buffered the batch until Sync and a Flush
+// only pushed bytes already written, so the client waited for rows that
+// were never sent -- a hang, not a slow answer.
+func TestFlushAnswersBeforeSync(t *testing.T) {
+	h := newShardedHarness(t)
+	conn, err := pgx.Connect(context.Background(), h.dsn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hj, err := conn.PgConn().Hijack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hj.Conn.Close() })
+	fe := hj.Frontend
+	tenant, _ := h.twoTenants(t)
+	for _, m := range []pgproto3.FrontendMessage{
+		&pgproto3.Parse{Query: fmt.Sprintf("select id from orders where tenant_id = %d", tenant)},
+		&pgproto3.Bind{}, &pgproto3.Execute{MaxRows: 2}, &pgproto3.Flush{},
+	} {
+		fe.Send(m)
+	}
+	if err := fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	var rows int
+	var suspended bool
+	go func() {
+		for {
+			msg, err := fe.Receive()
+			if err != nil {
+				done <- err
+				return
+			}
+			switch msg.(type) {
+			case *pgproto3.DataRow:
+				rows++
+			case *pgproto3.PortalSuspended:
+				suspended = true
+				done <- nil
+				return
+			case *pgproto3.ReadyForQuery:
+				done <- errors.New("a Flush must not produce ReadyForQuery")
+				return
+			}
+		}
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the client is still waiting for rows it asked to be flushed: Flush did not reach the executor")
+	}
+	if !suspended || rows != 2 {
+		t.Fatalf("rows = %d suspended = %v, want the row limit answered before Sync", rows, suspended)
+	}
+}
+
+// TestFlushOnAWriteBatchStillAnswersAtSync: only a plain single-shard read
+// takes the early-answer path. A write needs the gating and failover
+// machinery Sync runs around it, so its Flush stays what it always was --
+// nothing. The batch must still be intact for Sync, not lost or half-sent.
+func TestFlushOnAWriteBatchStillAnswersAtSync(t *testing.T) {
+	h := newShardedHarness(t)
+	conn, err := pgx.Connect(context.Background(), h.dsn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hj, err := conn.PgConn().Hijack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hj.Conn.Close() })
+	fe := hj.Frontend
+	tenant, _ := h.twoTenants(t)
+	for _, m := range []pgproto3.FrontendMessage{
+		&pgproto3.Parse{Query: fmt.Sprintf("insert into orders (tenant_id, id) values (%d, 991)", tenant)},
+		&pgproto3.Bind{}, &pgproto3.Execute{}, &pgproto3.Flush{}, &pgproto3.Sync{},
+	} {
+		fe.Send(m)
+	}
+	if err := fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	var completed bool
+	for {
+		msg, err := fe.Receive()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if e, ok := msg.(*pgproto3.ErrorResponse); ok {
+			t.Fatalf("write batch failed: %s %s", e.Code, e.Message)
+		}
+		if _, ok := msg.(*pgproto3.CommandComplete); ok {
+			completed = true
+		}
+		if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+			break
+		}
+	}
+	if !completed {
+		t.Fatal("the write was neither answered early nor at Sync: the batch was lost")
+	}
+}

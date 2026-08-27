@@ -647,6 +647,16 @@ func (s *session) dispatch(ctx context.Context, msg pgproto3.FrontendMessage) (b
 		}
 		s.be.Send(&pgproto3.CloseComplete{})
 	case *pgproto3.Flush:
+		// Flush must produce the answers to what has been staged, not only
+		// push bytes already written: a pipelined client sends Execute
+		// then Flush and waits, so buffering until Sync hangs it.
+		qctx, cancel := s.queryContext(ctx)
+		err := s.exec.Flush(qctx, w)
+		cancel()
+		if err != nil {
+			s.reportError(err)
+			s.skipToSync = true
+		}
 		return true, s.be.Flush()
 	case *pgproto3.Sync:
 		s.skipToSync = false

@@ -306,6 +306,19 @@ type relay struct {
 	// certain when the batch ends without an error.
 	parsed   []string
 	batchErr bool
+	// awaiting counts the backend replies still owed for messages sent
+	// since the last flush. A Flush produces no ReadyForQuery, so this is
+	// the only way to know when its answers have all arrived; it includes
+	// the Close messages the pooler injects, which the backend answers
+	// like any other.
+	awaiting int
+}
+
+// expect sends a frontend message the backend answers with exactly one
+// terminating reply, and records that the reply is owed.
+func (r *relay) expect(b *Backend, fm pgproto3.FrontendMessage) {
+	b.send(fm)
+	r.awaiting++
 }
 
 func (r *relay) send(msg *pgshardv1.ExecuteResponse) error {
@@ -411,6 +424,14 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 			return r.refuse(&pgshardv1.Error{Sqlstate: "57P03", Message: "pooler is draining"})
 		}
 	}
+	if _, isFlush := req.Message.(*pgshardv1.ExecuteRequest_Flush); isFlush {
+		// Flush itself is answered by nothing, so it is not counted.
+		b.send(fm)
+		if err := b.flush(); err != nil {
+			return r.backendLost(b, err)
+		}
+		return r.pumpFlush(b)
+	}
 	r.forward(b, fm)
 	if !flushesBackend(req) {
 		return nil
@@ -440,13 +461,13 @@ func (r *relay) forward(b *Backend, fm pgproto3.FrontendMessage) {
 		fp := statementFingerprint(m)
 		if !b.sqlPrepared && b.prepared.holds(m.Name, fp) {
 			r.srv.notePrepared(true)
-			b.send(&pgproto3.Close{ObjectType: 'P', Name: noopPortal})
+			r.expect(b, &pgproto3.Close{ObjectType: 'P', Name: noopPortal})
 			r.closes = append(r.closes, closeAsParse)
 			return
 		}
 		r.srv.notePrepared(false)
 		if b.prepared.mayHold(m.Name) || b.sqlPrepared {
-			b.send(&pgproto3.Close{ObjectType: 'S', Name: m.Name})
+			r.expect(b, &pgproto3.Close{ObjectType: 'S', Name: m.Name})
 			r.closes = append(r.closes, closeInjected)
 		}
 		if b.prepared == nil {
@@ -469,7 +490,7 @@ func (r *relay) forward(b *Backend, fm pgproto3.FrontendMessage) {
 			b.sqlPrepared = true
 		}
 	}
-	b.send(fm)
+	r.expect(b, fm)
 }
 
 // endBatch settles the batch's bookkeeping at ReadyForQuery.
@@ -482,11 +503,70 @@ func (r *relay) endBatch(b *Backend) {
 			}
 		}
 	}
-	r.closes, r.parsed, r.batchErr = r.closes[:0], r.parsed[:0], false
+	// A Sync batch is answered to its ReadyForQuery whatever the count
+	// says, so anything still owed belongs to the batch that just ended.
+	r.closes, r.parsed, r.batchErr, r.awaiting = r.closes[:0], r.parsed[:0], false, 0
 }
 
 // pump forwards backend responses until the batch ends: ReadyForQuery, or a
 // COPY-in start where the router must speak next.
+// terminatesMessage reports whether msg is the last reply to one forwarded
+// frontend message. ParameterDescription is not one: a Describe of a
+// statement sends it first and then the row shape.
+func terminatesMessage(msg pgproto3.BackendMessage) bool {
+	switch msg.(type) {
+	case *pgproto3.ParseComplete, *pgproto3.BindComplete, *pgproto3.CloseComplete,
+		*pgproto3.NoData, *pgproto3.RowDescription, *pgproto3.CommandComplete,
+		*pgproto3.EmptyQueryResponse, *pgproto3.PortalSuspended,
+		*pgproto3.CopyInResponse, *pgproto3.CopyOutResponse, *pgproto3.CopyBothResponse:
+		return true
+	}
+	return false
+}
+
+// pumpFlush relays the answers to one Flush. There is no ReadyForQuery to
+// stop at -- that is what distinguishes Flush from Sync -- so it stops when
+// every forwarded message has been answered, and tells the router by
+// sending FlushComplete. An error stops it too: PostgreSQL discards the
+// rest of the batch until Sync, so the outstanding replies never come.
+func (r *relay) pumpFlush(b *Backend) error {
+	for r.awaiting > 0 {
+		msg, err := b.receive()
+		if err != nil {
+			return r.backendLost(b, err)
+		}
+		if _, isErr := msg.(*pgproto3.ErrorResponse); isErr {
+			r.batchErr = true
+			r.awaiting = 0
+		} else if terminatesMessage(msg) {
+			r.awaiting--
+		}
+		if cc, isClose := msg.(*pgproto3.CloseComplete); isClose && len(r.closes) > 0 {
+			_ = cc
+			kind := r.closes[0]
+			r.closes = r.closes[1:]
+			switch kind {
+			case closeInjected:
+				continue
+			case closeAsParse:
+				msg = &pgproto3.ParseComplete{}
+			}
+		}
+		if resp := toResponse(msg); resp != nil {
+			if err := r.send(resp); err != nil {
+				return err
+			}
+		}
+		// COPY takes the stream over until the client ends it, exactly as
+		// it does for a Sync batch.
+		switch msg.(type) {
+		case *pgproto3.CopyInResponse, *pgproto3.CopyBothResponse:
+			return nil
+		}
+	}
+	return r.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_FlushComplete{FlushComplete: &pgshardv1.FlushComplete{}}})
+}
+
 func (r *relay) pump(b *Backend) error {
 	for {
 		msg, err := b.receive()

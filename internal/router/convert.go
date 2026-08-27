@@ -52,6 +52,10 @@ func syncReq() *pgshardv1.ExecuteRequest {
 	return &pgshardv1.ExecuteRequest{Message: &pgshardv1.ExecuteRequest_Sync{Sync: &pgshardv1.Sync{}}}
 }
 
+func flushReq() *pgshardv1.ExecuteRequest {
+	return &pgshardv1.ExecuteRequest{Message: &pgshardv1.ExecuteRequest_Flush{Flush: &pgshardv1.Flush{}}}
+}
+
 func copyDataReq(data []byte) *pgshardv1.ExecuteRequest {
 	return &pgshardv1.ExecuteRequest{Message: &pgshardv1.ExecuteRequest_CopyData{CopyData: &pgshardv1.CopyData{Data: data}}}
 }

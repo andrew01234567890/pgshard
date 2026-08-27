@@ -142,6 +142,11 @@ type Executor struct {
 	batch       []*pgshardv1.ExecuteRequest
 	batchStmts  []string
 	batchFailed bool
+	// backendOpen marks a batch this session flushed to the backend but
+	// has not synced. The backend is mid-batch and holding an implicit
+	// transaction open, so the client's Sync still has to reach it even
+	// though there is nothing left staged to send.
+	backendOpen bool
 	batchWriter pgwire.ResultWriter
 	// batchTarget is the shard the current extended batch resolved to.
 	batchTarget *Shard
@@ -1005,10 +1010,105 @@ func (e *Executor) Sync(ctx context.Context) error {
 	return e.guard("Sync", func() error { return e.sync(ctx) })
 }
 
+// Flush answers a client's Flush: the extended batch staged so far runs and
+// its responses reach the client, with no ReadyForQuery and the portals
+// left open, so a pipelined client gets its rows before it sends Sync.
+//
+// Only a plain single-shard read batch takes this path. A scatter, an
+// injected statement, a write, a transaction control statement and a
+// session-effect statement each need the machinery Sync runs around them,
+// and for those the Flush stays what it has always been -- nothing, with
+// the client's answers arriving at Sync as before. That is not a
+// regression, and a wrong guess here is a hung session.
+func (e *Executor) Flush(ctx context.Context, w pgwire.ResultWriter) error {
+	return e.guard("Flush", func() error { return e.flush(ctx, w) })
+}
+
+func (e *Executor) flush(ctx context.Context, w pgwire.ResultWriter) error {
+	if e.batchFailed || len(e.batch) == 0 || e.batchScatter != nil {
+		return nil
+	}
+	for _, injected := range e.batchInject {
+		if len(injected) > 0 {
+			return nil
+		}
+	}
+	for _, item := range e.batchExec {
+		if item.class.Write || item.class.Txn != plan.TxnNone || item.class.Session != plan.SessionNone {
+			return nil
+		}
+	}
+	batch, executed := e.batch, e.batchExec
+	if e.batchWriter != nil {
+		w = e.batchWriter
+	}
+	target := e.shard
+	if e.batchTarget != nil {
+		target = *e.batchTarget
+	}
+	fresh := map[string]bool{}
+	for _, name := range e.batchStmts {
+		fresh[name] = true
+	}
+	// The messages are about to be sent, so the Sync that follows must not
+	// send them again. The portals stay: that is the point of a Flush.
+	e.batch, e.batchStmts, e.batchWriter, e.batchTarget, e.batchExec, e.batchBinds = nil, nil, nil, nil, nil, nil
+	e.pendingDescribes, e.describes = e.describes, nil
+	if w == nil {
+		w = discardWriter{}
+	}
+	if err := e.moveTo(ctx, target); err != nil {
+		return e.afterBatch(ctx, err)
+	}
+	if err := e.acquire(ctx, fresh); err != nil {
+		return e.afterBatch(ctx, err)
+	}
+	// A flushed batch spans two client messages, so the backend has to be
+	// the same one when the Sync arrives.
+	if err := e.ensurePinned(ctx); err != nil {
+		return e.afterBatch(ctx, err)
+	}
+	for _, req := range batch {
+		if err := e.send(req); err != nil {
+			return e.afterBatch(ctx, err)
+		}
+	}
+	if err := e.send(flushReq()); err != nil {
+		return e.afterBatch(ctx, err)
+	}
+	e.backendOpen = true
+	err := e.pump(ctx, w)
+	if err == nil {
+		for _, item := range executed {
+			e.noteExecuted(item.sql, item.local)
+			e.noteSessionEffect(item.class, item.sql)
+		}
+	}
+	return e.afterBatch(ctx, err)
+}
+
+// closeBackendBatch ends a batch this session flushed but never synced.
+// The backend is mid-batch with an implicit transaction open, so its Sync
+// has to be sent even though nothing is staged: without it the next
+// statement joins a transaction the client believes ended.
+func (e *Executor) closeBackendBatch(ctx context.Context) error {
+	if !e.backendOpen {
+		return nil
+	}
+	e.backendOpen = false
+	if e.conn == nil {
+		return nil
+	}
+	if err := e.send(syncReq()); err != nil {
+		return e.afterBatch(ctx, err)
+	}
+	return e.afterBatch(ctx, e.pump(ctx, discardWriter{}))
+}
+
 func (e *Executor) sync(ctx context.Context) error {
 	if e.batchFailed {
 		e.batchFailed = false
-		return nil
+		return e.closeBackendBatch(ctx)
 	}
 	batch, w, executed, binds := e.batch, e.batchWriter, e.batchExec, e.batchBinds
 	target := e.shard
@@ -1033,7 +1133,7 @@ func (e *Executor) sync(ctx context.Context) error {
 	e.batch, e.batchStmts, e.batchWriter, e.batchTarget, e.batchExec, e.batchBinds = nil, nil, nil, nil, nil, nil
 	e.pendingDescribes, e.describes = e.describes, nil
 	if len(batch) == 0 {
-		return nil
+		return e.closeBackendBatch(ctx)
 	}
 	if w == nil {
 		w = discardWriter{}
@@ -1134,6 +1234,7 @@ func (e *Executor) sync(ctx context.Context) error {
 		if err := e.send(syncReq()); err != nil {
 			return err
 		}
+		e.backendOpen = false
 		e.hiddenExec = hidden
 		err := e.pump(ctx, cw)
 		e.hiddenExec = nil
@@ -1434,6 +1535,12 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 			if !e.popHidden() {
 				werr = w.EmptyQueryResponse()
 			}
+		case *pgshardv1.ExecuteResponse_FlushComplete:
+			// The pooler's own marker that a Flush has been answered in
+			// full. A Flush produces no ReadyForQuery, so this is where
+			// the pump stops; the client is told nothing, which is what
+			// Flush means on the wire.
+			return firstErr
 		case *pgshardv1.ExecuteResponse_PortalSuspended:
 			// A suspended portal ends this Execute's response in place of
 			// CommandComplete, so it advances the injected-Execute queue

@@ -184,6 +184,7 @@ func runPGSuite(t *testing.T, image string) {
 	t.Run("permission_denied", h.testPermissionDenied)
 	t.Run("prepared_statement", h.testPrepared)
 	t.Run("row_limited_portal_suspends", h.testPortalSuspended)
+	t.Run("flush_answers_without_sync", h.testFlush)
 	t.Run("copy_in", h.testCopyIn)
 	t.Run("stale_generation", h.testStaleGeneration)
 	t.Run("cancel", h.testCancel)
@@ -539,5 +540,106 @@ func (h *pgHarness) testPortalSuspended(t *testing.T) {
 	}
 	if completed != 0 {
 		t.Fatalf("CommandComplete count = %d, want none: a suspended portal did not finish", completed)
+	}
+}
+
+// testFlush: a Flush must produce the answers to everything sent since the
+// last one, without a ReadyForQuery and without ending the batch. There is
+// no PostgreSQL message that says "that is all", so the pooler counts what
+// it forwarded and answers with its own FlushComplete; getting that count
+// wrong hangs the session, which is the bug this exists to fix.
+func (h *pgHarness) testFlush(t *testing.T) {
+	stream, err := h.client.Execute(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := gen(3, 1)
+	send := func(msgs ...*pgshardv1.ExecuteRequest) {
+		t.Helper()
+		for _, m := range msgs {
+			if err := stream.Send(m); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	req := func(m any) *pgshardv1.ExecuteRequest {
+		r := &pgshardv1.ExecuteRequest{SessionId: "fl", Generation: g, User: h.identity()}
+		switch v := m.(type) {
+		case *pgshardv1.Parse:
+			r.Message = &pgshardv1.ExecuteRequest_Parse{Parse: v}
+		case *pgshardv1.Bind:
+			r.Message = &pgshardv1.ExecuteRequest_Bind{Bind: v}
+		case *pgshardv1.ExecutePortal:
+			r.Message = &pgshardv1.ExecuteRequest_Execute{Execute: v}
+		case *pgshardv1.Describe:
+			r.Message = &pgshardv1.ExecuteRequest_Describe{Describe: v}
+		case *pgshardv1.Flush:
+			r.Message = &pgshardv1.ExecuteRequest_Flush{Flush: v}
+		case *pgshardv1.Sync:
+			r.Message = &pgshardv1.ExecuteRequest_Sync{Sync: v}
+		}
+		return r
+	}
+	readTo := func(want string) []*pgshardv1.ExecuteResponse {
+		t.Helper()
+		var out []*pgshardv1.ExecuteResponse
+		for {
+			r, err := stream.Recv()
+			if err != nil {
+				t.Fatalf("waiting for %s: %v", want, err)
+			}
+			out = append(out, r)
+			if fmt.Sprintf("%T", r.Message) == want {
+				return out
+			}
+		}
+	}
+
+	// Describe adds a second message that answers with two responses, one
+	// of which is not a terminator; miscounting it would hang here.
+	send(req(&pgshardv1.Parse{Sql: "select i from generate_series(1, 5) i"}),
+		req(&pgshardv1.Bind{}),
+		req(&pgshardv1.Describe{Kind: pgshardv1.Describe_KIND_PORTAL}),
+		req(&pgshardv1.ExecutePortal{MaxRows: 2}),
+		req(&pgshardv1.Flush{}))
+	first := readTo("*pgshardv1.ExecuteResponse_FlushComplete")
+	if e := firstError(first); e != nil {
+		t.Fatalf("flush: %v", e)
+	}
+	var rows, suspended, ready int
+	for _, r := range first {
+		switch r.Message.(type) {
+		case *pgshardv1.ExecuteResponse_DataRow:
+			rows++
+		case *pgshardv1.ExecuteResponse_PortalSuspended:
+			suspended++
+		case *pgshardv1.ExecuteResponse_ReadyForQuery:
+			ready++
+		}
+	}
+	if rows != 2 || suspended != 1 {
+		t.Fatalf("first flush: %d rows, %d suspends; want the row limit and one suspend", rows, suspended)
+	}
+	if ready != 0 {
+		t.Fatal("a Flush must not produce ReadyForQuery: that is what makes it a Flush")
+	}
+
+	// The portal survived, so the client fetches the rest from it.
+	send(req(&pgshardv1.ExecutePortal{MaxRows: 2}), req(&pgshardv1.Flush{}))
+	second := readTo("*pgshardv1.ExecuteResponse_FlushComplete")
+	rows = 0
+	for _, r := range second {
+		if _, ok := r.Message.(*pgshardv1.ExecuteResponse_DataRow); ok {
+			rows++
+		}
+	}
+	if rows != 2 {
+		t.Fatalf("second flush returned %d rows, want the portal to have continued", rows)
+	}
+
+	// And Sync still ends the batch it left open.
+	send(req(&pgshardv1.Sync{}))
+	if e := firstError(readTo("*pgshardv1.ExecuteResponse_ReadyForQuery")); e != nil {
+		t.Fatalf("sync after flush: %v", e)
 	}
 }

@@ -26,6 +26,8 @@ type FakeExecutor struct {
 	// SyncDelay is the same hook for Sync, where an extended-protocol batch
 	// actually runs.
 	SyncDelay func(ctx context.Context) error
+	// FlushFn answers a client Flush; nil leaves the batch for Sync.
+	FlushFn func(ctx context.Context, w ResultWriter) error
 }
 
 // NewFakeExecutor returns a fresh idle FakeExecutor.
@@ -205,6 +207,16 @@ func (f *FakeExecutor) Close(_ context.Context, kind DescribeKind, name string) 
 func (f *FakeExecutor) Sync(ctx context.Context) error {
 	if f.SyncDelay != nil {
 		return f.SyncDelay(ctx)
+	}
+	return nil
+}
+
+// Flush implements Executor. FlushFn lets a test answer a Flush; the
+// default leaves the batch staged for Sync, which is what an executor that
+// cannot answer this batch early does.
+func (f *FakeExecutor) Flush(ctx context.Context, w ResultWriter) error {
+	if f.FlushFn != nil {
+		return f.FlushFn(ctx, w)
 	}
 	return nil
 }

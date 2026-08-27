@@ -678,6 +678,13 @@ func (s *fakeStream) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) 
 			return err
 		}
 		return s.rfq()
+	case *pgshardv1.ExecuteRequest_Flush:
+		// Like Sync but with the pooler's own marker instead of
+		// ReadyForQuery, which is what a Flush produces on the wire.
+		if err := s.runBatch(ctx); err != nil {
+			return err
+		}
+		return s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_FlushComplete{FlushComplete: &pgshardv1.FlushComplete{}}})
 	default:
 		s.batch = append(s.batch, req)
 		return nil
