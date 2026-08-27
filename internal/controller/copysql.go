@@ -163,9 +163,21 @@ type RelState byte
 // yet (not started, or paused): it cannot be caught up.
 const LagUnknown int64 = -1
 
+// BlockerSamples bounds how many non-ready relations a progress record
+// names. It is a sample, not a list: the point is to say WHICH target and
+// table are blocking, not to enumerate every one.
+const BlockerSamples = 3
+
 // SubscriptionProgress is what one subscription reports.
 type SubscriptionProgress struct {
-	Rels map[RelState]int
+	// Name is the subscription, which encodes the target and source shard.
+	Name string
+	// Blockers samples the relations not yet ready, as "schema.table(state)".
+	// Without them a workflow reporting "5/8 tables ready" says nothing
+	// about which three are stuck, and an operator has to query the
+	// subscription views on every target during the incident.
+	Blockers []string
+	Rels     map[RelState]int
 	// LagBytes is the source WAL position minus the applied position, or
 	// LagUnknown.
 	LagBytes int64
@@ -180,6 +192,20 @@ type CopyProgress struct {
 	TablesReady   int   `json:"tables_ready"`
 	LagBytes      int64 `json:"lag_bytes"`
 	Paused        int   `json:"paused"`
+	// Blockers samples which subscriptions and relations are not ready,
+	// bounded by BlockerSamples so the status stays a fixed size however
+	// many tables a workflow moves.
+	Blockers []string `json:"blockers,omitempty"`
+}
+
+// Describe renders the progress for a status message, naming the blockers
+// when there are any.
+func (p CopyProgress) Describe() string {
+	s := fmt.Sprintf("%d/%d tables ready, lag %d bytes", p.TablesReady, p.TablesTotal, p.LagBytes)
+	if len(p.Blockers) > 0 {
+		s += "; waiting on " + strings.Join(p.Blockers, ", ")
+	}
+	return s
 }
 
 // Aggregate folds subscription reports into one progress record; lag is
@@ -188,6 +214,15 @@ func Aggregate(reports []SubscriptionProgress) CopyProgress {
 	var p CopyProgress
 	for _, r := range reports {
 		p.Subscriptions++
+		for _, b := range r.Blockers {
+			if len(p.Blockers) >= BlockerSamples {
+				break
+			}
+			if r.Name != "" {
+				b = r.Name + " " + b
+			}
+			p.Blockers = append(p.Blockers, b)
+		}
 		for st, n := range r.Rels {
 			p.TablesTotal += n
 			if st == 'r' {

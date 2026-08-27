@@ -198,3 +198,37 @@ func TestExpandShardTemplate(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+// TestProgressNamesItsBlockers: "5/8 tables ready, lag 0 bytes" is what a
+// stalled reshard reported for 35 minutes, and it does not say which three
+// tables are stuck -- the diagnosis needed the must-gather and the target's
+// PostgreSQL log. The status should name them.
+func TestProgressNamesItsBlockers(t *testing.T) {
+	reports := []SubscriptionProgress{
+		{Name: "pgshard_reshard_g2_t0_s0", Rels: map[RelState]int{'r': 2}, LagBytes: 0, Enabled: true},
+		{Name: "pgshard_reshard_g2_t0_s1", Rels: map[RelState]int{'r': 3, 'd': 3}, LagBytes: 0, Enabled: true,
+			Blockers: []string{"public.ledger(d)", "public.orders(d)", "public.accounts(d)"}},
+	}
+	p := Aggregate(reports)
+	if p.TablesReady != 5 || p.TablesTotal != 8 {
+		t.Fatalf("progress %d/%d, want 5/8", p.TablesReady, p.TablesTotal)
+	}
+	got := p.Describe()
+	for _, want := range []string{"5/8 tables ready", "pgshard_reshard_g2_t0_s1", "public.ledger(d)"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("progress %q does not name %q; an operator still cannot tell which target or table is blocking", got, want)
+		}
+	}
+	// Bounded: a workflow moving hundreds of tables must not produce an
+	// unbounded status message.
+	if len(p.Blockers) > BlockerSamples {
+		t.Fatalf("%d blockers, want at most %d", len(p.Blockers), BlockerSamples)
+	}
+}
+
+func TestProgressWithoutBlockersIsUnchanged(t *testing.T) {
+	p := Aggregate([]SubscriptionProgress{{Name: "s", Rels: map[RelState]int{'r': 4}, LagBytes: 12}})
+	if got := p.Describe(); got != "4/4 tables ready, lag 12 bytes" {
+		t.Fatalf("describe = %q", got)
+	}
+}
