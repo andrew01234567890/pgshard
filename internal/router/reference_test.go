@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -487,5 +488,56 @@ func TestStatementPreparedWhileAnotherShardIsParkedIsReplayedOnRevival(t *testin
 	}
 	if n != 1 {
 		t.Fatalf("shard %d executed the statement %d times", h.shardOf(t, tenant), n)
+	}
+}
+
+// TestReferenceWriteWithReturningTellsTheClientNothingUntilEveryShardRan:
+// the canonical shard used to write its rows and CommandComplete straight
+// to the client while the other shards were still running, so a client was
+// told a write had succeeded and only then learned another shard had
+// failed and the whole thing was aborted. A RETURNING large enough to
+// flush had already reached the socket, past retracting.
+func TestReferenceWriteWithReturningTellsTheClientNothingUntilEveryShardRan(t *testing.T) {
+	h := newRefHarness(t)
+	ctx := context.Background()
+	conn := h.connect(t, h.dsn())
+	const sql = "update regions set name = 'z' returning id"
+	// Shard 2 fails; every other shard, including the canonical one, would
+	// have succeeded and produced rows.
+	// Held back so the canonical shard certainly finishes first: that is
+	// the ordering the bug needs, and leaving it to the scheduler tests
+	// nothing in particular.
+	h.poolers[2].script(sql, script{err: "relation \"regions\" does not exist on shard 2", delay: 250 * time.Millisecond})
+	// Over the 256-row flush threshold: below it the rows sit in pgwire's
+	// buffer and the error can still replace them, so a smaller result
+	// hides the bug rather than testing it.
+	vals := make([]string, 300)
+	for i := range vals {
+		vals[i] = fmt.Sprint(i)
+	}
+	for i := range h.poolers {
+		if i != 2 {
+			h.poolers[i].script(sql, int4Rows(vals...))
+		}
+	}
+	var seen int
+	rows, err := conn.Query(ctx, sql)
+	if err == nil {
+		for rows.Next() {
+			seen++
+		}
+		err = rows.Err()
+		rows.Close()
+	}
+	var pe *pgconn.PgError
+	if !errors.As(err, &pe) || !strings.Contains(pe.Message, "shard 2") {
+		t.Fatalf("expected the failing shard's error, got %v", err)
+	}
+	// The error arriving is not enough: the statement failed, so no row of
+	// its RETURNING may have reached the client first. Rows followed by an
+	// error is precisely the defect -- the client was told the write had
+	// produced these rows, and only afterwards that it had been aborted.
+	if seen != 0 {
+		t.Fatalf("the client was given %d rows before learning the write failed on shard 2", seen)
 	}
 }
