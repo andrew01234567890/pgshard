@@ -176,7 +176,14 @@ func (s *session) revokedNow() bool {
 func (s *session) drain() {
 	s.mu.Lock()
 	s.draining = true
-	idle := !s.active && !s.inTxn && !s.closed
+	// A session is registered on the server before startup runs, so drain
+	// can reach one still authenticating. Writing the FATAL to its socket
+	// then puts a second writer on a connection the startup path is still
+	// sending through, and the client reads the two interleaved: the
+	// terminate it was about to be sent lands inside its startup exchange
+	// and is gone by the time it looks for it. A session that has not
+	// finished startup ends through the check below instead.
+	idle := s.serving && !s.active && !s.inTxn && !s.closed
 	s.mu.Unlock()
 	if idle {
 		// The session goroutine is blocked in Receive, so write the error
@@ -497,6 +504,14 @@ func (s *session) startup(ctx context.Context) error {
 	// latching: the client is authenticated, so telling it why gives
 	// nothing away.
 	s.mu.Lock()
+	// A drain that arrived during startup left only the flag: it is this
+	// session's own job to act on it, now that nothing else is writing to
+	// the connection.
+	if s.draining && !s.inTxn {
+		s.mu.Unlock()
+		s.terminate(Errorf(CodeAdminShutdown, "terminating connection due to administrator command"))
+		return errors.New("session drained during startup")
+	}
 	s.serving = true
 	late := s.revoked
 	if late && s.queryCancel != nil {

@@ -1229,3 +1229,61 @@ func TestRevocationInTheExecutorInstallGap(t *testing.T) {
 		t.Fatal("no error reported to a session revoked in the install gap")
 	}
 }
+
+// liveSessions is the server's registered sessions. testServer has a mutex
+// of its own, which shadows the embedded server's, so the lock -- and only
+// the lock -- has to name it; this keeps that asymmetry in one place.
+func (ts *testServer) liveSessions() []*session {
+	ts.Server.mu.Lock()
+	defer ts.Server.mu.Unlock()
+	out := make([]*session, 0, len(ts.sessions))
+	for _, sess := range ts.sessions {
+		out = append(out, sess)
+	}
+	return out
+}
+
+// TestDrainDuringStartupStillTellsTheClientWhy: a session is on the
+// server's registry before startup runs, so a drain can reach one still
+// authenticating. Writing the FATAL straight to its socket then put a
+// second writer on a connection the startup path was still sending
+// through, and the client read the two interleaved -- the terminate landed
+// inside its own handshake and was gone by the time it looked for it.
+func TestDrainDuringStartupStillTellsTheClientWhy(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		ts := startServer(t, Config{})
+		c := dialRaw(t, ts.addr)
+		drained := make(chan int, 1)
+		go func() {
+			// The server is blocked reading the startup packet by now, so
+			// the session is registered and not yet serving: the window
+			// this test exists for.
+			time.Sleep(2 * time.Millisecond)
+			all := ts.liveSessions()
+			for _, sess := range all {
+				sess.drain()
+			}
+			drained <- len(all)
+		}()
+		time.Sleep(20 * time.Millisecond)
+		if n := <-drained; n != 1 {
+			t.Fatalf("run %d: drained %d sessions, want the one still starting up", i, n)
+		}
+		// The handshake still completes: the drain must not have written
+		// into the middle of it.
+		c.startup(ProtocolVersion30)
+		_ = c.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		msg, err := c.fe.Receive()
+		if err != nil {
+			t.Fatalf("run %d: client left with no explanation: %v", i, err)
+		}
+		er, ok := msg.(*pgproto3.ErrorResponse)
+		if !ok {
+			t.Fatalf("run %d: got %T, want the admin shutdown FATAL", i, msg)
+		}
+		if er.Code != CodeAdminShutdown || er.Severity != "FATAL" {
+			t.Fatalf("run %d: got %s %s, want a FATAL %s", i, er.Severity, er.Code, CodeAdminShutdown)
+		}
+		_ = c.conn.Close()
+	}
+}
