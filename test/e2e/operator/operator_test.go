@@ -421,7 +421,10 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 
 	t.Run("RouterDeploymentAndHPA", func(t *testing.T) {
 		rsel := sel + ",pgshard.io/component=router"
-		for kind, want := range map[string]int{"deployment": 1, "hpa": 1, "pdb": 1, "svc": 1, "serviceaccount": 1} {
+		// Two Services: the ClusterIP applications connect to, and the
+		// headless one whose DNS lets a replica forward a cancel to the
+		// replica that owns the session.
+		for kind, want := range map[string]int{"deployment": 1, "hpa": 1, "pdb": 1, "svc": 2, "serviceaccount": 1} {
 			if n := count(ctx, t, c, kind, rsel); n != want {
 				t.Errorf("router %s: got %d want %d", kind, n, want)
 			}

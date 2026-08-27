@@ -57,6 +57,10 @@ const (
 	agentHTTPPort = 8080
 	// routerHTTPPort serves the router's /metrics, /readyz and /healthz.
 	routerHTTPPort = 8080
+	// routerPeerPort carries cancels forwarded between router replicas. A
+	// CancelRequest opens a new connection, so the load balancer is free to
+	// land it on a replica that never saw the session it names.
+	routerPeerPort = 9090
 	agentGRPCPort  = 9090
 	superuserName  = "postgres"
 	secretKey      = "password"
