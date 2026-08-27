@@ -1334,3 +1334,36 @@ func TestDrainDuringStartupNeverLeavesTheClientWaiting(t *testing.T) {
 		_ = conn.Close()
 	}
 }
+
+// TestDrainBetweenServingAndIdleStillTerminates: the whole of startup
+// counts as one message, so a session stays marked active until run()
+// clears it -- while serving is set inside startup, at its end. A drain
+// landing in that window sees a session both serving and active and takes
+// neither branch: not the direct write, because it looks busy, and not the
+// end-of-startup check, because that has already run. The message loop
+// would not look again until the client sent something, and an idle client
+// never does, so the session waited for a terminate that never came.
+//
+// The client's startup returns on its ReadyForQuery, which the server
+// flushes before either of those two happen -- so draining right then is
+// the window.
+func TestDrainBetweenServingAndIdleStillTerminates(t *testing.T) {
+	for i := 0; i < 25; i++ {
+		ts := startServer(t, Config{})
+		c := dialRaw(t, ts.addr)
+		c.startup(ProtocolVersion30)
+		for _, sess := range ts.liveSessions() {
+			sess.drain()
+		}
+		_ = c.conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		msg, err := c.fe.Receive()
+		if err != nil {
+			t.Fatalf("run %d: drained session never answered: %v", i, err)
+		}
+		er, ok := msg.(*pgproto3.ErrorResponse)
+		if !ok || er.Code != CodeAdminShutdown || er.Severity != "FATAL" {
+			t.Fatalf("run %d: got %T %+v, want the admin shutdown FATAL", i, msg, msg)
+		}
+		_ = c.conn.Close()
+	}
+}
