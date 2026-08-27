@@ -90,12 +90,41 @@ type cutoverState struct {
 	FenceMS    int64      `json:"fence_ms,omitempty"`
 	SwitchedAt *time.Time `json:"switched_at,omitempty"`
 	Gate       string     `json:"gate,omitempty"`
+	// StepSince is when the current step was entered. After the journal
+	// every error is retried without a timeout or attempt limit, and each
+	// pass refreshes updated_at, so a step that has failed for hours is
+	// indistinguishable from a healthy running workflow without this.
+	StepSince *time.Time `json:"step_since,omitempty"`
 	// Schema fingerprints both sets at the switch, keyed set/shard/database.
 	// Logical replication carries no DDL, so a rollback has to prove the
 	// sources were not left structurally behind while they were idle.
 	Schema map[string]string `json:"schema,omitempty"`
 	Aborts []string          `json:"aborts,omitempty"`
 }
+
+// stampStep records when the current step was entered.
+func (s *cutoverState) stampStep(now time.Time) {
+	t := now
+	s.StepSince = &t
+}
+
+// stalledFor renders how long the current step has been retrying, once that
+// is long enough to be worth saying. A post-journal step has no timeout and
+// no attempt limit, so the age is the only signal that it is not progressing.
+func (s *cutoverState) stalledFor(now time.Time) string {
+	if s.StepSince == nil {
+		return ""
+	}
+	d := now.Sub(*s.StepSince)
+	if d < stalledAfter {
+		return ""
+	}
+	return fmt.Sprintf(" (step %s has not advanced for %s)", s.Step, d.Round(time.Second))
+}
+
+// stalledAfter is how long a single cutover step may retry before its age is
+// reported in the status.
+const stalledAfter = 2 * time.Minute
 
 // cutoverSpec is what the operator mirrors into the workflow spec.
 type cutoverSpec struct {
@@ -273,6 +302,7 @@ func (c *Copier) rollback(ctx context.Context, wf *copyWorkflow, ops cutoverOps)
 func (c *Copier) switchWrites(ctx context.Context, wf *copyWorkflow, ops cutoverOps) (bool, error) {
 	if wf.cutover.Step == "" {
 		wf.cutover.Step = StepFence
+		wf.cutover.stampStep(c.now())
 	}
 	for {
 		step := wf.cutover.Step
@@ -315,10 +345,12 @@ func (c *Copier) switchWrites(ctx context.Context, wf *copyWorkflow, ops cutover
 			if err != nil {
 				msg += ": " + strings.TrimPrefix(err.Error(), errRetry.Error()+": ")
 			}
+			msg += wf.cutover.stalledFor(c.now())
 			return false, c.saveCutover(ctx, wf, msg)
 		}
 		next := nextStep(step)
 		wf.cutover.Step = next
+		wf.cutover.stampStep(c.now())
 		if next == "" {
 			now := c.now()
 			wf.cutover.SwitchedAt = &now
