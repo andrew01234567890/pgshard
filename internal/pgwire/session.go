@@ -304,6 +304,21 @@ func (s *session) run() {
 		}
 		return
 	}
+	// The whole of startup counts as one message, so active stays set until
+	// the endMessage just above -- while serving is set inside startup, at
+	// its end. A drain landing in that window sees a session that is
+	// serving and active, takes neither branch, and leaves only the flag.
+	// The loop below would not look again until the client sent something,
+	// and an idle client has no reason to, so the session waited for a
+	// terminate that never came. Now that active is clear, the flag is
+	// this session's to act on.
+	s.mu.Lock()
+	drained := s.draining && !s.inTxn
+	s.mu.Unlock()
+	if drained {
+		s.terminate(Errorf(CodeAdminShutdown, "terminating connection due to administrator command"))
+		return
+	}
 	defer func() {
 		s.mu.Lock()
 		s.active = false
