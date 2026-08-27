@@ -152,6 +152,10 @@ func PrimaryConninfo(c *Config) string {
 	return strings.Join(parts, " ")
 }
 
+// superuserRole is the identity initdb creates and every control-plane
+// component connects as; see instance.go, which runs initdb -U postgres.
+const superuserRole = "postgres"
+
 // RenderPgHBAConf renders pg_hba.conf.
 func RenderPgHBAConf(c *Config) string {
 	host := "hostnossl"
@@ -169,8 +173,21 @@ func RenderPgHBAConf(c *Config) string {
 	b.WriteString("local   all             all                                     scram-sha-256\n")
 	b.WriteString("local   replication     all                                     scram-sha-256\n")
 	b.WriteString(tlsLine)
-	fmt.Fprintf(&b, "%-8s all             all             %-23s scram-sha-256\n", hostKeyword(host), cidr)
-	fmt.Fprintf(&b, "%-8s replication     all             %-23s scram-sha-256\n", hostKeyword(host), cidr)
+	// TCP is the control plane's path and nothing else's. Replicas, the
+	// controller and the router all reach a member as the superuser; the
+	// pooler an application actually talks through connects over the unix
+	// socket above, so an application role has no reason to arrive here.
+	//
+	// It had one before: any role could authenticate over TCP, and the
+	// roles are materialised with their verifiers on every group. A client
+	// that could reach a member could therefore connect to a shard of its
+	// choosing and write directly to it -- past the router, and so past
+	// shard-key routing, the write fences a cutover raises, and the
+	// coordination that makes a multi-shard write atomic. SCRAM proved who
+	// it was; nothing checked it had come the right way.
+	fmt.Fprintf(&b, "%-8s all             %-15s %-23s scram-sha-256\n", hostKeyword(host), superuserRole, cidr)
+	fmt.Fprintf(&b, "%-8s replication     %-15s %-23s scram-sha-256\n", hostKeyword(host), superuserRole, cidr)
+	fmt.Fprintf(&b, "%-8s all             all             %-23s reject\n", hostKeyword(host), cidr)
 	if host == "hostssl" {
 		fmt.Fprintf(&b, "%-8s all             all             %-23s reject\n", "hostnossl", cidr)
 	}

@@ -293,3 +293,48 @@ func TestLogicalWorkersExceedSubscriptions(t *testing.T) {
 		}
 	}
 }
+
+// TestPgHBARefusesApplicationRolesOverTCP: application roles are
+// materialised with their verifiers on every group, so a client that could
+// reach a member could connect straight to a shard of its choosing and
+// write to it -- past the router, and so past shard-key routing, the write
+// fences a cutover raises, and the coordination that makes a multi-shard
+// write atomic. SCRAM proved who the client was; nothing checked it had
+// come the right way.
+//
+// TCP is the control plane's path: replicas, the controller and the router
+// all arrive as the superuser, and the pooler an application talks through
+// connects over the unix socket.
+func TestPgHBARefusesApplicationRolesOverTCP(t *testing.T) {
+	for _, tls := range []bool{false, true} {
+		c := testConfig()
+		if tls {
+			c.TLS = TLSFiles{CertFile: "/certs/tls.crt", KeyFile: "/certs/tls.key", CAFile: "/certs/ca.crt"}
+		}
+		var host, superuser, reject int
+		for _, line := range strings.Split(RenderPgHBAConf(c), "\n") {
+			f := strings.Fields(line)
+			if len(f) < 4 || strings.HasPrefix(line, "#") || f[0] == "local" {
+				continue
+			}
+			host++
+			role, method := f[2], f[len(f)-1]
+			switch {
+			case method == "reject":
+				reject++
+			case role == "postgres":
+				superuser++
+			default:
+				t.Errorf("tls=%v: %q lets role %q authenticate over TCP", tls, line, role)
+			}
+		}
+		if superuser == 0 || reject == 0 || host != superuser+reject {
+			t.Errorf("tls=%v: %d TCP lines, %d superuser, %d reject", tls, host, superuser, reject)
+		}
+		// The socket stays open to everything: that is how the pooler, and
+		// so every application, actually reaches this instance.
+		if !strings.Contains(RenderPgHBAConf(c), "local   all             all") {
+			t.Errorf("tls=%v: local connections must still admit every role", tls)
+		}
+	}
+}
