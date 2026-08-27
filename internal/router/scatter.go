@@ -8,7 +8,6 @@ import (
 	"sync"
 
 	"github.com/jackc/pgx/v5/pgproto3"
-	"google.golang.org/protobuf/proto"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
@@ -293,7 +292,7 @@ func (e *Executor) runScatter(ctx context.Context, shards []int32, m *plan.Merge
 			}
 		}
 		for _, req := range reqs {
-			if err := ps.send(cloneRequest(req), p.sid, gen, e.ident, e.info.Database); err != nil {
+			if err := ps.send(perShard(req), p.sid, gen, e.ident, e.info.Database); err != nil {
 				return pgwire.Errorf(codeConnectionFailure, "pooler connection lost: %v", err)
 			}
 		}
@@ -341,8 +340,18 @@ func (e *Executor) runScatter(ctx context.Context, shards []int32, m *plan.Merge
 	return nil
 }
 
-func cloneRequest(req *pgshardv1.ExecuteRequest) *pgshardv1.ExecuteRequest {
-	return proto.Clone(req).(*pgshardv1.ExecuteRequest)
+// perShard gives one shard its own ExecuteRequest header while sharing the
+// payload. send() stamps the session id, generation, identity and database
+// onto whatever it is handed, which is why each shard needs a struct of its
+// own -- but it never touches Message, so the SQL, the parameters and the
+// format vectors do not need copying. Deep-cloning them made the work of a
+// scatter proportional to shards times protocol operations, for fields that
+// are identical on every shard.
+//
+// Safe because the sends are sequential: one participant at a time, and
+// gRPC marshals within Send. Nothing mutates the shared payload.
+func perShard(req *pgshardv1.ExecuteRequest) *pgshardv1.ExecuteRequest {
+	return &pgshardv1.ExecuteRequest{Message: req.GetMessage()}
 }
 
 // mergeScatter waits for every participant's RowDescription, checks they
