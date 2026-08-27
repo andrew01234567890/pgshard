@@ -60,6 +60,13 @@ type Placement struct {
 	// Migrating is set while a placement workflow moves the table: routers
 	// hold new writes to it until the swap publishes the new placement.
 	Migrating bool
+	// ReferenceChecked reports that the controller has inspected this
+	// reference table's shards for the generation in force. False means the
+	// inspection has not run, which is not the same as finding nothing.
+	ReferenceChecked bool
+	// ReferenceHazards is what that inspection found: everything a shard
+	// would evaluate for itself, and so differently on every shard.
+	ReferenceHazards []string
 }
 
 // Snapshot is an immutable view of the catalog taken in one transaction.
