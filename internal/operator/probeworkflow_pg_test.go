@@ -180,3 +180,48 @@ func shardStatusUpdatedAt(t *testing.T, conn *pgx.Conn, g Group) time.Time {
 	}
 	return at
 }
+
+// TestReshardWorkflowReportsJournalIDs: pgshard.workflows.journal_ids and
+// PgShardReshardStatus.journalIds both existed, and nothing carried one to
+// the other. A non-empty journal is how a responder knows the cutover passed
+// its point of no return -- the difference between backing out with a
+// desired-state edit and needing the workflow's own rollback -- and it was
+// visible only by connecting to the catalog directly.
+func TestReshardWorkflowReportsJournalIDs(t *testing.T) {
+	if err := exec.Command("docker", "info").Run(); err != nil {
+		dockertest.Unavailable(t, "docker unavailable")
+	}
+	ctx := context.Background()
+	dsn := startProbePostgres(t)
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if err := catalog.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+
+	// Before the journal: the switch has not committed.
+	mustProbeExec(t, conn, `INSERT INTO pgshard.workflows (id, kind, state, spec, status)
+		VALUES ('00000000-0000-0000-0000-0000000000aa'::uuid, 'reshard', 'running',
+		        '{"shard_set":"g2"}'::jsonb, '{"stage":"switching"}'::jsonb)`)
+	w, err := PgxProber{}.ReshardWorkflow(ctx, dsn, "g2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(w.JournalIDs) != 0 {
+		t.Fatalf("journal ids before the journal step: %v", w.JournalIDs)
+	}
+
+	// After the journal: the point of no return has passed.
+	mustProbeExec(t, conn, `UPDATE pgshard.workflows
+		SET journal_ids = ARRAY['j-1','j-2'] WHERE id = '00000000-0000-0000-0000-0000000000aa'::uuid`)
+	w, err = PgxProber{}.ReshardWorkflow(ctx, dsn, "g2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(w.JournalIDs) != 2 || w.JournalIDs[0] != "j-1" || w.JournalIDs[1] != "j-2" {
+		t.Fatalf("journal ids = %v, want [j-1 j-2]: a Kubernetes-only responder cannot tell the switch committed", w.JournalIDs)
+	}
+}

@@ -242,6 +242,11 @@ type WorkflowInfo struct {
 	// CutoverPauseMS is status.cutover.pause_ms: fence raised to new map
 	// published; zero before the switch.
 	CutoverPauseMS int64
+	// JournalIDs are the resharding journal ids the cutover wrote. A
+	// non-empty value means the switch passed its point of no return, which
+	// is the single most important thing a responder needs to know and was
+	// visible only by connecting to the catalog directly.
+	JournalIDs []string
 }
 
 // PlacementWorkflowInfo is one pgshard.workflows row of kind
@@ -352,9 +357,9 @@ func (PgxProber) ReshardWorkflow(ctx context.Context, dsn, shardSet string) (Wor
 	defer func() { _ = conn.Close(ctx) }()
 	var w WorkflowInfo
 	err = conn.QueryRow(ctx, `SELECT id::text, state, coalesce(status->>'stage', ''), coalesce(status->>'message', ''),
-			coalesce((status->'cutover'->>'pause_ms')::bigint, 0) FROM pgshard.workflows
+			coalesce((status->'cutover'->>'pause_ms')::bigint, 0), journal_ids FROM pgshard.workflows
 		WHERE kind IN ('reshard', 'upgrade') AND spec->>'shard_set' = $1
-		ORDER BY created_at DESC LIMIT 1`, shardSet).Scan(&w.ID, &w.State, &w.Stage, &w.Message, &w.CutoverPauseMS)
+		ORDER BY created_at DESC LIMIT 1`, shardSet).Scan(&w.ID, &w.State, &w.Stage, &w.Message, &w.CutoverPauseMS, &w.JournalIDs)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return WorkflowInfo{}, nil
 	}
