@@ -46,7 +46,8 @@ func TestRouterDeployment(t *testing.T) {
 		t.Errorf("custom image %q", got)
 	}
 	args := strings.Join(ctr.Args, " ")
-	want := "serve --listen=:5432 --health-listen=:8080 --catalog-dsn=host=demo-catalog-rw.ns1.svc port=5432 user=postgres dbname=postgres --catalog-pooler=demo-catalog-rw.ns1.svc:9091 --insecure-dev"
+	want := "serve --listen=:5432 --health-listen=:8080 --catalog-dsn=host=demo-catalog-rw.ns1.svc port=5432 user=postgres dbname=postgres --catalog-pooler=demo-catalog-rw.ns1.svc:9091 " +
+		"--peer-cancel-listen=:9090 --peer-service=demo-router-peers.ns1.svc:9090 --insecure-dev"
 	if args != want {
 		t.Errorf("args\n got %q\nwant %q", args, want)
 	}
@@ -123,7 +124,12 @@ func TestPoolerSidecarInMemberPod(t *testing.T) {
 		t.Errorf("pooler %s %s", pooler.Name, pooler.Image)
 	}
 	got := strings.Join(append(pooler.Command, pooler.Args...), " ")
-	for _, want := range []string{"pgshard-pooler run", "--listen :9091", "--pg-socket-dir /tmp", "--catalog-dsn ", "--shard-set catalog", "--shard-id 0", "--insecure-dev"} {
+	// Without --stream-dsn the pooler refuses every Stream and CopyTables
+	// call, so a change stream fails on its first request in any
+	// operator-deployed cluster. The database comes from the request, so
+	// the DSN only has to reach the local server.
+	for _, want := range []string{"pgshard-pooler run", "--listen :9091", "--pg-socket-dir /tmp", "--catalog-dsn ", "--shard-set catalog", "--shard-id 0",
+		"--stream-dsn host=/tmp user=postgres dbname=postgres", "--insecure-dev"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("command %q lacks %q", got, want)
 		}
@@ -294,5 +300,42 @@ func TestPoolerSidecarCarriesItsOwnShardSet(t *testing.T) {
 		if !strings.Contains(got, tc.want) {
 			t.Errorf("generation %d %s group: command lacks %q\n%s", tc.group.Generation, tc.group.Kind, tc.want, got)
 		}
+	}
+}
+
+// TestRouterPeerCancelIsWired: the default deployment is two replicas
+// behind one Service, and a CancelRequest arrives on a new connection, so
+// it lands on an arbitrary replica. Without a peer listener and a way to
+// find the others, the key is dropped and the query it named runs on.
+func TestRouterPeerCancelIsWired(t *testing.T) {
+	c := routerCluster()
+	if min, _ := RouterReplicas(c); min < 2 {
+		t.Fatalf("default router replicas = %d; peer cancels only matter above one", min)
+	}
+	svc := (Renderer{}).RouterPeerService(c)
+	if svc.Name != "demo-router-peers" {
+		t.Errorf("peer service name %q", svc.Name)
+	}
+	if svc.Spec.ClusterIP != corev1.ClusterIPNone {
+		t.Errorf("the peer service must be headless so DNS enumerates the replicas, got ClusterIP %q", svc.Spec.ClusterIP)
+	}
+	if !svc.Spec.PublishNotReadyAddresses {
+		t.Error("a draining replica still holds sessions a cancel must reach, so its address must stay in DNS")
+	}
+	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != routerPeerPort || svc.Spec.Ports[0].TargetPort.StrVal != "peer" {
+		t.Errorf("peer ports %+v", svc.Spec.Ports)
+	}
+	if svc.Spec.Selector[LabelComponent] != "router" {
+		t.Errorf("peer selector %v", svc.Spec.Selector)
+	}
+	ctr := (Renderer{}).RouterDeployment(c).Spec.Template.Spec.Containers[0]
+	var named bool
+	for _, p := range ctr.Ports {
+		if p.Name == "peer" && p.ContainerPort == routerPeerPort {
+			named = true
+		}
+	}
+	if !named {
+		t.Errorf("the deployment must expose the peer port the Service targets: %+v", ctr.Ports)
 	}
 }
