@@ -184,8 +184,8 @@ jobs:
           set -euo pipefail
           echo "$RESULTS"
           failed=$(echo "$RESULTS" | jq -r 'to_entries
-            | map(select(.value.result != "success"
-                         and not (.key == "pr-title" and .value.result == "skipped")))
+            | map(select(.value.result != "success"))
+            | map(select((.key == "pr-title" and .value.result == "skipped") | not))
             | map("\(.key)=\(.value.result)") | join(" ")')
           if [ -n "$failed" ]; then
             echo "::error::required jobs did not succeed: $failed"
