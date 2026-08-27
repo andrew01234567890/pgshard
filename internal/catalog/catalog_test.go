@@ -948,6 +948,66 @@ func runSuite(t *testing.T, img pgImage) {
 		expectPgError(t, err, "42501", "roles")
 	})
 
+	// The shard map is the effective routing state: ranges are what Locate
+	// hashes against, and the set marked serving is the one routers read.
+	// An admin may propose and shape a set; publishing one is the
+	// controller's, or a single UPDATE routes traffic at groups that were
+	// never provisioned.
+	t.Run("admin_cannot_publish_or_reshape_effective_topology", func(t *testing.T) {
+		admin := connect(t, dsn)
+		mustExec(t, admin, `SET ROLE `+RoleAdmin)
+		mustExec(t, conn, `INSERT INTO pgshard.shard_sets (shard_set, generation, state) VALUES ('gt', 40, 'desired')
+			ON CONFLICT (shard_set) DO NOTHING`)
+
+		// Shrinking one range reroutes every key it gives up, and creates
+		// no overlap, so it is refused by this check rather than by the
+		// coverage or exclusion constraints.
+		_, err := admin.Exec(ctx, `UPDATE pgshard.shard_ranges SET range = int8range(lower(range), 0)
+			WHERE shard_set = 'default' AND shard_id = (SELECT min(shard_id) FROM pgshard.shard_ranges WHERE shard_set = 'default')`)
+		expectPgError(t, err, "42501", "effective shard map")
+		_, err = admin.Exec(ctx, `DELETE FROM pgshard.shard_ranges WHERE shard_set = 'default'`)
+		expectPgError(t, err, "42501", "effective shard map")
+
+		_, err = admin.Exec(ctx, `UPDATE pgshard.shard_sets SET state = 'serving' WHERE shard_set = 'gt'`)
+		expectPgError(t, err, "42501", "cannot be moved from desired to serving")
+		_, err = admin.Exec(ctx, `INSERT INTO pgshard.shard_sets (shard_set, generation, state) VALUES ('gpub', 41, 'serving')`)
+		expectPgError(t, err, "42501", "may only be proposed in state desired")
+		_, err = admin.Exec(ctx, `DELETE FROM pgshard.shard_sets WHERE shard_set = 'default'`)
+		expectPgError(t, err, "42501", "cannot be dropped")
+		// Renaming a published set would leave its ranges under a name
+		// nothing serves: the same publication bug by another route.
+		_, err = admin.Exec(ctx, `UPDATE pgshard.shard_sets SET shard_set = 'renamed' WHERE shard_set = 'default'`)
+		expectPgError(t, err, "42501", "cannot be edited")
+
+		// What an admin proposes stays its own: shaping a desired set, and
+		// abandoning it, are the edits the reshard workflow is driven by.
+		mustExec(t, admin, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES ('gt', 0, '[,0)'::int8range), ('gt', 1, '[0,)'::int8range)`)
+		// Reshaping means replacing the ranges in one transaction, since no
+		// single row may move a boundary without overlapping its neighbour.
+		mustExec(t, admin, `BEGIN`)
+		mustExec(t, admin, `DELETE FROM pgshard.shard_ranges WHERE shard_set = 'gt'`)
+		mustExec(t, admin, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES ('gt', 0, '[,10)'::int8range), ('gt', 1, '[10,)'::int8range)`)
+		mustExec(t, admin, `COMMIT`)
+
+		// And none of it moved routing: the serving set and its ranges are
+		// what they were before the proposal existed.
+		var serving string
+		if err := conn.QueryRow(ctx, `SELECT shard_set FROM pgshard.shard_sets WHERE state = 'serving' ORDER BY generation DESC LIMIT 1`).Scan(&serving); err != nil {
+			t.Fatal(err)
+		}
+		if serving != "default" {
+			t.Fatalf("serving set = %s, want the proposal to have left routing alone", serving)
+		}
+
+		mustExec(t, admin, `DELETE FROM pgshard.shard_ranges WHERE shard_set = 'gt'`)
+		mustExec(t, admin, `DELETE FROM pgshard.shard_sets WHERE shard_set = 'gt'`)
+
+		// The control plane is not gated: it is the thing that publishes.
+		mustExec(t, conn, `INSERT INTO pgshard.shard_sets (shard_set, generation, state) VALUES ('gpub', 41, 'serving')`)
+		mustExec(t, conn, `UPDATE pgshard.shard_sets SET state = 'retired' WHERE shard_set = 'gpub'`)
+		mustExec(t, conn, `DELETE FROM pgshard.shard_sets WHERE shard_set = 'gpub'`)
+	})
+
 	t.Run("status_read_api", func(t *testing.T) {
 		mustExec(t, conn, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch)
 			VALUES ('default', 0, 'g0', 'serving', 3)`)
