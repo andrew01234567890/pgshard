@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -81,6 +82,9 @@ type script struct {
 	cols []scriptCol
 	rows [][]string
 	err  string
+	// delay holds this shard back, so a test can decide which shard
+	// answers first rather than leaving it to the scheduler.
+	delay time.Duration
 }
 
 type scriptCol struct {
@@ -112,6 +116,9 @@ func (s *fakeStream) scriptedDesc(sc script) error {
 // portal Describe already sent the RowDescription (as PostgreSQL then omits
 // it on Execute).
 func (s *fakeStream) scripted(sc script, described bool) error {
+	if sc.delay > 0 {
+		time.Sleep(sc.delay)
+	}
 	if sc.err != "" {
 		return s.errorf("42P01", sc.err)
 	}

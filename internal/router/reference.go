@@ -66,13 +66,32 @@ func (e *Executor) referenceWrite(ctx context.Context, pl plan.Plan, reqs []*pgs
 			}
 		}
 	}
-	e.each(targets, func(p *txnPart) error {
-		var out pgwire.ResultWriter = discardWriter{}
-		if p == targets[0] {
-			out = w
-		}
-		return e.runReqsOn(ctx, p, reqs, out)
-	})
+	// The canonical shard runs last, and alone. Running it alongside the
+	// others wrote its rows and CommandComplete straight to the client
+	// while they were still going, so a client was told the write had
+	// succeeded and only then learned another shard had failed and the
+	// whole thing was aborted -- and a RETURNING over 255 rows had already
+	// reached the socket, past retracting.
+	//
+	// Ordering it after them, rather than buffering its output, keeps the
+	// memory bounded: a reference table's RETURNING is unbounded in
+	// principle and holding it all to release it later would trade this
+	// bug for a way to exhaust the router.
+	//
+	// What this does not cover, and cannot: the implicit commit still runs
+	// after the client has its rows. Single-node PostgreSQL behaves the
+	// same way -- CommandComplete precedes the implicit commit, and a
+	// commit that fails reports an error after it -- so that is parity
+	// rather than a gap of ours.
+	canonical, others := targets[0], targets[1:]
+	if len(others) > 0 {
+		e.each(others, func(p *txnPart) error {
+			return e.runReqsOn(ctx, p, reqs, discardWriter{})
+		})
+	}
+	if err := firstError(others); err == nil {
+		canonical.err = e.runReqsOn(ctx, canonical, reqs, w)
+	}
 	e.syncCurrent(targets)
 	if err := firstError(targets); err != nil {
 		e.each(targets, func(p *txnPart) error {
