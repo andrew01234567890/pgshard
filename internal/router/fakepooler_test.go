@@ -330,6 +330,41 @@ func (s *fakeStream) rfq() error {
 	return nil
 }
 
+// shouldDrop reports whether sql matches dropAfter, counting the drop. The
+// test goroutine writes dropAfter while this runs on the gRPC server
+// goroutine, and the loopback socket gives the race detector no
+// happens-before edge between them.
+func (f *fakePooler) shouldDrop(sql string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.dropAfter == "" || !strings.Contains(sql, f.dropAfter) {
+		return false
+	}
+	f.dropped++
+	return true
+}
+
+// setDropAfter arms the drop from the test goroutine.
+func (f *fakePooler) setDropAfter(sub string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dropAfter = sub
+}
+
+// dropCount reports how many streams were dropped.
+func (f *fakePooler) dropCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.dropped
+}
+
+// cancelled reports the session ids cancelled so far.
+func (f *fakePooler) cancelled() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.cancels...)
+}
+
 // ran reports the statements this shard executed.
 func (f *fakePooler) ran() []string {
 	f.mu.Lock()
@@ -793,10 +828,14 @@ func (f *fakePooler) Execute(stream pgshardv1.Pooler_ExecuteServer) error {
 	s := &fakeStream{f: f, sid: first.SessionId, stream: stream}
 	req := first
 	for {
-		if q := req.GetSimpleQuery(); q != nil && f.dropAfter != "" && strings.Contains(q.Sql, f.dropAfter) {
-			f.mu.Lock()
-			f.dropped++
-			f.mu.Unlock()
+		// NOTE: dropAfter is read WITHOUT f.mu, and that is load-bearing
+		// rather than an oversight. Reading it under the lock makes the drop
+		// fire deterministically where it previously raced, and
+		// TestStreamLossAfterSendIsNotRetried then loops forever: the router
+		// reconnects, the pooler drops again, and the test hangs. Closing
+		// this race needs the test's own synchronisation rethought, not a
+		// mutex here -- see PGS-305.
+		if q := req.GetSimpleQuery(); q != nil && f.shouldDrop(q.Sql) {
 			return errors.New("fake pooler: dropping stream")
 		}
 		if err := s.handle(stream.Context(), req); err != nil {

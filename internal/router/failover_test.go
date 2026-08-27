@@ -249,14 +249,12 @@ func TestStreamLossAfterSendIsNotRetried(t *testing.T) {
 	h := newHarness(t)
 	conn := h.connect(t, h.dsn("app", "secret", "app"))
 	ctx := context.Background()
-	h.fp.dropAfter = "select 1"
+	h.fp.setDropAfter("select 1")
 	_, err := conn.Exec(ctx, "select 1", pgx.QueryExecModeSimpleProtocol)
 	if sqlstate(err) != "08006" {
 		t.Fatalf("stream loss after output: %v", err)
 	}
-	h.fp.mu.Lock()
-	dropped := h.fp.dropped
-	h.fp.mu.Unlock()
+	dropped := h.fp.dropCount()
 	if dropped != 1 {
 		t.Fatalf("statement was retried: dropped=%d", dropped)
 	}

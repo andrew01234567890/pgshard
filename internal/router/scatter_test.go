@@ -226,9 +226,7 @@ func TestScatterClientCancelReachesEveryShard(t *testing.T) {
 		t.Fatalf("cancel: %v", err)
 	}
 	for i, fp := range h.poolers {
-		fp.mu.Lock()
-		cancels := append([]string(nil), fp.cancels...)
-		fp.mu.Unlock()
+		cancels := fp.cancelled()
 		found := false
 		for _, c := range cancels {
 			if strings.HasPrefix(c, h.sidOf(t)+"-x") && strings.HasSuffix(c, "-"+itoa(int64(i))) {

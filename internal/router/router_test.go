@@ -384,8 +384,8 @@ func TestCancelReachesPooler(t *testing.T) {
 	if sqlstate(err) != "57014" {
 		t.Fatalf("cancel: %v", err)
 	}
-	if len(h.fp.cancels) != 1 {
-		t.Fatalf("pooler cancels %v", h.fp.cancels)
+	if c := h.fp.cancelled(); len(c) != 1 {
+		t.Fatalf("pooler cancels %v", c)
 	}
 	var n int
 	if err := conn.QueryRow(ctx, "select 1").Scan(&n); err != nil || n != 1 {
@@ -442,18 +442,18 @@ func TestPoolerStreamLossReportsAndRecovers(t *testing.T) {
 	if _, err := conn.Exec(ctx, "set application_name to 'x'"); err != nil {
 		t.Fatal(err)
 	}
-	h.fp.dropAfter = "select 1"
+	h.fp.setDropAfter("select 1")
 	_, err := conn.Exec(ctx, "select 1", pgx.QueryExecModeSimpleProtocol)
 	if sqlstate(err) != "08006" {
 		t.Fatalf("stream loss: %v", err)
 	}
-	h.fp.dropAfter = ""
+	h.fp.setDropAfter("")
 	var v string
 	if err := conn.QueryRow(ctx, "select current_setting('application_name')").Scan(&v); err != nil || v != "x" {
 		t.Fatalf("after recovery: %q %v", v, err)
 	}
-	if h.fp.dropped != 1 {
-		t.Fatalf("dropped %d", h.fp.dropped)
+	if h.fp.dropCount() != 1 {
+		t.Fatalf("dropped %d", h.fp.dropCount())
 	}
 }
 
