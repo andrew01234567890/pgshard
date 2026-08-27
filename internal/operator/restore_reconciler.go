@@ -198,7 +198,10 @@ func (r *RestoreReconciler) create(ctx context.Context, rs *pgshardv1alpha1.PgSh
 		if perr != nil {
 			return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("cannot read %s's superuser secret to confirm barrier %q: %v", source.Name, name, perr))
 		}
-		ok, cerr := r.Barriers.CertifiedBarrier(ctx, CatalogDSN(&source), password, BarrierRestorePoint(name))
+		// pgshard.restore_points is keyed by the barrier's own name; the
+		// pgshard- prefix belongs to the WAL restore point the recovery
+		// target names, not to the catalog row.
+		ok, cerr := r.Barriers.CertifiedBarrier(ctx, CatalogDSN(&source), password, name)
 		if cerr != nil {
 			return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("cannot confirm barrier %q is certified on %s: %v", name, source.Name, cerr))
 		}

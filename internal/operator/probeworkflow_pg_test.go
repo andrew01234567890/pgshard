@@ -225,3 +225,47 @@ func TestReshardWorkflowReportsJournalIDs(t *testing.T) {
 		t.Fatalf("journal ids = %v, want [j-1 j-2]: a Kubernetes-only responder cannot tell the switch committed", w.JournalIDs)
 	}
 }
+
+// TestCertifiedBarrierReadsTheCatalogRowOnPostgres: the fake in the unit
+// test answers whatever name it is handed, so it cannot tell the barrier's
+// own name from the WAL restore point's. Only a real catalog can, and
+// asking for the wrong one finds no row -- which reads as uncertified and
+// turns the gate into a blanket refusal of the barriers it exists to admit.
+func TestCertifiedBarrierReadsTheCatalogRowOnPostgres(t *testing.T) {
+	if err := exec.Command("docker", "info").Run(); err != nil {
+		dockertest.Unavailable(t, "docker unavailable")
+	}
+	ctx := context.Background()
+	dsn := startProbePostgres(t)
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if err := catalog.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	mustProbeExec(t, conn, `INSERT INTO pgshard.restore_points (id, name, shard_map_generation, per_group, certified)
+		VALUES (gen_random_uuid(), 'nightly', 7, '{}'::jsonb, true),
+		       (gen_random_uuid(), 'aborted', 7, '{}'::jsonb, false)`)
+
+	for _, c := range []struct {
+		name string
+		want bool
+	}{
+		{"nightly", true},
+		{"aborted", false},
+		{"never-taken", false},
+		// The name the recovery target uses, which is not what the row is
+		// keyed by. This is the case the fake could never fail on.
+		{BarrierRestorePoint("nightly"), false},
+	} {
+		got, err := PgxProber{}.CertifiedBarrier(ctx, dsn, "", c.name)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if got != c.want {
+			t.Errorf("CertifiedBarrier(%q) = %v, want %v", c.name, got, c.want)
+		}
+	}
+}

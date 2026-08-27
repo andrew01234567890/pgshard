@@ -400,8 +400,12 @@ func TestRestoreRefusesAnUncertifiedBarrier(t *testing.T) {
 	if cert.password != "source-pw" {
 		t.Fatalf("certifier password = %q, want the source cluster's superuser secret", cert.password)
 	}
-	if cert.asked != BarrierRestorePoint(barrier) {
-		t.Fatalf("asked about %q, want the restore point name %q", cert.asked, BarrierRestorePoint(barrier))
+	// The catalog row is keyed by the barrier name. Asking for the WAL
+	// restore point's name instead finds nothing, and "no row" reads as
+	// uncertified -- so the gate refuses every barrier, including the good
+	// ones it exists to admit.
+	if cert.asked != barrier {
+		t.Fatalf("asked about %q, want the barrier name %q as pgshard.restore_points keys it", cert.asked, barrier)
 	}
 	// The cluster must not exist: the point of the check is to refuse before
 	// any group is created.
