@@ -50,6 +50,29 @@ jobs:
       - run: make test
       - run: make build
 
+  envtest:
+    name: Envtest (API, operator, admin)
+    runs-on: ubuntu-latest
+    env:
+      # Missing control-plane assets must fail here, not exit zero. Over fifty
+      # deterministic tests -- CRD validation, failover, rolling restart,
+      # storage rebuild, reshard retirement, catalog upgrade -- used to skip
+      # silently because `make test` never sets KUBEBUILDER_ASSETS and no
+      # workflow called `make envtest`.
+      PGSHARD_REQUIRE_ENVTEST: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Cache envtest assets
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: bin/k8s
+          key: envtest-${{ runner.os }}-${{ hashFiles('Makefile', 'hack/envtest/setup-envtest.sh') }}
+      - run: make envtest
+
   proto:
     name: Proto lint and generated code drift
     runs-on: ubuntu-latest
@@ -150,7 +173,7 @@ jobs:
     # skipped. Requiring the jobs individually meant a new one -- proto drift
     # was the example -- stayed advisory until somebody remembered to add its
     # name to branch protection.
-    needs: [go, proto, govulncheck, secret-scan, actionlint, pr-title]
+    needs: [go, envtest, proto, govulncheck, secret-scan, actionlint, pr-title]
     if: always()
     runs-on: ubuntu-latest
     steps:

@@ -47,7 +47,9 @@ func TestUpgrade18To19UnderLoad(t *testing.T) {
 		return strings.HasPrefix(upgradeWorkflowState(ctx, t, c, "g2"), "provisioning:") ||
 			strings.HasPrefix(upgradeWorkflowState(ctx, t, c, "g2"), "running:")
 	})
-	waitFor(ctx, t, c, "writes switched to the 19 set", 30*time.Minute, func() bool {
+	waitForWhy(ctx, t, c, "writes switched to the 19 set", 30*time.Minute, func() string {
+		return upgradeWorkflowDetail(ctx, t, c)
+	}, func() bool {
 		if st := upgradeWorkflowState(ctx, t, c, "g2"); strings.HasPrefix(st, "failed") {
 			t.Fatalf("upgrade workflow failed: %s", catalogSQL(ctx, t, c, "SELECT coalesce(error, '') || ' ' || status::text FROM pgshard.workflows WHERE kind = 'upgrade'"))
 		}
@@ -94,7 +96,9 @@ func TestUpgrade18To19UnderLoad(t *testing.T) {
 	waitFor(ctx, t, c, "re-run upgrade record", 10*time.Minute, func() bool {
 		return jsonpath(ctx, c, "pgshardreshard", record3, "{.spec.mode}") == "upgrade"
 	})
-	waitFor(ctx, t, c, "writes switched to the 19 set again", 30*time.Minute, func() bool {
+	waitForWhy(ctx, t, c, "writes switched to the 19 set again", 30*time.Minute, func() string {
+		return upgradeWorkflowDetail(ctx, t, c)
+	}, func() bool {
 		if st := upgradeWorkflowState(ctx, t, c, "g3"); strings.HasPrefix(st, "failed") {
 			t.Fatalf("upgrade workflow failed: %s", catalogSQL(ctx, t, c, "SELECT coalesce(error, '') || ' ' || status::text FROM pgshard.workflows WHERE kind = 'upgrade' AND spec->>'shard_set' = 'g3'"))
 		}
@@ -155,7 +159,9 @@ func TestUpgrade18To19ChaosControllerAndPrimaryKill(t *testing.T) {
 	if _, err := c.Kubectl(ctx, nil, "-n", testNamespace, "delete", "pod", "-l", "app="+clusterName+"-controller", "--wait=false"); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(ctx, t, c, "writes switched to the 19 set", 30*time.Minute, func() bool {
+	waitForWhy(ctx, t, c, "writes switched to the 19 set", 30*time.Minute, func() string {
+		return upgradeWorkflowDetail(ctx, t, c)
+	}, func() bool {
 		if st := upgradeWorkflowState(ctx, t, c, "g2"); strings.HasPrefix(st, "failed") {
 			t.Fatalf("upgrade workflow failed: %s", catalogSQL(ctx, t, c, "SELECT coalesce(error, '') || ' ' || status::text FROM pgshard.workflows WHERE kind = 'upgrade'"))
 		}

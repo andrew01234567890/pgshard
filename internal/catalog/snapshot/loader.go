@@ -120,6 +120,7 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 	for _, n := range names {
 		s.Sequences[n] = true
 	}
+	s.index()
 	return s, tx.Commit(ctx)
 }
 
