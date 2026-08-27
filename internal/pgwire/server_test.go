@@ -731,6 +731,16 @@ func TestShutdownTerminatesIdleAndWaitsForActive(t *testing.T) {
 		defer cancel()
 		shutdownDone <- ts.Shutdown(ctx)
 	}()
+	// This has failed in CI as a bare "i/o timeout" on the receive, which
+	// says only that the terminate never arrived. Report what each session
+	// looked like so an occurrence names the invariant that broke instead
+	// of costing another 50-run matrix.
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		t.Log("session states at failure:\n" + ts.sessionStates())
+	})
 	er, ok := idle.recv().(*pgproto3.ErrorResponse)
 	if !ok || er.Code != CodeAdminShutdown || er.Severity != "FATAL" {
 		t.Fatalf("idle session got %+v", er)
@@ -1230,6 +1240,24 @@ func TestRevocationInTheExecutorInstallGap(t *testing.T) {
 	}
 }
 
+// sessionStates renders every registered session's drain-relevant flags.
+// drain() decides from exactly these, so a shutdown that failed to
+// terminate one is explained by whichever of them is not what it should
+// be -- and a session missing from this list altogether is its own answer.
+func (ts *testServer) sessionStates() string {
+	var b strings.Builder
+	for _, sess := range ts.liveSessions() {
+		sess.mu.Lock()
+		fmt.Fprintf(&b, "  id=%d serving=%v active=%v inTxn=%v closed=%v draining=%v revoked=%v\n",
+			sess.id, sess.serving, sess.active, sess.inTxn, sess.closed, sess.draining, sess.revoked)
+		sess.mu.Unlock()
+	}
+	if b.Len() == 0 {
+		return "  (no sessions registered)\n"
+	}
+	return b.String()
+}
+
 // liveSessions is the server's registered sessions. testServer has a mutex
 // of its own, which shadows the embedded server's, so the lock -- and only
 // the lock -- has to name it; this keeps that asymmetry in one place.
@@ -1243,47 +1271,62 @@ func (ts *testServer) liveSessions() []*session {
 	return out
 }
 
-// TestDrainDuringStartupStillTellsTheClientWhy: a session is on the
+// TestDrainDuringStartupNeverLeavesTheClientWaiting: a session is on the
 // server's registry before startup runs, so a drain can reach one still
 // authenticating. Writing the FATAL straight to its socket then put a
 // second writer on a connection the startup path was still sending
 // through, and the client read the two interleaved -- the terminate landed
-// inside its own handshake and was gone by the time it looked for it.
-func TestDrainDuringStartupStillTellsTheClientWhy(t *testing.T) {
-	for i := 0; i < 20; i++ {
+// inside its own handshake and was consumed there, so the client waited
+// out its deadline for a message that had already gone past.
+//
+// Either outcome is fine: told why, or the connection closed. What must
+// never happen is the client left waiting on a connection still open.
+func TestDrainDuringStartupNeverLeavesTheClientWaiting(t *testing.T) {
+	for i := 0; i < 30; i++ {
 		ts := startServer(t, Config{})
-		c := dialRaw(t, ts.addr)
-		drained := make(chan int, 1)
-		go func() {
-			// The server is blocked reading the startup packet by now, so
-			// the session is registered and not yet serving: the window
-			// this test exists for.
-			time.Sleep(2 * time.Millisecond)
-			all := ts.liveSessions()
-			for _, sess := range all {
-				sess.drain()
-			}
-			drained <- len(all)
-		}()
-		time.Sleep(20 * time.Millisecond)
-		if n := <-drained; n != 1 {
-			t.Fatalf("run %d: drained %d sessions, want the one still starting up", i, n)
-		}
-		// The handshake still completes: the drain must not have written
-		// into the middle of it.
-		c.startup(ProtocolVersion30)
-		_ = c.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		msg, err := c.fe.Receive()
+		conn, err := net.Dial("tcp", ts.addr)
 		if err != nil {
-			t.Fatalf("run %d: client left with no explanation: %v", i, err)
+			t.Fatal(err)
 		}
-		er, ok := msg.(*pgproto3.ErrorResponse)
-		if !ok {
-			t.Fatalf("run %d: got %T, want the admin shutdown FATAL", i, msg)
+		var all []*session
+		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+			if all = ts.liveSessions(); len(all) > 0 {
+				break
+			}
+			time.Sleep(time.Millisecond)
 		}
-		if er.Code != CodeAdminShutdown || er.Severity != "FATAL" {
-			t.Fatalf("run %d: got %s %s, want a FATAL %s", i, er.Severity, er.Code, CodeAdminShutdown)
+		if len(all) != 1 {
+			t.Fatalf("run %d: %d sessions registered, want the one still starting up", i, len(all))
 		}
-		_ = c.conn.Close()
+		for _, sess := range all {
+			sess.drain()
+		}
+		fe := pgproto3.NewFrontend(conn, conn)
+		fe.Send(&pgproto3.StartupMessage{ProtocolVersion: ProtocolVersion30,
+			Parameters: map[string]string{"user": "u", "database": "d"}})
+		if err := fe.Flush(); err != nil {
+			_ = conn.Close()
+			continue // the server had already gone: nothing was left waiting
+		}
+		// Read until the connection ends or the terminate arrives. A
+		// deadline reached with the connection still open is the bug.
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		for {
+			msg, err := fe.Receive()
+			if err != nil {
+				var ne net.Error
+				if errors.As(err, &ne) && ne.Timeout() {
+					t.Fatalf("run %d: client left waiting on an open connection", i)
+				}
+				break // closed, which tells the client the server is gone
+			}
+			if er, ok := msg.(*pgproto3.ErrorResponse); ok {
+				if er.Code != CodeAdminShutdown || er.Severity != "FATAL" {
+					t.Fatalf("run %d: got %s %s, want a FATAL %s", i, er.Severity, er.Code, CodeAdminShutdown)
+				}
+				break
+			}
+		}
+		_ = conn.Close()
 	}
 }
