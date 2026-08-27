@@ -1434,6 +1434,15 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 			if !e.popHidden() {
 				werr = w.EmptyQueryResponse()
 			}
+		case *pgshardv1.ExecuteResponse_PortalSuspended:
+			// A suspended portal ends this Execute's response in place of
+			// CommandComplete, so it advances the injected-Execute queue
+			// the same way. Dropping it altogether left the client
+			// believing the result set had ended, so a row-limited fetch
+			// returned short with no error.
+			if !e.popHidden() {
+				werr = w.PortalSuspended()
+			}
 		case *pgshardv1.ExecuteResponse_Error:
 			if firstErr == nil {
 				firstErr = toPgwireError(m.Error.GetError())

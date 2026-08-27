@@ -28,21 +28,40 @@ type RestoreSource struct {
 	// BackupIDs are the pgBackRest labels per group name; a group without an
 	// entry lets pgbackrest select the set for the target.
 	BackupIDs map[string]string `json:"backupIds,omitempty"`
-	Type      backup.TargetType `json:"type,omitempty"`
-	Target    string            `json:"target,omitempty"`
-	TargetTLI int64             `json:"targetTLI,omitempty"`
-	Exclusive bool              `json:"exclusive,omitempty"`
+	// SourceGroups maps a new cluster's group name to the source group it
+	// restores from. They differ whenever the source had resharded or been
+	// upgraded: Group.Name() carries the generation, and a fresh cluster
+	// has no status to carry one, so it would look for shard-0 where the
+	// repository holds shard-0-g3.
+	SourceGroups map[string]string `json:"sourceGroups,omitempty"`
+	Type         backup.TargetType `json:"type,omitempty"`
+	Target       string            `json:"target,omitempty"`
+	TargetTLI    int64             `json:"targetTLI,omitempty"`
+	Exclusive    bool              `json:"exclusive,omitempty"`
+}
+
+// SourceGroup is the source group a group of the new cluster restores
+// from. It falls back to the group's own name, which is what an annotation
+// written before source groups were recorded means, and what a source that
+// never resharded says anyway.
+func (s RestoreSource) SourceGroup(g Group) string {
+	if name := s.SourceGroups[g.Name()]; name != "" {
+		return name
+	}
+	return g.Name()
 }
 
 // Stanza is the source stanza a group of the new cluster restores from.
 func (s RestoreSource) Stanza(g Group) string {
-	return backup.StanzaName(s.SourceCluster, g.Name(), s.Major)
+	return backup.StanzaName(s.SourceCluster, s.SourceGroup(g), s.Major)
 }
 
-// Options are the agent's restore options for one group.
+// Options are the agent's restore options for one group. The backup labels
+// are keyed by source group too: they were recorded against the source's
+// own names.
 func (s RestoreSource) Options(g Group) backup.RestoreOptions {
 	return backup.RestoreOptions{
-		Stanza: s.Stanza(g), BackupID: s.BackupIDs[g.Name()],
+		Stanza: s.Stanza(g), BackupID: s.BackupIDs[s.SourceGroup(g)],
 		Type: s.Type, Target: s.Target, TargetTLI: s.TargetTLI, Exclusive: s.Exclusive,
 	}
 }
