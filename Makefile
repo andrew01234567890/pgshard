@@ -22,8 +22,13 @@ fmt-check:
 lint:
 	golangci-lint run ./...
 
+# -p bounds how many PACKAGES run at once; PGSHARD_TEST_PG_PARALLEL bounds the
+# PostgreSQL-backed tests within each. Containers in flight is the product of
+# the two, so they are set together here: raising one without the other swamps
+# the runner. See internal/dockertest/parallel.go.
+test: PGSHARD_TEST_PG_PARALLEL ?= 4
 test:
-	go test -race ./...
+	PGSHARD_TEST_PG_PARALLEL=$(PGSHARD_TEST_PG_PARALLEL) go test -race -p 4 ./...
 
 verify: fmt-check vet lint proto-lint test build
 
@@ -86,7 +91,7 @@ envtest-assets:
 		hack/envtest/setup-envtest.sh $(ENVTEST_ASSETS_DIR)
 
 envtest: envtest-assets
-	KUBEBUILDER_ASSETS="$$(hack/envtest/setup-envtest.sh $(ENVTEST_ASSETS_DIR))" go test -race -count=1 ./api/... ./internal/operator/... ./internal/admin/...
+	KUBEBUILDER_ASSETS="$$(hack/envtest/setup-envtest.sh $(ENVTEST_ASSETS_DIR))" PGSHARD_REQUIRE_ENVTEST=1 go test -race -count=1 ./api/... ./internal/operator/... ./internal/admin/...
 
 IMG ?= ghcr.io/andrew01234567890/pgshard-operator:latest
 

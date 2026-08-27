@@ -51,8 +51,11 @@ type ClusterReconciler struct {
 	FailoverDelay  time.Duration
 	PollInterval   time.Duration
 	QuiesceTimeout time.Duration
-	RolloutTimeout time.Duration
-	Now            func() time.Time
+	// PodFenceTimeout bounds the wait for the old primary's Pod to go
+	// before a successor is promoted; zero means DefaultPodFenceTimeout.
+	PodFenceTimeout time.Duration
+	RolloutTimeout  time.Duration
+	Now             func() time.Time
 	// Metrics counts failovers and rolling-update progress; nil disables it.
 	Metrics *metrics.Operator
 

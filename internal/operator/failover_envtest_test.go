@@ -342,3 +342,36 @@ func TestConvergeRepromotesPendingPrimary(t *testing.T) {
 		t.Fatalf("converge must not keep re-promoting a completed primary: %v", fa.promotes[before:])
 	}
 }
+
+// TestFailoverRemovesAnUnreachableOldPrimaryBeforePromoting guards the gap
+// quiesce cannot close. An agent it cannot reach counts as gone, because
+// waiting for one that will never answer would turn every partition into an
+// outage — which leaves the old primary possibly alive and still writable
+// while a successor is promoted. Its Pod has to go first.
+func TestFailoverRemovesAnUnreachableOldPrimaryBeforePromoting(t *testing.T) {
+	r, fp, fa, c := healthyCluster(t, "podfence")
+
+	// The old primary's Pod is left in place but stops being ready, and its
+	// agent does not answer: the operator cannot know whether PostgreSQL is
+	// still running there, which is exactly when assuming it stopped is
+	// unsafe.
+	var old corev1.Pod
+	get(t, "podfence-shard-0-0", &old)
+	old.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse}}
+	if err := k8sClient.Status().Update(context.Background(), &old); err != nil {
+		t.Fatal(err)
+	}
+	fa.set(podIP(1, 0), AgentStatus{}, errors.New("connection refused"))
+	fp.standbys[podIP(1, 1)] = StandbyState{InRecovery: true, FlushLSN: 100}
+	fp.standbys[podIP(1, 2)] = StandbyState{InRecovery: true, FlushLSN: 200}
+	fp.err = errors.New("no primary")
+
+	reconcile(t, r, c)
+
+	if err := k8sClient.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "podfence-shard-0-0"}, &corev1.Pod{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("the old primary's pod must be removed before a successor is promoted: %v", err)
+	}
+	if len(fa.promotes) != 1 || !strings.HasSuffix(fa.promotes[0], ":1:podfence-shard-0-2") {
+		t.Fatalf("expected exactly one promotion after the old primary was fenced, got %v", fa.promotes)
+	}
+}
