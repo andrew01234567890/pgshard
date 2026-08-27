@@ -69,10 +69,30 @@ type Placement struct {
 	ReferenceHazards []string
 }
 
+// MaxAge is how old a snapshot may be before the router serving it must
+// stop rather than plan against a view of the catalog it can no longer
+// trust. It is one fallback reload plus a margin, so a healthy router --
+// which reloads every DefaultReloadInterval -- never trips it, and a
+// router whose reloads are failing stops within one interval of the last
+// one that worked.
+//
+// The online rewrite's settle window is the same quantity, and that is the
+// point: the applier publishes the visible column list, waits, and then
+// adds the hidden physical column. Any router still serving after the wait
+// has reloaded inside it, because one that had not would have stopped.
+// Tying both to the reload interval in one place also means shortening the
+// interval for latency tightens the fail-closed bound with it, instead of
+// silently making rewrites unsafe.
+const MaxAge = DefaultReloadInterval + 5*time.Second
+
 // Snapshot is an immutable view of the catalog taken in one transaction.
 // Role verifiers are loaded separately (see Loader.LoadRoles) and never
 // live in a Snapshot, so printing one can never leak credentials.
 type Snapshot struct {
+	// LoadedAt is when this view was read from the catalog. A router that
+	// cannot reload keeps serving the last good snapshot, so age is the
+	// only thing that distinguishes a current view from a stale one.
+	LoadedAt           time.Time
 	ShardMapGeneration int64
 	DesiredGeneration  int64
 	// ServingSet names the shard set routers route user data by.

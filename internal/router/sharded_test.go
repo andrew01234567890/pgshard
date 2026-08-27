@@ -874,3 +874,45 @@ func TestFlushOnAWriteBatchStillAnswersAtSync(t *testing.T) {
 		t.Fatal("the write was neither answered early nor at Sync: the batch was lost")
 	}
 }
+
+// TestStaleSnapshotRefusesToPlan: a failed reload leaves the previous
+// snapshot in place and the router serving it, so nothing else tells a
+// current catalog view from one whose reloads have been failing. An online
+// rewrite relies on a router either having reloaded or having stopped --
+// quietly serving the view from before the column list was published is
+// exactly how the hidden column leaks out of SELECT *.
+func TestStaleSnapshotRefusesToPlan(t *testing.T) {
+	h := newShardedHarness(t)
+	conn, err := pgx.Connect(context.Background(), h.dsn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := conn.Exec(ctx, "select 1"); err != nil {
+		t.Fatalf("a fresh snapshot must plan: %v", err)
+	}
+	// Age the snapshot past the bound without touching the clock the rest
+	// of the harness reads.
+	snap := h.snap
+	snap.LoadedAt = time.Now().Add(-snapshot.MaxAge - time.Second)
+	h.snapp.Store(snap)
+
+	_, err = conn.Exec(ctx, "select 1")
+	var pe *pgconn.PgError
+	if !errors.As(err, &pe) {
+		t.Fatalf("expected a refusal once the snapshot went stale, got %v", err)
+	}
+	if pe.Code != "55000" {
+		t.Errorf("SQLSTATE %s, want 55000: a router that cannot reload is a condition to retry, not a fault", pe.Code)
+	}
+	if !strings.Contains(pe.Message, "last read the catalog") {
+		t.Errorf("message %q does not say the snapshot is stale", pe.Message)
+	}
+
+	// Reloading clears it: the refusal is about age, not a latch.
+	snap.LoadedAt = time.Now()
+	h.snapp.Store(snap)
+	if _, err := conn.Exec(ctx, "select 1"); err != nil {
+		t.Fatalf("a reloaded snapshot must plan again: %v", err)
+	}
+}

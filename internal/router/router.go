@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/andrew01234567890/pgshard/internal/metrics"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
@@ -16,6 +17,9 @@ import (
 
 // Config wires a Router.
 type Config struct {
+	// Now is the clock the router reads for snapshot staleness; nil means
+	// time.Now.
+	Now      func() time.Time
 	Snapshot SnapshotFunc
 	Poolers  *Poolers
 	Planner  *Planner
@@ -107,6 +111,13 @@ func New(cfg Config) (*Router, error) {
 		rt.cfg.Planner = NewPlannerWithMetrics(rt.metrics)
 	}
 	return rt, nil
+}
+
+func (r *Router) now() time.Time {
+	if r.cfg.Now != nil {
+		return r.cfg.Now()
+	}
+	return time.Now()
 }
 
 func (r *Router) preparedCapacity(sh Shard) (ok, known bool) {

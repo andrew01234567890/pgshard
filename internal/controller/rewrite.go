@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -32,7 +31,14 @@ const DefaultRewriteBatch = 1000
 // must cover the snapshot watcher's fallback reload: a router whose LISTEN
 // dropped only notices the column list on its periodic reload, and a
 // shorter settle would let its SELECT * leak the hidden column.
-const DefaultRewriteSettle = snapshot.DefaultReloadInterval + 5*time.Second
+//
+// It is snapshot.MaxAge rather than that sum written out again, and the
+// two being the same quantity is what makes the wait a guarantee instead
+// of a hope: a router whose reloads are failing keeps its old snapshot and
+// would never see the column list however long the wait, so past MaxAge it
+// stops serving. After this settle every router still answering has
+// reloaded inside it.
+const DefaultRewriteSettle = snapshot.MaxAge
 
 // driveRewrite runs an online rewrite migration: per phase across every
 // shard, so no shard cuts over before all shards finished their backfill.
