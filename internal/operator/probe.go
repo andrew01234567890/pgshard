@@ -330,6 +330,11 @@ func (PgxProber) DropShardSet(ctx context.Context, dsn, name string) error {
 }
 
 // ReshardWorkflow reads the newest active reshard workflow of shardSet.
+// ReshardWorkflow returns the newest reshard or upgrade workflow targeting
+// shardSet. An online major upgrade is recorded with kind 'upgrade' and
+// reuses the reshard cutover, so filtering on 'reshard' alone left the
+// operator unable to see the workflow whose proceed gates, rollback request,
+// completion and retirement it is meant to mirror.
 func (PgxProber) ReshardWorkflow(ctx context.Context, dsn, shardSet string) (WorkflowInfo, error) {
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
@@ -339,7 +344,8 @@ func (PgxProber) ReshardWorkflow(ctx context.Context, dsn, shardSet string) (Wor
 	var w WorkflowInfo
 	err = conn.QueryRow(ctx, `SELECT id::text, state, coalesce(status->>'stage', ''), coalesce(status->>'message', ''),
 			coalesce((status->'cutover'->>'pause_ms')::bigint, 0) FROM pgshard.workflows
-		WHERE kind = 'reshard' AND spec->>'shard_set' = $1 ORDER BY created_at DESC LIMIT 1`, shardSet).Scan(&w.ID, &w.State, &w.Stage, &w.Message, &w.CutoverPauseMS)
+		WHERE kind IN ('reshard', 'upgrade') AND spec->>'shard_set' = $1
+		ORDER BY created_at DESC LIMIT 1`, shardSet).Scan(&w.ID, &w.State, &w.Stage, &w.Message, &w.CutoverPauseMS)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return WorkflowInfo{}, nil
 	}
