@@ -418,6 +418,7 @@ func (r *ClusterReconciler) updateReshardStatus(ctx context.Context, plan reshar
 	return r.patchReshardStatus(ctx, plan.record, func(st *pgshardv1alpha1.PgShardReshardStatus) {
 		st.Phase = reshardPhase(plan.workflow)
 		st.WorkflowID = plan.workflow.ID
+		st.JournalIDs = plan.workflow.JournalIDs
 		st.CutoverPause = cutoverPause(plan.workflow)
 		if plan.pending == nil {
 			meta.SetStatusCondition(&st.Conditions, metav1.Condition{Type: pgshardv1alpha1.ReshardConditionSwitched, Status: metav1.ConditionTrue, Reason: st.Phase, Message: plan.workflow.Message, ObservedGeneration: plan.record.Generation})
