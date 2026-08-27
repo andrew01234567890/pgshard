@@ -203,12 +203,21 @@ func (PgxProber) PublishShardStatus(ctx context.Context, dsn string, g Group, ep
 	if g.Retired {
 		state = "retired"
 	}
+	// The epoch guard alone still rewrote an unchanged row on every pass,
+	// because an EQUAL epoch satisfies <=. Each write fires notify_serving,
+	// and every router and pooler watcher answers it by opening a catalog
+	// connection and reloading ranges, statuses, databases, tables,
+	// rewrites, fences and sequences -- so a healthy cluster reconciling
+	// every 30s paid a full reload wave per shard for no change at all.
 	_, err = conn.Exec(ctx, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch, primary_endpoint)
 		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (shard_set, shard_id) DO UPDATE
 		SET group_name = EXCLUDED.group_name, primary_epoch = EXCLUDED.primary_epoch,
 		    primary_endpoint = EXCLUDED.primary_endpoint, updated_at = now()
-		WHERE pgshard.shard_status.primary_epoch <= EXCLUDED.primary_epoch`,
+		WHERE pgshard.shard_status.primary_epoch <= EXCLUDED.primary_epoch
+		  AND (pgshard.shard_status.group_name IS DISTINCT FROM EXCLUDED.group_name
+		    OR pgshard.shard_status.primary_epoch IS DISTINCT FROM EXCLUDED.primary_epoch
+		    OR pgshard.shard_status.primary_endpoint IS DISTINCT FROM EXCLUDED.primary_endpoint)`,
 		g.ShardSet(), g.ShardID, g.Name(), state, epoch, endpoint)
 	return err
 }
@@ -330,6 +339,11 @@ func (PgxProber) DropShardSet(ctx context.Context, dsn, name string) error {
 }
 
 // ReshardWorkflow reads the newest active reshard workflow of shardSet.
+// ReshardWorkflow returns the newest reshard or upgrade workflow targeting
+// shardSet. An online major upgrade is recorded with kind 'upgrade' and
+// reuses the reshard cutover, so filtering on 'reshard' alone left the
+// operator unable to see the workflow whose proceed gates, rollback request,
+// completion and retirement it is meant to mirror.
 func (PgxProber) ReshardWorkflow(ctx context.Context, dsn, shardSet string) (WorkflowInfo, error) {
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
@@ -339,7 +353,8 @@ func (PgxProber) ReshardWorkflow(ctx context.Context, dsn, shardSet string) (Wor
 	var w WorkflowInfo
 	err = conn.QueryRow(ctx, `SELECT id::text, state, coalesce(status->>'stage', ''), coalesce(status->>'message', ''),
 			coalesce((status->'cutover'->>'pause_ms')::bigint, 0) FROM pgshard.workflows
-		WHERE kind = 'reshard' AND spec->>'shard_set' = $1 ORDER BY created_at DESC LIMIT 1`, shardSet).Scan(&w.ID, &w.State, &w.Stage, &w.Message, &w.CutoverPauseMS)
+		WHERE kind IN ('reshard', 'upgrade') AND spec->>'shard_set' = $1
+		ORDER BY created_at DESC LIMIT 1`, shardSet).Scan(&w.ID, &w.State, &w.Stage, &w.Message, &w.CutoverPauseMS)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return WorkflowInfo{}, nil
 	}
