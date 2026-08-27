@@ -183,6 +183,7 @@ func runPGSuite(t *testing.T, image string) {
 	t.Run("current_user", h.testCurrentUser)
 	t.Run("permission_denied", h.testPermissionDenied)
 	t.Run("prepared_statement", h.testPrepared)
+	t.Run("row_limited_portal_suspends", h.testPortalSuspended)
 	t.Run("copy_in", h.testCopyIn)
 	t.Run("stale_generation", h.testStaleGeneration)
 	t.Run("cancel", h.testCancel)
@@ -493,5 +494,50 @@ func (h *pgHarness) testDrain(t *testing.T) {
 			t.Fatalf("%d appuser backends still connected after drain", n)
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// testPortalSuspended: a real backend answers a row-limited Execute with
+// PortalSuspended instead of CommandComplete. The conversion dropped it,
+// so a partial fetch reached the router as a finished result set.
+func (h *pgHarness) testPortalSuspended(t *testing.T) {
+	stream, err := h.client.Execute(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := gen(3, 1)
+	for _, m := range []*pgshardv1.ExecuteRequest{
+		{SessionId: "sus", Generation: g, User: h.identity(), Message: &pgshardv1.ExecuteRequest_Parse{Parse: &pgshardv1.Parse{Sql: "select i from generate_series(1, 10) i"}}},
+		{SessionId: "sus", Generation: g, Message: &pgshardv1.ExecuteRequest_Bind{Bind: &pgshardv1.Bind{}}},
+		{SessionId: "sus", Generation: g, Message: &pgshardv1.ExecuteRequest_Execute{Execute: &pgshardv1.ExecutePortal{MaxRows: 3}}},
+		{SessionId: "sus", Generation: g, Message: &pgshardv1.ExecuteRequest_Sync{Sync: &pgshardv1.Sync{}}},
+	} {
+		if err := stream.Send(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rs := collect(t, stream)
+	if e := firstError(rs); e != nil {
+		t.Fatalf("error: %v", e)
+	}
+	var suspended, completed, dataRows int
+	for _, r := range rs {
+		switch r.Message.(type) {
+		case *pgshardv1.ExecuteResponse_PortalSuspended:
+			suspended++
+		case *pgshardv1.ExecuteResponse_CommandComplete:
+			completed++
+		case *pgshardv1.ExecuteResponse_DataRow:
+			dataRows++
+		}
+	}
+	if suspended != 1 {
+		t.Fatalf("PortalSuspended count = %d, want the row limit to suspend the portal", suspended)
+	}
+	if dataRows != 3 {
+		t.Fatalf("data rows = %d, want the row limit", dataRows)
+	}
+	if completed != 0 {
+		t.Fatalf("CommandComplete count = %d, want none: a suspended portal did not finish", completed)
 	}
 }

@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -704,5 +705,63 @@ func TestPipelinedResetRestoresTheStartupSearchPathInTheSameSync(t *testing.T) {
 	}
 	if got != `"audit", "public"` {
 		t.Fatalf("statement pipelined behind RESET ran with search_path = %q, want the startup path the planner routed with", got)
+	}
+}
+
+// TestRowLimitedFetchReportsTheSuspendedPortal: a client that asks for a
+// row limit must be told the portal stopped short rather than finished --
+// the JDBC setFetchSize shape. Dropping PortalSuspended made a partial
+// fetch look like a complete result set, with no error anywhere.
+func TestRowLimitedFetchReportsTheSuspendedPortal(t *testing.T) {
+	h := newShardedHarness(t)
+	conn, err := pgx.Connect(context.Background(), h.dsn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hj, err := conn.PgConn().Hijack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hj.Conn.Close() })
+	fe := hj.Frontend
+	tenant, _ := h.twoTenants(t)
+	for _, m := range []pgproto3.FrontendMessage{
+		&pgproto3.Parse{Query: fmt.Sprintf("select id from orders where tenant_id = %d", tenant)},
+		&pgproto3.Bind{}, &pgproto3.Execute{MaxRows: 2}, &pgproto3.Sync{},
+	} {
+		fe.Send(m)
+	}
+	if err := fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	var rows int
+	var suspended, completed bool
+	for {
+		msg, err := fe.Receive()
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch m := msg.(type) {
+		case *pgproto3.DataRow:
+			rows++
+		case *pgproto3.PortalSuspended:
+			suspended = true
+		case *pgproto3.CommandComplete:
+			completed = true
+		case *pgproto3.ErrorResponse:
+			t.Fatalf("row-limited fetch failed: %s %s", m.Code, m.Message)
+		}
+		if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+			break
+		}
+	}
+	if !suspended {
+		t.Fatal("a portal that stopped at its row limit must report PortalSuspended, or the client reads a short result set as a complete one")
+	}
+	if completed {
+		t.Fatal("a suspended portal must not also report CommandComplete")
+	}
+	if rows != 2 {
+		t.Fatalf("rows = %d, want the row limit", rows)
 	}
 }
