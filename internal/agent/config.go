@@ -84,11 +84,24 @@ type Config struct {
 
 // PostgresSettings are the operator-provided values in postgresql.conf.
 type PostgresSettings struct {
-	MaxPreparedTransactions     int    `json:"maxPreparedTransactions"`
-	MaxReplicationSlots         int    `json:"maxReplicationSlots"`
-	MaxWALSenders               int    `json:"maxWalSenders"`
-	MaxActiveReplicationOrigins int    `json:"maxActiveReplicationOrigins"`
-	SynchronousStandbyNames     string `json:"synchronousStandbyNames"`
+	MaxPreparedTransactions     int `json:"maxPreparedTransactions"`
+	MaxReplicationSlots         int `json:"maxReplicationSlots"`
+	MaxWALSenders               int `json:"maxWalSenders"`
+	MaxActiveReplicationOrigins int `json:"maxActiveReplicationOrigins"`
+	// MaxLogicalReplicationWorkers must exceed the number of subscriptions
+	// this group holds: every subscription keeps an apply worker for its
+	// whole life, and table sync draws from the same pool. A reshard target
+	// subscribes to every source it takes range from, so a merge exhausts
+	// PostgreSQL's default of 4 with apply workers alone and no table ever
+	// finishes its initial copy.
+	MaxLogicalReplicationWorkers int `json:"maxLogicalReplicationWorkers"`
+	// MaxSyncWorkersPerSubscription bounds how much of that pool one
+	// subscription may take for table sync.
+	MaxSyncWorkersPerSubscription int `json:"maxSyncWorkersPerSubscription"`
+	// MaxWorkerProcesses caps every background worker; PostgreSQL silently
+	// starts fewer logical workers than asked for when this is lower.
+	MaxWorkerProcesses      int    `json:"maxWorkerProcesses"`
+	SynchronousStandbyNames string `json:"synchronousStandbyNames"`
 	// WALKeepSize retains WAL past the last checkpoint so pg_rewind can find
 	// the divergence point without an archive; PostgreSQL size syntax.
 	WALKeepSize string `json:"walKeepSize"`
@@ -201,6 +214,19 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Postgres.MaxActiveReplicationOrigins == 0 {
 		c.Postgres.MaxActiveReplicationOrigins = 16
+	}
+	if c.Postgres.MaxLogicalReplicationWorkers == 0 {
+		// Above the slot count, not equal to it: every subscription holds an
+		// apply worker for its whole life, so a pool the same size as the
+		// slots leaves nothing for table sync and the initial copy never
+		// finishes.
+		c.Postgres.MaxLogicalReplicationWorkers = c.Postgres.MaxReplicationSlots + 8
+	}
+	if c.Postgres.MaxSyncWorkersPerSubscription == 0 {
+		c.Postgres.MaxSyncWorkersPerSubscription = 2
+	}
+	if c.Postgres.MaxWorkerProcesses == 0 {
+		c.Postgres.MaxWorkerProcesses = c.Postgres.MaxLogicalReplicationWorkers + 8
 	}
 	if c.Postgres.WALKeepSize == "" {
 		c.Postgres.WALKeepSize = "512MB"

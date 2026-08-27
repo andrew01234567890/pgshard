@@ -313,3 +313,38 @@ func TestProtectedDurabilityGUCRefused(t *testing.T) {
 		}
 	}
 }
+
+// TestBarrierPauseGUCsRefused: the barrier pauses writes with
+// default_transaction_read_only, and the router replays a client's SETs onto
+// every shard session it opens -- so a client that turned either read-only
+// GUC off wrote straight through a pause taken to make a cluster-consistent
+// restore point, and the override followed the session to every shard.
+func TestBarrierPauseGUCsRefused(t *testing.T) {
+	snap := fixture(t)
+	refuse := []string{
+		"set default_transaction_read_only = off",
+		"set transaction_read_only = off",
+		"set local default_transaction_read_only to off",
+		"set session transaction_read_only = false",
+		"alter role app set default_transaction_read_only = off",
+		"alter role all set default_transaction_read_only to off",
+		"select set_config('default_transaction_read_only', 'off', false)",
+		"select pg_catalog.set_config('transaction_read_only','off',true)",
+		"update pg_settings set setting = 'off' where name = 'default_transaction_read_only'",
+	}
+	for _, sql := range refuse {
+		pl, err := New().Plan(context.Background(), session(snap), sql)
+		if err == nil || pl.Kind != Refuse {
+			t.Fatalf("%s: expected refusal, got %+v %v", sql, pl, err)
+		}
+		var pe *pgwire.Error
+		if !errors.As(err, &pe) || pe.Code != pgwire.CodeInsufficientPrivilege {
+			t.Fatalf("%s: want SQLSTATE %s, got %v", sql, pgwire.CodeInsufficientPrivilege, err)
+		}
+	}
+	// A client that wants a read-only transaction still has one: only
+	// overriding the cluster's own setting is refused.
+	if _, err := New().Plan(context.Background(), session(snap), "begin read only"); err != nil {
+		t.Fatalf("BEGIN READ ONLY refused: %v", err)
+	}
+}
