@@ -22,8 +22,13 @@ fmt-check:
 lint:
 	golangci-lint run ./...
 
+# -p bounds how many PACKAGES run at once; PGSHARD_TEST_PG_PARALLEL bounds the
+# PostgreSQL-backed tests within each. Containers in flight is the product of
+# the two, so they are set together here: raising one without the other swamps
+# the runner. See internal/dockertest/parallel.go.
+test: PGSHARD_TEST_PG_PARALLEL ?= 4
 test:
-	go test -race ./...
+	PGSHARD_TEST_PG_PARALLEL=$(PGSHARD_TEST_PG_PARALLEL) go test -race -p 4 ./...
 
 verify: fmt-check vet lint proto-lint test build
 

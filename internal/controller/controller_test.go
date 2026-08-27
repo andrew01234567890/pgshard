@@ -4,10 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
-	"runtime"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -40,39 +37,12 @@ func startPostgresWith(t *testing.T, opts ...string) string {
 	return startPostgresImage(t, pgImage, nil, opts...)
 }
 
-// pgSlots bounds how many PostgreSQL-backed tests run at once. Admission is
-// per test, not per container: a fixture takes several containers one at a
-// time, so a per-container limit deadlocks as soon as every slot is held by a
-// test still waiting for its next container.
-var pgSlots = make(chan struct{}, pgLimit)
-
-// PGSHARD_TEST_PG_PARALLEL overrides the limit; 1 makes the suite serial
-// again on a runner that cannot afford the containers.
-var pgLimit = func() int {
-	if v, err := strconv.Atoi(os.Getenv("PGSHARD_TEST_PG_PARALLEL")); err == nil && v > 0 {
-		return v
-	}
-	n := runtime.GOMAXPROCS(0)
-	switch {
-	case n <= 2:
-		return 1
-	case n <= 4:
-		return 2
-	case n < 12:
-		return n / 2
-	default:
-		return 6
-	}
-}()
-
-// parallelPG marks a PostgreSQL-backed test parallel and holds a slot for its
-// whole lifetime. The release is registered before any container cleanup so it
-// runs last, after the containers are actually gone.
+// parallelPG marks a PostgreSQL-backed test parallel under the shared
+// admission limit. The helper lives in internal/dockertest so every package
+// that starts containers uses one bound rather than a copy of it.
 func parallelPG(t *testing.T) {
 	t.Helper()
-	t.Parallel()
-	pgSlots <- struct{}{}
-	t.Cleanup(func() { <-pgSlots })
+	dockertest.Parallel(t)
 }
 
 // hostPort reads back the host side of the container's published 5432.
