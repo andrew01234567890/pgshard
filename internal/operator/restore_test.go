@@ -354,3 +354,80 @@ func TestCrashLoopReason(t *testing.T) {
 		t.Fatal("only the postgres container counts")
 	}
 }
+
+// fakeCertifier answers the barrier certification question without a catalog.
+type fakeCertifier struct {
+	certified bool
+	err       error
+	asked     string
+	password  string
+}
+
+func (f *fakeCertifier) CertifiedBarrier(_ context.Context, _, password, name string) (bool, error) {
+	f.asked, f.password = name, password
+	return f.certified, f.err
+}
+
+// TestRestoreRefusesAnUncertifiedBarrier: a barrier attempt that created the
+// physical restore point on every group and then failed certification leaves
+// a name that restores cleanly on every group with no error, landing the
+// cluster on a point explicitly recorded as not two-phase-consistent. The
+// restore checked only that the CRD field was set, while isBarrierRestore's
+// own comment claimed it "targets a certified barrier".
+func TestRestoreRefusesAnUncertifiedBarrier(t *testing.T) {
+	source := boundCluster("old")
+	one := 1
+	source.Spec.Shards = &one
+	barrier := "nightly-2026"
+	rs := newRestore("r1", pgshardv1alpha1.PgShardRestoreSpec{ClusterName: "old", NewClusterName: "new",
+		BackupID: "b1", Target: pgshardv1alpha1.RestoreTarget{Barrier: &barrier}})
+	cl := restoreClient(t, source, newPolicy(), completedBackup("b1", "old"), rs, superuserSecret("old"))
+	cert := &fakeCertifier{certified: false}
+	r := &RestoreReconciler{Client: cl, Agents: newFakeAgents(nil), Barriers: cert,
+		Now: func() time.Time { return time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC) }}
+
+	_, got := reconcileRestore(t, r, "r1")
+	if got.Status.Phase != pgshardv1alpha1.RestorePhaseFailed {
+		t.Fatalf("phase %s: an uncertified barrier was accepted", got.Status.Phase)
+	}
+	if !strings.Contains(got.Status.Error, "not certified") {
+		t.Fatalf("message %q does not say the barrier was uncertified", got.Status.Error)
+	}
+	// The operator holds no PGPASSWORD for an arbitrary cluster, so the
+	// check has to authenticate from that cluster's own secret. Without
+	// this it reached the catalog and was refused, and every barrier
+	// restore failed as "cannot confirm".
+	if cert.password != "source-pw" {
+		t.Fatalf("certifier password = %q, want the source cluster's superuser secret", cert.password)
+	}
+	// The catalog row is keyed by the barrier name. Asking for the WAL
+	// restore point's name instead finds nothing, and "no row" reads as
+	// uncertified -- so the gate refuses every barrier, including the good
+	// ones it exists to admit.
+	if cert.asked != barrier {
+		t.Fatalf("asked about %q, want the barrier name %q as pgshard.restore_points keys it", cert.asked, barrier)
+	}
+	// The cluster must not exist: the point of the check is to refuse before
+	// any group is created.
+	var created pgshardv1alpha1.PgShardCluster
+	if err := cl.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "new"}, &created); err == nil {
+		t.Fatal("the restore created a cluster despite refusing the barrier")
+	}
+}
+
+func TestRestoreAcceptsACertifiedBarrier(t *testing.T) {
+	source := boundCluster("old")
+	one := 1
+	source.Spec.Shards = &one
+	barrier := "nightly-2026"
+	rs := newRestore("r1", pgshardv1alpha1.PgShardRestoreSpec{ClusterName: "old", NewClusterName: "new",
+		BackupID: "b1", Target: pgshardv1alpha1.RestoreTarget{Barrier: &barrier}})
+	cl := restoreClient(t, source, newPolicy(), completedBackup("b1", "old"), rs, superuserSecret("old"))
+	r := &RestoreReconciler{Client: cl, Agents: newFakeAgents(nil), Barriers: &fakeCertifier{certified: true},
+		Now: func() time.Time { return time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC) }}
+
+	_, got := reconcileRestore(t, r, "r1")
+	if got.Status.Phase == pgshardv1alpha1.RestorePhaseFailed {
+		t.Fatalf("a certified barrier was refused: %s", got.Status.Error)
+	}
+}

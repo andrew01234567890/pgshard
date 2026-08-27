@@ -37,7 +37,15 @@ type RestoreReconciler struct {
 	// TwoPC finishes prepared transactions and lifts the write fence after a
 	// barrier restore; nil fails barrier restores with a clear reason.
 	TwoPC TwoPCAgentClient
-	Now   func() time.Time
+	// Barriers answers whether a named barrier was certified, asked of the
+	// live source cluster before the restore starts. nil skips the check.
+	Barriers BarrierCertifier
+	Now      func() time.Time
+}
+
+// BarrierCertifier reports whether a barrier of that name was certified.
+type BarrierCertifier interface {
+	CertifiedBarrier(ctx context.Context, dsn, password, name string) (bool, error)
 }
 
 // SetupWithManager registers the reconciler; clusters created by a restore
@@ -180,6 +188,27 @@ func (r *RestoreReconciler) create(ctx context.Context, rs *pgshardv1alpha1.PgSh
 	if got, want := len(Groups(newCluster)), len(Groups(&source)); got != want || spec.PostgreSQL.Major != source.Spec.PostgreSQL.Major {
 		return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("the new cluster must keep the source's %d groups and PostgreSQL %d", want, source.Spec.PostgreSQL.Major))
 	}
+	// A barrier that failed certification still left its physical restore
+	// point on every group, so restoring to it succeeds and silently lands
+	// the cluster on a point that is not two-phase-consistent. Ask the live
+	// source, which is the only place the answer is knowable.
+	if rs.Spec.Target.Barrier != nil && r.Barriers != nil {
+		name := *rs.Spec.Target.Barrier
+		password, perr := r.superuserPassword(ctx, &source)
+		if perr != nil {
+			return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("cannot read %s's superuser secret to confirm barrier %q: %v", source.Name, name, perr))
+		}
+		// pgshard.restore_points is keyed by the barrier's own name; the
+		// pgshard- prefix belongs to the WAL restore point the recovery
+		// target names, not to the catalog row.
+		ok, cerr := r.Barriers.CertifiedBarrier(ctx, CatalogDSN(&source), password, name)
+		if cerr != nil {
+			return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("cannot confirm barrier %q is certified on %s: %v", name, source.Name, cerr))
+		}
+		if !ok {
+			return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("barrier %q is not certified on %s; restoring to it would land on a point that is not two-phase consistent", name, source.Name))
+		}
+	}
 	src := RestoreSource{
 		SourceCluster: source.Name, Major: source.Spec.PostgreSQL.Major, Restore: rs.Name, BackupIDs: ids,
 		Type: target.Type, Target: target.Target, TargetTLI: target.TargetTLI, Exclusive: target.Exclusive,
@@ -210,6 +239,22 @@ func (r *RestoreReconciler) create(ctx context.Context, rs *pgshardv1alpha1.PgSh
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: restorePollInterval}, nil
+}
+
+// superuserPassword reads the source cluster's superuser password. The
+// operator process holds no credentials for an arbitrary cluster, so
+// anything it connects to has to be authenticated from that cluster's own
+// secret.
+func (r *RestoreReconciler) superuserPassword(ctx context.Context, source *pgshardv1alpha1.PgShardCluster) (string, error) {
+	var sec corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: source.Namespace, Name: SecretName(source.Name)}, &sec); err != nil {
+		return "", err
+	}
+	pw, ok := sec.Data[secretKey]
+	if !ok || len(pw) == 0 {
+		return "", fmt.Errorf("secret %s has no %q key", SecretName(source.Name), secretKey)
+	}
+	return string(pw), nil
 }
 
 // copySuperuserSecret gives the new cluster the source's superuser password:
