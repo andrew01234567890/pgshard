@@ -118,9 +118,7 @@ func TestCancelWithWrongSecretIsIgnoredEverywhere(t *testing.T) {
 		cancelVia(t, b.addr, pid, bogus)
 		cancelVia(t, a.addr, pid, bogus)
 		time.Sleep(200 * time.Millisecond)
-		a.fp.mu.Lock()
-		cancels := len(a.fp.cancels)
-		a.fp.mu.Unlock()
+		cancels := len(a.fp.cancelled())
 		if cancels != 0 {
 			t.Errorf("pooler saw %d cancels for a bogus key", cancels)
 		}

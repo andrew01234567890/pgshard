@@ -11,7 +11,7 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 )
 
-// upgradePreconditions runs the automatic checks of plan §3.11 before an
+// upgradePreconditions runs the automatic checks of docs/upgrade.md before an
 // upgrade workflow starts copying. A violation fails the workflow with a
 // message that names every failed check.
 func (c *Copier) upgradePreconditions(ctx context.Context, wf *copyWorkflow, srcSet string, srcIDs []int32, dbs []dbPlan) error {

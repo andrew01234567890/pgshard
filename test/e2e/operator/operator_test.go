@@ -194,6 +194,16 @@ type writer struct {
 	firstAckAf time.Time
 }
 
+// ackedCount is the acknowledgements so far. Taking a high-water mark before
+// a transition and requiring it to rise afterwards is the only way to assert
+// the new primary accepts WRITES: pg_is_in_recovery() is a read, and a total
+// count includes everything written before the event.
+func (w *writer) ackedCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.acked)
+}
+
 func startWriter(ctx context.Context, c *e2e.Cluster, rw string, start int64) *writer {
 	w := &writer{c: c, rw: rw, stop: make(chan struct{}), done: make(chan struct{})}
 	go func() {
@@ -562,9 +572,15 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 		})
 		newPrimary := primaryOf()
 		t.Logf("failover: %s -> %s at epoch %d", oldPrimary, newPrimary, epochOf())
+		ackedAtPromotion := w.ackedCount()
 		waitFor(ctx, t, "writes to resume on the new primary", 3*time.Minute, func() bool {
 			out, err := psql(ctx, c, rw, "SELECT pg_is_in_recovery()")
-			return err == nil && out == "f"
+			if err != nil || out != "f" {
+				return false
+			}
+			// Left at pg_is_in_recovery alone, a primary that serves reads
+			// and rejects every write passed this.
+			return w.ackedCount() > ackedAtPromotion
 		})
 		time.Sleep(5 * time.Second)
 		acked, failures, pause := w.finish()
@@ -624,9 +640,16 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 		waitFor(ctx, t, "switchover to "+target, 4*time.Minute, func() bool {
 			return primaryOf() == target && epochOf() == oldEpoch+1
 		})
+		ackedAtSwitchover := w.ackedCount()
 		waitFor(ctx, t, "writes to resume on the target", 3*time.Minute, func() bool {
 			out, err := psql(ctx, c, rw, "SELECT pg_is_in_recovery()")
-			return err == nil && out == "f"
+			if err != nil || out != "f" {
+				return false
+			}
+			// A switchover asserted no acknowledgement at all before this,
+			// so a target that came out of recovery and rejected every write
+			// satisfied it.
+			return w.ackedCount() > ackedAtSwitchover
 		})
 		time.Sleep(5 * time.Second)
 		acked, failures, pause := w.finish()
