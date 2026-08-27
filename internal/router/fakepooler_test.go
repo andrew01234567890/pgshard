@@ -767,6 +767,24 @@ func (s *fakeStream) runBatch(ctx context.Context) error {
 			s.f.mu.Lock()
 			s.f.bound = append(s.f.bound, strings.ToLower(sql)+" <- "+s.params[m.Execute.Portal])
 			s.f.mu.Unlock()
+			// A row limit suspends the portal instead of completing it,
+			// which is what a real backend does once it has sent the
+			// limit's worth of rows.
+			if m.Execute.MaxRows > 0 {
+				if err := s.rowDesc("id", 23); err != nil {
+					return err
+				}
+				for i := range int(m.Execute.MaxRows) {
+					if err := s.row(fmt.Sprint(i)); err != nil {
+						return err
+					}
+				}
+				if err := s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_PortalSuspended{PortalSuspended: &pgshardv1.PortalSuspended{}}}); err != nil {
+					return err
+				}
+				s.described, s.formats = false, nil
+				continue
+			}
 			ready, err := s.query(ctx, sql)
 			s.described, s.formats = false, nil
 			if err != nil {
