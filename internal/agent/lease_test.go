@@ -12,7 +12,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
+	coordclient "k8s.io/client-go/kubernetes/typed/coordination/v1"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
 )
 
 func leaseCfg(pod string) *Config {
@@ -79,14 +81,10 @@ func TestLeaseHoldReturnsWhenTakenOver(t *testing.T) {
 	errc := make(chan error, 1)
 	go func() { errc <- a.Hold(ctx) }()
 	time.Sleep(30 * time.Millisecond)
-	l, _ := client.Get(ctx, "c1-s0-primary", metav1.GetOptions{})
-	holder := "pod-b"
-	l.Spec.HolderIdentity = &holder
-	now := metav1.NewMicroTime(time.Now())
-	l.Spec.RenewTime = &now
-	if _, err := client.Update(ctx, l, metav1.UpdateOptions{}); err != nil {
-		t.Fatal(err)
-	}
+	// The fake clientset applies any update regardless of resourceVersion, so a
+	// renew landing between this Get and Update would silently reinstate pod-a
+	// and the hold would never see the takeover.
+	takeOver(ctx, t, client)
 	select {
 	case err := <-errc:
 		if !errors.Is(err, ErrLeaseHeld) {
@@ -145,5 +143,29 @@ func TestLeaseAcquireRetriesOwnConflict(t *testing.T) {
 	})
 	if err := a.Acquire(ctx); err == nil || errors.Is(err, ErrLeaseHeld) {
 		t.Fatalf("persistent conflict must surface as transient, got %v", err)
+	}
+}
+
+func takeOver(ctx context.Context, t *testing.T, client coordclient.LeaseInterface) {
+	t.Helper()
+	holder := "pod-b"
+	for {
+		l, err := client.Get(ctx, "c1-s0-primary", metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		l.Spec.HolderIdentity = &holder
+		now := metav1.NewMicroTime(time.Now())
+		l.Spec.RenewTime = &now
+		switch _, err := client.Update(ctx, l, metav1.UpdateOptions{}); {
+		case err == nil:
+			if got, _ := client.Get(ctx, "c1-s0-primary", metav1.GetOptions{}); got != nil &&
+				ptr.Deref(got.Spec.HolderIdentity, "") == holder {
+				return
+			}
+		case apierrors.IsConflict(err):
+		default:
+			t.Fatal(err)
+		}
 	}
 }
