@@ -40,9 +40,21 @@ func env(key, def string) string {
 }
 
 func clusterManifest(major, image string, shards int) string {
+	return pausedClusterManifest(major, image, shards, "")
+}
+
+// pausedClusterManifest renders the cluster with an opt-in reshard pause.
+// A cancel test has to hold the workflow before its point of no return:
+// once the journal is written the cutover completes by design and there is
+// nothing left to cancel.
+func pausedClusterManifest(major, image string, shards int, pauseBefore string) string {
 	img := ""
 	if image != "" {
 		img = "    image: " + image + "\n"
+	}
+	pause := ""
+	if pauseBefore != "" {
+		pause = "  resharding:\n    pauseBefore: " + pauseBefore + "\n"
 	}
 	return fmt.Sprintf(`
 apiVersion: v1
@@ -65,7 +77,7 @@ spec:
     storage:
       size: 512Mi
   shards: %[5]d
-  replicasPerShard: 1
+%[6]s  replicasPerShard: 1
   unsafeSingleReplica: true
   storage:
     size: 512Mi
@@ -73,7 +85,7 @@ spec:
     requests:
       cpu: 50m
       memory: 128Mi
-`, testNamespace, clusterName, major, img, shards)
+`, testNamespace, clusterName, major, img, shards, pause)
 }
 
 func clientManifest(image string) string {
@@ -448,7 +460,10 @@ func TestReshardProvisionsTargetsAndCancels(t *testing.T) {
 		t.Fatalf("default ranges: %q", got)
 	}
 
-	if err := c.Apply(ctx, clusterManifest(major, os.Getenv("PGSHARD_POSTGRES_IMAGE"), 2)); err != nil {
+	// Held before the write switch: past the journal the cutover completes
+	// by design, so a cancel raced against it has nothing to cancel and the
+	// workflow reports Completing instead.
+	if err := c.Apply(ctx, pausedClusterManifest(major, os.Getenv("PGSHARD_POSTGRES_IMAGE"), 2, "switchWrites")); err != nil {
 		t.Fatal(err)
 	}
 	record := clusterName + "-reshard-g2"
@@ -488,8 +503,12 @@ func TestReshardProvisionsTargetsAndCancels(t *testing.T) {
 		}
 		return got == "running:catch_up_done"
 	})
-	if got := jsonpath(ctx, c, "pgshardreshard", record, "{.status.phase}"); got != "Copying" {
-		t.Errorf("record phase during copy: %q", got)
+	// Before the write switch, not one exact phase: the pause holds the
+	// workflow short of the cutover, but whether it is still copying or has
+	// reached verifying by now is a matter of timing, and pinning one of
+	// them is the same race in miniature.
+	if got := jsonpath(ctx, c, "pgshardreshard", record, "{.status.phase}"); got != "Copying" && got != "Verifying" {
+		t.Errorf("record phase during copy: %q, want the workflow still short of the switch", got)
 	}
 	if _, err := shardSQL(ctx, c, "shard-0", "INSERT INTO orders (tenant_id, note) SELECT g * 7919 + 13, 'late' FROM generate_series(1001, 1100) g"); err != nil {
 		t.Fatal(err)
@@ -548,7 +567,7 @@ func TestReshardProvisionsTargetsAndCancels(t *testing.T) {
 		t.Errorf("cluster status: %q", got)
 	}
 
-	if err := c.Apply(ctx, clusterManifest(major, os.Getenv("PGSHARD_POSTGRES_IMAGE"), 1)); err != nil {
+	if err := c.Apply(ctx, pausedClusterManifest(major, os.Getenv("PGSHARD_POSTGRES_IMAGE"), 1, "switchWrites")); err != nil {
 		t.Fatal(err)
 	}
 	cancelState := func() string {
