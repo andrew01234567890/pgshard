@@ -125,7 +125,7 @@ func (e *Executor) scatterSimple(ctx context.Context, pl plan.Plan, sql string, 
 	if m.ShardSQL != "" {
 		sql = m.ShardSQL
 	}
-	return e.runScatter(ctx, pl.Shards, m, []*pgshardv1.ExecuteRequest{simpleQuery(sql)}, scatterOutput{execute: true, describe: true}, w)
+	return e.runScatter(ctx, pl.Shards, m, []*pgshardv1.ExecuteRequest{simpleQuery(sql)}, scatterOutput{execute: true, describe: true}, w, e.rewriting(pl))
 }
 
 // scatterBatch runs an extended-protocol batch bound to a multi-shard plan:
@@ -186,7 +186,7 @@ func (e *Executor) scatterBatch(ctx context.Context, pl plan.Plan, stmt string, 
 	if !parsed {
 		return nil
 	}
-	return e.runScatter(ctx, pl.Shards, m, reqs, scatterOutput{execute: executes, describe: described}, w)
+	return e.runScatter(ctx, pl.Shards, m, reqs, scatterOutput{execute: executes, describe: described}, w, e.rewriting(pl))
 }
 
 // scatterOutput says which client-visible responses a scatter batch owes:
@@ -223,7 +223,7 @@ type participant struct {
 
 // runScatter opens one pooler stream per shard, sends reqs on each and
 // merges the responses into w.
-func (e *Executor) runScatter(ctx context.Context, shards []int32, m *plan.Merge, reqs []*pgshardv1.ExecuteRequest, out scatterOutput, w pgwire.ResultWriter) error {
+func (e *Executor) runScatter(ctx context.Context, shards []int32, m *plan.Merge, reqs []*pgshardv1.ExecuteRequest, out scatterOutput, w pgwire.ResultWriter, rewriting string) error {
 	if err := e.scatterAllowed(len(shards)); err != nil {
 		return err
 	}
@@ -312,7 +312,7 @@ func (e *Executor) runScatter(ctx context.Context, shards []int32, m *plan.Merge
 	for _, p := range parts {
 		go p.pump(cancelAll)
 	}
-	err := e.mergeScatter(parts, m, out, w)
+	err := e.mergeScatter(parts, m, out, w, rewriting)
 	if err != nil {
 		cancelAll()
 	}
@@ -347,7 +347,25 @@ func cloneRequest(req *pgshardv1.ExecuteRequest) *pgshardv1.ExecuteRequest {
 
 // mergeScatter waits for every participant's RowDescription, checks they
 // agree, then streams the merged rows.
-func (e *Executor) mergeScatter(parts []*participant, m *plan.Merge, out scatterOutput, w pgwire.ResultWriter) error {
+// rewriting names a table of this plan whose rewrite migration still has a
+// working column, or "" when none has. A rewrite cuts over one shard at a
+// time, so between the first shard's swap and the last the same column has
+// a different type OID on different shards -- which is a defined stage of
+// the migration, not the schema drift the mismatch otherwise means.
+func (e *Executor) rewriting(pl plan.Plan) string {
+	snap := e.currentSnapshot()
+	if snap == nil {
+		return ""
+	}
+	for _, k := range pl.Tables {
+		if p, ok := snap.Tables[k]; ok && len(p.HiddenColumns) > 0 {
+			return k.SchemaName + "." + k.TableName
+		}
+	}
+	return ""
+}
+
+func (e *Executor) mergeScatter(parts []*participant, m *plan.Merge, out scatterOutput, w pgwire.ResultWriter, rewriting string) error {
 	for _, p := range parts {
 		<-p.header
 	}
@@ -359,7 +377,7 @@ func (e *Executor) mergeScatter(parts []*participant, m *plan.Merge, out scatter
 		return e.relayPrelude(first.prelude, w)
 	}
 	for _, p := range parts[1:] {
-		if err := sameDescription(first, p); err != nil {
+		if err := sameDescription(first, p, rewriting); err != nil {
 			return err
 		}
 	}
@@ -419,7 +437,7 @@ func (e *Executor) relayPrelude(msgs []*pgshardv1.ExecuteResponse, w pgwire.Resu
 	return nil
 }
 
-func sameDescription(a, b *participant) error {
+func sameDescription(a, b *participant, rewriting string) error {
 	if b.rowDesc == nil {
 		if b.err != nil {
 			return b.err
@@ -428,17 +446,25 @@ func sameDescription(a, b *participant) error {
 	}
 	fa, fb := a.rowDesc.Fields, b.rowDesc.Fields
 	if len(fa) != len(fb) {
-		return descMismatch(a, b, fmt.Sprintf("%d vs %d columns", len(fa), len(fb)))
+		return descMismatch(a, b, fmt.Sprintf("%d vs %d columns", len(fa), len(fb)), rewriting)
 	}
 	for i := range fa {
 		if fa[i].Name != fb[i].Name || fa[i].TypeOid != fb[i].TypeOid || fa[i].TypeModifier != fb[i].TypeModifier || fa[i].Format != fb[i].Format {
-			return descMismatch(a, b, fmt.Sprintf("column %d is %s (oid %d) vs %s (oid %d)", i+1, fa[i].Name, fa[i].TypeOid, fb[i].Name, fb[i].TypeOid))
+			return descMismatch(a, b, fmt.Sprintf("column %d is %s (oid %d) vs %s (oid %d)", i+1, fa[i].Name, fa[i].TypeOid, fb[i].Name, fb[i].TypeOid), rewriting)
 		}
 	}
 	return nil
 }
 
-func descMismatch(a, b *participant, what string) error {
+func descMismatch(a, b *participant, what, rewriting string) error {
+	// Mid-rewrite this is the migration, not drift: a client told to align
+	// the schema by hand would be told to undo the migration, and XX000
+	// reads as a router bug rather than a stage to wait out.
+	if rewriting != "" {
+		err := pgwire.Errorf(codeRewriteInProgress, "table %s is being rewritten and its shards do not yet agree on the result shape: %s", rewriting, what)
+		err.Hint = "the rewrite cuts over one shard at a time; retry once it has finished on every shard"
+		return err
+	}
 	err := pgwire.Errorf("XX000", "shards %s/%d and %s/%d disagree on the result shape: %s", a.shard.Set, a.shard.ID, b.shard.Set, b.shard.ID, what)
 	err.Hint = "the table definition differs between shards; align the schema on every shard"
 	return err
