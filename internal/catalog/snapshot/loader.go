@@ -81,6 +81,8 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 				p.ShardKey = *ts.EffectiveShardKey
 			}
 			p.SequenceColumns = t.SequenceColumns
+			p.ReferenceChecked = ts.ReferenceCheckedGeneration != nil && *ts.ReferenceCheckedGeneration == ts.EffectiveGeneration
+			p.ReferenceHazards = ts.ReferenceHazards
 			s.Tables[key] = p
 			continue
 		}

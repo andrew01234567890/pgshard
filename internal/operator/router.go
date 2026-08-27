@@ -35,6 +35,10 @@ const (
 // RouterName names every router object of the cluster.
 func RouterName(cluster string) string { return cluster + "-router" }
 
+// RouterPeerServiceName is the headless Service whose DNS records enumerate
+// the router replicas, so each can forward a cancel to the others.
+func RouterPeerServiceName(cluster string) string { return RouterName(cluster) + "-peers" }
+
 func routerLabels(c *pgshardv1alpha1.PgShardCluster) map[string]string {
 	return map[string]string{LabelCluster: c.Name, LabelComponent: routerComponent}
 }
@@ -70,7 +74,11 @@ func (r Renderer) RouterDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.De
 	}
 	labels := routerLabels(c)
 	minReplicas, _ := RouterReplicas(c)
-	args := []string{"serve", fmt.Sprintf("--listen=:%d", postgresPort), fmt.Sprintf("--health-listen=:%d", routerHTTPPort), "--catalog-dsn=" + CatalogDSN(c), "--catalog-pooler=" + CatalogPoolerEndpoint(c)}
+	args := []string{"serve", fmt.Sprintf("--listen=:%d", postgresPort), fmt.Sprintf("--health-listen=:%d", routerHTTPPort), "--catalog-dsn=" + CatalogDSN(c), "--catalog-pooler=" + CatalogPoolerEndpoint(c),
+		// Without these a cancel that lands on the wrong replica is
+		// discarded in silence, and the query it named runs on.
+		fmt.Sprintf("--peer-cancel-listen=:%d", routerPeerPort),
+		fmt.Sprintf("--peer-service=%s.%s.svc:%d", RouterPeerServiceName(c.Name), c.Namespace, routerPeerPort)}
 	var mounts []corev1.VolumeMount
 	var volumes []corev1.Volume
 	if ref := internalTLSRef(c); ref != nil {
@@ -106,7 +114,8 @@ func (r Renderer) RouterDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.De
 						Args:            args,
 						Env: []corev1.EnvVar{{Name: "PGPASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
 							LocalObjectReference: corev1.LocalObjectReference{Name: SecretName(c.Name)}, Key: secretKey}}}},
-						Ports: []corev1.ContainerPort{{Name: "postgres", ContainerPort: postgresPort}, {Name: "http", ContainerPort: routerHTTPPort}},
+						Ports: []corev1.ContainerPort{{Name: "postgres", ContainerPort: postgresPort}, {Name: "http", ContainerPort: routerHTTPPort},
+							{Name: "peer", ContainerPort: routerPeerPort}},
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler:  corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString("postgres")}},
 							PeriodSeconds: 10,
@@ -134,6 +143,25 @@ func (Renderer) RouterService(c *pgshardv1alpha1.PgShardCluster) *corev1.Service
 			Type:     corev1.ServiceTypeClusterIP,
 			Selector: routerLabels(c),
 			Ports:    []corev1.ServicePort{{Name: "postgres", Port: postgresPort, TargetPort: intstr.FromString("postgres")}},
+		},
+	}
+}
+
+// RouterPeerService renders the headless Service the routers resolve to
+// find each other. It publishes addresses that are not ready as well: a
+// replica draining or briefly failing its probe still holds the sessions a
+// cancel has to reach, and dropping it from DNS is what would lose them.
+func (Renderer) RouterPeerService(c *pgshardv1alpha1.PgShardCluster) *corev1.Service {
+	meta := routerMeta(c)
+	meta.Name = RouterPeerServiceName(c.Name)
+	return &corev1.Service{
+		ObjectMeta: meta,
+		Spec: corev1.ServiceSpec{
+			Type:                     corev1.ServiceTypeClusterIP,
+			ClusterIP:                corev1.ClusterIPNone,
+			PublishNotReadyAddresses: true,
+			Selector:                 routerLabels(c),
+			Ports:                    []corev1.ServicePort{{Name: "peer", Port: routerPeerPort, TargetPort: intstr.FromString("peer")}},
 		},
 	}
 }
@@ -225,6 +253,25 @@ func (r *ClusterReconciler) reconcileRouter(ctx context.Context, c *pgshardv1alp
 		svc.Spec.Type = desiredSvc.Spec.Type
 		svc.Spec.Selector = desiredSvc.Spec.Selector
 		svc.Spec.Ports = desiredSvc.Spec.Ports
+		return nil
+	}); err != nil {
+		return err
+	}
+	desiredPeers := r.Renderer.RouterPeerService(c)
+	peerMeta := routerMeta(c)
+	peerMeta.Name = RouterPeerServiceName(c.Name)
+	peers := &corev1.Service{ObjectMeta: peerMeta}
+	if err := r.ensureOwned(ctx, c, peers, func() error {
+		peers.Labels = desiredPeers.Labels
+		peers.Spec.Type = desiredPeers.Spec.Type
+		// ClusterIP is immutable, so it is set only on creation; an
+		// existing Service keeps whatever it was made with.
+		if peers.Spec.ClusterIP == "" {
+			peers.Spec.ClusterIP = desiredPeers.Spec.ClusterIP
+		}
+		peers.Spec.PublishNotReadyAddresses = desiredPeers.Spec.PublishNotReadyAddresses
+		peers.Spec.Selector = desiredPeers.Spec.Selector
+		peers.Spec.Ports = desiredPeers.Spec.Ports
 		return nil
 	}); err != nil {
 		return err
