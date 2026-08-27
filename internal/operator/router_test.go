@@ -309,8 +309,8 @@ func TestPoolerSidecarCarriesItsOwnShardSet(t *testing.T) {
 // find the others, the key is dropped and the query it named runs on.
 func TestRouterPeerCancelIsWired(t *testing.T) {
 	c := routerCluster()
-	if min, _ := RouterReplicas(c); min < 2 {
-		t.Fatalf("default router replicas = %d; peer cancels only matter above one", min)
+	if replicas, _ := RouterReplicas(c); replicas < 2 {
+		t.Fatalf("default router replicas = %d; peer cancels only matter above one", replicas)
 	}
 	svc := (Renderer{}).RouterPeerService(c)
 	if svc.Name != "demo-router-peers" {
