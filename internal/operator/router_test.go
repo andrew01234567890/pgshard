@@ -339,3 +339,30 @@ func TestRouterPeerCancelIsWired(t *testing.T) {
 		t.Errorf("the deployment must expose the peer port the Service targets: %+v", ctr.Ports)
 	}
 }
+
+// TestCancellableOnRevert: lowering spec.shards back undoes a reshard that
+// has not passed the journal. The journal is a step of the switch, so
+// Switching is the first phase that cannot be undone -- and Verifying,
+// which is what a run reports while it waits at an opt-in pause before the
+// write switch, must be, or that pause has nothing to offer.
+func TestCancellableOnRevert(t *testing.T) {
+	for _, c := range []struct {
+		phase string
+		want  bool
+	}{
+		{pgshardv1alpha1.ReshardPhasePending, true},
+		{pgshardv1alpha1.ReshardPhaseProvisioning, true},
+		{pgshardv1alpha1.ReshardPhaseCopying, true},
+		{pgshardv1alpha1.ReshardPhaseVerifying, true},
+		// Past the journal: undoing these is a switch back, not a cancel.
+		{pgshardv1alpha1.ReshardPhaseSwitching, false},
+		{pgshardv1alpha1.ReshardPhaseCompleting, false},
+		{pgshardv1alpha1.ReshardPhaseCompleted, false},
+		{pgshardv1alpha1.ReshardPhaseCancelled, false},
+		{pgshardv1alpha1.ReshardPhaseFailed, false},
+	} {
+		if got := cancellableOnRevert(c.phase); got != c.want {
+			t.Errorf("cancellableOnRevert(%s) = %v, want %v", c.phase, got, c.want)
+		}
+	}
+}
