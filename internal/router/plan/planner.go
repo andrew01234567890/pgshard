@@ -372,6 +372,16 @@ type rel struct {
 	// client-visible column list of a table under an online rewrite.
 	hidden  []string
 	visible []string
+	// refDeclared marks a reference table that has a row in pgshard.tables,
+	// and so a status row the controller inspects. A table that is a
+	// reference table only because its database defaults to that placement
+	// has neither, and is not gated here.
+	refDeclared bool
+	// refChecked and refHazards carry the controller's inspection: whether
+	// it has run for the generation in force, and what it found that a
+	// shard would evaluate for itself.
+	refChecked bool
+	refHazards []string
 	// terms are the key predicates found for this relation.
 	terms []keyTerm
 	// scatter marks a sharded relation without any key predicate.
@@ -456,7 +466,7 @@ func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
 		case "sharded":
 			r.kind, r.shardKey, r.seqCols = placeSharded, pl.ShardKey, pl.SequenceColumns
 		case "reference":
-			r.kind = placeReference
+			r.kind, r.refDeclared, r.refChecked, r.refHazards = placeReference, true, pl.ReferenceChecked, pl.ReferenceHazards
 		}
 		r.hidden, r.visible = pl.HiddenColumns, pl.VisibleColumns
 		return r, nil
@@ -1283,6 +1293,19 @@ func (w *walker) referenceWrite(otherRels int) error {
 		}
 		return notYet("a write to reference table \""+w.target.name+"\" cannot run with "+w.sess.SearchPath[0]+" searched before pg_catalog: an unqualified function name could resolve to that schema instead of the built-in",
 			"reset search_path, or qualify the reference write's functions with pg_catalog")
+	}
+	// The statement is only half of it: a default, a generated expression,
+	// an identity column, a trigger or a rule never appears in the parse
+	// tree and is evaluated by each shard for itself, so an INSERT naming
+	// no such column still writes a different row on every shard. Only the
+	// shards can answer that, and the controller publishes what they said.
+	if w.target.refDeclared && !w.target.refChecked {
+		return notYet("a write to reference table \""+w.target.name+"\" cannot be planned until its shards have been inspected",
+			"the controller records what a reference table evaluates per shard; retry once it has run")
+	}
+	if len(w.target.refHazards) > 0 {
+		return notYet("a write to reference table \""+w.target.name+"\" would not write the same row on every shard: "+strings.Join(w.target.refHazards, "; "),
+			"a reference table is replicated to every shard, so every value it stores must be fixed by the statement")
 	}
 	if fn := nonImmutableCall(w.root); fn != "" {
 		return notYet("a write to reference table \""+w.target.name+"\" cannot call "+fn+"(): the statement runs on every shard and only a function proven to return the same answer everywhere may take part",

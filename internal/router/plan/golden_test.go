@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
 )
 
@@ -572,4 +573,45 @@ func sortShards(s []int32) {
 			s[j-1], s[j] = s[j], s[j-1]
 		}
 	}
+}
+
+// TestReferenceWriteNeedsTheShardInspection covers the half of the
+// divergence a statement cannot show: what a shard evaluates for itself.
+func TestReferenceWriteNeedsTheShardInspection(t *testing.T) {
+	const sql = "insert into regions (id) values (1)"
+	key := snapshot.TableKey{Database: fixtureDB, SchemaName: "public", TableName: "regions"}
+	for _, c := range []struct {
+		name  string
+		place snapshot.Placement
+		msg   string
+	}{
+		{"uninspected", snapshot.Placement{Placement: "reference"},
+			"a write to reference table \"regions\" cannot be planned until its shards have been inspected"},
+		{"a hazard the statement cannot show", snapshot.Placement{Placement: "reference", ReferenceChecked: true,
+			ReferenceHazards: []string{"the default of column tag calls gen_random_uuid(), which pg_proc marks VOLATILE"}},
+			"a write to reference table \"regions\" would not write the same row on every shard: the default of column tag calls gen_random_uuid()"},
+		{"two hazards are both named", snapshot.Placement{Placement: "reference", ReferenceChecked: true,
+			ReferenceHazards: []string{"trigger stamp fires on writes", "column id is an identity column"}},
+			"a write to reference table \"regions\" would not write the same row on every shard: trigger stamp fires on writes; column id is an identity column"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			snap := fixture(t)
+			snap.Tables[key] = c.place
+			p := New()
+			pl, err := p.Plan(context.Background(), session(snap), sql)
+			checkRefusal(t, pl, err, c.msg, "0A000")
+		})
+	}
+	t.Run("inspected and clean plans onto every shard", func(t *testing.T) {
+		snap := fixture(t)
+		snap.Tables[key] = snapshot.Placement{Placement: "reference", ReferenceChecked: true}
+		p := New()
+		pl, err := p.Plan(context.Background(), session(snap), sql)
+		if err != nil {
+			t.Fatalf("plan: %v", err)
+		}
+		if pl.Kind != Reference || len(pl.Shards) != 4 {
+			t.Fatalf("kind = %v shards = %v, want a Reference plan on all four", pl.Kind, pl.Shards)
+		}
+	})
 }
