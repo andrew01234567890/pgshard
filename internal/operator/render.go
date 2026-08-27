@@ -457,6 +457,11 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 		"--catalog-dsn", CatalogDSN(c),
 		"--shard-set", shardSet,
 		"--shard-id", fmt.Sprint(g.ShardID),
+		// Without a DSN the pooler refuses every Stream and CopyTables
+		// call, so a change stream fails on the first request. The
+		// database is taken from the request, so this one only has to
+		// reach the local server; PGPASSWORD is already in the env.
+		"--stream-dsn", fmt.Sprintf("host=%s user=%s dbname=postgres", pgSocketDir, superuserName),
 	}
 	mounts := []corev1.VolumeMount{
 		{Name: "pg-socket", MountPath: pgSocketDir},
