@@ -1248,8 +1248,12 @@ func (ts *testServer) sessionStates() string {
 	var b strings.Builder
 	for _, sess := range ts.liveSessions() {
 		sess.mu.Lock()
-		fmt.Fprintf(&b, "  id=%d serving=%v active=%v inTxn=%v closed=%v draining=%v revoked=%v\n",
-			sess.id, sess.serving, sess.active, sess.inTxn, sess.closed, sess.draining, sess.revoked)
+		saw := sess.drainSaw
+		if saw == "" {
+			saw = "drain never ran"
+		}
+		fmt.Fprintf(&b, "  id=%d serving=%v active=%v inTxn=%v closed=%v draining=%v revoked=%v | drain saw: %s\n",
+			sess.id, sess.serving, sess.active, sess.inTxn, sess.closed, sess.draining, sess.revoked, saw)
 		sess.mu.Unlock()
 	}
 	if b.Len() == 0 {
