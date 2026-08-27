@@ -261,7 +261,7 @@ func (s *Server) detach(se *session) {
 		s.detachUnlocked()
 	}
 	if !keep {
-		s.recycle(b, true)
+		s.recycle(b)
 	}
 	close(detached)
 }
@@ -269,7 +269,7 @@ func (s *Server) detach(se *session) {
 // recycle returns b to the pool clean: an open transaction is rolled back,
 // and DISCARD ALL resets it when a session held it (GUCs may be staged) or
 // it still holds statements. A backend that cannot be cleaned is discarded.
-func (s *Server) recycle(b *Backend, resetSession bool) {
+func (s *Server) recycle(b *Backend) {
 	if b == nil {
 		return
 	}
@@ -283,14 +283,27 @@ func (s *Server) recycle(b *Backend, resetSession bool) {
 			return
 		}
 	}
-	if resetSession || len(b.prepared) > 0 || b.sqlPrepared {
-		if err := b.simpleQuery("DISCARD ALL"); err != nil {
-			s.cfg.Pool.Discard(b)
-			return
-		}
-		b.prepared = nil
-		b.sqlPrepared = false
+	// Every handoff resets, not only the ones the router recognised as
+	// stateful. The router pins on syntax, and a statement's effect on the
+	// backend need not be visible in its syntax: SELECT set_config(...,
+	// false) sets a GUC, pg_advisory_lock() takes a lock the backend holds,
+	// and a user function does whatever it does -- all three parse as
+	// ordinary reads. Whatever they left would otherwise be inherited by
+	// the next logical session of the same role, which is a leak between
+	// clients rather than a lapse in tidiness.
+	//
+	// DISCARD ALL covers it: verified on PostgreSQL 18 that it both
+	// releases advisory locks (it runs pg_advisory_unlock_all) and resets
+	// GUCs to their defaults.
+	//
+	// The cost is one round trip per backend handoff, which is what
+	// PgBouncer's server_reset_query pays for the same reason.
+	if err := b.simpleQuery("DISCARD ALL"); err != nil {
+		s.cfg.Pool.Discard(b)
+		return
 	}
+	b.prepared = nil
+	b.sqlPrepared = false
 	s.cfg.Pool.Release(b)
 }
 
@@ -598,7 +611,7 @@ func (r *relay) pump(b *Backend) error {
 			r.endBatch(b)
 			if !r.reserved() && b.idle() {
 				r.setBackend(nil)
-				r.srv.recycle(b, false)
+				r.srv.recycle(b)
 			}
 			return nil
 		case *pgproto3.CopyInResponse, *pgproto3.CopyBothResponse:
@@ -669,7 +682,7 @@ func (s *Server) Release(ctx context.Context, req *pgshardv1.ReleaseRequest) (*p
 		delete(s.sessions, se.id)
 	}
 	s.mu.Unlock()
-	s.recycle(b, true)
+	s.recycle(b)
 	return &pgshardv1.ReleaseResponse{}, nil
 }
 
@@ -695,7 +708,7 @@ func (s *Server) expireReservations(now time.Time) {
 	s.mu.Unlock()
 	for _, c := range expired {
 		s.cfg.Logger.Warn("releasing reservation with no stream", "session", c.se.id, "role", c.se.role)
-		s.recycle(c.b, true)
+		s.recycle(c.b)
 	}
 }
 
