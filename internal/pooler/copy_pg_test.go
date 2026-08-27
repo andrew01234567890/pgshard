@@ -148,15 +148,21 @@ func (h *pgHarness) testCopyTables(t *testing.T) {
 	if strings.Join(resumed.tables, ",") != "public.citems,public.pairs" || len(resumed.rows["public.pairs"]) != 10 || !resumed.done {
 		t.Fatalf("resumed tables %v", resumed.tables)
 	}
-	// A resume in the middle of the no-PK table continues by ctid.
+	// A no-PK table paginates on ctid, and a ctid does not survive a heap
+	// rewrite: VACUUM FULL or CLUSTER between the snapshot a checkpoint
+	// came from and this one can move an untouched row below it, and a
+	// physical rewrite is not reported as row DML, so resuming there would
+	// silently drop the row. The table starts again instead, whatever
+	// checkpoint the caller kept -- the copy is at-least-once, so repeating
+	// rows is within the contract and losing one is not.
 	st, err = h.client.CopyTables(ctx, &pgshardv1.CopyTablesRequest{Stream: "copyt", BatchRows: 100, ResumeSchema: "public", ResumeTable: "nopk",
 		ResumeLastpk: []byte(`["(0,3)"]`), DoneTables: []string{"public.citems", "public.items", "public.pairs", "public.secret_t"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	byCtid := collectCopy(t, st, 0)
-	if got := byCtid.rows["public.nopk"]; len(got) != 4 || got[0] != "4|NULL" {
-		t.Fatalf("nopk resumed: %v", got)
+	if got := byCtid.rows["public.nopk"]; len(got) != 7 || got[0] != "1|n1" {
+		t.Fatalf("a no-PK table must restart rather than resume from a ctid: %v", got)
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
