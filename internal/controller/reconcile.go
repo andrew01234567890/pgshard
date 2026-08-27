@@ -137,7 +137,8 @@ func reconcileTables(ctx context.Context, tx pgx.Tx, res *Result) error {
 				VALUES ($1, $2, $3, $4, $5, $6)
 				ON CONFLICT (database, schema_name, table_name) DO UPDATE
 				SET effective_placement = EXCLUDED.effective_placement, effective_shard_key = EXCLUDED.effective_shard_key,
-				    effective_generation = EXCLUDED.effective_generation, updated_at = now()`,
+				    effective_generation = EXCLUDED.effective_generation, reference_checked_generation = NULL,
+				    reference_hazards = '{}', updated_at = now()`,
 				t.Database, t.SchemaName, t.TableName, t.Placement, t.ShardKey, t.DesiredGeneration); err != nil {
 				return err
 			}

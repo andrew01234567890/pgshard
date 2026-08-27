@@ -65,6 +65,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	throttleLow := fs.Int64("copy-throttle-low-bytes", controller.DefaultThrottleLo, "source standby lag under which paused reshard subscriptions resume")
 	preparedWait := fs.Duration("copy-prepared-wait", controller.DefaultPreparedWait, "how long slot creation waits for in-doubt prepared transactions before the reshard fails")
 	placementEvery := fs.Duration("placement-interval", 5*time.Second, "time between table placement passes")
+	refCheckEvery := fs.Duration("reference-check-interval", 5*time.Second, "time between reference-table inspection passes")
 	placementBuffer := fs.Duration("placement-buffer-timeout", controller.DefaultBufferTimeout, "longest table-scoped write pause of one placement swap attempt")
 	placementDropOld := fs.Duration("placement-drop-old-after", controller.DefaultDropOldAfter, "grace before a placement workflow drops the previous tables")
 	agentPort := fs.Int("agent-port", controller.DefaultAgentPort, "gRPC port of member agents (schema materialization)")
@@ -157,6 +158,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		go copier.Run(ctx, *copyEvery, leader.Load)
 		placer := &controller.Placer{Pool: pool, Shards: dialer, Logger: logger, LagBytes: *copyLag, BufferTimeout: *placementBuffer, DropOldAfter: *placementDropOld}
 		go placer.Run(ctx, *placementEvery, leader.Load)
+		go (&controller.ReferenceCheck{Pool: pool, Shards: dialer, Logger: logger}).Run(ctx, *refCheckEvery, leader.Load)
 	}
 
 	if *listen == "" {

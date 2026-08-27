@@ -56,7 +56,7 @@ func newShardedHarnessWith(t *testing.T, cfg Config) *shardedHarness {
 		snap.Serving[snapshot.ShardKey{ShardSet: DefaultShardSet, ShardID: int32(i)}] = snapshot.Serving{Epoch: 2, PrimaryEndpoint: addr, State: "serving"}
 	}
 	tbl := func(name, placement, key string) {
-		snap.Tables[snapshot.TableKey{Database: "app", SchemaName: "public", TableName: name}] = snapshot.Placement{Placement: placement, ShardKey: key}
+		snap.Tables[snapshot.TableKey{Database: "app", SchemaName: "public", TableName: name}] = snapshot.Placement{Placement: placement, ShardKey: key, ReferenceChecked: placement == "reference"}
 	}
 	tbl("items", "unsharded", "")
 	tbl("regions", "reference", "")

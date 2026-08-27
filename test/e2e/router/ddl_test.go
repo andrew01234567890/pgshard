@@ -61,7 +61,9 @@ func startDDLStack(tb testing.TB) *ddlStack {
 		`INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('app', 'public', 'orders', 'sharded', 'tenant_id')`,
 		`INSERT INTO pgshard.table_status (database, schema_name, table_name, effective_placement, effective_shard_key) VALUES ('app', 'public', 'orders', 'sharded', 'tenant_id')`,
 		`INSERT INTO pgshard.tables (database, schema_name, table_name, placement) VALUES ('app', 'public', 'regions', 'reference')`,
-		`INSERT INTO pgshard.table_status (database, schema_name, table_name, effective_placement) VALUES ('app', 'public', 'regions', 'reference')`,
+		// Stands in for the controller's inspection pass, which this stack
+		// does not run; regions evaluates nothing per shard.
+		`INSERT INTO pgshard.table_status (database, schema_name, table_name, effective_placement, reference_checked_generation) VALUES ('app', 'public', 'regions', 'reference', 0)`,
 	} {
 		if _, err := cat.Exec(ctx, sql); err != nil {
 			tb.Fatalf("%s: %v", sql, err)

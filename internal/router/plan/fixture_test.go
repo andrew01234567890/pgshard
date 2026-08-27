@@ -28,7 +28,7 @@ func fixture(t testing.TB) *snapshot.Snapshot {
 		s.ShardSets[DefaultShardSet] = append(s.ShardSets[DefaultShardSet], snapshot.Range{ShardID: int32(i), Start: r.Start, End: r.End})
 	}
 	tbl := func(name, placement, key string) {
-		s.Tables[snapshot.TableKey{Database: fixtureDB, SchemaName: "public", TableName: name}] = snapshot.Placement{Placement: placement, ShardKey: key, Generation: 3}
+		s.Tables[snapshot.TableKey{Database: fixtureDB, SchemaName: "public", TableName: name}] = snapshot.Placement{Placement: placement, ShardKey: key, Generation: 3, ReferenceChecked: placement == "reference"}
 	}
 	tbl("items", "unsharded", "")
 	tbl("regions", "reference", "")
