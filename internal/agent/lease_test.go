@@ -14,7 +14,6 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	coordclient "k8s.io/client-go/kubernetes/typed/coordination/v1"
 	k8stesting "k8s.io/client-go/testing"
-	"k8s.io/utils/ptr"
 )
 
 func leaseCfg(pod string) *Config {
@@ -80,18 +79,30 @@ func TestLeaseHoldReturnsWhenTakenOver(t *testing.T) {
 	}
 	errc := make(chan error, 1)
 	go func() { errc <- a.Hold(ctx) }()
-	time.Sleep(30 * time.Millisecond)
-	// The fake clientset applies any update regardless of resourceVersion, so a
-	// renew landing between this Get and Update would silently reinstate pod-a
-	// and the hold would never see the takeover.
-	takeOver(ctx, t, client)
-	select {
-	case err := <-errc:
-		if !errors.Is(err, ErrLeaseHeld) {
-			t.Fatalf("hold returned %v", err)
+	// The fake clientset applies any update whatever resourceVersion it
+	// carries, so a renew that read the lease before this write lands after
+	// it and reinstates pod-a. Confirming the write stuck is not enough --
+	// an in-flight renew can still overwrite it a moment later. The only
+	// state that settles the question is Hold itself having returned, so
+	// the takeover is reasserted until it does.
+	// Well under the 15s lease duration on purpose. Past it Hold gives up
+	// with "lease not renewed within ...", which wraps the same
+	// ErrLeaseHeld -- so a generous deadline would let a Hold that merely
+	// timed out pass as one that noticed the takeover.
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case err := <-errc:
+			if !errors.Is(err, ErrLeaseHeld) {
+				t.Fatalf("hold returned %v", err)
+			}
+			return
+		case <-deadline:
+			t.Fatal("hold did not notice the takeover")
+		default:
 		}
-	case <-ctx.Done():
-		t.Fatal("hold did not notice takeover")
+		takeOver(ctx, t, client)
+		time.Sleep(2 * time.Millisecond)
 	}
 }
 
@@ -146,26 +157,19 @@ func TestLeaseAcquireRetriesOwnConflict(t *testing.T) {
 	}
 }
 
+// takeOver writes pod-b in as the holder once. It does not verify the write
+// survived: only the caller's loop, which watches Hold, can tell that.
 func takeOver(ctx context.Context, t *testing.T, client coordclient.LeaseInterface) {
 	t.Helper()
+	l, err := client.Get(ctx, "c1-s0-primary", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	holder := "pod-b"
-	for {
-		l, err := client.Get(ctx, "c1-s0-primary", metav1.GetOptions{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		l.Spec.HolderIdentity = &holder
-		now := metav1.NewMicroTime(time.Now())
-		l.Spec.RenewTime = &now
-		switch _, err := client.Update(ctx, l, metav1.UpdateOptions{}); {
-		case err == nil:
-			if got, _ := client.Get(ctx, "c1-s0-primary", metav1.GetOptions{}); got != nil &&
-				ptr.Deref(got.Spec.HolderIdentity, "") == holder {
-				return
-			}
-		case apierrors.IsConflict(err):
-		default:
-			t.Fatal(err)
-		}
+	l.Spec.HolderIdentity = &holder
+	now := metav1.NewMicroTime(time.Now())
+	l.Spec.RenewTime = &now
+	if _, err := client.Update(ctx, l, metav1.UpdateOptions{}); err != nil && !apierrors.IsConflict(err) {
+		t.Fatal(err)
 	}
 }
