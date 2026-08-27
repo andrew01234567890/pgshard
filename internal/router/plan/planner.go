@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 	"github.com/andrew01234567890/pgshard/internal/pgparser"
 	"github.com/andrew01234567890/pgshard/internal/pgparser/pg18/pgquerypb"
@@ -60,10 +61,11 @@ func (p *Planner) Plan(ctx context.Context, sess Session, sql string) (Plan, err
 	if err := classify(raw.GetStmt(), &pl.Class); err != nil {
 		return refusalErr(err)
 	}
-	if err := refuseProtectedSetConfig(raw.GetStmt()); err != nil {
-		return refusalErr(err)
+	scan := scanStatement(raw.GetStmt())
+	if scan.setConfigErr != nil {
+		return refusalErr(scan.setConfigErr)
 	}
-	w := &walker{sess: sess, plan: pl, tree: res.Tree, root: raw.GetStmt(), raw: raw, sql: sql}
+	w := &walker{sess: sess, plan: pl, tree: res.Tree, root: raw.GetStmt(), raw: raw, sql: sql, hiddenName: scan.hiddenName}
 	if err := w.statement(raw.GetStmt()); err != nil {
 		return refusalErr(err)
 	}
@@ -229,45 +231,73 @@ var protectedDurabilityGUCs = map[string]bool{
 // refuseProtectedSetConfig refuses set_config('<protected>', ...) anywhere in a
 // statement, the expression-level equivalent of SET. A non-constant setting
 // name cannot be checked at plan time, so it fails closed.
-func refuseProtectedSetConfig(root *pgquerypb.Node) error {
-	var refErr error
+// preScan makes one pass over the statement for the two checks that each
+// used to walk the whole tree on their own. The walk is protobuf
+// reflection over every field of every node and is the dominant cost of
+// planning -- two passes cost twice that, for answers one pass can carry.
+//
+// Both answers are returned rather than reported here, so each is still
+// raised where it was: the set_config refusal before the walker exists,
+// the hidden-name one from hideRewriteColumns. A statement that violates
+// both reports the same error it did before.
+type preScan struct {
+	setConfigErr error
+	hiddenName   string
+}
+
+func scanStatement(root *pgquerypb.Node) preScan {
+	var out preScan
 	visit(root, func(n *pgquerypb.Node) bool {
-		fc := n.GetFuncCall()
-		if fc == nil {
-			return true
+		if cr := n.GetColumnRef(); cr != nil && out.hiddenName == "" {
+			for _, f := range stringList(cr.GetFields()) {
+				if strings.HasPrefix(f, catalog.HiddenPrefix) {
+					out.hiddenName = f
+					break
+				}
+			}
 		}
-		names := stringList(fc.GetFuncname())
-		last := len(names) - 1
-		if last < 0 || !strings.EqualFold(names[last], "set_config") {
-			return true
+		if rt := n.GetResTarget(); rt != nil && out.hiddenName == "" && strings.HasPrefix(rt.GetName(), catalog.HiddenPrefix) {
+			out.hiddenName = rt.GetName()
 		}
-		// The durability built-in is pg_catalog.set_config, reachable
-		// unqualified or with a pg_catalog schema part (optionally preceded
-		// by the current-database name). A set_config in any other schema is
-		// a different function. Match on the parse tree, never the SQL text:
-		// U&"..." escapes and database qualification hide it from a substring
-		// check while still resolving to the built-in.
-		if last >= 1 && !strings.EqualFold(names[last-1], "pg_catalog") {
-			return true
-		}
-		args := fc.GetArgs()
-		if len(args) == 0 {
-			return true
-		}
-		name := args[0].GetAConst().GetSval().GetSval()
-		if name == "" {
-			err := pgwire.Errorf(pgwire.CodeInsufficientPrivilege, "set_config with a non-constant setting name is not permitted through pgshard")
-			err.Hint = "durability settings are fixed by the cluster to keep commits recoverable across failover"
-			refErr = err
-			return false
-		}
-		if err := refuseProtectedGUC(name); err != nil {
-			refErr = err
-			return false
+		if out.setConfigErr == nil {
+			out.setConfigErr = setConfigRefusal(n)
 		}
 		return true
 	})
-	return refErr
+	return out
+}
+
+// setConfigRefusal reports why this node may not run, or nil.
+func setConfigRefusal(n *pgquerypb.Node) error {
+	fc := n.GetFuncCall()
+	if fc == nil {
+		return nil
+	}
+	names := stringList(fc.GetFuncname())
+	last := len(names) - 1
+	if last < 0 || !strings.EqualFold(names[last], "set_config") {
+		return nil
+	}
+	// The durability built-in is pg_catalog.set_config, reachable
+	// unqualified or with a pg_catalog schema part (optionally preceded by
+	// the current-database name). A set_config in any other schema is a
+	// different function. Match on the parse tree, never the SQL text:
+	// U&"..." escapes and database qualification hide it from a substring
+	// check while still resolving to the built-in.
+	if last >= 1 && !strings.EqualFold(names[last-1], "pg_catalog") {
+		return nil
+	}
+	args := fc.GetArgs()
+	if len(args) == 0 {
+		return nil
+	}
+	name := args[0].GetAConst().GetSval().GetSval()
+	if name == "" {
+		err := pgwire.Errorf(pgwire.CodeInsufficientPrivilege, "set_config with a non-constant setting name is not permitted through pgshard")
+		err.Hint = "durability settings are fixed by the cluster to keep commits recoverable across failover"
+		return err
+	}
+	return refuseProtectedGUC(name)
 }
 
 // targetsPgSettings reports whether a range var names pg_catalog.pg_settings.
@@ -399,8 +429,11 @@ func (r *rel) root() *rel {
 type walker struct {
 	sess Session
 	plan *Plan
-	rels []*rel
-	ctes map[string]bool
+	// hiddenName is the first migration working column the statement names,
+	// found by the single pre-scan rather than by a walk of its own.
+	hiddenName string
+	rels       []*rel
+	ctes       map[string]bool
 	// features of the outermost SELECT that a scatter cannot carry yet.
 	scatterBlockers []string
 	nested          bool

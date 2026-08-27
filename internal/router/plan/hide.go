@@ -1,8 +1,6 @@
 package plan
 
 import (
-	"strings"
-
 	"google.golang.org/protobuf/proto"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
@@ -94,27 +92,10 @@ func (w *walker) hideRewriteColumns() error {
 // refuseHiddenNames refuses any statement that names a migration working
 // column, whether it belongs to a known rewrite or not.
 func (w *walker) refuseHiddenNames() error {
-	var bad string
-	visit(w.root, func(n *pgquerypb.Node) bool {
-		if bad != "" {
-			return false
-		}
-		if cr := n.GetColumnRef(); cr != nil {
-			for _, f := range stringList(cr.GetFields()) {
-				if strings.HasPrefix(f, catalog.HiddenPrefix) {
-					bad = f
-				}
-			}
-		}
-		if rt := n.GetResTarget(); rt != nil && strings.HasPrefix(rt.GetName(), catalog.HiddenPrefix) {
-			bad = rt.GetName()
-		}
-		return true
-	})
-	if bad == "" {
+	if w.hiddenName == "" {
 		return nil
 	}
-	e := pgwire.Errorf("42703", "column \"%s\" does not exist", bad)
+	e := pgwire.Errorf("42703", "column \"%s\" does not exist", w.hiddenName)
 	e.Hint = "columns starting with " + catalog.HiddenPrefix + " belong to an online schema migration"
 	return e
 }
