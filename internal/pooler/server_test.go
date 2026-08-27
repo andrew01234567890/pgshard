@@ -405,9 +405,9 @@ func TestUnreservedBatchLeavesNoStatementsInThePool(t *testing.T) {
 	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
 		t.Fatalf("parse: %s", got)
 	}
-	waitFor(t, h.pg.sawQueryFn("DISCARD ALL"))
-	if _, idle := h.srv.cfg.Pool.Stats(); idle != 1 {
-		t.Fatalf("idle = %d", idle)
+	waitFor(t, func() bool { _, idle := h.srv.cfg.Pool.Stats(); return idle == 1 })
+	if !h.pg.sawQuery("DISCARD ALL") {
+		t.Fatalf("the backend must be reset before it returns to the pool: %v", h.pg.seen)
 	}
 }
 
@@ -562,9 +562,9 @@ func TestUnreservedSQLLevelPrepareLeavesNoStatementsInThePool(t *testing.T) {
 	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
 		t.Fatalf("parse: %s", got)
 	}
-	waitFor(t, h.pg.sawQueryFn("DISCARD ALL"))
-	if _, idle := h.srv.cfg.Pool.Stats(); idle != 1 {
-		t.Fatalf("idle = %d", idle)
+	waitFor(t, func() bool { _, idle := h.srv.cfg.Pool.Stats(); return idle == 1 })
+	if !h.pg.sawQuery("DISCARD ALL") {
+		t.Fatalf("the backend must be reset before it returns to the pool: %v", h.pg.seen)
 	}
 }
 
