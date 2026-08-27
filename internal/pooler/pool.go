@@ -146,8 +146,12 @@ func (p *Pool) Acquire(ctx context.Context, database, role string, clientKey, se
 		if p.cfg.OnWait != nil {
 			p.cfg.OnWait()
 		}
-		if err := acquireSlot(ctx, rp.sem); err != nil {
+		reused, err := p.awaitSlot(ctx, rp, digest)
+		if err != nil {
 			return nil, err
+		}
+		if reused != nil {
+			return reused, nil
 		}
 	}
 	if err := p.acquireTotal(ctx); err != nil {
@@ -253,15 +257,39 @@ func (p *Pool) evictIdle() bool {
 	return true
 }
 
-func acquireSlot(ctx context.Context, sem chan struct{}) error {
-	select {
-	case sem <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return ErrBudgetExhausted
+// awaitSlot waits for the role to have room. It returns a backend when one
+// was released to the idle list while waiting, or nil when the caller now
+// holds a slot of its own and should dial.
+//
+// Watching the semaphore alone was not enough: a released backend keeps its
+// slot and joins the idle list, so nothing frees the semaphore and a waiter
+// sat there until its acquire timeout while a backend it could have used
+// was idle. It watches p.changed too and rechecks the idle list, the same
+// way acquireTotal waits for the pool-wide budget.
+func (p *Pool) awaitSlot(ctx context.Context, rp *rolePool, digest [32]byte) (*Backend, error) {
+	for {
+		// Snapshot the wake channel before looking, so a release between
+		// the look and the wait closes the channel this select watches.
+		p.mu.Lock()
+		changed := p.changed
+		closed := p.closed
+		p.mu.Unlock()
+		if closed {
+			return nil, ErrPoolClosed
 		}
-		return ctx.Err()
+		if b := p.popIdle(rp, digest); b != nil {
+			return b, nil
+		}
+		select {
+		case rp.sem <- struct{}{}:
+			return nil, nil
+		case <-changed:
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return nil, ErrBudgetExhausted
+			}
+			return nil, ctx.Err()
+		}
 	}
 }
 
@@ -312,6 +340,9 @@ func (p *Pool) Discard(b *Backend) {
 func (p *Pool) Close() {
 	p.mu.Lock()
 	p.closed = true
+	// Waiters watch this channel; without the wake a shutdown leaves them
+	// blocked until their acquire timeout for a pool that is already gone.
+	p.notify()
 	type held struct {
 		b  *Backend
 		rp *rolePool

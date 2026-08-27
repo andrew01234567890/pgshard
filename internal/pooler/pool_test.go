@@ -228,3 +228,54 @@ func TestIdleReuseRequiresMatchingSCRAMKeys(t *testing.T) {
 		t.Fatalf("matching keys must reuse the idle backend: %v %v", c, err)
 	}
 }
+
+// TestAcquireTakesABackendReleasedWhileItWaits: a released backend keeps
+// its per-role slot and joins the idle list, so nothing frees the
+// semaphore. A waiter watching the semaphore alone therefore sat until its
+// acquire timeout while a backend it could have used was idle -- a
+// five-second stall on a healthy pool, reported to the client as no
+// backend available.
+func TestAcquireTakesABackendReleasedWhileItWaits(t *testing.T) {
+	pg := newFakePG()
+	p := newPool(PoolConfig{MaxBackends: 4, MaxPerRole: 1, AcquireTimeout: 5 * time.Second}, pg.dial)
+	ctx := context.Background()
+	held, err := p.Acquire(ctx, "db", "alice", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiting := make(chan struct{})
+	p.cfg.OnWait = func() { close(waiting) }
+
+	got := make(chan *Backend, 1)
+	errc := make(chan error, 1)
+	go func() {
+		b, err := p.Acquire(ctx, "db", "alice", nil, nil)
+		if err != nil {
+			errc <- err
+			return
+		}
+		got <- b
+	}()
+	<-waiting
+	start := time.Now()
+	p.Release(held)
+
+	select {
+	case b := <-got:
+		if b != held {
+			t.Fatalf("waiter got a different backend: it should have reused the released one")
+		}
+		// Anything near the acquire timeout means it timed out and
+		// retried rather than being woken by the release.
+		if waited := time.Since(start); waited > time.Second {
+			t.Fatalf("waiter took %s to see a backend released the moment it started waiting", waited)
+		}
+	case err := <-errc:
+		t.Fatalf("waiter failed while a backend was idle: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("waiter never saw the released backend")
+	}
+	if d := pg.dials.Load(); d != 1 {
+		t.Fatalf("dials = %d, want the released backend reused rather than a new one", d)
+	}
+}
