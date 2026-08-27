@@ -21,8 +21,10 @@ import (
 // onto 19 behind the stable catalog Service; and the whole cluster ends on
 // 19. Backup-stanza continuity is covered by the backup suite (the stanza
 // is derived per group, so new-major groups archive into fresh stanzas);
-// VStream continuity is asserted once the M6 stream stack is present after
-// the rebase onto main.
+// VStream continuity across the cutover is NOT asserted here. The stream
+// stack does exist now (internal/router/vstream), so the original reason --
+// waiting for a rebase -- no longer applies; it is simply unwritten, and
+// PGS-351 tracks the gap it would cover.
 func TestUpgrade18To19UnderLoad(t *testing.T) {
 	c := e2e.NewCluster(t)
 	c.GatherOnFailure(t)
@@ -45,7 +47,9 @@ func TestUpgrade18To19UnderLoad(t *testing.T) {
 		return strings.HasPrefix(upgradeWorkflowState(ctx, t, c, "g2"), "provisioning:") ||
 			strings.HasPrefix(upgradeWorkflowState(ctx, t, c, "g2"), "running:")
 	})
-	waitFor(ctx, t, c, "writes switched to the 19 set", 30*time.Minute, func() bool {
+	waitForWhy(ctx, t, c, "writes switched to the 19 set", 30*time.Minute, func() string {
+		return upgradeWorkflowDetail(ctx, t, c)
+	}, func() bool {
 		if st := upgradeWorkflowState(ctx, t, c, "g2"); strings.HasPrefix(st, "failed") {
 			t.Fatalf("upgrade workflow failed: %s", catalogSQL(ctx, t, c, "SELECT coalesce(error, '') || ' ' || status::text FROM pgshard.workflows WHERE kind = 'upgrade'"))
 		}
@@ -57,7 +61,14 @@ func TestUpgrade18To19UnderLoad(t *testing.T) {
 	if pause := catalogSQL(ctx, t, c, "SELECT coalesce((status->'cutover'->>'pause_ms')::bigint, -1) FROM pgshard.workflows WHERE kind = 'upgrade' AND spec->>'shard_set' = 'g2'"); pause == "-1" || pause == "0" {
 		t.Errorf("cutover pause not recorded: %q", pause)
 	}
-	waitFor(ctx, t, c, "writes flowing on the new major", 3*time.Minute, func() bool { return l.acked.Load() > 0 && servingShardGroup(ctx, c) == "shard-0-g2" })
+	// Snapshot the high-water AFTER the switch is observed. acked > 0 was
+	// already true before the upgrade began -- the writer runs throughout --
+	// so it asserted nothing about the new major. A primary that serves
+	// reads and rejects every write passed this.
+	ackedAfterSwitch := l.acked.Load()
+	waitFor(ctx, t, c, "writes acknowledged on the new major after the switch", 3*time.Minute, func() bool {
+		return l.acked.Load() > ackedAfterSwitch && servingShardGroup(ctx, c) == "shard-0-g2"
+	})
 	l.verify(ctx, t, l.acked.Load())
 
 	// VDiff-lite across the pair while both sets exist: the retired 18
@@ -92,7 +103,9 @@ func TestUpgrade18To19UnderLoad(t *testing.T) {
 	waitFor(ctx, t, c, "re-run upgrade record", 10*time.Minute, func() bool {
 		return jsonpath(ctx, c, "pgshardreshard", record3, "{.spec.mode}") == "upgrade"
 	})
-	waitFor(ctx, t, c, "writes switched to the 19 set again", 30*time.Minute, func() bool {
+	waitForWhy(ctx, t, c, "writes switched to the 19 set again", 30*time.Minute, func() string {
+		return upgradeWorkflowDetail(ctx, t, c)
+	}, func() bool {
 		if st := upgradeWorkflowState(ctx, t, c, "g3"); strings.HasPrefix(st, "failed") {
 			t.Fatalf("upgrade workflow failed: %s", catalogSQL(ctx, t, c, "SELECT coalesce(error, '') || ' ' || status::text FROM pgshard.workflows WHERE kind = 'upgrade' AND spec->>'shard_set' = 'g3'"))
 		}
@@ -153,7 +166,9 @@ func TestUpgrade18To19ChaosControllerAndPrimaryKill(t *testing.T) {
 	if _, err := c.Kubectl(ctx, nil, "-n", testNamespace, "delete", "pod", "-l", "app="+clusterName+"-controller", "--wait=false"); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(ctx, t, c, "writes switched to the 19 set", 30*time.Minute, func() bool {
+	waitForWhy(ctx, t, c, "writes switched to the 19 set", 30*time.Minute, func() string {
+		return upgradeWorkflowDetail(ctx, t, c)
+	}, func() bool {
 		if st := upgradeWorkflowState(ctx, t, c, "g2"); strings.HasPrefix(st, "failed") {
 			t.Fatalf("upgrade workflow failed: %s", catalogSQL(ctx, t, c, "SELECT coalesce(error, '') || ' ' || status::text FROM pgshard.workflows WHERE kind = 'upgrade'"))
 		}

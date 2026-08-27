@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -22,7 +24,7 @@ import (
 
 func TestWatchesNotifyOnGroupUpdate(t *testing.T) {
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
-		t.Skip("KUBEBUILDER_ASSETS is not set; run 'make envtest'")
+		dockertest.EnvtestMissing(t, "the admin watch envtest")
 	}
 	env := &envtest.Environment{CRDDirectoryPaths: []string{filepath.Join("..", "..", "config", "crd", "bases")}, ErrorIfCRDPathMissing: true}
 	cfg, err := env.Start()
@@ -87,7 +89,7 @@ func TestWatchesNotifyOnGroupUpdate(t *testing.T) {
 
 func TestRunServesAndShutsDown(t *testing.T) {
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
-		t.Skip("KUBEBUILDER_ASSETS is not set; run 'make envtest'")
+		dockertest.EnvtestMissing(t, "the admin watch envtest")
 	}
 	env := &envtest.Environment{CRDDirectoryPaths: []string{filepath.Join("..", "..", "config", "crd", "bases")}, ErrorIfCRDPathMissing: true}
 	cfg, err := env.Start()

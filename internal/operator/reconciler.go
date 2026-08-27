@@ -384,11 +384,22 @@ func (r *ClusterReconciler) loadState(ctx context.Context, c *pgshardv1alpha1.Pg
 			st.pvcs[m.Name] = m.PVC
 		}
 	}
-	if st.primary == "" {
+	// A designated primary outside the member set is not an oracle to be
+	// obeyed: scaling replicasPerShard below the ordinal of a primary that a
+	// failover promoted leaves status.primary naming a member that no longer
+	// exists, and status.primary is externally editable besides. Designate a
+	// member that does exist and let the ordinary converge path promote it.
+	// The epoch is NOT reset here, unlike the never-designated case below: it
+	// fences writes against a primary that may still be running, so it may
+	// only ever increase.
+	stale := st.primary != "" && !slices.Contains(g.MemberNames(), st.primary)
+	if stale || st.primary == "" {
 		st.primary = g.MemberName(0)
 		base := pg.DeepCopy()
 		pg.Status.Primary = st.primary
-		pg.Status.Epoch = 0
+		if !stale {
+			pg.Status.Epoch = 0
+		}
 		if err := r.Status().Patch(ctx, pg, client.MergeFrom(base)); err != nil {
 			return groupState{}, err
 		}
@@ -473,6 +484,14 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 	}
 
 	primary := members[state.primary]
+	if primary == nil {
+		// loadState keeps the designated primary inside the member set, so
+		// reaching here means the pod has not been observed this pass. Treat
+		// it as an unhealthy primary, which is what every neighbouring
+		// function does, rather than dereferencing nil and panicking the
+		// whole cluster's reconcile.
+		primary = &memberInfo{}
+	}
 	var st AgentStatus
 	stErr := errors.New("pod missing")
 	switch {

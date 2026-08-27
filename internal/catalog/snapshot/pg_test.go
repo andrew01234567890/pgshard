@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
+
 	"github.com/jackc/pgx/v5"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
@@ -19,11 +21,11 @@ const pgImage = "ghcr.io/andrew01234567890/pgshard-postgres:18"
 func startPostgres(t *testing.T) string {
 	t.Helper()
 	if err := exec.Command("docker", "info").Run(); err != nil {
-		t.Skip("docker unavailable; skipping snapshot integration tests")
+		dockertest.Unavailable(t, "docker unavailable; skipping snapshot integration tests")
 	}
 	if exec.Command("docker", "image", "inspect", pgImage).Run() != nil {
 		if out, err := exec.Command("docker", "pull", pgImage).CombinedOutput(); err != nil {
-			t.Skipf("image %s unavailable: %v: %s", pgImage, err, out)
+			dockertest.Unavailable(t, "image %s unavailable: %v: %s", pgImage, err, out)
 		}
 	}
 	l, err := net.Listen("tcp", "127.0.0.1:0")

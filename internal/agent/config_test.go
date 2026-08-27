@@ -262,3 +262,34 @@ func TestRefreshTakesOverParametersOverrideAndSettingsHash(t *testing.T) {
 		t.Fatal("a config not loaded from a file has nothing to refresh")
 	}
 }
+
+// TestLogicalWorkersExceedSubscriptions: every subscription holds an apply
+// worker for its whole life and table sync draws from the same pool, so a
+// pool no larger than the subscription count means no table ever finishes
+// its initial copy. A reshard merge is where that bites -- each target
+// subscribes to every source -- and it stalled at "5/8 tables ready, lag 0
+// bytes" with no error until this was sized.
+//
+// These live on the agent rather than in pgtune deliberately: pgtune refuses
+// to derive anything below a 512MB budget, so on a small cluster the tuned
+// values never arrive and PostgreSQL's default of 4 would stand.
+func TestLogicalWorkersExceedSubscriptions(t *testing.T) {
+	c := testConfig()
+	if c.Postgres.MaxLogicalReplicationWorkers <= c.Postgres.MaxReplicationSlots {
+		t.Errorf("max_logical_replication_workers=%d is not above max_replication_slots=%d, so a group holding that many subscriptions has nothing left for table sync",
+			c.Postgres.MaxLogicalReplicationWorkers, c.Postgres.MaxReplicationSlots)
+	}
+	if c.Postgres.MaxWorkerProcesses < c.Postgres.MaxLogicalReplicationWorkers {
+		t.Errorf("max_worker_processes=%d is below max_logical_replication_workers=%d; PostgreSQL would silently start fewer",
+			c.Postgres.MaxWorkerProcesses, c.Postgres.MaxLogicalReplicationWorkers)
+	}
+	if c.Postgres.MaxSyncWorkersPerSubscription < 1 {
+		t.Error("max_sync_workers_per_subscription must allow at least one table sync")
+	}
+	conf := RenderPostgresqlConf(c, false)
+	for _, want := range []string{"max_logical_replication_workers", "max_sync_workers_per_subscription", "max_worker_processes"} {
+		if !strings.Contains(conf, want) {
+			t.Errorf("%s is absent from postgresql.conf, so it would fall back to the PostgreSQL default", want)
+		}
+	}
+}

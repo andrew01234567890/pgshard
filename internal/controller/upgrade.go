@@ -11,7 +11,7 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 )
 
-// upgradePreconditions runs the automatic checks of plan §3.11 before an
+// upgradePreconditions runs the automatic checks of docs/upgrade.md before an
 // upgrade workflow starts copying. A violation fails the workflow with a
 // message that names every failed check.
 func (c *Copier) upgradePreconditions(ctx context.Context, wf *copyWorkflow, srcSet string, srcIDs []int32, dbs []dbPlan) error {
@@ -251,6 +251,17 @@ func (o *pgCutover) Rollback(ctx context.Context) error {
 	}
 	if heldByOther > 0 {
 		return fmt.Errorf("another cutover holds the write fence on %s or %s", o.srcSet, o.wf.set)
+	}
+	// Logical replication carries no DDL, so anything applied since the
+	// switch reached only the set that was serving. Switching back to a
+	// structurally stale set either fails on reverse apply or quietly drops
+	// the change, so refuse rather than guess which.
+	drifted, err := o.schemaDrift(ctx)
+	if err != nil {
+		return err
+	}
+	if len(drifted) > 0 {
+		return fmt.Errorf("schema changed since the switch on %s; rollback would restore a set that never received it, so it needs reconciling by hand", strings.Join(drifted, ", "))
 	}
 	positions := map[int32]int64{}
 	for _, t := range o.wf.ids {

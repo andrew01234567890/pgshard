@@ -80,6 +80,27 @@ type Snapshot struct {
 	// WriteFence is set while the cluster pauses writes for a certified
 	// restore point; routers hold new writes until it clears.
 	WriteFence bool
+	// migrating caches Migrating for a loaded snapshot, which the router
+	// consults on every write. nil means it was not computed -- a snapshot
+	// built directly rather than through Load -- and the scan still runs, so
+	// a construction that misses this cannot silently report false.
+	migrating *bool
+}
+
+// index precomputes what the request path would otherwise recompute per
+// statement. Load calls it; the fields are immutable afterwards.
+func (s *Snapshot) index() {
+	m := s.scanMigrating()
+	s.migrating = &m
+}
+
+func (s *Snapshot) scanMigrating() bool {
+	for k, sv := range s.Serving {
+		if k.ShardSet == s.ServingShardSet() && sv.Migrating {
+			return true
+		}
+	}
+	return false
 }
 
 // Resharding reports whether a non-serving shard set is being provisioned
@@ -104,14 +125,14 @@ func (s *Snapshot) ServingShardSet() string {
 }
 
 // Migrating reports whether any shard of the serving set is fenced by a
-// reshard cutover; routers hold new writes meanwhile.
+// reshard cutover; routers hold new writes meanwhile. The router asks this
+// for every write, so a loaded snapshot answers from a precomputed flag
+// rather than walking the whole serving map per statement.
 func (s *Snapshot) Migrating() bool {
-	for k, sv := range s.Serving {
-		if k.ShardSet == s.ServingShardSet() && sv.Migrating {
-			return true
-		}
+	if s.migrating != nil {
+		return *s.migrating
 	}
-	return false
+	return s.scanMigrating()
 }
 
 // TableMigrating reports whether any of keys is fenced by a placement

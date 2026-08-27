@@ -18,6 +18,20 @@ const (
 	defaultMaxBackends = 100
 )
 
+// logicalSlotsFor bounds the subscriptions one group can hold at once: a
+// reshard target subscribes to every source, so the larger of the serving
+// and desired shard counts is the worst case, plus headroom for VStream.
+func logicalSlotsFor(c *pgshardv1alpha1.PgShardCluster) int {
+	n := ServingShards(c)
+	if c.Spec.Shards != nil && *c.Spec.Shards > n {
+		n = *c.Spec.Shards
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n + 2
+}
+
 // Tuning derives the pgtune settings for one group from the pod resources
 // (limits, else requests) and spec.postgresql. It returns nil settings when
 // no memory is requested: without a budget nothing can be derived and the
@@ -37,6 +51,12 @@ func Tuning(c *pgshardv1alpha1.PgShardCluster, g Group) (pgtune.Settings, error)
 		MaxBackends:   defaultMaxBackends,
 		Replicas:      g.Replicas - 1,
 		Overrides:     c.Spec.PostgreSQL.Parameters,
+		// A reshard target subscribes to every source it takes range from,
+		// so the worst case is the larger of the current and desired shard
+		// counts -- a merge from four shards to two gives each target four
+		// subscriptions. This was unset, so every group was sized as though
+		// resharding never happened.
+		LogicalSlots: logicalSlotsFor(c),
 	}
 	if in.CPUMillicores <= 0 {
 		in.CPUMillicores = 1000

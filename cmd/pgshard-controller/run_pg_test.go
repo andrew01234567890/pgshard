@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
+
 	"github.com/jackc/pgx/v5"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -42,11 +44,11 @@ func (s *syncBuffer) String() string {
 func startPostgres(t *testing.T) string {
 	t.Helper()
 	if err := exec.Command("docker", "info").Run(); err != nil {
-		t.Skip("docker unavailable")
+		dockertest.Unavailable(t, "docker unavailable")
 	}
 	if exec.Command("docker", "image", "inspect", pgImage).Run() != nil {
 		if out, err := exec.Command("docker", "pull", pgImage).CombinedOutput(); err != nil {
-			t.Skipf("image %s unavailable: %v: %s", pgImage, err, out)
+			dockertest.Unavailable(t, "image %s unavailable: %v: %s", pgImage, err, out)
 		}
 	}
 	l, err := net.Listen("tcp", "127.0.0.1:0")

@@ -4,13 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
-	"runtime"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -38,39 +37,12 @@ func startPostgresWith(t *testing.T, opts ...string) string {
 	return startPostgresImage(t, pgImage, nil, opts...)
 }
 
-// pgSlots bounds how many PostgreSQL-backed tests run at once. Admission is
-// per test, not per container: a fixture takes several containers one at a
-// time, so a per-container limit deadlocks as soon as every slot is held by a
-// test still waiting for its next container.
-var pgSlots = make(chan struct{}, pgLimit)
-
-// PGSHARD_TEST_PG_PARALLEL overrides the limit; 1 makes the suite serial
-// again on a runner that cannot afford the containers.
-var pgLimit = func() int {
-	if v, err := strconv.Atoi(os.Getenv("PGSHARD_TEST_PG_PARALLEL")); err == nil && v > 0 {
-		return v
-	}
-	n := runtime.GOMAXPROCS(0)
-	switch {
-	case n <= 2:
-		return 1
-	case n <= 4:
-		return 2
-	case n < 12:
-		return n / 2
-	default:
-		return 6
-	}
-}()
-
-// parallelPG marks a PostgreSQL-backed test parallel and holds a slot for its
-// whole lifetime. The release is registered before any container cleanup so it
-// runs last, after the containers are actually gone.
+// parallelPG marks a PostgreSQL-backed test parallel under the shared
+// admission limit. The helper lives in internal/dockertest so every package
+// that starts containers uses one bound rather than a copy of it.
 func parallelPG(t *testing.T) {
 	t.Helper()
-	t.Parallel()
-	pgSlots <- struct{}{}
-	t.Cleanup(func() { <-pgSlots })
+	dockertest.Parallel(t)
 }
 
 // hostPort reads back the host side of the container's published 5432.
@@ -94,11 +66,11 @@ func hostPort(t *testing.T, id string) string {
 func startPostgresImage(t *testing.T, image string, dockerArgs []string, opts ...string) string {
 	t.Helper()
 	if err := exec.Command("docker", "info").Run(); err != nil {
-		t.Skip("docker unavailable; skipping controller integration tests")
+		dockertest.Unavailable(t, "docker unavailable; skipping controller integration tests")
 	}
 	if exec.Command("docker", "image", "inspect", image).Run() != nil {
 		if out, err := exec.Command("docker", "pull", image).CombinedOutput(); err != nil {
-			t.Skipf("image %s unavailable: %v: %s", image, err, out)
+			dockertest.Unavailable(t, "image %s unavailable: %v: %s", image, err, out)
 		}
 	}
 	// Docker picks the host port: choosing one here and binding it a moment

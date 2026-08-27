@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
 )
 
 const psqlImage = "ghcr.io/andrew01234567890/pgshard-postgres:18"
@@ -19,7 +21,7 @@ func TestPsqlConformance(t *testing.T) {
 		t.Skip("integration test skipped in -short mode")
 	}
 	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("docker not on PATH; skipping psql conformance test")
+		dockertest.Unavailable(t, "docker not on PATH; skipping psql conformance test")
 	}
 	if err := exec.Command("docker", "image", "inspect", psqlImage).Run(); err != nil {
 		t.Skipf("image %s not available locally; skipping psql conformance test", psqlImage)

@@ -1125,3 +1125,107 @@ func TestOneStalledClientDoesNotDelayRevokingTheRest(t *testing.T) {
 		t.Fatal("a session was left executing while the sweep dealt with another")
 	}
 }
+
+// TestOversizedMessageIsRefusedBeforeAllocation: the message body length
+// comes from a five-byte header and pgproto3 allocates the whole declared
+// length before any body byte arrives, so the ceiling is what one
+// authenticated session can make the router allocate for free. It was 1 GiB
+// -- PostgreSQL's own limit, but a router never needs to hold a 1 GiB Bind.
+func TestOversizedMessageIsRefusedBeforeAllocation(t *testing.T) {
+	ts := startServer(t, Config{MaxMessageBodyLen: 1 << 20})
+	c := dialRaw(t, ts.addr)
+	c.startup(ProtocolVersion30)
+
+	// A Query header declaring a body far larger than the cap, and no body.
+	var hdr [5]byte
+	hdr[0] = 'Q'
+	binary.BigEndian.PutUint32(hdr[1:], uint32(64<<20))
+	if _, err := c.conn.Write(hdr[:]); err != nil {
+		t.Fatal(err)
+	}
+	// The refusal must be prompt and explicit. A deadline is essential to
+	// this test: without the cap the router accepts the length, allocates
+	// for it, and blocks waiting for a body that never comes -- which looks
+	// like a pass to any assertion that tolerates a read error.
+	if err := c.conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := c.fe.Receive()
+	if err != nil {
+		t.Fatalf("no refusal within 2s: the router accepted the declared length and waited for the body (%v)", err)
+	}
+	er, ok := msg.(*pgproto3.ErrorResponse)
+	if !ok {
+		t.Fatalf("a message declaring more than the cap was accepted: got %T", msg)
+	}
+	if er.Severity != "FATAL" {
+		t.Fatalf("oversized message refused with severity %q, want FATAL", er.Severity)
+	}
+}
+
+func TestDefaultMessageBodyCapIsFarBelowAGigabyte(t *testing.T) {
+	if DefaultMaxMessageBodyLen >= 1<<30 {
+		t.Fatalf("default cap %d is at PostgreSQL's 1 GiB backend limit; a router does not need it", DefaultMaxMessageBodyLen)
+	}
+	if DefaultMaxMessageBodyLen < 1<<20 {
+		t.Fatalf("default cap %d is below 1 MiB and would refuse ordinary large statements", DefaultMaxMessageBodyLen)
+	}
+}
+
+// TestRevocationInTheExecutorInstallGap: between deciding a session is not
+// revoked and installing its executor, NewExecutor runs. A revocation landing
+// in that window must still take effect, and the client must not be able to
+// tell it apart from an ordinary authentication failure -- otherwise the
+// error itself reveals that the role exists and was revoked.
+func TestRevocationInTheExecutorInstallGap(t *testing.T) {
+	ts := startServer(t, Config{})
+	building := make(chan struct{})
+	release := make(chan struct{})
+	ts.newExec = func(info SessionInfo) (Executor, error) {
+		if info.User == "revoked" {
+			close(building)
+			<-release
+		}
+		return NewFakeExecutor(), nil
+	}
+
+	c := dialRaw(t, ts.addr)
+	go func() {
+		c.rawStartup(ProtocolVersion30, map[string]string{"user": "revoked", "database": "db"})
+	}()
+
+	// The session is registered and its role is known, but its executor is
+	// not installed yet: this is the gap.
+	<-building
+	if n := ts.TerminateUser("revoked"); n != 1 {
+		t.Fatalf("revoked %d sessions in the install gap, want 1", n)
+	}
+	close(release)
+
+	if err := c.conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var sawError bool
+	for {
+		msg, err := c.fe.Receive()
+		if err != nil {
+			break
+		}
+		if er, ok := msg.(*pgproto3.ErrorResponse); ok {
+			sawError = true
+			// Indistinguishable from any other authentication failure: a
+			// distinct code or message would disclose that the role exists.
+			if er.Code != CodeInvalidPassword {
+				t.Fatalf("revocation in the install gap reported %s (%q); it must look like an ordinary authentication failure",
+					er.Code, er.Message)
+			}
+			break
+		}
+		if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+			t.Fatal("the session became usable despite being revoked before its executor was installed")
+		}
+	}
+	if !sawError {
+		t.Fatal("no error reported to a session revoked in the install gap")
+	}
+}

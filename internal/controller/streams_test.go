@@ -79,20 +79,6 @@ func TestStreamMonitor(t *testing.T) {
 	}
 }
 
-func (d *flakyDialer) DialDatabase(ctx context.Context, set string, id int32, database string) (ShardConn, error) {
-	if id == d.down {
-		return nil, fmt.Errorf("shard %s/%d unreachable", set, id)
-	}
-	return d.inner.(*PgxShardDialer).DialDatabase(ctx, set, id, database)
-}
-
-func (d *flakyDialer) DialDatabaseAs(ctx context.Context, set string, id int32, database, user, password string) (ShardConn, error) {
-	if id == d.down {
-		return nil, fmt.Errorf("shard %s/%d unreachable", set, id)
-	}
-	return d.inner.(*PgxShardDialer).DialDatabaseAs(ctx, set, id, database, user, password)
-}
-
 func TestStreamAdminCreatesAndDropsSlotsOnEveryShard(t *testing.T) {
 	parallelPG(t)
 	f := newResolverFixture(t)

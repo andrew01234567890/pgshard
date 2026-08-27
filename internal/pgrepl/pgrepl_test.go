@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
+
 	"github.com/jackc/pgx/v5"
 
 	"github.com/andrew01234567890/pgshard/internal/pgoutput"
@@ -107,7 +109,7 @@ func TestQuoteLiteral(t *testing.T) {
 // internal/pgoutput/testdata that the decoder tests replay offline.
 func TestCaptures(t *testing.T) {
 	if err := exec.Command("docker", "info").Run(); err != nil {
-		t.Skip("docker unavailable")
+		dockertest.Unavailable(t, "docker unavailable")
 	}
 	seen := map[string]bool{}
 	ran := 0

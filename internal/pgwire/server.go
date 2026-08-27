@@ -65,7 +65,13 @@ type Config struct {
 	// past the cap are refused with 53300. Zero means 100, negative
 	// disables the cap.
 	MaxStartupConns int
-	Logger          *slog.Logger
+	// MaxMessageBodyLen bounds one frontend message body. The length is
+	// taken from a five-byte header and the buffer for it is allocated
+	// before any of the body arrives, so an unbounded ceiling lets a valid
+	// login force an allocation per session at negligible cost to the
+	// client. Zero uses DefaultMaxMessageBodyLen.
+	MaxMessageBodyLen int
+	Logger            *slog.Logger
 }
 
 // Server accepts PostgreSQL client connections.

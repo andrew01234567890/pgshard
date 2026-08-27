@@ -1,45 +1,78 @@
-name: e2e-kind
+# Establishes how often one kind e2e suite actually fails. repeat.yml does the
+# same for Go packages, but the suites that block work -- reshard, upgrade --
+# are e2e, and their rate has never been measured.
+#
+# The cap is 12, not 50. Each run builds images and stands up its own kind
+# cluster, so a run costs tens of minutes of a hosted runner rather than
+# seconds. 12 runs distinguishes "fails most times" from "fails occasionally"
+# and bounds a rate at roughly the 1-in-12 level; it cannot see a 1-in-50
+# flake, and a green 12 must not be reported as one.
+#
+#   gh workflow run repeat-e2e.yml -f suite=reshard -f pg=18 -f runs=12
+name: Repeat e2e
 
 on:
-  pull_request:
-  push:
-    branches: [main]
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Which e2e suite to repeat
+        required: true
+        type: choice
+        options: [smoke, operator, backup, reshard, reshard-split, reshard-merge, upgrade]
+      pg:
+        description: PostgreSQL major
+        required: false
+        default: "18"
+        type: choice
+        options: ["18", "19"]
+      runs:
+        description: How many times (1-12)
+        required: false
+        default: "12"
+      ref:
+        description: Branch or SHA to run against (defaults to this workflow's ref)
+        required: false
+        default: ""
 
 permissions:
   contents: read
 
-concurrency:
-  group: e2e-kind-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  e2e:
-    name: e2e (pg${{ matrix.pg }}, ${{ matrix.suite }})
+  plan:
+    name: Plan ${{ inputs.runs }} runs
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ (matrix.suite == 'upgrade' || startsWith(matrix.suite, 'reshard-')) && 120 || 80 }}
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+    steps:
+      - id: build
+        run: |
+          set -euo pipefail
+          n="${{ inputs.runs }}"
+          if ! [[ "$n" =~ ^[0-9]+$ ]] || [ "$n" -lt 1 ] || [ "$n" -gt 12 ]; then
+            echo "::error::runs must be between 1 and 12, got '$n'"
+            exit 1
+          fi
+          echo "matrix=$(seq 1 "$n" | jq -R . | jq -sc '{run: .}')" >> "$GITHUB_OUTPUT"
+
+  repeat:
+    name: ${{ inputs.suite }} ${{ matrix.run }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # Every run must report, or the rate is meaningless.
+    continue-on-error: true
     strategy:
       fail-fast: false
-      matrix:
-        pg: [18, 19]
-        suite: [smoke, operator, backup, reshard]
-        include:
-          # The upgrade suite runs the online 18 -> 19 major upgrade, so it
-          # needs both majors' images. The scale suites drive one reshard each
-          # under continuous write load: a split and a merge, in separate jobs
-          # with separate clusters, because three transitions in one job did
-          # not finish inside a per-step budget the last one could use. One
-          # major each keeps the matrix inside the runner budget.
-          - pg: 18
-            suite: upgrade
-          - pg: 18
-            suite: reshard-split
-          - pg: 18
-            suite: reshard-merge
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
-      PG_MAJOR: ${{ matrix.pg }}
-      E2E_ARTIFACTS: ${{ github.workspace }}/artifacts/e2e-pg${{ matrix.pg }}-${{ matrix.suite }}
+      PG_MAJOR: ${{ inputs.pg }}
+      E2E_SUITE: ${{ inputs.suite }}
+      E2E_ARTIFACTS: ${{ github.workspace }}/artifacts/run-${{ matrix.run }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -49,27 +82,27 @@ jobs:
           version: v0.32.0
           install_only: true
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
-        if: matrix.suite != 'smoke'
+        if: inputs.suite != 'smoke'
       - name: Build PostgreSQL image
-        if: matrix.suite != 'smoke'
+        if: inputs.suite != 'smoke'
         uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7.3.0
         with:
           source: .
-          targets: postgres-${{ matrix.pg }}
+          targets: postgres-${{ inputs.pg }}
           load: true
         env:
           CI: "true"
       - name: Build operator and admin images
-        if: matrix.suite != 'smoke'
+        if: inputs.suite != 'smoke'
         run: |
           docker build -f Dockerfile.control --build-arg CMD=pgshard-operator -t pgshard-operator:e2e .
           docker build -f Dockerfile.control --build-arg CMD=pgshard-admin -t pgshard-admin:e2e .
           docker build -f Dockerfile.router -t pgshard-router:e2e .
       - name: Build controller image
-        if: startsWith(matrix.suite, 'reshard') || matrix.suite == 'upgrade'
+        if: startsWith(inputs.suite, 'reshard') || inputs.suite == 'upgrade'
         run: docker build -f Dockerfile.control --build-arg CMD=pgshard-controller -t pgshard-controller:e2e .
       - name: Build the target-major PostgreSQL image
-        if: matrix.suite == 'upgrade'
+        if: inputs.suite == 'upgrade'
         uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7.3.0
         with:
           source: .
@@ -80,13 +113,13 @@ jobs:
       - name: Create kind cluster
         run: hack/kind/up.sh
       - name: Load images into kind
-        if: matrix.suite != 'smoke'
+        if: inputs.suite != 'smoke'
         run: hack/kind/load-images.sh pgshard-operator:e2e pgshard-admin:e2e pgshard-router:e2e "ghcr.io/andrew01234567890/pgshard-postgres:${PG_MAJOR}"
       - name: Load controller image into kind
-        if: startsWith(matrix.suite, 'reshard') || matrix.suite == 'upgrade'
+        if: startsWith(inputs.suite, 'reshard') || inputs.suite == 'upgrade'
         run: hack/kind/load-images.sh pgshard-controller:e2e
       - name: Load the target-major image into kind
-        if: matrix.suite == 'upgrade'
+        if: inputs.suite == 'upgrade'
         run: hack/kind/load-images.sh "ghcr.io/andrew01234567890/pgshard-postgres:19"
       - name: Run e2e suite
         run: |
@@ -103,7 +136,6 @@ jobs:
             *) echo "unknown suite $E2E_SUITE" >&2; exit 1 ;;
           esac
         env:
-          E2E_SUITE: ${{ matrix.suite }}
           ROUTER_IMAGE: pgshard-router:e2e
           OPERATOR_IMAGE: pgshard-operator:e2e
           ADMIN_IMAGE: pgshard-admin:e2e
@@ -116,29 +148,35 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: e2e-pg${{ matrix.pg }}-${{ matrix.suite }}
+          name: repeat-e2e-${{ inputs.suite }}-pg${{ inputs.pg }}-run${{ matrix.run }}
           path: artifacts/
           if-no-files-found: ignore
       - name: Delete kind cluster
         if: always()
         run: hack/kind/down.sh
 
-  gate:
-    name: e2e gate
-    # Aggregates the whole matrix, so a suite added to it is gated from the
-    # moment it exists rather than when its cell name is added to branch
-    # protection by hand.
-    needs: [e2e]
+  rate:
+    name: Pass rate
+    needs: [plan, repeat]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Check that every e2e cell succeeded
+      - name: Report
         env:
-          RESULT: ${{ needs.e2e.result }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [ "$RESULT" != "success" ]; then
-            echo "::error::the e2e matrix did not succeed: $RESULT"
-            exit 1
-          fi
-          echo "every e2e cell succeeded"
+          jobs=$(gh api --paginate \
+            "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" \
+            --jq '.jobs[] | select(.name | startswith("${{ inputs.suite }} ")) | .conclusion')
+          total=$(echo "$jobs" | grep -c . || true)
+          passed=$(echo "$jobs" | grep -c '^success$' || true)
+          {
+            echo "## ${{ inputs.suite }} (pg${{ inputs.pg }}): $passed/$total passed"
+            echo
+            if [ "$passed" != "$total" ]; then
+              echo "Failing $((total - passed)) of $total. Record this rate on the ticket before changing anything."
+            else
+              echo "Green $total/$total — which bounds the rate at roughly 1-in-$total, not at zero."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

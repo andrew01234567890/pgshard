@@ -59,9 +59,12 @@ func newResolverFixtureWith(t *testing.T, opts ...string) *resolverFixture {
 	return f
 }
 
-// flakyDialer refuses one shard on demand.
+// flakyDialer refuses one shard on demand. It decorates the full dialer,
+// not just ShardDialer: a decorator that implemented only the narrow
+// interface was how the resolver's database-aware requirement came to be
+// discovered at run time instead of stated in its type.
 type flakyDialer struct {
-	inner ShardDialer
+	inner *PgxShardDialer
 	down  int32
 }
 
@@ -70,6 +73,20 @@ func (d *flakyDialer) Dial(ctx context.Context, set string, id int32) (ShardConn
 		return nil, fmt.Errorf("shard %s/%d unreachable", set, id)
 	}
 	return d.inner.Dial(ctx, set, id)
+}
+
+func (d *flakyDialer) DialDatabase(ctx context.Context, set string, id int32, database string) (ShardConn, error) {
+	if id == d.down {
+		return nil, fmt.Errorf("shard %s/%d unreachable", set, id)
+	}
+	return d.inner.DialDatabase(ctx, set, id, database)
+}
+
+func (d *flakyDialer) DialDatabaseAs(ctx context.Context, set string, id int32, database, user, password string) (ShardConn, error) {
+	if id == d.down {
+		return nil, fmt.Errorf("shard %s/%d unreachable", set, id)
+	}
+	return d.inner.DialDatabaseAs(ctx, set, id, database, user, password)
 }
 
 func (f *resolverFixture) shardDSN(id int) string { return f.shards[id] }
@@ -319,7 +336,7 @@ func TestResolverFinishesOtherDatabase(t *testing.T) {
 	if got := f.decisions(); len(got) != 0 {
 		t.Fatalf("decisions left %v", got)
 	}
-	conn, err := f.res.Shards.(ShardDBDialer).DialDatabase(ctx, "default", 0, "appdb")
+	conn, err := f.res.Shards.DialDatabase(ctx, "default", 0, "appdb")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -2,10 +2,12 @@ package metrics
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -159,5 +161,55 @@ func TestServeExposesMetricsAndShutsDown(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("Serve returned %v", err)
+	}
+}
+
+// TestServeReportsAnAcceptFailureWithoutWaitingForShutdown: Serve waited
+// unconditionally on a channel that only closed after ctx was cancelled, so a
+// listener or accept failure could not be returned until shutdown. The
+// controller and pooler run this in a background goroutine specifically to
+// log such a failure, so the metrics endpoint stayed dead while the process
+// looked healthy and the error sat in a goroutine nobody read.
+func TestServeReportsAnAcceptFailureWithoutWaitingForShutdown(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ctx is never cancelled: the point is that Serve returns anyway.
+	done := make(chan error, 1)
+	go func() { done <- serveOn(context.Background(), l, prometheus.NewRegistry()) }()
+
+	// Take the listener away, as a closed socket or an accept failure would.
+	time.Sleep(50 * time.Millisecond)
+	_ = l.Close()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a listener that went away was reported as a clean shutdown")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after its listener failed; it is waiting for a cancellation that may never come")
+	}
+}
+
+// A cancelled context must still shut down cleanly and report nil.
+func TestServeReturnsNilOnCancellation(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- serveOn(ctx, l, prometheus.NewRegistry()) }()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("clean shutdown reported %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after cancellation")
 	}
 }

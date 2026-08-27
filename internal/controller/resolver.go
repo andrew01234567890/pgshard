@@ -57,8 +57,13 @@ type ShardRef struct {
 // rolls back prepared transactions no decision row claims. Every step is
 // idempotent and safe to run concurrently with a coordinating router.
 type Resolver struct {
-	Pool   *pgxpool.Pool
-	Shards ShardDialer
+	Pool *pgxpool.Pool
+	// Shards must be database-aware: PostgreSQL finishes a prepared
+	// transaction only from the database it was prepared in, so the type is
+	// the requirement rather than a capability discovered at run time. A
+	// decorator that implemented only ShardDialer used to satisfy the field
+	// and silently lose that, finishing against the DSN's default database.
+	Shards ShardDBDialer
 	Logger *slog.Logger
 	// PreparingTimeout overrides DefaultPreparingTimeout.
 	PreparingTimeout time.Duration
@@ -248,13 +253,7 @@ func (r *Resolver) resolveDecision(ctx context.Context, d decision, holders map[
 // finishes a prepared transaction from the database it was prepared in, so
 // the connection targets h's database, not the DSN's default one.
 func (r *Resolver) finishOn(ctx context.Context, h holder, commit bool, gid string) error {
-	var conn ShardConn
-	var err error
-	if d, ok := r.Shards.(ShardDBDialer); ok {
-		conn, err = d.DialDatabase(ctx, h.Shard.Set, h.Shard.ID, h.Database)
-	} else {
-		conn, err = r.Shards.Dial(ctx, h.Shard.Set, h.Shard.ID)
-	}
+	conn, err := r.Shards.DialDatabase(ctx, h.Shard.Set, h.Shard.ID, h.Database)
 	if err != nil {
 		return err
 	}
@@ -337,8 +336,10 @@ func (r *Resolver) listShards(ctx context.Context, shardSet string) ([]ShardRef,
 	return refs, nil
 }
 
-// Run resolves every interval until ctx ends.
-func (r *Resolver) Run(ctx context.Context, interval time.Duration) {
+// Run resolves in-doubt transactions on every tick while this replica is
+// the leader. Only the leader may: a pass commits and rolls back prepared
+// transactions on every group.
+func (r *Resolver) Run(ctx context.Context, interval time.Duration, leader func() bool) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -346,6 +347,9 @@ func (r *Resolver) Run(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+		}
+		if leader != nil && !leader() {
+			continue
 		}
 		out, err := r.Resolve(ctx, "")
 		if err != nil && r.Logger != nil {
