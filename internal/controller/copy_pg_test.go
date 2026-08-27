@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -401,7 +402,11 @@ func TestReshardCopyOnPostgres(t *testing.T) {
 	for {
 		f.pass()
 		state, stage, msg = f.workflow(id)
-		if stage == StageCatchUpDone {
+		// Having reached catch-up counts even if the workflow has moved
+		// on: it can pass through catch_up_done between two polls, and
+		// waiting for that exact stage then spun until the deadline on a
+		// workflow that had already switched.
+		if slices.Contains(cutoverStages, stage) {
 			break
 		}
 		if state != StateRunning || time.Now().After(deadline) {
