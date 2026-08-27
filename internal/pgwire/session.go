@@ -42,6 +42,11 @@ type session struct {
 	mu       sync.Mutex
 	active   bool
 	draining bool
+	// drainSaw records the flags drain() decided from, and whether it took
+	// the idle branch. The state a failing shutdown test can read
+	// afterwards says where things ended, not what drain() saw when it
+	// chose, and those have disagreed.
+	drainSaw string
 	// revoked latches a revocation so a session still authenticating cannot
 	// finish startup and begin serving.
 	revoked bool
@@ -184,6 +189,8 @@ func (s *session) drain() {
 	// and is gone by the time it looks for it. A session that has not
 	// finished startup ends through the check below instead.
 	idle := s.serving && !s.active && !s.inTxn && !s.closed
+	s.drainSaw = fmt.Sprintf("serving=%v active=%v inTxn=%v closed=%v -> idle=%v",
+		s.serving, s.active, s.inTxn, s.closed, idle)
 	s.mu.Unlock()
 	if idle {
 		// The session goroutine is blocked in Receive, so write the error
