@@ -209,9 +209,20 @@ func (r *RestoreReconciler) create(ctx context.Context, rs *pgshardv1alpha1.PgSh
 			return ctrl.Result{}, r.fail(ctx, rs, fmt.Sprintf("barrier %q is not certified on %s; restoring to it would land on a point that is not two-phase consistent", name, source.Name))
 		}
 	}
+	// The group count and major are already checked equal above, so the
+	// groups line up one for one; only their names differ, and only when
+	// the source carried a generation the new cluster has no status for.
+	sourceGroups := map[string]string{}
+	newGroups, srcGroups := Groups(newCluster), Groups(&source)
+	for i := range newGroups {
+		if newGroups[i].Name() != srcGroups[i].Name() {
+			sourceGroups[newGroups[i].Name()] = srcGroups[i].Name()
+		}
+	}
 	src := RestoreSource{
 		SourceCluster: source.Name, Major: source.Spec.PostgreSQL.Major, Restore: rs.Name, BackupIDs: ids,
-		Type: target.Type, Target: target.Target, TargetTLI: target.TargetTLI, Exclusive: target.Exclusive,
+		SourceGroups: sourceGroups,
+		Type:         target.Type, Target: target.Target, TargetTLI: target.TargetTLI, Exclusive: target.Exclusive,
 	}
 	newCluster.Labels = map[string]string{LabelRestoredFrom: rs.Name}
 	newCluster.Annotations = map[string]string{AnnotationRestoreSource: src.Encode()}
@@ -231,7 +242,7 @@ func (r *RestoreReconciler) create(ctx context.Context, rs *pgshardv1alpha1.PgSh
 	rs.Status.Error = ""
 	rs.Status.Groups = nil
 	for _, g := range Groups(newCluster) {
-		rs.Status.Groups = append(rs.Status.Groups, pgshardv1alpha1.GroupRestoreStatus{Group: g.Name(), SourceStanza: src.Stanza(g), BackupID: ids[g.Name()]})
+		rs.Status.Groups = append(rs.Status.Groups, pgshardv1alpha1.GroupRestoreStatus{Group: g.Name(), SourceStanza: src.Stanza(g), BackupID: ids[src.SourceGroup(g)]})
 	}
 	meta.SetStatusCondition(&rs.Status.Conditions, metav1.Condition{Type: "Progressing", Status: metav1.ConditionTrue, Reason: "Restoring",
 		Message: fmt.Sprintf("cluster %s restoring from %s (%s)", newCluster.Name, source.Name, target.String()), ObservedGeneration: rs.Generation})
