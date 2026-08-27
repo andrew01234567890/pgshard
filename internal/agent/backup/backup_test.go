@@ -55,7 +55,13 @@ func TestRenderGoldens(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got = strings.ReplaceAll(got, s.Repo.CredentialsDir, "CREDDIR")
+			// ReplaceAll with an empty old string inserts the replacement
+			// between every character, and it corrupts the golden and the
+			// rendered config identically, so the comparison still passed
+			// while the file on disk became unreadable.
+			if s.Repo.CredentialsDir != "" {
+				got = strings.ReplaceAll(got, s.Repo.CredentialsDir, "CREDDIR")
+			}
 			golden := filepath.Join("testdata", name+".conf")
 			if *update {
 				if err := os.WriteFile(golden, []byte(got), 0o644); err != nil {

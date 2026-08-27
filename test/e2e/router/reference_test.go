@@ -28,7 +28,14 @@ func (s *shardedStack) declareReferenceAndSequences(tb testing.TB) {
 	defer func() { _ = cat.Close(ctx) }()
 	for _, sql := range []string{
 		`INSERT INTO pgshard.tables (database, schema_name, table_name, placement) VALUES ('app', 'public', 'regions', 'reference')`,
-		`INSERT INTO pgshard.table_status (database, schema_name, table_name, effective_placement) VALUES ('app', 'public', 'regions', 'reference')`,
+		// Standing in for the controller's inspection pass, which this
+		// stack does not run: regions evaluates nothing per shard, and
+		// stamped carries a default that every shard would evaluate for
+		// itself.
+		`INSERT INTO pgshard.table_status (database, schema_name, table_name, effective_placement, reference_checked_generation) VALUES ('app', 'public', 'regions', 'reference', 0)`,
+		`INSERT INTO pgshard.tables (database, schema_name, table_name, placement) VALUES ('app', 'public', 'stamped', 'reference')`,
+		`INSERT INTO pgshard.table_status (database, schema_name, table_name, effective_placement, reference_checked_generation, reference_hazards)
+			VALUES ('app', 'public', 'stamped', 'reference', 0, '{"the default of column seen calls now(), which pg_proc marks STABLE"}')`,
 		`INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key, sequence_columns) VALUES ('app', 'public', 'tickets', 'sharded', 'tenant_id', '{id}')`,
 		`INSERT INTO pgshard.table_status (database, schema_name, table_name, effective_placement, effective_shard_key) VALUES ('app', 'public', 'tickets', 'sharded', 'tenant_id')`,
 	} {
@@ -41,7 +48,8 @@ func (s *shardedStack) declareReferenceAndSequences(tb testing.TB) {
 		if err != nil {
 			tb.Fatal(err)
 		}
-		if _, err := conn.Exec(ctx, `create table regions (id int primary key, name text, stamp timestamptz default now());
+		if _, err := conn.Exec(ctx, `create table regions (id int primary key, name text, stamp timestamptz);
+			create table stamped (id int primary key, seen timestamptz default now());
 			create table tickets (tenant_id int8, id int8, body text, primary key (tenant_id, id));
 			grant all on regions, tickets to `+appRole); err != nil {
 			tb.Fatal(err)
@@ -189,6 +197,15 @@ func TestRouterReferenceTableWrites(t *testing.T) {
 		}
 		if _, err := shard1.Exec(ctx, "delete from regions where id = 9"); err != nil {
 			t.Fatal(err)
+		}
+	})
+
+	// The statement names no volatile value and still cannot be planned:
+	// the default is on the table, and only the shards can report it.
+	t.Run("a hazard the statement cannot show is refused", func(t *testing.T) {
+		_, err := conn.Exec(ctx, "insert into stamped (id) values (1)")
+		if sqlstate(err) != "0A000" || !strings.Contains(err.Error(), "the default of column seen calls now()") {
+			t.Fatalf("expected the recorded hazard to refuse the write, got %v", err)
 		}
 	})
 

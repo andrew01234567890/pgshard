@@ -399,7 +399,11 @@ func TestBackupReconcilerRunsEveryGroupPrimaryInOrder(t *testing.T) {
 	if got.Status.Phase != pgshardv1alpha1.BackupPhaseCompleted || got.Status.CompletedAt == nil || got.Status.BackupID != "20260819-020000F" || got.Status.Error != "" {
 		t.Fatalf("after finish: %+v", got.Status)
 	}
-	if want := []string{"backup 10.0.0.1:9090 incr", "expire 10.0.0.1:9090", "backup 10.0.0.2:9090 incr", "expire 10.0.0.2:9090"}; strings.Join(agents.journal(), ",") != strings.Join(want, ",") {
+	// Every backup first, then every expire. Expiring a group the moment
+	// its own backup lands can retire the set the last complete cluster
+	// backup depends on while a later group is still running; if that one
+	// then fails, nothing restorable cluster-wide is left.
+	if want := []string{"backup 10.0.0.1:9090 incr", "backup 10.0.0.2:9090 incr", "expire 10.0.0.1:9090", "expire 10.0.0.2:9090"}; strings.Join(agents.journal(), ",") != strings.Join(want, ",") {
 		t.Fatalf("calls %v", agents.journal())
 	}
 	shard := got.Status.Groups[1]

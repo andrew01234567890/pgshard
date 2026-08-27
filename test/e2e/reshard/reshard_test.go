@@ -285,6 +285,25 @@ func psql(ctx context.Context, c *e2e.Cluster, host, sql string) (string, error)
 	return strings.TrimSpace(out), err
 }
 
+// psqlOr and shardSQLOr report the error in place of the answer: they feed
+// a diagnostic, where failing the test would hide the state it is trying to
+// show.
+func psqlOr(ctx context.Context, c *e2e.Cluster, host, sql string) string {
+	out, err := psql(ctx, c, host, sql)
+	if err != nil {
+		return "unavailable: " + err.Error()
+	}
+	return out
+}
+
+func shardSQLOr(ctx context.Context, c *e2e.Cluster, group, sql string) string {
+	out, err := shardSQL(ctx, c, group, sql)
+	if err != nil {
+		return "unavailable: " + err.Error()
+	}
+	return out
+}
+
 func catalogSQL(ctx context.Context, t *testing.T, c *e2e.Cluster, sql string) string {
 	t.Helper()
 	out, err := psql(ctx, c, clusterName+"-catalog-rw", sql)
@@ -551,7 +570,19 @@ func TestReshardProvisionsTargetsAndCancels(t *testing.T) {
 	if got := catalogSQL(ctx, t, c, "SELECT string_agg(shard_set || ':' || shard_id || ':' || serving_state, ',') FROM pgshard.shard_status"); got != "default:0:serving" {
 		t.Fatalf("shard_status after cancel: %q", got)
 	}
-	waitFor(ctx, t, c, "copy cleaned up on the source", 5*time.Minute, func() bool {
+	// Three conditions have to line up here, and a bare wait reports only
+	// that they did not. Name which one is outstanding, with the slots'
+	// holders and the workflow's error, so a failure is a diagnosis rather
+	// than another run.
+	cleanupState := func() string {
+		return "\nworkflow: " + catalogSQL(ctx, t, c,
+			"SELECT coalesce(string_agg(state || ':' || coalesce(status->>'stage', '') || ' err=' || coalesce(error, ''), '; '), 'none') FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = 'g2'") +
+			"\nslots: " + psqlOr(ctx, c, clusterName+"-shard-0-rw",
+			"SELECT coalesce(string_agg(slot_name || ' active_pid=' || coalesce(active_pid::text, 'none') || ' wal=' || coalesce(pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)), '?'), ', '), 'none') FROM pg_replication_slots WHERE slot_name LIKE 'pgshard\\_reshard\\_%'") +
+			"\npublications: " + shardSQLOr(ctx, c, "shard-0",
+			"SELECT coalesce(string_agg(pubname, ', '), 'none') FROM pg_publication")
+	}
+	waitForWhy(ctx, t, c, "copy cleaned up on the source", 5*time.Minute, cleanupState, func() bool {
 		wf := catalogSQL(ctx, t, c, "SELECT coalesce(string_agg(state || ':' || (status->>'stage'), ','), '') FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = 'g2'")
 		slots, err := psql(ctx, c, clusterName+"-shard-0-rw", "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pgshard\\_reshard\\_%'")
 		if err != nil {

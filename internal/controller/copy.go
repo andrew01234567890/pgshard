@@ -491,7 +491,7 @@ func (c *Copier) drive(ctx context.Context, wf *copyWorkflow) (bool, error) {
 	}
 	wf.copy.Progress = progress
 	stage := ""
-	msg := fmt.Sprintf("copying: %d/%d tables ready, lag %d bytes", progress.TablesReady, progress.TablesTotal, progress.LagBytes)
+	msg := "copying: " + progress.Describe()
 	if wf.copy.Paused {
 		msg += " (paused: source standby lag over watermark)"
 	}
@@ -956,8 +956,13 @@ func (c *Copier) observe(ctx context.Context, wf *copyWorkflow, srcSet string, s
 func subscriptionReports(ctx context.Context, conn ShardConn, gen int64, t int32, srcIDs []int32, sourceLSN map[int32]int64) ([]SubscriptionProgress, error) {
 	rows, err := conn.Query(ctx, `
 		SELECT s.subname, s.subenabled, coalesce(r.srsubstate, ''), count(r.srrelid),
-		       (SELECT (st.latest_end_lsn - '0/0'::pg_lsn)::bigint FROM pg_stat_subscription st WHERE st.subid = s.oid AND st.relid IS NULL AND st.latest_end_lsn IS NOT NULL LIMIT 1)
+		       (SELECT (st.latest_end_lsn - '0/0'::pg_lsn)::bigint FROM pg_stat_subscription st WHERE st.subid = s.oid AND st.relid IS NULL AND st.latest_end_lsn IS NOT NULL LIMIT 1),
+		       -- Name the relations that are NOT ready, bounded: "5/8 tables
+		       -- ready" alone does not say which three are stuck.
+		       (array_agg(c.relnamespace::regnamespace || '.' || c.relname ORDER BY c.relname)
+		          FILTER (WHERE r.srsubstate IS DISTINCT FROM 'r'))[1:3]
 		FROM pg_subscription s LEFT JOIN pg_subscription_rel r ON r.srsubid = s.oid
+		     LEFT JOIN pg_class c ON c.oid = r.srrelid
 		WHERE s.subname LIKE $1
 		GROUP BY s.oid, s.subname, s.subenabled, r.srsubstate`, fmt.Sprintf("pgshard\\_reshard\\_g%d\\_t%d\\_%%", gen, t))
 	if err != nil {
@@ -970,12 +975,13 @@ func subscriptionReports(ctx context.Context, conn ShardConn, gen int64, t int32
 		var enabled bool
 		var n int
 		var applied *int64
-		if err := rows.Scan(&name, &enabled, &state, &n, &applied); err != nil {
+		var stuck []string
+		if err := rows.Scan(&name, &enabled, &state, &n, &applied, &stuck); err != nil {
 			return nil, err
 		}
 		p := bySub[name]
 		if p == nil {
-			p = &SubscriptionProgress{Rels: map[RelState]int{}, Enabled: enabled, LagBytes: LagUnknown}
+			p = &SubscriptionProgress{Name: name, Rels: map[RelState]int{}, Enabled: enabled, LagBytes: LagUnknown}
 			bySub[name] = p
 			if applied != nil && enabled {
 				if lsn, ok := sourceLSN[sourceOf(name, gen, t, srcIDs)]; ok {
@@ -985,6 +991,12 @@ func subscriptionReports(ctx context.Context, conn ShardConn, gen int64, t int32
 		}
 		if state != "" {
 			p.Rels[RelState(state[0])] += n
+		}
+		for _, rel := range stuck {
+			if len(p.Blockers) >= BlockerSamples {
+				break
+			}
+			p.Blockers = append(p.Blockers, fmt.Sprintf("%s(%s)", rel, state))
 		}
 	}
 	if err := rows.Err(); err != nil {

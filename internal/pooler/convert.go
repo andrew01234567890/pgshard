@@ -156,6 +156,8 @@ func toResponse(msg pgproto3.BackendMessage) *pgshardv1.ExecuteResponse {
 		r.Message = &pgshardv1.ExecuteResponse_ParameterStatus{ParameterStatus: &pgshardv1.ParameterStatus{Name: m.Name, Value: m.Value}}
 	case *pgproto3.EmptyQueryResponse:
 		r.Message = &pgshardv1.ExecuteResponse_EmptyQuery{EmptyQuery: &pgshardv1.EmptyQuery{}}
+	case *pgproto3.PortalSuspended:
+		r.Message = &pgshardv1.ExecuteResponse_PortalSuspended{PortalSuspended: &pgshardv1.PortalSuspended{}}
 	default:
 		return nil
 	}

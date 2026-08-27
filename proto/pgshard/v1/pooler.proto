@@ -285,6 +285,10 @@ message NotificationResponse {
 // EmptyQuery mirrors pgwire EmptyQueryResponse.
 message EmptyQuery {}
 
+// PortalSuspended reports that Execute stopped at its row limit with the
+// portal still open, so the client may Execute it again for more rows.
+message PortalSuspended {}
+
 // ExecuteResponse is one pooler-originated pgwire message.
 message ExecuteResponse {
   // Router session the message belongs to.
@@ -308,6 +312,7 @@ message ExecuteResponse {
     ParameterStatus parameter_status = 24;
     EmptyQuery empty_query = 25;
     NotificationResponse notification = 26;
+    PortalSuspended portal_suspended = 27;
   }
 }
 
