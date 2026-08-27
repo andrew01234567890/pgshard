@@ -7,6 +7,32 @@ for the reshard cutover fence; nothing is upgraded in place, and the old
 groups stay current over reverse replication until retirement, so the flip
 can be undone.
 
+## Preconditions
+
+Both sides gate the upgrade before anything physical happens, and a failure
+names every check that failed rather than the first.
+
+Operator-side (`UpgradeBlockers`), checked before the pending set is
+materialized:
+
+- `spec.postgresql.image`, when set, must name the target major — an image
+  built for the old major cannot serve the new one.
+- Backups must be healthy: a fresh full backup has to be possible before and
+  after, and the stanza changes with the major.
+- No shard set may already be pending — a reshard in flight must finish
+  first.
+- No table placement workflow may be running.
+
+Controller-side (`upgradePreconditions`), checked before the copy starts:
+
+- Every extension present on the source must exist on the target major.
+- No large objects in any database: logical replication does not carry
+  `pg_largeobject`, so those need the offline strategy.
+
+This list is the specification. Earlier comments in the code cited a plan
+section that is not tracked in the repository; if a check is added or
+removed, change it here.
+
 ## Online strategy (default)
 
 Setting `spec.postgresql.major` from 18 to 19 (with an image built for 19,

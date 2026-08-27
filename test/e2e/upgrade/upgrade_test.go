@@ -21,8 +21,10 @@ import (
 // onto 19 behind the stable catalog Service; and the whole cluster ends on
 // 19. Backup-stanza continuity is covered by the backup suite (the stanza
 // is derived per group, so new-major groups archive into fresh stanzas);
-// VStream continuity is asserted once the M6 stream stack is present after
-// the rebase onto main.
+// VStream continuity across the cutover is NOT asserted here. The stream
+// stack does exist now (internal/router/vstream), so the original reason --
+// waiting for a rebase -- no longer applies; it is simply unwritten, and
+// PGS-351 tracks the gap it would cover.
 func TestUpgrade18To19UnderLoad(t *testing.T) {
 	c := e2e.NewCluster(t)
 	c.GatherOnFailure(t)
@@ -45,7 +47,9 @@ func TestUpgrade18To19UnderLoad(t *testing.T) {
 		return strings.HasPrefix(upgradeWorkflowState(ctx, t, c, "g2"), "provisioning:") ||
 			strings.HasPrefix(upgradeWorkflowState(ctx, t, c, "g2"), "running:")
 	})
-	waitFor(ctx, t, c, "writes switched to the 19 set", 30*time.Minute, func() bool {
+	waitForWhy(ctx, t, c, "writes switched to the 19 set", 30*time.Minute, func() string {
+		return upgradeWorkflowDetail(ctx, t, c)
+	}, func() bool {
 		if st := upgradeWorkflowState(ctx, t, c, "g2"); strings.HasPrefix(st, "failed") {
 			t.Fatalf("upgrade workflow failed: %s", catalogSQL(ctx, t, c, "SELECT coalesce(error, '') || ' ' || status::text FROM pgshard.workflows WHERE kind = 'upgrade'"))
 		}
@@ -99,7 +103,9 @@ func TestUpgrade18To19UnderLoad(t *testing.T) {
 	waitFor(ctx, t, c, "re-run upgrade record", 10*time.Minute, func() bool {
 		return jsonpath(ctx, c, "pgshardreshard", record3, "{.spec.mode}") == "upgrade"
 	})
-	waitFor(ctx, t, c, "writes switched to the 19 set again", 30*time.Minute, func() bool {
+	waitForWhy(ctx, t, c, "writes switched to the 19 set again", 30*time.Minute, func() string {
+		return upgradeWorkflowDetail(ctx, t, c)
+	}, func() bool {
 		if st := upgradeWorkflowState(ctx, t, c, "g3"); strings.HasPrefix(st, "failed") {
 			t.Fatalf("upgrade workflow failed: %s", catalogSQL(ctx, t, c, "SELECT coalesce(error, '') || ' ' || status::text FROM pgshard.workflows WHERE kind = 'upgrade' AND spec->>'shard_set' = 'g3'"))
 		}
@@ -160,7 +166,9 @@ func TestUpgrade18To19ChaosControllerAndPrimaryKill(t *testing.T) {
 	if _, err := c.Kubectl(ctx, nil, "-n", testNamespace, "delete", "pod", "-l", "app="+clusterName+"-controller", "--wait=false"); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(ctx, t, c, "writes switched to the 19 set", 30*time.Minute, func() bool {
+	waitForWhy(ctx, t, c, "writes switched to the 19 set", 30*time.Minute, func() string {
+		return upgradeWorkflowDetail(ctx, t, c)
+	}, func() bool {
 		if st := upgradeWorkflowState(ctx, t, c, "g2"); strings.HasPrefix(st, "failed") {
 			t.Fatalf("upgrade workflow failed: %s", catalogSQL(ctx, t, c, "SELECT coalesce(error, '') || ' ' || status::text FROM pgshard.workflows WHERE kind = 'upgrade'"))
 		}
