@@ -8,7 +8,9 @@ seconds. This runbook is for when it cannot.
 ## Symptoms
 
 - Clients received `08007` (`transaction_resolution_unknown`) on `COMMIT`.
-- `pgshard_router_in_doubt_transactions_total` climbing on `/metrics`.
+- `pgshard_router_twopc_in_doubt_total` climbing on `/metrics`, and
+  `pgshard_controller_in_doubt_transactions` (undecided rows) or
+  `pgshard_controller_in_doubt_oldest_age_seconds` not returning to zero.
 - Rows stuck in the decision log, or prepared transactions lingering on a
   shard (they hold locks and pin the vacuum horizon):
 

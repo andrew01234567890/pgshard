@@ -42,20 +42,37 @@ func Serve(ctx context.Context, addr string, reg *prometheus.Registry) error {
 	if err != nil {
 		return err
 	}
+	return serveOn(ctx, l, reg)
+}
+
+// serveOn is Serve on an already-bound listener, so a test can take the
+// listener away and observe what Serve does about it.
+func serveOn(ctx context.Context, l net.Listener, reg *prometheus.Registry) error {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", Handler(reg))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	done := make(chan struct{})
-	go func() {
-		<-ctx.Done()
+
+	// Serve's result has to be selectable. Waiting unconditionally on a
+	// channel that only closes after cancellation meant a listener or accept
+	// failure could not be returned until shutdown: the callers run this in a
+	// background goroutine precisely to log such a failure, so the metrics
+	// endpoint stayed dead while the process looked healthy.
+	srvErr := make(chan error, 1)
+	go func() { srvErr <- srv.Serve(l) }()
+
+	select {
+	case err := <-srvErr:
+		return normalizeServeErr(err)
+	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
-		close(done)
-	}()
-	err = srv.Serve(l)
-	<-done
+		return normalizeServeErr(<-srvErr)
+	}
+}
+
+func normalizeServeErr(err error) error {
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
