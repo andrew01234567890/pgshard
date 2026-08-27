@@ -277,6 +277,13 @@ func (r *BackupReconciler) start(ctx context.Context, b *pgshardv1alpha1.PgShard
 			st.RepoSizeBytes = int64(res.RepoBytes)
 			run.groups = append(run.groups, st)
 			log.Info("group backup completed", "group", t.group.Name(), "label", res.Label)
+		}
+		// Only now: a group that expires as soon as its own backup lands
+		// can retire the set the last complete cluster backup depends on
+		// while a later group is still running, and a failure there leaves
+		// nothing restorable cluster-wide. The loop returns on the first
+		// failure, so reaching here means every group has a new backup.
+		for _, t := range targets {
 			if err := r.Agents.Expire(runCtx, t.addr); err != nil {
 				run.expireErr = errors.Join(run.expireErr, fmt.Errorf("group %s: %w", t.group.Name(), err))
 			}
