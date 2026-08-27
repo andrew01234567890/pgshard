@@ -173,6 +173,7 @@ message ExecuteRequest {
     Describe describe = 14;
     Close close = 15;
     Sync sync = 16;
+    Flush flush = 21;
     CopyData copy_data = 17;
     CopyDone copy_done = 18;
     CopyFail copy_fail = 19;
@@ -289,6 +290,18 @@ message EmptyQuery {}
 // portal still open, so the client may Execute it again for more rows.
 message PortalSuspended {}
 
+// Flush asks the backend to answer everything sent since the last flush
+// without ending the batch, so a pipelined client gets its rows before it
+// sends Sync. Unlike Sync it produces no ReadyForQuery, so the pooler
+// answers with FlushComplete once every message it forwarded has been
+// answered -- otherwise neither side knows when to stop reading.
+message Flush {}
+
+// FlushComplete marks the end of the responses to one Flush. It is the
+// pooler's own marker, not a PostgreSQL message, and is never forwarded to
+// a client.
+message FlushComplete {}
+
 // ExecuteResponse is one pooler-originated pgwire message.
 message ExecuteResponse {
   // Router session the message belongs to.
@@ -313,6 +326,7 @@ message ExecuteResponse {
     EmptyQuery empty_query = 25;
     NotificationResponse notification = 26;
     PortalSuspended portal_suspended = 27;
+    FlushComplete flush_complete = 28;
   }
 }
 

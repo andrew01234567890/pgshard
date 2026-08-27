@@ -76,6 +76,11 @@ type Executor interface {
 	// Sync is called for every Sync message so the executor can end an
 	// implicit transaction block.
 	Sync(ctx context.Context) error
+	// Flush is called for every Flush message: the batch staged so far
+	// runs and its responses reach the client, without ending the batch
+	// and without a ReadyForQuery. An executor that cannot answer a
+	// particular batch early returns nil and leaves it staged for Sync.
+	Flush(ctx context.Context, w ResultWriter) error
 	TransactionStatus() TxStatus
 	// Release frees any resources when the session ends.
 	Release()

@@ -41,6 +41,8 @@ func toFrontend(req *pgshardv1.ExecuteRequest) (pgproto3.FrontendMessage, error)
 		return &pgproto3.Close{ObjectType: closeKind(m.Close.Kind), Name: m.Close.Name}, nil
 	case *pgshardv1.ExecuteRequest_Sync:
 		return &pgproto3.Sync{}, nil
+	case *pgshardv1.ExecuteRequest_Flush:
+		return &pgproto3.Flush{}, nil
 	case *pgshardv1.ExecuteRequest_CopyData:
 		return &pgproto3.CopyData{Data: m.CopyData.Data}, nil
 	case *pgshardv1.ExecuteRequest_CopyDone:
