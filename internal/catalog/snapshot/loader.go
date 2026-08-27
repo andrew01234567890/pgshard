@@ -3,6 +3,7 @@ package snapshot
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -24,6 +25,7 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	s := &Snapshot{
+		LoadedAt:  time.Now(),
 		ShardSets: map[string][]Range{},
 		Serving:   map[ShardKey]Serving{},
 		Databases: map[string]catalog.Database{},
