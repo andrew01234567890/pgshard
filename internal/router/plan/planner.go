@@ -215,6 +215,15 @@ func classify(node *pgquerypb.Node, c *StmtClass) error {
 // selection assumes. The safe value is forced as the server default instead.
 var protectedDurabilityGUCs = map[string]bool{
 	"synchronous_commit": true,
+	// The barrier pauses writes with default_transaction_read_only, so a
+	// client that can turn either of these off writes straight through a
+	// pause taken to make a cluster-consistent restore point -- and the
+	// router replays client SETs onto every shard session it opens, so one
+	// override follows the session everywhere. BEGIN READ ONLY still gives
+	// a client a read-only transaction; only overriding the cluster's own
+	// setting is refused.
+	"default_transaction_read_only": true,
+	"transaction_read_only":         true,
 }
 
 // refuseProtectedSetConfig refuses set_config('<protected>', ...) anywhere in a
@@ -302,7 +311,7 @@ func refuseProtectedGUC(name string) error {
 	}
 	if protectedDurabilityGUCs[strings.ToLower(name)] {
 		err := pgwire.Errorf(pgwire.CodeInsufficientPrivilege, "changing %s is not permitted through pgshard", strings.ToLower(name))
-		err.Hint = "durability settings are fixed by the cluster to keep commits recoverable across failover"
+		err.Hint = "durability and write-pause settings are fixed by the cluster; use BEGIN READ ONLY for a read-only transaction"
 		return err
 	}
 	return nil

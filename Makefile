@@ -86,7 +86,7 @@ envtest-assets:
 		hack/envtest/setup-envtest.sh $(ENVTEST_ASSETS_DIR)
 
 envtest: envtest-assets
-	KUBEBUILDER_ASSETS="$$(hack/envtest/setup-envtest.sh $(ENVTEST_ASSETS_DIR))" go test -race -count=1 ./api/... ./internal/operator/... ./internal/admin/...
+	KUBEBUILDER_ASSETS="$$(hack/envtest/setup-envtest.sh $(ENVTEST_ASSETS_DIR))" PGSHARD_REQUIRE_ENVTEST=1 go test -race -count=1 ./api/... ./internal/operator/... ./internal/admin/...
 
 IMG ?= ghcr.io/andrew01234567890/pgshard-operator:latest
 
