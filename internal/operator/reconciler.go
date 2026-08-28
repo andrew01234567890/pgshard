@@ -276,15 +276,37 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	return ctrl.Result{RequeueAfter: requeue}, nil
 }
 
+// adoptSecret makes c the owner of an unowned secret. One that already has
+// a controller is left alone, whoever it is: taking an object from another
+// owner is how a deletion elsewhere removes a live cluster's credential.
+func (r *ClusterReconciler) adoptSecret(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, sec *corev1.Secret) error {
+	if metav1.GetControllerOf(sec) != nil {
+		return nil
+	}
+	base := sec.DeepCopy()
+	if err := controllerutil.SetControllerReference(c, sec, r.Scheme()); err != nil {
+		return err
+	}
+	return r.Patch(ctx, sec, client.MergeFrom(base))
+}
+
 func (r *ClusterReconciler) ensureSecret(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) (string, error) {
 	var sec corev1.Secret
 	key := types.NamespacedName{Namespace: c.Namespace, Name: SecretName(c.Name)}
 	err := r.Get(ctx, key, &sec)
 	if err == nil {
-		if pw, ok := sec.Data[secretKey]; ok && len(pw) > 0 {
-			return string(pw), nil
+		pw, ok := sec.Data[secretKey]
+		if !ok || len(pw) == 0 {
+			return "", fmt.Errorf("secret %s has no %q key", key.Name, secretKey)
 		}
-		return "", fmt.Errorf("secret %s has no %q key", key.Name, secretKey)
+		// A secret copied by a restore is created before the cluster
+		// exists, so it cannot be owned at that point. Adopt it now, so
+		// deleting the cluster takes its credential with it instead of
+		// leaving one behind for the next cluster of the same name.
+		if err := r.adoptSecret(ctx, c, &sec); err != nil {
+			return "", err
+		}
+		return string(pw), nil
 	}
 	if !apierrors.IsNotFound(err) {
 		return "", err

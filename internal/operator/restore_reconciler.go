@@ -1,6 +1,7 @@
 package operator
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"maps"
@@ -226,10 +227,24 @@ func (r *RestoreReconciler) create(ctx context.Context, rs *pgshardv1alpha1.PgSh
 	}
 	newCluster.Labels = map[string]string{LabelRestoredFrom: rs.Name}
 	newCluster.Annotations = map[string]string{AnnotationRestoreSource: src.Encode()}
-	if err := r.copySuperuserSecret(ctx, &source, newCluster.Name); err != nil {
-		return ctrl.Result{}, err
+	createdSecret, err := r.copySuperuserSecret(ctx, rs, &source, newCluster.Name)
+	if err != nil {
+		if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, r.fail(ctx, rs, err.Error())
 	}
 	if err := r.Create(ctx, newCluster); err != nil {
+		// The credential this pass wrote belongs to a cluster that does
+		// not exist, so leaving it behind would poison the next attempt
+		// with a copy nothing owns. One created by an earlier pass is not
+		// touched: it is already this restore's own.
+		if createdSecret {
+			sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: SecretName(newCluster.Name), Namespace: newCluster.Namespace}}
+			if derr := r.Delete(ctx, sec); client.IgnoreNotFound(derr) != nil {
+				logf.FromContext(ctx).Error(derr, "removing the copied superuser secret after a failed cluster create")
+			}
+		}
 		if apierrors.IsAlreadyExists(err) {
 			return ctrl.Result{RequeueAfter: restorePollInterval}, nil
 		}
@@ -271,20 +286,53 @@ func (r *RestoreReconciler) superuserPassword(ctx context.Context, source *pgsha
 // copySuperuserSecret gives the new cluster the source's superuser password:
 // the restored catalog carries the source's roles, so a freshly generated
 // password would lock the agent out of its own instance.
-func (r *RestoreReconciler) copySuperuserSecret(ctx context.Context, source *pgshardv1alpha1.PgShardCluster, newName string) error {
+// copySuperuserSecret puts the source's credential where the restored
+// cluster will look for it, and reports whether this pass created it.
+//
+// A secret already sitting at that name is not evidence of anything: it may
+// be left over from a deleted cluster, or belong to one that still exists.
+// Adopting it silently gives the restored cluster a credential that does
+// not match what the restored catalog holds, which locks its own agents and
+// routers out of it. So a collision is only reused when the object proves
+// it is this restore's own earlier copy, carrying the same password.
+func (r *RestoreReconciler) copySuperuserSecret(ctx context.Context, rs *pgshardv1alpha1.PgShardRestore, source *pgshardv1alpha1.PgShardCluster, newName string) (bool, error) {
 	var src corev1.Secret
 	if err := r.Get(ctx, types.NamespacedName{Namespace: source.Namespace, Name: SecretName(source.Name)}, &src); err != nil {
 		if apierrors.IsNotFound(err) {
-			return fmt.Errorf("source cluster %s has no superuser secret %s yet", source.Name, SecretName(source.Name))
+			return false, fmt.Errorf("source cluster %s has no superuser secret %s yet", source.Name, SecretName(source.Name))
 		}
-		return err
+		return false, err
 	}
-	dst := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: SecretName(newName), Namespace: source.Namespace, Labels: map[string]string{LabelCluster: newName}},
+	dst := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name: SecretName(newName), Namespace: source.Namespace,
+		Labels: map[string]string{LabelCluster: newName},
+		Annotations: map[string]string{
+			AnnotationRestoreUID:       string(rs.UID),
+			AnnotationRestoreSourceUID: string(source.UID),
+		}},
 		Type: src.Type, Data: src.Data}
-	if err := r.Create(ctx, dst); err != nil && !apierrors.IsAlreadyExists(err) {
-		return err
+	err := r.Create(ctx, dst)
+	if err == nil {
+		return true, nil
 	}
-	return nil
+	if !apierrors.IsAlreadyExists(err) {
+		return false, err
+	}
+	var existing corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: source.Namespace, Name: SecretName(newName)}, &existing); err != nil {
+		return false, err
+	}
+	switch {
+	// An unstamped object cannot be this restore's own copy, and an
+	// unidentified restore cannot claim one.
+	case rs.UID == "" || existing.Annotations[AnnotationRestoreUID] != string(rs.UID):
+		return false, fmt.Errorf("secret %s already exists and was not created by this restore; remove it or restore into another name", SecretName(newName))
+	case existing.Annotations[AnnotationRestoreSourceUID] != string(source.UID):
+		return false, fmt.Errorf("secret %s carries a credential from another source cluster; remove it or restore into another name", SecretName(newName))
+	case !bytes.Equal(existing.Data[secretKey], src.Data[secretKey]):
+		return false, fmt.Errorf("secret %s holds a different password than %s; the restored cluster would lock its own agents out", SecretName(newName), SecretName(source.Name))
+	}
+	return false, nil
 }
 
 // observe refreshes the per-group progress from the new cluster and settles
