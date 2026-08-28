@@ -325,7 +325,15 @@ type relay struct {
 	// the Close messages the pooler injects, which the backend answers
 	// like any other.
 	awaiting int
+	// copyBytes counts CopyData buffered for the backend since the last
+	// write to it. COPY IN produces no reply until it ends, so nothing
+	// else would move the upload out of memory before CopyDone.
+	copyBytes int
 }
+
+// flushEveryCopyBytes bounds how much of a COPY IN upload the pooler holds
+// before handing it to PostgreSQL.
+const flushEveryCopyBytes = 64 << 10
 
 // expect sends a frontend message the backend answers with exactly one
 // terminating reply, and records that the reply is owed.
@@ -447,8 +455,18 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 	}
 	r.forward(b, fm)
 	if !flushesBackend(req) {
+		if m, ok := req.Message.(*pgshardv1.ExecuteRequest_CopyData); ok {
+			r.copyBytes += len(m.CopyData.Data)
+			if r.copyBytes >= flushEveryCopyBytes {
+				r.copyBytes = 0
+				if err := b.flush(); err != nil {
+					return r.backendLost(b, err)
+				}
+			}
+		}
 		return nil
 	}
+	r.copyBytes = 0
 	if err := b.flush(); err != nil {
 		return r.backendLost(b, err)
 	}
