@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/andrew01234567890/pgshard/internal/placement"
 )
 
@@ -193,7 +195,7 @@ func TestAgentAddr(t *testing.T) {
 }
 
 func TestExpandShardTemplate(t *testing.T) {
-	got := ExpandShardTemplate("postgres://u:p@c-{group}-rw:5432/{db}?set={set}&id={id}", "g2", 1, "shard-1-g2", "app")
+	got := ExpandShardTemplate("postgres://u:p@c-{group}-rw:5432/app?set={set}&id={id}", "g2", 1, "shard-1-g2")
 	if got != "postgres://u:p@c-shard-1-g2-rw:5432/app?set=g2&id=1" {
 		t.Fatal(got)
 	}
@@ -258,5 +260,37 @@ func TestSubscriptionWithNoTablesIsNotCaughtUp(t *testing.T) {
 	}
 	if !Aggregate([]SubscriptionProgress{done}).CaughtUp(1 << 20) {
 		t.Fatal("a finished subscription is caught up")
+	}
+}
+
+// TestConnInfoKeepsADatabaseNameOneValue: the database came from CREATE
+// DATABASE, so a CREATEDB user chose it, and it went into dbname= raw.
+// libpq separates keywords on whitespace, so a quoted name carrying a
+// newline appended host and sslmode of the attacker's choosing to a string
+// that also carries the shard superuser password -- the next copy dialled
+// their PostgreSQL and offered it the credential.
+func TestConnInfoKeepsADatabaseNameOneValue(t *testing.T) {
+	const dsn = "host=shard-1-rw port=5432 user=postgres password=s3cret dbname=postgres"
+	for _, name := range []string{
+		"app\nhost=evil.example\nsslmode=disable",
+		"app\thost=evil.example",
+		"app host=evil.example",
+		"app' host='evil.example",
+		`app\ host=evil.example`,
+	} {
+		if _, err := ConnInfo(dsn, name); err == nil {
+			t.Fatalf("%q was accepted as a database name", name)
+		}
+	}
+	got, err := ConnInfo(dsn, "reports")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := pgx.ParseConfig(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Host != "shard-1-rw" || cfg.User != "postgres" || cfg.Password != "s3cret" || cfg.Database != "reports" {
+		t.Fatalf("host=%s user=%s database=%s", cfg.Host, cfg.User, cfg.Database)
 	}
 }
