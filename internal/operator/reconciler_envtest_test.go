@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -105,6 +106,41 @@ type fakeProber struct {
 	catalogRollbackDrops    []string
 	catalogRollbackErr      string
 	catalogRollbackDisables []string
+	// gateWidth, when set, holds every shard group's Probe until that many
+	// of them are waiting at once; gateOpened records that they were.
+	gateWidth  int
+	gateCount  int
+	gateOpen   chan struct{}
+	gateOpened bool
+}
+
+// waitAtGate blocks a shard group's probe until gateWidth groups are
+// probing at once, so a test can tell a concurrent pass from a serial one
+// without timing it. A serial pass never gets past one waiter and every
+// call falls out on the timeout instead.
+func (f *fakeProber) waitAtGate(dsn string) {
+	f.mu.Lock()
+	if f.gateWidth == 0 || !strings.Contains(dsn, "-shard-") {
+		f.mu.Unlock()
+		return
+	}
+	if f.gateOpen == nil {
+		f.gateOpen = make(chan struct{})
+	}
+	open := f.gateOpen
+	f.gateCount++
+	if f.gateCount >= f.gateWidth {
+		f.gateOpened = true
+		close(open)
+	}
+	f.mu.Unlock()
+	select {
+	case <-open:
+	case <-time.After(500 * time.Millisecond):
+	}
+	f.mu.Lock()
+	f.gateCount--
+	f.mu.Unlock()
 }
 
 func (f *fakeProber) SetShardSetMajor(_ context.Context, _ string, name string, major int) error {
@@ -303,7 +339,16 @@ func (f *fakeProber) ProbeStandby(_ context.Context, dsn string) (StandbyState, 
 	return StandbyState{}, errors.New("unreachable")
 }
 
-func (f *fakeProber) PublishShardStatus(_ context.Context, _ string, g Group, epoch int64, endpoint string) error {
+func (f *fakeProber) PublishShardStatus(ctx context.Context, dsn string, rows []ShardStatus) error {
+	for _, row := range rows {
+		if err := f.publishOne(ctx, dsn, row.Group, row.Epoch, row.Endpoint); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *fakeProber) publishOne(_ context.Context, _ string, g Group, epoch int64, endpoint string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.published = append(f.published, fmt.Sprintf("%s:%d:%s", g.Name(), epoch, endpoint))
@@ -422,6 +467,7 @@ func (f *fakeAgents) Demote(_ context.Context, addr string, epoch uint64) error 
 }
 
 func (f *fakeProber) Probe(_ context.Context, dsn string) (PrimaryState, error) {
+	f.waitAtGate(dsn)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.err != nil {
@@ -996,5 +1042,42 @@ func TestPrimaryOutsideTheMemberSetDoesNotPanic(t *testing.T) {
 	// so re-designating must never wind it back.
 	if after.Status.Epoch < 7 {
 		t.Fatalf("epoch went backwards: %d, was 7", after.Status.Epoch)
+	}
+}
+
+// TestReconcileWalksGroupsConcurrently pins that a pass costs the slowest
+// group rather than the sum of them. Every group used to be reconciled in
+// one sequential loop -- Kubernetes reads and writes, an agent RPC and a
+// few PostgreSQL round trips each -- so on a large topology a pass ran
+// past the requeue interval and a primary failure in the last group was
+// not noticed until the walk reached it.
+func TestReconcileWalksGroupsConcurrently(t *testing.T) {
+	const shards = 12
+	r, fp, c := setup(t, "conc")
+	c.Spec.Shards = ptr.To(shards)
+	if err := k8sClient.Update(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, r, c)
+	markPodsRunning(t, c)
+	fp.err = nil
+	streaming := map[string]bool{}
+	for _, g := range Groups(c) {
+		for i := 1; i < g.Replicas; i++ {
+			streaming[g.MemberName(i)] = true
+		}
+	}
+	fp.mu.Lock()
+	fp.streaming = streaming
+	fp.gateWidth = shards
+	fp.mu.Unlock()
+
+	reconcile(t, r, c)
+
+	fp.mu.Lock()
+	opened := fp.gateOpened
+	fp.mu.Unlock()
+	if !opened {
+		t.Errorf("no two of the %d shard groups were ever reconciled at the same time", shards)
 	}
 }

@@ -139,14 +139,14 @@ func TestPublishShardStatusIsQuietWhenNothingChanged(t *testing.T) {
 
 	g := Group{Cluster: "rs", Kind: "shard", ShardID: 0, Generation: 1}
 	p := PgxProber{}
-	if err := p.PublishShardStatus(ctx, dsn, g, 3, "rs-shard-0-rw:5432"); err != nil {
+	if err := p.PublishShardStatus(ctx, dsn, []ShardStatus{{Group: g, Epoch: 3, Endpoint: "rs-shard-0-rw:5432"}}); err != nil {
 		t.Fatal(err)
 	}
 	first := shardStatusUpdatedAt(t, conn, g)
 
 	// Three more identical passes, as a healthy cluster would do.
 	for i := 0; i < 3; i++ {
-		if err := p.PublishShardStatus(ctx, dsn, g, 3, "rs-shard-0-rw:5432"); err != nil {
+		if err := p.PublishShardStatus(ctx, dsn, []ShardStatus{{Group: g, Epoch: 3, Endpoint: "rs-shard-0-rw:5432"}}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -155,14 +155,14 @@ func TestPublishShardStatusIsQuietWhenNothingChanged(t *testing.T) {
 	}
 
 	// A real change must still land.
-	if err := p.PublishShardStatus(ctx, dsn, g, 4, "rs-shard-0-rw:5432"); err != nil {
+	if err := p.PublishShardStatus(ctx, dsn, []ShardStatus{{Group: g, Epoch: 4, Endpoint: "rs-shard-0-rw:5432"}}); err != nil {
 		t.Fatal(err)
 	}
 	afterEpoch := shardStatusUpdatedAt(t, conn, g)
 	if afterEpoch.Equal(first) {
 		t.Fatal("an epoch change did not update the row")
 	}
-	if err := p.PublishShardStatus(ctx, dsn, g, 4, "rs-shard-0-other:5432"); err != nil {
+	if err := p.PublishShardStatus(ctx, dsn, []ShardStatus{{Group: g, Epoch: 4, Endpoint: "rs-shard-0-other:5432"}}); err != nil {
 		t.Fatal(err)
 	}
 	if shardStatusUpdatedAt(t, conn, g).Equal(afterEpoch) {
@@ -331,4 +331,72 @@ func probeCount(t *testing.T, conn *pgx.Conn, sql string) int {
 		t.Fatal(err)
 	}
 	return n
+}
+
+// TestPublishShardStatusWritesEveryShardAtOnce: a pass published one
+// group per connection, so a large topology paid a connect and a round
+// trip per shard. The whole set now goes in one statement, which must
+// still refuse to lower an epoch and still leave an unchanged row alone.
+func TestPublishShardStatusWritesEveryShardAtOnce(t *testing.T) {
+	if err := exec.Command("docker", "info").Run(); err != nil {
+		dockertest.Unavailable(t, "docker unavailable")
+	}
+	ctx := context.Background()
+	dsn := startProbePostgres(t)
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if err := catalog.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+
+	p := PgxProber{}
+	group := func(id int) Group { return Group{Cluster: "rs", Kind: "shard", ShardID: id, Generation: 1} }
+	var rows []ShardStatus
+	for id := range 4 {
+		rows = append(rows, ShardStatus{Group: group(id), Epoch: 3, Endpoint: fmt.Sprintf("rs-shard-%d-rw:5432", id)})
+	}
+	if err := p.PublishShardStatus(ctx, dsn, rows); err != nil {
+		t.Fatal(err)
+	}
+	for id := range 4 {
+		if ep := shardStatusEndpoint(t, conn, group(id)); ep != fmt.Sprintf("rs-shard-%d-rw:5432", id) {
+			t.Fatalf("shard %d published %q", id, ep)
+		}
+	}
+	first := shardStatusUpdatedAt(t, conn, group(2))
+
+	if err := p.PublishShardStatus(ctx, dsn, rows); err != nil {
+		t.Fatal(err)
+	}
+	if again := shardStatusUpdatedAt(t, conn, group(2)); !again.Equal(first) {
+		t.Errorf("an unchanged batch rewrote a row (updated_at %s -> %s)", first, again)
+	}
+
+	// A stale epoch among fresh ones must not lower the fence, and the
+	// same shard named twice must not make PostgreSQL refuse the whole
+	// statement for touching a row a second time.
+	rows[2].Epoch = 2
+	rows[2].Endpoint = "rs-shard-2-stale:5432"
+	rows = append(rows, ShardStatus{Group: group(3), Epoch: 5, Endpoint: "rs-shard-3-promoted:5432"})
+	if err := p.PublishShardStatus(ctx, dsn, rows); err != nil {
+		t.Fatal(err)
+	}
+	if ep := shardStatusEndpoint(t, conn, group(2)); ep != "rs-shard-2-rw:5432" {
+		t.Errorf("a lower epoch overwrote the fence: %q", ep)
+	}
+	if ep := shardStatusEndpoint(t, conn, group(3)); ep != "rs-shard-3-promoted:5432" {
+		t.Errorf("the later row for a repeated shard did not win: %q", ep)
+	}
+}
+
+func shardStatusEndpoint(t *testing.T, conn *pgx.Conn, g Group) string {
+	t.Helper()
+	var ep string
+	if err := conn.QueryRow(context.Background(), "SELECT primary_endpoint FROM pgshard.shard_status WHERE shard_set = $1 AND shard_id = $2", g.ShardSet(), g.ShardID).Scan(&ep); err != nil {
+		t.Fatal(err)
+	}
+	return ep
 }

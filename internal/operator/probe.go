@@ -48,9 +48,10 @@ type Prober interface {
 	ProbeStandby(ctx context.Context, dsn string) (StandbyState, error)
 	SetSyncStandbyNames(ctx context.Context, dsn, value string) error
 	MigrateCatalog(ctx context.Context, dsn string) error
-	// PublishShardStatus upserts pgshard.shard_status for one shard group;
-	// it never lowers primary_epoch. Non-serving groups stay provisioning.
-	PublishShardStatus(ctx context.Context, dsn string, g Group, epoch int64, endpoint string) error
+	// PublishShardStatus upserts pgshard.shard_status for the given shard
+	// groups in one statement; it never lowers primary_epoch. Non-serving
+	// groups stay provisioning.
+	PublishShardStatus(ctx context.Context, dsn string, rows []ShardStatus) error
 	// ShardSets lists the catalog shard sets with their ranges.
 	ShardSets(ctx context.Context, dsn string) ([]ShardSetInfo, error)
 	// MaterializeShardSet writes a new shard set of equal ranges in state.
@@ -189,19 +190,43 @@ func (PgxProber) ProbeStandby(ctx context.Context, dsn string) (StandbyState, er
 	return st, nil
 }
 
-// PublishShardStatus upserts the shard's fence into pgshard.shard_status.
-func (PgxProber) PublishShardStatus(ctx context.Context, dsn string, g Group, epoch int64, endpoint string) error {
+// ShardStatus is one shard group's fence as published to the catalog.
+type ShardStatus struct {
+	Group    Group
+	Epoch    int64
+	Endpoint string
+}
+
+// PublishShardStatus upserts the shards' fences into pgshard.shard_status.
+// The whole set goes in one statement on one connection: a pass published
+// every group of the cluster separately, so a large topology paid a
+// connect and a round trip per shard.
+func (PgxProber) PublishShardStatus(ctx context.Context, dsn string, rows []ShardStatus) error {
+	rows = latestPerShard(rows)
+	if len(rows) == 0 {
+		return nil
+	}
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = conn.Close(ctx) }()
-	state := "serving"
-	if g.NonServing {
-		state = "provisioning"
-	}
-	if g.Retired {
-		state = "retired"
+	sets := make([]string, len(rows))
+	ids := make([]int, len(rows))
+	names := make([]string, len(rows))
+	states := make([]string, len(rows))
+	epochs := make([]int64, len(rows))
+	endpoints := make([]string, len(rows))
+	for i, row := range rows {
+		state := "serving"
+		if row.Group.NonServing {
+			state = "provisioning"
+		}
+		if row.Group.Retired {
+			state = "retired"
+		}
+		sets[i], ids[i], names[i] = row.Group.ShardSet(), row.Group.ShardID, row.Group.Name()
+		states[i], epochs[i], endpoints[i] = state, row.Epoch, row.Endpoint
 	}
 	// The epoch guard alone still rewrote an unchanged row on every pass,
 	// because an EQUAL epoch satisfies <=. Each write fires notify_serving,
@@ -210,7 +235,7 @@ func (PgxProber) PublishShardStatus(ctx context.Context, dsn string, g Group, ep
 	// rewrites, fences and sequences -- so a healthy cluster reconciling
 	// every 30s paid a full reload wave per shard for no change at all.
 	_, err = conn.Exec(ctx, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch, primary_endpoint)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		SELECT * FROM unnest($1::text[], $2::integer[], $3::text[], $4::text[], $5::bigint[], $6::text[])
 		ON CONFLICT (shard_set, shard_id) DO UPDATE
 		SET group_name = EXCLUDED.group_name, primary_epoch = EXCLUDED.primary_epoch,
 		    primary_endpoint = EXCLUDED.primary_endpoint, updated_at = now()
@@ -218,8 +243,31 @@ func (PgxProber) PublishShardStatus(ctx context.Context, dsn string, g Group, ep
 		  AND (pgshard.shard_status.group_name IS DISTINCT FROM EXCLUDED.group_name
 		    OR pgshard.shard_status.primary_epoch IS DISTINCT FROM EXCLUDED.primary_epoch
 		    OR pgshard.shard_status.primary_endpoint IS DISTINCT FROM EXCLUDED.primary_endpoint)`,
-		g.ShardSet(), g.ShardID, g.Name(), state, epoch, endpoint)
+		sets, ids, names, states, epochs, endpoints)
 	return err
+}
+
+// latestPerShard keeps one row per shard: PostgreSQL refuses an ON
+// CONFLICT DO UPDATE that would touch the same row twice in one command.
+// The row kept is the one the sequence of single-row upserts would have
+// left behind -- the highest epoch, since the guard refuses to lower one,
+// and the last of equal epochs.
+func latestPerShard(rows []ShardStatus) []ShardStatus {
+	out := make([]ShardStatus, 0, len(rows))
+	at := map[[2]any]int{}
+	for _, row := range rows {
+		key := [2]any{row.Group.ShardSet(), row.Group.ShardID}
+		i, seen := at[key]
+		if !seen {
+			at[key] = len(out)
+			out = append(out, row)
+			continue
+		}
+		if row.Epoch >= out[i].Epoch {
+			out[i] = row
+		}
+	}
+	return out
 }
 
 // ShardSetInfo is one catalog shard set with its ranges in key order.
@@ -592,10 +640,10 @@ func (b boundedProber) MigrateCatalog(ctx context.Context, dsn string) error {
 	return b.Inner.MigrateCatalog(ctx, dsn)
 }
 
-func (b boundedProber) PublishShardStatus(ctx context.Context, dsn string, g Group, epoch int64, endpoint string) error {
+func (b boundedProber) PublishShardStatus(ctx context.Context, dsn string, rows []ShardStatus) error {
 	ctx, cancel := b.bound(ctx)
 	defer cancel()
-	return b.Inner.PublishShardStatus(ctx, dsn, g, epoch, endpoint)
+	return b.Inner.PublishShardStatus(ctx, dsn, rows)
 }
 
 func (b boundedProber) ShardSets(ctx context.Context, dsn string) ([]ShardSetInfo, error) {

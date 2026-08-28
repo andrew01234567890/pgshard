@@ -292,7 +292,7 @@ func (r *ClusterReconciler) releaseLease(ctx context.Context, c *pgshardv1alpha1
 func (r *ClusterReconciler) publishFence(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, oldPrimary, primary string, epoch int64, password string) error {
 	if g.Kind == "shard" {
 		catalog := Groups(c)[0]
-		if err := r.Prober.PublishShardStatus(ctx, DSN(catalog.ServiceRW(), c.Namespace, password), g, epoch, r.memberEndpoint(c, g, primary)); err != nil {
+		if err := r.Prober.PublishShardStatus(ctx, DSN(catalog.ServiceRW(), c.Namespace, password), []ShardStatus{{Group: g, Epoch: epoch, Endpoint: r.memberEndpoint(c, g, primary)}}); err != nil {
 			return fmt.Errorf("publish shard_status: %w", err)
 		}
 	}
