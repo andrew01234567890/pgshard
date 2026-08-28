@@ -89,7 +89,7 @@ func newHarnessWith(t *testing.T, fp *fakePooler, poolerAddr string, mutate func
 }
 
 // startHarness builds the router from cfg and serves it on a loopback port.
-func startHarness(t *testing.T, h *harness, cfg Config) {
+func startHarness(t testing.TB, h *harness, cfg Config) {
 	t.Helper()
 	r, err := New(cfg)
 	if err != nil {
