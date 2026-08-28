@@ -167,14 +167,37 @@ func (r *ClusterReconciler) backupState(ctx context.Context, c *pgshardv1alpha1.
 		cond.Reason, cond.Message = "NoPolicy", "spec.backup.policyRef is empty; WAL is not archived"
 		return nil, false, cond, nil
 	}
+	// Members archive to what the policy last accepted, not to its spec. A
+	// spec that does not validate is a desired state that was rejected,
+	// and letting it through changes the member template, rolls the pods
+	// and can leave a replacement agent refusing to start on configuration
+	// nothing approved. Until an edit validates, the pods keep the
+	// configuration that did.
+	// Nothing accepted yet means nothing has been applied from this policy
+	// either, so there is no earlier configuration to protect and the spec
+	// is all there is.
+	accepted := policy.DeepCopy()
+	stale := false
+	if policy.Status.Accepted != nil {
+		accepted.Spec = *policy.Status.Accepted
+		stale = policy.Status.AcceptedGeneration != policy.Generation
+	}
 	backups, err := backupsOfCluster(ctx, r.Client, c.Namespace, c.Name)
 	if err != nil {
 		return nil, false, cond, err
 	}
-	health := BackupHealth(r.now(), policy.Spec.Schedules, lastSuccessful(backups))
+	health := BackupHealth(r.now(), accepted.Spec.Schedules, lastSuccessful(backups))
 	cond.Status, cond.Reason = health.Status, health.Reason
-	cond.Message = fmt.Sprintf("policy %s (%s): %s", policy.Name, policy.Spec.ObjectStore.Type, health.Message)
-	return policy, len(lastSuccessful(backups)) > 0, cond, nil
+	cond.Message = fmt.Sprintf("policy %s (%s): %s", policy.Name, accepted.Spec.ObjectStore.Type, health.Message)
+	if stale {
+		// Say the policy is not being followed rather than reporting on
+		// backups taken under a spec that is no longer the desired one.
+		cond.Status = metav1.ConditionFalse
+		cond.Reason = "PolicyInvalid"
+		cond.Message = fmt.Sprintf("policy %s generation %d did not validate; members keep the configuration accepted at generation %d",
+			policy.Name, policy.Generation, policy.Status.AcceptedGeneration)
+	}
+	return accepted, len(lastSuccessful(backups)) > 0, cond, nil
 }
 
 // backupsOfCluster lists the PgShardBackups naming the cluster.

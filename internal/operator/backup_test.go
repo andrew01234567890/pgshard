@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -747,5 +748,64 @@ func TestBackupRecordsTheSpecItStartedWith(t *testing.T) {
 	}
 	if list, err = backupsOfCluster(context.Background(), r.Client, b.Namespace, "somewhere-else"); err != nil || len(list) != 0 {
 		t.Fatalf("attributed to the wrong cluster: %+v %v", list, err)
+	}
+}
+
+// TestAnInvalidPolicyEditDoesNotReachTheMembers: the policy reconciler
+// marks a bad spec Valid=False and the cluster reconciler read spec.
+// anyway, so a rejected desired state became executable member
+// configuration: it changed the template and the pod hash, rolled the
+// members, and could leave a replacement agent refusing to start on
+// settings nothing had approved.
+func TestAnInvalidPolicyEditDoesNotReachTheMembers(t *testing.T) {
+	ctx := context.Background()
+	good := pgshardv1alpha1.PgShardBackupPolicySpec{
+		ObjectStore: pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "backups", Region: "eu-west-1"},
+		Schedules:   pgshardv1alpha1.BackupSchedules{Full: "0 2 * * *"},
+	}
+	pol := &pgshardv1alpha1.PgShardBackupPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "nightly", Namespace: "default", Generation: 2},
+		// Generation 2's spec never validated; generation 1's did.
+		Spec: pgshardv1alpha1.PgShardBackupPolicySpec{ObjectStore: pgshardv1alpha1.ObjectStoreSpec{Type: "s3"}},
+		Status: pgshardv1alpha1.PgShardBackupPolicyStatus{
+			Accepted: good.DeepCopy(), AcceptedGeneration: 1,
+		},
+	}
+	c := &pgshardv1alpha1.PgShardCluster{ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "default"}}
+	c.Spec.Backup.PolicyRef = "nightly"
+	cl := restoreClient(t, pol, c)
+	cr := &ClusterReconciler{Client: cl, Now: time.Now}
+
+	got, _, cond, err := cr.backupState(ctx, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil {
+		t.Fatal("the members must keep the configuration that validated, not lose it")
+	}
+	if got.Spec.ObjectStore.Bucket != "backups" || got.Spec.ObjectStore.Region != "eu-west-1" {
+		t.Fatalf("members were given the rejected spec: %+v", got.Spec.ObjectStore)
+	}
+	if !reflect.DeepEqual(Template(c, Groups(c)[0], nil, got).Backup, &good) {
+		t.Fatal("the member template must carry the accepted spec")
+	}
+	if cond.Status != metav1.ConditionFalse || cond.Reason != "PolicyInvalid" {
+		t.Fatalf("the cluster must say the policy is not being followed: %+v", cond)
+	}
+	if !strings.Contains(cond.Message, "generation 2 did not validate") {
+		t.Fatalf("condition message %q", cond.Message)
+	}
+
+	// Once the edit validates, it is what the members get.
+	validated := pol.DeepCopy()
+	validated.Status.Accepted = pol.Spec.DeepCopy()
+	validated.Status.AcceptedGeneration = 2
+	cr = &ClusterReconciler{Client: restoreClient(t, validated, c.DeepCopy()), Now: time.Now}
+	got, _, cond, err = cr.backupState(ctx, c)
+	if err != nil || got == nil {
+		t.Fatalf("after validation: %v", err)
+	}
+	if got.Spec.ObjectStore.Bucket != "" || cond.Reason == "PolicyInvalid" {
+		t.Fatalf("an accepted edit must be followed: %+v %+v", got.Spec.ObjectStore, cond)
 	}
 }

@@ -134,6 +134,10 @@ func (r *BackupPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		valid.Reason = "InvalidSchedule"
 		valid.Message = err.Error()
 	}
+	if valid.Status == metav1.ConditionTrue {
+		pol.Status.Accepted = pol.Spec.DeepCopy()
+		pol.Status.AcceptedGeneration = pol.Generation
+	}
 	meta.SetStatusCondition(&pol.Status.Conditions, valid)
 	r.setBarrierHealthy(&pol)
 

@@ -133,6 +133,15 @@ type ClusterBackupStatus struct {
 type PgShardBackupPolicyStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+	// Accepted is the last spec that validated, and AcceptedGeneration the
+	// generation it came from. Members archive to this rather than to
+	// spec: an edit that does not validate must not reach the pods, and
+	// the alternative to keeping what was accepted is rolling every member
+	// onto no archive configuration at all.
+	// +optional
+	Accepted *PgShardBackupPolicySpec `json:"accepted,omitempty"`
+	// +optional
+	AcceptedGeneration int64 `json:"acceptedGeneration,omitempty"`
 	// Clusters lists every cluster whose spec.backup.policyRef names this
 	// policy with its last successful backups.
 	// +optional
