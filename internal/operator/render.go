@@ -254,6 +254,15 @@ func (Renderer) MemberRBAC(c *pgshardv1alpha1.PgShardCluster) (*corev1.ServiceAc
 // one for the whole rollback window after the cutover has moved on. A rule
 // naming only the serving groups leaves each of them unable to renew, and an
 // agent that cannot hold its lease refuses to run.
+//
+// The serving, target and retired groups are all described by one reshard
+// record, which tells the truth about one cutover. A cluster that switched,
+// rolled back and switched again has a generation still running that none
+// of them names -- and its agent then crash-loops, silently, while the
+// cluster still reports Ready. So the names cover every generation the
+// cluster has reached, not only the three it can currently describe. They
+// all carry this cluster's own name, so a wider list still cannot reach
+// another cluster's primary, which is what the name scoping is for.
 func MemberRules(c *pgshardv1alpha1.PgShardCluster) []rbacv1.PolicyRule {
 	groups := Groups(c)
 	groups = append(groups, TargetGroups(c)...)
@@ -264,6 +273,7 @@ func MemberRules(c *pgshardv1alpha1.PgShardCluster) []rbacv1.PolicyRule {
 	if g := RetiredCatalogGroup(c); g != nil {
 		groups = append(groups, *g)
 	}
+	groups = append(groups, everyGenerationsGroups(c)...)
 	var leases []string
 	for _, g := range groups {
 		leases = append(leases, g.LeaseName())
@@ -275,6 +285,36 @@ func MemberRules(c *pgshardv1alpha1.PgShardCluster) []rbacv1.PolicyRule {
 		{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, ResourceNames: leases, Verbs: []string{"get", "update", "patch"}},
 		{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"get", "list", "watch"}},
 	}
+}
+
+// everyGenerationsGroups names the catalog and shard groups of every
+// generation from the first to the highest this cluster has reached, at the
+// widest shard count it has used. Groups whose pods are long gone cost a
+// name in a Role; a group still running whose name is missing costs a
+// primary that will not start.
+func everyGenerationsGroups(c *pgshardv1alpha1.PgShardCluster) []Group {
+	maxGen, maxShards := ServingGeneration(c), ServingShards(c)
+	note := func(gen int64, shards int) {
+		maxGen = max(maxGen, gen)
+		maxShards = max(maxShards, shards)
+	}
+	if rs := c.Status.Reshard; rs != nil {
+		note(rs.Generation, rs.Shards)
+		note(rs.RetiredGeneration, rs.RetiredShards)
+	}
+	note(CatalogGeneration(c), 0)
+	if up := c.Status.CatalogUpgrade; up != nil {
+		note(up.Generation, 0)
+		note(up.RetiredGeneration, 0)
+	}
+	var out []Group
+	for gen := int64(1); gen <= maxGen; gen++ {
+		out = append(out, Group{Cluster: c.Name, Kind: "catalog", Generation: gen})
+		for i := 0; i < maxShards; i++ {
+			out = append(out, Group{Cluster: c.Name, Kind: "shard", ShardID: i, Generation: gen})
+		}
+	}
+	return out
 }
 
 func service(c *pgshardv1alpha1.PgShardCluster, g Group, name string, selector map[string]string, headless bool) *corev1.Service {
