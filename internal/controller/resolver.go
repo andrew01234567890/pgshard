@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/metrics"
 )
 
@@ -389,7 +390,7 @@ func (d *PgxShardDialer) dsn(ctx context.Context, shardSet string, shardID int32
 	if err != nil {
 		return "", err
 	}
-	return ExpandShardTemplate(d.Template, shardSet, shardID, group, ""), nil
+	return ExpandShardTemplate(d.Template, shardSet, shardID, group), nil
 }
 
 // GroupName reads the shard_status group name of one shard.
@@ -401,10 +402,42 @@ func GroupName(ctx context.Context, pool *pgxpool.Pool, shardSet string, shardID
 	return group, nil
 }
 
-// ExpandShardTemplate substitutes {set}, {id}, {group} and {db} in a DSN
-// template.
-func ExpandShardTemplate(template, shardSet string, shardID int32, group, database string) string {
-	return strings.NewReplacer("{set}", shardSet, "{id}", fmt.Sprint(shardID), "{group}", group, "{db}", database).Replace(template)
+// ExpandShardTemplate substitutes {set}, {id} and {group} in a DSN
+// template. The database is not substituted: it is a name a CREATEDB user
+// chooses, so it is set through ConnInfo, which cannot let it become
+// anything but a database.
+func ExpandShardTemplate(template, shardSet string, shardID int32, group string) string {
+	return strings.NewReplacer("{set}", shardSet, "{id}", fmt.Sprint(shardID), "{group}", group).Replace(template)
+}
+
+// ConnInfo renders dsn with its database replaced by database, as a libpq
+// keyword/value string. The name is checked before it is used and every
+// value is quoted, so a database name cannot become further keywords:
+// PostgreSQL accepts any quoted identifier as a database name, and libpq
+// separates keywords on whitespace, so an unquoted name is an injection of
+// host, sslmode and the rest into a string that carries a shard superuser
+// credential.
+func ConnInfo(dsn, database string) (string, error) {
+	if err := catalog.CheckDatabaseName(database); err != nil {
+		return "", err
+	}
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return "", err
+	}
+	parts := []string{"host=" + quoteConnValue(cfg.Host), "port=" + fmt.Sprint(cfg.Port),
+		"user=" + quoteConnValue(cfg.User), "dbname=" + quoteConnValue(database)}
+	if cfg.Password != "" {
+		parts = append(parts, "password="+quoteConnValue(cfg.Password))
+	}
+	if cfg.TLSConfig == nil {
+		parts = append(parts, "sslmode=disable")
+	}
+	return strings.Join(parts, " "), nil
+}
+
+func quoteConnValue(v string) string {
+	return "'" + strings.NewReplacer("\\", "\\\\", "'", "\\'").Replace(v) + "'"
 }
 
 type pgxShardConn struct{ *pgx.Conn }

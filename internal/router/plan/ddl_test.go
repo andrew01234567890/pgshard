@@ -403,3 +403,23 @@ func TestDetachStepsCarryThePartitionSchema(t *testing.T) {
 		}
 	}
 }
+
+// TestCreateDatabaseRefusesConnectionSyntaxInTheName: a database name
+// travels into libpq connection strings that carry a shard superuser
+// credential, and PostgreSQL accepts any quoted identifier as one. A name
+// carrying whitespace appended host and sslmode keys of the creator's
+// choosing to those strings.
+func TestCreateDatabaseRefusesConnectionSyntaxInTheName(t *testing.T) {
+	for _, sql := range []string{
+		"create database \"shop host=evil.example\"",
+		"create database \"shop\nhost=evil.example\"",
+		"create database \"shop\thost=evil.example\"",
+		"create database \"sh'op\"",
+	} {
+		pl, err := New().Plan(context.Background(), session(fixture(t)), sql)
+		checkRefusal(t, pl, err, "database name", "42602")
+	}
+	if _, err := New().Plan(context.Background(), session(fixture(t)), "create database shop"); err != nil {
+		t.Fatalf("an ordinary name must still be accepted: %v", err)
+	}
+}
