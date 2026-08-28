@@ -335,13 +335,10 @@ func (e *Executor) staleSnapshot() error {
 		return nil
 	}
 	snap := e.r.cfg.Snapshot()
-	if snap == nil || snap.LoadedAt.IsZero() {
+	if !snap.Stale(e.r.now()) {
 		return nil
 	}
-	age := e.r.now().Sub(snap.LoadedAt)
-	if age <= snapshot.MaxAge {
-		return nil
-	}
+	age, _ := snap.Age(e.r.now())
 	err := pgwire.Errorf(codeStaleGeneration, "this router last read the catalog %s ago and will not plan against it", age.Round(time.Second))
 	err.Hint = "the router is failing to reload its catalog snapshot; retry, and check the catalog is reachable from it"
 	return err
