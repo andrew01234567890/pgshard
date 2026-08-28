@@ -344,3 +344,69 @@ func TestUpgradeRollbackRefusesAfterSchemaDrift(t *testing.T) {
 		t.Fatalf("serving set moved to %s despite the refusal", set)
 	}
 }
+
+// TestRollbackWaitsForAWriterThatStartedBeforeTheFence: the fence stops
+// routers that have seen it, and default_transaction_read_only is read when
+// a transaction starts, so neither ends a write that was already open. The
+// rollback checked positions and flipped, and Complete then dropped the
+// reverse replication -- so a transaction that committed in that window was
+// acknowledged on the set being rolled away from and its row went with the
+// replication.
+func TestRollbackWaitsForAWriterThatStartedBeforeTheFence(t *testing.T) {
+	parallelPG(t)
+	f := newUpgradeFixture(t)
+	id := f.startWorkflowKind(KindUpgrade)
+
+	deadline := time.Now().Add(4 * time.Minute)
+	var state, stage, msg string
+	for {
+		f.pass()
+		state, stage, msg = f.workflow(id)
+		if stage == StageSwitched || state == StateFailed || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if stage != StageSwitched {
+		t.Fatalf("upgrade did not switch: %s %s %q", state, stage, msg)
+	}
+
+	tenant := int64(999_337)
+	tid, _ := placement.KeyspaceID(tenant)
+	ctx := context.Background()
+	tgt := connect(t, f.appDSN("g2", int32(f.tgtRng.Locate(tid))))
+	tx, err := tgt.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO orders (tenant_id, note) VALUES ($1, 'in-flight-on-19')`, tenant); err != nil {
+		t.Fatal(err)
+	}
+
+	mustExec(t, f.catalog, `UPDATE pgshard.workflows SET spec = spec || '{"rollback": true}' WHERE id = $1::uuid`, id)
+	// Commit while the rollback is running. The drain has to be what lets
+	// it through, not luck.
+	committed := make(chan error, 1)
+	go func() {
+		time.Sleep(2 * time.Second)
+		committed <- tx.Commit(ctx)
+	}()
+	for {
+		f.pass()
+		state, stage, msg = f.workflow(id)
+		if stage == StageRolledBack || state == StateFailed || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if err := <-committed; err != nil {
+		t.Fatalf("the in-flight write could not commit: %v", err)
+	}
+	if stage != StageRolledBack || state != StateCancelled {
+		t.Fatalf("rollback did not finish: %s %s %q", state, stage, msg)
+	}
+	src := connect(t, f.appDSN("default", int32(f.srcRng.Locate(tid))))
+	waitFor(t, 30*time.Second, func() bool {
+		return queryOne[int64](t, src, `SELECT count(*) FROM orders WHERE note = 'in-flight-on-19'`) == 1
+	}, "a write that was in flight when the rollback began must reach the source")
+}

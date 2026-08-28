@@ -274,6 +274,20 @@ func (o *pgCutover) Rollback(ctx context.Context) error {
 	if len(drifted) > 0 {
 		return fmt.Errorf("schema changed since the switch on %s; rollback would restore a set that never received it, so it needs reconciling by hand", strings.Join(drifted, ", "))
 	}
+	// The metadata fence stops routers that have seen it, and a router
+	// that has not can still commit on the set being rolled away from --
+	// after which Complete drops the reverse replication that would have
+	// carried the row back. So the targets stop taking new writing
+	// transactions, and the ones already open are waited out: the setting
+	// is read when a transaction starts, so the pause alone does not end
+	// a writer that began before it.
+	if err := o.pauseSet(ctx, o.wf.set, o.wf.ids, true); err != nil {
+		return err
+	}
+	defer func() { _ = o.pauseSet(ctx, o.wf.set, o.wf.ids, false) }()
+	if err := o.drainWriters(ctx, o.wf.set, o.wf.ids); err != nil {
+		return err
+	}
 	positions := map[int32]int64{}
 	for _, t := range o.wf.ids {
 		lsn, err := o.currentLSN(ctx, o.wf.set, t)
@@ -288,19 +302,6 @@ func (o *pgCutover) Rollback(ctx context.Context) error {
 	}
 	if len(behind) > 0 {
 		return retryf("reverse subscriptions behind the target position: %s", strings.Join(behind, ", "))
-	}
-	// A router that missed the fence may have written on the new-major set
-	// after the positions were read; the flip back only happens once the
-	// targets stood still through a whole reverse catch-up, so that write
-	// is replicated back instead of lost.
-	for _, t := range o.wf.ids {
-		lsn, err := o.currentLSN(ctx, o.wf.set, t)
-		if err != nil {
-			return err
-		}
-		if lsn != positions[t] {
-			return retryf("target %s/%d advanced from %d to %d during the rollback catch-up", o.wf.set, t, positions[t], lsn)
-		}
 	}
 	if err := o.syncSequences(ctx, o.wf.set, o.wf.ids, o.srcSet, o.srcIDs); err != nil {
 		return err
