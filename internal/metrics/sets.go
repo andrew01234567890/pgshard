@@ -4,19 +4,21 @@ import "github.com/prometheus/client_golang/prometheus"
 
 // Router is the router process metric set.
 type Router struct {
-	Connections    prometheus.Counter
-	Queries        *prometheus.CounterVec
-	PlanCacheHits  prometheus.Counter
-	PlanCacheMiss  prometheus.Counter
-	Refusals       *prometheus.CounterVec
-	TwoPCCommits   prometheus.Counter
-	TwoPCAborts    prometheus.Counter
-	TwoPCInDoubt   prometheus.Counter
-	BufferEvents   prometheus.Counter
-	BufferSeconds  prometheus.Histogram
-	ScatterFanout  prometheus.Histogram
-	ShardLatency   *prometheus.HistogramVec
-	activeSessions prometheus.GaugeFunc
+	Connections      prometheus.Counter
+	Queries          *prometheus.CounterVec
+	PlanCacheHits    prometheus.Counter
+	PlanCacheMiss    prometheus.Counter
+	PlanCacheEvicted prometheus.Gauge
+	PlanCacheBytes   prometheus.Gauge
+	Refusals         *prometheus.CounterVec
+	TwoPCCommits     prometheus.Counter
+	TwoPCAborts      prometheus.Counter
+	TwoPCInDoubt     prometheus.Counter
+	BufferEvents     prometheus.Counter
+	BufferSeconds    prometheus.Histogram
+	ScatterFanout    prometheus.Histogram
+	ShardLatency     *prometheus.HistogramVec
+	activeSessions   prometheus.GaugeFunc
 }
 
 // NewRouter registers the router metric set on reg. sessions reports the
@@ -31,6 +33,10 @@ func NewRouter(reg *prometheus.Registry, sessions func() float64) *Router {
 			Name: "pgshard_router_plan_cache_hits_total", Help: "Parse cache hits."}),
 		PlanCacheMiss: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "pgshard_router_plan_cache_misses_total", Help: "Parse cache misses."}),
+		PlanCacheEvicted: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "pgshard_router_plan_cache_evicted_total", Help: "Parse cache entries evicted."}),
+		PlanCacheBytes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "pgshard_router_plan_cache_bytes", Help: "Heap the parse cache accounts for."}),
 		Refusals: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "pgshard_router_refusals_total", Help: "Statements the router refused, by SQLSTATE."}, []string{"sqlstate"}),
 		TwoPCCommits: prometheus.NewCounter(prometheus.CounterOpts{
@@ -53,7 +59,7 @@ func NewRouter(reg *prometheus.Registry, sessions func() float64) *Router {
 	}
 	m.activeSessions = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "pgshard_router_active_sessions", Help: "Live client sessions."}, sessions)
-	reg.MustRegister(m.Connections, m.Queries, m.PlanCacheHits, m.PlanCacheMiss, m.Refusals,
+	reg.MustRegister(m.Connections, m.Queries, m.PlanCacheHits, m.PlanCacheMiss, m.PlanCacheEvicted, m.PlanCacheBytes, m.Refusals,
 		m.TwoPCCommits, m.TwoPCAborts, m.TwoPCInDoubt, m.BufferEvents, m.BufferSeconds,
 		m.ScatterFanout, m.ShardLatency, m.activeSessions)
 	return m
@@ -64,6 +70,12 @@ func (m *Router) CacheHit() { m.PlanCacheHits.Inc() }
 
 // CacheMiss satisfies the parser cache metrics hook.
 func (m *Router) CacheMiss() { m.PlanCacheMiss.Inc() }
+
+// CacheEvicted satisfies the parser cache metrics hook.
+func (m *Router) CacheEvicted(total int) { m.PlanCacheEvicted.Set(float64(total)) }
+
+// CacheLiveBytes satisfies the parser cache metrics hook.
+func (m *Router) CacheLiveBytes(n int) { m.PlanCacheBytes.Set(float64(n)) }
 
 // Pooler is the pooler process metric set.
 type Pooler struct {

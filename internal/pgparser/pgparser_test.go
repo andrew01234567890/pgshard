@@ -192,10 +192,12 @@ func TestStmtLocations(t *testing.T) {
 	}
 }
 
-type countingMetrics struct{ hits, misses int }
+type countingMetrics struct{ hits, misses, evicted, bytes int }
 
-func (m *countingMetrics) CacheHit()  { m.hits++ }
-func (m *countingMetrics) CacheMiss() { m.misses++ }
+func (m *countingMetrics) CacheHit()            { m.hits++ }
+func (m *countingMetrics) CacheMiss()           { m.misses++ }
+func (m *countingMetrics) CacheEvicted(n int)   { m.evicted = n }
+func (m *countingMetrics) CacheLiveBytes(n int) { m.bytes = n }
 
 func TestParserLimits(t *testing.T) {
 	p := New(Options{MaxSQLBytes: 30, MaxStatements: 2})
@@ -238,12 +240,18 @@ func TestParserCache(t *testing.T) {
 	m := &countingMetrics{}
 	p := New(Options{CacheEntries: 2, CacheBytes: 1 << 20, Metrics: m})
 	ctx := context.Background()
+	// The first sighting only opens the door; the second is admitted and
+	// the third is served from the cache.
+	_, _ = p.Parse(ctx, "SELECT 1")
+	if p.cache.len() != 0 {
+		t.Fatal("a statement seen once must not be admitted")
+	}
 	first, _ := p.Parse(ctx, "SELECT 1")
 	second, _ := p.Parse(ctx, "SELECT 1")
 	if first != second {
 		t.Fatal("cache hit must return the same result")
 	}
-	if m.hits != 1 || m.misses != 1 {
+	if m.hits != 1 || m.misses != 2 {
 		t.Fatalf("hits=%d misses=%d", m.hits, m.misses)
 	}
 	if _, err := p.Parse(ctx, "SELEC 1"); err == nil {
@@ -252,14 +260,19 @@ func TestParserCache(t *testing.T) {
 	if p.cache.len() != 1 {
 		t.Fatalf("errors must not be cached, len=%d", p.cache.len())
 	}
+	_, _ = p.Parse(ctx, "SELECT 2")
 	if _, _ = p.Parse(ctx, "SELECT 2"); p.cache.len() != 2 {
 		t.Fatalf("len=%d", p.cache.len())
 	}
 	if _, _ = p.Parse(ctx, "SELECT 1"); m.hits != 2 {
 		t.Fatalf("hits=%d", m.hits)
 	}
+	_, _ = p.Parse(ctx, "SELECT 3")
 	if _, _ = p.Parse(ctx, "SELECT 3"); p.cache.len() != 2 {
 		t.Fatalf("len=%d", p.cache.len())
+	}
+	if m.evicted != 1 || m.bytes <= 0 {
+		t.Fatalf("evicted=%d live bytes=%d", m.evicted, m.bytes)
 	}
 	if _, ok := p.cache.get("SELECT 2"); ok {
 		t.Fatal("least recently used entry should have been evicted")
@@ -275,15 +288,22 @@ func TestParserCache(t *testing.T) {
 	}
 }
 
+// twice admits key through the doorkeeper, which holds a statement out of
+// the cache until it has been seen a second time.
+func twice(c *lru, key string, r *ParseResult, size int) {
+	c.put(key, r, size)
+	c.put(key, r, size)
+}
+
 func TestCacheBytesBound(t *testing.T) {
 	c := newLRU(100, 100)
 	r := &ParseResult{}
-	c.put("a", r, 60)
-	c.put("b", r, 60)
+	twice(c, "a", r, 60)
+	twice(c, "b", r, 60)
 	if _, ok := c.get("a"); ok || c.len() != 1 || c.bytes != 60 {
 		t.Fatalf("byte bound not enforced: len=%d bytes=%d", c.len(), c.bytes)
 	}
-	c.put("huge", r, 101)
+	twice(c, "huge", r, 101)
 	if _, ok := c.get("huge"); ok {
 		t.Fatal("oversized entries must not be stored")
 	}
@@ -330,5 +350,28 @@ func TestCachedParseWeightCoversRealHeap(t *testing.T) {
 		if charged < live {
 			t.Errorf("%s: charged %d bytes for %d bytes of heap; a cache bound that undercounts is not a bound", name, charged, live)
 		}
+	}
+}
+
+// TestOneHitStatementsCannotEvictAReusedPlan: the cache admitted every
+// miss, so a stream of literal-varying statements -- each parsed once and
+// never seen again -- pushed out the prepared statement the workload
+// actually reuses.
+func TestOneHitStatementsCannotEvictAReusedPlan(t *testing.T) {
+	p := New(Options{CacheEntries: 8, CacheBytes: 1 << 20})
+	ctx := context.Background()
+	const hot = "SELECT * FROM orders WHERE id = $1"
+	for range 2 {
+		if _, err := p.Parse(ctx, hot); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range 200 {
+		if _, err := p.Parse(ctx, fmt.Sprintf("SELECT * FROM orders WHERE id = %d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, ok := p.cache.get(hot); !ok {
+		t.Fatalf("the reused statement was evicted by %d one-hit statements", 200)
 	}
 }
