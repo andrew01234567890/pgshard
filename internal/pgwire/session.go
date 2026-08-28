@@ -64,6 +64,10 @@ type session struct {
 	// skipToSync is set after an extended-protocol error until Sync arrives.
 	skipToSync bool
 	dataRows   int
+	// copyBytes is what the current COPY OUT has queued since its last
+	// flush; rows are counted, COPY chunks have no fixed size so they are
+	// weighed.
+	copyBytes int
 	// copyIn is the active COPY FROM STDIN stream, if any.
 	copyIn *copyInStream
 }
