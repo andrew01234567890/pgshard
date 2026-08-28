@@ -47,7 +47,11 @@ spec:
           metadata:
             type: object
           spec:
-            description: PgShardBackupSpec requests one backup of a cluster.
+            description: |-
+              PgShardBackupSpec requests one backup of a cluster. It is immutable: a
+              backup is one operation, and the physical work starts against the
+              cluster and type it was created with. Editing them afterwards would
+              record the result of backing up one cluster as a backup of another.
             properties:
               clusterName:
                 type: string
@@ -61,12 +65,22 @@ spec:
             required:
             - clusterName
             type: object
+            x-kubernetes-validations:
+            - message: a backup's spec is immutable; create another PgShardBackup
+              rule: self == oldSelf
           status:
             description: PgShardBackupStatus is the observed state of a backup.
             properties:
               backupId:
                 description: BackupID is the catalog stanza's backup label once every
                   group completed.
+                type: string
+              clusterName:
+                description: |-
+                  ClusterName and Type are the spec this run was accepted with,
+                  recorded before any physical work starts. Provenance is read from
+                  here, never from the spec: what a completed backup protected is what
+                  was captured when it began.
                 type: string
               completedAt:
                 format: date-time
@@ -171,8 +185,17 @@ spec:
                 type: array
               phase:
                 type: string
+              policy:
+                description: |-
+                  Policy is the backup policy the run resolved, by name and UID: a
+                  policy deleted and recreated at the same name is a different store.
+                type: string
+              policyUID:
+                type: string
               startedAt:
                 format: date-time
+                type: string
+              type:
                 type: string
             type: object
         required:
