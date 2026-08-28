@@ -3,6 +3,8 @@ package pgparser
 import (
 	"context"
 	"errors"
+	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -288,5 +290,45 @@ func TestCacheBytesBound(t *testing.T) {
 	c.put("b", r, 30)
 	if c.bytes != 30 || c.len() != 1 {
 		t.Fatalf("resize: len=%d bytes=%d", c.len(), c.bytes)
+	}
+}
+
+// TestCachedParseWeightCoversRealHeap: CacheBytes is a memory bound an
+// operator sets, so what the cache charges an entry has to be at least
+// what that entry actually holds. The serialized size alone is not: the
+// wire encoding is compact, and the Go objects it becomes are structs,
+// slices, maps and pointers.
+func TestCachedParseWeightCoversRealHeap(t *testing.T) {
+	const n = 2000
+	shapes := map[string]func(int) string{
+		"simple": func(i int) string { return fmt.Sprintf("SELECT a FROM t WHERE id = %d", i) },
+		"join": func(i int) string {
+			return fmt.Sprintf("SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.cid WHERE o.id = %d", i)
+		},
+		"insert": func(i int) string { return fmt.Sprintf("INSERT INTO t (a,b,c) VALUES (%d,%d,%d)", i, i, i) },
+	}
+	for name, gen := range shapes {
+		runtime.GC()
+		var before runtime.MemStats
+		runtime.ReadMemStats(&before)
+		held := make([]*ParseResult, 0, n)
+		charged := 0
+		for i := range n {
+			sql := gen(i)
+			r, err := Parse(sql)
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			held = append(held, r)
+			charged += astWeight(sql, r.Tree)
+		}
+		runtime.GC()
+		var after runtime.MemStats
+		runtime.ReadMemStats(&after)
+		live := int(after.HeapAlloc - before.HeapAlloc)
+		runtime.KeepAlive(held)
+		if charged < live {
+			t.Errorf("%s: charged %d bytes for %d bytes of heap; a cache bound that undercounts is not a bound", name, charged, live)
+		}
 	}
 }
