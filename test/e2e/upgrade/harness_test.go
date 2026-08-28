@@ -346,8 +346,49 @@ func (l *ledger) verify(ctx context.Context, t *testing.T, acked int64) {
 	}
 	want := fmt.Sprintf("%d/%d", acked, acked)
 	if got != want {
-		t.Fatalf("ledger oracle on %s: %s, want %s (acked writes lost or duplicated)", group, got, want)
+		t.Fatalf("ledger oracle on %s: %s, want %s (acked writes lost or duplicated)\n%s", group, got, want, l.explain(ctx, t, group, acked))
 	}
+}
+
+// explain says which rows are missing and what replication looked like.
+// "1675 of 6275" does not distinguish a copy that never ran from a stream
+// that dropped rows, and those have different causes: a contiguous block
+// missing from the front is an initial copy that was not waited for, gaps
+// throughout are changes the subscription did not carry, and a block
+// missing from the end is a switch that happened before the target caught
+// up.
+func (l *ledger) explain(ctx context.Context, t *testing.T, group string, acked int64) string {
+	t.Helper()
+	var b strings.Builder
+	ask := func(label, target, db, sql string) {
+		out, err := psql(ctx, l.c, clusterName+"-"+target, db, sql)
+		if err != nil {
+			fmt.Fprintf(&b, "  %s: %v\n", label, err)
+			return
+		}
+		fmt.Fprintf(&b, "  %s: %s\n", label, strings.ReplaceAll(strings.TrimSpace(out), "\n", " | "))
+	}
+	shape := fmt.Sprintf(`SELECT 'rows=' || count(*) || ' min=' || coalesce(min(id)::text, '-') || ' max=' || coalesce(max(id)::text, '-')
+		|| ' first_gap=' || coalesce((SELECT min(g) FROM generate_series(1, %d) g WHERE NOT EXISTS (SELECT 1 FROM ledger WHERE id = g))::text, 'none')
+		FROM ledger WHERE id <= %d`, acked, acked)
+	b.WriteString("ledger shape (acked ids are dense 1.." + fmt.Sprint(acked) + "):\n")
+	ask("serving "+group, group+"-rw", appDatabase, shape)
+	other := "shard-0"
+	if group == "shard-0" {
+		other = "shard-0-g2"
+	}
+	ask("other "+other, other+"-rw", appDatabase, shape)
+	b.WriteString("replication:\n")
+	ask("subscriptions on "+other, other+"-rw", appDatabase,
+		`SELECT s.subname || ' enabled=' || s.subenabled || ' rels=' || coalesce(string_agg(r.srsubstate, ',' ORDER BY r.srsubstate), 'none')
+		 FROM pg_subscription s LEFT JOIN pg_subscription_rel r ON r.srsubid = s.oid GROUP BY s.subname, s.subenabled ORDER BY 1`)
+	ask("subscriptions on "+group, group+"-rw", appDatabase,
+		`SELECT s.subname || ' enabled=' || s.subenabled || ' rels=' || coalesce(string_agg(r.srsubstate, ',' ORDER BY r.srsubstate), 'none')
+		 FROM pg_subscription s LEFT JOIN pg_subscription_rel r ON r.srsubid = s.oid GROUP BY s.subname, s.subenabled ORDER BY 1`)
+	ask("slots on "+other, other+"-rw", appDatabase,
+		`SELECT slot_name || ' active=' || active || ' confirmed=' || coalesce(confirmed_flush_lsn::text, '-') FROM pg_replication_slots ORDER BY 1`)
+	b.WriteString("workflow: " + upgradeWorkflowDetail(ctx, t, l.c))
+	return b.String()
 }
 
 func seedLedger(ctx context.Context, t *testing.T, c *e2e.Cluster) {
