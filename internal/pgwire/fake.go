@@ -26,6 +26,9 @@ type FakeExecutor struct {
 	// SyncDelay is the same hook for Sync, where an extended-protocol batch
 	// actually runs.
 	SyncDelay func(ctx context.Context) error
+	// CopyOutFn, when set, answers a simple query by writing a COPY OUT
+	// through w instead of rows.
+	CopyOutFn func(w ResultWriter) error
 	// FlushFn answers a client Flush; nil leaves the batch for Sync.
 	FlushFn func(ctx context.Context, w ResultWriter) error
 }
@@ -121,6 +124,9 @@ func (f *FakeExecutor) SimpleQuery(ctx context.Context, sql string, w ResultWrit
 		if err := f.Delay(ctx); err != nil {
 			return err
 		}
+	}
+	if f.CopyOutFn != nil {
+		return f.CopyOutFn(w)
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()

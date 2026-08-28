@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -1366,4 +1367,55 @@ func TestDrainBetweenServingAndIdleStillTerminates(t *testing.T) {
 		}
 		_ = c.conn.Close()
 	}
+}
+
+// TestCopyOutReachesTheClientBeforeTheQueryEnds: COPY data was written into
+// the backend buffer and not flushed, so an export sat in the router until
+// ReadyForQuery -- memory proportional to the export, and a client whose
+// first byte waited for its last.
+func TestCopyOutReachesTheClientBeforeTheQueryEnds(t *testing.T) {
+	release := make(chan struct{})
+	sent := make(chan struct{})
+	ts := startServer(t, Config{})
+	ts.newExec = func(SessionInfo) (Executor, error) {
+		e := NewFakeExecutor()
+		e.CopyOutFn = func(w ResultWriter) error {
+			if err := w.CopyOut(0, nil); err != nil {
+				return err
+			}
+			chunk := bytes.Repeat([]byte("x"), 8<<10)
+			for range 16 { // 128 KiB, past the flush threshold
+				if err := w.CopyData(chunk); err != nil {
+					return err
+				}
+			}
+			close(sent)
+			// Hold the query open: anything the client has by now was
+			// flushed as the copy ran, not at ReadyForQuery.
+			<-release
+			if err := w.CopyDone(); err != nil {
+				return err
+			}
+			return w.CommandComplete("COPY 16")
+		}
+		return e, nil
+	}
+	c := dialRaw(t, ts.addr)
+	c.startup(ProtocolVersion30)
+	c.send(&pgproto3.Query{String: "copy t to stdout"})
+	<-sent
+
+	_ = c.conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	var copied int
+	for copied < 8<<10 {
+		msg, err := c.fe.Receive()
+		if err != nil {
+			close(release)
+			t.Fatalf("the export was still in the router when the query had produced 128 KiB: %v", err)
+		}
+		if d, ok := msg.(*pgproto3.CopyData); ok {
+			copied += len(d.Data)
+		}
+	}
+	close(release)
 }
