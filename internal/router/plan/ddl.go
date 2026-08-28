@@ -689,6 +689,9 @@ func rewritePassword(node *pgquerypb.Node, verifier string) {
 }
 
 func (w *walker) createDatabase(s *pgquerypb.CreatedbStmt) error {
+	if err := catalog.CheckDatabaseName(s.GetDbname()); err != nil {
+		return pgwire.Errorf("42602", "%v", err)
+	}
 	return w.migration(Migration{Kind: "CREATE DATABASE", Scope: ScopeAll, Database: s.GetDbname(), DatabaseOp: "create",
 		Object: ObjectRef{Kind: "database", Name: s.GetDbname(), Expect: objectPresent}})
 }

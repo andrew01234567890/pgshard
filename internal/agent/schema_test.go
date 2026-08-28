@@ -47,7 +47,7 @@ func TestMaterializeSchemaRunsDumpIntoPsql(t *testing.T) {
 	if err != nil || resp.GetError() == nil || !strings.Contains(resp.GetError().GetMessage(), "psql: ") || !strings.Contains(resp.GetError().GetMessage(), "relation exists") {
 		t.Fatalf("psql failure must be reported: %v %v", err, resp.GetError())
 	}
-	for _, bad := range []string{"", "app db", "a'b"} {
+	for _, bad := range []string{"", "app db", "a'b", "app\ndb", "app\tdb"} {
 		resp, err = srv.MaterializeSchema(context.Background(), &pgshardv1.MaterializeSchemaRequest{SourceConninfo: "host=src", Database: bad})
 		if err != nil || resp.GetError() == nil || !strings.Contains(resp.GetError().GetMessage(), "invalid database name") {
 			t.Fatalf("database %q: %v %v", bad, err, resp.GetError())

@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -37,6 +38,26 @@ const (
 
 //go:embed schema/*.sql
 var schemaFS embed.FS
+
+// CheckDatabaseName refuses a name that could not travel through a libpq
+// connection string as one value. PostgreSQL accepts any quoted identifier
+// as a database name, and the name reaches connection strings that carry a
+// shard superuser credential: libpq separates keywords on whitespace, so a
+// name carrying any is an injection of host, sslmode and the rest. The
+// quote and the backslash go with it, because the escaping that would make
+// them safe is not agreed on by every connection-string parser that reads
+// what we write.
+func CheckDatabaseName(name string) error {
+	if name == "" {
+		return fmt.Errorf("database name must not be empty")
+	}
+	for _, r := range name {
+		if unicode.IsSpace(r) || unicode.IsControl(r) || r == '\'' || r == '\\' {
+			return fmt.Errorf("database name %q must not contain whitespace, control characters, a quote or a backslash", name)
+		}
+	}
+	return nil
+}
 
 // ErrChecksumMismatch is returned when an applied migration's embedded text
 // no longer matches the checksum recorded in the database.
