@@ -222,7 +222,7 @@ func TestDDLRefusedInTransactionAndRewriteClass(t *testing.T) {
 		t.Fatal("refused DDL was queued")
 	}
 	_, err = conn.Exec(ctx, "alter table orders set unlogged")
-	_ = expectRefusal(t, err, "rewrite-class DDL is not available yet")
+	_ = expectRefusal(t, err, "ALTER TABLE ... SET UNLOGGED is not supported")
 	_, err = conn.Exec(ctx, "drop table items, orders")
 	_ = expectRefusal(t, err, "one DDL statement cannot touch both sharded and unsharded tables")
 	if len(q.queued) != 0 {

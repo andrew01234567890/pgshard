@@ -302,6 +302,18 @@ func notYet(msg, hint string) *pgwire.Error {
 	return err
 }
 
+// notDurable refuses a relation whose rows are acknowledged but not
+// WAL-logged. PostgreSQL truncates an unlogged relation on crash recovery
+// and a promoted standby has never held its rows, so a write to one is
+// acknowledged and then gone -- which is the thing the cluster's durability
+// floor exists to prevent. pgshard enforces synchronous_commit = on and
+// refuses to let it be lowered; accepting a relation that opts out of WAL
+// entirely would make that guarantee a matter of which table was written.
+func notDurable(form string) *pgwire.Error {
+	return notYet(form+" is not supported: an unlogged relation is emptied by crash recovery and its rows never reach a standby, so writes to it would be acknowledged and lost on a failover",
+		"create the relation LOGGED; pgshard has no durability mode in which unlogged rows survive")
+}
+
 func refuse(msg, hint string) (Plan, error) {
 	err := notYet(msg, hint)
 	return Plan{Kind: Refuse, Err: err}, err
