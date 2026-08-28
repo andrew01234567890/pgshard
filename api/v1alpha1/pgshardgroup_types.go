@@ -47,7 +47,12 @@ type PgShardGroupStatus struct {
 	SettingsRestartPending bool `json:"settingsRestartPending,omitempty"`
 }
 
-// PgShardGroup is a status-only view of one catalog or shard group.
+// PgShardGroup is the operator's record of one catalog or shard group.
+// Users do not write it. Its status carries the designated primary and the
+// fencing epoch, which the operator reads back on every reconcile -- but
+// it is not the only record of them: the group Lease carries the same two
+// values, written before any promotion, and the operator reconstructs from
+// the Lease when this object's status has been lost.
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Kind",type=string,JSONPath=`.spec.kind`
