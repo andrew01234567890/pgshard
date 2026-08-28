@@ -719,3 +719,33 @@ func TestBackupPolicyStatusWithoutClusters(t *testing.T) {
 		t.Errorf("valid %+v", cnd)
 	}
 }
+
+// TestBackupRecordsTheSpecItStartedWith: the reconciler joined a running
+// backup by UID alone and read the cluster and type off the current spec
+// at every step, so provenance came from a value that could change under
+// the run. The accepted spec is recorded in status before any physical
+// work, and everything downstream reads it from there.
+func TestBackupRecordsTheSpecItStartedWith(t *testing.T) {
+	agents := &fakeBackupAgents{}
+	r, _, b := backupFixture(t, agents)
+	_, got := reconcileBackup(t, r, b)
+	if got.Status.ClusterName != b.Spec.ClusterName || got.Status.Type != b.Spec.Type {
+		t.Fatalf("the accepted spec must be recorded before the run: %+v", got.Status)
+	}
+	if got.Status.Policy == "" || got.Status.PolicyUID == "" {
+		t.Fatalf("the resolved policy must be recorded: %+v", got.Status)
+	}
+	// The API refuses a spec edit, but a cluster's backups are attributed
+	// from the recorded value regardless, so nothing downstream depends on
+	// the spec having stayed put.
+	list, err := backupsOfCluster(context.Background(), r.Client, b.Namespace, got.Status.ClusterName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].Name != b.Name {
+		t.Fatalf("a started backup must be attributed to the cluster it started against: %+v", list)
+	}
+	if list, err = backupsOfCluster(context.Background(), r.Client, b.Namespace, "somewhere-else"); err != nil || len(list) != 0 {
+		t.Fatalf("attributed to the wrong cluster: %+v %v", list, err)
+	}
+}

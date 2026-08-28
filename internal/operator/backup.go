@@ -185,7 +185,14 @@ func backupsOfCluster(ctx context.Context, cl client.Client, namespace, cluster 
 	}
 	var out []pgshardv1alpha1.PgShardBackup
 	for _, b := range list.Items {
-		if b.Spec.ClusterName == cluster {
+		// A run that has started is attributed to the cluster it started
+		// against, whatever the spec says now; one that has not is still
+		// only a request, so the spec is all there is.
+		name := b.Status.ClusterName
+		if name == "" {
+			name = b.Spec.ClusterName
+		}
+		if name == cluster {
 			out = append(out, b)
 		}
 	}

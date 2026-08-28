@@ -164,7 +164,11 @@ type PgShardBackupPolicyList struct {
 	Items           []PgShardBackupPolicy `json:"items"`
 }
 
-// PgShardBackupSpec requests one backup of a cluster.
+// PgShardBackupSpec requests one backup of a cluster. It is immutable: a
+// backup is one operation, and the physical work starts against the
+// cluster and type it was created with. Editing them afterwards would
+// record the result of backing up one cluster as a backup of another.
+// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="a backup's spec is immutable; create another PgShardBackup"
 type PgShardBackupSpec struct {
 	ClusterName string `json:"clusterName"`
 	// +kubebuilder:validation:Enum=full;differential;incremental
@@ -213,6 +217,20 @@ type GroupBackupStatus struct {
 type PgShardBackupStatus struct {
 	// +optional
 	Phase string `json:"phase,omitempty"`
+	// ClusterName and Type are the spec this run was accepted with,
+	// recorded before any physical work starts. Provenance is read from
+	// here, never from the spec: what a completed backup protected is what
+	// was captured when it began.
+	// +optional
+	ClusterName string `json:"clusterName,omitempty"`
+	// +optional
+	Type string `json:"type,omitempty"`
+	// Policy is the backup policy the run resolved, by name and UID: a
+	// policy deleted and recreated at the same name is a different store.
+	// +optional
+	Policy string `json:"policy,omitempty"`
+	// +optional
+	PolicyUID string `json:"policyUID,omitempty"`
 	// BackupID is the catalog stanza's backup label once every group completed.
 	// +optional
 	BackupID string `json:"backupId,omitempty"`

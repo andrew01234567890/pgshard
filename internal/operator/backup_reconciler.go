@@ -229,6 +229,8 @@ func (r *BackupReconciler) start(ctx context.Context, b *pgshardv1alpha1.PgShard
 	typ, _ := backupTypeArg(b.Spec.Type)
 	base := b.DeepCopy()
 	b.Status.Phase = pgshardv1alpha1.BackupPhaseRunning
+	b.Status.ClusterName, b.Status.Type = b.Spec.ClusterName, b.Spec.Type
+	b.Status.Policy, b.Status.PolicyUID = pol.Name, string(pol.UID)
 	b.Status.StartedAt = ptrTime(r.now())
 	b.Status.Error = ""
 	b.Status.Groups = nil

@@ -450,3 +450,47 @@ func TestClusterShardsAndReshardingValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestBackupSpecIsImmutable: a backup is one operation, and the physical
+// work starts against the cluster and type it was created with. Editing
+// clusterName from A to B while the run was going recorded the result of
+// backing up A as a backup of B -- counted toward B's health, and offered
+// to a restore of B with A's stanzas behind it.
+func TestBackupSpecIsImmutable(t *testing.T) {
+	b := &pgshardv1alpha1.PgShardBackup{
+		ObjectMeta: metav1.ObjectMeta{Name: "immutable", Namespace: "default"},
+		Spec:       pgshardv1alpha1.PgShardBackupSpec{ClusterName: "a", Type: "full"},
+	}
+	if err := create(t, b); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		what string
+		edit func(*pgshardv1alpha1.PgShardBackup)
+	}{
+		{"cluster", func(x *pgshardv1alpha1.PgShardBackup) { x.Spec.ClusterName = "b" }},
+		{"type", func(x *pgshardv1alpha1.PgShardBackup) { x.Spec.Type = "incremental" }},
+	} {
+		t.Run(c.what, func(t *testing.T) {
+			var got pgshardv1alpha1.PgShardBackup
+			if err := k8sClient.Get(context.Background(), client.ObjectKeyFromObject(b), &got); err != nil {
+				t.Fatal(err)
+			}
+			c.edit(&got)
+			err := k8sClient.Update(context.Background(), &got)
+			if err == nil || !strings.Contains(err.Error(), "spec is immutable") {
+				t.Fatalf("editing %s after create: %v", c.what, err)
+			}
+		})
+	}
+	// An update that changes nothing is still allowed, so a controller may
+	// set labels or finalizers on a running backup.
+	var got pgshardv1alpha1.PgShardBackup
+	if err := k8sClient.Get(context.Background(), client.ObjectKeyFromObject(b), &got); err != nil {
+		t.Fatal(err)
+	}
+	got.Labels = map[string]string{"pgshard.io/keep": "yes"}
+	if err := k8sClient.Update(context.Background(), &got); err != nil {
+		t.Fatalf("a metadata-only update must be allowed: %v", err)
+	}
+}
