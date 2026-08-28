@@ -81,3 +81,45 @@ func TestMemberRulesCoverRetiredSource(t *testing.T) {
 		}
 	}
 }
+
+// TestMemberRulesCoverAGenerationLeftBehindByARollback: the serving, target
+// and retired groups are all read out of one reshard record, which
+// describes one cutover. A cluster that switched, rolled back and switched
+// again is running a generation none of them names -- and its agent then
+// exits with "primary cannot start without the lease" and crash-loops,
+// while the cluster still reports Ready.
+func TestMemberRulesCoverAGenerationLeftBehindByARollback(t *testing.T) {
+	c := &pgshardv1alpha1.PgShardCluster{ObjectMeta: metav1.ObjectMeta{Name: "up"}}
+	// Generation 1 served, generation 2 took over and was rolled back, and
+	// generation 3 now serves with 2 retired. Generation 1's groups are
+	// still running: nothing has retired them.
+	c.Status.EffectiveShards = 1
+	c.Status.ServingGeneration = 3
+	c.Status.Reshard = &pgshardv1alpha1.ClusterReshardStatus{
+		Name: "up-reshard-g3", ShardSet: "g3", Generation: 3, Shards: 1,
+		RetiredShardSet: "g2", RetiredGeneration: 2, RetiredShards: 1,
+	}
+
+	var named []string
+	for _, rule := range MemberRules(c) {
+		if slices.Contains(rule.Verbs, "update") {
+			named = append(named, rule.ResourceNames...)
+		}
+	}
+	left := Group{Cluster: "up", Kind: "shard", ShardID: 0, Generation: 1}
+	if !slices.Contains(named, left.LeaseName()) {
+		t.Errorf("a generation left running by a rollback cannot renew %s; named leases are %v", left.LeaseName(), named)
+	}
+	if cat := (Group{Cluster: "up", Kind: "catalog", Generation: 1}); !slices.Contains(named, cat.LeaseName()) {
+		t.Errorf("the first catalog generation lost its lease permission: %v", named)
+	}
+	// Everything the record does describe stays covered.
+	for _, g := range append(Groups(c), RetiredGroups(c)...) {
+		if !slices.Contains(named, g.LeaseName()) {
+			t.Errorf("group %s lost its lease permission: %v", g.Name(), named)
+		}
+	}
+	if len(named) != len(slices.Compact(slices.Clone(named))) {
+		t.Errorf("lease names must not repeat: %v", named)
+	}
+}
