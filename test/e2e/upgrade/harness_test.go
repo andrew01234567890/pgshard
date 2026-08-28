@@ -336,8 +336,13 @@ func servingShardGroup(ctx context.Context, c *e2e.Cluster) string {
 // through fences and failovers. Every acknowledged id must survive the
 // upgrade exactly once.
 type ledger struct {
-	c       *e2e.Cluster
-	acked   atomic.Int64
+	c     *e2e.Cluster
+	acked atomic.Int64
+	mu    sync.Mutex
+	// lastErr is why the writer is not acknowledging anything. Without it
+	// a wait for the first write times out saying only that none arrived,
+	// which is the one thing the test already knew.
+	lastErr string
 	retries atomic.Int64
 	stopped chan struct{}
 	stop    context.CancelFunc
@@ -357,9 +362,22 @@ func startLedger(ctx context.Context, t *testing.T, c *e2e.Cluster) *ledger {
 			// The router decides which set the write lands on, so the
 			// writer does not need to know and must not choose.
 			hi := next + 24
-			sql := fmt.Sprintf(`INSERT INTO ledger (id, tenant_id, amount) SELECT g, 4242, 1 FROM generate_series(%d, %d) g ON CONFLICT DO NOTHING`, next, hi)
+			// An explicit VALUES list rather than INSERT ... SELECT: the
+			// router routes an insert by its shard key, and the key has to
+			// be readable from the statement.
+			var rows strings.Builder
+			for id := next; id <= hi; id++ {
+				if id > next {
+					rows.WriteString(", ")
+				}
+				fmt.Fprintf(&rows, "(%d, 4242, 1)", id)
+			}
+			sql := "INSERT INTO ledger (id, tenant_id, amount) VALUES " + rows.String() + " ON CONFLICT DO NOTHING"
 			if _, err := routerSQL(lctx, c, sql); err != nil {
 				l.retries.Add(1)
+				l.mu.Lock()
+				l.lastErr = err.Error()
+				l.mu.Unlock()
 				time.Sleep(2 * time.Second)
 				continue
 			}
@@ -369,6 +387,16 @@ func startLedger(ctx context.Context, t *testing.T, c *e2e.Cluster) *ledger {
 		}
 	}()
 	return l
+}
+
+// why is the writer's last refusal, for a wait that is not seeing writes.
+func (l *ledger) why() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.lastErr == "" {
+		return "\nwriter: no error recorded yet"
+	}
+	return "\nwriter: " + l.lastErr
 }
 
 // finish stops the writer and returns the highest acknowledged id.

@@ -32,7 +32,8 @@ func TestUpgrade18To19UnderLoad(t *testing.T) {
 	defer cancel()
 	bringUpCluster(ctx, t, c, "2m")
 	l := startLedger(ctx, t, c)
-	waitFor(ctx, t, c, "first acknowledged ledger writes", 2*time.Minute, func() bool { return l.acked.Load() >= 25 })
+	waitForWhy(ctx, t, c, "first acknowledged ledger writes", 2*time.Minute, l.why,
+		func() bool { return l.acked.Load() >= 25 })
 
 	if err := c.Apply(ctx, clusterManifest(19, "2m")); err != nil {
 		t.Fatal(err)
@@ -153,7 +154,8 @@ func TestUpgrade18To19ChaosControllerAndPrimaryKill(t *testing.T) {
 	defer cancel()
 	bringUpCluster(ctx, t, c, "1m")
 	l := startLedger(ctx, t, c)
-	waitFor(ctx, t, c, "first acknowledged ledger writes", 2*time.Minute, func() bool { return l.acked.Load() >= 25 })
+	waitForWhy(ctx, t, c, "first acknowledged ledger writes", 2*time.Minute, l.why,
+		func() bool { return l.acked.Load() >= 25 })
 
 	if err := c.Apply(ctx, clusterManifest(19, "1m")); err != nil {
 		t.Fatal(err)
