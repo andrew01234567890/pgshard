@@ -517,13 +517,16 @@ func TestScatterSetsUpEveryShardConcurrently(t *testing.T) {
 		fp.gate = gate
 	}
 	ctx := context.Background()
-	conn := h.connect(t, h.dsn()+"&default_query_exec_mode=simple_protocol")
+	// The extended protocol on purpose: every participant then marshals
+	// the same Bind, with its parameters and format vectors, at the same
+	// time, which is the sharing perShard relies on.
+	conn := h.connect(t, h.dsn())
 	// Any session setting makes the participants reserve a backend.
 	if _, err := conn.Exec(ctx, "set timezone to 'UTC'"); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := conn.Exec(ctx, "select * from orders"); err != nil {
+	if _, err := conn.Exec(ctx, "select * from orders where v > $1", 1); err != nil {
 		t.Fatal(err)
 	}
 	if !gate.reached() {

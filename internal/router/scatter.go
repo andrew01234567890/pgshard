@@ -393,8 +393,11 @@ func (e *Executor) runScatter(ctx context.Context, shards []int32, m *plan.Merge
 // scatter proportional to shards times protocol operations, for fields that
 // are identical on every shard.
 //
-// Safe because the sends are sequential: one participant at a time, and
-// gRPC marshals within Send. Nothing mutates the shared payload.
+// Safe under the concurrent setup because the payload is only ever read:
+// gRPC marshals it inside Send, and nothing on this path writes to it. The
+// 32-shard fan-out test drives that sharing under the race detector, on
+// the extended protocol, so the parameters and format vectors of one Bind
+// really are marshalled by every participant at once.
 func perShard(req *pgshardv1.ExecuteRequest) *pgshardv1.ExecuteRequest {
 	return &pgshardv1.ExecuteRequest{Message: req.GetMessage()}
 }
