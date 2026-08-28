@@ -130,6 +130,24 @@ func (f *fakePG) serve(conn net.Conn) {
 	}
 }
 
+// log is what this backend has been asked to run, copied under the lock.
+// Reading f.seen directly from a test raced with the serve goroutine that
+// appends to it -- in a t.Fatalf argument, so it only bit when some other
+// assertion was already failing and the race detector then turned a clear
+// failure into an unrelated one.
+func (f *fakePG) log() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.seen...)
+}
+
+// keys are the SCRAM key slices handed to the most recent dial.
+func (f *fakePG) keys() [][]byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return [][]byte{f.lastCK, f.lastSK}
+}
+
 func (f *fakePG) count(prefix string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()

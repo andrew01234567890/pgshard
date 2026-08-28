@@ -65,10 +65,10 @@ func TestFencingRefusesBeforeBackend(t *testing.T) {
 		t.Fatalf("matching generation refused: %v", e)
 	}
 	// The statement plus the DISCARD ALL that resets the backend before it
-	// can be handed to another logical session.
-	if h.pg.queries.Load() != 2 {
-		t.Fatalf("matching generation must reach PostgreSQL: %v", h.pg.seen)
-	}
+	// can be handed to another logical session. The reset is sent after
+	// the response, so sampling the count here raced the pooler and this
+	// assertion failed on a slow runner for no reason of its own.
+	waitFor(t, func() bool { return h.pg.queries.Load() == 2 })
 	h.src.Set(View{Generation: 8, Epoch: 3})
 	rs = roundTrip(t, stream, queryReq("ok", "select 2", gen(7, 3), nil))
 	if e := firstError(rs); e == nil || e.Message != "stale routing generation" {
@@ -140,7 +140,7 @@ func TestReserveAndRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !h.pg.sawQuery("ROLLBACK") || !h.pg.sawQuery("DISCARD ALL") {
-		t.Fatalf("release must roll back and discard: %v", h.pg.seen)
+		t.Fatalf("release must roll back and discard: %v", h.pg.log())
 	}
 	if h.srv.lookup("s") != nil || h.srv.held() != 0 {
 		t.Fatal("session should be gone after release")
@@ -236,9 +236,7 @@ func TestKeysZeroisedAndNeverLogged(t *testing.T) {
 			}
 		}
 	}
-	h.pg.mu.Lock()
-	dialed := [][]byte{h.pg.lastCK, h.pg.lastSK}
-	h.pg.mu.Unlock()
+	dialed := h.pg.keys()
 	for _, k := range dialed {
 		if len(k) != 32 {
 			t.Fatal("relay keys not captured")
@@ -359,7 +357,7 @@ func TestReusedBackendNeverReparsesAHeldStatement(t *testing.T) {
 	stream, _ = h.client.Execute(ctx)
 	rs = parseBatch(t, stream, parseReq("s", "select 1", identity("alice")), syncReq("s"))
 	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
-		t.Fatalf("identical re-parse must be answered, got %s (%v)", got, h.pg.seen)
+		t.Fatalf("identical re-parse must be answered, got %s (%v)", got, h.pg.log())
 	}
 	if n := h.pg.count("PARSE st1"); n != 1 {
 		t.Fatalf("PostgreSQL saw %d parses of st1, want 1 (identical statement is skipped)", n)
@@ -368,10 +366,10 @@ func TestReusedBackendNeverReparsesAHeldStatement(t *testing.T) {
 	// Same name, different SQL: the old statement is closed first.
 	rs = parseBatch(t, stream, parseReq("s", "select 2", nil), syncReq("s"))
 	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
-		t.Fatalf("re-parse with new SQL: %s (%v)", got, h.pg.seen)
+		t.Fatalf("re-parse with new SQL: %s (%v)", got, h.pg.log())
 	}
 	if h.pg.count("CLOSE S st1") != 1 || h.pg.count("PARSE st1") != 2 {
-		t.Fatalf("expected one Close and a second Parse: %v", h.pg.seen)
+		t.Fatalf("expected one Close and a second Parse: %v", h.pg.log())
 	}
 
 	// A router Close is relayed as-is; a failed parse leaves the name in
@@ -382,10 +380,10 @@ func TestReusedBackendNeverReparsesAHeldStatement(t *testing.T) {
 	}
 	rs = parseBatch(t, stream, parseReq("s", "select 3", nil), syncReq("s"))
 	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
-		t.Fatalf("parse after doubt: %s (%v)", got, h.pg.seen)
+		t.Fatalf("parse after doubt: %s (%v)", got, h.pg.log())
 	}
 	if h.pg.count("CLOSE S st1") != 4 {
-		t.Fatalf("uncertain name must be closed before parsing: %v", h.pg.seen)
+		t.Fatalf("uncertain name must be closed before parsing: %v", h.pg.log())
 	}
 
 	// Release hands the backend to the pool clean; the next session parses
@@ -412,7 +410,7 @@ func TestUnreservedBatchLeavesNoStatementsInThePool(t *testing.T) {
 	}
 	waitFor(t, func() bool { _, idle := h.srv.cfg.Pool.Stats(); return idle == 1 })
 	if !h.pg.sawQuery("DISCARD ALL") {
-		t.Fatalf("the backend must be reset before it returns to the pool: %v", h.pg.seen)
+		t.Fatalf("the backend must be reset before it returns to the pool: %v", h.pg.log())
 	}
 }
 
@@ -435,10 +433,10 @@ func TestDeallocateThroughExtendedProtocolDoubtsHeldStatements(t *testing.T) {
 	}
 	rs = parseBatch(t, stream, parseReq("s", "select 1", nil), syncReq("s"))
 	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
-		t.Fatalf("parse after deallocate: %s (%v)", got, h.pg.seen)
+		t.Fatalf("parse after deallocate: %s (%v)", got, h.pg.log())
 	}
 	if h.pg.count("PARSE st1") != 2 {
-		t.Fatalf("a statement deallocated through the extended protocol must be parsed again: %v", h.pg.seen)
+		t.Fatalf("a statement deallocated through the extended protocol must be parsed again: %v", h.pg.log())
 	}
 }
 
@@ -483,7 +481,7 @@ func TestReservationWithoutStreamExpires(t *testing.T) {
 		t.Fatal("expired reservation must be released")
 	}
 	if !h.pg.sawQuery("ROLLBACK") || !h.pg.sawQuery("DISCARD ALL") {
-		t.Fatalf("expiry must roll back and discard: %v", h.pg.seen)
+		t.Fatalf("expiry must roll back and discard: %v", h.pg.log())
 	}
 	if _, idle := h.srv.cfg.Pool.Stats(); idle != 1 {
 		t.Fatalf("idle = %d, want the backend back in the pool", idle)
@@ -544,10 +542,10 @@ func TestSQLLevelPrepareIsClosedBeforeAParseAndResetsTheBackend(t *testing.T) {
 	}
 	rs = parseBatch(t, stream, parseReq("s", "select 1", nil), syncReq("s"))
 	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
-		t.Fatalf("parse after sql-level prepare: %s (%v)", got, h.pg.seen)
+		t.Fatalf("parse after sql-level prepare: %s (%v)", got, h.pg.log())
 	}
 	if h.pg.count("CLOSE S st1") != 1 {
-		t.Fatalf("a name a SQL-level PREPARE may hold must be closed before parsing: %v", h.pg.seen)
+		t.Fatalf("a name a SQL-level PREPARE may hold must be closed before parsing: %v", h.pg.log())
 	}
 	_ = stream.CloseSend()
 	waitFor(t, func() bool { return !h.attached() })
@@ -569,7 +567,7 @@ func TestUnreservedSQLLevelPrepareLeavesNoStatementsInThePool(t *testing.T) {
 	}
 	waitFor(t, func() bool { _, idle := h.srv.cfg.Pool.Stats(); return idle == 1 })
 	if !h.pg.sawQuery("DISCARD ALL") {
-		t.Fatalf("the backend must be reset before it returns to the pool: %v", h.pg.seen)
+		t.Fatalf("the backend must be reset before it returns to the pool: %v", h.pg.log())
 	}
 }
 
