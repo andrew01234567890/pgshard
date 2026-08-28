@@ -745,6 +745,21 @@ func TestReplicaPDBOmittedBelowThreeMembers(t *testing.T) {
 	}
 }
 
+// deleteServicesOf gives a cluster's service IPs back to envtest.
+func deleteServicesOf(t *testing.T, c *pgshardv1alpha1.PgShardCluster) {
+	t.Helper()
+	var svcs corev1.ServiceList
+	if err := k8sClient.List(context.Background(), &svcs, client.InNamespace(c.Namespace)); err != nil {
+		t.Log(err)
+		return
+	}
+	for i := range svcs.Items {
+		if strings.HasPrefix(svcs.Items[i].Name, c.Name+"-") {
+			_ = k8sClient.Delete(context.Background(), &svcs.Items[i])
+		}
+	}
+}
+
 // podIP is the deterministic fake IP of member i of group index gi.
 func podIP(gi, i int) string { return fmt.Sprintf("10.%d.0.%d", gi+1, i+1) }
 
@@ -1052,8 +1067,12 @@ func TestPrimaryOutsideTheMemberSetDoesNotPanic(t *testing.T) {
 // past the requeue interval and a primary failure in the last group was
 // not noticed until the walk reached it.
 func TestReconcileWalksGroupsConcurrently(t *testing.T) {
-	const shards = 12
+	const shards = 8
 	r, fp, c := setup(t, "conc")
+	// envtest shares one apiserver across the package and never collects
+	// the objects a test leaves behind, so a group per shard exhausts its
+	// service IP range for every test that follows.
+	t.Cleanup(func() { deleteServicesOf(t, c) })
 	c.Spec.Shards = ptr.To(shards)
 	if err := k8sClient.Update(context.Background(), c); err != nil {
 		t.Fatal(err)
