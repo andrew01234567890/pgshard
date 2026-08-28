@@ -198,6 +198,11 @@ func psql(ctx context.Context, c *e2e.Cluster, host, db, sql string) (string, er
 // more. The reshard suite has always written through the router; this one
 // did not, and that -- not the upgrade -- is what its ledger oracle was
 // reporting as lost writes.
+// rollbackWindow is retireOldGroupsAfter for the rollback test: long
+// enough to outlast everything the test does between the flip and the
+// rollback it then asks for.
+const rollbackWindow = "12m"
+
 const (
 	ledgerRole     = "ledger_writer"
 	ledgerPassword = "ledger-writer-password"
@@ -314,17 +319,21 @@ func gatherNamespace(ctx context.Context, c *e2e.Cluster) {
 }
 
 // servingShardGroup resolves the group name currently serving shard 0.
+// servingShardGroup asks the question routing asks: catalog.ServingShardSet
+// takes the serving set with the highest generation from pgshard.shard_sets.
+// This used to read an arbitrary row of pgshard.serving with LIMIT 1 and
+// take the highest generation of whatever set that row named. The flip
+// inserts the new set's rows without deleting the old ones -- they go at
+// Complete -- so through the whole window between the flip and retirement
+// the helper could keep answering with the retired set, and every wait and
+// assertion built on it was reading a cutover that had already happened as
+// one that had not.
 func servingShardGroup(ctx context.Context, c *e2e.Cluster) string {
-	out, err := psql(ctx, c, clusterName+"-catalog-rw", "postgres",
-		`SELECT s.shard_set || ':' || (SELECT max(generation) FROM pgshard.shard_sets ss WHERE ss.shard_set = s.shard_set) FROM pgshard.serving s LIMIT 1`)
-	if err != nil || out == "" {
+	gen, err := psql(ctx, c, clusterName+"-catalog-rw", "postgres",
+		`SELECT coalesce((SELECT generation::text FROM pgshard.shard_sets WHERE state = 'serving' ORDER BY generation DESC LIMIT 1), '')`)
+	if err != nil || gen == "" {
 		return ""
 	}
-	set, gen, ok := strings.Cut(out, ":")
-	if !ok {
-		return ""
-	}
-	_ = set
 	if gen == "1" {
 		return "shard-0"
 	}

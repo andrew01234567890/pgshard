@@ -35,13 +35,16 @@ func TestUpgrade18To19UnderLoad(t *testing.T) {
 	// major, runs the ledger oracle and reads the retired primary for the
 	// VDiff. At two minutes the 18 groups were deleted before the rollback
 	// was asked for, and "rollback to the 18 set" waited fifteen minutes
-	// for pods that no longer existed.
-	bringUpCluster(ctx, t, c, "12m")
+	// for pods that no longer existed. It has to be the same value in both
+	// manifests: the apply that asks for 19 replaces the whole spec, so a
+	// window widened only at creation is narrowed again before the upgrade
+	// starts.
+	bringUpCluster(ctx, t, c, rollbackWindow)
 	l := startLedger(ctx, t, c)
 	waitForWhy(ctx, t, c, "first acknowledged ledger writes", 2*time.Minute, l.why,
 		func() bool { return l.acked.Load() >= 25 })
 
-	if err := c.Apply(ctx, clusterManifest(19, "2m")); err != nil {
+	if err := c.Apply(ctx, clusterManifest(19, rollbackWindow)); err != nil {
 		t.Fatal(err)
 	}
 	record := clusterName + "-reshard-g2"
