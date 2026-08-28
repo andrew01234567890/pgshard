@@ -56,9 +56,51 @@ type fakePooler struct {
 	maxPrepared string
 	failPrepare bool
 	prepared    []string
-	// reserveDelay holds every Reserve back, so a test can measure whether
-	// a fan-out pays that cost once or once per shard.
-	reserveDelay time.Duration
+	// gate, when set, holds every Reserve until several shards are
+	// reserving at once.
+	gate *reserveGate
+}
+
+// reserveGate holds every Reserve until gateWidth shards are reserving at
+// once, so a test can tell a concurrent fan-out from a serial one without
+// timing it: a serial setup never gets a second shard to the gate and
+// every call falls out on the timeout instead.
+type reserveGate struct {
+	mu     sync.Mutex
+	width  int
+	count  int
+	open   chan struct{}
+	opened bool
+}
+
+func (g *reserveGate) wait() {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	if g.open == nil {
+		g.open = make(chan struct{})
+	}
+	open := g.open
+	g.count++
+	if g.count >= g.width {
+		g.opened = true
+		close(open)
+	}
+	g.mu.Unlock()
+	select {
+	case <-open:
+	case <-time.After(500 * time.Millisecond):
+	}
+	g.mu.Lock()
+	g.count--
+	g.mu.Unlock()
+}
+
+func (g *reserveGate) reached() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.opened
 }
 
 func (f *fakePooler) preparedGIDs() []string {
@@ -239,9 +281,7 @@ func (f *fakePooler) fence(g *pgshardv1.Generation) *pgshardv1.Error {
 }
 
 func (f *fakePooler) Reserve(_ context.Context, req *pgshardv1.ReserveRequest) (*pgshardv1.ReserveResponse, error) {
-	if f.reserveDelay > 0 {
-		time.Sleep(f.reserveDelay)
-	}
+	f.gate.wait()
 	if e := f.fence(req.Generation); e != nil {
 		return &pgshardv1.ReserveResponse{Error: e}, nil
 	}

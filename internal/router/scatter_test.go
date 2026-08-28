@@ -510,13 +510,11 @@ func TestScatterReplaysSetRole(t *testing.T) {
 // shard is touched) used to run in a sequential loop, so a wide fan-out
 // spent N x RTT before any shard had begun executing.
 func TestScatterSetsUpEveryShardConcurrently(t *testing.T) {
-	const (
-		shards = 32
-		delay  = 20 * time.Millisecond
-	)
+	const shards = 32
 	h := newShardedHarnessShards(t, Config{}, shards)
+	gate := &reserveGate{width: shards}
 	for _, fp := range h.poolers {
-		fp.reserveDelay = delay
+		fp.gate = gate
 	}
 	ctx := context.Background()
 	conn := h.connect(t, h.dsn()+"&default_query_exec_mode=simple_protocol")
@@ -525,12 +523,10 @@ func TestScatterSetsUpEveryShardConcurrently(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	start := time.Now()
 	if _, err := conn.Exec(ctx, "select * from orders"); err != nil {
 		t.Fatal(err)
 	}
-	took := time.Since(start)
-	if took > shards/4*delay {
-		t.Errorf("scatter over %d shards took %s with a %s reserve delay, want the cost of a few round trips, not one per shard", shards, took, delay)
+	if !gate.reached() {
+		t.Errorf("no two of the %d shards were ever set up at the same time", shards)
 	}
 }
