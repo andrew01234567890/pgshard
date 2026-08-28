@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -66,9 +67,11 @@ func newResolverFixtureWith(t *testing.T, opts ...string) *resolverFixture {
 type flakyDialer struct {
 	inner *PgxShardDialer
 	down  int32
+	dials atomic.Int32
 }
 
 func (d *flakyDialer) Dial(ctx context.Context, set string, id int32) (ShardConn, error) {
+	d.dials.Add(1)
 	if id == d.down {
 		return nil, fmt.Errorf("shard %s/%d unreachable", set, id)
 	}
@@ -76,6 +79,7 @@ func (d *flakyDialer) Dial(ctx context.Context, set string, id int32) (ShardConn
 }
 
 func (d *flakyDialer) DialDatabase(ctx context.Context, set string, id int32, database string) (ShardConn, error) {
+	d.dials.Add(1)
 	if id == d.down {
 		return nil, fmt.Errorf("shard %s/%d unreachable", set, id)
 	}
@@ -83,6 +87,7 @@ func (d *flakyDialer) DialDatabase(ctx context.Context, set string, id int32, da
 }
 
 func (d *flakyDialer) DialDatabaseAs(ctx context.Context, set string, id int32, database, user, password string) (ShardConn, error) {
+	d.dials.Add(1)
 	if id == d.down {
 		return nil, fmt.Errorf("shard %s/%d unreachable", set, id)
 	}
@@ -159,6 +164,53 @@ func (f *resolverFixture) decisions() []string {
 		f.t.Fatal(err)
 	}
 	return out
+}
+
+// TestResolverIdleClusterDoesNotScan pins the cost of a resolver with
+// nothing to do: between orphan sweeps it must not touch a shard at all.
+// It used to dial and query every shard of the topology on every pass, so
+// a large cluster paid for the resolver's cadence forever.
+func TestResolverIdleClusterDoesNotScan(t *testing.T) {
+	parallelPG(t)
+	f := newResolverFixture(t)
+	ctx := context.Background()
+	now := time.Now()
+	f.res.Now = func() time.Time { return now }
+
+	if _, err := f.res.Resolve(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	swept := f.dialer.dials.Load()
+	if swept == 0 {
+		t.Fatalf("first pass swept no shard: dials %d", swept)
+	}
+
+	for range 3 {
+		if _, err := f.res.Resolve(ctx, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := f.dialer.dials.Load(); got != swept {
+		t.Errorf("idle passes dialled %d shards, want none after the sweep", got-swept)
+	}
+
+	// A pass due for a sweep searches again, and so does a pass with
+	// something in doubt however recently the last sweep ran.
+	now = now.Add(DefaultSweepInterval)
+	if _, err := f.res.Resolve(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.dialer.dials.Load(); got == swept {
+		t.Error("a pass past the sweep interval did not search the topology")
+	}
+	swept = f.dialer.dials.Load()
+	f.decide("pgshard-h-1-1", "commit", 0, 0, 1)
+	if _, err := f.res.Resolve(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.dialer.dials.Load(); got == swept {
+		t.Error("a pass with a decision in doubt did not search the topology")
+	}
 }
 
 func TestResolver(t *testing.T) {
