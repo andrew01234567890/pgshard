@@ -198,6 +198,13 @@ func TestUpgradeRollbackOnPostgres(t *testing.T) {
 	waitFor(t, 30*time.Second, func() bool {
 		return queryOne[int64](t, src, `SELECT count(*) FROM orders WHERE note = 'written-on-19'`) == 1
 	}, "post-switch write must flow back to the source")
+	// A rolled-back run completes with the roles the other way round: the
+	// set it calls its source is serving again. Making that one read-only
+	// because it is the workflow's source stops the next upgrade before it
+	// can create a publication on it.
+	if _, err := src.Exec(context.Background(), `INSERT INTO orders (tenant_id, note) VALUES ($1, 'after-rollback')`, tenant); err != nil {
+		t.Fatalf("the set serving after a rollback must still take writes: %v", err)
+	}
 	if n := queryOne[int64](t, src, `SELECT count(*) FROM orders WHERE note = 'late-write-on-19'`); lateWritten && n != 1 {
 		t.Fatalf("write during the rollback catch-up lost: %d", n)
 	}
