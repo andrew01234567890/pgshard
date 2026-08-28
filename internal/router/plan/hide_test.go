@@ -267,3 +267,48 @@ func TestReferenceWriteCarriesTheMasking(t *testing.T) {
 		t.Fatalf("rewritten %q, want %q", pl.Rewritten, want)
 	}
 }
+
+// TestUndeclaredReferenceWriteWaitsForItsInspection: a table that is a
+// reference table only because its database defaults to reference
+// placement is replicated to every shard and diverges in exactly the same
+// ways as a declared one -- a default, a generated expression, an identity
+// column, a trigger or a rule that each shard evaluates for itself. It has
+// no catalog row, so the gate that holds a declared reference write until
+// the shards have been inspected did not apply to it, and the write went
+// out unchecked to write a different row on every shard.
+func TestUndeclaredReferenceWriteWaitsForItsInspection(t *testing.T) {
+	refDefault := func(t *testing.T) *snapshot.Snapshot {
+		t.Helper()
+		s := fixture(t)
+		db := s.Databases[fixtureDB]
+		db.DefaultPlacement = "reference"
+		s.Databases[fixtureDB] = db
+		return s
+	}
+	key := snapshot.TableKey{Database: fixtureDB, SchemaName: "public", TableName: "undeclared"}
+
+	// Never inspected: refused, and the refusal says what will clear it.
+	pl, err := New().Plan(context.Background(), session(refDefault(t)), "insert into undeclared (id) values (1)")
+	checkRefusal(t, pl, err, "a write to reference table \"undeclared\" cannot be planned until its shards have been inspected", "0A000")
+
+	// Inspected and clean: the write plans onto every shard.
+	clean := refDefault(t)
+	clean.Tables[key] = snapshot.Placement{Placement: "reference", ReferenceChecked: true}
+	pl, err = New().Plan(context.Background(), session(clean), "insert into undeclared (id) values (1)")
+	if err != nil || pl.Kind != Reference {
+		t.Fatalf("a clean undeclared reference table must accept writes: %+v %v", pl, err)
+	}
+
+	// Inspected and diverging: refused, naming what the shards would each
+	// evaluate for themselves.
+	hazard := refDefault(t)
+	hazard.Tables[key] = snapshot.Placement{Placement: "reference", ReferenceChecked: true,
+		ReferenceHazards: []string{"the default of column tag calls gen_random_uuid(), which pg_proc marks VOLATILE"}}
+	pl, err = New().Plan(context.Background(), session(hazard), "insert into undeclared (id) values (1)")
+	checkRefusal(t, pl, err, "a write to reference table \"undeclared\" would not write the same row on every shard", "0A000")
+
+	// Reads are unaffected throughout.
+	if _, err := New().Plan(context.Background(), session(refDefault(t)), "select * from undeclared"); err != nil {
+		t.Fatalf("reads must not wait for the inspection: %v", err)
+	}
+}

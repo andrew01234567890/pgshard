@@ -546,7 +546,13 @@ func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
 	if snap != nil {
 		switch snap.Databases[w.sess.Database].DefaultPlacement {
 		case "reference":
-			r.kind = placeReference
+			// Undeclared, but a reference table all the same: it is
+			// replicated to every shard and diverges in the same ways.
+			// refDeclared says the inspection can reach it, which it now
+			// can -- the controller sweeps the tables of a
+			// reference-default database that have no catalog row -- so a
+			// write waits for that answer rather than going out unchecked.
+			r.kind, r.refDeclared = placeReference, true
 		case "sharded":
 			return nil, notYet("table \""+name+"\" is not declared in the catalog and the database defaults to sharded placement",
 				"declare the table in pgshard.tables with its shard key, or set the database default placement to unsharded")

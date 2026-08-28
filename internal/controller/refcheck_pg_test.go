@@ -164,3 +164,57 @@ func hazardsOf(t *testing.T, conn *pgx.Conn, table string) []string {
 	slices.Sort(got)
 	return got
 }
+
+// TestSweepInspectsTablesTheCatalogDoesNotKnow: a table that is a
+// reference table only because its database defaults to reference
+// placement has no row in pgshard.tables and therefore none in
+// table_status, so the pass that finds its work there never saw it. The
+// divergence is the same one: a write runs on every shard, 2PC commits
+// them all, and each shard evaluates its own default.
+func TestSweepInspectsTablesTheCatalogDoesNotKnow(t *testing.T) {
+	ctx := context.Background()
+	f := newPlacementFixture(t)
+	check := &ReferenceCheck{Pool: f.pool, Shards: f.placer.Shards, Logger: slog.New(slog.DiscardHandler)}
+
+	mustExec(t, f.catalog, `UPDATE pgshard.databases SET default_placement = 'reference' WHERE name = 'app'`)
+	for _, ddl := range []string{
+		`CREATE TABLE undeclared_clean (id bigint PRIMARY KEY, note text NOT NULL DEFAULT 'x')`,
+		`CREATE TABLE undeclared_diverging (id bigint PRIMARY KEY, tag uuid NOT NULL DEFAULT gen_random_uuid())`,
+	} {
+		for id := range 2 {
+			mustExec(t, f.app(int32(id)), ddl)
+		}
+	}
+
+	n, err := check.SweepUndeclared(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n < 2 {
+		t.Fatalf("inspected %d tables, want both undeclared ones", n)
+	}
+	hazards := func(table string) []string {
+		var out []string
+		if err := f.catalog.QueryRow(ctx, `SELECT reference_hazards FROM pgshard.table_status
+			WHERE database = 'app' AND schema_name = 'public' AND table_name = $1`, table).Scan(&out); err != nil {
+			t.Fatalf("%s has no status row: %v", table, err)
+		}
+		return out
+	}
+	if got := hazards("undeclared_clean"); len(got) != 0 {
+		t.Errorf("clean table reported %v", got)
+	}
+	if got := hazards("undeclared_diverging"); len(got) == 0 || !strings.Contains(strings.Join(got, "; "), "gen_random_uuid") {
+		t.Errorf("diverging table reported %v, want the volatile default named", got)
+	}
+
+	// A declared table is the other pass's work and is not duplicated here.
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement) VALUES ('app', 'public', 'undeclared_clean', 'reference')`)
+	before := hazards("undeclared_clean")
+	if _, err := check.SweepUndeclared(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := hazards("undeclared_clean"); len(got) != len(before) {
+		t.Errorf("a declared table must be left to the declared pass: %v", got)
+	}
+}

@@ -92,6 +92,23 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 			s.Tables[key] = Placement{Placement: t.Placement, Generation: t.DesiredGeneration}
 		}
 	}
+	// A table that is a reference table only because its database defaults
+	// to reference placement has no row in pgshard.tables, so the loop
+	// above never sees it. The inspection pass records what it found on a
+	// status row, and that row is the only record pgshard has that the
+	// table exists at all -- so it is what routers plan from.
+	for key, ts := range effective {
+		if _, ok := s.Tables[key]; ok || ts.EffectivePlacement == nil {
+			continue
+		}
+		p := Placement{Placement: *ts.EffectivePlacement, Generation: ts.EffectiveGeneration, Migrating: ts.Migrating}
+		if ts.EffectiveShardKey != nil {
+			p.ShardKey = *ts.EffectiveShardKey
+		}
+		p.ReferenceChecked = ts.ReferenceCheckedGeneration != nil && *ts.ReferenceCheckedGeneration == ts.EffectiveGeneration
+		p.ReferenceHazards = ts.ReferenceHazards
+		s.Tables[key] = p
+	}
 	rewrites, err := catalog.PendingRewrites(ctx, tx)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot: rewrites: %w", err)

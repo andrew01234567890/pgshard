@@ -82,6 +82,16 @@ type ReferenceCheck struct {
 	Pool   *pgxpool.Pool
 	Shards ShardDBDialer
 	Logger *slog.Logger
+	// Now is the clock the undeclared sweep paces itself by; nil is
+	// time.Now.
+	Now func() time.Time
+}
+
+func (r *ReferenceCheck) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
 }
 
 func (r *ReferenceCheck) logger() *slog.Logger {
@@ -95,6 +105,7 @@ func (r *ReferenceCheck) logger() *slog.Logger {
 func (r *ReferenceCheck) Run(ctx context.Context, interval time.Duration, leader func() bool) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	nextSweep := r.now()
 	for {
 		select {
 		case <-ctx.Done():
@@ -106,6 +117,12 @@ func (r *ReferenceCheck) Run(ctx context.Context, interval time.Duration, leader
 		}
 		if _, err := r.Pass(ctx); err != nil {
 			r.logger().Warn("reference check pass failed", "err", err)
+		}
+		if r.now().After(nextSweep) {
+			nextSweep = r.now().Add(undeclaredSweepInterval)
+			if _, err := r.SweepUndeclared(ctx); err != nil {
+				r.logger().Warn("undeclared reference sweep failed", "err", err)
+			}
 		}
 	}
 }
@@ -211,4 +228,107 @@ func referenceHazards(ctx context.Context, conn ShardConn, schema, table string)
 		return nil, err
 	}
 	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
+// undeclaredSweepInterval is how often the undeclared tables of a
+// reference-default database are re-inspected. They have no generation to
+// invalidate their last answer -- nothing in the catalog changes when a
+// trigger is added on a shard -- so the only way to notice is to look
+// again, and looking is a query per table per shard. Slower than the
+// declared pass on purpose.
+const undeclaredSweepInterval = time.Minute
+
+// SweepUndeclared inspects the reference tables that have no catalog row.
+// A table whose database defaults to reference placement is replicated to
+// every shard exactly like a declared one, and diverges in exactly the
+// same ways -- a default, a generated expression, an identity column, a
+// trigger or a rule that each shard evaluates for itself. The declared
+// pass finds its work in pgshard.table_status and so never sees these.
+//
+// The answer is recorded as a table_status row, which is what the snapshot
+// already carries to routers; the row is the only record that the table
+// exists as far as pgshard is concerned, so it is created here rather than
+// looked up.
+func (r *ReferenceCheck) SweepUndeclared(ctx context.Context) (int, error) {
+	dbs, err := catalog.ListDatabases(ctx, r.Pool)
+	if err != nil {
+		return 0, err
+	}
+	var set string
+	if err := r.Pool.QueryRow(ctx, `SELECT shard_set FROM pgshard.shard_sets WHERE state = $1 ORDER BY generation DESC LIMIT 1`, catalog.ShardSetServing).Scan(&set); err != nil {
+		return 0, fmt.Errorf("serving shard set: %w", err)
+	}
+	ranges, err := catalog.ListShardRanges(ctx, r.Pool, set)
+	if err != nil || len(ranges) == 0 {
+		return 0, err
+	}
+	declared, err := catalog.ListAllTables(ctx, r.Pool)
+	if err != nil {
+		return 0, err
+	}
+	isDeclared := map[string]bool{}
+	for _, t := range declared {
+		isDeclared[t.Database+"."+t.SchemaName+"."+t.TableName] = true
+	}
+	inspected := 0
+	for _, d := range dbs {
+		if d.DefaultPlacement != "reference" {
+			continue
+		}
+		tables, err := r.userTables(ctx, set, ranges[0].ShardID, d.Name)
+		if err != nil {
+			r.logger().Warn("undeclared reference tables not enumerated", "database", d.Name, "err", err)
+			continue
+		}
+		for _, t := range tables {
+			if isDeclared[d.Name+"."+t.SchemaName+"."+t.TableName] {
+				continue
+			}
+			hazards, err := r.inspect(ctx, set, ranges, referenceTable{Database: d.Name, SchemaName: t.SchemaName, TableName: t.TableName})
+			if err != nil {
+				r.logger().Warn("undeclared reference table not inspected", "database", d.Name,
+					"schema", t.SchemaName, "table", t.TableName, "err", err)
+				continue
+			}
+			if _, err := r.Pool.Exec(ctx, `
+				INSERT INTO pgshard.table_status (database, schema_name, table_name, effective_placement,
+					effective_generation, reference_checked_generation, reference_hazards, updated_at)
+				VALUES ($1, $2, $3, 'reference', 0, 0, $4, now())
+				ON CONFLICT (database, schema_name, table_name) DO UPDATE
+				SET reference_checked_generation = pgshard.table_status.effective_generation,
+					reference_hazards = EXCLUDED.reference_hazards, updated_at = now()`,
+				d.Name, t.SchemaName, t.TableName, hazards); err != nil {
+				return inspected, err
+			}
+			if len(hazards) > 0 {
+				r.logger().Warn("undeclared reference table cannot be written safely", "database", d.Name,
+					"schema", t.SchemaName, "table", t.TableName, "hazards", hazards)
+			}
+			inspected++
+		}
+	}
+	return inspected, nil
+}
+
+type shardTable struct {
+	SchemaName string
+	TableName  string
+}
+
+// userTables lists the ordinary tables of one database on one shard,
+// leaving out the schemas pgshard and PostgreSQL own.
+func (r *ReferenceCheck) userTables(ctx context.Context, set string, id int32, database string) ([]shardTable, error) {
+	conn, err := r.Shards.DialDatabase(ctx, set, id, database)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	rows, err := conn.Query(ctx, `SELECT n.nspname, c.relname
+		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.relkind IN ('r', 'p') AND n.nspname NOT IN ('pgshard', 'information_schema')
+		  AND n.nspname NOT LIKE 'pg\_%' ORDER BY 1, 2`)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[shardTable])
 }
