@@ -128,12 +128,30 @@ func classify(node *pgquerypb.Node, c *StmtClass) error {
 			return notYet("WITH HOLD cursors are not supported through the router", "")
 		}
 	case *pgquerypb.Node_CreateStmt:
-		if n.CreateStmt.GetRelation().GetRelpersistence() == "t" {
+		switch n.CreateStmt.GetRelation().GetRelpersistence() {
+		case "t":
 			return notYet("temporary tables are not supported through the router", "")
+		case "u":
+			return notDurable("CREATE UNLOGGED TABLE")
 		}
 	case *pgquerypb.Node_CreateTableAsStmt:
-		if n.CreateTableAsStmt.GetInto().GetRel().GetRelpersistence() == "t" {
+		// The same node carries CREATE MATERIALIZED VIEW and SELECT INTO.
+		form := "CREATE UNLOGGED TABLE AS"
+		if n.CreateTableAsStmt.GetObjtype() == pgquerypb.ObjectType_OBJECT_MATVIEW {
+			form = "CREATE UNLOGGED MATERIALIZED VIEW"
+		}
+		switch n.CreateTableAsStmt.GetInto().GetRel().GetRelpersistence() {
+		case "t":
 			return notYet("temporary tables are not supported through the router", "")
+		case "u":
+			return notDurable(form)
+		}
+	case *pgquerypb.Node_CreateSeqStmt:
+		switch n.CreateSeqStmt.GetSequence().GetRelpersistence() {
+		case "t":
+			return notYet("temporary sequences are not supported through the router", "")
+		case "u":
+			return notDurable("CREATE UNLOGGED SEQUENCE")
 		}
 	case *pgquerypb.Node_TransactionStmt:
 		t := n.TransactionStmt
