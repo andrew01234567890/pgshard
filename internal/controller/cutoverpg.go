@@ -1245,6 +1245,22 @@ func (o *pgCutover) Complete(ctx context.Context) error {
 			}
 		}
 	}
-	_, err := o.c.Pool.Exec(ctx, `DELETE FROM pgshard.serving WHERE shard_set = $1`, o.srcSet)
-	return err
+	if _, err := o.c.Pool.Exec(ctx, `DELETE FROM pgshard.serving WHERE shard_set = $1`, o.srcSet); err != nil {
+		return err
+	}
+	// The old set now has no replication in either direction and will
+	// never serve again, but its pods stay up for the retirement window
+	// and its -rw Service still answers. A client connected straight to it
+	// -- which is not the supported path, but is reachable -- would have
+	// its writes acknowledged by a primary nothing reads from again, and
+	// lose them at deletion with no error anywhere. Refusing is the
+	// difference between losing data and being told no.
+	//
+	// Best effort, and last: a set that cannot be reached is already
+	// beyond reach of a client too, and a retirement that has otherwise
+	// finished must not be undone by it.
+	if err := o.pauseSet(ctx, o.srcSet, o.srcIDs, true); err != nil {
+		o.c.logger().Info("reshard complete: retired set not made read-only", "workflow", o.wf.id, "set", o.srcSet, "err", err)
+	}
+	return nil
 }
