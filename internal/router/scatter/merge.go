@@ -26,7 +26,7 @@ func Merge(spec *plan.Merge, cols []Column, sources []Source, emit func([][]byte
 	case len(spec.Aggregates) > 0:
 		err = combineAggregates(spec.Aggregates, cols, sources, out)
 	case len(spec.OrderBy) > 0:
-		err = mergeOrdered(spec.OrderBy, cols, sources, out)
+		err = mergeOrdered(spec.OrderBy, cols, spec.Hidden, sources, out)
 	default:
 		err = concatenate(sources, out)
 	}
@@ -109,8 +109,8 @@ func (h *rowHeap) errored() error { return h.err }
 
 // mergeOrdered streams the k-way merge: every shard already returned its
 // rows in the requested order.
-func mergeOrdered(keys []plan.SortKey, cols []Column, sources []Source, out *limiter) error {
-	cmp, err := NewRowComparator(keys, cols)
+func mergeOrdered(keys []plan.SortKey, cols []Column, hidden int, sources []Source, out *limiter) error {
+	cmp, err := NewRowComparator(keys, cols, hidden)
 	if err != nil {
 		return err
 	}
