@@ -494,10 +494,11 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 			// no user write behind it, and after the journal there is no
 			// timeout to end the wait. What the flip needs is that the
 			// targets hold everything the sources hold, which CaughtUp
-			// has just established for these very positions; the carry is
-			// re-run because it is cheap, not because the flip is unsafe
-			// without it. A stale-router nextval in the window is already
-			// covered by the headroom collectSequences carries.
+			// has just established for these very positions. Sequence
+			// positions are the part CaughtUp cannot speak for, and the
+			// headroom collectSequences adds is finite, so the swap
+			// carries them again with the sources paused rather than
+			// leaving this bound to be what keeps them right.
 			wf.cutover.Positions = pos
 			wf.cutover.Recarries++
 			wf.cutover.Step = StepSequences
@@ -544,6 +545,17 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 			// Left writable between attempts: a workflow that stops here
 			// must not leave the sources refusing writes for good.
 			return true, errors.Join(retryf("%s", why), ops.PauseSources(ctx, false))
+		}
+		// Sequence positions are not replicated. Between the carry before
+		// the flip and here, a router that had not yet reloaded could
+		// still have called nextval on a source: the row it wrote reaches
+		// the targets, the sequence position does not, and the targets
+		// hand the same value out again. The carry runs a second time
+		// with the sources paused, so nothing can consume a value after
+		// it -- which is what makes the flip's bounded re-carry a
+		// liveness measure rather than the thing safety rests on.
+		if err := ops.Sequences(ctx); err != nil {
+			return false, errors.Join(err, ops.PauseSources(ctx, false))
 		}
 		if err := ops.DisableForward(ctx); err != nil {
 			return false, errors.Join(err, ops.PauseSources(ctx, false))

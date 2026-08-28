@@ -178,7 +178,7 @@ func TestCutoverHappyPath(t *testing.T) {
 	h.runUntil(t, StageSwitched)
 	want := []string{"gate", StepFence, StepDrain, StepSweep, StepPositions, StepCatchUp, StepPositions, StepVerify, StepSequences, StepReverse, StepJournal,
 		StepPositions, StepCatchUp, StepFlip,
-		"pause_sources", StepPositions, StepCatchUp, StepSwap, "pause_sources", "enable_reverse", StepRelease}
+		"pause_sources", StepPositions, StepCatchUp, StepSequences, StepSwap, "pause_sources", "enable_reverse", StepRelease}
 	if got := strings.Join(h.ops.calls, ","); got != strings.Join(want, ",") {
 		t.Fatalf("calls %s", got)
 	}
@@ -609,5 +609,28 @@ func TestSwapLeavesTheSourcesWritableWhenItCannotFinish(t *testing.T) {
 	}
 	if h.ops.pauses == 0 {
 		t.Fatal("the swap must have paused them in the first place")
+	}
+}
+
+// TestSwapCarriesSequencesInsideThePause: sequence positions are not
+// replicated. Between the carry before the flip and the swap, a router
+// that had not reloaded could still call nextval on a source: the row it
+// writes reaches the targets, the sequence position does not, and the
+// targets hand the same value out again. The carry has to run once more
+// where nothing can consume a value after it.
+func TestSwapCarriesSequencesInsideThePause(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.runUntil(t, StageSwitched)
+	calls := strings.Join(h.ops.calls, ",")
+	swap := strings.Index(calls, StepSwap)
+	pause := strings.LastIndex(calls[:swap], "pause_sources")
+	if swap < 0 || pause < 0 {
+		t.Fatalf("calls %s", calls)
+	}
+	if !strings.Contains(calls[pause:swap], StepSequences) {
+		t.Fatalf("the sequences must be carried again inside the pause: %s", calls[pause:swap])
+	}
+	if got := strings.Count(calls, StepSequences); got < 2 {
+		t.Fatalf("sequences carried %d times, want the pre-flip carry and the one at the swap", got)
 	}
 }

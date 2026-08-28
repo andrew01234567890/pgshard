@@ -298,6 +298,21 @@ func TestCollectSequencesHeadroomOnPostgres(t *testing.T) {
 	if _, err := conn.Exec(ctx, `SELECT nextval('edge_seq')`); err == nil {
 		t.Fatal("nextval past the clamped bigint maximum must error, not hand out a duplicate")
 	}
+
+	// The carry runs a second time at the swap, by which point the targets
+	// are serving and may be past the sources on their own. Moving a live
+	// sequence backwards would hand every value between out twice.
+	mustExec(t, conn, `SELECT setval('app_seq', 900000, true)`)
+	mustExec(t, conn, `SELECT setval('down_seq', -900000, true)`)
+	if err := applySequences(ctx, pgxShardConn{conn}, values); err != nil {
+		t.Fatal(err)
+	}
+	if next := queryOne[int64](t, conn, `SELECT nextval('app_seq')`); next <= 900000 {
+		t.Fatalf("an ascending sequence was moved back to %d; it was already at 900000", next)
+	}
+	if next := queryOne[int64](t, conn, `SELECT nextval('down_seq')`); next >= -900000 {
+		t.Fatalf("a descending sequence was moved back to %d; it was already at -900000", next)
+	}
 }
 
 // TestUpgradeRollbackRefusesAfterSchemaDrift: logical replication carries no
