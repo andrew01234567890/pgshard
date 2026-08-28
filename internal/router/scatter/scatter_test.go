@@ -148,7 +148,7 @@ func TestRowComparatorDirectionsAndNulls(t *testing.T) {
 		{keyASC, "NULL", "2", 1}, {keyASC, "2", "NULL", -1}, {keyASC, "NULL", "NULL", 0},
 		{keyDESC, "NULL", "2", -1}, {keyASCNullsFirst, "NULL", "2", -1},
 	} {
-		rc, err := NewRowComparator(c.keys, oids)
+		rc, err := NewRowComparator(c.keys, oids, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -158,17 +158,17 @@ func TestRowComparatorDirectionsAndNulls(t *testing.T) {
 		}
 	}
 	// Ties on the first key fall through to the second.
-	rc, err := NewRowComparator([]plan.SortKey{{Column: 0}, {Column: 1, Desc: true, CCollation: true}}, oids)
+	rc, err := NewRowComparator([]plan.SortKey{{Column: 0}, {Column: 1, Desc: true, CCollation: true}}, oids, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := rc.Compare(row("1", "a"), row("1", "b")); got != 1 {
 		t.Fatalf("second key DESC: got %d, want 1", got)
 	}
-	if _, err := NewRowComparator([]plan.SortKey{{Column: 1}}, oids); sqlstate(err) != pgwire.CodeFeatureNotSupported {
+	if _, err := NewRowComparator([]plan.SortKey{{Column: 1}}, oids, 0); sqlstate(err) != pgwire.CodeFeatureNotSupported {
 		t.Fatalf("text key without C collation must be refused: %v", err)
 	}
-	if _, err := NewRowComparator([]plan.SortKey{{Column: 5}}, oids); err == nil {
+	if _, err := NewRowComparator([]plan.SortKey{{Column: 5}}, oids, 0); err == nil {
 		t.Fatal("out-of-range key must be an error")
 	}
 }
@@ -423,5 +423,26 @@ func TestBinaryFormatComparatorsAndAggregates(t *testing.T) {
 		sources(rows("9223372036854775807"), rows("1")), func([][]byte) error { return nil })
 	if sqlstate(err) != "22003" {
 		t.Fatalf("overflow: %v", err)
+	}
+}
+
+// TestMergeHiddenSortKeysFollowTheRealRowWidth: a hidden sort key was a
+// position in the parsed select list, so a star -- whose width only the
+// shard knows -- merged on an unrelated column and returned misordered
+// rows, and with LIMIT the wrong ones.
+func TestMergeHiddenSortKeysFollowTheRealRowWidth(t *testing.T) {
+	// SELECT *, created_at AS __pgshard_sort_0 against a three-column
+	// table: the key travels last, whatever the star expanded to.
+	spec := &plan.Merge{OrderBy: []plan.SortKey{{Column: 0, FromHidden: true}}, Hidden: 1, Limit: 2, Offset: -1}
+	got, n, err := collect(t, spec, []uint32{oidInt4, oidText, oidText, oidInt4}, sources(
+		[][][]byte{row("1", "a", "x", "30"), row("4", "d", "x", "60")},
+		[][][]byte{row("2", "b", "y", "10"), row("5", "e", "y", "50")},
+		[][][]byte{row("3", "c", "z", "20"), row("6", "f", "z", "40")},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "2|b|y,3|c|z"; strings.Join(got, ",") != want || n != 2 {
+		t.Fatalf("merged %v (%d), want %s", got, n, want)
 	}
 }
