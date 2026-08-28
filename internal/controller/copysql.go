@@ -192,6 +192,11 @@ type CopyProgress struct {
 	TablesReady   int   `json:"tables_ready"`
 	LagBytes      int64 `json:"lag_bytes"`
 	Paused        int   `json:"paused"`
+	// Enumerating counts subscriptions that have no pg_subscription_rel
+	// rows yet. Such a subscription has copied nothing, and counting its
+	// zero tables as zero-outstanding is how a switch begins before any
+	// data has moved.
+	Enumerating int `json:"enumerating,omitempty"`
 	// Blockers samples which subscriptions and relations are not ready,
 	// bounded by BlockerSamples so the status stays a fixed size however
 	// many tables a workflow moves.
@@ -202,6 +207,9 @@ type CopyProgress struct {
 // when there are any.
 func (p CopyProgress) Describe() string {
 	s := fmt.Sprintf("%d/%d tables ready, lag %d bytes", p.TablesReady, p.TablesTotal, p.LagBytes)
+	if p.Enumerating > 0 {
+		s += fmt.Sprintf("; %d subscriptions have no tables yet", p.Enumerating)
+	}
 	if len(p.Blockers) > 0 {
 		s += "; waiting on " + strings.Join(p.Blockers, ", ")
 	}
@@ -223,11 +231,16 @@ func Aggregate(reports []SubscriptionProgress) CopyProgress {
 			}
 			p.Blockers = append(p.Blockers, b)
 		}
+		rels := 0
 		for st, n := range r.Rels {
+			rels += n
 			p.TablesTotal += n
 			if st == 'r' {
 				p.TablesReady += n
 			}
+		}
+		if rels == 0 {
+			p.Enumerating++
 		}
 		switch {
 		case p.LagBytes == LagUnknown:
@@ -245,7 +258,8 @@ func Aggregate(reports []SubscriptionProgress) CopyProgress {
 
 // CaughtUp is true once every table is ready and the lag is under threshold.
 func (p CopyProgress) CaughtUp(threshold int64) bool {
-	return p.Subscriptions > 0 && p.TablesTotal == p.TablesReady && p.LagBytes >= 0 && p.LagBytes < threshold
+	return p.Subscriptions > 0 && p.Enumerating == 0 && p.TablesTotal > 0 &&
+		p.TablesTotal == p.TablesReady && p.LagBytes >= 0 && p.LagBytes < threshold
 }
 
 // Throttle decides whether the subscriptions should be paused given the
