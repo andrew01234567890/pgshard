@@ -201,3 +201,69 @@ func TestVacuumFullBecomesRepack(t *testing.T) {
 	}
 	_ = pl
 }
+
+// TestMultiShardPlansCarryTheMaskingIntoShardSQL: the masking produced
+// plan.Rewritten after the merge spec was already built from the client's
+// tree, so Merge.ShardSQL -- which the scatter executor prefers -- still
+// carried the bare star. Every multi-shard read of a table under an online
+// rewrite therefore returned the working column to the client, while the
+// same query with a shard-key predicate did not.
+func TestMultiShardPlansCarryTheMaskingIntoShardSQL(t *testing.T) {
+	p := New()
+	snap := rewriteFixture(t, "tenant_id", "id", "amount")
+	for _, c := range []struct {
+		sql  string
+		want string
+	}{
+		{"select * from orders limit 10", "SELECT tenant_id, id, amount FROM orders LIMIT 10"},
+		{"select * from orders order by id limit 10", "SELECT tenant_id, id, amount FROM orders ORDER BY id LIMIT 10"},
+		{"select o.* from orders o limit 10", "SELECT o.tenant_id, o.id, o.amount FROM orders o LIMIT 10"},
+	} {
+		t.Run(c.sql, func(t *testing.T) {
+			pl, err := p.Plan(context.Background(), session(snap), c.sql)
+			if err != nil {
+				t.Fatalf("plan: %v", err)
+			}
+			if pl.Kind != Scatter {
+				t.Fatalf("kind %s, want Scatter", pl.Kind)
+			}
+			m, err := pl.MultiShard()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if m.ShardSQL != c.want {
+				t.Fatalf("shard SQL %q, want %q", m.ShardSQL, c.want)
+			}
+			// Whatever a caller reaches for, no text with a bare star over
+			// a table under rewrite may leave the router.
+			for _, sql := range []string{m.ShardSQL, pl.Rewritten} {
+				if strings.Contains(sql, "*") {
+					t.Fatalf("a star reached the shards: %q", sql)
+				}
+			}
+		})
+	}
+}
+
+// TestReferenceWriteCarriesTheMasking: a reference write fans out to every
+// shard, and its RETURNING * was expanded only into plan.Rewritten, which
+// the extended-protocol reference path did not read.
+func TestReferenceWriteCarriesTheMasking(t *testing.T) {
+	s := fixture(t)
+	key := snapshot.TableKey{Database: fixtureDB, SchemaName: "public", TableName: "regions"}
+	pr := s.Tables[key]
+	pr.HiddenColumns = []string{"_pgshard_name_deadbeef"}
+	pr.VisibleColumns = []string{"id", "name"}
+	s.Tables[key] = pr
+
+	pl, err := New().Plan(context.Background(), session(s), "insert into regions (id, name) values (1, 'a') returning *")
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if pl.Kind != Reference {
+		t.Fatalf("kind %s, want Reference", pl.Kind)
+	}
+	if want := "INSERT INTO regions (id, name) VALUES (1, 'a') RETURNING id, name"; pl.Rewritten != want {
+		t.Fatalf("rewritten %q, want %q", pl.Rewritten, want)
+	}
+}
