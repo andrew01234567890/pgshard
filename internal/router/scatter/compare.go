@@ -470,10 +470,13 @@ type RowComparator struct {
 }
 
 // NewRowComparator resolves the comparators for keys against the columns of
-// the shard rows.
-func NewRowComparator(keys []plan.SortKey, cols []Column) (*RowComparator, error) {
-	rc := &RowComparator{keys: keys}
+// the shard rows. hidden is how many columns the router appended, which is
+// what places a key the planner could only position relative to the end.
+func NewRowComparator(keys []plan.SortKey, cols []Column, hidden int) (*RowComparator, error) {
+	rc := &RowComparator{}
 	for _, k := range keys {
+		k.Column, k.FromHidden = k.Index(len(cols), hidden), false
+		rc.keys = append(rc.keys, k)
 		if k.Column < 0 || k.Column >= len(cols) {
 			return nil, pgwire.Errorf(pgwire.CodeInternalError, "router: sort key column %d outside the %d-column shard row", k.Column, len(cols))
 		}
