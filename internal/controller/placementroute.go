@@ -149,6 +149,30 @@ func (s rowShape) identityAlways(i int) bool {
 	return i < len(s.Identity) && s.Identity[i] == "a"
 }
 
+// alwaysIdentityChanged reports whether an UPDATE gave a GENERATED ALWAYS
+// identity column outside the primary key a new value -- what UPDATE t SET
+// c = DEFAULT does. The upsert cannot carry it: PostgreSQL forbids such a
+// column in ON CONFLICT DO UPDATE SET, so the statement would conflict on
+// the unchanged key and leave the old value standing.
+func (s rowShape) alwaysIdentityChanged(old, updated *Tuple) bool {
+	if old == nil || updated == nil {
+		return false
+	}
+	for i, c := range s.Columns {
+		if !s.identityAlways(i) || slices.Contains(s.PK, c) {
+			continue
+		}
+		if i >= len(old.Values) || i >= len(updated.Values) {
+			continue
+		}
+		x, y := old.Values[i], updated.Values[i]
+		if (x == nil) != (y == nil) || (x != nil && *x != *y) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s rowShape) pkIndexes() []int {
 	var out []int
 	for _, k := range s.PK {
@@ -313,9 +337,13 @@ func routeChange(r *placementRouter, shape rowShape, table string, c *Change) ([
 				ops = append(ops, applyOp{t, shape.DeleteSQL(table, old)})
 			}
 		}
-		moved := !slices.Equal(oldTargets, newTargets) || !samePK(shape, old, c.New)
+		// A changed GENERATED ALWAYS identity is replayed the same way a
+		// changed key is: remove the row the shadow holds and insert the
+		// new one, which the insert may carry because it overrides the
+		// system value.
+		replace := !samePK(shape, old, c.New) || shape.alwaysIdentityChanged(c.Old, c.New)
 		for _, t := range newTargets {
-			if moved && slices.Contains(oldTargets, t) && !samePK(shape, old, c.New) {
+			if replace && slices.Contains(oldTargets, t) {
 				ops = append(ops, applyOp{t, shape.DeleteSQL(table, old)})
 			}
 			for _, sql := range shape.UpsertSQL(table, []*Tuple{c.New}) {

@@ -219,3 +219,43 @@ func TestRouteChange(t *testing.T) {
 }
 
 func itoa(v int64) string { return strconv.FormatInt(v, 10) }
+
+// TestRouteChangeReplacesAChangedAlwaysIdentity: the applier's upsert leaves
+// a GENERATED ALWAYS identity column out of ON CONFLICT DO UPDATE SET,
+// because PostgreSQL forbids updating one to an explicit value. UPDATE t SET
+// tag = DEFAULT therefore conflicted on the unchanged key and the shadow
+// kept the old tag -- a stale always-identity value on the moved table, with
+// nothing to say so.
+func TestRouteChangeReplacesAChangedAlwaysIdentity(t *testing.T) {
+	cols := []string{"id", "tenant_id", "region_id", "tag"}
+	shape := rowShape{Schema: "public", Name: "orders", Columns: cols,
+		Identity: []string{"", "", "", "a"}, PK: []string{"id"}}
+	r := twoShardRouter(TablePlacement{Placement: "sharded", ShardKey: s("region_id")}, cols)
+	var region *string
+	for v := int64(1); ; v++ {
+		if shardOf(t, v) == 0 {
+			region = s(itoa(v))
+			break
+		}
+	}
+	rel := &Relation{Schema: "public", Name: "orders", Columns: cols}
+	row := func(tag string) *Tuple {
+		return &Tuple{Values: []*string{s("1"), s("1"), region, s(tag)}, Unchanged: make([]bool, 4)}
+	}
+
+	ops, err := routeChange(r, shape, "orders__pgshard_new", &Change{Op: OpUpdate, Relation: rel, Old: row("5"), New: row("6")})
+	if err != nil || len(ops) != 2 {
+		t.Fatalf("a new always-identity value needs a delete and an insert: %+v %v", ops, err)
+	}
+	if !strings.HasPrefix(ops[0].sql, "DELETE") || !strings.Contains(ops[0].sql, `"id" = '1'`) {
+		t.Fatalf("first op: %s", ops[0].sql)
+	}
+	if !strings.HasPrefix(ops[1].sql, "INSERT") || !strings.Contains(ops[1].sql, "OVERRIDING SYSTEM VALUE") || !strings.Contains(ops[1].sql, "'6'") {
+		t.Fatalf("second op: %s", ops[1].sql)
+	}
+	// An identity that did not move still takes the cheap path.
+	ops, err = routeChange(r, shape, "orders__pgshard_new", &Change{Op: OpUpdate, Relation: rel, Old: row("5"), New: row("5")})
+	if err != nil || len(ops) != 1 || !strings.HasPrefix(ops[0].sql, "INSERT") {
+		t.Fatalf("an unchanged identity must stay an upsert: %+v %v", ops, err)
+	}
+}
