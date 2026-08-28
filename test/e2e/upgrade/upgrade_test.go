@@ -30,7 +30,13 @@ func TestUpgrade18To19UnderLoad(t *testing.T) {
 	c.GatherOnFailure(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
 	defer cancel()
-	bringUpCluster(ctx, t, c, "2m")
+	// retireOldGroupsAfter is the rollback window, and this test spends it:
+	// between the flip and the rollback it waits for writes on the new
+	// major, runs the ledger oracle and reads the retired primary for the
+	// VDiff. At two minutes the 18 groups were deleted before the rollback
+	// was asked for, and "rollback to the 18 set" waited fifteen minutes
+	// for pods that no longer existed.
+	bringUpCluster(ctx, t, c, "12m")
 	l := startLedger(ctx, t, c)
 	waitForWhy(ctx, t, c, "first acknowledged ledger writes", 2*time.Minute, l.why,
 		func() bool { return l.acked.Load() >= 25 })
