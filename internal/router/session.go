@@ -1206,7 +1206,11 @@ func (e *Executor) sync(ctx context.Context) error {
 			if !ok {
 				return e.afterBatch(ctx, pgwire.Errorf("26000", "prepared statement %q does not exist", scatterStmt))
 			}
-			return e.afterBatch(ctx, e.referenceWrite(ctx, *scatterPlan, unnamedBatch(st.sql, st.oids, batch), w))
+			// shardSQL, not the client's text: a reference write on a
+			// table under an online rewrite carries a column list the
+			// client did not write, and RETURNING * is expanded to the
+			// visible columns.
+			return e.afterBatch(ctx, e.referenceWrite(ctx, *scatterPlan, unnamedBatch(st.shardSQL(), st.shardOIDs(), batch), w))
 		}
 		return e.afterBatch(ctx, e.scatterBatch(ctx, *scatterPlan, scatterStmt, batch, w))
 	}

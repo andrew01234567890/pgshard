@@ -140,7 +140,10 @@ func (e *Executor) scatterBatch(ctx context.Context, pl plan.Plan, stmt string, 
 	if !ok {
 		return pgwire.Errorf("26000", "prepared statement %q does not exist", stmt)
 	}
-	sql := st.sql
+	// ShardSQL is derived from the same masked statement shardSQL returns,
+	// so either carries the online-rewrite masking; st.sql is the client's
+	// text and does not.
+	sql := st.shardSQL()
 	if m.ShardSQL != "" {
 		sql = m.ShardSQL
 	}

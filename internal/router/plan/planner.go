@@ -35,6 +35,17 @@ const cursorOptHold = 0x0020
 // the home shard alone, silently skipping the shards a newer server's
 // grammar would have targeted.
 func (p *Planner) Plan(ctx context.Context, sess Session, sql string) (Plan, error) {
+	return p.plan(ctx, sess, sql, false)
+}
+
+// plan resolves sql. masked is set on the second pass over a statement the
+// online-rewrite masking rewrote, which exists so everything derived from
+// the statement -- the merge spec and its ShardSQL as much as the text a
+// single shard receives -- comes from the same masked tree. Without it the
+// merge spec was built from the client's text and the masking applied
+// afterwards, so a scatter sent the shards the star form and the working
+// column came back to the client.
+func (p *Planner) plan(ctx context.Context, sess Session, sql string, masked bool) (Plan, error) {
 	res, err := p.parser.Parse(ctx, sql)
 	if err != nil {
 		var perr *pgparser.Error
@@ -71,6 +82,16 @@ func (p *Planner) Plan(ctx context.Context, sess Session, sql string) (Plan, err
 	}
 	if err := w.hideRewriteColumns(); err != nil {
 		return refusalErr(err)
+	}
+	if pl.Rewritten != "" && !masked {
+		// The masked text names its columns, so the second pass finds
+		// nothing left to mask and cannot recurse again.
+		out, err := p.plan(ctx, sess, pl.Rewritten, true)
+		if err != nil {
+			return out, err
+		}
+		out.Rewritten = pl.Rewritten
+		return out, nil
 	}
 	pl.Class.Write = pl.Kind != SessionLocal && (w.stmt != "SELECT" || w.locking)
 	if pl.merge != nil && raw.GetStmt().GetSelectStmt() == nil {
