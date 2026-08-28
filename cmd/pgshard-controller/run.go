@@ -18,7 +18,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -217,13 +216,12 @@ func listenerCredentials(certFile, keyFile, caFile string, insecureDev bool) (cr
 		ClientAuth: tls.RequireAndVerifyClientCert, MinVersion: tls.VersionTLS13}), nil
 }
 
-// shardConnInfo renders the connection string of one shard database:
-// an explicit --shard-dsn entry with its database replaced, else the
-// template expanded ({db} or, without the placeholder, the database
-// replaced in the expanded DSN).
+// shardConnInfo renders the connection string of one shard database: an
+// explicit --shard-dsn entry with its database replaced, else the template
+// expanded and its database replaced.
 func shardConnInfo(ctx context.Context, pool *pgxpool.Pool, dsns shardDSNFlag, template string, ref controller.ShardRef, database string) (string, error) {
 	if dsn, ok := dsns[ref]; ok {
-		return withDatabase(dsn, database)
+		return controller.ConnInfo(dsn, database)
 	}
 	if template == "" {
 		return "", fmt.Errorf("no DSN for shard %s/%d", ref.Set, ref.ID)
@@ -232,31 +230,7 @@ func shardConnInfo(ctx context.Context, pool *pgxpool.Pool, dsns shardDSNFlag, t
 	if err != nil {
 		return "", err
 	}
-	dsn := controller.ExpandShardTemplate(template, ref.Set, ref.ID, group, database)
-	if strings.Contains(template, "{db}") {
-		return dsn, nil
-	}
-	return withDatabase(dsn, database)
-}
-
-// withDatabase rewrites the database of a DSN as a keyword/value string.
-func withDatabase(dsn, database string) (string, error) {
-	cfg, err := pgx.ParseConfig(dsn)
-	if err != nil {
-		return "", err
-	}
-	parts := []string{"host=" + cfg.Host, "port=" + fmt.Sprint(cfg.Port), "user=" + cfg.User, "dbname=" + database}
-	if cfg.Password != "" {
-		parts = append(parts, "password="+pqEscape(cfg.Password))
-	}
-	if cfg.TLSConfig == nil {
-		parts = append(parts, "sslmode=disable")
-	}
-	return strings.Join(parts, " "), nil
-}
-
-func pqEscape(v string) string {
-	return "'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(v) + "'"
+	return controller.ConnInfo(controller.ExpandShardTemplate(template, ref.Set, ref.ID, group), database)
 }
 
 // shardDSNFlag collects --shard-dsn <set>/<id>=<dsn> values.
