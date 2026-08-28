@@ -74,6 +74,27 @@ func NewWatcher(dsn string, opts Options) *Watcher {
 // Current returns the latest Snapshot, or nil before the first load.
 func (w *Watcher) Current() *Snapshot { return w.current.Load() }
 
+// Fresh reports whether the watcher holds a snapshot recent enough to act
+// on. A component whose reloads are failing stops being a valid
+// participant rather than serving a view it can no longer trust.
+func (w *Watcher) Fresh(now time.Time) bool {
+	snap := w.Current()
+	return snap != nil && !snap.Stale(now)
+}
+
+// AgeSeconds is the age of the held snapshot for a metrics gauge; it is
+// negative when there is no snapshot to age.
+func (w *Watcher) AgeSeconds(now time.Time) float64 {
+	age, ok := w.Current().Age(now)
+	if !ok {
+		return -1
+	}
+	return age.Seconds()
+}
+
+// SetForTest installs a snapshot without a catalog behind it.
+func (w *Watcher) SetForTest(s *Snapshot) { w.current.Store(s) }
+
 // Subscribe returns a channel that receives generation changes. Slow
 // receivers miss intermediate changes but always get the latest one.
 func (w *Watcher) Subscribe() (<-chan Change, func()) {

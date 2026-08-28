@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 )
 
 // fakeListener records what the drainer did before and during Shutdown.
@@ -152,5 +154,40 @@ func TestReadyRequiresACatalogSnapshot(t *testing.T) {
 	d.state.Store(int32(DrainDraining))
 	if d.Ready() {
 		t.Error("a draining router must not be ready whatever its snapshot")
+	}
+}
+
+// TestReadinessFollowsSnapshotFreshness: a router whose catalog reloads are
+// failing keeps its last snapshot, and readiness only ever asked whether it
+// had one at all. It therefore stayed in the Service, advertising a view of
+// the catalog it had already stopped planning against.
+func TestReadinessFollowsSnapshotFreshness(t *testing.T) {
+	fl := &fakeListener{block: make(chan struct{})}
+	d := NewDrainer(fl, 0, time.Second)
+	fl.d = d
+	loaded := time.Now()
+	now := loaded
+	snap := &snapshot.Snapshot{LoadedAt: loaded}
+	d.Routable = func() bool { return !snap.Stale(now) }
+	srv := httptest.NewServer(d.Handler())
+	defer srv.Close()
+	code := func() int {
+		resp, err := http.Get(srv.URL + "/readyz")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		return resp.StatusCode
+	}
+	if got := code(); got != http.StatusOK {
+		t.Fatalf("readyz with a fresh snapshot: %d", got)
+	}
+	now = loaded.Add(snapshot.MaxAge + time.Second)
+	if got := code(); got != http.StatusServiceUnavailable {
+		t.Fatalf("readyz with a snapshot older than MaxAge: %d", got)
+	}
+	snap = &snapshot.Snapshot{LoadedAt: now}
+	if got := code(); got != http.StatusOK {
+		t.Fatalf("readyz after a successful reload: %d", got)
 	}
 }
