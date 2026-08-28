@@ -651,6 +651,24 @@ func (h *pgHarness) testFlush(t *testing.T) {
 // and both parse as ordinary reads -- so neither pinned the session, and
 // whatever they left was inherited by the next logical session of the same
 // role. That is a leak between clients, not untidiness.
+// waitIdle waits until every backend is back in the pool. The reset runs
+// after the client has its ReadyForQuery, so without this the next session
+// starts on a second backend while the first is still being cleaned, and
+// an assertion about what the first left behind races the cleaning.
+func waitIdle(t *testing.T, h *pgHarness) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if live, idle := h.srv.cfg.Pool.Stats(); live == idle {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("backends did not return to the pool")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func (h *pgHarness) testNoStateLeak(t *testing.T) {
 	ctx := context.Background()
 	run := func(session, sql string) []*pgshardv1.ExecuteResponse {
@@ -675,12 +693,23 @@ func (h *pgHarness) testNoStateLeak(t *testing.T) {
 	run("leak1", "SELECT set_config('application_name', 'left-behind', false)")
 	run("leak2", "SELECT pg_advisory_lock(4242)")
 
-	if got := rows(run("innocent1", "SELECT current_setting('application_name')")); len(got) != 1 || got[0] == "left-behind" {
-		t.Errorf("application_name = %v; a later session inherited the GUC", got)
+	waitIdle(t, h)
+	// Asked of the whole server, not of whichever backend this session
+	// happens to land on: a check that only inspects the current backend
+	// passes for free whenever the pool hands out a different one.
+	if got := rows(run("innocent1", "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'left-behind'")); len(got) != 1 || got[0] != "0" {
+		t.Errorf("a pooled backend still carries the application_name a finished session set: %v", got)
 	}
 	// pg_try_advisory_lock reports false while another backend holds it, so
-	// this fails if the lock outlived the session that took it.
-	if got := rows(run("innocent2", "SELECT pg_try_advisory_lock(4242)")); len(got) != 1 || got[0] != "t" {
+	// this fails if the lock outlived the session that took it. The reset
+	// runs after the client has its ReadyForQuery, so the next session can
+	// start -- on a different backend -- while the one that took the lock
+	// is still being cleaned; a lock that was actually leaked never clears.
+	// Likewise: pg_try_advisory_lock succeeds on the session that already
+	// holds the lock, so it reports nothing unless the pool happens to hand
+	// out a different backend. pg_locks sees the holder whichever backend
+	// asks.
+	if got := rows(run("innocent2", "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'")); len(got) != 1 || got[0] != "0" {
 		t.Errorf("advisory lock still held by a pooled backend: %v", got)
 	}
 }
