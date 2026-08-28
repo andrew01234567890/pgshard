@@ -34,7 +34,7 @@ func TestRegistryCarriesBuildInfo(t *testing.T) {
 
 func TestRouterSetServesKeySeries(t *testing.T) {
 	reg := NewRegistry("router")
-	m := NewRouter(reg, func() float64 { return 3 })
+	m := NewRouter(reg, func() float64 { return 3 }, func() float64 { return 12 })
 	m.Connections.Inc()
 	m.Queries.WithLabelValues("Single", "simple").Inc()
 	m.Refusals.WithLabelValues("0A000").Add(2)
@@ -46,6 +46,7 @@ func TestRouterSetServesKeySeries(t *testing.T) {
 	body := scrape(t, reg)
 	for _, want := range []string{
 		"pgshard_router_active_sessions 3",
+		"pgshard_router_snapshot_age_seconds 12",
 		"pgshard_router_connections_total 1",
 		`pgshard_router_queries_total{kind="Single",opcode="simple"} 1`,
 		`pgshard_router_refusals_total{sqlstate="0A000"} 2`,
@@ -63,7 +64,7 @@ func TestRouterSetServesKeySeries(t *testing.T) {
 
 func TestPoolerSetServesKeySeries(t *testing.T) {
 	reg := NewRegistry("pooler")
-	m := NewPooler(reg, func() float64 { return 5 }, func() float64 { return 2 })
+	m := NewPooler(reg, func() float64 { return 5 }, func() float64 { return 2 }, func() float64 { return 7 })
 	m.BackendDials.WithLabelValues("ok").Inc()
 	m.PoolWaits.Inc()
 	m.PreparedHits.Inc()
@@ -72,6 +73,7 @@ func TestPoolerSetServesKeySeries(t *testing.T) {
 	for _, want := range []string{
 		"pgshard_pooler_backends_live 5",
 		"pgshard_pooler_backends_idle 2",
+		"pgshard_pooler_snapshot_age_seconds 7",
 		`pgshard_pooler_backend_dials_total{result="ok"} 1`,
 		"pgshard_pooler_pool_waits_total 1",
 		"pgshard_pooler_prepared_cache_hits_total 1",
