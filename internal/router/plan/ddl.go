@@ -293,8 +293,10 @@ func checkAlterCmd(r *rel, c *pgquerypb.AlterTableCmd) error {
 		if sharded && c.GetName() == r.shardKey {
 			return shardKeyChangeError(r)
 		}
-	case pgquerypb.AlterTableType_AT_SetLogged, pgquerypb.AlterTableType_AT_SetUnLogged:
-		return rewriteClass("SET LOGGED / SET UNLOGGED")
+	case pgquerypb.AlterTableType_AT_SetUnLogged:
+		return notDurable("ALTER TABLE ... SET UNLOGGED")
+	case pgquerypb.AlterTableType_AT_SetLogged:
+		return rewriteClass("SET LOGGED")
 	case pgquerypb.AlterTableType_AT_SetTableSpace:
 		return rewriteClass("SET TABLESPACE")
 	case pgquerypb.AlterTableType_AT_AddColumn:
