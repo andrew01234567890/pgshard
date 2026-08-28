@@ -215,9 +215,20 @@ func collectSequences(ctx context.Context, conn ShardConn, values map[string]seq
 
 // applySequences sets every sequence conn holds to the recorded value; a
 // sequence the target does not have (never materialized) is skipped.
+// applySequences moves each target sequence to the carried value, never
+// backwards. The carry runs a second time at the swap, by which point the
+// targets are serving and may have advanced past the sources on their own;
+// an unconditional setval would hand those values out twice. Direction
+// matters: for a descending sequence "further on" is the smaller value.
 func applySequences(ctx context.Context, conn ShardConn, values map[string]seqCarry) error {
+	const sql = `SELECT pg_catalog.setval(c.oid,
+		CASE WHEN $3::bool
+			THEN greatest(coalesce(pg_catalog.pg_sequence_last_value(c.oid), $2::bigint), $2::bigint)
+			ELSE least(coalesce(pg_catalog.pg_sequence_last_value(c.oid), $2::bigint), $2::bigint)
+		END, true)
+		FROM pg_class c WHERE c.oid = to_regclass($1) AND c.relkind = 'S'`
 	for _, name := range sortedKeys(values) {
-		if _, err := conn.Exec(ctx, `SELECT pg_catalog.setval(oid, $2, true) FROM pg_class WHERE oid = to_regclass($1) AND relkind = 'S'`, name, values[name].Value); err != nil {
+		if _, err := conn.Exec(ctx, sql, name, values[name].Value, values[name].Ascending); err != nil {
 			return err
 		}
 	}
