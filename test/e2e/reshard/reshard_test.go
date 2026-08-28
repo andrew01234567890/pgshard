@@ -325,6 +325,22 @@ func catalogSQL(ctx context.Context, t *testing.T, c *e2e.Cluster, sql string) s
 	return out
 }
 
+// reshardRecordDetail is what a reshard that never reports its targets
+// ready needs said about it: the phase and message the record carries, and
+// every condition with its reason. A timeout that prints only the pod list
+// cannot tell a controller that never looked from one that looked and
+// refused, and the pods are Running in both.
+func reshardRecordDetail(ctx context.Context, c *e2e.Cluster, record string) string {
+	phase := jsonpath(ctx, c, "pgshardreshard", record, "{.status.phase}")
+	msg := jsonpath(ctx, c, "pgshardreshard", record, "{.status.message}")
+	conds := jsonpath(ctx, c, "pgshardreshard", record,
+		`{range .status.conditions[*]}{.type}={.status}({.reason}: {.message}) {end}`)
+	groups := jsonpath(ctx, c, "pgshardgroup", clusterName+"-shard-0-g2",
+		`{.status.primary}/{.status.epoch} members={range .status.members[*]}{.name}:ready={.ready} {end}`)
+	return fmt.Sprintf("\nreshard %s: phase=%q message=%q\nconditions: %s\nshard-0-g2: %s",
+		record, phase, msg, conds, groups)
+}
+
 func waitFor(ctx context.Context, t *testing.T, c *e2e.Cluster, what string, timeout time.Duration, cond func() bool) {
 	t.Helper()
 	waitForWhy(ctx, t, c, what, timeout, nil, cond)
@@ -482,7 +498,9 @@ func TestReshardProvisionsTargetsAndCancels(t *testing.T) {
 			t.Errorf("target group %s: %q", g, got)
 		}
 	}
-	waitFor(ctx, t, c, "targets Ready", 15*time.Minute, func() bool {
+	waitForWhy(ctx, t, c, "targets Ready", 15*time.Minute, func() string {
+		return reshardRecordDetail(ctx, c, record)
+	}, func() bool {
 		phase := jsonpath(ctx, c, "pgshardreshard", record, "{.status.phase}")
 		ready := jsonpath(ctx, c, "pgshardreshard", record, `{.status.conditions[?(@.type=="TargetsReady")].status}`)
 		return ready == "True" && (phase == "Provisioning" || phase == "Copying")
