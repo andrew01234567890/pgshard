@@ -12,6 +12,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/internal/agent/backup"
@@ -494,5 +495,120 @@ func TestRestoreKeepsTheSourcesGroupNames(t *testing.T) {
 		if got, w := src.Options(g).Stanza, want[g.Name()].stanza; got != w {
 			t.Errorf("%s restore stanza = %q, want %q", g.Name(), got, w)
 		}
+	}
+}
+
+// TestRestoreWillNotAdoptAForeignSuperuserSecret: the copy ignored
+// AlreadyExists, so a secret left by a deleted cluster -- or belonging to a
+// live one -- was adopted by name alone. The restored catalog holds the
+// source's password, so a restored cluster given someone else's credential
+// locks its own agents and routers out of itself, and nothing says so.
+func TestRestoreWillNotAdoptAForeignSuperuserSecret(t *testing.T) {
+	newSource := func() *pgshardv1alpha1.PgShardCluster {
+		c := boundCluster("old")
+		one := 1
+		c.Spec.Shards = &one
+		c.UID = "source-uid"
+		return c
+	}
+	restore := func() *pgshardv1alpha1.PgShardRestore {
+		rs := newRestore("r1", pgshardv1alpha1.PgShardRestoreSpec{ClusterName: "old", NewClusterName: "new", BackupID: "b1"})
+		rs.UID = "restore-uid"
+		return rs
+	}
+	stranger := func(pw string, ann map[string]string) *corev1.Secret {
+		return &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: SecretName("new"), Namespace: "default", Annotations: ann},
+			Type:       corev1.SecretTypeBasicAuth,
+			Data:       map[string][]byte{"username": []byte(superuserName), secretKey: []byte(pw)},
+		}
+	}
+	for _, c := range []struct {
+		name   string
+		secret *corev1.Secret
+		want   string
+	}{
+		{"unstamped leftover", stranger("someone-elses-pw", nil), "was not created by this restore"},
+		{"another restore", stranger("source-pw", map[string]string{AnnotationRestoreUID: "other-restore"}), "was not created by this restore"},
+		{"another source", stranger("source-pw", map[string]string{AnnotationRestoreUID: "restore-uid", AnnotationRestoreSourceUID: "other-source"}), "another source cluster"},
+		{"same restore, wrong password", stranger("drifted", map[string]string{AnnotationRestoreUID: "restore-uid", AnnotationRestoreSourceUID: "source-uid"}), "different password"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cl := restoreClient(t, newSource(), newPolicy(), completedBackup("b1", "old"), restore(), superuserSecret("old"), c.secret)
+			r := &RestoreReconciler{Client: cl, Agents: newFakeAgents(nil), Now: time.Now}
+			_, got := reconcileRestore(t, r, "r1")
+			if got.Status.Phase != pgshardv1alpha1.RestorePhaseFailed || !strings.Contains(got.Status.Error, c.want) {
+				t.Fatalf("phase %s message %q, want a failure mentioning %q", got.Status.Phase, got.Status.Error, c.want)
+			}
+			var cluster pgshardv1alpha1.PgShardCluster
+			if err := cl.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "new"}, &cluster); err == nil {
+				t.Fatal("the cluster must not be created against a credential that is not the source's")
+			}
+			var after corev1.Secret
+			if err := cl.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: SecretName("new")}, &after); err != nil {
+				t.Fatalf("the foreign secret must be left alone: %v", err)
+			}
+			if string(after.Data[secretKey]) != string(c.secret.Data[secretKey]) {
+				t.Fatalf("the foreign secret was rewritten: %q", after.Data[secretKey])
+			}
+		})
+	}
+
+	t.Run("this restore's own earlier copy is reused", func(t *testing.T) {
+		mine := stranger("source-pw", map[string]string{AnnotationRestoreUID: "restore-uid", AnnotationRestoreSourceUID: "source-uid"})
+		cl := restoreClient(t, newSource(), newPolicy(), completedBackup("b1", "old"), restore(), superuserSecret("old"), mine)
+		r := &RestoreReconciler{Client: cl, Agents: newFakeAgents(nil), Now: time.Now}
+		_, got := reconcileRestore(t, r, "r1")
+		if got.Status.Phase != pgshardv1alpha1.RestorePhaseRestoring {
+			t.Fatalf("a retry must reuse its own copy: %s %q", got.Status.Phase, got.Status.Error)
+		}
+	})
+}
+
+// TestRestoredClusterOwnsItsCopiedSecret: the copy is made before the
+// cluster exists, so it cannot be owned at that moment and nothing owned it
+// afterwards either. Deleting the restored cluster then left its credential
+// behind, for the next cluster of that name to inherit.
+func TestRestoredClusterOwnsItsCopiedSecret(t *testing.T) {
+	c := boundCluster("new")
+	c.UID = "cluster-uid"
+	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: SecretName("new"), Namespace: "default"},
+		Type: corev1.SecretTypeBasicAuth, Data: map[string][]byte{"username": []byte(superuserName), secretKey: []byte("source-pw")}}
+	cl := restoreClient(t, c, sec)
+	r := &ClusterReconciler{Client: cl}
+	pw, err := r.ensureSecret(context.Background(), c)
+	if err != nil || pw != "source-pw" {
+		t.Fatalf("ensureSecret: %q %v", pw, err)
+	}
+	var got corev1.Secret
+	if err := cl.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: SecretName("new")}, &got); err != nil {
+		t.Fatal(err)
+	}
+	owner := metav1.GetControllerOf(&got)
+	if owner == nil || owner.Name != "new" || owner.Kind != "PgShardCluster" {
+		t.Fatalf("the restored cluster must own its credential: %+v", owner)
+	}
+
+	// A secret another controller owns is not taken: adopting one is how a
+	// deletion elsewhere removes a live cluster's credential.
+	foreign := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: SecretName("other"), Namespace: "default"},
+		Type: corev1.SecretTypeBasicAuth, Data: map[string][]byte{secretKey: []byte("pw")}}
+	elsewhere := boundCluster("elsewhere")
+	elsewhere.UID = "elsewhere-uid"
+	if err := controllerutil.SetControllerReference(elsewhere, foreign, cl.Scheme()); err != nil {
+		t.Fatal(err)
+	}
+	other := boundCluster("other")
+	other.UID = "other-uid"
+	cl2 := restoreClient(t, other, foreign)
+	r2 := &ClusterReconciler{Client: cl2}
+	if _, err := r2.ensureSecret(context.Background(), other); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl2.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: SecretName("other")}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if owner := metav1.GetControllerOf(&got); owner == nil || owner.Name != "elsewhere" {
+		t.Fatalf("an owned secret must keep its owner: %+v", owner)
 	}
 }

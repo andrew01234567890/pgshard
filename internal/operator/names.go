@@ -44,7 +44,15 @@ const (
 	// AnnotationPrimaryEpoch and AnnotationPrimary on the group Lease publish
 	// the fence for readers that cannot reach the catalog.
 	AnnotationPrimaryEpoch = "pgshard.io/primary-epoch"
-	AnnotationPrimary      = "pgshard.io/primary"
+
+	// AnnotationRestoreUID and AnnotationRestoreSourceUID record which
+	// restore copied a superuser secret and which cluster it came from.
+	// A restored cluster whose credential is not the source's cannot be
+	// reached by its own agents, so name equality is not enough to reuse
+	// one: a retry must prove it is looking at its own copy.
+	AnnotationRestoreUID       = "pgshard.io/restore-uid"
+	AnnotationRestoreSourceUID = "pgshard.io/restore-source-uid"
+	AnnotationPrimary          = "pgshard.io/primary"
 
 	// ConditionCatalogReady is set once the catalog schema migrations ran on
 	// the catalog primary.
