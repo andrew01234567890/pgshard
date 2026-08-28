@@ -3,21 +3,29 @@
 # Example: docker build -f Dockerfile.control --build-arg CMD=pgshard-admin -t pgshard-admin:dev .
 ARG CMD=pgshard-operator
 
-FROM golang:1.27-bookworm AS build
+FROM golang:1.27-bookworm@sha256:ded31c68586d2e49e760acc2e65a884b23d032e9bbbed0ae0c55abd3fcaf4452 AS build
 ARG CMD
 ARG VERSION=dev
 ARG COMMIT=none
 ARG DATE=unknown
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod go mod download
+# Retried: the module proxy answers a build with a stream error often
+# enough that an unretried download makes a green suite a matter of luck.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    for attempt in 1 2 3; do \
+        go mod download && exit 0; \
+        echo "go mod download failed (attempt $attempt), retrying" >&2; \
+        sleep 5; \
+    done; \
+    exit 1
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -trimpath \
       -ldflags "-s -w -X github.com/andrew01234567890/pgshard/internal/buildinfo.Version=${VERSION} -X github.com/andrew01234567890/pgshard/internal/buildinfo.Commit=${COMMIT} -X github.com/andrew01234567890/pgshard/internal/buildinfo.Date=${DATE}" \
       -o /out/${CMD} ./cmd/${CMD}
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 ARG CMD
 LABEL org.opencontainers.image.source="https://github.com/andrew01234567890/pgshard" \
       org.opencontainers.image.title="${CMD}"
