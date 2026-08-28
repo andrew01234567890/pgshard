@@ -944,7 +944,9 @@ func (o *pgCutover) stillSoleServing(ctx context.Context, tx pgx.Tx, set string)
 
 // Swap freezes the forward direction (disable; dropped on complete) and
 // starts the reverse one.
-func (o *pgCutover) Swap(ctx context.Context) error {
+// DisableForward stops the forward subscriptions once the targets hold
+// everything the sources have.
+func (o *pgCutover) DisableForward(ctx context.Context) error {
 	for _, db := range o.dbs {
 		for _, t := range o.wf.ids {
 			conn, err := o.c.Shards.DialDatabase(ctx, o.wf.set, t, db.name)
@@ -957,6 +959,15 @@ func (o *pgCutover) Swap(ctx context.Context) error {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+// EnableReverse starts the reverse subscriptions, which keep the sources
+// current for a rollback. Their apply workers write to the sources, so this
+// runs after the write pause is lifted.
+func (o *pgCutover) EnableReverse(ctx context.Context) error {
+	for _, db := range o.dbs {
 		for _, s := range o.srcIDs {
 			conn, err := o.c.Shards.DialDatabase(ctx, o.srcSet, s, db.name)
 			if err != nil {
@@ -970,6 +981,76 @@ func (o *pgCutover) Swap(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// PauseSources flips default_transaction_read_only on every source primary,
+// so a router that has not yet seen the fence cannot commit to one while
+// the swap decides the targets are caught up. Reads, and the replication
+// the swap itself depends on, are unaffected.
+//
+// Pausing is confirmed on a fresh backend: the reload is asynchronous, and
+// a pause that is not yet in force is the same as no pause at all.
+func (o *pgCutover) PauseSources(ctx context.Context, pause bool) error {
+	stmt := `ALTER SYSTEM RESET default_transaction_read_only`
+	if pause {
+		stmt = `ALTER SYSTEM SET default_transaction_read_only = on`
+	}
+	for _, s := range o.srcIDs {
+		if err := o.setSourceReadOnly(ctx, s, stmt, pause); err != nil {
+			return fmt.Errorf("write pause on %s/%d: %w", o.srcSet, s, err)
+		}
+	}
+	return nil
+}
+
+func (o *pgCutover) setSourceReadOnly(ctx context.Context, s int32, stmt string, pause bool) error {
+	conn, err := o.c.Shards.Dial(ctx, o.srcSet, s)
+	if err != nil {
+		return err
+	}
+	// ALTER SYSTEM cannot run inside a transaction block, so it and the
+	// reload go as separate statements.
+	_, err = conn.Exec(ctx, stmt)
+	if err == nil {
+		_, err = conn.Exec(ctx, `SELECT pg_reload_conf()`)
+	}
+	_ = conn.Close(ctx)
+	if err != nil || !pause {
+		return err
+	}
+	deadline := o.c.now().Add(pauseConfirmTimeout)
+	for {
+		on, err := o.sourceRefusesWrites(ctx, s)
+		if err != nil {
+			return err
+		}
+		if on {
+			return nil
+		}
+		if o.c.now().After(deadline) {
+			return fmt.Errorf("did not start refusing writes within %s", pauseConfirmTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+// sourceRefusesWrites asks a backend started after the reload, since an
+// existing one may have been running before the setting changed.
+func (o *pgCutover) sourceRefusesWrites(ctx context.Context, s int32) (bool, error) {
+	conn, err := o.c.Shards.Dial(ctx, o.srcSet, s)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	rows, err := conn.Query(ctx, `SELECT current_setting('default_transaction_read_only') = 'on'`)
+	if err != nil {
+		return false, err
+	}
+	return pgx.CollectExactlyOneRow(rows, pgx.RowTo[bool])
 }
 
 // alterSubscriptions applies verb to the subscriptions matching pattern

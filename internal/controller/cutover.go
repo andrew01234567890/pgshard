@@ -199,7 +199,18 @@ type cutoverOps interface {
 	// Flip publishes the new map in one catalog transaction.
 	Flip(ctx context.Context, journalID string) error
 	// Swap disables forward and enables reverse replication.
-	Swap(ctx context.Context) error
+	// PauseSources stops the sources accepting new writing transactions,
+	// and lets them again. The swap's last catch-up check and the
+	// disabling of the forward subscriptions have to happen with nothing
+	// able to arrive in between, or a write acknowledged in that gap is
+	// left on a source nothing replicates from any more.
+	PauseSources(ctx context.Context, pause bool) error
+	// DisableForward stops the forward subscriptions; EnableReverse starts
+	// the reverse ones. They were one step, which meant the sources had to
+	// be writable again before the reverse apply could run and could not
+	// stay paused across the disable.
+	DisableForward(ctx context.Context) error
+	EnableReverse(ctx context.Context) error
 	// Release drops the range fence.
 	Release(ctx context.Context) error
 	// Complete drops every replication object of the run.
@@ -510,18 +521,37 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 		// are disabled the targets must have applied everything the (now
 		// fenced and retired) sources wrote, or a last write acked on a
 		// source would be dropped.
+		//
+		// Checking and then disabling is not enough on its own: the check
+		// speaks for the position it sampled, and a router that has not
+		// yet reloaded its snapshot can still commit to a source in the
+		// gap. So the sources stop accepting writing transactions first,
+		// and only start again once the forward subscriptions are off --
+		// which is also why enabling the reverse ones is a separate step,
+		// since their apply workers need the sources writable.
+		if err := ops.PauseSources(ctx, true); err != nil {
+			return false, err
+		}
 		pos, err := ops.Positions(ctx)
 		if err != nil {
-			return false, err
+			return false, errors.Join(err, ops.PauseSources(ctx, false))
 		}
 		ok, why, err := ops.CaughtUp(ctx, pos)
 		if err != nil {
-			return false, err
+			return false, errors.Join(err, ops.PauseSources(ctx, false))
 		}
 		if !ok {
-			return true, retryf("%s", why)
+			// Left writable between attempts: a workflow that stops here
+			// must not leave the sources refusing writes for good.
+			return true, errors.Join(retryf("%s", why), ops.PauseSources(ctx, false))
 		}
-		if err := ops.Swap(ctx); err != nil {
+		if err := ops.DisableForward(ctx); err != nil {
+			return false, errors.Join(err, ops.PauseSources(ctx, false))
+		}
+		if err := ops.PauseSources(ctx, false); err != nil {
+			return false, err
+		}
+		if err := ops.EnableReverse(ctx); err != nil {
 			return false, err
 		}
 	case StepRelease:
