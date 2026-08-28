@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgerrcode"
@@ -68,6 +69,14 @@ type Resolver struct {
 	Logger *slog.Logger
 	// PreparingTimeout overrides DefaultPreparingTimeout.
 	PreparingTimeout time.Duration
+	// SweepInterval is how often the whole topology is searched for
+	// prepared transactions no decision row names. That sweep is a safety
+	// net for a coordinator that died between preparing and recording, so
+	// it does not have to run as often as the resolver looks at the
+	// decisions it does know about. Zero means DefaultSweepInterval.
+	SweepInterval time.Duration
+	// lastSweep is when the whole topology was last searched.
+	lastSweep time.Time
 	// Now overrides the clock in tests.
 	Now func() time.Time
 	// Metrics counts resolved transactions; nil disables it.
@@ -112,11 +121,27 @@ func (r *Resolver) Resolve(ctx context.Context, shardSet string) (Outcome, error
 	if err != nil {
 		return out, fmt.Errorf("resolver: decisions: %w", err)
 	}
+	// A healthy cluster deletes each decision row as the 2PC completes, so
+	// at rest there is nothing to resolve -- and searching every shard for
+	// prepared transactions anyway costs a dial and a query per shard, per
+	// pass, forever. With nothing in doubt the only reason to look is the
+	// orphan sweep, which is a safety net for a coordinator that died
+	// between preparing and recording, and does not need the resolver's
+	// cadence. When there is something in doubt the search is unchanged:
+	// a decision may only be deleted once the whole topology was seen, and
+	// making that wait for a sweep would put a minute between a commit and
+	// its resolution.
+	if len(decisions) == 0 && !r.sweepDue() {
+		return out, nil
+	}
 	shards, err := r.listShards(ctx, shardSet)
 	if err != nil {
 		return out, err
 	}
 	holders, scanErrs := r.scanPrepared(ctx, shards)
+	if shardSet == "" {
+		r.lastSweep = r.now()
+	}
 	// A decision may only be deleted once every shard of the whole current
 	// topology was searched: a participant can sit on a group its shard id
 	// no longer maps to after a reshard.
@@ -138,24 +163,66 @@ func (r *Resolver) Resolve(ctx context.Context, shardSet string) (Outcome, error
 	return out, nil
 }
 
+// DefaultSweepInterval is how often the whole topology is searched for
+// prepared transactions no decision row names.
+const DefaultSweepInterval = time.Minute
+
+func (r *Resolver) sweepDue() bool {
+	every := r.SweepInterval
+	if every == 0 {
+		every = DefaultSweepInterval
+	}
+	return !r.now().Before(r.lastSweep.Add(every))
+}
+
 // scanPrepared searches every shard's pg_prepared_xacts for
 // router-coordinated gids and returns where each is held, with the scan
 // errors per unreachable shard.
 func (r *Resolver) scanPrepared(ctx context.Context, shards []ShardRef) (map[string][]holder, map[ShardRef]error) {
+	// Serially, a pass costs one round trip per shard in sequence, so at a
+	// few hundred shards it no longer fits in the interval it runs on and
+	// the resolver never idles. The shards are independent, so the pass
+	// takes as long as the slowest one rather than the sum.
+	type result struct {
+		shard ShardRef
+		gids  map[string]string
+		err   error
+	}
+	results := make([]result, len(shards))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, scanConcurrency)
+	for i, sh := range shards {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			gids, err := r.listPrepared(ctx, sh)
+			results[i] = result{shard: sh, gids: gids, err: err}
+		}()
+	}
+	wg.Wait()
+
 	holders := map[string][]holder{}
 	scanErrs := map[ShardRef]error{}
-	for _, sh := range shards {
-		gids, err := r.listPrepared(ctx, sh)
-		if err != nil {
-			scanErrs[sh] = err
+	// Collected in topology order, so a gid held on several shards lists
+	// them the same way on every pass.
+	for _, res := range results {
+		if res.err != nil {
+			scanErrs[res.shard] = res.err
 			continue
 		}
-		for gid, db := range gids {
-			holders[gid] = append(holders[gid], holder{Shard: sh, Database: db})
+		for gid, db := range res.gids {
+			holders[gid] = append(holders[gid], holder{Shard: res.shard, Database: db})
 		}
 	}
 	return holders, scanErrs
 }
+
+// scanConcurrency bounds the prepared-transaction scan: enough to stop the
+// pass being a sum of round trips, few enough not to open a connection to
+// every shard of a large topology at once.
+const scanConcurrency = 16
 
 // listPrepared reads sh's pg_prepared_xacts: gid to database. The view is
 // cluster-wide, so one connection sees every database's entries.
