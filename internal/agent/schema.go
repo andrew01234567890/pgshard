@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
-	"strings"
 
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/schemacopy"
 )
@@ -22,7 +22,7 @@ func (s *Server) MaterializeSchema(ctx context.Context, req *pgshardv1.Materiali
 // psql against the local database. The source password must be resolvable
 // through the conninfo or the agent's pgpass file.
 func (in *Instance) MaterializeSchema(ctx context.Context, source, database string) error {
-	if database == "" || strings.ContainsAny(database, "'\\ ") {
+	if err := catalog.CheckDatabaseName(database); err != nil {
 		return fmt.Errorf("invalid database name %q", database)
 	}
 	local := fmt.Sprintf("host=/tmp port=%d user=postgres dbname=%s", in.cfg.Port, database)
