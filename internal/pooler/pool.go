@@ -62,6 +62,13 @@ type Pool struct {
 	sems    map[string]chan struct{}
 	closed  bool
 	changed chan struct{}
+	// waiters counts acquirers parked on changed. A release with nobody to
+	// wake skips the broadcast, and the channel allocation it needs. Every
+	// waiter registers under mu before it looks at the resource it wants,
+	// so a release that sees none cannot be racing one that is about to
+	// park: it would have to take mu to do so, and would then find the
+	// resource already there.
+	waiters int
 }
 
 // poolKey identifies one backend pool: backends are only interchangeable
@@ -191,22 +198,46 @@ func (p *Pool) acquireTotal(ctx context.Context) error {
 		}
 		p.mu.Lock()
 		changed := p.changed
+		p.waiters++
 		p.mu.Unlock()
-		select {
-		case p.total <- struct{}{}:
-			return nil
-		case <-changed:
-		case <-ctx.Done():
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return ErrBudgetExhausted
+		err := func() error {
+			defer p.unwait()
+			select {
+			case p.total <- struct{}{}:
+				return errGotSlot
+			case <-changed:
+				return nil
+			case <-ctx.Done():
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					return ErrBudgetExhausted
+				}
+				return ctx.Err()
 			}
-			return ctx.Err()
+		}()
+		if errors.Is(err, errGotSlot) {
+			return nil
+		}
+		if err != nil {
+			return err
 		}
 	}
 }
 
+// unwait deregisters a parked acquirer.
+func (p *Pool) unwait() {
+	p.mu.Lock()
+	p.waiters--
+	p.mu.Unlock()
+}
+
+// errGotSlot marks the budget slot having been taken inside the wait.
+var errGotSlot = errors.New("slot acquired")
+
 // notify wakes acquirers waiting for the budget; call with mu held.
 func (p *Pool) notify() {
+	if p.waiters == 0 {
+		return
+	}
 	close(p.changed)
 	p.changed = make(chan struct{})
 }
@@ -273,22 +304,35 @@ func (p *Pool) awaitSlot(ctx context.Context, rp *rolePool, digest [32]byte) (*B
 		p.mu.Lock()
 		changed := p.changed
 		closed := p.closed
+		p.waiters++
 		p.mu.Unlock()
 		if closed {
+			p.unwait()
 			return nil, ErrPoolClosed
 		}
 		if b := p.popIdle(rp, digest); b != nil {
+			p.unwait()
 			return b, nil
 		}
-		select {
-		case rp.sem <- struct{}{}:
-			return nil, nil
-		case <-changed:
-		case <-ctx.Done():
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return nil, ErrBudgetExhausted
+		got, err := func() (bool, error) {
+			defer p.unwait()
+			select {
+			case rp.sem <- struct{}{}:
+				return true, nil
+			case <-changed:
+				return false, nil
+			case <-ctx.Done():
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					return false, ErrBudgetExhausted
+				}
+				return false, ctx.Err()
 			}
-			return nil, ctx.Err()
+		}()
+		if err != nil {
+			return nil, err
+		}
+		if got {
+			return nil, nil
 		}
 	}
 }
