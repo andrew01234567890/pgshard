@@ -189,6 +189,55 @@ func psql(ctx context.Context, c *e2e.Cluster, host, db, sql string) (string, er
 	return strings.TrimSpace(out), err
 }
 
+// ledgerRole is the login the workload writes as. The workload has to go
+// through the router: the router is what knows a cutover happened, buffers
+// across the flip and sends the next statement to the new serving set. A
+// connection straight to a group's -rw Service keeps writing to whichever
+// PostgreSQL it dialled, including one the switch has already retired, and
+// those writes are acknowledged by a primary nothing replicates from any
+// more. The reshard suite has always written through the router; this one
+// did not, and that -- not the upgrade -- is what its ledger oracle was
+// reporting as lost writes.
+const (
+	ledgerRole     = "ledger_writer"
+	ledgerPassword = "ledger-writer-password"
+)
+
+// routerSQL runs one statement against the app database through the router.
+func routerSQL(ctx context.Context, c *e2e.Cluster, sql string) (string, error) {
+	out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "exec", clientPod, "--",
+		"env", "PGPASSWORD="+ledgerPassword,
+		"psql", "-h", clusterName+"-router", "-U", ledgerRole, "-d", appDatabase,
+		"-v", "ON_ERROR_STOP=1", "-v", "VERBOSITY=verbose", "-tAc", sql)
+	return strings.TrimSpace(out), err
+}
+
+// registerLedgerRole gives the workload a role the router will accept. The
+// verifier has to come from PostgreSQL, which has no function to derive
+// one, so the role is created on the catalog to have its rolpassword read
+// back and registered as desired state for the applier to fan out to every
+// group, including the upgrade targets provisioned later.
+func registerLedgerRole(ctx context.Context, t *testing.T, c *e2e.Cluster) {
+	t.Helper()
+	if _, err := psql(ctx, c, clusterName+"-catalog-rw", "postgres",
+		"SET password_encryption = 'scram-sha-256'; CREATE ROLE "+ledgerRole+" LOGIN PASSWORD '"+ledgerPassword+"'"); err != nil {
+		t.Fatal(err)
+	}
+	verifier, err := psql(ctx, c, clusterName+"-catalog-rw", "postgres",
+		"SELECT rolpassword FROM pg_authid WHERE rolname = '"+ledgerRole+"'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(verifier, "SCRAM-SHA-256$") {
+		t.Fatalf("verifier for %s is not SCRAM: %q", ledgerRole, verifier)
+	}
+	catalogSQL(ctx, t, c, "INSERT INTO pgshard.roles (rolname, verifier, login) VALUES ('"+ledgerRole+"', '"+verifier+"', true)")
+	catalogSQL(ctx, t, c, "INSERT INTO pgshard.grants (rolname, database, object_kind, object_schema, object_name, privileges) VALUES "+
+		"('"+ledgerRole+"', '"+appDatabase+"', 'database', '', '"+appDatabase+"', ARRAY['CONNECT']), "+
+		"('"+ledgerRole+"', '"+appDatabase+"', 'schema', '', 'public', ARRAY['USAGE']), "+
+		"('"+ledgerRole+"', '"+appDatabase+"', 'table', 'public', 'ledger', ARRAY['SELECT','INSERT'])")
+}
+
 func catalogSQL(ctx context.Context, t *testing.T, c *e2e.Cluster, sql string) string {
 	t.Helper()
 	out, err := psql(ctx, c, clusterName+"-catalog-rw", "postgres", sql)
@@ -287,8 +336,13 @@ func servingShardGroup(ctx context.Context, c *e2e.Cluster) string {
 // through fences and failovers. Every acknowledged id must survive the
 // upgrade exactly once.
 type ledger struct {
-	c       *e2e.Cluster
-	acked   atomic.Int64
+	c     *e2e.Cluster
+	acked atomic.Int64
+	mu    sync.Mutex
+	// lastErr is why the writer is not acknowledging anything. Without it
+	// a wait for the first write times out saying only that none arrived,
+	// which is the one thing the test already knew.
+	lastErr string
 	retries atomic.Int64
 	stopped chan struct{}
 	stop    context.CancelFunc
@@ -305,15 +359,25 @@ func startLedger(ctx context.Context, t *testing.T, c *e2e.Cluster) *ledger {
 		defer close(l.stopped)
 		next := int64(1)
 		for lctx.Err() == nil {
-			group := servingShardGroup(lctx, c)
-			if group == "" {
-				time.Sleep(time.Second)
-				continue
-			}
+			// The router decides which set the write lands on, so the
+			// writer does not need to know and must not choose.
 			hi := next + 24
-			sql := fmt.Sprintf(`INSERT INTO ledger (id, tenant_id, amount) SELECT g, 4242, 1 FROM generate_series(%d, %d) g ON CONFLICT DO NOTHING`, next, hi)
-			if _, err := psql(lctx, c, clusterName+"-"+group+"-rw", appDatabase, sql); err != nil {
+			// An explicit VALUES list rather than INSERT ... SELECT: the
+			// router routes an insert by its shard key, and the key has to
+			// be readable from the statement.
+			var rows strings.Builder
+			for id := next; id <= hi; id++ {
+				if id > next {
+					rows.WriteString(", ")
+				}
+				fmt.Fprintf(&rows, "(%d, 4242, 1)", id)
+			}
+			sql := "INSERT INTO ledger (id, tenant_id, amount) VALUES " + rows.String() + " ON CONFLICT DO NOTHING"
+			if _, err := routerSQL(lctx, c, sql); err != nil {
 				l.retries.Add(1)
+				l.mu.Lock()
+				l.lastErr = err.Error()
+				l.mu.Unlock()
 				time.Sleep(2 * time.Second)
 				continue
 			}
@@ -323,6 +387,16 @@ func startLedger(ctx context.Context, t *testing.T, c *e2e.Cluster) *ledger {
 		}
 	}()
 	return l
+}
+
+// why is the writer's last refusal, for a wait that is not seeing writes.
+func (l *ledger) why() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.lastErr == "" {
+		return "\nwriter: no error recorded yet"
+	}
+	return "\nwriter: " + l.lastErr
 }
 
 // finish stops the writer and returns the highest acknowledged id.
@@ -499,6 +573,11 @@ func bringUpCluster(ctx context.Context, t *testing.T, c *e2e.Cluster, retire st
 	}
 	waitFor(ctx, t, c, "serving shard set stamped major 18", 3*time.Minute, func() bool {
 		return catalogSQL(ctx, t, c, "SELECT coalesce(max(pg_major), 0) FROM pgshard.shard_sets WHERE state = 'serving'") == "18"
+	})
+	registerLedgerRole(ctx, t, c)
+	waitFor(ctx, t, c, "the workload role on every group", 3*time.Minute, func() bool {
+		out, err := routerSQL(ctx, c, "SELECT 1")
+		return err == nil && out == "1"
 	})
 }
 
