@@ -485,3 +485,40 @@ func TestStepAgeIsAbsentBeforeAnyStep(t *testing.T) {
 		t.Fatalf("unstamped state reported %q", got)
 	}
 }
+
+// TestCaughtUpIsNeverVacuouslyTrue: the check asked whether every forward
+// slot had confirmed a flush at or past its source's position, and
+// answered "yes" whenever there was nothing to ask -- no sources, no
+// targets, or a source whose position the map did not carry, where the
+// lookup yields zero and every slot is at or past zero. Each of those
+// lets a switch proceed onto a target that never received the rows, which
+// is how an upgrade completed with a quarter of the acknowledged writes on
+// the group it retired.
+func TestCaughtUpIsNeverVacuouslyTrue(t *testing.T) {
+	for _, c := range []struct {
+		name              string
+		srcIDs, targetIDs []int32
+		positions         map[string]int64
+		want              string
+	}{
+		{"no sources", nil, []int32{0}, map[string]int64{"0": 100}, "no source shards"},
+		{"no targets", []int32{0}, nil, map[string]int64{"0": 100}, "no target shards"},
+		{"position missing", []int32{0}, []int32{1}, map[string]int64{}, "0 has no recorded source position"},
+		{"position for another shard", []int32{0}, []int32{1}, map[string]int64{"7": 100}, "0 has no recorded source position"},
+		{"position zero", []int32{0}, []int32{1}, map[string]int64{"0": 0}, "0 has no recorded source position"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := nothingToCompare("default", c.srcIDs, c.targetIDs, c.positions)
+			if len(got) == 0 {
+				t.Fatalf("comparing nothing must not read as caught up")
+			}
+			if !strings.Contains(strings.Join(got, "; "), c.want) {
+				t.Fatalf("refusals %v, want one mentioning %q", got, c.want)
+			}
+		})
+	}
+	// A question with content is left to the slot comparison.
+	if got := nothingToCompare("default", []int32{0, 1}, []int32{2}, map[string]int64{"0": 10, "1": 20}); len(got) != 0 {
+		t.Fatalf("a complete question must not be refused: %v", got)
+	}
+}

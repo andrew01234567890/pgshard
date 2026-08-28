@@ -439,6 +439,11 @@ func (l *ledger) explain(ctx context.Context, t *testing.T, group string, acked 
 		b.WriteString("replication while the switch was running:\n" + replicationSample)
 	}
 	b.WriteString("workflow: " + upgradeWorkflowDetail(ctx, t, l.c))
+	// The cutover record says which positions the switch compared against
+	// and how it got to the flip, which is the other half of any answer
+	// about a target that was let through behind.
+	fmt.Fprintf(&b, "\ncutover: %s\n", catalogSQL(ctx, t, l.c,
+		"SELECT coalesce(jsonb_pretty(status->'cutover'), '-') FROM pgshard.workflows WHERE kind = 'upgrade' ORDER BY updated_at DESC LIMIT 1"))
 	return b.String()
 }
 

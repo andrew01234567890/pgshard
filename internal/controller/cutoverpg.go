@@ -291,8 +291,12 @@ func (o *pgCutover) currentLSN(ctx context.Context, set string, id int32) (int64
 // in-memory pg_stat_subscription.latest_end_lsn) and still advances over
 // keepalives on an idle source.
 func (o *pgCutover) CaughtUp(ctx context.Context, positions map[string]int64) (bool, string, error) {
-	var behind []string
+	behind := nothingToCompare(o.srcSet, o.srcIDs, o.wf.ids, positions)
 	for _, s := range o.srcIDs {
+		want, ok := positions[fmt.Sprint(s)]
+		if !ok || want <= 0 {
+			continue
+		}
 		flushed, err := slotFlushPositions(ctx, o.c.Shards, o.srcSet, s,
 			fmt.Sprintf("pgshard\\_reshard\\_g%d\\_t%%\\_s%d", o.wf.gen, s))
 		if err != nil {
@@ -302,12 +306,34 @@ func (o *pgCutover) CaughtUp(ctx context.Context, positions map[string]int64) (b
 		for _, t := range o.wf.ids {
 			expected = append(expected, SubscriptionName(o.wf.gen, t, s))
 		}
-		behind = append(behind, slotsBehind(expected, flushed, positions[fmt.Sprint(s)], fmt.Sprintf("%s/%d", o.srcSet, s))...)
+		behind = append(behind, slotsBehind(expected, flushed, want, fmt.Sprintf("%s/%d", o.srcSet, s))...)
 	}
 	if len(behind) > 0 {
 		return false, "subscriptions behind the source position: " + strings.Join(behind, ", "), nil
 	}
 	return true, "", nil
+}
+
+// nothingToCompare reports the ways the caught-up question can have no
+// content: no sources, no targets, or a source with no recorded position.
+// Each of them made the check return "caught up" while comparing nothing,
+// which is how a switch proceeds onto a target that never received the
+// rows. A missing position is the sharpest of the three, because the map
+// lookup yields zero and every slot is at or past zero.
+func nothingToCompare(srcSet string, srcIDs, targetIDs []int32, positions map[string]int64) []string {
+	var out []string
+	if len(srcIDs) == 0 {
+		out = append(out, "no source shards to compare")
+	}
+	if len(targetIDs) == 0 {
+		out = append(out, "no target shards to compare")
+	}
+	for _, s := range srcIDs {
+		if want, ok := positions[fmt.Sprint(s)]; !ok || want <= 0 {
+			out = append(out, fmt.Sprintf("%s/%d has no recorded source position", srcSet, s))
+		}
+	}
+	return out
 }
 
 // slotsBehind lists the expected publisher slots that are missing,
