@@ -325,6 +325,9 @@ type ClusterReshardStatus struct {
 	// blue/green major upgrade; zero for a topology reshard.
 	// +optional
 	PGMajor int `json:"pgMajor,omitempty"`
+	// PGImage is the image the target groups were provisioned with.
+	// +optional
+	PGImage string `json:"pgImage,omitempty"`
 	// +optional
 	Phase string `json:"phase,omitempty"`
 	// RetiredShardSet, RetiredGeneration and RetiredShards describe the
@@ -333,9 +336,15 @@ type ClusterReshardStatus struct {
 	RetiredShardSet string `json:"retiredShardSet,omitempty"`
 	// +optional
 	RetiredGeneration int64 `json:"retiredGeneration,omitempty"`
-	// RetiredPGMajor is the major the retired groups still run.
+	// RetiredPGMajor is the major the retired groups still run, and
+	// RetiredPGImage the image they were built with. Both are captured at
+	// the switch: the retired set must keep running byte-identically
+	// through the rollback window, and after the switch the spec no longer
+	// describes it.
 	// +optional
 	RetiredPGMajor int `json:"retiredPGMajor,omitempty"`
+	// +optional
+	RetiredPGImage string `json:"retiredPGImage,omitempty"`
 	// +optional
 	RetiredShards int `json:"retiredShards,omitempty"`
 }
@@ -387,6 +396,15 @@ type PgShardClusterStatus struct {
 	// as stamped in the catalog; zero when the catalog predates upgrades.
 	// +optional
 	ServingPGMajor int `json:"servingPGMajor,omitempty"`
+	// ServingPGImage is the image those groups run, captured while the
+	// spec still described them. A cluster on a custom image that is
+	// upgraded has a spec naming the new major's image while the serving
+	// set is still on the old one, and deriving an old group's image from
+	// the current spec substitutes a public default -- which changes the
+	// member template, rolls the set the upgrade is copying from, and in
+	// an air-gapped registry cannot be pulled at all.
+	// +optional
+	ServingPGImage string `json:"servingPGImage,omitempty"`
 	// Reshard is the resharding run in flight, if any.
 	// +optional
 	Reshard *ClusterReshardStatus `json:"reshard,omitempty"`
@@ -394,6 +412,10 @@ type PgShardClusterStatus struct {
 	// 1, catalog-g<n> after a catalog major upgrade).
 	// +optional
 	CatalogGeneration int64 `json:"catalogGeneration,omitempty"`
+	// CatalogPGImage is the image the active catalog group was built with,
+	// captured while the spec still described it.
+	// +optional
+	CatalogPGImage string `json:"catalogPGImage,omitempty"`
 	// CatalogPGMajor is the PostgreSQL major the active catalog group
 	// runs, probed from the server; zero until first probed.
 	// +optional

@@ -81,6 +81,11 @@ func (r *ClusterReconciler) reconcileCatalogUpgrade(ctx context.Context, c *pgsh
 			c.Status.CatalogGeneration = 1
 		}
 	}
+	// Captured while the spec still describes this catalog group, so it
+	// survives a spec that moves on to the next major.
+	if c.Status.CatalogPGImage == "" || c.Status.CatalogPGMajor == c.Spec.PostgreSQL.Major {
+		c.Status.CatalogPGImage = Image(c)
+	}
 	up := c.Status.CatalogUpgrade
 	if up == nil {
 		if !CatalogUpgradeRequested(c) {

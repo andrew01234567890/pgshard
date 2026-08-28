@@ -285,7 +285,14 @@ spec:
                     - trace
                     type: string
                   objectStore:
-                    description: ObjectStoreSpec locates a backup repository.
+                    description: |-
+                      ObjectStoreSpec locates a backup repository.
+                      The fields each store variant needs are required here as well as at
+                      runtime, so an object that cannot work is refused when it is written
+                      rather than accepted and then reported invalid. The rules mirror
+                      backup.Settings.Validate; the credential ones account for the same
+                      defaulting it applies, where an unset credentialType means shared for
+                      s3 and azure and service for gcs.
                     properties:
                       bucket:
                         description: Bucket is the S3 or GCS bucket.
@@ -402,6 +409,26 @@ spec:
                     required:
                     - type
                     type: object
+                    x-kubernetes-validations:
+                    - message: an s3 store needs bucket, endpoint and region
+                      rule: self.type != 's3' || (has(self.bucket) && has(self.endpoint)
+                        && has(self.region))
+                    - message: s3 shared credentials need credentials.secretRef
+                      rule: self.type != 's3' || has(self.credentialType) && self.credentialType
+                        != 'shared' || has(self.credentials.secretRef)
+                    - message: an azure store needs container
+                      rule: self.type != 'azure' || has(self.container)
+                    - message: an azure store needs credentials.secretRef
+                      rule: self.type != 'azure' || has(self.credentials.secretRef)
+                    - message: a gcs store needs bucket
+                      rule: self.type != 'gcs' || has(self.bucket)
+                    - message: gcs service and token credentials need credentials.secretRef
+                      rule: self.type != 'gcs' || has(self.credentialType) && !(self.credentialType
+                        in ['service', 'token']) || has(self.credentials.secretRef)
+                    - message: an sftp store needs sftp.host and sftp.user
+                      rule: self.type != 'sftp' || has(self.sftp)
+                    - message: an sftp store needs credentials.secretRef
+                      rule: self.type != 'sftp' || has(self.credentials.secretRef)
                   processMax:
                     description: ProcessMax bounds pgBackRest parallelism per member.
                     minimum: 1

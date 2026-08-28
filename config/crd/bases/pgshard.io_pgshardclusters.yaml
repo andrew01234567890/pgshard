@@ -377,6 +377,11 @@ spec:
                   1, catalog-g<n> after a catalog major upgrade).
                 format: int64
                 type: integer
+              catalogPGImage:
+                description: |-
+                  CatalogPGImage is the image the active catalog group was built with,
+                  captured while the spec still described it.
+                type: string
               catalogPGMajor:
                 description: |-
                   CatalogPGMajor is the PostgreSQL major the active catalog group
@@ -553,6 +558,10 @@ spec:
                   name:
                     description: Name is the PgShardReshard object.
                     type: string
+                  pgImage:
+                    description: PGImage is the image the target groups were provisioned
+                      with.
+                    type: string
                   pgMajor:
                     description: |-
                       PGMajor is the PostgreSQL major of the pending set when the run is a
@@ -563,9 +572,15 @@ spec:
                   retiredGeneration:
                     format: int64
                     type: integer
+                  retiredPGImage:
+                    type: string
                   retiredPGMajor:
-                    description: RetiredPGMajor is the major the retired groups still
-                      run.
+                    description: |-
+                      RetiredPGMajor is the major the retired groups still run, and
+                      RetiredPGImage the image they were built with. Both are captured at
+                      the switch: the retired set must keep running byte-identically
+                      through the rollback window, and after the switch the spec no longer
+                      describes it.
                     type: integer
                   retiredShardSet:
                     description: |-
@@ -612,6 +627,16 @@ spec:
                   after).
                 format: int64
                 type: integer
+              servingPGImage:
+                description: |-
+                  ServingPGImage is the image those groups run, captured while the
+                  spec still described them. A cluster on a custom image that is
+                  upgraded has a spec naming the new major's image while the serving
+                  set is still on the old one, and deriving an old group's image from
+                  the current spec substitutes a public default -- which changes the
+                  member template, rolls the set the upgrade is copying from, and in
+                  an air-gapped registry cannot be pulled at all.
+                type: string
               servingPGMajor:
                 description: |-
                   ServingPGMajor is the PostgreSQL major the serving set's groups run,

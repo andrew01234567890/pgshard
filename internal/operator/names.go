@@ -93,6 +93,9 @@ type Group struct {
 	// Retired marks a source of a switched reshard, kept up only for
 	// reverse replication until the old groups are deleted.
 	Retired bool
+	// PGImage is the image this generation was built with, captured while
+	// the spec still described it. Empty means the spec still does.
+	PGImage string
 	// PGMajor is the PostgreSQL major the group's set runs; zero means the
 	// cluster spec's major.
 	PGMajor int
@@ -206,7 +209,7 @@ func TargetGroups(c *pgshardv1alpha1.PgShardCluster) []Group {
 	var out []Group
 	for i := 0; i < rs.Shards; i++ {
 		out = append(out, Group{Cluster: c.Name, Kind: "shard", ShardID: i, Replicas: shardReplicas(c), Storage: c.Spec.Storage,
-			Generation: rs.Generation, NonServing: true, PGMajor: rs.PGMajor})
+			Generation: rs.Generation, NonServing: true, PGMajor: rs.PGMajor, PGImage: rs.PGImage})
 	}
 	return out
 }
@@ -228,7 +231,7 @@ func RetiredGroups(c *pgshardv1alpha1.PgShardCluster) []Group {
 	var out []Group
 	for i := 0; i < rs.RetiredShards; i++ {
 		out = append(out, Group{Cluster: c.Name, Kind: "shard", ShardID: i, Replicas: shardReplicas(c), Storage: c.Spec.Storage,
-			Generation: rs.RetiredGeneration, Retired: true, PGMajor: rs.RetiredPGMajor})
+			Generation: rs.RetiredGeneration, Retired: true, PGMajor: rs.RetiredPGMajor, PGImage: rs.RetiredPGImage})
 	}
 	return out
 }
@@ -252,9 +255,10 @@ func Groups(c *pgshardv1alpha1.PgShardCluster) []Group {
 		catalogReplicas = 3
 	}
 	out := []Group{{Cluster: c.Name, Kind: "catalog", Replicas: catalogReplicas, Storage: c.Spec.Catalog.Storage,
-		Generation: CatalogGeneration(c), PGMajor: CatalogMajor(c)}}
+		Generation: CatalogGeneration(c), PGMajor: CatalogMajor(c), PGImage: c.Status.CatalogPGImage}}
 	for i := 0; i < shards; i++ {
-		out = append(out, Group{Cluster: c.Name, Kind: "shard", ShardID: i, Replicas: shardReplicas(c), Storage: c.Spec.Storage, Generation: gen, PGMajor: c.Status.ServingPGMajor})
+		out = append(out, Group{Cluster: c.Name, Kind: "shard", ShardID: i, Replicas: shardReplicas(c), Storage: c.Spec.Storage,
+			Generation: gen, PGMajor: c.Status.ServingPGMajor, PGImage: c.Status.ServingPGImage})
 	}
 	return out
 }
@@ -321,6 +325,7 @@ func catalogGroupAt(c *pgshardv1alpha1.PgShardCluster, gen int64, major int) Gro
 	base := Groups(c)[0]
 	base.Generation = gen
 	base.PGMajor = major
+	base.PGImage = generationImage(c, major)
 	return base
 }
 
@@ -355,6 +360,13 @@ func MajorFor(c *pgshardv1alpha1.PgShardCluster, g Group) int {
 // other major mid-upgrade.
 func ImageFor(c *pgshardv1alpha1.PgShardCluster, g Group) string {
 	if g.PGMajor != 0 && g.PGMajor != c.Spec.PostgreSQL.Major {
+		// The image this generation was built with, if it was captured
+		// while the spec still described it. Falling back to the public
+		// default for the major is a guess, and a wrong one for any
+		// cluster running an image of its own.
+		if g.PGImage != "" {
+			return g.PGImage
+		}
 		return fmt.Sprintf("%s:%d", DefaultImageRepository, g.PGMajor)
 	}
 	return Image(c)
