@@ -221,6 +221,49 @@ func waitForLedgerRole(ctx context.Context, t *testing.T, c *e2e.Cluster) {
 	})
 }
 
+// assertOnlyTheRouterAdmitsTheAppRole is the acceptance of the rule that a
+// shard's PostgreSQL port is the control plane's path and nothing else's.
+// The roles are materialised with their verifiers on every group, so before
+// pg_hba refused them over TCP a client that could reach a member could
+// pick a shard and write to it directly -- past shard-key routing, past the
+// write fence a cutover raises, and past the coordination that makes a
+// multi-shard write atomic. SCRAM proved who it was; nothing checked it had
+// come the right way.
+func assertOnlyTheRouterAdmitsTheAppRole(ctx context.Context, t *testing.T, c *e2e.Cluster) {
+	t.Helper()
+	out, err := shardSQLAs(ctx, c, "shard-0", ledgerRole, ledgerPassword, "SELECT 1")
+	if err == nil {
+		t.Errorf("%s connected straight to a shard and got %q", ledgerRole, out)
+	} else if !strings.Contains(err.Error(), "pg_hba.conf") {
+		t.Errorf("%s was refused, but not by pg_hba: %v", ledgerRole, err)
+	}
+	if _, err := shardSQLAs(ctx, c, "shard-0", ledgerRole, ledgerPassword,
+		"INSERT INTO ledger (id, tenant_id, amount) VALUES (-1, -1, -1)"); err == nil {
+		t.Errorf("%s wrote to a shard directly", ledgerRole)
+	}
+
+	// The same credential through the router, and the superuser path the
+	// control plane and replication use, both have to keep working: a rule
+	// that closed those would be a much larger outage than the hole. The
+	// routed writes are the workload's, which starts straight after this
+	// and is checked row by row -- a sentinel written here would have to be
+	// kept out of that count for no gain.
+	if out, err := routerSQL(ctx, c, "SELECT 1"); err != nil || out != "1" {
+		t.Errorf("%s through the router: %q %v", ledgerRole, out, err)
+	}
+	if out, err := shardSQL(ctx, c, "shard-0", "SELECT 1"); err != nil || out != "1" {
+		t.Errorf("superuser lost its path to a shard: %q %v", out, err)
+	}
+}
+
+// shardSQLAs is shardSQL as a chosen role rather than the superuser.
+func shardSQLAs(ctx context.Context, c *e2e.Cluster, group, role, password, sql string) (string, error) {
+	out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "exec", clientPod, "--",
+		"env", "PGPASSWORD="+password, "PGCONNECT_TIMEOUT=10",
+		"psql", "-h", clusterName+"-"+group+"-rw", "-U", role, "-d", appDatabase, "-v", "ON_ERROR_STOP=1", "-tAc", sql)
+	return strings.TrimSpace(out), err
+}
+
 func reshardTo(ctx context.Context, t *testing.T, c *e2e.Cluster, major string, shards int, generation int64) {
 	t.Helper()
 	if err := c.Apply(ctx, clusterManifestWithRetire(major, os.Getenv("PGSHARD_POSTGRES_IMAGE"), shards, "30s")); err != nil {
@@ -326,6 +369,7 @@ func reshardUnderLoad(t *testing.T, startShards int, steps []reshardStep) {
 	})
 
 	waitForLedgerRole(ctx, t, c)
+	assertOnlyTheRouterAdmitsTheAppRole(ctx, t, c)
 
 	l := startScaleLedger(ctx, c)
 	waitForWhy(ctx, t, c, "first acknowledged ledger writes", 3*time.Minute, l.why, func() bool {
