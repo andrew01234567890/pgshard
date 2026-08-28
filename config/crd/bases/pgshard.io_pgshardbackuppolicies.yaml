@@ -251,6 +251,188 @@ spec:
           status:
             description: PgShardBackupPolicyStatus is the observed state of a policy.
             properties:
+              accepted:
+                description: |-
+                  Accepted is the last spec that validated, and AcceptedGeneration the
+                  generation it came from. Members archive to this rather than to
+                  spec: an edit that does not validate must not reach the pods, and
+                  the alternative to keeping what was accepted is rolling every member
+                  onto no archive configuration at all.
+                properties:
+                  barrierSchedule:
+                    description: |-
+                      BarrierSchedule is a cron expression on which the operator asks each
+                      bound cluster's controller for a certified barrier: a cluster-wide
+                      restore point taken with writes paused and two-phase commits drained.
+                    type: string
+                  controllerEndpoint:
+                    description: |-
+                      ControllerEndpoint is the host:port of a cluster's Controller gRPC
+                      service, with {cluster} and {namespace} substituted; the default is
+                      {cluster}-controller.{namespace}.svc:15500.
+                    type: string
+                  logLevel:
+                    description: |-
+                      LogLevel is the pgBackRest log level (off, error, warn, info, detail,
+                      debug, trace).
+                    enum:
+                    - "off"
+                    - error
+                    - warn
+                    - info
+                    - detail
+                    - debug
+                    - trace
+                    type: string
+                  objectStore:
+                    description: ObjectStoreSpec locates a backup repository.
+                    properties:
+                      bucket:
+                        description: Bucket is the S3 or GCS bucket.
+                        type: string
+                      container:
+                        description: Container is the Azure blob container.
+                        type: string
+                      credentialType:
+                        description: |-
+                          CredentialType selects how pgBackRest authenticates:
+                          s3 shared|web-id|auto, azure shared|sas, gcs service|token|auto.
+                        enum:
+                        - shared
+                        - web-id
+                        - auto
+                        - sas
+                        - service
+                        - token
+                        type: string
+                      credentials:
+                        description: |-
+                          Credentials names the Secret whose keys hold the store credentials:
+                          s3 key/keySecret, azure account/key, gcs key.json, sftp privateKey.
+                        properties:
+                          secretRef:
+                            description: |-
+                              LocalObjectReference contains enough information to let you locate the
+                              referenced object inside the same namespace.
+                            properties:
+                              name:
+                                default: ""
+                                description: |-
+                                  Name of the referent.
+                                  This field is effectively required, but due to backwards compatibility is
+                                  allowed to be empty. Instances of this type with an empty value here are
+                                  almost certainly wrong.
+                                  More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                type: string
+                            type: object
+                            x-kubernetes-map-type: atomic
+                        type: object
+                      encryption:
+                        description: |-
+                          Encryption names the Secret whose passphrase key encrypts the
+                          repository with aes-256-cbc.
+                        properties:
+                          secretRef:
+                            description: |-
+                              LocalObjectReference contains enough information to let you locate the
+                              referenced object inside the same namespace.
+                            properties:
+                              name:
+                                default: ""
+                                description: |-
+                                  Name of the referent.
+                                  This field is effectively required, but due to backwards compatibility is
+                                  allowed to be empty. Instances of this type with an empty value here are
+                                  almost certainly wrong.
+                                  More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                type: string
+                            type: object
+                            x-kubernetes-map-type: atomic
+                        type: object
+                      endpoint:
+                        description: |-
+                          Endpoint overrides the store endpoint; an http:// or https:// URL or a
+                          host[:port].
+                        type: string
+                      prefix:
+                        description: Prefix is the path inside the store the repository
+                          lives under.
+                        type: string
+                      region:
+                        type: string
+                      sftp:
+                        description: SFTP holds the host settings of an sftp store.
+                        properties:
+                          host:
+                            type: string
+                          hostKeyCheck:
+                            enum:
+                            - strict
+                            - accept-new
+                            - fingerprint
+                            - none
+                            type: string
+                          port:
+                            type: integer
+                          user:
+                            type: string
+                        required:
+                        - host
+                        - user
+                        type: object
+                      type:
+                        enum:
+                        - s3
+                        - azure
+                        - gcs
+                        - posix
+                        - sftp
+                        type: string
+                      uriStyle:
+                        description: URIStyle is host or path addressing for S3 and
+                          Azure.
+                        enum:
+                        - host
+                        - path
+                        type: string
+                      verifyTLS:
+                        description: VerifyTLS defaults to true; false accepts self-signed
+                          store certificates.
+                        type: boolean
+                    required:
+                    - type
+                    type: object
+                  processMax:
+                    description: ProcessMax bounds pgBackRest parallelism per member.
+                    minimum: 1
+                    type: integer
+                  retention:
+                    description: BackupRetention counts backups to keep per type.
+                    properties:
+                      differential:
+                        minimum: 1
+                        type: integer
+                      full:
+                        minimum: 1
+                        type: integer
+                    type: object
+                  schedules:
+                    description: BackupSchedules holds cron expressions per backup
+                      type.
+                    properties:
+                      differential:
+                        type: string
+                      full:
+                        type: string
+                      incremental:
+                        type: string
+                    type: object
+                required:
+                - objectStore
+                type: object
+              acceptedGeneration:
+                format: int64
+                type: integer
               clusters:
                 description: |-
                   Clusters lists every cluster whose spec.backup.policyRef names this
