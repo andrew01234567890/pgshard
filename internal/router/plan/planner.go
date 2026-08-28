@@ -863,6 +863,19 @@ var aggregateNames = map[string]bool{
 	"regr_sxy": true, "regr_syy": true,
 }
 
+// hasStar reports whether the expression expands to an unknown number of
+// output columns.
+func hasStar(node *pgquerypb.Node) bool {
+	found := false
+	visit(node, func(n *pgquerypb.Node) bool {
+		if n.GetAStar() != nil {
+			found = true
+		}
+		return !found
+	})
+	return found
+}
+
 func hasAggregate(node *pgquerypb.Node) bool {
 	found := false
 	visit(node, func(n *pgquerypb.Node) bool {
