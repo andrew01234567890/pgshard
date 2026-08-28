@@ -66,6 +66,11 @@ type ParseResult struct {
 type Metrics interface {
 	CacheHit()
 	CacheMiss()
+	// CacheEvicted reports the running total of entries evicted, and
+	// CacheLiveBytes the heap the cache accounts for, after each parse
+	// the cache admitted.
+	CacheEvicted(total int)
+	CacheLiveBytes(n int)
 }
 
 // Options configure a Parser. Zero values take the Default* constants;
@@ -111,8 +116,10 @@ func New(opts Options) *Parser {
 
 type noMetrics struct{}
 
-func (noMetrics) CacheHit()  {}
-func (noMetrics) CacheMiss() {}
+func (noMetrics) CacheHit()            {}
+func (noMetrics) CacheMiss()           {}
+func (noMetrics) CacheEvicted(_ int)   {}
+func (noMetrics) CacheLiveBytes(_ int) {}
 
 // Parse parses sql, honouring ctx for cancellation and the configured limits.
 // Results may be shared between callers and must not be mutated.
@@ -142,6 +149,9 @@ func (p *Parser) Parse(ctx context.Context, sql string) (*ParseResult, error) {
 	}
 	if p.cache != nil {
 		p.cache.put(sql, res, astWeight(sql, res.Tree))
+		bytes, evicted := p.cache.stats()
+		p.metrics.CacheLiveBytes(bytes)
+		p.metrics.CacheEvicted(evicted)
 	}
 	return res, nil
 }
