@@ -130,7 +130,13 @@ func TestUpgrade18To19UnderLoad(t *testing.T) {
 	// The catalog group goes last: a new-major catalog group comes up, the
 	// pgshard database is copied over logical replication and the stable
 	// catalog Service is repointed without the routers' DSN changing.
-	waitFor(ctx, t, c, "catalog group on 19", 25*time.Minute, func() bool {
+	waitForWhy(ctx, t, c, "catalog group on 19", 25*time.Minute, func() string {
+		// The catalog upgrade records its stage, message and blockers, and
+		// a timeout that prints only the pod list says none of it -- the
+		// pods are Running whether the copy has stalled or never started.
+		return "\ncatalogUpgrade: " + jsonpath(ctx, c, "pgshardcluster", clusterName,
+			`{.status.catalogUpgrade.stage}: {.status.catalogUpgrade.message} blockers={.status.catalogUpgrade.blockers}`)
+	}, func() bool {
 		return jsonpath(ctx, c, "pgshardcluster", clusterName, "{.status.catalogPGMajor}") == "19"
 	})
 	if got, err := psql(ctx, c, clusterName+"-catalog-rw", "postgres", "SELECT current_setting('server_version_num')::int / 10000"); err != nil || got != "19" {
