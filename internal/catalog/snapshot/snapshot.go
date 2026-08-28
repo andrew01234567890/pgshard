@@ -85,6 +85,21 @@ type Placement struct {
 // silently making rewrites unsafe.
 const MaxAge = DefaultReloadInterval + 5*time.Second
 
+// Age is how long ago this view was read. A snapshot with no load time
+// (one built by hand, as tests and fixtures do) is ageless.
+func (s *Snapshot) Age(now time.Time) (time.Duration, bool) {
+	if s == nil || s.LoadedAt.IsZero() {
+		return 0, false
+	}
+	return now.Sub(s.LoadedAt), true
+}
+
+// Stale reports whether this view is too old to act on.
+func (s *Snapshot) Stale(now time.Time) bool {
+	age, ok := s.Age(now)
+	return ok && age > MaxAge
+}
+
 // Snapshot is an immutable view of the catalog taken in one transaction.
 // Role verifiers are loaded separately (see Loader.LoadRoles) and never
 // live in a Snapshot, so printing one can never leak credentials.

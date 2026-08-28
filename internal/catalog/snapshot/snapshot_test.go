@@ -6,6 +6,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 )
@@ -131,5 +132,41 @@ func TestMigratingConsidersServingSetOnly(t *testing.T) {
 	s.Serving[ShardKey{"g2", 0}] = Serving{}
 	if s.Migrating() {
 		t.Fatal("after the flip the retired set's fence is irrelevant")
+	}
+}
+
+// TestFreshnessIsBoundedByMaxAge: a watcher whose reloads fail keeps the
+// last snapshot it managed to read, so age is the only thing that tells a
+// current view from one that stopped being refreshed an hour ago.
+func TestFreshnessIsBoundedByMaxAge(t *testing.T) {
+	loaded := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	var w Watcher
+	if w.Fresh(loaded) {
+		t.Error("a watcher with no snapshot is not fresh")
+	}
+	if got := w.AgeSeconds(loaded); got != -1 {
+		t.Errorf("age with no snapshot = %v, want -1", got)
+	}
+	w.current.Store(&Snapshot{LoadedAt: loaded})
+	for _, c := range []struct {
+		at    time.Time
+		fresh bool
+	}{
+		{loaded, true},
+		{loaded.Add(MaxAge), true},
+		{loaded.Add(MaxAge + time.Millisecond), false},
+		{loaded.Add(time.Hour), false},
+	} {
+		if got := w.Fresh(c.at); got != c.fresh {
+			t.Errorf("fresh at %s = %v, want %v", c.at.Sub(loaded), got, c.fresh)
+		}
+	}
+	if got := w.AgeSeconds(loaded.Add(90 * time.Second)); got != 90 {
+		t.Errorf("age = %v, want 90", got)
+	}
+	// A snapshot built by hand carries no load time and is never stale, so
+	// tests and fixtures are not silently refused.
+	if (&Snapshot{}).Stale(loaded) {
+		t.Error("a snapshot with no load time must not be stale")
 	}
 }

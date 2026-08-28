@@ -19,11 +19,13 @@ type Router struct {
 	ScatterFanout    prometheus.Histogram
 	ShardLatency     *prometheus.HistogramVec
 	activeSessions   prometheus.GaugeFunc
+	snapshotAge      prometheus.GaugeFunc
 }
 
 // NewRouter registers the router metric set on reg. sessions reports the
-// live session count at scrape time.
-func NewRouter(reg *prometheus.Registry, sessions func() float64) *Router {
+// live session count and snapshotAge the age of the catalog view, both at
+// scrape time; snapshotAge may be nil where there is no watcher.
+func NewRouter(reg *prometheus.Registry, sessions, snapshotAge func() float64) *Router {
 	m := &Router{
 		Connections: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "pgshard_router_connections_total", Help: "Client sessions accepted."}),
@@ -59,9 +61,15 @@ func NewRouter(reg *prometheus.Registry, sessions func() float64) *Router {
 	}
 	m.activeSessions = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "pgshard_router_active_sessions", Help: "Live client sessions."}, sessions)
+	if snapshotAge == nil {
+		snapshotAge = func() float64 { return -1 }
+	}
+	m.snapshotAge = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "pgshard_router_snapshot_age_seconds",
+		Help: "Age of the catalog snapshot the router is serving; -1 before the first load."}, snapshotAge)
 	reg.MustRegister(m.Connections, m.Queries, m.PlanCacheHits, m.PlanCacheMiss, m.PlanCacheEvicted, m.PlanCacheBytes, m.Refusals,
 		m.TwoPCCommits, m.TwoPCAborts, m.TwoPCInDoubt, m.BufferEvents, m.BufferSeconds,
-		m.ScatterFanout, m.ShardLatency, m.activeSessions)
+		m.ScatterFanout, m.ShardLatency, m.activeSessions, m.snapshotAge)
 	return m
 }
 
@@ -87,8 +95,12 @@ type Pooler struct {
 }
 
 // NewPooler registers the pooler metric set on reg. live and idle report
-// backend counts at scrape time.
-func NewPooler(reg *prometheus.Registry, live, idle func() float64) *Pooler {
+// backend counts and snapshotAge the age of the catalog view, all at scrape
+// time; snapshotAge may be nil where there is no watcher.
+func NewPooler(reg *prometheus.Registry, live, idle, snapshotAge func() float64) *Pooler {
+	if snapshotAge == nil {
+		snapshotAge = func() float64 { return -1 }
+	}
 	m := &Pooler{
 		BackendDials: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "pgshard_pooler_backend_dials_total", Help: "Backend dial attempts, by result."}, []string{"result"}),
@@ -105,7 +117,10 @@ func NewPooler(reg *prometheus.Registry, live, idle func() float64) *Pooler {
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "pgshard_pooler_backends_live", Help: "Open backends."}, live),
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-			Name: "pgshard_pooler_backends_idle", Help: "Idle backends."}, idle))
+			Name: "pgshard_pooler_backends_idle", Help: "Idle backends."}, idle),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "pgshard_pooler_snapshot_age_seconds",
+			Help: "Age of the catalog snapshot the pooler fences from; -1 when it has none."}, snapshotAge))
 	return m
 }
 

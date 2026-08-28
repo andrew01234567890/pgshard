@@ -296,7 +296,10 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	drainer := router.NewDrainer(srv, *drainDelay, *drain)
 	// A router with no catalog snapshot stamps every request with generation
 	// zero and has each one refused, so it must not be sent traffic.
-	drainer.Routable = func() bool { return w.Current() != nil }
+	// A router whose reloads are failing keeps its last snapshot, so
+	// without the age it would stay in the Service advertising a view of
+	// the catalog it has already stopped planning against.
+	drainer.Routable = func() bool { return w.Fresh(time.Now()) }
 	if *healthListen != "" {
 		hl, err := net.Listen(listenNetwork(*healthListen), *healthListen)
 		if err != nil {

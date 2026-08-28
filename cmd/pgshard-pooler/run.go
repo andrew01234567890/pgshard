@@ -100,6 +100,7 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	dialer := pooler.Dialer{Address: addr, Timeout: 5 * time.Second, TLS: backendTLS}
 	base := pooler.View{Generation: *generation, Epoch: *epoch, Role: pgshardv1.HealthStatus_ROLE_PRIMARY, Serving: true}
 	var source pooler.Source = pooler.NewStaticSource(base)
+	snapshotAge := func() float64 { return -1 }
 	if *catalogDSN != "" {
 		w := snapshot.NewWatcher(*catalogDSN, snapshot.Options{Logf: func(f string, a ...any) { logger.Info(fmt.Sprintf(f, a...)) }})
 		go func() {
@@ -108,6 +109,7 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 			}
 		}()
 		source = &pooler.SnapshotSource{Watcher: w, Shard: snapshot.ShardKey{ShardSet: *shardSet, ShardID: int32(*shardID)}, Base: base}
+		snapshotAge = func() float64 { return w.AgeSeconds(time.Now()) }
 	}
 	reg := metrics.NewRegistry("pooler")
 	var pm *metrics.Pooler
@@ -116,7 +118,8 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	var pool *pooler.Pool
 	pm = metrics.NewPooler(reg,
 		func() float64 { live, _ := pool.Stats(); return float64(live) },
-		func() float64 { _, idle := pool.Stats(); return float64(idle) })
+		func() float64 { _, idle := pool.Stats(); return float64(idle) },
+		snapshotAge)
 	poolCfg.OnDial = func(err error) {
 		result := "ok"
 		if err != nil {
