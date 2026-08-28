@@ -226,6 +226,7 @@ func waitForWhy(ctx context.Context, t *testing.T, c *e2e.Cluster, what string, 
 			t.Logf("still waiting for %s (%s elapsed)", what, time.Since(started).Round(time.Second))
 			nextProgress = time.Now().Add(time.Minute)
 		}
+		sampleReplication(ctx, c)
 		select {
 		case <-ctx.Done():
 			t.Fatal(ctx.Err())
@@ -350,6 +351,53 @@ func (l *ledger) verify(ctx context.Context, t *testing.T, acked int64) {
 	}
 }
 
+// replicationSample is the last look at replication taken while the switch
+// was still running. The subscriptions and slots are dropped when the
+// upgrade completes, so a report gathered at the oracle -- which runs
+// after -- finds nothing, and the state that matters is the state at the
+// flip.
+var replicationSample string
+
+// nextSample rate-limits the sampling: three exec'd queries on every poll
+// of a three-second loop would slow the wait enough to change what it is
+// measuring.
+var nextSample time.Time
+
+// sampleReplication records how the target's subscriptions and the
+// source's slots looked at this moment, if it can reach them.
+func sampleReplication(ctx context.Context, c *e2e.Cluster) {
+	if time.Now().Before(nextSample) {
+		return
+	}
+	nextSample = time.Now().Add(15 * time.Second)
+	var b strings.Builder
+	for _, q := range []struct{ label, target, sql string }{
+		{"subscriptions on shard-0-g2", "shard-0-g2-rw",
+			`SELECT s.subname || ' enabled=' || s.subenabled || ' rels=' || coalesce(string_agg(r.srsubstate, ',' ORDER BY r.srsubstate), 'none')
+			   || ' applied=' || coalesce((SELECT max(latest_end_lsn)::text FROM pg_stat_subscription st WHERE st.subid = s.oid), '-')
+			   || ' last_msg=' || coalesce((SELECT max(last_msg_receipt_time)::text FROM pg_stat_subscription st WHERE st.subid = s.oid), '-')
+			 FROM pg_subscription s LEFT JOIN pg_subscription_rel r ON r.srsubid = s.oid
+			 GROUP BY s.oid, s.subname, s.subenabled ORDER BY 1`},
+		{"slots on shard-0", "shard-0-rw",
+			`SELECT slot_name || ' active=' || active || ' confirmed=' || coalesce(confirmed_flush_lsn::text, '-')
+			   || ' behind=' || coalesce(pg_size_pretty(pg_current_wal_lsn() - confirmed_flush_lsn), '-')
+			 FROM pg_replication_slots ORDER BY 1`},
+		{"walsenders on shard-0", "shard-0-rw",
+			`SELECT coalesce(application_name, '-') || ' state=' || state || ' sent=' || coalesce(sent_lsn::text, '-') || ' flush=' || coalesce(flush_lsn::text, '-') FROM pg_stat_replication ORDER BY 1`},
+	} {
+		out, err := psql(ctx, c, clusterName+"-"+q.target, appDatabase, q.sql)
+		if err != nil {
+			continue
+		}
+		if trimmed := strings.TrimSpace(out); trimmed != "" {
+			fmt.Fprintf(&b, "  %s: %s\n", q.label, strings.ReplaceAll(trimmed, "\n", " | "))
+		}
+	}
+	if b.Len() > 0 {
+		replicationSample = b.String()
+	}
+}
+
 // explain says which rows are missing and what replication looked like.
 // "1675 of 6275" does not distinguish a copy that never ran from a stream
 // that dropped rows, and those have different causes: a contiguous block
@@ -387,6 +435,9 @@ func (l *ledger) explain(ctx context.Context, t *testing.T, group string, acked 
 		 FROM pg_subscription s LEFT JOIN pg_subscription_rel r ON r.srsubid = s.oid GROUP BY s.subname, s.subenabled ORDER BY 1`)
 	ask("slots on "+other, other+"-rw", appDatabase,
 		`SELECT slot_name || ' active=' || active || ' confirmed=' || coalesce(confirmed_flush_lsn::text, '-') FROM pg_replication_slots ORDER BY 1`)
+	if replicationSample != "" {
+		b.WriteString("replication while the switch was running:\n" + replicationSample)
+	}
 	b.WriteString("workflow: " + upgradeWorkflowDetail(ctx, t, l.c))
 	return b.String()
 }
