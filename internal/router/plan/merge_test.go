@@ -31,7 +31,11 @@ func keys(m *Merge) string {
 		if k.NullsFirst {
 			nulls = "first"
 		}
-		parts[i] = fmt.Sprintf("%d:%s:%s", k.Column, dir, nulls)
+		pos := fmt.Sprint(k.Column)
+		if k.FromHidden {
+			pos = "h" + pos
+		}
+		parts[i] = fmt.Sprintf("%s:%s:%s", pos, dir, nulls)
 		if k.CCollation {
 			parts[i] += ":C"
 		}
@@ -53,11 +57,15 @@ func TestMergeSpecOrderByResolvesColumns(t *testing.T) {
 		{sql: "select id, lower(status) from orders order by lower(status)", keys: "1:asc:last"},
 		{sql: "select id, status from orders order by status collate \"C\"", keys: "1:asc:last:C"},
 		{sql: "select id, status collate \"C\" as s from orders order by s", keys: "1:asc:last:C"},
-		{sql: "select id from orders order by status", keys: "1:asc:last", hidden: 1,
+		{sql: "select id from orders order by status", keys: "h0:asc:last", hidden: 1,
 			shardSQL: "SELECT id, status AS __pgshard_sort_0 FROM orders ORDER BY status"},
-		{sql: "select * from orders order by created_at desc, id", keys: "1:desc:first,2:asc:last", hidden: 2,
+		{sql: "select * from orders order by created_at desc, id", keys: "h0:desc:first,h1:asc:last", hidden: 2,
 			shardSQL: "SELECT *, created_at AS __pgshard_sort_0, id AS __pgshard_sort_1 FROM orders ORDER BY created_at DESC, id"},
-		{sql: "select id from orders order by status collate \"C\" desc", keys: "1:desc:first:C", hidden: 1,
+		{sql: "select *, id from orders order by id", keys: "h0:asc:last", hidden: 1,
+			shardSQL: "SELECT *, id, id AS __pgshard_sort_0 FROM orders ORDER BY id"},
+		{sql: "select o.* from orders o order by status", keys: "h0:asc:last", hidden: 1,
+			shardSQL: "SELECT o.*, status AS __pgshard_sort_0 FROM orders o ORDER BY status"},
+		{sql: "select id from orders order by status collate \"C\" desc", keys: "h0:desc:first:C", hidden: 1,
 			shardSQL: "SELECT id, status COLLATE \"C\" AS __pgshard_sort_0 FROM orders ORDER BY status COLLATE \"C\" DESC"},
 	}
 	for _, c := range cases {
@@ -197,4 +205,41 @@ func TestMergeSpecOnMultiShardInPlans(t *testing.T) {
 	if _, err := pl.MultiShard(); err != nil {
 		t.Fatalf("single-shard reads carry a merge spec too: %v", err)
 	}
+}
+
+// TestMergeSortKeysIndexTheShardRowNotTheSelectList: sort keys were
+// positions in the parsed select list, which a star makes unrelated to the
+// row the shard returns -- SELECT * ... ORDER BY merged on whichever column
+// happened to sit at that index.
+func TestMergeSortKeysIndexTheShardRowNotTheSelectList(t *testing.T) {
+	// width is what the shard's RowDescription reports, with orders
+	// standing at four columns; the planner never sees it.
+	cases := []struct {
+		sql   string
+		width int
+		want  []int
+	}{
+		{sql: "select * from orders order by created_at desc, id", width: 6, want: []int{4, 5}},
+		{sql: "select *, id from orders order by id", width: 6, want: []int{5}},
+		{sql: "select id, status from orders order by status", width: 2, want: []int{1}},
+		{sql: "select id from orders order by status", width: 2, want: []int{1}},
+	}
+	for _, c := range cases {
+		m := mergeOf(t, c.sql)
+		width := c.width
+		for i, k := range m.OrderBy {
+			got := k.Index(width, m.Hidden)
+			if got != c.want[i] {
+				t.Errorf("%s: key %d lands on column %d of a %d column row, want %d", c.sql, i, got, width, c.want[i])
+			}
+			if got < 0 || got >= width {
+				t.Errorf("%s: key %d is outside the row", c.sql, i)
+			}
+		}
+	}
+}
+
+func TestMergeRefusesOrderByPositionWithAStar(t *testing.T) {
+	pl, err := New().Plan(context.Background(), session(fixture(t)), "select * from orders order by 2")
+	checkRefusal(t, pl, err, "multi-shard ORDER BY by position with * in the select list is not available yet", "0A000")
 }
