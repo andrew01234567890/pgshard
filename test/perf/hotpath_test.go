@@ -280,3 +280,21 @@ func BenchmarkGRPCPoolerHop(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkParserCacheMiss is an uncached parse through Parser.Parse, the
+// entry the router actually calls. BenchmarkParseUncached above calls the
+// package-level Parse directly and so measures the parser alone, missing
+// the cache bookkeeping and the context handling around it.
+func BenchmarkParserCacheMiss(b *testing.B) {
+	p := pgparser.New(pgparser.Options{CacheEntries: 4096, CacheBytes: 32 << 20})
+	ctx := context.Background()
+	b.ReportAllocs()
+	i := 0
+	for b.Loop() {
+		i++
+		sql := fmt.Sprintf("SELECT abalance FROM pgbench_accounts WHERE aid = %d", i)
+		if _, err := p.Parse(ctx, sql); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
