@@ -498,12 +498,22 @@ func TestReshardProvisionsTargetsAndCancels(t *testing.T) {
 			t.Errorf("target group %s: %q", g, got)
 		}
 	}
+	// Any phase from provisioning onwards. Requiring one of two of them
+	// meant the wait had to catch the workflow inside a phase it passes
+	// through: on a fast run it reached Verifying between two three-second
+	// polls and the condition could never hold again, so the wait spent
+	// its full fifteen minutes. That is why this failed on quick runs and
+	// passed on slow ones, which reads like a flake and is not one.
+	// Not Switching: the assertion below reads the targets' serving_state
+	// as provisioning, and the switch is what changes it. The run pauses
+	// before switchWrites anyway, so it cannot get that far here.
+	provisioned := map[string]bool{"Provisioning": true, "Copying": true, "Verifying": true}
 	waitForWhy(ctx, t, c, "targets Ready", 15*time.Minute, func() string {
 		return reshardRecordDetail(ctx, c, record)
 	}, func() bool {
 		phase := jsonpath(ctx, c, "pgshardreshard", record, "{.status.phase}")
 		ready := jsonpath(ctx, c, "pgshardreshard", record, `{.status.conditions[?(@.type=="TargetsReady")].status}`)
-		return ready == "True" && (phase == "Provisioning" || phase == "Copying")
+		return ready == "True" && provisioned[phase]
 	})
 	if n := count(ctx, t, c, "pods", sel); n != 2 {
 		t.Errorf("target pods: got %d want 2", n)

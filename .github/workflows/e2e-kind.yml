@@ -51,6 +51,7 @@ jobs:
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         if: matrix.suite != 'smoke'
       - name: Build PostgreSQL image
+        id: build_postgres
         if: matrix.suite != 'smoke'
         uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7.3.0
         with:
@@ -60,15 +61,18 @@ jobs:
         env:
           CI: "true"
       - name: Build operator and admin images
+        id: build_control
         if: matrix.suite != 'smoke'
         run: |
           docker build -f Dockerfile.control --build-arg CMD=pgshard-operator -t pgshard-operator:e2e .
           docker build -f Dockerfile.control --build-arg CMD=pgshard-admin -t pgshard-admin:e2e .
           docker build -f Dockerfile.router -t pgshard-router:e2e .
       - name: Build controller image
+        id: build_controller
         if: startsWith(matrix.suite, 'reshard') || matrix.suite == 'upgrade'
         run: docker build -f Dockerfile.control --build-arg CMD=pgshard-controller -t pgshard-controller:e2e .
       - name: Build the target-major PostgreSQL image
+        id: build_postgres_target
         if: matrix.suite == 'upgrade'
         uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7.3.0
         with:
@@ -78,17 +82,22 @@ jobs:
         env:
           CI: "true"
       - name: Create kind cluster
+        id: kind_up
         run: hack/kind/up.sh
       - name: Load images into kind
+        id: load_images
         if: matrix.suite != 'smoke'
         run: hack/kind/load-images.sh pgshard-operator:e2e pgshard-admin:e2e pgshard-router:e2e "ghcr.io/andrew01234567890/pgshard-postgres:${PG_MAJOR}"
       - name: Load controller image into kind
+        id: load_controller
         if: startsWith(matrix.suite, 'reshard') || matrix.suite == 'upgrade'
         run: hack/kind/load-images.sh pgshard-controller:e2e
       - name: Load the target-major image into kind
+        id: load_target
         if: matrix.suite == 'upgrade'
         run: hack/kind/load-images.sh "ghcr.io/andrew01234567890/pgshard-postgres:19"
       - name: Run e2e suite
+        id: run_suite
         run: |
           set -o pipefail
           mkdir -p "$E2E_ARTIFACTS"
@@ -108,6 +117,39 @@ jobs:
           OPERATOR_IMAGE: pgshard-operator:e2e
           ADMIN_IMAGE: pgshard-admin:e2e
           CONTROLLER_IMAGE: pgshard-controller:e2e
+      - name: Say whether the cell reached its tests
+        if: failure()
+        env:
+          SUITE: ${{ matrix.suite }}
+          PG: ${{ matrix.pg }}
+          SUITE_OUTCOME: ${{ steps.run_suite.outcome }}
+          SETUP_OUTCOMES: |
+            build PostgreSQL image=${{ steps.build_postgres.outcome }}
+            build operator and admin images=${{ steps.build_control.outcome }}
+            build controller image=${{ steps.build_controller.outcome }}
+            build the target-major PostgreSQL image=${{ steps.build_postgres_target.outcome }}
+            create kind cluster=${{ steps.kind_up.outcome }}
+            load images into kind=${{ steps.load_images.outcome }}
+            load controller image into kind=${{ steps.load_controller.outcome }}
+            load the target-major image into kind=${{ steps.load_target.outcome }}
+        # A cell that never reached its tests and one whose tests failed are
+        # different findings, and the gate reports both as a red cell. An
+        # image registry answering 403, or a module proxy dropping a stream,
+        # says nothing about the product; reading a run should not require
+        # opening the log to tell which happened.
+        run: |
+          set -uo pipefail
+          failed_setup=$(printf '%s\n' "$SETUP_OUTCOMES" | grep '=failure$' | sed 's/=failure$//' | paste -sd', ' -)
+          if [ -n "$failed_setup" ]; then
+            echo "::error title=e2e setup failed::$SUITE on pg$PG never reached its tests: $failed_setup"
+            echo "**e2e ($PG, $SUITE): setup failed** — never reached the tests: $failed_setup" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$SUITE_OUTCOME" = "failure" ]; then
+            echo "::error title=e2e tests failed::$SUITE on pg$PG ran its tests and they failed"
+            echo "**e2e ($PG, $SUITE): tests failed** — the suite ran and reported failures" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error title=e2e cell failed::$SUITE on pg$PG failed outside its setup and its tests"
+            echo "**e2e ($PG, $SUITE): failed outside setup and tests**" >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Collect cluster state on failure
         if: failure()
         run: |
