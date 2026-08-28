@@ -369,7 +369,15 @@ func TestCutoverSpecDefaults(t *testing.T) {
 	}
 }
 
-func TestCutoverFlipWaitsForLateSourceWrites(t *testing.T) {
+// TestCutoverFlipRecarriesSequencesThenFlipsAnyway: movement at the flip
+// sends the switch back to re-carry sequences, but only so many times. A
+// source is never obliged to stand still -- a checkpoint or an autovacuum
+// moves pg_current_wal_lsn with no user write behind it -- and after the
+// journal there is no timeout to end the wait, so requiring stillness is
+// requiring something the source may never do. A real 18-to-19 upgrade sat
+// in exactly this state for the whole 30-minute e2e budget, reporting
+// "sources advanced past the recorded positions before the flip".
+func TestCutoverFlipRecarriesSequencesThenFlipsAnyway(t *testing.T) {
 	h := newCutoverHarness(t)
 	h.runUntil(t, StageSwitching)
 	boom := errors.New("boom")
@@ -377,8 +385,10 @@ func TestCutoverFlipWaitsForLateSourceWrites(t *testing.T) {
 	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); !errors.Is(err, boom) {
 		t.Fatalf("err %v", err)
 	}
+	// The source never stops moving, not even between the journal and the
+	// flip.
 	h.ops.advance = 10
-	for i := 0; i < 3; i++ {
+	for i := range maxSeqRecarries {
 		_, err := h.c.cutover(context.Background(), h.wf, h.ops)
 		if err == nil || isFatal(err) {
 			t.Fatalf("pass %d: err %v", i, err)
@@ -388,13 +398,12 @@ func TestCutoverFlipWaitsForLateSourceWrites(t *testing.T) {
 		}
 	}
 	sequenceRuns := strings.Count(strings.Join(h.ops.calls, ","), StepSequences)
-	h.ops.advance = 0
 	h.runUntil(t, StageSwitched)
-	if h.wf.cutover.Positions["0"] != h.ops.lsn {
-		t.Fatalf("positions %v, source at %d", h.wf.cutover.Positions, h.ops.lsn)
-	}
 	if got := strings.Count(strings.Join(h.ops.calls, ","), StepSequences); got <= sequenceRuns {
 		t.Fatalf("sequences must be re-carried after the sources moved: %d runs before settling, %d after", sequenceRuns, got)
+	}
+	if h.wf.cutover.Recarries != maxSeqRecarries {
+		t.Fatalf("re-carries %d, want the bound %d", h.wf.cutover.Recarries, maxSeqRecarries)
 	}
 }
 
