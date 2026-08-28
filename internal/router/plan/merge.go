@@ -34,13 +34,28 @@ type Merge struct {
 
 // SortKey is one ORDER BY key over the shard rows.
 type SortKey struct {
-	// Column indexes the shard row (hidden columns included).
-	Column     int
+	// Column indexes the shard row (hidden columns included), or, when
+	// FromHidden is set, counts from the first hidden column instead.
+	Column int
+	// FromHidden marks a key carried by a column the router appended. A
+	// select list containing a star has a width the planner cannot know,
+	// so such keys are placed relative to the end of the row, where the
+	// appended columns always are.
+	FromHidden bool
 	Desc       bool
 	NullsFirst bool
 	// CCollation is set when the key carries an explicit COLLATE "C" or
 	// "POSIX"; text keys without it are refused at execution.
 	CCollation bool
+}
+
+// Index is the position of the key in a shard row of the given width that
+// carries hidden columns of the count the merge spec recorded.
+func (k SortKey) Index(width, hidden int) int {
+	if k.FromHidden {
+		return width - hidden + k.Column
+	}
+	return k.Column
 }
 
 // AggFunc is a distributive aggregate the router combines across shards.
@@ -317,6 +332,15 @@ func (b *mergeBuilder) limitValue(node *pgquerypb.Node, what string) (int64, err
 // hidden columns for expressions the select list does not carry.
 func (b *mergeBuilder) orderBy(distinct bool) error {
 	targets := b.sel.GetTargetList()
+	// A star expands to a width only the shard knows, so no position in
+	// the parsed select list is a position in the row that comes back.
+	star := false
+	for _, t := range targets {
+		if hasStar(t.GetResTarget().GetVal()) {
+			star = true
+			break
+		}
+	}
 	for i, sb := range b.sel.GetSortClause() {
 		sort := sb.GetSortBy()
 		if sort.GetSortbyDir() == pgquerypb.SortByDir_SORTBY_USING {
@@ -339,9 +363,18 @@ func (b *mergeBuilder) orderBy(distinct bool) error {
 			// name COLLATE "C" orders the existing name column.
 			match = cc.GetArg()
 		}
-		col, err := b.sortColumn(match, targets)
-		if err != nil {
-			return err
+		col := -1
+		if star {
+			if match.GetAConst() != nil {
+				return notYet("multi-shard ORDER BY by position with * in the select list is not available yet",
+					"order by the column name")
+			}
+		} else {
+			var err error
+			col, err = b.sortColumn(match, targets)
+			if err != nil {
+				return err
+			}
 		}
 		if col < 0 {
 			if distinct {
@@ -351,10 +384,11 @@ func (b *mergeBuilder) orderBy(distinct bool) error {
 			m := b.mutable()
 			m.TargetList = append(m.TargetList, &pgquerypb.Node{Node: &pgquerypb.Node_ResTarget{ResTarget: &pgquerypb.ResTarget{
 				Name: fmt.Sprintf("%s%d", hiddenPrefix, i), Val: proto.Clone(expr).(*pgquerypb.Node)}}})
-			col = len(targets) + b.spec.Hidden
+			key.FromHidden = true
+			col = b.spec.Hidden
 			b.spec.Hidden++
 		}
-		if col < len(targets) && isCCollation(targets[col].GetResTarget().GetVal().GetCollateClause()) {
+		if !key.FromHidden && col < len(targets) && isCCollation(targets[col].GetResTarget().GetVal().GetCollateClause()) {
 			key.CCollation = true
 		}
 		key.Column = col
