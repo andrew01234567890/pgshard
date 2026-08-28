@@ -526,8 +526,47 @@ func (r *ClusterReconciler) pollInterval() time.Duration {
 // converge repairs a group whose designated primary is not acting as one:
 // a standby that must be (re)promoted, or a former primary that must be
 // demoted. It returns the possibly bumped state.
-func (r *ClusterReconciler) converge(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, state groupState, members map[string]*memberInfo, password string) (groupState, error) {
+// admissiblePrimary reports why target must not be promoted, or "" when it
+// may be. Promotion is safe only for the member that holds every
+// acknowledged commit, which is what chooseCandidate encodes; the failover
+// path has always asked it, and this is the same question asked on the
+// healthy path, so there is one rule for who may become primary.
+//
+// The synchronous set is what state.syncSet last observed streaming, so a
+// member that has never streamed cannot hold an acknowledgement and does
+// not make the group unpromotable while it is still being created.
+func (r *ClusterReconciler) admissiblePrimary(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, state groupState, members map[string]*memberInfo, password, target string) string {
+	views := make([]memberView, 0, len(members))
+	for _, name := range g.MemberNames() {
+		v := memberView{Name: name, Listed: state.syncSet[name]}
+		if m := members[name]; m != nil && m.pod != nil && m.ip != "" {
+			if st, err := r.Prober.ProbeStandby(ctx, HostDSN(m.ip, password)); err == nil {
+				v.Reachable, v.InRecovery, v.Streaming, v.FlushLSN = true, st.InRecovery, st.Streaming, st.FlushLSN
+			}
+		}
+		views = append(views, v)
+	}
+	for _, v := range views {
+		// A live primary elsewhere is the failover path's business, not
+		// this one: promoting beside it is how two primaries happen, and
+		// the commits it has taken are not on the member being promoted.
+		if v.Reachable && !v.InRecovery && v.Name != target {
+			return fmt.Sprintf("designated primary %s not promoted: %s is running as a primary", target, v.Name)
+		}
+	}
+	candidate, err := chooseCandidate(views, "", target, minSyncStandbys(c))
+	switch {
+	case err != nil:
+		return fmt.Sprintf("designated primary %s not promoted: %v", target, err)
+	case candidate != target:
+		return fmt.Sprintf("designated primary %s not promoted: %s holds a higher flushed LSN", target, candidate)
+	}
+	return ""
+}
+
+func (r *ClusterReconciler) converge(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, state groupState, members map[string]*memberInfo, password string) (groupState, string, error) {
 	log := logf.FromContext(ctx).WithValues("group", g.Name())
+	refused := ""
 	for _, name := range g.MemberNames() {
 		m := members[name]
 		if m == nil || m.pod == nil || m.ip == "" {
@@ -550,33 +589,43 @@ func (r *ClusterReconciler) converge(ctx context.Context, c *pgshardv1alpha1.PgS
 				log.Info("designated primary still finishing its promotion; waiting before re-promoting", "member", name)
 				continue
 			}
+			// A member that is already primary is finishing a promotion the
+			// operator decided on; only a standby is a new promotion, and
+			// only that needs the candidate gate.
+			if !st.Primary {
+				if why := r.admissiblePrimary(ctx, c, g, state, members, password, name); why != "" {
+					log.Info("refusing to promote the designated primary", "member", name, "reason", why)
+					refused = why
+					continue
+				}
+			}
 			epoch := promotionEpoch(state.epoch, st.Epoch)
 			if epoch != state.epoch {
 				if err := r.publishFence(ctx, c, g, "", name, epoch, password); err != nil {
-					return state, err
+					return state, refused, err
 				}
 				state.epoch = epoch
 			}
 			log.Info("designated primary needs (re)promotion", "member", name, "epoch", epoch, "standby", !st.Primary, "promotionPending", st.PromotionPending)
 			if err := r.Agents.Promote(ctx, agentAddr(m.ip), uint64(epoch), name); err != nil {
-				return state, fmt.Errorf("promote %s: %w", name, err)
+				return state, refused, fmt.Errorf("promote %s: %w", name, err)
 			}
 			if err := r.patchRole(ctx, m.pod, RolePrimary); err != nil {
-				return state, err
+				return state, refused, err
 			}
 		case name != state.primary && st.Primary:
 			log.Info("member reports itself primary but is not designated; demoting", "member", name, "epoch", state.epoch)
 			if err := r.patchRole(ctx, m.pod, RoleUnhealthy); err != nil {
-				return state, err
+				return state, refused, err
 			}
 			if err := r.Agents.Demote(ctx, agentAddr(m.ip), uint64(state.epoch)); err != nil {
 				log.Info("demote failed; will retry", "member", name, "err", err.Error())
 			}
 		case name != state.primary && m.pod.Labels[LabelRole] != RoleReplica:
 			if err := r.patchRole(ctx, m.pod, RoleReplica); err != nil {
-				return state, err
+				return state, refused, err
 			}
 		}
 	}
-	return state, nil
+	return state, refused, nil
 }

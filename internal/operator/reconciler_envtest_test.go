@@ -286,6 +286,12 @@ func (f *fakeProber) Settings(_ context.Context, _ string, names []string) (map[
 	return out, nil
 }
 
+func (f *fakeProber) setStandby(ip string, st StandbyState) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.standbys[ip] = st
+}
+
 func (f *fakeProber) ProbeStandby(_ context.Context, dsn string) (StandbyState, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
