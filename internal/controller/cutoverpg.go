@@ -991,20 +991,81 @@ func (o *pgCutover) EnableReverse(ctx context.Context) error {
 // Pausing is confirmed on a fresh backend: the reload is asynchronous, and
 // a pause that is not yet in force is the same as no pause at all.
 func (o *pgCutover) PauseSources(ctx context.Context, pause bool) error {
+	return o.pauseSet(ctx, o.srcSet, o.srcIDs, pause)
+}
+
+// pauseSet flips default_transaction_read_only on every primary of a set.
+func (o *pgCutover) pauseSet(ctx context.Context, set string, ids []int32, pause bool) error {
 	stmt := `ALTER SYSTEM RESET default_transaction_read_only`
 	if pause {
 		stmt = `ALTER SYSTEM SET default_transaction_read_only = on`
 	}
-	for _, s := range o.srcIDs {
-		if err := o.setSourceReadOnly(ctx, s, stmt, pause); err != nil {
-			return fmt.Errorf("write pause on %s/%d: %w", o.srcSet, s, err)
+	for _, s := range ids {
+		if err := o.setReadOnly(ctx, set, s, stmt, pause); err != nil {
+			return fmt.Errorf("write pause on %s/%d: %w", set, s, err)
 		}
 	}
 	return nil
 }
 
-func (o *pgCutover) setSourceReadOnly(ctx context.Context, s int32, stmt string, pause bool) error {
-	conn, err := o.c.Shards.Dial(ctx, o.srcSet, s)
+// drainWriters waits until no client backend on the set still holds a
+// write transaction. default_transaction_read_only is read when a
+// transaction starts, so one that began before the pause can still commit
+// after it; the pause alone stops new writers, not the ones already in
+// flight.
+func (o *pgCutover) drainWriters(ctx context.Context, set string, ids []int32) error {
+	deadline := o.c.now().Add(writerDrainTimeout)
+	for {
+		busy, err := o.writingBackends(ctx, set, ids)
+		if err != nil {
+			return err
+		}
+		if busy == 0 {
+			return nil
+		}
+		if o.c.now().After(deadline) {
+			return fmt.Errorf("%d write transactions on %s still open after %s", busy, set, writerDrainTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// writingBackends counts client backends holding a transaction that has
+// written. A transaction is assigned an xid the first time it writes, so
+// backend_xid is exactly the question; readers and the replication workers
+// carrying the rollback are not counted.
+func (o *pgCutover) writingBackends(ctx context.Context, set string, ids []int32) (int, error) {
+	total := 0
+	for _, s := range ids {
+		conn, err := o.c.Shards.Dial(ctx, set, s)
+		if err != nil {
+			return 0, err
+		}
+		rows, err := conn.Query(ctx, `SELECT count(*)::int FROM pg_stat_activity
+			WHERE backend_xid IS NOT NULL AND backend_type = 'client backend' AND pid <> pg_backend_pid()`)
+		var n int
+		if err == nil {
+			n, err = pgx.CollectExactlyOneRow(rows, pgx.RowTo[int])
+		}
+		_ = conn.Close(ctx)
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
+// writerDrainTimeout bounds the wait for in-flight write transactions to
+// end once new ones are refused.
+const writerDrainTimeout = 30 * time.Second
+
+func (o *pgCutover) setReadOnly(ctx context.Context, set string, s int32, stmt string, pause bool) error {
+	conn, err := o.c.Shards.Dial(ctx, set, s)
 	if err != nil {
 		return err
 	}
@@ -1020,7 +1081,7 @@ func (o *pgCutover) setSourceReadOnly(ctx context.Context, s int32, stmt string,
 	}
 	deadline := o.c.now().Add(pauseConfirmTimeout)
 	for {
-		on, err := o.sourceRefusesWrites(ctx, s)
+		on, err := o.refusesWrites(ctx, set, s)
 		if err != nil {
 			return err
 		}
@@ -1040,8 +1101,8 @@ func (o *pgCutover) setSourceReadOnly(ctx context.Context, s int32, stmt string,
 
 // sourceRefusesWrites asks a backend started after the reload, since an
 // existing one may have been running before the setting changed.
-func (o *pgCutover) sourceRefusesWrites(ctx context.Context, s int32) (bool, error) {
-	conn, err := o.c.Shards.Dial(ctx, o.srcSet, s)
+func (o *pgCutover) refusesWrites(ctx context.Context, set string, s int32) (bool, error) {
+	conn, err := o.c.Shards.Dial(ctx, set, s)
 	if err != nil {
 		return false, err
 	}
