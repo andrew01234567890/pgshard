@@ -269,3 +269,66 @@ func TestCertifiedBarrierReadsTheCatalogRowOnPostgres(t *testing.T) {
 		}
 	}
 }
+
+// TestCatalogCopyClearsAShardMapItCannotTruncate: the catalog copy
+// truncated every table in the pgshard schema before subscribing, to make
+// itself re-runnable. The shard-map tables refuse TRUNCATE outright --
+// row-level constraint triggers do not fire on it, so truncating would
+// empty the map past the coverage, numbering and workflow-ownership checks
+// -- and a freshly migrated target carries a bootstrap shard set row that
+// has to go. So the copy could never start, and the catalog half of a
+// major upgrade never completed: stage stayed "copying" with the reason
+// only in the cluster's status message.
+func TestCatalogCopyClearsAShardMapItCannotTruncate(t *testing.T) {
+	if err := exec.Command("docker", "info").Run(); err != nil {
+		dockertest.Unavailable(t, "docker unavailable")
+	}
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, startProbePostgres(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if err := catalog.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+
+	// The bootstrap row a fresh catalog carries, and a row in a table that
+	// is truncated the ordinary way.
+	if _, err := conn.Exec(ctx, `INSERT INTO pgshard.databases (name) VALUES ('app')`); err != nil {
+		t.Fatal(err)
+	}
+	if n := probeCount(t, conn, `SELECT count(*) FROM pgshard.shard_sets`); n == 0 {
+		t.Fatal("the fixture must start with a shard set to clear")
+	}
+
+	if err := clearCatalogSchema(ctx, conn, "pgshard"); err != nil {
+		t.Fatalf("the copy must be able to clear a fresh catalog: %v", err)
+	}
+	for _, q := range []string{
+		`SELECT count(*) FROM pgshard.shard_sets`,
+		`SELECT count(*) FROM pgshard.shard_ranges`,
+		`SELECT count(*) FROM pgshard.databases`,
+	} {
+		if n := probeCount(t, conn, q); n != 0 {
+			t.Errorf("%s left %d rows behind", q, n)
+		}
+	}
+	// Re-runnable: clearing an already-empty catalog is not an error.
+	if err := clearCatalogSchema(ctx, conn, "pgshard"); err != nil {
+		t.Fatalf("clearing twice: %v", err)
+	}
+	// The guard is still there for everyone else.
+	if _, err := conn.Exec(ctx, `TRUNCATE pgshard.shard_sets`); err == nil {
+		t.Error("the shard map must still refuse TRUNCATE")
+	}
+}
+
+func probeCount(t *testing.T, conn *pgx.Conn, sql string) int {
+	t.Helper()
+	var n int
+	if err := conn.QueryRow(context.Background(), sql).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
