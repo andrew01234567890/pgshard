@@ -245,8 +245,11 @@ func TestFailoverRefusesWhenLeaseHeldByAnotherLiveHolder(t *testing.T) {
 }
 
 func TestConvergeRepromotesDesignatedPrimaryWithHigherEpoch(t *testing.T) {
-	r, _, fa, c := healthyCluster(t, "conv")
+	r, fp, fa, c := healthyCluster(t, "conv")
 	fa.set(podIP(1, 0), AgentStatus{Running: true, Primary: false, Epoch: 0}, nil)
+	for i := range 3 {
+		fp.setStandby(podIP(1, i), StandbyState{InRecovery: true, Streaming: true, FlushLSN: 500})
+	}
 	reconcile(t, r, c)
 	if len(fa.promotes) != 1 || fa.promotes[0] != agentAddr(podIP(1, 0))+":1:conv-shard-0-0" {
 		t.Fatalf("a designated primary answering as a standby must be promoted with a strictly greater epoch: %v", fa.promotes)
@@ -374,4 +377,66 @@ func TestFailoverRemovesAnUnreachableOldPrimaryBeforePromoting(t *testing.T) {
 	if len(fa.promotes) != 1 || !strings.HasSuffix(fa.promotes[0], ":1:podfence-shard-0-2") {
 		t.Fatalf("expected exactly one promotion after the old primary was fenced, got %v", fa.promotes)
 	}
+}
+
+// TestConvergeRefusesToPromoteAnUnsafeDesignatedPrimary: converge promoted
+// whatever the status named as primary, with none of the checks the
+// failover path is built around. A designated primary that is a standby
+// behind another member -- reachable through a rolled-back or hand-edited
+// group status -- was promoted on the healthy branch of an ordinary
+// reconcile, losing every commit it had not replayed.
+func TestConvergeRefusesToPromoteAnUnsafeDesignatedPrimary(t *testing.T) {
+	t.Run("another member is running as a primary", func(t *testing.T) {
+		r, fp, fa, c := healthyCluster(t, "lp")
+		before := len(fa.promotes)
+		fa.set(podIP(1, 0), AgentStatus{Running: true, Primary: false}, nil)
+		fa.set(podIP(1, 1), AgentStatus{Running: true, Primary: true}, nil)
+		fp.setStandby(podIP(1, 0), StandbyState{InRecovery: true, Streaming: true, FlushLSN: 100})
+		fp.setStandby(podIP(1, 1), StandbyState{FlushLSN: 400})
+		fp.setStandby(podIP(1, 2), StandbyState{InRecovery: true, Streaming: true, FlushLSN: 400})
+		reconcile(t, r, c)
+		if len(fa.promotes) != before {
+			t.Fatalf("no promotion may be issued beside a live primary: %v", fa.promotes[before:])
+		}
+		if cond := condition(t, "lp", pgshardv1alpha1.ConditionPrimaryHealthy); cond.Status == metav1.ConditionTrue {
+			t.Fatalf("the refusal must be visible: %+v", cond)
+		}
+	})
+
+	t.Run("another member holds a higher flushed LSN", func(t *testing.T) {
+		r, fp, fa, c := healthyCluster(t, "hl")
+		before := len(fa.promotes)
+		for i := range 3 {
+			fa.set(podIP(1, i), AgentStatus{Running: true, Primary: false}, nil)
+		}
+		fp.setStandby(podIP(1, 0), StandbyState{InRecovery: true, Streaming: true, FlushLSN: 100})
+		fp.setStandby(podIP(1, 1), StandbyState{InRecovery: true, Streaming: true, FlushLSN: 900})
+		fp.setStandby(podIP(1, 2), StandbyState{InRecovery: true, Streaming: true, FlushLSN: 100})
+		reconcile(t, r, c)
+		if len(fa.promotes) != before {
+			t.Fatalf("a member behind another must not be promoted: %v", fa.promotes[before:])
+		}
+		cond := condition(t, "hl", pgshardv1alpha1.ConditionPrimaryHealthy)
+		if cond.Status == metav1.ConditionTrue {
+			t.Fatalf("the refusal must be visible: %+v", cond)
+		}
+	})
+
+	t.Run("the designated primary holds the maximum", func(t *testing.T) {
+		r, fp, fa, c := healthyCluster(t, "ok")
+		before := len(fa.promotes)
+		for i := range 3 {
+			fa.set(podIP(1, i), AgentStatus{Running: true, Primary: false}, nil)
+		}
+		fp.setStandby(podIP(1, 0), StandbyState{InRecovery: true, Streaming: true, FlushLSN: 900})
+		fp.setStandby(podIP(1, 1), StandbyState{InRecovery: true, Streaming: true, FlushLSN: 900})
+		fp.setStandby(podIP(1, 2), StandbyState{InRecovery: true, Streaming: true, FlushLSN: 100})
+		reconcile(t, r, c)
+		if len(fa.promotes) != before+1 {
+			t.Fatalf("the designated primary holds every commit and must be promoted: %v", fa.promotes[before:])
+		}
+		if got := fa.promotes[before]; !strings.HasSuffix(got, ":ok-shard-0-0") {
+			t.Fatalf("promotion must target the designated primary: %s", got)
+		}
+	})
 }
