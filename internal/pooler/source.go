@@ -3,6 +3,7 @@ package pooler
 import (
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
@@ -58,6 +59,13 @@ func (s *SnapshotSource) View() View {
 	v := s.Base
 	snap := s.Watcher.Current()
 	if snap == nil {
+		return v
+	}
+	if snap.Stale(time.Now()) {
+		// Generation and epoch are the fence the pooler enforces for the
+		// router; enforcing them from a view that has stopped being
+		// refreshed is enforcing the wrong thing, so stop serving instead.
+		v.Serving = false
 		return v
 	}
 	v.Generation = uint64(snap.ShardMapGeneration)

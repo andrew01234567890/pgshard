@@ -105,7 +105,14 @@ func New(cfg Config) (*Router, error) {
 	rt := &Router{cfg: cfg, prefix: hex.EncodeToString(b[:]), scatter: newScatterSlots(cfg.Scatter.MaxStreams),
 		sessions: map[uint64]*Executor{}, buffered: map[Shard]int{}, prepared: map[Shard]bool{}}
 	reg := metrics.NewRegistry("router")
-	rt.metrics = metrics.NewRouter(reg, func() float64 { return float64(rt.Sessions()) })
+	rt.metrics = metrics.NewRouter(reg, func() float64 { return float64(rt.Sessions()) },
+		func() float64 {
+			age, ok := rt.cfg.Snapshot().Age(rt.now())
+			if !ok {
+				return -1
+			}
+			return age.Seconds()
+		})
 	rt.mhandler = metrics.Handler(reg)
 	if rt.cfg.Planner == nil {
 		rt.cfg.Planner = NewPlannerWithMetrics(rt.metrics)
