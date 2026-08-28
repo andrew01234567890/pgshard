@@ -29,6 +29,7 @@ type fakePG struct {
 	seen    []string
 	dialed  []string
 	block   chan struct{}
+	copied  atomic.Int64
 	// lastCK/lastSK alias the key slices handed to the most recent dial.
 	lastCK, lastSK []byte
 }
@@ -115,6 +116,12 @@ func (f *fakePG) serve(conn net.Conn) {
 				continue
 			}
 			be.Send(&pgproto3.CommandComplete{CommandTag: []byte(q)})
+			be.Send(&pgproto3.ReadyForQuery{TxStatus: tx})
+			_ = be.Flush()
+		case *pgproto3.CopyData:
+			f.copied.Add(int64(len(m.Data)))
+		case *pgproto3.CopyDone, *pgproto3.CopyFail:
+			be.Send(&pgproto3.CommandComplete{CommandTag: []byte("COPY 0")})
 			be.Send(&pgproto3.ReadyForQuery{TxStatus: tx})
 			_ = be.Flush()
 		case *pgproto3.Terminate:
