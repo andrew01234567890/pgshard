@@ -1,6 +1,7 @@
 package pooler
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/hex"
@@ -765,4 +766,40 @@ func attachAs(t *testing.T, h *harness, session string, user *pgshardv1.UserIden
 	}
 	_, err = s.Recv()
 	return err
+}
+
+// TestCopyInReachesPostgresBeforeItEnds: an upload was buffered whole. COPY
+// IN is answered by nothing until CopyDone, so pooler memory grew with the
+// upload and PostgreSQL did not start ingesting until the client finished.
+func TestCopyInReachesPostgresBeforeItEnds(t *testing.T) {
+	h := startHarness(t, PoolConfig{})
+	stream, err := h.client.Execute(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, user := gen(7, 3), identity("app")
+	roundTrip(t, stream, queryReq("copy", "copy t from stdin", g, user))
+
+	chunk := bytes.Repeat([]byte("x"), 8<<10)
+	for range 16 { // 128 KiB, past the flush threshold
+		req := &pgshardv1.ExecuteRequest{SessionId: "copy", Generation: g, User: user,
+			Message: &pgshardv1.ExecuteRequest_CopyData{CopyData: &pgshardv1.CopyData{Data: chunk}}}
+		if err := stream.Send(req); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The upload has not ended, so anything PostgreSQL holds got there
+	// while the copy was still running.
+	deadline := time.Now().Add(5 * time.Second)
+	for h.pg.copied.Load() < int64(len(chunk)) {
+		if time.Now().After(deadline) {
+			t.Fatal("the upload was still in the pooler after 128 KiB had been sent")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	roundTrip(t, stream, &pgshardv1.ExecuteRequest{SessionId: "copy", Generation: g, User: user,
+		Message: &pgshardv1.ExecuteRequest_CopyDone{CopyDone: &pgshardv1.CopyDone{}}})
+	if got := h.pg.copied.Load(); got != int64(16*len(chunk)) {
+		t.Fatalf("PostgreSQL received %d bytes of a %d byte upload", got, 16*len(chunk))
+	}
 }
