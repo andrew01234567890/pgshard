@@ -71,6 +71,9 @@ const (
 	DefaultCutoverAttempts = 3
 	// DefaultRetireAfter is how long the old groups stay after the switch.
 	DefaultRetireAfter = 24 * time.Hour
+	// maxSeqRecarries bounds how often a moving source sends the flip back
+	// to re-carry sequences before it proceeds anyway.
+	maxSeqRecarries = 2
 )
 
 // cutoverState is the cutover record under workflows.status->'cutover'.
@@ -84,6 +87,9 @@ type cutoverState struct {
 	Verify     *VerifyReport    `json:"verify,omitempty"`
 	FlippedAt  *time.Time       `json:"flipped_at,omitempty"`
 	ReleasedAt *time.Time       `json:"released_at,omitempty"`
+	// Recarries counts how many times the flip has sent the switch back to
+	// re-carry sequences because the sources moved.
+	Recarries int `json:"recarries,omitempty"`
 	// PauseMS is the router-visible write pause: fence raised to new map
 	// published. FenceMS is fence raised to fence released.
 	PauseMS    int64      `json:"pause_ms,omitempty"`
@@ -467,11 +473,22 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 		if !ok {
 			return true, retryf("%s", why)
 		}
-		if !maps.Equal(pos, wf.cutover.Positions) {
+		if !maps.Equal(pos, wf.cutover.Positions) && wf.cutover.Recarries < maxSeqRecarries {
 			// The movement may carry sequence advances the earlier
 			// StepSequences did not see, so the switch jumps back there
 			// and re-carries them before another flip attempt.
+			//
+			// Bounded, because a source is never obliged to stand still:
+			// a checkpoint or an autovacuum moves pg_current_wal_lsn with
+			// no user write behind it, and after the journal there is no
+			// timeout to end the wait. What the flip needs is that the
+			// targets hold everything the sources hold, which CaughtUp
+			// has just established for these very positions; the carry is
+			// re-run because it is cheap, not because the flip is unsafe
+			// without it. A stale-router nextval in the window is already
+			// covered by the headroom collectSequences carries.
 			wf.cutover.Positions = pos
+			wf.cutover.Recarries++
 			wf.cutover.Step = StepSequences
 			if err := c.saveCutover(ctx, wf, "switching: sources advanced before the flip; re-carrying sequences"); err != nil {
 				return false, err
