@@ -531,12 +531,16 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 		return r.finishGroup(ctx, c, g, obs, members), nil
 	}
 
-	state, err = r.converge(ctx, c, g, state, members, password)
+	state, refused, err := r.converge(ctx, c, g, state, members, password)
 	obs.state = state
 	if err != nil {
 		return obs, err
 	}
 	obs = r.finishGroup(ctx, c, g, obs, members)
+	if refused != "" {
+		obs.failing, obs.primaryErr = true, refused
+		return obs, nil
+	}
 
 	dsn := DSN(g.ServiceRW(), c.Namespace, password)
 	pstate, err := r.Prober.Probe(ctx, dsn)
