@@ -28,14 +28,14 @@ type shardedHarness struct {
 	snap    *snapshot.Snapshot
 }
 
-func newShardedHarness(t *testing.T) *shardedHarness {
+func newShardedHarness(t testing.TB) *shardedHarness {
 	t.Helper()
 	return newShardedHarnessWith(t, Config{})
 }
 
 // newShardedHarnessWith is newShardedHarness with cfg's Scatter and
 // Decisions settings.
-func newShardedHarnessWith(t *testing.T, cfg Config) *shardedHarness {
+func newShardedHarnessWith(t testing.TB, cfg Config) *shardedHarness {
 	t.Helper()
 	ranges, err := placement.Split(4)
 	if err != nil {

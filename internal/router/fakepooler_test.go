@@ -175,7 +175,7 @@ func newFakePooler() *fakePooler {
 	return &fakePooler{gen: 7, epoch: 2, backends: map[string]*fakeBackend{}, reserved: map[string]bool{}, sleeping: map[string]chan struct{}{}, attached: map[string]chan struct{}{}}
 }
 
-func startFakePooler(t *testing.T, fp *fakePooler) string {
+func startFakePooler(t testing.TB, fp *fakePooler) string {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
