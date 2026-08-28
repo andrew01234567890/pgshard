@@ -66,6 +66,11 @@ type ParseResult struct {
 type Metrics interface {
 	CacheHit()
 	CacheMiss()
+	// CacheEvicted reports the running total of entries evicted, and
+	// CacheLiveBytes the heap the cache accounts for, after each parse
+	// the cache admitted.
+	CacheEvicted(total int)
+	CacheLiveBytes(n int)
 }
 
 // Options configure a Parser. Zero values take the Default* constants;
@@ -111,8 +116,10 @@ func New(opts Options) *Parser {
 
 type noMetrics struct{}
 
-func (noMetrics) CacheHit()  {}
-func (noMetrics) CacheMiss() {}
+func (noMetrics) CacheHit()            {}
+func (noMetrics) CacheMiss()           {}
+func (noMetrics) CacheEvicted(_ int)   {}
+func (noMetrics) CacheLiveBytes(_ int) {}
 
 // Parse parses sql, honouring ctx for cancellation and the configured limits.
 // Results may be shared between callers and must not be mutated.
@@ -141,9 +148,36 @@ func (p *Parser) Parse(ctx context.Context, sql string) (*ParseResult, error) {
 		}
 	}
 	if p.cache != nil {
-		p.cache.put(sql, res, len(sql)+proto.Size(res.Tree))
+		p.cache.put(sql, res, astWeight(sql, res.Tree))
+		bytes, evicted := p.cache.stats()
+		p.metrics.CacheLiveBytes(bytes)
+		p.metrics.CacheEvicted(evicted)
 	}
 	return res, nil
+}
+
+// astHeapFactor turns a tree's serialized size into an estimate of the heap
+// it actually holds. The wire encoding is compact; the Go objects it becomes
+// are structs, slices, maps and pointers, and there are far more bytes of
+// them.
+//
+// Measured by parsing two thousand statements of a shape, holding them, and
+// comparing HeapAlloc against the serialized total: a simple SELECT is
+// 22.2x, a join 13.5x, a multi-column INSERT 14.5x, and one with a long
+// string literal 10.1x -- literals raise the serialized size without adding
+// nodes, which is why they score lowest.
+//
+// The factor is the top of that range rather than the middle, deliberately.
+// CacheBytes is a memory bound an operator sets, so the accounting must not
+// exceed it; erring high costs cache entries, which erring low pays for in
+// resident memory the operator did not ask for. Before this the factor was
+// effectively one, so a nominal 32 MiB cache could hold several hundred
+// megabytes.
+const astHeapFactor = 24
+
+// astWeight estimates the heap a cached parse holds.
+func astWeight(sql string, tree proto.Message) int {
+	return len(sql) + proto.Size(tree)*astHeapFactor
 }
 
 // parseWithContext parses sql, refusing before and after if the caller has
