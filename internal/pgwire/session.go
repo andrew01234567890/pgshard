@@ -63,11 +63,9 @@ type session struct {
 
 	// skipToSync is set after an extended-protocol error until Sync arrives.
 	skipToSync bool
-	dataRows   int
-	// copyBytes is what the current COPY OUT has queued since its last
-	// flush; rows are counted, COPY chunks have no fixed size so they are
-	// weighed.
-	copyBytes int
+	// queued is what has been handed to the backend buffer since the last
+	// flush, in bytes on the wire.
+	queued int
 	// copyIn is the active COPY FROM STDIN stream, if any.
 	copyIn *copyInStream
 }
@@ -93,6 +91,12 @@ func (s *session) send(msgs ...pgproto3.BackendMessage) error {
 	for _, m := range msgs {
 		s.be.Send(m)
 	}
+	return s.flush()
+}
+
+// flush writes the backend buffer and forgets what it owed.
+func (s *session) flush() error {
+	s.queued = 0
 	return s.be.Flush()
 }
 
@@ -523,7 +527,7 @@ func (s *session) startup(ctx context.Context) error {
 	}
 	s.be.Send(&pgproto3.BackendKeyData{ProcessID: key.PID, SecretKey: key.Secret})
 	s.be.Send(&pgproto3.ReadyForQuery{TxStatus: byte(exec.TransactionStatus())})
-	if err := s.be.Flush(); err != nil {
+	if err := s.flush(); err != nil {
 		return err
 	}
 	// From here a revocation ends the session outright rather than only
@@ -698,7 +702,7 @@ func (s *session) dispatch(ctx context.Context, msg pgproto3.FrontendMessage) (b
 			s.reportError(err)
 			s.skipToSync = true
 		}
-		return true, s.be.Flush()
+		return true, s.flush()
 	case *pgproto3.Sync:
 		s.skipToSync = false
 		// Sync is where an extended-protocol batch actually runs, so it
@@ -724,7 +728,7 @@ func (s *session) dispatch(ctx context.Context, msg pgproto3.FrontendMessage) (b
 func (s *session) extendedError(err error) error {
 	s.skipToSync = true
 	s.reportError(err)
-	return s.be.Flush()
+	return s.flush()
 }
 
 func (s *session) simpleQuery(ctx context.Context, sql string, w *resultWriter) error {
