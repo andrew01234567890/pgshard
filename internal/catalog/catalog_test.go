@@ -1273,6 +1273,30 @@ func runSuite(t *testing.T, img pgImage) {
 		type block struct{ start, end int64 }
 		results := make(chan block, workers*per)
 		errs := make(chan error, workers)
+		// An operator trying to reset the sequence while the routers are
+		// allocating is the case the split exists for: every attempt must
+		// fail, and no value may be handed out twice.
+		resetDone := make(chan int)
+		go func() {
+			c, err := pgx.Connect(ctx, dsn)
+			if err != nil {
+				resetDone <- 0
+				return
+			}
+			defer func() { _ = c.Close(ctx) }()
+			_, _ = c.Exec(ctx, `SET ROLE `+RoleAdmin)
+			refused := 0
+			for i := 0; i < 40; i++ {
+				if _, err := c.Exec(ctx, `UPDATE pgshard.sequences SET next_value = 1 WHERE name = 'app.public.orders.id'`); err != nil {
+					refused++
+				}
+				if _, err := c.Exec(ctx, `DELETE FROM pgshard.sequences WHERE name = 'app.public.orders.id'`); err != nil {
+					refused++
+				}
+				time.Sleep(time.Millisecond)
+			}
+			resetDone <- refused
+		}()
 		for w := 0; w < workers; w++ {
 			go func() {
 				c, err := pgx.Connect(ctx, dsn)
@@ -1296,6 +1320,9 @@ func runSuite(t *testing.T, img pgImage) {
 			if err := <-errs; err != nil {
 				t.Fatal(err)
 			}
+		}
+		if refused := <-resetDone; refused != 80 {
+			t.Fatalf("%d of 80 reset attempts were refused", refused)
 		}
 		close(results)
 		seen := map[int64]bool{}
@@ -1326,6 +1353,34 @@ func runSuite(t *testing.T, img pgImage) {
 		mustExec(t, reader, `SET ROLE `+RoleReader)
 		_, err = reader.Exec(ctx, `SELECT * FROM pgshard.allocate_sequence_block('by_reader')`)
 		expectPgError(t, err, "42501", "allocate_sequence_block")
+
+		// The watermark is the allocator's, not an operator's column:
+		// routers cache the blocks below it, so anything that moves it
+		// back hands a second router values another one is using.
+		_, err = admin.Exec(ctx, `UPDATE pgshard.sequences SET next_value = 1 WHERE name = 'declared'`)
+		expectPgError(t, err, "42501", "sequences")
+		_, err = admin.Exec(ctx, `DELETE FROM pgshard.sequences WHERE name = 'declared'`)
+		expectPgError(t, err, "42501", "sequences")
+		mustExec(t, admin, `UPDATE pgshard.sequences SET block_size = 25 WHERE name = 'declared'`)
+
+		// Not even the owner may lower it.
+		_, err = conn.Exec(ctx, `UPDATE pgshard.sequences SET next_value = 1 WHERE name = 'declared'`)
+		expectPgError(t, err, "23514", "cannot go back to 1")
+
+		// The administrative setval moves forward and reports where the
+		// sequence ended up; asking for less than the watermark is a no-op.
+		var at int64
+		if err := admin.QueryRow(ctx, `SELECT pgshard.advance_sequence('declared', 5000)`).Scan(&at); err != nil || at != 5000 {
+			t.Fatalf("advance_sequence forward: %d %v", at, err)
+		}
+		if err := admin.QueryRow(ctx, `SELECT pgshard.advance_sequence('declared', 10)`).Scan(&at); err != nil || at != 5000 {
+			t.Fatalf("advance_sequence backward must not move it: %d %v", at, err)
+		}
+		if err := admin.QueryRow(ctx, `SELECT * FROM pgshard.allocate_sequence_block('declared')`).Scan(&start, &end); err != nil || start != 5000 {
+			t.Fatalf("allocation after the advance: [%d, %d] %v", start, end, err)
+		}
+		_, err = admin.Exec(ctx, `SELECT pgshard.advance_sequence('missing', 1)`)
+		expectPgError(t, err, "P0002", "does not exist")
 	})
 
 	t.Run("stream_status_slot_health", func(t *testing.T) {
