@@ -109,10 +109,10 @@ func TestAggregateAndCaughtUp(t *testing.T) {
 	reports := []SubscriptionProgress{
 		{Rels: map[RelState]int{'r': 3}, LagBytes: 100, Enabled: true},
 		{Rels: map[RelState]int{'r': 1, 'd': 2}, LagBytes: 5000, Enabled: true},
-		{Rels: map[RelState]int{}, LagBytes: 0, Enabled: false},
+		{Rels: map[RelState]int{'r': 2}, LagBytes: 0, Enabled: false},
 	}
 	p := Aggregate(reports)
-	if p.Subscriptions != 3 || p.TablesTotal != 6 || p.TablesReady != 4 || p.LagBytes != 5000 || p.Paused != 1 {
+	if p.Subscriptions != 3 || p.TablesTotal != 8 || p.TablesReady != 6 || p.LagBytes != 5000 || p.Paused != 1 {
 		t.Fatalf("aggregate %+v", p)
 	}
 	if p.CaughtUp(1 << 20) {
@@ -128,7 +128,7 @@ func TestAggregateAndCaughtUp(t *testing.T) {
 	if p.LagBytes != LagUnknown || p.CaughtUp(math.MaxInt64) {
 		t.Fatalf("unknown lag must win: %+v", p)
 	}
-	p = Aggregate([]SubscriptionProgress{{LagBytes: LagUnknown, Enabled: true}, {LagBytes: 7, Enabled: true}})
+	p = Aggregate([]SubscriptionProgress{{Rels: map[RelState]int{'r': 1}, LagBytes: LagUnknown, Enabled: true}, {Rels: map[RelState]int{'r': 1}, LagBytes: 7, Enabled: true}})
 	if p.LagBytes != LagUnknown {
 		t.Fatalf("unknown lag must stick: %+v", p)
 	}
@@ -230,5 +230,33 @@ func TestProgressWithoutBlockersIsUnchanged(t *testing.T) {
 	p := Aggregate([]SubscriptionProgress{{Name: "s", Rels: map[RelState]int{'r': 4}, LagBytes: 12}})
 	if got := p.Describe(); got != "4/4 tables ready, lag 12 bytes" {
 		t.Fatalf("describe = %q", got)
+	}
+}
+
+// TestSubscriptionWithNoTablesIsNotCaughtUp: a subscription PostgreSQL has
+// not yet filled pg_subscription_rel for reports no relations, and counting
+// its zero tables as zero outstanding made the switch gate open before any
+// data had been copied. The e2e upgrade then switched writes to a target
+// holding 1875 of 6400 acknowledged rows.
+func TestSubscriptionWithNoTablesIsNotCaughtUp(t *testing.T) {
+	fresh := SubscriptionProgress{Name: "pgshard_reshard_g2_t0_s0", Rels: map[RelState]int{}, LagBytes: 0, Enabled: true}
+	p := Aggregate([]SubscriptionProgress{fresh})
+	if p.Enumerating != 1 || p.TablesTotal != 0 {
+		t.Fatalf("aggregate %+v", p)
+	}
+	if p.CaughtUp(1 << 20) {
+		t.Fatal("a subscription that has copied nothing must not read as caught up")
+	}
+	if !strings.Contains(p.Describe(), "no tables yet") {
+		t.Fatalf("the gate must say why it is closed: %q", p.Describe())
+	}
+	// One subscription still enumerating holds the gate even when the
+	// others have finished.
+	done := SubscriptionProgress{Name: "pgshard_reshard_g2_t1_s0", Rels: map[RelState]int{'r': 4}, LagBytes: 0, Enabled: true}
+	if Aggregate([]SubscriptionProgress{done, fresh}).CaughtUp(1 << 20) {
+		t.Fatal("one subscription with no tables must hold the gate")
+	}
+	if !Aggregate([]SubscriptionProgress{done}).CaughtUp(1 << 20) {
+		t.Fatal("a finished subscription is caught up")
 	}
 }
