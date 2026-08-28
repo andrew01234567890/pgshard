@@ -6,6 +6,20 @@ import (
 )
 
 // ObjectStoreSpec locates a backup repository.
+// The fields each store variant needs are required here as well as at
+// runtime, so an object that cannot work is refused when it is written
+// rather than accepted and then reported invalid. The rules mirror
+// backup.Settings.Validate; the credential ones account for the same
+// defaulting it applies, where an unset credentialType means shared for
+// s3 and azure and service for gcs.
+// +kubebuilder:validation:XValidation:rule="self.type != 's3' || (has(self.bucket) && has(self.endpoint) && has(self.region))",message="an s3 store needs bucket, endpoint and region"
+// +kubebuilder:validation:XValidation:rule="self.type != 's3' || has(self.credentialType) && self.credentialType != 'shared' || has(self.credentials.secretRef)",message="s3 shared credentials need credentials.secretRef"
+// +kubebuilder:validation:XValidation:rule="self.type != 'azure' || has(self.container)",message="an azure store needs container"
+// +kubebuilder:validation:XValidation:rule="self.type != 'azure' || has(self.credentials.secretRef)",message="an azure store needs credentials.secretRef"
+// +kubebuilder:validation:XValidation:rule="self.type != 'gcs' || has(self.bucket)",message="a gcs store needs bucket"
+// +kubebuilder:validation:XValidation:rule="self.type != 'gcs' || has(self.credentialType) && !(self.credentialType in ['service', 'token']) || has(self.credentials.secretRef)",message="gcs service and token credentials need credentials.secretRef"
+// +kubebuilder:validation:XValidation:rule="self.type != 'sftp' || has(self.sftp)",message="an sftp store needs sftp.host and sftp.user"
+// +kubebuilder:validation:XValidation:rule="self.type != 'sftp' || has(self.credentials.secretRef)",message="an sftp store needs credentials.secretRef"
 type ObjectStoreSpec struct {
 	// +kubebuilder:validation:Enum=s3;azure;gcs;posix;sftp
 	Type string `json:"type"`

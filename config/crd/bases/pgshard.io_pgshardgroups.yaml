@@ -27,7 +27,13 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: PgShardGroup is a status-only view of one catalog or shard group.
+        description: |-
+          PgShardGroup is the operator's record of one catalog or shard group.
+          Users do not write it. Its status carries the designated primary and the
+          fencing epoch, which the operator reads back on every reconcile -- but
+          it is not the only record of them: the group Lease carries the same two
+          values, written before any promotion, and the operator reconstructs from
+          the Lease when this object's status has been lost.
         properties:
           apiVersion:
             description: |-

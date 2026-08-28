@@ -285,7 +285,7 @@ func TestBackupPolicyStoreTypeEnum(t *testing.T) {
 	if err := create(t, p); err == nil || !apierrors.IsInvalid(err) {
 		t.Fatalf("expected Invalid, got %v", err)
 	}
-	p.Spec.ObjectStore = pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "b", Region: "r", Credentials: pgshardv1alpha1.SecretRefSpec{SecretRef: &corev1.LocalObjectReference{Name: "creds"}}}
+	p.Spec.ObjectStore = pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "b", Endpoint: "s3.example", Region: "r", Credentials: pgshardv1alpha1.SecretRefSpec{SecretRef: &corev1.LocalObjectReference{Name: "creds"}}}
 	p.Spec.Schedules.Full = "0 2 * * 0"
 	p.Spec.Retention.Full = 4
 	if err := create(t, p); err != nil {
@@ -492,5 +492,58 @@ func TestBackupSpecIsImmutable(t *testing.T) {
 	got.Labels = map[string]string{"pgshard.io/keep": "yes"}
 	if err := k8sClient.Update(context.Background(), &got); err != nil {
 		t.Fatalf("a metadata-only update must be allowed: %v", err)
+	}
+}
+
+// TestObjectStoreRequiresWhatItsVariantNeeds: a policy missing the fields
+// its store type needs was accepted by the API and only then marked
+// Valid=False by the reconciler, which is a rejected desired state sitting
+// in the cluster for something to read.
+func TestObjectStoreRequiresWhatItsVariantNeeds(t *testing.T) {
+	policy := func(name string, st pgshardv1alpha1.ObjectStoreSpec) *pgshardv1alpha1.PgShardBackupPolicy {
+		return &pgshardv1alpha1.PgShardBackupPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec:       pgshardv1alpha1.PgShardBackupPolicySpec{ObjectStore: st},
+		}
+	}
+	secret := pgshardv1alpha1.SecretRefSpec{SecretRef: &corev1.LocalObjectReference{Name: "creds"}}
+	for _, c := range []struct {
+		name  string
+		store pgshardv1alpha1.ObjectStoreSpec
+		want  string
+	}{
+		{"s3 without bucket", pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Endpoint: "s3.example", Region: "eu", Credentials: secret}, "needs bucket, endpoint and region"},
+		{"s3 without endpoint", pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "b", Region: "eu", Credentials: secret}, "needs bucket, endpoint and region"},
+		{"s3 without region", pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "b", Endpoint: "s3.example", Credentials: secret}, "needs bucket, endpoint and region"},
+		{"s3 shared without credentials", pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "b", Endpoint: "s3.example", Region: "eu"}, "shared credentials need credentials.secretRef"},
+		{"azure without container", pgshardv1alpha1.ObjectStoreSpec{Type: "azure", Credentials: secret}, "needs container"},
+		{"azure without credentials", pgshardv1alpha1.ObjectStoreSpec{Type: "azure", Container: "c"}, "azure store needs credentials.secretRef"},
+		{"gcs without bucket", pgshardv1alpha1.ObjectStoreSpec{Type: "gcs", Credentials: secret}, "gcs store needs bucket"},
+		{"gcs service without credentials", pgshardv1alpha1.ObjectStoreSpec{Type: "gcs", Bucket: "b"}, "service and token credentials need"},
+		{"sftp without host settings", pgshardv1alpha1.ObjectStoreSpec{Type: "sftp", Credentials: secret}, "needs sftp.host and sftp.user"},
+		{"sftp without credentials", pgshardv1alpha1.ObjectStoreSpec{Type: "sftp", SFTP: &pgshardv1alpha1.SFTPStoreSpec{Host: "h", User: "u"}}, "sftp store needs credentials.secretRef"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			mustReject(t, policy(strings.ToLower(strings.ReplaceAll(c.name, " ", "-")), c.store), c.want)
+		})
+	}
+
+	// The complete forms, and posix which needs nothing.
+	for _, c := range []struct {
+		name  string
+		store pgshardv1alpha1.ObjectStoreSpec
+	}{
+		{"s3", pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "b", Endpoint: "s3.example", Region: "eu", Credentials: secret}},
+		{"s3 web-id", pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "b", Endpoint: "s3.example", Region: "eu", CredentialType: "web-id"}},
+		{"azure", pgshardv1alpha1.ObjectStoreSpec{Type: "azure", Container: "c", Credentials: secret}},
+		{"gcs auto", pgshardv1alpha1.ObjectStoreSpec{Type: "gcs", Bucket: "b", CredentialType: "auto"}},
+		{"sftp", pgshardv1alpha1.ObjectStoreSpec{Type: "sftp", SFTP: &pgshardv1alpha1.SFTPStoreSpec{Host: "h", User: "u"}, Credentials: secret}},
+		{"posix", pgshardv1alpha1.ObjectStoreSpec{Type: "posix"}},
+	} {
+		t.Run("accepts "+c.name, func(t *testing.T) {
+			if err := create(t, policy("ok-"+strings.ReplaceAll(c.name, " ", "-"), c.store)); err != nil {
+				t.Fatalf("a complete %s store must be accepted: %v", c.name, err)
+			}
+		})
 	}
 }
