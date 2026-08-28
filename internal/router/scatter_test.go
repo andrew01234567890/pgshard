@@ -503,3 +503,34 @@ func TestScatterReplaysSetRole(t *testing.T) {
 		t.Fatalf("only %d shard(s) took part; the statement did not fan out, so this proves nothing", took)
 	}
 }
+
+// TestScatterSetsUpEveryShardConcurrently pins the shape of fan-out
+// setup: it costs a round trip, not one per shard. Setting a participant
+// up (Reserve, then the session state statement drained before the next
+// shard is touched) used to run in a sequential loop, so a wide fan-out
+// spent N x RTT before any shard had begun executing.
+func TestScatterSetsUpEveryShardConcurrently(t *testing.T) {
+	const (
+		shards = 32
+		delay  = 20 * time.Millisecond
+	)
+	h := newShardedHarnessShards(t, Config{}, shards)
+	for _, fp := range h.poolers {
+		fp.reserveDelay = delay
+	}
+	ctx := context.Background()
+	conn := h.connect(t, h.dsn()+"&default_query_exec_mode=simple_protocol")
+	// Any session setting makes the participants reserve a backend.
+	if _, err := conn.Exec(ctx, "set timezone to 'UTC'"); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	if _, err := conn.Exec(ctx, "select * from orders"); err != nil {
+		t.Fatal(err)
+	}
+	took := time.Since(start)
+	if took > shards/4*delay {
+		t.Errorf("scatter over %d shards took %s with a %s reserve delay, want the cost of a few round trips, not one per shard", shards, took, delay)
+	}
+}

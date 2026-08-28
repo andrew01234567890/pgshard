@@ -37,7 +37,14 @@ func newShardedHarness(t testing.TB) *shardedHarness {
 // Decisions settings.
 func newShardedHarnessWith(t testing.TB, cfg Config) *shardedHarness {
 	t.Helper()
-	ranges, err := placement.Split(4)
+	return newShardedHarnessShards(t, cfg, 4)
+}
+
+// newShardedHarnessShards is newShardedHarnessWith over a chosen number of
+// shards.
+func newShardedHarnessShards(t testing.TB, cfg Config, shards int) *shardedHarness {
+	t.Helper()
+	ranges, err := placement.Split(shards)
 	if err != nil {
 		t.Fatal(err)
 	}

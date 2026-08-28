@@ -56,6 +56,9 @@ type fakePooler struct {
 	maxPrepared string
 	failPrepare bool
 	prepared    []string
+	// reserveDelay holds every Reserve back, so a test can measure whether
+	// a fan-out pays that cost once or once per shard.
+	reserveDelay time.Duration
 }
 
 func (f *fakePooler) preparedGIDs() []string {
@@ -236,6 +239,9 @@ func (f *fakePooler) fence(g *pgshardv1.Generation) *pgshardv1.Error {
 }
 
 func (f *fakePooler) Reserve(_ context.Context, req *pgshardv1.ReserveRequest) (*pgshardv1.ReserveResponse, error) {
+	if f.reserveDelay > 0 {
+		time.Sleep(f.reserveDelay)
+	}
 	if e := f.fence(req.Generation); e != nil {
 		return &pgshardv1.ReserveResponse{Error: e}, nil
 	}
