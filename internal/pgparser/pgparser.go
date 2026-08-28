@@ -146,26 +146,26 @@ func (p *Parser) Parse(ctx context.Context, sql string) (*ParseResult, error) {
 	return res, nil
 }
 
-type parseOutcome struct {
-	res *ParseResult
-	err error
-}
-
+// parseWithContext parses sql, refusing before and after if the caller has
+// gone away.
+//
+// It used to run the parse on a goroutine and select on the context. That
+// bought nothing: the parse itself cannot be interrupted, so a cancelled
+// caller only abandoned a parse that carried on running and threw its
+// result away. What it cost was a channel and a goroutine on every cache
+// miss. The check after the parse keeps the caller's side of that
+// behaviour -- a context that ends mid-parse still yields its error rather
+// than a result -- and the length limit enforced above bounds how long a
+// cancelled caller can be kept waiting.
 func parseWithContext(ctx context.Context, sql string) (*ParseResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	done := make(chan parseOutcome, 1)
-	go func() {
-		res, err := Parse(sql)
-		done <- parseOutcome{res, err}
-	}()
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case out := <-done:
-		return out.res, out.err
+	res, err := Parse(sql)
+	if cerr := ctx.Err(); cerr != nil {
+		return nil, cerr
 	}
+	return res, err
 }
 
 // Parse parses sql without limits or caching.
