@@ -44,17 +44,17 @@ func TestShardConnInfo(t *testing.T) {
 	ref := controller.ShardRef{Set: "default", ID: 1}
 	explicit := shardDSNFlag{ref: "postgres://postgres:p%27w@10.0.0.5:5433/postgres?sslmode=disable"}
 	got, err := shardConnInfo(ctx, nil, explicit, "", ref, "app")
-	if err != nil || got != "host=10.0.0.5 port=5433 user=postgres dbname=app password='p\\'w' sslmode=disable" {
+	if err != nil || got != "host='10.0.0.5' port=5433 user='postgres' dbname='app' password='p\\'w' sslmode=disable" {
 		t.Fatalf("explicit DSN: %q %v", got, err)
 	}
 	if _, err := shardConnInfo(ctx, nil, nil, "", ref, "app"); err == nil {
 		t.Fatal("no DSN and no template must fail")
 	}
-	got, err = withDatabase("host=h port=5432 user=u sslmode=disable", "db")
-	if err != nil || got != "host=h port=5432 user=u dbname=db sslmode=disable" {
-		t.Fatalf("withDatabase: %q %v", got, err)
+	got, err = controller.ConnInfo("host=h port=5432 user=u sslmode=disable", "db")
+	if err != nil || got != "host='h' port=5432 user='u' dbname='db' sslmode=disable" {
+		t.Fatalf("ConnInfo: %q %v", got, err)
 	}
-	if _, err := withDatabase("postgres://[bad", "db"); err == nil {
+	if _, err := controller.ConnInfo("postgres://[bad", "db"); err == nil {
 		t.Fatal("unparsable DSN must fail")
 	}
 }

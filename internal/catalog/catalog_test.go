@@ -878,6 +878,15 @@ func runSuite(t *testing.T, img pgImage) {
 		})
 	})
 
+	// A database name reaches libpq connection strings that carry a shard
+	// superuser credential, where whitespace separates keywords.
+	t.Run("database_names_cannot_carry_connection_syntax", func(t *testing.T) {
+		for _, name := range []string{"", "app db", "app\nhost=evil.example", "app\thost=evil.example", "a'b", `a\b`} {
+			_, err := conn.Exec(ctx, `INSERT INTO pgshard.databases (name) VALUES ($1)`, name)
+			expectPgError(t, err, "23514", "database_name_is_connection_safe")
+		}
+	})
+
 	t.Run("tables_constraints", func(t *testing.T) {
 		mustExec(t, conn, `INSERT INTO pgshard.databases (name) VALUES ('app')`)
 		_, err := conn.Exec(ctx, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, hash_version)
