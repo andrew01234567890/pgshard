@@ -45,6 +45,12 @@ type fakeOps struct {
 	journaled       map[string]int
 	lsn             int64
 	advance         int64
+	paused          bool
+	pauses          int
+	// caughtUpUntil, when set, makes CaughtUp report behind from that call
+	// onwards, so a test can park the run at a chosen check.
+	caughtUpUntil int
+	caughtUpCalls int
 }
 
 func newFakeOps() *fakeOps {
@@ -74,12 +80,18 @@ func (f *fakeOps) Sweep(context.Context) error {
 	return f.sweepErr
 }
 func (f *fakeOps) Positions(context.Context) (map[string]int64, error) {
-	f.lsn += f.advance
+	if !f.paused {
+		f.lsn += f.advance
+	}
 	return map[string]int64{"0": f.lsn}, f.step(StepPositions)
 }
 func (f *fakeOps) CaughtUp(_ context.Context, pos map[string]int64) (bool, string, error) {
 	if pos["0"] != f.lsn {
 		return false, "", fmt.Errorf("caught-up check against stale position %d, current %d", pos["0"], f.lsn)
+	}
+	f.caughtUpCalls++
+	if f.caughtUpUntil > 0 && f.caughtUpCalls > f.caughtUpUntil {
+		return false, "lagging", f.step(StepCatchUp)
 	}
 	return f.caughtUp, "lagging", f.step(StepCatchUp)
 }
@@ -96,10 +108,25 @@ func (f *fakeOps) Journal(_ context.Context, id string) error {
 	f.journaled[id]++
 	return f.step(StepJournal)
 }
-func (f *fakeOps) Flip(context.Context, string) error { return f.step(StepFlip) }
-func (f *fakeOps) Swap(context.Context) error         { return f.step(StepSwap) }
-func (f *fakeOps) Release(context.Context) error      { f.fenced = false; return f.step(StepRelease) }
-func (f *fakeOps) Complete(context.Context) error     { return f.step("complete") }
+func (f *fakeOps) Flip(context.Context, string) error   { return f.step(StepFlip) }
+func (f *fakeOps) DisableForward(context.Context) error { return f.step(StepSwap) }
+func (f *fakeOps) EnableReverse(context.Context) error  { return f.step("enable_reverse") }
+
+// PauseSources records the pause and, while paused, stops the fake source
+// advancing: that is what a write pause buys, and a test that keeps the
+// source moving through it is not testing the pause.
+func (f *fakeOps) PauseSources(_ context.Context, pause bool) error {
+	if err := f.step("pause_sources"); err != nil {
+		return err
+	}
+	f.paused = pause
+	if pause {
+		f.pauses++
+	}
+	return nil
+}
+func (f *fakeOps) Release(context.Context) error  { f.fenced = false; return f.step(StepRelease) }
+func (f *fakeOps) Complete(context.Context) error { return f.step("complete") }
 func (f *fakeOps) Rollback(context.Context) error {
 	if err := f.step("rollback"); err != nil {
 		return err
@@ -150,7 +177,8 @@ func TestCutoverHappyPath(t *testing.T) {
 	h := newCutoverHarness(t)
 	h.runUntil(t, StageSwitched)
 	want := []string{"gate", StepFence, StepDrain, StepSweep, StepPositions, StepCatchUp, StepPositions, StepVerify, StepSequences, StepReverse, StepJournal,
-		StepPositions, StepCatchUp, StepFlip, StepPositions, StepCatchUp, StepSwap, StepRelease}
+		StepPositions, StepCatchUp, StepFlip,
+		"pause_sources", StepPositions, StepCatchUp, StepSwap, "pause_sources", "enable_reverse", StepRelease}
 	if got := strings.Join(h.ops.calls, ","); got != strings.Join(want, ",") {
 		t.Fatalf("calls %s", got)
 	}
@@ -520,5 +548,66 @@ func TestCaughtUpIsNeverVacuouslyTrue(t *testing.T) {
 	// A question with content is left to the slot comparison.
 	if got := nothingToCompare("default", []int32{0, 1}, []int32{2}, map[string]int64{"0": 10, "1": 20}); len(got) != 0 {
 		t.Fatalf("a complete question must not be refused: %v", got)
+	}
+}
+
+// TestSwapPausesTheSourcesAroundTheLastCheck: the swap sampled the source
+// positions, checked the targets had applied them, and only then disabled
+// the forward subscriptions. A router that had not yet reloaded its
+// snapshot could commit to a source in that gap, and the write was
+// acknowledged on a group whose replication was about to be turned off.
+// The check speaks for the position it sampled and nothing else, so the
+// sources have to be unable to accept a write between the two.
+func TestSwapPausesTheSourcesAroundTheLastCheck(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.runUntil(t, StageSwitched)
+	calls := strings.Join(h.ops.calls, ",")
+	swap := strings.Index(calls, StepSwap)
+	pause := strings.LastIndex(calls[:swap], "pause_sources")
+	if swap < 0 || pause < 0 {
+		t.Fatalf("calls %s", calls)
+	}
+	// Nothing between the pause and the disable may sample or decide
+	// anything the pause was taken to make safe -- and the disable itself
+	// must land inside it.
+	between := calls[pause:swap]
+	if !strings.Contains(between, StepPositions) || !strings.Contains(between, StepCatchUp) {
+		t.Fatalf("the last check must happen inside the pause: %s", between)
+	}
+	if h.ops.paused {
+		t.Fatal("the sources must be writable again once the forward subscriptions are off")
+	}
+	// The reverse subscriptions apply to the sources, so they start after
+	// the pause is lifted.
+	if strings.Index(calls, "enable_reverse") < strings.LastIndex(calls, "pause_sources") {
+		t.Fatalf("reverse replication must start after the pause is lifted: %s", calls)
+	}
+}
+
+// TestSwapLeavesTheSourcesWritableWhenItCannotFinish: a workflow that stops
+// at the swap must not leave the sources refusing writes for good.
+func TestSwapLeavesTheSourcesWritableWhenItCannotFinish(t *testing.T) {
+	h := newCutoverHarness(t)
+	// The catch-up step and the flip ask first; the swap's own check is the
+	// third, and that is the one this parks on.
+	h.ops.caughtUpUntil = 2
+	h.runUntil(t, StageSwitching)
+	var err error
+	for i := 0; h.wf.cutover.Step != StepSwap || err == nil; i++ {
+		if i > 50 {
+			t.Fatalf("never parked at %s; at %s (%v)", StepSwap, h.wf.cutover.Step, err)
+		}
+		_, err = h.c.cutover(context.Background(), h.wf, h.ops)
+	}
+	// After the journal a step that cannot finish is reported rather than
+	// silently retried, which is what parks the run here.
+	if !errors.Is(err, errRetry) {
+		t.Fatalf("swap gave up with %v, want a retry", err)
+	}
+	if h.ops.paused {
+		t.Fatal("the sources were left refusing writes after the swap gave up")
+	}
+	if h.ops.pauses == 0 {
+		t.Fatal("the swap must have paused them in the first place")
 	}
 }
