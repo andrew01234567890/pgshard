@@ -440,3 +440,72 @@ func TestConvergeRefusesToPromoteAnUnsafeDesignatedPrimary(t *testing.T) {
 		}
 	})
 }
+
+// TestLoadStateReconstructsThePrimaryFromTheFence: the designated primary
+// and the fencing epoch were read only from the PgShardGroup status, and a
+// blank status designated member 0 at epoch 0 -- whoever actually held the
+// data and the fence. An etcd restore, a deleted object or a status-schema
+// migration was therefore enough to promote the wrong member and lose
+// every commit the two differ by. The group Lease carries the same two
+// values, written before any promotion.
+func TestLoadStateReconstructsThePrimaryFromTheFence(t *testing.T) {
+	r, _, fa, c := healthyCluster(t, "fence")
+	g := Groups(c)[1]
+
+	// A failover has moved the primary to member 1 at epoch 7, so that is
+	// what the fence says.
+	if err := r.fenceLease(context.Background(), c, g, g.MemberName(0), FenceHolder, 7, g.MemberName(1)); err != nil {
+		t.Fatal(err)
+	}
+	// ...and the status is lost.
+	var pg pgshardv1alpha1.PgShardGroup
+	get(t, g.Prefix(), &pg)
+	base := pg.DeepCopy()
+	pg.Status.Primary, pg.Status.Epoch = "", 0
+	if err := k8sClient.Status().Patch(context.Background(), &pg, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+
+	before := len(fa.promotes)
+	st, err := r.loadState(context.Background(), c, g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.primary != g.MemberName(1) {
+		t.Fatalf("designated %s, want the member the fence names (%s)", st.primary, g.MemberName(1))
+	}
+	if st.epoch < 7 {
+		t.Fatalf("epoch %d, want at least the fenced 7", st.epoch)
+	}
+	if got := groupStatus(t, g.Prefix()); got.Primary != g.MemberName(1) || got.Epoch < 7 {
+		t.Fatalf("status not written back: %+v", got)
+	}
+	if len(fa.promotes) != before {
+		t.Fatalf("reading the state must promote nothing: %v", fa.promotes[before:])
+	}
+}
+
+// TestLoadStateStillBootstrapsMemberZero: with nothing ever promoted there
+// is no fence to read, and the first member is the primary.
+func TestLoadStateStillBootstrapsMemberZero(t *testing.T) {
+	r, _, _, c := healthyCluster(t, "boot")
+	g := Groups(c)[1]
+	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: g.LeaseName(), Namespace: "default"}}
+	if err := k8sClient.Delete(context.Background(), lease); client.IgnoreNotFound(err) != nil {
+		t.Fatal(err)
+	}
+	var pg pgshardv1alpha1.PgShardGroup
+	get(t, g.Prefix(), &pg)
+	base := pg.DeepCopy()
+	pg.Status.Primary, pg.Status.Epoch = "", 0
+	if err := k8sClient.Status().Patch(context.Background(), &pg, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+	st, err := r.loadState(context.Background(), c, g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.primary != g.MemberName(0) || st.epoch != 0 {
+		t.Fatalf("bootstrap designated %s at epoch %d, want %s at 0", st.primary, st.epoch, g.MemberName(0))
+	}
+}

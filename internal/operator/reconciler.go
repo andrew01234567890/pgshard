@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"sync"
 	"time"
 
@@ -88,8 +89,10 @@ func (r *ClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// groupState is the persistent failover state of a group, read from and
-// written to the PgShardGroup status.
+// groupState is the failover state of a group. The PgShardGroup status is
+// where it is kept and written back to; the group Lease carries the same
+// primary and epoch, and loadState reconstructs from it when the status
+// has been lost.
 type groupState struct {
 	primary string
 	epoch   int64
@@ -377,8 +380,29 @@ func (r *ClusterReconciler) ensureOwned(ctx context.Context, owner client.Object
 	return err
 }
 
-// loadState reads the group's designated primary and epoch, designating
-// member 0 at epoch 0 for a new group.
+// leaseState reads the primary and epoch the fencing protocol last
+// published on the group Lease. The Lease is written before any promotion
+// and outlives the PgShardGroup, so it is what says who the primary is
+// when the status does not.
+func (r *ClusterReconciler) leaseState(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group) (string, int64) {
+	var lease coordinationv1.Lease
+	if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: g.LeaseName()}, &lease); err != nil {
+		return "", 0
+	}
+	epoch, err := strconv.ParseInt(lease.Annotations[AnnotationPrimaryEpoch], 10, 64)
+	if err != nil {
+		epoch = 0
+	}
+	return lease.Annotations[AnnotationPrimary], epoch
+}
+
+// loadState reads the group's designated primary and epoch. The
+// PgShardGroup status is where they are kept, but it is not the only
+// record of them and it is losable -- an etcd restore, a deleted object, a
+// status-schema migration -- so a group whose status says nothing is
+// reconstructed from the group Lease before member 0 is designated at
+// epoch 0. Designating member 0 while another member holds the fence and
+// the data is how a promotion loses every commit the two differ by.
 func (r *ClusterReconciler) loadState(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group) (groupState, error) {
 	pg := r.Renderer.PgShardGroup(c, g)
 	if err := r.ensureOwned(ctx, c, pg, nil); err != nil {
@@ -416,12 +440,26 @@ func (r *ClusterReconciler) loadState(ctx context.Context, c *pgshardv1alpha1.Pg
 	// only ever increase.
 	stale := st.primary != "" && !slices.Contains(g.MemberNames(), st.primary)
 	if stale || st.primary == "" {
-		st.primary = g.MemberName(0)
-		base := pg.DeepCopy()
-		pg.Status.Primary = st.primary
-		if !stale {
-			pg.Status.Epoch = 0
+		fenced, fencedEpoch := r.leaseState(ctx, c, g)
+		switch {
+		case st.primary == "" && slices.Contains(g.MemberNames(), fenced):
+			// The fence names a member that still exists: it holds the
+			// data a promotion would otherwise discard, and its epoch is
+			// the one the poolers are refusing writes below.
+			st.primary, st.epoch = fenced, max(st.epoch, fencedEpoch)
+		default:
+			st.primary = g.MemberName(0)
+			// The epoch fences writes against a primary that may still be
+			// running, so it only ever increases: it is left alone for a
+			// designated primary that has gone out of the member set, and
+			// for a group the fence remembers, and reset only where
+			// nothing has ever been promoted.
+			if !stale {
+				st.epoch = max(st.epoch, fencedEpoch)
+			}
 		}
+		base := pg.DeepCopy()
+		pg.Status.Primary, pg.Status.Epoch = st.primary, st.epoch
 		if err := r.Status().Patch(ctx, pg, client.MergeFrom(base)); err != nil {
 			return groupState{}, err
 		}
