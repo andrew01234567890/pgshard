@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -156,20 +157,81 @@ func (p PgxProber) EnsureCatalogCopy(ctx context.Context, srcDSN, tgtDSN string)
 	if subExists {
 		return nil
 	}
-	tables, err := schemaTables(ctx, tgt, "pgshard")
-	if err != nil {
+	if err := clearCatalogSchema(ctx, tgt, "pgshard"); err != nil {
 		return err
-	}
-	if len(tables) > 0 {
-		if _, err := tgt.Exec(ctx, `TRUNCATE `+strings.Join(tables, ", ")+` RESTART IDENTITY CASCADE`); err != nil {
-			return fmt.Errorf("truncate catalog target: %w", err)
-		}
 	}
 	if _, err := tgt.Exec(ctx, fmt.Sprintf(`CREATE SUBSCRIPTION %s CONNECTION %s PUBLICATION %s WITH (copy_data = true, streaming = parallel)`,
 		CatalogUpgradeSubscription, quoteLiteral(srcDSN), CatalogUpgradePublication)); err != nil {
 		return fmt.Errorf("create subscription: %w", err)
 	}
 	return nil
+}
+
+// mapTablesInDeleteOrder are the tables that refuse TRUNCATE, children
+// first. Row-level constraint triggers never fire on TRUNCATE, so emptying
+// the shard map that way would go past the coverage, numbering and
+// workflow-ownership checks that guard it -- a refusal the catalog is
+// right to make, and one a freshly migrated target trips over, because it
+// carries a bootstrap shard set row that the copy has to clear first.
+// DELETE fires those checks and they are satisfied by an empty map.
+// The names are as quote_ident renders them, which is unquoted for these:
+// the same form schemaTables and truncateGuardedTables return, so they
+// compare.
+var mapTablesInDeleteOrder = []string{"pgshard.shard_ranges", "pgshard.shard_sets"}
+
+// clearCatalogSchema empties the schema so the copy can be re-run: TRUNCATE
+// where it is allowed, DELETE for the shard map. A table that refuses
+// TRUNCATE and is not one this knows how to delete is an error rather than
+// a silent skip -- the copy would then start against rows it did not
+// clear.
+func clearCatalogSchema(ctx context.Context, conn *pgx.Conn, schema string) error {
+	all, err := schemaTables(ctx, conn, schema)
+	if err != nil {
+		return err
+	}
+	refusing, err := truncateGuardedTables(ctx, conn, schema)
+	if err != nil {
+		return err
+	}
+	for _, t := range refusing {
+		if !slices.Contains(mapTablesInDeleteOrder, t) {
+			return fmt.Errorf("catalog target: %s refuses TRUNCATE and the copy does not know how to clear it", t)
+		}
+	}
+	for _, t := range mapTablesInDeleteOrder {
+		if !slices.Contains(all, t) {
+			continue
+		}
+		if _, err := conn.Exec(ctx, `DELETE FROM `+t); err != nil {
+			return fmt.Errorf("clear catalog target %s: %w", t, err)
+		}
+	}
+	var truncate []string
+	for _, t := range all {
+		if !slices.Contains(refusing, t) {
+			truncate = append(truncate, t)
+		}
+	}
+	if len(truncate) > 0 {
+		if _, err := conn.Exec(ctx, `TRUNCATE `+strings.Join(truncate, ", ")+` RESTART IDENTITY CASCADE`); err != nil {
+			return fmt.Errorf("truncate catalog target: %w", err)
+		}
+	}
+	return nil
+}
+
+// truncateGuardedTables lists the schema's tables carrying a user BEFORE
+// TRUNCATE trigger, so the set is read from the catalog rather than
+// remembered here.
+func truncateGuardedTables(ctx context.Context, conn *pgx.Conn, schema string) ([]string, error) {
+	rows, err := conn.Query(ctx, `SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname)
+		FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND NOT g.tgisinternal AND (g.tgtype & 32) <> 0
+		GROUP BY 1 ORDER BY 1`, schema)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
 func schemaTables(ctx context.Context, conn *pgx.Conn, schema string) ([]string, error) {
