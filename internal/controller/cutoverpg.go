@@ -1245,6 +1245,52 @@ func (o *pgCutover) Complete(ctx context.Context) error {
 			}
 		}
 	}
-	_, err := o.c.Pool.Exec(ctx, `DELETE FROM pgshard.serving WHERE shard_set = $1`, o.srcSet)
-	return err
+	if _, err := o.c.Pool.Exec(ctx, `DELETE FROM pgshard.serving WHERE shard_set = $1`, o.srcSet); err != nil {
+		return err
+	}
+	// The retired set now has no replication in either direction and will
+	// never serve again, but its pods stay up for the retirement window
+	// and its -rw Service still answers. A client connected straight to it
+	// -- which is not the supported path, but is reachable -- would have
+	// its writes acknowledged by a primary nothing reads from again, and
+	// lose them at deletion with no error anywhere. Refusing is the
+	// difference between losing data and being told no.
+	//
+	// Which set that is has to be read, not assumed. A run that was rolled
+	// back completes with the roles the other way round: its source set is
+	// serving again and its targets are the retired ones. Pausing the
+	// workflow's source set unconditionally made the live set read-only,
+	// and the next upgrade could not so much as create a publication on
+	// it.
+	set, ids := o.srcSet, o.srcIDs
+	serving, err := o.setIsServing(ctx, set)
+	if err != nil {
+		o.c.logger().Info("reshard complete: serving state unreadable, leaving the sets writable", "workflow", o.wf.id, "err", err)
+		return nil
+	}
+	if serving {
+		set, ids = o.wf.set, o.wf.ids
+		if serving, err := o.setIsServing(ctx, set); err != nil || serving {
+			// Neither is retired, or the answer is not readable. Making a
+			// serving set read-only is worse than leaving a retired one
+			// writable, so do neither.
+			return nil
+		}
+	}
+	// Best effort, and last: a set that cannot be reached is already
+	// beyond reach of a client too, and a retirement that has otherwise
+	// finished must not be undone by it.
+	if err := o.pauseSet(ctx, set, ids, true); err != nil {
+		o.c.logger().Info("reshard complete: retired set not made read-only", "workflow", o.wf.id, "set", set, "err", err)
+	}
+	return nil
+}
+
+// setIsServing reports whether a shard set is the one routing goes to.
+func (o *pgCutover) setIsServing(ctx context.Context, set string) (bool, error) {
+	var state string
+	if err := o.c.Pool.QueryRow(ctx, `SELECT state FROM pgshard.shard_sets WHERE shard_set = $1`, set).Scan(&state); err != nil {
+		return false, err
+	}
+	return state == catalog.ShardSetServing, nil
 }

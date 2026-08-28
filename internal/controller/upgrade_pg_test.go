@@ -89,6 +89,22 @@ func TestUpgrade18To19OnPostgres(t *testing.T) {
 	if set := queryOne[string](t, f.catalog, `SELECT shard_set FROM pgshard.shard_sets WHERE state = 'serving'`); set != "g2" {
 		t.Fatalf("serving set %s", set)
 	}
+
+	// The retired set keeps running for the retirement window and its -rw
+	// Service still answers. Nothing reads from it again, so a write made
+	// straight to it would be acknowledged and then deleted with the
+	// group; being told no is the difference between that and losing data.
+	for sid := range 2 {
+		old := connect(t, f.appDSN("default", int32(sid)))
+		if _, err := old.Exec(ctx, `INSERT INTO orders (tenant_id, note) VALUES (1, 'after-retirement')`); err == nil {
+			t.Errorf("retired source %d still accepted a write", sid)
+		} else if !strings.Contains(err.Error(), "read-only") {
+			t.Errorf("retired source %d refused with %v, want a read-only transaction error", sid, err)
+		}
+		if _, err := old.Exec(ctx, `SELECT count(*) FROM orders`); err != nil {
+			t.Errorf("retired source %d must still answer reads: %v", sid, err)
+		}
+	}
 	for tid := range 2 {
 		tgt := connect(t, f.appDSN("g2", int32(tid)))
 		if v := queryOne[string](t, tgt, `SHOW server_version_num`); !strings.HasPrefix(v, "19") {
@@ -182,6 +198,13 @@ func TestUpgradeRollbackOnPostgres(t *testing.T) {
 	waitFor(t, 30*time.Second, func() bool {
 		return queryOne[int64](t, src, `SELECT count(*) FROM orders WHERE note = 'written-on-19'`) == 1
 	}, "post-switch write must flow back to the source")
+	// A rolled-back run completes with the roles the other way round: the
+	// set it calls its source is serving again. Making that one read-only
+	// because it is the workflow's source stops the next upgrade before it
+	// can create a publication on it.
+	if _, err := src.Exec(context.Background(), `INSERT INTO orders (tenant_id, note) VALUES ($1, 'after-rollback')`, tenant); err != nil {
+		t.Fatalf("the set serving after a rollback must still take writes: %v", err)
+	}
 	if n := queryOne[int64](t, src, `SELECT count(*) FROM orders WHERE note = 'late-write-on-19'`); lateWritten && n != 1 {
 		t.Fatalf("write during the rollback catch-up lost: %d", n)
 	}
