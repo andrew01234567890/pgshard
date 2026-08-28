@@ -8,6 +8,13 @@ import (
 
 const flushEveryRows = 256
 
+// flushEveryCopyBytes bounds what a COPY OUT may hold before it reaches the
+// client. Rows are flushed by count, but a COPY chunk is of no fixed size,
+// so this one counts bytes: without it an export sat in the backend buffer
+// until ReadyForQuery, making the router's memory proportional to the size
+// of the export and the client's first byte wait for its last.
+const flushEveryCopyBytes = 64 << 10
+
 // resultWriter implements ResultWriter over the session's backend buffer.
 type resultWriter struct {
 	s     *session
@@ -76,10 +83,21 @@ func (w *resultWriter) CopyIn(overallFormat byte, columnFormats []uint16) (CopyI
 }
 
 func (w *resultWriter) CopyOut(overallFormat byte, columnFormats []uint16) error {
+	w.s.copyBytes = 0
 	return w.send(&pgproto3.CopyOutResponse{OverallFormat: overallFormat, ColumnFormatCodes: columnFormats})
 }
 
-func (w *resultWriter) CopyData(data []byte) error { return w.send(&pgproto3.CopyData{Data: data}) }
+func (w *resultWriter) CopyData(data []byte) error {
+	if err := w.send(&pgproto3.CopyData{Data: data}); err != nil {
+		return err
+	}
+	w.s.copyBytes += len(data)
+	if w.s.copyBytes >= flushEveryCopyBytes {
+		w.s.copyBytes = 0
+		return w.flush()
+	}
+	return nil
+}
 
 func (w *resultWriter) CopyDone() error { return w.send(&pgproto3.CopyDone{}) }
 
