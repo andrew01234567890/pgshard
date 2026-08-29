@@ -204,6 +204,7 @@ func (m *merger) choose() (*unit, time.Duration) {
 		return nil, 0
 	}
 	now := m.now()
+	floors := m.commitFloors()
 	var pick *unit
 	var pickShard router.Shard
 	var wait time.Duration
@@ -217,7 +218,7 @@ func (m *merger) choose() (*unit, time.Duration) {
 			delete(m.heldSince, sh)
 			return u, 0
 		}
-		floor, known := m.slowestOther(sh)
+		floor, known := floors.without(sh)
 		eligible := !known || u.commitTS <= floor+m.opts.skew.Microseconds()
 		if !eligible {
 			since, held := m.heldSince[sh]
@@ -244,22 +245,50 @@ func (m *merger) choose() (*unit, time.Duration) {
 	return pick, 0
 }
 
-func (m *merger) slowestOther(self router.Shard) (int64, bool) {
-	var floor int64
-	known := false
+// commitFloors summarises the last commit timestamps once per pass. The
+// question asked of it -- the slowest shard other than this one -- used to
+// be answered by walking every shard again for each candidate, so aligning
+// skew cost the square of the shard count on every unit emitted. The two
+// smallest timestamps are all that can answer it: excluding one shard
+// removes at most the smallest, and then the second smallest stands in.
+type commitFloors struct {
+	min, next int64
+	at        router.Shard
+	seen      int
+}
+
+func (m *merger) commitFloors() commitFloors {
+	var f commitFloors
 	for _, sh := range m.shards {
-		if sh == self {
-			continue
-		}
 		ts, ok := m.lastCommit[sh]
 		if !ok {
 			continue
 		}
-		if !known || ts < floor {
-			floor, known = ts, true
+		switch {
+		case f.seen == 0 || ts < f.min:
+			f.next = f.min
+			f.min, f.at = ts, sh
+		case f.seen == 1 || ts < f.next:
+			f.next = ts
 		}
+		f.seen++
 	}
-	return floor, known
+	return f
+}
+
+// without is the slowest commit timestamp among the shards other than
+// self, and whether there is one.
+func (f commitFloors) without(self router.Shard) (int64, bool) {
+	switch {
+	case f.seen == 0:
+		return 0, false
+	case f.at != self:
+		return f.min, true
+	case f.seen == 1:
+		return 0, false
+	default:
+		return f.next, true
+	}
 }
 
 func (m *merger) emit(u *unit) error {
