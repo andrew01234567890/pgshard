@@ -7,7 +7,7 @@ package plan
 
 import (
 	"fmt"
-	"sort"
+	"slices"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
@@ -233,9 +233,14 @@ func (p Plan) Resolve(params Params) (Plan, error) {
 // finish turns per-term values into shards.
 func (p *Plan) finish(values [][]any) error {
 	var shards []int32
+	first := true
 	p.ShardKeyValues = nil
 	for _, vals := range values {
-		var termShards []int32
+		// Collected then sorted and compacted, rather than scanned for a
+		// duplicate on every value: an IN list of N values over S shards
+		// cost N*S comparisons here, and comparing two terms cost S*S
+		// again, on every Bind of a prepared statement.
+		termShards := make([]int32, 0, len(vals))
 		for _, v := range vals {
 			id, err := placement.KeyspaceID(v)
 			if err != nil {
@@ -245,24 +250,27 @@ func (p *Plan) finish(values [][]any) error {
 			if err != nil {
 				return pgwire.Errorf("57P03", "%v", err)
 			}
-			termShards = appendUnique(termShards, sh)
+			termShards = append(termShards, sh)
 			p.ShardKeyValues = append(p.ShardKeyValues, v)
 		}
-		if shards == nil {
-			shards = termShards
+		slices.Sort(termShards)
+		termShards = slices.Compact(termShards)
+		if first {
+			shards, first = termShards, false
 			continue
 		}
-		if !sameShards(shards, termShards) {
+		if !slices.Equal(shards, termShards) {
 			if p.multiRow {
 				return notYet("multi-row INSERT spanning shards is not available yet", "insert rows for one shard key value per statement")
 			}
 			return notYet("cross-shard join is not available yet", "join sharded tables only on equal shard keys")
 		}
 	}
-	if p.touches == Unsharded && !sameShards(shards, []int32{p.home}) {
+	if p.touches == Unsharded && !slices.Equal(shards, []int32{p.home}) {
 		return notYet("cross-shard join is not available yet", "unsharded tables live on the home shard; join them only with rows of that shard")
 	}
-	sort.Slice(shards, func(i, j int) bool { return shards[i] < shards[j] })
+	// Already sorted and unique by construction; kept explicit because the
+	// order is part of what callers rely on.
 	p.Shards = shards
 	return nil
 }
@@ -274,25 +282,6 @@ func appendUnique(s []int32, v int32) []int32 {
 		}
 	}
 	return append(s, v)
-}
-
-func sameShards(a, b []int32) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for _, x := range a {
-		found := false
-		for _, y := range b {
-			if x == y {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false
-		}
-	}
-	return true
 }
 
 // notYet builds the 0A000 refusal every unsupported shape reports.
