@@ -524,7 +524,11 @@ func TestReshardProvisionsTargetsAndCancels(t *testing.T) {
 	if got := catalogSQL(ctx, t, c, "SELECT string_agg(shard_set, ',' ORDER BY shard_set) FROM pgshard.serving"); got != "default" {
 		t.Fatalf("serving sets: %q", got)
 	}
-	waitFor(ctx, t, c, "copy caught up", 15*time.Minute, func() bool {
+	why := func() string {
+		return "; workflow: " + catalogSQL(ctx, t, c,
+			"SELECT coalesce(string_agg(state || ':' || (status->>'stage') || ' ' || coalesce(status->>'message', '') || ' progress=' || coalesce((status->'progress')::text, ''), ' | '), 'no workflow row') FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = 'g2'")
+	}
+	waitForWhy(ctx, t, c, "copy caught up", 15*time.Minute, why, func() bool {
 		got := catalogSQL(ctx, t, c, "SELECT coalesce(string_agg(state || ':' || (status->>'stage'), ','), '') FROM pgshard.workflows WHERE kind = 'reshard' AND spec->>'shard_set' = 'g2'")
 		if strings.HasPrefix(got, "failed") {
 			t.Fatalf("reshard workflow failed: %s", catalogSQL(ctx, t, c, "SELECT coalesce(error, '') || ' ' || status::text FROM pgshard.workflows WHERE kind = 'reshard'"))
