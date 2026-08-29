@@ -275,3 +275,69 @@ func TestExpireVerifyAndLogTail(t *testing.T) {
 		t.Fatalf("verify %v %v", err, tail)
 	}
 }
+
+// TestRepoFieldCannotInjectAnOption: pgbackrest.conf is key=value lines
+// and these values come from the cluster spec. A newline starts a line of
+// the attacker's choosing -- repo1-s3-endpoint redirects every backup and
+// WAL segment to a store of their own, repo1-storage-verify-tls=n removes
+// transport verification, repo1-cipher-type=none removes encryption at
+// rest. Backups are the one artifact holding a complete copy of all
+// tenant data.
+func TestRepoFieldCannotInjectAnOption(t *testing.T) {
+	base := func() Settings {
+		return Settings{Stanza: "demo-catalog-pg18", Repo: Repo{
+			Type: TypeS3, Bucket: "pgshard", Endpoint: "s3.example.com", Region: "us-east-1", Path: "/demo", KeyType: "web-id"}}
+	}
+	hostile := "x\nrepo1-s3-endpoint=attacker.example.com"
+
+	for name, mutate := range map[string]func(*Settings){
+		"bucket":         func(s *Settings) { s.Repo.Bucket = hostile },
+		"endpoint":       func(s *Settings) { s.Repo.Endpoint = hostile },
+		"region":         func(s *Settings) { s.Repo.Region = hostile },
+		"path":           func(s *Settings) { s.Repo.Path = "/x\nrepo1-cipher-type=none" },
+		"caFile":         func(s *Settings) { s.Repo.CAFile = hostile },
+		"uriStyle":       func(s *Settings) { s.Repo.URIStyle = hostile },
+		"keyType":        func(s *Settings) { s.Repo.KeyType = hostile },
+		"credentialsDir": func(s *Settings) { s.Repo.CredentialsDir = hostile },
+		"host":           func(s *Settings) { s.Repo.Host = hostile },
+		"hostUser":       func(s *Settings) { s.Repo.HostUser = hostile },
+		"hostKeyCheck":   func(s *Settings) { s.Repo.HostKeyCheck = hostile },
+		"stanza":         func(s *Settings) { s.Stanza = hostile },
+		"carriage":       func(s *Settings) { s.Repo.Endpoint = "x\rrepo1-s3-endpoint=attacker.example.com" },
+		"equals":         func(s *Settings) { s.Repo.Endpoint = "x=y" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := base()
+			mutate(&s)
+			if err := s.Validate(); err == nil {
+				t.Fatal("Validate accepted a value that can write another option")
+			}
+			out, err := Render(s, "/var/lib/postgresql/data/pgdata", 5432)
+			if err == nil {
+				t.Fatal("Render accepted it")
+			}
+			if out != "" {
+				t.Errorf("Render returned a partial file: %q", out)
+			}
+		})
+	}
+
+	// A legitimate configuration still renders, and every line of it is
+	// one option -- the property that matters, rather than a check for
+	// one known victim.
+	out, err := Render(base(), "/var/lib/postgresql/data/pgdata", 5432)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if line == "" || strings.HasPrefix(line, "[") || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.Count(line, "=") < 1 {
+			t.Errorf("line %q is not an option", line)
+		}
+	}
+	if n := strings.Count(out, "repo1-s3-endpoint="); n != 1 {
+		t.Errorf("repo1-s3-endpoint appears %d times", n)
+	}
+}
