@@ -4,6 +4,7 @@ package upgrade
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
