@@ -43,9 +43,22 @@ type PostgreSQLSpec struct {
 	// +kubebuilder:default=oltp
 	// +optional
 	Profile string `json:"profile,omitempty"`
-	// Parameters are extra postgresql.conf settings. Keys that pgshard owns
-	// (fsync, full_page_writes, wal_level, max_prepared_transactions, ssl,
-	// synchronous_commit) are rejected.
+	// Parameters are extra postgresql.conf settings. A key must be a
+	// PostgreSQL setting name and nothing else: the agent writes the name
+	// as it stands, so one carrying a newline would write a second setting
+	// of its own and defeat every rule below, which names settings.
+	//
+	// Keys that pgshard owns (fsync, full_page_writes, wal_level,
+	// max_prepared_transactions, ssl, synchronous_commit) are rejected,
+	// and so are the settings that make PostgreSQL run a command:
+	// archive_command, restore_command, archive_cleanup_command and
+	// recovery_end_command each execute in the member pod, and pgshard
+	// sets the ones it needs itself.
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k.matches('^[A-Za-z_][A-Za-z0-9_.]*$'))",message="every parameter key must be a PostgreSQL setting name"
+	// +kubebuilder:validation:XValidation:rule="!('archive_command' in self)",message="parameters must not set archive_command"
+	// +kubebuilder:validation:XValidation:rule="!('restore_command' in self)",message="parameters must not set restore_command"
+	// +kubebuilder:validation:XValidation:rule="!('archive_cleanup_command' in self)",message="parameters must not set archive_cleanup_command"
+	// +kubebuilder:validation:XValidation:rule="!('recovery_end_command' in self)",message="parameters must not set recovery_end_command"
 	// +kubebuilder:validation:XValidation:rule="!('fsync' in self)",message="parameters must not set fsync"
 	// +kubebuilder:validation:XValidation:rule="!('full_page_writes' in self)",message="parameters must not set full_page_writes"
 	// +kubebuilder:validation:XValidation:rule="!('wal_level' in self)",message="parameters must not set wal_level"

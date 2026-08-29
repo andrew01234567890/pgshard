@@ -338,3 +338,48 @@ func TestPgHBARefusesApplicationRolesOverTCP(t *testing.T) {
 		}
 	}
 }
+
+// TestParameterNameCannotInjectASetting: the value of a parameter is
+// quoted but its name is written as it stands, so a name carrying a
+// newline used to write a second setting of its own -- and every guard on
+// the CRD names a setting, so anything they refuse could be smuggled in
+// behind a key they allow.
+func TestParameterNameCannotInjectASetting(t *testing.T) {
+	c := testConfig()
+	c.Postgres.Parameters = map[string]string{
+		"work_mem = '4MB'\nssl": "off",
+		"fine_setting":          "1",
+		"also.fine":             "2",
+		"has space":             "3",
+		"has=equals":            "4",
+		"has'quote":             "5",
+		"":                      "6",
+	}
+	conf := renderPostgresqlConf(c, false, false)
+
+	if n := strings.Count(conf, "\nssl = "); n != 1 {
+		t.Errorf("postgresql.conf has %d ssl lines, want the one pgshard writes:\n%s", n, conf)
+	}
+	if strings.Contains(conf, "ssl = 'off'") {
+		t.Error("an injected key turned TLS off")
+	}
+	for _, want := range []string{"fine_setting = '1'", "also.fine = '2'"} {
+		if !strings.Contains(conf, want) {
+			t.Errorf("a legitimate parameter was dropped: %q missing", want)
+		}
+	}
+	for _, bad := range []string{"has space", "has=equals", "has'quote"} {
+		if strings.Contains(conf, bad) {
+			t.Errorf("a key that is not a setting name reached the file: %q", bad)
+		}
+	}
+	// Every line the file carries has to be one setting.
+	for _, line := range strings.Split(conf, "\n") {
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.Count(line, " = ") != 1 {
+			t.Errorf("line %q is not a single setting", line)
+		}
+	}
+}
