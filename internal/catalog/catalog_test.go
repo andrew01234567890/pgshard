@@ -1392,6 +1392,27 @@ func runSuite(t *testing.T, img pgImage) {
 		expectPgError(t, err, "P0002", "does not exist")
 	})
 
+	// A catalog migrated by a newer binary is refused rather than used.
+	// Without the guard the skew is silent in both directions: a component
+	// that predates a column keeps writing its old shape, and one that
+	// postdates it fails deep in a query with a raw "column does not
+	// exist" naming neither the gap nor who opened it.
+	t.Run("a_newer_catalog_is_refused", func(t *testing.T) {
+		mustExec(t, conn, `INSERT INTO pgshard.schema_migrations (version, checksum) VALUES (9001, 'from-a-newer-binary')`)
+		defer mustExec(t, conn, `DELETE FROM pgshard.schema_migrations WHERE version = 9001`)
+
+		err := Migrate(ctx, conn)
+		if !errors.Is(err, ErrCatalogAhead) {
+			t.Fatalf("Migrate against a newer catalog: %v", err)
+		}
+		if !strings.Contains(err.Error(), "9001") {
+			t.Errorf("the error must name the version it does not know: %v", err)
+		}
+		if err := CheckCompatible(ctx, conn, nil); !errors.Is(err, ErrCatalogAhead) {
+			t.Errorf("CheckCompatible: %v", err)
+		}
+	})
+
 	// The in-doubt readers must not scan the heap. xact_decisions is a
 	// queue -- written on prepare, deleted on completion -- so at rest it
 	// holds almost nothing while its heap tracks bloat, and a burst of
