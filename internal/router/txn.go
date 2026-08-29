@@ -257,7 +257,7 @@ func (e *Executor) runReqsOn(ctx context.Context, p *txnPart, reqs []*pgshardv1.
 		case *pgshardv1.ExecuteResponse_RowDescription:
 			werr = w.RowDescription(fieldDescriptions(m.RowDescription.Fields))
 		case *pgshardv1.ExecuteResponse_DataRow:
-			werr = w.DataRow(rowValues(m.DataRow.Columns))
+			werr = w.DataRow(rowValues(m.DataRow))
 		case *pgshardv1.ExecuteResponse_CommandComplete:
 			p.tag = m.CommandComplete.Tag
 			werr = w.CommandComplete(m.CommandComplete.Tag)

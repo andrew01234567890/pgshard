@@ -496,7 +496,7 @@ func TestReservationWithoutStreamExpires(t *testing.T) {
 }
 
 func TestNotificationsAreForwarded(t *testing.T) {
-	msg := toResponse(&pgproto3.NotificationResponse{PID: 7, Channel: "events", Payload: "hello"})
+	msg := toResponse(&pgproto3.NotificationResponse{PID: 7, Channel: "events", Payload: "hello"}, false)
 	n := msg.GetNotification()
 	if n == nil || n.Pid != 7 || n.Channel != "events" || n.Payload != "hello" {
 		t.Fatalf("notification = %v", msg)

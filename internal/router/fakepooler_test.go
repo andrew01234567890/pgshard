@@ -59,6 +59,9 @@ type fakePooler struct {
 	// gate, when set, holds every Reserve until several shards are
 	// reserving at once.
 	gate *reserveGate
+	// legacyRows answers with a Value submessage per column whatever the
+	// router asked for, as a pooler that predates the packed shape does.
+	legacyRows bool
 }
 
 // reserveGate holds every Reserve until gateWidth shards are reserving at
@@ -194,7 +197,7 @@ func (s *fakeStream) scripted(sc script, described bool) error {
 				cols[i] = &pgshardv1.Value{Data: []byte(v)}
 			}
 		}
-		if err := s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_DataRow{DataRow: &pgshardv1.DataRow{Columns: cols}}}); err != nil {
+		if err := s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_DataRow{DataRow: s.dataRow(cols)}}); err != nil {
 			return err
 		}
 	}
@@ -333,6 +336,10 @@ type fakeStream struct {
 	batch  []*pgshardv1.ExecuteRequest
 	copyIn []byte
 	inCopy bool
+	// packed answers rows the way a current pooler does once the router
+	// has asked, so the whole suite exercises that shape rather than only
+	// the one a pooler that predates the request field sends.
+	packed bool
 	// binary is set while a Bind asked for binary results; described while
 	// the portal was described before Execute.
 	formats   []int32
@@ -449,7 +456,23 @@ func (s *fakeStream) rowDesc(name string, oid uint32) error {
 }
 
 func (s *fakeStream) row(v string) error {
-	return s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_DataRow{DataRow: &pgshardv1.DataRow{Columns: []*pgshardv1.Value{{Data: []byte(v)}}}}})
+	return s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_DataRow{DataRow: s.dataRow([]*pgshardv1.Value{{Data: []byte(v)}})}})
+}
+
+// dataRow answers in whichever shape the router asked for.
+func (s *fakeStream) dataRow(cols []*pgshardv1.Value) *pgshardv1.DataRow {
+	if !s.packed {
+		return &pgshardv1.DataRow{Columns: cols}
+	}
+	out := &pgshardv1.DataRow{Packed: make([][]byte, len(cols))}
+	for i, c := range cols {
+		if c.Null {
+			out.Nulls = append(out.Nulls, uint32(i))
+			continue
+		}
+		out.Packed[i] = c.Data
+	}
+	return out
 }
 
 // query answers one SQL statement; ready reports whether ReadyForQuery must
@@ -903,7 +926,7 @@ func (f *fakePooler) Execute(stream pgshardv1.Pooler_ExecuteServer) error {
 		}
 		f.detach(first.SessionId)
 	}()
-	s := &fakeStream{f: f, sid: first.SessionId, stream: stream}
+	s := &fakeStream{f: f, sid: first.SessionId, stream: stream, packed: first.PackedRows && !f.legacyRows}
 	req := first
 	for {
 		// NOTE: dropAfter is read WITHOUT f.mu, and that is load-bearing
@@ -916,6 +939,7 @@ func (f *fakePooler) Execute(stream pgshardv1.Pooler_ExecuteServer) error {
 		if q := req.GetSimpleQuery(); q != nil && f.shouldDrop(q.Sql) {
 			return errors.New("fake pooler: dropping stream")
 		}
+		s.packed = s.packed || (req.PackedRows && !f.legacyRows)
 		if err := s.handle(stream.Context(), req); err != nil {
 			return err
 		}

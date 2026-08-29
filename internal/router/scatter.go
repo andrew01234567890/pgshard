@@ -619,7 +619,7 @@ func (p *participant) pump(onError func()) {
 		case *pgshardv1.ExecuteResponse_DataRow:
 			if headerSent && !stopped {
 				select {
-				case p.rows <- rowValues(m.DataRow.Columns):
+				case p.rows <- rowValues(m.DataRow):
 				case <-p.stop:
 					stopped = true
 				}
