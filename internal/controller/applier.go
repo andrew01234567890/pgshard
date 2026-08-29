@@ -31,6 +31,12 @@ type DatabaseDialer interface {
 // DefaultDDLRole is the non-superuser login client statements run through.
 const DefaultDDLRole = "pgshard_ddl"
 
+// DefaultShardConnectTimeout bounds one attempt to reach a shard whose DSN
+// does not bound it itself. An explicit connect_timeout=0 means "wait for
+// ever", which is the failure this exists to prevent, so it is overridden
+// like an absent one.
+const DefaultShardConnectTimeout = 10 * time.Second
+
 // MigrationStore is the catalog side of the applier.
 type MigrationStore interface {
 	// Pending lists queued and running migrations oldest first.
@@ -254,21 +260,11 @@ func (a *Applier) now() time.Time {
 // Run drives pending migrations every interval while leader() is true.
 func (a *Applier) Run(ctx context.Context, interval time.Duration, leader func() bool) {
 	a.leader = leader
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-		if leader != nil && !leader() {
-			continue
-		}
+	runLoop(ctx, interval, leader, a.logger, "applier", func(ctx context.Context) {
 		if _, err := a.RunOnce(ctx); err != nil && ctx.Err() == nil {
 			a.logger().Warn("applier pass failed", "err", err)
 		}
-	}
+	})
 }
 
 // RunOnce drives every pending migration to completion or failure and
@@ -1038,6 +1034,29 @@ func (d *PgxShardDialer) DialDatabase(ctx context.Context, shardSet string, shar
 	return d.DialDatabaseAs(ctx, shardSet, shardID, database, "", "")
 }
 
+// shardConnConfig renders the connection settings of one shard dial. An
+// empty database or user keeps the DSN's own.
+func shardConnConfig(dsn, database, user, password string) (*pgx.ConnConfig, error) {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.ConnectTimeout == 0 {
+		// A PostgreSQL that is still starting accepts the connection and
+		// then says nothing. The controller's loops are single goroutines
+		// carrying no deadline of their own, so an unbounded dial stops one
+		// of them for the life of the process.
+		cfg.ConnectTimeout = DefaultShardConnectTimeout
+	}
+	if database != "" {
+		cfg.Database = database
+	}
+	if user != "" {
+		cfg.User, cfg.Password = user, password
+	}
+	return cfg, nil
+}
+
 // DialDatabaseAs implements DatabaseDialer; an empty user keeps the DSN's
 // credentials.
 func (d *PgxShardDialer) DialDatabaseAs(ctx context.Context, shardSet string, shardID int32, database, user, password string) (ShardConn, error) {
@@ -1045,15 +1064,9 @@ func (d *PgxShardDialer) DialDatabaseAs(ctx context.Context, shardSet string, sh
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := pgx.ParseConfig(dsn)
+	cfg, err := shardConnConfig(dsn, database, user, password)
 	if err != nil {
 		return nil, fmt.Errorf("shard %s/%d: %w", shardSet, shardID, err)
-	}
-	if database != "" {
-		cfg.Database = database
-	}
-	if user != "" {
-		cfg.User, cfg.Password = user, password
 	}
 	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {
