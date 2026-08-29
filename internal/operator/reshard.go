@@ -129,6 +129,12 @@ func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1al
 	effective := len(serving.Ranges)
 	c.Status.EffectiveShards = effective
 	c.Status.ServingGeneration = serving.Generation
+	// Captured while the spec still describes this set. Once the spec
+	// names a newer major the serving set has not reached, this keeps the
+	// image those groups were actually built with.
+	if serving.PGMajor == c.Spec.PostgreSQL.Major || c.Status.ServingPGImage == "" {
+		c.Status.ServingPGImage = Image(c)
+	}
 	c.Status.ServingPGMajor = serving.PGMajor
 	want := c.Spec.Shards
 
@@ -259,14 +265,31 @@ func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1al
 	}
 	c.Status.Reshard = &pgshardv1alpha1.ClusterReshardStatus{
 		Name: record.Name, ShardSet: pending.Name, Generation: pending.Generation, Shards: len(pending.Ranges), Phase: phase,
-		PGMajor: pending.PGMajor,
+		PGMajor: pending.PGMajor, PGImage: generationImage(c, pending.PGMajor),
 	}
 	plan.pending, plan.workflow, plan.record = pending, wf, record
 	return plan, r.patchClusterStatus(ctx, c, base)
 }
 
+// generationImage is the image a set of the given major runs: the spec's
+// when the spec describes that major, and otherwise whatever was captured
+// for the set already serving. A cluster that never carried a custom image
+// gets an empty string and ImageFor falls back to the public default, as
+// it always did.
+func generationImage(c *pgshardv1alpha1.PgShardCluster, major int) string {
+	if major == 0 || major == c.Spec.PostgreSQL.Major {
+		return Image(c)
+	}
+	if c.Status.ServingPGImage != "" {
+		return c.Status.ServingPGImage
+	}
+	return c.Status.CatalogPGImage
+}
+
 func (r *ClusterReconciler) patchClusterStatus(ctx context.Context, c, base *pgshardv1alpha1.PgShardCluster) error {
-	if c.Status.EffectiveShards == base.Status.EffectiveShards && c.Status.ServingGeneration == base.Status.ServingGeneration && c.Status.ServingPGMajor == base.Status.ServingPGMajor && equalReshard(c.Status.Reshard, base.Status.Reshard) {
+	if c.Status.EffectiveShards == base.Status.EffectiveShards && c.Status.ServingGeneration == base.Status.ServingGeneration &&
+		c.Status.ServingPGMajor == base.Status.ServingPGMajor && c.Status.ServingPGImage == base.Status.ServingPGImage &&
+		equalReshard(c.Status.Reshard, base.Status.Reshard) {
 		return nil
 	}
 	return r.Status().Patch(ctx, c, client.MergeFrom(base))
@@ -355,8 +378,9 @@ func (r *ClusterReconciler) reconcileRetirement(ctx context.Context, c, base *pg
 	plan.cond.Message = fmt.Sprintf("reshard %s: writes switched to %s; %s retiring", record.Name, serving.Name, retired.Name)
 	c.Status.Reshard = &pgshardv1alpha1.ClusterReshardStatus{
 		Name: record.Name, ShardSet: serving.Name, Generation: serving.Generation, Shards: len(serving.Ranges), Phase: phase,
-		PGMajor: serving.PGMajor, RetiredShardSet: retired.Name, RetiredGeneration: retired.Generation, RetiredShards: len(retired.Ranges),
-		RetiredPGMajor: retired.PGMajor,
+		PGMajor: serving.PGMajor, PGImage: generationImage(c, serving.PGMajor),
+		RetiredShardSet: retired.Name, RetiredGeneration: retired.Generation, RetiredShards: len(retired.Ranges),
+		RetiredPGMajor: retired.PGMajor, RetiredPGImage: generationImage(c, retired.PGMajor),
 	}
 	plan.workflow, plan.record = wf, record
 	return false, r.patchClusterStatus(ctx, c, base)
