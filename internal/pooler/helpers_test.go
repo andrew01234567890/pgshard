@@ -181,7 +181,7 @@ type harness struct {
 	logs   *strings.Builder
 }
 
-func startHarness(t *testing.T, cfg PoolConfig) *harness {
+func startHarness(t testing.TB, cfg PoolConfig) *harness {
 	t.Helper()
 	pg := newFakePG()
 	src := NewStaticSource(View{Generation: 7, Epoch: 3, Role: pgshardv1.HealthStatus_ROLE_PRIMARY, Serving: true})

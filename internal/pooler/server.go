@@ -70,6 +70,11 @@ type Server struct {
 
 	mu       sync.Mutex
 	sessions map[string]*session
+	// nextExpiry is when the earliest detached reservation falls due, or
+	// zero when none is waiting. Every Execute stream used to scan the
+	// whole session map to find out, so establishing N sessions cost N
+	// squared checks on the one mutex that also serializes them.
+	nextExpiry time.Time
 	// readers holds the one admitted change-stream reader per slot.
 	readers  map[string]*streamReader
 	draining atomic.Bool
@@ -246,6 +251,7 @@ func (s *Server) detach(se *session) {
 	keep := se.reserved
 	if keep {
 		se.detachedAt = time.Now()
+		s.noteExpiry(se.detachedAt)
 	} else {
 		se.b = nil
 		// Forget under the same lock: dropping it after unlocking would
@@ -673,6 +679,7 @@ func (s *Server) Reserve(_ context.Context, req *pgshardv1.ReserveRequest) (*pgs
 	se.reserved = true
 	if !se.attached {
 		se.detachedAt = time.Now()
+		s.noteExpiry(se.detachedAt)
 	}
 	var pid int32
 	if se.b != nil {
@@ -716,6 +723,16 @@ func (s *Server) Release(ctx context.Context, req *pgshardv1.ReleaseRequest) (*p
 // expireReservations releases reserved sessions whose Execute stream has
 // been gone for ReserveTimeout: their router died without Release and
 // would otherwise hold the backend and the session entry forever.
+// noteExpiry records that a reservation detached at t, so a later pass
+// knows whether anything can be due without walking the sessions. Call
+// with mu held.
+func (s *Server) noteExpiry(t time.Time) {
+	due := t.Add(s.cfg.ReserveTimeout)
+	if s.nextExpiry.IsZero() || due.Before(s.nextExpiry) {
+		s.nextExpiry = due
+	}
+}
+
 func (s *Server) expireReservations(now time.Time) {
 	type claim struct {
 		se *session
@@ -723,14 +740,27 @@ func (s *Server) expireReservations(now time.Time) {
 	}
 	var expired []claim
 	s.mu.Lock()
+	// Nothing is due: the common case on a stream that arrives while the
+	// pooler is busy, and the one that used to walk every session.
+	if s.nextExpiry.IsZero() || now.Before(s.nextExpiry) {
+		s.mu.Unlock()
+		return
+	}
+	s.nextExpiry = time.Time{}
 	for id, se := range s.sessions {
-		if se.reserved && !se.attached && !se.detachedAt.IsZero() && now.Sub(se.detachedAt) >= s.cfg.ReserveTimeout {
+		if !se.reserved || se.attached || se.detachedAt.IsZero() {
+			continue
+		}
+		if now.Sub(se.detachedAt) >= s.cfg.ReserveTimeout {
 			delete(s.sessions, id)
 			// Claim the backend under the lock so a Release racing this
 			// expiry finds nothing left to recycle.
 			expired = append(expired, claim{se: se, b: se.b})
 			se.b, se.reserved = nil, false
+			continue
 		}
+		// Still waiting: it sets when the next pass has work to do.
+		s.noteExpiry(se.detachedAt)
 	}
 	s.mu.Unlock()
 	for _, c := range expired {

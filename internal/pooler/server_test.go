@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -799,5 +800,29 @@ func TestCopyInReachesPostgresBeforeItEnds(t *testing.T) {
 		Message: &pgshardv1.ExecuteRequest_CopyDone{CopyDone: &pgshardv1.CopyDone{}}})
 	if got := h.pg.copied.Load(); got != int64(16*len(chunk)) {
 		t.Fatalf("PostgreSQL received %d bytes of a %d byte upload", got, 16*len(chunk))
+	}
+}
+
+// BenchmarkSessionLookupWithReservations measures what establishing one
+// Execute stream costs while N reservations are held. Every stream used to
+// scan the whole session map looking for expiries, on the same mutex that
+// serializes establishment, so a ramp of N sessions paid N squared checks.
+// The cost should not grow with N.
+func BenchmarkSessionLookupWithReservations(b *testing.B) {
+	for _, n := range []int{100, 10000} {
+		b.Run(strconv.Itoa(n), func(b *testing.B) {
+			h := startHarness(b, PoolConfig{})
+			for i := range n {
+				id := "held-" + strconv.Itoa(i)
+				h.srv.mu.Lock()
+				h.srv.sessions[id] = &session{id: id, reserved: true, detachedAt: time.Now()}
+				h.srv.noteExpiry(time.Now())
+				h.srv.mu.Unlock()
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				h.srv.session("probe")
+			}
+		})
 	}
 }
