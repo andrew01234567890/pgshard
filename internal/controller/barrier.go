@@ -623,6 +623,47 @@ func (b *Barrier) inFlight(ctx context.Context, groups []GroupRef) (string, erro
 
 // awaitArchived waits until every group's archive holds the segment of its
 // restore point.
+// archivedSegment is the WAL segment a group's archiver has reached,
+// given the last file it reports and the segment the restore point needs.
+// It is "" when the report names no segment, which is a reason to keep
+// waiting rather than to certify.
+//
+// pg_stat_archiver.last_archived_wal is the last file archived, and that
+// is not always a segment: a timeline history file (00000002.history) and
+// a backup label (<segment>.<offset>.backup) are archived like any other.
+// Comparing those to a segment name as plain strings is what made this
+// dangerous -- a history file for timeline 2 sorts above every timeline-1
+// segment, because the two diverge at the timeline digit, so the barrier
+// certified a restore point whose segment had never been archived. A
+// restore aimed at that point then stops short of it on that group, at
+// the moment the point exists to be used.
+func archivedSegment(last, want string) (string, error) {
+	switch {
+	case segmentName.MatchString(last):
+	case backupLabel.MatchString(last):
+		// The label is archived after the segment it names, so that
+		// segment is in the archive.
+		last = last[:24]
+	default:
+		// A history file, an empty report, or anything else: it says
+		// nothing about which segments are there.
+		return "", nil
+	}
+	// Within one timeline a segment name orders numerically as a string.
+	// Across timelines it does not, and a report from another timeline
+	// means this group was promoted since the restore point was taken --
+	// which invalidates the point regardless of what was archived.
+	if last[:8] != want[:8] {
+		return "", fmt.Errorf("timeline changed from %s to %s since the restore point at %s; it is no longer restorable", want[:8], last[:8], want)
+	}
+	return last, nil
+}
+
+var (
+	segmentName = regexp.MustCompile(`^[0-9A-F]{24}$`)
+	backupLabel = regexp.MustCompile(`^[0-9A-F]{24}\.[0-9A-F]{8}\.backup$`)
+)
+
 func (b *Barrier) awaitArchived(ctx context.Context, name string, groups []GroupRef, points []GroupRestorePoint) error {
 	deadline := b.now().Add(orDefault(b.ArchiveTimeout, DefaultArchiveTimeout))
 	for i, g := range groups {
@@ -631,7 +672,11 @@ func (b *Barrier) awaitArchived(ctx context.Context, name string, groups []Group
 			if err != nil {
 				return fmt.Errorf("barrier %s: archive of %s: %w", name, g.Name, err)
 			}
-			if archived >= points[i].WALSegment {
+			seg, err := archivedSegment(archived, points[i].WALSegment)
+			if err != nil {
+				return fmt.Errorf("barrier %s: archive of %s: %w", name, g.Name, err)
+			}
+			if seg != "" && seg >= points[i].WALSegment {
 				break
 			}
 			if !b.now().Before(deadline) {

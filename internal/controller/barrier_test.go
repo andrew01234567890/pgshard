@@ -678,3 +678,87 @@ func TestBarrierKeepsTheFenceRaisedWhenAResumeFails(t *testing.T) {
 		t.Fatal("recovery did not resume the stranded shard")
 	}
 }
+
+// TestArchivedSegmentIgnoresWhatIsNotASegment: pg_stat_archiver reports
+// the last file archived, and that is not always a WAL segment. Comparing
+// a timeline history file to a segment name as plain strings certified a
+// restore point whose segment had never reached the archive -- a history
+// file for timeline 2 sorts above every timeline-1 segment, because the
+// two diverge at the timeline digit.
+func TestArchivedSegmentIgnoresWhatIsNotASegment(t *testing.T) {
+	const want = "000000010000000000000009"
+	for _, tc := range []struct {
+		name, last, seg string
+		fails           bool
+	}{
+		{name: "the segment itself", last: want, seg: want},
+		{name: "a later segment", last: "00000001000000000000000A", seg: "00000001000000000000000A"},
+		{name: "an earlier segment", last: "000000010000000000000008", seg: "000000010000000000000008"},
+		{name: "a backup label names its segment", last: want + ".00000028.backup", seg: want},
+		{name: "a history file names none", last: "00000002.history"},
+		{name: "nothing archived yet", last: ""},
+		{name: "a segment from another timeline", last: "000000020000000000000009", fails: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			seg, err := archivedSegment(tc.last, want)
+			if tc.fails {
+				if err == nil {
+					t.Fatalf("timeline change must fail the barrier, got %q", seg)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if seg != tc.seg {
+				t.Errorf("archivedSegment(%q) = %q, want %q", tc.last, seg, tc.seg)
+			}
+			if certified := seg != "" && seg >= want; certified != (tc.seg >= want && tc.seg != "") {
+				t.Errorf("certification from %q = %v", tc.last, certified)
+			}
+		})
+	}
+}
+
+// TestBarrierDoesNotCertifyOnAHistoryFile: a group that changed timeline
+// while the barrier was between the restore point and the archive wait
+// reports a history file as the last thing archived. It sorts above every
+// segment of the older timeline, so the wait used to end immediately and
+// the point was recorded certified with its segment still unarchived --
+// a restore aimed at it then stops short of the point on that group.
+func TestBarrierDoesNotCertifyOnAHistoryFile(t *testing.T) {
+	f := newBarrierFixture()
+	f.groups.archived["shard1"] = "00000002.history"
+	_, err := f.b.Run(context.Background(), "nightly-1")
+	if err == nil {
+		t.Fatal("a history file certified the barrier")
+	}
+	if !strings.Contains(err.Error(), "not archived after") || !strings.Contains(err.Error(), "shard1") {
+		t.Errorf("error must name the group and the segment it waited for: %v", err)
+	}
+	if f.store.fenced {
+		t.Error("fence left raised")
+	}
+	if len(f.store.recorded) > 0 {
+		t.Error("an uncertified restore point was recorded")
+	}
+}
+
+// TestBarrierFailsWhenTheTimelineMovedUnderIt: once the group archives a
+// segment of the new timeline, the barrier can say what happened rather
+// than wait out its timeout -- a promotion since the restore point
+// invalidates the point whatever reached the archive.
+func TestBarrierFailsWhenTheTimelineMovedUnderIt(t *testing.T) {
+	f := newBarrierFixture()
+	f.groups.archived["shard1"] = "000000020000000000000009"
+	_, err := f.b.Run(context.Background(), "nightly-1")
+	if err == nil {
+		t.Fatal("a timeline change certified the barrier")
+	}
+	if !strings.Contains(err.Error(), "timeline changed") {
+		t.Errorf("error must name the timeline change: %v", err)
+	}
+	if f.store.fenced {
+		t.Error("fence left raised")
+	}
+}
