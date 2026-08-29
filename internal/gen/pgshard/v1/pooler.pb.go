@@ -1022,6 +1022,11 @@ type ExecuteRequest struct {
 	// message of a session. Empty falls back to the pooler's configured
 	// default database.
 	Database string `protobuf:"bytes,4,opt,name=database,proto3" json:"database,omitempty"`
+	// PackedRows asks for rows in DataRow's packed columns rather than one
+	// Value submessage per column. The router asks; a pooler that predates
+	// the field ignores it and answers the old way, and a pooler that has
+	// it never packs unless asked, so the two can be rolled independently.
+	PackedRows bool `protobuf:"varint,5,opt,name=packed_rows,json=packedRows,proto3" json:"packed_rows,omitempty"`
 	// Exactly one pgwire-shaped message.
 	//
 	// Types that are valid to be assigned to Message:
@@ -1099,6 +1104,13 @@ func (x *ExecuteRequest) GetDatabase() string {
 		return x.Database
 	}
 	return ""
+}
+
+func (x *ExecuteRequest) GetPackedRows() bool {
+	if x != nil {
+		return x.PackedRows
+	}
+	return false
 }
 
 func (x *ExecuteRequest) GetMessage() isExecuteRequest_Message {
@@ -1439,8 +1451,17 @@ func (x *RowDescription) GetFields() []*FieldDescription {
 
 // DataRow mirrors pgwire DataRow with raw column bytes.
 type DataRow struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Columns       []*Value               `protobuf:"bytes,1,rep,name=columns,proto3" json:"columns,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Columns as one submessage each. Sent unless the request asked for
+	// packed rows.
+	Columns []*Value `protobuf:"bytes,1,rep,name=columns,proto3" json:"columns,omitempty"`
+	// Packed columns: the value bytes in column order, with the indexes of
+	// the SQL NULL columns listed separately because an empty value and a
+	// NULL are not the same thing. A Value per column cost an allocation
+	// and a length-delimited submessage each way, per column, per row.
+	Packed [][]byte `protobuf:"bytes,2,rep,name=packed,proto3" json:"packed,omitempty"`
+	// Indexes into packed that are SQL NULL rather than empty.
+	Nulls         []uint32 `protobuf:"varint,3,rep,packed,name=nulls,proto3" json:"nulls,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1478,6 +1499,20 @@ func (*DataRow) Descriptor() ([]byte, []int) {
 func (x *DataRow) GetColumns() []*Value {
 	if x != nil {
 		return x.Columns
+	}
+	return nil
+}
+
+func (x *DataRow) GetPacked() [][]byte {
+	if x != nil {
+		return x.Packed
+	}
+	return nil
+}
+
+func (x *DataRow) GetNulls() []uint32 {
+	if x != nil {
+		return x.Nulls
 	}
 	return nil
 }
@@ -5257,7 +5292,7 @@ const file_pgshard_v1_pooler_proto_rawDesc = "" +
 	"\rCancelRequest\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\"\x10\n" +
-	"\x0eCancelResponse\"\x8a\x06\n" +
+	"\x0eCancelResponse\"\xab\x06\n" +
 	"\x0eExecuteRequest\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x126\n" +
@@ -5265,7 +5300,9 @@ const file_pgshard_v1_pooler_proto_rawDesc = "" +
 	"generation\x18\x02 \x01(\v2\x16.pgshard.v1.GenerationR\n" +
 	"generation\x12,\n" +
 	"\x04user\x18\x03 \x01(\v2\x18.pgshard.v1.UserIdentityR\x04user\x12\x1a\n" +
-	"\bdatabase\x18\x04 \x01(\tR\bdatabase\x12<\n" +
+	"\bdatabase\x18\x04 \x01(\tR\bdatabase\x12\x1f\n" +
+	"\vpacked_rows\x18\x05 \x01(\bR\n" +
+	"packedRows\x12<\n" +
 	"\fsimple_query\x18\n" +
 	" \x01(\v2\x17.pgshard.v1.SimpleQueryH\x00R\vsimpleQuery\x12)\n" +
 	"\x05parse\x18\v \x01(\v2\x11.pgshard.v1.ParseH\x00R\x05parse\x12&\n" +
@@ -5290,9 +5327,11 @@ const file_pgshard_v1_pooler_proto_rawDesc = "" +
 	"\rtype_modifier\x18\x06 \x01(\x05R\ftypeModifier\x12\x16\n" +
 	"\x06format\x18\a \x01(\x05R\x06format\"F\n" +
 	"\x0eRowDescription\x124\n" +
-	"\x06fields\x18\x01 \x03(\v2\x1c.pgshard.v1.FieldDescriptionR\x06fields\"6\n" +
+	"\x06fields\x18\x01 \x03(\v2\x1c.pgshard.v1.FieldDescriptionR\x06fields\"d\n" +
 	"\aDataRow\x12+\n" +
-	"\acolumns\x18\x01 \x03(\v2\x11.pgshard.v1.ValueR\acolumns\"#\n" +
+	"\acolumns\x18\x01 \x03(\v2\x11.pgshard.v1.ValueR\acolumns\x12\x16\n" +
+	"\x06packed\x18\x02 \x03(\fR\x06packed\x12\x14\n" +
+	"\x05nulls\x18\x03 \x03(\rR\x05nulls\"#\n" +
 	"\x0fCommandComplete\x12\x10\n" +
 	"\x03tag\x18\x01 \x01(\tR\x03tag\"8\n" +
 	"\rErrorResponse\x12'\n" +

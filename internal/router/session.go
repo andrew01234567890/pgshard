@@ -1552,7 +1552,7 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 			werr = w.RowDescription(fieldDescriptions(m.RowDescription.Fields))
 		case *pgshardv1.ExecuteResponse_DataRow:
 			if !e.hiddenNow() {
-				werr = w.DataRow(rowValues(m.DataRow.Columns))
+				werr = w.DataRow(rowValues(m.DataRow))
 			}
 		case *pgshardv1.ExecuteResponse_CommandComplete:
 			if !e.popHidden() {

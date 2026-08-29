@@ -66,6 +66,10 @@ func (ps *poolerStream) reader() {
 func (ps *poolerStream) send(req *pgshardv1.ExecuteRequest, sid string, gen *pgshardv1.Generation, ident *pgshardv1.UserIdentity, database string) error {
 	req.SessionId = sid
 	req.Generation = gen
+	// Always: the packed shape carries the same columns with no object per
+	// column on either side, and a pooler that predates the field ignores
+	// it and answers the old way, which the router still reads.
+	req.PackedRows = true
 	if ps.first {
 		req.User = ident
 		req.Database = database

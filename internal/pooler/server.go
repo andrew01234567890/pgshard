@@ -329,6 +329,11 @@ type relay struct {
 	// write to it. COPY IN produces no reply until it ends, so nothing
 	// else would move the upload out of memory before CopyDone.
 	copyBytes int
+	// packed is set once a request asks for packed rows and answers every
+	// row of the session that way. A Value submessage per column cost an
+	// allocation and a length-delimited frame each way, per column, per
+	// row, and rows are the one message a result has many of.
+	packed bool
 }
 
 // flushEveryCopyBytes bounds how much of a COPY IN upload the pooler holds
@@ -407,6 +412,10 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 	if req.SessionId != r.se.id {
 		return status.Error(codes.InvalidArgument, "session_id changed mid-stream")
 	}
+	// Latched rather than read per message: the router sets it on the
+	// messages it originates, and a row can arrive while the relay is
+	// answering something else.
+	r.packed = r.packed || req.PackedRows
 	view := r.srv.cfg.Source.View()
 	if e := fence(view, req.Generation); e != nil {
 		return r.refuse(e)
@@ -583,7 +592,7 @@ func (r *relay) pumpFlush(b *Backend) error {
 				msg = &pgproto3.ParseComplete{}
 			}
 		}
-		if resp := toResponse(msg); resp != nil {
+		if resp := toResponse(msg, r.packed); resp != nil {
 			if err := r.send(resp); err != nil {
 				return err
 			}
@@ -619,7 +628,7 @@ func (r *relay) pump(b *Backend) error {
 				}
 			}
 		}
-		if resp := toResponse(msg); resp != nil {
+		if resp := toResponse(msg, r.packed); resp != nil {
 			if err := r.send(resp); err != nil {
 				return err
 			}

@@ -96,7 +96,31 @@ func fieldDescriptions(fs []*pgshardv1.FieldDescription) []pgproto3.FieldDescrip
 	return out
 }
 
-func rowValues(cols []*pgshardv1.Value) [][]byte {
+// rowValues is one row's columns, whichever shape the pooler sent. The
+// packed shape needs no per-column object on either side, so it is what
+// the router asks for; the submessage shape stays for a pooler that
+// predates the request field.
+func rowValues(row *pgshardv1.DataRow) [][]byte {
+	if len(row.Packed) > 0 || len(row.Columns) == 0 {
+		out := make([][]byte, len(row.Packed))
+		for i, v := range row.Packed {
+			if v == nil {
+				out[i] = []byte{}
+			} else {
+				out[i] = v
+			}
+		}
+		for _, i := range row.Nulls {
+			if int(i) < len(out) {
+				out[i] = nil
+			}
+		}
+		return out
+	}
+	return valueRow(row.Columns)
+}
+
+func valueRow(cols []*pgshardv1.Value) [][]byte {
 	out := make([][]byte, len(cols))
 	for i, c := range cols {
 		if c.Null {

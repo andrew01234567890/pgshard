@@ -164,6 +164,11 @@ message ExecuteRequest {
   // message of a session. Empty falls back to the pooler's configured
   // default database.
   string database = 4;
+  // PackedRows asks for rows in DataRow's packed columns rather than one
+  // Value submessage per column. The router asks; a pooler that predates
+  // the field ignores it and answers the old way, and a pooler that has
+  // it never packs unless asked, so the two can be rolled independently.
+  bool packed_rows = 5;
   // Exactly one pgwire-shaped message.
   oneof message {
     SimpleQuery simple_query = 10;
@@ -206,7 +211,16 @@ message RowDescription {
 
 // DataRow mirrors pgwire DataRow with raw column bytes.
 message DataRow {
+  // Columns as one submessage each. Sent unless the request asked for
+  // packed rows.
   repeated Value columns = 1;
+  // Packed columns: the value bytes in column order, with the indexes of
+  // the SQL NULL columns listed separately because an empty value and a
+  // NULL are not the same thing. A Value per column cost an allocation
+  // and a length-delimited submessage each way, per column, per row.
+  repeated bytes packed = 2;
+  // Indexes into packed that are SQL NULL rather than empty.
+  repeated uint32 nulls = 3;
 }
 
 // CommandComplete mirrors pgwire CommandComplete.

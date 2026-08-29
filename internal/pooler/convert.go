@@ -100,9 +100,36 @@ func flushesBackend(req *pgshardv1.ExecuteRequest) bool {
 	return false
 }
 
+// dataRow carries one row's columns, packed into parallel slices when the
+// router asked for that and as a submessage per column when it did not.
+// The packed form has to name the NULL columns separately: an empty value
+// and a NULL are different, and repeated bytes cannot tell them apart.
+func dataRow(values [][]byte, packed bool) *pgshardv1.DataRow {
+	if !packed {
+		cols := make([]*pgshardv1.Value, len(values))
+		for i, v := range values {
+			if v == nil {
+				cols[i] = &pgshardv1.Value{Null: true}
+			} else {
+				cols[i] = &pgshardv1.Value{Data: v}
+			}
+		}
+		return &pgshardv1.DataRow{Columns: cols}
+	}
+	out := &pgshardv1.DataRow{Packed: make([][]byte, len(values))}
+	for i, v := range values {
+		if v == nil {
+			out.Nulls = append(out.Nulls, uint32(i))
+			continue
+		}
+		out.Packed[i] = v
+	}
+	return out
+}
+
 // toResponse converts a backend message into an ExecuteResponse payload; nil
 // means the message is not forwarded.
-func toResponse(msg pgproto3.BackendMessage) *pgshardv1.ExecuteResponse {
+func toResponse(msg pgproto3.BackendMessage, packed bool) *pgshardv1.ExecuteResponse {
 	r := &pgshardv1.ExecuteResponse{}
 	switch m := msg.(type) {
 	case *pgproto3.RowDescription:
@@ -114,15 +141,7 @@ func toResponse(msg pgproto3.BackendMessage) *pgshardv1.ExecuteResponse {
 		}
 		r.Message = &pgshardv1.ExecuteResponse_RowDescription{RowDescription: &pgshardv1.RowDescription{Fields: fields}}
 	case *pgproto3.DataRow:
-		cols := make([]*pgshardv1.Value, len(m.Values))
-		for i, v := range m.Values {
-			if v == nil {
-				cols[i] = &pgshardv1.Value{Null: true}
-			} else {
-				cols[i] = &pgshardv1.Value{Data: v}
-			}
-		}
-		r.Message = &pgshardv1.ExecuteResponse_DataRow{DataRow: &pgshardv1.DataRow{Columns: cols}}
+		r.Message = &pgshardv1.ExecuteResponse_DataRow{DataRow: dataRow(m.Values, packed)}
 	case *pgproto3.CommandComplete:
 		r.Message = &pgshardv1.ExecuteResponse_CommandComplete{CommandComplete: &pgshardv1.CommandComplete{Tag: string(m.CommandTag)}}
 	case *pgproto3.ErrorResponse:

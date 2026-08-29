@@ -596,3 +596,19 @@ func TestScatterSetsUpEveryShardConcurrently(t *testing.T) {
 		t.Errorf("no two of the %d shards were ever set up at the same time", shards)
 	}
 }
+
+// TestReadsAPoolerThatCannotPackRows: the router asks every pooler for
+// packed rows, and a pooler that predates the field ignores the request
+// and answers with a Value submessage per column. The rows still have to
+// arrive, or a rolling upgrade breaks reads for as long as one side is
+// behind.
+func TestReadsAPoolerThatCannotPackRows(t *testing.T) {
+	h := newShardedHarness(t)
+	for _, fp := range h.poolers {
+		fp.legacyRows = true
+	}
+	conn := h.connect(t, h.dsn()+"&default_query_exec_mode=simple_protocol")
+	if got := collectInts(t, conn, "select * from orders"); len(got) != 4 {
+		t.Fatalf("rows %v, want one per shard from a pooler answering the old way", got)
+	}
+}
