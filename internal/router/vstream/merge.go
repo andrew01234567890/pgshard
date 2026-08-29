@@ -59,21 +59,49 @@ type merger struct {
 	sentRel    map[string]string
 	lastCommit map[router.Shard]int64
 	heldSince  map[router.Shard]time.Time
-	heads      map[router.Shard]*unit
-	next       int
+	// pos is the position message, rebuilt in place rather than allocated
+	// again for every transaction; posShard holds its per-shard entries so
+	// their shard references are allocated once each.
+	pos      *pgshardv1.VPosition
+	posShard map[router.Shard]*pgshardv1.VPosition_Shard
+	heads    map[router.Shard]*unit
+	next     int
 }
 
+// vector is where the stream has reached. It is sent after every
+// position-bearing transaction, and used to allocate a fresh message plus
+// one entry per shard each time -- so a stream of small transactions on a
+// wide cluster spent more on saying where it was than on what had changed.
+//
+// The message is built once and its numbers updated in place. That is
+// sound because the only consumer is send, which marshals before it
+// returns: the bytes are on the wire before anything can move the position
+// again. A consumer that kept the message rather than its contents would
+// see it change underneath, which is why this returns to the caller that
+// sends it immediately and nothing else calls it.
 func (m *merger) vector() *pgshardv1.VPosition {
-	pos := &pgshardv1.VPosition{ShardMapGeneration: m.generation}
+	if m.pos == nil {
+		m.pos = &pgshardv1.VPosition{}
+		m.posShard = map[router.Shard]*pgshardv1.VPosition_Shard{}
+	}
+	m.pos.ShardMapGeneration = m.generation
+	m.pos.Shards = m.pos.Shards[:0]
+	m.pos.CopyState = m.pos.CopyState[:0]
 	for _, sh := range m.shards {
 		if lsn := m.position[sh]; lsn > 0 {
-			pos.Shards = append(pos.Shards, &pgshardv1.VPosition_Shard{Shard: shardRef(sh), Lsn: lsn})
+			e := m.posShard[sh]
+			if e == nil {
+				e = &pgshardv1.VPosition_Shard{Shard: shardRef(sh)}
+				m.posShard[sh] = e
+			}
+			e.Lsn = lsn
+			m.pos.Shards = append(m.pos.Shards, e)
 		}
 		if st := m.copying[sh]; st != nil {
-			pos.CopyState = append(pos.CopyState, st)
+			m.pos.CopyState = append(m.pos.CopyState, st)
 		}
 	}
-	return pos
+	return m.pos
 }
 
 // run drives the fan-in until ctx ends, a shard reports an error, or the
