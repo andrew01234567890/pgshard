@@ -305,6 +305,15 @@ barrier is outside the certification contract -- step 5 above is what keeps
 such a write from being certified rather than silently included: the barrier
 fails instead.
 
+A pause does not outlive the primary that holds it. It is an `ALTER SYSTEM`,
+so it lives in `postgresql.auto.conf`, which the agent rewrites on bootstrap,
+on promotion and after a restore: a primary that restarts, or a standby
+promoted mid-barrier, comes back without it. Step 5 is what makes that safe
+-- the barrier re-checks that every group still refuses writes and fails
+rather than certifying a point that is not consistent -- so a barrier taken
+across a restart or a failover fails and is retried; it does not certify a
+bad point.
+
 ### Barrier restore
 
 `PgShardRestore.spec.target.barrier: <name>` (with `backupId` naming a backup

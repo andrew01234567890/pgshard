@@ -216,6 +216,18 @@ func hostKeyword(h string) string {
 	return h
 }
 
+// autoConfHeader replaces whatever postgresql.auto.conf held. The control
+// plane does use ALTER SYSTEM at runtime -- the barrier pauses writes with
+// default_transaction_read_only, the operator probes the catalog the same
+// way -- and those settings live here until the agent next writes
+// configuration, which it does on bootstrap, on promotion and after a
+// restore. A setting that has to outlive any of those belongs in the
+// rendered postgresql.conf instead, and a control-plane action that relies
+// on one has to notice when it is gone rather than assume it held.
+const autoConfHeader = "# Managed by pgshard-agent: rewritten on bootstrap, promotion and restore.\n" +
+	"# A runtime ALTER SYSTEM lasts only until then; anything that must survive\n" +
+	"# belongs in postgresql.conf, which pgshard renders.\n"
+
 // WriteConfig writes postgresql.conf and pg_hba.conf into PGDATA and clears
 // any settings a clone tool left in postgresql.auto.conf so the rendered
 // file is authoritative.
@@ -229,7 +241,7 @@ func writeConfig(c *Config, standby, recovering bool) error {
 	files := map[string]string{
 		postgresqlConf: renderPostgresqlConf(c, standby, recovering),
 		pgHBAConf:      RenderPgHBAConf(c),
-		autoConf:       "# Managed by pgshard-agent; runtime ALTER SYSTEM is not supported.\n",
+		autoConf:       autoConfHeader,
 	}
 	if c.OverrideFile != "" {
 		body, err := os.ReadFile(c.OverrideFile)
