@@ -20,6 +20,20 @@ import (
 // +kubebuilder:validation:XValidation:rule="self.type != 'gcs' || has(self.credentialType) && !(self.credentialType in ['service', 'token']) || has(self.credentials.secretRef)",message="gcs service and token credentials need credentials.secretRef"
 // +kubebuilder:validation:XValidation:rule="self.type != 'sftp' || has(self.sftp)",message="an sftp store needs sftp.host and sftp.user"
 // +kubebuilder:validation:XValidation:rule="self.type != 'sftp' || has(self.credentials.secretRef)",message="an sftp store needs credentials.secretRef"
+// These fields are written into pgbackrest.conf as key=value lines, so a
+// value carrying a newline writes an option of its own: an endpoint of the
+// attacker's choosing takes every backup and WAL segment with it, and the
+// backups are the one artifact holding a complete copy of all tenant data.
+//
+// One rule rather than one per field, and contains() rather than a regex:
+// Kubernetes gives each object's validation a cost budget, and past it the
+// API server stops evaluating rules rather than refusing the object -- so
+// five regex rules here silently disabled the credential rules below.
+// +kubebuilder:validation:XValidation:rule="(!has(self.bucket) || !(self.bucket.contains('\\n') || self.bucket.contains('\\r') || self.bucket.contains('=')))",message="bucket must not contain a newline, a carriage return or an equals sign"
+// +kubebuilder:validation:XValidation:rule="(!has(self.container) || !(self.container.contains('\\n') || self.container.contains('\\r') || self.container.contains('=')))",message="container must not contain a newline, a carriage return or an equals sign"
+// +kubebuilder:validation:XValidation:rule="(!has(self.endpoint) || !(self.endpoint.contains('\\n') || self.endpoint.contains('\\r') || self.endpoint.contains('=')))",message="endpoint must not contain a newline, a carriage return or an equals sign"
+// +kubebuilder:validation:XValidation:rule="(!has(self.region) || !(self.region.contains('\\n') || self.region.contains('\\r') || self.region.contains('=')))",message="region must not contain a newline, a carriage return or an equals sign"
+// +kubebuilder:validation:XValidation:rule="(!has(self.prefix) || !(self.prefix.contains('\\n') || self.prefix.contains('\\r') || self.prefix.contains('=')))",message="prefix must not contain a newline, a carriage return or an equals sign"
 type ObjectStoreSpec struct {
 	// +kubebuilder:validation:Enum=s3;azure;gcs;posix;sftp
 	Type string `json:"type"`
@@ -63,7 +77,10 @@ type ObjectStoreSpec struct {
 	SFTP *SFTPStoreSpec `json:"sftp,omitempty"`
 }
 
-// SFTPStoreSpec locates an sftp repository host.
+// SFTPStoreSpec locates an sftp repository host. Its fields reach
+// pgbackrest.conf the same way the store's do.
+// +kubebuilder:validation:XValidation:rule="!(self.host.contains('\\n') || self.host.contains('\\r') || self.host.contains('='))",message="sftp.host must not contain a newline, a carriage return or an equals sign"
+// +kubebuilder:validation:XValidation:rule="!(self.user.contains('\\n') || self.user.contains('\\r') || self.user.contains('='))",message="sftp.user must not contain a newline, a carriage return or an equals sign"
 type SFTPStoreSpec struct {
 	Host string `json:"host"`
 	User string `json:"user"`

@@ -573,3 +573,40 @@ func TestObjectStoreRequiresWhatItsVariantNeeds(t *testing.T) {
 		})
 	}
 }
+
+// TestBackupPolicyStoreFieldCannotInjectAnOption: these fields are written
+// into pgbackrest.conf as key=value lines, so a value carrying a newline
+// writes an option of its own -- an endpoint of the attacker's choosing
+// takes every backup and WAL segment with it, and the backups are the one
+// artifact holding a complete copy of all tenant data.
+func TestBackupPolicyStoreFieldCannotInjectAnOption(t *testing.T) {
+	hostile := "x\nrepo1-s3-endpoint=attacker.example.com"
+	policy := func(name string, mutate func(*pgshardv1alpha1.ObjectStoreSpec)) *pgshardv1alpha1.PgShardBackupPolicy {
+		store := pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "b", Endpoint: "s3.example", Region: "r",
+			Credentials: pgshardv1alpha1.SecretRefSpec{SecretRef: &corev1.LocalObjectReference{Name: "creds"}}}
+		mutate(&store)
+		p := &pgshardv1alpha1.PgShardBackupPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec:       pgshardv1alpha1.PgShardBackupPolicySpec{ObjectStore: store},
+		}
+		p.Spec.Schedules.Full = "0 2 * * 0"
+		p.Spec.Retention.Full = 4
+		return p
+	}
+	for name, tc := range map[string]struct {
+		mutate func(*pgshardv1alpha1.ObjectStoreSpec)
+		field  string
+	}{
+		"bucket":    {func(s *pgshardv1alpha1.ObjectStoreSpec) { s.Bucket = hostile }, "bucket"},
+		"endpoint":  {func(s *pgshardv1alpha1.ObjectStoreSpec) { s.Endpoint = hostile }, "endpoint"},
+		"region":    {func(s *pgshardv1alpha1.ObjectStoreSpec) { s.Region = hostile }, "region"},
+		"prefix":    {func(s *pgshardv1alpha1.ObjectStoreSpec) { s.Prefix = "/x\nrepo1-cipher-type=none" }, "prefix"},
+		"carriage":  {func(s *pgshardv1alpha1.ObjectStoreSpec) { s.Endpoint = "x\rrepo1-s3-endpoint=e" }, "endpoint"},
+		"equals":    {func(s *pgshardv1alpha1.ObjectStoreSpec) { s.Region = "a=b" }, "region"},
+		"container": {func(s *pgshardv1alpha1.ObjectStoreSpec) { s.Container = hostile }, "container"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			mustReject(t, policy("inject-"+name, tc.mutate), tc.field+" must not contain a newline")
+		})
+	}
+}

@@ -123,11 +123,44 @@ func (s Settings) WithDefaults() Settings {
 	return s
 }
 
-// Validate rejects settings pgbackrest could not use.
+// configHostile reports whether v could write more than the one option it
+// is the value of. pgbackrest.conf is key=value lines, and the values here
+// come from the cluster spec: a newline starts a line of the attacker's
+// choosing, and an equals sign inside a key would split it. A repository
+// redirected that way takes every backup and WAL segment with it, and the
+// backups are the one artifact holding a complete copy of all tenant data.
+func configHostile(v string) bool {
+	return strings.ContainsAny(v, "\n\r=")
+}
+
+// Validate rejects settings pgbackrest could not use, and values that
+// could write an option of their own.
 func (s Settings) Validate() error {
 	var errs []error
 	if s.Stanza == "" {
 		errs = append(errs, errors.New("stanza is required"))
+	}
+	for _, f := range []struct {
+		name, value string
+	}{
+		{"repo.bucket", s.Repo.Bucket},
+		{"repo.endpoint", s.Repo.Endpoint},
+		{"repo.region", s.Repo.Region},
+		{"repo.path", s.Repo.Path},
+		{"repo.uriStyle", s.Repo.URIStyle},
+		{"repo.caFile", s.Repo.CAFile},
+		{"repo.keyType", s.Repo.KeyType},
+		{"repo.credentialsDir", s.Repo.CredentialsDir},
+		{"repo.host", s.Repo.Host},
+		{"repo.hostUser", s.Repo.HostUser},
+		{"repo.hostKeyCheck", s.Repo.HostKeyCheck},
+		{"stanza", s.Stanza},
+		{"spoolPath", s.SpoolPath},
+		{"logPath", s.LogPath},
+	} {
+		if configHostile(f.value) {
+			errs = append(errs, fmt.Errorf("%s must not contain a newline, a carriage return or an equals sign", f.name))
+		}
 	}
 	if !strings.HasPrefix(s.Repo.Path, "/") {
 		errs = append(errs, errors.New("repo.path must be absolute"))

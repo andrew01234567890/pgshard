@@ -86,6 +86,15 @@ spec:
                   backup.Settings.Validate; the credential ones account for the same
                   defaulting it applies, where an unset credentialType means shared for
                   s3 and azure and service for gcs.
+                  These fields are written into pgbackrest.conf as key=value lines, so a
+                  value carrying a newline writes an option of its own: an endpoint of the
+                  attacker's choosing takes every backup and WAL segment with it, and the
+                  backups are the one artifact holding a complete copy of all tenant data.
+
+                  One rule rather than one per field, and contains() rather than a regex:
+                  Kubernetes gives each object's validation a cost budget, and past it the
+                  API server stops evaluating rules rather than refusing the object -- so
+                  five regex rules here silently disabled the credential rules below.
                 properties:
                   bucket:
                     description: Bucket is the S3 or GCS bucket.
@@ -180,6 +189,15 @@ spec:
                     - host
                     - user
                     type: object
+                    x-kubernetes-validations:
+                    - message: sftp.host must not contain a newline, a carriage return
+                        or an equals sign
+                      rule: '!(self.host.contains(''\n'') || self.host.contains(''\r'')
+                        || self.host.contains(''=''))'
+                    - message: sftp.user must not contain a newline, a carriage return
+                        or an equals sign
+                      rule: '!(self.user.contains(''\n'') || self.user.contains(''\r'')
+                        || self.user.contains(''=''))'
                   type:
                     enum:
                     - s3
@@ -221,6 +239,26 @@ spec:
                   rule: self.type != 'sftp' || has(self.sftp)
                 - message: an sftp store needs credentials.secretRef
                   rule: self.type != 'sftp' || has(self.credentials.secretRef)
+                - message: bucket must not contain a newline, a carriage return or
+                    an equals sign
+                  rule: (!has(self.bucket) || !(self.bucket.contains('\n') || self.bucket.contains('\r')
+                    || self.bucket.contains('=')))
+                - message: container must not contain a newline, a carriage return
+                    or an equals sign
+                  rule: (!has(self.container) || !(self.container.contains('\n') ||
+                    self.container.contains('\r') || self.container.contains('=')))
+                - message: endpoint must not contain a newline, a carriage return
+                    or an equals sign
+                  rule: (!has(self.endpoint) || !(self.endpoint.contains('\n') ||
+                    self.endpoint.contains('\r') || self.endpoint.contains('=')))
+                - message: region must not contain a newline, a carriage return or
+                    an equals sign
+                  rule: (!has(self.region) || !(self.region.contains('\n') || self.region.contains('\r')
+                    || self.region.contains('=')))
+                - message: prefix must not contain a newline, a carriage return or
+                    an equals sign
+                  rule: (!has(self.prefix) || !(self.prefix.contains('\n') || self.prefix.contains('\r')
+                    || self.prefix.contains('=')))
               processMax:
                 description: ProcessMax bounds pgBackRest parallelism per member.
                 minimum: 1
@@ -293,6 +331,15 @@ spec:
                       backup.Settings.Validate; the credential ones account for the same
                       defaulting it applies, where an unset credentialType means shared for
                       s3 and azure and service for gcs.
+                      These fields are written into pgbackrest.conf as key=value lines, so a
+                      value carrying a newline writes an option of its own: an endpoint of the
+                      attacker's choosing takes every backup and WAL segment with it, and the
+                      backups are the one artifact holding a complete copy of all tenant data.
+
+                      One rule rather than one per field, and contains() rather than a regex:
+                      Kubernetes gives each object's validation a cost budget, and past it the
+                      API server stops evaluating rules rather than refusing the object -- so
+                      five regex rules here silently disabled the credential rules below.
                     properties:
                       bucket:
                         description: Bucket is the S3 or GCS bucket.
@@ -387,6 +434,15 @@ spec:
                         - host
                         - user
                         type: object
+                        x-kubernetes-validations:
+                        - message: sftp.host must not contain a newline, a carriage
+                            return or an equals sign
+                          rule: '!(self.host.contains(''\n'') || self.host.contains(''\r'')
+                            || self.host.contains(''=''))'
+                        - message: sftp.user must not contain a newline, a carriage
+                            return or an equals sign
+                          rule: '!(self.user.contains(''\n'') || self.user.contains(''\r'')
+                            || self.user.contains(''=''))'
                       type:
                         enum:
                         - s3
@@ -429,6 +485,26 @@ spec:
                       rule: self.type != 'sftp' || has(self.sftp)
                     - message: an sftp store needs credentials.secretRef
                       rule: self.type != 'sftp' || has(self.credentials.secretRef)
+                    - message: bucket must not contain a newline, a carriage return
+                        or an equals sign
+                      rule: (!has(self.bucket) || !(self.bucket.contains('\n') ||
+                        self.bucket.contains('\r') || self.bucket.contains('=')))
+                    - message: container must not contain a newline, a carriage return
+                        or an equals sign
+                      rule: (!has(self.container) || !(self.container.contains('\n')
+                        || self.container.contains('\r') || self.container.contains('=')))
+                    - message: endpoint must not contain a newline, a carriage return
+                        or an equals sign
+                      rule: (!has(self.endpoint) || !(self.endpoint.contains('\n')
+                        || self.endpoint.contains('\r') || self.endpoint.contains('=')))
+                    - message: region must not contain a newline, a carriage return
+                        or an equals sign
+                      rule: (!has(self.region) || !(self.region.contains('\n') ||
+                        self.region.contains('\r') || self.region.contains('=')))
+                    - message: prefix must not contain a newline, a carriage return
+                        or an equals sign
+                      rule: (!has(self.prefix) || !(self.prefix.contains('\n') ||
+                        self.prefix.contains('\r') || self.prefix.contains('=')))
                   processMax:
                     description: ProcessMax bounds pgBackRest parallelism per member.
                     minimum: 1
