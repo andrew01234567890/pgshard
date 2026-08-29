@@ -612,3 +612,63 @@ func TestReadsAPoolerThatCannotPackRows(t *testing.T) {
 		t.Fatalf("rows %v, want one per shard from a pooler answering the old way", got)
 	}
 }
+
+// TestScatterRowsAreBoundedByBytes: the merge queue used to be bounded by
+// row count alone, at 64 rows a shard. A row is anything from a few bytes
+// to a megabyte, so a wide result held 64 megabytes per shard and a
+// fan-out over a large topology multiplied that by the shard count.
+func TestScatterRowsAreBoundedByBytes(t *testing.T) {
+	p := &participant{rows: make(chan [][]byte, 64), stop: make(chan struct{}), taken: make(chan struct{}, 1)}
+	wide := [][]byte{make([]byte, scatterRowBudget/2)}
+
+	// Under the budget the producer is never held up: the merge needs a
+	// head row from every shard, so a participant holding nothing has to
+	// get through whatever the others are doing.
+	for range 2 {
+		if !p.waitForRoom() {
+			t.Fatal("a participant under its budget was held")
+		}
+		p.queued.Add(rowBytes(wide))
+		p.rows <- wide
+	}
+
+	held := make(chan bool, 1)
+	go func() { held <- p.waitForRoom() }()
+	select {
+	case <-held:
+		t.Fatal("a participant over its byte budget kept producing")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Taking a row releases it.
+	if _, ok, _ := p.Next(); !ok {
+		t.Fatal("no row to take")
+	}
+	select {
+	case ok := <-held:
+		if !ok {
+			t.Error("the producer was told to stop rather than let through")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("taking a row did not release the producer")
+	}
+}
+
+// TestScatterRowGateReleasesOnStop: a merge that no longer wants rows
+// closes stop, and a producer parked on the byte budget has to notice --
+// otherwise the pump goroutine outlives the statement.
+func TestScatterRowGateReleasesOnStop(t *testing.T) {
+	p := &participant{rows: make(chan [][]byte, 64), stop: make(chan struct{}), taken: make(chan struct{}, 1)}
+	p.queued.Add(scatterRowBudget)
+	held := make(chan bool, 1)
+	go func() { held <- p.waitForRoom() }()
+	p.stopRows()
+	select {
+	case ok := <-held:
+		if ok {
+			t.Error("a stopped participant was told to keep producing")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop did not release the producer")
+	}
+}

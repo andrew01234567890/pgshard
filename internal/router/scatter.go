@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -216,10 +217,14 @@ type participant struct {
 	header  chan struct{}
 	rows    chan [][]byte
 	notices []*pgproto3.NoticeResponse
-	tag     string
-	err     error
-	done    chan struct{}
-	stop    chan struct{}
+	// queued is the bytes of rows this participant has handed to the merge
+	// and the merge has not taken yet; taken signals that it dropped.
+	queued atomic.Int64
+	taken  chan struct{}
+	tag    string
+	err    error
+	done   chan struct{}
+	stop   chan struct{}
 	// reserved is set once the pooler pinned the backend so the session's
 	// search_path could be applied; finish releases it.
 	reserved bool
@@ -250,7 +255,8 @@ func (e *Executor) startParticipant(ctx context.Context, sh Shard, seq, setup st
 		return nil, pgwire.Errorf(codeConnectionFailure, "pooler of shard %s/%d refused the connection: %v", sh.Set, sh.ID, err)
 	}
 	p := &participant{shard: sh, sid: e.sid + "-x" + seq + "-" + strconv.FormatInt(int64(sh.ID), 10), client: client, ps: ps,
-		header: make(chan struct{}), rows: make(chan [][]byte, 64), done: make(chan struct{}), stop: make(chan struct{})}
+		header: make(chan struct{}), rows: make(chan [][]byte, 64), done: make(chan struct{}), stop: make(chan struct{}),
+		taken: make(chan struct{}, 1)}
 	gen := e.r.cfg.Poolers.Generation(sh)
 	// A fresh scatter backend starts on the server defaults, so it gets
 	// the same session state a routed backend is replayed: not just the
@@ -618,9 +624,16 @@ func (p *participant) pump(onError func()) {
 			sendHeader()
 		case *pgshardv1.ExecuteResponse_DataRow:
 			if headerSent && !stopped {
+				row := rowValues(m.DataRow)
+				if !p.waitForRoom() {
+					stopped = true
+					break
+				}
+				p.queued.Add(rowBytes(row))
 				select {
-				case p.rows <- rowValues(m.DataRow):
+				case p.rows <- row:
 				case <-p.stop:
+					p.queued.Add(-rowBytes(row))
 					stopped = true
 				}
 			}
@@ -652,11 +665,47 @@ func (p *participant) pump(onError func()) {
 	}
 }
 
+// scatterRowBudget is what one participant may hold in rows the merge has
+// not taken. The queue used to be bounded by row count alone, at 64: a
+// row is anything from a few bytes to a megabyte, so a wide result held
+// 64 megabytes per shard and a fan-out over a large topology multiplied
+// that by the shard count. Bytes bound it either way, and the count bound
+// stays as a second limit so a narrow result cannot queue without end.
+const scatterRowBudget = 256 << 10
+
+// waitForRoom blocks until this participant is under its byte budget, and
+// reports whether the merge still wants rows. A participant is always let
+// through when it holds nothing, so the merge can always reach a head row
+// on every shard and an ordered merge cannot stall itself.
+func (p *participant) waitForRoom() bool {
+	for p.queued.Load() >= scatterRowBudget {
+		select {
+		case <-p.taken:
+		case <-p.stop:
+			return false
+		}
+	}
+	return true
+}
+
+func rowBytes(row [][]byte) int64 {
+	n := int64(0)
+	for _, v := range row {
+		n += int64(len(v)) + 8
+	}
+	return n
+}
+
 // Next implements scatter.Source over the participant's rows.
 func (p *participant) Next() ([][]byte, bool, error) {
 	row, ok := <-p.rows
 	if !ok {
 		return nil, false, p.err
+	}
+	p.queued.Add(-rowBytes(row))
+	select {
+	case p.taken <- struct{}{}:
+	default:
 	}
 	return row, true, nil
 }
