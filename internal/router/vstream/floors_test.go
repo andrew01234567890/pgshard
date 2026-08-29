@@ -4,6 +4,7 @@ import (
 	"math/rand/v2"
 	"testing"
 
+	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/router"
 )
 
@@ -115,4 +116,72 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(b)
+}
+
+// TestVectorReportsThePositionItIsAskedFor: the position message is built
+// once and updated in place, so the risk is a stale field rather than a
+// wrong calculation -- a shard whose LSN moved but whose entry was not
+// refreshed, or an entry left behind from a shard that has since gone
+// quiet.
+func TestVectorReportsThePositionItIsAskedFor(t *testing.T) {
+	shards := []router.Shard{{Set: "default", ID: 0}, {Set: "default", ID: 1}, {Set: "default", ID: 2}}
+	m := &merger{shards: shards, generation: 7, position: map[router.Shard]uint64{}, copying: map[router.Shard]*pgshardv1.VCopyState{}}
+
+	// Nothing yet.
+	if v := m.vector(); len(v.Shards) != 0 || v.ShardMapGeneration != 7 {
+		t.Fatalf("empty position: %+v", v)
+	}
+
+	// Each shard appears once its LSN moves, and carries the LSN it has.
+	want := map[uint32]uint64{}
+	for i, sh := range shards {
+		m.position[sh] = uint64(100 + i)
+		want[uint32(sh.ID)] = uint64(100 + i)
+		got := map[uint32]uint64{}
+		for _, e := range m.vector().Shards {
+			got[e.Shard.ShardId] = e.Lsn
+		}
+		if len(got) != len(want) {
+			t.Fatalf("after %d shards moved: %v", i+1, got)
+		}
+		for id, lsn := range want {
+			if got[id] != lsn {
+				t.Errorf("shard %d reported %d, want %d", id, got[id], lsn)
+			}
+		}
+	}
+
+	// A later move is reflected, and the entry is the same object reused.
+	first := m.vector().Shards[0]
+	m.position[shards[0]] = 999
+	again := m.vector().Shards[0]
+	if again.Lsn != 999 {
+		t.Errorf("a moved shard reported %d", again.Lsn)
+	}
+	if first != again {
+		t.Error("the entry was reallocated rather than reused, so the point of this is gone")
+	}
+
+	// The generation is re-read, not frozen at the first call.
+	m.generation = 9
+	if v := m.vector(); v.ShardMapGeneration != 9 {
+		t.Errorf("generation %d, want the current 9", v.ShardMapGeneration)
+	}
+}
+
+func BenchmarkVector(b *testing.B) {
+	var shards []router.Shard
+	m := &merger{generation: 7, position: map[router.Shard]uint64{}, copying: map[router.Shard]*pgshardv1.VCopyState{}}
+	for i := range 128 {
+		sh := router.Shard{Set: "default", ID: int32(i)}
+		shards = append(shards, sh)
+		m.position[sh] = uint64(i + 1)
+	}
+	m.shards = shards
+	b.ReportAllocs()
+	for b.Loop() {
+		if len(m.vector().Shards) != 128 {
+			b.Fatal("short vector")
+		}
+	}
 }
