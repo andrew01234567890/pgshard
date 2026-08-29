@@ -717,3 +717,36 @@ func TestOneCancelPerStatementAcrossPumps(t *testing.T) {
 		t.Errorf("after a second statement: %d cancels, want 2", n)
 	}
 }
+
+// TestReadWriteTransactionModeReachesTheShardNeutralised: the pause the
+// barrier takes is default_transaction_read_only on the primary, so what a
+// shard runs must never be a mode that turns it off. The client's statement
+// succeeds; what arrives is the cluster's own default.
+func TestReadWriteTransactionModeReachesTheShardNeutralised(t *testing.T) {
+	h := newHarness(t)
+	conn := h.connect(t, h.dsn("app", "secret", "app"))
+	ctx := context.Background()
+	for _, sql := range []string{
+		"set session characteristics as transaction read write",
+		"begin read write",
+		"commit",
+	} {
+		if _, err := conn.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	for _, q := range h.fp.ran() {
+		if strings.Contains(strings.ToUpper(q), "READ WRITE") {
+			t.Errorf("the shard ran %q, which lifts the write pause", q)
+		}
+	}
+	var sawDefault bool
+	for _, q := range h.fp.ran() {
+		if strings.Contains(strings.ToLower(q), "default_transaction_read_only = default") {
+			sawDefault = true
+		}
+	}
+	if !sawDefault {
+		t.Errorf("the shard never saw the neutralised form: %v", h.fp.ran())
+	}
+}

@@ -559,6 +559,29 @@ the controller raises while it takes a certified barrier (see
 - At most `--buffer-cap` statements wait behind the fence cluster-wide; the
   next is refused with `53300`.
 
+The fence is what holds writes the planner can see. Underneath it the
+primaries themselves run with `default_transaction_read_only = on` for the
+length of the pause, which catches a statement whose write the planner does
+not recognise -- a volatile function, `SELECT set_config(...)`. So that a
+session cannot lift that guard, the router refuses `SET` (and `SET LOCAL`,
+`RESET`, `set_config`) of `transaction_read_only` and
+`default_transaction_read_only` with **`42501` (insufficient_privilege)**.
+
+The same override spelled as a transaction mode -- `BEGIN READ WRITE`,
+`START TRANSACTION READ WRITE`, `SET TRANSACTION READ WRITE`, `SET SESSION
+CHARACTERISTICS AS TRANSACTION READ WRITE` -- is not refused but neutralised:
+the mode is dropped and, where nothing else remains, the statement becomes a
+`SET ... = DEFAULT` that puts the cluster's own value back. With no pause
+running the session is read-write exactly as it asked; during one it stays
+paused. Refusing these would break ordinary clients -- pgjdbc sends the
+session-characteristics form whenever an application calls
+`setReadOnly(false)`, which a connection pool does on every connection it
+hands back.
+
+`READ ONLY` in every form is untouched: a session may make itself more
+restrictive, never less. The rewritten text is what reaches the shards and
+what the router replays onto every other shard session it opens.
+
 `pgshard.table_status.migrating` is the same pause scoped to one table: a
 placement workflow raises it while it swaps the table's shadow in. Only
 statements whose plan resolved that table wait (the plan lists every
