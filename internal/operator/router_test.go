@@ -137,7 +137,8 @@ func TestPoolerSidecarInMemberPod(t *testing.T) {
 	if strings.Contains(got, "--http") {
 		t.Errorf("command %q still passes the removed --http flag", got)
 	}
-	if pooler.ReadinessProbe == nil || pooler.ReadinessProbe.TCPSocket == nil || pooler.ReadinessProbe.TCPSocket.Port.IntValue() != 9091 {
+	if pooler.ReadinessProbe == nil || pooler.ReadinessProbe.HTTPGet == nil ||
+		pooler.ReadinessProbe.HTTPGet.Path != "/healthz" || pooler.ReadinessProbe.HTTPGet.Port.IntValue() != 9127 {
 		t.Errorf("readiness %+v", pooler.ReadinessProbe)
 	}
 	if len(pooler.Env) != 1 || pooler.Env[0].Name != "PGPASSWORD" || pooler.Env[0].ValueFrom == nil {

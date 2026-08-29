@@ -15,6 +15,7 @@ import (
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -80,6 +81,7 @@ func (r *ClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&rbacv1.RoleBinding{}).
 		Owns(&coordinationv1.Lease{}).
 		Owns(&policyv1.PodDisruptionBudget{}).
+		Owns(&networkingv1.NetworkPolicy{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
 		Owns(&pgshardv1alpha1.PgShardReshard{}).
@@ -178,6 +180,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	ctx = agentauth.WithToken(ctx, agentToken)
 	if err := r.ensureMemberRBAC(ctx, &cluster); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.ensureNetworkPolicy(ctx, &cluster); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -369,6 +374,38 @@ func (r *ClusterReconciler) ensureMemberRBAC(ctx context.Context, c *pgshardv1al
 		if rb.RoleRef.Name == "" {
 			rb.RoleRef = dRB.RoleRef
 		}
+		return nil
+	})
+}
+
+// ensureNetworkPolicy renders the member policy while it is enabled and
+// removes it when it is turned off: a policy left behind keeps enforcing.
+func (r *ClusterReconciler) ensureNetworkPolicy(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) error {
+	desired := r.Renderer.MemberNetworkPolicy(c)
+	if !c.Spec.NetworkPolicy.Enabled {
+		// Only ours: a policy of the same name that somebody wrote by hand
+		// is not this operator's to remove, and the default spec would
+		// remove it on every pass.
+		var existing networkingv1.NetworkPolicy
+		if err := r.Get(ctx, client.ObjectKeyFromObject(desired), &existing); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		if ref := metav1.GetControllerOf(&existing); ref == nil || ref.UID != c.UID {
+			return nil
+		}
+		err := r.Delete(ctx, &existing)
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	np := &networkingv1.NetworkPolicy{ObjectMeta: desired.ObjectMeta}
+	return r.ensureOwned(ctx, c, np, func() error {
+		np.Labels = desired.Labels
+		np.Spec = desired.Spec
 		return nil
 	})
 }
