@@ -37,17 +37,39 @@ type PGDecisionLog struct {
 // durable runs sql in its own transaction with synchronous commit forced on
 // so the row is on disk (and on the catalog's synchronous standbys) before
 // the coordinator proceeds.
+// durable runs sql in a transaction that reaches disk before it returns,
+// in one round trip. The decision log sits in front of every cross-shard
+// commit, and a separate BEGIN, SET LOCAL, statement and COMMIT made that
+// four round trips to the catalog of which three carried no information --
+// so the catalog became a per-commit tax on every multi-shard write in the
+// cluster. Pipelined, the four still execute in order and still abort
+// together; only the waiting is gone.
 func (l *PGDecisionLog) durable(ctx context.Context, sql string, args ...any) (int64, error) {
+	b := &pgx.Batch{}
+	b.Queue("BEGIN")
+	// The decision has to be on disk before anything acts on it: a
+	// coordinator that told a shard to commit and then lost the record
+	// leaves a transaction nothing can resolve.
+	b.Queue("SET LOCAL synchronous_commit = on")
+	b.Queue(sql, args...)
+	b.Queue("COMMIT")
+
+	br := l.Pool.SendBatch(ctx, b)
 	var affected int64
-	err := pgx.BeginFunc(ctx, l.Pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, "SET LOCAL synchronous_commit = on"); err != nil {
-			return err
+	var firstErr error
+	for i := range 4 {
+		tag, err := br.Exec()
+		if err != nil && firstErr == nil {
+			firstErr = err
 		}
-		tag, err := tx.Exec(ctx, sql, args...)
-		affected = tag.RowsAffected()
-		return err
-	})
-	return affected, err
+		if i == 2 {
+			affected = tag.RowsAffected()
+		}
+	}
+	if err := br.Close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return affected, firstErr
 }
 
 // Begin implements DecisionLog.
