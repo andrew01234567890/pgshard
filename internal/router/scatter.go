@@ -2,10 +2,12 @@ package router
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 
@@ -280,9 +282,50 @@ func (e *Executor) startParticipant(ctx context.Context, sh Shard, seq, setup st
 	return p, nil
 }
 
-// runScatter opens one pooler stream per shard, sends reqs on each and
-// merges the responses into w.
+// runScatter merges a multi-shard read into w, waiting out a rewrite that
+// is mid-cutover rather than refusing the read for its duration.
+//
+// A rewrite cuts over one shard at a time, so between the first shard's
+// swap and the last the same column has a different type OID on different
+// shards and a merge cannot describe the result. That window is short, and
+// it is the same kind of window a cutover flip opens, which the router
+// waits out rather than failing. It is bounded, not unbounded: a shard
+// whose swap is blocked behind a lock can hold the window open, so past
+// the buffering window the read is refused with the condition that says
+// to retry, exactly as before.
+//
+// The retry is only safe because a shape mismatch is found before any of
+// the merged output is written; the counting writer is what checks that
+// rather than assuming it.
 func (e *Executor) runScatter(ctx context.Context, shards []int32, m *plan.Merge, reqs []*pgshardv1.ExecuteRequest, out scatterOutput, w pgwire.ResultWriter, rewriting string) error {
+	deadline := e.r.now().Add(e.r.cfg.Buffering.Window)
+	waited := false
+	for {
+		cw := &countingWriter{w: w}
+		err := e.scatterOnce(ctx, shards, m, reqs, out, cw, rewriting)
+		if !isRewriteCutover(err) || cw.wrote || !e.r.now().Before(deadline) {
+			if waited && err == nil {
+				e.r.cfg.Logger.Info("multi-shard read served after waiting out a rewrite cutover", "session", e.sid, "table", rewriting)
+			}
+			return err
+		}
+		waited = true
+		select {
+		case <-time.After(e.r.cfg.Buffering.Poll):
+		case <-ctx.Done():
+			return err
+		}
+	}
+}
+
+// isRewriteCutover reports the refusal a scatter raises while a rewrite's
+// shards disagree on the result shape.
+func isRewriteCutover(err error) bool {
+	var pe *pgwire.Error
+	return errors.As(err, &pe) && pe.Code == codeRewriteInProgress
+}
+
+func (e *Executor) scatterOnce(ctx context.Context, shards []int32, m *plan.Merge, reqs []*pgshardv1.ExecuteRequest, out scatterOutput, w pgwire.ResultWriter, rewriting string) error {
 	if err := e.scatterAllowed(len(shards)); err != nil {
 		return err
 	}

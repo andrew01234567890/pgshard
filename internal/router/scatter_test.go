@@ -203,6 +203,69 @@ func TestScatterRowDescriptionMismatchIsAnError(t *testing.T) {
 	}
 }
 
+// TestScatterWaitsOutARewriteCutover: a rewrite cuts over one shard at a
+// time, and between the first shard's swap and the last a merge cannot
+// describe the result. Refusing every multi-shard read for that window
+// made a migration that is supposed to be online an outage for scatter
+// reads; the read now waits the window out, which is what the router does
+// for the other cutover it knows about.
+func TestScatterWaitsOutARewriteCutover(t *testing.T) {
+	h := newShardedHarness(t)
+	key := snapshot.TableKey{Database: "app", SchemaName: "public", TableName: "orders"}
+	pl := h.snap.Tables[key]
+	pl.HiddenColumns = []string{"_pgshard_new_v"}
+	h.snap.Tables[key] = pl
+	const sql = "select v from orders"
+	lagging := h.poolers[3]
+	for i, fp := range h.poolers {
+		sc := int4Rows("1")
+		if i == 3 {
+			sc.cols[0].oid = 20
+		}
+		fp.script(sql, sc)
+	}
+	// The last shard swaps once the read has already seen it disagree.
+	go func() {
+		for {
+			if len(lagging.ran()) > 0 {
+				lagging.script(sql, int4Rows("1"))
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	conn := h.connect(t, h.dsn()+"&default_query_exec_mode=simple_protocol")
+	if got := collectInts(t, conn, sql); len(got) != 4 {
+		t.Fatalf("rows %v, want one per shard once the cutover finished", got)
+	}
+}
+
+// TestScatterRefusesWhenARewriteCutoverOutlastsTheWindow: the wait is
+// bounded. A shard whose swap is stuck behind a lock can hold the window
+// open for as long as the lock does, and the read has to come back with
+// the condition that says to retry rather than hang.
+func TestScatterRefusesWhenARewriteCutoverOutlastsTheWindow(t *testing.T) {
+	h := newShardedHarness(t)
+	key := snapshot.TableKey{Database: "app", SchemaName: "public", TableName: "orders"}
+	pl := h.snap.Tables[key]
+	pl.HiddenColumns = []string{"_pgshard_new_v"}
+	h.snap.Tables[key] = pl
+	for i, fp := range h.poolers {
+		sc := int4Rows("1")
+		if i == 3 {
+			sc.cols[0].oid = 20
+		}
+		fp.script("select v from orders", sc)
+	}
+	conn := h.connect(t, h.dsn()+"&default_query_exec_mode=simple_protocol")
+	_, err := conn.Exec(context.Background(), "select v from orders")
+	var pe *pgconn.PgError
+	if !errors.As(err, &pe) || pe.Code != "55000" {
+		t.Fatalf("a cutover that never finishes must still be refused with 55000, got %v", err)
+	}
+}
+
 // TestScatterMismatchMidRewriteNamesTheMigration: a rewrite cuts over one
 // shard at a time, so between the first shard's swap and the last the same
 // column has a different type OID on different shards. Reporting that as
