@@ -6,14 +6,14 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 
-const flushEveryRows = 256
-
-// flushEveryCopyBytes bounds what a COPY OUT may hold before it reaches the
-// client. Rows are flushed by count, but a COPY chunk is of no fixed size,
-// so this one counts bytes: without it an export sat in the backend buffer
-// until ReadyForQuery, making the router's memory proportional to the size
-// of the export and the client's first byte wait for its last.
-const flushEveryCopyBytes = 64 << 10
+// flushEveryBytes bounds what a result may hold before it reaches the
+// client. Rows used to be flushed every 256 of them, which says nothing
+// about how much is queued: a row is anything from a few bytes to a
+// megabyte, so a wide result held far more than the client had asked for
+// and a narrow one paid for a write every few kilobytes. Counting bytes
+// bounds the memory either way and is the same thing a COPY needs, whose
+// chunks have no fixed size at all.
+const flushEveryBytes = 64 << 10
 
 // resultWriter implements ResultWriter over the session's backend buffer.
 type resultWriter struct {
@@ -33,8 +33,18 @@ func (w *resultWriter) flush() error {
 	if w.ioErr != nil {
 		return w.ioErr
 	}
-	w.ioErr = w.s.be.Flush()
+	w.ioErr = w.s.flush()
 	return w.ioErr
+}
+
+// queued records bytes handed to the backend buffer and flushes once the
+// client is owed enough of them.
+func (w *resultWriter) queued(n int) error {
+	w.s.queued += n
+	if w.s.queued >= flushEveryBytes {
+		return w.flush()
+	}
+	return nil
 }
 
 func (w *resultWriter) RowDescription(fields []pgproto3.FieldDescription) error {
@@ -45,11 +55,18 @@ func (w *resultWriter) DataRow(values [][]byte) error {
 	if err := w.send(&pgproto3.DataRow{Values: values}); err != nil {
 		return err
 	}
-	w.s.dataRows++
-	if w.s.dataRows%flushEveryRows == 0 {
-		return w.flush()
+	return w.queued(dataRowBytes(values))
+}
+
+// dataRowBytes is what a DataRow takes on the wire: the message header and
+// column count, then a length per column and the value behind it. A NULL
+// is the length alone.
+func dataRowBytes(values [][]byte) int {
+	n := 5 + 2
+	for _, v := range values {
+		n += 4 + len(v)
 	}
-	return nil
+	return n
 }
 
 func (w *resultWriter) CommandComplete(tag string) error {
@@ -83,7 +100,6 @@ func (w *resultWriter) CopyIn(overallFormat byte, columnFormats []uint16) (CopyI
 }
 
 func (w *resultWriter) CopyOut(overallFormat byte, columnFormats []uint16) error {
-	w.s.copyBytes = 0
 	return w.send(&pgproto3.CopyOutResponse{OverallFormat: overallFormat, ColumnFormatCodes: columnFormats})
 }
 
@@ -91,12 +107,7 @@ func (w *resultWriter) CopyData(data []byte) error {
 	if err := w.send(&pgproto3.CopyData{Data: data}); err != nil {
 		return err
 	}
-	w.s.copyBytes += len(data)
-	if w.s.copyBytes >= flushEveryCopyBytes {
-		w.s.copyBytes = 0
-		return w.flush()
-	}
-	return nil
+	return w.queued(5 + len(data))
 }
 
 func (w *resultWriter) CopyDone() error { return w.send(&pgproto3.CopyDone{}) }
