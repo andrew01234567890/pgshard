@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -112,7 +113,11 @@ type Executor struct {
 	home Shard
 	// shard is the shard the session's stream is (or will next be) on.
 	shard Shard
-	ident *pgshardv1.UserIdentity
+	// latency is the ShardLatency observer of latencyOf, kept so a
+	// statement does not pay to resolve it again.
+	latencyOf Shard
+	latency   prometheus.Observer
+	ident     *pgshardv1.UserIdentity
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -1337,6 +1342,18 @@ func (e *Executor) applyStaged() {
 	e.staged = nil
 }
 
+// shardLatency is the latency observer of the session's current shard.
+// Resolving it needed a formatted label and a lookup in the metric's label
+// map, on a path that runs once per statement; a session stays on one
+// shard for long stretches, so it is resolved when the shard changes.
+func (e *Executor) shardLatency() prometheus.Observer {
+	if e.latency == nil || e.latencyOf != e.shard {
+		e.latencyOf = e.shard
+		e.latency = e.r.metrics.ShardLatency.WithLabelValues(e.shard.Set + "/" + strconv.FormatInt(int64(e.shard.ID), 10))
+	}
+	return e.latency
+}
+
 func (e *Executor) generation() *pgshardv1.Generation { return e.r.cfg.Poolers.Generation(e.shard) }
 
 func (e *Executor) client() (pgshardv1.PoolerClient, error) { return e.r.cfg.Poolers.Client(e.shard) }
@@ -1535,9 +1552,8 @@ func (r *refusedError) Unwrap() error { return r.error }
 // returned after the batch is drained so pgwire reports them itself.
 func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 	start := time.Now()
-	defer func() {
-		e.r.metrics.ShardLatency.WithLabelValues(fmt.Sprintf("%s/%d", e.shard.Set, e.shard.ID)).Observe(time.Since(start).Seconds())
-	}()
+	observer := e.shardLatency()
+	defer func() { observer.Observe(time.Since(start).Seconds()) }()
 	var firstErr error
 	e.cancelSent.Store(false)
 	onCancel := func() { e.cancelBackend(context.Background()) }
