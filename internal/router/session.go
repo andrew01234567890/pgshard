@@ -127,8 +127,16 @@ type Executor struct {
 	tx       pgwire.TxStatus
 	lastTag  string
 	txnEnded bool
-	// cancelSent dedupes cancel requests within one batch.
+	// cancelSent dedupes cancel requests within one statement, and
+	// cancelFor is the statement context it was reset for. The reset used
+	// to happen on every pump, and a statement pumps more than once -- the
+	// backend is acquired, the session state replayed, the transaction
+	// prelude reopened, and only then the statement itself. A cancellation
+	// observed either side of one of those boundaries therefore sent a
+	// second Cancel, and the pooler cancels by session: the second one can
+	// land on whatever that backend is running by the time it arrives.
 	cancelSent atomic.Bool
+	cancelFor  context.Context
 
 	gucs   []gucEntry
 	staged []gucEntry
@@ -1555,7 +1563,7 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 	observer := e.shardLatency()
 	defer func() { observer.Observe(time.Since(start).Seconds()) }()
 	var firstErr error
-	e.cancelSent.Store(false)
+	e.beginStatement(ctx)
 	onCancel := func() { e.cancelBackend(context.Background()) }
 	for {
 		resp, err := e.conn.recv(ctx, onCancel)
@@ -1706,6 +1714,19 @@ func (e *Executor) copyIn(w pgwire.ResultWriter, resp *pgshardv1.CopyInResponse)
 
 // cancelBackend asks the pooler to interrupt the statement running for this
 // session.
+// beginStatement arms the backend cancel for a statement, once. A
+// statement pumps more than once -- the backend is acquired, the session
+// state replayed, the transaction prelude reopened, and only then the
+// statement runs -- and arming on each of those let one cancellation send
+// a second Cancel. The context is an identity here, never waited on: it
+// says which statement a pump belongs to.
+func (e *Executor) beginStatement(ctx context.Context) {
+	if e.cancelFor != ctx {
+		e.cancelFor = ctx
+		e.cancelSent.Store(false)
+	}
+}
+
 func (e *Executor) cancelBackend(ctx context.Context) {
 	if !e.cancelSent.CompareAndSwap(false, true) {
 		return
