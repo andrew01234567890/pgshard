@@ -279,3 +279,80 @@ func TestAcquireTakesABackendReleasedWhileItWaits(t *testing.T) {
 		t.Fatalf("dials = %d, want the released backend reused rather than a new one", d)
 	}
 }
+
+// TestEvictionTakesTheColdestIdleBackend: the idle list is LIFO, so its
+// last entry is the warmest backend there is -- the one with the hottest
+// prepared statements and the one most likely to be wanted next. Eviction
+// took exactly that one, from whichever role pool the map happened to
+// yield first, while older connections sat untouched.
+func TestEvictionTakesTheColdestIdleBackend(t *testing.T) {
+	pg := newFakePG()
+	p := newPool(PoolConfig{MaxBackends: 3, MaxPerRole: 3, AcquireTimeout: time.Second}, pg.dial)
+	defer p.Close()
+	ctx := context.Background()
+
+	var held []*Backend
+	for _, role := range []string{"alice", "bob", "carol"} {
+		b, err := p.Acquire(ctx, "db", role, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, b)
+	}
+	// Released oldest first, and each release stamps lastUsed, so alice's
+	// is the coldest and carol's the warmest.
+	for i, b := range held {
+		b.lastUsed = time.Now().Add(time.Duration(i-len(held)) * time.Minute)
+		p.Release(b)
+	}
+
+	// A fourth role has to displace one of them: it must be the coldest.
+	d, err := p.Acquire(ctx, "db", "dave", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Release(d)
+	for _, role := range []string{"bob", "carol"} {
+		b, err := p.Acquire(ctx, "db", role, nil, nil)
+		if err != nil {
+			t.Fatalf("%s should still have its idle backend: %v", role, err)
+		}
+		if b != held[1] && b != held[2] {
+			t.Errorf("%s got a fresh backend, so a warm one was evicted", role)
+		}
+		p.Release(b)
+	}
+	if d := pg.dials.Load(); d != 4 {
+		t.Errorf("dials = %d, want 4: evicting the coldest costs exactly one redial", d)
+	}
+}
+
+// TestIdleBackendsAreReapedWhileQuiet: an idle lifetime used to be noticed
+// only by the next acquire, so the connections a spike created stayed for
+// as long as the pool was quiet -- which is exactly when nothing arrives
+// to notice them.
+func TestIdleBackendsAreReapedWhileQuiet(t *testing.T) {
+	pg := newFakePG()
+	p := newPool(PoolConfig{MaxBackends: 4, MaxPerRole: 4, MaxIdleTime: 50 * time.Millisecond, AcquireTimeout: time.Second}, pg.dial)
+	defer p.Close()
+	ctx := context.Background()
+	for _, role := range []string{"alice", "bob"} {
+		b, err := p.Acquire(ctx, "db", role, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.Release(b)
+	}
+	if _, idle := p.Stats(); idle != 2 {
+		t.Fatalf("idle = %d, want the two just released", idle)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, idle := p.Stats(); idle == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_, idle := p.Stats()
+	t.Fatalf("%d backends still idle well past MaxIdleTime with nothing touching the pool", idle)
+}
