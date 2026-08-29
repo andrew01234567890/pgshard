@@ -19,8 +19,10 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -667,7 +669,7 @@ func TestReconcileGeneratesGroupObjects(t *testing.T) {
 			if pod.Spec.Volumes[0].PersistentVolumeClaim.ClaimName != pod.Name {
 				t.Errorf("pod %s must mount its own PVC: %+v", pod.Name, pod.Spec.Volumes[0])
 			}
-			if len(pod.Spec.Containers) != 2 || pod.Spec.Containers[1].Name != "pooler" || pod.Spec.Containers[1].Image != ctr.Image || pod.Spec.Containers[1].ReadinessProbe.TCPSocket == nil {
+			if len(pod.Spec.Containers) != 2 || pod.Spec.Containers[1].Name != "pooler" || pod.Spec.Containers[1].Image != ctr.Image || pod.Spec.Containers[1].ReadinessProbe.HTTPGet == nil {
 				t.Errorf("pod %s must carry the pooler sidecar from the same image: %+v", pod.Name, pod.Spec.Containers)
 			}
 			var pvc corev1.PersistentVolumeClaim
@@ -1098,5 +1100,42 @@ func TestReconcileWalksGroupsConcurrently(t *testing.T) {
 	fp.mu.Unlock()
 	if !opened {
 		t.Errorf("no two of the %d shard groups were ever reconciled at the same time", shards)
+	}
+}
+
+func TestNetworkPolicyIsRenderedOnlyWhileItIsEnabled(t *testing.T) {
+	r, _, c := setup(t, "netpol")
+	ctx := context.Background()
+	key := types.NamespacedName{Namespace: "default", Name: MemberNetworkPolicyName("netpol")}
+
+	reconcile(t, r, c)
+	var np networkingv1.NetworkPolicy
+	if err := k8sClient.Get(ctx, key, &np); !apierrors.IsNotFound(err) {
+		t.Fatalf("a policy nobody asked for: %v", err)
+	}
+
+	get(t, "netpol", c)
+	c.Spec.NetworkPolicy.Enabled = true
+	c.Spec.NetworkPolicy.Clients = []networkingv1.NetworkPolicyPeer{{
+		PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "pgshard-controller"}},
+	}}
+	if err := k8sClient.Update(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, r, c)
+	get(t, key.Name, &np)
+	ownedBy(t, &np, c)
+	if len(np.Spec.Ingress) != 2 || len(np.Spec.Ingress[0].From) != 2 {
+		t.Fatalf("policy does not carry the declared client: %+v", np.Spec.Ingress)
+	}
+
+	get(t, "netpol", c)
+	c.Spec.NetworkPolicy.Enabled = false
+	if err := k8sClient.Update(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, r, c)
+	if err := k8sClient.Get(ctx, key, &np); !apierrors.IsNotFound(err) {
+		t.Fatalf("a policy that was turned off keeps enforcing: %v", err)
 	}
 }

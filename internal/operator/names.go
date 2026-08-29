@@ -336,6 +336,9 @@ func SecretName(cluster string) string { return cluster + "-superuser" }
 // member agents run under.
 func MemberServiceAccount(cluster string) string { return cluster + "-member" }
 
+// MemberNetworkPolicyName is the NetworkPolicy in front of a cluster's pods.
+func MemberNetworkPolicyName(cluster string) string { return cluster + "-members" }
+
 // Image returns the PostgreSQL image for the cluster.
 func Image(c *pgshardv1alpha1.PgShardCluster) string {
 	if c.Spec.PostgreSQL.Image != "" {

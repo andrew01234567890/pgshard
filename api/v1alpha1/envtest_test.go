@@ -12,6 +12,7 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/dockertest"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -608,5 +609,22 @@ func TestBackupPolicyStoreFieldCannotInjectAnOption(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			mustReject(t, policy("inject-"+name, tc.mutate), tc.field+" must not contain a newline")
 		})
+	}
+}
+
+func TestClusterNetworkPolicyWithoutClientsRejected(t *testing.T) {
+	c := validCluster("netpol-empty")
+	c.Spec.NetworkPolicy.Enabled = true
+	mustReject(t, c, "networkPolicy.clients must name the control plane")
+}
+
+func TestClusterNetworkPolicyWithAClientAccepted(t *testing.T) {
+	c := validCluster("netpol-client")
+	c.Spec.NetworkPolicy.Enabled = true
+	c.Spec.NetworkPolicy.Clients = []networkingv1.NetworkPolicyPeer{{
+		NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/metadata.name": "pgshard-system"}},
+	}}
+	if err := create(t, c); err != nil {
+		t.Fatal(err)
 	}
 }
