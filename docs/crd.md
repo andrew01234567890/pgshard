@@ -12,7 +12,7 @@ Print columns: Shards, Ready, Age.
 | `spec.postgresql.major` | int | required; `18` or `19` |
 | `spec.postgresql.image` | string | optional override |
 | `spec.postgresql.profile` | enum | `oltp` (default), `mixed`, `analytics` |
-| `spec.postgresql.parameters` | map[string]string | must not contain `fsync`, `full_page_writes`, `wal_level`, `max_prepared_transactions`, `ssl`, `synchronous_commit` (CEL, message names the key) |
+| `spec.postgresql.parameters` | map[string]string | every key must be a PostgreSQL setting name (`^[A-Za-z_][A-Za-z0-9_.]*$`) — the agent writes the name as it stands, so one carrying a newline would write a second setting and defeat the rules below; must not contain the settings pgshard owns (`fsync`, `full_page_writes`, `wal_level`, `max_prepared_transactions`, `ssl`, `synchronous_commit`) or the ones that run a command in the member pod (`archive_command`, `restore_command`, `archive_cleanup_command`, `recovery_end_command`) (CEL, message names the key) |
 | `spec.resources` | corev1.ResourceRequirements | per PostgreSQL pod |
 | `spec.catalog.replicas` | int | default 3, min 1; CEL: `>= 3` ("catalog.replicas must be >= 3 for HA") |
 | `spec.catalog.storage.size` / `.storageClassName` | Quantity / *string | size required |

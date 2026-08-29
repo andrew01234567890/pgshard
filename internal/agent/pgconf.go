@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -36,12 +37,26 @@ func RenderPostgresqlConf(c *Config, standby bool) string {
 // instance is a normal primary again.
 func RenderRecoveryConf(c *Config) string { return renderPostgresqlConf(c, false, true) }
 
+// gucName is what PostgreSQL accepts as a setting name: a letter or
+// underscore, then letters, digits, underscores and dots.
+var gucName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.]*$`)
+
 func renderPostgresqlConf(c *Config, standby, recovering bool) string {
 	set := ownedSettings(c, standby, recovering)
 	for k, v := range c.Postgres.Parameters {
-		if _, owned := set[k]; !owned {
-			set[k] = quote(v)
+		if _, owned := set[k]; owned {
+			continue
 		}
+		if !gucName.MatchString(k) {
+			// The value is quoted but the name is written as it stands, so
+			// a name carrying a newline used to write a second setting of
+			// its own -- and the CRD's guards name settings, so anything
+			// they refuse could be smuggled in behind a key they allow.
+			// A name that is not a name is dropped rather than escaped:
+			// there is no legitimate one this rejects.
+			continue
+		}
+		set[k] = quote(v)
 	}
 	keys := make([]string, 0, len(set))
 	for k := range set {

@@ -189,8 +189,34 @@ func TestClusterRouterMaxEqualMinAccepted(t *testing.T) {
 	}
 }
 
+// TestClusterParameterKeyMustBeASettingName: the agent writes a
+// parameter's name as it stands, so a name carrying a newline writes a
+// second setting of its own -- and every rule beside this one names a
+// setting, so anything they refuse could be smuggled in behind a key they
+// allow.
+func TestClusterParameterKeyMustBeASettingName(t *testing.T) {
+	for name, key := range map[string]string{
+		"newline": "work_mem = '4MB'\nssl",
+		"space":   "work mem",
+		"equals":  "work_mem=1",
+		"quote":   "work_mem'",
+		"empty":   "",
+		"digit":   "1work_mem",
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := validCluster("paramkey-" + name)
+			c.Spec.PostgreSQL.Parameters = map[string]string{key: "1"}
+			mustReject(t, c, "every parameter key must be a PostgreSQL setting name")
+		})
+	}
+}
+
 func TestClusterUnsafeParametersRejected(t *testing.T) {
-	for _, key := range []string{"fsync", "full_page_writes", "wal_level", "max_prepared_transactions", "ssl", "synchronous_commit"} {
+	for _, key := range []string{
+		"fsync", "full_page_writes", "wal_level", "max_prepared_transactions", "ssl", "synchronous_commit",
+		// Each of these makes PostgreSQL run a command in the member pod.
+		"archive_command", "restore_command", "archive_cleanup_command", "recovery_end_command",
+	} {
 		t.Run(key, func(t *testing.T) {
 			c := validCluster("param-" + strings.ReplaceAll(key, "_", "-"))
 			c.Spec.PostgreSQL.Parameters = map[string]string{key: "off"}
