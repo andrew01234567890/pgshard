@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -444,5 +445,79 @@ func TestMergeHiddenSortKeysFollowTheRealRowWidth(t *testing.T) {
 	}
 	if want := "2|b|y,3|c|z"; strings.Join(got, ",") != want || n != 2 {
 		t.Fatalf("merged %v (%d), want %s", got, n, want)
+	}
+}
+
+// TestCompareKeysMatchesCompare: the merge heap compares decoded keys now
+// rather than raw bytes, so the two have to order every pair the same way
+// -- including NULLs, which are recorded rather than decoded, and DESC,
+// which flips the comparison but not where a NULL sits.
+func TestCompareKeysMatchesCompare(t *testing.T) {
+	cols := []Column{{TypeOID: 23}, {TypeOID: 25}}
+	rows := [][][]byte{
+		{[]byte("1"), []byte("a")},
+		{[]byte("2"), []byte("a")},
+		{[]byte("1"), []byte("b")},
+		{[]byte("1"), nil},
+		{nil, []byte("a")},
+		{nil, nil},
+		{[]byte("-3"), []byte("")},
+	}
+	for _, desc := range []bool{false, true} {
+		for _, nullsFirst := range []bool{false, true} {
+			keys := []plan.SortKey{
+				{Column: 0, Desc: desc, NullsFirst: nullsFirst, CCollation: true},
+				{Column: 1, Desc: desc, NullsFirst: nullsFirst, CCollation: true},
+			}
+			rc, err := NewRowComparator(keys, cols, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, a := range rows {
+				for _, b := range rows {
+					want, err := rc.Compare(a, b)
+					if err != nil {
+						t.Fatal(err)
+					}
+					ka, err := rc.Key(a)
+					if err != nil {
+						t.Fatal(err)
+					}
+					kb, err := rc.Key(b)
+					if err != nil {
+						t.Fatal(err)
+					}
+					got := rc.CompareKeys(ka, kb)
+					if (got < 0) != (want < 0) || (got > 0) != (want > 0) {
+						t.Fatalf("desc=%v nullsFirst=%v rows %v vs %v: keys say %d, bytes say %d", desc, nullsFirst, a, b, got, want)
+					}
+				}
+			}
+		}
+	}
+}
+
+// BenchmarkOrderedMerge measures a merge over many shards ordered by a
+// numeric column, which is the case where decoding costs most: arbitrary
+// precision parsing, once per comparison before, once per row now.
+func BenchmarkOrderedMerge(b *testing.B) {
+	const shards, perShard = 64, 50
+	cols := []Column{{TypeOID: 1700}}
+	keys := []plan.SortKey{{Column: 0, CCollation: true}}
+	spec := &plan.Merge{OrderBy: keys, Limit: -1}
+	b.ReportAllocs()
+	for b.Loop() {
+		sources := make([]Source, shards)
+		for s := range shards {
+			rows := make([][][]byte, perShard)
+			for i := range rows {
+				rows[i] = [][]byte{[]byte(fmt.Sprintf("%d.%09d", s*perShard+i, i))}
+			}
+			sources[s] = &sliceSource{rows: rows}
+		}
+		n, err := Merge(spec, cols, sources, func([][]byte) error { return nil })
+		if err != nil || n != shards*perShard {
+			b.Fatalf("merged %d: %v", n, err)
+		}
 	}
 }
