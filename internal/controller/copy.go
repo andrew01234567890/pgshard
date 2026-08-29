@@ -59,6 +59,10 @@ type Copier struct {
 	ThrottleHigh, ThrottleLow int64
 	// PreparedWait bounds the wait for in-doubt prepared transactions.
 	PreparedWait time.Duration
+
+	// progress is the last copy state logged per workflow, so a pass that
+	// found no change stays quiet.
+	progress map[string]string
 	// SlotFailover requests failover slots (PG 17+ subscription option).
 	SlotFailover bool
 	// CutoverTimeout bounds the fence of one switch attempt; CutoverAttempts
@@ -489,6 +493,17 @@ func (c *Copier) drive(ctx context.Context, wf *copyWorkflow) (bool, error) {
 		stage = StageCatchUpDone
 		advanced = true
 		msg = fmt.Sprintf("caught up: %d tables ready, lag %d bytes", progress.TablesReady, progress.LagBytes)
+	}
+	// A copy that stops short of caught up otherwise says so only in the
+	// catalog: the pass succeeds, logs nothing, and the workflow sits at
+	// the same stage with no way to tell which of the conditions is unmet
+	// without reading the row.
+	if c.progress == nil {
+		c.progress = map[string]string{}
+	}
+	if c.progress[wf.id] != msg {
+		c.progress[wf.id] = msg
+		c.logger().Info("reshard copy progress", "workflow", wf.id, "state", msg)
 	}
 	return advanced, c.save(ctx, wf, stage, msg)
 }
