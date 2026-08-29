@@ -852,8 +852,16 @@ func (o *pgCutover) Journal(ctx context.Context, id string) error {
 						return err
 					}
 				}
+				// The targets are updated rather than left alone: a flip
+				// that found the sources had advanced rewinds to re-carry
+				// the sequences and comes back through here, and the
+				// journal has to describe the attempt that actually
+				// flipped. Leaving the first attempt's positions in place
+				// starts a consumer that repositions off the journal
+				// before the cutover it is repositioning to.
 				_, err := conn.Exec(ctx, fmt.Sprintf(`INSERT INTO %s.%s (id, generation, source_shard, participants, targets)
-					VALUES ($1::uuid, $2, $3, $4, $5::jsonb) ON CONFLICT (id, source_shard) DO NOTHING`, JournalSchema, JournalTable),
+					VALUES ($1::uuid, $2, $3, $4, $5::jsonb)
+					ON CONFLICT (id, source_shard) DO UPDATE SET targets = EXCLUDED.targets`, JournalSchema, JournalTable),
 					id, o.wf.gen, s, o.srcIDs, mustJSON(targets))
 				return err
 			}()
@@ -869,7 +877,8 @@ func (o *pgCutover) Journal(ctx context.Context, id string) error {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	if _, err := tx.Exec(ctx, `INSERT INTO pgshard.resharding_journal (id, generation, shard_set, participants, targets)
-		VALUES ($1::uuid, $2, $3, $4, $5::jsonb) ON CONFLICT (id) DO NOTHING`, id, o.wf.gen, o.wf.set, o.srcIDs, mustJSON(targets)); err != nil {
+		VALUES ($1::uuid, $2, $3, $4, $5::jsonb)
+		ON CONFLICT (id) DO UPDATE SET targets = EXCLUDED.targets`, id, o.wf.gen, o.wf.set, o.srcIDs, mustJSON(targets)); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE pgshard.workflows SET journal_ids = array_append(array_remove(journal_ids, $2), $2) WHERE id = $1::uuid`, o.wf.id, id); err != nil {

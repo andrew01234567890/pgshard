@@ -634,3 +634,82 @@ func TestSwapCarriesSequencesInsideThePause(t *testing.T) {
 		t.Fatalf("sequences carried %d times, want the pre-flip carry and the one at the swap", got)
 	}
 }
+
+// TestNoAbortOnceTheJournalIsWritten: the journal is the point of no
+// return -- its rows tell every consumer of the change stream that the
+// cutover happened, and nothing retracts them. The abort was gated on the
+// step cursor, and StepFlip rewinds that cursor back to StepSequences when
+// the sources moved before the flip, so an error on the way forward again
+// found itself "before the journal" with the fence long past its timeout
+// and undid a switch the sources had already announced.
+func TestNoAbortOnceTheJournalIsWritten(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.runUntil(t, StageSwitching)
+	// Park the run at the journal, then let it through with the sources
+	// moving so the flip rewinds to the sequence carry.
+	h.ops.fail[StepJournal] = errors.New("boom")
+	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); err == nil {
+		t.Fatal("the journal step must surface its error")
+	}
+	delete(h.ops.fail, StepJournal)
+	h.ops.advance = 10
+	// The rewind reports itself as a retry, which pass would treat as
+	// fatal, so the pass is driven directly here.
+	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); err == nil || isFatal(err) {
+		t.Fatalf("movement at the flip must ask for a retry, got %v", err)
+	}
+	if h.wf.cutover.Step != StepSequences {
+		t.Fatalf("step %s, want the rewind to the sequence carry", h.wf.cutover.Step)
+	}
+	if h.wf.cutover.JournalID == "" {
+		t.Fatal("the journal was never written, so this does not test what it says")
+	}
+
+	// A step now fails with the fence well past its timeout: the old gate
+	// would have aborted here, because the cursor is before the journal.
+	h.ops.advance = 0
+	h.ops.fail[StepSequences] = errors.New("target unreachable")
+	h.clock = h.clock.Add(4 * DefaultCutoverTimeout)
+	aborts := len(h.wf.cutover.Aborts)
+	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); err == nil {
+		t.Fatal("the failing step must surface its error")
+	}
+	if len(h.wf.cutover.Aborts) != aborts {
+		t.Fatalf("the switch was undone after the journal: %v", h.wf.cutover.Aborts)
+	}
+	if !h.ops.fenced {
+		t.Error("the fence was released after the journal")
+	}
+
+	// It recovers by retrying, not by going back to the gate.
+	delete(h.ops.fail, StepSequences)
+	h.runUntil(t, StageSwitched)
+}
+
+// TestJournalRefreshesItsTargetsAfterARewind: the journal's targets are
+// where a consumer repositions to. A flip that rewinds to re-carry the
+// sequences comes back through the journal, and the row must describe the
+// attempt that actually flipped -- leaving the first attempt's positions
+// starts a consumer before the cutover it is repositioning to.
+func TestJournalRefreshesItsTargetsAfterARewind(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.runUntil(t, StageSwitching)
+	h.ops.fail[StepJournal] = errors.New("boom")
+	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); err == nil {
+		t.Fatal("the journal step must surface its error")
+	}
+	delete(h.ops.fail, StepJournal)
+	h.ops.advance = 10
+	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); err == nil || isFatal(err) {
+		t.Fatalf("movement at the flip must ask for a retry, got %v", err)
+	}
+	first := h.ops.journaled[h.wf.cutover.JournalID]
+	if first == 0 {
+		t.Fatal("the journal was never written")
+	}
+	h.ops.advance = 0
+	h.runUntil(t, StageSwitched)
+	if again := h.ops.journaled[h.wf.cutover.JournalID]; again <= first {
+		t.Errorf("the journal was written %d times and not again after the rewind", again)
+	}
+}
