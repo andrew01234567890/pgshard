@@ -202,42 +202,58 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		plan.cond = metav1.Condition{Type: pgshardv1alpha1.ConditionResharding, Status: metav1.ConditionUnknown, Reason: "CatalogNotReady", Message: catalogReady.Message, ObservedGeneration: cluster.Generation}
 	}
 	observations := []groupObservation{catalogObs}
-	for _, g := range Groups(&cluster)[1:] {
-		obs, err := r.reconcileGroup(ctx, &cluster, g, password, policy, repoReady)
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("group %s: %w", g.Name(), err)
-		}
-		observations = append(observations, obs)
+	shardObs, err := r.reconcileGroups(ctx, &cluster, Groups(&cluster)[1:], password, policy, repoReady)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
+	observations = append(observations, shardObs...)
+
+	// A target group over the provisioning budget only reconciles once it
+	// has started, so which groups run is decided before they run: every
+	// started group, then as many fresh ones as the budget still has room
+	// for once the started ones that came back not ready are counted.
 	var targets []groupObservation
-	inflight := 0
-	budget := ProvisionBudget(&cluster)
-	for _, g := range TargetGroups(&cluster) {
-		if budget > 0 && inflight >= budget {
-			started, err := r.groupStarted(ctx, &cluster, g)
+	if budget := ProvisionBudget(&cluster); budget > 0 {
+		var started, fresh []Group
+		for _, g := range TargetGroups(&cluster) {
+			ok, err := r.groupStarted(ctx, &cluster, g)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
-			if !started {
-				continue
+			if ok {
+				started = append(started, g)
+			} else {
+				fresh = append(fresh, g)
 			}
 		}
-		obs, err := r.reconcileGroup(ctx, &cluster, g, password, policy, repoReady)
+		obs, err := r.reconcileGroups(ctx, &cluster, started, password, policy, repoReady)
 		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("target group %s: %w", g.Name(), err)
+			return ctrl.Result{}, err
 		}
-		if !obs.ready() {
-			inflight++
+		inflight := 0
+		for _, o := range obs {
+			if !o.ready() {
+				inflight++
+			}
 		}
-		targets = append(targets, obs)
+		if room := budget - inflight; room > 0 && len(fresh) > 0 {
+			more, err := r.reconcileGroups(ctx, &cluster, fresh[:min(room, len(fresh))], password, policy, repoReady)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			obs = append(obs, more...)
+		}
+		targets = inGroupOrder(TargetGroups(&cluster), obs)
+	} else {
+		var err error
+		targets, err = r.reconcileGroups(ctx, &cluster, TargetGroups(&cluster), password, policy, repoReady)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 	}
-	var retired []groupObservation
-	for _, g := range RetiredGroups(&cluster) {
-		obs, err := r.reconcileGroup(ctx, &cluster, g, password, policy, repoReady)
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("retired group %s: %w", g.Name(), err)
-		}
-		retired = append(retired, obs)
+	retired, err := r.reconcileGroups(ctx, &cluster, RetiredGroups(&cluster), password, policy, repoReady)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 
 	if catalogReady.Status == metav1.ConditionTrue {
@@ -834,13 +850,14 @@ func (r *ClusterReconciler) reconcileCatalogSchema(ctx context.Context, c *pgsha
 // catalog; target groups stay provisioning until their set is serving.
 func (r *ClusterReconciler) publishShardStatus(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, dsn string, shards []groupObservation) metav1.Condition {
 	cond := metav1.Condition{Type: ConditionCatalogReady, Status: metav1.ConditionTrue, Reason: "Migrated", Message: "catalog schema is current", ObservedGeneration: c.Generation}
-	for _, o := range shards {
-		if err := r.Prober.PublishShardStatus(ctx, dsn, o.group, o.state.epoch, r.memberEndpoint(c, o.group, o.state.primary)); err != nil {
-			cond.Status = metav1.ConditionFalse
-			cond.Reason = "PublishFailed"
-			cond.Message = err.Error()
-			return cond
-		}
+	rows := make([]ShardStatus, len(shards))
+	for i, o := range shards {
+		rows[i] = ShardStatus{Group: o.group, Epoch: o.state.epoch, Endpoint: r.memberEndpoint(c, o.group, o.state.primary)}
+	}
+	if err := r.Prober.PublishShardStatus(ctx, dsn, rows); err != nil {
+		cond.Status = metav1.ConditionFalse
+		cond.Reason = "PublishFailed"
+		cond.Message = err.Error()
 	}
 	return cond
 }
@@ -997,6 +1014,76 @@ func ProvisionBudget(c *pgshardv1alpha1.PgShardCluster) int {
 		return 0
 	}
 	return c.Spec.Upgrade.MaxParallelGroups
+}
+
+// inGroupOrder sorts observations the way groups lists them, so which
+// groups the budget admitted does not change the order a pass reports
+// them in.
+func inGroupOrder(groups []Group, obs []groupObservation) []groupObservation {
+	at := map[string]groupObservation{}
+	for _, o := range obs {
+		at[o.group.Name()] = o
+	}
+	out := make([]groupObservation, 0, len(obs))
+	for _, g := range groups {
+		if o, ok := at[g.Name()]; ok {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
+// groupConcurrency bounds how many groups reconcile at once. A group's
+// pass is mostly waiting -- Kubernetes reads and writes, an agent RPC and
+// a few PostgreSQL round trips -- so serially a pass cost the sum over
+// every group of the cluster. On a large topology that ran past the
+// requeue interval, and a primary failure in the last group was not
+// noticed until the walk reached it.
+const groupConcurrency = 16
+
+// reconcileGroups reconciles groups concurrently and returns their
+// observations in the order given. The first error in that same order is
+// returned: which of several failing groups a pass blames should not
+// depend on which goroutine lost the race.
+func (r *ClusterReconciler) reconcileGroups(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, groups []Group, password string, pol *pgshardv1alpha1.PgShardBackupPolicy, repoReady bool) ([]groupObservation, error) {
+	if len(groups) == 0 {
+		return nil, nil
+	}
+	// A switchover writes to the cluster object the other groups are
+	// reading, and it is one deliberate operation on one group, so it is
+	// not worth making every other read of the object synchronise.
+	if target := c.Annotations[AnnotationSwitchover]; target != "" {
+		out := make([]groupObservation, 0, len(groups))
+		for _, g := range groups {
+			obs, err := r.reconcileGroup(ctx, c, g, password, pol, repoReady)
+			if err != nil {
+				return nil, fmt.Errorf("group %s: %w", g.Name(), err)
+			}
+			out = append(out, obs)
+		}
+		return out, nil
+	}
+	out := make([]groupObservation, len(groups))
+	errs := make([]error, len(groups))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, groupConcurrency)
+	for i, g := range groups {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			obs, err := r.reconcileGroup(ctx, c, g, password, pol, repoReady)
+			out[i], errs[i] = obs, err
+		}()
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			return nil, fmt.Errorf("group %s: %w", groups[i].Name(), err)
+		}
+	}
+	return out, nil
 }
 
 // groupStarted reports whether a target group's PgShardGroup record
