@@ -80,8 +80,14 @@ func TestRoleCacheReloadsOnMissAndTTL(t *testing.T) {
 	if v, err := c.Lookup(ctx, "bob"); err != nil || v != "v2" || q.calls != 2 {
 		t.Fatalf("miss must reload once: %q %v calls=%d", v, err, q.calls)
 	}
-	if _, err := c.Lookup(ctx, "carol"); !errors.Is(err, ErrUnknownRole) || q.calls != 3 {
-		t.Fatalf("unknown role: %v calls=%d", err, q.calls)
+	// A second unknown name inside the same window must not reload again.
+	// Every miss used to, so a burst of invalid usernames -- which anyone
+	// who can reach the port can send -- turned into catalog traffic.
+	if _, err := c.Lookup(ctx, "carol"); !errors.Is(err, ErrUnknownRole) || q.calls != 2 {
+		t.Fatalf("unknown role reloaded inside the window: %v calls=%d", err, q.calls)
+	}
+	if _, err := c.Lookup(ctx, "dave"); !errors.Is(err, ErrUnknownRole) || q.calls != 2 {
+		t.Fatalf("a third unknown role reloaded: %v calls=%d", err, q.calls)
 	}
 	q.roles["alice"] = "v3"
 	if v, _ := c.Lookup(ctx, "alice"); v != "v1" {
@@ -90,6 +96,17 @@ func TestRoleCacheReloadsOnMissAndTTL(t *testing.T) {
 	now = now.Add(2 * time.Minute)
 	if v, _ := c.Lookup(ctx, "alice"); v != "v3" {
 		t.Fatalf("after TTL the verifier must refresh, got %q", v)
+	}
+	// Past the window an unknown name is worth looking again: a role
+	// created since the last read has to become usable.
+	q.roles["erin"] = "v5"
+	now = now.Add(2 * time.Minute)
+	before := q.calls
+	if v, err := c.Lookup(ctx, "erin"); err != nil || v != "v5" {
+		t.Fatalf("a role created since the last read must be found: %q %v", v, err)
+	}
+	if q.calls <= before {
+		t.Errorf("finding a new role took no catalog read: calls %d -> %d", before, q.calls)
 	}
 	q.err = errors.New("catalog down")
 	now = now.Add(2 * time.Minute)
@@ -227,5 +244,56 @@ func TestMayLogInAnswersFromCurrentState(t *testing.T) {
 	}
 	if c.MayLogIn("never-existed") {
 		t.Fatal("an unknown role may not log in")
+	}
+}
+
+// TestRoleCacheLooksUpConcurrently: a lookup that finds the roles fresh
+// must not take a lock, and a refresh must not serialize the logins that
+// arrive during it. The cache held one mutex across its catalog round
+// trip, so every login waited for it.
+func TestRoleCacheLooksUpConcurrently(t *testing.T) {
+	q := &fakeQuerier{roles: map[string]string{"alice": "v1"}}
+	c := NewRoleCache(q, time.Minute)
+	release := make(chan struct{})
+	loads := make(chan struct{}, 16)
+	inner := c.load
+	c.load = func(ctx context.Context) (*snapshot.Roles, error) {
+		loads <- struct{}{}
+		<-release
+		return inner(ctx)
+	}
+	ctx := context.Background()
+
+	// Several logins arrive with nothing cached. One reads the catalog;
+	// the others wait for it rather than opening their own.
+	done := make(chan error, 4)
+	for range 4 {
+		go func() {
+			_, err := c.Lookup(ctx, "alice")
+			done <- err
+		}()
+	}
+	<-loads
+	select {
+	case <-loads:
+		t.Error("a second login opened its own catalog read")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	for range 4 {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// With the roles published, a lookup does no catalog work at all.
+	c.load = func(context.Context) (*snapshot.Roles, error) {
+		t.Error("a fresh lookup read the catalog")
+		return nil, errors.New("unexpected")
+	}
+	for range 8 {
+		if v, err := c.Lookup(ctx, "alice"); err != nil || v != "v1" {
+			t.Fatalf("cached lookup: %q %v", v, err)
+		}
 	}
 }
