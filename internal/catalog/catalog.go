@@ -63,6 +63,10 @@ func CheckDatabaseName(name string) error {
 // no longer matches the checksum recorded in the database.
 var ErrChecksumMismatch = errors.New("catalog: applied migration checksum changed")
 
+// ErrCatalogAhead is returned when the catalog carries migrations this
+// binary does not have, which means it was migrated by a newer one.
+var ErrCatalogAhead = errors.New("catalog: schema is newer than this binary")
+
 // Migration is one embedded schema file.
 type Migration struct {
 	Version  int
@@ -127,10 +131,51 @@ func Migrate(ctx context.Context, conn *pgx.Conn) error {
 		)`); err != nil {
 		return fmt.Errorf("catalog: prepare schema_migrations: %w", err)
 	}
+	if err := CheckCompatible(ctx, conn, migrations); err != nil {
+		return err
+	}
 	for _, m := range migrations {
 		if err := applyMigration(ctx, conn, m); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// CheckCompatible refuses a catalog that has been migrated by a newer
+// binary than this one. Without it the skew is silent in both directions:
+// a component that predates a column keeps writing its old shape against
+// a schema that has moved on, and one that postdates it fails somewhere
+// deep in a query with a raw "column does not exist" that names neither
+// the version gap nor the component that opened it. Passing migrations is
+// optional; nil reads the embedded set.
+func CheckCompatible(ctx context.Context, q Querier, migrations []Migration) error {
+	if migrations == nil {
+		var err error
+		if migrations, err = Migrations(); err != nil {
+			return err
+		}
+	}
+	known := make(map[int]bool, len(migrations))
+	for _, m := range migrations {
+		known[m.Version] = true
+	}
+	rows, err := q.Query(ctx, `SELECT version FROM pgshard.schema_migrations ORDER BY version`)
+	if err != nil {
+		return fmt.Errorf("catalog: read applied migrations: %w", err)
+	}
+	applied, err := pgx.CollectRows(rows, pgx.RowTo[int32])
+	if err != nil {
+		return fmt.Errorf("catalog: read applied migrations: %w", err)
+	}
+	var unknown []int32
+	for _, v := range applied {
+		if !known[int(v)] {
+			unknown = append(unknown, v)
+		}
+	}
+	if len(unknown) > 0 {
+		return fmt.Errorf("%w: it has migrations %v this binary does not know; upgrade it rather than run against a schema it cannot read", ErrCatalogAhead, unknown)
 	}
 	return nil
 }
