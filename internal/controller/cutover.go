@@ -339,7 +339,7 @@ func (c *Copier) switchWrites(ctx context.Context, wf *copyWorkflow, ops cutover
 					}
 					return false, err
 				}
-				if wf.cutover.FencedAt != nil && c.now().Sub(*wf.cutover.FencedAt) > c.cutoverTimeout() {
+				if c.mayAbort(wf) && c.now().Sub(*wf.cutover.FencedAt) > c.cutoverTimeout() {
 					return c.abortSwitch(ctx, wf, ops, fmt.Sprintf("step %s did not finish within %s: %s", step, c.cutoverTimeout(), err))
 				}
 				return false, err
@@ -347,7 +347,7 @@ func (c *Copier) switchWrites(ctx context.Context, wf *copyWorkflow, ops cutover
 			waiting = true
 		}
 		if waiting {
-			if beforeJournal(step) && wf.cutover.FencedAt != nil && c.now().Sub(*wf.cutover.FencedAt) > c.cutoverTimeout() {
+			if c.mayAbort(wf) && beforeJournal(step) && c.now().Sub(*wf.cutover.FencedAt) > c.cutoverTimeout() {
 				// The step knows what it is still waiting for; without it an
 				// abort says only that the deadline passed, which does not
 				// distinguish replication that is still catching up from a
@@ -581,6 +581,19 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 		return false, fatal("unknown switch step %q", step)
 	}
 	return false, nil
+}
+
+// mayAbort reports whether the switch can still be undone. The journal is
+// the point of no return: once its rows are on the sources, every consumer
+// of the change stream has been told the cutover happened, and nothing
+// retracts that. So the question is answered from the durable fact that a
+// journal id was allocated, not from the step cursor -- StepFlip rewinds
+// the cursor back to StepSequences when the sources advanced before the
+// flip, and a cursor that can move backwards across the boundary cannot
+// stand for a write that cannot be taken back. Past that point every error
+// is retried instead.
+func (c *Copier) mayAbort(wf *copyWorkflow) bool {
+	return wf.cutover.FencedAt != nil && wf.cutover.JournalID == ""
 }
 
 // abortSwitch undoes the fence before the journal and returns to the gate,
