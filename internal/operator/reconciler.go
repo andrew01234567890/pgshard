@@ -279,7 +279,13 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, fmt.Errorf("router: %w", err)
 	}
 	if catalogReady.Status == metav1.ConditionTrue {
-		catalogReady = r.publishShardStatus(ctx, &cluster, dsn, slices.Concat(observations[1:], targets, retired))
+		published := r.publishShardStatus(ctx, &cluster, dsn, slices.Concat(observations[1:], targets, retired))
+		// Publishing succeeded says nothing about the schema, and it is the
+		// schema this condition reports: a deferral has to survive it.
+		if published.Status == metav1.ConditionTrue {
+			published.Reason, published.Message = catalogReady.Reason, catalogReady.Message
+		}
+		catalogReady = published
 	}
 	if err := r.updateReshardStatus(ctx, plan, targets); err != nil {
 		return ctrl.Result{}, err
@@ -872,6 +878,19 @@ func (r *ClusterReconciler) reconcileCatalogSchema(ctx context.Context, c *pgsha
 		return cond, ""
 	}
 	dsn := DSN(catalog.group.ServiceRW(), c.Namespace, password)
+	if up := c.Status.CatalogUpgrade; up != nil && up.Stage == CatalogUpgradeRetiring {
+		// A schema migration applied here cannot be rolled back with the
+		// data. Logical replication carries no DDL, so the reverse stream
+		// would take pgshard.schema_migrations to the old catalog while the
+		// DDL it describes stayed behind, and rows written to a table the
+		// migration created would not replicate at all until the
+		// subscription refreshed. The old catalog would then be structurally
+		// behind and believe otherwise. Defer until it is retired.
+		cond.Status = metav1.ConditionTrue
+		cond.Reason = "MigrationDeferred"
+		cond.Message = "catalog schema migrations wait while the previous catalog is kept for rollback; they run when it is retired"
+		return cond, dsn
+	}
 	if err := r.Prober.MigrateCatalog(ctx, dsn); err != nil {
 		cond.Reason = "MigrationFailed"
 		cond.Message = err.Error()

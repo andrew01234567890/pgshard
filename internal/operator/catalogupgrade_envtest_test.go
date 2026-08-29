@@ -511,3 +511,63 @@ func TestCatalogRollbackRecordsTheRestoredCatalogBeforeItMovesAnything(t *testin
 		t.Errorf("the rollback must be recorded as started before it moves anything: %+v", atRelease.Status.CatalogUpgrade)
 	}
 }
+
+// TestCatalogMigrationsWaitForTheRollbackWindowToClose: a catalog schema
+// migration applied while the previous catalog is still kept for rollback
+// cannot be rolled back with the data. Logical replication carries no DDL,
+// so the old catalog would take the bookkeeping row that says it is migrated
+// while the DDL stayed behind, and rows in a table the migration created
+// would not replicate at all.
+func TestCatalogMigrationsWaitForTheRollbackWindowToClose(t *testing.T) {
+	r, fp, c := setup(t, "cm")
+	cur := startCatalogUpgrade(t, r, fp, c)
+	base := cur.DeepCopy()
+	cur.Spec.Resharding.RetireOldGroupsAfter = &metav1.Duration{Duration: time.Hour}
+	if err := k8sClient.Patch(context.Background(), cur, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4 && catalogStage(t, c.Name) != CatalogUpgradeRetiring; i++ {
+		reconcile(t, r, c)
+	}
+	if catalogStage(t, c.Name) != CatalogUpgradeRetiring {
+		t.Fatalf("the upgrade never reached retiring: %q", catalogStage(t, c.Name))
+	}
+
+	fp.mu.Lock()
+	fp.migrated = 0
+	fp.mu.Unlock()
+	reconcile(t, r, c)
+	fp.mu.Lock()
+	during := fp.migrated
+	fp.mu.Unlock()
+	if during != 0 {
+		t.Errorf("the catalog was migrated %d time(s) while the old one was still kept for rollback", during)
+	}
+	if cond := condition(t, c.Name, ConditionCatalogReady); cond.Reason != "MigrationDeferred" {
+		t.Errorf("CatalogReady reason = %q, want the deferral said out loud", cond.Reason)
+	}
+
+	// Once the window closes and the upgrade is done, migrations resume.
+	cur = getCluster(t, c.Name)
+	base = cur.DeepCopy()
+	cur.Spec.Resharding.RetireOldGroupsAfter = &metav1.Duration{Duration: 0}
+	if err := k8sClient.Patch(context.Background(), cur, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4 && getCluster(t, c.Name).Status.CatalogUpgrade != nil; i++ {
+		reconcile(t, r, c)
+	}
+	if up := getCluster(t, c.Name).Status.CatalogUpgrade; up != nil {
+		t.Fatalf("the upgrade never retired: %+v", up)
+	}
+	fp.mu.Lock()
+	fp.migrated = 0
+	fp.mu.Unlock()
+	reconcile(t, r, c)
+	fp.mu.Lock()
+	after := fp.migrated
+	fp.mu.Unlock()
+	if after == 0 {
+		t.Error("migrations must resume once the previous catalog is retired")
+	}
+}
