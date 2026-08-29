@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -55,8 +56,56 @@ func (ps preparedSet) doubtAll() {
 // touchesPrepared reports whether a simple query may deallocate
 // statements.
 func touchesPrepared(sql string) bool {
-	u := strings.ToUpper(sql)
-	return strings.Contains(u, "DEALLOCATE") || strings.Contains(u, "DISCARD")
+	if !isASCII(sql) {
+		// Unicode case folding can turn a non-ASCII letter into an ASCII
+		// one -- dotless i uppercases to I -- so a scan that folds only
+		// ASCII could miss a statement this has to catch. Vanishingly
+		// rare, and a miss leaves stale prepared state on a recycled
+		// backend, so those strings take the old path.
+		u := strings.ToUpper(sql)
+		return strings.Contains(u, "DEALLOCATE") || strings.Contains(u, "DISCARD")
+	}
+	return containsFold(sql, "DEALLOCATE") || containsFold(sql, "DISCARD")
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
+// containsFold reports whether s contains word, which must be upper-case
+// ASCII, ignoring case and without allocating. Every SimpleQuery and Parse
+// passes through here, and uppercasing the whole statement to look for a
+// rare state transition cost an allocation and a full scan on every
+// ordinary SELECT.
+func containsFold(s, word string) bool {
+	n := len(word)
+	for i := 0; i+n <= len(s); i++ {
+		if upperASCII(s[i]) != word[0] {
+			continue
+		}
+		j := 1
+		for ; j < n; j++ {
+			if upperASCII(s[i+j]) != word[j] {
+				break
+			}
+		}
+		if j == n {
+			return true
+		}
+	}
+	return false
+}
+
+func upperASCII(b byte) byte {
+	if b >= 'a' && b <= 'z' {
+		return b - ('a' - 'A')
+	}
+	return b
 }
 
 var sqlPrepareRE = regexp.MustCompile(`(?i)\bPREPARE\s+(?:TRANSACTION\b)?`)
