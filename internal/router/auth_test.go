@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -295,5 +296,91 @@ func TestRoleCacheLooksUpConcurrently(t *testing.T) {
 		if v, err := c.Lookup(ctx, "alice"); err != nil || v != "v1" {
 			t.Fatalf("cached lookup: %q %v", v, err)
 		}
+	}
+}
+
+// TestMaxSessionsCapsWhatOneLoginCanHold: the pre-authentication cap
+// releases its slot the moment a session authenticates, and a role carries
+// no connection limit unless one was set on it. Without a cap of its own
+// one valid login could hold sessions until the router ran out of memory,
+// taking every tenant on it down.
+func TestMaxSessionsCapsWhatOneLoginCanHold(t *testing.T) {
+	fp := newFakePooler()
+	h := newHarnessWith(t, fp, startFakePooler(t, fp), func(cfg *Config) {
+		cfg.MaxSessions = 2
+	})
+	var open []*pgx.Conn
+	for i := range 2 {
+		c, err := pgx.Connect(context.Background(), h.dsn("app", "secret", "app"))
+		if err != nil {
+			t.Fatalf("session %d of a cap of 2: %v", i, err)
+		}
+		open = append(open, c)
+	}
+	_, err := pgx.Connect(context.Background(), h.dsn("app", "secret", "app"))
+	if sqlstate(err) != "53300" {
+		t.Fatalf("third session past a cap of 2: %v", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "too many clients already") {
+		t.Errorf("the refusal must say what happened: %v", err)
+	}
+
+	// A closed session gives its slot back.
+	if err := open[0].Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c, err := pgx.Connect(context.Background(), h.dsn("app", "secret", "app"))
+		if err == nil {
+			_ = c.Close(context.Background())
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("a closed session must free its slot: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	for _, c := range open[1:] {
+		_ = c.Close(context.Background())
+	}
+}
+
+// TestMaxSessionsAdmitsConcurrentlyWithoutExceedingTheCap: admission reads
+// the count and records the session in one critical section, so racing
+// logins cannot both see room for the last slot.
+func TestMaxSessionsAdmitsConcurrentlyWithoutExceedingTheCap(t *testing.T) {
+	fp := newFakePooler()
+	const capacity = 4
+	h := newHarnessWith(t, fp, startFakePooler(t, fp), func(cfg *Config) {
+		cfg.MaxSessions = capacity
+	})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var opened []*pgx.Conn
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, err := pgx.Connect(context.Background(), h.dsn("app", "secret", "app"))
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			opened = append(opened, c)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	defer func() {
+		for _, c := range opened {
+			_ = c.Close(context.Background())
+		}
+	}()
+	if len(opened) > capacity {
+		t.Errorf("%d sessions admitted past a cap of %d", len(opened), capacity)
+	}
+	if len(opened) == 0 {
+		t.Error("no session was admitted at all")
 	}
 }
