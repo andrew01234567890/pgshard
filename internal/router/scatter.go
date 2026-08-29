@@ -223,6 +223,63 @@ type participant struct {
 	reserved bool
 }
 
+// scatterSetupConcurrency bounds how many participants are set up at
+// once: enough that setup costs a round trip rather than one per shard,
+// few enough that a wide fan-out does not open every stream at once.
+const scatterSetupConcurrency = 32
+
+// startParticipant opens a shard's stream, applies the session state and
+// sends reqs. The participant is returned even when a later step failed,
+// so the caller can finish the stream it opened.
+func (e *Executor) startParticipant(ctx context.Context, sh Shard, seq, setup string, reqs []*pgshardv1.ExecuteRequest) (*participant, error) {
+	if e.r.blocking(sh) {
+		if ok, err := e.r.awaitConsistent(ctx, sh, false, e.r.cfg.Buffering.Window); err != nil {
+			return nil, err
+		} else if !ok {
+			return nil, pgwire.Errorf(codeConnectionFailure, "shard %s/%d has no serving primary", sh.Set, sh.ID)
+		}
+	}
+	client, err := e.r.cfg.Poolers.Client(sh)
+	if err != nil {
+		return nil, err
+	}
+	ps, err := openStream(e.ctx, client)
+	if err != nil {
+		return nil, pgwire.Errorf(codeConnectionFailure, "pooler of shard %s/%d refused the connection: %v", sh.Set, sh.ID, err)
+	}
+	p := &participant{shard: sh, sid: e.sid + "-x" + seq + "-" + strconv.FormatInt(int64(sh.ID), 10), client: client, ps: ps,
+		header: make(chan struct{}), rows: make(chan [][]byte, 64), done: make(chan struct{}), stop: make(chan struct{})}
+	gen := e.r.cfg.Poolers.Generation(sh)
+	// A fresh scatter backend starts on the server defaults, so it gets
+	// the same session state a routed backend is replayed: not just the
+	// search_path the planner resolved relations under, but every SET
+	// the session has run. SET ROLE in particular decides which grants
+	// and row-level security policies apply, and a participant that
+	// missed it would evaluate the query as the login role.
+	if setup != "" {
+		resp, rerr := client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: p.sid, Generation: gen})
+		if rerr != nil {
+			return p, pgwire.Errorf(codeConnectionFailure, "pooler of shard %s/%d refused the connection: %v", sh.Set, sh.ID, rerr)
+		}
+		if resp.Error != nil {
+			return p, toPgwireError(resp.Error)
+		}
+		p.reserved = true
+		if err := ps.send(simpleQuery(setup), p.sid, gen, e.ident, e.info.Database); err != nil {
+			return p, pgwire.Errorf(codeConnectionFailure, "pooler connection lost: %v", err)
+		}
+		if err := p.drain(ctx); err != nil {
+			return p, err
+		}
+	}
+	for _, req := range reqs {
+		if err := ps.send(perShard(req), p.sid, gen, e.ident, e.info.Database); err != nil {
+			return p, pgwire.Errorf(codeConnectionFailure, "pooler connection lost: %v", err)
+		}
+	}
+	return p, nil
+}
+
 // runScatter opens one pooler stream per shard, sends reqs on each and
 // merges the responses into w.
 func (e *Executor) runScatter(ctx context.Context, shards []int32, m *plan.Merge, reqs []*pgshardv1.ExecuteRequest, out scatterOutput, w pgwire.ResultWriter, rewriting string) error {
@@ -239,65 +296,50 @@ func (e *Executor) runScatter(ctx context.Context, shards []int32, m *plan.Merge
 	// the previous scatter's late Release.
 	e.scatterSeq++
 	seq := strconv.FormatUint(e.scatterSeq, 10)
-	parts := make([]*participant, 0, len(shards))
+	// Every participant needs the same session state, so it is composed
+	// once rather than per shard.
+	settings := e.sessionSettings()
+	if path := e.searchPath(); path != nil {
+		// Pin the path the planner actually resolved relations under,
+		// whatever the replayed sequence composed to.
+		settings = append(settings, searchPathSQL(path))
+	}
+	setup := strings.Join(settings, "; ")
+
+	parts := make([]*participant, len(shards))
 	defer func() {
 		for _, p := range parts {
-			p.finish(e.r)
+			if p != nil {
+				p.finish(e.r)
+			}
 		}
 	}()
-	for _, id := range shards {
-		sh := Shard{Set: e.userSet(), ID: id}
-		if e.r.blocking(sh) {
-			if ok, err := e.r.awaitConsistent(ctx, sh, false, e.r.cfg.Buffering.Window); err != nil {
-				return err
-			} else if !ok {
-				return pgwire.Errorf(codeConnectionFailure, "shard %s/%d has no serving primary", sh.Set, sh.ID)
-			}
-		}
-		client, err := e.r.cfg.Poolers.Client(sh)
+	// Setting a participant up costs a Reserve round trip and a session
+	// state statement that has to be drained before the next one starts.
+	// Serially that is one round trip per shard before any shard has begun
+	// executing, so fan-out setup grew with the shard count instead of
+	// staying the cost of the slowest shard.
+	errs := make([]error, len(shards))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, scatterSetupConcurrency)
+	for i, id := range shards {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			// parts[i] is written before any step that can fail, so the
+			// deferred cleanup finishes a participant whose setup broke
+			// half way.
+			parts[i], errs[i] = e.startParticipant(ctx, Shard{Set: e.userSet(), ID: id}, seq, setup, reqs)
+		}()
+	}
+	wg.Wait()
+	// Reported in shard order: which of several failing shards a scatter
+	// blames should not depend on which goroutine lost the race.
+	for _, err := range errs {
 		if err != nil {
 			return err
-		}
-		ps, err := openStream(e.ctx, client)
-		if err != nil {
-			return pgwire.Errorf(codeConnectionFailure, "pooler of shard %s/%d refused the connection: %v", sh.Set, sh.ID, err)
-		}
-		p := &participant{shard: sh, sid: e.sid + "-x" + seq + "-" + strconv.FormatInt(int64(id), 10), client: client, ps: ps,
-			header: make(chan struct{}), rows: make(chan [][]byte, 64), done: make(chan struct{}), stop: make(chan struct{})}
-		parts = append(parts, p)
-		gen := e.r.cfg.Poolers.Generation(sh)
-		// A fresh scatter backend starts on the server defaults, so it gets
-		// the same session state a routed backend is replayed: not just the
-		// search_path the planner resolved relations under, but every SET
-		// the session has run. SET ROLE in particular decides which grants
-		// and row-level security policies apply, and a participant that
-		// missed it would evaluate the query as the login role.
-		settings := e.sessionSettings()
-		if path := e.searchPath(); path != nil {
-			// Pin the path the planner actually resolved relations under,
-			// whatever the replayed sequence composed to.
-			settings = append(settings, searchPathSQL(path))
-		}
-		if len(settings) > 0 {
-			resp, rerr := client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: p.sid, Generation: gen})
-			if rerr != nil {
-				return pgwire.Errorf(codeConnectionFailure, "pooler of shard %s/%d refused the connection: %v", sh.Set, sh.ID, rerr)
-			}
-			if resp.Error != nil {
-				return toPgwireError(resp.Error)
-			}
-			p.reserved = true
-			if err := ps.send(simpleQuery(strings.Join(settings, "; ")), p.sid, gen, e.ident, e.info.Database); err != nil {
-				return pgwire.Errorf(codeConnectionFailure, "pooler connection lost: %v", err)
-			}
-			if err := p.drain(ctx); err != nil {
-				return err
-			}
-		}
-		for _, req := range reqs {
-			if err := ps.send(perShard(req), p.sid, gen, e.ident, e.info.Database); err != nil {
-				return pgwire.Errorf(codeConnectionFailure, "pooler connection lost: %v", err)
-			}
 		}
 	}
 	// Any failure or client cancel interrupts every participant once.
@@ -351,8 +393,11 @@ func (e *Executor) runScatter(ctx context.Context, shards []int32, m *plan.Merge
 // scatter proportional to shards times protocol operations, for fields that
 // are identical on every shard.
 //
-// Safe because the sends are sequential: one participant at a time, and
-// gRPC marshals within Send. Nothing mutates the shared payload.
+// Safe under the concurrent setup because the payload is only ever read:
+// gRPC marshals it inside Send, and nothing on this path writes to it. The
+// 32-shard fan-out test drives that sharing under the race detector, on
+// the extended protocol, so the parameters and format vectors of one Bind
+// really are marshalled by every participant at once.
 func perShard(req *pgshardv1.ExecuteRequest) *pgshardv1.ExecuteRequest {
 	return &pgshardv1.ExecuteRequest{Message: req.GetMessage()}
 }
