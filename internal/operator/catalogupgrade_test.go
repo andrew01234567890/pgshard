@@ -130,3 +130,32 @@ func TestProvisionBudgetOnlyDuringUpgrades(t *testing.T) {
 		t.Fatalf("upgrade run: budget %d", got)
 	}
 }
+
+// TestRollbackCommitted: the rollback is the request until the replay has
+// run and status names the old catalog; after that it is the cluster's
+// state, and withdrawing the request must not turn it back.
+func TestRollbackCommitted(t *testing.T) {
+	cluster := func(gen int64, up *pgshardv1alpha1.ClusterCatalogUpgradeStatus) *pgshardv1alpha1.PgShardCluster {
+		c := &pgshardv1alpha1.PgShardCluster{}
+		c.Status.CatalogGeneration = gen
+		c.Status.CatalogUpgrade = up
+		return c
+	}
+	started := func() *pgshardv1alpha1.ClusterCatalogUpgradeStatus {
+		return &pgshardv1alpha1.ClusterCatalogUpgradeStatus{Generation: 2, RetiredGeneration: 1, RetiredMajor: 18, RollbackStarted: true}
+	}
+	for name, tc := range map[string]struct {
+		c    *pgshardv1alpha1.PgShardCluster
+		want bool
+	}{
+		"no upgrade":                      {cluster(1, nil), false},
+		"upgrade, no rollback":            {cluster(2, &pgshardv1alpha1.ClusterCatalogUpgradeStatus{Generation: 2, RetiredGeneration: 1}), false},
+		"rollback started, not replayed":  {cluster(2, started()), false},
+		"rollback replayed":               {cluster(1, started()), true},
+		"no retired generation to return": {cluster(0, &pgshardv1alpha1.ClusterCatalogUpgradeStatus{Generation: 2, RollbackStarted: true}), false},
+	} {
+		if got := rollbackCommitted(tc.c); got != tc.want {
+			t.Errorf("%s: rollbackCommitted = %v, want %v", name, got, tc.want)
+		}
+	}
+}

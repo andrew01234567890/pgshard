@@ -85,6 +85,9 @@ type fakeProber struct {
 	placements []PlacementWorkflowInfo
 	// journal records fence writes and promotions in order.
 	journal *[]string
+	// onRelease runs inside ReleaseCatalog, so a test can see what the
+	// cluster looked like at that point of the rollback.
+	onRelease func()
 	// settings is the pg_settings view of every member; contexts default to
 	// "sighup" for names not listed.
 	settings map[string]SettingState
@@ -216,8 +219,12 @@ func (f *fakeProber) DisableCatalogRollback(_ context.Context, dsn string) error
 
 func (f *fakeProber) ReleaseCatalog(_ context.Context, dsn string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	onRelease := f.onRelease
 	f.catalogReleases = append(f.catalogReleases, hostOf(dsn))
+	f.mu.Unlock()
+	if onRelease != nil {
+		onRelease()
+	}
 	return nil
 }
 

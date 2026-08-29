@@ -462,3 +462,52 @@ func (w countingStatusWriter) Patch(ctx context.Context, obj client.Object, patc
 	}
 	return w.SubResourceWriter.Patch(ctx, obj, patch, opts...)
 }
+
+// TestCatalogRollbackRecordsTheRestoredCatalogBeforeItMovesAnything: the
+// rollback repoints the stable Service and deletes the new catalog group. If
+// status still named that group when the operator died, the next pass sent
+// schema reconciliation at a fenced catalog and, once the delete had run,
+// rebuilt an empty group of that generation and pointed the Service at it.
+// So the restored generation has to be durable before anything moves.
+func TestCatalogRollbackRecordsTheRestoredCatalogBeforeItMovesAnything(t *testing.T) {
+	r, fp, c := setup(t, "cb")
+	cur := startCatalogUpgrade(t, r, fp, c)
+	base := cur.DeepCopy()
+	cur.Spec.Resharding.RetireOldGroupsAfter = &metav1.Duration{Duration: time.Hour}
+	if err := k8sClient.Patch(context.Background(), cur, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4 && catalogStage(t, c.Name) != CatalogUpgradeRetiring; i++ {
+		reconcile(t, r, c)
+	}
+
+	// ReleaseCatalog runs after the endpoint has moved and before the new
+	// group is deleted: what the API server holds at that moment is what an
+	// operator that died there would leave behind.
+	var atRelease *pgshardv1alpha1.PgShardCluster
+	fp.mu.Lock()
+	fp.onRelease = func() { atRelease = getCluster(t, c.Name) }
+	fp.mu.Unlock()
+
+	cur = getCluster(t, c.Name)
+	base = cur.DeepCopy()
+	if cur.Annotations == nil {
+		cur.Annotations = map[string]string{}
+	}
+	cur.Annotations[pgshardv1alpha1.AnnotationCatalogUpgrade] = pgshardv1alpha1.UpgradeActionRollback
+	if err := k8sClient.Patch(context.Background(), cur, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, r, c)
+
+	if atRelease == nil {
+		t.Fatal("the rollback never reached the release, so this proves nothing")
+	}
+	if atRelease.Status.CatalogGeneration != 1 || atRelease.Status.CatalogPGMajor != 18 {
+		t.Errorf("status named generation %d (major %d) while the rollback was moving the endpoint; want the restored generation 1 (major 18)",
+			atRelease.Status.CatalogGeneration, atRelease.Status.CatalogPGMajor)
+	}
+	if up := atRelease.Status.CatalogUpgrade; up == nil || !up.RollbackStarted {
+		t.Errorf("the rollback must be recorded as started before it moves anything: %+v", atRelease.Status.CatalogUpgrade)
+	}
+}

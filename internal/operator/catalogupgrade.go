@@ -193,7 +193,14 @@ func (r *ClusterReconciler) reconcileCatalogUpgrade(ctx context.Context, c *pgsh
 		}
 		log.Info("catalog upgrade switched", "generation", up.Generation, "major", up.ToMajor)
 	case CatalogUpgradeRetiring:
-		if up.RollbackRequested {
+		// Once the replay has run and status names the old catalog again,
+		// the rollback is past the point where it can be called off: the
+		// old group is the one holding the writes and the one the Service
+		// is being moved to. Withdrawing the request then would release
+		// both catalogs and, at retirement, delete the group that is
+		// serving. So the request is what starts a rollback, not what keeps
+		// it going.
+		if up.RollbackRequested || rollbackCommitted(c) {
 			// Replay first: the endpoint must not move back to the old
 			// group until everything the new catalog accepted since the
 			// cutover has been applied to it.
@@ -202,14 +209,38 @@ func (r *ClusterReconciler) reconcileCatalogUpgrade(ctx context.Context, c *pgsh
 			// endpoint moves below.
 			oldDSN := DSN(CatalogGenerationServiceRW(c.Name, up.RetiredGeneration), c.Namespace, password)
 			newDSN := r.catalogTargetDSN(c, catalogGroupAt(c, up.Generation, up.ToMajor), password)
-			up.RollbackStarted = true
+			// Record the intent before acting on it: a pass that dies part
+			// way through has to be recognisable as a rollback in progress,
+			// and the whole sequence below is idempotent when it is.
+			if !up.RollbackStarted {
+				up.RollbackStarted = true
+				if err := patch(); err != nil {
+					return obs, err
+				}
+				// A patch replaces the object with the server's answer, so
+				// up now points at a detached copy; take it again or every
+				// later write to it is lost.
+				up = c.Status.CatalogUpgrade
+			}
 			if err := r.Prober.RollbackCatalog(ctx, oldDSN, newDSN); err != nil {
 				up.Message = "catalog rollback: " + err.Error()
 				break
 			}
-			log.Info("catalog upgrade rollback: repointing the catalog endpoint at the old group")
+			// The replay left the old catalog serving and the new one
+			// fenced, so status names the old one before anything moves or
+			// is deleted. Patched here rather than at the end of the pass:
+			// status that still named the new group after the endpoint had
+			// moved sent schema reconciliation at a fenced catalog, and
+			// once the delete below had run it made the operator rebuild an
+			// empty group of that generation and point the stable Service
+			// at it.
 			c.Status.CatalogGeneration = up.RetiredGeneration
 			c.Status.CatalogPGMajor = up.RetiredMajor
+			if err := patch(); err != nil {
+				return obs, err
+			}
+			up = c.Status.CatalogUpgrade
+			log.Info("catalog upgrade rollback: repointing the catalog endpoint at the old group")
 			if err := r.ensureCatalogEndpoint(ctx, c); err != nil {
 				return obs, err
 			}
@@ -267,6 +298,18 @@ func (r *ClusterReconciler) reconcileCatalogUpgrade(ctx context.Context, c *pgsh
 
 // catalogTargetDSN is the DSN of one catalog group's own -rw Service (not
 // the stable endpoint, which follows the flip).
+// rollbackCommitted reports a catalog rollback that has passed the point
+// where it can be called off: the replay has run and status names the old
+// catalog, so that group holds the writes and the stable Service is on its
+// way to it. Withdrawing the request after that would take the abandoned
+// path, which releases both catalogs and, at retirement, deletes the group
+// that is serving.
+func rollbackCommitted(c *pgshardv1alpha1.PgShardCluster) bool {
+	up := c.Status.CatalogUpgrade
+	return up != nil && up.RollbackStarted && up.RetiredGeneration != 0 &&
+		c.Status.CatalogGeneration == up.RetiredGeneration
+}
+
 func (r *ClusterReconciler) catalogTargetDSN(c *pgshardv1alpha1.PgShardCluster, g Group, password string) string {
 	return DSN(g.ServiceRW(), c.Namespace, password)
 }
