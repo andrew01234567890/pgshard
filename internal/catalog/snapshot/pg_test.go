@@ -241,3 +241,70 @@ func TestSnapshotWithPostgres(t *testing.T) {
 		})
 	}
 }
+
+// TestWatcherKeepsOneReloadConnection: a reload used to dial the catalog
+// every time, so a router paid a TCP handshake, a TLS handshake and SCRAM
+// before every snapshot -- on the periodic reload and again on every
+// notification. It also has to survive that connection dying, since the
+// catalog it points at can restart under it.
+func TestWatcherKeepsOneReloadConnection(t *testing.T) {
+	dsn := startPostgres(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	if err := catalog.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+
+	w := NewWatcher(dsn, Options{ReloadInterval: 200 * time.Millisecond, DisableListen: true, Logf: t.Logf})
+	done := make(chan error, 1)
+	go func() { done <- w.Run(ctx) }()
+	waitUntil(t, 10*time.Second, "the first snapshot", func() bool { return w.Current() != nil })
+
+	backends := func() int {
+		var n int
+		if err := conn.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database() AND pid <> pg_backend_pid() AND application_name <> 'psql'`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	// Several reload periods: a watcher that dials per reload would leave
+	// a trail of them, and one that keeps a connection stays at one.
+	time.Sleep(time.Second)
+	if n := backends(); n != 1 {
+		t.Errorf("catalog has %d backends for the watcher, want the one it keeps", n)
+	}
+
+	// The catalog restarting under the connection must not strand it.
+	first := w.Current().LoadedAt
+	if _, err := conn.Exec(ctx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+		WHERE datname = current_database() AND pid <> pg_backend_pid() AND application_name <> 'psql'`); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 15*time.Second, "a snapshot after the connection was killed", func() bool {
+		s := w.Current()
+		return s != nil && s.LoadedAt.After(first)
+	})
+	if n := backends(); n != 1 {
+		t.Errorf("after recovering the watcher holds %d backends, want one", n)
+	}
+	cancel()
+	<-done
+}
+
+func waitUntil(t *testing.T, timeout time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out after %s waiting for %s", timeout, what)
+}

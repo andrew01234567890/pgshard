@@ -20,6 +20,13 @@ type Watcher struct {
 	listen         bool
 	debounce       time.Duration
 
+	// conn is the connection reloads run on, kept between them. Every
+	// reload used to dial the catalog, so a router paid a TCP handshake,
+	// a TLS handshake and SCRAM before it could read a snapshot -- on the
+	// periodic reload and again on every notification. Only Run's
+	// goroutine touches it.
+	conn *pgx.Conn
+
 	current atomic.Pointer[Snapshot]
 	mu      sync.Mutex
 	subs    map[chan Change]struct{}
@@ -112,6 +119,7 @@ func (w *Watcher) Subscribe() (<-chan Change, func()) {
 // Run blocks until ctx is done. It returns after the first snapshot fails to
 // load so callers can fail fast at startup.
 func (w *Watcher) Run(ctx context.Context) error {
+	defer w.closeConn(ctx)
 	// The first reload used to be fatal. A router or pooler that started
 	// before the catalog accepted connections lost its watcher there and then
 	// served for the rest of its life with no snapshot, stamping every request
@@ -169,12 +177,16 @@ func (w *Watcher) requestReload() {
 }
 
 func (w *Watcher) reload(ctx context.Context) error {
-	conn, err := pgx.Connect(ctx, w.dsn)
-	if err != nil {
-		return err
+	reused := w.conn != nil
+	s, err := w.loadOnce(ctx)
+	if err != nil && reused && ctx.Err() == nil {
+		// The kept connection is the likeliest reason -- the catalog may
+		// have restarted under it -- and the failure already dropped it,
+		// so this attempt dials. Worth one immediate retry rather than
+		// waiting for the next tick: a snapshot that waits can age past
+		// the bound the router refuses to plan against.
+		s, err = w.loadOnce(ctx)
 	}
-	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
-	s, err := Load(ctx, conn)
 	if err != nil {
 		return err
 	}
@@ -183,6 +195,32 @@ func (w *Watcher) reload(ctx context.Context) error {
 		w.publish(Change{s.ShardMapGeneration, s.DesiredGeneration})
 	}
 	return nil
+}
+
+// loadOnce reads a snapshot on the kept connection, dialling one first if
+// there is none. Any failure drops the connection: it may be the reason,
+// and a wedged one must not be kept forever.
+func (w *Watcher) loadOnce(ctx context.Context) (*Snapshot, error) {
+	if w.conn == nil {
+		conn, err := pgx.Connect(ctx, w.dsn)
+		if err != nil {
+			return nil, err
+		}
+		w.conn = conn
+	}
+	s, err := Load(ctx, w.conn)
+	if err != nil {
+		w.closeConn(ctx)
+		return nil, err
+	}
+	return s, nil
+}
+
+func (w *Watcher) closeConn(ctx context.Context) {
+	if w.conn != nil {
+		_ = w.conn.Close(context.WithoutCancel(ctx))
+		w.conn = nil
+	}
 }
 
 func (w *Watcher) publish(c Change) {
