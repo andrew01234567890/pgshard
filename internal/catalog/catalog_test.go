@@ -1392,6 +1392,33 @@ func runSuite(t *testing.T, img pgImage) {
 		expectPgError(t, err, "P0002", "does not exist")
 	})
 
+	// The in-doubt readers must not scan the heap. xact_decisions is a
+	// queue -- written on prepare, deleted on completion -- so at rest it
+	// holds almost nothing while its heap tracks bloat, and a burst of
+	// in-doubt transactions degrades the metrics poller, the resolver and
+	// the barrier drain check at the same moment.
+	t.Run("in_doubt_decisions_are_indexed", func(t *testing.T) {
+		mustExec(t, conn, `INSERT INTO pgshard.xact_decisions (gid, state, participants)
+			SELECT 'g-' || i, CASE WHEN i % 50 = 0 THEN 'preparing' ELSE 'commit' END, ARRAY[0]
+			FROM generate_series(1, 2000) AS i`)
+		mustExec(t, conn, `ANALYZE pgshard.xact_decisions`)
+		defer mustExec(t, conn, `DELETE FROM pgshard.xact_decisions`)
+
+		rows, err := conn.Query(ctx, `EXPLAIN SELECT count(*), min(created_at)
+			FROM pgshard.xact_decisions WHERE state = 'preparing'`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan := strings.Join(lines, "\n")
+		if !strings.Contains(plan, "xact_decisions_preparing_idx") {
+			t.Errorf("the in-doubt count scans instead of using the partial index:\n%s", plan)
+		}
+	})
+
 	t.Run("stream_status_slot_health", func(t *testing.T) {
 		if err := CreateStream(ctx, conn, Stream{Name: "health", Database: "app"}); err != nil {
 			t.Fatal(err)
