@@ -72,6 +72,9 @@ func (p *Planner) plan(ctx context.Context, sess Session, sql string, masked boo
 	if err := classify(raw.GetStmt(), &pl.Class); err != nil {
 		return refusalErr(err)
 	}
+	if rw := readWriteRewrite(raw.GetStmt()); rw != "" {
+		pl.Rewritten = rw
+	}
 	scan := scanStatement(raw.GetStmt())
 	if scan.setConfigErr != nil {
 		return refusalErr(scan.setConfigErr)
@@ -384,6 +387,119 @@ func refuseProtectedGUC(name string) error {
 		return err
 	}
 	return nil
+}
+
+// refuseReadWriteOverride refuses the transaction-level spelling of what
+// protectedDurabilityGUCs already refuses as a setting: BEGIN READ WRITE,
+// START TRANSACTION READ WRITE and SET SESSION CHARACTERISTICS AS
+// TRANSACTION READ WRITE all turn transaction_read_only off, which is how
+// the barrier pauses writes for a certified restore point. A client may
+// still make itself more restrictive -- READ ONLY is untouched -- and a
+// plain BEGIN gives a writable transaction whenever the cluster is not
+// pausing.
+// readWriteRewrite neutralises a transaction that declares itself READ
+// WRITE. The barrier pauses writes with default_transaction_read_only, which
+// catches what the planner does not class as a write -- a volatile function,
+// a set_config -- and the setting form of the override is already refused;
+// BEGIN READ WRITE, START TRANSACTION READ WRITE, SET TRANSACTION READ WRITE
+// and SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE turn the same
+// GUC off through the grammar.
+//
+// Refusing them would break ordinary clients: pgjdbc sends SET SESSION
+// CHARACTERISTICS AS TRANSACTION READ WRITE whenever an application calls
+// setReadOnly(false), which a pool does on every connection it hands back.
+// So the mode is dropped instead and the cluster's own default put back:
+// with no pause running the session is read-write exactly as it asked, and
+// during one it stays paused. READ ONLY is left alone -- a session may make
+// itself more restrictive, never less.
+//
+// The rewritten text is planned again, so a form this builds wrongly fails
+// as a parse error here rather than reaching a shard.
+func readWriteRewrite(node *pgquerypb.Node) string {
+	switch {
+	case node.GetTransactionStmt() != nil:
+		t := node.GetTransactionStmt()
+		kind := t.GetKind()
+		if kind != pgquerypb.TransactionStmtKind_TRANS_STMT_BEGIN && kind != pgquerypb.TransactionStmtKind_TRANS_STMT_START {
+			return ""
+		}
+		modes, dropped := transactionModes(t.GetOptions())
+		if !dropped {
+			return ""
+		}
+		head := "BEGIN"
+		if kind == pgquerypb.TransactionStmtKind_TRANS_STMT_START {
+			head = "START TRANSACTION"
+		}
+		return strings.TrimSpace(head + " " + strings.Join(modes, " "))
+	case node.GetVariableSetStmt() != nil:
+		s := node.GetVariableSetStmt()
+		if s.GetKind() != pgquerypb.VariableSetKind_VAR_SET_MULTI {
+			return ""
+		}
+		session := strings.EqualFold(s.GetName(), "SESSION CHARACTERISTICS")
+		if !session && !strings.EqualFold(s.GetName(), "TRANSACTION") {
+			return ""
+		}
+		modes, dropped := transactionModes(s.GetArgs())
+		if !dropped {
+			return ""
+		}
+		local := ""
+		if s.GetIsLocal() {
+			local = "LOCAL "
+		}
+		if len(modes) == 0 {
+			// Nothing left to say: put the cluster's own value back, which
+			// is off while nothing is pausing and on while something is.
+			guc := "transaction_read_only"
+			if session {
+				guc = "default_transaction_read_only"
+			}
+			return "SET " + local + guc + " = DEFAULT"
+		}
+		head := "SET " + local + "TRANSACTION "
+		if session {
+			head = "SET " + local + "SESSION CHARACTERISTICS AS TRANSACTION "
+		}
+		return head + strings.Join(modes, " ")
+	}
+	return ""
+}
+
+// transactionModes renders the transaction modes of a BEGIN or SET
+// TRANSACTION, dropping a READ WRITE and reporting that it did. The
+// grammar carries READ WRITE as the integer 0 and READ ONLY as 1, and an
+// argument that is neither counts as READ WRITE: a mode that could turn the
+// pause off must not survive because it was spelled oddly.
+func transactionModes(options []*pgquerypb.Node) (modes []string, dropped bool) {
+	for _, o := range options {
+		d := o.GetDefElem()
+		if d == nil {
+			continue
+		}
+		switch strings.ToLower(d.GetDefname()) {
+		case "transaction_read_only":
+			if v := d.GetArg().GetAConst(); v != nil && v.GetIval().GetIval() == 1 {
+				modes = append(modes, "READ ONLY")
+				continue
+			}
+			dropped = true
+		case "transaction_deferrable":
+			if v := d.GetArg().GetAConst(); v != nil && v.GetIval().GetIval() == 1 {
+				modes = append(modes, "DEFERRABLE")
+				continue
+			}
+			modes = append(modes, "NOT DEFERRABLE")
+		case "transaction_isolation":
+			level := d.GetArg().GetAConst().GetSval().GetSval()
+			if level == "" {
+				continue
+			}
+			modes = append(modes, "ISOLATION LEVEL "+strings.ToUpper(level))
+		}
+	}
+	return modes, dropped
 }
 
 // searchPathArgs turns the arguments of SET search_path into a schema

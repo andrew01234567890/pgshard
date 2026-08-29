@@ -288,6 +288,23 @@ one bound cluster after another) runs `controller.Barrier`:
 `Controller.ListBarriers` (`certified_only`) lists them newest first; the
 restore point name every group shares is `pgshard-<name>`.
 
+**What a certified barrier covers, and what it does not.** The pause is
+`default_transaction_read_only` on every primary. The router refuses the
+statements that would turn it off for a session -- `SET` of
+`default_transaction_read_only` or `transaction_read_only`, and `set_config`
+of either -- and neutralises the transaction-mode spellings of the same
+thing, `BEGIN READ WRITE` and its relatives, by dropping the mode (see
+[router.md](router.md#write-fence)). `READ ONLY` in any form still works, and
+a plain `BEGIN` is writable whenever no pause is running.
+
+That covers everything reaching a shard through pgshard. It does not cover a
+connection made straight to a member's PostgreSQL: `pg_hba` admits only the
+superuser there (see [operator.md](operator.md#member-pods)), and a superuser
+can turn the pause off for itself. A superuser writing on a member during a
+barrier is outside the certification contract -- step 5 above is what keeps
+such a write from being certified rather than silently included: the barrier
+fails instead.
+
 ### Barrier restore
 
 `PgShardRestore.spec.target.barrier: <name>` (with `backupId` naming a backup
