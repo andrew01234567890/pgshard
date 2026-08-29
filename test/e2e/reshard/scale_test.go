@@ -248,9 +248,18 @@ func assertOnlyTheRouterAdmitsTheAppRole(ctx context.Context, t *testing.T, c *e
 	// routed writes are the workload's, which starts straight after this
 	// and is checked row by row -- a sentinel written here would have to be
 	// kept out of that count for no gain.
-	if out, err := routerSQL(ctx, c, "SELECT 1"); err != nil || out != "1" {
-		t.Errorf("%s through the router: %q %v", ledgerRole, out, err)
-	}
+	//
+	// Waited for rather than sampled: nothing before this point requires
+	// the router to be accepting connections, so a single attempt reports
+	// a refused connection as a broken rule.
+	var last string
+	var lastErr error
+	waitForWhy(ctx, t, c, "the app role reaching the router", 3*time.Minute,
+		func() string { return fmt.Sprintf("\nlast attempt: %q %v", last, lastErr) },
+		func() bool {
+			last, lastErr = routerSQL(ctx, c, "SELECT 1")
+			return lastErr == nil && last == "1"
+		})
 	if out, err := shardSQL(ctx, c, "shard-0", "SELECT 1"); err != nil || out != "1" {
 		t.Errorf("superuser lost its path to a shard: %q %v", out, err)
 	}
