@@ -706,10 +706,15 @@ func (e *Executor) dropStream() {
 	e.tx = pgwire.TxIdle
 }
 
-// releaseAsync returns the pinned backend of the current shard without
-// waiting for the pooler; acquire on the same shard waits for it.
-// releaseOn releases the session on the pooler that holds it.
+// releaseOn releases the session on the pooler that holds the current
+// shard's backend, without waiting for it; acquire on the same shard waits
+// through awaitRelease.
 func (e *Executor) releaseOn(client pgshardv1.PoolerClient) {
+	e.releaseOnShard(client, e.shard)
+}
+
+// releaseOnShard is releaseOn for a shard the session is not sitting on.
+func (e *Executor) releaseOnShard(client pgshardv1.PoolerClient, sh Shard) {
 	if client == nil {
 		return
 	}
@@ -717,8 +722,8 @@ func (e *Executor) releaseOn(client pgshardv1.PoolerClient) {
 		e.releasing = map[Shard]chan struct{}{}
 	}
 	done := make(chan struct{})
-	prev := e.releasing[e.shard]
-	e.releasing[e.shard] = done
+	prev := e.releasing[sh]
+	e.releasing[sh] = done
 	go func() {
 		defer close(done)
 		if prev != nil {
@@ -731,13 +736,17 @@ func (e *Executor) releaseOn(client pgshardv1.PoolerClient) {
 // awaitRelease blocks until the async release of the current shard, if
 // any, has finished.
 func (e *Executor) awaitRelease(ctx context.Context) error {
-	done, ok := e.releasing[e.shard]
+	return e.awaitReleaseOf(ctx, e.shard)
+}
+
+func (e *Executor) awaitReleaseOf(ctx context.Context, sh Shard) error {
+	done, ok := e.releasing[sh]
 	if !ok {
 		return nil
 	}
 	select {
 	case <-done:
-		delete(e.releasing, e.shard)
+		delete(e.releasing, sh)
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
