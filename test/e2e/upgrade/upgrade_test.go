@@ -4,6 +4,7 @@ package upgrade
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -139,9 +140,24 @@ func TestUpgrade18To19UnderLoad(t *testing.T) {
 	}, func() bool {
 		return jsonpath(ctx, c, "pgshardcluster", clusterName, "{.status.catalogPGMajor}") == "19"
 	})
-	if got, err := psql(ctx, c, clusterName+"-catalog-rw", "postgres", "SELECT current_setting('server_version_num')::int / 10000"); err != nil || got != "19" {
-		t.Fatalf("stable catalog endpoint after the flip: %q %v", got, err)
-	}
+	// Waited for rather than sampled. The operator repoints the stable
+	// Service before it publishes catalogPGMajor, so the ordering is
+	// right, but a Service selector does not move traffic the instant it
+	// changes: the endpoints controller and kube-proxy have to catch up,
+	// and on a loaded runner that takes longer than the status write. A
+	// single attempt one second after the flip reads the old major and
+	// calls the upgrade broken.
+	var endpoint string
+	var endpointErr error
+	waitForWhy(ctx, t, c, "the stable catalog endpoint to serve 19", 5*time.Minute,
+		func() string {
+			return fmt.Sprintf("\nlast attempt: %q %v\nselector: %s", endpoint, endpointErr,
+				jsonpath(ctx, c, "service", clusterName+"-catalog-rw", `{.spec.selector.pgshard\.io/group}`))
+		},
+		func() bool {
+			endpoint, endpointErr = psql(ctx, c, clusterName+"-catalog-rw", "postgres", "SELECT current_setting('server_version_num')::int / 10000")
+			return endpointErr == nil && endpoint == "19"
+		})
 	if sel := jsonpath(ctx, c, "service", clusterName+"-catalog-rw", "{.spec.selector.pgshard\\.io/group}"); sel != "catalog-g2" {
 		t.Errorf("stable catalog Service selector: %q, want catalog-g2", sel)
 	}
