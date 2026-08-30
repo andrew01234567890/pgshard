@@ -310,3 +310,73 @@ func waitUntil(t *testing.T, timeout time.Duration, what string, cond func() boo
 	}
 	t.Fatalf("timed out after %s waiting for %s", timeout, what)
 }
+
+// TestLoadServingReadsOnlyWhatAPoolerEnforces: a pooler enforces the
+// shard-map generation and its own shard's epoch and migrating flag, and
+// reads nothing else out of a snapshot. There is one pooler per member, so
+// loading the whole catalog on every notification grows the catalog's read
+// load as pooler count times catalog size. What this pins is that the
+// cheap load still carries everything SnapshotSource reads -- and that the
+// rest is empty and marked Partial, so nobody mistakes it for a view they
+// can plan against.
+func TestLoadServingReadsOnlyWhatAPoolerEnforces(t *testing.T) {
+	dsn := startPostgres(t)
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if err := catalog.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, `INSERT INTO pgshard.databases (name, default_placement) VALUES ('app', 'sharded')`)
+	mustExec(t, conn, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES
+		('app', 'public', 'orders', 'sharded', 'customer_id')`)
+	mustExec(t, conn, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES ('default', 0, '[,0)'), ('default', 1, '[0,)')`)
+	mustExec(t, conn, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch, primary_endpoint) VALUES
+		('default', 0, 'g0', 'serving', 3, 'g0-0:5432'), ('default', 1, 'g1', 'migrating', 1, NULL)`)
+	mustExec(t, conn, `UPDATE pgshard.shard_map_generation SET generation = 5`)
+
+	full, err := Load(ctx, conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	part, err := LoadServing(ctx, conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Everything a pooler reads is the same in both.
+	if part.ShardMapGeneration != full.ShardMapGeneration {
+		t.Errorf("generation %d, want %d", part.ShardMapGeneration, full.ShardMapGeneration)
+	}
+	for key, want := range full.Serving {
+		got, ok := part.Serving[key]
+		if !ok {
+			t.Errorf("serving %v missing from the partial view", key)
+			continue
+		}
+		if got != want {
+			t.Errorf("serving %v = %+v, want %+v", key, got, want)
+		}
+	}
+	if len(part.Serving) != len(full.Serving) {
+		t.Errorf("partial view has %d serving rows, full has %d", len(part.Serving), len(full.Serving))
+	}
+	if part.LoadedAt.IsZero() || part.Stale(part.LoadedAt.Add(MaxAge+time.Second)) != true {
+		t.Error("a partial view must still age like any other")
+	}
+
+	// Everything it does not read was never loaded, and it says so.
+	if !part.IsPartial() {
+		t.Error("a view loaded by LoadServing must be marked Partial")
+	}
+	if len(part.Tables) != 0 || len(part.Databases) != 0 || len(part.ShardSets) != 0 || len(part.Sequences) != 0 {
+		t.Errorf("the cheap load read more than the serving rows: tables=%d databases=%d sets=%d sequences=%d",
+			len(part.Tables), len(part.Databases), len(part.ShardSets), len(part.Sequences))
+	}
+	if full.IsPartial() {
+		t.Error("a full view must not be marked Partial")
+	}
+}
