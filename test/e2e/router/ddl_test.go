@@ -407,10 +407,32 @@ func TestRouterDDLMigrations(t *testing.T) {
 	})
 
 	t.Run("roles_share_one_verifier", func(t *testing.T) {
-		for id := 0; id < 3; id++ {
-			if _, err := s.shardConn(t, id).Exec(ctx, "alter role "+appRole+" createrole"); err != nil {
-				t.Fatal(err)
+		// CREATEROLE is desired state in the catalog, not something applied
+		// to each shard behind pgshard's back: an out-of-band ALTER ROLE is
+		// drift the materializer repairs, which used to leave app without
+		// CREATEROLE by the time the drop ran -- and DROP ROLE needs
+		// CREATEROLE as well as admin on the role. A role also cannot grant
+		// itself the attribute through the router, which is why this is an
+		// operator's edit of pgshard.roles rather than an ALTER ROLE.
+		adm, err := pgx.Connect(ctx, s.catalogDSN)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := adm.Exec(ctx, "UPDATE pgshard.roles SET createrole = true WHERE rolname = $1", appRole); err != nil {
+			t.Fatal(err)
+		}
+		_ = adm.Close(ctx)
+		granted := false
+		for deadline := time.Now().Add(30 * time.Second); !granted && time.Now().Before(deadline); {
+			var yes bool
+			if err := s.shardConn(t, 0).QueryRow(ctx, `SELECT rolcreaterole FROM pg_roles WHERE rolname = $1`, appRole).Scan(&yes); err == nil && yes {
+				granted = true
+				break
 			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		if !granted {
+			t.Fatal("app never got CREATEROLE from the catalog")
 		}
 		if _, err := conn.Exec(ctx, "create role analyst login password 'an-secret'"); err != nil {
 			t.Fatal(err)
