@@ -82,6 +82,11 @@ type fakeProber struct {
 	streaming map[string]bool
 	syncNames map[string]string
 	setCalls  []string
+	// fenced is the catalog write fence the operator reads; paused records
+	// the DSNs it made refuse writes, and pausedDSN those already paused.
+	fenced    bool
+	paused    []string
+	pausedDSN map[string]bool
 	migrated  int
 	// standbys is keyed by pod IP; missing IPs are unreachable.
 	standbys map[string]StandbyState
@@ -491,7 +496,7 @@ func (f *fakeProber) Probe(_ context.Context, dsn string) (PrimaryState, error) 
 	if f.err != nil {
 		return PrimaryState{}, f.err
 	}
-	st := PrimaryState{Streaming: map[string]bool{}, SyncStandbyNames: f.syncNames[dsn]}
+	st := PrimaryState{Streaming: map[string]bool{}, SyncStandbyNames: f.syncNames[dsn], WritesPaused: f.pausedDSN[dsn]}
 	for k, v := range f.streaming {
 		st.Streaming[k] = v
 	}
@@ -507,6 +512,23 @@ func (f *fakeProber) SetSyncStandbyNames(_ context.Context, dsn, value string) e
 	f.syncNames[dsn] = value
 	f.setCalls = append(f.setCalls, value)
 	return nil
+}
+
+func (f *fakeProber) PauseWrites(_ context.Context, dsn string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.pausedDSN == nil {
+		f.pausedDSN = map[string]bool{}
+	}
+	f.pausedDSN[dsn] = true
+	f.paused = append(f.paused, dsn)
+	return nil
+}
+
+func (f *fakeProber) WriteFenced(context.Context, string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.fenced, nil
 }
 
 func (f *fakeProber) MigrateCatalog(context.Context, string) error {
