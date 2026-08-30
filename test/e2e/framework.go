@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -73,16 +74,16 @@ func (c *Cluster) Kubectl(ctx context.Context, stdin []byte, args ...string) (st
 	return stdout.String(), nil
 }
 
-// PortForward runs kubectl port-forward to a Service on an ephemeral local
-// port and returns the base URL once the port is accepting connections. The
-// forwarder stops when ctx is cancelled or the returned function is called.
+// PortForward runs kubectl port-forward to a Service and returns the base URL
+// once the port is accepting connections. The forwarder stops when ctx is
+// cancelled or the returned function is called.
+//
+// kubectl chooses the local port and says which one it took. Choosing it
+// here would mean binding a listener, closing it, and asking kubectl to bind
+// the same number a moment later -- and between those two the suites running
+// in parallel, or anything else on the machine, can take it. The failure that
+// produces says nothing about the code under test.
 func (c *Cluster) PortForward(ctx context.Context, namespace, service string, port int) (string, func(), error) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return "", nil, err
-	}
-	local := ln.Addr().(*net.TCPAddr).Port
-	_ = ln.Close()
 	full := []string{}
 	if c.Kubeconfig != "" {
 		full = append(full, "--kubeconfig", c.Kubeconfig)
@@ -90,11 +91,13 @@ func (c *Cluster) PortForward(ctx context.Context, namespace, service string, po
 	if c.Context != "" {
 		full = append(full, "--context", c.Context)
 	}
-	full = append(full, "-n", namespace, "port-forward", "--address", "127.0.0.1", "svc/"+service, fmt.Sprintf("%d:%d", local, port))
+	full = append(full, "-n", namespace, "port-forward", "--address", "127.0.0.1", "svc/"+service, fmt.Sprintf(":%d", port))
 	ctx, cancel := context.WithCancel(ctx)
 	cmd := exec.CommandContext(ctx, "kubectl", full...)
 	var stderr bytes.Buffer
+	var stdout lockedBuffer
 	cmd.Stderr = &stderr
+	cmd.Stdout = &stdout
 	if err := cmd.Start(); err != nil {
 		cancel()
 		return "", nil, err
@@ -103,20 +106,61 @@ func (c *Cluster) PortForward(ctx context.Context, namespace, service string, po
 		cancel()
 		_ = cmd.Wait()
 	}
-	addr := fmt.Sprintf("127.0.0.1:%d", local)
 	deadline := time.Now().Add(30 * time.Second)
+	var addr string
 	for {
-		conn, err := net.DialTimeout("tcp", addr, time.Second)
-		if err == nil {
-			_ = conn.Close()
-			return "http://" + addr, stop, nil
+		if addr == "" {
+			addr = forwardedAddr(stdout.String())
+		}
+		if addr != "" {
+			conn, err := net.DialTimeout("tcp", addr, time.Second)
+			if err == nil {
+				_ = conn.Close()
+				return "http://" + addr, stop, nil
+			}
 		}
 		if time.Now().After(deadline) || ctx.Err() != nil {
 			stop()
-			return "", nil, fmt.Errorf("port-forward %s/%s: %w: %s", namespace, service, err, strings.TrimSpace(stderr.String()))
+			return "", nil, fmt.Errorf("port-forward %s/%s: no local address after %s: %s%s",
+				namespace, service, time.Since(deadline.Add(-30*time.Second)).Round(time.Second),
+				strings.TrimSpace(stdout.String()), strings.TrimSpace(stderr.String()))
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+}
+
+// forwardedAddr reads the local address out of kubectl's "Forwarding from
+// 127.0.0.1:39217 -> 8081", which is how it reports the port it chose.
+func forwardedAddr(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		_, rest, ok := strings.Cut(line, "Forwarding from ")
+		if !ok {
+			continue
+		}
+		addr, _, _ := strings.Cut(rest, " ->")
+		if addr = strings.TrimSpace(addr); strings.HasPrefix(addr, "127.0.0.1:") {
+			return addr
+		}
+	}
+	return ""
+}
+
+// lockedBuffer is written by the kubectl goroutine and read by the wait loop.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // Apply applies a manifest from memory.
