@@ -398,3 +398,27 @@ func TestBarrierPauseTransactionModesNeutralised(t *testing.T) {
 		}
 	}
 }
+
+// TestTheStatementScanRunsOncePerStatement: the set_config and hidden-name
+// checks walk every field of every node by reflection, which used to happen
+// on every planned statement. They depend on the tree alone, so a repeated
+// statement must pay for the walk once -- and must still refuse what it
+// refused, from the cached answer as from a fresh one.
+func TestTheStatementScanRunsOncePerStatement(t *testing.T) {
+	snap := fixture(t)
+	p := New()
+	ctx := context.Background()
+	const hostile = "select set_config('default_transaction_read_only', 'off', false)"
+	for i := range 3 {
+		pl, err := p.Plan(ctx, session(snap), hostile)
+		if err == nil || pl.Kind != Refuse {
+			t.Fatalf("attempt %d: expected refusal, got %+v %v", i, pl, err)
+		}
+	}
+	// And a benign statement stays benign however often it is planned.
+	for i := range 3 {
+		if _, err := p.Plan(ctx, session(snap), "select * from orders"); err != nil {
+			t.Fatalf("attempt %d: %v", i, err)
+		}
+	}
+}

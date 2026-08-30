@@ -75,7 +75,10 @@ func (p *Planner) plan(ctx context.Context, sess Session, sql string, masked boo
 	if rw := readWriteRewrite(raw.GetStmt()); rw != "" {
 		pl.Rewritten = rw
 	}
-	scan := scanStatement(raw.GetStmt())
+	// Once per distinct statement, not once per execution: the scan walks
+	// every field of every node by reflection and depends on the tree
+	// alone, so the parse cache's result is where the answer belongs.
+	scan := res.Memo(func() any { return scanStatement(raw.GetStmt()) }).(preScan)
 	if scan.setConfigErr != nil {
 		return refusalErr(scan.setConfigErr)
 	}
