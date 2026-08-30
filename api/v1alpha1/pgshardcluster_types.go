@@ -157,6 +157,13 @@ type AdminSpec struct {
 	// +kubebuilder:default=true
 	// +optional
 	Enabled *bool `json:"enabled,omitempty"`
+	// InsecureNoAuth serves the admin to anything that can reach its
+	// Service. It has no mutations, but everything it shows -- topology,
+	// backup and restore state, stream positions, two-phase commit
+	// identifiers, the text of DDL -- is operational detail about the
+	// cluster, so it is credentialed unless this says otherwise.
+	// +optional
+	InsecureNoAuth bool `json:"insecureNoAuth,omitempty"`
 }
 
 // NetworkPolicySpec renders a NetworkPolicy in front of the member pods.

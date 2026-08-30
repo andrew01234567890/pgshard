@@ -26,6 +26,7 @@ Print columns: Shards, Ready, Age.
 | `spec.router.hpa.cpuUtilization` | int | default 70 (1..100) |
 | `spec.router.tls.secretRef` | LocalObjectReference | optional |
 | `spec.admin.enabled` | *bool | default true |
+| `spec.admin.insecureNoAuth` | bool | default false; serves the admin UI without a credential (development only, see [admin.md](admin.md#security)) |
 | `spec.backup.policyRef` | string | name of a PgShardBackupPolicy |
 | `spec.networkPolicy.enabled` | bool | default false; renders `<cluster>-members` (see [operator.md](operator.md#network-policy)) |
 | `spec.networkPolicy.clients` | []networkingv1.NetworkPolicyPeer | peers admitted to 5432/9090/9091 besides the cluster's own pods; CEL: non-empty while `enabled` ("networkPolicy.clients must name the control plane") |

@@ -51,7 +51,10 @@ var AdminRules = []rbacv1.PolicyRule{
 }
 
 // AdminDeployment renders the admin UI Deployment scoped to the cluster's namespace.
-func (r Renderer) AdminDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.Deployment {
+// AdminDeployment renders the admin UI. tokenKey is the key of the admin
+// Secret holding the credential; it is mounted under the name the admin
+// expects whatever the Secret calls it.
+func (r Renderer) AdminDeployment(c *pgshardv1alpha1.PgShardCluster, tokenKey string) *appsv1.Deployment {
 	image := r.AdminImage
 	if image == "" {
 		image = DefaultAdminImage
@@ -73,8 +76,9 @@ func (r Renderer) AdminDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.Dep
 						Name:            adminComponent,
 						Image:           image,
 						ImagePullPolicy: corev1.PullIfNotPresent,
-						Args:            []string{"serve", "--listen=:8081", "--namespace=" + c.Namespace},
+						Args:            adminArgs(c),
 						Ports:           []corev1.ContainerPort{{Name: "http", ContainerPort: adminPort}},
+						VolumeMounts:    adminMounts(c),
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler:  corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("http")}},
 							PeriodSeconds: 10,
@@ -85,10 +89,49 @@ func (r Renderer) AdminDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.Dep
 							Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 						},
 					}},
+					Volumes: adminVolumes(c, tokenKey),
 				},
 			},
 		},
 	}
+}
+
+const (
+	adminTokenDir = "/etc/pgshard-admin"
+	// adminSecretKey is the key of the admin credential, and the file name
+	// it is mounted under.
+	adminSecretKey = "token"
+)
+
+// adminArgs credentials the admin unless the spec asks for it to be open.
+func adminArgs(c *pgshardv1alpha1.PgShardCluster) []string {
+	args := []string{"serve", "--listen=:8081", "--namespace=" + c.Namespace}
+	if c.Spec.Admin.InsecureNoAuth {
+		return append(args, "--insecure-no-auth")
+	}
+	return append(args, "--token-file="+adminTokenDir+"/"+adminSecretKey)
+}
+
+func adminMounts(c *pgshardv1alpha1.PgShardCluster) []corev1.VolumeMount {
+	if c.Spec.Admin.InsecureNoAuth {
+		return nil
+	}
+	return []corev1.VolumeMount{{Name: "token", ReadOnly: true, MountPath: adminTokenDir}}
+}
+
+func adminVolumes(c *pgshardv1alpha1.PgShardCluster, tokenKey string) []corev1.Volume {
+	if c.Spec.Admin.InsecureNoAuth {
+		return nil
+	}
+	if tokenKey == "" {
+		tokenKey = adminSecretKey
+	}
+	return []corev1.Volume{{Name: "token", VolumeSource: corev1.VolumeSource{
+		Secret: &corev1.SecretVolumeSource{
+			SecretName: AdminSecretName(c.Name),
+			Items:      []corev1.KeyToPath{{Key: tokenKey, Path: adminSecretKey}},
+		},
+	}}}
 }
 
 // AdminService renders the ClusterIP Service in front of the admin UI.
@@ -112,13 +155,30 @@ func (r *ClusterReconciler) reconcileAdmin(ctx context.Context, c *pgshardv1alph
 	rb := &rbacv1.RoleBinding{ObjectMeta: adminMeta(c)}
 	dep := &appsv1.Deployment{ObjectMeta: adminMeta(c)}
 	svc := &corev1.Service{ObjectMeta: adminMeta(c)}
-	if !AdminEnabled(c) {
-		for _, obj := range []client.Object{dep, svc, rb, role, sa} {
+	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: AdminSecretName(c.Name), Namespace: c.Namespace}}
+	// A credential nothing mounts is a credential somebody can still read,
+	// so it goes when the admin does -- and when the admin is deliberately
+	// open.
+	if !AdminEnabled(c) || c.Spec.Admin.InsecureNoAuth {
+		gone := []client.Object{sec}
+		if !AdminEnabled(c) {
+			gone = []client.Object{dep, svc, rb, role, sa, sec}
+		}
+		for _, obj := range gone {
 			if err := r.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
 				return err
 			}
 		}
-		return nil
+		if !AdminEnabled(c) {
+			return nil
+		}
+	}
+	tokenKey := adminSecretKey
+	if !c.Spec.Admin.InsecureNoAuth {
+		var err error
+		if tokenKey, err = r.ensureAdminSecret(ctx, c); err != nil {
+			return err
+		}
 	}
 	if err := r.ensureOwned(ctx, c, sa, func() error { sa.Labels = adminLabels(c); return nil }); err != nil {
 		return err
@@ -138,7 +198,7 @@ func (r *ClusterReconciler) reconcileAdmin(ctx context.Context, c *pgshardv1alph
 	}); err != nil {
 		return err
 	}
-	desiredDep := r.Renderer.AdminDeployment(c)
+	desiredDep := r.Renderer.AdminDeployment(c, tokenKey)
 	if err := r.ensureOwned(ctx, c, dep, func() error {
 		dep.Labels = desiredDep.Labels
 		dep.Spec.Replicas = desiredDep.Spec.Replicas
