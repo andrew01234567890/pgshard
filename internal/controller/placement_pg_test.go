@@ -641,6 +641,7 @@ func TestUniqueConstraintsMissingKeyOnPostgres(t *testing.T) {
 		`CREATE TABLE include_only (id int, v int, PRIMARY KEY (id, v), UNIQUE (id) INCLUDE (v))`,
 		`CREATE TABLE nondet (id int, t text COLLATE ci, PRIMARY KEY (t))`,
 		`CREATE TABLE excl_eq (id int, v int, PRIMARY KEY (v), EXCLUDE USING btree (v WITH =))`,
+		`CREATE TABLE excl_overlap (id int, span int4range, EXCLUDE USING gist (id WITH =, span WITH &&))`,
 		`CREATE TABLE temporal (id int, valid int4range, PRIMARY KEY (id, valid WITHOUT OVERLAPS))`,
 	} {
 		mustExec(t, conn, stmt)
@@ -653,8 +654,18 @@ func TestUniqueConstraintsMissingKeyOnPostgres(t *testing.T) {
 		{"pk_covers", "v", nil},                                  // v is a PK key column
 		{"include_only", "v", []string{"include_only_id_v_key"}}, // v is only a covering column of the unique index
 		{"nondet", "t", []string{"nondet_pkey"}},                 // nondeterministic collation != raw-hash equality
-		{"excl_eq", "v", []string{"excl_eq_v_excl"}},             // exclusion refused (not recreated on target shadows)
-		{"temporal", "id", []string{"temporal_pkey"}},            // temporal WITHOUT OVERLAPS is an exclusion index
+		// An exclusion is per-shard safe when the shard key's own element
+		// is compared with equality: rows with different keys can never
+		// conflict, wherever they live.
+		{"excl_eq", "v", nil},
+		{"excl_overlap", "id", nil},
+		// Sharding by the overlapping element is not: two spans that
+		// overlap can land on different shards, and neither sees the other.
+		{"excl_overlap", "span", []string{"excl_overlap_id_span_excl"}},
+		// A temporal PRIMARY KEY is an exclusion index; the scalar part is
+		// equality, the period part is not.
+		{"temporal", "id", nil},
+		{"temporal", "valid", []string{"temporal_pkey"}},
 	}
 	for _, c := range cases {
 		got, err := uniqueConstraintsMissingKey(ctx, pgxShardConn{conn}, "public", c.table, c.key)
@@ -1182,5 +1193,102 @@ func TestPlacementCarriesAnExclusionConstraintOnPostgres(t *testing.T) {
 		if _, err := c.Exec(context.Background(), `INSERT INTO slots VALUES (999, 'r1')`); err == nil {
 			t.Errorf("shard %d: the moved table accepted a row its exclusion constraint forbids", id)
 		}
+	}
+}
+
+// TestPlacementShardsATableWithATemporalKeyOnPostgres: an exclusion whose
+// shard-key element is equality is enforceable one shard at a time, so a
+// table carrying one can be sharded. What has to hold after the cutover is
+// that the constraint is on every shard and still rejects the conflict it
+// was there to reject.
+//
+// The temporal key here is a UNIQUE, not the primary key: the copy applies
+// rows by the primary key, and PostgreSQL cannot match an exclusion
+// constraint from an ON CONFLICT column list. A table whose only primary
+// key is temporal is refused, which the case below covers.
+func TestPlacementShardsATableWithATemporalKeyOnPostgres(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	home := f.app(0)
+	// A temporal key over a scalar needs btree_gist on every shard that
+	// will hold the table; nothing materializes extensions onto target
+	// shards yet, so the fixture installs it.
+	for id := range int32(2) {
+		mustExec(t, f.app(id), `CREATE EXTENSION IF NOT EXISTS btree_gist`)
+	}
+	mustExec(t, home, `CREATE TABLE bookings (
+		tenant bigint NOT NULL,
+		id bigint NOT NULL,
+		during int4range NOT NULL,
+		note text,
+		PRIMARY KEY (tenant, id),
+		UNIQUE (tenant, during WITHOUT OVERLAPS))`)
+	mustExec(t, home, `INSERT INTO bookings SELECT g, g, int4range(g * 10, g * 10 + 5), 'n' || g FROM generate_series(1, 40) g`)
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement) VALUES ('app', 'public', 'bookings', 'unsharded')`)
+	f.reconcile()
+	mustExec(t, f.catalog, `UPDATE pgshard.tables SET placement = 'sharded', shard_key = 'tenant' WHERE table_name = 'bookings'`)
+	f.reconcile()
+	mustExec(t, f.catalog, `UPDATE pgshard.workflows SET spec = spec || '{"drop_old_after_seconds": 0}'`)
+	f.driveUntil("bookings", 2*time.Minute, StageCompleted)
+
+	total := int64(0)
+	for id := range int32(2) {
+		c := f.app(id)
+		total += queryOne[int64](t, c, `SELECT count(*) FROM bookings`)
+		if n := queryOne[int64](t, c, `SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.bookings'::regclass AND conperiod`); n != 1 {
+			t.Errorf("shard %d: the temporal key did not survive the move", id)
+		}
+		var tenant int64
+		if err := c.QueryRow(context.Background(), `SELECT tenant FROM bookings LIMIT 1`).Scan(&tenant); err != nil {
+			continue
+		}
+		// The row this shard holds overlaps [tenant*10, tenant*10+5).
+		if _, err := c.Exec(context.Background(), `INSERT INTO bookings VALUES ($1, $1 + 1000, int4range($2, $3), 'overlap')`,
+			tenant, tenant*10+1, tenant*10+9); err == nil {
+			t.Errorf("shard %d: the moved table accepted a booking that overlaps one it holds", id)
+		}
+	}
+	if total != 40 {
+		t.Fatalf("bookings across shards: %d", total)
+	}
+}
+
+// TestPlacementRefusesATemporalPrimaryKeyOnPostgres: the copy applies rows
+// by the primary key, and PostgreSQL will not match an exclusion constraint
+// from an ON CONFLICT column list. Accepting the table and then failing
+// every batch deep in the copy is worse than saying so at the start.
+func TestPlacementRefusesATemporalPrimaryKeyOnPostgres(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	// Every shard the table could move to needs btree_gist, or the move is
+	// refused for the missing extension before it ever looks at the key.
+	for id := range int32(2) {
+		mustExec(t, f.app(id), `CREATE EXTENSION IF NOT EXISTS btree_gist`)
+	}
+	home := f.app(0)
+	mustExec(t, home, `CREATE TABLE spans (
+		tenant bigint NOT NULL,
+		during int4range NOT NULL,
+		PRIMARY KEY (tenant, during WITHOUT OVERLAPS))`)
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement) VALUES ('app', 'public', 'spans', 'unsharded')`)
+	f.reconcile()
+	mustExec(t, f.catalog, `UPDATE pgshard.tables SET placement = 'sharded', shard_key = 'tenant' WHERE table_name = 'spans'`)
+	f.reconcile()
+
+	var state, msg string
+	for range 40 {
+		if _, err := f.placer.Pass(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.catalog.QueryRow(context.Background(),
+			`SELECT state, coalesce(status->>'message', '') FROM pgshard.workflows ORDER BY created_at DESC LIMIT 1`).Scan(&state, &msg); err != nil {
+			t.Fatal(err)
+		}
+		if state == StateFailed {
+			break
+		}
+	}
+	if state != StateFailed || !strings.Contains(msg, "temporal key") {
+		t.Fatalf("workflow ended %s: %q, want a refusal naming the temporal key", state, msg)
 	}
 }

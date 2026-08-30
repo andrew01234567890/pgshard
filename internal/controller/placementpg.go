@@ -104,6 +104,20 @@ func (p *Placer) describe(ctx context.Context, wf *placementWorkflow) error {
 	// row shape (it is recomputed on the target), so routing by it or
 	// applying rows by a primary key that contains it has nothing to read.
 	// Refuse up front rather than fail per row deep in the copy.
+	// A temporal primary key (PG18 ... WITHOUT OVERLAPS) is an exclusion
+	// index, and PostgreSQL cannot infer an exclusion constraint from an
+	// ON CONFLICT column list -- nor update through one. The copy applies
+	// rows by the primary key, so a table whose only primary key is
+	// temporal has nothing the copy can apply by. The constraint itself is
+	// fine on a sharded table when the shard key is compared with equality;
+	// it is being the primary key that the copy cannot work with.
+	temporalPK, err := primaryKeyIsTemporal(ctx, conn, wf.spec.SchemaName, wf.spec.TableName)
+	if err != nil {
+		return err
+	}
+	if temporalPK {
+		return fatal("the primary key of table %s is a temporal key (WITHOUT OVERLAPS); placement workflows apply rows by the primary key and PostgreSQL cannot match an exclusion constraint by column list", wf.spec.table())
+	}
 	copied := copiedColumns(cols)
 	for _, k := range pk {
 		if !slices.Contains(colNames(copied), k) {
@@ -199,6 +213,19 @@ func tableColumns(ctx context.Context, conn ShardConn, schema, name string) ([]t
 	return out, rows.Err()
 }
 
+// primaryKeyIsTemporal reports whether the table's primary key is backed by
+// an exclusion index, which is what PG18's PRIMARY KEY (..., x WITHOUT
+// OVERLAPS) builds.
+func primaryKeyIsTemporal(ctx context.Context, conn ShardConn, schema, name string) (bool, error) {
+	rows, err := conn.Query(ctx, `SELECT coalesce(bool_or(i.indisexclusion), false) FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2 AND i.indisprimary`, schema, name)
+	if err != nil {
+		return false, err
+	}
+	return pgx.CollectExactlyOneRow(rows, pgx.RowTo[bool])
+}
+
 func primaryKey(ctx context.Context, conn ShardConn, schema, name string) ([]string, error) {
 	rows, err := conn.Query(ctx, `SELECT a.attname FROM pg_index i
 		JOIN pg_class c ON c.oid = i.indrelid JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -218,29 +245,36 @@ func primaryKey(ctx context.Context, conn ShardConn, schema, name string) ([]str
 // INCLUDE column) AND that column uses a deterministic collation and the
 // default operator class: index equality must match pgshard's raw-hash
 // distribution equality, or two "equal" values could hash to different shards.
-// Exclusion constraints (including PG18 temporal WITHOUT OVERLAPS keys, whose
-// index is indisexclusion) are refused outright: their targets are not yet
-// recreated on shadow shards and their operators are not verified here.
+// An exclusion constraint -- including a PG18 temporal PRIMARY KEY or UNIQUE
+// ... WITHOUT OVERLAPS, whose index is indisexclusion -- needs one condition
+// more. Its elements are compared with operators of its own, and it is only
+// per-shard safe when the shard key's element is compared with equality: two
+// rows with different keys are then never in conflict, wherever they live.
+// An element compared with && or <> can conflict across shards, and no shard
+// can see the other's rows, so that stays refused.
+//
 // Expression and partial unique indexes are reported too (fail closed).
 func uniqueConstraintsMissingKey(ctx context.Context, conn ShardConn, schema, name, key string) ([]string, error) {
 	rows, err := conn.Query(ctx, `SELECT ix.relname FROM pg_index i
 		JOIN pg_class c ON c.oid = i.indrelid JOIN pg_namespace n ON n.oid = c.relnamespace
 		JOIN pg_class ix ON ix.oid = i.indexrelid
+		LEFT JOIN pg_constraint x ON x.conindid = i.indexrelid AND x.conexclop IS NOT NULL
 		WHERE n.nspname = $1 AND c.relname = $2 AND (i.indisunique OR i.indisexclusion)
-		AND NOT (
-			NOT i.indisexclusion
+		AND NOT EXISTS (
+			SELECT 1 FROM unnest(i.indkey) WITH ORDINALITY k(attnum, ord)
+			JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
+			WHERE k.ord <= i.indnkeyatts AND a.attname = $3
+			AND NOT EXISTS (
+				SELECT 1 FROM unnest(i.indcollation::oid[]) WITH ORDINALITY ic(coll, cord)
+				JOIN pg_collation cl ON cl.oid = ic.coll
+				WHERE ic.cord = k.ord AND NOT cl.collisdeterministic)
 			AND EXISTS (
-				SELECT 1 FROM unnest(i.indkey) WITH ORDINALITY k(attnum, ord)
-				JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
-				WHERE k.ord <= i.indnkeyatts AND a.attname = $3
-				AND NOT EXISTS (
-					SELECT 1 FROM unnest(i.indcollation::oid[]) WITH ORDINALITY ic(coll, cord)
-					JOIN pg_collation cl ON cl.oid = ic.coll
-					WHERE ic.cord = k.ord AND NOT cl.collisdeterministic)
-				AND EXISTS (
-					SELECT 1 FROM unnest(i.indclass::oid[]) WITH ORDINALITY icl(cls, clord)
-					JOIN pg_opclass oc ON oc.oid = icl.cls
-					WHERE icl.clord = k.ord AND oc.opcdefault)))
+				SELECT 1 FROM unnest(i.indclass::oid[]) WITH ORDINALITY icl(cls, clord)
+				JOIN pg_opclass oc ON oc.oid = icl.cls
+				WHERE icl.clord = k.ord AND oc.opcdefault)
+			AND (NOT i.indisexclusion OR EXISTS (
+				SELECT 1 FROM pg_amop ao JOIN pg_am am ON am.oid = ao.amopmethod
+				WHERE ao.amopopr = x.conexclop[k.ord] AND am.amname = 'btree' AND ao.amopstrategy = 3)))
 		ORDER BY ix.relname`, schema, name, key)
 	if err != nil {
 		return nil, err
