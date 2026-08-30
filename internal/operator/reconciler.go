@@ -752,9 +752,15 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 		return obs, nil
 	}
 	obs.primaryOK = true
+	// Reported, never fatal to the pass: the fence lives in the catalog
+	// group, which is itself rebuilt member by member on a storage-class
+	// change, and a group that stopped rolling out because it could not
+	// read the catalog for a moment would be waiting on the very thing it
+	// is waiting for. A pause that does not get reapplied still fails the
+	// barrier's certification, which is what it did before it was
+	// reapplied at all.
 	if err := r.reapplyWritePause(ctx, c, g, dsn, pstate, password); err != nil {
-		obs.primaryErr = err.Error()
-		return obs, nil
+		logf.FromContext(ctx).Info("could not reapply the write pause; continuing", "group", g.Name(), "err", err)
 	}
 	var slots []string
 	for _, name := range g.MemberNames() {
