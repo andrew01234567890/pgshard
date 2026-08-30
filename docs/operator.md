@@ -41,6 +41,13 @@ Plaintext is never a fallback: without a `secretRef` the spec must set
 `spec.internalTLS.insecure: true` (unsupported outside development, and only
 tolerable behind a NetworkPolicy restricting port 9091 to router pods) or
 the API server rejects the cluster.
+`pg_hba.conf` admits only the control plane over TCP: the superuser, and
+`pgshard_router` for the router's catalog connection, which exists only
+where the catalog schema does. Everything else is rejected, so an
+application role reaches a shard through the pooler's unix socket and the
+router, which is where shard-key routing, the write fences and the
+coordination of a multi-shard write happen.
+
 The agent's own gRPC port (9090) requires a per-cluster token derived from
 the superuser Secret on every RPC, so reaching the port is not enough to
 drive failovers.
@@ -116,7 +123,7 @@ For every cluster the operator owns `<cluster>-router`:
 | Object | Content |
 |--------|---------|
 | ServiceAccount | Identity of the router pods. |
-| Deployment | `serve --listen=:5432 --catalog-dsn=host=<cluster>-catalog-rw.<ns>.svc port=5432 user=postgres dbname=postgres --catalog-pooler=<cluster>-catalog-rw.<ns>.svc:9091 --insecure-dev`; the superuser password arrives as `PGPASSWORD` from the `<cluster>-superuser` Secret. Replicas start at `spec.router.minReplicas` and are then owned by the HPA. |
+| Deployment | `serve --listen=:5432 --catalog-dsn=host=<cluster>-catalog-rw.<ns>.svc port=5432 user=pgshard_router dbname=postgres --catalog-pooler=<cluster>-catalog-rw.<ns>.svc:9091 --insecure-dev`; the password arrives as `PGPASSWORD` from the `<cluster>-router` Secret. That role is the catalog's own least-privilege login (see [router.md](router.md#startup-and-authentication)) -- not the superuser, whose password is also the seed of the agent control-plane token. Replicas start at `spec.router.minReplicas` and are then owned by the HPA. |
 | Service | ClusterIP on 5432, the endpoint applications connect to. |
 | HorizontalPodAutoscaler | `autoscaling/v2`, CPU utilization target `spec.router.hpa.cpuUtilization` (default 70) between `minReplicas` and `maxReplicas`. |
 | PodDisruptionBudget | `minAvailable: 1`. |

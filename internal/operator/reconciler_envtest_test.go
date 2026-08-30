@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/placement"
 )
 
@@ -51,6 +52,12 @@ func TestMain(m *testing.M) {
 		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
 		ErrorIfCRDPathMissing: true,
 	}
+	// Every test in this package stands its cluster up in the same control
+	// plane, and each one takes a handful of Services. The default range
+	// holds 254 addresses and nothing gives them back, so the suite ran out
+	// as it grew -- "failed to allocate a serviceIP: range is full", in
+	// whichever test happened to be last.
+	env.ControlPlane.GetAPIServer().Configure().Set("service-cluster-ip-range", "10.0.0.0/16")
 	cfg, err := env.Start()
 	if err != nil {
 		fmt.Fprint(os.Stderr, "envtest: start: "+err.Error()+"\n")
@@ -85,6 +92,8 @@ type fakeProber struct {
 	placements []PlacementWorkflowInfo
 	// journal records fence writes and promotions in order.
 	journal *[]string
+	// routerPasswords records every ALTER ROLE the reconcile asked for.
+	routerPasswords []string
 	// onRelease runs inside ReleaseCatalog, so a test can see what the
 	// cluster looked like at that point of the rollback.
 	onRelease func()
@@ -504,6 +513,13 @@ func (f *fakeProber) MigrateCatalog(context.Context, string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.migrated++
+	return nil
+}
+
+func (f *fakeProber) SetRouterPassword(_ context.Context, dsn, password string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.routerPasswords = append(f.routerPasswords, hostOf(dsn)+"="+password)
 	return nil
 }
 
@@ -1144,5 +1160,47 @@ func TestNetworkPolicyIsRenderedOnlyWhileItIsEnabled(t *testing.T) {
 	reconcile(t, r, c)
 	if err := k8sClient.Get(ctx, key, &np); !apierrors.IsNotFound(err) {
 		t.Fatalf("a policy that was turned off keeps enforcing: %v", err)
+	}
+}
+
+// TestRouterCredentialIsGeneratedAndApplied: the router's password is the
+// cluster's own, generated once and told to the catalog on every pass, so a
+// catalog restored or rebuilt from elsewhere comes back in step with the
+// Secret rather than locking the router out.
+func TestRouterCredentialIsGeneratedAndApplied(t *testing.T) {
+	r, fp, c := setup(t, "rc")
+	bringUp(t, r, fp, c)
+
+	var sec corev1.Secret
+	get(t, RouterSecretName(c.Name), &sec)
+	ownedBy(t, &sec, c)
+	pw := string(sec.Data["password"])
+	if len(pw) < 32 {
+		t.Fatalf("router password is %d characters", len(pw))
+	}
+	if string(sec.Data["username"]) != catalog.RouterRole {
+		t.Errorf("username %q, want %q", sec.Data["username"], catalog.RouterRole)
+	}
+
+	var su corev1.Secret
+	get(t, SecretName(c.Name), &su)
+	if string(su.Data["password"]) == pw {
+		t.Error("the router's password must not be the superuser's")
+	}
+
+	fp.mu.Lock()
+	applied := append([]string(nil), fp.routerPasswords...)
+	fp.mu.Unlock()
+	if len(applied) == 0 {
+		t.Fatal("the catalog was never told the router's password")
+	}
+	if got := applied[len(applied)-1]; got != "rc-catalog-rw.default.svc="+pw {
+		t.Errorf("last ALTER ROLE = %q, want the generated password on the catalog", got)
+	}
+
+	reconcile(t, r, c)
+	get(t, RouterSecretName(c.Name), &sec)
+	if string(sec.Data["password"]) != pw {
+		t.Error("the password must survive a reconcile: it was regenerated")
 	}
 }

@@ -30,6 +30,7 @@ import (
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/internal/agentauth"
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/pgtune"
 
 	"github.com/andrew01234567890/pgshard/internal/metrics"
@@ -361,6 +362,45 @@ func (r *ClusterReconciler) ensureSecret(ctx context.Context, c *pgshardv1alpha1
 	if err := r.Create(ctx, &sec); err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			return r.ensureSecret(ctx, c)
+		}
+		return "", err
+	}
+	return pw, nil
+}
+
+// ensureRouterSecret generates the router's catalog password. Like the
+// admin's, it is the cluster's own and separate from the superuser's: the
+// router terminates untrusted client connections, and the superuser
+// password is also the seed of the agent control-plane token.
+func (r *ClusterReconciler) ensureRouterSecret(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) (string, error) {
+	key := types.NamespacedName{Namespace: c.Namespace, Name: RouterSecretName(c.Name)}
+	var sec corev1.Secret
+	err := r.Get(ctx, key, &sec)
+	if err == nil {
+		if pw := sec.Data[secretKey]; len(pw) > 0 {
+			return string(pw), nil
+		}
+		return "", fmt.Errorf("secret %s has no %q key", key.Name, secretKey)
+	}
+	if !apierrors.IsNotFound(err) {
+		return "", err
+	}
+	buf := make([]byte, 24)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	pw := hex.EncodeToString(buf)
+	sec = corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace, Labels: map[string]string{LabelCluster: c.Name}},
+		Type:       corev1.SecretTypeBasicAuth,
+		StringData: map[string]string{"username": catalog.RouterRole, secretKey: pw},
+	}
+	if err := controllerutil.SetControllerReference(c, &sec, r.Scheme()); err != nil {
+		return "", err
+	}
+	if err := r.Create(ctx, &sec); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return r.ensureRouterSecret(ctx, c)
 		}
 		return "", err
 	}
@@ -922,6 +962,16 @@ func (r *ClusterReconciler) reconcileCatalogSchema(ctx context.Context, c *pgsha
 		return cond, ""
 	}
 	dsn := DSN(catalog.group.ServiceRW(), c.Namespace, password)
+	// The router's password is not part of the schema and is not
+	// replicated, so it is applied on its own: a catalog just switched to
+	// has the role from its migration and no password for it.
+	setRouterCredential := func() error {
+		pw, err := r.ensureRouterSecret(ctx, c)
+		if err != nil {
+			return err
+		}
+		return r.Prober.SetRouterPassword(ctx, dsn, pw)
+	}
 	if up := c.Status.CatalogUpgrade; up != nil && up.Stage == CatalogUpgradeRetiring {
 		// A schema migration applied here cannot be rolled back with the
 		// data. Logical replication carries no DDL, so the reverse stream
@@ -933,10 +983,22 @@ func (r *ClusterReconciler) reconcileCatalogSchema(ctx context.Context, c *pgsha
 		cond.Status = metav1.ConditionTrue
 		cond.Reason = "MigrationDeferred"
 		cond.Message = "catalog schema migrations wait while the previous catalog is kept for rollback; they run when it is retired"
+		if err := setRouterCredential(); err != nil {
+			// Not fatal here: the catalog is serving, and refusing to
+			// reconcile the rest of the cluster over a credential the next
+			// pass can set again helps nobody.
+			cond.Message += "; the router credential could not be applied: " + err.Error()
+		}
 		return cond, dsn
 	}
 	if err := r.Prober.MigrateCatalog(ctx, dsn); err != nil {
 		cond.Reason = "MigrationFailed"
+		cond.Message = err.Error()
+		return cond, ""
+	}
+	// After the migration, which is what creates the role.
+	if err := setRouterCredential(); err != nil {
+		cond.Reason = "RouterCredential"
 		cond.Message = err.Error()
 		return cond, ""
 	}

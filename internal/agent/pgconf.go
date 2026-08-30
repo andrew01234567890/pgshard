@@ -171,6 +171,11 @@ func PrimaryConninfo(c *Config) string {
 // component connects as; see instance.go, which runs initdb -U postgres.
 const superuserRole = "postgres"
 
+// routerRole mirrors catalog.RouterRole. The agent renders configuration
+// for a member and does not otherwise know the catalog schema, so the name
+// is repeated rather than imported; a test keeps them equal.
+const routerRole = "pgshard_router"
+
 // RenderPgHBAConf renders pg_hba.conf.
 func RenderPgHBAConf(c *Config) string {
 	host := "hostnossl"
@@ -202,6 +207,11 @@ func RenderPgHBAConf(c *Config) string {
 	// it was; nothing checked it had come the right way.
 	fmt.Fprintf(&b, "%-8s all             %-15s %-23s scram-sha-256\n", hostKeyword(host), superuserRole, cidr)
 	fmt.Fprintf(&b, "%-8s replication     %-15s %-23s scram-sha-256\n", hostKeyword(host), superuserRole, cidr)
+	// The router reaches the catalog as its own least-privilege role rather
+	// than as the superuser, and it does so over TCP like the rest of the
+	// control plane. The role exists only where the catalog schema does, so
+	// on a shard this line matches nothing.
+	fmt.Fprintf(&b, "%-8s all             %-15s %-23s scram-sha-256\n", hostKeyword(host), routerRole, cidr)
 	fmt.Fprintf(&b, "%-8s all             all             %-23s reject\n", hostKeyword(host), cidr)
 	if host == "hostssl" {
 		fmt.Fprintf(&b, "%-8s all             all             %-23s reject\n", "hostnossl", cidr)

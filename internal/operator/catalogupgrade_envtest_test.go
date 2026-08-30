@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -569,5 +570,28 @@ func TestCatalogMigrationsWaitForTheRollbackWindowToClose(t *testing.T) {
 	fp.mu.Unlock()
 	if after == 0 {
 		t.Error("migrations must resume once the previous catalog is retired")
+	}
+}
+
+// TestCatalogUpgradeGivesTheNewCatalogTheRouterPassword: roles are not
+// logically replicated, so the new catalog has the router's role from its
+// own migration and no password for it. If nothing set one, every router
+// would be refused the moment the endpoint moved to it.
+func TestCatalogUpgradeGivesTheNewCatalogTheRouterPassword(t *testing.T) {
+	r, fp, c := setup(t, "cp")
+	startCatalogUpgrade(t, r, fp, c)
+	for i := 0; i < 3 && catalogStage(t, c.Name) == CatalogUpgradeProvisioning; i++ {
+		reconcile(t, r, c)
+	}
+
+	var sec corev1.Secret
+	get(t, RouterSecretName(c.Name), &sec)
+	want := "cp-catalog-g2-rw.default.svc=" + string(sec.Data["password"])
+
+	fp.mu.Lock()
+	applied := append([]string(nil), fp.routerPasswords...)
+	fp.mu.Unlock()
+	if !slices.Contains(applied, want) {
+		t.Errorf("the new catalog was never given the router password: %v", applied)
 	}
 }

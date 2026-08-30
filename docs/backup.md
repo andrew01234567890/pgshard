@@ -299,8 +299,9 @@ a plain `BEGIN` is writable whenever no pause is running.
 
 That covers everything reaching a shard through pgshard. It does not cover a
 connection made straight to a member's PostgreSQL: `pg_hba` admits only the
-superuser there (see [operator.md](operator.md#member-pods)), and a superuser
-can turn the pause off for itself. A superuser writing on a member during a
+control plane's own roles there -- the superuser, and the router's catalog
+role on the catalog group (see [operator.md](operator.md#member-pods)) -- and
+a superuser can turn the pause off for itself. A superuser writing on a member during a
 barrier is outside the certification contract -- step 5 above is what keeps
 such a write from being certified rather than silently included: the barrier
 fails instead.

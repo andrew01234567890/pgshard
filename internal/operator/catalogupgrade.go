@@ -142,8 +142,22 @@ func (r *ClusterReconciler) reconcileCatalogUpgrade(ctx context.Context, c *pgsh
 			up.Message = "waiting for the new-major catalog group"
 			break
 		}
-		if err := r.Prober.MigrateCatalog(ctx, r.catalogTargetDSN(c, *target, password)); err != nil {
+		targetDSN := r.catalogTargetDSN(c, *target, password)
+		if err := r.Prober.MigrateCatalog(ctx, targetDSN); err != nil {
 			up.Message = "migrate new catalog: " + err.Error()
+			break
+		}
+		// Roles are not logically replicated, so the copy will not carry
+		// the router's password across: the new catalog has the role from
+		// the migration and no password for it, and would refuse every
+		// router the moment the endpoint moved.
+		routerPW, err := r.ensureRouterSecret(ctx, c)
+		if err != nil {
+			up.Message = "router credential: " + err.Error()
+			break
+		}
+		if err := r.Prober.SetRouterPassword(ctx, targetDSN, routerPW); err != nil {
+			up.Message = "router credential on the new catalog: " + err.Error()
 			break
 		}
 		up.Stage = CatalogUpgradeCopying

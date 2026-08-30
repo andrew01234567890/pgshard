@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/andrew01234567890/pgshard/internal/agent/backup"
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 )
 
 func testConfig() *Config {
@@ -311,6 +312,12 @@ func TestPgHBARefusesApplicationRolesOverTCP(t *testing.T) {
 		if tls {
 			c.TLS = TLSFiles{CertFile: "/certs/tls.crt", KeyFile: "/certs/tls.key", CAFile: "/certs/ca.crt"}
 		}
+		// The control plane's own roles, and nothing else. The superuser is
+		// how the operator, the controller and a replica reach a member;
+		// the router's catalog role is how the router reaches the catalog,
+		// and it exists only where the catalog schema does, so on a shard
+		// this line matches no role at all.
+		controlPlane := map[string]bool{"postgres": true, catalog.RouterRole: true}
 		var host, superuser, reject int
 		for _, line := range strings.Split(RenderPgHBAConf(c), "\n") {
 			f := strings.Fields(line)
@@ -322,14 +329,21 @@ func TestPgHBARefusesApplicationRolesOverTCP(t *testing.T) {
 			switch {
 			case method == "reject":
 				reject++
-			case role == "postgres":
+			case controlPlane[role]:
 				superuser++
 			default:
 				t.Errorf("tls=%v: %q lets role %q authenticate over TCP", tls, line, role)
 			}
 		}
 		if superuser == 0 || reject == 0 || host != superuser+reject {
-			t.Errorf("tls=%v: %d TCP lines, %d superuser, %d reject", tls, host, superuser, reject)
+			t.Errorf("tls=%v: %d TCP lines, %d control plane, %d reject", tls, host, superuser, reject)
+		}
+		// An application role is still refused, which is the point of all
+		// of this: it must reach a shard through the pooler and the router,
+		// where shard-key routing, the write fences and the coordination of
+		// a multi-shard write happen.
+		if strings.Contains(RenderPgHBAConf(c), " app ") {
+			t.Errorf("tls=%v: an application role reached the TCP rules", tls)
 		}
 		// The socket stays open to everything: that is how the pooler, and
 		// so every application, actually reaches this instance.

@@ -16,9 +16,23 @@ the rest with `0A000`. See *Routing* below.
 ## Startup and authentication
 
 - **Catalog.** `--catalog-dsn` must be able to read `pgshard.roles.verifier`
-  (`pgshard_system`, `pgshard_admin` or a superuser). The router follows the
-  catalog through the snapshot watcher (LISTEN/NOTIFY plus periodic reload)
-  and refuses to listen until the first snapshot arrives (`--snapshot-wait`).
+  and to write the decision log and the migration queue. The operator points
+  it at `pgshard_router`, a login role the catalog schema creates for exactly
+  that: `pgshard_admin` and `pgshard_reader` plus INSERT/UPDATE/DELETE on
+  `pgshard.xact_decisions` and INSERT/UPDATE on `pgshard.migrations`, with no
+  superuser, `CREATEROLE` or `CREATEDB`. Its password is generated per
+  cluster into the Secret `<cluster>-router`.
+
+  It is deliberately **not** the superuser: the router is the one component
+  untrusted clients connect to, parsing their protocol and their SQL, and the
+  superuser password is also the seed of the agent control-plane token
+  (`internal/agentauth`) — one compromised router would otherwise be the
+  whole cluster. Running the router by hand with a superuser DSN still works
+  and is what the development harnesses do.
+
+  The router follows the catalog through the snapshot watcher (LISTEN/NOTIFY
+  plus periodic reload) and refuses to listen until the first snapshot
+  arrives (`--snapshot-wait`).
 - **SCRAM.** Every session authenticates with SCRAM-SHA-256 against the
   verifier stored in `pgshard.roles`; verifiers are cached for `--roles-ttl`
   (5s) and reloaded on a miss so new roles work immediately. A wrong password
