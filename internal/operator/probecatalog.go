@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/andrew01234567890/pgshard/internal/pgsequence"
 )
 
 // CatalogUpgradePublication and CatalogUpgradeSubscription name the
@@ -84,33 +86,14 @@ func drainSlot(ctx context.Context, conn *pgx.Conn, slot, lsn string, now func()
 
 // carrySequences copies every sequence position from one catalog to the
 // other. Logical replication does not replicate sequences, so whichever
-// side is about to serve has to be told where they got to.
+// side is about to serve has to be told where they got to. The catalog's
+// own pgshard schema is carried too: its sequences are catalog data.
 func carrySequences(ctx context.Context, from, to *pgx.Conn) error {
-	sequences := map[string]int64{}
-	rows, err := from.Query(ctx, `SELECT quote_ident(schemaname) || '.' || quote_ident(sequencename), last_value
-		FROM pg_sequences WHERE last_value IS NOT NULL`)
+	values, err := pgsequence.Snapshot(ctx, from, nil)
 	if err != nil {
 		return err
 	}
-	for rows.Next() {
-		var name string
-		var v int64
-		if err := rows.Scan(&name, &v); err != nil {
-			rows.Close()
-			return err
-		}
-		sequences[name] = v
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for name, v := range sequences {
-		if _, err := to.Exec(ctx, `SELECT pg_catalog.setval(oid, $2, true) FROM pg_class WHERE oid = to_regclass($1) AND relkind = 'S'`, name, v); err != nil {
-			return fmt.Errorf("carry sequence %s: %w", name, err)
-		}
-	}
-	return nil
+	return pgsequence.Apply(ctx, to, values)
 }
 
 // ServerMajor implements Prober.

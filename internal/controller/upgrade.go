@@ -8,6 +8,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/andrew01234567890/pgshard/internal/pgsequence"
+
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 )
 
@@ -131,17 +133,18 @@ func (o *pgCutover) Sequences(ctx context.Context) error {
 
 func (o *pgCutover) syncSequences(ctx context.Context, fromSet string, fromIDs []int32, toSet string, toIDs []int32) error {
 	for _, db := range o.dbs {
-		values := map[string]seqCarry{}
+		values := map[string]pgsequence.Value{}
 		for _, s := range fromIDs {
 			conn, err := o.c.Shards.DialDatabase(ctx, fromSet, s, db.name)
 			if err != nil {
 				return err
 			}
-			err = collectSequences(ctx, conn, values)
+			from, err := pgsequence.Snapshot(ctx, conn, []string{"pgshard", JournalSchema})
 			_ = conn.Close(ctx)
 			if err != nil {
 				return fmt.Errorf("sequences of %s on %s/%d: %w", db.name, fromSet, s, err)
 			}
+			pgsequence.Merge(values, from)
 		}
 		if len(values) == 0 {
 			continue
@@ -151,85 +154,11 @@ func (o *pgCutover) syncSequences(ctx context.Context, fromSet string, fromIDs [
 			if err != nil {
 				return err
 			}
-			err = applySequences(ctx, conn, values)
+			err = pgsequence.Apply(ctx, conn, values)
 			_ = conn.Close(ctx)
 			if err != nil {
 				return fmt.Errorf("sequences of %s on %s/%d: %w", db.name, toSet, t, err)
 			}
-		}
-	}
-	return nil
-}
-
-// seqCarry is the value carried for one sequence and the direction it
-// advances in, so the merge across sources keeps the furthest value in
-// that direction.
-type seqCarry struct {
-	Value     int64
-	Ascending bool
-}
-
-// collectSequences merges the called sequences of conn into values, keeping
-// per qualified name the last_value furthest in the direction of
-// increment_by plus a safety headroom: a session may hold up to cache_size
-// values and PostgreSQL pre-logs 32 (SEQ_LOG_VALS) per fetch, so nextval
-// calls that consume that headroom move neither pg_current_wal_lsn() nor
-// the on-disk value; without the bump a stale-router nextval between the
-// carry and the flip could hand the target duplicates. The headroom is
-// signed (greatest(cache_size, 32) * increment_by), computed in numeric so
-// it cannot overflow bigint, and clamped to max_value (ascending) or
-// min_value (descending) before the cast back. A CYCLE sequence clamps at
-// its boundary instead of simulating the wrap: the carried value is never
-// out of range, and values reused past a wrap are inherent to CYCLE, not
-// introduced here.
-func collectSequences(ctx context.Context, conn ShardConn, values map[string]seqCarry) error {
-	rows, err := conn.Query(ctx, `SELECT quote_ident(schemaname) || '.' || quote_ident(sequencename),
-			(CASE WHEN increment_by > 0
-				THEN least(last_value::numeric + greatest(cache_size, 32)::numeric * increment_by::numeric, max_value::numeric)
-				ELSE greatest(last_value::numeric + greatest(cache_size, 32)::numeric * increment_by::numeric, min_value::numeric)
-			END)::bigint,
-			increment_by > 0
-		FROM pg_sequences WHERE last_value IS NOT NULL AND schemaname NOT IN ('pgshard', $1) ORDER BY 1`, JournalSchema)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var name string
-		var v int64
-		var asc bool
-		if err := rows.Scan(&name, &v, &asc); err != nil {
-			return err
-		}
-		if prev, ok := values[name]; ok {
-			if asc {
-				v = max(prev.Value, v)
-			} else {
-				v = min(prev.Value, v)
-			}
-		}
-		values[name] = seqCarry{Value: v, Ascending: asc}
-	}
-	return rows.Err()
-}
-
-// applySequences sets every sequence conn holds to the recorded value; a
-// sequence the target does not have (never materialized) is skipped.
-// applySequences moves each target sequence to the carried value, never
-// backwards. The carry runs a second time at the swap, by which point the
-// targets are serving and may have advanced past the sources on their own;
-// an unconditional setval would hand those values out twice. Direction
-// matters: for a descending sequence "further on" is the smaller value.
-func applySequences(ctx context.Context, conn ShardConn, values map[string]seqCarry) error {
-	const sql = `SELECT pg_catalog.setval(c.oid,
-		CASE WHEN $3::bool
-			THEN greatest(coalesce(pg_catalog.pg_sequence_last_value(c.oid), $2::bigint), $2::bigint)
-			ELSE least(coalesce(pg_catalog.pg_sequence_last_value(c.oid), $2::bigint), $2::bigint)
-		END, true)
-		FROM pg_class c WHERE c.oid = to_regclass($1) AND c.relkind = 'S'`
-	for _, name := range sortedKeys(values) {
-		if _, err := conn.Exec(ctx, sql, name, values[name].Value, values[name].Ascending); err != nil {
-			return err
 		}
 	}
 	return nil
