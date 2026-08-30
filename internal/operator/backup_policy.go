@@ -227,6 +227,15 @@ func (r *BackupPolicyReconciler) setBarrierHealthy(pol *pgshardv1alpha1.PgShardB
 		return
 	}
 	cond := metav1.Condition{Type: ConditionBarrierHealthy, Status: metav1.ConditionUnknown, Reason: "NotFiredYet", Message: "no scheduled barrier has run yet", ObservedGeneration: pol.Generation}
+	// The scheduler's record of the last tick is in memory, so a restarted
+	// operator has none -- but the outcome it wrote is still on the object.
+	// Keeping it is the difference between "the last barrier failed" and
+	// "nothing is known", which is what an operator restart used to turn a
+	// failure into.
+	if prev := meta.FindStatusCondition(pol.Status.Conditions, ConditionBarrierHealthy); prev != nil && prev.Reason != "NotFiredYet" {
+		cond = *prev
+		cond.ObservedGeneration = pol.Generation
+	}
 	if last, ok := r.Scheduler.LastBarrier(client.ObjectKeyFromObject(pol)); ok {
 		cond.Status, cond.Reason = metav1.ConditionTrue, "Recorded"
 		cond.Message = fmt.Sprintf("barrier tick at %s reached every bound cluster", last.At.UTC().Format(time.RFC3339))
@@ -234,6 +243,7 @@ func (r *BackupPolicyReconciler) setBarrierHealthy(pol *pgshardv1alpha1.PgShardB
 			cond.Status, cond.Reason = metav1.ConditionFalse, "BarrierFailed"
 			cond.Message = fmt.Sprintf("barrier tick at %s: %s", last.At.UTC().Format(time.RFC3339), last.Error)
 		}
+		cond.ObservedGeneration = pol.Generation
 	}
 	meta.SetStatusCondition(&pol.Status.Conditions, cond)
 }
