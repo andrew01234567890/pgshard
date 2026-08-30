@@ -221,7 +221,13 @@ func (c *Copier) Pass(ctx context.Context) (CopyOutcome, error) {
 				}
 				continue
 			}
-			c.logger().Warn("reshard copy pass incomplete", "workflow", wf.id, "err", err)
+			if wf.cutover.stalled(c.now()) {
+				c.logger().Error("cutover step is not advancing", "workflow", wf.id, "stage", wf.stage,
+					"step", wf.cutover.Step, "since", wf.cutover.StepSince, "retries", wf.cutover.StepRetries,
+					"past_journal", wf.cutover.JournalID != "", "err", err)
+			} else {
+				c.logger().Warn("reshard copy pass incomplete", "workflow", wf.id, "err", err)
+			}
 			if serr := c.save(ctx, wf, "", err.Error()); serr != nil {
 				return out, serr
 			}

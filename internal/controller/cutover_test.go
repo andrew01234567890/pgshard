@@ -781,3 +781,48 @@ func TestAConfiguredPauseIsRecordedWithItsOwnClock(t *testing.T) {
 		t.Fatalf("a workflow let through still reports a pause: %+v", h.wf.cutover)
 	}
 }
+
+// TestAStalledPostJournalStepSaysSoInTheCatalog: after the journal a step
+// is retried without a timeout or an attempt limit, and the pass that fails
+// used to save nothing, so the workflow read as recently updated and
+// perfectly healthy while writes stayed fenced.
+func TestAStalledPostJournalStepSaysSoInTheCatalog(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.c.CutoverTimeout = time.Second
+	h.runUntil(t, StageSwitching)
+	h.ops.fail[StepFlip] = errors.New("catalog down")
+
+	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); err == nil {
+		t.Fatal("a failing flip must still report the error")
+	}
+	if h.wf.cutover.StepRetries != 1 {
+		t.Fatalf("retries = %d, want the failed pass counted", h.wf.cutover.StepRetries)
+	}
+	last := h.store.saves[len(h.store.saves)-1]
+	if !strings.Contains(last, "step flip failed 1 time(s)") || !strings.Contains(last, "catalog down") {
+		t.Fatalf("a failed post-journal pass must say so in the status: %q", last)
+	}
+	if h.wf.cutover.stalled(h.clock) {
+		t.Fatal("a step that just failed once is not stalled yet")
+	}
+
+	h.clock = h.clock.Add(stalledAfter)
+	h.ops.fail[StepFlip] = errors.New("catalog down")
+	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); err == nil {
+		t.Fatal("a failing flip must still report the error")
+	}
+	if !h.wf.cutover.stalled(h.clock) {
+		t.Fatal("a step failing for the whole stall window is stalled")
+	}
+	last = h.store.saves[len(h.store.saves)-1]
+	if !strings.Contains(last, "has not advanced for") || !strings.Contains(last, "step flip failed 2 time(s)") {
+		t.Fatalf("a stalled step must report its age and its retries: %q", last)
+	}
+
+	// Advancing resets both: the next step's age is its own.
+	h.clock = h.clock.Add(time.Minute)
+	h.runUntil(t, StageSwitched)
+	if h.wf.cutover.StepRetries != 0 {
+		t.Fatalf("retries = %d after the step advanced", h.wf.cutover.StepRetries)
+	}
+}
