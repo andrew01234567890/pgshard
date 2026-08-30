@@ -443,9 +443,7 @@ func (r *ClusterReconciler) failover(ctx context.Context, c *pgshardv1alpha1.PgS
 	// the pause, and the agent rewrote postgresql.auto.conf on its way up.
 	// Reapply it from the fence before the new primary is labelled to serve,
 	// rather than leaving the gap for the next reconcile to close.
-	if err := r.pauseIfFenced(ctx, c, g, HostDSN(members[candidate].ip, password), password); err != nil {
-		return state, err
-	}
+	r.pauseIfFenced(ctx, c, g, HostDSN(members[candidate].ip, password), password)
 	if err := r.patchRole(ctx, members[candidate].pod, RolePrimary); err != nil {
 		return state, err
 	}
@@ -470,22 +468,28 @@ func (r *ClusterReconciler) failover(ctx context.Context, c *pgshardv1alpha1.PgS
 // pauseIfFenced makes a primary refuse writes when the catalog write fence
 // is raised, so a group that changes primary during a barrier comes back
 // holding still rather than serving writes the barrier believes are stopped.
-func (r *ClusterReconciler) pauseIfFenced(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, dsn, password string) error {
+func (r *ClusterReconciler) pauseIfFenced(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, dsn, password string) {
+	log := logf.FromContext(ctx)
 	if g.Kind != "shard" {
-		return nil
+		return
 	}
+	// A promotion is never held up by this. Failing over is what keeps the
+	// shard serving at all, and a barrier certifies that every shard is
+	// still refusing writes before it records anything, so a primary that
+	// comes up unpaused fails the barrier rather than corrupting its point.
 	fenced, err := r.Prober.WriteFenced(ctx, DSN(Groups(c)[0].ServiceRW(), c.Namespace, password))
 	if err != nil {
-		return fmt.Errorf("read the write fence: %w", err)
+		log.Info("could not read the write fence while promoting; continuing", "group", g.Name(), "err", err)
+		return
 	}
 	if !fenced {
-		return nil
+		return
 	}
 	if err := r.Prober.PauseWrites(ctx, dsn); err != nil {
-		return fmt.Errorf("pause the promoted primary: %w", err)
+		log.Error(err, "promoted under a raised write fence but could not pause the new primary", "group", g.Name())
+		return
 	}
-	logf.FromContext(ctx).Info("promoted under a raised write fence; the new primary refuses writes", "group", g.Name())
-	return nil
+	log.Info("promoted under a raised write fence; the new primary refuses writes", "group", g.Name())
 }
 
 // quiesce waits until the old primary no longer answers as a running primary

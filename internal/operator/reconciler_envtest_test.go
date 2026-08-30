@@ -85,6 +85,7 @@ type fakeProber struct {
 	// fenced is the catalog write fence the operator reads; paused records
 	// the DSNs it made refuse writes, and pausedDSN those already paused.
 	fenced    bool
+	fenceErr  error
 	paused    []string
 	pausedDSN map[string]bool
 	migrated  int
@@ -528,7 +529,7 @@ func (f *fakeProber) PauseWrites(_ context.Context, dsn string) error {
 func (f *fakeProber) WriteFenced(context.Context, string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.fenced, nil
+	return f.fenced, f.fenceErr
 }
 
 func (f *fakeProber) MigrateCatalog(context.Context, string) error {

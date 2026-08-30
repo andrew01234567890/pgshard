@@ -568,3 +568,43 @@ func TestAPrimaryThatLostThePauseGetsItBack(t *testing.T) {
 		t.Fatalf("a primary already refusing writes must not be paused again: %v", fp.paused)
 	}
 }
+
+// TestTheWritePauseNeverStallsAGroup: the fence lives in the catalog
+// group, which is itself rebuilt member by member on a storage-class
+// change. A group that stopped rolling out, or a failover that refused to
+// promote, because the catalog was briefly unreadable would be waiting on
+// the very thing it is waiting for -- and an unpaused primary fails the
+// barrier's certification rather than spoiling its point.
+func TestTheWritePauseNeverStallsAGroup(t *testing.T) {
+	r, fp, fa, c := healthyCluster(t, "fr")
+	fp.fenceErr = errors.New("catalog unreachable")
+
+	fp.mu.Lock()
+	fp.slots = nil
+	fp.mu.Unlock()
+	reconcile(t, r, c)
+	fp.mu.Lock()
+	shardSlots := 0
+	for _, s := range fp.slots {
+		if strings.Contains(s, "fr-shard-0") {
+			shardSlots++
+		}
+	}
+	fp.mu.Unlock()
+	if shardSlots == 0 {
+		t.Fatalf("the shard pass stopped at the fence read, so the group cannot roll out: %v", fp.slots)
+	}
+
+	deletePod(t, "fr-shard-0-0")
+	fa.set(podIP(1, 0), AgentStatus{}, errors.New("connection refused"))
+	fp.standbys[podIP(1, 1)] = StandbyState{InRecovery: true, FlushLSN: 100}
+	fp.standbys[podIP(1, 2)] = StandbyState{InRecovery: true, FlushLSN: 200}
+	fp.err = errors.New("no primary")
+	reconcile(t, r, c)
+	if len(fa.promotes) != 1 {
+		t.Fatalf("an unreadable fence must not stop a promotion: %v", fa.promotes)
+	}
+	if got := podRole(t, "fr-shard-0-2"); got != RolePrimary {
+		t.Fatalf("the promoted member never took the primary label: %q", got)
+	}
+}
