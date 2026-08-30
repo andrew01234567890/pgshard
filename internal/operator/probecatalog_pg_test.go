@@ -32,12 +32,22 @@ type catalogNode struct {
 // both through published ports.
 func startCatalogPair(t *testing.T, image string) (src, tgt catalogNode) {
 	t.Helper()
+	return startCatalogPairAcross(t, image, image)
+}
+
+// startCatalogPairAcross is startCatalogPair with a different major on each
+// side, which is what a real catalog upgrade is: the old group publishes and
+// the new one subscribes.
+func startCatalogPairAcross(t *testing.T, srcImage, tgtImage string) (src, tgt catalogNode) {
+	t.Helper()
 	if err := exec.Command("docker", "info").Run(); err != nil {
 		dockertest.Unavailable(t, "docker unavailable")
 	}
-	if exec.Command("docker", "image", "inspect", image).Run() != nil {
-		if out, err := exec.Command("docker", "pull", image).CombinedOutput(); err != nil {
-			dockertest.Unavailable(t, "image %s unavailable: %v: %s", image, err, out)
+	for _, image := range []string{srcImage, tgtImage} {
+		if exec.Command("docker", "image", "inspect", image).Run() != nil {
+			if out, err := exec.Command("docker", "pull", image).CombinedOutput(); err != nil {
+				dockertest.Unavailable(t, "image %s unavailable: %v: %s", image, err, out)
+			}
 		}
 	}
 	net := fmt.Sprintf("pgshard-catupg-%d", time.Now().UnixNano())
@@ -46,7 +56,7 @@ func startCatalogPair(t *testing.T, image string) (src, tgt catalogNode) {
 	}
 	t.Cleanup(func() { _ = exec.Command("docker", "network", "rm", net).Run() })
 
-	start := func(name string) catalogNode {
+	start := func(name, image string) catalogNode {
 		out, err := exec.Command("docker", "run", "-d", "--rm", "--network", net, "--name", name,
 			"-p", "127.0.0.1::5432", "--entrypoint", "sh", image, "-ec",
 			`initdb -D /tmp/pgdata --auth=trust -U postgres --no-sync >/dev/null &&
@@ -81,7 +91,7 @@ func startCatalogPair(t *testing.T, image string) (src, tgt catalogNode) {
 		return catalogNode{}
 	}
 	base := fmt.Sprintf("catupg-%d", time.Now().UnixNano())
-	return start(base + "-src"), start(base + "-tgt")
+	return start(base+"-src", srcImage), start(base+"-tgt", tgtImage)
 }
 
 // TestCatalogUpgradeCycleOnPostgres drives the SQL the operator's envtests
@@ -101,9 +111,30 @@ func TestCatalogUpgradeCycleOnPostgres(t *testing.T) {
 	}
 }
 
+// TestCatalogUpgradeAcrossMajorsOnPostgres is the pair the upgrade actually
+// runs: an 18 catalog publishing to a 19 one. The same-major cases above
+// prove the mechanics; this proves they hold when the two sides are not the
+// same server version, which is the only configuration a real catalog
+// upgrade ever has.
+//
+// The e2e upgrade suite does not cover it: it rolls back before the catalog
+// upgrade begins, so catalog rollback across majors was never exercised
+// anywhere.
+func TestCatalogUpgradeAcrossMajorsOnPostgres(t *testing.T) {
+	ctx := context.Background()
+	src, tgt := startCatalogPairAcross(t,
+		"ghcr.io/andrew01234567890/pgshard-postgres:18",
+		"ghcr.io/andrew01234567890/pgshard-postgres:19")
+	runCatalogUpgradeCycle(ctx, t, src, tgt)
+}
+
 func testCatalogUpgradeCycle(t *testing.T, image string) {
 	ctx := context.Background()
 	src, tgt := startCatalogPair(t, image)
+	runCatalogUpgradeCycle(ctx, t, src, tgt)
+}
+
+func runCatalogUpgradeCycle(ctx context.Context, t *testing.T, src, tgt catalogNode) {
 	for _, n := range []catalogNode{src, tgt} {
 		conn := dialCatalog(t, n.side.DSN)
 		err := catalog.Migrate(ctx, conn)
