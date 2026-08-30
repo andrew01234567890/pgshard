@@ -503,9 +503,17 @@ message MaterializeSchemaRequest {
   string source_conninfo = 1;
   // Database name on both sides.
   string database = 2;
+  // Epoch the caller believes this member is serving at, as every other
+  // mutating call carries. A copy can outlive a failover of its target, so
+  // without it the schema can land on a member that stopped being the
+  // primary while it ran. Optional on the wire so that an absent epoch is
+  // distinguishable from epoch zero, and refused rather than assumed.
+  optional uint64 epoch = 3;
 }
 
 // MaterializeSchemaResponse reports the outcome.
 message MaterializeSchemaResponse {
   Error error = 1;
+  // Epoch the member is serving at now.
+  uint64 epoch = 2;
 }

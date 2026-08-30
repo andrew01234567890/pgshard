@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"google.golang.org/protobuf/proto"
+
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 )
 
@@ -27,7 +29,7 @@ func TestMaterializeSchemaRunsDumpIntoPsql(t *testing.T) {
 		}
 	}
 	srv := NewServer(in, in.epoch, nil, in.log, nil)
-	resp, err := srv.MaterializeSchema(context.Background(), &pgshardv1.MaterializeSchemaRequest{SourceConninfo: "host=src dbname=app", Database: "app"})
+	resp, err := srv.MaterializeSchema(context.Background(), &pgshardv1.MaterializeSchemaRequest{SourceConninfo: "host=src dbname=app", Database: "app", Epoch: proto.Uint64(in.epoch.Current())})
 	if err != nil || resp.GetError() != nil {
 		t.Fatalf("MaterializeSchema: %v %v", err, resp.GetError())
 	}
@@ -43,14 +45,41 @@ func TestMaterializeSchemaRunsDumpIntoPsql(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(in.sup.binDir, "psql"), []byte("#!/bin/sh\necho 'ERROR: relation exists' >&2\nexit 3\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	resp, err = srv.MaterializeSchema(context.Background(), &pgshardv1.MaterializeSchemaRequest{SourceConninfo: "host=src dbname=app", Database: "app"})
+	resp, err = srv.MaterializeSchema(context.Background(), &pgshardv1.MaterializeSchemaRequest{SourceConninfo: "host=src dbname=app", Database: "app", Epoch: proto.Uint64(in.epoch.Current())})
 	if err != nil || resp.GetError() == nil || !strings.Contains(resp.GetError().GetMessage(), "psql: ") || !strings.Contains(resp.GetError().GetMessage(), "relation exists") {
 		t.Fatalf("psql failure must be reported: %v %v", err, resp.GetError())
 	}
 	for _, bad := range []string{"", "app db", "a'b", "app\ndb", "app\tdb"} {
-		resp, err = srv.MaterializeSchema(context.Background(), &pgshardv1.MaterializeSchemaRequest{SourceConninfo: "host=src", Database: bad})
+		resp, err = srv.MaterializeSchema(context.Background(), &pgshardv1.MaterializeSchemaRequest{SourceConninfo: "host=src", Database: bad, Epoch: proto.Uint64(in.epoch.Current())})
 		if err != nil || resp.GetError() == nil || !strings.Contains(resp.GetError().GetMessage(), "invalid database name") {
 			t.Fatalf("database %q: %v %v", bad, err, resp.GetError())
 		}
+	}
+}
+
+// TestMaterializeSchemaProvesItIsTalkingToThePrimary: a schema copy can
+// outlive a failover of its own target, so it must prove the member is
+// still the one serving before it starts -- as every other mutating call
+// does. It used to carry no epoch at all, and would happily write the
+// schema onto a member that had stopped being the primary while it ran.
+func TestMaterializeSchemaProvesItIsTalkingToThePrimary(t *testing.T) {
+	in := newTestInstance(t)
+	srv := NewServer(in, in.epoch, nil, in.log, nil)
+	ctx := context.Background()
+
+	// No epoch at all: refused rather than read as zero, because a caller
+	// that does not name an epoch cannot be shown to mean this member.
+	resp, err := srv.MaterializeSchema(ctx, &pgshardv1.MaterializeSchemaRequest{SourceConninfo: "host=src", Database: "app"})
+	if err != nil || resp.GetError() == nil || !strings.Contains(resp.GetError().GetMessage(), "no epoch") {
+		t.Fatalf("a request with no epoch: %v %v", err, resp.GetError())
+	}
+
+	// An epoch that is not this member's: refused.
+	resp, err = srv.MaterializeSchema(ctx, &pgshardv1.MaterializeSchemaRequest{SourceConninfo: "host=src", Database: "app", Epoch: proto.Uint64(in.epoch.Current() + 1)})
+	if err != nil || resp.GetError() == nil {
+		t.Fatalf("a request naming another epoch: %v %v", err, resp.GetError())
+	}
+	if resp.GetEpoch() != in.epoch.Current() {
+		t.Fatalf("the response reported epoch %d, want the member's own %d", resp.GetEpoch(), in.epoch.Current())
 	}
 }

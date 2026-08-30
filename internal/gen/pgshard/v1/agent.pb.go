@@ -3264,7 +3264,13 @@ type MaterializeSchemaRequest struct {
 	// libpq connection string of the source database.
 	SourceConninfo string `protobuf:"bytes,1,opt,name=source_conninfo,json=sourceConninfo,proto3" json:"source_conninfo,omitempty"`
 	// Database name on both sides.
-	Database      string `protobuf:"bytes,2,opt,name=database,proto3" json:"database,omitempty"`
+	Database string `protobuf:"bytes,2,opt,name=database,proto3" json:"database,omitempty"`
+	// Epoch the caller believes this member is serving at, as every other
+	// mutating call carries. A copy can outlive a failover of its target, so
+	// without it the schema can land on a member that stopped being the
+	// primary while it ran. Optional on the wire so that an absent epoch is
+	// distinguishable from epoch zero, and refused rather than assumed.
+	Epoch         *uint64 `protobuf:"varint,3,opt,name=epoch,proto3,oneof" json:"epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3313,10 +3319,19 @@ func (x *MaterializeSchemaRequest) GetDatabase() string {
 	return ""
 }
 
+func (x *MaterializeSchemaRequest) GetEpoch() uint64 {
+	if x != nil && x.Epoch != nil {
+		return *x.Epoch
+	}
+	return 0
+}
+
 // MaterializeSchemaResponse reports the outcome.
 type MaterializeSchemaResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Error         *Error                 `protobuf:"bytes,1,opt,name=error,proto3" json:"error,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Error *Error                 `protobuf:"bytes,1,opt,name=error,proto3" json:"error,omitempty"`
+	// Epoch the member is serving at now.
+	Epoch         uint64 `protobuf:"varint,2,opt,name=epoch,proto3" json:"epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3356,6 +3371,13 @@ func (x *MaterializeSchemaResponse) GetError() *Error {
 		return x.Error
 	}
 	return nil
+}
+
+func (x *MaterializeSchemaResponse) GetEpoch() uint64 {
+	if x != nil {
+		return x.Epoch
+	}
+	return 0
 }
 
 var File_pgshard_v1_agent_proto protoreflect.FileDescriptor
@@ -3591,12 +3613,15 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\x06reason\x18\x03 \x01(\tR\x06reason\"V\n" +
 	"\x15SetWriteFenceResponse\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12'\n" +
-	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"_\n" +
+	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"\x84\x01\n" +
 	"\x18MaterializeSchemaRequest\x12'\n" +
 	"\x0fsource_conninfo\x18\x01 \x01(\tR\x0esourceConninfo\x12\x1a\n" +
-	"\bdatabase\x18\x02 \x01(\tR\bdatabase\"D\n" +
+	"\bdatabase\x18\x02 \x01(\tR\bdatabase\x12\x19\n" +
+	"\x05epoch\x18\x03 \x01(\x04H\x00R\x05epoch\x88\x01\x01B\b\n" +
+	"\x06_epoch\"Z\n" +
 	"\x19MaterializeSchemaResponse\x12'\n" +
-	"\x05error\x18\x01 \x01(\v2\x11.pgshard.v1.ErrorR\x05error*T\n" +
+	"\x05error\x18\x01 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\x12\x14\n" +
+	"\x05epoch\x18\x02 \x01(\x04R\x05epoch*T\n" +
 	"\bSlotKind\x12\x19\n" +
 	"\x15SLOT_KIND_UNSPECIFIED\x10\x00\x12\x16\n" +
 	"\x12SLOT_KIND_PHYSICAL\x10\x01\x12\x15\n" +
@@ -3798,6 +3823,7 @@ func file_pgshard_v1_agent_proto_init() {
 		return
 	}
 	file_pgshard_v1_common_proto_init()
+	file_pgshard_v1_agent_proto_msgTypes[48].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
