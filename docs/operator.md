@@ -41,6 +41,27 @@ Plaintext is never a fallback: without a `secretRef` the spec must set
 `spec.internalTLS.insecure: true` (unsupported outside development, and only
 tolerable behind a NetworkPolicy restricting port 9091 to router pods) or
 the API server rejects the cluster.
+
+**Upgrading a cluster made before this rule.** `spec.internalTLS` is
+required, so a manifest that predates it stops applying the moment the new
+CRD is installed -- and a GitOps controller reapplying it will report the
+rejection rather than drift. A cluster already running keeps running; it is
+the next apply that fails. Add one of the two to the manifest before or with
+the CRD upgrade:
+
+```yaml
+spec:
+  internalTLS:
+    secretRef: {name: demo-internal-tls}   # or: insecure: true
+```
+
+The same applies to the two other required-unless-you-say-otherwise rules
+this project has adopted since: `spec.networkPolicy.clients` when the policy
+is enabled (see [Network policy](#network-policy)) and
+`objectStore.encryption.secretRef` on a remote backup repository (see
+[backup.md](backup.md#encryption)). Each rejects on write rather than
+changing what a running cluster does, and each has an explicit opt-out for
+the case where the plain thing is what was wanted.
 `pg_hba.conf` admits only the control plane over TCP: the superuser, and
 `pgshard_router` for the router's catalog connection, which exists only
 where the catalog schema does. Everything else is rejected, so an
