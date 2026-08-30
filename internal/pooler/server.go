@@ -183,7 +183,7 @@ func (s *Server) attachSession(id, role, database string, cred [32]byte) (*sessi
 			"session %s was released after %s without an Execute stream and its transaction was rolled back", id, s.cfg.ReserveTimeout)
 	}
 	if se.attached {
-		return nil, status.Error(codes.FailedPrecondition, "session already has an Execute stream")
+		return nil, reasoned(status.New(codes.FailedPrecondition, "session already has an Execute stream"), ReasonSessionAttached)
 	}
 	if database == "" {
 		database = s.cfg.Database

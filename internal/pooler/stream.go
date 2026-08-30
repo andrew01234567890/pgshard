@@ -43,9 +43,30 @@ func positionGone(err *pgconn.PgError) bool {
 	return strings.Contains(err.Message, "has already been removed")
 }
 
-// ReasonPositionTooOld is the ErrorInfo reason attached when replication
-// cannot start from the requested position (the slot or WAL is gone).
-const ReasonPositionTooOld = "POSITION_TOO_OLD"
+// Reasons the pooler attaches as structured ErrorInfo. A caller deciding
+// whether to retry reads these; the message beside them is for a person,
+// and rewording it must not change what a router does.
+const (
+	// ReasonPositionTooOld: replication cannot start from the requested
+	// position, because the slot or the WAL is gone.
+	ReasonPositionTooOld = "POSITION_TOO_OLD"
+	// ReasonSessionAttached: the session already has an Execute stream.
+	// The router's previous stream is on its way out, so this is a race to
+	// wait through rather than a failure to report.
+	ReasonSessionAttached = "SESSION_ALREADY_ATTACHED"
+	// ReasonReaderActive: another reader holds the slot. A consumer
+	// retries; it is not a position it can do anything about.
+	ReasonReaderActive = "SLOT_READER_ACTIVE"
+)
+
+// reasoned attaches a structured reason to st, returning st unchanged if
+// the detail cannot be attached.
+func reasoned(st *status.Status, reason string) error {
+	if detailed, err := st.WithDetails(&errdetails.ErrorInfo{Reason: reason, Domain: ErrorDomain}); err == nil {
+		return detailed.Err()
+	}
+	return st.Err()
+}
 
 // StreamConfig wires the change-stream RPCs of a Server.
 type StreamConfig struct {
@@ -116,7 +137,7 @@ func (s *Server) claimSlot(slot string) (*streamReader, error) {
 		s.readers = map[string]*streamReader{}
 	}
 	if _, busy := s.readers[slot]; busy {
-		return nil, status.Errorf(codes.FailedPrecondition, "slot %s already has an active reader", slot)
+		return nil, reasoned(status.Newf(codes.FailedPrecondition, "slot %s already has an active reader", slot), ReasonReaderActive)
 	}
 	r := &streamReader{wake: make(chan struct{}, 1)}
 	s.readers[slot] = r
@@ -247,9 +268,7 @@ func (s *Server) runStream(ctx context.Context, req *pgshardv1.StreamRequest, em
 			// permission error or a bad option costs a full re-snapshot for
 			// a configuration mistake.
 			if positionGone(pgErr) {
-				if detailed, derr := st.WithDetails(&errdetails.ErrorInfo{Reason: ReasonPositionTooOld, Domain: ErrorDomain}); derr == nil {
-					st = detailed
-				}
+				return reasoned(st, ReasonPositionTooOld)
 			}
 			return st.Err()
 		}
