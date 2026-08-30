@@ -179,8 +179,11 @@ SELECT label FROM (
 // snapshots to reload before any hidden column exists.
 func (a *Applier) recordRewriteColumns(ctx context.Context, m *catalog.DDLMigration) error {
 	rw := m.Meta.Rewrite
-	if len(rw.Columns) > 0 {
+	if rw.Settled {
 		return nil
+	}
+	if len(rw.Columns) > 0 {
+		return a.settleColumns(ctx, m)
 	}
 	keys := sortedShardKeys(m.PerShard)
 	if len(keys) == 0 {
@@ -232,6 +235,17 @@ func (a *Applier) recordRewriteColumns(ctx context.Context, m *catalog.DDLMigrat
 	if err := a.Store.SaveMeta(ctx, m.ID, m.Meta); err != nil {
 		return err
 	}
+	return a.settleColumns(ctx, m)
+}
+
+// settleColumns waits for every router to reload the column list, then
+// records that the wait finished. A migration resumed before that record
+// waits again from the beginning rather than skipping the wait: the crash
+// may have interrupted it, and the applier cannot tell how much of it had
+// run. Waiting a whole window again costs one window on a resume that had
+// already served it out, which is nothing against a rewrite of a table
+// large enough to need one.
+func (a *Applier) settleColumns(ctx context.Context, m *catalog.DDLMigration) error {
 	settle := a.RewriteSettle
 	if settle == 0 {
 		settle = DefaultRewriteSettle
@@ -241,7 +255,8 @@ func (a *Applier) recordRewriteColumns(ctx context.Context, m *catalog.DDLMigrat
 			return err
 		}
 	}
-	return nil
+	m.Meta.Rewrite.Settled = true
+	return a.Store.SaveMeta(ctx, m.ID, m.Meta)
 }
 
 // rewritePhase runs one phase of the rewrite on one shard.

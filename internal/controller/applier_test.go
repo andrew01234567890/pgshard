@@ -1216,6 +1216,11 @@ func TestApplierResumedDropUnderExistingScopeCountsAMissingObjectSkipped(t *test
 	if m.State != catalog.MigrationFailed {
 		t.Fatalf("no shard had the object but the migration ended %s %s", m.State, states(m))
 	}
+	// The operator reading this failure has to know the drop may have run:
+	// a resumed DROP cannot tell "we dropped it" from "it was never here".
+	if !strings.Contains(m.Error, "completed before it crashed") {
+		t.Fatalf("the failure does not say the drop may have happened: %q", m.Error)
+	}
 
 	f.shards.exec = nil
 	id = f.queue(resumed())
