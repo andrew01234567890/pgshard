@@ -63,7 +63,23 @@ func (c *RoleCache) Lookup(ctx context.Context, user string) (string, error) {
 		return "", err
 	}
 	if cred, ok := cur.roles.Cred(user); ok {
-		return c.admit(user, cred)
+		verifier, refusal := c.admit(user, cred)
+		if refusal == nil {
+			return verifier, nil
+		}
+		// The cached entry refuses, and it may simply be old: a password
+		// renewed or a role re-enabled a moment ago looks exactly like
+		// this until the ttl comes round. Read the catalog again -- bounded
+		// the way a miss is, so a caller hammering a disabled role cannot
+		// ask for more than one reload per ttl -- and answer from what
+		// comes back.
+		if fresh, rerr := c.reloadForMiss(ctx); rerr == nil && fresh != nil {
+			if cred, ok := fresh.roles.Cred(user); ok {
+				return c.admit(user, cred)
+			}
+			return "", ErrUnknownRole
+		}
+		return verifier, refusal
 	}
 	cur, err = c.reloadForMiss(ctx)
 	if err != nil {
@@ -106,14 +122,18 @@ func (c *RoleCache) reloadForMiss(ctx context.Context) (*rolesAt, error) {
 	return c.loadLocked(ctx)
 }
 
-// admit refuses roles that must not log in; the 28000 error is relayed to
-// the client as-is instead of the mock SCRAM exchange for unknown roles.
+// admit refuses roles that must not log in. The verifier comes back with
+// the refusal so the SCRAM exchange still runs: answering "role %q is not
+// permitted to log in" before the client has proved anything tells an
+// unauthenticated caller that the role exists, while an unknown role gets
+// the mock exchange. PostgreSQL draws the same distinction only after
+// authentication.
 func (c *RoleCache) admit(user string, cred snapshot.RoleCred) (string, error) {
 	if !cred.CanLogin {
-		return "", pgwire.Errorf(pgwire.CodeInvalidAuthorization, "role %q is not permitted to log in", user)
+		return cred.Verifier, pgwire.Errorf(pgwire.CodeInvalidAuthorization, "role %q is not permitted to log in", user)
 	}
 	if cred.ValidUntil != nil && !c.now().Before(*cred.ValidUntil) {
-		return "", pgwire.Errorf(pgwire.CodeInvalidAuthorization, "password for role %q has expired", user)
+		return cred.Verifier, pgwire.Errorf(pgwire.CodeInvalidAuthorization, "password for role %q has expired", user)
 	}
 	return cred.Verifier, nil
 }

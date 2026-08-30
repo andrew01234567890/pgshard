@@ -516,3 +516,35 @@ func TestResolverSweepContinuesPastGonePreparedXact(t *testing.T) {
 		t.Fatalf("shard 0 values %v", got)
 	}
 }
+
+// TestAFinishedDecisionIsPrunedBeforeItsXidFreezes: a decision row that
+// outlives the transaction it decided becomes unverifiable once its
+// transaction id freezes past the clog horizon, and a restore then fences
+// a cluster that is perfectly consistent. The router deletes the row when
+// it finishes the commit itself; this is the other path, where that delete
+// never happened and nothing holds the transaction any more.
+func TestAFinishedDecisionIsPrunedBeforeItsXidFreezes(t *testing.T) {
+	parallelPG(t)
+	f := newResolverFixture(t)
+	ctx := context.Background()
+
+	// Committed everywhere and no longer prepared anywhere: exactly what a
+	// row looks like when the coordinator died between COMMIT PREPARED and
+	// deleting it.
+	f.decide("pgshard-finished-1", "commit", time.Hour, 0, 1)
+	f.decide("pgshard-finished-2", "abort", time.Hour, 1)
+	if got := f.decisions(); len(got) != 2 {
+		t.Fatalf("decisions before the pass: %v", got)
+	}
+
+	out, err := f.res.Resolve(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Unresolved != 0 {
+		t.Fatalf("outcome %+v, want the rows settled", out)
+	}
+	if got := f.decisions(); len(got) != 0 {
+		t.Fatalf("decision rows left to freeze: %v", got)
+	}
+}

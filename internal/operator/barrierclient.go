@@ -47,12 +47,11 @@ const (
 )
 
 // ListPrepared calls Agent.ListPreparedTransactions.
-func (c GRPCAgentClient) ListPrepared(ctx context.Context, addr string) (map[string]string, error) {
-	conn, cl, err := c.dial(ctx, addr)
+func (c *GRPCAgentClient) ListPrepared(ctx context.Context, addr string) (map[string]string, error) {
+	cl, err := c.dial(ctx, addr)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = conn.Close() }()
 	ctx, cancel := context.WithTimeout(ctx, twopcListTimeout)
 	defer cancel()
 	resp, err := cl.ListPreparedTransactions(ctx, &pgshardv1.ListPreparedTransactionsRequest{})
@@ -70,12 +69,11 @@ func (c GRPCAgentClient) ListPrepared(ctx context.Context, addr string) (map[str
 }
 
 // ListTransactionDecisions calls Agent.ListTransactionDecisions.
-func (c GRPCAgentClient) ListTransactionDecisions(ctx context.Context, addr string) ([]twopc.Decision, error) {
-	conn, cl, err := c.dial(ctx, addr)
+func (c *GRPCAgentClient) ListTransactionDecisions(ctx context.Context, addr string) ([]twopc.Decision, error) {
+	cl, err := c.dial(ctx, addr)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = conn.Close() }()
 	ctx, cancel := context.WithTimeout(ctx, twopcListTimeout)
 	defer cancel()
 	resp, err := cl.ListTransactionDecisions(ctx, &pgshardv1.ListTransactionDecisionsRequest{})
@@ -93,12 +91,11 @@ func (c GRPCAgentClient) ListTransactionDecisions(ctx context.Context, addr stri
 }
 
 // ReconcilePrepared calls Agent.ReconcilePreparedTransactions.
-func (c GRPCAgentClient) ReconcilePrepared(ctx context.Context, addr string, epoch uint64, shardID int32, decisions []twopc.Decision) (twopc.Outcome, error) {
-	conn, cl, err := c.dial(ctx, addr)
+func (c *GRPCAgentClient) ReconcilePrepared(ctx context.Context, addr string, epoch uint64, shardID int32, decisions []twopc.Decision) (twopc.Outcome, error) {
+	cl, err := c.dial(ctx, addr)
 	if err != nil {
 		return twopc.Outcome{}, err
 	}
-	defer func() { _ = conn.Close() }()
 	req := &pgshardv1.ReconcilePreparedTransactionsRequest{Epoch: epoch, ShardId: shardID}
 	for _, d := range decisions {
 		req.Decisions = append(req.Decisions, &pgshardv1.TransactionDecision{Gid: d.GID, State: d.State, Participants: d.Participants, ParticipantXids: d.ParticipantXIDs})
@@ -117,12 +114,11 @@ func (c GRPCAgentClient) ReconcilePrepared(ctx context.Context, addr string, epo
 }
 
 // SetWriteFence calls Agent.SetWriteFence.
-func (c GRPCAgentClient) SetWriteFence(ctx context.Context, addr string, epoch uint64, active bool, reason string) error {
-	conn, cl, err := c.dial(ctx, addr)
+func (c *GRPCAgentClient) SetWriteFence(ctx context.Context, addr string, epoch uint64, active bool, reason string) error {
+	cl, err := c.dial(ctx, addr)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = conn.Close() }()
 	ctx, cancel := context.WithTimeout(ctx, twopcFenceTimeout)
 	defer cancel()
 	resp, err := cl.SetWriteFence(ctx, &pgshardv1.SetWriteFenceRequest{Epoch: epoch, Active: active, Reason: reason})
@@ -184,7 +180,6 @@ func (c GRPCBarrierClient) CreateBarrier(ctx context.Context, addr, name string)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = conn.Close() }()
 	ctx, cancel := context.WithTimeout(ctx, barrierRPCTimeout)
 	defer cancel()
 	resp, err := pgshardv1.NewControllerClient(conn).CreateBarrier(ctx, &pgshardv1.CreateBarrierRequest{Name: name})

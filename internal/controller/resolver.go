@@ -408,17 +408,7 @@ func (r *Resolver) listShards(ctx context.Context, shardSet string) ([]ShardRef,
 // the leader. Only the leader may: a pass commits and rolls back prepared
 // transactions on every group.
 func (r *Resolver) Run(ctx context.Context, interval time.Duration, leader func() bool) {
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-		if leader != nil && !leader() {
-			continue
-		}
+	runLoop(ctx, interval, leader, func() *slog.Logger { return r.Logger }, "resolver", func(ctx context.Context) {
 		out, err := r.Resolve(ctx, "")
 		if err != nil && r.Logger != nil {
 			r.Logger.Warn("resolver pass failed", "err", err)
@@ -426,8 +416,9 @@ func (r *Resolver) Run(ctx context.Context, interval time.Duration, leader func(
 		if r.Metrics != nil {
 			r.Metrics.ResolvedTxns.WithLabelValues("committed").Add(float64(out.Committed))
 			r.Metrics.ResolvedTxns.WithLabelValues("rolled_back").Add(float64(out.RolledBack))
+			r.Metrics.ResolverUnresolved.Set(float64(out.Unresolved))
 		}
-	}
+	})
 }
 
 func quoteLiteral(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }

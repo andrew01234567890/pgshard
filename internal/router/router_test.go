@@ -671,3 +671,82 @@ func TestNotificationsReachTheClient(t *testing.T) {
 		t.Fatalf("notifications %+v", got)
 	}
 }
+
+// TestOneCancelPerStatementAcrossPumps: a statement pumps more than once
+// -- the backend is acquired, the session state replayed, the transaction
+// prelude reopened, and only then the statement itself runs. The dedupe
+// used to be armed by every pump, so a cancellation seen either side of
+// one of those boundaries sent a second Cancel. The pooler cancels by
+// session, so the second lands on whatever that backend is running when it
+// arrives, which may be the next statement.
+func TestOneCancelPerStatementAcrossPumps(t *testing.T) {
+	fp := newFakePooler()
+	h := newHarnessWith(t, fp, startFakePooler(t, fp), nil)
+	conn := h.connect(t, h.dsn("app", "secret", "app"))
+	if _, err := conn.Exec(context.Background(), "select 1"); err != nil {
+		t.Fatal(err)
+	}
+	h.r.mu.Lock()
+	var e *Executor
+	for _, live := range h.r.sessions {
+		e = live
+		break
+	}
+	h.r.mu.Unlock()
+	if e == nil {
+		t.Fatal("no executor for the session")
+	}
+
+	stmt, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Every pump of one statement arms it once between them.
+	for range 4 {
+		e.beginStatement(stmt)
+		e.cancelBackend(context.Background())
+	}
+	if n := len(fp.cancelled()); n != 1 {
+		t.Errorf("one statement sent %d cancels; the pooler cancels by session, so the extras land on the next statement", n)
+	}
+
+	// The next statement is cancellable in its own right.
+	next, cancelNext := context.WithCancel(context.Background())
+	defer cancelNext()
+	e.beginStatement(next)
+	e.cancelBackend(context.Background())
+	if n := len(fp.cancelled()); n != 2 {
+		t.Errorf("after a second statement: %d cancels, want 2", n)
+	}
+}
+
+// TestReadWriteTransactionModeReachesTheShardNeutralised: the pause the
+// barrier takes is default_transaction_read_only on the primary, so what a
+// shard runs must never be a mode that turns it off. The client's statement
+// succeeds; what arrives is the cluster's own default.
+func TestReadWriteTransactionModeReachesTheShardNeutralised(t *testing.T) {
+	h := newHarness(t)
+	conn := h.connect(t, h.dsn("app", "secret", "app"))
+	ctx := context.Background()
+	for _, sql := range []string{
+		"set session characteristics as transaction read write",
+		"begin read write",
+		"commit",
+	} {
+		if _, err := conn.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	for _, q := range h.fp.ran() {
+		if strings.Contains(strings.ToUpper(q), "READ WRITE") {
+			t.Errorf("the shard ran %q, which lifts the write pause", q)
+		}
+	}
+	var sawDefault bool
+	for _, q := range h.fp.ran() {
+		if strings.Contains(strings.ToLower(q), "default_transaction_read_only = default") {
+			sawDefault = true
+		}
+	}
+	if !sawDefault {
+		t.Errorf("the shard never saw the neutralised form: %v", h.fp.ran())
+	}
+}

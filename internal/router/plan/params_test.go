@@ -348,3 +348,77 @@ func TestBarrierPauseGUCsRefused(t *testing.T) {
 		t.Fatalf("BEGIN READ ONLY refused: %v", err)
 	}
 }
+
+// TestBarrierPauseTransactionModesNeutralised: the same override spelled as
+// a transaction mode. A statement that turns transaction_read_only off is
+// the pause defeated whether it says so as a setting or as BEGIN READ WRITE,
+// but refusing it would break every client whose pool calls setReadOnly
+// (false) on the way back, so the mode is dropped and the cluster's own
+// default put back instead.
+func TestBarrierPauseTransactionModesNeutralised(t *testing.T) {
+	snap := fixture(t)
+	for sql, want := range map[string]string{
+		"begin read write":                                                                     "BEGIN",
+		"start transaction read write":                                                         "START TRANSACTION",
+		"begin isolation level read committed read write":                                      "BEGIN ISOLATION LEVEL READ COMMITTED",
+		"start transaction read write, isolation level serializable":                           "START TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+		"set transaction read write":                                                           "SET transaction_read_only = DEFAULT",
+		"set session characteristics as transaction read write":                                "SET default_transaction_read_only = DEFAULT",
+		"set local transaction read write":                                                     "SET LOCAL transaction_read_only = DEFAULT",
+		"set session characteristics as transaction isolation level read committed read write": "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED",
+	} {
+		pl, err := New().Plan(context.Background(), session(snap), sql)
+		if err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		if pl.Rewritten != want {
+			t.Errorf("%s\n rewrote to %q\n want      %q", sql, pl.Rewritten, want)
+		}
+		if strings.Contains(strings.ToUpper(pl.Rewritten), "READ WRITE") {
+			t.Errorf("%s: the rewrite still declares READ WRITE: %q", sql, pl.Rewritten)
+		}
+	}
+	// Anything that does not lift the pause is left exactly as it was.
+	for _, sql := range []string{
+		"begin",
+		"start transaction",
+		"begin read only",
+		"start transaction isolation level repeatable read read only",
+		"set session characteristics as transaction read only",
+		"set transaction read only",
+		"begin isolation level read committed",
+		"commit",
+	} {
+		pl, err := New().Plan(context.Background(), session(snap), sql)
+		if err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		if pl.Rewritten != "" {
+			t.Errorf("%s: rewritten to %q, want untouched", sql, pl.Rewritten)
+		}
+	}
+}
+
+// TestTheStatementScanRunsOncePerStatement: the set_config and hidden-name
+// checks walk every field of every node by reflection, which used to happen
+// on every planned statement. They depend on the tree alone, so a repeated
+// statement must pay for the walk once -- and must still refuse what it
+// refused, from the cached answer as from a fresh one.
+func TestTheStatementScanRunsOncePerStatement(t *testing.T) {
+	snap := fixture(t)
+	p := New()
+	ctx := context.Background()
+	const hostile = "select set_config('default_transaction_read_only', 'off', false)"
+	for i := range 3 {
+		pl, err := p.Plan(ctx, session(snap), hostile)
+		if err == nil || pl.Kind != Refuse {
+			t.Fatalf("attempt %d: expected refusal, got %+v %v", i, pl, err)
+		}
+	}
+	// And a benign statement stays benign however often it is planned.
+	for i := range 3 {
+		if _, err := p.Plan(ctx, session(snap), "select * from orders"); err != nil {
+			t.Fatalf("attempt %d: %v", i, err)
+		}
+	}
+}

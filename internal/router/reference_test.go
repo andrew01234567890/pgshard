@@ -541,3 +541,95 @@ func TestReferenceWriteWithReturningTellsTheClientNothingUntilEveryShardRan(t *t
 		t.Fatalf("the client was given %d rows before learning the write failed on shard 2", seen)
 	}
 }
+
+// TestReferenceWriteSetsUpEveryShardConcurrently pins the shape of a
+// reference write's setup: it costs a round trip, not one per shard.
+// Reserving a backend and replaying the session state used to run in a
+// sequential walk, so the setup grew with the shard count and every shard
+// already opened held its transaction while the walk reached the rest.
+func TestReferenceWriteSetsUpEveryShardConcurrently(t *testing.T) {
+	const shards = 32
+	log := &fakeDecisionLog{rows: map[string]string{}, fail: map[string]error{}}
+	h := newShardedHarnessShards(t, Config{Decisions: log, Sequences: NewSequenceAllocator(newMemBlocks(10))}, shards)
+	log.h = h
+	// The shard the session already sits on is opened before the others,
+	// so the concurrent phase is every shard but that one.
+	gate := &reserveGate{width: shards - 1}
+	for i := range h.poolers {
+		h.poolers[i].gate = gate
+		h.poolers[i].script("insert into regions (id, name) values (7, 'eu')", script{})
+	}
+	ctx := context.Background()
+	conn := h.connect(t, h.dsn())
+	// Any session setting makes the shards reserve a backend.
+	if _, err := conn.Exec(ctx, "set timezone to 'UTC'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "insert into regions (id, name) values (7, 'eu')"); err != nil {
+		t.Fatal(err)
+	}
+	th := &txnHarness{shardedHarness: h, log: log}
+	if got := th.allRan("insert into regions"); len(got) != shards {
+		t.Fatalf("the write ran on %d shards, want all %d", len(got), shards)
+	}
+	if !gate.reached() {
+		t.Errorf("no two of the %d shards were ever set up at the same time", shards)
+	}
+}
+
+// TestReferenceWriteCarriesSQLPreparedStatements: a shard opened for a
+// reference write must reach the state the session's statements need, and
+// a SQL-level PREPARE is part of that state. Preparing the shards together
+// replays it the same way the one-at-a-time walk did; without it an
+// EXECUTE on a shard the write opened finds no such statement.
+func TestReferenceWriteCarriesSQLPreparedStatements(t *testing.T) {
+	h := newRefHarness(t)
+	ctx := context.Background()
+	conn := h.connect(t, h.dsn()+"&default_query_exec_mode=simple_protocol")
+	for i := range h.poolers {
+		h.poolers[i].script("insert into regions (id, name) values (7, 'eu')", script{})
+	}
+	if _, err := conn.Exec(ctx, "prepare p1 as select 1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "insert into regions (id, name) values (7, 'eu')"); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.allRan("prepare p1"); len(got) != len(h.poolers) {
+		t.Fatalf("shards that saw the PREPARE: %v, want all %d", got, len(h.poolers))
+	}
+}
+
+// TestReferenceWriteReleasesAShardItCouldNotPrepare: preparing the shards
+// together must leave a shard that refused exactly as it found it. Aborting
+// the stream only cancels the router's side -- the pooler holds the session
+// attached and refuses a second stream -- so a shard that failed after its
+// stream opened has to be released, or the walk that follows reports a
+// stream collision instead of the refusal the client needs to see.
+func TestReferenceWriteReleasesAShardItCouldNotPrepare(t *testing.T) {
+	h := newRefHarness(t)
+	ctx := context.Background()
+	conn := h.connect(t, h.dsn()+"&default_query_exec_mode=simple_protocol")
+	for i := range h.poolers {
+		h.poolers[i].script("insert into regions (id, name) values (7, 'eu')", script{})
+	}
+	// A session setting makes every shard reserve; shard 3 then refuses.
+	if _, err := conn.Exec(ctx, "set timezone to 'UTC'"); err != nil {
+		t.Fatal(err)
+	}
+	h.poolers[3].gen = 999
+
+	_, err := conn.Exec(ctx, "insert into regions (id, name) values (7, 'eu')")
+	if err == nil {
+		t.Fatal("the write must fail: one shard refuses the session")
+	}
+	if !strings.Contains(err.Error(), "stale routing generation") {
+		t.Fatalf("the client must see the shard's refusal, got %v", err)
+	}
+	h.poolers[3].mu.Lock()
+	releases := len(h.poolers[3].releases)
+	h.poolers[3].mu.Unlock()
+	if releases == 0 {
+		t.Error("the shard that refused was never released, so its stream stays attached")
+	}
+}

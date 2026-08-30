@@ -11,11 +11,13 @@ table placement workflows and major upgrade workflows.
 ## Running
 
 ```
-pgshard-admin serve [--listen :8081] [--kubeconfig PATH] [--namespace NS] [--catalog-dsn DSN]
+pgshard-admin serve --token-file PATH [--listen :8081] [--kubeconfig PATH] [--namespace NS] [--catalog-dsn DSN]
 ```
 
 | Flag | Default | Meaning |
 |------|---------|---------|
+| `--token-file` | required | File holding the credential every route but `/healthz` requires. |
+| `--insecure-no-auth` | off | Serve to anyone who can reach the listener. Development only, and mutually exclusive with `--token-file`. |
 | `--listen` | `:8081` | HTTP listen address. |
 | `--kubeconfig` | in-cluster | Kubeconfig to use outside a pod. |
 | `--namespace` | all namespaces | Restrict the watch and the clusters list to one namespace. |
@@ -88,7 +90,10 @@ Two ways to run it in a cluster:
    `spec.admin.enabled: false` removes these objects.
 2. **Standalone.** `config/admin/` holds a Deployment, Service, ServiceAccount
    and a cluster-wide read-only ClusterRole for one instance that watches all
-   namespaces: `make deploy-admin` (override `ADMIN_IMG`).
+   namespaces: `make deploy-admin` (override `ADMIN_IMG`). That target
+   generates the Secret `pgshard-admin` if it does not exist and prints how
+   to read the token; the Deployment mounts it, so applying
+   `config/admin/deployment.yaml` on its own needs the Secret created first.
 
 Build the image with `make admin-image` or
 `docker build -f Dockerfile.control --build-arg CMD=pgshard-admin .`.
@@ -99,10 +104,28 @@ Build the image with `make admin-image` or
   the pgshard CRDs (clusters, groups, backup policies, backups, restores, reshards),
   Pods, PVCs, Services and Leases (`config/admin/rbac.yaml`; a unit test
   enforces this). Secrets are not readable.
-* There is **no authentication**. Do not expose the Service outside the
-  cluster directly; put it behind an ingress or proxy that authenticates
-  (OIDC, mTLS, VPN). The catalog DSN, if given, is a plain database credential
-  and should be a read-only role.
+* Every route but `/healthz` **requires a credential**: the token in
+  `--token-file`, sent either as `Authorization: Bearer <token>` or as the
+  password of HTTP basic auth (any user name, so a browser can be pointed at
+  the UI and log in). Without it the answer is `401` with a `Basic`
+  challenge, whatever the route. `/healthz` stays open because requiring the
+  token for it would make the credential a dependency of the pod staying up.
+
+  The operator generates the token per cluster into the Secret
+  `<cluster>-admin` (key `token`) and mounts it; read it with
+  `kubectl get secret <cluster>-admin -o jsonpath='{.data.token}' | base64 -d`.
+  It is not the superuser password: reading the admin is not being able to
+  write to PostgreSQL. `spec.admin.insecureNoAuth: true` serves the UI to
+  anything that can reach its Service, which is a development setting.
+
+  A metrics scraper needs the credential too — Prometheus takes it as
+  `bearer_token_file` or `basic_auth`.
+
+* The transport is plain HTTP inside the cluster, so the credential is only
+  as private as the pod network. Put the Service behind an ingress or proxy
+  that terminates TLS, and prefer one that authenticates in its own right
+  (OIDC, mTLS, VPN) before exposing it outside the cluster. The catalog DSN,
+  if given, is a plain database credential and should be a read-only role.
 * Every response carries a strict `Content-Security-Policy`
   (`default-src 'none'; script-src 'self'; style-src 'self'; ...`) plus
   `X-Content-Type-Options`, `X-Frame-Options: DENY` and a no-referrer policy.

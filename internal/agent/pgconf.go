@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -36,12 +37,26 @@ func RenderPostgresqlConf(c *Config, standby bool) string {
 // instance is a normal primary again.
 func RenderRecoveryConf(c *Config) string { return renderPostgresqlConf(c, false, true) }
 
+// gucName is what PostgreSQL accepts as a setting name: a letter or
+// underscore, then letters, digits, underscores and dots.
+var gucName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.]*$`)
+
 func renderPostgresqlConf(c *Config, standby, recovering bool) string {
 	set := ownedSettings(c, standby, recovering)
 	for k, v := range c.Postgres.Parameters {
-		if _, owned := set[k]; !owned {
-			set[k] = quote(v)
+		if _, owned := set[k]; owned {
+			continue
 		}
+		if !gucName.MatchString(k) {
+			// The value is quoted but the name is written as it stands, so
+			// a name carrying a newline used to write a second setting of
+			// its own -- and the CRD's guards name settings, so anything
+			// they refuse could be smuggled in behind a key they allow.
+			// A name that is not a name is dropped rather than escaped:
+			// there is no legitimate one this rejects.
+			continue
+		}
+		set[k] = quote(v)
 	}
 	keys := make([]string, 0, len(set))
 	for k := range set {
@@ -156,6 +171,11 @@ func PrimaryConninfo(c *Config) string {
 // component connects as; see instance.go, which runs initdb -U postgres.
 const superuserRole = "postgres"
 
+// routerRole mirrors catalog.RouterRole. The agent renders configuration
+// for a member and does not otherwise know the catalog schema, so the name
+// is repeated rather than imported; a test keeps them equal.
+const routerRole = "pgshard_router"
+
 // RenderPgHBAConf renders pg_hba.conf.
 func RenderPgHBAConf(c *Config) string {
 	host := "hostnossl"
@@ -187,6 +207,11 @@ func RenderPgHBAConf(c *Config) string {
 	// it was; nothing checked it had come the right way.
 	fmt.Fprintf(&b, "%-8s all             %-15s %-23s scram-sha-256\n", hostKeyword(host), superuserRole, cidr)
 	fmt.Fprintf(&b, "%-8s replication     %-15s %-23s scram-sha-256\n", hostKeyword(host), superuserRole, cidr)
+	// The router reaches the catalog as its own least-privilege role rather
+	// than as the superuser, and it does so over TCP like the rest of the
+	// control plane. The role exists only where the catalog schema does, so
+	// on a shard this line matches nothing.
+	fmt.Fprintf(&b, "%-8s all             %-15s %-23s scram-sha-256\n", hostKeyword(host), routerRole, cidr)
 	fmt.Fprintf(&b, "%-8s all             all             %-23s reject\n", hostKeyword(host), cidr)
 	if host == "hostssl" {
 		fmt.Fprintf(&b, "%-8s all             all             %-23s reject\n", "hostnossl", cidr)
@@ -201,6 +226,19 @@ func hostKeyword(h string) string {
 	return h
 }
 
+// autoConfHeader replaces whatever postgresql.auto.conf held. The control
+// plane does use ALTER SYSTEM at runtime -- the barrier pauses writes with
+// default_transaction_read_only, the operator probes the catalog the same
+// way -- and those settings live here until the agent next writes
+// configuration, which it does on bootstrap, on promotion and after a
+// restore. A setting that has to outlive any of those belongs in the
+// rendered postgresql.conf instead, or with an owner that reapplies it: the
+// write pause is held by the catalog write fence, which the operator reads
+// on every pass and before a promoted member serves.
+const autoConfHeader = "# Managed by pgshard-agent: rewritten on bootstrap, promotion and restore.\n" +
+	"# A runtime ALTER SYSTEM lasts only until then; anything that must survive\n" +
+	"# belongs in postgresql.conf, which pgshard renders.\n"
+
 // WriteConfig writes postgresql.conf and pg_hba.conf into PGDATA and clears
 // any settings a clone tool left in postgresql.auto.conf so the rendered
 // file is authoritative.
@@ -214,7 +252,7 @@ func writeConfig(c *Config, standby, recovering bool) error {
 	files := map[string]string{
 		postgresqlConf: renderPostgresqlConf(c, standby, recovering),
 		pgHBAConf:      RenderPgHBAConf(c),
-		autoConf:       "# Managed by pgshard-agent; runtime ALTER SYSTEM is not supported.\n",
+		autoConf:       autoConfHeader,
 	}
 	if c.OverrideFile != "" {
 		body, err := os.ReadFile(c.OverrideFile)

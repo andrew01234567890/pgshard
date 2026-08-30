@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -528,31 +529,37 @@ func TestDetachForgetsTheSessionBeforeANewExecuteCanReattach(t *testing.T) {
 }
 
 func TestSQLLevelPrepareIsClosedBeforeAParseAndResetsTheBackend(t *testing.T) {
-	h := startHarness(t, PoolConfig{})
-	ctx := context.Background()
-	if _, err := h.client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: "s", Generation: gen(7, 3)}); err != nil {
-		t.Fatal(err)
+	// PostgreSQL asks for no separator between a keyword and a quoted
+	// identifier or a comment, and each spelling here prepares st1.
+	for _, sql := range []string{"PREPARE st1 AS SELECT 1", `PREPARE"st1"AS SELECT 1`, "PREPARE/*st1*/st1 AS SELECT 1"} {
+		t.Run(sql, func(t *testing.T) {
+			h := startHarness(t, PoolConfig{})
+			ctx := context.Background()
+			if _, err := h.client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: "s", Generation: gen(7, 3)}); err != nil {
+				t.Fatal(err)
+			}
+			stream, _ := h.client.Execute(ctx)
+			unnamed := &pgshardv1.ExecuteRequest{SessionId: "s", Generation: gen(7, 3), User: identity("alice"),
+				Message: &pgshardv1.ExecuteRequest_Parse{Parse: &pgshardv1.Parse{Name: "", Sql: sql}}}
+			rs := parseBatch(t, stream, unnamed, syncReq("s"))
+			if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
+				t.Fatalf("sql-level prepare: %s", got)
+			}
+			rs = parseBatch(t, stream, parseReq("s", "select 1", nil), syncReq("s"))
+			if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
+				t.Fatalf("parse after sql-level prepare: %s (%v)", got, h.pg.log())
+			}
+			if h.pg.count("CLOSE S st1") != 1 {
+				t.Fatalf("a name a SQL-level PREPARE may hold must be closed before parsing: %v", h.pg.log())
+			}
+			_ = stream.CloseSend()
+			waitFor(t, func() bool { return !h.attached() })
+			if _, err := h.client.Release(ctx, &pgshardv1.ReleaseRequest{SessionId: "s"}); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, h.pg.sawQueryFn("DISCARD ALL"))
+		})
 	}
-	stream, _ := h.client.Execute(ctx)
-	unnamed := &pgshardv1.ExecuteRequest{SessionId: "s", Generation: gen(7, 3), User: identity("alice"),
-		Message: &pgshardv1.ExecuteRequest_Parse{Parse: &pgshardv1.Parse{Name: "", Sql: "PREPARE st1 AS SELECT 1"}}}
-	rs := parseBatch(t, stream, unnamed, syncReq("s"))
-	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
-		t.Fatalf("sql-level prepare: %s", got)
-	}
-	rs = parseBatch(t, stream, parseReq("s", "select 1", nil), syncReq("s"))
-	if got := fmt.Sprint(kinds(rs)); got != "[parse ready]" {
-		t.Fatalf("parse after sql-level prepare: %s (%v)", got, h.pg.log())
-	}
-	if h.pg.count("CLOSE S st1") != 1 {
-		t.Fatalf("a name a SQL-level PREPARE may hold must be closed before parsing: %v", h.pg.log())
-	}
-	_ = stream.CloseSend()
-	waitFor(t, func() bool { return !h.attached() })
-	if _, err := h.client.Release(ctx, &pgshardv1.ReleaseRequest{SessionId: "s"}); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, h.pg.sawQueryFn("DISCARD ALL"))
 }
 
 func TestUnreservedSQLLevelPrepareLeavesNoStatementsInThePool(t *testing.T) {
@@ -583,6 +590,18 @@ func TestCreatesPrepared(t *testing.T) {
 		{"BEGIN; PREPARE plan1 AS SELECT 1; PREPARE TRANSACTION 'gid'", true},
 		{"SELECT 'prepared'", false},
 		{"SELECT 1", false},
+		// PostgreSQL asks for no separator between a keyword and a quoted
+		// identifier or a comment; each of these prepares a statement.
+		{`PREPARE"plan1"AS SELECT 1`, true},
+		{"PREPARE/*keep*/plan1 AS SELECT 1", true},
+		{"PREPARE--name it\nplan1 AS SELECT 1", true},
+		{"PREPARE/*a/*nested*/comment*/plan1 AS SELECT 1", true},
+		{"PREPARE/*unterminated plan1 AS SELECT 1", true},
+		{"PREPARE\tTRANSACTION 'gid'", false},
+		{"PREPARE/*c*/TRANSACTION 'gid'", false},
+		{"prepare transaction'gid'", false},
+		{"SELECT 1 AS preparedness", false},
+		{"SELECT 1 AS unprepare", false},
 	}
 	for _, c := range cases {
 		if got := createsPrepared(c.sql); got != c.want {
@@ -800,4 +819,106 @@ func TestCopyInReachesPostgresBeforeItEnds(t *testing.T) {
 	if got := h.pg.copied.Load(); got != int64(16*len(chunk)) {
 		t.Fatalf("PostgreSQL received %d bytes of a %d byte upload", got, 16*len(chunk))
 	}
+}
+
+// BenchmarkSessionLookupWithReservations measures what establishing one
+// Execute stream costs while N reservations are held. Every stream used to
+// scan the whole session map looking for expiries, on the same mutex that
+// serializes establishment, so a ramp of N sessions paid N squared checks.
+// The cost should not grow with N.
+func BenchmarkSessionLookupWithReservations(b *testing.B) {
+	for _, n := range []int{100, 10000} {
+		b.Run(strconv.Itoa(n), func(b *testing.B) {
+			h := startHarness(b, PoolConfig{})
+			for i := range n {
+				id := "held-" + strconv.Itoa(i)
+				h.srv.mu.Lock()
+				h.srv.sessions[id] = &session{id: id, reserved: true, detachedAt: time.Now()}
+				h.srv.noteExpiry(time.Now())
+				h.srv.mu.Unlock()
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				h.srv.session("probe")
+			}
+		})
+	}
+}
+
+// TestExpiredReservationWithATransactionIsReported: a reserved session that
+// loses its stream for longer than the timeout is rolled back and dropped.
+// If the next attach were simply given a fresh session, the client would
+// carry on as though its transaction were still open and find out only when
+// the next statement behaved as if nothing had begun.
+func TestExpiredReservationWithATransactionIsReported(t *testing.T) {
+	// The default five-minute timeout, so nothing expires on its own while
+	// the test is setting up: the sweep below is the only one that matters
+	// and it is driven with a clock of the test's choosing.
+	h := startHarness(t, PoolConfig{})
+	ctx := context.Background()
+	if _, err := h.client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: "s", Generation: gen(7, 3)}); err != nil {
+		t.Fatal(err)
+	}
+	stream, err := h.client.Execute(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, stream, queryReq("s", "begin", gen(7, 3), identity("alice")))
+	_ = stream.CloseSend()
+	waitFor(t, func() bool { return !h.attached() })
+
+	h.srv.expireReservations(time.Now().Add(10 * time.Minute))
+
+	next, err := h.client.Execute(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := next.Send(queryReq("s", "select 1", gen(7, 3), identity("alice"))); err != nil {
+		t.Fatal(err)
+	}
+	_, err = next.Recv()
+	if status.Code(err) != codes.Aborted {
+		t.Fatalf("attach after an expiry that rolled a transaction back: %v", err)
+	}
+	if !strings.Contains(err.Error(), "transaction was rolled back") {
+		t.Errorf("the error must say what happened: %v", err)
+	}
+
+	// Told once. A session id that comes back again is a new session.
+	third, err := h.client.Execute(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := firstError(roundTrip(t, third, queryReq("s", "select 1", gen(7, 3), identity("alice")))); e != nil {
+		t.Errorf("the session must work again once the router has been told: %v", e)
+	}
+	_ = third.CloseSend()
+}
+
+// TestExpiredReservationWithoutATransactionIsSilent: an idle reservation
+// expiring costs the client nothing, so there is nothing to report.
+func TestExpiredReservationWithoutATransactionIsSilent(t *testing.T) {
+	h := startHarness(t, PoolConfig{})
+	ctx := context.Background()
+	if _, err := h.client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: "s", Generation: gen(7, 3)}); err != nil {
+		t.Fatal(err)
+	}
+	stream, err := h.client.Execute(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, stream, queryReq("s", "select 1", gen(7, 3), identity("alice")))
+	_ = stream.CloseSend()
+	waitFor(t, func() bool { return !h.attached() })
+
+	h.srv.expireReservations(time.Now().Add(10 * time.Minute))
+
+	next, err := h.client.Execute(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := firstError(roundTrip(t, next, queryReq("s", "select 1", gen(7, 3), identity("alice")))); e != nil {
+		t.Errorf("an idle reservation expiring must cost the client nothing: %v", e)
+	}
+	_ = next.CloseSend()
 }

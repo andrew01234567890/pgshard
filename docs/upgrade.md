@@ -123,11 +123,25 @@ own blue/green replacement, tracked in `status.catalogUpgrade`:
    `spec.resharding.retireOldGroupsAfter`, then it is deleted. Annotating
    the cluster with `pgshard.io/catalog-upgrade=rollback` inside that
    window repoints the Service back, lifts the fence and deletes the
-   new-major group. The old catalog is frozen from the cutover on, so
-   catalog changes made after the flip (workflow progress, serving-map
-   bumps) are lost on rollback — roll back only from a quiet cluster,
-   which the trigger conditions (no reshard or placement in flight)
-   enforce at the start.
+   new-major group. A reverse stream keeps the old catalog current in the
+   meantime: the new group publishes `pgshard_catalog_rollback` for the
+   `pgshard` schema and the old one subscribes, so a rollback replays what
+   the new catalog accepted before it serves again, and refuses rather than
+   serve a catalog that is missing writes. Roll back only from a quiet
+   cluster all the same — the trigger conditions (no reshard or placement
+   in flight) enforce it at the start.
+
+   Catalog **schema** migrations wait for this window to close. Logical
+   replication carries no DDL, so a migration applied after the flip would
+   send its `pgshard.schema_migrations` row back to the old catalog while
+   the DDL it describes stayed behind, and rows in a table it created would
+   not replicate at all until the subscription refreshed — the old catalog
+   would be structurally behind and believe otherwise. While the previous
+   catalog is kept, `CatalogReady` says `MigrationDeferred`, and the
+   migrations run once it is retired. An operator upgraded *inside* this
+   window therefore runs against the schema it found until the window
+   closes: shorten `retireOldGroupsAfter` or finish the catalog upgrade
+   before rolling the operator.
 
 A serving catalog whose major was never probed is stamped on the first
 reconcile (`status.catalogPGMajor`).

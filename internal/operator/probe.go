@@ -20,6 +20,9 @@ type PrimaryState struct {
 	// walsender.
 	Streaming        map[string]bool
 	SyncStandbyNames string
+	// WritesPaused is default_transaction_read_only: the barrier's pause,
+	// which the operator reapplies to a primary that lost it.
+	WritesPaused bool
 }
 
 // StandbyState is what the operator learned from one probe of a member
@@ -47,7 +50,12 @@ type Prober interface {
 	Probe(ctx context.Context, dsn string) (PrimaryState, error)
 	ProbeStandby(ctx context.Context, dsn string) (StandbyState, error)
 	SetSyncStandbyNames(ctx context.Context, dsn, value string) error
+	// PauseWrites makes a primary refuse new writing transactions.
+	PauseWrites(ctx context.Context, dsn string) error
+	// WriteFenced reads the catalog write fence, given a catalog DSN.
+	WriteFenced(ctx context.Context, dsn string) (bool, error)
 	MigrateCatalog(ctx context.Context, dsn string) error
+	SetRouterPassword(ctx context.Context, dsn, password string) error
 	// PublishShardStatus upserts pgshard.shard_status for the given shard
 	// groups in one statement; it never lowers primary_epoch. Non-serving
 	// groups stay provisioning.
@@ -128,42 +136,42 @@ func HostDSN(host, password string) string {
 // PgxProber is the production Prober.
 type PgxProber struct{}
 
-// Probe runs SELECT 1 and reads replication state on the primary.
+// probePrimarySQL reads everything a primary probe needs in one row: that
+// the server answers at all, that it is not in recovery, which standbys are
+// streaming, and the synchronous standby list. It used to be four
+// statements -- SELECT 1, pg_is_in_recovery(), the pg_stat_replication scan
+// and SHOW -- and the operator runs this for every member of every group on
+// every pass, so it was four round trips where one does.
+//
+// The aggregate is legal beside the two function calls because neither
+// refers to a column of pg_stat_replication; with no rows the filtered
+// array_agg is NULL, which coalesce turns into the empty array.
+const probePrimarySQL = `SELECT pg_is_in_recovery(),
+	current_setting('synchronous_standby_names'),
+	current_setting('default_transaction_read_only')::bool,
+	coalesce(array_agg(application_name) FILTER (WHERE state = 'streaming'), '{}')
+	FROM pg_stat_replication`
+
+// Probe reads liveness and replication state from the primary.
 func (PgxProber) Probe(ctx context.Context, dsn string) (PrimaryState, error) {
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		return PrimaryState{}, err
 	}
 	defer func() { _ = conn.Close(ctx) }()
-	var one int
-	if err := conn.QueryRow(ctx, "SELECT 1").Scan(&one); err != nil || one != 1 {
-		return PrimaryState{}, fmt.Errorf("SELECT 1: %w", err)
-	}
 	var recovery bool
-	if err := conn.QueryRow(ctx, "SELECT pg_is_in_recovery()").Scan(&recovery); err != nil {
+	var syncNames string
+	var paused bool
+	var streaming []string
+	if err := conn.QueryRow(ctx, probePrimarySQL).Scan(&recovery, &syncNames, &paused, &streaming); err != nil {
 		return PrimaryState{}, err
 	}
 	if recovery {
 		return PrimaryState{}, fmt.Errorf("primary service points at a standby")
 	}
-	st := PrimaryState{Streaming: map[string]bool{}}
-	rows, err := conn.Query(ctx, "SELECT application_name FROM pg_stat_replication WHERE state = 'streaming'")
-	if err != nil {
-		return PrimaryState{}, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return PrimaryState{}, err
-		}
+	st := PrimaryState{Streaming: make(map[string]bool, len(streaming)), SyncStandbyNames: syncNames, WritesPaused: paused}
+	for _, name := range streaming {
 		st.Streaming[name] = true
-	}
-	if err := rows.Err(); err != nil {
-		return PrimaryState{}, err
-	}
-	if err := conn.QueryRow(ctx, "SHOW synchronous_standby_names").Scan(&st.SyncStandbyNames); err != nil {
-		return PrimaryState{}, err
 	}
 	return st, nil
 }
@@ -565,6 +573,46 @@ func (PgxProber) SetSyncStandbyNames(ctx context.Context, dsn, value string) err
 	return err
 }
 
+// PauseWrites makes a primary refuse new writing transactions, the state a
+// raised write fence means. Only the pause direction is here: the barrier
+// that raised the fence owns lifting it, and the fence outliving a barrier
+// is what its recovery pass reads to know shards are still paused.
+func (PgxProber) PauseWrites(ctx context.Context, dsn string) error {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if _, err := conn.Exec(ctx, "ALTER SYSTEM SET default_transaction_read_only = on"); err != nil {
+		return err
+	}
+	ok, err := scalarBool(ctx, conn, "SELECT pg_reload_conf()")
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("pg_reload_conf() refused to signal the postmaster")
+	}
+	return nil
+}
+
+// WriteFenced reports whether the catalog write fence is raised.
+func (PgxProber) WriteFenced(ctx context.Context, dsn string) (bool, error) {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	f, err := catalog.ReadWriteFence(ctx, conn)
+	return f.Active, err
+}
+
+func scalarBool(ctx context.Context, conn *pgx.Conn, sql string) (bool, error) {
+	var v bool
+	err := conn.QueryRow(ctx, sql).Scan(&v)
+	return v, err
+}
+
 // MigrateCatalog applies the embedded catalog migrations.
 func (PgxProber) MigrateCatalog(ctx context.Context, dsn string) error {
 	conn, err := pgx.Connect(ctx, dsn)
@@ -573,6 +621,22 @@ func (PgxProber) MigrateCatalog(ctx context.Context, dsn string) error {
 	}
 	defer func() { _ = conn.Close(ctx) }()
 	return catalog.Migrate(ctx, conn)
+}
+
+// SetRouterPassword gives the router's login role the password the operator
+// generated for this cluster. It runs on every pass: the role is the same
+// for every cluster and its password is not, so the catalog has to be told
+// which one, and saying it again is how a restored or rebuilt catalog gets
+// back in step with the Secret.
+func (PgxProber) SetRouterPassword(ctx context.Context, dsn, password string) error {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	// ALTER ROLE takes no parameters, so the password is a quoted literal.
+	_, err = conn.Exec(ctx, `ALTER ROLE `+catalog.RouterRole+` WITH LOGIN PASSWORD `+quoteLiteral(password))
+	return err
 }
 
 func quoteLiteral(s string) string {
@@ -634,10 +698,28 @@ func (b boundedProber) SetSyncStandbyNames(ctx context.Context, dsn, value strin
 	return b.Inner.SetSyncStandbyNames(ctx, dsn, value)
 }
 
+func (b boundedProber) PauseWrites(ctx context.Context, dsn string) error {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.PauseWrites(ctx, dsn)
+}
+
+func (b boundedProber) WriteFenced(ctx context.Context, dsn string) (bool, error) {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.WriteFenced(ctx, dsn)
+}
+
 func (b boundedProber) MigrateCatalog(ctx context.Context, dsn string) error {
 	ctx, cancel := b.bound(ctx)
 	defer cancel()
 	return b.Inner.MigrateCatalog(ctx, dsn)
+}
+
+func (b boundedProber) SetRouterPassword(ctx context.Context, dsn, password string) error {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.SetRouterPassword(ctx, dsn, password)
 }
 
 func (b boundedProber) PublishShardStatus(ctx context.Context, dsn string, rows []ShardStatus) error {

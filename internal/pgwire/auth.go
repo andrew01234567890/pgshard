@@ -122,11 +122,21 @@ func (a SCRAMAuthenticator) Authenticate(ctx context.Context, startup map[string
 		return nil, Errorf(CodeInvalidAuthorization, "client selected an invalid SASL authentication mechanism %q", initial.AuthMechanism)
 	}
 	secret, err := a.Lookup(ctx, user)
+	// A refusal that names the role -- NOLOGIN, an expired password -- is
+	// held until the client has proved it knows the password. Relaying it
+	// here answered "does this role exist?" for anyone who asked, since an
+	// unknown role got the mock exchange below and a disabled one got a
+	// 28000 immediately. PostgreSQL makes the same distinction only after
+	// authentication.
+	var held *Error
 	var refusal *Error
 	if errors.As(err, &refusal) {
-		// A deliberate refusal (NOLOGIN, expired password) is relayed as-is;
-		// only unknown roles get the mock exchange below.
-		return nil, refusal
+		held, err = refusal, nil
+		if secret == "" {
+			// Nothing to run a real exchange with: fall through to the
+			// mock one, and the refusal is never reached.
+			err = refusal
+		}
 	}
 	verifier, perr := ParseSCRAMVerifier(secret)
 	if err != nil || perr != nil {
@@ -160,6 +170,10 @@ func (a SCRAMAuthenticator) Authenticate(ctx context.Context, startup map[string
 	// AuthenticationSASLFinal is sent without waiting for a reply.
 	if _, err := ex.Request(&pgproto3.AuthenticationSASLFinal{Data: serverFinal}, pgproto3.AuthTypeSASLFinal); err != nil {
 		return nil, err
+	}
+	if held != nil {
+		// The password was right and the role still may not log in.
+		return nil, held
 	}
 	return &AuthResult{SCRAM: srv.keys}, nil
 }

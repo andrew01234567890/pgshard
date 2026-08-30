@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -461,4 +462,136 @@ func (w countingStatusWriter) Patch(ctx context.Context, obj client.Object, patc
 		*w.patches++
 	}
 	return w.SubResourceWriter.Patch(ctx, obj, patch, opts...)
+}
+
+// TestCatalogRollbackRecordsTheRestoredCatalogBeforeItMovesAnything: the
+// rollback repoints the stable Service and deletes the new catalog group. If
+// status still named that group when the operator died, the next pass sent
+// schema reconciliation at a fenced catalog and, once the delete had run,
+// rebuilt an empty group of that generation and pointed the Service at it.
+// So the restored generation has to be durable before anything moves.
+func TestCatalogRollbackRecordsTheRestoredCatalogBeforeItMovesAnything(t *testing.T) {
+	r, fp, c := setup(t, "cb")
+	cur := startCatalogUpgrade(t, r, fp, c)
+	base := cur.DeepCopy()
+	cur.Spec.Resharding.RetireOldGroupsAfter = &metav1.Duration{Duration: time.Hour}
+	if err := k8sClient.Patch(context.Background(), cur, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4 && catalogStage(t, c.Name) != CatalogUpgradeRetiring; i++ {
+		reconcile(t, r, c)
+	}
+
+	// ReleaseCatalog runs after the endpoint has moved and before the new
+	// group is deleted: what the API server holds at that moment is what an
+	// operator that died there would leave behind.
+	var atRelease *pgshardv1alpha1.PgShardCluster
+	fp.mu.Lock()
+	fp.onRelease = func() { atRelease = getCluster(t, c.Name) }
+	fp.mu.Unlock()
+
+	cur = getCluster(t, c.Name)
+	base = cur.DeepCopy()
+	if cur.Annotations == nil {
+		cur.Annotations = map[string]string{}
+	}
+	cur.Annotations[pgshardv1alpha1.AnnotationCatalogUpgrade] = pgshardv1alpha1.UpgradeActionRollback
+	if err := k8sClient.Patch(context.Background(), cur, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, r, c)
+
+	if atRelease == nil {
+		t.Fatal("the rollback never reached the release, so this proves nothing")
+	}
+	if atRelease.Status.CatalogGeneration != 1 || atRelease.Status.CatalogPGMajor != 18 {
+		t.Errorf("status named generation %d (major %d) while the rollback was moving the endpoint; want the restored generation 1 (major 18)",
+			atRelease.Status.CatalogGeneration, atRelease.Status.CatalogPGMajor)
+	}
+	if up := atRelease.Status.CatalogUpgrade; up == nil || !up.RollbackStarted {
+		t.Errorf("the rollback must be recorded as started before it moves anything: %+v", atRelease.Status.CatalogUpgrade)
+	}
+}
+
+// TestCatalogMigrationsWaitForTheRollbackWindowToClose: a catalog schema
+// migration applied while the previous catalog is still kept for rollback
+// cannot be rolled back with the data. Logical replication carries no DDL,
+// so the old catalog would take the bookkeeping row that says it is migrated
+// while the DDL stayed behind, and rows in a table the migration created
+// would not replicate at all.
+func TestCatalogMigrationsWaitForTheRollbackWindowToClose(t *testing.T) {
+	r, fp, c := setup(t, "cm")
+	cur := startCatalogUpgrade(t, r, fp, c)
+	base := cur.DeepCopy()
+	cur.Spec.Resharding.RetireOldGroupsAfter = &metav1.Duration{Duration: time.Hour}
+	if err := k8sClient.Patch(context.Background(), cur, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4 && catalogStage(t, c.Name) != CatalogUpgradeRetiring; i++ {
+		reconcile(t, r, c)
+	}
+	if catalogStage(t, c.Name) != CatalogUpgradeRetiring {
+		t.Fatalf("the upgrade never reached retiring: %q", catalogStage(t, c.Name))
+	}
+
+	fp.mu.Lock()
+	fp.migrated = 0
+	fp.mu.Unlock()
+	reconcile(t, r, c)
+	fp.mu.Lock()
+	during := fp.migrated
+	fp.mu.Unlock()
+	if during != 0 {
+		t.Errorf("the catalog was migrated %d time(s) while the old one was still kept for rollback", during)
+	}
+	if cond := condition(t, c.Name, ConditionCatalogReady); cond.Reason != "MigrationDeferred" {
+		t.Errorf("CatalogReady reason = %q, want the deferral said out loud", cond.Reason)
+	}
+
+	// Once the window closes and the upgrade is done, migrations resume.
+	cur = getCluster(t, c.Name)
+	base = cur.DeepCopy()
+	cur.Spec.Resharding.RetireOldGroupsAfter = &metav1.Duration{Duration: 0}
+	if err := k8sClient.Patch(context.Background(), cur, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4 && getCluster(t, c.Name).Status.CatalogUpgrade != nil; i++ {
+		reconcile(t, r, c)
+	}
+	if up := getCluster(t, c.Name).Status.CatalogUpgrade; up != nil {
+		t.Fatalf("the upgrade never retired: %+v", up)
+	}
+	fp.mu.Lock()
+	fp.migrated = 0
+	fp.mu.Unlock()
+	reconcile(t, r, c)
+	fp.mu.Lock()
+	after := fp.migrated
+	fp.mu.Unlock()
+	if after == 0 {
+		t.Error("migrations must resume once the previous catalog is retired")
+	}
+}
+
+// TestCatalogUpgradeGivesTheNewCatalogTheRouterPassword: roles are not
+// logically replicated, so the new catalog has the router's role from its
+// own migration and no password for it. If nothing set one, every router
+// would be refused the moment the endpoint moved to it.
+func TestCatalogUpgradeGivesTheNewCatalogTheRouterPassword(t *testing.T) {
+	r, fp, c := setup(t, "cp")
+	startCatalogUpgrade(t, r, fp, c)
+	for i := 0; i < 3 && catalogStage(t, c.Name) == CatalogUpgradeProvisioning; i++ {
+		reconcile(t, r, c)
+	}
+
+	var sec corev1.Secret
+	get(t, RouterSecretName(c.Name), &sec)
+	want := "cp-catalog-g2-rw.default.svc=" + string(sec.Data["password"])
+
+	fp.mu.Lock()
+	applied := append([]string(nil), fp.routerPasswords...)
+	fp.mu.Unlock()
+	if !slices.Contains(applied, want) {
+		t.Errorf("the new catalog was never given the router password: %v", applied)
+	}
 }

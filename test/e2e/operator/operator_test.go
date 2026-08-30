@@ -4,6 +4,7 @@ package operator
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -306,6 +307,15 @@ func waitCondition(ctx context.Context, c *e2e.Cluster, cond string, timeout tim
 	return err
 }
 
+func decodeSecret(t *testing.T, b64 string) string {
+	t.Helper()
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
+	if err != nil {
+		t.Fatalf("decoding a secret value: %v", err)
+	}
+	return string(raw)
+}
+
 func jsonpath(ctx context.Context, t *testing.T, c *e2e.Cluster, kind, name, path string) string {
 	t.Helper()
 	out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "get", kind, name, "-o", "jsonpath="+path)
@@ -453,8 +463,19 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer stop()
-		httpGet := func(path string) (int, string) {
-			resp, err := http.Get(base + path)
+		token := decodeSecret(t, jsonpath(ctx, t, c, "secret", clusterName+"-admin", "{.data.token}"))
+		if token == "" {
+			t.Fatal("the operator must generate the admin credential")
+		}
+		httpGet := func(path string, opts ...func(*http.Request)) (int, string) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, o := range opts {
+				o(req)
+			}
+			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				t.Fatalf("GET %s: %v", path, err)
 			}
@@ -462,13 +483,25 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 			body, _ := io.ReadAll(resp.Body)
 			return resp.StatusCode, string(body)
 		}
-		if code, body := httpGet("/"); code != http.StatusOK || !strings.Contains(body, clusterName) {
+		withToken := func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+token) }
+		// Everything the admin serves is operational detail about the
+		// cluster, so a workload that can reach it but has no credential
+		// must see none of it.
+		for _, path := range []string{"/", "/api/v1/clusters", "/clusters/" + testNamespace + "/" + clusterName} {
+			if code, body := httpGet(path); code != http.StatusUnauthorized {
+				t.Errorf("GET %s without a credential: %d %.200s", path, code, body)
+			}
+		}
+		if code, _ := httpGet("/healthz"); code != http.StatusOK {
+			t.Errorf("GET /healthz: %d, want 200 without a credential", code)
+		}
+		if code, body := httpGet("/", withToken); code != http.StatusOK || !strings.Contains(body, clusterName) {
 			t.Errorf("GET /: %d %.400s", code, body)
 		}
-		if code, body := httpGet("/clusters/" + testNamespace + "/" + clusterName); code != http.StatusOK || !strings.Contains(body, clusterName+"-shard-0-0") {
+		if code, body := httpGet("/clusters/"+testNamespace+"/"+clusterName, withToken); code != http.StatusOK || !strings.Contains(body, clusterName+"-shard-0-0") {
 			t.Errorf("GET cluster page: %d %.400s", code, body)
 		}
-		if code, body := httpGet("/api/v1/clusters/" + testNamespace + "/" + clusterName); code != http.StatusOK ||
+		if code, body := httpGet("/api/v1/clusters/"+testNamespace+"/"+clusterName, withToken); code != http.StatusOK ||
 			!strings.Contains(body, `"name": "`+clusterName+`"`) || !strings.Contains(body, `"primary": "`+clusterName+`-shard-0-0"`) {
 			t.Errorf("GET admin JSON: %d %.400s", code, body)
 		}

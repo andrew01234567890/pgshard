@@ -275,10 +275,11 @@ func TestWatcherKeepsOneReloadConnection(t *testing.T) {
 	}
 	// Several reload periods: a watcher that dials per reload would leave
 	// a trail of them, and one that keeps a connection stays at one.
+	// Waited for rather than sampled -- a reload that has just dropped a
+	// connection has not opened its replacement yet, and one dial behind
+	// is not the trail this is looking for.
 	time.Sleep(time.Second)
-	if n := backends(); n != 1 {
-		t.Errorf("catalog has %d backends for the watcher, want the one it keeps", n)
-	}
+	waitUntil(t, 10*time.Second, "the watcher to settle on one backend", func() bool { return backends() == 1 })
 
 	// The catalog restarting under the connection must not strand it.
 	first := w.Current().LoadedAt
@@ -290,9 +291,10 @@ func TestWatcherKeepsOneReloadConnection(t *testing.T) {
 		s := w.Current()
 		return s != nil && s.LoadedAt.After(first)
 	})
-	if n := backends(); n != 1 {
-		t.Errorf("after recovering the watcher holds %d backends, want one", n)
-	}
+	// Same again: the reload that produced that snapshot dialled, but a
+	// later one may be between dropping and redialling at the instant
+	// this looks, so the count is waited for rather than sampled.
+	waitUntil(t, 10*time.Second, "one backend again after the kill", func() bool { return backends() == 1 })
 	cancel()
 	<-done
 }

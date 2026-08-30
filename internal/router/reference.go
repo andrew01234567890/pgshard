@@ -46,6 +46,11 @@ func (e *Executor) referenceWrite(ctx context.Context, pl plan.Plan, reqs []*pgs
 		e.txnPrelude = append(e.txnPrelude, "BEGIN")
 	}
 	e.txnTouched = true
+	targetShards := make([]Shard, 0, len(pl.Shards))
+	for _, id := range pl.Shards {
+		targetShards = append(targetShards, Shard{Set: e.userSet(), ID: id})
+	}
+	e.openParts(ctx, targetShards)
 	for _, id := range pl.Shards {
 		if err := e.moveTo(ctx, Shard{Set: e.userSet(), ID: id}); err != nil {
 			return e.referenceFailed(ctx, implicit, err)

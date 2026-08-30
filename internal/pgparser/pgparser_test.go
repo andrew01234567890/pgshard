@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -373,5 +375,37 @@ func TestOneHitStatementsCannotEvictAReusedPlan(t *testing.T) {
 	}
 	if _, ok := p.cache.get(hot); !ok {
 		t.Fatalf("the reused statement was evicted by %d one-hit statements", 200)
+	}
+}
+
+// TestMemoRunsOncePerParseResult: the parse cache hands the same result to
+// every session that sends the same SQL, and a memo is how a whole-tree
+// walk that would otherwise run per statement runs per distinct statement.
+func TestMemoRunsOncePerParseResult(t *testing.T) {
+	res := &ParseResult{}
+	var runs int32
+	compute := func() any { atomic.AddInt32(&runs, 1); return "answer" }
+
+	var wg sync.WaitGroup
+	got := make([]any, 8)
+	for i := range got {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			got[i] = res.Memo(compute)
+		}(i)
+	}
+	wg.Wait()
+	if n := atomic.LoadInt32(&runs); n != 1 {
+		t.Errorf("compute ran %d times, want once", n)
+	}
+	for i, v := range got {
+		if v != "answer" {
+			t.Errorf("caller %d saw %v", i, v)
+		}
+	}
+	// A different result computes its own.
+	if other := (&ParseResult{}).Memo(compute); other != "answer" || atomic.LoadInt32(&runs) != 2 {
+		t.Errorf("a second parse result must compute its own: %v runs=%d", other, runs)
 	}
 }

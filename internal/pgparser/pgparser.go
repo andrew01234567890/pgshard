@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -60,6 +61,25 @@ type ParseResult struct {
 	// Tree is the whole version-specific ParseResult message; pass it to Deparse.
 	Tree  proto.Message
 	Stmts []Stmt
+
+	// memo holds one value a caller derives from the tree alone, computed
+	// on first use and shared by everyone the parse cache hands this
+	// result to. See Memo.
+	memoOnce sync.Once
+	memo     any
+}
+
+// Memo returns compute()'s value, running it once for this parse result
+// however many callers ask. It is for answers that depend on the tree and
+// nothing else: the parse cache hands the same result to every session that
+// sends the same SQL, so a whole-tree walk that would otherwise run on
+// every statement runs once per distinct statement instead.
+//
+// A caller that memoizes something session-dependent here would hand one
+// session's answer to another, so the contract is the tree alone.
+func (r *ParseResult) Memo(compute func() any) any {
+	r.memoOnce.Do(func() { r.memo = compute() })
+	return r.memo
 }
 
 // Metrics receives cache events. Implementations must be safe for concurrent use.

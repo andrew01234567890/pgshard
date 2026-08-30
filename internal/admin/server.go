@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -41,6 +42,11 @@ type Server struct {
 	Namespace  string
 	Logger     *slog.Logger
 	Tick       time.Duration
+	// Token is the credential every route but /healthz requires, as a
+	// bearer token or as the password of HTTP basic auth (any user name,
+	// so a browser can be pointed at the UI and log in). Empty serves the
+	// admin to anyone who can reach it.
+	Token string
 
 	tmpl *template.Template
 	mux  *http.ServeMux
@@ -118,8 +124,35 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Set("Referrer-Policy", "no-referrer")
 	start := time.Now()
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	if !s.authorized(r) {
+		// A liveness probe is the one thing a stranger may ask: it says
+		// nothing about the cluster, and requiring the token for it would
+		// make the credential a dependency of the pod staying up.
+		w.Header().Set("WWW-Authenticate", `Basic realm="pgshard admin"`)
+		http.Error(rec, "unauthorized", http.StatusUnauthorized)
+		s.Logger.Info("request", "method", r.Method, "path", r.URL.Path, "status", rec.status, "duration", time.Since(start).String(), "remote", r.RemoteAddr)
+		return
+	}
 	s.mux.ServeHTTP(rec, r)
 	s.Logger.Info("request", "method", r.Method, "path", r.URL.Path, "status", rec.status, "duration", time.Since(start).String(), "remote", r.RemoteAddr)
+}
+
+// authorized reports whether r carries the admin credential. Everything the
+// admin serves is operational detail -- topology, backup and restore state,
+// stream positions, two-phase commit identifiers, the text of DDL -- so the
+// whole surface is behind it, /healthz apart.
+func (s *Server) authorized(r *http.Request) bool {
+	if s.Token == "" || r.URL.Path == "/healthz" {
+		return true
+	}
+	if _, password, ok := r.BasicAuth(); ok {
+		return subtle.ConstantTimeCompare([]byte(password), []byte(s.Token)) == 1
+	}
+	const bearer = "Bearer "
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, bearer) {
+		return subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(h, bearer)), []byte(s.Token)) == 1
+	}
+	return false
 }
 
 type statusRecorder struct {

@@ -137,13 +137,6 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		}
 		fmt.Fprintf(stdout, "pgshard-pooler run: pprof on %s\n", pa)
 	}
-	if *metricsListen != "" {
-		go func() {
-			if err := metrics.Serve(ctx, *metricsListen, reg); err != nil {
-				logger.Error("metrics listener stopped", "err", err)
-			}
-		}()
-	}
 	if *streamShard == "" {
 		set := *shardSet
 		if set == "" {
@@ -168,6 +161,21 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	fmt.Fprintf(stdout, "pgshard-pooler run: listening on %s (%s), postgres at %s\n", l.Addr(), mode, addr)
 	errc := make(chan error, 1)
 	go func() { errc <- g.Serve(l) }()
+	// After the gRPC listener, never before: /healthz on this port is the
+	// pooler's readiness probe, and a member NetworkPolicy leaves the
+	// metrics port open to the kubelet while the gRPC port stays closed to
+	// everything but the cluster. Answering it while nothing is serving
+	// would report a pooler that cannot take a query as Ready.
+	if *metricsListen != "" {
+		go func() {
+			if err := metrics.Serve(ctx, *metricsListen, reg); err != nil && ctx.Err() == nil {
+				// Fatal, not logged: /healthz on this listener is the
+				// readiness probe, so a pooler that cannot serve it is a
+				// pod that never becomes Ready however well it runs.
+				errc <- fmt.Errorf("metrics listener: %w", err)
+			}
+		}()
+	}
 	select {
 	case err := <-errc:
 		fmt.Fprintf(stderr, "pgshard-pooler run: %v\n", err)

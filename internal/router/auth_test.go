@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -129,9 +130,13 @@ func TestRoleCacheRefusesNologinAndExpired(t *testing.T) {
 	c := NewRoleCache(q, time.Minute)
 	c.now = func() time.Time { return now }
 	ctx := context.Background()
-	assert28000 := func(user, want string) {
+	// The refusal comes back with the role's verifier: pgwire runs the
+	// exchange anyway and only relays the refusal to a client that proved
+	// the password, so a caller who has proved nothing cannot tell a
+	// disabled role from an absent one.
+	assert28000 := func(user, want, verifier string) {
 		t.Helper()
-		_, err := c.Lookup(ctx, user)
+		v, err := c.Lookup(ctx, user)
 		var pe *pgwire.Error
 		if !errors.As(err, &pe) || pe.Code != pgwire.CodeInvalidAuthorization {
 			t.Fatalf("%s: want 28000 refusal, got %v", user, err)
@@ -139,9 +144,12 @@ func TestRoleCacheRefusesNologinAndExpired(t *testing.T) {
 		if !strings.Contains(pe.Message, want) {
 			t.Fatalf("%s: message %q lacks %q", user, pe.Message, want)
 		}
+		if v != verifier {
+			t.Fatalf("%s: verifier %q, want %q -- a refusal without one cannot run a real exchange", user, v, verifier)
+		}
 	}
-	assert28000("batch", "not permitted to log in")
-	assert28000("expired", "expired")
+	assert28000("batch", "not permitted to log in", "v1")
+	assert28000("expired", "expired", "v2")
 	if v, err := c.Lookup(ctx, "current"); err != nil || v != "v3" {
 		t.Fatalf("valid_until in the future must pass: %q %v", v, err)
 	}
@@ -149,7 +157,7 @@ func TestRoleCacheRefusesNologinAndExpired(t *testing.T) {
 		t.Fatalf("no valid_until must pass: %q %v", v, err)
 	}
 	now = future
-	assert28000("current", "expired")
+	assert28000("current", "expired", "v3")
 }
 
 // TestConnectionLimitRefusesBeyondTheRolesAllowance: a role's
@@ -295,5 +303,141 @@ func TestRoleCacheLooksUpConcurrently(t *testing.T) {
 		if v, err := c.Lookup(ctx, "alice"); err != nil || v != "v1" {
 			t.Fatalf("cached lookup: %q %v", v, err)
 		}
+	}
+}
+
+// TestMaxSessionsCapsWhatOneLoginCanHold: the pre-authentication cap
+// releases its slot the moment a session authenticates, and a role carries
+// no connection limit unless one was set on it. Without a cap of its own
+// one valid login could hold sessions until the router ran out of memory,
+// taking every tenant on it down.
+func TestMaxSessionsCapsWhatOneLoginCanHold(t *testing.T) {
+	fp := newFakePooler()
+	h := newHarnessWith(t, fp, startFakePooler(t, fp), func(cfg *Config) {
+		cfg.MaxSessions = 2
+	})
+	var open []*pgx.Conn
+	for i := range 2 {
+		c, err := pgx.Connect(context.Background(), h.dsn("app", "secret", "app"))
+		if err != nil {
+			t.Fatalf("session %d of a cap of 2: %v", i, err)
+		}
+		open = append(open, c)
+	}
+	_, err := pgx.Connect(context.Background(), h.dsn("app", "secret", "app"))
+	if sqlstate(err) != "53300" {
+		t.Fatalf("third session past a cap of 2: %v", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "too many clients already") {
+		t.Errorf("the refusal must say what happened: %v", err)
+	}
+
+	// A closed session gives its slot back.
+	if err := open[0].Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c, err := pgx.Connect(context.Background(), h.dsn("app", "secret", "app"))
+		if err == nil {
+			_ = c.Close(context.Background())
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("a closed session must free its slot: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	for _, c := range open[1:] {
+		_ = c.Close(context.Background())
+	}
+}
+
+// TestMaxSessionsAdmitsConcurrentlyWithoutExceedingTheCap: admission reads
+// the count and records the session in one critical section, so racing
+// logins cannot both see room for the last slot.
+func TestMaxSessionsAdmitsConcurrentlyWithoutExceedingTheCap(t *testing.T) {
+	fp := newFakePooler()
+	const capacity = 4
+	h := newHarnessWith(t, fp, startFakePooler(t, fp), func(cfg *Config) {
+		cfg.MaxSessions = capacity
+	})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var opened []*pgx.Conn
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, err := pgx.Connect(context.Background(), h.dsn("app", "secret", "app"))
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			opened = append(opened, c)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	defer func() {
+		for _, c := range opened {
+			_ = c.Close(context.Background())
+		}
+	}()
+	if len(opened) > capacity {
+		t.Errorf("%d sessions admitted past a cap of %d", len(opened), capacity)
+	}
+	if len(opened) == 0 {
+		t.Error("no session was admitted at all")
+	}
+}
+
+// TestARefusedRoleIsLookedUpAgain: a cached credential that refuses may
+// simply be old. A password renewed or a role re-enabled a moment ago looks
+// exactly like a disabled one until the ttl comes round, and making the
+// client wait out the ttl for a change already made in the catalog is the
+// sort of thing that gets diagnosed as "it works if you try again".
+func TestARefusedRoleIsLookedUpAgain(t *testing.T) {
+	now := time.Unix(1000, 0)
+	past := now.Add(-time.Hour)
+	q := &fakeQuerier{
+		roles: map[string]string{"batch": "v1"},
+		attrs: map[string]fakeRole{"batch": {validUntil: &past}},
+	}
+	c := NewRoleCache(q, time.Minute)
+	c.now = func() time.Time { return now }
+	ctx := context.Background()
+
+	// The cache is loaded while the password is expired.
+	if _, err := c.Lookup(ctx, "batch"); err == nil {
+		t.Fatal("an expired password must be refused")
+	}
+	// Somebody renews it. The cache does not know, and the ttl has not
+	// come round.
+	q.attrs["batch"] = fakeRole{}
+	c.lastMiss = time.Time{}
+	before := q.calls
+	if v, err := c.Lookup(ctx, "batch"); err != nil || v != "v1" {
+		t.Errorf("a refusal from a stale entry must be checked against the catalog: %q %v", v, err)
+	}
+	if q.calls == before {
+		t.Error("the catalog was never read again")
+	}
+
+	// But only once per ttl, so a caller hammering a disabled role cannot
+	// turn every attempt into a catalog read.
+	q.attrs["batch"] = fakeRole{validUntil: &past}
+	c.cur.Store(nil)
+	if _, err := c.Lookup(ctx, "batch"); err == nil {
+		t.Fatal("an expired password must be refused")
+	}
+	before = q.calls
+	for range 5 {
+		if _, err := c.Lookup(ctx, "batch"); err == nil {
+			t.Fatal("still expired")
+		}
+	}
+	if q.calls != before {
+		t.Errorf("refusals must be rate-limited: %d catalog reads for five attempts", q.calls-before)
 	}
 }

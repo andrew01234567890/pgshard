@@ -24,8 +24,14 @@ Every member pod runs two containers from the same `pgshard-postgres` image:
 
 The agent pins `unix_socket_directories` to `/tmp`; the two containers share
 that directory through an emptyDir so the pooler reaches PostgreSQL over the
-Unix socket. The pooler's readiness probe is a TCP check on 9091, so a pod
-is Ready only when both the agent and the pooler are.
+Unix socket. The pooler's readiness probe is `/healthz` on its metrics port,
+which it starts serving only once its gRPC listener is up, so a pod is Ready
+only when both the agent and the pooler are — and the probe stays on a port
+the member NetworkPolicy leaves open. The rendered shape of a member pod is
+part of the template hash, so an operator that renders it differently rolls
+existing members once, member by member, through the usual zero-downtime
+path: pods are immutable, and a cluster created by an older operator would
+otherwise keep the older shape indefinitely.
 
 Setting `spec.internalTLS.secretRef` to a Secret holding `tls.crt`,
 `tls.key` and `ca.crt` turns on mutual TLS between routers and poolers: the
@@ -35,9 +41,92 @@ Plaintext is never a fallback: without a `secretRef` the spec must set
 `spec.internalTLS.insecure: true` (unsupported outside development, and only
 tolerable behind a NetworkPolicy restricting port 9091 to router pods) or
 the API server rejects the cluster.
+
+**Upgrading a cluster made before this rule.** `spec.internalTLS` is
+required, so a manifest that predates it stops applying the moment the new
+CRD is installed -- and a GitOps controller reapplying it will report the
+rejection rather than drift. A cluster already running keeps running; it is
+the next apply that fails. Add one of the two to the manifest before or with
+the CRD upgrade:
+
+```yaml
+spec:
+  internalTLS:
+    secretRef: {name: demo-internal-tls}   # or: insecure: true
+```
+
+The same applies to the two other required-unless-you-say-otherwise rules
+this project has adopted since: `spec.networkPolicy.clients` when the policy
+is enabled (see [Network policy](#network-policy)) and
+`objectStore.encryption.secretRef` on a remote backup repository (see
+[backup.md](backup.md#encryption)). Each rejects on write rather than
+changing what a running cluster does, and each has an explicit opt-out for
+the case where the plain thing is what was wanted.
+`pg_hba.conf` admits only the control plane over TCP: the superuser, and
+`pgshard_router` for the router's catalog connection, which exists only
+where the catalog schema does. Everything else is rejected, so an
+application role reaches a shard through the pooler's unix socket and the
+router, which is where shard-key routing, the write fences and the
+coordination of a multi-shard write happen.
+
 The agent's own gRPC port (9090) requires a per-cluster token derived from
 the superuser Secret on every RPC, so reaching the port is not enough to
 drive failovers.
+
+## Network policy
+
+`spec.networkPolicy.enabled: true` renders `<cluster>-members`, a
+NetworkPolicy selecting the cluster's **member** pods — the ones carrying
+`pgshard.io/group-kind`, so the routers and the admin UI are left alone: a
+router serves clients on 5432 and probes itself on that port, and the admin
+UI listens on 8081, which no rule here opens.
+
+| Rule | Ports | From |
+|------|-------|------|
+| restricted | 5432 (PostgreSQL), 9090 (agent gRPC), 9091 (pooler gRPC) | pods labelled `pgshard.io/cluster: <cluster>` (members, routers, admin) plus every peer in `spec.networkPolicy.clients` |
+| open | 8080 (probes), 9127 (pooler metrics) | anywhere |
+
+This is the layer under `pg_hba`, which already refuses an application role
+over TCP: with the policy the port is unreachable rather than reachable and
+refused, and it covers whatever else listens on a member.
+
+Three things about it are deliberate.
+
+**It is off by default, and turning it on requires naming the control
+plane.** A NetworkPolicy is enforced by the CNI or silently ignored by it,
+and one that fails to name a client of a member's PostgreSQL takes that
+client off the cluster with nothing to read but a refused connection. The
+operator dials the agent and the pooler from its own namespace and the
+controller dials the catalog, so `spec.networkPolicy.clients` must not be
+empty while the policy is enabled — the API server refuses the cluster
+otherwise. Entries are ordinary `NetworkPolicyPeer`s (`podSelector`,
+`namespaceSelector`, `ipBlock`); list anything that reaches a member from
+outside the cluster's own pods, including a `pgshard-controller` you deploy
+yourself and any migration job.
+
+```yaml
+networkPolicy:
+  enabled: true
+  clients:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: pgshard-system   # the operator
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/name: pgshard-controller
+```
+
+**The probe and metrics ports stay open to every source.** The kubelet is not
+a pod, so no pod or namespace selector matches it; a rule that leaves it out
+fails every readiness probe on a CNI that enforces policies.
+
+**Egress is not restricted.** Members archive WAL to object storage, resolve
+DNS and replicate to each other; the policy declares `Ingress` only.
+
+Enforcement itself is not covered by the e2e suites: kind's default CNI does
+not implement NetworkPolicies, so a test asserting a blocked connection would
+pass for the wrong reason. The rendered object is asserted field by field in
+envtest instead.
 
 ## Shard groups and resharding
 
@@ -55,7 +144,7 @@ For every cluster the operator owns `<cluster>-router`:
 | Object | Content |
 |--------|---------|
 | ServiceAccount | Identity of the router pods. |
-| Deployment | `serve --listen=:5432 --catalog-dsn=host=<cluster>-catalog-rw.<ns>.svc port=5432 user=postgres dbname=postgres --catalog-pooler=<cluster>-catalog-rw.<ns>.svc:9091 --insecure-dev`; the superuser password arrives as `PGPASSWORD` from the `<cluster>-superuser` Secret. Replicas start at `spec.router.minReplicas` and are then owned by the HPA. |
+| Deployment | `serve --listen=:5432 --catalog-dsn=host=<cluster>-catalog-rw.<ns>.svc port=5432 user=pgshard_router dbname=postgres --catalog-pooler=<cluster>-catalog-rw.<ns>.svc:9091 --insecure-dev`; the password arrives as `PGPASSWORD` from the `<cluster>-router` Secret. That role is the catalog's own least-privilege login (see [router.md](router.md#startup-and-authentication)) -- not the superuser, whose password is also the seed of the agent control-plane token. Replicas start at `spec.router.minReplicas` and are then owned by the HPA. |
 | Service | ClusterIP on 5432, the endpoint applications connect to. |
 | HorizontalPodAutoscaler | `autoscaling/v2`, CPU utilization target `spec.router.hpa.cpuUtilization` (default 70) between `minReplicas` and `maxReplicas`. |
 | PodDisruptionBudget | `minAvailable: 1`. |
