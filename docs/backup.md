@@ -29,11 +29,54 @@ same idempotent step.
 | `repo1-type` | `spec.objectStore.type`: `s3`, `azure`, `gcs`, `posix`, `sftp` |
 | `repo1-path` | `spec.objectStore.prefix` (default `/pgshard`) |
 | `repo1-bundle`, `repo1-block` | `y` (bundled small files, block-level incrementals) |
-| `repo1-cipher-type` / `repo1-cipher-pass` | `aes-256-cbc` with the `passphrase` key of `spec.objectStore.encryption.secretRef` |
+| `repo1-cipher-type` / `repo1-cipher-pass` | `aes-256-cbc` with the `passphrase` key of `spec.objectStore.encryption.secretRef` (required for a remote store; see below) |
 | `repo1-retention-full` / `repo1-retention-diff` | `spec.retention.full` (default 2) / `spec.retention.differential` |
 | `archive-async=y`, `spool-path=/var/lib/pgbackrest/spool` | asynchronous archive-push/get; the spool lives on the container filesystem |
 | `log-level-console`, `log-level-file` | `spec.logLevel` (default `info`) |
 | `process-max` | `spec.processMax` (default 2) |
+
+### Encryption
+
+A repository holds a complete copy of every database in the cluster, and a
+remote store is somebody else's disk. So `s3`, `azure`, `gcs` and `sftp`
+stores must set `spec.objectStore.encryption.secretRef` -- a Secret with a
+`passphrase` key, which becomes `repo1-cipher-type=aes-256-cbc` and
+`repo1-cipher-pass` -- and the API server rejects a policy that sets
+neither that nor `spec.objectStore.insecureUnencrypted: true`. Storing the
+backups in the clear is a decision somebody can make; it is not one anybody
+should make by not noticing, which is the same shape as
+`spec.internalTLS.insecure`.
+
+A `posix` repository is a volume of this cluster's own and is exempt.
+
+Whatever the policy says, `PgShardBackupPolicy.status.conditions` carries
+`RepositoryEncrypted`: `True` with reason `Encrypted`, `False` with
+`Unencrypted` for a remote store in the clear, or `False` with
+`LocalRepository` for posix.
+
+**A repository's encryption is fixed when its stanza is created.**
+pgBackRest cannot read a repository with a passphrase other than the one it
+was written with, and cannot read an unencrypted one as encrypted either. So:
+
+- rotating the passphrase makes every existing backup unreadable;
+- turning encryption *on* over a repository already written in the clear
+  breaks it in the same way -- `check` and `archive-push` start failing and
+  WAL accumulates on the members.
+
+Either way the answer is a new stanza: a new `objectStore.prefix`, kept
+alongside the old one until its backups are past retention.
+
+An existing cluster whose repository is unencrypted therefore has two honest
+choices, and the API asks for one of them the next time its policy is
+edited: keep the repository and set `insecureUnencrypted: true`, or point
+the policy at a new prefix with `encryption.secretRef` and let the old
+backups age out. Until the policy is edited it keeps working as it is --
+a CEL rule validates writes, not what is already stored.
+
+This needs a cluster with CEL validation ratcheting (Kubernetes 1.30 and
+later): without it a status write re-validates the whole spec, so an
+unencrypted policy that predates this rule would fail its own status
+updates. pgshard is developed and tested against 1.34.
 | `pg1-path`, `pg1-port`, `pg1-socket-path`, `pg1-user` | the member's PGDATA, port, `/tmp` socket and `postgres` |
 
 Store-specific options and the credential Secret keys mounted at

@@ -52,9 +52,10 @@ its members keep `archive_mode=off` until its shard set becomes serving.
 
 ## PgShardBackupPolicy (status subresource)
 
-`spec.objectStore{type: s3|azure|gcs|posix|sftp, bucket, container, endpoint, region, prefix, uriStyle: host|path, verifyTLS, credentialType, credentials.secretRef, encryption.secretRef, sftp{host, user, port, hostKeyCheck}}`,
+`spec.objectStore{type: s3|azure|gcs|posix|sftp, bucket, container, endpoint, region, prefix, uriStyle: host|path, verifyTLS, credentialType, credentials.secretRef, encryption.secretRef, insecureUnencrypted, sftp{host, user, port, hostKeyCheck}}`,
+a remote store requiring `encryption.secretRef` unless `insecureUnencrypted` says otherwise (CEL; see [backup.md](backup.md#encryption)),
 `spec.schedules{full, differential, incremental}` (five-field cron), `spec.retention{full, differential}`, `spec.logLevel`, `spec.processMax`.
-Clusters bind through `spec.backup.policyRef`. `status{observedGeneration, clusters[]{name, lastFullTime, lastDifferentialTime, lastIncrementalTime, healthy, message}, conditions: Valid, BackupHealthy}`.
+Clusters bind through `spec.backup.policyRef`. `status{observedGeneration, clusters[]{name, lastFullTime, lastDifferentialTime, lastIncrementalTime, healthy, message}, conditions: Valid, BackupHealthy, RepositoryEncrypted, and BarrierHealthy when a barrierSchedule is set}`.
 See [backup.md](backup.md).
 
 ## PgShardBackup (status subresource)
