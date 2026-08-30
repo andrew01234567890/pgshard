@@ -480,4 +480,16 @@ func TestRewriteBackfillBatchesWithoutASinglePrimaryKey(t *testing.T) {
 	if versions < 2 {
 		t.Fatalf("every row shares one transaction id: the backfill ran as a single unbounded UPDATE of all %d rows", rewriteRows)
 	}
+	// Between them the batches walk the table about once. Each batch used
+	// to start at the head instead -- the bounded scan for the next rows,
+	// and a sequential scan of the whole table to join the rows it picked
+	// -- so a hundred batches read two orders of magnitude more rows than
+	// the table holds, and the cost grew with the square of its size.
+	var read int64
+	if err := pool.QueryRow(ctx, `SELECT coalesce(seq_tup_read, 0) FROM pg_stat_user_tables WHERE relname = 'ledger'`).Scan(&read); err != nil {
+		t.Fatal(err)
+	}
+	if read > 20*rewriteRows {
+		t.Fatalf("the backfill read %d rows from a table of %d in batches of 100: the batches are rescanning rows earlier ones converted", read, rewriteRows)
+	}
 }
