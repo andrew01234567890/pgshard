@@ -65,7 +65,6 @@ type TableStatus struct {
 	EffectiveShardKey   *string
 	EffectiveGeneration int64
 	WorkflowID          *string
-	Progress            []byte
 	UpdatedAt           time.Time
 	// Migrating marks a table whose writes routers hold while a placement
 	// workflow swaps its shadow tables in.
@@ -181,7 +180,7 @@ func ListShardRanges(ctx context.Context, q Querier, shardSet string) ([]ShardRa
 func ListTableStatus(ctx context.Context, q Querier, database string) ([]TableStatus, error) {
 	rows, err := q.Query(ctx, `
 		SELECT database, schema_name, table_name, effective_placement, effective_shard_key,
-		       effective_generation, workflow_id::text, progress, updated_at, migrating,
+		       effective_generation, workflow_id::text, updated_at, migrating,
 		       reference_checked_generation, reference_hazards,
 		       shard_key_checked_generation, shard_key_error
 		FROM pgshard.table_status WHERE database = $1 ORDER BY schema_name, table_name`, database)
@@ -241,7 +240,7 @@ func ListAllShardRanges(ctx context.Context, q Querier) ([]ShardRange, error) {
 func ListAllTableStatus(ctx context.Context, q Querier) ([]TableStatus, error) {
 	rows, err := q.Query(ctx, `
 		SELECT database, schema_name, table_name, effective_placement, effective_shard_key,
-		       effective_generation, workflow_id::text, progress, updated_at, migrating,
+		       effective_generation, workflow_id::text, updated_at, migrating,
 		       reference_checked_generation, reference_hazards,
 		       shard_key_checked_generation, shard_key_error
 		FROM pgshard.table_status ORDER BY database, schema_name, table_name`)
