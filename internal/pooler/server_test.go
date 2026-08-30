@@ -463,6 +463,36 @@ func TestDrainStartedDuringAcquireIsNotAdopted(t *testing.T) {
 	}
 }
 
+// TestAnIdleClientKeepsItsTransaction: the reservation timeout exists to
+// release a session whose router is gone, not one whose client is thinking.
+// A client sitting inside an open transaction between statements keeps its
+// Execute stream, and a session with a stream is never a candidate for
+// expiry however long it has been idle -- which is what makes a router-side
+// liveness ping unnecessary while the stream is up.
+func TestAnIdleClientKeepsItsTransaction(t *testing.T) {
+	h := startHarness(t, PoolConfig{})
+	ctx := context.Background()
+	if _, err := h.client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: "s", Generation: gen(7, 3)}); err != nil {
+		t.Fatal(err)
+	}
+	stream, _ := h.client.Execute(ctx)
+	roundTrip(t, stream, queryReq("s", "begin", gen(7, 3), identity("alice")))
+	roundTrip(t, stream, queryReq("s", "insert into t values (1)", gen(7, 3), identity("alice")))
+
+	// The client thinks for a very long time. The stream stays up.
+	h.srv.expireReservations(time.Now().Add(100 * h.srv.cfg.ReserveTimeout))
+
+	if h.srv.lookup("s") == nil || h.srv.held() != 1 {
+		t.Fatal("an attached session was expired while its client was idle")
+	}
+	if h.pg.sawQuery("ROLLBACK") || h.pg.sawQuery("DISCARD ALL") {
+		t.Fatalf("the transaction was rolled back under a live client: %v", h.pg.log())
+	}
+	// And it can carry on where it left off.
+	roundTrip(t, stream, queryReq("s", "commit", gen(7, 3), identity("alice")))
+	_ = stream.CloseSend()
+}
+
 func TestReservationWithoutStreamExpires(t *testing.T) {
 	h := startHarness(t, PoolConfig{})
 	ctx := context.Background()

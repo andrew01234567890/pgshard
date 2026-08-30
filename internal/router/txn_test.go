@@ -620,3 +620,37 @@ func TestCoordinatorHeartbeatsWhilePreparing(t *testing.T) {
 		t.Fatal("coordinator never heartbeat its preparing decision row: the resolver would abort a slow live coordinator")
 	}
 }
+
+// TestAnIdleTransactionKeepsItsStream: the pooler releases a reservation
+// whose Execute stream has been gone for ReserveTimeout, which is how a
+// dead router's sessions are reclaimed. A client thinking between two
+// statements of an open transaction must not look like a dead router, and
+// it does not: the router keeps one stream for the transaction rather than
+// reconnecting per statement, so the pooler never sees the session
+// detached and never starts its clock.
+func TestAnIdleTransactionKeepsItsStream(t *testing.T) {
+	h := newTxnHarness(t)
+	ctx := context.Background()
+	a, _ := h.twoTenants(t)
+	shard := h.shardOf(t, a)
+	conn := h.connect(t, h.dsn())
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := h.poolers[shard].totalAttaches()
+	for i := range 3 {
+		if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, $2)", a, int64(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := tx.Exec(ctx, "select * from orders where tenant_id = $1", a); err != nil {
+		t.Fatal(err)
+	}
+	if n := h.poolers[shard].totalAttaches() - before; n > 1 {
+		t.Fatalf("%d Execute streams for one transaction; each gap between them is a detached reservation counting down", n)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+}

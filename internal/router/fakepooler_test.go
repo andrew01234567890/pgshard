@@ -36,6 +36,9 @@ type fakePooler struct {
 	users    []string
 	sleeping map[string]chan struct{}
 	attached map[string]chan struct{}
+	// attaches counts Execute streams ever opened per session, so a test
+	// can tell a session that kept its stream from one that reconnected.
+	attaches map[string]int
 	// holdDetach, when set, keeps the Execute handler attached until it is
 	// closed, so a test can hold a session across the router's abort.
 	holdDetach chan struct{}
@@ -257,7 +260,23 @@ func (f *fakePooler) attach(sid string) error {
 		return status.Error(codes.FailedPrecondition, "session already has an Execute stream")
 	}
 	f.attached[sid] = make(chan struct{})
+	if f.attaches == nil {
+		f.attaches = map[string]int{}
+	}
+	f.attaches[sid]++
 	return nil
+}
+
+// totalAttaches reports how many Execute streams have been opened, over
+// every session.
+func (f *fakePooler) totalAttaches() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, c := range f.attaches {
+		n += c
+	}
+	return n
 }
 
 func (f *fakePooler) detach(sid string) {
