@@ -84,8 +84,17 @@ func TestDeriveAlerts(t *testing.T) {
 			{State: "preparing", CreatedAt: now.Add(-6 * time.Minute)}}}, []string{"TwoPCInDoubtAged"}},
 		{"in-doubt young stays quiet", AlertInputs{Now: now, Decisions: []TwoPCRow{
 			{State: "preparing", CreatedAt: now.Add(-time.Minute)}}}, nil},
-		{"decided rows never fire", AlertInputs{Now: now, Decisions: []TwoPCRow{
-			{State: "commit", CreatedAt: now.Add(-time.Hour)}}}, nil},
+		// A decided row is deleted when the resolver finishes it, so one
+		// that outlives its decision is a transaction it cannot finish,
+		// holding locks, WAL and a vacuum horizon while it waits.
+		{"decided and unfinished", AlertInputs{Now: now, Decisions: []TwoPCRow{
+			{GID: "g1", State: "commit", CreatedAt: now.Add(-2 * time.Hour), DecidedAt: ptrTime(now.Add(-time.Hour))}}},
+			[]string{"TwoPCDecidedUnfinished"}},
+		{"decided moments ago stays quiet", AlertInputs{Now: now, Decisions: []TwoPCRow{
+			{GID: "g2", State: "commit", CreatedAt: now.Add(-time.Hour), DecidedAt: ptrTime(now.Add(-time.Second))}}}, nil},
+		{"an aborted row waits the same way", AlertInputs{Now: now, Decisions: []TwoPCRow{
+			{GID: "g3", State: "abort", CreatedAt: now.Add(-2 * time.Hour), DecidedAt: ptrTime(now.Add(-time.Hour))}}},
+			[]string{"TwoPCDecidedUnfinished"}},
 		{"slot lost", AlertInputs{Now: now, Streams: []StreamSummary{{Name: "s", LostSlots: 1}}}, []string{"StreamSlotLost"}},
 		{"cutover pause", AlertInputs{Now: now, Paused: []WorkflowRow{
 			{ID: "w1", Kind: "reshard", UpdatedAt: now.Add(-time.Hour)}}}, []string{"CutoverPauseExceeded"}},
@@ -197,3 +206,5 @@ func TestAdminServesMetrics(t *testing.T) {
 		t.Fatalf("GET /metrics = %d", rec.Code)
 	}
 }
+
+func ptrTime(t time.Time) *time.Time { return &t }
