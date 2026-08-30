@@ -49,6 +49,8 @@
 | [roles.md](roles.md) | Cluster-wide roles, grants, drift repair |
 | [pooler.md](pooler.md) | Per-shard pooler, SCRAM passthrough, fencing |
 | [placement.md](placement.md) | Extended hash port, key ranges, controller reconcile |
+| [resharding.md](resharding.md) | Reshard and placement workflows: stages, cutover steps, journal, retirement |
+| [upgrade.md](upgrade.md) | Online major upgrade: group replacement, catalog upgrade, rollback window |
 | [streams.md](streams.md) | Logical decoding, slots, VStream, initial copy |
 | [admin.md](admin.md) | Admin UI pages, deployment, security |
 | [pgparser.md](pgparser.md) | Bound PostgreSQL grammar |

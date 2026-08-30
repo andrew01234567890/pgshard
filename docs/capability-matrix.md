@@ -93,17 +93,19 @@ tests are authoritative.
 
 | Capability | Status | Where |
 |---|---|---|
-| Shard-range and re-key edits detected; `reshard`/`table_rekey` workflows recorded; pause/resume RPCs | Partial | `internal/controller/reconcile.go`; workflows stay `pending` — no executor |
-| Data movement, traffic switch, reverse replication, old-group retirement | Planned | building blocks merged (streams, initial copy, role materializer); executor in progress |
-| `PgShardReshard` CRD and `spec.resharding.*` knobs | Partial | API merged and validated; not yet acted on |
-| Major upgrade 18→19 (online or offline) | Planned | `spec.upgrade.*` API only; migrate side by side ([guide/upgrades.md](guide/upgrades.md)) |
+| Shard-range and re-key edits detected; `reshard`/`table_rekey` workflows recorded; pause/resume RPCs | Implemented | `internal/controller/reconcile.go`, `internal/controller/placement.go` |
+| Data movement, traffic switch, reverse replication, old-group retirement | Implemented | `internal/controller/copy.go` (`Copier.Pass`), `cutover.go`, `cutoverpg.go`; e2e `reshard`, `reshard-split`, `reshard-merge` under write load |
+| `PgShardReshard` CRD and `spec.resharding.*` knobs | Implemented | `ClusterReconciler.reconcileReshard` provisions and retires target sets; `pauseBefore`/`proceed` gate the cutover ([resharding.md](resharding.md)) |
+| Table placement changes (unsharded ↔ sharded, → reference, re-key) | Implemented | `internal/controller/placement.go`, `placementpg.go`; shadow build, catch-up, table-scoped swap |
+| Major upgrade 18→19, online (blue/green via logical replication) | Implemented | triggered by a `spec.postgresql.major` change; `internal/controller/upgrade.go`, `internal/operator/catalogupgrade.go`; e2e `upgrade` on 18→19 ([upgrade.md](upgrade.md)) |
+| Major upgrade, offline (`pg_upgrade --link`) | Planned | the online strategy is the only one implemented |
 
 ## Observability and operations
 
 | Capability | Status | Where |
 |---|---|---|
 | Admin UI: topology, backups/restores/restore points, migrations, streams; JSON APIs; SSE live updates | Implemented | `internal/admin`, [admin.md](admin.md) |
-| Admin UI authentication | Planned | front with an authenticating proxy |
+| Admin UI authentication | Implemented | a credential on every route but `/healthz` ([admin.md](admin.md)) |
 | Router metrics endpoint | Implemented | Prometheus metrics across router, pooler, controller and agent; [observability.md](observability.md), `internal/metrics` |
 
 ## Testing and CI

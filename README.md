@@ -43,14 +43,18 @@ exists today:
   explicit refusals for unsupported statements, scatter queries, single-shard transactions and
   two-phase commit, reference tables and sequences; DDL (`docs/ddl.md`).
 - Change streams over logical decoding (`docs/streams.md`) and the admin UI (`docs/admin.md`).
+- Automatic resharding and table placement changes (`docs/resharding.md`): target provisioning,
+  copy, cutover under write load, reverse replication and retirement, exercised on kind by the
+  `reshard`, `reshard-split` and `reshard-merge` e2e suites.
+- Online major upgrades 18→19 (`docs/upgrade.md`), driven by a `spec.postgresql.major` change and
+  exercised by the `upgrade` e2e suite.
 - e2e (kind), chaos and perf harnesses under `test/`.
 
 - Backups to object stores with PITR restore, certified cross-shard restore points and fenced
   barrier restores with two-phase reconciliation (`docs/backup.md`).
 
-Not there yet: the resharding and re-keying workflow executors (edits are detected and recorded as
-pending workflows, `docs/guide/resharding.md`), online major upgrades (`docs/guide/upgrades.md`),
-and most chaos experiments (`test/chaos/README.md` lists the planned catalogue). Design documents
+Not there yet: the offline (`pg_upgrade --link`) upgrade strategy, and most chaos experiments
+(`test/chaos/README.md` lists the planned catalogue). Design documents
 describe intended behaviour; where a document and the code disagree, the code and its tests are
 authoritative — `docs/capability-matrix.md` is the summary.
 

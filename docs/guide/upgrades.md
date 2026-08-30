@@ -1,11 +1,15 @@
 # Major upgrades: PostgreSQL 18 to 19
 
-> **Status: planned.** The CRD carries the upgrade spec
-> (`spec.upgrade.strategy: online | offline`, `spec.upgrade.maxParallelGroups`)
-> and both majors are fully built, tested and released as images, but the
-> operator does not yet act on a `spec.postgresql.major` change. Do not
-> edit `major` on a live cluster. See
-> [capability-matrix.md](../capability-matrix.md).
+> **Status: implemented for the online strategy.** Editing
+> `spec.postgresql.major` is the trigger: the operator provisions groups on
+> the new major, the controller replicates into them and cuts over with the
+> reshard machinery, and the catalog group is upgraded the same way. The
+> kind suite `upgrade` runs 18→19 end to end. `spec.upgrade.strategy:
+> offline` (`pg_upgrade --link`) is still planned and is not acted on.
+>
+> [upgrade.md](../upgrade.md) is the reference for the stages and the
+> rollback window; [capability-matrix.md](../capability-matrix.md) is the
+> per-feature status of record.
 
 ## What exists today
 
