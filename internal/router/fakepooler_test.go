@@ -908,8 +908,20 @@ func (f *fakePooler) Execute(stream pgshardv1.Pooler_ExecuteServer) error {
 	if err != nil {
 		return err
 	}
-	if first.User == nil || first.User.Username == "" || len(first.User.ScramClientKey) == 0 {
+	// The same shape production requires (internal/pooler/server.go): a
+	// session id, a username, and BOTH SCRAM keys at exactly 32 bytes. A
+	// double that accepted any non-empty client key would let the router
+	// send a malformed pair and pass every test here while the real pooler
+	// refused it with InvalidArgument.
+	if first.SessionId == "" {
+		return errors.New("first message must carry the session id")
+	}
+	if first.User == nil || first.User.Username == "" {
 		return errors.New("first message must carry the identity")
+	}
+	if len(first.User.ScramClientKey) != 32 || len(first.User.ScramServerKey) != 32 {
+		return fmt.Errorf("SCRAM client and server keys must be 32 bytes, got %d and %d",
+			len(first.User.ScramClientKey), len(first.User.ScramServerKey))
 	}
 	f.mu.Lock()
 	f.users = append(f.users, first.User.Username)
