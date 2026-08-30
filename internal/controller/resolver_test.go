@@ -1,8 +1,10 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -68,6 +70,9 @@ type flakyDialer struct {
 	inner *PgxShardDialer
 	down  int32
 	dials atomic.Int32
+	// downDatabase fails only the connections opened to finish a prepared
+	// transaction, which are the only ones that name a database.
+	downDatabase string
 }
 
 func (d *flakyDialer) Dial(ctx context.Context, set string, id int32) (ShardConn, error) {
@@ -82,6 +87,9 @@ func (d *flakyDialer) DialDatabase(ctx context.Context, set string, id int32, da
 	d.dials.Add(1)
 	if id == d.down {
 		return nil, fmt.Errorf("shard %s/%d unreachable", set, id)
+	}
+	if database != "" && database == d.downDatabase {
+		return nil, fmt.Errorf("database %q unreachable", database)
 	}
 	return d.inner.DialDatabase(ctx, set, id, database)
 }
@@ -514,5 +522,73 @@ func TestResolverSweepContinuesPastGonePreparedXact(t *testing.T) {
 	}
 	if got := f.values(0); len(got) != 0 {
 		t.Fatalf("shard 0 values %v", got)
+	}
+}
+
+// TestAnUnfinishedParticipantIsNamed: shard ids repeat across shard sets
+// and PostgreSQL finishes a prepared transaction only from the database it
+// was prepared in, so a resolver failure that named neither left an
+// operator searching every set and database for the participant that would
+// not budge.
+func TestAnUnfinishedParticipantIsNamed(t *testing.T) {
+	parallelPG(t)
+	f := newResolverFixture(t)
+	ctx := context.Background()
+	mustExec(t, connect(t, f.shardDSN(0)), "CREATE DATABASE appdb")
+	f.prepareIn(0, "appdb", "pgshard-x-1-1", "stuck")
+	f.decide("pgshard-x-1-1", "commit", 0, 0)
+
+	var log bytes.Buffer
+	f.res.Logger = slog.New(slog.NewTextHandler(&log, nil))
+	f.dialer.downDatabase = "appdb"
+
+	out, err := f.res.Resolve(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The decision pass fails to finish it, and the orphan sweep then
+	// fails on the same prepared transaction, so both count.
+	if out.Unresolved == 0 || out.Committed != 0 {
+		t.Fatalf("outcome %+v, want the commit left unresolved", out)
+	}
+	if got := f.decisions(); len(got) != 1 {
+		t.Fatalf("a decision the resolver could not finish must be kept: %v", got)
+	}
+	for _, want := range []string{"COMMIT PREPARED", "default/0", `database \"appdb\"`, "pgshard-x-1-1"} {
+		if !strings.Contains(log.String(), want) {
+			t.Fatalf("the resolver warning does not say %s:\n%s", want, log.String())
+		}
+	}
+}
+
+// TestAFinishedDecisionIsPrunedBeforeItsXidFreezes: a decision row that
+// outlives the transaction it decided becomes unverifiable once its
+// transaction id freezes past the clog horizon, and a restore then fences
+// a cluster that is perfectly consistent. The router deletes the row when
+// it finishes the commit itself; this is the other path, where that delete
+// never happened and nothing holds the transaction any more.
+func TestAFinishedDecisionIsPrunedBeforeItsXidFreezes(t *testing.T) {
+	parallelPG(t)
+	f := newResolverFixture(t)
+	ctx := context.Background()
+
+	// Committed everywhere and no longer prepared anywhere: exactly what a
+	// row looks like when the coordinator died between COMMIT PREPARED and
+	// deleting it.
+	f.decide("pgshard-finished-1", "commit", time.Hour, 0, 1)
+	f.decide("pgshard-finished-2", "abort", time.Hour, 1)
+	if got := f.decisions(); len(got) != 2 {
+		t.Fatalf("decisions before the pass: %v", got)
+	}
+
+	out, err := f.res.Resolve(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Unresolved != 0 {
+		t.Fatalf("outcome %+v, want the rows settled", out)
+	}
+	if got := f.decisions(); len(got) != 0 {
+		t.Fatalf("decision rows left to freeze: %v", got)
 	}
 }

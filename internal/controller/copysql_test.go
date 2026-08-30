@@ -228,10 +228,36 @@ func TestProgressNamesItsBlockers(t *testing.T) {
 	}
 }
 
-func TestProgressWithoutBlockersIsUnchanged(t *testing.T) {
-	p := Aggregate([]SubscriptionProgress{{Name: "s", Rels: map[RelState]int{'r': 4}, LagBytes: 12}})
-	if got := p.Describe(); got != "4/4 tables ready, lag 12 bytes" {
+func TestProgressWithoutBlockersNamesOnlyTheLag(t *testing.T) {
+	p := Aggregate([]SubscriptionProgress{{Name: "app/s", Rels: map[RelState]int{'r': 4}, LagBytes: 12}})
+	if got := p.Describe(); got != "4/4 tables ready, lag 12 bytes on app/s" {
 		t.Fatalf("describe = %q", got)
+	}
+}
+
+// TestTheLaggingSubscriptionIsNamed: the lag is a maximum over every
+// subscription of every database, and a number with no owner sends an
+// operator to the subscription views on each target to find out whose it
+// is. The same for a lag that cannot be read at all.
+func TestTheLaggingSubscriptionIsNamed(t *testing.T) {
+	p := Aggregate([]SubscriptionProgress{
+		{Name: "app/pgshard_reshard_g2_t0_s0", Rels: map[RelState]int{'r': 2}, LagBytes: 10, Enabled: true},
+		{Name: "orders/pgshard_reshard_g2_t1_s1", Rels: map[RelState]int{'r': 2}, LagBytes: 900, Enabled: true},
+		{Name: "app/pgshard_reshard_g2_t1_s0", Rels: map[RelState]int{'r': 2}, LagBytes: 30, Enabled: true},
+	})
+	if p.LagBytes != 900 || p.LagFrom != "orders/pgshard_reshard_g2_t1_s1" {
+		t.Fatalf("lag %d from %q, want 900 from the subscription reporting it", p.LagBytes, p.LagFrom)
+	}
+	if got := p.Describe(); !strings.Contains(got, "lag 900 bytes on orders/pgshard_reshard_g2_t1_s1") {
+		t.Fatalf("describe = %q", got)
+	}
+
+	unknown := Aggregate([]SubscriptionProgress{
+		{Name: "app/pgshard_reshard_g2_t0_s0", Rels: map[RelState]int{'r': 2}, LagBytes: 10, Enabled: true},
+		{Name: "app/pgshard_reshard_g2_t1_s0", Rels: map[RelState]int{'r': 2}, LagBytes: LagUnknown, Enabled: true},
+	})
+	if unknown.LagBytes != LagUnknown || unknown.LagFrom != "app/pgshard_reshard_g2_t1_s0" {
+		t.Fatalf("lag %d from %q, want the subscription whose lag could not be read", unknown.LagBytes, unknown.LagFrom)
 	}
 }
 

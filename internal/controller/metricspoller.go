@@ -44,7 +44,6 @@ func (p *MetricsPoller) Refresh(ctx context.Context) error {
 		return err
 	}
 	m.Workflows.Reset()
-	var paused float64
 	for rows.Next() {
 		var kind, state string
 		var n int64
@@ -53,15 +52,35 @@ func (p *MetricsPoller) Refresh(ctx context.Context) error {
 			return err
 		}
 		m.Workflows.WithLabelValues(kind, state).Set(float64(n))
-		if state == StatePaused {
-			paused += float64(n)
-		}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	m.CutoverPaused.Set(paused)
+
+	// A configured cutover pause holds a workflow that is still running --
+	// only an operator pauses the workflow itself -- so counting the ones
+	// in state paused reported a manual pause at any stage and never the
+	// automatic gate this is named for. A workflow that reaches a pause is
+	// one line here, carrying enough to say which one it is.
+	rows, err = p.Pool.Query(ctx, `SELECT kind, coalesce(spec->>'shard_set', ''), id::text, status->'cutover'->>'pause'
+		FROM pgshard.workflows WHERE state = $1 AND status->'cutover'->>'pause' IS NOT NULL`, StateRunning)
+	if err != nil {
+		return err
+	}
+	m.CutoverPaused.Reset()
+	for rows.Next() {
+		var kind, set, id, pause string
+		if err := rows.Scan(&kind, &set, &id, &pause); err != nil {
+			rows.Close()
+			return err
+		}
+		m.CutoverPaused.WithLabelValues(kind, set, id, pause).Set(1)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
 
 	rows, err = p.Pool.Query(ctx, `SELECT kind, id::text,
 		       CASE WHEN coalesce((status->'progress'->>'tables_total')::float8, 0) > 0
@@ -88,18 +107,71 @@ func (p *MetricsPoller) Refresh(ctx context.Context) error {
 		return err
 	}
 
+	// A cutover step past the journal has no timeout and no attempt limit,
+	// and every pass rewrites updated_at, so a step that has been failing
+	// for hours looks exactly like a workflow that is getting on with it.
+	// Its age is the difference.
+	rows, err = p.Pool.Query(ctx, `SELECT kind, id::text, coalesce(status->>'stage', ''), coalesce(status->'cutover'->>'step', ''),
+		extract(epoch FROM now() - (status->'cutover'->>'step_since')::timestamptz)
+		FROM pgshard.workflows
+		WHERE state = $1 AND status->'cutover'->>'step_since' IS NOT NULL`, StateRunning)
+	if err != nil {
+		return err
+	}
+	m.WorkflowStepAge.Reset()
+	for rows.Next() {
+		var kind, id, stage, step string
+		var age float64
+		if err := rows.Scan(&kind, &id, &stage, &step, &age); err != nil {
+			rows.Close()
+			return err
+		}
+		m.WorkflowStepAge.WithLabelValues(kind, id, stage, step).Set(age)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// A row survives its decision only while the resolver cannot finish it:
+	// finishing deletes it. So a decided row is not history, it is a
+	// transaction still holding locks, WAL and a vacuum horizon on every
+	// participant -- aged from the decision, since that is when finishing
+	// it became the only thing left to do.
+	rows, err = p.Pool.Query(ctx, `SELECT state, count(*), extract(epoch FROM now() - min(coalesce(decided_at, created_at)))
+		FROM pgshard.xact_decisions GROUP BY state`)
+	if err != nil {
+		return err
+	}
+	m.Decided.Reset()
+	m.DecidedOldestAge.Reset()
 	var inDoubt int64
-	var oldest *float64
-	if err := p.Pool.QueryRow(ctx, `SELECT count(*), extract(epoch FROM now() - min(created_at))
-		FROM pgshard.xact_decisions WHERE state = 'preparing'`).Scan(&inDoubt, &oldest); err != nil {
+	var inDoubtOldest float64
+	for rows.Next() {
+		var state string
+		var n int64
+		var oldest *float64
+		if err := rows.Scan(&state, &n, &oldest); err != nil {
+			rows.Close()
+			return err
+		}
+		age := 0.0
+		if oldest != nil {
+			age = *oldest
+		}
+		if state == "preparing" {
+			inDoubt, inDoubtOldest = n, age
+			continue
+		}
+		m.Decided.WithLabelValues(state).Set(float64(n))
+		m.DecidedOldestAge.WithLabelValues(state).Set(age)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
 		return err
 	}
 	m.InDoubt.Set(float64(inDoubt))
-	if oldest != nil {
-		m.InDoubtOldestAge.Set(*oldest)
-	} else {
-		m.InDoubtOldestAge.Set(0)
-	}
+	m.InDoubtOldestAge.Set(inDoubtOldest)
 
 	rows, err = p.Pool.Query(ctx, `SELECT state, count(*) FROM pgshard.migrations GROUP BY state`)
 	if err != nil {

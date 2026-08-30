@@ -321,17 +321,24 @@ func (r *Resolver) resolveDecision(ctx context.Context, d decision, holders map[
 // finishes a prepared transaction from the database it was prepared in, so
 // the connection targets h's database, not the DSN's default one.
 func (r *Resolver) finishOn(ctx context.Context, h holder, commit bool, gid string) error {
-	conn, err := r.Shards.DialDatabase(ctx, h.Shard.Set, h.Shard.ID, h.Database)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = conn.Close(ctx) }()
 	verb := "ROLLBACK PREPARED"
 	if commit {
 		verb = "COMMIT PREPARED"
 	}
-	_, err = conn.Exec(ctx, verb+" "+quoteLiteral(gid))
-	return err
+	// Shard ids repeat across shard sets, and PostgreSQL will only finish a
+	// prepared transaction from the database it was prepared in, so an
+	// error naming neither leaves an operator to search every set and
+	// database for the participant that would not budge.
+	where := fmt.Sprintf("%s on %s/%d database %q", verb, h.Shard.Set, h.Shard.ID, h.Database)
+	conn, err := r.Shards.DialDatabase(ctx, h.Shard.Set, h.Shard.ID, h.Database)
+	if err != nil {
+		return fmt.Errorf("%s: %w", where, err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if _, err := conn.Exec(ctx, verb+" "+quoteLiteral(gid)); err != nil {
+		return fmt.Errorf("%s: %w", where, err)
+	}
+	return nil
 }
 
 // sweepOrphans finishes the remaining prepared transactions no decision
@@ -416,6 +423,7 @@ func (r *Resolver) Run(ctx context.Context, interval time.Duration, leader func(
 		if r.Metrics != nil {
 			r.Metrics.ResolvedTxns.WithLabelValues("committed").Add(float64(out.Committed))
 			r.Metrics.ResolvedTxns.WithLabelValues("rolled_back").Add(float64(out.RolledBack))
+			r.Metrics.ResolverUnresolved.Set(float64(out.Unresolved))
 		}
 	})
 }

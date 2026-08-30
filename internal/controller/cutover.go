@@ -96,11 +96,24 @@ type cutoverState struct {
 	FenceMS    int64      `json:"fence_ms,omitempty"`
 	SwitchedAt *time.Time `json:"switched_at,omitempty"`
 	Gate       string     `json:"gate,omitempty"`
+	// Pause names the configured pause holding the workflow
+	// (PauseSwitchWrites or PauseComplete) and PausedAt when it began.
+	// A configured pause leaves the workflow running -- only an operator
+	// pauses the workflow itself -- so its top-level state says nothing
+	// about it, and every pass rewrites updated_at, so the age of one
+	// cannot be read from the row either.
+	Pause    string     `json:"pause,omitempty"`
+	PausedAt *time.Time `json:"paused_at,omitempty"`
 	// StepSince is when the current step was entered. After the journal
 	// every error is retried without a timeout or attempt limit, and each
 	// pass refreshes updated_at, so a step that has failed for hours is
 	// indistinguishable from a healthy running workflow without this.
 	StepSince *time.Time `json:"step_since,omitempty"`
+	// StepRetries counts the passes the current step has failed. Before
+	// the journal a step gives up; after it there is nothing to do but
+	// retry, so this and StepSince are the only measure of a step that is
+	// getting nowhere.
+	StepRetries int `json:"step_retries,omitempty"`
 	// Schema fingerprints both sets at the switch, keyed set/shard/database.
 	// Logical replication carries no DDL, so a rollback has to prove the
 	// sources were not left structurally behind while they were idle.
@@ -111,7 +124,14 @@ type cutoverState struct {
 // stampStep records when the current step was entered.
 func (s *cutoverState) stampStep(now time.Time) {
 	t := now
-	s.StepSince = &t
+	s.StepSince, s.StepRetries = &t, 0
+}
+
+// stalled reports whether the current step has been going nowhere long
+// enough to be worth an operator's attention rather than a line in a log
+// nobody reads.
+func (s *cutoverState) stalled(now time.Time) bool {
+	return s.StepSince != nil && now.Sub(*s.StepSince) >= stalledAfter
 }
 
 // stalledFor renders how long the current step has been retrying, once that
@@ -219,6 +239,26 @@ type cutoverOps interface {
 	// reverse replication (errRetry while behind), carry the sequences
 	// back and flip the serving map to the source set.
 	Rollback(ctx context.Context) error
+	// DropJournal removes the journal rows this run wrote on its sources.
+	DropJournal(ctx context.Context, id string) error
+}
+
+// sourceRetiredError marks a switch that can never proceed, as against one
+// that cannot proceed yet: its source set is no longer serving, and nothing
+// returns a retired set to serving. Retrying such a step forever holds the
+// run's replication slots, and with them the sources' WAL.
+type sourceRetiredError struct{ err error }
+
+func (e *sourceRetiredError) Error() string { return e.err.Error() }
+func (e *sourceRetiredError) Unwrap() error { return e.err }
+
+func sourceRetired(format string, args ...any) error {
+	return &sourceRetiredError{fmt.Errorf(format, args...)}
+}
+
+func isSourceRetired(err error) bool {
+	var e *sourceRetiredError
+	return errors.As(err, &e)
 }
 
 func isFatal(err error) bool {
@@ -287,9 +327,11 @@ func (c *Copier) gate(ctx context.Context, wf *copyWorkflow, ops cutoverOps) (bo
 	}
 	if wf.spec.paused(PauseSwitchWrites) {
 		wf.cutover.Gate = "paused before switchWrites"
+		c.holdAt(wf, PauseSwitchWrites)
 		return false, c.saveCutover(ctx, wf, "paused before switchWrites: waiting for proceed")
 	}
 	wf.cutover.Gate = ""
+	c.released(wf)
 	wf.cutover.Step = StepFence
 	wf.stage = StageSwitching
 	return true, c.saveCutover(ctx, wf, "switch gate open: switching writes")
@@ -328,7 +370,20 @@ func (c *Copier) switchWrites(ctx context.Context, wf *copyWorkflow, ops cutover
 		}
 		waiting, err := c.runStep(ctx, wf, ops, step)
 		if err != nil {
+			if isSourceRetired(err) {
+				return c.abandonSwitch(ctx, wf, ops, err.Error())
+			}
 			if !beforeJournal(step) {
+				// Nothing undoes a step past the journal, so the only
+				// honest report is how long it has been failing and how
+				// often. Saving it here also means a stalled switch reads
+				// as one in the catalog, not as a workflow updated a
+				// moment ago.
+				wf.cutover.StepRetries++
+				msg := fmt.Sprintf("switching: step %s failed %d time(s): %v", step, wf.cutover.StepRetries, err)
+				if serr := c.saveCutover(ctx, wf, msg+wf.cutover.stalledFor(c.now())); serr != nil {
+					return false, serr
+				}
 				return false, err
 			}
 			if !errors.Is(err, errRetry) {
@@ -596,6 +651,36 @@ func (c *Copier) mayAbort(wf *copyWorkflow) bool {
 	return wf.cutover.FencedAt != nil && wf.cutover.JournalID == ""
 }
 
+// abandonSwitch ends a switch that can never finish because its source set
+// was retired underneath it, releasing everything the run holds.
+//
+// The journal is the point of no return because its rows tell every change
+// stream consumer that the cutover happened, and nothing retracts that.
+// That reasoning assumes the cutover then happens. Here it cannot: another
+// workflow already flipped and retired these sources, so this run's journal
+// rows point consumers at a target set that will never serve. Leaving them
+// sends a consumer that has not read them yet to a dead end, so they are
+// removed with the rest of what the run holds -- and a consumer that
+// repositioned on them before that has to resume from the set now serving,
+// which is what it would have done had these rows never existed.
+//
+// What is not released here is the target set: it holds a copy no one is
+// serving, and tearing it down is the operator's decision, not a step in
+// unwinding the switch.
+func (c *Copier) abandonSwitch(ctx context.Context, wf *copyWorkflow, ops cutoverOps, reason string) (bool, error) {
+	if err := ops.DropJournal(ctx, wf.cutover.JournalID); err != nil {
+		return false, err
+	}
+	if err := ops.Release(ctx); err != nil {
+		return false, err
+	}
+	if err := ops.Complete(ctx); err != nil {
+		return false, err
+	}
+	wf.stage = StageFailed
+	return true, c.finishCutover(ctx, wf, StateFailed, "abandoned: "+reason)
+}
+
 // abortSwitch undoes the fence before the journal and returns to the gate,
 // failing the workflow once the attempts are used up.
 func (c *Copier) abortSwitch(ctx context.Context, wf *copyWorkflow, ops cutoverOps, reason string) (bool, error) {
@@ -621,10 +706,28 @@ func (c *Copier) retire(ctx context.Context, wf *copyWorkflow) (bool, error) {
 		}
 	}
 	if wf.spec.paused(PauseComplete) {
+		c.holdAt(wf, PauseComplete)
 		return false, c.saveCutover(ctx, wf, "paused before complete: waiting for proceed")
 	}
+	c.released(wf)
 	wf.stage = StageCompleting
 	return true, c.saveCutover(ctx, wf, "completing: dropping reverse replication")
+}
+
+// holdAt records which configured pause is holding the workflow, and since
+// when. The timestamp is written once: a pause that keeps being observed is
+// the same pause, and refreshing it would report every one as new.
+func (c *Copier) holdAt(wf *copyWorkflow, point string) {
+	if wf.cutover.Pause == point {
+		return
+	}
+	at := c.now()
+	wf.cutover.Pause, wf.cutover.PausedAt = point, &at
+}
+
+// released clears the pause once the workflow moves past it.
+func (c *Copier) released(wf *copyWorkflow) {
+	wf.cutover.Pause, wf.cutover.PausedAt = "", nil
 }
 
 func beforeJournal(step string) bool {
