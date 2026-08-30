@@ -147,6 +147,10 @@ type fakeShards struct {
 	// rewrite scripting
 	columns      []string
 	pks          []string
+	pkType       string
+	batchCursor  map[int32][]string
+	batchNext    func(id int32, call int) []string
+	batchCalls   map[int32]int
 	hiddenExists func(shard int32) bool
 	oldDefault   string
 	oldNotNull   bool
@@ -239,6 +243,9 @@ func (c *fakeConn) Exec(_ context.Context, sql string, _ ...any) (pgconnTag, err
 }
 
 func (c *fakeConn) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
+	if strings.Contains(sql, "WITH batch AS") {
+		return c.batch(sql, args)
+	}
 	switch {
 	case strings.Contains(sql, "server_version_num"):
 		return &intRows{vals: []int{c.f.version}}, nil
@@ -250,7 +257,12 @@ func (c *fakeConn) Query(_ context.Context, sql string, args ...any) (pgx.Rows, 
 		return &stringRows{vals: c.f.columns}, nil
 	case strings.Contains(sql, "indisprimary"):
 		return &stringRows{vals: c.f.pks}, nil
-	case strings.Contains(sql, "::text FROM") && strings.Contains(sql, "LIMIT 1"):
+	case strings.Contains(sql, "format_type"):
+		if c.f.pkType == "" {
+			return &stringRows{vals: []string{"bigint"}}, nil
+		}
+		return &stringRows{vals: []string{c.f.pkType}}, nil
+	case strings.Contains(sql, "AS at FROM") && strings.Contains(sql, "LIMIT 1"):
 		c.f.mu.Lock()
 		if c.f.probeCalls == nil {
 			c.f.probeCalls = map[int32]int{}
@@ -311,6 +323,67 @@ func (c *fakeConn) Query(_ context.Context, sql string, args ...any) (pgx.Rows, 
 	}
 	return nil, fmt.Errorf("unexpected query %q", sql)
 }
+
+// batch answers one backfill batch: it records the cursor it started
+// from, counts the pass and returns the last key the pass selected.
+func (c *fakeConn) batch(sql string, args []any) (pgx.Rows, error) {
+	c.f.mu.Lock()
+	c.f.ran[c.id] = append(c.f.ran[c.id], sql)
+	at := "<start>"
+	if len(args) == 1 {
+		if v, ok := args[0].(string); ok {
+			at = v
+		}
+	}
+	if c.f.batchCursor == nil {
+		c.f.batchCursor = map[int32][]string{}
+	}
+	if c.f.batchCalls == nil {
+		c.f.batchCalls = map[int32]int{}
+	}
+	c.f.batchCursor[c.id] = append(c.f.batchCursor[c.id], at)
+	call := c.f.batchCalls[c.id]
+	c.f.batchCalls[c.id] = call + 1
+	next, exec := c.f.batchNext, c.f.exec
+	c.f.mu.Unlock()
+	if exec != nil {
+		if err := exec(c.id, sql); err != nil {
+			return nil, err
+		}
+	}
+	if next == nil {
+		return &maxRows{}, nil
+	}
+	return &maxRows{val: next(c.id, call)}, nil
+}
+
+// maxRows is the one nullable text column a backfill batch returns.
+type maxRows struct {
+	val  []string
+	done bool
+}
+
+func (r *maxRows) Close()                                       {}
+func (r *maxRows) Err() error                                   { return nil }
+func (r *maxRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (r *maxRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (r *maxRows) Next() bool                                   { done := r.done; r.done = true; return !done }
+func (r *maxRows) Scan(dest ...any) error {
+	p, ok := dest[0].(**string)
+	if !ok {
+		return fmt.Errorf("backfill batch scanned into %T", dest[0])
+	}
+	if len(r.val) == 0 {
+		*p = nil
+		return nil
+	}
+	v := r.val[0]
+	*p = &v
+	return nil
+}
+func (r *maxRows) Values() ([]any, error) { return []any{r.val}, nil }
+func (r *maxRows) RawValues() [][]byte    { return nil }
+func (r *maxRows) Conn() *pgx.Conn        { return nil }
 
 func (c *fakeConn) Close(context.Context) error { return nil }
 
