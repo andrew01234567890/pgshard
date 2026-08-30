@@ -439,6 +439,13 @@ func (r *ClusterReconciler) failover(ctx context.Context, c *pgshardv1alpha1.PgS
 	if err := r.Agents.Promote(ctx, agentAddr(members[candidate].ip), uint64(epoch), candidate); err != nil {
 		return state, fmt.Errorf("promote %s: %w", candidate, err)
 	}
+	// A promotion mid-barrier hands service to a member that never received
+	// the pause, and the agent rewrote postgresql.auto.conf on its way up.
+	// Reapply it from the fence before the new primary is labelled to serve,
+	// rather than leaving the gap for the next reconcile to close.
+	if err := r.pauseIfFenced(ctx, c, g, HostDSN(members[candidate].ip, password), password); err != nil {
+		return state, err
+	}
 	if err := r.patchRole(ctx, members[candidate].pod, RolePrimary); err != nil {
 		return state, err
 	}
@@ -458,6 +465,27 @@ func (r *ClusterReconciler) failover(ctx context.Context, c *pgshardv1alpha1.PgS
 	r.unhealthyFor(g.Prefix(), false)
 	log.Info("failover complete", "primary", candidate, "epoch", epoch)
 	return state, nil
+}
+
+// pauseIfFenced makes a primary refuse writes when the catalog write fence
+// is raised, so a group that changes primary during a barrier comes back
+// holding still rather than serving writes the barrier believes are stopped.
+func (r *ClusterReconciler) pauseIfFenced(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, dsn, password string) error {
+	if g.Kind != "shard" {
+		return nil
+	}
+	fenced, err := r.Prober.WriteFenced(ctx, DSN(Groups(c)[0].ServiceRW(), c.Namespace, password))
+	if err != nil {
+		return fmt.Errorf("read the write fence: %w", err)
+	}
+	if !fenced {
+		return nil
+	}
+	if err := r.Prober.PauseWrites(ctx, dsn); err != nil {
+		return fmt.Errorf("pause the promoted primary: %w", err)
+	}
+	logf.FromContext(ctx).Info("promoted under a raised write fence; the new primary refuses writes", "group", g.Name())
+	return nil
 }
 
 // quiesce waits until the old primary no longer answers as a running primary
