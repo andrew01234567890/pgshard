@@ -221,7 +221,10 @@ func TestRouterShardedRouting(t *testing.T) {
 			{"update orders set tenant_id = 1 where tenant_id = 2", "shard key is immutable"},
 			{"delete from orders", "scatter DELETE without a shard key predicate is not available yet"},
 			{"select * from orders where tenant_id::text = '7'::text", "shard key column tenant_id is compared through a cast"},
-			{"alter table orders set unlogged", "rewrite-class DDL is not available yet"},
+			// The refusal is the durability one, not the rewrite-class one: an
+			// unlogged relation is emptied by crash recovery whatever pgshard
+			// can rewrite.
+			{"alter table orders set unlogged", "an unlogged relation is emptied by crash recovery"},
 			{"create table orders (id int primary key, tenant_id int8)", "primary key or unique constraint (id) on sharded table \"orders\" must include the shard key \"tenant_id\""},
 		} {
 			_, err := conn.Exec(ctx, c.sql)

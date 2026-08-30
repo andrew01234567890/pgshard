@@ -68,7 +68,9 @@ chmod 600 "$PGDATA/server.key"
 echo "include_if_exists = '/override/pgshard.override.conf'" >> "$PGDATA/postgresql.conf"
 exec postgres -D "$PGDATA"`
 	out, err := exec.Command("docker", "run", "-d", "--name", name, "--user", "postgres", "--shm-size", "2g",
-		"-e", "PGDATA=/tmp/pgdata", "-v", dir+":/override:ro", img, "sh", "-c", script).CombinedOutput()
+		// The image runs pgshard-agent as PID 1, so a script needs the
+		// entrypoint replaced rather than appended to.
+		"--entrypoint", "sh", "-e", "PGDATA=/tmp/pgdata", "-v", dir+":/override:ro", img, "-c", script).CombinedOutput()
 	if err != nil {
 		t.Fatalf("docker run: %v\n%s", err, out)
 	}

@@ -392,7 +392,10 @@ func TestRouterDDLMigrations(t *testing.T) {
 		}
 		_ = tx.Rollback(ctx)
 		for _, c := range []struct{ sql, msg string }{
-			{"alter table orders set unlogged", "rewrite-class DDL is not available yet"},
+			// The refusal is the durability one, not the rewrite-class one: an
+			// unlogged relation is emptied by crash recovery whatever pgshard
+			// can rewrite.
+			{"alter table orders set unlogged", "an unlogged relation is emptied by crash recovery"},
 			{"alter table orders drop column tenant_id", "cannot be dropped, renamed or retyped"},
 			{"drop table orders, notes", "one DDL statement cannot touch both sharded and unsharded tables"},
 		} {
