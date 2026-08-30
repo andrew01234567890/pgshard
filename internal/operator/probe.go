@@ -129,42 +129,40 @@ func HostDSN(host, password string) string {
 // PgxProber is the production Prober.
 type PgxProber struct{}
 
-// Probe runs SELECT 1 and reads replication state on the primary.
+// probePrimarySQL reads everything a primary probe needs in one row: that
+// the server answers at all, that it is not in recovery, which standbys are
+// streaming, and the synchronous standby list. It used to be four
+// statements -- SELECT 1, pg_is_in_recovery(), the pg_stat_replication scan
+// and SHOW -- and the operator runs this for every member of every group on
+// every pass, so it was four round trips where one does.
+//
+// The aggregate is legal beside the two function calls because neither
+// refers to a column of pg_stat_replication; with no rows the filtered
+// array_agg is NULL, which coalesce turns into the empty array.
+const probePrimarySQL = `SELECT pg_is_in_recovery(),
+	current_setting('synchronous_standby_names'),
+	coalesce(array_agg(application_name) FILTER (WHERE state = 'streaming'), '{}')
+	FROM pg_stat_replication`
+
+// Probe reads liveness and replication state from the primary.
 func (PgxProber) Probe(ctx context.Context, dsn string) (PrimaryState, error) {
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		return PrimaryState{}, err
 	}
 	defer func() { _ = conn.Close(ctx) }()
-	var one int
-	if err := conn.QueryRow(ctx, "SELECT 1").Scan(&one); err != nil || one != 1 {
-		return PrimaryState{}, fmt.Errorf("SELECT 1: %w", err)
-	}
 	var recovery bool
-	if err := conn.QueryRow(ctx, "SELECT pg_is_in_recovery()").Scan(&recovery); err != nil {
+	var syncNames string
+	var streaming []string
+	if err := conn.QueryRow(ctx, probePrimarySQL).Scan(&recovery, &syncNames, &streaming); err != nil {
 		return PrimaryState{}, err
 	}
 	if recovery {
 		return PrimaryState{}, fmt.Errorf("primary service points at a standby")
 	}
-	st := PrimaryState{Streaming: map[string]bool{}}
-	rows, err := conn.Query(ctx, "SELECT application_name FROM pg_stat_replication WHERE state = 'streaming'")
-	if err != nil {
-		return PrimaryState{}, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return PrimaryState{}, err
-		}
+	st := PrimaryState{Streaming: make(map[string]bool, len(streaming)), SyncStandbyNames: syncNames}
+	for _, name := range streaming {
 		st.Streaming[name] = true
-	}
-	if err := rows.Err(); err != nil {
-		return PrimaryState{}, err
-	}
-	if err := conn.QueryRow(ctx, "SHOW synchronous_standby_names").Scan(&st.SyncStandbyNames); err != nil {
-		return PrimaryState{}, err
 	}
 	return st, nil
 }
