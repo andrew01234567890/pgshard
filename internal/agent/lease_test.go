@@ -173,3 +173,33 @@ func takeOver(ctx context.Context, t *testing.T, client coordclient.LeaseInterfa
 		t.Fatal(err)
 	}
 }
+
+// TestLeaseIsLabelledWithItsCluster: a namespace can hold several clusters,
+// and every other object pgshard creates says which one it belongs to. A
+// Lease that does not can only be attributed by matching names, and a
+// cluster called "a" prefixes "ab"'s objects.
+func TestLeaseIsLabelledWithItsCluster(t *testing.T) {
+	cs := fake.NewClientset()
+	client := cs.CoordinationV1().Leases("ns")
+	ctx := context.Background()
+	l := NewLeaseWithClient(client, leaseCfg("pod-a"), slog.New(slog.DiscardHandler))
+	if err := l.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := client.Get(ctx, "c1-s0-primary", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Labels[LabelCluster] != "c1" {
+		t.Fatalf("labels %v, want %s=c1", got.Labels, LabelCluster)
+	}
+	// And a renewal keeps it: the label must not depend on which pass
+	// created the object.
+	if err := l.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = client.Get(ctx, "c1-s0-primary", metav1.GetOptions{})
+	if got.Labels[LabelCluster] != "c1" {
+		t.Fatalf("after a renewal: labels %v", got.Labels)
+	}
+}
