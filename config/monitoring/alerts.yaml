@@ -91,13 +91,30 @@ spec:
           annotations:
             summary: The operator is failing to reconcile
             description: controller-runtime reconcile errors are persistent; check the operator logs.
+        - alert: PgshardTwoPCDecidedUnfinished
+          expr: max by (decision) (pgshard_controller_decided_oldest_age_seconds) > 300
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: A decided two-phase transaction is still not finished
+            description: >-
+              A {{ $labels.decision }} decision has waited more than five
+              minutes for the resolver to finish it on every participant.
+              The row is deleted as soon as it is finished, so one that
+              outlives its decision is holding locks, WAL and a vacuum
+              horizon on each participant meanwhile. Check
+              pgshard_controller_resolver_unresolved and the resolver logs.
         - alert: PgshardCutoverPaused
           expr: pgshard_controller_cutover_paused > 0
           for: 30m
           labels:
             severity: warning
           annotations:
-            summary: A workflow is paused at cutover
+            summary: A workflow is held at a configured cutover pause
             description: >-
-              A reshard/placement/upgrade workflow has been paused for more
-              than 30 minutes and is waiting for an operator to resume it.
+              {{ $labels.kind }} workflow {{ $labels.id }} on shard set
+              {{ $labels.shard_set }} has waited more than 30 minutes at its
+              configured pause before {{ $labels.pause }}; it proceeds only
+              when an operator lets it. Workflows an operator paused outright
+              are pgshard_controller_workflows{state="paused"} instead.

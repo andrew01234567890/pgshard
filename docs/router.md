@@ -16,13 +16,37 @@ the rest with `0A000`. See *Routing* below.
 ## Startup and authentication
 
 - **Catalog.** `--catalog-dsn` must be able to read `pgshard.roles.verifier`
-  (`pgshard_system`, `pgshard_admin` or a superuser). The router follows the
-  catalog through the snapshot watcher (LISTEN/NOTIFY plus periodic reload)
-  and refuses to listen until the first snapshot arrives (`--snapshot-wait`).
+  and to write the decision log and the migration queue. The operator points
+  it at `pgshard_router`, a login role the catalog schema creates for exactly
+  that: `pgshard_admin` and `pgshard_reader` plus INSERT/UPDATE/DELETE on
+  `pgshard.xact_decisions` and INSERT/UPDATE on `pgshard.migrations`, with no
+  superuser, `CREATEROLE` or `CREATEDB`. Its password is generated per
+  cluster into the Secret `<cluster>-router`.
+
+  It is deliberately **not** the superuser: the router is the one component
+  untrusted clients connect to, parsing their protocol and their SQL, and the
+  superuser password is also the seed of the agent control-plane token
+  (`internal/agentauth`) — one compromised router would otherwise be the
+  whole cluster. Running the router by hand with a superuser DSN still works
+  and is what the development harnesses do.
+
+  The router follows the catalog through the snapshot watcher (LISTEN/NOTIFY
+  plus periodic reload) and refuses to listen until the first snapshot
+  arrives (`--snapshot-wait`).
 - **SCRAM.** Every session authenticates with SCRAM-SHA-256 against the
   verifier stored in `pgshard.roles`; verifiers are cached for `--roles-ttl`
-  (5s) and reloaded on a miss so new roles work immediately. A wrong password
-  or an unknown role is `28P01`. The keys recovered from the exchange
+  (5s), reloaded on a miss so new roles work immediately, and reloaded once
+  per TTL when a cached credential is the thing refusing -- a password
+  renewed or a role re-enabled a moment ago otherwise looks disabled until
+  the TTL comes round. A wrong password
+  or an unknown role is `28P01`, and so is a role that may not log in or
+  whose password has expired **until the client proves the password**: the
+  exchange runs either way, and the refusal that names the role (`28000`,
+  "not permitted to log in", "password has expired") is relayed only to a
+  caller who got the password right. Answering it earlier told anyone who
+  asked whether a role existed, since an unknown one gets a mock exchange.
+  PostgreSQL draws the same line -- `rolcanlogin` is checked after
+  authentication, not before. The keys recovered from the exchange
   (`ClientKey`/`ServerKey`) become the `UserIdentity` sent to the pooler on
   the first message of each stream, so no password ever leaves the client.
 - **Database.** The startup `database` must exist in `pgshard.databases`
@@ -558,6 +582,29 @@ the controller raises while it takes a certified barrier (see
   distributed transaction straddles the barrier's restore points.
 - At most `--buffer-cap` statements wait behind the fence cluster-wide; the
   next is refused with `53300`.
+
+The fence is what holds writes the planner can see. Underneath it the
+primaries themselves run with `default_transaction_read_only = on` for the
+length of the pause, which catches a statement whose write the planner does
+not recognise -- a volatile function, `SELECT set_config(...)`. So that a
+session cannot lift that guard, the router refuses `SET` (and `SET LOCAL`,
+`RESET`, `set_config`) of `transaction_read_only` and
+`default_transaction_read_only` with **`42501` (insufficient_privilege)**.
+
+The same override spelled as a transaction mode -- `BEGIN READ WRITE`,
+`START TRANSACTION READ WRITE`, `SET TRANSACTION READ WRITE`, `SET SESSION
+CHARACTERISTICS AS TRANSACTION READ WRITE` -- is not refused but neutralised:
+the mode is dropped and, where nothing else remains, the statement becomes a
+`SET ... = DEFAULT` that puts the cluster's own value back. With no pause
+running the session is read-write exactly as it asked; during one it stays
+paused. Refusing these would break ordinary clients -- pgjdbc sends the
+session-characteristics form whenever an application calls
+`setReadOnly(false)`, which a connection pool does on every connection it
+hands back.
+
+`READ ONLY` in every form is untouched: a session may make itself more
+restrictive, never less. The rewritten text is what reaches the shards and
+what the router replays onto every other shard session it opens.
 
 `pgshard.table_status.migrating` is the same pause scoped to one table: a
 placement workflow raises it while it swaps the table's shadow in. Only

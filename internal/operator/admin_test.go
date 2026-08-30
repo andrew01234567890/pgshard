@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -29,7 +30,7 @@ func TestAdminEnabledDefaultsTrue(t *testing.T) {
 
 func TestAdminDeploymentAndService(t *testing.T) {
 	c := &pgshardv1alpha1.PgShardCluster{ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "ns1"}}
-	dep := Renderer{}.AdminDeployment(c)
+	dep := Renderer{}.AdminDeployment(c, adminSecretKey)
 	if dep.Name != "demo-admin" || dep.Namespace != "ns1" {
 		t.Errorf("meta %s/%s", dep.Namespace, dep.Name)
 	}
@@ -37,7 +38,7 @@ func TestAdminDeploymentAndService(t *testing.T) {
 	if ctr.Image != DefaultAdminImage {
 		t.Errorf("default image %q", ctr.Image)
 	}
-	if got := (Renderer{AdminImage: "custom:1"}).AdminDeployment(c).Spec.Template.Spec.Containers[0].Image; got != "custom:1" {
+	if got := (Renderer{AdminImage: "custom:1"}).AdminDeployment(c, adminSecretKey).Spec.Template.Spec.Containers[0].Image; got != "custom:1" {
 		t.Errorf("custom image %q", got)
 	}
 	wantArgs := []string{"serve", "--listen=:8081", "--namespace=ns1"}
@@ -103,5 +104,79 @@ func TestReconcileAdminObjects(t *testing.T) {
 		if !apierrors.IsNotFound(err) {
 			t.Errorf("%T still present after disabling admin: %v", obj, err)
 		}
+	}
+}
+
+// TestAdminDeploymentCarriesItsCredential: the admin is rendered with the
+// token file its API requires, and mounts the Secret holding it. The open
+// mode has to be asked for in the spec, and then says so on the command
+// line rather than silently serving to anyone.
+func TestAdminDeploymentCarriesItsCredential(t *testing.T) {
+	c := &pgshardv1alpha1.PgShardCluster{ObjectMeta: metav1.ObjectMeta{Name: "bank", Namespace: "prod"}}
+	dep := Renderer{}.AdminDeployment(c, adminSecretKey)
+	ctr := dep.Spec.Template.Spec.Containers[0]
+	if !slices.Contains(ctr.Args, "--token-file=/etc/pgshard-admin/token") {
+		t.Errorf("args %v, want the token file", ctr.Args)
+	}
+	if len(ctr.VolumeMounts) != 1 || ctr.VolumeMounts[0].MountPath != "/etc/pgshard-admin" || !ctr.VolumeMounts[0].ReadOnly {
+		t.Errorf("mounts %+v", ctr.VolumeMounts)
+	}
+	vols := dep.Spec.Template.Spec.Volumes
+	if len(vols) != 1 || vols[0].Secret == nil || vols[0].Secret.SecretName != "bank-admin" {
+		t.Errorf("volumes %+v, want the admin secret", vols)
+	}
+	// A Secret somebody else made follows the basic-auth convention, so
+	// the key is mapped onto the file name the admin expects.
+	byPassword := Renderer{}.AdminDeployment(c, "password").Spec.Template.Spec.Volumes
+	if len(byPassword) != 1 || len(byPassword[0].Secret.Items) != 1 ||
+		byPassword[0].Secret.Items[0].Key != "password" || byPassword[0].Secret.Items[0].Path != "token" {
+		t.Errorf("a password-keyed secret must still mount as token: %+v", byPassword)
+	}
+
+	c.Spec.Admin.InsecureNoAuth = true
+	dep = Renderer{}.AdminDeployment(c, adminSecretKey)
+	ctr = dep.Spec.Template.Spec.Containers[0]
+	if !slices.Contains(ctr.Args, "--insecure-no-auth") {
+		t.Errorf("args %v, want the open mode said out loud", ctr.Args)
+	}
+	if len(ctr.VolumeMounts) != 0 || len(dep.Spec.Template.Spec.Volumes) != 0 {
+		t.Errorf("nothing to mount without a credential: %+v %+v", ctr.VolumeMounts, dep.Spec.Template.Spec.Volumes)
+	}
+}
+
+// TestAdminSecretIsGeneratedAndKept: the credential is the cluster's own,
+// generated once and left alone afterwards, so restarting the admin does
+// not lock out whoever already has it.
+func TestAdminSecretIsGeneratedAndKept(t *testing.T) {
+	requireEnvtest(t)
+	r, _, c := setup(t, "adm")
+	ctx := context.Background()
+	reconcile(t, r, c)
+
+	var sec corev1.Secret
+	get(t, AdminSecretName(c.Name), &sec)
+	ownedBy(t, &sec, c)
+	first := string(sec.Data["token"])
+	if len(first) < 32 {
+		t.Fatalf("token is %d characters, want something worth guarding", len(first))
+	}
+	if string(sec.Data["username"]) != "admin" {
+		t.Errorf("username %q", sec.Data["username"])
+	}
+
+	reconcile(t, r, c)
+	get(t, AdminSecretName(c.Name), &sec)
+	if got := string(sec.Data["token"]); got != first {
+		t.Error("the credential must survive a reconcile: it was regenerated")
+	}
+
+	// The superuser password is a different credential: reading the admin
+	// is not being able to write to PostgreSQL.
+	var su corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: SecretName(c.Name)}, &su); err != nil {
+		t.Fatal(err)
+	}
+	if string(su.Data["password"]) == first {
+		t.Error("the admin token must not be the superuser password")
 	}
 }

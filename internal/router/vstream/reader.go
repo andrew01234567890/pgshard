@@ -121,6 +121,20 @@ func (r *reader) run(ctx context.Context) {
 	}
 }
 
+// positionGoneText recognises, in the message of a pooler too old to send
+// the structured reason, the failures that mean the position itself is
+// gone: an invalidated or absent slot, or WAL that has been removed.
+func positionGoneText(msg string) bool {
+	for _, s := range []string{"invalidated", "can no longer get changes", "has already been removed"} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	// "does not exist" alone is not enough: a missing publication says it
+	// too, and that is a configuration mistake rather than a lost position.
+	return strings.Contains(msg, "replication slot") && strings.Contains(msg, "does not exist")
+}
+
 // fatal maps a pooler failure that no reconnect can cure to an Error event.
 func fatal(err error, sh router.Shard) *pgshardv1.VEvent_Error {
 	st, ok := status.FromError(err)
@@ -133,8 +147,13 @@ func fatal(err error, sh router.Shard) *pgshardv1.VEvent_Error {
 			code = pgshardv1.VEvent_Error_CODE_POSITION_TOO_OLD
 		}
 	}
-	// Poolers from before the structured detail only carry the text.
-	if code == pgshardv1.VEvent_Error_CODE_INTERNAL && strings.Contains(st.Message(), "start replication") {
+	// Poolers from before the structured detail only carry the text, and
+	// the text has to say the position is gone rather than merely that a
+	// StartReplication failed: a consumer told POSITION_TOO_OLD discards
+	// its checkpoints and copies everything again, which is a costly answer
+	// to a missing publication or a rejected option.
+	if code == pgshardv1.VEvent_Error_CODE_INTERNAL && strings.Contains(st.Message(), "start replication") &&
+		positionGoneText(st.Message()) {
 		code = pgshardv1.VEvent_Error_CODE_POSITION_TOO_OLD
 	}
 	return &pgshardv1.VEvent_Error{Code: code, Message: fmt.Sprintf("shard %s/%d: %s", sh.Set, sh.ID, st.Message()), Shard: shardRef(sh)}

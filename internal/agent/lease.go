@@ -20,10 +20,21 @@ import (
 // ErrLeaseHeld is returned when another holder owns an unexpired lease.
 var ErrLeaseHeld = errors.New("lease held by another identity")
 
+// LabelCluster names the cluster an object belongs to. Every object pgshard
+// creates carries it, and a namespace holding several clusters is sorted by
+// it. The agent cannot import the operator, which owns the key, so it is
+// repeated here and a test keeps the two equal.
+const LabelCluster = "pgshard.io/cluster"
+
 // Lease guards the shard primary with a coordination.k8s.io Lease.
 type Lease struct {
-	client   coordclient.LeaseInterface
-	name     string
+	client coordclient.LeaseInterface
+	name   string
+	// cluster labels the Lease. Everything else pgshard creates carries
+	// pgshard.io/cluster, and a namespace holding several clusters is
+	// sorted by it; without it a Lease can only be attributed by matching
+	// names, and a cluster called "a" prefixes "ab"'s objects.
+	cluster  string
 	holder   string
 	duration time.Duration
 	renew    time.Duration
@@ -58,6 +69,7 @@ func NewLeaseWithClient(client coordclient.LeaseInterface, cfg *Config, log *slo
 	return &Lease{
 		client:   client,
 		name:     cfg.LeaseName(),
+		cluster:  cfg.Cluster,
 		holder:   cfg.PodName,
 		duration: time.Duration(cfg.Lease.Duration),
 		renew:    time.Duration(cfg.Lease.Renew),
@@ -131,6 +143,12 @@ func (l *Lease) spec(base *coordinationv1.Lease) *coordinationv1.Lease {
 	out := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: l.name}}
 	if base != nil {
 		out = base.DeepCopy()
+	}
+	if l.cluster != "" {
+		if out.Labels == nil {
+			out.Labels = map[string]string{}
+		}
+		out.Labels[LabelCluster] = l.cluster
 	}
 	now := metav1.NewMicroTime(l.now())
 	if base == nil || ptr.Deref(base.Spec.HolderIdentity, "") != l.holder {

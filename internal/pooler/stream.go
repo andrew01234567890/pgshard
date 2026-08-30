@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -21,6 +22,26 @@ import (
 
 // ErrorDomain marks structured error details produced by the pooler.
 const ErrorDomain = "pgshard-pooler"
+
+// positionGone reports a StartReplication failure that means the position
+// the consumer asked for is no longer available: a slot PostgreSQL
+// invalidated (max_slot_wal_keep_size, idle_replication_slot_timeout), a
+// slot that no longer exists, or WAL that has been removed. Everything else
+// -- a publication that is not there, a permission failure, an option the
+// server rejects -- is a configuration problem the consumer fixes without
+// discarding anything.
+func positionGone(err *pgconn.PgError) bool {
+	switch err.Code {
+	case "55000": // object_not_in_prerequisite_state: an invalidated slot
+		return strings.Contains(err.Message, "invalidated") ||
+			strings.Contains(err.Message, "can no longer get changes")
+	case "42704": // undefined_object: the slot is gone
+		return strings.Contains(err.Message, "replication slot")
+	case "58P01": // undefined_file: the WAL segment has been removed
+		return true
+	}
+	return strings.Contains(err.Message, "has already been removed")
+}
 
 // ReasonPositionTooOld is the ErrorInfo reason attached when replication
 // cannot start from the requested position (the slot or WAL is gone).
@@ -220,8 +241,15 @@ func (s *Server) runStream(ctx context.Context, req *pgshardv1.StreamRequest, em
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) {
 			st := status.Newf(codes.FailedPrecondition, "start replication: %s (%s)", pgErr.Message, pgErr.Code)
-			if detailed, derr := st.WithDetails(&errdetails.ErrorInfo{Reason: ReasonPositionTooOld, Domain: ErrorDomain}); derr == nil {
-				st = detailed
+			// Only when the position really is gone. A consumer told
+			// POSITION_TOO_OLD throws its checkpoints away and copies
+			// everything again, so saying it about a missing publication, a
+			// permission error or a bad option costs a full re-snapshot for
+			// a configuration mistake.
+			if positionGone(pgErr) {
+				if detailed, derr := st.WithDetails(&errdetails.ErrorInfo{Reason: ReasonPositionTooOld, Domain: ErrorDomain}); derr == nil {
+					st = detailed
+				}
 			}
 			return st.Err()
 		}

@@ -3,6 +3,7 @@ package operator
 import (
 	"context"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -56,7 +57,7 @@ func TestPromoteAndDemoteGetALongerDeadlineThanReload(t *testing.T) {
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)
 
-	c := GRPCAgentClient{}
+	c := NewGRPCAgentClient()
 	ctx := context.Background()
 	addr := lis.Addr().String()
 	if err := c.Promote(ctx, addr, 1, "h"); err != nil {
@@ -117,7 +118,7 @@ func TestBarrierRPCsCarryTheirOwnDeadline(t *testing.T) {
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)
 
-	c := GRPCAgentClient{}
+	c := NewGRPCAgentClient()
 	ctx := context.Background()
 	addr := lis.Addr().String()
 	if _, err := c.ListPrepared(ctx, addr); err != nil {
@@ -150,4 +151,60 @@ func TestBarrierRPCsCarryTheirOwnDeadline(t *testing.T) {
 	if reconcile <= 31*time.Second {
 		t.Errorf("reconcile deadline %s: it commits every in-doubt transaction and needs longer than a list", reconcile)
 	}
+}
+
+// TestAgentClientKeepsOneConnectionPerAddress: a reconcile pass asks every
+// group's primary for its status, and the groups reconcile concurrently.
+// Dialling per call meant a TCP handshake and an HTTP/2 preface per group
+// per pass, thrown away the moment the answer arrived.
+func TestAgentClientKeepsOneConnectionPerAddress(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var conns atomic.Int64
+	counted := &countingListener{Listener: lis, accepted: &conns}
+	srv := grpc.NewServer()
+	pgshardv1.RegisterAgentServer(srv, &deadlineAgent{deadlines: make(chan time.Duration, 64)})
+	go func() { _ = srv.Serve(counted) }()
+	t.Cleanup(srv.Stop)
+
+	c := NewGRPCAgentClient()
+	defer c.Close()
+	ctx := context.Background()
+	addr := lis.Addr().String()
+	for range 10 {
+		if _, err := c.Status(ctx, addr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := conns.Load(); n != 1 {
+		t.Errorf("ten calls to one agent opened %d connections, want the one it keeps", n)
+	}
+
+	// A connection that has gone is not kept: the next call dials again
+	// rather than waiting on a broken one.
+	c.mu.Lock()
+	cc := c.conns[addr]
+	c.mu.Unlock()
+	c.drop(addr, cc)
+	if _, err := c.Status(ctx, addr); err != nil {
+		t.Fatal(err)
+	}
+	if n := conns.Load(); n != 2 {
+		t.Errorf("after dropping the connection: %d in total, want a second", n)
+	}
+}
+
+type countingListener struct {
+	net.Listener
+	accepted *atomic.Int64
+}
+
+func (l *countingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err == nil {
+		l.accepted.Add(1)
+	}
+	return c, err
 }

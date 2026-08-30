@@ -1,6 +1,7 @@
 package operator
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -8,6 +9,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 )
 
 func routerCluster() *pgshardv1alpha1.PgShardCluster {
@@ -46,12 +48,12 @@ func TestRouterDeployment(t *testing.T) {
 		t.Errorf("custom image %q", got)
 	}
 	args := strings.Join(ctr.Args, " ")
-	want := "serve --listen=:5432 --health-listen=:8080 --catalog-dsn=host=demo-catalog-rw.ns1.svc port=5432 user=postgres dbname=postgres --catalog-pooler=demo-catalog-rw.ns1.svc:9091 " +
+	want := "serve --listen=:5432 --health-listen=:8080 --catalog-dsn=host=demo-catalog-rw.ns1.svc port=5432 user=pgshard_router dbname=postgres --catalog-pooler=demo-catalog-rw.ns1.svc:9091 " +
 		"--peer-cancel-listen=:9090 --peer-service=demo-router-peers.ns1.svc:9090 --insecure-dev"
 	if args != want {
 		t.Errorf("args\n got %q\nwant %q", args, want)
 	}
-	if len(ctr.Env) != 1 || ctr.Env[0].Name != "PGPASSWORD" || ctr.Env[0].ValueFrom.SecretKeyRef.Name != "demo-superuser" || ctr.Env[0].ValueFrom.SecretKeyRef.Key != "password" {
+	if len(ctr.Env) != 1 || ctr.Env[0].Name != "PGPASSWORD" || ctr.Env[0].ValueFrom.SecretKeyRef.Name != "demo-router" || ctr.Env[0].ValueFrom.SecretKeyRef.Key != "password" {
 		t.Errorf("env %+v", ctr.Env)
 	}
 	if len(dep.Spec.Template.Spec.Volumes) != 0 || len(ctr.VolumeMounts) != 0 {
@@ -137,7 +139,8 @@ func TestPoolerSidecarInMemberPod(t *testing.T) {
 	if strings.Contains(got, "--http") {
 		t.Errorf("command %q still passes the removed --http flag", got)
 	}
-	if pooler.ReadinessProbe == nil || pooler.ReadinessProbe.TCPSocket == nil || pooler.ReadinessProbe.TCPSocket.Port.IntValue() != 9091 {
+	if pooler.ReadinessProbe == nil || pooler.ReadinessProbe.HTTPGet == nil ||
+		pooler.ReadinessProbe.HTTPGet.Path != "/healthz" || pooler.ReadinessProbe.HTTPGet.Port.IntValue() != 9127 {
 		t.Errorf("readiness %+v", pooler.ReadinessProbe)
 	}
 	if len(pooler.Env) != 1 || pooler.Env[0].Name != "PGPASSWORD" || pooler.Env[0].ValueFrom == nil {
@@ -364,5 +367,44 @@ func TestCancellableOnRevert(t *testing.T) {
 		if got := cancellableOnRevert(c.phase); got != c.want {
 			t.Errorf("cancellableOnRevert(%s) = %v, want %v", c.phase, got, c.want)
 		}
+	}
+}
+
+// TestRouterHoldsItsOwnCatalogCredential: the router terminates untrusted
+// client connections, so what it holds must be its own least-privilege
+// login and not the cluster superuser password -- which is also the seed of
+// the agent control-plane token, and would turn one compromised router into
+// the whole cluster.
+func TestRouterHoldsItsOwnCatalogCredential(t *testing.T) {
+	c := &pgshardv1alpha1.PgShardCluster{ObjectMeta: metav1.ObjectMeta{Name: "bank", Namespace: "prod"}}
+	dsn := RouterCatalogDSN(c)
+	if !strings.Contains(dsn, "user="+catalog.RouterRole) {
+		t.Errorf("router DSN = %q, want the router's own role", dsn)
+	}
+	if strings.Contains(dsn, "user=postgres") {
+		t.Errorf("router DSN still connects as the superuser: %q", dsn)
+	}
+
+	dep := Renderer{}.RouterDeployment(c)
+	ctr := dep.Spec.Template.Spec.Containers[0]
+	var pw *corev1.EnvVar
+	for i := range ctr.Env {
+		if ctr.Env[i].Name == "PGPASSWORD" {
+			pw = &ctr.Env[i]
+		}
+	}
+	if pw == nil || pw.ValueFrom == nil || pw.ValueFrom.SecretKeyRef == nil {
+		t.Fatalf("router env: %+v", ctr.Env)
+	}
+	if got := pw.ValueFrom.SecretKeyRef.Name; got != RouterSecretName("bank") {
+		t.Errorf("PGPASSWORD comes from %q, want %q", got, RouterSecretName("bank"))
+	}
+	if pw.ValueFrom.SecretKeyRef.Name == SecretName("bank") {
+		t.Error("the router must not be given the superuser secret")
+	}
+	if !slices.ContainsFunc(ctr.Args, func(a string) bool {
+		return strings.HasPrefix(a, "--catalog-dsn=") && strings.Contains(a, catalog.RouterRole)
+	}) {
+		t.Errorf("router args %v", ctr.Args)
 	}
 }

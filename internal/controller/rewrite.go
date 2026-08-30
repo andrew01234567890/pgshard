@@ -179,8 +179,11 @@ SELECT label FROM (
 // snapshots to reload before any hidden column exists.
 func (a *Applier) recordRewriteColumns(ctx context.Context, m *catalog.DDLMigration) error {
 	rw := m.Meta.Rewrite
-	if len(rw.Columns) > 0 {
+	if rw.Settled {
 		return nil
+	}
+	if len(rw.Columns) > 0 {
+		return a.settleColumns(ctx, m)
 	}
 	keys := sortedShardKeys(m.PerShard)
 	if len(keys) == 0 {
@@ -232,6 +235,17 @@ func (a *Applier) recordRewriteColumns(ctx context.Context, m *catalog.DDLMigrat
 	if err := a.Store.SaveMeta(ctx, m.ID, m.Meta); err != nil {
 		return err
 	}
+	return a.settleColumns(ctx, m)
+}
+
+// settleColumns waits for every router to reload the column list, then
+// records that the wait finished. A migration resumed before that record
+// waits again from the beginning rather than skipping the wait: the crash
+// may have interrupted it, and the applier cannot tell how much of it had
+// run. Waiting a whole window again costs one window on a resume that had
+// already served it out, which is nothing against a rewrite of a table
+// large enough to need one.
+func (a *Applier) settleColumns(ctx context.Context, m *catalog.DDLMigration) error {
 	settle := a.RewriteSettle
 	if settle == 0 {
 		settle = DefaultRewriteSettle
@@ -241,7 +255,8 @@ func (a *Applier) recordRewriteColumns(ctx context.Context, m *catalog.DDLMigrat
 			return err
 		}
 	}
-	return nil
+	m.Meta.Rewrite.Settled = true
+	return a.Store.SaveMeta(ctx, m.ID, m.Meta)
 }
 
 // rewritePhase runs one phase of the rewrite on one shard.
@@ -323,8 +338,10 @@ func backfillExpr(rw *catalog.RewriteChange) string {
 
 // backfill converts existing rows in batches, one committed batch at a
 // time: keyset-paginated over a single-column primary key when the table
-// has one, ctid-batched otherwise. Both loops stop only when a probe finds
-// no remaining row, and both refuse to spin when the minimum stops moving.
+// has one, ctid-batched otherwise. Each batch reports the last key it
+// selected and the next starts there, so no batch rescans what an earlier
+// one converted; the loop ends only when a scan of the whole table finds
+// nothing left to convert.
 func (a *Applier) backfill(ctx context.Context, conn ShardConn, rw *catalog.RewriteChange, mid string) error {
 	table := qualified(rw.Schema, rw.Table)
 	hidden := rw.HiddenColumn(mid)
@@ -343,73 +360,103 @@ func (a *Applier) backfill(ctx context.Context, conn ShardConn, rw *catalog.Rewr
 	}
 	pred := backfillPredicate(rw, hidden)
 	set := ident(hidden) + " = (" + backfillExpr(rw) + ")"
+	// A primary key is ordered by its own index, so batches follow it and
+	// none can be skipped. ctid has no index and sorting by it would read
+	// and sort every remaining row on every batch -- the cost this cursor
+	// exists to avoid -- so the ctid batches take the rows the scan reaches
+	// first. A row a batch passes over is not lost: the scan of the whole
+	// table at the end finds it and the loop resumes from there.
+	cursor, order, cast := "ctid", "", "tid"
 	if len(pks) == 1 {
-		pk := ident(pks[0])
-		sql := "WITH batch AS (SELECT " + pk + " FROM " + table + " WHERE " + pred +
-			" ORDER BY " + pk + " LIMIT " + fmt.Sprint(batch) + ")" +
-			" UPDATE " + table + " t SET " + set + " FROM batch WHERE t." + pk + " = batch." + pk
-		// RowsAffected undercounts when a concurrent DELETE or PK change
-		// removes a selected row before the UPDATE reaches it, so a short
-		// batch does not prove the backfill finished: only a probe that
-		// finds no matching row does. The probe returns zero rows when
-		// done and the minimum matching key otherwise; a stalled minimum
-		// after an update means a volatile DEFAULT yielding NULL or an
-		// unstable USING keeps rows matching pred forever.
-		probe := "SELECT " + pk + "::text FROM " + table + " WHERE " + pred + " ORDER BY " + pk + " LIMIT 1"
-		lastMin, haveMin := "", false
-		for {
-			if _, err := conn.Exec(ctx, sql); err != nil {
-				return err
-			}
-			rows, err := conn.Query(ctx, probe)
-			if err != nil {
-				return err
-			}
-			mins, err := pgx.CollectRows(rows, pgx.RowTo[string])
-			if err != nil {
-				return err
-			}
-			if len(mins) == 0 {
-				return nil
-			}
-			minKey := mins[0]
-			if haveMin && minKey == lastMin {
+		cursor = ident(pks[0])
+		order = " ORDER BY " + cursor
+		if cast, err = cursorType(ctx, conn, table, pks[0]); err != nil {
+			return err
+		}
+	}
+	// The bound is a statement of its own rather than "OR $1 IS NULL" in
+	// one: an OR over the cursor hides the range from the planner, which
+	// then scans from the head of the table anyway. The UPDATE takes the
+	// batch's keys as an array for the same reason -- joined against the
+	// CTE it is planned as a hash join over a sequential scan of the whole
+	// table, once per batch.
+	pass := func(where string) string {
+		return "WITH batch AS (SELECT " + cursor + " FROM " + table + " WHERE " + pred + where + order +
+			" LIMIT " + fmt.Sprint(batch) + "), upd AS (UPDATE " + table + " t SET " + set +
+			" WHERE t." + cursor + " = ANY (ARRAY(SELECT " + cursor + " FROM batch)))" +
+			" SELECT max(" + cursor + ")::text AS at FROM batch"
+	}
+	// The batch reports the last key it selected, not how many rows it
+	// changed: a concurrent DELETE or primary-key change can remove a
+	// selected row before the UPDATE reaches it, so a short batch does not
+	// mean the table is done. A key that survives its own batch does mean
+	// the conversion cannot finish -- a volatile DEFAULT yielding NULL or
+	// an unstable USING keeps rows matching pred however often they are
+	// updated.
+	head, from := pass(""), pass(" AND "+cursor+" >= ($1)::"+cast)
+	rest := "SELECT " + cursor + "::text AS at FROM " + table + " WHERE " + pred + " LIMIT 1"
+	var at *string
+	for {
+		var rows pgx.Rows
+		var err error
+		if at == nil {
+			rows, err = conn.Query(ctx, head)
+		} else {
+			rows, err = conn.Query(ctx, from, *at)
+		}
+		if err != nil {
+			return err
+		}
+		next, err := pgx.CollectRows(rows, pgx.RowTo[*string])
+		if err != nil {
+			return err
+		}
+		if len(next) == 1 && next[0] != nil {
+			if at != nil && *next[0] == *at {
 				return fmt.Errorf("backfill of %s is not converging: rows keep matching %q after being updated (a volatile DEFAULT returning NULL or an unstable USING expression cannot be backfilled); fix the expression and run the migration again", table, pred)
 			}
-			lastMin, haveMin = minKey, true
+			at = next[0]
+			continue
 		}
-	}
-	// No single-column primary key: batch on ctid instead. The predicate
-	// itself shrinks as rows are converted, so this needs no stable cursor
-	// -- only a bound on how much one transaction rewrites. A composite or
-	// missing primary key is the common case for the tables most worth
-	// batching, so leaving this as one statement made the online path
-	// unavailable precisely where it mattered.
-	sql := "WITH batch AS (SELECT ctid FROM " + table + " WHERE " + pred +
-		" ORDER BY ctid LIMIT " + fmt.Sprint(batch) + ")" +
-		" UPDATE " + table + " t SET " + set + " FROM batch WHERE t.ctid = batch.ctid"
-	probe := "SELECT ctid::text FROM " + table + " WHERE " + pred + " ORDER BY ctid LIMIT 1"
-	lastMin, haveMin := "", false
-	for {
-		if _, err := conn.Exec(ctx, sql); err != nil {
-			return err
-		}
-		rows, err := conn.Query(ctx, probe)
-		if err != nil {
-			return err
-		}
-		mins, err := pgx.CollectRows(rows, pgx.RowTo[string])
-		if err != nil {
-			return err
-		}
-		if len(mins) == 0 {
+		if at == nil {
 			return nil
 		}
-		if haveMin && mins[0] == lastMin {
+		// Nothing left from the cursor on. Read the whole table once to
+		// find anything the batches passed over, and resume there.
+		rows, err = conn.Query(ctx, rest)
+		if err != nil {
+			return err
+		}
+		left, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return err
+		}
+		if len(left) == 0 {
+			return nil
+		}
+		if left[0] == *at {
 			return fmt.Errorf("backfill of %s is not converging: rows keep matching %q after being updated (a volatile DEFAULT returning NULL or an unstable USING expression cannot be backfilled); fix the expression and run the migration again", table, pred)
 		}
-		lastMin, haveMin = mins[0], true
+		at = &left[0]
 	}
+}
+
+// cursorType names a column's type as SQL text, for casting a cursor read
+// back as text into the type it is compared against.
+func cursorType(ctx context.Context, conn ShardConn, table, column string) (string, error) {
+	rows, err := conn.Query(ctx, `SELECT pg_catalog.format_type(atttypid, atttypmod) FROM pg_attribute
+		WHERE attrelid = ($1)::regclass AND attname = $2`, table, column)
+	if err != nil {
+		return "", err
+	}
+	types, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return "", err
+	}
+	if len(types) != 1 {
+		return "", fmt.Errorf("column %q of %s has no type", column, table)
+	}
+	return types[0], nil
 }
 
 // cutover swaps the working column in for the old one in one transaction

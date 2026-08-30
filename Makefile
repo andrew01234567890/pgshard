@@ -113,12 +113,18 @@ admin-image:
 	docker build -f Dockerfile.control --build-arg CMD=pgshard-admin \
 		--build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg DATE=$(DATE) -t $(ADMIN_IMG) .
 
+# The admin requires a credential, so the Secret comes first -- generated
+# once and left alone, or the token would change under whoever holds it.
 deploy-admin:
+	kubectl get secret pgshard-admin >/dev/null 2>&1 || \
+		kubectl create secret generic pgshard-admin --from-literal=token="$$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 	kubectl apply -f config/admin/service_account.yaml -f config/admin/rbac.yaml
 	sed 's|image: ghcr.io/andrew01234567890/pgshard-admin:latest|image: $(ADMIN_IMG)|' config/admin/deployment.yaml | kubectl apply -f -
+	@echo "admin token: kubectl get secret pgshard-admin -o jsonpath='{.data.token}' | base64 -d"
 
 undeploy-admin:
 	kubectl delete --ignore-not-found -f config/admin
+	kubectl delete --ignore-not-found secret pgshard-admin
 
 deploy: install
 	kubectl apply -f config/manager/namespace.yaml

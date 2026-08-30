@@ -26,12 +26,26 @@ type TwoPCSource interface {
 	ListPausedWorkflows(ctx context.Context) ([]WorkflowRow, error)
 }
 
-// WorkflowRow is one paused workflow.
+// WorkflowRow is one paused workflow: either one an operator paused, or one
+// a configured cutover pause is holding, which stays running.
 type WorkflowRow struct {
 	ID        string    `json:"id"`
 	Kind      string    `json:"kind"`
 	State     string    `json:"state"`
 	UpdatedAt time.Time `json:"updatedAt"`
+	// Pause names the configured pause holding a running workflow, empty
+	// for one an operator paused. PausedAt is when the hold began;
+	// UpdatedAt is not, because every pass rewrites it.
+	Pause    string     `json:"pause,omitempty"`
+	PausedAt *time.Time `json:"pausedAt,omitempty"`
+}
+
+// Since is when this workflow stopped moving.
+func (w WorkflowRow) Since() time.Time {
+	if w.PausedAt != nil {
+		return *w.PausedAt
+	}
+	return w.UpdatedAt
 }
 
 // TwoPCEntry is one decision-log row prepared for display.
@@ -106,7 +120,13 @@ type AlertInputs struct {
 
 // Alert thresholds.
 const (
-	InDoubtAgeThreshold   = 5 * time.Minute
+	InDoubtAgeThreshold = 5 * time.Minute
+	// DecidedAgeThreshold is how long a decided transaction may go
+	// unfinished. Finishing one deletes its row, so a row that outlives
+	// its decision is one the resolver keeps failing to finish, and it
+	// holds locks, WAL and a vacuum horizon meanwhile. The resolver runs
+	// every minute, so this is several passes, not a normal gap.
+	DecidedAgeThreshold   = 5 * time.Minute
 	PreparedCountWarning  = 100
 	BackupStaleThreshold  = 26 * time.Hour
 	CutoverPauseThreshold = 30 * time.Minute
@@ -119,6 +139,18 @@ func DeriveAlerts(in AlertInputs) []Alert {
 	var oldest time.Duration
 	for _, d := range in.Decisions {
 		if d.State != "preparing" {
+			// A decided row is deleted when the resolver finishes it, so
+			// one still here is a transaction it cannot finish: the locks,
+			// WAL and vacuum horizon are held exactly as they are by an
+			// undecided one.
+			since := d.CreatedAt
+			if d.DecidedAt != nil {
+				since = *d.DecidedAt
+			}
+			if held := in.Now.Sub(since); held >= DecidedAgeThreshold {
+				alerts = append(alerts, Alert{Name: "TwoPCDecidedUnfinished", Severity: "critical",
+					Detail: fmt.Sprintf("%s decided %s ago and the resolver has not finished it on every participant", d.GID, shortDuration(held))})
+			}
 			continue
 		}
 		inDoubt++
@@ -141,10 +173,15 @@ func DeriveAlerts(in AlertInputs) []Alert {
 		}
 	}
 	for _, w := range in.Paused {
-		if in.Now.Sub(w.UpdatedAt) >= CutoverPauseThreshold {
-			alerts = append(alerts, Alert{Name: "CutoverPauseExceeded", Severity: "warning",
-				Detail: fmt.Sprintf("%s workflow %s paused for %s", w.Kind, w.ID, shortDuration(in.Now.Sub(w.UpdatedAt)))})
+		held := in.Now.Sub(w.Since())
+		if held < CutoverPauseThreshold {
+			continue
 		}
+		detail := fmt.Sprintf("%s workflow %s paused for %s", w.Kind, w.ID, shortDuration(held))
+		if w.Pause != "" {
+			detail += " before " + w.Pause
+		}
+		alerts = append(alerts, Alert{Name: "CutoverPauseExceeded", Severity: "warning", Detail: detail})
 	}
 	if in.BackupsKnown {
 		switch {

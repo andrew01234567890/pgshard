@@ -20,6 +20,10 @@ spec:
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
+      volumes:
+        - name: token
+          secret:
+            secretName: pgshard-admin
       containers:
         - name: admin
           image: ghcr.io/andrew01234567890/pgshard-admin:latest
@@ -27,6 +31,15 @@ spec:
           args:
             - serve
             - --listen=:8081
+            # Everything the admin serves is operational detail about the
+            # cluster, so it is credentialed. Create the Secret first:
+            #   kubectl create secret generic pgshard-admin \
+            #     --from-literal=token="$(openssl rand -hex 24)"
+            - --token-file=/etc/pgshard-admin/token
+          volumeMounts:
+            - name: token
+              mountPath: /etc/pgshard-admin
+              readOnly: true
           ports:
             - name: http
               containerPort: 8081

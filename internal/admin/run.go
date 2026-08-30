@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -37,6 +38,14 @@ type Options struct {
 	Kubeconfig string
 	Namespace  string
 	CatalogDSN string
+	// TokenFile holds the credential every route but /healthz requires.
+	TokenFile string
+	// InsecureNoAuth serves the admin to anyone who can reach it. The
+	// admin has no mutations, but everything it shows -- topology, backup
+	// and restore state, stream positions, two-phase commit identifiers,
+	// the text of DDL -- is operational detail about the cluster, so this
+	// is a development setting and has to be asked for.
+	InsecureNoAuth bool
 }
 
 // ParseFlags parses the `serve` subcommand's flags.
@@ -48,13 +57,39 @@ func ParseFlags(args []string, stderr io.Writer) (Options, error) {
 	fs.StringVar(&o.Kubeconfig, "kubeconfig", "", "path to a kubeconfig; empty uses the in-cluster configuration")
 	fs.StringVar(&o.Namespace, "namespace", "", "namespace to watch; empty watches all namespaces")
 	fs.StringVar(&o.CatalogDSN, "catalog-dsn", "", "optional PostgreSQL DSN of the catalog database for the shard status snapshot and the streams pages")
+	fs.StringVar(&o.TokenFile, "token-file", "", "file holding the credential every route but /healthz requires, as a bearer token or the password of HTTP basic auth")
+	fs.BoolVar(&o.InsecureNoAuth, "insecure-no-auth", false, "serve the admin to anyone who can reach it (development only)")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}
 	if fs.NArg() > 0 {
 		return o, fmt.Errorf("unexpected argument %q", fs.Arg(0))
 	}
+	if o.TokenFile == "" && !o.InsecureNoAuth {
+		return o, errors.New("--token-file is required; everything the admin serves is operational detail about the cluster, and --insecure-no-auth is the explicit way to serve it to anyone who can reach it")
+	}
+	if o.TokenFile != "" && o.InsecureNoAuth {
+		return o, errors.New("--token-file and --insecure-no-auth are contradictory")
+	}
 	return o, nil
+}
+
+// readToken loads the admin credential. An empty path is the explicit
+// no-auth mode; a file that is empty or only whitespace is a mounted Secret
+// that has not been filled in, which must not pass for one.
+func readToken(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("admin token: %w", err)
+	}
+	token := strings.TrimSpace(string(body))
+	if token == "" {
+		return "", fmt.Errorf("admin token: %s is empty", path)
+	}
+	return token, nil
 }
 
 func restConfig(kubeconfig string) (*rest.Config, error) {
@@ -97,10 +132,15 @@ func Run(ctx context.Context, o Options) error {
 	if o.CatalogDSN != "" {
 		catalogSrc = PgxCatalog{DSN: o.CatalogDSN}
 	}
+	token, err := readToken(o.TokenFile)
+	if err != nil {
+		return err
+	}
 	srv, err := NewServer(mgr.GetClient(), catalogSrc, notifier, o.Namespace, logger)
 	if err != nil {
 		return err
 	}
+	srv.Token = token
 	ln, err := net.Listen("tcp", o.Listen)
 	if err != nil {
 		return err

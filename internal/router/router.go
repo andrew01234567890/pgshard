@@ -42,6 +42,14 @@ type Config struct {
 	Sequences *SequenceAllocator
 	// Migrations queues DDL for the controller's applier; nil refuses DDL.
 	Migrations MigrationQueue
+	// MaxSessions caps the authenticated sessions this router holds at
+	// once, whatever role they belong to. The pre-authentication cap
+	// releases its slot the moment a session authenticates, and a role
+	// carries no connection limit unless one was set on it, so without
+	// this one login could hold sessions until the router ran out of
+	// memory and took every tenant with it. Zero means DefaultMaxSessions;
+	// negative means no cap.
+	MaxSessions int
 	// RoleLimits reports a role's connection limit; nil leaves limits
 	// unenforced.
 	RoleLimits RoleLimiter
@@ -164,6 +172,10 @@ func (r *Router) NewExecutor(info pgwire.SessionInfo) (pgwire.Executor, error) {
 	// session close, cancel and buffer reservation behind catalog latency.
 	limit, limited := r.limitFor(info.User)
 	r.mu.Lock()
+	if limit := r.maxSessions(); limit > 0 && len(r.sessions) >= limit {
+		r.mu.Unlock()
+		return nil, pgwire.Errorf(pgwire.CodeTooManyConnections, "sorry, too many clients already: this router holds %d sessions", limit)
+	}
 	if limited && r.perUser[info.User] >= limit {
 		r.mu.Unlock()
 		return nil, pgwire.Errorf(codeBufferFull, "too many connections for role %q", info.User)
@@ -176,6 +188,20 @@ func (r *Router) NewExecutor(info pgwire.SessionInfo) (pgwire.Executor, error) {
 	r.mu.Unlock()
 	r.metrics.Connections.Inc()
 	return e, nil
+}
+
+// DefaultMaxSessions is the live-session cap a router applies when its
+// configuration names none. A session is a goroutine, its buffers and its
+// pooler streams, so the number is a memory bound rather than a policy:
+// it is high enough that no ordinary workload meets it and low enough
+// that meeting it refuses a connection instead of ending the process.
+const DefaultMaxSessions = 5000
+
+func (r *Router) maxSessions() int {
+	if r.cfg.MaxSessions == 0 {
+		return DefaultMaxSessions
+	}
+	return r.cfg.MaxSessions
 }
 
 // limitFor is Config.RoleLimits, with nil meaning unlimited.

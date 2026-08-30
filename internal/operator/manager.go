@@ -73,12 +73,16 @@ func Run(ctx context.Context, o Options) error {
 	if err != nil {
 		return fmt.Errorf("new manager: %w", err)
 	}
-	r := &ClusterReconciler{Client: mgr.GetClient(), Renderer: Renderer{AdminImage: o.AdminImage, RouterImage: o.RouterImage}, Prober: boundedProber{Inner: PgxProber{}}, Agents: GRPCAgentClient{},
+	// One client for the process: it keeps a connection per agent address,
+	// so the reconcilers share them rather than each dialling per call.
+	agents := NewGRPCAgentClient()
+	defer agents.Close()
+	r := &ClusterReconciler{Client: mgr.GetClient(), Renderer: Renderer{AdminImage: o.AdminImage, RouterImage: o.RouterImage}, Prober: boundedProber{Inner: PgxProber{}}, Agents: agents,
 		Metrics: metrics.NewOperator(ctrlmetrics.Registry)}
 	if err := r.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup reconciler: %w", err)
 	}
-	if err := (&BackupReconciler{Client: mgr.GetClient(), Agents: GRPCAgentClient{}}).SetupWithManager(mgr); err != nil {
+	if err := (&BackupReconciler{Client: mgr.GetClient(), Agents: agents}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup backup reconciler: %w", err)
 	}
 	barriers, err := NewGRPCBarrierClient(o.ControllerTLSCert, o.ControllerTLSKey, o.ControllerTLSCA)
@@ -90,7 +94,7 @@ func Run(ctx context.Context, o Options) error {
 	if err := (&BackupPolicyReconciler{Client: mgr.GetClient(), Scheduler: scheduler}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup backup policy reconciler: %w", err)
 	}
-	if err := (&RestoreReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Agents: GRPCAgentClient{}, TwoPC: GRPCAgentClient{}, Barriers: PgxProber{}}).SetupWithManager(mgr); err != nil {
+	if err := (&RestoreReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Agents: agents, TwoPC: agents, Barriers: PgxProber{}}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup restore reconciler: %w", err)
 	}
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

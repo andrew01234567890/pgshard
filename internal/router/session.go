@@ -127,8 +127,16 @@ type Executor struct {
 	tx       pgwire.TxStatus
 	lastTag  string
 	txnEnded bool
-	// cancelSent dedupes cancel requests within one batch.
+	// cancelSent dedupes cancel requests within one statement, and
+	// cancelFor is the statement context it was reset for. The reset used
+	// to happen on every pump, and a statement pumps more than once -- the
+	// backend is acquired, the session state replayed, the transaction
+	// prelude reopened, and only then the statement itself. A cancellation
+	// observed either side of one of those boundaries therefore sent a
+	// second Cancel, and the pooler cancels by session: the second one can
+	// land on whatever that backend is running by the time it arrives.
 	cancelSent atomic.Bool
+	cancelFor  context.Context
 
 	gucs   []gucEntry
 	staged []gucEntry
@@ -698,10 +706,15 @@ func (e *Executor) dropStream() {
 	e.tx = pgwire.TxIdle
 }
 
-// releaseAsync returns the pinned backend of the current shard without
-// waiting for the pooler; acquire on the same shard waits for it.
-// releaseOn releases the session on the pooler that holds it.
+// releaseOn releases the session on the pooler that holds the current
+// shard's backend, without waiting for it; acquire on the same shard waits
+// through awaitRelease.
 func (e *Executor) releaseOn(client pgshardv1.PoolerClient) {
+	e.releaseOnShard(client, e.shard)
+}
+
+// releaseOnShard is releaseOn for a shard the session is not sitting on.
+func (e *Executor) releaseOnShard(client pgshardv1.PoolerClient, sh Shard) {
 	if client == nil {
 		return
 	}
@@ -709,8 +722,8 @@ func (e *Executor) releaseOn(client pgshardv1.PoolerClient) {
 		e.releasing = map[Shard]chan struct{}{}
 	}
 	done := make(chan struct{})
-	prev := e.releasing[e.shard]
-	e.releasing[e.shard] = done
+	prev := e.releasing[sh]
+	e.releasing[sh] = done
 	go func() {
 		defer close(done)
 		if prev != nil {
@@ -723,13 +736,17 @@ func (e *Executor) releaseOn(client pgshardv1.PoolerClient) {
 // awaitRelease blocks until the async release of the current shard, if
 // any, has finished.
 func (e *Executor) awaitRelease(ctx context.Context) error {
-	done, ok := e.releasing[e.shard]
+	return e.awaitReleaseOf(ctx, e.shard)
+}
+
+func (e *Executor) awaitReleaseOf(ctx context.Context, sh Shard) error {
+	done, ok := e.releasing[sh]
 	if !ok {
 		return nil
 	}
 	select {
 	case <-done:
-		delete(e.releasing, e.shard)
+		delete(e.releasing, sh)
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -1555,7 +1572,7 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 	observer := e.shardLatency()
 	defer func() { observer.Observe(time.Since(start).Seconds()) }()
 	var firstErr error
-	e.cancelSent.Store(false)
+	e.beginStatement(ctx)
 	onCancel := func() { e.cancelBackend(context.Background()) }
 	for {
 		resp, err := e.conn.recv(ctx, onCancel)
@@ -1706,6 +1723,19 @@ func (e *Executor) copyIn(w pgwire.ResultWriter, resp *pgshardv1.CopyInResponse)
 
 // cancelBackend asks the pooler to interrupt the statement running for this
 // session.
+// beginStatement arms the backend cancel for a statement, once. A
+// statement pumps more than once -- the backend is acquired, the session
+// state replayed, the transaction prelude reopened, and only then the
+// statement runs -- and arming on each of those let one cancellation send
+// a second Cancel. The context is an identity here, never waited on: it
+// says which statement a pump belongs to.
+func (e *Executor) beginStatement(ctx context.Context) {
+	if e.cancelFor != ctx {
+		e.cancelFor = ctx
+		e.cancelSent.Store(false)
+	}
+}
+
 func (e *Executor) cancelBackend(ctx context.Context) {
 	if !e.cancelSent.CompareAndSwap(false, true) {
 		return

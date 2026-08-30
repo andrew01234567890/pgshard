@@ -11,6 +11,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -80,6 +81,8 @@ type MemberTemplate struct {
 	Resources    corev1.ResourceRequirements `json:"resources"`
 	Settings     map[string]string           `json:"settings"`
 	RestartToken string                      `json:"restartToken,omitempty"`
+	// Shape is set by Hash alone; see podShape.
+	Shape string `json:"shape,omitempty"`
 	// Backup is the policy the members archive to; it changes the pod
 	// (mounted Secrets) and archive_mode, so it is part of the pod hash.
 	Backup *pgshardv1alpha1.PgShardBackupPolicySpec `json:"backup,omitempty"`
@@ -107,10 +110,19 @@ func Template(c *pgshardv1alpha1.PgShardCluster, g Group, tuning pgtune.Settings
 	return tpl
 }
 
+// podShape changes whenever this operator renders a member pod differently
+// from a previous one in a way the template itself does not describe -- a
+// probe moving to another port, a container gaining an argument. Pods are
+// immutable, so without it a cluster keeps the shape it was created with
+// until something else rolls it, and a shape the rest of the release
+// depends on is silently absent.
+const podShape = "2:pooler-probe-on-metrics-port"
+
 // Hash is the pod-shaped part of the template (image, resources, restart
 // token) as stamped on pods; a difference always means a pod restart.
 func (t MemberTemplate) Hash() string {
 	t.Settings = nil
+	t.Shape = podShape
 	b, err := json.Marshal(t)
 	if err != nil {
 		panic(err)
@@ -225,6 +237,54 @@ func ConfigMapSettings(cm *corev1.ConfigMap) map[string]string {
 	}
 	_ = json.Unmarshal([]byte(cm.Data[settingsKey]), &out)
 	return out
+}
+
+// MemberNetworkPolicy renders the policy that keeps everything but the
+// cluster's own pods and its declared clients off a member's PostgreSQL,
+// agent and pooler ports. It is the layer under pg_hba: pg_hba refuses an
+// application role, this makes the port unreachable, and it also covers
+// whatever else listens on a member.
+//
+// The probe and metrics ports stay open to every source. The kubelet is not
+// a pod, so no selector matches it, and on a CNI that enforces policies a
+// rule that leaves it out fails every readiness probe. Egress is not
+// restricted either: members archive WAL to object storage, resolve DNS and
+// replicate to each other.
+func (Renderer) MemberNetworkPolicy(c *pgshardv1alpha1.PgShardCluster) *networkingv1.NetworkPolicy {
+	tcp := corev1.ProtocolTCP
+	port := func(p int32) networkingv1.NetworkPolicyPort {
+		v := intstr.FromInt32(p)
+		return networkingv1.NetworkPolicyPort{Protocol: &tcp, Port: &v}
+	}
+	own := []networkingv1.NetworkPolicyPeer{{
+		PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{LabelCluster: c.Name}},
+	}}
+	// Members only. The routers and the admin UI carry the cluster label
+	// too, and they are not members: a router serves clients on 5432 and
+	// has a TCP readiness probe on it, so selecting one would take the
+	// cluster's front door off the network and then fail its probe.
+	members := metav1.LabelSelector{
+		MatchLabels:      map[string]string{LabelCluster: c.Name},
+		MatchExpressions: []metav1.LabelSelectorRequirement{{Key: LabelKind, Operator: metav1.LabelSelectorOpExists}},
+	}
+	return &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      MemberNetworkPolicyName(c.Name),
+			Namespace: c.Namespace,
+			Labels:    map[string]string{LabelCluster: c.Name},
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: members,
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{
+				{
+					From:  append(own, c.Spec.NetworkPolicy.Clients...),
+					Ports: []networkingv1.NetworkPolicyPort{port(postgresPort), port(agentGRPCPort), port(poolerGRPCPort)},
+				},
+				{Ports: []networkingv1.NetworkPolicyPort{port(agentHTTPPort), port(poolerMetricsPort)}},
+			},
+		},
+	}
 }
 
 // MemberRBAC renders the ServiceAccount, Role and RoleBinding the member
@@ -527,8 +587,12 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 			{Name: "pooler-grpc", ContainerPort: poolerGRPCPort},
 			{Name: "pooler-metrics", ContainerPort: poolerMetricsPort},
 		},
+		// /healthz on the metrics port, not a TCP check on the gRPC port:
+		// the pooler serves metrics only once its gRPC listener is up, so
+		// the two say the same thing, and the metrics port is the one a
+		// member NetworkPolicy leaves open to the kubelet.
 		ReadinessProbe: &corev1.Probe{
-			ProbeHandler:  corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt32(poolerGRPCPort)}},
+			ProbeHandler:  corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromInt32(poolerMetricsPort)}},
 			PeriodSeconds: 5,
 		},
 		VolumeMounts: mounts,

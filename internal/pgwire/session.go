@@ -268,6 +268,11 @@ func (s *session) cancelQuery(secret []byte) bool {
 	return true
 }
 
+// refusalWriteTimeout bounds a refusal written before the startup deadline
+// exists. It is generous: the message is a few hundred bytes, so anything
+// slower than this is a peer that is not reading.
+const refusalWriteTimeout = 5 * time.Second
+
 func (s *session) run() {
 	log := s.server.logger.With("session", s.id, "remote", s.conn.RemoteAddr().String())
 	ctx := context.Background()
@@ -276,6 +281,11 @@ func (s *session) run() {
 	}
 	if !s.server.acquireStartup() {
 		s.endMessage()
+		// Bounded: this path runs before the startup deadline is set, and a
+		// peer that never reads would otherwise hold the goroutine and the
+		// socket on a write nobody is taking -- which is a way to keep a
+		// server busy with connections it has just refused.
+		_ = s.conn.SetWriteDeadline(time.Now().Add(refusalWriteTimeout))
 		s.terminate(Errorf(CodeTooManyConnections, "sorry, too many clients already (startup)"))
 		return
 	}

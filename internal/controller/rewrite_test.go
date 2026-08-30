@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -40,20 +41,9 @@ func TestRewriteMigrationRunsAllPhases(t *testing.T) {
 	shards.pks = []string{"id"}
 	shards.oldNotNull = true
 	shards.nnPending = true
-	batches := map[int32]int{}
-	shards.affected = func(id int32, sql string) int64 {
-		if !strings.Contains(sql, "WITH batch AS") {
-			return 0
-		}
-		batches[id]++
-		if batches[id] == 1 {
-			return 2
-		}
-		return 1
-	}
-	shards.backfillProbe = func(_ int32, call int) []string {
-		if call == 0 {
-			return []string{"3"}
+	shards.batchNext = func(_ int32, call int) []string {
+		if call < 2 {
+			return []string{fmt.Sprint(3 + call)}
 		}
 		return nil
 	}
@@ -86,8 +76,13 @@ func TestRewriteMigrationRunsAllPhases(t *testing.T) {
 				t.Fatalf("shard %d never ran %q:\n%s", id, want, strings.Join(ran, "\n"))
 			}
 		}
-		if batches[id] != 2 {
-			t.Fatalf("shard %d ran %d backfill batches, want 2", id, batches[id])
+		// Each batch starts at the key the probe before it found, so
+		// neither statement rescans the rows the pass already converted.
+		if got := fmt.Sprint(shards.batchCursor[id]); got != "[<start> 3 4]" {
+			t.Fatalf("shard %d backfilled from %s, want each batch to start at the last key found", id, got)
+		}
+		if got := shards.batchCalls[id]; got != 3 {
+			t.Fatalf("shard %d ran %d backfill passes, want 3: two that converted rows and one that found none left", id, got)
 		}
 		if got := m.PerShard[shardKey(id)]; got.State != catalog.ShardApplied {
 			t.Fatalf("shard %d state %+v", id, got)
@@ -245,21 +240,14 @@ func TestBackfillStopsOnlyWhenNoRowsMatchThePredicate(t *testing.T) {
 	shards.pks = []string{"id"}
 	shards.oldNotNull = true
 	shards.nnPending = true
-	batches := 0
-	shards.affected = func(_ int32, sql string) int64 {
-		if !strings.Contains(sql, "WITH batch AS") {
-			return 0
-		}
-		batches++
-		// Fewer rows than the batch selected, as a concurrent DELETE or
-		// PK change produces; rows above the keyset still match.
-		return 1
-	}
-	shards.backfillProbe = func(_ int32, call int) []string {
-		if call == 0 {
-			// An empty-string text PK still matching must not read as
-			// "no rows remain".
+	shards.batchNext = func(_ int32, call int) []string {
+		switch call {
+		case 0:
+			// An empty-string text PK is a key like any other and must
+			// not read as "no rows remain".
 			return []string{""}
+		case 1:
+			return []string{"a"}
 		}
 		return nil
 	}
@@ -271,8 +259,8 @@ func TestBackfillStopsOnlyWhenNoRowsMatchThePredicate(t *testing.T) {
 	if m.State != catalog.MigrationComplete {
 		t.Fatalf("state = %s error %q", m.State, m.Error)
 	}
-	if batches != 2 {
-		t.Fatalf("ran %d backfill batches, want 2: a short batch with rows remaining was declared done", batches)
+	if got := shards.batchCalls[0]; got != 3 {
+		t.Fatalf("ran %d backfill passes, want 3: a pass that returned a key with rows remaining was declared done", got)
 	}
 }
 
@@ -282,13 +270,7 @@ func TestBackfillFailsWhenItDoesNotConverge(t *testing.T) {
 	shards := newFakeShards()
 	shards.columns = []string{"tenant_id", "id", "amount"}
 	shards.pks = []string{"id"}
-	shards.affected = func(_ int32, sql string) int64 {
-		if strings.Contains(sql, "WITH batch AS") {
-			return 2
-		}
-		return 0
-	}
-	shards.backfillProbe = func(int32, int) []string { return []string{"42"} }
+	shards.batchNext = func(int32, int) []string { return []string{"42"} }
 	a := newRewriteApplier(store, shards)
 	if _, err := a.RunOnce(context.Background()); err != nil {
 		t.Fatal(err)
@@ -296,5 +278,54 @@ func TestBackfillFailsWhenItDoesNotConverge(t *testing.T) {
 	m := store.get(t, "00000000-0000-0000-0000-00000000ab09")
 	if m.State != catalog.MigrationFailed || !strings.Contains(m.Error, "not converging") {
 		t.Fatalf("state %s error %q", m.State, m.Error)
+	}
+}
+
+// TestAResumedRewriteWaitsOutTheSettleWindowAgain: the column list alone
+// does not say the wait for routers to reload it ran. A crash inside the
+// wait used to resume straight into ADD COLUMN, so a router still serving
+// the view from before the column list would expand SELECT * over the
+// hidden column.
+func TestAResumedRewriteWaitsOutTheSettleWindowAgain(t *testing.T) {
+	waited := func(settled bool) (time.Duration, bool, bool, []string) {
+		m := rewriteMigration("00000000-0000-0000-0000-00000000ab0d")
+		m.State = catalog.MigrationRunning
+		m.Meta.Rewrite.Columns = []string{"tenant_id", "id", "amount"}
+		m.Meta.Rewrite.Settled = settled
+		m.PerShard = map[string]catalog.ShardMigration{"0": {State: catalog.ShardPending}}
+		store := &memStore{migrations: []catalog.DDLMigration{m}, shards: []int32{0}}
+		shards := newFakeShards()
+		shards.columns = []string{"tenant_id", "id", "amount"}
+		shards.pks = []string{"id"}
+		a := newRewriteApplier(store, shards)
+		a.RewriteSettle = DefaultRewriteSettle
+		var slept time.Duration
+		var ranWhenSlept []string
+		a.Sleep = func(_ context.Context, d time.Duration) error {
+			slept, ranWhenSlept = slept+d, shards.statements(0)
+			return nil
+		}
+		if _, err := a.RunOnce(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		got := store.get(t, m.ID)
+		if got.State != catalog.MigrationComplete {
+			t.Fatalf("state %s: %s", got.State, got.Error)
+		}
+		return slept, has(ranWhenSlept, "ADD COLUMN"), got.Meta.Rewrite.Settled, shards.statements(0)
+	}
+
+	slept, addedFirst, recorded, ran := waited(false)
+	if slept < DefaultRewriteSettle {
+		t.Fatalf("a resumed rewrite waited %s, want at least one settle window of %s:\n%s", slept, DefaultRewriteSettle, strings.Join(ran, "\n"))
+	}
+	if addedFirst {
+		t.Fatal("the hidden column was added before the wait for routers to reload the column list")
+	}
+	if !recorded {
+		t.Fatal("the finished wait was not recorded, so every later resume waits again")
+	}
+	if slept, _, _, _ := waited(true); slept != 0 {
+		t.Fatalf("a rewrite that recorded a finished wait waited %s again", slept)
 	}
 }

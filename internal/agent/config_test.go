@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/andrew01234567890/pgshard/internal/agent/backup"
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 )
 
 func testConfig() *Config {
@@ -311,6 +312,12 @@ func TestPgHBARefusesApplicationRolesOverTCP(t *testing.T) {
 		if tls {
 			c.TLS = TLSFiles{CertFile: "/certs/tls.crt", KeyFile: "/certs/tls.key", CAFile: "/certs/ca.crt"}
 		}
+		// The control plane's own roles, and nothing else. The superuser is
+		// how the operator, the controller and a replica reach a member;
+		// the router's catalog role is how the router reaches the catalog,
+		// and it exists only where the catalog schema does, so on a shard
+		// this line matches no role at all.
+		controlPlane := map[string]bool{"postgres": true, catalog.RouterRole: true}
 		var host, superuser, reject int
 		for _, line := range strings.Split(RenderPgHBAConf(c), "\n") {
 			f := strings.Fields(line)
@@ -322,19 +329,71 @@ func TestPgHBARefusesApplicationRolesOverTCP(t *testing.T) {
 			switch {
 			case method == "reject":
 				reject++
-			case role == "postgres":
+			case controlPlane[role]:
 				superuser++
 			default:
 				t.Errorf("tls=%v: %q lets role %q authenticate over TCP", tls, line, role)
 			}
 		}
 		if superuser == 0 || reject == 0 || host != superuser+reject {
-			t.Errorf("tls=%v: %d TCP lines, %d superuser, %d reject", tls, host, superuser, reject)
+			t.Errorf("tls=%v: %d TCP lines, %d control plane, %d reject", tls, host, superuser, reject)
+		}
+		// An application role is still refused, which is the point of all
+		// of this: it must reach a shard through the pooler and the router,
+		// where shard-key routing, the write fences and the coordination of
+		// a multi-shard write happen.
+		if strings.Contains(RenderPgHBAConf(c), " app ") {
+			t.Errorf("tls=%v: an application role reached the TCP rules", tls)
 		}
 		// The socket stays open to everything: that is how the pooler, and
 		// so every application, actually reaches this instance.
 		if !strings.Contains(RenderPgHBAConf(c), "local   all             all") {
 			t.Errorf("tls=%v: local connections must still admit every role", tls)
+		}
+	}
+}
+
+// TestParameterNameCannotInjectASetting: the value of a parameter is
+// quoted but its name is written as it stands, so a name carrying a
+// newline used to write a second setting of its own -- and every guard on
+// the CRD names a setting, so anything they refuse could be smuggled in
+// behind a key they allow.
+func TestParameterNameCannotInjectASetting(t *testing.T) {
+	c := testConfig()
+	c.Postgres.Parameters = map[string]string{
+		"work_mem = '4MB'\nssl": "off",
+		"fine_setting":          "1",
+		"also.fine":             "2",
+		"has space":             "3",
+		"has=equals":            "4",
+		"has'quote":             "5",
+		"":                      "6",
+	}
+	conf := renderPostgresqlConf(c, false, false)
+
+	if n := strings.Count(conf, "\nssl = "); n != 1 {
+		t.Errorf("postgresql.conf has %d ssl lines, want the one pgshard writes:\n%s", n, conf)
+	}
+	if strings.Contains(conf, "ssl = 'off'") {
+		t.Error("an injected key turned TLS off")
+	}
+	for _, want := range []string{"fine_setting = '1'", "also.fine = '2'"} {
+		if !strings.Contains(conf, want) {
+			t.Errorf("a legitimate parameter was dropped: %q missing", want)
+		}
+	}
+	for _, bad := range []string{"has space", "has=equals", "has'quote"} {
+		if strings.Contains(conf, bad) {
+			t.Errorf("a key that is not a setting name reached the file: %q", bad)
+		}
+	}
+	// Every line the file carries has to be one setting.
+	for _, line := range strings.Split(conf, "\n") {
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.Count(line, " = ") != 1 {
+			t.Errorf("line %q is not a single setting", line)
 		}
 	}
 }

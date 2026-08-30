@@ -59,21 +59,49 @@ type merger struct {
 	sentRel    map[string]string
 	lastCommit map[router.Shard]int64
 	heldSince  map[router.Shard]time.Time
-	heads      map[router.Shard]*unit
-	next       int
+	// pos is the position message, rebuilt in place rather than allocated
+	// again for every transaction; posShard holds its per-shard entries so
+	// their shard references are allocated once each.
+	pos      *pgshardv1.VPosition
+	posShard map[router.Shard]*pgshardv1.VPosition_Shard
+	heads    map[router.Shard]*unit
+	next     int
 }
 
+// vector is where the stream has reached. It is sent after every
+// position-bearing transaction, and used to allocate a fresh message plus
+// one entry per shard each time -- so a stream of small transactions on a
+// wide cluster spent more on saying where it was than on what had changed.
+//
+// The message is built once and its numbers updated in place. That is
+// sound because the only consumer is send, which marshals before it
+// returns: the bytes are on the wire before anything can move the position
+// again. A consumer that kept the message rather than its contents would
+// see it change underneath, which is why this returns to the caller that
+// sends it immediately and nothing else calls it.
 func (m *merger) vector() *pgshardv1.VPosition {
-	pos := &pgshardv1.VPosition{ShardMapGeneration: m.generation}
+	if m.pos == nil {
+		m.pos = &pgshardv1.VPosition{}
+		m.posShard = map[router.Shard]*pgshardv1.VPosition_Shard{}
+	}
+	m.pos.ShardMapGeneration = m.generation
+	m.pos.Shards = m.pos.Shards[:0]
+	m.pos.CopyState = m.pos.CopyState[:0]
 	for _, sh := range m.shards {
 		if lsn := m.position[sh]; lsn > 0 {
-			pos.Shards = append(pos.Shards, &pgshardv1.VPosition_Shard{Shard: shardRef(sh), Lsn: lsn})
+			e := m.posShard[sh]
+			if e == nil {
+				e = &pgshardv1.VPosition_Shard{Shard: shardRef(sh)}
+				m.posShard[sh] = e
+			}
+			e.Lsn = lsn
+			m.pos.Shards = append(m.pos.Shards, e)
 		}
 		if st := m.copying[sh]; st != nil {
-			pos.CopyState = append(pos.CopyState, st)
+			m.pos.CopyState = append(m.pos.CopyState, st)
 		}
 	}
-	return pos
+	return m.pos
 }
 
 // run drives the fan-in until ctx ends, a shard reports an error, or the
@@ -204,6 +232,7 @@ func (m *merger) choose() (*unit, time.Duration) {
 		return nil, 0
 	}
 	now := m.now()
+	floors := m.commitFloors()
 	var pick *unit
 	var pickShard router.Shard
 	var wait time.Duration
@@ -217,7 +246,7 @@ func (m *merger) choose() (*unit, time.Duration) {
 			delete(m.heldSince, sh)
 			return u, 0
 		}
-		floor, known := m.slowestOther(sh)
+		floor, known := floors.without(sh)
 		eligible := !known || u.commitTS <= floor+m.opts.skew.Microseconds()
 		if !eligible {
 			since, held := m.heldSince[sh]
@@ -244,22 +273,50 @@ func (m *merger) choose() (*unit, time.Duration) {
 	return pick, 0
 }
 
-func (m *merger) slowestOther(self router.Shard) (int64, bool) {
-	var floor int64
-	known := false
+// commitFloors summarises the last commit timestamps once per pass. The
+// question asked of it -- the slowest shard other than this one -- used to
+// be answered by walking every shard again for each candidate, so aligning
+// skew cost the square of the shard count on every unit emitted. The two
+// smallest timestamps are all that can answer it: excluding one shard
+// removes at most the smallest, and then the second smallest stands in.
+type commitFloors struct {
+	min, next int64
+	at        router.Shard
+	seen      int
+}
+
+func (m *merger) commitFloors() commitFloors {
+	var f commitFloors
 	for _, sh := range m.shards {
-		if sh == self {
-			continue
-		}
 		ts, ok := m.lastCommit[sh]
 		if !ok {
 			continue
 		}
-		if !known || ts < floor {
-			floor, known = ts, true
+		switch {
+		case f.seen == 0 || ts < f.min:
+			f.next = f.min
+			f.min, f.at = ts, sh
+		case f.seen == 1 || ts < f.next:
+			f.next = ts
 		}
+		f.seen++
 	}
-	return floor, known
+	return f
+}
+
+// without is the slowest commit timestamp among the shards other than
+// self, and whether there is one.
+func (f commitFloors) without(self router.Shard) (int64, bool) {
+	switch {
+	case f.seen == 0:
+		return 0, false
+	case f.at != self:
+		return f.min, true
+	case f.seen == 1:
+		return 0, false
+	default:
+		return f.next, true
+	}
 }
 
 func (m *merger) emit(u *unit) error {

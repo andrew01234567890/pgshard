@@ -16,6 +16,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 )
 
 // DefaultRouterImage is the router image used when the operator is started
@@ -59,10 +60,21 @@ func RouterReplicas(c *pgshardv1alpha1.PgShardCluster) (minReplicas, maxReplicas
 	return minReplicas, maxReplicas
 }
 
-// CatalogDSN is the libpq connection string the router uses to reach the
-// catalog primary; the password comes from PGPASSWORD.
+// CatalogDSN is the libpq connection string the control plane uses to reach
+// the catalog primary as the superuser; the password comes from PGPASSWORD.
 func CatalogDSN(c *pgshardv1alpha1.PgShardCluster) string {
 	return fmt.Sprintf("host=%s.%s.svc port=%d user=%s dbname=postgres", CatalogServiceRW(c.Name), c.Namespace, postgresPort, superuserName)
+}
+
+// RouterCatalogDSN is the same catalog, reached as the router's own login
+// role. The router terminates untrusted client connections -- the pgwire
+// state machine, the SQL parser, the planner -- so it holds a credential
+// that is only what it needs: the roles table with its verifiers, the
+// decision log, the migration queue, the sequence allocator. Not the
+// superuser password, which is also the seed of the agent control-plane
+// token, and would turn one compromised router into the whole cluster.
+func RouterCatalogDSN(c *pgshardv1alpha1.PgShardCluster) string {
+	return fmt.Sprintf("host=%s.%s.svc port=%d user=%s dbname=postgres", CatalogServiceRW(c.Name), c.Namespace, postgresPort, catalog.RouterRole)
 }
 
 // RouterDeployment renders the router Deployment; the HPA owns the replica
@@ -74,7 +86,7 @@ func (r Renderer) RouterDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.De
 	}
 	labels := routerLabels(c)
 	minReplicas, _ := RouterReplicas(c)
-	args := []string{"serve", fmt.Sprintf("--listen=:%d", postgresPort), fmt.Sprintf("--health-listen=:%d", routerHTTPPort), "--catalog-dsn=" + CatalogDSN(c), "--catalog-pooler=" + CatalogPoolerEndpoint(c),
+	args := []string{"serve", fmt.Sprintf("--listen=:%d", postgresPort), fmt.Sprintf("--health-listen=:%d", routerHTTPPort), "--catalog-dsn=" + RouterCatalogDSN(c), "--catalog-pooler=" + CatalogPoolerEndpoint(c),
 		// Without these a cancel that lands on the wrong replica is
 		// discarded in silence, and the query it named runs on.
 		fmt.Sprintf("--peer-cancel-listen=:%d", routerPeerPort),
@@ -113,7 +125,7 @@ func (r Renderer) RouterDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.De
 						ImagePullPolicy: corev1.PullIfNotPresent,
 						Args:            args,
 						Env: []corev1.EnvVar{{Name: "PGPASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-							LocalObjectReference: corev1.LocalObjectReference{Name: SecretName(c.Name)}, Key: secretKey}}}},
+							LocalObjectReference: corev1.LocalObjectReference{Name: RouterSecretName(c.Name)}, Key: secretKey}}}},
 						Ports: []corev1.ContainerPort{{Name: "postgres", ContainerPort: postgresPort}, {Name: "http", ContainerPort: routerHTTPPort},
 							{Name: "peer", ContainerPort: routerPeerPort}},
 						ReadinessProbe: &corev1.Probe{

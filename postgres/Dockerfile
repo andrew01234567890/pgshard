@@ -46,7 +46,7 @@ RUN curl -fsSLo pgbackrest.tar.gz "https://github.com/pgbackrest/pgbackrest/arch
     && ninja -C build \
     && install -m 0755 build/src/pgbackrest /usr/local/bin/pgbackrest
 
-FROM golang:1.27-bookworm@sha256:484ef6066fa69acb059fdfeda7ba2b8f7391f2ef6abc6f9b8411e669ebd56466 AS agent-build
+FROM golang:1.27-bookworm@sha256:ded31c68586d2e49e760acc2e65a884b23d032e9bbbed0ae0c55abd3fcaf4452 AS agent-build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download

@@ -118,9 +118,13 @@ func TestSchedulerFiresBarriersPerBoundCluster(t *testing.T) {
 	if cond := barrierCondition(); cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != "Recorded" {
 		t.Fatalf("recorded barrier condition %+v", cond)
 	}
+	// The scheduler forgetting its last tick is what an operator restart
+	// looks like from here: the policy still has a barrier schedule, and
+	// what the last barrier did is still worth knowing. It used to become
+	// Unknown, turning a recorded failure into no information at all.
 	s.Remove(key)
-	if cond := barrierCondition(); cond == nil || cond.Status != metav1.ConditionUnknown || cond.Reason != "NotFiredYet" {
-		t.Fatalf("fresh condition %+v", cond)
+	if cond := barrierCondition(); cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != "Recorded" {
+		t.Fatalf("condition after the scheduler forgot: %+v", cond)
 	}
 	var stored pgshardv1alpha1.PgShardBackupPolicy
 	if err := cl.Get(context.Background(), key, &stored); err != nil {
@@ -456,4 +460,46 @@ func mustCluster(t *testing.T, cl client.Client, name string) *pgshardv1alpha1.P
 		t.Fatal(err)
 	}
 	return &c
+}
+
+// TestBarrierHealthySurvivesAnOperatorRestart: the scheduler's record of
+// the last tick lives in memory, so a restarted operator has none. What the
+// last barrier did is still on the object, and keeping it is the difference
+// between "the last barrier failed" and "nothing is known".
+func TestBarrierHealthySurvivesAnOperatorRestart(t *testing.T) {
+	for name, tc := range map[string]struct {
+		prev   metav1.Condition
+		status metav1.ConditionStatus
+		reason string
+	}{
+		"a recorded failure stands": {
+			prev:   metav1.Condition{Type: ConditionBarrierHealthy, Status: metav1.ConditionFalse, Reason: "BarrierFailed", Message: "barrier tick at 2026-08-19T02:00:00Z: drain"},
+			status: metav1.ConditionFalse, reason: "BarrierFailed",
+		},
+		"a recorded success stands": {
+			prev:   metav1.Condition{Type: ConditionBarrierHealthy, Status: metav1.ConditionTrue, Reason: "Recorded", Message: "barrier tick at 2026-08-19T02:00:00Z reached every bound cluster"},
+			status: metav1.ConditionTrue, reason: "Recorded",
+		},
+		"nothing recorded stays unknown": {
+			prev:   metav1.Condition{Type: ConditionBarrierHealthy, Status: metav1.ConditionUnknown, Reason: "NotFiredYet", Message: "no scheduled barrier has run yet"},
+			status: metav1.ConditionUnknown, reason: "NotFiredYet",
+		},
+	} {
+		pol := &pgshardv1alpha1.PgShardBackupPolicy{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default", Generation: 3}}
+		pol.Spec.BarrierSchedule = "0 2 * * *"
+		tc.prev.LastTransitionTime = metav1.Now()
+		pol.Status.Conditions = []metav1.Condition{tc.prev}
+
+		// A scheduler that has never seen a tick: the restarted operator.
+		r := &BackupPolicyReconciler{Scheduler: NewBackupScheduler(nil)}
+		r.setBarrierHealthy(pol)
+
+		got := meta.FindStatusCondition(pol.Status.Conditions, ConditionBarrierHealthy)
+		if got == nil || got.Status != tc.status || got.Reason != tc.reason {
+			t.Errorf("%s: %+v", name, got)
+		}
+		if got != nil && got.ObservedGeneration != pol.Generation {
+			t.Errorf("%s: observedGeneration %d, want %d", name, got.ObservedGeneration, pol.Generation)
+		}
+	}
 }

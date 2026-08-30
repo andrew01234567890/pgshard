@@ -467,6 +467,22 @@ type Column struct {
 type RowComparator struct {
 	keys  []plan.SortKey
 	comps []Comparator
+	decs  []decoder
+	fams  []family
+}
+
+// SortKey is one row's ordering columns, decoded. A heap compares each
+// head row against O(log shards) others, and comparing on raw bytes
+// decoded both sides every time -- so a numeric or a timestamp was parsed
+// again for every comparison it took part in, rather than once when the
+// row arrived.
+type SortKey struct {
+	cols []keyCol
+}
+
+type keyCol struct {
+	null bool
+	v    value
 }
 
 // NewRowComparator resolves the comparators for keys against the columns of
@@ -485,8 +501,54 @@ func NewRowComparator(keys []plan.SortKey, cols []Column, hidden int) (*RowCompa
 			return nil, err
 		}
 		rc.comps = append(rc.comps, c)
+		fam := familyOf(cols[k.Column].TypeOID)
+		rc.fams = append(rc.fams, fam)
+		rc.decs = append(rc.decs, decoderFor(fam, cols[k.Column].TypeOID, cols[k.Column].Format))
 	}
 	return rc, nil
+}
+
+// Key decodes the ordering columns of one row, once. A NULL is recorded
+// as such rather than decoded: the wire has no value to decode, and where
+// it sorts is the key's business, not the type's.
+func (rc *RowComparator) Key(row [][]byte) (SortKey, error) {
+	k := SortKey{cols: make([]keyCol, len(rc.keys))}
+	for i, sk := range rc.keys {
+		b := row[sk.Column]
+		if b == nil {
+			k.cols[i].null = true
+			continue
+		}
+		v, err := rc.decs[i](b)
+		if err != nil {
+			return SortKey{}, err
+		}
+		k.cols[i].v = v
+	}
+	return k, nil
+}
+
+// CompareKeys orders two decoded keys the way Compare orders the rows they
+// came from.
+func (rc *RowComparator) CompareKeys(a, b SortKey) int {
+	for i, sk := range rc.keys {
+		x, y := a.cols[i], b.cols[i]
+		switch {
+		case x.null && y.null:
+			continue
+		case x.null:
+			return nullOrder(sk)
+		case y.null:
+			return -nullOrder(sk)
+		}
+		if c := compareValues(rc.fams[i], x.v, y.v); c != 0 {
+			if sk.Desc {
+				c = -c
+			}
+			return c
+		}
+	}
+	return 0
 }
 
 // Compare orders a before b (negative), after (positive) or equal (0);

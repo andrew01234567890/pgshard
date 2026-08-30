@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -42,8 +43,41 @@ type AgentClient interface {
 	SetSynchronizedStandbySlots(ctx context.Context, addr string, slots []string) ([]string, error)
 }
 
-// GRPCAgentClient is the production AgentClient.
-type GRPCAgentClient struct{}
+// GRPCAgentClient is the production AgentClient. It keeps one connection
+// per agent address: a reconcile pass asks every group's primary for its
+// status, and with the groups reconciled concurrently that was a TCP
+// handshake and an HTTP/2 preface per group per pass, thrown away the
+// moment the answer arrived.
+type GRPCAgentClient struct {
+	mu    sync.Mutex
+	conns map[string]*grpc.ClientConn
+}
+
+// NewGRPCAgentClient builds a client that keeps its connections.
+func NewGRPCAgentClient() *GRPCAgentClient {
+	return &GRPCAgentClient{conns: map[string]*grpc.ClientConn{}}
+}
+
+// Close drops every kept connection.
+func (c *GRPCAgentClient) Close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for addr, cc := range c.conns {
+		_ = cc.Close()
+		delete(c.conns, addr)
+	}
+}
+
+// drop forgets a connection that could not be used, so the next call
+// dials rather than waiting on the same broken one.
+func (c *GRPCAgentClient) drop(addr string, cc *grpc.ClientConn) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conns[addr] == cc {
+		delete(c.conns, addr)
+		_ = cc.Close()
+	}
+}
 
 const (
 	agentDialTimeout = 3 * time.Second
@@ -56,32 +90,47 @@ const (
 	agentPromoteTimeout = 2 * time.Minute
 )
 
-func (GRPCAgentClient) dial(ctx context.Context, addr string) (*grpc.ClientConn, pgshardv1.AgentClient, error) {
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, nil, err
+// dial returns the connection to addr, opening one if there is none. The
+// wait for READY is kept on every call: a connection that has gone idle or
+// broken is reconnected here, so a caller still fails fast on an agent it
+// cannot reach rather than inside its own RPC deadline.
+func (c *GRPCAgentClient) dial(ctx context.Context, addr string) (pgshardv1.AgentClient, error) {
+	c.mu.Lock()
+	if c.conns == nil {
+		c.conns = map[string]*grpc.ClientConn{}
 	}
+	conn, ok := c.conns[addr]
+	if !ok {
+		var err error
+		conn, err = grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			c.mu.Unlock()
+			return nil, err
+		}
+		c.conns[addr] = conn
+	}
+	c.mu.Unlock()
+
 	dialCtx, cancel := context.WithTimeout(ctx, agentDialTimeout)
 	defer cancel()
 	conn.Connect()
 	for state := conn.GetState(); !stateReady(state); state = conn.GetState() {
 		if !conn.WaitForStateChange(dialCtx, state) {
-			_ = conn.Close()
-			return nil, nil, fmt.Errorf("agent %s unreachable: %w", addr, dialCtx.Err())
+			c.drop(addr, conn)
+			return nil, fmt.Errorf("agent %s unreachable: %w", addr, dialCtx.Err())
 		}
 	}
-	return conn, pgshardv1.NewAgentClient(conn), nil
+	return pgshardv1.NewAgentClient(conn), nil
 }
 
 func stateReady(s interface{ String() string }) bool { return s.String() == "READY" }
 
 // Status calls Agent.Status.
-func (c GRPCAgentClient) Status(ctx context.Context, addr string) (AgentStatus, error) {
-	conn, cl, err := c.dial(ctx, addr)
+func (c *GRPCAgentClient) Status(ctx context.Context, addr string) (AgentStatus, error) {
+	cl, err := c.dial(ctx, addr)
 	if err != nil {
 		return AgentStatus{}, err
 	}
-	defer func() { _ = conn.Close() }()
 	ctx, cancel := context.WithTimeout(ctx, agentDialTimeout)
 	defer cancel()
 	resp, err := cl.Status(ctx, &pgshardv1.StatusRequest{})
@@ -96,12 +145,11 @@ func (c GRPCAgentClient) Status(ctx context.Context, addr string) (AgentStatus, 
 }
 
 // Promote calls Agent.Promote and turns an embedded error into a Go error.
-func (c GRPCAgentClient) Promote(ctx context.Context, addr string, epoch uint64, holder string) error {
-	conn, cl, err := c.dial(ctx, addr)
+func (c *GRPCAgentClient) Promote(ctx context.Context, addr string, epoch uint64, holder string) error {
+	cl, err := c.dial(ctx, addr)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = conn.Close() }()
 	ctx, cancel := context.WithTimeout(ctx, agentPromoteTimeout)
 	defer cancel()
 	resp, err := cl.Promote(ctx, &pgshardv1.PromoteRequest{Epoch: epoch, LeaseHolder: holder})
@@ -115,12 +163,11 @@ func (c GRPCAgentClient) Promote(ctx context.Context, addr string, epoch uint64,
 }
 
 // Demote calls Agent.Demote and turns an embedded error into a Go error.
-func (c GRPCAgentClient) Demote(ctx context.Context, addr string, epoch uint64) error {
-	conn, cl, err := c.dial(ctx, addr)
+func (c *GRPCAgentClient) Demote(ctx context.Context, addr string, epoch uint64) error {
+	cl, err := c.dial(ctx, addr)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = conn.Close() }()
 	ctx, cancel := context.WithTimeout(ctx, agentPromoteTimeout)
 	defer cancel()
 	resp, err := cl.Demote(ctx, &pgshardv1.DemoteRequest{Epoch: epoch})
@@ -134,12 +181,11 @@ func (c GRPCAgentClient) Demote(ctx context.Context, addr string, epoch uint64) 
 }
 
 // Reload reads the agent's epoch and calls Agent.Reload at that epoch.
-func (c GRPCAgentClient) Reload(ctx context.Context, addr string) (string, error) {
-	conn, cl, err := c.dial(ctx, addr)
+func (c *GRPCAgentClient) Reload(ctx context.Context, addr string) (string, error) {
+	cl, err := c.dial(ctx, addr)
 	if err != nil {
 		return "", err
 	}
-	defer func() { _ = conn.Close() }()
 	ctx, cancel := context.WithTimeout(ctx, agentCallTimeout)
 	defer cancel()
 	st, err := cl.Status(ctx, &pgshardv1.StatusRequest{})
@@ -199,12 +245,11 @@ func backupResultFromProto(i *pgshardv1.BackupInfo) BackupResult {
 }
 
 // Backup reads the agent's epoch and calls Agent.Backup at that epoch.
-func (c GRPCAgentClient) Backup(ctx context.Context, addr string, t string) (BackupResult, error) {
-	conn, cl, err := c.dial(ctx, addr)
+func (c *GRPCAgentClient) Backup(ctx context.Context, addr string, t string) (BackupResult, error) {
+	cl, err := c.dial(ctx, addr)
 	if err != nil {
 		return BackupResult{}, err
 	}
-	defer func() { _ = conn.Close() }()
 	// The backup itself runs pgbackrest synchronously and is bounded by the
 	// caller (backupRunTimeout); only the epoch probe gets a short deadline.
 	sctx, scancel := context.WithTimeout(ctx, agentCallTimeout)
@@ -237,12 +282,11 @@ func (c GRPCAgentClient) Backup(ctx context.Context, addr string, t string) (Bac
 }
 
 // Expire reads the agent's epoch and calls Agent.Expire at that epoch.
-func (c GRPCAgentClient) Expire(ctx context.Context, addr string) error {
-	conn, cl, err := c.dial(ctx, addr)
+func (c *GRPCAgentClient) Expire(ctx context.Context, addr string) error {
+	cl, err := c.dial(ctx, addr)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = conn.Close() }()
 	// Expire can run long on a large repo; bound only the epoch probe, not
 	// the Expire RPC (the caller bounds the overall run).
 	sctx, scancel := context.WithTimeout(ctx, agentCallTimeout)
@@ -262,12 +306,11 @@ func (c GRPCAgentClient) Expire(ctx context.Context, addr string) error {
 }
 
 // Info calls Agent.RestoreInfo.
-func (c GRPCAgentClient) Info(ctx context.Context, addr string) (RepoInfo, error) {
-	conn, cl, err := c.dial(ctx, addr)
+func (c *GRPCAgentClient) Info(ctx context.Context, addr string) (RepoInfo, error) {
+	cl, err := c.dial(ctx, addr)
 	if err != nil {
 		return RepoInfo{}, err
 	}
-	defer func() { _ = conn.Close() }()
 	resp, err := cl.RestoreInfo(ctx, &pgshardv1.RestoreInfoRequest{})
 	if err != nil {
 		return RepoInfo{}, err
@@ -284,12 +327,11 @@ func (c GRPCAgentClient) Info(ctx context.Context, addr string) (RepoInfo, error
 
 // SetSynchronizedStandbySlots reads the agent's epoch and calls
 // Agent.SetSynchronizedStandbySlots at that epoch.
-func (c GRPCAgentClient) SetSynchronizedStandbySlots(ctx context.Context, addr string, slots []string) ([]string, error) {
-	conn, cl, err := c.dial(ctx, addr)
+func (c *GRPCAgentClient) SetSynchronizedStandbySlots(ctx context.Context, addr string, slots []string) ([]string, error) {
+	cl, err := c.dial(ctx, addr)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = conn.Close() }()
 	ctx, cancel := context.WithTimeout(ctx, agentCallTimeout)
 	defer cancel()
 	st, err := cl.Status(ctx, &pgshardv1.StatusRequest{})

@@ -8,6 +8,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/internal/agent"
 )
 
 func TestSyncStandbyNamesOrdersStreamingFirst(t *testing.T) {
@@ -142,5 +143,16 @@ func TestServingShardsPrefersCatalogOverSpec(t *testing.T) {
 	}
 	if ReshardName("c", 3) != "c-reshard-g3" {
 		t.Errorf("ReshardName: %s", ReshardName("c", 3))
+	}
+}
+
+// TestAgentLeaseCarriesTheClusterLabel: everything pgshard creates carries
+// the cluster label, and a namespace holding several clusters is sorted by
+// it -- a Lease without it can only be attributed by matching names, and a
+// cluster called "a" prefixes "ab"'s objects. The agent repeats the key
+// because it cannot import this package; this is what keeps them equal.
+func TestAgentLeaseCarriesTheClusterLabel(t *testing.T) {
+	if agent.LabelCluster != LabelCluster {
+		t.Fatalf("the agent labels leases %q, the operator sorts by %q", agent.LabelCluster, LabelCluster)
 	}
 }

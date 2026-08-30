@@ -400,3 +400,46 @@ func shardStatusEndpoint(t *testing.T, conn *pgx.Conn, g Group) string {
 	}
 	return ep
 }
+
+// TestProbeReadsAPrimaryInOneRoundTrip: the operator probes every member of
+// every group on every pass, so what the probe costs is multiplied by the
+// topology. It reads liveness, recovery state, the streaming standbys and
+// the synchronous list in one statement; this proves the statement returns
+// what the four it replaced did.
+func TestProbeReadsAPrimaryInOneRoundTrip(t *testing.T) {
+	if err := exec.Command("docker", "info").Run(); err != nil {
+		dockertest.Unavailable(t, "docker unavailable")
+	}
+	ctx := context.Background()
+	dsn := startProbePostgres(t)
+
+	st, err := PgxProber{}.Probe(ctx, dsn)
+	if err != nil {
+		t.Fatalf("probing a live primary: %v", err)
+	}
+	if st.Streaming == nil {
+		t.Error("streaming must be an empty map, not nil, when nothing is streaming")
+	}
+	if len(st.Streaming) != 0 {
+		t.Errorf("streaming standbys on a lone primary: %v", st.Streaming)
+	}
+	if st.SyncStandbyNames != "" {
+		t.Errorf("synchronous_standby_names = %q, want empty", st.SyncStandbyNames)
+	}
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	mustProbeExec(t, conn, `ALTER SYSTEM SET synchronous_standby_names = 'ANY 1 (a,b)'`)
+	mustProbeExec(t, conn, `SELECT pg_reload_conf()`)
+
+	st, err = PgxProber{}.Probe(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.SyncStandbyNames != "ANY 1 (a,b)" {
+		t.Errorf("synchronous_standby_names = %q", st.SyncStandbyNames)
+	}
+}
