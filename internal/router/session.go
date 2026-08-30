@@ -983,10 +983,27 @@ func (e *Executor) bind(ctx context.Context, portal, statement string, paramForm
 }
 
 // replanStale plans statement again when it was prepared against an older
-// snapshot than the current one.
+// snapshot than the current one -- and refuses first if the snapshot it
+// would plan against can no longer be trusted.
+//
+// The refusal has to be here rather than only in planOp. A router whose
+// reloads are failing keeps the same snapshot, so the pointer comparison
+// below finds nothing to replan and the statement runs on. Nothing else on
+// the extended path consults the catalog again, so a statement prepared
+// while the view was fresh could be bound and executed against a view that
+// was hours old -- which is the case the whole staleness bound exists to
+// prevent, and the one an online rewrite relies on: past MaxAge a router
+// has either reloaded and hides the working column, or has stopped.
 func (e *Executor) replanStale(ctx context.Context, statement string) error {
 	st, ok := e.stmts[statement]
-	if !ok || snapshot.SamePlanning(st.snap, e.currentSnapshot()) {
+	if !ok {
+		return nil
+	}
+	if err := e.staleSnapshot(); err != nil {
+		e.r.metrics.Refusals.WithLabelValues(codeStaleGeneration).Inc()
+		return err
+	}
+	if snapshot.SamePlanning(st.snap, e.currentSnapshot()) {
 		return nil
 	}
 	pl, err := e.planOp(ctx, st.sql, "parse")

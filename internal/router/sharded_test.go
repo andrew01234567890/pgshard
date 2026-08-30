@@ -953,3 +953,50 @@ func TestReferenceReadsSpreadAcrossShards(t *testing.T) {
 		t.Fatalf("sixteen sessions read the reference table on shards %v; the read is pinned to one member", seen)
 	}
 }
+
+// TestStaleSnapshotRefusesAPreparedStatementToo: the refusal used to live
+// only where a statement is planned. A router whose reloads are failing
+// keeps the same snapshot, so nothing on the extended path replans and
+// nothing consulted the catalog again -- a statement prepared while the
+// view was fresh went on being bound and executed against a view that was
+// hours old. That is the leak the bound exists to prevent: past MaxAge a
+// router has either reloaded and hides an online rewrite's working column,
+// or has stopped.
+func TestStaleSnapshotRefusesAPreparedStatementToo(t *testing.T) {
+	h := newShardedHarness(t)
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, h.dsn())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Prepare while the view is fresh, and use it, so the statement is
+	// cached against this snapshot and would not be replanned.
+	if _, err := conn.Prepare(ctx, "bykey", "select * from orders where tenant_id = $1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "bykey", int64(1)); err != nil {
+		t.Fatalf("a fresh snapshot must execute: %v", err)
+	}
+
+	snap := h.snap
+	snap.LoadedAt = time.Now().Add(-snapshot.MaxAge - time.Second)
+	h.snapp.Store(snap)
+
+	_, err = conn.Exec(ctx, "bykey", int64(1))
+	var pe *pgconn.PgError
+	if !errors.As(err, &pe) {
+		t.Fatalf("a prepared statement must be refused once the snapshot went stale, got %v", err)
+	}
+	if pe.Code != "55000" {
+		t.Errorf("SQLSTATE %s, want 55000, the same refusal the simple path gives", pe.Code)
+	}
+	if !strings.Contains(pe.Message, "last read the catalog") {
+		t.Errorf("message %q does not say the snapshot is stale", pe.Message)
+	}
+
+	snap.LoadedAt = time.Now()
+	h.snapp.Store(snap)
+	if _, err := conn.Exec(ctx, "bykey", int64(1)); err != nil {
+		t.Fatalf("a reloaded snapshot must execute again: %v", err)
+	}
+}
