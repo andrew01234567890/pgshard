@@ -35,7 +35,10 @@ the rest with `0A000`. See *Routing* below.
   arrives (`--snapshot-wait`).
 - **SCRAM.** Every session authenticates with SCRAM-SHA-256 against the
   verifier stored in `pgshard.roles`; verifiers are cached for `--roles-ttl`
-  (5s) and reloaded on a miss so new roles work immediately. A wrong password
+  (5s), reloaded on a miss so new roles work immediately, and reloaded once
+  per TTL when a cached credential is the thing refusing -- a password
+  renewed or a role re-enabled a moment ago otherwise looks disabled until
+  the TTL comes round. A wrong password
   or an unknown role is `28P01`, and so is a role that may not log in or
   whose password has expired **until the client proves the password**: the
   exchange runs either way, and the refusal that names the role (`28000`,

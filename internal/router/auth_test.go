@@ -391,3 +391,53 @@ func TestMaxSessionsAdmitsConcurrentlyWithoutExceedingTheCap(t *testing.T) {
 		t.Error("no session was admitted at all")
 	}
 }
+
+// TestARefusedRoleIsLookedUpAgain: a cached credential that refuses may
+// simply be old. A password renewed or a role re-enabled a moment ago looks
+// exactly like a disabled one until the ttl comes round, and making the
+// client wait out the ttl for a change already made in the catalog is the
+// sort of thing that gets diagnosed as "it works if you try again".
+func TestARefusedRoleIsLookedUpAgain(t *testing.T) {
+	now := time.Unix(1000, 0)
+	past := now.Add(-time.Hour)
+	q := &fakeQuerier{
+		roles: map[string]string{"batch": "v1"},
+		attrs: map[string]fakeRole{"batch": {validUntil: &past}},
+	}
+	c := NewRoleCache(q, time.Minute)
+	c.now = func() time.Time { return now }
+	ctx := context.Background()
+
+	// The cache is loaded while the password is expired.
+	if _, err := c.Lookup(ctx, "batch"); err == nil {
+		t.Fatal("an expired password must be refused")
+	}
+	// Somebody renews it. The cache does not know, and the ttl has not
+	// come round.
+	q.attrs["batch"] = fakeRole{}
+	c.lastMiss = time.Time{}
+	before := q.calls
+	if v, err := c.Lookup(ctx, "batch"); err != nil || v != "v1" {
+		t.Errorf("a refusal from a stale entry must be checked against the catalog: %q %v", v, err)
+	}
+	if q.calls == before {
+		t.Error("the catalog was never read again")
+	}
+
+	// But only once per ttl, so a caller hammering a disabled role cannot
+	// turn every attempt into a catalog read.
+	q.attrs["batch"] = fakeRole{validUntil: &past}
+	c.cur.Store(nil)
+	if _, err := c.Lookup(ctx, "batch"); err == nil {
+		t.Fatal("an expired password must be refused")
+	}
+	before = q.calls
+	for range 5 {
+		if _, err := c.Lookup(ctx, "batch"); err == nil {
+			t.Fatal("still expired")
+		}
+	}
+	if q.calls != before {
+		t.Errorf("refusals must be rate-limited: %d catalog reads for five attempts", q.calls-before)
+	}
+}
