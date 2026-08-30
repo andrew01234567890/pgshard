@@ -416,6 +416,7 @@ func (r *Resolver) Run(ctx context.Context, interval time.Duration, leader func(
 		if r.Metrics != nil {
 			r.Metrics.ResolvedTxns.WithLabelValues("committed").Add(float64(out.Committed))
 			r.Metrics.ResolvedTxns.WithLabelValues("rolled_back").Add(float64(out.RolledBack))
+			r.Metrics.ResolverUnresolved.Set(float64(out.Unresolved))
 		}
 	})
 }

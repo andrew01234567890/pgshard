@@ -28,8 +28,12 @@ import (
 var k8sClient client.Client
 
 func TestMain(m *testing.M) {
+	// Without a control plane the CRD validation tests skip themselves, but
+	// the rest of this package's tests read the generated manifests and need
+	// nothing: exiting here would take them with it.
 	if !dockertest.EnvtestAvailable() {
-		os.Exit(dockertest.EnvtestMissingMain("the API CRD validation tests"))
+		fmt.Fprint(os.Stderr, "envtest: KUBEBUILDER_ASSETS is not set; run 'make envtest'. Skipping the API CRD validation tests.\n")
+		os.Exit(m.Run())
 	}
 	env := &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
@@ -70,6 +74,9 @@ func validCluster(name string) *pgshardv1alpha1.PgShardCluster {
 
 func create(t *testing.T, obj client.Object) error {
 	t.Helper()
+	if k8sClient == nil {
+		dockertest.EnvtestMissing(t, "the API CRD validation tests")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	err := k8sClient.Create(ctx, obj)
