@@ -75,3 +75,71 @@ func TestMetricsPollerReportsWorkflowProgress(t *testing.T) {
 		t.Errorf("a workflow with no tables yet must report 0, got %v", v)
 	}
 }
+
+// TestDecidedTransactionsAreCountedSeparately: a decision row is deleted
+// when the resolver finishes it, so one that outlives its decision is a
+// transaction still holding locks, WAL and a vacuum horizon on every
+// participant. The gauges counted only undecided rows, so nothing said so.
+func TestDecidedTransactionsAreCountedSeparately(t *testing.T) {
+	parallelPG(t)
+	dsn := startPostgres(t)
+	ctx := context.Background()
+	conn := connect(t, dsn)
+	if err := catalog.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, `INSERT INTO pgshard.xact_decisions (gid, state, participants, created_at, decided_at) VALUES
+		('pgshard-a', 'preparing', '{0}', now() - interval '10 minutes', NULL),
+		('pgshard-b', 'commit',    '{0}', now() - interval '2 hours',    now() - interval '1 hour'),
+		('pgshard-c', 'commit',    '{0}', now() - interval '2 hours',    now() - interval '30 minutes'),
+		('pgshard-d', 'abort',     '{0}', now() - interval '2 hours',    now() - interval '15 minutes')`)
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	reg := prometheus.NewRegistry()
+	p := &MetricsPoller{Pool: pool, Metrics: metrics.NewController(reg)}
+	if err := p.Refresh(ctx); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	got := map[string]float64{}
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range families {
+		switch f.GetName() {
+		case "pgshard_controller_decided_transactions", "pgshard_controller_decided_oldest_age_seconds",
+			"pgshard_controller_in_doubt_transactions", "pgshard_controller_in_doubt_oldest_age_seconds":
+		default:
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			key := f.GetName()
+			for _, l := range m.GetLabel() {
+				key += "/" + l.GetValue()
+			}
+			got[key] = m.GetGauge().GetValue()
+		}
+	}
+
+	if got["pgshard_controller_decided_transactions/commit"] != 2 || got["pgshard_controller_decided_transactions/abort"] != 1 {
+		t.Fatalf("decided rows are not counted by decision: %v", got)
+	}
+	// Aged from the decision, not from when the transaction started.
+	if age := got["pgshard_controller_decided_oldest_age_seconds/commit"]; age < 3500 || age > 3700 {
+		t.Fatalf("oldest commit decision aged %v seconds, want about one hour since it was decided", age)
+	}
+	if age := got["pgshard_controller_decided_oldest_age_seconds/abort"]; age < 800 || age > 1000 {
+		t.Fatalf("oldest abort decision aged %v seconds, want about fifteen minutes", age)
+	}
+	if got["pgshard_controller_in_doubt_transactions"] != 1 {
+		t.Fatalf("the undecided count must not include decided rows: %v", got)
+	}
+	if age := got["pgshard_controller_in_doubt_oldest_age_seconds"]; age < 550 || age > 700 {
+		t.Fatalf("oldest undecided aged %v seconds, want about ten minutes", age)
+	}
+}
