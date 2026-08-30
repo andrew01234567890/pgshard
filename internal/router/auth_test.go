@@ -130,9 +130,13 @@ func TestRoleCacheRefusesNologinAndExpired(t *testing.T) {
 	c := NewRoleCache(q, time.Minute)
 	c.now = func() time.Time { return now }
 	ctx := context.Background()
-	assert28000 := func(user, want string) {
+	// The refusal comes back with the role's verifier: pgwire runs the
+	// exchange anyway and only relays the refusal to a client that proved
+	// the password, so a caller who has proved nothing cannot tell a
+	// disabled role from an absent one.
+	assert28000 := func(user, want, verifier string) {
 		t.Helper()
-		_, err := c.Lookup(ctx, user)
+		v, err := c.Lookup(ctx, user)
 		var pe *pgwire.Error
 		if !errors.As(err, &pe) || pe.Code != pgwire.CodeInvalidAuthorization {
 			t.Fatalf("%s: want 28000 refusal, got %v", user, err)
@@ -140,9 +144,12 @@ func TestRoleCacheRefusesNologinAndExpired(t *testing.T) {
 		if !strings.Contains(pe.Message, want) {
 			t.Fatalf("%s: message %q lacks %q", user, pe.Message, want)
 		}
+		if v != verifier {
+			t.Fatalf("%s: verifier %q, want %q -- a refusal without one cannot run a real exchange", user, v, verifier)
+		}
 	}
-	assert28000("batch", "not permitted to log in")
-	assert28000("expired", "expired")
+	assert28000("batch", "not permitted to log in", "v1")
+	assert28000("expired", "expired", "v2")
 	if v, err := c.Lookup(ctx, "current"); err != nil || v != "v3" {
 		t.Fatalf("valid_until in the future must pass: %q %v", v, err)
 	}
@@ -150,7 +157,7 @@ func TestRoleCacheRefusesNologinAndExpired(t *testing.T) {
 		t.Fatalf("no valid_until must pass: %q %v", v, err)
 	}
 	now = future
-	assert28000("current", "expired")
+	assert28000("current", "expired", "v3")
 }
 
 // TestConnectionLimitRefusesBeyondTheRolesAllowance: a role's

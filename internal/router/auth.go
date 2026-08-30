@@ -106,14 +106,18 @@ func (c *RoleCache) reloadForMiss(ctx context.Context) (*rolesAt, error) {
 	return c.loadLocked(ctx)
 }
 
-// admit refuses roles that must not log in; the 28000 error is relayed to
-// the client as-is instead of the mock SCRAM exchange for unknown roles.
+// admit refuses roles that must not log in. The verifier comes back with
+// the refusal so the SCRAM exchange still runs: answering "role %q is not
+// permitted to log in" before the client has proved anything tells an
+// unauthenticated caller that the role exists, while an unknown role gets
+// the mock exchange. PostgreSQL draws the same distinction only after
+// authentication.
 func (c *RoleCache) admit(user string, cred snapshot.RoleCred) (string, error) {
 	if !cred.CanLogin {
-		return "", pgwire.Errorf(pgwire.CodeInvalidAuthorization, "role %q is not permitted to log in", user)
+		return cred.Verifier, pgwire.Errorf(pgwire.CodeInvalidAuthorization, "role %q is not permitted to log in", user)
 	}
 	if cred.ValidUntil != nil && !c.now().Before(*cred.ValidUntil) {
-		return "", pgwire.Errorf(pgwire.CodeInvalidAuthorization, "password for role %q has expired", user)
+		return cred.Verifier, pgwire.Errorf(pgwire.CodeInvalidAuthorization, "password for role %q has expired", user)
 	}
 	return cred.Verifier, nil
 }

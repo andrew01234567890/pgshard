@@ -36,7 +36,14 @@ the rest with `0A000`. See *Routing* below.
 - **SCRAM.** Every session authenticates with SCRAM-SHA-256 against the
   verifier stored in `pgshard.roles`; verifiers are cached for `--roles-ttl`
   (5s) and reloaded on a miss so new roles work immediately. A wrong password
-  or an unknown role is `28P01`. The keys recovered from the exchange
+  or an unknown role is `28P01`, and so is a role that may not log in or
+  whose password has expired **until the client proves the password**: the
+  exchange runs either way, and the refusal that names the role (`28000`,
+  "not permitted to log in", "password has expired") is relayed only to a
+  caller who got the password right. Answering it earlier told anyone who
+  asked whether a role existed, since an unknown one gets a mock exchange.
+  PostgreSQL draws the same line -- `rolcanlogin` is checked after
+  authentication, not before. The keys recovered from the exchange
   (`ClientKey`/`ServerKey`) become the `UserIdentity` sent to the pooler on
   the first message of each stream, so no password ever leaves the client.
 - **Database.** The startup `database` must exist in `pgshard.databases`

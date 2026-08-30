@@ -889,13 +889,41 @@ func TestShutdownLetsOpenTransactionFinish(t *testing.T) {
 	}
 }
 
-func TestLookupRefusalIsRelayedAs28000(t *testing.T) {
+// TestARefusalWaitsForThePassword: a refusal that names the role -- NOLOGIN,
+// an expired password -- must not reach a caller who has proved nothing.
+// Answering it at lookup time told anyone who asked whether a role existed,
+// because an unknown role got the mock exchange and a disabled one got a
+// 28000 straight away.
+func TestARefusalWaitsForThePassword(t *testing.T) {
+	scram, err := BuildSCRAMVerifier("pw", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := SCRAMAuthenticator{Lookup: func(_ context.Context, user string) (string, error) {
+		return scram.String(), Errorf(CodeInvalidAuthorization, "role %q is not permitted to log in", user)
+	}}
+	ts := startServer(t, Config{Authenticator: auth})
+
+	// The wrong password is refused exactly as an unknown role is, so the
+	// two are indistinguishable from outside.
+	_, err = pgxConnect(t, ts.addr, "batch", "wrong", "")
+	assertAuthFailure(t, err, CodeInvalidPassword)
+
+	// The right password earns the real answer.
+	_, err = pgxConnect(t, ts.addr, "batch", "pw", "")
+	assertAuthFailure(t, err, CodeInvalidAuthorization)
+}
+
+// TestARefusalWithNoVerifierNeverNamesTheRole: a refusal that comes with no
+// verifier cannot run a real exchange, so the caller gets what an unknown
+// role gets and learns nothing either way.
+func TestARefusalWithNoVerifierNeverNamesTheRole(t *testing.T) {
 	auth := SCRAMAuthenticator{Lookup: func(_ context.Context, user string) (string, error) {
 		return "", Errorf(CodeInvalidAuthorization, "role %q is not permitted to log in", user)
 	}}
 	ts := startServer(t, Config{Authenticator: auth})
 	_, err := pgxConnect(t, ts.addr, "batch", "pw", "")
-	assertAuthFailure(t, err, CodeInvalidAuthorization)
+	assertAuthFailure(t, err, CodeInvalidPassword)
 }
 
 func TestStartupConnCapRefusesPolitely(t *testing.T) {
