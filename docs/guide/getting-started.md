@@ -5,26 +5,46 @@ you can connect to with `psql`.
 
 ## Prerequisites
 
-- Kubernetes 1.29+ with a default StorageClass.
-- `kubectl` and, to build images locally, Docker and Go 1.26+.
-- The container images. CI pushes them to GHCR
-  (`ghcr.io/andrew01234567890/pgshard-postgres:{18,19}`, `pgshard-router`,
-  `pgshard-admin`); build your own with `docker buildx bake postgres`,
-  `make operator-image admin-image` and
-  `docker build -f Dockerfile.router .`.
+- Kubernetes 1.29+ with a default StorageClass, or Docker and `kind` for a
+  local one.
+- `kubectl`, Docker and Go 1.26+.
+- The container images. **CI publishes only the PostgreSQL images**
+  (`ghcr.io/andrew01234567890/pgshard-postgres:{18,19}`); the router, admin,
+  operator and controller images are built locally:
 
-## Install the operator
+  ```sh
+  hack/dev/build-images.sh dev 18 postgres control controller
+  ```
+
+## The whole thing on kind, in one command
+
+```sh
+make dev-up    # images, kind cluster, images loaded, operator, sample cluster
+```
+
+`hack/dev/up.sh` does what the steps below do, in order, and points the
+operator at the images it just built — without that last part every cluster
+it creates would pull a router image that was never published. Tear it down
+with `make kind-down`.
+
+## Or step by step, on a cluster you already have
 
 Install the CRDs and the operator:
 
 ```sh
-make deploy    # CRDs (make install), namespace, RBAC, operator Deployment
+make deploy IMG=<your operator image>   # CRDs, namespace, RBAC, operator Deployment
 ```
 
-For development, `make kind-up` (via `hack/kind/up.sh`, used by the e2e
-suites) creates a kind cluster with the images preloaded, and the operator
-can be run locally with `go run ./cmd/pgshard-operator run` against the
-current kubeconfig.
+`make deploy` substitutes the operator's own image only. The operator
+creates the router and admin workloads from `--router-image` and
+`--admin-image`, which default to the published tags, so a locally built
+router needs those flags set on the operator Deployment as `hack/dev/up.sh`
+does.
+
+`make kind-up` creates the kind cluster and nothing else — no images are
+built or loaded, which is what the e2e suites want because they load their
+own. The operator can also be run outside the cluster with
+`go run ./cmd/pgshard-operator run` against the current kubeconfig.
 
 ## Create a cluster
 
@@ -104,8 +124,11 @@ SQL.
 
 ## Local development without Kubernetes
 
-`hack/compose/docker-compose.yml --profile router` starts a catalog, one
-shard, its pooler and a router on port 6432. `pgshard-router dev-bootstrap`
+```sh
+docker compose -f hack/compose/docker-compose.yml --profile router up --build
+```
+
+starts a catalog, one shard, its pooler and a router on port 6432. `pgshard-router dev-bootstrap`
 migrates the catalog and registers a database, a role and the shard's pooler
 endpoint (password from `PGSHARD_DEV_PASSWORD`).
 

@@ -75,7 +75,14 @@ proto-breaking:
 		echo "proto-breaking: no proto files on main, skipping"; \
 	fi
 
-.PHONY: kind-up kind-down e2e perf-bench admin-image deploy-admin undeploy-admin
+.PHONY: dev-up kind-up kind-down e2e perf-bench admin-image deploy-admin undeploy-admin
+
+# dev-up is the one command that takes an empty machine to a running
+# cluster: images, kind, load, operator pointed at the local images, and
+# the sample PgShardCluster. kind-up is the cluster alone, which is what
+# the e2e suites want because they load their own images.
+dev-up:
+	hack/dev/up.sh $(E2E_PG)
 
 kind-up:
 	hack/kind/up.sh

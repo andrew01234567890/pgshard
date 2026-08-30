@@ -36,18 +36,15 @@ upgrade)       args=(-timeout 110m ./test/e2e/upgrade/...); needs="base controll
 esac
 
 cd "$root"
+echo "==> building images"
 if [[ "$needs" == *base* ]]; then
-	echo "==> building images"
-	docker buildx bake "postgres-$major" --load
-	docker build -f Dockerfile.control --build-arg CMD=pgshard-operator -t pgshard-operator:e2e .
-	docker build -f Dockerfile.control --build-arg CMD=pgshard-admin -t pgshard-admin:e2e .
-	docker build -f Dockerfile.router -t pgshard-router:e2e .
+	hack/dev/build-images.sh e2e "$major" postgres control
 fi
 if [[ "$needs" == *controller* ]]; then
-	docker build -f Dockerfile.control --build-arg CMD=pgshard-controller -t pgshard-controller:e2e .
+	hack/dev/build-images.sh e2e "$major" controller
 fi
 if [[ "$needs" == *target-major* ]]; then
-	docker buildx bake postgres-19 --load
+	hack/dev/build-images.sh e2e "$major" target-major
 fi
 
 echo "==> kind cluster"
