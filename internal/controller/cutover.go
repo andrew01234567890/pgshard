@@ -96,6 +96,14 @@ type cutoverState struct {
 	FenceMS    int64      `json:"fence_ms,omitempty"`
 	SwitchedAt *time.Time `json:"switched_at,omitempty"`
 	Gate       string     `json:"gate,omitempty"`
+	// Pause names the configured pause holding the workflow
+	// (PauseSwitchWrites or PauseComplete) and PausedAt when it began.
+	// A configured pause leaves the workflow running -- only an operator
+	// pauses the workflow itself -- so its top-level state says nothing
+	// about it, and every pass rewrites updated_at, so the age of one
+	// cannot be read from the row either.
+	Pause    string     `json:"pause,omitempty"`
+	PausedAt *time.Time `json:"paused_at,omitempty"`
 	// StepSince is when the current step was entered. After the journal
 	// every error is retried without a timeout or attempt limit, and each
 	// pass refreshes updated_at, so a step that has failed for hours is
@@ -307,9 +315,11 @@ func (c *Copier) gate(ctx context.Context, wf *copyWorkflow, ops cutoverOps) (bo
 	}
 	if wf.spec.paused(PauseSwitchWrites) {
 		wf.cutover.Gate = "paused before switchWrites"
+		c.holdAt(wf, PauseSwitchWrites)
 		return false, c.saveCutover(ctx, wf, "paused before switchWrites: waiting for proceed")
 	}
 	wf.cutover.Gate = ""
+	c.released(wf)
 	wf.cutover.Step = StepFence
 	wf.stage = StageSwitching
 	return true, c.saveCutover(ctx, wf, "switch gate open: switching writes")
@@ -674,10 +684,28 @@ func (c *Copier) retire(ctx context.Context, wf *copyWorkflow) (bool, error) {
 		}
 	}
 	if wf.spec.paused(PauseComplete) {
+		c.holdAt(wf, PauseComplete)
 		return false, c.saveCutover(ctx, wf, "paused before complete: waiting for proceed")
 	}
+	c.released(wf)
 	wf.stage = StageCompleting
 	return true, c.saveCutover(ctx, wf, "completing: dropping reverse replication")
+}
+
+// holdAt records which configured pause is holding the workflow, and since
+// when. The timestamp is written once: a pause that keeps being observed is
+// the same pause, and refreshing it would report every one as new.
+func (c *Copier) holdAt(wf *copyWorkflow, point string) {
+	if wf.cutover.Pause == point {
+		return
+	}
+	at := c.now()
+	wf.cutover.Pause, wf.cutover.PausedAt = point, &at
+}
+
+// released clears the pause once the workflow moves past it.
+func (c *Copier) released(wf *copyWorkflow) {
+	wf.cutover.Pause, wf.cutover.PausedAt = "", nil
 }
 
 func beforeJournal(step string) bool {

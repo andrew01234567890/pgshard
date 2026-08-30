@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -141,5 +142,60 @@ func TestDecidedTransactionsAreCountedSeparately(t *testing.T) {
 	}
 	if age := got["pgshard_controller_in_doubt_oldest_age_seconds"]; age < 550 || age > 700 {
 		t.Fatalf("oldest undecided aged %v seconds, want about ten minutes", age)
+	}
+}
+
+// TestCutoverPausedCountsTheGateAndNotTheState: pauseBefore leaves the
+// workflow running with the pause recorded in its cutover status -- only an
+// operator pauses the workflow itself -- so counting workflows in state
+// paused reported a manual pause at any stage and never the automatic gate
+// the metric is named for.
+func TestCutoverPausedCountsTheGateAndNotTheState(t *testing.T) {
+	parallelPG(t)
+	dsn := startPostgres(t)
+	ctx := context.Background()
+	conn := connect(t, dsn)
+	if err := catalog.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, `INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES
+		('11111111-1111-1111-1111-111111111111', 'reshard', 'running', '{"shard_set": "g2"}'::jsonb,
+		 '{"cutover": {"pause": "switchWrites", "paused_at": "2026-01-01T00:00:00Z"}}'::jsonb),
+		('22222222-2222-2222-2222-222222222222', 'upgrade', 'paused', '{"shard_set": "g3"}'::jsonb, '{}'::jsonb),
+		('33333333-3333-3333-3333-333333333333', 'reshard', 'running', '{"shard_set": "g4"}'::jsonb,
+		 '{"cutover": {"step": "fence"}}'::jsonb)`)
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	reg := prometheus.NewRegistry()
+	p := &MetricsPoller{Pool: pool, Metrics: metrics.NewController(reg)}
+	if err := p.Refresh(ctx); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	var samples []string
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range families {
+		if f.GetName() != "pgshard_controller_cutover_paused" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, l := range m.GetLabel() {
+				labels[l.GetName()] = l.GetValue()
+			}
+			samples = append(samples, fmt.Sprintf("%s/%s/%s/%s=%v",
+				labels["kind"], labels["shard_set"], labels["id"], labels["pause"], m.GetGauge().GetValue()))
+		}
+	}
+	want := "reshard/g2/11111111-1111-1111-1111-111111111111/switchWrites=1"
+	if len(samples) != 1 || samples[0] != want {
+		t.Fatalf("cutover pauses reported as %v, want exactly [%s]", samples, want)
 	}
 }

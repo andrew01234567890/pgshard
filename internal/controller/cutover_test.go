@@ -752,3 +752,32 @@ func TestASwitchWhoseSourceWasRetiredEndsInsteadOfRetrying(t *testing.T) {
 		t.Fatalf("journal rows point consumers at a set that will never serve: %v", h.ops.journaled)
 	}
 }
+
+// TestAConfiguredPauseIsRecordedWithItsOwnClock: pauseBefore holds a
+// workflow that stays running, and every pass rewrites updated_at, so
+// nothing on the row said which pause was holding it or for how long.
+func TestAConfiguredPauseIsRecordedWithItsOwnClock(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.wf.spec.PauseBefore = PauseSwitchWrites
+	h.runUntil(t, StageAwaitingSwitch)
+	h.pass(t)
+	if h.wf.cutover.Pause != PauseSwitchWrites || h.wf.cutover.PausedAt == nil {
+		t.Fatalf("the pause holding the workflow is not recorded: %+v", h.wf.cutover)
+	}
+	began := *h.wf.cutover.PausedAt
+
+	h.clock = h.clock.Add(time.Hour)
+	h.pass(t)
+	if h.wf.cutover.PausedAt == nil || !h.wf.cutover.PausedAt.Equal(began) {
+		t.Fatalf("observing the same pause again restarted its clock: %v, began %v", h.wf.cutover.PausedAt, began)
+	}
+	if h.wf.stage != StageAwaitingSwitch {
+		t.Fatalf("stage %s: a pause must hold the workflow at the gate", h.wf.stage)
+	}
+
+	h.wf.spec.Proceed = []string{PauseSwitchWrites}
+	h.pass(t)
+	if h.wf.cutover.Pause != "" || h.wf.cutover.PausedAt != nil {
+		t.Fatalf("a workflow let through still reports a pause: %+v", h.wf.cutover)
+	}
+}

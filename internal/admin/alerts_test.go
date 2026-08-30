@@ -98,6 +98,15 @@ func TestDeriveAlerts(t *testing.T) {
 		{"slot lost", AlertInputs{Now: now, Streams: []StreamSummary{{Name: "s", LostSlots: 1}}}, []string{"StreamSlotLost"}},
 		{"cutover pause", AlertInputs{Now: now, Paused: []WorkflowRow{
 			{ID: "w1", Kind: "reshard", UpdatedAt: now.Add(-time.Hour)}}}, []string{"CutoverPauseExceeded"}},
+		// A workflow held at a configured pause keeps running, and every
+		// controller pass rewrites updated_at, so the hold is only
+		// visible in paused_at.
+		{"gate pause held for an hour", AlertInputs{Now: now, Paused: []WorkflowRow{
+			{ID: "w2", Kind: "reshard", State: "running", Pause: "switchWrites",
+				UpdatedAt: now, PausedAt: ptrTime(now.Add(-time.Hour))}}}, []string{"CutoverPauseExceeded"}},
+		{"gate pause just begun stays quiet", AlertInputs{Now: now, Paused: []WorkflowRow{
+			{ID: "w3", Kind: "reshard", State: "running", Pause: "switchWrites",
+				UpdatedAt: now.Add(-time.Hour), PausedAt: ptrTime(now)}}}, nil},
 		{"fresh pause stays quiet", AlertInputs{Now: now, Paused: []WorkflowRow{
 			{ID: "w1", Kind: "reshard", UpdatedAt: now.Add(-time.Minute)}}}, nil},
 		{"backup stale", AlertInputs{Now: now, BackupsKnown: true, LatestBackup: &stale}, []string{"BackupStale"}},

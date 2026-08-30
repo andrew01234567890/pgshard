@@ -161,7 +161,7 @@ func NewAgent(reg *prometheus.Registry, primary, lagBytes func() float64) *Agent
 type Controller struct {
 	Workflows        *prometheus.GaugeVec
 	WorkflowProgress *prometheus.GaugeVec
-	CutoverPaused    prometheus.Gauge
+	CutoverPaused    *prometheus.GaugeVec
 	InDoubt          prometheus.Gauge
 	InDoubtOldestAge prometheus.Gauge
 	// Decided counts rows the resolver has decided but could not finish,
@@ -187,8 +187,10 @@ func NewController(reg *prometheus.Registry) *Controller {
 			Name: "pgshard_controller_workflows", Help: "Workflows in the catalog, by kind and state."}, []string{"kind", "state"}),
 		WorkflowProgress: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "pgshard_controller_workflow_progress", Help: "Progress fraction of each running workflow."}, []string{"kind", "id"}),
-		CutoverPaused: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "pgshard_controller_cutover_paused", Help: "Workflows paused at cutover awaiting an operator."}),
+		CutoverPaused: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "pgshard_controller_cutover_paused",
+			Help: "Workflows held at a configured cutover pause, waiting for an operator to let them proceed."},
+			[]string{"kind", "shard_set", "id", "pause"}),
 		InDoubt: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "pgshard_controller_in_doubt_transactions", Help: "Undecided rows in pgshard.xact_decisions."}),
 		InDoubtOldestAge: prometheus.NewGauge(prometheus.GaugeOpts{
