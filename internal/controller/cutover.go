@@ -219,6 +219,26 @@ type cutoverOps interface {
 	// reverse replication (errRetry while behind), carry the sequences
 	// back and flip the serving map to the source set.
 	Rollback(ctx context.Context) error
+	// DropJournal removes the journal rows this run wrote on its sources.
+	DropJournal(ctx context.Context, id string) error
+}
+
+// sourceRetiredError marks a switch that can never proceed, as against one
+// that cannot proceed yet: its source set is no longer serving, and nothing
+// returns a retired set to serving. Retrying such a step forever holds the
+// run's replication slots, and with them the sources' WAL.
+type sourceRetiredError struct{ err error }
+
+func (e *sourceRetiredError) Error() string { return e.err.Error() }
+func (e *sourceRetiredError) Unwrap() error { return e.err }
+
+func sourceRetired(format string, args ...any) error {
+	return &sourceRetiredError{fmt.Errorf(format, args...)}
+}
+
+func isSourceRetired(err error) bool {
+	var e *sourceRetiredError
+	return errors.As(err, &e)
 }
 
 func isFatal(err error) bool {
@@ -328,6 +348,9 @@ func (c *Copier) switchWrites(ctx context.Context, wf *copyWorkflow, ops cutover
 		}
 		waiting, err := c.runStep(ctx, wf, ops, step)
 		if err != nil {
+			if isSourceRetired(err) {
+				return c.abandonSwitch(ctx, wf, ops, err.Error())
+			}
 			if !beforeJournal(step) {
 				return false, err
 			}
@@ -594,6 +617,36 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 // is retried instead.
 func (c *Copier) mayAbort(wf *copyWorkflow) bool {
 	return wf.cutover.FencedAt != nil && wf.cutover.JournalID == ""
+}
+
+// abandonSwitch ends a switch that can never finish because its source set
+// was retired underneath it, releasing everything the run holds.
+//
+// The journal is the point of no return because its rows tell every change
+// stream consumer that the cutover happened, and nothing retracts that.
+// That reasoning assumes the cutover then happens. Here it cannot: another
+// workflow already flipped and retired these sources, so this run's journal
+// rows point consumers at a target set that will never serve. Leaving them
+// sends a consumer that has not read them yet to a dead end, so they are
+// removed with the rest of what the run holds -- and a consumer that
+// repositioned on them before that has to resume from the set now serving,
+// which is what it would have done had these rows never existed.
+//
+// What is not released here is the target set: it holds a copy no one is
+// serving, and tearing it down is the operator's decision, not a step in
+// unwinding the switch.
+func (c *Copier) abandonSwitch(ctx context.Context, wf *copyWorkflow, ops cutoverOps, reason string) (bool, error) {
+	if err := ops.DropJournal(ctx, wf.cutover.JournalID); err != nil {
+		return false, err
+	}
+	if err := ops.Release(ctx); err != nil {
+		return false, err
+	}
+	if err := ops.Complete(ctx); err != nil {
+		return false, err
+	}
+	wf.stage = StageFailed
+	return true, c.finishCutover(ctx, wf, StateFailed, "abandoned: "+reason)
 }
 
 // abortSwitch undoes the fence before the journal and returns to the gate,

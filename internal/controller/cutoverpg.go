@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -948,6 +949,11 @@ func (o *pgCutover) stillSoleServing(ctx context.Context, tx pgx.Tx, set string)
 	if len(serving) == 1 && serving[0] == set {
 		return nil
 	}
+	if !slices.Contains(serving, set) {
+		// Retired sets are never returned to serving, so this switch can
+		// never publish on top of one: it is over, not waiting.
+		return sourceRetired("%s no longer serves; another workflow published %v while this one was switching", set, serving)
+	}
 	return fmt.Errorf("%s is no longer the only serving shard set (serving: %v)", set, serving)
 }
 
@@ -1191,6 +1197,31 @@ func (o *pgCutover) Unwind(ctx context.Context) error {
 // slots and publications on the targets, the frozen forward subscriptions
 // on the targets and the forward slots and publications on the sources, and
 // unpublishes the retired set. Sources that are already gone are skipped.
+// DropJournal removes this run's journal rows from every source database.
+// A source that cannot be reached is skipped and reported: its rows point
+// at a set that will never serve, but the alternative is a workflow that
+// cannot end while one source is down.
+func (o *pgCutover) DropJournal(ctx context.Context, id string) error {
+	if id == "" {
+		return nil
+	}
+	for _, db := range o.dbs {
+		for _, src := range o.srcIDs {
+			conn, err := o.c.Shards.DialDatabase(ctx, o.srcSet, src, db.name)
+			if err != nil {
+				o.c.logger().Info("abandoned switch: source unreachable, its journal rows stay", "workflow", o.wf.id, "source", src, "err", err)
+				continue
+			}
+			_, err = conn.Exec(ctx, fmt.Sprintf(`DELETE FROM %s.%s WHERE id = $1::uuid`, JournalSchema, JournalTable), id)
+			_ = conn.Close(ctx)
+			if err != nil && !missingObject(err) {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (o *pgCutover) Complete(ctx context.Context) error {
 	for _, db := range o.dbs {
 		for _, s := range o.srcIDs {
