@@ -88,18 +88,45 @@ func (p *MetricsPoller) Refresh(ctx context.Context) error {
 		return err
 	}
 
+	// A row survives its decision only while the resolver cannot finish it:
+	// finishing deletes it. So a decided row is not history, it is a
+	// transaction still holding locks, WAL and a vacuum horizon on every
+	// participant -- aged from the decision, since that is when finishing
+	// it became the only thing left to do.
+	rows, err = p.Pool.Query(ctx, `SELECT state, count(*), extract(epoch FROM now() - min(coalesce(decided_at, created_at)))
+		FROM pgshard.xact_decisions GROUP BY state`)
+	if err != nil {
+		return err
+	}
+	m.Decided.Reset()
+	m.DecidedOldestAge.Reset()
 	var inDoubt int64
-	var oldest *float64
-	if err := p.Pool.QueryRow(ctx, `SELECT count(*), extract(epoch FROM now() - min(created_at))
-		FROM pgshard.xact_decisions WHERE state = 'preparing'`).Scan(&inDoubt, &oldest); err != nil {
+	var inDoubtOldest float64
+	for rows.Next() {
+		var state string
+		var n int64
+		var oldest *float64
+		if err := rows.Scan(&state, &n, &oldest); err != nil {
+			rows.Close()
+			return err
+		}
+		age := 0.0
+		if oldest != nil {
+			age = *oldest
+		}
+		if state == "preparing" {
+			inDoubt, inDoubtOldest = n, age
+			continue
+		}
+		m.Decided.WithLabelValues(state).Set(float64(n))
+		m.DecidedOldestAge.WithLabelValues(state).Set(age)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
 		return err
 	}
 	m.InDoubt.Set(float64(inDoubt))
-	if oldest != nil {
-		m.InDoubtOldestAge.Set(*oldest)
-	} else {
-		m.InDoubtOldestAge.Set(0)
-	}
+	m.InDoubtOldestAge.Set(inDoubtOldest)
 
 	rows, err = p.Pool.Query(ctx, `SELECT state, count(*) FROM pgshard.migrations GROUP BY state`)
 	if err != nil {
