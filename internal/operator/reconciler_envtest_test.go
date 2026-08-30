@@ -185,10 +185,10 @@ func (f *fakeProber) ServerMajor(context.Context, string) (int, error) {
 	return 18, nil
 }
 
-func (f *fakeProber) EnsureCatalogCopy(_ context.Context, srcDSN, tgtDSN string) error {
+func (f *fakeProber) EnsureCatalogCopy(_ context.Context, source, target CatalogSide) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.catalogCopies = append(f.catalogCopies, hostOf(srcDSN)+">"+hostOf(tgtDSN))
+	f.catalogCopies = append(f.catalogCopies, hostOf(source.DSN)+">"+hostOf(target.DSN))
 	return nil
 }
 
@@ -201,10 +201,10 @@ func (f *fakeProber) CatalogCopyCaughtUp(context.Context, string) (bool, string,
 	return true, "", nil
 }
 
-func (f *fakeProber) CutoverCatalog(_ context.Context, srcDSN, tgtDSN string) error {
+func (f *fakeProber) CutoverCatalog(_ context.Context, source, target CatalogSide) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.catalogCutovers = append(f.catalogCutovers, hostOf(srcDSN)+">"+hostOf(tgtDSN))
+	f.catalogCutovers = append(f.catalogCutovers, hostOf(source.DSN)+">"+hostOf(target.DSN))
 	return nil
 }
 
