@@ -509,3 +509,62 @@ func TestLoadStateStillBootstrapsMemberZero(t *testing.T) {
 		t.Fatalf("bootstrap designated %s at epoch %d, want %s at 0", st.primary, st.epoch, g.MemberName(0))
 	}
 }
+
+// TestAFailoverUnderAWriteFenceHandsOverAPausedPrimary: a barrier stops
+// writes with ALTER SYSTEM, which lives in postgresql.auto.conf and is
+// rewritten by the agent on promotion, so a member promoted mid-barrier
+// used to start serving writes the barrier believed were stopped. The
+// catalog write fence is the durable statement of that intent.
+func TestAFailoverUnderAWriteFenceHandsOverAPausedPrimary(t *testing.T) {
+	r, fp, fa, c := healthyCluster(t, "fp")
+	fp.fenced = true
+
+	deletePod(t, "fp-shard-0-0")
+	fa.set(podIP(1, 0), AgentStatus{}, errors.New("connection refused"))
+	fp.standbys[podIP(1, 1)] = StandbyState{InRecovery: true, FlushLSN: 100}
+	fp.standbys[podIP(1, 2)] = StandbyState{InRecovery: true, FlushLSN: 200}
+	fp.err = errors.New("no primary")
+
+	reconcile(t, r, c)
+	if len(fa.promotes) != 1 {
+		t.Fatalf("expected one promotion, got %v", fa.promotes)
+	}
+	if len(fp.paused) != 1 || !strings.Contains(fp.paused[0], podIP(1, 2)) {
+		t.Fatalf("the promoted primary must refuse writes while the fence is raised, paused=%v", fp.paused)
+	}
+	if got := podRole(t, "fp-shard-0-2"); got != RolePrimary {
+		t.Fatalf("new primary label %q", got)
+	}
+}
+
+// TestAPrimaryThatLostThePauseGetsItBack covers the other way the pause
+// evaporates: the primary itself restarts, the agent rewrites
+// postgresql.auto.conf on the way up, and nothing else would put the pause
+// back.
+func TestAPrimaryThatLostThePauseGetsItBack(t *testing.T) {
+	r, fp, _, c := healthyCluster(t, "fq")
+	reconcile(t, r, c)
+	if len(fp.paused) != 0 {
+		t.Fatalf("no fence is raised, so nothing may be paused: %v", fp.paused)
+	}
+
+	fp.fenced = true
+	reconcile(t, r, c)
+	if len(fp.paused) == 0 {
+		t.Fatal("a raised fence over an unpaused primary must reapply the pause")
+	}
+	for _, dsn := range fp.paused {
+		if strings.Contains(dsn, Groups(c)[0].ServiceRW()) {
+			t.Fatalf("the catalog group is never paused by the barrier: %v", fp.paused)
+		}
+	}
+	if !strings.Contains(strings.Join(fp.paused, ","), Groups(c)[1].ServiceRW()) {
+		t.Fatalf("the shard primary was not the one paused: %v", fp.paused)
+	}
+
+	before := len(fp.paused)
+	reconcile(t, r, c)
+	if len(fp.paused) != before {
+		t.Fatalf("a primary already refusing writes must not be paused again: %v", fp.paused)
+	}
+}

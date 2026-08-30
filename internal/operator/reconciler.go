@@ -752,6 +752,10 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 		return obs, nil
 	}
 	obs.primaryOK = true
+	if err := r.reapplyWritePause(ctx, c, g, dsn, pstate, password); err != nil {
+		obs.primaryErr = err.Error()
+		return obs, nil
+	}
 	var slots []string
 	for _, name := range g.MemberNames() {
 		if name == state.primary {
@@ -822,6 +826,35 @@ func ordinalOf(g Group, member string) int {
 }
 
 // finishGroup fills the pod counters and member statuses from members.
+// reapplyWritePause puts back the barrier's pause on a primary that lost
+// it. The pause is an ALTER SYSTEM, so it lives in postgresql.auto.conf,
+// which the agent rewrites on bootstrap, promotion and restore: a primary
+// that crashed and came back, or one promoted mid-barrier, serves writes
+// again while the barrier believes every shard is holding still. The
+// durable statement of that intent is the catalog write fence, and this
+// makes the primary match it.
+//
+// Only the pause is reapplied. Lifting it belongs to the barrier that
+// raised the fence -- or, if that barrier died, to the recovery pass that
+// reads the still-raised fence and resumes the shards it left paused.
+func (r *ClusterReconciler) reapplyWritePause(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, dsn string, pstate PrimaryState, password string) error {
+	if g.Kind != "shard" || pstate.WritesPaused {
+		return nil
+	}
+	fenced, err := r.Prober.WriteFenced(ctx, DSN(Groups(c)[0].ServiceRW(), c.Namespace, password))
+	if err != nil {
+		return fmt.Errorf("read the write fence: %w", err)
+	}
+	if !fenced {
+		return nil
+	}
+	if err := r.Prober.PauseWrites(ctx, dsn); err != nil {
+		return fmt.Errorf("reapply the write pause: %w", err)
+	}
+	logf.FromContext(ctx).Info("write fence is raised and the primary was accepting writes; pause reapplied", "group", g.Name())
+	return nil
+}
+
 func (r *ClusterReconciler) finishGroup(_ context.Context, _ *pgshardv1alpha1.PgShardCluster, g Group, obs groupObservation, members map[string]*memberInfo) groupObservation {
 	obs.podsRunning, obs.podsReady, obs.members = 0, 0, nil
 	for _, name := range g.MemberNames() {
