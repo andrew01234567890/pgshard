@@ -17,12 +17,21 @@ request must follow these rules:
 - Every change must be reachable from a `main.go` under `cmd/`; do not
   land capabilities without a caller.
 - Tests are required, and `gofmt` must be clean. Run `make verify` before
-  opening a PR.
+  opening a PR, and the tier your change needs on top of it:
+  [docs/guide/testing.md](docs/guide/testing.md) maps areas to gates.
+  `make verify` skips the PostgreSQL-backed tests without Docker and the
+  Kubernetes ones without envtest assets, so a green fast run is not on its
+  own evidence that your area was covered.
 - Titles follow Conventional Commits (`feat:`, `fix:`, `docs:`, `test:`,
   `chore:`, `refactor:`), written in the imperative mood.
 
 ## Development
 
 ```sh
-make verify
+make tools    # pinned linters and code generators, once
+make verify   # the fast gate
+make gates    # everything CI gates on, except the secret scan
 ```
+
+[docs/guide/testing.md](docs/guide/testing.md) describes every tier, what it
+needs and which change calls for it.
