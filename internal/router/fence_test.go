@@ -303,3 +303,58 @@ func TestWriteFenceLetsATransactionOlderThanTheFenceWrite(t *testing.T) {
 		t.Fatalf("commit: %v", err)
 	}
 }
+
+// TestAPauseTheShardEnforcedIsStillOurPause: the write pause is raised in
+// two places that cannot be raised at once -- the catalog fence, which a
+// router sees through its snapshot, and default_transaction_read_only on
+// every group, which the barrier sets immediately afterwards. In the gap a
+// router has not seen the fence, forwards a write, and the shard refuses it
+// with PostgreSQL's own 25006. The client got the backend's error for a
+// pause pgshard took, and nothing told it to retry.
+func TestAPauseTheShardEnforcedIsStillOurPause(t *testing.T) {
+	h := newTxnHarness(t)
+	ctx := context.Background()
+	a, _ := h.twoTenants(t)
+	conn := h.connect(t, h.dsn())
+
+	// The shard answers the write the way a paused server does, slowly
+	// enough that the fence arrives while the statement is in flight --
+	// which is the order the barrier produces.
+	h.poolers[h.shardOf(t, a)].script("insert into orders (tenant_id, id) values ($1, 1)", script{
+		err: "cannot execute INSERT in a read-only transaction", code: "25006", delay: 300 * time.Millisecond})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := conn.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 1)", a)
+		done <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	h.fenced(true)
+
+	err := <-done
+	pe := expectRefusalCode(t, err, codeWriteFence)
+	if !strings.Contains(pe.Message, "write pause") {
+		t.Fatalf("refusal %q does not say the cluster is paused", pe.Message)
+	}
+	if pe.Hint == "" {
+		t.Fatal("the refusal must tell the client to retry")
+	}
+}
+
+// TestAReadOnlyErrorWithNoPauseIsLeftAlone: the translation is only
+// truthful while our own fence is up. Without one, 25006 is the server's
+// answer and must reach the client as it is.
+func TestAReadOnlyErrorWithNoPauseIsLeftAlone(t *testing.T) {
+	h := newTxnHarness(t)
+	ctx := context.Background()
+	a, _ := h.twoTenants(t)
+	conn := h.connect(t, h.dsn())
+	h.poolers[h.shardOf(t, a)].script("insert into orders (tenant_id, id) values ($1, 1)", script{
+		err: "cannot execute INSERT in a read-only transaction", code: "25006"})
+
+	_, err := conn.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 1)", a)
+	pe := expectRefusalCode(t, err, "25006")
+	if !strings.Contains(pe.Message, "read-only transaction") {
+		t.Fatalf("refusal %q, want the server's own message", pe.Message)
+	}
+}

@@ -490,7 +490,34 @@ func (e *Executor) guard(op string, run func() error) (err error) {
 		e.txnOnBackend, e.txnPreFence = false, false
 		err = pgwire.Errorf(pgwire.CodeInternalError, "internal error while processing the statement; the session state was reset")
 	}()
-	return run()
+	return e.asWritePause(run())
+}
+
+// asWritePause reports a statement the cluster's own write pause stopped as
+// that pause, rather than as the backend's read-only error.
+//
+// The pause is raised in two places that cannot be raised at once: the
+// catalog fence, which routers see through their snapshot, and
+// default_transaction_read_only on every group, which the barrier sets
+// immediately afterwards. In the gap a router has not yet seen the fence,
+// forwards a write, and the shard refuses it with 25006 -- so the client
+// gets PostgreSQL's error for a pause pgshard took, instead of the
+// retryable 57P03 the contract promises, and nothing tells it to retry.
+//
+// Translated only while our own fence is raised. The one imprecision left
+// is a session that asked for BEGIN READ ONLY during a pause: its write
+// would have been refused either way, and it is told about the pause. A
+// client cannot reach this by setting a GUC -- default_transaction_read_only
+// and transaction_read_only are both refused by the planner.
+func (e *Executor) asWritePause(err error) error {
+	var pe *pgwire.Error
+	if err == nil || !errors.As(err, &pe) || pe.Code != pgwire.CodeReadOnlySQLTransaction {
+		return err
+	}
+	if !e.r.writeFenced(nil) {
+		return err
+	}
+	return writeFenceError(e.r.migrating(), false)
 }
 
 // SimpleQuery implements pgwire.Executor.
