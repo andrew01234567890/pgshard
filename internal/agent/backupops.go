@@ -39,7 +39,14 @@ func (in *Instance) backupRunner() (*backup.Runner, error) {
 // EnsureStanza creates or upgrades the pgbackrest stanza; a no-op without a
 // policy or on a standby.
 func (in *Instance) EnsureStanza(ctx context.Context) error {
-	if in.cfg.Backup == nil || in.IsStandby() {
+	if in.cfg.Backup == nil {
+		return nil
+	}
+	standby, err := in.IsStandby()
+	if err != nil {
+		return err
+	}
+	if standby {
 		return nil
 	}
 	r, err := in.backupRunner()
@@ -94,7 +101,11 @@ func stanzaWait(err error, retry time.Duration, busy *int) (time.Duration, bool)
 
 // Backup takes a backup of the given type; the primary only.
 func (in *Instance) Backup(ctx context.Context, t backup.Type) (backup.Result, error) {
-	if in.IsStandby() {
+	standby, err := in.IsStandby()
+	if err != nil {
+		return backup.Result{}, err
+	}
+	if standby {
 		return backup.Result{}, ErrBackupOnStandby
 	}
 	r, err := in.backupRunner()

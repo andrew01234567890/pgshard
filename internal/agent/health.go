@@ -25,8 +25,12 @@ func (in *Instance) Started(ctx context.Context) error {
 	return err
 }
 
-// IsPrimary is the inverse of IsStandby.
-func (in *Instance) IsPrimary() bool { return !in.IsStandby() }
+// IsPrimary is the inverse of IsStandby, and carries its error for the
+// same reason: not knowing is not the same as being a primary.
+func (in *Instance) IsPrimary() (bool, error) {
+	standby, err := in.IsStandby()
+	return !standby, err
+}
 
 // PrimaryAcceptsWrites checks the instance is out of recovery.
 func (in *Instance) PrimaryAcceptsWrites(ctx context.Context) error {

@@ -55,7 +55,11 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	sup.OnUnexpectedExit = fatal
 	srv := NewServer(inst, epoch, lease, log, fatal)
 	srv.bgCtx = ctx
-	if !inst.IsStandby() && lease != nil {
+	standby, err := inst.IsStandby()
+	if err != nil {
+		return fmt.Errorf("reading the instance role: %w", err)
+	}
+	if !standby && lease != nil {
 		if err := lease.Acquire(ctx); err != nil {
 			return fmt.Errorf("primary cannot start without the lease: %w", err)
 		}
@@ -72,13 +76,13 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	reg := metrics.NewRegistry("agent")
 	am := metrics.NewAgent(reg,
 		func() float64 {
-			if inst.IsPrimary() {
+			if primary, err := inst.IsPrimary(); err == nil && primary {
 				return 1
 			}
 			return 0
 		},
 		func() float64 {
-			if inst.IsPrimary() {
+			if primary, err := inst.IsPrimary(); err != nil || primary {
 				return 0
 			}
 			lctx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -140,7 +144,7 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 			fatal(err)
 		}
 	}()
-	log.Info("agent ready", "http", httpLn.Addr().String(), "grpc", grpcLn.Addr().String(), "standby", inst.IsStandby())
+	log.Info("agent ready", "http", httpLn.Addr().String(), "grpc", grpcLn.Addr().String(), "standby", standby)
 
 	sigs := make(chan os.Signal, 2)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
