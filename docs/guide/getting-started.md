@@ -85,12 +85,31 @@ The cluster is usable when the `Ready` condition is `True` and
 ## Connect
 
 The router speaks the ordinary PostgreSQL wire protocol and authenticates
-with SCRAM-SHA-256 against roles stored in the catalog
-(`pgshard.roles`). Create an application database and role through the
-catalog first — see [Defining sharding](sharding.md) — then:
+with SCRAM-SHA-256 against roles stored in the catalog (`pgshard.roles`).
+
+### The first login
+
+A new cluster's `pgshard.roles` holds one row: the superuser the operator
+generated a password for when it created the cluster, published there so
+that the credential which already exists is the one you bootstrap with.
+Read it from the Secret the operator owns:
 
 ```sh
+kubectl get secret demo-superuser -o jsonpath='{.data.password}' | base64 -d
 kubectl port-forward svc/demo-router 5432:5432
+PGPASSWORD=<that password> psql "host=127.0.0.1 port=5432 dbname=pgshard user=postgres"
+```
+
+That is a superuser credential for every PostgreSQL group in the cluster.
+Use it to create the roles your applications will use, and then stop using
+it — the same way you would treat the `postgres` role of a single server.
+
+### Then as your own role
+
+Create an application database and role through the catalog — see
+[Defining sharding](sharding.md) — and connect as that role:
+
+```sh
 psql "host=127.0.0.1 port=5432 dbname=app user=app_rw"
 ```
 
