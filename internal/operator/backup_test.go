@@ -809,3 +809,51 @@ func TestAnInvalidPolicyEditDoesNotReachTheMembers(t *testing.T) {
 		t.Fatalf("an accepted edit must be followed: %+v %+v", got.Spec.ObjectStore, cond)
 	}
 }
+
+// TestRepositoryEncryptionCondition: whether a backup can be read by
+// whoever holds the bucket is worth saying on the policy, not leaving to be
+// inferred from a spec field that may not be set at all.
+func TestRepositoryEncryptionCondition(t *testing.T) {
+	pol := func(mutate func(*pgshardv1alpha1.ObjectStoreSpec)) *pgshardv1alpha1.PgShardBackupPolicy {
+		p := &pgshardv1alpha1.PgShardBackupPolicy{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default", Generation: 2}}
+		p.Spec.ObjectStore = pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "b"}
+		mutate(&p.Spec.ObjectStore)
+		return p
+	}
+	encrypted := repositoryEncryption(pol(func(st *pgshardv1alpha1.ObjectStoreSpec) {
+		st.Encryption = pgshardv1alpha1.SecretRefSpec{SecretRef: &corev1.LocalObjectReference{Name: "k"}}
+	}))
+	if encrypted.Status != metav1.ConditionTrue || encrypted.Reason != "Encrypted" {
+		t.Errorf("encrypted store: %+v", encrypted)
+	}
+	plain := repositoryEncryption(pol(func(st *pgshardv1alpha1.ObjectStoreSpec) { st.InsecureUnencrypted = true }))
+	if plain.Status != metav1.ConditionFalse || plain.Reason != "Unencrypted" {
+		t.Errorf("plain store: %+v", plain)
+	}
+	local := repositoryEncryption(pol(func(st *pgshardv1alpha1.ObjectStoreSpec) { st.Type = "posix" }))
+	if local.Status != metav1.ConditionFalse || local.Reason != "LocalRepository" {
+		t.Errorf("posix store: %+v", local)
+	}
+	if encrypted.ObservedGeneration != 2 {
+		t.Errorf("observedGeneration %d", encrypted.ObservedGeneration)
+	}
+
+	// What the members archive with is the accepted spec: an edit that does
+	// not validate never reaches them, so a policy whose new spec adds
+	// encryption while its accepted one has none is still writing in the
+	// clear, and must say so.
+	pending := pol(func(st *pgshardv1alpha1.ObjectStoreSpec) {
+		st.Encryption = pgshardv1alpha1.SecretRefSpec{SecretRef: &corev1.LocalObjectReference{Name: "k"}}
+	})
+	accepted := pending.Spec.DeepCopy()
+	accepted.ObjectStore.Encryption = pgshardv1alpha1.SecretRefSpec{}
+	pending.Status.Accepted = accepted
+	got := repositoryEncryption(pending)
+	if got.Status != metav1.ConditionFalse || got.Reason != "Unencrypted" {
+		t.Errorf("a policy whose accepted spec has no encryption: %+v", got)
+	}
+	// And the advice must not be "turn it on", which breaks the repository.
+	if strings.Contains(got.Message, "set objectStore.encryption.secretRef") {
+		t.Errorf("the message tells an operator to do the thing that breaks an existing repository: %q", got.Message)
+	}
+}

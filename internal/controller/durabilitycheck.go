@@ -73,21 +73,11 @@ func (d *DurabilityCheck) logger() *slog.Logger {
 
 // Run re-audits on a ticker while this process is the leader.
 func (d *DurabilityCheck) Run(ctx context.Context, interval time.Duration, leader func() bool) {
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-		if leader != nil && !leader() {
-			continue
-		}
+	runLoop(ctx, interval, leader, d.logger, "durability check", func(ctx context.Context) {
 		if _, err := d.Pass(ctx); err != nil {
 			d.logger().Warn("durability check pass failed", "err", err)
 		}
-	}
+	})
 }
 
 // Pass audits every shard of the serving set and returns what it found,

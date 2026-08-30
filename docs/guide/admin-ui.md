@@ -5,8 +5,13 @@
 all-namespaces instance is `make deploy-admin`. Reference:
 [admin.md](../admin.md).
 
+Every page and API route needs the cluster's admin credential -- as a bearer
+token, or as the password of HTTP basic auth with any user name, which is
+what a browser will ask you for:
+
 ```sh
 kubectl port-forward svc/demo-admin 8081:8081
+kubectl get secret demo-admin -o jsonpath='{.data.token}' | base64 -d
 ```
 
 ## Pages

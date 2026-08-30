@@ -2,6 +2,7 @@ package v1alpha1
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -43,9 +44,22 @@ type PostgreSQLSpec struct {
 	// +kubebuilder:default=oltp
 	// +optional
 	Profile string `json:"profile,omitempty"`
-	// Parameters are extra postgresql.conf settings. Keys that pgshard owns
-	// (fsync, full_page_writes, wal_level, max_prepared_transactions, ssl,
-	// synchronous_commit) are rejected.
+	// Parameters are extra postgresql.conf settings. A key must be a
+	// PostgreSQL setting name and nothing else: the agent writes the name
+	// as it stands, so one carrying a newline would write a second setting
+	// of its own and defeat every rule below, which names settings.
+	//
+	// Keys that pgshard owns (fsync, full_page_writes, wal_level,
+	// max_prepared_transactions, ssl, synchronous_commit) are rejected,
+	// and so are the settings that make PostgreSQL run a command:
+	// archive_command, restore_command, archive_cleanup_command and
+	// recovery_end_command each execute in the member pod, and pgshard
+	// sets the ones it needs itself.
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k.matches('^[A-Za-z_][A-Za-z0-9_.]*$'))",message="every parameter key must be a PostgreSQL setting name"
+	// +kubebuilder:validation:XValidation:rule="!('archive_command' in self)",message="parameters must not set archive_command"
+	// +kubebuilder:validation:XValidation:rule="!('restore_command' in self)",message="parameters must not set restore_command"
+	// +kubebuilder:validation:XValidation:rule="!('archive_cleanup_command' in self)",message="parameters must not set archive_cleanup_command"
+	// +kubebuilder:validation:XValidation:rule="!('recovery_end_command' in self)",message="parameters must not set recovery_end_command"
 	// +kubebuilder:validation:XValidation:rule="!('fsync' in self)",message="parameters must not set fsync"
 	// +kubebuilder:validation:XValidation:rule="!('full_page_writes' in self)",message="parameters must not set full_page_writes"
 	// +kubebuilder:validation:XValidation:rule="!('wal_level' in self)",message="parameters must not set wal_level"
@@ -143,6 +157,33 @@ type AdminSpec struct {
 	// +kubebuilder:default=true
 	// +optional
 	Enabled *bool `json:"enabled,omitempty"`
+	// InsecureNoAuth serves the admin to anything that can reach its
+	// Service. It has no mutations, but everything it shows -- topology,
+	// backup and restore state, stream positions, two-phase commit
+	// identifiers, the text of DDL -- is operational detail about the
+	// cluster, so it is credentialed unless this says otherwise.
+	// +optional
+	InsecureNoAuth bool `json:"insecureNoAuth,omitempty"`
+}
+
+// NetworkPolicySpec renders a NetworkPolicy in front of the member pods.
+// +kubebuilder:validation:XValidation:rule="!has(self.enabled) || !self.enabled || (has(self.clients) && size(self.clients) > 0)",message="networkPolicy.clients must name the control plane: the operator and the controller reach a member from outside the cluster's own pods, and a policy without them fences the cluster off from what runs it"
+type NetworkPolicySpec struct {
+	// Enabled renders the policy. It is off by default: a NetworkPolicy is
+	// worth nothing under a CNI that does not enforce one, and one that
+	// fails to name a client of a member's PostgreSQL takes that client off
+	// the cluster with no diagnostic beyond a refused connection.
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+	// Clients are peers admitted to a member's PostgreSQL, agent and pooler
+	// ports on top of the cluster's own pods, and enabling the policy
+	// requires at least one: the operator dials the agent and the pooler
+	// from its own namespace, and the controller dials the catalog, so a
+	// policy that names neither takes the cluster away from its control
+	// plane. Probe and metrics ports are never restricted, so the kubelet
+	// and a scraper need no entry here.
+	// +optional
+	Clients []networkingv1.NetworkPolicyPeer `json:"clients,omitempty"`
 }
 
 // BackupSpec links the cluster to a PgShardBackupPolicy.
@@ -207,6 +248,9 @@ type PgShardClusterSpec struct {
 	Admin AdminSpec `json:"admin,omitempty"`
 	// +optional
 	Backup BackupSpec `json:"backup,omitempty"`
+	// +kubebuilder:default={}
+	// +optional
+	NetworkPolicy NetworkPolicySpec `json:"networkPolicy,omitempty"`
 	// +kubebuilder:default={}
 	// +optional
 	Resharding ReshardingSpec `json:"resharding,omitempty"`

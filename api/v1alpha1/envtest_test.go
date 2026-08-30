@@ -12,6 +12,7 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/dockertest"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,8 +28,12 @@ import (
 var k8sClient client.Client
 
 func TestMain(m *testing.M) {
+	// Without a control plane the CRD validation tests skip themselves, but
+	// the rest of this package's tests read the generated manifests and need
+	// nothing: exiting here would take them with it.
 	if !dockertest.EnvtestAvailable() {
-		os.Exit(dockertest.EnvtestMissingMain("the API CRD validation tests"))
+		fmt.Fprint(os.Stderr, "envtest: KUBEBUILDER_ASSETS is not set; run 'make envtest'. Skipping the API CRD validation tests.\n")
+		os.Exit(m.Run())
 	}
 	env := &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
@@ -69,6 +74,9 @@ func validCluster(name string) *pgshardv1alpha1.PgShardCluster {
 
 func create(t *testing.T, obj client.Object) error {
 	t.Helper()
+	if k8sClient == nil {
+		dockertest.EnvtestMissing(t, "the API CRD validation tests")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	err := k8sClient.Create(ctx, obj)
@@ -189,8 +197,34 @@ func TestClusterRouterMaxEqualMinAccepted(t *testing.T) {
 	}
 }
 
+// TestClusterParameterKeyMustBeASettingName: the agent writes a
+// parameter's name as it stands, so a name carrying a newline writes a
+// second setting of its own -- and every rule beside this one names a
+// setting, so anything they refuse could be smuggled in behind a key they
+// allow.
+func TestClusterParameterKeyMustBeASettingName(t *testing.T) {
+	for name, key := range map[string]string{
+		"newline": "work_mem = '4MB'\nssl",
+		"space":   "work mem",
+		"equals":  "work_mem=1",
+		"quote":   "work_mem'",
+		"empty":   "",
+		"digit":   "1work_mem",
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := validCluster("paramkey-" + name)
+			c.Spec.PostgreSQL.Parameters = map[string]string{key: "1"}
+			mustReject(t, c, "every parameter key must be a PostgreSQL setting name")
+		})
+	}
+}
+
 func TestClusterUnsafeParametersRejected(t *testing.T) {
-	for _, key := range []string{"fsync", "full_page_writes", "wal_level", "max_prepared_transactions", "ssl", "synchronous_commit"} {
+	for _, key := range []string{
+		"fsync", "full_page_writes", "wal_level", "max_prepared_transactions", "ssl", "synchronous_commit",
+		// Each of these makes PostgreSQL run a command in the member pod.
+		"archive_command", "restore_command", "archive_cleanup_command", "recovery_end_command",
+	} {
 		t.Run(key, func(t *testing.T) {
 			c := validCluster("param-" + strings.ReplaceAll(key, "_", "-"))
 			c.Spec.PostgreSQL.Parameters = map[string]string{key: "off"}
@@ -285,7 +319,9 @@ func TestBackupPolicyStoreTypeEnum(t *testing.T) {
 	if err := create(t, p); err == nil || !apierrors.IsInvalid(err) {
 		t.Fatalf("expected Invalid, got %v", err)
 	}
-	p.Spec.ObjectStore = pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "b", Endpoint: "s3.example", Region: "r", Credentials: pgshardv1alpha1.SecretRefSpec{SecretRef: &corev1.LocalObjectReference{Name: "creds"}}}
+	p.Spec.ObjectStore = pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "b", Endpoint: "s3.example", Region: "r",
+		Credentials: pgshardv1alpha1.SecretRefSpec{SecretRef: &corev1.LocalObjectReference{Name: "creds"}},
+		Encryption:  pgshardv1alpha1.SecretRefSpec{SecretRef: &corev1.LocalObjectReference{Name: "repo-key"}}}
 	p.Spec.Schedules.Full = "0 2 * * 0"
 	p.Spec.Retention.Full = 4
 	if err := create(t, p); err != nil {
@@ -512,15 +548,15 @@ func TestObjectStoreRequiresWhatItsVariantNeeds(t *testing.T) {
 		store pgshardv1alpha1.ObjectStoreSpec
 		want  string
 	}{
-		{"s3 without bucket", pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Endpoint: "s3.example", Region: "eu", Credentials: secret}, "needs bucket, endpoint and region"},
-		{"s3 without endpoint", pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "b", Region: "eu", Credentials: secret}, "needs bucket, endpoint and region"},
-		{"s3 without region", pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "b", Endpoint: "s3.example", Credentials: secret}, "needs bucket, endpoint and region"},
+		{"s3 without bucket", pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Endpoint: "s3.example", Region: "eu", Credentials: secret, Encryption: secret}, "needs bucket, endpoint and region"},
+		{"s3 without endpoint", pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "b", Region: "eu", Credentials: secret, Encryption: secret}, "needs bucket, endpoint and region"},
+		{"s3 without region", pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "b", Endpoint: "s3.example", Credentials: secret, Encryption: secret}, "needs bucket, endpoint and region"},
 		{"s3 shared without credentials", pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "b", Endpoint: "s3.example", Region: "eu"}, "shared credentials need credentials.secretRef"},
-		{"azure without container", pgshardv1alpha1.ObjectStoreSpec{Type: "azure", Credentials: secret}, "needs container"},
+		{"azure without container", pgshardv1alpha1.ObjectStoreSpec{Type: "azure", Credentials: secret, Encryption: secret}, "needs container"},
 		{"azure without credentials", pgshardv1alpha1.ObjectStoreSpec{Type: "azure", Container: "c"}, "azure store needs credentials.secretRef"},
-		{"gcs without bucket", pgshardv1alpha1.ObjectStoreSpec{Type: "gcs", Credentials: secret}, "gcs store needs bucket"},
+		{"gcs without bucket", pgshardv1alpha1.ObjectStoreSpec{Type: "gcs", Credentials: secret, Encryption: secret}, "gcs store needs bucket"},
 		{"gcs service without credentials", pgshardv1alpha1.ObjectStoreSpec{Type: "gcs", Bucket: "b"}, "service and token credentials need"},
-		{"sftp without host settings", pgshardv1alpha1.ObjectStoreSpec{Type: "sftp", Credentials: secret}, "needs sftp.host and sftp.user"},
+		{"sftp without host settings", pgshardv1alpha1.ObjectStoreSpec{Type: "sftp", Credentials: secret, Encryption: secret}, "needs sftp.host and sftp.user"},
 		{"sftp without credentials", pgshardv1alpha1.ObjectStoreSpec{Type: "sftp", SFTP: &pgshardv1alpha1.SFTPStoreSpec{Host: "h", User: "u"}}, "sftp store needs credentials.secretRef"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -533,11 +569,11 @@ func TestObjectStoreRequiresWhatItsVariantNeeds(t *testing.T) {
 		name  string
 		store pgshardv1alpha1.ObjectStoreSpec
 	}{
-		{"s3", pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "b", Endpoint: "s3.example", Region: "eu", Credentials: secret}},
-		{"s3 web-id", pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "b", Endpoint: "s3.example", Region: "eu", CredentialType: "web-id"}},
-		{"azure", pgshardv1alpha1.ObjectStoreSpec{Type: "azure", Container: "c", Credentials: secret}},
-		{"gcs auto", pgshardv1alpha1.ObjectStoreSpec{Type: "gcs", Bucket: "b", CredentialType: "auto"}},
-		{"sftp", pgshardv1alpha1.ObjectStoreSpec{Type: "sftp", SFTP: &pgshardv1alpha1.SFTPStoreSpec{Host: "h", User: "u"}, Credentials: secret}},
+		{"s3", pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "b", Endpoint: "s3.example", Region: "eu", Credentials: secret, Encryption: secret}},
+		{"s3 web-id", pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "b", Endpoint: "s3.example", Region: "eu", CredentialType: "web-id", Encryption: secret}},
+		{"azure", pgshardv1alpha1.ObjectStoreSpec{Type: "azure", Container: "c", Credentials: secret, Encryption: secret}},
+		{"gcs auto", pgshardv1alpha1.ObjectStoreSpec{Type: "gcs", Bucket: "b", CredentialType: "auto", Encryption: secret}},
+		{"sftp", pgshardv1alpha1.ObjectStoreSpec{Type: "sftp", SFTP: &pgshardv1alpha1.SFTPStoreSpec{Host: "h", User: "u"}, Credentials: secret, Encryption: secret}},
 		{"posix", pgshardv1alpha1.ObjectStoreSpec{Type: "posix"}},
 	} {
 		t.Run("accepts "+c.name, func(t *testing.T) {
@@ -545,5 +581,92 @@ func TestObjectStoreRequiresWhatItsVariantNeeds(t *testing.T) {
 				t.Fatalf("a complete %s store must be accepted: %v", c.name, err)
 			}
 		})
+	}
+}
+
+// TestBackupPolicyStoreFieldCannotInjectAnOption: these fields are written
+// into pgbackrest.conf as key=value lines, so a value carrying a newline
+// writes an option of its own -- an endpoint of the attacker's choosing
+// takes every backup and WAL segment with it, and the backups are the one
+// artifact holding a complete copy of all tenant data.
+func TestBackupPolicyStoreFieldCannotInjectAnOption(t *testing.T) {
+	hostile := "x\nrepo1-s3-endpoint=attacker.example.com"
+	policy := func(name string, mutate func(*pgshardv1alpha1.ObjectStoreSpec)) *pgshardv1alpha1.PgShardBackupPolicy {
+		store := pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "b", Endpoint: "s3.example", Region: "r",
+			Credentials: pgshardv1alpha1.SecretRefSpec{SecretRef: &corev1.LocalObjectReference{Name: "creds"}}}
+		mutate(&store)
+		p := &pgshardv1alpha1.PgShardBackupPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec:       pgshardv1alpha1.PgShardBackupPolicySpec{ObjectStore: store},
+		}
+		p.Spec.Schedules.Full = "0 2 * * 0"
+		p.Spec.Retention.Full = 4
+		return p
+	}
+	for name, tc := range map[string]struct {
+		mutate func(*pgshardv1alpha1.ObjectStoreSpec)
+		field  string
+	}{
+		"bucket":    {func(s *pgshardv1alpha1.ObjectStoreSpec) { s.Bucket = hostile }, "bucket"},
+		"endpoint":  {func(s *pgshardv1alpha1.ObjectStoreSpec) { s.Endpoint = hostile }, "endpoint"},
+		"region":    {func(s *pgshardv1alpha1.ObjectStoreSpec) { s.Region = hostile }, "region"},
+		"prefix":    {func(s *pgshardv1alpha1.ObjectStoreSpec) { s.Prefix = "/x\nrepo1-cipher-type=none" }, "prefix"},
+		"carriage":  {func(s *pgshardv1alpha1.ObjectStoreSpec) { s.Endpoint = "x\rrepo1-s3-endpoint=e" }, "endpoint"},
+		"equals":    {func(s *pgshardv1alpha1.ObjectStoreSpec) { s.Region = "a=b" }, "region"},
+		"container": {func(s *pgshardv1alpha1.ObjectStoreSpec) { s.Container = hostile }, "container"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			mustReject(t, policy("inject-"+name, tc.mutate), tc.field+" must not contain a newline")
+		})
+	}
+}
+
+func TestClusterNetworkPolicyWithoutClientsRejected(t *testing.T) {
+	c := validCluster("netpol-empty")
+	c.Spec.NetworkPolicy.Enabled = true
+	mustReject(t, c, "networkPolicy.clients must name the control plane")
+}
+
+func TestClusterNetworkPolicyWithAClientAccepted(t *testing.T) {
+	c := validCluster("netpol-client")
+	c.Spec.NetworkPolicy.Enabled = true
+	c.Spec.NetworkPolicy.Clients = []networkingv1.NetworkPolicyPeer{{
+		NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/metadata.name": "pgshard-system"}},
+	}}
+	if err := create(t, c); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRemoteRepositoryIsEncryptedUnlessSaidOtherwise: a backup repository
+// is a complete copy of every tenant's database, and a remote store is
+// somebody else's disk. Encryption was optional and off by default, so the
+// ordinary way to configure a cluster left plaintext copies of everything
+// in an object store.
+func TestRemoteRepositoryIsEncryptedUnlessSaidOtherwise(t *testing.T) {
+	secret := pgshardv1alpha1.SecretRefSpec{SecretRef: &corev1.LocalObjectReference{Name: "creds"}}
+	policy := func(name string, st pgshardv1alpha1.ObjectStoreSpec) *pgshardv1alpha1.PgShardBackupPolicy {
+		return &pgshardv1alpha1.PgShardBackupPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec:       pgshardv1alpha1.PgShardBackupPolicySpec{ObjectStore: st},
+		}
+	}
+	for name, store := range map[string]pgshardv1alpha1.ObjectStoreSpec{
+		"s3":    {Type: "s3", Bucket: "b", Endpoint: "s3.example", Region: "eu", Credentials: secret},
+		"azure": {Type: "azure", Container: "c", Credentials: secret},
+		"gcs":   {Type: "gcs", Bucket: "b", CredentialType: "auto"},
+		"sftp":  {Type: "sftp", SFTP: &pgshardv1alpha1.SFTPStoreSpec{Host: "h", User: "u"}, Credentials: secret},
+	} {
+		mustReject(t, policy("plain-"+name, store), "must set encryption.secretRef")
+	}
+
+	// Saying so is allowed; not noticing is not.
+	open := pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "b", Endpoint: "s3.example", Region: "eu", Credentials: secret, InsecureUnencrypted: true}
+	if err := create(t, policy("deliberately-plain", open)); err != nil {
+		t.Fatalf("an explicit opt-out must be accepted: %v", err)
+	}
+	// A posix repository is a PVC of this cluster's own.
+	if err := create(t, policy("posix-plain", pgshardv1alpha1.ObjectStoreSpec{Type: "posix"})); err != nil {
+		t.Fatalf("posix needs no encryption: %v", err)
 	}
 }

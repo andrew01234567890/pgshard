@@ -111,8 +111,16 @@ func (p PgxCatalog) ListDecisions(ctx context.Context) ([]TwoPCRow, error) {
 // ListPausedWorkflows implements TwoPCSource.
 func (p PgxCatalog) ListPausedWorkflows(ctx context.Context) ([]WorkflowRow, error) {
 	return withConn(ctx, p, func(ctx context.Context, conn *pgx.Conn) ([]WorkflowRow, error) {
-		rows, err := conn.Query(ctx, `SELECT id::text, kind, state, updated_at
-			FROM pgshard.workflows WHERE state = 'paused' ORDER BY updated_at`)
+		// A configured cutover pause leaves the workflow running, so the
+		// state column alone shows only the pauses an operator asked for
+		// and never the automatic gate. updated_at is not when either
+		// began: every pass rewrites it.
+		rows, err := conn.Query(ctx, `SELECT id::text, kind, state, updated_at,
+			coalesce(status->'cutover'->>'pause', ''),
+			(status->'cutover'->>'paused_at')::timestamptz
+			FROM pgshard.workflows
+			WHERE state = 'paused' OR status->'cutover'->>'pause' IS NOT NULL
+			ORDER BY updated_at`)
 		if err != nil {
 			return nil, err
 		}

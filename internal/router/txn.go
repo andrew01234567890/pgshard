@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"sort"
 	"strconv"
@@ -642,4 +643,127 @@ func (e *Executor) txnControlBatch(ctx context.Context, batch []*pgshardv1.Execu
 		}
 	}
 	return true, nil
+}
+
+// preparePart opens a stream on sh and brings it to the state this
+// session's statements need: a reserved backend, the session settings, the
+// named prepared statements and the transaction prelude. It touches no
+// executor field, so several shards can be prepared at once; the executor
+// state a failure normally drops is left to the caller, which is serial.
+func (e *Executor) preparePart(ctx context.Context, sh Shard) (*txnPart, error) {
+	client, err := e.r.cfg.Poolers.Client(sh)
+	if err != nil {
+		return nil, err
+	}
+	ps, err := openStream(e.ctx, client)
+	if err != nil {
+		return nil, err
+	}
+	p := &txnPart{shard: sh, ps: ps, tx: pgwire.TxIdle, known: map[string]bool{}}
+	if e.needsPin() {
+		resp, err := client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: e.sid, Generation: e.r.cfg.Poolers.Generation(sh)})
+		if err != nil {
+			return p, err
+		}
+		if resp.Error != nil {
+			return p, toPgwireError(resp.Error)
+		}
+		p.pinned = true
+		if settings := e.sessionSettings(); len(settings) > 0 {
+			if err := e.runOn(ctx, p, strings.Join(settings, "; "), discardWriter{}); err != nil {
+				return p, fmt.Errorf("router: replaying session settings: %w", err)
+			}
+		}
+		for _, sp := range e.sqlPrepared {
+			if err := e.runOn(ctx, p, sp.sql, discardWriter{}); err != nil {
+				return p, fmt.Errorf("router: replaying prepared statement %q: %w", sp.name, err)
+			}
+		}
+		var reqs []*pgshardv1.ExecuteRequest
+		for name, st := range e.stmts {
+			if name == "" || e.unsent[name] {
+				continue
+			}
+			reqs = append(reqs, parseReq(e.physical(name), st.shardSQL(), st.shardOIDs()))
+			p.known[name] = true
+		}
+		if len(reqs) > 0 {
+			if err := e.runReqsOn(ctx, p, append(reqs, syncReq()), discardWriter{}); err != nil {
+				return p, fmt.Errorf("router: replaying prepared statements: %w", err)
+			}
+		}
+	}
+	for _, sql := range e.txnPrelude {
+		if err := e.runOn(ctx, p, sql, discardWriter{}); err != nil {
+			return p, fmt.Errorf("router: replaying transaction prelude: %w", err)
+		}
+	}
+	return p, nil
+}
+
+// openParts prepares the shards of a multi-shard statement that the
+// transaction has not reached yet, all at once. Preparing one costs a
+// Reserve round trip and a session-state statement that has to be drained
+// before the next starts, so walking them one at a time made the setup of a
+// write grow with the shard count instead of costing the slowest shard.
+//
+// Errors are not reported here: a shard that could not be prepared is
+// simply left unopened, and the caller's own walk reaches it, fails on it
+// and reports it in shard order, through the one path that knows how to
+// tear the statement down.
+func (e *Executor) openParts(ctx context.Context, sh []Shard) {
+	var todo []Shard
+	for _, s := range sh {
+		if s == e.shard || e.parked[s] != nil {
+			continue
+		}
+		if err := e.awaitReleaseOf(ctx, s); err != nil {
+			return
+		}
+		todo = append(todo, s)
+	}
+	if len(todo) < 2 {
+		return
+	}
+	parts := make([]*txnPart, len(todo))
+	// A shard whose preparation broke half way: its stream is aborted in
+	// the goroutine, and the session is released here, where the executor
+	// is the caller's alone again.
+	dropped := make([]pgshardv1.PoolerClient, len(todo))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, scatterSetupConcurrency)
+	for i, s := range todo {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			p, err := e.preparePart(ctx, s)
+			if err == nil {
+				parts[i] = p
+				return
+			}
+			// Half-prepared is worse than unprepared: the walk would find
+			// a part it believes carries the session state.
+			if p != nil {
+				p.ps.abort()
+				dropped[i] = p.ps.client
+			}
+		}()
+	}
+	wg.Wait()
+	for i, p := range parts {
+		if p == nil {
+			// abort only cancels the router's side: the pooler holds the
+			// session attached and refuses a second stream while it does,
+			// so the walk's own openStream has to be ordered behind a
+			// Release, exactly as a lost connection is.
+			e.releaseOnShard(dropped[i], todo[i])
+			continue
+		}
+		if e.parked == nil {
+			e.parked = map[Shard]*txnPart{}
+		}
+		e.parked[p.shard] = p
+	}
 }

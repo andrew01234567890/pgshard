@@ -19,8 +19,10 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/placement"
 )
 
@@ -49,6 +52,12 @@ func TestMain(m *testing.M) {
 		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
 		ErrorIfCRDPathMissing: true,
 	}
+	// Every test in this package stands its cluster up in the same control
+	// plane, and each one takes a handful of Services. The default range
+	// holds 254 addresses and nothing gives them back, so the suite ran out
+	// as it grew -- "failed to allocate a serviceIP: range is full", in
+	// whichever test happened to be last.
+	env.ControlPlane.GetAPIServer().Configure().Set("service-cluster-ip-range", "10.0.0.0/16")
 	cfg, err := env.Start()
 	if err != nil {
 		fmt.Fprint(os.Stderr, "envtest: start: "+err.Error()+"\n")
@@ -73,6 +82,12 @@ type fakeProber struct {
 	streaming map[string]bool
 	syncNames map[string]string
 	setCalls  []string
+	// fenced is the catalog write fence the operator reads; paused records
+	// the DSNs it made refuse writes, and pausedDSN those already paused.
+	fenced    bool
+	fenceErr  error
+	paused    []string
+	pausedDSN map[string]bool
 	migrated  int
 	// standbys is keyed by pod IP; missing IPs are unreachable.
 	standbys map[string]StandbyState
@@ -83,6 +98,11 @@ type fakeProber struct {
 	placements []PlacementWorkflowInfo
 	// journal records fence writes and promotions in order.
 	journal *[]string
+	// routerPasswords records every ALTER ROLE the reconcile asked for.
+	routerPasswords []string
+	// onRelease runs inside ReleaseCatalog, so a test can see what the
+	// cluster looked like at that point of the rollback.
+	onRelease func()
 	// settings is the pg_settings view of every member; contexts default to
 	// "sighup" for names not listed.
 	settings map[string]SettingState
@@ -214,8 +234,12 @@ func (f *fakeProber) DisableCatalogRollback(_ context.Context, dsn string) error
 
 func (f *fakeProber) ReleaseCatalog(_ context.Context, dsn string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	onRelease := f.onRelease
 	f.catalogReleases = append(f.catalogReleases, hostOf(dsn))
+	f.mu.Unlock()
+	if onRelease != nil {
+		onRelease()
+	}
 	return nil
 }
 
@@ -473,7 +497,7 @@ func (f *fakeProber) Probe(_ context.Context, dsn string) (PrimaryState, error) 
 	if f.err != nil {
 		return PrimaryState{}, f.err
 	}
-	st := PrimaryState{Streaming: map[string]bool{}, SyncStandbyNames: f.syncNames[dsn]}
+	st := PrimaryState{Streaming: map[string]bool{}, SyncStandbyNames: f.syncNames[dsn], WritesPaused: f.pausedDSN[dsn]}
 	for k, v := range f.streaming {
 		st.Streaming[k] = v
 	}
@@ -491,10 +515,34 @@ func (f *fakeProber) SetSyncStandbyNames(_ context.Context, dsn, value string) e
 	return nil
 }
 
+func (f *fakeProber) PauseWrites(_ context.Context, dsn string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.pausedDSN == nil {
+		f.pausedDSN = map[string]bool{}
+	}
+	f.pausedDSN[dsn] = true
+	f.paused = append(f.paused, dsn)
+	return nil
+}
+
+func (f *fakeProber) WriteFenced(context.Context, string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.fenced, f.fenceErr
+}
+
 func (f *fakeProber) MigrateCatalog(context.Context, string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.migrated++
+	return nil
+}
+
+func (f *fakeProber) SetRouterPassword(_ context.Context, dsn, password string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.routerPasswords = append(f.routerPasswords, hostOf(dsn)+"="+password)
 	return nil
 }
 
@@ -667,7 +715,7 @@ func TestReconcileGeneratesGroupObjects(t *testing.T) {
 			if pod.Spec.Volumes[0].PersistentVolumeClaim.ClaimName != pod.Name {
 				t.Errorf("pod %s must mount its own PVC: %+v", pod.Name, pod.Spec.Volumes[0])
 			}
-			if len(pod.Spec.Containers) != 2 || pod.Spec.Containers[1].Name != "pooler" || pod.Spec.Containers[1].Image != ctr.Image || pod.Spec.Containers[1].ReadinessProbe.TCPSocket == nil {
+			if len(pod.Spec.Containers) != 2 || pod.Spec.Containers[1].Name != "pooler" || pod.Spec.Containers[1].Image != ctr.Image || pod.Spec.Containers[1].ReadinessProbe.HTTPGet == nil {
 				t.Errorf("pod %s must carry the pooler sidecar from the same image: %+v", pod.Name, pod.Spec.Containers)
 			}
 			var pvc corev1.PersistentVolumeClaim
@@ -1098,5 +1146,84 @@ func TestReconcileWalksGroupsConcurrently(t *testing.T) {
 	fp.mu.Unlock()
 	if !opened {
 		t.Errorf("no two of the %d shard groups were ever reconciled at the same time", shards)
+	}
+}
+
+func TestNetworkPolicyIsRenderedOnlyWhileItIsEnabled(t *testing.T) {
+	r, _, c := setup(t, "netpol")
+	ctx := context.Background()
+	key := types.NamespacedName{Namespace: "default", Name: MemberNetworkPolicyName("netpol")}
+
+	reconcile(t, r, c)
+	var np networkingv1.NetworkPolicy
+	if err := k8sClient.Get(ctx, key, &np); !apierrors.IsNotFound(err) {
+		t.Fatalf("a policy nobody asked for: %v", err)
+	}
+
+	get(t, "netpol", c)
+	c.Spec.NetworkPolicy.Enabled = true
+	c.Spec.NetworkPolicy.Clients = []networkingv1.NetworkPolicyPeer{{
+		PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "pgshard-controller"}},
+	}}
+	if err := k8sClient.Update(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, r, c)
+	get(t, key.Name, &np)
+	ownedBy(t, &np, c)
+	if len(np.Spec.Ingress) != 2 || len(np.Spec.Ingress[0].From) != 2 {
+		t.Fatalf("policy does not carry the declared client: %+v", np.Spec.Ingress)
+	}
+
+	get(t, "netpol", c)
+	c.Spec.NetworkPolicy.Enabled = false
+	if err := k8sClient.Update(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, r, c)
+	if err := k8sClient.Get(ctx, key, &np); !apierrors.IsNotFound(err) {
+		t.Fatalf("a policy that was turned off keeps enforcing: %v", err)
+	}
+}
+
+// TestRouterCredentialIsGeneratedAndApplied: the router's password is the
+// cluster's own, generated once and told to the catalog on every pass, so a
+// catalog restored or rebuilt from elsewhere comes back in step with the
+// Secret rather than locking the router out.
+func TestRouterCredentialIsGeneratedAndApplied(t *testing.T) {
+	r, fp, c := setup(t, "rc")
+	bringUp(t, r, fp, c)
+
+	var sec corev1.Secret
+	get(t, RouterSecretName(c.Name), &sec)
+	ownedBy(t, &sec, c)
+	pw := string(sec.Data["password"])
+	if len(pw) < 32 {
+		t.Fatalf("router password is %d characters", len(pw))
+	}
+	if string(sec.Data["username"]) != catalog.RouterRole {
+		t.Errorf("username %q, want %q", sec.Data["username"], catalog.RouterRole)
+	}
+
+	var su corev1.Secret
+	get(t, SecretName(c.Name), &su)
+	if string(su.Data["password"]) == pw {
+		t.Error("the router's password must not be the superuser's")
+	}
+
+	fp.mu.Lock()
+	applied := append([]string(nil), fp.routerPasswords...)
+	fp.mu.Unlock()
+	if len(applied) == 0 {
+		t.Fatal("the catalog was never told the router's password")
+	}
+	if got := applied[len(applied)-1]; got != "rc-catalog-rw.default.svc="+pw {
+		t.Errorf("last ALTER ROLE = %q, want the generated password on the catalog", got)
+	}
+
+	reconcile(t, r, c)
+	get(t, RouterSecretName(c.Name), &sec)
+	if string(sec.Data["password"]) != pw {
+		t.Error("the password must survive a reconcile: it was regenerated")
 	}
 }

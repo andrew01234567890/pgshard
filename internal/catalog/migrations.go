@@ -115,6 +115,12 @@ type RewriteChange struct {
 	Columns []string `json:"columns,omitempty"`
 	// BatchSize bounds one backfill batch; 0 means the default.
 	BatchSize int `json:"batch_size,omitempty"`
+	// Settled records that the wait for routers to reload Columns ran to
+	// its end. Columns alone does not say that: the applier may have
+	// crashed inside the wait, and a resume that took the column list as
+	// proof would add the hidden column while a router still served the
+	// view from before it.
+	Settled bool `json:"settled,omitempty"`
 }
 
 // HiddenPrefix starts every working column, trigger and function of a
@@ -153,7 +159,8 @@ type MigrationCheck struct {
 	// Name is the constraint, column, index or partition the check is on.
 	Name string `json:"name,omitempty"`
 	// NameSchema is the schema of Name when it is a partition named with
-	// an explicit schema; empty matches any schema.
+	// an explicit schema; empty resolves Name through the search_path, as
+	// the statement itself does.
 	NameSchema string `json:"name_schema,omitempty"`
 }
 

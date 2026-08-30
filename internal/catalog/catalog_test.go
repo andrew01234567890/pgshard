@@ -243,6 +243,55 @@ func runSuite(t *testing.T, img pgImage) {
 	ctx := context.Background()
 	conn := connect(t, dsn)
 
+	t.Run("router_role_is_least_privilege", func(t *testing.T) {
+		if err := Migrate(ctx, conn); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Exec(ctx, `ALTER ROLE `+RouterRole+` WITH LOGIN PASSWORD 'router-secret'`); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := pgx.ParseConfig(dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.User, cfg.Password = RouterRole, "router-secret"
+		rc, err := pgx.ConnectConfig(ctx, cfg)
+		if err != nil {
+			t.Fatalf("the router role must be able to log in: %v", err)
+		}
+		defer func() { _ = rc.Close(ctx) }()
+
+		// What the router needs: the verifier column the SCRAM termination
+		// reads, and the decision log it writes for two-phase commit.
+		if _, err := rc.Exec(ctx, `SELECT verifier FROM pgshard.roles`); err != nil {
+			t.Errorf("reading role verifiers: %v", err)
+		}
+		if _, err := rc.Exec(ctx, `INSERT INTO pgshard.xact_decisions (gid, state, participants) VALUES ('pgshard-t-1', 'preparing', '{0}')`); err != nil {
+			t.Errorf("writing the decision log: %v", err)
+		}
+		if _, err := rc.Exec(ctx, `DELETE FROM pgshard.xact_decisions WHERE gid = 'pgshard-t-1'`); err != nil {
+			t.Errorf("clearing the decision log: %v", err)
+		}
+
+		// What it must not be able to do.
+		var super, createrole, createdb bool
+		if err := rc.QueryRow(ctx, `SELECT rolsuper, rolcreaterole, rolcreatedb FROM pg_roles WHERE rolname = current_user`).Scan(&super, &createrole, &createdb); err != nil {
+			t.Fatal(err)
+		}
+		if super || createrole || createdb {
+			t.Errorf("router role: super=%v createrole=%v createdb=%v, want none of them", super, createrole, createdb)
+		}
+		if _, err := rc.Exec(ctx, `ALTER SYSTEM SET default_transaction_read_only = on`); err == nil {
+			t.Error("the router role could ALTER SYSTEM, which is how the barrier pauses writes")
+		}
+		if _, err := rc.Exec(ctx, `SELECT rolpassword FROM pg_authid`); err == nil {
+			t.Error("the router role could read pg_authid")
+		}
+		if _, err := rc.Exec(ctx, `CREATE ROLE somebody_else LOGIN`); err == nil {
+			t.Error("the router role could create roles")
+		}
+	})
+
 	t.Run("migrate_twice", func(t *testing.T) {
 		if err := Migrate(ctx, conn); err != nil {
 			t.Fatal(err)

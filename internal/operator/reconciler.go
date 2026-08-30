@@ -15,6 +15,7 @@ import (
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -29,6 +30,7 @@ import (
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/internal/agentauth"
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/pgtune"
 
 	"github.com/andrew01234567890/pgshard/internal/metrics"
@@ -80,6 +82,7 @@ func (r *ClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&rbacv1.RoleBinding{}).
 		Owns(&coordinationv1.Lease{}).
 		Owns(&policyv1.PodDisruptionBudget{}).
+		Owns(&networkingv1.NetworkPolicy{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
 		Owns(&pgshardv1alpha1.PgShardReshard{}).
@@ -180,6 +183,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.ensureMemberRBAC(ctx, &cluster); err != nil {
 		return ctrl.Result{}, err
 	}
+	if err := r.ensureNetworkPolicy(ctx, &cluster); err != nil {
+		return ctrl.Result{}, err
+	}
 
 	policy, repoReady, backupCond, err := r.backupState(ctx, &cluster)
 	if err != nil {
@@ -268,13 +274,23 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	if err := r.reconcileAdmin(ctx, &cluster); err != nil {
-		return ctrl.Result{}, fmt.Errorf("admin: %w", err)
+		// The admin is an accessory: a credential somebody pre-created
+		// with the wrong key, or an image that will not pull, must not
+		// stop the router, the shard status and the conditions from being
+		// reconciled.
+		log.Error(err, "admin reconciliation failed; the rest of the cluster keeps reconciling")
 	}
 	if err := r.reconcileRouter(ctx, &cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("router: %w", err)
 	}
 	if catalogReady.Status == metav1.ConditionTrue {
-		catalogReady = r.publishShardStatus(ctx, &cluster, dsn, slices.Concat(observations[1:], targets, retired))
+		published := r.publishShardStatus(ctx, &cluster, dsn, slices.Concat(observations[1:], targets, retired))
+		// Publishing succeeded says nothing about the schema, and it is the
+		// schema this condition reports: a deferral has to survive it.
+		if published.Status == metav1.ConditionTrue {
+			published.Reason, published.Message = catalogReady.Reason, catalogReady.Message
+		}
+		catalogReady = published
 	}
 	if err := r.updateReshardStatus(ctx, plan, targets); err != nil {
 		return ctrl.Result{}, err
@@ -352,6 +368,85 @@ func (r *ClusterReconciler) ensureSecret(ctx context.Context, c *pgshardv1alpha1
 	return pw, nil
 }
 
+// ensureRouterSecret generates the router's catalog password. Like the
+// admin's, it is the cluster's own and separate from the superuser's: the
+// router terminates untrusted client connections, and the superuser
+// password is also the seed of the agent control-plane token.
+func (r *ClusterReconciler) ensureRouterSecret(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) (string, error) {
+	key := types.NamespacedName{Namespace: c.Namespace, Name: RouterSecretName(c.Name)}
+	var sec corev1.Secret
+	err := r.Get(ctx, key, &sec)
+	if err == nil {
+		if pw := sec.Data[secretKey]; len(pw) > 0 {
+			return string(pw), nil
+		}
+		return "", fmt.Errorf("secret %s has no %q key", key.Name, secretKey)
+	}
+	if !apierrors.IsNotFound(err) {
+		return "", err
+	}
+	buf := make([]byte, 24)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	pw := hex.EncodeToString(buf)
+	sec = corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace, Labels: map[string]string{LabelCluster: c.Name}},
+		Type:       corev1.SecretTypeBasicAuth,
+		StringData: map[string]string{"username": catalog.RouterRole, secretKey: pw},
+	}
+	if err := controllerutil.SetControllerReference(c, &sec, r.Scheme()); err != nil {
+		return "", err
+	}
+	if err := r.Create(ctx, &sec); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return r.ensureRouterSecret(ctx, c)
+		}
+		return "", err
+	}
+	return pw, nil
+}
+
+// ensureAdminSecret generates the credential the admin API requires. It is
+// the cluster's own, not the superuser's: reading the admin is not being
+// able to write to PostgreSQL, and a token that could do both would make the
+// weaker surface the way to the stronger one.
+func (r *ClusterReconciler) ensureAdminSecret(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) (string, error) {
+	key := types.NamespacedName{Namespace: c.Namespace, Name: AdminSecretName(c.Name)}
+	var sec corev1.Secret
+	err := r.Get(ctx, key, &sec)
+	if err == nil {
+		// A Secret somebody else made is likely to follow the basic-auth
+		// convention, whose key is password. Take either, and tell the
+		// caller which so the mount can name the file the admin expects.
+		for _, k := range []string{adminSecretKey, "password"} {
+			if len(sec.Data[k]) > 0 {
+				return k, nil
+			}
+		}
+		return "", fmt.Errorf("secret %s has neither a %q nor a \"password\" key", key.Name, adminSecretKey)
+	}
+	if !apierrors.IsNotFound(err) {
+		return "", err
+	}
+	buf := make([]byte, 24)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	sec = corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace, Labels: map[string]string{LabelCluster: c.Name}},
+		Type:       corev1.SecretTypeBasicAuth,
+		StringData: map[string]string{"username": "admin", adminSecretKey: hex.EncodeToString(buf)},
+	}
+	if err := controllerutil.SetControllerReference(c, &sec, r.Scheme()); err != nil {
+		return "", err
+	}
+	if err := r.Create(ctx, &sec); err != nil && !apierrors.IsAlreadyExists(err) {
+		return "", err
+	}
+	return adminSecretKey, nil
+}
+
 func (r *ClusterReconciler) ensureMemberRBAC(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) error {
 	dSA, dRole, dRB := r.Renderer.MemberRBAC(c)
 	sa := &corev1.ServiceAccount{ObjectMeta: dSA.ObjectMeta}
@@ -369,6 +464,38 @@ func (r *ClusterReconciler) ensureMemberRBAC(ctx context.Context, c *pgshardv1al
 		if rb.RoleRef.Name == "" {
 			rb.RoleRef = dRB.RoleRef
 		}
+		return nil
+	})
+}
+
+// ensureNetworkPolicy renders the member policy while it is enabled and
+// removes it when it is turned off: a policy left behind keeps enforcing.
+func (r *ClusterReconciler) ensureNetworkPolicy(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) error {
+	desired := r.Renderer.MemberNetworkPolicy(c)
+	if !c.Spec.NetworkPolicy.Enabled {
+		// Only ours: a policy of the same name that somebody wrote by hand
+		// is not this operator's to remove, and the default spec would
+		// remove it on every pass.
+		var existing networkingv1.NetworkPolicy
+		if err := r.Get(ctx, client.ObjectKeyFromObject(desired), &existing); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		if ref := metav1.GetControllerOf(&existing); ref == nil || ref.UID != c.UID {
+			return nil
+		}
+		err := r.Delete(ctx, &existing)
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	np := &networkingv1.NetworkPolicy{ObjectMeta: desired.ObjectMeta}
+	return r.ensureOwned(ctx, c, np, func() error {
+		np.Labels = desired.Labels
+		np.Spec = desired.Spec
 		return nil
 	})
 }
@@ -625,6 +752,16 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 		return obs, nil
 	}
 	obs.primaryOK = true
+	// Reported, never fatal to the pass: the fence lives in the catalog
+	// group, which is itself rebuilt member by member on a storage-class
+	// change, and a group that stopped rolling out because it could not
+	// read the catalog for a moment would be waiting on the very thing it
+	// is waiting for. A pause that does not get reapplied still fails the
+	// barrier's certification, which is what it did before it was
+	// reapplied at all.
+	if err := r.reapplyWritePause(ctx, c, g, dsn, pstate, password); err != nil {
+		logf.FromContext(ctx).Info("could not reapply the write pause; continuing", "group", g.Name(), "err", err)
+	}
 	var slots []string
 	for _, name := range g.MemberNames() {
 		if name == state.primary {
@@ -695,6 +832,35 @@ func ordinalOf(g Group, member string) int {
 }
 
 // finishGroup fills the pod counters and member statuses from members.
+// reapplyWritePause puts back the barrier's pause on a primary that lost
+// it. The pause is an ALTER SYSTEM, so it lives in postgresql.auto.conf,
+// which the agent rewrites on bootstrap, promotion and restore: a primary
+// that crashed and came back, or one promoted mid-barrier, serves writes
+// again while the barrier believes every shard is holding still. The
+// durable statement of that intent is the catalog write fence, and this
+// makes the primary match it.
+//
+// Only the pause is reapplied. Lifting it belongs to the barrier that
+// raised the fence -- or, if that barrier died, to the recovery pass that
+// reads the still-raised fence and resumes the shards it left paused.
+func (r *ClusterReconciler) reapplyWritePause(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, dsn string, pstate PrimaryState, password string) error {
+	if g.Kind != "shard" || pstate.WritesPaused {
+		return nil
+	}
+	fenced, err := r.Prober.WriteFenced(ctx, DSN(Groups(c)[0].ServiceRW(), c.Namespace, password))
+	if err != nil {
+		return fmt.Errorf("read the write fence: %w", err)
+	}
+	if !fenced {
+		return nil
+	}
+	if err := r.Prober.PauseWrites(ctx, dsn); err != nil {
+		return fmt.Errorf("reapply the write pause: %w", err)
+	}
+	logf.FromContext(ctx).Info("write fence is raised and the primary was accepting writes; pause reapplied", "group", g.Name())
+	return nil
+}
+
 func (r *ClusterReconciler) finishGroup(_ context.Context, _ *pgshardv1alpha1.PgShardCluster, g Group, obs groupObservation, members map[string]*memberInfo) groupObservation {
 	obs.podsRunning, obs.podsReady, obs.members = 0, 0, nil
 	for _, name := range g.MemberNames() {
@@ -835,8 +1001,43 @@ func (r *ClusterReconciler) reconcileCatalogSchema(ctx context.Context, c *pgsha
 		return cond, ""
 	}
 	dsn := DSN(catalog.group.ServiceRW(), c.Namespace, password)
+	// The router's password is not part of the schema and is not
+	// replicated, so it is applied on its own: a catalog just switched to
+	// has the role from its migration and no password for it.
+	setRouterCredential := func() error {
+		pw, err := r.ensureRouterSecret(ctx, c)
+		if err != nil {
+			return err
+		}
+		return r.Prober.SetRouterPassword(ctx, dsn, pw)
+	}
+	if up := c.Status.CatalogUpgrade; up != nil && up.Stage == CatalogUpgradeRetiring {
+		// A schema migration applied here cannot be rolled back with the
+		// data. Logical replication carries no DDL, so the reverse stream
+		// would take pgshard.schema_migrations to the old catalog while the
+		// DDL it describes stayed behind, and rows written to a table the
+		// migration created would not replicate at all until the
+		// subscription refreshed. The old catalog would then be structurally
+		// behind and believe otherwise. Defer until it is retired.
+		cond.Status = metav1.ConditionTrue
+		cond.Reason = "MigrationDeferred"
+		cond.Message = "catalog schema migrations wait while the previous catalog is kept for rollback; they run when it is retired"
+		if err := setRouterCredential(); err != nil {
+			// Not fatal here: the catalog is serving, and refusing to
+			// reconcile the rest of the cluster over a credential the next
+			// pass can set again helps nobody.
+			cond.Message += "; the router credential could not be applied: " + err.Error()
+		}
+		return cond, dsn
+	}
 	if err := r.Prober.MigrateCatalog(ctx, dsn); err != nil {
 		cond.Reason = "MigrationFailed"
+		cond.Message = err.Error()
+		return cond, ""
+	}
+	// After the migration, which is what creates the role.
+	if err := setRouterCredential(); err != nil {
+		cond.Reason = "RouterCredential"
 		cond.Message = err.Error()
 		return cond, ""
 	}

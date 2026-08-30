@@ -31,6 +31,12 @@ type DatabaseDialer interface {
 // DefaultDDLRole is the non-superuser login client statements run through.
 const DefaultDDLRole = "pgshard_ddl"
 
+// DefaultShardConnectTimeout bounds one attempt to reach a shard whose DSN
+// does not bound it itself. An explicit connect_timeout=0 means "wait for
+// ever", which is the failure this exists to prevent, so it is overridden
+// like an absent one.
+const DefaultShardConnectTimeout = 10 * time.Second
+
 // MigrationStore is the catalog side of the applier.
 type MigrationStore interface {
 	// Pending lists queued and running migrations oldest first.
@@ -254,21 +260,11 @@ func (a *Applier) now() time.Time {
 // Run drives pending migrations every interval while leader() is true.
 func (a *Applier) Run(ctx context.Context, interval time.Duration, leader func() bool) {
 	a.leader = leader
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-		if leader != nil && !leader() {
-			continue
-		}
+	runLoop(ctx, interval, leader, a.logger, "applier", func(ctx context.Context) {
 		if _, err := a.RunOnce(ctx); err != nil && ctx.Err() == nil {
 			a.logger().Warn("applier pass failed", "err", err)
 		}
-	}
+	})
 }
 
 // RunOnce drives every pending migration to completion or failure and
@@ -650,7 +646,8 @@ func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, key string,
 				// it skipped so a migration where no shard had the object
 				// still fails instead of reporting applied.
 				if m.Scope == "existing" && m.Meta.Object.Expect == "absent" {
-					return "", &skippedError{fmt.Errorf("%s %q is not present on this shard", m.Meta.Object.Kind, m.Meta.Object.Name)}
+					return "", &skippedError{fmt.Errorf("%s %q is not present on this shard, which is also what a DROP this migration completed before it crashed leaves behind",
+						m.Meta.Object.Kind, m.Meta.Object.Name)}
 				}
 				return catalog.ShardApplied, nil
 			}
@@ -818,35 +815,37 @@ func (a *Applier) runStep(ctx context.Context, m *catalog.DDLMigration, id int32
 
 // checkHolds evaluates a step's skip predicate on the shard.
 func checkHolds(ctx context.Context, conn ShardConn, c catalog.MigrationCheck) (bool, error) {
-	const rel = `SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE c.relname = $1 AND ($2 = '' AND n.nspname = ANY (current_schemas(false)) OR n.nspname = $2)`
+	// to_regclass resolves a name through the session's search_path exactly
+	// as the statement being skipped does. Matching pg_class.relname and a
+	// namespace instead would answer for a same-named relation in another
+	// schema: a partition may live in a different schema from its parent,
+	// so one parent can have two children called the same thing.
+	const rel = `pg_catalog.to_regclass(CASE WHEN $2 = '' THEN pg_catalog.quote_ident($1)
+		ELSE pg_catalog.quote_ident($2) || '.' || pg_catalog.quote_ident($1) END)::oid`
+	const part = `pg_catalog.to_regclass(CASE WHEN $4 = '' THEN pg_catalog.quote_ident($3)
+		ELSE pg_catalog.quote_ident($4) || '.' || pg_catalog.quote_ident($3) END)::oid`
 	var sql string
 	switch c.Kind {
 	case "":
 		return false, nil
 	case "constraint":
-		sql = `SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = $3 AND conrelid = (` + rel + `))`
+		sql = `SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = $3 AND conrelid = ` + rel + `)`
 	case "constraint_valid":
-		sql = `SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = $3 AND convalidated AND conrelid = (` + rel + `))`
+		sql = `SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = $3 AND convalidated AND conrelid = ` + rel + `)`
 	case "notnull":
 		sql = `SELECT EXISTS (SELECT 1 FROM pg_constraint k JOIN pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = ANY (k.conkey)
-			WHERE k.contype = 'n' AND a.attname = $3 AND k.conrelid = (` + rel + `))`
+			WHERE k.contype = 'n' AND a.attname = $3 AND k.conrelid = ` + rel + `)`
 	case "notnull_valid":
 		sql = `SELECT EXISTS (SELECT 1 FROM pg_constraint k JOIN pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = ANY (k.conkey)
-			WHERE k.contype = 'n' AND k.convalidated AND a.attname = $3 AND k.conrelid = (` + rel + `))`
+			WHERE k.contype = 'n' AND k.convalidated AND a.attname = $3 AND k.conrelid = ` + rel + `)`
 	case "index_valid":
-		rows, err := conn.Query(ctx, `SELECT EXISTS (SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
-			WHERE i.indisvalid AND c.relname = $1 AND ($2 = '' AND n.nspname = ANY (current_schemas(false)) OR n.nspname = $2))`, c.Name, c.Schema)
-		if err != nil {
-			return false, err
-		}
-		return pgx.CollectOneRow(rows, pgx.RowTo[bool])
+		sql = `SELECT EXISTS (SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+			WHERE i.indisvalid AND c.relname = $3 AND i.indrelid = ` + rel + `)`
 	case "detached":
-		sql = `SELECT NOT EXISTS (SELECT 1 FROM pg_inherits h JOIN pg_class p ON p.oid = h.inhrelid JOIN pg_namespace pn ON pn.oid = p.relnamespace
-			WHERE p.relname = $3 AND ($4 = '' OR pn.nspname = $4) AND h.inhparent = (` + rel + `))`
+		sql = `SELECT NOT EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = ` + part + ` AND inhparent = ` + rel + `)`
 	case "detach_pending":
-		sql = `SELECT NOT EXISTS (SELECT 1 FROM pg_inherits h JOIN pg_class p ON p.oid = h.inhrelid JOIN pg_namespace pn ON pn.oid = p.relnamespace
-			WHERE p.relname = $3 AND ($4 = '' OR pn.nspname = $4) AND NOT h.inhdetachpending AND h.inhparent = (` + rel + `))`
+		sql = `SELECT NOT EXISTS (SELECT 1 FROM pg_inherits
+			WHERE inhrelid = ` + part + ` AND NOT inhdetachpending AND inhparent = ` + rel + `)`
 	default:
 		return false, fmt.Errorf("unknown step check %q", c.Kind)
 	}
@@ -1038,6 +1037,29 @@ func (d *PgxShardDialer) DialDatabase(ctx context.Context, shardSet string, shar
 	return d.DialDatabaseAs(ctx, shardSet, shardID, database, "", "")
 }
 
+// shardConnConfig renders the connection settings of one shard dial. An
+// empty database or user keeps the DSN's own.
+func shardConnConfig(dsn, database, user, password string) (*pgx.ConnConfig, error) {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.ConnectTimeout == 0 {
+		// A PostgreSQL that is still starting accepts the connection and
+		// then says nothing. The controller's loops are single goroutines
+		// carrying no deadline of their own, so an unbounded dial stops one
+		// of them for the life of the process.
+		cfg.ConnectTimeout = DefaultShardConnectTimeout
+	}
+	if database != "" {
+		cfg.Database = database
+	}
+	if user != "" {
+		cfg.User, cfg.Password = user, password
+	}
+	return cfg, nil
+}
+
 // DialDatabaseAs implements DatabaseDialer; an empty user keeps the DSN's
 // credentials.
 func (d *PgxShardDialer) DialDatabaseAs(ctx context.Context, shardSet string, shardID int32, database, user, password string) (ShardConn, error) {
@@ -1045,15 +1067,9 @@ func (d *PgxShardDialer) DialDatabaseAs(ctx context.Context, shardSet string, sh
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := pgx.ParseConfig(dsn)
+	cfg, err := shardConnConfig(dsn, database, user, password)
 	if err != nil {
 		return nil, fmt.Errorf("shard %s/%d: %w", shardSet, shardID, err)
-	}
-	if database != "" {
-		cfg.Database = database
-	}
-	if user != "" {
-		cfg.User, cfg.Password = user, password
 	}
 	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {

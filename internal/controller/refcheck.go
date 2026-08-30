@@ -103,18 +103,8 @@ func (r *ReferenceCheck) logger() *slog.Logger {
 
 // Run re-inspects on a ticker while this process is the leader.
 func (r *ReferenceCheck) Run(ctx context.Context, interval time.Duration, leader func() bool) {
-	t := time.NewTicker(interval)
-	defer t.Stop()
 	nextSweep := r.now()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-		if leader != nil && !leader() {
-			continue
-		}
+	runLoop(ctx, interval, leader, r.logger, "reference check", func(ctx context.Context) {
 		if _, err := r.Pass(ctx); err != nil {
 			r.logger().Warn("reference check pass failed", "err", err)
 		}
@@ -124,7 +114,7 @@ func (r *ReferenceCheck) Run(ctx context.Context, interval time.Duration, leader
 				r.logger().Warn("undeclared reference sweep failed", "err", err)
 			}
 		}
-	}
+	})
 }
 
 type referenceTable struct {

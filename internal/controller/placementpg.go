@@ -453,20 +453,24 @@ func sequenceInSchema(ctx context.Context, conn ShardConn, seqRegclass, schema s
 
 // sequenceOptionsClause renders the non-default options of the sequence at
 // seqRegclass so a recreated sequence keeps the same increment, bounds, cache
-// and cycle behaviour instead of silently falling back to the defaults.
-func sequenceOptionsClause(ctx context.Context, conn ShardConn, seqRegclass string) (string, error) {
+// and cycle behaviour instead of silently falling back to the defaults. It
+// returns the declared type separately, because only CREATE SEQUENCE takes
+// one: inside an identity column's options PostgreSQL rejects AS as
+// "conflicting or redundant", the sequence taking its type from the column.
+func sequenceOptionsClause(ctx context.Context, conn ShardConn, seqRegclass string) (asType, options string, err error) {
 	var inc, minV, maxV, start, cache int64
 	var cycle bool
-	rows, err := conn.Query(ctx, `SELECT seqincrement, seqmin, seqmax, seqstart, seqcache, seqcycle
+	var typ string
+	rows, err := conn.Query(ctx, `SELECT seqtypid::regtype::text, seqincrement, seqmin, seqmax, seqstart, seqcache, seqcycle
 		FROM pg_sequence WHERE seqrelid = $1::regclass`, seqRegclass)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	found, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (struct{}, error) {
-		return struct{}{}, r.Scan(&inc, &minV, &maxV, &start, &cache, &cycle)
+		return struct{}{}, r.Scan(&typ, &inc, &minV, &maxV, &start, &cache, &cycle)
 	})
 	if err != nil || len(found) == 0 {
-		return "", err
+		return "", "", err
 	}
 	clause := fmt.Sprintf("INCREMENT BY %d MINVALUE %d MAXVALUE %d START WITH %d CACHE %d", inc, minV, maxV, start, cache)
 	if cycle {
@@ -474,7 +478,7 @@ func sequenceOptionsClause(ctx context.Context, conn ShardConn, seqRegclass stri
 	} else {
 		clause += " NO CYCLE"
 	}
-	return clause, nil
+	return typ, clause, nil
 }
 
 // shadowDDL renders the shadow table from the source table's catalog
@@ -529,7 +533,7 @@ func (p *Placer) shadowDDL(ctx context.Context, wf *placementWorkflow) ([]string
 			}
 			d += " GENERATED " + kind + " AS IDENTITY"
 			if seq != "" {
-				opts, oerr := sequenceOptionsClause(ctx, conn, seq)
+				_, opts, oerr := sequenceOptionsClause(ctx, conn, seq)
 				if oerr != nil {
 					return nil, oerr
 				}
@@ -540,11 +544,18 @@ func (p *Placer) shadowDDL(ctx context.Context, wf *placementWorkflow) ([]string
 		default:
 			if c.def != "" {
 				for _, m := range nextvalRE.FindAllStringSubmatch(c.def, -1) {
-					opts, oerr := sequenceOptionsClause(ctx, conn, m[1])
+					asType, opts, oerr := sequenceOptionsClause(ctx, conn, m[1])
 					if oerr != nil {
 						return nil, oerr
 					}
 					stmt := "CREATE SEQUENCE IF NOT EXISTS " + m[1]
+					// A sequence declared AS smallint or AS integer keeps the
+					// same bounds and the same nextval, so this changes no
+					// behaviour -- but the moved table's catalog should say
+					// what the source's did.
+					if asType != "" && asType != "bigint" {
+						stmt += " AS " + asType
+					}
 					if opts != "" {
 						stmt += " " + opts
 					}

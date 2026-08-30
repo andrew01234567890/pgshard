@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -852,8 +853,16 @@ func (o *pgCutover) Journal(ctx context.Context, id string) error {
 						return err
 					}
 				}
+				// The targets are updated rather than left alone: a flip
+				// that found the sources had advanced rewinds to re-carry
+				// the sequences and comes back through here, and the
+				// journal has to describe the attempt that actually
+				// flipped. Leaving the first attempt's positions in place
+				// starts a consumer that repositions off the journal
+				// before the cutover it is repositioning to.
 				_, err := conn.Exec(ctx, fmt.Sprintf(`INSERT INTO %s.%s (id, generation, source_shard, participants, targets)
-					VALUES ($1::uuid, $2, $3, $4, $5::jsonb) ON CONFLICT (id, source_shard) DO NOTHING`, JournalSchema, JournalTable),
+					VALUES ($1::uuid, $2, $3, $4, $5::jsonb)
+					ON CONFLICT (id, source_shard) DO UPDATE SET targets = EXCLUDED.targets`, JournalSchema, JournalTable),
 					id, o.wf.gen, s, o.srcIDs, mustJSON(targets))
 				return err
 			}()
@@ -869,7 +878,8 @@ func (o *pgCutover) Journal(ctx context.Context, id string) error {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	if _, err := tx.Exec(ctx, `INSERT INTO pgshard.resharding_journal (id, generation, shard_set, participants, targets)
-		VALUES ($1::uuid, $2, $3, $4, $5::jsonb) ON CONFLICT (id) DO NOTHING`, id, o.wf.gen, o.wf.set, o.srcIDs, mustJSON(targets)); err != nil {
+		VALUES ($1::uuid, $2, $3, $4, $5::jsonb)
+		ON CONFLICT (id) DO UPDATE SET targets = EXCLUDED.targets`, id, o.wf.gen, o.wf.set, o.srcIDs, mustJSON(targets)); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE pgshard.workflows SET journal_ids = array_append(array_remove(journal_ids, $2), $2) WHERE id = $1::uuid`, o.wf.id, id); err != nil {
@@ -938,6 +948,11 @@ func (o *pgCutover) stillSoleServing(ctx context.Context, tx pgx.Tx, set string)
 	}
 	if len(serving) == 1 && serving[0] == set {
 		return nil
+	}
+	if !slices.Contains(serving, set) {
+		// Retired sets are never returned to serving, so this switch can
+		// never publish on top of one: it is over, not waiting.
+		return sourceRetired("%s no longer serves; another workflow published %v while this one was switching", set, serving)
 	}
 	return fmt.Errorf("%s is no longer the only serving shard set (serving: %v)", set, serving)
 }
@@ -1182,6 +1197,31 @@ func (o *pgCutover) Unwind(ctx context.Context) error {
 // slots and publications on the targets, the frozen forward subscriptions
 // on the targets and the forward slots and publications on the sources, and
 // unpublishes the retired set. Sources that are already gone are skipped.
+// DropJournal removes this run's journal rows from every source database.
+// A source that cannot be reached is skipped and reported: its rows point
+// at a set that will never serve, but the alternative is a workflow that
+// cannot end while one source is down.
+func (o *pgCutover) DropJournal(ctx context.Context, id string) error {
+	if id == "" {
+		return nil
+	}
+	for _, db := range o.dbs {
+		for _, src := range o.srcIDs {
+			conn, err := o.c.Shards.DialDatabase(ctx, o.srcSet, src, db.name)
+			if err != nil {
+				o.c.logger().Info("abandoned switch: source unreachable, its journal rows stay", "workflow", o.wf.id, "source", src, "err", err)
+				continue
+			}
+			_, err = conn.Exec(ctx, fmt.Sprintf(`DELETE FROM %s.%s WHERE id = $1::uuid`, JournalSchema, JournalTable), id)
+			_ = conn.Close(ctx)
+			if err != nil && !missingObject(err) {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (o *pgCutover) Complete(ctx context.Context) error {
 	for _, db := range o.dbs {
 		for _, s := range o.srcIDs {

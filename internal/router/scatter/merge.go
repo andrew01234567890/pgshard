@@ -82,6 +82,10 @@ func concatenate(sources []Source, out *limiter) error {
 type headRow struct {
 	row [][]byte
 	src int
+	// key is the row's ordering columns, decoded once when it became a
+	// head. The heap compares it against O(log shards) others, and
+	// comparing on raw bytes decoded both sides every time.
+	key SortKey
 }
 
 type rowHeap struct {
@@ -92,10 +96,7 @@ type rowHeap struct {
 
 func (h *rowHeap) Len() int { return len(h.rows) }
 func (h *rowHeap) Less(i, j int) bool {
-	c, err := h.cmp.Compare(h.rows[i].row, h.rows[j].row)
-	if err != nil && h.err == nil {
-		h.err = err
-	}
+	c := h.cmp.CompareKeys(h.rows[i].key, h.rows[j].key)
 	// Ties keep shard order so the merge is deterministic.
 	if c == 0 {
 		return h.rows[i].src < h.rows[j].src
@@ -121,7 +122,11 @@ func mergeOrdered(keys []plan.SortKey, cols []Column, hidden int, sources []Sour
 			return err
 		}
 		if ok {
-			heap.Push(h, headRow{row: row, src: i})
+			key, err := cmp.Key(row)
+			if err != nil {
+				return err
+			}
+			heap.Push(h, headRow{row: row, src: i, key: key})
 		}
 		if err := h.errored(); err != nil {
 			return err
@@ -140,7 +145,11 @@ func mergeOrdered(keys []plan.SortKey, cols []Column, hidden int, sources []Sour
 			return err
 		}
 		if ok {
-			heap.Push(h, headRow{row: row, src: top.src})
+			key, err := cmp.Key(row)
+			if err != nil {
+				return err
+			}
+			heap.Push(h, headRow{row: row, src: top.src, key: key})
 			if err := h.errored(); err != nil {
 				return err
 			}

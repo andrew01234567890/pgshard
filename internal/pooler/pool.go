@@ -57,6 +57,10 @@ type Pool struct {
 	dial  dialFunc
 	total chan struct{}
 
+	// stop ends the idle reaper; wg waits for it.
+	stop chan struct{}
+	wg   sync.WaitGroup
+
 	mu      sync.Mutex
 	roles   map[poolKey]*rolePool
 	sems    map[string]chan struct{}
@@ -94,7 +98,66 @@ func NewPool(cfg PoolConfig, d Dialer) *Pool {
 
 func newPool(cfg PoolConfig, dial dialFunc) *Pool {
 	cfg = cfg.withDefaults()
-	return &Pool{cfg: cfg, dial: dial, total: make(chan struct{}, cfg.MaxBackends), roles: map[poolKey]*rolePool{}, sems: map[string]chan struct{}{}, changed: make(chan struct{})}
+	p := &Pool{cfg: cfg, dial: dial, total: make(chan struct{}, cfg.MaxBackends), roles: map[poolKey]*rolePool{}, sems: map[string]chan struct{}{}, changed: make(chan struct{}), stop: make(chan struct{})}
+	if cfg.MaxIdleTime > 0 {
+		p.wg.Add(1)
+		go p.reap()
+	}
+	return p
+}
+
+// reap closes backends that have sat idle past MaxIdleTime. Without it an
+// idle lifetime was only noticed by the next acquire, so the connections a
+// spike created -- and the pgx buffers, the PostgreSQL backends and their
+// memory behind them -- stayed for as long as the pool was quiet, which is
+// exactly when nothing comes to notice.
+func (p *Pool) reap() {
+	defer p.wg.Done()
+	every := max(p.cfg.MaxIdleTime/2, time.Second)
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-p.stop:
+			return
+		case <-t.C:
+		}
+		p.reapOnce()
+	}
+}
+
+func (p *Pool) reapOnce() {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	type held struct {
+		b  *Backend
+		rp *rolePool
+	}
+	var dead []held
+	for _, rp := range p.roles {
+		kept := rp.idle[:0]
+		for _, b := range rp.idle {
+			if p.expired(b) {
+				dead = append(dead, held{b, rp})
+				continue
+			}
+			kept = append(kept, b)
+		}
+		rp.idle = kept
+	}
+	p.mu.Unlock()
+	for _, h := range dead {
+		h.b.close()
+		p.free(h.rp)
+	}
+	if len(dead) > 0 {
+		p.mu.Lock()
+		p.notify()
+		p.mu.Unlock()
+	}
 }
 
 func (p *Pool) role(database, role string) *rolePool {
@@ -268,16 +331,26 @@ func (p *Pool) popIdle(rp *rolePool, digest [32]byte) *Backend {
 }
 
 // evictIdle closes one idle backend of any role, freeing its slot.
+// evictIdle closes the least recently used idle backend to make room, and
+// reports whether it found one. It used to take the last entry of whichever
+// role pool the map happened to yield first: the idle list is LIFO, so the
+// last entry is the warmest backend there is -- the one with the hottest
+// prepared statements and the one most likely to be wanted next -- while
+// older connections sat untouched.
 func (p *Pool) evictIdle() bool {
 	p.mu.Lock()
 	var victim *Backend
 	var owner *rolePool
+	var at int
 	for _, rp := range p.roles {
-		if n := len(rp.idle); n > 0 {
-			victim, owner = rp.idle[n-1], rp
-			rp.idle = rp.idle[:n-1]
-			break
+		for i, b := range rp.idle {
+			if victim == nil || b.lastUsed.Before(victim.lastUsed) {
+				victim, owner, at = b, rp, i
+			}
 		}
+	}
+	if victim != nil {
+		owner.idle = append(owner.idle[:at], owner.idle[at+1:]...)
 	}
 	p.mu.Unlock()
 	if victim == nil {
@@ -383,6 +456,9 @@ func (p *Pool) Discard(b *Backend) {
 // held by callers are closed when released.
 func (p *Pool) Close() {
 	p.mu.Lock()
+	if !p.closed {
+		close(p.stop)
+	}
 	p.closed = true
 	// Waiters watch this channel; without the wake a shutdown leaves them
 	// blocked until their acquire timeout for a pool that is already gone.
@@ -403,6 +479,7 @@ func (p *Pool) Close() {
 		h.b.close()
 		p.free(h.rp)
 	}
+	p.wg.Wait()
 }
 
 // Stats reports live and idle counts for observability.
