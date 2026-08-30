@@ -161,8 +161,12 @@ serves `pgshard.v1.VStream` with the router↔pooler mTLS material
     there because it was synchronized (see above). A shard that stays broken
     for longer than the reconnect window (30s) ends the stream with
     `Error{SHARD_UNAVAILABLE}`;
-  - an invalidated slot or an LSN no longer retained ends the stream with
-    `Error{POSITION_TOO_OLD}`; a shard map generation change ends it with
+  - an invalidated slot, a slot that is gone, or WAL no longer retained ends
+    the stream with `Error{POSITION_TOO_OLD}`, which tells a consumer its
+    checkpoints are worthless and it must copy again. Nothing else earns it:
+    a publication that does not exist, a permission failure or an option the
+    server rejects ends the stream with `Error{INTERNAL}` and its message,
+    because those are fixed without discarding anything; a shard map generation change ends it with
     `Error{RESHARDED}`, or with a `Journal` (participants, no targets yet)
     when `stop_on_reshard` is set — following a reshard arrives with the
     journal rows;
