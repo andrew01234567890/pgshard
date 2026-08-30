@@ -63,17 +63,16 @@ func TestPostgres(t *testing.T) {
 
 func startPostgres(t *testing.T, image string) (addr, adminDSN string) {
 	t.Helper()
-	port := freePort(t)
 	script := `initdb -D /tmp/pgdata --auth=trust -U postgres >/dev/null &&
 		 printf 'host all postgres all trust\nhost replication postgres all trust\nhost all all all scram-sha-256\n' >> /tmp/pgdata/pg_hba.conf &&
 		 exec postgres -D /tmp/pgdata -c listen_addresses='*' -c wal_level=logical -c max_prepared_transactions=16`
-	out, err := exec.Command("docker", "run", "-d", "--rm", "-p", fmt.Sprintf("127.0.0.1:%d:5432", port), "--user", "postgres", "--entrypoint", "sh", image, "-ec", script).CombinedOutput()
+	out, err := exec.Command("docker", "run", "-d", "--rm", "-p", "127.0.0.1::5432", "--user", "postgres", "--entrypoint", "sh", image, "-ec", script).CombinedOutput()
 	if err != nil {
 		t.Fatalf("docker run: %v: %s", err, out)
 	}
 	id := strings.TrimSpace(string(out))
 	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", id).Run() })
-	addr = fmt.Sprintf("127.0.0.1:%d", port)
+	addr = dockertest.HostPort(t, id, "5432")
 	adminDSN = fmt.Sprintf("postgres://postgres@%s/postgres?sslmode=disable", addr)
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
@@ -89,16 +88,6 @@ func startPostgres(t *testing.T, image string) (addr, adminDSN string) {
 	logs, _ := exec.Command("docker", "logs", id).CombinedOutput()
 	t.Fatalf("postgres did not become ready:\n%s", logs)
 	return "", ""
-}
-
-func freePort(t *testing.T) int {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = l.Close() }()
-	return l.Addr().(*net.TCPAddr).Port
 }
 
 // deriveKeys recomputes ClientKey/ServerKey the way the router recovers them
