@@ -70,6 +70,10 @@ type Server struct {
 
 	mu       sync.Mutex
 	sessions map[string]*session
+	// discarded remembers the sessions an expiry rolled a transaction back
+	// on, so the router that returns is told rather than handed a fresh
+	// session; see noteDiscarded.
+	discarded map[string]time.Time
 	// nextExpiry is when the earliest detached reservation falls due, or
 	// zero when none is waiting. Every Execute stream used to scan the
 	// whole session map to find out, so establishing N sessions cost N
@@ -170,6 +174,14 @@ func (s *Server) attachSession(id, role, database string, cred [32]byte) (*sessi
 		}
 	}
 	defer s.mu.Unlock()
+	if !ok && s.takeDiscarded(id, time.Now()) {
+		// A session id the pooler expired with a transaction open. The
+		// fresh one above is exactly what must not be handed back without
+		// a word, so it goes again and the router is told why.
+		delete(s.sessions, id)
+		return nil, status.Errorf(codes.Aborted,
+			"session %s was released after %s without an Execute stream and its transaction was rolled back", id, s.cfg.ReserveTimeout)
+	}
 	if se.attached {
 		return nil, status.Error(codes.FailedPrecondition, "session already has an Execute stream")
 	}
@@ -753,6 +765,14 @@ func (s *Server) expireReservations(now time.Time) {
 		}
 		if now.Sub(se.detachedAt) >= s.cfg.ReserveTimeout {
 			delete(s.sessions, id)
+			// An expiry that rolls back an open transaction has to be
+			// tellable afterwards: without this the next attach gets a
+			// fresh session and the client carries on as though its
+			// transaction were still open, finding out only when the next
+			// statement behaves as if nothing had begun.
+			if se.b != nil && !se.b.idle() {
+				s.noteDiscarded(id, now)
+			}
 			// Claim the backend under the lock so a Release racing this
 			// expiry finds nothing left to recycle.
 			expired = append(expired, claim{se: se, b: se.b})
@@ -767,6 +787,46 @@ func (s *Server) expireReservations(now time.Time) {
 		s.cfg.Logger.Warn("releasing reservation with no stream", "session", c.se.id, "role", c.se.role)
 		s.recycle(c.b)
 	}
+}
+
+// discardedRetention is how long an expiry that took a transaction with it
+// is remembered, so the router that comes back is told rather than handed a
+// fresh session. It is a bound on memory, not a promise: a router that
+// returns later than this is in the same position as one whose pooler
+// restarted.
+const discardedRetention = 30 * time.Minute
+
+// discardedCap bounds the record. A pooler cannot be made to grow without
+// limit by a caller inventing session ids, so the oldest entries go first.
+const discardedCap = 4096
+
+// noteDiscarded records that this session's transaction was rolled back by
+// an expiry. Called with s.mu held.
+func (s *Server) noteDiscarded(id string, now time.Time) {
+	if s.discarded == nil {
+		s.discarded = map[string]time.Time{}
+	}
+	if len(s.discarded) >= discardedCap {
+		oldest, at := "", time.Time{}
+		for k, v := range s.discarded {
+			if at.IsZero() || v.Before(at) {
+				oldest, at = k, v
+			}
+		}
+		delete(s.discarded, oldest)
+	}
+	s.discarded[id] = now
+}
+
+// takeDiscarded reports whether this session was expired with a transaction
+// open, and forgets it: the caller is being told now. Called with s.mu held.
+func (s *Server) takeDiscarded(id string, now time.Time) bool {
+	at, ok := s.discarded[id]
+	if !ok {
+		return false
+	}
+	delete(s.discarded, id)
+	return now.Sub(at) < discardedRetention
 }
 
 // Cancel interrupts the statement running on the session's backend.
