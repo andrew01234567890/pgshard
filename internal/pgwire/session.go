@@ -483,6 +483,15 @@ func (s *session) startup(ctx context.Context) error {
 	s.mu.Unlock()
 	result, err := s.server.cfg.Authenticator.Authenticate(ctx, pkt.params, authExchange{s})
 	if err != nil {
+		if s.revokedNow() {
+			// A revoked session ends as a revoked session, whatever the
+			// exchange happened to be failing on at the time. Relaying the
+			// authenticator's own message here would tell the client that
+			// the role is NOLOGIN or its password expired -- a description
+			// of a role the cluster has just withdrawn.
+			s.terminate(Errorf(CodeInvalidPassword, "password authentication failed"))
+			return errors.New("session revoked during authentication")
+		}
 		var pe *Error
 		if !errors.As(err, &pe) {
 			err = Errorf(CodeInvalidAuthorization, "authentication failed: %v", err)
