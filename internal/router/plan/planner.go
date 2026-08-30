@@ -1743,12 +1743,3 @@ func (w *walker) delete(s *pgquerypb.DeleteStmt) error {
 	}
 	return w.decide(true)
 }
-
-// referenceShard spreads reference reads across the shard set by session.
-func (w *walker) referenceShard() int32 {
-	all := w.allShards()
-	if len(all) == 0 {
-		return w.sess.HomeShard
-	}
-	return all[w.sess.ID%uint64(len(all))]
-}

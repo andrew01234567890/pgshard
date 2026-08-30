@@ -298,7 +298,7 @@ func TestReshardCardsCountActiveAndLastPause(t *testing.T) {
 			t.Errorf("index missing %q", want)
 		}
 	}
-	cards, err := BuildReshardCards(context.Background(), s.Client, "ns2")
+	cards, err := BuildReshardCards(context.Background(), s.Client, "ns2", "")
 	if err != nil {
 		t.Fatal(err)
 	}

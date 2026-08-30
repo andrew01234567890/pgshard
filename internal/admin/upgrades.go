@@ -46,11 +46,12 @@ type UpgradesPage struct {
 // PgShardCluster status: the shard-set replacement run (status.reshard
 // with a pgMajor), the catalog group upgrade (status.catalogUpgrade) and
 // the blockers the operator reports on the Resharding condition.
-func BuildUpgradesPage(ctx context.Context, c client.Reader, namespace string) (UpgradesPage, error) {
+func BuildUpgradesPage(ctx context.Context, c client.Reader, namespace, cluster string) (UpgradesPage, error) {
 	var list pgshardv1alpha1.PgShardClusterList
 	if err := c.List(ctx, &list, client.InNamespace(namespace)); err != nil {
 		return UpgradesPage{}, err
 	}
+	list.Items = onlyCluster(list.Items, cluster)
 	page := UpgradesPage{Namespace: namespace}
 	for i := range list.Items {
 		page.Clusters = append(page.Clusters, clusterUpgrade(ctx, c, &list.Items[i]))

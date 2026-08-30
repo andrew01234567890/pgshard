@@ -191,17 +191,18 @@ var terminalPhases = map[string]bool{
 }
 
 // BuildReshardsPage assembles the reshards panel for every cluster in namespace.
-func BuildReshardsPage(ctx context.Context, c client.Reader, src CatalogSource, namespace string) (*ReshardsPage, error) {
+func BuildReshardsPage(ctx context.Context, c client.Reader, src CatalogSource, namespace, cluster string) (*ReshardsPage, error) {
 	var clusters pgshardv1alpha1.PgShardClusterList
 	if err := c.List(ctx, &clusters, client.InNamespace(namespace)); err != nil {
 		return nil, err
 	}
+	clusters.Items = onlyCluster(clusters.Items, cluster)
 	page := &ReshardsPage{Clusters: []ClusterReshards{}, Placements: []Placement{}, Upgrades: []Upgrade{}}
 	workflows, err := loadWorkflows(ctx, src)
 	if err != nil {
 		page.CatalogError = err.Error()
 	}
-	reshards, err := ListReshards(ctx, c, namespace, workflows)
+	reshards, err := ListReshards(ctx, c, namespace, cluster, workflows)
 	if err != nil {
 		return nil, err
 	}
@@ -240,8 +241,8 @@ func BuildReshardsPage(ctx context.Context, c client.Reader, src CatalogSource, 
 }
 
 // BuildReshardCards derives the overview cards from the reshards in namespace.
-func BuildReshardCards(ctx context.Context, c client.Reader, namespace string) (*ReshardCards, error) {
-	reshards, err := ListReshards(ctx, c, namespace, nil)
+func BuildReshardCards(ctx context.Context, c client.Reader, namespace, cluster string) (*ReshardCards, error) {
+	reshards, err := ListReshards(ctx, c, namespace, cluster, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -265,7 +266,7 @@ func BuildReshardCards(ctx context.Context, c client.Reader, namespace string) (
 
 // ListReshards returns every PgShardReshard in namespace, newest first,
 // joined with workflows by status.workflowId.
-func ListReshards(ctx context.Context, c client.Reader, namespace string, workflows []WorkflowRecord) ([]Reshard, error) {
+func ListReshards(ctx context.Context, c client.Reader, namespace, cluster string, workflows []WorkflowRecord) ([]Reshard, error) {
 	var list pgshardv1alpha1.PgShardReshardList
 	if err := c.List(ctx, &list, client.InNamespace(namespace)); err != nil {
 		return nil, err
@@ -273,20 +274,27 @@ func ListReshards(ctx context.Context, c client.Reader, namespace string, workfl
 	byID := indexWorkflows(workflows)
 	out := make([]Reshard, 0, len(list.Items))
 	for i := range list.Items {
-		out = append(out, convertReshard(&list.Items[i], byID))
+		rs := convertReshard(&list.Items[i], byID)
+		if cluster != "" && rs.Cluster != cluster {
+			continue
+		}
+		out = append(out, rs)
 	}
 	sort.Slice(out, func(i, j int) bool { return newerFirst(out[i].StartedAt, out[i].Name, out[j].StartedAt, out[j].Name) })
 	return out, nil
 }
 
 // GetReshard reads one PgShardReshard and its workflow.
-func GetReshard(ctx context.Context, c client.Reader, src CatalogSource, namespace, name string) (*Reshard, error) {
+func GetReshard(ctx context.Context, c client.Reader, src CatalogSource, namespace, name, cluster string) (*Reshard, error) {
 	var r pgshardv1alpha1.PgShardReshard
 	if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &r); err != nil {
 		return nil, err
 	}
 	workflows, err := loadWorkflows(ctx, src)
 	out := convertReshard(&r, indexWorkflows(workflows))
+	if cluster != "" && out.Cluster != cluster {
+		return nil, notServed("reshard", name)
+	}
 	if err != nil {
 		out.Error = joinErr(out.Error, "catalog: "+err.Error())
 	}
