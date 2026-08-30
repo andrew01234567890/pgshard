@@ -12,7 +12,7 @@ what you think it means.
 | Kubernetes | `make envtest` | envtest assets, downloaded by the target itself | CRD validation, the operator and the admin server against a real API server |
 | Generated code | `make proto-drift` | `buf`, `protoc-gen-go`, `protoc-gen-go-grpc` | that `internal/gen` matches `proto/` |
 | Vulnerabilities | `make govulncheck` | `govulncheck` | known advisories in the dependency graph |
-| Workflows | `make actionlint` | `actionlint`, python3 with PyYAML | workflow syntax and this repository's action policy |
+| Workflows | `make actionlint` | `actionlint`, python3 with PyYAML | workflow syntax, this repository's action policy, and the CI shell helpers' own tests |
 | All of the above | `make gates` | everything above | what CI gates on, except the secret scan |
 | End to end | `make e2e` | a kind cluster and the images | the suites under `test/e2e` |
 
