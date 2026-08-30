@@ -130,6 +130,20 @@ func TestDDLClassification(t *testing.T) {
 		{sql: "grant analyst to app", mig: "GRANT ROLE all"},
 		{sql: "revoke analyst from app", mig: "REVOKE ROLE all"},
 		{sql: "create role boss superuser", refuse: "roles with the SUPERUSER attribute are not available through the router"},
+		// The cluster's own roles: a client that could create one under a
+		// name the catalog reserves would have the shards holding a role of
+		// its making, and a later membership grant applied to the catalog's
+		// real role by the controller's identity.
+		{sql: "create role pgshard_admin", refuse: "role pgshard_admin is reserved by pgshard"},
+		{sql: "create role PGSHARD_Admin", refuse: "role pgshard_admin is reserved by pgshard"},
+		// Quoted, so PostgreSQL does not fold it: the check has to.
+		{sql: `create role "PGSHARD_Admin"`, refuse: "role PGSHARD_Admin is reserved by pgshard"},
+		{sql: "create role pgshard_anything_at_all", refuse: "role pgshard_anything_at_all is reserved by pgshard"},
+		{sql: "alter role pgshard_system createdb", refuse: "role pgshard_system is reserved by pgshard"},
+		{sql: "drop role pgshard_reader", refuse: "role pgshard_reader is reserved by pgshard"},
+		{sql: "grant pgshard_admin to analyst", refuse: "role pgshard_admin is reserved by pgshard"},
+		{sql: "grant analyst to pgshard_admin", refuse: "role pgshard_admin is reserved by pgshard"},
+		{sql: "grant select on orders to pgshard_reader", refuse: "role pgshard_reader is reserved by pgshard"},
 		{sql: "alter role analyst replication", refuse: "roles with the REPLICATION attribute are not available through the router"},
 		{sql: "create user x bypassrls", refuse: "roles with the BYPASSRLS attribute are not available through the router"},
 		{sql: "create user x nosuperuser", mig: "CREATE ROLE all", object: "role:x:present"},
