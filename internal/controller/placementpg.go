@@ -157,11 +157,24 @@ type tableColumn struct {
 	// collate is the qualified collation name when it differs from the
 	// type's default, "" otherwise.
 	collate string
+	// storage and compression are set only when the column differs from
+	// what its type would give a freshly created column; a shadow built
+	// column by column would otherwise silently detoast differently from
+	// the table it replaces.
+	storage     string
+	compression string
+	// comment is the column's COMMENT, which LIKE INCLUDING ALL carries
+	// and a hand-built shadow has to carry itself.
+	comment string
 }
 
 func tableColumns(ctx context.Context, conn ShardConn, schema, name string) ([]tableColumn, error) {
 	rows, err := conn.Query(ctx, `SELECT a.attname, format_type(a.atttypid, a.atttypmod), coalesce(pg_get_expr(d.adbin, d.adrelid), ''), a.attnotnull, a.attidentity::text, a.attgenerated::text,
-		CASE WHEN a.attcollation <> 0 AND a.attcollation <> ty.typcollation THEN format('%I.%I', cn.nspname, co.collname) ELSE '' END
+		CASE WHEN a.attcollation <> 0 AND a.attcollation <> ty.typcollation THEN format('%I.%I', cn.nspname, co.collname) ELSE '' END,
+		CASE WHEN a.attstorage = ty.typstorage THEN '' ELSE
+			CASE a.attstorage WHEN 'p' THEN 'PLAIN' WHEN 'e' THEN 'EXTERNAL' WHEN 'm' THEN 'MAIN' WHEN 'x' THEN 'EXTENDED' END END,
+		CASE a.attcompression WHEN 'p' THEN 'pglz' WHEN 'l' THEN 'lz4' ELSE '' END,
+		coalesce(pg_catalog.col_description(a.attrelid, a.attnum), '')
 		FROM pg_attribute a
 		JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
 		JOIN pg_type ty ON ty.oid = a.atttypid
@@ -177,7 +190,8 @@ func tableColumns(ctx context.Context, conn ShardConn, schema, name string) ([]t
 	var out []tableColumn
 	for rows.Next() {
 		var c tableColumn
-		if err := rows.Scan(&c.name, &c.typ, &c.def, &c.notNull, &c.identity, &c.generated, &c.collate); err != nil {
+		if err := rows.Scan(&c.name, &c.typ, &c.def, &c.notNull, &c.identity, &c.generated, &c.collate,
+			&c.storage, &c.compression, &c.comment); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -491,7 +505,13 @@ func (p *Placer) ensureShadows(ctx context.Context, wf *placementWorkflow) error
 			// cancellation would refuse to clean up.
 			var stmts []string
 			if local {
-				stmts = []string{fmt.Sprintf("CREATE TABLE %s (LIKE %s INCLUDING ALL)", wf.shape.qualified(wf.shadow()), wf.shape.qualified(wf.spec.TableName))}
+				// LIKE INCLUDING ALL does not copy reloptions, so the
+				// storage parameters are applied either way.
+				opts, oerr := tableReloptions(ctx, conn, wf)
+				if oerr != nil {
+					return oerr
+				}
+				stmts = append([]string{fmt.Sprintf("CREATE TABLE %s (LIKE %s INCLUDING ALL)", wf.shape.qualified(wf.shadow()), wf.shape.qualified(wf.spec.TableName))}, opts...)
 			} else {
 				if ddl == nil {
 					if ddl, err = p.shadowDDL(ctx, wf); err != nil {
@@ -683,7 +703,7 @@ func (p *Placer) shadowDDL(ctx context.Context, wf *placementWorkflow) ([]string
 		out = append(out, fmt.Sprintf("ALTER SEQUENCE %s OWNED BY %s.%s", o.seq, wf.shape.qualified(wf.shadow()), QuoteIdent(o.col)))
 	}
 	rows, err := conn.Query(ctx, `SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint
-		WHERE conrelid = $1::regclass AND contype IN ('p', 'u', 'c') ORDER BY contype, conname`, wf.shape.qualified(wf.spec.TableName))
+		WHERE conrelid = $1::regclass AND contype IN ('p', 'u', 'c', 'x') ORDER BY contype, conname`, wf.shape.qualified(wf.spec.TableName))
 	if err != nil {
 		return nil, err
 	}
@@ -711,7 +731,87 @@ func (p *Placer) shadowDDL(ctx context.Context, wf *placementWorkflow) ([]string
 		def = strings.Replace(def, " INDEX "+i.Name+" ", " INDEX "+QuoteIdent(shadowName(i.Name, wf.spec.TableName, wf.shadow()))+" ", 1)
 		out = append(out, def)
 	}
+	shadow := wf.shape.qualified(wf.shadow())
+	for _, c := range cols {
+		if c.storage != "" {
+			out = append(out, "ALTER TABLE "+shadow+" ALTER COLUMN "+QuoteIdent(c.name)+" SET STORAGE "+c.storage)
+		}
+		if c.compression != "" {
+			out = append(out, "ALTER TABLE "+shadow+" ALTER COLUMN "+QuoteIdent(c.name)+" SET COMPRESSION "+c.compression)
+		}
+		if c.comment != "" {
+			out = append(out, "COMMENT ON COLUMN "+shadow+"."+QuoteIdent(c.name)+" IS "+QuoteLiteral(&c.comment))
+		}
+	}
+	stats, err := extendedStatistics(ctx, conn, wf)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, stats...)
+	opts, err := tableReloptions(ctx, conn, wf)
+	if err != nil {
+		return nil, err
+	}
+	return append(out, opts...), nil
+}
+
+// statisticsKinds maps pg_statistic_ext.stxkind to the words CREATE
+// STATISTICS takes. A kind a later PostgreSQL adds is an error rather than
+// a silently dropped one: the shadow becomes the table, and a planner that
+// used to have a statistic would quietly stop having it.
+var statisticsKinds = map[string]string{"d": "dependencies", "f": "ndistinct", "m": "mcv"}
+
+// extendedStatistics rebuilds the source table's extended statistics on the
+// shadow. LIKE INCLUDING ALL carries them; a hand-built shadow did not, so
+// a moved table lost every multi-column estimate it had.
+func extendedStatistics(ctx context.Context, conn ShardConn, wf *placementWorkflow) ([]string, error) {
+	rows, err := conn.Query(ctx, `SELECT s.stxname, s.stxkind::text[], pg_catalog.pg_get_statisticsobjdef_columns(s.oid)
+		FROM pg_statistic_ext s WHERE s.stxrelid = $1::regclass ORDER BY s.stxname`, wf.shape.qualified(wf.spec.TableName))
+	if err != nil {
+		return nil, err
+	}
+	found, err := pgx.CollectRows(rows, pgx.RowToStructByPos[struct {
+		Name    string
+		Kinds   []string
+		Columns string
+	}])
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, st := range found {
+		words := make([]string, 0, len(st.Kinds))
+		for _, k := range st.Kinds {
+			w, ok := statisticsKinds[k]
+			if !ok {
+				return nil, fatal("statistics object %s on %s uses kind %q, which this version of pgshard cannot rebuild on the moved table", st.Name, wf.spec.table(), k)
+			}
+			words = append(words, w)
+		}
+		stmt := "CREATE STATISTICS " + wf.shape.qualified(shadowName(st.Name, wf.spec.TableName, wf.shadow()))
+		if len(words) > 0 {
+			stmt += " (" + strings.Join(words, ", ") + ")"
+		}
+		out = append(out, stmt+" ON "+st.Columns+" FROM "+wf.shape.qualified(wf.shadow()))
+	}
 	return out, nil
+}
+
+// tableReloptions renders the source table's storage parameters. Neither
+// path carried them: LIKE INCLUDING ALL does not copy reloptions, so a
+// table with a tuned fillfactor or its own autovacuum thresholds came back
+// from a move with the defaults.
+func tableReloptions(ctx context.Context, conn ShardConn, wf *placementWorkflow) ([]string, error) {
+	rows, err := conn.Query(ctx, `SELECT coalesce(array_to_string(c.reloptions, ', '), '') FROM pg_class c WHERE c.oid = $1::regclass`,
+		wf.shape.qualified(wf.spec.TableName))
+	if err != nil {
+		return nil, err
+	}
+	opts, err := pgx.CollectExactlyOneRow(rows, pgx.RowTo[string])
+	if err != nil || opts == "" {
+		return nil, err
+	}
+	return []string{"ALTER TABLE " + wf.shape.qualified(wf.shadow()) + " SET (" + opts + ")"}, nil
 }
 
 // shadowName renames an index or constraint of the table for its shadow the
@@ -1596,6 +1696,19 @@ func renameShadowIndexes(ctx context.Context, conn ShardConn, wf *placementWorkf
 	}
 	for _, name := range idx {
 		if _, err := conn.Exec(ctx, fmt.Sprintf("ALTER INDEX %s.%s RENAME TO %s", QuoteIdent(wf.spec.SchemaName), QuoteIdent(name), QuoteIdent(strings.Replace(name, ShadowSuffix, "", 1)))); err != nil {
+			return err
+		}
+	}
+	rows, err = conn.Query(ctx, `SELECT stxname FROM pg_statistic_ext WHERE stxrelid = $1::regclass AND stxname LIKE $2 ORDER BY stxname`, table, "%"+ShadowSuffix+"%")
+	if err != nil {
+		return err
+	}
+	stats, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return err
+	}
+	for _, name := range stats {
+		if _, err := conn.Exec(ctx, fmt.Sprintf("ALTER STATISTICS %s.%s RENAME TO %s", QuoteIdent(wf.spec.SchemaName), QuoteIdent(name), QuoteIdent(strings.Replace(name, ShadowSuffix, "", 1)))); err != nil {
 			return err
 		}
 	}

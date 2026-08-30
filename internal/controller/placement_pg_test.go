@@ -1149,3 +1149,38 @@ func tableExistsOrFail(ctx context.Context, t *testing.T, conn ShardConn, schema
 	}
 	return ok
 }
+
+// TestPlacementCarriesAnExclusionConstraintOnPostgres: a hand-built shadow
+// selected only p, u and c constraints, so a table with an exclusion
+// constraint came back from a move without it -- and without the index
+// behind it, which the index pass skips because a constraint owns it. A
+// sharded table cannot have one yet (every uniqueness key must contain the
+// shard key, and that is not yet decided for an exclusion), so the move
+// that exercises it is to a reference table.
+func TestPlacementCarriesAnExclusionConstraintOnPostgres(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	src := f.app(0)
+	mustExec(t, src, `CREATE TABLE slots (id bigint PRIMARY KEY, room text NOT NULL)`)
+	mustExec(t, src, `ALTER TABLE slots ADD CONSTRAINT slots_one_per_room EXCLUDE USING btree (room WITH =)`)
+	mustExec(t, src, `INSERT INTO slots SELECT g, 'r' || g FROM generate_series(1, 20) g`)
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement) VALUES ('app', 'public', 'slots', 'unsharded')`)
+	f.reconcile()
+	mustExec(t, f.catalog, `UPDATE pgshard.tables SET placement = 'reference' WHERE table_name = 'slots'`)
+	f.reconcile()
+	mustExec(t, f.catalog, `UPDATE pgshard.workflows SET spec = spec || '{"drop_old_after_seconds": 0}'`)
+	f.driveUntil("slots", 2*time.Minute, StageCompleted)
+
+	for id := range int32(2) {
+		c := f.app(id)
+		// The home shard's copy is named by LIKE, which renames what it
+		// copies; what has to survive the move is the constraint, not the
+		// name it happened to have.
+		if n := queryOne[int64](t, c, `SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.slots'::regclass AND contype = 'x'`); n != 1 {
+			t.Errorf("shard %d: %d exclusion constraints, want the one the table had", id, n)
+		}
+		if _, err := c.Exec(context.Background(), `INSERT INTO slots VALUES (999, 'r1')`); err == nil {
+			t.Errorf("shard %d: the moved table accepted a row its exclusion constraint forbids", id)
+		}
+	}
+}
