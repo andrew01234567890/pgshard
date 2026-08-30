@@ -63,7 +63,23 @@ func (c *RoleCache) Lookup(ctx context.Context, user string) (string, error) {
 		return "", err
 	}
 	if cred, ok := cur.roles.Cred(user); ok {
-		return c.admit(user, cred)
+		verifier, refusal := c.admit(user, cred)
+		if refusal == nil {
+			return verifier, nil
+		}
+		// The cached entry refuses, and it may simply be old: a password
+		// renewed or a role re-enabled a moment ago looks exactly like
+		// this until the ttl comes round. Read the catalog again -- bounded
+		// the way a miss is, so a caller hammering a disabled role cannot
+		// ask for more than one reload per ttl -- and answer from what
+		// comes back.
+		if fresh, rerr := c.reloadForMiss(ctx); rerr == nil && fresh != nil {
+			if cred, ok := fresh.roles.Cred(user); ok {
+				return c.admit(user, cred)
+			}
+			return "", ErrUnknownRole
+		}
+		return verifier, refusal
 	}
 	cur, err = c.reloadForMiss(ctx)
 	if err != nil {
