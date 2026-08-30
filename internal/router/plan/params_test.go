@@ -418,3 +418,50 @@ func TestTheStatementScanRunsOncePerStatement(t *testing.T) {
 		}
 	}
 }
+
+// TestStandardConformingStringsIsFixed: the router parses every statement
+// with standard_conforming_strings on and hashes the shard key out of the
+// parse tree. A session that turned it off would have the backend read
+// '\\141' as the single character a while the router hashed four, so the
+// row would be stored on one shard and looked for on another. The setting
+// is also reported as on in the router's ParameterStatus.
+func TestStandardConformingStringsIsFixed(t *testing.T) {
+	snap := fixture(t)
+	for _, sql := range []string{
+		"set standard_conforming_strings = off",
+		"set standard_conforming_strings to 'off'",
+		"set local standard_conforming_strings = off",
+		// On is refused too: the value is the cluster's to hold, and a
+		// session that may set it may also set it back.
+		"set standard_conforming_strings = on",
+		"alter role app set standard_conforming_strings = off",
+		"alter role app in database d set standard_conforming_strings to off",
+		"alter role all set standard_conforming_strings = off",
+		"select set_config('standard_conforming_strings', 'off', true)",
+		"select pg_catalog.set_config('standard_conforming_strings', 'off', false)",
+		"update orders set note = set_config('standard_conforming_strings','off',true) where tenant_id = 1",
+	} {
+		pl, err := New().Plan(context.Background(), session(snap), sql)
+		if err == nil || pl.Kind != Refuse {
+			t.Fatalf("%s: expected refusal, got %+v %v", sql, pl, err)
+		}
+		var pe *pgwire.Error
+		if !errors.As(err, &pe) || pe.Code != pgwire.CodeInsufficientPrivilege {
+			t.Fatalf("%s: want SQLSTATE %s, got %v", sql, pgwire.CodeInsufficientPrivilege, err)
+		}
+		if !strings.Contains(pe.Hint, "standard_conforming_strings") {
+			t.Fatalf("%s: the hint must say which setting and why: %q", sql, pe.Hint)
+		}
+	}
+	// Restoring the forced default stays allowed, as it does for every
+	// other protected setting.
+	for _, sql := range []string{
+		"reset standard_conforming_strings",
+		"set standard_conforming_strings to default",
+		"alter role app reset standard_conforming_strings",
+	} {
+		if _, err := New().Plan(context.Background(), session(snap), sql); err != nil {
+			t.Fatalf("%s refused: %v", sql, err)
+		}
+	}
+}

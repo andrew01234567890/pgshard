@@ -205,6 +205,7 @@ func Derive(in Input) (Settings, error) {
 	must("track_commit_timestamp", "on", "commit timestamps are needed for conflict resolution")
 	must("max_slot_wal_keep_size", human(slotKeep), slotReason)
 	must("idle_replication_slot_timeout", "24h", "drop abandoned slots before they fill the disk")
+	must("standard_conforming_strings", "on", "the router parses shard keys out of string literals with it on; a shard that read them differently would hold rows the router looks for elsewhere")
 	must("password_encryption", "scram-sha-256", "no md5 passwords")
 	must("ssl", "on", "TLS between every process")
 
