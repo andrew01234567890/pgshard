@@ -274,13 +274,6 @@ func (c *fakeConn) Query(_ context.Context, sql string, args ...any) (pgx.Rows, 
 		return &stringRows{vals: c.f.sweepDrops}, nil
 	}
 	name, _ := args[0].(string)
-	if strings.Contains(sql, "WHERE i.indisvalid") {
-		c.f.mu.Lock()
-		c.f.ran[c.id] = append(c.f.ran[c.id], "check index_valid "+name)
-		c.f.mu.Unlock()
-		v := c.f.check != nil && c.f.check(c.id, "index_valid", "", name)
-		return &boolRows{vals: []bool{v}}, nil
-	}
 	if len(args) == 3 || len(args) == 4 {
 		table, _ := args[0].(string)
 		obj, _ := args[2].(string)
@@ -332,6 +325,8 @@ func checkKind(sql string) string {
 		return "constraint_valid"
 	case strings.Contains(sql, "conname = $3"):
 		return "constraint"
+	case strings.Contains(sql, "i.indisvalid"):
+		return "index_valid"
 	case strings.Contains(sql, "inhdetachpending"):
 		return "detach_pending"
 	case strings.Contains(sql, "pg_inherits"):
@@ -983,7 +978,7 @@ func TestApplierRunsMultistepStepsInOrderEachUnderItsOwnTransaction(t *testing.T
 		"BEGIN", pkSteps()[0].SQL, "COMMIT",
 		"SET lock_timeout = '2000ms'", "SET ROLE \"app\"", "check notnull_valid t id",
 		"BEGIN", pkSteps()[1].SQL, "COMMIT",
-		"SET lock_timeout = '2000ms'", "SET ROLE \"app\"", "check index_valid t_pkey",
+		"SET lock_timeout = '2000ms'", "SET ROLE \"app\"", "check index_valid t t_pkey",
 		pkSteps()[2].SQL,
 		"SET lock_timeout = '2000ms'", "SET ROLE \"app\"", "check constraint t t_pkey",
 		"BEGIN", pkSteps()[3].SQL, "COMMIT",
