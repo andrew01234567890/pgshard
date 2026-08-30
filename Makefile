@@ -7,7 +7,7 @@ LDFLAGS  := -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
             -X $(MODULE)/internal/buildinfo.Date=$(DATE)
 CMDS     := $(notdir $(wildcard cmd/*))
 
-.PHONY: build vet fmt-check lint test verify clean proto proto-lint proto-breaking pgparser-sync pgparser-proto
+.PHONY: build vet fmt-check lint test verify gates tools proto-drift govulncheck actionlint clean proto proto-lint proto-breaking pgparser-sync pgparser-proto
 
 build:
 	@mkdir -p bin
@@ -30,7 +30,33 @@ test: PGSHARD_TEST_PG_PARALLEL ?= 4
 test:
 	PGSHARD_TEST_PG_PARALLEL=$(PGSHARD_TEST_PG_PARALLEL) go test -race -p 4 ./...
 
+# verify is the fast gate: everything that needs only Go, a C compiler and
+# the pinned linters. It deliberately does not run the gates that need a
+# Kubernetes control plane, Docker images or a network, so it can be fast
+# enough to run before every push -- `make gates` is the whole set, and
+# docs/guide/testing.md says which tier a change needs.
 verify: fmt-check vet lint proto-lint test build
+	@echo "verify: fast gate passed. Not run here: envtest, e2e, generated-code drift, govulncheck, workflow policy. See 'make gates'."
+
+# gates runs every check CI gates a pull request on except the secret scan,
+# which runs as a GitHub action over the repository history.
+gates: verify envtest proto-drift govulncheck actionlint
+
+tools:
+	hack/tools/install.sh
+
+proto-drift: proto
+	@if ! git diff --exit-code -- internal/gen; then \
+		echo "internal/gen is out of date; run 'make proto' and commit the result"; exit 1; \
+	fi
+
+govulncheck:
+	govulncheck ./...
+
+actionlint:
+	actionlint -color
+	hack/check-actions.sh
+	hack/test-check-actions.sh
 
 clean:
 	rm -rf bin dist
