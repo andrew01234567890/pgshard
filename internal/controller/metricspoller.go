@@ -44,7 +44,6 @@ func (p *MetricsPoller) Refresh(ctx context.Context) error {
 		return err
 	}
 	m.Workflows.Reset()
-	var paused float64
 	for rows.Next() {
 		var kind, state string
 		var n int64
@@ -53,15 +52,35 @@ func (p *MetricsPoller) Refresh(ctx context.Context) error {
 			return err
 		}
 		m.Workflows.WithLabelValues(kind, state).Set(float64(n))
-		if state == StatePaused {
-			paused += float64(n)
-		}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	m.CutoverPaused.Set(paused)
+
+	// A configured cutover pause holds a workflow that is still running --
+	// only an operator pauses the workflow itself -- so counting the ones
+	// in state paused reported a manual pause at any stage and never the
+	// automatic gate this is named for. A workflow that reaches a pause is
+	// one line here, carrying enough to say which one it is.
+	rows, err = p.Pool.Query(ctx, `SELECT kind, coalesce(spec->>'shard_set', ''), id::text, status->'cutover'->>'pause'
+		FROM pgshard.workflows WHERE state = $1 AND status->'cutover'->>'pause' IS NOT NULL`, StateRunning)
+	if err != nil {
+		return err
+	}
+	m.CutoverPaused.Reset()
+	for rows.Next() {
+		var kind, set, id, pause string
+		if err := rows.Scan(&kind, &set, &id, &pause); err != nil {
+			rows.Close()
+			return err
+		}
+		m.CutoverPaused.WithLabelValues(kind, set, id, pause).Set(1)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
 
 	rows, err = p.Pool.Query(ctx, `SELECT kind, id::text,
 		       CASE WHEN coalesce((status->'progress'->>'tables_total')::float8, 0) > 0
