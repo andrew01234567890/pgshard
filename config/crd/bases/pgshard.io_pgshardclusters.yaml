@@ -58,6 +58,14 @@ spec:
                   enabled:
                     default: true
                     type: boolean
+                  insecureNoAuth:
+                    description: |-
+                      InsecureNoAuth serves the admin to anything that can reach its
+                      Service. It has no mutations, but everything it shows -- topology,
+                      backup and restore state, stream positions, two-phase commit
+                      identifiers, the text of DDL -- is operational detail about the
+                      cluster, so it is credentialed unless this says otherwise.
+                    type: boolean
                 type: object
               backup:
                 description: BackupSpec links the cluster to a PgShardBackupPolicy.

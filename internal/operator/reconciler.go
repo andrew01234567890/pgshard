@@ -273,7 +273,11 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	if err := r.reconcileAdmin(ctx, &cluster); err != nil {
-		return ctrl.Result{}, fmt.Errorf("admin: %w", err)
+		// The admin is an accessory: a credential somebody pre-created
+		// with the wrong key, or an image that will not pull, must not
+		// stop the router, the shard status and the conditions from being
+		// reconciled.
+		log.Error(err, "admin reconciliation failed; the rest of the cluster keeps reconciling")
 	}
 	if err := r.reconcileRouter(ctx, &cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("router: %w", err)
@@ -361,6 +365,46 @@ func (r *ClusterReconciler) ensureSecret(ctx context.Context, c *pgshardv1alpha1
 		return "", err
 	}
 	return pw, nil
+}
+
+// ensureAdminSecret generates the credential the admin API requires. It is
+// the cluster's own, not the superuser's: reading the admin is not being
+// able to write to PostgreSQL, and a token that could do both would make the
+// weaker surface the way to the stronger one.
+func (r *ClusterReconciler) ensureAdminSecret(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) (string, error) {
+	key := types.NamespacedName{Namespace: c.Namespace, Name: AdminSecretName(c.Name)}
+	var sec corev1.Secret
+	err := r.Get(ctx, key, &sec)
+	if err == nil {
+		// A Secret somebody else made is likely to follow the basic-auth
+		// convention, whose key is password. Take either, and tell the
+		// caller which so the mount can name the file the admin expects.
+		for _, k := range []string{adminSecretKey, "password"} {
+			if len(sec.Data[k]) > 0 {
+				return k, nil
+			}
+		}
+		return "", fmt.Errorf("secret %s has neither a %q nor a \"password\" key", key.Name, adminSecretKey)
+	}
+	if !apierrors.IsNotFound(err) {
+		return "", err
+	}
+	buf := make([]byte, 24)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	sec = corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace, Labels: map[string]string{LabelCluster: c.Name}},
+		Type:       corev1.SecretTypeBasicAuth,
+		StringData: map[string]string{"username": "admin", adminSecretKey: hex.EncodeToString(buf)},
+	}
+	if err := controllerutil.SetControllerReference(c, &sec, r.Scheme()); err != nil {
+		return "", err
+	}
+	if err := r.Create(ctx, &sec); err != nil && !apierrors.IsAlreadyExists(err) {
+		return "", err
+	}
+	return adminSecretKey, nil
 }
 
 func (r *ClusterReconciler) ensureMemberRBAC(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) error {

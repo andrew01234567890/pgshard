@@ -328,13 +328,21 @@ func TestNotifierCoalescesAndUnsubscribes(t *testing.T) {
 }
 
 func TestParseFlags(t *testing.T) {
-	o, err := ParseFlags([]string{"--listen", ":9000", "--namespace", "x", "--catalog-dsn", "postgres://c/x", "--kubeconfig", "kc"}, io.Discard)
-	if err != nil || o.Listen != ":9000" || o.Namespace != "x" || o.CatalogDSN != "postgres://c/x" || o.Kubeconfig != "kc" {
+	o, err := ParseFlags([]string{"--listen", ":9000", "--namespace", "x", "--catalog-dsn", "postgres://c/x", "--kubeconfig", "kc", "--token-file", "/etc/t"}, io.Discard)
+	if err != nil || o.Listen != ":9000" || o.Namespace != "x" || o.CatalogDSN != "postgres://c/x" || o.Kubeconfig != "kc" || o.TokenFile != "/etc/t" {
 		t.Fatalf("%+v %v", o, err)
 	}
-	o, err = ParseFlags(nil, io.Discard)
-	if err != nil || o.Listen != ":8081" || o.Namespace != "" {
+	o, err = ParseFlags([]string{"--insecure-no-auth"}, io.Discard)
+	if err != nil || o.Listen != ":8081" || o.Namespace != "" || !o.InsecureNoAuth {
 		t.Fatalf("defaults: %+v %v", o, err)
+	}
+	// Serving the cluster's operational detail to anyone who can reach it
+	// is a choice, so it has to be made rather than fallen into.
+	if _, err := ParseFlags(nil, io.Discard); err == nil {
+		t.Fatal("neither a token nor the explicit no-auth flag must be rejected")
+	}
+	if _, err := ParseFlags([]string{"--token-file", "/etc/t", "--insecure-no-auth"}, io.Discard); err == nil {
+		t.Fatal("a token and no-auth together must be rejected")
 	}
 	if _, err := ParseFlags([]string{"extra"}, io.Discard); err == nil {
 		t.Fatal("positional argument must be rejected")

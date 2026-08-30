@@ -332,6 +332,9 @@ func catalogGroupAt(c *pgshardv1alpha1.PgShardCluster, gen int64, major int) Gro
 // SecretName is the Secret holding the superuser password.
 func SecretName(cluster string) string { return cluster + "-superuser" }
 
+// AdminSecretName holds the credential the admin API requires.
+func AdminSecretName(cluster string) string { return cluster + "-admin" }
+
 // MemberServiceAccount names the ServiceAccount (and Role, RoleBinding) the
 // member agents run under.
 func MemberServiceAccount(cluster string) string { return cluster + "-member" }
