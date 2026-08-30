@@ -390,6 +390,13 @@ func TestReshardCopyOnPostgres(t *testing.T) {
 	if strings.Contains(msg, "prepared") {
 		t.Fatalf("still blocked: %s", msg)
 	}
+	// Whatever the copy is waiting on, the status names the database as
+	// well as the subscription: the subscription name carries the target
+	// and source shards but not the database, and the same table names
+	// exist in each of them.
+	if strings.Contains(msg, "pgshard_reshard_") && !strings.Contains(msg, "app/pgshard_reshard_") {
+		t.Fatalf("a subscription is named without its database: %s", msg)
+	}
 
 	// A restarted controller re-drives the workflow from the catalogs alone.
 	f.copier = &Copier{Pool: f.pool, Shards: f.dialer, Schema: f.materializer(), SourceConnInfo: f.connInfo, LagBytes: 1 << 20, Resolver: f.copier.Resolver}
