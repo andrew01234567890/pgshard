@@ -140,6 +140,7 @@ func (r *BackupPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 	meta.SetStatusCondition(&pol.Status.Conditions, valid)
 	r.setBarrierHealthy(&pol)
+	meta.SetStatusCondition(&pol.Status.Conditions, repositoryEncryption(&pol))
 
 	clusters, err := clustersOfPolicy(ctx, r.Client, req.NamespacedName)
 	if err != nil {
@@ -213,6 +214,40 @@ func lastSuccessful(backups []pgshardv1alpha1.PgShardBackup) map[string]*metav1.
 		}
 	}
 	return out
+}
+
+// ConditionRepositoryEncrypted says whether the repository this policy
+// writes is encrypted. A backup is a complete copy of every tenant's
+// database, so whether it is readable by whoever holds the bucket is worth
+// stating on the object rather than leaving to be inferred from a spec
+// field that may not be set.
+const ConditionRepositoryEncrypted = "RepositoryEncrypted"
+
+func repositoryEncryption(pol *pgshardv1alpha1.PgShardBackupPolicy) metav1.Condition {
+	cond := metav1.Condition{Type: ConditionRepositoryEncrypted, Status: metav1.ConditionTrue,
+		Reason: "Encrypted", Message: "the repository is encrypted with aes-256-cbc", ObservedGeneration: pol.Generation}
+	// What the members are archiving with is the accepted spec, not the
+	// spec: an edit that does not validate never reaches them. Reporting
+	// the spec would say a repository is encrypted while every member is
+	// still writing it in the clear.
+	store := pol.Spec.ObjectStore
+	if pol.Status.Accepted != nil {
+		store = pol.Status.Accepted.ObjectStore
+	}
+	switch {
+	case store.Encryption.SecretRef != nil:
+		return cond
+	case store.Type == "posix":
+		cond.Reason, cond.Message = "LocalRepository", "a posix repository is a volume of this cluster's own and is not encrypted by pgshard"
+		cond.Status = metav1.ConditionFalse
+	default:
+		cond.Status, cond.Reason = metav1.ConditionFalse, "Unencrypted"
+		// Not "set encryption.secretRef": pgBackRest fixes a repository's
+		// cipher when the stanza is created, so turning encryption on over
+		// an existing repository stops it being readable at all.
+		cond.Message = "the repository holds a complete copy of every database in the clear; a repository already written this way cannot be encrypted in place, so encrypt a new one (a new objectStore.prefix) or keep this one and say so with objectStore.insecureUnencrypted"
+	}
+	return cond
 }
 
 // ConditionBarrierHealthy reports whether the last scheduled barrier of a

@@ -34,6 +34,7 @@ import (
 // +kubebuilder:validation:XValidation:rule="(!has(self.endpoint) || !(self.endpoint.contains('\\n') || self.endpoint.contains('\\r') || self.endpoint.contains('=')))",message="endpoint must not contain a newline, a carriage return or an equals sign"
 // +kubebuilder:validation:XValidation:rule="(!has(self.region) || !(self.region.contains('\\n') || self.region.contains('\\r') || self.region.contains('=')))",message="region must not contain a newline, a carriage return or an equals sign"
 // +kubebuilder:validation:XValidation:rule="(!has(self.prefix) || !(self.prefix.contains('\\n') || self.prefix.contains('\\r') || self.prefix.contains('=')))",message="prefix must not contain a newline, a carriage return or an equals sign"
+// +kubebuilder:validation:XValidation:rule="self.type == 'posix' || (has(self.insecureUnencrypted) && self.insecureUnencrypted) || (has(self.encryption) && has(self.encryption.secretRef))",message="a remote repository must set encryption.secretRef, or insecureUnencrypted to store every tenant's data in the clear on purpose"
 type ObjectStoreSpec struct {
 	// +kubebuilder:validation:Enum=s3;azure;gcs;posix;sftp
 	Type string `json:"type"`
@@ -72,6 +73,13 @@ type ObjectStoreSpec struct {
 	// repository with aes-256-cbc.
 	// +optional
 	Encryption SecretRefSpec `json:"encryption,omitempty"`
+	// InsecureUnencrypted stores the repository in the clear. A backup is a
+	// complete copy of every tenant's data, and a remote store is somewhere
+	// else's disk, so encryption is required for one unless this says
+	// otherwise -- the same shape as internalTLS.insecure. A posix
+	// repository is a PVC of this cluster's own and is exempt.
+	// +optional
+	InsecureUnencrypted bool `json:"insecureUnencrypted,omitempty"`
 	// SFTP holds the host settings of an sftp store.
 	// +optional
 	SFTP *SFTPStoreSpec `json:"sftp,omitempty"`
