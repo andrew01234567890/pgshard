@@ -201,12 +201,20 @@ type CopyProgress struct {
 	// bounded by BlockerSamples so the status stays a fixed size however
 	// many tables a workflow moves.
 	Blockers []string `json:"blockers,omitempty"`
+	// LagFrom names the subscription LagBytes came from. The lag is a
+	// maximum over every subscription of every database, and a number
+	// with no owner sends an operator to query the subscription views on
+	// each target to find out which one it is.
+	LagFrom string `json:"lag_from,omitempty"`
 }
 
 // Describe renders the progress for a status message, naming the blockers
 // when there are any.
 func (p CopyProgress) Describe() string {
 	s := fmt.Sprintf("%d/%d tables ready, lag %d bytes", p.TablesReady, p.TablesTotal, p.LagBytes)
+	if p.LagFrom != "" {
+		s += " on " + p.LagFrom
+	}
 	if p.Enumerating > 0 {
 		s += fmt.Sprintf("; %d subscriptions have no tables yet", p.Enumerating)
 	}
@@ -245,9 +253,9 @@ func Aggregate(reports []SubscriptionProgress) CopyProgress {
 		switch {
 		case p.LagBytes == LagUnknown:
 		case r.LagBytes == LagUnknown:
-			p.LagBytes = LagUnknown
+			p.LagBytes, p.LagFrom = LagUnknown, r.Name
 		case r.LagBytes > p.LagBytes:
-			p.LagBytes = r.LagBytes
+			p.LagBytes, p.LagFrom = r.LagBytes, r.Name
 		}
 		if !r.Enabled {
 			p.Paused++

@@ -172,6 +172,9 @@ type Controller struct {
 	// only undecided rows, say nothing about it.
 	Decided          *prometheus.GaugeVec
 	DecidedOldestAge *prometheus.GaugeVec
+	// WorkflowStepAge is how long each running workflow has been on its
+	// current cutover step.
+	WorkflowStepAge *prometheus.GaugeVec
 	// ResolverUnresolved is what the last resolver pass could not settle:
 	// decisions it could not finish, shards it could not search, and a
 	// failed orphan sweep.
@@ -201,6 +204,9 @@ func NewController(reg *prometheus.Registry) *Controller {
 		DecidedOldestAge: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "pgshard_controller_decided_oldest_age_seconds",
 			Help: "Age since the decision of the oldest unfinished decided transaction, by decision."}, []string{"decision"}),
+		WorkflowStepAge: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "pgshard_controller_workflow_step_age_seconds",
+			Help: "How long a running workflow has been on its current cutover step."}, []string{"kind", "id", "stage", "step"}),
 		ResolverUnresolved: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "pgshard_controller_resolver_unresolved",
 			Help: "Transactions, shard scans and sweeps the last resolver pass could not settle."}),
@@ -210,7 +216,7 @@ func NewController(reg *prometheus.Registry) *Controller {
 			Name: "pgshard_controller_resolved_transactions_total", Help: "In-doubt transactions the resolver finished, by outcome."}, []string{"outcome"}),
 	}
 	reg.MustRegister(m.Workflows, m.WorkflowProgress, m.CutoverPaused, m.InDoubt, m.InDoubtOldestAge,
-		m.Decided, m.DecidedOldestAge, m.ResolverUnresolved, m.Migrations, m.ResolvedTxns)
+		m.Decided, m.DecidedOldestAge, m.WorkflowStepAge, m.ResolverUnresolved, m.Migrations, m.ResolvedTxns)
 	return m
 }
 

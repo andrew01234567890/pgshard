@@ -109,6 +109,11 @@ type cutoverState struct {
 	// pass refreshes updated_at, so a step that has failed for hours is
 	// indistinguishable from a healthy running workflow without this.
 	StepSince *time.Time `json:"step_since,omitempty"`
+	// StepRetries counts the passes the current step has failed. Before
+	// the journal a step gives up; after it there is nothing to do but
+	// retry, so this and StepSince are the only measure of a step that is
+	// getting nowhere.
+	StepRetries int `json:"step_retries,omitempty"`
 	// Schema fingerprints both sets at the switch, keyed set/shard/database.
 	// Logical replication carries no DDL, so a rollback has to prove the
 	// sources were not left structurally behind while they were idle.
@@ -119,7 +124,14 @@ type cutoverState struct {
 // stampStep records when the current step was entered.
 func (s *cutoverState) stampStep(now time.Time) {
 	t := now
-	s.StepSince = &t
+	s.StepSince, s.StepRetries = &t, 0
+}
+
+// stalled reports whether the current step has been going nowhere long
+// enough to be worth an operator's attention rather than a line in a log
+// nobody reads.
+func (s *cutoverState) stalled(now time.Time) bool {
+	return s.StepSince != nil && now.Sub(*s.StepSince) >= stalledAfter
 }
 
 // stalledFor renders how long the current step has been retrying, once that
@@ -362,6 +374,16 @@ func (c *Copier) switchWrites(ctx context.Context, wf *copyWorkflow, ops cutover
 				return c.abandonSwitch(ctx, wf, ops, err.Error())
 			}
 			if !beforeJournal(step) {
+				// Nothing undoes a step past the journal, so the only
+				// honest report is how long it has been failing and how
+				// often. Saving it here also means a stalled switch reads
+				// as one in the catalog, not as a workflow updated a
+				// moment ago.
+				wf.cutover.StepRetries++
+				msg := fmt.Sprintf("switching: step %s failed %d time(s): %v", step, wf.cutover.StepRetries, err)
+				if serr := c.saveCutover(ctx, wf, msg+wf.cutover.stalledFor(c.now())); serr != nil {
+					return false, serr
+				}
 				return false, err
 			}
 			if !errors.Is(err, errRetry) {

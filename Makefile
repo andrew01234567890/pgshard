@@ -75,7 +75,7 @@ proto-breaking:
 		echo "proto-breaking: no proto files on main, skipping"; \
 	fi
 
-.PHONY: kind-up kind-down e2e perf-bench admin-image deploy-admin undeploy-admin
+.PHONY: kind-up kind-down e2e integration perf-bench admin-image deploy-admin undeploy-admin
 
 kind-up:
 	hack/kind/up.sh
@@ -85,6 +85,19 @@ kind-down:
 
 e2e:
 	go test -tags e2e -count=1 -v ./test/e2e/...
+
+# integration runs the suites that need Docker and the PostgreSQL image but
+# not Kubernetes: the router system tests against a real pooler and real
+# servers, the agent's lifecycle and backup suites, and the live check that
+# every setting pgtune renders exists on the server it renders for.
+#
+# They carry their own build tag, and for a long time nothing ran them --
+# not this Makefile and not any workflow -- which is how a live test that
+# could never pass, and refusal messages that had changed underneath their
+# assertions, went unnoticed. The timeout is the suite's, not Go's ten
+# minutes: the router suite alone takes longer than that.
+integration:
+	PGSHARD_REQUIRE_DOCKER=1 go test -tags integration -count=1 -timeout 45m ./test/e2e/router/... ./internal/agent/... ./internal/pgtune/...
 
 perf-bench:
 	hack/perf/benchstat.sh $(PERF_BASE_REF) $(PERF_OUT_DIR)

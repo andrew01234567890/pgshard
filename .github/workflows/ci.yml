@@ -123,6 +123,31 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - run: make govulncheck
 
+  integration:
+    name: Integration (router, agent, pgtune)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # A missing image must fail this job rather than skip its tests: a
+      # suite that silently ran nothing is what this job exists to end.
+      PGSHARD_REQUIRE_DOCKER: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Build the PostgreSQL image the suites run against
+        uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7.3.0
+        with:
+          source: .
+          targets: postgres-18
+          load: true
+        env:
+          CI: "true"
+      - run: make integration
+
   secret-scan:
     name: Secret scan
     runs-on: ubuntu-latest

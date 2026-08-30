@@ -321,17 +321,24 @@ func (r *Resolver) resolveDecision(ctx context.Context, d decision, holders map[
 // finishes a prepared transaction from the database it was prepared in, so
 // the connection targets h's database, not the DSN's default one.
 func (r *Resolver) finishOn(ctx context.Context, h holder, commit bool, gid string) error {
-	conn, err := r.Shards.DialDatabase(ctx, h.Shard.Set, h.Shard.ID, h.Database)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = conn.Close(ctx) }()
 	verb := "ROLLBACK PREPARED"
 	if commit {
 		verb = "COMMIT PREPARED"
 	}
-	_, err = conn.Exec(ctx, verb+" "+quoteLiteral(gid))
-	return err
+	// Shard ids repeat across shard sets, and PostgreSQL will only finish a
+	// prepared transaction from the database it was prepared in, so an
+	// error naming neither leaves an operator to search every set and
+	// database for the participant that would not budge.
+	where := fmt.Sprintf("%s on %s/%d database %q", verb, h.Shard.Set, h.Shard.ID, h.Database)
+	conn, err := r.Shards.DialDatabase(ctx, h.Shard.Set, h.Shard.ID, h.Database)
+	if err != nil {
+		return fmt.Errorf("%s: %w", where, err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if _, err := conn.Exec(ctx, verb+" "+quoteLiteral(gid)); err != nil {
+		return fmt.Errorf("%s: %w", where, err)
+	}
+	return nil
 }
 
 // sweepOrphans finishes the remaining prepared transactions no decision
@@ -430,6 +437,43 @@ type PgxShardDialer struct {
 	Pool     *pgxpool.Pool
 	DSNs     map[ShardRef]string
 	Template string
+
+	// groups caches the group name a template DSN needs. A copy pass dials
+	// each source and target of each database several times every few
+	// seconds, and each template dial asked the catalog for a name that
+	// almost never changes -- so the catalog's read load grew with the
+	// square of the topology for a lookup that is nearly constant.
+	//
+	// "Almost never" is why this is a cache and not a field read once: the
+	// operator's upsert does set group_name, so a rebuilt or renamed group
+	// can change it. A dial that fails forgets the entry and tries again
+	// with a fresh lookup, so a stale name costs one failed connection
+	// rather than a wedged workflow.
+	groupMu sync.Mutex
+	groups  map[ShardRef]string
+}
+
+func (d *PgxShardDialer) cachedGroup(ref ShardRef) (string, bool) {
+	d.groupMu.Lock()
+	defer d.groupMu.Unlock()
+	g, ok := d.groups[ref]
+	return g, ok
+}
+
+func (d *PgxShardDialer) rememberGroup(ref ShardRef, group string) {
+	d.groupMu.Lock()
+	defer d.groupMu.Unlock()
+	if d.groups == nil {
+		d.groups = map[ShardRef]string{}
+	}
+	d.groups[ref] = group
+}
+
+// forgetGroup drops a cached name after a dial that used it failed.
+func (d *PgxShardDialer) forgetGroup(ref ShardRef) {
+	d.groupMu.Lock()
+	defer d.groupMu.Unlock()
+	delete(d.groups, ref)
 }
 
 // Dial implements ShardDialer.
@@ -437,18 +481,26 @@ func (d *PgxShardDialer) Dial(ctx context.Context, shardSet string, shardID int3
 	return d.DialDatabase(ctx, shardSet, shardID, "")
 }
 
-func (d *PgxShardDialer) dsn(ctx context.Context, shardSet string, shardID int32) (string, error) {
-	if dsn, ok := d.DSNs[ShardRef{Set: shardSet, ID: shardID}]; ok {
-		return dsn, nil
+// dsn returns the DSN of one shard, and whether it came from the group
+// cache -- a caller that then fails to connect uses that to decide whether
+// the name is worth forgetting.
+func (d *PgxShardDialer) dsn(ctx context.Context, shardSet string, shardID int32) (dsn string, cached bool, err error) {
+	ref := ShardRef{Set: shardSet, ID: shardID}
+	if dsn, ok := d.DSNs[ref]; ok {
+		return dsn, false, nil
 	}
 	if d.Template == "" {
-		return "", fmt.Errorf("no DSN for shard %s/%d", shardSet, shardID)
+		return "", false, fmt.Errorf("no DSN for shard %s/%d", shardSet, shardID)
+	}
+	if group, ok := d.cachedGroup(ref); ok {
+		return ExpandShardTemplate(d.Template, shardSet, shardID, group), true, nil
 	}
 	group, err := GroupName(ctx, d.Pool, shardSet, shardID)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	return ExpandShardTemplate(d.Template, shardSet, shardID, group), nil
+	d.rememberGroup(ref, group)
+	return ExpandShardTemplate(d.Template, shardSet, shardID, group), false, nil
 }
 
 // GroupName reads the shard_status group name of one shard.

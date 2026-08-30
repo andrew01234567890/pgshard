@@ -1,8 +1,10 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -68,6 +70,9 @@ type flakyDialer struct {
 	inner *PgxShardDialer
 	down  int32
 	dials atomic.Int32
+	// downDatabase fails only the connections opened to finish a prepared
+	// transaction, which are the only ones that name a database.
+	downDatabase string
 }
 
 func (d *flakyDialer) Dial(ctx context.Context, set string, id int32) (ShardConn, error) {
@@ -82,6 +87,9 @@ func (d *flakyDialer) DialDatabase(ctx context.Context, set string, id int32, da
 	d.dials.Add(1)
 	if id == d.down {
 		return nil, fmt.Errorf("shard %s/%d unreachable", set, id)
+	}
+	if database != "" && database == d.downDatabase {
+		return nil, fmt.Errorf("database %q unreachable", database)
 	}
 	return d.inner.DialDatabase(ctx, set, id, database)
 }
@@ -517,6 +525,42 @@ func TestResolverSweepContinuesPastGonePreparedXact(t *testing.T) {
 	}
 }
 
+// TestAnUnfinishedParticipantIsNamed: shard ids repeat across shard sets
+// and PostgreSQL finishes a prepared transaction only from the database it
+// was prepared in, so a resolver failure that named neither left an
+// operator searching every set and database for the participant that would
+// not budge.
+func TestAnUnfinishedParticipantIsNamed(t *testing.T) {
+	parallelPG(t)
+	f := newResolverFixture(t)
+	ctx := context.Background()
+	mustExec(t, connect(t, f.shardDSN(0)), "CREATE DATABASE appdb")
+	f.prepareIn(0, "appdb", "pgshard-x-1-1", "stuck")
+	f.decide("pgshard-x-1-1", "commit", 0, 0)
+
+	var log bytes.Buffer
+	f.res.Logger = slog.New(slog.NewTextHandler(&log, nil))
+	f.dialer.downDatabase = "appdb"
+
+	out, err := f.res.Resolve(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The decision pass fails to finish it, and the orphan sweep then
+	// fails on the same prepared transaction, so both count.
+	if out.Unresolved == 0 || out.Committed != 0 {
+		t.Fatalf("outcome %+v, want the commit left unresolved", out)
+	}
+	if got := f.decisions(); len(got) != 1 {
+		t.Fatalf("a decision the resolver could not finish must be kept: %v", got)
+	}
+	for _, want := range []string{"COMMIT PREPARED", "default/0", `database \"appdb\"`, "pgshard-x-1-1"} {
+		if !strings.Contains(log.String(), want) {
+			t.Fatalf("the resolver warning does not say %s:\n%s", want, log.String())
+		}
+	}
+}
+
 // TestAFinishedDecisionIsPrunedBeforeItsXidFreezes: a decision row that
 // outlives the transaction it decided becomes unverifiable once its
 // transaction id freezes past the clog horizon, and a restore then fences
@@ -546,5 +590,70 @@ func TestAFinishedDecisionIsPrunedBeforeItsXidFreezes(t *testing.T) {
 	}
 	if got := f.decisions(); len(got) != 0 {
 		t.Fatalf("decision rows left to freeze: %v", got)
+	}
+}
+
+// TestTemplateDialAsksForAGroupNameOnce: a copy pass dials every source and
+// target of every database several times every few seconds, and each
+// template dial asked the catalog for a group name that almost never
+// changes. The name is cached; a dial that fails while using a cached name
+// forgets it, so a group that really was renamed costs one failed
+// connection rather than a wedged workflow.
+func TestTemplateDialAsksForAGroupNameOnce(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	f := newResolverFixture(t)
+	ref := ShardRef{Set: "default", ID: 0}
+	d := &PgxShardDialer{Pool: f.pool, Template: "postgres://nobody@127.0.0.1:1/{group}?connect_timeout=1"}
+
+	var group string
+	if err := f.pool.QueryRow(ctx, `SELECT group_name FROM pgshard.shard_status WHERE shard_set = $1 AND shard_id = $2`, ref.Set, ref.ID).Scan(&group); err != nil {
+		t.Fatal(err)
+	}
+	dsn, cached, err := d.dsn(ctx, ref.Set, ref.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached {
+		t.Fatal("the first lookup cannot come from the cache")
+	}
+	if !strings.Contains(dsn, group) {
+		t.Fatalf("dsn %q does not carry the group name %q", dsn, group)
+	}
+
+	// The catalog changes underneath: a cached lookup keeps answering from
+	// the cache, which is the whole point -- it is not asking any more.
+	if _, err := f.pool.Exec(ctx, `UPDATE pgshard.shard_status SET group_name = 'renamed' WHERE shard_set = $1 AND shard_id = $2`, ref.Set, ref.ID); err != nil {
+		t.Fatal(err)
+	}
+	dsn, cached, err = d.dsn(ctx, ref.Set, ref.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cached || !strings.Contains(dsn, group) {
+		t.Fatalf("second lookup: cached=%v dsn=%q, want the cached %q", cached, dsn, group)
+	}
+
+	// Forgetting it is what a failed dial does, and the next lookup reads
+	// the catalog again.
+	d.forgetGroup(ref)
+	dsn, cached, err = d.dsn(ctx, ref.Set, ref.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached || !strings.Contains(dsn, "renamed") {
+		t.Fatalf("after forgetting: cached=%v dsn=%q, want a fresh read of \"renamed\"", cached, dsn)
+	}
+
+	// And a dial that fails while using a cached name forgets it, so the
+	// next attempt re-reads rather than repeating a name that cannot work.
+	d.rememberGroup(ref, "stale")
+	if _, err := d.DialDatabase(ctx, ref.Set, ref.ID, ""); err == nil {
+		t.Fatal("dialing 127.0.0.1:1 must fail")
+	}
+	// The retry re-read the catalog, so the cache now holds the current
+	// name rather than the stale one. What must not survive is "stale".
+	if got, ok := d.cachedGroup(ref); !ok || got != "renamed" {
+		t.Fatalf("cached group after a failed dial = %q (present=%v), want the re-read %q", got, ok, "renamed")
 	}
 }

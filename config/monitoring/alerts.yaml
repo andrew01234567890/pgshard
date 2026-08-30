@@ -91,6 +91,20 @@ spec:
           annotations:
             summary: The operator is failing to reconcile
             description: controller-runtime reconcile errors are persistent; check the operator logs.
+        - alert: PgshardCutoverStepStalled
+          expr: max by (kind, id, stage, step) (pgshard_controller_workflow_step_age_seconds) > 900
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: A cutover step has stopped advancing
+            description: >-
+              {{ $labels.kind }} workflow {{ $labels.id }} has been on step
+              {{ $labels.step }} of {{ $labels.stage }} for more than fifteen
+              minutes. A step past the journal is retried without a timeout or
+              an attempt limit, so writes can stay fenced while the workflow
+              still looks like it is running. Read the controller log for
+              "cutover step is not advancing".
         - alert: PgshardTwoPCDecidedUnfinished
           expr: max by (decision) (pgshard_controller_decided_oldest_age_seconds) > 300
           for: 5m

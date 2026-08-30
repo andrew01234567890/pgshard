@@ -199,3 +199,63 @@ func TestCutoverPausedCountsTheGateAndNotTheState(t *testing.T) {
 		t.Fatalf("cutover pauses reported as %v, want exactly [%s]", samples, want)
 	}
 }
+
+// TestStepAgeIsExportedForARunningCutover: a step past the journal is
+// retried without a timeout or an attempt limit and every pass rewrites
+// updated_at, so nothing outside the catalog distinguished a switch that
+// had been failing for hours from one getting on with it.
+func TestStepAgeIsExportedForARunningCutover(t *testing.T) {
+	parallelPG(t)
+	dsn := startPostgres(t)
+	ctx := context.Background()
+	conn := connect(t, dsn)
+	if err := catalog.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, `INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES
+		('44444444-4444-4444-4444-444444444444', 'reshard', 'running', '{}'::jsonb,
+		 jsonb_build_object('stage', 'switching', 'cutover',
+		   jsonb_build_object('step', 'flip', 'step_since', to_char(now() - interval '20 minutes', 'YYYY-MM-DD"T"HH24:MI:SSOF')))),
+		('55555555-5555-5555-5555-555555555555', 'reshard', 'running', '{}'::jsonb,
+		 '{"stage": "copying"}'::jsonb),
+		('66666666-6666-6666-6666-666666666666', 'reshard', 'completed', '{}'::jsonb,
+		 jsonb_build_object('stage', 'completed', 'cutover',
+		   jsonb_build_object('step', 'flip', 'step_since', to_char(now() - interval '3 hours', 'YYYY-MM-DD"T"HH24:MI:SSOF'))))`)
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	reg := prometheus.NewRegistry()
+	p := &MetricsPoller{Pool: pool, Metrics: metrics.NewController(reg)}
+	if err := p.Refresh(ctx); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	var samples []string
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range families {
+		if f.GetName() != "pgshard_controller_workflow_step_age_seconds" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, l := range m.GetLabel() {
+				labels[l.GetName()] = l.GetValue()
+			}
+			age := m.GetGauge().GetValue()
+			if age < 1150 || age > 1250 {
+				t.Fatalf("step age %v seconds, want about twenty minutes", age)
+			}
+			samples = append(samples, fmt.Sprintf("%s/%s/%s/%s", labels["kind"], labels["id"], labels["stage"], labels["step"]))
+		}
+	}
+	want := "reshard/44444444-4444-4444-4444-444444444444/switching/flip"
+	if len(samples) != 1 || samples[0] != want {
+		t.Fatalf("step ages reported as %v, want exactly [%s]", samples, want)
+	}
+}
