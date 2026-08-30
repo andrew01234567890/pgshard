@@ -59,11 +59,18 @@ Target PostgreSQL versions: 18 and 19.
 ## Building and testing
 
 ```sh
-make verify   # gofmt check, go vet, golangci-lint, go test -race, build all commands into ./bin
+make tools    # install the pinned linters and code generators
+make verify   # the fast gate: gofmt, go vet, golangci-lint, proto lint, go test -race, build
+make gates    # every check CI gates on, except the secret scan
 make build    # build only
 ```
 
-Go 1.26 or newer is required. See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution rules
+Go 1.26 or newer is required, along with a C compiler: the SQL parser is a cgo
+binding to libpg_query. `make verify` is deliberately the fast tier and says so
+when it finishes; the PostgreSQL-backed tests need Docker and the Kubernetes
+tests need envtest assets, and both **skip** when those are missing.
+[docs/guide/testing.md](docs/guide/testing.md) says which tier a change needs
+and how to make the skips fail instead. See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution rules
 (public repository: synthetic data only, no secrets) and [SECURITY.md](SECURITY.md) for reporting
 vulnerabilities.
 

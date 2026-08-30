@@ -107,6 +107,32 @@ func (p *MetricsPoller) Refresh(ctx context.Context) error {
 		return err
 	}
 
+	// A cutover step past the journal has no timeout and no attempt limit,
+	// and every pass rewrites updated_at, so a step that has been failing
+	// for hours looks exactly like a workflow that is getting on with it.
+	// Its age is the difference.
+	rows, err = p.Pool.Query(ctx, `SELECT kind, id::text, coalesce(status->>'stage', ''), coalesce(status->'cutover'->>'step', ''),
+		extract(epoch FROM now() - (status->'cutover'->>'step_since')::timestamptz)
+		FROM pgshard.workflows
+		WHERE state = $1 AND status->'cutover'->>'step_since' IS NOT NULL`, StateRunning)
+	if err != nil {
+		return err
+	}
+	m.WorkflowStepAge.Reset()
+	for rows.Next() {
+		var kind, id, stage, step string
+		var age float64
+		if err := rows.Scan(&kind, &id, &stage, &step, &age); err != nil {
+			rows.Close()
+			return err
+		}
+		m.WorkflowStepAge.WithLabelValues(kind, id, stage, step).Set(age)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
 	// A row survives its decision only while the resolver cannot finish it:
 	// finishing deletes it. So a decided row is not history, it is a
 	// transaction still holding locks, WAL and a vacuum horizon on every

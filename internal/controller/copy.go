@@ -221,7 +221,13 @@ func (c *Copier) Pass(ctx context.Context) (CopyOutcome, error) {
 				}
 				continue
 			}
-			c.logger().Warn("reshard copy pass incomplete", "workflow", wf.id, "err", err)
+			if wf.cutover.stalled(c.now()) {
+				c.logger().Error("cutover step is not advancing", "workflow", wf.id, "stage", wf.stage,
+					"step", wf.cutover.Step, "since", wf.cutover.StepSince, "retries", wf.cutover.StepRetries,
+					"past_journal", wf.cutover.JournalID != "", "err", err)
+			} else {
+				c.logger().Warn("reshard copy pass incomplete", "workflow", wf.id, "err", err)
+			}
 			if serr := c.save(ctx, wf, "", err.Error()); serr != nil {
 				return out, serr
 			}
@@ -947,7 +953,7 @@ func (c *Copier) observe(ctx context.Context, wf *copyWorkflow, srcSet string, s
 			if err != nil {
 				return CopyProgress{}, err
 			}
-			rs, err := subscriptionReports(ctx, conn, wf.gen, t, srcIDs, sourceLSN)
+			rs, err := subscriptionReports(ctx, conn, db.name, wf.gen, t, srcIDs, sourceLSN)
 			_ = conn.Close(ctx)
 			if err != nil {
 				return CopyProgress{}, fmt.Errorf("progress of %s on %s/%d: %w", db.name, wf.set, t, err)
@@ -958,7 +964,11 @@ func (c *Copier) observe(ctx context.Context, wf *copyWorkflow, srcSet string, s
 	return Aggregate(reports), nil
 }
 
-func subscriptionReports(ctx context.Context, conn ShardConn, gen int64, t int32, srcIDs []int32, sourceLSN map[int32]int64) ([]SubscriptionProgress, error) {
+// subscriptionReports reads one database's subscriptions on one target.
+// Every report is named database/subscription: the subscription name
+// carries the target and source shards but not the database, and a copy
+// moves the same table names in each of them.
+func subscriptionReports(ctx context.Context, conn ShardConn, db string, gen int64, t int32, srcIDs []int32, sourceLSN map[int32]int64) ([]SubscriptionProgress, error) {
 	rows, err := conn.Query(ctx, `
 		SELECT s.subname, s.subenabled, coalesce(r.srsubstate, ''), count(r.srrelid),
 		       (SELECT (st.latest_end_lsn - '0/0'::pg_lsn)::bigint FROM pg_stat_subscription st WHERE st.subid = s.oid AND st.relid IS NULL AND st.latest_end_lsn IS NOT NULL LIMIT 1),
@@ -986,7 +996,7 @@ func subscriptionReports(ctx context.Context, conn ShardConn, gen int64, t int32
 		}
 		p := bySub[name]
 		if p == nil {
-			p = &SubscriptionProgress{Name: name, Rels: map[RelState]int{}, Enabled: enabled, LagBytes: LagUnknown}
+			p = &SubscriptionProgress{Name: db + "/" + name, Rels: map[RelState]int{}, Enabled: enabled, LagBytes: LagUnknown}
 			bySub[name] = p
 			if applied != nil && enabled {
 				if lsn, ok := sourceLSN[sourceOf(name, gen, t, srcIDs)]; ok {
