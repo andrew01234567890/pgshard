@@ -857,3 +857,51 @@ func TestRepositoryEncryptionCondition(t *testing.T) {
 		t.Errorf("the message tells an operator to do the thing that breaks an existing repository: %q", got.Message)
 	}
 }
+
+// TestDeletingABackupStopsItsWork: the cancel for a run's context lived
+// inside the goroutine that made it, so nothing outside could stop a
+// backup whose PgShardBackup had been deleted -- it went on issuing agent
+// RPCs until its own timeout, hours later. Worse, a delete the reconciler
+// sees only as a NotFound returned before the bookkeeping, leaving the run
+// in the map for the life of the operator.
+func TestDeletingABackupStopsItsWork(t *testing.T) {
+	for _, tc := range []struct{ name, how string }{
+		{"deleted and gone", "gone"},
+		{"deletion timestamp observed", "terminal"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agents := &fakeBackupAgents{block: make(chan struct{})}
+			r, cl, b := backupFixture(t, agents)
+			if _, got := reconcileBackup(t, r, b); got.Status.Phase != pgshardv1alpha1.BackupPhaseRunning {
+				t.Fatalf("backup did not start: %+v", got.Status)
+			}
+			run := r.run(b.UID)
+			if run == nil {
+				t.Fatal("no run in flight")
+			}
+
+			switch tc.how {
+			case "gone":
+				if err := cl.Delete(context.Background(), b); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(b)}); err != nil {
+					t.Fatal(err)
+				}
+			case "terminal":
+				r.forget(b.UID)
+			}
+
+			// The agent call returns as soon as its context is cancelled,
+			// so a run that is still going is one nothing can stop.
+			select {
+			case <-run.done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the run kept going after its backup was deleted; nothing can stop it until its timeout")
+			}
+			if r.run(b.UID) != nil {
+				t.Fatal("the deleted backup's run is still in the map")
+			}
+		})
+	}
+}

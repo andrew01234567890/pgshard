@@ -43,7 +43,14 @@ type BackupReconciler struct {
 }
 
 type backupRun struct {
-	done   chan struct{}
+	done chan struct{}
+	// cancel stops the work. It used to live inside the goroutine that
+	// created it, so nothing outside could stop a run whose backup had
+	// been deleted: it went on issuing agent RPCs until its own timeout,
+	// hours later. name is how a deletion the reconciler sees only as a
+	// NotFound finds it, the UID having gone with the object.
+	cancel context.CancelFunc
+	name   types.NamespacedName
 	groups []pgshardv1alpha1.GroupBackupStatus
 	// expireErr collects retention failures; they do not fail the backup.
 	expireErr error
@@ -98,7 +105,14 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	log := logf.FromContext(ctx)
 	var b pgshardv1alpha1.PgShardBackup
 	if err := r.Get(ctx, req.NamespacedName, &b); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		if apierrors.IsNotFound(err) {
+			// Deleted and already gone: the UID went with it, so the run
+			// is found by name. Returning here without doing that left
+			// the work running and its entry in the map for ever.
+			r.forgetNamed(req.NamespacedName)
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
 	}
 	if !b.DeletionTimestamp.IsZero() || b.Status.Phase == pgshardv1alpha1.BackupPhaseCompleted || b.Status.Phase == pgshardv1alpha1.BackupPhaseFailed {
 		r.forget(b.UID)
@@ -219,10 +233,33 @@ func (r *BackupReconciler) run(uid types.UID) *backupRun {
 	return r.runs[uid]
 }
 
+// forget drops a run and stops whatever it is still doing.
 func (r *BackupReconciler) forget(uid types.UID) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	run := r.runs[uid]
 	delete(r.runs, uid)
+	r.mu.Unlock()
+	if run != nil && run.cancel != nil {
+		run.cancel()
+	}
+}
+
+// forgetNamed is forget for a backup whose object is gone, so its UID is
+// no longer available to look it up by.
+func (r *BackupReconciler) forgetNamed(name types.NamespacedName) {
+	r.mu.Lock()
+	var found *backupRun
+	for uid, run := range r.runs {
+		if run.name == name {
+			found = run
+			delete(r.runs, uid)
+			break
+		}
+	}
+	r.mu.Unlock()
+	if found != nil && found.cancel != nil {
+		found.cancel()
+	}
 }
 
 func (r *BackupReconciler) start(ctx context.Context, b *pgshardv1alpha1.PgShardBackup, c *pgshardv1alpha1.PgShardCluster, pol *pgshardv1alpha1.PgShardBackupPolicy, targets []backupTarget) error {
@@ -242,7 +279,7 @@ func (r *BackupReconciler) start(ctx context.Context, b *pgshardv1alpha1.PgShard
 	if err := r.Status().Patch(ctx, b, client.MergeFrom(base)); err != nil {
 		return err
 	}
-	run := &backupRun{done: make(chan struct{})}
+	run := &backupRun{done: make(chan struct{}), name: client.ObjectKeyFromObject(b)}
 	r.mu.Lock()
 	if r.runs == nil {
 		r.runs = map[types.UID]*backupRun{}
@@ -254,9 +291,12 @@ func (r *BackupReconciler) start(ctx context.Context, b *pgshardv1alpha1.PgShard
 		baseCtx = context.Background()
 	}
 	log := logf.FromContext(ctx).WithValues("backup", b.Name, "cluster", c.Name)
+	runCtx, cancel := context.WithTimeout(baseCtx, backupRunTimeout)
+	r.mu.Lock()
+	run.cancel = cancel
+	r.mu.Unlock()
 	go func() {
 		defer close(run.done)
-		runCtx, cancel := context.WithTimeout(baseCtx, backupRunTimeout)
 		defer cancel()
 		runCtx = withClusterAgentToken(runCtx, r.Client, c.Namespace, c.Name)
 		for _, t := range targets {
