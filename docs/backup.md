@@ -147,7 +147,9 @@ metadata:
 spec:
   backup:
     policyRef: nightly
-  # ...
+  internalTLS:
+    secretRef: {name: demo-internal-tls}
+  # ... the rest of the cluster spec
 ---
 apiVersion: pgshard.io/v1alpha1
 kind: PgShardBackupPolicy
