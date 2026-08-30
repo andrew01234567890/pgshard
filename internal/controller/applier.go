@@ -646,7 +646,8 @@ func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, key string,
 				// it skipped so a migration where no shard had the object
 				// still fails instead of reporting applied.
 				if m.Scope == "existing" && m.Meta.Object.Expect == "absent" {
-					return "", &skippedError{fmt.Errorf("%s %q is not present on this shard", m.Meta.Object.Kind, m.Meta.Object.Name)}
+					return "", &skippedError{fmt.Errorf("%s %q is not present on this shard, which is also what a DROP this migration completed before it crashed leaves behind",
+						m.Meta.Object.Kind, m.Meta.Object.Name)}
 				}
 				return catalog.ShardApplied, nil
 			}
