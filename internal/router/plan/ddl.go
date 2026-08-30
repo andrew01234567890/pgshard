@@ -81,7 +81,8 @@ type Check struct {
 	Table  string
 	Name   string
 	// NameSchema qualifies Name when it is a partition with an explicit
-	// schema; empty matches any schema.
+	// schema; empty resolves Name through the search_path, as the
+	// statement itself does.
 	NameSchema string
 }
 
