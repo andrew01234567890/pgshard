@@ -1063,7 +1063,7 @@ func shardConnConfig(dsn, database, user, password string) (*pgx.ConnConfig, err
 // DialDatabaseAs implements DatabaseDialer; an empty user keeps the DSN's
 // credentials.
 func (d *PgxShardDialer) DialDatabaseAs(ctx context.Context, shardSet string, shardID int32, database, user, password string) (ShardConn, error) {
-	dsn, err := d.dsn(ctx, shardSet, shardID)
+	dsn, cached, err := d.dsn(ctx, shardSet, shardID)
 	if err != nil {
 		return nil, err
 	}
@@ -1072,6 +1072,21 @@ func (d *PgxShardDialer) DialDatabaseAs(ctx context.Context, shardSet string, sh
 		return nil, fmt.Errorf("shard %s/%d: %w", shardSet, shardID, err)
 	}
 	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil && cached {
+		// The name the DSN was built from came from the cache. A group that
+		// was rebuilt or renamed makes that name wrong, and no amount of
+		// retrying the same address fixes it, so read it again and try once
+		// more before reporting a failure.
+		d.forgetGroup(ShardRef{Set: shardSet, ID: shardID})
+		var derr error
+		if dsn, _, derr = d.dsn(ctx, shardSet, shardID); derr != nil {
+			return nil, fmt.Errorf("shard %s/%d: %w", shardSet, shardID, err)
+		}
+		if cfg, derr = shardConnConfig(dsn, database, user, password); derr != nil {
+			return nil, fmt.Errorf("shard %s/%d: %w", shardSet, shardID, derr)
+		}
+		conn, err = pgx.ConnectConfig(ctx, cfg)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("shard %s/%d: %w", shardSet, shardID, err)
 	}

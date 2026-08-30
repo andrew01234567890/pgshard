@@ -592,3 +592,68 @@ func TestAFinishedDecisionIsPrunedBeforeItsXidFreezes(t *testing.T) {
 		t.Fatalf("decision rows left to freeze: %v", got)
 	}
 }
+
+// TestTemplateDialAsksForAGroupNameOnce: a copy pass dials every source and
+// target of every database several times every few seconds, and each
+// template dial asked the catalog for a group name that almost never
+// changes. The name is cached; a dial that fails while using a cached name
+// forgets it, so a group that really was renamed costs one failed
+// connection rather than a wedged workflow.
+func TestTemplateDialAsksForAGroupNameOnce(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	f := newResolverFixture(t)
+	ref := ShardRef{Set: "default", ID: 0}
+	d := &PgxShardDialer{Pool: f.pool, Template: "postgres://nobody@127.0.0.1:1/{group}?connect_timeout=1"}
+
+	var group string
+	if err := f.pool.QueryRow(ctx, `SELECT group_name FROM pgshard.shard_status WHERE shard_set = $1 AND shard_id = $2`, ref.Set, ref.ID).Scan(&group); err != nil {
+		t.Fatal(err)
+	}
+	dsn, cached, err := d.dsn(ctx, ref.Set, ref.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached {
+		t.Fatal("the first lookup cannot come from the cache")
+	}
+	if !strings.Contains(dsn, group) {
+		t.Fatalf("dsn %q does not carry the group name %q", dsn, group)
+	}
+
+	// The catalog changes underneath: a cached lookup keeps answering from
+	// the cache, which is the whole point -- it is not asking any more.
+	if _, err := f.pool.Exec(ctx, `UPDATE pgshard.shard_status SET group_name = 'renamed' WHERE shard_set = $1 AND shard_id = $2`, ref.Set, ref.ID); err != nil {
+		t.Fatal(err)
+	}
+	dsn, cached, err = d.dsn(ctx, ref.Set, ref.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cached || !strings.Contains(dsn, group) {
+		t.Fatalf("second lookup: cached=%v dsn=%q, want the cached %q", cached, dsn, group)
+	}
+
+	// Forgetting it is what a failed dial does, and the next lookup reads
+	// the catalog again.
+	d.forgetGroup(ref)
+	dsn, cached, err = d.dsn(ctx, ref.Set, ref.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached || !strings.Contains(dsn, "renamed") {
+		t.Fatalf("after forgetting: cached=%v dsn=%q, want a fresh read of \"renamed\"", cached, dsn)
+	}
+
+	// And a dial that fails while using a cached name forgets it, so the
+	// next attempt re-reads rather than repeating a name that cannot work.
+	d.rememberGroup(ref, "stale")
+	if _, err := d.DialDatabase(ctx, ref.Set, ref.ID, ""); err == nil {
+		t.Fatal("dialing 127.0.0.1:1 must fail")
+	}
+	// The retry re-read the catalog, so the cache now holds the current
+	// name rather than the stale one. What must not survive is "stale".
+	if got, ok := d.cachedGroup(ref); !ok || got != "renamed" {
+		t.Fatalf("cached group after a failed dial = %q (present=%v), want the re-read %q", got, ok, "renamed")
+	}
+}
