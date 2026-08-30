@@ -57,6 +57,7 @@ actionlint:
 	actionlint -color
 	hack/check-actions.sh
 	hack/test-check-actions.sh
+	hack/ci/test-retry.sh
 
 clean:
 	rm -rf bin dist

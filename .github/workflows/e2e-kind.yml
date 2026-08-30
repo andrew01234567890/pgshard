@@ -50,6 +50,21 @@ jobs:
           install_only: true
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         if: matrix.suite != 'smoke'
+      - name: Warm the module and base-image caches
+        id: warm_caches
+        # The failures that take a cell down are usually somebody else's
+        # network: a registry answering 403, a module proxy dropping a
+        # stream. Fetching both here, with retries, means the builds that
+        # follow find them locally instead of failing the whole gate on one
+        # HTTP response.
+        run: |
+          set -euo pipefail
+          hack/ci/retry.sh -- go mod download
+          # By digest, as the Dockerfiles pin them: pulling the tag would
+          # warm the cache with an image the build then ignores.
+          awk '/^FROM .*@sha256:/ {print $2}' Dockerfile.control Dockerfile.router | sort -u | while read -r image; do
+            hack/ci/retry.sh -- docker pull "$image"
+          done
       - name: Build PostgreSQL image
         id: build_postgres
         if: matrix.suite != 'smoke'
@@ -64,13 +79,13 @@ jobs:
         id: build_control
         if: matrix.suite != 'smoke'
         run: |
-          docker build -f Dockerfile.control --build-arg CMD=pgshard-operator -t pgshard-operator:e2e .
-          docker build -f Dockerfile.control --build-arg CMD=pgshard-admin -t pgshard-admin:e2e .
-          docker build -f Dockerfile.router -t pgshard-router:e2e .
+          hack/ci/retry.sh -- docker build -f Dockerfile.control --build-arg CMD=pgshard-operator -t pgshard-operator:e2e .
+          hack/ci/retry.sh -- docker build -f Dockerfile.control --build-arg CMD=pgshard-admin -t pgshard-admin:e2e .
+          hack/ci/retry.sh -- docker build -f Dockerfile.router -t pgshard-router:e2e .
       - name: Build controller image
         id: build_controller
         if: startsWith(matrix.suite, 'reshard') || matrix.suite == 'upgrade'
-        run: docker build -f Dockerfile.control --build-arg CMD=pgshard-controller -t pgshard-controller:e2e .
+        run: hack/ci/retry.sh -- docker build -f Dockerfile.control --build-arg CMD=pgshard-controller -t pgshard-controller:e2e .
       - name: Build the target-major PostgreSQL image
         id: build_postgres_target
         if: matrix.suite == 'upgrade'
@@ -83,7 +98,9 @@ jobs:
           CI: "true"
       - name: Create kind cluster
         id: kind_up
-        run: hack/kind/up.sh
+        # A cluster that does not come up leaves nothing worth keeping, and
+        # a second attempt cannot reuse the first one's half-built cluster.
+        run: hack/ci/retry.sh -n 2 -d 15 -c hack/kind/down.sh -- hack/kind/up.sh
       - name: Load images into kind
         id: load_images
         if: matrix.suite != 'smoke'
@@ -124,6 +141,7 @@ jobs:
           PG: ${{ matrix.pg }}
           SUITE_OUTCOME: ${{ steps.run_suite.outcome }}
           SETUP_OUTCOMES: |
+            warm the module and base-image caches=${{ steps.warm_caches.outcome }}
             build PostgreSQL image=${{ steps.build_postgres.outcome }}
             build operator and admin images=${{ steps.build_control.outcome }}
             build controller image=${{ steps.build_controller.outcome }}
