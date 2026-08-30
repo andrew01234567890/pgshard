@@ -645,6 +645,17 @@ func (r *ClusterReconciler) converge(ctx context.Context, c *pgshardv1alpha1.PgS
 			if err := r.patchRole(ctx, m.pod, RolePrimary); err != nil {
 				return state, refused, err
 			}
+		case name == state.primary && m.pod.Labels[LabelRole] != RolePrimary:
+			// Promoted, healthy, and wearing the wrong label: the failover
+			// patches the label after the promotion, so an operator that
+			// exits in between leaves a shard with a writable primary that
+			// the -rw Service selects nothing for. Nothing else repairs it,
+			// because every other case here asks the agent what it is, and
+			// the agent is right -- it is the label that is stale.
+			log.Info("designated primary is not labelled primary; repairing", "member", name, "epoch", state.epoch)
+			if err := r.patchRole(ctx, m.pod, RolePrimary); err != nil {
+				return state, refused, err
+			}
 		case name != state.primary && st.Primary:
 			log.Info("member reports itself primary but is not designated; demoting", "member", name, "epoch", state.epoch)
 			if err := r.patchRole(ctx, m.pod, RoleUnhealthy); err != nil {

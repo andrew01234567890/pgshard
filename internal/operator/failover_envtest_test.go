@@ -608,3 +608,41 @@ func TestTheWritePauseNeverStallsAGroup(t *testing.T) {
 		t.Fatalf("the promoted member never took the primary label: %q", got)
 	}
 }
+
+// TestAPromotedPrimaryWithoutItsLabelIsRepaired: the failover promotes the
+// candidate and only then patches its Pod to role=primary. An operator that
+// exits in between -- or a Patch that fails -- leaves a shard whose primary
+// is writable and whose -rw Service selects nothing, because every other
+// path here asks the agent what a member is, and the agent is right: it is
+// the label that is stale. The existing failover test runs the whole
+// sequence uninterrupted and cannot see it.
+func TestAPromotedPrimaryWithoutItsLabelIsRepaired(t *testing.T) {
+	r, fp, fa, c := healthyCluster(t, "lb")
+
+	deletePod(t, "lb-shard-0-0")
+	fa.set(podIP(1, 0), AgentStatus{}, errors.New("connection refused"))
+	fp.standbys[podIP(1, 1)] = StandbyState{InRecovery: true, FlushLSN: 100}
+	fp.standbys[podIP(1, 2)] = StandbyState{InRecovery: true, FlushLSN: 200}
+	fp.err = errors.New("no primary")
+	reconcile(t, r, c)
+	if len(fa.promotes) != 1 || podRole(t, "lb-shard-0-2") != RolePrimary {
+		t.Fatalf("setup: promotes=%v role=%q", fa.promotes, podRole(t, "lb-shard-0-2"))
+	}
+
+	// The state the crash leaves: promoted, and still labelled a replica.
+	var pod corev1.Pod
+	get(t, "lb-shard-0-2", &pod)
+	pod.Labels[LabelRole] = RoleReplica
+	if err := k8sClient.Update(context.Background(), &pod); err != nil {
+		t.Fatal(err)
+	}
+	fp.err = nil
+
+	reconcile(t, r, c)
+	if got := podRole(t, "lb-shard-0-2"); got != RolePrimary {
+		t.Fatalf("the promoted primary is labelled %q, so the -rw Service selects nothing", got)
+	}
+	if len(fa.promotes) != 1 {
+		t.Fatalf("the label was repaired by promoting again: %v", fa.promotes)
+	}
+}
