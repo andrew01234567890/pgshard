@@ -5,6 +5,9 @@ import (
 	"context"
 	"sort"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -95,7 +98,7 @@ type CatalogSource interface {
 }
 
 // ListClusters summarizes every PgShardCluster in namespace (all if empty).
-func ListClusters(ctx context.Context, c client.Reader, namespace string) ([]ClusterSummary, error) {
+func ListClusters(ctx context.Context, c client.Reader, namespace, cluster string) ([]ClusterSummary, error) {
 	var list pgshardv1alpha1.PgShardClusterList
 	if err := c.List(ctx, &list, client.InNamespace(namespace)); err != nil {
 		return nil, err
@@ -103,6 +106,9 @@ func ListClusters(ctx context.Context, c client.Reader, namespace string) ([]Clu
 	out := make([]ClusterSummary, 0, len(list.Items))
 	for i := range list.Items {
 		pc := &list.Items[i]
+		if cluster != "" && pc.Name != cluster {
+			continue
+		}
 		s := ClusterSummary{Namespace: pc.Namespace, Name: pc.Name, Shards: 1, Major: pc.Spec.PostgreSQL.Major, Ready: "Unknown"}
 		if pc.Spec.Shards != nil {
 			s.Shards = *pc.Spec.Shards
@@ -195,4 +201,27 @@ func groupLess(a, b Group) bool {
 		return *a.ShardID < *b.ShardID
 	}
 	return a.Name < b.Name
+}
+
+// onlyCluster keeps the clusters a scoped admin serves; an unscoped admin
+// (no --cluster) keeps them all, which is how an operator running one by
+// hand across a namespace still sees everything.
+func onlyCluster(items []pgshardv1alpha1.PgShardCluster, cluster string) []pgshardv1alpha1.PgShardCluster {
+	if cluster == "" {
+		return items
+	}
+	out := items[:0]
+	for _, c := range items {
+		if c.Name == cluster {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// notServed is what an admin scoped to one cluster returns for an object of
+// another: absent, not forbidden. An admin that serves one cluster has
+// nothing to say about what else exists.
+func notServed(kind, name string) error {
+	return apierrors.NewNotFound(schema.GroupResource{Group: pgshardv1alpha1.GroupVersion.Group, Resource: kind}, name)
 }

@@ -144,20 +144,21 @@ type BackupCards struct {
 const RestorePointsLimit = 50
 
 // BuildBackupsPage assembles the backups panel for every cluster in namespace.
-func BuildBackupsPage(ctx context.Context, c client.Reader, src CatalogSource, namespace string) (*BackupsPage, error) {
+func BuildBackupsPage(ctx context.Context, c client.Reader, src CatalogSource, namespace, cluster string) (*BackupsPage, error) {
 	var clusters pgshardv1alpha1.PgShardClusterList
 	if err := c.List(ctx, &clusters, client.InNamespace(namespace)); err != nil {
 		return nil, err
 	}
+	clusters.Items = onlyCluster(clusters.Items, cluster)
 	var policies pgshardv1alpha1.PgShardBackupPolicyList
 	if err := c.List(ctx, &policies, client.InNamespace(namespace)); err != nil {
 		return nil, err
 	}
-	backups, err := ListBackups(ctx, c, namespace)
+	backups, err := ListBackups(ctx, c, namespace, cluster)
 	if err != nil {
 		return nil, err
 	}
-	restores, err := ListRestores(ctx, c, namespace)
+	restores, err := ListRestores(ctx, c, namespace, cluster)
 	if err != nil {
 		return nil, err
 	}
@@ -206,12 +207,12 @@ func BuildBackupsPage(ctx context.Context, c client.Reader, src CatalogSource, n
 }
 
 // BuildBackupCards derives the overview cards from the backups and restores in namespace.
-func BuildBackupCards(ctx context.Context, c client.Reader, namespace string, now time.Time) (*BackupCards, error) {
-	backups, err := ListBackups(ctx, c, namespace)
+func BuildBackupCards(ctx context.Context, c client.Reader, namespace, cluster string, now time.Time) (*BackupCards, error) {
+	backups, err := ListBackups(ctx, c, namespace, cluster)
 	if err != nil {
 		return nil, err
 	}
-	restores, err := ListRestores(ctx, c, namespace)
+	restores, err := ListRestores(ctx, c, namespace, cluster)
 	if err != nil {
 		return nil, err
 	}
@@ -241,50 +242,68 @@ func BuildBackupCards(ctx context.Context, c client.Reader, namespace string, no
 }
 
 // ListBackups returns every PgShardBackup in namespace, newest first.
-func ListBackups(ctx context.Context, c client.Reader, namespace string) ([]Backup, error) {
+func ListBackups(ctx context.Context, c client.Reader, namespace, cluster string) ([]Backup, error) {
 	var list pgshardv1alpha1.PgShardBackupList
 	if err := c.List(ctx, &list, client.InNamespace(namespace)); err != nil {
 		return nil, err
 	}
 	out := make([]Backup, 0, len(list.Items))
 	for i := range list.Items {
-		out = append(out, convertBackup(&list.Items[i]))
+		b := convertBackup(&list.Items[i])
+		if cluster != "" && b.Cluster != cluster {
+			continue
+		}
+		out = append(out, b)
 	}
 	sort.Slice(out, func(i, j int) bool { return newerFirst(out[i].StartedAt, out[i].Name, out[j].StartedAt, out[j].Name) })
 	return out, nil
 }
 
 // ListRestores returns every PgShardRestore in namespace, newest first.
-func ListRestores(ctx context.Context, c client.Reader, namespace string) ([]Restore, error) {
+func ListRestores(ctx context.Context, c client.Reader, namespace, cluster string) ([]Restore, error) {
 	var list pgshardv1alpha1.PgShardRestoreList
 	if err := c.List(ctx, &list, client.InNamespace(namespace)); err != nil {
 		return nil, err
 	}
 	out := make([]Restore, 0, len(list.Items))
 	for i := range list.Items {
-		out = append(out, convertRestore(&list.Items[i]))
+		r := convertRestore(&list.Items[i])
+		// A restore names the cluster it reads and the one it creates; a
+		// scoped admin serves it if either is the cluster it serves.
+		if cluster != "" && r.Cluster != cluster && r.NewCluster != cluster {
+			continue
+		}
+		out = append(out, r)
 	}
 	sort.Slice(out, func(i, j int) bool { return newerFirst(out[i].StartedAt, out[i].Name, out[j].StartedAt, out[j].Name) })
 	return out, nil
 }
 
-// GetBackup reads one PgShardBackup.
-func GetBackup(ctx context.Context, c client.Reader, namespace, name string) (*Backup, error) {
+// GetBackup reads one PgShardBackup. A backup of another cluster reads as
+// absent to an admin scoped to one, not as forbidden: an admin that serves
+// one cluster has nothing to say about what else exists.
+func GetBackup(ctx context.Context, c client.Reader, namespace, name, cluster string) (*Backup, error) {
 	var b pgshardv1alpha1.PgShardBackup
 	if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &b); err != nil {
 		return nil, err
 	}
 	out := convertBackup(&b)
+	if cluster != "" && out.Cluster != cluster {
+		return nil, notServed("backup", name)
+	}
 	return &out, nil
 }
 
 // GetRestore reads one PgShardRestore.
-func GetRestore(ctx context.Context, c client.Reader, namespace, name string) (*Restore, error) {
+func GetRestore(ctx context.Context, c client.Reader, namespace, name, cluster string) (*Restore, error) {
 	var r pgshardv1alpha1.PgShardRestore
 	if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &r); err != nil {
 		return nil, err
 	}
 	out := convertRestore(&r)
+	if cluster != "" && out.Cluster != cluster && out.NewCluster != cluster {
+		return nil, notServed("restore", name)
+	}
 	return &out, nil
 }
 

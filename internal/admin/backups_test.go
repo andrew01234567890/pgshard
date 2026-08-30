@@ -179,7 +179,7 @@ func TestOverviewCards(t *testing.T) {
 			t.Errorf("overview missing %q", want)
 		}
 	}
-	cards, err := BuildBackupCards(context.Background(), s.Client, "", time.Date(2026, 8, 19, 12, 1, 30, 0, time.UTC))
+	cards, err := BuildBackupCards(context.Background(), s.Client, "", "", time.Date(2026, 8, 19, 12, 1, 30, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}

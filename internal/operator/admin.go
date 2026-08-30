@@ -105,7 +105,9 @@ const (
 
 // adminArgs credentials the admin unless the spec asks for it to be open.
 func adminArgs(c *pgshardv1alpha1.PgShardCluster) []string {
-	args := []string{"serve", "--listen=:8081", "--namespace=" + c.Namespace}
+	// One admin per cluster, one credential per admin: without --cluster
+	// that credential reads every cluster in the namespace.
+	args := []string{"serve", "--listen=:8081", "--namespace=" + c.Namespace, "--cluster=" + c.Name}
 	if c.Spec.Admin.InsecureNoAuth {
 		return append(args, "--insecure-no-auth")
 	}
