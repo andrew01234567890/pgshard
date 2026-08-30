@@ -331,3 +331,52 @@ func TestDrainCountsAPreparedTransactionPgshardDidNotMake(t *testing.T) {
 		t.Fatalf("%d prepared transactions after a resolver pass, want the outsider left alone", n)
 	}
 }
+
+// TestAnUnownedWriteCannotDisturbABarriersFence: the fence a barrier
+// raises is stamped with an owner, but the agent's SetWriteFence RPC
+// writes it without one. Against a live catalog that would open writes in
+// the middle of the barrier that raised it, or -- raising over it -- take
+// the owner's stamp away so the barrier's own release matched nothing and
+// left the cluster fenced.
+func TestAnUnownedWriteCannotDisturbABarriersFence(t *testing.T) {
+	parallelPG(t)
+	f := newResolverFixtureWith(t)
+	ctx := context.Background()
+
+	// No owner: a restored catalog, which is what this path is for.
+	if err := catalog.SetWriteFence(ctx, f.pool, true, "restore"); err != nil {
+		t.Fatalf("fencing an unowned catalog: %v", err)
+	}
+	if err := catalog.SetWriteFence(ctx, f.pool, false, ""); err != nil {
+		t.Fatalf("unfencing an unowned catalog: %v", err)
+	}
+
+	if err := catalog.RaiseWriteFence(ctx, f.pool, "barrier b1", "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		what   string
+		active bool
+	}{{"release", false}, {"raise", true}} {
+		if err := catalog.SetWriteFence(ctx, f.pool, c.active, "someone else"); !errors.Is(err, catalog.ErrFenceOwned) {
+			t.Fatalf("an unowned %s of an owned fence returned %v, want ErrFenceOwned", c.what, err)
+		}
+	}
+	fence, err := catalog.ReadWriteFence(ctx, f.pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fence.Active || fence.Reason != "barrier b1" {
+		t.Fatalf("the barrier's fence was disturbed: %+v", fence)
+	}
+
+	// The owner still releases its own fence, and once it has, the
+	// unowned path works again.
+	cleared, err := catalog.ReleaseWriteFence(ctx, f.pool, "owner-1")
+	if err != nil || !cleared {
+		t.Fatalf("owner release: %v %v", cleared, err)
+	}
+	if err := catalog.SetWriteFence(ctx, f.pool, true, "restore"); err != nil {
+		t.Fatalf("after the owner released it: %v", err)
+	}
+}

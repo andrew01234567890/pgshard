@@ -55,6 +55,10 @@ func (s *Server) CreateBarrier(ctx context.Context, req *pgshardv1.CreateBarrier
 	switch {
 	case errors.Is(err, ErrBarrierName), errors.Is(err, ErrBarrierExists):
 		return nil, status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, ErrBarrierBusy):
+		// Retryable, and a client cannot tell that from a message: another
+		// barrier holds the lock and this one never started.
+		return nil, status.Error(codes.Unavailable, err.Error())
 	case err != nil:
 		return &pgshardv1.CreateBarrierResponse{Error: &pgshardv1.Error{Message: err.Error()}}, nil
 	}

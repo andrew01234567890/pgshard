@@ -29,6 +29,11 @@ import (
 	pgmetrics "github.com/andrew01234567890/pgshard/internal/metrics"
 )
 
+// minCatalogConns is the smallest catalog pool a controller can work with:
+// one connection is held by a running barrier's advisory lock and the rest
+// of the barrier runs on the others.
+const minCatalogConns = 2
+
 func run(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -98,7 +103,18 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	}
 	logger := slog.New(slog.NewTextHandler(stderr, nil))
 
-	pool, err := pgxpool.New(ctx, *catalogDSN)
+	poolCfg, err := pgxpool.ParseConfig(*catalogDSN)
+	if err != nil {
+		fmt.Fprintf(stderr, "pgshard-controller run: catalog: %v\n", err)
+		return cli.ExitUsage
+	}
+	// A barrier holds one connection for its advisory lock for as long as
+	// it runs, and does its work on others. A pool of one deadlocks
+	// against itself the moment a barrier starts.
+	if poolCfg.MaxConns < minCatalogConns {
+		poolCfg.MaxConns = minCatalogConns
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "pgshard-controller run: catalog: %v\n", err)
 		return cli.ExitUsage
