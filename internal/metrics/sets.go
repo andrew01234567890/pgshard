@@ -161,11 +161,26 @@ func NewAgent(reg *prometheus.Registry, primary, lagBytes func() float64) *Agent
 type Controller struct {
 	Workflows        *prometheus.GaugeVec
 	WorkflowProgress *prometheus.GaugeVec
-	CutoverPaused    prometheus.Gauge
+	CutoverPaused    *prometheus.GaugeVec
 	InDoubt          prometheus.Gauge
 	InDoubtOldestAge prometheus.Gauge
-	Migrations       *prometheus.GaugeVec
-	ResolvedTxns     *prometheus.CounterVec
+	// Decided counts rows the resolver has decided but could not finish,
+	// and DecidedOldestAge their age since the decision. A decided
+	// transaction still holds its locks, WAL and vacuum horizon on every
+	// participant, so one the resolver keeps failing to finish costs the
+	// same as an undecided one -- and the in-doubt gauges, which count
+	// only undecided rows, say nothing about it.
+	Decided          *prometheus.GaugeVec
+	DecidedOldestAge *prometheus.GaugeVec
+	// WorkflowStepAge is how long each running workflow has been on its
+	// current cutover step.
+	WorkflowStepAge *prometheus.GaugeVec
+	// ResolverUnresolved is what the last resolver pass could not settle:
+	// decisions it could not finish, shards it could not search, and a
+	// failed orphan sweep.
+	ResolverUnresolved prometheus.Gauge
+	Migrations         *prometheus.GaugeVec
+	ResolvedTxns       *prometheus.CounterVec
 }
 
 // NewController registers the controller metric set on reg.
@@ -175,18 +190,33 @@ func NewController(reg *prometheus.Registry) *Controller {
 			Name: "pgshard_controller_workflows", Help: "Workflows in the catalog, by kind and state."}, []string{"kind", "state"}),
 		WorkflowProgress: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "pgshard_controller_workflow_progress", Help: "Progress fraction of each running workflow."}, []string{"kind", "id"}),
-		CutoverPaused: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "pgshard_controller_cutover_paused", Help: "Workflows paused at cutover awaiting an operator."}),
+		CutoverPaused: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "pgshard_controller_cutover_paused",
+			Help: "Workflows held at a configured cutover pause, waiting for an operator to let them proceed."},
+			[]string{"kind", "shard_set", "id", "pause"}),
 		InDoubt: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "pgshard_controller_in_doubt_transactions", Help: "Undecided rows in pgshard.xact_decisions."}),
 		InDoubtOldestAge: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "pgshard_controller_in_doubt_oldest_age_seconds", Help: "Age of the oldest undecided two-phase commit."}),
+		Decided: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "pgshard_controller_decided_transactions",
+			Help: "Decided rows in pgshard.xact_decisions the resolver has not finished, by decision."}, []string{"decision"}),
+		DecidedOldestAge: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "pgshard_controller_decided_oldest_age_seconds",
+			Help: "Age since the decision of the oldest unfinished decided transaction, by decision."}, []string{"decision"}),
+		WorkflowStepAge: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "pgshard_controller_workflow_step_age_seconds",
+			Help: "How long a running workflow has been on its current cutover step."}, []string{"kind", "id", "stage", "step"}),
+		ResolverUnresolved: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "pgshard_controller_resolver_unresolved",
+			Help: "Transactions, shard scans and sweeps the last resolver pass could not settle."}),
 		Migrations: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "pgshard_controller_ddl_migrations", Help: "DDL migrations in the catalog, by state."}, []string{"state"}),
 		ResolvedTxns: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "pgshard_controller_resolved_transactions_total", Help: "In-doubt transactions the resolver finished, by outcome."}, []string{"outcome"}),
 	}
-	reg.MustRegister(m.Workflows, m.WorkflowProgress, m.CutoverPaused, m.InDoubt, m.InDoubtOldestAge, m.Migrations, m.ResolvedTxns)
+	reg.MustRegister(m.Workflows, m.WorkflowProgress, m.CutoverPaused, m.InDoubt, m.InDoubtOldestAge,
+		m.Decided, m.DecidedOldestAge, m.WorkflowStepAge, m.ResolverUnresolved, m.Migrations, m.ResolvedTxns)
 	return m
 }
 

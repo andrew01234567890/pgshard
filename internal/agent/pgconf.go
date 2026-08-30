@@ -232,8 +232,9 @@ func hostKeyword(h string) string {
 // way -- and those settings live here until the agent next writes
 // configuration, which it does on bootstrap, on promotion and after a
 // restore. A setting that has to outlive any of those belongs in the
-// rendered postgresql.conf instead, and a control-plane action that relies
-// on one has to notice when it is gone rather than assume it held.
+// rendered postgresql.conf instead, or with an owner that reapplies it: the
+// write pause is held by the catalog write fence, which the operator reads
+// on every pass and before a promoted member serves.
 const autoConfHeader = "# Managed by pgshard-agent: rewritten on bootstrap, promotion and restore.\n" +
 	"# A runtime ALTER SYSTEM lasts only until then; anything that must survive\n" +
 	"# belongs in postgresql.conf, which pgshard renders.\n"

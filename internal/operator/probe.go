@@ -20,6 +20,9 @@ type PrimaryState struct {
 	// walsender.
 	Streaming        map[string]bool
 	SyncStandbyNames string
+	// WritesPaused is default_transaction_read_only: the barrier's pause,
+	// which the operator reapplies to a primary that lost it.
+	WritesPaused bool
 }
 
 // StandbyState is what the operator learned from one probe of a member
@@ -47,6 +50,10 @@ type Prober interface {
 	Probe(ctx context.Context, dsn string) (PrimaryState, error)
 	ProbeStandby(ctx context.Context, dsn string) (StandbyState, error)
 	SetSyncStandbyNames(ctx context.Context, dsn, value string) error
+	// PauseWrites makes a primary refuse new writing transactions.
+	PauseWrites(ctx context.Context, dsn string) error
+	// WriteFenced reads the catalog write fence, given a catalog DSN.
+	WriteFenced(ctx context.Context, dsn string) (bool, error)
 	MigrateCatalog(ctx context.Context, dsn string) error
 	SetRouterPassword(ctx context.Context, dsn, password string) error
 	// PublishShardStatus upserts pgshard.shard_status for the given shard
@@ -141,6 +148,7 @@ type PgxProber struct{}
 // array_agg is NULL, which coalesce turns into the empty array.
 const probePrimarySQL = `SELECT pg_is_in_recovery(),
 	current_setting('synchronous_standby_names'),
+	current_setting('default_transaction_read_only')::bool,
 	coalesce(array_agg(application_name) FILTER (WHERE state = 'streaming'), '{}')
 	FROM pg_stat_replication`
 
@@ -153,14 +161,15 @@ func (PgxProber) Probe(ctx context.Context, dsn string) (PrimaryState, error) {
 	defer func() { _ = conn.Close(ctx) }()
 	var recovery bool
 	var syncNames string
+	var paused bool
 	var streaming []string
-	if err := conn.QueryRow(ctx, probePrimarySQL).Scan(&recovery, &syncNames, &streaming); err != nil {
+	if err := conn.QueryRow(ctx, probePrimarySQL).Scan(&recovery, &syncNames, &paused, &streaming); err != nil {
 		return PrimaryState{}, err
 	}
 	if recovery {
 		return PrimaryState{}, fmt.Errorf("primary service points at a standby")
 	}
-	st := PrimaryState{Streaming: make(map[string]bool, len(streaming)), SyncStandbyNames: syncNames}
+	st := PrimaryState{Streaming: make(map[string]bool, len(streaming)), SyncStandbyNames: syncNames, WritesPaused: paused}
 	for _, name := range streaming {
 		st.Streaming[name] = true
 	}
@@ -564,6 +573,46 @@ func (PgxProber) SetSyncStandbyNames(ctx context.Context, dsn, value string) err
 	return err
 }
 
+// PauseWrites makes a primary refuse new writing transactions, the state a
+// raised write fence means. Only the pause direction is here: the barrier
+// that raised the fence owns lifting it, and the fence outliving a barrier
+// is what its recovery pass reads to know shards are still paused.
+func (PgxProber) PauseWrites(ctx context.Context, dsn string) error {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if _, err := conn.Exec(ctx, "ALTER SYSTEM SET default_transaction_read_only = on"); err != nil {
+		return err
+	}
+	ok, err := scalarBool(ctx, conn, "SELECT pg_reload_conf()")
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("pg_reload_conf() refused to signal the postmaster")
+	}
+	return nil
+}
+
+// WriteFenced reports whether the catalog write fence is raised.
+func (PgxProber) WriteFenced(ctx context.Context, dsn string) (bool, error) {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	f, err := catalog.ReadWriteFence(ctx, conn)
+	return f.Active, err
+}
+
+func scalarBool(ctx context.Context, conn *pgx.Conn, sql string) (bool, error) {
+	var v bool
+	err := conn.QueryRow(ctx, sql).Scan(&v)
+	return v, err
+}
+
 // MigrateCatalog applies the embedded catalog migrations.
 func (PgxProber) MigrateCatalog(ctx context.Context, dsn string) error {
 	conn, err := pgx.Connect(ctx, dsn)
@@ -647,6 +696,18 @@ func (b boundedProber) SetSyncStandbyNames(ctx context.Context, dsn, value strin
 	ctx, cancel := b.bound(ctx)
 	defer cancel()
 	return b.Inner.SetSyncStandbyNames(ctx, dsn, value)
+}
+
+func (b boundedProber) PauseWrites(ctx context.Context, dsn string) error {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.PauseWrites(ctx, dsn)
+}
+
+func (b boundedProber) WriteFenced(ctx context.Context, dsn string) (bool, error) {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.WriteFenced(ctx, dsn)
 }
 
 func (b boundedProber) MigrateCatalog(ctx context.Context, dsn string) error {

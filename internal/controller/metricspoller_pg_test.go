@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -73,5 +74,188 @@ func TestMetricsPollerReportsWorkflowProgress(t *testing.T) {
 	}
 	if v, ok := got["upgrade/aaaaaaaa-9999-9999-9999-999999999999"]; !ok || v != 0 {
 		t.Errorf("a workflow with no tables yet must report 0, got %v", v)
+	}
+}
+
+// TestDecidedTransactionsAreCountedSeparately: a decision row is deleted
+// when the resolver finishes it, so one that outlives its decision is a
+// transaction still holding locks, WAL and a vacuum horizon on every
+// participant. The gauges counted only undecided rows, so nothing said so.
+func TestDecidedTransactionsAreCountedSeparately(t *testing.T) {
+	parallelPG(t)
+	dsn := startPostgres(t)
+	ctx := context.Background()
+	conn := connect(t, dsn)
+	if err := catalog.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, `INSERT INTO pgshard.xact_decisions (gid, state, participants, created_at, decided_at) VALUES
+		('pgshard-a', 'preparing', '{0}', now() - interval '10 minutes', NULL),
+		('pgshard-b', 'commit',    '{0}', now() - interval '2 hours',    now() - interval '1 hour'),
+		('pgshard-c', 'commit',    '{0}', now() - interval '2 hours',    now() - interval '30 minutes'),
+		('pgshard-d', 'abort',     '{0}', now() - interval '2 hours',    now() - interval '15 minutes')`)
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	reg := prometheus.NewRegistry()
+	p := &MetricsPoller{Pool: pool, Metrics: metrics.NewController(reg)}
+	if err := p.Refresh(ctx); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	got := map[string]float64{}
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range families {
+		switch f.GetName() {
+		case "pgshard_controller_decided_transactions", "pgshard_controller_decided_oldest_age_seconds",
+			"pgshard_controller_in_doubt_transactions", "pgshard_controller_in_doubt_oldest_age_seconds":
+		default:
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			key := f.GetName()
+			for _, l := range m.GetLabel() {
+				key += "/" + l.GetValue()
+			}
+			got[key] = m.GetGauge().GetValue()
+		}
+	}
+
+	if got["pgshard_controller_decided_transactions/commit"] != 2 || got["pgshard_controller_decided_transactions/abort"] != 1 {
+		t.Fatalf("decided rows are not counted by decision: %v", got)
+	}
+	// Aged from the decision, not from when the transaction started.
+	if age := got["pgshard_controller_decided_oldest_age_seconds/commit"]; age < 3500 || age > 3700 {
+		t.Fatalf("oldest commit decision aged %v seconds, want about one hour since it was decided", age)
+	}
+	if age := got["pgshard_controller_decided_oldest_age_seconds/abort"]; age < 800 || age > 1000 {
+		t.Fatalf("oldest abort decision aged %v seconds, want about fifteen minutes", age)
+	}
+	if got["pgshard_controller_in_doubt_transactions"] != 1 {
+		t.Fatalf("the undecided count must not include decided rows: %v", got)
+	}
+	if age := got["pgshard_controller_in_doubt_oldest_age_seconds"]; age < 550 || age > 700 {
+		t.Fatalf("oldest undecided aged %v seconds, want about ten minutes", age)
+	}
+}
+
+// TestCutoverPausedCountsTheGateAndNotTheState: pauseBefore leaves the
+// workflow running with the pause recorded in its cutover status -- only an
+// operator pauses the workflow itself -- so counting workflows in state
+// paused reported a manual pause at any stage and never the automatic gate
+// the metric is named for.
+func TestCutoverPausedCountsTheGateAndNotTheState(t *testing.T) {
+	parallelPG(t)
+	dsn := startPostgres(t)
+	ctx := context.Background()
+	conn := connect(t, dsn)
+	if err := catalog.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, `INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES
+		('11111111-1111-1111-1111-111111111111', 'reshard', 'running', '{"shard_set": "g2"}'::jsonb,
+		 '{"cutover": {"pause": "switchWrites", "paused_at": "2026-01-01T00:00:00Z"}}'::jsonb),
+		('22222222-2222-2222-2222-222222222222', 'upgrade', 'paused', '{"shard_set": "g3"}'::jsonb, '{}'::jsonb),
+		('33333333-3333-3333-3333-333333333333', 'reshard', 'running', '{"shard_set": "g4"}'::jsonb,
+		 '{"cutover": {"step": "fence"}}'::jsonb)`)
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	reg := prometheus.NewRegistry()
+	p := &MetricsPoller{Pool: pool, Metrics: metrics.NewController(reg)}
+	if err := p.Refresh(ctx); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	var samples []string
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range families {
+		if f.GetName() != "pgshard_controller_cutover_paused" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, l := range m.GetLabel() {
+				labels[l.GetName()] = l.GetValue()
+			}
+			samples = append(samples, fmt.Sprintf("%s/%s/%s/%s=%v",
+				labels["kind"], labels["shard_set"], labels["id"], labels["pause"], m.GetGauge().GetValue()))
+		}
+	}
+	want := "reshard/g2/11111111-1111-1111-1111-111111111111/switchWrites=1"
+	if len(samples) != 1 || samples[0] != want {
+		t.Fatalf("cutover pauses reported as %v, want exactly [%s]", samples, want)
+	}
+}
+
+// TestStepAgeIsExportedForARunningCutover: a step past the journal is
+// retried without a timeout or an attempt limit and every pass rewrites
+// updated_at, so nothing outside the catalog distinguished a switch that
+// had been failing for hours from one getting on with it.
+func TestStepAgeIsExportedForARunningCutover(t *testing.T) {
+	parallelPG(t)
+	dsn := startPostgres(t)
+	ctx := context.Background()
+	conn := connect(t, dsn)
+	if err := catalog.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, `INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES
+		('44444444-4444-4444-4444-444444444444', 'reshard', 'running', '{}'::jsonb,
+		 jsonb_build_object('stage', 'switching', 'cutover',
+		   jsonb_build_object('step', 'flip', 'step_since', to_char(now() - interval '20 minutes', 'YYYY-MM-DD"T"HH24:MI:SSOF')))),
+		('55555555-5555-5555-5555-555555555555', 'reshard', 'running', '{}'::jsonb,
+		 '{"stage": "copying"}'::jsonb),
+		('66666666-6666-6666-6666-666666666666', 'reshard', 'completed', '{}'::jsonb,
+		 jsonb_build_object('stage', 'completed', 'cutover',
+		   jsonb_build_object('step', 'flip', 'step_since', to_char(now() - interval '3 hours', 'YYYY-MM-DD"T"HH24:MI:SSOF'))))`)
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	reg := prometheus.NewRegistry()
+	p := &MetricsPoller{Pool: pool, Metrics: metrics.NewController(reg)}
+	if err := p.Refresh(ctx); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	var samples []string
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range families {
+		if f.GetName() != "pgshard_controller_workflow_step_age_seconds" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, l := range m.GetLabel() {
+				labels[l.GetName()] = l.GetValue()
+			}
+			age := m.GetGauge().GetValue()
+			if age < 1150 || age > 1250 {
+				t.Fatalf("step age %v seconds, want about twenty minutes", age)
+			}
+			samples = append(samples, fmt.Sprintf("%s/%s/%s/%s", labels["kind"], labels["id"], labels["stage"], labels["step"]))
+		}
+	}
+	want := "reshard/44444444-4444-4444-4444-444444444444/switching/flip"
+	if len(samples) != 1 || samples[0] != want {
+		t.Fatalf("step ages reported as %v, want exactly [%s]", samples, want)
 	}
 }
