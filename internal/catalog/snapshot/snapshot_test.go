@@ -170,3 +170,83 @@ func TestFreshnessIsBoundedByMaxAge(t *testing.T) {
 		t.Error("a snapshot with no load time must not be stale")
 	}
 }
+
+// TestAReloadOfAnUnchangedCatalogPlansTheSame: the watcher swaps a freshly
+// built snapshot in on every reload whether or not the catalog moved, so
+// comparing snapshots by identity replanned every prepared statement of
+// every session on its next Bind, every reload, for ever.
+func TestAReloadOfAnUnchangedCatalogPlansTheSame(t *testing.T) {
+	build := func() *Snapshot {
+		s := &Snapshot{
+			LoadedAt:           time.Now(),
+			ShardMapGeneration: 7,
+			DesiredGeneration:  9,
+			ServingSet:         "default",
+			ShardSets:          map[string][]Range{"default": {{ShardID: 0, Start: math.MinInt64, End: 0}, {ShardID: 1, Start: 1, End: math.MaxInt64}}},
+			Serving: map[ShardKey]Serving{
+				{ShardSet: "default", ShardID: 0}: {PrimaryEndpoint: "a:5432", Epoch: 3, State: "serving"},
+				{ShardSet: "default", ShardID: 1}: {PrimaryEndpoint: "b:5432", Epoch: 4, State: "serving"},
+			},
+			Databases: map[string]catalog.Database{"app": {Name: "app", DefaultPlacement: "unsharded", HomeShard: 0}},
+			Tables: map[TableKey]Placement{
+				{Database: "app", SchemaName: "public", TableName: "orders"}: {Placement: "sharded", ShardKey: "tenant_id", Generation: 3},
+			},
+			Sequences: map[string]bool{"app.public.orders_id_seq": true},
+		}
+		s.index()
+		return s
+	}
+
+	first, second := build(), build()
+	if first == second {
+		t.Fatal("the fixture must build two snapshots, as two reloads do")
+	}
+	if !SamePlanning(first, second) {
+		t.Fatal("two reloads of an unchanged catalog must not replan anything")
+	}
+	// Read at a different moment: the same catalog, said again.
+	later := build()
+	later.LoadedAt = first.LoadedAt.Add(time.Hour)
+	later.index()
+	if !SamePlanning(first, later) {
+		t.Fatal("when the catalog was read is not what a plan depends on")
+	}
+
+	// Anything the snapshot says about the catalog does replan.
+	for name, change := range map[string]func(*Snapshot){
+		"shard map generation": func(s *Snapshot) { s.ShardMapGeneration = 8 },
+		"desired generation":   func(s *Snapshot) { s.DesiredGeneration = 10 },
+		"serving set":          func(s *Snapshot) { s.ServingSet = "g2" },
+		"a range bound":        func(s *Snapshot) { s.ShardSets["default"][0].End = 5 },
+		"a shard's state": func(s *Snapshot) {
+			s.Serving[ShardKey{ShardSet: "default", ShardID: 0}] = Serving{State: "provisioning"}
+		},
+		"a table's placement": func(s *Snapshot) {
+			s.Tables[TableKey{Database: "app", SchemaName: "public", TableName: "orders"}] = Placement{Placement: "reference"}
+		},
+		"a new table": func(s *Snapshot) {
+			s.Tables[TableKey{Database: "app", SchemaName: "public", TableName: "new"}] = Placement{}
+		},
+		"a database default": func(s *Snapshot) { s.Databases["app"] = catalog.Database{Name: "app", DefaultPlacement: "sharded"} },
+		"a global sequence":  func(s *Snapshot) { s.Sequences["app.public.new_id_seq"] = true },
+		"the write fence":    func(s *Snapshot) { s.WriteFence = true },
+	} {
+		changed := build()
+		change(changed)
+		changed.index()
+		if SamePlanning(first, changed) {
+			t.Errorf("%s changed and nothing replanned", name)
+		}
+	}
+
+	// A snapshot built by hand rather than loaded carries no fingerprint,
+	// and must compare equal only to itself: assuming otherwise would let a
+	// fixture keep a plan it should not.
+	byHand := &Snapshot{ShardMapGeneration: 7}
+	if SamePlanning(byHand, first) || SamePlanning(byHand, &Snapshot{ShardMapGeneration: 7}) {
+		t.Fatal("a snapshot with no fingerprint must not be taken for another")
+	}
+	if !SamePlanning(byHand, byHand) {
+		t.Fatal("a snapshot is always itself")
+	}
+}

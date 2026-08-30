@@ -3,9 +3,15 @@
 package snapshot
 
 import (
+	"cmp"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"io"
+	"maps"
 	"math"
+	"slices"
 	"sort"
 	"time"
 
@@ -127,6 +133,29 @@ type Snapshot struct {
 	// built directly rather than through Load -- and the scan still runs, so
 	// a construction that misses this cannot silently report false.
 	migrating *bool
+	// rev fingerprints everything this snapshot says about the catalog, so
+	// two reloads that read the same catalog are recognisable as such. Zero
+	// means it was not computed, which SamePlanning reads as "assume they
+	// differ".
+	rev uint64
+}
+
+// SamePlanning reports whether b says the same thing about the catalog as
+// a, so a statement planned against a needs no replanning against b.
+//
+// The watcher swaps a freshly built snapshot in on every reload, whether or
+// not the catalog moved, so comparing snapshots by identity replanned every
+// prepared statement of every session on its next Bind, every reload, for
+// ever. Only a snapshot that was loaded carries a fingerprint; one built by
+// hand, as tests and fixtures do, compares equal only to itself.
+func SamePlanning(a, b *Snapshot) bool {
+	if a == b {
+		return true
+	}
+	if a == nil || b == nil || a.rev == 0 || b.rev == 0 {
+		return false
+	}
+	return a.rev == b.rev
 }
 
 // index precomputes what the request path would otherwise recompute per
@@ -134,6 +163,98 @@ type Snapshot struct {
 func (s *Snapshot) index() {
 	m := s.scanMigrating()
 	s.migrating = &m
+	s.rev = s.fingerprint()
+}
+
+// fingerprint hashes everything the snapshot says about the catalog. It
+// covers more than the planner reads today on purpose: a field left out
+// that a plan turns out to depend on is a stale plan, while one left in
+// that nothing depends on costs a replan nobody notices. Only LoadedAt is
+// excluded, because it is when the catalog was read rather than what it
+// said.
+func (s *Snapshot) fingerprint() uint64 {
+	h := fnv.New64a()
+	num := func(v int64) { _ = binary.Write(h, binary.LittleEndian, v) }
+	str := func(v string) { num(int64(len(v))); _, _ = io.WriteString(h, v) }
+	strs := func(vs []string) {
+		num(int64(len(vs)))
+		for _, v := range vs {
+			str(v)
+		}
+	}
+	flag := func(v bool) {
+		if v {
+			num(1)
+		} else {
+			num(0)
+		}
+	}
+	num(s.ShardMapGeneration)
+	num(s.DesiredGeneration)
+	str(s.ServingSet)
+	flag(s.WriteFence)
+
+	for _, set := range slices.Sorted(maps.Keys(s.ShardSets)) {
+		str(set)
+		for _, r := range s.ShardSets[set] {
+			num(int64(r.ShardID))
+			num(r.Start)
+			num(r.End)
+		}
+	}
+	for _, k := range slices.SortedFunc(maps.Keys(s.Serving), compareShardKeys) {
+		str(k.ShardSet)
+		num(int64(k.ShardID))
+		v := s.Serving[k]
+		str(v.PrimaryEndpoint)
+		num(v.Epoch)
+		str(v.State)
+		flag(v.Migrating)
+	}
+	for _, name := range slices.Sorted(maps.Keys(s.Databases)) {
+		d := s.Databases[name]
+		str(d.Name)
+		str(d.DefaultPlacement)
+		num(int64(d.HomeShard))
+		num(d.DesiredGeneration)
+	}
+	for _, k := range slices.SortedFunc(maps.Keys(s.Tables), compareTableKeys) {
+		str(k.Database)
+		str(k.SchemaName)
+		str(k.TableName)
+		t := s.Tables[k]
+		str(t.Placement)
+		str(t.ShardKey)
+		num(t.Generation)
+		strs(t.SequenceColumns)
+		strs(t.HiddenColumns)
+		strs(t.VisibleColumns)
+		flag(t.Migrating)
+		flag(t.ReferenceChecked)
+		strs(t.ReferenceHazards)
+	}
+	for _, name := range slices.Sorted(maps.Keys(s.Sequences)) {
+		str(name)
+		flag(s.Sequences[name])
+	}
+	return h.Sum64()
+}
+
+func compareShardKeys(a, b ShardKey) int {
+	if c := cmp.Compare(a.ShardSet, b.ShardSet); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.ShardID, b.ShardID)
+}
+
+func compareTableKeys(a, b TableKey) int {
+	if c := cmp.Compare(a.Database, b.Database); c != 0 {
+		return c
+	}
+	if c := cmp.Compare(a.SchemaName, b.SchemaName); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.TableName, b.TableName)
 }
 
 func (s *Snapshot) scanMigrating() bool {
