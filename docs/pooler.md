@@ -37,6 +37,19 @@
   session whose `Execute` stream has been gone for `--reserve-timeout`
   (5m) is released the same way, so a router that died without `Release`
   cannot hold a backend forever.
+
+  An expiry that rolls back an **open transaction** is remembered for half
+  an hour: the next `Execute` for that session id is refused with
+  `Aborted`, naming the timeout and saying the transaction was rolled back,
+  rather than being handed a fresh session that would let the client carry
+  on as though its transaction were still open. The refusal is once -- the
+  session id works again immediately afterwards, as a new session. An idle
+  reservation expiring costs the client nothing and is silent.
+
+  This does not stop the expiry taking the transaction: a client that sits
+  idle inside one for longer than `--reserve-timeout`, with its router
+  perfectly alive, still loses it. Keeping such a session is a router-side
+  liveness ping and is tracked separately.
 - **Asynchronous messages.** `NoticeResponse`, `ParameterStatus` and
   `NotificationResponse` (LISTEN payloads) from the backend are forwarded on
   the session's stream in order.

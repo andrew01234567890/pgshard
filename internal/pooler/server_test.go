@@ -826,3 +826,81 @@ func BenchmarkSessionLookupWithReservations(b *testing.B) {
 		})
 	}
 }
+
+// TestExpiredReservationWithATransactionIsReported: a reserved session that
+// loses its stream for longer than the timeout is rolled back and dropped.
+// If the next attach were simply given a fresh session, the client would
+// carry on as though its transaction were still open and find out only when
+// the next statement behaved as if nothing had begun.
+func TestExpiredReservationWithATransactionIsReported(t *testing.T) {
+	// The default five-minute timeout, so nothing expires on its own while
+	// the test is setting up: the sweep below is the only one that matters
+	// and it is driven with a clock of the test's choosing.
+	h := startHarness(t, PoolConfig{})
+	ctx := context.Background()
+	if _, err := h.client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: "s", Generation: gen(7, 3)}); err != nil {
+		t.Fatal(err)
+	}
+	stream, err := h.client.Execute(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, stream, queryReq("s", "begin", gen(7, 3), identity("alice")))
+	_ = stream.CloseSend()
+	waitFor(t, func() bool { return !h.attached() })
+
+	h.srv.expireReservations(time.Now().Add(10 * time.Minute))
+
+	next, err := h.client.Execute(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := next.Send(queryReq("s", "select 1", gen(7, 3), identity("alice"))); err != nil {
+		t.Fatal(err)
+	}
+	_, err = next.Recv()
+	if status.Code(err) != codes.Aborted {
+		t.Fatalf("attach after an expiry that rolled a transaction back: %v", err)
+	}
+	if !strings.Contains(err.Error(), "transaction was rolled back") {
+		t.Errorf("the error must say what happened: %v", err)
+	}
+
+	// Told once. A session id that comes back again is a new session.
+	third, err := h.client.Execute(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := firstError(roundTrip(t, third, queryReq("s", "select 1", gen(7, 3), identity("alice")))); e != nil {
+		t.Errorf("the session must work again once the router has been told: %v", e)
+	}
+	_ = third.CloseSend()
+}
+
+// TestExpiredReservationWithoutATransactionIsSilent: an idle reservation
+// expiring costs the client nothing, so there is nothing to report.
+func TestExpiredReservationWithoutATransactionIsSilent(t *testing.T) {
+	h := startHarness(t, PoolConfig{})
+	ctx := context.Background()
+	if _, err := h.client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: "s", Generation: gen(7, 3)}); err != nil {
+		t.Fatal(err)
+	}
+	stream, err := h.client.Execute(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, stream, queryReq("s", "select 1", gen(7, 3), identity("alice")))
+	_ = stream.CloseSend()
+	waitFor(t, func() bool { return !h.attached() })
+
+	h.srv.expireReservations(time.Now().Add(10 * time.Minute))
+
+	next, err := h.client.Execute(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := firstError(roundTrip(t, next, queryReq("s", "select 1", gen(7, 3), identity("alice")))); e != nil {
+		t.Errorf("an idle reservation expiring must cost the client nothing: %v", e)
+	}
+	_ = next.CloseSend()
+}
