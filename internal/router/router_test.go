@@ -405,8 +405,13 @@ func TestCopyFromStdin(t *testing.T) {
 	if err := conn.QueryRow(ctx, "select rows").Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if n != 3 && n != 0 {
-		t.Fatalf("rows after copy: %d", n)
+	// Exactly three. The count used to be allowed to be zero as well,
+	// because the fake shard modelled its table on whichever backend ran
+	// the statement and a session under transaction pooling reads back
+	// through a different one -- so the assertion could not fail for the
+	// thing the test is named after.
+	if n != 3 {
+		t.Fatalf("rows after copy: %d, want 3", n)
 	}
 	if err := conn.QueryRow(ctx, "select 1").Scan(&n); err != nil || n != 1 {
 		t.Fatalf("session after copy: %v", err)

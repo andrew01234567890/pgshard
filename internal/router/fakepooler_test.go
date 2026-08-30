@@ -27,7 +27,12 @@ type fakePooler struct {
 	pgshardv1.UnimplementedPoolerServer
 	gen, epoch uint64
 
-	mu       sync.Mutex
+	mu sync.Mutex
+	// rows models the shard's table, not one backend's view of it: a
+	// session under transaction pooling gets a different backend for its
+	// next statement, and a table that only one backend could see made
+	// "how many rows did the COPY persist?" unanswerable.
+	rows     int
 	backends map[string]*fakeBackend
 	reserved map[string]bool
 	reserves []string
@@ -208,7 +213,6 @@ type fakeBackend struct {
 	gucs  map[string]string
 	stmts map[string]string
 	tx    byte
-	rows  int
 	// xidAssigned mirrors pg_current_xact_id_if_assigned(): set by DML and
 	// by "select write_fn()".
 	xidAssigned bool
@@ -546,7 +550,7 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 		}
 		return true, s.complete("SELECT 1")
 	case strings.HasPrefix(q, "select write_fn()"):
-		b.rows++
+		s.f.addRows(1)
 		b.xidAssigned = true
 		if err := s.rowDesc("write_fn", 23); err != nil {
 			return true, err
@@ -671,12 +675,12 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 		if err := s.rowDesc("n", 23); err != nil {
 			return true, err
 		}
-		if err := s.row(fmt.Sprint(b.rows)); err != nil {
+		if err := s.row(fmt.Sprint(s.f.rowCount())); err != nil {
 			return true, err
 		}
 		return true, s.complete("SELECT 1")
 	case strings.HasPrefix(q, "insert into "):
-		b.rows++
+		s.f.addRows(1)
 		b.xidAssigned = true
 		return true, s.complete("INSERT 0 1")
 	case strings.HasPrefix(q, "update "):
@@ -689,7 +693,7 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 		if err := s.rowDesc("id", 23); err != nil {
 			return true, err
 		}
-		if err := s.row(fmt.Sprint(b.rows)); err != nil {
+		if err := s.row(fmt.Sprint(s.f.rowCount())); err != nil {
 			return true, err
 		}
 		return true, s.complete("SELECT 1")
@@ -710,7 +714,6 @@ func (s *fakeStream) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) 
 		}
 		return s.rfq()
 	}
-	b := s.f.backend(s.sid)
 	switch m := req.Message.(type) {
 	case *pgshardv1.ExecuteRequest_SimpleQuery:
 		var results []string
@@ -737,7 +740,7 @@ func (s *fakeStream) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) 
 		if len(strings.TrimSpace(string(s.copyIn))) == 0 {
 			n = 0
 		}
-		b.rows += n
+		s.f.addRows(n)
 		s.copyIn, s.inCopy = nil, false
 		if err := s.complete(fmt.Sprintf("COPY %d", n)); err != nil {
 			return err
@@ -901,6 +904,20 @@ func paramOIDs(sql string) []uint32 {
 		out[i] = oid
 	}
 	return out
+}
+
+// addRows and rowCount keep the modelled table on the shard rather than on
+// whichever backend happened to run the statement.
+func (f *fakePooler) addRows(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rows += n
+}
+
+func (f *fakePooler) rowCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.rows
 }
 
 func (f *fakePooler) Execute(stream pgshardv1.Pooler_ExecuteServer) error {
