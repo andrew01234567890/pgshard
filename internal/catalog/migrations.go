@@ -159,7 +159,8 @@ type MigrationCheck struct {
 	// Name is the constraint, column, index or partition the check is on.
 	Name string `json:"name,omitempty"`
 	// NameSchema is the schema of Name when it is a partition named with
-	// an explicit schema; empty matches any schema.
+	// an explicit schema; empty resolves Name through the search_path, as
+	// the statement itself does.
 	NameSchema string `json:"name_schema,omitempty"`
 }
 
