@@ -16,6 +16,7 @@ var unsafeKeys = map[string]string{
 	"ssl":                           "TLS is required between processes",
 	"data_checksums":                "checksums are decided at initdb time",
 	"password_encryption":           "scram-sha-256 is the only accepted password scheme",
+	"standard_conforming_strings":   "the router parses shard keys out of string literals with it on",
 	"track_commit_timestamp":        "commit timestamps are required for conflict resolution",
 	"max_replication_slots":         "derived from replicas and slots",
 	"max_wal_senders":               "derived from replicas and slots",
