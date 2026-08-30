@@ -36,6 +36,11 @@ const (
 	RoleReader = "pgshard_reader"
 )
 
+// RouterRole is the login role the router uses to reach the catalog. It has
+// what pgshard_admin has and nothing more: not the superuser password, from
+// which the agent control-plane token is also derived.
+const RouterRole = "pgshard_router"
+
 //go:embed schema/*.sql
 var schemaFS embed.FS
 

@@ -48,6 +48,7 @@ type Prober interface {
 	ProbeStandby(ctx context.Context, dsn string) (StandbyState, error)
 	SetSyncStandbyNames(ctx context.Context, dsn, value string) error
 	MigrateCatalog(ctx context.Context, dsn string) error
+	SetRouterPassword(ctx context.Context, dsn, password string) error
 	// PublishShardStatus upserts pgshard.shard_status for the given shard
 	// groups in one statement; it never lowers primary_epoch. Non-serving
 	// groups stay provisioning.
@@ -575,6 +576,22 @@ func (PgxProber) MigrateCatalog(ctx context.Context, dsn string) error {
 	return catalog.Migrate(ctx, conn)
 }
 
+// SetRouterPassword gives the router's login role the password the operator
+// generated for this cluster. It runs on every pass: the role is the same
+// for every cluster and its password is not, so the catalog has to be told
+// which one, and saying it again is how a restored or rebuilt catalog gets
+// back in step with the Secret.
+func (PgxProber) SetRouterPassword(ctx context.Context, dsn, password string) error {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	// ALTER ROLE takes no parameters, so the password is a quoted literal.
+	_, err = conn.Exec(ctx, `ALTER ROLE `+catalog.RouterRole+` WITH LOGIN PASSWORD `+quoteLiteral(password))
+	return err
+}
+
 func quoteLiteral(s string) string {
 	var b []byte
 	b = append(b, '\'')
@@ -638,6 +655,12 @@ func (b boundedProber) MigrateCatalog(ctx context.Context, dsn string) error {
 	ctx, cancel := b.bound(ctx)
 	defer cancel()
 	return b.Inner.MigrateCatalog(ctx, dsn)
+}
+
+func (b boundedProber) SetRouterPassword(ctx context.Context, dsn, password string) error {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.SetRouterPassword(ctx, dsn, password)
 }
 
 func (b boundedProber) PublishShardStatus(ctx context.Context, dsn string, rows []ShardStatus) error {
