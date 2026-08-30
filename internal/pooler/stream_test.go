@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -258,6 +259,38 @@ func TestStreamRejectsUnsafeSlotAndOptionNames(t *testing.T) {
 	for _, key := range []string{"proto_version", "publication_names", "streaming", "messages", "_x"} {
 		if !optionKeyRE.MatchString(key) {
 			t.Errorf("option key %q was rejected; the pgoutput options pgshard itself sets must pass", key)
+		}
+	}
+}
+
+// TestOnlyAGonePositionSaysPositionTooOld: a consumer told POSITION_TOO_OLD
+// throws its checkpoints away and copies everything again. Saying it about
+// a missing publication or a rejected option buys a full re-snapshot for a
+// configuration mistake, so the reason belongs only to the failures that
+// mean the position itself is gone.
+func TestOnlyAGonePositionSaysPositionTooOld(t *testing.T) {
+	gone := []*pgconn.PgError{
+		{Code: "55000", Message: `can no longer get changes from replication slot "s"`},
+		{Code: "55000", Message: `replication slot "s" has been invalidated`},
+		{Code: "42704", Message: `replication slot "s" does not exist`},
+		{Code: "58P01", Message: `requested WAL segment 000000010000000000000002 has already been removed`},
+		{Code: "XX000", Message: `requested WAL segment has already been removed`},
+	}
+	for _, e := range gone {
+		if !positionGone(e) {
+			t.Errorf("%s %q: want the position reported gone", e.Code, e.Message)
+		}
+	}
+	kept := []*pgconn.PgError{
+		{Code: "42704", Message: `publication "pgshard_all" does not exist`},
+		{Code: "42501", Message: `permission denied for replication`},
+		{Code: "22023", Message: `option "proto_version" is not supported`},
+		{Code: "55000", Message: `replication slot "s" is active for PID 42`},
+		{Code: "XX000", Message: `internal error`},
+	}
+	for _, e := range kept {
+		if positionGone(e) {
+			t.Errorf("%s %q: a consumer must not be told to re-snapshot for this", e.Code, e.Message)
 		}
 	}
 }
