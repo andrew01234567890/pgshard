@@ -80,6 +80,28 @@ The executor follows the Vitess model on the merged streaming machinery
    (default 24h). `spec.resharding.pauseBefore: switchWrites` holds the
    workflow before the write switch for manual confirmation.
 
+## What it costs while it runs
+
+A reshard is not an in-place split. The targets are new shard groups, so
+for the length of the workflow **and** for `retireOldGroupsAfter`
+afterwards (default 24h) the shard set holds both the old groups and the
+new ones. Plan for roughly twice the storage of the moving ranges, plus
+the volumes the operator provisions for the new members, and note that the
+window is a day by default: lowering `retireOldGroupsAfter` shortens it at
+the cost of the interval in which switching back is still cheap.
+
+Each source carries one replication slot per target it feeds
+(`pgshard_reshard_<target>_<table set>_<source>`), so a 1→2 split puts two
+on the source and a 2→1 merge puts one on each. A slot holds WAL on its
+source until the target has confirmed it, which means a target that falls
+behind consumes disk on the shard that is still serving. `max_slot_wal_keep_size`
+and `max_replication_slots` are sized for this by the tuner, and the
+workflow throttles on replica lag and bloat pressure on both sides rather
+than copying as fast as the disks allow.
+
+The copy competes with the workload for I/O on the source. The cutover
+itself is a sub-second write pause; everything before it is background.
+
 ## Observing and controlling workflows
 
 ```sql
