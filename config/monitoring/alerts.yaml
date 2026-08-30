@@ -111,7 +111,10 @@ spec:
           labels:
             severity: warning
           annotations:
-            summary: A workflow is paused at cutover
+            summary: A workflow is held at a configured cutover pause
             description: >-
-              A reshard/placement/upgrade workflow has been paused for more
-              than 30 minutes and is waiting for an operator to resume it.
+              {{ $labels.kind }} workflow {{ $labels.id }} on shard set
+              {{ $labels.shard_set }} has waited more than 30 minutes at its
+              configured pause before {{ $labels.pause }}; it proceeds only
+              when an operator lets it. Workflows an operator paused outright
+              are pgshard_controller_workflows{state="paused"} instead.
