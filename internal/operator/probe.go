@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
+	"github.com/andrew01234567890/pgshard/internal/pgwire"
 	"github.com/andrew01234567890/pgshard/internal/placement"
 )
 
@@ -56,6 +57,10 @@ type Prober interface {
 	WriteFenced(ctx context.Context, dsn string) (bool, error)
 	MigrateCatalog(ctx context.Context, dsn string) error
 	SetRouterPassword(ctx context.Context, dsn, password string) error
+	// SeedBootstrapRole publishes a SCRAM verifier for rolname in
+	// pgshard.roles, so the generated credential can reach the cluster
+	// through the router and create the first role of its own.
+	SeedBootstrapRole(ctx context.Context, dsn, rolname, password string) error
 	// PublishShardStatus upserts pgshard.shard_status for the given shard
 	// groups in one statement; it never lowers primary_epoch. Non-serving
 	// groups stay provisioning.
@@ -639,6 +644,45 @@ func (PgxProber) SetRouterPassword(ctx context.Context, dsn, password string) er
 	return err
 }
 
+// SeedBootstrapRole implements Prober. Nothing else writes pgshard.roles
+// until somebody logs in, and nobody can log in until something writes
+// pgshard.roles: the router authenticates against that table alone, and
+// the migrations leave it empty. So the credential the operator generated
+// for the cluster's superuser is published there, and the first
+// administrator connects with the one secret that already exists.
+//
+// The verifier is rebuilt only when it does not already match the
+// password, so a reconcile that changes nothing writes nothing -- and an
+// operator who rotated the verifier by hand does not have it replaced on
+// every pass.
+func (PgxProber) SeedBootstrapRole(ctx context.Context, dsn, rolname, password string) error {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	var existing string
+	err = conn.QueryRow(ctx, `SELECT coalesce(verifier, '') FROM pgshard.roles WHERE rolname = $1`, rolname).Scan(&existing)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	if existing != "" {
+		if old, perr := pgwire.ParseSCRAMVerifier(existing); perr == nil {
+			if same, berr := pgwire.BuildSCRAMVerifier(password, old.Salt, old.Iterations); berr == nil && same.String() == existing {
+				return nil
+			}
+		}
+	}
+	v, err := pgwire.BuildSCRAMVerifier(password, nil, pgwire.DefaultSCRAMIterations)
+	if err != nil {
+		return err
+	}
+	_, err = conn.Exec(ctx, `INSERT INTO pgshard.roles (rolname, verifier, login, createdb, createrole)
+		VALUES ($1, $2, true, true, true)
+		ON CONFLICT (rolname) DO UPDATE SET verifier = EXCLUDED.verifier, updated_at = now()`, rolname, v.String())
+	return err
+}
+
 func quoteLiteral(s string) string {
 	var b []byte
 	b = append(b, '\'')
@@ -720,6 +764,12 @@ func (b boundedProber) SetRouterPassword(ctx context.Context, dsn, password stri
 	ctx, cancel := b.bound(ctx)
 	defer cancel()
 	return b.Inner.SetRouterPassword(ctx, dsn, password)
+}
+
+func (b boundedProber) SeedBootstrapRole(ctx context.Context, dsn, rolname, password string) error {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.SeedBootstrapRole(ctx, dsn, rolname, password)
 }
 
 func (b boundedProber) PublishShardStatus(ctx context.Context, dsn string, rows []ShardStatus) error {
