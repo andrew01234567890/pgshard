@@ -163,7 +163,7 @@ func (r *ClusterReconciler) reconcileCatalogUpgrade(ctx context.Context, c *pgsh
 		up.Stage = CatalogUpgradeCopying
 		up.Message = ""
 	case CatalogUpgradeCopying:
-		if err := r.Prober.EnsureCatalogCopy(ctx, dsn, r.catalogTargetDSN(c, *target, password)); err != nil {
+		if err := r.Prober.EnsureCatalogCopy(ctx, CatalogSide{DSN: dsn}, CatalogSide{DSN: r.catalogTargetDSN(c, *target, password)}); err != nil {
 			up.Message = "catalog copy: " + err.Error()
 			break
 		}
@@ -190,7 +190,7 @@ func (r *ClusterReconciler) reconcileCatalogUpgrade(ctx context.Context, c *pgsh
 		if err := r.ensureCatalogGenerationEndpoint(ctx, c, Groups(c)[0]); err != nil {
 			return obs, err
 		}
-		if err := r.Prober.CutoverCatalog(ctx, dsn, r.catalogTargetDSN(c, *target, password)); err != nil {
+		if err := r.Prober.CutoverCatalog(ctx, CatalogSide{DSN: dsn}, CatalogSide{DSN: r.catalogTargetDSN(c, *target, password)}); err != nil {
 			up.Message = "catalog cutover: " + err.Error()
 			break
 		}

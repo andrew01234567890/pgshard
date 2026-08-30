@@ -92,7 +92,7 @@ type Prober interface {
 	// from the old-major to the new-major catalog primary: publication on
 	// the source, truncate plus subscription with the initial copy on the
 	// target. Idempotent.
-	EnsureCatalogCopy(ctx context.Context, srcDSN, tgtDSN string) error
+	EnsureCatalogCopy(ctx context.Context, source, target CatalogSide) error
 	// CatalogCopyCaughtUp reports whether the catalog copy subscription
 	// consumed the source's current WAL position; lag describes the rest.
 	CatalogCopyCaughtUp(ctx context.Context, srcDSN string) (bool, string, error)
@@ -100,7 +100,7 @@ type Prober interface {
 	// backends terminated), waits for the subscription to drain, carries
 	// the sequence positions over and drops the subscription so the new
 	// primary owns the catalog.
-	CutoverCatalog(ctx context.Context, srcDSN, tgtDSN string) error
+	CutoverCatalog(ctx context.Context, source, target CatalogSide) error
 	// RollbackCatalog reverses a cutover: it fences the new catalog,
 	// replays what it accepted back into the old group over the reverse
 	// subscription armed at cutover, carries the sequences back and lets
@@ -764,10 +764,10 @@ func (b boundedProber) ServerMajor(ctx context.Context, dsn string) (int, error)
 	return b.Inner.ServerMajor(ctx, dsn)
 }
 
-func (b boundedProber) EnsureCatalogCopy(ctx context.Context, srcDSN, tgtDSN string) error {
+func (b boundedProber) EnsureCatalogCopy(ctx context.Context, source, target CatalogSide) error {
 	ctx, cancel := b.bound(ctx)
 	defer cancel()
-	return b.Inner.EnsureCatalogCopy(ctx, srcDSN, tgtDSN)
+	return b.Inner.EnsureCatalogCopy(ctx, source, target)
 }
 
 func (b boundedProber) CatalogCopyCaughtUp(ctx context.Context, srcDSN string) (bool, string, error) {
@@ -776,10 +776,10 @@ func (b boundedProber) CatalogCopyCaughtUp(ctx context.Context, srcDSN string) (
 	return b.Inner.CatalogCopyCaughtUp(ctx, srcDSN)
 }
 
-func (b boundedProber) CutoverCatalog(ctx context.Context, srcDSN, tgtDSN string) error {
+func (b boundedProber) CutoverCatalog(ctx context.Context, source, target CatalogSide) error {
 	ctx, cancel := b.boundBy(ctx, catalogCallTimeout)
 	defer cancel()
-	return b.Inner.CutoverCatalog(ctx, srcDSN, tgtDSN)
+	return b.Inner.CutoverCatalog(ctx, source, target)
 }
 
 func (b boundedProber) RollbackCatalog(ctx context.Context, oldDSN, newDSN string) error {

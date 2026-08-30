@@ -110,11 +110,33 @@ func (PgxProber) ServerMajor(ctx context.Context, dsn string) (int, error) {
 	return num / 10000, nil
 }
 
-// EnsureCatalogCopy implements Prober. The subscription's conninfo is the
-// source DSN as the target pod resolves it (a Service name), so it must be
-// the in-cluster form.
-func (p PgxProber) EnsureCatalogCopy(ctx context.Context, srcDSN, tgtDSN string) error {
-	src, err := pgx.Connect(ctx, srcDSN)
+// CatalogSide is one side of a catalog upgrade: the DSN the operator dials
+// it with, and the conninfo the other side's apply worker dials it with.
+//
+// In a cluster those are the same in-cluster Service DSN, which is why the
+// two uses were one string. They are not the same thing, and nowhere else
+// can they coincide: a test process reaches a container through a published
+// 127.0.0.1 port while the peer container reaches it by name on a docker
+// network, and no single address works from both. internal/controller has
+// the same split as Copier.SourceConnInfo.
+type CatalogSide struct {
+	// DSN is what the operator connects with.
+	DSN string
+	// ConnInfo is what goes into CREATE SUBSCRIPTION on the other side.
+	// Empty means the DSN, which is what a cluster wants.
+	ConnInfo string
+}
+
+func (s CatalogSide) connInfo() string {
+	if s.ConnInfo != "" {
+		return s.ConnInfo
+	}
+	return s.DSN
+}
+
+// EnsureCatalogCopy implements Prober.
+func (p PgxProber) EnsureCatalogCopy(ctx context.Context, source, target CatalogSide) error {
+	src, err := pgx.Connect(ctx, source.DSN)
 	if err != nil {
 		return fmt.Errorf("catalog source: %w", err)
 	}
@@ -128,7 +150,7 @@ func (p PgxProber) EnsureCatalogCopy(ctx context.Context, srcDSN, tgtDSN string)
 			return fmt.Errorf("create publication: %w", err)
 		}
 	}
-	tgt, err := pgx.Connect(ctx, tgtDSN)
+	tgt, err := pgx.Connect(ctx, target.DSN)
 	if err != nil {
 		return fmt.Errorf("catalog target: %w", err)
 	}
@@ -144,7 +166,7 @@ func (p PgxProber) EnsureCatalogCopy(ctx context.Context, srcDSN, tgtDSN string)
 		return err
 	}
 	if _, err := tgt.Exec(ctx, fmt.Sprintf(`CREATE SUBSCRIPTION %s CONNECTION %s PUBLICATION %s WITH (copy_data = true, streaming = parallel)`,
-		CatalogUpgradeSubscription, quoteLiteral(srcDSN), CatalogUpgradePublication)); err != nil {
+		CatalogUpgradeSubscription, quoteLiteral(source.connInfo()), CatalogUpgradePublication)); err != nil {
 		return fmt.Errorf("create subscription: %w", err)
 	}
 	return nil
@@ -272,8 +294,8 @@ func catalogCutoverResume(slotOnSource, subOnTarget bool) (alreadyCutOver bool, 
 }
 
 // CutoverCatalog implements Prober.
-func (p PgxProber) CutoverCatalog(ctx context.Context, srcDSN, tgtDSN string) error {
-	src, err := pgx.Connect(ctx, srcDSN)
+func (p PgxProber) CutoverCatalog(ctx context.Context, source, target CatalogSide) error {
+	src, err := pgx.Connect(ctx, source.DSN)
 	if err != nil {
 		return fmt.Errorf("catalog source: %w", err)
 	}
@@ -281,7 +303,7 @@ func (p PgxProber) CutoverCatalog(ctx context.Context, srcDSN, tgtDSN string) er
 	if err := fenceCatalog(ctx, src); err != nil {
 		return fmt.Errorf("fence catalog source: %w", err)
 	}
-	tgt, err := pgx.Connect(ctx, tgtDSN)
+	tgt, err := pgx.Connect(ctx, target.DSN)
 	if err != nil {
 		return fmt.Errorf("catalog target: %w", err)
 	}
@@ -304,7 +326,7 @@ func (p PgxProber) CutoverCatalog(ctx context.Context, srcDSN, tgtDSN string) er
 		// reverse pair still has to be armed - a run that died between the
 		// two would otherwise leave no way back, which is the data loss
 		// this whole path exists to prevent.
-		return ensureCatalogRollback(ctx, src, tgt, tgtDSN)
+		return ensureCatalogRollback(ctx, src, tgt, target.connInfo())
 	}
 	var fence string
 	if err := src.QueryRow(ctx, `SELECT pg_current_wal_lsn()::text`).Scan(&fence); err != nil {
@@ -324,7 +346,7 @@ func (p PgxProber) CutoverCatalog(ctx context.Context, srcDSN, tgtDSN string) er
 	// write to a read-only database - but its slot is created now, so a
 	// rollback replays everything the new catalog accepted rather than
 	// throwing it away.
-	if err := ensureCatalogRollback(ctx, src, tgt, tgtDSN); err != nil {
+	if err := ensureCatalogRollback(ctx, src, tgt, target.connInfo()); err != nil {
 		return err
 	}
 	return nil
