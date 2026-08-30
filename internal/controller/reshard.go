@@ -119,6 +119,22 @@ func reconcileReshards(ctx context.Context, tx pgx.Tx, res *Result) error {
 				res.Invalid = append(res.Invalid, fmt.Sprintf("shard set %s: %v", ss.Name, err))
 				continue
 			}
+			// Only one workflow may be moving data out of a given set: a
+			// second would flip onto a set the first has retired. The
+			// catalog enforces it, and an insert that violated it would
+			// abort the whole reconcile transaction, so the pass says why
+			// and leaves the set declared for a later one.
+			var moving bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pgshard.workflows
+				WHERE kind = ANY($1) AND state = ANY($2) AND spec->>'source_set' = $3
+				  AND spec->>'source_set' IS DISTINCT FROM spec->>'shard_set')`,
+				copyKinds, activeStates, source).Scan(&moving); err != nil {
+				return err
+			}
+			if moving {
+				res.Invalid = append(res.Invalid, fmt.Sprintf("shard set %s: another workflow is already moving data out of %s; it starts when that one ends", ss.Name, source))
+				continue
+			}
 			kind := KindReshard
 			spec := map[string]any{"shard_set": ss.Name, "generation": ss.Generation, "desired_generation": ss.DesiredGeneration, "ranges": specRanges(ranges), "source_set": source}
 			srv := setByName[source]

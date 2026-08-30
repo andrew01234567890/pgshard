@@ -272,3 +272,79 @@ func TestCutoverFenceWaitsForARunningMigrationOnPostgres(t *testing.T) {
 		t.Fatalf("%d shards fenced after the migration finished, want 2", n)
 	}
 }
+
+// TestOnlyOneWorkflowMayMoveOutOfAServingSetOnPostgres: two workflows
+// moving data out of the same serving set can retire each other's source.
+// The flip refuses that when it reaches it, which is late: by then both
+// have provisioned groups, copied data and fenced writes. The catalog now
+// refuses the second at creation, and an in-place reshard of the serving
+// set -- which has no other set to retire -- is deliberately still allowed,
+// because a cluster-wide rule would queue every newly declared set behind
+// work the reconciler recreates on every pass.
+func TestOnlyOneWorkflowMayMoveOutOfAServingSetOnPostgres(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	dsn := startPostgres(t)
+	conn := connect(t, dsn)
+	if err := catalog.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	rs, _ := placement.Split(2)
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []struct {
+		name  string
+		gen   int64
+		state string
+	}{{"default", 1, catalog.ShardSetServing}, {"g2", 2, catalog.ShardSetDesired}, {"g3", 3, catalog.ShardSetDesired}} {
+		if err := catalog.MaterializeShardSet(ctx, tx, s.name, s.gen, s.state, rs, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, `INSERT INTO pgshard.serving (shard_set, generation) VALUES ('default', 1)`)
+
+	res := reconcile(t, conn)
+	if res.WorkflowsCreated != 1 {
+		t.Fatalf("two sets declared at once must produce one workflow, not %d: %+v", res.WorkflowsCreated, res)
+	}
+	if len(res.Invalid) != 1 || !strings.Contains(res.Invalid[0], "already moving data out of default") {
+		t.Fatalf("the pass must say why the second set waits: %+v", res.Invalid)
+	}
+	if n := queryOne[int64](t, conn, `SELECT count(*) FROM pgshard.workflows WHERE kind = ANY($1)`, copyKinds); n != 1 {
+		t.Fatalf("%d workflows after the pass", n)
+	}
+
+	// The catalog refuses it by any path, not only through the reconciler.
+	_, err = conn.Exec(ctx, `INSERT INTO pgshard.workflows (id, kind, state, spec)
+		VALUES (gen_random_uuid(), 'reshard', 'pending', '{"shard_set": "g3", "source_set": "default"}'::jsonb)`)
+	if err == nil || !strings.Contains(err.Error(), "workflows_one_moving_per_source") {
+		t.Fatalf("a second moving workflow inserted directly: %v", err)
+	}
+
+	// A workflow out of a different source is not in the hazard: two
+	// workflows can only retire each other's source when it is the same
+	// source, and the rule is that narrow on purpose.
+	if _, err := conn.Exec(ctx, `INSERT INTO pgshard.workflows (id, kind, state, spec)
+		VALUES (gen_random_uuid(), 'reshard', 'pending', '{"shard_set": "g9", "source_set": "g8"}'::jsonb)`); err != nil {
+		t.Fatalf("a move out of another source must not be blocked: %v", err)
+	}
+
+	// An in-place reshard of the serving set is not a move and is allowed
+	// beside it: its source and target are the same set.
+	if _, err := conn.Exec(ctx, `INSERT INTO pgshard.workflows (id, kind, state, spec)
+		VALUES (gen_random_uuid(), 'reshard', 'pending', '{"shard_set": "default"}'::jsonb)`); err != nil {
+		t.Fatalf("an in-place reshard must not be blocked: %v", err)
+	}
+
+	// Once the first ends, the next declared set may move.
+	mustExec(t, conn, `UPDATE pgshard.workflows SET state = 'completed' WHERE spec->>'source_set' IS NOT NULL`)
+	if _, err := conn.Exec(ctx, `INSERT INTO pgshard.workflows (id, kind, state, spec)
+		VALUES (gen_random_uuid(), 'reshard', 'pending', '{"shard_set": "g3", "source_set": "default"}'::jsonb)`); err != nil {
+		t.Fatalf("a moving workflow after the first ended: %v", err)
+	}
+}
