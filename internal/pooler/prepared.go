@@ -1,7 +1,6 @@
 package pooler
 
 import (
-	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -108,19 +107,78 @@ func upperASCII(b byte) byte {
 	return b
 }
 
-var sqlPrepareRE = regexp.MustCompile(`(?i)\bPREPARE\s+(?:TRANSACTION\b)?`)
-
 // createsPrepared reports whether the SQL may create a statement with a
 // SQL-level PREPARE the pooler cannot name. PREPARE TRANSACTION creates
 // none, but a conservative match only costs an extra Close and a DISCARD
 // ALL on reuse.
 func createsPrepared(sql string) bool {
-	for _, m := range sqlPrepareRE.FindAllString(sql, -1) {
-		if !strings.Contains(strings.ToUpper(m), "TRANSACTION") {
+	for i := range len(sql) {
+		if !wordAt(sql, i, "PREPARE") {
+			continue
+		}
+		if !wordAt(sql, skipNoise(sql, i+len("PREPARE")), "TRANSACTION") {
 			return true
 		}
 	}
 	return false
+}
+
+// wordAt reports whether s holds word, upper-case ASCII, at i as a whole
+// token. PostgreSQL asks for no separator between a keyword and a quoted
+// identifier or a comment, so what ends the token is a byte that cannot
+// continue an identifier, not a space.
+func wordAt(s string, i int, word string) bool {
+	if i+len(word) > len(s) || (i > 0 && identByte(s[i-1])) {
+		return false
+	}
+	for j := range len(word) {
+		if upperASCII(s[i+j]) != word[j] {
+			return false
+		}
+	}
+	return i+len(word) == len(s) || !identByte(s[i+len(word)])
+}
+
+// identByte reports whether b can continue an unquoted identifier. Bytes
+// above ASCII can, but reading them as a boundary only over-reports a
+// PREPARE, and under-reporting one leaks a prepared statement into the
+// next session on the backend.
+func identByte(b byte) bool {
+	u := upperASCII(b)
+	return b == '_' || b == '$' || (b >= '0' && b <= '9') || (u >= 'A' && u <= 'Z' && b < 0x80)
+}
+
+// skipNoise returns the index of the first byte at or after i that is
+// neither whitespace nor a comment. Block comments nest in PostgreSQL.
+func skipNoise(s string, i int) int {
+	for i < len(s) {
+		switch {
+		case s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r' || s[i] == '\f' || s[i] == '\v':
+			i++
+		case strings.HasPrefix(s[i:], "--"):
+			nl := strings.IndexByte(s[i:], '\n')
+			if nl < 0 {
+				return len(s)
+			}
+			i += nl + 1
+		case strings.HasPrefix(s[i:], "/*"):
+			depth, j := 1, i+2
+			for j < len(s) && depth > 0 {
+				switch {
+				case strings.HasPrefix(s[j:], "/*"):
+					depth, j = depth+1, j+2
+				case strings.HasPrefix(s[j:], "*/"):
+					depth, j = depth-1, j+2
+				default:
+					j++
+				}
+			}
+			i = j
+		default:
+			return i
+		}
+	}
+	return i
 }
 
 // closeAction says what the relay does with the CloseComplete answering a

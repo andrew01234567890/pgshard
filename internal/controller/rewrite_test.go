@@ -298,3 +298,52 @@ func TestBackfillFailsWhenItDoesNotConverge(t *testing.T) {
 		t.Fatalf("state %s error %q", m.State, m.Error)
 	}
 }
+
+// TestAResumedRewriteWaitsOutTheSettleWindowAgain: the column list alone
+// does not say the wait for routers to reload it ran. A crash inside the
+// wait used to resume straight into ADD COLUMN, so a router still serving
+// the view from before the column list would expand SELECT * over the
+// hidden column.
+func TestAResumedRewriteWaitsOutTheSettleWindowAgain(t *testing.T) {
+	waited := func(settled bool) (time.Duration, bool, bool, []string) {
+		m := rewriteMigration("00000000-0000-0000-0000-00000000ab0d")
+		m.State = catalog.MigrationRunning
+		m.Meta.Rewrite.Columns = []string{"tenant_id", "id", "amount"}
+		m.Meta.Rewrite.Settled = settled
+		m.PerShard = map[string]catalog.ShardMigration{"0": {State: catalog.ShardPending}}
+		store := &memStore{migrations: []catalog.DDLMigration{m}, shards: []int32{0}}
+		shards := newFakeShards()
+		shards.columns = []string{"tenant_id", "id", "amount"}
+		shards.pks = []string{"id"}
+		a := newRewriteApplier(store, shards)
+		a.RewriteSettle = DefaultRewriteSettle
+		var slept time.Duration
+		var ranWhenSlept []string
+		a.Sleep = func(_ context.Context, d time.Duration) error {
+			slept, ranWhenSlept = slept+d, shards.statements(0)
+			return nil
+		}
+		if _, err := a.RunOnce(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		got := store.get(t, m.ID)
+		if got.State != catalog.MigrationComplete {
+			t.Fatalf("state %s: %s", got.State, got.Error)
+		}
+		return slept, has(ranWhenSlept, "ADD COLUMN"), got.Meta.Rewrite.Settled, shards.statements(0)
+	}
+
+	slept, addedFirst, recorded, ran := waited(false)
+	if slept < DefaultRewriteSettle {
+		t.Fatalf("a resumed rewrite waited %s, want at least one settle window of %s:\n%s", slept, DefaultRewriteSettle, strings.Join(ran, "\n"))
+	}
+	if addedFirst {
+		t.Fatal("the hidden column was added before the wait for routers to reload the column list")
+	}
+	if !recorded {
+		t.Fatal("the finished wait was not recorded, so every later resume waits again")
+	}
+	if slept, _, _, _ := waited(true); slept != 0 {
+		t.Fatalf("a rewrite that recorded a finished wait waited %s again", slept)
+	}
+}
