@@ -97,6 +97,28 @@ func requireDocker(tb testing.TB) {
 	}
 }
 
+// dockerHostPort reads back the 127.0.0.1 address Docker published for the
+// container's PostgreSQL port.
+func dockerHostPort(tb testing.TB, container string) string {
+	tb.Helper()
+	out, err := exec.Command("docker", "port", container, "5432/tcp").Output()
+	if err != nil {
+		tb.Fatalf("docker port %s: %v", container, err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if addr := strings.TrimSpace(line); strings.HasPrefix(addr, "127.0.0.1:") {
+			return addr
+		}
+	}
+	tb.Fatalf("docker port %s: no 127.0.0.1 mapping in %q", container, out)
+	return ""
+}
+
+// freePort is still how the pgshard binaries under test are given a listen
+// address: they take one on the command line and do not report a port they
+// chose themselves, so there is nothing to read back. The window is real but
+// small, and closing it means teaching each binary to accept :0 and say
+// where it landed.
 func freePort(tb testing.TB) int {
 	tb.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -109,17 +131,21 @@ func freePort(tb testing.TB) int {
 
 func startPostgres(tb testing.TB, name string, opts ...string) (addr, adminDSN string) {
 	tb.Helper()
-	port := freePort(tb)
 	script := `initdb -D /tmp/pgdata --auth=trust -U postgres >/dev/null &&
 		 printf 'host all postgres all trust\nhost all all all scram-sha-256\n' >> /tmp/pgdata/pg_hba.conf &&
 		 exec postgres -D /tmp/pgdata -c listen_addresses='*' -c wal_level=logical ` + strings.Join(opts, " ")
-	cname := fmt.Sprintf("pgshard-router-e2e-%s-%d", name, port)
-	out, err := exec.Command("docker", "run", "-d", "--rm", "--name", cname, "-p", fmt.Sprintf("127.0.0.1:%d:5432", port), "--entrypoint", "sh", pgImage(), "-ec", script).CombinedOutput()
+	cname := fmt.Sprintf("pgshard-router-e2e-%s-%d", name, time.Now().UnixNano())
+	// Docker chooses the host port and is asked which one it took. Choosing
+	// it here would mean binding a listener, closing it, and asking Docker
+	// to bind the same number a moment later; between those two anything
+	// else on the machine can take it, and "ports are not available" says
+	// nothing about the code under test.
+	out, err := exec.Command("docker", "run", "-d", "--rm", "--name", cname, "-p", "127.0.0.1::5432", "--entrypoint", "sh", pgImage(), "-ec", script).CombinedOutput()
 	if err != nil {
 		tb.Fatalf("docker run: %v: %s", err, out)
 	}
 	tb.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", cname).Run() })
-	addr = fmt.Sprintf("127.0.0.1:%d", port)
+	addr = dockerHostPort(tb, cname)
 	adminDSN = fmt.Sprintf("postgres://postgres@%s/postgres?sslmode=disable", addr)
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
