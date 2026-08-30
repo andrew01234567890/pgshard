@@ -256,12 +256,17 @@ func classify(node *pgquerypb.Node, c *StmtClass) error {
 	return nil
 }
 
-// protectedDurabilityGUCs are settings the router never lets a client change:
-// weakening them would let a transaction be acknowledged before its WAL is
-// durable, which silently breaks the durability that failover candidate
-// selection assumes. The safe value is forced as the server default instead.
-var protectedDurabilityGUCs = map[string]bool{
-	"synchronous_commit": true,
+// durabilityHint is the advice on every setting fixed for durability's sake.
+const durabilityHint = "durability and write-pause settings are fixed by the cluster; use BEGIN READ ONLY for a read-only transaction"
+
+// protectedGUCs are settings the router never lets a client change, each with
+// the reason it is fixed. The safe value is forced as the server default
+// instead.
+var protectedGUCs = map[string]string{
+	// Weakening this would let a transaction be acknowledged before its WAL
+	// is durable, which silently breaks the durability that failover
+	// candidate selection assumes.
+	"synchronous_commit": durabilityHint,
 	// The barrier pauses writes with default_transaction_read_only, so a
 	// client that can turn either of these off writes straight through a
 	// pause taken to make a cluster-consistent restore point -- and the
@@ -269,8 +274,16 @@ var protectedDurabilityGUCs = map[string]bool{
 	// override follows the session everywhere. BEGIN READ ONLY still gives
 	// a client a read-only transaction; only overriding the cluster's own
 	// setting is refused.
-	"default_transaction_read_only": true,
-	"transaction_read_only":         true,
+	"default_transaction_read_only": durabilityHint,
+	"transaction_read_only":         durabilityHint,
+	// The router parses every statement with standard_conforming_strings
+	// on, and hashes the shard key out of the parse tree. A session that
+	// turned it off would have the backend read '\141' as the one
+	// character a while the router hashed four -- so the row would be
+	// stored on one shard and looked for on another. The router also
+	// reports the setting as on in its ParameterStatus, which a client that
+	// could change it would be entitled to disbelieve.
+	"standard_conforming_strings": "pgshard parses and routes with standard_conforming_strings on; a session that read string literals differently from the router would place rows on a shard the router would not look on",
 }
 
 // refuseProtectedSetConfig refuses set_config('<protected>', ...) anywhere in a
@@ -384,9 +397,9 @@ func refuseProtectedGUC(name string) error {
 		err.Hint = "settings under the pgshard namespace belong to the control plane"
 		return err
 	}
-	if protectedDurabilityGUCs[strings.ToLower(name)] {
+	if hint, ok := protectedGUCs[strings.ToLower(name)]; ok {
 		err := pgwire.Errorf(pgwire.CodeInsufficientPrivilege, "changing %s is not permitted through pgshard", strings.ToLower(name))
-		err.Hint = "durability and write-pause settings are fixed by the cluster; use BEGIN READ ONLY for a read-only transaction"
+		err.Hint = hint
 		return err
 	}
 	return nil
