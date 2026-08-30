@@ -55,7 +55,8 @@ type RestorePointResult struct {
 type BarrierGroups interface {
 	// List returns every group: the catalog first, then the shards.
 	List(ctx context.Context) ([]GroupRef, error)
-	// PreparedCount counts router-coordinated prepared transactions on g.
+	// PreparedCount counts the prepared transactions on g, whoever
+	// prepared them.
 	PreparedCount(ctx context.Context, g GroupRef) (int, error)
 	// CreateRestorePoint creates the named restore point on g's primary and
 	// forces the WAL segment holding it out to the archive.
@@ -940,11 +941,20 @@ func scalar[T any](ctx context.Context, c groupConn, sql string, args ...any) (T
 	return pgx.CollectExactlyOneRow(rows, pgx.RowTo[T])
 }
 
-// PreparedCount implements BarrierGroups.
+// PreparedCount implements BarrierGroups. Every prepared transaction
+// counts, not only the ones pgshard coordinated: after PREPARE a backend
+// holds no transaction id, and COMMIT PREPARED is transaction control,
+// which PostgreSQL allows under a read-only default. So a two-phase
+// transaction pgshard did not prepare can commit inside the window the
+// pause is meant to have emptied, and land on one side of a barrier the
+// other shards know nothing about.
+//
+// The resolver keeps its own filter: finishing a transaction it did not
+// coordinate is a decision it has no right to make.
 func (s *SQLBarrierGroups) PreparedCount(ctx context.Context, g GroupRef) (int, error) {
 	var n int
 	err := s.with(ctx, g, func(c groupConn) (err error) {
-		n, err = scalar[int](ctx, c, `SELECT count(*)::int FROM pg_prepared_xacts WHERE gid LIKE $1`, GIDPrefix+"%")
+		n, err = scalar[int](ctx, c, `SELECT count(*)::int FROM pg_prepared_xacts`)
 		return err
 	})
 	return n, err

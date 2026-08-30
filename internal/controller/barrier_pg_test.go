@@ -283,3 +283,49 @@ func TestBarrierPauseAndWriterCountOnPostgres(t *testing.T) {
 		t.Fatalf("resumed shard still refuses writes: %v", err)
 	}
 }
+
+// TestDrainCountsAPreparedTransactionPgshardDidNotMake: after PREPARE a
+// backend holds no transaction id, and COMMIT PREPARED is transaction
+// control, which PostgreSQL allows under a read-only default. So a
+// two-phase transaction pgshard never coordinated can commit inside the
+// window the pause is meant to have emptied, and land on one side of a
+// barrier the other shards know nothing about. The drain counted only
+// pgshard's own gids and would have certified over it.
+func TestDrainCountsAPreparedTransactionPgshardDidNotMake(t *testing.T) {
+	parallelPG(t)
+	f := newResolverFixtureWith(t)
+	ctx := context.Background()
+	groups := &SQLBarrierGroups{Pool: f.pool, Shards: f.dialer}
+	g := GroupRef{Name: "shard0", Set: "default", ID: 0}
+	shard := connect(t, f.shardDSN(0))
+	mustExec(t, shard, `CREATE TABLE outsider (id int)`)
+
+	if n, err := groups.PreparedCount(ctx, g); err != nil || n != 0 {
+		t.Fatalf("idle shard prepared = %d %v", n, err)
+	}
+	for _, sql := range []string{`BEGIN`, `INSERT INTO outsider VALUES (1)`, `PREPARE TRANSACTION 'someone-elses-2pc'`} {
+		mustExec(t, shard, sql)
+	}
+	t.Cleanup(func() { mustExec(t, shard, `ROLLBACK PREPARED 'someone-elses-2pc'`) })
+
+	n, err := groups.PreparedCount(ctx, g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("prepared = %d, want the drain to see a transaction whatever prepared it", n)
+	}
+
+	// The resolver keeps its own filter: finishing a transaction it did not
+	// coordinate is not its decision to make.
+	out, err := f.res.Resolve(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Committed != 0 || out.RolledBack != 0 {
+		t.Fatalf("the resolver touched a transaction it did not coordinate: %+v", out)
+	}
+	if n := queryOne[int64](t, shard, `SELECT count(*) FROM pg_prepared_xacts`); n != 1 {
+		t.Fatalf("%d prepared transactions after a resolver pass, want the outsider left alone", n)
+	}
+}
