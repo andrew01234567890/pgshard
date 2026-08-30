@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -124,6 +125,10 @@ func (f *fakeOps) PauseSources(_ context.Context, pause bool) error {
 		f.pauses++
 	}
 	return nil
+}
+func (f *fakeOps) DropJournal(_ context.Context, id string) error {
+	delete(f.journaled, id)
+	return f.step("drop_journal")
 }
 func (f *fakeOps) Release(context.Context) error  { f.fenced = false; return f.step(StepRelease) }
 func (f *fakeOps) Complete(context.Context) error { return f.step("complete") }
@@ -711,5 +716,39 @@ func TestJournalRefreshesItsTargetsAfterARewind(t *testing.T) {
 	h.runUntil(t, StageSwitched)
 	if again := h.ops.journaled[h.wf.cutover.JournalID]; again <= first {
 		t.Errorf("the journal was written %d times and not again after the rewind", again)
+	}
+}
+
+// TestASwitchWhoseSourceWasRetiredEndsInsteadOfRetrying: after the journal
+// every error is retried, because the journal is the point of no return.
+// A source set another workflow already retired is the exception -- the
+// flip can never publish on top of it -- and retrying held the run's
+// slots, and the sources' WAL with them, for ever.
+func TestASwitchWhoseSourceWasRetiredEndsInsteadOfRetrying(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.c.CutoverTimeout = time.Second
+	h.ops.fail[StepFlip] = sourceRetired("default no longer serves; another workflow published [g3]")
+	h.runUntil(t, StageSwitching)
+
+	advanced, err := h.c.cutover(context.Background(), h.wf, h.ops)
+	if err != nil {
+		t.Fatalf("an abandoned switch ends the workflow, it does not error the pass: %v", err)
+	}
+	if !advanced || h.wf.stage != StageFailed {
+		t.Fatalf("stage %s advanced %v, want the workflow finished", h.wf.stage, advanced)
+	}
+	if !strings.Contains(h.store.finished, StateFailed) || !strings.Contains(h.store.finished, "no longer serves") {
+		t.Fatalf("the operator must see why it ended: %q", h.store.finished)
+	}
+	if h.ops.fenced {
+		t.Fatal("the fence outlived the switch that raised it")
+	}
+	for _, want := range []string{"drop_journal", "complete"} {
+		if !slices.Contains(h.ops.calls, want) {
+			t.Fatalf("%s never ran, so the run's replication objects are still there: %v", want, h.ops.calls)
+		}
+	}
+	if len(h.ops.journaled) != 0 {
+		t.Fatalf("journal rows point consumers at a set that will never serve: %v", h.ops.journaled)
 	}
 }
