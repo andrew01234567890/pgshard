@@ -28,6 +28,23 @@ func BenchmarkRelayConcurrentSessions(b *testing.B) {
 				}
 				streams[i] = st
 			}
+			// One message each first: the pooler attaches a session on the
+			// stream's first Execute, and 64 attaches at the same instant
+			// otherwise dominate a benchmark that means to measure relaying.
+			for i, st := range streams {
+				if err := st.Send(queryReq(fmt.Sprintf("s-%d", i), "select 1", gen(7, 3), identity("alice"))); err != nil {
+					b.Fatal(err)
+				}
+				for {
+					resp, err := st.Recv()
+					if err != nil {
+						b.Fatal(err)
+					}
+					if resp.GetReadyForQuery() != nil {
+						break
+					}
+				}
+			}
 			b.ResetTimer()
 			var wg sync.WaitGroup
 			per := b.N / sessions
