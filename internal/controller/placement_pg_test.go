@@ -686,9 +686,18 @@ func TestPlacementIdentityColumnsOnPostgres(t *testing.T) {
 		twice bigint GENERATED ALWAYS AS (tenant * 2) STORED,
 		code text COLLATE "C",
 		PRIMARY KEY (tenant, seq))`)
+	// Everything below is carried by LIKE INCLUDING ALL on the home shard
+	// and had to be rendered by hand for the others: per-column storage
+	// and compression, a column comment, extended statistics -- and
+	// reloptions, which neither path carried.
+	mustExec(t, home, `ALTER TABLE things ALTER COLUMN note SET STORAGE EXTERNAL, ALTER COLUMN note SET COMPRESSION pglz`)
+	mustExec(t, home, `ALTER TABLE things SET (fillfactor = 70, autovacuum_vacuum_scale_factor = 0.05)`)
+	mustExec(t, home, `CREATE STATISTICS things_shape (ndistinct, dependencies) ON tenant, note FROM things`)
 	mustExec(t, home, `INSERT INTO things (tenant, note) SELECT g, 'n' || g FROM generate_series(1, 60) g`)
 	const thingsComment = `path C:\x and an ' apostrophe`
+	const noteComment = `the note, with an ' apostrophe`
 	mustExec(t, home, `COMMENT ON TABLE things IS `+quoteLiteralE(s(thingsComment)))
+	mustExec(t, home, `COMMENT ON COLUMN things.note IS `+quoteLiteralE(s(noteComment)))
 	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('app', 'public', 'things', 'unsharded', NULL)`)
 	f.reconcile()
 
@@ -761,6 +770,32 @@ func TestPlacementIdentityColumnsOnPostgres(t *testing.T) {
 		got := queryOne[string](t, f.app(id), `SELECT obj_description('public.things'::regclass, 'pg_class')`)
 		if got != thingsComment {
 			t.Errorf("shard %d: table comment not restored: %q", id, got)
+		}
+	}
+	for id := range int32(2) {
+		c := f.app(id)
+		if st := queryOne[string](t, c, `SELECT attstorage::text FROM pg_attribute WHERE attrelid = 'public.things'::regclass AND attname = 'note'`); st != "e" {
+			t.Errorf("shard %d: note storage = %q, want EXTERNAL", id, st)
+		}
+		if cm := queryOne[string](t, c, `SELECT attcompression::text FROM pg_attribute WHERE attrelid = 'public.things'::regclass AND attname = 'note'`); cm != "p" {
+			t.Errorf("shard %d: note compression = %q, want pglz", id, cm)
+		}
+		if got := queryOne[string](t, c, `SELECT col_description('public.things'::regclass, attnum) FROM pg_attribute WHERE attrelid = 'public.things'::regclass AND attname = 'note'`); got != noteComment {
+			t.Errorf("shard %d: column comment not restored: %q", id, got)
+		}
+		opts := queryOne[string](t, c, `SELECT coalesce(array_to_string(reloptions, ','), '') FROM pg_class WHERE oid = 'public.things'::regclass`)
+		for _, want := range []string{"fillfactor=70", "autovacuum_vacuum_scale_factor=0.05"} {
+			if !strings.Contains(opts, want) {
+				t.Errorf("shard %d: reloptions = %q, want %s", id, opts, want)
+			}
+		}
+		if n := queryOne[int64](t, c, `SELECT count(*) FROM pg_statistic_ext WHERE stxrelid = 'public.things'::regclass`); n != 1 {
+			t.Errorf("shard %d: %d extended statistics objects, want the one the table had", id, n)
+		}
+		// A statistics object left with the shadow's name is a shadow name
+		// on the table nobody moved away from.
+		if n := queryOne[int64](t, c, `SELECT count(*) FROM pg_statistic_ext WHERE stxrelid = 'public.things'::regclass AND stxname LIKE '%__pgshard_new%'`); n != 0 {
+			t.Errorf("shard %d: an extended statistics object kept the shadow's name", id)
 		}
 	}
 }
@@ -1043,4 +1078,39 @@ func TestPlacementFenceRefusesAStaleRouterOnPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustExec(t, client, `INSERT INTO moving VALUES (6, 60, 'after release')`)
+}
+
+// TestPlacementCarriesAnExclusionConstraintOnPostgres: a hand-built shadow
+// selected only p, u and c constraints, so a table with an exclusion
+// constraint came back from a move without it -- and without the index
+// behind it, which the index pass skips because a constraint owns it. A
+// sharded table cannot have one yet (every uniqueness key must contain the
+// shard key, and that is not yet decided for an exclusion), so the move
+// that exercises it is to a reference table.
+func TestPlacementCarriesAnExclusionConstraintOnPostgres(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	src := f.app(0)
+	mustExec(t, src, `CREATE TABLE slots (id bigint PRIMARY KEY, room text NOT NULL)`)
+	mustExec(t, src, `ALTER TABLE slots ADD CONSTRAINT slots_one_per_room EXCLUDE USING btree (room WITH =)`)
+	mustExec(t, src, `INSERT INTO slots SELECT g, 'r' || g FROM generate_series(1, 20) g`)
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement) VALUES ('app', 'public', 'slots', 'unsharded')`)
+	f.reconcile()
+	mustExec(t, f.catalog, `UPDATE pgshard.tables SET placement = 'reference' WHERE table_name = 'slots'`)
+	f.reconcile()
+	mustExec(t, f.catalog, `UPDATE pgshard.workflows SET spec = spec || '{"drop_old_after_seconds": 0}'`)
+	f.driveUntil("slots", 2*time.Minute, StageCompleted)
+
+	for id := range int32(2) {
+		c := f.app(id)
+		// The home shard's copy is named by LIKE, which renames what it
+		// copies; what has to survive the move is the constraint, not the
+		// name it happened to have.
+		if n := queryOne[int64](t, c, `SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.slots'::regclass AND contype = 'x'`); n != 1 {
+			t.Errorf("shard %d: %d exclusion constraints, want the one the table had", id, n)
+		}
+		if _, err := c.Exec(context.Background(), `INSERT INTO slots VALUES (999, 'r1')`); err == nil {
+			t.Errorf("shard %d: the moved table accepted a row its exclusion constraint forbids", id)
+		}
+	}
 }
