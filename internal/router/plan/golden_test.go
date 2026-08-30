@@ -615,3 +615,36 @@ func TestReferenceWriteNeedsTheShardInspection(t *testing.T) {
 		}
 	})
 }
+
+// TestAnUnhashableShardKeyIsNotRoutable: the router hashes the key the
+// client sent and a copy hashes the key the shard stored, so a type whose
+// equality ignores what its hash does not -- blank-padded character(n) --
+// puts two equal keys on two shards. A read is refused with the write: it
+// would look on the shard the row is not on.
+func TestAnUnhashableShardKeyIsNotRoutable(t *testing.T) {
+	key := snapshot.TableKey{Database: fixtureDB, SchemaName: "public", TableName: "orders"}
+	const refusal = "shard key tenant_id of type character(8) is not supported"
+	for _, sql := range []string{
+		"insert into orders (tenant_id, id) values ('a', 1)",
+		"select * from orders where tenant_id = 'a'",
+		"update orders set id = 2 where tenant_id = 'a'",
+		"delete from orders where tenant_id = 'a'",
+	} {
+		t.Run(sql, func(t *testing.T) {
+			snap := fixture(t)
+			pl := snap.Tables[key]
+			pl.ShardKeyError = refusal
+			snap.Tables[key] = pl
+			p := New()
+			got, err := p.Plan(context.Background(), session(snap), sql)
+			checkRefusal(t, got, err, "table \"orders\" cannot be routed: "+refusal, "0A000")
+		})
+	}
+	t.Run("a key nothing faulted still routes", func(t *testing.T) {
+		snap := fixture(t)
+		p := New()
+		if _, err := p.Plan(context.Background(), session(snap), "select * from orders where tenant_id = 'a'"); err != nil {
+			t.Fatalf("plan: %v", err)
+		}
+	})
+}

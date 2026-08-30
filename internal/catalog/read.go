@@ -77,6 +77,13 @@ type TableStatus struct {
 	// ReferenceHazards is what that inspection found: everything the shard
 	// would evaluate for itself, and so differently on each one.
 	ReferenceHazards []string
+	// ShardKeyCheckedGeneration is the desired generation whose shard key
+	// the controller has asked a shard about. Nil means never, and an
+	// unchecked sharded table is not made effective.
+	ShardKeyCheckedGeneration *int64
+	// ShardKeyError says why the key column cannot be hashed, when it
+	// cannot; nil when the type is one the router and a row filter agree on.
+	ShardKeyError *string
 }
 
 // ShardStatus is a row of pgshard.shard_status.
@@ -175,7 +182,8 @@ func ListTableStatus(ctx context.Context, q Querier, database string) ([]TableSt
 	rows, err := q.Query(ctx, `
 		SELECT database, schema_name, table_name, effective_placement, effective_shard_key,
 		       effective_generation, workflow_id::text, progress, updated_at, migrating,
-		       reference_checked_generation, reference_hazards
+		       reference_checked_generation, reference_hazards,
+		       shard_key_checked_generation, shard_key_error
 		FROM pgshard.table_status WHERE database = $1 ORDER BY schema_name, table_name`, database)
 	if err != nil {
 		return nil, err
@@ -234,7 +242,8 @@ func ListAllTableStatus(ctx context.Context, q Querier) ([]TableStatus, error) {
 	rows, err := q.Query(ctx, `
 		SELECT database, schema_name, table_name, effective_placement, effective_shard_key,
 		       effective_generation, workflow_id::text, progress, updated_at, migrating,
-		       reference_checked_generation, reference_hazards
+		       reference_checked_generation, reference_hazards,
+		       shard_key_checked_generation, shard_key_error
 		FROM pgshard.table_status ORDER BY database, schema_name, table_name`)
 	if err != nil {
 		return nil, err
