@@ -240,6 +240,14 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
 		return cli.ExitNotReady
 	}
+	defer func() { _ = l.Close() }()
+	// Every endpoint reports here. A router whose peer-cancel, VStream or
+	// health listener has stopped keeps accepting sessions and keeps
+	// answering readiness, so those exits end the process rather than being
+	// discarded: cancellation would be delivered nowhere, a consumer's
+	// stream would never reconnect, and the Service would go on sending
+	// traffic to a router that cannot say it is unwell.
+	errc := make(chan error, 4)
 	if *peerListen != "" {
 		serverCreds, err := peerCredentials(*poolerCert, *poolerKey, *poolerCA, *insecureDev)
 		if err != nil {
@@ -255,7 +263,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		pgshardv1.RegisterRouterPeerServer(g, &cancelpeer.Server{Local: func(ctx context.Context, key pgwire.CancelKey) bool {
 			return rt.CancelLocal(ctx, srv, key)
 		}})
-		go func() { _ = g.Serve(pl) }()
+		serveAux(ctx, errc, "peer cancels", func() error { return g.Serve(pl) })
 		defer g.Stop()
 		fmt.Fprintf(stdout, "pgshard-router serve: peer cancels on %s (instance %d)\n", pl.Addr(), srv.InstanceID())
 	}
@@ -283,7 +291,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		}
 		g := grpc.NewServer(grpc.Creds(serverCreds))
 		pgshardv1.RegisterVStreamServer(g, vs)
-		go func() { _ = g.Serve(vl) }()
+		serveAux(ctx, errc, "vstream", func() error { return g.Serve(vl) })
 		defer g.Stop()
 		fmt.Fprintf(stdout, "pgshard-router serve: vstream on %s\n", vl.Addr())
 	}
@@ -312,7 +320,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		mux.Handle("/", drainer.Handler())
 		mux.Handle("/metrics", rt.MetricsHandler())
 		hs := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-		go func() { _ = hs.Serve(hl) }()
+		serveAux(ctx, errc, "health", func() error { return hs.Serve(hl) })
 		defer func() { _ = hs.Close() }()
 		fmt.Fprintf(stdout, "pgshard-router serve: health on %s\n", hl.Addr())
 	}
@@ -321,7 +329,6 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		mode = "INSECURE plaintext to poolers"
 	}
 	fmt.Fprintf(stdout, "pgshard-router serve: listening on %s (%s)\n", l.Addr(), mode)
-	errc := make(chan error, 1)
 	// Authentication only gates new connections, so a role that is dropped,
 	// set NOLOGIN or expired would keep the sessions it already holds.
 	go func() {
@@ -451,4 +458,25 @@ func poolerCredentials(certFile, keyFile, caFile string, insecureDev bool) (cred
 		return nil, fmt.Errorf("%s: no certificates found", caFile)
 	}
 	return credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: pool, MinVersion: tls.VersionTLS13}), nil
+}
+
+// serveAux runs one of the router's auxiliary listeners and reports its
+// exit on errc. An auxiliary endpoint is not optional once it is bound:
+// the router goes on accepting sessions whatever happens to it, so an exit
+// nobody hears leaves the process serving with a piece of itself missing.
+// An exit after the context ends is the shutdown, and says nothing.
+func serveAux(ctx context.Context, errc chan<- error, name string, serve func() error) {
+	go func() {
+		err := serve()
+		if ctx.Err() != nil {
+			return
+		}
+		if err == nil {
+			err = errors.New("stopped serving")
+		}
+		select {
+		case errc <- fmt.Errorf("%s listener: %w", name, err):
+		default:
+		}
+	}()
 }

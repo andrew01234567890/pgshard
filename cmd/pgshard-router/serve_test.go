@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/andrew01234567890/pgshard/internal/router"
 )
@@ -91,5 +93,47 @@ func TestPeerFlags(t *testing.T) {
 	}
 	if !strings.Contains(p.String(), "10.0.0.1:9000") {
 		t.Fatalf("String %q", p.String())
+	}
+}
+
+// TestAnAuxiliaryListenerThatStopsIsReported: the router keeps accepting
+// sessions whatever happens to its peer-cancel, VStream or health
+// listener, so an exit nobody hears leaves it serving with a piece of
+// itself missing -- cancellation delivered nowhere, a consumer's stream
+// never reconnecting, a Service still sending traffic to a router that
+// cannot say it is unwell.
+func TestAnAuxiliaryListenerThatStopsIsReported(t *testing.T) {
+	errc := make(chan error, 4)
+	stopped := errors.New("listener closed")
+
+	serveAux(context.Background(), errc, "vstream", func() error { return stopped })
+	select {
+	case err := <-errc:
+		if !errors.Is(err, stopped) || !strings.Contains(err.Error(), "vstream") {
+			t.Fatalf("reported %v, want the named listener's own error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("an auxiliary listener stopped and nothing was reported")
+	}
+
+	// A listener that returns nil has still stopped serving.
+	serveAux(context.Background(), errc, "health", func() error { return nil })
+	select {
+	case err := <-errc:
+		if !strings.Contains(err.Error(), "health") {
+			t.Fatalf("reported %v, want the health listener", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a listener that returned nil was taken for one still serving")
+	}
+
+	// An exit after the context ends is the shutdown, and says nothing.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	serveAux(ctx, errc, "peer cancels", func() error { return stopped })
+	select {
+	case err := <-errc:
+		t.Fatalf("shutdown reported as a failure: %v", err)
+	case <-time.After(200 * time.Millisecond):
 	}
 }
