@@ -1095,3 +1095,57 @@ func TestPlacementNamesAMissingExtensionOnPostgres(t *testing.T) {
 		t.Errorf("a shard that has the extension must not be named: %q", msg)
 	}
 }
+
+// TestRetirementSaysWhenItLeftATableBehind: dropArtifactTable is right to
+// leave a table it did not mark -- it may be a user's, and dropping it
+// would be worse -- but the workflow used to report a clean retirement
+// while a shard still held the old table. Nobody goes looking behind a
+// workflow that says it finished.
+func TestRetirementSaysWhenItLeftATableBehind(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	raw := connect(t, startPostgres(t))
+	conn := pgxShardConn{raw}
+	mustExec(t, raw, `CREATE TABLE orders__pgshard_old (id bigint)`)
+
+	// Not ours: no marker at all, which is what a table from before
+	// markers existed looks like, and what a user's table looks like too.
+	dropped, err := dropArtifactTable(ctx, conn, "public", "orders__pgshard_old", "pgshard:placement:some-workflow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dropped {
+		t.Fatal("an unmarked table must not be dropped")
+	}
+	if !tableExistsOrFail(ctx, t, conn, "public", "orders__pgshard_old") {
+		t.Fatal("the table was dropped after all")
+	}
+
+	// Ours: marked, and dropped.
+	mustExec(t, raw, `COMMENT ON TABLE orders__pgshard_old IS 'pgshard:placement:some-workflow'`)
+	dropped, err = dropArtifactTable(ctx, conn, "public", "orders__pgshard_old", "pgshard:placement:some-workflow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !dropped {
+		t.Fatal("a table carrying this workflow's marker must be dropped and reported as dropped")
+	}
+	if tableExistsOrFail(ctx, t, conn, "public", "orders__pgshard_old") {
+		t.Fatal("the marked table is still there")
+	}
+
+	// Nothing there at all is not the same as leaving something behind.
+	dropped, err = dropArtifactTable(ctx, conn, "public", "orders__pgshard_old", "pgshard:placement:some-workflow")
+	if err != nil || dropped {
+		t.Fatalf("dropping a table that is not there: dropped=%v err=%v", dropped, err)
+	}
+}
+
+func tableExistsOrFail(ctx context.Context, t *testing.T, conn ShardConn, schema, name string) bool {
+	t.Helper()
+	ok, err := tableExists(ctx, conn, schema, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ok
+}
