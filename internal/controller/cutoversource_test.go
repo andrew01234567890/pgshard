@@ -63,14 +63,23 @@ func TestFlipRefusesAnObsoleteSourceOnPostgres(t *testing.T) {
 	// Driving Flip itself, not the check: a regression that dropped the
 	// call site would pass a test that only exercised the helper.
 	err = o.Flip(ctx, "")
-	if err == nil || !strings.Contains(err.Error(), "no longer the only serving") {
-		t.Fatalf("a cutover from a retired source must be refused: %v", err)
+	if err == nil || !isSourceRetired(err) {
+		t.Fatalf("a source another workflow retired can never come back, so the switch is over, not waiting: %v", err)
 	}
 	if st := queryOne[string](t, conn, `SELECT state FROM pgshard.shard_sets WHERE shard_set = 'g2'`); st != catalog.ShardSetProvisioning {
 		t.Fatalf("a refused flip must publish nothing: g2 is %s", st)
 	}
 	if n := queryOne[int64](t, conn, `SELECT count(*) FROM pgshard.shard_sets WHERE state = 'serving'`); n != 1 {
 		t.Fatalf("%d serving sets after a refused flip", n)
+	}
+
+	// Two serving sets with the frozen source among them is a state this
+	// switch did not cause and may still resolve, so it stays a plain
+	// error the pass retries rather than one that ends the workflow.
+	mustExec(t, conn, `UPDATE pgshard.shard_sets SET state = 'serving' WHERE shard_set = 'default'`)
+	err = o.Flip(ctx, "")
+	if err == nil || isSourceRetired(err) || !strings.Contains(err.Error(), "no longer the only serving") {
+		t.Fatalf("a source still serving beside another set is not retired: %v", err)
 	}
 
 	// Once the frozen source is the only serving set again, it proceeds.

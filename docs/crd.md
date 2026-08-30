@@ -25,6 +25,8 @@ Print columns: Shards, Ready, Age.
 | `spec.router.minReplicas` / `.maxReplicas` | int | defaults 2 / 10; CEL: `maxReplicas >= minReplicas` |
 | `spec.router.hpa.cpuUtilization` | int | default 70 (1..100) |
 | `spec.router.tls.secretRef` | LocalObjectReference | optional |
+| `spec.internalTLS.secretRef` | LocalObjectReference | required unless `insecure`; a Secret with `tls.crt`, `tls.key`, `ca.crt`. Poolers refuse a client whose certificate does not chain to `ca.crt` |
+| `spec.internalTLS.insecure` | bool | runs the pooler port as plaintext gRPC; unsupported outside development. CEL: one of `secretRef` or `insecure` is required, and they are mutually exclusive |
 | `spec.admin.enabled` | *bool | default true |
 | `spec.admin.insecureNoAuth` | bool | default false; serves the admin UI without a credential (development only, see [admin.md](admin.md#security)) |
 | `spec.backup.policyRef` | string | name of a PgShardBackupPolicy |
@@ -52,9 +54,13 @@ its members keep `archive_mode=off` until its shard set becomes serving.
 
 ## PgShardBackupPolicy (status subresource)
 
-`spec.objectStore{type: s3|azure|gcs|posix|sftp, bucket, container, endpoint, region, prefix, uriStyle: host|path, verifyTLS, credentialType, credentials.secretRef, encryption.secretRef, insecureUnencrypted, sftp{host, user, port, hostKeyCheck}}`,
+`spec.objectStore{type: s3|azure|gcs|posix|sftp, bucket, container, endpoint, region, prefix, uriStyle: host|path,
+verifyTLS, credentialType: shared|web-id|auto|sas|service|token, credentials.secretRef, encryption.secretRef,
+insecureUnencrypted, sftp{host, user, port, hostKeyCheck: strict|accept-new|fingerprint|none}}` (`type` is required,
+and `sftp.host` and `sftp.user` with it),
 a remote store requiring `encryption.secretRef` unless `insecureUnencrypted` says otherwise (CEL; see [backup.md](backup.md#encryption)),
-`spec.schedules{full, differential, incremental}` (five-field cron), `spec.retention{full, differential}`, `spec.logLevel`, `spec.processMax`.
+`spec.schedules{full, differential, incremental}` (five-field cron), `spec.retention{full, differential}`,
+`spec.logLevel: off|error|warn|info|detail|debug|trace`, `spec.processMax`.
 Clusters bind through `spec.backup.policyRef`. `status{observedGeneration, clusters[]{name, lastFullTime, lastDifferentialTime, lastIncrementalTime, healthy, message}, conditions: Valid, BackupHealthy, RepositoryEncrypted, and BarrierHealthy when a barrierSchedule is set}`.
 See [backup.md](backup.md).
 
@@ -65,16 +71,30 @@ See [backup.md](backup.md).
 
 ## PgShardRestore (status subresource)
 
-`spec{clusterName, newClusterName, clusterSpec (optional PgShardCluster spec; defaults to the source's), backupId, target{time|lsn|name|xid|immediate}, targetTLI, exclusive}`.
+`spec{clusterName, newClusterName, clusterSpec (optional PgShardCluster spec; defaults to the source's), backupId,
+target{time|lsn|name|xid|immediate|barrier}, targetTLI, exclusive}` — `target.barrier` names a certified barrier, so
+every group recovers to the same commit point (see [backup.md](backup.md#restore)); `clusterName` and
+`newClusterName` are required.
 CEL: at most one recovery target may be set; `newClusterName` differs from
 `clusterName`; `target.name`, `target.xid` and `target.immediate` require
-`backupId`. `status{phase: Pending|Restoring|Recovered|Failed, startedAt, completedAt, groups[]{group, sourceStanza, backupId, timeline, reachedTarget, message}, error, conditions: Progressing}`.
+`backupId`. `status{phase: Pending|Restoring|Reconciling|Recovered|Failed, startedAt, completedAt,
+groups[]{group, sourceStanza, backupId, timeline, reachedTarget, preparedTransactions[], message},
+reconciliation{decisions, committed, rolledBack, contradictions[], unverifiable[], unfenced}, error,
+conditions: Progressing, PreparedTransactionsPending}` — a barrier restore passes through `Reconciling` while it
+finishes the prepared transactions its decision log names, and a contradiction or an unverifiable commit there fails
+the restore and leaves the cluster fenced.
 See [backup.md](backup.md#restore).
 
 ## PgShardReshard (status subresource)
 
 Generated record of one resharding run; the catalog table `pgshard.shard_ranges` is the source of truth.
-`spec{clusterName, fromGeneration (min 1), targetGeneration (min 2), targetShardSet, targetShards (min 1), targetRanges[]{shardId, rangeStart, rangeEnd}}`.
+`spec{clusterName, fromGeneration (min 1), targetGeneration (min 2), targetShardSet, targetShards (min 1),
+targetRanges[]{shardId, rangeStart, rangeEnd}, mode: reshard|upgrade, targetMajor}` — `mode` says whether the run is a
+topology change or a blue/green major upgrade, and `targetMajor` is the major the target groups run when it is an
+upgrade. Every field but `mode` and `targetMajor` is required.
 CEL: `targetRanges` has exactly `targetShards` entries; `targetGeneration > fromGeneration`.
-`status{phase: Pending|Provisioning|Copying|Verifying|Switching|Completed|Cancelled|Failed, workflowId, targets[]{shardId, group, ready, primary}, journalIds[], message, conditions: TargetsReady, WorkflowCreated}`.
+`status{phase: Pending|Provisioning|Copying|Verifying|Switching|Completing|Completed|Cancelled|Failed, workflowId,
+targets[]{shardId, group, ready, primary}, journalIds[], cutoverPause, message, conditions: TargetsReady,
+WorkflowCreated, WritesSwitched}` — `Completing` is the window after the writes switched and before the old groups
+are retired, and `cutoverPause` is how long writes were held at the flip.
 Label `pgshard.io/reshard-source` is `spec` or `catalog`. See [resharding.md](resharding.md).
