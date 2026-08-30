@@ -1082,7 +1082,17 @@ func runSuite(t *testing.T, img pgImage) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(ts) != 1 || *ts[0].EffectivePlacement != "sharded" || string(ts[0].Progress) != "{}" {
+		// The column the metrics poller used to average is gone; nothing
+		// wrote it and the aggregate it invited does not exist for jsonb.
+		var dead int
+		if err := conn.QueryRow(ctx, `SELECT count(*)::int FROM information_schema.columns
+			WHERE table_schema = 'pgshard' AND table_name = 'table_status' AND column_name = 'progress'`).Scan(&dead); err != nil {
+			t.Fatal(err)
+		}
+		if dead != 0 {
+			t.Error("table_status.progress is still there for the next reader to average")
+		}
+		if len(ts) != 1 || *ts[0].EffectivePlacement != "sharded" {
 			t.Fatalf("unexpected table status %+v", ts)
 		}
 		dbs, err := ListDatabases(ctx, conn)
