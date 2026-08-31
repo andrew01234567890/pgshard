@@ -18,6 +18,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -581,7 +582,7 @@ func setupWithAgents(t *testing.T, name string) (*ClusterReconciler, *fakeProber
 	if err := k8sClient.Create(ctx, c); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = k8sClient.Delete(context.Background(), c) })
+	t.Cleanup(func() { deleteCluster(t, c) })
 	journal := &[]string{}
 	fp := &fakeProber{err: errors.New("dial: refused"), standbys: map[string]StandbyState{}, journal: journal}
 	fa := newFakeAgents(journal)
@@ -1225,5 +1226,40 @@ func TestRouterCredentialIsGeneratedAndApplied(t *testing.T) {
 	get(t, RouterSecretName(c.Name), &sec)
 	if string(sec.Data["password"]) != pw {
 		t.Error("the password must survive a reconcile: it was regenerated")
+	}
+}
+
+// deleteCluster removes the cluster and everything rendered for it.
+//
+// envtest runs an API server with no controller-manager, so nothing collects
+// garbage: an object whose owner is deleted simply stays. A second run of the
+// same test then finds the first run's PgShardReshard, or its pods, owned by
+// a cluster UID that no longer exists -- which is why
+// TestReshardProvisionsNonServingTargets passed under -count=1 and failed
+// under -count=3 with "is not controlled by the cluster".
+func deleteCluster(t *testing.T, c *pgshardv1alpha1.PgShardCluster) {
+	t.Helper()
+	ctx := context.Background()
+	_ = k8sClient.Delete(ctx, c)
+	inCluster := client.MatchingLabels{LabelCluster: c.Name}
+	ns := client.InNamespace(c.Namespace)
+	for _, list := range []client.Object{
+		&pgshardv1alpha1.PgShardGroup{},
+		&pgshardv1alpha1.PgShardReshard{},
+		&corev1.Pod{},
+		&corev1.Service{},
+		&corev1.Secret{},
+		&corev1.ConfigMap{},
+	} {
+		// A kind the cluster never created deletes nothing, which is why
+		// the error is ignored rather than asserted on.
+		_ = k8sClient.DeleteAllOf(ctx, list, ns, inCluster, client.GracePeriodSeconds(0))
+	}
+	// The promotion Leases are made by the agents rather than rendered, so
+	// they carry no cluster label and have to be named. A stale one is held
+	// by a holder that no longer exists, and nothing expires it without a
+	// kubelet.
+	for _, g := range append(Groups(c), TargetGroups(c)...) {
+		_ = k8sClient.Delete(ctx, &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: g.LeaseName(), Namespace: c.Namespace}})
 	}
 }
