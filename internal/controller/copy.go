@@ -259,7 +259,7 @@ func (c *Copier) Pass(ctx context.Context) (CopyOutcome, error) {
 			} else {
 				c.logger().Warn("reshard copy pass incomplete", "workflow", wf.id, "err", err)
 			}
-			if serr := c.save(ctx, wf, "", err.Error()); serr != nil {
+			if serr := c.save(ctx, wf, "", err.Error()); serr != nil && !errors.Is(serr, errNotOwner) {
 				return out, serr
 			}
 		}
@@ -490,7 +490,7 @@ func (c *Copier) databases(ctx context.Context) ([]dbPlan, error) {
 // drive advances one workflow through the copy phase; it reports whether
 // the stage changed.
 func (c *Copier) drive(ctx context.Context, wf *copyWorkflow) (bool, error) {
-	if err := checkOwner(ctx, c.Pool, wf.id, wf.owner); err != nil {
+	if err := holdClaim(ctx, c.Pool, wf.id, wf.owner); err != nil {
 		return false, err
 	}
 	srcSet, srcIDs, err := c.pinSource(ctx, wf)

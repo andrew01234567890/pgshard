@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // shadowTables lists the placement artifacts a pass has created on a shard.
@@ -112,7 +114,9 @@ func TestPlacementPassStopsWhenTheClaimIsRevokedMidPass(t *testing.T) {
 	id := startPlacement(t, f)
 
 	wf := f.load(id)
-	wf.owner = "a-claim-that-was-revoked"
+	// The fence is the state the pass started from, so only the owner half
+	// of the guard can refuse this write.
+	wf.owner, wf.fence = "a-claim-that-was-revoked", wf.state
 	_, stageBefore, _, updatedBefore := ownerRow(t, f, id)
 	before := [][]string{shadowTables(t, f.app(0)), shadowTables(t, f.app(1))}
 
@@ -198,5 +202,169 @@ func TestPassStopsWhenTheWorkflowStateMovedUnderIt(t *testing.T) {
 	}
 	if state != StateCancelled {
 		t.Fatalf("the stale pass overwrote the state: %s", state)
+	}
+}
+
+// TestAnExpiredClaimIsTakenOver: a replica that dies mid-pass leaves its
+// claim behind. Nothing else would ever take the workflow if the claim
+// outlived its owner, so it is only held while it is refreshed.
+func TestAnExpiredClaimIsTakenOver(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	ctx := context.Background()
+	id := startPlacement(t, f)
+
+	mustExec(t, f.catalog, `UPDATE pgshard.workflows SET owner = 'a-replica-that-died', owned_at = now() - interval '1 hour' WHERE id = $1::uuid`, id)
+	out, err := f.placer.Pass(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Driven != 1 {
+		t.Fatalf("an expired claim stranded the workflow: %+v", out)
+	}
+	_, _, owner, _ := ownerRow(t, f, id)
+	if owner == "a-replica-that-died" || owner == "" {
+		t.Fatalf("the workflow was driven without taking the claim over: %q", owner)
+	}
+
+	// A live claim is not stealable, so the two cannot be confused.
+	mustExec(t, f.catalog, `UPDATE pgshard.workflows SET owner = 'a-live-replica', owned_at = now() WHERE id = $1::uuid`, id)
+	if out, err = f.placer.Pass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if out.Driven != 0 {
+		t.Fatalf("a live claim was stolen: %+v", out)
+	}
+}
+
+// TestALongStepKeepsItsClaimAlive: copying one source shard is a single
+// step over a whole table and can outrun the lease. A pass that is still
+// making progress keeps its claim; one that is not loses it.
+func TestALongStepKeepsItsClaimAlive(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	ctx := context.Background()
+	id := startPlacement(t, f)
+
+	if _, err := f.placer.Pass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var owner string
+	var before time.Time
+	if err := f.catalog.QueryRow(ctx, `SELECT coalesce(owner, ''), owned_at FROM pgshard.workflows WHERE id = $1::uuid`, id).Scan(&owner, &before); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, f.catalog, `UPDATE pgshard.workflows SET owned_at = now() - interval '1 hour' WHERE id = $1::uuid`, id)
+
+	if err := holdClaim(ctx, f.pool, id, owner); err != nil {
+		t.Fatalf("a step of the owning pass lost the claim: %v", err)
+	}
+	var after time.Time
+	if err := f.catalog.QueryRow(ctx, `SELECT owned_at FROM pgshard.workflows WHERE id = $1::uuid`, id).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if !after.After(before.Add(-time.Second)) {
+		t.Fatalf("the step did not refresh the lease: %s", after)
+	}
+	if err := holdClaim(ctx, f.pool, id, "some-other-replica"); !isNotOwner(err) {
+		t.Fatalf("a step of a pass that does not own the workflow held a claim: %v", err)
+	}
+}
+
+// takenOverDialer takes the workflow over the first time a pass reaches a
+// shard, which is how a pass loses its claim: part-way through, with work
+// already done and a status write still to come.
+type takenOverDialer struct {
+	ShardDBDialer
+	pool *pgxpool.Pool
+	id   string
+	once sync.Once
+}
+
+func (d *takenOverDialer) DialDatabase(ctx context.Context, set string, id int32, db string) (ShardConn, error) {
+	var moved bool
+	d.once.Do(func() {
+		_, _ = d.pool.Exec(ctx, `UPDATE pgshard.workflows SET state = $2 WHERE id = $1::uuid`, d.id, StatePaused)
+		moved = true
+	})
+	if moved {
+		// The step fails for its own reason, as a shard that has just gone
+		// away would; the pass then has a status write left to make.
+		return nil, errors.New("shard is unreachable")
+	}
+	return d.ShardDBDialer.DialDatabase(ctx, set, id, db)
+}
+
+// TestCopierPassSurvivesAWorkflowTakenOverMidStep: a copy pass whose
+// workflow moves under it fails its step and then tries to record why. That
+// write is refused, and returning the refusal from Pass would log a
+// spurious failure and skip every workflow after it in the list.
+func TestCopierPassSurvivesAWorkflowTakenOverMidStep(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	ctx := context.Background()
+
+	var id string
+	if err := f.catalog.QueryRow(ctx, `INSERT INTO pgshard.workflows (id, kind, state, spec, status)
+		VALUES (gen_random_uuid(), $1, $2, '{"database": "app"}'::jsonb, jsonb_build_object('stage', $3::text))
+		RETURNING id::text`, KindReshard, StateRunning, StageCopying).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	c := &Copier{
+		Pool:   f.pool,
+		Shards: &takenOverDialer{ShardDBDialer: f.placer.Shards, pool: f.pool, id: id},
+		Logger: f.placer.Logger,
+	}
+
+	out, err := c.Pass(ctx)
+	if err != nil {
+		t.Fatalf("a workflow that moved under the pass failed the whole pass: %v", err)
+	}
+	if out.Failed != 0 {
+		t.Fatalf("a workflow that moved under the pass was failed: %+v", out)
+	}
+	var state string
+	if err := f.catalog.QueryRow(ctx, `SELECT state FROM pgshard.workflows WHERE id = $1::uuid`, id).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != StatePaused {
+		t.Fatalf("the pass wrote over the state that moved under it: %s", state)
+	}
+}
+
+// TestARevokedPassDoesNotTearDownTheWorkflowItLost: fail lifts the write
+// fence and drops the table lock before it records the failure. Run by a
+// pass whose claim is gone, that hands the table back while the replica
+// that owns the workflow now is still driving it -- unfenced, and with the
+// lock free for a second workflow on the same table.
+func TestARevokedPassDoesNotTearDownTheWorkflowItLost(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	ctx := context.Background()
+	id := startPlacement(t, f)
+
+	locks := func() int {
+		t.Helper()
+		var n int
+		if err := f.catalog.QueryRow(ctx, `SELECT count(*) FROM pgshard.workflow_locks WHERE workflow_id = $1::uuid`, id).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if locks() != 1 {
+		t.Fatal("the workflow does not hold its table lock")
+	}
+
+	wf := f.load(id)
+	wf.owner, wf.fence = "a-claim-that-was-revoked", wf.state
+	if err := f.placer.fail(ctx, wf, fatal("a failure raised by a pass that lost its claim")); !isNotOwner(err) {
+		t.Fatalf("a revoked pass failed the workflow: %v", err)
+	}
+	if locks() != 1 {
+		t.Fatal("a revoked pass dropped the table lock of the workflow it lost")
+	}
+	state, _, _, _ := ownerRow(t, f, id)
+	if state == StateFailed {
+		t.Fatal("a revoked pass failed a workflow another replica owns")
 	}
 }
