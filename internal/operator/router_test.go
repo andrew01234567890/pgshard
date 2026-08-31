@@ -143,8 +143,40 @@ func TestPoolerSidecarInMemberPod(t *testing.T) {
 		pooler.ReadinessProbe.HTTPGet.Path != "/healthz" || pooler.ReadinessProbe.HTTPGet.Port.IntValue() != 9127 {
 		t.Errorf("readiness %+v", pooler.ReadinessProbe)
 	}
-	if len(pooler.Env) != 1 || pooler.Env[0].Name != "PGPASSWORD" || pooler.Env[0].ValueFrom == nil {
-		t.Errorf("pooler must read the catalog password from the secret: %+v", pooler.Env)
+	// Two credentials, from two Secrets. PGPASSWORD is the superuser's and
+	// libpq applies it to every connection, so it is the local socket's --
+	// the one that creates and reads replication slots. The catalog
+	// connection reads the shard map as the router's login role, with its
+	// password mounted from that role's own Secret, so a compromised pooler
+	// no longer holds the credential that is also the seed of the agent
+	// control-plane token.
+	if len(pooler.Env) != 1 || pooler.Env[0].Name != "PGPASSWORD" || pooler.Env[0].ValueFrom == nil ||
+		pooler.Env[0].ValueFrom.SecretKeyRef.Name != SecretName(c.Name) {
+		t.Errorf("PGPASSWORD must be the superuser Secret, for the local socket: %+v", pooler.Env)
+	}
+	if !strings.Contains(got, "--catalog-dsn "+RouterCatalogDSN(c)) {
+		t.Errorf("the catalog connection must be the router role: %q", got)
+	}
+	if !strings.Contains(got, "--catalog-password-file /etc/pgshard/catalog/password") {
+		t.Errorf("the catalog password must come from a file, not the environment: %q", got)
+	}
+	catalogMount := ""
+	for _, m := range pooler.VolumeMounts {
+		if m.Name == "catalog-secret" {
+			catalogMount = m.MountPath
+		}
+	}
+	if catalogMount != "/etc/pgshard/catalog" {
+		t.Errorf("catalog secret mount %q", catalogMount)
+	}
+	catalogSecret := ""
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == "catalog-secret" && v.Secret != nil {
+			catalogSecret = v.Secret.SecretName
+		}
+	}
+	if catalogSecret != RouterSecretName(c.Name) {
+		t.Errorf("the catalog password must come from the router login Secret, got %q", catalogSecret)
 	}
 	socketMount := func(ctr corev1.Container) string {
 		for _, m := range ctr.VolumeMounts {

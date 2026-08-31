@@ -77,6 +77,11 @@ const (
 	agentTokenVolume = "agent-token"
 	agentTokenDir    = "/etc/pgshard/agent"
 	agentTokenKey    = "token"
+	// poolerCatalogSecretVolume mounts the router login Secret into the
+	// pooler, whose catalog connection reads the shard map as that role
+	// rather than as the superuser.
+	poolerCatalogSecretVolume = "catalog-secret"
+	poolerCatalogPasswordDir  = "/etc/pgshard/catalog"
 	// LabelShardSet on a shard group's objects names the catalog shard set
 	// it belongs to.
 	LabelShardSet = "pgshard.io/shard-set"

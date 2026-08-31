@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -53,6 +54,7 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	caFile := fs.String("tls-ca", "", "CA bundle that client (router) certificates must chain to")
 	insecureDev := fs.Bool("insecure-dev", false, "serve plaintext gRPC without client authentication (development only)")
 	catalogDSN := fs.String("catalog-dsn", "", "catalog DSN; when set, generation and epoch come from the catalog")
+	catalogPasswordFile := fs.String("catalog-password-file", "", "file holding the password for --catalog-dsn; the environment's PGPASSWORD is left for the local server")
 	shardSet := fs.String("shard-set", "", "shard set of this shard (with --catalog-dsn)")
 	shardID := fs.Int("shard-id", 0, "shard id of this shard (with --catalog-dsn)")
 	generation := fs.Uint64("generation", 0, "static shard-map generation (without --catalog-dsn)")
@@ -102,6 +104,17 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	var source pooler.Source = pooler.NewStaticSource(base)
 	snapshotAge := func() float64 { return -1 }
 	if *catalogDSN != "" {
+		// The catalog login is its own credential. PGPASSWORD is the
+		// superuser's, for the local socket that reads replication slots,
+		// and libpq would apply it to both connections -- so this one
+		// carries its password in the DSN, read from a file rather than
+		// written into a pod spec.
+		dsn, err := withPasswordFile(*catalogDSN, *catalogPasswordFile)
+		if err != nil {
+			fmt.Fprintf(stderr, "pgshard-pooler run: %v\n", err)
+			return cli.ExitUsage
+		}
+		*catalogDSN = dsn
 		// ServingOnly: the pooler enforces the shard-map generation and its own
 		// shard's epoch, and reads nothing else out of a snapshot. There is one
 		// pooler per member, so loading the whole catalog on every notification
@@ -247,4 +260,25 @@ func listenerCredentials(certFile, keyFile, caFile string, insecureDev bool) (cr
 	}
 	return credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}, ClientCAs: pool,
 		ClientAuth: tls.RequireAndVerifyClientCert, MinVersion: tls.VersionTLS13}), nil
+}
+
+// withPasswordFile adds the password in path to a libpq keyword/value DSN.
+// An empty path leaves the DSN alone, so a caller that has PGPASSWORD for
+// this connection keeps working.
+func withPasswordFile(dsn, path string) (string, error) {
+	if path == "" {
+		return dsn, nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("catalog password file: %w", err)
+	}
+	pw := strings.TrimRight(string(b), "\r\n")
+	if pw == "" {
+		return "", fmt.Errorf("catalog password file %s is empty", path)
+	}
+	// libpq quoting: single quotes around the value, backslash before a
+	// quote or a backslash inside it.
+	esc := strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(pw)
+	return dsn + " password='" + esc + "'", nil
 }
