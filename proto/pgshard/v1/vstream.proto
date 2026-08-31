@@ -37,13 +37,24 @@ message VStreamOptions {
   // Interval between Heartbeat events while idle, in milliseconds; zero
   // means 5000.
   uint32 heartbeat_interval_ms = 3;
-  // Hold back shards whose commit timestamps run ahead of the slowest shard
-  // by more than align_skew_ms, releasing them after align_timeout_ms.
-  bool align_skew = 4;
+  // Hold back shards whose commit timestamps run ahead of the slowest
+  // shard by more than wall_clock_lead_ms, releasing them after
+  // wall_clock_hold_ms.
+  //
+  // This changes presentation only. The timestamps it sorts by are each
+  // shard's own PostgreSQL commit timestamp, taken from that host's
+  // clock, and a held shard is released on a timeout whether or not the
+  // slow one has caught up. It therefore establishes no causal, real-time
+  // or serialization order, and enabling it does not weaken or strengthen
+  // the contract above: transactions of different shards remain unordered
+  // with respect to each other. Every event carries its shard, and every
+  // Commit its LSN, so a consumer that needs provenance has it regardless
+  // of this setting.
+  bool best_effort_wall_clock_alignment = 4;
   // Allowed commit-timestamp lead in milliseconds; zero means 1000.
-  uint32 align_skew_ms = 5;
+  uint32 wall_clock_lead_ms = 5;
   // Longest hold of a shard in milliseconds; zero means 10000.
-  uint32 align_timeout_ms = 6;
+  uint32 wall_clock_hold_ms = 6;
   // Shard set to stream; empty means default.
   string shard_set = 7;
   // Where a shard absent from position starts: its slot's confirmed

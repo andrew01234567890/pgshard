@@ -201,13 +201,24 @@ type VStreamOptions struct {
 	// Interval between Heartbeat events while idle, in milliseconds; zero
 	// means 5000.
 	HeartbeatIntervalMs uint32 `protobuf:"varint,3,opt,name=heartbeat_interval_ms,json=heartbeatIntervalMs,proto3" json:"heartbeat_interval_ms,omitempty"`
-	// Hold back shards whose commit timestamps run ahead of the slowest shard
-	// by more than align_skew_ms, releasing them after align_timeout_ms.
-	AlignSkew bool `protobuf:"varint,4,opt,name=align_skew,json=alignSkew,proto3" json:"align_skew,omitempty"`
+	// Hold back shards whose commit timestamps run ahead of the slowest
+	// shard by more than wall_clock_lead_ms, releasing them after
+	// wall_clock_hold_ms.
+	//
+	// This changes presentation only. The timestamps it sorts by are each
+	// shard's own PostgreSQL commit timestamp, taken from that host's
+	// clock, and a held shard is released on a timeout whether or not the
+	// slow one has caught up. It therefore establishes no causal, real-time
+	// or serialization order, and enabling it does not weaken or strengthen
+	// the contract above: transactions of different shards remain unordered
+	// with respect to each other. Every event carries its shard, and every
+	// Commit its LSN, so a consumer that needs provenance has it regardless
+	// of this setting.
+	BestEffortWallClockAlignment bool `protobuf:"varint,4,opt,name=best_effort_wall_clock_alignment,json=bestEffortWallClockAlignment,proto3" json:"best_effort_wall_clock_alignment,omitempty"`
 	// Allowed commit-timestamp lead in milliseconds; zero means 1000.
-	AlignSkewMs uint32 `protobuf:"varint,5,opt,name=align_skew_ms,json=alignSkewMs,proto3" json:"align_skew_ms,omitempty"`
+	WallClockLeadMs uint32 `protobuf:"varint,5,opt,name=wall_clock_lead_ms,json=wallClockLeadMs,proto3" json:"wall_clock_lead_ms,omitempty"`
 	// Longest hold of a shard in milliseconds; zero means 10000.
-	AlignTimeoutMs uint32 `protobuf:"varint,6,opt,name=align_timeout_ms,json=alignTimeoutMs,proto3" json:"align_timeout_ms,omitempty"`
+	WallClockHoldMs uint32 `protobuf:"varint,6,opt,name=wall_clock_hold_ms,json=wallClockHoldMs,proto3" json:"wall_clock_hold_ms,omitempty"`
 	// Shard set to stream; empty means default.
 	ShardSet string `protobuf:"bytes,7,opt,name=shard_set,json=shardSet,proto3" json:"shard_set,omitempty"`
 	// Where a shard absent from position starts: its slot's confirmed
@@ -271,23 +282,23 @@ func (x *VStreamOptions) GetHeartbeatIntervalMs() uint32 {
 	return 0
 }
 
-func (x *VStreamOptions) GetAlignSkew() bool {
+func (x *VStreamOptions) GetBestEffortWallClockAlignment() bool {
 	if x != nil {
-		return x.AlignSkew
+		return x.BestEffortWallClockAlignment
 	}
 	return false
 }
 
-func (x *VStreamOptions) GetAlignSkewMs() uint32 {
+func (x *VStreamOptions) GetWallClockLeadMs() uint32 {
 	if x != nil {
-		return x.AlignSkewMs
+		return x.WallClockLeadMs
 	}
 	return 0
 }
 
-func (x *VStreamOptions) GetAlignTimeoutMs() uint32 {
+func (x *VStreamOptions) GetWallClockHoldMs() uint32 {
 	if x != nil {
-		return x.AlignTimeoutMs
+		return x.WallClockHoldMs
 	}
 	return 0
 }
@@ -2809,15 +2820,14 @@ var File_pgshard_v1_vstream_proto protoreflect.FileDescriptor
 const file_pgshard_v1_vstream_proto_rawDesc = "" +
 	"\n" +
 	"\x18pgshard/v1/vstream.proto\x12\n" +
-	"pgshard.v1\x1a\x17pgshard/v1/common.proto\"\xf1\x02\n" +
+	"pgshard.v1\x1a\x17pgshard/v1/common.proto\"\xa6\x03\n" +
 	"\x0eVStreamOptions\x12\x1b\n" +
 	"\ttwo_phase\x18\x01 \x01(\bR\btwoPhase\x12&\n" +
 	"\x0fstop_on_reshard\x18\x02 \x01(\bR\rstopOnReshard\x122\n" +
-	"\x15heartbeat_interval_ms\x18\x03 \x01(\rR\x13heartbeatIntervalMs\x12\x1d\n" +
-	"\n" +
-	"align_skew\x18\x04 \x01(\bR\talignSkew\x12\"\n" +
-	"\ralign_skew_ms\x18\x05 \x01(\rR\valignSkewMs\x12(\n" +
-	"\x10align_timeout_ms\x18\x06 \x01(\rR\x0ealignTimeoutMs\x12\x1b\n" +
+	"\x15heartbeat_interval_ms\x18\x03 \x01(\rR\x13heartbeatIntervalMs\x12F\n" +
+	" best_effort_wall_clock_alignment\x18\x04 \x01(\bR\x1cbestEffortWallClockAlignment\x12+\n" +
+	"\x12wall_clock_lead_ms\x18\x05 \x01(\rR\x0fwallClockLeadMs\x12+\n" +
+	"\x12wall_clock_hold_ms\x18\x06 \x01(\rR\x0fwallClockHoldMs\x12\x1b\n" +
 	"\tshard_set\x18\a \x01(\tR\bshardSet\x124\n" +
 	"\n" +
 	"start_from\x18\b \x01(\x0e2\x15.pgshard.v1.StartFromR\tstartFrom\x12&\n" +
