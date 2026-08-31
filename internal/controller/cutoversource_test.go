@@ -1,10 +1,13 @@
 package controller
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -355,5 +358,260 @@ func TestOnlyOneWorkflowMayMoveOutOfAServingSetOnPostgres(t *testing.T) {
 	if _, err := conn.Exec(ctx, `INSERT INTO pgshard.workflows (id, kind, state, spec)
 		VALUES (gen_random_uuid(), 'reshard', 'pending', '{"shard_set": "g3", "source_set": "default"}'::jsonb)`); err != nil {
 		t.Fatalf("a moving workflow after the first ended: %v", err)
+	}
+}
+
+// racingCutovers builds two cutovers of the same source, on their own
+// target sets, over one catalog. Their fixture is the state the flip acts
+// on: a serving source of two shards, two provisioned targets and a
+// database whose home shard the flip moves.
+func racingCutovers(t *testing.T) (*pgxpool.Pool, *pgx.Conn, *pgCutover, *pgCutover) {
+	t.Helper()
+	ctx := context.Background()
+	dsn := startPostgres(t)
+	conn := connect(t, dsn)
+	if err := catalog.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	rs, _ := placement.Split(2)
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []struct {
+		name  string
+		gen   int64
+		state string
+	}{{"default", 1, catalog.ShardSetServing}, {"g2", 2, catalog.ShardSetProvisioning}, {"g3", 3, catalog.ShardSetProvisioning}} {
+		if err := catalog.MaterializeShardSet(ctx, tx, s.name, s.gen, s.state, rs, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, `INSERT INTO pgshard.databases (name) VALUES ('app')`)
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	mk := func(set string, gen int64) *pgCutover {
+		return &pgCutover{
+			c:         &Copier{Pool: pool},
+			wf:        &copyWorkflow{id: newWorkflowID(t, conn), set: set, gen: gen, ids: []int32{0, 1}, ranges: rs},
+			srcSet:    "default",
+			srcIDs:    []int32{0, 1},
+			srcRanges: rs,
+		}
+	}
+	return pool, conn, mk("g2", 2), mk("g3", 3)
+}
+
+// serving names the shard sets the catalog is serving.
+func serving(t *testing.T, conn *pgx.Conn) []string {
+	t.Helper()
+	rows, err := conn.Query(context.Background(), `SELECT shard_set FROM pgshard.shard_sets WHERE state = $1 ORDER BY shard_set`, catalog.ShardSetServing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+// both runs two catalog operations so that they really overlap, and
+// returns their errors in order.
+//
+// Starting two goroutines proves nothing on its own: the second may not
+// begin until the first has committed, and then no two transactions ever
+// held a view of the catalog at once. So the test holds the row both of
+// them must write -- the source shard set -- until both have started,
+// passed their own checks and blocked on it. Releasing it then decides
+// the race inside PostgreSQL, which is where it happens in production.
+func both(t *testing.T, conn *pgx.Conn, first, second func() error) (error, error) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The map generation is the last row both a flip and a rollback write,
+	// so a lock on it holds each of them after it has read the catalog and
+	// decided to publish -- which is the interleaving that matters.
+	if _, err := tx.Exec(ctx, `SELECT generation FROM pgshard.shard_map_generation FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	gate := make(chan struct{})
+	errs := make([]error, 2)
+	for i, fn := range []func() error{first, second} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-gate
+			errs[i] = fn()
+		}()
+	}
+	close(gate)
+
+	// Both are in flight once both are waiting on the held row.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		n := queryOne[int64](t, conn, `SELECT count(*) FROM pg_locks WHERE NOT granted`)
+		if n >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d of 2 operations reached the contended row; they did not overlap", n)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	return errs[0], errs[1]
+}
+
+// TestTwoFlipsOfOneSourceCannotBothPublishOnPostgres: each flip checks that
+// its source is still the only serving set, but the check and the publish
+// are two statements. Two cutovers of the same source that overlap could
+// each see a sole serving source and each publish on top of it, which is
+// the state the check exists to prevent: two serving shard sets, and every
+// write committed to one of them invisible through the other.
+func TestTwoFlipsOfOneSourceCannotBothPublishOnPostgres(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	_, conn, first, second := racingCutovers(t)
+
+	e1, e2 := both(t, conn, func() error { return first.Flip(ctx, "") }, func() error { return second.Flip(ctx, "") })
+	if (e1 == nil) == (e2 == nil) {
+		t.Fatalf("exactly one flip must publish; got %v and %v", e1, e2)
+	}
+	// The loser is stopped by the isolation level, not by the sole-serving
+	// check: both read the catalog before either wrote, so both saw one
+	// serving source. Repeatable read is what turns the second write into a
+	// failure, and this asserts that rather than any error at all.
+	if lost := cmp.Or(e1, e2); !strings.Contains(lost.Error(), "40001") {
+		t.Fatalf("the losing flip failed with %v, want a serialization failure", lost)
+	}
+	if got := serving(t, conn); len(got) != 1 {
+		t.Fatalf("serving sets after two racing flips: %v", got)
+	}
+	if n := queryOne[int64](t, conn, `SELECT count(*) FROM pgshard.serving`); n != 1 {
+		t.Fatalf("%d rows in pgshard.serving after two racing flips", n)
+	}
+}
+
+// TestAFlipRacingARollbackLeavesOneServingSetOnPostgres: a rollback puts
+// its source back and retires its target, so it publishes a serving set
+// exactly as a flip does. The two race only where both are still possible:
+// once the first workflow has switched to g2, a second reshard out of g2 is
+// a live flip, and the first workflow rolling back to default is a live
+// rollback -- of the same serving set.
+func TestAFlipRacingARollbackLeavesOneServingSetOnPostgres(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	pool, conn, first, _ := racingCutovers(t)
+
+	if err := first.Flip(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := serving(t, conn); len(got) != 1 || got[0] != "g2" {
+		t.Fatalf("after the first flip: %v", got)
+	}
+
+	// A reshard out of the set that now serves.
+	rs, _ := placement.Split(2)
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.MaterializeShardSet(ctx, tx, "g4", 4, catalog.ShardSetProvisioning, rs, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	next := &pgCutover{
+		c:         &Copier{Pool: pool},
+		wf:        &copyWorkflow{id: newWorkflowID(t, conn), set: "g4", gen: 4, ids: []int32{0, 1}, ranges: rs},
+		srcSet:    "g2",
+		srcIDs:    []int32{0, 1},
+		srcRanges: rs,
+	}
+
+	e1, e2 := both(t, conn, func() error { return first.flipBack(ctx) }, func() error { return next.Flip(ctx, "") })
+	if e1 != nil && e2 != nil {
+		t.Fatalf("one of the two must succeed; got %v and %v", e1, e2)
+	}
+	got := serving(t, conn)
+	if len(got) != 1 {
+		t.Fatalf("serving sets after a rollback raced a flip: %v (rollback %v, flip %v)", got, e1, e2)
+	}
+	// Whichever won published its own serving row. A row for the set it
+	// replaced is expected to remain: it is deleted when the workflow
+	// completes, because until then the old set is still reachable and a
+	// rollback may need it back.
+	if n := queryOne[int64](t, conn, `SELECT count(*) FROM pgshard.serving WHERE shard_set = $1`, got[0]); n != 1 {
+		t.Fatalf("the serving set %s has no published generation", got[0])
+	}
+}
+
+// atOnce starts two operations together. Unlike the flips, a fence is
+// decided by one conditional UPDATE, so whichever order PostgreSQL runs
+// them in is a real order -- there is no window between a check and a
+// write to force them into.
+func atOnce(first, second func() error) (error, error) {
+	var wg sync.WaitGroup
+	gate := make(chan struct{})
+	errs := make([]error, 2)
+	for i, fn := range []func() error{first, second} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-gate
+			errs[i] = fn()
+		}()
+	}
+	close(gate)
+	wg.Wait()
+	return errs[0], errs[1]
+}
+
+// TestTwoCutoversFencingOneSourceAtOnceOnPostgres: the fence is owned, and
+// the owner is decided by a write. Two cutovers fencing the same source at
+// the same moment must not both come away believing they hold it.
+func TestTwoCutoversFencingOneSourceAtOnceOnPostgres(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+	_, conn, first, second := racingCutovers(t)
+	mustExec(t, conn, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch)
+		VALUES ('default', 0, 'shard0', 'serving', 1), ('default', 1, 'shard1', 'serving', 1)`)
+
+	e1, e2 := atOnce(func() error { return first.Fence(ctx) }, func() error { return second.Fence(ctx) })
+	if (e1 == nil) == (e2 == nil) {
+		t.Fatalf("exactly one cutover may hold the fence; got %v and %v", e1, e2)
+	}
+	winner, loser := first, second
+	if e1 != nil {
+		winner, loser = second, first
+	}
+	// The loser giving up must not open writes the winner is holding.
+	if err := loser.Release(ctx); err != nil {
+		t.Fatalf("the loser's release: %v", err)
+	}
+	if n := queryOne[int64](t, conn, `SELECT count(*) FROM pgshard.shard_status WHERE shard_set = 'default' AND migrating`); n != 2 {
+		t.Fatalf("the winner's fence was lifted by the cutover that lost the race: %d shards still fenced", n)
+	}
+	if err := winner.Release(ctx); err != nil {
+		t.Fatalf("the winner's release: %v", err)
+	}
+	if n := queryOne[int64](t, conn, `SELECT count(*) FROM pgshard.shard_status WHERE shard_set = 'default' AND migrating`); n != 0 {
+		t.Fatalf("%d shards still fenced after the owner released", n)
 	}
 }
