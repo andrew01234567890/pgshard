@@ -807,8 +807,14 @@ func TestPlacementRefusesUserArtifactTableOnPostgres(t *testing.T) {
 			t.Fatalf("move completed despite a conflicting user table")
 		}
 	}
-	if state != StateFailed || !strings.Contains(msg, "not this workflow's shadow") {
+	// The refusal has to say both things an operator might be looking at:
+	// their own table, and a shadow this workflow left before the
+	// controller stamped its artifacts. Only they can tell which.
+	if state != StateFailed || !strings.Contains(msg, "does not carry this workflow's marker") {
 		t.Fatalf("expected refusal, got %s %q", state, msg)
+	}
+	if !strings.Contains(msg, "rename it") || !strings.Contains(msg, "drop it and let the workflow rebuild it") {
+		t.Fatalf("the refusal must name both cases and what to do about each: %q", msg)
 	}
 	// The user's table and its row must be untouched.
 	if v := queryOne[string](t, other, `SELECT keep FROM items__pgshard_new`); v != "precious" {
