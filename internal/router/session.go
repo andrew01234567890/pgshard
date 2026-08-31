@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -139,6 +140,17 @@ type Executor struct {
 	// land on whatever that backend is running by the time it arrives.
 	cancelSent atomic.Bool
 	cancelFor  context.Context
+
+	// cancelMu guards cancelTo, the poolers a cancel must reach: the streams
+	// this statement has run on. It is the only executor state another
+	// goroutine reads. Resolving the pooler from e.shard instead raced the
+	// session goroutine moving the session, and could send the cancel to the
+	// shard it had just left -- while marking the statement cancelled, so the
+	// right one was never asked. A stream also records the pooler it was
+	// opened on for the same reason a release does: the endpoint may have
+	// moved since.
+	cancelMu sync.Mutex
+	cancelTo []pgshardv1.PoolerClient
 
 	gucs   []gucEntry
 	staged []gucEntry
@@ -1791,9 +1803,14 @@ func (e *Executor) copyIn(w pgwire.ResultWriter, resp *pgshardv1.CopyInResponse)
 // a second Cancel. The context is an identity here, never waited on: it
 // says which statement a pump belongs to.
 func (e *Executor) beginStatement(ctx context.Context) {
+	e.cancelMu.Lock()
+	defer e.cancelMu.Unlock()
 	if e.cancelFor != ctx {
 		e.cancelFor = ctx
 		e.cancelSent.Store(false)
+	}
+	if e.conn != nil {
+		e.noteCancelTargetLocked(e.conn.client)
 	}
 }
 
@@ -1801,14 +1818,15 @@ func (e *Executor) cancelBackend(ctx context.Context) {
 	if !e.cancelSent.CompareAndSwap(false, true) {
 		return
 	}
-	client, err := e.client()
-	if err != nil {
-		return
-	}
+	e.cancelMu.Lock()
+	targets := append([]pgshardv1.PoolerClient(nil), e.cancelTo...)
+	e.cancelMu.Unlock()
 	cctx, cancel := context.WithTimeout(ctx, releaseTimeout)
 	defer cancel()
-	if _, err := client.Cancel(cctx, &pgshardv1.CancelRequest{SessionId: e.sid}); err != nil {
-		e.r.cfg.Logger.Warn("cancel failed", "session", e.sid, "err", err)
+	for _, client := range targets {
+		if _, err := client.Cancel(cctx, &pgshardv1.CancelRequest{SessionId: e.sid}); err != nil {
+			e.r.cfg.Logger.Warn("cancel failed", "session", e.sid, "err", err)
+		}
 	}
 }
 
@@ -1907,4 +1925,36 @@ func (e *Executor) reportParameter(w pgwire.ResultWriter, name, value string) er
 	}
 	e.reported[name] = value
 	return w.ParameterStatus(name, value)
+}
+
+// noteCancelTarget records a pooler this session has work on, so a cancel
+// reaches it. The list is the transaction's rather than the statement's: a
+// multi-shard transaction leaves participants running on shards the current
+// statement is not on, and every one of them has work to stop. It is
+// cleared when the transaction ends, and a cancel that arrives for a pooler
+// with nothing to cancel costs a round trip and no more.
+func (e *Executor) noteCancelTarget(c pgshardv1.PoolerClient) {
+	e.cancelMu.Lock()
+	defer e.cancelMu.Unlock()
+	e.noteCancelTargetLocked(c)
+}
+
+func (e *Executor) noteCancelTargetLocked(c pgshardv1.PoolerClient) {
+	if c == nil {
+		return
+	}
+	for _, have := range e.cancelTo {
+		if have == c {
+			return
+		}
+	}
+	e.cancelTo = append(e.cancelTo, c)
+}
+
+// forgetCancelTargets drops the poolers of a transaction that is over. The
+// next statement records the stream it runs on.
+func (e *Executor) forgetCancelTargets() {
+	e.cancelMu.Lock()
+	e.cancelTo = nil
+	e.cancelMu.Unlock()
 }

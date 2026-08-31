@@ -243,6 +243,10 @@ func (e *Executor) runReqsOn(ctx context.Context, p *txnPart, reqs []*pgshardv1.
 	if p.ps == nil {
 		return pgwire.Errorf(codeConnectionFailure, "shard %s/%d: no stream", p.shard.Set, p.shard.ID)
 	}
+	// A participant is running this statement too, and a cancel that never
+	// reaches it leaves its half going.
+	e.noteCancelTarget(p.ps.client)
+	onCancel := func() { e.cancelBackend(context.Background()) }
 	for _, req := range reqs {
 		if err := p.ps.send(perShard(req), e.sid, e.r.cfg.Poolers.Generation(p.shard), e.ident, e.info.Database); err != nil {
 			return pgwire.Errorf(codeConnectionFailure, "shard %s/%d: pooler connection lost: %v", p.shard.Set, p.shard.ID, err)
@@ -250,7 +254,7 @@ func (e *Executor) runReqsOn(ctx context.Context, p *txnPart, reqs []*pgshardv1.
 	}
 	var firstErr error
 	for {
-		resp, err := p.ps.recv(ctx, nil)
+		resp, err := p.ps.recv(ctx, onCancel)
 		if err != nil {
 			return pgwire.Errorf(codeConnectionFailure, "shard %s/%d: pooler connection lost: %v", p.shard.Set, p.shard.ID, err)
 		}
@@ -547,6 +551,7 @@ func heartbeatUntilDecided(ctx context.Context, log DecisionLog, gid string) {
 
 // finishTxn marks the multi-shard transaction over on the current stream.
 func (e *Executor) finishTxn(tag string) {
+	e.forgetCancelTargets()
 	e.tx = pgwire.TxIdle
 	e.txnOnBackend, e.txnPreFence = false, false
 	e.txnEnded = true

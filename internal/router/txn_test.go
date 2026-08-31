@@ -654,3 +654,50 @@ func TestAnIdleTransactionKeepsItsStream(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestACancelReachesEveryParticipant: a cancel used to be sent to one
+// pooler, resolved from the session's current shard by the cancelling
+// goroutine while the session goroutine was free to move it. So it could
+// reach the shard the session had just left -- and because the statement
+// was marked cancelled before the target was resolved, the right shard was
+// then never asked. A multi-shard transaction has work running on every
+// participant, and all of it has to stop.
+func TestACancelReachesEveryParticipant(t *testing.T) {
+	h := newTxnHarness(t)
+	ctx := context.Background()
+	a, b := h.twoTenants(t)
+	sa, sb := h.shardOf(t, a), h.shardOf(t, b)
+	conn := h.connect(t, h.dsn())
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tenant := range []int64{a, b} {
+		if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 1)", tenant); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	h.r.mu.Lock()
+	var e *Executor
+	for _, live := range h.r.sessions {
+		e = live
+		break
+	}
+	h.r.mu.Unlock()
+	if e == nil {
+		t.Fatal("no executor for the session")
+	}
+
+	stmt, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e.beginStatement(stmt)
+	e.cancelBackend(context.Background())
+
+	for _, shard := range []int{sa, sb} {
+		if len(h.poolers[shard].cancelled()) == 0 {
+			t.Errorf("shard %d was never asked to cancel; its half of the transaction is still running", shard)
+		}
+	}
+	_ = tx.Rollback(ctx)
+}
