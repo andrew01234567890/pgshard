@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -61,6 +62,12 @@ type Prober interface {
 	// pgshard.roles, so the generated credential can reach the cluster
 	// through the router and create the first role of its own.
 	SeedBootstrapRole(ctx context.Context, dsn, rolname, password string) error
+	// BootstrapVerifier reads the verifier pgshard.roles publishes for
+	// rolname, given a catalog DSN. Empty when the role has none.
+	BootstrapVerifier(ctx context.Context, dsn, rolname string) (string, error)
+	// AdoptBootstrapVerifier gives rolname the published verifier on the
+	// group behind dsn, so key forwarding reaches it.
+	AdoptBootstrapVerifier(ctx context.Context, dsn, rolname, verifier string) error
 	// PublishShardStatus upserts pgshard.shard_status for the given shard
 	// groups in one statement; it never lowers primary_epoch. Non-serving
 	// groups stay provisioning.
@@ -719,6 +726,10 @@ func (PgxProber) SeedBootstrapRole(ctx context.Context, dsn, rolname, password s
 	return err
 }
 
+func quoteIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
 func quoteLiteral(s string) string {
 	var b []byte
 	b = append(b, '\'')
@@ -800,6 +811,66 @@ func (b boundedProber) SetRouterPassword(ctx context.Context, dsn, password stri
 	ctx, cancel := b.bound(ctx)
 	defer cancel()
 	return b.Inner.SetRouterPassword(ctx, dsn, password)
+}
+
+// BootstrapVerifier implements Prober.
+//
+// A shard group runs its own initdb, which mints its own salt for the
+// superuser, so its verifier is unrelated to the catalog's even though the
+// password behind both is the same. SCRAM key forwarding cannot bridge that:
+// the router recovers ClientKey against the salt the catalog publishes, and a
+// backend salted differently rejects it. One verifier everywhere is what makes
+// the forwarded key mean the same thing on every group.
+func (PgxProber) BootstrapVerifier(ctx context.Context, dsn, rolname string) (string, error) {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	var verifier string
+	err = conn.QueryRow(ctx, `SELECT coalesce(verifier, '') FROM pgshard.roles WHERE rolname = $1`, rolname).Scan(&verifier)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return verifier, err
+}
+
+// AdoptBootstrapVerifier implements Prober.
+func (PgxProber) AdoptBootstrapVerifier(ctx context.Context, dsn, rolname, verifier string) error {
+	if _, err := pgwire.ParseSCRAMVerifier(verifier); err != nil {
+		return fmt.Errorf("published verifier for %s is not a SCRAM verifier: %w", rolname, err)
+	}
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	var stored string
+	if err := conn.QueryRow(ctx, `SELECT coalesce(rolpassword, '') FROM pg_authid WHERE rolname = $1`, rolname).Scan(&stored); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	if stored == verifier {
+		return nil
+	}
+	// ALTER ROLE takes no parameters, and a PASSWORD that already is a
+	// verifier is stored verbatim rather than hashed again.
+	_, err = conn.Exec(ctx, `ALTER ROLE `+quoteIdent(rolname)+` WITH PASSWORD `+quoteLiteral(verifier))
+	return err
+}
+
+func (b boundedProber) BootstrapVerifier(ctx context.Context, dsn, rolname string) (string, error) {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.BootstrapVerifier(ctx, dsn, rolname)
+}
+
+func (b boundedProber) AdoptBootstrapVerifier(ctx context.Context, dsn, rolname, verifier string) error {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.AdoptBootstrapVerifier(ctx, dsn, rolname, verifier)
 }
 
 func (b boundedProber) SeedBootstrapRole(ctx context.Context, dsn, rolname, password string) error {
