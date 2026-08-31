@@ -43,11 +43,19 @@ type Instance struct {
 	stanzaMu     sync.Mutex
 	stanzaCancel context.CancelFunc
 	stanzaDone   chan struct{}
+	// repoGate serialises this instance's pgBackRest operations. pgBackRest
+	// takes a per-stanza lock and refuses a second operation outright --
+	// exit status 50, "unable to acquire lock" -- so a backup arriving while
+	// another was finishing used to fail rather than wait, and the record
+	// carrying it went to Failed with a raw pgBackRest error. One agent owns
+	// one stanza, so waiting here is the whole of it.
+	repoGate chan struct{}
 }
 
 // NewInstance wires an Instance from its parts.
 func NewInstance(cfg *Config, sup *Supervisor, epoch *EpochStore, log *slog.Logger) *Instance {
-	in := &Instance{cfg: cfg, sup: sup, epoch: epoch, log: log, cloneRetry: 5 * time.Second}
+	in := &Instance{cfg: cfg, sup: sup, epoch: epoch, log: log, cloneRetry: 5 * time.Second,
+		repoGate: make(chan struct{}, 1)}
 	in.rewindFn = in.pgRewind
 	in.recloneFn = in.baseBackup
 	in.repoCloneFn = in.repoClone
