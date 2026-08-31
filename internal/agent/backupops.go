@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os/exec"
 	"time"
 
@@ -15,6 +16,21 @@ var ErrNoBackupPolicy = errors.New("no backup policy configured for this member"
 
 // ErrBackupOnStandby is returned when a backup is requested from a standby.
 var ErrBackupOnStandby = errors.New("backups run on the primary only")
+
+// holdRepo takes this instance's pgBackRest gate, waiting for whatever holds
+// it. pgBackRest refuses a second operation on a stanza outright rather than
+// queueing, with exit status 50, so a backup that arrived while another was
+// finishing failed on a lock instead of running a moment later. Waiting is
+// bounded by the caller's context: a request that gives up says what it was
+// waiting for, which "unable to acquire lock on file" never did.
+func (in *Instance) holdRepo(ctx context.Context) (func(), error) {
+	select {
+	case in.repoGate <- struct{}{}:
+		return func() { <-in.repoGate }, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("pgbackrest: another operation is still running on this stanza: %w", ctx.Err())
+	}
+}
 
 // backupRunner builds the pgbackrest runner for the current settings.
 func (in *Instance) backupRunner() (*backup.Runner, error) {
@@ -56,6 +72,11 @@ func (in *Instance) EnsureStanza(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	release, err := in.holdRepo(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
 	return r.EnsureStanza(ctx)
 }
 
@@ -151,6 +172,11 @@ func (in *Instance) Backup(ctx context.Context, t backup.Type) (backup.Result, e
 	if err != nil {
 		return backup.Result{}, err
 	}
+	release, err := in.holdRepo(ctx)
+	if err != nil {
+		return backup.Result{}, err
+	}
+	defer release()
 	return r.Backup(ctx, t)
 }
 
@@ -241,6 +267,13 @@ func (s *Server) Expire(ctx context.Context, req *pgshardv1.ExpireRequest) (*pgs
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
+	// Expire takes the same stanza lock a backup does.
+	release, err := s.inst.holdRepo(ctx)
+	if err != nil {
+		resp.Error = pgErr(err)
+		return resp, nil
+	}
+	defer release()
 	resp.Log, err = r.Expire(ctx)
 	resp.Error = pgErr(err)
 	return resp, nil

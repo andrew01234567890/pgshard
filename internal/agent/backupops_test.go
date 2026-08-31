@@ -298,3 +298,105 @@ func awaitCount(t *testing.T, c *atomic.Int64, want int64) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// TestASecondBackupWaitsRatherThanFailingOnTheLock: pgBackRest takes a
+// per-stanza lock and refuses a second operation outright, so a backup that
+// arrived while another was finishing failed with "unable to acquire lock on
+// file ... Resource temporarily unavailable" and the record carrying it went
+// to Failed. Seen in CI on a pull request that touched neither backups nor
+// the agent: a scheduled incremental started while a full was still running.
+func TestASecondBackupWaitsRatherThanFailingOnTheLock(t *testing.T) {
+	in := newTestInstance(t)
+	dir := t.TempDir()
+	in.cfg.Role = RolePrimary
+	in.cfg.Backup = &backup.Settings{Stanza: "t-catalog-pg18", Repo: backup.Repo{Type: backup.TypePosix},
+		ConfigPath: filepath.Join(dir, "pgbackrest.conf"), SpoolPath: filepath.Join(dir, "spool"), LogPath: filepath.Join(dir, "log")}
+
+	info, err := os.ReadFile(filepath.Join("backup", "testdata", "info.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &fakePgbackrest{info: string(info), fail: map[string]error{}}
+
+	var concurrent, peak atomic.Int64
+	release := make(chan struct{})
+	in.newRunner = func(s backup.Settings) *backup.Runner {
+		r := backup.NewRunner(s, in.log)
+		r.Exec = func(ctx context.Context, args []string, onLine func(string)) error {
+			if args[len(args)-1] != "backup" {
+				return f.exec(ctx, args, onLine)
+			}
+			n := concurrent.Add(1)
+			defer concurrent.Add(-1)
+			for {
+				p := peak.Load()
+				if n <= p || peak.CompareAndSwap(p, n) {
+					break
+				}
+			}
+			select {
+			case <-release:
+				return f.exec(ctx, args, onLine)
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return r
+	}
+
+	ctx := context.Background()
+	done := make(chan error, 2)
+	for range 2 {
+		go func() {
+			_, err := in.Backup(ctx, backup.Incr)
+			done <- err
+		}()
+	}
+	// Both are in flight as far as the agent is concerned; only one may be
+	// inside pgbackrest.
+	time.Sleep(100 * time.Millisecond)
+	if n := peak.Load(); n != 1 {
+		t.Fatalf("%d pgbackrest operations ran at once; the second would meet the stanza lock", n)
+	}
+	close(release)
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatalf("backup: %v", err)
+		}
+	}
+	if n := peak.Load(); n != 1 {
+		t.Fatalf("peak concurrency %d, want 1", n)
+	}
+}
+
+// TestABackupThatGivesUpWaitingSaysWhatItWasWaitingFor: the wait is bounded
+// by the caller's own context, and what it reports is the reason -- not
+// pgBackRest's exit status 50, which named a lock file and nothing else.
+func TestABackupThatGivesUpWaitingSaysWhatItWasWaitingFor(t *testing.T) {
+	in := newTestInstance(t)
+	dir := t.TempDir()
+	in.cfg.Role = RolePrimary
+	in.cfg.Backup = &backup.Settings{Stanza: "t-catalog-pg18", Repo: backup.Repo{Type: backup.TypePosix},
+		ConfigPath: filepath.Join(dir, "pgbackrest.conf"), SpoolPath: filepath.Join(dir, "spool"), LogPath: filepath.Join(dir, "log")}
+	held := make(chan struct{})
+	in.newRunner = func(s backup.Settings) *backup.Runner {
+		r := backup.NewRunner(s, in.log)
+		r.Exec = func(ctx context.Context, _ []string, _ func(string)) error {
+			close(held)
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return r
+	}
+	first, stopFirst := context.WithCancel(context.Background())
+	go func() { _, _ = in.Backup(first, backup.Full) }()
+	<-held
+
+	second, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := in.Backup(second, backup.Incr)
+	if err == nil || !strings.Contains(err.Error(), "another operation is still running on this stanza") {
+		t.Fatalf("the second backup reported: %v", err)
+	}
+	stopFirst()
+}
