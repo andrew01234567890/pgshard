@@ -103,8 +103,13 @@ func (s *Server) ResolveTransactions(ctx context.Context, req *pgshardv1.Resolve
 	return resp, nil
 }
 
+// kindToProto must name every kind the controller creates. A kind missing
+// here reports as UNSPECIFIED and cannot be filtered for, so a caller asking
+// for upgrades got none and one listing everything could not tell what it
+// was looking at -- while the upgrade itself ran normally.
 var kindToProto = map[string]pgshardv1.WorkflowKind{
 	KindReshard:        pgshardv1.WorkflowKind_WORKFLOW_KIND_RESHARD,
+	KindUpgrade:        pgshardv1.WorkflowKind_WORKFLOW_KIND_UPGRADE,
 	KindTablePlacement: pgshardv1.WorkflowKind_WORKFLOW_KIND_REKEY,
 }
 
