@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -396,4 +397,71 @@ func TestParameterNameCannotInjectASetting(t *testing.T) {
 			t.Errorf("line %q is not a single setting", line)
 		}
 	}
+}
+
+// TestBackupPolicyIsSafeToReadWhileAReloadReplacesIt: a reload replaces the
+// backup policy from whichever goroutine served it, while the backup RPCs
+// and the stanza loop read it without the agent server's lock. Reading the
+// field twice -- once to check it for nil and once to dereference it --
+// could find a policy and then nil, which ends the agent, and the agent is
+// PID 1 in the PostgreSQL pod.
+func TestBackupPolicyIsSafeToReadWhileAReloadReplacesIt(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "member.json")
+	const base = `{"cluster":"c","shard":"s","member":"m","role":"primary","pgdata":"/d","passwordFile":"/p","port":5433`
+	withPolicy := base + `,"backup":{"stanza":"st","repo":{"type":"posix","path":"/repo"}}}`
+	withoutPolicy := base + `}`
+	if err := os.WriteFile(path, []byte(withPolicy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			body := withPolicy
+			if i%2 == 1 {
+				body = withoutPolicy
+			}
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				return
+			}
+			_ = c.Refresh()
+		}
+	}()
+
+	// The readers are the backup RPCs and the stanza loop: several
+	// goroutines, none of them holding the server lock, for as long as the
+	// reload keeps going.
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				// What a reader does: take the policy once, then use it.
+				if p := c.BackupPolicy(); p != nil {
+					_ = p.Stanza
+				}
+			}
+		}()
+	}
+	time.Sleep(200 * time.Millisecond)
+	close(stop)
+	wg.Wait()
 }
