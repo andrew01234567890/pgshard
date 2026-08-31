@@ -1059,6 +1059,13 @@ func (r *ClusterReconciler) reconcileCatalogSchema(ctx context.Context, c *pgsha
 		}
 		return r.Prober.SetRouterPassword(ctx, dsn, pw)
 	}
+	// The router authenticates against pgshard.roles and the migrations
+	// leave it empty, so without this nobody can reach the cluster through
+	// the router to create the first role -- including the operator's own
+	// generated superuser credential, which is the only one that exists.
+	seedBootstrapRole := func() error {
+		return r.Prober.SeedBootstrapRole(ctx, dsn, superuserName, password)
+	}
 	if up := c.Status.CatalogUpgrade; up != nil && up.Stage == CatalogUpgradeRetiring {
 		// A schema migration applied here cannot be rolled back with the
 		// data. Logical replication carries no DDL, so the reverse stream
@@ -1076,6 +1083,9 @@ func (r *ClusterReconciler) reconcileCatalogSchema(ctx context.Context, c *pgsha
 			// pass can set again helps nobody.
 			cond.Message += "; the router credential could not be applied: " + err.Error()
 		}
+		if err := seedBootstrapRole(); err != nil {
+			cond.Message += "; the bootstrap role could not be published: " + err.Error()
+		}
 		return cond, dsn
 	}
 	if err := r.Prober.MigrateCatalog(ctx, dsn); err != nil {
@@ -1086,6 +1096,12 @@ func (r *ClusterReconciler) reconcileCatalogSchema(ctx context.Context, c *pgsha
 	// After the migration, which is what creates the role.
 	if err := setRouterCredential(); err != nil {
 		cond.Reason = "RouterCredential"
+		cond.Message = err.Error()
+		return cond, ""
+	}
+	// Also after the migration: pgshard.roles does not exist before it.
+	if err := seedBootstrapRole(); err != nil {
+		cond.Reason = "BootstrapRole"
 		cond.Message = err.Error()
 		return cond, ""
 	}

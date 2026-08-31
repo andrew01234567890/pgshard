@@ -101,6 +101,9 @@ type fakeProber struct {
 	journal *[]string
 	// routerPasswords records every ALTER ROLE the reconcile asked for.
 	routerPasswords []string
+	// bootstrapRoles records every verifier the reconcile published so a
+	// generated credential can reach the router.
+	bootstrapRoles []string
 	// onRelease runs inside ReleaseCatalog, so a test can see what the
 	// cluster looked like at that point of the rollback.
 	onRelease func()
@@ -544,6 +547,13 @@ func (f *fakeProber) SetRouterPassword(_ context.Context, dsn, password string) 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.routerPasswords = append(f.routerPasswords, hostOf(dsn)+"="+password)
+	return nil
+}
+
+func (f *fakeProber) SeedBootstrapRole(_ context.Context, dsn, rolname, password string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.bootstrapRoles = append(f.bootstrapRoles, hostOf(dsn)+"="+rolname+":"+password)
 	return nil
 }
 

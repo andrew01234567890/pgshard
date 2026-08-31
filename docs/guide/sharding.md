@@ -6,6 +6,11 @@ database, edited with ordinary SQL. Connect to the router with
 `pgshard_admin`, and every component follows your edits through
 LISTEN/NOTIFY. The full schema is in [catalog.md](../catalog.md).
 
+On a cluster nobody has logged into yet, that role is the superuser whose
+password the operator generated; see
+[the first login](getting-started.md#the-first-login) for how to read it
+out of the Secret.
+
 ## Declare a database
 
 ```sql
