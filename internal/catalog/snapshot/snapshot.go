@@ -73,6 +73,12 @@ type Placement struct {
 	// ReferenceHazards is what that inspection found: everything a shard
 	// would evaluate for itself, and so differently on every shard.
 	ReferenceHazards []string
+	// ShardKeyError says why this table's shard key cannot be routed by,
+	// when the controller's inspection of the column on the shards found a
+	// type whose equality does not match its hash. Empty when the key is
+	// fine, and also when the inspection has not run: an unchecked table
+	// is one nothing has found fault with.
+	ShardKeyError string
 }
 
 // MaxAge is how old a snapshot may be before the router serving it must

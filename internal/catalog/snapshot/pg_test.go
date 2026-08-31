@@ -92,6 +92,37 @@ func TestSnapshotWithPostgres(t *testing.T) {
 	mustExec(t, conn, `INSERT INTO pgshard.roles (rolname, verifier) VALUES ('alice', 'SCRAM-SHA-256$4096:salt$a:b')`)
 	mustExec(t, conn, `UPDATE pgshard.shard_map_generation SET generation = 5`)
 
+	// A verdict on the shard key is about the key the table had when the
+	// controller asked. Once the key changes the generation moves, and the
+	// old answer describes a column the table no longer shards on.
+	t.Run("a shard key fault applies to the generation it was recorded for", func(t *testing.T) {
+		key := TableKey{"app", "public", "orders"}
+		for _, c := range []struct {
+			name       string
+			generation int64
+			want       string
+		}{
+			{"the generation in force", 7, "shard key customer_id of type character(8) is not supported"},
+			{"a generation the table has left behind", 6, ""},
+		} {
+			t.Run(c.name, func(t *testing.T) {
+				if _, err := conn.Exec(ctx, `UPDATE pgshard.table_status SET shard_key_checked_generation = $1,
+					shard_key_error = 'shard key customer_id of type character(8) is not supported'
+					WHERE table_name = 'orders'`, c.generation); err != nil {
+					t.Fatal(err)
+				}
+				s, err := Load(ctx, conn)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := s.Tables[key].ShardKeyError; got != c.want {
+					t.Fatalf("ShardKeyError = %q, want %q", got, c.want)
+				}
+			})
+		}
+		mustExec(t, conn, `UPDATE pgshard.table_status SET shard_key_checked_generation = NULL, shard_key_error = NULL WHERE table_name = 'orders'`)
+	})
+
 	t.Run("load", func(t *testing.T) {
 		s, err := Load(ctx, conn)
 		if err != nil {

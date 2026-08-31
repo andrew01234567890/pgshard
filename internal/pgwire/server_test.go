@@ -1447,3 +1447,89 @@ func TestCopyOutReachesTheClientBeforeTheQueryEnds(t *testing.T) {
 	}
 	close(release)
 }
+
+// blockingAuthenticator lets a test hold a session inside Authenticate,
+// revoke it, and then decide what the exchange reports.
+type blockingAuthenticator struct {
+	reached chan struct{}
+	release chan struct{}
+	err     error
+}
+
+func (a *blockingAuthenticator) Authenticate(context.Context, map[string]string, AuthExchange) (*AuthResult, error) {
+	close(a.reached)
+	<-a.release
+	return nil, a.err
+}
+
+// TestARevocationDuringAuthenticationReportsTheRevocation: the latch was
+// consulted only after Authenticate returned successfully, so an exchange
+// that was failing for its own reason reported that reason instead -- a
+// revoked role could still be told it is NOLOGIN or that its password has
+// expired, which describes a role the cluster has just withdrawn. Whatever
+// the exchange was doing, a revoked session ends as a revoked one.
+func TestARevocationDuringAuthenticationReportsTheRevocation(t *testing.T) {
+	auth := &blockingAuthenticator{
+		reached: make(chan struct{}),
+		release: make(chan struct{}),
+		err:     Errorf(CodeInvalidAuthorization, "role \"revoked\" is not permitted to log in"),
+	}
+	ts := startServer(t, Config{Authenticator: auth})
+	c := dialRaw(t, ts.addr)
+	c.rawStartup(ProtocolVersion30, map[string]string{"user": "revoked", "database": "db"})
+
+	<-auth.reached
+	if n := ts.TerminateUser("revoked"); n != 1 {
+		t.Fatalf("terminated %d sessions, want the one still authenticating", n)
+	}
+	close(auth.release)
+
+	var fatal *pgproto3.ErrorResponse
+	for range 20 {
+		msg, err := c.fe.Receive()
+		if err != nil {
+			break
+		}
+		if e, ok := msg.(*pgproto3.ErrorResponse); ok && e.Severity == "FATAL" {
+			fatal = e
+		}
+	}
+	if fatal == nil {
+		t.Fatal("a revoked session must be told why it ended")
+	}
+	if fatal.Message != "password authentication failed" {
+		t.Fatalf("a revoked session reported %q, want the same message every revoked session gets", fatal.Message)
+	}
+	if fatal.Code != CodeInvalidPassword {
+		t.Fatalf("code = %q, want %q", fatal.Code, CodeInvalidPassword)
+	}
+}
+
+// TestAnAuthenticationFailureWithNoRevocationKeepsItsOwnMessage is the
+// other half: normalising every failure would hide the reasons the cluster
+// discloses on purpose.
+func TestAnAuthenticationFailureWithNoRevocationKeepsItsOwnMessage(t *testing.T) {
+	auth := &blockingAuthenticator{
+		reached: make(chan struct{}),
+		release: make(chan struct{}),
+		err:     Errorf(CodeInvalidAuthorization, "role \"nologin\" is not permitted to log in"),
+	}
+	close(auth.release)
+	ts := startServer(t, Config{Authenticator: auth})
+	c := dialRaw(t, ts.addr)
+	c.rawStartup(ProtocolVersion30, map[string]string{"user": "nologin", "database": "db"})
+
+	var fatal *pgproto3.ErrorResponse
+	for range 20 {
+		msg, err := c.fe.Receive()
+		if err != nil {
+			break
+		}
+		if e, ok := msg.(*pgproto3.ErrorResponse); ok && e.Severity == "FATAL" {
+			fatal = e
+		}
+	}
+	if fatal == nil || fatal.Message != "role \"nologin\" is not permitted to log in" {
+		t.Fatalf("failure reported as %+v, want the authenticator's own message", fatal)
+	}
+}

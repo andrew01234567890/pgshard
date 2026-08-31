@@ -647,6 +647,18 @@ func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
 		r.schema = schema
 		switch pl.Placement {
 		case "sharded":
+			// The router hashes the key value the client sent; a copy, a
+			// row filter and a re-key hash the value the shard stored. For
+			// a blank-padded character(n) those differ for keys PostgreSQL
+			// calls equal, so the same key can be routed to one shard and
+			// copied to another. The controller asks the shards what the
+			// column really is; a table it faulted is not routable at all,
+			// reads included, because the read would go to the shard the
+			// row is not on.
+			if pl.ShardKeyError != "" {
+				return nil, notYet("table \""+name+"\" cannot be routed: "+pl.ShardKeyError,
+					"change the shard key to a column whose type hashes the way it compares, or move the table with a placement workflow")
+			}
 			r.kind, r.shardKey, r.seqCols = placeSharded, pl.ShardKey, pl.SequenceColumns
 		case "reference":
 			r.kind, r.refDeclared, r.refChecked, r.refHazards = placeReference, true, pl.ReferenceChecked, pl.ReferenceHazards

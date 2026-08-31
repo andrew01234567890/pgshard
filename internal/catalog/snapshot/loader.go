@@ -85,6 +85,7 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 			p.SequenceColumns = t.SequenceColumns
 			p.ReferenceChecked = ts.ReferenceCheckedGeneration != nil && *ts.ReferenceCheckedGeneration == ts.EffectiveGeneration
 			p.ReferenceHazards = ts.ReferenceHazards
+			p.ShardKeyError = shardKeyError(ts)
 			s.Tables[key] = p
 			continue
 		}
@@ -107,6 +108,7 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 		}
 		p.ReferenceChecked = ts.ReferenceCheckedGeneration != nil && *ts.ReferenceCheckedGeneration == ts.EffectiveGeneration
 		p.ReferenceHazards = ts.ReferenceHazards
+		p.ShardKeyError = shardKeyError(ts)
 		s.Tables[key] = p
 	}
 	rewrites, err := catalog.PendingRewrites(ctx, tx)
@@ -163,4 +165,14 @@ func LoadRoles(ctx context.Context, q catalog.Querier) (*Roles, error) {
 		r.verifiers[name] = cred
 	}
 	return r, rows.Err()
+}
+
+// shardKeyError reports the controller's verdict on a table's shard key,
+// but only for the generation now in force: a verdict recorded against an
+// older generation was about a key the table no longer has.
+func shardKeyError(ts catalog.TableStatus) string {
+	if ts.ShardKeyError == nil || ts.ShardKeyCheckedGeneration == nil || *ts.ShardKeyCheckedGeneration != ts.EffectiveGeneration {
+		return ""
+	}
+	return *ts.ShardKeyError
 }
