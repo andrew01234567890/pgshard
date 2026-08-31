@@ -51,6 +51,10 @@ type ResultWriter interface {
 	PortalSuspended() error
 	Notice(*pgproto3.NoticeResponse) error
 	Notification(*pgproto3.NotificationResponse) error
+	// ParameterStatus reports a GUC_REPORT setting whose value changed on
+	// the server, so a driver's cached view of the session matches the
+	// backend that ran the statement.
+	ParameterStatus(name, value string) error
 	// CopyIn starts a COPY FROM STDIN transfer; the returned stream yields
 	// CopyData payloads until CopyDone (io.EOF) or CopyFail (ErrCopyFail).
 	CopyIn(overallFormat byte, columnFormats []uint16) (CopyInStream, error)
