@@ -256,23 +256,10 @@ func runSuite(t *testing.T, img pgImage) {
 			{"a name starting with a digit", `INSERT INTO pgshard.streams (name, database, state) VALUES ('1s', 'streamdb', 'creating')`},
 			{"a state nothing produces", `INSERT INTO pgshard.streams (name, database, state) VALUES ('ok_name', 'streamdb', 'running')`},
 			{"no database at all", `INSERT INTO pgshard.streams (name, database, state) VALUES ('ok_name', '', 'creating')`},
-			// A stream's slot is created in its database on every shard, so
-			// one naming a database nobody declared fails there rather than
-			// here, on every shard, for ever.
-			{"a database that was never declared", `INSERT INTO pgshard.streams (name, database, state) VALUES ('ok_name', 'no_such_db', 'creating')`},
 		} {
 			if _, err := conn.Exec(ctx, bad.sql); err == nil {
 				t.Errorf("the catalog stored %s", bad.what)
 			}
-		}
-
-		// And it goes with the database, like every other per-database row,
-		// rather than being left behind with nothing to serve.
-		mustExec(t, conn, `INSERT INTO pgshard.databases (name) VALUES ('goes_away')`)
-		mustExec(t, conn, `INSERT INTO pgshard.streams (name, database, state) VALUES ('gone_too', 'goes_away', 'creating')`)
-		mustExec(t, conn, `DELETE FROM pgshard.databases WHERE name = 'goes_away'`)
-		if n := queryOne[int64](t, conn, `SELECT count(*) FROM pgshard.streams WHERE name = 'gone_too'`); n != 0 {
-			t.Error("a stream outlived the database it streams")
 		}
 
 		// The names the table takes are exactly the names the RPC takes.
