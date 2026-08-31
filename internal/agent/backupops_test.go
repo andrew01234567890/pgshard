@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -231,5 +232,69 @@ func TestStanzaWaitBoundsTheFastRetries(t *testing.T) {
 	}
 	if wait, _ := stanzaWait(busy, time.Millisecond, &n); wait != time.Millisecond {
 		t.Fatalf("fast retry never exceeds the slow one: %v", wait)
+	}
+}
+
+// TestOneStanzaWorkerPerPrimaryTerm: the stanza loop retries a repository
+// that is unreachable, and an attempt can stay blocked for as long as
+// pgBackRest takes to give up. Startup began one and every successful
+// promotion began another, with no handle on either, so role cycling during
+// repository trouble accumulated loops and the pgBackRest children they
+// track -- and a demotion could not end the attempt still running.
+func TestOneStanzaWorkerPerPrimaryTerm(t *testing.T) {
+	in := newTestInstance(t)
+	dir := t.TempDir()
+	in.cfg.Role = RolePrimary
+	in.cfg.Backup = &backup.Settings{Stanza: "t-catalog-pg18", Repo: backup.Repo{Type: backup.TypePosix},
+		ConfigPath: filepath.Join(dir, "pgbackrest.conf"), SpoolPath: filepath.Join(dir, "spool"), LogPath: filepath.Join(dir, "log")}
+
+	// Each attempt blocks until its context ends, so a live worker holds
+	// exactly one: the count in flight is the number of workers.
+	var running atomic.Int64
+	in.newRunner = func(s backup.Settings) *backup.Runner {
+		r := backup.NewRunner(s, in.log)
+		r.Exec = func(ctx context.Context, _ []string, _ func(string)) error {
+			// A repository that never answers, which is what the loop is
+			// for and what used to outlive the term that started it.
+			running.Add(1)
+			defer running.Add(-1)
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return r
+	}
+
+	in.rewindFn = func(context.Context, string) error { return nil }
+	ctx := context.Background()
+	in.startStanzaWorker(ctx, time.Millisecond)
+	awaitCount(t, &running, 1)
+
+	// A second term does not add a second worker: the first one is ended,
+	// and the attempt in flight is the new one.
+	in.startStanzaWorker(ctx, time.Millisecond)
+	awaitCount(t, &running, 1)
+	time.Sleep(100 * time.Millisecond)
+	if n := running.Load(); n != 1 {
+		t.Fatalf("%d stanza attempts in flight after a second term, want 1", n)
+	}
+
+	// Demotion ends the term, and waits for it.
+	if err := in.Demote(ctx, "host=x"); err != nil {
+		t.Fatal(err)
+	}
+	if n := running.Load(); n != 0 {
+		t.Fatalf("%d stanza attempts still running after demotion", n)
+	}
+}
+
+// awaitCount waits for c to settle at want.
+func awaitCount(t *testing.T, c *atomic.Int64, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for c.Load() != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("in flight = %d, want %d", c.Load(), want)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

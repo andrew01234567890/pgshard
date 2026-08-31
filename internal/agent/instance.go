@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -33,6 +34,15 @@ type Instance struct {
 	cloneRetry time.Duration
 	// newRunner overrides the pgbackrest runner in tests.
 	newRunner func(backup.Settings) *backup.Runner
+
+	// stanzaMu guards the one stanza worker this instance may have. It is
+	// started when the instance becomes a primary and ended when it stops
+	// being one: an attempt still blocked on an unreachable repository used
+	// to survive the demotion, and the next promotion started another
+	// beside it.
+	stanzaMu     sync.Mutex
+	stanzaCancel context.CancelFunc
+	stanzaDone   chan struct{}
 }
 
 // NewInstance wires an Instance from its parts.
@@ -342,6 +352,9 @@ func (in *Instance) waitWALReceiverStopped(ctx context.Context) error {
 // pg_rewind (falling back to a full reclone), stale slot removal, standby
 // configuration and restart.
 func (in *Instance) Demote(ctx context.Context, source string) error {
+	// This node's term as primary is over: nothing of it may still be
+	// talking to the repository when the next one starts.
+	in.stopStanzaWorker()
 	if err := in.sup.Stop(ctx, ShutdownFast, time.Duration(in.cfg.ShutdownTimeout)); err != nil {
 		return err
 	}
@@ -432,6 +445,9 @@ func (in *Instance) ensureSlotOnSource(ctx context.Context, source string) error
 // Reclone rebuilds PGDATA and starts it as a standby: from the primary
 // with pg_basebackup, or from the repository when fromRepo is set.
 func (in *Instance) Reclone(ctx context.Context, fromRepo bool) error {
+	// The same reason as Demote: this member is no longer the primary it
+	// was, and the stanza worker of that term must not outlive it.
+	in.stopStanzaWorker()
 	if err := in.sup.Stop(ctx, ShutdownFast, time.Duration(in.cfg.ShutdownTimeout)); err != nil {
 		return err
 	}
@@ -447,6 +463,9 @@ func (in *Instance) Reclone(ctx context.Context, fromRepo bool) error {
 
 // Rewind runs pg_rewind against source and restarts as a standby.
 func (in *Instance) Rewind(ctx context.Context, source string) error {
+	// The same reason as Demote: this member is no longer the primary it
+	// was, and the stanza worker of that term must not outlive it.
+	in.stopStanzaWorker()
 	if err := in.sup.Stop(ctx, ShutdownFast, time.Duration(in.cfg.ShutdownTimeout)); err != nil {
 		return err
 	}

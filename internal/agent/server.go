@@ -128,7 +128,7 @@ func (s *Server) Promote(ctx context.Context, req *pgshardv1.PromoteRequest) (*p
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
-	go s.inst.ensureStanzaLoop(s.bgCtx, stanzaRetry)
+	s.inst.startStanzaWorker(s.bgCtx, stanzaRetry)
 	st, _ := s.Status(ctx, nil)
 	resp.Timeline = st.GetTimeline()
 	return resp, nil
