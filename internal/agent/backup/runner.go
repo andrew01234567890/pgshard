@@ -57,7 +57,13 @@ func (r *Runner) args(cmd string, extra ...string) []string {
 }
 
 func (r *Runner) execBinary(ctx context.Context, args []string, onLine func(string)) error {
-	cmd := exec.CommandContext(ctx, "pgbackrest", args...)
+	return r.runBinary(ctx, "pgbackrest", args, onLine)
+}
+
+// runBinary is execBinary with the binary named, so a test can drive the
+// same reader against a child whose output it controls.
+func (r *Runner) runBinary(ctx context.Context, bin string, args []string, onLine func(string)) error {
+	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Env = append(os.Environ(), r.Env...)
 	pr, pw := io.Pipe()
 	cmd.Stdout = pw
@@ -72,19 +78,70 @@ func (r *Runner) execBinary(ctx context.Context, args []string, onLine func(stri
 		return err
 	}
 	defer stop()
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		sc := bufio.NewScanner(pr)
-		sc.Buffer(make([]byte, 64*1024), 1024*1024)
-		for sc.Scan() {
-			onLine(sc.Text())
-		}
-	}()
+	// os/exec copies the child's output into pw from a goroutine that
+	// cmd.Wait joins, and pw is closed only once Wait returns. A reader
+	// that stops before the child does therefore deadlocks the command:
+	// the copy blocks on a pipe nobody is draining, Wait waits for the
+	// copy, and the close that would break the cycle waits for Wait. So
+	// this reader has no way to stop early -- no token limit to exceed --
+	// and if it ever fails anyway it closes its end, which unblocks the
+	// writer with an error instead of hanging.
+	read := make(chan error, 1)
+	go func() { read <- scanLines(pr, onLine) }()
 	err = cmd.Wait()
 	_ = pw.Close()
-	wg.Wait()
+	return errors.Join(err, <-read)
+}
+
+// maxLine bounds one line delivered to onLine. pgbackrest writes log
+// lines, but a corrupt or hostile stream must neither stop the reader nor
+// grow it without bound, so a longer line is delivered truncated and the
+// rest of it discarded.
+const maxLine = 1 << 20
+
+// scanLines delivers r's lines to onLine until the stream ends, and closes
+// r with whatever ended it.
+func scanLines(r *io.PipeReader, onLine func(string)) error {
+	br := bufio.NewReaderSize(r, 64*1024)
+	var line []byte
+	var dropping bool
+	deliver := func() {
+		if !dropping {
+			onLine(string(line))
+		}
+		line, dropping = line[:0], false
+	}
+	var err error
+	for {
+		var chunk []byte
+		chunk, err = br.ReadSlice('\n')
+		for _, b := range chunk {
+			if b == '\n' {
+				line = bytes.TrimSuffix(line, []byte("\r"))
+				deliver()
+				continue
+			}
+			if len(line) < maxLine {
+				line = append(line, b)
+			} else if !dropping {
+				onLine(string(line) + " [truncated]")
+				dropping = true
+			}
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if err != nil {
+			break
+		}
+	}
+	if len(line) > 0 || dropping {
+		deliver()
+	}
+	if errors.Is(err, io.EOF) {
+		err = nil
+	}
+	_ = r.CloseWithError(err)
 	return err
 }
 
