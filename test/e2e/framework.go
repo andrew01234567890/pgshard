@@ -178,6 +178,7 @@ func (c *Cluster) Delete(ctx context.Context, manifest string) error {
 // WaitPodsReady blocks until all pods matching selector in namespace are Ready.
 func (c *Cluster) WaitPodsReady(ctx context.Context, namespace, selector string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	backOffSince := map[string]time.Time{}
 	for {
 		out, err := c.Kubectl(ctx, nil, "-n", namespace, "get", "pods", "-l", selector, "-o", "name")
 		remaining := time.Until(deadline).Truncate(time.Second)
@@ -188,6 +189,9 @@ func (c *Cluster) WaitPodsReady(ctx context.Context, namespace, selector string,
 				return nil
 			}
 		}
+		if stuck := durableImagePullFailure(c.imagePullBackOff(ctx, namespace, selector), backOffSince, time.Now(), imagePullGrace); stuck != "" {
+			return fmt.Errorf("pods %q in %s cannot pull an image, which waiting does not fix:\n%s", selector, namespace, stuck)
+		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("pods %q in %s not ready after %s: %w", selector, namespace, timeout, err)
 		}
@@ -197,6 +201,67 @@ func (c *Cluster) WaitPodsReady(ctx context.Context, namespace, selector string,
 		case <-time.After(2 * time.Second):
 		}
 	}
+}
+
+// imagePullGrace is how long a container may sit in ImagePullBackOff before
+// the suite calls it, rather than waiting out the whole timeout. It is not
+// zero because a registry hiccup backs off once and then succeeds, and a
+// suite that fails on the first one trades a slow failure for a flaky one.
+const imagePullGrace = 90 * time.Second
+
+// imagePullBackOffTemplate renders one "pod: message" line per container the
+// kubelet has given up pulling for, and nothing for a pod that is running,
+// still pulling, or too young to have container statuses at all.
+const imagePullBackOffTemplate = `{{range .items}}{{$pod := .metadata.name}}` +
+	`{{with .status.containerStatuses}}{{range .}}{{with .state}}{{with .waiting}}` +
+	`{{if eq .reason "ImagePullBackOff"}}{{$pod}}: {{.message}}{{"\n"}}{{end}}` +
+	`{{end}}{{end}}{{end}}{{end}}{{end}}`
+
+// imagePullBackOff lists the containers the kubelet has given up pulling for,
+// one "pod/container: message" per line.
+func (c *Cluster) imagePullBackOff(ctx context.Context, namespace, selector string) []string {
+	out, err := c.Kubectl(ctx, nil, "-n", namespace, "get", "pods", "-l", selector, "-o", "go-template="+imagePullBackOffTemplate)
+	if err != nil {
+		return nil
+	}
+	var lines []string
+	for _, l := range strings.Split(out, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	return lines
+}
+
+// durableImagePullFailure reports the containers that have been backing off
+// for longer than grace, and records when each was first seen. A container
+// that recovers drops out of the input and is forgotten.
+//
+// A pod that cannot pull its image never becomes ready, so waiting out the
+// timeout only delays the same failure and reports it as "pods not ready" --
+// the image and the 403 behind it end up in a must-gather dump instead of in
+// the message. Both backup cells failed this way on every pull request for
+// long enough that the cause was looked for in the product.
+func durableImagePullFailure(lines []string, since map[string]time.Time, now time.Time, grace time.Duration) string {
+	current := make(map[string]bool, len(lines))
+	var stuck []string
+	for _, l := range lines {
+		current[l] = true
+		first, ok := since[l]
+		if !ok {
+			since[l] = now
+			continue
+		}
+		if now.Sub(first) >= grace {
+			stuck = append(stuck, l)
+		}
+	}
+	for l := range since {
+		if !current[l] {
+			delete(since, l)
+		}
+	}
+	return strings.Join(stuck, "\n")
 }
 
 // MustGather dumps cluster state and pgshard-system pod logs into the artifacts dir.
