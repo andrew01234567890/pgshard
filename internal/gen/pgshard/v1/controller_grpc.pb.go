@@ -25,6 +25,7 @@ const (
 	Controller_GetWorkflow_FullMethodName         = "/pgshard.v1.Controller/GetWorkflow"
 	Controller_PauseWorkflow_FullMethodName       = "/pgshard.v1.Controller/PauseWorkflow"
 	Controller_ResumeWorkflow_FullMethodName      = "/pgshard.v1.Controller/ResumeWorkflow"
+	Controller_CancelWorkflow_FullMethodName      = "/pgshard.v1.Controller/CancelWorkflow"
 	Controller_ResolveTransactions_FullMethodName = "/pgshard.v1.Controller/ResolveTransactions"
 	Controller_ApplyDDL_FullMethodName            = "/pgshard.v1.Controller/ApplyDDL"
 	Controller_CreateBarrier_FullMethodName       = "/pgshard.v1.Controller/CreateBarrier"
@@ -48,6 +49,10 @@ type ControllerClient interface {
 	PauseWorkflow(ctx context.Context, in *PauseWorkflowRequest, opts ...grpc.CallOption) (*PauseWorkflowResponse, error)
 	// ResumeWorkflow continues a paused workflow.
 	ResumeWorkflow(ctx context.Context, in *ResumeWorkflowRequest, opts ...grpc.CallOption) (*ResumeWorkflowResponse, error)
+	// CancelWorkflow ends a workflow that has not started. A pending or
+	// paused one has claimed nothing and copied nothing, so it can simply be
+	// abandoned; a running one has to be unwound, which is its own operation.
+	CancelWorkflow(ctx context.Context, in *CancelWorkflowRequest, opts ...grpc.CallOption) (*CancelWorkflowResponse, error)
 	// ResolveTransactions triggers a resolution pass over in-doubt
 	// distributed transactions.
 	ResolveTransactions(ctx context.Context, in *ResolveTransactionsRequest, opts ...grpc.CallOption) (*ResolveTransactionsResponse, error)
@@ -110,6 +115,16 @@ func (c *controllerClient) ResumeWorkflow(ctx context.Context, in *ResumeWorkflo
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ResumeWorkflowResponse)
 	err := c.cc.Invoke(ctx, Controller_ResumeWorkflow_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controllerClient) CancelWorkflow(ctx context.Context, in *CancelWorkflowRequest, opts ...grpc.CallOption) (*CancelWorkflowResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CancelWorkflowResponse)
+	err := c.cc.Invoke(ctx, Controller_CancelWorkflow_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -209,6 +224,10 @@ type ControllerServer interface {
 	PauseWorkflow(context.Context, *PauseWorkflowRequest) (*PauseWorkflowResponse, error)
 	// ResumeWorkflow continues a paused workflow.
 	ResumeWorkflow(context.Context, *ResumeWorkflowRequest) (*ResumeWorkflowResponse, error)
+	// CancelWorkflow ends a workflow that has not started. A pending or
+	// paused one has claimed nothing and copied nothing, so it can simply be
+	// abandoned; a running one has to be unwound, which is its own operation.
+	CancelWorkflow(context.Context, *CancelWorkflowRequest) (*CancelWorkflowResponse, error)
 	// ResolveTransactions triggers a resolution pass over in-doubt
 	// distributed transactions.
 	ResolveTransactions(context.Context, *ResolveTransactionsRequest) (*ResolveTransactionsResponse, error)
@@ -248,6 +267,9 @@ func (UnimplementedControllerServer) PauseWorkflow(context.Context, *PauseWorkfl
 }
 func (UnimplementedControllerServer) ResumeWorkflow(context.Context, *ResumeWorkflowRequest) (*ResumeWorkflowResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ResumeWorkflow not implemented")
+}
+func (UnimplementedControllerServer) CancelWorkflow(context.Context, *CancelWorkflowRequest) (*CancelWorkflowResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CancelWorkflow not implemented")
 }
 func (UnimplementedControllerServer) ResolveTransactions(context.Context, *ResolveTransactionsRequest) (*ResolveTransactionsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ResolveTransactions not implemented")
@@ -359,6 +381,24 @@ func _Controller_ResumeWorkflow_Handler(srv interface{}, ctx context.Context, de
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ControllerServer).ResumeWorkflow(ctx, req.(*ResumeWorkflowRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Controller_CancelWorkflow_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CancelWorkflowRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControllerServer).CancelWorkflow(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Controller_CancelWorkflow_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControllerServer).CancelWorkflow(ctx, req.(*CancelWorkflowRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -504,6 +544,10 @@ var Controller_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ResumeWorkflow",
 			Handler:    _Controller_ResumeWorkflow_Handler,
+		},
+		{
+			MethodName: "CancelWorkflow",
+			Handler:    _Controller_CancelWorkflow_Handler,
 		},
 		{
 			MethodName: "ResolveTransactions",
