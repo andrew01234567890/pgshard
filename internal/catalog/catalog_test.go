@@ -271,6 +271,48 @@ func runSuite(t *testing.T, img pgImage) {
 		}
 	})
 
+	t.Run("a_reader_cannot_read_verifiers", func(t *testing.T) {
+		if err := Migrate(ctx, conn); err != nil {
+			t.Fatal(err)
+		}
+		mustExec(t, conn, `DO $$ BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'watcher') THEN
+				CREATE ROLE watcher LOGIN PASSWORD 'watching';
+			END IF;
+		END $$`)
+		mustExec(t, conn, `GRANT pgshard_reader TO watcher`)
+		cfg, err := pgx.ParseConfig(dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.User, cfg.Password = "watcher", "watching"
+		rc, err := pgx.ConnectConfig(ctx, cfg)
+		if err != nil {
+			t.Fatalf("a monitoring login must be able to connect: %v", err)
+		}
+		defer func() { _ = rc.Close(ctx) }()
+
+		// The verifier is withheld on pgshard.roles, and pgshard.migrations
+		// used to hand it back: role DDL is rewritten to SCRAM before it is
+		// recorded, so the verifier is in the statement and in meta.
+		if _, err := rc.Exec(ctx, `SELECT verifier FROM pgshard.roles`); err == nil {
+			t.Error("a reader can read pgshard.roles.verifier")
+		}
+		for _, q := range []string{
+			`SELECT statement FROM pgshard.migrations`,
+			`SELECT meta FROM pgshard.migrations`,
+			`SELECT count(*) FROM pgshard.migrations`,
+		} {
+			if _, err := rc.Exec(ctx, q); err == nil {
+				t.Errorf("a reader can still run %q", q)
+			}
+		}
+		// And keeps what monitoring is for.
+		if _, err := rc.Exec(ctx, `SELECT id, database, kind, state, error, created_at FROM pgshard.migrations_public`); err != nil {
+			t.Errorf("a reader lost the migration state it watches: %v", err)
+		}
+	})
+
 	t.Run("router_role_is_least_privilege", func(t *testing.T) {
 		if err := Migrate(ctx, conn); err != nil {
 			t.Fatal(err)
