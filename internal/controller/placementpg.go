@@ -422,28 +422,34 @@ func restoreComment(ctx context.Context, conn ShardConn, schema, name string, co
 // workflow's marker, so a same-named user table is never dropped. The lock,
 // marker re-check and DROP run in one transaction so a concurrent rename
 // cannot slip an unmarked table under the name between the check and the drop.
-func dropArtifactTable(ctx context.Context, conn ShardConn, schema, name, marker string) error {
+//
+// It reports whether it dropped anything. A table that is there but not
+// marked is left alone -- it may be a user's -- and the caller has to say
+// so rather than report a retirement that left a table behind.
+func dropArtifactTable(ctx context.Context, conn ShardConn, schema, name, marker string) (dropped bool, err error) {
 	exists, err := tableExists(ctx, conn, schema, name)
 	if err != nil || !exists {
-		return err
+		return false, err
 	}
 	if _, err := conn.Exec(ctx, "BEGIN"); err != nil {
-		return err
+		return false, err
 	}
 	defer func() { _, _ = conn.Exec(ctx, "ROLLBACK") }()
 	qual := QuoteIdent(schema) + "." + QuoteIdent(name)
 	if _, err := conn.Exec(ctx, "LOCK TABLE "+qual+" IN ACCESS EXCLUSIVE MODE"); err != nil {
-		return err
+		return false, err
 	}
 	ours, err := isPlacementArtifact(ctx, conn, schema, name, marker)
 	if err != nil || !ours {
-		return err
+		return false, err
 	}
 	if _, err := conn.Exec(ctx, "DROP TABLE "+qual); err != nil {
-		return err
+		return false, err
 	}
-	_, err = conn.Exec(ctx, "COMMIT")
-	return err
+	if _, err := conn.Exec(ctx, "COMMIT"); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (p *Placer) ensureShadows(ctx context.Context, wf *placementWorkflow) error {
@@ -1530,8 +1536,26 @@ func (p *Placer) dropOld(ctx context.Context, wf *placementWorkflow) error {
 			return err
 		}
 		err = func() error {
-			if err := dropArtifactTable(ctx, conn, wf.spec.SchemaName, wf.old(), wf.placementMarker()); err != nil {
+			dropped, err := dropArtifactTable(ctx, conn, wf.spec.SchemaName, wf.old(), wf.placementMarker())
+			if err != nil {
 				return err
+			}
+			if !dropped {
+				// Retirement is not clean if it left a table behind. The
+				// table is not dropped because it does not carry this
+				// workflow's marker -- it may be a user's, and dropping it
+				// would be worse -- but a workflow that says it retired
+				// while a shard still holds the old table is a workflow
+				// nobody will go looking behind.
+				left, lerr := tableExists(ctx, conn, wf.spec.SchemaName, wf.old())
+				if lerr != nil {
+					return lerr
+				}
+				if left {
+					p.logger().Warn("retirement left a table in place: it does not carry this workflow's marker",
+						"shard", fmt.Sprintf("%s/%d", wf.st.SourceSet, t), "table", wf.shape.qualified(wf.old()),
+						"workflow", wf.id, "hint", "a user table of that name is left alone by design; a leftover pgshard shadow has to be dropped by hand")
+				}
 			}
 			if !slices.Contains(wf.rt.Holders(), t) {
 				return nil

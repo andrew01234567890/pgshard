@@ -604,10 +604,19 @@ func (p *Placer) cleanup(ctx context.Context, wf *placementWorkflow) error {
 		if err != nil {
 			return err
 		}
-		err = dropArtifactTable(ctx, conn, wf.spec.SchemaName, wf.shadow(), wf.placementMarker())
+		dropped, derr := dropArtifactTable(ctx, conn, wf.spec.SchemaName, wf.shadow(), wf.placementMarker())
+		if !dropped && derr == nil {
+			// Same reasoning as the retirement path: a shadow left behind
+			// because it is not ours is the right call, and saying nothing
+			// about it is not.
+			if left, lerr := tableExists(ctx, conn, wf.spec.SchemaName, wf.shadow()); lerr == nil && left {
+				p.logger().Warn("cancellation left a shadow in place: it does not carry this workflow's marker",
+					"shard", fmt.Sprintf("%s/%d", wf.st.SourceSet, t), "table", wf.shape.qualified(wf.shadow()), "workflow", wf.id)
+			}
+		}
 		_ = conn.Close(ctx)
-		if err != nil {
-			return err
+		if derr != nil {
+			return derr
 		}
 	}
 	return p.unlock(ctx, wf)
