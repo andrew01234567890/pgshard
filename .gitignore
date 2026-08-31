@@ -1,4 +1,7 @@
 bin/
+# The envtest control plane is downloaded by hack/envtest/setup-envtest.sh;
+# it was once committed here, 163 MiB of it, referenced by nothing.
+hack/envtest/assets/
 dist/
 *.test
 *.out
