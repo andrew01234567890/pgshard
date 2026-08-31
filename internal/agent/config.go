@@ -78,6 +78,12 @@ type Config struct {
 	// shard map yet: WAL archiving stays off until it is.
 	NonServing bool `json:"nonServing,omitempty"`
 
+	// AuthTokenFile holds the control-plane token this agent accepts, as its
+	// own secret rather than something derived from the superuser password.
+	// Empty falls back to the derived token alone, which is what an agent
+	// deployed before that Secret existed does.
+	AuthTokenFile string `json:"authTokenFile,omitempty"`
+
 	// path is where the config was loaded from; Refresh rereads it.
 	path string
 }

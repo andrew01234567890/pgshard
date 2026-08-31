@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -121,14 +122,37 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	if _, err := agentauth.Token(password); err != nil {
 		return fmt.Errorf("agent auth token: %w", err)
 	}
-	// Re-derive from the mounted password file on every call so a rotated
-	// superuser Secret is honoured without an agent restart.
-	grpcSrv := grpc.NewServer(grpc.UnaryInterceptor(agentauth.DynamicUnaryServerInterceptor(func() (string, error) {
+	// Both tokens, re-read on every call so a rotated Secret is honoured
+	// without an agent restart.
+	//
+	// The mounted one is this cluster's own. The derived one is what agents
+	// used before that Secret existed, and is still accepted so a cluster
+	// can be rolled onto the new token a member at a time -- callers send
+	// both, so an old agent and a new one are both reachable throughout.
+	//
+	// REMOVE the derived token once every caller sends the mounted one --
+	// PGS-572. The controller still derives its own from the catalog
+	// password, so until that changes, anything holding the superuser
+	// password also holds a token that unlocks Promote, Demote, Rewind and
+	// Reclone.
+	grpcSrv := grpc.NewServer(grpc.UnaryInterceptor(agentauth.AnyOfUnaryServerInterceptor(func() ([]string, error) {
+		var tokens []string
+		if cfg.AuthTokenFile != "" {
+			b, err := os.ReadFile(cfg.AuthTokenFile)
+			if err != nil {
+				return nil, err
+			}
+			tokens = append(tokens, strings.TrimSpace(string(b)))
+		}
 		pw, err := inst.password()
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		return agentauth.Token(pw)
+		derived, err := agentauth.Token(pw)
+		if err != nil {
+			return nil, err
+		}
+		return append(tokens, derived), nil
 	})))
 	pgshardv1.RegisterAgentServer(grpcSrv, srv)
 	grpcLn, err := net.Listen("tcp", cfg.GRPCAddr)

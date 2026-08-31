@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -175,11 +176,19 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	agentToken, err := agentauth.Token(password)
+	derived, err := agentauth.Token(password)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("agent auth token: %w", err)
 	}
-	ctx = agentauth.WithToken(ctx, agentToken)
+	agentToken, err := r.ensureAgentSecret(ctx, &cluster)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	// Both, so one operator reaches an agent that has been rolled onto the
+	// cluster's own token and one that has not. The server accepts a call
+	// presenting either. REMOVE the derived one with the agent's acceptance
+	// of it -- PGS-572.
+	ctx = agentauth.WithTokens(ctx, agentToken, derived)
 	if err := r.ensureMemberRBAC(ctx, &cluster); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -405,6 +414,45 @@ func (r *ClusterReconciler) ensureRouterSecret(ctx context.Context, c *pgshardv1
 		return "", err
 	}
 	return pw, nil
+}
+
+// ensureAgentSecret generates the control-plane token the member agents
+// accept. It is the cluster's own rather than something derived from the
+// superuser password: anything holding that password used to hold the token
+// that unlocks Promote, Demote, Rewind and Reclone on every member, and
+// rotating either silently rotated the other.
+func (r *ClusterReconciler) ensureAgentSecret(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) (string, error) {
+	key := types.NamespacedName{Namespace: c.Namespace, Name: AgentSecretName(c.Name)}
+	var sec corev1.Secret
+	err := r.Get(ctx, key, &sec)
+	if err == nil {
+		if tok := sec.Data[agentTokenKey]; len(tok) > 0 {
+			return strings.TrimSpace(string(tok)), nil
+		}
+		return "", fmt.Errorf("secret %s has no %q key", key.Name, agentTokenKey)
+	}
+	if !apierrors.IsNotFound(err) {
+		return "", err
+	}
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	token := hex.EncodeToString(buf)
+	sec = corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace, Labels: map[string]string{LabelCluster: c.Name}},
+		StringData: map[string]string{agentTokenKey: token},
+	}
+	if err := controllerutil.SetControllerReference(c, &sec, r.Scheme()); err != nil {
+		return "", err
+	}
+	if err := r.Create(ctx, &sec); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return r.ensureAgentSecret(ctx, c)
+		}
+		return "", err
+	}
+	return token, nil
 }
 
 // ensureAdminSecret generates the credential the admin API requires. It is

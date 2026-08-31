@@ -166,6 +166,7 @@ func agentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary str
 		Role:             role,
 		PGData:           pgdataPath,
 		PasswordFile:     secretMountPath + "/" + secretKey,
+		AuthTokenFile:    agentTokenDir + "/" + agentTokenKey,
 		PrimaryConninfo:  fmt.Sprintf("host=%s.%s.svc port=%d user=%s", g.ServiceRW(), c.Namespace, postgresPort, superuserName),
 		PodCIDR:          "all",
 		PeerFailsafeURLs: peers,
@@ -515,6 +516,7 @@ func (Renderer) Pod(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, rol
 					{Name: "data", MountPath: dataMountPath},
 					{Name: "config", MountPath: configMountPath, ReadOnly: true},
 					{Name: "secret", MountPath: secretMountPath, ReadOnly: true},
+					{Name: agentTokenVolume, MountPath: agentTokenDir, ReadOnly: true},
 					{Name: "pg-socket", MountPath: pgSocketDir},
 				},
 			}, poolerSidecar(c, g)},
@@ -523,6 +525,10 @@ func (Renderer) Pod(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, rol
 				{Name: "config", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
 					LocalObjectReference: corev1.LocalObjectReference{Name: g.ConfigMapName()}}}},
 				{Name: "secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: SecretName(c.Name)}}},
+				// The control-plane token, its own Secret so rotating it and
+				// rotating the superuser password are separate acts.
+				{Name: agentTokenVolume, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+					SecretName: AgentSecretName(c.Name)}}},
 				{Name: "pg-socket", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 			},
 		},
