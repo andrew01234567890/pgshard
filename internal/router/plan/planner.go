@@ -1426,7 +1426,12 @@ func (w *walker) decide(write bool) error {
 	}
 	if sharded == 0 {
 		if unsharded == 0 && reference > 0 {
-			p.Kind, p.Shards = Reference, []int32{w.referenceShard()}
+			// No shard: any of them serves a reference table, and the
+			// executor picks. A plan that named one would depend on which
+			// session asked, and so could never be shared between them --
+			// a cached one would pin every session to whichever shard the
+			// first was given.
+			p.Kind, p.Shards = Reference, nil
 			return nil
 		}
 		p.Kind, p.Shards = Unsharded, []int32{w.sess.HomeShard}
@@ -1572,15 +1577,6 @@ func (w *walker) allShards() []int32 {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out
-}
-
-// referenceShard spreads reference reads across the shard set by session.
-func (w *walker) referenceShard() int32 {
-	all := w.allShards()
-	if len(all) == 0 {
-		return w.sess.HomeShard
-	}
-	return all[w.sess.ID%uint64(len(all))]
 }
 
 func (w *walker) insert(s *pgquerypb.InsertStmt) error {

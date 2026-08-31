@@ -176,18 +176,14 @@ func TestSearchPathAndReferenceSpread(t *testing.T) {
 	if err != nil || pl.Kind != Unsharded {
 		t.Fatalf("explicit pg_catalog qualifier resolves to the home shard: %+v %v", pl, err)
 	}
-	seen := map[int32]bool{}
-	for id := uint64(0); id < 8; id++ {
-		sess := session(snap)
-		sess.ID = id
-		pl, err := New().Plan(context.Background(), sess, "select * from regions")
-		if err != nil || pl.Kind != Reference || len(pl.Shards) != 1 {
-			t.Fatalf("reference read: %+v %v", pl, err)
-		}
-		seen[pl.Shards[0]] = true
-	}
-	if len(seen) != 4 {
-		t.Fatalf("reference reads used shards %v, want all four", seen)
+	// A reference read names no shard: any of them serves the table, and
+	// the executor picks. A plan that named one would depend on which
+	// session asked, and could never be shared between them. The spread
+	// itself is asserted where it now happens, in the router
+	// (TestReferenceReadsSpreadAcrossShards).
+	pl, err = New().Plan(context.Background(), session(snap), "select * from regions")
+	if err != nil || pl.Kind != Reference || len(pl.Shards) != 0 {
+		t.Fatalf("reference read: %+v %v", pl, err)
 	}
 }
 

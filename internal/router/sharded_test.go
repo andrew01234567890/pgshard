@@ -923,3 +923,33 @@ func TestStaleSnapshotRefusesToPlan(t *testing.T) {
 		t.Fatalf("a reloaded snapshot must plan again: %v", err)
 	}
 }
+
+// TestReferenceReadsSpreadAcrossShards: a reference table is on every
+// shard, so a read of one can go to any -- and sending every session's to
+// the same shard would make one member carry the lot. The choice used to be
+// made in the plan, from the session id, which is what kept plans from
+// being shared between sessions: a cached plan would have pinned every
+// session to whichever shard the first was given. It is the executor's now,
+// and the spread has to survive that move.
+func TestReferenceReadsSpreadAcrossShards(t *testing.T) {
+	h := newShardedHarness(t)
+	ctx := context.Background()
+
+	seen := map[int]bool{}
+	for range 16 {
+		conn := h.connect(t, h.dsn())
+		var n int
+		if err := conn.QueryRow(ctx, "select * from regions").Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.Close(ctx)
+		for i := range h.poolers {
+			if h.ranOn(i, "select * from regions") {
+				seen[i] = true
+			}
+		}
+	}
+	if len(seen) < 2 {
+		t.Fatalf("sixteen sessions read the reference table on shards %v; the read is pinned to one member", seen)
+	}
+}
