@@ -224,7 +224,13 @@ func (s *Server) Demote(ctx context.Context, req *pgshardv1.DemoteRequest) (*pgs
 	return resp, nil
 }
 
-// Rewind fences and rewinds against req.Source.
+// Every mutating RPC below fences on the epoch before it touches
+// PostgreSQL, so a controller that has been superseded cannot act on a
+// member that has moved on without it. Status and ListSlots do not fence,
+// because they read.
+
+// Rewind runs pg_rewind against req.Source, which is how a demoted primary
+// rejoins without a full copy.
 func (s *Server) Rewind(ctx context.Context, req *pgshardv1.RewindRequest) (*pgshardv1.RewindResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -245,9 +251,8 @@ func (s *Server) Rewind(ctx context.Context, req *pgshardv1.RewindRequest) (*pgs
 	return resp, nil
 }
 
-// Reclone fences and rebuilds the data directory from the primary
-// (pg_basebackup) or from the member's backup stanza (pgbackrest delta
-// restore as a standby).
+// Reclone rebuilds the data directory from the primary (pg_basebackup) or
+// from the member's backup stanza (pgbackrest delta restore as a standby).
 func (s *Server) Reclone(ctx context.Context, req *pgshardv1.RecloneRequest) (*pgshardv1.RecloneResponse, error) {
 	fromRepo := req.GetSourceKind() == pgshardv1.RecloneRequest_SOURCE_KIND_BACKUP
 	s.mu.Lock()
@@ -269,7 +274,8 @@ func (s *Server) Reclone(ctx context.Context, req *pgshardv1.RecloneRequest) (*p
 	return resp, nil
 }
 
-// Reload fences and reloads configuration.
+// Reload re-reads the configuration file; PostgreSQL keeps running, so a
+// setting that needs a restart is not applied by this.
 func (s *Server) Reload(ctx context.Context, req *pgshardv1.ReloadRequest) (*pgshardv1.ReloadResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -288,7 +294,8 @@ func (s *Server) Reload(ctx context.Context, req *pgshardv1.ReloadRequest) (*pgs
 	return resp, nil
 }
 
-// Restart fences and restarts with the requested shutdown mode.
+// Restart stops PostgreSQL in the requested shutdown mode and starts it
+// again, which is what a setting Reload cannot apply needs.
 func (s *Server) Restart(ctx context.Context, req *pgshardv1.RestartRequest) (*pgshardv1.RestartResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -315,7 +322,8 @@ func (s *Server) Restart(ctx context.Context, req *pgshardv1.RestartRequest) (*p
 	return resp, nil
 }
 
-// CreateRestorePoint fences and creates a named restore point.
+// CreateRestorePoint records a named point a PITR can recover to. It is
+// the per-group half of a cluster-consistent barrier.
 func (s *Server) CreateRestorePoint(ctx context.Context, req *pgshardv1.CreateRestorePointRequest) (*pgshardv1.CreateRestorePointResponse, error) {
 	resp := &pgshardv1.CreateRestorePointResponse{Epoch: s.epoch.Current()}
 	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
@@ -332,7 +340,9 @@ func (s *Server) CreateRestorePoint(ctx context.Context, req *pgshardv1.CreateRe
 	return resp, nil
 }
 
-// CreateSlot fences and creates a physical or logical slot.
+// CreateSlot creates a physical or logical replication slot. A slot
+// retains WAL until it is dropped or invalidated, so one created and
+// forgotten fills the disk.
 func (s *Server) CreateSlot(ctx context.Context, req *pgshardv1.CreateSlotRequest) (*pgshardv1.CreateSlotResponse, error) {
 	resp := &pgshardv1.CreateSlotResponse{Epoch: s.epoch.Current()}
 	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
@@ -366,7 +376,7 @@ func (s *Server) CreateSlot(ctx context.Context, req *pgshardv1.CreateSlotReques
 	return resp, nil
 }
 
-// DropSlot fences and drops a slot.
+// DropSlot removes a slot and the WAL it was retaining.
 func (s *Server) DropSlot(ctx context.Context, req *pgshardv1.DropSlotRequest) (*pgshardv1.DropSlotResponse, error) {
 	resp := &pgshardv1.DropSlotResponse{Epoch: s.epoch.Current()}
 	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
