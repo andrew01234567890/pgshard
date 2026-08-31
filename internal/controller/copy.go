@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -93,7 +94,12 @@ type copyState struct {
 	BlockedSince        *time.Time                 `json:"blocked_since,omitempty"`
 	ReplicaIdentityFull []string                   `json:"replica_identity_full,omitempty"`
 	Progress            CopyProgress               `json:"progress"`
-	Skipped             []string                   `json:"skipped,omitempty"`
+	// Targets is the same progress per target shard, keyed by its id. The
+	// aggregate says the copy is behind; this says which target is, which
+	// is what an operator does something about -- and it is what the admin
+	// reshard panel reads.
+	Targets map[string]CopyProgress `json:"targets,omitempty"`
+	Skipped []string                `json:"skipped,omitempty"`
 }
 
 type copyWorkflow struct {
@@ -297,7 +303,13 @@ func (c *Copier) listCopyWorkflows(ctx context.Context) ([]copyWorkflow, error) 
 }
 
 func (c *Copier) save(ctx context.Context, wf *copyWorkflow, stage, message string) error {
+	// progress and targets are lifted to the top of status because that is
+	// where the admin panel and the operator read them; copy keeps the
+	// whole phase record.
 	patch := map[string]any{"copy": wf.copy, "message": message, "progress": wf.copy.Progress}
+	if len(wf.copy.Targets) > 0 {
+		patch["targets"] = wf.copy.Targets
+	}
 	if stage != "" {
 		patch["stage"] = stage
 	}
@@ -482,14 +494,14 @@ func (c *Copier) drive(ctx context.Context, wf *copyWorkflow) (bool, error) {
 	if err := c.ensureSubscriptions(ctx, wf, srcSet, srcIDs, dbs); err != nil {
 		return advanced, err
 	}
-	progress, err := c.observe(ctx, wf, srcSet, srcIDs, dbs)
+	progress, byTarget, err := c.observe(ctx, wf, srcSet, srcIDs, dbs)
 	if err != nil {
 		return advanced, err
 	}
 	if err := c.throttle(ctx, wf, srcSet, srcIDs, dbs); err != nil {
 		return advanced, err
 	}
-	wf.copy.Progress = progress
+	wf.copy.Progress, wf.copy.Targets = progress, byTarget
 	stage := ""
 	msg := "copying: " + progress.Describe()
 	if wf.copy.Paused {
@@ -928,12 +940,15 @@ func (c *Copier) blockedBy(wf *copyWorkflow, srcSet string, s int32, gids []stri
 
 // observe reads pg_subscription_rel and pg_stat_subscription on every
 // target and the WAL position of every source.
-func (c *Copier) observe(ctx context.Context, wf *copyWorkflow, srcSet string, srcIDs []int32, dbs []dbPlan) (CopyProgress, error) {
+// observe reads the copy's progress: the aggregate, and the same per target
+// shard. Flattening to one maximum told an operator the copy was behind
+// without saying which target was behind, which is the thing they act on.
+func (c *Copier) observe(ctx context.Context, wf *copyWorkflow, srcSet string, srcIDs []int32, dbs []dbPlan) (CopyProgress, map[string]CopyProgress, error) {
 	sourceLSN := map[int32]int64{}
 	for _, s := range srcIDs {
 		conn, err := c.Shards.Dial(ctx, srcSet, s)
 		if err != nil {
-			return CopyProgress{}, err
+			return CopyProgress{}, nil, err
 		}
 		rows, err := conn.Query(ctx, `SELECT (pg_current_wal_lsn() - '0/0'::pg_lsn)::bigint`)
 		if err == nil {
@@ -943,25 +958,31 @@ func (c *Copier) observe(ctx context.Context, wf *copyWorkflow, srcSet string, s
 		}
 		_ = conn.Close(ctx)
 		if err != nil {
-			return CopyProgress{}, err
+			return CopyProgress{}, nil, err
 		}
 	}
 	var reports []SubscriptionProgress
+	perTarget := map[int32][]SubscriptionProgress{}
 	for _, db := range dbs {
 		for _, t := range wf.ids {
 			conn, err := c.Shards.DialDatabase(ctx, wf.set, t, db.name)
 			if err != nil {
-				return CopyProgress{}, err
+				return CopyProgress{}, nil, err
 			}
 			rs, err := subscriptionReports(ctx, conn, db.name, wf.gen, t, srcIDs, sourceLSN)
 			_ = conn.Close(ctx)
 			if err != nil {
-				return CopyProgress{}, fmt.Errorf("progress of %s on %s/%d: %w", db.name, wf.set, t, err)
+				return CopyProgress{}, nil, fmt.Errorf("progress of %s on %s/%d: %w", db.name, wf.set, t, err)
 			}
 			reports = append(reports, rs...)
+			perTarget[t] = append(perTarget[t], rs...)
 		}
 	}
-	return Aggregate(reports), nil
+	byTarget := make(map[string]CopyProgress, len(perTarget))
+	for t, rs := range perTarget {
+		byTarget[strconv.Itoa(int(t))] = Aggregate(rs)
+	}
+	return Aggregate(reports), byTarget, nil
 }
 
 // subscriptionReports reads one database's subscriptions on one target.
