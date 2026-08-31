@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -161,8 +162,15 @@ func (l *scaleLedger) finish() []int64 {
 // exactly once on the tenant's serving group and nowhere else.
 func (l *scaleLedger) verify(ctx context.Context, t *testing.T, acked []int64) {
 	t.Helper()
-	var total int64
-	for i, tenant := range ledgerTenants {
+	// Every group that holds the table, not only the ones tenants route to
+	// now: a copy that put rows on the right shard AND a wrong one is
+	// invisible to a per-owner check, because uniqueness is per shard and
+	// count(DISTINCT id) on the owner cannot see a twin somewhere else.
+	// Sources and retired groups are included for the same reason -- a
+	// cutover that did not clear its source leaves the row in two places.
+	groups := ledgerGroups(ctx, t, l.c)
+	owner := map[int64]string{}
+	for _, tenant := range ledgerTenants {
 		group, err := resolveGroup(ctx, l.c, tenant)
 		if err != nil {
 			t.Fatalf("tenant %d: %v", tenant, err)
@@ -170,6 +178,15 @@ func (l *scaleLedger) verify(ctx context.Context, t *testing.T, acked []int64) {
 		if group == "" {
 			t.Fatalf("tenant %d has no serving group", tenant)
 		}
+		owner[tenant] = group
+		if !slices.Contains(groups, group) {
+			t.Fatalf("tenant %d routes to %s, which holds no ledger table: %v", tenant, group, groups)
+		}
+	}
+
+	var total int64
+	for i, tenant := range ledgerTenants {
+		group := owner[tenant]
 		got, err := shardSQL(ctx, l.c, group, fmt.Sprintf(
 			`SELECT count(*) FILTER (WHERE id <= %d) || '/' || count(DISTINCT id) FILTER (WHERE id <= %d) FROM ledger WHERE tenant_id = %d`,
 			acked[i], acked[i], tenant))
@@ -180,8 +197,81 @@ func (l *scaleLedger) verify(ctx context.Context, t *testing.T, acked []int64) {
 			t.Fatalf("tenant %d on %s: %s, want %s (rows lost or duplicated)", tenant, group, got, want)
 		}
 		total += acked[i]
+
+		// Nowhere else. This is the guarantee the oracle is named for and
+		// the one it never checked.
+		for _, g := range groups {
+			if g == group {
+				continue
+			}
+			stray, err := shardSQL(ctx, l.c, g, fmt.Sprintf(
+				`SELECT count(*) FROM ledger WHERE tenant_id = %d AND id <= %d`, tenant, acked[i]))
+			if err != nil {
+				t.Fatalf("checking %s for stray tenant %d rows: %v", g, tenant, err)
+			}
+			if stray != "0" {
+				t.Fatalf("tenant %d belongs to %s but %s holds %s of its rows: the same row is in two places", tenant, group, g, stray)
+			}
+		}
 	}
-	_ = total
+
+	// The global multiset: every acknowledged row exists exactly once
+	// across the whole cluster, counted without reference to who owns what.
+	var everywhere int64
+	for _, g := range groups {
+		got, err := shardSQL(ctx, l.c, g, `SELECT count(*) FROM ledger WHERE `+ackedPredicate(acked))
+		if err != nil {
+			t.Fatalf("counting acknowledged rows on %s: %v", g, err)
+		}
+		n, perr := strconv.ParseInt(got, 10, 64)
+		if perr != nil {
+			t.Fatalf("counting acknowledged rows on %s: %q: %v", g, got, perr)
+		}
+		everywhere += n
+	}
+	if everywhere != total {
+		t.Fatalf("%d acknowledged rows exist %d times across %v: exactly-once placement is broken", total, everywhere, groups)
+	}
+}
+
+// ackedPredicate matches exactly the rows the writers were told were
+// committed: one contiguous id range per tenant, which is what they produce.
+func ackedPredicate(acked []int64) string {
+	var b strings.Builder
+	for i, tenant := range ledgerTenants {
+		if i > 0 {
+			b.WriteString(" OR ")
+		}
+		fmt.Fprintf(&b, "(tenant_id = %d AND id <= %d)", tenant, acked[i])
+	}
+	return b.String()
+}
+
+// ledgerGroups lists every shard group of every set that still exists,
+// serving or not. A retired source that kept its rows is exactly the defect
+// the "nowhere else" check is looking for, so it must be asked too.
+func ledgerGroups(ctx context.Context, t *testing.T, c *e2e.Cluster) []string {
+	t.Helper()
+	out := catalogSQL(ctx, t, c, `SELECT coalesce(string_agg(
+			CASE WHEN ss.generation = 1 THEN 'shard-' || s.shard_id
+			     ELSE 'shard-' || s.shard_id || '-g' || ss.generation END, ',' ORDER BY ss.generation, s.shard_id), '')
+		FROM pgshard.shard_status s JOIN pgshard.shard_sets ss ON ss.shard_set = s.shard_set`)
+	if out == "" {
+		t.Fatal("the catalog lists no shard groups")
+	}
+	var groups []string
+	for _, g := range strings.Split(out, ",") {
+		if g = strings.TrimSpace(g); g == "" {
+			continue
+		}
+		// A group provisioned but never given the table answers with an
+		// error rather than a count; those hold nothing by definition.
+		if _, err := shardSQL(ctx, c, g, "SELECT 1 FROM ledger LIMIT 1"); err != nil {
+			continue
+		}
+		groups = append(groups, g)
+	}
+	return groups
 }
 
 // seedLedgerTable creates the sharded ledger on every starting shard. A
