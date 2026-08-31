@@ -128,6 +128,10 @@ type groupObservation struct {
 	syncApplied  bool
 	members      []pgshardv1alpha1.MemberStatus
 	replicasWant int
+	// nodes names the node each running member landed on, in member order.
+	// A group with two members on one node has fewer failure domains than
+	// replicas, whatever the replica count says.
+	nodes []string
 	// failing is set while the primary is unhealthy or a failover is pending.
 	failing bool
 	// template is the desired member template; tuning the derived settings
@@ -743,6 +747,9 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 			return obs, err
 		}
 		members[name] = m
+		if m.pod != nil && m.pod.Spec.NodeName != "" {
+			obs.nodes = append(obs.nodes, m.pod.Spec.NodeName)
+		}
 	}
 
 	if target := c.Annotations[AnnotationSwitchover]; target != "" && g.HasMember(target) {
@@ -1223,6 +1230,18 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, c *pgshardv1alpha1
 	set(pgshardv1alpha1.ConditionPrimaryHealthy, primaryOK, boolReason(primaryOK, "AcceptingSQL", "ProbeFailed"), "")
 	set(pgshardv1alpha1.ConditionReplicationHealthy, replOK, boolReason(replOK, "AllStreaming", "ReplicasMissing"), "")
 	set(pgshardv1alpha1.ConditionProgressing, !ready, boolReason(!ready, "Reconciling", "Stable"), "")
+	var crowded []string
+	for _, o := range obs {
+		if m := topologyMessage(o.group.Name(), o.nodes); m != "" {
+			crowded = append(crowded, m)
+		}
+	}
+	// True is the bad state here, as with Degraded: a cluster says when it
+	// has fewer failure domains than replicas rather than leaving the
+	// replica count to imply otherwise.
+	set(pgshardv1alpha1.ConditionTopologyDegraded, len(crowded) > 0,
+		boolReason(len(crowded) > 0, "MembersShareNodes", "MembersOnDistinctNodes"),
+		strings.Join(crowded, "; "))
 	meta.SetStatusCondition(&c.Status.Conditions, catalogReady)
 	meta.SetStatusCondition(&c.Status.Conditions, backupCond)
 	meta.SetStatusCondition(&c.Status.Conditions, reshardCond)

@@ -544,6 +544,9 @@ func (Renderer) Pod(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, rol
 	if tpl.Backup != nil {
 		mountBackupSecrets(pod, tpl.Backup)
 	}
+	// One group's members are what must not share a node: they are the
+	// primary and the standbys that would replace it.
+	applyPlacement(&pod.Spec, c.Spec.Placement, map[string]string{LabelCluster: g.Cluster, LabelGroup: g.Name()})
 	return pod
 }
 

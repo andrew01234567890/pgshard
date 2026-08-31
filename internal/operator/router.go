@@ -108,7 +108,7 @@ func (r Renderer) RouterDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.De
 		mounts = append(mounts, corev1.VolumeMount{Name: "tls", MountPath: routerTLSMountDir, ReadOnly: true})
 		volumes = append(volumes, corev1.Volume{Name: "tls", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: ref.Name}}})
 	}
-	return &appsv1.Deployment{
+	dep := &appsv1.Deployment{
 		ObjectMeta: routerMeta(c),
 		Spec: appsv1.DeploymentSpec{
 			Replicas: ptr.To(minReplicas),
@@ -145,6 +145,10 @@ func (r Renderer) RouterDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.De
 			},
 		},
 	}
+	// The routers are stateless, but a node taking all of them out at once
+	// is still a gap in service that spreading avoids.
+	applyPlacement(&dep.Spec.Template.Spec, c.Spec.Placement, labels)
+	return dep
 }
 
 // RouterService renders the ClusterIP Service applications connect to.
