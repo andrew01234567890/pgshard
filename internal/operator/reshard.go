@@ -366,6 +366,17 @@ func (r *ClusterReconciler) reconcileRetirement(ctx context.Context, c, base *pg
 		if err := r.deleteTargetGroups(ctx, c, retired.Name); err != nil {
 			return false, err
 		}
+		// The catalog rows go with the groups, and only after them. While a
+		// retired group exists it can still hold a prepared transaction, and
+		// the resolver finds shards to search through pgshard.shard_status --
+		// so removing the rows first would hide a group that still needs
+		// finishing. Leaving them behind is the other failure: the resolver
+		// goes on dialling groups that are gone, every pass, and a set that
+		// never leaves the retired state means retirement never observably
+		// completes.
+		if err := r.Prober.DropShardSet(ctx, dsn, retired.Name); err != nil {
+			return false, fmt.Errorf("drop retired shard set %s: %w", retired.Name, err)
+		}
 		if err := r.patchReshardStatus(ctx, record, func(st *pgshardv1alpha1.PgShardReshardStatus) {
 			st.Phase = phase
 			st.WorkflowID = wf.ID
