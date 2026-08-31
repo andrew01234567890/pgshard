@@ -1,0 +1,7 @@
+# Workflow and policy files decide what CI is allowed to do, so a change to
+# one is a change to the review gate itself. Naming an owner here does not
+# require the review on its own -- branch protection's "require review from
+# Code Owners" does -- but nothing can require it until the file exists.
+/.github/           @andrew01234567890
+/hack/check-actions.sh      @andrew01234567890
+/hack/ci/                   @andrew01234567890

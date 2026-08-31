@@ -38,13 +38,22 @@ def walk_strings(v):
 def norm_perms(p):
     return {k.lower(): (v.lower() if isinstance(v, str) else v) for k, v in p.items()} if isinstance(p, dict) else p
 
+# A pull request's own code runs in these workflows, including a change to
+# the workflow file itself, so a token that can publish or sign must not be
+# handed to the whole file: it is available before review. Job-level is
+# fine, because a job can be gated on main.
+FORBIDDEN_AT_TOP = ("contents", "packages", "id-token", "deployments", "attestations")
+
 def check_permissions(perms, where, errs, top):
     if perms is None:
         return
     if isinstance(perms, str) and perms.lower() == "write-all":
         errs.append(f"{where}: permissions: write-all is forbidden")
-    if top and isinstance(perms, dict) and norm_perms(perms).get("contents") == "write":
-        errs.append(f"{where}: top-level contents: write is forbidden")
+    if top and isinstance(perms, dict):
+        got = norm_perms(perms)
+        for name in FORBIDDEN_AT_TOP:
+            if got.get(name) == "write":
+                errs.append(f"{where}: top-level {name}: write is forbidden; grant it on the job that needs it, gated on main")
 
 errs = []
 for path in sys.argv[1:]:
