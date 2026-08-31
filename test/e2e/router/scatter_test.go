@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
-	"net/url"
 	"os/exec"
 	"sort"
 	"strings"
@@ -367,12 +366,8 @@ func TestRouterScatterDifferential(t *testing.T) {
 func (s *scatterStack) canceledCount(tb testing.TB) int {
 	tb.Helper()
 	total := 0
-	for i, dsn := range s.shardDSNs {
-		u, err := url.Parse(dsn)
-		if err != nil {
-			tb.Fatal(err)
-		}
-		cname := fmt.Sprintf("pgshard-router-e2e-shard%d-%s", i, u.Port())
+	for _, dsn := range s.shardDSNs {
+		cname := containerAt(tb, dsn)
 		out, err := exec.Command("docker", "logs", cname).CombinedOutput()
 		if err != nil {
 			tb.Fatalf("docker logs %s: %v: %s", cname, err, out)
