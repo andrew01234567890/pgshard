@@ -357,7 +357,10 @@ type BackupScheduler struct {
 	// Barriers asks controllers for barriers; nil disables barrier ticks.
 	Barriers BarrierClient
 
-	mu      sync.Mutex
+	mu sync.Mutex
+	// baseCtx is the manager's context once Start has it, so a barrier in
+	// flight ends with the operator rather than outliving it.
+	baseCtx context.Context
 	entries map[types.NamespacedName][]cron.EntryID
 	specs   map[types.NamespacedName]pgshardv1alpha1.BackupSchedules
 	// barriers holds the barrier entry and cron expression per policy.
@@ -389,7 +392,14 @@ type barrierEntry struct {
 
 // NewBackupScheduler builds a scheduler that creates backups through cl.
 func NewBackupScheduler(cl client.Client) *BackupScheduler {
-	return &BackupScheduler{client: cl, cron: cron.New(cron.WithParser(cronParser), cron.WithLocation(time.UTC)), now: time.Now,
+	// SkipIfStillRunning, because a barrier pauses writes: two of them
+	// overlapping contend for the same fence and one fails spuriously,
+	// and a slow tick that finished after a later one used to overwrite
+	// its result, moving the reported barrier backwards in time.
+	return &BackupScheduler{client: cl, now: time.Now,
+		cron: cron.New(cron.WithParser(cronParser), cron.WithLocation(time.UTC),
+			cron.WithChain(cron.SkipIfStillRunning(cron.DiscardLogger))),
+		baseCtx: context.Background(),
 		entries: map[types.NamespacedName][]cron.EntryID{}, specs: map[types.NamespacedName]pgshardv1alpha1.BackupSchedules{},
 		barriers: map[types.NamespacedName]barrierEntry{}, lastBarriers: map[types.NamespacedName]BarrierResult{}}
 }
@@ -430,7 +440,13 @@ func (s *BackupScheduler) BarrierArmed(key types.NamespacedName) bool {
 }
 
 func (s *BackupScheduler) fireBarrier(key types.NamespacedName) {
-	ctx, cancel := context.WithTimeout(context.Background(), barrierRPCTimeout+30*time.Second)
+	// Derived from the manager's context, so a shutdown ends a barrier in
+	// flight instead of waiting out its timeout: cron.Stop waits for
+	// running jobs, and a detached one delayed termination by minutes.
+	s.mu.Lock()
+	base := s.baseCtx
+	s.mu.Unlock()
+	ctx, cancel := context.WithTimeout(base, barrierRPCTimeout+30*time.Second)
 	defer cancel()
 	if err := s.FireBarrier(ctx, key); err != nil {
 		logf.Log.WithName("backup-scheduler").Error(err, "scheduled barrier failed", "policy", key.String())
@@ -470,13 +486,21 @@ func (s *BackupScheduler) FireBarrier(ctx context.Context, key types.NamespacedN
 		result.Error = err.Error()
 	}
 	s.mu.Lock()
-	s.lastBarriers[key] = result
+	// Never backwards. Overlap is prevented for scheduled ticks, but
+	// FireBarrier is also called directly, and a result from an earlier
+	// tick must not replace a later one.
+	if prev, ok := s.lastBarriers[key]; !ok || !result.At.Before(prev.At) {
+		s.lastBarriers[key] = result
+	}
 	s.mu.Unlock()
 	return err
 }
 
 // Start runs the cron loop until ctx ends.
 func (s *BackupScheduler) Start(ctx context.Context) error {
+	s.mu.Lock()
+	s.baseCtx = ctx
+	s.mu.Unlock()
 	s.cron.Start()
 	<-ctx.Done()
 	<-s.cron.Stop().Done()
