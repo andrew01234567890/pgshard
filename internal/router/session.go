@@ -761,6 +761,7 @@ func (e *Executor) withFailover(ctx context.Context, w pgwire.ResultWriter, run 
 			err = run(cw)
 		}
 	}
+	err = e.namePauseThatCannotBeRetriedHere(err)
 	switch decideFailover(isFailover(err), inTxn, cw.wrote, e.r.Buffered(e.shard), e.r.cfg.Buffering.PerShardCap) {
 	case failoverFailTxn:
 		e.dropStream()

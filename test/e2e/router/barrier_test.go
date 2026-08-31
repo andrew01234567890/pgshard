@@ -79,6 +79,12 @@ func TestBarrierUnderTwoPhaseWorkload(t *testing.T) {
 				case err == nil:
 					committed.Add(1)
 				case errors.As(err, &pgErr) && pgErr.Code == "57P03":
+					// The router's own answer for a write pause, whether it
+					// held the statement or met the pause on a transaction
+					// that had already written and could not be given back.
+					// PostgreSQL's 25006 is not accepted here: the point of
+					// naming the pause is that a client never has to guess
+					// from it.
 					paused.Add(1)
 				default:
 					errs <- fmt.Errorf("worker %d: %w", w, err)
