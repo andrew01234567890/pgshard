@@ -78,6 +78,60 @@ jobs:
   # cluster pulls, so a manual run of an unmerged branch could once replace
   # them with code that had passed no review. A run on any other branch still
   # builds and smoke-tests; this job simply does not exist for it.
+  control:
+    name: build and smoke (control plane)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7.3.0
+        with:
+          source: .
+          targets: control
+          load: true
+        env:
+          CI: "true"
+          GIT_SHA: ${{ github.sha }}
+          VERSION: ${{ github.ref_name }}
+          BUILD_DATE: ${{ github.event.repository.updated_at }}
+      - name: smoke
+        run: |
+          for name in operator controller admin router; do
+            docker run --rm "ghcr.io/andrew01234567890/pgshard-$name:latest" --version
+          done
+
+  # The images getting-started tells a reader to deploy. Publishing is main's
+  # alone and happens after the smoke test, exactly as the PostgreSQL images
+  # do; a run on any other branch still builds and smoke-tests them.
+  publish-control:
+    name: publish (control plane)
+    needs: control
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7.3.0
+        with:
+          source: .
+          targets: control
+          push: true
+        env:
+          CI: "true"
+          GIT_SHA: ${{ github.sha }}
+          VERSION: ${{ github.ref_name }}
+          BUILD_DATE: ${{ github.event.repository.updated_at }}
+
   publish:
     name: publish
     needs: build
