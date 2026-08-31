@@ -98,6 +98,15 @@ the rest with `0A000`. See *Routing* below.
   `40001` — retry, nothing was written — never the pooler's own `55000`,
   which names a state and no way out of it.
 
+- **Payload limit.** A single Bind value, `DataRow` or COPY chunk travels
+  between router and pooler as one protobuf message, capped at **4 MiB**
+  (`pooler.MaxMessageBytes`, set explicitly on both sides). PostgreSQL's own
+  protocol limit is far larger, so this is a deliberate narrowing: exceeding
+  it is `54000` (`program_limit_exceeded`) naming the limit, not a
+  connection error. Raising it waits on byte-weighted admission — row
+  channels and writer flushes are bounded by item count, so a larger limit
+  would let a few rows hold hundreds of megabytes in the router.
+
 ## Session model
 
 - **Statements.** The simple protocol relays `Query` as one pooler

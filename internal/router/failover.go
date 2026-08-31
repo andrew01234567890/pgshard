@@ -6,10 +6,13 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
+	"github.com/andrew01234567890/pgshard/internal/pooler"
 )
 
 // SQLSTATEs used by failover buffering.
@@ -279,3 +282,27 @@ func (c *countingWriter) CopyOut(f byte, cf []uint16) error {
 }
 func (c *countingWriter) CopyData(b []byte) error { c.wrote = true; return c.w.CopyData(b) }
 func (c *countingWriter) CopyDone() error         { c.wrote = true; return c.w.CopyDone() }
+
+// codeTooLarge is program_limit_exceeded: the statement or its result is
+// larger than the router and pooler carry between them.
+const codeTooLarge = "54000"
+
+// poolerTransportError is the client's answer to a gRPC failure on a
+// pooler stream.
+//
+// A message over pooler.MaxMessageBytes is not a lost connection: the
+// stream is intact, and what failed is a single Bind value, DataRow or
+// COPY chunk being larger than pgshard carries. Reporting it as 08006
+// tells a client to reconnect, which changes nothing and hides the one
+// fact that would let anyone act -- that there is a size limit, what it
+// is, and that PostgreSQL's own is far larger.
+func poolerTransportError(what string, err error) error {
+	if status.Code(err) == codes.ResourceExhausted {
+		pe := pgwire.Errorf(codeTooLarge, "%s: a message exceeded the %d MiB pgshard carries between the router and a pooler: %v",
+			what, pooler.MaxMessageBytes>>20, err)
+		pe.Detail = "A single parameter value, result row or COPY chunk is larger than this limit. PostgreSQL's own protocol limit is much larger; this one is pgshard's."
+		pe.Hint = "Send or return the value in smaller pieces -- fewer rows per batch, a smaller COPY chunk, or a large value read in parts."
+		return pe
+	}
+	return pgwire.Errorf(codeConnectionFailure, "%s: pooler connection lost: %v", what, err)
+}

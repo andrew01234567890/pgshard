@@ -298,14 +298,14 @@ func (e *Executor) runReqsOn(ctx context.Context, p *txnPart, reqs []*pgshardv1.
 	onCancel := func() { e.cancelBackend(context.Background()) }
 	for _, req := range reqs {
 		if err := p.ps.send(perShard(req), e.sid, e.r.cfg.Poolers.Generation(p.shard), e.ident, e.info.Database); err != nil {
-			return pgwire.Errorf(codeConnectionFailure, "shard %s/%d: pooler connection lost: %v", p.shard.Set, p.shard.ID, err)
+			return poolerTransportError(fmt.Sprintf("shard %s/%d", p.shard.Set, p.shard.ID), err)
 		}
 	}
 	var firstErr error
 	for {
 		resp, err := p.ps.recv(ctx, onCancel)
 		if err != nil {
-			return pgwire.Errorf(codeConnectionFailure, "shard %s/%d: pooler connection lost: %v", p.shard.Set, p.shard.ID, err)
+			return poolerTransportError(fmt.Sprintf("shard %s/%d", p.shard.Set, p.shard.ID), err)
 		}
 		var werr error
 		switch m := resp.Message.(type) {

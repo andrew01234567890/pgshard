@@ -12,6 +12,7 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
+	"github.com/andrew01234567890/pgshard/internal/pooler"
 )
 
 // SnapshotFunc returns the current catalog snapshot, nil before the first
@@ -86,7 +87,9 @@ func (p *Poolers) Client(sh Shard) (pgshardv1.PoolerClient, error) {
 	now := p.now()
 	c, ok := p.conns[ep]
 	if !ok {
-		cc, err := grpc.NewClient(ep, grpc.WithTransportCredentials(p.creds), grpc.WithIdleTimeout(poolerIdleTimeout))
+		cc, err := grpc.NewClient(ep, grpc.WithTransportCredentials(p.creds), grpc.WithIdleTimeout(poolerIdleTimeout),
+			grpc.WithDefaultCallOptions(
+				grpc.MaxCallRecvMsgSize(pooler.MaxMessageBytes), grpc.MaxCallSendMsgSize(pooler.MaxMessageBytes)))
 		if err != nil {
 			return nil, fmt.Errorf("router: dial pooler %s: %w", ep, err)
 		}

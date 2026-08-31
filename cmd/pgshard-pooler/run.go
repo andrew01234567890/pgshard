@@ -170,7 +170,10 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		fmt.Fprintf(stderr, "pgshard-pooler run: %v\n", err)
 		return cli.ExitNotReady
 	}
-	g := grpc.NewServer(grpc.Creds(creds))
+	// Explicitly what grpc-go would default to, so the limit is pgshard's
+	// and testable rather than a dependency's.
+	g := grpc.NewServer(grpc.Creds(creds),
+		grpc.MaxRecvMsgSize(pooler.MaxMessageBytes), grpc.MaxSendMsgSize(pooler.MaxMessageBytes))
 	srv.Register(g)
 	mode := "mTLS"
 	if *insecureDev {

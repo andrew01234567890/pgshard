@@ -319,7 +319,7 @@ func (e *Executor) startParticipant(ctx context.Context, sh Shard, seq, setup st
 		}
 		p.reserved = true
 		if err := ps.send(simpleQuery(setup), p.sid, gen, e.ident, e.info.Database); err != nil {
-			return p, pgwire.Errorf(codeConnectionFailure, "pooler connection lost: %v", err)
+			return p, poolerTransportError("pooler stream", err)
 		}
 		if err := p.drain(ctx); err != nil {
 			return p, err
@@ -327,7 +327,7 @@ func (e *Executor) startParticipant(ctx context.Context, sh Shard, seq, setup st
 	}
 	for _, req := range reqs {
 		if err := ps.send(perShard(req), p.sid, gen, e.ident, e.info.Database); err != nil {
-			return p, pgwire.Errorf(codeConnectionFailure, "pooler connection lost: %v", err)
+			return p, poolerTransportError("pooler stream", err)
 		}
 	}
 	return p, nil
@@ -628,7 +628,7 @@ func (p *participant) drain(ctx context.Context) error {
 	for {
 		resp, err := p.ps.recv(ctx, nil)
 		if err != nil {
-			return pgwire.Errorf(codeConnectionFailure, "pooler connection lost: %v", err)
+			return poolerTransportError("pooler stream", err)
 		}
 		switch m := resp.Message.(type) {
 		case *pgshardv1.ExecuteResponse_Error:
@@ -657,7 +657,7 @@ func (p *participant) pump(onError func()) {
 	for {
 		resp, err := p.ps.recv(context.Background(), nil)
 		if err != nil {
-			p.err = pgwire.Errorf(codeConnectionFailure, "pooler connection lost: %v", err)
+			p.err = poolerTransportError("pooler stream", err)
 			onError()
 			return
 		}
