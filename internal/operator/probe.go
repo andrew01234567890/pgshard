@@ -460,6 +460,25 @@ func (PgxProber) CertifiedBarrier(ctx context.Context, dsn, password, name strin
 	return certified, err
 }
 
+// ClearWriteFenceAfterRestore lifts the fence on a restored catalog,
+// including the owner stamp its backup captured. It goes to the catalog
+// directly rather than through the agent RPC so the agent's own
+// SetWriteFence stays owner-gated: a restore is the one caller entitled to
+// clear a fence it does not own.
+func (PgxProber) ClearWriteFenceAfterRestore(ctx context.Context, dsn, password string) error {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return err
+	}
+	cfg.Password = password
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	return catalog.ClearWriteFenceAfterRestore(ctx, conn)
+}
+
 // SetShardSetMajor stamps the PostgreSQL major of one shard set.
 func (PgxProber) SetShardSetMajor(ctx context.Context, dsn, name string, major int) error {
 	conn, err := pgx.Connect(ctx, dsn)

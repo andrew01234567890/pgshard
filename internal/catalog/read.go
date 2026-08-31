@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"time"
 
@@ -302,13 +303,50 @@ func ReadWriteFence(ctx context.Context, q Querier) (WriteFence, error) {
 	return pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[WriteFence])
 }
 
+// ErrFenceOwned is returned when an unowned write to the fence would
+// disturb one a barrier is holding.
+var ErrFenceOwned = errors.New("the write fence is held by a running barrier; only its owner may change it")
+
+// ClearWriteFenceAfterRestore drops the fence and its owner together.
+//
+// SetWriteFence refuses to touch a fence an owner holds, which is right for
+// a live cluster: clearing one mid-barrier opens writes the barrier is
+// holding shut. A restored catalog is the case that rule cannot see. The
+// certified restore point is taken while the barrier holds the fence --
+// Barrier.run raises it, then creates the point on every group -- so the
+// restored row carries an owner naming a barrier that finished before the
+// backup was even restored, and can never come back to release it.
+//
+// Only the restore path may use this, and it names its own caller: every
+// other writer goes through SetWriteFence and stays subject to the owner.
+func ClearWriteFenceAfterRestore(ctx context.Context, q Execer) error {
+	_, err := q.Exec(ctx, `UPDATE pgshard.shard_map_generation
+		SET write_fence = false, write_fence_reason = '', write_fence_owner = '',
+		    write_fenced_at = NULL, updated_at = now()`)
+	return err
+}
+
 // SetWriteFence raises or releases the write fence; the change notifies
 // routers through ServingChannel.
+//
+// It refuses to touch a fence some barrier owns. This path exists for a
+// restored catalog, which is not serving and whose fence has no owner, but
+// it is reachable as an agent RPC against any catalog: clearing an owned
+// fence there would open writes in the middle of the barrier that raised
+// it, and raising over one would take the owner's stamp away so its own
+// release would match nothing and leave the cluster fenced.
 func SetWriteFence(ctx context.Context, q Execer, active bool, reason string) error {
-	_, err := q.Exec(ctx, `UPDATE pgshard.shard_map_generation
+	tag, err := q.Exec(ctx, `UPDATE pgshard.shard_map_generation
 		SET write_fence = $1, write_fence_reason = CASE WHEN $1 THEN $2 ELSE '' END,
-		    write_fenced_at = CASE WHEN $1 THEN now() ELSE NULL END, updated_at = now()`, active, reason)
-	return err
+		    write_fenced_at = CASE WHEN $1 THEN now() ELSE NULL END, updated_at = now()
+		WHERE write_fence_owner = ''`, active, reason)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrFenceOwned
+	}
+	return nil
 }
 
 // RaiseWriteFence raises the write fence and stamps it with owner, the token

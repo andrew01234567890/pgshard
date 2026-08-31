@@ -223,7 +223,8 @@ func recoveredRestore(t *testing.T, name string, target pgshardv1alpha1.RestoreT
 	cl := restoreClient(t, source, newPolicy(), bk, rs, superuserSecret("old"))
 	agents := newFakeAgents(nil)
 	twoPC := &fakeTwoPC{outcomes: map[string]twopc.Outcome{}, fail: map[string]error{}}
-	r := &RestoreReconciler{Client: cl, Agents: agents, TwoPC: twoPC, Now: func() time.Time { return time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC) }}
+	r := &RestoreReconciler{Client: cl, Agents: agents, TwoPC: twoPC, Barriers: &fakeCertifier{certified: true},
+		Now: func() time.Time { return time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC) }}
 	if _, got := reconcileRestore(t, r, name); got.Status.Phase != pgshardv1alpha1.RestorePhaseRestoring {
 		t.Fatalf("after create: %+v", got.Status)
 	}
@@ -273,10 +274,15 @@ func TestBarrierRestoreReconcilesPreparedTransactionsThenUnfences(t *testing.T) 
 		"decisions 10.1.0.1:9090",
 		"reconcile 10.1.0.2:9090 epoch=11 shard=0 decisions=2",
 		"reconcile 10.1.0.3:9090 epoch=12 shard=1 decisions=2",
-		"fence 10.1.0.1:9090 epoch=10 active=false",
 	}
 	if strings.Join(twoPC.calls, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("calls:\n%s", strings.Join(twoPC.calls, "\n"))
+	}
+	// The fence comes off through the catalog, not the agent RPC: a
+	// restored catalog carries the owner its backup captured, and the RPC
+	// refuses a fence it does not own.
+	if cert, ok := r.Barriers.(*fakeCertifier); !ok || cert.unfenced != 1 {
+		t.Fatalf("the restore unfenced through the agent RPC instead of the catalog: %+v", r.Barriers)
 	}
 	if cond := meta.FindStatusCondition(got.Status.Conditions, "Progressing"); cond == nil || cond.Status != metav1.ConditionFalse || !strings.Contains(cond.Message, "unfenced: 2 committed, 1 rolled back") {
 		t.Fatalf("condition %+v", cond)
@@ -358,11 +364,12 @@ func TestBarrierRestoreRetriesTransientAgentErrors(t *testing.T) {
 		t.Fatalf("condition %+v", cond)
 	}
 	delete(twoPC.fail, "10.1.0.3:9090")
-	twoPC.fenceErr = errors.New("catalog agent busy")
-	if _, err := r.Reconcile(context.Background(), reconcileReq(key)); err == nil || !strings.Contains(err.Error(), "release write fence: catalog agent busy") {
+	cert := r.Barriers.(*fakeCertifier)
+	cert.unfenceErr = errors.New("catalog not reachable")
+	if _, err := r.Reconcile(context.Background(), reconcileReq(key)); err == nil || !strings.Contains(err.Error(), "release write fence: catalog not reachable") {
 		t.Fatalf("fence err %v", err)
 	}
-	twoPC.fenceErr = nil
+	cert.unfenceErr = nil
 	_, got2 := reconcileRestore(t, r, "r3")
 	if got2.Status.Phase != pgshardv1alpha1.RestorePhaseRecovered || !got2.Status.Reconciliation.Unfenced {
 		t.Fatalf("status %+v", got2.Status)
