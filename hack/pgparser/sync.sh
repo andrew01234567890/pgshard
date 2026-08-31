@@ -26,7 +26,7 @@ if [ -z "$expect" ]; then
 	exit 2
 fi
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+trap 'rm -rf "$tmp" 2>/dev/null || true' EXIT
 
 git -c advice.detachedHead=false clone -q --depth 1 -b "$tag" https://github.com/pganalyze/libpg_query "$tmp/src"
 commit="$(git -C "$tmp/src" rev-parse HEAD)"

@@ -6,7 +6,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 checker="$root/hack/check-actions.sh"
 data="$root/hack/testdata"
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+trap 'rm -rf "$tmp" 2>/dev/null || true' EXIT
 fail=0
 
 if ! "$checker" "$data/good" >/dev/null; then
