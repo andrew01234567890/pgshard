@@ -284,8 +284,9 @@ func TestResolver(t *testing.T) {
 	if err != nil || out.Committed != 1 || out.Unresolved != 0 {
 		t.Fatalf("outcome %+v err %v", out, err)
 	}
-	// Once the young row ages out it is aborted.
-	f.res.Now = func() time.Time { return time.Now().Add(time.Minute) }
+	// Once the young row ages out it is aborted. Aged in the catalog,
+	// which is the only clock that decides this.
+	mustExecPool(t, f.pool, `UPDATE pgshard.xact_decisions SET created_at = now() - interval '10 minutes', heartbeat_at = now() - interval '10 minutes' WHERE gid = 'pgshard-r-1-4'`)
 	out, err = f.res.Resolve(ctx, "")
 	if err != nil {
 		t.Fatal(err)
