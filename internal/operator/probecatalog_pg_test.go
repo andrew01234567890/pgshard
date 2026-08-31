@@ -144,6 +144,15 @@ func runCatalogUpgradeCycle(ctx context.Context, t *testing.T, src, tgt catalogN
 		}
 	}
 	execOn(t, src.side.DSN, `INSERT INTO pgshard.databases (name) VALUES ('before-cutover')`)
+	// Logical replication does not carry sequences, so the cutover copies
+	// their positions itself. Advance one first: left behind, the new
+	// catalog would hand out generations the old one already used, and
+	// every reader keyed on desired_generation would see two different
+	// states under one number.
+	for range 5 {
+		_ = queryOn[int64](t, src.side.DSN, `SELECT nextval('pgshard.desired_generation_seq')`)
+	}
+	srcSeq := queryOn[int64](t, src.side.DSN, `SELECT last_value FROM pgshard.desired_generation_seq`)
 
 	p := PgxProber{}
 	if err := p.EnsureCatalogCopy(ctx, src.side, tgt.side); err != nil {
@@ -179,6 +188,14 @@ func runCatalogUpgradeCycle(ctx context.Context, t *testing.T, src, tgt catalogN
 		t.Error("the forward subscription outlived the cutover")
 	}
 	// The reverse pair is armed, disabled, with its slot on the new side.
+	// The sequence came with it: the next generation the new catalog hands
+	// out is past every one the old catalog issued.
+	if got := queryOn[int64](t, tgt.side.DSN, `SELECT last_value FROM pgshard.desired_generation_seq`); got < srcSeq {
+		t.Errorf("the new catalog restarts desired_generation at %d, behind the %d the old one reached", got, srcSeq)
+	}
+	if next := queryOn[int64](t, tgt.side.DSN, `SELECT nextval('pgshard.desired_generation_seq')`); next <= srcSeq {
+		t.Errorf("the new catalog hands out generation %d, which the old catalog already used (reached %d)", next, srcSeq)
+	}
 	if n := queryOn[int64](t, tgt.side.DSN, `SELECT count(*) FROM pg_publication WHERE pubname = $1`, CatalogRollbackPublication); n != 1 {
 		t.Fatal("no rollback publication: there would be no way back")
 	}
