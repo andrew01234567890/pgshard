@@ -1624,3 +1624,58 @@ func TestShutdownDoesNotOvertakeAnAcceptedConnection(t *testing.T) {
 		t.Fatalf("a session read from the connection %d times after Shutdown returned", n)
 	}
 }
+
+// TestUnauthenticatedClientCannotDeclareALargeBody: the body length comes
+// from a five-byte header and pgproto3 allocates the whole declared length
+// before any body byte arrives. The ceiling exists for what an
+// authenticated session may do; a client that has sent nothing but a
+// startup packet has earned none of it, and every startup slot the router
+// allows at once multiplies whatever it can claim.
+func TestUnauthenticatedClientCannotDeclareALargeBody(t *testing.T) {
+	scram, err := BuildSCRAMVerifier("s3cret", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := startServer(t, Config{Authenticator: SCRAMAuthenticator{Lookup: lookup(map[string]string{"alice": scram.String()})}})
+	c := dialRaw(t, ts.addr)
+	c.rawStartup(ProtocolVersion30, map[string]string{"user": "alice", "database": "db"})
+	if _, err := c.fe.Receive(); err != nil {
+		t.Fatalf("expected an authentication request: %v", err)
+	}
+
+	// A PasswordMessage header declaring a body far above the pre-auth
+	// limit but well inside the authenticated one, and no body at all.
+	var hdr [5]byte
+	hdr[0] = 'p'
+	binary.BigEndian.PutUint32(hdr[1:], uint32(32<<20))
+	if _, err := c.conn.Write(hdr[:]); err != nil {
+		t.Fatal(err)
+	}
+	// Without the pre-auth limit the router accepts the length, allocates
+	// for it and blocks for a body that never comes -- which a test that
+	// tolerated a read error would call a pass. The deadline is the
+	// assertion.
+	if err := c.conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := c.fe.Receive()
+	if err != nil {
+		t.Fatalf("no refusal within 2s: the router allocated for an unauthenticated client's declared length (%v)", err)
+	}
+	if er, ok := msg.(*pgproto3.ErrorResponse); !ok {
+		t.Fatalf("an unauthenticated client's oversized message was accepted: got %T", msg)
+	} else if er.Severity != "FATAL" {
+		t.Fatalf("refused with severity %q, want FATAL", er.Severity)
+	}
+}
+
+func TestPreAuthCapIsWellBelowTheAuthenticatedOne(t *testing.T) {
+	if preAuthMaxMessageBodyLen >= DefaultMaxMessageBodyLen {
+		t.Fatalf("pre-auth cap %d does not bound anything below the authenticated cap %d", preAuthMaxMessageBodyLen, DefaultMaxMessageBodyLen)
+	}
+	// A startup packet, a password message and a SCRAM exchange are
+	// hundreds of bytes; a cap under 4 KiB would start refusing real ones.
+	if preAuthMaxMessageBodyLen < 4<<10 {
+		t.Fatalf("pre-auth cap %d is small enough to refuse a legitimate exchange", preAuthMaxMessageBodyLen)
+	}
+}
