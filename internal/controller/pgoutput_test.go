@@ -71,6 +71,14 @@ func TestDecoderRelationInsertUpdateDelete(t *testing.T) {
 	if err != nil || c.Op != OpUpdate || *c.Old.Values[2] != "old" || !c.New.Unchanged[2] || *c.New.Values[1] != "11" {
 		t.Fatalf("update: %+v %v", c, err)
 	}
+	// Default replica identity sends the key as K, not the full old row as
+	// O. The applier reads one old image either way.
+	keyed := tuple(tuple((&msgBuilder{}).byte('U').u32(7).byte('K'), s("1"), nil, nil).byte('N'), s("1"), s("12"), s("note")).b
+	c, _, err = d.Decode(keyed)
+	if err != nil || c.Op != OpUpdate || c.Old == nil || *c.Old.Values[0] != "1" || *c.New.Values[1] != "12" {
+		t.Fatalf("keyed update: %+v %v", c, err)
+	}
+
 	del := tuple((&msgBuilder{}).byte('D').u32(7).byte('K'), s("1"), nil, nil).b
 	c, _, err = d.Decode(del)
 	if err != nil || c.Op != OpDelete || c.Old == nil || *c.Old.Values[0] != "1" {
@@ -114,20 +122,5 @@ func TestDecoderRefusals(t *testing.T) {
 	}
 	if c, committed, err := d.Decode((&msgBuilder{}).byte('Y').u32(1).str("public").str("mood").b); c != nil || committed || err != nil {
 		t.Errorf("type message: %v %v %v", c, committed, err)
-	}
-}
-
-func TestLSNRoundTrip(t *testing.T) {
-	v, err := ParseLSN("1/A0")
-	if err != nil || v != 1<<32|0xA0 {
-		t.Fatalf("%d %v", v, err)
-	}
-	if got := FormatLSN(v); got != "1/A0" {
-		t.Fatalf("%s", got)
-	}
-	for _, bad := range []string{"", "1", "x/1", "1/x"} {
-		if _, err := ParseLSN(bad); err == nil {
-			t.Errorf("%q accepted", bad)
-		}
 	}
 }

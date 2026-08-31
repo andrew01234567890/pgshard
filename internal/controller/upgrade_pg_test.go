@@ -8,6 +8,8 @@ import (
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/placement"
+
+	"github.com/andrew01234567890/pgshard/internal/pgsequence"
 )
 
 // TestUpgradeWorkflowKindOnPostgres: the reconciler creates a kind=upgrade
@@ -227,12 +229,12 @@ func waitFor(t *testing.T, d time.Duration, cond func() bool, msg string) {
 	}
 }
 
-// TestCollectSequencesHeadroomOnPostgres: the carried value covers what a
+// TestSequenceCarryHeadroomOnPostgres: the carried value covers what a
 // session cache or the WAL pre-log window may already have handed out
 // without moving pg_current_wal_lsn(), applied in the direction of
 // increment_by, clamped to the boundary in that direction, and safe at the
 // bigint edges.
-func TestCollectSequencesHeadroomOnPostgres(t *testing.T) {
+func TestSequenceCarryHeadroomOnPostgres(t *testing.T) {
 	parallelPG(t)
 	dsn := startPostgresWith(t)
 	conn := connect(t, dsn)
@@ -248,50 +250,65 @@ func TestCollectSequencesHeadroomOnPostgres(t *testing.T) {
 		queryOne[int64](t, conn, `SELECT nextval('`+seq+`')`)
 	}
 	last := queryOne[int64](t, conn, `SELECT last_value FROM pg_sequences WHERE sequencename = 'app_seq'`)
-	values := map[string]seqCarry{}
-	if err := collectSequences(ctx, pgxShardConn{conn}, values); err != nil {
+	// A shard set carries the user databases' sequences. pgshard's own
+	// schema and the journal are the control plane's, materialized on the
+	// targets by the workflow itself, and carrying them would overwrite
+	// what the workflow just wrote.
+	mustExec(t, conn, `CREATE SCHEMA pgshard`)
+	mustExec(t, conn, `CREATE SCHEMA `+JournalSchema)
+	mustExec(t, conn, `CREATE SEQUENCE pgshard.ours`)
+	mustExec(t, conn, `CREATE SEQUENCE `+JournalSchema+`.ours`)
+	for _, seq := range []string{"pgshard.ours", JournalSchema + ".ours"} {
+		queryOne[int64](t, conn, `SELECT nextval('`+seq+`')`)
+	}
+
+	values, err := pgsequence.Snapshot(ctx, conn, []string{"pgshard", JournalSchema})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if got := values["public.app_seq"]; got.Value != last+32 || !got.Ascending {
+	for _, name := range []string{"pgshard.ours", JournalSchema + ".ours"} {
+		if got, ok := values[name]; ok {
+			t.Errorf("%s is the control plane's, not the workload's, and was carried as %+v", name, got)
+		}
+	}
+	if got := values["public.app_seq"]; got.At != last+32 || !got.Ascending {
 		t.Fatalf("app_seq carried as %+v, want last_value %d + 32 headroom, ascending", got, last)
 	}
-	if got := values["public.tiny_seq"]; got.Value != 10 {
+	if got := values["public.tiny_seq"]; got.At != 10 {
 		t.Fatalf("tiny_seq carried as %+v, want the clamp at max_value 10", got)
 	}
-	if got := values["public.down_seq"]; got.Value != -10-32*3 || got.Ascending {
+	if got := values["public.down_seq"]; got.At != -10-32*3 || got.Ascending {
 		t.Fatalf("down_seq carried as %+v, want start -10 minus 32*3 headroom, descending", got)
 	}
-	if got := values["public.wide_seq"]; got.Value != 1+32*7 {
+	if got := values["public.wide_seq"]; got.At != 1+32*7 {
 		t.Fatalf("wide_seq carried as %+v, want start 1 plus 32*7 headroom", got)
 	}
-	if got := values["public.edge_seq"]; got.Value != 9223372036854775807 {
+	if got := values["public.edge_seq"]; got.At != 9223372036854775807 {
 		t.Fatalf("edge_seq carried as %+v, want the clamp at the bigint maximum", got)
 	}
-	if got := values["public.edge_down_seq"]; got.Value != -9223372036854775807 {
+	if got := values["public.edge_down_seq"]; got.At != -9223372036854775807 {
 		t.Fatalf("edge_down_seq carried as %+v, want the clamp at min_value", got)
 	}
-	if got := values["public.cycle_seq"]; got.Value != 20 {
+	if got := values["public.cycle_seq"]; got.At != 20 {
 		t.Fatalf("cycle_seq carried as %+v, want the clamp at max_value 20, never a wrapped value", got)
 	}
 
 	// The merge across sources keeps the furthest value per direction: a
 	// later source further along must win, an earlier one must not regress
 	// the carry.
-	merged := map[string]seqCarry{
-		"public.app_seq":  {Value: last + 1000, Ascending: true},
-		"public.down_seq": {Value: -5000, Ascending: false},
+	merged := map[string]pgsequence.Value{
+		"public.app_seq":  {At: last + 1000, Ascending: true},
+		"public.down_seq": {At: -5000, Ascending: false},
 	}
-	if err := collectSequences(ctx, pgxShardConn{conn}, merged); err != nil {
-		t.Fatal(err)
-	}
-	if got := merged["public.app_seq"]; got.Value != last+1000 {
+	pgsequence.Merge(merged, values)
+	if got := merged["public.app_seq"]; got.At != last+1000 {
 		t.Fatalf("ascending merge regressed to %+v", got)
 	}
-	if got := merged["public.down_seq"]; got.Value != -5000 {
+	if got := merged["public.down_seq"]; got.At != -5000 {
 		t.Fatalf("descending merge regressed to %+v", got)
 	}
 
-	if err := applySequences(ctx, pgxShardConn{conn}, values); err != nil {
+	if err := pgsequence.Apply(ctx, conn, values); err != nil {
 		t.Fatal(err)
 	}
 	if next := queryOne[int64](t, conn, `SELECT nextval('app_seq')`); next <= last+32 {
@@ -311,7 +328,7 @@ func TestCollectSequencesHeadroomOnPostgres(t *testing.T) {
 	// sequence backwards would hand every value between out twice.
 	mustExec(t, conn, `SELECT setval('app_seq', 900000, true)`)
 	mustExec(t, conn, `SELECT setval('down_seq', -900000, true)`)
-	if err := applySequences(ctx, pgxShardConn{conn}, values); err != nil {
+	if err := pgsequence.Apply(ctx, conn, values); err != nil {
 		t.Fatal(err)
 	}
 	if next := queryOne[int64](t, conn, `SELECT nextval('app_seq')`); next <= 900000 {
