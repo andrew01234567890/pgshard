@@ -62,11 +62,17 @@ This directory vendors libpg_query (https://github.com/pganalyze/libpg_query)
 at tag $tag (commit $commit), which is licensed under the BSD 3-Clause
 License (see LICENSE). It bundles portions of PostgreSQL $major (see
 COPYRIGHT.postgresql, PostgreSQL License), protobuf-c (BSD 2-Clause) and
-xxHash (BSD 2-Clause). Regenerate with: hack/pgparser/sync.sh $major $tag
+xxHash (BSD 2-Clause). Individual files carry further licences, all
+permissive; sbom.spdx.json lists every one found in the vendored bytes and
+is what hack/pgparser/verify.sh checks. Regenerate with:
+hack/pgparser/sync.sh $major $tag
 NOTICE
 # The manifest is what makes a later hand-edit of the vendored C visible.
 # It covers upstream's files only: the .go files in this directory are
 # pgshard's binding and change on their own schedule.
-( cd "$dest" && find . -type f ! -name '*.go' ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > SHA256SUMS )
+( cd "$dest" && find . -type f ! -name '*.go' ! -name SHA256SUMS ! -name sbom.spdx.json -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > SHA256SUMS )
+
+# Written from the manifest, so it records the bytes just checksummed.
+python3 "$(dirname "$0")/sbom.py" generate "$dest"
 
 echo "synced libpg_query $tag ($commit) into $dest"
