@@ -657,3 +657,41 @@ func TestTemplateDialAsksForAGroupNameOnce(t *testing.T) {
 		t.Fatalf("cached group after a failed dial = %q (present=%v), want the re-read %q", got, ok, "renamed")
 	}
 }
+
+// TestPreparingTimeoutOutlivesTheCoordinatorHeartbeat: the beat interval
+// and this timeout are one invariant across two processes, and they were
+// independent constants. A timeout set within a beat or two of the
+// interval aborts live coordinators whose beat was merely late -- safe for
+// the data, but the client was told the transaction was fine.
+func TestPreparingTimeoutOutlivesTheCoordinatorHeartbeat(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  time.Duration
+		beat time.Duration
+		want time.Duration
+	}{
+		{"unset uses the default", 0, 0, DefaultPreparingTimeout},
+		{"the default is raised too when the beat is slow", 0, 5 * time.Second, 20 * time.Second},
+		{"a timeout under the floor is lifted to it", time.Second, 0, catalog.MinPreparingTimeout},
+		{"a generous timeout is kept", time.Minute, 0, time.Minute},
+		{"a shorter beat lowers the floor with it", time.Second, 100 * time.Millisecond, time.Second},
+		{"the floor follows the configured beat", 10 * time.Millisecond, 100 * time.Millisecond, 400 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &Resolver{PreparingTimeout: tc.set, HeartbeatInterval: tc.beat}
+			if got := r.preparingTimeout(); got != tc.want {
+				t.Fatalf("preparingTimeout() = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTheDefaultTimeoutSpansSeveralHeartbeats guards the pair of constants
+// themselves: a later edit to either that brought them together would put
+// every cluster on the default into the spurious-abort window.
+func TestTheDefaultTimeoutSpansSeveralHeartbeats(t *testing.T) {
+	if DefaultPreparingTimeout < catalog.MinPreparingTimeout {
+		t.Fatalf("DefaultPreparingTimeout %s is under the floor of %d heartbeats (%s)",
+			DefaultPreparingTimeout, catalog.MinPreparingBeats, catalog.MinPreparingTimeout)
+	}
+}

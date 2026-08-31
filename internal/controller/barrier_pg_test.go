@@ -25,7 +25,9 @@ func TestBarrierOnPostgres(t *testing.T) {
 	ctx := context.Background()
 	f.prepare(0, "pgshard-stale", "stale")
 	f.decide("pgshard-stale", "preparing", time.Minute, 0)
-	f.res.PreparingTimeout = time.Second
+	// The row is a minute stale; a short timeout needs a short heartbeat
+	// under it, or the floor that keeps live coordinators alive lifts it.
+	f.res.PreparingTimeout, f.res.HeartbeatInterval = time.Second, 100*time.Millisecond
 	b := &Barrier{Store: &PGBarrierStore{Pool: f.pool}, Groups: &SQLBarrierGroups{Pool: f.pool, Shards: f.dialer}, Resolver: f.res, Poll: 50 * time.Millisecond}
 	srv := &Server{Pool: f.pool, Barrier: b, Resolver: f.res}
 

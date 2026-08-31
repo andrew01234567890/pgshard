@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgproto3"
 
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
 	"github.com/andrew01234567890/pgshard/internal/router/crashpoint"
@@ -525,7 +526,7 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 // decisionHeartbeatInterval is how often a coordinator marks its
 // preparing decision row alive; the resolver's preparing timeout spans
 // several missed beats. A variable so tests can shrink it.
-var decisionHeartbeatInterval = 2 * time.Second
+var decisionHeartbeatInterval = catalog.DecisionHeartbeatInterval
 
 // heartbeatUntilDecided keeps the preparing row's heartbeat fresh while
 // the coordinator is between the decision-log write and the decision, so

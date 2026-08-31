@@ -67,8 +67,14 @@ type Resolver struct {
 	// and silently lose that, finishing against the DSN's default database.
 	Shards ShardDBDialer
 	Logger *slog.Logger
-	// PreparingTimeout overrides DefaultPreparingTimeout.
+	// PreparingTimeout overrides DefaultPreparingTimeout. It is held to a
+	// floor of several coordinator heartbeats; see preparingTimeout.
 	PreparingTimeout time.Duration
+	// HeartbeatInterval is how often coordinators are expected to mark a
+	// preparing row alive; zero means catalog.DecisionHeartbeatInterval.
+	// Lowering it lowers the floor under PreparingTimeout with it, which
+	// is what a test that wants both short needs.
+	HeartbeatInterval time.Duration
 	// SweepInterval is how often the whole topology is searched for
 	// prepared transactions no decision row names. That sweep is a safety
 	// net for a coordinator that died between preparing and recording, so
@@ -77,6 +83,8 @@ type Resolver struct {
 	SweepInterval time.Duration
 	// lastSweep is when the whole topology was last searched.
 	lastSweep time.Time
+	// warnRaised keeps the raised-timeout warning to one line per process.
+	warnRaised sync.Once
 	// Now overrides the clock in tests.
 	Now func() time.Time
 	// Metrics counts resolved transactions; nil disables it.
@@ -254,11 +262,35 @@ func (r *Resolver) now() time.Time {
 	return time.Now()
 }
 
+// preparingTimeout never returns less than the coordinator heartbeat can
+// survive. The interval and this timeout are one invariant across two
+// processes, and a timeout set within a beat or two of the interval aborts
+// live coordinators whose beat was merely late -- safe, but a transaction
+// the client was told nothing had gone wrong with.
 func (r *Resolver) preparingTimeout() time.Duration {
-	if r.PreparingTimeout > 0 {
-		return r.PreparingTimeout
+	beat := r.HeartbeatInterval
+	if beat <= 0 {
+		beat = catalog.DecisionHeartbeatInterval
 	}
-	return DefaultPreparingTimeout
+	want := r.PreparingTimeout
+	if want <= 0 {
+		want = DefaultPreparingTimeout
+	}
+	floor := catalog.MinPreparingBeats * beat
+	if want >= floor {
+		return want
+	}
+	// Silently running to a different timeout than the one configured is
+	// how an operator ends up debugging the wrong number.
+	r.warnRaised.Do(func() {
+		logger := r.Logger
+		if logger == nil {
+			logger = slog.Default()
+		}
+		logger.Warn("resolver: preparing timeout raised to span the coordinator heartbeat",
+			"configured", want, "using", floor, "heartbeat", beat, "beats", catalog.MinPreparingBeats)
+	})
+	return floor
 }
 
 // resolveDecision finishes one decision row. A preparing row older than the

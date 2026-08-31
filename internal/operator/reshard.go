@@ -61,6 +61,13 @@ type reshardPlan struct {
 // opt-in pause before the write switch -- leaving it out meant a reshard
 // paused before switchWrites could not be cancelled by reverting
 // spec.shards, which is the one thing that pause exists to allow.
+//
+// Being before the switch is also what makes the DropShardSet that follows
+// safe: it deletes the set's pgshard.shard_status rows, and those rows are
+// how the resolver finds shards to search for prepared transactions. A set
+// that never took client writes holds none, so removing them hides
+// nothing. Past the switch the old set is retired rather than dropped --
+// its rows stay, and stay visible to the resolver.
 func cancellableOnRevert(phase string) bool {
 	switch phase {
 	case pgshardv1alpha1.ReshardPhasePending, pgshardv1alpha1.ReshardPhaseProvisioning,
@@ -410,7 +417,10 @@ func reshardPhase(wf WorkflowInfo) string {
 		return pgshardv1alpha1.ReshardPhaseCopying
 	case wf.Stage == "awaiting_switch_writes":
 		return pgshardv1alpha1.ReshardPhaseVerifying
-	case wf.Stage == "switching":
+	case wf.Stage == "switching", wf.Stage == "rolling_back":
+		// A rollback is a switch being undone, so the set is live and the
+		// phase must not be one that lets it be dropped. Unmapped, this
+		// stage fell through to Provisioning, which is droppable.
 		return pgshardv1alpha1.ReshardPhaseSwitching
 	case wf.Stage == "switched", wf.Stage == "completing":
 		return pgshardv1alpha1.ReshardPhaseCompleting
