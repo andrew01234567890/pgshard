@@ -459,7 +459,13 @@ func (e *Executor) moveTo(ctx context.Context, target Shard) error {
 		return nil
 	}
 	if e.tx != pgwire.TxIdle && e.txnTouched {
-		return e.switchPart(ctx, target)
+		// switchPart runs SQL on a part the transaction has already used:
+		// it repins it and replays the prelude. That happens before
+		// withFailover ever sees the statement, so a flip landing there
+		// went to the client as the participant's own 55000 -- the last
+		// way one could, and the one a transfer alternating between two
+		// shards hits every time round.
+		return nameFenceInTxn(e.switchPart(ctx, target))
 	}
 	e.dropStream()
 	e.shard = target
