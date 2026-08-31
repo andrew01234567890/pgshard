@@ -12,7 +12,7 @@ runs the checker against the fixtures under `hack/testdata`.
 | `images.yml` | builds the PostgreSQL 18 and 19 images with `docker buildx bake` and pushes them to GHCR on `main` |
 | `e2e-kind.yml` | kind-based smoke, operator, backup and reshard suites for both majors, plus upgrade, reshard-split and reshard-merge on pg18 |
 | `perf.yml` | benchstat comparison against the base branch; only benchmarks tagged `Gate` can fail a PR (see `hack/perf/gate.sh`) |
-| `repeat.yml` | manual: repeats one Go package up to 50 times and reports the pass rate |
+| `repeat.yml` | manual: repeats one Go package or the integration suite up to 50 times, against an optional `ref`, and reports the pass rate |
 | `repeat-e2e.yml` | manual: repeats one kind e2e suite up to 12 times, against an optional `ref`, and reports the pass rate |
 | `chaos.yml` | Chaos Mesh experiments (`test/chaos`) |
 | `dependency-review.yml`, `dependabot-automerge.yml` | dependency hygiene |
@@ -47,8 +47,18 @@ A test is not flaky until a rate says so, and not fixed until the same run
 says so again: one green run proves nothing about a test that fails one time
 in five. `repeat.yml` repeats a Go package (up to 50 runs); `repeat-e2e.yml`
 repeats one kind e2e suite (up to 12, because each run builds images and
-stands up its own cluster). `repeat-e2e.yml` takes a `ref`, so a suspect
-branch can be compared against `main` on the same suite.
+stands up its own cluster). Both take a `ref`, so a suspect branch can be
+compared against `main` on the same target.
+
+`repeat.yml`'s `integration` target covers the suite `make integration`
+runs -- `test/e2e/router`, the agent and pgtune -- which is where the
+tests that flake in practice live, since they drive real PostgreSQL
+through a real router. Note that `router` means `./internal/router/...`:
+the cutover and two-phase-commit tests are under `test/e2e/router` and
+belong to `integration`. With a `pattern` it repeats one of them:
+
+    gh workflow run repeat.yml -f target=integration -f runs=20 \
+      -f pattern=TestReshardCutoverUnderLoad -f ref=my-branch
 
 Twelve runs bounds a failure rate at roughly one in twelve. It cannot see a
 rarer flake, so a green twelve is not evidence of zero — the run summary says
