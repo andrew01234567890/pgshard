@@ -19,6 +19,10 @@ const (
 	CodeSyntaxError           = "42601"
 	CodeInsufficientPrivilege = "42501"
 	CodeInternalError         = "XX000"
+	// CodeReadOnlySQLTransaction is what PostgreSQL answers a write in a
+	// read-only transaction, including one made read-only by
+	// default_transaction_read_only.
+	CodeReadOnlySQLTransaction = "25006"
 )
 
 // Error is a PostgreSQL-style error that is sent to the client as an

@@ -138,6 +138,8 @@ type script struct {
 	cols []scriptCol
 	rows [][]string
 	err  string
+	// code is the SQLSTATE err is reported with; empty means 42P01.
+	code string
 	// delay holds this shard back, so a test can decide which shard
 	// answers first rather than leaving it to the scheduler.
 	delay time.Duration
@@ -176,7 +178,11 @@ func (s *fakeStream) scripted(sc script, described bool) error {
 		time.Sleep(sc.delay)
 	}
 	if sc.err != "" {
-		return s.errorf("42P01", sc.err)
+		code := sc.code
+		if code == "" {
+			code = "42P01"
+		}
+		return s.errorf(code, sc.err)
 	}
 	if !described {
 		if err := s.scriptedDesc(sc); err != nil {
