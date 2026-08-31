@@ -89,6 +89,11 @@ type sqlPreparedStmt struct{ name, sql string }
 type savepointMark struct {
 	name   string
 	staged int
+	// prepared is the SQL-level PREPAREs as they stood when the savepoint
+	// was taken. A snapshot rather than a length, because a DEALLOCATE
+	// inside the savepoint has to come back on ROLLBACK TO, and a length
+	// can only undo additions.
+	prepared []sqlPreparedStmt
 }
 
 type execItem struct {
@@ -163,6 +168,11 @@ type Executor struct {
 	// savepoints marks the staged length at each open savepoint so
 	// ROLLBACK TO drops the settings staged after it.
 	savepoints []savepointMark
+	// txnPrepared is the SQL-level PREPAREs as they stood when the open
+	// transaction began, restored if it rolls back. txnPreparedSet
+	// separates "no transaction has begun" from "none were prepared".
+	txnPrepared    []sqlPreparedStmt
+	txnPreparedSet bool
 	// portals maps portal names to logical statement names.
 	portals map[string]string
 
@@ -526,6 +536,7 @@ func (e *Executor) guard(op string, run func() error) (err error) {
 		e.dropStream()
 		e.staged, e.stagedMark = nil, 0
 		e.txnPrelude, e.txnTouched = nil, false
+		e.txnPrepared, e.txnPreparedSet = nil, false
 		e.txnOnBackend, e.txnPreFence = false, false
 		err = pgwire.Errorf(pgwire.CodeInternalError, "internal error while processing the statement; the session state was reset")
 	}()
@@ -678,11 +689,18 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 // adds a replayed statement, DEALLOCATE and DISCARD ALL drop them.
 func (e *Executor) noteSessionEffect(class StmtClass, sql string) {
 	switch class.Txn {
+	case plan.TxnBegin:
+		e.txnPrepared, e.txnPreparedSet = slices.Clone(e.sqlPrepared), true
 	case plan.TxnSavepoint:
-		e.savepoints = append(e.savepoints, savepointMark{name: class.Savepoint, staged: len(e.staged)})
+		e.savepoints = append(e.savepoints, savepointMark{
+			name:     class.Savepoint,
+			staged:   len(e.staged),
+			prepared: slices.Clone(e.sqlPrepared),
+		})
 	case plan.TxnRollbackTo:
 		if i := e.savepointIndex(class.Savepoint); i >= 0 {
 			e.staged = e.staged[:min(e.savepoints[i].staged, len(e.staged))]
+			e.sqlPrepared = slices.Clone(e.savepoints[i].prepared)
 			e.savepoints = e.savepoints[:i+1]
 		}
 	case plan.TxnRelease:
@@ -1441,9 +1459,18 @@ func (e *Executor) afterBatch(ctx context.Context, err error) error {
 		switch {
 		case err != nil || strings.HasPrefix(e.lastTag, "ROLLBACK"):
 			e.staged = nil
+			// PostgreSQL drops a PREPARE with the transaction that made
+			// it, and restores one a rolled-back DEALLOCATE removed. The
+			// router replays what it holds onto a fresh backend, so
+			// keeping either would make the session behave one way before
+			// a failover and another after it.
+			if e.txnPreparedSet {
+				e.sqlPrepared = e.txnPrepared
+			}
 		default:
 			e.applyStaged()
 		}
+		e.txnPrepared, e.txnPreparedSet = nil, false
 	}
 	if e.txnEnded && e.pinned {
 		e.txnEnded = false
