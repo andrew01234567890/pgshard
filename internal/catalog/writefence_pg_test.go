@@ -3,8 +3,25 @@ package catalog
 import (
 	"context"
 	"errors"
+	"os/exec"
 	"testing"
+
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
 )
+
+// requireDocker skips (or, where docker is required, fails) rather than
+// letting `docker run` fail as a test failure: every other PostgreSQL-backed
+// test in this package skips without a daemon, and these two turned a
+// machine with no Docker into a red suite.
+func requireDocker(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("docker"); err != nil {
+		dockertest.Unavailable(t, "docker not on PATH")
+	}
+	if err := exec.Command("docker", "info").Run(); err != nil {
+		dockertest.Unavailable(t, "docker daemon unavailable")
+	}
+}
 
 // TestOnlyTheOwnerMayChangeALiveFence: an unowned writer -- the agent RPC
 // reaching any catalog -- must not disturb a fence a barrier is holding.
@@ -12,6 +29,7 @@ import (
 // and raising over one takes the owner's stamp away, so the owner's own
 // release matches nothing and the cluster stays fenced.
 func TestOnlyTheOwnerMayChangeALiveFence(t *testing.T) {
+	requireDocker(t)
 	ctx := context.Background()
 	conn := connect(t, startPostgres(t, candidateImages[0]))
 	if err := Migrate(ctx, conn); err != nil {
@@ -39,6 +57,7 @@ func TestOnlyTheOwnerMayChangeALiveFence(t *testing.T) {
 // restored cluster would stay fenced for good; the restore path is the one
 // caller entitled to clear a fence it does not own.
 func TestARestoredCatalogCanBeUnfenced(t *testing.T) {
+	requireDocker(t)
 	ctx := context.Background()
 	conn := connect(t, startPostgres(t, candidateImages[0]))
 	if err := Migrate(ctx, conn); err != nil {
