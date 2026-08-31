@@ -60,11 +60,35 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("reading the instance role: %w", err)
 	}
+	// Checked before anything is acquired: an agent that cannot derive its
+	// control-plane token will not serve, and finding that out after taking
+	// the lease and starting PostgreSQL means unwinding both.
+	password, err := inst.password()
+	if err != nil {
+		return fmt.Errorf("agent auth token: %w", err)
+	}
+	if _, err := agentauth.Token(password); err != nil {
+		return fmt.Errorf("agent auth token: %w", err)
+	}
+
+	// Startup takes a lease, a PostgreSQL process and two listeners, and
+	// steps after the first of them can still fail. Without this, Run
+	// returned with PostgreSQL serving, HTTP answering and the lease
+	// renewing: the caller exits, and the lease is left to expire on its
+	// own, during which nothing else may promote.
+	var rollback startupRollback
+	defer rollback.run()
+
 	if !standby && lease != nil {
 		if err := lease.Acquire(ctx); err != nil {
 			return fmt.Errorf("primary cannot start without the lease: %w", err)
 		}
 		srv.startHold()
+		rollback.push(func() {
+			relCtx, relCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer relCancel()
+			srv.releaseLease(relCtx)
+		})
 	}
 	startCtx, startCancel := context.WithTimeout(ctx, 10*time.Minute)
 	err = inst.Start(startCtx)
@@ -72,6 +96,11 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	rollback.push(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 3*time.Duration(cfg.ShutdownTimeout))
+		defer stopCancel()
+		_ = sup.Stop(stopCtx, ShutdownFast, time.Duration(cfg.ShutdownTimeout))
+	})
 	inst.startStanzaWorker(ctx, stanzaRetry)
 
 	reg := metrics.NewRegistry("agent")
@@ -113,19 +142,17 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	rollback.push(func() {
+		shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutCancel()
+		_ = httpSrv.Shutdown(shutCtx)
+	})
 	go func() {
 		if err := httpSrv.Serve(httpLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fatal(err)
 		}
 	}()
 
-	password, err := inst.password()
-	if err != nil {
-		return fmt.Errorf("agent auth token: %w", err)
-	}
-	if _, err := agentauth.Token(password); err != nil {
-		return fmt.Errorf("agent auth token: %w", err)
-	}
 	// Both tokens, re-read on every call so a rotated Secret is honoured
 	// without an agent restart.
 	//
@@ -163,12 +190,16 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	rollback.push(grpcSrv.Stop)
 	go func() {
 		if err := grpcSrv.Serve(grpcLn); err != nil {
 			fatal(err)
 		}
 	}()
 	log.Info("agent ready", "http", httpLn.Addr().String(), "grpc", grpcLn.Addr().String(), "standby", standby)
+
+	// Past here the steady-state path below owns the shutdown.
+	rollback.succeed()
 
 	sigs := make(chan os.Signal, 2)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
