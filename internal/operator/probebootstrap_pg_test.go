@@ -94,3 +94,47 @@ func TestSeedBootstrapRolePublishesACredentialThatCanReachTheRouter(t *testing.T
 		t.Fatal("a rotated password did not reach the catalog")
 	}
 }
+
+// TestTheSeededVerifierIsTheOneTheServerHolds: the catalog verifier and the
+// server's must be the same string, not two hashes of the same password.
+// SCRAM derives ClientKey from the salt, so a second verifier with a fresh
+// salt gives the router a key the backend cannot accept: the router
+// authenticates the client against the catalog, forwards that key, and
+// PostgreSQL answers 28P01 -- a login the guide documents, failing after
+// the router has already said yes.
+func TestTheSeededVerifierIsTheOneTheServerHolds(t *testing.T) {
+	if err := exec.Command("docker", "info").Run(); err != nil {
+		dockertest.Unavailable(t, "docker unavailable")
+	}
+	ctx := context.Background()
+	dsn := startProbePostgres(t)
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if err := catalog.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	// What initdb leaves: a verifier the server salted itself, which the
+	// operator never chose and cannot reproduce from the password alone.
+	const password = "s3cret-generated-by-the-operator"
+	if _, err := conn.Exec(ctx, `ALTER ROLE `+superuserName+` PASSWORD '`+password+`'`); err != nil {
+		t.Fatal(err)
+	}
+	var server string
+	if err := conn.QueryRow(ctx, `SELECT rolpassword FROM pg_authid WHERE rolname = $1`, superuserName).Scan(&server); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := (PgxProber{}).SeedBootstrapRole(ctx, dsn, superuserName, password); err != nil {
+		t.Fatal(err)
+	}
+	var seeded string
+	if err := conn.QueryRow(ctx, `SELECT verifier FROM pgshard.roles WHERE rolname = $1`, superuserName).Scan(&seeded); err != nil {
+		t.Fatal(err)
+	}
+	if seeded != server {
+		t.Fatalf("the catalog holds a different verifier from the server, so a forwarded ClientKey cannot match:\n catalog %s\n server  %s", seeded, server)
+	}
+}
