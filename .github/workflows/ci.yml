@@ -179,6 +179,8 @@ jobs:
 
   pr-title:
     name: PR title
+    # Also in pr-title.yml, which re-checks on an edit. This copy is the one
+    # the gate can see: a job in another workflow cannot be a `needs`.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
