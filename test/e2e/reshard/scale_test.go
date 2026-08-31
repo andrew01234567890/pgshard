@@ -210,7 +210,16 @@ func (l *scaleLedger) verify(ctx context.Context, t *testing.T, acked []int64) {
 				t.Fatalf("checking %s for stray tenant %d rows: %v", g, tenant, err)
 			}
 			if stray != "0" {
-				t.Fatalf("tenant %d belongs to %s but %s holds %s of its rows: the same row is in two places", tenant, group, g, stray)
+				// Which set the stray group belongs to decides what this
+				// is. A group of the serving set holding another group's
+				// tenant is duplication. A group of a set the cutover
+				// retired is a source that kept its rows -- or one the
+				// operator has not deleted yet, which is a race in this
+				// check rather than a defect in the cutover. The message
+				// has to say which, or every occurrence has to be
+				// investigated from scratch.
+				t.Fatalf("tenant %d belongs to %s but %s holds %s of its rows: the same row is in two places (%s is %s; %s is %s)",
+					tenant, group, g, stray, g, setStateOf(ctx, t, l.c, g), group, setStateOf(ctx, t, l.c, group))
 			}
 		}
 	}
@@ -250,6 +259,22 @@ func ackedPredicate(acked []int64) string {
 // ledgerGroups lists every shard group of every set that still exists,
 // serving or not. A retired source that kept its rows is exactly the defect
 // the "nowhere else" check is looking for, so it must be asked too.
+// setStateOf reports the state of the shard set a group belongs to, so a
+// stray-rows failure says whether the group is still serving or is a
+// retired source on its way out.
+func setStateOf(ctx context.Context, t *testing.T, c *e2e.Cluster, group string) string {
+	t.Helper()
+	id, gen := group, "1"
+	if i := strings.LastIndex(group, "-g"); i >= 0 {
+		id, gen = group[:i], group[i+2:]
+	}
+	id = strings.TrimPrefix(id, "shard-")
+	st := catalogSQL(ctx, t, c, `SELECT coalesce(string_agg(ss.state || '/serving=' || s.serving_state, ','), 'unknown')
+		FROM pgshard.shard_status s JOIN pgshard.shard_sets ss ON ss.shard_set = s.shard_set
+		WHERE s.shard_id = `+id+` AND ss.generation = `+gen)
+	return st
+}
+
 func ledgerGroups(ctx context.Context, t *testing.T, c *e2e.Cluster) []string {
 	t.Helper()
 	out := catalogSQL(ctx, t, c, `SELECT coalesce(string_agg(
