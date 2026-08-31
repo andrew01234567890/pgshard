@@ -168,6 +168,15 @@ func (l *scaleLedger) verify(ctx context.Context, t *testing.T, acked []int64) {
 	// count(DISTINCT id) on the owner cannot see a twin somewhere else.
 	// Sources and retired groups are included for the same reason -- a
 	// cutover that did not clear its source leaves the row in two places.
+	// A retired set's groups and its catalog rows are removed after the
+	// workflow completes, and completion and removal are different events.
+	// Sweeping in between finds the source still holding its copy -- a
+	// split copies rather than moves, and that copy is what makes the
+	// switch reversible -- and reports rows in two places for a group on
+	// its way out. Waiting for retirement to finish also proves the
+	// operator removes what it retires, and then the sweep means what it
+	// says: a source that kept its rows is a defect.
+	waitForRetirement(ctx, t, l.c)
 	groups := ledgerGroups(ctx, t, l.c)
 	owner := map[int64]string{}
 	for _, tenant := range ledgerTenants {
@@ -254,6 +263,20 @@ func ackedPredicate(acked []int64) string {
 		fmt.Fprintf(&b, "(tenant_id = %d AND id <= %d)", tenant, acked[i])
 	}
 	return b.String()
+}
+
+// waitForRetirement waits until no shard set is left in the retired state,
+// so the "nowhere else" sweep does not race the removal of a completed
+// cutover's source.
+func waitForRetirement(ctx context.Context, t *testing.T, c *e2e.Cluster) {
+	t.Helper()
+	left := func() string {
+		return catalogSQL(ctx, t, c, `SELECT coalesce(string_agg(shard_set || '=' || state, ','), '')
+			FROM pgshard.shard_sets WHERE state = 'retired'`)
+	}
+	waitForWhy(ctx, t, c, "retired shard sets to be removed", 5*time.Minute,
+		func() string { return "still retired: " + left() },
+		func() bool { return left() == "" })
 }
 
 // ledgerGroups lists every shard group of every set that still exists,
