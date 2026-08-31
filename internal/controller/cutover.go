@@ -754,14 +754,21 @@ type poolCutoverStore struct{ c *Copier }
 
 func (s poolCutoverStore) Save(ctx context.Context, wf *copyWorkflow, message string) error {
 	patch := map[string]any{"stage": wf.stage, "cutover": wf.cutover, "message": message}
-	_, err := s.c.Pool.Exec(ctx, `UPDATE pgshard.workflows SET status = status || $2::jsonb, updated_at = now() WHERE id = $1::uuid`, wf.id, mustJSON(patch))
-	return err
+	return ownedExec(ctx, s.c.Pool, wf.owner,
+		`UPDATE pgshard.workflows SET status = status || $2::jsonb, updated_at = now()
+		 WHERE id = $1::uuid AND ($3::text IS NULL OR (owner = $3 AND state = $4))`,
+		wf.id, mustJSON(patch), nullIfEmpty(wf.owner), wf.fence)
 }
 
 func (s poolCutoverStore) Finish(ctx context.Context, wf *copyWorkflow, state, message string) error {
-	_, err := s.c.Pool.Exec(ctx, `UPDATE pgshard.workflows SET state = $2, status = status || $3::jsonb, updated_at = now() WHERE id = $1::uuid`,
-		wf.id, state, mustJSON(map[string]any{"stage": wf.stage, "cutover": wf.cutover, "message": message}))
-	return err
+	if err := ownedExec(ctx, s.c.Pool, wf.owner,
+		`UPDATE pgshard.workflows SET state = $2, status = status || $3::jsonb, updated_at = now()
+		 WHERE id = $1::uuid AND ($4::text IS NULL OR (owner = $4 AND state = $5))`,
+		wf.id, state, mustJSON(map[string]any{"stage": wf.stage, "cutover": wf.cutover, "message": message}), nullIfEmpty(wf.owner), wf.fence); err != nil {
+		return err
+	}
+	wf.fence = state
+	return nil
 }
 
 func (s poolCutoverStore) NewJournalID(ctx context.Context) (string, error) {

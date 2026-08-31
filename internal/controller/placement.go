@@ -96,6 +96,11 @@ type placementWorkflow struct {
 	stage string
 	spec  placementSpec
 	st    placementState
+	// owner is this pass's claim on the workflow and fence the state it
+	// started from; every write it makes requires both to still hold, so a
+	// workflow taken over stops the old pass instead of racing the new one.
+	owner string
+	fence string
 	rt    *placementRouter
 	from  *placementRouter
 	shape rowShape
@@ -130,6 +135,12 @@ type Placer struct {
 	// released pauses fail the workflow.
 	BufferTimeout  time.Duration
 	BufferAttempts int
+	// OwnerLease is how long this replica's claim on a workflow stands
+	// without being refreshed; zero means DefaultOwnerLease. Replica
+	// identifies this process in a claim; zero means a token generated
+	// once per process.
+	OwnerLease time.Duration
+	Replica    string
 	// DropOldAfter is the grace before the old tables drop.
 	DropOldAfter time.Duration
 	// CopyBatch is the keyset page of the initial copy.
@@ -219,6 +230,14 @@ func (p *Placer) Pass(ctx context.Context) (PlacementOutcome, error) {
 	}
 	for i := range wfs {
 		wf := &wfs[i]
+		var err error
+		var held bool
+		if wf.owner, held, err = claimWorkflow(ctx, p.Pool, p.Replica, wf.id, p.OwnerLease); err != nil {
+			return out, err
+		} else if !held {
+			continue
+		}
+		wf.fence = wf.state
 		out.Driven++
 		advanced, err := p.drive(ctx, wf)
 		if advanced {
@@ -233,16 +252,23 @@ func (p *Placer) Pass(ctx context.Context) (PlacementOutcome, error) {
 		if err == nil {
 			continue
 		}
+		if errors.Is(err, errNotOwner) {
+			p.logger().Info("table placement pass handed over", "workflow", wf.id, "table", wf.spec.table())
+			continue
+		}
 		if isFatal(err) {
 			out.Failed++
 			p.logger().Error("table placement failed", "workflow", wf.id, "table", wf.spec.table(), "err", err)
 			if ferr := p.fail(ctx, wf, err); ferr != nil {
+				if errors.Is(ferr, errNotOwner) {
+					continue
+				}
 				return out, ferr
 			}
 			continue
 		}
 		p.logger().Warn("table placement pass incomplete", "workflow", wf.id, "table", wf.spec.table(), "err", err)
-		if serr := p.save(ctx, wf, err.Error()); serr != nil {
+		if serr := p.save(ctx, wf, err.Error()); serr != nil && !errors.Is(serr, errNotOwner) {
 			return out, serr
 		}
 	}
@@ -284,8 +310,14 @@ func (p *Placer) list(ctx context.Context) ([]placementWorkflow, error) {
 
 func (p *Placer) save(ctx context.Context, wf *placementWorkflow, message string) error {
 	patch := map[string]any{"stage": wf.stage, "placement": wf.st, "message": message}
-	_, err := p.Pool.Exec(ctx, `UPDATE pgshard.workflows SET state = $2, status = status || $3::jsonb, updated_at = now() WHERE id = $1::uuid`, wf.id, wf.state, mustJSON(patch))
-	return err
+	if err := ownedExec(ctx, p.Pool, wf.owner,
+		`UPDATE pgshard.workflows SET state = $2, status = status || $3::jsonb, updated_at = now()
+		 WHERE id = $1::uuid AND ($4::text IS NULL OR (owner = $4 AND state = $5))`,
+		wf.id, wf.state, mustJSON(patch), nullIfEmpty(wf.owner), wf.fence); err != nil {
+		return err
+	}
+	wf.fence = wf.state
+	return nil
 }
 
 func (p *Placer) finish(ctx context.Context, wf *placementWorkflow, state, message string) error {
@@ -309,14 +341,23 @@ func (p *Placer) fail(ctx context.Context, wf *placementWorkflow, cause error) e
 		return err
 	}
 	wf.stage, wf.state = StageFailed, StateFailed
-	_, err := p.Pool.Exec(ctx, `UPDATE pgshard.workflows SET state = $2, error = $3, status = status || $4::jsonb, updated_at = now() WHERE id = $1::uuid`,
-		wf.id, StateFailed, cause.Error(), mustJSON(map[string]any{"stage": StageFailed, "placement": wf.st, "message": cause.Error()}))
-	return err
+	if err := ownedExec(ctx, p.Pool, wf.owner,
+		`UPDATE pgshard.workflows SET state = $2, error = $3, status = status || $4::jsonb, updated_at = now()
+		 WHERE id = $1::uuid AND ($5::text IS NULL OR (owner = $5 AND state = $6))`,
+		wf.id, StateFailed, cause.Error(), mustJSON(map[string]any{"stage": StageFailed, "placement": wf.st, "message": cause.Error()}),
+		nullIfEmpty(wf.owner), wf.fence); err != nil {
+		return err
+	}
+	wf.fence = wf.state
+	return nil
 }
 
 // drive advances one workflow by one pass; it reports whether the stage
 // changed.
 func (p *Placer) drive(ctx context.Context, wf *placementWorkflow) (bool, error) {
+	if err := checkOwner(ctx, p.Pool, wf.id, wf.owner); err != nil {
+		return false, err
+	}
 	if wf.stage == "" {
 		wf.stage = StagePlacementPreparing
 	}
