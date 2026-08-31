@@ -41,3 +41,36 @@ func TestVerifyDetailSeparatesForeignRowsFromDisagreement(t *testing.T) {
 		}
 	})
 }
+
+// TestSourcesMovedMessageSeparatesAFenceLeakFromDisagreement: a target
+// holding more than its sources predict cannot happen while the fence
+// holds, because replication only carries rows the sources have. So the
+// re-read decides which bug it is, and a failed cutover's status is all
+// anyone gets afterwards -- it has to say which.
+func TestSourcesMovedMessageSeparatesAFenceLeakFromDisagreement(t *testing.T) {
+	was := rowDigest{Rows: 1730, Hash: -59913961284}
+
+	still := sourcesMovedMessage(was, was)
+	if !strings.Contains(still, "the target and its sources disagree") {
+		t.Errorf("an unchanged re-read must name the disagreement: %q", still)
+	}
+	if strings.Contains(still, "fence") {
+		t.Errorf("an unchanged re-read must not blame the fence: %q", still)
+	}
+
+	moved := sourcesMovedMessage(rowDigest{Rows: 1740, Hash: -58625136507}, was)
+	if !strings.Contains(moved, "the fence did not hold") {
+		t.Errorf("a moved re-read must name the fence: %q", moved)
+	}
+	for _, want := range []string{"1740", "-58625136507"} {
+		if !strings.Contains(moved, want) {
+			t.Errorf("the new prediction is the evidence and must be in the message; %q lacks %s", moved, want)
+		}
+	}
+
+	// A hash that changed without the count changing is still movement:
+	// an UPDATE replicates as well as an INSERT.
+	if got := sourcesMovedMessage(rowDigest{Rows: was.Rows, Hash: was.Hash + 1}, was); !strings.Contains(got, "did not hold") {
+		t.Errorf("a changed hash at the same count is movement too: %q", got)
+	}
+}

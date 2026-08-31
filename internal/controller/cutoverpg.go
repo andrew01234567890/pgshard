@@ -541,6 +541,15 @@ func (o *pgCutover) Verify(ctx context.Context) (VerifyReport, error) {
 							}
 							detail = verifyDetail(got, want, inRange)
 						}
+						// Verify runs under the fence so both sides are
+						// still, and a target holding MORE than its sources
+						// predict cannot happen while that is true --
+						// replication only carries rows the sources have.
+						// So read the sources again: if the prediction has
+						// moved, they were writing during the verify and
+						// the fence was not holding, which is a different
+						// bug from the two sides genuinely disagreeing.
+						detail += o.sourcesMovedSince(ctx, db, schema, name, hashes[key], i, want)
 						report.Mismatches = append(report.Mismatches, fmt.Sprintf("%s.%s on %s/%d: %d rows hash %d, sources predict %d rows hash %d%s",
 							db.name, key, o.wf.set, t, got.Rows, got.Hash, want.Rows, want.Hash, detail))
 					}
@@ -554,6 +563,41 @@ func (o *pgCutover) Verify(ctx context.Context) (VerifyReport, error) {
 		}
 	}
 	return report, nil
+}
+
+// sourcesMovedSince re-reads the prediction for one table and target after a
+// mismatch, and says whether it changed. It runs only on the failing path,
+// where one more read is worth having: a prediction that moves between the
+// first read and this one is a fence that did not hold, and a prediction
+// that stands is the target and its sources genuinely disagreeing. The
+// difference decides which bug is being looked at, and the status of a
+// failed cutover is all anyone gets afterwards.
+func (o *pgCutover) sourcesMovedSince(ctx context.Context, db dbPlan, schema, name, hash string, i int, was rowDigest) string {
+	if hash == "" {
+		return ""
+	}
+	var now rowDigest
+	for _, s := range o.srcIDs {
+		conn, err := o.c.Shards.DialDatabase(ctx, o.srcSet, s, db.name)
+		if err != nil {
+			return fmt.Sprintf("; the sources could not be re-read (%v), so whether they moved during the verify is unknown", err)
+		}
+		d, err := digest(ctx, conn, schema, name, RangeFilter(hash, o.wf.ranges[i]))
+		_ = conn.Close(ctx)
+		if err != nil {
+			return fmt.Sprintf("; the sources could not be re-read (%v), so whether they moved during the verify is unknown", err)
+		}
+		now = now.add(d)
+	}
+	return sourcesMovedMessage(now, was)
+}
+
+// sourcesMovedMessage names which of the two the re-read showed.
+func sourcesMovedMessage(now, was rowDigest) string {
+	if now == was {
+		return "; the sources read the same again, so they were still: the target and its sources disagree"
+	}
+	return fmt.Sprintf("; the sources now predict %d rows hash %d, so they were still being written during the verify and the fence did not hold", now.Rows, now.Hash)
 }
 
 // Reverse creates, per database, a publication per source on every target
