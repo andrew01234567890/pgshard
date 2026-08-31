@@ -467,14 +467,17 @@ func (c *Copier) databases(ctx context.Context) ([]dbPlan, error) {
 	if err != nil {
 		return nil, err
 	}
+	// One read for every database's tables rather than one per database:
+	// this runs on every pass of every active workflow, whether or not the
+	// declarations changed.
+	byDatabase, err := catalog.ListTablesByDatabase(ctx, c.Pool)
+	if err != nil {
+		return nil, err
+	}
 	var out []dbPlan
 	for _, d := range dbs {
 		p := dbPlan{name: d.Name, home: d.HomeShard}
-		tables, err := catalog.ListTables(ctx, c.Pool, d.Name)
-		if err != nil {
-			return nil, err
-		}
-		for _, t := range tables {
+		for _, t := range byDatabase[d.Name] {
 			switch t.Placement {
 			case "sharded":
 				p.sharded = append(p.sharded, t)
