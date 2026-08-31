@@ -75,6 +75,10 @@ actionlint:
 	hack/ci/test-retry.sh
 	hack/e2e/test-suites.sh
 
+migration-check:
+	hack/test-check-migration-numbers.sh
+	hack/check-migration-numbers.sh
+
 clean:
 	rm -rf bin dist
 

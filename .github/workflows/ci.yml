@@ -53,6 +53,11 @@ jobs:
       - run: make fmt-check
       - run: make vet
       - run: make lint
+      - name: Migration numbers do not collide with the base branch
+        run: |
+          git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.ref || github.ref_name }}"
+          hack/test-check-migration-numbers.sh
+          hack/check-migration-numbers.sh FETCH_HEAD
       - run: make mod-check
       - run: make vendor-check
       - run: make test
