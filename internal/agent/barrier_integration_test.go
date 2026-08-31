@@ -15,6 +15,7 @@ import (
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
+	"github.com/andrew01234567890/pgshard/internal/twopc"
 )
 
 // TestRestoreReconciliationMatrix restores one shard to restore points
@@ -109,7 +110,11 @@ func TestRestoreReconciliationMatrix(t *testing.T) {
 	if err != nil || decisions.GetError() != nil || len(decisions.GetDecisions()) != 2 {
 		t.Fatalf("ListTransactionDecisions: %v %v", err, decisions)
 	}
-	if d := decisions.GetDecisions()[1]; d.GetGid() != "pgshard-z" || d.GetState() != "abort" || !slices.Equal(d.GetParticipants(), []int32{0, 1}) || !slices.Equal(d.GetParticipantXids(), []string{xidW, "7"}) {
+	if d := decisions.GetDecisions()[1]; d.GetGid() != "pgshard-z" || d.GetState() != pgshardv1.TransactionDecisionState_TRANSACTION_DECISION_STATE_ABORT ||
+		!slices.EqualFunc(d.GetParticipants(), []twopc.Participation{{Shard: 0, XID: xidW}, {Shard: 1, XID: "7"}},
+			func(got *pgshardv1.TransactionParticipant, want twopc.Participation) bool {
+				return got.GetShardId() == want.Shard && got.GetXid() == want.XID
+			}) {
 		t.Fatalf("decision %v", d)
 	}
 	epoch := p.status().GetEpoch()
@@ -130,10 +135,10 @@ func TestRestoreReconciliationMatrix(t *testing.T) {
 	}
 
 	log := []*pgshardv1.TransactionDecision{
-		{Gid: "pgshard-x", State: "commit", Participants: []int32{0}, ParticipantXids: []string{xidX}},
-		{Gid: "pgshard-z", State: "abort", Participants: []int32{0}},
-		{Gid: "pgshard-w", State: "commit", Participants: []int32{0}, ParticipantXids: []string{xidW}},
-		{Gid: "pgshard-elsewhere", State: "commit", Participants: []int32{1}, ParticipantXids: []string{"5"}},
+		twopc.DecisionToProto(twopc.Decision{GID: "pgshard-x", State: twopc.StateCommit, Participants: []twopc.Participation{{Shard: 0, XID: xidX}}}),
+		twopc.DecisionToProto(twopc.Decision{GID: "pgshard-z", State: twopc.StateAbort, Participants: []twopc.Participation{{Shard: 0}}}),
+		twopc.DecisionToProto(twopc.Decision{GID: "pgshard-w", State: twopc.StateCommit, Participants: []twopc.Participation{{Shard: 0, XID: xidW}}}),
+		twopc.DecisionToProto(twopc.Decision{GID: "pgshard-elsewhere", State: twopc.StateCommit, Participants: []twopc.Participation{{Shard: 1, XID: "5"}}}),
 	}
 	reconcile := func(n *node) *pgshardv1.ReconcilePreparedTransactionsResponse {
 		t.Helper()
