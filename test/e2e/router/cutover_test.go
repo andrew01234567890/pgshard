@@ -4,6 +4,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
@@ -226,11 +228,24 @@ func (s *cutoverStack) driveUntil(t *testing.T, id, wantStage string, timeout ti
 type transferLoad struct {
 	commits atomic.Int64
 	fails   atomic.Int64
-	mu      sync.Mutex
-	errs    map[string]int
-	errAt   []time.Time
-	stop    chan struct{}
-	wg      sync.WaitGroup
+	// paused counts transfers the router refused with 57P03 and the
+	// worker retried, which is what a client is told to do.
+	paused atomic.Int64
+	mu     sync.Mutex
+	errs   map[string]int
+	errAt  []time.Time
+	stop   chan struct{}
+	wg     sync.WaitGroup
+}
+
+// isWritePause reports the router's own answer to a write that met a
+// cluster write pause: 57P03, cannot_connect_now, which carries a hint to
+// retry. PostgreSQL's 25006 is not it -- that is a pause reaching a backend
+// the router thought was writable, and it tells the client nothing about
+// retrying, so it stays a failure here.
+func isWritePause(err error) bool {
+	var pe *pgconn.PgError
+	return errors.As(err, &pe) && pe.Code == "57P03"
 }
 
 func (s *cutoverStack) startLoad(t *testing.T, workers int) *transferLoad {
@@ -265,6 +280,21 @@ func (s *cutoverStack) startLoad(t *testing.T, workers int) *transferLoad {
 					}
 				}
 				if err != nil {
+					// A transfer writes to two accounts, so it spans two
+					// shards. A cutover pause that arrives between them
+					// refuses the second shard at once rather than
+					// buffering: buffering inside an open transaction
+					// would hold it in front of the drain the cutover is
+					// waiting on. The router says so with 57P03 and a
+					// hint to retry, and a client that retries loses
+					// nothing -- so the workload retries, and a lost
+					// transfer still counts as a failure.
+					if isWritePause(err) {
+						l.paused.Add(1)
+						i--
+						time.Sleep(50 * time.Millisecond)
+						continue
+					}
 					l.fails.Add(1)
 					l.mu.Lock()
 					l.errs[err.Error()]++
@@ -350,7 +380,7 @@ func TestReshardCutoverUnderLoad(t *testing.T) {
 	}
 	_, _, status := s.workflow(t, id)
 	pause := queryInt(t, s.catalog, `SELECT (status->'cutover'->>'pause_ms')::bigint FROM pgshard.workflows WHERE id = $1::uuid`, id)
-	t.Logf("cutover pause %dms; %s", pause, status)
+	t.Logf("cutover pause %dms, %d transfers retried through it; %s", pause, load.paused.Load(), status)
 	for _, at := range load.errAt {
 		t.Logf("error at %s", at.Format(time.RFC3339Nano))
 	}
