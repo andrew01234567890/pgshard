@@ -111,8 +111,15 @@ the rest with `0A000`. See *Routing* below.
   a batch that binds without parsing it — carried rather than pinned, since
   pinning would cost every such session its transaction pooling),
   `SET LOCAL` is honoured only within its transaction,
-  and advisory locks, `LISTEN` (refused) and temporary tables (refused) do
-  not survive a release.
+  and `LISTEN` and temporary tables (both refused) do not survive a
+  release. **Session advisory locks are refused** (`0A000`): PostgreSQL
+  keeps one until it is unlocked or the session ends, but the backend
+  holding it does not stay with the session, so granting one would leave
+  it on a backend another session goes on to use — and two clients would
+  each believe they held it, which for leader election or a migration
+  means both proceed. The transaction-scoped forms
+  (`pg_advisory_xact_lock` and friends) are allowed: the transaction is
+  already pinned to one backend and PostgreSQL releases them with it.
 - **Cancel grace.** A cancelled statement is drained to `ReadyForQuery` so
   the stream stays in sync, but only for 5s. The cancel is best-effort —
   it can fail, and a backend can be wedged somewhere PostgreSQL will not
@@ -709,8 +716,8 @@ expiry / cap) and each outcome end to end (held select, `40001`, `53300`,
 `08006`, `57014` while buffered); and the peer target selection and rate
 limit in `cancelpeer`. `go test -tags integration ./test/e2e/router/` builds the pooler and
 router, starts a catalog and a shard in Docker, bootstraps them and runs
-DDL/DML, prepared statements, rollback, replay-after-release (proved with an
-advisory lock the release drops), COPY, cancel (`57014`), `28P01`, `3D000`,
+DDL/DML, prepared statements, rollback, replay-after-release, the refusal
+of session advisory locks, COPY, cancel (`57014`), `28P01`, `3D000`,
 `0A000` and psql. `TestRouterShardedRouting` adds a second shard container
 and pooler, declares a sharded table in the catalog and proves through
 direct connections to each PostgreSQL that keyed inserts, selects, updates

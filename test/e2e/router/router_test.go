@@ -81,21 +81,13 @@ func TestRouterSingleShard(t *testing.T) {
 		if _, err := conn.Exec(ctx, "set application_name to 'router-e2e'"); err != nil {
 			t.Fatal(err)
 		}
-		// A session advisory lock is dropped by the pooler's DISCARD ALL on
-		// Release but is not part of the replayed state, so it proves the
-		// backend really was released while application_name proves replay.
-		if _, err := conn.Exec(ctx, "select pg_advisory_lock(4242)"); err != nil {
-			t.Fatal(err)
-		}
-		admin, err := pgx.Connect(ctx, strings.Replace(s.shardDSN, "/postgres?", "/"+appDatabase+"?", 1))
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() { _ = admin.Close(ctx) }()
-		var free bool
-		if err := admin.QueryRow(ctx, "select pg_try_advisory_lock(4242)").Scan(&free); err != nil || free {
-			t.Fatalf("lock should be held by the router session: %v %v", free, err)
-		}
+		// This used to take a session advisory lock and assert it was gone
+		// after a transaction, as proof the backend had been released.
+		// That is the defect, not a probe: PostgreSQL keeps a session
+		// advisory lock until it is unlocked or the session ends, so a
+		// test asserting it vanishes was asserting that pgshard breaks
+		// the guarantee. The router refuses the session-scoped forms now,
+		// and the pooler's own tests cover backend release.
 		tx, err := conn.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)
@@ -107,8 +99,26 @@ func TestRouterSingleShard(t *testing.T) {
 		if err := conn.QueryRow(ctx, "select current_setting('application_name')").Scan(&v); err != nil || v != "router-e2e" {
 			t.Fatalf("application_name after release: %q %v", v, err)
 		}
-		if err := admin.QueryRow(ctx, "select pg_try_advisory_lock(4242)").Scan(&free); err != nil || !free {
-			t.Fatalf("lock should have been released with the backend: %v %v", free, err)
+	})
+
+	t.Run("session_advisory_lock_refused", func(t *testing.T) {
+		// A lock the router cannot keep is refused rather than granted: the
+		// backend holding it does not stay with the session, so a second
+		// client would be told it holds the same lock. The transaction
+		// form is pinned to the transaction and means what it says.
+		for _, sql := range []string{"select pg_advisory_lock(4242)", "select pg_try_advisory_lock(4242)", "select pg_advisory_unlock_all()"} {
+			if _, err := conn.Exec(ctx, sql); sqlstate(err) != "0A000" {
+				t.Fatalf("%s: %v, want a 0A000 refusal", sql, err)
+			}
+		}
+		tx, err := conn.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		var got bool
+		if err := tx.QueryRow(ctx, "select pg_try_advisory_xact_lock(4242)").Scan(&got); err != nil || !got {
+			t.Fatalf("a transaction advisory lock must still work: %v %v", got, err)
 		}
 	})
 
