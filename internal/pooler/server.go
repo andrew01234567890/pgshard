@@ -130,15 +130,24 @@ func (s *Server) Register(g *grpc.Server) { pgshardv1.RegisterPoolerServer(g, s)
 
 var errUnavailable = status.Error(codes.Unavailable, "pooler is draining")
 
-func (s *Server) session(id string) *session {
+// session returns the session for id, creating it when there is none, and
+// applies mutate to it under the same lock. The mutation belongs inside:
+// a caller that looked up first and mutated afterwards could be writing to
+// an entry a detach had already forgotten, while another Execute stream
+// registered a replacement under the same id -- and would be told its
+// session was reserved while the registered one was not.
+func (s *Server) session(id string, mutate func(*session)) *session {
 	s.expireReservations(time.Now())
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if se, ok := s.sessions[id]; ok {
-		return se
+	se, ok := s.sessions[id]
+	if !ok {
+		se = &session{id: id}
+		s.sessions[id] = se
 	}
-	se := &session{id: id}
-	s.sessions[id] = se
+	if mutate != nil {
+		mutate(se)
+	}
 	return se
 }
 
@@ -685,18 +694,17 @@ func (s *Server) Reserve(_ context.Context, req *pgshardv1.ReserveRequest) (*pgs
 	if req.SessionId == "" {
 		return nil, status.Error(codes.InvalidArgument, "session_id is required")
 	}
-	se := s.session(req.SessionId)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	se.reserved = true
-	if !se.attached {
-		se.detachedAt = time.Now()
-		s.noteExpiry(se.detachedAt)
-	}
 	var pid int32
-	if se.b != nil {
-		pid = int32(se.b.pid)
-	}
+	s.session(req.SessionId, func(se *session) {
+		se.reserved = true
+		if !se.attached {
+			se.detachedAt = time.Now()
+			s.noteExpiry(se.detachedAt)
+		}
+		if se.b != nil {
+			pid = int32(se.b.pid)
+		}
+	})
 	return &pgshardv1.ReserveResponse{BackendPid: pid}, nil
 }
 
