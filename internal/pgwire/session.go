@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"sort"
 	"sync"
@@ -33,6 +35,12 @@ type session struct {
 	conn   net.Conn
 	reader *bufio.Reader
 	be     *pgproto3.Backend
+
+	// rows holds DataRow frames encoded for this session, and beDirty says
+	// the pgproto3 backend has bytes of its own waiting. At most one of the
+	// two is non-empty at a time; see sendMsg.
+	rows    []byte
+	beDirty bool
 
 	protocolVersion uint32
 	info            SessionInfo
@@ -89,15 +97,93 @@ func (s *session) resetIO(conn net.Conn) {
 
 func (s *session) send(msgs ...pgproto3.BackendMessage) error {
 	for _, m := range msgs {
-		s.be.Send(m)
+		if err := s.sendMsg(m); err != nil {
+			return err
+		}
 	}
 	return s.flush()
 }
 
-// flush writes the backend buffer and forgets what it owed.
+// maxRowSlab bounds what a session keeps between results. Rows are encoded
+// into a slab so they do not pass through pgproto3's write buffer, which is
+// thrown away above a kilobyte on every flush; keeping the slab is the point
+// of it, and keeping an arbitrarily large one would trade a copy for
+// resident memory on every session that ever returned a wide result.
+const maxRowSlab = 64 << 10
+
+// sendMsg buffers one message for the client, after anything already
+// encoded into the row slab.
+//
+// Only one of the two buffers may hold pending bytes at a time, and that is
+// what keeps the order: a message sent while rows are pending writes the
+// rows first, and a row appended while the backend has something buffered
+// flushes the backend first. Nothing else may call s.be.Send once a session
+// is serving results.
+func (s *session) sendMsg(m pgproto3.BackendMessage) error {
+	if err := s.writeRows(); err != nil {
+		return err
+	}
+	s.be.Send(m)
+	s.beDirty = true
+	return nil
+}
+
+// appendRow encodes a DataRow into the slab: 'D', the frame length, the
+// column count, then a length and the bytes of each column, with -1 for a
+// NULL. pgproto3 builds the same frame, but through a buffer it discards
+// above 1 KiB, so every result over a kilobyte grew and copied its way back
+// up on every batch.
+func (s *session) appendRow(values [][]byte) error {
+	if s.beDirty {
+		if err := s.flushBackend(); err != nil {
+			return err
+		}
+	}
+	n := 6
+	for _, v := range values {
+		n += 4 + len(v)
+	}
+	s.rows = append(s.rows, 'D')
+	s.rows = binary.BigEndian.AppendUint32(s.rows, uint32(n))
+	s.rows = binary.BigEndian.AppendUint16(s.rows, uint16(len(values)))
+	for _, v := range values {
+		if v == nil {
+			s.rows = binary.BigEndian.AppendUint32(s.rows, math.MaxUint32) // -1
+			continue
+		}
+		s.rows = binary.BigEndian.AppendUint32(s.rows, uint32(len(v)))
+		s.rows = append(s.rows, v...)
+	}
+	return nil
+}
+
+// writeRows puts the encoded rows on the wire and keeps the slab, unless it
+// has grown past what a session should hold on to.
+func (s *session) writeRows() error {
+	if len(s.rows) == 0 {
+		return nil
+	}
+	_, err := s.conn.Write(s.rows)
+	if cap(s.rows) > maxRowSlab {
+		s.rows = nil
+	} else {
+		s.rows = s.rows[:0]
+	}
+	return err
+}
+
+func (s *session) flushBackend() error {
+	s.beDirty = false
+	return s.be.Flush()
+}
+
+// flush writes everything pending and forgets what it owed.
 func (s *session) flush() error {
 	s.queued = 0
-	return s.be.Flush()
+	if err := s.writeRows(); err != nil {
+		return err
+	}
+	return s.flushBackend()
 }
 
 func (s *session) close() {
