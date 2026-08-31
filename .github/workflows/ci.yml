@@ -53,6 +53,7 @@ jobs:
       - run: make fmt-check
       - run: make vet
       - run: make lint
+      - run: make mod-check
       - run: make test
       - run: make build
 

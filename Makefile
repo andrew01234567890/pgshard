@@ -50,6 +50,14 @@ proto-drift: proto
 		echo "internal/gen is out of date; run 'make proto' and commit the result"; exit 1; \
 	fi
 
+# mod-check keeps the module graph honest: verify proves the downloaded
+# sources match go.sum, and tidy -diff fails on a go.mod that does not match
+# what the code imports -- a direct dependency left marked indirect, or an
+# indirect one that has become direct.
+mod-check:
+	go mod verify
+	go mod tidy -diff
+
 govulncheck:
 	govulncheck ./...
 
@@ -118,6 +126,7 @@ ENVTEST_K8S_VERSION    ?= 1.34
 ENVTEST_ASSETS_DIR     ?= $(CURDIR)/bin/k8s
 CONTROLLER_GEN          = go run sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION)
 
+.PHONY: mod-check
 .PHONY: generate manifests envtest-assets envtest
 
 generate:
