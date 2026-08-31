@@ -9,6 +9,44 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
 )
 
+// reservedRoles are the cluster's own roles. A client that could create,
+// alter, drop or grant one would be renaming a piece of the control plane:
+// the shards would get a role of the client's making under a name the
+// catalog reserves for its own, and a later membership grant would be
+// applied to the catalog's real role by the controller's identity.
+var reservedRoles = map[string]bool{
+	catalog.RoleSystem: true,
+	catalog.RoleAdmin:  true,
+	catalog.RoleReader: true,
+	catalog.RouterRole: true,
+	"pgshard_ddl":      true,
+}
+
+// checkRoleName refuses a role name the cluster reserves for itself, and
+// any name in that namespace, so a role added to the control plane later
+// is covered without this list being remembered.
+func checkRoleName(name string) error {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if !reservedRoles[n] && !strings.HasPrefix(n, "pgshard_") {
+		return nil
+	}
+	return notYet("role "+name+" is reserved by pgshard",
+		"choose a name outside the pgshard_ namespace; the cluster's own roles are managed by the operator")
+}
+
+// checkRoleNames refuses any reserved name among several.
+func checkRoleNames(names ...string) error {
+	for _, n := range names {
+		if n == "" {
+			continue
+		}
+		if err := checkRoleName(n); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // roleAttributes reads the attribute options of CREATE/ALTER ROLE and
 // refuses the ones the cluster does not hand out (superuser, replication,
 // bypassrls): they would give a client role rights on every shard's server.
@@ -93,6 +131,12 @@ func (w *walker) grantRole(g *pgquerypb.GrantRoleStmt) error {
 	}
 	for _, r := range g.GetGrantedRoles() {
 		for _, m := range g.GetGranteeRoles() {
+			// Both sides: granting a reserved role hands out the control
+			// plane's own rights, and granting anything TO one changes what
+			// the cluster's own role can do.
+			if err := checkRoleNames(r.GetAccessPriv().GetPrivName(), m.GetRoleSpec().GetRolename()); err != nil {
+				return err
+			}
 			ms := catalog.RoleMembership{Role: r.GetAccessPriv().GetPrivName(), Member: m.GetRoleSpec().GetRolename()}
 			if g.GetIsGrant() {
 				ms.Admin = admin

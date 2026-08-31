@@ -548,6 +548,13 @@ func (w *walker) grant(g *pgquerypb.GrantStmt) error {
 		return notYet("ALTER DEFAULT PRIVILEGES is not available through the router",
 			"default ACLs are recorded per creating role and schema; GRANT on the objects after creating them")
 	}
+	// A grant to one of the cluster's own roles changes what the control
+	// plane itself may do on every shard.
+	for _, r := range g.GetGrantees() {
+		if err := checkRoleName(r.GetRoleSpec().GetRolename()); err != nil {
+			return err
+		}
+	}
 	rc := &catalog.RoleChanges{}
 	if g.GetIsGrant() {
 		rc.Grants = grantChanges(g)
@@ -580,6 +587,9 @@ func (w *walker) grant(g *pgquerypb.GrantStmt) error {
 // createRole replaces a plaintext PASSWORD by its SCRAM verifier so every
 // shard stores the same verifier and the catalog can mirror it.
 func (w *walker) createRole(raw *pgquerypb.RawStmt, s *pgquerypb.CreateRoleStmt) error {
+	if err := checkRoleName(s.GetRole()); err != nil {
+		return err
+	}
 	m := Migration{Kind: "CREATE ROLE", Scope: ScopeAll, Role: s.GetRole(), RoleOp: "create",
 		Object: ObjectRef{Kind: "role", Name: s.GetRole(), Expect: objectPresent}}
 	attrs, err := roleAttributes(s.GetOptions())
@@ -605,6 +615,9 @@ func (w *walker) createRole(raw *pgquerypb.RawStmt, s *pgquerypb.CreateRoleStmt)
 }
 
 func (w *walker) alterRole(raw *pgquerypb.RawStmt, s *pgquerypb.AlterRoleStmt) error {
+	if err := checkRoleName(s.GetRole().GetRolename()); err != nil {
+		return err
+	}
 	m := Migration{Kind: "ALTER ROLE", Scope: ScopeAll, Role: s.GetRole().GetRolename(), RoleOp: "alter"}
 	attrs, err := roleAttributes(s.GetOptions())
 	if err != nil {
@@ -624,7 +637,11 @@ func (w *walker) alterRole(raw *pgquerypb.RawStmt, s *pgquerypb.AlterRoleStmt) e
 func (w *walker) dropRole(s *pgquerypb.DropRoleStmt) error {
 	m := Migration{Kind: "DROP ROLE", Scope: ScopeAll, RoleOp: "drop", Roles: &catalog.RoleChanges{}}
 	for _, r := range s.GetRoles() {
-		m.Roles.DropRoles = append(m.Roles.DropRoles, r.GetRoleSpec().GetRolename())
+		name := r.GetRoleSpec().GetRolename()
+		if err := checkRoleName(name); err != nil {
+			return err
+		}
+		m.Roles.DropRoles = append(m.Roles.DropRoles, name)
 	}
 	if len(m.Roles.DropRoles) == 1 {
 		m.Role = m.Roles.DropRoles[0]
