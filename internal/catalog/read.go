@@ -307,6 +307,25 @@ func ReadWriteFence(ctx context.Context, q Querier) (WriteFence, error) {
 // disturb one a barrier is holding.
 var ErrFenceOwned = errors.New("the write fence is held by a running barrier; only its owner may change it")
 
+// ClearWriteFenceAfterRestore drops the fence and its owner together.
+//
+// SetWriteFence refuses to touch a fence an owner holds, which is right for
+// a live cluster: clearing one mid-barrier opens writes the barrier is
+// holding shut. A restored catalog is the case that rule cannot see. The
+// certified restore point is taken while the barrier holds the fence --
+// Barrier.run raises it, then creates the point on every group -- so the
+// restored row carries an owner naming a barrier that finished before the
+// backup was even restored, and can never come back to release it.
+//
+// Only the restore path may use this, and it names its own caller: every
+// other writer goes through SetWriteFence and stays subject to the owner.
+func ClearWriteFenceAfterRestore(ctx context.Context, q Execer) error {
+	_, err := q.Exec(ctx, `UPDATE pgshard.shard_map_generation
+		SET write_fence = false, write_fence_reason = '', write_fence_owner = '',
+		    write_fenced_at = NULL, updated_at = now()`)
+	return err
+}
+
 // SetWriteFence raises or releases the write fence; the change notifies
 // routers through ServingChannel.
 //

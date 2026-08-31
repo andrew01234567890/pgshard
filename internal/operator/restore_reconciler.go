@@ -44,9 +44,11 @@ type RestoreReconciler struct {
 	Now      func() time.Time
 }
 
-// BarrierCertifier reports whether a barrier of that name was certified.
+// BarrierCertifier reports whether a barrier of that name was certified,
+// and lifts the fence a restored catalog came back holding.
 type BarrierCertifier interface {
 	CertifiedBarrier(ctx context.Context, dsn, password, name string) (bool, error)
+	ClearWriteFenceAfterRestore(ctx context.Context, dsn, password string) error
 }
 
 // SetupWithManager registers the reconciler; clusters created by a restore
@@ -491,7 +493,7 @@ func (r *RestoreReconciler) reconcileTwoPhase(ctx context.Context, rs *pgshardv1
 		return nil
 	}
 	groups := Groups(c)
-	catalogAddr, catalogEpoch, err := r.primaryAgent(ctx, c, groups[0])
+	catalogAddr, _, err := r.primaryAgent(ctx, c, groups[0])
 	if err != nil {
 		return err
 	}
@@ -524,7 +526,16 @@ func (r *RestoreReconciler) reconcileTwoPhase(ctx context.Context, rs *pgshardv1
 		rs.Status.Error = fmt.Sprintf("two-phase reconciliation found %d unresolved commit(s), the cluster stays fenced: %s", len(blockers), strings.Join(blockers, "; "))
 		return nil
 	}
-	if err := r.TwoPC.SetWriteFence(ctx, catalogAddr, catalogEpoch, false, ""); err != nil {
+	// Straight to the catalog, not through the agent RPC: a catalog
+	// restored to a certified barrier comes back holding that barrier's
+	// fence owner -- the restore point is taken while the fence is up --
+	// and the agent's SetWriteFence refuses to touch a fence it does not
+	// own, which would leave the restored cluster fenced for good.
+	password, perr := r.superuserPassword(ctx, c)
+	if perr != nil {
+		return fmt.Errorf("read superuser secret to release the write fence: %w", perr)
+	}
+	if err := r.Barriers.ClearWriteFenceAfterRestore(ctx, CatalogDSN(c), password); err != nil {
 		return fmt.Errorf("release write fence: %w", err)
 	}
 	st.Unfenced = true

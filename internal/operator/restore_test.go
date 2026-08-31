@@ -362,11 +362,24 @@ type fakeCertifier struct {
 	err       error
 	asked     string
 	password  string
+	// unfenced records that the restore lifted the fence through the
+	// catalog rather than the owner-gated agent RPC; unfenceErr makes that
+	// call fail, as a catalog that is not reachable yet would.
+	unfenced   int
+	unfenceErr error
 }
 
 func (f *fakeCertifier) CertifiedBarrier(_ context.Context, _, password, name string) (bool, error) {
 	f.asked, f.password = name, password
 	return f.certified, f.err
+}
+
+func (f *fakeCertifier) ClearWriteFenceAfterRestore(_ context.Context, _, _ string) error {
+	if f.unfenceErr != nil {
+		return f.unfenceErr
+	}
+	f.unfenced++
+	return nil
 }
 
 // TestRestoreRefusesAnUncertifiedBarrier: a barrier attempt that created the
