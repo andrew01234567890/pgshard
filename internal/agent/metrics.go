@@ -27,7 +27,9 @@ func pollMetrics(ctx context.Context, inst *Instance, m *metrics.Agent) {
 }
 
 func refreshMetrics(ctx context.Context, inst *Instance, m *metrics.Agent) {
-	if !inst.IsPrimary() {
+	// Metrics from a member whose role cannot be read would be wrong in a
+	// way nothing downstream could tell, so the pass is skipped.
+	if primary, err := inst.IsPrimary(); err != nil || !primary {
 		return
 	}
 	sctx, cancel := context.WithTimeout(ctx, 10*time.Second)

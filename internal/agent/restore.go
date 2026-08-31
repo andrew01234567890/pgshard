@@ -15,13 +15,32 @@ const recoverySignal = "recovery.signal"
 
 // restorePendingPath marks a restore from the repository that has not
 // reached its target yet; it lives beside PGDATA so clearing PGDATA keeps it.
+// removeIfPresent deletes path, treating only its absence as success.
+func removeIfPresent(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 func (in *Instance) restorePendingPath() string {
 	return filepath.Join(in.cfg.PGData, "..", ".pgshard-restore-pending")
 }
 
-func (in *Instance) restorePending() bool {
+// restorePending reports whether an earlier restore left its marker. Only
+// the marker's absence is absence: reading PGDATA's parent can fail for
+// reasons that are not "no restore was interrupted", and taking one for
+// the other starts PostgreSQL on a half-restored directory.
+func (in *Instance) restorePending() (bool, error) {
 	_, err := os.Stat(in.restorePendingPath())
-	return err == nil
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, os.ErrNotExist):
+		return false, nil
+	default:
+		return false, err
+	}
 }
 
 // restoreBootstrap builds a new primary from the source stanza: pgbackrest
@@ -52,7 +71,11 @@ func (in *Instance) restoreBootstrap(ctx context.Context) error {
 	if _, err := r.Restore(ctx, opts); err != nil {
 		return err
 	}
-	_ = os.Remove(filepath.Join(in.cfg.PGData, standbySignal))
+	// A signal file left behind decides how PostgreSQL starts, so a
+	// failure to remove one is not something to start on top of.
+	if err := removeIfPresent(filepath.Join(in.cfg.PGData, standbySignal)); err != nil {
+		return err
+	}
 	if err := writeFileSync(filepath.Join(in.cfg.PGData, recoverySignal), nil); err != nil {
 		return err
 	}
@@ -154,7 +177,9 @@ func (in *Instance) repoClone(ctx context.Context) error {
 	if err := in.dropStaleSlots(); err != nil {
 		return err
 	}
-	_ = os.Remove(filepath.Join(in.cfg.PGData, recoverySignal))
+	if err := removeIfPresent(filepath.Join(in.cfg.PGData, recoverySignal)); err != nil {
+		return err
+	}
 	if err := in.writeStandbySignal(); err != nil {
 		return err
 	}

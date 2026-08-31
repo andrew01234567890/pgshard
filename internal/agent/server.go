@@ -64,7 +64,13 @@ func (s *Server) fenceCurrent(epoch uint64) error {
 // Status is read-only.
 func (s *Server) Status(ctx context.Context, _ *pgshardv1.StatusRequest) (*pgshardv1.StatusResponse, error) {
 	resp := &pgshardv1.StatusResponse{Epoch: s.epoch.Current(), Role: pgshardv1.StatusResponse_ROLE_PRIMARY, PromotionPending: s.inst.PromotionPending()}
-	if s.inst.IsStandby() {
+	// A role that cannot be read is reported as an error rather than as
+	// primary: the operator promotes and fences on this answer.
+	switch standby, err := s.inst.IsStandby(); {
+	case err != nil:
+		resp.Error = pgErr(err)
+		return resp, nil
+	case standby:
 		resp.Role = pgshardv1.StatusResponse_ROLE_STANDBY
 	}
 	conn, err := s.inst.Connect(ctx)

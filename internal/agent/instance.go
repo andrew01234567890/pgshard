@@ -62,10 +62,20 @@ func (in *Instance) IsEmpty() (bool, error) {
 	}
 }
 
-// IsStandby reports whether standby.signal is present.
-func (in *Instance) IsStandby() bool {
+// IsStandby reports whether standby.signal is present. Only its absence is
+// absence: a permission or I/O error reading PGDATA is not evidence that
+// this member is a primary, and answering false to one is how a standby
+// gets configured as a primary, takes the lease and starts writing.
+func (in *Instance) IsStandby() (bool, error) {
 	_, err := os.Stat(filepath.Join(in.cfg.PGData, standbySignal))
-	return err == nil
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, os.ErrNotExist):
+		return false, nil
+	default:
+		return false, err
+	}
 }
 
 // Bootstrap initialises an empty PGDATA according to the configured role
@@ -79,12 +89,20 @@ func (in *Instance) Bootstrap(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if in.restorePending() {
+	pending, err := in.restorePending()
+	if err != nil {
+		return err
+	}
+	if pending {
 		in.log.Warn("an earlier restore from the repository did not finish; starting over")
 		if err := clearDir(in.cfg.PGData); err != nil {
 			return err
 		}
 		empty = true
+	}
+	standby, err := in.IsStandby()
+	if err != nil {
+		return err
 	}
 	switch {
 	case empty && in.cfg.Role == RolePrimary && in.cfg.Restore != nil:
@@ -99,7 +117,7 @@ func (in *Instance) Bootstrap(ctx context.Context) error {
 		if err := in.retryClone(ctx); err != nil {
 			return err
 		}
-	case !empty && in.cfg.Role == RoleStandby && !in.IsStandby():
+	case !empty && in.cfg.Role == RoleStandby && !standby:
 		in.log.Info("data directory belongs to a former primary; rejoining as a standby")
 		if err := in.waitSourceFn(ctx, in.cfg.PrimaryConninfo); err != nil {
 			return err
@@ -108,7 +126,12 @@ func (in *Instance) Bootstrap(ctx context.Context) error {
 			return err
 		}
 	}
-	return WriteConfig(in.cfg, in.IsStandby())
+	// Re-read: a clone or a rejoin above writes standby.signal.
+	standby, err = in.IsStandby()
+	if err != nil {
+		return err
+	}
+	return WriteConfig(in.cfg, standby)
 }
 
 func (in *Instance) initdb(ctx context.Context) error {
@@ -240,7 +263,11 @@ func (in *Instance) Promote(ctx context.Context) error {
 	// Idempotent: on a retry after a mid-promotion failure the node is
 	// already a primary, so skip the promote itself and re-run only the
 	// post-promotion setup, which is safe to repeat.
-	if in.IsStandby() {
+	standby, err := in.IsStandby()
+	if err != nil {
+		return err
+	}
+	if standby {
 		if err := in.waitWALReceiverStopped(ctx); err != nil {
 			return err
 		}
@@ -253,9 +280,18 @@ func (in *Instance) Promote(ctx context.Context) error {
 		if _, err := in.sup.RunTracked(in.sup.Command(ctx, "pg_ctl", "promote", "-w", "-D", in.cfg.PGData)); err != nil {
 			return err
 		}
-		for in.IsStandby() {
+		for {
+			// An error here is not "the signal is gone": waiting is the
+			// safe answer to not knowing, and ctx bounds it.
+			still, serr := in.IsStandby()
+			if serr == nil && !still {
+				break
+			}
 			select {
 			case <-ctx.Done():
+				if serr != nil {
+					return fmt.Errorf("reading standby.signal: %w", serr)
+				}
 				return fmt.Errorf("standby.signal still present: %w", ctx.Err())
 			case <-time.After(200 * time.Millisecond):
 			}
@@ -478,10 +514,14 @@ func (in *Instance) Reload(ctx context.Context) error {
 	if err := in.cfg.Refresh(); err != nil {
 		return err
 	}
-	if err := WriteConfig(in.cfg, in.IsStandby()); err != nil {
+	standby, err := in.IsStandby()
+	if err != nil {
 		return err
 	}
-	_, err := in.sup.RunTracked(in.sup.Command(ctx, "pg_ctl", "reload", "-D", in.cfg.PGData))
+	if err := WriteConfig(in.cfg, standby); err != nil {
+		return err
+	}
+	_, err = in.sup.RunTracked(in.sup.Command(ctx, "pg_ctl", "reload", "-D", in.cfg.PGData))
 	return err
 }
 

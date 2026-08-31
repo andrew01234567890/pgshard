@@ -15,8 +15,9 @@ type Health interface {
 	// Started reports whether the postmaster answers connection attempts,
 	// even with "the database system is starting up".
 	Started(ctx context.Context) error
-	// IsPrimary reports the current role.
-	IsPrimary() bool
+	// IsPrimary reports the current role, and whether it could be read at
+	// all: a probe that cannot tell must not answer as though it could.
+	IsPrimary() (bool, error)
 	// ReplayLagBytes returns the streaming lag on a standby.
 	ReplayLagBytes(ctx context.Context) (int64, error)
 	// PrimaryAcceptsWrites reports SELECT NOT pg_is_in_recovery().
@@ -80,7 +81,11 @@ func (p *Probes) readyz(w http.ResponseWriter, r *http.Request) {
 
 // Ready implements /readyz.
 func (p *Probes) Ready(ctx context.Context) error {
-	if p.Health.IsPrimary() {
+	primary, err := p.Health.IsPrimary()
+	if err != nil {
+		return fmt.Errorf("reading the instance role: %w", err)
+	}
+	if primary {
 		return p.Health.PrimaryAcceptsWrites(ctx)
 	}
 	lag, err := p.Health.ReplayLagBytes(ctx)
@@ -132,7 +137,12 @@ func (p *Probes) isolatedLongEnough(isolated bool) bool {
 // the kube API answers or, without it, when at least one peer's /failsafe
 // answers; a primary that reaches nothing is isolated.
 func (p *Probes) Live(ctx context.Context) error {
-	if !p.Health.IsPrimary() {
+	// A member whose role cannot be read is treated as a primary here: the
+	// checks below are what stop an isolated primary from staying alive,
+	// and skipping them on an unreadable role would skip exactly the case
+	// where something is already wrong with the data directory.
+	primary, err := p.Health.IsPrimary()
+	if err == nil && !primary {
 		return nil
 	}
 	if p.LeaseStale != nil && p.LeaseStale() {

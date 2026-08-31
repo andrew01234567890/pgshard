@@ -46,7 +46,7 @@ func TestDemoteFallsBackToRecloneWhenRewindFails(t *testing.T) {
 	if len(rewound) != 1 || rewound[0] != "host=new" || len(recloned) != 1 {
 		t.Fatalf("rewound=%v recloned=%v", rewound, recloned)
 	}
-	if !in.IsStandby() {
+	if standby, err := in.IsStandby(); err != nil || !standby {
 		t.Fatal("standby.signal missing after demote")
 	}
 	if entries, _ := os.ReadDir(filepath.Join(in.cfg.PGData, "pg_replslot")); len(entries) != 0 {
@@ -127,7 +127,7 @@ func TestBootstrapRejoinsFormerPrimaryAsStandby(t *testing.T) {
 	if rewound != in.cfg.PrimaryConninfo || waited != rewound {
 		t.Fatalf("rewound against %q waited %q", rewound, waited)
 	}
-	if !in.IsStandby() {
+	if standby, err := in.IsStandby(); err != nil || !standby {
 		t.Fatal("standby.signal missing after rejoin")
 	}
 	if entries, _ := os.ReadDir(filepath.Join(in.cfg.PGData, "pg_replslot")); len(entries) != 0 {
@@ -147,7 +147,7 @@ func TestBootstrapKeepsExistingPrimaryWhenRolePrimary(t *testing.T) {
 	if err := in.Bootstrap(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if in.IsStandby() {
+	if standby, err := in.IsStandby(); err != nil || standby {
 		t.Fatal("primary must stay a primary")
 	}
 }

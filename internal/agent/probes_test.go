@@ -11,6 +11,9 @@ import (
 )
 
 type fakeHealth struct {
+	// roleErr makes reading the role fail, as a permission or I/O error
+	// on PGDATA does.
+	roleErr  error
 	primary  bool
 	started  error
 	writes   error
@@ -20,7 +23,7 @@ type fakeHealth struct {
 }
 
 func (f *fakeHealth) Started(context.Context) error              { return f.started }
-func (f *fakeHealth) IsPrimary() bool                            { return f.primary }
+func (f *fakeHealth) IsPrimary() (bool, error)                   { return f.primary, f.roleErr }
 func (f *fakeHealth) PrimaryAcceptsWrites(context.Context) error { return f.writes }
 func (f *fakeHealth) ReplayLagBytes(context.Context) (int64, error) {
 	f.lagCalls++
@@ -145,5 +148,25 @@ func TestFailsafeIsUnauthenticated200(t *testing.T) {
 	p := &Probes{Health: &fakeHealth{}}
 	if get(t, p.Handler(), "/failsafe") != 200 {
 		t.Fatal("failsafe must return 200")
+	}
+}
+
+// TestAProbeThatCannotReadTheRoleDoesNotGuess: the role comes from a file
+// in PGDATA, and reading it can fail for reasons that are not "the file is
+// absent". Answering those as "standby" made a primary that could not read
+// its own data directory report ready and live -- readiness by ignorance,
+// on the member that must be fenced fastest.
+func TestAProbeThatCannotReadTheRoleDoesNotGuess(t *testing.T) {
+	broken := errors.New("permission denied")
+	p := &Probes{Health: &fakeHealth{primary: false, roleErr: broken}, MaxLagBytes: 1 << 20}
+	ctx := context.Background()
+
+	if err := p.Ready(ctx); err == nil {
+		t.Fatal("readiness answered without being able to read the role")
+	}
+	// Live treats an unreadable role as a primary's: the checks it skips
+	// for a standby are exactly the ones that fence an isolated primary.
+	if err := p.Live(ctx); err == nil {
+		t.Fatal("liveness skipped the primary checks for a member whose role it could not read")
 	}
 }
