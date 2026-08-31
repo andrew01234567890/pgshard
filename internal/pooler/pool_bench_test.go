@@ -78,7 +78,10 @@ func BenchmarkAcquireReleaseContended(b *testing.B) {
 			// not parked yet is not contention.
 			for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
 				p.mu.Lock()
-				parked := p.waiters
+				parked := len(p.budget)
+				for _, rp := range p.roles {
+					parked += len(rp.waiters)
+				}
 				p.mu.Unlock()
 				if parked >= waiters {
 					break
