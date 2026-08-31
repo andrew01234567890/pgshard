@@ -41,6 +41,7 @@ type fakeOps struct {
 	sweepErr        error
 	caughtUp        bool
 	verify          VerifyReport
+	verifyAdvance   int64
 	fail            map[string]error
 	fenced          bool
 	journaled       map[string]int
@@ -96,9 +97,15 @@ func (f *fakeOps) CaughtUp(_ context.Context, pos map[string]int64) (bool, strin
 	}
 	return f.caughtUp, "lagging", f.step(StepCatchUp)
 }
-func (f *fakeOps) Verify(context.Context) (VerifyReport, error) { return f.verify, f.step(StepVerify) }
-func (f *fakeOps) Sequences(context.Context) error              { return f.step(StepSequences) }
-func (f *fakeOps) Reverse(context.Context) error                { return f.step(StepReverse) }
+func (f *fakeOps) Verify(context.Context) (VerifyReport, error) {
+	// A source that moves while the digests are being taken: the source is
+	// read first and the target second, so a write in between is already
+	// applied on the target when it is read.
+	f.lsn += f.verifyAdvance
+	return f.verify, f.step(StepVerify)
+}
+func (f *fakeOps) Sequences(context.Context) error { return f.step(StepSequences) }
+func (f *fakeOps) Reverse(context.Context) error   { return f.step(StepReverse) }
 func (f *fakeOps) SchemaFingerprints(context.Context) (map[string]string, error) {
 	if f.fingerprints == nil {
 		return map[string]string{"default/0/app": "before"}, nil
@@ -303,6 +310,43 @@ func TestCutoverVerifyMismatchAbortsBeforeJournal(t *testing.T) {
 	}
 	if len(h.ops.journaled) != 0 {
 		t.Fatal("journal must not be written")
+	}
+}
+
+// TestCutoverVerifyRetriesWhileTheSourceMoves: verify reads the sources
+// first and the targets second, so a write landing between the two reads is
+// already applied on the target and makes it look ahead of its source. CI
+// saw exactly that -- a target holding one batch more than the sources
+// predicted. That is a race in the measurement, not a target that disagrees
+// with its source, and it must not abandon the switch: the positions say
+// which it was.
+func TestCutoverVerifyRetriesWhileTheSourceMoves(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.ops.verify = VerifyReport{Mismatches: []string{"app.ledger on g2/1: 1740 rows, sources predict 1730"}}
+	h.ops.verifyAdvance = 10
+	h.runUntil(t, StageSwitching)
+
+	// Several passes: each reaches verify, sees the source has moved, and
+	// starts again rather than giving up.
+	for range 3 {
+		if _, err := h.c.cutover(context.Background(), h.wf, h.ops); isFatal(err) {
+			t.Fatalf("a mismatch against a moving source must not abandon the switch: %v", err)
+		}
+	}
+	if len(h.ops.journaled) != 0 {
+		t.Fatal("journal must not be written")
+	}
+
+	// Standing still, the same mismatch is what it says it is.
+	h.ops.verifyAdvance = 0
+	var err error
+	for range 6 {
+		if _, err = h.c.cutover(context.Background(), h.wf, h.ops); isFatal(err) {
+			break
+		}
+	}
+	if !isFatal(err) || !strings.Contains(err.Error(), "verification failed") {
+		t.Fatalf("a mismatch against a still source must abort: %v", err)
 	}
 }
 
