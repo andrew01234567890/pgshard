@@ -232,6 +232,11 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 	observations = append(observations, shardObs...)
+	if catalogReady.Status == metav1.ConditionTrue {
+		if err := r.spreadBootstrapVerifier(ctx, &cluster, dsn, shardObs, password); err != nil {
+			log.Error(err, "bootstrap verifier not yet published to every group; retrying")
+		}
+	}
 
 	// A target group over the provisioning budget only reconciles once it
 	// has started, so which groups run is decided before they run: every
@@ -1049,6 +1054,31 @@ func podReady(p *corev1.Pod) bool {
 		}
 	}
 	return false
+}
+
+// The router terminates SCRAM against the verifier in pgshard.roles and
+// forwards the recovered key to a backend, so a group whose own initdb salted
+// the role differently refuses that key with 28P01 -- after the router has
+// already accepted the client. Give every group the published verifier.
+func (r *ClusterReconciler) spreadBootstrapVerifier(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, catalogDSN string, shards []groupObservation, password string) error {
+	verifier, err := r.Prober.BootstrapVerifier(ctx, catalogDSN, superuserName)
+	if err != nil {
+		return fmt.Errorf("read published verifier: %w", err)
+	}
+	if verifier == "" {
+		return nil
+	}
+	var errs []error
+	for _, o := range shards {
+		if !o.primaryOK {
+			continue
+		}
+		dsn := DSN(o.group.ServiceRW(), c.Namespace, password)
+		if err := r.Prober.AdoptBootstrapVerifier(ctx, dsn, superuserName, verifier); err != nil {
+			errs = append(errs, fmt.Errorf("group %s: %w", o.group.Name(), err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (r *ClusterReconciler) reconcileCatalogSchema(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, catalog groupObservation, password string) (metav1.Condition, string) {

@@ -138,3 +138,81 @@ func TestTheSeededVerifierIsTheOneTheServerHolds(t *testing.T) {
 		t.Fatalf("the catalog holds a different verifier from the server, so a forwarded ClientKey cannot match:\n catalog %s\n server  %s", seeded, server)
 	}
 }
+
+// TestEveryGroupGetsTheVerifierTheRouterForwardsAgainst: a shard group runs
+// its own initdb, so the same password produces a different verifier there
+// than in the catalog. The router recovers ClientKey against the catalog's
+// salt, and the shard backend refused it -- 28P01 after the router had
+// already accepted the client.
+func TestEveryGroupGetsTheVerifierTheRouterForwardsAgainst(t *testing.T) {
+	if err := exec.Command("docker", "info").Run(); err != nil {
+		dockertest.Unavailable(t, "docker unavailable")
+	}
+	ctx := context.Background()
+	const password = "s3cret-generated-by-the-operator"
+
+	catalogDSN := startProbePostgres(t)
+	cconn, err := pgx.Connect(ctx, catalogDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cconn.Close(ctx) }()
+	if err := catalog.Migrate(ctx, cconn); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cconn.Exec(ctx, `ALTER ROLE `+superuserName+` PASSWORD '`+password+`'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := (PgxProber{}).SeedBootstrapRole(ctx, catalogDSN, superuserName, password); err != nil {
+		t.Fatal(err)
+	}
+	published, err := (PgxProber{}).BootstrapVerifier(ctx, catalogDSN, superuserName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if published == "" {
+		t.Fatal("nothing published for the router to authenticate against")
+	}
+
+	shardDSN := startProbePostgres(t)
+	sconn, err := pgx.Connect(ctx, shardDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sconn.Close(ctx) }()
+	if _, err := sconn.Exec(ctx, `ALTER ROLE `+superuserName+` PASSWORD '`+password+`'`); err != nil {
+		t.Fatal(err)
+	}
+	var own string
+	if err := sconn.QueryRow(ctx, `SELECT rolpassword FROM pg_authid WHERE rolname = $1`, superuserName).Scan(&own); err != nil {
+		t.Fatal(err)
+	}
+	if own == published {
+		t.Fatal("two independent initdbs produced the same salt; this test would prove nothing")
+	}
+
+	if err := (PgxProber{}).AdoptBootstrapVerifier(ctx, shardDSN, superuserName, published); err != nil {
+		t.Fatal(err)
+	}
+	var adopted string
+	if err := sconn.QueryRow(ctx, `SELECT rolpassword FROM pg_authid WHERE rolname = $1`, superuserName).Scan(&adopted); err != nil {
+		t.Fatal(err)
+	}
+	if adopted != published {
+		t.Fatalf("the shard does not hold the verifier the router forwards against:\n published %s\n shard     %s", published, adopted)
+	}
+
+	// Stored verbatim is not enough: it has to still authenticate the
+	// password the user was given. Make the shard demand SCRAM and log in.
+	if _, err := sconn.Exec(ctx, `COPY (SELECT 'host all all all scram-sha-256') TO '/tmp/pgdata/pg_hba.conf'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sconn.Exec(ctx, `SELECT pg_reload_conf()`); err != nil {
+		t.Fatal(err)
+	}
+	scram, err := pgx.Connect(ctx, shardDSN+"&password="+password)
+	if err != nil {
+		t.Fatalf("the adopted verifier does not authenticate the password behind it: %v", err)
+	}
+	_ = scram.Close(ctx)
+}

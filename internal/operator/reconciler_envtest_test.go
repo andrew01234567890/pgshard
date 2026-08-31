@@ -103,7 +103,8 @@ type fakeProber struct {
 	routerPasswords []string
 	// bootstrapRoles records every verifier the reconcile published so a
 	// generated credential can reach the router.
-	bootstrapRoles []string
+	bootstrapRoles   []string
+	adoptedVerifiers []string
 	// onRelease runs inside ReleaseCatalog, so a test can see what the
 	// cluster looked like at that point of the rollback.
 	onRelease func()
@@ -554,6 +555,19 @@ func (f *fakeProber) SeedBootstrapRole(_ context.Context, dsn, rolname, password
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.bootstrapRoles = append(f.bootstrapRoles, hostOf(dsn)+"="+rolname+":"+password)
+	return nil
+}
+
+const fakePublishedVerifier = "SCRAM-SHA-256$4096:c2FsdA==$c3RvcmVk:c2VydmVy"
+
+func (f *fakeProber) BootstrapVerifier(_ context.Context, _, _ string) (string, error) {
+	return fakePublishedVerifier, nil
+}
+
+func (f *fakeProber) AdoptBootstrapVerifier(_ context.Context, dsn, rolname, verifier string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.adoptedVerifiers = append(f.adoptedVerifiers, hostOf(dsn)+"="+rolname+":"+verifier)
 	return nil
 }
 
@@ -1236,6 +1250,29 @@ func TestRouterCredentialIsGeneratedAndApplied(t *testing.T) {
 	get(t, RouterSecretName(c.Name), &sec)
 	if string(sec.Data["password"]) != pw {
 		t.Error("the password must survive a reconcile: it was regenerated")
+	}
+}
+
+// TestEveryShardGroupIsGivenThePublishedVerifier: the router authenticates a
+// client against pgshard.roles and forwards the key it recovers, so a shard
+// group still holding its own initdb verifier answers 28P01 to a credential
+// the router has already accepted.
+func TestEveryShardGroupIsGivenThePublishedVerifier(t *testing.T) {
+	r, fp, c := setup(t, "bv")
+	bringUp(t, r, fp, c)
+
+	shards := Groups(c)[1:]
+	if len(shards) == 0 {
+		t.Fatal("a cluster with no shard group proves nothing here")
+	}
+	fp.mu.Lock()
+	got := append([]string(nil), fp.adoptedVerifiers...)
+	fp.mu.Unlock()
+	for _, g := range shards {
+		want := g.ServiceRW() + "." + c.Namespace + ".svc=" + superuserName + ":" + fakePublishedVerifier
+		if !slices.Contains(got, want) {
+			t.Errorf("group %s never received the verifier the router forwards against; adopted %v", g.Name(), got)
+		}
 	}
 }
 
