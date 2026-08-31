@@ -92,7 +92,11 @@ func (s *shardedStack) resolver(tb testing.TB) *controller.Resolver {
 		{Set: router.DefaultShardSet, ID: 0}: s.appDSN(0),
 		{Set: router.DefaultShardSet, ID: 1}: s.appDSN(1),
 	}
-	return &controller.Resolver{Pool: pool, Shards: &controller.PgxShardDialer{Pool: pool, DSNs: dsns}, PreparingTimeout: time.Millisecond}
+	// The crash matrix kills a router and expects its preparing row to age
+	// out at once; the beat has to shrink with the timeout, or the floor
+	// that protects live coordinators holds the row alive for seconds.
+	return &controller.Resolver{Pool: pool, Shards: &controller.PgxShardDialer{Pool: pool, DSNs: dsns},
+		PreparingTimeout: time.Millisecond, HeartbeatInterval: time.Millisecond}
 }
 
 func TestRouterCrossShardTransactions(t *testing.T) {
