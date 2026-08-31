@@ -449,7 +449,7 @@ func dropArtifactTable(ctx context.Context, conn ShardConn, schema, name, marker
 func (p *Placer) ensureShadows(ctx context.Context, wf *placementWorkflow) error {
 	var ddl []string
 	for _, t := range wf.rt.Holders() {
-		if err := checkOwner(ctx, p.Pool, wf.id, wf.owner); err != nil {
+		if err := holdClaim(ctx, p.Pool, wf.id, wf.owner); err != nil {
 			return err
 		}
 		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
@@ -784,6 +784,9 @@ func (p *Placer) copySource(ctx context.Context, wf *placementWorkflow, s int32)
 			sql += fmt.Sprintf(" WHERE (%s) > (%s)", strings.Join(pkCols, ", "), strings.Join(keysetBounds(last, pkIdx, wf.st.Columns, typeOf), ", "))
 		}
 		sql += fmt.Sprintf(" ORDER BY %s LIMIT %d", strings.Join(pkCols, ", "), p.copyBatch())
+		if err := holdClaim(ctx, p.Pool, wf.id, wf.owner); err != nil {
+			return err
+		}
 		rows, err := conn.Query(ctx, sql)
 		if err != nil {
 			return err
@@ -1077,7 +1080,7 @@ func (p *Placer) fence(ctx context.Context, wf *placementWorkflow) error {
 // placement is published.
 func (p *Placer) fenceShards(ctx context.Context, wf *placementWorkflow) error {
 	return p.eachShard(ctx, wf, func(ctx context.Context, conn ShardConn) error {
-		if err := checkOwner(ctx, p.Pool, wf.id, wf.owner); err != nil {
+		if err := holdClaim(ctx, p.Pool, wf.id, wf.owner); err != nil {
 			return err
 		}
 		return fenceTables(ctx, conn, wf.spec.SchemaName, wf.shape.qualified(wf.spec.TableName), wf.shape.qualified(wf.shadow()))
@@ -1457,6 +1460,9 @@ func (p *Placer) publish(ctx context.Context, wf *placementWorkflow) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := holdClaimTx(ctx, tx, wf.id, wf.owner); err != nil {
+		return err
+	}
 	// The inspection belongs to the placement it was made under, so a table
 	// arriving at (or leaving) reference placement is unchecked again until
 	// the next pass has asked the shards.
