@@ -493,6 +493,15 @@ func MaterializeRoles(ctx context.Context, dial func(ctx context.Context, databa
 			if g.Database != db {
 				continue
 			}
+			// The privileges are rendered into the statement by
+			// concatenation, and the row they came from can be written
+			// directly by an administrator who is deliberately not a
+			// superuser on the shards. A privilege that is not a privilege
+			// is refused here rather than sent, whatever wrote the row.
+			if err := catalog.CheckPrivileges(g.Kind, g.Column, g.Privileges); err != nil {
+				errs = append(errs, fmt.Errorf("grant on %s %s to %s: %w", g.Kind, g.Name, g.Grantee, err))
+				continue
+			}
 			if _, err := dbConn.Exec(ctx, GrantSQL(g)); err != nil {
 				errs = append(errs, fmt.Errorf("grant on %s %s to %s: %w", g.Kind, g.Name, g.Grantee, err))
 			}

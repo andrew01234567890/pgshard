@@ -2,7 +2,9 @@ package catalog
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -85,6 +87,61 @@ var AllPrivileges = map[string][]string{
 	"type":     {"USAGE"},
 	"domain":   {"USAGE"},
 	"language": {"USAGE"},
+}
+
+// ErrUnknownPrivilege names a privilege that is not one. Privileges are
+// rendered into a GRANT statement by concatenation, so anything that is not
+// a privilege word is a way to put arbitrary SQL into a statement the
+// controller runs on every shard as the administration role.
+var ErrUnknownPrivilege = errors.New("not a privilege of this object kind")
+
+// CheckPrivileges reports the first element of privs that is not a
+// privilege of the kind, if any. A column grant takes the column set.
+func CheckPrivileges(kind, column string, privs []string) error {
+	k := strings.ToLower(strings.TrimSpace(kind))
+	if column != "" {
+		k = "column"
+	}
+	allowed, known := AllPrivileges[k]
+	for _, p := range privs {
+		p = strings.ToUpper(strings.TrimSpace(p))
+		if p == "" || p == "ALL" || p == "ALL PRIVILEGES" {
+			continue
+		}
+		if p == "TEMP" {
+			p = "TEMPORARY"
+		}
+		if !known {
+			// An object kind with no expansion still takes only words.
+			if !privilegeWord(p) {
+				return fmt.Errorf("%q: %w %q", p, ErrUnknownPrivilege, kind)
+			}
+			continue
+		}
+		if !slices.Contains(allowed, p) {
+			return fmt.Errorf("%q: %w %q", p, ErrUnknownPrivilege, kind)
+		}
+	}
+	return nil
+}
+
+// privilegeWord reports whether p could be a privilege at all: letters and
+// single spaces, nothing that ends a statement or starts another.
+func privilegeWord(p string) bool {
+	if p == "" {
+		return false
+	}
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		if c >= 'A' && c <= 'Z' {
+			continue
+		}
+		if c == ' ' && i > 0 && i < len(p)-1 && p[i-1] != ' ' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // NormalizePrivileges upper-cases, expands ALL for the kind (column grants
