@@ -24,10 +24,13 @@ func (s *Server) MaterializeSchema(ctx context.Context, req *pgshardv1.Materiali
 		resp.Error = pgErr(errors.New("materialize schema: no epoch in the request; the caller must name the epoch it believes this member serves at"))
 		return resp, nil
 	}
-	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
+	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
+	if err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
+	defer endTerm()
+	resp.Epoch = req.GetEpoch()
 	ctx, cancel := context.WithTimeout(ctx, s.opTimeout)
 	defer cancel()
 	resp.Error = pgErr(s.inst.MaterializeSchema(ctx, req.GetSourceConninfo(), req.GetDatabase()))
