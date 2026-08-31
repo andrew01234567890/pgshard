@@ -526,7 +526,19 @@ func (p *Placer) ensureShadows(ctx context.Context, wf *placementWorkflow) error
 					return err
 				}
 				if !ours {
-					return fatal("a table named %s already exists and is not this workflow's shadow; rename it before sharding %s", wf.shape.qualified(wf.shadow()), wf.spec.table())
+					// The marker is how a shadow is known to be this
+					// workflow's. A table without one is either a user's,
+					// or -- for a workflow that was already running when
+					// the controller learned to stamp them -- this
+					// workflow's own shadow from before the marker
+					// existed. Both look the same here, and only an
+					// operator can tell them apart, so the message has to
+					// name the second: without it the advice is to rename
+					// a table pgshard created and is refusing to touch.
+					return fatal("a table named %s already exists and does not carry this workflow's marker (%s), so it is not adopted; "+
+						"if it is a table of yours, rename it before sharding %s; if it is a shadow left by this workflow from before "+
+						"the controller stamped its artifacts, drop it and let the workflow rebuild it",
+						wf.shape.qualified(wf.shadow()), marker, wf.spec.table())
 				}
 				return nil
 			}
