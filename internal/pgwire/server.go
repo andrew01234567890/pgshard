@@ -81,6 +81,11 @@ type Server struct {
 	logger     *slog.Logger
 
 	startupSem chan struct{}
+	// afterAccept runs between Accept returning and the handler being
+	// registered. Tests set it to hold Serve exactly where Shutdown used to
+	// be able to overtake it; it is nil everywhere else.
+	afterAccept func()
+
 	// shutdownCh is closed by Shutdown so blocking pre-auth work (catalog
 	// lookups) is cancelled instead of holding startup slots.
 	shutdownCh   chan struct{}
@@ -178,7 +183,23 @@ func (s *Server) Serve(l net.Listener) error {
 			}
 			return err
 		}
+		if s.afterAccept != nil {
+			s.afterAccept()
+		}
+		// Registering the handler under the same lock that Shutdown sets
+		// closing under is what makes Shutdown's wait mean something. Adding
+		// to the WaitGroup outside it left a window where a connection was
+		// accepted, Shutdown ran to completion against a count of zero, and
+		// the handler started afterwards -- and an Add racing a Wait at zero
+		// is WaitGroup misuse in its own right.
+		s.mu.Lock()
+		if s.closing {
+			s.mu.Unlock()
+			_ = conn.Close()
+			return nil
+		}
 		s.wg.Add(1)
+		s.mu.Unlock()
 		go func() {
 			defer s.wg.Done()
 			s.handle(conn)
