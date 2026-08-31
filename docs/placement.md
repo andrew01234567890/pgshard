@@ -52,6 +52,26 @@ joins adjacent ranges. In the catalog the same ranges are stored as
 `int8range` (lower inclusive, upper exclusive, unbounded ends) in
 `pgshard.shard_ranges`, whose triggers reject gaps and overlaps.
 
+## Uniqueness on a sharded table
+
+Every global uniqueness key must contain the shard key, and must compare it
+the way pgshard distributes it: a deterministic collation and the default
+operator class, so index equality and hash equality agree.
+
+An exclusion constraint — including a PostgreSQL 18 temporal `PRIMARY KEY`
+or `UNIQUE ... WITHOUT OVERLAPS`, whose index is an exclusion index — needs
+one condition more. Its elements are compared with operators of its own,
+and it is enforceable one shard at a time only when the shard key's element
+is compared with **btree equality**: rows with different keys are then never
+in conflict, wherever they live. An element compared with `&&` or another
+non-equality operator can conflict across shards, and no shard can see the
+other's rows, so sharding by that element is refused.
+
+A table whose *primary key* is temporal is refused for a different reason:
+placement applies rows by the primary key and PostgreSQL cannot match an
+exclusion constraint from an `ON CONFLICT` column list. Declare the temporal
+key as a `UNIQUE` constraint alongside an ordinary primary key.
+
 ## Controller (`internal/controller`, `pgshard-controller run`)
 
 The controller turns desired state into status and workflows. Exactly one
