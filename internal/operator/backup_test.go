@@ -116,8 +116,14 @@ func TestTemplateAndPodCarryBackupPolicy(t *testing.T) {
 	if vols[backupCredentialsVolume] != "minio-creds" || vols[backupEncryptionVolume] != "repo-key" {
 		t.Errorf("volumes %v", vols)
 	}
-	if len(Renderer{}.Pod(c, g, 0, RolePrimary, "pvc", plain).Spec.Volumes) != 4 {
-		t.Error("pod without policy must not mount backup secrets")
+	// Named, not counted: a pod gains volumes for reasons that have nothing
+	// to do with backups, and a count says "something changed" where the
+	// test means "no backup secret is here".
+	bare := Renderer{}.Pod(c, g, 0, RolePrimary, "pvc", plain)
+	for _, v := range bare.Spec.Volumes {
+		if v.Name == backupCredentialsVolume || v.Name == backupEncryptionVolume {
+			t.Errorf("pod without policy mounts %s", v.Name)
+		}
 	}
 	cm := Renderer{}.ConfigMap(c, g, g.MemberName(0), nil, pol, false)
 	var cfg agent.Config

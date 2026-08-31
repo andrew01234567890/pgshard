@@ -39,6 +39,18 @@ func WithToken(ctx context.Context, token string) context.Context {
 	return metadata.AppendToOutgoingContext(ctx, MetadataKey, token)
 }
 
+// WithTokens carries several tokens, so one caller reaches agents that
+// expect different ones during a rolling update. The server accepts a call
+// presenting any token it knows.
+func WithTokens(ctx context.Context, tokens ...string) context.Context {
+	for _, t := range tokens {
+		if t != "" {
+			ctx = metadata.AppendToOutgoingContext(ctx, MetadataKey, t)
+		}
+	}
+	return ctx
+}
+
 // ErrUnauthenticated is returned to callers without a valid token.
 var errUnauthenticated = status.Error(codes.Unauthenticated, "agent: missing or invalid "+MetadataKey)
 
@@ -52,23 +64,47 @@ func UnaryServerInterceptor(token string) grpc.UnaryServerInterceptor {
 // call, so a rotated superuser Secret is picked up without restarting the
 // agent. A failed or empty evaluation rejects the call.
 func DynamicUnaryServerInterceptor(tokenFn func() (string, error)) grpc.UnaryServerInterceptor {
-	return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	return AnyOfUnaryServerInterceptor(func() ([]string, error) {
 		token, err := tokenFn()
-		if err != nil || token == "" || !authorized(ctx, token) {
+		if err != nil {
+			return nil, err
+		}
+		return []string{token}, nil
+	})
+}
+
+// AnyOfUnaryServerInterceptor accepts a call presenting any one of the
+// tokens tokensFn returns. Several exist so an agent can be moved onto its
+// own token without a flag day: for one release it accepts both that and
+// the one derived from the superuser password, and callers send both, so
+// old and new agents are reachable by old and new callers throughout a
+// rolling update. Removing the derived one is a deliberate later step.
+//
+// A failed evaluation, no tokens, or only empty ones rejects the call: an
+// empty expected token would otherwise match a caller that sent nothing.
+func AnyOfUnaryServerInterceptor(tokensFn func() ([]string, error)) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		tokens, err := tokensFn()
+		if err != nil || !authorized(ctx, tokens) {
 			return nil, errUnauthenticated
 		}
 		return handler(ctx, req)
 	}
 }
 
-func authorized(ctx context.Context, token string) bool {
+func authorized(ctx context.Context, tokens []string) bool {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return false
 	}
-	for _, got := range md.Get(MetadataKey) {
-		if hmac.Equal([]byte(got), []byte(token)) {
-			return true
+	for _, want := range tokens {
+		if want == "" {
+			continue
+		}
+		for _, got := range md.Get(MetadataKey) {
+			if hmac.Equal([]byte(got), []byte(want)) {
+				return true
+			}
 		}
 	}
 	return false

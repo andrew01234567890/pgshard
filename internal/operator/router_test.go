@@ -408,3 +408,36 @@ func TestRouterHoldsItsOwnCatalogCredential(t *testing.T) {
 		t.Errorf("router args %v", ctr.Args)
 	}
 }
+
+// TestTheAgentTokenIsItsOwnSecret: the control-plane token was
+// HMAC(superuser password), so anything holding that password also held the
+// token that unlocks Promote, Demote, Rewind and Reclone on every member,
+// and rotating either silently rotated the other. It is generated for the
+// cluster now, mounted into each member, and unaffected by the password.
+func TestTheAgentTokenIsItsOwnSecret(t *testing.T) {
+	c := routerCluster()
+	g := Groups(c)[0]
+	pod := Renderer{}.Pod(c, g, 0, RolePrimary, g.MemberName(0), Template(c, Group{}, nil, nil))
+
+	mount := ""
+	for _, m := range pod.Spec.Containers[0].VolumeMounts {
+		if m.Name == agentTokenVolume {
+			mount = m.MountPath
+		}
+	}
+	if mount != agentTokenDir {
+		t.Errorf("agent token mount %q, want %q", mount, agentTokenDir)
+	}
+	secret := ""
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == agentTokenVolume && v.Secret != nil {
+			secret = v.Secret.SecretName
+		}
+	}
+	if secret != AgentSecretName(c.Name) {
+		t.Errorf("agent token Secret %q, want %q", secret, AgentSecretName(c.Name))
+	}
+	if secret == SecretName(c.Name) {
+		t.Error("the agent token must not come from the superuser Secret")
+	}
+}

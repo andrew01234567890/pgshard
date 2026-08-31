@@ -9,6 +9,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
@@ -117,5 +118,60 @@ func TestDynamicInterceptorFollowsRotation(t *testing.T) {
 	}
 	if _, err := cl.Promote(WithToken(ctx, oldTok), &pgshardv1.PromoteRequest{}); status.Code(err) != codes.Unauthenticated {
 		t.Fatalf("stale token after rotation: %v", err)
+	}
+}
+
+// TestAnAgentAcceptsEitherTokenDuringTheRoll: the control-plane token is
+// moving from something derived from the superuser password to a Secret of
+// its own. For one release an agent accepts both and callers send both, so
+// an agent that has been rolled onto the new token and one that has not are
+// each reachable by the same operator.
+//
+// REMOVE this behaviour, and the derived token with it, when every caller
+// sends the mounted one -- PGS-572.
+func TestAnAgentAcceptsEitherTokenDuringTheRoll(t *testing.T) {
+	derived, err := Token("superuser-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const own = "0123456789abcdef"
+
+	// A caller in the middle of the roll sends both.
+	both := WithTokens(context.Background(), own, derived)
+	md, _ := metadata.FromOutgoingContext(both)
+	if got := md.Get(MetadataKey); len(got) != 2 {
+		t.Fatalf("a caller must send both tokens: %v", got)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		expect []string
+		accept bool
+	}{
+		{"an agent that has been rolled", []string{own, derived}, true},
+		{"an agent that has not", []string{derived}, true},
+		{"an agent past the removal", []string{own}, true},
+		{"an agent of another cluster", []string{"someone-elses"}, false},
+		{"an agent with no token at all", nil, false},
+		{"an agent whose token is empty", []string{""}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := metadata.NewIncomingContext(context.Background(), md)
+			var reached bool
+			handler := func(context.Context, any) (any, error) { reached = true; return nil, nil }
+			_, err := AnyOfUnaryServerInterceptor(func() ([]string, error) { return tc.expect, nil })(in, nil, nil, handler)
+			if reached != tc.accept {
+				t.Fatalf("reached = %v, want %v (err %v)", reached, tc.accept, err)
+			}
+		})
+	}
+
+	// A caller that sends nothing is refused whatever the agent knows.
+	var reached bool
+	_, _ = AnyOfUnaryServerInterceptor(func() ([]string, error) { return []string{own, derived}, nil })(
+		metadata.NewIncomingContext(context.Background(), metadata.MD{}), nil, nil,
+		func(context.Context, any) (any, error) { reached = true; return nil, nil })
+	if reached {
+		t.Fatal("a call presenting no token was accepted")
 	}
 }

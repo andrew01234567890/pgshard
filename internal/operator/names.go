@@ -72,6 +72,11 @@ const (
 	agentGRPCPort  = 9090
 	superuserName  = "postgres"
 	secretKey      = "password"
+	// agentTokenVolume mounts the cluster's agent control-plane token into
+	// every member pod.
+	agentTokenVolume = "agent-token"
+	agentTokenDir    = "/etc/pgshard/agent"
+	agentTokenKey    = "token"
 	// LabelShardSet on a shard group's objects names the catalog shard set
 	// it belongs to.
 	LabelShardSet = "pgshard.io/shard-set"
@@ -334,6 +339,11 @@ func SecretName(cluster string) string { return cluster + "-superuser" }
 
 // RouterSecretName holds the router's catalog login password.
 func RouterSecretName(cluster string) string { return cluster + "-router" }
+
+// AgentSecretName holds the control-plane token the member agents accept.
+// It is generated for the cluster rather than derived from the superuser
+// password, so rotating one does not silently rotate the other.
+func AgentSecretName(cluster string) string { return cluster + "-agent" }
 
 // AdminSecretName holds the credential the admin API requires.
 func AdminSecretName(cluster string) string { return cluster + "-admin" }
