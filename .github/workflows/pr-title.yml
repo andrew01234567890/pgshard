@@ -1,0 +1,41 @@
+# A pull request's title is validated in two places, deliberately.
+#
+# ci.yml's copy feeds the CI gate, which is the required check, and runs when
+# the pull request opens or is pushed to. It cannot re-run on a title edit:
+# adding `edited` to that workflow would re-run every job in it whenever
+# anybody touched a description.
+#
+# This one re-checks the title the moment it changes, so a title corrected
+# after opening -- which is how every stacked pull request is made, with a
+# generated title replaced by a real one seconds later -- is answered in
+# seconds instead of waiting for the next push.
+name: PR title
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  title:
+    name: Conventional Commits title
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate Conventional Commits title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          re='^(feat|fix|docs|ci|build|chore|refactor|test|perf|style|revert)(\(.+\))?!?: .+'
+          if [[ "$PR_TITLE" =~ $re ]]; then
+            echo "PR title OK"
+          else
+            echo "::error::PR title must follow Conventional Commits: type(scope)?: description"
+            exit 1
+          fi

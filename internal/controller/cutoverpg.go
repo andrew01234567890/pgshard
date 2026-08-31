@@ -56,6 +56,9 @@ type pgCutover struct {
 
 // driveCutover builds the PostgreSQL ops of one workflow and advances it.
 func (c *Copier) driveCutover(ctx context.Context, wf *copyWorkflow) (bool, error) {
+	if err := holdClaim(ctx, c.Pool, wf.id, wf.owner); err != nil {
+		return false, err
+	}
 	if _, _, err := c.pinSource(ctx, wf); err != nil {
 		return false, err
 	}
@@ -102,11 +105,11 @@ func (o *pgCutover) reversePattern(s int32) string {
 // GateOpen: every table ready, lag under threshold, no paused subscription
 // and an apply worker alive behind every forward subscription.
 func (o *pgCutover) GateOpen(ctx context.Context) (bool, string, error) {
-	progress, err := o.c.observe(ctx, o.wf, o.srcSet, o.srcIDs, o.dbs)
+	progress, byTarget, err := o.c.observe(ctx, o.wf, o.srcSet, o.srcIDs, o.dbs)
 	if err != nil {
 		return false, "", err
 	}
-	o.wf.copy.Progress = progress
+	o.wf.copy.Progress, o.wf.copy.Targets = progress, byTarget
 	if !progress.CaughtUp(o.c.lagBytes()) {
 		return false, progress.Describe(), nil
 	}

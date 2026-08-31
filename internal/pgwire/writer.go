@@ -25,7 +25,10 @@ func (w *resultWriter) send(m pgproto3.BackendMessage) error {
 	if w.ioErr != nil {
 		return w.ioErr
 	}
-	w.s.be.Send(m)
+	if err := w.s.sendMsg(m); err != nil {
+		w.ioErr = err
+		return err
+	}
 	return nil
 }
 
@@ -52,7 +55,11 @@ func (w *resultWriter) RowDescription(fields []pgproto3.FieldDescription) error 
 }
 
 func (w *resultWriter) DataRow(values [][]byte) error {
-	if err := w.send(&pgproto3.DataRow{Values: values}); err != nil {
+	if w.ioErr != nil {
+		return w.ioErr
+	}
+	if err := w.s.appendRow(values); err != nil {
+		w.ioErr = err
 		return err
 	}
 	return w.queued(dataRowBytes(values))

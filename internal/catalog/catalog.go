@@ -72,6 +72,10 @@ var ErrChecksumMismatch = errors.New("catalog: applied migration checksum change
 // binary does not have, which means it was migrated by a newer one.
 var ErrCatalogAhead = errors.New("catalog: schema is newer than this binary")
 
+// ErrMigrationOutOfOrder is returned when a pending migration is numbered
+// below one the catalog has already applied.
+var ErrMigrationOutOfOrder = errors.New("catalog: pending migration is numbered below an applied one")
+
 // Migration is one embedded schema file.
 type Migration struct {
 	Version  int
@@ -174,13 +178,31 @@ func CheckCompatible(ctx context.Context, q Querier, migrations []Migration) err
 		return fmt.Errorf("catalog: read applied migrations: %w", err)
 	}
 	var unknown []int32
+	var highest int32
+	appliedSet := make(map[int32]bool, len(applied))
 	for _, v := range applied {
+		appliedSet[v] = true
+		if v > highest {
+			highest = v
+		}
 		if !known[int(v)] {
 			unknown = append(unknown, v)
 		}
 	}
 	if len(unknown) > 0 {
 		return fmt.Errorf("%w: it has migrations %v this binary does not know; upgrade it rather than run against a schema it cannot read", ErrCatalogAhead, unknown)
+	}
+	// A pending migration numbered below one already applied is a file added
+	// out of order -- a version reused, or a gap filled in after later
+	// versions shipped. Applying it now runs it after its successors, in an
+	// order no one wrote it for and that no other catalog will ever repeat:
+	// two databases would end up with the same ledger and different schemas.
+	// Renumber it above the highest released version instead.
+	for _, m := range migrations {
+		if int32(m.Version) < highest && !appliedSet[int32(m.Version)] {
+			return fmt.Errorf("%w: %d (%s) is below %d, which is applied; renumber it above the highest released version",
+				ErrMigrationOutOfOrder, m.Version, m.Name, highest)
+		}
 	}
 	return nil
 }

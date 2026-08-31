@@ -47,6 +47,14 @@ type backupRun struct {
 	groups []pgshardv1alpha1.GroupBackupStatus
 	// expireErr collects retention failures; they do not fail the backup.
 	expireErr error
+	// cancel ends the worker. A backup whose record is deleted has nothing
+	// left to report to, and it holds an agent and a repository for as long
+	// as it runs -- long enough for a replacement to start against the same
+	// stanza beside it.
+	cancel context.CancelFunc
+	// key is what the record was called, so a reconcile that finds it gone
+	// -- and so has no UID -- can still find the worker.
+	key types.NamespacedName
 }
 
 // SetupWithManager registers the reconciler and its background runner.
@@ -98,10 +106,21 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	log := logf.FromContext(ctx)
 	var b pgshardv1alpha1.PgShardBackup
 	if err := r.Get(ctx, req.NamespacedName, &b); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		if apierrors.IsNotFound(err) {
+			// Deleted between the event and this read: there is no UID to
+			// look the worker up by, which is how one used to be left
+			// running with nothing to report to.
+			if !r.stopByName(req.NamespacedName) {
+				return ctrl.Result{RequeueAfter: backupPollInterval}, nil
+			}
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
 	}
 	if !b.DeletionTimestamp.IsZero() || b.Status.Phase == pgshardv1alpha1.BackupPhaseCompleted || b.Status.Phase == pgshardv1alpha1.BackupPhaseFailed {
-		r.forget(b.UID)
+		if !r.stop(b.UID) {
+			return ctrl.Result{RequeueAfter: backupPollInterval}, nil
+		}
 		return ctrl.Result{}, nil
 	}
 	if run := r.run(b.UID); run != nil {
@@ -225,6 +244,47 @@ func (r *BackupReconciler) forget(uid types.UID) {
 	delete(r.runs, uid)
 }
 
+// stop cancels the run for uid and reports whether it has finished. The
+// entry is kept until it has: a worker still running is still holding an
+// agent and a repository, and forgetting it here is what let a replacement
+// start beside it.
+func (r *BackupReconciler) stop(uid types.UID) bool {
+	r.mu.Lock()
+	run := r.runs[uid]
+	r.mu.Unlock()
+	if run == nil {
+		return true
+	}
+	if run.cancel != nil {
+		run.cancel()
+	}
+	select {
+	case <-run.done:
+		r.forget(uid)
+		return true
+	default:
+		return false
+	}
+}
+
+// stopByName is stop for a record that is already gone, so the caller has
+// its name but not its UID.
+func (r *BackupReconciler) stopByName(key types.NamespacedName) bool {
+	r.mu.Lock()
+	var uid types.UID
+	for u, run := range r.runs {
+		if run.key == key {
+			uid = u
+			break
+		}
+	}
+	r.mu.Unlock()
+	if uid == "" {
+		return true
+	}
+	return r.stop(uid)
+}
+
 func (r *BackupReconciler) start(ctx context.Context, b *pgshardv1alpha1.PgShardBackup, c *pgshardv1alpha1.PgShardCluster, pol *pgshardv1alpha1.PgShardBackupPolicy, targets []backupTarget) error {
 	typ, _ := backupTypeArg(b.Spec.Type)
 	base := b.DeepCopy()
@@ -242,23 +302,28 @@ func (r *BackupReconciler) start(ctx context.Context, b *pgshardv1alpha1.PgShard
 	if err := r.Status().Patch(ctx, b, client.MergeFrom(base)); err != nil {
 		return err
 	}
-	run := &backupRun{done: make(chan struct{})}
 	r.mu.Lock()
-	if r.runs == nil {
-		r.runs = map[types.UID]*backupRun{}
-	}
-	r.runs[b.UID] = run
 	baseCtx := r.base
 	r.mu.Unlock()
 	if baseCtx == nil {
 		baseCtx = context.Background()
 	}
+	// The cancel belongs to the run, not to the goroutine: a record that is
+	// deleted while its backup is going has to be able to end it.
+	runCtx, cancel := context.WithTimeout(baseCtx, backupRunTimeout)
+	run := &backupRun{done: make(chan struct{}), cancel: cancel,
+		key: types.NamespacedName{Namespace: b.Namespace, Name: b.Name}}
+	r.mu.Lock()
+	if r.runs == nil {
+		r.runs = map[types.UID]*backupRun{}
+	}
+	r.runs[b.UID] = run
+	r.mu.Unlock()
 	log := logf.FromContext(ctx).WithValues("backup", b.Name, "cluster", c.Name)
 	go func() {
 		defer close(run.done)
-		runCtx, cancel := context.WithTimeout(baseCtx, backupRunTimeout)
 		defer cancel()
-		runCtx = withClusterAgentToken(runCtx, r.Client, c.Namespace, c.Name)
+		runCtx := withClusterAgentToken(runCtx, r.Client, c.Namespace, c.Name)
 		for _, t := range targets {
 			st := pgshardv1alpha1.GroupBackupStatus{Group: t.group.Name(), Stanza: t.stanza, StartedAt: ptrTime(r.now())}
 			res, err := r.Agents.Backup(runCtx, t.addr, typ)

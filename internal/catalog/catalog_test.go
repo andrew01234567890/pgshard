@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -1459,6 +1460,40 @@ func runSuite(t *testing.T, img pgImage) {
 		}
 		if err := CheckCompatible(ctx, conn, nil); !errors.Is(err, ErrCatalogAhead) {
 			t.Errorf("CheckCompatible: %v", err)
+		}
+	})
+
+	// A migration numbered below one already applied is a file added out of
+	// order -- a version reused, or a gap filled in after later versions
+	// shipped. Applying it now would run it after its successors, in an
+	// order nobody wrote it for and no other catalog will repeat: two
+	// databases with the same ledger and different schemas.
+	t.Run("an_out_of_order_migration_is_refused", func(t *testing.T) {
+		embedded, err := Migrations()
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A released version above everything embedded, recorded as applied.
+		mustExec(t, conn, `INSERT INTO pgshard.schema_migrations (version, checksum) VALUES (9001, 'released')`)
+		defer mustExec(t, conn, `DELETE FROM pgshard.schema_migrations WHERE version = 9001`)
+		released := append(append([]Migration(nil), embedded...),
+			Migration{Version: 9001, Name: "9001_released", SQL: "SELECT 1", Checksum: "released"})
+
+		// In order: everything pending is above what is applied.
+		if err := CheckCompatible(ctx, conn, released); err != nil {
+			t.Fatalf("an in-order set must be accepted: %v", err)
+		}
+
+		// Out of order: a file added afterwards, numbered below it.
+		late := append(append([]Migration(nil), released...),
+			Migration{Version: 9000, Name: "9000_added_late", SQL: "SELECT 1", Checksum: "late"})
+		sort.Slice(late, func(i, j int) bool { return late[i].Version < late[j].Version })
+		err = CheckCompatible(ctx, conn, late)
+		if !errors.Is(err, ErrMigrationOutOfOrder) {
+			t.Fatalf("CheckCompatible with a late low-numbered migration: %v", err)
+		}
+		if !strings.Contains(err.Error(), "9000_added_late") || !strings.Contains(err.Error(), "9001") {
+			t.Errorf("the error must name the file and what it is below: %v", err)
 		}
 	})
 
