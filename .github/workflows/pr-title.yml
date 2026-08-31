@@ -1,14 +1,16 @@
 # A pull request's title is validated in two places, deliberately.
 #
-# ci.yml's copy feeds the CI gate, which is the required check, and runs when
-# the pull request opens or is pushed to. It cannot re-run on a title edit:
+# This workflow owns the `PR title` check, the required one, because it is
+# the only one that can re-run when the title changes. Every stacked pull
+# request is created with a generated title and given a real one seconds
+# later, so a check that only ever sees the placeholder blocks a merge on a
+# title that is in fact valid, and never revisits one edited into an invalid
+# shape.
+#
+# ci.yml keeps a copy under a different name, `Title at push`, so its gate
+# can see the title as a `needs`. It cannot carry the required check itself:
 # adding `edited` to that workflow would re-run every job in it whenever
 # anybody touched a description.
-#
-# This one re-checks the title the moment it changes, so a title corrected
-# after opening -- which is how every stacked pull request is made, with a
-# generated title replaced by a real one seconds later -- is answered in
-# seconds instead of waiting for the next push.
 name: PR title
 
 on:
@@ -24,7 +26,7 @@ concurrency:
 
 jobs:
   title:
-    name: Conventional Commits title
+    name: PR title
     runs-on: ubuntu-latest
     steps:
       - name: Validate Conventional Commits title
