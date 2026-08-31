@@ -327,6 +327,11 @@ func (p *Placer) finish(ctx context.Context, wf *placementWorkflow, state, messa
 
 // fail ends the workflow; a fence or lock it holds never outlives it.
 func (p *Placer) fail(ctx context.Context, wf *placementWorkflow, cause error) error {
+	// A pass that lost the claim must not lift the fence or drop the lock:
+	// the replica that owns the workflow now is relying on both.
+	if err := holdClaim(ctx, p.Pool, wf.id, wf.owner); err != nil {
+		return err
+	}
 	if wf.rt != nil {
 		if err := p.releaseFence(ctx, wf); err != nil {
 			return err
@@ -355,7 +360,7 @@ func (p *Placer) fail(ctx context.Context, wf *placementWorkflow, cause error) e
 // drive advances one workflow by one pass; it reports whether the stage
 // changed.
 func (p *Placer) drive(ctx context.Context, wf *placementWorkflow) (bool, error) {
-	if err := checkOwner(ctx, p.Pool, wf.id, wf.owner); err != nil {
+	if err := holdClaim(ctx, p.Pool, wf.id, wf.owner); err != nil {
 		return false, err
 	}
 	if wf.stage == "" {
@@ -567,6 +572,9 @@ func (p *Placer) buffer(ctx context.Context, wf *placementWorkflow) (bool, error
 }
 
 func (p *Placer) abortBuffer(ctx context.Context, wf *placementWorkflow, reason string) (bool, error) {
+	if err := holdClaim(ctx, p.Pool, wf.id, wf.owner); err != nil {
+		return false, err
+	}
 	if err := p.releaseFence(ctx, wf); err != nil {
 		return false, err
 	}
@@ -582,6 +590,9 @@ func (p *Placer) abortBuffer(ctx context.Context, wf *placementWorkflow, reason 
 // cleanup undoes a cancelled run: shadow tables, slots, publications,
 // fence and lock.
 func (p *Placer) cleanup(ctx context.Context, wf *placementWorkflow) error {
+	if err := holdClaim(ctx, p.Pool, wf.id, wf.owner); err != nil {
+		return err
+	}
 	if err := p.releaseFence(ctx, wf); err != nil {
 		return err
 	}

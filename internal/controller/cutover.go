@@ -387,8 +387,13 @@ func (c *Copier) switchWrites(ctx context.Context, wf *copyWorkflow, ops cutover
 				return false, err
 			}
 			if !errors.Is(err, errRetry) {
-				// A fence must never outlive the switch that raised it.
+				// A fence must never outlive the switch that raised it --
+				// unless the switch is no longer ours, in which case the
+				// replica that owns it now is behind that fence.
 				if isFatal(err) {
+					if oerr := holdClaim(ctx, c.Pool, wf.id, wf.owner); oerr != nil {
+						return false, oerr
+					}
 					if rerr := ops.Release(ctx); rerr != nil {
 						return false, rerr
 					}
@@ -684,6 +689,9 @@ func (c *Copier) abandonSwitch(ctx context.Context, wf *copyWorkflow, ops cutove
 // abortSwitch undoes the fence before the journal and returns to the gate,
 // failing the workflow once the attempts are used up.
 func (c *Copier) abortSwitch(ctx context.Context, wf *copyWorkflow, ops cutoverOps, reason string) (bool, error) {
+	if err := holdClaim(ctx, c.Pool, wf.id, wf.owner); err != nil {
+		return false, err
+	}
 	if err := ops.Release(ctx); err != nil {
 		return false, err
 	}

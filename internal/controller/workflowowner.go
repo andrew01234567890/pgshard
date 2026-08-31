@@ -61,24 +61,39 @@ func claimWorkflow(ctx context.Context, pool *pgxpool.Pool, me, id string, lease
 	return me, tag.RowsAffected() == 1, nil
 }
 
-// checkOwner stops a pass whose claim was taken over before it starts the
-// next stage's side effects, so a lost claim costs at most the step in
-// flight rather than a whole stage of shard mutation.
-func checkOwner(ctx context.Context, pool *pgxpool.Pool, id, owner string) error {
+// holdClaim confirms the claim before a step's side effects and refreshes
+// its lease. A step can outrun the lease -- copying one source shard is a
+// single step over a whole table -- so a pass that only claimed at its
+// start would be stealable while it is still writing; refreshing here keeps
+// the lease alive exactly as long as the pass keeps making progress.
+//
+// A workflow that was taken over or deleted under the pass matches nothing,
+// which stops the pass at the step in flight rather than a stage later.
+func holdClaim(ctx context.Context, pool *pgxpool.Pool, id, owner string) error {
 	if owner == "" {
 		return nil
 	}
-	var held bool
-	err := pool.QueryRow(ctx, `SELECT coalesce(owner = $2, false) FROM pgshard.workflows WHERE id = $1::uuid`, id, owner).Scan(&held)
-	if errors.Is(err, pgx.ErrNoRows) {
-		// The workflow was deleted under the pass; there is nothing left to
-		// drive and nothing to report.
-		return errNotOwner
-	}
+	tag, err := pool.Exec(ctx, `UPDATE pgshard.workflows SET owned_at = now() WHERE id = $1::uuid AND owner = $2`, id, owner)
 	if err != nil {
 		return err
 	}
-	if !held {
+	if tag.RowsAffected() == 0 {
+		return errNotOwner
+	}
+	return nil
+}
+
+// holdClaimTx is holdClaim inside a transaction, so a publish that makes a
+// new placement effective either carries the claim or does not happen.
+func holdClaimTx(ctx context.Context, tx pgx.Tx, id, owner string) error {
+	if owner == "" {
+		return nil
+	}
+	tag, err := tx.Exec(ctx, `UPDATE pgshard.workflows SET owned_at = now() WHERE id = $1::uuid AND owner = $2`, id, owner)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
 		return errNotOwner
 	}
 	return nil
