@@ -16,12 +16,14 @@ import (
 
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/prometheus/client_golang/prometheus"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
+	"github.com/andrew01234567890/pgshard/internal/pooler"
 	"github.com/andrew01234567890/pgshard/internal/router/plan"
 )
 
@@ -1571,8 +1573,20 @@ func (e *Executor) poolerRefused(cause error) error {
 // the refusal has to stay retryable rather than reach the client as a dead
 // connection.
 func attachRaced(cause error) bool {
-	return status.Code(cause) == codes.FailedPrecondition &&
-		strings.Contains(status.Convert(cause).Message(), "already has an Execute stream")
+	if status.Code(cause) != codes.FailedPrecondition {
+		return false
+	}
+	st := status.Convert(cause)
+	for _, d := range st.Details() {
+		if info, ok := d.(*errdetails.ErrorInfo); ok && info.GetReason() == pooler.ReasonSessionAttached {
+			return true
+		}
+	}
+	// A pooler from before the structured reason only carries the text.
+	// Kept as a fallback for a rolling upgrade, not as the contract: a
+	// reworded sentence must not turn a race worth waiting through into a
+	// dead connection reported to the client.
+	return strings.Contains(st.Message(), "already has an Execute stream")
 }
 
 // refusedError marks a pooler that refused the connection before any

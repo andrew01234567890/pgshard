@@ -138,14 +138,28 @@ func positionGoneText(msg string) bool {
 // fatal maps a pooler failure that no reconnect can cure to an Error event.
 func fatal(err error, sh router.Shard) *pgshardv1.VEvent_Error {
 	st, ok := status.FromError(err)
-	if !ok || (st.Code() != codes.FailedPrecondition && st.Code() != codes.InvalidArgument) || strings.Contains(st.Message(), "active reader") {
+	if !ok || (st.Code() != codes.FailedPrecondition && st.Code() != codes.InvalidArgument) {
 		return nil
 	}
 	code := pgshardv1.VEvent_Error_CODE_INTERNAL
 	for _, d := range st.Details() {
-		if info, ok := d.(*errdetails.ErrorInfo); ok && info.GetReason() == pooler.ReasonPositionTooOld {
-			code = pgshardv1.VEvent_Error_CODE_POSITION_TOO_OLD
+		info, ok := d.(*errdetails.ErrorInfo)
+		if !ok {
+			continue
 		}
+		switch info.GetReason() {
+		case pooler.ReasonPositionTooOld:
+			code = pgshardv1.VEvent_Error_CODE_POSITION_TOO_OLD
+		case pooler.ReasonReaderActive:
+			// Another reader holds the slot: the consumer reconnects, and
+			// telling it the position is gone would make it re-copy.
+			return nil
+		}
+	}
+	// A pooler from before the structured reason only carries the text.
+	// Kept as a fallback for a rolling upgrade, not as the contract.
+	if strings.Contains(st.Message(), "active reader") {
+		return nil
 	}
 	// Poolers from before the structured detail only carry the text, and
 	// the text has to say the position is gone rather than merely that a
