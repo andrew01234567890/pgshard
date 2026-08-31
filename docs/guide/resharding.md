@@ -1,21 +1,27 @@
 # Resharding and table re-keying
 
-> **Status: partial.** The desired-state model, the detection of range and
-> key changes, the workflow records and every building block (change
-> streams with initial copy, failover slots, role materialization for new
-> groups) are merged. The workflow *executor* that moves the data and
-> switches traffic is under active development. Until it lands, a
-> `reshard` or `table_rekey` workflow is created `pending` and stays there;
-> nothing moves. See [capability-matrix.md](../capability-matrix.md).
+> **Status: implemented.** A range or key change is detected, a workflow is
+> recorded, and the controller runs it: target groups are provisioned, the
+> data is copied and caught up, traffic is switched under write load, the
+> reverse stream is armed for rollback and the old groups are retired.
+> `spec.resharding.pauseBefore` and the `proceed` annotation are the opt-in
+> gates. The kind suites `reshard`, `reshard-split` and `reshard-merge`
+> drive it under continuous writes.
+>
+> This guide is the operator's view. [resharding.md](../resharding.md) is
+> the reference: the workflow stages, the cutover steps and what each one
+> is allowed to undo. [capability-matrix.md](../capability-matrix.md) is
+> the per-feature status of record.
 
 ## How you will trigger it
 
 Resharding is declared, not scripted:
 
-- **Change the shard count**: edit `spec.shards` on the `PgShardCluster`
-  (or create a `PgShardReshard` object naming `targetShards`), or edit
-  `pgshard.shard_ranges` directly — splits and merges as SQL in one
-  transaction:
+- **Change the shard count**: edit `spec.shards` on the `PgShardCluster`, or
+  edit `pgshard.shard_ranges` directly — splits and merges as SQL in one
+  transaction. (`PgShardReshard` is not a request: the operator creates one
+  per pending set as the record of a reshard it is already running. Creating
+  one yourself starts nothing.)
 
 ```sql
 BEGIN;
