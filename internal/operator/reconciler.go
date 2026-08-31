@@ -1106,17 +1106,22 @@ func (r *ClusterReconciler) reconcileCatalogSchema(ctx context.Context, c *pgsha
 	seedBootstrapRole := func() error {
 		return r.Prober.SeedBootstrapRole(ctx, dsn, superuserName, password)
 	}
-	if up := c.Status.CatalogUpgrade; up != nil && up.Stage == CatalogUpgradeRetiring {
-		// A schema migration applied here cannot be rolled back with the
-		// data. Logical replication carries no DDL, so the reverse stream
-		// would take pgshard.schema_migrations to the old catalog while the
-		// DDL it describes stayed behind, and rows written to a table the
-		// migration created would not replicate at all until the
-		// subscription refreshed. The old catalog would then be structurally
-		// behind and believe otherwise. Defer until it is retired.
+	if up := c.Status.CatalogUpgrade; up != nil {
+		// Both catalog publications are FOR TABLES IN SCHEMA pgshard, which
+		// includes pgshard.schema_migrations, and logical replication
+		// carries no DDL. So a migration applied to whichever catalog is
+		// serving replicates its ledger row to the other one while the
+		// ALTER and CREATE stay behind, and that catalog then skips DDL it
+		// believes it has already applied.
+		//
+		// After the cutover the stream runs new to old, so the group kept
+		// for rollback ends up structurally behind and believing
+		// otherwise. Before it, the stream runs old to new and the group
+		// about to serve does. Neither direction is safe, so the whole
+		// upgrade is the window, not just its retirement.
 		cond.Status = metav1.ConditionTrue
 		cond.Reason = "MigrationDeferred"
-		cond.Message = "catalog schema migrations wait while the previous catalog is kept for rollback; they run when it is retired"
+		cond.Message = "catalog schema migrations wait while a catalog upgrade is in flight; they run when it finishes"
 		if err := setRouterCredential(); err != nil {
 			// Not fatal here: the catalog is serving, and refusing to
 			// reconcile the rest of the cluster over a credential the next

@@ -104,6 +104,7 @@ type fakeProber struct {
 	// bootstrapRoles records every verifier the reconcile published so a
 	// generated credential can reach the router.
 	bootstrapRoles   []string
+	migratedDSNs     []string
 	adoptedVerifiers []string
 	// onRelease runs inside ReleaseCatalog, so a test can see what the
 	// cluster looked like at that point of the rollback.
@@ -537,10 +538,11 @@ func (f *fakeProber) WriteFenced(context.Context, string) (bool, error) {
 	return f.fenced, f.fenceErr
 }
 
-func (f *fakeProber) MigrateCatalog(context.Context, string) error {
+func (f *fakeProber) MigrateCatalog(_ context.Context, dsn string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.migrated++
+	f.migratedDSNs = append(f.migratedDSNs, hostOf(dsn))
 	return nil
 }
 
