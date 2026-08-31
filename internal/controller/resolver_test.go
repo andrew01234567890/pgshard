@@ -469,9 +469,8 @@ func TestResolverSparesPreparingRefreshedBetweenScanAndAbort(t *testing.T) {
 	// before the resolver aborts: the abort must land on zero rows and the
 	// pass must leave the transaction alone.
 	mustExecPool(t, f.pool, `UPDATE pgshard.xact_decisions SET heartbeat_at = now() WHERE gid = 'pgshard-c-1-1'`)
-	stale := time.Now().Add(-10 * time.Minute)
 	var out Outcome
-	if err := f.res.resolveDecision(ctx, decision{GID: "pgshard-c-1-1", State: "preparing", Participants: []int32{1}, LastAlive: stale}, holders, true, &out); err != nil {
+	if err := f.res.resolveDecision(ctx, decision{GID: "pgshard-c-1-1", State: "preparing", Participants: []int32{1}, AgeSeconds: 600}, holders, true, &out); err != nil {
 		t.Fatal(err)
 	}
 	if out != (Outcome{}) {
@@ -484,7 +483,7 @@ func TestResolverSparesPreparingRefreshedBetweenScanAndAbort(t *testing.T) {
 		t.Fatalf("shard 1 prepared %v", got)
 	}
 	// The genuinely stale sibling still ages out on the same pass shape.
-	if err := f.res.resolveDecision(ctx, decision{GID: "pgshard-c-1-2", State: "preparing", Participants: []int32{1}, LastAlive: stale}, holders, true, &out); err != nil {
+	if err := f.res.resolveDecision(ctx, decision{GID: "pgshard-c-1-2", State: "preparing", Participants: []int32{1}, AgeSeconds: 600}, holders, true, &out); err != nil {
 		t.Fatal(err)
 	}
 	if out.RolledBack != 1 {
@@ -694,4 +693,53 @@ func TestTheDefaultTimeoutSpansSeveralHeartbeats(t *testing.T) {
 		t.Fatalf("DefaultPreparingTimeout %s is under the floor of %d heartbeats (%s)",
 			DefaultPreparingTimeout, catalog.MinPreparingBeats, catalog.MinPreparingTimeout)
 	}
+}
+
+// TestOnlyTheCatalogClockDecidesACoordinatorIsDead: routers stamp
+// heartbeat_at with the catalog's clock, so the controller's own clock must
+// not be able to move the line between a live coordinator and a dead one.
+// An hour of skew is far more than the timeout in either direction.
+func TestOnlyTheCatalogClockDecidesACoordinatorIsDead(t *testing.T) {
+	parallelPG(t)
+	ctx := context.Background()
+
+	t.Run("a fast controller spares a live coordinator", func(t *testing.T) {
+		f := newResolverFixture(t)
+		f.res.Now = func() time.Time { return time.Now().Add(time.Hour) }
+		f.prepare(1, "pgshard-k-1-1", "still-deciding")
+		f.decide("pgshard-k-1-1", "preparing", 0, 1)
+		out, err := f.res.Resolve(ctx, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != (Outcome{}) {
+			t.Fatalf("outcome %+v: a heartbeating coordinator was resolved", out)
+		}
+		if got := f.prepared(1); strings.Join(got, ",") != "pgshard-k-1-1" {
+			t.Fatalf("shard 1 prepared %v", got)
+		}
+		if got := f.decisions(); strings.Join(got, ",") != "pgshard-k-1-1:preparing" {
+			t.Fatalf("decisions %v", got)
+		}
+	})
+
+	t.Run("a slow controller still buries a dead one", func(t *testing.T) {
+		f := newResolverFixture(t)
+		f.res.Now = func() time.Time { return time.Now().Add(-time.Hour) }
+		f.prepare(1, "pgshard-k-2-1", "abandoned")
+		f.decide("pgshard-k-2-1", "preparing", 10*time.Minute, 1)
+		out, err := f.res.Resolve(ctx, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out.RolledBack != 1 {
+			t.Fatalf("outcome %+v: an abandoned transaction was left prepared", out)
+		}
+		if got := f.prepared(1); len(got) != 0 {
+			t.Fatalf("shard 1 prepared %v", got)
+		}
+		if got := f.decisions(); len(got) != 0 {
+			t.Fatalf("decisions %v", got)
+		}
+	})
 }
