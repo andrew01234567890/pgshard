@@ -19,6 +19,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1531,5 +1532,95 @@ func TestAnAuthenticationFailureWithNoRevocationKeepsItsOwnMessage(t *testing.T)
 	}
 	if fatal == nil || fatal.Message != "role \"nologin\" is not permitted to log in" {
 		t.Fatalf("failure reported as %+v, want the authenticator's own message", fatal)
+	}
+}
+
+// oneConnListener hands out a single connection and then blocks until it is
+// closed, so a test can drive one accept exactly.
+type oneConnListener struct {
+	conn net.Conn
+	once sync.Once
+	done chan struct{}
+}
+
+func (l *oneConnListener) Accept() (net.Conn, error) {
+	var c net.Conn
+	l.once.Do(func() { c = l.conn })
+	if c != nil {
+		return c, nil
+	}
+	<-l.done
+	return nil, errors.New("listener closed")
+}
+
+func (l *oneConnListener) Close() error {
+	select {
+	case <-l.done:
+	default:
+		close(l.done)
+	}
+	return nil
+}
+
+func (l *oneConnListener) Addr() net.Addr { return &net.TCPAddr{} }
+
+// readCountingConn reports whether anything ever read from it, which is how
+// a test tells a connection that was handed to a session from one the accept
+// loop closed itself.
+type readCountingConn struct {
+	net.Conn
+	reads atomic.Int64
+}
+
+func (c *readCountingConn) Read(b []byte) (int, error) {
+	c.reads.Add(1)
+	return c.Conn.Read(b)
+}
+
+// TestShutdownDoesNotOvertakeAnAcceptedConnection: Serve used to add to the
+// WaitGroup after Accept returned and outside the lock, so a connection
+// could be accepted, Shutdown could run to completion against a count of
+// zero, and the handler could start afterwards -- a shutdown that had
+// already reported itself finished. The accept loop now registers the
+// handler under the lock Shutdown sets closing under, and a connection
+// accepted after that is closed rather than served.
+func TestShutdownDoesNotOvertakeAnAcceptedConnection(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = client.Close() }()
+	conn := &readCountingConn{Conn: server}
+
+	srv, err := NewServer(Config{Authenticator: TrustAuthenticator{},
+		NewExecutor: func(SessionInfo) (Executor, error) { return nil, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, release := make(chan struct{}), make(chan struct{})
+	srv.afterAccept = func() {
+		close(accepted)
+		<-release
+	}
+
+	served := make(chan error, 1)
+	l := &oneConnListener{conn: conn, done: make(chan struct{})}
+	go func() { served <- srv.Serve(l) }()
+	<-accepted
+
+	// The whole of Shutdown happens in the window Serve is held in.
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	close(release)
+
+	if err := <-served; err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+	// Join whatever the accept loop started, which Shutdown is supposed to
+	// have done already: a handler it left behind is the whole finding.
+	srv.wg.Wait()
+	if n := srv.nextID.Load(); n != 0 {
+		t.Fatalf("%d session(s) were started after Shutdown reported itself finished", n)
+	}
+	if n := conn.reads.Load(); n != 0 {
+		t.Fatalf("a session read from the connection %d times after Shutdown returned", n)
 	}
 }
