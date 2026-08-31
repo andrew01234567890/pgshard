@@ -14,6 +14,9 @@ regexes = [
   # headers, RFC 7677 vectors) are not credentials.
   '''SCRAM-SHA-256''',
   '''p=tls-server-end-point''',
+  # The operator's bootstrap-role tests need a password to seed and then
+  # read back; this is the literal they use, not a credential of anything.
+  '''s3cret-generated-by-the-operator''',
   # Azurite's published development account key (public emulator constant).
   '''Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==''',
 ]
