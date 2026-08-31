@@ -352,10 +352,11 @@ func TestRouterVStream(t *testing.T) {
 }
 
 // containerOf is the docker container name startPostgres gave the server
-// listening on addr.
-func containerOf(name, addr string) string {
-	_, port, _ := net.SplitHostPort(addr)
-	return fmt.Sprintf("pgshard-router-e2e-%s-%s", name, port)
+// listening on addr. The name is looked up rather than rebuilt: docker
+// chooses the host port, so it is not in the name.
+func containerOf(tb testing.TB, addr string) string {
+	tb.Helper()
+	return containerAt(tb, addr)
 }
 
 func hostPortOf(tb testing.TB, dsn string) string {
@@ -434,7 +435,7 @@ func TestRouterVStreamFailoverContinuity(t *testing.T) {
 	if created, err := s.client.Create(ctx, &pgshardv1.CreateVStreamRequest{Stream: "orders", Database: appDatabase}); err != nil || created.GetError() != nil {
 		t.Fatalf("create: %v %v", created, err)
 	}
-	standbyAddr, standbyDSN := startStandby(t, containerOf("shard1", hostPortOf(t, s.shard1DSN)), s.shard1DSN, preparedXacts)
+	standbyAddr, standbyDSN := startStandby(t, containerOf(t, s.shard1DSN), s.shard1DSN, preparedXacts)
 	standby, err := pgx.Connect(ctx, streamDSN(standbyDSN))
 	if err != nil {
 		t.Fatal(err)

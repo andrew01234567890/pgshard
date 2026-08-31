@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -129,6 +130,25 @@ func freePort(tb testing.TB) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
+// containers maps a server's host address to the docker container running
+// it. Docker chooses the host port now, so the name cannot be derived from
+// the port after the fact; whoever wants the logs asks here.
+var containers sync.Map
+
+// containerAt is the container name startPostgres gave the server listening
+// on addr, which may be a bare host:port or a DSN containing one.
+func containerAt(tb testing.TB, addr string) string {
+	tb.Helper()
+	if u, err := url.Parse(addr); err == nil && u.Host != "" {
+		addr = u.Host
+	}
+	name, ok := containers.Load(addr)
+	if !ok {
+		tb.Fatalf("no container recorded for %s; startPostgres records every server it starts", addr)
+	}
+	return name.(string)
+}
+
 func startPostgres(tb testing.TB, name string, opts ...string) (addr, adminDSN string) {
 	tb.Helper()
 	script := `initdb -D /tmp/pgdata --auth=trust -U postgres >/dev/null &&
@@ -146,6 +166,8 @@ func startPostgres(tb testing.TB, name string, opts ...string) (addr, adminDSN s
 	}
 	tb.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", cname).Run() })
 	addr = dockerHostPort(tb, cname)
+	containers.Store(addr, cname)
+	tb.Cleanup(func() { containers.Delete(addr) })
 	adminDSN = fmt.Sprintf("postgres://postgres@%s/postgres?sslmode=disable", addr)
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
