@@ -213,3 +213,43 @@ func BenchmarkRouterSelect1(b *testing.B) {
 		})
 	}
 }
+
+// TestParameterStatusReachesTheClient: PostgreSQL reports a GUC_REPORT
+// setting whenever it changes, and drivers read timestamps, intervals and
+// escaped text according to what they were last told. The router used to
+// drop those messages, so a client that changed one went on parsing results
+// by the values it was given at startup.
+func TestParameterStatusReachesTheClient(t *testing.T) {
+	s := startStack(t)
+	ctx := context.Background()
+	conn := s.connect(t)
+	defer func() { _ = conn.Close(ctx) }()
+
+	if got := conn.PgConn().ParameterStatus("TimeZone"); got != "UTC" {
+		t.Fatalf("TimeZone at startup = %q, want UTC", got)
+	}
+	if _, err := conn.Exec(ctx, "set time zone 'America/New_York'"); err != nil {
+		t.Fatal(err)
+	}
+	if got := conn.PgConn().ParameterStatus("TimeZone"); got != "America/New_York" {
+		t.Fatalf("TimeZone after SET = %q; the client is still parsing by the value it had at startup", got)
+	}
+
+	// A setting undone by ROLLBACK is reported back, so the client's view
+	// follows the transaction rather than the statement.
+	if _, err := conn.Exec(ctx, "begin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "set local time zone 'Asia/Tokyo'"); err != nil {
+		t.Fatal(err)
+	}
+	if got := conn.PgConn().ParameterStatus("TimeZone"); got != "Asia/Tokyo" {
+		t.Fatalf("TimeZone after SET LOCAL = %q", got)
+	}
+	if _, err := conn.Exec(ctx, "rollback"); err != nil {
+		t.Fatal(err)
+	}
+	if got := conn.PgConn().ParameterStatus("TimeZone"); got != "America/New_York" {
+		t.Fatalf("TimeZone after the rollback = %q; the client kept a value the backend no longer holds", got)
+	}
+}

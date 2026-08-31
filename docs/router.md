@@ -108,9 +108,16 @@ the rest with `0A000`. See *Routing* below.
   are forwarded to peer routers (see *Operations*).
 - **COPY.** `COPY ... FROM STDIN` relays client chunks to the pooler until
   `CopyDone`/`CopyFail`; `COPY ... TO STDOUT` streams back.
-- **Not yet.** `Flush`-driven pipelining (results before `Sync`),
-  `PortalSuspended` (`Execute` with a row limit) and `ParameterStatus`
-  forwarding are not supported by the pooler contract in this layer.
+- **`ParameterStatus`.** A GUC_REPORT setting a backend reports as changed
+  is forwarded to the client, including the report PostgreSQL sends when a
+  `SET LOCAL` is undone by `ROLLBACK` or a savepoint. Only changes: the
+  router replays session state onto every backend it moves a session to, and
+  a backend repeating what the session already asked for is not news. The
+  values advertised at startup are the router's own and are not yet read
+  back from a backend.
+- **Not yet.** `Flush`-driven pipelining (results before `Sync`) and
+  `PortalSuspended` (`Execute` with a row limit) are not supported by the
+  pooler contract in this layer.
 
 ## Routing
 

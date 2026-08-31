@@ -246,6 +246,15 @@ func (c *countingWriter) Notification(n *pgproto3.NotificationResponse) error {
 	c.wrote = true
 	return c.w.Notification(n)
 }
+
+// ParameterStatus does not count as output. It carries no part of a result,
+// and the executor suppresses one whose value the client already has, so a
+// statement retried after it is still a statement that told the client
+// nothing.
+func (c *countingWriter) ParameterStatus(name, value string) error {
+	return c.w.ParameterStatus(name, value)
+}
+
 func (c *countingWriter) CopyIn(f byte, cf []uint16) (pgwire.CopyInStream, error) {
 	c.wrote = true
 	return c.w.CopyIn(f, cf)

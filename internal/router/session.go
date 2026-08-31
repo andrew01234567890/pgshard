@@ -184,6 +184,12 @@ type Executor struct {
 	// pendingDescribes is describes for the batch in flight.
 	pendingDescribes []string
 
+	// reported is the value of every GUC_REPORT setting the client has been
+	// told, so a backend repeating one it already has -- which replaying
+	// session state onto a new backend makes routine -- is not forwarded
+	// again.
+	reported map[string]string
+
 	// txnPrelude holds the session-local statements (BEGIN, SET, ...) run
 	// since the transaction opened while nothing has touched a shard yet,
 	// so the transaction can still move to the shard of its first real
@@ -1641,8 +1647,9 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 				e.txnEnded = true
 			}
 			return firstErr
-		case *pgshardv1.ExecuteResponse_ParseComplete, *pgshardv1.ExecuteResponse_BindComplete,
-			*pgshardv1.ExecuteResponse_ParameterStatus:
+		case *pgshardv1.ExecuteResponse_ParameterStatus:
+			werr = e.reportParameter(w, m.ParameterStatus.GetName(), m.ParameterStatus.GetValue())
+		case *pgshardv1.ExecuteResponse_ParseComplete, *pgshardv1.ExecuteResponse_BindComplete:
 		default:
 			e.r.cfg.Logger.Warn("unexpected pooler response", "session", e.sid, "type", fmt.Sprintf("%T", resp.Message))
 		}
@@ -1814,9 +1821,36 @@ func (discardWriter) NoData() error                                     { return
 func (discardWriter) PortalSuspended() error                            { return nil }
 func (discardWriter) Notice(*pgproto3.NoticeResponse) error             { return nil }
 func (discardWriter) Notification(*pgproto3.NotificationResponse) error { return nil }
+func (discardWriter) ParameterStatus(string, string) error              { return nil }
 func (discardWriter) CopyIn(byte, []uint16) (pgwire.CopyInStream, error) {
 	return nil, pgwire.Errorf(pgwire.CodeProtocolViolation, "unexpected COPY while replaying session state")
 }
 func (discardWriter) CopyOut(byte, []uint16) error { return nil }
 func (discardWriter) CopyData([]byte) error        { return nil }
 func (discardWriter) CopyDone() error              { return nil }
+
+// reportParameter forwards a changed GUC_REPORT setting to the client.
+//
+// PostgreSQL sends one whenever such a setting changes, including when a
+// SET LOCAL is undone by ROLLBACK or a savepoint is rolled back, and drivers
+// read timestamps, intervals and escaped text according to what they were
+// last told. A router that drops these leaves a driver parsing results by
+// the values it was given at startup, on a backend that no longer holds
+// them.
+//
+// Only changes reach the client. The router replays session state onto
+// every backend it moves a session to, and a backend that reports back what
+// the session already asked for is not news.
+func (e *Executor) reportParameter(w pgwire.ResultWriter, name, value string) error {
+	if name == "" {
+		return nil
+	}
+	if e.reported == nil {
+		e.reported = map[string]string{}
+	}
+	if old, ok := e.reported[name]; ok && old == value {
+		return nil
+	}
+	e.reported[name] = value
+	return w.ParameterStatus(name, value)
+}
