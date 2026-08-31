@@ -54,6 +54,35 @@ Twelve runs bounds a failure rate at roughly one in twelve. It cannot see a
 rarer flake, so a green twelve is not evidence of zero — the run summary says
 so, and neither number should be reported as more than it is.
 
+## An archived dependency we cannot drop
+
+`github.com/json-iterator/go v1.1.12` is in the module graph and its upstream
+was archived on 2025-12-15, so a future parsing vulnerability there may never
+get a fix. It is not ours to remove:
+
+```
+$ go mod why github.com/json-iterator/go
+github.com/andrew01234567890/pgshard/api/v1alpha1
+k8s.io/apimachinery/pkg/runtime
+sigs.k8s.io/structured-merge-diff/v6/value
+github.com/json-iterator/go
+```
+
+Every controller-runtime user reaches it the same way. Dropping it means
+Kubernetes finishing its own move off json-iterator in
+`structured-merge-diff`; until then the honest position is that the risk is
+accepted rather than mitigated. Its `modern-go/concurrent` and
+`modern-go/reflect2` dependencies are old for the same reason.
+
+What bounds it: govulncheck runs in CI and reports on the packages actually
+reachable from our code, so a vulnerability in a json-iterator path we call
+fails a required check rather than sitting unnoticed; `dependency-review`
+covers what a pull request adds. Neither makes an archived upstream
+maintained, which is why this is written down instead of closed.
+
+Revisit when `structured-merge-diff` no longer imports it -- the check is the
+`go mod why` above returning nothing.
+
 ## Required checks
 
 What `main` requires **today** is a list of job names:
