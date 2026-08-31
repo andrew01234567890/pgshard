@@ -2,11 +2,18 @@ package router
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
 )
+
+// codeReadOnlyTransaction is PostgreSQL's own answer when a shard is paused
+// and something reached it anyway: the pause is
+// default_transaction_read_only, and a transaction that began under it
+// cannot write, whatever the router believed when it sent the statement.
+const codeReadOnlyTransaction = "25006"
 
 // codeWriteFence is cannot_connect_now: the cluster is pausing writes (for
 // a certified restore point, or a reshard cutover fenced the serving
@@ -177,4 +184,35 @@ func (e *Executor) txnWrote() bool {
 		}
 	}
 	return false
+}
+
+// writePauseRetryable reports that a statement failed only because a shard
+// was paused for a barrier the router had not seen yet, on a transaction
+// that has done nothing else and has told the client nothing.
+//
+// The window cannot be closed by looking harder: the pause is applied on
+// the shards and the routers learn of it afterwards, so a transaction can
+// always open in between. PostgreSQL reads default_transaction_read_only at
+// BEGIN, so such a transaction stays unable to write even after the pause
+// lifts -- an error the client can do nothing with, on a statement pgshard
+// undertook to buffer.
+func (e *Executor) writePauseRetryable(err error, wrote bool) bool {
+	if err == nil || wrote || e.txnTouched || e.txnWrote() {
+		return false
+	}
+	pe, ok := errors.AsType[*pgwire.Error](err)
+	return ok && pe.Code == codeReadOnlyTransaction
+}
+
+// reopenAfterWritePause gives the transaction back, waits the pause out and
+// opens it again, so the statement can run a second time on a backend that
+// is allowed to write.
+func (e *Executor) reopenAfterWritePause(ctx context.Context) error {
+	if err := e.releaseUntouchedTxn(ctx); err != nil {
+		return err
+	}
+	if err := e.r.awaitWriteFence(ctx, nil); err != nil {
+		return err
+	}
+	return e.replayPrelude(ctx)
 }

@@ -747,6 +747,14 @@ func (e *Executor) withFailover(ctx context.Context, w pgwire.ResultWriter, run 
 	}
 	cw := &countingWriter{w: w}
 	err := run(cw)
+	if e.writePauseRetryable(err, cw.wrote) {
+		if rerr := e.reopenAfterWritePause(ctx); rerr != nil {
+			err = rerr
+		} else {
+			e.r.cfg.Logger.Info("retrying statement after the cluster write pause", "session", e.sid, "shard", e.shard)
+			err = run(cw)
+		}
+	}
 	switch decideFailover(isFailover(err), inTxn, cw.wrote, e.r.Buffered(e.shard), e.r.cfg.Buffering.PerShardCap) {
 	case failoverFailTxn:
 		e.dropStream()

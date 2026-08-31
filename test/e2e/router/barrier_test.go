@@ -102,7 +102,10 @@ func TestBarrierUnderTwoPhaseWorkload(t *testing.T) {
 		t.Fatalf("workload made no progress: %d commits\n%s", committed.Load(), s.routerLog.String())
 	}
 
+	before := committed.Load()
+	start := time.Now()
 	rp, err := barrier.Run(ctx, "b1")
+	took := time.Since(start)
 	stop.Store(true)
 	wg.Wait()
 	close(errs)
@@ -128,12 +131,30 @@ func TestBarrierUnderTwoPhaseWorkload(t *testing.T) {
 	if strings.Join(names, ",") != "catalog,shard0,shard1" {
 		t.Fatalf("groups %v", names)
 	}
-	if paused.Load() != 0 {
-		t.Errorf("%d transactions were refused by the write pause; the barrier took longer than the buffering window", paused.Load())
+	// The barrier must not take the buffering window. Its drain waits for
+	// the transactions in flight, and those transactions wait for it if the
+	// router holds their statements, which is a deadlock only the window
+	// breaks -- and every client caught in it is refused. A healthy barrier
+	// here is milliseconds.
+	if took > 5*time.Second {
+		t.Errorf("the barrier took %s; a drain that waits for the transactions waiting for it takes the whole buffering window", took)
+	}
+	// Refusals are allowed, and are not a bug: a transaction that had
+	// already written and then reached a shard the barrier had just paused
+	// cannot be rescued, because PostgreSQL read
+	// default_transaction_read_only when that participant's transaction
+	// began. What the client must never see is the shard's own 25006 --
+	// the worker loop above fails the test on any code but pgshard's
+	// retryable 57P03.
+	if n := paused.Load(); n > 0 {
+		t.Logf("%d transactions refused by the write pause, retryable", n)
 	}
 	after := committed.Load()
 	if after < 8 {
 		t.Fatalf("commits %d", after)
+	}
+	if after <= before {
+		t.Errorf("no transaction committed after the barrier: %d then %d", before, after)
 	}
 
 	// The row and the state at the barrier: certified, all decisions
