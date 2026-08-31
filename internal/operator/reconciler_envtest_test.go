@@ -1310,3 +1310,53 @@ func deleteCluster(t *testing.T, c *pgshardv1alpha1.PgShardCluster) {
 		_ = k8sClient.Delete(ctx, &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: g.LeaseName(), Namespace: c.Namespace}})
 	}
 }
+
+func currentAgentToken(t *testing.T, cluster string) string {
+	t.Helper()
+	var sec corev1.Secret
+	get(t, AgentSecretName(cluster), &sec)
+	return string(sec.Data[agentTokenKey])
+}
+
+// TestRotatingOneCredentialLeavesTheOtherAlone: the agent's control-plane
+// token used to be HMAC(superuser password), so anything holding that
+// password also held what unlocks Promote, Demote, Rewind and Reclone on
+// every member -- and rotating either silently rotated the other. They are
+// separate Secrets now, which is only worth anything if rotating one really
+// does leave the other where it was.
+func TestRotatingOneCredentialLeavesTheOtherAlone(t *testing.T) {
+	r, _, c := setup(t, "rotate")
+	reconcile(t, r, c)
+	password, token := currentPassword(t, "rotate"), currentAgentToken(t, "rotate")
+	if password == "" || token == "" {
+		t.Fatal("both credentials must exist before rotating either")
+	}
+	if password == token {
+		t.Fatal("the token is the password; separate Secrets holding one value prove nothing")
+	}
+
+	rotate := func(name, key, value string) {
+		t.Helper()
+		var sec corev1.Secret
+		get(t, name, &sec)
+		sec.Data[key] = []byte(value)
+		if err := k8sClient.Update(context.Background(), &sec); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rotate(SecretName("rotate"), secretKey, "a-rotated-superuser-password")
+	reconcile(t, r, c)
+	if got := currentAgentToken(t, "rotate"); got != token {
+		t.Error("rotating the superuser password changed the agent token")
+	}
+
+	rotate(AgentSecretName("rotate"), agentTokenKey, "a-rotated-agent-token")
+	reconcile(t, r, c)
+	if got := currentPassword(t, "rotate"); got != "a-rotated-superuser-password" {
+		t.Errorf("rotating the agent token changed the superuser password to %q", got)
+	}
+	if got := currentAgentToken(t, "rotate"); got != "a-rotated-agent-token" {
+		t.Errorf("the rotated agent token was overwritten with %q", got)
+	}
+}
