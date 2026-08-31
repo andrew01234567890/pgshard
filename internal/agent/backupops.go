@@ -18,13 +18,16 @@ var ErrBackupOnStandby = errors.New("backups run on the primary only")
 
 // backupRunner builds the pgbackrest runner for the current settings.
 func (in *Instance) backupRunner() (*backup.Runner, error) {
-	if in.cfg.Backup == nil {
+	// One read of the policy, not three: a reload replacing it between them
+	// used to be a nil dereference in whichever goroutine got there.
+	policy := in.cfg.BackupPolicy()
+	if policy == nil {
 		return nil, ErrNoBackupPolicy
 	}
 	if in.newRunner != nil {
-		return in.newRunner(*in.cfg.Backup), nil
+		return in.newRunner(*policy), nil
 	}
-	r := backup.NewRunner(*in.cfg.Backup, in.log)
+	r := backup.NewRunner(*policy, in.log)
 	r.Env = []string{"PGPASSFILE=" + in.pgpassPath()}
 	r.Start = func(cmd *exec.Cmd) (func(), error) {
 		if err := in.sup.StartTracked(cmd); err != nil {
@@ -39,7 +42,7 @@ func (in *Instance) backupRunner() (*backup.Runner, error) {
 // EnsureStanza creates or upgrades the pgbackrest stanza; a no-op without a
 // policy or on a standby.
 func (in *Instance) EnsureStanza(ctx context.Context) error {
-	if in.cfg.Backup == nil {
+	if in.cfg.BackupPolicy() == nil {
 		return nil
 	}
 	standby, err := in.IsStandby()

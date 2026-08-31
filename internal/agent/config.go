@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/andrew01234567890/pgshard/internal/agent/backup"
@@ -86,6 +87,13 @@ type Config struct {
 
 	// path is where the config was loaded from; Refresh rereads it.
 	path string
+
+	// mu guards the fields Refresh replaces while the instance runs:
+	// Postgres.Parameters, OverrideFile, SettingsHash, Backup and
+	// RecloneFromRepo. Everything else is written once, at load. Readers
+	// that run outside the agent server's own lock take it through an
+	// accessor; today that is the backup policy.
+	mu sync.RWMutex
 }
 
 // PostgresSettings are the operator-provided values in postgresql.conf.
@@ -185,12 +193,29 @@ func (c *Config) Refresh() error {
 	if err != nil {
 		return err
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.Postgres.Parameters = fresh.Postgres.Parameters
 	c.OverrideFile = fresh.OverrideFile
 	c.SettingsHash = fresh.SettingsHash
 	c.Backup = fresh.Backup
 	c.RecloneFromRepo = fresh.RecloneFromRepo
 	return nil
+}
+
+// BackupPolicy is the backup settings in force, or nil when the cluster has
+// no policy.
+//
+// Read through this rather than through the field. Refresh replaces it from
+// whichever goroutine served the reload, while the backup RPCs and the
+// stanza loop read it without the server lock; reading the field twice --
+// once for the nil check and once to dereference -- could find a policy and
+// then nil, which ends the agent, and the agent is PID 1 in the PostgreSQL
+// pod.
+func (c *Config) BackupPolicy() *backup.Settings {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Backup
 }
 
 func (c *Config) applyDefaults() {

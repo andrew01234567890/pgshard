@@ -49,7 +49,8 @@ func (in *Instance) restorePending() (bool, error) {
 // starts again as a normal primary. Nothing is archived before that point,
 // so the source stanza is never written to.
 func (in *Instance) restoreBootstrap(ctx context.Context) error {
-	if in.cfg.Restore == nil || in.cfg.Backup == nil {
+	policy := in.cfg.BackupPolicy()
+	if in.cfg.Restore == nil || policy == nil {
 		return errors.New("restore needs restore and backup settings")
 	}
 	opts := *in.cfg.Restore
@@ -61,7 +62,7 @@ func (in *Instance) restoreBootstrap(ctx context.Context) error {
 	if err := clearDir(in.cfg.PGData); err != nil {
 		return err
 	}
-	if err := backup.WriteConfig(*in.cfg.Backup, in.cfg.PGData, in.cfg.Port, opts.Stanza); err != nil {
+	if err := backup.WriteConfig(*policy, in.cfg.PGData, in.cfg.Port, opts.Stanza); err != nil {
 		return fmt.Errorf("pgbackrest config: %w", err)
 	}
 	r, err := in.backupRunner()
@@ -154,10 +155,14 @@ func (in *Instance) repoClone(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	policy := in.cfg.BackupPolicy()
+	if policy == nil {
+		return ErrNoBackupPolicy
+	}
 	if err := os.MkdirAll(in.cfg.PGData, 0o700); err != nil {
 		return err
 	}
-	if err := backup.WriteConfig(*in.cfg.Backup, in.cfg.PGData, in.cfg.Port); err != nil {
+	if err := backup.WriteConfig(*policy, in.cfg.PGData, in.cfg.Port); err != nil {
 		return fmt.Errorf("pgbackrest config: %w", err)
 	}
 	ok, err := r.HasCompletedBackup(ctx)
@@ -167,7 +172,7 @@ func (in *Instance) repoClone(ctx context.Context) error {
 	if !ok {
 		return errors.New("the repository holds no backup for this stanza")
 	}
-	in.log.Info("recloning from the repository", "stanza", in.cfg.Backup.Stanza, "slot", in.cfg.SlotName())
+	in.log.Info("recloning from the repository", "stanza", policy.Stanza, "slot", in.cfg.SlotName())
 	if err := in.slotFn(ctx, in.cfg.PrimaryConninfo); err != nil {
 		return err
 	}
