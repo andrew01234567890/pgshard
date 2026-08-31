@@ -56,6 +56,9 @@ type pgCutover struct {
 
 // driveCutover builds the PostgreSQL ops of one workflow and advances it.
 func (c *Copier) driveCutover(ctx context.Context, wf *copyWorkflow) (bool, error) {
+	if err := checkOwner(ctx, c.Pool, wf.id, wf.owner); err != nil {
+		return false, err
+	}
 	if _, _, err := c.pinSource(ctx, wf); err != nil {
 		return false, err
 	}

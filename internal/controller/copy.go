@@ -60,6 +60,12 @@ type Copier struct {
 	ThrottleHigh, ThrottleLow int64
 	// PreparedWait bounds the wait for in-doubt prepared transactions.
 	PreparedWait time.Duration
+	// OwnerLease is how long this replica's claim on a workflow stands
+	// without being refreshed; zero means DefaultOwnerLease. Replica
+	// identifies this process in a claim; zero means a token generated
+	// once per process.
+	OwnerLease time.Duration
+	Replica    string
 
 	// progress is the last copy state logged per workflow, so a pass that
 	// found no change stays quiet.
@@ -114,6 +120,11 @@ type copyWorkflow struct {
 	copy    copyState
 	spec    cutoverSpec
 	cutover cutoverState
+	// owner is this pass's claim on the workflow and fence the state it
+	// started from; every write it makes requires both to still hold, so a
+	// workflow taken over stops the old pass instead of racing the new one.
+	owner string
+	fence string
 }
 
 // sourceSet is the shard set the workflow copies from: recorded in the
@@ -196,8 +207,15 @@ func (c *Copier) Pass(ctx context.Context) (CopyOutcome, error) {
 	}
 	for i := range wfs {
 		wf := &wfs[i]
-		out.Driven++
 		var err error
+		var held bool
+		if wf.owner, held, err = claimWorkflow(ctx, c.Pool, c.Replica, wf.id, c.OwnerLease); err != nil {
+			return out, err
+		} else if !held {
+			continue
+		}
+		wf.fence = wf.state
+		out.Driven++
 		if wf.stage == StageCancelling {
 			err = c.cancel(ctx, wf)
 			if err == nil {
@@ -218,11 +236,18 @@ func (c *Copier) Pass(ctx context.Context) (CopyOutcome, error) {
 			}
 		}
 		if err != nil {
+			if errors.Is(err, errNotOwner) {
+				c.logger().Info("reshard copy pass handed over", "workflow", wf.id)
+				continue
+			}
 			var fatal *fatalError
 			if errors.As(err, &fatal) {
 				out.Failed++
 				c.logger().Error("reshard copy failed", "workflow", wf.id, "err", err)
 				if ferr := c.fail(ctx, wf, err); ferr != nil {
+					if errors.Is(ferr, errNotOwner) {
+						continue
+					}
 					return out, ferr
 				}
 				continue
@@ -313,14 +338,22 @@ func (c *Copier) save(ctx context.Context, wf *copyWorkflow, stage, message stri
 	if stage != "" {
 		patch["stage"] = stage
 	}
-	_, err := c.Pool.Exec(ctx, `UPDATE pgshard.workflows SET status = status || $2::jsonb, updated_at = now() WHERE id = $1::uuid`, wf.id, mustJSON(patch))
-	return err
+	return ownedExec(ctx, c.Pool, wf.owner,
+		`UPDATE pgshard.workflows SET status = status || $2::jsonb, updated_at = now()
+		 WHERE id = $1::uuid AND ($3::text IS NULL OR (owner = $3 AND state = $4))`,
+		wf.id, mustJSON(patch), nullIfEmpty(wf.owner), wf.fence)
 }
 
 func (c *Copier) fail(ctx context.Context, wf *copyWorkflow, cause error) error {
-	_, err := c.Pool.Exec(ctx, `UPDATE pgshard.workflows SET state = $2, error = $3, status = status || $4::jsonb, updated_at = now() WHERE id = $1::uuid`,
-		wf.id, StateFailed, cause.Error(), mustJSON(map[string]any{"stage": "failed", "copy": wf.copy, "message": cause.Error()}))
-	return err
+	if err := ownedExec(ctx, c.Pool, wf.owner,
+		`UPDATE pgshard.workflows SET state = $2, error = $3, status = status || $4::jsonb, updated_at = now()
+		 WHERE id = $1::uuid AND ($5::text IS NULL OR (owner = $5 AND state = $6))`,
+		wf.id, StateFailed, cause.Error(), mustJSON(map[string]any{"stage": "failed", "copy": wf.copy, "message": cause.Error()}),
+		nullIfEmpty(wf.owner), wf.fence); err != nil {
+		return err
+	}
+	wf.fence = StateFailed
+	return nil
 }
 
 // sources are the shards of the serving set the copy reads from.
@@ -457,6 +490,9 @@ func (c *Copier) databases(ctx context.Context) ([]dbPlan, error) {
 // drive advances one workflow through the copy phase; it reports whether
 // the stage changed.
 func (c *Copier) drive(ctx context.Context, wf *copyWorkflow) (bool, error) {
+	if err := checkOwner(ctx, c.Pool, wf.id, wf.owner); err != nil {
+		return false, err
+	}
 	srcSet, srcIDs, err := c.pinSource(ctx, wf)
 	if err != nil {
 		return false, err
@@ -1182,9 +1218,14 @@ func (c *Copier) cancel(ctx context.Context, wf *copyWorkflow) error {
 		}
 		message = "cutover cancelled: fence lifted, reverse replication and forward objects dropped"
 	}
-	_, err = c.Pool.Exec(ctx, `UPDATE pgshard.workflows SET state = $2, status = status || $3::jsonb, updated_at = now() WHERE id = $1::uuid`,
-		wf.id, StateCancelled, mustJSON(map[string]any{"stage": StageCancelled, "message": message}))
-	return err
+	if err := ownedExec(ctx, c.Pool, wf.owner,
+		`UPDATE pgshard.workflows SET state = $2, status = status || $3::jsonb, updated_at = now()
+		 WHERE id = $1::uuid AND ($4::text IS NULL OR (owner = $4 AND state = $5))`,
+		wf.id, StateCancelled, mustJSON(map[string]any{"stage": StageCancelled, "message": message}), nullIfEmpty(wf.owner), wf.fence); err != nil {
+		return err
+	}
+	wf.fence = StateCancelled
+	return nil
 }
 
 // fencedStage reports whether a workflow's stage means a cutover has started,

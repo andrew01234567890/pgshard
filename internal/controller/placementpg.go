@@ -449,6 +449,9 @@ func dropArtifactTable(ctx context.Context, conn ShardConn, schema, name, marker
 func (p *Placer) ensureShadows(ctx context.Context, wf *placementWorkflow) error {
 	var ddl []string
 	for _, t := range wf.rt.Holders() {
+		if err := checkOwner(ctx, p.Pool, wf.id, wf.owner); err != nil {
+			return err
+		}
 		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
 		if err != nil {
 			return err
@@ -1074,6 +1077,9 @@ func (p *Placer) fence(ctx context.Context, wf *placementWorkflow) error {
 // placement is published.
 func (p *Placer) fenceShards(ctx context.Context, wf *placementWorkflow) error {
 	return p.eachShard(ctx, wf, func(ctx context.Context, conn ShardConn) error {
+		if err := checkOwner(ctx, p.Pool, wf.id, wf.owner); err != nil {
+			return err
+		}
 		return fenceTables(ctx, conn, wf.spec.SchemaName, wf.shape.qualified(wf.spec.TableName), wf.shape.qualified(wf.shadow()))
 	})
 }
