@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"reflect"
@@ -162,8 +161,7 @@ func imageAvailable(t *testing.T, name string) bool {
 
 func startPostgres(t *testing.T, img pgImage) string {
 	t.Helper()
-	port := freePort(t)
-	args := []string{"run", "-d", "--rm", "-p", fmt.Sprintf("127.0.0.1:%d:5432", port)}
+	args := []string{"run", "-d", "--rm", "-p", "127.0.0.1::5432"}
 	if img.bare {
 		args = append(args, "--entrypoint", "sh", img.name, "-ec",
 			`initdb -D /tmp/pgdata --auth=trust -U postgres >/dev/null &&
@@ -179,7 +177,7 @@ func startPostgres(t *testing.T, img pgImage) string {
 	id := strings.TrimSpace(string(out))
 	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", id).Run() })
 
-	dsn := fmt.Sprintf("postgres://postgres@127.0.0.1:%d/postgres?sslmode=disable", port)
+	dsn := fmt.Sprintf("postgres://postgres@%s/postgres?sslmode=disable", dockertest.HostPort(t, id, "5432"))
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -195,16 +193,6 @@ func startPostgres(t *testing.T, img pgImage) string {
 	logs, _ := exec.Command("docker", "logs", id).CombinedOutput()
 	t.Fatalf("postgres in %s did not become ready:\n%s", img.name, logs)
 	return ""
-}
-
-func freePort(t *testing.T) int {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = l.Close() }()
-	return l.Addr().(*net.TCPAddr).Port
 }
 
 func connect(t *testing.T, dsn string) *pgx.Conn {

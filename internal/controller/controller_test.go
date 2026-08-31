@@ -46,20 +46,6 @@ func parallelPG(t *testing.T) {
 }
 
 // hostPort reads back the host side of the container's published 5432.
-func hostPort(t *testing.T, id string) string {
-	t.Helper()
-	out, err := exec.Command("docker", "port", id, "5432").Output()
-	if err != nil {
-		t.Fatalf("docker port %s: %v", id, err)
-	}
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if addr := strings.TrimSpace(line); strings.HasPrefix(addr, "127.0.0.1:") {
-			return addr
-		}
-	}
-	t.Fatalf("docker port %s: no 127.0.0.1 mapping in %q", id, out)
-	return ""
-}
 
 // startPostgresImage starts image with extra docker run arguments and
 // server options and returns the host-side DSN.
@@ -88,7 +74,7 @@ func startPostgresImage(t *testing.T, image string, dockerArgs []string, opts ..
 	t.Cleanup(func() {
 		_ = exec.Command("docker", "rm", "-f", id).Run()
 	})
-	dsn := fmt.Sprintf("postgres://postgres@%s/postgres?sslmode=disable", hostPort(t, id))
+	dsn := fmt.Sprintf("postgres://postgres@%s/postgres?sslmode=disable", dockertest.HostPort(t, id, "5432"))
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

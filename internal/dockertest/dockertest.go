@@ -4,6 +4,8 @@ package dockertest
 
 import (
 	"os"
+	"os/exec"
+	"strings"
 	"testing"
 )
 
@@ -24,4 +26,25 @@ func Unavailable(t *testing.T, format string, args ...any) {
 		t.Fatalf("%s is set, so this must run: "+format, append([]any{RequireEnv}, args...)...)
 	}
 	t.Skipf(format, args...)
+}
+
+// HostPort is the 127.0.0.1 address Docker published for a container's
+// port. Fixtures ask Docker to choose the host port and then read it back,
+// rather than picking a free one and binding it a moment later: between
+// choosing and binding, any other test or process on the machine can take
+// it, and the failure that produces -- "ports are not available", or a
+// server that never comes up -- says nothing about the code under test.
+func HostPort(t *testing.T, id, port string) string {
+	t.Helper()
+	out, err := exec.Command("docker", "port", id, port).Output()
+	if err != nil {
+		t.Fatalf("docker port %s %s: %v", id, port, err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if addr := strings.TrimSpace(line); strings.HasPrefix(addr, "127.0.0.1:") {
+			return addr
+		}
+	}
+	t.Fatalf("docker port %s %s: no 127.0.0.1 mapping in %q", id, port, out)
+	return ""
 }
