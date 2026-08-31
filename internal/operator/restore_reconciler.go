@@ -519,11 +519,16 @@ func (r *RestoreReconciler) reconcileTwoPhase(ctx context.Context, rs *pgshardv1
 		for _, gid := range out.Unverifiable {
 			st.Unverifiable = append(st.Unverifiable, g.Name()+": "+gid)
 		}
+		for _, gid := range out.Unreadable {
+			st.Unreadable = append(st.Unreadable, g.Name()+": "+gid)
+		}
 	}
 	rs.Status.Reconciliation = st
-	if blockers := append(append([]string{}, st.Contradictions...), st.Unverifiable...); len(blockers) > 0 {
+	blockers := append(append([]string{}, st.Contradictions...), st.Unverifiable...)
+	blockers = append(blockers, st.Unreadable...)
+	if len(blockers) > 0 {
 		rs.Status.Phase = pgshardv1alpha1.RestorePhaseFailed
-		rs.Status.Error = fmt.Sprintf("two-phase reconciliation found %d unresolved commit(s), the cluster stays fenced: %s", len(blockers), strings.Join(blockers, "; "))
+		rs.Status.Error = fmt.Sprintf("two-phase reconciliation found %d transaction(s) it could not resolve, the cluster stays fenced: %s", len(blockers), strings.Join(blockers, "; "))
 		return nil
 	}
 	// Straight to the catalog, not through the agent RPC: a catalog

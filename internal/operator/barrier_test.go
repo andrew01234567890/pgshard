@@ -260,7 +260,7 @@ func recoveredRestore(t *testing.T, name string, target pgshardv1alpha1.RestoreT
 
 func TestBarrierRestoreReconcilesPreparedTransactionsThenUnfences(t *testing.T) {
 	r, cl, twoPC := recoveredBarrierRestore(t, "r1")
-	twoPC.decisions = []twopc.Decision{{GID: "pgshard-a", State: "commit", Participants: []int32{0, 1}}, {GID: "pgshard-b", State: "abort", Participants: []int32{1}}}
+	twoPC.decisions = []twopc.Decision{{GID: "pgshard-a", State: "commit", Participants: []twopc.Participation{{Shard: 0}, {Shard: 1}}}, {GID: "pgshard-b", State: "abort", Participants: []twopc.Participation{{Shard: 1}}}}
 	twoPC.outcomes["10.1.0.2:9090"] = twopc.Outcome{Committed: 1}
 	twoPC.outcomes["10.1.0.3:9090"] = twopc.Outcome{Committed: 1, RolledBack: 1}
 	res, got := reconcileRestore(t, r, "r1")
@@ -304,14 +304,14 @@ func TestBarrierRestoreReconcilesPreparedTransactionsThenUnfences(t *testing.T) 
 
 func TestBarrierRestoreFailsOnContradictionAndStaysFenced(t *testing.T) {
 	r, _, twoPC := recoveredBarrierRestore(t, "r2")
-	twoPC.decisions = []twopc.Decision{{GID: "pgshard-a", State: "commit", Participants: []int32{0, 1}}}
+	twoPC.decisions = []twopc.Decision{{GID: "pgshard-a", State: "commit", Participants: []twopc.Participation{{Shard: 0}, {Shard: 1}}}}
 	twoPC.outcomes["10.1.0.2:9090"] = twopc.Outcome{Committed: 1}
 	twoPC.outcomes["10.1.0.3:9090"] = twopc.Outcome{Contradictions: []string{"pgshard-a"}}
 	res, got := reconcileRestore(t, r, "r2")
 	if got.Status.Phase != pgshardv1alpha1.RestorePhaseFailed || res.RequeueAfter != 0 {
 		t.Fatalf("status %+v", got.Status)
 	}
-	if !strings.Contains(got.Status.Error, "1 unresolved commit(s), the cluster stays fenced: shard-1: pgshard-a") {
+	if !strings.Contains(got.Status.Error, "1 transaction(s) it could not resolve, the cluster stays fenced: shard-1: pgshard-a") {
 		t.Fatalf("error %q", got.Status.Error)
 	}
 	if st := got.Status.Reconciliation; st == nil || st.Unfenced || len(st.Contradictions) != 1 || st.Committed != 1 {
@@ -324,16 +324,41 @@ func TestBarrierRestoreFailsOnContradictionAndStaysFenced(t *testing.T) {
 	}
 }
 
+// TestBarrierRestoreFailsOnUnreadableAndStaysFenced: a group that cannot
+// read a decision leaves the transaction prepared, so the restore is not
+// finished and the cluster must not be unfenced.
+func TestBarrierRestoreFailsOnUnreadableAndStaysFenced(t *testing.T) {
+	r, _, twoPC := recoveredBarrierRestore(t, "rr")
+	twoPC.decisions = []twopc.Decision{{GID: "pgshard-a", State: "commit", Participants: []twopc.Participation{{Shard: 0}, {Shard: 1}}}}
+	twoPC.outcomes["10.1.0.2:9090"] = twopc.Outcome{Committed: 1}
+	twoPC.outcomes["10.1.0.3:9090"] = twopc.Outcome{Unreadable: []string{"pgshard-a"}}
+	res, got := reconcileRestore(t, r, "rr")
+	if got.Status.Phase != pgshardv1alpha1.RestorePhaseFailed || res.RequeueAfter != 0 {
+		t.Fatalf("status %+v", got.Status)
+	}
+	if !strings.Contains(got.Status.Error, "1 transaction(s) it could not resolve, the cluster stays fenced: shard-1: pgshard-a") {
+		t.Fatalf("error %q", got.Status.Error)
+	}
+	if st := got.Status.Reconciliation; st == nil || st.Unfenced || len(st.Unreadable) != 1 {
+		t.Fatalf("reconciliation %+v", st)
+	}
+	for _, c := range twoPC.calls {
+		if strings.HasPrefix(c, "fence") {
+			t.Fatalf("fence released despite an unreadable decision: %v", twoPC.calls)
+		}
+	}
+}
+
 func TestBarrierRestoreFailsOnUnverifiableAndStaysFenced(t *testing.T) {
 	r, _, twoPC := recoveredBarrierRestore(t, "ru")
-	twoPC.decisions = []twopc.Decision{{GID: "pgshard-a", State: "commit", Participants: []int32{0, 1}}}
+	twoPC.decisions = []twopc.Decision{{GID: "pgshard-a", State: "commit", Participants: []twopc.Participation{{Shard: 0}, {Shard: 1}}}}
 	twoPC.outcomes["10.1.0.2:9090"] = twopc.Outcome{Committed: 1}
 	twoPC.outcomes["10.1.0.3:9090"] = twopc.Outcome{Unverifiable: []string{"pgshard-a"}}
 	res, got := reconcileRestore(t, r, "ru")
 	if got.Status.Phase != pgshardv1alpha1.RestorePhaseFailed || res.RequeueAfter != 0 {
 		t.Fatalf("status %+v", got.Status)
 	}
-	if !strings.Contains(got.Status.Error, "1 unresolved commit(s), the cluster stays fenced: shard-1: pgshard-a") {
+	if !strings.Contains(got.Status.Error, "1 transaction(s) it could not resolve, the cluster stays fenced: shard-1: pgshard-a") {
 		t.Fatalf("error %q", got.Status.Error)
 	}
 	if st := got.Status.Reconciliation; st == nil || st.Unfenced || len(st.Unverifiable) != 1 || len(st.Contradictions) != 0 {

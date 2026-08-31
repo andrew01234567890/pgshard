@@ -32,15 +32,44 @@ func (s *Server) ListTransactionDecisions(ctx context.Context, _ *pgshardv1.List
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
-	decisions, err := pgx.CollectRows(rows, pgx.RowToStructByPos[twopc.Decision])
+	stored, err := pgx.CollectRows(rows, pgx.RowToStructByPos[decisionRow])
 	if err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
-	for _, d := range decisions {
-		resp.Decisions = append(resp.Decisions, &pgshardv1.TransactionDecision{Gid: d.GID, State: d.State, Participants: d.Participants, ParticipantXids: d.ParticipantXIDs})
+	for _, r := range stored {
+		resp.Decisions = append(resp.Decisions, twopc.DecisionToProto(r.decision()))
 	}
 	return resp, nil
+}
+
+// decisionRow is one xact_decisions row as the catalog stores it: the
+// participants and their transaction ids in two arrays paired by position.
+// This is the only place that pairing is read, so nothing downstream can
+// mis-associate a transaction id with a shard.
+type decisionRow struct {
+	GID          string
+	State        string
+	Participants []int32
+	XIDs         []string
+}
+
+func (r decisionRow) decision() twopc.Decision {
+	d := twopc.Decision{GID: r.GID, State: twopc.State(r.State)}
+	// Arrays of different lengths cannot be paired, and the writer sets
+	// both in one statement, so a mismatch means the row is not what it
+	// claims to be. Dropping every id is the safe reading: a commit the
+	// participant does not hold becomes unverifiable and fails the
+	// restore, rather than being decided against the wrong transaction.
+	paired := len(r.Participants) == len(r.XIDs)
+	for i, shard := range r.Participants {
+		p := twopc.Participation{Shard: shard}
+		if paired {
+			p.XID = r.XIDs[i]
+		}
+		d.Participants = append(d.Participants, p)
+	}
+	return d
 }
 
 // ListPreparedTransactions lists the pgshard-coordinated prepared
@@ -71,11 +100,11 @@ func (s *Server) ReconcilePreparedTransactions(ctx context.Context, req *pgshard
 	resp.Epoch = req.GetEpoch()
 	decisions := make([]twopc.Decision, 0, len(req.GetDecisions()))
 	for _, d := range req.GetDecisions() {
-		decisions = append(decisions, twopc.Decision{GID: d.GetGid(), State: d.GetState(), Participants: d.GetParticipants(), ParticipantXIDs: d.GetParticipantXids()})
+		decisions = append(decisions, twopc.DecisionFromProto(d))
 	}
 	out, err := twopc.Reconcile(ctx, &instanceParticipant{inst: s.inst}, req.GetShardId(), decisions)
 	resp.Committed, resp.RolledBack = uint32(out.Committed), uint32(out.RolledBack)
-	resp.Contradictions, resp.Unverifiable = out.Contradictions, out.Unverifiable
+	resp.Contradictions, resp.Unverifiable, resp.Unreadable = out.Contradictions, out.Unverifiable, out.Unreadable
 	resp.Error = pgErr(err)
 	return resp, nil
 }

@@ -1824,6 +1824,14 @@ spec:
                     description: Unfenced is true once the write fence of the new
                       cluster was released.
                     type: boolean
+                  unreadable:
+                    description: |-
+                      Unreadable lists "group: gid" pairs whose recorded decision the group
+                      does not recognise; they are left prepared rather than read as an
+                      abort, and any entry fails the restore.
+                    items:
+                      type: string
+                    type: array
                   unverifiable:
                     description: |-
                       Unverifiable lists "group: gid" pairs decided commit that the group

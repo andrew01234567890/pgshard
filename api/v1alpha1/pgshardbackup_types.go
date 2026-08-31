@@ -432,6 +432,11 @@ type RestoreReconciliationStatus struct {
 	// contradiction, since the commit's presence cannot be proven.
 	// +optional
 	Unverifiable []string `json:"unverifiable,omitempty"`
+	// Unreadable lists "group: gid" pairs whose recorded decision the group
+	// does not recognise; they are left prepared rather than read as an
+	// abort, and any entry fails the restore.
+	// +optional
+	Unreadable []string `json:"unreadable,omitempty"`
 	// Unfenced is true once the write fence of the new cluster was released.
 	Unfenced bool `json:"unfenced"`
 }

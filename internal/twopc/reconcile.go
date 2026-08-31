@@ -17,12 +17,27 @@ import (
 // GIDPrefix starts every transaction identifier the router coordinates.
 const GIDPrefix = "pgshard-"
 
+// State is what the decision log records for a transaction. The empty
+// state is the absence of a row, which is presumed abort; a state this
+// build does not recognise is not the same thing.
+type State string
+
 // Decision states of the log.
 const (
-	StatePreparing = "preparing"
-	StateCommit    = "commit"
-	StateAbort     = "abort"
+	StateNone      State = ""
+	StatePreparing State = "preparing"
+	StateCommit    State = "commit"
+	StateAbort     State = "abort"
 )
+
+// Known reports whether s is a state this build can act on.
+func (s State) Known() bool {
+	switch s {
+	case StateNone, StatePreparing, StateCommit, StateAbort:
+		return true
+	}
+	return false
+}
 
 // Action is what to do with one gid on one participant.
 type Action int
@@ -43,9 +58,14 @@ const (
 	// (frozen past the clog horizon, unrecorded or in the future). Treated
 	// like a contradiction, reported apart.
 	Unverifiable
+	// Unreadable: the log records a state this build does not recognise --
+	// a newer coordinator's, or a corrupted row. The transaction is left
+	// prepared and reported. Reading it as an abort is how a distributed
+	// transaction that committed everywhere else loses one participant.
+	Unreadable
 )
 
-var actionNames = [...]string{"nothing", "commit", "rollback", "contradiction", "unverifiable"}
+var actionNames = [...]string{"nothing", "commit", "rollback", "contradiction", "unverifiable", "unreadable"}
 
 func (a Action) String() string {
 	if int(a) < len(actionNames) {
@@ -67,11 +87,14 @@ const (
 	StatusUnavailable XactStatus = ""
 )
 
-// Decide is the decision table. state is the log's decision ("" when the
-// log has no row for the gid), prepared whether the participant still holds
-// the transaction, status the participant's view of the transaction id when
-// it is not prepared.
-func Decide(state string, prepared bool, status XactStatus) Action {
+// Decide is the decision table. state is the log's decision (StateNone
+// when the log has no row for the gid), prepared whether the participant
+// still holds the transaction, status the participant's view of the
+// transaction id when it is not prepared.
+func Decide(state State, prepared bool, status XactStatus) Action {
+	if !state.Known() {
+		return Unreadable
+	}
 	switch {
 	case prepared && state == StateCommit:
 		return Commit
@@ -87,21 +110,27 @@ func Decide(state string, prepared bool, status XactStatus) Action {
 	return Nothing
 }
 
+// Participation is one shard's part of a transaction, carrying its own
+// transaction id rather than a position in a second array.
+type Participation struct {
+	Shard int32
+	// XID is the transaction id on that shard, empty when the router
+	// recorded none.
+	XID string
+}
+
 // Decision is one row of the decision log.
 type Decision struct {
 	GID          string
-	State        string
-	Participants []int32
-	// ParticipantXIDs are the transaction ids on the participants, in the
-	// same order; missing entries mean the router did not record them.
-	ParticipantXIDs []string
+	State        State
+	Participants []Participation
 }
 
 // XID returns the transaction id recorded for shard, if any.
 func (d Decision) XID(shard int32) string {
-	for i, p := range d.Participants {
-		if p == shard && i < len(d.ParticipantXIDs) {
-			return d.ParticipantXIDs[i]
+	for _, p := range d.Participants {
+		if p.Shard == shard {
+			return p.XID
 		}
 	}
 	return ""
@@ -110,7 +139,7 @@ func (d Decision) XID(shard int32) string {
 // Involves reports whether shard is a participant.
 func (d Decision) Involves(shard int32) bool {
 	for _, p := range d.Participants {
-		if p == shard {
+		if p.Shard == shard {
 			return true
 		}
 	}
@@ -199,11 +228,15 @@ type Outcome struct {
 	// Unverifiable lists commit-decided gids whose outcome the participant
 	// can neither confirm nor deny (see Unverifiable).
 	Unverifiable []string
+	// Unreadable lists gids whose recorded state this build does not
+	// recognise; they are left prepared (see Unreadable).
+	Unreadable []string
 }
 
 // Reconcile applies the decision log to participant shard p. Every
 // router-coordinated prepared transaction on it is finished: by the log's
-// decision when there is one, rolled back otherwise. Commit-decided
+// decision when there is one, rolled back otherwise -- except one whose
+// state this build cannot read, which is left prepared. Commit-decided
 // transactions the participant does not hold prepared must be committed
 // (by their recorded transaction id); anything else is a contradiction. It
 // never returns early on a contradiction, so the outcome is complete.
@@ -235,7 +268,7 @@ func Reconcile(ctx context.Context, p Participant, shard int32, decisions []Deci
 		if seen[g] {
 			continue
 		}
-		if err := apply(ctx, p, prepared[g], g, Decide("", true, ""), &out); err != nil {
+		if err := apply(ctx, p, prepared[g], g, Decide(StateNone, true, ""), &out); err != nil {
 			return out, err
 		}
 	}
@@ -258,6 +291,8 @@ func apply(ctx context.Context, p Participant, db, gid string, a Action, out *Ou
 		out.Contradictions = append(out.Contradictions, gid)
 	case Unverifiable:
 		out.Unverifiable = append(out.Unverifiable, gid)
+	case Unreadable:
+		out.Unreadable = append(out.Unreadable, gid)
 	}
 	return nil
 }
@@ -297,6 +332,9 @@ func Contradictions(byShard map[int32]Outcome) error {
 		}
 		for _, gid := range byShard[shard].Unverifiable {
 			parts = append(parts, fmt.Sprintf("shard %d: %s is decided commit and not prepared, and its transaction id's status is unavailable (frozen, unrecorded or in the future): the commit cannot be verified", shard, gid))
+		}
+		for _, gid := range byShard[shard].Unreadable {
+			parts = append(parts, fmt.Sprintf("shard %d: %s records a decision this build does not recognise, so it is left prepared", shard, gid))
 		}
 	}
 	if len(parts) == 0 {

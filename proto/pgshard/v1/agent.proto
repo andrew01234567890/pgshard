@@ -430,14 +430,32 @@ message VerifyResponse {
   repeated string log = 3;
 }
 
+// TransactionDecisionState is what the log records for a transaction. A
+// receiver that does not recognise a value must leave the transaction
+// prepared and say so: an unread decision is not an abort.
+enum TransactionDecisionState {
+  TRANSACTION_DECISION_STATE_UNSPECIFIED = 0;
+  TRANSACTION_DECISION_STATE_PREPARING = 1;
+  TRANSACTION_DECISION_STATE_COMMIT = 2;
+  TRANSACTION_DECISION_STATE_ABORT = 3;
+}
+
+// TransactionParticipant is one shard's part of a transaction.
+message TransactionParticipant {
+  int32 shard_id = 1;
+  // The transaction id on that shard; unset when the router recorded none.
+  optional string xid = 2;
+}
+
 // TransactionDecision is one row of the decision log.
 message TransactionDecision {
+  // 2, 3 and 4 were a free-text state and two positionally coupled
+  // arrays; state and participants are the same ideas, typed.
+  reserved 2, 3, 4;
+
   string gid = 1;
-  // preparing, commit or abort.
-  string state = 2;
-  // Participant shard ids and, in the same order, their transaction ids.
-  repeated int32 participants = 3;
-  repeated string participant_xids = 4;
+  TransactionDecisionState state = 5;
+  repeated TransactionParticipant participants = 6;
 }
 
 // ListTransactionDecisionsRequest reads the decision log.
@@ -488,6 +506,9 @@ message ReconcilePreparedTransactionsResponse {
   // transaction id no longer resolves (frozen, unrecorded or in the
   // future), so the commit cannot be verified.
   repeated string unverifiable = 6;
+  // Gids whose recorded decision this agent does not recognise; they are
+  // left prepared rather than read as an abort.
+  repeated string unreadable = 7;
 }
 
 // SetWriteFenceRequest raises (active) or releases the fence.
