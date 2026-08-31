@@ -524,7 +524,10 @@ func expectShards(t *testing.T, spec string) []int32 {
 	case "all":
 		return []int32{0, 1, 2, 3}
 	case "ref":
-		return []int32{int32(session(s).ID % 4)}
+		// A reference read names no shard: any of them serves the table,
+		// and the executor picks so the plan does not depend on which
+		// session asked.
+		return nil
 	}
 	var out []int32
 	for _, part := range strings.Split(spec, ",") {

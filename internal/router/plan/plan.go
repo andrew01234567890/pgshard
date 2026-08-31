@@ -164,9 +164,7 @@ type Session struct {
 	// SearchPath lists the schemas an unqualified table name is looked up
 	// in; nil means {"public"}.
 	SearchPath []string
-	// ID spreads reference-table reads over shards.
-	ID       uint64
-	Snapshot *snapshot.Snapshot
+	Snapshot   *snapshot.Snapshot
 }
 
 // TypeHint is what the statement text says about a shard key parameter's

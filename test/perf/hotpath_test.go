@@ -125,7 +125,7 @@ var sinkPlan plan.Plan
 // prepared unsharded SELECT with a warm parse cache.
 func BenchmarkPlannerPlanUnshardedSelect(b *testing.B) {
 	p := plan.New()
-	sess := plan.Session{Database: "app", HomeShard: 0, ID: 5, Snapshot: benchSnapshot(b)}
+	sess := plan.Session{Database: "app", HomeShard: 0, Snapshot: benchSnapshot(b)}
 	ctx := context.Background()
 	b.ReportAllocs()
 	for b.Loop() {
@@ -139,7 +139,7 @@ func BenchmarkPlannerPlanUnshardedSelect(b *testing.B) {
 
 func BenchmarkPlannerPlanShardedSelect(b *testing.B) {
 	p := plan.New()
-	sess := plan.Session{Database: "app", HomeShard: 0, ID: 5, Snapshot: benchSnapshot(b)}
+	sess := plan.Session{Database: "app", HomeShard: 0, Snapshot: benchSnapshot(b)}
 	ctx := context.Background()
 	b.ReportAllocs()
 	for b.Loop() {

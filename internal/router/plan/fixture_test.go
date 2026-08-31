@@ -56,5 +56,5 @@ func shardOf(t testing.TB, snap *snapshot.Snapshot, v any) int32 {
 }
 
 func session(snap *snapshot.Snapshot) Session {
-	return Session{Database: fixtureDB, HomeShard: 0, ID: 5, Snapshot: snap}
+	return Session{Database: fixtureDB, HomeShard: 0, Snapshot: snap}
 }

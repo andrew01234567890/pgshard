@@ -339,7 +339,7 @@ func (e *Executor) Shard() Shard { return e.shard }
 // catalog shard set see no table placement and plan everything onto their
 // home shard.
 func (e *Executor) planSession() plan.Session {
-	sess := plan.Session{Database: e.info.Database, HomeShard: e.Home().ID, ID: e.info.ID, SearchPath: e.searchPath()}
+	sess := plan.Session{Database: e.info.Database, HomeShard: e.Home().ID, SearchPath: e.searchPath()}
 	if !e.catalogSession() {
 		sess.Snapshot = e.r.cfg.Snapshot()
 	}
@@ -401,12 +401,39 @@ func (e *Executor) target(pl plan.Plan) (Shard, error) {
 		return Shard{}, pl.Err
 	case pl.Kind == plan.SessionLocal:
 		return e.shard, nil
+	case pl.Kind == plan.Reference && !pl.Class.Write && len(pl.Shards) == 0:
+		return e.referenceTarget(), nil
 	case pl.Deferred:
 		return Shard{}, pgwire.Errorf(pgwire.CodeInternalError, "router: deferred plan was not resolved")
 	case len(pl.Shards) != 1:
 		return Shard{}, pgwire.Errorf(pgwire.CodeInternalError, "router: %s plan over %d shards has no single target", pl.Kind, len(pl.Shards))
 	}
 	return Shard{Set: e.userSet(), ID: pl.Shards[0]}, nil
+}
+
+// referenceTarget spreads reference reads across the serving shards, by
+// session, so they do not all land on one.
+//
+// The choice is made here rather than in the plan because a plan that named
+// the shard would depend on which session asked for it, which is the one
+// thing keeping plans from being shared between sessions: a cached
+// reference read would pin every session to whichever shard the first was
+// given.
+func (e *Executor) referenceTarget() Shard {
+	set := e.userSet()
+	var ids []int32
+	if snap := e.r.cfg.Snapshot(); snap != nil {
+		for _, r := range snap.ShardSets[set] {
+			if !slices.Contains(ids, r.ShardID) {
+				ids = append(ids, r.ShardID)
+			}
+		}
+	}
+	if len(ids) == 0 {
+		return e.Home()
+	}
+	slices.Sort(ids)
+	return Shard{Set: set, ID: ids[e.info.ID%uint64(len(ids))]}
 }
 
 // moveTo points the session at target, dropping the stream on the previous
