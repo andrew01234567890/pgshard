@@ -785,7 +785,13 @@ func (e *Executor) withFailover(ctx context.Context, w pgwire.ResultWriter, run 
 	// of it. It is the router's own answer: nothing was written, nothing
 	// committed, run it again. Only when no output has reached the client,
 	// because after that "run it again" is advice the client cannot take.
-	if isStaleGeneration(err) && !cw.wrote {
+	//
+	// The declared reason, not the SQLSTATE. isStaleGeneration accepts a
+	// bare 55000 for older poolers, and 55000 is also what a shard answers
+	// while a rewrite is in progress -- a condition that clears on its own
+	// and is not a fence. Turning that one into "retry the transaction"
+	// would send a client round a loop with nothing at the end of it.
+	if poolerReason(err) == pgshardv1.Reason_REASON_STALE_GENERATION && !cw.wrote {
 		err = failoverInTxnError()
 	}
 	return e.afterBatch(ctx, err)

@@ -317,7 +317,12 @@ func (f *fakePooler) detach(sid string) {
 
 func (f *fakePooler) fence(g *pgshardv1.Generation) *pgshardv1.Error {
 	if g == nil || g.ShardMapGeneration != f.gen || g.PrimaryEpoch != f.epoch {
-		return &pgshardv1.Error{Sqlstate: "55000", Message: "stale routing generation"}
+		// The real pooler declares the reason; a fake that does not would
+		// let the router's fence handling pass a test it fails in
+		// production, where the SQLSTATE alone cannot tell a fence from a
+		// rewrite in progress.
+		return &pgshardv1.Error{Sqlstate: "55000", Message: "stale routing generation",
+			Reason: pgshardv1.Reason_REASON_STALE_GENERATION}
 	}
 	return nil
 }
