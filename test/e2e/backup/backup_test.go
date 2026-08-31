@@ -60,7 +60,16 @@ func deployOperator(ctx context.Context, t *testing.T, c *e2e.Cluster, root, ima
 		t.Fatal(err)
 	}
 	manifest := strings.Replace(string(raw), "image: ghcr.io/andrew01234567890/pgshard-operator:latest", "image: "+image, 1)
-	manifest = strings.Replace(manifest, "            - run\n", "            - run\n            - --admin-image="+env("ADMIN_IMAGE", "pgshard-admin:e2e")+"\n", 1)
+	// The other suites pass both images; this one passed only the admin's,
+	// so every router it created came from the operator's default --
+	// ghcr.io/.../pgshard-router:latest, which is not published. The pods
+	// sat in ImagePullBackOff and the suite failed on a cluster that never
+	// had a router, in a required check.
+	extraArgs := "            - --admin-image=" + env("ADMIN_IMAGE", "pgshard-admin:e2e") + "\n"
+	if img := os.Getenv("ROUTER_IMAGE"); img != "" {
+		extraArgs += "            - --router-image=" + img + "\n"
+	}
+	manifest = strings.Replace(manifest, "            - run\n", "            - run\n"+extraArgs, 1)
 	if err := c.Apply(ctx, manifest); err != nil {
 		t.Fatal(err)
 	}
