@@ -94,7 +94,14 @@ Always emitted and never overridable: `wal_level=logical`,
 `synchronous_commit=on`, `track_commit_timestamp=on`, `max_slot_wal_keep_size`
 (20% of the disk clamped to [4GiB,200GiB], 20GiB when unknown),
 `idle_replication_slot_timeout=24h`, `password_encryption=scram-sha-256`,
-`ssl=on`.
+`ssl=on`, `standard_conforming_strings=on`.
+
+`standard_conforming_strings` is there because the router parses every
+statement with it on and hashes the shard key out of the parse tree. A shard
+that read `'\141'` as the single character `a` while the router hashed four
+characters would hold rows the router would look for on another shard, so
+the value is fixed on the server and the router refuses to let a session
+change it.
 
 ## Overrides
 
@@ -102,7 +109,8 @@ Always emitted and never overridable: `wal_level=logical`,
 adding a new setting with the reason `operator override`. Keys on the unsafe
 list are rejected with `ErrUnsafeOverride` naming the key: `fsync`,
 `full_page_writes`, `wal_level`, `max_prepared_transactions`, `ssl`,
-`data_checksums`, `password_encryption`, `track_commit_timestamp`, the
+`data_checksums`, `password_encryption`, `track_commit_timestamp`,
+`standard_conforming_strings`, the
 replication-slot and WAL-sender limits, everything the agent owns
 (`listen_addresses`, `hba_file`, `primary_conninfo`,
 `synchronous_standby_names`, ...) and the `include*` directives.

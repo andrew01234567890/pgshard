@@ -42,6 +42,15 @@ type Server struct {
 	Namespace  string
 	Logger     *slog.Logger
 	Tick       time.Duration
+	// Cluster scopes the admin to one PgShardCluster: every list, page,
+	// fragment and API route serves that cluster alone, and an object of
+	// another reads as absent. The operator sets it, because it deploys one
+	// admin per cluster and gives each its own credential -- without it the
+	// credential for one cluster's admin reads every cluster in the
+	// namespace. Empty serves them all, which is how an admin run by hand
+	// across a namespace still works.
+	Cluster string
+
 	// Token is the credential every route but /healthz requires, as a
 	// bearer token or as the password of HTTP basic auth (any user name,
 	// so a browser can be pointed at the UI and log in). Empty serves the
@@ -177,12 +186,12 @@ func (s *Server) streamSource() StreamSource {
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	clusters, err := ListClusters(r.Context(), s.Client, s.Namespace)
+	clusters, err := ListClusters(r.Context(), s.Client, s.Namespace, s.Cluster)
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
-	cards, err := BuildBackupCards(r.Context(), s.Client, s.Namespace, time.Now())
+	cards, err := BuildBackupCards(r.Context(), s.Client, s.Namespace, s.Cluster, time.Now())
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -196,7 +205,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 			data["Streams"] = overview
 		}
 	}
-	reshardCards, err := BuildReshardCards(r.Context(), s.Client, s.Namespace)
+	reshardCards, err := BuildReshardCards(r.Context(), s.Client, s.Namespace, s.Cluster)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -206,7 +215,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpgrades(w http.ResponseWriter, r *http.Request) {
-	page, err := BuildUpgradesPage(r.Context(), s.Client, s.Namespace)
+	page, err := BuildUpgradesPage(r.Context(), s.Client, s.Namespace, s.Cluster)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -215,7 +224,7 @@ func (s *Server) handleUpgrades(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpgradesFragment(w http.ResponseWriter, r *http.Request) {
-	page, err := BuildUpgradesPage(r.Context(), s.Client, s.Namespace)
+	page, err := BuildUpgradesPage(r.Context(), s.Client, s.Namespace, s.Cluster)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -224,7 +233,7 @@ func (s *Server) handleUpgradesFragment(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleAPIUpgrades(w http.ResponseWriter, r *http.Request) {
-	page, err := BuildUpgradesPage(r.Context(), s.Client, s.Namespace)
+	page, err := BuildUpgradesPage(r.Context(), s.Client, s.Namespace, s.Cluster)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -233,7 +242,7 @@ func (s *Server) handleAPIUpgrades(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request) {
-	page, err := BuildBackupsPage(r.Context(), s.Client, s.Catalog, s.Namespace)
+	page, err := BuildBackupsPage(r.Context(), s.Client, s.Catalog, s.Namespace, s.Cluster)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -242,7 +251,7 @@ func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleBackupsFragment(w http.ResponseWriter, r *http.Request) {
-	page, err := BuildBackupsPage(r.Context(), s.Client, s.Catalog, s.Namespace)
+	page, err := BuildBackupsPage(r.Context(), s.Client, s.Catalog, s.Namespace, s.Cluster)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -251,7 +260,7 @@ func (s *Server) handleBackupsFragment(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleBackup(w http.ResponseWriter, r *http.Request) {
-	b, err := GetBackup(r.Context(), s.Client, r.PathValue("ns"), r.PathValue("name"))
+	b, err := GetBackup(r.Context(), s.Client, r.PathValue("ns"), r.PathValue("name"), s.Cluster)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -260,7 +269,7 @@ func (s *Server) handleBackup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
-	rs, err := GetRestore(r.Context(), s.Client, r.PathValue("ns"), r.PathValue("name"))
+	rs, err := GetRestore(r.Context(), s.Client, r.PathValue("ns"), r.PathValue("name"), s.Cluster)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -269,7 +278,7 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleReshards(w http.ResponseWriter, r *http.Request) {
-	page, err := BuildReshardsPage(r.Context(), s.Client, s.Catalog, s.Namespace)
+	page, err := BuildReshardsPage(r.Context(), s.Client, s.Catalog, s.Namespace, s.Cluster)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -278,7 +287,7 @@ func (s *Server) handleReshards(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleReshardsFragment(w http.ResponseWriter, r *http.Request) {
-	page, err := BuildReshardsPage(r.Context(), s.Client, s.Catalog, s.Namespace)
+	page, err := BuildReshardsPage(r.Context(), s.Client, s.Catalog, s.Namespace, s.Cluster)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -287,7 +296,7 @@ func (s *Server) handleReshardsFragment(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleReshard(w http.ResponseWriter, r *http.Request) {
-	rs, err := GetReshard(r.Context(), s.Client, s.Catalog, r.PathValue("ns"), r.PathValue("name"))
+	rs, err := GetReshard(r.Context(), s.Client, s.Catalog, r.PathValue("ns"), r.PathValue("name"), s.Cluster)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -296,7 +305,7 @@ func (s *Server) handleReshard(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAPIReshards(w http.ResponseWriter, r *http.Request) {
-	page, err := BuildReshardsPage(r.Context(), s.Client, s.Catalog, s.Namespace)
+	page, err := BuildReshardsPage(r.Context(), s.Client, s.Catalog, s.Namespace, s.Cluster)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -305,7 +314,7 @@ func (s *Server) handleAPIReshards(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAPIReshard(w http.ResponseWriter, r *http.Request) {
-	rs, err := GetReshard(r.Context(), s.Client, s.Catalog, r.PathValue("ns"), r.PathValue("name"))
+	rs, err := GetReshard(r.Context(), s.Client, s.Catalog, r.PathValue("ns"), r.PathValue("name"), s.Cluster)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -314,7 +323,7 @@ func (s *Server) handleAPIReshard(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAPIBackups(w http.ResponseWriter, r *http.Request) {
-	list, err := ListBackups(r.Context(), s.Client, s.Namespace)
+	list, err := ListBackups(r.Context(), s.Client, s.Namespace, s.Cluster)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -323,7 +332,7 @@ func (s *Server) handleAPIBackups(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAPIRestores(w http.ResponseWriter, r *http.Request) {
-	list, err := ListRestores(r.Context(), s.Client, s.Namespace)
+	list, err := ListRestores(r.Context(), s.Client, s.Namespace, s.Cluster)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -347,6 +356,11 @@ func (s *Server) handleAPIRestorePoints(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) topology(r *http.Request) (*Topology, error) {
+	// Every cluster page, fragment and API route resolves here, so this is
+	// the one place a scoped admin has to refuse another cluster's name.
+	if name := r.PathValue("name"); s.Cluster != "" && name != s.Cluster {
+		return nil, notServed("cluster", name)
+	}
 	t, err := BuildTopology(r.Context(), s.Client, s.Catalog, r.PathValue("ns"), r.PathValue("name"))
 	if err != nil {
 		return nil, err
@@ -418,7 +432,7 @@ func (s *Server) handleTopologyFragment(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleAPIClusters(w http.ResponseWriter, r *http.Request) {
-	clusters, err := ListClusters(r.Context(), s.Client, s.Namespace)
+	clusters, err := ListClusters(r.Context(), s.Client, s.Namespace, s.Cluster)
 	if err != nil {
 		s.fail(w, err)
 		return

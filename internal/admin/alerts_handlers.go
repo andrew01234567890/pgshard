@@ -56,7 +56,7 @@ func (s *Server) buildAlerts(r *http.Request) (AlertsView, error) {
 		}
 		in.Streams = overview.Streams
 	}
-	if backups, err := ListBackups(ctx, s.Client, s.Namespace); err == nil {
+	if backups, err := ListBackups(ctx, s.Client, s.Namespace, s.Cluster); err == nil {
 		in.BackupsKnown = true
 		for _, b := range backups {
 			if b.Phase == pgshardv1alpha1.BackupPhaseCompleted && b.CompletedAt != nil &&

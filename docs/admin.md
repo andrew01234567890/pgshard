@@ -11,7 +11,7 @@ table placement workflows and major upgrade workflows.
 ## Running
 
 ```
-pgshard-admin serve --token-file PATH [--listen :8081] [--kubeconfig PATH] [--namespace NS] [--catalog-dsn DSN]
+pgshard-admin serve --token-file PATH [--listen :8081] [--kubeconfig PATH] [--namespace NS] [--cluster NAME] [--catalog-dsn DSN]
 ```
 
 | Flag | Default | Meaning |
@@ -21,6 +21,7 @@ pgshard-admin serve --token-file PATH [--listen :8081] [--kubeconfig PATH] [--na
 | `--listen` | `:8081` | HTTP listen address. |
 | `--kubeconfig` | in-cluster | Kubeconfig to use outside a pod. |
 | `--namespace` | all namespaces | Restrict the watch and the clusters list to one namespace. |
+| `--cluster` | every cluster in the namespace | Serve one `PgShardCluster` only. Every list, page, fragment and API route shows that cluster alone, and an object of another reads as absent rather than forbidden — an admin that serves one cluster has nothing to say about what else exists. The operator sets it, because it deploys one admin per cluster with its own credential; without it, that credential reads every cluster in the namespace. |
 | `--catalog-dsn` | none | PostgreSQL DSN of a catalog database; adds the catalog's `pgshard.shard_status` snapshot and a DDL card to the topology page, the certified restore points (`pgshard.restore_points`) to the backups page, the `pgshard.workflows` rows (newest 200) to the reshards page, and enables the migrations and streams panels. |
 
 `--help` and `--version` behave as in every pgshard command.
@@ -84,7 +85,8 @@ Two ways to run it in a cluster:
 1. **Per cluster, by the operator.** When `spec.admin.enabled` is true (the
    default) the operator creates `<cluster>-admin`: a ServiceAccount, a
    namespaced read-only Role and RoleBinding, a Deployment running
-   `serve --namespace <ns>` and a ClusterIP Service on port 8081. The image
+   `serve --namespace <ns> --cluster <name>` and a ClusterIP Service on port
+   8081. The image
    comes from the operator's `--admin-image` flag (default
    `ghcr.io/andrew01234567890/pgshard-admin:latest`). Setting
    `spec.admin.enabled: false` removes these objects.

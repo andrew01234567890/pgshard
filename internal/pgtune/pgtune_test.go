@@ -220,6 +220,7 @@ func TestMandatorySettingsAlwaysEmitted(t *testing.T) {
 		"wal_level": "logical", "max_replication_slots": "14", "max_wal_senders": "16", "max_prepared_transactions": "108",
 		"synchronous_commit": "on", "track_commit_timestamp": "on", "max_slot_wal_keep_size": "20GB",
 		"idle_replication_slot_timeout": "24h", "password_encryption": "scram-sha-256", "ssl": "on",
+		"standard_conforming_strings": "on",
 	}
 	s, err := Derive(baseInput(2000, 4*GiB, ProfileAnalytics))
 	if err != nil {

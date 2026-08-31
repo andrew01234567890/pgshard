@@ -37,6 +37,8 @@ type Options struct {
 	Listen     string
 	Kubeconfig string
 	Namespace  string
+	// Cluster scopes the admin to one PgShardCluster.
+	Cluster    string
 	CatalogDSN string
 	// TokenFile holds the credential every route but /healthz requires.
 	TokenFile string
@@ -56,6 +58,7 @@ func ParseFlags(args []string, stderr io.Writer) (Options, error) {
 	fs.StringVar(&o.Listen, "listen", ":8081", "HTTP listen address")
 	fs.StringVar(&o.Kubeconfig, "kubeconfig", "", "path to a kubeconfig; empty uses the in-cluster configuration")
 	fs.StringVar(&o.Namespace, "namespace", "", "namespace to watch; empty watches all namespaces")
+	fs.StringVar(&o.Cluster, "cluster", "", "serve only this PgShardCluster; empty serves every cluster in the namespace, so the credential of one cluster's admin reads them all")
 	fs.StringVar(&o.CatalogDSN, "catalog-dsn", "", "optional PostgreSQL DSN of the catalog database for the shard status snapshot and the streams pages")
 	fs.StringVar(&o.TokenFile, "token-file", "", "file holding the credential every route but /healthz requires, as a bearer token or the password of HTTP basic auth")
 	fs.BoolVar(&o.InsecureNoAuth, "insecure-no-auth", false, "serve the admin to anyone who can reach it (development only)")
@@ -141,6 +144,7 @@ func Run(ctx context.Context, o Options) error {
 		return err
 	}
 	srv.Token = token
+	srv.Cluster = o.Cluster
 	ln, err := net.Listen("tcp", o.Listen)
 	if err != nil {
 		return err

@@ -7,7 +7,7 @@ LDFLAGS  := -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
             -X $(MODULE)/internal/buildinfo.Date=$(DATE)
 CMDS     := $(notdir $(wildcard cmd/*))
 
-.PHONY: build vet fmt-check lint test verify gates tools proto-drift govulncheck actionlint clean proto proto-lint proto-breaking pgparser-sync pgparser-proto
+.PHONY: build vet fmt-check lint test verify vendor-check gates tools proto-drift govulncheck actionlint clean proto proto-lint proto-breaking pgparser-sync pgparser-proto
 
 build:
 	@mkdir -p bin
@@ -35,7 +35,14 @@ test:
 # Kubernetes control plane, Docker images or a network, so it can be fast
 # enough to run before every push -- `make gates` is the whole set, and
 # docs/guide/testing.md says which tier a change needs.
-verify: fmt-check vet lint proto-lint test build
+# vendor-check asserts the vendored libpg_query trees are the bytes
+# hack/pgparser/sync.sh recorded. It is in the fast gate because a change
+# there is a change to the parser every statement goes through, and nothing
+# else in the repository would notice one.
+vendor-check:
+	hack/pgparser/verify.sh
+
+verify: fmt-check vet lint proto-lint vendor-check test build
 	@echo "verify: fast gate passed. Not run here: envtest, e2e, generated-code drift, govulncheck, workflow policy. See 'make gates'."
 
 # gates runs every check CI gates a pull request on except the secret scan,
@@ -118,11 +125,14 @@ integration:
 perf-bench:
 	hack/perf/benchstat.sh $(PERF_BASE_REF) $(PERF_OUT_DIR)
 
-# libpg_query vendoring: one pinned tag per PostgreSQL major.
-LIBPG_QUERY_18_TAG := 18.0.0
+# libpg_query vendoring: one pinned tag per PostgreSQL major, and the commit
+# that tag must resolve to. A tag is a movable name and this is 14 MiB of C
+# in the router's SQL parser, so the commit is what is actually pinned.
+LIBPG_QUERY_18_TAG    := 18.0.0
+LIBPG_QUERY_18_COMMIT := 204fbdbd3ed5f8691ab358e49f1fc5397b4679e2
 
 pgparser-sync:
-	hack/pgparser/sync.sh 18 $(LIBPG_QUERY_18_TAG)
+	hack/pgparser/sync.sh 18 $(LIBPG_QUERY_18_TAG) $(LIBPG_QUERY_18_COMMIT)
 	$(MAKE) pgparser-proto
 
 pgparser-proto:
