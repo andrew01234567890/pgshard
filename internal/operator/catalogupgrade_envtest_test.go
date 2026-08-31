@@ -595,3 +595,70 @@ func TestCatalogUpgradeGivesTheNewCatalogTheRouterPassword(t *testing.T) {
 		t.Errorf("the new catalog was never given the router password: %v", applied)
 	}
 }
+
+// TestNoCatalogMigrationWhileAnUpgradeIsInFlight: both catalog
+// publications are FOR TABLES IN SCHEMA pgshard, which includes
+// pgshard.schema_migrations, and logical replication carries no DDL. A
+// migration applied to whichever catalog is serving therefore replicates
+// its ledger row to the other while the ALTER and CREATE stay behind, and
+// that catalog then skips DDL it believes it has already applied.
+//
+// The deferral used to cover the retirement window alone, where the stream
+// runs new to old. Before the cutover it runs old to new and the group
+// about to serve inherits the same lie, so the window is the whole
+// upgrade.
+func TestNoCatalogMigrationWhileAnUpgradeIsInFlight(t *testing.T) {
+	r, fp, c := setup(t, "nomig")
+	startCatalogUpgrade(t, r, fp, c)
+
+	serving := "nomig-catalog-rw.default.svc"
+	migratedServing := func() int {
+		fp.mu.Lock()
+		defer fp.mu.Unlock()
+		n := 0
+		for _, d := range fp.migratedDSNs {
+			if d == serving {
+				n++
+			}
+		}
+		return n
+	}
+	before := migratedServing()
+
+	// Every stage up to and including retirement, not just the last one.
+	for _, want := range []string{CatalogUpgradeCopying, CatalogUpgradeCatchingUp, CatalogUpgradeCutover} {
+		reconcile(t, r, c)
+		if got := catalogStage(t, c.Name); got != want {
+			t.Fatalf("stage %s, want %s", got, want)
+		}
+		if got := migratedServing(); got != before {
+			t.Fatalf("at stage %s the serving catalog was migrated (%d then %d)", want, before, got)
+		}
+	}
+
+	// The new catalog is still migrated: that is its setup, and it happens
+	// before any copy carries a ledger row to it.
+	fp.mu.Lock()
+	target := 0
+	for _, d := range fp.migratedDSNs {
+		if d == "nomig-catalog-g2-rw.default.svc" {
+			target++
+		}
+	}
+	fp.mu.Unlock()
+	if target == 0 {
+		t.Error("the new-major catalog was never migrated, so it has no schema to copy into")
+	}
+
+	// And the condition says why, rather than looking like a failure.
+	cur := getCluster(t, c.Name)
+	var cond *metav1.Condition
+	for i := range cur.Status.Conditions {
+		if cur.Status.Conditions[i].Type == ConditionCatalogReady {
+			cond = &cur.Status.Conditions[i]
+		}
+	}
+	if cond == nil || cond.Reason != "MigrationDeferred" || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("catalog condition %+v", cond)
+	}
+}
