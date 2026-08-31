@@ -431,6 +431,18 @@ func isGonePreparedXact(err error) bool {
 	return strings.Contains(err.Error(), "does not exist")
 }
 
+// listShards returns every shard row, whatever its serving state. That is
+// the invariant the resolver rests on: a retired shard can still hold a
+// prepared transaction, and a decision row can only be deleted once every
+// holder has finished it, so a scan that skipped non-serving shards could
+// delete a decision while its transaction was still prepared -- and a
+// prepared transaction nobody will ever finish pins WAL and blocks slot
+// creation for as long as the shard exists.
+//
+// Retirement leaves the row (serving_state = 'retired'); only dropping the
+// set removes it, by which point the cutover has drained the sources
+// through the resolver. So the filter here is deliberately on nothing but
+// the set name.
 func (r *Resolver) listShards(ctx context.Context, shardSet string) ([]ShardRef, error) {
 	rows, err := r.Pool.Query(ctx, `SELECT shard_set, shard_id FROM pgshard.shard_status WHERE ($1 = '' OR shard_set = $1) ORDER BY shard_set, shard_id`, shardSet)
 	if err != nil {

@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andrew01234567890/pgshard/internal/catalog"
+	"github.com/andrew01234567890/pgshard/internal/controller"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -700,4 +702,21 @@ func TestACancelReachesEveryParticipant(t *testing.T) {
 		}
 	}
 	_ = tx.Rollback(ctx)
+}
+
+// TestHeartbeatBeatsFasterThanTheResolverGivesUp: a coordinator marks its
+// preparing decision alive on one constant and the resolver abandons it on
+// another, in a different package and a different process. If the two ever
+// meet, the resolver aborts transactions whose coordinator is alive and
+// about to commit them -- safe, because abort is what a never-decided
+// transaction gets, but it throws away work that would have succeeded.
+func TestHeartbeatBeatsFasterThanTheResolverGivesUp(t *testing.T) {
+	const beatsBeforeGivingUp = 3
+	if got := catalog.MinPreparingTimeout / decisionHeartbeatInterval; got < beatsBeforeGivingUp {
+		t.Fatalf("the resolver gives up after %d heartbeats (%s / %s), want at least %d",
+			got, catalog.MinPreparingTimeout, decisionHeartbeatInterval, beatsBeforeGivingUp)
+	}
+	if controller.DefaultPreparingTimeout < catalog.MinPreparingTimeout {
+		t.Fatalf("the default timeout %s is below the floor %s", controller.DefaultPreparingTimeout, catalog.MinPreparingTimeout)
+	}
 }
