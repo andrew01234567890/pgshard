@@ -185,9 +185,13 @@ jobs:
       - run: make actionlint
 
   pr-title:
-    name: PR title
-    # Also in pr-title.yml, which re-checks on an edit. This copy is the one
-    # the gate can see: a job in another workflow cannot be a `needs`.
+    name: Title at push
+    # pr-title.yml owns the `PR title` check, because that one re-runs when
+    # the title is edited and this one cannot: adding `edited` here would
+    # re-run every job in this workflow whenever anybody touched a
+    # description. This copy exists only so the gate can see the title --
+    # a job in another workflow cannot be a `needs` -- and so it is named
+    # differently, or the two would report under one context.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
