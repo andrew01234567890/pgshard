@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 
@@ -13,9 +14,24 @@ import (
 // MaterializeSchema copies the schema of one database from a source into
 // the local database of the same name.
 func (s *Server) MaterializeSchema(ctx context.Context, req *pgshardv1.MaterializeSchemaRequest) (*pgshardv1.MaterializeSchemaResponse, error) {
+	resp := &pgshardv1.MaterializeSchemaResponse{Epoch: s.epoch.Current()}
+	// A copy can outlive a failover of its own target, so it proves the
+	// caller is talking to the member that is still serving before it
+	// starts, as every other mutating call does. An absent epoch is
+	// refused rather than read as zero: a caller that does not know the
+	// epoch cannot be shown to mean this member.
+	if req.Epoch == nil {
+		resp.Error = pgErr(errors.New("materialize schema: no epoch in the request; the caller must name the epoch it believes this member serves at"))
+		return resp, nil
+	}
+	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
+		resp.Error = pgErr(err)
+		return resp, nil
+	}
 	ctx, cancel := context.WithTimeout(ctx, s.opTimeout)
 	defer cancel()
-	return &pgshardv1.MaterializeSchemaResponse{Error: pgErr(s.inst.MaterializeSchema(ctx, req.GetSourceConninfo(), req.GetDatabase()))}, nil
+	resp.Error = pgErr(s.inst.MaterializeSchema(ctx, req.GetSourceConninfo(), req.GetDatabase()))
+	return resp, nil
 }
 
 // MaterializeSchema runs pg_dump --schema-only on source and pipes it into

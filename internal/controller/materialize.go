@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -42,7 +44,10 @@ type AgentMaterializer struct {
 // MaterializeSchema implements SchemaMaterializer.
 func (m *AgentMaterializer) MaterializeSchema(ctx context.Context, target ShardRef, database, sourceConnInfo string) error {
 	var endpoint *string
-	if err := m.Pool.QueryRow(ctx, `SELECT primary_endpoint FROM pgshard.shard_status WHERE shard_set = $1 AND shard_id = $2`, target.Set, target.ID).Scan(&endpoint); err != nil {
+	var epoch int64
+	// Endpoint and epoch in one read: taken separately, the copy could be
+	// sent to the member named by one and vouched for by the other.
+	if err := m.Pool.QueryRow(ctx, `SELECT primary_endpoint, primary_epoch FROM pgshard.shard_status WHERE shard_set = $1 AND shard_id = $2`, target.Set, target.ID).Scan(&endpoint, &epoch); err != nil {
 		return fmt.Errorf("target %s/%d: %w", target.Set, target.ID, err)
 	}
 	if endpoint == nil || *endpoint == "" {
@@ -70,7 +75,7 @@ func (m *AgentMaterializer) MaterializeSchema(ctx context.Context, target ShardR
 		return fmt.Errorf("agent auth token: %w", err)
 	}
 	ctx = agentauth.WithToken(ctx, token)
-	resp, err := pgshardv1.NewAgentClient(conn).MaterializeSchema(ctx, &pgshardv1.MaterializeSchemaRequest{SourceConninfo: sourceConnInfo, Database: database})
+	resp, err := pgshardv1.NewAgentClient(conn).MaterializeSchema(ctx, &pgshardv1.MaterializeSchemaRequest{SourceConninfo: sourceConnInfo, Database: database, Epoch: proto.Uint64(uint64(epoch))})
 	if err != nil {
 		return fmt.Errorf("agent %s: %w", addr, err)
 	}
