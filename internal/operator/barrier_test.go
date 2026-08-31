@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -508,5 +509,95 @@ func TestBarrierHealthySurvivesAnOperatorRestart(t *testing.T) {
 		if got != nil && got.ObservedGeneration != pol.Generation {
 			t.Errorf("%s: observedGeneration %d, want %d", name, got.ObservedGeneration, pol.Generation)
 		}
+	}
+}
+
+// blockingBarriers blocks in CreateBarrier until its context ends, so a
+// test can hold a barrier "in flight".
+type blockingBarriers struct {
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingBarriers) CreateBarrier(ctx context.Context, _, _ string) error {
+	b.once.Do(func() { close(b.entered) })
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestAScheduledBarrierEndsWithTheOperator: a barrier pauses writes, and
+// fireBarrier used to build its context from context.Background(). cron.Stop
+// waits for running jobs, so a shutdown during one waited out the whole
+// timeout -- minutes of an operator that had been told to stop.
+func TestAScheduledBarrierEndsWithTheOperator(t *testing.T) {
+	pol := newPolicy()
+	cl := fakeClient(t, pol, boundCluster("demo"))
+	s := NewBackupScheduler(cl)
+	bb := &blockingBarriers{entered: make(chan struct{})}
+	s.Barriers = bb
+
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	go func() { close(started); _ = s.Start(ctx) }()
+	<-started
+	// Start records the context the jobs derive from; wait for it rather
+	// than racing the goroutine.
+	for i := 0; i < 100; i++ {
+		s.mu.Lock()
+		set := s.baseCtx != context.Background()
+		s.mu.Unlock()
+		if set {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	done := make(chan struct{})
+	go func() { defer close(done); s.fireBarrier(client.ObjectKeyFromObject(pol)) }()
+	select {
+	case <-bb.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the barrier never started")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a barrier in flight outlived the operator's context")
+	}
+}
+
+// TestTheLastBarrierNeverMovesBackwards: two ticks that overlap can finish
+// out of order, and the older one used to overwrite the newer result, so
+// the reported barrier went backwards in time.
+func TestTheLastBarrierNeverMovesBackwards(t *testing.T) {
+	pol := newPolicy()
+	cl := fakeClient(t, pol, boundCluster("demo"))
+	s := NewBackupScheduler(cl)
+	s.Barriers = &fakeBarriers{}
+	key := client.ObjectKeyFromObject(pol)
+
+	later := time.Date(2026, 8, 19, 3, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return later }
+	if err := s.FireBarrier(context.Background(), key); err != nil {
+		t.Fatal(err)
+	}
+	earlier := later.Add(-time.Hour)
+	s.now = func() time.Time { return earlier }
+	if err := s.FireBarrier(context.Background(), key); err != nil {
+		t.Fatal(err)
+	}
+	if last, ok := s.LastBarrier(key); !ok || !last.At.Equal(later) {
+		t.Fatalf("last barrier moved back to %v, want %v", last.At, later)
+	}
+
+	// A newer one still lands.
+	newest := later.Add(time.Hour)
+	s.now = func() time.Time { return newest }
+	if err := s.FireBarrier(context.Background(), key); err != nil {
+		t.Fatal(err)
+	}
+	if last, _ := s.LastBarrier(key); !last.At.Equal(newest) {
+		t.Fatalf("a newer barrier did not land: %v", last.At)
 	}
 }
