@@ -504,6 +504,16 @@ func (a *Applier) applyOn(ctx context.Context, logger *slog.Logger, m *catalog.D
 	return s
 }
 
+// saveFailed marks a step that was not run because the catalog would not
+// record that it was about to be. It must be transient -- nothing happened
+// on the shard, so another attempt is always worth making -- which it is by
+// carrying no SQLSTATE; TestASaveFailureIsRetryable pins that rather than
+// the route it takes through transient.
+type saveFailed struct{ err error }
+
+func (e *saveFailed) Error() string { return "progress not saved: " + e.err.Error() }
+func (e *saveFailed) Unwrap() error { return e.err }
+
 // retrying runs one shard step until it ends, retrying transient failures
 // with backoff, and returns the shard's entry.
 func (a *Applier) retrying(ctx context.Context, logger *slog.Logger, m *catalog.DDLMigration, key string, id int32, s catalog.ShardMigration, run func() (string, error)) catalog.ShardMigration {
@@ -513,10 +523,27 @@ func (a *Applier) retrying(ctx context.Context, logger *slog.Logger, m *catalog.
 		s.Attempts++
 		s.State = catalog.ShardRunning
 		m.PerShard[key] = s
-		if err := a.Store.Save(ctx, *m); err != nil {
-			logger.Warn("progress not saved", "err", err)
+		saveErr := a.Store.Save(ctx, *m)
+		var outcome string
+		var err error
+		if saveErr != nil {
+			// Recording that the step is running is what makes running it
+			// recoverable: a resumed step checks whether its object is
+			// already there, and it only does that for a shard the catalog
+			// says was running. Execute without the record and a crash
+			// leaves the row saying pending, which resume reads as "never
+			// started" -- so a committed CREATE TABLE is replayed, fails
+			// 42P07, and ends the migration with the shards disagreeing.
+			//
+			// So the save is not advisory. A failure here is transient by
+			// nature (the catalog is the thing that is unwell), and this
+			// takes the transient path: back off, try again, and leave the
+			// row pending, which is the truth -- nothing ran.
+			err = &saveFailed{saveErr}
+			logger.Warn("step not started: progress not saved", "shard", id, "step", s.Step, "err", saveErr)
+		} else {
+			outcome, err = run()
 		}
-		outcome, err := run()
 		if err == nil {
 			s.State, s.Error, s.SQLState = outcome, "", ""
 			return s

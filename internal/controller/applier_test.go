@@ -25,8 +25,11 @@ type memStore struct {
 	dbs        []string
 	execs      []string
 	saves      int
-	ddlLocks   map[string]string
-	serving    string
+	// failRunningSaves is how many times the save that records a step as
+	// running fails. Nothing else is failed.
+	failRunningSaves int
+	ddlLocks         map[string]string
+	serving          string
 }
 
 func (s *memStore) ServingShardSet(context.Context) (string, error) {
@@ -83,6 +86,16 @@ func (s *memStore) Save(_ context.Context, m catalog.DDLMigration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.saves++
+	// The catalog failing at exactly the moment that matters: the save
+	// that records a step is about to run.
+	if s.failRunningSaves > 0 {
+		for _, sh := range m.PerShard {
+			if sh.State == catalog.ShardRunning {
+				s.failRunningSaves--
+				return errors.New("catalog unavailable")
+			}
+		}
+	}
 	for i := range s.migrations {
 		if s.migrations[i].ID == m.ID {
 			s.migrations[i] = cloneMigration(m)
@@ -1423,5 +1436,94 @@ func TestApplierKeepsThePinnedSetWhenACutoverLandsMidMigration(t *testing.T) {
 		if ran != "default" {
 			t.Fatalf("a shard was applied to %q after a mid-migration cutover; the migration was planned against default", ran)
 		}
+	}
+}
+
+// migration reads one migration back out of the store.
+func (f *applierFixture) migration(t *testing.T, id string) catalog.DDLMigration {
+	t.Helper()
+	f.store.mu.Lock()
+	defer f.store.mu.Unlock()
+	for _, m := range f.store.migrations {
+		if m.ID == id {
+			return m
+		}
+	}
+	t.Fatalf("no migration %s", id)
+	return catalog.DDLMigration{}
+}
+
+// TestAStepIsNotRunWhenItCannotBeRecorded: recording that a step is running
+// is what makes running it recoverable. A resumed step checks whether its
+// object is already there, and it only does that for a shard the catalog
+// says was running. Run the DDL without the record and a crash leaves the
+// row saying pending, which resume reads as "never started" -- so a
+// committed CREATE TABLE is replayed, fails 42P07, and ends the migration
+// with the shards disagreeing.
+//
+// The save used to be advisory: its failure was logged and the DDL ran
+// anyway.
+func TestAStepIsNotRunWhenItCannotBeRecorded(t *testing.T) {
+	const stmt = "create table t (id int)"
+	queue := func(f *applierFixture) string {
+		return f.queue(catalog.DDLMigration{Statement: stmt, Kind: "CREATE TABLE", Scope: "all",
+			Meta: catalog.MigrationMeta{Object: catalog.MigrationObject{Kind: "relation", Name: "t", Expect: "present"}}})
+	}
+	ranStatement := func(f *applierFixture, sh int32) int {
+		n := 0
+		for _, s := range f.shards.statements(sh) {
+			if s == stmt {
+				n++
+			}
+		}
+		return n
+	}
+
+	// A blip: the record fails once per shard, the retry records it, and
+	// the statement runs exactly once -- not twice, which is what running
+	// before the record and again after it would look like.
+	t.Run("a save that fails once costs an attempt, not a duplicate", func(t *testing.T) {
+		f := newApplierFixture(t)
+		queue(f)
+		f.store.failRunningSaves = len(f.store.shards)
+		f.run(t)
+		for _, sh := range f.store.shards {
+			if n := ranStatement(f, sh); n != 1 {
+				t.Errorf("shard %d ran the statement %d times, want once", sh, n)
+			}
+		}
+	})
+
+	// A catalog that stays down: the step gives up, and gives up without
+	// having run. A row that says failed is recoverable by an operator; a
+	// row that says pending for a statement that already committed is not.
+	t.Run("a save that keeps failing gives up without running", func(t *testing.T) {
+		f := newApplierFixture(t)
+		id := queue(f)
+		f.store.failRunningSaves = 1 << 30
+		_, _ = f.app.RunOnce(context.Background())
+		for _, sh := range f.store.shards {
+			if n := ranStatement(f, sh); n != 0 {
+				t.Errorf("shard %d ran the statement %d times without the applier being able to record that it would", sh, n)
+			}
+		}
+		for key, st := range f.migration(t, id).PerShard {
+			if st.State == catalog.ShardApplied {
+				t.Errorf("shard %s reports done for a statement that never ran", key)
+			}
+		}
+	})
+}
+
+// TestASaveFailureIsRetryable: a step that was not run because the catalog
+// would not record it must always be worth another attempt -- nothing
+// happened on the shard. Pinned here rather than left to whichever branch
+// of transient happens to cover it.
+func TestASaveFailureIsRetryable(t *testing.T) {
+	if !transient(&saveFailed{errors.New("catalog unavailable")}) {
+		t.Fatal("a step that was never run must be retryable")
+	}
+	if !transient(fmt.Errorf("wrapped: %w", &saveFailed{errors.New("catalog unavailable")})) {
+		t.Fatal("wrapping it must not make it permanent")
 	}
 }
