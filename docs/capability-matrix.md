@@ -10,7 +10,7 @@ tests are authoritative.
 
 | Capability | Status | Where |
 |---|---|---|
-| PostgreSQL 18 and 19 images built from source (pgBackRest, agent as PID 1, pooler) | Implemented | `postgres/`, `docker-bake.hcl` |
+| PostgreSQL 18 and 19 images built from source (pgBackRest, agent as PID 1, pooler) | Implemented | `postgres/`, `docker-bake.hcl`; `19` is Beta 3 ([crd.md](crd.md)) |
 | `PgShardCluster` CRD: catalog + shard groups, pods, PVCs, Services, PDBs | Implemented | `api/v1alpha1`, `internal/operator/reconciler.go`, [crd.md](crd.md) |
 | Agent lifecycle: initdb/clone, rewind rejoin, lease fencing, self-fence on isolation | Implemented | `internal/agent`, [ha.md](ha.md) |
 | Automatic failover with lease fencing, epoch publication, durability-over-availability candidate rule | Implemented | `internal/operator/failover.go`, [ha.md](ha.md#failover) |

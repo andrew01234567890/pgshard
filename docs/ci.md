@@ -20,6 +20,9 @@ runs the checker against the fixtures under `hack/testdata`.
 ## Container images on GHCR (one-time bootstrap)
 
 `images.yml` pushes `ghcr.io/andrew01234567890/pgshard-postgres:{18,18.x,19,19betaN}`
+from `main` only: `workflow_dispatch` can build any branch but cannot publish
+one. The `19` tag tracks whatever PostgreSQL 19 the build uses, which today is
+**Beta 3** -- a major-number tag is a channel, not a promise of a release
 using `GITHUB_TOKEN` with `packages: write`. For a user-owned namespace the very
 first push is rejected with `denied: permission_denied: write_package` until the
 package exists and is linked to the repository. Bootstrap once, by hand:
