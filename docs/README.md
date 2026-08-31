@@ -54,6 +54,28 @@
 | [pgparser.md](pgparser.md) | Bound PostgreSQL grammar |
 | [ci.md](ci.md) | Workflows and image publishing |
 
+## Decisions
+
+Architecture decision records say why the system is shaped the way it is,
+and what was rejected. They are historical: a superseded decision is
+replaced by a later record rather than edited.
+
+| ADR | Decision |
+|---|---|
+| [0001](adr/0001-durability-guc-enforcement.md) | Enforcing the durability floor against code the router cannot read |
+| [0003](adr/0003-run-postgresql-ourselves.md) | Running PostgreSQL ourselves rather than delegating to another operator |
+| [0004](adr/0004-route-as-the-real-user.md) | Connecting to shards as the client's own role |
+| [0005](adr/0005-postgresql-own-hash-for-placement.md) | Placing rows with PostgreSQL's own extended hash |
+| [0006](adr/0006-no-etcd.md) | Keeping coordination in Kubernetes and the catalog, not in etcd |
+| [0007](adr/0007-libpg_query-per-major.md) | Parsing with libpg_query, pinned per PostgreSQL major |
+| [0008](adr/0008-native-logical-replication-for-resharding.md) | Moving data with native logical replication |
+| [0009](adr/0009-oid-preserving-online-rewrites.md) | Rewriting tables in place rather than swapping them |
+| [0010](adr/0010-everything-automatic.md) | Making transitions automatic, with pauses as the opt-in |
+| [0011](adr/0011-catalog-tables-are-the-control-plane.md) | Declaring the shard layout as SQL in the `pgshard` database |
+| [0012](adr/0012-postgresql-images-from-source.md) | Building PostgreSQL images from source, per major, with a patch series |
+| [0013](adr/0013-crd-api-group.md) | `pgshard.io` as the CRD API group |
+| [0014](adr/0014-postgresql-18-and-19.md) | Targeting PostgreSQL 18 and 19, and nothing older |
+
 Component references are design-plus-behaviour documents; where one
 disagrees with the code, the code and its tests are authoritative, and the
 [capability matrix](capability-matrix.md) is the summary of record.
