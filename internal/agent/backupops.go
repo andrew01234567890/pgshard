@@ -140,10 +140,12 @@ func backupInfoProto(i backup.Info) *pgshardv1.BackupInfo {
 // Backup runs pgbackrest backup on the primary at the current epoch.
 func (s *Server) Backup(ctx context.Context, req *pgshardv1.BackupRequest) (*pgshardv1.BackupResponse, error) {
 	resp := &pgshardv1.BackupResponse{Epoch: s.epoch.Current()}
-	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
+	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
+	if err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
+	defer endTerm()
 	resp.Epoch = req.GetEpoch()
 	t, err := backupType(req.GetType())
 	if err != nil {
@@ -188,10 +190,12 @@ func (s *Server) RestoreInfo(ctx context.Context, _ *pgshardv1.RestoreInfoReques
 // Expire applies retention at the current epoch.
 func (s *Server) Expire(ctx context.Context, req *pgshardv1.ExpireRequest) (*pgshardv1.ExpireResponse, error) {
 	resp := &pgshardv1.ExpireResponse{Epoch: s.epoch.Current()}
-	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
+	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
+	if err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
+	defer endTerm()
 	resp.Epoch = req.GetEpoch()
 	r, err := s.inst.backupRunner()
 	if err != nil {
