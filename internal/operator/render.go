@@ -529,6 +529,10 @@ func (Renderer) Pod(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, rol
 				// rotating the superuser password are separate acts.
 				{Name: agentTokenVolume, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
 					SecretName: AgentSecretName(c.Name)}}},
+				// The pooler's catalog login, kept apart from the superuser
+				// Secret above so the two can be rotated independently.
+				{Name: poolerCatalogSecretVolume, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+					SecretName: RouterSecretName(c.Name)}}},
 				{Name: "pg-socket", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 			},
 		},
@@ -560,7 +564,15 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 		"--listen", fmt.Sprintf(":%d", poolerGRPCPort),
 		"--metrics-listen", fmt.Sprintf(":%d", poolerMetricsPort),
 		"--pg-socket-dir", pgSocketDir,
-		"--catalog-dsn", CatalogDSN(c),
+		// The catalog, as the router's login role rather than the
+		// superuser: this connection only reads the shard map's generation
+		// and epoch. The superuser password stays in PGPASSWORD for the
+		// local socket below, which creates and reads replication slots and
+		// genuinely needs it -- so the container holds two credentials, and
+		// a compromised pooler no longer holds the one that is also the
+		// seed of the agent control-plane token.
+		"--catalog-dsn", RouterCatalogDSN(c),
+		"--catalog-password-file", poolerCatalogPasswordDir + "/" + secretKey,
 		"--shard-set", shardSet,
 		"--shard-id", fmt.Sprint(g.ShardID),
 		// Without a DSN the pooler refuses every Stream and CopyTables
@@ -572,6 +584,7 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 	mounts := []corev1.VolumeMount{
 		{Name: "pg-socket", MountPath: pgSocketDir},
 		{Name: "secret", MountPath: secretMountPath, ReadOnly: true},
+		{Name: poolerCatalogSecretVolume, MountPath: poolerCatalogPasswordDir, ReadOnly: true},
 	}
 	if internalTLSRef(c) != nil {
 		args = append(args,
