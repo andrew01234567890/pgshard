@@ -190,6 +190,14 @@ type Executor struct {
 	// statement.
 	txnPrelude []string
 	txnTouched bool
+	// txnOnBackend says a shard is holding this transaction open, and
+	// txnPreFence whether the cluster's write pause went up after that
+	// happened. PostgreSQL reads default_transaction_read_only at BEGIN, so
+	// such a transaction can still write -- and a barrier's drain waits for
+	// exactly these before it takes a restore point. Holding its statements
+	// would hold the drain that is waiting for it.
+	txnOnBackend bool
+	txnPreFence  bool
 
 	// parked holds the streams of the other shards an open transaction has
 	// touched; wroteHere says whether the current shard was written to.
@@ -471,6 +479,7 @@ func (e *Executor) guard(op string, run func() error) (err error) {
 		e.dropStream()
 		e.staged, e.stagedMark = nil, 0
 		e.txnPrelude, e.txnTouched = nil, false
+		e.txnOnBackend, e.txnPreFence = false, false
 		err = pgwire.Errorf(pgwire.CodeInternalError, "internal error while processing the statement; the session state was reset")
 	}()
 	return run()
@@ -1320,6 +1329,7 @@ func (e *Executor) reapplyStartupSearchPath(ctx context.Context, g gucEntry) err
 func (e *Executor) afterBatch(ctx context.Context, err error) error {
 	if e.tx == pgwire.TxIdle {
 		e.txnPrelude, e.txnTouched = nil, false
+		e.txnOnBackend, e.txnPreFence = false, false
 		e.wroteHere, e.gid = false, ""
 		e.savepoints = nil
 		e.dropParked()
@@ -1637,6 +1647,9 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 		case *pgshardv1.ExecuteResponse_ReadyForQuery:
 			prev := e.tx
 			e.tx = txStatus(m.ReadyForQuery.TxnStatus)
+			if prev == pgwire.TxIdle && e.tx != pgwire.TxIdle && !e.txnOnBackend {
+				e.txnOnBackend, e.txnPreFence = true, !e.r.writeFenced(nil)
+			}
 			if prev != pgwire.TxIdle && e.tx == pgwire.TxIdle {
 				e.txnEnded = true
 			}

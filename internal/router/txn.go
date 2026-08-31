@@ -433,11 +433,13 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 	for i, p := range writers {
 		ids[i] = p.shard.ID
 	}
-	if err := e.r.awaitWriteFence(ctx, nil); err != nil {
-		e.each(append(writers, readers...), func(p *txnPart) error { return e.runOn(ctx, p, "ROLLBACK", discardWriter{}) })
-		e.finishTxn("ROLLBACK")
-		return err
-	}
+	// No write fence here. Every participant of this transaction already
+	// wrote, which is the case the fence exempts: a barrier's drain waits
+	// for exactly these transactions to finish, so holding their commit
+	// held the drain open until the buffering window expired, and then
+	// refused work the barrier was waiting on. The barrier stays consistent
+	// without it -- it drains prepared transactions and in-transaction
+	// backends, twice, before it takes any restore point.
 	e.each(readers, func(p *txnPart) error { return e.runOn(ctx, p, "ROLLBACK", discardWriter{}) })
 	xids := make([]string, len(writers))
 	e.each(writers, func(p *txnPart) error {
@@ -545,6 +547,7 @@ func heartbeatUntilDecided(ctx context.Context, log DecisionLog, gid string) {
 // finishTxn marks the multi-shard transaction over on the current stream.
 func (e *Executor) finishTxn(tag string) {
 	e.tx = pgwire.TxIdle
+	e.txnOnBackend, e.txnPreFence = false, false
 	e.txnEnded = true
 	e.wroteHere = false
 	e.gid = ""

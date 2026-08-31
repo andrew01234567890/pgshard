@@ -115,14 +115,52 @@ func (r *Router) awaitWriteFence(ctx context.Context, tables []snapshot.TableKey
 }
 
 // gateWrite applies the write fence to a statement that writes, unless the
-// session's transaction already wrote before the fence: open transactions
-// may finish, and holding their later statements would only make them
-// linger.
+// session's transaction was already open before the fence: open
+// transactions may finish, and holding their later statements would only
+// make them linger -- in front of a barrier's drain, which is waiting for
+// those same transactions to end.
 func (e *Executor) gateWrite(ctx context.Context, tables []snapshot.TableKey) error {
-	if e.txnWrote() {
+	if e.txnWrote() || e.txnPreFence {
 		return nil
 	}
-	return e.r.awaitWriteFence(ctx, tables)
+	if !e.r.writeFenced(tables) {
+		return nil
+	}
+	if err := e.releaseUntouchedTxn(ctx); err != nil {
+		return err
+	}
+	err := e.r.awaitWriteFence(ctx, tables)
+	if rerr := e.replayPrelude(ctx); rerr != nil && err == nil {
+		err = rerr
+	}
+	return err
+}
+
+// releaseUntouchedTxn closes the backend's transaction before a write waits
+// for the cluster's write pause, and is why that wait terminates. A
+// transaction that has run nothing but its prelude holds no rows and no
+// locks, but it does hold a backend inside a transaction -- and a barrier's
+// drain waits for exactly that before it takes its restore points. Waiting
+// while holding one waits for a pause that is waiting for us, until the
+// buffering window runs out and the client is refused.
+//
+// The prelude survives, so gateWrite reopens the transaction once the pause
+// lifts and the client sees the pause as latency. Reopening also matters
+// for what runs next: PostgreSQL reads default_transaction_read_only at
+// BEGIN, so a transaction opened during the pause would be refused its
+// write even after the pause ended.
+func (e *Executor) releaseUntouchedTxn(ctx context.Context) error {
+	if e.tx == pgwire.TxIdle || e.txnTouched || e.conn == nil || len(e.parked) > 0 {
+		return nil
+	}
+	if err := e.send(simpleQuery("ROLLBACK")); err != nil {
+		return err
+	}
+	if err := e.pump(ctx, discardWriter{}); err != nil {
+		return err
+	}
+	e.txnEnded, e.txnOnBackend = false, false
+	return nil
 }
 
 // txnWrote reports whether the current transaction wrote on any shard.
