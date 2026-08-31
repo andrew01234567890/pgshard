@@ -26,7 +26,11 @@ const CatalogGroup = "catalog"
 
 // Barrier timing defaults.
 const (
-	DefaultDrainTimeout   = 30 * time.Second
+	DefaultDrainTimeout = 30 * time.Second
+	// DefaultFenceSettle is how long a barrier holds the write fence before
+	// pausing the groups, so routers are buffering by the time a group
+	// would refuse a write itself. It is best effort: see settleFence.
+	DefaultFenceSettle    = time.Second
 	DefaultArchiveTimeout = 2 * time.Minute
 	DefaultBarrierPoll    = 200 * time.Millisecond
 )
@@ -170,7 +174,11 @@ type Barrier struct {
 	DrainTimeout   time.Duration
 	ArchiveTimeout time.Duration
 	Poll           time.Duration
-	Now            func() time.Time
+	// FenceSettle is how long the fence is up before the groups are paused,
+	// so routers have seen it and are holding new writes by the time a
+	// group would refuse one. Negative disables the wait.
+	FenceSettle time.Duration
+	Now         func() time.Time
 }
 
 func (b *Barrier) logger() *slog.Logger {
@@ -260,11 +268,32 @@ func (b *Barrier) run(ctx context.Context, name string) (RestorePoint, error) {
 		return RestorePoint{}, fmt.Errorf("barrier %s: fence: %w", name, err)
 	}
 	b.logger().Info("barrier: write fence raised", "barrier", name)
+	// Let the fence reach the routers before any group starts refusing.
+	//
+	// The pause is two things raised in sequence: this flag, which routers
+	// see through their snapshots and answer by holding new writes, and
+	// default_transaction_read_only on the groups, which PostgreSQL answers
+	// with 25006. A barrier that is not waiting on anything now takes
+	// milliseconds, so without this wait a whole barrier can begin and end
+	// inside the time it takes a router to notice, and every write it
+	// forwards meanwhile is refused by the server instead of being buffered
+	// by us.
+	//
+	// It is buffering, not correctness: the restore points are made
+	// consistent by the group pause and the drain, both of which stand
+	// whether or not a router ever saw the flag. A settle that is too short
+	// costs a client a retryable refusal, not a bad restore point -- which
+	// is why this is a wait rather than a check that every router has
+	// caught up, and why it can be turned off.
 	// Every group is paused before anything is measured, and stays paused
 	// until the last restore point is archived: that, not the catalog flag,
 	// is what makes the points a common commit barrier.
 	var rp RestorePoint
-	at, err := b.pauseAll(ctx, name, groups)
+	var at map[string]time.Time
+	err = b.settleFence(ctx)
+	if err == nil {
+		at, err = b.pauseAll(ctx, name, groups)
+	}
 	if err == nil {
 		rp, err = b.fenced(ctx, name, owner, groups, at)
 	}
@@ -689,6 +718,23 @@ func (b *Barrier) awaitArchived(ctx context.Context, name string, groups []Group
 		}
 	}
 	return nil
+}
+
+// settleFence waits FenceSettle, or DefaultFenceSettle, after raising the
+// fence.
+func (b *Barrier) settleFence(ctx context.Context) error {
+	d := orDefault(b.FenceSettle, DefaultFenceSettle)
+	if b.FenceSettle < 0 || d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 func (b *Barrier) sleep(ctx context.Context) error {

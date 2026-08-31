@@ -81,6 +81,12 @@ type Router struct {
 	// whose participants the router could not finish itself.
 	inDoubt atomic.Int64
 
+	// fenceSeen is when this router last observed the cluster write pause,
+	// in unix nanoseconds. A pause is short and a statement can outlive it,
+	// so a shard's read-only refusal is attributed to a pause we saw
+	// recently as well as to one still up.
+	fenceSeen atomic.Int64
+
 	mu       sync.Mutex
 	sessions map[uint64]*Executor
 	// perUser counts the live sessions of each role, for connection limits.

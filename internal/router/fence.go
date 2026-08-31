@@ -7,6 +7,7 @@ import (
 
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
+	"github.com/andrew01234567890/pgshard/internal/router/plan"
 )
 
 // codeReadOnlyTransaction is PostgreSQL's own answer when a shard is paused
@@ -45,7 +46,21 @@ func fenceBufferFullError() error {
 // shards (migrating). Reads never wait.
 func (r *Router) writeFenced(tables []snapshot.TableKey) bool {
 	snap := r.cfg.Snapshot()
-	return snap != nil && (snap.WriteFence || snap.Migrating() || snap.TableMigrating(tables))
+	fenced := snap != nil && (snap.WriteFence || snap.Migrating() || snap.TableMigrating(tables))
+	if fenced {
+		r.fenceSeen.Store(time.Now().UnixNano())
+	}
+	return fenced
+}
+
+// sawWriteFenceRecently reports that this router observed the cluster write
+// pause within the buffering window. A certified barrier is milliseconds
+// long once it is not waiting on anything, so a statement it refused can
+// easily return after it has finished, and the pause is then invisible to a
+// check that only looks at now.
+func (r *Router) sawWriteFenceRecently() bool {
+	seen := r.fenceSeen.Load()
+	return seen != 0 && time.Since(time.Unix(0, seen)) < r.cfg.Buffering.Window
 }
 
 func (r *Router) tableMigrating(tables []snapshot.TableKey) bool {
@@ -126,9 +141,19 @@ func (r *Router) awaitWriteFence(ctx context.Context, tables []snapshot.TableKey
 // transactions may finish, and holding their later statements would only
 // make them linger -- in front of a barrier's drain, which is waiting for
 // those same transactions to end.
-func (e *Executor) gateWrite(ctx context.Context, tables []snapshot.TableKey) error {
+func (e *Executor) gateWrite(ctx context.Context, target Shard, tables []snapshot.TableKey) error {
 	if e.txnWrote() || e.txnPreFence {
-		return nil
+		if e.holdsShard(target) || !e.r.writeFenced(tables) {
+			return nil
+		}
+		// The exemption covers the shards this transaction is already on,
+		// whose transactions began before the pause and may therefore still
+		// write. A shard it has not reached yet would open its transaction
+		// under the pause and refuse the statement with PostgreSQL's own
+		// 25006, which tells the client nothing about retrying -- so the
+		// answer is pgshard's, and it comes now rather than after a round
+		// trip that cannot succeed.
+		return writeFenceError(e.r.migrating(), e.r.tableMigrating(tables))
 	}
 	if !e.r.writeFenced(tables) {
 		return nil
@@ -166,7 +191,10 @@ func (e *Executor) releaseUntouchedTxn(ctx context.Context) error {
 	if err := e.pump(ctx, discardWriter{}); err != nil {
 		return err
 	}
+	// The transaction is gone, including what this statement had already
+	// recorded about it before it failed.
 	e.txnEnded, e.txnOnBackend = false, false
+	e.wroteHere, e.gid = false, ""
 	return nil
 }
 
@@ -186,6 +214,29 @@ func (e *Executor) txnWrote() bool {
 	return false
 }
 
+// writeTarget is the shard a single-shard write will run on. A statement
+// that fans out has no one target, and the session's current shard is the
+// closest thing to one.
+func (e *Executor) writeTarget(pl plan.Plan) Shard {
+	if len(pl.Shards) == 1 {
+		return Shard{Set: e.userSet(), ID: pl.Shards[0]}
+	}
+	return e.shard
+}
+
+// holdsShard reports that the open transaction already has a backend on s,
+// so PostgreSQL read default_transaction_read_only for it before any pause
+// that is up now.
+func (e *Executor) holdsShard(s Shard) bool {
+	if e.tx == pgwire.TxIdle {
+		return false
+	}
+	if s == e.shard && (e.txnTouched || e.wroteHere) {
+		return true
+	}
+	return e.parked[s] != nil
+}
+
 // writePauseRetryable reports that a statement failed only because a shard
 // was paused for a barrier the router had not seen yet, on a transaction
 // that has done nothing else and has told the client nothing.
@@ -196,8 +247,12 @@ func (e *Executor) txnWrote() bool {
 // BEGIN, so such a transaction stays unable to write even after the pause
 // lifts -- an error the client can do nothing with, on a statement pgshard
 // undertook to buffer.
+// wroteHere is deliberately not consulted: it is set before the statement
+// is sent, so it is true for the very statement that failed. What must not
+// be retried is a transaction an earlier statement already put on a shard,
+// and txnTouched is what says that.
 func (e *Executor) writePauseRetryable(err error, wrote bool) bool {
-	if err == nil || wrote || e.txnTouched || e.txnWrote() {
+	if err == nil || wrote || e.txnTouched {
 		return false
 	}
 	pe, ok := errors.AsType[*pgwire.Error](err)
