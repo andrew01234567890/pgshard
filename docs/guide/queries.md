@@ -99,7 +99,7 @@ COPY on sharded and reference tables is not available yet.
 | SQLSTATE | Meaning |
 |---|---|
 | `0A000` | refused shape; the message names the rule and usually a workaround |
-| `40001` | shard failover inside your open transaction — retry the whole transaction |
+| `40001` | the transaction did not commit anywhere — retry the whole transaction; `DETAIL` says whether it was a failover or a resolver abort |
 | `57P03` | cluster write pause while a certified barrier is taken — retry |
 | `08007` | two-phase commit outcome unknown; the resolver finishes it ([transactions.md](transactions.md)) |
 | `55000` | stale routing generation; transient during topology changes |

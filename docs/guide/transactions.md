@@ -59,12 +59,25 @@ transactions with no decision row are rolled back. See the
 
 ## Retry guidance
 
+Retry on the SQLSTATE, never on the message. These are the only codes that
+mean a retry is safe, and pgshard uses no others for it:
+
 | Error | Client action |
 |---|---|
-| `40001` shard failover | retry the whole transaction |
-| `57P03` write pause (barrier) | retry after a moment |
-| `08007` in doubt | do not retry blindly; the outcome is decided by the resolver — check your data or use an idempotency key |
-| any other `COMMIT` error | the transaction rolled back everywhere; safe to retry |
+| `40001` serialization_failure | retry the whole transaction — nothing it wrote was committed |
+| `40P01` deadlock_detected | retry the whole transaction |
+| `57P03` cannot_connect_now (write pause, barrier) | retry after a moment |
+| `08007` transaction_resolution_unknown | **do not retry** — the transaction may still commit; the resolver finishes it. Check your data or use an idempotency key |
+| anything else | the transaction is over; treat it as a failure, not as something to run again |
+
+`40001` is the single code for every outcome pgshard knows to be safely
+retryable — a failover inside your transaction, and a transaction the
+resolver rolled back because it presumed the coordinator dead. The `DETAIL`
+says which; the code does not change, because retry loops match one value.
+
+Do **not** retry on "any error other than `08007`". Most drivers surface
+connection failures and timeouts as neither, and a `COMMIT` that ends in a
+lost connection has exactly the unknown outcome `08007` describes.
 
 Metrics: `pgshard_router_in_doubt_transactions_total` on the router's
 `/metrics` endpoint.

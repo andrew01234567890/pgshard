@@ -29,7 +29,6 @@ const (
 	txnModeSingle = "single"
 
 	codeInDoubt         = "08007"
-	codeTxnRollback     = "40000"
 	codeInvalidParamVal = "22023"
 )
 
@@ -52,6 +51,25 @@ type txnPart struct {
 // switchPart parks the stream of the current shard and makes target the
 // current one, reviving its parked stream or leaving the session to open a
 // fresh one (acquire replays the transaction prelude on it).
+// resolverAbortError ends a transaction the resolver rolled back before
+// its coordinator could decide. It carries the same code as any other safe
+// whole-transaction retry: a driver's loop tests one value.
+func resolverAbortError(gid string) error {
+	perr := pgwire.Errorf(codeRetryTransaction, "two-phase commit: transaction %s was aborted by the resolver before it was decided", gid)
+	perr.Detail = "The coordinator was presumed dead and the resolver rolled the transaction back on every participant."
+	perr.Hint = "Retry the whole transaction. Nothing it wrote was committed."
+	return perr
+}
+
+// inDoubtError ends a transaction whose outcome the router does not know.
+// It is deliberately not a retry code: the transaction may still commit.
+func inDoubtError(gid string, err error) error {
+	perr := pgwire.Errorf(codeInDoubt, "two-phase commit: the outcome of transaction %s is unknown: %v", gid, err)
+	perr.Detail = "The decision could not be written or read back, so the transaction may still commit."
+	perr.Hint = "Do not retry. The resolver commits or rolls back the prepared transaction once the decision log is reachable; check the data or use an idempotency key."
+	return perr
+}
+
 func (e *Executor) switchPart(ctx context.Context, target Shard) error {
 	if e.catalogSession() {
 		return pgwire.Errorf(pgwire.CodeFeatureNotSupported, "transactions on the catalog shard set cannot span shards")
@@ -533,9 +551,7 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 		e.r.metrics.TwoPCInDoubt.Inc()
 		e.finishTxn("")
 		e.r.cfg.Logger.Warn("two-phase commit: decision unknown, participants left prepared for the resolver", "gid", gid, "err", err)
-		perr := pgwire.Errorf(codeInDoubt, "two-phase commit: the outcome of transaction %s is unknown: %v", gid, err)
-		perr.Hint = "the resolver commits or rolls back the prepared transaction once the decision log is reachable"
-		return perr
+		return inDoubtError(gid, err)
 	}
 	if !decided {
 		e.each(writers, func(p *txnPart) error {
@@ -543,7 +559,7 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 		})
 		e.finishTxn("ROLLBACK")
 		e.r.metrics.TwoPCAborts.Inc()
-		return pgwire.Errorf(codeTxnRollback, "two-phase commit: transaction %s was aborted by the resolver before it was decided", gid)
+		return resolverAbortError(gid)
 	}
 	crashpoint.Hit("after_decision")
 	e.r.metrics.TwoPCCommits.Inc()

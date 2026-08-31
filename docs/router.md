@@ -450,7 +450,9 @@ catalog table `pgshard.xact_decisions`:
    state = 'preparing'`, again synchronously committed. This single-row
    update is the point of no return. If it updates no row the resolver
    already aborted the transaction (a router presumed dead): the router
-   rolls the prepared transactions back and reports `40000`. If the update
+   rolls the prepared transactions back and reports `40001` — the same
+   retry code a failover gives, because the outcome is the same: nothing
+   committed and running it again is safe. If the update
    *fails* (catalog unreachable) the router does not know whether the
    decision landed: it reports `08007` (`transaction_resolution_unknown`),
    leaves the participants prepared and increments the in-doubt counter;
@@ -462,8 +464,10 @@ catalog table `pgshard.xact_decisions`:
 
 **What success means.** The client sees `COMMIT` only after step 3 is
 durable, so a successful `COMMIT` is committed on every shard eventually,
-even if the router dies right afterwards. An error from `COMMIT` other than
-`08007` means the transaction rolled back everywhere. `ROLLBACK` rolls back
+even if the router dies right afterwards. `08007` is the only code that
+means the outcome is unknown; a `COMMIT` that fails any other way rolled
+back everywhere, and `40001` marks the ones the router knows are safe to
+run again. `ROLLBACK` rolls back
 every participant and never touches the decision log.
 
 The `/metrics` endpoint on the health listener exposes

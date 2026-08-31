@@ -43,8 +43,8 @@ func TestAFenceSaysItIsAFence(t *testing.T) {
 
 	// The commit path is stricter: it is new behaviour, so only an explicit
 	// reason is rewritten. A bare 55000 there is left exactly as it was.
-	if got := nameFenceInTxn(fence); !errors.As(got, &pe) || pe.Code != codeFailoverInTxn {
-		t.Fatalf("a flip during PREPARE gave the client %v, want %s", got, codeFailoverInTxn)
+	if got := nameFenceInTxn(fence); !errors.As(got, &pe) || pe.Code != codeRetryTransaction {
+		t.Fatalf("a flip during PREPARE gave the client %v, want %s", got, codeRetryTransaction)
 	}
 	if got := nameFenceInTxn(bare); !errors.Is(got, bare) {
 		t.Errorf("a bare 55000 during PREPARE was rewritten to %v", got)
@@ -99,8 +99,8 @@ func TestAFlipAtCommitIsNamedWhereverItLands(t *testing.T) {
 	fence := toPgwireError(&pgshardv1.Error{Sqlstate: codeStaleGeneration, Message: "stale routing generation",
 		Reason: pgshardv1.Reason_REASON_STALE_GENERATION})
 	var pe *pgwire.Error
-	if got := nameFenceInTxn(fence); !errors.As(got, &pe) || pe.Code != codeFailoverInTxn {
-		t.Fatalf("a declared fence at commit gave %v, want %s", got, codeFailoverInTxn)
+	if got := nameFenceInTxn(fence); !errors.As(got, &pe) || pe.Code != codeRetryTransaction {
+		t.Fatalf("a declared fence at commit gave %v, want %s", got, codeRetryTransaction)
 	}
 	// Nothing else is touched: nil stays nil, and an error that is not a
 	// declared fence is the participant's to report.
@@ -135,8 +135,8 @@ func TestACommitMeetingAFlipTellsTheClientToRetry(t *testing.T) {
 	if err == nil {
 		t.Fatal("a commit whose shard has moved must not report success")
 	}
-	if got := sqlstate(err); got != codeFailoverInTxn {
-		t.Fatalf("commit gave %s (%v), want %s: at COMMIT a bare 55000 is where it helps least", got, err, codeFailoverInTxn)
+	if got := sqlstate(err); got != codeRetryTransaction {
+		t.Fatalf("commit gave %s (%v), want %s: at COMMIT a bare 55000 is where it helps least", got, err, codeRetryTransaction)
 	}
 }
 
@@ -149,8 +149,8 @@ func TestNoPathReturnsABareFence(t *testing.T) {
 		Reason: pgshardv1.Reason_REASON_STALE_GENERATION})
 	err := e.guard("Execute", func() error { return fence })
 	var pe *pgwire.Error
-	if !errors.As(err, &pe) || pe.Code != codeFailoverInTxn {
-		t.Fatalf("a fence leaving guard gave %v, want %s", err, codeFailoverInTxn)
+	if !errors.As(err, &pe) || pe.Code != codeRetryTransaction {
+		t.Fatalf("a fence leaving guard gave %v, want %s", err, codeRetryTransaction)
 	}
 	// A rewrite in progress carries the same SQLSTATE and is not a fence:
 	// it clears on its own, and "retry the transaction" would be a loop.

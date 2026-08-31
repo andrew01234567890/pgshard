@@ -389,7 +389,7 @@ func TestResolverAbortRaceIsRolledBack(t *testing.T) {
 	// guarded commit UPDATE then finds no preparing row.
 	h.log.abortAfterBegin = true
 	err = tx.Commit(ctx)
-	if pe := expectRefusalCode(t, err, "40000"); !strings.Contains(pe.Message, "aborted by the resolver") {
+	if pe := expectRefusalCode(t, err, "40001"); !strings.Contains(pe.Message, "aborted by the resolver") {
 		t.Fatalf("message %q", pe.Message)
 	}
 	if h.prepared() != 0 {

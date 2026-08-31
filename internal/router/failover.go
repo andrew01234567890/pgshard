@@ -20,10 +20,14 @@ const (
 	// codeRewriteInProgress marks a condition the client should wait out
 	// rather than a fault: the same SQLSTATE a fenced shard answers with.
 	codeRewriteInProgress = "55000"
-	// codeFailoverInTxn is serialization_failure: the statement ran inside a
-	// transaction the router cannot replay, so the client must retry the
-	// whole transaction, exactly as it would after a serialization failure.
-	codeFailoverInTxn = "40001"
+	// codeRetryTransaction is serialization_failure. It is the one code the
+	// router uses to say a transaction did not commit anywhere and running
+	// it again is safe, whatever ended it -- a failover mid-transaction, or
+	// the resolver aborting a transaction whose coordinator it presumed
+	// dead. Drivers' retry loops test for this exact value and nothing
+	// broader, so a second code for a second cause is a retry that never
+	// happens. The Detail says which cause it was.
+	codeRetryTransaction = "40001"
 	// codeBufferFull is too_many_connections: the per-shard buffer is full.
 	codeBufferFull = "53300"
 )
@@ -224,9 +228,10 @@ func bufferFullError(sh Shard) error {
 }
 
 func failoverInTxnError() error {
-	return &pgwire.Error{Severity: "ERROR", Code: codeFailoverInTxn,
+	return &pgwire.Error{Severity: "ERROR", Code: codeRetryTransaction,
 		Message: "shard failover; retry the transaction",
-		Detail:  "The shard serving this transaction changed primaries; statements already run in the transaction cannot be replayed."}
+		Detail:  "The shard serving this transaction changed primaries; statements already run in the transaction cannot be replayed.",
+		Hint:    "Retry the whole transaction. Nothing it wrote was committed."}
 }
 
 // countingWriter records whether any protocol message reached the client;
