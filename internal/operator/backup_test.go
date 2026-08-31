@@ -857,3 +857,48 @@ func TestRepositoryEncryptionCondition(t *testing.T) {
 		t.Errorf("the message tells an operator to do the thing that breaks an existing repository: %q", got.Message)
 	}
 }
+
+// TestDeletingABackupStopsIt: a PgShardBackup that is deleted while its
+// backup is running used to leave the worker going. It was bound only to
+// the manager context and a twelve-hour timeout, it had nothing left to
+// report to, and because the deleted record was no longer listed as Running
+// a replacement could start against the same stanza beside it.
+func TestDeletingABackupStopsIt(t *testing.T) {
+	agents := &fakeBackupAgents{block: make(chan struct{})}
+	r, cl, b := backupFixture(t, agents)
+	if _, got := reconcileBackup(t, r, b); got.Status.Phase != pgshardv1alpha1.BackupPhaseRunning {
+		t.Fatalf("phase %v", got.Status.Phase)
+	}
+	run := r.run(b.UID)
+	if run == nil {
+		t.Fatal("no run in flight")
+	}
+
+	// The record goes while the backup is still blocked in the agent.
+	if err := cl.Delete(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(b)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.RequeueAfter == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the reconciler never finished stopping the run")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	select {
+	case <-run.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the worker kept running after its record was deleted")
+	}
+	if r.run(b.UID) != nil {
+		t.Error("the stopped run must not be left in the registry")
+	}
+}
