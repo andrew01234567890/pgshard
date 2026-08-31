@@ -533,11 +533,11 @@ func (c *Copier) drive(ctx context.Context, wf *copyWorkflow) (bool, error) {
 	if err := c.ensureSubscriptions(ctx, wf, srcSet, srcIDs, dbs); err != nil {
 		return advanced, err
 	}
-	progress, byTarget, err := c.observe(ctx, wf, srcSet, srcIDs, dbs)
+	progress, byTarget, standbyLag, err := c.observe(ctx, wf, srcSet, srcIDs, dbs)
 	if err != nil {
 		return advanced, err
 	}
-	if err := c.throttle(ctx, wf, srcSet, srcIDs, dbs); err != nil {
+	if err := c.throttle(ctx, wf, srcIDs, dbs, standbyLag); err != nil {
 		return advanced, err
 	}
 	wf.copy.Progress, wf.copy.Targets = progress, byTarget
@@ -982,22 +982,30 @@ func (c *Copier) blockedBy(wf *copyWorkflow, srcSet string, s int32, gids []stri
 // observe reads the copy's progress: the aggregate, and the same per target
 // shard. Flattening to one maximum told an operator the copy was behind
 // without saying which target was behind, which is the thing they act on.
-func (c *Copier) observe(ctx context.Context, wf *copyWorkflow, srcSet string, srcIDs []int32, dbs []dbPlan) (CopyProgress, map[string]CopyProgress, error) {
+func (c *Copier) observe(ctx context.Context, wf *copyWorkflow, srcSet string, srcIDs []int32, dbs []dbPlan) (CopyProgress, map[string]CopyProgress, int64, error) {
+	var standbyLag int64
 	sourceLSN := map[int32]int64{}
+	// The source's write position and its standby lag come back from one
+	// dial: they were two, and every pass of an active workflow paid for
+	// both on every source. Nothing between them needs separating -- the
+	// throttle acts on the lag this same pass.
 	for _, s := range srcIDs {
 		conn, err := c.Shards.Dial(ctx, srcSet, s)
 		if err != nil {
-			return CopyProgress{}, nil, err
+			return CopyProgress{}, nil, 0, err
 		}
-		rows, err := conn.Query(ctx, `SELECT (pg_current_wal_lsn() - '0/0'::pg_lsn)::bigint`)
+		rows, err := conn.Query(ctx, `SELECT (pg_current_wal_lsn() - '0/0'::pg_lsn)::bigint,
+			(SELECT coalesce(max(pg_current_wal_lsn() - replay_lsn), 0)::bigint FROM pg_stat_replication
+			 WHERE application_name NOT LIKE 'pgshard\_reshard\_%')`)
 		if err == nil {
-			var lsn int64
-			lsn, err = pgx.CollectExactlyOneRow(rows, pgx.RowTo[int64])
-			sourceLSN[s] = lsn
+			var probe sourceProbe
+			probe, err = pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[sourceProbe])
+			sourceLSN[s] = probe.LSN
+			standbyLag = max(standbyLag, probe.StandbyLag)
 		}
 		_ = conn.Close(ctx)
 		if err != nil {
-			return CopyProgress{}, nil, err
+			return CopyProgress{}, nil, 0, err
 		}
 	}
 	var reports []SubscriptionProgress
@@ -1006,12 +1014,12 @@ func (c *Copier) observe(ctx context.Context, wf *copyWorkflow, srcSet string, s
 		for _, t := range wf.ids {
 			conn, err := c.Shards.DialDatabase(ctx, wf.set, t, db.name)
 			if err != nil {
-				return CopyProgress{}, nil, err
+				return CopyProgress{}, nil, 0, err
 			}
 			rs, err := subscriptionReports(ctx, conn, db.name, wf.gen, t, srcIDs, sourceLSN)
 			_ = conn.Close(ctx)
 			if err != nil {
-				return CopyProgress{}, nil, fmt.Errorf("progress of %s on %s/%d: %w", db.name, wf.set, t, err)
+				return CopyProgress{}, nil, 0, fmt.Errorf("progress of %s on %s/%d: %w", db.name, wf.set, t, err)
 			}
 			reports = append(reports, rs...)
 			perTarget[t] = append(perTarget[t], rs...)
@@ -1021,7 +1029,7 @@ func (c *Copier) observe(ctx context.Context, wf *copyWorkflow, srcSet string, s
 	for t, rs := range perTarget {
 		byTarget[strconv.Itoa(int(t))] = Aggregate(rs)
 	}
-	return Aggregate(reports), byTarget, nil
+	return Aggregate(reports), byTarget, standbyLag, nil
 }
 
 // subscriptionReports reads one database's subscriptions on one target.
@@ -1095,25 +1103,14 @@ func sourceOf(sub string, gen int64, t int32, srcIDs []int32) int32 {
 
 // throttle pauses or resumes every subscription of the workflow by the
 // largest physical standby lag over the sources.
-func (c *Copier) throttle(ctx context.Context, wf *copyWorkflow, srcSet string, srcIDs []int32, dbs []dbPlan) error {
-	var lag int64
-	for _, s := range srcIDs {
-		conn, err := c.Shards.Dial(ctx, srcSet, s)
-		if err != nil {
-			return err
-		}
-		rows, err := conn.Query(ctx, `SELECT coalesce(max(pg_current_wal_lsn() - replay_lsn), 0)::bigint FROM pg_stat_replication
-			WHERE application_name NOT LIKE 'pgshard\_reshard\_%'`)
-		if err == nil {
-			var l int64
-			l, err = pgx.CollectExactlyOneRow(rows, pgx.RowTo[int64])
-			lag = max(lag, l)
-		}
-		_ = conn.Close(ctx)
-		if err != nil {
-			return err
-		}
-	}
+// sourceProbe is one source's write position and the worst lag of the
+// standbys it is not itself feeding.
+type sourceProbe struct {
+	LSN        int64
+	StandbyLag int64
+}
+
+func (c *Copier) throttle(ctx context.Context, wf *copyWorkflow, srcIDs []int32, dbs []dbPlan, lag int64) error {
 	hi, lo := c.watermarks()
 	paused := Throttle(wf.copy.Paused, lag, hi, lo)
 	if paused == wf.copy.Paused {
