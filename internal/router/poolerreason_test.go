@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -41,16 +42,16 @@ func TestAFenceSaysItIsAFence(t *testing.T) {
 
 	// The commit path is stricter: it is new behaviour, so only an explicit
 	// reason is rewritten. A bare 55000 there is left exactly as it was.
-	if got := namePrepareFailover(fence); !errors.As(got, &pe) || pe.Code != codeFailoverInTxn {
+	if got := nameFenceInTxn(fence); !errors.As(got, &pe) || pe.Code != codeFailoverInTxn {
 		t.Fatalf("a flip during PREPARE gave the client %v, want %s", got, codeFailoverInTxn)
 	}
-	if got := namePrepareFailover(bare); !errors.Is(got, bare) {
+	if got := nameFenceInTxn(bare); !errors.Is(got, bare) {
 		t.Errorf("a bare 55000 during PREPARE was rewritten to %v", got)
 	}
-	if got := namePrepareFailover(rewrite); !errors.Is(got, rewrite) {
+	if got := nameFenceInTxn(rewrite); !errors.Is(got, rewrite) {
 		t.Errorf("a rewrite-in-progress during PREPARE was rewritten to %v", got)
 	}
-	if namePrepareFailover(nil) != nil {
+	if nameFenceInTxn(nil) != nil {
 		t.Error("nil must stay nil")
 	}
 }
@@ -83,5 +84,57 @@ func TestAFlipJoiningASecondShardFailsTheTransaction(t *testing.T) {
 	var pe *pgwire.Error
 	if !errors.As(failoverInTxnError(), &pe) || pe.Code != "40001" {
 		t.Fatalf("the answer must be 40001, got %v", failoverInTxnError())
+	}
+}
+
+// TestAFlipAtCommitIsNamedWhereverItLands: several ways of ending a
+// transaction reach a participant outside withFailover -- the hidden-writer
+// probe, the prepared-capacity check, a single writer's plain COMMIT, and
+// two-phase commit. A flip landing on any of them used to reach the client
+// as the participant's own 55000, at COMMIT, which is the point where it
+// tells them least. nameFenceInTxn is applied to every exit of endTxn, so
+// this asserts what that guarantees rather than each path separately.
+func TestAFlipAtCommitIsNamedWhereverItLands(t *testing.T) {
+	fence := toPgwireError(&pgshardv1.Error{Sqlstate: codeStaleGeneration, Message: "stale routing generation",
+		Reason: pgshardv1.Reason_REASON_STALE_GENERATION})
+	var pe *pgwire.Error
+	if got := nameFenceInTxn(fence); !errors.As(got, &pe) || pe.Code != codeFailoverInTxn {
+		t.Fatalf("a declared fence at commit gave %v, want %s", got, codeFailoverInTxn)
+	}
+	// Nothing else is touched: nil stays nil, and an error that is not a
+	// declared fence is the participant's to report.
+	if nameFenceInTxn(nil) != nil {
+		t.Fatal("a transaction that ended cleanly must not acquire an error")
+	}
+	other := toPgwireError(&pgshardv1.Error{Sqlstate: "23505", Message: "duplicate key value violates unique constraint"})
+	if got := nameFenceInTxn(other); !errors.Is(got, other) {
+		t.Fatalf("a constraint violation at commit was rewritten to %v", got)
+	}
+}
+
+// TestACommitMeetingAFlipTellsTheClientToRetry drives endTxn rather than
+// calling the namer: a transaction writes, the map moves under it, and the
+// COMMIT is what meets the fence. That is the path a cutover under load
+// actually took, and the one a test of the namer alone cannot see.
+func TestACommitMeetingAFlipTellsTheClientToRetry(t *testing.T) {
+	h := newHarness(t)
+	conn := h.connect(t, h.dsn("app", "secret", "app"))
+	ctx := context.Background()
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "insert into t values (1)"); err != nil {
+		t.Fatal(err)
+	}
+	// The map moves while the transaction is open. The pooler holding its
+	// writes now refuses the stamp the router is still sending.
+	h.fp.gen = 999
+	err = tx.Commit(ctx)
+	if err == nil {
+		t.Fatal("a commit whose shard has moved must not report success")
+	}
+	if got := sqlstate(err); got != codeFailoverInTxn {
+		t.Fatalf("commit gave %s (%v), want %s: at COMMIT a bare 55000 is where it helps least", got, err, codeFailoverInTxn)
 	}
 }

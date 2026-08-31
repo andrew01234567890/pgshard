@@ -233,16 +233,16 @@ func (e *Executor) queryOne(ctx context.Context, p *txnPart, sql string) (string
 // runOn sends one simple query on p's stream and drains the answer into w,
 // updating p's transaction status. It touches no executor state, so several
 // parts can run concurrently.
-// namePrepareFailover turns a participant's stale-generation refusal during
-// PREPARE TRANSACTION into the router's own answer for a topology that moved
-// under a transaction.
+// nameFenceInTxn turns a participant's stale-generation refusal, taken
+// while ending a transaction, into the router's own answer for a topology
+// that moved under it.
 //
 // The statement path already does this: decideFailover answers a stale
 // generation inside a transaction with failoverInTxnError, which tells the
 // client to retry the transaction and why. The commit path does not go
 // through it -- runOn relays the participant's answer -- so a cutover's flip
-// landing between a transaction's writes and its PREPARE reached the client
-// as a bare 55000, naming neither the flip nor a way out.
+// landing anywhere between a transaction's writes and its commit reached
+// the client as a bare 55000, naming neither the flip nor a way out.
 //
 // It is named rather than retried, deliberately. A PREPARE that failed on
 // one participant has left the others prepared, and those are rolled back
@@ -255,7 +255,7 @@ func (e *Executor) queryOne(ctx context.Context, p *txnPart, sql string) (string
 // 55000 is object_not_in_prerequisite_state -- a participant answers it for
 // conditions that are not a fence, and rewriting one of those into "retry
 // the transaction" would send a client round a loop that cannot end.
-func namePrepareFailover(err error) error {
+func nameFenceInTxn(err error) error {
 	if poolerReason(err) != pgshardv1.Reason_REASON_STALE_GENERATION {
 		return err
 	}
@@ -343,7 +343,15 @@ func firstError(parts []*txnPart) error {
 // endTxn finishes a transaction that spans several shards. Only one
 // writer: it commits or rolls back plainly and the others roll back. Several
 // writers: two-phase commit through the decision log.
-func (e *Executor) endTxn(ctx context.Context, commit bool, w pgwire.ResultWriter) error {
+func (e *Executor) endTxn(ctx context.Context, commit bool, w pgwire.ResultWriter) (err error) {
+	// Every way this ends passes through here, and several of them reach a
+	// participant outside withFailover: the hidden-writer probe, the
+	// prepared-capacity check, the plain COMMIT of a single writer, and
+	// two-phase commit itself. A flip landing on any of them returned the
+	// participant's own refusal, so the client saw a bare 55000 at COMMIT
+	// -- the point where it least tells them what to do. One place, so a
+	// path added later is covered by having been written here.
+	defer func() { err = nameFenceInTxn(err) }()
 	if !e.multiShardTxn() {
 		return pgwire.Errorf(pgwire.CodeInternalError, "router: endTxn on a single-shard transaction")
 	}
@@ -516,7 +524,7 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 			_ = log.Delete(ctx, gid)
 		}
 		e.finishTxn("ROLLBACK")
-		return namePrepareFailover(err)
+		return nameFenceInTxn(err)
 	}
 	crashpoint.Hit("after_prepare")
 	decided, err := log.Commit(ctx, gid)

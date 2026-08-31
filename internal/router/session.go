@@ -791,7 +791,13 @@ func (e *Executor) withFailover(ctx context.Context, w pgwire.ResultWriter, run 
 	// while a rewrite is in progress -- a condition that clears on its own
 	// and is not a fence. Turning that one into "retry the transaction"
 	// would send a client round a loop with nothing at the end of it.
-	if poolerReason(err) == pgshardv1.Reason_REASON_STALE_GENERATION && !cw.wrote {
+	//
+	// Output already sent stops a retry, because output cannot be
+	// replayed -- but naming the error is not retrying it. Inside a
+	// transaction the whole thing is dead and retryable whatever reached
+	// the client, so it is still told so. Outside one, a client that has
+	// already consumed rows is left with the statement's own answer.
+	if poolerReason(err) == pgshardv1.Reason_REASON_STALE_GENERATION && (!cw.wrote || inTxn) {
 		err = failoverInTxnError()
 	}
 	return e.afterBatch(ctx, err)
