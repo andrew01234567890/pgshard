@@ -778,6 +778,16 @@ func (e *Executor) withFailover(ctx context.Context, w pgwire.ResultWriter, run 
 			err = run(cw)
 		}
 	}
+	// A fence refusal must never reach the client as the pooler wrote it.
+	// The wait can run out with the map still moving, and the one retry it
+	// allows can meet the same flip, and both of those returned 55000 --
+	// object_not_in_prerequisite_state, which names a state and no way out
+	// of it. It is the router's own answer: nothing was written, nothing
+	// committed, run it again. Only when no output has reached the client,
+	// because after that "run it again" is advice the client cannot take.
+	if isStaleGeneration(err) && !cw.wrote {
+		err = failoverInTxnError()
+	}
 	return e.afterBatch(ctx, err)
 }
 

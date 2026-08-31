@@ -60,8 +60,11 @@ the rest with `0A000`. See *Routing* below.
   by default; `--pooler [SET/]ID=host:port` pins one statically. Pooler
   connections use mTLS (`--pooler-tls-cert/-key/-ca`) unless `--insecure-dev`.
 - **Fencing.** Every pooler request is stamped with the snapshot's
-  `shard_map_generation` and the shard's `primary_epoch`. A stale stamp comes
-  back as `55000` to the client; the watcher's next reload clears it.
+  `shard_map_generation` and the shard's `primary_epoch`. A pooler refuses a
+  stale stamp with `55000` and says so is a fence; the router buffers and
+  retries where it safely can, and where it cannot the client is told
+  `40001` — retry, nothing was written — never the pooler's own `55000`,
+  which names a state and no way out of it.
 
 ## Session model
 
@@ -547,7 +550,9 @@ hides short failovers from clients where it can do so safely:
   serving again (LISTEN/NOTIFY wakes it; status-only edits are picked up by
   a 200ms poll) or `--buffer-window` (10s) elapses, then runs once more
   against the refreshed endpoint. A window that expires with the shard
-  still blocking is `08006`.
+  still blocking is `08006`; one that expires with the map still moving, or
+  a retry that meets the next flip, is `40001` — nothing ran, so the answer
+  is to run it again.
 - A pooler that refused the connection outright (gRPC `Unavailable`) while
   the snapshot still shows the shard serving is a transport fault, not a
   failover: the statement is retried once after a new snapshot or
