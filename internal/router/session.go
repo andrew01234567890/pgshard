@@ -735,7 +735,7 @@ func (e *Executor) forgetNamedStatements() {
 // connection is retried once after the snapshot moves, provided nothing has
 // reached the client and no transaction is open (see decideFailover).
 func (e *Executor) withFailover(ctx context.Context, w pgwire.ResultWriter, run func(pgwire.ResultWriter) error) error {
-	inTxn := e.tx != pgwire.TxIdle
+	inTxn := e.inClientTransaction()
 	if e.r.blocking(e.shard) {
 		switch decideFailover(true, inTxn, false, e.r.Buffered(e.shard), e.r.cfg.Buffering.PerShardCap) {
 		case failoverFailTxn:
@@ -779,6 +779,16 @@ func (e *Executor) withFailover(ctx context.Context, w pgwire.ResultWriter, run 
 		}
 	}
 	return e.afterBatch(ctx, err)
+}
+
+// inClientTransaction reports whether the client is inside a transaction,
+// which is not the same as this part being inside one. e.tx is the current
+// part's status, and a transaction joining a shard it has not touched yet
+// starts that part idle -- idle while the client is very much in a
+// transaction, with writes already on another shard. Retry decisions are
+// the client's contract, not one backend's, so they ask this.
+func (e *Executor) inClientTransaction() bool {
+	return e.tx != pgwire.TxIdle || e.multiShardTxn()
 }
 
 func (e *Executor) bufferFull() error { return bufferFullError(e.shard) }

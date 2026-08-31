@@ -54,3 +54,34 @@ func TestAFenceSaysItIsAFence(t *testing.T) {
 		t.Error("nil must stay nil")
 	}
 }
+
+// TestAFlipJoiningASecondShardFailsTheTransaction: a transaction whose
+// second statement is the first to touch its shard starts that part idle,
+// so the executor's own transaction status says "no transaction" while the
+// client is inside one with writes already on another shard. Judged by the
+// part, a fence there was waited on and retried, and when the wait ran out
+// the pooler's bare 55000 went to the client -- which is what a cutover
+// under load produced. Judged by the session, it is what it is: the
+// topology moved under an open transaction.
+func TestAFlipJoiningASecondShardFailsTheTransaction(t *testing.T) {
+	e := &Executor{tx: pgwire.TxIdle}
+	if e.multiShardTxn() {
+		t.Fatal("a fresh executor is not in a multi-shard transaction")
+	}
+	if e.inClientTransaction() {
+		t.Fatal("an idle session must stay retryable")
+	}
+	// The transaction wrote on one shard and has just moved to another it
+	// has not touched, which is exactly the state switchPart leaves behind.
+	e.parked = map[Shard]*txnPart{{Set: "default", ID: 0}: {shard: Shard{Set: "default", ID: 0}, wrote: true}}
+	if !e.inClientTransaction() {
+		t.Fatal("a part that is idle while another holds the transaction's writes must not be treated as retryable")
+	}
+	if got := decideFailover(true, true, false, 0, 10); got != failoverFailTxn {
+		t.Fatalf("decideFailover = %v, want failoverFailTxn: the client has to be told to retry the transaction", got)
+	}
+	var pe *pgwire.Error
+	if !errors.As(failoverInTxnError(), &pe) || pe.Code != "40001" {
+		t.Fatalf("the answer must be 40001, got %v", failoverInTxnError())
+	}
+}
