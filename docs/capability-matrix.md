@@ -87,7 +87,7 @@ tests are authoritative.
 | Pooler `Stream`/`Ack`/`CopyTables` | Implemented | `internal/pooler` |
 | VStream: merged positioned stream over all shards, VGtid resume, two-phase events, failover continuity | Implemented | `internal/router/vstream` |
 | Initial copy (exported snapshots, per-table checkpoints, kill-resume) | Implemented | `TestRouterVStreamInitialCopy` |
-| Reshard journal events (`Error{RESHARDED}` / `Journal`) | Partial | events defined and emitted on generation change; no reshard executor produces real journals yet |
+| Reshard journal events (`Error{RESHARDED}` / `Journal`) | Partial | the cutover writes journal rows (`pgshard.resharding_journal`, `cutoverpg.go`); the stream still synthesises its event from the shard-map generation change and its own participant list (`vstream/merge.go`) rather than reading those rows |
 
 ## Resharding and upgrades
 
