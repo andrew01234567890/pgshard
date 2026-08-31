@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -506,14 +507,14 @@ func TestNotificationsAreForwarded(t *testing.T) {
 
 func TestDetachForgetsTheSessionBeforeANewExecuteCanReattach(t *testing.T) {
 	s := NewServer(Config{Logger: slog.New(slog.DiscardHandler)})
-	se := s.session("x")
+	se := s.session("x", nil)
 	s.mu.Lock()
 	se.attached = true
 	se.detached = make(chan struct{})
 	s.mu.Unlock()
 	var se2 *session
 	s.detachUnlocked = func() {
-		se2 = s.session("x")
+		se2 = s.session("x", nil)
 		s.mu.Lock()
 		se2.attached = true
 		se2.detached = make(chan struct{})
@@ -839,7 +840,7 @@ func BenchmarkSessionLookupWithReservations(b *testing.B) {
 			}
 			b.ReportAllocs()
 			for b.Loop() {
-				h.srv.session("probe")
+				h.srv.session("probe", nil)
 			}
 		})
 	}
@@ -921,4 +922,62 @@ func TestExpiredReservationWithoutATransactionIsSilent(t *testing.T) {
 		t.Errorf("an idle reservation expiring must cost the client nothing: %v", e)
 	}
 	_ = next.CloseSend()
+}
+
+// TestReserveMarksTheSessionThatIsRegistered: Reserve used to look the
+// session up, release the lock, and mark it afterwards. An Execute stream
+// detaching in that window deletes the entry, and the next attach installs
+// a replacement under the same id -- so Reserve marked an object nothing
+// could reach any more and told the router it was pinned, while the session
+// the pooler would actually serve was unreserved. The pooler could then
+// hand that backend back at ReadyForQuery, taking the transaction, the
+// prepared statements and the search_path with it.
+func TestReserveMarksTheSessionThatIsRegistered(t *testing.T) {
+	h := startHarness(t, PoolConfig{})
+	ctx := context.Background()
+
+	var churn sync.WaitGroup
+	stop := make(chan struct{})
+	churn.Add(1)
+	go func() {
+		defer churn.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// A stream that attaches and goes: the detach forgets the entry
+			// and the next attach registers a new one under the same id.
+			stream, err := h.client.Execute(ctx)
+			if err != nil {
+				return
+			}
+			_ = stream.Send(queryReq("racer", "select 1", gen(7, 3), identity("alice")))
+			for {
+				resp, err := stream.Recv()
+				if err != nil || resp.GetReadyForQuery() != nil {
+					break
+				}
+			}
+			_ = stream.CloseSend()
+		}
+	}()
+	defer func() { close(stop); churn.Wait() }()
+
+	for range 200 {
+		if _, err := h.client.Reserve(ctx, &pgshardv1.ReserveRequest{SessionId: "racer", Generation: gen(7, 3)}); err != nil {
+			t.Fatalf("reserve: %v", err)
+		}
+		h.srv.mu.Lock()
+		se, ok := h.srv.sessions["racer"]
+		reserved := ok && se.reserved
+		h.srv.mu.Unlock()
+		if ok && !reserved {
+			t.Fatal("Reserve reported success, and the session the pooler would serve is not reserved")
+		}
+		if _, err := h.client.Release(ctx, &pgshardv1.ReleaseRequest{SessionId: "racer"}); err != nil {
+			t.Fatalf("release: %v", err)
+		}
+	}
 }
