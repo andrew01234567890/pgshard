@@ -1679,3 +1679,53 @@ func TestPreAuthCapIsWellBelowTheAuthenticatedOne(t *testing.T) {
 		t.Fatalf("pre-auth cap %d is small enough to refuse a legitimate exchange", preAuthMaxMessageBodyLen)
 	}
 }
+
+// TestCancelDuringCopyInWakesTheSession: after CopyInResponse the session is
+// parked in a socket read waiting for the client's next CopyData. Cancelling
+// the query cancels its context, which that read never sees -- and the
+// common client behaviour is to issue the cancel and then wait for the
+// result before sending anything more. So the two waited for each other and
+// the backend and session were held until one gave up.
+func TestCancelDuringCopyInWakesTheSession(t *testing.T) {
+	ts := startServer(t, Config{})
+	c := dialRaw(t, ts.addr)
+	res := c.startup(ProtocolVersion30)
+	c.send(&pgproto3.Query{String: "copy fake from stdin"})
+	if _, ok := c.recv().(*pgproto3.CopyInResponse); !ok {
+		t.Fatal("expected CopyInResponse")
+	}
+	// One row, so the stream is genuinely mid-COPY rather than idle at its
+	// first read.
+	c.send(&pgproto3.CopyData{Data: []byte("a\n")})
+
+	// The client now sends nothing more, as a client waiting for the
+	// cancellation result does.
+	if !ts.CancelLocal(CancelKey{PID: res.key.ProcessID, Secret: res.key.SecretKey}) {
+		t.Fatal("cancel was not accepted")
+	}
+	if err := c.conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := c.fe.Receive()
+	if err != nil {
+		t.Fatalf("the session stayed parked in the COPY read after a cancel: %v", err)
+	}
+	if er, ok := msg.(*pgproto3.ErrorResponse); !ok {
+		t.Fatalf("want an error ending the COPY, got %T", msg)
+	} else if er.Code != CodeQueryCanceled && er.Code != "57014" {
+		t.Fatalf("COPY ended with %q, want a cancellation", er.Code)
+	}
+	if _, ok := c.recv().(*pgproto3.ReadyForQuery); !ok {
+		t.Fatal("no ReadyForQuery after the cancelled COPY")
+	}
+
+	// The read deadline used to wake the COPY must not linger: the session
+	// has to keep working afterwards.
+	if err := c.conn.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	c.send(&pgproto3.Query{String: "select 1"})
+	if _, ok := c.recv().(*pgproto3.RowDescription); !ok {
+		t.Fatal("the session did not survive the cancelled COPY")
+	}
+}

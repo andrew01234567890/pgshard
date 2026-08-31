@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"io"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -106,8 +107,9 @@ func (w *resultWriter) CopyIn(overallFormat byte, columnFormats []uint16) (CopyI
 	if err := w.flush(); err != nil {
 		return nil, err
 	}
-	w.s.copyIn = &copyInStream{s: w.s}
-	return w.s.copyIn, nil
+	cs := &copyInStream{s: w.s}
+	w.s.setCopyIn(cs)
+	return cs, nil
 }
 
 func (w *resultWriter) CopyOut(overallFormat byte, columnFormats []uint16) error {
@@ -138,6 +140,16 @@ func (c *copyInStream) Next() ([]byte, error) {
 	for {
 		msg, err := c.s.be.Receive()
 		if err != nil {
+			// The cancel path wakes this read by putting the deadline in
+			// the past. Clear it, or every later read on this connection
+			// fails too, and report the cancellation rather than the
+			// timeout it arrived as.
+			if c.s.queryCancelled() {
+				_ = c.s.conn.SetReadDeadline(time.Time{})
+				c.done = true
+				c.s.setCopyIn(nil)
+				return nil, ErrCopyFail
+			}
 			c.done = true
 			return nil, err
 		}
@@ -146,11 +158,11 @@ func (c *copyInStream) Next() ([]byte, error) {
 			return append([]byte(nil), m.Data...), nil
 		case *pgproto3.CopyDone:
 			c.done = true
-			c.s.copyIn = nil
+			c.s.setCopyIn(nil)
 			return nil, io.EOF
 		case *pgproto3.CopyFail:
 			c.done = true
-			c.s.copyIn = nil
+			c.s.setCopyIn(nil)
 			return nil, ErrCopyFail
 		case *pgproto3.Terminate:
 			c.done = true

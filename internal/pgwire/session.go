@@ -77,6 +77,9 @@ type session struct {
 	serving     bool
 	closed      bool
 	queryCancel context.CancelFunc
+	// queryCtx is the context queryCancel cancels, kept so a COPY parked in
+	// a read can tell a cancellation from a plain timeout.
+	queryCtx context.Context
 	// inTxn mirrors the executor's transaction status for drain decisions;
 	// it is only written by the session goroutine.
 	inTxn bool
@@ -86,7 +89,9 @@ type session struct {
 	// queued is what has been handed to the backend buffer since the last
 	// flush, in bytes on the wire.
 	queued int
-	// copyIn is the active COPY FROM STDIN stream, if any.
+	// copyIn is the active COPY FROM STDIN stream, if any. It is written by
+	// the session goroutine and read by a cancel arriving on another, so it
+	// is guarded like the rest of that group.
 	copyIn *copyInStream
 }
 
@@ -339,14 +344,14 @@ func (s *session) beginMessage() bool {
 func (s *session) endMessage() {
 	s.mu.Lock()
 	s.active = false
-	s.queryCancel = nil
+	s.queryCancel, s.queryCtx = nil, nil
 	s.mu.Unlock()
 }
 
 func (s *session) queryContext(parent context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(parent)
 	s.mu.Lock()
-	s.queryCancel = cancel
+	s.queryCancel, s.queryCtx = cancel, ctx
 	revoked := s.revoked
 	s.mu.Unlock()
 	if revoked {
@@ -367,7 +372,32 @@ func (s *session) cancelQuery(secret []byte) bool {
 	if s.queryCancel != nil {
 		s.queryCancel()
 	}
+	// A COPY FROM STDIN is parked in a socket read waiting for the client's
+	// next CopyData, and cancelling the query context does not wake it. The
+	// client that issued the cancel is commonly waiting for the result
+	// before sending anything more, so the two wait for each other and the
+	// backend and session are held until one of them gives up. A read
+	// deadline in the past ends that read; Next sees the cancelled context,
+	// clears the deadline and fails the COPY.
+	if s.copyIn != nil {
+		_ = s.conn.SetReadDeadline(time.Now())
+	}
 	return true
+}
+
+// setCopyIn records the COPY stream in flight, or clears it.
+func (s *session) setCopyIn(c *copyInStream) {
+	s.mu.Lock()
+	s.copyIn = c
+	s.mu.Unlock()
+}
+
+// queryCancelled reports whether the statement in flight has been cancelled.
+func (s *session) queryCancelled() bool {
+	s.mu.Lock()
+	ctx := s.queryCtx
+	s.mu.Unlock()
+	return ctx != nil && ctx.Err() != nil
 }
 
 // refusalWriteTimeout bounds a refusal written before the startup deadline
@@ -871,7 +901,7 @@ func (s *session) simpleQuery(ctx context.Context, sql string, w *resultWriter) 
 	err = s.exec.SimpleQuery(qctx, sql, w)
 	cancel()
 	// Any CopyData still in flight after an aborted COPY is ignored by dispatch.
-	s.copyIn = nil
+	s.setCopyIn(nil)
 	if err != nil {
 		if w.ioErr != nil {
 			return w.ioErr
