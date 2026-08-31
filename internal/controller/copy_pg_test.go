@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -396,6 +397,35 @@ func TestReshardCopyOnPostgres(t *testing.T) {
 	// exist in each of them.
 	if strings.Contains(msg, "pgshard_reshard_") && !strings.Contains(msg, "app/pgshard_reshard_") {
 		t.Fatalf("a subscription is named without its database: %s", msg)
+	}
+	// Per target, not just the aggregate. "the copy is behind" does not
+	// say which target is behind, and that is the thing an operator acts
+	// on -- the admin reshard panel reads this map.
+	var targets map[string]CopyProgress
+	raw := queryOne[[]byte](t, f.catalog, `SELECT coalesce(status->'targets', '{}'::jsonb) FROM pgshard.workflows WHERE id = $1::uuid`, id)
+	if err := json.Unmarshal(raw, &targets); err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 2 {
+		t.Fatalf("status.targets covers %d of two targets: %v", len(targets), targets)
+	}
+	for _, want := range []string{"0", "1"} {
+		p, ok := targets[want]
+		if !ok {
+			t.Fatalf("target %s missing from status.targets: %v", want, targets)
+		}
+		if p.Subscriptions == 0 || p.TablesTotal == 0 {
+			t.Errorf("target %s progress is empty: %+v", want, p)
+		}
+	}
+	// The aggregate is the sum of the parts, not one of them.
+	agg := CopyProgress{}
+	raw = queryOne[[]byte](t, f.catalog, `SELECT coalesce(status->'progress', '{}'::jsonb) FROM pgshard.workflows WHERE id = $1::uuid`, id)
+	if err := json.Unmarshal(raw, &agg); err != nil {
+		t.Fatal(err)
+	}
+	if agg.TablesTotal != targets["0"].TablesTotal+targets["1"].TablesTotal {
+		t.Errorf("aggregate %d tables, targets %d + %d", agg.TablesTotal, targets["0"].TablesTotal, targets["1"].TablesTotal)
 	}
 
 	// A restarted controller re-drives the workflow from the catalogs alone.

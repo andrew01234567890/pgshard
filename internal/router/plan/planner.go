@@ -392,14 +392,6 @@ func refuseProtectedGUC(name string) error {
 	return nil
 }
 
-// refuseReadWriteOverride refuses the transaction-level spelling of what
-// protectedDurabilityGUCs already refuses as a setting: BEGIN READ WRITE,
-// START TRANSACTION READ WRITE and SET SESSION CHARACTERISTICS AS
-// TRANSACTION READ WRITE all turn transaction_read_only off, which is how
-// the barrier pauses writes for a certified restore point. A client may
-// still make itself more restrictive -- READ ONLY is untouched -- and a
-// plain BEGIN gives a writable transaction whenever the cluster is not
-// pausing.
 // readWriteRewrite neutralises a transaction that declares itself READ
 // WRITE. The barrier pauses writes with default_transaction_read_only, which
 // catches what the planner does not class as a write -- a volatile function,

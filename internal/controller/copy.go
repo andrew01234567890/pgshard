@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -59,6 +60,12 @@ type Copier struct {
 	ThrottleHigh, ThrottleLow int64
 	// PreparedWait bounds the wait for in-doubt prepared transactions.
 	PreparedWait time.Duration
+	// OwnerLease is how long this replica's claim on a workflow stands
+	// without being refreshed; zero means DefaultOwnerLease. Replica
+	// identifies this process in a claim; zero means a token generated
+	// once per process.
+	OwnerLease time.Duration
+	Replica    string
 
 	// progress is the last copy state logged per workflow, so a pass that
 	// found no change stays quiet.
@@ -93,7 +100,12 @@ type copyState struct {
 	BlockedSince        *time.Time                 `json:"blocked_since,omitempty"`
 	ReplicaIdentityFull []string                   `json:"replica_identity_full,omitempty"`
 	Progress            CopyProgress               `json:"progress"`
-	Skipped             []string                   `json:"skipped,omitempty"`
+	// Targets is the same progress per target shard, keyed by its id. The
+	// aggregate says the copy is behind; this says which target is, which
+	// is what an operator does something about -- and it is what the admin
+	// reshard panel reads.
+	Targets map[string]CopyProgress `json:"targets,omitempty"`
+	Skipped []string                `json:"skipped,omitempty"`
 }
 
 type copyWorkflow struct {
@@ -108,6 +120,11 @@ type copyWorkflow struct {
 	copy    copyState
 	spec    cutoverSpec
 	cutover cutoverState
+	// owner is this pass's claim on the workflow and fence the state it
+	// started from; every write it makes requires both to still hold, so a
+	// workflow taken over stops the old pass instead of racing the new one.
+	owner string
+	fence string
 }
 
 // sourceSet is the shard set the workflow copies from: recorded in the
@@ -190,8 +207,15 @@ func (c *Copier) Pass(ctx context.Context) (CopyOutcome, error) {
 	}
 	for i := range wfs {
 		wf := &wfs[i]
-		out.Driven++
 		var err error
+		var held bool
+		if wf.owner, held, err = claimWorkflow(ctx, c.Pool, c.Replica, wf.id, c.OwnerLease); err != nil {
+			return out, err
+		} else if !held {
+			continue
+		}
+		wf.fence = wf.state
+		out.Driven++
 		if wf.stage == StageCancelling {
 			err = c.cancel(ctx, wf)
 			if err == nil {
@@ -212,11 +236,18 @@ func (c *Copier) Pass(ctx context.Context) (CopyOutcome, error) {
 			}
 		}
 		if err != nil {
+			if errors.Is(err, errNotOwner) {
+				c.logger().Info("reshard copy pass handed over", "workflow", wf.id)
+				continue
+			}
 			var fatal *fatalError
 			if errors.As(err, &fatal) {
 				out.Failed++
 				c.logger().Error("reshard copy failed", "workflow", wf.id, "err", err)
 				if ferr := c.fail(ctx, wf, err); ferr != nil {
+					if errors.Is(ferr, errNotOwner) {
+						continue
+					}
 					return out, ferr
 				}
 				continue
@@ -228,7 +259,7 @@ func (c *Copier) Pass(ctx context.Context) (CopyOutcome, error) {
 			} else {
 				c.logger().Warn("reshard copy pass incomplete", "workflow", wf.id, "err", err)
 			}
-			if serr := c.save(ctx, wf, "", err.Error()); serr != nil {
+			if serr := c.save(ctx, wf, "", err.Error()); serr != nil && !errors.Is(serr, errNotOwner) {
 				return out, serr
 			}
 		}
@@ -297,18 +328,32 @@ func (c *Copier) listCopyWorkflows(ctx context.Context) ([]copyWorkflow, error) 
 }
 
 func (c *Copier) save(ctx context.Context, wf *copyWorkflow, stage, message string) error {
+	// progress and targets are lifted to the top of status because that is
+	// where the admin panel and the operator read them; copy keeps the
+	// whole phase record.
 	patch := map[string]any{"copy": wf.copy, "message": message, "progress": wf.copy.Progress}
+	if len(wf.copy.Targets) > 0 {
+		patch["targets"] = wf.copy.Targets
+	}
 	if stage != "" {
 		patch["stage"] = stage
 	}
-	_, err := c.Pool.Exec(ctx, `UPDATE pgshard.workflows SET status = status || $2::jsonb, updated_at = now() WHERE id = $1::uuid`, wf.id, mustJSON(patch))
-	return err
+	return ownedExec(ctx, c.Pool, wf.owner,
+		`UPDATE pgshard.workflows SET status = status || $2::jsonb, updated_at = now()
+		 WHERE id = $1::uuid AND ($3::text IS NULL OR (owner = $3 AND state = $4))`,
+		wf.id, mustJSON(patch), nullIfEmpty(wf.owner), wf.fence)
 }
 
 func (c *Copier) fail(ctx context.Context, wf *copyWorkflow, cause error) error {
-	_, err := c.Pool.Exec(ctx, `UPDATE pgshard.workflows SET state = $2, error = $3, status = status || $4::jsonb, updated_at = now() WHERE id = $1::uuid`,
-		wf.id, StateFailed, cause.Error(), mustJSON(map[string]any{"stage": "failed", "copy": wf.copy, "message": cause.Error()}))
-	return err
+	if err := ownedExec(ctx, c.Pool, wf.owner,
+		`UPDATE pgshard.workflows SET state = $2, error = $3, status = status || $4::jsonb, updated_at = now()
+		 WHERE id = $1::uuid AND ($5::text IS NULL OR (owner = $5 AND state = $6))`,
+		wf.id, StateFailed, cause.Error(), mustJSON(map[string]any{"stage": "failed", "copy": wf.copy, "message": cause.Error()}),
+		nullIfEmpty(wf.owner), wf.fence); err != nil {
+		return err
+	}
+	wf.fence = StateFailed
+	return nil
 }
 
 // sources are the shards of the serving set the copy reads from.
@@ -445,6 +490,9 @@ func (c *Copier) databases(ctx context.Context) ([]dbPlan, error) {
 // drive advances one workflow through the copy phase; it reports whether
 // the stage changed.
 func (c *Copier) drive(ctx context.Context, wf *copyWorkflow) (bool, error) {
+	if err := holdClaim(ctx, c.Pool, wf.id, wf.owner); err != nil {
+		return false, err
+	}
 	srcSet, srcIDs, err := c.pinSource(ctx, wf)
 	if err != nil {
 		return false, err
@@ -482,14 +530,14 @@ func (c *Copier) drive(ctx context.Context, wf *copyWorkflow) (bool, error) {
 	if err := c.ensureSubscriptions(ctx, wf, srcSet, srcIDs, dbs); err != nil {
 		return advanced, err
 	}
-	progress, err := c.observe(ctx, wf, srcSet, srcIDs, dbs)
+	progress, byTarget, err := c.observe(ctx, wf, srcSet, srcIDs, dbs)
 	if err != nil {
 		return advanced, err
 	}
 	if err := c.throttle(ctx, wf, srcSet, srcIDs, dbs); err != nil {
 		return advanced, err
 	}
-	wf.copy.Progress = progress
+	wf.copy.Progress, wf.copy.Targets = progress, byTarget
 	stage := ""
 	msg := "copying: " + progress.Describe()
 	if wf.copy.Paused {
@@ -928,12 +976,15 @@ func (c *Copier) blockedBy(wf *copyWorkflow, srcSet string, s int32, gids []stri
 
 // observe reads pg_subscription_rel and pg_stat_subscription on every
 // target and the WAL position of every source.
-func (c *Copier) observe(ctx context.Context, wf *copyWorkflow, srcSet string, srcIDs []int32, dbs []dbPlan) (CopyProgress, error) {
+// observe reads the copy's progress: the aggregate, and the same per target
+// shard. Flattening to one maximum told an operator the copy was behind
+// without saying which target was behind, which is the thing they act on.
+func (c *Copier) observe(ctx context.Context, wf *copyWorkflow, srcSet string, srcIDs []int32, dbs []dbPlan) (CopyProgress, map[string]CopyProgress, error) {
 	sourceLSN := map[int32]int64{}
 	for _, s := range srcIDs {
 		conn, err := c.Shards.Dial(ctx, srcSet, s)
 		if err != nil {
-			return CopyProgress{}, err
+			return CopyProgress{}, nil, err
 		}
 		rows, err := conn.Query(ctx, `SELECT (pg_current_wal_lsn() - '0/0'::pg_lsn)::bigint`)
 		if err == nil {
@@ -943,25 +994,31 @@ func (c *Copier) observe(ctx context.Context, wf *copyWorkflow, srcSet string, s
 		}
 		_ = conn.Close(ctx)
 		if err != nil {
-			return CopyProgress{}, err
+			return CopyProgress{}, nil, err
 		}
 	}
 	var reports []SubscriptionProgress
+	perTarget := map[int32][]SubscriptionProgress{}
 	for _, db := range dbs {
 		for _, t := range wf.ids {
 			conn, err := c.Shards.DialDatabase(ctx, wf.set, t, db.name)
 			if err != nil {
-				return CopyProgress{}, err
+				return CopyProgress{}, nil, err
 			}
 			rs, err := subscriptionReports(ctx, conn, db.name, wf.gen, t, srcIDs, sourceLSN)
 			_ = conn.Close(ctx)
 			if err != nil {
-				return CopyProgress{}, fmt.Errorf("progress of %s on %s/%d: %w", db.name, wf.set, t, err)
+				return CopyProgress{}, nil, fmt.Errorf("progress of %s on %s/%d: %w", db.name, wf.set, t, err)
 			}
 			reports = append(reports, rs...)
+			perTarget[t] = append(perTarget[t], rs...)
 		}
 	}
-	return Aggregate(reports), nil
+	byTarget := make(map[string]CopyProgress, len(perTarget))
+	for t, rs := range perTarget {
+		byTarget[strconv.Itoa(int(t))] = Aggregate(rs)
+	}
+	return Aggregate(reports), byTarget, nil
 }
 
 // subscriptionReports reads one database's subscriptions on one target.
@@ -1161,9 +1218,14 @@ func (c *Copier) cancel(ctx context.Context, wf *copyWorkflow) error {
 		}
 		message = "cutover cancelled: fence lifted, reverse replication and forward objects dropped"
 	}
-	_, err = c.Pool.Exec(ctx, `UPDATE pgshard.workflows SET state = $2, status = status || $3::jsonb, updated_at = now() WHERE id = $1::uuid`,
-		wf.id, StateCancelled, mustJSON(map[string]any{"stage": StageCancelled, "message": message}))
-	return err
+	if err := ownedExec(ctx, c.Pool, wf.owner,
+		`UPDATE pgshard.workflows SET state = $2, status = status || $3::jsonb, updated_at = now()
+		 WHERE id = $1::uuid AND ($4::text IS NULL OR (owner = $4 AND state = $5))`,
+		wf.id, StateCancelled, mustJSON(map[string]any{"stage": StageCancelled, "message": message}), nullIfEmpty(wf.owner), wf.fence); err != nil {
+		return err
+	}
+	wf.fence = StateCancelled
+	return nil
 }
 
 // fencedStage reports whether a workflow's stage means a cutover has started,

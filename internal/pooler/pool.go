@@ -61,18 +61,86 @@ type Pool struct {
 	stop chan struct{}
 	wg   sync.WaitGroup
 
-	mu      sync.Mutex
-	roles   map[poolKey]*rolePool
-	sems    map[string]chan struct{}
-	closed  bool
-	changed chan struct{}
-	// waiters counts acquirers parked on changed. A release with nobody to
-	// wake skips the broadcast, and the channel allocation it needs. Every
-	// waiter registers under mu before it looks at the resource it wants,
-	// so a release that sees none cannot be racing one that is about to
-	// park: it would have to take mu to do so, and would then find the
-	// resource already there.
-	waiters int
+	mu     sync.Mutex
+	roles  map[poolKey]*rolePool
+	sems   map[string]chan struct{}
+	closed bool
+	// budget queues acquirers waiting for room in the shard-wide budget.
+	// They are woken when an idle backend appears anywhere, because that
+	// is a backend they can evict; a slot freed outright needs no wake,
+	// since their select takes it directly.
+	//
+	// A released backend used to close a channel every waiter watched, so
+	// one reusable backend woke every parked acquirer and all but one went
+	// straight back to sleep. Each waiter now has its own one-shot
+	// channel and a release wakes the ones that can actually use it: a
+	// waiter for that role, which can reuse the backend, and one budget
+	// waiter, which can evict it. Waking only the role would strand a
+	// budget waiter behind a role that keeps recycling its own backends.
+	//
+	// Every waiter queues under mu before it looks at the resource it
+	// wants, so a release that finds an empty queue cannot be racing one
+	// that is about to park: it would have to take mu to do so, and would
+	// then find the resource already there.
+	budget waitQueue
+}
+
+// waiter is one parked acquirer. Its channel is buffered and reused across
+// the turns of an acquire's loop, so re-parking allocates nothing.
+type waiter struct{ ch chan struct{} }
+
+func newWaiter() *waiter { return &waiter{ch: make(chan struct{}, 1)} }
+
+// waitQueue is a FIFO of parked acquirers. All of its methods run under
+// Pool.mu.
+type waitQueue []*waiter
+
+func (q *waitQueue) park(w *waiter) {
+	// A wake-up that arrived after this waiter last stopped watching is
+	// stale; dropping it saves one turn of the caller's loop.
+	select {
+	case <-w.ch:
+	default:
+	}
+	*q = append(*q, w)
+}
+
+// leave removes w and reports whether it was still queued. A waiter that
+// was already woken is gone from the queue, and has spent a wake-up that
+// it must pass on if it did not use the resource behind it.
+func (q *waitQueue) leave(w *waiter) bool {
+	for i, other := range *q {
+		if other == w {
+			*q = append((*q)[:i], (*q)[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+func (q *waitQueue) wakeOne() {
+	if len(*q) == 0 {
+		return
+	}
+	w := (*q)[0]
+	*q = (*q)[1:]
+	wake(w)
+}
+
+func (q *waitQueue) wakeAll() {
+	for _, w := range *q {
+		wake(w)
+	}
+	*q = nil
+}
+
+// wake never blocks: the buffer holds the one wake-up a parked waiter can
+// use, and a waiter is queued only while it is watching.
+func wake(w *waiter) {
+	select {
+	case w.ch <- struct{}{}:
+	default:
+	}
 }
 
 // poolKey identifies one backend pool: backends are only interchangeable
@@ -87,6 +155,9 @@ type poolKey struct {
 type rolePool struct {
 	sem  chan struct{}
 	idle []*Backend
+	// waiters queues acquirers of this role, woken when one of its
+	// backends is released to the idle list.
+	waiters waitQueue
 }
 
 // NewPool builds a pool that dials through d.
@@ -98,7 +169,7 @@ func NewPool(cfg PoolConfig, d Dialer) *Pool {
 
 func newPool(cfg PoolConfig, dial dialFunc) *Pool {
 	cfg = cfg.withDefaults()
-	p := &Pool{cfg: cfg, dial: dial, total: make(chan struct{}, cfg.MaxBackends), roles: map[poolKey]*rolePool{}, sems: map[string]chan struct{}{}, changed: make(chan struct{}), stop: make(chan struct{})}
+	p := &Pool{cfg: cfg, dial: dial, total: make(chan struct{}, cfg.MaxBackends), roles: map[poolKey]*rolePool{}, sems: map[string]chan struct{}{}, stop: make(chan struct{})}
 	if cfg.MaxIdleTime > 0 {
 		p.wg.Add(1)
 		go p.reap()
@@ -155,7 +226,9 @@ func (p *Pool) reapOnce() {
 	}
 	if len(dead) > 0 {
 		p.mu.Lock()
-		p.notify()
+		for _, h := range dead {
+			p.wakeFor(h.rp)
+		}
 		p.mu.Unlock()
 	}
 }
@@ -250,25 +323,38 @@ func (p *Pool) Acquire(ctx context.Context, database, role string, clientKey, se
 // acquireTotal takes a shard-wide slot, evicting idle backends of any role
 // while the budget is full and waking whenever a backend is released.
 func (p *Pool) acquireTotal(ctx context.Context) error {
+	var w *waiter
 	for {
 		select {
 		case p.total <- struct{}{}:
 			return nil
 		default:
 		}
+		if w == nil {
+			w = newWaiter()
+		}
+		// Queue before looking for something to evict, so a backend
+		// released between the look and the wait wakes this waiter rather
+		// than passing it by.
+		p.mu.Lock()
+		p.budget.park(w)
+		p.mu.Unlock()
 		if p.evictIdle() {
+			p.leave(&p.budget, w)
 			continue
 		}
-		p.mu.Lock()
-		changed := p.changed
-		p.waiters++
-		p.mu.Unlock()
 		err := func() error {
-			defer p.unwait()
+			defer func() { p.leave(&p.budget, w) }()
 			select {
 			case p.total <- struct{}{}:
 				return errGotSlot
-			case <-changed:
+			case <-w.ch:
+				p.mu.Lock()
+				closed := p.closed
+				p.mu.Unlock()
+				if closed {
+					return ErrPoolClosed
+				}
 				return nil
 			case <-ctx.Done():
 				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -286,23 +372,36 @@ func (p *Pool) acquireTotal(ctx context.Context) error {
 	}
 }
 
-// unwait deregisters a parked acquirer.
-func (p *Pool) unwait() {
+// leave deregisters a parked acquirer, handing on a wake-up it did not
+// use. Whether it used one is not something the caller can tell: a select
+// with both the wake-up and its own resource ready picks either, so a
+// waiter can win a freed slot while a wake-up pointing at a reusable
+// backend is already in its channel. The channel is the record -- a
+// wake-up still sitting in it was never taken -- and passing it on is what
+// keeps that backend from sitting idle while acquirers that could take it
+// wait out their timeout.
+func (p *Pool) leave(q *waitQueue, w *waiter) {
 	p.mu.Lock()
-	p.waiters--
-	p.mu.Unlock()
+	defer p.mu.Unlock()
+	if q.leave(w) {
+		return
+	}
+	select {
+	case <-w.ch:
+		q.wakeOne()
+	default:
+	}
 }
 
 // errGotSlot marks the budget slot having been taken inside the wait.
 var errGotSlot = errors.New("slot acquired")
 
-// notify wakes acquirers waiting for the budget; call with mu held.
-func (p *Pool) notify() {
-	if p.waiters == 0 {
-		return
-	}
-	close(p.changed)
-	p.changed = make(chan struct{})
+// wakeFor wakes the acquirers a change to rp can serve: one waiting for
+// that role, which can reuse a backend released to it, and one waiting for
+// the budget, which can evict it. Call with mu held.
+func (p *Pool) wakeFor(rp *rolePool) {
+	rp.waiters.wakeOne()
+	p.budget.wakeOne()
 }
 
 // popIdle returns a live idle backend of rp whose credential digest matches
@@ -368,31 +467,36 @@ func (p *Pool) evictIdle() bool {
 // Watching the semaphore alone was not enough: a released backend keeps its
 // slot and joins the idle list, so nothing frees the semaphore and a waiter
 // sat there until its acquire timeout while a backend it could have used
-// was idle. It watches p.changed too and rechecks the idle list, the same
+// was idle. It queues on the role too and rechecks the idle list, the same
 // way acquireTotal waits for the pool-wide budget.
 func (p *Pool) awaitSlot(ctx context.Context, rp *rolePool, digest [32]byte) (*Backend, error) {
+	var w *waiter
 	for {
-		// Snapshot the wake channel before looking, so a release between
-		// the look and the wait closes the channel this select watches.
+		// Queue before looking, so a release between the look and the wait
+		// wakes this waiter rather than passing it by.
+		if w == nil {
+			w = newWaiter()
+		}
 		p.mu.Lock()
-		changed := p.changed
+		rp.waiters.park(w)
 		closed := p.closed
-		p.waiters++
 		p.mu.Unlock()
 		if closed {
-			p.unwait()
+			p.leave(&rp.waiters, w)
 			return nil, ErrPoolClosed
 		}
 		if b := p.popIdle(rp, digest); b != nil {
-			p.unwait()
+			p.leave(&rp.waiters, w)
 			return b, nil
 		}
 		got, err := func() (bool, error) {
-			defer p.unwait()
+			defer func() { p.leave(&rp.waiters, w) }()
 			select {
 			case rp.sem <- struct{}{}:
 				return true, nil
-			case <-changed:
+			case <-w.ch:
+				// The backend this wake-up points at is taken on the next
+				// turn of the loop, which pops the idle list.
 				return false, nil
 			case <-ctx.Done():
 				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -437,7 +541,7 @@ func (p *Pool) Release(b *Backend) {
 	keep := !p.closed && !b.broken && !b.hasUnflushed() && b.idle() && !p.expired(b)
 	if keep {
 		rp.idle = append(rp.idle, b)
-		p.notify()
+		p.wakeFor(rp)
 	}
 	p.mu.Unlock()
 	if !keep {
@@ -460,9 +564,12 @@ func (p *Pool) Close() {
 		close(p.stop)
 	}
 	p.closed = true
-	// Waiters watch this channel; without the wake a shutdown leaves them
-	// blocked until their acquire timeout for a pool that is already gone.
-	p.notify()
+	// Without this a shutdown leaves every waiter blocked until its
+	// acquire timeout, for a pool that is already gone.
+	p.budget.wakeAll()
+	for _, rp := range p.roles {
+		rp.waiters.wakeAll()
+	}
 	type held struct {
 		b  *Backend
 		rp *rolePool

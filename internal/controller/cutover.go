@@ -387,8 +387,13 @@ func (c *Copier) switchWrites(ctx context.Context, wf *copyWorkflow, ops cutover
 				return false, err
 			}
 			if !errors.Is(err, errRetry) {
-				// A fence must never outlive the switch that raised it.
+				// A fence must never outlive the switch that raised it --
+				// unless the switch is no longer ours, in which case the
+				// replica that owns it now is behind that fence.
 				if isFatal(err) {
+					if oerr := holdClaim(ctx, c.Pool, wf.id, wf.owner); oerr != nil {
+						return false, oerr
+					}
 					if rerr := ops.Release(ctx); rerr != nil {
 						return false, rerr
 					}
@@ -684,6 +689,9 @@ func (c *Copier) abandonSwitch(ctx context.Context, wf *copyWorkflow, ops cutove
 // abortSwitch undoes the fence before the journal and returns to the gate,
 // failing the workflow once the attempts are used up.
 func (c *Copier) abortSwitch(ctx context.Context, wf *copyWorkflow, ops cutoverOps, reason string) (bool, error) {
+	if err := holdClaim(ctx, c.Pool, wf.id, wf.owner); err != nil {
+		return false, err
+	}
 	if err := ops.Release(ctx); err != nil {
 		return false, err
 	}
@@ -754,14 +762,21 @@ type poolCutoverStore struct{ c *Copier }
 
 func (s poolCutoverStore) Save(ctx context.Context, wf *copyWorkflow, message string) error {
 	patch := map[string]any{"stage": wf.stage, "cutover": wf.cutover, "message": message}
-	_, err := s.c.Pool.Exec(ctx, `UPDATE pgshard.workflows SET status = status || $2::jsonb, updated_at = now() WHERE id = $1::uuid`, wf.id, mustJSON(patch))
-	return err
+	return ownedExec(ctx, s.c.Pool, wf.owner,
+		`UPDATE pgshard.workflows SET status = status || $2::jsonb, updated_at = now()
+		 WHERE id = $1::uuid AND ($3::text IS NULL OR (owner = $3 AND state = $4))`,
+		wf.id, mustJSON(patch), nullIfEmpty(wf.owner), wf.fence)
 }
 
 func (s poolCutoverStore) Finish(ctx context.Context, wf *copyWorkflow, state, message string) error {
-	_, err := s.c.Pool.Exec(ctx, `UPDATE pgshard.workflows SET state = $2, status = status || $3::jsonb, updated_at = now() WHERE id = $1::uuid`,
-		wf.id, state, mustJSON(map[string]any{"stage": wf.stage, "cutover": wf.cutover, "message": message}))
-	return err
+	if err := ownedExec(ctx, s.c.Pool, wf.owner,
+		`UPDATE pgshard.workflows SET state = $2, status = status || $3::jsonb, updated_at = now()
+		 WHERE id = $1::uuid AND ($4::text IS NULL OR (owner = $4 AND state = $5))`,
+		wf.id, state, mustJSON(map[string]any{"stage": wf.stage, "cutover": wf.cutover, "message": message}), nullIfEmpty(wf.owner), wf.fence); err != nil {
+		return err
+	}
+	wf.fence = state
+	return nil
 }
 
 func (s poolCutoverStore) NewJournalID(ctx context.Context) (string, error) {

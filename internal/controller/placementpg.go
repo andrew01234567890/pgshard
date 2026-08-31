@@ -66,6 +66,19 @@ func (p *Placer) describe(ctx context.Context, wf *placementWorkflow) error {
 				wf.spec.table(), wf.st.SourceSet, src, strings.Join(unsupported, ", "))
 		}
 	}
+	// An index or an exclusion constraint can use an opclass or an operator
+	// that belongs to an extension -- btree_gist under a temporal key is the
+	// case that found this. The shadow build then fails on any target
+	// without it ("no default operator class for access method gist"), and
+	// the workflow retries against a condition that will not change on its
+	// own. Say so now, naming what to install and where.
+	//
+	// Named rather than created: CREATE EXTENSION needs rights the workflow
+	// does not otherwise use, and installing one into a user's database is
+	// a decision, not a step.
+	if err := p.checkExtensions(ctx, conn, wf); err != nil {
+		return err
+	}
 	comment, err := tableComment(ctx, conn, wf.spec.SchemaName, wf.spec.TableName)
 	if err != nil {
 		return err
@@ -232,6 +245,82 @@ func uniqueConstraintsMissingKey(ctx context.Context, conn ShardConn, schema, na
 // subscribers would silently stop receiving), and a non-default replica
 // identity (the shadow is created with DEFAULT, so downstream logical
 // replication of UPDATE/DELETE would break after the move).
+// tableExtensions are the extensions the table's indexes and constraints
+// depend on: the owners of the operator classes its indexes use and of the
+// operators its exclusion constraints name.
+func tableExtensions(ctx context.Context, conn ShardConn, schema, name string) ([]string, error) {
+	rows, err := conn.Query(ctx, `SELECT DISTINCT e.extname
+		FROM pg_depend d JOIN pg_extension e ON e.oid = d.refobjid
+		WHERE d.refclassid = 'pg_extension'::regclass
+		  AND ((d.classid = 'pg_opclass'::regclass AND d.objid IN (
+		        SELECT unnest(i.indclass)::oid FROM pg_index i WHERE i.indrelid = to_regclass($1)))
+		    OR (d.classid = 'pg_operator'::regclass AND d.objid IN (
+		        SELECT unnest(c.conexclop)::oid FROM pg_constraint c
+		        WHERE c.conrelid = to_regclass($1) AND c.contype = 'x')))
+		ORDER BY 1`, QuoteIdent(schema)+"."+QuoteIdent(name))
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
+// installedExtensions are the extension names present in one database.
+func installedExtensions(ctx context.Context, conn ShardConn) (map[string]bool, error) {
+	rows, err := conn.Query(ctx, `SELECT extname FROM pg_extension`)
+	if err != nil {
+		return nil, err
+	}
+	names, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(names))
+	for _, n := range names {
+		out[n] = true
+	}
+	return out, nil
+}
+
+// checkExtensions refuses a move whose target shards lack an extension the
+// table's indexes or constraints need.
+func (p *Placer) checkExtensions(ctx context.Context, source ShardConn, wf *placementWorkflow) error {
+	needed, err := tableExtensions(ctx, source, wf.spec.SchemaName, wf.spec.TableName)
+	if err != nil {
+		return err
+	}
+	if len(needed) == 0 {
+		return nil
+	}
+	missing := map[string][]string{}
+	for _, t := range wf.rt.Holders() {
+		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
+		if err != nil {
+			return err
+		}
+		have, err := installedExtensions(ctx, conn)
+		_ = conn.Close(ctx)
+		if err != nil {
+			return err
+		}
+		for _, ext := range needed {
+			if !have[ext] {
+				missing[ext] = append(missing[ext], fmt.Sprintf("%s/%d", wf.st.SourceSet, t))
+			}
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	var parts []string
+	for _, ext := range needed {
+		if shards := missing[ext]; len(shards) > 0 {
+			parts = append(parts, fmt.Sprintf("%s on %s", ext, strings.Join(shards, ", ")))
+		}
+	}
+	return fatal("table %s needs extensions its target shards do not have (%s); CREATE EXTENSION there, then retry the move",
+		wf.spec.table(), strings.Join(parts, "; "))
+}
+
 func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name string) ([]string, error) {
 	rows, err := conn.Query(ctx, `WITH t AS (
 			SELECT c.oid, c.relowner, c.relacl, c.relrowsecurity, c.relforcerowsecurity, c.relreplident
@@ -360,6 +449,9 @@ func dropArtifactTable(ctx context.Context, conn ShardConn, schema, name, marker
 func (p *Placer) ensureShadows(ctx context.Context, wf *placementWorkflow) error {
 	var ddl []string
 	for _, t := range wf.rt.Holders() {
+		if err := holdClaim(ctx, p.Pool, wf.id, wf.owner); err != nil {
+			return err
+		}
 		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
 		if err != nil {
 			return err
@@ -692,6 +784,9 @@ func (p *Placer) copySource(ctx context.Context, wf *placementWorkflow, s int32)
 			sql += fmt.Sprintf(" WHERE (%s) > (%s)", strings.Join(pkCols, ", "), strings.Join(keysetBounds(last, pkIdx, wf.st.Columns, typeOf), ", "))
 		}
 		sql += fmt.Sprintf(" ORDER BY %s LIMIT %d", strings.Join(pkCols, ", "), p.copyBatch())
+		if err := holdClaim(ctx, p.Pool, wf.id, wf.owner); err != nil {
+			return err
+		}
 		rows, err := conn.Query(ctx, sql)
 		if err != nil {
 			return err
@@ -985,6 +1080,9 @@ func (p *Placer) fence(ctx context.Context, wf *placementWorkflow) error {
 // placement is published.
 func (p *Placer) fenceShards(ctx context.Context, wf *placementWorkflow) error {
 	return p.eachShard(ctx, wf, func(ctx context.Context, conn ShardConn) error {
+		if err := holdClaim(ctx, p.Pool, wf.id, wf.owner); err != nil {
+			return err
+		}
 		return fenceTables(ctx, conn, wf.spec.SchemaName, wf.shape.qualified(wf.spec.TableName), wf.shape.qualified(wf.shadow()))
 	})
 }
@@ -1362,6 +1460,9 @@ func (p *Placer) publish(ctx context.Context, wf *placementWorkflow) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := holdClaimTx(ctx, tx, wf.id, wf.owner); err != nil {
+		return err
+	}
 	// The inspection belongs to the placement it was made under, so a table
 	// arriving at (or leaving) reference placement is unchecked again until
 	// the next pass has asked the shards.

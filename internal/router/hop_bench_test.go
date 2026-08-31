@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -43,11 +44,18 @@ func BenchmarkUnshardedSelectThroughRouter(b *testing.B) {
 // it, and only a wide one shows what each column costs to carry.
 func BenchmarkScatterRowsThroughRouter(b *testing.B) {
 	for _, cols := range []int{1, 16} {
-		b.Run(fmt.Sprintf("cols=%d", cols), func(b *testing.B) { benchScatterRows(b, cols) })
+		b.Run(fmt.Sprintf("cols=%d", cols), func(b *testing.B) { benchScatterRows(b, cols, 0) })
 	}
+	// A wide row, where a batch is far past the kilobyte at which pgproto3
+	// throws its write buffer away. That is the case the row slab exists
+	// for: without it every batch grew and copied its way back up from
+	// 1 KiB, on every read, forever.
+	b.Run("wide", func(b *testing.B) { benchScatterRows(b, 4, 4096) })
 }
 
-func benchScatterRows(b *testing.B, cols int) {
+// benchScatterRows reads 250 rows of cols columns; width, when non-zero, is
+// the bytes in each column.
+func benchScatterRows(b *testing.B, cols, width int) {
 	h := newShardedHarness(b)
 	conn, err := pgx.Connect(context.Background(), h.dsn()+"&default_query_exec_mode=simple_protocol")
 	if err != nil {
@@ -58,10 +66,11 @@ func benchScatterRows(b *testing.B, cols int) {
 	for i := range cols {
 		sc.cols = append(sc.cols, scriptCol{name: "c" + strconv.Itoa(i), oid: 25})
 	}
+	pad := strings.Repeat("x", max(width-8, 0))
 	for i := range 250 {
 		row := make([]string, cols)
 		for j := range row {
-			row[j] = strconv.Itoa(i*cols + j)
+			row[j] = strconv.Itoa(i*cols+j) + pad
 		}
 		sc.rows = append(sc.rows, row)
 	}
