@@ -84,7 +84,11 @@ func Run(ctx context.Context, o Options) error {
 	// so the reconcilers share them rather than each dialling per call.
 	agents := NewGRPCAgentClient()
 	defer agents.Close()
-	r := &ClusterReconciler{Client: mgr.GetClient(), Renderer: Renderer{AdminImage: o.AdminImage, RouterImage: o.RouterImage, ControllerImage: o.ControllerImage, ControllerPlacementDropOldAfter: o.ControllerPlacementDropOldAfter}, Prober: boundedProber{Inner: PgxProber{}}, Agents: agents,
+	// One prober for the manager's life: it keeps a small pool per member,
+	// so a reconcile pass over an unchanged cluster stops paying a
+	// handshake, TLS and SCRAM per probe per member.
+	prober := NewPgxProber()
+	r := &ClusterReconciler{Client: mgr.GetClient(), Renderer: Renderer{AdminImage: o.AdminImage, RouterImage: o.RouterImage, ControllerImage: o.ControllerImage, ControllerPlacementDropOldAfter: o.ControllerPlacementDropOldAfter}, Prober: boundedProber{Inner: prober}, Agents: agents,
 		Metrics: metrics.NewOperator(ctrlmetrics.Registry)}
 	if err := r.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup reconciler: %w", err)

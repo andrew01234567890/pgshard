@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
@@ -146,7 +148,109 @@ func HostDSN(host, password string) string {
 }
 
 // PgxProber is the production Prober.
-type PgxProber struct{}
+//
+// A prober built by NewPgxProber keeps one small pool per DSN. Probe and
+// ProbeStandby run for every member of every group on every reconcile pass,
+// and each used to dial: a TCP handshake, TLS and SCRAM before asking
+// anything, which is the dominant cost of a pass now that each probe is one
+// statement. The zero value has no cache and dials every time, which is what
+// the tests want and what any caller that probes once gets.
+type PgxProber struct {
+	conns *connCache
+}
+
+// NewPgxProber returns a prober that reuses its connections.
+func NewPgxProber() PgxProber { return PgxProber{conns: &connCache{}} }
+
+// Close releases every pooled connection. A prober without a cache has
+// nothing to close.
+func (p PgxProber) Close() {
+	if p.conns != nil {
+		p.conns.close()
+	}
+}
+
+// connCache holds one pool per DSN.
+//
+// The pools are small and let their connections go when they are idle: a
+// member the operator is about to fence must not be held open by the thing
+// that was watching it. A connection that breaks is discarded by the pool
+// rather than handed out again.
+type connCache struct {
+	mu    sync.Mutex
+	pools map[string]*pgxpool.Pool
+}
+
+// probeIdleTimeout is how long a pooled probe connection may sit unused. A
+// reconcile pass is far more frequent than this on a live cluster, so a
+// steady cluster reuses; a member that stops being probed lets its backend
+// go.
+const probeIdleTimeout = 2 * time.Minute
+
+func (c *connCache) pool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if p, ok := c.pools[dsn]; ok {
+		return p, nil
+	}
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	// Two: a primary probe and a standby probe of the same member can
+	// overlap, and nothing here wants more than that.
+	cfg.MaxConns = 2
+	cfg.MinConns = 0
+	cfg.MaxConnIdleTime = probeIdleTimeout
+	cfg.MaxConnLifetime = 30 * time.Minute
+	p, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if c.pools == nil {
+		c.pools = map[string]*pgxpool.Pool{}
+	}
+	c.pools[dsn] = p
+	return p, nil
+}
+
+func (c *connCache) close() {
+	c.mu.Lock()
+	pools := c.pools
+	c.pools = nil
+	c.mu.Unlock()
+	for _, p := range pools {
+		p.Close()
+	}
+}
+
+// probeRow is what a probe needs of a connection: one row, one statement.
+type probeRow interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// withProbeConn runs fn against dsn, on a pooled connection when this prober
+// has a cache and a fresh one otherwise.
+func (p PgxProber) withProbeConn(ctx context.Context, dsn string, fn func(probeRow) error) error {
+	if p.conns == nil {
+		conn, err := pgx.Connect(ctx, dsn)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = conn.Close(ctx) }()
+		return fn(conn)
+	}
+	pool, err := p.conns.pool(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	return fn(conn)
+}
 
 // probePrimarySQL reads everything a primary probe needs in one row: that
 // the server answers at all, that it is not in recovery, which standbys are
@@ -165,47 +269,50 @@ const probePrimarySQL = `SELECT pg_is_in_recovery(),
 	FROM pg_stat_replication`
 
 // Probe reads liveness and replication state from the primary.
-func (PgxProber) Probe(ctx context.Context, dsn string) (PrimaryState, error) {
-	conn, err := pgx.Connect(ctx, dsn)
+func (p PgxProber) Probe(ctx context.Context, dsn string) (PrimaryState, error) {
+	var st PrimaryState
+	err := p.withProbeConn(ctx, dsn, func(conn probeRow) error {
+		var recovery bool
+		var syncNames string
+		var paused bool
+		var streaming []string
+		if err := conn.QueryRow(ctx, probePrimarySQL).Scan(&recovery, &syncNames, &paused, &streaming); err != nil {
+			return err
+		}
+		if recovery {
+			return fmt.Errorf("primary service points at a standby")
+		}
+		st = PrimaryState{Streaming: make(map[string]bool, len(streaming)), SyncStandbyNames: syncNames, WritesPaused: paused}
+		for _, name := range streaming {
+			st.Streaming[name] = true
+		}
+		return nil
+	})
 	if err != nil {
 		return PrimaryState{}, err
-	}
-	defer func() { _ = conn.Close(ctx) }()
-	var recovery bool
-	var syncNames string
-	var paused bool
-	var streaming []string
-	if err := conn.QueryRow(ctx, probePrimarySQL).Scan(&recovery, &syncNames, &paused, &streaming); err != nil {
-		return PrimaryState{}, err
-	}
-	if recovery {
-		return PrimaryState{}, fmt.Errorf("primary service points at a standby")
-	}
-	st := PrimaryState{Streaming: make(map[string]bool, len(streaming)), SyncStandbyNames: syncNames, WritesPaused: paused}
-	for _, name := range streaming {
-		st.Streaming[name] = true
 	}
 	return st, nil
 }
 
 // ProbeStandby reads recovery and WAL receiver state from one member.
-func (PgxProber) ProbeStandby(ctx context.Context, dsn string) (StandbyState, error) {
-	conn, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		return StandbyState{}, err
-	}
-	defer func() { _ = conn.Close(ctx) }()
+func (p PgxProber) ProbeStandby(ctx context.Context, dsn string) (StandbyState, error) {
 	var st StandbyState
-	var lsn *int64
-	err = conn.QueryRow(ctx, `SELECT pg_is_in_recovery(),
-		EXISTS (SELECT 1 FROM pg_stat_wal_receiver WHERE status = 'streaming'),
-		CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn() ELSE pg_current_wal_flush_lsn() END - '0/0'::pg_lsn`).
-		Scan(&st.InRecovery, &st.Streaming, &lsn)
+	err := p.withProbeConn(ctx, dsn, func(conn probeRow) error {
+		var lsn *int64
+		err := conn.QueryRow(ctx, `SELECT pg_is_in_recovery(),
+			EXISTS (SELECT 1 FROM pg_stat_wal_receiver WHERE status = 'streaming'),
+			CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn() ELSE pg_current_wal_flush_lsn() END - '0/0'::pg_lsn`).
+			Scan(&st.InRecovery, &st.Streaming, &lsn)
+		if err != nil {
+			return err
+		}
+		if lsn != nil {
+			st.FlushLSN = uint64(*lsn)
+		}
+		return nil
+	})
 	if err != nil {
 		return StandbyState{}, err
-	}
-	if lsn != nil {
-		st.FlushLSN = uint64(*lsn)
 	}
 	return st, nil
 }

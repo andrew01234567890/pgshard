@@ -443,3 +443,65 @@ func TestProbeReadsAPrimaryInOneRoundTrip(t *testing.T) {
 		t.Errorf("synchronous_standby_names = %q", st.SyncStandbyNames)
 	}
 }
+
+// TestAPooledProbeKeepsItsConnection: Probe and ProbeStandby run for every
+// member of every group on every reconcile pass, and each used to dial --
+// a TCP handshake, TLS and SCRAM before asking anything, which is the
+// dominant cost of a pass now that each probe is one statement. A prober
+// built by NewPgxProber keeps one small pool per member; the zero value
+// still dials every time, which is what a caller that probes once wants.
+func TestAPooledProbeKeepsItsConnection(t *testing.T) {
+	if err := exec.Command("docker", "info").Run(); err != nil {
+		dockertest.Unavailable(t, "docker unavailable")
+	}
+	ctx := context.Background()
+	dsn := startProbePostgres(t)
+
+	watch, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = watch.Close(ctx) }()
+	// Sessions ever opened, not sessions open now: an unpooled probe closes
+	// its connection before the next count, so only the cumulative figure
+	// can tell dialling from reuse.
+	sessions := func() int64 {
+		t.Helper()
+		var n int64
+		if err := watch.QueryRow(ctx, `SELECT sessions FROM pg_stat_database WHERE datname = current_database()`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	pooled := NewPgxProber()
+	defer pooled.Close()
+	if _, err := pooled.Probe(ctx, dsn); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pooled.ProbeStandby(ctx, dsn); err != nil {
+		t.Fatal(err)
+	}
+	settled := sessions()
+	for range 8 {
+		if _, err := pooled.Probe(ctx, dsn); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pooled.ProbeStandby(ctx, dsn); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := sessions(); n != settled {
+		t.Errorf("%d new sessions over eight passes; a pooled probe must not dial again", n-settled)
+	}
+
+	// The zero value still dials, which is what a caller that probes once
+	// wants and what every test that builds one gets.
+	before := sessions()
+	if _, err := (PgxProber{}).Probe(ctx, dsn); err != nil {
+		t.Fatal(err)
+	}
+	if n := sessions(); n == before {
+		t.Error("an unpooled prober must open its own connection")
+	}
+}
