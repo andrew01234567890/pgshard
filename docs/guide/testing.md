@@ -40,6 +40,44 @@ PGSHARD_REQUIRE_ENVTEST=1 make envtest # the API control plane must be there
 Run the first before concluding that a change to anything touching
 PostgreSQL is tested.
 
+## envtest fails on a clock that jumps
+
+On a host whose clock is being corrected underneath it -- a WSL2 distro is
+the one this has been seen on -- envtest's control plane refuses its own
+requests:
+
+```
+tls: failed to verify certificate: x509: certificate has expired or is not
+yet valid: current time 2026-08-30T01:49:50+01:00 is before
+2026-08-30T00:50:21Z
+```
+
+or a bare `Unauthorized`. Once one test hits it the rest of the run usually
+goes with it, and a rerun passes, which is what makes it look like a flaky
+suite.
+
+It is not one, and it is not in the operator. The certificate's `notBefore`
+is about thirty seconds *ahead* of the clock the client reads, so the two
+processes disagree about the time: the control plane minted the certificate,
+and the clock then moved backwards before a test connected. Measure the host
+offset before blaming anything else:
+
+```sh
+curl -sI https://api.github.com | grep -i '^date:'   # against the host clock
+date -u
+```
+
+An offset of tens of seconds is enough. This machine measured 36 seconds
+ahead of network time while the failure was being investigated, and WSL2
+resyncs that drift by stepping the clock rather than slewing it, which is
+exactly the backwards jump the error describes. Resyncing deliberately
+(`sudo hwclock -s`, or restarting the distro) puts the step somewhere
+harmless instead of in the middle of a run.
+
+This is host-only. Across forty recent CI runs the envtest job never failed
+this way, so a failure of this shape on a runner is a real failure and worth
+reading rather than retrying.
+
 ## Which tier does my change need
 
 - **Anything at all**: `make verify`. It is the gate CONTRIBUTING asks for
