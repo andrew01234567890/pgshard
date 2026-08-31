@@ -673,6 +673,23 @@ func (PgxProber) SeedBootstrapRole(ctx context.Context, dsn, rolname, password s
 			}
 		}
 	}
+	// The server already has a verifier for this role: initdb built one
+	// from the same password when the group was created. Minting a second
+	// one here would give the catalog a different salt, and SCRAM key
+	// forwarding cannot survive that -- ClientKey is derived from the salt,
+	// so the key the router recovers against the catalog's verifier is not
+	// the key the backend expects, and the login fails with 28P01 after the
+	// router has already accepted the client. Adopt what the server holds.
+	var stored string
+	if err := conn.QueryRow(ctx, `SELECT coalesce(rolpassword, '') FROM pg_authid WHERE rolname = $1`, rolname).Scan(&stored); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	if _, perr := pgwire.ParseSCRAMVerifier(stored); perr == nil {
+		_, err = conn.Exec(ctx, `INSERT INTO pgshard.roles (rolname, verifier, login, createdb, createrole)
+			VALUES ($1, $2, true, true, true)
+			ON CONFLICT (rolname) DO UPDATE SET verifier = EXCLUDED.verifier, updated_at = now()`, rolname, stored)
+		return err
+	}
 	v, err := pgwire.BuildSCRAMVerifier(password, nil, pgwire.DefaultSCRAMIterations)
 	if err != nil {
 		return err
