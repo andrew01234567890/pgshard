@@ -66,6 +66,7 @@ actionlint:
 	hack/check-actions.sh
 	hack/test-check-actions.sh
 	hack/ci/test-retry.sh
+	hack/e2e/test-suites.sh
 
 clean:
 	rm -rf bin dist
@@ -91,8 +92,15 @@ kind-up:
 kind-down:
 	hack/kind/down.sh
 
+# e2e runs one suite the way CI runs it: the images that suite needs, a kind
+# cluster, the images loaded into it, and the one go test invocation with the
+# timeout and filter that suite is known to need. `go test ./test/e2e/...`
+# is not that -- see the comment at the top of hack/e2e/run.sh.
+E2E_SUITE ?=
+E2E_PG    ?= 18
+
 e2e:
-	go test -tags e2e -count=1 -v ./test/e2e/...
+	hack/e2e/run.sh $(E2E_SUITE) $(E2E_PG)
 
 # integration runs the suites that need Docker and the PostgreSQL image but
 # not Kubernetes: the router system tests against a real pooler and real
