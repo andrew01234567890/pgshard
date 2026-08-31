@@ -91,10 +91,23 @@ proto-breaking:
 		echo "proto-breaking: no proto files on main, skipping"; \
 	fi
 
-.PHONY: kind-up kind-down e2e integration perf-bench admin-image deploy-admin undeploy-admin
+.PHONY: kind-up kind-down dev-up dev-down e2e integration perf-bench admin-image deploy-admin undeploy-admin
 
 kind-up:
 	hack/kind/up.sh
+
+# dev-up is the whole getting-started path in one command: a kind cluster,
+# every image this repository builds, loaded into it, the operator deployed
+# against those images, and a small cluster applied.
+#
+# It exists because the guide's sequence could not be followed. CI publishes
+# only the PostgreSQL images, so the router and operator tags it named were
+# never pushed; kind-up created a cluster and loaded nothing; and nothing
+# told the operator to run a locally built router. Each step worked and the
+# path through them did not, which is the kind of thing only an executable
+# target keeps true.
+dev-up:
+	hack/kind/dev-up.sh
 
 kind-down:
 	hack/kind/down.sh

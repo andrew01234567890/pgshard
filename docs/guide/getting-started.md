@@ -7,11 +7,10 @@ you can connect to with `psql`.
 
 - Kubernetes 1.29+ with a default StorageClass.
 - `kubectl` and, to build images locally, Docker and Go 1.26+.
-- The container images. CI pushes them to GHCR
-  (`ghcr.io/andrew01234567890/pgshard-postgres:{18,19}`, `pgshard-router`,
-  `pgshard-admin`); build your own with `docker buildx bake postgres`,
-  `make operator-image admin-image` and
-  `docker build -f Dockerfile.router .`.
+- The container images. CI publishes only the PostgreSQL images
+  (`ghcr.io/andrew01234567890/pgshard-postgres:{18,19}`); the router,
+  operator and admin images are built locally, so `make dev-up` below builds
+  and loads all of them rather than pulling tags that do not exist.
 
 ## Install the operator
 
@@ -21,10 +20,20 @@ Install the CRDs and the operator:
 make deploy    # CRDs (make install), namespace, RBAC, operator Deployment
 ```
 
-For development, `make kind-up` (via `hack/kind/up.sh`, used by the e2e
-suites) creates a kind cluster with the images preloaded, and the operator
-can be run locally with `go run ./cmd/pgshard-operator run` against the
-current kubeconfig.
+For development, `make dev-up` does all of the above against a local kind
+cluster in one step: it creates the cluster, builds the PostgreSQL, router
+and operator images, loads them into it, deploys the operator pointed at the
+locally built router, and applies the demo cluster below. `make kind-down`
+removes it.
+
+```sh
+make dev-up
+```
+
+`make kind-up` creates the bare cluster on its own -- it loads no images,
+which is what the e2e suites want, since each builds and loads the images
+its own suite needs. The operator can also be run outside the cluster with
+`go run ./cmd/pgshard-operator run` against the current kubeconfig.
 
 ## Create a cluster
 
@@ -123,9 +132,12 @@ SQL.
 
 ## Local development without Kubernetes
 
-`hack/compose/docker-compose.yml --profile router` starts a catalog, one
-shard, its pooler and a router on port 6432. `pgshard-router dev-bootstrap`
-migrates the catalog and registers a database, a role and the shard's pooler
+```sh
+docker compose -f hack/compose/docker-compose.yml --profile router up --build
+```
+
+starts a catalog, one shard, its pooler and a router on port 6432.
+`pgshard-router dev-bootstrap` migrates the catalog and registers a database, a role and the shard's pooler
 endpoint (password from `PGSHARD_DEV_PASSWORD`).
 
 ## Where to next
