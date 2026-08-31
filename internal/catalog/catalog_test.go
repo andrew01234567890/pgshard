@@ -1653,3 +1653,37 @@ func mustTx(t *testing.T, tx pgx.Tx, sql string, args ...any) {
 		t.Fatalf("%s: %v", sql, err)
 	}
 }
+
+// TestUnownedCatalogObjectsAreGone: a table nothing writes and two columns
+// nothing reads advertise state that is never authoritative -- a reader
+// cannot tell an empty jsonb that means "nothing yet" from one that means
+// "nobody writes this" -- and both are replicated with the catalog and
+// carried through every upgrade.
+func TestUnownedCatalogObjectsAreGone(t *testing.T) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		dockertest.Unavailable(t, "docker not on PATH")
+	}
+	selected, err := selectImages(candidateImages, os.Getenv(requireProjectImagesEnv) != "", func(name string) bool { return imageAvailable(t, name) })
+	if err != nil || len(selected) == 0 {
+		t.Skipf("no PostgreSQL image available: %v", err)
+	}
+	ctx := context.Background()
+	conn := connect(t, startPostgres(t, selected[0]))
+	if err := Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []struct{ what, sql string }{
+		{"table pgshard.database_status", `SELECT to_regclass('pgshard.database_status') IS NULL`},
+		{"column pgshard.streams.spec", `SELECT NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pgshard.streams'::regclass AND attname = 'spec' AND NOT attisdropped)`},
+		{"column pgshard.streams.position", `SELECT NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pgshard.streams'::regclass AND attname = 'position' AND NOT attisdropped)`},
+	} {
+		if !queryOne[bool](t, conn, q.sql) {
+			t.Errorf("%s is still there; nothing owns it", q.what)
+		}
+	}
+	// The stream columns something does own are untouched.
+	mustExec(t, conn, `INSERT INTO pgshard.streams (name, database, two_phase, state) VALUES ('s1', 'app', false, 'creating')`)
+	if got := queryOne[string](t, conn, `SELECT state FROM pgshard.streams WHERE name = 's1'`); got != "creating" {
+		t.Fatalf("streams state = %q", got)
+	}
+}
