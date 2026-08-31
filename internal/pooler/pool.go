@@ -415,6 +415,8 @@ func (p *Pool) popIdle(rp *rolePool, digest [32]byte) *Backend {
 		if n := len(rp.idle); n > 0 {
 			b = rp.idle[n-1]
 			rp.idle = rp.idle[:n-1]
+			// Out of the pool and owned again, so it may be returned again.
+			b.released = false
 		}
 		p.mu.Unlock()
 		if b == nil {
@@ -533,8 +535,28 @@ func (p *Pool) expired(b *Backend) bool {
 // Release returns b to its role's idle set, or closes it when broken,
 // expired, not idle, or the pool is closed. Its budget slot is freed in the
 // latter cases.
-func (p *Pool) Release(b *Backend) {
+func (p *Pool) Release(b *Backend) { p.release(b, false) }
+
+// Discard closes b and frees its slot without reuse.
+func (p *Pool) Discard(b *Backend) { p.release(b, true) }
+
+// release returns b once. A second call for the same handout does nothing:
+// free drains a token from two channels, so freeing one backend's slot
+// twice takes another backend's tokens, and once they run out the receive
+// blocks for good -- a caller returning a backend somebody else had
+// already returned would hang there rather than fail. broken is set here
+// rather than by Discard so that it, and the decision it feeds, happen
+// under the one lock.
+func (p *Pool) release(b *Backend, broken bool) {
 	p.mu.Lock()
+	if b.released {
+		p.mu.Unlock()
+		return
+	}
+	b.released = true
+	if broken {
+		b.broken = true
+	}
 	rp := p.role(b.database, b.role)
 	// A backend with buffered, unflushed messages is never reused: the next
 	// user's flush would push another session's pipeline into PostgreSQL.
@@ -548,12 +570,6 @@ func (p *Pool) Release(b *Backend) {
 		b.close()
 		p.free(rp)
 	}
-}
-
-// Discard closes b and frees its slot without reuse.
-func (p *Pool) Discard(b *Backend) {
-	b.broken = true
-	p.Release(b)
 }
 
 // Close closes idle backends and makes further Acquire calls fail. Backends
