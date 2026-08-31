@@ -200,6 +200,16 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	// Before any group: every member pod mounts this Secret for its pooler,
+	// and a pod whose Secret does not exist never starts. Creating it on the
+	// catalog-ready path instead deadlocked -- the catalog group could not
+	// become ready because its own pooler was waiting for the Secret that
+	// readiness was going to create. Nothing here needs the catalog: it is a
+	// generated password, and the role it belongs to is given that password
+	// later, once there is a catalog to give it to.
+	if _, err := r.ensureRouterSecret(ctx, &cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("router secret: %w", err)
+	}
 	catalogGroup := Groups(&cluster)[0]
 	catalogObs, err := r.reconcileGroup(ctx, &cluster, catalogGroup, password, policy, repoReady)
 	if err != nil {
