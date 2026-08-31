@@ -6,7 +6,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+trap 'rm -rf "$tmp" 2>/dev/null || true' EXIT
 
 cat > "$tmp/go" <<'STUB'
 #!/usr/bin/env bash

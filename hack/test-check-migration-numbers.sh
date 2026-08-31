@@ -7,12 +7,20 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 checker="$root/hack/check-migration-numbers.sh"
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+# The cleanup must not decide the exit status. git can leave a background
+# maintenance run writing into .git, rm then reports "Directory not empty",
+# and under set -e a failing trap failed the whole job after every check had
+# already passed -- which is how this broke main rather than a branch.
+trap 'rm -rf "$tmp" 2>/dev/null || true' EXIT
 
 cd "$tmp"
 git init -q -b main .
 git config user.email t@example.invalid
 git config user.name test
+# No background repacking in a repository that exists for four commits and
+# is deleted a second later.
+git config gc.auto 0
+git config maintenance.auto false
 mkdir -p internal/catalog/schema
 echo "SELECT 1;" > internal/catalog/schema/0001_base.sql
 git add -A && git commit -qm base
