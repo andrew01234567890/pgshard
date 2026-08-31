@@ -56,12 +56,24 @@ so, and neither number should be reported as more than it is.
 
 ## Required checks
 
-Two aggregate jobs stand in for the individual ones: **CI gate** fails
-unless every job in `ci.yml` succeeded, and **e2e gate** fails unless every
-cell of the `e2e-kind.yml` matrix did. Requiring those two, rather than a
-list of job names, is what keeps a newly added job gated from the moment it
-exists: naming jobs individually is how `Proto lint and generated code
-drift` came to run on every PR without ever being able to block one.
+What `main` requires **today** is a list of job names:
+
+    Go build and test, PR title, Secret scan, Workflow lint and policy,
+    govulncheck, dependency-review,
+    e2e (pg18|pg19, smoke), e2e (pg18|pg19, operator), e2e (pg18|pg19, backup)
+
+Two aggregate jobs exist to replace that list: **CI gate** fails unless every
+job in `ci.yml` succeeded, and **e2e gate** fails unless every cell of the
+`e2e-kind.yml` matrix did. Requiring those two, rather than a list of job
+names, is what keeps a newly added job gated from the moment it exists:
+naming jobs individually is how `Proto lint and generated code drift` came to
+run on every PR without ever being able to block one, and it is why
+`Envtest`, `Integration` and the reshard and upgrade e2e cells cannot block
+one now either, though each is in a gate's `needs`.
+
+Neither gate is required yet. Switching protection to them is a deliberate
+step, not a tidy-up: it makes every cell of both workflows blocking at once,
+including the suites whose failure rate is still being measured.
 
 The reshard and upgrade e2e suites run single-replica clusters
 (`unsafeSingleReplica: true`, see [crd.md](crd.md)) so their pods fit the
