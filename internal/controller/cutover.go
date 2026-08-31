@@ -496,6 +496,22 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 		}
 		wf.cutover.Verify = &report
 		if len(report.Mismatches) > 0 {
+			// A source that moved while the digests were being taken makes
+			// the target look ahead of it: the source is read first, and a
+			// write landing between that read and the target's is already
+			// applied by the time the target is read. Seen in CI as a
+			// target holding exactly one batch more than the sources
+			// predicted. That is a race in the measurement, not a target
+			// that disagrees with its source, and it must not abandon a
+			// switch -- the positions say which it was.
+			pos, perr := ops.Positions(ctx)
+			if perr != nil {
+				return false, perr
+			}
+			if !maps.Equal(pos, wf.cutover.Positions) {
+				wf.cutover.Positions = pos
+				return true, retryf("sources advanced while verifying (%s)", strings.Join(report.Mismatches, "; "))
+			}
 			return false, fatal("verification failed: %s", strings.Join(report.Mismatches, "; "))
 		}
 	case StepSequences:
