@@ -2,7 +2,9 @@ package router
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"time"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 )
@@ -78,9 +80,23 @@ func (ps *poolerStream) send(req *pgshardv1.ExecuteRequest, sid string, gen *pgs
 	return ps.stream.Send(req)
 }
 
+// cancelGrace bounds the wait for a cancelled batch to reach
+// ReadyForQuery. Draining keeps the stream in sync and is worth waiting
+// for; waiting for ever is not. The cancel is best-effort -- it can fail,
+// and a backend can be wedged somewhere PostgreSQL will not interrupt --
+// and an unbounded wait then held this goroutine, the pooler session
+// behind it and the router's own drain open with nothing able to end
+// them. A variable so tests need not spend it.
+var cancelGrace = 5 * time.Second
+
+// errCancelGrace ends a batch whose cancellation was never acknowledged.
+var errCancelGrace = errors.New("cancelled statement did not finish within the cancel grace")
+
 // recv blocks for the next response. On ctx cancellation it calls onCancel
-// once and keeps waiting: the batch must be drained to ReadyForQuery to keep
-// the stream in sync.
+// once and waits for the batch to drain to ReadyForQuery, which keeps the
+// stream in sync -- but only for cancelGrace. Past that the stream is
+// aborted: it is stuck mid-batch, so the next statement on it would read
+// this one's leftovers, and no answer is coming to put it right.
 func (ps *poolerStream) recv(ctx context.Context, onCancel func()) (*pgshardv1.ExecuteResponse, error) {
 	select {
 	case r := <-ps.recvc:
@@ -90,8 +106,18 @@ func (ps *poolerStream) recv(ctx context.Context, onCancel func()) (*pgshardv1.E
 			onCancel()
 		}
 	}
-	r := <-ps.recvc
-	return r.msg, r.err
+	t := time.NewTimer(cancelGrace)
+	defer t.Stop()
+	select {
+	case r := <-ps.recvc:
+		return r.msg, r.err
+	case <-t.C:
+		// Aborting the gRPC stream is what makes this bounded: it wakes
+		// the receiving goroutine, closes done, and lets a later close or
+		// Release return instead of waiting on a batch that never ends.
+		ps.cancel()
+		return nil, errCancelGrace
+	}
 }
 
 // close half-closes the stream and waits until the pooler has finished the
