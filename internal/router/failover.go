@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
+	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
 )
 
@@ -97,7 +98,20 @@ func decideFailover(trigger, inTxn, outputSent bool, buffered, capacity int) fai
 // pooler or a refused connection to it.
 func isFailover(err error) bool { return isStaleGeneration(err) || isRefused(err) }
 
+// isStaleGeneration reports a pooler refusing because the topology moved.
+//
+// A pooler that says so is believed; one that does not is judged by its
+// SQLSTATE, as before. That fallback is not merely for older poolers: 55000
+// is object_not_in_prerequisite_state, which a shard answers for a rewrite
+// in progress and for conditions that are not a fence at all, so the code
+// alone cannot tell them apart and never could.
 func isStaleGeneration(err error) bool {
+	switch poolerReason(err) {
+	case pgshardv1.Reason_REASON_STALE_GENERATION:
+		return true
+	case pgshardv1.Reason_REASON_REWRITE_IN_PROGRESS:
+		return false
+	}
 	pe, ok := errors.AsType[*pgwire.Error](err)
 	return ok && pe.Code == codeStaleGeneration
 }

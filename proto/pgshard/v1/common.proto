@@ -41,6 +41,23 @@ message Error {
   string detail = 3;
   // Optional hint on how to resolve the error.
   string hint = 4;
+  // Why, where the SQLSTATE cannot say. 55000 is answered for a stale
+  // routing generation and for a rewrite in progress, so a caller reading
+  // the code alone cannot tell a topology that moved from a condition that
+  // retrying will not fix. UNSPECIFIED means the sender predates this
+  // field, and a reader must fall back to the SQLSTATE.
+  Reason reason = 5;
+}
+
+// Reason distinguishes conditions that share a SQLSTATE.
+enum Reason {
+  REASON_UNSPECIFIED = 0;
+  // The request carried a shard-map generation or epoch the pooler has
+  // moved past; the caller should reload and retry.
+  REASON_STALE_GENERATION = 1;
+  // A table is mid online-rewrite and its column list is not published;
+  // the caller should wait rather than treat it as a fault.
+  REASON_REWRITE_IN_PROGRESS = 2;
 }
 
 // KeyRange is a closed interval of hashed shard keys, [start, end], over the

@@ -233,6 +233,35 @@ func (e *Executor) queryOne(ctx context.Context, p *txnPart, sql string) (string
 // runOn sends one simple query on p's stream and drains the answer into w,
 // updating p's transaction status. It touches no executor state, so several
 // parts can run concurrently.
+// namePrepareFailover turns a participant's stale-generation refusal during
+// PREPARE TRANSACTION into the router's own answer for a topology that moved
+// under a transaction.
+//
+// The statement path already does this: decideFailover answers a stale
+// generation inside a transaction with failoverInTxnError, which tells the
+// client to retry the transaction and why. The commit path does not go
+// through it -- runOn relays the participant's answer -- so a cutover's flip
+// landing between a transaction's writes and its PREPARE reached the client
+// as a bare 55000, naming neither the flip nor a way out.
+//
+// It is named rather than retried, deliberately. A PREPARE that failed on
+// one participant has left the others prepared, and those are rolled back
+// above; retrying here would be a second attempt at a transaction whose
+// first is still being undone. Retrying is the client's to decide, which is
+// what a two-phase commit failure means.
+//
+// Only an explicit reason counts here, unlike isStaleGeneration, which also
+// accepts a bare 55000 for compatibility. This path is new behaviour, and
+// 55000 is object_not_in_prerequisite_state -- a participant answers it for
+// conditions that are not a fence, and rewriting one of those into "retry
+// the transaction" would send a client round a loop that cannot end.
+func namePrepareFailover(err error) error {
+	if poolerReason(err) != pgshardv1.Reason_REASON_STALE_GENERATION {
+		return err
+	}
+	return failoverInTxnError()
+}
+
 func (e *Executor) runOn(ctx context.Context, p *txnPart, sql string, w pgwire.ResultWriter) error {
 	return e.runReqsOn(ctx, p, []*pgshardv1.ExecuteRequest{simpleQuery(sql)}, w)
 }
@@ -487,7 +516,7 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 			_ = log.Delete(ctx, gid)
 		}
 		e.finishTxn("ROLLBACK")
-		return err
+		return namePrepareFailover(err)
 	}
 	crashpoint.Hit("after_prepare")
 	decided, err := log.Commit(ctx, gid)

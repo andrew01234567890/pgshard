@@ -1,6 +1,8 @@
 package router
 
 import (
+	"errors"
+
 	"github.com/jackc/pgx/v5/pgproto3"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
@@ -135,11 +137,39 @@ func valueRow(cols []*pgshardv1.Value) [][]byte {
 	return out
 }
 
-func toPgwireError(e *pgshardv1.Error) *pgwire.Error {
+func toPgwireError(e *pgshardv1.Error) error {
 	if e == nil {
 		return pgwire.Errorf(pgwire.CodeInternalError, "pooler reported an error without details")
 	}
-	return &pgwire.Error{Severity: "ERROR", Code: e.Sqlstate, Message: e.Message, Detail: e.Detail, Hint: e.Hint}
+	pe := &pgwire.Error{Severity: "ERROR", Code: e.Sqlstate, Message: e.Message, Detail: e.Detail, Hint: e.Hint}
+	if e.Reason == pgshardv1.Reason_REASON_UNSPECIFIED {
+		return pe
+	}
+	// The reason is kept beside the SQLSTATE rather than folded into it,
+	// because two conditions answer 55000 and only the sender knows which.
+	// errors.As still finds the *pgwire.Error, so every existing caller is
+	// unaffected; the ones that need to tell them apart ask for the reason.
+	return &poolerError{pe: pe, reason: e.Reason}
+}
+
+// poolerError is a pooler answer that knew why, wrapping the pgwire error
+// every caller already handles.
+type poolerError struct {
+	pe     *pgwire.Error
+	reason pgshardv1.Reason
+}
+
+func (e *poolerError) Error() string { return e.pe.Error() }
+func (e *poolerError) Unwrap() error { return e.pe }
+
+// poolerReason reports the reason a pooler gave, or UNSPECIFIED when it gave
+// none -- an older pooler, or an error that did not come from one.
+func poolerReason(err error) pgshardv1.Reason {
+	var pe *poolerError
+	if errors.As(err, &pe) {
+		return pe.reason
+	}
+	return pgshardv1.Reason_REASON_UNSPECIFIED
 }
 
 func toNotice(e *pgshardv1.Error) *pgproto3.NoticeResponse {
