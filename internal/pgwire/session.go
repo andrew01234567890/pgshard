@@ -29,6 +29,18 @@ var ErrCopyFail = errors.New("pgwire: COPY failed by client")
 // CopyData chunk and three orders of magnitude below the old ceiling.
 const DefaultMaxMessageBodyLen = 64 << 20
 
+// preAuthMaxMessageBodyLen bounds a frontend message body before the client
+// has authenticated. The ceiling above is what one AUTHENTICATED session can
+// make the router allocate from a five-byte header; before authentication
+// nobody has earned that, and a client that has sent nothing but a startup
+// packet could declare a 64 MiB SASL body and have it allocated, times every
+// startup slot the router allows at once.
+//
+// Nothing legitimate is near it: a startup packet, a password message and a
+// SCRAM exchange are hundreds of bytes. The limit is raised to the full one
+// the moment authentication succeeds.
+const preAuthMaxMessageBodyLen = 64 << 10
+
 type session struct {
 	server *Server
 	id     uint64
@@ -88,11 +100,15 @@ func (s *session) resetIO(conn net.Conn) {
 	s.conn = conn
 	s.reader = bufio.NewReader(conn)
 	s.be = pgproto3.NewBackend(s.reader, conn)
-	maxBody := s.server.cfg.MaxMessageBodyLen
-	if maxBody <= 0 {
-		maxBody = DefaultMaxMessageBodyLen
+	s.be.SetMaxBodyLen(min(preAuthMaxMessageBodyLen, s.maxBodyLen()))
+}
+
+// maxBodyLen is the configured ceiling for an authenticated session.
+func (s *session) maxBodyLen() int {
+	if n := s.server.cfg.MaxMessageBodyLen; n > 0 {
+		return n
 	}
-	s.be.SetMaxBodyLen(maxBody)
+	return DefaultMaxMessageBodyLen
 }
 
 func (s *session) send(msgs ...pgproto3.BackendMessage) error {
@@ -627,6 +643,8 @@ func (s *session) startup(ctx context.Context) error {
 	s.mu.Unlock()
 	s.be.Send(&pgproto3.AuthenticationOk{})
 	_ = s.be.SetAuthType(pgproto3.AuthTypeOk)
+	// Authenticated: this session may now declare the full body length.
+	s.be.SetMaxBodyLen(s.maxBodyLen())
 	for _, kv := range s.parameterStatus() {
 		s.be.Send(&pgproto3.ParameterStatus{Name: kv[0], Value: kv[1]})
 	}
