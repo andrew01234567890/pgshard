@@ -903,7 +903,7 @@ func (e *Executor) bind(ctx context.Context, portal, statement string, paramForm
 // snapshot than the current one.
 func (e *Executor) replanStale(ctx context.Context, statement string) error {
 	st, ok := e.stmts[statement]
-	if !ok || st.snap == e.currentSnapshot() {
+	if !ok || snapshot.SamePlanning(st.snap, e.currentSnapshot()) {
 		return nil
 	}
 	pl, err := e.planOp(ctx, st.sql, "parse")
