@@ -102,7 +102,12 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	var source pooler.Source = pooler.NewStaticSource(base)
 	snapshotAge := func() float64 { return -1 }
 	if *catalogDSN != "" {
-		w := snapshot.NewWatcher(*catalogDSN, snapshot.Options{Logf: func(f string, a ...any) { logger.Info(fmt.Sprintf(f, a...)) }})
+		// ServingOnly: the pooler enforces the shard-map generation and its own
+		// shard's epoch, and reads nothing else out of a snapshot. There is one
+		// pooler per member, so loading the whole catalog on every notification
+		// would grow the catalog's read load as pooler count times catalog size.
+		w := snapshot.NewWatcher(*catalogDSN, snapshot.Options{ServingOnly: true,
+			Logf: func(f string, a ...any) { logger.Info(fmt.Sprintf(f, a...)) }})
 		go func() {
 			if err := w.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				logger.Error("catalog watcher stopped", "err", err)

@@ -15,6 +15,53 @@ type Beginner interface {
 	BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error)
 }
 
+// LoadServing reads only what a pooler enforces: the shard-map generation
+// and the serving row of every shard. It is a fraction of Load -- no
+// ranges, databases, tables, table status, rewrites, roles or sequences --
+// and the difference matters because there is a pooler per shard member,
+// each holding a LISTEN connection and reloading on every notification as
+// well as on a timer. A cluster's catalog read load otherwise grows as
+// pooler count times catalog size, and adding shards does both at once.
+//
+// The result is marked Partial. It must not be used to plan: its Tables
+// and Databases are empty because they were never read, which is
+// indistinguishable from a cluster that has none.
+func LoadServing(ctx context.Context, db Beginner) (*Snapshot, error) {
+	tx, err := db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	s := &Snapshot{
+		LoadedAt:  time.Now(),
+		Partial:   true,
+		ShardSets: map[string][]Range{},
+		Serving:   map[ShardKey]Serving{},
+		Databases: map[string]catalog.Database{},
+		Tables:    map[TableKey]Placement{},
+		Sequences: map[string]bool{},
+	}
+	if s.ShardMapGeneration, s.DesiredGeneration, err = catalog.Generations(ctx, tx); err != nil {
+		return nil, fmt.Errorf("snapshot: generations: %w", err)
+	}
+	statuses, err := catalog.ListAllShardStatus(ctx, tx)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot: shard status: %w", err)
+	}
+	for _, st := range statuses {
+		sv := Serving{Epoch: st.PrimaryEpoch, State: st.ServingState, Migrating: st.Migrating}
+		if st.PrimaryEndpoint != nil {
+			sv.PrimaryEndpoint = *st.PrimaryEndpoint
+		}
+		s.Serving[ShardKey{st.ShardSet, st.ShardID}] = sv
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("snapshot: commit: %w", err)
+	}
+	return s, nil
+}
+
 // Load reads one Snapshot inside a single REPEATABLE READ transaction so
 // every table is seen at the same point in time.
 func Load(ctx context.Context, db Beginner) (*Snapshot, error) {

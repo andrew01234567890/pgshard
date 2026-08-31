@@ -81,6 +81,12 @@ type Placement struct {
 	ShardKeyError string
 }
 
+// IsPartial reports a view loaded by LoadServing: the generations and the
+// serving rows, and nothing else. Its Tables and Databases are empty
+// because they were never read, which is indistinguishable from a cluster
+// that has none -- so a partial view must never be used to plan.
+func (s *Snapshot) IsPartial() bool { return s != nil && s.Partial }
+
 // MaxAge is how old a snapshot may be before the router serving it must
 // stop rather than plan against a view of the catalog it can no longer
 // trust. It is one fallback reload plus a margin, so a healthy router --
@@ -119,7 +125,11 @@ type Snapshot struct {
 	// LoadedAt is when this view was read from the catalog. A router that
 	// cannot reload keeps serving the last good snapshot, so age is the
 	// only thing that distinguishes a current view from a stale one.
-	LoadedAt           time.Time
+	LoadedAt time.Time
+	// Partial marks a view LoadServing produced: the generations and the
+	// serving rows only. Everything else is empty because it was never
+	// read, not because the cluster has none of it.
+	Partial            bool
 	ShardMapGeneration int64
 	DesiredGeneration  int64
 	// ServingSet names the shard set routers route user data by.

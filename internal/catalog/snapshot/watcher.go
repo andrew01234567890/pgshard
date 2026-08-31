@@ -27,6 +27,8 @@ type Watcher struct {
 	// goroutine touches it.
 	conn *pgx.Conn
 
+	servingOnly bool
+
 	current atomic.Pointer[Snapshot]
 	mu      sync.Mutex
 	subs    map[chan Change]struct{}
@@ -57,6 +59,10 @@ type Options struct {
 	ReloadInterval time.Duration                    // default DefaultReloadInterval
 	DisableListen  bool                             // periodic reload only
 	Logf           func(format string, args ...any) // nil discards
+	// ServingOnly loads the generations and the serving rows and nothing
+	// else, which is all a pooler enforces. The snapshots it produces are
+	// marked Partial and must not be used to plan.
+	ServingOnly bool
 }
 
 // NewWatcher builds a Watcher for the catalog at dsn; Run starts it.
@@ -71,6 +77,7 @@ func NewWatcher(dsn string, opts Options) *Watcher {
 		dsn:            dsn,
 		reloadInterval: opts.ReloadInterval,
 		listen:         !opts.DisableListen,
+		servingOnly:    opts.ServingOnly,
 		debounce:       50 * time.Millisecond,
 		subs:           map[chan Change]struct{}{},
 		kick:           make(chan struct{}, 1),
@@ -208,7 +215,11 @@ func (w *Watcher) loadOnce(ctx context.Context) (*Snapshot, error) {
 		}
 		w.conn = conn
 	}
-	s, err := Load(ctx, w.conn)
+	load := Load
+	if w.servingOnly {
+		load = LoadServing
+	}
+	s, err := load(ctx, w.conn)
 	if err != nil {
 		w.closeConn(ctx)
 		return nil, err
