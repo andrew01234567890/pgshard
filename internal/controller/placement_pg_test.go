@@ -1044,3 +1044,54 @@ func TestPlacementFenceRefusesAStaleRouterOnPostgres(t *testing.T) {
 	}
 	mustExec(t, client, `INSERT INTO moving VALUES (6, 60, 'after release')`)
 }
+
+// TestPlacementNamesAMissingExtensionOnPostgres: an index or an exclusion
+// constraint can use an operator class or an operator that belongs to an
+// extension -- btree_gist under a temporal key is the case that found this.
+// The shadow build then fails on any target that lacks it, with "no default
+// operator class for access method gist", and the workflow retries against a
+// condition that will not change on its own. The move is refused up front
+// instead, naming the extension and the shards without it.
+func TestPlacementNamesAMissingExtensionOnPostgres(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	ctx := context.Background()
+
+	// Only the home shard has the extension; the other is where the move
+	// would land, and cannot build the shadow.
+	home := f.app(0)
+	mustExec(t, home, `CREATE EXTENSION btree_gist`)
+	// Otherwise movable: the shard key is in the primary key, and the index
+	// that needs the extension is not a uniqueness key at all -- a gist
+	// index over a scalar column, whose opclass comes from btree_gist. So
+	// nothing but the extension stands in the way of this move.
+	mustExec(t, home, `CREATE TABLE bookings (id bigint NOT NULL, room bigint NOT NULL, during tstzrange NOT NULL, PRIMARY KEY (id, room))`)
+	mustExec(t, home, `CREATE INDEX bookings_room_gist ON bookings USING gist (room)`)
+	mustExec(t, f.app(1), `CREATE TABLE bookings (id bigint NOT NULL, room bigint NOT NULL, during tstzrange NOT NULL, PRIMARY KEY (id, room))`)
+
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement)
+		VALUES ('app', 'public', 'bookings', 'unsharded')`)
+	if res := f.reconcile(); res.TablesMadeEffective != 1 {
+		t.Fatalf("%+v", res)
+	}
+	mustExec(t, f.catalog, `UPDATE pgshard.tables SET placement = 'sharded', shard_key = 'room' WHERE table_name = 'bookings'`)
+	if res := f.reconcile(); res.WorkflowsCreated != 1 {
+		t.Fatalf("%+v", res)
+	}
+	if _, err := f.placer.Pass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	_, state, _, msg := f.workflow("bookings")
+	if state != StateFailed {
+		t.Fatalf("state %s: %q", state, msg)
+	}
+	for _, want := range []string{"btree_gist", "default/1", "CREATE EXTENSION"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the refusal must name %q: %q", want, msg)
+		}
+	}
+	// The shard that has it is not named as missing it.
+	if strings.Contains(msg, "default/0") {
+		t.Errorf("a shard that has the extension must not be named: %q", msg)
+	}
+}
