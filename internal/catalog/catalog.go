@@ -116,8 +116,12 @@ func migrationsFrom(fsys fs.FS) ([]Migration, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Version < out[j].Version })
 	for i := range out {
+		// Naming both files matters: this is reached when two branches
+		// numbered a migration against the same main, and the reader has
+		// to know which one to renumber.
 		if i > 0 && out[i].Version == out[i-1].Version {
-			return nil, fmt.Errorf("catalog: duplicate migration version %d", out[i].Version)
+			return nil, fmt.Errorf("catalog: %s and %s are both migration %d; renumber the later one",
+				out[i-1].Name+".sql", out[i].Name+".sql", out[i].Version)
 		}
 	}
 	return out, nil

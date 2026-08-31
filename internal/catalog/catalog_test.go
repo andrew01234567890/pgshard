@@ -53,8 +53,16 @@ func TestMigrationsFrom(t *testing.T) {
 		t.Fatalf("gap: %v %+v", err, ms)
 	}
 	dup := fstest.MapFS{"schema/0001_a.sql": {Data: []byte("a")}, "schema/0001_b.sql": {Data: []byte("b")}}
-	if _, err := migrationsFrom(dup); err == nil {
+	_, err = migrationsFrom(dup)
+	if err == nil {
 		t.Fatal("duplicate versions accepted")
+	}
+	// Whoever reads this is holding two branches that numbered against the
+	// same main, and has to know which files to renumber.
+	for _, want := range []string{"0001_a.sql", "0001_b.sql"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the duplicate error does not name %s: %v", want, err)
+		}
 	}
 	bad := fstest.MapFS{"schema/x.sql": {Data: []byte("a")}}
 	if _, err := migrationsFrom(bad); err == nil {
