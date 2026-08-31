@@ -123,6 +123,32 @@ func ListTables(ctx context.Context, q Querier, database string) ([]Table, error
 	return pgx.CollectRows(rows, pgx.RowToStructByPos[Table])
 }
 
+// ListTablesByDatabase reads every declared table at once, grouped by
+// database.
+//
+// The copy pass wants the tables of every database, and asking per database
+// costs one round trip each -- on a pass that already opens a connection per
+// database and shard, and repeats every five seconds whether or not anything
+// changed. The rows are small and the whole table is read either way; the
+// only difference is how many times the catalog is asked.
+func ListTablesByDatabase(ctx context.Context, q Querier) (map[string][]Table, error) {
+	rows, err := q.Query(ctx, `
+		SELECT database, schema_name, table_name, placement, shard_key, hash_version, desired_generation, updated_at, sequence_columns
+		FROM pgshard.tables ORDER BY database, schema_name, table_name`)
+	if err != nil {
+		return nil, err
+	}
+	all, err := pgx.CollectRows(rows, pgx.RowToStructByPos[Table])
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string][]Table, len(all))
+	for _, t := range all {
+		out[t.Database] = append(out[t.Database], t)
+	}
+	return out, nil
+}
+
 // ShardRangeLockTimeout bounds how long a caller waits for the shard ranges it
 // is about to snapshot. A reconcile pass covers every shard set in one
 // transaction, so blocking here holds up work unrelated to the set being

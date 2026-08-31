@@ -956,6 +956,44 @@ func runSuite(t *testing.T, img pgImage) {
 		}
 	})
 
+	// The copy pass reads every database's tables on every five-second
+	// pass. Reading them per database costs a round trip each, on a pass
+	// that already opens a connection per database and shard, so the
+	// grouped read has to return exactly what the per-database one does --
+	// otherwise the saving is bought with a difference nobody sees until a
+	// table is missing from a plan.
+	t.Run("every_table_at_once_matches_per_database", func(t *testing.T) {
+		mustExec(t, conn, `INSERT INTO pgshard.databases (name) VALUES ('grouped_a'), ('grouped_b')`)
+		mustExec(t, conn, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key)
+			VALUES ('grouped_a', 'public', 'orders', 'sharded', 'tenant_id'),
+			       ('grouped_a', 'public', 'regions', 'reference', NULL),
+			       ('grouped_b', 'public', 'items', 'sharded', 'tenant_id')`)
+		defer mustExec(t, conn, `DELETE FROM pgshard.tables WHERE database IN ('grouped_a','grouped_b')`)
+		defer mustExec(t, conn, `DELETE FROM pgshard.databases WHERE name IN ('grouped_a','grouped_b')`)
+
+		grouped, err := ListTablesByDatabase(ctx, conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, db := range []string{"grouped_a", "grouped_b"} {
+			one, err := ListTables(ctx, conn, db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(one) == 0 {
+				t.Fatalf("%s: the fixture declared tables but the per-database read found none", db)
+			}
+			if !reflect.DeepEqual(grouped[db], one) {
+				t.Errorf("%s: grouped read %+v, per-database read %+v", db, grouped[db], one)
+			}
+		}
+		// A database with no tables must be absent rather than empty, so a
+		// caller ranging over the map does not invent work for it.
+		if _, ok := grouped["no_such_database"]; ok {
+			t.Error("the grouped read invented an entry for a database with no tables")
+		}
+	})
+
 	t.Run("tables_constraints", func(t *testing.T) {
 		mustExec(t, conn, `INSERT INTO pgshard.databases (name) VALUES ('app')`)
 		_, err := conn.Exec(ctx, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, hash_version)
