@@ -620,7 +620,13 @@ func (a *Applier) prepare(ctx context.Context, m *catalog.DDLMigration, key stri
 		_ = conn.Close(context.WithoutCancel(ctx))
 		return nil, err
 	}
-	if m.Meta.RunAs != "" && key != catalogKey {
+	// The catalog is not exempt. Role statements reach it too, and running
+	// them as the controller gave a client privileges PostgreSQL would have
+	// refused it: a GRANT of membership in a role the client has no ADMIN
+	// option on succeeds when the controller's identity issues it. The
+	// pooled connection resets role on release, so this does not follow the
+	// connection back into the pool.
+	if m.Meta.RunAs != "" {
 		if _, err := conn.Exec(ctx, "SET ROLE "+pgx.Identifier{m.Meta.RunAs}.Sanitize()); err != nil {
 			_ = conn.Close(context.WithoutCancel(ctx))
 			return nil, err

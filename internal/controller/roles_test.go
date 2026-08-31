@@ -149,8 +149,13 @@ func TestApplierFansRoleStatementsToTheCatalogLast(t *testing.T) {
 	if got := states(m); got != "0=applied/1 1=applied/1 2=applied/1 catalog=applied/1" || m.State != catalog.MigrationComplete {
 		t.Fatalf("%s %s", m.State, got)
 	}
-	if got := strings.Join(cat.statements(99), ";"); strings.Contains(got, "SET ROLE") || !strings.Contains(got, "create role r") {
-		t.Fatalf("catalog ran %q: no SET ROLE, the statement itself", got)
+	// The catalog runs the statement as the client, exactly as a shard
+	// does. Running it as the controller let a client reach privileges
+	// PostgreSQL would have refused it -- a membership GRANT it holds no
+	// ADMIN option for succeeds when the control plane's identity issues
+	// it.
+	if got := strings.Join(cat.statements(99), ";"); !strings.Contains(got, `SET ROLE "app"`) || !strings.Contains(got, "create role r") {
+		t.Fatalf("catalog ran %q: want the client's SET ROLE and the statement itself", got)
 	}
 	if g := f.store.get(t, grant); states(g) != "0=applied/1 1=applied/1 2=applied/1" {
 		t.Fatalf("object grants stay on the shards: %s", states(g))
