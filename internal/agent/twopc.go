@@ -62,10 +62,12 @@ func (s *Server) ListPreparedTransactions(ctx context.Context, _ *pgshardv1.List
 // this instance's prepared transactions.
 func (s *Server) ReconcilePreparedTransactions(ctx context.Context, req *pgshardv1.ReconcilePreparedTransactionsRequest) (*pgshardv1.ReconcilePreparedTransactionsResponse, error) {
 	resp := &pgshardv1.ReconcilePreparedTransactionsResponse{Epoch: s.epoch.Current()}
-	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
+	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
+	if err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
+	defer endTerm()
 	resp.Epoch = req.GetEpoch()
 	decisions := make([]twopc.Decision, 0, len(req.GetDecisions()))
 	for _, d := range req.GetDecisions() {
@@ -82,10 +84,12 @@ func (s *Server) ReconcilePreparedTransactions(ctx context.Context, req *pgshard
 // catalog database.
 func (s *Server) SetWriteFence(ctx context.Context, req *pgshardv1.SetWriteFenceRequest) (*pgshardv1.SetWriteFenceResponse, error) {
 	resp := &pgshardv1.SetWriteFenceResponse{Epoch: s.epoch.Current()}
-	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
+	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
+	if err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
+	defer endTerm()
 	resp.Epoch = req.GetEpoch()
 	conn, err := s.inst.ConnectDB(ctx, catalogDatabase)
 	if err != nil {

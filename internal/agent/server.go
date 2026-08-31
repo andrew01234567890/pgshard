@@ -56,9 +56,13 @@ func (s *Server) fence(epoch uint64) error {
 	return s.epoch.Accept(epoch)
 }
 
-// fenceCurrent accepts only the current epoch (same-term operations).
-func (s *Server) fenceCurrent(epoch uint64) error {
-	return s.epoch.RequireCurrent(epoch)
+// fenceCurrent accepts only the current epoch (same-term operations) and
+// returns the context that term's work must run under: it ends when a later
+// epoch is accepted, so an operation admitted by one controller does not go
+// on running for the one that replaced it. The release must be called when
+// the operation finishes.
+func (s *Server) fenceCurrent(ctx context.Context, epoch uint64) (context.Context, func(), error) {
+	return s.epoch.Term(ctx, epoch)
 }
 
 // Status is read-only.
@@ -219,10 +223,12 @@ func (s *Server) Rewind(ctx context.Context, req *pgshardv1.RewindRequest) (*pgs
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	resp := &pgshardv1.RewindResponse{Epoch: s.epoch.Current()}
-	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
+	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
+	if err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
+	defer endTerm()
 	resp.Epoch = req.GetEpoch()
 	ctx, cancel := context.WithTimeout(ctx, s.opTimeout)
 	defer cancel()
@@ -241,10 +247,12 @@ func (s *Server) Reclone(ctx context.Context, req *pgshardv1.RecloneRequest) (*p
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	resp := &pgshardv1.RecloneResponse{Epoch: s.epoch.Current()}
-	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
+	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
+	if err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
+	defer endTerm()
 	resp.Epoch = req.GetEpoch()
 	ctx, cancel := context.WithTimeout(ctx, s.opTimeout)
 	defer cancel()
@@ -260,10 +268,12 @@ func (s *Server) Reload(ctx context.Context, req *pgshardv1.ReloadRequest) (*pgs
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	resp := &pgshardv1.ReloadResponse{Epoch: s.epoch.Current()}
-	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
+	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
+	if err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
+	defer endTerm()
 	resp.Epoch = req.GetEpoch()
 	if err := s.inst.Reload(ctx); err != nil {
 		resp.Error = pgErr(err)
@@ -277,10 +287,12 @@ func (s *Server) Restart(ctx context.Context, req *pgshardv1.RestartRequest) (*p
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	resp := &pgshardv1.RestartResponse{Epoch: s.epoch.Current()}
-	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
+	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
+	if err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
+	defer endTerm()
 	resp.Epoch = req.GetEpoch()
 	mode := ShutdownFast
 	switch req.GetMode() {
@@ -300,12 +312,14 @@ func (s *Server) Restart(ctx context.Context, req *pgshardv1.RestartRequest) (*p
 // CreateRestorePoint fences and creates a named restore point.
 func (s *Server) CreateRestorePoint(ctx context.Context, req *pgshardv1.CreateRestorePointRequest) (*pgshardv1.CreateRestorePointResponse, error) {
 	resp := &pgshardv1.CreateRestorePointResponse{Epoch: s.epoch.Current()}
-	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
+	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
+	if err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
+	defer endTerm()
 	resp.Epoch = req.GetEpoch()
-	err := s.withConn(ctx, func(q querier) error {
+	err = s.withConn(ctx, func(q querier) error {
 		return q.QueryRow(ctx, "SELECT pg_create_restore_point($1) - '0/0'::pg_lsn", req.GetName()).Scan(&resp.Lsn)
 	})
 	resp.Error = pgErr(err)
@@ -315,12 +329,14 @@ func (s *Server) CreateRestorePoint(ctx context.Context, req *pgshardv1.CreateRe
 // CreateSlot fences and creates a physical or logical slot.
 func (s *Server) CreateSlot(ctx context.Context, req *pgshardv1.CreateSlotRequest) (*pgshardv1.CreateSlotResponse, error) {
 	resp := &pgshardv1.CreateSlotResponse{Epoch: s.epoch.Current()}
-	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
+	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
+	if err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
+	defer endTerm()
 	resp.Epoch = req.GetEpoch()
-	err := s.withConn(ctx, func(q querier) error {
+	err = s.withConn(ctx, func(q querier) error {
 		var lsn *uint64
 		var err error
 		switch req.GetKind() {
@@ -347,12 +363,14 @@ func (s *Server) CreateSlot(ctx context.Context, req *pgshardv1.CreateSlotReques
 // DropSlot fences and drops a slot.
 func (s *Server) DropSlot(ctx context.Context, req *pgshardv1.DropSlotRequest) (*pgshardv1.DropSlotResponse, error) {
 	resp := &pgshardv1.DropSlotResponse{Epoch: s.epoch.Current()}
-	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
+	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
+	if err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
+	defer endTerm()
 	resp.Epoch = req.GetEpoch()
-	err := s.withConn(ctx, func(q querier) error {
+	err = s.withConn(ctx, func(q querier) error {
 		_, err := q.Exec(ctx, "SELECT pg_drop_replication_slot($1)", req.GetName())
 		return err
 	})

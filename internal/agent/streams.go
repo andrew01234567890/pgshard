@@ -22,10 +22,12 @@ const StreamPublication = "pgshard_all"
 // slot is reused when its two_phase setting matches the request.
 func (s *Server) CreateStreamSlot(ctx context.Context, req *pgshardv1.CreateStreamSlotRequest) (*pgshardv1.CreateStreamSlotResponse, error) {
 	resp := &pgshardv1.CreateStreamSlotResponse{Epoch: s.epoch.Current()}
-	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
+	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
+	if err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
+	defer endTerm()
 	resp.Epoch = req.GetEpoch()
 	if !catalog.ValidStreamName(req.GetStream()) {
 		resp.Error = &pgshardv1.Error{Sqlstate: "22023", Message: fmt.Sprintf("invalid stream name %q", req.GetStream())}
@@ -36,7 +38,7 @@ func (s *Server) CreateStreamSlot(ctx context.Context, req *pgshardv1.CreateStre
 		return resp, nil
 	}
 	resp.Slot = catalog.StreamSlotName(req.GetStream(), s.inst.cfg.Shard)
-	err := s.withDB(ctx, req.GetDatabase(), func(q querier) error {
+	err = s.withDB(ctx, req.GetDatabase(), func(q querier) error {
 		if err := ensurePublication(ctx, q); err != nil {
 			return err
 		}
@@ -87,17 +89,19 @@ func ensurePublication(ctx context.Context, q querier) error {
 // an error.
 func (s *Server) DropStreamSlot(ctx context.Context, req *pgshardv1.DropStreamSlotRequest) (*pgshardv1.DropStreamSlotResponse, error) {
 	resp := &pgshardv1.DropStreamSlotResponse{Epoch: s.epoch.Current()}
-	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
+	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
+	if err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
+	defer endTerm()
 	resp.Epoch = req.GetEpoch()
 	if !catalog.ValidStreamName(req.GetStream()) {
 		resp.Error = &pgshardv1.Error{Sqlstate: "22023", Message: fmt.Sprintf("invalid stream name %q", req.GetStream())}
 		return resp, nil
 	}
 	slot := catalog.StreamSlotName(req.GetStream(), s.inst.cfg.Shard)
-	err := s.withConn(ctx, func(q querier) error {
+	err = s.withConn(ctx, func(q querier) error {
 		_, err := q.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1`, slot)
 		return err
 	})
@@ -111,12 +115,14 @@ func (s *Server) DropStreamSlot(ctx context.Context, req *pgshardv1.DropStreamSl
 // so such entries are dropped rather than applied.
 func (s *Server) SetSynchronizedStandbySlots(ctx context.Context, req *pgshardv1.SetSynchronizedStandbySlotsRequest) (*pgshardv1.SetSynchronizedStandbySlotsResponse, error) {
 	resp := &pgshardv1.SetSynchronizedStandbySlotsResponse{Epoch: s.epoch.Current()}
-	if err := s.fenceCurrent(req.GetEpoch()); err != nil {
+	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
+	if err != nil {
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
+	defer endTerm()
 	resp.Epoch = req.GetEpoch()
-	err := s.withConn(ctx, func(q querier) error {
+	err = s.withConn(ctx, func(q querier) error {
 		rows, err := q.Query(ctx, `SELECT slot_name FROM pg_replication_slots
 			WHERE slot_type = 'physical' AND active AND slot_name = ANY($1) ORDER BY slot_name`, req.GetSlots())
 		if err != nil {
