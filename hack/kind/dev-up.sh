@@ -22,8 +22,11 @@ echo "==> kind cluster"
 
 echo "==> PostgreSQL $major image"
 # The PostgreSQL image is a source build and takes a long time, so an image
-# already present is reused; delete it to rebuild.
-if ! docker image inspect "$pg_img" >/dev/null 2>&1; then
+# already present is reused. The agent and the pooler ship inside it, so a
+# branch that changes either -- including the flags the operator passes them
+# -- needs PG_REBUILD=1 or the sidecars will be the ones from the last build
+# and will reject arguments they have never heard of.
+if [ "${PG_REBUILD:-0}" = "1" ] || ! docker image inspect "$pg_img" >/dev/null 2>&1; then
   (cd "$root" && docker buildx bake "postgres-${major}")
 fi
 
