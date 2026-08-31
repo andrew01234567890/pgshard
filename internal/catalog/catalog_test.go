@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -1537,6 +1538,43 @@ func runSuite(t *testing.T, img pgImage) {
 		}
 		if !strings.Contains(err.Error(), "9000_added_late") || !strings.Contains(err.Error(), "9001") {
 			t.Errorf("the error must name the file and what it is below: %v", err)
+		}
+	})
+
+	// A workflow's kind and state were free text, so a typo or a controller
+	// the catalog has not been told about wrote a row every reader silently
+	// matched nothing against. And the table had no index but its primary
+	// key while every reader filters on kind and state and orders by
+	// created_at, against a table production never prunes.
+	t.Run("a_workflow_says_what_it_is", func(t *testing.T) {
+		_, err := conn.Exec(ctx, `INSERT INTO pgshard.workflows (id, kind, state) VALUES (gen_random_uuid(), 'reshardd', 'running')`)
+		expectPgError(t, err, "23514", "workflows_kind_is_known")
+		_, err = conn.Exec(ctx, `INSERT INTO pgshard.workflows (id, kind, state) VALUES (gen_random_uuid(), 'reshard', 'runnning')`)
+		expectPgError(t, err, "23514", "workflows_state_is_known")
+
+		// Every reader filters on kind and state and orders by created_at,
+		// against a table production never prunes. The live index is
+		// partial so it carries the work in flight rather than the history.
+		var names []string
+		rows, err := conn.Query(ctx, `SELECT indexname FROM pg_indexes WHERE schemaname = 'pgshard' AND tablename = 'workflows' ORDER BY indexname`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if names, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{"workflows_by_created_at", "workflows_live_by_kind"} {
+			if !slices.Contains(names, want) {
+				t.Errorf("index %s is missing: %v", want, names)
+			}
+		}
+		var partial bool
+		if err := conn.QueryRow(ctx, `SELECT indexdef LIKE '%WHERE%' FROM pg_indexes
+			WHERE schemaname = 'pgshard' AND tablename = 'workflows' AND indexname = 'workflows_live_by_kind'`).Scan(&partial); err != nil {
+			t.Fatal(err)
+		}
+		if !partial {
+			t.Error("the live index must be partial, or it grows with the history it exists to skip")
 		}
 	})
 
