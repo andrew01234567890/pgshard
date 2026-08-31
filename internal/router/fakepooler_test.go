@@ -138,6 +138,9 @@ type script struct {
 	cols []scriptCol
 	rows [][]string
 	err  string
+	// once makes err apply to the first matching statement only, so a test
+	// can script a failure the router is expected to recover from.
+	once bool
 	// code is the SQLSTATE err is reported with; empty means 42P01.
 	code string
 	// delay holds this shard back, so a test can decide which shard
@@ -173,11 +176,18 @@ func (s *fakeStream) scriptedDesc(sc script) error {
 // scripted answers with the canned result; described says whether a
 // portal Describe already sent the RowDescription (as PostgreSQL then omits
 // it on Execute).
-func (s *fakeStream) scripted(sc script, described bool) error {
+func (s *fakeStream) scripted(key string, sc script, described bool) error {
 	if sc.delay > 0 {
 		time.Sleep(sc.delay)
 	}
 	if sc.err != "" {
+		if sc.once {
+			s.f.mu.Lock()
+			used := sc
+			used.err, used.once = "", false
+			s.f.scripts[key] = used
+			s.f.mu.Unlock()
+		}
 		code := sc.code
 		if code == "" {
 			code = "42P01"
@@ -514,7 +524,7 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 	sc, scripted := s.f.scripts[q]
 	s.f.mu.Unlock()
 	if scripted {
-		return true, s.scripted(sc, s.described)
+		return true, s.scripted(q, sc, s.described)
 	}
 	if b.tx == 'E' && q != "rollback" && q != "commit" {
 		return true, s.errorf("25P02", "current transaction is aborted")

@@ -314,7 +314,10 @@ func newBarrierFixture() *barrierFixture {
 	for _, g := range []string{CatalogGroup, "shard0", "shard1"} {
 		f.groups.archived[g] = "000000010000000000000009"
 	}
-	f.b = &Barrier{Store: f.store, Groups: f.groups, Now: now, Poll: time.Millisecond, DrainTimeout: 50 * time.Millisecond, ArchiveTimeout: 50 * time.Millisecond}
+	// FenceSettle is the one real-time wait in a barrier; these tests drive
+	// a fake clock, so they turn it off and TestABarrierLetsTheFenceReach
+	// TheRouters covers it on its own.
+	f.b = &Barrier{Store: f.store, Groups: f.groups, Now: now, Poll: time.Millisecond, DrainTimeout: 50 * time.Millisecond, ArchiveTimeout: 50 * time.Millisecond, FenceSettle: -1}
 	return f
 }
 
@@ -760,5 +763,44 @@ func TestBarrierFailsWhenTheTimelineMovedUnderIt(t *testing.T) {
 	}
 	if f.store.fenced {
 		t.Error("fence left raised")
+	}
+}
+
+// TestABarrierLetsTheFenceReachTheRoutersBeforePausing: the pause is two
+// things raised in sequence, and the routers only see the first. A barrier
+// that pauses the groups the instant it raises the fence can begin and end
+// before a router notices, and every write forwarded meanwhile is refused
+// by PostgreSQL with 25006 instead of being buffered.
+func TestABarrierLetsTheFenceReachTheRoutersBeforePausing(t *testing.T) {
+	f := newBarrierFixture()
+	f.b.FenceSettle = 40 * time.Millisecond
+	start := time.Now()
+	if _, err := f.b.Run(context.Background(), "b"); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took < f.b.FenceSettle {
+		t.Fatalf("the barrier paused the groups after %s, before the fence could reach a router", took)
+	}
+	// The fence is up first and the groups are paused after it.
+	fence := slices.IndexFunc(f.journal, func(e string) bool { return strings.HasPrefix(e, "fence barrier") })
+	pause := slices.Index(f.journal, "pause shard0")
+	if fence < 0 || pause < 0 || fence > pause {
+		t.Fatalf("fence at %d, pause at %d: %v", fence, pause, f.journal)
+	}
+}
+
+// TestACancelledSettleStillReleasesTheFence: the wait is the first thing
+// after the fence goes up, so a barrier cancelled during it is the easiest
+// way to leave a cluster fenced with nothing running to lift it.
+func TestACancelledSettleStillReleasesTheFence(t *testing.T) {
+	f := newBarrierFixture()
+	f.b.FenceSettle = time.Minute
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(10 * time.Millisecond); cancel() }()
+	if _, err := f.b.Run(ctx, "b"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err %v", err)
+	}
+	if f.store.fenced {
+		t.Fatal("fence left raised after a cancelled settle")
 	}
 }

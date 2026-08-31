@@ -358,3 +358,69 @@ func TestAReadOnlyErrorWithNoPauseIsLeftAlone(t *testing.T) {
 		t.Fatalf("refusal %q, want the server's own message", pe.Message)
 	}
 }
+
+// TestWriteFenceRefusesAShardTheTransactionHasNotReached: the exemption
+// that lets a writing transaction finish covers the shards it is already
+// on, whose transactions began before the pause and may still write. A
+// shard it has not reached would open its transaction under the pause, so
+// PostgreSQL would refuse the statement with 25006 -- a code that tells the
+// client nothing about retrying. The answer is pgshard's own, and it comes
+// without the round trip that cannot succeed.
+func TestWriteFenceRefusesAShardTheTransactionHasNotReached(t *testing.T) {
+	h := newTxnHarness(t)
+	ctx := context.Background()
+	a, b := h.twoTenants(t)
+	other := h.shardOf(t, b)
+	conn := h.connect(t, h.dsn())
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 1)", a); err != nil {
+		t.Fatal(err)
+	}
+	h.fenced(true)
+
+	// The shard it is already on still takes writes: that transaction is
+	// older than the pause, and the barrier's drain is waiting for it.
+	if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 2)", a); err != nil {
+		t.Fatalf("a shard the transaction already holds: %v", err)
+	}
+	// A shard it has not reached does not.
+	before := len(h.poolers[other].ran())
+	_, err = tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 3)", b)
+	pe := expectRefusalCode(t, err, codeWriteFence)
+	if !strings.Contains(pe.Message, "write pause") {
+		t.Fatalf("message %q", pe.Message)
+	}
+	if n := len(h.poolers[other].ran()) - before; n != 0 {
+		t.Fatalf("the statement reached the new shard anyway: %v", h.poolers[other].ran()[before:])
+	}
+	_ = tx.Rollback(ctx)
+}
+
+// TestAReadOnlyRefusalOfAnUntouchedTransactionIsRetried: the pause is
+// applied on the shards and the routers learn of it afterwards, so a
+// transaction can always open in between and be refused by PostgreSQL. It
+// has told the client nothing yet, so it is given back and run again once
+// the pause lifts, and the client sees latency rather than an error it
+// could not have avoided.
+func TestAReadOnlyRefusalOfAnUntouchedTransactionIsRetried(t *testing.T) {
+	h := newTxnHarness(t)
+	ctx := context.Background()
+	a, _ := h.twoTenants(t)
+	h.poolers[h.shardOf(t, a)].script("insert into orders (tenant_id, id) values ($1, 1)", script{
+		err: "cannot execute INSERT in a read-only transaction", code: "25006", once: true})
+
+	conn := h.connect(t, h.dsn())
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 1)", a); err != nil {
+		t.Fatalf("the retry did not happen: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+}

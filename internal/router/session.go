@@ -543,7 +543,13 @@ func (e *Executor) guard(op string, run func() error) (err error) {
 // gets PostgreSQL's error for a pause pgshard took, instead of the
 // retryable 57P03 the contract promises, and nothing tells it to retry.
 //
-// Translated only while our own fence is raised. The one imprecision left
+// Translated while our own fence is raised, and for the buffering window
+// after we last saw it: a barrier that is not waiting on anything is
+// milliseconds long, so a statement it refused routinely returns after the
+// pause has already been lifted, and a check that only looks at now would
+// hand the client PostgreSQL's error for a pause that was ours.
+//
+// The one imprecision left
 // is a session that asked for BEGIN READ ONLY during a pause: its write
 // would have been refused either way, and it is told about the pause. A
 // client cannot reach this by setting a GUC -- default_transaction_read_only
@@ -553,7 +559,7 @@ func (e *Executor) asWritePause(err error) error {
 	if err == nil || !errors.As(err, &pe) || pe.Code != pgwire.CodeReadOnlySQLTransaction {
 		return err
 	}
-	if !e.r.writeFenced(nil) {
+	if !e.r.writeFenced(nil) && !e.r.sawWriteFenceRecently() {
 		return err
 	}
 	return writeFenceError(e.r.migrating(), false)
@@ -577,7 +583,7 @@ func (e *Executor) simpleQuery(ctx context.Context, sql string, w pgwire.ResultW
 	}
 	if pl.Class.Write {
 		before := e.currentSnapshot()
-		if err := e.gateWrite(ctx, pl.Tables); err != nil {
+		if err := e.gateWrite(ctx, e.writeTarget(pl), pl.Tables); err != nil {
 			return e.afterBatch(ctx, err)
 		}
 		if e.currentSnapshot() != before {
@@ -747,6 +753,14 @@ func (e *Executor) withFailover(ctx context.Context, w pgwire.ResultWriter, run 
 	}
 	cw := &countingWriter{w: w}
 	err := run(cw)
+	if e.writePauseRetryable(err, cw.wrote) {
+		if rerr := e.reopenAfterWritePause(ctx); rerr != nil {
+			err = rerr
+		} else {
+			e.r.cfg.Logger.Info("retrying statement after the cluster write pause", "session", e.sid, "shard", e.shard)
+			err = run(cw)
+		}
+	}
 	switch decideFailover(isFailover(err), inTxn, cw.wrote, e.r.Buffered(e.shard), e.r.cfg.Buffering.PerShardCap) {
 	case failoverFailTxn:
 		e.dropStream()
@@ -1287,7 +1301,7 @@ func (e *Executor) sync(ctx context.Context) error {
 	for _, item := range executed {
 		if item.class.Write {
 			before := e.currentSnapshot()
-			if err := e.gateWrite(ctx, item.tables); err != nil {
+			if err := e.gateWrite(ctx, target, item.tables); err != nil {
 				e.staged = e.staged[:min(e.stagedMark, len(e.staged))]
 				return e.afterBatch(ctx, err)
 			}
