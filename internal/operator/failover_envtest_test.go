@@ -646,3 +646,44 @@ func TestAPromotedPrimaryWithoutItsLabelIsRepaired(t *testing.T) {
 		t.Fatalf("the label was repaired by promoting again: %v", fa.promotes)
 	}
 }
+
+// TestConvergeRelabelsAPromotedPrimaryThatKeptTheReplicaLabel: failover
+// promotes the candidate and patches its Pod to role=primary afterwards. An
+// operator that exits between the two -- or a Patch that fails -- leaves a
+// shard with a writable primary that no Service selects, because the -rw
+// Service matches on role=primary and nothing wears it. The shard is then
+// unreachable indefinitely, and for the catalog group that is the whole
+// cluster.
+//
+// The other converge cases do not cover it: they act on a designated
+// primary that is still a standby or still finishing its promotion, and
+// this member is neither. It is promoted, healthy, and wearing the wrong
+// label, which is the one state a reconcile has to notice from the label
+// alone.
+func TestConvergeRelabelsAPromotedPrimaryThatKeptTheReplicaLabel(t *testing.T) {
+	r, _, fa, c := healthyCluster(t, "relabel")
+	member := "relabel-shard-0-0"
+
+	// What the interrupted failover leaves behind: the agent reports a
+	// finished promotion, the Pod still says replica.
+	fa.set(podIP(1, 0), AgentStatus{Running: true, Primary: true, Epoch: 1}, nil)
+	var pod corev1.Pod
+	get(t, member, &pod)
+	pod.Labels[LabelRole] = RoleReplica
+	if err := k8sClient.Update(context.Background(), &pod); err != nil {
+		t.Fatal(err)
+	}
+	if got := podRole(t, member); got != RoleReplica {
+		t.Fatalf("setup: role %q, want the stale replica label", got)
+	}
+
+	before := len(fa.promotes)
+	reconcile(t, r, c)
+
+	if got := podRole(t, member); got != RolePrimary {
+		t.Fatalf("a promoted primary kept the replica label, so the -rw Service selects nothing: role %q", got)
+	}
+	if len(fa.promotes) != before {
+		t.Fatalf("relabelling must not re-promote a primary that is already promoted: %v", fa.promotes[before:])
+	}
+}
