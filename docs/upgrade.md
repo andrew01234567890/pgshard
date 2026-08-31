@@ -160,11 +160,15 @@ is scaffolding only — the online strategy is the supported path.
 ## Mixed majors and the router
 
 While old- and new-major groups both serve, the router must parse with the
-grammar of the **lowest still-present major**
-(`pgparser.EffectiveMajor`), so no statement is accepted that an old-major
-group would refuse; the per-set major is `pgshard.shard_sets.pg_major` and
-per-run majors appear on `PgShardCluster.status` (`servingPGMajor`,
-`reshard.pgMajor`, `reshard.retiredPGMajor`). The bound grammar today is
+grammar of the **lowest still-present major** so no statement is accepted
+that an old-major group would refuse. `pgparser.EffectiveMajor` states that
+rule, and nothing calls it yet: the router binds one grammar at build time
+and cannot swap it per statement, so this is the intended behaviour rather
+than today's.
+
+The per-set major is `pgshard.shard_sets.pg_major`, and per-run majors
+appear on `PgShardCluster.status` (`servingPGMajor`, `reshard.pgMajor`,
+`reshard.retiredPGMajor`). The bound grammar today is
 PostgreSQL 18 (`internal/pgparser/pg18`); PG19-only syntax is refused
 until a libpg_query 19 binding lands, at which point the effective major
 flips once every group runs 19.

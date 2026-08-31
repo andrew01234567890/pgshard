@@ -147,12 +147,6 @@ func (t MemberTemplate) SettingsHash() string {
 	return hex.EncodeToString(sum[:8])
 }
 
-// AgentConfig renders the pgshard-agent JSON config for one member given
-// the group's current primary.
-func AgentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary string) *agent.Config {
-	return agentConfig(c, g, member, primary, Template(c, g, nil, nil), false, false)
-}
-
 func agentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary string, tpl MemberTemplate, override, repoReady bool) *agent.Config {
 	role := agent.RoleStandby
 	if member == primary {

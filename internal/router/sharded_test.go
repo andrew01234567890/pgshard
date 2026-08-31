@@ -646,7 +646,7 @@ func TestPreparedStatementReplansOnNewSnapshot(t *testing.T) {
 }
 
 func TestPanicInPlanningIsConfinedToTheSession(t *testing.T) {
-	planner := NewPlanner()
+	planner := newPlanner()
 	planner.before = func(sql string) {
 		if strings.Contains(sql, "boom") {
 			panic("planner exploded on " + sql)

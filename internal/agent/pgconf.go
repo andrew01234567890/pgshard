@@ -31,11 +31,12 @@ func RenderPostgresqlConf(c *Config, standby bool) string {
 	return renderPostgresqlConf(c, standby, false)
 }
 
-// RenderRecoveryConf renders postgresql.conf for the archive recovery that
+// renderRecoveryConf renders postgresql.conf for the archive recovery that
 // follows a restore from c.Restore: WAL comes from the source stanza, the
 // recovery target settings are set, and nothing is archived until the
-// instance is a normal primary again.
-func RenderRecoveryConf(c *Config) string { return renderPostgresqlConf(c, false, true) }
+// instance is a normal primary again. Production reaches it through
+// WriteRecoveryConfig.
+func renderRecoveryConf(c *Config) string { return renderPostgresqlConf(c, false, true) }
 
 // gucName is what PostgreSQL accepts as a setting name: a letter or
 // underscore, then letters, digits, underscores and dots.
