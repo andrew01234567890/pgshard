@@ -244,6 +244,36 @@ func runSuite(t *testing.T, img pgImage) {
 	ctx := context.Background()
 	conn := connect(t, dsn)
 
+	t.Run("stream_rows_match_what_the_controller_accepts", func(t *testing.T) {
+		if err := Migrate(ctx, conn); err != nil {
+			t.Fatal(err)
+		}
+		mustExec(t, conn, `INSERT INTO pgshard.databases (name) VALUES ('streamdb') ON CONFLICT DO NOTHING`)
+		t.Cleanup(func() {
+			mustExec(t, conn, `DELETE FROM pgshard.streams WHERE database = 'streamdb'`)
+			mustExec(t, conn, `DELETE FROM pgshard.databases WHERE name = 'streamdb'`)
+		})
+		mustExec(t, conn, `INSERT INTO pgshard.streams (name, database, state) VALUES ('a_b', 'streamdb', 'creating')`)
+		for _, bad := range []struct{ what, sql string }{
+			{"a name PostgreSQL will not accept as a slot", `INSERT INTO pgshard.streams (name, database, state) VALUES ('a-b', 'streamdb', 'creating')`},
+			{"a name starting with a digit", `INSERT INTO pgshard.streams (name, database, state) VALUES ('1s', 'streamdb', 'creating')`},
+			{"a state nothing produces", `INSERT INTO pgshard.streams (name, database, state) VALUES ('ok_name', 'streamdb', 'running')`},
+			{"no database at all", `INSERT INTO pgshard.streams (name, database, state) VALUES ('ok_name', '', 'creating')`},
+		} {
+			if _, err := conn.Exec(ctx, bad.sql); err == nil {
+				t.Errorf("the catalog stored %s", bad.what)
+			}
+		}
+
+		// The names the table takes are exactly the names the RPC takes.
+		for _, name := range []string{"s", "s_1", "a-b", "1s", "S", "", strings.Repeat("s", 33)} {
+			_, err := conn.Exec(ctx, `INSERT INTO pgshard.streams (name, database, state) VALUES ($1, 'streamdb', 'creating')`, name)
+			if stored := err == nil; stored != ValidStreamName(name) {
+				t.Errorf("stream name %q: catalog stored=%v, ValidStreamName=%v", name, stored, ValidStreamName(name))
+			}
+		}
+	})
+
 	t.Run("router_role_is_least_privilege", func(t *testing.T) {
 		if err := Migrate(ctx, conn); err != nil {
 			t.Fatal(err)
@@ -945,7 +975,22 @@ func runSuite(t *testing.T, img pgImage) {
 
 		_, err = conn.Exec(ctx, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement)
 			VALUES ('app', 'public', 'orders', 'sharded')`)
-		expectPgError(t, err, "23514", "sharded_tables_need_shard_key")
+		expectPgError(t, err, "23514", "tables_shard_key_matches_placement")
+
+		// The controller has always refused these two as well: a sharded
+		// table whose key is empty rather than absent, and a key on a
+		// table that is not sharded at all. Written directly, they used to
+		// be stored and then rejected on every pass for ever.
+		_, err = conn.Exec(ctx, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key)
+			VALUES ('app', 'public', 'orders', 'sharded', '')`)
+		expectPgError(t, err, "23514", "tables_shard_key_matches_placement")
+
+		_, err = conn.Exec(ctx, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key)
+			VALUES ('app', 'public', 'orders', 'reference', 'customer_id')`)
+		expectPgError(t, err, "23514", "tables_shard_key_matches_placement")
+
+		_, err = conn.Exec(ctx, `INSERT INTO pgshard.databases (name, home_shard) VALUES ('negative', -1)`)
+		expectPgError(t, err, "23514", "databases_home_shard_is_a_shard")
 
 		mustExec(t, conn, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key)
 			VALUES ('app', 'public', 'orders', 'sharded', 'customer_id')`)
