@@ -64,6 +64,42 @@ const (
 	stanzaLockRetries = 30
 )
 
+// startStanzaWorker runs ensureStanzaLoop as this instance's only stanza
+// worker, ending any earlier one first.
+//
+// The loop retries a repository that is unreachable, which is the point of
+// it, and an attempt can stay blocked for as long as pgBackRest takes to
+// give up. Startup began one and every successful promotion began another,
+// with no handle on either, so role cycling during repository trouble
+// accumulated loops and the pgBackRest children they track -- and a
+// demotion could not end the attempt that was still going.
+func (in *Instance) startStanzaWorker(ctx context.Context, retry time.Duration) {
+	in.stopStanzaWorker()
+	loopCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	in.stanzaMu.Lock()
+	in.stanzaCancel, in.stanzaDone = cancel, done
+	in.stanzaMu.Unlock()
+	go func() {
+		defer close(done)
+		in.ensureStanzaLoop(loopCtx, retry)
+	}()
+}
+
+// stopStanzaWorker ends the stanza worker and waits for it, so the caller
+// knows no pgBackRest attempt of the old term is still running.
+func (in *Instance) stopStanzaWorker() {
+	in.stanzaMu.Lock()
+	cancel, done := in.stanzaCancel, in.stanzaDone
+	in.stanzaCancel, in.stanzaDone = nil, nil
+	in.stanzaMu.Unlock()
+	if cancel == nil {
+		return
+	}
+	cancel()
+	<-done
+}
+
 // ensureStanzaLoop retries EnsureStanza until it succeeds or ctx ends, so a
 // repository that is unreachable at start does not keep the primary down.
 func (in *Instance) ensureStanzaLoop(ctx context.Context, retry time.Duration) {

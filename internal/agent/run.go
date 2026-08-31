@@ -71,7 +71,7 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	go inst.ensureStanzaLoop(ctx, stanzaRetry)
+	inst.startStanzaWorker(ctx, stanzaRetry)
 
 	reg := metrics.NewRegistry("agent")
 	am := metrics.NewAgent(reg,
