@@ -40,7 +40,7 @@ spec:
   internalTLS:
     insecure: true
   postgresql:
-    major: 18            # 18 or 19
+    major: 18            # 18, or 19 -- which is Beta 3, not for production
     profile: oltp        # oltp | mixed | analytics (drives automatic tuning)
   shards: 2
   replicasPerShard: 3    # minimum 3 for HA
