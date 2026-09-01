@@ -14,10 +14,10 @@ Print columns: Shards, Ready, Age.
 | `spec.postgresql.profile` | enum | `oltp` (default), `mixed`, `analytics` |
 | `spec.postgresql.parameters` | map[string]string | every key must be a PostgreSQL setting name (`^[A-Za-z_][A-Za-z0-9_.]*$`) — the agent writes the name as it stands, so one carrying a newline would write a second setting and defeat the rules below; must not contain the settings pgshard owns (`fsync`, `full_page_writes`, `wal_level`, `max_prepared_transactions`, `ssl`, `synchronous_commit`) or the ones that run a command in the member pod (`archive_command`, `restore_command`, `archive_cleanup_command`, `recovery_end_command`) (CEL, message names the key) |
 | `spec.resources` | corev1.ResourceRequirements | per PostgreSQL pod |
-| `spec.catalog.replicas` | int | default 3, min 1; CEL: `>= 3` ("catalog.replicas must be >= 3 for HA") |
+| `spec.catalog.replicas` | int | default 3, min 1; CEL: `>= 3` ("catalog.replicas must be >= 3 for HA"), and **cannot be decreased**, for the same reason as `replicasPerShard` |
 | `spec.catalog.storage.size` / `.storageClassName` | Quantity / *string | size required |
 | `spec.shards` | *int | optional, min 1 |
-| `spec.replicasPerShard` | int | default 3, min 1; CEL: `>= 3` ("replicasPerShard must be >= 3") |
+| `spec.replicasPerShard` | int | default 3, min 1; CEL: `>= 3` ("replicasPerShard must be >= 3"), and **cannot be decreased** — growing a group is reconciled, but nothing drains a removed member, switches away from one that is primary, or removes its pod and volume, so a decrease would leave members running that the generated configuration no longer describes |
 | `spec.unsafeSingleReplica` | bool | relaxes both `>= 3` rules so test/dev clusters can run one member per group; single-member groups have no synchronous standby and no failover candidate — unsupported for production (the operator logs a warning) |
 | `spec.storage.size` / `.storageClassName` | Quantity / *string | size required |
 | `spec.durability.synchronousCommit` | enum | `on` (default), `remote_apply` |
