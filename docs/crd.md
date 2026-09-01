@@ -29,6 +29,12 @@ Print columns: Shards, Ready, Age.
 | `spec.internalTLS.insecure` | bool | runs the pooler port as plaintext gRPC; unsupported outside development. CEL: one of `secretRef` or `insecure` is required, and they are mutually exclusive |
 | `spec.admin.enabled` | *bool | default true |
 | `spec.admin.insecureNoAuth` | bool | default false; serves the admin UI without a credential (development only, see [admin.md](admin.md#security)) |
+| `spec.placement.spreadNodes` | enum | `preferred` (default), `required`, `none`. Keeps one group's members off each other's nodes. `preferred` is the default because a required rule leaves the third replica of a three-replica cluster Pending for ever on a two-node cluster, and a member that never starts is the same illusion of three replicas arrived at differently |
+| `spec.placement.spreadZones` | enum | `preferred` (default), `required`, `none`. Even to within one across `zoneKey`. Nodes without the label all count as one domain, so a required rule there refuses everywhere rather than balancing |
+| `spec.placement.zoneKey` | string | default `topology.kubernetes.io/zone` |
+| `spec.placement.nodeSelector` | map[string]string | restricts every pod of the cluster |
+| `spec.placement.tolerations` | []corev1.Toleration | added to every pod of the cluster |
+| `spec.placement.affinity` | *corev1.Affinity | replaces the generated affinity entirely, including `nodeSelectorTerms` and any pod anti-affinity; `spreadNodes` and `spreadZones` no longer apply. A generated rule ANDed with an explicit one is how a pod becomes unschedulable for a reason nobody wrote down |
 | `spec.backup.policyRef` | string | name of a PgShardBackupPolicy |
 | `spec.networkPolicy.enabled` | bool | default false; renders `<cluster>-members` (see [operator.md](operator.md#network-policy)) |
 | `spec.networkPolicy.clients` | []networkingv1.NetworkPolicyPeer | peers admitted to 5432/9090/9091 besides the cluster's own pods; CEL: non-empty while `enabled` ("networkPolicy.clients must name the control plane") |
@@ -38,7 +44,10 @@ Print columns: Shards, Ready, Age.
 | `spec.upgrade.maxParallelGroups` | int | default 1, min 1 |
 
 Status: `conditions` (types Ready, Progressing, Degraded, PrimaryHealthy, ReplicationHealthy,
-Fenced, BackupHealthy, Resharding, ServingWrites, RouterReady, TuningApplied), `observedGeneration`,
+Fenced, BackupHealthy, Resharding, ServingWrites, RouterReady, TuningApplied,
+TopologyDegraded — True when a group's members share a node, so the cluster has
+fewer failure domains than replicas; it is what makes the default preferred
+spread honest), `observedGeneration`,
 `shardMapGeneration`, `shards[]{id, rangeStart, rangeEnd, primary, epoch, members[]{name, role, ready, replayLagBytes}}`,
 `effectiveShards` (shard count of the serving catalog shard set), `reshard{name, shardSet, generation, shards, phase}`
 (the run in flight), `placementWorkflows[]{workflowId, table, from, to, state, phase, message, pauseMs}`

@@ -215,6 +215,57 @@ type UpgradeSpec struct {
 	MaxParallelGroups int `json:"maxParallelGroups,omitempty"`
 }
 
+// PlacementSpec decides where a cluster's pods may run.
+//
+// Replica counts alone promise nothing: without this, Kubernetes was free
+// to put a primary and both of its synchronous standbys on one node, so a
+// three-replica cluster could lose every failover candidate to one machine
+// going away. A PodDisruptionBudget does not help -- it covers voluntary
+// eviction, and a node failure is not voluntary.
+type PlacementSpec struct {
+	// SpreadNodes keeps the members of one group off each other's nodes.
+	//
+	// "preferred" is the default rather than "required" on purpose. A
+	// required rule leaves the third replica of a three-replica cluster
+	// Pending for ever on a two-node cluster, and a member that never
+	// starts is a worse failure than one sharing a node -- it is the same
+	// illusion of three replicas, arrived at differently. Whichever is
+	// chosen, TopologyDegraded reports what the scheduler actually did.
+	// +kubebuilder:validation:Enum=preferred;required;none
+	// +kubebuilder:default=preferred
+	// +optional
+	SpreadNodes string `json:"spreadNodes,omitempty"`
+	// SpreadZones spreads the members of one group across the values of
+	// ZoneKey, evenly to within one. Zone labels are absent on many
+	// clusters, and a required rule there is unschedulable rather than
+	// unbalanced, so this defaults to preferred as well.
+	// +kubebuilder:validation:Enum=preferred;required;none
+	// +kubebuilder:default=preferred
+	// +optional
+	SpreadZones string `json:"spreadZones,omitempty"`
+	// ZoneKey is the node label that names a failure domain.
+	// +kubebuilder:default="topology.kubernetes.io/zone"
+	// +optional
+	ZoneKey string `json:"zoneKey,omitempty"`
+	// NodeSelector restricts every pod of the cluster to matching nodes.
+	// +optional
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+	// Tolerations are added to every pod of the cluster.
+	// +optional
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
+	// Affinity replaces the generated affinity entirely. It is the escape
+	// hatch for a topology this spec cannot describe; set it and
+	// SpreadNodes and SpreadZones no longer apply.
+	// +optional
+	Affinity *corev1.Affinity `json:"affinity,omitempty"`
+}
+
+// ConditionTopologyDegraded is True when the members of a group ended up
+// sharing a node, so the cluster has fewer real failure domains than
+// replicas. It is what makes a preferred spread honest: the scheduler is
+// allowed to co-locate, and the cluster says when it did.
+const ConditionTopologyDegraded = "TopologyDegraded"
+
 // PgShardClusterSpec is the desired state of a PgShardCluster.
 // +kubebuilder:validation:XValidation:rule="self.replicasPerShard >= 3 || (has(self.unsafeSingleReplica) && self.unsafeSingleReplica)",message="replicasPerShard must be >= 3"
 // +kubebuilder:validation:XValidation:rule="self.catalog.replicas >= 3 || (has(self.unsafeSingleReplica) && self.unsafeSingleReplica)",message="catalog.replicas must be >= 3 for HA"
@@ -246,6 +297,9 @@ type PgShardClusterSpec struct {
 	// +kubebuilder:default={}
 	// +optional
 	Admin AdminSpec `json:"admin,omitempty"`
+	// +kubebuilder:default={}
+	// +optional
+	Placement PlacementSpec `json:"placement,omitempty"`
 	// +optional
 	Backup BackupSpec `json:"backup,omitempty"`
 	// +kubebuilder:default={}
