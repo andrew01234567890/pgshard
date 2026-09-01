@@ -112,6 +112,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	scatterMaxShards := fs.Int("scatter-max-shards", 0, "most shards one SELECT may fan out to (0 = all)")
 	scatterMaxStreams := fs.Int("scatter-max-streams", 4096, "shard streams open for multi-shard reads across this router")
 	scatterMaxWait := fs.Duration("scatter-max-wait", 30*time.Second, "longest a multi-shard read waits for stream capacity before 53300; negative waits for ever")
+	crossShardLockTimeout := fs.Duration("cross-shard-lock-timeout", router.DefaultCrossShardLockTimeout, "bound a lock wait once a transaction spans shards; no shard's deadlock detector can see a cycle that crosses them. Negative waits for ever")
 	vstreamListen := fs.String("vstream-listen", "", "gRPC address for the VStream change-stream service (empty disables)")
 	controllerAddr := fs.String("controller", "", "controller gRPC endpoint used to create and drop streams (same credentials as poolers)")
 	if err := fs.Parse(args); err != nil {
@@ -221,17 +222,18 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	}
 	poolerClients := router.NewPoolers(poolers, w.Current, creds)
 	rt, err := router.New(router.Config{
-		Snapshot:    w.Current,
-		Poolers:     poolerClients,
-		Logger:      logger,
-		Peers:       peersOrNil(forwarder),
-		Buffering:   router.Buffering{Window: *bufferWindow, TransportWindow: *bufferTransportWindow, PerShardCap: *bufferCap, Changes: w.Subscribe},
-		Scatter:     router.ScatterConfig{MaxShards: *scatterMaxShards, MaxStreams: *scatterMaxStreams, MaxWait: *scatterMaxWait},
-		Decisions:   &router.PGDecisionLog{Pool: pool},
-		Sequences:   router.NewSequenceAllocator(&router.PGBlockSource{Pool: pool}),
-		Migrations:  &router.PGMigrationQueue{Pool: pool},
-		RoleLimits:  roles,
-		MaxSessions: *maxSessions,
+		Snapshot:              w.Current,
+		Poolers:               poolerClients,
+		Logger:                logger,
+		Peers:                 peersOrNil(forwarder),
+		Buffering:             router.Buffering{Window: *bufferWindow, TransportWindow: *bufferTransportWindow, PerShardCap: *bufferCap, Changes: w.Subscribe},
+		Scatter:               router.ScatterConfig{MaxShards: *scatterMaxShards, MaxStreams: *scatterMaxStreams, MaxWait: *scatterMaxWait},
+		CrossShardLockTimeout: *crossShardLockTimeout,
+		Decisions:             &router.PGDecisionLog{Pool: pool},
+		Sequences:             router.NewSequenceAllocator(&router.PGBlockSource{Pool: pool}),
+		Migrations:            &router.PGMigrationQueue{Pool: pool},
+		RoleLimits:            roles,
+		MaxSessions:           *maxSessions,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
