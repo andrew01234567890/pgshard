@@ -59,12 +59,23 @@ transactions with no decision row are rolled back. See the
 
 ## Retry guidance
 
+Retry on the **exact** SQLSTATE. pgx, JDBC and psycopg retry loops test for
+`40001` by value, so a safe retry reported under any other code is a retry
+that will not happen.
+
 | Error | Client action |
 |---|---|
-| `40001` shard failover | retry the whole transaction |
+| `40001` shard failover | retry the whole transaction — nothing was written |
+| `40001` resolver abort | retry the whole transaction — no participant committed. `DETAIL` distinguishes it from a serialization failure |
 | `57P03` write pause (barrier) | retry after a moment |
-| `08007` in doubt | do not retry blindly; the outcome is decided by the resolver — check your data or use an idempotency key |
-| any other `COMMIT` error | the transaction rolled back everywhere; safe to retry |
+| `08007` in doubt | **do not retry blindly** — the outcome is decided by the resolver; check your data or use an idempotency key |
+| any other `COMMIT` error | not known to be safe. Do not retry automatically |
+
+The last row used to say any other `COMMIT` error had rolled back everywhere
+and was safe to retry. That is the more dangerous of the two mistakes a
+client can make here: `08007` means the original transaction may still
+commit, and a blanket retry policy duplicates it. Every outcome that *is*
+safe to retry is named above.
 
 Metrics: `pgshard_router_in_doubt_transactions_total` on the router's
 `/metrics` endpoint.
