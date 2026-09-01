@@ -546,7 +546,7 @@ func (c *Copier) drive(ctx context.Context, wf *copyWorkflow) (bool, error) {
 	if wf.copy.Paused {
 		msg += " (paused: source standby lag over watermark)"
 	}
-	if wf.stage != StageCatchUpDone && progress.CaughtUp(c.lagBytes()) {
+	if readyToFinishCopy(wf.stage, progress, c.lagBytes(), wf.copy.Paused) {
 		stage = StageCatchUpDone
 		advanced = true
 		msg = fmt.Sprintf("caught up: %d tables ready, lag %d bytes", progress.TablesReady, progress.LagBytes)
@@ -563,6 +563,21 @@ func (c *Copier) drive(ctx context.Context, wf *copyWorkflow) (bool, error) {
 		c.logger().Info("reshard copy progress", "workflow", wf.id, "state", msg)
 	}
 	return advanced, c.save(ctx, wf, stage, msg)
+}
+
+// readyToFinishCopy reports whether the copy may leave the copying stage.
+//
+// Not while throttled. The progress it is given was read before throttle
+// ran on the same pass, so a pass that finds the source's standby lag over
+// the watermark disables every subscription and would still promote the
+// workflow on the observation taken beforehand -- and awaiting_switch_writes
+// is not a copy stage, so throttle never runs again to undo it. A transient
+// lag spike arriving in that window stranded an otherwise healthy reshard
+// until somebody repaired the catalog and the subscriptions by hand.
+//
+// Staying in the copy stage costs a pass. Leaving it costs an operator.
+func readyToFinishCopy(stage string, progress CopyProgress, lagBytes int64, paused bool) bool {
+	return stage != StageCatchUpDone && progress.CaughtUp(lagBytes) && !paused
 }
 
 func targetKey(id int32) string { return fmt.Sprint(id) }
