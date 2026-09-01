@@ -126,3 +126,33 @@ SELECT * FROM pgshard.shard_map_generation;
 
 Desired-state edits bump `desired_generation`; the controller validates
 them and publishes the effective state, which routers follow live.
+
+## Editing safely when something else may be editing too
+
+`desired_generation` is stamped by a `BEFORE` trigger on every insert and
+update, from one cluster-wide sequence. Because the stamp happens on the
+new row, the value a statement reads is the value of the row it is about to
+replace -- so it can be used as an expected-version predicate:
+
+```sql
+-- read the row and its generation
+SELECT placement, shard_key, desired_generation FROM pgshard.tables
+ WHERE database = 'app' AND schema_name = 'public' AND table_name = 'orders';
+
+-- write it back only if nothing else has changed it since
+UPDATE pgshard.tables SET shard_key = 'customer_id'
+ WHERE database = 'app' AND schema_name = 'public' AND table_name = 'orders'
+   AND desired_generation = 41;    -- the value just read
+```
+
+If the update reports zero rows, someone else changed the row first: re-read
+and decide again rather than retrying blindly. A shard-key change starts a
+re-key workflow, so a lost update here is not a lost edit -- it is an
+unintended workflow.
+
+This is a convention, not an enforcement. Raw `UPDATE` without the predicate
+still succeeds, and `pgshard_admin` holds direct DML on every desired-state
+table. **Automation should always carry the predicate**; two processes
+working from stale observations can otherwise silently overwrite each
+other's topology. Guarded mutation procedures that require the expected
+generation and refuse on mismatch are tracked separately.
