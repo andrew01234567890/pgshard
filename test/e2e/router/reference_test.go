@@ -72,19 +72,54 @@ func (s *shardedStack) declareReferenceAndSequences(tb testing.TB) {
 
 // awaitReference waits until the router knows regions as a reference table
 // (a volatile write is then refused by the router itself).
+//
+// The probe is a write, and until the router has learned the placement
+// nothing refuses it: every poll before the last one inserts a row for
+// real. How many of those there are is a race between the catalog
+// reaching the router and this loop, so on a loaded runner the table
+// starts out holding rows a test that counts them never wrote. The probe
+// cleans up after itself for that reason.
 func (s *shardedStack) awaitReference(tb testing.TB, conn *pgx.Conn) {
 	tb.Helper()
 	ctx := context.Background()
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		_, err := conn.Exec(ctx, "insert into regions (id, name) values (0, now()::text)", pgx.QueryExecModeSimpleProtocol)
+		// The mode has to be the first argument pgx sees, so the id is in
+		// the statement rather than a parameter.
+		_, err := conn.Exec(ctx, fmt.Sprintf("insert into regions (id, name) values (%d, now()::text)", probeID), pgx.QueryExecModeSimpleProtocol)
 		if sqlstate(err) == "0A000" && strings.Contains(err.Error(), "cannot call now()") {
+			// Straight to each shard, not through the router: the landed
+			// probes were routed by hash before the placement was known,
+			// so they are spread, and one subtest arms the router to die
+			// on its next multi-shard write -- which a delete through it
+			// would be, killing the router before the test's own.
+			s.clearProbeRows(tb)
 			return
 		}
 		if time.Now().After(deadline) {
 			tb.Fatalf("router never learned the reference placement (last: %v)\nrouter log:\n%s", err, s.routerLog.String())
 		}
 		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// probeID is the row awaitReference writes while it waits. No test uses it
+// for anything else, so a leftover is always the probe's.
+const probeID = 0
+
+func (s *shardedStack) clearProbeRows(tb testing.TB) {
+	tb.Helper()
+	ctx := context.Background()
+	for shard := 0; shard < 2; shard++ {
+		conn, err := pgx.Connect(ctx, s.appDSN(shard))
+		if err != nil {
+			tb.Fatal(err)
+		}
+		_, err = conn.Exec(ctx, "delete from regions where id = $1", probeID)
+		_ = conn.Close(ctx)
+		if err != nil {
+			tb.Fatalf("clearing the reference probe rows on shard %d: %v", shard, err)
+		}
 	}
 }
 
