@@ -17,6 +17,11 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 )
 
+// betaImage is what a test naming PostgreSQL 19 says it means; the CRD
+// refuses the major without one so a beta is never deployed by picking
+// what looks like an ordinary supported version.
+const betaImage = "ghcr.io/andrew01234567890/pgshard-postgres:19beta3"
+
 func (f *fakeProber) setShardSetMajor(name string, major int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -41,7 +46,9 @@ func startCatalogUpgrade(t *testing.T, r *ClusterReconciler, fp *fakeProber, c *
 	bringUp(t, r, fp, c)
 	fp.setShardSetMajor(catalog.DefaultShardSet, 19)
 	base := c.DeepCopy()
-	c.Spec.PostgreSQL.Major = 19
+	// 19 is a beta, so the CRD asks the request to name the image it
+	// means. A test upgrading to it is exactly such a request.
+	c.Spec.PostgreSQL.Major, c.Spec.PostgreSQL.Image = 19, betaImage
 	if err := k8sClient.Patch(context.Background(), c, client.MergeFrom(base)); err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +359,7 @@ func TestUpgradeProvisioningHonorsMaxParallelGroups(t *testing.T) {
 	fp.setShardSetMajor(catalog.DefaultShardSet, 18)
 	base = getCluster(t, c.Name).DeepCopy()
 	cur := base.DeepCopy()
-	cur.Spec.PostgreSQL.Major = 19
+	cur.Spec.PostgreSQL.Major, cur.Spec.PostgreSQL.Image = 19, betaImage
 	if err := k8sClient.Patch(context.Background(), cur, client.MergeFrom(base)); err != nil {
 		t.Fatal(err)
 	}

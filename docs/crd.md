@@ -9,7 +9,7 @@ Print columns: Shards, Ready, Age.
 
 | Field | Type | Default / constraint |
 |---|---|---|
-| `spec.postgresql.major` | int | required; `18` or `19`. **`19` is PostgreSQL 19 Beta 3**, and the `pgshard-postgres:19` tag follows the beta, not a release: PostgreSQL says beta releases are not intended for production and may contain serious bugs. Pin `spec.postgresql.image` to a `19betaN` tag if you want the channel to stop moving. |
+| `spec.postgresql.major` | int | required; `18` or `19`. **`19` is PostgreSQL 19 Beta 3**, and the `pgshard-postgres:19` tag follows the beta, not a release: PostgreSQL says beta releases are not intended for production and may contain serious bugs. CEL therefore **refuses `major: 19` unless `spec.postgresql.image` is set** — naming the image is how the choice is made deliberately rather than by picking what looks like an ordinary supported version. Any image satisfies it; pin a `19betaN` tag if you also want the channel to stop moving. |
 | `spec.postgresql.image` | string | optional override |
 | `spec.postgresql.profile` | enum | `oltp` (default), `mixed`, `analytics` |
 | `spec.postgresql.parameters` | map[string]string | every key must be a PostgreSQL setting name (`^[A-Za-z_][A-Za-z0-9_.]*$`) — the agent writes the name as it stands, so one carrying a newline would write a second setting and defeat the rules below; must not contain the settings pgshard owns (`fsync`, `full_page_writes`, `wal_level`, `max_prepared_transactions`, `ssl`, `synchronous_commit`) or the ones that run a command in the member pod (`archive_command`, `restore_command`, `archive_cleanup_command`, `recovery_end_command`) (CEL, message names the key) |

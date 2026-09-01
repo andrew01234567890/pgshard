@@ -35,6 +35,15 @@ const (
 )
 
 // PostgreSQLSpec selects the PostgreSQL build and its base configuration.
+//
+// A prerelease major has to be asked for by name. PostgreSQL 19 is Beta 3,
+// which upstream says is not intended for production and may contain
+// serious bugs, and `major: 19` on its own reads like any other supported
+// choice while resolving to the moving pgshard-postgres:19 tag. Naming the
+// image is what turns that into a decision somebody made: it is the same
+// opt-in whichever image is named, since what is being asked for is the
+// acknowledgement, not a particular tag.
+// +kubebuilder:validation:XValidation:rule="self.major != 19 || has(self.image)",message="PostgreSQL 19 is a beta and is not intended for production: set postgresql.image to the 19 image you mean (for example ghcr.io/andrew01234567890/pgshard-postgres:19beta3) to say so deliberately"
 type PostgreSQLSpec struct {
 	// +kubebuilder:validation:Enum=18;19
 	Major int `json:"major"`
