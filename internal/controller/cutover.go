@@ -180,7 +180,14 @@ type VerifyReport struct {
 	Tables     int      `json:"tables"`
 	Rows       int64    `json:"rows"`
 	Mismatches []string `json:"mismatches,omitempty"`
-	CheckedAt  time.Time
+	// Tagged with the name it already had. Without a tag this field
+	// serialised as "CheckedAt" among snake_case siblings, and the admin
+	// had to mirror that accident to read it -- an odd-looking tag with
+	// nothing to say why. Rows exist carrying the key, so it is kept and
+	// made deliberate rather than changed; renaming it belongs with the
+	// shared workflow model in PGS-331, which is also what would stop the
+	// next field doing this.
+	CheckedAt time.Time `json:"CheckedAt"`
 }
 
 // cutoverOps are the side effects of the switch, one per step. The

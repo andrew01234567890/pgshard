@@ -345,10 +345,13 @@ type reshardStatus struct {
 		FenceMS    int64      `json:"fence_ms"`
 		Aborts     []string   `json:"aborts"`
 		Verify     *struct {
-			Tables     int       `json:"tables"`
-			Rows       int64     `json:"rows"`
-			Mismatches []string  `json:"mismatches"`
-			CheckedAt  time.Time `json:"CheckedAt"`
+			Tables     int      `json:"tables"`
+			Rows       int64    `json:"rows"`
+			Mismatches []string `json:"mismatches"`
+			// Capitalised in the stored JSON; see VerifyReport in the
+			// controller, where the key is now declared rather than
+			// inherited from the field name.
+			CheckedAt time.Time `json:"CheckedAt"`
 		} `json:"verify"`
 	} `json:"cutover"`
 }

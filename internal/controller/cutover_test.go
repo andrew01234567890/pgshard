@@ -2,9 +2,11 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -869,4 +871,42 @@ func TestAStalledPostJournalStepSaysSoInTheCatalog(t *testing.T) {
 	if h.wf.cutover.StepRetries != 0 {
 		t.Fatalf("retries = %d after the step advanced", h.wf.cutover.StepRetries)
 	}
+}
+
+// TestTheVerifyReportKeepsItsStoredKey: CheckedAt had no JSON tag, so it
+// serialised under its Go field name among snake_case siblings and the
+// admin had to mirror that accident to read it. Rows exist carrying the
+// key, so the tag declares what is already stored rather than changing
+// it -- and this test is what would fail if someone tidied the casing
+// without migrating them.
+func TestTheVerifyReportKeepsItsStoredKey(t *testing.T) {
+	when := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	b, err := json.Marshal(VerifyReport{Tables: 2, Rows: 64, CheckedAt: when})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := raw["CheckedAt"]; !ok {
+		t.Fatalf("stored keys %v: rows exist with CheckedAt, and the admin reads that name", keysOf(raw))
+	}
+	// And it still reads back, which a renamed key would not from an old row.
+	var back VerifyReport
+	if err := json.Unmarshal([]byte(`{"tables":2,"rows":64,"CheckedAt":"2026-09-01T12:00:00Z"}`), &back); err != nil {
+		t.Fatal(err)
+	}
+	if !back.CheckedAt.Equal(when) {
+		t.Fatalf("CheckedAt read back as %v, want %v", back.CheckedAt, when)
+	}
+}
+
+func keysOf(m map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
