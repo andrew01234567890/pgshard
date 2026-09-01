@@ -11,28 +11,28 @@ import (
 
 // options are the resolved per-Stream settings.
 type options struct {
-	twoPhase      bool
-	stopOnReshard bool
-	heartbeat     time.Duration
-	alignSkew     bool
-	skew          time.Duration
-	alignTimeout  time.Duration
-	copy          bool
-	copyBatch     uint32
+	twoPhase       bool
+	stopOnReshard  bool
+	heartbeat      time.Duration
+	wallClockAlign bool
+	skew           time.Duration
+	alignTimeout   time.Duration
+	copy           bool
+	copyBatch      uint32
 }
 
 func resolveOptions(o *pgshardv1.VStreamOptions) options {
-	out := options{twoPhase: o.GetTwoPhase(), stopOnReshard: o.GetStopOnReshard(), alignSkew: o.GetAlignSkew(),
+	out := options{twoPhase: o.GetTwoPhase(), stopOnReshard: o.GetStopOnReshard(), wallClockAlign: o.GetBestEffortWallClockAlignment(),
 		heartbeat: 5 * time.Second, skew: time.Second, alignTimeout: 10 * time.Second,
 		copy: o.GetStartFrom() == pgshardv1.StartFrom_START_FROM_COPY, copyBatch: o.GetCopyBatchRows()}
 	if o.GetHeartbeatIntervalMs() > 0 {
 		out.heartbeat = time.Duration(o.GetHeartbeatIntervalMs()) * time.Millisecond
 	}
-	if o.GetAlignSkewMs() > 0 {
-		out.skew = time.Duration(o.GetAlignSkewMs()) * time.Millisecond
+	if o.GetWallClockLeadMs() > 0 {
+		out.skew = time.Duration(o.GetWallClockLeadMs()) * time.Millisecond
 	}
-	if o.GetAlignTimeoutMs() > 0 {
-		out.alignTimeout = time.Duration(o.GetAlignTimeoutMs()) * time.Millisecond
+	if o.GetWallClockHoldMs() > 0 {
+		out.alignTimeout = time.Duration(o.GetWallClockHoldMs()) * time.Millisecond
 	}
 	return out
 }
@@ -210,17 +210,22 @@ func (m *merger) fill() {
 	}
 }
 
-// choose picks the next unit. Without skew alignment the shards are served
+// choose picks the next unit. Without alignment the shards are served
 // round robin. With it, a transaction whose commit timestamp runs ahead of
-// every other shard's last commit by more than the allowed skew is held
-// back, for at most the alignment timeout; among eligible transactions the
+// every other shard's last commit by more than the allowed lead is held
+// back, for at most the hold timeout; among eligible transactions the
 // oldest goes first. The returned duration is how long to wait for a held
 // shard when nothing is eligible.
+//
+// The timestamps come from each shard host's own clock and a hold expires
+// whether or not the slow shard caught up, so this orders what a consumer
+// sees and nothing more. It is not a happens-before relation and must not
+// be presented as one.
 func (m *merger) choose() (*unit, time.Duration) {
 	if len(m.heads) == 0 {
 		return nil, 0
 	}
-	if !m.opts.alignSkew {
+	if !m.opts.wallClockAlign {
 		for i := range m.shards {
 			sh := m.shards[(m.next+i)%len(m.shards)]
 			if u := m.heads[sh]; u != nil {

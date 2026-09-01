@@ -137,8 +137,9 @@ serves `pgshard.v1.VStream` with the router↔pooler mTLS material
     `Truncate`s, transactional `Message`s, then `Commit{shard, lsn, end_lsn}`
     (or `Prepare{gid}` with `two_phase`) — never interleaved with another
     shard's events; nothing is promised about the order of transactions of
-    different shards (round robin by default, oldest commit first with
-    `align_skew`). In-progress (streamed) transactions are reassembled from
+    different shards, with or without alignment (round robin by default,
+    oldest commit timestamp first with `best_effort_wall_clock_alignment`,
+    which reorders the presentation without promising anything about it). In-progress (streamed) transactions are reassembled from
     their segments and aborted subtransactions dropped;
   - a `VGtid{position}` follows every transaction boundary
     (`Commit`, `Prepare`, `CommitPrepared`, `RollbackPrepared`); the vector
@@ -170,10 +171,16 @@ serves `pgshard.v1.VStream` with the router↔pooler mTLS material
     `Error{RESHARDED}`, or with a `Journal` (participants, no targets yet)
     when `stop_on_reshard` is set — following a reshard arrives with the
     journal rows;
-  - `align_skew` holds a shard whose next commit timestamp is ahead of every
-    other shard's last delivered commit by more than `align_skew_ms`
-    (default 1000) until they catch up or `align_timeout_ms` (default 10000)
-    passes;
+  - `best_effort_wall_clock_alignment` holds a shard whose next commit
+    timestamp is ahead of every other shard's last delivered commit by more
+    than `wall_clock_lead_ms` (default 1000) until they catch up or
+    `wall_clock_hold_ms` (default 10000) passes. **It changes presentation
+    only.** The timestamps are each shard host's own clock, and a hold is
+    released on the timeout whether or not the slow shard caught up, so it
+    establishes no causal, real-time or serialization order — the
+    no-ordering contract above is unchanged by it. Do not use it to decide
+    that one shard's transaction happened before another's; use the shard
+    and LSN on every event, which are there either way;
   - buffering is bounded: each shard may run at most 16 assembled
     transactions ahead of the consumer; beyond that the pooler stream stalls
     (flow control back to the walsender).

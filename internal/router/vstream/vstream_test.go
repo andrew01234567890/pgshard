@@ -482,11 +482,15 @@ func TestFailoverMovesTheShardStreamToTheNewPrimary(t *testing.T) {
 	}
 }
 
-func TestAlignSkewHoldsFastShardUntilSlowCatchesUpOrTimesOut(t *testing.T) {
+// TestAlignmentHoldsAFastShardButReleasesItOnTheTimeout: the hold expires
+// whether or not the slow shard caught up. That release is why alignment
+// is presentation and not an ordering guarantee, so it is worth keeping
+// visible in the test's name.
+func TestAlignmentHoldsAFastShardButReleasesItOnTheTimeout(t *testing.T) {
 	h := newHarness(t, 2)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	st := h.open(ctx, &pgshardv1.VStreamRequest_Start{Stream: "plain", Options: &pgshardv1.VStreamOptions{AlignSkew: true, AlignSkewMs: 1000, AlignTimeoutMs: 700}})
+	st := h.open(ctx, &pgshardv1.VStreamRequest_Start{Stream: "plain", Options: &pgshardv1.VStreamOptions{BestEffortWallClockAlignment: true, WallClockLeadMs: 1000, WallClockHoldMs: 700}})
 	for _, p := range h.pool {
 		p.feed("plain", batch(0, evRelation(1, "t", "id")))
 	}
