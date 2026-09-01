@@ -138,7 +138,7 @@ e2e:
 # assertions, went unnoticed. The timeout is the suite's, not Go's ten
 # minutes: the router suite alone takes longer than that.
 integration:
-	PGSHARD_REQUIRE_DOCKER=1 go test -tags integration -count=1 -timeout 45m ./test/e2e/router/... ./internal/agent/... ./internal/pgtune/...
+	PGSHARD_REQUIRE_DOCKER=1 go test -tags integration -count=1 -timeout 45m ./test/e2e/router/... ./internal/agent/... ./internal/pgtune/... ./internal/pgwire/...
 
 # fuzz runs each fuzz target for a bounded time. Go runs only a target's
 # seed corpus during an ordinary `go test`, so without this the three
