@@ -313,6 +313,7 @@ func (w *walker) rewriteInsert(s *pgquerypb.InsertStmt, r *rel) (*SequenceFill, 
 // not registered is left alone: that one is an ordinary PostgreSQL
 // sequence living on one shard, and it means there what it says.
 func (w *walker) sequenceRefusal(root *pgquerypb.Node) error {
+	claimed := w.claimedNextval(root)
 	var refusal error
 	visit(root, func(n *pgquerypb.Node) bool {
 		if refusal != nil {
@@ -334,6 +335,20 @@ func (w *walker) sequenceRefusal(root *pgquerypb.Node) error {
 			if seq := w.sequenceArg(fc); seq != "" {
 				refusal = notYet(strings.ToLower(names[len(names)-1])+"() on the global sequence "+seq+" is not available through the router: the value it would read or set belongs to one shard's own sequence object, not to the counter the router allocates from",
 					"keep the value the INSERT ... RETURNING gave you; global sequence state is not stored on a shard")
+			}
+		case "nextval":
+			// The dangerous one, and the reason this case exists at all:
+			// currval only reads the wrong counter, while an unclaimed
+			// nextval allocates from it. Two shards would hand out the same
+			// numbers from a sequence declared global, so the duplicates
+			// arrive as a primary key violation or as two rows that should
+			// never have shared an id.
+			if claimed[fc] {
+				break
+			}
+			if seq := w.sequenceArg(fc); seq != "" {
+				refusal = notYet("nextval() on the global sequence "+seq+" is not available in this statement: the router allocates from the global counter only for `SELECT nextval(...)` on its own and for the sequence columns of an INSERT, and anywhere else the value would come from one shard's own sequence object",
+					"select the value first with `SELECT nextval('"+seq+"')` and bind it, or let the INSERT fill the column")
 			}
 		}
 		return refusal == nil
@@ -410,4 +425,36 @@ func (w *walker) registeredSequence(arg *pgquerypb.Node) string {
 		return ""
 	}
 	return ""
+}
+
+// claimedNextval collects the nextval() calls the router answers itself, so
+// the refusal above lets exactly those through: the whole statement being
+// `SELECT nextval(...)`, and a value directly in an INSERT's VALUES, which
+// is where the sequence fill substitutes an allocated parameter.
+//
+// The VALUES case is claimed by position rather than by column, because the
+// columns a fill claims are known only once the relation is resolved, which
+// happens after this runs. A nextval in a VALUES position for a column that
+// is not a registered sequence column is therefore still forwarded to a
+// shard.
+func (w *walker) claimedNextval(root *pgquerypb.Node) map[*pgquerypb.FuncCall]bool {
+	claimed := map[*pgquerypb.FuncCall]bool{}
+	switch n := root.GetNode().(type) {
+	case *pgquerypb.Node_SelectStmt:
+		// Exactly the shape the planner answers, not merely one that looks
+		// like it: `SELECT nextval('g') FROM t` is a scatter over t and the
+		// router does not allocate for it.
+		if w.nextvalName(n.SelectStmt) != "" {
+			claimed[n.SelectStmt.GetTargetList()[0].GetResTarget().GetVal().GetFuncCall()] = true
+		}
+	case *pgquerypb.Node_InsertStmt:
+		for _, row := range n.InsertStmt.GetSelectStmt().GetSelectStmt().GetValuesLists() {
+			for _, item := range row.GetList().GetItems() {
+				if fc := item.GetFuncCall(); fc != nil {
+					claimed[fc] = true
+				}
+			}
+		}
+	}
+	return claimed
 }
