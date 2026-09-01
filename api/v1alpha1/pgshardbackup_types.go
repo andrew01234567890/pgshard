@@ -341,6 +341,15 @@ type RestoreTarget struct {
 // PgShardRestoreSpec requests a restore: a new cluster is created from the
 // source cluster's repository and every group recovers to the same target.
 // A barrier target is the only cluster-consistent one.
+// A restore is one operation, and it starts the moment the child cluster
+// is created from it. Its recovery target is serialized into that cluster
+// at creation, but whether the operator runs the barrier's two-phase
+// reconciliation afterwards is read from the live spec -- so turning a
+// plain restore into a barrier one after the child exists would have the
+// operator resolve prepared transactions against a cluster recovered to
+// the original, uncertified point. Immutable for the same reason a backup
+// is, and more urgently.
+// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="a restore's spec is immutable; create another PgShardRestore"
 // +kubebuilder:validation:XValidation:rule="self.newClusterName != self.clusterName",message="newClusterName must differ from clusterName"
 // +kubebuilder:validation:XValidation:rule="!(has(self.target) && (has(self.target.name) || has(self.target.xid) || has(self.target.barrier) || (has(self.target.immediate) && self.target.immediate))) || (has(self.backupId) && self.backupId.size() > 0)",message="target.name, target.xid, target.barrier and target.immediate require backupId"
 type PgShardRestoreSpec struct {

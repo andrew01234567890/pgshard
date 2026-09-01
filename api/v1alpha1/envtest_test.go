@@ -697,3 +697,42 @@ func TestABetaMajorHasToBeAskedForByName(t *testing.T) {
 		t.Fatalf("18 is a release and needs no image: %v", err)
 	}
 }
+
+// TestARestoreSpecDoesNotChangeUnderTheOperator: a restore starts the
+// moment its child cluster is created. The recovery target is serialized
+// into that cluster at creation, but whether the barrier's two-phase
+// reconciliation runs afterwards is read from the live spec -- so turning
+// a plain restore into a barrier one after the child exists would have the
+// operator resolve prepared transactions against a cluster recovered to
+// the original, uncertified point.
+func TestARestoreSpecDoesNotChangeUnderTheOperator(t *testing.T) {
+	lsn := "0/16B6C50"
+	r := &pgshardv1alpha1.PgShardRestore{
+		ObjectMeta: metav1.ObjectMeta{Name: "immutable-restore", Namespace: "default"},
+		Spec: pgshardv1alpha1.PgShardRestoreSpec{
+			ClusterName: "src", NewClusterName: "dst", BackupID: "b1",
+			Target: pgshardv1alpha1.RestoreTarget{LSN: &lsn},
+		},
+	}
+	if err := create(t, r); err != nil {
+		t.Fatal(err)
+	}
+
+	// The edit the ticket is about: a plain restore becomes a barrier one.
+	changed := r.DeepCopy()
+	barrier := "nightly-barrier"
+	changed.Spec.Target = pgshardv1alpha1.RestoreTarget{Barrier: &barrier}
+	if err := k8sClient.Update(context.Background(), changed); err == nil {
+		t.Fatal("a restore's target must not change once the restore exists")
+	} else if !strings.Contains(err.Error(), "immutable") {
+		t.Fatalf("update rejected for the wrong reason: %v", err)
+	}
+
+	// Metadata is not the request, so it stays editable: a label or an
+	// annotation says nothing about which point the cluster recovers to.
+	labelled := r.DeepCopy()
+	labelled.Labels = map[string]string{"team": "platform"}
+	if err := k8sClient.Update(context.Background(), labelled); err != nil {
+		t.Fatalf("labels are not part of the request: %v", err)
+	}
+}
