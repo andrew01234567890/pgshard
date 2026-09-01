@@ -9,8 +9,12 @@ permissions:
   contents: read
 
 concurrency:
+  # A new push to a pull request supersedes the last one, so cancelling is
+  # right there. On main it is not: cancelling means the merge that follows
+  # kills the run proving the merge before it, and a run of merges leaves
+  # every composition in between unverified.
   group: e2e-kind-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   e2e:
