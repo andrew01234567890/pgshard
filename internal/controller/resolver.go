@@ -335,7 +335,13 @@ func (r *Resolver) resolveDecision(ctx context.Context, d decision, holders map[
 	}
 	for len(holders[d.GID]) > 0 {
 		h := holders[d.GID][0]
-		if err := r.finishOn(ctx, h, d.State == "commit", d.GID); err != nil {
+		// The coordinator can finish a participant between the scan
+		// snapshot and this call, and killing it does not recall the
+		// COMMIT PREPARED already in flight. sweepOrphans already reads a
+		// gone prepared transaction as resolved; on this path it was
+		// reported in doubt for ever, because nothing else ever clears a
+		// decision whose participant has left.
+		if err := r.finishOn(ctx, h, d.State == "commit", d.GID); err != nil && !isGonePreparedXact(err) {
 			return err
 		}
 		holders[d.GID] = holders[d.GID][1:]

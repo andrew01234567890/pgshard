@@ -525,6 +525,32 @@ func TestResolverSweepContinuesPastGonePreparedXact(t *testing.T) {
 	}
 }
 
+// TestResolverDecisionContinuesPastGonePreparedXact: the coordinator can
+// finish a participant between the scan snapshot and the resolver's call,
+// and killing it does not recall the COMMIT PREPARED already in flight.
+// Reported in doubt, the decision row is never cleared, so nothing ever
+// resolves it and the in-doubt alert stands for ever.
+func TestResolverDecisionContinuesPastGonePreparedXact(t *testing.T) {
+	parallelPG(t)
+	f := newResolverFixture(t)
+	ctx := context.Background()
+	f.decide("pgshard-g-1-1", "commit", 0, 0)
+	holders := map[string][]holder{
+		"pgshard-g-1-1": {{Shard: ShardRef{Set: "default", ID: 0}}},
+	}
+	var out Outcome
+	d := decision{GID: "pgshard-g-1-1", State: "commit", Participants: []int32{0}}
+	if err := f.res.resolveDecision(ctx, d, holders, true, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Committed != 1 || out.RolledBack != 0 || out.Unresolved != 0 {
+		t.Fatalf("outcome %+v", out)
+	}
+	if got := f.decisions(); len(got) != 0 {
+		t.Fatalf("decisions left %v: a decision whose participant has already finished must be cleared", got)
+	}
+}
+
 // TestAnUnfinishedParticipantIsNamed: shard ids repeat across shard sets
 // and PostgreSQL finishes a prepared transaction only from the database it
 // was prepared in, so a resolver failure that named neither left an
