@@ -55,7 +55,10 @@ message VStreamOptions {
   uint32 wall_clock_lead_ms = 5;
   // Longest hold of a shard in milliseconds; zero means 10000.
   uint32 wall_clock_hold_ms = 6;
-  // Shard set to stream; empty means default.
+  // Shard set to stream; empty means whichever set is serving. A reshard
+  // or a blue/green upgrade makes another set serving and retires the old
+  // one, and a consumer that names no set follows that rather than staying
+  // on the shards nothing writes to any more.
   string shard_set = 7;
   // Where a shard absent from position starts: its slot's confirmed
   // position (default) or an initial copy of every table followed by

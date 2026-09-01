@@ -145,9 +145,14 @@ func (s *Server) Stream(srv pgshardv1.VStream_StreamServer) error {
 	if opts.twoPhase && !def.TwoPhase {
 		return status.Errorf(codes.FailedPrecondition, "stream %q was not created with two_phase", def.Name)
 	}
+	// An omitted set means the set now serving, not the literal "default".
+	// After a reshard or a blue/green upgrade cuts over to another set, the
+	// old one is retired, and a consumer that never named a set would
+	// otherwise have gone on streaming the shards nothing writes to any
+	// more -- with no error, because those shards are still there.
 	set := start.GetOptions().GetShardSet()
 	if set == "" {
-		set = router.DefaultShardSet
+		set = s.Topology.ServingSet()
 	}
 	shards := sortedShards(s.Topology.Shards(set))
 	if len(shards) == 0 {

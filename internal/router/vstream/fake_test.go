@@ -204,6 +204,18 @@ type fakeTopology struct {
 	gen     uint64
 	epochs  map[router.Shard]uint64
 	poolers map[router.Shard]*fakePooler
+	// serving is what an omitted shard set resolves to; empty means the
+	// default set, which is what a cluster that never resharded reports.
+	serving string
+}
+
+func (t *fakeTopology) ServingSet() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.serving == "" {
+		return router.DefaultShardSet
+	}
+	return t.serving
 }
 
 func (t *fakeTopology) Shards(set string) []router.Shard {

@@ -620,3 +620,37 @@ func TestTruncateIsPrecededByItsRelation(t *testing.T) {
 		t.Fatalf("truncate without a prior relation:\n%s", strings.Join(got, "\n"))
 	}
 }
+
+// TestAnOmittedShardSetFollowsTheCutover: a reshard or a blue/green
+// upgrade makes another set serving and retires the old one. A consumer
+// that never named a set was pinned to the literal "default" and went on
+// streaming shards nothing writes to any more -- with no error, because
+// those shards are still there and their slots still exist.
+func TestAnOmittedShardSetFollowsTheCutover(t *testing.T) {
+	h := newHarness(t, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// g2 is serving and holds no shards in this harness, so a stream that
+	// resolves the serving set correctly reports that rather than quietly
+	// streaming the retired default set.
+	h.topo.mu.Lock()
+	h.topo.serving = "g2"
+	h.topo.mu.Unlock()
+
+	st := h.open(ctx, &pgshardv1.VStreamRequest_Start{Stream: "plain"})
+	_, err := st.Recv()
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("an omitted set must resolve to the serving set: %v", err)
+	}
+	if !strings.Contains(err.Error(), `"g2"`) {
+		t.Errorf("error %q does not name the serving set", err)
+	}
+
+	// Naming a set explicitly still wins: a consumer draining the retired
+	// set on purpose must be able to say so.
+	st = h.open(ctx, &pgshardv1.VStreamRequest_Start{Stream: "plain", Options: &pgshardv1.VStreamOptions{ShardSet: "default"}})
+	if _, err := st.Recv(); status.Code(err) == codes.FailedPrecondition {
+		t.Fatalf("an explicit set must still be honoured: %v", err)
+	}
+}
