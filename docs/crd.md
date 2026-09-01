@@ -51,6 +51,10 @@ spread honest), `observedGeneration`,
 Fenced, BackupHealthy, Resharding, ServingWrites, RouterReady, ControllerReady, TuningApplied),
 `observedGeneration`,
 `shardMapGeneration`, `shards[]{id, rangeStart, rangeEnd, primary, epoch, members[]{name, role, ready, replayLagBytes}}`,
+Fenced, BackupHealthy, Resharding, ServingWrites, RouterReady, TuningApplied), `observedGeneration`,
+`shardMapGeneration`, `shards[]{id, rangeStart, rangeEnd, primary, epoch, members[]{name, role, ready, replayLagBytes, pvc, build}}`
+(`build` is what the primary's agent reports; empty on a standby, whose agent
+the operator does not call, and on an agent old enough not to say),
 `effectiveShards` (shard count of the serving catalog shard set), `reshard{name, shardSet, generation, shards, phase}`
 (the run in flight), `placementWorkflows[]{workflowId, table, from, to, state, phase, message, pauseMs}`
 (table placement workflows active or ended within a day), `tuning.derived[]{name, value, reason}`. See

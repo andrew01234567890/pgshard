@@ -132,6 +132,11 @@ type groupObservation struct {
 	// A group with two members on one node has fewer failure domains than
 	// replicas, whatever the replica count says.
 	nodes []string
+	// primaryBuild is what the primary's agent says it is. Only the
+	// primary's: that is the one Status call this pass already makes, and
+	// asking every member would be an RPC per member per reconcile for
+	// something that changes at the pace of a rollout.
+	primaryBuild string
 	// failing is set while the primary is unhealthy or a failover is pending.
 	failing bool
 	// writesPaused is the primary refusing writes: the observable effect of
@@ -780,6 +785,7 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 	case primary.pod != nil:
 		stErr = errors.New("pod has no IP yet")
 	}
+	obs.primaryBuild = st.Build
 	healthy := primaryHealthy(primary.pod, primary.ready, st, stErr)
 	unhealthyFor := r.unhealthyFor(g.Prefix(), !healthy)
 	if !healthy {
@@ -944,6 +950,9 @@ func (r *ClusterReconciler) finishGroup(_ context.Context, _ *pgshardv1alpha1.Pg
 	for _, name := range g.MemberNames() {
 		m := members[name]
 		ms := pgshardv1alpha1.MemberStatus{Name: name, PVC: obs.state.pvcs[name]}
+		if name == obs.state.primary {
+			ms.Build = obs.primaryBuild
+		}
 		if m != nil && m.pod != nil {
 			ms.Role = m.pod.Labels[LabelRole]
 			if m.running {

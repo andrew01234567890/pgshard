@@ -25,6 +25,9 @@ type AgentStatus struct {
 	// PromotionPending is true while the agent ran pg_ctl promote but has not
 	// finished the post-promotion setup; converge re-issues Promote.
 	PromotionPending bool
+	// Build is what the agent says it is. Empty from one that predates the
+	// field, which is itself the answer "older than this".
+	Build string
 }
 
 // AgentClient drives member agents over pgshard.v1.Agent. addr is host:port
@@ -137,7 +140,7 @@ func (c *GRPCAgentClient) Status(ctx context.Context, addr string) (AgentStatus,
 	if err != nil {
 		return AgentStatus{}, err
 	}
-	st := AgentStatus{Running: resp.GetRunning(), Primary: resp.GetRole() == pgshardv1.StatusResponse_ROLE_PRIMARY, Epoch: resp.GetEpoch(), LSN: resp.GetLsn(), Timeline: resp.GetTimeline(), PromotionPending: resp.GetPromotionPending()}
+	st := AgentStatus{Running: resp.GetRunning(), Primary: resp.GetRole() == pgshardv1.StatusResponse_ROLE_PRIMARY, Epoch: resp.GetEpoch(), LSN: resp.GetLsn(), Timeline: resp.GetTimeline(), PromotionPending: resp.GetPromotionPending(), Build: resp.GetBuild()}
 	if e := resp.GetError(); e != nil {
 		return st, errors.New(e.GetMessage())
 	}

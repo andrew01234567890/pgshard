@@ -334,8 +334,15 @@ type StatusResponse struct {
 	// True while a promotion has run pg_ctl promote but not yet finished its
 	// post-promotion setup; the operator re-issues Promote to complete it.
 	PromotionPending bool `protobuf:"varint,7,opt,name=promotion_pending,json=promotionPending,proto3" json:"promotion_pending,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Build is the agent's version metadata. During a rolling upgrade the
+	// members of one cluster run different binaries for a while, and
+	// nothing in this response said which -- so neither an operator
+	// watching the roll nor a caller deciding whether an optional RPC
+	// exists could tell. Empty from an agent that predates the field,
+	// which is itself the answer "older than this".
+	Build         string `protobuf:"bytes,8,opt,name=build,proto3" json:"build,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *StatusResponse) Reset() {
@@ -415,6 +422,13 @@ func (x *StatusResponse) GetPromotionPending() bool {
 		return x.PromotionPending
 	}
 	return false
+}
+
+func (x *StatusResponse) GetBuild() string {
+	if x != nil {
+		return x.Build
+	}
+	return ""
 }
 
 // PromoteRequest promotes the instance.
@@ -3386,7 +3400,7 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\n" +
 	"\x16pgshard/v1/agent.proto\x12\n" +
 	"pgshard.v1\x1a\x17pgshard/v1/common.proto\"\x0f\n" +
-	"\rStatusRequest\"\xbb\x02\n" +
+	"\rStatusRequest\"\xd1\x02\n" +
 	"\x0eStatusResponse\x123\n" +
 	"\x04role\x18\x01 \x01(\x0e2\x1f.pgshard.v1.StatusResponse.RoleR\x04role\x12\x14\n" +
 	"\x05epoch\x18\x02 \x01(\x04R\x05epoch\x12\x10\n" +
@@ -3394,7 +3408,8 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\btimeline\x18\x04 \x01(\rR\btimeline\x12\x18\n" +
 	"\arunning\x18\x05 \x01(\bR\arunning\x12'\n" +
 	"\x05error\x18\x06 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\x12+\n" +
-	"\x11promotion_pending\x18\a \x01(\bR\x10promotionPending\"@\n" +
+	"\x11promotion_pending\x18\a \x01(\bR\x10promotionPending\x12\x14\n" +
+	"\x05build\x18\b \x01(\tR\x05build\"@\n" +
 	"\x04Role\x12\x14\n" +
 	"\x10ROLE_UNSPECIFIED\x10\x00\x12\x10\n" +
 	"\fROLE_PRIMARY\x10\x01\x12\x10\n" +
