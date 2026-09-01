@@ -225,10 +225,28 @@ func TestRewriteTriggerSQLShapes(t *testing.T) {
 	}
 }
 
+// TestRewriteSettleCoversTheSnapshotFallbackReload pins the bound the whole
+// online-rewrite safety argument rests on.
+//
+// Covering the fallback reload is not enough on its own: a router that
+// misses one reload still serves its old view until MaxAge, and only past
+// MaxAge does it stop. So the settle has to cover MaxAge, not the reload
+// interval -- at exactly the reload interval a router whose snapshot is
+// older than that and younger than MaxAge is still answering, and its
+// SELECT * would leak the working column the applier is about to add.
+//
+// The two constants being the same quantity is what turns the wait from a
+// hope into a guarantee, and nothing else in the tree would fail if someone
+// shortened the settle to the reload interval, which is why this asserts
+// the bound that matters rather than the weaker one it used to.
 func TestRewriteSettleCoversTheSnapshotFallbackReload(t *testing.T) {
-	if DefaultRewriteSettle < snapshot.DefaultReloadInterval {
-		t.Fatalf("settle %s is shorter than the snapshot fallback reload %s: a router whose LISTEN dropped could leak the hidden column",
-			DefaultRewriteSettle, snapshot.DefaultReloadInterval)
+	if DefaultRewriteSettle < snapshot.MaxAge {
+		t.Fatalf("settle %s is shorter than the snapshot bound %s: past that a router has either reloaded or stopped, and short of it one can still be serving a view from before the column list was published",
+			DefaultRewriteSettle, snapshot.MaxAge)
+	}
+	if snapshot.MaxAge <= snapshot.DefaultReloadInterval {
+		t.Fatalf("MaxAge %s leaves no margin over the fallback reload %s: a healthy router would trip the bound it is meant never to reach",
+			snapshot.MaxAge, snapshot.DefaultReloadInterval)
 	}
 }
 
