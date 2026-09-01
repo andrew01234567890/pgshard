@@ -244,23 +244,23 @@ func TestRouterRolesAndGrants(t *testing.T) {
 			t.Fatal(err)
 		}
 		_ = shard1.Close(ctx)
-		sawDrift := false
+		// The drifted status is a state the controller passes through, and
+		// a repair inside one poll interval never shows it. What must hold
+		// is that the hijacked verifier is gone: the shard cannot match the
+		// others again unless the drift was detected and repaired.
 		deadline := time.Now().Add(30 * time.Second)
 		for {
 			st := s.roleStatus(t, "analyst")
-			if strings.HasPrefix(st["default/1"], "drifted") && strings.Contains(st["default/1"], `"verifier": "differs"`) {
-				sawDrift = true
+			if drift := st["default/1"]; strings.HasPrefix(drift, "drifted") && !strings.Contains(drift, `"verifier": "differs"`) {
+				t.Fatalf("drift reported without naming the verifier: %s", drift)
 			}
-			if sawDrift && st["default/1"] == "in_sync {}" {
+			if st["default/1"] == "in_sync {}" && len(s.everywhere(t, "select rolpassword from pg_authid where rolname = 'analyst'")) == 1 {
 				break
 			}
 			if time.Now().After(deadline) {
-				t.Fatalf("status never went drifted -> in_sync: %v\ncontroller log:\n%s", st, s.controllerLog.String())
+				t.Fatalf("the hijacked verifier was never repaired: %v\ncontroller log:\n%s", st, s.controllerLog.String())
 			}
 			time.Sleep(200 * time.Millisecond)
-		}
-		if verifiers := s.everywhere(t, "select rolpassword from pg_authid where rolname = 'analyst'"); len(verifiers) != 1 {
-			t.Fatalf("verifiers per group after repair: %v", verifiers)
 		}
 		st := s.roleStatus(t, "app")
 		if len(st) != 4 {
