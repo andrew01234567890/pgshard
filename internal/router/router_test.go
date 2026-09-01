@@ -418,6 +418,12 @@ func TestCopyFromStdin(t *testing.T) {
 	}
 }
 
+// TestStaleGenerationSurfaces: a generation the router cannot resolve
+// within the buffer window still reaches the client -- it is not held for
+// ever -- but as the router's own answer rather than the pooler's. 55000
+// is object_not_in_prerequisite_state: it names a state and no way out of
+// it, and a client reading it has nothing to act on. Nothing was written
+// and nothing committed, so the answer is to run it again.
 func TestStaleGenerationSurfaces(t *testing.T) {
 	h := newHarness(t)
 	conn := h.connect(t, h.dsn("app", "secret", "app"))
@@ -427,8 +433,8 @@ func TestStaleGenerationSurfaces(t *testing.T) {
 	stale.ShardMapGeneration = 6
 	h.setSnap(&stale)
 	start := time.Now()
-	if _, err := conn.Exec(ctx, "select 1"); sqlstate(err) != "55000" {
-		t.Fatalf("stale generation: %v", err)
+	if _, err := conn.Exec(ctx, "select 1"); sqlstate(err) != "40001" {
+		t.Fatalf("stale generation: %v, want 40001 so the client knows to retry", err)
 	}
 	if time.Since(start) < 700*time.Millisecond {
 		t.Fatalf("stale generation was reported after %s without waiting for the buffer window", time.Since(start))

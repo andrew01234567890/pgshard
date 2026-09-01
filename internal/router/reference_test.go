@@ -623,8 +623,11 @@ func TestReferenceWriteReleasesAShardItCouldNotPrepare(t *testing.T) {
 	if err == nil {
 		t.Fatal("the write must fail: one shard refuses the session")
 	}
-	if !strings.Contains(err.Error(), "stale routing generation") {
-		t.Fatalf("the client must see the shard's refusal, got %v", err)
+	// The client is told the topology moved and the write did not happen,
+	// not handed the shard's own 55000: a reference write that one shard
+	// refuses is aborted everywhere, so running it again is the answer.
+	if sqlstate(err) != "40001" {
+		t.Fatalf("the client must be told to retry, got %v", err)
 	}
 	h.poolers[3].mu.Lock()
 	releases := len(h.poolers[3].releases)

@@ -23,6 +23,60 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// Reason distinguishes conditions that share a SQLSTATE.
+type Reason int32
+
+const (
+	Reason_REASON_UNSPECIFIED Reason = 0
+	// The request carried a shard-map generation or epoch the pooler has
+	// moved past; the caller should reload and retry.
+	Reason_REASON_STALE_GENERATION Reason = 1
+	// A table is mid online-rewrite and its column list is not published;
+	// the caller should wait rather than treat it as a fault.
+	Reason_REASON_REWRITE_IN_PROGRESS Reason = 2
+)
+
+// Enum value maps for Reason.
+var (
+	Reason_name = map[int32]string{
+		0: "REASON_UNSPECIFIED",
+		1: "REASON_STALE_GENERATION",
+		2: "REASON_REWRITE_IN_PROGRESS",
+	}
+	Reason_value = map[string]int32{
+		"REASON_UNSPECIFIED":         0,
+		"REASON_STALE_GENERATION":    1,
+		"REASON_REWRITE_IN_PROGRESS": 2,
+	}
+)
+
+func (x Reason) Enum() *Reason {
+	p := new(Reason)
+	*p = x
+	return p
+}
+
+func (x Reason) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (Reason) Descriptor() protoreflect.EnumDescriptor {
+	return file_pgshard_v1_common_proto_enumTypes[0].Descriptor()
+}
+
+func (Reason) Type() protoreflect.EnumType {
+	return &file_pgshard_v1_common_proto_enumTypes[0]
+}
+
+func (x Reason) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use Reason.Descriptor instead.
+func (Reason) EnumDescriptor() ([]byte, []int) {
+	return file_pgshard_v1_common_proto_rawDescGZIP(), []int{0}
+}
+
 // ShardRef identifies one shard within a shard set.
 type ShardRef struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -200,7 +254,13 @@ type Error struct {
 	// Optional secondary detail.
 	Detail string `protobuf:"bytes,3,opt,name=detail,proto3" json:"detail,omitempty"`
 	// Optional hint on how to resolve the error.
-	Hint          string `protobuf:"bytes,4,opt,name=hint,proto3" json:"hint,omitempty"`
+	Hint string `protobuf:"bytes,4,opt,name=hint,proto3" json:"hint,omitempty"`
+	// Why, where the SQLSTATE cannot say. 55000 is answered for a stale
+	// routing generation and for a rewrite in progress, so a caller reading
+	// the code alone cannot tell a topology that moved from a condition that
+	// retrying will not fix. UNSPECIFIED means the sender predates this
+	// field, and a reader must fall back to the SQLSTATE.
+	Reason        Reason `protobuf:"varint,5,opt,name=reason,proto3,enum=pgshard.v1.Reason" json:"reason,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -261,6 +321,13 @@ func (x *Error) GetHint() string {
 		return x.Hint
 	}
 	return ""
+}
+
+func (x *Error) GetReason() Reason {
+	if x != nil {
+		return x.Reason
+	}
+	return Reason_REASON_UNSPECIFIED
 }
 
 // KeyRange is a closed interval of hashed shard keys, [start, end], over the
@@ -340,15 +407,20 @@ const file_pgshard_v1_common_proto_rawDesc = "" +
 	"\x14shard_map_generation\x18\x02 \x01(\x04R\x12shardMapGeneration\x1a;\n" +
 	"\rShardLsnEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\rR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\x04R\x05value:\x028\x01\"i\n" +
+	"\x05value\x18\x02 \x01(\x04R\x05value:\x028\x01\"\x95\x01\n" +
 	"\x05Error\x12\x1a\n" +
 	"\bsqlstate\x18\x01 \x01(\tR\bsqlstate\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12\x16\n" +
 	"\x06detail\x18\x03 \x01(\tR\x06detail\x12\x12\n" +
-	"\x04hint\x18\x04 \x01(\tR\x04hint\"2\n" +
+	"\x04hint\x18\x04 \x01(\tR\x04hint\x12*\n" +
+	"\x06reason\x18\x05 \x01(\x0e2\x12.pgshard.v1.ReasonR\x06reason\"2\n" +
 	"\bKeyRange\x12\x14\n" +
 	"\x05start\x18\x01 \x01(\x03R\x05start\x12\x10\n" +
-	"\x03end\x18\x02 \x01(\x03R\x03endB\xae\x01\n" +
+	"\x03end\x18\x02 \x01(\x03R\x03end*]\n" +
+	"\x06Reason\x12\x16\n" +
+	"\x12REASON_UNSPECIFIED\x10\x00\x12\x1b\n" +
+	"\x17REASON_STALE_GENERATION\x10\x01\x12\x1e\n" +
+	"\x1aREASON_REWRITE_IN_PROGRESS\x10\x02B\xae\x01\n" +
 	"\x0ecom.pgshard.v1B\vCommonProtoP\x01ZFgithub.com/andrew01234567890/pgshard/internal/gen/pgshard/v1;pgshardv1\xa2\x02\x03PXX\xaa\x02\n" +
 	"Pgshard.V1\xca\x02\n" +
 	"Pgshard\\V1\xe2\x02\x16Pgshard\\V1\\GPBMetadata\xea\x02\vPgshard::V1b\x06proto3"
@@ -365,22 +437,25 @@ func file_pgshard_v1_common_proto_rawDescGZIP() []byte {
 	return file_pgshard_v1_common_proto_rawDescData
 }
 
+var file_pgshard_v1_common_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
 var file_pgshard_v1_common_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
 var file_pgshard_v1_common_proto_goTypes = []any{
-	(*ShardRef)(nil),   // 0: pgshard.v1.ShardRef
-	(*Generation)(nil), // 1: pgshard.v1.Generation
-	(*Position)(nil),   // 2: pgshard.v1.Position
-	(*Error)(nil),      // 3: pgshard.v1.Error
-	(*KeyRange)(nil),   // 4: pgshard.v1.KeyRange
-	nil,                // 5: pgshard.v1.Position.ShardLsnEntry
+	(Reason)(0),        // 0: pgshard.v1.Reason
+	(*ShardRef)(nil),   // 1: pgshard.v1.ShardRef
+	(*Generation)(nil), // 2: pgshard.v1.Generation
+	(*Position)(nil),   // 3: pgshard.v1.Position
+	(*Error)(nil),      // 4: pgshard.v1.Error
+	(*KeyRange)(nil),   // 5: pgshard.v1.KeyRange
+	nil,                // 6: pgshard.v1.Position.ShardLsnEntry
 }
 var file_pgshard_v1_common_proto_depIdxs = []int32{
-	5, // 0: pgshard.v1.Position.shard_lsn:type_name -> pgshard.v1.Position.ShardLsnEntry
-	1, // [1:1] is the sub-list for method output_type
-	1, // [1:1] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	6, // 0: pgshard.v1.Position.shard_lsn:type_name -> pgshard.v1.Position.ShardLsnEntry
+	0, // 1: pgshard.v1.Error.reason:type_name -> pgshard.v1.Reason
+	2, // [2:2] is the sub-list for method output_type
+	2, // [2:2] is the sub-list for method input_type
+	2, // [2:2] is the sub-list for extension type_name
+	2, // [2:2] is the sub-list for extension extendee
+	0, // [0:2] is the sub-list for field type_name
 }
 
 func init() { file_pgshard_v1_common_proto_init() }
@@ -393,13 +468,14 @@ func file_pgshard_v1_common_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pgshard_v1_common_proto_rawDesc), len(file_pgshard_v1_common_proto_rawDesc)),
-			NumEnums:      0,
+			NumEnums:      1,
 			NumMessages:   6,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
 		GoTypes:           file_pgshard_v1_common_proto_goTypes,
 		DependencyIndexes: file_pgshard_v1_common_proto_depIdxs,
+		EnumInfos:         file_pgshard_v1_common_proto_enumTypes,
 		MessageInfos:      file_pgshard_v1_common_proto_msgTypes,
 	}.Build()
 	File_pgshard_v1_common_proto = out.File

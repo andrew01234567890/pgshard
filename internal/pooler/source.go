@@ -109,15 +109,18 @@ const fenceSQLState = "55000"
 // fence checks a request's generation against the view; nil means admitted.
 func fence(v View, g *pgshardv1.Generation) *pgshardv1.Error {
 	if g == nil {
-		return &pgshardv1.Error{Sqlstate: fenceSQLState, Message: "missing routing generation"}
+		return &pgshardv1.Error{Sqlstate: fenceSQLState, Message: "missing routing generation",
+			Reason: pgshardv1.Reason_REASON_STALE_GENERATION}
 	}
 	if g.ShardMapGeneration != v.Generation {
 		return &pgshardv1.Error{Sqlstate: fenceSQLState, Message: "stale routing generation",
-			Detail: detailf("request %d, pooler %d", g.ShardMapGeneration, v.Generation)}
+			Detail: detailf("request %d, pooler %d", g.ShardMapGeneration, v.Generation),
+			Reason: pgshardv1.Reason_REASON_STALE_GENERATION}
 	}
 	if g.PrimaryEpoch != v.Epoch {
 		return &pgshardv1.Error{Sqlstate: fenceSQLState, Message: "stale primary epoch",
-			Detail: detailf("request %d, pooler %d", g.PrimaryEpoch, v.Epoch)}
+			Detail: detailf("request %d, pooler %d", g.PrimaryEpoch, v.Epoch),
+			Reason: pgshardv1.Reason_REASON_STALE_GENERATION}
 	}
 	return nil
 }

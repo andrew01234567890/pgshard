@@ -459,7 +459,13 @@ func (e *Executor) moveTo(ctx context.Context, target Shard) error {
 		return nil
 	}
 	if e.tx != pgwire.TxIdle && e.txnTouched {
-		return e.switchPart(ctx, target)
+		// switchPart runs SQL on a part the transaction has already used:
+		// it repins it and replays the prelude. That happens before
+		// withFailover ever sees the statement, so a flip landing there
+		// went to the client as the participant's own 55000 -- the last
+		// way one could, and the one a transfer alternating between two
+		// shards hits every time round.
+		return nameFenceInTxn(e.switchPart(ctx, target))
 	}
 	e.dropStream()
 	e.shard = target
@@ -529,7 +535,31 @@ func (e *Executor) guard(op string, run func() error) (err error) {
 		e.txnOnBackend, e.txnPreFence = false, false
 		err = pgwire.Errorf(pgwire.CodeInternalError, "internal error while processing the statement; the session state was reset")
 	}()
-	return e.asWritePause(run())
+	return e.nameFence(e.asWritePause(run()))
+}
+
+// nameFence is the last word on a pooler's fence refusal.
+//
+// Four separate paths were found returning one to the client unchanged --
+// the statement path, the commit path, a wait that ran out, and rejoining
+// a shard a transaction had already used -- and each was fixed where it
+// was found, and the next measurement found another. The list was never
+// the point. 55000 is object_not_in_prerequisite_state: a client can do
+// nothing with it, and no path should be able to send it. Every public
+// entry point goes through guard, so a path added later is covered by
+// having been written at all.
+//
+// The declared reason only. A bare 55000 may be a rewrite in progress,
+// which is not a fence and clears on its own, and rewriting that into
+// "retry the transaction" would be a loop with nothing at the end of it.
+// The paths above still answer first where they know more than this does
+// -- whether output was sent, whether a transaction is open -- and this
+// catches what reaches here regardless.
+func (e *Executor) nameFence(err error) error {
+	if poolerReason(err) != pgshardv1.Reason_REASON_STALE_GENERATION {
+		return err
+	}
+	return failoverInTxnError()
 }
 
 // asWritePause reports a statement the cluster's own write pause stopped as
@@ -735,7 +765,7 @@ func (e *Executor) forgetNamedStatements() {
 // connection is retried once after the snapshot moves, provided nothing has
 // reached the client and no transaction is open (see decideFailover).
 func (e *Executor) withFailover(ctx context.Context, w pgwire.ResultWriter, run func(pgwire.ResultWriter) error) error {
-	inTxn := e.tx != pgwire.TxIdle
+	inTxn := e.inClientTransaction()
 	if e.r.blocking(e.shard) {
 		switch decideFailover(true, inTxn, false, e.r.Buffered(e.shard), e.r.cfg.Buffering.PerShardCap) {
 		case failoverFailTxn:
@@ -778,7 +808,39 @@ func (e *Executor) withFailover(ctx context.Context, w pgwire.ResultWriter, run 
 			err = run(cw)
 		}
 	}
+	// A fence refusal must never reach the client as the pooler wrote it.
+	// The wait can run out with the map still moving, and the one retry it
+	// allows can meet the same flip, and both of those returned 55000 --
+	// object_not_in_prerequisite_state, which names a state and no way out
+	// of it. It is the router's own answer: nothing was written, nothing
+	// committed, run it again. Only when no output has reached the client,
+	// because after that "run it again" is advice the client cannot take.
+	//
+	// The declared reason, not the SQLSTATE. isStaleGeneration accepts a
+	// bare 55000 for older poolers, and 55000 is also what a shard answers
+	// while a rewrite is in progress -- a condition that clears on its own
+	// and is not a fence. Turning that one into "retry the transaction"
+	// would send a client round a loop with nothing at the end of it.
+	//
+	// Output already sent stops a retry, because output cannot be
+	// replayed -- but naming the error is not retrying it. Inside a
+	// transaction the whole thing is dead and retryable whatever reached
+	// the client, so it is still told so. Outside one, a client that has
+	// already consumed rows is left with the statement's own answer.
+	if poolerReason(err) == pgshardv1.Reason_REASON_STALE_GENERATION && (!cw.wrote || inTxn) {
+		err = failoverInTxnError()
+	}
 	return e.afterBatch(ctx, err)
+}
+
+// inClientTransaction reports whether the client is inside a transaction,
+// which is not the same as this part being inside one. e.tx is the current
+// part's status, and a transaction joining a shard it has not touched yet
+// starts that part idle -- idle while the client is very much in a
+// transaction, with writes already on another shard. Retry decisions are
+// the client's contract, not one backend's, so they ask this.
+func (e *Executor) inClientTransaction() bool {
+	return e.tx != pgwire.TxIdle || e.multiShardTxn()
 }
 
 func (e *Executor) bufferFull() error { return bufferFullError(e.shard) }

@@ -238,14 +238,22 @@ type transferLoad struct {
 	wg     sync.WaitGroup
 }
 
-// isWritePause reports the router's own answer to a write that met a
-// cluster write pause: 57P03, cannot_connect_now, which carries a hint to
-// retry. PostgreSQL's 25006 is not it -- that is a pause reaching a backend
-// the router thought was writable, and it tells the client nothing about
-// retrying, so it stays a failure here.
+// isWritePause reports one of the router's own answers to a transfer the
+// cutover interrupted, both of which name the condition and tell the client
+// to retry: 57P03 (cannot_connect_now) for a write held by the pause, and
+// 40001 (serialization_failure) when the generation flipped between a
+// transaction's writes and its PREPARE, so the transaction cannot be
+// replayed and the client must run it again.
+//
+// PostgreSQL's own 25006 is not one of these -- that is a pause reaching a
+// backend the router thought was writable, and it tells the client nothing
+// about retrying, so it stays a failure here.
 func isWritePause(err error) bool {
 	var pe *pgconn.PgError
-	return errors.As(err, &pe) && pe.Code == "57P03"
+	if !errors.As(err, &pe) {
+		return false
+	}
+	return pe.Code == "57P03" || pe.Code == "40001"
 }
 
 func (s *cutoverStack) startLoad(t *testing.T, workers int) *transferLoad {
