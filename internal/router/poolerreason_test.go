@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"testing"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
@@ -136,5 +137,28 @@ func TestACommitMeetingAFlipTellsTheClientToRetry(t *testing.T) {
 	}
 	if got := sqlstate(err); got != codeFailoverInTxn {
 		t.Fatalf("commit gave %s (%v), want %s: at COMMIT a bare 55000 is where it helps least", got, err, codeFailoverInTxn)
+	}
+}
+
+// TestNoPathReturnsABareFence: the contract, rather than one more path.
+// Every public entry point goes through guard, so whatever a path decides,
+// a declared fence cannot leave the executor as the pooler wrote it.
+func TestNoPathReturnsABareFence(t *testing.T) {
+	e := &Executor{r: &Router{cfg: Config{Logger: slog.New(slog.DiscardHandler)}}}
+	fence := toPgwireError(&pgshardv1.Error{Sqlstate: codeStaleGeneration, Message: "stale routing generation",
+		Reason: pgshardv1.Reason_REASON_STALE_GENERATION})
+	err := e.guard("Execute", func() error { return fence })
+	var pe *pgwire.Error
+	if !errors.As(err, &pe) || pe.Code != codeFailoverInTxn {
+		t.Fatalf("a fence leaving guard gave %v, want %s", err, codeFailoverInTxn)
+	}
+	// A rewrite in progress carries the same SQLSTATE and is not a fence:
+	// it clears on its own, and "retry the transaction" would be a loop.
+	rewrite := toPgwireError(&pgshardv1.Error{Sqlstate: codeRewriteInProgress, Message: "table rewrite in progress"})
+	if got := e.guard("Execute", func() error { return rewrite }); !errors.Is(got, rewrite) {
+		t.Fatalf("a rewrite in progress was rewritten to %v", got)
+	}
+	if got := e.guard("Execute", func() error { return nil }); got != nil {
+		t.Fatalf("a clean statement acquired %v", got)
 	}
 }

@@ -535,7 +535,31 @@ func (e *Executor) guard(op string, run func() error) (err error) {
 		e.txnOnBackend, e.txnPreFence = false, false
 		err = pgwire.Errorf(pgwire.CodeInternalError, "internal error while processing the statement; the session state was reset")
 	}()
-	return e.asWritePause(run())
+	return e.nameFence(e.asWritePause(run()))
+}
+
+// nameFence is the last word on a pooler's fence refusal.
+//
+// Four separate paths were found returning one to the client unchanged --
+// the statement path, the commit path, a wait that ran out, and rejoining
+// a shard a transaction had already used -- and each was fixed where it
+// was found, and the next measurement found another. The list was never
+// the point. 55000 is object_not_in_prerequisite_state: a client can do
+// nothing with it, and no path should be able to send it. Every public
+// entry point goes through guard, so a path added later is covered by
+// having been written at all.
+//
+// The declared reason only. A bare 55000 may be a rewrite in progress,
+// which is not a fence and clears on its own, and rewriting that into
+// "retry the transaction" would be a loop with nothing at the end of it.
+// The paths above still answer first where they know more than this does
+// -- whether output was sent, whether a transaction is open -- and this
+// catches what reaches here regardless.
+func (e *Executor) nameFence(err error) error {
+	if poolerReason(err) != pgshardv1.Reason_REASON_STALE_GENERATION {
+		return err
+	}
+	return failoverInTxnError()
 }
 
 // asWritePause reports a statement the cluster's own write pause stopped as
