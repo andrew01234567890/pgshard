@@ -485,7 +485,16 @@ func TestRouterVStreamFailoverContinuity(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("slot not synchronized in time (synced=%t replay=%d current=%d)", synced, replay, current)
+			// synced=false says nothing about which of the three ways it
+			// can be false happened: no row on the standby at all, a row
+			// the slotsync worker declined to sync, or one still
+			// temporary. to_jsonb carries whichever columns this major
+			// has, including PG19's slotsync_skip_reason.
+			var row string
+			if err := standby.QueryRow(ctx, "select coalesce((select to_jsonb(s)::text from pg_replication_slots s where slot_name = 'pgshard_orders_shard1'), 'no such slot on the standby')").Scan(&row); err != nil {
+				row = "could not be read: " + err.Error()
+			}
+			t.Fatalf("slot not synchronized in time (synced=%t replay=%d current=%d)\nstandby slot: %s", synced, replay, current, row)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
