@@ -58,6 +58,11 @@ type memberView struct {
 	InRecovery bool
 	Streaming  bool
 	FlushLSN   uint64
+	// Why carries the probe's error when Reachable is false. A member the
+	// probe could not reach and one that is genuinely gone both arrive here
+	// as Reachable=false, and the refusal they produce names neither; the
+	// views are logged, so the reason travels with them.
+	Why string
 }
 
 // errQuorum is returned when unreachable listed standbys could hold an
@@ -514,7 +519,12 @@ func (r *ClusterReconciler) quiesce(ctx context.Context, g Group, old string, me
 			}
 			v := memberView{Name: name}
 			if m := members[name]; m != nil && m.pod != nil && m.ip != "" {
-				if st, err := r.Prober.ProbeStandby(ctx, HostDSN(m.ip, password)); err == nil {
+				st, err := r.Prober.ProbeStandby(ctx, HostDSN(m.ip, password))
+				if err != nil {
+					// quiesce polls, so logging each failure would bury the
+					// run. The views are already logged every iteration.
+					v.Why = err.Error()
+				} else {
 					v.Reachable, v.InRecovery, v.Streaming, v.FlushLSN = true, st.InRecovery, st.Streaming, st.FlushLSN
 				}
 			}
@@ -578,6 +588,7 @@ func (r *ClusterReconciler) admissiblePrimary(ctx context.Context, c *pgshardv1a
 				// that refuses promotion outright, and discarding the
 				// error left no way to tell a member that is genuinely
 				// gone from one the probe itself could not reach.
+				v.Why = err.Error()
 				logf.FromContext(ctx).Info("member did not answer the promotion probe",
 					"group", g.Name(), "member", name, "listed", v.Listed, "err", err.Error())
 			} else {
