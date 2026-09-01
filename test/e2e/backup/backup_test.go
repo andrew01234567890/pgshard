@@ -66,6 +66,11 @@ func deployOperator(ctx context.Context, t *testing.T, c *e2e.Cluster, root, ima
 	// sat in ImagePullBackOff and the suite failed on a cluster that never
 	// had a router, in a required check.
 	extraArgs := "            - --admin-image=" + env("ADMIN_IMAGE", "pgshard-admin:e2e") + "\n"
+	// Every cluster now gets a controller from the operator. Without this
+	// the operator reaches for its default image, which is not published
+	// and never loaded into kind, so the controller sits in
+	// ImagePullBackOff and the router talks to a Service with no endpoints.
+	extraArgs += "            - --controller-image=" + env("CONTROLLER_IMAGE", "pgshard-controller:e2e") + "\n"
 	if img := os.Getenv("ROUTER_IMAGE"); img != "" {
 		extraArgs += "            - --router-image=" + img + "\n"
 	}

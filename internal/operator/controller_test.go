@@ -3,6 +3,7 @@ package operator
 import (
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -139,5 +140,42 @@ func TestTheRouterCanReachTheStreamAndTheController(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("router service ports %+v: the stream is listened on but not published", svc.Spec.Ports)
+	}
+}
+
+// TestTheControllerCanReachTheShards: without a shard DSN template the
+// controller does not start its resolver at all, so a cluster would have a
+// controller that cannot finish an in-doubt transaction -- the one job
+// nothing else in the system does. Without the subscription template a
+// reshard cannot copy: the target's PostgreSQL has nothing to subscribe to.
+func TestTheControllerCanReachTheShards(t *testing.T) {
+	dep := Renderer{}.ControllerDeployment(controllerCluster())
+	args := dep.Spec.Template.Spec.Containers[0].Args
+
+	shard := argOf(args, "--shard-dsn-template=")
+	if !strings.Contains(shard, "demo-{group}-rw.ns.svc") || !strings.Contains(shard, "dbname=postgres") {
+		t.Errorf("shard DSN template = %q, want the group's rw Service with a {group} placeholder", shard)
+	}
+	sub := argOf(args, "--subscription-dsn-template=")
+	if !strings.Contains(sub, "demo-{group}-rw.ns.svc") || !strings.Contains(sub, "dbname={db}") {
+		t.Errorf("subscription DSN template = %q, want the source group's rw Service and a {db} placeholder", sub)
+	}
+	// PostgreSQL on the target opens this one, not the controller, so it
+	// cannot pick the password up from the controller's environment.
+	if !strings.Contains(sub, "password=$(PGPASSWORD)") {
+		t.Errorf("subscription DSN template = %q, want the password Kubernetes expands from the container's environment", sub)
+	}
+	if strings.Contains(shard, "password=") {
+		t.Errorf("shard DSN template must leave the password to PGPASSWORD, got %q", shard)
+	}
+}
+
+func TestThePlacementGraceIsOnlyPassedWhenSet(t *testing.T) {
+	if got := argOf(Renderer{}.ControllerDeployment(controllerCluster()).Spec.Template.Spec.Containers[0].Args, "--placement-drop-old-after="); got != "" {
+		t.Errorf("unset grace must leave the controller's own default, got %q", got)
+	}
+	r := Renderer{ControllerPlacementDropOldAfter: 10 * time.Second}
+	if got := argOf(r.ControllerDeployment(controllerCluster()).Spec.Template.Spec.Containers[0].Args, "--placement-drop-old-after="); got != "10s" {
+		t.Errorf("grace = %q, want 10s", got)
 	}
 }

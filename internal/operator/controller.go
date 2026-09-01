@@ -54,6 +54,18 @@ func (r Renderer) ControllerDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv
 		"--catalog-dsn=" + CatalogDSN(c),
 		fmt.Sprintf("--listen=:%d", controllerPort),
 		fmt.Sprintf("--metrics-listen=:%d", controllerHTTPPort),
+		// Without the shard template the resolver does not run at all, so a
+		// controller given only the catalog is a controller that cannot
+		// finish an in-doubt transaction -- the one job nothing else does.
+		"--shard-dsn-template=" + ShardDSNTemplate(c),
+		// PostgreSQL on the target opens this connection, not the
+		// controller, so this one carries the password rather than reading
+		// PGPASSWORD. Kubernetes expands $(PGPASSWORD) from the container's
+		// environment, so the secret stays out of the manifest.
+		"--subscription-dsn-template=" + SubscriptionDSNTemplate(c),
+	}
+	if d := r.ControllerPlacementDropOldAfter; d > 0 {
+		args = append(args, "--placement-drop-old-after="+d.String())
 	}
 	var mounts []corev1.VolumeMount
 	var volumes []corev1.Volume
@@ -107,6 +119,19 @@ func (r Renderer) ControllerDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv
 		},
 	}
 	return dep
+}
+
+// ShardDSNTemplate is the superuser DSN of any shard group's primary, with
+// the {group} placeholder the controller expands. The password comes from
+// PGPASSWORD in the controller's environment.
+func ShardDSNTemplate(c *pgshardv1alpha1.PgShardCluster) string {
+	return fmt.Sprintf("host=%s-{group}-rw.%s.svc port=%d user=%s dbname=postgres", c.Name, c.Namespace, postgresPort, superuserName)
+}
+
+// SubscriptionDSNTemplate is what a target's PostgreSQL uses to subscribe to
+// a source database: {group} names the source group and {db} the database.
+func SubscriptionDSNTemplate(c *pgshardv1alpha1.PgShardCluster) string {
+	return fmt.Sprintf("host=%s-{group}-rw.%s.svc port=%d user=%s password=$(PGPASSWORD) dbname={db}", c.Name, c.Namespace, postgresPort, superuserName)
 }
 
 // ControllerService is the address DefaultControllerEndpoint names.

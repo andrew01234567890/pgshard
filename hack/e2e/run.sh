@@ -22,8 +22,8 @@ major="${2:-${PG_MAJOR:-18}}"
 # names; hack/e2e/test-suites.sh checks the two have not drifted apart.
 case "$suite" in
 smoke)         args=(-run Smoke ./test/e2e/...); needs="" ;;
-operator)      args=(-timeout 70m ./test/e2e/operator/...); needs="base" ;;
-backup)        args=(-timeout 70m ./test/e2e/backup/...); needs="base" ;;
+operator)      args=(-timeout 70m ./test/e2e/operator/...); needs="base controller" ;;
+backup)        args=(-timeout 70m ./test/e2e/backup/...); needs="base controller" ;;
 reshard)       args=(-timeout 50m -skip 'TestReshardSplitUnderLoad|TestReshardMergeUnderLoad' ./test/e2e/reshard/...); needs="base controller" ;;
 reshard-split) args=(-timeout 110m -run TestReshardSplitUnderLoad ./test/e2e/reshard/...); needs="base controller" ;;
 reshard-merge) args=(-timeout 110m -run TestReshardMergeUnderLoad ./test/e2e/reshard/...); needs="base controller" ;;
