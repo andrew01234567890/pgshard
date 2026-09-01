@@ -51,9 +51,11 @@ func betaImage(major int) string {
 	if major != 19 {
 		return ""
 	}
-	if img := os.Getenv("PGSHARD_POSTGRES_IMAGE"); img != "" {
-		return "    image: " + img + "\n"
-	}
+	// Not PGSHARD_POSTGRES_IMAGE: in this suite that names the SOURCE
+	// major's image -- the matrix cell is pg18 -- and stamping it on a
+	// major-19 cluster would ask the operator to run 19 from an 18 image.
+	// The target image is the one the workflow loads into kind for this
+	// suite alone.
 	return "    image: ghcr.io/andrew01234567890/pgshard-postgres:19\n"
 }
 
