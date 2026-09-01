@@ -18,6 +18,12 @@ func TestARefusalNamesAStatementThatExists(t *testing.T) {
 		{"create function f() returns int as $$ select 1 $$ language sql", "CREATE FUNCTION"},
 		{"create extension pg_stat_statements", "CREATE EXTENSION"},
 		{"security label on table orders is 'x'", "SECURITY LABEL"},
+		{"create statistics st on tenant_id, id from orders", "CREATE STATISTICS"},
+		// One node type covers all of these, so naming them needs the
+		// node's object kind rather than its Go type name.
+		{"create collation col (locale = 'C')", "CREATE COLLATION"},
+		{"create operator === (leftarg = int, rightarg = int, function = int4eq)", "CREATE OPERATOR"},
+		{"create aggregate agg (basetype = int, sfunc = int4pl, stype = int)", "CREATE AGGREGATE"},
 	} {
 		t.Run(c.want, func(t *testing.T) {
 			_, err := New().Plan(context.Background(), session(snap), c.sql)
