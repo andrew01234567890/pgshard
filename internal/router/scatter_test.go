@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
+	"github.com/andrew01234567890/pgshard/internal/pgwire"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 
@@ -670,5 +671,54 @@ func TestScatterRowGateReleasesOnStop(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("stop did not release the producer")
+	}
+}
+
+// TestScatterCapacityWaitIsBounded: without a bound a burst of wide
+// scatters parks every later statement indefinitely, and a statement
+// needing many slots is overtaken for ever by smaller ones that take each
+// slot as it is freed. The client sees a session that stopped answering
+// rather than an error it could act on.
+func TestScatterCapacityWaitIsBounded(t *testing.T) {
+	s := newScatterSlots(2, 50*time.Millisecond)
+	if err := s.acquire(context.Background(), 2); err != nil {
+		t.Fatalf("the whole budget must be acquirable: %v", err)
+	}
+	err := s.acquire(context.Background(), 1)
+	var pe *pgwire.Error
+	if !errors.As(err, &pe) {
+		t.Fatalf("an exhausted budget must refuse rather than block for ever, got %v", err)
+	}
+	if pe.Code != "53300" {
+		t.Errorf("SQLSTATE %s, want 53300, what the stream budget already refuses with", pe.Code)
+	}
+	if pe.Hint == "" {
+		t.Error("a refusal a client is meant to retry must say so")
+	}
+
+	// Capacity that comes back before the deadline is still served.
+	s.release(2)
+	if err := s.acquire(context.Background(), 1); err != nil {
+		t.Fatalf("released capacity must be acquirable: %v", err)
+	}
+}
+
+// A negative wait keeps the old behaviour for anyone who wants it.
+func TestScatterWaitCanBeDisabled(t *testing.T) {
+	s := newScatterSlots(1, -1)
+	if err := s.acquire(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.acquire(ctx, 1) }()
+	select {
+	case err := <-done:
+		t.Fatalf("a negative wait must block, got %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancel()
+	if err := <-done; err == nil {
+		t.Error("a cancelled wait must return the cancellation")
 	}
 }

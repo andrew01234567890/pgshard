@@ -254,7 +254,13 @@ shard, and `Execute` with a row limit (partial portal fetch) is refused
 `--scatter-max-shards` (default 0 = all) caps the shards one statement may
 touch and `--scatter-max-streams` (4096) the scatter streams open across
 the router; a statement waits for capacity and a client cancel while
-waiting is honoured.
+waiting is honoured. That wait is bounded by `--scatter-max-wait` (30s;
+negative waits for ever), after which the statement is refused with
+`53300` and a retry hint. Unbounded, a burst of wide scatters parks every
+later statement indefinitely, and a statement needing many streams is
+overtaken for ever by smaller ones taking each stream as it is freed --
+the client sees a session that stopped answering rather than an error it
+could act on.
 
 **Refusals (all `0A000`).**
 

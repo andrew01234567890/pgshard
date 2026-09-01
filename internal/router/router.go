@@ -116,7 +116,7 @@ func New(cfg Config) (*Router, error) {
 	if _, err := rand.Read(b[:]); err != nil {
 		return nil, err
 	}
-	rt := &Router{cfg: cfg, prefix: hex.EncodeToString(b[:]), scatter: newScatterSlots(cfg.Scatter.MaxStreams),
+	rt := &Router{cfg: cfg, prefix: hex.EncodeToString(b[:]), scatter: newScatterSlots(cfg.Scatter.MaxStreams, cfg.Scatter.MaxWait),
 		sessions: map[uint64]*Executor{}, buffered: map[Shard]int{}, prepared: map[Shard]bool{}}
 	reg := metrics.NewRegistry("router")
 	rt.metrics = metrics.NewRouter(reg, func() float64 { return float64(rt.Sessions()) },
