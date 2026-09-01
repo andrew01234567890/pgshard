@@ -142,6 +142,11 @@ const (
 	// A shard stream could not be (re)opened in time.
 	VEvent_Error_CODE_SHARD_UNAVAILABLE VEvent_Error_Code = 3
 	VEvent_Error_CODE_INTERNAL          VEvent_Error_Code = 4
+	// One transaction, or the open transactions of one shard together,
+	// did not fit in the router's buffer for this stream. The last
+	// position delivered is still valid: resume from it, with a larger
+	// buffer or after the transaction that did not fit has been split.
+	VEvent_Error_CODE_TRANSACTION_TOO_LARGE VEvent_Error_Code = 5
 )
 
 // Enum value maps for VEvent_Error_Code.
@@ -152,13 +157,15 @@ var (
 		2: "CODE_RESHARDED",
 		3: "CODE_SHARD_UNAVAILABLE",
 		4: "CODE_INTERNAL",
+		5: "CODE_TRANSACTION_TOO_LARGE",
 	}
 	VEvent_Error_Code_value = map[string]int32{
-		"CODE_UNSPECIFIED":       0,
-		"CODE_POSITION_TOO_OLD":  1,
-		"CODE_RESHARDED":         2,
-		"CODE_SHARD_UNAVAILABLE": 3,
-		"CODE_INTERNAL":          4,
+		"CODE_UNSPECIFIED":           0,
+		"CODE_POSITION_TOO_OLD":      1,
+		"CODE_RESHARDED":             2,
+		"CODE_SHARD_UNAVAILABLE":     3,
+		"CODE_INTERNAL":              4,
+		"CODE_TRANSACTION_TOO_LARGE": 5,
 	}
 )
 
@@ -2897,7 +2904,7 @@ const file_pgshard_v1_vstream_proto_rawDesc = "" +
 	"\x0funchanged_toast\x18\x02 \x01(\bR\x0eunchangedToast\x12\x14\n" +
 	"\x05value\x18\x03 \x01(\fR\x05value\"7\n" +
 	"\x06VTuple\x12-\n" +
-	"\acolumns\x18\x01 \x03(\v2\x13.pgshard.v1.VColumnR\acolumns\"\xe7\x19\n" +
+	"\acolumns\x18\x01 \x03(\v2\x13.pgshard.v1.VColumnR\acolumns\"\x88\x1a\n" +
 	"\x06VEvent\x120\n" +
 	"\x05begin\x18\x01 \x01(\v2\x18.pgshard.v1.VEvent.BeginH\x00R\x05begin\x129\n" +
 	"\brelation\x18\x02 \x01(\v2\x1b.pgshard.v1.VEvent.RelationH\x00R\brelation\x12*\n" +
@@ -2995,17 +3002,18 @@ const file_pgshard_v1_vstream_proto_rawDesc = "" +
 	"\x14shard_map_generation\x18\x04 \x01(\x04R\x12shardMapGeneration\x1aF\n" +
 	"\x06Target\x12*\n" +
 	"\x05shard\x18\x01 \x01(\v2\x14.pgshard.v1.ShardRefR\x05shard\x12\x10\n" +
-	"\x03lsn\x18\x02 \x01(\x04R\x03lsn\x1a\xfc\x01\n" +
+	"\x03lsn\x18\x02 \x01(\x04R\x03lsn\x1a\x9d\x02\n" +
 	"\x05Error\x121\n" +
 	"\x04code\x18\x01 \x01(\x0e2\x1d.pgshard.v1.VEvent.Error.CodeR\x04code\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12*\n" +
-	"\x05shard\x18\x03 \x01(\v2\x14.pgshard.v1.ShardRefR\x05shard\"z\n" +
+	"\x05shard\x18\x03 \x01(\v2\x14.pgshard.v1.ShardRefR\x05shard\"\x9a\x01\n" +
 	"\x04Code\x12\x14\n" +
 	"\x10CODE_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15CODE_POSITION_TOO_OLD\x10\x01\x12\x12\n" +
 	"\x0eCODE_RESHARDED\x10\x02\x12\x1a\n" +
 	"\x16CODE_SHARD_UNAVAILABLE\x10\x03\x12\x11\n" +
-	"\rCODE_INTERNAL\x10\x04B\a\n" +
+	"\rCODE_INTERNAL\x10\x04\x12\x1e\n" +
+	"\x1aCODE_TRANSACTION_TOO_LARGE\x10\x05B\a\n" +
 	"\x05event*Q\n" +
 	"\tStartFrom\x12\x1a\n" +
 	"\x16START_FROM_UNSPECIFIED\x10\x00\x12\x13\n" +

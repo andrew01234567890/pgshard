@@ -111,23 +111,36 @@ func (h *pgHarness) testStream(t *testing.T) {
 	if err != nil || ack.GetError() != nil {
 		t.Fatalf("ack: %v %v", ack, err)
 	}
+	// The ack reaches the walsender as a standby status update, which
+	// PostgreSQL applies to the slot on its own schedule: the RPC returning
+	// says the ack was sent, not that the slot has moved.
 	var confirmed uint64
-	if err := h.admin.QueryRow(ctx, "SELECT confirmed_flush_lsn - '0/0'::pg_lsn FROM pg_replication_slots WHERE slot_name = 'pgshard_orders_shard0'").Scan(&confirmed); err != nil {
-		t.Fatal(err)
-	}
-	if confirmed < cp.EndLsn {
-		t.Fatalf("confirmed_flush_lsn %d < acked %d", confirmed, cp.EndLsn)
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		if err := h.admin.QueryRow(ctx, "SELECT confirmed_flush_lsn - '0/0'::pg_lsn FROM pg_replication_slots WHERE slot_name = 'pgshard_orders_shard0'").Scan(&confirmed); err != nil {
+			t.Fatal(err)
+		}
+		if confirmed >= cp.EndLsn {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("confirmed_flush_lsn %d < acked %d", confirmed, cp.EndLsn)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	const overAck = uint64(1) << 62
 	if ack, err = h.client.Ack(ctx, &pgshardv1.AckRequest{Stream: "orders", Lsn: overAck}); err != nil || ack.GetError() != nil {
 		t.Fatalf("over-ack: %v %v", ack, err)
 	}
+	// A single read here would pass whether the over-ack was clamped or
+	// merely not applied yet, so hold the invariant over a window instead.
 	var walEnd uint64
-	if err := h.admin.QueryRow(ctx, "SELECT confirmed_flush_lsn - '0/0'::pg_lsn, pg_current_wal_lsn() - '0/0'::pg_lsn FROM pg_replication_slots WHERE slot_name = 'pgshard_orders_shard0'").Scan(&confirmed, &walEnd); err != nil {
-		t.Fatal(err)
-	}
-	if confirmed > walEnd || confirmed >= overAck {
-		t.Fatalf("over-ack moved confirmed_flush_lsn to %d (wal end %d)", confirmed, walEnd)
+	for settle := time.Now().Add(time.Second); time.Now().Before(settle); time.Sleep(50 * time.Millisecond) {
+		if err := h.admin.QueryRow(ctx, "SELECT confirmed_flush_lsn - '0/0'::pg_lsn, pg_current_wal_lsn() - '0/0'::pg_lsn FROM pg_replication_slots WHERE slot_name = 'pgshard_orders_shard0'").Scan(&confirmed, &walEnd); err != nil {
+			t.Fatal(err)
+		}
+		if confirmed > walEnd || confirmed >= overAck {
+			t.Fatalf("over-ack moved confirmed_flush_lsn to %d (wal end %d)", confirmed, walEnd)
+		}
 	}
 	cancel()
 	deadline := time.Now().Add(5 * time.Second)

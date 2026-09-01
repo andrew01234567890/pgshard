@@ -356,6 +356,11 @@ message VEvent {
       // A shard stream could not be (re)opened in time.
       CODE_SHARD_UNAVAILABLE = 3;
       CODE_INTERNAL = 4;
+      // One transaction, or the open transactions of one shard together,
+      // did not fit in the router's buffer for this stream. The last
+      // position delivered is still valid: resume from it, with a larger
+      // buffer or after the transaction that did not fit has been split.
+      CODE_TRANSACTION_TOO_LARGE = 5;
     }
     Code code = 1;
     string message = 2;

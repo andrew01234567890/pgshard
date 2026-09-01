@@ -195,7 +195,14 @@ serves `pgshard.v1.VStream` with the router↔pooler mTLS material
     and LSN on every event, which are there either way;
   - buffering is bounded: each shard may run at most 16 assembled
     transactions ahead of the consumer; beyond that the pooler stream stalls
-    (flow control back to the walsender).
+    (flow control back to the walsender). A transaction that has **not**
+    committed cannot stall anything -- it is not a unit yet -- so it is
+    bounded separately: 64 MiB of uncommitted events per shard and 256
+    interleaved in-progress transactions. Exceeding either ends the stream
+    with `TRANSACTION_TOO_LARGE`, and the last position delivered is still
+    valid: resume from it, with a larger bound or after splitting the
+    transaction. Reconnecting without changing either would reassemble the
+    same transaction and reach the same limit.
 - `start_from: COPY` runs an initial copy for every shard missing from the
   position (see "Initial copy"); `copy_batch_rows` sizes its batches.
 - `two_phase` on `Stream` requires a stream created with `two_phase`; it
