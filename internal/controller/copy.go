@@ -70,8 +70,13 @@ type Copier struct {
 	// progress is the last copy state logged per workflow, so a pass that
 	// found no change stays quiet.
 	progress map[string]string
-	// SlotFailover requests failover slots (PG 17+ subscription option).
-	SlotFailover bool
+	// SlotFailoverDisabled turns off failover slots (PG 17+ subscription
+	// option) for the reshard's subscriptions. It reads backwards on
+	// purpose: the field it replaced defaulted to false, so a Copier built
+	// without setting it created slots a promotion on the source strands,
+	// which is what happened. Off by default means the zero value is the
+	// safe one and only a caller that means it can give that up.
+	SlotFailoverDisabled bool
 	// CutoverTimeout bounds the fence of one switch attempt; CutoverAttempts
 	// how many undone attempts fail the workflow.
 	CutoverTimeout  time.Duration
@@ -946,7 +951,7 @@ func (c *Copier) subscribeOn(ctx context.Context, wf *copyWorkflow, conn ShardCo
 			return err
 		}
 		cctx, cancel := context.WithTimeout(ctx, createSubscriptionTimeout)
-		_, err = conn.Exec(cctx, CreateSubscriptionSQL(name, conninfo, c.publicationsFor(wf, db, t, s), SubscriptionOptions{Slot: name, Failover: c.SlotFailover}))
+		_, err = conn.Exec(cctx, CreateSubscriptionSQL(name, conninfo, c.publicationsFor(wf, db, t, s), SubscriptionOptions{Slot: name, Failover: !c.SlotFailoverDisabled}))
 		cancel()
 		if err != nil {
 			return err

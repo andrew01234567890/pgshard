@@ -182,7 +182,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		// the combination PostgreSQL supports.
 		copier := &controller.Copier{Pool: pool, Shards: dialer, Schema: schema, SourceConnInfo: connInfo, Resolver: resolver, Logger: logger,
 			LagBytes: *copyLag, ThrottleHigh: *throttleHigh, ThrottleLow: *throttleLow, PreparedWait: *preparedWait,
-			SlotFailover: *slotFailover}
+			SlotFailoverDisabled: !*slotFailover}
 		go copier.Run(ctx, *copyEvery, leader.Load)
 		placer := &controller.Placer{Pool: pool, Shards: dialer, Logger: logger, LagBytes: *copyLag, BufferTimeout: *placementBuffer, DropOldAfter: *placementDropOld}
 		go placer.Run(ctx, *placementEvery, leader.Load)

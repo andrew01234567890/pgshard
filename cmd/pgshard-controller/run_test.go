@@ -66,11 +66,11 @@ func TestShardConnInfo(t *testing.T) {
 // a failover mid-copy left the subscription pointing at a slot the new
 // primary does not have.
 //
-// This checks only that the flag is registered and defaults on. It does
-// NOT check that its value reaches Copier.SlotFailover: runController
-// builds the Copier inline, so deleting that assignment again would leave
-// this test green. Proving the wiring needs the slot's own failover column
-// read on the source after a reshard, which no fixture here runs.
+// This checks only that the flag is registered and defaults on, not that
+// its value reaches the Copier: runController builds the Copier inline.
+// What stops the regression recurring is not this test but the field it
+// sets -- SlotFailoverDisabled, whose zero value is the safe one, so a
+// Copier built without it still asks for failover slots.
 func TestReshardSlotsFailOverByDefault(t *testing.T) {
 	var out, errb bytes.Buffer
 	if code := runController(context.Background(), []string{"--help"}, &out, &errb); code == 0 {
