@@ -344,6 +344,12 @@ type MemberStatus struct {
 	// PVC is the claim the member's data directory lives on.
 	// +optional
 	PVC string `json:"pvc,omitempty"`
+	// Build is the agent's version, as the agent reports it. During a
+	// rolling upgrade the members of one cluster run different binaries
+	// for a while, and this is where that is visible; empty means an
+	// agent old enough not to say.
+	// +optional
+	Build string `json:"build,omitempty"`
 }
 
 // ShardStatus reports one shard and its members.

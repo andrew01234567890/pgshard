@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/andrew01234567890/pgshard/internal/buildinfo"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 )
 
@@ -67,7 +68,8 @@ func (s *Server) fenceCurrent(ctx context.Context, epoch uint64) (context.Contex
 
 // Status is read-only.
 func (s *Server) Status(ctx context.Context, _ *pgshardv1.StatusRequest) (*pgshardv1.StatusResponse, error) {
-	resp := &pgshardv1.StatusResponse{Epoch: s.epoch.Current(), Role: pgshardv1.StatusResponse_ROLE_PRIMARY, PromotionPending: s.inst.PromotionPending()}
+	resp := &pgshardv1.StatusResponse{Epoch: s.epoch.Current(), Role: pgshardv1.StatusResponse_ROLE_PRIMARY,
+		PromotionPending: s.inst.PromotionPending(), Build: buildinfo.String()}
 	// A role that cannot be read is reported as an error rather than as
 	// primary: the operator promotes and fences on this answer.
 	switch standby, err := s.inst.IsStandby(); {
