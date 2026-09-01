@@ -65,6 +65,7 @@ replaced by a later record rather than edited.
 | ADR | Decision |
 |---|---|
 | [0001](adr/0001-durability-guc-enforcement.md) | Enforcing the durability floor against code the router cannot read |
+| [0002](adr/0002-revocation-during-authentication.md) | What a client learns when a revocation lands mid-authentication |
 | [0003](adr/0003-run-postgresql-ourselves.md) | Running PostgreSQL ourselves rather than delegating to another operator |
 | [0004](adr/0004-route-as-the-real-user.md) | Connecting to shards as the client's own role |
 | [0005](adr/0005-postgresql-own-hash-for-placement.md) | Placing rows with PostgreSQL's own extended hash |
