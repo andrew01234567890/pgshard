@@ -784,3 +784,53 @@ func TestAReplicaCountOnlyGrows(t *testing.T) {
 		t.Fatalf("growing a group must stay allowed: %v", err)
 	}
 }
+
+// TestADurabilityPromiseCanBeKept: a group of n members has n-1 standbys.
+// Asking for more acknowledgements than that is asking for something no
+// configuration can deliver, and the runtime quietly clamped it -- so the
+// stored spec went on promising N while PostgreSQL was set up for fewer,
+// and rollout admission read the unclamped number and could hold a group
+// for a quorum that would never be reachable.
+func TestADurabilityPromiseCanBeKept(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		mutate   func(*pgshardv1alpha1.PgShardClusterSpec)
+		wantPart string
+	}{
+		{"more than the shard has standbys", func(s *pgshardv1alpha1.PgShardClusterSpec) {
+			s.ReplicasPerShard = 3
+			s.Durability.MinSyncStandbys = 3
+		}, "at most replicasPerShard - 1"},
+		{"more than the catalog has standbys", func(s *pgshardv1alpha1.PgShardClusterSpec) {
+			s.ReplicasPerShard = 5
+			s.Catalog.Replicas = 3
+			s.Durability.MinSyncStandbys = 4
+		}, "at most catalog.replicas - 1"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cl := validCluster("dur-" + strings.ReplaceAll(c.name, " ", "-"))
+			c.mutate(&cl.Spec)
+			mustReject(t, cl, c.wantPart)
+		})
+	}
+
+	// Exactly the standbys that exist is the strictest promise that can be
+	// kept, and it is accepted.
+	ok := validCluster("dur-exact")
+	ok.Spec.ReplicasPerShard = 3
+	ok.Spec.Catalog.Replicas = 3
+	ok.Spec.Durability.MinSyncStandbys = 2
+	if err := create(t, ok); err != nil {
+		t.Fatalf("n-1 acknowledgements from n members must be allowed: %v", err)
+	}
+
+	// unsafeSingleReplica already says there is no synchronous standby, so
+	// it is not asked to say it twice.
+	single := validCluster("dur-single")
+	single.Spec.UnsafeSingleReplica = true
+	single.Spec.ReplicasPerShard = 1
+	single.Spec.Catalog.Replicas = 1
+	if err := create(t, single); err != nil {
+		t.Fatalf("the unsafe single-replica mode must stay usable: %v", err)
+	}
+}

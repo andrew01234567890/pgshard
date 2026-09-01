@@ -293,6 +293,21 @@ const ConditionTopologyDegraded = "TopologyDegraded"
 // cluster; a group can still be replaced by resharding to a new set.
 // +kubebuilder:validation:XValidation:rule="self.replicasPerShard >= oldSelf.replicasPerShard",message="replicasPerShard cannot be decreased: removing members needs a drain that pgshard does not implement yet, and the removed pods and volumes would be left running"
 // +kubebuilder:validation:XValidation:rule="self.catalog.replicas >= oldSelf.catalog.replicas",message="catalog.replicas cannot be decreased: removing members needs a drain that pgshard does not implement yet, and the removed pods and volumes would be left running"
+// A group of n members has n-1 standbys, so asking for more
+// acknowledgements than that is asking for something no configuration can
+// deliver. SyncStandbyNames clamps it to what exists, which means the
+// stored spec goes on promising N while PostgreSQL is set up for fewer --
+// and rollout admission reads the unclamped number, so a group can be held
+// for a quorum that will never be reachable. Refused rather than clamped:
+// a promise the cluster cannot keep is worth an error at the point it is
+// made.
+//
+// unsafeSingleReplica is exempt because it already says what it is: one
+// member, no synchronous standby, no failover candidate, unsupported for
+// production. Making those manifests also write minSyncStandbys: 0 would
+// add ceremony to an acknowledgement they have already given.
+// +kubebuilder:validation:XValidation:rule="self.durability.minSyncStandbys <= self.replicasPerShard - 1 || (has(self.unsafeSingleReplica) && self.unsafeSingleReplica)",message="durability.minSyncStandbys must be at most replicasPerShard - 1: a group of n members has n-1 standbys to acknowledge from"
+// +kubebuilder:validation:XValidation:rule="self.durability.minSyncStandbys <= self.catalog.replicas - 1 || (has(self.unsafeSingleReplica) && self.unsafeSingleReplica)",message="durability.minSyncStandbys must be at most catalog.replicas - 1: the catalog group acknowledges from its own standbys"
 type PgShardClusterSpec struct {
 	PostgreSQL PostgreSQLSpec `json:"postgresql"`
 	// +optional

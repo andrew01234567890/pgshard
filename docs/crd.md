@@ -21,7 +21,7 @@ Print columns: Shards, Ready, Age.
 | `spec.unsafeSingleReplica` | bool | relaxes both `>= 3` rules so test/dev clusters can run one member per group; single-member groups have no synchronous standby and no failover candidate — unsupported for production (the operator logs a warning) |
 | `spec.storage.size` / `.storageClassName` | Quantity / *string | size required |
 | `spec.durability.synchronousCommit` | enum | `on` (default), `remote_apply` |
-| `spec.durability.minSyncStandbys` | int | default 1 |
+| `spec.durability.minSyncStandbys` | int | default 1. CEL: at most `replicasPerShard - 1` and at most `catalog.replicas - 1` — a group of n members has n-1 standbys to acknowledge from, so more than that is refused rather than clamped: the stored spec would otherwise promise N while PostgreSQL was configured for fewer, and rollout admission reads the unclamped number. `unsafeSingleReplica` is exempt, having already said there is no synchronous standby |
 | `spec.router.minReplicas` / `.maxReplicas` | int | defaults 2 / 10; CEL: `maxReplicas >= minReplicas` |
 | `spec.router.hpa.cpuUtilization` | int | default 70 (1..100) |
 | `spec.router.tls.secretRef` | LocalObjectReference | optional |

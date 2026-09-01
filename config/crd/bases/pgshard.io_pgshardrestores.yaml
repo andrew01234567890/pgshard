@@ -1630,6 +1630,14 @@ spec:
                     needs a drain that pgshard does not implement yet, and the removed
                     pods and volumes would be left running'
                   rule: self.catalog.replicas >= oldSelf.catalog.replicas
+                - message: 'durability.minSyncStandbys must be at most replicasPerShard
+                    - 1: a group of n members has n-1 standbys to acknowledge from'
+                  rule: self.durability.minSyncStandbys <= self.replicasPerShard -
+                    1 || (has(self.unsafeSingleReplica) && self.unsafeSingleReplica)
+                - message: 'durability.minSyncStandbys must be at most catalog.replicas
+                    - 1: the catalog group acknowledges from its own standbys'
+                  rule: self.durability.minSyncStandbys <= self.catalog.replicas -
+                    1 || (has(self.unsafeSingleReplica) && self.unsafeSingleReplica)
               exclusive:
                 description: Exclusive stops recovery just before the target.
                 type: boolean
