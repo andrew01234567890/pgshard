@@ -1134,6 +1134,39 @@ func (w *walker) fromItem(node *pgquerypb.Node) error {
 				return err
 			}
 		}
+	case *pgquerypb.Node_RangeTableSample:
+		// TABLESAMPLE wraps the relation rather than being one, so without
+		// this the table was never resolved: the statement looked as
+		// though it touched nothing and went to the home shard. A sample
+		// of a sharded table came back as a sample of shard 0, and one
+		// with a shard key in its WHERE went to the wrong shard entirely
+		// and returned nothing.
+		if err := w.fromItem(n.RangeTableSample.GetRelation()); err != nil {
+			return err
+		}
+		for _, a := range n.RangeTableSample.GetArgs() {
+			if err := w.expr(a); err != nil {
+				return err
+			}
+		}
+	case *pgquerypb.Node_RangeTableFunc:
+		// XMLTABLE and friends: a function scan that produces rows, not a
+		// table this router can route by.
+		w.blocker("function scans")
+		if err := w.expr(n.RangeTableFunc.GetDocexpr()); err != nil {
+			return err
+		}
+		if err := w.expr(n.RangeTableFunc.GetRowexpr()); err != nil {
+			return err
+		}
+	default:
+		// Fail closed. A FROM item this planner does not recognise used to
+		// be skipped, and skipping one means the statement appears to
+		// touch no table at all -- which routes it to the home shard and
+		// answers from there. Every silent wrong answer of that shape
+		// begins here, so an unknown item is refused instead.
+		return notYet("this FROM item is not supported through the router yet",
+			"rewrite the query without it, or run it against one shard's database directly")
 	}
 	return nil
 }
