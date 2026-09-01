@@ -49,6 +49,32 @@ the rest with `0A000`. See *Routing* below.
   authentication, not before. The keys recovered from the exchange
   (`ClientKey`/`ServerKey`) become the `UserIdentity` sent to the pooler on
   the first message of each stream, so no password ever leaves the client.
+  That is not the same as the keys being safe from the shards, and the
+  distinction matters -- see *Trust boundary* below.
+- **Trust boundary.** The shards are inside it. Every group carries the
+  same SCRAM verifier for a role (see [roles.md](roles.md)), and the pooler
+  dials a shard as the real user by proving possession of the forwarded
+  `ClientKey`. A shard therefore sees a SCRAM exchange from a party holding
+  that user's key material, and a shard under an attacker's control is in a
+  position to derive it from what it holds and what it observes. Once it
+  has, it can authenticate as that user anywhere the same verifier is
+  installed: the other shards, the catalog, and the router itself.
+
+  So a compromised shard is a compromise of every role whose queries
+  reached it, not of that shard's data alone. **Rotate the passwords of
+  affected roles after any shard compromise**, and treat shard-to-shard and
+  shard-to-catalog isolation as a containment measure rather than a
+  boundary this authentication model enforces.
+
+  This is a consequence of the design choice recorded in the charter:
+  terminating SCRAM at the router and forwarding the client's keys, rather
+  than connecting as a service role and issuing `SET ROLE`. Key forwarding
+  keeps the shard's own privilege checks working against the real user,
+  which `SET ROLE` gives up; what it costs is this. Removing the cost means
+  a distinct pooler service identity with controlled role assumption, or
+  per-shard short-lived delegated credentials -- neither of which exists
+  today.
+
 - **Database.** The startup `database` must exist in `pgshard.databases`
   (else `3D000`). Its `home_shard` in shard set `default` is the session's
   home shard, where unsharded tables live; sharded and reference tables
