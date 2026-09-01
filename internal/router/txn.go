@@ -56,6 +56,19 @@ func (e *Executor) switchPart(ctx context.Context, target Shard) error {
 	if e.catalogSession() {
 		return pgwire.Errorf(pgwire.CodeFeatureNotSupported, "transactions on the catalog shard set cannot span shards")
 	}
+	// Each shard would run its own PostgreSQL transaction at this level and
+	// each could pick a locally valid serialization order, while the
+	// combined history has a cycle neither one can see. Two-phase commit
+	// makes the outcome atomic; it does not make the snapshots one
+	// snapshot, and a transaction that asked for SERIALIZABLE and got
+	// write skew is worse than one that was refused.
+	if e.strictIsolationInEffect() {
+		err := pgwire.Errorf(pgwire.CodeFeatureNotSupported,
+			"a transaction under REPEATABLE READ or SERIALIZABLE isolation cannot span shards: it already touched shard %s/%d and this statement needs %s/%d",
+			e.shard.Set, e.shard.ID, target.Set, target.ID)
+		err.Hint = "the shards take independent snapshots, so isolation is per shard and not across them; keep the transaction on one shard key, or use READ COMMITTED and serialise the invariant in the application"
+		return err
+	}
 	if e.parked == nil {
 		e.parked = map[Shard]*txnPart{}
 	}
