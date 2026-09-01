@@ -64,7 +64,7 @@ tests are authoritative.
 |---|---|---|
 | Online DDL/DCL fan-out as migrations; idempotent per-shard resume; sync + async wait | Implemented | `internal/controller/applier.go`, [ddl.md](ddl.md) |
 | Weaker-lock strategies (NOT VALID+VALIDATE, concurrent index PK/UNIQUE, DETACH CONCURRENTLY) | Implemented | [ddl.md](ddl.md) |
-| Rewrite-class DDL (`ALTER COLUMN ... TYPE`, volatile-default ADD COLUMN, ...) — online schema change | Implemented | OID-preserving column duplication with trigger backfill; router hides the working column; [online-ddl.md](online-ddl.md), `internal/controller/rewrite.go`, `internal/router/plan/hide.go` |
+| Rewrite-class DDL (`ALTER COLUMN ... TYPE`, volatile-default ADD COLUMN, ...) — online schema change | Implemented | OID-preserving column duplication with trigger backfill; router hides the working column. **No rollback window once cutover starts**: cutting a shard over drops the old column, so a failure part-way leaves shards on both sides and the old values recoverable only from a backup ([online-ddl.md](online-ddl.md#failure-revert-and-gc)); `internal/controller/rewrite.go`, `internal/router/plan/hide.go` |
 | Cluster-wide roles/grants with one SCRAM verifier, drift detection and repair | Implemented | `internal/controller/roles.go`, [roles.md](roles.md) |
 | Superuser/replication/BYPASSRLS role management through the router | Planned | refused by design; manage on the shards directly |
 

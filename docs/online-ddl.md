@@ -91,6 +91,15 @@ the `pg_class.oid`.
 * A failure during cutover leaves the migration `failed` with the shards
   on each side named in the error (schema DEGRADED until the statement is
   re-run or resolved by hand); already-cut-over shards are not reverted.
+
+  **Cutover is the point of no return, and there is no rollback window
+  after it.** Cutting a shard over drops the old column, so its values are
+  gone on that shard: the migration cannot be reversed, only completed on
+  the shards that are behind or reconciled by hand, and recovering the old
+  values means restoring from a backup. Phases 0–2 are entirely
+  reversible and revert every shard on any failure, so a change worth
+  hesitating over is worth hesitating over before cutover rather than
+  during it. Retaining the old data for a reversal window is PGS-479.
 * A **sweeper** (`Applier.SweepRewriteArtifacts`) runs whenever the
   migration queue is empty and drops any `_pgshard_…` trigger, function or
   column left on any shard by a crashed process.
