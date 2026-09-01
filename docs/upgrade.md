@@ -77,8 +77,13 @@ clear message (controller) otherwise:
 - the target image names the new major (or the default image is used);
 - backups are healthy when a backup policy is bound;
 - no reshard or table placement workflow is in flight;
-- every extension installed on the sources appears in
-  `pg_available_extensions` on the target major;
+- every extension installed in **every database on every source shard**
+  appears in `pg_available_extensions` on **every** target shard. Extensions
+  are per-database objects and availability is per installation, so one
+  shard's default database says nothing about the rest — and an extension
+  available on only some target shards would install on those and fail on
+  the others, which is the same outcome as missing, found after the target
+  groups are provisioned;
 - no large objects (`pg_largeobject_metadata` must be empty): logical
   replication does not carry `pg_largeobject` — use the offline strategy.
 

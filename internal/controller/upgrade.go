@@ -21,12 +21,29 @@ func (c *Copier) upgradePreconditions(ctx context.Context, wf *copyWorkflow, src
 		return fatal("upgrade %s: no shards to check", wf.set)
 	}
 	var failures []string
-	missing, err := c.missingTargetExtensions(ctx, srcSet, srcIDs[0], wf.set, wf.ids[0])
+	// Every source shard and every database, against every target shard.
+	// Checking one pair passed preflight on a cluster whose other shard
+	// had the extension and whose other database did not -- and the
+	// upgrade then failed during schema restore, which is after the
+	// target groups have been provisioned and is the expensive place to
+	// find out. Extensions are per-database objects; availability is per
+	// installation, so an extension has to be available on all of the
+	// target shards, not the one that happened to be first.
+	available, err := c.commonTargetExtensions(ctx, wf.set, wf.ids)
 	if err != nil {
 		return err
 	}
-	if len(missing) > 0 {
-		failures = append(failures, "extensions missing on the target major: "+strings.Join(missing, ", "))
+	for _, db := range dbs {
+		for _, s := range srcIDs {
+			installed, err := c.installedExtensions(ctx, srcSet, s, db.name)
+			if err != nil {
+				return err
+			}
+			if missing := MissingExtensions(installed, available); len(missing) > 0 {
+				failures = append(failures, fmt.Sprintf("extensions missing on the target major for %s on %s/%d: %s",
+					db.name, srcSet, s, strings.Join(missing, ", ")))
+			}
+		}
 	}
 	for _, db := range dbs {
 		for _, s := range srcIDs {
@@ -52,18 +69,38 @@ func (c *Copier) upgradePreconditions(ctx context.Context, wf *copyWorkflow, src
 	return nil
 }
 
-// missingTargetExtensions compares pg_available_extensions: every extension
-// installed anywhere on the source shard must be available on the target.
-func (c *Copier) missingTargetExtensions(ctx context.Context, srcSet string, src int32, tgtSet string, tgt int32) ([]string, error) {
-	installed, err := c.installedExtensions(ctx, srcSet, src)
-	if err != nil {
-		return nil, err
+// commonTargetExtensions is what every target shard can offer: an
+// extension available on one of them and not another would install on some
+// shards and fail on the rest, which is the same outcome as missing.
+func (c *Copier) commonTargetExtensions(ctx context.Context, tgtSet string, tgtIDs []int32) ([]string, error) {
+	var common []string
+	for i, id := range tgtIDs {
+		available, err := c.availableExtensions(ctx, tgtSet, id)
+		if err != nil {
+			return nil, err
+		}
+		if i == 0 {
+			common = available
+			continue
+		}
+		common = intersect(common, available)
 	}
-	available, err := c.availableExtensions(ctx, tgtSet, tgt)
-	if err != nil {
-		return nil, err
+	return common, nil
+}
+
+// intersect returns the names present in both, keeping a's order.
+func intersect(a, b []string) []string {
+	have := make(map[string]bool, len(b))
+	for _, x := range b {
+		have[x] = true
 	}
-	return MissingExtensions(installed, available), nil
+	var out []string
+	for _, x := range a {
+		if have[x] {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 // MissingExtensions returns the installed extensions absent from available,
@@ -84,8 +121,11 @@ func MissingExtensions(installed, available []string) []string {
 	return missing
 }
 
-func (c *Copier) installedExtensions(ctx context.Context, set string, id int32) ([]string, error) {
-	conn, err := c.Shards.Dial(ctx, set, id)
+// installedExtensions lists one database's extensions. They are
+// per-database objects, so the default database's list says nothing about
+// the others.
+func (c *Copier) installedExtensions(ctx context.Context, set string, id int32, database string) ([]string, error) {
+	conn, err := c.Shards.DialDatabase(ctx, set, id, database)
 	if err != nil {
 		return nil, err
 	}
