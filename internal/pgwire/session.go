@@ -386,10 +386,26 @@ func (s *session) cancelQuery(secret []byte) bool {
 }
 
 // setCopyIn records the COPY stream in flight, or clears it.
+//
+// A cancel that arrives before the COPY is registered finds no stream to
+// wake: cancelQuery sees a nil copyIn, sets no deadline, and the read that
+// starts a moment later parks for ever waiting for a client that is itself
+// waiting for the cancellation's result. That is the same standoff
+// cancelQuery exists to break, arriving in the other order, so it gets the
+// same answer here.
+//
+// It is a race the executor loses more often the busier the process is,
+// which is why it showed up in CI -- where the whole tree runs four
+// packages at a time under the race detector -- and not when the test was
+// run on its own.
 func (s *session) setCopyIn(c *copyInStream) {
 	s.mu.Lock()
 	s.copyIn = c
+	cancelled := c != nil && s.queryCtx != nil && s.queryCtx.Err() != nil
 	s.mu.Unlock()
+	if cancelled {
+		_ = s.conn.SetReadDeadline(time.Now())
+	}
 }
 
 // queryCancelled reports whether the statement in flight has been cancelled.
