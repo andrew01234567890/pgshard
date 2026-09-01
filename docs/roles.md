@@ -8,6 +8,11 @@ catalog holds the desired state, the [migration applier](ddl.md) fans each
 statement out, and the controller's role verifier keeps every group equal
 to the desired state and repairs what drifts.
 
+One verifier on every group is what lets a shard check the real user's
+privileges, and it is also why a compromised shard reaches further than its
+own data: the same verifier authenticates that role everywhere. See *Trust
+boundary* in [router.md](router.md).
+
 ## Desired state
 
 | Table | Written by | Holds |
