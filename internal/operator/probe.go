@@ -411,7 +411,6 @@ func (PgxProber) DropShardSet(ctx context.Context, dsn, name string) error {
 	return inTx(ctx, dsn, func(tx pgx.Tx) error { return catalog.DropShardSet(ctx, tx, name) })
 }
 
-// ReshardWorkflow reads the newest active reshard workflow of shardSet.
 // ReshardWorkflow returns the newest reshard or upgrade workflow targeting
 // shardSet. An online major upgrade is recorded with kind 'upgrade' and
 // reuses the reshard cutover, so filtering on 'reshard' alone left the
