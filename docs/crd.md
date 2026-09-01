@@ -84,9 +84,14 @@ See [backup.md](backup.md).
 target{time|lsn|name|xid|immediate|barrier}, targetTLI, exclusive}` — `target.barrier` names a certified barrier, so
 every group recovers to the same commit point (see [backup.md](backup.md#restore)); `clusterName` and
 `newClusterName` are required.
-CEL: at most one recovery target may be set; `newClusterName` differs from
-`clusterName`; `target.name`, `target.xid` and `target.immediate` require
-`backupId`. `status{phase: Pending|Restoring|Reconciling|Recovered|Failed, startedAt, completedAt,
+CEL: **the spec is immutable once created** — a restore starts when its child
+cluster is created, the recovery target is serialized into that cluster then,
+but whether the barrier's two-phase reconciliation runs is read from the live
+spec, so a plain restore edited into a barrier one would have the operator
+resolve prepared transactions against a cluster recovered to the original,
+uncertified point; create another PgShardRestore instead. Also: at most one
+recovery target may be set; `newClusterName` differs from `clusterName`;
+`target.name`, `target.xid` and `target.immediate` require `backupId`. `status{phase: Pending|Restoring|Reconciling|Recovered|Failed, startedAt, completedAt,
 groups[]{group, sourceStanza, backupId, timeline, reachedTarget, preparedTransactions[], message},
 reconciliation{decisions, committed, rolledBack, contradictions[], unverifiable[], unfenced}, error,
 conditions: Progressing, PreparedTransactionsPending}` — a barrier restore passes through `Reconciling` while it
