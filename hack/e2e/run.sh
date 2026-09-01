@@ -21,7 +21,13 @@ major="${2:-${PG_MAJOR:-18}}"
 # arguments, and which images it needs beyond the base set. CI runs the same
 # names; hack/e2e/test-suites.sh checks the two have not drifted apart.
 case "$suite" in
-smoke)         args=(-run Smoke ./test/e2e/...); needs="" ;;
+# The root package only, and unfiltered. -run Smoke over ./test/e2e/...
+# reached exactly one test and silently excluded the others in that
+# package -- TestForwardedAddr and the image-pull backoff tests are pure
+# table tests of e2e helpers, needing no cluster and running in
+# milliseconds, and they had never executed anywhere. Naming the package
+# rather than filtering by test name keeps that from recurring.
+smoke)         args=(./test/e2e/); needs="" ;;
 operator)      args=(-timeout 70m ./test/e2e/operator/...); needs="base controller" ;;
 backup)        args=(-timeout 70m ./test/e2e/backup/...); needs="base controller" ;;
 reshard)       args=(-timeout 50m -skip 'TestReshardSplitUnderLoad|TestReshardMergeUnderLoad' ./test/e2e/reshard/...); needs="base controller" ;;
