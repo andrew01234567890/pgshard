@@ -39,6 +39,10 @@ type AgentMaterializer struct {
 	Port int
 	// Timeout bounds one materialization; zero means 10 minutes.
 	Timeout time.Duration
+	// AgentToken is the cluster's own agent control-plane token, mounted
+	// by the operator. Empty falls back to the token derived from the
+	// catalog password alone, which is what this did before it had one.
+	AgentToken string
 }
 
 // MaterializeSchema implements SchemaMaterializer.
@@ -68,13 +72,16 @@ func (m *AgentMaterializer) MaterializeSchema(ctx context.Context, target ShardR
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	// The catalog pool authenticates with the superuser password the agents
-	// derive their auth token from.
-	token, err := agentauth.Token(m.Pool.Config().ConnConfig.Password)
+	// The cluster's own token first, then the one derived from the catalog
+	// password. Sending both reaches an agent either side of a rollout, and
+	// the derived one exists only until PGS-572 withdraws it -- while it
+	// does, anything holding the superuser password holds a credential that
+	// unlocks Promote, Demote, Rewind and Reclone.
+	derived, err := agentauth.Token(m.Pool.Config().ConnConfig.Password)
 	if err != nil {
 		return fmt.Errorf("agent auth token: %w", err)
 	}
-	ctx = agentauth.WithToken(ctx, token)
+	ctx = agentauth.WithTokens(ctx, m.AgentToken, derived)
 	resp, err := pgshardv1.NewAgentClient(conn).MaterializeSchema(ctx, &pgshardv1.MaterializeSchemaRequest{SourceConninfo: sourceConnInfo, Database: database, Epoch: proto.Uint64(uint64(epoch))})
 	if err != nil {
 		return fmt.Errorf("agent %s: %w", addr, err)

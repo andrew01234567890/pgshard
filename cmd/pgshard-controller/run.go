@@ -76,6 +76,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	placementBuffer := fs.Duration("placement-buffer-timeout", controller.DefaultBufferTimeout, "longest table-scoped write pause of one placement swap attempt")
 	placementDropOld := fs.Duration("placement-drop-old-after", controller.DefaultDropOldAfter, "grace before a placement workflow drops the previous tables")
 	agentPort := fs.Int("agent-port", controller.DefaultAgentPort, "gRPC port of member agents (schema materialization)")
+	agentTokenFile := fs.String("agent-token-file", "", "file holding the cluster's agent control-plane token; without it the controller falls back to deriving one from the catalog password")
 	pgBin := fs.String("pg-bin", os.Getenv("PGSHARD_PG_BIN"), "directory with pg_dump and psql; when set, schemas are materialized from the controller host instead of through agents (PGSHARD_PG_BIN)")
 	var shardDSNs shardDSNFlag
 	fs.Var(&shardDSNs, "shard-dsn", "explicit shard DSN as <set>/<id>=<dsn>; repeatable")
@@ -93,6 +94,18 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	if *catalogDSN == "" {
 		fmt.Fprintln(stderr, "pgshard-controller run: --catalog-dsn is required")
 		return cli.ExitUsage
+	}
+	// Before dialing anything: reading a mounted file is cheap, and a
+	// controller that cannot present its agent credential should say so
+	// once at startup rather than once per reshard.
+	var agentToken string
+	if *agentTokenFile != "" {
+		b, err := os.ReadFile(*agentTokenFile)
+		if err != nil {
+			fmt.Fprintf(stderr, "pgshard-controller run: agent token file: %v\n", err)
+			return cli.ExitUsage
+		}
+		agentToken = strings.TrimSpace(string(b))
 	}
 	var creds credentials.TransportCredentials
 	if *listen != "" {
@@ -167,7 +180,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		connInfo := func(ctx context.Context, ref controller.ShardRef, database string) (string, error) {
 			return shardConnInfo(ctx, pool, shardDSNs, subTemplate, ref, database)
 		}
-		var schema controller.SchemaMaterializer = &controller.AgentMaterializer{Pool: pool, Port: *agentPort}
+		var schema controller.SchemaMaterializer = &controller.AgentMaterializer{Pool: pool, Port: *agentPort, AgentToken: agentToken}
 		if *pgBin != "" {
 			schema = &controller.ExecMaterializer{BinDir: *pgBin, TargetConnInfo: connInfo}
 		}

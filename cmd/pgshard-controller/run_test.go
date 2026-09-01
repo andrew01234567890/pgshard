@@ -84,3 +84,35 @@ func TestReshardSlotsFailOverByDefault(t *testing.T) {
 		t.Errorf("copy-slot-failover must default on; usage: %s", usage)
 	}
 }
+
+// TestTheControllerTakesTheClustersAgentToken: the controller derived its
+// agent credential from the catalog password alone, so anything holding
+// the superuser password held one that unlocks Promote, Demote, Rewind and
+// Reclone (PGS-428). The operator now mounts the cluster's own token and
+// passes it here; the flag has to exist for that wiring to mean anything.
+func TestTheControllerTakesTheClustersAgentToken(t *testing.T) {
+	var out, errb bytes.Buffer
+	runController(context.Background(), []string{"--help"}, &out, &errb)
+	usage := out.String() + errb.String()
+	if !strings.Contains(usage, "agent-token-file") {
+		t.Fatalf("the controller offers no way to be given the cluster's agent token: %s", usage)
+	}
+}
+
+// An unreadable token file fails at startup rather than at the first
+// materialization: a controller that cannot present its credential should
+// say so once, not once per reshard.
+func TestAnUnreadableAgentTokenFileFailsAtStartup(t *testing.T) {
+	var out, errb bytes.Buffer
+	code := runController(context.Background(), []string{
+		"--catalog-dsn", "postgres://nobody@127.0.0.1:1/none",
+		"--agent-token-file", "/nonexistent/agent/token",
+		"--listen", "",
+	}, &out, &errb)
+	if code == 0 {
+		t.Fatal("a controller that cannot read its agent token must not start")
+	}
+	if !strings.Contains(errb.String()+out.String(), "agent token file") {
+		t.Errorf("startup failure does not name the token file: %s", errb.String()+out.String())
+	}
+}
