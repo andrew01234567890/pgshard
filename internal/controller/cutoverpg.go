@@ -105,7 +105,7 @@ func (o *pgCutover) reversePattern(s int32) string {
 // GateOpen: every table ready, lag under threshold, no paused subscription
 // and an apply worker alive behind every forward subscription.
 func (o *pgCutover) GateOpen(ctx context.Context) (bool, string, error) {
-	progress, byTarget, err := o.c.observe(ctx, o.wf, o.srcSet, o.srcIDs, o.dbs)
+	progress, byTarget, _, err := o.c.observe(ctx, o.wf, o.srcSet, o.srcIDs, o.dbs)
 	if err != nil {
 		return false, "", err
 	}
