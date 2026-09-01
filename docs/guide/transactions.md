@@ -57,6 +57,36 @@ transactions with no decision row are rolled back. See the
   `COMMIT PREPARED` and `ROLLBACK PREPARED` are always refused: they belong
   to the coordinator.
 
+## Deadlocks that span shards
+
+PostgreSQL detects deadlocks, but only the ones it can see. A multi-shard
+transaction holds one backend, and its locks, on each shard it touched. If
+`T1` holds a row on shard A and waits on B while `T2` holds a row on B and
+waits on A, each server sees exactly one edge of that cycle and neither
+finds it. `deadlock_timeout` does not help: it decides when a server *looks*
+for a cycle, not how long a wait may last, so a server that looks and finds
+nothing goes on waiting.
+
+**pgshard does not detect deadlocks that span shards.** There is no global
+wait graph. Such a cycle is broken by a timeout, not by detection, and both
+transactions wait until it fires.
+
+What this means for an application:
+
+- A cross-shard deadlock costs the timeout in latency before either side
+  gives up, where a single-shard one is resolved by PostgreSQL almost at
+  once.
+- Single-shard transactions are unaffected — PostgreSQL's own detector sees
+  the whole cycle and still resolves it as usual, with `40P01`.
+- The usual defence is ordering: have transactions take their shards in a
+  consistent order, so a cycle cannot form. That is the same advice as for
+  single-node PostgreSQL, and here it matters more because the cost of
+  getting it wrong is a timeout rather than an immediate abort.
+
+Detecting these properly means collecting per-shard wait edges into one
+graph and choosing a victim, which is what CockroachDB does. pgshard has not
+built that, and this page will say so until it does.
+
 ## Retry guidance
 
 Retry on the **exact** SQLSTATE. pgx, JDBC and psycopg retry loops test for
