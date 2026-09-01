@@ -118,7 +118,7 @@ Status tables are written by `pgshard_system`; `pgshard_admin` and
 
 | Table | Columns |
 |-------|---------|
-| `table_status` | `database`, `schema_name`, `table_name`, `effective_placement`, `effective_shard_key`, `effective_generation`, `workflow_id`, `updated_at`, `migrating` (table-scoped write pause of a placement workflow), `reference_checked_generation` + `reference_hazards` (what a shard would evaluate for itself on a reference table), `shard_key_checked_generation` + `shard_key_error` (why a sharded table's key column cannot be routed by) |
+| `table_status` | `database`, `schema_name`, `table_name`, `effective_placement`, `effective_shard_key`, `effective_generation`, `workflow_id`, `updated_at`, `migrating` (table-scoped write pause of a placement workflow), `reference_checked_generation` + `reference_hazards` (what a shard would evaluate for itself on a reference table), `shard_key_checked_generation` + `shard_key_error` (why a sharded table's key column cannot be routed by) + `shard_key_type` (that column's type on the shards, typmod included, so the router normalises a key value the way the column does before hashing it) |
 | `shard_status` | `shard_set`, `shard_id`, `group_name`, `serving_state`, `primary_epoch`, `primary_endpoint`, `replay_lag_bytes`, `updated_at` |
 | `role_status` | per `(rolname, group_name)`: `state` (`in_sync`, `drifted`, `missing`, `unmanaged`, `unmanaged_superuser`), `details` (jsonb), `roles_generation`, `checked_at` (`docs/roles.md`) |
 | `role_group_status` | `group_name`, `roles_generation` the group was last materialized at, `materialized_at` |

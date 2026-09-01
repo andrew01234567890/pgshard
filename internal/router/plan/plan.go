@@ -199,6 +199,9 @@ type keyTerm struct {
 	params []ParamRef
 	// list marks an IN list (Kind In) as opposed to a plain equality.
 	list bool
+	// keyType is the shard key column's declared type on the shards, empty
+	// when the controller has not recorded one for the generation in force.
+	keyType string
 }
 
 // Resolve completes a deferred plan with parameter values. It is also safe
@@ -233,13 +236,14 @@ func (p *Plan) finish(values [][]any) error {
 	var shards []int32
 	first := true
 	p.ShardKeyValues = nil
-	for _, vals := range values {
+	for i, vals := range values {
 		// Collected then sorted and compacted, rather than scanned for a
 		// duplicate on every value: an IN list of N values over S shards
 		// cost N*S comparisons here, and comparing two terms cost S*S
 		// again, on every Bind of a prepared statement.
 		termShards := make([]int32, 0, len(vals))
 		for _, v := range vals {
+			v = normaliseKey(v, p.terms[i].keyType)
 			id, err := placement.KeyspaceID(v)
 			if err != nil {
 				return pgwire.Errorf(pgwire.CodeFeatureNotSupported, "%v", err)

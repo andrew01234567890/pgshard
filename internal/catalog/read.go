@@ -84,6 +84,11 @@ type TableStatus struct {
 	// ShardKeyError says why the key column cannot be hashed, when it
 	// cannot; nil when the type is one the router and a row filter agree on.
 	ShardKeyError *string
+	// ShardKeyType is format_type of the key column as the shards actually
+	// declare it, typmod included, so the router can apply the same
+	// normalisation the type does before it hashes. Nil when the check has
+	// not run, or ran before this column existed.
+	ShardKeyType *string
 }
 
 // ShardStatus is a row of pgshard.shard_status.
@@ -209,7 +214,7 @@ func ListTableStatus(ctx context.Context, q Querier, database string) ([]TableSt
 		SELECT database, schema_name, table_name, effective_placement, effective_shard_key,
 		       effective_generation, workflow_id::text, updated_at, migrating,
 		       reference_checked_generation, reference_hazards,
-		       shard_key_checked_generation, shard_key_error
+		       shard_key_checked_generation, shard_key_error, shard_key_type
 		FROM pgshard.table_status WHERE database = $1 ORDER BY schema_name, table_name`, database)
 	if err != nil {
 		return nil, err
@@ -269,7 +274,7 @@ func ListAllTableStatus(ctx context.Context, q Querier) ([]TableStatus, error) {
 		SELECT database, schema_name, table_name, effective_placement, effective_shard_key,
 		       effective_generation, workflow_id::text, updated_at, migrating,
 		       reference_checked_generation, reference_hazards,
-		       shard_key_checked_generation, shard_key_error
+		       shard_key_checked_generation, shard_key_error, shard_key_type
 		FROM pgshard.table_status ORDER BY database, schema_name, table_name`)
 	if err != nil {
 		return nil, err
