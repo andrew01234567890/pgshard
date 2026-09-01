@@ -166,7 +166,12 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	// password, so until that changes, anything holding the superuser
 	// password also holds a token that unlocks Promote, Demote, Rewind and
 	// Reclone.
-	grpcSrv := grpc.NewServer(grpc.UnaryInterceptor(agentauth.AnyOfUnaryServerInterceptor(func() ([]string, error) {
+	//
+	// Both interceptors read the same tokens. The service is unary
+	// throughout, so the streaming one gates nothing today -- it is
+	// registered so that adding a streaming method cannot quietly add an
+	// unauthenticated one.
+	agentTokens := func() ([]string, error) {
 		var tokens []string
 		if cfg.AuthTokenFile != "" {
 			b, err := os.ReadFile(cfg.AuthTokenFile)
@@ -184,7 +189,11 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 			return nil, err
 		}
 		return append(tokens, derived), nil
-	})))
+	}
+	grpcSrv := grpc.NewServer(
+		grpc.UnaryInterceptor(agentauth.AnyOfUnaryServerInterceptor(agentTokens)),
+		grpc.StreamInterceptor(agentauth.AnyOfStreamServerInterceptor(agentTokens)),
+	)
 	pgshardv1.RegisterAgentServer(grpcSrv, srv)
 	grpcLn, err := net.Listen("tcp", cfg.GRPCAddr)
 	if err != nil {
