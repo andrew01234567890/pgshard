@@ -971,3 +971,50 @@ func TestAPausedCopyDoesNotEnterCutover(t *testing.T) {
 		t.Fatalf("stage %s, want %s", h.wf.stage, StageAwaitingSwitch)
 	}
 }
+
+// TestVerifyIsBoundedByWhatIsLeftOfTheFence: the digests are full scans and
+// they run with writes already fenced, so the scan is the write outage.
+// Bounding the pass by the fence's remaining budget turns an oversized table
+// into a cancelled scan and an aborted switch, rather than an outage that
+// lasts as long as the scan does.
+func TestVerifyIsBoundedByWhatIsLeftOfTheFence(t *testing.T) {
+	base := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	now := base
+	c := &Copier{CutoverTimeout: 60 * time.Second, Now: func() time.Time { return now }}
+
+	t.Run("no fence yet is not bounded", func(t *testing.T) {
+		o := &pgCutover{c: c, wf: &copyWorkflow{}}
+		if _, ok := o.fenceRemaining(); ok {
+			t.Fatal("nothing is fenced, so there is no fence to bound")
+		}
+	})
+
+	t.Run("past the journal is not bounded", func(t *testing.T) {
+		fenced := base
+		o := &pgCutover{c: c, wf: &copyWorkflow{cutover: cutoverState{FencedAt: &fenced, JournalID: "j"}}}
+		if _, ok := o.fenceRemaining(); ok {
+			t.Fatal("past the journal there is no going back, so no deadline to enforce")
+		}
+	})
+
+	t.Run("the budget is what the fence has left", func(t *testing.T) {
+		fenced := base
+		o := &pgCutover{c: c, wf: &copyWorkflow{cutover: cutoverState{FencedAt: &fenced}}}
+		now = base.Add(20 * time.Second)
+		got, ok := o.fenceRemaining()
+		if !ok || got != 40*time.Second {
+			t.Fatalf("remaining = %v ok=%t, want 40s of a 60s fence held for 20s", got, ok)
+		}
+	})
+
+	t.Run("already over budget still runs, and briefly", func(t *testing.T) {
+		fenced := base
+		o := &pgCutover{c: c, wf: &copyWorkflow{cutover: cutoverState{FencedAt: &fenced}}}
+		now = base.Add(90 * time.Second)
+		got, ok := o.fenceRemaining()
+		if !ok || got <= 0 {
+			t.Fatalf("remaining = %v ok=%t: an over-budget fence must still send the query, so the "+
+				"step fails on the deadline check rather than on a context that was dead already", got, ok)
+		}
+	})
+}
