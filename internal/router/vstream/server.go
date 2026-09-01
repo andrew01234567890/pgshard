@@ -35,6 +35,16 @@ type Server struct {
 	// ReconnectWindow bounds how long a shard stream may stay broken before
 	// the stream ends with SHARD_UNAVAILABLE; zero means 30s.
 	ReconnectWindow time.Duration
+	// MaxTransactionBytes bounds the encoded events one shard may hold for
+	// transactions that have not committed; zero means 64 MiB. BufferUnits
+	// bounds transactions already assembled, and nothing bounded the ones
+	// being assembled, so one very large transaction could take the
+	// router's memory -- and the router is not only serving this stream.
+	MaxTransactionBytes int
+	// MaxOpenTransactions bounds interleaved in-progress transactions per
+	// shard; zero means 256. Bytes alone would admit a very large number
+	// of small ones, each with its own bookkeeping.
+	MaxOpenTransactions int
 }
 
 func (s *Server) logger() *slog.Logger {
@@ -174,6 +184,14 @@ func (s *Server) Stream(srv pgshardv1.VStream_StreamServer) error {
 	if window <= 0 {
 		window = 30 * time.Second
 	}
+	maxBytes := s.MaxTransactionBytes
+	if maxBytes <= 0 {
+		maxBytes = 64 << 20
+	}
+	maxOpen := s.MaxOpenTransactions
+	if maxOpen <= 0 {
+		maxOpen = 256
+	}
 	inputs := map[router.Shard]chan *unit{}
 	ready := make(chan struct{}, 1)
 	var wg sync.WaitGroup
@@ -181,7 +199,8 @@ func (s *Server) Stream(srv pgshardv1.VStream_StreamServer) error {
 		ch := make(chan *unit, buffer)
 		inputs[sh] = ch
 		r := &reader{shard: sh, stream: def.Name, database: def.Database, twoPhase: opts.twoPhase, topo: s.Topology,
-			out: ch, ready: ready, window: window, delivered: startPos[sh]}
+			out: ch, ready: ready, window: window, delivered: startPos[sh],
+			maxBytes: maxBytes, maxOpen: maxOpen}
 		if st, ok := copying[sh]; ok {
 			r.copy = copyPhaseFrom(st, opts.copyBatch)
 		} else if opts.copy && startPos[sh] == 0 {

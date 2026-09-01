@@ -11,6 +11,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"google.golang.org/protobuf/proto"
+
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/pooler"
 	"github.com/andrew01234567890/pgshard/internal/router"
@@ -69,6 +71,8 @@ type reader struct {
 	ready     chan<- struct{}
 	window    time.Duration
 	delivered uint64
+	maxBytes  int
+	maxOpen   int
 	// copy is the pending initial copy; nil once streaming.
 	copy *copyPhase
 
@@ -78,7 +82,8 @@ type reader struct {
 var errEpochChanged = errors.New("primary epoch changed")
 
 func (r *reader) run(ctx context.Context) {
-	r.asm = assembler{shard: r.shard, relations: map[uint32]*relMeta{}, streamed: map[uint32]*unit{}}
+	r.asm = assembler{shard: r.shard, relations: map[uint32]*relMeta{}, streamed: map[uint32]*unit{},
+		maxBytes: r.maxBytes, maxOpen: r.maxOpen}
 	backoff := 200 * time.Millisecond
 	var firstFailure time.Time
 	for {
@@ -137,6 +142,14 @@ func positionGoneText(msg string) bool {
 
 // fatal maps a pooler failure that no reconnect can cure to an Error event.
 func fatal(err error, sh router.Shard) *pgshardv1.VEvent_Error {
+	// The router's own limit, not the pooler's answer: reconnecting would
+	// reassemble the same transaction and overrun the same buffer. The
+	// last delivered position stands, so the consumer resumes from it.
+	var big *errTooLarge
+	if errors.As(err, &big) {
+		return &pgshardv1.VEvent_Error{Code: pgshardv1.VEvent_Error_CODE_TRANSACTION_TOO_LARGE,
+			Message: big.Error(), Shard: shardRef(sh)}
+	}
 	st, ok := status.FromError(err)
 	if !ok || (st.Code() != codes.FailedPrecondition && st.Code() != codes.InvalidArgument) {
 		return nil
@@ -203,6 +216,14 @@ func (r *reader) once(ctx context.Context) error {
 		for _, ev := range batch.GetEvents() {
 			u, err := r.asm.add(ev)
 			if err != nil {
+				var big *errTooLarge
+				if errors.As(err, &big) {
+					// Returned as itself: wrapping it in a status turns
+					// the router's own limit into a decode failure, and
+					// the consumer would be told INTERNAL for something
+					// it can act on.
+					return err
+				}
 				return status.Errorf(codes.FailedPrecondition, "decode: %v", err)
 			}
 			if u == nil {
@@ -244,12 +265,31 @@ type assembler struct {
 	cur       *unit
 	streamed  map[uint32]*unit
 	inStream  uint32
+	// buffered is the encoded size of every event held for a transaction
+	// that has not committed yet, and maxBytes bounds it. The unit channel
+	// bounds transactions that are already assembled; nothing bounded the
+	// one being assembled, so a single large transaction, or enough
+	// interleaved open ones, could take the router's memory with it -- and
+	// the router is not only serving this stream.
+	buffered int
+	maxBytes int
+	// maxOpen bounds interleaved streamed transactions. Bytes alone would
+	// let a very large number of small ones through, each with its own
+	// map entry and slices.
+	maxOpen int
 }
+
+// errTooLarge ends a stream whose buffer a transaction did not fit in. The
+// last delivered position stands, so a consumer resumes from it.
+type errTooLarge struct{ msg string }
+
+func (e *errTooLarge) Error() string { return e.msg }
 
 func (a *assembler) reset() {
 	a.cur = nil
 	a.streamed = map[uint32]*unit{}
 	a.inStream = 0
+	a.buffered = 0
 }
 
 func (a *assembler) open(ev *pgshardv1.VEvent, ts int64) *unit {
@@ -270,6 +310,34 @@ func (a *assembler) append(u *unit, ev *pgshardv1.VEvent, xid uint32, rels ...*r
 	u.events = append(u.events, ev)
 	u.rels = append(u.rels, rels)
 	u.xids = append(u.xids, xid)
+	a.buffered += proto.Size(ev)
+}
+
+// fits reports whether the transactions being assembled are still within
+// the buffer, and says what overran when they are not.
+func (a *assembler) fits() error {
+	if a.maxBytes > 0 && a.buffered > a.maxBytes {
+		return &errTooLarge{fmt.Sprintf("shard %s/%d: %d bytes of uncommitted transactions exceed the %d-byte stream buffer",
+			a.shard.Set, a.shard.ID, a.buffered, a.maxBytes)}
+	}
+	if a.maxOpen > 0 && len(a.streamed) > a.maxOpen {
+		return &errTooLarge{fmt.Sprintf("shard %s/%d: %d interleaved in-progress transactions exceed the limit of %d",
+			a.shard.Set, a.shard.ID, len(a.streamed), a.maxOpen)}
+	}
+	return nil
+}
+
+// done releases what a finished transaction was holding.
+func (a *assembler) done(u *unit) *unit {
+	if u != nil {
+		for _, ev := range u.events {
+			a.buffered -= proto.Size(ev)
+		}
+		if a.buffered < 0 {
+			a.buffered = 0
+		}
+	}
+	return u
 }
 
 func (a *assembler) idle() bool { return a.cur == nil && len(a.streamed) == 0 }
@@ -292,7 +360,7 @@ func (a *assembler) add(ev *pgshardv1.ChangeEvent) (*unit, error) {
 		}
 		a.append(u, &pgshardv1.VEvent{Event: &pgshardv1.VEvent_Commit_{Commit: &pgshardv1.VEvent_Commit{Shard: sh, Lsn: e.Commit.GetCommitLsn(), EndLsn: e.Commit.GetEndLsn()}}}, 0)
 		u.endLSN = e.Commit.GetEndLsn()
-		return u, nil
+		return a.done(u), nil
 	case *pgshardv1.ChangeEvent_BeginPrepare_:
 		a.cur = a.open(a.begin(e.BeginPrepare.GetXid(), e.BeginPrepare.GetPrepareTs(), e.BeginPrepare.GetGid()), e.BeginPrepare.GetPrepareTs())
 	case *pgshardv1.ChangeEvent_Prepare_:
@@ -303,15 +371,15 @@ func (a *assembler) add(ev *pgshardv1.ChangeEvent) (*unit, error) {
 		}
 		a.append(u, &pgshardv1.VEvent{Event: &pgshardv1.VEvent_Prepare_{Prepare: &pgshardv1.VEvent_Prepare{Shard: sh, Gid: e.Prepare.GetGid(), Lsn: e.Prepare.GetPrepareLsn()}}}, 0)
 		u.endLSN = e.Prepare.GetEndLsn()
-		return u, nil
+		return a.done(u), nil
 	case *pgshardv1.ChangeEvent_CommitPrepared_:
 		u := a.open(&pgshardv1.VEvent{Event: &pgshardv1.VEvent_CommitPrepared_{CommitPrepared: &pgshardv1.VEvent_CommitPrepared{Shard: sh, Gid: e.CommitPrepared.GetGid(), Lsn: e.CommitPrepared.GetCommitLsn()}}}, 0)
 		u.endLSN = e.CommitPrepared.GetEndLsn()
-		return u, nil
+		return a.done(u), nil
 	case *pgshardv1.ChangeEvent_RollbackPrepared_:
 		u := a.open(&pgshardv1.VEvent{Event: &pgshardv1.VEvent_RollbackPrepared_{RollbackPrepared: &pgshardv1.VEvent_RollbackPrepared{Shard: sh, Gid: e.RollbackPrepared.GetGid(), Lsn: e.RollbackPrepared.GetRollbackLsn()}}}, 0)
 		u.endLSN = e.RollbackPrepared.GetEndLsn()
-		return u, nil
+		return a.done(u), nil
 	case *pgshardv1.ChangeEvent_Relation_:
 		a.relations[e.Relation.GetRelationId()] = relMetaOf(e.Relation)
 	case *pgshardv1.ChangeEvent_Row_:
@@ -365,7 +433,7 @@ func (a *assembler) add(ev *pgshardv1.ChangeEvent) (*unit, error) {
 		u.commitTS = e.StreamCommit.GetCommitTs()
 		a.append(u, &pgshardv1.VEvent{Event: &pgshardv1.VEvent_Commit_{Commit: &pgshardv1.VEvent_Commit{Shard: sh, Lsn: e.StreamCommit.GetCommitLsn(), EndLsn: e.StreamCommit.GetEndLsn()}}}, 0)
 		u.endLSN = e.StreamCommit.GetEndLsn()
-		return u, nil
+		return a.done(u), nil
 	case *pgshardv1.ChangeEvent_StreamPrepare_:
 		u := a.streamed[e.StreamPrepare.GetXid()]
 		delete(a.streamed, e.StreamPrepare.GetXid())
@@ -377,10 +445,11 @@ func (a *assembler) add(ev *pgshardv1.ChangeEvent) (*unit, error) {
 		u.commitTS = e.StreamPrepare.GetPrepareTs()
 		a.append(u, &pgshardv1.VEvent{Event: &pgshardv1.VEvent_Prepare_{Prepare: &pgshardv1.VEvent_Prepare{Shard: sh, Gid: e.StreamPrepare.GetGid(), Lsn: e.StreamPrepare.GetPrepareLsn()}}}, 0)
 		u.endLSN = e.StreamPrepare.GetEndLsn()
-		return u, nil
+		return a.done(u), nil
 	case *pgshardv1.ChangeEvent_StreamAbort_:
 		xid, sub := e.StreamAbort.GetXid(), e.StreamAbort.GetSubxid()
 		if sub == 0 || sub == xid {
+			a.done(a.streamed[xid])
 			delete(a.streamed, xid)
 			break
 		}
@@ -391,7 +460,9 @@ func (a *assembler) add(ev *pgshardv1.ChangeEvent) (*unit, error) {
 	default:
 		return nil, fmt.Errorf("unhandled change event %T", ev.GetEvent())
 	}
-	return nil, nil
+	// Checked once per consumed event, which is the only place the buffer
+	// can have grown.
+	return nil, a.fits()
 }
 
 func (u *unit) dropXid(xid uint32) {
