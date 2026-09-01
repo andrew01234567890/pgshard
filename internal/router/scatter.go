@@ -26,13 +26,25 @@ type ScatterConfig struct {
 	// MaxStreams caps the shard streams open for multi-shard reads across
 	// the router; 0 picks the default.
 	MaxStreams int
+	// MaxWait bounds how long a statement waits for scatter capacity
+	// before it is refused; 0 picks the default, negative waits for ever.
+	MaxWait time.Duration
 }
 
 const defaultScatterStreams = 4096
 
+// defaultScatterWait bounds the wait for capacity. A statement that has
+// waited this long is behind enough other work that failing it with a
+// retryable error serves the client better than holding its session open
+// for an answer that is not coming soon.
+const defaultScatterWait = 30 * time.Second
+
 func (c ScatterConfig) withDefaults() ScatterConfig {
 	if c.MaxStreams <= 0 {
 		c.MaxStreams = defaultScatterStreams
+	}
+	if c.MaxWait == 0 {
+		c.MaxWait = defaultScatterWait
 	}
 	return c
 }
@@ -42,27 +54,50 @@ type scatterSlots struct {
 	mu   sync.Mutex
 	cond *sync.Cond
 	free int
+	// wait bounds how long acquire blocks; zero or less waits for ever.
+	wait time.Duration
+	// now is overridable so a test can drive the deadline.
+	now func() time.Time
 }
 
-func newScatterSlots(n int) *scatterSlots {
-	s := &scatterSlots{free: n}
+func newScatterSlots(n int, wait time.Duration) *scatterSlots {
+	s := &scatterSlots{free: n, wait: wait, now: time.Now}
 	s.cond = sync.NewCond(&s.mu)
 	return s
 }
 
 // acquire takes n slots, waiting while the budget is exhausted.
+//
+// The wait is bounded. Without a bound a burst of wide scatters parks every
+// later statement indefinitely, and a statement needing many slots can be
+// overtaken for ever by smaller ones that take each slot as it is freed --
+// so the client sees a session that has stopped answering rather than an
+// error it could act on. 53300 is what the stream budget already refuses
+// with, and it is retryable.
 func (s *scatterSlots) acquire(ctx context.Context, n int) error {
-	stop := context.AfterFunc(ctx, func() {
+	broadcast := func() {
 		s.mu.Lock()
 		s.cond.Broadcast()
 		s.mu.Unlock()
-	})
+	}
+	stop := context.AfterFunc(ctx, broadcast)
 	defer stop()
+	var deadline time.Time
+	if s.wait > 0 {
+		deadline = s.now().Add(s.wait)
+		timer := time.AfterFunc(s.wait, broadcast)
+		defer timer.Stop()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for s.free < n {
 		if ctx.Err() != nil {
 			return pgwire.Errorf("57014", "canceling statement while waiting for scatter capacity")
+		}
+		if !deadline.IsZero() && !s.now().Before(deadline) {
+			err := pgwire.Errorf("53300", "waited %s for scatter capacity and %d of %d streams are still in use", s.wait, n, n)
+			err.Hint = "retry the statement, narrow it to fewer shards, or raise the scatter stream budget"
+			return err
 		}
 		s.cond.Wait()
 	}
