@@ -41,6 +41,17 @@ PodMonitor selecting the `pgshard.io/cluster` label instead.
 | `buffering_events_total` / `buffering_seconds` | counter / histogram | failover buffering |
 | `scatter_fanout` | histogram | shards touched by scatter statements |
 | `shard_latency_seconds{shard}` | histogram | per-shard statement latency |
+| `shard_statements_total{shard}` | counter | statements sent to each shard |
+| `shard_rows_total{shard}` | counter | data rows each shard returned |
+| `shard_errors_total{shard}` | counter | statements each shard answered with an error |
+
+Latency alone cannot tell a shard that is busy from one that is slow: both
+show as time. `shard_statements_total` and `shard_rows_total` beside it are
+what separate a hot shard from slow storage, which is the question to answer
+before choosing a reshard boundary. Errors are counted apart so a shard
+failing fast is not read as one doing work. These cover the routed paths
+that go through the router's own pump; scatter accounts for its shards
+separately and has no per-shard series yet (PGS-504).
 
 ### Pooler (`pgshard_pooler_*`)
 
