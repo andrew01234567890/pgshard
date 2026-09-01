@@ -96,7 +96,7 @@ proto-breaking:
 		echo "proto-breaking: no proto files on main, skipping"; \
 	fi
 
-.PHONY: kind-up kind-down dev-up dev-down e2e integration perf-bench admin-image deploy-admin undeploy-admin
+.PHONY: kind-up kind-down dev-up dev-down e2e integration fuzz perf-bench admin-image deploy-admin undeploy-admin
 
 kind-up:
 	hack/kind/up.sh
@@ -139,6 +139,18 @@ e2e:
 # minutes: the router suite alone takes longer than that.
 integration:
 	PGSHARD_REQUIRE_DOCKER=1 go test -tags integration -count=1 -timeout 45m ./test/e2e/router/... ./internal/agent/... ./internal/pgtune/...
+
+# fuzz runs each fuzz target for a bounded time. Go runs only a target's
+# seed corpus during an ordinary `go test`, so without this the three
+# targets in this repository have never generated an input -- they have
+# been three table tests wearing a fuzzer's name.
+#
+# One invocation per target: `go test -fuzz` fuzzes exactly one.
+FUZZTIME ?= 60s
+fuzz:
+	go test -run '^$$' -fuzz FuzzCountStatements -fuzztime $(FUZZTIME) ./internal/pgwire/
+	go test -run '^$$' -fuzz FuzzDecodeStartupPacket -fuzztime $(FUZZTIME) ./internal/pgwire/
+	go test -run '^$$' -fuzz FuzzDecode -fuzztime $(FUZZTIME) ./internal/pgoutput/
 
 perf-bench:
 	hack/perf/benchstat.sh $(PERF_BASE_REF) $(PERF_OUT_DIR)
