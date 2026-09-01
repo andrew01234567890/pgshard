@@ -2,6 +2,7 @@ package agentauth
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -175,3 +176,71 @@ func TestAnAgentAcceptsEitherTokenDuringTheRoll(t *testing.T) {
 		t.Fatal("a call presenting no token was accepted")
 	}
 }
+
+// TestStreamInterceptorGatesTheSameWayAsUnary: the Agent service is unary
+// throughout, so a unary-only interceptor authenticates everything today
+// and would keep looking correct the moment somebody adds `returns
+// (stream ...)` to a service whose methods include Promote, Demote,
+// Rewind and Reclone. These exercise the streaming interceptor directly,
+// since there is no streaming RPC to call.
+func TestStreamInterceptorGatesTheSameWayAsUnary(t *testing.T) {
+	tokens := func() ([]string, error) { return []string{"expected"}, nil }
+	intercept := AnyOfStreamServerInterceptor(tokens)
+	handled := false
+	// Returns a distinguishable error so a test cannot mistake "the handler
+	// ran" for "the interceptor allowed it and the handler did nothing".
+	errHandlerRan := errors.New("handler ran")
+	handler := func(any, grpc.ServerStream) error { handled = true; return errHandlerRan }
+
+	t.Run("a stream with no token is refused", func(t *testing.T) {
+		handled = false
+		err := intercept(nil, fakeStream{ctx: context.Background()}, nil, handler)
+		if status.Code(err) != codes.Unauthenticated {
+			t.Fatalf("err = %v, want Unauthenticated", err)
+		}
+		if handled {
+			t.Fatal("the handler ran for an unauthenticated stream")
+		}
+	})
+
+	t.Run("a stream with the wrong token is refused", func(t *testing.T) {
+		handled = false
+		ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(MetadataKey, "wrong"))
+		if err := intercept(nil, fakeStream{ctx: ctx}, nil, handler); status.Code(err) != codes.Unauthenticated {
+			t.Fatalf("err = %v, want Unauthenticated", err)
+		}
+		if handled {
+			t.Fatal("the handler ran for a stream presenting the wrong token")
+		}
+	})
+
+	t.Run("a stream with the token is served", func(t *testing.T) {
+		handled = false
+		ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(MetadataKey, "expected"))
+		if err := intercept(nil, fakeStream{ctx: ctx}, nil, handler); !errors.Is(err, errHandlerRan) {
+			t.Fatalf("err = %v, want the handler's own error, proving it was reached", err)
+		}
+		if !handled {
+			t.Fatal("the handler did not run for an authenticated stream")
+		}
+	})
+
+	t.Run("a token source that errors refuses rather than opens", func(t *testing.T) {
+		handled = false
+		failing := AnyOfStreamServerInterceptor(func() ([]string, error) { return nil, errors.New("no secret") })
+		ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(MetadataKey, "expected"))
+		if err := failing(nil, fakeStream{ctx: ctx}, nil, handler); status.Code(err) != codes.Unauthenticated {
+			t.Fatalf("err = %v, want Unauthenticated", err)
+		}
+		if handled {
+			t.Fatal("the handler ran although the tokens could not be read")
+		}
+	})
+}
+
+type fakeStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (f fakeStream) Context() context.Context { return f.ctx }

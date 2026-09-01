@@ -92,6 +92,24 @@ func AnyOfUnaryServerInterceptor(tokensFn func() ([]string, error)) grpc.UnarySe
 	}
 }
 
+// AnyOfStreamServerInterceptor is the streaming half of
+// AnyOfUnaryServerInterceptor, and exists so that adding a streaming
+// method to the agent cannot quietly add an unauthenticated one.
+//
+// The Agent service is unary throughout today, so this gates nothing yet.
+// That is the point: a unary-only interceptor leaves a service whose
+// methods include Promote, Demote, Rewind and Reclone one `returns
+// (stream ...)` away from an open door, and nothing would fail to say so.
+func AnyOfStreamServerInterceptor(tokensFn func() ([]string, error)) grpc.StreamServerInterceptor {
+	return func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		tokens, err := tokensFn()
+		if err != nil || !authorized(ss.Context(), tokens) {
+			return errUnauthenticated
+		}
+		return handler(srv, ss)
+	}
+}
+
 func authorized(ctx context.Context, tokens []string) bool {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
