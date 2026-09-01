@@ -60,6 +60,14 @@ against it stays editable. That covers one still `pending`, and one paused
 before it started — pausing records the state to resume into, and a workflow
 that would resume to `pending` has not begun.
 
+Such a workflow can also be ended outright, with the controller's
+`CancelWorkflow`. It owns nothing, so cancelling is a state change and no
+more, and the row stops counting as active — which matters because
+`pgshard_admin` is deliberately `SELECT`-only on `pgshard.workflows`, so a
+pending row could not otherwise be cleared at all. A **running** workflow is
+refused: unwinding one means dropping subscriptions and lifting a fence, and
+that is a different operation.
+
 - **Re-key a table**: change `placement` or `shard_key` in
   `pgshard.tables` for a table that already has an effective placement.
 

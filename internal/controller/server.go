@@ -241,6 +241,35 @@ func (s *Server) PauseWorkflow(ctx context.Context, req *pgshardv1.PauseWorkflow
 	return &pgshardv1.PauseWorkflowResponse{Workflow: w}, nil
 }
 
+// CancelWorkflow ends a workflow that has not started.
+//
+// A pending or paused workflow has provisioned nothing, copied nothing and
+// fenced nothing, so abandoning it is a state change and no more. A running
+// one has to be unwound -- subscriptions dropped, the fence lifted, serving
+// left where it was -- and that is a different operation, so it is refused
+// here rather than half-done.
+//
+// Without this, an in-place reshard created by editing pgshard.shard_ranges
+// stayed pending for ever with no way to remove it: pgshard_admin is
+// SELECT-only on pgshard.workflows, deliberately, so the row could not be
+// deleted by hand either.
+func (s *Server) CancelWorkflow(ctx context.Context, req *pgshardv1.CancelWorkflowRequest) (*pgshardv1.CancelWorkflowResponse, error) {
+	if err := s.requireLeader(); err != nil {
+		return nil, err
+	}
+	if err := s.transition(ctx, req.GetId(), `
+		UPDATE pgshard.workflows
+		SET state = $2, status = (status - 'paused_from') || jsonb_build_object('message', 'cancelled before it started'), updated_at = now()
+		WHERE id::text = $1 AND state IN ($3, $4)`, StateCancelled, StatePending, StatePaused); err != nil {
+		return nil, err
+	}
+	w, err := s.getWorkflow(ctx, req.GetId())
+	if err != nil {
+		return nil, err
+	}
+	return &pgshardv1.CancelWorkflowResponse{Workflow: w}, nil
+}
+
 // ResumeWorkflow returns a paused workflow to the state it was paused from.
 func (s *Server) ResumeWorkflow(ctx context.Context, req *pgshardv1.ResumeWorkflowRequest) (*pgshardv1.ResumeWorkflowResponse, error) {
 	if err := s.requireLeader(); err != nil {

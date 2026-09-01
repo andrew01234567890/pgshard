@@ -17,6 +17,10 @@ service Controller {
   rpc PauseWorkflow(PauseWorkflowRequest) returns (PauseWorkflowResponse);
   // ResumeWorkflow continues a paused workflow.
   rpc ResumeWorkflow(ResumeWorkflowRequest) returns (ResumeWorkflowResponse);
+  // CancelWorkflow ends a workflow that has not started. A pending or
+  // paused one has claimed nothing and copied nothing, so it can simply be
+  // abandoned; a running one has to be unwound, which is its own operation.
+  rpc CancelWorkflow(CancelWorkflowRequest) returns (CancelWorkflowResponse);
   // ResolveTransactions triggers a resolution pass over in-doubt
   // distributed transactions.
   rpc ResolveTransactions(ResolveTransactionsRequest) returns (ResolveTransactionsResponse);
@@ -109,6 +113,16 @@ message PauseWorkflowRequest {
 
 // PauseWorkflowResponse returns the workflow after the request.
 message PauseWorkflowResponse {
+  Workflow workflow = 1;
+}
+
+// CancelWorkflowRequest names the workflow to abandon.
+message CancelWorkflowRequest {
+  string id = 1;
+}
+
+// CancelWorkflowResponse returns the workflow after the request.
+message CancelWorkflowResponse {
   Workflow workflow = 1;
 }
 

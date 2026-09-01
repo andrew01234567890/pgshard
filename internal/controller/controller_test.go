@@ -321,7 +321,32 @@ func TestController(t *testing.T) {
 		if err != nil || resumed.Workflow.State != pgshardv1.WorkflowState_WORKFLOW_STATE_RUNNING {
 			t.Fatalf("resume from running: %v %v", resumed, err)
 		}
+
+		// A running workflow has provisioned, copied or fenced something,
+		// and abandoning it would leave that behind. Unwinding one is a
+		// different operation, so this refuses rather than half-doing it.
+		if _, err := srv.CancelWorkflow(ctx, &pgshardv1.CancelWorkflowRequest{Id: id}); status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("cancelling a running workflow: %v", err)
+		}
 		mustExec(t, conn, `UPDATE pgshard.workflows SET state = 'pending' WHERE id::text = $1`, id)
+
+		// A pending one has claimed nothing. Without this it stayed for
+		// ever: pgshard_admin is SELECT-only on pgshard.workflows, so the
+		// row could not be removed by hand either.
+		cancelled, err := srv.CancelWorkflow(ctx, &pgshardv1.CancelWorkflowRequest{Id: id})
+		if err != nil || cancelled.Workflow.State != pgshardv1.WorkflowState_WORKFLOW_STATE_CANCELLED {
+			t.Fatalf("cancel: %v %v", cancelled, err)
+		}
+		if _, err := srv.CancelWorkflow(ctx, &pgshardv1.CancelWorkflowRequest{Id: id}); status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("double cancel: %v", err)
+		}
+		// And it stops counting as active, which is the point: the
+		// reconciler creates the workflow the edit still wants.
+		if res := reconcile(t, conn); res.WorkflowsCreated != 1 {
+			t.Fatalf("a cancelled workflow still blocks its replacement: %+v", res)
+		}
+		mustExec(t, conn, `DELETE FROM pgshard.workflows WHERE id::text <> $1 AND kind = 'rekey'`, id)
+		mustExec(t, conn, `UPDATE pgshard.workflows SET state = 'pending', status = '{}'::jsonb WHERE id::text = $1`, id)
 	})
 
 	t.Run("reshard_pending_set_state_machine", func(t *testing.T) {
