@@ -841,7 +841,7 @@ func (o *pgCutover) reverseSubscribeOn(ctx context.Context, conn ShardConn, db d
 			return err
 		}
 		cctx, cancel := context.WithTimeout(ctx, createSubscriptionTimeout)
-		_, err = conn.Exec(cctx, CreateReverseSubscriptionSQL(name, conninfo, pubs, SubscriptionOptions{Slot: name, Failover: o.c.SlotFailover}))
+		_, err = conn.Exec(cctx, CreateReverseSubscriptionSQL(name, conninfo, pubs, SubscriptionOptions{Slot: name, Failover: !o.c.SlotFailoverDisabled}))
 		cancel()
 		if err != nil {
 			return err
