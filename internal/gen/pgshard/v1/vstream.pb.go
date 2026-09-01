@@ -219,7 +219,10 @@ type VStreamOptions struct {
 	WallClockLeadMs uint32 `protobuf:"varint,5,opt,name=wall_clock_lead_ms,json=wallClockLeadMs,proto3" json:"wall_clock_lead_ms,omitempty"`
 	// Longest hold of a shard in milliseconds; zero means 10000.
 	WallClockHoldMs uint32 `protobuf:"varint,6,opt,name=wall_clock_hold_ms,json=wallClockHoldMs,proto3" json:"wall_clock_hold_ms,omitempty"`
-	// Shard set to stream; empty means default.
+	// Shard set to stream; empty means whichever set is serving. A reshard
+	// or a blue/green upgrade makes another set serving and retires the old
+	// one, and a consumer that names no set follows that rather than staying
+	// on the shards nothing writes to any more.
 	ShardSet string `protobuf:"bytes,7,opt,name=shard_set,json=shardSet,proto3" json:"shard_set,omitempty"`
 	// Where a shard absent from position starts: its slot's confirmed
 	// position (default) or an initial copy of every table followed by
