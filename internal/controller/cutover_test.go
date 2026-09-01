@@ -531,6 +531,34 @@ func TestCutoverErroringStepBeforeJournalHitsTimeout(t *testing.T) {
 	}
 }
 
+// TestCutoverSucceedingStepStillHitsTheFenceDeadline: the deadline was only
+// consulted when a step failed or reported waiting, so a step that SUCCEEDED
+// slowly held the fence for as long as it took. verify is the case that
+// matters -- it scans every table with writes already fenced, so on a real
+// table the hold grows with the data and nothing stopped it.
+func TestCutoverSucceedingStepStillHitsTheFenceDeadline(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.c.CutoverTimeout, h.c.CutoverAttempts = time.Second, 2
+	h.ops.fail = map[string]error{StepVerify: retryf("still comparing")}
+	h.runUntil(t, StageSwitching)
+	h.pass(t)
+	if h.wf.cutover.Step != StepVerify || !h.ops.fenced {
+		t.Fatalf("expected to be parked at verify behind the fence; step=%s fenced=%t", h.wf.cutover.Step, h.ops.fenced)
+	}
+	// The scan finishes -- successfully -- but only after the fence has been
+	// held past its limit.
+	h.clock = h.clock.Add(2 * time.Second)
+	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); err != nil {
+		t.Fatalf("an over-deadline fence must abort, not error: %v", err)
+	}
+	if h.wf.stage != StageAwaitingSwitch || h.ops.fenced {
+		t.Fatalf("a step that succeeded past the deadline must undo the fence: stage=%s fenced=%t", h.wf.stage, h.ops.fenced)
+	}
+	if h.wf.cutover.Attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", h.wf.cutover.Attempts)
+	}
+}
+
 // TestStalledStepReportsItsAge: after the journal every error is retried
 // with no timeout and no attempt limit, and every pass refreshes updated_at.
 // A step that has been failing for hours therefore looks exactly like a

@@ -443,6 +443,15 @@ func (c *Copier) switchWrites(ctx context.Context, wf *copyWorkflow, ops cutover
 			msg += wf.cutover.stalledFor(c.now())
 			return false, c.saveCutover(ctx, wf, msg)
 		}
+		// The deadline was only ever consulted when a step failed or
+		// reported waiting, so a step that SUCCEEDED slowly held the fence
+		// for as long as it liked. verify is the one that matters: it
+		// scans every table with writes already fenced, so on a real table
+		// the hold grows with the data and nothing here stopped it.
+		if c.mayAbort(wf) && beforeJournal(step) && c.now().Sub(*wf.cutover.FencedAt) > c.cutoverTimeout() {
+			return c.abortSwitch(ctx, wf, ops, fmt.Sprintf("step %s finished but the fence had been held %s, over the %s limit",
+				step, c.now().Sub(*wf.cutover.FencedAt).Round(time.Millisecond), c.cutoverTimeout()))
+		}
 		next := nextStep(step)
 		wf.cutover.Step = next
 		wf.cutover.stampStep(c.now())
