@@ -529,8 +529,13 @@ func TestReshardCopyOnPostgres(t *testing.T) {
 	// This cancel happens at stage switching but before the fence step ran,
 	// so there is nothing fenced to undo here; the undo itself is covered by
 	// TestUnwindLiftsTheFenceWithoutTheTargets, which raises a real fence.
+	// A count alone cannot be diagnosed after the fact: a shard left
+	// write-fenced by a cancelled cutover is a stuck shard, and which ones
+	// they are and how far the workflow got is the whole question.
 	if n := queryOne[int64](t, f.catalog, `SELECT count(*) FROM pgshard.shard_status WHERE migrating`); n != 0 {
-		t.Errorf("%d shard(s) left write-fenced by a cancelled cutover", n)
+		stuck := queryOne[string](t, f.catalog, `SELECT string_agg(shard_set || '/' || shard_id, ', ' ORDER BY shard_set, shard_id) FROM pgshard.shard_status WHERE migrating`)
+		_, stage, msg := f.workflow(id)
+		t.Errorf("%d shard(s) left write-fenced by a cancelled cutover: %s (workflow stage %s: %s)", n, stuck, stage, msg)
 	}
 	if out := f.pass(); out.Driven != 0 {
 		t.Fatalf("cancelled workflow driven again: %+v", out)
