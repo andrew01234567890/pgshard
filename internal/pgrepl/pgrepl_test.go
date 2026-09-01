@@ -114,15 +114,25 @@ func TestCaptures(t *testing.T) {
 	seen := map[string]bool{}
 	ran := 0
 	for _, img := range images {
-		if seen[img.label] || exec.Command("docker", "image", "inspect", img.name).Run() != nil {
+		if seen[img.label] {
 			continue
+		}
+		// Pull rather than skip. These captures are what the offline
+		// decoder tests replay, so an image that is merely not cached yet
+		// meant the goldens were never checked against real PostgreSQL --
+		// and a golden nothing verifies is just a file.
+		if exec.Command("docker", "image", "inspect", img.name).Run() != nil {
+			if err := exec.Command("docker", "pull", img.name).Run(); err != nil {
+				t.Logf("image %s is not present and could not be pulled: %v", img.name, err)
+				continue
+			}
 		}
 		seen[img.label] = true
 		ran++
 		t.Run(img.label, func(t *testing.T) { runCaptures(t, img.name, img.label) })
 	}
 	if ran == 0 {
-		t.Skip("no PostgreSQL 18/19 image available")
+		dockertest.Unavailable(t, "no PostgreSQL 18/19 image available and none could be pulled")
 	}
 }
 

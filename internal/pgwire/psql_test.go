@@ -24,7 +24,14 @@ func TestPsqlConformance(t *testing.T) {
 		dockertest.Unavailable(t, "docker not on PATH; skipping psql conformance test")
 	}
 	if err := exec.Command("docker", "image", "inspect", psqlImage).Run(); err != nil {
-		t.Skipf("image %s not available locally; skipping psql conformance test", psqlImage)
+		// Pull rather than skip. This test drives the real psql against the
+		// wire implementation, and it is the only thing that does; skipping
+		// it when the image merely is not cached yet meant it never ran in
+		// CI at all, where nothing pulls this image and the conformance it
+		// checks went unverified on every commit.
+		if perr := exec.Command("docker", "pull", psqlImage).Run(); perr != nil {
+			dockertest.Unavailable(t, "image %s is not present and could not be pulled (%v); skipping psql conformance test", psqlImage, perr)
+		}
 	}
 	scram, err := BuildSCRAMVerifier("s3cret", nil, 0)
 	if err != nil {
