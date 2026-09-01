@@ -389,8 +389,20 @@ func TestResolverAbortRaceIsRolledBack(t *testing.T) {
 	// guarded commit UPDATE then finds no preparing row.
 	h.log.abortAfterBegin = true
 	err = tx.Commit(ctx)
-	if pe := expectRefusalCode(t, err, "40000"); !strings.Contains(pe.Message, "aborted by the resolver") {
+	// 40001, not the generic 40000: nothing was decided, so nothing
+	// committed, and standard client retry loops test for exact 40001.
+	pe := expectRefusalCode(t, err, "40001")
+	if !strings.Contains(pe.Message, "aborted by the resolver") {
 		t.Fatalf("message %q", pe.Message)
+	}
+	// Distinguishable from a serialization failure without parsing prose:
+	// both are 40001 and both are safe to retry, but only one is about
+	// contention.
+	if !strings.Contains(pe.Detail, "no participant committed") {
+		t.Errorf("detail %q must say the transaction did not commit anywhere", pe.Detail)
+	}
+	if pe.Hint == "" {
+		t.Error("a retryable error must say it is retryable")
 	}
 	if h.prepared() != 0 {
 		t.Fatalf("%d prepared transactions left", h.prepared())

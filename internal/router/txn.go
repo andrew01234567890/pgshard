@@ -28,8 +28,15 @@ const (
 	txnModeTwoPC  = "twopc"
 	txnModeSingle = "single"
 
-	codeInDoubt         = "08007"
-	codeTxnRollback     = "40000"
+	codeInDoubt = "08007"
+	// codeRetryable is 40001. The resolver aborting an undecided
+	// transaction is a known-safe whole-transaction retry -- nothing was
+	// decided, so nothing committed -- and it is the same safety the
+	// failover path already reports as 40001. It used to be 40000, which
+	// is the generic class code: pgx, JDBC and psycopg retry loops test
+	// for exact 40001, so a retry that was safe went unretried and
+	// surfaced to the application as a failure.
+	codeRetryable       = "40001"
 	codeInvalidParamVal = "22023"
 )
 
@@ -556,7 +563,13 @@ func (e *Executor) twoPhaseCommit(ctx context.Context, writers, readers []*txnPa
 		})
 		e.finishTxn("ROLLBACK")
 		e.r.metrics.TwoPCAborts.Inc()
-		return pgwire.Errorf(codeTxnRollback, "two-phase commit: transaction %s was aborted by the resolver before it was decided", gid)
+		err := pgwire.Errorf(codeRetryable, "two-phase commit: transaction %s was aborted by the resolver before it was decided", gid)
+		// Named so a client can tell this apart from a serialization
+		// failure without parsing the message: both are 40001 and both are
+		// safe to retry, but only one says anything about contention.
+		err.Detail = "the resolver aborted the transaction; no participant committed"
+		err.Hint = "retry the transaction"
+		return err
 	}
 	crashpoint.Hit("after_decision")
 	e.r.metrics.TwoPCCommits.Inc()
