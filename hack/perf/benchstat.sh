@@ -5,7 +5,17 @@ set -euo pipefail
 base_ref="${1:-${PERF_BASE_REF:-origin/main}}"
 out="${2:-${PERF_OUT_DIR:-perf-out}}"
 count="${PERF_COUNT:-10}"
-pkgs="${PERF_PKGS:-./test/perf/...}"
+# The gate watched ./test/perf/... alone, which is 14 benchmarks -- while
+# 12 more live beside the code they measure, in the router, the pooler,
+# the scatter merge, the VStream vector and the snapshot. Those are the
+# hot paths a regression actually shows up on: BenchmarkMigrating's own
+# comment says it measures the check the router makes on every write, and
+# a regression there was invisible to the only gate watching for one.
+#
+# Named explicitly rather than ./internal/... because a blanket sweep
+# builds every internal package's test binary, and some need envtest or
+# Docker at TestMain even with -run '^$'.
+pkgs="${PERF_PKGS:-./test/perf/... ./internal/catalog/snapshot/... ./internal/pooler/... ./internal/router/...}"
 BENCHSTAT_VERSION="${BENCHSTAT_VERSION:-v0.0.0-20260813145340-fd4a688df892}"
 
 root="$(git rev-parse --show-toplevel)"
