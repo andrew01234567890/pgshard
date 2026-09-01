@@ -56,6 +56,14 @@ func startDDLStack(tb testing.TB) *ddlStack {
 		tb.Fatal(err)
 	}
 	defer func() { _ = cat.Close(ctx) }()
+	// One transaction: the reconciler upserts a status row for a table it
+	// finds declared without one, and that upsert clears the inspection
+	// the rows below are standing in for.
+	tx, err := cat.Begin(ctx)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
 	for _, sql := range []string{
 		`INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES ('default', 0, '[,-3000000000000000000)'), ('default', 1, '[-3000000000000000000,3000000000000000000)'), ('default', 2, '[3000000000000000000,)')`,
 		`INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('app', 'public', 'orders', 'sharded', 'tenant_id')`,
@@ -65,9 +73,12 @@ func startDDLStack(tb testing.TB) *ddlStack {
 		// does not run; regions evaluates nothing per shard.
 		`INSERT INTO pgshard.table_status (database, schema_name, table_name, effective_placement, reference_checked_generation) VALUES ('app', 'public', 'regions', 'reference', 0)`,
 	} {
-		if _, err := cat.Exec(ctx, sql); err != nil {
+		if _, err := tx.Exec(ctx, sql); err != nil {
 			tb.Fatalf("%s: %v", sql, err)
 		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		tb.Fatal(err)
 	}
 	return s
 }
