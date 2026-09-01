@@ -13,6 +13,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/andrew01234567890/pgshard/internal/dockertest"
 )
 
 func sqlstate(err error) string {
@@ -166,7 +168,9 @@ func TestRouterSingleShard(t *testing.T) {
 
 	t.Run("psql", func(t *testing.T) {
 		if err := exec.Command("docker", "image", "inspect", pgImage()).Run(); err != nil {
-			t.Skip("no psql image")
+			if perr := exec.Command("docker", "pull", pgImage()).Run(); perr != nil {
+				dockertest.Unavailable(t, "image %s is not present and could not be pulled: %v", pgImage(), perr)
+			}
 		}
 		name := "pgshard-router-e2e-psql-" + s.routerPort
 		t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", name).Run() })
