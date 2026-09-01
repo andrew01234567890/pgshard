@@ -104,6 +104,12 @@ the rest with `0A000`. See *Routing* below.
   different backends), `SET LOCAL` is honoured only within its transaction,
   and advisory locks, `LISTEN` (refused) and temporary tables (refused) do
   not survive a release.
+- **Cancel grace.** A cancelled statement is drained to `ReadyForQuery` so
+  the stream stays in sync, but only for 5s. The cancel is best-effort —
+  it can fail, and a backend can be wedged somewhere PostgreSQL will not
+  interrupt it — and past the grace the stream is aborted rather than
+  waited on, since no answer is coming and an unbounded wait holds the
+  session, its pooler session and the router's drain open.
 - **Cancel.** A `CancelRequest` is verified against the session's key and
   forwarded as the pooler `Cancel` RPC; a query context that ends while a
   batch is in flight (drain) does the same. The batch is always drained to

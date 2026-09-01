@@ -688,6 +688,13 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 		case <-ctx.Done():
 			return true, ctx.Err()
 		}
+	case strings.HasPrefix(q, "select wedged()"):
+		// A backend PostgreSQL will not interrupt: the Cancel RPC is
+		// accepted, recorded and changes nothing. This is the case the
+		// cancel grace exists for -- the one where waiting for the drain
+		// waits for ever.
+		<-ctx.Done()
+		return true, ctx.Err()
 	case q == "copy t from stdin":
 		s.inCopy = true
 		return false, s.send(&pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_CopyInResponse{CopyInResponse: &pgshardv1.CopyInResponse{}}})
