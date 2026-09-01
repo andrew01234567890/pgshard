@@ -283,7 +283,9 @@ func TestClusterFullSpecAccepted(t *testing.T) {
 	sc := "fast"
 	shards := 4
 	c.Spec.Shards = &shards
+	// 19 is a beta, so it has to be asked for by name.
 	c.Spec.PostgreSQL.Major = 19
+	c.Spec.PostgreSQL.Image = "ghcr.io/andrew01234567890/pgshard-postgres:19beta3"
 	c.Spec.PostgreSQL.Profile = "analytics"
 	c.Spec.Storage.StorageClassName = &sc
 	c.Spec.Resources = corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("8Gi")}}
@@ -668,5 +670,30 @@ func TestRemoteRepositoryIsEncryptedUnlessSaidOtherwise(t *testing.T) {
 	// A posix repository is a PVC of this cluster's own.
 	if err := create(t, policy("posix-plain", pgshardv1alpha1.ObjectStoreSpec{Type: "posix"})); err != nil {
 		t.Fatalf("posix needs no encryption: %v", err)
+	}
+}
+
+// TestABetaMajorHasToBeAskedForByName: PostgreSQL says a beta is not
+// intended for production and may contain serious bugs. `major: 19` on its
+// own reads like any other supported choice and resolves to a moving tag,
+// so it is refused until an image says the choice was deliberate. 18 is a
+// release and needs nothing.
+func TestABetaMajorHasToBeAskedForByName(t *testing.T) {
+	bare := validCluster("beta-bare")
+	bare.Spec.PostgreSQL.Major = 19
+	mustReject(t, bare, "PostgreSQL 19 is a beta")
+
+	named := validCluster("beta-named")
+	named.Spec.PostgreSQL.Major = 19
+	named.Spec.PostgreSQL.Image = "ghcr.io/andrew01234567890/pgshard-postgres:19beta3"
+	if err := create(t, named); err != nil {
+		t.Fatalf("naming the image is the opt-in: %v", err)
+	}
+
+	// A release major is unaffected: nothing to acknowledge.
+	release := validCluster("release-bare")
+	release.Spec.PostgreSQL.Major = 18
+	if err := create(t, release); err != nil {
+		t.Fatalf("18 is a release and needs no image: %v", err)
 	}
 }

@@ -68,6 +68,10 @@ jobs:
     env:
       PG_MAJOR: ${{ inputs.pg }}
       E2E_SUITE: ${{ inputs.suite }}
+      # The CRD refuses a beta major without an explicit image, so a suite
+      # that runs one names it. This is the same image the load step puts
+      # into kind, so the gate costs a line and changes nothing else.
+      PGSHARD_POSTGRES_IMAGE: ghcr.io/andrew01234567890/pgshard-postgres:${{ inputs.pg }}
       E2E_ARTIFACTS: ${{ github.workspace }}/artifacts/run-${{ matrix.run }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

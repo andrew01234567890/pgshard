@@ -42,6 +42,21 @@ func env(key, def string) string {
 
 // clusterManifest renders the cluster at major with a short retirement
 // window so the upgrade completes within the suite.
+// betaImage names the image for a prerelease major. The CRD refuses
+// `major: 19` without one, so that nobody deploys a beta by choosing what
+// looks like an ordinary supported version -- and a suite whose whole
+// purpose is reaching 19 is exactly a caller that means it, so it says so
+// rather than being exempted.
+func betaImage(major int) string {
+	if major != 19 {
+		return ""
+	}
+	if img := os.Getenv("PGSHARD_POSTGRES_IMAGE"); img != "" {
+		return "    image: " + img + "\n"
+	}
+	return "    image: ghcr.io/andrew01234567890/pgshard-postgres:19\n"
+}
+
 func clusterManifest(major int, retire string) string {
 	return fmt.Sprintf(`
 apiVersion: v1
@@ -59,7 +74,7 @@ spec:
     insecure: true
   postgresql:
     major: %[3]d
-  catalog:
+%[5]s  catalog:
     replicas: 1
     storage:
       size: 512Mi
@@ -74,7 +89,7 @@ spec:
     requests:
       cpu: 50m
       memory: 128Mi
-`, testNamespace, clusterName, major, retire)
+`, testNamespace, clusterName, major, retire, betaImage(major))
 }
 
 func clientManifest(image string) string {
