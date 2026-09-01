@@ -227,10 +227,18 @@ idempotent, so a controller crash anywhere repeats at most one step:
 4. `positions` — `pg_current_wal_lsn()` per source, kept in the record.
 5. `catch_up` — every forward subscription's `latest_end_lsn` reaches its
    source position.
-6. `verify` — per table, range and target: `count(*)` and
-   `sum(hashtext(row::text))` under the source position vs the target. A
-   mismatch aborts the switch (fence released, workflow `failed`) before
-   anything irreversible.
+6. `verify` — per table, range and target: `count(*)`, `sum(h)` and
+   `bit_xor(h)` where `h = hashtextextended(row::text, 0)`, under the source
+   position vs the target. A mismatch aborts the switch (fence released,
+   workflow `failed`) before anything irreversible.
+
+   Two combinations rather than one because a sum is commutative and
+   additive: any two rows swapped for two others of the same total pass a
+   sum unnoticed, and rows that sum alike generally do not XOR alike. The
+   hash is 64-bit for the same reason — at a few million rows a 32-bit
+   collision is unremarkable. It remains a digest, not a row-by-row
+   comparison: an online, resumable per-key diff before the fence is
+   PGS-478.
 7. `reverse` — publications on the targets (`pgshard_reshard_g<gen>_rev_s<src>`,
    same row filters, target -> source direction) and disabled subscriptions
    on the sources (`origin=none, copy_data=false, create_slot=true`),

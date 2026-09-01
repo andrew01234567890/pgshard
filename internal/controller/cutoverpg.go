@@ -386,22 +386,53 @@ func slotFlushPositions(ctx context.Context, dialer ShardDialer, set string, id 
 	return out, rows.Err()
 }
 
-// rowDigest is count(*) and the sum of per-row text hashes of one table
-// slice.
+// rowDigest is one table slice's row count and two independent
+// combinations of its per-row text hashes.
 type rowDigest struct {
 	Rows int64
 	Hash int64
+	// XOR is the same per-row hashes combined over a different algebra,
+	// so a substitution that preserves the sum still has to preserve this.
+	XOR int64
 }
 
 func (d rowDigest) add(o rowDigest) rowDigest {
-	return rowDigest{Rows: d.Rows + o.Rows, Hash: d.Hash + o.Hash}
+	return rowDigest{Rows: d.Rows + o.Rows, Hash: d.Hash + o.Hash, XOR: d.XOR ^ o.XOR}
 }
 
+// digest is what verification compares, and it decides whether a cutover
+// proceeds -- so what it costs to fool matters.
+//
+// hashtext is 32 bits, which at a few million rows makes an accidental
+// collision unremarkable, and a sum is commutative and additive: any two
+// rows swapped for two others of the same total pass unnoticed. Both
+// together mean a target missing or holding wrong rows could verify clean,
+// which is the worst answer this can give -- it is the one that lets the
+// cutover continue.
+//
+// So: 64 bits instead of 32, and a second aggregate over a different
+// algebra. Rows that sum the same generally do not XOR the same, so
+// defeating both at once is a much harder accident than defeating either.
+// It is still a digest and not a row-by-row comparison; that is the
+// resumable VDiff phase in PGS-478, and this is what the fenced check can
+// afford until it exists.
 func digest(ctx context.Context, conn ShardConn, schema, name, filter string) (rowDigest, error) {
-	sql := fmt.Sprintf(`SELECT count(*), coalesce(sum(hashtext(t::text)::bigint), 0) FROM %s.%s t`, QuoteIdent(schema), QuoteIdent(name))
+	where := ""
 	if filter != "" {
-		sql += " WHERE (" + filter + ")"
+		where = " WHERE (" + filter + ")"
 	}
+	// Hashed once per row rather than once per aggregate.
+	//
+	// The sum is taken over the low 31 bits of each hash, not the whole
+	// 64: sum(bigint) is numeric in PostgreSQL and a full-width sum runs
+	// past int64 after a few million rows, which failed the scan rather
+	// than the comparison -- a verification that errors instead of
+	// answering. Masking bounds the total at rows x 2^31, which no table
+	// this runs on comes near. The sum loses width; bit_xor still carries
+	// all 64 bits, and it is the pair that makes a substitution hard.
+	sql := fmt.Sprintf(`SELECT count(*), coalesce(sum(h & 2147483647), 0), coalesce(bit_xor(h), 0)
+		FROM (SELECT hashtextextended(t::text, 0) AS h FROM %s.%s t%s) s`,
+		QuoteIdent(schema), QuoteIdent(name), where)
 	rows, err := conn.Query(ctx, sql)
 	if err != nil {
 		return rowDigest{}, err
@@ -550,8 +581,8 @@ func (o *pgCutover) Verify(ctx context.Context) (VerifyReport, error) {
 						// the fence was not holding, which is a different
 						// bug from the two sides genuinely disagreeing.
 						detail += o.sourcesMovedSince(ctx, db, schema, name, hashes[key], i, want)
-						report.Mismatches = append(report.Mismatches, fmt.Sprintf("%s.%s on %s/%d: %d rows hash %d, sources predict %d rows hash %d%s",
-							db.name, key, o.wf.set, t, got.Rows, got.Hash, want.Rows, want.Hash, detail))
+						report.Mismatches = append(report.Mismatches, fmt.Sprintf("%s.%s on %s/%d: %d rows hash %d/%d, sources predict %d rows hash %d/%d%s",
+							db.name, key, o.wf.set, t, got.Rows, got.Hash, got.XOR, want.Rows, want.Hash, want.XOR, detail))
 					}
 				}
 				return nil
