@@ -88,12 +88,12 @@ func (s *shardedStack) awaitReference(tb testing.TB, conn *pgx.Conn) {
 		// the statement rather than a parameter.
 		_, err := conn.Exec(ctx, fmt.Sprintf("insert into regions (id, name) values (%d, now()::text)", probeID), pgx.QueryExecModeSimpleProtocol)
 		if sqlstate(err) == "0A000" && strings.Contains(err.Error(), "cannot call now()") {
-			// A reference-table delete reaches every shard, which is where
-			// the landed probes are: before the placement was known they
-			// were routed by hash, so they are not all on one.
-			if _, derr := conn.Exec(ctx, "delete from regions where id = $1", probeID); derr != nil {
-				tb.Fatalf("clearing the reference probe rows: %v", derr)
-			}
+			// Straight to each shard, not through the router: the landed
+			// probes were routed by hash before the placement was known,
+			// so they are spread, and one subtest arms the router to die
+			// on its next multi-shard write -- which a delete through it
+			// would be, killing the router before the test's own.
+			s.clearProbeRows(tb)
 			return
 		}
 		if time.Now().After(deadline) {
@@ -106,6 +106,22 @@ func (s *shardedStack) awaitReference(tb testing.TB, conn *pgx.Conn) {
 // probeID is the row awaitReference writes while it waits. No test uses it
 // for anything else, so a leftover is always the probe's.
 const probeID = 0
+
+func (s *shardedStack) clearProbeRows(tb testing.TB) {
+	tb.Helper()
+	ctx := context.Background()
+	for shard := 0; shard < 2; shard++ {
+		conn, err := pgx.Connect(ctx, s.appDSN(shard))
+		if err != nil {
+			tb.Fatal(err)
+		}
+		_, err = conn.Exec(ctx, "delete from regions where id = $1", probeID)
+		_ = conn.Close(ctx)
+		if err != nil {
+			tb.Fatalf("clearing the reference probe rows on shard %d: %v", shard, err)
+		}
+	}
+}
 
 func (s *shardedStack) regionsOn(tb testing.TB, shard int) []string {
 	tb.Helper()
