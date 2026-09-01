@@ -851,10 +851,44 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 
 // statementName renders the human-readable name of an unrecognised
 // statement node for the refusal message.
+// abbreviatedStatementWords expands the words libpg_query shortens in its
+// node type names to what a user typed.
+var abbreviatedStatementWords = map[string]string{
+	"MAT":   "MATERIALIZED",
+	"SEC":   "SECURITY",
+	"SEQ":   "SEQUENCE",
+	"STATS": "STATISTICS",
+	"TRIG":  "TRIGGER",
+}
+
+// defineStatementNames give a DefineStmt the name the user typed. One node
+// type covers CREATE OPERATOR, COLLATION, AGGREGATE, TYPE and the text
+// search objects, so deriving the name from the node alone produced
+// "DEFINE is not supported through the router" -- a refusal naming
+// something that is not a statement and does not appear in any statement
+// the client could have written.
+var defineStatementNames = map[pgquerypb.ObjectType]string{
+	pgquerypb.ObjectType_OBJECT_AGGREGATE:       "CREATE AGGREGATE",
+	pgquerypb.ObjectType_OBJECT_COLLATION:       "CREATE COLLATION",
+	pgquerypb.ObjectType_OBJECT_OPERATOR:        "CREATE OPERATOR",
+	pgquerypb.ObjectType_OBJECT_OPCLASS:         "CREATE OPERATOR CLASS",
+	pgquerypb.ObjectType_OBJECT_OPFAMILY:        "CREATE OPERATOR FAMILY",
+	pgquerypb.ObjectType_OBJECT_TSCONFIGURATION: "CREATE TEXT SEARCH CONFIGURATION",
+	pgquerypb.ObjectType_OBJECT_TSDICTIONARY:    "CREATE TEXT SEARCH DICTIONARY",
+	pgquerypb.ObjectType_OBJECT_TSPARSER:        "CREATE TEXT SEARCH PARSER",
+	pgquerypb.ObjectType_OBJECT_TSTEMPLATE:      "CREATE TEXT SEARCH TEMPLATE",
+	pgquerypb.ObjectType_OBJECT_TYPE:            "CREATE TYPE",
+}
+
 func statementName(node *pgquerypb.Node) string {
 	inner := node.GetNode()
 	if inner == nil {
 		return "an empty statement"
+	}
+	if d, ok := inner.(*pgquerypb.Node_DefineStmt); ok {
+		if name, known := defineStatementNames[d.DefineStmt.GetKind()]; known {
+			return name
+		}
 	}
 	name := strings.TrimPrefix(fmt.Sprintf("%T", inner), "*pgquerypb.Node_")
 	name = strings.TrimSuffix(name, "Stmt")
@@ -866,9 +900,18 @@ func statementName(node *pgquerypb.Node) string {
 		}
 		out = append(out, c)
 	}
-	name = strings.ToUpper(string(out))
-	r := strings.NewReplacer("MAT VIEW", "MATERIALIZED VIEW", "SEC LABEL", "SECURITY LABEL", "SEQ ", "SEQUENCE ", "TRIG ", "TRIGGER ")
-	return r.Replace(name)
+	// Expanded word by word rather than by substring: the abbreviations
+	// that end a name -- CREATE TRIG, CREATE SEQ, CREATE EVENT TRIG -- are
+	// the common ones, and a rule written with a trailing space never fires
+	// on them, so the router refused statements by a name that does not
+	// exist.
+	words := strings.Split(strings.ToUpper(string(out)), " ")
+	for i, w := range words {
+		if full, ok := abbreviatedStatementWords[w]; ok {
+			words[i] = full
+		}
+	}
+	return strings.Join(words, " ")
 }
 
 // unshardedOnly pins the plan to the home shard.
