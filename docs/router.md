@@ -101,7 +101,10 @@ the rest with `0A000`. See *Routing* below.
   state that the router does not track is lost when the backend changes:
   the unnamed prepared statement lives only until the next `Sync` (a
   `Parse` of `""` in one batch and a `Bind` of it in a later one may land on
-  different backends), `SET LOCAL` is honoured only within its transaction,
+  different backends, so the router re-parses the unnamed statement ahead of
+  a batch that binds without parsing it — carried rather than pinned, since
+  pinning would cost every such session its transaction pooling),
+  `SET LOCAL` is honoured only within its transaction,
   and advisory locks, `LISTEN` (refused) and temporary tables (refused) do
   not survive a release.
 - **Cancel grace.** A cancelled statement is drained to `ReadyForQuery` so
