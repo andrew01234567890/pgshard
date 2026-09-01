@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -214,6 +215,38 @@ const StrategyRewrite = "rewrite"
 // Stored as concurrent, read back as repack.
 const StrategyRepack = "repack"
 
+// metaStrategy is the logical strategy a migration's metadata encodes.
+//
+// The strategy column stores only direct and concurrent; multistep,
+// rewrite and repack live in the metadata. Reconstructing them with three
+// sequential assignments let a row carrying two of them resolve to
+// whichever happened to be checked last -- silently running a different
+// migration from the one that was planned, chosen by the order of three
+// ifs rather than by anything anyone decided.
+//
+// Exactly one of them may be set. Two is not a strategy to choose
+// between: it is metadata no planner emits, and the migration it
+// describes is unknown rather than ambiguous.
+func metaStrategy(stored string, meta MigrationMeta) (string, error) {
+	var found []string
+	if len(meta.Steps) > 0 {
+		found = append(found, StrategyMultistep)
+	}
+	if meta.Rewrite != nil {
+		found = append(found, StrategyRewrite)
+	}
+	if meta.Repack {
+		found = append(found, StrategyRepack)
+	}
+	switch len(found) {
+	case 0:
+		return stored, nil
+	case 1:
+		return found[0], nil
+	}
+	return "", fmt.Errorf("metadata encodes %s at once, so the migration it describes is not known", strings.Join(found, " and "))
+}
+
 // EnqueueMigration inserts m as queued and returns its id.
 func EnqueueMigration(ctx context.Context, db RowQuerier, m DDLMigration) (string, error) {
 	strategy := m.Strategy
@@ -348,15 +381,11 @@ func collectMigrations(rows pgx.Rows) ([]DDLMigration, error) {
 		if err := json.Unmarshal(meta, &m.Meta); err != nil {
 			return nil, fmt.Errorf("catalog: migration %s meta: %w", m.ID, err)
 		}
-		if len(m.Meta.Steps) > 0 {
-			m.Strategy = StrategyMultistep
+		strategy, serr := metaStrategy(m.Strategy, m.Meta)
+		if serr != nil {
+			return nil, fmt.Errorf("catalog: migration %s: %w", m.ID, serr)
 		}
-		if m.Meta.Rewrite != nil {
-			m.Strategy = StrategyRewrite
-		}
-		if m.Meta.Repack {
-			m.Strategy = StrategyRepack
-		}
+		m.Strategy = strategy
 		m.PerShard = map[string]ShardMigration{}
 		if err := json.Unmarshal(perShard, &m.PerShard); err != nil {
 			return nil, fmt.Errorf("catalog: migration %s per_shard: %w", m.ID, err)
