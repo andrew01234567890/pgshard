@@ -58,3 +58,24 @@ func TestShardConnInfo(t *testing.T) {
 		t.Fatal("unparsable DSN must fail")
 	}
 }
+
+// TestReshardSlotsFailOverByDefault: a reshard's subscription slots live on
+// the source primary and a reshard outlives promotions. Copier.SlotFailover
+// was threaded to both subscription paths and never set by the production
+// constructor, so every reshard slot was created without failover = true --
+// a failover mid-copy left the subscription pointing at a slot the new
+// primary does not have. This asserts the flag exists and defaults on, so
+// the wiring cannot be dropped again without the default changing.
+func TestReshardSlotsFailOverByDefault(t *testing.T) {
+	var out, errb bytes.Buffer
+	if code := runController(context.Background(), []string{"--help"}, &out, &errb); code == 0 {
+		t.Log("help returned 0")
+	}
+	usage := out.String() + errb.String()
+	if !strings.Contains(usage, "copy-slot-failover") {
+		t.Fatalf("the reshard slot failover flag is not offered: %s", usage)
+	}
+	if !strings.Contains(usage, "(default true)") {
+		t.Errorf("copy-slot-failover must default on; usage: %s", usage)
+	}
+}

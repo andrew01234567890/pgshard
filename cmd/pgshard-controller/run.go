@@ -68,6 +68,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	throttleHigh := fs.Int64("copy-throttle-high-bytes", controller.DefaultThrottleHi, "source standby lag that pauses reshard subscriptions")
 	throttleLow := fs.Int64("copy-throttle-low-bytes", controller.DefaultThrottleLo, "source standby lag under which paused reshard subscriptions resume")
 	preparedWait := fs.Duration("copy-prepared-wait", controller.DefaultPreparedWait, "how long slot creation waits for in-doubt prepared transactions before the reshard fails")
+	slotFailover := fs.Bool("copy-slot-failover", true, "create reshard subscription slots with failover = true so a promotion on the source does not strand the copy")
 	placementEvery := fs.Duration("placement-interval", 5*time.Second, "time between table placement passes")
 	refCheckEvery := fs.Duration("reference-check-interval", 5*time.Second, "time between reference-table inspection passes")
 	keyCheckEvery := fs.Duration("shard-key-check-interval", 5*time.Second, "time between shard-key type checks of newly declared sharded tables")
@@ -170,8 +171,18 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		if *pgBin != "" {
 			schema = &controller.ExecMaterializer{BinDir: *pgBin, TargetConnInfo: connInfo}
 		}
+		// A reshard's subscription slots live on the SOURCE primary and a
+		// reshard outlives promotions. Without failover = true the slot is
+		// not synced to the standbys, so a failover mid-copy leaves the
+		// subscription pointing at a slot the new primary does not have and
+		// the copy cannot resume from where it stopped. The cluster is
+		// already set up for this -- the agent sets sync_replication_slots
+		// and the operator maintains synchronized_standby_slots -- and
+		// these subscriptions are created with two_phase = false, which is
+		// the combination PostgreSQL supports.
 		copier := &controller.Copier{Pool: pool, Shards: dialer, Schema: schema, SourceConnInfo: connInfo, Resolver: resolver, Logger: logger,
-			LagBytes: *copyLag, ThrottleHigh: *throttleHigh, ThrottleLow: *throttleLow, PreparedWait: *preparedWait}
+			LagBytes: *copyLag, ThrottleHigh: *throttleHigh, ThrottleLow: *throttleLow, PreparedWait: *preparedWait,
+			SlotFailover: *slotFailover}
 		go copier.Run(ctx, *copyEvery, leader.Load)
 		placer := &controller.Placer{Pool: pool, Shards: dialer, Logger: logger, LagBytes: *copyLag, BufferTimeout: *placementBuffer, DropOldAfter: *placementDropOld}
 		go placer.Run(ctx, *placementEvery, leader.Load)
