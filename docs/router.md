@@ -390,7 +390,27 @@ read or write an unrelated physical counter and return an answer that looks
 ordinary and is about something else. `lastval()` is refused outright — it
 names whichever sequence `nextval` last touched, and the router cannot tell
 from the statement which that was. Keep the value `INSERT … RETURNING`
-gave you. A sequence that is not registered as global is untouched: it
+gave you.
+
+`nextval()` over a global sequence is answered by the router in exactly two
+places: `SELECT nextval('<name>')` as the whole statement, and a value of an
+INSERT's registered sequence column (written out, or given as `DEFAULT` or
+`nextval()`). **Anywhere else it is refused** (`0A000`) rather than sent to a
+shard — `SELECT nextval('g') + 1`, `UPDATE … SET c = nextval('g')`,
+`INSERT … SELECT nextval('g')` and `SELECT nextval('g') FROM t` all take the
+value from that shard's own sequence object, so two shards would hand out
+the same numbers from a sequence declared global. That matters more than the
+`currval()` refusal above: `currval` only reads the wrong counter, while
+`nextval` allocates from it, and the duplicates arrive later as a primary
+key violation or as two rows sharing an id that could not. Select the value
+first and bind it, or let the INSERT fill the column.
+
+One gap remains: a `nextval()` on a global sequence written into a VALUES
+position of a column that is **not** a registered sequence column is still
+forwarded to the shard, because which columns a fill claims is known only
+after the relation is resolved and the refusal runs before that.
+
+A sequence that is not registered as global is untouched: it
 lives on one shard and means there what it says.
 
 Each column is backed by a row of `pgshard.sequences` named
