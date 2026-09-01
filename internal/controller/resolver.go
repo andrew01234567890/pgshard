@@ -102,9 +102,15 @@ type decision struct {
 	GID          string
 	State        string
 	Participants []int32
-	// LastAlive is the later of the row's creation and its coordinator's
-	// last heartbeat.
-	LastAlive time.Time
+	// AgeSeconds is how long the row has gone without a sign of its
+	// coordinator. The routers stamp heartbeat_at with the catalog's
+	// clock, so the age is measured there too: a controller whose clock
+	// runs fast must not be able to call a live coordinator dead.
+	AgeSeconds float64
+}
+
+func (d decision) age() time.Duration {
+	return time.Duration(d.AgeSeconds * float64(time.Second))
 }
 
 // holder is one place a prepared transaction sits: a shard's primary and
@@ -121,7 +127,7 @@ func (r *Resolver) Resolve(ctx context.Context, shardSet string) (Outcome, error
 		logger = slog.Default()
 	}
 	var out Outcome
-	rows, err := r.Pool.Query(ctx, `SELECT gid, state, participants, greatest(created_at, heartbeat_at) FROM pgshard.xact_decisions ORDER BY created_at`)
+	rows, err := r.Pool.Query(ctx, `SELECT gid, state, participants, extract(epoch from clock_timestamp() - greatest(created_at, heartbeat_at))::float8 FROM pgshard.xact_decisions ORDER BY created_at`)
 	if err != nil {
 		return out, fmt.Errorf("resolver: decisions: %w", err)
 	}
@@ -302,14 +308,14 @@ func (r *Resolver) preparingTimeout() time.Duration {
 // deleted only once every shard was searched and none still holds the gid.
 func (r *Resolver) resolveDecision(ctx context.Context, d decision, holders map[string][]holder, complete bool, out *Outcome) error {
 	if d.State == "preparing" {
-		if r.now().Sub(d.LastAlive) < r.preparingTimeout() {
+		if d.age() < r.preparingTimeout() {
 			return nil
 		}
-		// The staleness check re-runs inside the UPDATE against the same
-		// cutoff: a coordinator heartbeat landing after the scan snapshot
-		// makes it match zero rows instead of aborting a live transaction.
-		cutoff := r.now().Add(-r.preparingTimeout())
-		tag, err := r.Pool.Exec(ctx, `UPDATE pgshard.xact_decisions SET state = 'abort', decided_at = now() WHERE gid = $1 AND state = 'preparing' AND greatest(created_at, heartbeat_at) <= $2`, d.GID, cutoff)
+		// The staleness check re-runs inside the UPDATE, against the
+		// catalog's clock at that moment: a coordinator heartbeat landing
+		// after the scan makes it match zero rows instead of aborting a
+		// live transaction.
+		tag, err := r.Pool.Exec(ctx, `UPDATE pgshard.xact_decisions SET state = 'abort', decided_at = now() WHERE gid = $1 AND state = 'preparing' AND greatest(created_at, heartbeat_at) <= clock_timestamp() - make_interval(secs => $2::float8)`, d.GID, r.preparingTimeout().Seconds())
 		if err != nil {
 			return err
 		}
