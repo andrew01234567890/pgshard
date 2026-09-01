@@ -187,6 +187,11 @@ type connCache struct {
 // go.
 const probeIdleTimeout = 2 * time.Minute
 
+// probeNetworkTimeout bounds a pooled connection's liveness ping and its
+// dial. Well under proberCallTimeout: a probe that cannot reach its member
+// should say so with budget left, not spend all of it finding out.
+const probeNetworkTimeout = 3 * time.Second
+
 func (c *connCache) pool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -203,6 +208,13 @@ func (c *connCache) pool(ctx context.Context, dsn string) (*pgxpool.Pool, error)
 	cfg.MinConns = 0
 	cfg.MaxConnIdleTime = probeIdleTimeout
 	cfg.MaxConnLifetime = 30 * time.Minute
+	// A pooled connection whose member has gone away is discovered by the
+	// liveness ping Acquire runs, and pgxpool gives PingTimeout no default:
+	// left at zero the ping inherits the caller's context, so finding out
+	// costs the probe its whole proberCallTimeout budget where a fresh dial
+	// would have been refused at once. The same reasoning bounds the dial.
+	cfg.PingTimeout = probeNetworkTimeout
+	cfg.ConnConfig.ConnectTimeout = probeNetworkTimeout
 	p, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
