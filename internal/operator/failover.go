@@ -572,7 +572,15 @@ func (r *ClusterReconciler) admissiblePrimary(ctx context.Context, c *pgshardv1a
 	for _, name := range g.MemberNames() {
 		v := memberView{Name: name, Listed: state.syncSet[name]}
 		if m := members[name]; m != nil && m.pod != nil && m.ip != "" {
-			if st, err := r.Prober.ProbeStandby(ctx, HostDSN(m.ip, password)); err == nil {
+			st, err := r.Prober.ProbeStandby(ctx, HostDSN(m.ip, password))
+			if err != nil {
+				// An unreachable synchronous standby is the one condition
+				// that refuses promotion outright, and discarding the
+				// error left no way to tell a member that is genuinely
+				// gone from one the probe itself could not reach.
+				logf.FromContext(ctx).Info("member did not answer the promotion probe",
+					"group", g.Name(), "member", name, "listed", v.Listed, "err", err.Error())
+			} else {
 				v.Reachable, v.InRecovery, v.Streaming, v.FlushLSN = true, st.InRecovery, st.Streaming, st.FlushLSN
 			}
 		}
