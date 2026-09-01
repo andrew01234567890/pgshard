@@ -910,3 +910,36 @@ func keysOf(m map[string]any) []string {
 	sort.Strings(out)
 	return out
 }
+
+// TestAPausedCopyDoesNotEnterCutover: the throttle pauses by DISABLING the
+// subscriptions, and it runs only for the copy stages.
+// awaiting_switch_writes is a cutover stage, so advancing while paused is a
+// one-way door -- nothing re-evaluates the watermark, nothing re-enables
+// what was disabled, and the switch gate then rejects the very
+// subscriptions the throttle turned off. A transient replica-lag spike at
+// the catch-up boundary would strand an otherwise healthy reshard until
+// someone repaired catalog state by hand.
+func TestAPausedCopyDoesNotEnterCutover(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.wf.copy.Paused = true
+
+	if h.pass(t) {
+		t.Fatal("a paused copy must not advance out of catch_up_done")
+	}
+	if h.wf.stage != StageCatchUpDone {
+		t.Fatalf("stage %s, want the workflow held where the throttle can still see it", h.wf.stage)
+	}
+	if len(h.store.saves) == 0 || !strings.Contains(h.store.saves[len(h.store.saves)-1], "watermark") {
+		t.Errorf("the hold must say why: %v", h.store.saves)
+	}
+
+	// Once the lag recovers the throttle clears the pause, and the next
+	// pass proceeds exactly as it would have.
+	h.wf.copy.Paused = false
+	if !h.pass(t) {
+		t.Fatal("an unpaused copy must advance")
+	}
+	if h.wf.stage != StageAwaitingSwitch {
+		t.Fatalf("stage %s, want %s", h.wf.stage, StageAwaitingSwitch)
+	}
+}
