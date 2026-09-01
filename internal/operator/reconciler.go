@@ -301,6 +301,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		retired = append(retired, catObs...)
 	}
 
+	if err := r.reconcileController(ctx, &cluster); err != nil {
+		return ctrl.Result{}, err
+	}
 	if err := r.reconcileAdmin(ctx, &cluster); err != nil {
 		// The admin is an accessory: a credential somebody pre-created
 		// with the wrong key, or an image that will not pull, must not

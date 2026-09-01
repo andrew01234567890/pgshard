@@ -17,13 +17,14 @@ import (
 
 // Options configures the operator manager.
 type Options struct {
-	MetricsAddr   string
-	ProbeAddr     string
-	LeaderElect   bool
-	LeaderElectID string
-	AdminImage    string
-	RouterImage   string
-	Development   bool
+	MetricsAddr     string
+	ProbeAddr       string
+	LeaderElect     bool
+	LeaderElectID   string
+	AdminImage      string
+	ControllerImage string
+	RouterImage     string
+	Development     bool
 	// ControllerTLSCert, ControllerTLSKey and ControllerTLSCA are the
 	// client certificate and CA the operator presents to cluster
 	// controllers (scheduled barriers); unset dials plaintext.
@@ -42,6 +43,7 @@ func ParseFlags(args []string, stderr io.Writer) (Options, error) {
 	fs.BoolVar(&o.LeaderElect, "leader-elect", false, "enable leader election")
 	fs.StringVar(&o.LeaderElectID, "leader-election-id", "pgshard-operator.pgshard.io", "leader election lease name")
 	fs.StringVar(&o.AdminImage, "admin-image", DefaultAdminImage, "image of the admin UI deployed for clusters with spec.admin.enabled")
+	fs.StringVar(&o.ControllerImage, "controller-image", DefaultControllerImage, "image of the controller deployed for every cluster: two-phase resolution, DDL, workflows and barriers")
 	fs.StringVar(&o.RouterImage, "router-image", DefaultRouterImage, "image of the router Deployment created for every cluster")
 	fs.BoolVar(&o.Development, "development", false, "human-readable logs")
 	fs.StringVar(&o.ControllerTLSCert, "controller-tls-cert", "", "client certificate for Controller gRPC calls (scheduled barriers); unset dials plaintext")
@@ -77,7 +79,7 @@ func Run(ctx context.Context, o Options) error {
 	// so the reconcilers share them rather than each dialling per call.
 	agents := NewGRPCAgentClient()
 	defer agents.Close()
-	r := &ClusterReconciler{Client: mgr.GetClient(), Renderer: Renderer{AdminImage: o.AdminImage, RouterImage: o.RouterImage}, Prober: boundedProber{Inner: PgxProber{}}, Agents: agents,
+	r := &ClusterReconciler{Client: mgr.GetClient(), Renderer: Renderer{AdminImage: o.AdminImage, RouterImage: o.RouterImage, ControllerImage: o.ControllerImage}, Prober: boundedProber{Inner: PgxProber{}}, Agents: agents,
 		Metrics: metrics.NewOperator(ctrlmetrics.Registry)}
 	if err := r.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup reconciler: %w", err)

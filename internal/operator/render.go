@@ -45,8 +45,9 @@ const (
 
 // Renderer builds the Kubernetes objects for one cluster.
 type Renderer struct {
-	AdminImage  string
-	RouterImage string
+	AdminImage      string
+	RouterImage     string
+	ControllerImage string
 }
 
 func objectMeta(g Group, name, namespace string, extra map[string]string) metav1.ObjectMeta {
