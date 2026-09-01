@@ -64,8 +64,13 @@ func TestShardConnInfo(t *testing.T) {
 // was threaded to both subscription paths and never set by the production
 // constructor, so every reshard slot was created without failover = true --
 // a failover mid-copy left the subscription pointing at a slot the new
-// primary does not have. This asserts the flag exists and defaults on, so
-// the wiring cannot be dropped again without the default changing.
+// primary does not have.
+//
+// This checks only that the flag is registered and defaults on. It does
+// NOT check that its value reaches Copier.SlotFailover: runController
+// builds the Copier inline, so deleting that assignment again would leave
+// this test green. Proving the wiring needs the slot's own failover column
+// read on the source after a reshard, which no fixture here runs.
 func TestReshardSlotsFailOverByDefault(t *testing.T) {
 	var out, errb bytes.Buffer
 	if code := runController(context.Background(), []string{"--help"}, &out, &errb); code == 0 {
