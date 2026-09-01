@@ -64,3 +64,33 @@ func TestUpgradeRollbackIgnoredAfterCompletion(t *testing.T) {
 		t.Fatal("a completed workflow must not roll back")
 	}
 }
+
+// TestATargetOffersOnlyWhatEveryShardHas: availability is per
+// installation, so an extension present on one target shard and not
+// another would install on some shards and fail on the rest -- the same
+// outcome as missing, found later and after the target groups are already
+// provisioned.
+func TestATargetOffersOnlyWhatEveryShardHas(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		a, b []string
+		want []string
+	}{
+		{"identical", []string{"plpgsql", "pgcrypto"}, []string{"plpgsql", "pgcrypto"}, []string{"plpgsql", "pgcrypto"}},
+		{"one shard is missing one", []string{"plpgsql", "postgis"}, []string{"plpgsql"}, []string{"plpgsql"}},
+		{"nothing in common", []string{"postgis"}, []string{"pgcrypto"}, nil},
+		{"a shard offering nothing offers nothing", []string{"plpgsql"}, nil, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := intersect(c.a, c.b)
+			if len(got) != len(c.want) {
+				t.Fatalf("intersect(%v, %v) = %v, want %v", c.a, c.b, got, c.want)
+			}
+			for i := range got {
+				if got[i] != c.want[i] {
+					t.Fatalf("intersect(%v, %v) = %v, want %v", c.a, c.b, got, c.want)
+				}
+			}
+		})
+	}
+}
