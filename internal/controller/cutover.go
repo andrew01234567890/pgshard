@@ -299,6 +299,17 @@ func (c *Copier) cutoverAttempts() int {
 func (c *Copier) cutover(ctx context.Context, wf *copyWorkflow, ops cutoverOps) (bool, error) {
 	switch wf.stage {
 	case StageCatchUpDone:
+		if wf.copy.Paused {
+			// Throttle pauses by disabling the subscriptions, and it runs
+			// only for the copy stages. awaiting_switch_writes is a cutover
+			// stage, so advancing while paused is a one-way door: nothing
+			// re-evaluates the watermark, nothing re-enables what was
+			// disabled, and the switch gate then rejects the very
+			// subscriptions the throttle turned off. Holding here instead
+			// leaves the workflow where the throttle can still see it, and
+			// a transient lag spike resolves itself.
+			return false, c.saveCutover(ctx, wf, "caught up, but the source standby lag is over the watermark; holding before the switch gate")
+		}
 		wf.stage = StageAwaitingSwitch
 		return true, c.saveCutover(ctx, wf, "copy caught up; waiting for the switch gate")
 	case StageAwaitingSwitch:
