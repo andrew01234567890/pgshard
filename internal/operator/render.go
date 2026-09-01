@@ -320,9 +320,17 @@ func (Renderer) MemberRBAC(c *pgshardv1alpha1.PgShardCluster) (*corev1.ServiceAc
 // rolled back and switched again has a generation still running that none
 // of them names -- and its agent then crash-loops, silently, while the
 // cluster still reports Ready. So the names cover every generation the
-// cluster has reached, not only the three it can currently describe. They
-// all carry this cluster's own name, so a wider list still cannot reach
-// another cluster's primary, which is what the name scoping is for.
+// cluster has reached, not only the three it can currently describe.
+//
+// What the name list does and does not buy, precisely, because a wider one
+// is easy to wave through: it scopes update and patch, so a member of one
+// cluster cannot take or renew another cluster's primary lease -- that is
+// the fence, and it holds. It does NOT scope get, list, watch or create,
+// which the first rule grants over every lease in the namespace, because
+// Kubernetes RBAC resourceNames does not apply to those verbs. A member
+// can therefore read another cluster's primary and epoch annotations if
+// the two share a namespace. Separate namespaces are what keeps that from
+// mattering; the Role is namespaced and cannot do it alone.
 func MemberRules(c *pgshardv1alpha1.PgShardCluster) []rbacv1.PolicyRule {
 	groups := Groups(c)
 	groups = append(groups, TargetGroups(c)...)
