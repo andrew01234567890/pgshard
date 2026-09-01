@@ -109,7 +109,12 @@ jobs:
               # Its own argument list: the shared one carries -race, which
               # these do not want, and building it as an array keeps the
               # optional -run from being word-split.
-              iargs=(-tags integration -count=1 -timeout 45m)
+              # -v because these tests log what they measured -- cutover
+              # pause, fence hold, settle times -- and go test discards a
+              # passing test's log output. Without it a rate run answers
+              # how often, never how close, which is the question when the
+              # bound under test is a number rather than a behaviour.
+              iargs=(-tags integration -count=1 -timeout 45m -v)
               if [ -n "${{ inputs.pattern }}" ]; then
                 iargs+=(-run "${{ inputs.pattern }}")
               fi
