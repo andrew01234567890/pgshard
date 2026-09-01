@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 )
 
 // fenced publishes a copy of the harness snapshot with the write fence
@@ -422,5 +424,64 @@ func TestAReadOnlyRefusalOfAnUntouchedTransactionIsRetried(t *testing.T) {
 	}
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// tableMigrating marks one table as being moved by a placement workflow,
+// which is a write hold scoped to that table rather than to the cluster.
+func (h *shardedHarness) tableMigrating(table string, active bool) {
+	s := *h.snap
+	tables := make(map[snapshot.TableKey]snapshot.Placement, len(s.Tables))
+	for k, v := range s.Tables {
+		if k.TableName == table {
+			v.Migrating = active
+		}
+		tables[k] = v
+	}
+	s.Tables = tables
+	h.setSnap(&s)
+}
+
+// TestAMigratingTableHoldsOnlyItsOwnWrites: writeFenced covers three
+// separate conditions -- the cluster write fence, a migrating shard map,
+// and a single migrating table -- and only the first two had a test here.
+// The third is the one a placement workflow uses, and getting it wrong in
+// either direction is expensive: too wide and an unrelated table stalls for
+// the length of a table move, too narrow and a write lands on the table the
+// swap is about to replace.
+func TestAMigratingTableHoldsOnlyItsOwnWrites(t *testing.T) {
+	h := newTxnHarness(t)
+	ctx := context.Background()
+	a, _ := h.twoTenants(t)
+	conn := h.connect(t, h.dsn())
+	h.tableMigrating("orders", true)
+
+	// Reads of the migrating table are not held: the rows are still there
+	// and still correct until the swap publishes the new placement.
+	if _, err := conn.Exec(ctx, "select * from orders where tenant_id = $1", a); err != nil {
+		t.Fatalf("reads of a migrating table must pass: %v", err)
+	}
+	// A write to a table the workflow is not moving must not wait behind it.
+	if _, err := conn.Exec(ctx, "insert into order_lines (tenant_id) values ($1)", a); err != nil {
+		t.Fatalf("writes to another table must not be held: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := conn.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 1)", a)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("a write to the migrating table returned while it was held: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if h.r.FenceWaiting() != 1 {
+		t.Fatalf("fence waiting = %d, want the one held write", h.r.FenceWaiting())
+	}
+
+	h.tableMigrating("orders", false)
+	if err := <-done; err != nil {
+		t.Fatalf("the held write must go through once the move published: %v", err)
 	}
 }
