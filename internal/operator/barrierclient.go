@@ -85,7 +85,7 @@ func (c *GRPCAgentClient) ListTransactionDecisions(ctx context.Context, addr str
 	}
 	out := make([]twopc.Decision, 0, len(resp.GetDecisions()))
 	for _, d := range resp.GetDecisions() {
-		out = append(out, twopc.Decision{GID: d.GetGid(), State: d.GetState(), Participants: d.GetParticipants(), ParticipantXIDs: d.GetParticipantXids()})
+		out = append(out, twopc.DecisionFromProto(d))
 	}
 	return out, nil
 }
@@ -98,7 +98,7 @@ func (c *GRPCAgentClient) ReconcilePrepared(ctx context.Context, addr string, ep
 	}
 	req := &pgshardv1.ReconcilePreparedTransactionsRequest{Epoch: epoch, ShardId: shardID}
 	for _, d := range decisions {
-		req.Decisions = append(req.Decisions, &pgshardv1.TransactionDecision{Gid: d.GID, State: d.State, Participants: d.Participants, ParticipantXids: d.ParticipantXIDs})
+		req.Decisions = append(req.Decisions, twopc.DecisionToProto(d))
 	}
 	ctx, cancel := context.WithTimeout(ctx, twopcReconcileTimeout)
 	defer cancel()
@@ -106,7 +106,7 @@ func (c *GRPCAgentClient) ReconcilePrepared(ctx context.Context, addr string, ep
 	if err != nil {
 		return twopc.Outcome{}, err
 	}
-	out := twopc.Outcome{Committed: int(resp.GetCommitted()), RolledBack: int(resp.GetRolledBack()), Contradictions: resp.GetContradictions(), Unverifiable: resp.GetUnverifiable()}
+	out := twopc.Outcome{Committed: int(resp.GetCommitted()), RolledBack: int(resp.GetRolledBack()), Contradictions: resp.GetContradictions(), Unverifiable: resp.GetUnverifiable(), Unreadable: resp.GetUnreadable()}
 	if e := resp.GetError(); e != nil {
 		return out, fmt.Errorf("reconcile prepared transactions: %s", e.GetMessage())
 	}

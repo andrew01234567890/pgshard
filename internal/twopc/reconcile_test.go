@@ -13,7 +13,7 @@ import (
 
 func TestDecide(t *testing.T) {
 	cases := []struct {
-		state    string
+		state    State
 		prepared bool
 		status   XactStatus
 		want     Action
@@ -29,6 +29,11 @@ func TestDecide(t *testing.T) {
 		{StateAbort, false, "", Nothing},
 		{StatePreparing, false, "", Nothing},
 		{"", false, StatusCommitted, Nothing},
+		// A state this build cannot read is not an abort: the transaction
+		// stays prepared and is reported.
+		{"committed", true, "", Unreadable},
+		{"COMMIT", true, "", Unreadable},
+		{"commit2", false, StatusCommitted, Unreadable},
 	}
 	for _, c := range cases {
 		if got := Decide(c.state, c.prepared, c.status); got != c.want {
@@ -108,14 +113,14 @@ func (r *fakeRows) Scan(dest ...any) error {
 
 func TestReconcileAppliesTheTable(t *testing.T) {
 	decisions := []Decision{
-		{GID: "pgshard-c1", State: StateCommit, Participants: []int32{0, 1}, ParticipantXIDs: []string{"10", "20"}},
-		{GID: "pgshard-a1", State: StateAbort, Participants: []int32{0, 1}},
-		{GID: "pgshard-p1", State: StatePreparing, Participants: []int32{0}},
-		{GID: "pgshard-done", State: StateCommit, Participants: []int32{0}, ParticipantXIDs: []string{"30"}},
-		{GID: "pgshard-lost", State: StateCommit, Participants: []int32{0}, ParticipantXIDs: []string{"40"}},
-		{GID: "pgshard-noxid", State: StateCommit, Participants: []int32{0}},
-		{GID: "pgshard-future", State: StateCommit, Participants: []int32{0}, ParticipantXIDs: []string{"future"}},
-		{GID: "pgshard-other", State: StateCommit, Participants: []int32{1}, ParticipantXIDs: []string{"50"}},
+		{GID: "pgshard-c1", State: StateCommit, Participants: []Participation{{Shard: 0, XID: "10"}, {Shard: 1, XID: "20"}}},
+		{GID: "pgshard-a1", State: StateAbort, Participants: []Participation{{Shard: 0}, {Shard: 1}}},
+		{GID: "pgshard-p1", State: StatePreparing, Participants: []Participation{{Shard: 0}}},
+		{GID: "pgshard-done", State: StateCommit, Participants: []Participation{{Shard: 0, XID: "30"}}},
+		{GID: "pgshard-lost", State: StateCommit, Participants: []Participation{{Shard: 0, XID: "40"}}},
+		{GID: "pgshard-noxid", State: StateCommit, Participants: []Participation{{Shard: 0}}},
+		{GID: "pgshard-future", State: StateCommit, Participants: []Participation{{Shard: 0, XID: "future"}}},
+		{GID: "pgshard-other", State: StateCommit, Participants: []Participation{{Shard: 1, XID: "50"}}},
 	}
 	conn := &fakeConn{prepared: []string{"pgshard-c1", "pgshard-a1", "pgshard-p1", "pgshard-orphan"},
 		status: map[string]XactStatus{"30": StatusCommitted, "40": StatusAborted}}
@@ -152,12 +157,12 @@ func TestReconcileAppliesTheTable(t *testing.T) {
 
 func TestReconcileReportsErrors(t *testing.T) {
 	conn := &fakeConn{prepared: []string{"pgshard-c1"}, failExec: errors.New("read only")}
-	_, err := Reconcile(context.Background(), ConnParticipant{conn}, 0, []Decision{{GID: "pgshard-c1", State: StateCommit, Participants: []int32{0}}})
+	_, err := Reconcile(context.Background(), ConnParticipant{conn}, 0, []Decision{{GID: "pgshard-c1", State: StateCommit, Participants: []Participation{{Shard: 0}}}})
 	if err == nil || !strings.Contains(err.Error(), "commit prepared pgshard-c1: read only") {
 		t.Fatalf("err %v", err)
 	}
 	conn = &fakeConn{}
-	_, err = Reconcile(context.Background(), ConnParticipant{conn}, 0, []Decision{{GID: "pgshard-x", State: StateCommit, Participants: []int32{0}, ParticipantXIDs: []string{"broken"}}})
+	_, err = Reconcile(context.Background(), ConnParticipant{conn}, 0, []Decision{{GID: "pgshard-x", State: StateCommit, Participants: []Participation{{Shard: 0, XID: "broken"}}}})
 	if err == nil || !strings.Contains(err.Error(), "pg_xact_status(broken): connection lost") {
 		t.Fatalf("err %v", err)
 	}
