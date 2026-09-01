@@ -21,6 +21,12 @@ service Controller {
   // distributed transactions.
   rpc ResolveTransactions(ResolveTransactionsRequest) returns (ResolveTransactionsResponse);
   // ApplyDDL starts a DDL migration and streams per-shard progress.
+  //
+  // NOT IMPLEMENTED: the server has no handler for this and answers
+  // UNIMPLEMENTED. It is declared because the shape is settled and the
+  // applier it would drive exists; wiring it up is PGS-489. Said here
+  // because this file is what clients are generated from, and a method
+  // that only fails when called is worse to discover at run time.
   rpc ApplyDDL(ApplyDDLRequest) returns (stream ApplyDDLResponse);
   // CreateBarrier pauses writes, drains two-phase commits, creates a named
   // restore point on every group and records a certified restore point.

@@ -52,6 +52,12 @@ type ControllerClient interface {
 	// distributed transactions.
 	ResolveTransactions(ctx context.Context, in *ResolveTransactionsRequest, opts ...grpc.CallOption) (*ResolveTransactionsResponse, error)
 	// ApplyDDL starts a DDL migration and streams per-shard progress.
+	//
+	// NOT IMPLEMENTED: the server has no handler for this and answers
+	// UNIMPLEMENTED. It is declared because the shape is settled and the
+	// applier it would drive exists; wiring it up is PGS-489. Said here
+	// because this file is what clients are generated from, and a method
+	// that only fails when called is worse to discover at run time.
 	ApplyDDL(ctx context.Context, in *ApplyDDLRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ApplyDDLResponse], error)
 	// CreateBarrier pauses writes, drains two-phase commits, creates a named
 	// restore point on every group and records a certified restore point.
@@ -213,6 +219,12 @@ type ControllerServer interface {
 	// distributed transactions.
 	ResolveTransactions(context.Context, *ResolveTransactionsRequest) (*ResolveTransactionsResponse, error)
 	// ApplyDDL starts a DDL migration and streams per-shard progress.
+	//
+	// NOT IMPLEMENTED: the server has no handler for this and answers
+	// UNIMPLEMENTED. It is declared because the shape is settled and the
+	// applier it would drive exists; wiring it up is PGS-489. Said here
+	// because this file is what clients are generated from, and a method
+	// that only fails when called is worse to discover at run time.
 	ApplyDDL(*ApplyDDLRequest, grpc.ServerStreamingServer[ApplyDDLResponse]) error
 	// CreateBarrier pauses writes, drains two-phase commits, creates a named
 	// restore point on every group and records a certified restore point.

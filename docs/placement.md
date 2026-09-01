@@ -111,7 +111,10 @@ Workflows are exposed through the `pgshard.v1.Controller` gRPC service:
 `ListWorkflows` (filter by kind and state), `GetWorkflow`, `PauseWorkflow`
 (pending or running to paused; the previous state is kept in
 `status.paused_from`) and `ResumeWorkflow` (back to that state).
-`ResolveTransactions` and `ApplyDDL` are not implemented yet.
+`ResolveTransactions` is served when the controller runs a resolver, and
+`CreateBarrier` when it runs a barrier; each answers `UNIMPLEMENTED` when its
+component is not configured. `ApplyDDL` is declared in the service and has no
+implementation at all: it always answers `UNIMPLEMENTED` (PGS-489).
 
 ```
 pgshard-controller run --catalog-dsn postgres://... \
