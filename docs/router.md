@@ -59,6 +59,12 @@ the rest with `0A000`. See *Routing* below.
 - **Poolers.** Endpoints come from `pgshard.shard_status.primary_endpoint`
   by default; `--pooler [SET/]ID=host:port` pins one statically. Pooler
   connections use mTLS (`--pooler-tls-cert/-key/-ca`) unless `--insecure-dev`.
+- **Reported version.** `server_version` is `--server-version`, default
+  `18.6 (pgshard)`. It is a fixed string, not derived from what the shards
+  run, so a cluster serving PostgreSQL 19 reports 18.6 unless this is set.
+  Deriving it needs the router to learn the shards' version, and during a
+  rolling major upgrade to decide which of two answers is the cluster's
+  (PGS-471); until then it is at least correctable without a rebuild.
 - **Fencing.** Every pooler request is stamped with the snapshot's
   `shard_map_generation` and the shard's `primary_epoch`. A stale stamp comes
   back as `55000` to the client; the watcher's next reload clears it.

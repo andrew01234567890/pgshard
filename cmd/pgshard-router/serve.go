@@ -85,6 +85,14 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	rolesTTL := fs.Duration("roles-ttl", 5*time.Second, "how long catalog role verifiers are cached")
 	snapshotWait := fs.Duration("snapshot-wait", 30*time.Second, "time to wait for the first catalog snapshot")
 	startupTimeout := fs.Duration("startup-timeout", 10*time.Second, "time a connection may spend before authentication completes")
+	// Compiled in, this was wrong for every PostgreSQL minor after the one
+	// it was written against, and wrong by a whole major on a cluster
+	// serving 19 -- which reports itself to clients as 18.6. Deriving it
+	// from what the shards actually run needs the router to learn their
+	// version, and during a rolling major upgrade to decide which of two
+	// answers is the cluster's; that is PGS-471. Until then it is at least
+	// correctable without a rebuild.
+	serverVersion := fs.String("server-version", "18.6 (pgshard)", "value reported as the server_version parameter to clients")
 	maxStartupConns := fs.Int("max-startup-conns", 100, "concurrent connections allowed in the pre-authentication phase (refused with 53300 past the cap)")
 	maxSessions := fs.Int("max-sessions", router.DefaultMaxSessions, "authenticated sessions this router holds at once, whatever role they belong to (refused with 53300 past the cap; negative means no cap)")
 	maxMessageBody := fs.Int("max-message-body", pgwire.DefaultMaxMessageBodyLen, "largest frontend message body accepted, in bytes; the buffer is allocated from the message header before the body arrives")
@@ -193,7 +201,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		Authenticator:     pgwire.SCRAMAuthenticator{Lookup: roles.Lookup},
 		TLSConfig:         tlsCfg,
 		AllowPlaintext:    *allowPlaintext,
-		ServerVersion:     "18.6 (pgshard)",
+		ServerVersion:     *serverVersion,
 		InstanceID:        uint32(*instanceID),
 		StartupTimeout:    *startupTimeout,
 		MaxStartupConns:   *maxStartupConns,
