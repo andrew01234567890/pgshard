@@ -360,6 +360,16 @@ UPDATE pgshard.tables SET sequence_columns = '{id}'
  WHERE database = 'app' AND schema_name = 'public' AND table_name = 'tickets';
 ```
 
+`currval()`, `setval()` and `lastval()` are **refused** (`0A000`) over a
+global sequence. The router's counter is the sequence; the per-shard
+sequence objects the DDL fanned out are not it, so those functions would
+read or write an unrelated physical counter and return an answer that looks
+ordinary and is about something else. `lastval()` is refused outright — it
+names whichever sequence `nextval` last touched, and the router cannot tell
+from the statement which that was. Keep the value `INSERT … RETURNING`
+gave you. A sequence that is not registered as global is untouched: it
+lives on one shard and means there what it says.
+
 Each column is backed by a row of `pgshard.sequences` named
 `<database>.<schema>.<table>.<column>` (`app.public.tickets.id`), created
 on first use with `next_value = 1` and `block_size = 1000`; both fields can

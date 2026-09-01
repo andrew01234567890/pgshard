@@ -295,6 +295,61 @@ func (w *walker) rewriteInsert(s *pgquerypb.InsertStmt, r *rel) (*SequenceFill, 
 	return fill, injected, nil
 }
 
+// sequenceRefusal refuses the sequence functions whose answer pgshard
+// cannot give truthfully.
+//
+// A global sequence is a catalog counter the router allocates from; the
+// per-shard sequence objects the DDL fanned out are not it. currval and
+// setval naming a registered global sequence therefore reach an unrelated
+// physical counter -- the answer looks ordinary and is about a different
+// sequence. lastval has no name at all: it means "the sequence nextval
+// last touched in this session", which for a global sequence was the
+// router's counter and not the backend's, and the router cannot tell from
+// the statement which one is meant.
+//
+// So they are refused rather than answered wrongly, which is the whole of
+// this until a global sequence is a real catalog object with its own
+// currval and lastval state. A currval or setval over a sequence that is
+// not registered is left alone: that one is an ordinary PostgreSQL
+// sequence living on one shard, and it means there what it says.
+func (w *walker) sequenceRefusal(root *pgquerypb.Node) error {
+	var refusal error
+	visit(root, func(n *pgquerypb.Node) bool {
+		if refusal != nil {
+			return false
+		}
+		fc := n.GetFuncCall()
+		if fc == nil {
+			return true
+		}
+		names := stringList(fc.GetFuncname())
+		if len(names) == 0 || !builtinName(names) {
+			return true
+		}
+		switch strings.ToLower(names[len(names)-1]) {
+		case "lastval":
+			refusal = notYet("lastval() is not available through the router: it names whichever sequence nextval last touched, and for a global sequence that was the router's counter rather than this backend's",
+				"use currval('<sequence>') on a sequence that is not global, or keep the value the INSERT ... RETURNING gave you")
+		case "currval", "setval":
+			if seq := w.sequenceArg(fc); seq != "" {
+				refusal = notYet(strings.ToLower(names[len(names)-1])+"() on the global sequence "+seq+" is not available through the router: the value it would read or set belongs to one shard's own sequence object, not to the counter the router allocates from",
+					"keep the value the INSERT ... RETURNING gave you; global sequence state is not stored on a shard")
+			}
+		}
+		return refusal == nil
+	})
+	return refusal
+}
+
+// sequenceArg resolves a sequence function's first argument to a registered
+// global sequence name, or "" when it names none.
+func (w *walker) sequenceArg(fc *pgquerypb.FuncCall) string {
+	if len(fc.GetArgs()) == 0 {
+		return ""
+	}
+	return w.registeredSequence(fc.GetArgs()[0])
+}
+
 // nextvalName recognises `SELECT nextval('<name>')` over a registered global
 // sequence and returns the sequence's catalog name; "" for anything else.
 func (w *walker) nextvalName(s *pgquerypb.SelectStmt) string {
@@ -310,7 +365,12 @@ func (w *walker) nextvalName(s *pgquerypb.SelectStmt) string {
 	if len(names) == 0 || !strings.EqualFold(names[len(names)-1], "nextval") {
 		return ""
 	}
-	arg := fc.GetArgs()[0]
+	return w.registeredSequence(fc.GetArgs()[0])
+}
+
+// registeredSequence resolves a sequence-naming argument -- a literal, or a
+// cast of one -- to a registered global sequence's catalog name.
+func (w *walker) registeredSequence(arg *pgquerypb.Node) string {
 	if tc := arg.GetTypeCast(); tc != nil {
 		arg = tc.GetArg()
 	}

@@ -83,6 +83,13 @@ func (p *Planner) plan(ctx context.Context, sess Session, sql string, masked boo
 		return refusalErr(scan.setConfigErr)
 	}
 	w := &walker{sess: sess, plan: pl, tree: res.Tree, root: raw.GetStmt(), raw: raw, sql: sql, hiddenName: scan.hiddenName}
+	// Before planning: a statement asking a sequence question pgshard
+	// cannot answer truthfully is refused whatever else it does, and the
+	// answer depends on the snapshot, so it cannot live in the memoised
+	// per-tree scan above.
+	if err := w.sequenceRefusal(raw.GetStmt()); err != nil {
+		return refusalErr(err)
+	}
 	if err := w.statement(raw.GetStmt()); err != nil {
 		return refusalErr(err)
 	}
