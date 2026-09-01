@@ -48,14 +48,18 @@ jobs:
       E2E_ARTIFACTS: ${{ github.workspace }}/artifacts/e2e-pg${{ matrix.pg }}-${{ matrix.suite }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        id: setup_go
         with:
           go-version-file: go.mod
       - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        id: install_kind
         with:
           version: v0.32.0
           install_only: true
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        id: setup_buildx
         if: matrix.suite != 'smoke'
       - name: Warm the module and base-image caches
         id: warm_caches
@@ -150,6 +154,10 @@ jobs:
           PG: ${{ matrix.pg }}
           SUITE_OUTCOME: ${{ steps.run_suite.outcome }}
           SETUP_OUTCOMES: |
+            check out the repository=${{ steps.checkout.outcome }}
+            install Go=${{ steps.setup_go.outcome }}
+            install kind=${{ steps.install_kind.outcome }}
+            set up buildx=${{ steps.setup_buildx.outcome }}
             warm the module and base-image caches=${{ steps.warm_caches.outcome }}
             build PostgreSQL image=${{ steps.build_postgres.outcome }}
             build operator and admin images=${{ steps.build_control.outcome }}
