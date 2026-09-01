@@ -259,6 +259,37 @@ func (e *Executor) writePauseRetryable(err error, wrote bool) bool {
 	return ok && pe.Code == codeReadOnlyTransaction
 }
 
+// namePauseThatCannotBeRetriedHere turns PostgreSQL's 25006 into pgshard's
+// own answer for a write pause, when the router cannot retry the statement
+// itself.
+//
+// A transaction that has already written to another shard cannot be given
+// back and reopened, so a barrier landing between its statements reaches
+// the client -- as "cannot execute INSERT in a read-only transaction",
+// which says nothing about a cluster write pause and nothing about
+// retrying. A client cannot tell it from a transaction it really did open
+// read-only. The router already answers 57P03 with a retry hint for the
+// pause it saw in time; this is the same event, and gets the same answer.
+//
+// Only when the router agrees a pause is on: a genuine read-only
+// transaction still gets PostgreSQL's own error, which is the truthful one
+// there.
+func (e *Executor) namePauseThatCannotBeRetriedHere(err error) error {
+	if err == nil {
+		return nil
+	}
+	pe, ok := errors.AsType[*pgwire.Error](err)
+	if !ok || pe.Code != codeReadOnlyTransaction {
+		return err
+	}
+	if !e.r.writeFenced(nil) && !e.r.sawWriteFenceRecently() {
+		return err
+	}
+	named := pgwire.Errorf(codeWriteFence, "cluster write pause reached a transaction that had already written")
+	named.Hint = "the pause is lifted when the barrier's restore points are recorded, or the new shard map is published; retry the transaction"
+	return named
+}
+
 // reopenAfterWritePause gives the transaction back, waits the pause out and
 // opens it again, so the statement can run a second time on a backend that
 // is allowed to write.
