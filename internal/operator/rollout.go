@@ -333,9 +333,9 @@ func (r *ClusterReconciler) stepAwayFromPrimary(ctx context.Context, c *pgshardv
 		obs.rollout = step
 		return nil
 	}
-	target := r.freshestStandby(ctx, g, obs.state, members, password)
+	target, why := r.freshestStandby(ctx, g, obs.state, members, password)
 	if target == "" {
-		obs.rollout = &pgshardv1alpha1.GroupRollout{Phase: pgshardv1alpha1.RolloutPhaseHeld, Member: obs.state.primary, Reason: "no sync-set standby to switch over to"}
+		obs.rollout = &pgshardv1alpha1.GroupRollout{Phase: pgshardv1alpha1.RolloutPhaseHeld, Member: obs.state.primary, Reason: why}
 		return nil
 	}
 	step := &pgshardv1alpha1.GroupRollout{Phase: pgshardv1alpha1.RolloutPhaseSwitchover, Member: obs.state.primary, Reason: "switching over to " + target + " before restarting the primary", Since: r.metaNow()}
@@ -359,7 +359,10 @@ func (r *ClusterReconciler) stepAwayFromPrimary(ctx context.Context, c *pgshardv
 // (planned switchover target); unlike failover it only considers standbys that
 // were streaming, since the primary is alive and no acknowledgement can be
 // lost by the choice.
-func (r *ClusterReconciler) freshestStandby(ctx context.Context, g Group, state groupState, members map[string]*memberInfo, password string) string {
+// It returns the target and, when there is none, why -- an empty sync set
+// and a sync set whose standbys did not answer are different problems and
+// a held rollout should not report them with the same sentence.
+func (r *ClusterReconciler) freshestStandby(ctx context.Context, g Group, state groupState, members map[string]*memberInfo, password string) (string, string) {
 	var views []memberView
 	for _, name := range g.MemberNames() {
 		if name == state.primary || !state.syncSet[name] {
@@ -367,7 +370,10 @@ func (r *ClusterReconciler) freshestStandby(ctx context.Context, g Group, state 
 		}
 		v := memberView{Name: name, Listed: true}
 		if m := members[name]; m != nil && m.ip != "" {
-			if st, err := r.Prober.ProbeStandby(ctx, HostDSN(m.ip, password)); err == nil {
+			st, err := r.Prober.ProbeStandby(ctx, HostDSN(m.ip, password))
+			if err != nil {
+				v.Why = err.Error()
+			} else {
 				v.Reachable, v.InRecovery, v.FlushLSN = true, st.InRecovery, st.FlushLSN
 			}
 		}
@@ -375,9 +381,33 @@ func (r *ClusterReconciler) freshestStandby(ctx context.Context, g Group, state 
 	}
 	best, err := chooseCandidate(views, state.primary, "", 1)
 	if err != nil {
-		return ""
+		// A rollout held because the sync set is empty and one held
+		// because its standbys did not answer look identical from the
+		// outside, and an operator reading the second while looking at a
+		// healthy sync set has been told something that is not true.
+		logf.FromContext(ctx).Info("no switchover target", "group", g.Name(),
+			"why", err.Error(), "views", fmt.Sprintf("%+v", views))
+		if len(views) == 0 {
+			return "", "no sync-set standby to switch over to"
+		}
+		if unreachable := unreachableStandbys(views); len(unreachable) > 0 {
+			return "", "no sync-set standby answered its probe: " + strings.Join(unreachable, ", ")
+		}
+		return "", "no sync-set standby eligible to switch over to"
 	}
-	return best
+	return best, ""
+}
+
+// unreachableStandbys names the sync-set standbys whose probe did not
+// answer, so a held rollout can say which kind of nothing it found.
+func unreachableStandbys(views []memberView) []string {
+	var out []string
+	for _, v := range views {
+		if !v.Reachable {
+			out = append(out, v.Name)
+		}
+	}
+	return out
 }
 
 // stepReload asks every stale agent to reread its config and stamps the pod

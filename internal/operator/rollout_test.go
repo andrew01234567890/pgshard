@@ -1,6 +1,7 @@
 package operator
 
 import (
+	"context"
 	"reflect"
 	"strings"
 	"testing"
@@ -241,3 +242,53 @@ func TestChangedSettings(t *testing.T) {
 }
 
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
+
+// TestAHeldRolloutSaysWhichKindOfNothing: a rollout held because the sync
+// set is empty and one held because its standbys did not answer their
+// probe both reported "no sync-set standby to switch over to". An operator
+// reading the second while looking at a healthy sync set was told
+// something untrue, and the probe error that would have explained it was
+// discarded -- the same shape as PGS-598 in the failover path.
+func TestAHeldRolloutSaysWhichKindOfNothing(t *testing.T) {
+	g := Group{Cluster: "demo", Kind: "shard", ShardID: 0, Replicas: 3}
+	primary, standby := g.MemberName(0), g.MemberName(1)
+
+	newState := func(sync bool) groupState {
+		st := groupState{primary: primary, syncSet: map[string]bool{}, pvcs: map[string]string{}}
+		if sync {
+			st.syncSet[standby] = true
+		}
+		return st
+	}
+	members := map[string]*memberInfo{standby: {name: standby, ip: "10.0.0.2"}}
+
+	t.Run("an empty sync set says so", func(t *testing.T) {
+		r := &ClusterReconciler{Prober: &fakeProber{}}
+		target, why := r.freshestStandby(context.Background(), g, newState(false), members, "pw")
+		if target != "" || why != "no sync-set standby to switch over to" {
+			t.Fatalf("target=%q why=%q", target, why)
+		}
+	})
+
+	t.Run("a standby that did not answer is named, not called absent", func(t *testing.T) {
+		// fakeProber knows no standbys, so every probe errors.
+		r := &ClusterReconciler{Prober: &fakeProber{}}
+		target, why := r.freshestStandby(context.Background(), g, newState(true), members, "pw")
+		if target != "" {
+			t.Fatalf("target = %q, want none", target)
+		}
+		if !strings.Contains(why, standby) {
+			t.Fatalf("why = %q; it must name the standby that did not answer rather than say none exists", why)
+		}
+	})
+
+	t.Run("a reachable standby is chosen", func(t *testing.T) {
+		r := &ClusterReconciler{Prober: &fakeProber{standbys: map[string]StandbyState{
+			"10.0.0.2": {InRecovery: true, Streaming: true, FlushLSN: 42},
+		}}}
+		target, why := r.freshestStandby(context.Background(), g, newState(true), members, "pw")
+		if target != standby || why != "" {
+			t.Fatalf("target=%q why=%q, want %q", target, why, standby)
+		}
+	})
+}
