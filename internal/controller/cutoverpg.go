@@ -400,6 +400,24 @@ func (d rowDigest) add(o rowDigest) rowDigest {
 	return rowDigest{Rows: d.Rows + o.Rows, Hash: d.Hash + o.Hash, XOR: d.XOR ^ o.XOR}
 }
 
+// fenceRemaining is how long the current fence may still be held. It
+// reports false when there is no fence to bound -- nothing has been fenced
+// yet, or the switch is past the journal, where there is no going back and
+// so no deadline to enforce.
+func (o *pgCutover) fenceRemaining() (time.Duration, bool) {
+	if o.wf == nil || o.wf.cutover.FencedAt == nil || o.wf.cutover.JournalID != "" {
+		return 0, false
+	}
+	left := o.c.cutoverTimeout() - o.c.now().Sub(*o.wf.cutover.FencedAt)
+	if left <= 0 {
+		// Already over: give the scan a moment rather than zero, so the
+		// step fails on the deadline check that follows it instead of on a
+		// context that was dead before the query was sent.
+		return time.Millisecond, true
+	}
+	return left, true
+}
+
 // digest is what verification compares, and it decides whether a cutover
 // proceeds -- so what it costs to fool matters.
 //
@@ -462,6 +480,16 @@ func verifyDetail(got, want, inRange rowDigest) string {
 // after the targets caught up, so both sides are still.
 func (o *pgCutover) Verify(ctx context.Context) (VerifyReport, error) {
 	report := VerifyReport{CheckedAt: o.c.now()}
+	// The digests are full scans and they run with writes already fenced,
+	// so the scan is the write outage. Bounding the pass by what is left of
+	// the fence means an oversized table cancels the query and aborts the
+	// switch, rather than holding writes for as long as the scan takes.
+	// A cancelled scan is a retry; a fence held open is an outage.
+	if left, ok := o.fenceRemaining(); ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, left)
+		defer cancel()
+	}
 	for _, db := range o.dbs {
 		expected := map[string]map[int32]rowDigest{}
 		hashes := map[string]string{}
