@@ -422,7 +422,15 @@ func digest(ctx context.Context, conn ShardConn, schema, name, filter string) (r
 		where = " WHERE (" + filter + ")"
 	}
 	// Hashed once per row rather than once per aggregate.
-	sql := fmt.Sprintf(`SELECT count(*), coalesce(sum(h), 0), coalesce(bit_xor(h), 0)
+	//
+	// The sum is taken over the low 31 bits of each hash, not the whole
+	// 64: sum(bigint) is numeric in PostgreSQL and a full-width sum runs
+	// past int64 after a few million rows, which failed the scan rather
+	// than the comparison -- a verification that errors instead of
+	// answering. Masking bounds the total at rows x 2^31, which no table
+	// this runs on comes near. The sum loses width; bit_xor still carries
+	// all 64 bits, and it is the pair that makes a substitution hard.
+	sql := fmt.Sprintf(`SELECT count(*), coalesce(sum(h & 2147483647), 0), coalesce(bit_xor(h), 0)
 		FROM (SELECT hashtextextended(t::text, 0) AS h FROM %s.%s t%s) s`,
 		QuoteIdent(schema), QuoteIdent(name), where)
 	rows, err := conn.Query(ctx, sql)
