@@ -20,6 +20,9 @@ import (
 // pooler client for the shard's current primary.
 type Topology interface {
 	Shards(set string) []router.Shard
+	// ServingSet names the shard set now serving, which is what a request
+	// that omits one means.
+	ServingSet() string
 	Generation() uint64
 	Epoch(sh router.Shard) uint64
 	Client(sh router.Shard) (pgshardv1.PoolerClient, error)
@@ -47,6 +50,16 @@ func (t SnapshotTopology) Shards(set string) []router.Shard {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
+}
+
+// ServingSet answers from the snapshot, the same source the planner and
+// the session use, so a stream that omits a set follows a cutover instead
+// of staying on the set that was serving when it was written.
+func (t SnapshotTopology) ServingSet() string {
+	if s := t.Snapshot(); s != nil {
+		return s.ServingShardSet()
+	}
+	return router.DefaultShardSet
 }
 
 // Generation returns the shard map generation.

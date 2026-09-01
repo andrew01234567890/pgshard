@@ -103,6 +103,14 @@ the change stream.
 and `pgshard.stream_status` per `(stream, shard)` — see
 [catalog.md](catalog.md).
 
+A `Stream` request that names no `shard_set` streams **whichever set is
+serving**, not the literal `default`. A reshard or a blue/green upgrade
+makes another set serving and retires the old one, and a consumer pinned to
+`default` would go on reading shards nothing writes to any more -- without
+an error, because those shards and their slots are still there. Naming a set
+explicitly still wins, so a consumer draining a retired set on purpose can
+say so.
+
 ## Creating a stream (controller)
 
 `Controller.CreateStream(stream, database, two_phase, shard_set)` inserts
