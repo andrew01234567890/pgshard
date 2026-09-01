@@ -1,0 +1,61 @@
+# Go runs a fuzz target's seed corpus during an ordinary `go test` and
+# fuzzes only under -fuzz. Without this workflow the repository's fuzz
+# targets never generate an input: they are table tests wearing a fuzzer's
+# name. Two of them sit on the pre-authentication wire surface, which is
+# where a length field trusted before it is bounded does the most damage.
+#
+# Scheduled rather than a PR gate. Fuzzing is time-boxed exploration, not a
+# pass/fail signal a pull request should wait on, and a crasher is worth
+# finding a day late.
+name: fuzz
+
+on:
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+    inputs:
+      fuzztime:
+        description: How long to fuzz each target
+        required: false
+        default: "5m"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: FuzzCountStatements
+            package: ./internal/pgwire/
+          - target: FuzzDecodeStartupPacket
+            package: ./internal/pgwire/
+          - target: FuzzDecode
+            package: ./internal/pgoutput/
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Fuzz ${{ matrix.target }}
+        run: |
+          go test -run '^$' -fuzz '${{ matrix.target }}' \
+            -fuzztime '${{ inputs.fuzztime || '5m' }}' '${{ matrix.package }}'
+      # Go writes a failing input under testdata/fuzz/<target>/. Keeping it
+      # is the whole point: committed as a seed it becomes a permanent
+      # regression test, so the same defect cannot return unnoticed.
+      - name: Keep any crasher
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-crasher-${{ matrix.target }}
+          path: "**/testdata/fuzz/**"
+          if-no-files-found: ignore
