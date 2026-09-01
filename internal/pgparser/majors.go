@@ -1,7 +1,15 @@
 package pgparser
 
 // EffectiveMajor is the grammar major a router must target while shard
-// groups of several majors serve, e.g. during a rolling major upgrade: the
+// groups of several majors serve.
+//
+// Nothing calls it yet: the router binds one grammar at build time
+// (internal/pgparser/pg18) and has no way to swap it per statement, so this
+// is the rule waiting for the mechanism rather than a switch that is wired.
+// A reader of docs/upgrade.md should not take the reference there as a
+// description of what runs today.
+//
+// The rule itself: during a rolling major upgrade it is the
 // lowest still-present major, so no statement is accepted that an old-major
 // group would refuse. It flips to the new major only once every group runs
 // it. Non-positive entries (unknown majors) are ignored; with no known

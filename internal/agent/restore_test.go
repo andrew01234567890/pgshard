@@ -61,7 +61,7 @@ func TestRecoveryConfRendersTargetAndSourceStanza(t *testing.T) {
 	c.Role = RolePrimary
 	c.Backup = repoSettings()
 	c.Restore = &backup.RestoreOptions{Stanza: "old-s0-pg18", Type: backup.TargetTime, Target: "2026-08-19 10:00:00+00", Exclusive: true, TargetTLI: 2}
-	got := RenderRecoveryConf(c)
+	got := renderRecoveryConf(c)
 	for _, want := range []string{
 		"archive_mode = off\n",
 		"restore_command = 'pgbackrest --config=/etc/pgbackrest/pgbackrest.conf --stanza=old-s0-pg18 archive-get %f \"%p\"'\n",

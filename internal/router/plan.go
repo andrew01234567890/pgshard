@@ -31,8 +31,9 @@ type Planner struct {
 	before func(sql string)
 }
 
-// NewPlanner builds a Planner with a bounded parse cache.
-func NewPlanner() *Planner { return &Planner{inner: plan.New()} }
+// newPlanner builds a Planner with a bounded parse cache. Production uses
+// NewPlannerWithMetrics; this exists for tests that need neither.
+func newPlanner() *Planner { return &Planner{inner: plan.New()} }
 
 // NewPlannerWithMetrics builds a Planner whose parse cache reports hits and
 // misses to m.
