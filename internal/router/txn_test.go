@@ -720,3 +720,82 @@ func TestHeartbeatBeatsFasterThanTheResolverGivesUp(t *testing.T) {
 		t.Fatalf("the default timeout %s is below the floor %s", controller.DefaultPreparingTimeout, catalog.MinPreparingTimeout)
 	}
 }
+
+// TestStrictIsolationRefusesASecondShard: two-phase commit makes the
+// outcome atomic, not the snapshots one snapshot. Each shard would run its
+// own PostgreSQL transaction at this level and each could choose a locally
+// valid serialization order while the combined history has a cycle neither
+// can see, so a transaction that asked for SERIALIZABLE would commit with
+// write skew. Scatter reads were refused for this; keyed transactions
+// crossing shards one statement at a time were not.
+func TestStrictIsolationRefusesASecondShard(t *testing.T) {
+	ctx := context.Background()
+	for _, begin := range []string{
+		"begin isolation level serializable",
+		"begin isolation level repeatable read",
+	} {
+		t.Run(begin, func(t *testing.T) {
+			h := newTxnHarness(t)
+			a, b := h.twoTenants(t)
+			conn := h.connect(t, h.dsn())
+			if _, err := conn.Exec(ctx, begin); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := conn.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 1)", a); err != nil {
+				t.Fatal(err)
+			}
+			_, err := conn.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 2)", b)
+			pe := expectRefusal(t, err, "a transaction under REPEATABLE READ or SERIALIZABLE isolation cannot span shards")
+			if !strings.Contains(pe.Hint, "independent snapshots") {
+				t.Fatalf("hint %q", pe.Hint)
+			}
+			_, _ = conn.Exec(ctx, "rollback")
+			if got := h.log.log(); len(got) != 0 {
+				t.Errorf("a refused transaction must not reach the decision log: %v", got)
+			}
+		})
+	}
+}
+
+// The same session default reaches every backend the transaction opens, so
+// it has to be refused even though no BEGIN mentions an isolation level.
+func TestStrictSessionDefaultRefusesASecondShard(t *testing.T) {
+	ctx := context.Background()
+	h := newTxnHarness(t)
+	a, b := h.twoTenants(t)
+	conn := h.connect(t, h.dsn())
+	if _, err := conn.Exec(ctx, "set default_transaction_isolation = 'serializable'"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 1)", a); err != nil {
+		t.Fatal(err)
+	}
+	_, err = tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 2)", b)
+	_ = expectRefusal(t, err, "a transaction under REPEATABLE READ or SERIALIZABLE isolation cannot span shards")
+	_ = tx.Rollback(ctx)
+}
+
+// READ COMMITTED still spans shards: this is the isolation pgshard
+// supports across shards, and refusing it would refuse two-phase commit.
+func TestReadCommittedStillSpansShards(t *testing.T) {
+	ctx := context.Background()
+	h := newTxnHarness(t)
+	a, b := h.twoTenants(t)
+	conn := h.connect(t, h.dsn())
+	if _, err := conn.Exec(ctx, "begin isolation level read committed"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 1)", a); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 2)", b); err != nil {
+		t.Fatalf("READ COMMITTED must still cross shards: %v", err)
+	}
+	if _, err := conn.Exec(ctx, "commit"); err != nil {
+		t.Fatal(err)
+	}
+}

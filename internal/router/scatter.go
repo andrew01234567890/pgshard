@@ -84,17 +84,8 @@ func (e *Executor) scatterAllowed(shards int) error {
 		err.Hint = "run the multi-shard SELECT outside the transaction, or filter on the transaction's shard key"
 		return err
 	}
-	if e.tx != pgwire.TxIdle {
-		for _, sql := range e.txnPrelude {
-			if strictIsolation(sql) {
-				return isolationRefusal()
-			}
-		}
-	}
-	for _, g := range append(append([]gucEntry(nil), e.gucs...), e.staged...) {
-		if (g.name == "default_transaction_isolation" || g.name == "session characteristics") && strictIsolation(g.sql) {
-			return isolationRefusal()
-		}
+	if e.strictIsolationInEffect() {
+		return isolationRefusal()
 	}
 	if m := e.r.cfg.Scatter.MaxShards; m > 0 && shards > m {
 		err := pgwire.Errorf(pgwire.CodeFeatureNotSupported, "statement fans out to %d shards, more than the router's limit of %d", shards, m)
@@ -105,6 +96,25 @@ func (e *Executor) scatterAllowed(shards int) error {
 		return pgwire.Errorf("53300", "statement needs %d shard streams, more than the router's scatter stream budget of %d", shards, e.r.cfg.Scatter.MaxStreams)
 	}
 	return nil
+}
+
+// strictIsolationInEffect reports whether the session has asked for
+// REPEATABLE READ or SERIALIZABLE, whether by the transaction's own BEGIN
+// or by a session default that every backend will pick up.
+func (e *Executor) strictIsolationInEffect() bool {
+	if e.tx != pgwire.TxIdle {
+		for _, sql := range e.txnPrelude {
+			if strictIsolation(sql) {
+				return true
+			}
+		}
+	}
+	for _, g := range append(append([]gucEntry(nil), e.gucs...), e.staged...) {
+		if (g.name == "default_transaction_isolation" || g.name == "session characteristics") && strictIsolation(g.sql) {
+			return true
+		}
+	}
+	return false
 }
 
 func strictIsolation(sql string) bool {

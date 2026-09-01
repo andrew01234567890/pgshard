@@ -244,7 +244,24 @@ READ`/`SERIALIZABLE`, `SET TRANSACTION …` in the prelude, or a session
 `default_transaction_isolation`/`SESSION CHARACTERISTICS` of those levels
 refuse every scatter ("multi-shard reads under REPEATABLE READ or
 SERIALIZABLE isolation are not available yet"): the shards take independent
-snapshots. Session GUCs (`SET`) are **not** replayed on the scatter backends.
+snapshots. The same levels also refuse a **keyed transaction that reaches a
+second shard** ("a transaction under REPEATABLE READ or SERIALIZABLE
+isolation cannot span shards"), for reads and writes alike. Two-phase commit
+makes the outcome atomic; it does not make the snapshots one snapshot. Each
+shard would run its own PostgreSQL transaction at that level and each could
+choose a locally valid serialization order while the combined history has a
+cycle neither can see, so the transaction would commit with write skew
+rather than raising `40001`. Cross-shard invariants -- balances, quotas,
+uniqueness, authorization -- cannot be protected by PostgreSQL isolation
+levels here: keep them behind one shard key, or serialise them in the
+application. Supporting them properly needs a global timestamp and
+cross-shard read certification, which pgshard does not have.
+
+For the same reason a scatter read under READ COMMITTED is weaker than
+PostgreSQL's statement-level READ COMMITTED: each shard takes its own
+snapshot at its own moment, and those snapshots need never have coexisted.
+
+Session GUCs (`SET`) are **not** replayed on the scatter backends.
 Through the extended protocol a scatter statement must be the only statement
 of its batch (`Bind` and `Execute` before one `Sync`; a `Parse`+`Describe`
 round trip on its own runs on the session's shard, so drivers that prepare
