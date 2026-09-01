@@ -1011,3 +1011,64 @@ func TestReserveMarksTheSessionThatIsRegistered(t *testing.T) {
 		}
 	}
 }
+
+// TestAMismatchedAttachDoesNotTakeARunningStreamsBackend: rejecting an
+// attach that presents the wrong credentials is what denies it the
+// backend; tearing the backend away as well took one the running Execute
+// stream still held and would return itself. Two owners returning one
+// backend is how a slot gets freed twice.
+func TestAMismatchedAttachDoesNotTakeARunningStreamsBackend(t *testing.T) {
+	pg := newFakePG()
+	pool := newPool(PoolConfig{MaxBackends: 1, MaxPerRole: 1, AcquireTimeout: 2 * time.Second}, pg.dial)
+	defer pool.Close()
+	s := NewServer(Config{Logger: slog.New(slog.DiscardHandler), Pool: pool, Database: "db"})
+
+	se, err := s.attachSession("x", "alice", "db", sessionCred("alice", testKey(0x11), testKey(0x22)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := pool.Acquire(context.Background(), "db", "alice", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	se.b = b
+	s.mu.Unlock()
+
+	// Somebody with the session id but not the credentials.
+	if _, err := s.attachSession("x", "mallory", "db", sessionCred("mallory", testKey(0x33), testKey(0x44))); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("mismatched attach = %v, want PermissionDenied", err)
+	}
+	s.mu.Lock()
+	held, evicted := se.b, se.evicted
+	s.mu.Unlock()
+	if held != b {
+		t.Fatal("the running stream's backend was taken from under it")
+	}
+	if !evicted {
+		t.Fatal("the session must be marked so its own stream gets rid of the backend")
+	}
+	if b.released {
+		t.Fatal("the backend was returned to the pool while its stream still held it")
+	}
+
+	// The owner ends. It is the only one to return the backend, and because
+	// the session was torn down the backend goes rather than being reused.
+	s.detach(se)
+	if !b.released {
+		t.Fatal("the stream did not return the backend on its way out")
+	}
+	if !b.broken {
+		t.Fatal("a backend whose session was torn down for a credential mismatch must not be reused")
+	}
+	// The slot was freed exactly once, so it can be taken again -- and only
+	// once more.
+	b2, err := pool.Acquire(context.Background(), "db", "alice", nil, nil)
+	if err != nil {
+		t.Fatalf("the slot was not freed: %v", err)
+	}
+	if b2 == b {
+		t.Fatal("a discarded backend came back out of the pool")
+	}
+	pool.Release(b2)
+}

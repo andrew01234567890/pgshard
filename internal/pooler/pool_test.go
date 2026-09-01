@@ -356,3 +356,44 @@ func TestIdleBackendsAreReapedWhileQuiet(t *testing.T) {
 	_, idle := p.Stats()
 	t.Fatalf("%d backends still idle well past MaxIdleTime with nothing touching the pool", idle)
 }
+
+// TestABackendIsReleasedOnce: free drains a token from two channels, so
+// returning one backend's slot twice takes another backend's tokens, and
+// once they run out the receive blocks for good. A second return has to be
+// a no-op rather than a hang, whichever way it arrives.
+func TestABackendIsReleasedOnce(t *testing.T) {
+	for _, twice := range []struct {
+		name string
+		put  func(p *Pool, b *Backend)
+	}{
+		{"release then release", func(p *Pool, b *Backend) { p.Release(b); p.Release(b) }},
+		{"discard then discard", func(p *Pool, b *Backend) { p.Discard(b); p.Discard(b) }},
+		{"discard then release", func(p *Pool, b *Backend) { p.Discard(b); p.Release(b) }},
+		{"release then discard", func(p *Pool, b *Backend) { p.Release(b); p.Discard(b) }},
+	} {
+		t.Run(twice.name, func(t *testing.T) {
+			pg := newFakePG()
+			p := newPool(PoolConfig{MaxBackends: 1, MaxPerRole: 1, AcquireTimeout: 2 * time.Second}, pg.dial)
+			defer p.Close()
+			ctx := context.Background()
+			b, err := p.Acquire(ctx, "db", "alice", nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan struct{})
+			go func() { defer close(done); twice.put(p, b) }()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("returning a backend twice blocked: the second free took a token that was not its own")
+			}
+			// The slot has to be free exactly once, so the next acquire
+			// succeeds and the one after it has to wait for a real release.
+			b2, err := p.Acquire(ctx, "db", "alice", nil, nil)
+			if err != nil {
+				t.Fatalf("the slot was not freed: %v", err)
+			}
+			p.Release(b2)
+		})
+	}
+}

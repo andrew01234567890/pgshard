@@ -80,6 +80,10 @@ type Backend struct {
 	lastUsed time.Time
 	txStatus byte
 	broken   bool
+	// released is true while the pool owns the backend rather than a
+	// caller: set when it is returned, cleared when it is handed out. It
+	// is what makes a second return a no-op instead of a double free.
+	released bool
 	// credDigest fingerprints the SCRAM keys that authenticated this
 	// backend; an idle backend is only handed to a session presenting the
 	// same keys.

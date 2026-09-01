@@ -109,6 +109,10 @@ type session struct {
 	// b is the backend currently held; nil when the session is between
 	// stateless batches.
 	b *Backend
+	// evicted marks a session torn down while its Execute stream was still
+	// running -- a credential mismatch. The stream owns the backend, so it
+	// is the one that must get rid of it.
+	evicted bool
 }
 
 // NewServer builds a Server; Register attaches it to a gRPC server.
@@ -169,9 +173,19 @@ func (s *Server) attachSession(id, role, database string, cred [32]byte) (*sessi
 		if roleOK&credOK != 1 {
 			// Reject and tear the session down: a caller holding only the
 			// session id must never reach the backend the real credentials
-			// authenticated.
-			b := se.b
-			se.b, se.reserved = nil, false
+			// authenticated. Refusing the attach is what denies it; the
+			// teardown is so the backend is not reused afterwards either.
+			var b *Backend
+			if se.attached {
+				// A relay is running on this backend and holds its own
+				// pointer to it. Taking it here would leave two owners
+				// returning one backend, so the owner keeps it and
+				// discards it instead of recycling it on its way out.
+				se.evicted = true
+			} else {
+				b, se.b = se.b, nil
+			}
+			se.reserved = false
 			if s.sessions[se.id] == se {
 				delete(s.sessions, se.id)
 			}
@@ -283,12 +297,19 @@ func (s *Server) detach(se *session) {
 		}
 	}
 	detached := se.detached
+	evicted := se.evicted
 	s.mu.Unlock()
 	if s.detachUnlocked != nil {
 		s.detachUnlocked()
 	}
 	if !keep {
-		s.recycle(b)
+		if evicted && b != nil {
+			// Torn down under this stream for a credential mismatch: the
+			// backend goes rather than returning to the pool.
+			s.cfg.Pool.Discard(b)
+		} else {
+			s.recycle(b)
+		}
 	}
 	close(detached)
 }
