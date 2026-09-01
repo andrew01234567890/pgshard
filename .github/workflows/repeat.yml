@@ -14,7 +14,7 @@ on:
         description: Which suite to repeat
         required: true
         type: choice
-        options: [operator, controller, catalog, router, pooler, pgwire, agent, unit]
+        options: [operator, controller, catalog, router, pooler, pgwire, agent, integration, unit]
       runs:
         description: How many times (1-50)
         required: false
@@ -98,6 +98,23 @@ jobs:
             pooler)      go test "${args[@]}" ./internal/pooler/... ;;
             pgwire)      go test "${args[@]}" ./internal/pgwire/... ;;
             agent)       go test "${args[@]}" ./internal/agent/... ;;
+            # The integration suite is where the tests that actually flake
+            # live -- it drives real PostgreSQL through a real router -- and
+            # until now it was the one suite this workflow could not
+            # measure, because `router` means ./internal/router/... and the
+            # cutover and 2PC tests are under test/e2e/router. It keeps its
+            # own timeout, and no -race: these are separate processes, so
+            # the detector has nothing to watch and only slows them down.
+            integration)
+              # Its own argument list: the shared one carries -race, which
+              # these do not want, and building it as an array keeps the
+              # optional -run from being word-split.
+              iargs=(-tags integration -count=1 -timeout 45m)
+              if [ -n "${{ inputs.pattern }}" ]; then
+                iargs+=(-run "${{ inputs.pattern }}")
+              fi
+              PGSHARD_REQUIRE_DOCKER=1 go test "${iargs[@]}" \
+                ./test/e2e/router/... ./internal/agent/... ./internal/pgtune/... ;;
             unit)        go test "${args[@]}" ./... ;;
             *) echo "::error::unknown target"; exit 1 ;;
           esac
