@@ -69,9 +69,13 @@ const (
 	// CancelRequest opens a new connection, so the load balancer is free to
 	// land it on a replica that never saw the session it names.
 	routerPeerPort = 9090
-	agentGRPCPort  = 9090
-	superuserName  = "postgres"
-	secretKey      = "password"
+	// routerVStreamPort serves the merged change stream. Consumers reach
+	// it through the router Service, so it is a port of the cluster's
+	// front door rather than something to be found.
+	routerVStreamPort = 9091
+	agentGRPCPort     = 9090
+	superuserName     = "postgres"
+	secretKey         = "password"
 	// agentTokenVolume mounts the cluster's agent control-plane token into
 	// every member pod.
 	agentTokenVolume = "agent-token"

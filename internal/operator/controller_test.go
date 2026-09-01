@@ -107,3 +107,37 @@ func TestTheControllerSpeaksTheClusterSTLS(t *testing.T) {
 		t.Fatal("the certificate files are named but not mounted")
 	}
 }
+
+// TestTheRouterCanReachTheStreamAndTheController: the merged change stream
+// needs both ends. Without --vstream-listen a consumer has nothing to
+// dial; without --controller the router can serve an existing stream but
+// not create or drop one, so Create answers Unimplemented on a cluster
+// whose controller is running right there.
+func TestTheRouterCanReachTheStreamAndTheController(t *testing.T) {
+	c := controllerCluster()
+	args := Renderer{}.RouterDeployment(c).Spec.Template.Spec.Containers[0].Args
+	if got := argOf(args, "--vstream-listen="); got == "" {
+		t.Fatalf("args %v: no VStream listener, so nothing can consume the stream", args)
+	}
+	// The address the router is told is the Service this operator renders.
+	want := ControllerName(c.Name) + "." + c.Namespace + ".svc:15500"
+	if got := argOf(args, "--controller="); got != want {
+		t.Fatalf("controller endpoint %q, want %q", got, want)
+	}
+	if got := ControllerEndpoint("", c.Name, c.Namespace); got != want {
+		t.Fatalf("the router dials %q while barriers resolve %q", want, got)
+	}
+
+	// And a consumer outside the cluster reaches it through the router
+	// Service, so the port has to be published, not merely listened on.
+	svc := Renderer{}.RouterService(c)
+	var found bool
+	for _, p := range svc.Spec.Ports {
+		if p.Name == "vstream" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("router service ports %+v: the stream is listened on but not published", svc.Spec.Ports)
+	}
+}

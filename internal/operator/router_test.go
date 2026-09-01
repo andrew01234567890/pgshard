@@ -49,7 +49,8 @@ func TestRouterDeployment(t *testing.T) {
 	}
 	args := strings.Join(ctr.Args, " ")
 	want := "serve --listen=:5432 --health-listen=:8080 --catalog-dsn=host=demo-catalog-rw.ns1.svc port=5432 user=pgshard_router dbname=postgres --catalog-pooler=demo-catalog-rw.ns1.svc:9091 " +
-		"--peer-cancel-listen=:9090 --peer-service=demo-router-peers.ns1.svc:9090 --insecure-dev"
+		"--peer-cancel-listen=:9090 --peer-service=demo-router-peers.ns1.svc:9090 " +
+		"--vstream-listen=:9091 --controller=demo-controller.ns1.svc:15500 --insecure-dev"
 	if args != want {
 		t.Errorf("args\n got %q\nwant %q", args, want)
 	}

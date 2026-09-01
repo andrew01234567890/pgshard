@@ -19,7 +19,7 @@ tests are authoritative.
 | Online PVC growth and StorageClass change via member rebuild | Implemented | `internal/operator/rollout.go` |
 | Automatic tuning from resources and profile, memory-budget invariant | Implemented | `internal/pgtune`, [tuning.md](tuning.md) |
 | Pooler sidecar per member; router Deployment + HPA + PDB; admin and controller Deployments | Implemented | `internal/operator/router.go`, `admin.go`, `controller.go` |
-| Controller deployed by the operator (Deployment/Service per cluster) | Implemented | one leader-elected replica plus the `{cluster}-controller` Service that barriers, workflow calls and backup policies already resolve; `internal/operator/controller.go`. Router `--vstream-listen`/`--controller` and pooler `--stream-dsn` are still unwired (PGS-495) |
+| Controller deployed by the operator (Deployment/Service per cluster) | Implemented | one leader-elected replica plus the `{cluster}-controller` Service that barriers, workflow calls and backup policies already resolve; `internal/operator/controller.go`. Router `--vstream-listen`/`--controller` and pooler `--stream-dsn` are wired; no ControllerReady condition yet (PGS-495) |
 | mTLS operator↔agent and router↔pooler in operator-deployed clusters | Partial | flags and TLS paths exist (`--pooler-tls-*`, controller `--tls-*`); operator wiring still passes `--insecure-dev` ([operator.md](operator.md)) |
 
 ## Catalog and placement

@@ -90,7 +90,13 @@ func (r Renderer) RouterDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.De
 		// Without these a cancel that lands on the wrong replica is
 		// discarded in silence, and the query it named runs on.
 		fmt.Sprintf("--peer-cancel-listen=:%d", routerPeerPort),
-		fmt.Sprintf("--peer-service=%s.%s.svc:%d", RouterPeerServiceName(c.Name), c.Namespace, routerPeerPort)}
+		fmt.Sprintf("--peer-service=%s.%s.svc:%d", RouterPeerServiceName(c.Name), c.Namespace, routerPeerPort),
+		// The merged change stream. Without the listener a consumer has
+		// nothing to dial; without --controller the router can serve an
+		// existing stream but not create or drop one, so Create answers
+		// Unimplemented on a cluster whose controller is right there.
+		fmt.Sprintf("--vstream-listen=:%d", routerVStreamPort),
+		fmt.Sprintf("--controller=%s.%s.svc:%d", ControllerName(c.Name), c.Namespace, controllerPort)}
 	var mounts []corev1.VolumeMount
 	var volumes []corev1.Volume
 	if ref := internalTLSRef(c); ref != nil {
@@ -127,7 +133,8 @@ func (r Renderer) RouterDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.De
 						Env: []corev1.EnvVar{{Name: "PGPASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
 							LocalObjectReference: corev1.LocalObjectReference{Name: RouterSecretName(c.Name)}, Key: secretKey}}}},
 						Ports: []corev1.ContainerPort{{Name: "postgres", ContainerPort: postgresPort}, {Name: "http", ContainerPort: routerHTTPPort},
-							{Name: "peer", ContainerPort: routerPeerPort}},
+							{Name: "peer", ContainerPort: routerPeerPort},
+							{Name: "vstream", ContainerPort: routerVStreamPort}},
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler:  corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString("postgres")}},
 							PeriodSeconds: 10,
@@ -158,7 +165,10 @@ func (Renderer) RouterService(c *pgshardv1alpha1.PgShardCluster) *corev1.Service
 		Spec: corev1.ServiceSpec{
 			Type:     corev1.ServiceTypeClusterIP,
 			Selector: routerLabels(c),
-			Ports:    []corev1.ServicePort{{Name: "postgres", Port: postgresPort, TargetPort: intstr.FromString("postgres")}},
+			Ports: []corev1.ServicePort{
+				{Name: "postgres", Port: postgresPort, TargetPort: intstr.FromString("postgres")},
+				{Name: "vstream", Port: routerVStreamPort, TargetPort: intstr.FromString("vstream")},
+			},
 		},
 	}
 }
