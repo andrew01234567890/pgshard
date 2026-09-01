@@ -128,7 +128,7 @@ func Run(ctx context.Context, o Options) error {
 		return fmt.Errorf("new manager: %w", err)
 	}
 	notifier := NewNotifier()
-	if err := RegisterWatches(mgr, notifier); err != nil {
+	if err := RegisterWatches(mgr, notifier, o.Cluster); err != nil {
 		return err
 	}
 	var catalogSrc CatalogSource
@@ -177,17 +177,28 @@ func Run(ctx context.Context, o Options) error {
 // RegisterWatches wires informers on PgShardCluster, PgShardGroup, the backup
 // objects and Pod so
 // every create/update/delete calls notifier.Notify.
-func RegisterWatches(mgr ctrl.Manager, notifier *Notifier) error {
+//
+// cluster scopes the watches the way it scopes every page: an admin
+// serving one cluster is not told that another one changed. The tick
+// carries no cluster identity, so it disclosed nothing about the other
+// cluster except that it exists and is busy -- but it also re-rendered
+// this admin for changes that could not alter a thing it serves, which is
+// the better reason to stop doing it. Where the mapping cannot answer,
+// it notifies: see inScope.
+func RegisterWatches(mgr ctrl.Manager, notifier *Notifier, cluster string) error {
+	policies := func(ctx context.Context, p *pgshardv1alpha1.PgShardBackupPolicy) bool {
+		return policyInScope(ctx, mgr.GetClient(), cluster, p)
+	}
 	_, err := ctrl.NewControllerManagedBy(mgr).
 		Named("admin-topology").
 		WithOptions(controller.Options{SkipNameValidation: &skipNameValidation}).
-		WatchesRawSource(source.Kind(mgr.GetCache(), &pgshardv1alpha1.PgShardCluster{}, notifyHandler[*pgshardv1alpha1.PgShardCluster]())).
-		WatchesRawSource(source.Kind(mgr.GetCache(), &pgshardv1alpha1.PgShardGroup{}, notifyHandler[*pgshardv1alpha1.PgShardGroup]())).
-		WatchesRawSource(source.Kind(mgr.GetCache(), &pgshardv1alpha1.PgShardBackupPolicy{}, notifyHandler[*pgshardv1alpha1.PgShardBackupPolicy]())).
-		WatchesRawSource(source.Kind(mgr.GetCache(), &pgshardv1alpha1.PgShardBackup{}, notifyHandler[*pgshardv1alpha1.PgShardBackup]())).
-		WatchesRawSource(source.Kind(mgr.GetCache(), &pgshardv1alpha1.PgShardRestore{}, notifyHandler[*pgshardv1alpha1.PgShardRestore]())).
-		WatchesRawSource(source.Kind(mgr.GetCache(), &pgshardv1alpha1.PgShardReshard{}, notifyHandler[*pgshardv1alpha1.PgShardReshard]())).
-		WatchesRawSource(source.Kind(mgr.GetCache(), &corev1.Pod{}, notifyHandler[*corev1.Pod](), predicate.NewTypedPredicateFuncs(func(p *corev1.Pod) bool {
+		WatchesRawSource(source.Kind(mgr.GetCache(), &pgshardv1alpha1.PgShardCluster{}, notifyHandler(scopedTo[*pgshardv1alpha1.PgShardCluster](cluster)))).
+		WatchesRawSource(source.Kind(mgr.GetCache(), &pgshardv1alpha1.PgShardGroup{}, notifyHandler(scopedTo[*pgshardv1alpha1.PgShardGroup](cluster)))).
+		WatchesRawSource(source.Kind(mgr.GetCache(), &pgshardv1alpha1.PgShardBackupPolicy{}, notifyHandler(policies))).
+		WatchesRawSource(source.Kind(mgr.GetCache(), &pgshardv1alpha1.PgShardBackup{}, notifyHandler(scopedTo[*pgshardv1alpha1.PgShardBackup](cluster)))).
+		WatchesRawSource(source.Kind(mgr.GetCache(), &pgshardv1alpha1.PgShardRestore{}, notifyHandler(scopedTo[*pgshardv1alpha1.PgShardRestore](cluster)))).
+		WatchesRawSource(source.Kind(mgr.GetCache(), &pgshardv1alpha1.PgShardReshard{}, notifyHandler(scopedTo[*pgshardv1alpha1.PgShardReshard](cluster)))).
+		WatchesRawSource(source.Kind(mgr.GetCache(), &corev1.Pod{}, notifyHandler(scopedTo[*corev1.Pod](cluster)), predicate.NewTypedPredicateFuncs(func(p *corev1.Pod) bool {
 			_, ok := p.Labels[operator.LabelCluster]
 			return ok
 		}))).
@@ -200,8 +211,19 @@ func RegisterWatches(mgr ctrl.Manager, notifier *Notifier) error {
 
 var skipNameValidation = true
 
-func notifyHandler[T client.Object]() handler.TypedEventHandler[T, reconcile.Request] {
-	return handler.TypedEnqueueRequestsFromMapFunc[T](func(_ context.Context, obj T) []reconcile.Request {
+// scopedTo is inScope for one watched kind.
+func scopedTo[T client.Object](cluster string) func(context.Context, T) bool {
+	return func(_ context.Context, obj T) bool { return inScope(cluster, obj) }
+}
+
+// notifyHandler enqueues obj only when want says it belongs to this admin.
+// Returning no requests is what suppresses the notification: the reconcile
+// function is the notify, and it never sees which object caused it.
+func notifyHandler[T client.Object](want func(context.Context, T) bool) handler.TypedEventHandler[T, reconcile.Request] {
+	return handler.TypedEnqueueRequestsFromMapFunc[T](func(ctx context.Context, obj T) []reconcile.Request {
+		if !want(ctx, obj) {
+			return nil
+		}
 		return []reconcile.Request{{NamespacedName: client.ObjectKeyFromObject(obj)}}
 	})
 }
