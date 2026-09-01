@@ -1378,6 +1378,28 @@ func (e *Executor) sync(ctx context.Context) error {
 				break
 			}
 		}
+		// A batch that Binds the unnamed statement without Parsing it is
+		// binding one an earlier batch left behind. PostgreSQL keeps the
+		// unnamed statement until something replaces it, but the router
+		// does not pin for it and the pooler hands an unreserved session
+		// whatever backend is free, having reset it -- so the Bind
+		// reached a backend that had never seen the Parse and the client
+		// got "prepared statement does not exist" for a sequence the
+		// protocol allows. A driver doing a separate prepare round trip
+		// produces exactly that sequence.
+		//
+		// Carried rather than pinned: re-parsing one statement costs a
+		// message, while pinning would cost every such session its
+		// transaction pooling, including the single-batch
+		// Parse-Bind-Execute that works correctly today. The extra
+		// ParseComplete needs no suppression -- the router drops the
+		// pooler's ParseComplete for every statement and pgwire answers
+		// the client itself.
+		if st, ok := e.stmts[""]; ok && !fresh[""] && bindsUnnamed(batch) {
+			if err := e.send(parseReq("", st.shardSQL(), st.shardOIDs())); err != nil {
+				return err
+			}
+		}
 		var hidden []bool
 		for i, req := range batch {
 			if err := e.send(req); err != nil {
@@ -1410,6 +1432,16 @@ func (e *Executor) sync(ctx context.Context) error {
 		}
 		return err
 	})
+}
+
+// bindsUnnamed reports whether the batch binds the unnamed statement.
+func bindsUnnamed(batch []*pgshardv1.ExecuteRequest) bool {
+	for _, req := range batch {
+		if b, ok := req.Message.(*pgshardv1.ExecuteRequest_Bind); ok && b.Bind.GetStatement() == "" {
+			return true
+		}
+	}
+	return false
 }
 
 // reapplyStartupSearchPath keeps the executing backend's search_path in step
