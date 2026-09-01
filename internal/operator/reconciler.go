@@ -134,6 +134,10 @@ type groupObservation struct {
 	nodes []string
 	// failing is set while the primary is unhealthy or a failover is pending.
 	failing bool
+	// writesPaused is the primary refusing writes: the observable effect of
+	// a raised catalog write fence, and what a barrier or a cutover leaves
+	// behind if it dies mid-flight.
+	writesPaused bool
 	// template is the desired member template; tuning the derived settings
 	// behind it (tuningErr when they could not be derived).
 	template  MemberTemplate
@@ -825,6 +829,7 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 		return obs, nil
 	}
 	obs.primaryOK = true
+	obs.writesPaused = pstate.WritesPaused
 	// Reported, never fatal to the pass: the fence lives in the catalog
 	// group, which is itself rebuilt member by member on a storage-class
 	// change, and a group that stopped rolling out because it could not
@@ -1186,6 +1191,7 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, c *pgshardv1alpha1
 	ready := true
 	primaryOK := true
 	replOK := true
+	fenced, servingShards, pausedShards := false, 0, 0
 	var msg string
 	var shards []pgshardv1alpha1.ShardStatus
 	for _, o := range obs {
@@ -1198,6 +1204,12 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, c *pgshardv1alpha1
 		}
 		if !o.primaryOK {
 			primaryOK = false
+		}
+		if o.group.Kind == "shard" {
+			servingShards++
+			if o.writesPaused {
+				fenced, pausedShards = true, pausedShards+1
+			}
 		}
 		if o.streamingCount() < o.replicasWant {
 			replOK = false
@@ -1245,6 +1257,17 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, c *pgshardv1alpha1
 	set(pgshardv1alpha1.ConditionTopologyDegraded, len(crowded) > 0,
 		boolReason(len(crowded) > 0, "MembersShareNodes", "MembersOnDistinctNodes"),
 		strings.Join(crowded, "; "))
+	// Fenced and ServingWrites were declared and documented alongside the
+	// two below and were likewise never set. Both are read off what the
+	// pass already probed rather than a fresh catalog read: a primary
+	// refusing writes is the observable effect of a raised fence, and it is
+	// the state a barrier or a cutover leaves behind if it dies mid-flight.
+	servingWrites := primaryOK && !fenced && servingShards > 0
+	set(pgshardv1alpha1.ConditionFenced, fenced,
+		boolReason(fenced, "WritesPaused", "Unfenced"),
+		fmt.Sprintf("%d/%d shard primaries refusing writes", pausedShards, servingShards))
+	set(pgshardv1alpha1.ConditionServingWrites, servingWrites,
+		boolReason(servingWrites, "Serving", "NotServing"), "")
 	// Both of these were declared in the API and documented as conditions a
 	// cluster reports, and neither was ever set: anybody waiting on
 	// RouterReady waited for something that never arrived. ControllerReady
