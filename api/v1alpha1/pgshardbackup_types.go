@@ -20,6 +20,10 @@ import (
 // +kubebuilder:validation:XValidation:rule="self.type != 'gcs' || has(self.credentialType) && !(self.credentialType in ['service', 'token']) || has(self.credentials.secretRef)",message="gcs service and token credentials need credentials.secretRef"
 // +kubebuilder:validation:XValidation:rule="self.type != 'sftp' || has(self.sftp)",message="an sftp store needs sftp.host and sftp.user"
 // +kubebuilder:validation:XValidation:rule="self.type != 'sftp' || has(self.credentials.secretRef)",message="an sftp store needs credentials.secretRef"
+// A credentialType belongs to the store that has it: the enum lists all
+// five stores' values, so without this an s3 store accepts azure's sas and
+// a posix repository accepts a credential type it has no use for.
+// +kubebuilder:validation:XValidation:rule="!has(self.credentialType) || (self.type == 's3' && self.credentialType in ['shared', 'web-id', 'auto']) || (self.type == 'azure' && self.credentialType in ['shared', 'sas']) || (self.type == 'gcs' && self.credentialType in ['service', 'token', 'auto'])",message="credentialType must suit the store: s3 shared|web-id|auto, azure shared|sas, gcs service|token|auto, and none for posix or sftp"
 // These fields are written into pgbackrest.conf as key=value lines, so a
 // value carrying a newline writes an option of its own: an endpoint of the
 // attacker's choosing takes every backup and WAL segment with it, and the
@@ -57,7 +61,9 @@ type ObjectStoreSpec struct {
 	// +kubebuilder:validation:Enum=host;path
 	// +optional
 	URIStyle string `json:"uriStyle,omitempty"`
-	// VerifyTLS defaults to true; false accepts self-signed store certificates.
+	// VerifyTLS is true unless set; false accepts self-signed store
+	// certificates.
+	// +kubebuilder:default=true
 	// +optional
 	VerifyTLS *bool `json:"verifyTLS,omitempty"`
 	// CredentialType selects how pgBackRest authenticates:
@@ -95,6 +101,7 @@ type SFTPStoreSpec struct {
 	// +optional
 	Port int `json:"port,omitempty"`
 	// +kubebuilder:validation:Enum=strict;accept-new;fingerprint;none
+	// +kubebuilder:default=strict
 	// +optional
 	HostKeyCheck string `json:"hostKeyCheck,omitempty"`
 }
@@ -105,12 +112,21 @@ type SecretRefSpec struct {
 	SecretRef *corev1.LocalObjectReference `json:"secretRef,omitempty"`
 }
 
-// BackupSchedules holds cron expressions per backup type.
+// BackupSchedules holds cron expressions per backup type. The pattern
+// checks the shape only -- five fields, or a descriptor -- so that a
+// schedule that can never fire is refused when it is written instead of
+// reported as a condition later. It is deliberately permissive about each
+// field's contents: the reconciler's parser stays the authority, and a
+// pattern strict enough to judge ranges and steps would sooner or later
+// refuse an expression that works.
 type BackupSchedules struct {
+	// +kubebuilder:validation:Pattern=`^$|^(@(annually|yearly|monthly|weekly|daily|midnight|hourly)|@every +[0-9]+(ns|us|µs|ms|s|m|h)([0-9]+(ns|us|µs|ms|s|m|h))*)$|^ *[0-9*/,?A-Za-z-]+( +[0-9*/,?A-Za-z-]+){4} *$`
 	// +optional
 	Full string `json:"full,omitempty"`
+	// +kubebuilder:validation:Pattern=`^$|^(@(annually|yearly|monthly|weekly|daily|midnight|hourly)|@every +[0-9]+(ns|us|µs|ms|s|m|h)([0-9]+(ns|us|µs|ms|s|m|h))*)$|^ *[0-9*/,?A-Za-z-]+( +[0-9*/,?A-Za-z-]+){4} *$`
 	// +optional
 	Differential string `json:"differential,omitempty"`
+	// +kubebuilder:validation:Pattern=`^$|^(@(annually|yearly|monthly|weekly|daily|midnight|hourly)|@every +[0-9]+(ns|us|µs|ms|s|m|h)([0-9]+(ns|us|µs|ms|s|m|h))*)$|^ *[0-9*/,?A-Za-z-]+( +[0-9*/,?A-Za-z-]+){4} *$`
 	// +optional
 	Incremental string `json:"incremental,omitempty"`
 }
@@ -136,15 +152,18 @@ type PgShardBackupPolicySpec struct {
 	// LogLevel is the pgBackRest log level (off, error, warn, info, detail,
 	// debug, trace).
 	// +kubebuilder:validation:Enum=off;error;warn;info;detail;debug;trace
+	// +kubebuilder:default=info
 	// +optional
 	LogLevel string `json:"logLevel,omitempty"`
 	// ProcessMax bounds pgBackRest parallelism per member.
 	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=2
 	// +optional
 	ProcessMax int `json:"processMax,omitempty"`
 	// BarrierSchedule is a cron expression on which the operator asks each
 	// bound cluster's controller for a certified barrier: a cluster-wide
 	// restore point taken with writes paused and two-phase commits drained.
+	// +kubebuilder:validation:Pattern=`^$|^(@(annually|yearly|monthly|weekly|daily|midnight|hourly)|@every +[0-9]+(ns|us|µs|ms|s|m|h)([0-9]+(ns|us|µs|ms|s|m|h))*)$|^ *[0-9*/,?A-Za-z-]+( +[0-9*/,?A-Za-z-]+){4} *$`
 	// +optional
 	BarrierSchedule string `json:"barrierSchedule,omitempty"`
 	// ControllerEndpoint is the host:port of a cluster's Controller gRPC

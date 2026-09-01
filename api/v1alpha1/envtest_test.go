@@ -560,6 +560,10 @@ func TestObjectStoreRequiresWhatItsVariantNeeds(t *testing.T) {
 		{"gcs service without credentials", pgshardv1alpha1.ObjectStoreSpec{Type: "gcs", Bucket: "b"}, "service and token credentials need"},
 		{"sftp without host settings", pgshardv1alpha1.ObjectStoreSpec{Type: "sftp", Credentials: secret, Encryption: secret}, "needs sftp.host and sftp.user"},
 		{"sftp without credentials", pgshardv1alpha1.ObjectStoreSpec{Type: "sftp", SFTP: &pgshardv1alpha1.SFTPStoreSpec{Host: "h", User: "u"}}, "sftp store needs credentials.secretRef"},
+		{"s3 with azure's credential type", pgshardv1alpha1.ObjectStoreSpec{Type: "s3", Bucket: "b", Endpoint: "s3.example", Region: "eu", CredentialType: "sas", Credentials: secret, Encryption: secret}, "credentialType must suit the store"},
+		{"azure with s3's credential type", pgshardv1alpha1.ObjectStoreSpec{Type: "azure", Container: "c", CredentialType: "web-id", Credentials: secret, Encryption: secret}, "credentialType must suit the store"},
+		{"gcs with azure's credential type", pgshardv1alpha1.ObjectStoreSpec{Type: "gcs", Bucket: "b", CredentialType: "shared", Credentials: secret, Encryption: secret}, "credentialType must suit the store"},
+		{"posix with a credential type it cannot use", pgshardv1alpha1.ObjectStoreSpec{Type: "posix", CredentialType: "auto"}, "credentialType must suit the store"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			mustReject(t, policy(strings.ToLower(strings.ReplaceAll(c.name, " ", "-")), c.store), c.want)
@@ -583,6 +587,46 @@ func TestObjectStoreRequiresWhatItsVariantNeeds(t *testing.T) {
 				t.Fatalf("a complete %s store must be accepted: %v", c.name, err)
 			}
 		})
+	}
+}
+
+// TestABackupScheduleIsJudgedWhenItIsWritten: a schedule that can never
+// fire used to be accepted and reported as a condition afterwards, by
+// which time clusters may already be bound to the policy.
+func TestABackupScheduleIsJudgedWhenItIsWritten(t *testing.T) {
+	store := pgshardv1alpha1.ObjectStoreSpec{Type: "posix"}
+	policy := func(name string, mutate func(*pgshardv1alpha1.PgShardBackupPolicySpec)) *pgshardv1alpha1.PgShardBackupPolicy {
+		spec := pgshardv1alpha1.PgShardBackupPolicySpec{ObjectStore: store}
+		mutate(&spec)
+		return &pgshardv1alpha1.PgShardBackupPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec:       spec,
+		}
+	}
+	for _, c := range []struct {
+		name   string
+		mutate func(*pgshardv1alpha1.PgShardBackupPolicySpec)
+	}{
+		{"full-is-prose", func(s *pgshardv1alpha1.PgShardBackupPolicySpec) { s.Schedules.Full = "every night" }},
+		{"differential-is-short", func(s *pgshardv1alpha1.PgShardBackupPolicySpec) { s.Schedules.Differential = "0 2 * *" }},
+		{"incremental-is-long", func(s *pgshardv1alpha1.PgShardBackupPolicySpec) { s.Schedules.Incremental = "0 2 * * * *" }},
+		{"descriptor-is-invented", func(s *pgshardv1alpha1.PgShardBackupPolicySpec) { s.BarrierSchedule = "@fortnightly" }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			mustReject(t, policy(c.name, c.mutate), "spec")
+		})
+	}
+	accepted := policy("schedules-ok", func(s *pgshardv1alpha1.PgShardBackupPolicySpec) {
+		s.Schedules = pgshardv1alpha1.BackupSchedules{Full: "0 2 * * 0", Differential: "@daily", Incremental: "*/15 1-5 * JAN-MAR MON,TUE"}
+		s.BarrierSchedule = "@every 1h30m"
+	})
+	if err := create(t, accepted); err != nil {
+		t.Fatalf("valid schedules must be accepted: %v", err)
+	}
+	// The defaults the runtime applies are written down, so the stored
+	// object says what it will do rather than leaving it to be filled in.
+	if accepted.Spec.LogLevel != "info" || accepted.Spec.ProcessMax != 2 {
+		t.Fatalf("defaults not persisted: logLevel %q processMax %d", accepted.Spec.LogLevel, accepted.Spec.ProcessMax)
 	}
 }
 
