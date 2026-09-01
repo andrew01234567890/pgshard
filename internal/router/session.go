@@ -116,11 +116,14 @@ type Executor struct {
 	home Shard
 	// shard is the shard the session's stream is (or will next be) on.
 	shard Shard
-	// latency is the ShardLatency observer of latencyOf, kept so a
-	// statement does not pay to resolve it again.
-	latencyOf Shard
-	latency   prometheus.Observer
-	ident     *pgshardv1.UserIdentity
+	// latency and the shard counters belong to latencyOf, kept so a
+	// statement does not pay to resolve them again.
+	latencyOf  Shard
+	latency    prometheus.Observer
+	statements prometheus.Counter
+	rows       prometheus.Counter
+	errors     prometheus.Counter
+	ident      *pgshardv1.UserIdentity
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -1479,11 +1482,20 @@ func (e *Executor) applyStaged() {
 // map, on a path that runs once per statement; a session stays on one
 // shard for long stretches, so it is resolved when the shard changes.
 func (e *Executor) shardLatency() prometheus.Observer {
-	if e.latency == nil || e.latencyOf != e.shard {
-		e.latencyOf = e.shard
-		e.latency = e.r.metrics.ShardLatency.WithLabelValues(e.shard.Set + "/" + strconv.FormatInt(int64(e.shard.ID), 10))
-	}
+	e.resolveShardMetrics()
 	return e.latency
+}
+
+func (e *Executor) resolveShardMetrics() {
+	if e.latency != nil && e.latencyOf == e.shard {
+		return
+	}
+	e.latencyOf = e.shard
+	label := e.shard.Set + "/" + strconv.FormatInt(int64(e.shard.ID), 10)
+	e.latency = e.r.metrics.ShardLatency.WithLabelValues(label)
+	e.statements = e.r.metrics.ShardStatements.WithLabelValues(label)
+	e.rows = e.r.metrics.ShardRows.WithLabelValues(label)
+	e.errors = e.r.metrics.ShardErrors.WithLabelValues(label)
 }
 
 func (e *Executor) generation() *pgshardv1.Generation { return e.r.cfg.Poolers.Generation(e.shard) }
@@ -1697,6 +1709,7 @@ func (r *refusedError) Unwrap() error { return r.error }
 func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 	start := time.Now()
 	observer := e.shardLatency()
+	e.statements.Inc()
 	defer func() { observer.Observe(time.Since(start).Seconds()) }()
 	var firstErr error
 	e.beginStatement(ctx)
@@ -1711,6 +1724,7 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 		case *pgshardv1.ExecuteResponse_RowDescription:
 			werr = w.RowDescription(fieldDescriptions(m.RowDescription.Fields))
 		case *pgshardv1.ExecuteResponse_DataRow:
+			e.rows.Inc()
 			if !e.hiddenNow() {
 				werr = w.DataRow(rowValues(m.DataRow))
 			}
@@ -1740,6 +1754,7 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 			}
 		case *pgshardv1.ExecuteResponse_Error:
 			if firstErr == nil {
+				e.errors.Inc()
 				firstErr = toPgwireError(m.Error.GetError())
 			}
 		case *pgshardv1.ExecuteResponse_Notice:

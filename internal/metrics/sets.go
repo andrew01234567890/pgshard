@@ -18,6 +18,9 @@ type Router struct {
 	BufferSeconds    prometheus.Histogram
 	ScatterFanout    prometheus.Histogram
 	ShardLatency     *prometheus.HistogramVec
+	ShardStatements  *prometheus.CounterVec
+	ShardRows        *prometheus.CounterVec
+	ShardErrors      *prometheus.CounterVec
 	activeSessions   prometheus.GaugeFunc
 	snapshotAge      prometheus.GaugeFunc
 }
@@ -58,6 +61,16 @@ func NewRouter(reg *prometheus.Registry, sessions, snapshotAge func() float64) *
 		ShardLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name: "pgshard_router_shard_latency_seconds", Help: "Per-shard statement latency.",
 			Buckets: prometheus.ExponentialBuckets(0.0005, 2, 16)}, []string{"shard"}),
+		// Latency alone cannot tell a shard that is busy from one that is
+		// slow: both show as time. Counting the work as well as timing it
+		// is what separates a hot shard from slow storage, and the label
+		// is the shard, whose cardinality is the shard count.
+		ShardStatements: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "pgshard_router_shard_statements_total", Help: "Statements sent to each shard."}, []string{"shard"}),
+		ShardRows: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "pgshard_router_shard_rows_total", Help: "Data rows returned by each shard."}, []string{"shard"}),
+		ShardErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "pgshard_router_shard_errors_total", Help: "Statements each shard answered with an error."}, []string{"shard"}),
 	}
 	m.activeSessions = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "pgshard_router_active_sessions", Help: "Live client sessions."}, sessions)
@@ -69,7 +82,8 @@ func NewRouter(reg *prometheus.Registry, sessions, snapshotAge func() float64) *
 		Help: "Age of the catalog snapshot the router is serving; -1 before the first load."}, snapshotAge)
 	reg.MustRegister(m.Connections, m.Queries, m.PlanCacheHits, m.PlanCacheMiss, m.PlanCacheEvicted, m.PlanCacheBytes, m.Refusals,
 		m.TwoPCCommits, m.TwoPCAborts, m.TwoPCInDoubt, m.BufferEvents, m.BufferSeconds,
-		m.ScatterFanout, m.ShardLatency, m.activeSessions, m.snapshotAge)
+		m.ScatterFanout, m.ShardLatency, m.ShardStatements, m.ShardRows, m.ShardErrors,
+		m.activeSessions, m.snapshotAge)
 	return m
 }
 
