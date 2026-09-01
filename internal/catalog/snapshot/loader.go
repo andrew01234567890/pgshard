@@ -133,6 +133,7 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 			p.ReferenceChecked = ts.ReferenceCheckedGeneration != nil && *ts.ReferenceCheckedGeneration == ts.EffectiveGeneration
 			p.ReferenceHazards = ts.ReferenceHazards
 			p.ShardKeyError = shardKeyError(ts)
+			p.ShardKeyType = shardKeyType(ts)
 			s.Tables[key] = p
 			continue
 		}
@@ -156,6 +157,7 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 		p.ReferenceChecked = ts.ReferenceCheckedGeneration != nil && *ts.ReferenceCheckedGeneration == ts.EffectiveGeneration
 		p.ReferenceHazards = ts.ReferenceHazards
 		p.ShardKeyError = shardKeyError(ts)
+		p.ShardKeyType = shardKeyType(ts)
 		s.Tables[key] = p
 	}
 	rewrites, err := catalog.PendingRewrites(ctx, tx)
@@ -222,4 +224,15 @@ func shardKeyError(ts catalog.TableStatus) string {
 		return ""
 	}
 	return *ts.ShardKeyError
+}
+
+// shardKeyType reports the key column's recorded type, under the same
+// generation rule as shardKeyError: a type recorded against an older
+// generation described a column the table no longer keys on, and
+// normalising by it would be worse than not normalising at all.
+func shardKeyType(ts catalog.TableStatus) string {
+	if ts.ShardKeyType == nil || ts.ShardKeyCheckedGeneration == nil || *ts.ShardKeyCheckedGeneration != ts.EffectiveGeneration {
+		return ""
+	}
+	return *ts.ShardKeyType
 }

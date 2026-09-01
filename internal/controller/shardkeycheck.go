@@ -84,7 +84,7 @@ func (c *ShardKeyCheck) Pass(ctx context.Context) (int, error) {
 	}
 	published := 0
 	for _, t := range pending {
-		refusal, err := c.inspect(ctx, set, ranges, t)
+		refusal, typ, err := c.inspect(ctx, set, ranges, t)
 		if err != nil {
 			// An unreachable shard must not publish a verdict for a table
 			// nobody looked at. The row stays unchecked, which holds the
@@ -93,7 +93,7 @@ func (c *ShardKeyCheck) Pass(ctx context.Context) (int, error) {
 				"schema", t.SchemaName, "table", t.TableName, "err", err)
 			continue
 		}
-		if err := c.publish(ctx, t, refusal); err != nil {
+		if err := c.publish(ctx, t, refusal, typ); err != nil {
 			return published, err
 		}
 		if refusal != nil {
@@ -105,15 +105,16 @@ func (c *ShardKeyCheck) Pass(ctx context.Context) (int, error) {
 	return published, nil
 }
 
-func (c *ShardKeyCheck) publish(ctx context.Context, t uncheckedKey, refusal *string) error {
+func (c *ShardKeyCheck) publish(ctx context.Context, t uncheckedKey, refusal *string, typ *string) error {
 	_, err := c.Pool.Exec(ctx, `
 		INSERT INTO pgshard.table_status (database, schema_name, table_name,
-			shard_key_checked_generation, shard_key_error)
-		VALUES ($1, $2, $3, $4, $5)
+			shard_key_checked_generation, shard_key_error, shard_key_type)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (database, schema_name, table_name) DO UPDATE
 		SET shard_key_checked_generation = EXCLUDED.shard_key_checked_generation,
-		    shard_key_error = EXCLUDED.shard_key_error, updated_at = now()`,
-		t.Database, t.SchemaName, t.TableName, t.Generation, refusal)
+		    shard_key_error = EXCLUDED.shard_key_error,
+		    shard_key_type = EXCLUDED.shard_key_type, updated_at = now()`,
+		t.Database, t.SchemaName, t.TableName, t.Generation, refusal, typ)
 	return err
 }
 
@@ -124,26 +125,45 @@ func (c *ShardKeyCheck) publish(ctx context.Context, t uncheckedKey, refusal *st
 // A table no shard has yet is not a refusal: placement may be declared
 // before the table exists, and the CREATE TABLE that follows goes through
 // pgshard, which checks the type itself.
-func (c *ShardKeyCheck) inspect(ctx context.Context, set string, ranges []catalog.ShardRange, t uncheckedKey) (*string, error) {
+func (c *ShardKeyCheck) inspect(ctx context.Context, set string, ranges []catalog.ShardRange, t uncheckedKey) (*string, *string, error) {
+	var agreed string
+	var agreedShard int32
 	for _, rg := range ranges {
 		conn, err := c.Shards.DialDatabase(ctx, set, rg.ShardID, t.Database)
 		if err != nil {
-			return nil, fmt.Errorf("shard %s/%d: %w", set, rg.ShardID, err)
+			return nil, nil, fmt.Errorf("shard %s/%d: %w", set, rg.ShardID, err)
 		}
 		typ, err := shardKeyType(ctx, conn, t.SchemaName, t.TableName, t.ShardKey)
 		_ = conn.Close(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("shard %s/%d: %w", set, rg.ShardID, err)
+			return nil, nil, fmt.Errorf("shard %s/%d: %w", set, rg.ShardID, err)
 		}
 		if typ == "" {
 			continue
 		}
 		if _, err := KeyHashExpr(t.ShardKey, typ); err != nil {
 			msg := err.Error()
-			return &msg, nil
+			return &msg, nil, nil
+		}
+		// Every shard passing on its own is not the same as the shards
+		// agreeing. The router normalises by one recorded type, so a column
+		// that is varchar(8) here and varchar(16) there truncates
+		// differently depending on which shard the value came to rest on --
+		// the drift this pass exists to catch.
+		if agreed == "" {
+			agreed, agreedShard = typ, rg.ShardID
+			continue
+		}
+		if typ != agreed {
+			msg := fmt.Sprintf("shard key %s has type %s on shard %d and %s on shard %d: the shards must agree before rows can be routed by it",
+				t.ShardKey, agreed, agreedShard, typ, rg.ShardID)
+			return &msg, nil, nil
 		}
 	}
-	return nil, nil
+	if agreed == "" {
+		return nil, nil, nil
+	}
+	return nil, &agreed, nil
 }
 
 // shardKeyType returns the key column's SQL type on conn, or "" when the

@@ -132,3 +132,73 @@ func keyErrorOf(t *testing.T, conn *pgx.Conn, table string) string {
 	}
 	return *got
 }
+
+func keyTypeOf(t *testing.T, conn *pgx.Conn, table string) string {
+	t.Helper()
+	var got *string
+	if err := conn.QueryRow(context.Background(),
+		`SELECT shard_key_type FROM pgshard.table_status WHERE database = 'app' AND schema_name = 'public' AND table_name = $1`, table).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got == nil {
+		return ""
+	}
+	return *got
+}
+
+// The router hashes the value the client sent and the shard stores what the
+// column's type makes of it. For character varying(n) those differ -- an
+// overlength value whose excess is spaces is silently truncated -- so the
+// router needs the type, not just a verdict that the type is hashable.
+func TestShardKeyCheckRecordsTheColumnType(t *testing.T) {
+	ctx := context.Background()
+	f := newPlacementFixture(t)
+	check := &ShardKeyCheck{Pool: f.pool, Shards: f.placer.Shards, Logger: slog.New(slog.DiscardHandler)}
+	for id := range 2 {
+		mustExec(t, f.app(int32(id)), `CREATE TABLE codes (tenant_id character varying(8) NOT NULL, id bigint)`)
+		mustExec(t, f.app(int32(id)), `CREATE TABLE freetext (tenant_id text NOT NULL, id bigint)`)
+	}
+	for _, name := range []string{"codes", "freetext", "notyetcreated"} {
+		mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key)
+			VALUES ('app', 'public', $1, 'sharded', 'tenant_id')`, name)
+	}
+	if _, err := check.Pass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ table, want string }{
+		{"codes", "character varying(8)"},
+		{"freetext", "text"},
+		// No shard has the table, so no shard reported a type; the router
+		// normalises nothing, which is what it did before types existed.
+		{"notyetcreated", ""},
+	} {
+		if got := keyTypeOf(t, f.catalog, c.table); got != c.want {
+			t.Errorf("%s: shard_key_type = %q, want %q", c.table, got, c.want)
+		}
+		if got := keyErrorOf(t, f.catalog, c.table); got != "" {
+			t.Errorf("%s: unexpected fault %q", c.table, got)
+		}
+	}
+}
+
+// Both lengths are hashable on their own, so checking each shard in
+// isolation passes them both -- and then the router truncates by whichever
+// length it happened to record while one shard stores something else.
+func TestShardKeyCheckFaultsShardsThatDisagreeOnLength(t *testing.T) {
+	ctx := context.Background()
+	f := newPlacementFixture(t)
+	check := &ShardKeyCheck{Pool: f.pool, Shards: f.placer.Shards, Logger: slog.New(slog.DiscardHandler)}
+	mustExec(t, f.app(0), `CREATE TABLE widened (tenant_id character varying(8) NOT NULL, id bigint)`)
+	mustExec(t, f.app(1), `CREATE TABLE widened (tenant_id character varying(16) NOT NULL, id bigint)`)
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key)
+		VALUES ('app', 'public', 'widened', 'sharded', 'tenant_id')`)
+	if _, err := check.Pass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := keyErrorOf(t, f.catalog, "widened"); !strings.Contains(got, "must agree") {
+		t.Fatalf("fault = %q, want the shards' disagreement on length to be faulted", got)
+	}
+	if got := keyTypeOf(t, f.catalog, "widened"); got != "" {
+		t.Errorf("a faulted key must record no type to normalise by, got %q", got)
+	}
+}

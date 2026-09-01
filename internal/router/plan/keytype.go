@@ -1,0 +1,55 @@
+package plan
+
+import (
+	"strconv"
+	"strings"
+)
+
+// normaliseKey applies the normalisation the shard key column's own type
+// applies, so the router hashes the value the shard will store rather than
+// the value the client sent.
+//
+// character varying(n) is the case that diverges: PostgreSQL does not
+// reject an overlength value whose excess is only spaces, it silently drops
+// the excess (SQL demands exactly that). It then stores and hashes 'abc'
+// where the client sent 'abc   ', and a router hashing the untrimmed bytes
+// sends the row to one shard and every later lookup of it to another.
+//
+// An overlength value whose excess is not all spaces is left alone: that
+// statement fails on the shard with 22001 whatever shard it reaches, and
+// inventing a truncation PostgreSQL would not do would only route it
+// somewhere less obvious.
+func normaliseKey(v any, columnType string) any {
+	s, ok := v.(string)
+	if !ok {
+		return v
+	}
+	base, n, hasLimit := parseCharType(columnType)
+	if !hasLimit || base != "character varying" {
+		return v
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return v
+	}
+	if strings.Trim(string(r[n:]), " ") != "" {
+		return v
+	}
+	return string(r[:n])
+}
+
+// parseCharType splits format_type output such as "character varying(8)"
+// into its base name and length. hasLimit is false for a type with no
+// length, which normalises nothing.
+func parseCharType(t string) (base string, n int, hasLimit bool) {
+	t = strings.TrimSpace(strings.ToLower(t))
+	open := strings.IndexByte(t, '(')
+	if open < 0 || !strings.HasSuffix(t, ")") {
+		return t, 0, false
+	}
+	n, err := strconv.Atoi(t[open+1 : len(t)-1])
+	if err != nil || n < 0 {
+		return strings.TrimSpace(t[:open]), 0, false
+	}
+	return strings.TrimSpace(t[:open]), n, true
+}

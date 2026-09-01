@@ -566,6 +566,10 @@ type rel struct {
 	schema   string
 	kind     placementKind
 	shardKey string
+	// shardKeyType is that column's type on the shards, as the controller's
+	// inspection recorded it; the router normalises key values by it before
+	// hashing.
+	shardKeyType string
 	// seqCols are the registered sequence columns of a sharded table.
 	seqCols []string
 	// hidden and visible are the migration working columns and the
@@ -680,6 +684,7 @@ func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
 					"change the shard key to a column whose type hashes the way it compares, or move the table with a placement workflow")
 			}
 			r.kind, r.shardKey, r.seqCols = placeSharded, pl.ShardKey, pl.SequenceColumns
+			r.shardKeyType = pl.ShardKeyType
 		case "reference":
 			r.kind, r.refDeclared, r.refChecked, r.refHazards = placeReference, true, pl.ReferenceChecked, pl.ReferenceHazards
 		}
@@ -1495,6 +1500,7 @@ func (w *walker) decide(write bool) error {
 			if len(t.params) > 0 {
 				p.Deferred = true
 			}
+			t.keyType = r.root().shardKeyType
 			p.terms = append(p.terms, t)
 		}
 	}

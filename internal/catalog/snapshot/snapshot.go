@@ -79,6 +79,12 @@ type Placement struct {
 	// fine, and also when the inspection has not run: an unchecked table
 	// is one nothing has found fault with.
 	ShardKeyError string
+	// ShardKeyType is the key column's type as the shards declare it,
+	// typmod included, from the same inspection that sets ShardKeyError.
+	// Empty when that inspection has not run for the generation in force,
+	// in which case the router hashes the value the client sent unchanged
+	// -- which is what it did before any type was recorded.
+	ShardKeyType string
 }
 
 // IsPartial reports a view loaded by LoadServing: the generations and the
