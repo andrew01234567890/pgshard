@@ -1622,6 +1622,14 @@ spec:
                 - message: catalog.replicas must be >= 3 for HA
                   rule: self.catalog.replicas >= 3 || (has(self.unsafeSingleReplica)
                     && self.unsafeSingleReplica)
+                - message: 'replicasPerShard cannot be decreased: removing members
+                    needs a drain that pgshard does not implement yet, and the removed
+                    pods and volumes would be left running'
+                  rule: self.replicasPerShard >= oldSelf.replicasPerShard
+                - message: 'catalog.replicas cannot be decreased: removing members
+                    needs a drain that pgshard does not implement yet, and the removed
+                    pods and volumes would be left running'
+                  rule: self.catalog.replicas >= oldSelf.catalog.replicas
               exclusive:
                 description: Exclusive stops recovery just before the target.
                 type: boolean

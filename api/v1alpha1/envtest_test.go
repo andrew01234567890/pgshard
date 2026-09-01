@@ -736,3 +736,51 @@ func TestARestoreSpecDoesNotChangeUnderTheOperator(t *testing.T) {
 		t.Fatalf("labels are not part of the request: %v", err)
 	}
 }
+
+// TestAReplicaCountOnlyGrows: growing a group is reconciled -- the new
+// ordinals get pods and join. There is no path the other way: nothing
+// discovers the members outside the new range, switches away from one that
+// is primary, drains it, updates synchronous and slot membership, and then
+// removes its pod and claim. A decrease would leave those members running
+// with a replication membership the generated configuration no longer
+// describes.
+func TestAReplicaCountOnlyGrows(t *testing.T) {
+	c := validCluster("scale")
+	c.Spec.ReplicasPerShard = 5
+	c.Spec.Catalog.Replicas = 5
+	if err := create(t, c); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*pgshardv1alpha1.PgShardCluster)
+		want   string
+	}{
+		{"fewer members per shard", func(x *pgshardv1alpha1.PgShardCluster) { x.Spec.ReplicasPerShard = 3 },
+			"replicasPerShard cannot be decreased"},
+		{"fewer catalog members", func(x *pgshardv1alpha1.PgShardCluster) { x.Spec.Catalog.Replicas = 3 },
+			"catalog.replicas cannot be decreased"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			smaller := c.DeepCopy()
+			tc.mutate(smaller)
+			err := k8sClient.Update(context.Background(), smaller)
+			if err == nil {
+				t.Fatal("a decrease must be refused while nothing drains the removed members")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("refused for the wrong reason: %v", err)
+			}
+		})
+	}
+
+	// Growing is reconciled, so it stays allowed -- containment here must
+	// not cost the direction that works.
+	bigger := c.DeepCopy()
+	bigger.Spec.ReplicasPerShard = 7
+	bigger.Spec.Catalog.Replicas = 7
+	if err := k8sClient.Update(context.Background(), bigger); err != nil {
+		t.Fatalf("growing a group must stay allowed: %v", err)
+	}
+}

@@ -283,6 +283,16 @@ const ConditionTopologyDegraded = "TopologyDegraded"
 // PgShardClusterSpec is the desired state of a PgShardCluster.
 // +kubebuilder:validation:XValidation:rule="self.replicasPerShard >= 3 || (has(self.unsafeSingleReplica) && self.unsafeSingleReplica)",message="replicasPerShard must be >= 3"
 // +kubebuilder:validation:XValidation:rule="self.catalog.replicas >= 3 || (has(self.unsafeSingleReplica) && self.unsafeSingleReplica)",message="catalog.replicas must be >= 3 for HA"
+// Growing a group is reconciled: the new ordinals get pods and join. There
+// is no path the other way -- nothing discovers the members outside the new
+// range, switches away from one that is primary, drains it, updates
+// synchronous and slot membership, and then removes its pod and claim. A
+// decrease would leave those members running with a replication membership
+// the generated configuration no longer describes, and their volumes with
+// them. Refused until that path exists rather than half-done on a live
+// cluster; a group can still be replaced by resharding to a new set.
+// +kubebuilder:validation:XValidation:rule="self.replicasPerShard >= oldSelf.replicasPerShard",message="replicasPerShard cannot be decreased: removing members needs a drain that pgshard does not implement yet, and the removed pods and volumes would be left running"
+// +kubebuilder:validation:XValidation:rule="self.catalog.replicas >= oldSelf.catalog.replicas",message="catalog.replicas cannot be decreased: removing members needs a drain that pgshard does not implement yet, and the removed pods and volumes would be left running"
 type PgShardClusterSpec struct {
 	PostgreSQL PostgreSQLSpec `json:"postgresql"`
 	// +optional

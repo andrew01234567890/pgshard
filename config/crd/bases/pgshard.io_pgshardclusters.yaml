@@ -49,7 +49,16 @@ spec:
           metadata:
             type: object
           spec:
-            description: PgShardClusterSpec is the desired state of a PgShardCluster.
+            description: |-
+              PgShardClusterSpec is the desired state of a PgShardCluster.
+              Growing a group is reconciled: the new ordinals get pods and join. There
+              is no path the other way -- nothing discovers the members outside the new
+              range, switches away from one that is primary, drains it, updates
+              synchronous and slot membership, and then removes its pod and claim. A
+              decrease would leave those members running with a replication membership
+              the generated configuration no longer describes, and their volumes with
+              them. Refused until that path exists rather than half-done on a live
+              cluster; a group can still be replaced by resharding to a new set.
             properties:
               admin:
                 default: {}
@@ -1581,6 +1590,14 @@ spec:
             - message: catalog.replicas must be >= 3 for HA
               rule: self.catalog.replicas >= 3 || (has(self.unsafeSingleReplica) &&
                 self.unsafeSingleReplica)
+            - message: 'replicasPerShard cannot be decreased: removing members needs
+                a drain that pgshard does not implement yet, and the removed pods
+                and volumes would be left running'
+              rule: self.replicasPerShard >= oldSelf.replicasPerShard
+            - message: 'catalog.replicas cannot be decreased: removing members needs
+                a drain that pgshard does not implement yet, and the removed pods
+                and volumes would be left running'
+              rule: self.catalog.replicas >= oldSelf.catalog.replicas
           status:
             description: PgShardClusterStatus is the observed state of a PgShardCluster.
             properties:

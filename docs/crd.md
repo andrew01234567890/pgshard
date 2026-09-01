@@ -17,7 +17,7 @@ Print columns: Shards, Ready, Age.
 | `spec.catalog.replicas` | int | default 3, min 1; CEL: `>= 3` ("catalog.replicas must be >= 3 for HA") |
 | `spec.catalog.storage.size` / `.storageClassName` | Quantity / *string | size required |
 | `spec.shards` | *int | optional, min 1 |
-| `spec.replicasPerShard` | int | default 3, min 1; CEL: `>= 3` ("replicasPerShard must be >= 3") |
+| `spec.replicasPerShard` | int | default 3, min 1; CEL: `>= 3` ("replicasPerShard must be >= 3"), and **cannot be decreased** — growing a group is reconciled, but nothing drains a removed member, switches away from one that is primary, or removes its pod and volume, so a decrease would leave members running that the generated configuration no longer describes |
 | `spec.unsafeSingleReplica` | bool | relaxes both `>= 3` rules so test/dev clusters can run one member per group; single-member groups have no synchronous standby and no failover candidate — unsupported for production (the operator logs a warning) |
 | `spec.storage.size` / `.storageClassName` | Quantity / *string | size required |
 | `spec.durability.synchronousCommit` | enum | `on` (default), `remote_apply` |
