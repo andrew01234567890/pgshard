@@ -1245,6 +1245,16 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, c *pgshardv1alpha1
 	set(pgshardv1alpha1.ConditionTopologyDegraded, len(crowded) > 0,
 		boolReason(len(crowded) > 0, "MembersShareNodes", "MembersOnDistinctNodes"),
 		strings.Join(crowded, "; "))
+	// Both of these were declared in the API and documented as conditions a
+	// cluster reports, and neither was ever set: anybody waiting on
+	// RouterReady waited for something that never arrived. ControllerReady
+	// matters more than it looks -- every other condition here can be True
+	// while nothing resolves in-doubt transactions or applies queued DDL,
+	// because that work belongs to a process none of them describe.
+	routerReady, routerMsg := r.deploymentReady(ctx, c.Namespace, RouterName(c.Name))
+	set(pgshardv1alpha1.ConditionRouterReady, routerReady, boolReason(routerReady, "Ready", "NotReady"), routerMsg)
+	controllerReady, controllerMsg := r.deploymentReady(ctx, c.Namespace, ControllerName(c.Name))
+	set(pgshardv1alpha1.ConditionControllerReady, controllerReady, boolReason(controllerReady, "Ready", "NotReady"), controllerMsg)
 	meta.SetStatusCondition(&c.Status.Conditions, catalogReady)
 	meta.SetStatusCondition(&c.Status.Conditions, backupCond)
 	meta.SetStatusCondition(&c.Status.Conditions, reshardCond)
@@ -1253,6 +1263,24 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, c *pgshardv1alpha1
 	c.Status.Shards = shards
 	c.Status.PlacementWorkflows = placements
 	return r.Status().Patch(ctx, c, client.MergeFrom(base))
+}
+
+// deploymentReady reports whether a Deployment has a ready replica, and
+// says why when it has not. A missing Deployment is not ready rather than
+// an error: the pass that creates it runs before the pass that reports on
+// it, and a reconcile that failed here would never get to the creating.
+func (r *ClusterReconciler) deploymentReady(ctx context.Context, namespace, name string) (bool, string) {
+	var dep appsv1.Deployment
+	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &dep); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, name + " does not exist yet"
+		}
+		return false, "reading " + name + ": " + err.Error()
+	}
+	if dep.Status.ReadyReplicas > 0 {
+		return true, ""
+	}
+	return false, fmt.Sprintf("%s has %d ready replica(s) of %d", name, dep.Status.ReadyReplicas, dep.Status.Replicas)
 }
 
 // setRolloutStatus summarises the groups' rolling steps into status.rollout

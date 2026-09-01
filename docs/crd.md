@@ -48,6 +48,8 @@ Fenced, BackupHealthy, Resharding, ServingWrites, RouterReady, TuningApplied,
 TopologyDegraded — True when a group's members share a node, so the cluster has
 fewer failure domains than replicas; it is what makes the default preferred
 spread honest), `observedGeneration`,
+Fenced, BackupHealthy, Resharding, ServingWrites, RouterReady, ControllerReady, TuningApplied),
+`observedGeneration`,
 `shardMapGeneration`, `shards[]{id, rangeStart, rangeEnd, primary, epoch, members[]{name, role, ready, replayLagBytes}}`,
 `effectiveShards` (shard count of the serving catalog shard set), `reshard{name, shardSet, generation, shards, phase}`
 (the run in flight), `placementWorkflows[]{workflowId, table, from, to, state, phase, message, pauseMs}`
