@@ -116,3 +116,24 @@ func TestAnUnreadableAgentTokenFileFailsAtStartup(t *testing.T) {
 		t.Errorf("startup failure does not name the token file: %s", errb.String()+out.String())
 	}
 }
+
+// TestTheCutoverFlagsTheDocsPromiseExist: docs/resharding.md tells an
+// operator that a switch which has not reached the journal within
+// --cutover-timeout is undone and retried, and that --cutover-attempts
+// undone attempts fail the workflow. Neither flag existed, so both values
+// were pinned at their defaults and the documented commands failed with
+// "flag provided but not defined". The fence deadline matters more since
+// it became what aborts a slow verify (PGS-605), so it has to be tunable.
+func TestTheCutoverFlagsTheDocsPromiseExist(t *testing.T) {
+	var out, errb bytes.Buffer
+	runController(context.Background(), []string{"--help"}, &out, &errb)
+	usage := out.String() + errb.String()
+	for _, flag := range []string{"cutover-timeout", "cutover-attempts"} {
+		if !strings.Contains(usage, flag) {
+			t.Errorf("docs/resharding.md documents --%s and the controller does not offer it", flag)
+		}
+	}
+	if !strings.Contains(usage, "1m0s") {
+		t.Errorf("--cutover-timeout should default to the documented 60s; usage: %s", usage)
+	}
+}
