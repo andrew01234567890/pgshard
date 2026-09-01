@@ -1,0 +1,35 @@
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "libpg_query-18.0.0",
+  "documentNamespace": "https://github.com/pganalyze/libpg_query@204fbdbd3ed5f8691ab358e49f1fc5397b4679e2",
+  "creationInfo": {
+    "created": "2026-08-31T22:52:42Z",
+    "creators": [
+      "Tool: hack/pgparser/sbom.py"
+    ]
+  },
+  "documentDescribes": [
+    "SPDXRef-Package-libpg-query"
+  ],
+  "packages": [
+    {
+      "SPDXID": "SPDXRef-Package-libpg-query",
+      "name": "libpg_query",
+      "versionInfo": "18.0.0",
+      "downloadLocation": "git+https://github.com/pganalyze/libpg_query.git@204fbdbd3ed5f8691ab358e49f1fc5397b4679e2",
+      "sourceInfo": "vendored into third_party/libpg_query/18 by hack/pgparser/sync.sh",
+      "filesAnalyzed": false,
+      "licenseConcluded": "(BSD-2-Clause) AND (BSD-3-Clause) AND (GPL-2.0-or-later WITH Bison-exception-2.2) AND (ISC) AND (MIT) AND (PostgreSQL) AND (Spencer-99)",
+      "licenseDeclared": "NOASSERTION",
+      "copyrightText": "NOASSERTION",
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "4b6c2eec0ce9c289916dfb93d89af851c0af42b49ac249193f6994b46731b852"
+        }
+      ]
+    }
+  ]
+}

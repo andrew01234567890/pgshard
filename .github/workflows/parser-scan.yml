@@ -1,0 +1,73 @@
+# Static analysis of the vendored C parser.
+#
+# The vendored libpg_query is compiled into the router and reads every
+# statement a client sends, and no analyser looked at it: CodeQL's default
+# setup covers Actions, Go and JavaScript, and adding C/C++ to it is a
+# repository setting rather than a file in this tree. This runs a C
+# analyser without touching that setting; if C/C++ is later added to the
+# default setup, this workflow is the thing to delete.
+#
+# It reports and does not gate. The vendored tree is 600 files of upstream
+# C that has never been read by this analyser, so the first honest baseline
+# is whatever the first run prints -- gating on it before anyone has seen
+# it would only teach people to ignore a red check. Promoting it to a gate
+# once that baseline is agreed is PGS-585.
+name: Parser scan
+
+on:
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "third_party/libpg_query/**"
+      - "hack/pgparser/**"
+      - ".github/workflows/parser-scan.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  cppcheck:
+    name: C static analysis (report only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install cppcheck
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y cppcheck
+          cppcheck --version
+      - name: Analyse the vendored parser
+        run: |
+          set -euo pipefail
+          mkdir -p parser-scan
+          for dir in third_party/libpg_query/*/; do
+            major="$(basename "$dir")"
+            echo "::group::cppcheck $dir"
+            # --force because the generated parser has more #if branches
+            # than cppcheck explores by default, and missingInclude is
+            # noise: the real include path is assembled by cgo, not here.
+            cppcheck --force --quiet --enable=warning,performance,portability \
+              --suppress=missingInclude --suppress=missingIncludeSystem \
+              --inline-suppr --error-exitcode=0 \
+              --xml "$dir" 2> "parser-scan/cppcheck-$major.xml" || true
+            python3 - "parser-scan/cppcheck-$major.xml" <<'PY' | tee "parser-scan/cppcheck-$major.txt"
+          import collections, sys, xml.etree.ElementTree as ET
+          errors = ET.parse(sys.argv[1]).getroot().findall("./errors/error")
+          by = collections.Counter(e.get("severity") for e in errors)
+          print("%d finding(s): %s" % (len(errors), dict(by)))
+          for e in errors:
+              loc = e.find("location")
+              where = "%s:%s" % (loc.get("file"), loc.get("line")) if loc is not None else "?"
+              print("  [%s] %s %s: %s" % (e.get("severity"), e.get("id"), where, e.get("msg")))
+          PY
+            echo "::endgroup::"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: parser-scan
+          path: parser-scan/
+          retention-days: 14

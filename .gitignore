@@ -18,3 +18,4 @@ test/e2e/**/artifacts/
 /pgshard-admin
 /pgshard-controller
 .envtest-assets/
+__pycache__/
