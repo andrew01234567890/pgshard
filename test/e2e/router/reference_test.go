@@ -26,6 +26,15 @@ func (s *shardedStack) declareReferenceAndSequences(tb testing.TB) {
 		tb.Fatal(err)
 	}
 	defer func() { _ = cat.Close(ctx) }()
+	// One transaction, because the reconciler upserts a status row for any
+	// table it finds declared without one, and that upsert clears the
+	// inspection these rows are standing in for. Committing a declaration
+	// and its status together leaves no moment where it could.
+	tx, err := cat.Begin(ctx)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
 	for _, sql := range []string{
 		`INSERT INTO pgshard.tables (database, schema_name, table_name, placement) VALUES ('app', 'public', 'regions', 'reference')`,
 		// Standing in for the controller's inspection pass, which this
@@ -39,9 +48,12 @@ func (s *shardedStack) declareReferenceAndSequences(tb testing.TB) {
 		`INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key, sequence_columns) VALUES ('app', 'public', 'tickets', 'sharded', 'tenant_id', '{id}')`,
 		`INSERT INTO pgshard.table_status (database, schema_name, table_name, effective_placement, effective_shard_key) VALUES ('app', 'public', 'tickets', 'sharded', 'tenant_id')`,
 	} {
-		if _, err := cat.Exec(ctx, sql); err != nil {
+		if _, err := tx.Exec(ctx, sql); err != nil {
 			tb.Fatalf("%s: %v", sql, err)
 		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		tb.Fatal(err)
 	}
 	for shard := 0; shard < 2; shard++ {
 		conn, err := pgx.Connect(ctx, s.appDSN(shard))
