@@ -106,8 +106,14 @@ jobs:
             # own timeout, and no -race: these are separate processes, so
             # the detector has nothing to watch and only slows them down.
             integration)
-              PGSHARD_REQUIRE_DOCKER=1 go test -tags integration -count=1 -timeout 45m \
-                $([ -n "${{ inputs.pattern }}" ] && echo -run "${{ inputs.pattern }}") \
+              # Its own argument list: the shared one carries -race, which
+              # these do not want, and building it as an array keeps the
+              # optional -run from being word-split.
+              iargs=(-tags integration -count=1 -timeout 45m)
+              if [ -n "${{ inputs.pattern }}" ]; then
+                iargs+=(-run "${{ inputs.pattern }}")
+              fi
+              PGSHARD_REQUIRE_DOCKER=1 go test "${iargs[@]}" \
                 ./test/e2e/router/... ./internal/agent/... ./internal/pgtune/... ;;
             unit)        go test "${args[@]}" ./... ;;
             *) echo "::error::unknown target"; exit 1 ;;
