@@ -114,7 +114,10 @@ workflow throttles on replica lag and bloat pressure on both sides rather
 than copying as fast as the disks allow.
 
 The copy competes with the workload for I/O on the source. The cutover
-itself is a sub-second write pause; everything before it is background.
+itself is a brief write pause; everything before it is background. On a
+four-vCPU CI runner under load, twenty consecutive cutovers paused for a
+median of 1.3 seconds (range 1.0-1.4s). Your own hardware decides the
+number; `status.cutover.pause_ms` records what each one actually cost.
 
 ## Observing and controlling workflows
 
