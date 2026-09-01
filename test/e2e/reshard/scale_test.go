@@ -505,10 +505,10 @@ func reshardUnderLoad(t *testing.T, startShards int, steps []reshardStep) {
 		t.Fatal(err)
 	}
 	seedLedgerTable(ctx, t, c, startShards)
-	if err := c.Apply(ctx, controllerManifest(env("CONTROLLER_IMAGE", "pgshard-controller:e2e"))); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.WaitPodsReady(ctx, testNamespace, "app="+clusterName+"-controller", 3*time.Minute); err != nil {
+	// The operator deploys the controller; this suite used to apply one of
+	// its own under the same name, which is how it passed while proving
+	// nothing about whether the operator ever produced a working one.
+	if err := c.WaitPodsReady(ctx, testNamespace, "pgshard.io/cluster="+clusterName+",pgshard.io/component=controller", 3*time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(ctx, t, c, "serving shard set materialized", 5*time.Minute, func() bool {

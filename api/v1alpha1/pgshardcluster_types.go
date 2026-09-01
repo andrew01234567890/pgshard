@@ -19,8 +19,13 @@ const (
 	ConditionResharding         = "Resharding"
 	ConditionServingWrites      = "ServingWrites"
 	ConditionRouterReady        = "RouterReady"
-	ConditionTuningApplied      = "TuningApplied"
-	ConditionRolloutInProgress  = "RolloutInProgress"
+	// ConditionControllerReady is True once the controller Deployment has a
+	// ready replica. Without it nothing resolves in-doubt transactions,
+	// applies queued DDL, drives a workflow or certifies a barrier -- and
+	// every other condition can be True while that is so.
+	ConditionControllerReady   = "ControllerReady"
+	ConditionTuningApplied     = "TuningApplied"
+	ConditionRolloutInProgress = "RolloutInProgress"
 )
 
 // Rollout phases reported in status.rollout.phase.

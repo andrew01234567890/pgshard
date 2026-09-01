@@ -116,57 +116,6 @@ spec:
 `, clientPod, testNamespace, image, clusterName)
 }
 
-// controllerManifest runs pgshard-controller against the cluster's catalog
-// and shards: the reconciler, the resolver and the reshard copier. The
-// superuser password comes from the cluster's Secret; schema
-// materialization goes through the member agents.
-func controllerManifest(image string) string {
-	ns := testNamespace
-	return fmt.Sprintf(`
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: %[1]s-controller
-  namespace: %[2]s
-  labels:
-    app: %[1]s-controller
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: %[1]s-controller
-  template:
-    metadata:
-      labels:
-        app: %[1]s-controller
-    spec:
-      containers:
-        - name: controller
-          image: %[3]s
-          imagePullPolicy: IfNotPresent
-          args:
-            - run
-            - --listen=
-            - --catalog-dsn=postgres://postgres:$(PGPASSWORD)@%[1]s-catalog-rw.%[2]s.svc:5432/postgres?sslmode=disable
-            - --shard-dsn-template=postgres://postgres:$(PGPASSWORD)@%[1]s-{group}-rw.%[2]s.svc:5432/postgres?sslmode=disable
-            - --subscription-dsn-template=host=%[1]s-{group}-rw.%[2]s.svc port=5432 user=postgres password=$(PGPASSWORD) dbname={db} sslmode=disable
-            - --reconcile-interval=5s
-            - --copy-interval=5s
-            - --resolve-interval=5s
-            # A table re-key holds the renamed old tables for an hour by
-            # default before dropping them and completing. The suite asserts
-            # the old table is gone, so without this it waits for something
-            # that cannot happen inside its timeout.
-            - --placement-drop-old-after=10s
-          env:
-            - name: PGPASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: %[1]s-superuser
-                  key: password
-`, clusterName, ns, image)
-}
-
 // shardSQL runs sql on the primary of one shard group's app database.
 // routerSQL runs one statement against the app database through the router,
 // which is how a client reaches the cluster: it routes by shard key and it
@@ -271,6 +220,14 @@ func deployOperator(ctx context.Context, t *testing.T, c *e2e.Cluster, root, ima
 	}
 	manifest := strings.Replace(string(raw), "image: ghcr.io/andrew01234567890/pgshard-operator:latest", "image: "+image, 1)
 	extraArgs := "            - --admin-image=" + env("ADMIN_IMAGE", "pgshard-admin:e2e") + "\n"
+	// Every cluster now gets a controller from the operator. Without this
+	// the operator reaches for its default image, which is not published
+	// and never loaded into kind, so the controller sits in
+	// ImagePullBackOff and the router talks to a Service with no endpoints.
+	extraArgs += "            - --controller-image=" + env("CONTROLLER_IMAGE", "pgshard-controller:e2e") + "\n"
+	// The suites assert the tables a placement workflow replaced are gone,
+	// and the controller holds them for an hour by default.
+	extraArgs += "            - --controller-placement-drop-old-after=10s\n"
 	if img := os.Getenv("ROUTER_IMAGE"); img != "" {
 		extraArgs += "            - --router-image=" + img + "\n"
 	}
@@ -459,10 +416,10 @@ func TestReshardProvisionsTargetsAndCancels(t *testing.T) {
 		t.Fatal(err)
 	}
 	seedApp(ctx, t, c)
-	if err := c.Apply(ctx, controllerManifest(env("CONTROLLER_IMAGE", "pgshard-controller:e2e"))); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.WaitPodsReady(ctx, testNamespace, "app="+clusterName+"-controller", 3*time.Minute); err != nil {
+	// The operator deploys the controller; this suite used to apply one of
+	// its own under the same name, which is how it passed while proving
+	// nothing about whether the operator ever produced a working one.
+	if err := c.WaitPodsReady(ctx, testNamespace, "pgshard.io/cluster="+clusterName+",pgshard.io/component=controller", 3*time.Minute); err != nil {
 		t.Fatal(err)
 	}
 

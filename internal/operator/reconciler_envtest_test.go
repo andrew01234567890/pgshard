@@ -1362,3 +1362,37 @@ func TestRotatingOneCredentialLeavesTheOtherAlone(t *testing.T) {
 		t.Errorf("the rotated agent token was overwritten with %q", got)
 	}
 }
+
+func TestFencedAndServingWritesFollowTheWriteFence(t *testing.T) {
+	r, fp, c := setup(t, "fence")
+	reconcile(t, r, c)
+	markPodsRunning(t, c)
+	fp.err = nil
+	fp.streaming = map[string]bool{
+		"fence-catalog-1": true, "fence-catalog-2": true,
+		"fence-shard-0-1": true, "fence-shard-0-2": true,
+	}
+	reconcile(t, r, c)
+
+	if cond := condition(t, "fence", pgshardv1alpha1.ConditionFenced); cond.Status != metav1.ConditionFalse {
+		t.Fatalf("an unfenced cluster must report Fenced False: %+v", cond)
+	}
+	if cond := condition(t, "fence", pgshardv1alpha1.ConditionServingWrites); cond.Status != metav1.ConditionTrue {
+		t.Fatalf("a healthy unfenced cluster must report ServingWrites True: %+v", cond)
+	}
+
+	// Raising the catalog fence makes the reconcile pause the shard
+	// primary; the pass after it probes that primary and must report both
+	// conditions from what it found.
+	fp.fenced = true
+	reconcile(t, r, c)
+	reconcile(t, r, c)
+
+	cond := condition(t, "fence", pgshardv1alpha1.ConditionFenced)
+	if cond.Status != metav1.ConditionTrue || !strings.Contains(cond.Message, "1/1 shard primaries refusing writes") {
+		t.Fatalf("a raised fence must reach the Fenced condition: %+v", cond)
+	}
+	if cond := condition(t, "fence", pgshardv1alpha1.ConditionServingWrites); cond.Status != metav1.ConditionFalse {
+		t.Fatalf("a fenced cluster is not serving writes: %+v", cond)
+	}
+}

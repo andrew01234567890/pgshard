@@ -45,8 +45,13 @@ const (
 
 // Renderer builds the Kubernetes objects for one cluster.
 type Renderer struct {
-	AdminImage  string
-	RouterImage string
+	AdminImage      string
+	RouterImage     string
+	ControllerImage string
+	// ControllerPlacementDropOldAfter overrides how long a placement
+	// workflow keeps the tables it replaced before dropping them; zero
+	// leaves the controller's own default.
+	ControllerPlacementDropOldAfter time.Duration
 }
 
 func objectMeta(g Group, name, namespace string, extra map[string]string) metav1.ObjectMeta {

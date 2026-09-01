@@ -134,6 +134,10 @@ type groupObservation struct {
 	nodes []string
 	// failing is set while the primary is unhealthy or a failover is pending.
 	failing bool
+	// writesPaused is the primary refusing writes: the observable effect of
+	// a raised catalog write fence, and what a barrier or a cutover leaves
+	// behind if it dies mid-flight.
+	writesPaused bool
 	// template is the desired member template; tuning the derived settings
 	// behind it (tuningErr when they could not be derived).
 	template  MemberTemplate
@@ -301,6 +305,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		retired = append(retired, catObs...)
 	}
 
+	if err := r.reconcileController(ctx, &cluster); err != nil {
+		return ctrl.Result{}, err
+	}
 	if err := r.reconcileAdmin(ctx, &cluster); err != nil {
 		// The admin is an accessory: a credential somebody pre-created
 		// with the wrong key, or an image that will not pull, must not
@@ -822,6 +829,7 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 		return obs, nil
 	}
 	obs.primaryOK = true
+	obs.writesPaused = pstate.WritesPaused
 	// Reported, never fatal to the pass: the fence lives in the catalog
 	// group, which is itself rebuilt member by member on a storage-class
 	// change, and a group that stopped rolling out because it could not
@@ -1183,6 +1191,7 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, c *pgshardv1alpha1
 	ready := true
 	primaryOK := true
 	replOK := true
+	fenced, servingShards, pausedShards := false, 0, 0
 	var msg string
 	var shards []pgshardv1alpha1.ShardStatus
 	for _, o := range obs {
@@ -1195,6 +1204,12 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, c *pgshardv1alpha1
 		}
 		if !o.primaryOK {
 			primaryOK = false
+		}
+		if o.group.Kind == "shard" {
+			servingShards++
+			if o.writesPaused {
+				fenced, pausedShards = true, pausedShards+1
+			}
 		}
 		if o.streamingCount() < o.replicasWant {
 			replOK = false
@@ -1242,6 +1257,27 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, c *pgshardv1alpha1
 	set(pgshardv1alpha1.ConditionTopologyDegraded, len(crowded) > 0,
 		boolReason(len(crowded) > 0, "MembersShareNodes", "MembersOnDistinctNodes"),
 		strings.Join(crowded, "; "))
+	// Fenced and ServingWrites were declared and documented alongside the
+	// two below and were likewise never set. Both are read off what the
+	// pass already probed rather than a fresh catalog read: a primary
+	// refusing writes is the observable effect of a raised fence, and it is
+	// the state a barrier or a cutover leaves behind if it dies mid-flight.
+	servingWrites := primaryOK && !fenced && servingShards > 0
+	set(pgshardv1alpha1.ConditionFenced, fenced,
+		boolReason(fenced, "WritesPaused", "Unfenced"),
+		fmt.Sprintf("%d/%d shard primaries refusing writes", pausedShards, servingShards))
+	set(pgshardv1alpha1.ConditionServingWrites, servingWrites,
+		boolReason(servingWrites, "Serving", "NotServing"), "")
+	// Both of these were declared in the API and documented as conditions a
+	// cluster reports, and neither was ever set: anybody waiting on
+	// RouterReady waited for something that never arrived. ControllerReady
+	// matters more than it looks -- every other condition here can be True
+	// while nothing resolves in-doubt transactions or applies queued DDL,
+	// because that work belongs to a process none of them describe.
+	routerReady, routerMsg := r.deploymentReady(ctx, c.Namespace, RouterName(c.Name))
+	set(pgshardv1alpha1.ConditionRouterReady, routerReady, boolReason(routerReady, "Ready", "NotReady"), routerMsg)
+	controllerReady, controllerMsg := r.deploymentReady(ctx, c.Namespace, ControllerName(c.Name))
+	set(pgshardv1alpha1.ConditionControllerReady, controllerReady, boolReason(controllerReady, "Ready", "NotReady"), controllerMsg)
 	meta.SetStatusCondition(&c.Status.Conditions, catalogReady)
 	meta.SetStatusCondition(&c.Status.Conditions, backupCond)
 	meta.SetStatusCondition(&c.Status.Conditions, reshardCond)
@@ -1250,6 +1286,24 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, c *pgshardv1alpha1
 	c.Status.Shards = shards
 	c.Status.PlacementWorkflows = placements
 	return r.Status().Patch(ctx, c, client.MergeFrom(base))
+}
+
+// deploymentReady reports whether a Deployment has a ready replica, and
+// says why when it has not. A missing Deployment is not ready rather than
+// an error: the pass that creates it runs before the pass that reports on
+// it, and a reconcile that failed here would never get to the creating.
+func (r *ClusterReconciler) deploymentReady(ctx context.Context, namespace, name string) (bool, string) {
+	var dep appsv1.Deployment
+	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &dep); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, name + " does not exist yet"
+		}
+		return false, "reading " + name + ": " + err.Error()
+	}
+	if dep.Status.ReadyReplicas > 0 {
+		return true, ""
+	}
+	return false, fmt.Sprintf("%s has %d ready replica(s) of %d", name, dep.Status.ReadyReplicas, dep.Status.Replicas)
 }
 
 // setRolloutStatus summarises the groups' rolling steps into status.rollout

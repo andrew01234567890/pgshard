@@ -121,6 +121,10 @@ it forwards `VStream.Create`/`Drop` to the controller (`--controller`).
 ## VStream API (router)
 
 `pgshard-router serve --vstream-listen host:port [--controller host:port]`
+
+In an operator-deployed cluster both are set for you: the routers listen on
+`9091`, published by the router Service as the `vstream` port, and point at
+the cluster's controller Service. Consumers dial the router Service.
 serves `pgshard.v1.VStream` with the router↔pooler mTLS material
 (`--pooler-tls-*`, or plaintext with `--insecure-dev`).
 
