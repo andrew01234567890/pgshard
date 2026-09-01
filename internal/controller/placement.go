@@ -131,6 +131,10 @@ type Placer struct {
 	Logger *slog.Logger
 	// LagBytes is the slot lag under which the catch-up counts as done.
 	LagBytes int64
+	// SlotFailoverDisabled turns off failover slots for the placement's
+	// own slots, and reads backwards for the same reason Copier's does:
+	// the zero value has to be the safe one.
+	SlotFailoverDisabled bool
 	// BufferTimeout bounds one write pause; BufferAttempts how many
 	// released pauses fail the workflow.
 	BufferTimeout  time.Duration

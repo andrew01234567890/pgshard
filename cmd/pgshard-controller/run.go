@@ -68,7 +68,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	throttleHigh := fs.Int64("copy-throttle-high-bytes", controller.DefaultThrottleHi, "source standby lag that pauses reshard subscriptions")
 	throttleLow := fs.Int64("copy-throttle-low-bytes", controller.DefaultThrottleLo, "source standby lag under which paused reshard subscriptions resume")
 	preparedWait := fs.Duration("copy-prepared-wait", controller.DefaultPreparedWait, "how long slot creation waits for in-doubt prepared transactions before the reshard fails")
-	slotFailover := fs.Bool("copy-slot-failover", true, "create reshard subscription slots with failover = true so a promotion on the source does not strand the copy")
+	slotFailover := fs.Bool("copy-slot-failover", true, "create reshard and placement slots with failover = true so a promotion on the source does not strand the copy")
 	placementEvery := fs.Duration("placement-interval", 5*time.Second, "time between table placement passes")
 	refCheckEvery := fs.Duration("reference-check-interval", 5*time.Second, "time between reference-table inspection passes")
 	keyCheckEvery := fs.Duration("shard-key-check-interval", 5*time.Second, "time between shard-key type checks of newly declared sharded tables")
@@ -184,7 +184,8 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 			LagBytes: *copyLag, ThrottleHigh: *throttleHigh, ThrottleLow: *throttleLow, PreparedWait: *preparedWait,
 			SlotFailoverDisabled: !*slotFailover}
 		go copier.Run(ctx, *copyEvery, leader.Load)
-		placer := &controller.Placer{Pool: pool, Shards: dialer, Logger: logger, LagBytes: *copyLag, BufferTimeout: *placementBuffer, DropOldAfter: *placementDropOld}
+		placer := &controller.Placer{Pool: pool, Shards: dialer, Logger: logger, LagBytes: *copyLag, BufferTimeout: *placementBuffer, DropOldAfter: *placementDropOld,
+			SlotFailoverDisabled: !*slotFailover}
 		go placer.Run(ctx, *placementEvery, leader.Load)
 		go (&controller.ReferenceCheck{Pool: pool, Shards: dialer, Logger: logger}).Run(ctx, *refCheckEvery, leader.Load)
 		go (&controller.ShardKeyCheck{Pool: pool, Shards: dialer, Logger: logger}).Run(ctx, *keyCheckEvery, leader.Load)

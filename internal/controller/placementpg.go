@@ -1083,7 +1083,11 @@ func (p *Placer) ensureReplication(ctx context.Context, wf *placementWorkflow, c
 		return err
 	}
 	if !exists {
-		if _, err := conn.Exec(ctx, `SELECT pg_create_logical_replication_slot($1, 'pgoutput')`, wf.slotName(s)); err != nil {
+		// pg_create_logical_replication_slot(slot_name, plugin, temporary,
+		// twophase, failover): naming only the first two leaves failover
+		// false, so a promotion on the source strands the placement the
+		// way it stranded a reshard before the Copier asked for it.
+		if _, err := conn.Exec(ctx, `SELECT pg_create_logical_replication_slot($1, 'pgoutput', false, false, $2)`, wf.slotName(s), !p.SlotFailoverDisabled); err != nil {
 			return err
 		}
 	}
