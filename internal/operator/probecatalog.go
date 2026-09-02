@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/pgsequence"
 )
 
@@ -335,6 +336,12 @@ func (p PgxProber) CutoverCatalog(ctx context.Context, source, target CatalogSid
 	if err := drainSlot(ctx, src, CatalogUpgradeSubscription, fence, time.Now); err != nil {
 		return err
 	}
+	if err := carryShardMapGeneration(ctx, src, tgt); err != nil {
+		return err
+	}
+	if err := catalogTargetIsReadable(ctx, tgt); err != nil {
+		return err
+	}
 	if err := carrySequences(ctx, src, tgt); err != nil {
 		return err
 	}
@@ -348,6 +355,66 @@ func (p PgxProber) CutoverCatalog(ctx context.Context, source, target CatalogSid
 	// throwing it away.
 	if err := ensureCatalogRollback(ctx, src, tgt, target.connInfo()); err != nil {
 		return err
+	}
+	return nil
+}
+
+// carryShardMapGeneration restores the target's shard_map_generation row.
+//
+// The row is a singleton, and the ONLY thing that ever inserts one is the
+// schema migration (0003_status.sql). Everything afterwards is an UPDATE,
+// which quietly affects nothing when the row is gone. EnsureCatalogCopy
+// clears the target's whole pgshard schema before the copy, so between the
+// clear and the copy delivering it the target has no generation at all --
+// and if the copy never delivers it, nothing else ever will.
+//
+// Carried explicitly for the same reason sequences are: it is catalog state
+// the copy is not guaranteed to bring across, and the new catalog cannot
+// serve without it. A router that cannot read the generation refuses to
+// plan and leaves the Service, so an unrepaired target means every router
+// stops, not one.
+//
+// Repair, not overwrite: a target that already has its row keeps it,
+// including the write-fence columns that share it. Only a missing row is
+// filled, and it is filled from the source, which is fenced by now and
+// therefore final.
+func carryShardMapGeneration(ctx context.Context, src, tgt *pgx.Conn) error {
+	var generation int64
+	var fence bool
+	var reason, owner string
+	if err := src.QueryRow(ctx,
+		`SELECT generation, write_fence, write_fence_reason, write_fence_owner FROM pgshard.shard_map_generation`,
+	).Scan(&generation, &fence, &reason, &owner); err != nil {
+		return fmt.Errorf("read shard map generation from the catalog source: %w", err)
+	}
+	if _, err := tgt.Exec(ctx,
+		`INSERT INTO pgshard.shard_map_generation (singleton, generation, write_fence, write_fence_reason, write_fence_owner)
+		 VALUES (true, $1, $2, $3, $4) ON CONFLICT (singleton) DO NOTHING`,
+		generation, fence, reason, owner); err != nil {
+		return fmt.Errorf("restore shard map generation on the catalog target: %w", err)
+	}
+	return nil
+}
+
+// catalogTargetIsReadable refuses a cutover onto a catalog a router could
+// not read.
+//
+// The gate before this one, CatalogCopyCaughtUp, asks only the SOURCE:
+// no table-sync workers left and zero WAL lag. Both can be true while the
+// target holds nothing, because EnsureCatalogCopy clears the target's whole
+// pgshard schema before the copy and the copy is what puts it back. If it
+// did not, the flip strands every router: shard_map_generation is a
+// singleton, an empty one makes catalog.Generations return
+// ErrNoShardMapGeneration, and a router that cannot read the generation
+// refuses to plan and leaves the Service. Observed exactly that way -- all
+// three routers unable to load a snapshot, writes stopped, while the
+// cluster reported CatalogReady.
+//
+// Run after the drain, so everything the fenced source held has been
+// applied and a missing row means the copy is broken rather than late.
+func catalogTargetIsReadable(ctx context.Context, tgt *pgx.Conn) error {
+	if _, _, err := catalog.Generations(ctx, tgt); err != nil {
+		return fmt.Errorf("catalog target is not readable, so the cutover onto it is refused: %w", err)
 	}
 	return nil
 }
