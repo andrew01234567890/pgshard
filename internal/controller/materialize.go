@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/andrew01234567890/pgshard/internal/agentauth"
@@ -39,6 +40,9 @@ type AgentMaterializer struct {
 	Port int
 	// Timeout bounds one materialization; zero means 10 minutes.
 	Timeout time.Duration
+	// Creds is what the agent dial presents. Nil means plaintext, which is
+	// what an agent without GRPCTLS serves; the two have to agree.
+	Creds credentials.TransportCredentials
 	// AgentToken is the cluster's own agent control-plane token, mounted
 	// by the operator. Empty falls back to the token derived from the
 	// catalog password alone, which is what this did before it had one.
@@ -61,7 +65,11 @@ func (m *AgentMaterializer) MaterializeSchema(ctx context.Context, target ShardR
 	if err != nil {
 		return err
 	}
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	tc := m.Creds
+	if tc == nil {
+		tc = insecure.NewCredentials()
+	}
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(tc))
 	if err != nil {
 		return err
 	}

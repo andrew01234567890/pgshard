@@ -35,8 +35,21 @@ func (h *harness) startMinIO(stanza string) map[string]any {
 	}
 	// The bucket must exist before the stanza can be created; a throwaway
 	// mc-style call through the MinIO image does it without another image.
-	docker(t, "run", "--rm", "--network", h.net, "--entrypoint", "sh", minioImage, "-c",
-		"for i in $(seq 1 30); do mc alias set store http://"+minio+":9000 minioadmin minioadmin >/dev/null 2>&1 && mc mb --ignore-existing store/pgshard && exit 0; sleep 1; done; exit 1")
+	//
+	// The loop keeps the last attempt's error instead of discarding it, and
+	// the container's own log is printed if it never came up. Without both,
+	// a timeout here reports "exit status 1" and nothing else, which does
+	// not distinguish a MinIO that was slow to start on a loaded runner
+	// from one that never started at all.
+	bucket := fmt.Sprintf(`last=; for i in $(seq 1 60); do `+
+		`if last=$(mc alias set store http://%s:9000 minioadmin minioadmin 2>&1) && `+
+		`last=$(mc mb --ignore-existing store/pgshard 2>&1); then exit 0; fi; `+
+		`sleep 1; done; echo "last attempt: $last" >&2; exit 1`, minio)
+	if out, err := exec.Command("docker", "run", "--rm", "--network", h.net,
+		"--entrypoint", "sh", minioImage, "-c", bucket).CombinedOutput(); err != nil {
+		logs, _ := exec.Command("docker", "logs", "--tail", "50", minio).CombinedOutput()
+		t.Fatalf("creating the pgshard bucket: %v\n%s\nminio container log:\n%s", err, out, logs)
+	}
 	return map[string]any{
 		"stanza": stanza,
 		"repo": map[string]any{
