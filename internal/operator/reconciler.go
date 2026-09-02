@@ -246,7 +246,7 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	observations = append(observations, shardObs...)
 	if catalogReady.Status == metav1.ConditionTrue {
-		if err := r.spreadBootstrapVerifier(ctx, &cluster, dsn, shardObs, password); err != nil {
+		if err := r.spreadBootstrapVerifier(ctx, &cluster, dsn, observations, password); err != nil {
 			log.Error(err, "bootstrap verifier not yet published to every group; retrying")
 		}
 	}
@@ -1084,7 +1084,12 @@ func podReady(p *corev1.Pod) bool {
 // forwards the recovered key to a backend, so a group whose own initdb salted
 // the role differently refuses that key with 28P01 -- after the router has
 // already accepted the client. Give every group the published verifier.
-func (r *ClusterReconciler) spreadBootstrapVerifier(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, catalogDSN string, shards []groupObservation, password string) error {
+//
+// EVERY group, the catalog included. It was the shard groups only, and the
+// catalog is the one this is most visible on: the pgshard database routes to
+// the catalog set, so the first login the getting-started guide documents
+// goes there and nowhere else. It failed while every shard was reachable.
+func (r *ClusterReconciler) spreadBootstrapVerifier(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, catalogDSN string, groups []groupObservation, password string) error {
 	verifier, err := r.Prober.BootstrapVerifier(ctx, catalogDSN, superuserName)
 	if err != nil {
 		return fmt.Errorf("read published verifier: %w", err)
@@ -1093,7 +1098,7 @@ func (r *ClusterReconciler) spreadBootstrapVerifier(ctx context.Context, c *pgsh
 		return nil
 	}
 	var errs []error
-	for _, o := range shards {
+	for _, o := range groups {
 		if !o.primaryOK {
 			continue
 		}

@@ -1255,22 +1255,27 @@ func TestRouterCredentialIsGeneratedAndApplied(t *testing.T) {
 	}
 }
 
-// TestEveryShardGroupIsGivenThePublishedVerifier: the router authenticates a
-// client against pgshard.roles and forwards the key it recovers, so a shard
-// group still holding its own initdb verifier answers 28P01 to a credential
-// the router has already accepted.
-func TestEveryShardGroupIsGivenThePublishedVerifier(t *testing.T) {
+// TestEveryGroupIsGivenThePublishedVerifier: the router authenticates a client
+// against pgshard.roles and forwards the key it recovers, so a group still
+// holding its own initdb verifier answers 28P01 to a credential the router has
+// already accepted.
+//
+// EVERY group, catalog included. This asserted Groups(c)[1:] -- the same
+// off-by-one the code had -- so it passed while the documented first login
+// failed: `dbname=pgshard` routes to the catalog set, so that login reaches
+// the one group nothing had given the verifier to.
+func TestEveryGroupIsGivenThePublishedVerifier(t *testing.T) {
 	r, fp, c := setup(t, "bv")
 	bringUp(t, r, fp, c)
 
-	shards := Groups(c)[1:]
-	if len(shards) == 0 {
+	groups := Groups(c)
+	if len(groups) < 2 {
 		t.Fatal("a cluster with no shard group proves nothing here")
 	}
 	fp.mu.Lock()
 	got := append([]string(nil), fp.adoptedVerifiers...)
 	fp.mu.Unlock()
-	for _, g := range shards {
+	for _, g := range groups {
 		want := g.ServiceRW() + "." + c.Namespace + ".svc=" + superuserName + ":" + fakePublishedVerifier
 		if !slices.Contains(got, want) {
 			t.Errorf("group %s never received the verifier the router forwards against; adopted %v", g.Name(), got)
