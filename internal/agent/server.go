@@ -168,6 +168,13 @@ func (s *Server) promoteWithRetry(ctx context.Context) error {
 	return err
 }
 
+// startHold renews the primary lease until releaseLease ends it. The
+// renewal deliberately runs on context.Background rather than the agent's
+// lifecycle context: shutdown cancels that context first and only then
+// stops PostgreSQL, with a budget of three times shutdownTimeout against a
+// lease an eighth as long, so a hold bound to it would stop renewing while
+// this member was still a writable primary and let another one promote
+// under it. Ending the hold is releaseLease's job, once postgres is down.
 func (s *Server) startHold() {
 	if s.lease == nil || s.holdStop != nil {
 		return
