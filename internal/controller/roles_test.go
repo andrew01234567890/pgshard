@@ -185,7 +185,7 @@ type roleGroupConn struct {
 	ran   []string
 }
 
-func (c *roleGroupConn) Exec(_ context.Context, sql string, _ ...any) (pgconnTag, error) {
+func (c *roleGroupConn) Exec(_ context.Context, sql string, _ ...any) (CommandTag, error) {
 	c.ran = append(c.ran, sql)
 	return pgconn.CommandTag{}, nil
 }

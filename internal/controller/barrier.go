@@ -952,14 +952,14 @@ func (s *SQLBarrierGroups) List(ctx context.Context) ([]GroupRef, error) {
 
 type groupConn interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
-	Exec(ctx context.Context, sql string, args ...any) (pgconnTag, error)
+	Exec(ctx context.Context, sql string, args ...any) (CommandTag, error)
 }
 
 // poolGroupConn adapts the catalog pool to groupConn, whose Exec returns the
 // package's loose command-tag interface so a ShardConn satisfies it too.
 type poolGroupConn struct{ *pgxpool.Pool }
 
-func (c poolGroupConn) Exec(ctx context.Context, sql string, args ...any) (pgconnTag, error) {
+func (c poolGroupConn) Exec(ctx context.Context, sql string, args ...any) (CommandTag, error) {
 	return c.Pool.Exec(ctx, sql, args...)
 }
 

@@ -42,8 +42,8 @@ func (c *slotConn) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, err
 	return r, nil
 }
 
-func (c *slotConn) Exec(context.Context, string, ...any) (pgconnTag, error) { return nil, nil }
-func (c *slotConn) Close(context.Context) error                             { return nil }
+func (c *slotConn) Exec(context.Context, string, ...any) (CommandTag, error) { return nil, nil }
+func (c *slotConn) Close(context.Context) error                              { return nil }
 
 type slotRows struct {
 	names []string
