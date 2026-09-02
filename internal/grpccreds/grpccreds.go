@@ -51,3 +51,35 @@ func Listener(certFile, keyFile, caFile string, insecureDev bool) (credentials.T
 	return credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}, ClientCAs: pool,
 		ClientAuth: tls.RequireAndVerifyClientCert, MinVersion: tls.VersionTLS13}), nil
 }
+
+// Dialer returns the credentials an internal gRPC client dials with: it
+// presents certFile/keyFile and verifies the server against caFile.
+//
+// The mirror of Listener, and fail-closed the same way, so a caller cannot
+// end up in plaintext because a flag was forgotten. serverName is the name
+// the server's certificate must carry; empty uses the dial address.
+func Dialer(certFile, keyFile, caFile, serverName string, insecureDev bool) (credentials.TransportCredentials, error) {
+	if insecureDev {
+		if certFile != "" || keyFile != "" || caFile != "" {
+			return nil, errors.New("insecure dialling cannot be combined with TLS material")
+		}
+		return insecure.NewCredentials(), nil
+	}
+	if certFile == "" || keyFile == "" || caFile == "" {
+		return nil, errors.New("a client certificate, key and CA are all required (or insecure dialling)")
+	}
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, err
+	}
+	pemBytes, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pemBytes) {
+		return nil, fmt.Errorf("%s: no certificates found", caFile)
+	}
+	return credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: pool,
+		ServerName: serverName, MinVersion: tls.VersionTLS13}), nil
+}

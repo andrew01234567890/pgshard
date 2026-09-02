@@ -202,3 +202,66 @@ func writeFile(t *testing.T, dir, name string, b []byte) string {
 	}
 	return p
 }
+
+// TestDialerVerifiesTheServerItReaches: a client that presents its own
+// certificate but does not verify the server's would connect happily to
+// anything that answered on the address, which is the half of mutual TLS
+// that is easy to leave out. Asserted against a real server rather than by
+// reading the tls.Config.
+func TestDialerVerifiesTheServerItReaches(t *testing.T) {
+	dir := t.TempDir()
+	ca := newTestCA(t)
+	impostorCA := newTestCA(t)
+	srvCert, srvKey := ca.issue(t, "server", 5)
+	cliCert, cliKey := ca.issue(t, "client", 6)
+	impostorCert, impostorKey := impostorCA.issue(t, "server", 7)
+
+	listener, err := grpccreds.Listener(
+		writeFile(t, dir, "s.crt", srvCert), writeFile(t, dir, "s.key", srvKey),
+		writeFile(t, dir, "ca.crt", ca.pem), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	impostorListener, err := grpccreds.Listener(
+		writeFile(t, dir, "i.crt", impostorCert), writeFile(t, dir, "i.key", impostorKey),
+		writeFile(t, dir, "ica.crt", impostorCA.pem), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clientCert := writeFile(t, dir, "c.crt", cliCert)
+	clientKey := writeFile(t, dir, "c.key", cliKey)
+	caPath := writeFile(t, dir, "trust.crt", ca.pem)
+
+	t.Run("reaches a server the CA vouches for", func(t *testing.T) {
+		tc, err := grpccreds.Dialer(clientCert, clientKey, caPath, "localhost", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := call(t, serve(t, listener), tc); status.Code(err) != codes.Unimplemented {
+			t.Fatalf("a properly issued client could not reach its server: %v", err)
+		}
+	})
+
+	t.Run("refuses a server the CA does not vouch for", func(t *testing.T) {
+		tc, err := grpccreds.Dialer(clientCert, clientKey, caPath, "localhost", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := call(t, serve(t, impostorListener), tc); status.Code(err) == codes.Unimplemented {
+			t.Fatal("the client reached a server presenting a certificate from an untrusted CA")
+		}
+	})
+
+	t.Run("is fail-closed on partial material", func(t *testing.T) {
+		if _, err := grpccreds.Dialer("", "", "", "", false); err == nil {
+			t.Error("no material and no insecure dialling must be an error, not plaintext")
+		}
+		if _, err := grpccreds.Dialer(clientCert, clientKey, caPath, "", true); err == nil {
+			t.Error("insecure dialling combined with TLS material must be an error")
+		}
+		if _, err := grpccreds.Dialer("", "", "", "", true); err != nil {
+			t.Errorf("insecure dialling alone is the documented plaintext path: %v", err)
+		}
+	})
+}
