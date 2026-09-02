@@ -162,6 +162,36 @@ func psql(ctx context.Context, c *e2e.Cluster, host, sql string) (string, error)
 	return strings.TrimSpace(out), err
 }
 
+// psqlOn is psql against a chosen database, which is what the router makes
+// meaningful: the pgshard database routes to the catalog set and every other
+// one to a shard set, so a login proves nothing about a group it never
+// reached.
+func psqlOn(ctx context.Context, c *e2e.Cluster, host, database, sql string) (string, error) {
+	out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "exec", clientPod, "--",
+		"psql", "-h", host, "-U", "postgres", "-d", database, "-v", "ON_ERROR_STOP=1", "-tAc", sql)
+	return strings.TrimSpace(out), err
+}
+
+// psqlRetryOn is psqlOn with the same backoff psqlRetry uses.
+func psqlRetryOn(ctx context.Context, c *e2e.Cluster, host, database, sql string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	delay := time.Second
+	for {
+		out, err := psqlOn(ctx, c, host, database, sql)
+		if err == nil || time.Now().After(deadline) {
+			return out, err
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(delay):
+		}
+		if delay < 10*time.Second {
+			delay *= 2
+		}
+	}
+}
+
 // psqlRetry repeats psql with backoff until it succeeds or timeout elapses;
 // Services briefly lose their endpoints while members restart.
 func psqlRetry(ctx context.Context, c *e2e.Cluster, host, sql string, timeout time.Duration) (string, error) {
@@ -453,6 +483,26 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 		if err := c.WaitPodsReady(ctx, testNamespace, rsel, 5*time.Minute); err != nil {
 			reasons, _ := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pods", "-l", rsel, "-o", "jsonpath={.items[*].status.containerStatuses[*].state.waiting.reason}")
 			t.Fatalf("router pods not ready (%s): %v", reasons, err)
+		}
+	})
+
+	// The sequence docs/guide/getting-started.md opens with, and the first
+	// thing a reader does. It failed against a cluster reporting Ready on
+	// every condition: the router accepted the client against the verifier
+	// published in pgshard.roles, forwarded the key it recovered, and the
+	// backend answered 28P01 -- because the catalog group had never been
+	// given that verifier (PGS-576). Every shard had.
+	//
+	// Asserted through the router on the pgshard database specifically,
+	// because that is what routes to the catalog set. A test against a shard
+	// database would have passed throughout.
+	t.Run("DocumentedFirstLoginThroughTheRouter", func(t *testing.T) {
+		out, err := psqlRetryOn(ctx, c, clusterName+"-router", "pgshard", "SELECT 1", 3*time.Minute)
+		if err != nil {
+			t.Fatalf("the first login the guide documents does not work: %v", err)
+		}
+		if out != "1" {
+			t.Errorf("first login returned %q, want 1", out)
 		}
 	})
 
