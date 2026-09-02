@@ -23,6 +23,12 @@ jobs:
         with:
           go-version-file: go.mod
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          # Pinned rather than latest: the action SHA fixes the downloader, not the
+          # binary it fetches, so an unpinned helm changes under a chart that has
+          # not. Held on 3.x because hack/chaos/install.sh installs the Chaos Mesh
+          # chart, which is published for helm 3.
+          version: v3.21.4
       - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
         with:
           version: v0.32.0
