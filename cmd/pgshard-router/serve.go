@@ -222,18 +222,19 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	}
 	poolerClients := router.NewPoolers(poolers, w.Current, creds)
 	rt, err := router.New(router.Config{
-		Snapshot:              w.Current,
-		Poolers:               poolerClients,
-		Logger:                logger,
-		Peers:                 peersOrNil(forwarder),
-		Buffering:             router.Buffering{Window: *bufferWindow, TransportWindow: *bufferTransportWindow, PerShardCap: *bufferCap, Changes: w.Subscribe},
-		Scatter:               router.ScatterConfig{MaxShards: *scatterMaxShards, MaxStreams: *scatterMaxStreams, MaxWait: *scatterMaxWait},
-		CrossShardLockTimeout: *crossShardLockTimeout,
-		Decisions:             &router.PGDecisionLog{Pool: pool},
-		Sequences:             router.NewSequenceAllocator(&router.PGBlockSource{Pool: pool}),
-		Migrations:            &router.PGMigrationQueue{Pool: pool},
-		RoleLimits:            roles,
-		MaxSessions:           *maxSessions,
+		Snapshot:                w.Current,
+		Poolers:                 poolerClients,
+		Logger:                  logger,
+		Peers:                   peersOrNil(forwarder),
+		Buffering:               router.Buffering{Window: *bufferWindow, TransportWindow: *bufferTransportWindow, PerShardCap: *bufferCap, Changes: w.Subscribe},
+		Scatter:                 router.ScatterConfig{MaxShards: *scatterMaxShards, MaxStreams: *scatterMaxStreams, MaxWait: *scatterMaxWait},
+		CrossShardLockTimeout:   *crossShardLockTimeout,
+		Decisions:               &router.PGDecisionLog{Pool: pool},
+		Sequences:               router.NewSequenceAllocator(&router.PGBlockSource{Pool: pool}),
+		Migrations:              &router.PGMigrationQueue{Pool: pool},
+		CatalogPhysicalDatabase: catalogPhysicalDatabase(*catalogDSN),
+		RoleLimits:              roles,
+		MaxSessions:             *maxSessions,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
@@ -490,4 +491,16 @@ func serveAux(ctx context.Context, errc chan<- error, name string, serve func() 
 		default:
 		}
 	}()
+}
+
+// catalogPhysicalDatabase reads the database out of the catalog DSN. The
+// catalog is a schema inside an ordinary database, so the name clients
+// connect with (pgshard) is not the name a backend is opened on; this is
+// where the real one is already known.
+func catalogPhysicalDatabase(dsn string) string {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil || cfg.ConnConfig.Database == "" {
+		return ""
+	}
+	return cfg.ConnConfig.Database
 }

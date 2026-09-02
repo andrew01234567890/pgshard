@@ -28,6 +28,13 @@ type Config struct {
 	// sessions opening it are routed to the catalog shard set. Default
 	// "pgshard".
 	CatalogDatabase string
+	// CatalogPhysicalDatabase is the database the catalog group actually
+	// holds the pgshard schema in. It differs from CatalogDatabase, which
+	// is the name clients connect with: the catalog is a SCHEMA inside an
+	// ordinary database, so a session opened as `dbname=pgshard` has to
+	// reach a backend on this one. Empty means "postgres", which is what
+	// the operator's own catalog DSN uses.
+	CatalogPhysicalDatabase string
 	// Peers receives cancel keys no local session owns; nil drops them.
 	Peers CancelForwarder
 	// Buffering tunes failover buffering; zero values pick defaults.
@@ -115,6 +122,9 @@ func New(cfg Config) (*Router, error) {
 	}
 	if cfg.CatalogDatabase == "" {
 		cfg.CatalogDatabase = "pgshard"
+	}
+	if cfg.CatalogPhysicalDatabase == "" {
+		cfg.CatalogPhysicalDatabase = "postgres"
 	}
 	cfg.Buffering = cfg.Buffering.withDefaults()
 	cfg.Scatter = cfg.Scatter.withDefaults()
