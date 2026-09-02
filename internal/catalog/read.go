@@ -294,6 +294,15 @@ func ListAllShardStatus(ctx context.Context, q Querier) ([]ShardStatus, error) {
 	return pgx.CollectRows(rows, pgx.RowToStructByPos[ShardStatus])
 }
 
+// ErrNoShardMapGeneration is returned when pgshard.shard_map_generation holds
+// no row. It stays an error rather than defaulting to zero: a router that
+// cannot read the generation stamps every request with zero, which poolers
+// refuse, so serving on a guess would turn a diagnosable stop into a cluster
+// that answers every query with a fence error.
+var ErrNoShardMapGeneration = errors.New(
+	"pgshard.shard_map_generation holds no row, so this catalog has no shard map generation: " +
+		"its schema exists but its singleton row does not, which is what a catalog being copied into looks like before the copy delivers it")
+
 // Generations returns the shard-map generation and the highest desired
 // generation stamped on any desired-state row.
 func Generations(ctx context.Context, q Querier) (shardMap, desired int64, err error) {
@@ -312,10 +321,21 @@ func Generations(ctx context.Context, q Querier) (shardMap, desired int64, err e
 	if !rows.Next() {
 		return 0, 0, rows.Err()
 	}
-	if err := rows.Scan(&shardMap, &desired); err != nil {
+	// shard_map_generation is a singleton seeded by the schema migration, so
+	// a NULL here means the table is EMPTY rather than that a generation is
+	// unset -- a scalar subquery over no rows. That happens to a catalog the
+	// upgrade copy has cleared and not yet refilled, and every router pointed
+	// at it then fails to load a snapshot. Scanned through a pointer so the
+	// reason can be said: the raw failure is "cannot scan NULL into *int64",
+	// which names neither the table nor the state it is in.
+	var gen *int64
+	if err := rows.Scan(&gen, &desired); err != nil {
 		return 0, 0, err
 	}
-	return shardMap, desired, rows.Err()
+	if gen == nil {
+		return 0, 0, ErrNoShardMapGeneration
+	}
+	return *gen, desired, rows.Err()
 }
 
 // WriteFence is the cluster-wide write pause routers observe.
