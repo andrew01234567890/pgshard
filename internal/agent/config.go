@@ -48,8 +48,13 @@ type Config struct {
 	GRPCAddr string `json:"grpcAddr"`
 
 	Postgres PostgresSettings `json:"postgres"`
-	TLS      TLSFiles         `json:"tls"`
-	Lease    LeaseConfig      `json:"lease"`
+	// TLS is PostgreSQL's server certificate, not the agent's own gRPC
+	// material -- the two are different trust domains and sharing one pair
+	// between them would make a shard's certificate a control-plane
+	// credential. GRPCTLS is the gRPC listener's.
+	TLS     TLSFiles    `json:"tls"`
+	GRPCTLS TLSFiles    `json:"grpcTLS"`
+	Lease   LeaseConfig `json:"lease"`
 
 	// MaxLagBytes is the replay lag above which a standby reports not ready.
 	MaxLagBytes int64 `json:"maxLagBytes"`
