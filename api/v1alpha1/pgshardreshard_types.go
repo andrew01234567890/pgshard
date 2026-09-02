@@ -34,6 +34,21 @@ const (
 	UpgradeActionRollback = "rollback"
 )
 
+// AnnotationRollback asks a switched run of ANY mode to return serving to
+// the set it switched from, while reverse replication still keeps that set
+// current and before retirement tears it down.
+//
+// The machinery was never upgrade-specific: the controller triggers on
+// spec.Rollback at StageSwitched and its rollback path names no kind
+// (internal/controller/cutover.go). Only the operator's mirroring was
+// gated on mode == upgrade, so an ordinary reshard could be rolled back
+// only by editing pgshard.workflows by hand -- during an incident, which
+// is where that goes wrong.
+//
+// AnnotationUpgrade keeps working for upgrade runs; this is the name that
+// does not lie about what it covers.
+const AnnotationRollback = "pgshard.io/rollback"
+
 // AnnotationCatalogUpgrade on a PgShardCluster controls the catalog
 // group's major upgrade; "rollback" returns serving to the old-major
 // catalog group before its retirement deletes it.

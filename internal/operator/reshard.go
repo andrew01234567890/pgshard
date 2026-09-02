@@ -332,9 +332,13 @@ func (r *ClusterReconciler) mirrorCutoverSpec(ctx context.Context, c *pgshardv1a
 	if err := r.Prober.SetReshardCutoverSpec(ctx, dsn, wf.ID, c.Spec.Resharding.PauseBefore, proceed, retire); err != nil {
 		return wf, fmt.Errorf("mirror cutover spec: %w", err)
 	}
-	if record.Spec.Mode == pgshardv1alpha1.ReshardModeUpgrade && record.Annotations[pgshardv1alpha1.AnnotationUpgrade] == pgshardv1alpha1.UpgradeActionRollback {
+	// Either annotation, any mode. The controller's rollback is kind-agnostic
+	// -- it triggers on spec.Rollback at StageSwitched and reverses whatever
+	// the run switched -- so gating the operator's mirroring on upgrade mode
+	// left ordinary reshards with the machinery and no way to ask for it.
+	if rollbackRequested(record) {
 		if err := r.Prober.SetWorkflowRollback(ctx, dsn, wf.ID); err != nil {
-			return wf, fmt.Errorf("mirror upgrade rollback: %w", err)
+			return wf, fmt.Errorf("mirror rollback: %w", err)
 		}
 	}
 	return wf, nil
@@ -536,4 +540,15 @@ func (r *ClusterReconciler) deleteTargetGroups(ctx context.Context, c *pgshardv1
 		}
 	}
 	return nil
+}
+
+// rollbackRequested reports whether a run has been asked to return serving to
+// the set it switched from. AnnotationUpgrade is still honoured on upgrade
+// runs, which is how it was asked for before AnnotationRollback existed.
+func rollbackRequested(record *pgshardv1alpha1.PgShardReshard) bool {
+	if record.Annotations[pgshardv1alpha1.AnnotationRollback] == pgshardv1alpha1.UpgradeActionRollback {
+		return true
+	}
+	return record.Spec.Mode == pgshardv1alpha1.ReshardModeUpgrade &&
+		record.Annotations[pgshardv1alpha1.AnnotationUpgrade] == pgshardv1alpha1.UpgradeActionRollback
 }

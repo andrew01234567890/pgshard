@@ -3,6 +3,7 @@ package operator
 import (
 	"context"
 	"math"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -261,6 +262,23 @@ func TestReshardRetiresOldGroupsAfterSwitch(t *testing.T) {
 	fp.mu.Unlock()
 	if last != "wf-2:switchWrites::86400" {
 		t.Fatalf("mirrored spec: %q", last)
+	}
+
+	// A plain reshard can ask to be rolled back. The controller's rollback
+	// names no kind -- it triggers on spec.Rollback at StageSwitched -- but
+	// the operator used to mirror the request only for upgrade-mode runs, so
+	// an ordinary reshard had the machinery and no handle, leaving a hand
+	// edit of pgshard.workflows as the only route during an incident.
+	rec.Annotations = map[string]string{pgshardv1alpha1.AnnotationRollback: pgshardv1alpha1.UpgradeActionRollback}
+	if err := k8sClient.Update(context.Background(), &rec); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t, r, c)
+	fp.mu.Lock()
+	rolled := append([]string(nil), fp.rollbacks...)
+	fp.mu.Unlock()
+	if !slices.Contains(rolled, "wf-2") {
+		t.Errorf("a reshard asking for rollback did not reach the workflow; mirrored %v", rolled)
 	}
 
 	rec.Annotations = map[string]string{pgshardv1alpha1.AnnotationProceed: "switchWrites, complete"}
