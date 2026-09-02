@@ -8,9 +8,11 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
+	"github.com/andrew01234567890/pgshard/internal/grpccreds"
 )
 
 // AgentStatus is the operator's view of one member agent.
@@ -54,11 +56,27 @@ type AgentClient interface {
 type GRPCAgentClient struct {
 	mu    sync.Mutex
 	conns map[string]*grpc.ClientConn
+	// creds is what dial presents. Nil means plaintext, which is what an
+	// agent that has not been given GRPCTLS expects; the two have to agree,
+	// so this is set from the same material the agents are mounted.
+	creds credentials.TransportCredentials
 }
 
-// NewGRPCAgentClient builds a client that keeps its connections.
+// NewGRPCAgentClient builds a client that keeps its connections and dials
+// in plaintext, which is what an agent without GRPCTLS serves.
 func NewGRPCAgentClient() *GRPCAgentClient {
 	return &GRPCAgentClient{conns: map[string]*grpc.ClientConn{}}
+}
+
+// NewGRPCAgentClientTLS builds one that presents certFile/keyFile and
+// verifies the agent against caFile. serverName is the name the agents'
+// certificates carry; empty uses the dial address.
+func NewGRPCAgentClientTLS(certFile, keyFile, caFile, serverName string) (*GRPCAgentClient, error) {
+	creds, err := grpccreds.Dialer(certFile, keyFile, caFile, serverName, false)
+	if err != nil {
+		return nil, err
+	}
+	return &GRPCAgentClient{conns: map[string]*grpc.ClientConn{}, creds: creds}, nil
 }
 
 // Close drops every kept connection.
@@ -105,7 +123,11 @@ func (c *GRPCAgentClient) dial(ctx context.Context, addr string) (pgshardv1.Agen
 	conn, ok := c.conns[addr]
 	if !ok {
 		var err error
-		conn, err = grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		tc := c.creds
+		if tc == nil {
+			tc = insecure.NewCredentials()
+		}
+		conn, err = grpc.NewClient(addr, grpc.WithTransportCredentials(tc))
 		if err != nil {
 			c.mu.Unlock()
 			return nil, err
