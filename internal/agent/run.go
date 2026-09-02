@@ -17,6 +17,7 @@ import (
 
 	"github.com/andrew01234567890/pgshard/internal/agentauth"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
+	"github.com/andrew01234567890/pgshard/internal/grpccreds"
 	"github.com/andrew01234567890/pgshard/internal/metrics"
 )
 
@@ -190,7 +191,22 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 		}
 		return append(tokens, derived), nil
 	}
+	// Transport security is opt-in and off by default, because the callers
+	// (the operator and the controller) still dial plaintext -- turning it
+	// on here without them would make every agent unreachable. Configuring
+	// GRPCTLS is therefore a deliberate act, and grpccreds.Listener is the
+	// same hardened definition the pooler and controller listen with:
+	// client certificates required and verified against a named CA.
+	//
+	// Until it is configured the bearer token travels in clear, which is
+	// what PGS-235 and PGS-421 are about.
+	grpcCreds, err := grpccreds.Listener(cfg.GRPCTLS.CertFile, cfg.GRPCTLS.KeyFile, cfg.GRPCTLS.CAFile,
+		cfg.GRPCTLS.CertFile == "" && cfg.GRPCTLS.KeyFile == "" && cfg.GRPCTLS.CAFile == "")
+	if err != nil {
+		return fmt.Errorf("agent gRPC credentials: %w", err)
+	}
 	grpcSrv := grpc.NewServer(
+		grpc.Creds(grpcCreds),
 		grpc.UnaryInterceptor(agentauth.AnyOfUnaryServerInterceptor(agentTokens)),
 		grpc.StreamInterceptor(agentauth.AnyOfStreamServerInterceptor(agentTokens)),
 	)
