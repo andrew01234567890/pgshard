@@ -76,6 +76,28 @@ func (e *Executor) switchPart(ctx context.Context, target Shard) error {
 		err.Hint = "the shards take independent snapshots, so isolation is per shard and not across them; keep the transaction on one shard key, or use READ COMMITTED and serialise the invariant in the application"
 		return err
 	}
+	// This is the moment the transaction stops being something PostgreSQL
+	// can reason about on its own. Each shard runs its own backend and
+	// sees only its own wait edges, so from here a cycle can form that no
+	// local detector will ever find: T1 holds a row here and waits there
+	// while T2 holds there and waits here. deadlock_timeout does not help
+	// -- it decides when a server looks, not how long a wait may last.
+	//
+	// Bounding it here rather than on every statement keeps single-shard
+	// transactions on PostgreSQL's own detector, which sees the whole
+	// cycle, resolves it in milliseconds and reports 40P01. A timeout is
+	// strictly worse than that, so it is applied only where the detector
+	// has gone blind.
+	if len(e.parked) == 0 {
+		if sql := e.crossShardLockTimeoutSQL(); sql != "" {
+			// The shard already holding locks does not get the prelude
+			// again, so it is set directly; joiners replay the prelude.
+			if err := e.runOn(ctx, e.current(), sql, discardWriter{}); err != nil {
+				return err
+			}
+			e.txnPrelude = append(e.txnPrelude, sql)
+		}
+	}
 	if e.parked == nil {
 		e.parked = map[Shard]*txnPart{}
 	}
@@ -100,6 +122,25 @@ func (e *Executor) switchPart(ctx context.Context, target Shard) error {
 	}
 	e.conn, e.pinned, e.tx, e.wroteHere = nil, false, pgwire.TxIdle, false
 	return nil
+}
+
+// DefaultCrossShardLockTimeout bounds a lock wait once a transaction spans
+// shards. Generous on purpose: it is a backstop for a cycle no detector can
+// see, not a latency target, and a multi-shard transaction that has waited
+// this long on one row is already in trouble by any reading.
+const DefaultCrossShardLockTimeout = 30 * time.Second
+
+// crossShardLockTimeoutSQL is the statement that bounds the wait, or "" when
+// the operator has disabled it.
+func (e *Executor) crossShardLockTimeoutSQL() string {
+	d := e.r.cfg.CrossShardLockTimeout
+	if d < 0 {
+		return ""
+	}
+	if d == 0 {
+		d = DefaultCrossShardLockTimeout
+	}
+	return fmt.Sprintf("SET LOCAL lock_timeout = '%dms'", d.Milliseconds())
 }
 
 // current is the executor's active shard as a txnPart.

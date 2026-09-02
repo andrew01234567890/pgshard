@@ -811,3 +811,70 @@ func TestReadCommittedStillSpansShards(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestACrossShardTransactionBoundsItsLockWaits: each shard runs its own
+// backend, so its deadlock detector sees only its own wait edges. T1 can
+// hold a row on shard A and wait on B while T2 holds B and waits on A, and
+// neither server finds the cycle -- deadlock_timeout decides when a server
+// LOOKS, not how long a wait may last, so nothing ends it. The bound is
+// applied at the moment the transaction spans shards, so single-shard
+// transactions keep PostgreSQL's own detector and its 40P01.
+func TestACrossShardTransactionBoundsItsLockWaits(t *testing.T) {
+	h := newTxnHarness(t)
+	ctx := context.Background()
+	a, b := h.twoTenants(t)
+	conn := h.connect(t, h.dsn())
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 1)", a); err != nil {
+		t.Fatal(err)
+	}
+	first := h.shardOf(t, a)
+	if h.ranOn(first, "lock_timeout") {
+		t.Fatal("a single-shard transaction must keep PostgreSQL's own detector, which is faster and reports 40P01")
+	}
+	if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 2)", b); err != nil {
+		t.Fatal(err)
+	}
+	second := h.shardOf(t, b)
+	// The shard already holding locks is the one the detector cannot help,
+	// and it does not get the prelude again -- so it must be set directly.
+	if !h.ranOn(first, "set local lock_timeout") {
+		t.Errorf("the first shard never bounded its wait: %v", h.poolers[first].ran())
+	}
+	if !h.ranOn(second, "set local lock_timeout") {
+		t.Errorf("the joining shard never bounded its wait: %v", h.poolers[second].ran())
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A negative timeout restores the unbounded wait, for an operator who would
+// rather hang than have a legitimate contended wait aborted.
+func TestCrossShardLockWaitsCanBeLeftUnbounded(t *testing.T) {
+	log := &fakeDecisionLog{rows: map[string]string{}, fail: map[string]error{}}
+	h := newShardedHarnessWith(t, Config{Decisions: log, CrossShardLockTimeout: -1})
+	log.h = h
+	ctx := context.Background()
+	a, b := h.twoTenants(t)
+	conn := h.connect(t, h.dsn())
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 1)", a); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 2)", b); err != nil {
+		t.Fatal(err)
+	}
+	for _, shard := range []int{h.shardOf(t, a), h.shardOf(t, b)} {
+		if h.ranOn(shard, "lock_timeout") {
+			t.Errorf("a negative timeout must leave the wait unbounded; shard %d ran %v", shard, h.poolers[shard].ran())
+		}
+	}
+	_ = tx.Rollback(ctx)
+}

@@ -34,6 +34,12 @@ type Config struct {
 	Buffering Buffering
 	// Scatter bounds multi-shard reads; zero values pick defaults.
 	Scatter ScatterConfig
+	// CrossShardLockTimeout bounds a lock wait once a transaction spans
+	// shards. Each shard's deadlock detector sees only its own wait
+	// edges, so a cycle running across two of them is invisible to both
+	// and nothing ends it; this is what does. Zero picks the default,
+	// negative disables it and restores an unbounded wait.
+	CrossShardLockTimeout time.Duration
 	// Decisions is the durable log two-phase commit decides through; nil
 	// refuses transactions that write to more than one shard.
 	Decisions DecisionLog

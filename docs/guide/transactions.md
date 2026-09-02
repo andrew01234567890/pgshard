@@ -71,6 +71,12 @@ nothing goes on waiting.
 wait graph. Such a cycle is broken by a timeout, not by detection, and both
 transactions wait until it fires.
 
+The timeout is `lock_timeout`, set on every shard of a transaction at the
+moment it spans more than one — `--cross-shard-lock-timeout`, 30s by
+default, negative to leave the wait unbounded. It is deliberately not
+`deadlock_timeout`, which decides when a server *looks* for a cycle rather
+than how long a wait may last, and so cannot end one it never finds.
+
 What this means for an application:
 
 - A cross-shard deadlock costs the timeout in latency before either side

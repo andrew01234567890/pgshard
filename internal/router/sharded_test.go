@@ -79,7 +79,7 @@ func newShardedHarnessShards(t testing.TB, cfg Config, shards int) *shardedHarne
 	pl := NewPoolers(nil, h.snap, insecure.NewCredentials())
 	t.Cleanup(pl.Close)
 	sh := &shardedHarness{harness: h, poolers: poolers, snap: snap}
-	startHarness(t, h, Config{Snapshot: h.snap, Poolers: pl, Logger: slog.New(slog.DiscardHandler), Scatter: cfg.Scatter, Decisions: cfg.Decisions, Sequences: cfg.Sequences, Planner: cfg.Planner, Migrations: cfg.Migrations,
+	startHarness(t, h, Config{Snapshot: h.snap, Poolers: pl, Logger: slog.New(slog.DiscardHandler), Scatter: cfg.Scatter, Decisions: cfg.Decisions, CrossShardLockTimeout: cfg.CrossShardLockTimeout, Sequences: cfg.Sequences, Planner: cfg.Planner, Migrations: cfg.Migrations,
 		Buffering: Buffering{Window: 700 * time.Millisecond, Poll: 20 * time.Millisecond, PerShardCap: 2, Changes: h.subscribe}})
 	return sh
 }
