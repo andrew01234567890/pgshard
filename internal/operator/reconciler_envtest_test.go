@@ -106,6 +106,7 @@ type fakeProber struct {
 	bootstrapRoles   []string
 	migratedDSNs     []string
 	adoptedVerifiers []string
+	rollbacks        []string
 	// onRelease runs inside ReleaseCatalog, so a test can see what the
 	// cluster looked like at that point of the rollback.
 	onRelease func()
@@ -249,7 +250,12 @@ func (f *fakeProber) ReleaseCatalog(_ context.Context, dsn string) error {
 	return nil
 }
 
-func (f *fakeProber) SetWorkflowRollback(context.Context, string, string) error { return nil }
+func (f *fakeProber) SetWorkflowRollback(_ context.Context, _, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rollbacks = append(f.rollbacks, id)
+	return nil
+}
 
 func (f *fakeProber) SetReshardCutoverSpec(_ context.Context, _ string, id, pause string, proceed []string, retire int64) error {
 	f.mu.Lock()
