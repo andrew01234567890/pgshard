@@ -135,8 +135,19 @@ func (r Renderer) RouterDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.De
 						Ports: []corev1.ContainerPort{{Name: "postgres", ContainerPort: postgresPort}, {Name: "http", ContainerPort: routerHTTPPort},
 							{Name: "peer", ContainerPort: routerPeerPort},
 							{Name: "vstream", ContainerPort: routerVStreamPort}},
+						// /readyz, not a TCP dial on the postgres port. The
+						// listener accepts connections whatever the router
+						// can do with them: one whose catalog snapshot has
+						// gone stale refuses every statement and has already
+						// stopped being routable, and a TCP probe still
+						// passes. It then stays in the Service, keeps taking
+						// traffic it will only refuse, and holds RouterReady
+						// true. /readyz is the answer the router already
+						// computes -- Drainer.Ready, which is false without a
+						// fresh snapshot and through a drain.
 						ReadinessProbe: &corev1.Probe{
-							ProbeHandler:  corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString("postgres")}},
+							ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
+								Path: "/readyz", Port: intstr.FromString("http")}},
 							PeriodSeconds: 10,
 						},
 						Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")}},

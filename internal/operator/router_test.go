@@ -66,8 +66,16 @@ func TestRouterDeployment(t *testing.T) {
 	if ctr.Resources.Requests.Cpu().IsZero() {
 		t.Error("HPA on CPU needs a CPU request")
 	}
-	if ctr.ReadinessProbe == nil || ctr.ReadinessProbe.TCPSocket == nil || ctr.ReadinessProbe.TCPSocket.Port.String() != "postgres" {
-		t.Errorf("readiness %+v", ctr.ReadinessProbe)
+	// A TCP dial on the postgres port passes for a router that refuses every
+	// statement, so it would keep taking traffic and hold RouterReady true
+	// while serving nothing. /readyz is Drainer.Ready: false without a fresh
+	// catalog snapshot, and false through a drain.
+	rp := ctr.ReadinessProbe
+	if rp == nil || rp.HTTPGet == nil || rp.HTTPGet.Path != "/readyz" || rp.HTTPGet.Port.String() != "http" {
+		t.Errorf("readiness %+v", rp)
+	}
+	if rp != nil && rp.TCPSocket != nil {
+		t.Error("readiness still dials a port instead of asking the router whether it can serve")
 	}
 }
 

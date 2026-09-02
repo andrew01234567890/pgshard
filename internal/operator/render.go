@@ -261,7 +261,7 @@ func (Renderer) MemberNetworkPolicy(c *pgshardv1alpha1.PgShardCluster) *networki
 	}}
 	// Members only. The routers and the admin UI carry the cluster label
 	// too, and they are not members: a router serves clients on 5432 and
-	// has a TCP readiness probe on it, so selecting one would take the
+	// answers its readiness probe on 8080, so selecting one would take the
 	// cluster's front door off the network and then fail its probe.
 	members := metav1.LabelSelector{
 		MatchLabels:      map[string]string{LabelCluster: c.Name},
