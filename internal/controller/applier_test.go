@@ -228,7 +228,7 @@ type fakeConn struct {
 	superuser bool
 }
 
-func (c *fakeConn) Exec(_ context.Context, sql string, _ ...any) (pgconnTag, error) {
+func (c *fakeConn) Exec(_ context.Context, sql string, _ ...any) (CommandTag, error) {
 	c.f.mu.Lock()
 	if c.superuser {
 		c.f.super[c.id] = append(c.f.super[c.id], sql)

@@ -32,11 +32,16 @@ const DefaultPreparingTimeout = 10 * time.Second
 // see and finish prepared transactions.
 type ShardConn interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
-	Exec(ctx context.Context, sql string, args ...any) (pgconnTag, error)
+	Exec(ctx context.Context, sql string, args ...any) (CommandTag, error)
 	Close(ctx context.Context) error
 }
 
-type pgconnTag interface{ RowsAffected() int64 }
+// CommandTag is what Exec reports. It is named rather than pgconn.CommandTag
+// so a ShardConn can be implemented without pgconn, and exported because an
+// unexported return type cannot be named at all from another package: a
+// would-be implementation could not write the method signature, whatever it
+// was willing to depend on.
+type CommandTag interface{ RowsAffected() int64 }
 
 // ShardDialer opens a connection to a shard's primary.
 type ShardDialer interface {
@@ -608,6 +613,6 @@ func quoteConnValue(v string) string {
 
 type pgxShardConn struct{ *pgx.Conn }
 
-func (c pgxShardConn) Exec(ctx context.Context, sql string, args ...any) (pgconnTag, error) {
+func (c pgxShardConn) Exec(ctx context.Context, sql string, args ...any) (CommandTag, error) {
 	return c.Conn.Exec(ctx, sql, args...)
 }

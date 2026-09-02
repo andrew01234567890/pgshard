@@ -912,7 +912,7 @@ func CatalogDialer(pool *pgxpool.Pool) func(ctx context.Context) (ShardConn, err
 
 type poolShardConn struct{ *pgxpool.Conn }
 
-func (c poolShardConn) Exec(ctx context.Context, sql string, args ...any) (pgconnTag, error) {
+func (c poolShardConn) Exec(ctx context.Context, sql string, args ...any) (CommandTag, error) {
 	return c.Conn.Exec(ctx, sql, args...)
 }
 
