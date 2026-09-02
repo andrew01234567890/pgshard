@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -21,11 +19,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/andrew01234567890/pgshard/internal/cli"
 	"github.com/andrew01234567890/pgshard/internal/controller"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
+	"github.com/andrew01234567890/pgshard/internal/grpccreds"
 	pgmetrics "github.com/andrew01234567890/pgshard/internal/metrics"
 )
 
@@ -112,7 +110,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	var creds credentials.TransportCredentials
 	if *listen != "" {
 		var err error
-		if creds, err = listenerCredentials(*certFile, *keyFile, *caFile, *insecureDev); err != nil {
+		if creds, err = grpccreds.Listener(*certFile, *keyFile, *caFile, *insecureDev); err != nil {
 			fmt.Fprintf(stderr, "pgshard-controller run: %v\n", err)
 			return cli.ExitUsage
 		}
@@ -236,32 +234,6 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	g.Stop()
 	<-errc
 	return cli.ExitOK
-}
-
-func listenerCredentials(certFile, keyFile, caFile string, insecureDev bool) (credentials.TransportCredentials, error) {
-	if insecureDev {
-		if certFile != "" || keyFile != "" || caFile != "" {
-			return nil, errors.New("--insecure-dev cannot be combined with TLS flags")
-		}
-		return insecure.NewCredentials(), nil
-	}
-	if certFile == "" || keyFile == "" || caFile == "" {
-		return nil, errors.New("--tls-cert, --tls-key and --tls-ca are required (or --insecure-dev)")
-	}
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, err
-	}
-	pem, err := os.ReadFile(caFile)
-	if err != nil {
-		return nil, err
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		return nil, fmt.Errorf("%s: no certificates found", caFile)
-	}
-	return credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}, ClientCAs: pool,
-		ClientAuth: tls.RequireAndVerifyClientCert, MinVersion: tls.VersionTLS13}), nil
 }
 
 // shardConnInfo renders the connection string of one shard database: an
