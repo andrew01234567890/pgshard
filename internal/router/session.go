@@ -1736,10 +1736,24 @@ func (e *Executor) replayStatements(ctx context.Context, skip map[string]bool) e
 }
 
 func (e *Executor) send(req *pgshardv1.ExecuteRequest) error {
-	if err := e.conn.send(req, e.sid, e.generation(), e.ident, e.info.Database); err != nil {
+	if err := e.conn.send(req, e.sid, e.generation(), e.ident, e.backendDatabase()); err != nil {
 		return e.poolerLost(err)
 	}
 	return nil
+}
+
+// backendDatabase is the database the pooler opens a backend on, which is
+// not always the one the client named. The catalog is a SCHEMA inside an
+// ordinary database, so `dbname=pgshard` -- the name the guide documents and
+// the only way to edit the desired-state tables -- has no database of that
+// name behind it, and asking for one gets PostgreSQL's 3D000. Planning still
+// uses the client's name: it is the logical database, and only the backend
+// needs the physical one.
+func (e *Executor) backendDatabase() string {
+	if e.catalogSession() {
+		return e.r.cfg.CatalogPhysicalDatabase
+	}
+	return e.info.Database
 }
 
 // poolerLost drops the stream and reports 08006; the next statement
