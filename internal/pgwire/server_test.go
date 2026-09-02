@@ -1020,11 +1020,11 @@ func TestPlaintextStartupAllowedByTheDevelopmentOptOut(t *testing.T) {
 	}
 }
 
-// TestTerminateUserEndsOnlyThatRolesSessions: revoking a role has to reach
+// TestTerminateWhereEndsOnlyThatRolesSessions: revoking a role has to reach
 // the sessions it already holds, including one sitting inside an open
 // transaction - which is exactly where a client that just lost its access
 // would sit - and must not disturb anyone else's.
-func TestTerminateUserEndsOnlyThatRolesSessions(t *testing.T) {
+func TestTerminateWhereEndsOnlyThatRolesSessions(t *testing.T) {
 	ts := startServer(t, Config{})
 	revoked := dialRaw(t, ts.addr)
 	if res := revoked.startupAs(ProtocolVersion30, "revoked"); res.ready == nil {
@@ -1042,7 +1042,7 @@ func TestTerminateUserEndsOnlyThatRolesSessions(t *testing.T) {
 	if res := kept.startupAs(ProtocolVersion30, "kept"); res.ready == nil {
 		t.Fatalf("startup: %+v", res)
 	}
-	if n := ts.TerminateUser("revoked"); n != 2 {
+	if n := ts.TerminateWhere(func(u string) bool { return u == "revoked" }); n != 2 {
 		t.Fatalf("terminated %d sessions, want 2", n)
 	}
 	// Both revoked sessions must receive a FATAL and then end.
@@ -1097,7 +1097,7 @@ func TestRevokingASessionStopsAnExtendedProtocolBatch(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the batch never reached Sync")
 	}
-	if n := ts.TerminateUser("revoked"); n != 1 {
+	if n := ts.TerminateWhere(func(u string) bool { return u == "revoked" }); n != 1 {
 		t.Fatalf("terminated %d sessions, want 1", n)
 	}
 	// The batch must be cancelled and the connection ended, not waited on.
@@ -1155,7 +1155,7 @@ func TestOneStalledClientDoesNotDelayRevokingTheRest(t *testing.T) {
 		t.Fatal("the batch never reached Sync")
 	}
 
-	if n := ts.TerminateUser("revoked"); n != 2 {
+	if n := ts.TerminateWhere(func(u string) bool { return u == "revoked" }); n != 2 {
 		t.Fatalf("terminated %d sessions, want 2", n)
 	}
 	// Whatever order the sweep took, the running batch was cancelled.
@@ -1237,7 +1237,7 @@ func TestRevocationInTheExecutorInstallGap(t *testing.T) {
 	// The session is registered and its role is known, but its executor is
 	// not installed yet: this is the gap.
 	<-building
-	if n := ts.TerminateUser("revoked"); n != 1 {
+	if n := ts.TerminateWhere(func(u string) bool { return u == "revoked" }); n != 1 {
 		t.Fatalf("revoked %d sessions in the install gap, want 1", n)
 	}
 	close(release)
@@ -1480,7 +1480,7 @@ func TestARevocationDuringAuthenticationReportsTheRevocation(t *testing.T) {
 	c.rawStartup(ProtocolVersion30, map[string]string{"user": "revoked", "database": "db"})
 
 	<-auth.reached
-	if n := ts.TerminateUser("revoked"); n != 1 {
+	if n := ts.TerminateWhere(func(u string) bool { return u == "revoked" }); n != 1 {
 		t.Fatalf("terminated %d sessions, want the one still authenticating", n)
 	}
 	close(auth.release)
