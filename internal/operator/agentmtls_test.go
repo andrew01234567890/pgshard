@@ -19,8 +19,10 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/grpccreds"
+	corev1 "k8s.io/api/core/v1"
 )
 
 // TestTheOperatorCanReachAnAgentThatRequiresMTLS: the agent gained the
@@ -152,4 +154,37 @@ func writeAgentFile(t *testing.T, dir, name string, b []byte) string {
 		t.Fatal(err)
 	}
 	return p
+}
+
+// TestTheAgentHoldsItsTLSMaterialBeforeItNeedsIt: every way of staging the
+// switch to agent mTLS needs the certificates present on every member
+// before anything requires them, because members restart one at a time and
+// an agent serving plaintext while the operator dials TLS is unreachable.
+// Mounting is therefore separate from, and earlier than, requiring.
+func TestTheAgentHoldsItsTLSMaterialBeforeItNeedsIt(t *testing.T) {
+	withTLS := &pgshardv1alpha1.PgShardCluster{}
+	withTLS.Spec.InternalTLS.SecretRef = &corev1.LocalObjectReference{Name: "internal-tls"}
+
+	if has(agentMounts(withTLS), internalTLSVolume) != true {
+		t.Error("a cluster with internal TLS must mount it into the agent, so a later switch has something to use")
+	}
+	if has(agentMounts(&pgshardv1alpha1.PgShardCluster{}), internalTLSVolume) {
+		t.Error("a cluster without internal TLS must not mount a volume the pod does not carry")
+	}
+	// The mount alone must not turn it on: the agent serves plaintext until
+	// GRPCTLS is set, which is what keeps this change inert.
+	for _, m := range agentMounts(withTLS) {
+		if m.Name == internalTLSVolume && !m.ReadOnly {
+			t.Error("the agent's copy of the material must be read-only")
+		}
+	}
+}
+
+func has(mounts []corev1.VolumeMount, name string) bool {
+	for _, m := range mounts {
+		if m.Name == name {
+			return true
+		}
+	}
+	return false
 }

@@ -519,13 +519,7 @@ func (Renderer) Pod(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, rol
 				StartupProbe:   httpProbe("/startz", 5, 120),
 				ReadinessProbe: httpProbe("/readyz", 5, 1),
 				LivenessProbe:  httpProbe("/livez", 10, 3),
-				VolumeMounts: []corev1.VolumeMount{
-					{Name: "data", MountPath: dataMountPath},
-					{Name: "config", MountPath: configMountPath, ReadOnly: true},
-					{Name: "secret", MountPath: secretMountPath, ReadOnly: true},
-					{Name: agentTokenVolume, MountPath: agentTokenDir, ReadOnly: true},
-					{Name: "pg-socket", MountPath: pgSocketDir},
-				},
+				VolumeMounts:   agentMounts(c),
 			}, poolerSidecar(c, g)},
 			Volumes: []corev1.Volume{
 				{Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvc}}},
@@ -659,6 +653,26 @@ func internalTLSDataChecksum(data map[string][]byte) string {
 		h.Write([]byte{0})
 	}
 	return hex.EncodeToString(h.Sum(nil)[:8])
+}
+
+// agentMounts is what the agent container sees. The internal-TLS material
+// is mounted whenever the cluster has any, even though the agent does not
+// yet serve mTLS with it: every way of staging that switch needs the
+// certificates present on every member BEFORE anything requires them, and
+// members restart one at a time. Mounting first and requiring later is the
+// only order that does not take a control plane offline mid-roll (PGS-236).
+func agentMounts(c *pgshardv1alpha1.PgShardCluster) []corev1.VolumeMount {
+	mounts := []corev1.VolumeMount{
+		{Name: "data", MountPath: dataMountPath},
+		{Name: "config", MountPath: configMountPath, ReadOnly: true},
+		{Name: "secret", MountPath: secretMountPath, ReadOnly: true},
+		{Name: agentTokenVolume, MountPath: agentTokenDir, ReadOnly: true},
+		{Name: "pg-socket", MountPath: pgSocketDir},
+	}
+	if internalTLSRef(c) != nil {
+		mounts = append(mounts, corev1.VolumeMount{Name: internalTLSVolume, MountPath: internalTLSMountPath, ReadOnly: true})
+	}
+	return mounts
 }
 
 // internalTLSRef returns the router/pooler mTLS secret reference, if any.
