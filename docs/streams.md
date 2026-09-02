@@ -132,9 +132,29 @@ it forwards `VStream.Create`/`Drop` to the controller (`--controller`).
 
 In an operator-deployed cluster both are set for you: the routers listen on
 `9091`, published by the router Service as the `vstream` port, and point at
-the cluster's controller Service. Consumers dial the router Service.
+the cluster's controller Service. Consumers dial the router Service, which
 serves `pgshard.v1.VStream` with the router↔pooler mTLS material
 (`--pooler-tls-*`, or plaintext with `--insecure-dev`).
+
+### What `pgshard.v1` does and does not promise
+
+The wire contract is `pgshard.v1.VStream`, and a consumer reaches it the way
+the `grpcurl` examples below do, or by generating stubs from `proto/` in its
+own build. That path is supported.
+
+What is **not** available is importing pgshard's own generated Go stubs: their
+`go_package` is `internal/gen/pgshard/v1`, and the Go toolchain forbids another
+module from importing an `internal` path. A Go consumer generates its own from
+the `.proto` files.
+
+The `v1` in the protobuf package is not a stability guarantee. The Kubernetes
+API is `v1alpha1` deliberately, and this service is at the same maturity — the
+package name predates the question rather than answering it. Whether these
+services become a published consumer contract (a publicly importable package
+and a compatibility policy) or are declared private with a separate versioned
+consumer API is an open decision, tracked as PGS-394. Until it is made, treat
+method paths and message shapes as able to change, and pin the commit you
+generated from.
 
 - `Create(stream, database, two_phase)`, `Drop(stream)`: forwarded to the
   controller (`UNIMPLEMENTED` without `--controller`). `List` reads

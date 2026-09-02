@@ -88,6 +88,7 @@ tests are authoritative.
 | Pooler `Stream`/`Ack`/`CopyTables` | Implemented | `internal/pooler` |
 | VStream: merged positioned stream over all shards, VGtid resume, two-phase events, failover continuity | Implemented | `internal/router/vstream` |
 | Initial copy (exported snapshots, per-table checkpoints, kill-resume) | Implemented | `TestRouterVStreamInitialCopy` |
+| Consumer contract: publicly importable stubs and a compatibility policy | Planned | the wire service `pgshard.v1.VStream` works and can be consumed by generating stubs from `proto/`, but pgshard's own generated Go stubs are under `internal/gen`, which another module cannot import, and the `v1` in the protobuf package is not a stability guarantee while the Kubernetes API is `v1alpha1` ([streams.md](streams.md), PGS-394) |
 | Reshard journal events (`Error{RESHARDED}` / `Journal`) | Partial | the cutover writes journal rows (`pgshard.resharding_journal`, `cutoverpg.go`); the stream still synthesises its event from the shard-map generation change and its own participant list (`vstream/merge.go`) rather than reading those rows |
 
 ## Resharding and upgrades
