@@ -95,6 +95,7 @@ tests are authoritative.
 
 | Capability | Status | Where |
 |---|---|---|
+| In-place range edit on the SERVING set drives a reshard | Planned | the edit commits and records a `pending` workflow, but nothing transitions it to `running`, so no data moves; `spec.shards` is the working path ([resharding.md](guide/resharding.md), PGS-508) |
 | Shard-range and re-key edits detected; `reshard`/`table_rekey` workflows recorded; pause/resume RPCs | Implemented | `internal/controller/reconcile.go`, `internal/controller/placement.go` |
 | Data movement, traffic switch, reverse replication, old-group retirement | Implemented | `internal/controller/copy.go` (`Copier.Pass`), `cutover.go`, `cutoverpg.go`; e2e `reshard`, `reshard-split`, `reshard-merge` under write load |
 | `PgShardReshard` CRD and `spec.resharding.*` knobs | Implemented | `ClusterReconciler.reconcileReshard` provisions and retires target sets; `pauseBefore`/`proceed` gate the cutover ([resharding.md](resharding.md)) |

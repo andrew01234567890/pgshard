@@ -17,11 +17,21 @@
 
 Resharding is declared, not scripted:
 
-- **Change the shard count**: edit `spec.shards` on the `PgShardCluster`, or
-  edit `pgshard.shard_ranges` directly — splits and merges as SQL in one
-  transaction. (`PgShardReshard` is not a request: the operator creates one
-  per pending set as the record of a reshard it is already running. Creating
-  one yourself starts nothing.)
+- **Change the shard count**: edit `spec.shards` on the `PgShardCluster`.
+  (`PgShardReshard` is not a request: the operator creates one per pending
+  set as the record of a reshard it is already running. Creating one
+  yourself starts nothing.)
+
+> **Editing the serving set's ranges does not reshard it yet.** The SQL
+> below is the shape the catalog accepts, and the edit commits — but a range
+> change on a set that is already `serving` records a workflow in `pending`
+> and nothing drives it out of that state. The copier only picks up
+> workflows in `running` (`internal/controller/copy.go`), and the only
+> transition into `running` is for a set that went `desired` →
+> `provisioning` (`internal/controller/reshard.go`), which is what
+> `spec.shards` produces and an in-place edit does not. The rows stay in
+> `pgshard.workflows`; `CancelWorkflow` clears them. Tracked as PGS-508.
+> Use `spec.shards` to change the shard count today.
 
 ```sql
 BEGIN;
