@@ -94,3 +94,61 @@ func TestCutoverRefusesACatalogItCannotRepair(t *testing.T) {
 		t.Fatalf("error %q does not say the target is unreadable and why", err)
 	}
 }
+
+// TestTheNewCatalogCanStillDeclareAShardedTable: the seeded rows the copy
+// leaves behind are not all equally loud. shard_map_generation stops every
+// router at once and is impossible to miss; hash_versions stops nothing --
+// until somebody declares a sharded table, because pgshard.tables.hash_version
+// is a FOREIGN KEY onto it. An upgrade would look entirely successful and the
+// failure would arrive days later, attached to an unrelated action.
+//
+// So this asserts the user-visible property rather than the row: after a
+// cutover, the new catalog can still do the thing the old one could.
+func TestTheNewCatalogCanStillDeclareAShardedTable(t *testing.T) {
+	ctx := context.Background()
+	src, tgt := startCatalogPair(t, "ghcr.io/andrew01234567890/pgshard-postgres:18")
+	for _, n := range []catalogNode{src, tgt} {
+		conn := dialCatalog(t, n.side.DSN)
+		err := catalog.Migrate(ctx, conn)
+		_ = conn.Close(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	execOn(t, src.side.DSN, `INSERT INTO pgshard.databases (name) VALUES ('app')`)
+
+	p := PgxProber{}
+	if err := p.EnsureCatalogCopy(ctx, src.side, tgt.side); err != nil {
+		t.Fatalf("ensure copy: %v", err)
+	}
+	waitCatalogRow(t, tgt.side.DSN, "app", "the copy never reached the target")
+	for deadline := time.Now().Add(60 * time.Second); ; {
+		ok, _, err := p.CatalogCopyCaughtUp(ctx, src.side.DSN)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the copy never reported caught up")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	// What clearCatalogSchema leaves behind when the copy does not deliver
+	// them: both seeded tables empty.
+	execOn(t, tgt.side.DSN, `DELETE FROM pgshard.shard_map_generation`)
+	execOn(t, tgt.side.DSN, `DELETE FROM pgshard.hash_versions`)
+
+	if err := p.CutoverCatalog(ctx, src.side, tgt.side); err != nil {
+		t.Fatalf("cutover: %v", err)
+	}
+	// The declaration a sharded table needs. Without hash_versions this is
+	// a foreign key violation, and nothing before this point would have
+	// said so.
+	execOn(t, tgt.side.DSN, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key)
+		VALUES ('app', 'public', 'orders', 'sharded', 'tenant_id')`)
+	if n := queryOn[int64](t, tgt.side.DSN, `SELECT count(*) FROM pgshard.hash_versions`); n == 0 {
+		t.Error("the new catalog has no hash versions; every sharded table declaration would fail its foreign key")
+	}
+}

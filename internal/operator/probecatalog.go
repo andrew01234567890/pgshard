@@ -339,6 +339,9 @@ func (p PgxProber) CutoverCatalog(ctx context.Context, source, target CatalogSid
 	if err := carryShardMapGeneration(ctx, src, tgt); err != nil {
 		return err
 	}
+	if err := carryHashVersions(ctx, src, tgt); err != nil {
+		return err
+	}
 	if err := catalogTargetIsReadable(ctx, tgt); err != nil {
 		return err
 	}
@@ -392,6 +395,41 @@ func carryShardMapGeneration(ctx context.Context, src, tgt *pgx.Conn) error {
 		 VALUES (true, $1, $2, $3, $4) ON CONFLICT (singleton) DO NOTHING`,
 		generation, fence, reason, owner); err != nil {
 		return fmt.Errorf("restore shard map generation on the catalog target: %w", err)
+	}
+	return nil
+}
+
+// carryHashVersions restores the target's hash_versions rows, for the same
+// reason carryShardMapGeneration restores the generation: the rows are
+// seeded by the schema migration (0001_roles_and_schema.sql) and
+// clearCatalogSchema TRUNCATEs them off the target before the copy.
+//
+// This one bites later rather than immediately. pgshard.tables.hash_version
+// is a FOREIGN KEY onto it, so a new catalog missing the row does not fail
+// on its own -- it fails the next time anybody declares a sharded table,
+// which is long after the upgrade looked successful.
+//
+// Repair, not overwrite: rows the target already has are kept, and a
+// version the source does not know about is left alone rather than deleted.
+func carryHashVersions(ctx context.Context, src, tgt *pgx.Conn) error {
+	rows, err := src.Query(ctx, `SELECT version, description FROM pgshard.hash_versions ORDER BY version`)
+	if err != nil {
+		return fmt.Errorf("read hash versions from the catalog source: %w", err)
+	}
+	type hashVersion struct {
+		Version     int32
+		Description string
+	}
+	versions, err := pgx.CollectRows(rows, pgx.RowToStructByPos[hashVersion])
+	if err != nil {
+		return fmt.Errorf("read hash versions from the catalog source: %w", err)
+	}
+	for _, v := range versions {
+		if _, err := tgt.Exec(ctx,
+			`INSERT INTO pgshard.hash_versions (version, description) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING`,
+			v.Version, v.Description); err != nil {
+			return fmt.Errorf("restore hash version %d on the catalog target: %w", v.Version, err)
+		}
 	}
 	return nil
 }
