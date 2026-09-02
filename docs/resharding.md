@@ -22,6 +22,34 @@ generation of the map:
 | `provisioning` | The controller opened the reshard workflow; the operator is bringing the target groups up. |
 | `retired` | A former serving set kept until `spec.resharding.retireOldGroupsAfter` elapses. |
 
+### One cluster is one keyspace
+
+A shard set is a **generation of one cluster-wide map**, not an independent
+routing domain. `Snapshot.ServingShardSet()` returns a single value for the
+whole snapshot, so every database in a cluster is routed by the same serving
+set and moves to a new one together.
+
+That is a deliberate model, and it has a consequence worth stating plainly:
+a reshard's write fence is **cluster-wide for its flip window**.
+`Snapshot.Migrating()` reports whether *any* shard of the serving set is
+fenced, and `internal/router/fence.go` holds new writes on that answer, so
+databases that are not being resharded are held for the same window as the
+one that is. The hold is bounded by the cutover pause (measured in
+[the cutover section](#cutover)), not by the copy, which is why the model is
+workable — but it is not isolation.
+
+Isolation between unrelated workloads is therefore **a separate
+`PgShardCluster`**, not a boundary inside one. Vitess models several
+keyspaces per installation, each with its own sharding, traffic policy and
+workflow scope; pgshard does not, and one installation is the unit that
+reshards, upgrades and fences together. If you need one database to reshard
+without touching another's write path, run two clusters.
+
+Placement workflows are the exception that shows the rule: `TableMigrating`
+fences only the tables under a placement change, so a re-key holds writes for
+its own tables rather than the cluster (PGS-485 tracks whether the keyspace
+boundary should become first class).
+
 The catalog table is the source of truth. Two things write pending sets:
 
 1. `PgShardCluster.spec.shards`. When it differs from the serving shard

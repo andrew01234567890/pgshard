@@ -101,6 +101,7 @@ tests are authoritative.
 | Table placement changes (unsharded ↔ sharded, → reference, re-key) | Implemented | `internal/controller/placement.go`, `placementpg.go`; shadow build, catch-up, table-scoped swap |
 | Major upgrade 18→19, online (blue/green via logical replication) | Implemented | triggered by a `spec.postgresql.major` change; `internal/controller/upgrade.go`, `internal/operator/catalogupgrade.go`; e2e `upgrade` on 18→19 ([upgrade.md](upgrade.md)) |
 | Major upgrade, offline (`pg_upgrade --link`) | Planned | the online strategy is the only one implemented |
+| Independent keyspaces within one cluster | Not planned | a shard set is a generation of one cluster-wide map, so every database shares the serving generation and a reshard's flip fences writes cluster-wide for its cutover window; isolation between unrelated workloads is a separate `PgShardCluster` ([resharding.md](resharding.md#one-cluster-is-one-keyspace), PGS-485) |
 
 ## Observability and operations
 
