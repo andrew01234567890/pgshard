@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
+	"github.com/andrew01234567890/pgshard/internal/grpccreds"
 )
 
 type testCA struct {
@@ -93,7 +94,7 @@ func TestPoolerListenerRejectsNonMTLSPeers(t *testing.T) {
 	srvCert, srvKey := ca.issue(t, "pooler", 2)
 	cliCert, cliKey := ca.issue(t, "router", 3)
 	caFile := writeFile(t, dir, "ca.crt", ca.pem)
-	creds, err := listenerCredentials(writeFile(t, dir, "tls.crt", srvCert), writeFile(t, dir, "tls.key", srvKey), caFile, false)
+	creds, err := grpccreds.Listener(writeFile(t, dir, "tls.crt", srvCert), writeFile(t, dir, "tls.key", srvKey), caFile, false)
 	if err != nil {
 		t.Fatal(err)
 	}

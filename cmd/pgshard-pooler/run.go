@@ -19,13 +19,12 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 	"github.com/andrew01234567890/pgshard/internal/cli"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
+	"github.com/andrew01234567890/pgshard/internal/grpccreds"
 	"github.com/andrew01234567890/pgshard/internal/metrics"
 	"github.com/andrew01234567890/pgshard/internal/pooler"
 	"github.com/andrew01234567890/pgshard/internal/pprofserve"
@@ -79,7 +78,7 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		fmt.Fprintf(stderr, "pgshard-pooler run: unexpected argument %q\n", fs.Arg(0))
 		return cli.ExitUsage
 	}
-	creds, err := listenerCredentials(*certFile, *keyFile, *caFile, *insecureDev)
+	creds, err := grpccreds.Listener(*certFile, *keyFile, *caFile, *insecureDev)
 	if err != nil {
 		fmt.Fprintf(stderr, "pgshard-pooler run: %v\n", err)
 		return cli.ExitUsage
@@ -237,32 +236,6 @@ func backendTLSConfig(mode, rootCert, host string) (*tls.Config, error) {
 		return &tls.Config{RootCAs: pool, ServerName: host, MinVersion: tls.VersionTLS12}, nil
 	}
 	return nil, fmt.Errorf("--pg-sslmode %q: want disable, require or verify-full", mode)
-}
-
-func listenerCredentials(certFile, keyFile, caFile string, insecureDev bool) (credentials.TransportCredentials, error) {
-	if insecureDev {
-		if certFile != "" || keyFile != "" || caFile != "" {
-			return nil, errors.New("--insecure-dev cannot be combined with TLS flags")
-		}
-		return insecure.NewCredentials(), nil
-	}
-	if certFile == "" || keyFile == "" || caFile == "" {
-		return nil, errors.New("--tls-cert, --tls-key and --tls-ca are required (or --insecure-dev)")
-	}
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, err
-	}
-	pem, err := os.ReadFile(caFile)
-	if err != nil {
-		return nil, err
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		return nil, fmt.Errorf("%s: no certificates found", caFile)
-	}
-	return credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}, ClientCAs: pool,
-		ClientAuth: tls.RequireAndVerifyClientCert, MinVersion: tls.VersionTLS13}), nil
 }
 
 // withPasswordFile adds the password in path to a libpq keyword/value DSN.
