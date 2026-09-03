@@ -136,6 +136,10 @@ type groupObservation struct {
 	// A group with two members on one node has fewer failure domains than
 	// replicas, whatever the replica count says.
 	nodes []string
+	// primaryAgentMTLS is whether the primary's agent was STARTED requiring
+	// mutual TLS. Published to the catalog for the controller, which dials
+	// this shard's primary and cannot read pod annotations itself.
+	primaryAgentMTLS bool
 	// primaryBuild is what the primary's agent says it is. Only the
 	// primary's: that is the one Status call this pass already makes, and
 	// asking every member would be an RPC per member per reconcile for
@@ -656,6 +660,9 @@ func (r *ClusterReconciler) loadState(ctx context.Context, c *pgshardv1alpha1.Pg
 			st.pvcs[m.Name] = m.PVC
 		}
 	}
+	if err := r.recoverPVCs(ctx, c, g, pg, st); err != nil {
+		return groupState{}, err
+	}
 	// A designated primary outside the member set is not an oracle to be
 	// obeyed: scaling replicasPerShard below the ordinal of a primary that a
 	// failover promoted leaves status.primary naming a member that no longer
@@ -691,6 +698,87 @@ func (r *ClusterReconciler) loadState(ctx context.Context, c *pgshardv1alpha1.Pg
 		}
 	}
 	return st, nil
+}
+
+// recoverPVCs fills in the claim of any member whose status did not name
+// one, by reading what that member's pod actually mounts.
+//
+// The default is the claim named after the member, and after a storage
+// rebuild that is the wrong one: the rebuilt claim gains a -v<n> suffix,
+// so a group that lost its status would mount the pre-rebuild volume -
+// the old storage class, and data as stale as the rebuild is old. The
+// running pod is the authority on where its data directory is, which is
+// exactly the evidence status was standing in for.
+func (r *ClusterReconciler) recoverPVCs(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, pg *pgshardv1alpha1.PgShardGroup, st groupState) error {
+	known := map[string]bool{}
+	for _, m := range pg.Status.Members {
+		if m.PVC != "" {
+			known[m.Name] = true
+		}
+	}
+	var claimed corev1.PersistentVolumeClaimList
+	if err := r.List(ctx, &claimed, client.InNamespace(c.Namespace),
+		client.MatchingLabels{LabelCluster: c.Name, LabelGroup: g.Name()}); err != nil {
+		return err
+	}
+	for _, name := range g.MemberNames() {
+		if known[name] {
+			continue
+		}
+		var pod corev1.Pod
+		err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: name}, &pod)
+		if err == nil {
+			if claim := dataClaim(&pod); claim != "" {
+				st.pvcs[name] = claim
+				continue
+			}
+		} else if !apierrors.IsNotFound(err) {
+			return err
+		}
+		// No pod to ask. The claims themselves say which volumes the
+		// member has had; rebuilds only ever move forward, so the newest
+		// is the one holding its data.
+		if claim := newestClaim(claimed.Items, name); claim != "" {
+			st.pvcs[name] = claim
+		}
+	}
+	return nil
+}
+
+// newestClaim is the member's most recent claim: rebuilds rename forward,
+// member then member-v2 then member-v3, so the highest suffix is the last
+// one the member was rebuilt onto.
+func newestClaim(claims []corev1.PersistentVolumeClaim, member string) string {
+	best, bestV := "", -1
+	for _, pvc := range claims {
+		if pvc.Labels[LabelMember] != member {
+			continue
+		}
+		v := 1
+		if rest, ok := strings.CutPrefix(pvc.Name, member+"-v"); ok {
+			n, err := strconv.Atoi(rest)
+			if err != nil {
+				continue
+			}
+			v = n
+		} else if pvc.Name != member {
+			continue
+		}
+		if v > bestV {
+			best, bestV = pvc.Name, v
+		}
+	}
+	return best
+}
+
+// dataClaim is the claim a member's pod mounts as its data directory.
+func dataClaim(pod *corev1.Pod) string {
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == "data" && v.PersistentVolumeClaim != nil {
+			return v.PersistentVolumeClaim.ClaimName
+		}
+	}
+	return ""
 }
 
 func (r *ClusterReconciler) ensureConfigMap(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, primary string, tuning pgtune.Settings, pol *pgshardv1alpha1.PgShardBackupPolicy, repoReady bool) error {
@@ -790,6 +878,11 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 		stErr = errors.New("pod has no IP yet")
 	}
 	obs.primaryBuild = st.Build
+	// Taken from the pod, not the spec: the controller dials this shard's
+	// primary and cannot see pods, so the catalog has to carry what this
+	// member is RUNNING rather than what the cluster now asks for.
+	obs.primaryAgentMTLS = primary.pod != nil && primary.pod.Annotations[AnnotationAgentMTLS] == "true"
+
 	healthy := primaryHealthy(primary.pod, primary.ready, st, stErr)
 	unhealthyFor := r.unhealthyFor(g.Prefix(), !healthy)
 	if !healthy {
@@ -1199,7 +1292,8 @@ func (r *ClusterReconciler) publishShardStatus(ctx context.Context, c *pgshardv1
 	cond := metav1.Condition{Type: ConditionCatalogReady, Status: metav1.ConditionTrue, Reason: "Migrated", Message: "catalog schema is current", ObservedGeneration: c.Generation}
 	rows := make([]ShardStatus, len(shards))
 	for i, o := range shards {
-		rows[i] = ShardStatus{Group: o.group, Epoch: o.state.epoch, Endpoint: r.memberEndpoint(c, o.group, o.state.primary)}
+		rows[i] = ShardStatus{Group: o.group, Epoch: o.state.epoch,
+			Endpoint: r.memberEndpoint(c, o.group, o.state.primary), AgentMTLS: o.primaryAgentMTLS}
 	}
 	if err := r.Prober.PublishShardStatus(ctx, dsn, rows); err != nil {
 		cond.Status = metav1.ConditionFalse
