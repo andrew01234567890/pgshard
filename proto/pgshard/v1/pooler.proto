@@ -129,6 +129,13 @@ message Close {
 message Sync {}
 
 // CopyData carries one chunk of COPY payload in either direction.
+// DataRows is several rows in one message. The pooler coalesces rows until
+// a byte cap or until a message that is not a row has to go out, so the
+// rows a client sees still arrive in order and still arrive before whatever
+// followed them.
+message DataRows {
+  repeated DataRow rows = 1;
+}
 message CopyData {
   // Raw COPY bytes.
   bytes data = 1;
@@ -169,6 +176,12 @@ message ExecuteRequest {
   // the field ignores it and answers the old way, and a pooler that has
   // it never packs unless asked, so the two can be rolled independently.
   bool packed_rows = 5;
+  // BatchedRows asks for rows in DataRows rather than one DataRow message
+  // each. A message per row made a scatter cost a socket write and a
+  // goroutine wake per row; a batch makes it cost one per flush. Asked for
+  // the same way packed_rows is, so a pooler that predates the field
+  // answers the old way and the two roll independently.
+  bool batched_rows = 6;
   // Exactly one pgwire-shaped message.
   oneof message {
     SimpleQuery simple_query = 10;
@@ -341,6 +354,7 @@ message ExecuteResponse {
     NotificationResponse notification = 26;
     PortalSuspended portal_suspended = 27;
     FlushComplete flush_complete = 28;
+    DataRows data_rows = 29;
   }
 }
 

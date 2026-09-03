@@ -62,6 +62,17 @@ func responseBytes(m *pgshardv1.ExecuteResponse) int {
 			n += len(c.GetData())
 		}
 		return n
+	case *pgshardv1.ExecuteResponse_DataRows:
+		n := 0
+		for _, r := range x.DataRows.GetRows() {
+			for _, v := range r.GetPacked() {
+				n += len(v)
+			}
+			for _, c := range r.GetColumns() {
+				n += len(c.GetData())
+			}
+		}
+		return n
 	case *pgshardv1.ExecuteResponse_CopyData:
 		return len(x.CopyData.GetData())
 	}
@@ -126,6 +137,10 @@ func (ps *poolerStream) send(req *pgshardv1.ExecuteRequest, sid string, gen *pgs
 	// column on either side, and a pooler that predates the field ignores
 	// it and answers the old way, which the router still reads.
 	req.PackedRows = true
+	// Always, for the same reason: a pooler that predates the field
+	// ignores it and answers a message per row, which the router still
+	// reads.
+	req.BatchedRows = true
 	if ps.first {
 		req.User = ident
 		req.Database = database

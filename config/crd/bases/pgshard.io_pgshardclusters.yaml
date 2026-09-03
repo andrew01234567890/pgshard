@@ -1656,6 +1656,15 @@ spec:
           status:
             description: PgShardClusterStatus is the observed state of a PgShardCluster.
             properties:
+              appliedShards:
+                description: |-
+                  AppliedShards is the spec.shards value the operator last acted on.
+                  It is what tells a spec the user changed apart from a catalog that
+                  moved on its own: spec.shards differing from effectiveShards means
+                  a reshard only when this differs from spec.shards too. Without it
+                  the operator resharded straight back after every shard set created
+                  through SQL.
+                type: integer
               catalogGeneration:
                 description: |-
                   CatalogGeneration names the active catalog group (catalog for 0 or
