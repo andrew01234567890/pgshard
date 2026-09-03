@@ -24,6 +24,7 @@ import (
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/grpccreds"
+	"github.com/andrew01234567890/pgshard/internal/pki"
 )
 
 // TestListenerRejectsAnythingWithoutAVerifiedClientCertificate is the whole
@@ -264,4 +265,106 @@ func TestDialerVerifiesTheServerItReaches(t *testing.T) {
 			t.Errorf("insecure dialling alone is the documented plaintext path: %v", err)
 		}
 	})
+}
+
+// TestAuthorizeRefusesAnIdentityTheListenerDoesNotWant is the point of the
+// whole exercise: one CA stands behind every internal workload, so an
+// agent's certificate verifies against a pooler's listener exactly as a
+// router's does. Chaining is authenticity; this is authority.
+func TestAuthorizeRefusesAnIdentityTheListenerDoesNotWant(t *testing.T) {
+	ca, err := pki.NewCA("demo", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	write := func(name string, b []byte) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	caFile := write("ca.crt", ca.CertPEM)
+	issue := func(name, role, member string, req pki.Request) (string, string) {
+		req.Identity = pki.Identity{Namespace: "ns", Cluster: "demo", Role: role, Member: member}
+		m, err := ca.Issue(req, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return write(name+".crt", m.CertPEM), write(name+".key", m.KeyPEM)
+	}
+	srvCert, srvKey := issue("pooler", pki.RolePooler, "", pki.Request{DNSNames: []string{"pooler.ns.svc"}, Server: true})
+	routerCert, routerKey := issue("router", pki.RoleRouter, "", pki.Request{Client: true})
+	agentCert, agentKey := issue("agent", pki.RoleAgent, "m0", pki.Request{Client: true})
+
+	listener, err := grpccreds.Listener(srvCert, srvKey, caFile, false,
+		grpccreds.Authorize(func(id pki.Identity) bool { return id.Role == pki.RoleRouter }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := serve(t, listener)
+	for _, tc := range []struct {
+		name       string
+		cert, key  string
+		wantAccept bool
+	}{
+		{"a router is what this listener serves", routerCert, routerKey, true},
+		{"an agent holds a certificate from the same CA", agentCert, agentKey, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dialer, err := grpccreds.Dialer(tc.cert, tc.key, caFile, "pooler.ns.svc", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = call(t, addr, dialer)
+			// The server is Unimplemented for everything, so reaching it
+			// at all is the accept: a refused peer never gets that far.
+			if tc.wantAccept && status.Code(err) != codes.Unimplemented {
+				t.Fatalf("a peer it should serve was refused: %v", err)
+			}
+			if !tc.wantAccept && status.Code(err) == codes.Unimplemented {
+				t.Fatal("a peer whose identity the listener does not serve reached the service")
+			}
+		})
+	}
+}
+
+// TestAListenerWithoutAuthorizeStillAcceptsAnyoneFromItsCA pins what the
+// option does and does not change, so the previous behaviour is not
+// mistaken for a regression later.
+func TestAListenerWithoutAuthorizeStillAcceptsAnyoneFromItsCA(t *testing.T) {
+	ca, err := pki.NewCA("demo", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	write := func(name string, b []byte) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	caFile := write("ca.crt", ca.CertPEM)
+	srv, err := ca.Issue(pki.Request{Identity: pki.Identity{Namespace: "ns", Cluster: "demo", Role: pki.RolePooler},
+		DNSNames: []string{"pooler.ns.svc"}, Server: true}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent, err := ca.Issue(pki.Request{Identity: pki.Identity{Namespace: "ns", Cluster: "demo", Role: pki.RoleAgent, Member: "m0"},
+		Client: true}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := grpccreds.Listener(write("s.crt", srv.CertPEM), write("s.key", srv.KeyPEM), caFile, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialer, err := grpccreds.Dialer(write("a.crt", agent.CertPEM), write("a.key", agent.KeyPEM), caFile, "pooler.ns.svc", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := call(t, serve(t, listener), dialer); status.Code(err) != codes.Unimplemented {
+		t.Fatalf("without Authorize a listener must accept any peer from its CA: %v", err)
+	}
 }
