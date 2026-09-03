@@ -244,8 +244,40 @@ func (b *Backend) receive() (pgproto3.BackendMessage, error) {
 
 func (b *Backend) idle() bool { return b.txStatus == 'I' }
 
+// resetTimeout bounds the reset statements a backend runs on its way back
+// to the pool.
+//
+// ROLLBACK and DISCARD ALL take under a millisecond on a backend that is
+// answering. One that is not answering is the case this exists for: the
+// reset queues behind whatever the backend is still doing, and recycle
+// waits for it with nothing able to end the wait -- holding the pooler
+// session, the goroutine, and the drain that a shutdown is waiting on.
+//
+// Generous rather than tight, because the only cost of waiting is the
+// wait: a backend that misses this is discarded rather than reused, which
+// is what should happen to one that cannot answer ROLLBACK in ten seconds.
+const resetTimeout = 10 * time.Second
+
 // simpleQuery runs sql and drains responses; used for reset commands.
 func (b *Backend) simpleQuery(sql string) error {
+	return b.simpleQueryWithin(resetTimeout, sql)
+}
+
+// simpleQueryWithin is simpleQuery with a deadline on the socket. The
+// deadline is cleared on the way out, so a backend that answered in time
+// goes back to the pool without one; a backend that did not is broken and
+// gets discarded by its caller, so what its socket carries stops mattering.
+func (b *Backend) simpleQueryWithin(d time.Duration, sql string) error {
+	// Captured, because close() sets b.conn to nil and the deferred clear
+	// would then be a nil dereference on the path that already failed.
+	if conn := b.conn; conn != nil {
+		_ = conn.SetDeadline(time.Now().Add(d))
+		defer func() { _ = conn.SetDeadline(time.Time{}) }()
+	}
+	return b.runSimpleQuery(sql)
+}
+
+func (b *Backend) runSimpleQuery(sql string) error {
 	b.send(&pgproto3.Query{String: sql})
 	if err := b.flush(); err != nil {
 		return err
