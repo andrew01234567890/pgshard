@@ -296,3 +296,34 @@ func encode(der []byte, key *ecdsa.PrivateKey) (Material, error) {
 func serialNumber() (*big.Int, error) {
 	return rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 }
+
+// callers is who may call each listener. It is a table rather than
+// configuration because it is a property of the system, not of a
+// deployment: the router is the only thing that calls a pooler, and a
+// cluster where that is untrue is a cluster with a bug, not one with a
+// different policy.
+//
+// The router's change-stream listener is deliberately absent. Its callers
+// are the cluster's consumers, which hold no pgshard identity, so a rule
+// there would refuse the traffic it exists to serve.
+var callers = map[string][]string{
+	RolePooler:     {RoleRouter},
+	RoleAgent:      {RoleController, RoleOperator},
+	RoleController: {RoleRouter, RoleOperator},
+	RoleRouter:     {RoleRouter},
+}
+
+// AllowedCallers reports whether an identity may call a listener serving
+// role, and whether role has a rule at all. A listener with no rule
+// authorises nothing and keeps accepting whatever chains to the CA.
+func AllowedCallers(role string) (func(Identity) bool, bool) {
+	allowed, ok := callers[role]
+	if !ok {
+		return nil, false
+	}
+	set := make(map[string]bool, len(allowed))
+	for _, a := range allowed {
+		set[a] = true
+	}
+	return func(id Identity) bool { return set[id.Role] }, true
+}

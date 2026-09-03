@@ -26,6 +26,7 @@ import (
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/grpccreds"
 	"github.com/andrew01234567890/pgshard/internal/metrics"
+	"github.com/andrew01234567890/pgshard/internal/pki"
 	"github.com/andrew01234567890/pgshard/internal/pooler"
 	"github.com/andrew01234567890/pgshard/internal/pprofserve"
 )
@@ -51,6 +52,7 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	certFile := fs.String("tls-cert", "", "server certificate for the gRPC listener (mTLS)")
 	keyFile := fs.String("tls-key", "", "server private key")
 	caFile := fs.String("tls-ca", "", "CA bundle that client (router) certificates must chain to")
+	authorizeCallers := fs.Bool("tls-authorize-callers", false, "refuse callers whose certificate does not carry a pgshard identity allowed to call this listener; needs certificates the operator issued")
 	insecureDev := fs.Bool("insecure-dev", false, "serve plaintext gRPC without client authentication (development only)")
 	catalogDSN := fs.String("catalog-dsn", "", "catalog DSN; when set, generation and epoch come from the catalog")
 	catalogPasswordFile := fs.String("catalog-password-file", "", "file holding the password for --catalog-dsn; the environment's PGPASSWORD is left for the local server")
@@ -78,7 +80,7 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		fmt.Fprintf(stderr, "pgshard-pooler run: unexpected argument %q\n", fs.Arg(0))
 		return cli.ExitUsage
 	}
-	creds, err := grpccreds.Listener(*certFile, *keyFile, *caFile, *insecureDev)
+	creds, err := grpccreds.Listener(*certFile, *keyFile, *caFile, *insecureDev, authorize(*authorizeCallers, pki.RolePooler)...)
 	if err != nil {
 		fmt.Fprintf(stderr, "pgshard-pooler run: %v\n", err)
 		return cli.ExitUsage
@@ -257,4 +259,19 @@ func withPasswordFile(dsn, path string) (string, error) {
 	// quote or a backslash inside it.
 	esc := strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(pw)
 	return dsn + " password='" + esc + "'", nil
+}
+
+// authorize turns the flag into the option grpccreds takes. Off it is
+// nothing at all, so a cluster whose certificates were supplied rather
+// than issued keeps working: those certificates carry no pgshard identity,
+// and a fail-closed check would refuse every caller.
+func authorize(on bool, role string) []grpccreds.Option {
+	if !on {
+		return nil
+	}
+	allow, ok := pki.AllowedCallers(role)
+	if !ok {
+		return nil
+	}
+	return []grpccreds.Option{grpccreds.Authorize(allow)}
 }
