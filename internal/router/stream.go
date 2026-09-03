@@ -19,6 +19,12 @@ type poolerStream struct {
 	stream pgshardv1.Pooler_ExecuteClient
 	cancel context.CancelFunc
 	recvc  chan recvResult
+	// credit bounds how many bytes the reader may hold ahead of the
+	// session, one token per streamCreditChunk. The queue was bounded at
+	// 64 messages, which says nothing about memory: a row or a COPY chunk
+	// runs to whatever the gRPC receive limit allows, so a handful of wide
+	// rows on each of many streams retained far more than a count suggests.
+	credit chan struct{}
 	done   chan struct{}
 	gone   chan struct{}
 	once   sync.Once
@@ -28,6 +34,46 @@ type poolerStream struct {
 type recvResult struct {
 	msg *pgshardv1.ExecuteResponse
 	err error
+	// credits is what the reader took for msg and the session returns
+	// once it has it.
+	credits int
+}
+
+const (
+	// streamCreditChunk is the granularity of the read-ahead bound.
+	streamCreditChunk = 16 << 10
+	// streamCredits is how many chunks one stream may hold ahead, so a
+	// megabyte. Small messages still queue freely; a large one is what the
+	// bound is for.
+	streamCredits = 64
+)
+
+// responseBytes is the payload a response carries. Only rows and COPY
+// chunks are worth counting: every other message is a header or a short
+// string, and walking them all would cost more than it bounds.
+func responseBytes(m *pgshardv1.ExecuteResponse) int {
+	switch x := m.GetMessage().(type) {
+	case *pgshardv1.ExecuteResponse_DataRow:
+		n := 0
+		for _, v := range x.DataRow.GetPacked() {
+			n += len(v)
+		}
+		for _, c := range x.DataRow.GetColumns() {
+			n += len(c.GetData())
+		}
+		return n
+	case *pgshardv1.ExecuteResponse_CopyData:
+		return len(x.CopyData.GetData())
+	}
+	return 0
+}
+
+// creditsFor is what a response costs, never more than the whole bound: a
+// message larger than the bound must still be deliverable, and with one
+// reader taking every token it is.
+func creditsFor(m *pgshardv1.ExecuteResponse) int {
+	n := (responseBytes(m) + streamCreditChunk - 1) / streamCreditChunk
+	return min(max(n, 1), streamCredits)
 }
 
 func openStream(ctx context.Context, client pgshardv1.PoolerClient) (*poolerStream, error) {
@@ -37,7 +83,7 @@ func openStream(ctx context.Context, client pgshardv1.PoolerClient) (*poolerStre
 		cancel()
 		return nil, err
 	}
-	ps := &poolerStream{client: client, stream: st, cancel: cancel, recvc: make(chan recvResult, 64), done: make(chan struct{}), gone: make(chan struct{}), first: true}
+	ps := &poolerStream{client: client, stream: st, cancel: cancel, recvc: make(chan recvResult, 64), credit: make(chan struct{}, streamCredits), done: make(chan struct{}), gone: make(chan struct{}), first: true}
 	go ps.reader()
 	return ps, nil
 }
@@ -55,8 +101,16 @@ func (ps *poolerStream) reader() {
 			}
 			return
 		}
+		n := creditsFor(msg)
+		for range n {
+			select {
+			case ps.credit <- struct{}{}:
+			case <-ps.stream.Context().Done():
+				return
+			}
+		}
 		select {
-		case ps.recvc <- recvResult{msg: msg}:
+		case ps.recvc <- recvResult{msg: msg, credits: n}:
 		case <-ps.stream.Context().Done():
 			return
 		}
@@ -100,7 +154,7 @@ var errCancelGrace = errors.New("cancelled statement did not finish within the c
 func (ps *poolerStream) recv(ctx context.Context, onCancel func()) (*pgshardv1.ExecuteResponse, error) {
 	select {
 	case r := <-ps.recvc:
-		return r.msg, r.err
+		return ps.took(r)
 	case <-ctx.Done():
 		if onCancel != nil {
 			onCancel()
@@ -110,7 +164,7 @@ func (ps *poolerStream) recv(ctx context.Context, onCancel func()) (*pgshardv1.E
 	defer t.Stop()
 	select {
 	case r := <-ps.recvc:
-		return r.msg, r.err
+		return ps.took(r)
 	case <-t.C:
 		// Aborting the gRPC stream is what makes this bounded: it wakes
 		// the receiving goroutine, closes done, and lets a later close or
@@ -118,6 +172,17 @@ func (ps *poolerStream) recv(ctx context.Context, onCancel func()) (*pgshardv1.E
 		ps.cancel()
 		return nil, errCancelGrace
 	}
+}
+
+// took returns what the reader spent to hold r, letting it read on.
+func (ps *poolerStream) took(r recvResult) (*pgshardv1.ExecuteResponse, error) {
+	for range r.credits {
+		select {
+		case <-ps.credit:
+		default:
+		}
+	}
+	return r.msg, r.err
 }
 
 // close half-closes the stream and waits until the pooler has finished the
