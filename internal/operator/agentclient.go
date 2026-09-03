@@ -402,8 +402,6 @@ func (c *GRPCAgentClient) Info(ctx context.Context, addr string) (RepoInfo, erro
 	return info, nil
 }
 
-// SetSynchronizedStandbySlots reads the agent's epoch and calls
-// Agent.SetSynchronizedStandbySlots at that epoch.
 // ReadySlots counts the logical slots that would survive a promotion here.
 //
 // The three conditions are PostgreSQL's own: a slot the standby
@@ -436,6 +434,8 @@ func (c *GRPCAgentClient) ReadySlots(ctx context.Context, addr string) (int, err
 	return n, nil
 }
 
+// SetSynchronizedStandbySlots reads the agent's epoch and calls
+// Agent.SetSynchronizedStandbySlots at that epoch.
 func (c *GRPCAgentClient) SetSynchronizedStandbySlots(ctx context.Context, addr string, slots []string) ([]string, error) {
 	cl, err := c.dial(ctx, addr)
 	if err != nil {
