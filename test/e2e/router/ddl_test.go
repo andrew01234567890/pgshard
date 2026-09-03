@@ -468,6 +468,31 @@ func TestRouterDDLMigrations(t *testing.T) {
 		if err := cat.QueryRow(ctx, "select verifier from pgshard.roles where rolname = 'analyst'").Scan(&v); err != nil || v != verifiers[0] {
 			t.Fatalf("catalog verifier %q %v", v, err)
 		}
+		// The catalog must have run CREATE ROLE as the client, like every
+		// shard did. PostgreSQL records the creator as the new role's
+		// admin, so the creator is readable: it is the client if the
+		// statement carried the client's identity to the catalog, and the
+		// controller's own role if the catalog applied it with more
+		// authority than the client had.
+		var admins []string
+		rows, err := cat.Query(ctx, `SELECT r.rolname FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.member
+			WHERE m.roleid = 'analyst'::regrole AND m.admin_option`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var n string
+			if err := rows.Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			admins = append(admins, n)
+		}
+		if rows.Err() != nil {
+			t.Fatal(rows.Err())
+		}
+		if len(admins) != 1 || admins[0] != appRole {
+			t.Fatalf("on the catalog, analyst was created by %v, want only %q: the catalog applied the role statement with an identity the client does not have", admins, appRole)
+		}
 		if _, err := conn.Exec(ctx, "drop role analyst"); err != nil {
 			t.Fatal(err)
 		}
