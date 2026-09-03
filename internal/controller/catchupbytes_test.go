@@ -31,3 +31,21 @@ func TestTheHoldIsBoundedByBytesNotOnlyOperations(t *testing.T) {
 			narrow, applyFlushBytes, applyFlushOps)
 	}
 }
+
+// TestTheOpenTransactionHasABoundNoFlushCanProvide: the committed hold can
+// always be shortened by flushing it. The transaction being decoded cannot
+// -- its operations are not applicable until it commits -- so it needs a
+// bound of its own, and without one a peek that fills without reaching a
+// commit quadruples its limit and decodes the same transaction again from
+// the start, retaining more of it each round.
+func TestTheOpenTransactionHasABoundNoFlushCanProvide(t *testing.T) {
+	if catchUpMaxOpenBytes <= applyFlushBytes {
+		t.Fatalf("the open bound (%d) is not above the flush bound (%d); an ordinary round would trip it",
+			catchUpMaxOpenBytes, applyFlushBytes)
+	}
+	// Generous enough that a normal large transaction still replicates:
+	// a hundred thousand rows of a kilobyte is inside it.
+	if catchUpMaxOpenBytes < 100_000*1024 {
+		t.Fatalf("the open bound (%d) refuses transactions a placement should carry", catchUpMaxOpenBytes)
+	}
+}

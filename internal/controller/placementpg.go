@@ -1140,6 +1140,22 @@ const applyFlushOps = 2000
 // is not a bound at all.
 const applyFlushBytes = 8 << 20
 
+// catchUpMaxOpenBytes bounds the ONE transaction being decoded, which no
+// flush can shorten: its operations cannot be applied until it commits, so
+// they are held whole.
+//
+// A peek that fills without reaching a commit quadruples its limit and
+// starts again from the slot, decoding the same transaction from its
+// beginning each time and retaining more of it. Nothing stopped that, so a
+// large enough source transaction took the controller's memory -- and the
+// controller is not running only this workflow.
+//
+// Failing is the answer rather than spilling, for now. A workflow that
+// stops with a message naming the table and the size is one an operator
+// can act on; a controller killed by the kernel takes every other workflow
+// with it and says nothing.
+const catchUpMaxOpenBytes = 256 << 20
+
 func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn ShardConn, targets targetConns, s int32, drain bool) (int64, int, error) {
 	dec := NewDecoder()
 	applied := 0
@@ -1204,6 +1220,10 @@ func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn 
 			}
 			for _, op := range ops {
 				openBytes += len(op.sql)
+			}
+			if openBytes > catchUpMaxOpenBytes {
+				return 0, applied, fatal("a single source transaction on %s/%d holds %d bytes of changes to %s, past the %d-byte catch-up bound: it cannot be applied until it commits, so it cannot be flushed",
+					wf.st.SourceSet, s, openBytes, wf.spec.table(), catchUpMaxOpenBytes)
 			}
 			open = append(open, ops...)
 			n++
