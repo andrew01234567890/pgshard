@@ -660,6 +660,9 @@ func (r *ClusterReconciler) loadState(ctx context.Context, c *pgshardv1alpha1.Pg
 			st.pvcs[m.Name] = m.PVC
 		}
 	}
+	if err := r.recoverPVCs(ctx, c, g, pg, st); err != nil {
+		return groupState{}, err
+	}
 	// A designated primary outside the member set is not an oracle to be
 	// obeyed: scaling replicasPerShard below the ordinal of a primary that a
 	// failover promoted leaves status.primary naming a member that no longer
@@ -695,6 +698,87 @@ func (r *ClusterReconciler) loadState(ctx context.Context, c *pgshardv1alpha1.Pg
 		}
 	}
 	return st, nil
+}
+
+// recoverPVCs fills in the claim of any member whose status did not name
+// one, by reading what that member's pod actually mounts.
+//
+// The default is the claim named after the member, and after a storage
+// rebuild that is the wrong one: the rebuilt claim gains a -v<n> suffix,
+// so a group that lost its status would mount the pre-rebuild volume -
+// the old storage class, and data as stale as the rebuild is old. The
+// running pod is the authority on where its data directory is, which is
+// exactly the evidence status was standing in for.
+func (r *ClusterReconciler) recoverPVCs(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, pg *pgshardv1alpha1.PgShardGroup, st groupState) error {
+	known := map[string]bool{}
+	for _, m := range pg.Status.Members {
+		if m.PVC != "" {
+			known[m.Name] = true
+		}
+	}
+	var claimed corev1.PersistentVolumeClaimList
+	if err := r.List(ctx, &claimed, client.InNamespace(c.Namespace),
+		client.MatchingLabels{LabelCluster: c.Name, LabelGroup: g.Name()}); err != nil {
+		return err
+	}
+	for _, name := range g.MemberNames() {
+		if known[name] {
+			continue
+		}
+		var pod corev1.Pod
+		err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: name}, &pod)
+		if err == nil {
+			if claim := dataClaim(&pod); claim != "" {
+				st.pvcs[name] = claim
+				continue
+			}
+		} else if !apierrors.IsNotFound(err) {
+			return err
+		}
+		// No pod to ask. The claims themselves say which volumes the
+		// member has had; rebuilds only ever move forward, so the newest
+		// is the one holding its data.
+		if claim := newestClaim(claimed.Items, name); claim != "" {
+			st.pvcs[name] = claim
+		}
+	}
+	return nil
+}
+
+// newestClaim is the member's most recent claim: rebuilds rename forward,
+// member then member-v2 then member-v3, so the highest suffix is the last
+// one the member was rebuilt onto.
+func newestClaim(claims []corev1.PersistentVolumeClaim, member string) string {
+	best, bestV := "", -1
+	for _, pvc := range claims {
+		if pvc.Labels[LabelMember] != member {
+			continue
+		}
+		v := 1
+		if rest, ok := strings.CutPrefix(pvc.Name, member+"-v"); ok {
+			n, err := strconv.Atoi(rest)
+			if err != nil {
+				continue
+			}
+			v = n
+		} else if pvc.Name != member {
+			continue
+		}
+		if v > bestV {
+			best, bestV = pvc.Name, v
+		}
+	}
+	return best
+}
+
+// dataClaim is the claim a member's pod mounts as its data directory.
+func dataClaim(pod *corev1.Pod) string {
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == "data" && v.PersistentVolumeClaim != nil {
+			return v.PersistentVolumeClaim.ClaimName
+		}
+	}
+	return ""
 }
 
 func (r *ClusterReconciler) ensureConfigMap(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, primary string, tuning pgtune.Settings, pol *pgshardv1alpha1.PgShardBackupPolicy, repoReady bool) error {
