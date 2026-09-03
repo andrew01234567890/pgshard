@@ -210,6 +210,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// presenting either. REMOVE the derived one with the agent's acceptance
 	// of it -- PGS-572.
 	ctx = agentauth.WithTokens(ctx, agentToken, derived)
+	if err := r.reconcilePKI(ctx, &cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("internal certificates: %w", err)
+	}
 	if err := r.ensureMemberRBAC(ctx, &cluster); err != nil {
 		return ctrl.Result{}, err
 	}

@@ -164,6 +164,19 @@ spec:
                       Insecure runs the pooler port as plaintext gRPC. Unsupported outside
                       development; the network must be protected by other means.
                     type: boolean
+                  issue:
+                    description: |-
+                      Issue makes the operator its own certificate authority: it mints a
+                      CA for the cluster and a certificate per workload from it, and each
+                      listener then accepts only the identities it is meant to serve.
+
+                      secretRef cannot do that, whoever supplies it. One Secret is one
+                      certificate, and it is mounted into the agent, the router and the
+                      pooler alike -- so it spans three trust boundaries, and a listener
+                      verifying the chain learns only that the peer is somewhere in the
+                      cluster. Distinguishing a router from an agent needs them to hold
+                      different certificates, and that needs an issuer.
+                    type: boolean
                   secretRef:
                     description: |-
                       SecretRef names a Secret with tls.crt, tls.key and ca.crt; the
@@ -183,18 +196,22 @@ spec:
                     x-kubernetes-map-type: atomic
                 type: object
                 x-kubernetes-validations:
-                - message: 'internalTLS requires secretRef, or insecure: true to explicitly
-                    opt into plaintext (unsupported outside development)'
+                - message: 'internalTLS requires issue: true, or secretRef, or insecure:
+                    true to explicitly opt into plaintext (unsupported outside development)'
                   rule: (has(self.secretRef) && self.secretRef.name != "") || (has(self.insecure)
-                    && self.insecure)
+                    && self.insecure) || (has(self.issue) && self.issue)
                 - message: internalTLS.secretRef and internalTLS.insecure are mutually
                     exclusive
                   rule: '!((has(self.secretRef) && self.secretRef.name != "") && has(self.insecure)
                     && self.insecure)'
-                - message: 'internalTLS.agentMTLS needs secretRef: the agents require
-                    the certificates it names'
+                - message: 'internalTLS.issue is exclusive with secretRef and insecure:
+                    the operator either issues the certificates or is given them'
+                  rule: '!(has(self.issue) && self.issue) || (!(has(self.secretRef)
+                    && self.secretRef.name != "") && !(has(self.insecure) && self.insecure))'
+                - message: 'internalTLS.agentMTLS needs secretRef or issue: the agents
+                    require certificates from somewhere'
                   rule: '!(has(self.agentMTLS) && self.agentMTLS) || (has(self.secretRef)
-                    && self.secretRef.name != "")'
+                    && self.secretRef.name != "") || (has(self.issue) && self.issue)'
               networkPolicy:
                 default: {}
                 description: NetworkPolicySpec renders a NetworkPolicy in front of

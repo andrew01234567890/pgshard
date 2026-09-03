@@ -134,9 +134,10 @@ type TLSSpec struct {
 // InternalTLSSpec configures router<->pooler transport security. Plaintext
 // is never the default: it must be requested with insecure, which is
 // unsupported outside development environments.
-// +kubebuilder:validation:XValidation:rule="(has(self.secretRef) && self.secretRef.name != \"\") || (has(self.insecure) && self.insecure)",message="internalTLS requires secretRef, or insecure: true to explicitly opt into plaintext (unsupported outside development)"
+// +kubebuilder:validation:XValidation:rule="(has(self.secretRef) && self.secretRef.name != \"\") || (has(self.insecure) && self.insecure) || (has(self.issue) && self.issue)",message="internalTLS requires issue: true, or secretRef, or insecure: true to explicitly opt into plaintext (unsupported outside development)"
 // +kubebuilder:validation:XValidation:rule="!((has(self.secretRef) && self.secretRef.name != \"\") && has(self.insecure) && self.insecure)",message="internalTLS.secretRef and internalTLS.insecure are mutually exclusive"
-// +kubebuilder:validation:XValidation:rule="!(has(self.agentMTLS) && self.agentMTLS) || (has(self.secretRef) && self.secretRef.name != \"\")",message="internalTLS.agentMTLS needs secretRef: the agents require the certificates it names"
+// +kubebuilder:validation:XValidation:rule="!(has(self.issue) && self.issue) || (!(has(self.secretRef) && self.secretRef.name != \"\") && !(has(self.insecure) && self.insecure))",message="internalTLS.issue is exclusive with secretRef and insecure: the operator either issues the certificates or is given them"
+// +kubebuilder:validation:XValidation:rule="!(has(self.agentMTLS) && self.agentMTLS) || (has(self.secretRef) && self.secretRef.name != \"\") || (has(self.issue) && self.issue)",message="internalTLS.agentMTLS needs secretRef or issue: the agents require certificates from somewhere"
 type InternalTLSSpec struct {
 	// SecretRef names a Secret with tls.crt, tls.key and ca.crt; the
 	// poolers refuse clients whose certificate does not chain to ca.crt
@@ -159,6 +160,18 @@ type InternalTLSSpec struct {
 	// today -- must not be given the material.
 	// +optional
 	AgentMTLS bool `json:"agentMTLS,omitempty"`
+	// Issue makes the operator its own certificate authority: it mints a
+	// CA for the cluster and a certificate per workload from it, and each
+	// listener then accepts only the identities it is meant to serve.
+	//
+	// secretRef cannot do that, whoever supplies it. One Secret is one
+	// certificate, and it is mounted into the agent, the router and the
+	// pooler alike -- so it spans three trust boundaries, and a listener
+	// verifying the chain learns only that the peer is somewhere in the
+	// cluster. Distinguishing a router from an agent needs them to hold
+	// different certificates, and that needs an issuer.
+	// +optional
+	Issue bool `json:"issue,omitempty"`
 }
 
 // RouterSpec configures the stateless router deployment.
