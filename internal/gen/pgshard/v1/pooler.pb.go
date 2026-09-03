@@ -2755,7 +2755,6 @@ func (x *ReleaseRequest) GetSessionId() string {
 // ReleaseResponse acknowledges the release.
 type ReleaseResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Error         *Error                 `protobuf:"bytes,1,opt,name=error,proto3" json:"error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2788,13 +2787,6 @@ func (x *ReleaseResponse) ProtoReflect() protoreflect.Message {
 // Deprecated: Use ReleaseResponse.ProtoReflect.Descriptor instead.
 func (*ReleaseResponse) Descriptor() ([]byte, []int) {
 	return file_pgshard_v1_pooler_proto_rawDescGZIP(), []int{38}
-}
-
-func (x *ReleaseResponse) GetError() *Error {
-	if x != nil {
-		return x.Error
-	}
-	return nil
 }
 
 // HealthRequest opens a health stream.
@@ -5408,9 +5400,8 @@ const file_pgshard_v1_pooler_proto_rawDesc = "" +
 	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"/\n" +
 	"\x0eReleaseRequest\x12\x1d\n" +
 	"\n" +
-	"session_id\x18\x01 \x01(\tR\tsessionId\":\n" +
-	"\x0fReleaseResponse\x12'\n" +
-	"\x05error\x18\x01 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"\x0f\n" +
+	"session_id\x18\x01 \x01(\tR\tsessionId\"\x1e\n" +
+	"\x0fReleaseResponseJ\x04\b\x01\x10\x02R\x05error\"\x0f\n" +
 	"\rHealthRequest\"\xfd\x01\n" +
 	"\fHealthStatus\x121\n" +
 	"\x04role\x18\x01 \x01(\x0e2\x1d.pgshard.v1.HealthStatus.RoleR\x04role\x12(\n" +
@@ -5761,63 +5752,62 @@ var file_pgshard_v1_pooler_proto_depIdxs = []int32{
 	38, // 40: pgshard.v1.ExecuteResponse.flush_complete:type_name -> pgshard.v1.FlushComplete
 	78, // 41: pgshard.v1.ReserveRequest.generation:type_name -> pgshard.v1.Generation
 	79, // 42: pgshard.v1.ReserveResponse.error:type_name -> pgshard.v1.Error
-	79, // 43: pgshard.v1.ReleaseResponse.error:type_name -> pgshard.v1.Error
-	3,  // 44: pgshard.v1.HealthStatus.role:type_name -> pgshard.v1.HealthStatus.Role
-	53, // 45: pgshard.v1.StreamRequest.options:type_name -> pgshard.v1.StreamRequest.OptionsEntry
-	79, // 46: pgshard.v1.AckResponse.error:type_name -> pgshard.v1.Error
-	54, // 47: pgshard.v1.CopyTablesResponse.snapshot:type_name -> pgshard.v1.CopyTablesResponse.Snapshot
-	55, // 48: pgshard.v1.CopyTablesResponse.table_begin:type_name -> pgshard.v1.CopyTablesResponse.TableBegin
-	57, // 49: pgshard.v1.CopyTablesResponse.rows:type_name -> pgshard.v1.CopyTablesResponse.Rows
-	58, // 50: pgshard.v1.CopyTablesResponse.table_done:type_name -> pgshard.v1.CopyTablesResponse.TableDone
-	59, // 51: pgshard.v1.CopyTablesResponse.done:type_name -> pgshard.v1.CopyTablesResponse.Done
-	52, // 52: pgshard.v1.ChangeBatch.events:type_name -> pgshard.v1.ChangeEvent
-	60, // 53: pgshard.v1.ChangeEvent.begin:type_name -> pgshard.v1.ChangeEvent.Begin
-	61, // 54: pgshard.v1.ChangeEvent.row:type_name -> pgshard.v1.ChangeEvent.Row
-	62, // 55: pgshard.v1.ChangeEvent.commit:type_name -> pgshard.v1.ChangeEvent.Commit
-	63, // 56: pgshard.v1.ChangeEvent.keepalive:type_name -> pgshard.v1.ChangeEvent.Keepalive
-	64, // 57: pgshard.v1.ChangeEvent.prepare:type_name -> pgshard.v1.ChangeEvent.Prepare
-	65, // 58: pgshard.v1.ChangeEvent.commit_prepared:type_name -> pgshard.v1.ChangeEvent.CommitPrepared
-	66, // 59: pgshard.v1.ChangeEvent.rollback_prepared:type_name -> pgshard.v1.ChangeEvent.RollbackPrepared
-	67, // 60: pgshard.v1.ChangeEvent.message:type_name -> pgshard.v1.ChangeEvent.Message
-	68, // 61: pgshard.v1.ChangeEvent.relation:type_name -> pgshard.v1.ChangeEvent.Relation
-	69, // 62: pgshard.v1.ChangeEvent.truncate:type_name -> pgshard.v1.ChangeEvent.Truncate
-	70, // 63: pgshard.v1.ChangeEvent.stream_start:type_name -> pgshard.v1.ChangeEvent.StreamStart
-	71, // 64: pgshard.v1.ChangeEvent.stream_stop:type_name -> pgshard.v1.ChangeEvent.StreamStop
-	72, // 65: pgshard.v1.ChangeEvent.stream_commit:type_name -> pgshard.v1.ChangeEvent.StreamCommit
-	73, // 66: pgshard.v1.ChangeEvent.stream_abort:type_name -> pgshard.v1.ChangeEvent.StreamAbort
-	74, // 67: pgshard.v1.ChangeEvent.begin_prepare:type_name -> pgshard.v1.ChangeEvent.BeginPrepare
-	75, // 68: pgshard.v1.ChangeEvent.stream_prepare:type_name -> pgshard.v1.ChangeEvent.StreamPrepare
-	76, // 69: pgshard.v1.ChangeEvent.origin:type_name -> pgshard.v1.ChangeEvent.Origin
-	68, // 70: pgshard.v1.CopyTablesResponse.TableBegin.relation:type_name -> pgshard.v1.ChangeEvent.Relation
-	9,  // 71: pgshard.v1.CopyTablesResponse.Row.values:type_name -> pgshard.v1.Value
-	56, // 72: pgshard.v1.CopyTablesResponse.Rows.rows:type_name -> pgshard.v1.CopyTablesResponse.Row
-	4,  // 73: pgshard.v1.ChangeEvent.Row.kind:type_name -> pgshard.v1.ChangeEvent.Row.Kind
-	9,  // 74: pgshard.v1.ChangeEvent.Row.old:type_name -> pgshard.v1.Value
-	9,  // 75: pgshard.v1.ChangeEvent.Row.new:type_name -> pgshard.v1.Value
-	77, // 76: pgshard.v1.ChangeEvent.Relation.columns:type_name -> pgshard.v1.ChangeEvent.Relation.Column
-	19, // 77: pgshard.v1.Pooler.Execute:input_type -> pgshard.v1.ExecuteRequest
-	40, // 78: pgshard.v1.Pooler.Reserve:input_type -> pgshard.v1.ReserveRequest
-	42, // 79: pgshard.v1.Pooler.Release:input_type -> pgshard.v1.ReleaseRequest
-	17, // 80: pgshard.v1.Pooler.Cancel:input_type -> pgshard.v1.CancelRequest
-	44, // 81: pgshard.v1.Pooler.Health:input_type -> pgshard.v1.HealthRequest
-	46, // 82: pgshard.v1.Pooler.StreamChanges:input_type -> pgshard.v1.StreamRequest
-	46, // 83: pgshard.v1.Pooler.Stream:input_type -> pgshard.v1.StreamRequest
-	47, // 84: pgshard.v1.Pooler.Ack:input_type -> pgshard.v1.AckRequest
-	49, // 85: pgshard.v1.Pooler.CopyTables:input_type -> pgshard.v1.CopyTablesRequest
-	39, // 86: pgshard.v1.Pooler.Execute:output_type -> pgshard.v1.ExecuteResponse
-	41, // 87: pgshard.v1.Pooler.Reserve:output_type -> pgshard.v1.ReserveResponse
-	43, // 88: pgshard.v1.Pooler.Release:output_type -> pgshard.v1.ReleaseResponse
-	18, // 89: pgshard.v1.Pooler.Cancel:output_type -> pgshard.v1.CancelResponse
-	45, // 90: pgshard.v1.Pooler.Health:output_type -> pgshard.v1.HealthStatus
-	52, // 91: pgshard.v1.Pooler.StreamChanges:output_type -> pgshard.v1.ChangeEvent
-	51, // 92: pgshard.v1.Pooler.Stream:output_type -> pgshard.v1.ChangeBatch
-	48, // 93: pgshard.v1.Pooler.Ack:output_type -> pgshard.v1.AckResponse
-	50, // 94: pgshard.v1.Pooler.CopyTables:output_type -> pgshard.v1.CopyTablesResponse
-	86, // [86:95] is the sub-list for method output_type
-	77, // [77:86] is the sub-list for method input_type
-	77, // [77:77] is the sub-list for extension type_name
-	77, // [77:77] is the sub-list for extension extendee
-	0,  // [0:77] is the sub-list for field type_name
+	3,  // 43: pgshard.v1.HealthStatus.role:type_name -> pgshard.v1.HealthStatus.Role
+	53, // 44: pgshard.v1.StreamRequest.options:type_name -> pgshard.v1.StreamRequest.OptionsEntry
+	79, // 45: pgshard.v1.AckResponse.error:type_name -> pgshard.v1.Error
+	54, // 46: pgshard.v1.CopyTablesResponse.snapshot:type_name -> pgshard.v1.CopyTablesResponse.Snapshot
+	55, // 47: pgshard.v1.CopyTablesResponse.table_begin:type_name -> pgshard.v1.CopyTablesResponse.TableBegin
+	57, // 48: pgshard.v1.CopyTablesResponse.rows:type_name -> pgshard.v1.CopyTablesResponse.Rows
+	58, // 49: pgshard.v1.CopyTablesResponse.table_done:type_name -> pgshard.v1.CopyTablesResponse.TableDone
+	59, // 50: pgshard.v1.CopyTablesResponse.done:type_name -> pgshard.v1.CopyTablesResponse.Done
+	52, // 51: pgshard.v1.ChangeBatch.events:type_name -> pgshard.v1.ChangeEvent
+	60, // 52: pgshard.v1.ChangeEvent.begin:type_name -> pgshard.v1.ChangeEvent.Begin
+	61, // 53: pgshard.v1.ChangeEvent.row:type_name -> pgshard.v1.ChangeEvent.Row
+	62, // 54: pgshard.v1.ChangeEvent.commit:type_name -> pgshard.v1.ChangeEvent.Commit
+	63, // 55: pgshard.v1.ChangeEvent.keepalive:type_name -> pgshard.v1.ChangeEvent.Keepalive
+	64, // 56: pgshard.v1.ChangeEvent.prepare:type_name -> pgshard.v1.ChangeEvent.Prepare
+	65, // 57: pgshard.v1.ChangeEvent.commit_prepared:type_name -> pgshard.v1.ChangeEvent.CommitPrepared
+	66, // 58: pgshard.v1.ChangeEvent.rollback_prepared:type_name -> pgshard.v1.ChangeEvent.RollbackPrepared
+	67, // 59: pgshard.v1.ChangeEvent.message:type_name -> pgshard.v1.ChangeEvent.Message
+	68, // 60: pgshard.v1.ChangeEvent.relation:type_name -> pgshard.v1.ChangeEvent.Relation
+	69, // 61: pgshard.v1.ChangeEvent.truncate:type_name -> pgshard.v1.ChangeEvent.Truncate
+	70, // 62: pgshard.v1.ChangeEvent.stream_start:type_name -> pgshard.v1.ChangeEvent.StreamStart
+	71, // 63: pgshard.v1.ChangeEvent.stream_stop:type_name -> pgshard.v1.ChangeEvent.StreamStop
+	72, // 64: pgshard.v1.ChangeEvent.stream_commit:type_name -> pgshard.v1.ChangeEvent.StreamCommit
+	73, // 65: pgshard.v1.ChangeEvent.stream_abort:type_name -> pgshard.v1.ChangeEvent.StreamAbort
+	74, // 66: pgshard.v1.ChangeEvent.begin_prepare:type_name -> pgshard.v1.ChangeEvent.BeginPrepare
+	75, // 67: pgshard.v1.ChangeEvent.stream_prepare:type_name -> pgshard.v1.ChangeEvent.StreamPrepare
+	76, // 68: pgshard.v1.ChangeEvent.origin:type_name -> pgshard.v1.ChangeEvent.Origin
+	68, // 69: pgshard.v1.CopyTablesResponse.TableBegin.relation:type_name -> pgshard.v1.ChangeEvent.Relation
+	9,  // 70: pgshard.v1.CopyTablesResponse.Row.values:type_name -> pgshard.v1.Value
+	56, // 71: pgshard.v1.CopyTablesResponse.Rows.rows:type_name -> pgshard.v1.CopyTablesResponse.Row
+	4,  // 72: pgshard.v1.ChangeEvent.Row.kind:type_name -> pgshard.v1.ChangeEvent.Row.Kind
+	9,  // 73: pgshard.v1.ChangeEvent.Row.old:type_name -> pgshard.v1.Value
+	9,  // 74: pgshard.v1.ChangeEvent.Row.new:type_name -> pgshard.v1.Value
+	77, // 75: pgshard.v1.ChangeEvent.Relation.columns:type_name -> pgshard.v1.ChangeEvent.Relation.Column
+	19, // 76: pgshard.v1.Pooler.Execute:input_type -> pgshard.v1.ExecuteRequest
+	40, // 77: pgshard.v1.Pooler.Reserve:input_type -> pgshard.v1.ReserveRequest
+	42, // 78: pgshard.v1.Pooler.Release:input_type -> pgshard.v1.ReleaseRequest
+	17, // 79: pgshard.v1.Pooler.Cancel:input_type -> pgshard.v1.CancelRequest
+	44, // 80: pgshard.v1.Pooler.Health:input_type -> pgshard.v1.HealthRequest
+	46, // 81: pgshard.v1.Pooler.StreamChanges:input_type -> pgshard.v1.StreamRequest
+	46, // 82: pgshard.v1.Pooler.Stream:input_type -> pgshard.v1.StreamRequest
+	47, // 83: pgshard.v1.Pooler.Ack:input_type -> pgshard.v1.AckRequest
+	49, // 84: pgshard.v1.Pooler.CopyTables:input_type -> pgshard.v1.CopyTablesRequest
+	39, // 85: pgshard.v1.Pooler.Execute:output_type -> pgshard.v1.ExecuteResponse
+	41, // 86: pgshard.v1.Pooler.Reserve:output_type -> pgshard.v1.ReserveResponse
+	43, // 87: pgshard.v1.Pooler.Release:output_type -> pgshard.v1.ReleaseResponse
+	18, // 88: pgshard.v1.Pooler.Cancel:output_type -> pgshard.v1.CancelResponse
+	45, // 89: pgshard.v1.Pooler.Health:output_type -> pgshard.v1.HealthStatus
+	52, // 90: pgshard.v1.Pooler.StreamChanges:output_type -> pgshard.v1.ChangeEvent
+	51, // 91: pgshard.v1.Pooler.Stream:output_type -> pgshard.v1.ChangeBatch
+	48, // 92: pgshard.v1.Pooler.Ack:output_type -> pgshard.v1.AckResponse
+	50, // 93: pgshard.v1.Pooler.CopyTables:output_type -> pgshard.v1.CopyTablesResponse
+	85, // [85:94] is the sub-list for method output_type
+	76, // [76:85] is the sub-list for method input_type
+	76, // [76:76] is the sub-list for extension type_name
+	76, // [76:76] is the sub-list for extension extendee
+	0,  // [0:76] is the sub-list for field type_name
 }
 
 func init() { file_pgshard_v1_pooler_proto_init() }
