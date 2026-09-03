@@ -11,6 +11,34 @@ password the operator generated; see
 [the first login](getting-started.md#the-first-login) for how to read it
 out of the Secret.
 
+## What one cluster is
+
+A `PgShardCluster` is the unit of isolation. Everything inside one shares a
+single shard set and a single serving generation, and the workflows that
+change either act on all of it at once:
+
+- **Reshard and major upgrade.** A cutover flips the serving set for every
+  database in the cluster, not per database. Unrelated databases move
+  together.
+- **The write fence.** A certified barrier and a cutover pause writes
+  cluster-wide for their window ([resharding.md](resharding.md),
+  [backup-restore.md](backup-restore.md)).
+- **Failover.** A group's promotion is scoped to that group, and which
+  databases notice depends on where their data is: a sharded or reference
+  table has rows on every group, so any database with one is affected by any
+  group; a database whose tables are all unsharded is affected only by the
+  failover of its home shard.
+
+Databases are a naming and permission boundary, not a blast-radius boundary.
+`CREATE DATABASE` fans out to every shard group rather than provisioning
+anything of its own, which is what makes adding a database cheap and what
+makes it share everything above.
+
+**To isolate two workloads from each other, run two clusters.** That is the
+supported answer, and it is the only one: there is no per-database shard set
+and no per-database serving generation to keep them apart inside one
+cluster.
+
 ## Declare a database
 
 ```sql
