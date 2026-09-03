@@ -64,6 +64,60 @@ func collectCopy(t *testing.T, st pgshardv1.Pooler_CopyTablesClient, stopAfterBa
 	}
 }
 
+// testCopyWideRowsChunksOnBytes: a page of the initial copy went out as one
+// message bounded by the ROW COUNT alone. A row is anything from a few
+// bytes to a megabyte, so a page of wide rows built a message past the
+// gRPC limit both sides enforce, and the copy failed on a table whose only
+// fault was wide columns.
+func (h *pgHarness) testCopyWideRowsChunksOnBytes(t *testing.T) {
+	ctx := context.Background()
+	for _, sql := range []string{
+		"CREATE TABLE wide (id int primary key, body text)",
+		// 40 rows of 256 KiB is 10 MiB in one page at BatchRows: 100 --
+		// comfortably past the 4 MiB message limit, and the point is that
+		// it now arrives rather than failing.
+		"INSERT INTO wide SELECT g, repeat('x', 256 * 1024) FROM generate_series(1, 40) g",
+	} {
+		if _, err := h.admin.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	t.Cleanup(func() {
+		for _, sql := range []string{"SELECT pg_drop_replication_slot('pgshard_wide_shard0')", "DROP TABLE wide", "DROP PUBLICATION pgshard_wide_all"} {
+			_, _ = h.admin.Exec(ctx, sql)
+		}
+	})
+	if _, err := h.admin.Exec(ctx, "CREATE PUBLICATION pgshard_wide_all FOR TABLE wide"); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := h.client.CopyTables(ctx, &pgshardv1.CopyTablesRequest{Stream: "wide", BatchRows: 100, Publication: "pgshard_wide_all"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectCopy(t, st, 0)
+	if n := len(got.rows["public.wide"]); n != 40 {
+		t.Fatalf("copied %d rows of 40", n)
+	}
+	// One page, so one message before the byte bound. Several after it,
+	// and every one of them carries a resume point: a chunk that was
+	// delivered is a chunk the copy does not have to send again.
+	batches := got.batches["public.wide"]
+	if len(batches) < 4 {
+		t.Fatalf("40 wide rows went out in %d messages; the byte bound did not split the page", len(batches))
+	}
+	for i, b := range batches {
+		if len(b) == 0 {
+			t.Fatalf("chunk %d carries no resume point", i)
+		}
+	}
+	// The resume points advance: each names its own chunk's last row, not
+	// the page's.
+	if string(batches[0]) == string(batches[len(batches)-1]) {
+		t.Fatalf("every chunk reported the same resume point %q", batches[0])
+	}
+}
+
 func (h *pgHarness) testCopyTables(t *testing.T) {
 	ctx := context.Background()
 	for _, sql := range []string{

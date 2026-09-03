@@ -179,6 +179,7 @@ func runPGSuite(t *testing.T, image string) {
 	t.Run("stale_generation", h.testStaleGeneration)
 	t.Run("cancel", h.testCancel)
 	t.Run("copy_tables", h.testCopyTables)
+	t.Run("copy_wide_rows_chunk_on_bytes", h.testCopyWideRowsChunksOnBytes)
 	t.Run("change_stream", h.testStream)
 	t.Run("drain_lets_txn_commit", h.testDrain)
 }

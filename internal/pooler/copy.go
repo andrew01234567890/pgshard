@@ -276,6 +276,12 @@ func keyColumnIndexes(t copyTable) []int {
 	return idx
 }
 
+// copyChunkBytes bounds one initial-copy message. Well under the gRPC
+// limit both sides enforce, because the row bytes are not the whole
+// message: there is a Value per column around them and the framing around
+// that, and a bound that only just fits leaves no room for either.
+const copyChunkBytes = 1 << 20
+
 func copyRows(ctx context.Context, conn *pgconn.PgConn, t copyTable, lastpk []string, batch int, send func(*pgshardv1.CopyTablesResponse) error) error {
 	keyIdx := keyColumnIndexes(t)
 	for {
@@ -291,7 +297,39 @@ func copyRows(ctx context.Context, conn *pgconn.PgConn, t copyTable, lastpk []st
 		if len(res.Rows) == 0 {
 			return nil
 		}
+		keyOf := func(row [][]byte) []string {
+			if t.byCtid {
+				return []string{string(row[0])}
+			}
+			key := make([]string, len(keyIdx))
+			for i, ci := range keyIdx {
+				key[i] = string(row[ci])
+			}
+			return key
+		}
 		out := &pgshardv1.CopyTablesResponse_Rows{}
+		size := 0
+		// A page's rows go out in as few messages as fit, not in one.
+		// One message per page is bounded by the ROW COUNT alone, and a
+		// row is anything from a few bytes to a megabyte -- so a page of
+		// wide rows built a message past the gRPC limit and the copy
+		// failed on a table whose only fault was wide columns.
+		//
+		// Each chunk carries the key of its own last row, so the resume
+		// point advances with what was actually delivered rather than
+		// with the page it came from.
+		flush := func(row [][]byte) error {
+			if len(out.Rows) == 0 {
+				return nil
+			}
+			lastpk = keyOf(row)
+			out.Lastpk = EncodeLastPK(lastpk)
+			if err := send(&pgshardv1.CopyTablesResponse{Response: &pgshardv1.CopyTablesResponse_Rows_{Rows: out}}); err != nil {
+				return err
+			}
+			out, size = &pgshardv1.CopyTablesResponse_Rows{}, 0
+			return nil
+		}
 		for _, row := range res.Rows {
 			vals := row
 			if t.byCtid {
@@ -303,21 +341,17 @@ func copyRows(ctx context.Context, conn *pgconn.PgConn, t copyTable, lastpk []st
 					r.Values[i] = &pgshardv1.Value{Null: true}
 				} else {
 					r.Values[i] = &pgshardv1.Value{Data: append([]byte(nil), v...)}
+					size += len(v)
 				}
 			}
 			out.Rows = append(out.Rows, r)
-		}
-		last := res.Rows[len(res.Rows)-1]
-		if t.byCtid {
-			lastpk = []string{string(last[0])}
-		} else {
-			lastpk = make([]string, len(keyIdx))
-			for i, ci := range keyIdx {
-				lastpk[i] = string(last[ci])
+			if size >= copyChunkBytes {
+				if err := flush(row); err != nil {
+					return err
+				}
 			}
 		}
-		out.Lastpk = EncodeLastPK(lastpk)
-		if err := send(&pgshardv1.CopyTablesResponse{Response: &pgshardv1.CopyTablesResponse_Rows_{Rows: out}}); err != nil {
+		if err := flush(res.Rows[len(res.Rows)-1]); err != nil {
 			return err
 		}
 		if len(res.Rows) < batch {
