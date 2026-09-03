@@ -458,3 +458,46 @@ func (w *walker) claimedNextval(root *pgquerypb.Node) map[*pgquerypb.FuncCall]bo
 	}
 	return claimed
 }
+
+// registeredSequenceObject reports the registered global sequence whose
+// serial a sequence OBJECT backs, or "" for one that backs none.
+//
+// The two are named differently and that is the whole difficulty.
+// pgshard registers a global sequence as database.schema.table.column;
+// PostgreSQL names the physical sequence a serial creates
+// <table>_<column>_seq. So ALTER SEQUENCE orders_id_seq names a per-shard
+// object, and fanning it out resets every shard's own counter while the
+// counter the router actually allocates from carries on untouched. The
+// statement reports success and changes nothing that matters.
+//
+// Derived rather than looked up, because the router has the registered
+// columns and not the shards' catalogs. A name PostgreSQL truncated to 63
+// characters will not match and the statement is fanned out as before:
+// missing one is the safe direction, since the outcome is the behaviour
+// that exists today rather than a refusal of something unrelated.
+func (w *walker) registeredSequenceObject(rv *pgquerypb.RangeVar) string {
+	if rv == nil || w.sess.Snapshot == nil || rv.GetRelname() == "" {
+		return ""
+	}
+	schemas := []string{rv.GetSchemaname()}
+	if rv.GetSchemaname() == "" {
+		schemas = w.sess.SearchPath
+		if len(schemas) == 0 {
+			schemas = []string{"public"}
+		}
+	}
+	for name := range w.sess.Snapshot.Sequences {
+		parts := strings.Split(name, ".")
+		if len(parts) != 4 || parts[0] != w.sess.Database {
+			continue
+		}
+		schema, table, col := parts[1], parts[2], parts[3]
+		if !contains(schemas, schema) {
+			continue
+		}
+		if table+"_"+col+"_seq" == rv.GetRelname() {
+			return name
+		}
+	}
+	return ""
+}

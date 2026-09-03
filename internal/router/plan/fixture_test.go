@@ -37,7 +37,11 @@ func fixture(t testing.TB) *snapshot.Snapshot {
 	tbl("docs", "sharded", "slug")
 	s.Tables[snapshot.TableKey{Database: fixtureDB, SchemaName: "public", TableName: "tickets"}] = snapshot.Placement{Placement: "sharded", ShardKey: "tenant_id", SequenceColumns: []string{"id"}}
 	s.Tables[snapshot.TableKey{Database: fixtureDB, SchemaName: "public", TableName: "events"}] = snapshot.Placement{Placement: "sharded", ShardKey: "event_id", SequenceColumns: []string{"event_id"}}
-	s.Sequences = map[string]bool{"invoice_numbers": true}
+	// A registered global sequence, named the way the catalog names one:
+	// database.schema.table.column. The physical sequence behind it is
+	// PostgreSQL's tickets_id_seq, which is what an ALTER SEQUENCE would
+	// name.
+	s.Sequences = map[string]bool{"invoice_numbers": true, fixtureDB + ".public.tickets.id": true}
 	s.Tables[snapshot.TableKey{Database: fixtureDB, SchemaName: "audit", TableName: "events"}] = snapshot.Placement{Placement: "sharded", ShardKey: "tenant_id"}
 	return s
 }

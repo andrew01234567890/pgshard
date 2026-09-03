@@ -800,6 +800,10 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 	case *pgquerypb.Node_CreateSeqStmt:
 		return w.migration(Migration{Kind: "CREATE SEQUENCE", Scope: ScopeAll, Object: relationRef(n.CreateSeqStmt.GetSequence(), objectPresent)})
 	case *pgquerypb.Node_AlterSeqStmt:
+		if seq := w.registeredSequenceObject(n.AlterSeqStmt.GetSequence()); seq != "" {
+			return notYet("ALTER SEQUENCE on "+n.AlterSeqStmt.GetSequence().GetRelname()+" is not available through the router: it is the per-shard sequence behind the global sequence "+seq+", and altering it changes each shard's own counter rather than the one the router allocates from",
+				"a global sequence's allocation is the router's; there is nothing on a shard to restart or re-parameterise")
+		}
 		return w.migration(Migration{Kind: "ALTER SEQUENCE", Scope: ScopeAll})
 	case *pgquerypb.Node_CompositeTypeStmt, *pgquerypb.Node_CreateEnumStmt, *pgquerypb.Node_CreateRangeStmt:
 		return w.migration(Migration{Kind: "CREATE TYPE", Scope: ScopeAll})
