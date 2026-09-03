@@ -354,6 +354,12 @@ func (e *Executor) runReqsOn(ctx context.Context, p *txnPart, reqs []*pgshardv1.
 			werr = w.RowDescription(fieldDescriptions(m.RowDescription.Fields))
 		case *pgshardv1.ExecuteResponse_DataRow:
 			werr = w.DataRow(rowValues(m.DataRow))
+		case *pgshardv1.ExecuteResponse_DataRows:
+			for _, row := range m.DataRows.GetRows() {
+				if werr = w.DataRow(rowValues(row)); werr != nil {
+					break
+				}
+			}
 		case *pgshardv1.ExecuteResponse_CommandComplete:
 			p.tag = m.CommandComplete.Tag
 			werr = w.CommandComplete(m.CommandComplete.Tag)

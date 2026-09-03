@@ -384,6 +384,12 @@ type fakeStream struct {
 	// has asked, so the whole suite exercises that shape rather than only
 	// the one a pooler that predates the request field sends.
 	packed bool
+	// batched coalesces rows into DataRows the way a current pooler does
+	// once the router has asked, so the suite exercises that shape too.
+	// Any other message sends the pending rows first, which is the
+	// ordering production guarantees.
+	batched bool
+	rows    []*pgshardv1.DataRow
 	// binary is set while a Bind asked for binary results; described while
 	// the portal was described before Execute.
 	formats   []int32
@@ -410,7 +416,52 @@ func (s *fakeStream) binaryCol(i int) bool {
 }
 
 func (s *fakeStream) send(m *pgshardv1.ExecuteResponse) error {
+	if s.batched {
+		if dr, ok := m.GetMessage().(*pgshardv1.ExecuteResponse_DataRow); ok && !fakeWideRow(dr.DataRow) {
+			s.rows = append(s.rows, dr.DataRow)
+			if len(s.rows) < fakeRowBatch {
+				return nil
+			}
+			return s.flushRows()
+		}
+		if err := s.flushRows(); err != nil {
+			return err
+		}
+	}
 	m.SessionId = s.sid
+	return s.stream.Send(m)
+}
+
+// fakeRowBatch is deliberately small: a suite whose results are a handful
+// of rows would never fill a production-sized batch, and an arm nothing
+// reaches is an arm nothing tests.
+const fakeRowBatch = 3
+
+// fakeWideRow mirrors the real pooler's rule that a row already several
+// kilobytes wide is sent on its own, because batching such a row costs
+// more to marshal than the message it saves. A double that batched
+// everything would measure a shape production never sends.
+func fakeWideRow(d *pgshardv1.DataRow) bool {
+	n := 0
+	for _, v := range d.GetPacked() {
+		n += len(v)
+	}
+	for _, c := range d.GetColumns() {
+		n += len(c.GetData())
+	}
+	return n >= 4<<10
+}
+
+func (s *fakeStream) flushRows() error {
+	if len(s.rows) == 0 {
+		return nil
+	}
+	m := &pgshardv1.ExecuteResponse{SessionId: s.sid,
+		Message: &pgshardv1.ExecuteResponse_DataRows{DataRows: &pgshardv1.DataRows{Rows: s.rows}}}
+	if len(s.rows) == 1 {
+		m.Message = &pgshardv1.ExecuteResponse_DataRow{DataRow: s.rows[0]}
+	}
+	s.rows = nil
 	return s.stream.Send(m)
 }
 
@@ -1002,7 +1053,8 @@ func (f *fakePooler) Execute(stream pgshardv1.Pooler_ExecuteServer) error {
 		}
 		f.detach(first.SessionId)
 	}()
-	s := &fakeStream{f: f, sid: first.SessionId, stream: stream, packed: first.PackedRows && !f.legacyRows}
+	s := &fakeStream{f: f, sid: first.SessionId, stream: stream, packed: first.PackedRows && !f.legacyRows,
+		batched: first.BatchedRows && !f.legacyRows}
 	req := first
 	for {
 		// NOTE: dropAfter is read WITHOUT f.mu, and that is load-bearing
@@ -1016,6 +1068,7 @@ func (f *fakePooler) Execute(stream pgshardv1.Pooler_ExecuteServer) error {
 			return errors.New("fake pooler: dropping stream")
 		}
 		s.packed = s.packed || (req.PackedRows && !f.legacyRows)
+		s.batched = s.batched || (req.BatchedRows && !f.legacyRows)
 		if err := s.handle(stream.Context(), req); err != nil {
 			return err
 		}

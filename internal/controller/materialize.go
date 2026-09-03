@@ -53,9 +53,13 @@ type AgentMaterializer struct {
 func (m *AgentMaterializer) MaterializeSchema(ctx context.Context, target ShardRef, database, sourceConnInfo string) error {
 	var endpoint *string
 	var epoch int64
-	// Endpoint and epoch in one read: taken separately, the copy could be
-	// sent to the member named by one and vouched for by the other.
-	if err := m.Pool.QueryRow(ctx, `SELECT primary_endpoint, primary_epoch FROM pgshard.shard_status WHERE shard_set = $1 AND shard_id = $2`, target.Set, target.ID).Scan(&endpoint, &epoch); err != nil {
+	var agentMTLS bool
+	// Endpoint, epoch and transport mode in one read: taken separately, the
+	// copy could be sent to the member named by one, vouched for by another,
+	// and dialled the way a third says. The mode belongs with the endpoint
+	// in particular -- during a rollout it changes per member, so the way to
+	// reach a member is only true of the member it was read with.
+	if err := m.Pool.QueryRow(ctx, `SELECT primary_endpoint, primary_epoch, agent_mtls FROM pgshard.shard_status WHERE shard_set = $1 AND shard_id = $2`, target.Set, target.ID).Scan(&endpoint, &epoch, &agentMTLS); err != nil {
 		return fmt.Errorf("target %s/%d: %w", target.Set, target.ID, err)
 	}
 	if endpoint == nil || *endpoint == "" {
@@ -65,8 +69,11 @@ func (m *AgentMaterializer) MaterializeSchema(ctx context.Context, target ShardR
 	if err != nil {
 		return err
 	}
+	// Plaintext unless this member says otherwise, even when credentials
+	// exist: an agent that has not restarted into the requirement refuses a
+	// TLS handshake, and half a rolled-over fleet is in that state.
 	tc := m.Creds
-	if tc == nil {
+	if tc == nil || !agentMTLS {
 		tc = insecure.NewCredentials()
 	}
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(tc))

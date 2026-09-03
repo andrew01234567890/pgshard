@@ -654,6 +654,27 @@ func (p *participant) pump(onError func()) {
 	}
 	defer sendHeader()
 	stopped := false
+	// emit publishes one row and reports whether the next one is still
+	// wanted: a stopped participant has nowhere to put it.
+	emit := func(dr *pgshardv1.DataRow) bool {
+		if !headerSent || stopped {
+			return false
+		}
+		row := rowValues(dr)
+		if !p.waitForRoom() {
+			stopped = true
+			return false
+		}
+		p.queued.Add(rowBytes(row))
+		select {
+		case p.rows <- row:
+			return true
+		case <-p.stop:
+			p.queued.Add(-rowBytes(row))
+			stopped = true
+			return false
+		}
+	}
 	for {
 		resp, err := p.ps.recv(context.Background(), nil)
 		if err != nil {
@@ -668,18 +689,11 @@ func (p *participant) pump(onError func()) {
 			}
 			sendHeader()
 		case *pgshardv1.ExecuteResponse_DataRow:
-			if headerSent && !stopped {
-				row := rowValues(m.DataRow)
-				if !p.waitForRoom() {
-					stopped = true
+			emit(m.DataRow)
+		case *pgshardv1.ExecuteResponse_DataRows:
+			for _, row := range m.DataRows.GetRows() {
+				if !emit(row) {
 					break
-				}
-				p.queued.Add(rowBytes(row))
-				select {
-				case p.rows <- row:
-				case <-p.stop:
-					p.queued.Add(-rowBytes(row))
-					stopped = true
 				}
 			}
 		case *pgshardv1.ExecuteResponse_CommandComplete:

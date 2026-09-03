@@ -136,6 +136,10 @@ type groupObservation struct {
 	// A group with two members on one node has fewer failure domains than
 	// replicas, whatever the replica count says.
 	nodes []string
+	// primaryAgentMTLS is whether the primary's agent was STARTED requiring
+	// mutual TLS. Published to the catalog for the controller, which dials
+	// this shard's primary and cannot read pod annotations itself.
+	primaryAgentMTLS bool
 	// primaryBuild is what the primary's agent says it is. Only the
 	// primary's: that is the one Status call this pass already makes, and
 	// asking every member would be an RPC per member per reconcile for
@@ -874,6 +878,11 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 		stErr = errors.New("pod has no IP yet")
 	}
 	obs.primaryBuild = st.Build
+	// Taken from the pod, not the spec: the controller dials this shard's
+	// primary and cannot see pods, so the catalog has to carry what this
+	// member is RUNNING rather than what the cluster now asks for.
+	obs.primaryAgentMTLS = primary.pod != nil && primary.pod.Annotations[AnnotationAgentMTLS] == "true"
+
 	healthy := primaryHealthy(primary.pod, primary.ready, st, stErr)
 	unhealthyFor := r.unhealthyFor(g.Prefix(), !healthy)
 	if !healthy {
@@ -1283,7 +1292,8 @@ func (r *ClusterReconciler) publishShardStatus(ctx context.Context, c *pgshardv1
 	cond := metav1.Condition{Type: ConditionCatalogReady, Status: metav1.ConditionTrue, Reason: "Migrated", Message: "catalog schema is current", ObservedGeneration: c.Generation}
 	rows := make([]ShardStatus, len(shards))
 	for i, o := range shards {
-		rows[i] = ShardStatus{Group: o.group, Epoch: o.state.epoch, Endpoint: r.memberEndpoint(c, o.group, o.state.primary)}
+		rows[i] = ShardStatus{Group: o.group, Epoch: o.state.epoch,
+			Endpoint: r.memberEndpoint(c, o.group, o.state.primary), AgentMTLS: o.primaryAgentMTLS}
 	}
 	if err := r.Prober.PublishShardStatus(ctx, dsn, rows); err != nil {
 		cond.Status = metav1.ConditionFalse
