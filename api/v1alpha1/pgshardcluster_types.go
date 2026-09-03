@@ -93,8 +93,12 @@ type StorageSpec struct {
 
 // CatalogSpec configures the control-plane catalog group.
 type CatalogSpec struct {
+	// Replicas is the catalog group's member count. Like
+	// replicasPerShard it may be raised and not lowered, and for the same
+	// reason: nothing retires a member it stops rendering.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=3
+	// +kubebuilder:validation:XValidation:rule="self >= oldSelf",message="catalog.replicas cannot be lowered: a member removed by lowering this is left running: it keeps its pod, its PVC, its replication slot and its place in synchronous_standby_names, because nothing drains or deletes it yet. Raising it is supported"
 	// +optional
 	Replicas int         `json:"replicas,omitempty"`
 	Storage  StorageSpec `json:"storage"`
@@ -329,8 +333,19 @@ type PgShardClusterSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	Shards *int `json:"shards,omitempty"`
+	// ReplicasPerShard is one primary and the standbys behind it.
+	//
+	// It may be raised and not lowered. Lowering it stops the operator
+	// rendering the removed members, and nothing else: their pods keep
+	// running, their PVCs stay, their slots stay, and they stay in
+	// synchronous_standby_names -- so a commit can still be acknowledged
+	// by a member the cluster has stopped managing. Refusing the edit is
+	// the honest containment until there is a path that switches away from
+	// a removed primary, drains one member at a time, and retires each
+	// one's volume deliberately.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=3
+	// +kubebuilder:validation:XValidation:rule="self >= oldSelf",message="replicasPerShard cannot be lowered: a member removed by lowering this is left running: it keeps its pod, its PVC, its replication slot and its place in synchronous_standby_names, because nothing drains or deletes it yet. Raising it is supported"
 	// +optional
 	ReplicasPerShard int `json:"replicasPerShard,omitempty"`
 	// UnsafeSingleReplica relaxes the replicasPerShard and catalog.replicas
