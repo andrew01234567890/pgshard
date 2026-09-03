@@ -29,7 +29,7 @@ type Router struct {
 	VStreamOpenTxns      prometheus.Gauge
 	VStreamTooLarge      *prometheus.CounterVec
 	activeSessions       prometheus.GaugeFunc
-	snapshotAge      prometheus.GaugeFunc
+	snapshotAge          prometheus.GaugeFunc
 }
 
 // NewRouter registers the router metric set on reg. sessions reports the
