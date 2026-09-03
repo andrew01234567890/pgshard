@@ -382,6 +382,16 @@ type relay struct {
 	// allocation and a length-delimited frame each way, per column, per
 	// row, and rows are the one message a result has many of.
 	packed bool
+	// batched is set once a request asks for batched rows, and then every
+	// row of the session goes out in a DataRows message. A message per row
+	// cost a socket write and a goroutine wake per row, which is what made
+	// a scatter expensive: a batch pays those once per flush instead.
+	batched bool
+	// rows holds the batch not yet sent, and rowBytes what it carries.
+	// Any message that is not a row sends them first, so a client still
+	// sees its rows before whatever followed them.
+	rows     []*pgshardv1.DataRow
+	rowBytes int
 }
 
 // flushEveryCopyBytes bounds how much of a COPY IN upload the pooler holds
@@ -395,9 +405,72 @@ func (r *relay) expect(b *Backend, fm pgproto3.FrontendMessage) {
 	r.awaiting++
 }
 
+// batchRowBytes bounds what one DataRows message carries.
+const batchRowBytes = 64 << 10
+
+// batchRowCount bounds the same message by rows, so a narrow result still
+// reaches the client in reasonable pieces rather than waiting for the byte
+// bound to accumulate out of two-byte rows.
+const batchRowCount = 256
+
+// batchWideRow is the row size above which batching stops paying and
+// starts costing. A batch amortises a message's fixed cost over the rows
+// in it, so it only helps rows that are small compared to that cost; a row
+// already several kilobytes wide amortises nothing, and carrying it inside
+// a repeated field measurably costs more to marshal and unmarshal than
+// sending it on its own. Measured on BenchmarkScatterRowsThroughRouter:
+// 4 KiB columns lost 60% of their throughput and gained 40% of their
+// allocations when batched, and lost exactly as much with one row per
+// batch as with eight - so it is the envelope, not the batching.
+const batchWideRow = 4 << 10
+
 func (r *relay) send(msg *pgshardv1.ExecuteResponse) error {
+	if r.batched {
+		if dr, ok := msg.GetMessage().(*pgshardv1.ExecuteResponse_DataRow); ok {
+			if n := rowBytes(dr.DataRow); n < batchWideRow {
+				r.rows = append(r.rows, dr.DataRow)
+				r.rowBytes += n
+				if r.rowBytes >= batchRowBytes || len(r.rows) >= batchRowCount {
+					return r.flushRows()
+				}
+				return nil
+			}
+		}
+		if err := r.flushRows(); err != nil {
+			return err
+		}
+	}
 	msg.SessionId = r.se.id
 	return r.stream.Send(msg)
+}
+
+func (r *relay) flushRows() error {
+	if len(r.rows) == 0 {
+		return nil
+	}
+	msg := &pgshardv1.ExecuteResponse{SessionId: r.se.id,
+		Message: &pgshardv1.ExecuteResponse_DataRows{DataRows: &pgshardv1.DataRows{Rows: r.rows}}}
+	// A batch of one is not a batch. Wrapping a lone row costs the
+	// envelope and saves no message, which a single-row result pays on
+	// every statement.
+	if len(r.rows) == 1 {
+		msg.Message = &pgshardv1.ExecuteResponse_DataRow{DataRow: r.rows[0]}
+	}
+	r.rows, r.rowBytes = nil, 0
+	return r.stream.Send(msg)
+}
+
+// rowBytes is what a row's values take, which is what the batch bound is
+// about. The framing around them is a constant the bound need not track.
+func rowBytes(d *pgshardv1.DataRow) int {
+	n := 0
+	for _, v := range d.GetPacked() {
+		n += len(v)
+	}
+	for _, c := range d.GetColumns() {
+		n += len(c.GetData())
+	}
+	return n
 }
 
 func (r *relay) refuse(e *pgshardv1.Error) error {
@@ -464,6 +537,7 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 	// messages it originates, and a row can arrive while the relay is
 	// answering something else.
 	r.packed = r.packed || req.PackedRows
+	r.batched = r.batched || req.BatchedRows
 	view := r.srv.cfg.Source.View()
 	if e := fence(view, req.Generation); e != nil {
 		return r.refuse(e)

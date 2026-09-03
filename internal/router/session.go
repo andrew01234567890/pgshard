@@ -1837,6 +1837,15 @@ func (e *Executor) pump(ctx context.Context, w pgwire.ResultWriter) error {
 			if !e.hiddenNow() {
 				werr = w.DataRow(rowValues(m.DataRow))
 			}
+		case *pgshardv1.ExecuteResponse_DataRows:
+			for _, row := range m.DataRows.GetRows() {
+				e.rows.Inc()
+				if !e.hiddenNow() {
+					if werr = w.DataRow(rowValues(row)); werr != nil {
+						break
+					}
+				}
+			}
 		case *pgshardv1.ExecuteResponse_CommandComplete:
 			if !e.popHidden() {
 				e.lastTag = m.CommandComplete.Tag
