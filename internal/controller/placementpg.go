@@ -7,8 +7,11 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/jackc/pgx/v5"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 )
@@ -1332,43 +1335,79 @@ func (p *Placer) unlock(ctx context.Context, wf *placementWorkflow) error {
 // the first rename on that shard) covers it: only that marker proves the
 // swap began after a verification that already passed, so a shadow lost to
 // anything else can never publish a stale placement.
+// verifyPlacementConcurrency bounds the shards digested at once. The
+// digests run with the table fenced, so they are the write pause; taking
+// them one shard after another made that pause grow with the number of
+// shards, when the shards are separate machines doing separate scans.
+const verifyPlacementConcurrency = 8
+
 func (p *Placer) verifyPlacement(ctx context.Context, wf *placementWorkflow) error {
+	// The holders come first and on their own. A holder that has already
+	// swapped ends the verification, and it has to end it before any
+	// source is read: the swap renames the source table away, so reading
+	// one after a swap began finds nothing where the table was.
+	var swapped atomic.Bool
+	var mu sync.Mutex
 	targets := map[int32]rowDigest{}
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(verifyPlacementConcurrency)
 	for _, t := range wf.rt.Holders() {
-		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
-		if err != nil {
-			return err
-		}
-		hasShadow, err := tableExists(ctx, conn, wf.spec.SchemaName, wf.shadow())
-		if err == nil && !hasShadow {
-			_ = conn.Close(ctx)
-			if slices.Contains(wf.st.Swapped, t) {
-				return nil
+		g.Go(func() error {
+			conn, err := p.Shards.DialDatabase(gctx, wf.st.SourceSet, t, wf.spec.Database)
+			if err != nil {
+				return err
 			}
-			return fatal("shadow of %s missing on shard %d before the swap began", wf.spec.table(), t)
-		}
-		var d rowDigest
-		if err == nil {
-			d, err = digest(ctx, conn, wf.spec.SchemaName, wf.shadow(), "")
-		}
-		_ = conn.Close(ctx)
-		if err != nil {
-			return err
-		}
-		targets[t] = d
+			defer func() { _ = conn.Close(gctx) }()
+			hasShadow, err := tableExists(gctx, conn, wf.spec.SchemaName, wf.shadow())
+			if err == nil && !hasShadow {
+				if slices.Contains(wf.st.Swapped, t) {
+					swapped.Store(true)
+					return nil
+				}
+				return fatal("shadow of %s missing on shard %d before the swap began", wf.spec.table(), t)
+			}
+			var d rowDigest
+			if err == nil {
+				d, err = digest(gctx, conn, wf.spec.SchemaName, wf.shadow(), "")
+			}
+			if err != nil {
+				return err
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			targets[t] = d
+			return nil
+		})
 	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	if swapped.Load() {
+		return nil
+	}
+
 	var src rowDigest
+	g, gctx = errgroup.WithContext(ctx)
+	g.SetLimit(verifyPlacementConcurrency)
 	for _, s := range wf.from.Sources() {
-		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, s, wf.spec.Database)
-		if err != nil {
-			return err
-		}
-		d, err := digest(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, "")
-		_ = conn.Close(ctx)
-		if err != nil {
-			return err
-		}
-		src = src.add(d)
+		g.Go(func() error {
+			conn, err := p.Shards.DialDatabase(gctx, wf.st.SourceSet, s, wf.spec.Database)
+			if err != nil {
+				return err
+			}
+			d, err := digest(gctx, conn, wf.spec.SchemaName, wf.spec.TableName, "")
+			_ = conn.Close(gctx)
+			if err != nil {
+				return err
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			src = src.add(d)
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
 	}
 	if mismatches := placementMismatches(wf.spec.To.Placement, src, targets); len(mismatches) > 0 {
 		return fatal("placement verification of %s failed: %s", wf.spec.table(), strings.Join(mismatches, "; "))
