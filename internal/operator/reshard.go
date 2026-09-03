@@ -151,6 +151,22 @@ func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1al
 			return plan, err
 		}
 	}
+	// A spec.shards that has not changed since the operator last acted on
+	// it is not a reshard request, however far the catalog has moved: a
+	// shard set created through SQL is a supported way to reshard, and
+	// reading the difference as a request turned every one of them into an
+	// automatic reverse reshard back to the spec.
+	if want != nil && *want == effective {
+		c.Status.AppliedShards = want
+	}
+	if pending == nil && want != nil && *want != effective && c.Status.AppliedShards != nil && *c.Status.AppliedShards == *want {
+		plan.cond.Status = metav1.ConditionTrue
+		plan.cond.Reason = "ShardCountConflict"
+		plan.cond.Message = fmt.Sprintf("spec.shards is %d and the serving shard set has %d: the catalog was resharded elsewhere and spec.shards has not changed since, so it is not being applied. Set spec.shards to %d to accept the catalog, or change it to reshard again",
+			*want, effective, effective)
+		log.Info("spec.shards differs from the catalog but has not changed; not resharding", "spec", *want, "effective", effective)
+		want = nil
+	}
 	if pending == nil && want != nil && *want != effective {
 		gen := maxGen + 1
 		ranges, err := placement.Split(*want)
@@ -168,6 +184,7 @@ func (r *ClusterReconciler) reconcileReshard(ctx context.Context, c *pgshardv1al
 		}
 		log.Info("materialized pending shard set", "set", name, "shards", *want)
 		pending = &ShardSetInfo{Name: name, Generation: gen, State: catalog.ShardSetDesired, Ranges: ranges, PGMajor: serving.PGMajor}
+		c.Status.AppliedShards = want
 		if err := r.ensureReshardRecord(ctx, c, serving, pending, ReshardSourceSpec); err != nil {
 			return plan, err
 		}
@@ -296,10 +313,18 @@ func generationImage(c *pgshardv1alpha1.PgShardCluster, major int) string {
 func (r *ClusterReconciler) patchClusterStatus(ctx context.Context, c, base *pgshardv1alpha1.PgShardCluster) error {
 	if c.Status.EffectiveShards == base.Status.EffectiveShards && c.Status.ServingGeneration == base.Status.ServingGeneration &&
 		c.Status.ServingPGMajor == base.Status.ServingPGMajor && c.Status.ServingPGImage == base.Status.ServingPGImage &&
+		equalIntPtr(c.Status.AppliedShards, base.Status.AppliedShards) &&
 		equalReshard(c.Status.Reshard, base.Status.Reshard) {
 		return nil
 	}
 	return r.Status().Patch(ctx, c, client.MergeFrom(base))
+}
+
+func equalIntPtr(a, b *int) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 func equalReshard(a, b *pgshardv1alpha1.ClusterReshardStatus) bool {
