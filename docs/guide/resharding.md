@@ -29,9 +29,13 @@ Resharding is declared, not scripted:
 > workflows in `running` (`internal/controller/copy.go`), and the only
 > transition into `running` is for a set that went `desired` →
 > `provisioning` (`internal/controller/reshard.go`), which is what
-> `spec.shards` produces and an in-place edit does not. The rows stay in
+> `spec.shards` produces and an in-place edit does not. The workflow says
+> so on itself — `status->>'message'` on the row explains that it is
+> recorded and not driven, and names what to do instead — so nobody has to
+> find this page to learn why nothing is happening. The rows stay in
 > `pgshard.workflows`; `CancelWorkflow` clears them. Tracked as PGS-508.
-> Use `spec.shards` to change the shard count today.
+> Use `spec.shards` to change the shard count today, or declare a new
+> shard set and let the ranges move to it.
 
 ```sql
 BEGIN;
