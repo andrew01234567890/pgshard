@@ -73,6 +73,7 @@ type reader struct {
 	delivered uint64
 	maxBytes  int
 	maxOpen   int
+	meter     Meter
 	// copy is the pending initial copy; nil once streaming.
 	copy *copyPhase
 
@@ -83,7 +84,7 @@ var errEpochChanged = errors.New("primary epoch changed")
 
 func (r *reader) run(ctx context.Context) {
 	r.asm = assembler{shard: r.shard, relations: map[uint32]*relMeta{}, streamed: map[uint32]*unit{},
-		maxBytes: r.maxBytes, maxOpen: r.maxOpen}
+		maxBytes: r.maxBytes, maxOpen: r.maxOpen, meter: r.meter}
 	backoff := 200 * time.Millisecond
 	var firstFailure time.Time
 	for {
@@ -277,6 +278,39 @@ type assembler struct {
 	// let a very large number of small ones through, each with its own
 	// map entry and slices.
 	maxOpen int
+	// meter reports the two gauges. Nil is the ordinary case in tests and
+	// costs nothing.
+	meter Meter
+}
+
+// report moves the gauges by what the last step changed. Deltas rather
+// than absolute values because every shard's assembler shares the gauge,
+// and one setting an absolute figure would erase the others.
+func (a *assembler) report(bytes, open int) {
+	if a.meter == nil {
+		return
+	}
+	if bytes != 0 {
+		a.meter.BufferedBytes(bytes)
+	}
+	if open != 0 {
+		a.meter.OpenTransactions(open)
+	}
+}
+
+// Meter is what the assembler reports its buffers through. It is an
+// interface rather than the metrics set so this package keeps no
+// dependency on it, and so a test can watch the numbers without a
+// registry: the bounds are what stop a router being taken by one
+// transaction, and the point of the gauges is seeing that coming.
+type Meter interface {
+	// BufferedBytes and OpenTransactions move by a delta, positive as
+	// events are held and negative as transactions finish, because there
+	// is one gauge for every shard's assembler.
+	BufferedBytes(delta int)
+	OpenTransactions(delta int)
+	// TooLarge names the bound that tripped: "bytes" or "transactions".
+	TooLarge(bound string)
 }
 
 // errTooLarge ends a stream whose buffer a transaction did not fit in. The
@@ -286,6 +320,7 @@ type errTooLarge struct{ msg string }
 func (e *errTooLarge) Error() string { return e.msg }
 
 func (a *assembler) reset() {
+	a.report(-a.buffered, -len(a.streamed))
 	a.cur = nil
 	a.streamed = map[uint32]*unit{}
 	a.inStream = 0
@@ -317,10 +352,16 @@ func (a *assembler) append(u *unit, ev *pgshardv1.VEvent, xid uint32, rels ...*r
 // the buffer, and says what overran when they are not.
 func (a *assembler) fits() error {
 	if a.maxBytes > 0 && a.buffered > a.maxBytes {
+		if a.meter != nil {
+			a.meter.TooLarge("bytes")
+		}
 		return &errTooLarge{fmt.Sprintf("shard %s/%d: %d bytes of uncommitted transactions exceed the %d-byte stream buffer",
 			a.shard.Set, a.shard.ID, a.buffered, a.maxBytes)}
 	}
 	if a.maxOpen > 0 && len(a.streamed) > a.maxOpen {
+		if a.meter != nil {
+			a.meter.TooLarge("transactions")
+		}
 		return &errTooLarge{fmt.Sprintf("shard %s/%d: %d interleaved in-progress transactions exceed the limit of %d",
 			a.shard.Set, a.shard.ID, len(a.streamed), a.maxOpen)}
 	}
@@ -347,7 +388,18 @@ func (a *assembler) begin(xid uint32, ts int64, gid string) *pgshardv1.VEvent {
 }
 
 // add consumes one event and returns a finished unit, if any.
+// add takes one decoded change and returns the unit it completed, if any.
+// It reports what it changed rather than instrumenting each mutation: the
+// buffer moves in several places inside, and a wrapper that measures the
+// difference cannot miss one of them.
 func (a *assembler) add(ev *pgshardv1.ChangeEvent) (*unit, error) {
+	bytes, open := a.buffered, len(a.streamed)
+	u, err := a.addOne(ev)
+	a.report(a.buffered-bytes, len(a.streamed)-open)
+	return u, err
+}
+
+func (a *assembler) addOne(ev *pgshardv1.ChangeEvent) (*unit, error) {
 	sh := shardRef(a.shard)
 	switch e := ev.GetEvent().(type) {
 	case *pgshardv1.ChangeEvent_Begin_:

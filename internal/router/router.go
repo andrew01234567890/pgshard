@@ -177,6 +177,12 @@ func (r *Router) InDoubt() int64 { return r.inDoubt.Load() }
 // MetricsHandler serves the router's registry in the Prometheus text format.
 func (r *Router) MetricsHandler() http.Handler { return r.mhandler }
 
+// Metrics is the router's metric set. The change stream server is built
+// beside the router rather than inside it -- vstream imports router, so
+// router cannot import vstream -- and it cannot report what its buffers
+// hold without being handed the collectors.
+func (r *Router) Metrics() *metrics.Router { return r.metrics }
+
 // NewExecutor implements pgwire.Config.NewExecutor: it resolves the session's
 // database to its home shard and refuses databases the catalog does not know
 // with 3D000.
