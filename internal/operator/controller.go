@@ -12,6 +12,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
+	"github.com/andrew01234567890/pgshard/internal/pki"
 )
 
 // DefaultControllerImage is the controller image used when the operator is
@@ -77,7 +78,7 @@ func (r Renderer) ControllerDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv
 	mounts = append(mounts, corev1.VolumeMount{Name: agentTokenVolume, MountPath: agentTokenDir, ReadOnly: true})
 	volumes = append(volumes, corev1.Volume{Name: agentTokenVolume, VolumeSource: corev1.VolumeSource{
 		Secret: &corev1.SecretVolumeSource{SecretName: AgentSecretName(c.Name)}}})
-	if ref := internalTLSRef(c); ref != nil {
+	if ref := internalTLSRefFor(c, pki.RoleController); ref != nil {
 		args = append(args,
 			"--tls-cert="+internalTLSMountPath+"/tls.crt",
 			"--tls-key="+internalTLSMountPath+"/tls.key",
