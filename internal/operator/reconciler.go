@@ -50,6 +50,10 @@ type ClusterReconciler struct {
 	Renderer Renderer
 	Prober   Prober
 	Agents   AgentClient
+	// AgentTLS is how each member's agent must be dialled, filled from the
+	// pods this reconciler observes and read by the agent client. Nil means
+	// every agent is plaintext.
+	AgentTLS *AgentTLSModes
 	// FailoverDelay overrides DefaultFailoverDelay; PollInterval the
 	// quiesce poll; Now the clock. Zero values mean the defaults.
 	FailoverDelay  time.Duration
@@ -1068,6 +1072,10 @@ func (r *ClusterReconciler) observePod(ctx context.Context, c *pgshardv1alpha1.P
 	m.running = pod.Status.Phase == corev1.PodRunning
 	m.ready = podReady(&pod)
 	m.ip = pod.Status.PodIP
+	// Recorded before anything dials this member: the annotation says what
+	// its agent was started requiring, and during a rollout that differs
+	// from what the spec now asks for.
+	r.AgentTLS.Set(agentAddr(m.ip), pod.Annotations[AnnotationAgentMTLS] == "true")
 	return m, nil
 }
 

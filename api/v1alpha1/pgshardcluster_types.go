@@ -136,6 +136,7 @@ type TLSSpec struct {
 // unsupported outside development environments.
 // +kubebuilder:validation:XValidation:rule="(has(self.secretRef) && self.secretRef.name != \"\") || (has(self.insecure) && self.insecure)",message="internalTLS requires secretRef, or insecure: true to explicitly opt into plaintext (unsupported outside development)"
 // +kubebuilder:validation:XValidation:rule="!((has(self.secretRef) && self.secretRef.name != \"\") && has(self.insecure) && self.insecure)",message="internalTLS.secretRef and internalTLS.insecure are mutually exclusive"
+// +kubebuilder:validation:XValidation:rule="!(has(self.agentMTLS) && self.agentMTLS) || (has(self.secretRef) && self.secretRef.name != \"\")",message="internalTLS.agentMTLS needs secretRef: the agents require the certificates it names"
 type InternalTLSSpec struct {
 	// SecretRef names a Secret with tls.crt, tls.key and ca.crt; the
 	// poolers refuse clients whose certificate does not chain to ca.crt
@@ -146,6 +147,18 @@ type InternalTLSSpec struct {
 	// development; the network must be protected by other means.
 	// +optional
 	Insecure bool `json:"insecure,omitempty"`
+	// AgentMTLS makes each member's agent REQUIRE mutual TLS on its gRPC
+	// listener, using the same material secretRef supplies.
+	//
+	// Separate from secretRef because turning it on is a rollout, not a
+	// setting: members restart one at a time, so for the length of the roll
+	// some agents require TLS and some do not. The operator dials each
+	// member according to the spec that member is running, which is why the
+	// switch is safe to make while the cluster serves. Until every member
+	// has restarted, a caller that cannot tell them apart -- the controller
+	// today -- must not be given the material.
+	// +optional
+	AgentMTLS bool `json:"agentMTLS,omitempty"`
 }
 
 // RouterSpec configures the stateless router deployment.

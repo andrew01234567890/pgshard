@@ -176,6 +176,7 @@ func agentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary str
 			SynchronousStandbyNames: SyncStandbyNames(g, primary, c.Spec.Durability.MinSyncStandbys, nil),
 			Parameters:              c.Spec.PostgreSQL.Parameters,
 		},
+		GRPCTLS:         agentGRPCTLS(c),
 		Lease:           agent.LeaseConfig{Enabled: true, Namespace: c.Namespace},
 		ShutdownTimeout: agent.Duration(agentShutdownTimeout),
 		SettingsHash:    tpl.SettingsHash(),
@@ -495,6 +496,12 @@ func (Renderer) Pod(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, rol
 	meta := objectMeta(g, name, c.Namespace, map[string]string{LabelOrdinal: strconv.Itoa(ordinal), LabelRole: role})
 	meta.Annotations = map[string]string{AnnotationTemplateHash: tpl.Hash(), AnnotationSettingsHash: tpl.SettingsHash(),
 		AnnotationScrape: "true", AnnotationScrapePort: strconv.Itoa(agentHTTPPort), AnnotationScrapePath: "/metrics"}
+	// Stamped on the pod rather than derived from the spec, because during a
+	// rollout the two disagree: this records what THIS pod's agent was
+	// started requiring, which is what a caller has to dial it by.
+	if agentGRPCTLS(c) != (agent.TLSFiles{}) {
+		meta.Annotations[AnnotationAgentMTLS] = "true"
+	}
 	pod := &corev1.Pod{
 		ObjectMeta: meta,
 		Spec: corev1.PodSpec{
@@ -653,6 +660,24 @@ func internalTLSDataChecksum(data map[string][]byte) string {
 		h.Write([]byte{0})
 	}
 	return hex.EncodeToString(h.Sum(nil)[:8])
+}
+
+// agentGRPCTLS is the material the agent's gRPC listener requires, or the
+// zero value for a listener that serves plaintext.
+//
+// Only when spec.internalTLS.agentMTLS is on. Mounting the certificates is
+// not the same as requiring them: agentMounts puts them on every member as
+// soon as the cluster has any, precisely so that turning this on later is a
+// restart and not a provisioning step.
+func agentGRPCTLS(c *pgshardv1alpha1.PgShardCluster) agent.TLSFiles {
+	if !c.Spec.InternalTLS.AgentMTLS || internalTLSRef(c) == nil {
+		return agent.TLSFiles{}
+	}
+	return agent.TLSFiles{
+		CertFile: internalTLSMountPath + "/tls.crt",
+		KeyFile:  internalTLSMountPath + "/tls.key",
+		CAFile:   internalTLSMountPath + "/ca.crt",
+	}
 }
 
 // agentMounts is what the agent container sees. The internal-TLS material
