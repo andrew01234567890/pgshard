@@ -144,6 +144,10 @@ func TestDDLClassification(t *testing.T) {
 		{sql: "grant pgshard_admin to analyst", refuse: "role pgshard_admin is reserved by pgshard"},
 		{sql: "grant analyst to pgshard_admin", refuse: "role pgshard_admin is reserved by pgshard"},
 		{sql: "grant select on orders to pgshard_reader", refuse: "role pgshard_reader is reserved by pgshard"},
+		// Settling what a role's sessions start with reaches the control
+		// plane's own sessions when the role is one of ours.
+		{sql: "alter role pgshard_system set statement_timeout = '1ms'", refuse: "role pgshard_system is reserved by pgshard"},
+		{sql: "alter role pgshard_admin in database app reset all", refuse: "role pgshard_admin is reserved by pgshard"},
 		{sql: "alter role analyst replication", refuse: "roles with the REPLICATION attribute are not available through the router"},
 		{sql: "create user x bypassrls", refuse: "roles with the BYPASSRLS attribute are not available through the router"},
 		{sql: "create user x nosuperuser", mig: "CREATE ROLE all", object: "role:x:present"},
