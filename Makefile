@@ -22,13 +22,17 @@ fmt-check:
 lint:
 	golangci-lint run ./...
 
-# -p bounds how many PACKAGES run at once; PGSHARD_TEST_PG_PARALLEL bounds the
-# PostgreSQL-backed tests within each. Containers in flight is the product of
-# the two, so they are set together here: raising one without the other swamps
-# the runner. See internal/dockertest/parallel.go.
+# PGSHARD_TEST_PG_PARALLEL bounds the PostgreSQL-backed tests within one
+# package; PGSHARD_TEST_PG_GLOBAL bounds them across every test binary, with
+# a lock file per slot, so the containers in flight are bounded whatever -p
+# is and whatever anybody runs by hand. The pairing used to be a convention
+# here and nothing enforced it -- `go test ./pkg/a ./pkg/b` walked straight
+# past it, and the failure was a container that never became ready in
+# whichever suite was unlucky. See internal/dockertest/parallel.go.
 test: PGSHARD_TEST_PG_PARALLEL ?= 4
+test: PGSHARD_TEST_PG_GLOBAL ?= 6
 test:
-	PGSHARD_TEST_PG_PARALLEL=$(PGSHARD_TEST_PG_PARALLEL) go test -race -p 4 ./...
+	PGSHARD_TEST_PG_PARALLEL=$(PGSHARD_TEST_PG_PARALLEL) PGSHARD_TEST_PG_GLOBAL=$(PGSHARD_TEST_PG_GLOBAL) go test -race -p 4 ./...
 
 # verify is the fast gate: everything that needs only Go, a C compiler and
 # the pinned linters. It deliberately does not run the gates that need a
@@ -137,8 +141,9 @@ e2e:
 # could never pass, and refusal messages that had changed underneath their
 # assertions, went unnoticed. The timeout is the suite's, not Go's ten
 # minutes: the router suite alone takes longer than that.
+integration: PGSHARD_TEST_PG_GLOBAL ?= 6
 integration:
-	PGSHARD_REQUIRE_DOCKER=1 go test -tags integration -count=1 -timeout 45m ./test/e2e/router/... ./internal/agent/... ./internal/pgtune/... ./internal/pgwire/... ./internal/pgrepl/...
+	PGSHARD_REQUIRE_DOCKER=1 PGSHARD_TEST_PG_GLOBAL=$(PGSHARD_TEST_PG_GLOBAL) go test -tags integration -count=1 -timeout 45m ./test/e2e/router/... ./internal/agent/... ./internal/pgtune/... ./internal/pgwire/... ./internal/pgrepl/...
 
 # fuzz runs each fuzz target for a bounded time. Go runs only a target's
 # seed corpus during an ordinary `go test`, so without this the three
