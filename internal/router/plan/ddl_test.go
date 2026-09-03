@@ -31,8 +31,11 @@ func TestDDLClassification(t *testing.T) {
 		{sql: "create table regions (id int primary key)", mig: "CREATE TABLE all", object: "relation:regions:present"},
 		{sql: "create table orders (id int primary key, tenant_id int8)", refuse: "primary key or unique constraint (id) on sharded table"},
 		{sql: "create table orders (id int)", refuse: "sharded table \"orders\" must define its shard key column"},
-		{sql: "create table orders (tenant_id character(3), id int, primary key (tenant_id, id))", refuse: "shard key column \"tenant_id\" of sharded table \"orders\" cannot be a blank-padded"},
-		{sql: "create table orders (tenant_id bpchar, id int, primary key (tenant_id, id))", refuse: "shard key column \"tenant_id\" of sharded table \"orders\" cannot be a blank-padded"},
+		// A blank-padded shard key is allowed: the router trims by the
+		// column's declared type, so it hashes the value the ::text cast
+		// on the shard hashes.
+		{sql: "create table orders (tenant_id character(3), id int, primary key (tenant_id, id))", mig: "CREATE TABLE all", object: "relation:orders:present"},
+		{sql: "create table orders (tenant_id bpchar, id int, primary key (tenant_id, id))", mig: "CREATE TABLE all", object: "relation:orders:present"},
 		{sql: "create unlogged table t2 (id int)", refuse: "CREATE UNLOGGED TABLE is not supported"},
 		{sql: "create unlogged table t3 as select 1", refuse: "CREATE UNLOGGED TABLE AS is not supported"},
 		{sql: "create unlogged materialized view mv2 as select 1", refuse: "CREATE UNLOGGED MATERIALIZED VIEW is not supported"},

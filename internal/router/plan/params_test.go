@@ -50,8 +50,10 @@ func TestDecodeShardKey(t *testing.T) {
 		{name: "unknown binary with text hint", oid: 0, hint: HintText, format: 1, raw: []byte("12345678"), want: "12345678"},
 		{name: "unsupported binary type", oid: 1700, format: 1, raw: be64(1), fails: true},
 		{name: "unsupported text type", oid: 1700, raw: []byte("1.5"), fails: true},
-		{name: "bpchar text is refused", oid: oidBpchar, raw: []byte("ab "), err: errBlankPaddedKey},
-		{name: "bpchar binary is refused", oid: oidBpchar, format: 1, raw: []byte("ab "), err: errBlankPaddedKey},
+		// bpchar decodes to its bytes; the trailing spaces come off in
+		// normaliseKey, which is where the column's type is known.
+		{name: "bpchar text decodes", oid: oidBpchar, raw: []byte("ab "), want: "ab "},
+		{name: "bpchar binary decodes", oid: oidBpchar, format: 1, raw: []byte("ab "), want: "ab "},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

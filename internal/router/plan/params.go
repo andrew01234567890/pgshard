@@ -60,11 +60,6 @@ func (b BindParams) ShardKey(n int32, hint TypeHint) (any, error) {
 // shard key.
 var ErrAmbiguousKey = errors.New("value is untyped and looks numeric: cast it to int8 or text")
 
-// errBlankPaddedKey refuses a bpchar shard-key parameter: blank-padded
-// equality ignores trailing spaces, so hashing the raw bytes may not match
-// the shard the row was placed on.
-var errBlankPaddedKey = errors.New("bpchar shard key parameters are not supported; cast to text")
-
 // DecodeShardKey turns one bound parameter into an int64 or string shard
 // key. The declared parameter type wins; a cast in the statement text
 // (hint) types an undeclared parameter; an undeclared text-format value
@@ -111,7 +106,12 @@ func DecodeShardKey(oid uint32, hint TypeHint, format int16, raw []byte) (any, e
 		case oidText, oidVarchar, oidName:
 			return string(raw), nil
 		case oidBpchar:
-			return nil, errBlankPaddedKey
+			// The trailing spaces come off where the column's declared
+			// length is known: this decodes the value, normaliseKey trims
+			// it by type. A bpchar parameter is not itself padded -- the
+			// padding is the column's -- but a client may send one that
+			// is, and PostgreSQL would compare it equal either way.
+			return string(raw), nil
 		}
 		return nil, fmt.Errorf("binary parameter of type oid %d is not a supported shard key", oid)
 	}
@@ -126,7 +126,7 @@ func DecodeShardKey(oid uint32, hint TypeHint, format int16, raw []byte) (any, e
 	case oidText, oidVarchar, oidName:
 		return s, nil
 	case oidBpchar:
-		return nil, errBlankPaddedKey
+		return s, nil
 	case 0, oidUnknown:
 		if _, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64); err == nil {
 			return nil, ErrAmbiguousKey
