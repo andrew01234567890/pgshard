@@ -48,7 +48,16 @@ target "_common" {
   dockerfile = "postgres/Dockerfile"
   cache-from = CI == "true" ? ["type=gha"] : []
   cache-to   = CI == "true" ? ["type=gha,mode=max"] : []
-  args = { PGBACKREST_VERSION = PGBACKREST_VERSION, PGBACKREST_SHA256 = PGBACKREST_SHA256 }
+  args = {
+    PGBACKREST_VERSION = PGBACKREST_VERSION, PGBACKREST_SHA256 = PGBACKREST_SHA256,
+    // The agent and the pooler ship inside this image and are as much a
+    // deployed binary as the control plane's are. Built without these they
+    // answered --version with "dev (none, unknown)", which is no answer at
+    // all when the question is which commit is running on a member.
+    VERSION = VERSION != "" ? VERSION : "dev",
+    COMMIT  = GIT_SHA != "" ? GIT_SHA : "none",
+    DATE    = BUILD_DATE != "" ? BUILD_DATE : "unknown",
+  }
 }
 
 target "postgres-18" {
