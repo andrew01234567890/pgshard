@@ -93,8 +93,12 @@ type StorageSpec struct {
 
 // CatalogSpec configures the control-plane catalog group.
 type CatalogSpec struct {
+	// Replicas is the catalog group's member count. Like
+	// replicasPerShard it may be raised and not lowered, and for the same
+	// reason: nothing retires a member it stops rendering.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=3
+	// +kubebuilder:validation:XValidation:rule="self >= oldSelf",message="catalog.replicas cannot be lowered: a member removed by lowering this is left running: it keeps its pod, its PVC, its replication slot and its place in synchronous_standby_names, because nothing drains or deletes it yet. Raising it is supported"
 	// +optional
 	Replicas int         `json:"replicas,omitempty"`
 	Storage  StorageSpec `json:"storage"`
@@ -134,9 +138,10 @@ type TLSSpec struct {
 // InternalTLSSpec configures router<->pooler transport security. Plaintext
 // is never the default: it must be requested with insecure, which is
 // unsupported outside development environments.
-// +kubebuilder:validation:XValidation:rule="(has(self.secretRef) && self.secretRef.name != \"\") || (has(self.insecure) && self.insecure)",message="internalTLS requires secretRef, or insecure: true to explicitly opt into plaintext (unsupported outside development)"
+// +kubebuilder:validation:XValidation:rule="(has(self.secretRef) && self.secretRef.name != \"\") || (has(self.insecure) && self.insecure) || (has(self.issue) && self.issue)",message="internalTLS requires issue: true, or secretRef, or insecure: true to explicitly opt into plaintext (unsupported outside development)"
 // +kubebuilder:validation:XValidation:rule="!((has(self.secretRef) && self.secretRef.name != \"\") && has(self.insecure) && self.insecure)",message="internalTLS.secretRef and internalTLS.insecure are mutually exclusive"
-// +kubebuilder:validation:XValidation:rule="!(has(self.agentMTLS) && self.agentMTLS) || (has(self.secretRef) && self.secretRef.name != \"\")",message="internalTLS.agentMTLS needs secretRef: the agents require the certificates it names"
+// +kubebuilder:validation:XValidation:rule="!(has(self.issue) && self.issue) || (!(has(self.secretRef) && self.secretRef.name != \"\") && !(has(self.insecure) && self.insecure))",message="internalTLS.issue is exclusive with secretRef and insecure: the operator either issues the certificates or is given them"
+// +kubebuilder:validation:XValidation:rule="!(has(self.agentMTLS) && self.agentMTLS) || (has(self.secretRef) && self.secretRef.name != \"\") || (has(self.issue) && self.issue)",message="internalTLS.agentMTLS needs secretRef or issue: the agents require certificates from somewhere"
 type InternalTLSSpec struct {
 	// SecretRef names a Secret with tls.crt, tls.key and ca.crt; the
 	// poolers refuse clients whose certificate does not chain to ca.crt
@@ -159,6 +164,18 @@ type InternalTLSSpec struct {
 	// today -- must not be given the material.
 	// +optional
 	AgentMTLS bool `json:"agentMTLS,omitempty"`
+	// Issue makes the operator its own certificate authority: it mints a
+	// CA for the cluster and a certificate per workload from it, and each
+	// listener then accepts only the identities it is meant to serve.
+	//
+	// secretRef cannot do that, whoever supplies it. One Secret is one
+	// certificate, and it is mounted into the agent, the router and the
+	// pooler alike -- so it spans three trust boundaries, and a listener
+	// verifying the chain learns only that the peer is somewhere in the
+	// cluster. Distinguishing a router from an agent needs them to hold
+	// different certificates, and that needs an issuer.
+	// +optional
+	Issue bool `json:"issue,omitempty"`
 }
 
 // RouterSpec configures the stateless router deployment.
@@ -329,8 +346,19 @@ type PgShardClusterSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	Shards *int `json:"shards,omitempty"`
+	// ReplicasPerShard is one primary and the standbys behind it.
+	//
+	// It may be raised and not lowered. Lowering it stops the operator
+	// rendering the removed members, and nothing else: their pods keep
+	// running, their PVCs stay, their slots stay, and they stay in
+	// synchronous_standby_names -- so a commit can still be acknowledged
+	// by a member the cluster has stopped managing. Refusing the edit is
+	// the honest containment until there is a path that switches away from
+	// a removed primary, drains one member at a time, and retires each
+	// one's volume deliberately.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=3
+	// +kubebuilder:validation:XValidation:rule="self >= oldSelf",message="replicasPerShard cannot be lowered: a member removed by lowering this is left running: it keeps its pod, its PVC, its replication slot and its place in synchronous_standby_names, because nothing drains or deletes it yet. Raising it is supported"
 	// +optional
 	ReplicasPerShard int `json:"replicasPerShard,omitempty"`
 	// UnsafeSingleReplica relaxes the replicasPerShard and catalog.replicas
@@ -543,6 +571,14 @@ type PgShardClusterStatus struct {
 	// materialized in the catalog; zero until the catalog exists.
 	// +optional
 	EffectiveShards int `json:"effectiveShards,omitempty"`
+	// AppliedShards is the spec.shards value the operator last acted on.
+	// It is what tells a spec the user changed apart from a catalog that
+	// moved on its own: spec.shards differing from effectiveShards means
+	// a reshard only when this differs from spec.shards too. Without it
+	// the operator resharded straight back after every shard set created
+	// through SQL.
+	// +optional
+	AppliedShards *int `json:"appliedShards,omitempty"`
 	// ServingGeneration is the generation of the serving shard set; it
 	// names the serving shard groups (shard-<id> for 1, shard-<id>-g<n>
 	// after).

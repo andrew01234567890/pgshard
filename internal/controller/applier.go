@@ -616,11 +616,20 @@ func (a *Applier) prepare(ctx context.Context, m *catalog.DDLMigration, key stri
 	if timeout <= 0 {
 		timeout = DefaultLockTimeout
 	}
+	// Nothing is set on the catalog session. It is a pooled connection the
+	// applier also does its own bookkeeping on, so a role set here would
+	// apply to reading the migration queue as well as to the client's
+	// statement -- which is how the first attempt at this broke the
+	// applier. The catalog's settings go inside the statement's own
+	// transaction instead.
+	if key == catalogKey {
+		return conn, nil
+	}
 	if _, err := conn.Exec(ctx, "SET lock_timeout = "+quoteLiteral(fmt.Sprint(timeout.Milliseconds())+"ms")); err != nil {
 		_ = conn.Close(context.WithoutCancel(ctx))
 		return nil, err
 	}
-	if m.Meta.RunAs != "" && key != catalogKey {
+	if m.Meta.RunAs != "" {
 		if _, err := conn.Exec(ctx, "SET ROLE "+pgx.Identifier{m.Meta.RunAs}.Sanitize()); err != nil {
 			_ = conn.Close(context.WithoutCancel(ctx))
 			return nil, err
@@ -686,7 +695,7 @@ func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, key string,
 	case m.Strategy == "concurrent" || outsideTransaction(m.Kind):
 		err = a.concurrently(ctx, conn, m)
 	default:
-		err = inTransaction(ctx, conn, m.Statement)
+		err = inTransaction(ctx, conn, m.Statement, a.catalogLocals(m, key)...)
 	}
 	if err != nil {
 		if m.Scope == "existing" && missingObject(err) {
@@ -889,13 +898,52 @@ func checkHolds(ctx context.Context, conn ShardConn, c catalog.MigrationCheck) (
 
 // outsideTransaction lists the kinds PostgreSQL refuses inside a
 // transaction block.
+// catalogLocals is what the catalog's statement sets inside its own
+// transaction, and only inside it.
+//
+// Every shard runs a role statement as the client; the catalog ran it as
+// the controller, so the catalog was the one place a role change was
+// applied with more authority than the client had. It runs as the client
+// there now, and is refused there for the same reasons it is refused on a
+// shard.
+//
+// SET LOCAL rather than SET is the whole difference between this and the
+// attempt that was reverted. The catalog connection is pooled and the
+// applier reads its own migration queue on it; a session-level role made
+// that read run as a client with no rights on pgshard.migrations, and the
+// applier could not see its own work. Scoped to the transaction, the role
+// covers the client's statement and nothing else.
+func (a *Applier) catalogLocals(m *catalog.DDLMigration, key string) []string {
+	if key != catalogKey {
+		return nil
+	}
+	timeout := a.LockTimeout
+	if timeout <= 0 {
+		timeout = DefaultLockTimeout
+	}
+	out := []string{"SET LOCAL lock_timeout = " + quoteLiteral(fmt.Sprint(timeout.Milliseconds())+"ms")}
+	if m.Meta.RunAs != "" {
+		out = append(out, "SET LOCAL ROLE "+pgx.Identifier{m.Meta.RunAs}.Sanitize())
+	}
+	return out
+}
+
 func outsideTransaction(kind string) bool {
 	return kind == "CREATE DATABASE" || kind == "DROP DATABASE"
 }
 
-func inTransaction(ctx context.Context, conn ShardConn, sql string) error {
+// inTransaction runs sql in its own transaction. locals are SET LOCAL
+// statements applied inside it first, so they hold for sql and for nothing
+// else on that session, however the transaction ends.
+func inTransaction(ctx context.Context, conn ShardConn, sql string, locals ...string) error {
 	if _, err := conn.Exec(ctx, "BEGIN"); err != nil {
 		return err
+	}
+	for _, l := range locals {
+		if _, err := conn.Exec(ctx, l); err != nil {
+			_, _ = conn.Exec(context.WithoutCancel(ctx), "ROLLBACK")
+			return err
+		}
 	}
 	if _, err := conn.Exec(ctx, sql); err != nil {
 		_, _ = conn.Exec(context.WithoutCancel(ctx), "ROLLBACK")
