@@ -41,6 +41,11 @@ const (
 	// AnnotationTemplateHash on a member pod is the MemberTemplate hash the
 	// member runs with.
 	AnnotationTemplateHash = "pgshard.io/template-hash"
+	// AnnotationAgentMTLS on a member pod records that this pod's agent was
+	// STARTED requiring mutual TLS on its gRPC listener. It is what the pod
+	// is running, not what the spec now asks for: during a rollout those
+	// differ, and a caller has to dial each member by the first.
+	AnnotationAgentMTLS = "pgshard.io/agent-mtls"
 	// AnnotationPrimaryEpoch and AnnotationPrimary on the group Lease publish
 	// the fence for readers that cannot reach the catalog.
 	AnnotationPrimaryEpoch = "pgshard.io/primary-epoch"
