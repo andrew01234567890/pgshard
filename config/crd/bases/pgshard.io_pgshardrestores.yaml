@@ -156,6 +156,19 @@ spec:
                       ca.crt) or the explicit insecure override must be set; there is no
                       implicit plaintext fallback.
                     properties:
+                      agentMTLS:
+                        description: |-
+                          AgentMTLS makes each member's agent REQUIRE mutual TLS on its gRPC
+                          listener, using the same material secretRef supplies.
+
+                          Separate from secretRef because turning it on is a rollout, not a
+                          setting: members restart one at a time, so for the length of the roll
+                          some agents require TLS and some do not. The operator dials each
+                          member according to the spec that member is running, which is why the
+                          switch is safe to make while the cluster serves. Until every member
+                          has restarted, a caller that cannot tell them apart -- the controller
+                          today -- must not be given the material.
+                        type: boolean
                       insecure:
                         description: |-
                           Insecure runs the pooler port as plaintext gRPC. Unsupported outside
@@ -188,6 +201,10 @@ spec:
                         mutually exclusive
                       rule: '!((has(self.secretRef) && self.secretRef.name != "")
                         && has(self.insecure) && self.insecure)'
+                    - message: 'internalTLS.agentMTLS needs secretRef: the agents
+                        require the certificates it names'
+                      rule: '!(has(self.agentMTLS) && self.agentMTLS) || (has(self.secretRef)
+                        && self.secretRef.name != "")'
                   networkPolicy:
                     default: {}
                     description: NetworkPolicySpec renders a NetworkPolicy in front

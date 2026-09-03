@@ -35,6 +35,16 @@ type Options struct {
 	ControllerTLSCert string
 	ControllerTLSKey  string
 	ControllerTLSCA   string
+	// AgentTLSCert, AgentTLSKey and AgentTLSCA are what the operator
+	// presents to member agents that require mutual TLS
+	// (spec.internalTLS.agentMTLS). Unset dials every agent in plaintext.
+	//
+	// Having them does not make every dial TLS: the operator dials each
+	// member by the mode that member's pod was started with, so a cluster
+	// mid-rollout is reached correctly on both sides of the roll.
+	AgentTLSCert string
+	AgentTLSKey  string
+	AgentTLSCA   string
 }
 
 // ParseFlags parses the `run` subcommand's flags.
@@ -51,6 +61,9 @@ func ParseFlags(args []string, stderr io.Writer) (Options, error) {
 	fs.DurationVar(&o.ControllerPlacementDropOldAfter, "controller-placement-drop-old-after", 0, "grace before a placement workflow drops the tables it replaced (0 keeps the controller's default)")
 	fs.StringVar(&o.RouterImage, "router-image", DefaultRouterImage, "image of the router Deployment created for every cluster")
 	fs.BoolVar(&o.Development, "development", false, "human-readable logs")
+	fs.StringVar(&o.AgentTLSCert, "agent-tls-cert", "", "client certificate for agent gRPC calls; unset dials every agent plaintext")
+	fs.StringVar(&o.AgentTLSKey, "agent-tls-key", "", "client private key for agent gRPC calls")
+	fs.StringVar(&o.AgentTLSCA, "agent-tls-ca", "", "CA bundle verifying agent gRPC certificates")
 	fs.StringVar(&o.ControllerTLSCert, "controller-tls-cert", "", "client certificate for Controller gRPC calls (scheduled barriers); unset dials plaintext")
 	fs.StringVar(&o.ControllerTLSKey, "controller-tls-key", "", "client private key for Controller gRPC calls")
 	fs.StringVar(&o.ControllerTLSCA, "controller-tls-ca", "", "CA bundle controller certificates must chain to")
@@ -82,9 +95,22 @@ func Run(ctx context.Context, o Options) error {
 	}
 	// One client for the process: it keeps a connection per agent address,
 	// so the reconcilers share them rather than each dialling per call.
+	//
+	// agentModes is shared with the reconciler, which fills it from the pod
+	// annotation before it calls anything. That is what lets one client
+	// reach a fleet that is half rolled over: the mode is per member, not
+	// per process.
+	agentModes := &AgentTLSModes{}
 	agents := NewGRPCAgentClient()
+	if o.AgentTLSCert != "" || o.AgentTLSKey != "" || o.AgentTLSCA != "" {
+		agents, err = NewGRPCAgentClientTLS(o.AgentTLSCert, o.AgentTLSKey, o.AgentTLSCA, "")
+		if err != nil {
+			return fmt.Errorf("agent credentials: %w", err)
+		}
+		agents.RequiresTLS = agentModes.Requires
+	}
 	defer agents.Close()
-	r := &ClusterReconciler{Client: mgr.GetClient(), Renderer: Renderer{AdminImage: o.AdminImage, RouterImage: o.RouterImage, ControllerImage: o.ControllerImage, ControllerPlacementDropOldAfter: o.ControllerPlacementDropOldAfter}, Prober: boundedProber{Inner: PgxProber{}}, Agents: agents,
+	r := &ClusterReconciler{Client: mgr.GetClient(), Renderer: Renderer{AdminImage: o.AdminImage, RouterImage: o.RouterImage, ControllerImage: o.ControllerImage, ControllerPlacementDropOldAfter: o.ControllerPlacementDropOldAfter}, Prober: boundedProber{Inner: PgxProber{}}, Agents: agents, AgentTLS: agentModes,
 		Metrics: metrics.NewOperator(ctrlmetrics.Registry)}
 	if err := r.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup reconciler: %w", err)
