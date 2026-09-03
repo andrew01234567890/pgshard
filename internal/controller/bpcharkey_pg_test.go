@@ -62,3 +62,58 @@ func TestEveryBlankPaddedSpellingOfAKeyRoutesTogether(t *testing.T) {
 		t.Fatalf("the same key spelled %d ways hashed to %d places", 4, len(seen))
 	}
 }
+
+// TestAnOverlongVarcharKeyHashesWhereItIsStored is the other half of the
+// same hazard, and the one that is easy to disbelieve. A value too long
+// for a character varying(n) is an error -- unless every character past
+// the limit is a space, in which case PostgreSQL silently truncates and
+// stores the short value. The client sent bytes the shard did not keep,
+// so the router has to hash what was kept.
+//
+// Asked of PostgreSQL for the same reason as above: the router agreeing
+// with the router proves nothing about the value a shard placed a row by.
+func TestAnOverlongVarcharKeyHashesWhereItIsStored(t *testing.T) {
+	parallelPG(t)
+	dsn := startPostgres(t)
+	ctx := context.Background()
+	conn := connect(t, dsn)
+	mustExec(t, conn, `CREATE TABLE codes (k character varying(3) PRIMARY KEY)`)
+
+	expr, err := KeyHashExpr("k", "character varying(3)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []string{"abc", "abc ", "abc   ", "ab", ""} {
+		mustExec(t, conn, `TRUNCATE codes`)
+		mustExec(t, conn, `INSERT INTO codes VALUES ($1)`, raw)
+
+		var want int64
+		if err := conn.QueryRow(ctx, `SELECT `+expr+` FROM codes`).Scan(&want); err != nil {
+			t.Fatalf("%q: %v", raw, err)
+		}
+
+		norm := plan.NormaliseKeyForType(raw, "character varying(3)")
+		got := placement.HashTextExtended(norm, placement.PartitionSeed)
+		if got != want {
+			t.Fatalf("key %q: router hashes %d, the shard places by %d (normalised to %q)", raw, got, want, norm)
+		}
+	}
+}
+
+// TestAnOverlongNonSpaceVarcharKeyIsPostgreSQLsErrorToGive: the truncation
+// is only for trailing spaces. Anything else is an error, and the router
+// must not quietly shorten a value PostgreSQL would refuse -- that would
+// route a statement the shard was never going to accept.
+func TestAnOverlongNonSpaceVarcharKeyIsPostgreSQLsErrorToGive(t *testing.T) {
+	parallelPG(t)
+	dsn := startPostgres(t)
+	conn := connect(t, dsn)
+	mustExec(t, conn, `CREATE TABLE codes (k character varying(3) PRIMARY KEY)`)
+
+	if _, err := conn.Exec(context.Background(), `INSERT INTO codes VALUES ($1)`, "abcd"); err == nil {
+		t.Fatal("PostgreSQL accepted a value too long for varchar(3); this test's premise is wrong")
+	}
+	if norm := plan.NormaliseKeyForType("abcd", "character varying(3)"); norm != "abcd" {
+		t.Fatalf("the router shortened %q to %q, hiding an error PostgreSQL owns", "abcd", norm)
+	}
+}
