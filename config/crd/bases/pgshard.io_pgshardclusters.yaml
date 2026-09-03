@@ -100,8 +100,18 @@ spec:
                 properties:
                   replicas:
                     default: 3
+                    description: |-
+                      Replicas is the catalog group's member count. Like
+                      replicasPerShard it may be raised and not lowered, and for the same
+                      reason: nothing retires a member it stops rendering.
                     minimum: 1
                     type: integer
+                    x-kubernetes-validations:
+                    - message: 'catalog.replicas cannot be lowered: a member removed
+                        by lowering this is left running: it keeps its pod, its PVC,
+                        its replication slot and its place in synchronous_standby_names,
+                        because nothing drains or deletes it yet. Raising it is supported'
+                      rule: self >= oldSelf
                   storage:
                     description: StorageSpec describes a persistent volume request.
                     properties:
@@ -1461,8 +1471,25 @@ spec:
                   rule: self.major != 19 || has(self.image)
               replicasPerShard:
                 default: 3
+                description: |-
+                  ReplicasPerShard is one primary and the standbys behind it.
+
+                  It may be raised and not lowered. Lowering it stops the operator
+                  rendering the removed members, and nothing else: their pods keep
+                  running, their PVCs stay, their slots stay, and they stay in
+                  synchronous_standby_names -- so a commit can still be acknowledged
+                  by a member the cluster has stopped managing. Refusing the edit is
+                  the honest containment until there is a path that switches away from
+                  a removed primary, drains one member at a time, and retires each
+                  one's volume deliberately.
                 minimum: 1
                 type: integer
+                x-kubernetes-validations:
+                - message: 'replicasPerShard cannot be lowered: a member removed by
+                    lowering this is left running: it keeps its pod, its PVC, its
+                    replication slot and its place in synchronous_standby_names, because
+                    nothing drains or deletes it yet. Raising it is supported'
+                  rule: self >= oldSelf
               resharding:
                 default: {}
                 description: ReshardingSpec controls resharding behaviour.
