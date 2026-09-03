@@ -210,6 +210,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// presenting either. REMOVE the derived one with the agent's acceptance
 	// of it -- PGS-572.
 	ctx = agentauth.WithTokens(ctx, agentToken, derived)
+	if err := r.reconcilePKI(ctx, &cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("internal certificates: %w", err)
+	}
 	if err := r.ensureMemberRBAC(ctx, &cluster); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -660,6 +663,28 @@ func (r *ClusterReconciler) loadState(ctx context.Context, c *pgshardv1alpha1.Pg
 			st.pvcs[m.Name] = m.PVC
 		}
 	}
+	if err := r.recoverPVCs(ctx, c, g, pg, st); err != nil {
+		return groupState{}, err
+	}
+	if len(st.syncSet) == 0 {
+		// status is rebuilt from what a pass observes, so it comes back on
+		// its own while there is a primary to observe. During an outage
+		// there is not, and an empty synchronous set refuses every
+		// failover -- safely, but the cluster stays down. The Lease
+		// remembers it for exactly that case.
+		for _, name := range rememberedSyncSet(g, pg.Annotations[AnnotationSyncSet]) {
+			st.syncSet[name] = true
+		}
+	}
+	if len(st.syncSet) == 0 {
+		// The group object itself can be gone, not just its status. The
+		// Lease is a separate object and outlives it -- when there is one:
+		// it is created by the first fence, so a cluster that has never
+		// failed over has none.
+		for _, name := range r.leaseSyncSet(ctx, c, g) {
+			st.syncSet[name] = true
+		}
+	}
 	// A designated primary outside the member set is not an oracle to be
 	// obeyed: scaling replicasPerShard below the ordinal of a primary that a
 	// failover promoted leaves status.primary naming a member that no longer
@@ -695,6 +720,155 @@ func (r *ClusterReconciler) loadState(ctx context.Context, c *pgshardv1alpha1.Pg
 		}
 	}
 	return st, nil
+}
+
+// recordSyncSet keeps the Lease's memory of the synchronous set current.
+// It writes only when the set changed: a Lease rewritten every pass for
+// every group is a write per group per pass for a value that rarely moves.
+func (r *ClusterReconciler) recordSyncSet(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, primary string, streaming map[string]bool) error {
+	var names []string
+	for _, name := range g.MemberNames() {
+		if name != primary && streaming[name] {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		// Nothing observed streaming is not evidence that nothing is: a
+		// pass that could not reach the members must not erase what the
+		// last one knew.
+		return nil
+	}
+	want := strings.Join(names, ",")
+	pg := r.Renderer.PgShardGroup(c, g)
+	if err := r.Get(ctx, client.ObjectKeyFromObject(pg), pg); err == nil && pg.Annotations[AnnotationSyncSet] != want {
+		base := pg.DeepCopy()
+		if pg.Annotations == nil {
+			pg.Annotations = map[string]string{}
+		}
+		pg.Annotations[AnnotationSyncSet] = want
+		if err := r.Patch(ctx, pg, client.MergeFrom(base)); err != nil {
+			return err
+		}
+	} else if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	var lease coordinationv1.Lease
+	key := types.NamespacedName{Namespace: c.Namespace, Name: g.LeaseName()}
+	if err := r.Get(ctx, key, &lease); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if lease.Annotations[AnnotationSyncSet] == want {
+		return nil
+	}
+	base := lease.DeepCopy()
+	if lease.Annotations == nil {
+		lease.Annotations = map[string]string{}
+	}
+	lease.Annotations[AnnotationSyncSet] = want
+	return r.Patch(ctx, &lease, client.MergeFrom(base))
+}
+
+// rememberedSyncSet reads a recorded set, keeping only members that still
+// exist: a set scaled down leaves names behind, and a name that is not a
+// member is not a candidate for anything.
+func rememberedSyncSet(g Group, recorded string) []string {
+	var out []string
+	for _, name := range strings.Split(recorded, ",") {
+		if name != "" && slices.Contains(g.MemberNames(), name) {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// leaseSyncSet is the synchronous set the Lease remembers.
+func (r *ClusterReconciler) leaseSyncSet(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group) []string {
+	var lease coordinationv1.Lease
+	if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: g.LeaseName()}, &lease); err != nil {
+		return nil
+	}
+	return rememberedSyncSet(g, lease.Annotations[AnnotationSyncSet])
+}
+
+// recoverPVCs fills in the claim of any member whose status did not name
+// one, by reading what that member's pod actually mounts.
+//
+// The default is the claim named after the member, and after a storage
+// rebuild that is the wrong one: the rebuilt claim gains a -v<n> suffix,
+// so a group that lost its status would mount the pre-rebuild volume -
+// the old storage class, and data as stale as the rebuild is old. The
+// running pod is the authority on where its data directory is, which is
+// exactly the evidence status was standing in for.
+func (r *ClusterReconciler) recoverPVCs(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, pg *pgshardv1alpha1.PgShardGroup, st groupState) error {
+	known := map[string]bool{}
+	for _, m := range pg.Status.Members {
+		if m.PVC != "" {
+			known[m.Name] = true
+		}
+	}
+	var claimed corev1.PersistentVolumeClaimList
+	if err := r.List(ctx, &claimed, client.InNamespace(c.Namespace),
+		client.MatchingLabels{LabelCluster: c.Name, LabelGroup: g.Name()}); err != nil {
+		return err
+	}
+	for _, name := range g.MemberNames() {
+		if known[name] {
+			continue
+		}
+		var pod corev1.Pod
+		err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: name}, &pod)
+		if err == nil {
+			if claim := dataClaim(&pod); claim != "" {
+				st.pvcs[name] = claim
+				continue
+			}
+		} else if !apierrors.IsNotFound(err) {
+			return err
+		}
+		// No pod to ask. The claims themselves say which volumes the
+		// member has had; rebuilds only ever move forward, so the newest
+		// is the one holding its data.
+		if claim := newestClaim(claimed.Items, name); claim != "" {
+			st.pvcs[name] = claim
+		}
+	}
+	return nil
+}
+
+// newestClaim is the member's most recent claim: rebuilds rename forward,
+// member then member-v2 then member-v3, so the highest suffix is the last
+// one the member was rebuilt onto.
+func newestClaim(claims []corev1.PersistentVolumeClaim, member string) string {
+	best, bestV := "", -1
+	for _, pvc := range claims {
+		if pvc.Labels[LabelMember] != member {
+			continue
+		}
+		v := 1
+		if rest, ok := strings.CutPrefix(pvc.Name, member+"-v"); ok {
+			n, err := strconv.Atoi(rest)
+			if err != nil {
+				continue
+			}
+			v = n
+		} else if pvc.Name != member {
+			continue
+		}
+		if v > bestV {
+			best, bestV = pvc.Name, v
+		}
+	}
+	return best
+}
+
+// dataClaim is the claim a member's pod mounts as its data directory.
+func dataClaim(pod *corev1.Pod) string {
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == "data" && v.PersistentVolumeClaim != nil {
+			return v.PersistentVolumeClaim.ClaimName
+		}
+	}
+	return ""
 }
 
 func (r *ClusterReconciler) ensureConfigMap(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, primary string, tuning pgtune.Settings, pol *pgshardv1alpha1.PgShardBackupPolicy, repoReady bool) error {
@@ -881,6 +1055,9 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 		}
 	}
 	obs.syncApplied = true
+	if err := r.recordSyncSet(ctx, c, g, state.primary, obs.streaming); err != nil {
+		logf.FromContext(ctx).Info("could not record the synchronous set on the lease; continuing", "group", g.Name(), "err", err)
+	}
 	if primary.ip != "" {
 		if _, err := r.Agents.SetSynchronizedStandbySlots(ctx, agentAddr(primary.ip), SynchronizedStandbySlots(g, state.primary, c.Spec.Durability.MinSyncStandbys, obs.streaming)); err != nil {
 			obs.primaryErr = "set synchronized_standby_slots: " + err.Error()
