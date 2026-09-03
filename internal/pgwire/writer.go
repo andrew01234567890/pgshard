@@ -112,8 +112,15 @@ func (w *resultWriter) CopyIn(overallFormat byte, columnFormats []uint16) (CopyI
 	return cs, nil
 }
 
+// CopyOut flushes the response rather than queueing it, so the client
+// learns the COPY started before flushEveryBytes of it exists. A COPY that
+// produces its rows slowly otherwise showed the client nothing at all until
+// enough had accumulated, which is not what the byte bound is for.
 func (w *resultWriter) CopyOut(overallFormat byte, columnFormats []uint16) error {
-	return w.send(&pgproto3.CopyOutResponse{OverallFormat: overallFormat, ColumnFormatCodes: columnFormats})
+	if err := w.send(&pgproto3.CopyOutResponse{OverallFormat: overallFormat, ColumnFormatCodes: columnFormats}); err != nil {
+		return err
+	}
+	return w.flush()
 }
 
 func (w *resultWriter) CopyData(data []byte) error {

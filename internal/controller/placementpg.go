@@ -7,8 +7,11 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/jackc/pgx/v5"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 )
@@ -1122,6 +1125,13 @@ func (p *Placer) catchUp(ctx context.Context, wf *placementWorkflow, drain bool)
 
 const peekChanges = 2000
 
+// applyFlushOps bounds how many committed operations catch-up holds before
+// applying them. Applying at every source commit made a stream of
+// single-row transactions one round trip per row; holding them lets a
+// round's worth go out together, and the slot advances no earlier either
+// way, because it only ever advances once the whole round is applied.
+const applyFlushOps = 2000
+
 func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn ShardConn, targets targetConns, s int32, drain bool) (int64, int, error) {
 	dec := NewDecoder()
 	applied := 0
@@ -1139,20 +1149,35 @@ func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn 
 		if err != nil {
 			return 0, applied, err
 		}
-		var pending []applyOp
+		// ready holds the operations of transactions that have committed
+		// and open those of the one being decoded: only committed work is
+		// ever applied, and it is applied in as few round trips as the
+		// flush bound allows rather than once per source transaction.
+		var ready, open []applyOp
 		var commitLSN string
-		n := 0
+		readyN, n := 0, 0
+		flush := func() error {
+			if err := applyOps(ctx, targets, ready); err != nil {
+				return err
+			}
+			applied += readyN
+			ready, readyN = nil, 0
+			return nil
+		}
 		for _, m := range msgs {
 			c, committed, err := dec.Decode(m.Data)
 			if err != nil {
 				return 0, applied, err
 			}
 			if committed {
-				if err := applyOps(ctx, targets, pending); err != nil {
-					return 0, applied, err
+				ready = append(ready, open...)
+				readyN += n
+				open, n, commitLSN = nil, 0, m.LSN
+				if len(ready) >= applyFlushOps {
+					if err := flush(); err != nil {
+						return 0, applied, err
+					}
 				}
-				applied += n
-				pending, n, commitLSN = nil, 0, m.LSN
 				continue
 			}
 			if c == nil || c.Relation.Schema != wf.spec.SchemaName || c.Relation.Name != wf.spec.TableName {
@@ -1165,8 +1190,11 @@ func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn 
 			if err != nil {
 				return 0, applied, fatal("%w", err)
 			}
-			pending = append(pending, ops...)
+			open = append(open, ops...)
 			n++
+		}
+		if err := flush(); err != nil {
+			return 0, applied, err
 		}
 		switch {
 		case commitLSN != "":
@@ -1194,17 +1222,74 @@ func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn 
 	}
 }
 
+// applyBatchOps bounds one statement sent to a target: enough operations to
+// amortise the round trip, few enough that a slow statement is still
+// cancellable and the string stays small.
+const applyBatchOps = 500
+
+// applyBatchBytes bounds the same statement by size, because one operation
+// carries a whole row and a wide table reaches the interesting sizes long
+// before it reaches applyBatchOps.
+const applyBatchBytes = 1 << 20
+
+// applyOps applies the operations to their targets. Order is preserved per
+// target - a row inserted then deleted must stay deleted - but not across
+// targets, which is sound because a target only ever holds keys no other
+// target holds, so no two targets order the same row.
+//
+// Each target's work goes out as one multi-statement query in a transaction
+// rather than a statement per operation. That is the difference between one
+// round trip and one commit per target and one of each per row: catch-up
+// used to apply around 765 operations a second, which a single ordinary
+// writer outran, so slot lag grew instead of converging and the placement
+// never reached its cutover.
 func applyOps(ctx context.Context, targets targetConns, ops []applyOp) error {
+	if len(ops) == 0 {
+		return nil
+	}
+	order := make([]int32, 0, len(targets))
+	byTarget := map[int32][]string{}
 	for _, op := range ops {
-		conn, ok := targets[op.shard]
-		if !ok {
-			return fmt.Errorf("no connection to target shard %d", op.shard)
+		if _, seen := byTarget[op.shard]; !seen {
+			order = append(order, op.shard)
 		}
-		if _, err := conn.Exec(ctx, op.sql); err != nil {
-			return fmt.Errorf("target %d: %w", op.shard, err)
+		byTarget[op.shard] = append(byTarget[op.shard], op.sql)
+	}
+	for _, shard := range order {
+		conn, ok := targets[shard]
+		if !ok {
+			return fmt.Errorf("no connection to target shard %d", shard)
+		}
+		if err := applyToTarget(ctx, conn, byTarget[shard]); err != nil {
+			return fmt.Errorf("target %d: %w", shard, err)
 		}
 	}
 	return nil
+}
+
+func applyToTarget(ctx context.Context, conn ShardConn, stmts []string) error {
+	var b strings.Builder
+	n := 0
+	flush := func() error {
+		if n == 0 {
+			return nil
+		}
+		_, err := conn.Exec(ctx, "BEGIN;"+b.String()+"COMMIT")
+		b.Reset()
+		n = 0
+		return err
+	}
+	for _, sql := range stmts {
+		b.WriteString(sql)
+		b.WriteString(";")
+		n++
+		if n >= applyBatchOps || b.Len() >= applyBatchBytes {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+	}
+	return flush()
 }
 
 func slotLag(ctx context.Context, conn ShardConn, slot string) (int64, error) {
@@ -1332,43 +1417,79 @@ func (p *Placer) unlock(ctx context.Context, wf *placementWorkflow) error {
 // the first rename on that shard) covers it: only that marker proves the
 // swap began after a verification that already passed, so a shadow lost to
 // anything else can never publish a stale placement.
+// verifyPlacementConcurrency bounds the shards digested at once. The
+// digests run with the table fenced, so they are the write pause; taking
+// them one shard after another made that pause grow with the number of
+// shards, when the shards are separate machines doing separate scans.
+const verifyPlacementConcurrency = 8
+
 func (p *Placer) verifyPlacement(ctx context.Context, wf *placementWorkflow) error {
+	// The holders come first and on their own. A holder that has already
+	// swapped ends the verification, and it has to end it before any
+	// source is read: the swap renames the source table away, so reading
+	// one after a swap began finds nothing where the table was.
+	var swapped atomic.Bool
+	var mu sync.Mutex
 	targets := map[int32]rowDigest{}
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(verifyPlacementConcurrency)
 	for _, t := range wf.rt.Holders() {
-		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
-		if err != nil {
-			return err
-		}
-		hasShadow, err := tableExists(ctx, conn, wf.spec.SchemaName, wf.shadow())
-		if err == nil && !hasShadow {
-			_ = conn.Close(ctx)
-			if slices.Contains(wf.st.Swapped, t) {
-				return nil
+		g.Go(func() error {
+			conn, err := p.Shards.DialDatabase(gctx, wf.st.SourceSet, t, wf.spec.Database)
+			if err != nil {
+				return err
 			}
-			return fatal("shadow of %s missing on shard %d before the swap began", wf.spec.table(), t)
-		}
-		var d rowDigest
-		if err == nil {
-			d, err = digest(ctx, conn, wf.spec.SchemaName, wf.shadow(), "")
-		}
-		_ = conn.Close(ctx)
-		if err != nil {
-			return err
-		}
-		targets[t] = d
+			defer func() { _ = conn.Close(gctx) }()
+			hasShadow, err := tableExists(gctx, conn, wf.spec.SchemaName, wf.shadow())
+			if err == nil && !hasShadow {
+				if slices.Contains(wf.st.Swapped, t) {
+					swapped.Store(true)
+					return nil
+				}
+				return fatal("shadow of %s missing on shard %d before the swap began", wf.spec.table(), t)
+			}
+			var d rowDigest
+			if err == nil {
+				d, err = digest(gctx, conn, wf.spec.SchemaName, wf.shadow(), "")
+			}
+			if err != nil {
+				return err
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			targets[t] = d
+			return nil
+		})
 	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	if swapped.Load() {
+		return nil
+	}
+
 	var src rowDigest
+	g, gctx = errgroup.WithContext(ctx)
+	g.SetLimit(verifyPlacementConcurrency)
 	for _, s := range wf.from.Sources() {
-		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, s, wf.spec.Database)
-		if err != nil {
-			return err
-		}
-		d, err := digest(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, "")
-		_ = conn.Close(ctx)
-		if err != nil {
-			return err
-		}
-		src = src.add(d)
+		g.Go(func() error {
+			conn, err := p.Shards.DialDatabase(gctx, wf.st.SourceSet, s, wf.spec.Database)
+			if err != nil {
+				return err
+			}
+			d, err := digest(gctx, conn, wf.spec.SchemaName, wf.spec.TableName, "")
+			_ = conn.Close(gctx)
+			if err != nil {
+				return err
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			src = src.add(d)
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
 	}
 	if mismatches := placementMismatches(wf.spec.To.Placement, src, targets); len(mismatches) > 0 {
 		return fatal("placement verification of %s failed: %s", wf.spec.table(), strings.Join(mismatches, "; "))
