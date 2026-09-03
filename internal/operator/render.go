@@ -20,6 +20,7 @@ import (
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/internal/agent"
 	"github.com/andrew01234567890/pgshard/internal/pgtune"
+	"github.com/andrew01234567890/pgshard/internal/pki"
 )
 
 const (
@@ -27,10 +28,15 @@ const (
 	secretMountPath = "/etc/pgshard-secret"
 	// internalTLSMountPath holds the router<->pooler mTLS material.
 	internalTLSMountPath = "/etc/pgshard-internal-tls"
-	internalTLSVolume    = "internal-tls"
-	dataMountPath        = "/var/lib/postgresql/data"
-	pgdataPath           = dataMountPath + "/pgdata"
-	postgresUID          = int64(999)
+	// poolerTLSMountPath is where the pooler's own certificate goes when
+	// the operator issues one. The agent and the pooler share a pod and
+	// hold different identities, so they cannot share a mount.
+	poolerTLSMountPath = "/etc/pgshard-pooler-tls"
+	poolerTLSVolume    = "pooler-tls"
+	internalTLSVolume  = "internal-tls"
+	dataMountPath      = "/var/lib/postgresql/data"
+	pgdataPath         = dataMountPath + "/pgdata"
+	postgresUID        = int64(999)
 	// pgSocketDir is the agent's fixed unix_socket_directories; the pooler
 	// sidecar reaches the local server through it over a shared emptyDir.
 	pgSocketDir    = "/tmp"
@@ -545,9 +551,14 @@ func (Renderer) Pod(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, rol
 			},
 		},
 	}
-	if ref := internalTLSRef(c); ref != nil {
+	if ref := internalTLSRefFor(c, pki.RoleAgent); ref != nil {
 		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{Name: internalTLSVolume,
 			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: ref.Name}}})
+	}
+	if c.Spec.InternalTLS.Issue {
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{Name: poolerTLSVolume,
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+				SecretName: RoleTLSSecretName(c.Name, pki.RolePooler)}}})
 	}
 	if tpl.Backup != nil {
 		mountBackupSecrets(pod, tpl.Backup)
@@ -601,12 +612,16 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 		{Name: "secret", MountPath: secretMountPath, ReadOnly: true},
 		{Name: poolerCatalogSecretVolume, MountPath: poolerCatalogPasswordDir, ReadOnly: true},
 	}
-	if internalTLSRef(c) != nil {
+	if internalTLSEnabled(c) {
+		dir, vol := internalTLSMountPath, internalTLSVolume
+		if c.Spec.InternalTLS.Issue {
+			dir, vol = poolerTLSMountPath, poolerTLSVolume
+		}
 		args = append(args,
-			"--tls-cert", internalTLSMountPath+"/tls.crt",
-			"--tls-key", internalTLSMountPath+"/tls.key",
-			"--tls-ca", internalTLSMountPath+"/ca.crt")
-		mounts = append(mounts, corev1.VolumeMount{Name: internalTLSVolume, MountPath: internalTLSMountPath, ReadOnly: true})
+			"--tls-cert", dir+"/tls.crt",
+			"--tls-key", dir+"/tls.key",
+			"--tls-ca", dir+"/ca.crt")
+		mounts = append(mounts, corev1.VolumeMount{Name: vol, MountPath: dir, ReadOnly: true})
 	} else if c.Spec.InternalTLS.Insecure {
 		args = append(args, "--insecure-dev")
 	}
@@ -635,6 +650,9 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 
 // internalTLSMode names the router<->pooler transport the spec asks for.
 func internalTLSMode(c *pgshardv1alpha1.PgShardCluster) string {
+	if c.Spec.InternalTLS.Issue {
+		return "issued"
+	}
 	if ref := internalTLSRef(c); ref != nil {
 		return "secret:" + ref.Name
 	}
@@ -670,7 +688,7 @@ func internalTLSDataChecksum(data map[string][]byte) string {
 // soon as the cluster has any, precisely so that turning this on later is a
 // restart and not a provisioning step.
 func agentGRPCTLS(c *pgshardv1alpha1.PgShardCluster) agent.TLSFiles {
-	if !c.Spec.InternalTLS.AgentMTLS || internalTLSRef(c) == nil {
+	if !c.Spec.InternalTLS.AgentMTLS || !internalTLSEnabled(c) {
 		return agent.TLSFiles{}
 	}
 	return agent.TLSFiles{
@@ -694,7 +712,7 @@ func agentMounts(c *pgshardv1alpha1.PgShardCluster) []corev1.VolumeMount {
 		{Name: agentTokenVolume, MountPath: agentTokenDir, ReadOnly: true},
 		{Name: "pg-socket", MountPath: pgSocketDir},
 	}
-	if internalTLSRef(c) != nil {
+	if internalTLSEnabled(c) {
 		mounts = append(mounts, corev1.VolumeMount{Name: internalTLSVolume, MountPath: internalTLSMountPath, ReadOnly: true})
 	}
 	return mounts
@@ -706,4 +724,22 @@ func internalTLSRef(c *pgshardv1alpha1.PgShardCluster) *corev1.LocalObjectRefere
 		return ref
 	}
 	return nil
+}
+
+// internalTLSRefFor is internalTLSRef when the certificates are supplied,
+// and the role's own issued Secret when the operator mints them. Which
+// Secret a workload mounts is the whole difference: one shared certificate
+// cannot tell a router from an agent, and a listener can only authorise
+// what it can distinguish.
+func internalTLSRefFor(c *pgshardv1alpha1.PgShardCluster, role string) *corev1.LocalObjectReference {
+	if c.Spec.InternalTLS.Issue {
+		return &corev1.LocalObjectReference{Name: RoleTLSSecretName(c.Name, role)}
+	}
+	return internalTLSRef(c)
+}
+
+// internalTLSEnabled reports whether internal gRPC runs with TLS at all,
+// however the material arrives.
+func internalTLSEnabled(c *pgshardv1alpha1.PgShardCluster) bool {
+	return c.Spec.InternalTLS.Issue || internalTLSRef(c) != nil
 }

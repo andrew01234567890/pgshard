@@ -9,6 +9,7 @@ import (
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -17,6 +18,7 @@ import (
 
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/internal/catalog"
+	"github.com/andrew01234567890/pgshard/internal/pki"
 )
 
 // DefaultRouterImage is the router image used when the operator is started
@@ -99,7 +101,7 @@ func (r Renderer) RouterDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv1.De
 		fmt.Sprintf("--controller=%s.%s.svc:%d", ControllerName(c.Name), c.Namespace, controllerPort)}
 	var mounts []corev1.VolumeMount
 	var volumes []corev1.Volume
-	if ref := internalTLSRef(c); ref != nil {
+	if ref := internalTLSRefFor(c, pki.RoleRouter); ref != nil {
 		args = append(args,
 			"--pooler-tls-cert="+internalTLSMountPath+"/tls.crt",
 			"--pooler-tls-key="+internalTLSMountPath+"/tls.key",
@@ -243,6 +245,33 @@ const AnnotationInternalTLSChecksum = "pgshard.io/internal-tls-checksum"
 // internalTLSChecksum digests the referenced internal TLS Secret; empty
 // when the cluster runs with the explicit insecure override.
 func (r *ClusterReconciler) internalTLSChecksum(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) (string, error) {
+	if c.Spec.InternalTLS.Issue {
+		// Every issued Secret, not just the caller's own. One checksum
+		// serves the router annotation and the member template alike, and
+		// the certificates are issued and renewed together, so digesting
+		// them together is what makes a renewal roll everything holding
+		// one. A workload keeps the certificate it started with until it
+		// restarts, whatever the file on disk says.
+		all := map[string][]byte{}
+		for _, name := range append(issuedRoleNames(), "") {
+			secret := CASecretName(c.Name)
+			if name != "" {
+				secret = RoleTLSSecretName(c.Name, name)
+			}
+			var sec corev1.Secret
+			if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: secret}, &sec); err != nil {
+				if apierrors.IsNotFound(err) {
+					continue
+				}
+				return "", fmt.Errorf("internal TLS secret %q: %w", secret, err)
+			}
+			all[secret] = []byte(internalTLSDataChecksum(sec.Data))
+		}
+		if len(all) == 0 {
+			return "", nil
+		}
+		return internalTLSDataChecksum(all), nil
+	}
 	ref := internalTLSRef(c)
 	if ref == nil {
 		return "", nil
