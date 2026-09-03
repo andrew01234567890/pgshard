@@ -215,6 +215,10 @@ type ShardStatus struct {
 	Group    Group
 	Epoch    int64
 	Endpoint string
+	// AgentMTLS is whether this shard's primary agent requires mutual TLS,
+	// published for callers that cannot see pods -- the controller dials
+	// agents during a reshard and reads the catalog, not the Kubernetes API.
+	AgentMTLS bool
 }
 
 // PublishShardStatus upserts the shards' fences into pgshard.shard_status.
@@ -237,6 +241,7 @@ func (PgxProber) PublishShardStatus(ctx context.Context, dsn string, rows []Shar
 	states := make([]string, len(rows))
 	epochs := make([]int64, len(rows))
 	endpoints := make([]string, len(rows))
+	mtls := make([]bool, len(rows))
 	for i, row := range rows {
 		state := "serving"
 		if row.Group.NonServing {
@@ -247,6 +252,7 @@ func (PgxProber) PublishShardStatus(ctx context.Context, dsn string, rows []Shar
 		}
 		sets[i], ids[i], names[i] = row.Group.ShardSet(), row.Group.ShardID, row.Group.Name()
 		states[i], epochs[i], endpoints[i] = state, row.Epoch, row.Endpoint
+		mtls[i] = row.AgentMTLS
 	}
 	// The epoch guard alone still rewrote an unchanged row on every pass,
 	// because an EQUAL epoch satisfies <=. Each write fires notify_serving,
@@ -254,16 +260,21 @@ func (PgxProber) PublishShardStatus(ctx context.Context, dsn string, rows []Shar
 	// connection and reloading ranges, statuses, databases, tables,
 	// rewrites, fences and sequences -- so a healthy cluster reconciling
 	// every 30s paid a full reload wave per shard for no change at all.
-	_, err = conn.Exec(ctx, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch, primary_endpoint)
-		SELECT * FROM unnest($1::text[], $2::integer[], $3::text[], $4::text[], $5::bigint[], $6::text[])
+	// agent_mtls is in the change test as well as the update: a member that
+	// restarts into the requirement changes nothing else on this row, and
+	// left out of the test the new mode would never be written -- leaving
+	// the controller dialling the old way for as long as nothing else moved.
+	_, err = conn.Exec(ctx, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch, primary_endpoint, agent_mtls)
+		SELECT * FROM unnest($1::text[], $2::integer[], $3::text[], $4::text[], $5::bigint[], $6::text[], $7::boolean[])
 		ON CONFLICT (shard_set, shard_id) DO UPDATE
 		SET group_name = EXCLUDED.group_name, primary_epoch = EXCLUDED.primary_epoch,
-		    primary_endpoint = EXCLUDED.primary_endpoint, updated_at = now()
+		    primary_endpoint = EXCLUDED.primary_endpoint, agent_mtls = EXCLUDED.agent_mtls, updated_at = now()
 		WHERE pgshard.shard_status.primary_epoch <= EXCLUDED.primary_epoch
 		  AND (pgshard.shard_status.group_name IS DISTINCT FROM EXCLUDED.group_name
 		    OR pgshard.shard_status.primary_epoch IS DISTINCT FROM EXCLUDED.primary_epoch
-		    OR pgshard.shard_status.primary_endpoint IS DISTINCT FROM EXCLUDED.primary_endpoint)`,
-		sets, ids, names, states, epochs, endpoints)
+		    OR pgshard.shard_status.primary_endpoint IS DISTINCT FROM EXCLUDED.primary_endpoint
+		    OR pgshard.shard_status.agent_mtls IS DISTINCT FROM EXCLUDED.agent_mtls)`,
+		sets, ids, names, states, epochs, endpoints, mtls)
 	return err
 }
 

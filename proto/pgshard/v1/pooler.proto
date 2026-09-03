@@ -365,7 +365,18 @@ message ReleaseRequest {
 
 // ReleaseResponse acknowledges the release.
 message ReleaseResponse {
-  Error error = 1;
+  // Release is unary, and under the project's rule a unary RPC reports
+  // whole-call failure through the embedded Error -- but Release has no
+  // failure to report. A session it does not know is already released, and
+  // the only thing that can go wrong is the call itself, which arrives as a
+  // gRPC status.
+  //
+  // So the field was set by nobody and READ by the router, giving a branch
+  // that looked like error handling and could never run. Removed rather
+  // than filled: inventing an outcome to justify a field is worse than not
+  // having one.
+  reserved 1;
+  reserved "error";
 }
 
 // HealthRequest opens a health stream.

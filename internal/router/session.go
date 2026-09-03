@@ -2029,12 +2029,13 @@ func (e *Executor) release(ctx context.Context) error {
 func releaseRPC(ctx context.Context, client pgshardv1.PoolerClient, sid string) error {
 	rctx, cancel := context.WithTimeout(ctx, releaseTimeout)
 	defer cancel()
-	resp, err := client.Release(rctx, &pgshardv1.ReleaseRequest{SessionId: sid})
-	if err != nil {
+	// One channel. Release reports nothing in its response -- a session the
+	// pooler does not know is already released -- so the only failure is the
+	// call itself, and it arrives as a gRPC status. The branch that used to
+	// read an embedded error could never run, which made the release path
+	// look like it handled a case it did not.
+	if _, err := client.Release(rctx, &pgshardv1.ReleaseRequest{SessionId: sid}); err != nil {
 		return pgwire.Errorf(codeConnectionFailure, "pooler release failed: %v", err)
-	}
-	if resp.Error != nil {
-		return toPgwireError(resp.Error)
 	}
 	return nil
 }
