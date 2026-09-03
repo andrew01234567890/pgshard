@@ -1053,7 +1053,7 @@ func TestInternalTLSValidationFailsClosed(t *testing.T) {
 	missing.Spec.InternalTLS = pgshardv1alpha1.InternalTLSSpec{}
 	if err := k8sClient.Create(ctx, missing); err == nil {
 		t.Fatal("cluster with neither secretRef nor insecure must be rejected")
-	} else if !strings.Contains(err.Error(), "internalTLS requires secretRef") {
+	} else if !strings.Contains(err.Error(), "internalTLS requires issue: true, or secretRef") {
 		t.Fatalf("unexpected rejection: %v", err)
 	}
 
@@ -1064,6 +1064,38 @@ func TestInternalTLSValidationFailsClosed(t *testing.T) {
 		t.Fatal("secretRef combined with insecure must be rejected")
 	} else if !strings.Contains(err.Error(), "mutually exclusive") {
 		t.Fatalf("unexpected rejection: %v", err)
+	}
+
+	// Issuing and being given certificates are alternatives, not layers:
+	// a cluster that supplies its own must not also get minted ones, or
+	// which of the two a workload holds depends on mount order.
+	for _, tc := range []struct {
+		name string
+		spec pgshardv1alpha1.InternalTLSSpec
+	}{
+		{"tls-issue-and-ref", pgshardv1alpha1.InternalTLSSpec{Issue: true, SecretRef: &corev1.LocalObjectReference{Name: "internal-tls"}}},
+		{"tls-issue-and-insecure", pgshardv1alpha1.InternalTLSSpec{Issue: true, Insecure: true}},
+	} {
+		cl := newCluster(tc.name)
+		cl.Spec.InternalTLS = tc.spec
+		if err := k8sClient.Create(ctx, cl); err == nil {
+			t.Fatalf("%s must be rejected", tc.name)
+		} else if !strings.Contains(err.Error(), "issue is exclusive") {
+			t.Fatalf("%s: unexpected rejection: %v", tc.name, err)
+		}
+	}
+
+	issued := newCluster("tls-issued")
+	issued.Spec.InternalTLS = pgshardv1alpha1.InternalTLSSpec{Issue: true}
+	if err := k8sClient.Create(ctx, issued); err != nil {
+		t.Fatalf("issue alone must be accepted: %v", err)
+	}
+
+	// agentMTLS needs material from somewhere, and issuing is somewhere.
+	mtls := newCluster("tls-issued-mtls")
+	mtls.Spec.InternalTLS = pgshardv1alpha1.InternalTLSSpec{Issue: true, AgentMTLS: true}
+	if err := k8sClient.Create(ctx, mtls); err != nil {
+		t.Fatalf("agentMTLS with issued certificates must be accepted: %v", err)
 	}
 
 	secure := newCluster("tls-secure")
