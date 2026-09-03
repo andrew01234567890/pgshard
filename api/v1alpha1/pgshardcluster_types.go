@@ -543,6 +543,14 @@ type PgShardClusterStatus struct {
 	// materialized in the catalog; zero until the catalog exists.
 	// +optional
 	EffectiveShards int `json:"effectiveShards,omitempty"`
+	// AppliedShards is the spec.shards value the operator last acted on.
+	// It is what tells a spec the user changed apart from a catalog that
+	// moved on its own: spec.shards differing from effectiveShards means
+	// a reshard only when this differs from spec.shards too. Without it
+	// the operator resharded straight back after every shard set created
+	// through SQL.
+	// +optional
+	AppliedShards *int `json:"appliedShards,omitempty"`
 	// ServingGeneration is the generation of the serving shard set; it
 	// names the serving shard groups (shard-<id> for 1, shard-<id>-g<n>
 	// after).
