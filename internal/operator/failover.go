@@ -58,11 +58,38 @@ type memberView struct {
 	InRecovery bool
 	Streaming  bool
 	FlushLSN   uint64
+	// ReadySlots is how many logical slots would survive promoting this
+	// member. It never outranks the flushed LSN -- a candidate with more
+	// slots and less data would lose acknowledged commits, and no amount
+	// of saved workflow is worth one of those -- so it breaks ties among
+	// members that hold the same data.
+	ReadySlots int
 	// Why carries the probe's error when Reachable is false. A member the
 	// probe could not reach and one that is genuinely gone both arrive here
 	// as Reachable=false, and the refusal they produce names neither; the
 	// views are logged, so the reason travels with them.
 	Why string
+}
+
+// readySlots asks a member how many logical slots would survive promoting
+// it. A member that cannot answer counts as none: the tie-break may then
+// pick differently, which is a worse-informed choice and never an unsafe
+// one, and refusing a failover because a slot count was unavailable would
+// trade an outage for an optimisation.
+func (r *ClusterReconciler) readySlots(ctx context.Context, g Group, name, ip string) int {
+	// A reconciler with no agent client is a rollout decision taken from
+	// probes alone, which is a supported way to run: the tie-break simply
+	// has nothing to break the tie with.
+	if r.Agents == nil {
+		return 0
+	}
+	n, err := r.Agents.ReadySlots(ctx, agentAddr(ip))
+	if err != nil {
+		logf.FromContext(ctx).Info("member did not report its slots; counting none",
+			"group", g.Name(), "member", name, "err", err.Error())
+		return 0
+	}
+	return n
 }
 
 // errQuorum is returned when unreachable listed standbys could hold an
@@ -75,7 +102,14 @@ var errQuorum = fmt.Errorf("%w: unreachable synchronous standbys may hold acknow
 // acknowledged a commit, so all reachable standbys are eligible; if a listed
 // standby is unreachable and the reachable ones do not outnumber the acks
 // (reachable + numSync <= listed), no candidate is admissible. preferred wins
-// when it holds the maximum LSN. Ties break by name.
+// when it holds the maximum LSN.
+//
+// Members holding the same data are separated by how many logical slots
+// would survive their promotion, and only then by name. A reshard's
+// subscription, a cutover's rollback window and a change stream's position
+// each live in one, so between two members with identical LSNs the one
+// keeping more of them costs less to promote. It is strictly a tie-break:
+// data first, always.
 func chooseCandidate(members []memberView, exclude, preferred string, numSync int) (string, error) {
 	if numSync < 1 {
 		numSync = 1
@@ -106,6 +140,9 @@ func chooseCandidate(members []memberView, exclude, preferred string, numSync in
 	sort.Slice(eligible, func(i, j int) bool {
 		if eligible[i].FlushLSN != eligible[j].FlushLSN {
 			return eligible[i].FlushLSN > eligible[j].FlushLSN
+		}
+		if eligible[i].ReadySlots != eligible[j].ReadySlots {
+			return eligible[i].ReadySlots > eligible[j].ReadySlots
 		}
 		return eligible[i].Name < eligible[j].Name
 	})
@@ -526,6 +563,7 @@ func (r *ClusterReconciler) quiesce(ctx context.Context, g Group, old string, me
 					v.Why = err.Error()
 				} else {
 					v.Reachable, v.InRecovery, v.Streaming, v.FlushLSN = true, st.InRecovery, st.Streaming, st.FlushLSN
+					v.ReadySlots = r.readySlots(ctx, g, name, m.ip)
 				}
 			}
 			if !v.Reachable || v.Streaming {
@@ -593,6 +631,7 @@ func (r *ClusterReconciler) admissiblePrimary(ctx context.Context, c *pgshardv1a
 					"group", g.Name(), "member", name, "listed", v.Listed, "err", err.Error())
 			} else {
 				v.Reachable, v.InRecovery, v.Streaming, v.FlushLSN = true, st.InRecovery, st.Streaming, st.FlushLSN
+				v.ReadySlots = r.readySlots(ctx, g, name, m.ip)
 			}
 		}
 		views = append(views, v)

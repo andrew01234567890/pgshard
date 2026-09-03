@@ -46,6 +46,16 @@ type AgentClient interface {
 	// SetSynchronizedStandbySlots tells the primary's agent which physical
 	// slots failover slots must wait for; it returns the slots applied.
 	SetSynchronizedStandbySlots(ctx context.Context, addr string, slots []string) ([]string, error)
+	// ReadySlots is how many logical replication slots on this member
+	// would survive its promotion: synchronised from the primary, not
+	// temporary, and not invalidated.
+	//
+	// A reshard's subscription, the reverse replication that makes a
+	// cutover reversible, and a change stream's resumable position each
+	// depend on one, so promoting a member that has fewer of them costs
+	// work that promoting one with more does not: a stranded subscription,
+	// a rollback window that is gone, a stream that must re-baseline.
+	ReadySlots(ctx context.Context, addr string) (int, error)
 }
 
 // GRPCAgentClient is the production AgentClient. It keeps one connection
@@ -394,6 +404,38 @@ func (c *GRPCAgentClient) Info(ctx context.Context, addr string) (RepoInfo, erro
 
 // SetSynchronizedStandbySlots reads the agent's epoch and calls
 // Agent.SetSynchronizedStandbySlots at that epoch.
+// ReadySlots counts the logical slots that would survive a promotion here.
+//
+// The three conditions are PostgreSQL's own: a slot the standby
+// synchronised from the primary, that is not temporary (a temporary slot
+// dies with the session that made it), and that has not been invalidated
+// -- most often by the primary discarding WAL the slot still needed.
+// A slot failing any of them exists on the standby and would not work
+// after promotion, which is worse than not being there, because nothing
+// would notice until a subscription stalled.
+func (c *GRPCAgentClient) ReadySlots(ctx context.Context, addr string) (int, error) {
+	cl, err := c.dial(ctx, addr)
+	if err != nil {
+		return 0, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, agentCallTimeout)
+	defer cancel()
+	resp, err := cl.ListSlots(ctx, &pgshardv1.ListSlotsRequest{})
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, s := range resp.GetSlots() {
+		if s.GetKind() != pgshardv1.SlotKind_SLOT_KIND_LOGICAL {
+			continue
+		}
+		if s.GetSynced() && !s.GetTemporary() && s.GetInvalidationReason() == "" {
+			n++
+		}
+	}
+	return n, nil
+}
+
 func (c *GRPCAgentClient) SetSynchronizedStandbySlots(ctx context.Context, addr string, slots []string) ([]string, error) {
 	cl, err := c.dial(ctx, addr)
 	if err != nil {

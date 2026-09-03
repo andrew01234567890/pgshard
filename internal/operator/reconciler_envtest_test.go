@@ -417,6 +417,27 @@ type fakeAgents struct {
 	reloads    []string
 	// syncSlots records the last SetSynchronizedStandbySlots call per addr.
 	syncSlots map[string][]string
+	// ready is how many logical slots each member reports would survive
+	// its promotion; absent means none, as a member that cannot answer.
+	ready map[string]int
+}
+
+func (f *fakeAgents) ReadySlots(_ context.Context, addr string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.errs[addr]; err != nil {
+		return 0, err
+	}
+	return f.ready[addr], nil
+}
+
+func (f *fakeAgents) setReady(addr string, n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.ready == nil {
+		f.ready = map[string]int{}
+	}
+	f.ready[addr] = n
 }
 
 func (f *fakeAgents) SetSynchronizedStandbySlots(_ context.Context, addr string, slots []string) ([]string, error) {
