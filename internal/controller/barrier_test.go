@@ -9,6 +9,11 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 )
 
 // fakeBarrierStore is the catalog side: the fence, the decision log
@@ -802,5 +807,31 @@ func TestACancelledSettleStillReleasesTheFence(t *testing.T) {
 	}
 	if f.store.fenced {
 		t.Fatal("fence left raised after a cancelled settle")
+	}
+}
+
+// TestAFailedBarrierIsAFailedRPC: a barrier that did not happen has to
+// arrive as a failed call. Embedded in a successful response it counted as
+// OK to every gRPC retry policy, interceptor and metric in the path, and
+// only a caller that also read the body could tell the difference -- the
+// two-channel problem, inside a single RPC, since the same method already
+// reported its name and busy failures as statuses.
+func TestAFailedBarrierIsAFailedRPC(t *testing.T) {
+	f := newBarrierFixture()
+	f.groups.fail["restorepoint:shard1"] = errors.New("read only")
+	srv := &Server{Barrier: f.b}
+
+	resp, err := srv.CreateBarrier(context.Background(), &pgshardv1.CreateBarrierRequest{Name: "b1"})
+	if err == nil {
+		t.Fatalf("a barrier that failed returned a successful RPC: %v", resp)
+	}
+	if got := status.Code(err); got != codes.Internal {
+		t.Fatalf("code %v, want Internal: a run that failed partway is not known to be retryable", got)
+	}
+	if !strings.Contains(err.Error(), "read only") {
+		t.Fatalf("the status dropped what went wrong: %v", err)
+	}
+	if resp != nil {
+		t.Fatalf("a failed call must carry no response body: %v", resp)
 	}
 }
