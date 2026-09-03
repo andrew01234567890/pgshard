@@ -41,5 +41,5 @@ The operator owns a `<cluster>-router` Deployment, a ClusterIP Service on
   poolers' `--max-backends` per shard, not router CPU.
 - Scatter fan-out is bounded per router by `--scatter-max-streams` (4096)
   and per statement by `--scatter-max-shards`.
-- Watch `pgshard_router_in_doubt_transactions_total` and connection counts
-  on the `/metrics` endpoint of the health listener.
+- Watch `pgshard_router_twopc_in_doubt_total` and connection counts on the
+  `/metrics` endpoint of the health listener.

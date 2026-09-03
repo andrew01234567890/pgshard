@@ -584,12 +584,18 @@ catalog table `pgshard.xact_decisions`:
 
 **What success means.** The client sees `COMMIT` only after step 3 is
 durable, so a successful `COMMIT` is committed on every shard eventually,
-even if the router dies right afterwards. An error from `COMMIT` other than
-`08007` means the transaction rolled back everywhere. `ROLLBACK` rolls back
-every participant and never touches the decision log.
+even if the router dies right afterwards. A `COMMIT` that fails in the
+prepare phase rolled back everywhere. Any other `COMMIT` error is not known
+to be safe to retry -- see the retry table in
+[the transactions guide](guide/transactions.md#retry-guidance), which names
+every outcome that is. `ROLLBACK` rolls back every participant and never
+touches the decision log.
 
 The `/metrics` endpoint on the health listener exposes
-`pgshard_router_in_doubt_transactions_total`.
+`pgshard_router_twopc_in_doubt_total`. What is still undecided *now*, rather
+than how many have ever been left to the resolver, is on the controller:
+`pgshard_controller_in_doubt_transactions` and
+`pgshard_controller_in_doubt_oldest_age_seconds`.
 
 ### Resolver
 
