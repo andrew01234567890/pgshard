@@ -458,6 +458,47 @@ func digest(ctx context.Context, conn ShardConn, schema, name, filter string) (r
 	return pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[rowDigest])
 }
 
+// bucketDigests is digest for every target range at once: one scan of the
+// source table that buckets each row by the range its key hash falls in,
+// rather than one scan per range. Verification runs with writes fenced, so
+// the scans are the write outage - and a scan apiece made that outage grow
+// with the number of targets as well as with the table.
+//
+// A row whose hash falls in no range buckets to NULL and is dropped, which
+// is what a per-range filter did with it too. A range with no rows is
+// simply absent, and its zero digest is the same answer the filtered scan
+// gave.
+func bucketDigests(ctx context.Context, conn ShardConn, schema, name, hashExpr string, ranges []placement.Range) (map[int]rowDigest, error) {
+	var cases strings.Builder
+	for i, r := range ranges {
+		fmt.Fprintf(&cases, " WHEN (%s) THEN %d", RangeFilter(hashExpr, r), i)
+	}
+	sql := fmt.Sprintf(`SELECT b, count(*), coalesce(sum(h & 2147483647), 0), coalesce(bit_xor(h), 0)
+		FROM (SELECT CASE%s END AS b, hashtextextended(t::text, 0) AS h FROM %s.%s t) s
+		WHERE b IS NOT NULL GROUP BY b`,
+		cases.String(), QuoteIdent(schema), QuoteIdent(name))
+	rows, err := conn.Query(ctx, sql)
+	if err != nil {
+		return nil, err
+	}
+	type bucket struct {
+		B int
+		D rowDigest
+	}
+	got, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (bucket, error) {
+		var b bucket
+		return b, r.Scan(&b.B, &b.D.Rows, &b.D.Hash, &b.D.XOR)
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[int]rowDigest, len(got))
+	for _, g := range got {
+		out[g.B] = g.D
+	}
+	return out, nil
+}
+
 // verifyDetail explains a mismatch. The prediction is the sources restricted to
 // one target's range, while got is everything that target holds, so the two can
 // differ either because the target carries rows that are not its own or because
@@ -519,12 +560,12 @@ func (o *pgCutover) Verify(ctx context.Context) (VerifyReport, error) {
 							return fatal("%s: %w", tb.TableName, err)
 						}
 					}
+					buckets, err := bucketDigests(ctx, conn, tb.SchemaName, tb.TableName, hashes[key], o.wf.ranges)
+					if err != nil {
+						return err
+					}
 					for i, t := range o.wf.ids {
-						d, err := digest(ctx, conn, tb.SchemaName, tb.TableName, RangeFilter(hashes[key], o.wf.ranges[i]))
-						if err != nil {
-							return err
-						}
-						add(key, t, d)
+						add(key, t, buckets[i])
 					}
 				}
 				if s != db.home {
