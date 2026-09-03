@@ -49,6 +49,15 @@ const (
 	// AnnotationPrimaryEpoch and AnnotationPrimary on the group Lease publish
 	// the fence for readers that cannot reach the catalog.
 	AnnotationPrimaryEpoch = "pgshard.io/primary-epoch"
+	// AnnotationSyncSet on the group Lease records the standbys last seen
+	// streaming: the members an acknowledged commit may exist on.
+	//
+	// It lives beside the fence rather than only in PgShardGroup.status
+	// because it is recovered from the same place the primary and the
+	// epoch are. status is rebuilt from what a pass observes, which works
+	// while there is a primary to observe -- and a status lost during an
+	// outage is exactly when there is not.
+	AnnotationSyncSet = "pgshard.io/sync-set"
 
 	// AnnotationRestoreUID and AnnotationRestoreSourceUID record which
 	// restore copied a superuser secret and which cluster it came from.
