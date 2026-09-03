@@ -428,7 +428,7 @@ func (r *relay) send(msg *pgshardv1.ExecuteResponse) error {
 	if r.batched {
 		if dr, ok := msg.GetMessage().(*pgshardv1.ExecuteResponse_DataRow); ok {
 			if n := rowBytes(dr.DataRow); n < batchWideRow {
-				r.rows = append(r.rows, dr.DataRow)
+				r.rows = append(r.rows, copyRow(dr.DataRow))
 				r.rowBytes += n
 				if r.rowBytes >= batchRowBytes || len(r.rows) >= batchRowCount {
 					return r.flushRows()
@@ -458,6 +458,45 @@ func (r *relay) flushRows() error {
 	}
 	r.rows, r.rowBytes = nil, 0
 	return r.stream.Send(msg)
+}
+
+// copyRow copies a row's values out of the connection's receive buffer.
+// pgproto3 hands out column values that point into that buffer and
+// overwrites it on the next message, so a row is only usable until the one
+// after it arrives. Sending each row as it was decoded stayed inside that
+// window; holding rows for a batch does not, and the rows already in hand
+// were being overwritten by the rows still arriving.
+//
+// One allocation for the bytes and one for the slice, whatever the column
+// count: the buffer is sized exactly, so appending into it never moves it
+// and the per-column slices into it stay valid.
+func copyRow(d *pgshardv1.DataRow) *pgshardv1.DataRow {
+	out := &pgshardv1.DataRow{Nulls: d.GetNulls()}
+	n := 0
+	for _, v := range d.GetPacked() {
+		n += len(v)
+	}
+	for _, c := range d.GetColumns() {
+		n += len(c.GetData())
+	}
+	buf := make([]byte, 0, n)
+	if p := d.GetPacked(); len(p) > 0 {
+		out.Packed = make([][]byte, len(p))
+		for i, v := range p {
+			start := len(buf)
+			buf = append(buf, v...)
+			out.Packed[i] = buf[start:len(buf):len(buf)]
+		}
+	}
+	if cols := d.GetColumns(); len(cols) > 0 {
+		out.Columns = make([]*pgshardv1.Value, len(cols))
+		for i, c := range cols {
+			start := len(buf)
+			buf = append(buf, c.GetData()...)
+			out.Columns[i] = &pgshardv1.Value{Data: buf[start:len(buf):len(buf)], Null: c.GetNull()}
+		}
+	}
+	return out
 }
 
 // rowBytes is what a row's values take, which is what the batch bound is

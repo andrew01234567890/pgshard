@@ -1,6 +1,7 @@
 package pooler
 
 import (
+	"fmt"
 	"testing"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
@@ -143,5 +144,70 @@ func TestRowsAreNotBatchedUntilTheRouterAsks(t *testing.T) {
 	}
 	if len(st.sent) != 5 {
 		t.Fatalf("a router that never asked got %d messages for 5 rows", len(st.sent))
+	}
+}
+
+// TestABatchSurvivesTheBufferItWasDecodedFrom is the defect that batching
+// introduced and that only a real backend caught: pgproto3 hands out
+// column values pointing into its receive buffer and overwrites that
+// buffer on the next message. Sending each row as it was decoded stayed
+// inside that window. Holding rows for a batch does not, and the rows
+// already in hand were overwritten by the rows still arriving -- which
+// reached the client as other rows' bytes, not as an error.
+func TestABatchSurvivesTheBufferItWasDecodedFrom(t *testing.T) {
+	r, st := batchRelay(t)
+	shared := []byte("first")
+	send := func() {
+		row := &pgshardv1.ExecuteResponse{Message: &pgshardv1.ExecuteResponse_DataRow{
+			DataRow: &pgshardv1.DataRow{Packed: [][]byte{shared}}}}
+		if err := r.send(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	send()
+	copy(shared, "SECND") // the next message lands in the same buffer
+	send()
+	if err := r.send(complete()); err != nil {
+		t.Fatal(err)
+	}
+	rows := st.sent[0].GetMessage().(*pgshardv1.ExecuteResponse_DataRows).DataRows.GetRows()
+	if len(rows) != 2 {
+		t.Fatalf("batch holds %d rows, want 2", len(rows))
+	}
+	if got := string(rows[0].Packed[0]); got != "first" {
+		t.Fatalf("the first row read %q; the second row overwrote it in place", got)
+	}
+	if got := string(rows[1].Packed[0]); got != "SECND" {
+		t.Fatalf("the second row read %q", got)
+	}
+}
+
+func TestCopyRowCarriesNullsAndTheUnpackedShape(t *testing.T) {
+	src := &pgshardv1.DataRow{Columns: []*pgshardv1.Value{
+		{Data: []byte("a")}, {Null: true}, {Data: []byte("")}}, Nulls: []uint32{7}}
+	got := copyRow(src)
+	if len(got.Columns) != 3 || string(got.Columns[0].Data) != "a" {
+		t.Fatalf("columns: %+v", got.Columns)
+	}
+	if !got.Columns[1].Null || got.Columns[2].Null {
+		t.Fatal("a NULL column and an empty one are not the same thing")
+	}
+	if len(got.Nulls) != 1 || got.Nulls[0] != 7 {
+		t.Fatalf("nulls: %v", got.Nulls)
+	}
+}
+
+func BenchmarkCopyRow(b *testing.B) {
+	for _, cols := range []int{1, 16} {
+		b.Run(fmt.Sprintf("cols=%d", cols), func(b *testing.B) {
+			src := &pgshardv1.DataRow{Packed: make([][]byte, cols)}
+			for i := range src.Packed {
+				src.Packed[i] = make([]byte, 16)
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				_ = copyRow(src)
+			}
+		})
 	}
 }
