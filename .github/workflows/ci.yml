@@ -165,11 +165,22 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_CONFIG: .gitleaks.toml
-          GITLEAKS_ENABLE_SUMMARY: "false"
+      # Run by digest rather than through the action. The action is SHA
+      # pinned, which fixes the downloader and not the binary it fetches:
+      # it pulls a release tarball with no digest check, so whoever can
+      # replace that asset decides what this gate runs. A gate that can be
+      # replaced is worth less than no gate, because it reports success.
+      #
+      # git, not dir: dir scans the working tree, so a secret committed and
+      # then deleted would pass. That is why the checkout above asks for
+      # the whole history.
+      - name: Scan history for secrets
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE":/repo \
+            ghcr.io/gitleaks/gitleaks:v8.30.0@sha256:691af3c7c5a48b16f187ce3446d5f194838f91238f27270ed36eef6359a574d9 \
+            git /repo --config /repo/.gitleaks.toml --no-banner --redact
 
   actionlint:
     name: Workflow lint and policy
