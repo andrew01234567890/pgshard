@@ -666,6 +666,25 @@ func (r *ClusterReconciler) loadState(ctx context.Context, c *pgshardv1alpha1.Pg
 	if err := r.recoverPVCs(ctx, c, g, pg, st); err != nil {
 		return groupState{}, err
 	}
+	if len(st.syncSet) == 0 {
+		// status is rebuilt from what a pass observes, so it comes back on
+		// its own while there is a primary to observe. During an outage
+		// there is not, and an empty synchronous set refuses every
+		// failover -- safely, but the cluster stays down. The Lease
+		// remembers it for exactly that case.
+		for _, name := range rememberedSyncSet(g, pg.Annotations[AnnotationSyncSet]) {
+			st.syncSet[name] = true
+		}
+	}
+	if len(st.syncSet) == 0 {
+		// The group object itself can be gone, not just its status. The
+		// Lease is a separate object and outlives it -- when there is one:
+		// it is created by the first fence, so a cluster that has never
+		// failed over has none.
+		for _, name := range r.leaseSyncSet(ctx, c, g) {
+			st.syncSet[name] = true
+		}
+	}
 	// A designated primary outside the member set is not an oracle to be
 	// obeyed: scaling replicasPerShard below the ordinal of a primary that a
 	// failover promoted leaves status.primary naming a member that no longer
@@ -701,6 +720,74 @@ func (r *ClusterReconciler) loadState(ctx context.Context, c *pgshardv1alpha1.Pg
 		}
 	}
 	return st, nil
+}
+
+// recordSyncSet keeps the Lease's memory of the synchronous set current.
+// It writes only when the set changed: a Lease rewritten every pass for
+// every group is a write per group per pass for a value that rarely moves.
+func (r *ClusterReconciler) recordSyncSet(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, primary string, streaming map[string]bool) error {
+	var names []string
+	for _, name := range g.MemberNames() {
+		if name != primary && streaming[name] {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		// Nothing observed streaming is not evidence that nothing is: a
+		// pass that could not reach the members must not erase what the
+		// last one knew.
+		return nil
+	}
+	want := strings.Join(names, ",")
+	pg := r.Renderer.PgShardGroup(c, g)
+	if err := r.Get(ctx, client.ObjectKeyFromObject(pg), pg); err == nil && pg.Annotations[AnnotationSyncSet] != want {
+		base := pg.DeepCopy()
+		if pg.Annotations == nil {
+			pg.Annotations = map[string]string{}
+		}
+		pg.Annotations[AnnotationSyncSet] = want
+		if err := r.Patch(ctx, pg, client.MergeFrom(base)); err != nil {
+			return err
+		}
+	} else if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	var lease coordinationv1.Lease
+	key := types.NamespacedName{Namespace: c.Namespace, Name: g.LeaseName()}
+	if err := r.Get(ctx, key, &lease); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if lease.Annotations[AnnotationSyncSet] == want {
+		return nil
+	}
+	base := lease.DeepCopy()
+	if lease.Annotations == nil {
+		lease.Annotations = map[string]string{}
+	}
+	lease.Annotations[AnnotationSyncSet] = want
+	return r.Patch(ctx, &lease, client.MergeFrom(base))
+}
+
+// rememberedSyncSet reads a recorded set, keeping only members that still
+// exist: a set scaled down leaves names behind, and a name that is not a
+// member is not a candidate for anything.
+func rememberedSyncSet(g Group, recorded string) []string {
+	var out []string
+	for _, name := range strings.Split(recorded, ",") {
+		if name != "" && slices.Contains(g.MemberNames(), name) {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// leaseSyncSet is the synchronous set the Lease remembers.
+func (r *ClusterReconciler) leaseSyncSet(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group) []string {
+	var lease coordinationv1.Lease
+	if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: g.LeaseName()}, &lease); err != nil {
+		return nil
+	}
+	return rememberedSyncSet(g, lease.Annotations[AnnotationSyncSet])
 }
 
 // recoverPVCs fills in the claim of any member whose status did not name
@@ -968,6 +1055,9 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 		}
 	}
 	obs.syncApplied = true
+	if err := r.recordSyncSet(ctx, c, g, state.primary, obs.streaming); err != nil {
+		logf.FromContext(ctx).Info("could not record the synchronous set on the lease; continuing", "group", g.Name(), "err", err)
+	}
 	if primary.ip != "" {
 		if _, err := r.Agents.SetSynchronizedStandbySlots(ctx, agentAddr(primary.ip), SynchronizedStandbySlots(g, state.primary, c.Spec.Durability.MinSyncStandbys, obs.streaming)); err != nil {
 			obs.primaryErr = "set synchronized_standby_slots: " + err.Error()
