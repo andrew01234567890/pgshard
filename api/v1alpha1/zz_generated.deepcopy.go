@@ -695,6 +695,11 @@ func (in *PgShardClusterStatus) DeepCopyInto(out *PgShardClusterStatus) {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
 	}
+	if in.AppliedShards != nil {
+		in, out := &in.AppliedShards, &out.AppliedShards
+		*out = new(int)
+		**out = **in
+	}
 	if in.Reshard != nil {
 		in, out := &in.Reshard, &out.Reshard
 		*out = new(ClusterReshardStatus)
