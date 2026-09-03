@@ -1772,6 +1772,9 @@ func (e *Executor) poolerLost(cause error) error {
 	if _, isPG := errors.AsType[*pgwire.Error](cause); isPG {
 		return cause
 	}
+	if pe := tooLargeError("pooler stream", cause); pe != nil {
+		return pe
+	}
 	return pgwire.Errorf(codeConnectionFailure, "pooler connection lost: %v", cause)
 }
 

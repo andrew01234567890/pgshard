@@ -297,12 +297,28 @@ const codeTooLarge = "54000"
 // fact that would let anyone act -- that there is a size limit, what it
 // is, and that PostgreSQL's own is far larger.
 func poolerTransportError(what string, err error) error {
-	if status.Code(err) == codes.ResourceExhausted {
-		pe := pgwire.Errorf(codeTooLarge, "%s: a message exceeded the %d MiB pgshard carries between the router and a pooler: %v",
-			what, pooler.MaxMessageBytes>>20, err)
-		pe.Detail = "A single parameter value, result row or COPY chunk is larger than this limit. PostgreSQL's own protocol limit is much larger; this one is pgshard's."
-		pe.Hint = "Send or return the value in smaller pieces -- fewer rows per batch, a smaller COPY chunk, or a large value read in parts."
+	if pe := tooLargeError(what, err); pe != nil {
 		return pe
 	}
 	return pgwire.Errorf(codeConnectionFailure, "%s: pooler connection lost: %v", what, err)
+}
+
+// tooLargeError is the size limit's answer, or nil when err is not one.
+//
+// It is separate because there is more than one place a gRPC failure
+// becomes a client error -- the scatter path, the transaction path and the
+// session path each had their own -- and a size limit reported as a lost
+// connection on any of them is a client told to reconnect over a value
+// that will be exactly as large next time. The direction does not matter:
+// grpc-go refuses an oversized message on the way out as readily as on the
+// way in, and a client cannot tell the difference or act on it.
+func tooLargeError(what string, err error) *pgwire.Error {
+	if status.Code(err) != codes.ResourceExhausted {
+		return nil
+	}
+	pe := pgwire.Errorf(codeTooLarge, "%s: a message exceeded the %d MiB pgshard carries between the router and a pooler: %v",
+		what, pooler.MaxMessageBytes>>20, err)
+	pe.Detail = "A single parameter value, result row or COPY chunk is larger than this limit. PostgreSQL's own protocol limit is much larger; this one is pgshard's."
+	pe.Hint = "Send or return the value in smaller pieces -- fewer rows per batch, a smaller COPY chunk, or a large value read in parts."
+	return pe
 }
