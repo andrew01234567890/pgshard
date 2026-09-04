@@ -17,8 +17,57 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Whether this pull request touches anything the e2e matrix could prove
+  # something about. A docs-only change cannot break resharding, and every
+  # cell it occupies is capacity the pull requests that could merge are
+  # waiting for.
+  #
+  # The cells still RUN and still report: several of them are required
+  # contexts, and a required check that never runs never reports, which
+  # blocks the pull request for ever. So this decides whether the cells do
+  # their WORK, not whether they exist. paths-ignore would have stranded
+  # every docs pull request instead of speeding it up.
+  changes:
+    name: e2e relevance
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # Anything that is not a pull request runs everything: a push to
+          # main proves the merge, and there is no base to compare against.
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(git diff --name-only "$BASE" "$HEAD" || true)
+          if [ -z "$changed" ]; then
+            # No readable diff is not evidence of a docs-only change.
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Err toward running. docs/ and top-level .md files are safe to
+          # skip; .github/ is not, because a workflow change must run the
+          # workflows, and neither is test/ or hack/.
+          if printf '%s\n' "$changed" | grep -qvE '^(docs/|[^/]*\.md$)'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "only docs changed; cells will report without provisioning clusters"
+          fi
+
   e2e:
     name: e2e (pg${{ matrix.pg }}, ${{ matrix.suite }})
+    needs: [changes]
     runs-on: ubuntu-latest
     timeout-minutes: ${{ (matrix.suite == 'upgrade' || startsWith(matrix.suite, 'reshard-')) && 120 || 80 }}
     strategy:
@@ -48,8 +97,10 @@ jobs:
       E2E_ARTIFACTS: ${{ github.workspace }}/artifacts/e2e-pg${{ matrix.pg }}-${{ matrix.suite }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.changes.outputs.code == 'true'
         id: checkout
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: needs.changes.outputs.code == 'true'
         id: setup_go
         with:
           go-version-file: go.mod
@@ -60,6 +111,7 @@ jobs:
       # required context and roughly forty minutes of somebody's rerun.
       # The SHA stays pinned; only the attempt is repeated.
       - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        if: needs.changes.outputs.code == 'true'
         id: install_kind
         continue-on-error: true
         with:
@@ -67,7 +119,7 @@ jobs:
           install_only: true
       - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
         id: install_kind_retry
-        if: steps.install_kind.outcome == 'failure'
+        if: steps.install_kind.outcome == 'failure' && needs.changes.outputs.code == 'true'
         with:
           version: v0.32.0
           install_only: true
@@ -77,14 +129,15 @@ jobs:
           driver-opts: image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
         id: setup_buildx
         continue-on-error: true
-        if: matrix.suite != 'smoke'
+        if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true'
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         with:
           version: v0.36.1
           driver-opts: image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
         id: setup_buildx_retry
-        if: matrix.suite != 'smoke' && steps.setup_buildx.outcome == 'failure'
+        if: matrix.suite != 'smoke' && steps.setup_buildx.outcome == 'failure' && needs.changes.outputs.code == 'true'
       - name: Warm the module and base-image caches
+        if: needs.changes.outputs.code == 'true'
         id: warm_caches
         # The failures that take a cell down are usually somebody else's
         # network: a registry answering 403, a module proxy dropping a
@@ -101,7 +154,7 @@ jobs:
           done
       - name: Build PostgreSQL image
         id: build_postgres
-        if: matrix.suite != 'smoke'
+        if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true'
         uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7.3.0
         with:
           source: .
@@ -111,7 +164,7 @@ jobs:
           CI: "true"
       - name: Build operator and admin images
         id: build_control
-        if: matrix.suite != 'smoke'
+        if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true'
         run: |
           hack/ci/retry.sh -- docker build -f Dockerfile.control --build-arg CMD=pgshard-operator -t pgshard-operator:e2e .
           hack/ci/retry.sh -- docker build -f Dockerfile.control --build-arg CMD=pgshard-admin -t pgshard-admin:e2e .
@@ -120,11 +173,11 @@ jobs:
         id: build_controller
         # Every cluster gets a controller from the operator now, not just
         # the suites that drive a workflow through one.
-        if: matrix.suite != 'smoke'
+        if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true'
         run: hack/ci/retry.sh -- docker build -f Dockerfile.control --build-arg CMD=pgshard-controller -t pgshard-controller:e2e .
       - name: Build the target-major PostgreSQL image
         id: build_postgres_target
-        if: matrix.suite == 'upgrade'
+        if: matrix.suite == 'upgrade' && needs.changes.outputs.code == 'true'
         uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7.3.0
         with:
           source: .
@@ -133,23 +186,25 @@ jobs:
         env:
           CI: "true"
       - name: Create kind cluster
+        if: needs.changes.outputs.code == 'true'
         id: kind_up
         # A cluster that does not come up leaves nothing worth keeping, and
         # a second attempt cannot reuse the first one's half-built cluster.
         run: hack/ci/retry.sh -n 2 -d 15 -c hack/kind/down.sh -- hack/kind/up.sh
       - name: Load images into kind
         id: load_images
-        if: matrix.suite != 'smoke'
+        if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true'
         run: hack/kind/load-images.sh pgshard-operator:e2e pgshard-admin:e2e pgshard-router:e2e "ghcr.io/andrew01234567890/pgshard-postgres:${PG_MAJOR}"
       - name: Load controller image into kind
         id: load_controller
-        if: matrix.suite != 'smoke'
+        if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true'
         run: hack/kind/load-images.sh pgshard-controller:e2e
       - name: Load the target-major image into kind
         id: load_target
-        if: matrix.suite == 'upgrade'
+        if: matrix.suite == 'upgrade' && needs.changes.outputs.code == 'true'
         run: hack/kind/load-images.sh "ghcr.io/andrew01234567890/pgshard-postgres:19"
       - name: Run e2e suite
+        if: needs.changes.outputs.code == 'true'
         id: run_suite
         run: |
           set -o pipefail
@@ -171,7 +226,7 @@ jobs:
           ADMIN_IMAGE: pgshard-admin:e2e
           CONTROLLER_IMAGE: pgshard-controller:e2e
       - name: Say whether the cell reached its tests
-        if: failure()
+        if: failure() && needs.changes.outputs.code == 'true'
         env:
           SUITE: ${{ matrix.suite }}
           PG: ${{ matrix.pg }}
@@ -209,18 +264,18 @@ jobs:
             echo "**e2e ($PG, $SUITE): failed outside setup and tests**" >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Collect cluster state on failure
-        if: failure()
+        if: failure() && needs.changes.outputs.code == 'true'
         run: |
           kubectl get all -A -o yaml > "$E2E_ARTIFACTS/all.yaml" || true
           kubectl get events -A --sort-by=.lastTimestamp > "$E2E_ARTIFACTS/events.txt" || true
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
+        if: always() && needs.changes.outputs.code == 'true'
         with:
           name: e2e-pg${{ matrix.pg }}-${{ matrix.suite }}
           path: artifacts/
           if-no-files-found: ignore
       - name: Delete kind cluster
-        if: always()
+        if: always() && needs.changes.outputs.code == 'true'
         run: hack/kind/down.sh
 
   gate:
