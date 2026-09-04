@@ -439,3 +439,70 @@ func TestGroupRolloutStatusWithoutPhasePassesValidation(t *testing.T) {
 		t.Fatalf("clear rollout: %v", err)
 	}
 }
+
+// TestARebuildWaitsForTheDeletedPodToGoAway is PGS-606.
+//
+// Kubernetes keeps a terminating pod Running and Ready for its whole grace
+// period, which is long here on purpose so PostgreSQL shuts down cleanly.
+// The settled check counted pods, so the standby a rebuild step had just
+// deleted was still one of the three ready members, the step was declared
+// complete, and the rollout took the next standby out too.
+//
+// In CI that left one member cloning and one just deleted, the rollout
+// asked to switch away from the primary, chooseCandidate found nothing
+// promotable, and the fence was raised and released for the rest of the
+// run:
+//
+//	22:05:29 storage rebuild: deleting standby pod member=demo-shard-0-0
+//	22:05:42 rollout step complete member=demo-shard-0-0 phase=Rebuilding
+//	22:05:42 storage rebuild: deleting standby pod member=demo-shard-0-2
+//	22:06:26 no failover candidate; releasing the fence
+func TestARebuildWaitsForTheDeletedPodToGoAway(t *testing.T) {
+	r, fp, _, c := healthyCluster(t, "term")
+	fp.standbys[podIP(1, 1)] = StandbyState{InRecovery: true, FlushLSN: 900}
+	fp.standbys[podIP(1, 2)] = StandbyState{InRecovery: true, FlushLSN: 900}
+
+	// A finalizer is what makes envtest keep the pod after the delete, the
+	// way a grace period does in a real cluster.
+	var held corev1.Pod
+	get(t, "term-shard-0-1", &held)
+	held.Finalizers = append(held.Finalizers, "pgshard.io/test-hold")
+	if err := k8sClient.Update(context.Background(), &held); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		var p corev1.Pod
+		if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "term-shard-0-1"}, &p); err == nil {
+			p.Finalizers = nil
+			_ = k8sClient.Update(context.Background(), &p)
+		}
+	})
+
+	patchSpec(t, c, func(c *pgshardv1alpha1.PgShardCluster) {
+		c.Spec.Storage.StorageClassName = ptr.To("fast")
+	})
+	reconcile(t, r, c)
+	if st := groupStatus(t, "term-shard-0"); st.Rollout == nil || st.Rollout.Member != "term-shard-0-1" {
+		t.Fatalf("pass 1 must start rebuilding the first standby: %+v", st.Rollout)
+	}
+
+	// The pod is deleted but still there, still Ready. Several passes: none
+	// of them may call this step complete or touch the second standby,
+	// because the group does not have three members right now however many
+	// ready pods the API server reports.
+	var terminating corev1.Pod
+	get(t, "term-shard-0-1", &terminating)
+	if terminating.DeletionTimestamp == nil {
+		t.Fatal("the finalizer should have left the pod terminating")
+	}
+	for range 3 {
+		reconcile(t, r, c)
+		st := groupStatus(t, "term-shard-0")
+		if st.Rollout == nil || st.Rollout.Member != "term-shard-0-1" {
+			t.Fatalf("a rebuild whose pod has not gone away is not complete: %+v", st.Rollout)
+		}
+		if !podExists(t, "term-shard-0-2") {
+			t.Fatal("the second standby was taken out while the first was still terminating")
+		}
+	}
+}
