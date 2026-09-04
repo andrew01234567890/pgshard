@@ -147,11 +147,20 @@ jobs:
         run: |
           set -euo pipefail
           hack/ci/retry.sh -- go mod download
-          # By digest, as the Dockerfiles pin them: pulling the tag would
-          # warm the cache with an image the build then ignores.
-          awk '/^FROM .*@sha256:/ {print $2}' Dockerfile.control Dockerfile.router | sort -u | while read -r image; do
-            hack/ci/retry.sh -- docker pull "$image"
-          done
+          # From our mirror, by the same digest the Dockerfiles pin. Docker
+          # Hub rate-limits a shared runner pool by IP, and a base image it
+          # will not serve for longer than a retry window takes six required
+          # contexts down on a change that is fine -- which is what happened
+          # to #641.
+          #
+          # Best effort per image: the build has its own fallback, because
+          # the FROM lines are unchanged and a missing override just goes to
+          # Docker Hub. A warm step that failed the job would turn a mirror
+          # that is merely behind into an outage of its own.
+          while IFS=$'\t' read -r ref slug; do
+            hack/ci/retry.sh -n 2 -d 5 -- docker pull "ghcr.io/${{ github.repository_owner }}/pgshard-base@${ref#*@}" \
+              || echo "::warning::${slug} not available from the mirror; the build will fall back to Docker Hub"
+          done < <(hack/ci/base-images.sh)
       - name: Build PostgreSQL image
         id: build_postgres
         if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true'
@@ -166,15 +175,24 @@ jobs:
         id: build_control
         if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true'
         run: |
-          hack/ci/retry.sh -- docker build -f Dockerfile.control --build-arg CMD=pgshard-operator -t pgshard-operator:e2e .
-          hack/ci/retry.sh -- docker build -f Dockerfile.control --build-arg CMD=pgshard-admin -t pgshard-admin:e2e .
-          hack/ci/retry.sh -- docker build -f Dockerfile.router -t pgshard-router:e2e .
+          set -euo pipefail
+          # The overrides point every FROM at the mirrored copy of the same
+          # digest. With none -- a fork without the mirror, or a base added
+          # before the mirror workflow ran -- the Dockerfiles are unchanged
+          # and the build goes to Docker Hub as before.
+          mapfile -t mirror < <(hack/ci/mirror-args.sh)
+          hack/ci/retry.sh -- docker buildx build "${mirror[@]}" --load -f Dockerfile.control --build-arg CMD=pgshard-operator -t pgshard-operator:e2e .
+          hack/ci/retry.sh -- docker buildx build "${mirror[@]}" --load -f Dockerfile.control --build-arg CMD=pgshard-admin -t pgshard-admin:e2e .
+          hack/ci/retry.sh -- docker buildx build "${mirror[@]}" --load -f Dockerfile.router -t pgshard-router:e2e .
       - name: Build controller image
         id: build_controller
         # Every cluster gets a controller from the operator now, not just
         # the suites that drive a workflow through one.
         if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true'
-        run: hack/ci/retry.sh -- docker build -f Dockerfile.control --build-arg CMD=pgshard-controller -t pgshard-controller:e2e .
+        run: |
+          set -euo pipefail
+          mapfile -t mirror < <(hack/ci/mirror-args.sh)
+          hack/ci/retry.sh -- docker buildx build "${mirror[@]}" --load -f Dockerfile.control --build-arg CMD=pgshard-controller -t pgshard-controller:e2e .
       - name: Build the target-major PostgreSQL image
         id: build_postgres_target
         if: matrix.suite == 'upgrade' && needs.changes.outputs.code == 'true'

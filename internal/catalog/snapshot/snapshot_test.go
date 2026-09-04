@@ -189,7 +189,7 @@ func TestAReloadOfAnUnchangedCatalogPlansTheSame(t *testing.T) {
 			},
 			Databases: map[string]catalog.Database{"app": {Name: "app", DefaultPlacement: "unsharded", HomeShard: 0}},
 			Tables: map[TableKey]Placement{
-				{Database: "app", SchemaName: "public", TableName: "orders"}: {Placement: "sharded", ShardKey: "tenant_id", Generation: 3},
+				{Database: "app", SchemaName: "public", TableName: "orders"}: {Placement: "sharded", ShardKey: "tenant_id", ShardKeyChecked: true, Generation: 3},
 			},
 			Sequences: map[string]bool{"app.public.orders_id_seq": true},
 		}
@@ -226,6 +226,29 @@ func TestAReloadOfAnUnchangedCatalogPlansTheSame(t *testing.T) {
 		},
 		"a new table": func(s *Snapshot) {
 			s.Tables[TableKey{Database: "app", SchemaName: "public", TableName: "new"}] = Placement{}
+		},
+		// The shard-key verdict is published on its own pass, without the
+		// table's generation moving, and the planner reads all three: it
+		// refuses an unchecked or faulted key and normalises the client's
+		// value by the recorded type. A plan cached across the publication
+		// is a plan made under the rule that no longer applies.
+		"the shard key becoming checked": func(s *Snapshot) {
+			k := TableKey{Database: "app", SchemaName: "public", TableName: "orders"}
+			p := s.Tables[k]
+			p.ShardKeyChecked = false
+			s.Tables[k] = p
+		},
+		"a shard key fault": func(s *Snapshot) {
+			k := TableKey{Database: "app", SchemaName: "public", TableName: "orders"}
+			p := s.Tables[k]
+			p.ShardKeyError = "shard key tenant_id of type character(8) is not supported"
+			s.Tables[k] = p
+		},
+		"the shard key's recorded type": func(s *Snapshot) {
+			k := TableKey{Database: "app", SchemaName: "public", TableName: "orders"}
+			p := s.Tables[k]
+			p.ShardKeyType = "character(8)"
+			s.Tables[k] = p
 		},
 		"a database default": func(s *Snapshot) { s.Databases["app"] = catalog.Database{Name: "app", DefaultPlacement: "sharded"} },
 		"a global sequence":  func(s *Snapshot) { s.Sequences["app.public.new_id_seq"] = true },

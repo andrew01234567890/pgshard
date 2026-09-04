@@ -113,6 +113,93 @@ client can make here: `08007` means the original transaction may still
 commit, and a blanket retry policy duplicates it. Every outcome that *is*
 safe to retry is named above.
 
+### Retry loops
+
+One loop per driver. Each retries `40001` and `40P01` and nothing else,
+backs off between attempts, and lets `08007` out unretried -- an in-doubt
+commit may still land, and a blanket retry duplicates it.
+
+The codes below are checked against the router's own constants by
+`TestGuideRetryExamplesMatchTheContract`, so changing the contract breaks
+these examples rather than silently outdating them.
+
+pgx:
+
+```go
+func withRetry(ctx context.Context, pool *pgxpool.Pool, fn func(pgx.Tx) error) error {
+    var err error
+    for attempt := range 5 {
+        if attempt > 0 {
+            time.Sleep(time.Duration(1<<attempt) * 50 * time.Millisecond)
+        }
+        err = pgx.BeginFunc(ctx, pool, fn)
+        if err == nil {
+            return nil
+        }
+        var pge *pgconn.PgError
+        if !errors.As(err, &pge) {
+            return err
+        }
+        // 40001 is every outcome the router knows is safe to run again;
+        // 40P01 is a deadlock PostgreSQL already rolled back. Anything
+        // else, 08007 included, is returned to the caller.
+        if pge.Code != "40001" && pge.Code != "40P01" {
+            return err
+        }
+    }
+    return err
+}
+```
+
+psycopg (3.x):
+
+```python
+def with_retry(conn, fn, attempts=5):
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(0.05 * (2 ** attempt))
+        try:
+            with conn.transaction():
+                return fn(conn)
+        except psycopg.errors.Error as e:
+            # sqlstate, not the exception class: psycopg maps 40001 and
+            # 40P01 to different classes, and 08007 to one that looks
+            # retryable and is not.
+            if e.sqlstate not in ("40001", "40P01"):
+                raise
+    raise RuntimeError("transaction did not succeed in %d attempts" % attempts)
+```
+
+JDBC:
+
+```java
+static <T> T withRetry(DataSource ds, SQLFunction<Connection, T> fn) throws SQLException {
+    SQLException last = null;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        if (attempt > 0) {
+            try { Thread.sleep(50L << attempt); }
+            catch (InterruptedException ie) { Thread.currentThread().interrupt(); throw last; }
+        }
+        try (Connection c = ds.getConnection()) {
+            c.setAutoCommit(false);
+            T out = fn.apply(c);
+            c.commit();
+            return out;
+        } catch (SQLException e) {
+            // getSQLState, not the exception type: a SQLTransientException
+            // is not the same set, and 08007 arrives as a connection
+            // exception that a transient-class check would retry.
+            String state = e.getSQLState();
+            if (!"40001".equals(state) && !"40P01".equals(state)) {
+                throw e;
+            }
+            last = e;
+        }
+    }
+    throw last;
+}
+```
+
 Metrics: `pgshard_router_twopc_in_doubt_total` on the router's `/metrics`
 endpoint counts commits left to the resolver. To see what is still
 undecided *now*, and how old it is, watch the controller's

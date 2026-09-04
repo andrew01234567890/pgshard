@@ -92,7 +92,10 @@ func startCutoverStack(t *testing.T) *cutoverStack {
 	}
 	for _, sql := range []string{
 		`INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('app', 'public', 'accounts', 'sharded', 'id')`,
-		`INSERT INTO pgshard.table_status (database, schema_name, table_name, effective_placement, effective_shard_key) VALUES ('app', 'public', 'accounts', 'sharded', 'id')`,
+		// The verdict a running ShardKeyCheck would publish. This stack drives
+		// the workflow itself and runs no controller, so nothing else records
+		// it, and a sharded table with no verdict is not routable.
+		`INSERT INTO pgshard.table_status (database, schema_name, table_name, effective_placement, effective_shard_key, shard_key_checked_generation, shard_key_type) VALUES ('app', 'public', 'accounts', 'sharded', 'id', 0, 'bigint')`,
 	} {
 		if _, err := tx.Exec(ctx, sql); err != nil {
 			t.Fatalf("%s: %v", sql, err)
