@@ -8,7 +8,7 @@ runs the checker against the fixtures under `hack/testdata`.
 
 | Workflow | What it does |
 | --- | --- |
-| `ci.yml` | gofmt, vet, golangci-lint, `go test -race`, build; `buf lint` plus a drift check that fails when `make proto` changes `internal/gen`; govulncheck; gitleaks; actionlint and the policy checker; PR title check |
+| `ci.yml` | gofmt, vet, golangci-lint, `go test -race`, build; `buf lint`, `buf breaking` and a drift check that fails when `make proto` changes `internal/gen`; govulncheck; gitleaks; actionlint and the policy checker; PR title check |
 | `images.yml` | builds the PostgreSQL 18 and 19 images with `docker buildx bake` and pushes them to GHCR on `main` |
 | `e2e-kind.yml` | kind-based smoke, operator, backup and reshard suites for both majors, plus upgrade, reshard-split and reshard-merge on pg18 |
 | `perf.yml` | benchstat comparison against the base branch; only benchmarks tagged `Gate` can fail a PR (see `hack/perf/gate.sh`) |
@@ -51,6 +51,27 @@ works anonymously. The catalog integration test then runs against the project
 images for both majors; set `PGSHARD_REQUIRE_PROJECT_IMAGES=1` (planned for
 `ci.yml` after the bootstrap) to fail instead of falling back to Docker Hub
 `postgres:*` tags when a project image is missing.
+
+## What `pgshard.v1` promises
+
+`buf breaking` runs on every pull request, against `main`, at the **WIRE**
+category. That is a decision, not a default.
+
+`FILE` — buf's strictest — forbids removing an rpc or a message.
+`pgshard.v1` has never been released: no tag, no release, and the images
+carry moving tags, so nothing outside this repository generates clients from
+it. Holding the proto to a promise nothing depends on costs real work;
+PGS-629 removed an rpc that was declared and implemented nowhere, and `FILE`
+would have refused it.
+
+What `WIRE` still forbids is the change that breaks a deployment silently: a
+field number reused for a different type, or a type changed under a field
+that keeps its number. A router and a pooler of different versions then
+disagree about the bytes on the wire, and no amount of "it is pre-1.0" makes
+that acceptable.
+
+Tighten it to `FILE` when `pgshard.v1` is released and something outside this
+repository depends on it.
 
 ## Cutting a release
 
