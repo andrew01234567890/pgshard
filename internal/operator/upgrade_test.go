@@ -83,6 +83,28 @@ func TestImageForPinsOldMajorDuringUpgrade(t *testing.T) {
 	}
 }
 
+// A 19 group whose image was never captured must not acquire the moving
+// pgshard-postgres:19 tag. The CRD refuses `major: 19` without an image so
+// nobody reaches a beta by picking an ordinary-looking major; resolving the
+// default here would be that same implicit selection by another road.
+func TestAGroupOnAMajorThatMustBeNamedGetsNoGuessedImage(t *testing.T) {
+	c := upgradeCluster(18)
+	c.Spec.PostgreSQL.Image = "example.invalid/postgres:18"
+	if got := ImageFor(c, Group{PGMajor: 19}); got != "" {
+		t.Fatalf("a 19 group with no captured image must not be guessed at, got %q", got)
+	}
+	// A captured image is still honoured: this refuses the guess, not the
+	// group.
+	if got := ImageFor(c, Group{PGMajor: 19, PGImage: "example.invalid/postgres:19beta3"}); got != "example.invalid/postgres:19beta3" {
+		t.Fatalf("a captured image must still be used, got %q", got)
+	}
+	// A major that does not have to be named is unchanged: the guess is
+	// how an old-major group keeps its own image during an upgrade.
+	if got := ImageFor(upgradeCluster(19), Group{PGMajor: 18}); got != DefaultImageRepository+":18" {
+		t.Fatalf("18 groups still resolve their default: %q", got)
+	}
+}
+
 func TestUpgradeJob(t *testing.T) {
 	c := upgradeCluster(19)
 	c.Namespace = "prod"

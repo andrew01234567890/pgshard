@@ -409,6 +409,17 @@ func ImageFor(c *pgshardv1alpha1.PgShardCluster, g Group) string {
 		if g.PGImage != "" {
 			return g.PGImage
 		}
+		// A major that has to be asked for by name cannot be guessed. The
+		// CRD refuses `major: 19` without an image precisely so nobody
+		// reaches a beta by picking what looks like an ordinary major, and
+		// resolving the moving pgshard-postgres:19 tag here would be that
+		// same implicit selection arriving by another road. Empty is
+		// returned instead: a member rendered with no image is refused by
+		// the API server, which is a loud failure, where running an image
+		// the owner never named is a silent one.
+		if pgshardv1alpha1.RequiresNamedImage(g.PGMajor) {
+			return ""
+		}
 		return fmt.Sprintf("%s:%d", DefaultImageRepository, g.PGMajor)
 	}
 	return Image(c)
