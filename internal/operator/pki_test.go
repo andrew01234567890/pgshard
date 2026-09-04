@@ -2,6 +2,9 @@ package operator
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -212,5 +215,48 @@ func TestASuppliedSecretIsStillMountedEverywhere(t *testing.T) {
 	}
 	if ref := internalTLSRefFor(c, pki.RolePooler); ref == nil || ref.Name != c.Spec.InternalTLS.SecretRef.Name {
 		t.Fatalf("the supplied secret must still serve every role: %+v", ref)
+	}
+}
+
+// serverRoles are the workloads the operator hands --tls-cert and starts a
+// listener with, paired with the address something else dials them on. A
+// certificate mounted as a server has to say it may serve, and has to name
+// the address callers use, or every caller fails the handshake.
+func serverRoles(c *pgshardv1alpha1.PgShardCluster) map[string]string {
+	return map[string]string{
+		pki.RoleRouter:     RouterName(c.Name) + "." + c.Namespace + ".svc",
+		pki.RoleController: ControllerName(c.Name) + "." + c.Namespace + ".svc",
+	}
+}
+
+// TestEveryListenerGetsACertificateItCanServeWith: the controller is
+// mounted with --tls-cert and serves gRPC on it -- barriers, workflows,
+// DDL and the resolver all arrive that way -- but it was issued a
+// client-only certificate: no ServerAuth EKU and no DNS name for its
+// Service. Both are fatal on their own, and a caller that verifies either
+// one cannot complete a handshake, so turning on issued certificates took
+// the controller off the air.
+func TestEveryListenerGetsACertificateItCanServeWith(t *testing.T) {
+	c := issuingCluster("listen")
+	r := pkiReconciler(t, time.Now(), c)
+	if err := r.reconcilePKI(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	for role, dialed := range serverRoles(c) {
+		sec := secretOf(t, r, c.Namespace, RoleTLSSecretName(c.Name, role))
+		block, _ := pem.Decode(sec.Data["tls.crt"])
+		if block == nil {
+			t.Fatalf("%s: no certificate in the secret", role)
+		}
+		crt, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatalf("%s: %v", role, err)
+		}
+		if !slices.Contains(crt.ExtKeyUsage, x509.ExtKeyUsageServerAuth) {
+			t.Errorf("%s serves TLS but its certificate has no ServerAuth usage: %v", role, crt.ExtKeyUsage)
+		}
+		if err := crt.VerifyHostname(dialed); err != nil {
+			t.Errorf("%s is dialled at %s and its certificate does not name it: %v", role, dialed, err)
+		}
 	}
 }
