@@ -133,6 +133,10 @@ func (r *BackupPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		valid.Status = metav1.ConditionFalse
 		valid.Reason = "InvalidSchedule"
 		valid.Message = err.Error()
+	} else if err := r.Scheduler.SetVerify(req.NamespacedName, pol.Spec.VerifySchedule); err != nil {
+		valid.Status = metav1.ConditionFalse
+		valid.Reason = "InvalidSchedule"
+		valid.Message = err.Error()
 	}
 	if valid.Status == metav1.ConditionTrue {
 		pol.Status.Accepted = pol.Spec.DeepCopy()
@@ -140,6 +144,7 @@ func (r *BackupPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 	meta.SetStatusCondition(&pol.Status.Conditions, valid)
 	r.setBarrierHealthy(&pol)
+	r.setVerifyHealthy(&pol)
 	meta.SetStatusCondition(&pol.Status.Conditions, repositoryEncryption(&pol))
 
 	clusters, err := clustersOfPolicy(ctx, r.Client, req.NamespacedName)
@@ -192,6 +197,11 @@ func (r *BackupPolicyReconciler) validate(pol *pgshardv1alpha1.PgShardBackupPoli
 	if pol.Spec.BarrierSchedule != "" {
 		if _, err := ParseSchedule(pol.Spec.BarrierSchedule); err != nil {
 			return fmt.Errorf("barrierSchedule %q: %w", pol.Spec.BarrierSchedule, err)
+		}
+	}
+	if pol.Spec.VerifySchedule != "" {
+		if _, err := ParseSchedule(pol.Spec.VerifySchedule); err != nil {
+			return fmt.Errorf("verifySchedule %q: %w", pol.Spec.VerifySchedule, err)
 		}
 	}
 	return nil
@@ -283,6 +293,38 @@ func (r *BackupPolicyReconciler) setBarrierHealthy(pol *pgshardv1alpha1.PgShardB
 	meta.SetStatusCondition(&pol.Status.Conditions, cond)
 }
 
+// ConditionVerifyHealthy reports whether the last scheduled verification of
+// a policy with a verifySchedule found every bound repository intact.
+const ConditionVerifyHealthy = "VerifyHealthy"
+
+// setVerifyHealthy derives VerifyHealthy from the scheduler's last tick; a
+// policy without a verification schedule carries no such condition. It
+// keeps a recorded outcome across an operator restart for the same reason
+// the barrier condition does: the scheduler's memory is empty after a
+// restart, and turning "the last verification failed" into "nothing is
+// known" is exactly the wrong direction for a backup that may not restore.
+func (r *BackupPolicyReconciler) setVerifyHealthy(pol *pgshardv1alpha1.PgShardBackupPolicy) {
+	if pol.Spec.VerifySchedule == "" {
+		meta.RemoveStatusCondition(&pol.Status.Conditions, ConditionVerifyHealthy)
+		return
+	}
+	cond := metav1.Condition{Type: ConditionVerifyHealthy, Status: metav1.ConditionUnknown, Reason: "NotFiredYet", Message: "no scheduled verification has run yet", ObservedGeneration: pol.Generation}
+	if prev := meta.FindStatusCondition(pol.Status.Conditions, ConditionVerifyHealthy); prev != nil && prev.Reason != "NotFiredYet" {
+		cond = *prev
+		cond.ObservedGeneration = pol.Generation
+	}
+	if last, ok := r.Scheduler.LastVerify(client.ObjectKeyFromObject(pol)); ok {
+		cond.Status, cond.Reason = metav1.ConditionTrue, "Verified"
+		cond.Message = fmt.Sprintf("verification at %s found every bound repository intact", last.At.UTC().Format(time.RFC3339))
+		if last.Error != "" {
+			cond.Status, cond.Reason = metav1.ConditionFalse, "VerifyFailed"
+			cond.Message = fmt.Sprintf("verification at %s: %s", last.At.UTC().Format(time.RFC3339), last.Error)
+		}
+		cond.ObservedGeneration = pol.Generation
+	}
+	meta.SetStatusCondition(&pol.Status.Conditions, cond)
+}
+
 // BackupHealth derives the BackupHealthy condition: every scheduled type
 // must have a success no older than one full period past its due time; a
 // coarser type's success satisfies a finer one (a full counts as an incr).
@@ -356,6 +398,9 @@ type BackupScheduler struct {
 	now    func() time.Time
 	// Barriers asks controllers for barriers; nil disables barrier ticks.
 	Barriers BarrierClient
+	// Agents runs repository verification on member agents; nil disables
+	// verify ticks.
+	Agents BackupAgentClient
 
 	mu sync.Mutex
 	// baseCtx is the manager's context once Start has it, so a barrier in
@@ -368,6 +413,10 @@ type BackupScheduler struct {
 	// lastBarriers remembers how the last scheduled barrier tick of each
 	// policy went, for the BarrierHealthy condition.
 	lastBarriers map[types.NamespacedName]BarrierResult
+	// verifies and lastVerifies mirror the barrier pair for repository
+	// verification.
+	verifies     map[types.NamespacedName]barrierEntry
+	lastVerifies map[types.NamespacedName]BarrierResult
 }
 
 // BarrierResult is the outcome of the last scheduled barrier tick of a
@@ -375,6 +424,14 @@ type BackupScheduler struct {
 type BarrierResult struct {
 	At    time.Time
 	Error string
+}
+
+// LastVerify reports the last scheduled verification outcome of a policy.
+func (s *BackupScheduler) LastVerify(key types.NamespacedName) (BarrierResult, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.lastVerifies[key]
+	return r, ok
 }
 
 // LastBarrier reports the last scheduled barrier outcome of a policy.
@@ -401,7 +458,8 @@ func NewBackupScheduler(cl client.Client) *BackupScheduler {
 			cron.WithChain(cron.SkipIfStillRunning(cron.DiscardLogger))),
 		baseCtx: context.Background(),
 		entries: map[types.NamespacedName][]cron.EntryID{}, specs: map[types.NamespacedName]pgshardv1alpha1.BackupSchedules{},
-		barriers: map[types.NamespacedName]barrierEntry{}, lastBarriers: map[types.NamespacedName]BarrierResult{}}
+		barriers: map[types.NamespacedName]barrierEntry{}, lastBarriers: map[types.NamespacedName]BarrierResult{},
+		verifies: map[types.NamespacedName]barrierEntry{}, lastVerifies: map[types.NamespacedName]BarrierResult{}}
 }
 
 // SetBarrier arms (or, with "", disarms) the barrier schedule of a policy;
@@ -422,6 +480,111 @@ func (s *BackupScheduler) SetBarrier(key types.NamespacedName, expr string) erro
 	}
 	s.barriers[key] = barrierEntry{id: id, expr: expr}
 	return nil
+}
+
+// verifyRunTimeout bounds one verification tick across every cluster the
+// policy binds. Generous, because pgbackrest verify reads every backup in
+// a repository and a large repo is slow; bounded, because a tick that
+// never ends holds the cron slot and the next one is skipped.
+const verifyRunTimeout = 6 * time.Hour
+
+// SetVerify arms (or, with "", disarms) the verification schedule of a
+// policy; an unchanged expression keeps its entry.
+func (s *BackupScheduler) SetVerify(key types.NamespacedName, expr string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cur, ok := s.verifies[key]; ok && cur.expr == expr {
+		return nil
+	}
+	s.removeVerifyLocked(key)
+	if expr == "" {
+		return nil
+	}
+	id, err := s.cron.AddFunc(expr, func() { s.fireVerify(key) })
+	if err != nil {
+		return fmt.Errorf("verifySchedule %q: %w", expr, err)
+	}
+	s.verifies[key] = barrierEntry{id: id, expr: expr}
+	return nil
+}
+
+func (s *BackupScheduler) removeVerifyLocked(key types.NamespacedName) {
+	if e, ok := s.verifies[key]; ok {
+		s.cron.Remove(e.id)
+		delete(s.verifies, key)
+	}
+}
+
+// VerifyArmed reports whether a policy has a verification schedule armed.
+func (s *BackupScheduler) VerifyArmed(key types.NamespacedName) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.verifies[key]
+	return ok
+}
+
+func (s *BackupScheduler) fireVerify(key types.NamespacedName) {
+	s.mu.Lock()
+	base := s.baseCtx
+	s.mu.Unlock()
+	ctx, cancel := context.WithTimeout(base, verifyRunTimeout)
+	defer cancel()
+	if err := s.FireVerify(ctx, key); err != nil {
+		logf.Log.WithName("backup-scheduler").Error(err, "scheduled verification failed", "policy", key.String())
+	}
+}
+
+// FireVerify runs pgbackrest verify on every group primary of every cluster
+// bound to the policy. One failure does not stop the others: a repository
+// that cannot be verified is the thing worth reporting, and reporting it for
+// one group is no reason to skip the rest.
+func (s *BackupScheduler) FireVerify(ctx context.Context, key types.NamespacedName) error {
+	if s.Agents == nil {
+		return errors.New("no agent client configured")
+	}
+	var pol pgshardv1alpha1.PgShardBackupPolicy
+	if err := s.client.Get(ctx, key, &pol); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	clusters, err := clustersOfPolicy(ctx, s.client, key)
+	if err != nil {
+		return err
+	}
+	at := s.now()
+	var errs []error
+	for i := range clusters {
+		c := &clusters[i]
+		targets, pending, err := primariesOf(ctx, s.client, c)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("cluster %s: %w", c.Name, err))
+			continue
+		}
+		if pending != "" {
+			// Not an error: a cluster still coming up has nothing to
+			// verify yet, and saying so every tick would bury the
+			// repositories that really are unverifiable.
+			logf.Log.WithName("backup-scheduler").Info("verification skipped", "policy", key.String(), "cluster", c.Name, "reason", pending)
+			continue
+		}
+		for _, t := range targets {
+			if _, err := s.Agents.Verify(ctx, t.addr); err != nil {
+				errs = append(errs, fmt.Errorf("cluster %s group %s (%s): %w", c.Name, t.group.Name(), t.stanza, err))
+				continue
+			}
+			logf.Log.WithName("backup-scheduler").Info("repository verified", "policy", key.String(), "cluster", c.Name, "group", t.group.Name())
+		}
+	}
+	err = errors.Join(errs...)
+	result := BarrierResult{At: at}
+	if err != nil {
+		result.Error = err.Error()
+	}
+	s.mu.Lock()
+	if prev, ok := s.lastVerifies[key]; !ok || !result.At.Before(prev.At) {
+		s.lastVerifies[key] = result
+	}
+	s.mu.Unlock()
+	return err
 }
 
 func (s *BackupScheduler) removeBarrierLocked(key types.NamespacedName) {
@@ -557,6 +720,10 @@ func (s *BackupScheduler) removeLocked(key types.NamespacedName) {
 	delete(s.entries, key)
 	delete(s.specs, key)
 	s.removeBarrierLocked(key)
+	// A deleted policy must take its verification schedule with it, or the
+	// entry fires for ever against a policy the cluster no longer has.
+	s.removeVerifyLocked(key)
+	delete(s.lastVerifies, key)
 }
 
 // Entries reports how many cron entries a policy has armed.

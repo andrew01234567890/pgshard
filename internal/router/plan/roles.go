@@ -284,6 +284,12 @@ func (w *walker) alterRoleSet(s *pgquerypb.AlterRoleSetStmt) error {
 	if role == nil || role.GetRoletype() != pgquerypb.RoleSpecType_ROLESPEC_CSTRING {
 		return w.migration(m)
 	}
+	// Every other role statement refuses a name the cluster keeps for
+	// itself; this one settles what a role's sessions start with, which is
+	// the control plane's own sessions when the name is one of ours.
+	if err := checkRoleName(role.GetRolename()); err != nil {
+		return err
+	}
 	rs := catalog.RoleSetting{Role: role.GetRolename(), Database: s.GetDatabase(), Name: set.GetName()}
 	switch set.GetKind() {
 	case pgquerypb.VariableSetKind_VAR_SET_VALUE:

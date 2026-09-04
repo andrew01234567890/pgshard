@@ -189,6 +189,16 @@ with the client certificate given by its `--controller-tls-cert`,
 `--controller-tls-key` and `--controller-tls-ca` flags; without them it
 dials plaintext, which only a controller run with `--insecure-dev` accepts.
 
+`verifySchedule` ticks run `pgbackrest verify` over every group's repository
+in each bound cluster, one group after another. A repository that cannot be
+verified is a backup you do not have, and nothing else notices: taking a
+backup keeps succeeding long after the repository stopped being restorable.
+One unverifiable group is reported and does not stop the rest; a cluster
+whose groups have no primary yet is skipped rather than reported, so a
+cluster still coming up does not bury the repositories that really are
+broken. Verification reads every backup in a repository, so schedule it far
+less often than the backups themselves.
+
 Policy status: `Valid` (store settings and cron expressions parse),
 `BackupHealthy` aggregated over the bound clusters, `BarrierHealthy` (only
 with a `barrierSchedule`: `True` once the last tick reached every bound

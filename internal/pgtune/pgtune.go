@@ -125,6 +125,19 @@ func Derive(in Input) (Settings, error) {
 	}
 
 	add("max_connections", itoa(maxConns), fmt.Sprintf("pooler backend budget %d plus %d reserved for superuser and the agent", in.MaxBackends, reservedConnections))
+	// The headroom above is only headroom until PostgreSQL is told to keep
+	// it: without this, superuser_reserved_connections is the default 3 and
+	// the other five are handed to whoever asks first. The control plane is
+	// what asks last -- the resolver reaches a shard when something has
+	// already gone wrong -- and an in-doubt prepared transaction it cannot
+	// reach pins WAL and blocks logical slot creation, so a resolver locked
+	// out of a busy shard makes the busy shard worse.
+	//
+	// Set to the same constant max_connections is derived from, so
+	// non-superusers get exactly the pooler's budget and the reservation
+	// cannot drift from the headroom that was sized for it.
+	add("superuser_reserved_connections", itoa(int64(reservedConnections)),
+		fmt.Sprintf("keep the %d connections above the pooler budget for the control plane, rather than the default 3", reservedConnections))
 	add("shared_buffers", human(sharedBuffers), "25% of the memory limit, capped at 16GiB")
 	add("effective_cache_size", human(alignMiB(mem*3/4)), "75% of the memory limit; the kernel page cache is counted")
 	add("work_mem", human(workMem), fmt.Sprintf("(memory - shared_buffers - maintenance - decoding - overhead) / (%d backends × 4 sorts)", in.MaxBackends))
