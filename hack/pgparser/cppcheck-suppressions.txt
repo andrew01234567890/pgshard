@@ -1,0 +1,14 @@
+unknownMacro
+syntaxError
+returnImplicitInt
+internalError
+memleak
+nullPointerRedundantCheck
+nullPointerArithmeticRedundantCheck
+uselessAssignmentPtrArg
+pointerOutOfBounds
+sizeofwithnumericparameter
+shiftNegativeLHS
+shiftTooManyBitsSigned
+uninitvar
+pointerSize

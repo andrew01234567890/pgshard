@@ -1,0 +1,55 @@
+# Why each cppcheck suppression is accepted
+
+`cppcheck-suppressions.txt` is fed to `--suppressions-list`, which parses
+**every** line as a suppression spec. A comment line yields no id and aborts
+the whole scan with `Failed to add suppression. No id.`, so that file must
+contain ids and nothing else. The reasons live here instead.
+
+Accepted cppcheck findings in the vendored libpg_query tree.
+
+Every finding in the first agreed baseline (nightly run 33837983681,
+2026-09-04: 59 findings, 14 error / 15 portability / 30 warning) was in
+vendored upstream C. None was in code this repository writes. That is the
+line drawn here: a finding upstream owns is suppressed BY ID, so the scan
+still gates -- an id that has never been seen before, or any finding in
+our own C, fails the job.
+
+Suppressing by id rather than by file keeps this honest in the direction
+that matters. A libpg_query bump that introduces a NEW class of finding
+is a red check; one that adds another instance of a class upstream
+already lives with is not, because we do not patch the vendored tree and
+a check we cannot act on is a check people learn to ignore.
+
+When a suppression stops being needed, delete it: an id listed here that
+no longer fires is not reported by cppcheck, so this file only shrinks
+deliberately.
+NO BLANK LINES: cppcheck reads this with --suppressions-list and rejects
+an empty line with "Failed to add suppression. No id.", which aborts the
+scan before it writes anything. Comments are fine; blank lines are not.
+cppcheck cannot expand PostgreSQL's macros, so it misparses rather than
+finds anything. foreach/foreach_ptr are the usual culprits, and the
+implicit-int and syntax errors below are consequences of the same thing:
+the *_conds.c fragments are #included inside a switch and are not
+translation units on their own.
+PostgreSQL's memory contexts. The "leaks" are blocks handed to a context
+that frees them wholesale, and the null-check patterns are aset.c's
+deliberate style. Upstream's to change, not ours.
+Generated parser tables (gram.c, pl_gram.c, scan.c) and the bison
+skeletons they come from. Not written by hand and not ours to edit.
+
+## The ids
+
+- `unknownMacro`
+- `syntaxError`
+- `returnImplicitInt`
+- `internalError`
+- `memleak`
+- `nullPointerRedundantCheck`
+- `nullPointerArithmeticRedundantCheck`
+- `uselessAssignmentPtrArg`
+- `pointerOutOfBounds`
+- `sizeofwithnumericparameter`
+- `shiftNegativeLHS`
+- `shiftTooManyBitsSigned`
+- `uninitvar`
+- `pointerSize`
