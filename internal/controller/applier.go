@@ -158,8 +158,14 @@ type Applier struct {
 	Catalog func(ctx context.Context) (ShardConn, error)
 	// Roles, when set, materializes the desired roles on groups that are
 	// behind before migrations run.
-	Roles  *RoleVerifier
-	Logger *slog.Logger
+	Roles *RoleVerifier
+	// KeyCheck, when set, records the shard-key verdict for a table a
+	// migration just changed, instead of leaving it to the next scheduled
+	// pass. The router refuses to route a sharded table whose key column
+	// has not been inspected, so without this a CREATE TABLE is followed by
+	// a window in which the table it created cannot be used.
+	KeyCheck *ShardKeyCheck
+	Logger   *slog.Logger
 	// DDLRole is the non-superuser login every client statement runs
 	// through (SET ROLE into the client role from there), so a function a
 	// statement evaluates can RESET ROLE only into a plain role. It
@@ -399,12 +405,34 @@ func (a *Applier) drive(ctx context.Context, m catalog.DDLMigration) error {
 		if err := a.mirror(ctx, m); err != nil {
 			return err
 		}
+		a.recheckShardKey(ctx, m, logger)
 	}
 	if err := a.Store.Save(ctx, m); err != nil {
 		return err
 	}
 	logger.Info("migration finished", "state", m.State, "error", m.Error)
 	return nil
+}
+
+// recheckShardKey records the verdict for a table this migration changed.
+// Never fatal: the scheduled pass records it either way, and a migration
+// that applied everywhere has not failed because the follow-up inspection
+// could not run.
+func (a *Applier) recheckShardKey(ctx context.Context, m catalog.DDLMigration, logger *slog.Logger) {
+	// No kind test: the planner records a table as Kind "relation", the
+	// same as an index or a view, and Recheck already narrows to tables
+	// that are effectively sharded and need a verdict. An object that is
+	// not one of those matches nothing and costs one query.
+	if a.KeyCheck == nil || m.Meta.Object.Name == "" {
+		return
+	}
+	schema := m.Meta.Object.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	if err := a.KeyCheck.Recheck(ctx, m.Database, schema, m.Meta.Object.Name); err != nil {
+		logger.Warn("shard key not rechecked after the migration", "table", m.Meta.Object.Name, "err", err)
+	}
 }
 
 func shardKey(id int32) string { return strconv.FormatInt(int64(id), 10) }

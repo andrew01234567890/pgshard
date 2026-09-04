@@ -18,11 +18,15 @@ import (
 // The router hashes the key value the client sent; a row filter, a copy and
 // a re-key hash the value the shard stored. For most types those are the
 // same bytes. For a blank-padded character(n) they are not: PostgreSQL
-// calls 'a' and 'a   ' equal, and the two hash to different shards. A table
-// created through pgshard is refused at CREATE TABLE, and a table moved
-// into place is refused by its placement workflow -- but a table that was
-// already on the shards and is merely declared sharded in pgshard.tables
-// passed through neither.
+// calls 'a' and 'a   ' equal, and the two hash to different shards.
+//
+// This pass is the only thing that asks. CREATE TABLE used to refuse such a
+// key outright, and #606 removed that deliberately -- the router now
+// normalises the client's value by the recorded type instead, which is
+// better, and which is only possible once the type has been recorded. So
+// the verdict is not advisory: until it exists the router refuses to route
+// the table at all, because hashing an unnormalised value would put the
+// write on one shard and every later lookup of it on another.
 type ShardKeyCheck struct {
 	Pool   *pgxpool.Pool
 	Shards ShardDBDialer
@@ -53,17 +57,43 @@ type uncheckedKey struct {
 	Generation int64
 }
 
-// Pass checks every sharded table whose recorded check is older than its
-// desired generation, and returns how many it published.
+// Pass checks every effectively-sharded table whose recorded verdict is not
+// the one its effective generation calls for, and returns how many it
+// published.
 func (c *ShardKeyCheck) Pass(ctx context.Context) (int, error) {
+	return c.check(ctx, "")
+}
+
+// Recheck records the verdict for one table now rather than at the next
+// pass. The DDL applier calls it when a migration finishes, because a
+// sharded table is not routable until its key column has been inspected and
+// waiting a whole interval to learn the type of a column pgshard has just
+// created is a window nobody needs. A table that needs no verdict, or one
+// no shard has, is not an error here: this is an optimisation of when the
+// pass happens, never a substitute for it.
+func (c *ShardKeyCheck) Recheck(ctx context.Context, database, schema, table string) error {
+	_, err := c.check(ctx, database+"."+schema+"."+table)
+	return err
+}
+
+// check does one pass. only, when set, narrows it to a single
+// "database.schema.table"; empty means every table needing a verdict.
+func (c *ShardKeyCheck) check(ctx context.Context, only string) (int, error) {
+	// From the status table, and against the EFFECTIVE generation, because
+	// that pair is what the router compares: it treats a verdict as current
+	// only when shard_key_checked_generation equals effective_generation.
+	// Selecting from pgshard.tables against desired_generation instead --
+	// which this did -- published verdicts the router could never accept
+	// whenever the two generations differed, and never saw a table that is
+	// effective without a desired row at all. ReferenceCheck.Pass is the
+	// same shape for the same reason.
 	rows, err := c.Pool.Query(ctx, `
-		SELECT t.database, t.schema_name, t.table_name, t.shard_key, t.desired_generation
-		FROM pgshard.tables t
-		LEFT JOIN pgshard.table_status s
-		  ON s.database = t.database AND s.schema_name = t.schema_name AND s.table_name = t.table_name
-		WHERE t.placement = 'sharded'
-		  AND s.shard_key_checked_generation IS DISTINCT FROM t.desired_generation
-		ORDER BY t.database, t.schema_name, t.table_name`)
+		SELECT database, schema_name, table_name, effective_shard_key, effective_generation
+		FROM pgshard.table_status
+		WHERE effective_placement = 'sharded' AND effective_shard_key IS NOT NULL
+		  AND shard_key_checked_generation IS DISTINCT FROM effective_generation
+		  AND ($1 = '' OR $1 = database || '.' || schema_name || '.' || table_name)
+		ORDER BY database, schema_name, table_name`, only)
 	if err != nil {
 		return 0, err
 	}
@@ -93,6 +123,15 @@ func (c *ShardKeyCheck) Pass(ctx context.Context) (int, error) {
 				"schema", t.SchemaName, "table", t.TableName, "err", err)
 			continue
 		}
+		if refusal == nil && typ == nil {
+			// No shard has the column yet. Placement may be declared before
+			// the table exists, and there is nothing to route to until it
+			// does, so leaving the row unchecked costs nothing and keeps
+			// the table out of the routing map until its type is known.
+			c.logger().Debug("shard key not checked: no shard has the column yet", "database", t.Database,
+				"schema", t.SchemaName, "table", t.TableName, "column", t.ShardKey)
+			continue
+		}
 		if err := c.publish(ctx, t, refusal, typ); err != nil {
 			return published, err
 		}
@@ -105,15 +144,15 @@ func (c *ShardKeyCheck) Pass(ctx context.Context) (int, error) {
 	return published, nil
 }
 
+// publish records the verdict against the generation it was made under. The
+// generation is in the WHERE clause so a table whose effective generation
+// moved while the shards were being asked keeps no verdict rather than one
+// describing the column it used to have.
 func (c *ShardKeyCheck) publish(ctx context.Context, t uncheckedKey, refusal *string, typ *string) error {
 	_, err := c.Pool.Exec(ctx, `
-		INSERT INTO pgshard.table_status (database, schema_name, table_name,
-			shard_key_checked_generation, shard_key_error, shard_key_type)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		ON CONFLICT (database, schema_name, table_name) DO UPDATE
-		SET shard_key_checked_generation = EXCLUDED.shard_key_checked_generation,
-		    shard_key_error = EXCLUDED.shard_key_error,
-		    shard_key_type = EXCLUDED.shard_key_type, updated_at = now()`,
+		UPDATE pgshard.table_status
+		SET shard_key_checked_generation = $4, shard_key_error = $5, shard_key_type = $6, updated_at = now()
+		WHERE database = $1 AND schema_name = $2 AND table_name = $3 AND effective_generation = $4`,
 		t.Database, t.SchemaName, t.TableName, t.Generation, refusal, typ)
 	return err
 }
@@ -122,9 +161,14 @@ func (c *ShardKeyCheck) publish(ctx context.Context, t uncheckedKey, refusal *st
 // identical, and a shard whose column type has drifted is exactly the case
 // that would otherwise surface as rows on the wrong shard.
 //
-// A table no shard has yet is not a refusal: placement may be declared
-// before the table exists, and the CREATE TABLE that follows goes through
-// pgshard, which checks the type itself.
+// A table no shard has yet is not a refusal either, but it is not a verdict:
+// inspect reports it by returning no refusal and no type, and Pass leaves
+// the row unchecked so a later pass asks again. Publishing "checked, no
+// type" for it would be worse than saying nothing -- the router would take
+// the table as verified and hash the client's value unnormalised for as
+// long as the generation stood. That used to be defended by the CREATE
+// TABLE path refusing a blank-padded character(n) key outright, which #606
+// deliberately removed.
 func (c *ShardKeyCheck) inspect(ctx context.Context, set string, ranges []catalog.ShardRange, t uncheckedKey) (*string, *string, error) {
 	var agreed string
 	var agreedShard int32

@@ -99,6 +99,10 @@ func (s *shardedStack) awaitSharded(tb testing.TB, conn *pgx.Conn) {
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		_, err := conn.Exec(ctx, "select * from orders for update", pgx.QueryExecModeSimpleProtocol)
+		// Either refusal means the router learned the table is sharded,
+		// which is what this waits for. A table whose shard key has not
+		// been checked yet refuses with the same code; the tables that go
+		// on to route create the table first, and the verdict follows it.
 		if sqlstate(err) == "0A000" {
 			return
 		}

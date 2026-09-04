@@ -11,7 +11,7 @@ func varcharFixture(t testing.TB, columnType string) *snapshot.Snapshot {
 	t.Helper()
 	s := fixture(t)
 	s.Tables[snapshot.TableKey{Database: fixtureDB, SchemaName: "public", TableName: "codes"}] =
-		snapshot.Placement{Placement: "sharded", ShardKey: "code", Generation: 3, ShardKeyType: columnType}
+		snapshot.Placement{Placement: "sharded", ShardKey: "code", Generation: 3, ShardKeyChecked: true, ShardKeyType: columnType}
 	return s
 }
 
