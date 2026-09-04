@@ -50,9 +50,34 @@ func TestATooLargeMessageIsNotALostConnection(t *testing.T) {
 // accepts what the other refuses.
 func TestTheLimitIsTheOneBothSidesEnforce(t *testing.T) {
 	// 4 MiB is grpc-go's default, which is what makes this a naming of
-	// existing behaviour rather than a change to it. If this ever moves,
-	// the byte-weighted bounds have to move first.
+	// existing behaviour rather than a change to it. Moving it is now a
+	// judgement about the one message decoded whole, not a thing blocked
+	// on byte-weighted bounds: those exist.
 	if pooler.MaxMessageBytes != 4<<20 {
-		t.Fatalf("MaxMessageBytes = %d; raising it needs byte-weighted admission first (PGS-499)", pooler.MaxMessageBytes)
+		t.Fatalf("MaxMessageBytes = %d; the boundary tests and the documented contract move with it", pooler.MaxMessageBytes)
+	}
+}
+
+// TestEveryPathReportsTheSizeLimitTheSameWay: the scatter path, the
+// transaction path and the session path each turn a gRPC failure into a
+// client error, and a size limit reported as a lost connection on any of
+// them tells a client to reconnect over a value that will be exactly as
+// large next time.
+func TestEveryPathReportsTheSizeLimitTheSameWay(t *testing.T) {
+	for _, direction := range []string{
+		"grpc: received message larger than max (5000000 vs. 4194304)",
+		"trying to send message larger than max (5000000 vs. 4194304)",
+	} {
+		err := status.Error(codes.ResourceExhausted, direction)
+		var pe *pgwire.Error
+		if !errors.As(poolerTransportError("shard default/0", err), &pe) || pe.Code != codeTooLarge {
+			t.Fatalf("scatter and transaction paths: %v", err)
+		}
+		if pe := tooLargeError("pooler stream", err); pe == nil || pe.Code != codeTooLarge {
+			t.Fatalf("session path: %v", err)
+		}
+	}
+	if tooLargeError("x", status.Error(codes.Unavailable, "connection refused")) != nil {
+		t.Fatal("a lost connection was reported as a size limit")
 	}
 }

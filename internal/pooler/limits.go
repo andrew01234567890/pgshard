@@ -11,9 +11,18 @@ package pooler
 // connection.
 //
 // PostgreSQL itself accepts protocol messages up to 1 GiB, so this is a
-// real narrowing of the contract and is documented as such. Raising it is
-// not a matter of changing this number: row channels and writer flushes
-// are bounded by item count, not bytes, so a larger limit would let a
-// handful of rows hold hundreds of megabytes in the router. Byte-weighted
-// admission comes first -- see PGS-499.
+// real narrowing of the contract and is documented as such.
+//
+// What used to block raising it no longer does: rows and COPY chunks were
+// bounded by item count, so a larger limit would have let a handful of
+// wide rows hold hundreds of megabytes in the router. They are bounded by
+// bytes now -- the pgwire writer flushes on a byte threshold, the pooler
+// batches rows to a byte cap, and a router's read-ahead on a pooler stream
+// spends a byte credit per message.
+//
+// What still argues for a number rather than PostgreSQL's is that one
+// message is still decoded whole: the bounds stop many large messages
+// accumulating, not one large message existing. Raising this is now a
+// judgement about that single allocation, taken against a measurement,
+// rather than a thing that cannot be done.
 const MaxMessageBytes = 4 << 20
