@@ -564,3 +564,40 @@ func (f *copyFixture) reconcileDrop(ctx context.Context) error {
 	}
 	return nil
 }
+
+// TestCancelLiftsAFenceTheStageDoesNotKnowAbout: cancel decided whether to
+// undo the fence from the workflow's STAGE, which is a proxy; the catalog
+// holds the fact in shard_status.migrating_by. They part company whenever
+// something moved the stage on without clearing the row -- an abort sets
+// StageAwaitingSwitch, which fencedStage does not count as fenced, and a
+// Release that failed after the stage was written leaves the same shape.
+//
+// The result is the one PGS-601 saw once in seventy runs: shards left
+// write-fenced by a cancelled cutover, which is a stuck shard rather than a
+// failed reshard. Here it is deterministic -- a copy-stage workflow is not
+// a fenced stage, so the old code skipped the undo entirely.
+func TestCancelLiftsAFenceTheStageDoesNotKnowAbout(t *testing.T) {
+	parallelPG(t)
+	f := newCopyFixture(t)
+	ctx := context.Background()
+	id := f.startWorkflow()
+
+	mustExecPool(t, f.pool, `UPDATE pgshard.shard_status SET migrating = true, migrating_by = $1::uuid WHERE shard_set = 'default'`, id)
+	if n := queryOne[int64](t, f.catalog, `SELECT count(*) FROM pgshard.shard_status WHERE migrating`); n == 0 {
+		t.Fatal("the fixture must start with a fence raised, or this proves nothing")
+	}
+	if _, stage, _ := f.workflow(id); fencedStage(stage) {
+		t.Fatalf("this test needs a stage the fence check does NOT recognise, got %s", stage)
+	}
+
+	if err := f.reconcileDrop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if out := f.pass(); out.Cancelled != 1 {
+		t.Fatalf("cancel pass: %+v", out)
+	}
+	if n := queryOne[int64](t, f.catalog, `SELECT count(*) FROM pgshard.shard_status WHERE migrating`); n != 0 {
+		stuck := queryOne[string](t, f.catalog, `SELECT string_agg(shard_set || '/' || shard_id, ', ') FROM pgshard.shard_status WHERE migrating`)
+		t.Fatalf("%d shard(s) still write-fenced after cancel: %s", n, stuck)
+	}
+}

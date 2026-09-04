@@ -1238,6 +1238,21 @@ func (c *Copier) cancel(ctx context.Context, wf *copyWorkflow) error {
 		}
 		message = "cutover cancelled: fence lifted, reverse replication and forward objects dropped"
 	}
+	// Whatever the stage says, a fence recorded against THIS workflow is
+	// this workflow's to lift. The check above asks the stage, which is a
+	// proxy; the catalog holds the fact. They part company when something
+	// moved the stage on without clearing the row -- an abort sets
+	// StageAwaitingSwitch, which fencedStage does not count as fenced, and a
+	// Release that failed after the stage was written leaves the same shape.
+	// The result is a shard that stays unwritable with no workflow left to
+	// lift it, which is a stuck shard rather than a failed reshard.
+	//
+	// Scoped by migrating_by, so it lifts nothing it did not raise and does
+	// nothing at all when this workflow holds no fence.
+	if _, err := c.Pool.Exec(ctx, `UPDATE pgshard.shard_status SET migrating = false, migrating_by = NULL, updated_at = now()
+		WHERE migrating AND migrating_by = $1::uuid`, wf.id); err != nil {
+		return fmt.Errorf("cancel: lifting a fence this workflow still held: %w", err)
+	}
 	if err := ownedExec(ctx, c.Pool, wf.owner,
 		`UPDATE pgshard.workflows SET state = $2, status = status || $3::jsonb, updated_at = now()
 		 WHERE id = $1::uuid AND ($4::text IS NULL OR (owner = $4 AND state = $5))`,
