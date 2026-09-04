@@ -36,7 +36,14 @@ const (
 	// is the generic class code: pgx, JDBC and psycopg retry loops test
 	// for exact 40001, so a retry that was safe went unretried and
 	// surfaced to the application as a failure.
-	codeRetryable       = "40001"
+	codeRetryable = "40001"
+	// deadlockDetected is PostgreSQL's own, reported by a shard rather than
+	// by the router: the deadlock is already rolled back, so the whole
+	// transaction is safe to run again. It is named here because it is half
+	// of the retry contract the client guide documents, and a contract with
+	// one half in a constant and the other half only in prose is one that
+	// can drift.
+	deadlockDetected    = "40P01"
 	codeInvalidParamVal = "22023"
 )
 
