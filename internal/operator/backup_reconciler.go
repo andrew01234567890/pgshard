@@ -205,10 +205,17 @@ type backupTarget struct {
 // primaries resolves every group's primary agent address; pending names the
 // first group that has no reachable primary yet.
 func (r *BackupReconciler) primaries(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) ([]backupTarget, string, error) {
+	return primariesOf(ctx, r.Client, c)
+}
+
+// primariesOf resolves every group's primary agent for c. It is a function
+// rather than a method because the scheduler needs the same answer for
+// verification and holds no reconciler.
+func primariesOf(ctx context.Context, k client.Client, c *pgshardv1alpha1.PgShardCluster) ([]backupTarget, string, error) {
 	var out []backupTarget
 	for _, g := range Groups(c) {
 		var pg pgshardv1alpha1.PgShardGroup
-		if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: g.Prefix()}, &pg); err != nil {
+		if err := k.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: g.Prefix()}, &pg); err != nil {
 			if apierrors.IsNotFound(err) {
 				return nil, fmt.Sprintf("group %s not created yet", g.Name()), nil
 			}
@@ -218,7 +225,7 @@ func (r *BackupReconciler) primaries(ctx context.Context, c *pgshardv1alpha1.PgS
 			return nil, fmt.Sprintf("group %s has no primary yet", g.Name()), nil
 		}
 		var pod corev1.Pod
-		if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: pg.Status.Primary}, &pod); err != nil {
+		if err := k.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: pg.Status.Primary}, &pod); err != nil {
 			if apierrors.IsNotFound(err) {
 				return nil, fmt.Sprintf("primary %s of group %s has no pod", pg.Status.Primary, g.Name()), nil
 			}

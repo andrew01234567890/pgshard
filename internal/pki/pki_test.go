@@ -302,3 +302,58 @@ func run(server, client *tls.Config) (*x509.Certificate, error) {
 	}
 	return got.peer, nil
 }
+
+func TestOnlyARouterMayCallAPooler(t *testing.T) {
+	allow, ok := AllowedCallers(RolePooler)
+	if !ok {
+		t.Fatal("a pooler has no rule")
+	}
+	id := func(role string) Identity {
+		return Identity{Namespace: "ns", Cluster: "demo", Role: role}
+	}
+	if !allow(id(RoleRouter)) {
+		t.Fatal("a pooler must serve routers")
+	}
+	for _, role := range []string{RoleAgent, RolePooler, RoleController, RoleOperator, RoleAdmin} {
+		if allow(id(role)) {
+			t.Fatalf("a pooler must not serve %s", role)
+		}
+	}
+}
+
+func TestTheChangeStreamHasNoRuleBecauseItsCallersHaveNoIdentity(t *testing.T) {
+	// Consumers of the change stream are outside the cluster. A rule here
+	// would refuse exactly the traffic the listener exists to serve, so
+	// its absence is deliberate and this says so out loud.
+	for _, role := range []string{RoleAdmin, "vstream", "consumer"} {
+		if _, ok := AllowedCallers(role); ok {
+			t.Fatalf("%s gained a caller rule; check that its callers carry identities", role)
+		}
+	}
+}
+
+func TestAgentAndControllerServeTheirOwnCallers(t *testing.T) {
+	for _, tc := range []struct {
+		listener string
+		serves   []string
+		refuses  []string
+	}{
+		{RoleAgent, []string{RoleController, RoleOperator}, []string{RoleRouter, RolePooler, RoleAgent}},
+		{RoleController, []string{RoleRouter, RoleOperator}, []string{RoleAgent, RolePooler}},
+	} {
+		allow, ok := AllowedCallers(tc.listener)
+		if !ok {
+			t.Fatalf("%s has no rule", tc.listener)
+		}
+		for _, r := range tc.serves {
+			if !allow(Identity{Namespace: "ns", Cluster: "demo", Role: r}) {
+				t.Fatalf("%s must serve %s", tc.listener, r)
+			}
+		}
+		for _, r := range tc.refuses {
+			if allow(Identity{Namespace: "ns", Cluster: "demo", Role: r}) {
+				t.Fatalf("%s must not serve %s", tc.listener, r)
+			}
+		}
+	}
+}

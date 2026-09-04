@@ -60,7 +60,16 @@ func (s *Server) CreateBarrier(ctx context.Context, req *pgshardv1.CreateBarrier
 		// barrier holds the lock and this one never started.
 		return nil, status.Error(codes.Unavailable, err.Error())
 	case err != nil:
-		return &pgshardv1.CreateBarrierResponse{Error: &pgshardv1.Error{Message: err.Error()}}, nil
+		// The same channel its sibling failures use. Embedding this one
+		// made a barrier that did not happen arrive as a successful RPC,
+		// so retry policies, interceptors and telemetry counted it as OK
+		// and only a caller that also read the body could tell.
+		//
+		// Internal, not Unavailable: a run that failed partway is not
+		// known to be retryable. The one failure that is -- another
+		// barrier holds the lock and this one never started -- says so
+		// above.
+		return nil, status.Error(codes.Internal, err.Error())
 	}
 	return &pgshardv1.CreateBarrierResponse{Barrier: restorePointProto(rp)}, nil
 }

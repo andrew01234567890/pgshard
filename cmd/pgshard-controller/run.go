@@ -25,6 +25,7 @@ import (
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/grpccreds"
 	pgmetrics "github.com/andrew01234567890/pgshard/internal/metrics"
+	"github.com/andrew01234567890/pgshard/internal/pki"
 )
 
 // minCatalogConns is the smallest catalog pool a controller can work with:
@@ -50,6 +51,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	certFile := fs.String("tls-cert", "", "server certificate for the gRPC listener (mTLS)")
 	keyFile := fs.String("tls-key", "", "server private key")
 	caFile := fs.String("tls-ca", "", "CA bundle that client certificates must chain to")
+	authorizeCallers := fs.Bool("tls-authorize-callers", false, "refuse callers whose certificate does not carry a pgshard identity allowed to call this listener; needs certificates the operator issued")
 	insecureDev := fs.Bool("insecure-dev", false, "serve plaintext gRPC without client authentication (development only)")
 	interval := fs.Duration("reconcile-interval", 30*time.Second, "longest time between reconcile passes without a catalog notification")
 	retry := fs.Duration("election-retry", 5*time.Second, "time between leadership attempts")
@@ -110,7 +112,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	var creds credentials.TransportCredentials
 	if *listen != "" {
 		var err error
-		if creds, err = grpccreds.Listener(*certFile, *keyFile, *caFile, *insecureDev); err != nil {
+		if creds, err = grpccreds.Listener(*certFile, *keyFile, *caFile, *insecureDev, authorize(*authorizeCallers, pki.RoleController)...); err != nil {
 			fmt.Fprintf(stderr, "pgshard-controller run: %v\n", err)
 			return cli.ExitUsage
 		}
@@ -276,4 +278,19 @@ func (f *shardDSNFlag) Set(v string) error {
 	}
 	(*f)[controller.ShardRef{Set: set, ID: int32(id)}] = dsn
 	return nil
+}
+
+// authorize turns the flag into the option grpccreds takes. Off it is
+// nothing at all, so a cluster whose certificates were supplied rather
+// than issued keeps working: those certificates carry no pgshard identity,
+// and a fail-closed check would refuse every caller.
+func authorize(on bool, role string) []grpccreds.Option {
+	if !on {
+		return nil
+	}
+	allow, ok := pki.AllowedCallers(role)
+	if !ok {
+		return nil
+	}
+	return []grpccreds.Option{grpccreds.Authorize(allow)}
 }

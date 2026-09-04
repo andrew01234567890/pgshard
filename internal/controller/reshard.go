@@ -75,7 +75,14 @@ func reconcileReshards(ctx context.Context, tx pgx.Tx, res *Result) error {
 			reason = "source shard set removed"
 		}
 		switch w.State {
-		case StateProvisioning:
+		// Pending alongside provisioning: neither has created a
+		// subscription, a slot or a publication, so there is nothing to
+		// clean up and the row can be cancelled where it stands. Pending
+		// used to fall through to the default and be skipped, which left
+		// it active for ever against a set that no longer exists -- and a
+		// workflow the catalog still counts as moving data out of a set
+		// holds off the next one that wants to.
+		case StateProvisioning, StatePending:
 		case StateRunning, StatePaused:
 			if !sourceGone {
 				// The copier drops subscriptions, slots and publications, then

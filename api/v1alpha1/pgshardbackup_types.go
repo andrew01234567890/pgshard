@@ -166,6 +166,14 @@ type PgShardBackupPolicySpec struct {
 	// +kubebuilder:validation:Pattern=`^$|^(@(annually|yearly|monthly|weekly|daily|midnight|hourly)|@every +[0-9]+(ns|us|µs|ms|s|m|h)([0-9]+(ns|us|µs|ms|s|m|h))*)$|^ *[0-9*/,?A-Za-z-]+( +[0-9*/,?A-Za-z-]+){4} *$`
 	// +optional
 	BarrierSchedule string `json:"barrierSchedule,omitempty"`
+	// VerifySchedule is a cron expression on which the operator runs
+	// pgbackrest verify over each bound cluster's repositories. A backup
+	// that cannot be verified is a backup you do not have, and nothing
+	// else notices: taking one succeeds long after the repository has
+	// stopped being restorable.
+	// +kubebuilder:validation:Pattern=`^$|^(@(annually|yearly|monthly|weekly|daily|midnight|hourly)|@every +[0-9]+(ns|us|µs|ms|s|m|h)([0-9]+(ns|us|µs|ms|s|m|h))*)$|^ *[0-9*/,?A-Za-z-]+( +[0-9*/,?A-Za-z-]+){4} *$`
+	// +optional
+	VerifySchedule string `json:"verifySchedule,omitempty"`
 	// ControllerEndpoint is the host:port of a cluster's Controller gRPC
 	// service, with {cluster} and {namespace} substituted; the default is
 	// {cluster}-controller.{namespace}.svc:15500.
