@@ -225,13 +225,20 @@ func placementFailed(ctx context.Context, tx pgx.Tx, id string, generation int64
 }
 
 func createWorkflow(ctx context.Context, tx pgx.Tx, kind string, spec map[string]any) (string, error) {
+	return createWorkflowWithStatus(ctx, tx, kind, spec, nil)
+}
+
+func createWorkflowWithStatus(ctx context.Context, tx pgx.Tx, kind string, spec, status map[string]any) (string, error) {
 	body, err := json.Marshal(spec)
 	if err != nil {
 		return "", err
 	}
+	if status == nil {
+		status = map[string]any{}
+	}
 	var id string
-	err = tx.QueryRow(ctx, `INSERT INTO pgshard.workflows (id, kind, state, spec) VALUES (gen_random_uuid(), $1, $2, $3) RETURNING id::text`,
-		kind, StatePending, body).Scan(&id)
+	err = tx.QueryRow(ctx, `INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES (gen_random_uuid(), $1, $2, $3, $4) RETURNING id::text`,
+		kind, StatePending, body, mustJSON(status)).Scan(&id)
 	return id, err
 }
 
@@ -338,7 +345,21 @@ func reconcileShardSets(ctx context.Context, tx pgx.Tx, res *Result) error {
 			continue
 		}
 		spec := map[string]any{"shard_set": set, "desired_generation": maxGen, "ranges": specRanges(desired)}
-		if _, err := createWorkflow(ctx, tx, KindReshard, spec); err != nil {
+		// The workflow records the edit and then waits, because nothing
+		// drives it: the copier runs workflows in 'running', and the only
+		// way into 'running' is a set that went 'desired' to
+		// 'provisioning', which spec.shards produces and an in-place edit
+		// of a serving set does not.
+		//
+		// It says so on itself rather than only in the guide. Someone who
+		// edited shard_ranges and is now looking at pgshard.workflows is
+		// looking at the one place that can tell them, and 'pending' with
+		// nothing beside it reads as work about to start.
+		if _, err := createWorkflowWithStatus(ctx, tx, KindReshard, spec, map[string]any{
+			"message": "waiting: an in-place range edit of a serving shard set is recorded but not driven yet. " +
+				"Change the shard count with spec.shards, or declare a new shard set and let the ranges move to it. " +
+				"CancelWorkflow removes this row.",
+		}); err != nil {
 			return err
 		}
 		res.WorkflowsCreated++
