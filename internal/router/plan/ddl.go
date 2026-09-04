@@ -173,16 +173,6 @@ func (w *walker) createTable(c *pgquerypb.CreateStmt) error {
 	return w.migration(Migration{Kind: "CREATE TABLE", Scope: scope, Object: relationRef(c.GetRelation(), objectPresent)})
 }
 
-// blankPaddedType reports whether a type name is a blank-padded character
-// type, whose equality ignores trailing spaces and so cannot key routing.
-func blankPaddedType(name string) bool {
-	switch strings.ToLower(name) {
-	case "bpchar", "char", "character":
-		return true
-	}
-	return false
-}
-
 func checkCreateSharded(r *rel, c *pgquerypb.CreateStmt) error {
 	haveKey := false
 	for _, elt := range c.GetTableElts() {
@@ -190,10 +180,6 @@ func checkCreateSharded(r *rel, c *pgquerypb.CreateStmt) error {
 		case *pgquerypb.Node_ColumnDef:
 			if e.ColumnDef.GetColname() == r.shardKey {
 				haveKey = true
-				if names := stringList(e.ColumnDef.GetTypeName().GetNames()); len(names) > 0 && blankPaddedType(names[len(names)-1]) {
-					return notYet("shard key column \""+r.shardKey+"\" of sharded table \""+r.name+"\" cannot be a blank-padded character type",
-						"character(n)/bpchar equality ignores trailing spaces, which does not match byte-wise routing; use text or varchar")
-				}
 			}
 			for _, con := range e.ColumnDef.GetConstraints() {
 				if isUniqueConstraint(con.GetConstraint()) && e.ColumnDef.GetColname() != r.shardKey {

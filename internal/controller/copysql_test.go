@@ -32,12 +32,17 @@ func TestKeyHashExprMirrorsPlacement(t *testing.T) {
 			t.Errorf("%s must be refused", typ)
 		}
 	}
-	// Blank-padded character types compare with trailing spaces ignored and
-	// their ::text cast strips them, so the row filter and the router would
-	// hash different bytes for equal keys.
+	// Blank-padded character types hash through ::text, which strips the
+	// padding -- the same value bpchar equality compares, and the same one
+	// the router hashes after trimming by the column's type.
 	for _, typ := range []string{"character(3)", "character", "bpchar", "char(1)"} {
-		if _, err := KeyHashExpr("k", typ); err == nil || !strings.Contains(err.Error(), "blank-padded") {
-			t.Errorf("%s must be refused as blank-padded: %v", typ, err)
+		got, err := KeyHashExpr("k", typ)
+		if err != nil {
+			t.Errorf("%s must be hashable: %v", typ, err)
+			continue
+		}
+		if !strings.Contains(got, "::text") {
+			t.Errorf("%s must hash the trimmed value: %s", typ, got)
 		}
 	}
 }

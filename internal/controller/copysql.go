@@ -56,12 +56,16 @@ func KeyHashExpr(col, typ string) (string, error) {
 	case "uuid":
 		return fmt.Sprintf("uuid_hash_extended(%s, %s)", QuoteIdent(col), seed), nil
 	case "character", "bpchar", "char":
-		// Blank-padded character equality ignores trailing spaces and the
-		// ::text cast strips them, so the row filter would hash a trimmed
-		// value while the router hashes the client's raw bytes: two "equal"
-		// keys could land on different shards. Refuse until the router can
-		// normalise by column type.
-		return "", fmt.Errorf("shard key %s of type %s is not supported: blank-padded character equality does not match byte-wise hashing; use text or varchar", col, typ)
+		// The ::text cast strips the blank padding, so this hashes the
+		// value with its trailing spaces removed -- which is the value
+		// bpchar equality compares. The router applies the same trim
+		// before hashing a key of this type, so a client's 'abc  ' and
+		// 'abc' route to the shard that holds the row either way.
+		//
+		// This was refused until the router could normalise by column
+		// type. It can: the shard key's type reaches the snapshot and the
+		// planner trims by it.
+		return fmt.Sprintf("hashtextextended(%s::text, %s)", QuoteIdent(col), seed), nil
 	}
 	return "", fmt.Errorf("shard key %s of type %s cannot be hashed by a row filter", col, typ)
 }

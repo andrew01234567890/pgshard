@@ -43,7 +43,10 @@ func TestShardKeyCheckFaultsAKeyTheRouterAndTheCopyWouldDisagreeOn(t *testing.T)
 		// Declared before the table exists: nothing to fault, and the
 		// CREATE TABLE that follows goes through pgshard, which checks it.
 		{"notyetcreated", ""},
-		{"padded", "blank-padded character equality does not match byte-wise hashing"},
+		// A blank-padded key routes now: the router trims by the column's
+		// declared type and the row filter hashes through ::text, so both
+		// hash the value with its padding gone.
+		{"padded", ""},
 		{"jsonkey", "cannot be hashed by a row filter"},
 	} {
 		got := keyErrorOf(t, f.catalog, c.table)
@@ -61,13 +64,13 @@ func TestShardKeyCheckFaultsAKeyTheRouterAndTheCopyWouldDisagreeOn(t *testing.T)
 		t.Fatalf("second pass published %d (%v), want none", published, err)
 	}
 
-	// Point the table at a key that works: the next pass must clear the
-	// fault rather than leave the table refused for ever.
-	mustExec(t, f.catalog, `UPDATE pgshard.tables SET shard_key = 'id' WHERE table_name = 'padded'`)
+	// Point the faulted table at a key that works: the next pass must
+	// clear the fault rather than leave the table refused for ever.
+	mustExec(t, f.catalog, `UPDATE pgshard.tables SET shard_key = 'id' WHERE table_name = 'jsonkey'`)
 	if _, err := check.Pass(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := keyErrorOf(t, f.catalog, "padded"); got != "" {
+	if got := keyErrorOf(t, f.catalog, "jsonkey"); got != "" {
 		t.Fatalf("still faulted as %q after the key changed", got)
 	}
 }
@@ -85,7 +88,11 @@ func TestShardKeyCheckSeesADriftedShard(t *testing.T) {
 	if _, err := check.Pass(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := keyErrorOf(t, f.catalog, "drifted"); !strings.Contains(got, "blank-padded") {
+	// Both types are hashable on their own; disagreeing about which one
+	// the column is, is the fault. A check that asked one shard would see
+	// text, call it fine, and route by a hash the other shard's rows were
+	// never placed with.
+	if got := keyErrorOf(t, f.catalog, "drifted"); !strings.Contains(got, "the shards must agree") {
 		t.Fatalf("fault = %q, want the second shard's column type to have been seen", got)
 	}
 }

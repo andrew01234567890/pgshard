@@ -25,6 +25,16 @@ func normaliseKey(v any, columnType string) any {
 		return v
 	}
 	base, n, hasLimit := parseCharType(columnType)
+	// character(n) is stored blank-padded and compares with its trailing
+	// spaces ignored, and the ::text cast the row filter and the copy use
+	// strips them. Trimming here is what makes the router hash the value
+	// the shard stored rather than the bytes the client sent: without it
+	// 'abc' and 'abc  ' are the same key to PostgreSQL and two different
+	// shards to pgshard.
+	switch base {
+	case "character", "bpchar", "char":
+		return strings.TrimRight(s, " ")
+	}
 	if !hasLimit || base != "character varying" {
 		return v
 	}
@@ -52,4 +62,14 @@ func parseCharType(t string) (base string, n int, hasLimit bool) {
 		return strings.TrimSpace(t[:open]), 0, false
 	}
 	return strings.TrimSpace(t[:open]), n, true
+}
+
+// NormaliseKeyForType is normaliseKey for a string, exported so the
+// differential test can ask PostgreSQL whether the router and a shard
+// agree about a key. The hazard this normalisation exists for is a
+// disagreement with PostgreSQL, and a test that cannot reach both sides
+// cannot see one.
+func NormaliseKeyForType(v, columnType string) string {
+	s, _ := normaliseKey(v, columnType).(string)
+	return s
 }

@@ -1488,10 +1488,12 @@ func castItem(item keyItem, tn *pgquerypb.TypeName) (keyItem, bool) {
 		hint = HintInt
 	case "text", "varchar", "name":
 		hint = HintText
+	case "bpchar", "char", "character":
+		// Routable now: the key's declared type reaches the planner, and
+		// normaliseKey trims the trailing spaces the ::text cast strips on
+		// the shard, so the operand hashes to where the row is.
+		hint = HintText
 	default:
-		// bpchar/char/character are refused too: their equality ignores
-		// trailing spaces, so a raw-byte hash of the operand may not match
-		// the shard the row was placed on.
 		return keyItem{}, false
 	}
 	if item.param != 0 {
