@@ -32,7 +32,7 @@ import (
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
 	"github.com/andrew01234567890/pgshard/internal/agentauth"
 	"github.com/andrew01234567890/pgshard/internal/catalog"
-	"github.com/andrew01234567890/pgshard/internal/pgparser"
+	"github.com/andrew01234567890/pgshard/internal/pgparser/grammar"
 	"github.com/andrew01234567890/pgshard/internal/pgtune"
 
 	"github.com/andrew01234567890/pgshard/internal/metrics"
@@ -1498,7 +1498,7 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, c *pgshardv1alpha1
 	// that got it there reported success -- correctly, because the data
 	// moved. Saying so here is the difference between a documented
 	// limitation and a statement that is refused for no visible reason.
-	behind := c.Status.ServingPGMajor > pgparser.Major
+	behind := c.Status.ServingPGMajor > grammar.Major
 	set(pgshardv1alpha1.ConditionSQLSurfaceBehindServers, behind,
 		boolReason(behind, "GrammarOlderThanServers", "GrammarMatchesServers"),
 		sqlSurfaceMessage(c.Status.ServingPGMajor))
@@ -1530,14 +1530,14 @@ func (r *ClusterReconciler) deploymentReady(ctx context.Context, namespace, name
 // because "the routers parse PostgreSQL 18" is only interesting next to
 // what the servers are.
 func sqlSurfaceMessage(serving int) string {
-	if serving <= 0 || serving == pgparser.Major {
-		return fmt.Sprintf("routers parse PostgreSQL %d and the shards run it", pgparser.Major)
+	if serving <= 0 || serving == grammar.Major {
+		return fmt.Sprintf("routers parse PostgreSQL %d and the shards run it", grammar.Major)
 	}
-	if serving < pgparser.Major {
-		return fmt.Sprintf("routers parse PostgreSQL %d while the shards run %d; syntax the shards would refuse is refused here first", pgparser.Major, serving)
+	if serving < grammar.Major {
+		return fmt.Sprintf("routers parse PostgreSQL %d while the shards run %d; syntax the shards would refuse is refused here first", grammar.Major, serving)
 	}
 	return fmt.Sprintf("the shards run PostgreSQL %d but the routers parse %d: %d-only syntax is refused and server_version reports %d. The upgrade moved the data; the SQL surface follows a router build that parses %d",
-		serving, pgparser.Major, serving, pgparser.Major, serving)
+		serving, grammar.Major, serving, grammar.Major, serving)
 }
 
 // setRolloutStatus summarises the groups' rolling steps into status.rollout
