@@ -443,3 +443,73 @@ func TestProbeReadsAPrimaryInOneRoundTrip(t *testing.T) {
 		t.Errorf("synchronous_standby_names = %q", st.SyncStandbyNames)
 	}
 }
+
+// TestProbesReuseOneConnection is PGS-564's acceptance: repeated probes of
+// an unchanged member must open no new PostgreSQL connection after the
+// first. ProbeStandby used to call pgx.Connect and close it again, so every
+// probe of every standby on every reconcile pass paid a TCP handshake, TLS
+// and SCRAM before it asked anything -- which, now that the probe is one
+// statement, was the dominant cost of a pass.
+//
+// Probe is deliberately not pooled and is not asserted here; it reads
+// synchronous_standby_names, and a pooled backend can answer with the list
+// from before a reload.
+func TestProbesReuseOneConnection(t *testing.T) {
+	if err := exec.Command("docker", "info").Run(); err != nil {
+		dockertest.Unavailable(t, "docker unavailable")
+	}
+	ctx := context.Background()
+	dsn := startProbePostgres(t)
+
+	admin, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = admin.Close(ctx) }()
+
+	// pg_stat_database.sessions counts sessions ESTABLISHED, cumulatively.
+	// It is what the acceptance asks about directly; a backend pid or a
+	// count of live connections cannot answer it, because a probe that
+	// connects and closes leaves both unchanged.
+	sessions := func() int64 {
+		t.Helper()
+		var n int64
+		if err := admin.QueryRow(ctx, `SELECT sessions FROM pg_stat_database WHERE datname = current_database()`).Scan(&n); err != nil {
+			t.Fatalf("reading pg_stat_database.sessions: %v", err)
+		}
+		return n
+	}
+
+	// One probe first, so the pool has its connection and the count that
+	// follows measures the steady state rather than the first open.
+	if _, err := (PgxProber{}).ProbeStandby(ctx, dsn); err != nil {
+		t.Fatalf("probing as a standby: %v", err)
+	}
+	before := sessions()
+	for range 5 {
+		if _, err := (PgxProber{}).ProbeStandby(ctx, dsn); err != nil {
+			t.Fatalf("probing as a standby: %v", err)
+		}
+	}
+	if got := sessions(); got != before {
+		t.Errorf("%d sessions opened by five probes of an unchanged member, want 0", got-before)
+	}
+
+	// The other half of the acceptance: a connection that has gone bad is
+	// replaced rather than reused. Terminating the backend from another
+	// session is what a fenced, restarted or rewound member looks like from
+	// here, and it is not detected until something reads from the
+	// connection -- so without the retry the next probe reports a healthy
+	// member as unreachable.
+	if _, err := admin.Exec(ctx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+		WHERE pid <> pg_backend_pid() AND datname = current_database()`); err != nil {
+		t.Fatalf("terminating the pooled backends: %v", err)
+	}
+	if _, err := (PgxProber{}).ProbeStandby(ctx, dsn); err != nil {
+		t.Fatalf("a probe after the backend was terminated must reconnect, not fail: %v", err)
+	}
+	// And it did reconnect rather than answering from the dead one.
+	if got := sessions(); got <= before {
+		t.Errorf("sessions did not rise after the pooled backend was terminated: %d, was %d", got, before)
+	}
+}
