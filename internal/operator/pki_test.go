@@ -2,6 +2,9 @@ package operator
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -212,5 +215,113 @@ func TestASuppliedSecretIsStillMountedEverywhere(t *testing.T) {
 	}
 	if ref := internalTLSRefFor(c, pki.RolePooler); ref == nil || ref.Name != c.Spec.InternalTLS.SecretRef.Name {
 		t.Fatalf("the supplied secret must still serve every role: %+v", ref)
+	}
+}
+
+// serverRoles are the workloads the operator hands --tls-cert and starts a
+// listener with, paired with the address something else dials them on. A
+// certificate mounted as a server has to say it may serve, and has to name
+// the address callers use, or every caller fails the handshake.
+func serverRoles(c *pgshardv1alpha1.PgShardCluster) map[string]string {
+	return map[string]string{
+		pki.RoleRouter:     RouterName(c.Name) + "." + c.Namespace + ".svc",
+		pki.RoleController: ControllerName(c.Name) + "." + c.Namespace + ".svc",
+	}
+}
+
+// TestEveryListenerGetsACertificateItCanServeWith: the controller is
+// mounted with --tls-cert and serves gRPC on it -- barriers, workflows,
+// DDL and the resolver all arrive that way -- but it was issued a
+// client-only certificate: no ServerAuth EKU and no DNS name for its
+// Service. Both are fatal on their own, and a caller that verifies either
+// one cannot complete a handshake, so turning on issued certificates took
+// the controller off the air.
+func TestEveryListenerGetsACertificateItCanServeWith(t *testing.T) {
+	c := issuingCluster("listen")
+	r := pkiReconciler(t, time.Now(), c)
+	if err := r.reconcilePKI(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	for role, dialed := range serverRoles(c) {
+		sec := secretOf(t, r, c.Namespace, RoleTLSSecretName(c.Name, role))
+		block, _ := pem.Decode(sec.Data["tls.crt"])
+		if block == nil {
+			t.Fatalf("%s: no certificate in the secret", role)
+		}
+		crt, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatalf("%s: %v", role, err)
+		}
+		if !slices.Contains(crt.ExtKeyUsage, x509.ExtKeyUsageServerAuth) {
+			t.Errorf("%s serves TLS but its certificate has no ServerAuth usage: %v", role, crt.ExtKeyUsage)
+		}
+		if err := crt.VerifyHostname(dialed); err != nil {
+			t.Errorf("%s is dialled at %s and its certificate does not name it: %v", role, dialed, err)
+		}
+	}
+}
+
+// TestIssuedCertificatesTurnAuthorisationOn pins the pairing: the flag is
+// only correct where the certificates carry identities, so it must follow
+// issuing and nothing else. On without them, every caller is refused; off
+// with them, the identities are carried and ignored.
+func TestIssuedCertificatesTurnAuthorisationOn(t *testing.T) {
+	const flag = "--tls-authorize-callers"
+	for _, tc := range []struct {
+		name string
+		tls  pgshardv1alpha1.InternalTLSSpec
+		want bool
+	}{
+		{"issued", pgshardv1alpha1.InternalTLSSpec{Issue: true}, true},
+		{"supplied", pgshardv1alpha1.InternalTLSSpec{SecretRef: &corev1.LocalObjectReference{Name: "given"}}, false},
+		{"insecure", pgshardv1alpha1.InternalTLSSpec{Insecure: true}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newCluster("authz-" + tc.name)
+			c.Spec.InternalTLS = tc.tls
+			g := Group{Cluster: c.Name, Kind: "shard", ShardID: 0, Replicas: 3}
+			pod := Renderer{}.Pod(c, g, 0, RolePrimary, g.MemberName(0), Template(c, g, nil, nil))
+			var pooler bool
+			for _, ct := range pod.Spec.Containers {
+				if strings.Contains(ct.Name, "pooler") {
+					pooler = slices.Contains(ct.Args, flag)
+				}
+			}
+			if pooler != tc.want {
+				t.Fatalf("pooler authorisation is %v, want %v", pooler, tc.want)
+			}
+			dep := Renderer{}.RouterDeployment(c)
+			if dep != nil {
+				for _, ct := range dep.Spec.Template.Spec.Containers {
+					if got := slices.Contains(ct.Args, flag); got != tc.want {
+						t.Fatalf("router authorisation is %v, want %v", got, tc.want)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestTheAgentAuthorisesOnlyWithIssuedCertificates(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tls  pgshardv1alpha1.InternalTLSSpec
+		want bool
+	}{
+		{"issued", pgshardv1alpha1.InternalTLSSpec{Issue: true, AgentMTLS: true}, true},
+		{"supplied", pgshardv1alpha1.InternalTLSSpec{
+			SecretRef: &corev1.LocalObjectReference{Name: "given"}, AgentMTLS: true}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newCluster("agentauthz-" + tc.name)
+			c.Spec.InternalTLS = tc.tls
+			tls := agentGRPCTLS(c)
+			if tls.CertFile == "" {
+				t.Fatal("agentMTLS must give the agent material")
+			}
+			if tls.AuthorizeCallers != tc.want {
+				t.Fatalf("agent authorisation is %v, want %v", tls.AuthorizeCallers, tc.want)
+			}
+		})
 	}
 }

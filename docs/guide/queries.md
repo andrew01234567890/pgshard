@@ -102,4 +102,5 @@ COPY on sharded and reference tables is not available yet.
 | `40001` | shard failover inside your open transaction — retry the whole transaction |
 | `57P03` | cluster write pause while a certified barrier is taken — retry |
 | `08007` | two-phase commit outcome unknown; the resolver finishes it ([transactions.md](transactions.md)) |
-| `55000` | stale routing generation; transient during topology changes |
+| `53300` | the cluster is at a concurrency limit: no backend free, the failover buffer full, or the scatter budget exhausted. The first three clear on their own; a statement needing more shard streams than the whole budget will not succeed on retry |
+| `55000` | wait and retry. Two conditions answer it: a stale routing generation during a topology change, and a table mid online-rewrite whose column list is not published yet. The error's `Reason` distinguishes them, because the SQLSTATE alone cannot |

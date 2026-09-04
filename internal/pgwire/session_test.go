@@ -79,3 +79,42 @@ func TestTheStartupRefusalIsWrittenUnderADeadline(t *testing.T) {
 		t.Errorf("the refusal was written with no deadline: %v", dc.deadlines)
 	}
 }
+
+// TestTheDrainGoodbyeIsWrittenUnderADeadline: draining an idle session
+// writes its FATAL straight to the socket, because the session goroutine
+// is blocked in Receive and cannot carry it. That write carried no
+// deadline, so a peer that had stopped reading could hold it open for as
+// long as it liked -- and unlike the startup refusal, this one runs on the
+// shutdown path, where the wait is the whole server's rather than one
+// connection's.
+func TestTheDrainGoodbyeIsWrittenUnderADeadline(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = client.Close() }()
+	blocked := make(chan struct{})
+	dc := &deadlineConn{Conn: server, blocked: blocked}
+
+	srv, err := NewServer(Config{Authenticator: TrustAuthenticator{},
+		NewExecutor: func(SessionInfo) (Executor, error) { return nil, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess := newSession(srv, dc, 1)
+	sess.mu.Lock()
+	sess.serving = true
+	sess.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() { defer close(done); sess.drain() }()
+
+	// The write blocks until we let it fail, as a peer that never reads
+	// would. The drain must still finish.
+	close(blocked)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("drain blocked on a peer that never took its goodbye")
+	}
+	if !dc.wroteUnderADeadline() {
+		t.Error("the drain goodbye was written with no write deadline")
+	}
+}

@@ -303,6 +303,11 @@ type BackupAgentClient interface {
 	Expire(ctx context.Context, addr string) error
 	// Info reads the repository contents through the agent at addr.
 	Info(ctx context.Context, addr string) (RepoInfo, error)
+	// Verify checks the repository through the agent at addr and returns
+	// what pgBackRest said. A backup that cannot be verified is a backup
+	// you do not have, so the outcome is worth recording even when it
+	// passes.
+	Verify(ctx context.Context, addr string) ([]string, error)
 }
 
 func backupResultFromProto(i *pgshardv1.BackupInfo) BackupResult {
@@ -370,6 +375,31 @@ func (c *GRPCAgentClient) Expire(ctx context.Context, addr string) error {
 		return fmt.Errorf("expire: %s (%s)", e.GetMessage(), e.GetSqlstate())
 	}
 	return nil
+}
+
+// Verify calls Agent.Verify, which runs pgbackrest verify over the
+// repository. Bounded like Expire: the epoch probe is short, the RPC
+// itself is not, because verification reads every backup in the repo and
+// the caller owns the overall deadline.
+func (c *GRPCAgentClient) Verify(ctx context.Context, addr string) ([]string, error) {
+	cl, err := c.dial(ctx, addr)
+	if err != nil {
+		return nil, err
+	}
+	sctx, scancel := context.WithTimeout(ctx, agentCallTimeout)
+	_, err = cl.Status(sctx, &pgshardv1.StatusRequest{})
+	scancel()
+	if err != nil {
+		return nil, err
+	}
+	resp, err := cl.Verify(ctx, &pgshardv1.VerifyRequest{})
+	if err != nil {
+		return nil, err
+	}
+	if e := resp.GetError(); e != nil {
+		return resp.GetLog(), fmt.Errorf("verify: %s (%s)", e.GetMessage(), e.GetSqlstate())
+	}
+	return resp.GetLog(), nil
 }
 
 // Info calls Agent.RestoreInfo.

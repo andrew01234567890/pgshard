@@ -28,10 +28,11 @@ func RoleTLSSecretName(cluster, role string) string { return cluster + "-tls-" +
 // each answers RPCs and makes them. The router serves its peers and the
 // VStream API as well as dialling poolers.
 var issuedRoles = map[string]pki.Request{
-	pki.RoleAgent:      {Server: true, Client: true},
-	pki.RolePooler:     {Server: true, Client: true},
-	pki.RoleRouter:     {Server: true, Client: true},
-	pki.RoleController: {Client: true},
+	pki.RoleAgent:  {Server: true, Client: true},
+	pki.RolePooler: {Server: true, Client: true},
+	pki.RoleRouter: {Server: true, Client: true},
+	// Serves as well as dials: the router and the operator both call it.
+	pki.RoleController: {Server: true, Client: true},
 	pki.RoleOperator:   {Client: true},
 	pki.RoleAdmin:      {Client: true},
 }
@@ -159,6 +160,8 @@ func roleDNSNames(c *pgshardv1alpha1.PgShardCluster, role string) []string {
 	switch role {
 	case pki.RoleRouter:
 		return svc(RouterName(c.Name))
+	case pki.RoleController:
+		return svc(ControllerName(c.Name))
 	case pki.RolePooler, pki.RoleAgent:
 		// Reached pod by pod rather than through a Service: a caller that
 		// dials a member by name must find that name on the certificate.

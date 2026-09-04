@@ -336,6 +336,13 @@ func (f *fakeBackupAgents) Expire(_ context.Context, addr string) error {
 
 func (f *fakeBackupAgents) Info(context.Context, string) (RepoInfo, error) { return RepoInfo{}, nil }
 
+func (f *fakeBackupAgents) Verify(_ context.Context, addr string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "verify "+addr)
+	return []string{"verified " + addr}, f.fail["verify "+addr]
+}
+
 func (f *fakeBackupAgents) journal() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
