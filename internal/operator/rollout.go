@@ -375,6 +375,7 @@ func (r *ClusterReconciler) freshestStandby(ctx context.Context, g Group, state 
 				v.Why = err.Error()
 			} else {
 				v.Reachable, v.InRecovery, v.FlushLSN = true, st.InRecovery, st.FlushLSN
+				v.ReadySlots = r.readySlots(ctx, g, name, m.ip)
 			}
 		}
 		views = append(views, v)
