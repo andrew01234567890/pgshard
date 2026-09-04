@@ -480,7 +480,16 @@ func TestRouterVStreamFailoverContinuity(t *testing.T) {
 		var replay, current int64
 		_ = standby.QueryRow(ctx, "select coalesce((select synced and not temporary from pg_replication_slots where slot_name = 'pgshard_orders_shard1'), false)").Scan(&synced)
 		_ = standby.QueryRow(ctx, "select coalesce(pg_last_wal_replay_lsn() - '0/0'::pg_lsn, 0)").Scan(&replay)
-		_ = primary.QueryRow(ctx, "select pg_current_wal_lsn() - '0/0'::pg_lsn").Scan(&current)
+		// The primary's SLOT position, not the primary's current WAL.
+		// slotsync keeps a synced slot temporary while the remote slot has
+		// not caught up to the position the standby reserved locally
+		// (slotsync.c update_and_persist_local_synced_slot), so the wait
+		// has to be on the slot the sync is copying. Waiting on
+		// pg_current_wal_lsn asks whether the standby is caught up with
+		// the primary's WAL, which it can be while this is still false --
+		// the shape of the observed failure, replay == current with the
+		// slot still temporary.
+		_ = primary.QueryRow(ctx, "select coalesce((select confirmed_flush_lsn - '0/0'::pg_lsn from pg_replication_slots where slot_name = 'pgshard_orders_shard1'), 0)").Scan(&current)
 		if synced && replay >= current {
 			break
 		}
@@ -494,7 +503,17 @@ func TestRouterVStreamFailoverContinuity(t *testing.T) {
 			if err := standby.QueryRow(ctx, "select coalesce((select to_jsonb(s)::text from pg_replication_slots s where slot_name = 'pgshard_orders_shard1'), 'no such slot on the standby')").Scan(&row); err != nil {
 				row = "could not be read: " + err.Error()
 			}
-			t.Fatalf("slot not synchronized in time (synced=%t replay=%d current=%d)\nstandby slot: %s", synced, replay, current, row)
+			// Both sides, because the decision is made by comparing them
+			// and a dump of one cannot say which is behind. The observed
+			// failure had synced=true and temporary=true on the standby,
+			// which reads as "sync did not finish" and says nothing about
+			// why; the primary's slot is where the reason is.
+			var primaryRow string
+			if err := primary.QueryRow(ctx, "select coalesce((select to_jsonb(s)::text from pg_replication_slots s where slot_name = 'pgshard_orders_shard1'), 'no such slot on the primary')").Scan(&primaryRow); err != nil {
+				primaryRow = "could not be read: " + err.Error()
+			}
+			t.Fatalf("slot not synchronized in time (synced=%t replay=%d primary confirmed_flush=%d)\nstandby slot: %s\nprimary slot: %s",
+				synced, replay, current, row, primaryRow)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
