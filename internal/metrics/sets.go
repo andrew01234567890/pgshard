@@ -21,8 +21,15 @@ type Router struct {
 	ShardStatements  *prometheus.CounterVec
 	ShardRows        *prometheus.CounterVec
 	ShardErrors      *prometheus.CounterVec
-	activeSessions   prometheus.GaugeFunc
-	snapshotAge      prometheus.GaugeFunc
+	// The change stream's buffers. A stream ends with
+	// TRANSACTION_TOO_LARGE when one of the bounds trips, and by then the
+	// consumer has to resume; watching the gauges is how anybody sees it
+	// coming rather than reading about it afterwards.
+	VStreamBufferedBytes prometheus.Gauge
+	VStreamOpenTxns      prometheus.Gauge
+	VStreamTooLarge      *prometheus.CounterVec
+	activeSessions       prometheus.GaugeFunc
+	snapshotAge          prometheus.GaugeFunc
 }
 
 // NewRouter registers the router metric set on reg. sessions reports the
@@ -71,6 +78,12 @@ func NewRouter(reg *prometheus.Registry, sessions, snapshotAge func() float64) *
 			Name: "pgshard_router_shard_rows_total", Help: "Data rows returned by each shard."}, []string{"shard"}),
 		ShardErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "pgshard_router_shard_errors_total", Help: "Statements each shard answered with an error."}, []string{"shard"}),
+		VStreamBufferedBytes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "pgshard_router_vstream_buffered_bytes", Help: "Encoded events held for change-stream transactions that have not committed."}),
+		VStreamOpenTxns: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "pgshard_router_vstream_open_transactions", Help: "Interleaved in-progress change-stream transactions being assembled."}),
+		VStreamTooLarge: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "pgshard_router_vstream_too_large_total", Help: "Change streams ended because a buffer bound was exceeded, by which bound."}, []string{"bound"}),
 	}
 	m.activeSessions = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "pgshard_router_active_sessions", Help: "Live client sessions."}, sessions)
@@ -83,6 +96,7 @@ func NewRouter(reg *prometheus.Registry, sessions, snapshotAge func() float64) *
 	reg.MustRegister(m.Connections, m.Queries, m.PlanCacheHits, m.PlanCacheMiss, m.PlanCacheEvicted, m.PlanCacheBytes, m.Refusals,
 		m.TwoPCCommits, m.TwoPCAborts, m.TwoPCInDoubt, m.BufferEvents, m.BufferSeconds,
 		m.ScatterFanout, m.ShardLatency, m.ShardStatements, m.ShardRows, m.ShardErrors,
+		m.VStreamBufferedBytes, m.VStreamOpenTxns, m.VStreamTooLarge,
 		m.activeSessions, m.snapshotAge)
 	return m
 }

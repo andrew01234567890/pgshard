@@ -45,6 +45,11 @@ type Server struct {
 	// shard; zero means 256. Bytes alone would admit a very large number
 	// of small ones, each with its own bookkeeping.
 	MaxOpenTransactions int
+	// Meter, when set, reports what the buffers hold. A stream ends with
+	// TRANSACTION_TOO_LARGE when a bound trips and the consumer has to
+	// resume from its last position; the gauges are how that is seen
+	// coming rather than read about afterwards.
+	Meter Meter
 }
 
 func (s *Server) logger() *slog.Logger {
@@ -200,7 +205,7 @@ func (s *Server) Stream(srv pgshardv1.VStream_StreamServer) error {
 		inputs[sh] = ch
 		r := &reader{shard: sh, stream: def.Name, database: def.Database, twoPhase: opts.twoPhase, topo: s.Topology,
 			out: ch, ready: ready, window: window, delivered: startPos[sh],
-			maxBytes: maxBytes, maxOpen: maxOpen}
+			maxBytes: maxBytes, maxOpen: maxOpen, meter: s.Meter}
 		if st, ok := copying[sh]; ok {
 			r.copy = copyPhaseFrom(st, opts.copyBatch)
 		} else if opts.copy && startPos[sh] == 0 {
