@@ -79,3 +79,38 @@ func tokensIn(ctx context.Context, t *testing.T) []string {
 	}
 	return out
 }
+
+// A restore reaches agents of two clusters in one pass: it reconciles
+// prepared transactions on the source and polls the primaries of the new
+// one. Their tokens are unrelated -- ensureAgentSecret generates a fresh
+// random one per cluster and nothing copies it between them -- so a context
+// carrying one reaches only half of them.
+//
+// This is what the withdrawn derived token was hiding. Both clusters share
+// a superuser Secret, so a token hashed from that password matched
+// everywhere and the restore authenticated without either cluster's own.
+func TestARestoreCarriesBothClustersTokens(t *testing.T) {
+	const ns, source, restored = "default", "demo", "demo-restored"
+	cl := fakeClient(t,
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: AgentSecretName(source), Namespace: ns},
+			Data:       map[string][]byte{agentTokenKey: []byte("source-token\n")},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: AgentSecretName(restored), Namespace: ns},
+			Data:       map[string][]byte{agentTokenKey: []byte("restored-token")},
+		},
+	)
+	got := tokensIn(withClusterAgentTokens(context.Background(), cl, ns, source, restored), t)
+	if len(got) != 2 || got[0] != "source-token" || got[1] != "restored-token" {
+		t.Fatalf("sent %v, want both clusters' own tokens", got)
+	}
+
+	// The new cluster's Secret does not exist until its own reconcile
+	// creates it, and a restore pass before that must still reach the
+	// source rather than sending nothing.
+	only := tokensIn(withClusterAgentTokens(context.Background(), cl, ns, source, "not-created-yet"), t)
+	if len(only) != 1 || only[0] != "source-token" {
+		t.Fatalf("sent %v, want just the source's while the new cluster has no secret", only)
+	}
+}

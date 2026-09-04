@@ -25,6 +25,25 @@ func WithToken(ctx context.Context, token string) context.Context {
 	return metadata.AppendToOutgoingContext(ctx, MetadataKey, token)
 }
 
+// WithTokens carries several tokens, for a caller that reaches agents of
+// more than one cluster in a single pass. The server accepts a call
+// presenting any token it knows, so each agent takes its own and ignores
+// the rest.
+//
+// This is not the withdrawn derived-token fallback: these are distinct
+// clusters' own mounted tokens, and neither is derived from a password. A
+// restore is the case -- it reconciles prepared transactions on the source
+// cluster and polls the primaries of the new one, and every cluster's agent
+// token is generated independently.
+func WithTokens(ctx context.Context, tokens ...string) context.Context {
+	for _, t := range tokens {
+		if t != "" {
+			ctx = metadata.AppendToOutgoingContext(ctx, MetadataKey, t)
+		}
+	}
+	return ctx
+}
+
 // ErrUnauthenticated is returned to callers without a valid token.
 var errUnauthenticated = status.Error(codes.Unauthenticated, "agent: missing or invalid "+MetadataKey)
 

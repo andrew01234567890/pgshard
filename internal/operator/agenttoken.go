@@ -26,9 +26,23 @@ func mountedAgentToken(ctx context.Context, c client.Client, namespace, cluster 
 // withClusterAgentToken stamps ctx so agent RPCs authenticate; a missing
 // secret leaves ctx unchanged (the agents are not up either).
 func withClusterAgentToken(ctx context.Context, c client.Client, namespace, cluster string) context.Context {
-	tok, err := mountedAgentToken(ctx, c, namespace, cluster)
-	if err != nil || tok == "" {
+	return withClusterAgentTokens(ctx, c, namespace, cluster)
+}
+
+// withClusterAgentTokens is the same for a caller that reaches agents of
+// more than one cluster. Every cluster's agent token is generated
+// independently -- ensureAgentSecret makes a fresh random one for a cluster
+// that has none, and nothing copies it between clusters -- so a pass that
+// spans two of them has to carry both.
+func withClusterAgentTokens(ctx context.Context, c client.Client, namespace string, clusters ...string) context.Context {
+	var tokens []string
+	for _, name := range clusters {
+		if tok, err := mountedAgentToken(ctx, c, namespace, name); err == nil && tok != "" {
+			tokens = append(tokens, tok)
+		}
+	}
+	if len(tokens) == 0 {
 		return ctx
 	}
-	return agentauth.WithToken(ctx, tok)
+	return agentauth.WithTokens(ctx, tokens...)
 }
