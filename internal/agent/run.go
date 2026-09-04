@@ -192,12 +192,14 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 		}
 		return append(tokens, derived), nil
 	}
-	// Transport security is opt-in and off by default, because the callers
-	// (the operator and the controller) still dial plaintext -- turning it
-	// on here without them would make every agent unreachable. Configuring
-	// GRPCTLS is therefore a deliberate act, and grpccreds.Listener is the
-	// same hardened definition the pooler and controller listen with:
-	// client certificates required and verified against a named CA.
+	// Transport security is opt-in and off by default. Both callers can dial
+	// with credentials, but each decides per member from
+	// spec.internalTLS.agentMTLS, so an agent that listens for TLS before its
+	// member carries the flag refuses every handshake it is sent. The flag is
+	// what turns this on; enabling it here alone takes the agent off the air.
+	// grpccreds.Listener is the same hardened definition the pooler and
+	// controller listen with: client certificates required and verified
+	// against a named CA.
 	//
 	// Until it is configured the bearer token travels in clear, which is
 	// what PGS-235 and PGS-421 are about.
