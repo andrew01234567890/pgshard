@@ -17,6 +17,15 @@ runs the checker against the fixtures under `hack/testdata`.
 | `chaos.yml` | Chaos Mesh experiments (`test/chaos`) |
 | `release.yml` | on a `v*` tag: verifies the commit, builds every image from it, publishes them with an immutable version tag, and signs a build provenance attestation for each |
 | `mirror-base-images.yml` | copies the pinned Docker Hub base images into GHCR so a build does not depend on an anonymous pull |
+
+The e2e builds take their bases from that mirror. `hack/ci/mirror-args.sh`
+emits a `--build-context` override per image, which redirects a `FROM` to the
+mirrored copy of the **same digest** without touching any Dockerfile: the
+pins stay where they are, and a build with no overrides -- a fork, or a base
+added before the mirror workflow ran -- goes to Docker Hub exactly as
+before. `hack/ci/test-mirror-args.sh` checks every override names a `FROM`
+that exists and redirects it to the same digest, because buildx accepts an
+override that matches nothing and silently ignores it.
 | `dependency-review.yml`, `dependabot-automerge.yml` | dependency hygiene |
 
 ## Container images on GHCR (one-time bootstrap)
