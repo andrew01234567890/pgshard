@@ -2,6 +2,7 @@ package dockertest
 
 import (
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"testing"
@@ -12,17 +13,43 @@ import (
 // containers.
 const ParallelEnv = "PGSHARD_TEST_PG_PARALLEL"
 
-// pgSlots bounds how many PostgreSQL-backed tests run at once. Admission is
-// per test, not per container: a fixture takes several containers one at a
-// time, so a per-container limit deadlocks as soon as every slot is held by a
-// test still waiting for its next container.
-//
-// The bound is per PROCESS, and `go test ./...` runs up to -p packages
-// concurrently, so the containers actually in flight are this limit times the
-// number of container-heavy packages running together. The Makefile sets -p
-// alongside this so the product stays bounded; raising either without the
-// other will swamp a runner.
+// pgSlots bounds how many PostgreSQL-backed tests run at once IN THIS
+// PROCESS. Admission is per test, not per container: a fixture takes
+// several containers one at a time, so a per-container limit deadlocks as
+// soon as every slot is held by a test still waiting for its next one.
 var pgSlots = make(chan struct{}, Limit)
+
+// GlobalEnv overrides how many PostgreSQL-backed tests run at once across
+// every test binary; GlobalLimit is the value.
+const GlobalEnv = "PGSHARD_TEST_PG_GLOBAL"
+
+// GlobalLimit bounds the containers in flight across processes.
+//
+// `go test ./...` runs up to -p packages at once, each its own binary with
+// its own copy of pgSlots, so the containers actually reaching the daemon
+// were this package's limit times the number of container-heavy packages
+// running together. That product is what a runner cannot take, and it was
+// held only by the Makefile setting -p to match -- a convention, and one
+// that anybody running `go test ./pkg/a ./pkg/b` by hand steps straight
+// past. The failure is not subtle and it is not honest either: containers
+// that never become ready, in whichever suite was unlucky.
+var GlobalLimit = func() int {
+	if v, err := strconv.Atoi(os.Getenv(GlobalEnv)); err == nil && v > 0 {
+		return v
+	}
+	return Limit
+}()
+
+// slotDir holds the lock files. Under the user's cache rather than a
+// fixed path so two users on one machine do not share a bound, and so a
+// machine that clears its cache clears nothing that matters.
+var slotDir = func() string {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		base = os.TempDir()
+	}
+	return filepath.Join(base, "pgshard-test-pg-slots", strconv.Itoa(GlobalLimit))
+}()
 
 // Limit is the per-package cap derived from GOMAXPROCS, or ParallelEnv.
 var Limit = func() int {
@@ -50,4 +77,13 @@ func Parallel(t *testing.T) {
 	t.Parallel()
 	pgSlots <- struct{}{}
 	t.Cleanup(func() { <-pgSlots })
+	release, err := acquireSlot(slotDir, GlobalLimit)
+	if err != nil {
+		// The cross-process bound is an optimisation on top of a bound
+		// that already holds, so a machine that cannot provide it runs the
+		// tests rather than failing them.
+		t.Logf("cross-process test slots unavailable, continuing with the per-process bound only: %v", err)
+		return
+	}
+	t.Cleanup(release)
 }
