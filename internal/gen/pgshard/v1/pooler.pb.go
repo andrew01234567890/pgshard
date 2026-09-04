@@ -2908,7 +2908,13 @@ type HealthStatus struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Role  HealthStatus_Role      `protobuf:"varint,1,opt,name=role,proto3,enum=pgshard.v1.HealthStatus_Role" json:"role,omitempty"`
 	// Bytes of WAL received but not yet replayed; zero on a primary.
-	ReplayLagBytes uint64 `protobuf:"varint,2,opt,name=replay_lag_bytes,json=replayLagBytes,proto3" json:"replay_lag_bytes,omitempty"`
+	//
+	// Optional because a pooler that cannot measure lag must be able to say
+	// so. Zero is a legitimate answer here -- it is what a caught-up standby
+	// and every primary report -- so a pooler with no measurement that sent 0
+	// would be indistinguishable from one that had measured, and a consumer
+	// gating on lag would conclude there is none. Absent means unknown.
+	ReplayLagBytes *uint64 `protobuf:"varint,2,opt,name=replay_lag_bytes,json=replayLagBytes,proto3,oneof" json:"replay_lag_bytes,omitempty"`
 	// Primary epoch the instance serves under.
 	Epoch uint64 `protobuf:"varint,3,opt,name=epoch,proto3" json:"epoch,omitempty"`
 	// Shard map generation the pooler is configured with.
@@ -2957,8 +2963,8 @@ func (x *HealthStatus) GetRole() HealthStatus_Role {
 }
 
 func (x *HealthStatus) GetReplayLagBytes() uint64 {
-	if x != nil {
-		return x.ReplayLagBytes
+	if x != nil && x.ReplayLagBytes != nil {
+		return *x.ReplayLagBytes
 	}
 	return 0
 }
@@ -5483,10 +5489,10 @@ const file_pgshard_v1_pooler_proto_rawDesc = "" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\"\x1e\n" +
 	"\x0fReleaseResponseJ\x04\b\x01\x10\x02R\x05error\"\x0f\n" +
-	"\rHealthRequest\"\xfd\x01\n" +
+	"\rHealthRequest\"\x97\x02\n" +
 	"\fHealthStatus\x121\n" +
-	"\x04role\x18\x01 \x01(\x0e2\x1d.pgshard.v1.HealthStatus.RoleR\x04role\x12(\n" +
-	"\x10replay_lag_bytes\x18\x02 \x01(\x04R\x0ereplayLagBytes\x12\x14\n" +
+	"\x04role\x18\x01 \x01(\x0e2\x1d.pgshard.v1.HealthStatus.RoleR\x04role\x12-\n" +
+	"\x10replay_lag_bytes\x18\x02 \x01(\x04H\x00R\x0ereplayLagBytes\x88\x01\x01\x12\x14\n" +
 	"\x05epoch\x18\x03 \x01(\x04R\x05epoch\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x04 \x01(\x04R\n" +
@@ -5495,7 +5501,8 @@ const file_pgshard_v1_pooler_proto_rawDesc = "" +
 	"\x04Role\x12\x14\n" +
 	"\x10ROLE_UNSPECIFIED\x10\x00\x12\x10\n" +
 	"\fROLE_PRIMARY\x10\x01\x12\x10\n" +
-	"\fROLE_STANDBY\x10\x02\"\xb5\x02\n" +
+	"\fROLE_STANDBY\x10\x02B\x13\n" +
+	"\x11_replay_lag_bytes\"\xb5\x02\n" +
 	"\rStreamRequest\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\tR\x04slot\x12 \n" +
 	"\vpublication\x18\x02 \x01(\tR\vpublication\x12\x1b\n" +
@@ -5936,6 +5943,7 @@ func file_pgshard_v1_pooler_proto_init() {
 		(*ExecuteResponse_FlushComplete)(nil),
 		(*ExecuteResponse_DataRows)(nil),
 	}
+	file_pgshard_v1_pooler_proto_msgTypes[41].OneofWrappers = []any{}
 	file_pgshard_v1_pooler_proto_msgTypes[46].OneofWrappers = []any{
 		(*CopyTablesResponse_Snapshot_)(nil),
 		(*CopyTablesResponse_TableBegin_)(nil),
