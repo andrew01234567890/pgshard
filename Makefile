@@ -77,6 +77,7 @@ actionlint:
 	hack/check-actions.sh
 	hack/test-check-actions.sh
 	hack/ci/test-retry.sh
+	hack/ci/test-base-images.sh
 	hack/tools/test-install-retry.sh
 	hack/e2e/test-suites.sh
 

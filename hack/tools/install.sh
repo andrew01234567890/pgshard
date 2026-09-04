@@ -27,6 +27,7 @@ install_one() {
     protoc-gen-go-grpc) go_install "google.golang.org/grpc/cmd/protoc-gen-go-grpc@${PROTOC_GEN_GO_GRPC_VERSION}" ;;
     govulncheck)   go_install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" ;;
     actionlint)    go_install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}" ;;
+    crane)         go_install "github.com/google/go-containerregistry/cmd/crane@${CRANE_VERSION}" ;;
     *) echo "install.sh: unknown tool $1" >&2; return 1 ;;
   esac
   echo "installed $1"
@@ -34,7 +35,7 @@ install_one() {
 
 tools=("$@")
 if [ "${#tools[@]}" -eq 0 ]; then
-  tools=(golangci-lint buf protoc-gen-go protoc-gen-go-grpc govulncheck actionlint)
+  tools=(golangci-lint buf protoc-gen-go protoc-gen-go-grpc govulncheck actionlint crane)
 fi
 for t in "${tools[@]}"; do install_one "$t"; done
 
