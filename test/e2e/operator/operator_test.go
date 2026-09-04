@@ -1023,19 +1023,47 @@ reclaimPolicy: Delete
 		}
 	})
 
-	// Last, because it leaves the shard group with two members: lowering a
-	// replica count is the one operation here that does not end where it
-	// started.
-	t.Run("LoweringReplicasRetiresAMemberWithoutLosingCommits", func(t *testing.T) {
+	// Last, because it is the one operation here that does not end where it
+	// started. It also has to go up before it can come down:
+	// replicasPerShard has an HA floor of 3, so a lowering has to start
+	// from a group that is above it.
+	t.Run("LoweringReplicasRetiresMembersWithoutLosingCommits", func(t *testing.T) {
+		shardPods := func() int {
+			return count(ctx, t, c, "pods", "pgshard.io/cluster="+clusterName+",pgshard.io/group=shard-0")
+		}
+		patchCluster(`{"spec":{"replicasPerShard":5}}`)
+		waitForWhy(ctx, t, "two more shard members to join", 15*time.Minute, func() string {
+			return fmt.Sprintf("shard pods=%d rolloutIdle=%v", shardPods(), rolloutIdle())
+		}, func() bool {
+			if shardPods() != 5 {
+				return false
+			}
+			out, err := psql(ctx, c, rw, "SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming'")
+			return err == nil && out == "4" && rolloutIdle()
+		})
+
 		oldPrimary := primaryOf()
-		retired := clusterName + "-shard-0-2"
+		retired := []string{clusterName + "-shard-0-4", clusterName + "-shard-0-3"}
 		w := startWriter(ctx, c, rw, lastID)
 
 		// synchronous_standby_names must never list a member that is gone.
 		// Sampled throughout rather than checked at the end: the hazard is
 		// a window in which the primary waits for acknowledgements from a
 		// standby that has been deleted, and a window closes.
+		//
+		// The pod count is sampled for the same reason. Retiring two at
+		// once is what leaves a group without a promotable standby, and it
+		// is invisible afterwards -- 5 and 3 look the same whether the
+		// members left one at a time or together.
+		//
+		// The count going 5 -> 4 -> 3 is one at a time; never dropping
+		// below 3 is the property, because a step that took both would
+		// show 3 with one of them still terminating and then 2. Seeing 4
+		// is the positive evidence and is logged rather than asserted: at
+		// two-second sampling a fast pair of steps could miss it, and a
+		// flaky assertion about sampling is worse than none.
 		var badSync []string
+		minPods, sawFour := 5, false
 		stop, sampled := make(chan struct{}), make(chan struct{})
 		go func() {
 			defer close(sampled)
@@ -1045,31 +1073,39 @@ reclaimPolicy: Delete
 					return
 				case <-time.After(2 * time.Second):
 				}
+				switch n := shardPods(); {
+				case n < minPods:
+					minPods = n
+				case n == 4:
+					sawFour = true
+				}
 				names, err := psql(ctx, c, rw, "SHOW synchronous_standby_names")
-				if err != nil || !strings.Contains(names, retired) {
+				if err != nil {
 					continue
 				}
-				out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pod", retired, "-o", "jsonpath={.metadata.name}")
-				if err != nil || strings.TrimSpace(out) == "" {
-					badSync = append(badSync, names)
+				for _, name := range retired {
+					if !strings.Contains(names, name) {
+						continue
+					}
+					out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pod", name, "-o", "jsonpath={.metadata.name}")
+					if err != nil || strings.TrimSpace(out) == "" {
+						badSync = append(badSync, name+" in "+names)
+					}
 				}
 			}
 		}()
 
 		started := time.Now()
-		patchCluster(`{"spec":{"replicasPerShard":2}}`)
-		waitForWhy(ctx, t, "the third shard member to be retired", 15*time.Minute, func() string {
-			return fmt.Sprintf("shard pods=%d rolloutIdle=%v",
-				count(ctx, t, c, "pods", "pgshard.io/cluster="+clusterName+",pgshard.io/group=shard-0"), rolloutIdle())
-		}, func() bool {
-			return count(ctx, t, c, "pods", "pgshard.io/cluster="+clusterName+",pgshard.io/group=shard-0") == 2 && rolloutIdle()
-		})
+		patchCluster(`{"spec":{"replicasPerShard":3}}`)
+		waitForWhy(ctx, t, "the two extra shard members to be retired", 20*time.Minute, func() string {
+			return fmt.Sprintf("shard pods=%d rolloutIdle=%v", shardPods(), rolloutIdle())
+		}, func() bool { return shardPods() == 3 && rolloutIdle() })
 		close(stop)
 		<-sampled
 
 		acked, failures, pause := w.finish()
-		t.Logf("retiring a member took %s; writer: %d acknowledged, %d failed, unavailability window %s",
-			time.Since(started).Round(time.Second), len(acked), failures, pause)
+		t.Logf("retiring two members took %s; writer: %d acknowledged, %d failed, unavailability window %s; fewest pods seen %d, saw the intermediate 4: %v",
+			time.Since(started).Round(time.Second), len(acked), failures, pause, minPods, sawFour)
 		if len(acked) > 0 {
 			lastID = acked[len(acked)-1]
 		}
@@ -1086,35 +1122,37 @@ reclaimPolicy: Delete
 			t.Errorf("synchronous_standby_names listed a member that was gone: %q", badSync[0])
 		}
 		if primaryOf() != oldPrimary {
-			t.Errorf("retiring a standby must not move the primary: %s -> %s", oldPrimary, primaryOf())
+			t.Errorf("retiring standbys must not move the primary: %s -> %s", oldPrimary, primaryOf())
+		}
+		if minPods < 3 {
+			t.Errorf("the group dropped to %d members: retirements must take one member at a time", minPods)
 		}
 
-		// Nothing of the member survives except its claim, which is
+		// Nothing of a retired member survives except its claim, which is
 		// retained on purpose: it is the only copy of whatever had not
 		// replicated when it left.
-		// The exact name, not a pattern: "_" is a LIKE wildcard, so a
-		// pattern here would match slots this test is not about and could
-		// pass while the slot it cares about survived.
-		slot := "pgshard_" + strings.NewReplacer("-", "_", ".", "_").Replace(retired)
-		slots, err := psql(ctx, c, rw,
-			"SELECT count(*) FROM pg_replication_slots WHERE slot_name = '"+slot+"'")
-		if err != nil || slots != "0" {
-			t.Errorf("the retired member's slot %s must be dropped, got %q %v", slot, slots, err)
+		for _, name := range retired {
+			// The exact slot name, not a pattern: "_" is a LIKE wildcard,
+			// so a pattern would match slots this test is not about and
+			// could pass while the slot it cares about survived.
+			slot := "pgshard_" + strings.NewReplacer("-", "_", ".", "_").Replace(name)
+			if n, err := psql(ctx, c, rw, "SELECT count(*) FROM pg_replication_slots WHERE slot_name = '"+slot+"'"); err != nil || n != "0" {
+				t.Errorf("the retired member's slot %s must be dropped, got %q %v", slot, n, err)
+			}
+			if n := count(ctx, t, c, "pvc", "pgshard.io/cluster="+clusterName+",pgshard.io/member="+name); n != 1 {
+				t.Errorf("the claim of retired %s is kept by default, got %d", name, n)
+			}
 		}
-		// And the assertion is not vacuous: the surviving standby still has
-		// one, so a query that finds nothing whatever the state would fail
-		// here too.
+		// And the assertion above is not vacuous: a surviving standby still
+		// has its slot, so a query that finds nothing whatever the state
+		// would fail here too.
 		kept := "pgshard_" + strings.NewReplacer("-", "_", ".", "_").Replace(clusterName+"-shard-0-1")
-		if n, err := psql(ctx, c, rw,
-			"SELECT count(*) FROM pg_replication_slots WHERE slot_name = '"+kept+"'"); err != nil || n != "1" {
-			t.Errorf("the remaining standby must still have its slot %s, got %q %v", kept, n, err)
+		if n, err := psql(ctx, c, rw, "SELECT count(*) FROM pg_replication_slots WHERE slot_name = '"+kept+"'"); err != nil || n != "1" {
+			t.Errorf("a surviving standby must still have its slot %s, got %q %v", kept, n, err)
 		}
-		if n := count(ctx, t, c, "pvc", "pgshard.io/cluster="+clusterName+",pgshard.io/member="+retired); n != 1 {
-			t.Errorf("the retired member's claim is kept by default, got %d", n)
-		}
-		waitFor(ctx, t, "the remaining standby to stream", 5*time.Minute, func() bool {
+		waitFor(ctx, t, "both remaining standbys to stream", 5*time.Minute, func() bool {
 			out, err := psql(ctx, c, rw, "SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming'")
-			return err == nil && out == "1"
+			return err == nil && out == "2"
 		})
 	})
 }
