@@ -127,6 +127,43 @@ func TestSnapshotWithPostgres(t *testing.T) {
 		mustExec(t, conn, `UPDATE pgshard.table_status SET shard_key_checked_generation = NULL, shard_key_error = NULL WHERE table_name = 'orders'`)
 	})
 
+	// The state this asserts is the one the reconciler writes: it makes a
+	// declared sharded table effective at its desired generation
+	// (controller/reconcile.go, the INSERT ... ON CONFLICT that sets
+	// effective_generation), while the verdict on the key column is
+	// published by the shard-key check on a later pass -- or never, when a
+	// shard is unreachable, which
+	// TestShardKeyCheckLeavesATableUncheckedWhenAShardIsUnreachable covers.
+	// So a sharded table routable-looking with no verdict is the ordinary
+	// path, not a corrupt row, and the snapshot has to say so.
+	t.Run("a sharded table with no verdict for the generation in force is unchecked", func(t *testing.T) {
+		s, err := Load(ctx, conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := s.Tables[TableKey{"app", "public", "orders"}]
+		if got.Placement != "sharded" || got.Generation != 7 {
+			t.Fatalf("the fixture no longer describes an effective sharded table: %+v", got)
+		}
+		if got.ShardKeyChecked {
+			t.Fatal("a table with shard_key_checked_generation NULL reported a checked key")
+		}
+		if got.ShardKeyError != "" || got.ShardKeyType != "" {
+			t.Fatalf("nothing was recorded, so there is nothing to report: %+v", got)
+		}
+		// And once the verdict lands for that generation it is checked,
+		// with no fault: this is a window, not a permanent state.
+		mustExec(t, conn, `UPDATE pgshard.table_status SET shard_key_checked_generation = 7, shard_key_type = 'bigint' WHERE table_name = 'orders'`)
+		s, err = Load(ctx, conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := s.Tables[TableKey{"app", "public", "orders"}]; !got.ShardKeyChecked || got.ShardKeyType != "bigint" {
+			t.Fatalf("verdict not picked up: %+v", got)
+		}
+		mustExec(t, conn, `UPDATE pgshard.table_status SET shard_key_checked_generation = NULL, shard_key_type = NULL WHERE table_name = 'orders'`)
+	})
+
 	t.Run("load", func(t *testing.T) {
 		s, err := Load(ctx, conn)
 		if err != nil {

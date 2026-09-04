@@ -27,22 +27,22 @@ func TestShardKeyCheckFaultsAKeyTheRouterAndTheCopyWouldDisagreeOn(t *testing.T)
 		mustExec(t, f.app(int32(id)), `CREATE TABLE jsonkey (tenant_id jsonb NOT NULL, id bigint)`)
 	}
 	for _, name := range []string{"padded", "plain", "jsonkey", "notyetcreated"} {
-		mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key)
-			VALUES ('app', 'public', $1, 'sharded', 'tenant_id')`, name)
+		declareSharded(t, f, name)
 	}
 
 	published, err := check.Pass(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if published != 4 {
-		t.Fatalf("published = %d, want every sharded table checked", published)
+	// Three, not four: "notyetcreated" is declared and no shard has it, so
+	// no verdict is published for it and a later pass asks again. See
+	// TestShardKeyCheckDoesNotVerifyATableNoShardHasYet for why marking it
+	// checked would be worse than saying nothing.
+	if published != 3 {
+		t.Fatalf("published = %d, want every sharded table that exists checked", published)
 	}
 	for _, c := range []struct{ table, want string }{
 		{"plain", ""},
-		// Declared before the table exists: nothing to fault, and the
-		// CREATE TABLE that follows goes through pgshard, which checks it.
-		{"notyetcreated", ""},
 		// A blank-padded key routes now: the router trims by the column's
 		// declared type and the row filter hashes through ::text, so both
 		// hash the value with its padding gone.
@@ -66,7 +66,15 @@ func TestShardKeyCheckFaultsAKeyTheRouterAndTheCopyWouldDisagreeOn(t *testing.T)
 
 	// Point the faulted table at a key that works: the next pass must
 	// clear the fault rather than leave the table refused for ever.
+	//
+	// Both rows move, because the reconciler is what carries a desired key
+	// into effect and this test has none. The check follows the effective
+	// key at the effective generation -- a desired-side edit alone is a key
+	// nothing routes by yet, and re-checking against it would publish a
+	// verdict about a column the table is not sharded on.
 	mustExec(t, f.catalog, `UPDATE pgshard.tables SET shard_key = 'id' WHERE table_name = 'jsonkey'`)
+	mustExec(t, f.catalog, `UPDATE pgshard.table_status SET effective_shard_key = 'id',
+		effective_generation = effective_generation + 1 WHERE table_name = 'jsonkey'`)
 	if _, err := check.Pass(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -83,8 +91,7 @@ func TestShardKeyCheckSeesADriftedShard(t *testing.T) {
 	check := &ShardKeyCheck{Pool: f.pool, Shards: f.placer.Shards, Logger: slog.New(slog.DiscardHandler)}
 	mustExec(t, f.app(0), `CREATE TABLE drifted (tenant_id text NOT NULL, id bigint)`)
 	mustExec(t, f.app(1), `CREATE TABLE drifted (tenant_id character(8) NOT NULL, id bigint)`)
-	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key)
-		VALUES ('app', 'public', 'drifted', 'sharded', 'tenant_id')`)
+	declareSharded(t, f, "drifted")
 	if _, err := check.Pass(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -105,8 +112,7 @@ func TestShardKeyCheckLeavesATableUncheckedWhenAShardIsUnreachable(t *testing.T)
 	f := newPlacementFixture(t)
 	check := &ShardKeyCheck{Pool: f.pool, Logger: slog.New(slog.DiscardHandler)}
 	mustExec(t, f.app(0), `CREATE TABLE lonely (tenant_id character(8) NOT NULL, id bigint)`)
-	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key)
-		VALUES ('app', 'public', 'lonely', 'sharded', 'tenant_id')`)
+	declareSharded(t, f, "lonely")
 	check.Shards = &PgxShardDialer{Pool: f.pool, DSNs: map[ShardRef]string{
 		{Set: "default", ID: 0}: "postgres://pgshard@127.0.0.1:1/postgres?connect_timeout=1",
 		{Set: "default", ID: 1}: f.dsns[ShardRef{Set: "default", ID: 1}],
@@ -125,6 +131,64 @@ func TestShardKeyCheckLeavesATableUncheckedWhenAShardIsUnreachable(t *testing.T)
 	if checked != nil {
 		t.Fatalf("shard_key_checked_generation = %d, want NULL while a shard was never asked", *checked)
 	}
+}
+
+// A declared placement whose table no shard has yet must stay unchecked.
+// Publishing "checked, no type" would mark it verified for as long as the
+// generation stood, and the router would then hash the client's value
+// unnormalised once the table appeared with a blank-padded character(n)
+// key -- permanently, not for a window. The CREATE TABLE path used to
+// refuse such a key outright, which #606 removed.
+func TestShardKeyCheckDoesNotVerifyATableNoShardHasYet(t *testing.T) {
+	ctx := context.Background()
+	f := newPlacementFixture(t)
+	check := &ShardKeyCheck{Pool: f.pool, Shards: f.placer.Shards, Logger: slog.New(slog.DiscardHandler)}
+	declareSharded(t, f, "declared_first")
+
+	published, err := check.Pass(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if published != 0 {
+		t.Fatalf("published = %d, want no verdict for a table that does not exist", published)
+	}
+	var checked *int64
+	if err := f.catalog.QueryRow(ctx, `SELECT shard_key_checked_generation FROM pgshard.table_status WHERE table_name = 'declared_first'`).Scan(&checked); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatal(err)
+	}
+	if checked != nil {
+		t.Fatalf("shard_key_checked_generation = %d, want NULL for a table no shard has", *checked)
+	}
+
+	// Once it exists the next pass records what it found, so this is a
+	// wait, not a refusal to ever check.
+	for shard := int32(0); shard < 2; shard++ {
+		mustExec(t, f.app(shard), `CREATE TABLE declared_first (tenant_id bigint NOT NULL, id bigint)`)
+	}
+	if published, err = check.Pass(ctx); err != nil || published != 1 {
+		t.Fatalf("second pass published %d: %v", published, err)
+	}
+	var typ *string
+	if err := f.catalog.QueryRow(ctx, `SELECT shard_key_type FROM pgshard.table_status WHERE table_name = 'declared_first'`).Scan(&typ); err != nil {
+		t.Fatal(err)
+	}
+	if typ == nil || *typ != "bigint" {
+		t.Fatalf("shard_key_type = %v, want bigint", typ)
+	}
+}
+
+// declareSharded records a sharded table the way the reconciler does: the
+// desired row, and the status row that makes it effective. ShardKeyCheck
+// works from the status table against effective_generation, because that is
+// the pair the router compares -- a verdict recorded against anything else
+// is one the router will not accept, and a desired row on its own is a
+// table nothing routes yet.
+func declareSharded(t *testing.T, f *placementFixture, name string) {
+	t.Helper()
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key)
+		VALUES ('app', 'public', $1, 'sharded', 'tenant_id')`, name)
+	mustExec(t, f.catalog, `INSERT INTO pgshard.table_status (database, schema_name, table_name, effective_placement, effective_shard_key)
+		VALUES ('app', 'public', $1, 'sharded', 'tenant_id')`, name)
 }
 
 func keyErrorOf(t *testing.T, conn *pgx.Conn, table string) string {
@@ -166,8 +230,7 @@ func TestShardKeyCheckRecordsTheColumnType(t *testing.T) {
 		mustExec(t, f.app(int32(id)), `CREATE TABLE freetext (tenant_id text NOT NULL, id bigint)`)
 	}
 	for _, name := range []string{"codes", "freetext", "notyetcreated"} {
-		mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key)
-			VALUES ('app', 'public', $1, 'sharded', 'tenant_id')`, name)
+		declareSharded(t, f, name)
 	}
 	if _, err := check.Pass(ctx); err != nil {
 		t.Fatal(err)
@@ -197,8 +260,7 @@ func TestShardKeyCheckFaultsShardsThatDisagreeOnLength(t *testing.T) {
 	check := &ShardKeyCheck{Pool: f.pool, Shards: f.placer.Shards, Logger: slog.New(slog.DiscardHandler)}
 	mustExec(t, f.app(0), `CREATE TABLE widened (tenant_id character varying(8) NOT NULL, id bigint)`)
 	mustExec(t, f.app(1), `CREATE TABLE widened (tenant_id character varying(16) NOT NULL, id bigint)`)
-	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key)
-		VALUES ('app', 'public', 'widened', 'sharded', 'tenant_id')`)
+	declareSharded(t, f, "widened")
 	if _, err := check.Pass(ctx); err != nil {
 		t.Fatal(err)
 	}

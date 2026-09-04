@@ -73,11 +73,19 @@ type Placement struct {
 	// ReferenceHazards is what that inspection found: everything a shard
 	// would evaluate for itself, and so differently on every shard.
 	ReferenceHazards []string
+	// ShardKeyChecked reports that the controller has recorded a verdict on
+	// this table's shard key for the generation in force. False means the
+	// inspection has not run, which is not the same as it finding nothing:
+	// until it has, the key's type is unknown, and a type this router does
+	// not know is one it cannot normalise the client's value to. Routing a
+	// blank-padded character(n) key unnormalised sends the write to one
+	// shard and every later lookup of it to another.
+	ShardKeyChecked bool
 	// ShardKeyError says why this table's shard key cannot be routed by,
 	// when the controller's inspection of the column on the shards found a
 	// type whose equality does not match its hash. Empty when the key is
-	// fine, and also when the inspection has not run: an unchecked table
-	// is one nothing has found fault with.
+	// fine, and also when the inspection has not run -- ShardKeyChecked is
+	// what distinguishes those.
 	ShardKeyError string
 	// ShardKeyType is the key column's type as the shards declare it,
 	// typmod included, from the same inspection that sets ShardKeyError.
@@ -254,6 +262,14 @@ func (s *Snapshot) fingerprint() uint64 {
 		flag(t.Migrating)
 		flag(t.ReferenceChecked)
 		strs(t.ReferenceHazards)
+		// The planner reads all three: it refuses an unchecked or faulted
+		// key and normalises the client's value by the recorded type. They
+		// change without the generation moving, because the check publishes
+		// its verdict on its own pass -- so a plan cached across that
+		// publication is a plan made under the wrong rule.
+		flag(t.ShardKeyChecked)
+		str(t.ShardKeyError)
+		str(t.ShardKeyType)
 	}
 	for _, name := range slices.Sorted(maps.Keys(s.Sequences)) {
 		str(name)

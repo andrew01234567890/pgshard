@@ -168,8 +168,9 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 			Resolver: resolver, Logger: logger, DrainTimeout: *barrierDrain, ArchiveTimeout: *barrierArchive}
 		roles := &controller.RoleVerifier{Store: &controller.PGRoleStore{Pool: pool}, Shards: dialer, Catalog: controller.CatalogDialer(pool), Logger: logger}
 		go roles.Run(ctx, *verifyRolesEvery, leader.Load)
+		keyCheck := &controller.ShardKeyCheck{Pool: pool, Shards: dialer, Logger: logger}
 		applier := &controller.Applier{Store: &controller.PGMigrationStore{Pool: pool}, Logger: logger, Shards: dialer, DDLRole: *ddlRole,
-			Catalog: controller.CatalogDialer(pool), Roles: roles}
+			Catalog: controller.CatalogDialer(pool), Roles: roles, KeyCheck: keyCheck}
 		go applier.Run(ctx, *applyEvery, leader.Load)
 		go (&controller.StreamMonitor{Pool: pool, Logger: logger, Shards: dialer}).Run(ctx, *resolveEvery, leader.Load)
 		// A barrier whose controller died leaves the cluster fenced and its
@@ -204,7 +205,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 			SlotFailoverDisabled: !*slotFailover}
 		go placer.Run(ctx, *placementEvery, leader.Load)
 		go (&controller.ReferenceCheck{Pool: pool, Shards: dialer, Logger: logger}).Run(ctx, *refCheckEvery, leader.Load)
-		go (&controller.ShardKeyCheck{Pool: pool, Shards: dialer, Logger: logger}).Run(ctx, *keyCheckEvery, leader.Load)
+		go keyCheck.Run(ctx, *keyCheckEvery, leader.Load)
 		go (&controller.DurabilityCheck{Pool: pool, Shards: dialer, Logger: logger}).Run(ctx, *durabilityCheckEvery, leader.Load)
 	}
 

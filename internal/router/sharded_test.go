@@ -64,15 +64,15 @@ func newShardedHarnessShards(t testing.TB, cfg Config, shards int) *shardedHarne
 		snap.Serving[snapshot.ShardKey{ShardSet: DefaultShardSet, ShardID: int32(i)}] = snapshot.Serving{Epoch: 2, PrimaryEndpoint: addr, State: "serving"}
 	}
 	tbl := func(name, placement, key string) {
-		snap.Tables[snapshot.TableKey{Database: "app", SchemaName: "public", TableName: name}] = snapshot.Placement{Placement: placement, ShardKey: key, ReferenceChecked: placement == "reference"}
+		snap.Tables[snapshot.TableKey{Database: "app", SchemaName: "public", TableName: name}] = snapshot.Placement{Placement: placement, ShardKey: key, ReferenceChecked: placement == "reference", ShardKeyChecked: placement == "sharded"}
 	}
 	tbl("items", "unsharded", "")
 	tbl("regions", "reference", "")
 	tbl("orders", "sharded", "tenant_id")
 	tbl("docs", "sharded", "slug")
-	snap.Tables[snapshot.TableKey{Database: "app", SchemaName: "audit", TableName: "events"}] = snapshot.Placement{Placement: "sharded", ShardKey: "tenant_id"}
-	snap.Tables[snapshot.TableKey{Database: "app", SchemaName: "public", TableName: "tickets"}] = snapshot.Placement{Placement: "sharded", ShardKey: "tenant_id", SequenceColumns: []string{"id"}}
-	snap.Tables[snapshot.TableKey{Database: "app", SchemaName: "public", TableName: "eventlog"}] = snapshot.Placement{Placement: "sharded", ShardKey: "event_id", SequenceColumns: []string{"event_id"}}
+	snap.Tables[snapshot.TableKey{Database: "app", SchemaName: "audit", TableName: "events"}] = snapshot.Placement{Placement: "sharded", ShardKey: "tenant_id", ShardKeyChecked: true}
+	snap.Tables[snapshot.TableKey{Database: "app", SchemaName: "public", TableName: "tickets"}] = snapshot.Placement{Placement: "sharded", ShardKey: "tenant_id", ShardKeyChecked: true, SequenceColumns: []string{"id"}}
+	snap.Tables[snapshot.TableKey{Database: "app", SchemaName: "public", TableName: "eventlog"}] = snapshot.Placement{Placement: "sharded", ShardKey: "event_id", ShardKeyChecked: true, SequenceColumns: []string{"event_id"}}
 	snap.Sequences = map[string]bool{"invoice_numbers": true}
 	h := &harness{subs: map[chan snapshot.Change]struct{}{}}
 	h.snapp.Store(snap)

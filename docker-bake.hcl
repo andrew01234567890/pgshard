@@ -15,6 +15,12 @@ variable "CI" { default = "" }
 variable "VERSION" { default = "" }
 variable "BUILD_DATE" { default = "" }
 
+// RELEASE_TAG is the version tag a release is cut from, "v1.2.3". Set, it
+// adds an immutable tag to every image so a consumer has something to pin
+// that a later build cannot move; empty, nothing changes and the moving
+// tags are all a branch push produces.
+variable "RELEASE_TAG" { default = "" }
+
 group "default" { targets = ["postgres"] }
 group "postgres" { targets = ["postgres-18", "postgres-19"] }
 
@@ -32,6 +38,7 @@ function "controlTags" {
   result = concat(
     ["${REGISTRY}/pgshard-${name}:latest"],
     GIT_SHA != "" ? ["${REGISTRY}/pgshard-${name}:${GIT_SHA}"] : [],
+    RELEASE_TAG != "" ? ["${REGISTRY}/pgshard-${name}:${RELEASE_TAG}"] : [],
   )
 }
 
@@ -40,6 +47,7 @@ function "tags" {
   result = concat(
     ["${REGISTRY}/pgshard-postgres:${major}", "${REGISTRY}/pgshard-postgres:${version}"],
     GIT_SHA != "" ? ["${REGISTRY}/pgshard-postgres:${major}-${GIT_SHA}"] : [],
+    RELEASE_TAG != "" ? ["${REGISTRY}/pgshard-postgres:${major}-${RELEASE_TAG}"] : [],
   )
 }
 

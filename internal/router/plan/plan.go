@@ -202,6 +202,11 @@ type keyTerm struct {
 	// keyType is the shard key column's declared type on the shards, empty
 	// when the controller has not recorded one for the generation in force.
 	keyType string
+	// keyChecked reports that the controller has recorded a verdict on the
+	// key column for the generation in force. When it has not, the type is
+	// unknown and normaliseKey cannot do its job -- see the refusal in
+	// shardsFor, which is narrow because normaliseKey is.
+	keyChecked bool
 }
 
 // Resolve completes a deferred plan with parameter values. It is also safe
@@ -243,6 +248,21 @@ func (p *Plan) finish(values [][]any) error {
 		// again, on every Bind of a prepared statement.
 		termShards := make([]int32, 0, len(vals))
 		for _, v := range vals {
+			// normaliseKey only ever changes a string: character(n) is
+			// trimmed and an over-length character varying(n) truncated,
+			// because that is what the shard stored. Every other value
+			// hashes as it came. So an unrecorded type is only a hazard
+			// for a string key, and only that is refused -- routing an
+			// integer key while the verdict is outstanding cannot send the
+			// write to one shard and the lookup to another.
+			if !p.terms[i].keyChecked {
+				if _, isString := v.(string); isString {
+					err := pgwire.Errorf(pgwire.CodeFeatureNotSupported,
+						"the shard key of this table has not been checked for the generation now in force, so a text key cannot be routed yet")
+					err.Hint = "retry: the controller records the key column's type shortly after the table becomes effective"
+					return err
+				}
+			}
 			v = normaliseKey(v, p.terms[i].keyType)
 			id, err := placement.KeyspaceID(v)
 			if err != nil {

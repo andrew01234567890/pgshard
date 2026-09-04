@@ -15,6 +15,17 @@ runs the checker against the fixtures under `hack/testdata`.
 | `repeat.yml` | manual: repeats one Go package or the integration suite up to 50 times, against an optional `ref`, and reports the pass rate |
 | `repeat-e2e.yml` | manual: repeats one kind e2e suite up to 12 times, against an optional `ref`, and reports the pass rate |
 | `chaos.yml` | Chaos Mesh experiments (`test/chaos`) |
+| `release.yml` | on a `v*` tag: verifies the commit, builds every image from it, publishes them with an immutable version tag, and signs a build provenance attestation for each |
+| `mirror-base-images.yml` | copies the pinned Docker Hub base images into GHCR so a build does not depend on an anonymous pull |
+
+The e2e builds take their bases from that mirror. `hack/ci/mirror-args.sh`
+emits a `--build-context` override per image, which redirects a `FROM` to the
+mirrored copy of the **same digest** without touching any Dockerfile: the
+pins stay where they are, and a build with no overrides -- a fork, or a base
+added before the mirror workflow ran -- goes to Docker Hub exactly as
+before. `hack/ci/test-mirror-args.sh` checks every override names a `FROM`
+that exists and redirects it to the same digest, because buildx accepts an
+override that matches nothing and silently ignores it.
 | `dependency-review.yml`, `dependabot-automerge.yml` | dependency hygiene |
 
 ## Container images on GHCR (one-time bootstrap)
@@ -40,6 +51,43 @@ works anonymously. The catalog integration test then runs against the project
 images for both majors; set `PGSHARD_REQUIRE_PROJECT_IMAGES=1` (planned for
 `ci.yml` after the bootstrap) to fail instead of falling back to Docker Hub
 `postgres:*` tags when a project image is missing.
+
+## Cutting a release
+
+Branch pushes publish moving tags -- `:latest` and `:<sha>` -- and the deploy
+path uses `:latest`. A moving tag cannot tell a consumer that the image behind
+it was replaced, so a release is what pins one.
+
+Push a `v*` tag. `release.yml` then:
+
+1. runs `make verify` on that commit, so a tag pointing at a tree that does not
+   build publishes nothing. The e2e and chaos matrices are not repeated here --
+   they belong to the commit's own CI run, and rerunning them would put an hour
+   between a tag and its images;
+2. builds every image -- both PostgreSQL majors and all four control-plane
+   images -- from that one commit, and tags each with the version as well as
+   the moving tags;
+3. attaches an SBOM and maximum-mode provenance to each image;
+4. signs a build provenance attestation per image and pushes it to the
+   registry;
+5. records every immutable digest in the job summary and in the release notes.
+
+`workflow_dispatch` builds the same way and publishes nothing unless `dry_run`
+is turned off, so the path can be exercised without cutting a release.
+
+### Verifying an image against the source
+
+Every published image carries a signed attestation naming the commit it was
+built from:
+
+```
+gh attestation verify oci://ghcr.io/andrew01234567890/pgshard-operator@sha256:<digest> \
+    --repo andrew01234567890/pgshard
+```
+
+Use the digest, not the tag: verifying `:latest` verifies whatever it points at
+now, which is the property a release exists to remove. The digests are in the
+release notes.
 
 ## Measuring a flake
 
