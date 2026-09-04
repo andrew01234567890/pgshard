@@ -1,0 +1,226 @@
+name: Release
+
+# Publication today is driven by branch pushes: every image carries a moving
+# :latest that the deploy path uses, so a replaced tag is undetectable and
+# nothing connects a running binary to reviewed source. This workflow is the
+# other half -- one tag, one commit, every image built from it, each with a
+# digest a consumer can pin and an attestation they can verify.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and check without publishing anything.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify the commit being released
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install the pinned linters
+        run: |
+          set -euo pipefail
+          hack/tools/install.sh golangci-lint buf
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      # Not the whole matrix: e2e and chaos belong to the commit's own CI
+      # run, and repeating them here would put an hour between a tag and its
+      # images. This is the gate that a tag pointing at an unbuildable tree
+      # publishes nothing.
+      - run: make verify
+
+  images:
+    name: Build, publish and attest
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      # Provenance is signed with a workload identity, and the attestation
+      # is stored against the repository.
+      id-token: write
+      attestations: write
+    outputs:
+      digests: ${{ steps.digests.outputs.table }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Settle what is being released
+        id: what
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          EVENT: ${{ github.event_name }}
+          DRY: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "push" ]; then
+            tag="$REF_NAME"
+            dry=false
+          else
+            # A dispatched run has no version to claim, so it builds the
+            # same way and publishes nothing unless asked.
+            tag=""
+            dry="${DRY:-true}"
+          fi
+          {
+            echo "tag=$tag"
+            echo "dry=$dry"
+            echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+      - name: Build every image from this one commit
+        env:
+          RELEASE_TAG: ${{ steps.what.outputs.tag }}
+          VERSION: ${{ steps.what.outputs.tag }}
+          BUILD_DATE: ${{ steps.what.outputs.date }}
+          GIT_SHA: ${{ github.sha }}
+          CI: "true"
+          DRY: ${{ steps.what.outputs.dry }}
+        run: |
+          set -euo pipefail
+          out=type=registry
+          if [ "$DRY" = "true" ]; then out=type=cacheonly; fi
+          hack/ci/retry.sh -n 3 -d 15 -- docker buildx bake \
+            --file docker-bake.hcl \
+            --sbom=true --provenance=mode=max \
+            --set "*.output=$out" \
+            --metadata-file metadata.json \
+            postgres control
+      - name: Record the digests
+        id: digests
+        env:
+          DRY: ${{ steps.what.outputs.dry }}
+        run: |
+          set -euo pipefail
+          # An image with no digest is one that was not pushed; a dry run
+          # has none and says so rather than emitting an empty table that
+          # reads like a successful publish.
+          if [ "$DRY" = "true" ]; then
+            echo "dry run: nothing was published" >> "$GITHUB_STEP_SUMMARY"
+            echo "table=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          table=$(jq -r 'to_entries[] | select(.value["containerimage.digest"]) |
+            "| `\(.value["image.name"] | split(",")[0])` | `\(.value["containerimage.digest"])` |"' metadata.json | sort)
+          [ -n "$table" ] || { echo "::error::no image digests in metadata.json"; exit 1; }
+          {
+            echo "| image | digest |"
+            echo "| --- | --- |"
+            echo "$table"
+          } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "table<<EOF"
+            echo "| image | digest |"
+            echo "| --- | --- |"
+            echo "$table"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Keep the metadata for the attestation job
+        if: steps.what.outputs.dry != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-metadata
+          path: metadata.json
+          retention-days: 7
+      - name: Report what will be attested
+        env:
+          DRY: ${{ steps.what.outputs.dry }}
+        run: |
+          set -euo pipefail
+          if [ "$DRY" = "true" ]; then exit 0; fi
+          jq -r 'to_entries[] | select(.value["containerimage.digest"]) |
+            "\(.key) \(.value["image.name"] | split(",")[0] | split(":")[0]) \(.value["containerimage.digest"])"' metadata.json
+
+  attest:
+    name: Attest ${{ matrix.target }}
+    needs: images
+    if: needs.images.outputs.digests != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [postgres-18, postgres-19, operator, controller, admin, router]
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: image-metadata
+      # One subject per invocation is what the action takes, so the matrix
+      # is the loop. Reading the digest from the build's own metadata --
+      # rather than resolving the tag again -- is what ties the attestation
+      # to the image this run produced and not to whatever the tag points
+      # at by the time this job runs.
+      - name: Read this image's digest
+        id: image
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          name=$(jq -er --arg t "$TARGET" '.[$t]["image.name"] | split(",")[0] | split(":")[0]' metadata.json)
+          digest=$(jq -er --arg t "$TARGET" '.[$t]["containerimage.digest"]' metadata.json)
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+
+  release:
+    name: Record the digests on the release
+    needs: [images, attest]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Create or update the release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          DIGESTS: ${{ needs.images.outputs.digests }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Built from ${SHA}."
+            echo
+            echo "$DIGESTS"
+            echo
+            echo "Every image carries an SBOM and a signed build provenance attestation. Verify one with:"
+            echo
+            echo '```'
+            echo "gh attestation verify oci://<image>@<digest> --repo ${GITHUB_REPOSITORY}"
+            echo '```'
+          } > notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file notes.md
+          fi
