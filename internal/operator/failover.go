@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -71,6 +72,58 @@ type memberView struct {
 	Why string
 }
 
+// describeViews reports what chooseCandidate actually saw, member by
+// member, so a refusal carries the state rather than only the branch it
+// took.
+//
+// The refusals name a conclusion -- "unreachable synchronous standbys may
+// hold acknowledged commits" -- which in the case that prompted this was
+// true of one member out of three and said nothing about the other two:
+// one absent from the group entirely, one reachable but not streaming. A
+// reader could only recover that by finding the views field in the
+// operator's log, which is the thing the message exists to save them.
+//
+// A member that could not be probed carries the probe's error here. That
+// is the distinction the message could not otherwise make: "probed and it
+// said no" and "could not probe" both arrive as Reachable=false, and only
+// one of them is a statement about the member.
+func describeViews(members []memberView, exclude string) string {
+	if len(members) == 0 {
+		return "no members"
+	}
+	parts := make([]string, 0, len(members))
+	for _, m := range members {
+		var b strings.Builder
+		b.WriteString(m.Name)
+		if m.Name == exclude {
+			b.WriteString(" (excluded)")
+		}
+		if !m.Listed {
+			b.WriteString(" unlisted")
+		}
+		switch {
+		case !m.Reachable && m.Why != "":
+			b.WriteString(" unreachable: " + m.Why)
+		case !m.Reachable:
+			b.WriteString(" unreachable, no reason recorded")
+		default:
+			if m.InRecovery {
+				b.WriteString(" in-recovery")
+			} else {
+				b.WriteString(" not-in-recovery")
+			}
+			if m.Streaming {
+				b.WriteString(" streaming")
+			} else {
+				b.WriteString(" not-streaming")
+			}
+			fmt.Fprintf(&b, " flush=%d", m.FlushLSN)
+		}
+		parts = append(parts, b.String())
+	}
+	return strings.Join(parts, "; ")
+}
+
 // readySlots asks a member how many logical slots would survive promoting
 // it. A member that cannot answer counts as none: the tie-break may then
 // pick differently, which is a worse-informed choice and never an unsafe
@@ -132,10 +185,10 @@ func chooseCandidate(members []memberView, exclude, preferred string, numSync in
 		eligible = append(eligible, m)
 	}
 	if len(eligible) == 0 {
-		return "", errNoCandidate
+		return "", fmt.Errorf("%w; saw %s", errNoCandidate, describeViews(members, exclude))
 	}
 	if reachableListed < listed && reachableListed+numSync <= listed {
-		return "", errQuorum
+		return "", fmt.Errorf("%w; saw %s", errQuorum, describeViews(members, exclude))
 	}
 	sort.Slice(eligible, func(i, j int) bool {
 		if eligible[i].FlushLSN != eligible[j].FlushLSN {
