@@ -19,6 +19,7 @@ import (
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/grpccreds"
 	"github.com/andrew01234567890/pgshard/internal/metrics"
+	"github.com/andrew01234567890/pgshard/internal/pki"
 )
 
 // Run bootstraps and supervises the instance until ctx ends or a fatal
@@ -200,8 +201,14 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	//
 	// Until it is configured the bearer token travels in clear, which is
 	// what PGS-235 and PGS-421 are about.
+	var authz []grpccreds.Option
+	if cfg.GRPCTLS.AuthorizeCallers {
+		if allow, ok := pki.AllowedCallers(pki.RoleAgent); ok {
+			authz = append(authz, grpccreds.Authorize(allow))
+		}
+	}
 	grpcCreds, err := grpccreds.Listener(cfg.GRPCTLS.CertFile, cfg.GRPCTLS.KeyFile, cfg.GRPCTLS.CAFile,
-		cfg.GRPCTLS.CertFile == "" && cfg.GRPCTLS.KeyFile == "" && cfg.GRPCTLS.CAFile == "")
+		cfg.GRPCTLS.CertFile == "" && cfg.GRPCTLS.KeyFile == "" && cfg.GRPCTLS.CAFile == "", authz...)
 	if err != nil {
 		return fmt.Errorf("agent gRPC credentials: %w", err)
 	}

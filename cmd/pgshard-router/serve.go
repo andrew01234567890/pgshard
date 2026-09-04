@@ -29,7 +29,9 @@ import (
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 	"github.com/andrew01234567890/pgshard/internal/cli"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
+	"github.com/andrew01234567890/pgshard/internal/grpccreds"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
+	"github.com/andrew01234567890/pgshard/internal/pki"
 	"github.com/andrew01234567890/pgshard/internal/pprofserve"
 	"github.com/andrew01234567890/pgshard/internal/router"
 	"github.com/andrew01234567890/pgshard/internal/router/cancelpeer"
@@ -81,6 +83,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	poolerCert := fs.String("pooler-tls-cert", "", "client certificate for pooler mTLS")
 	poolerKey := fs.String("pooler-tls-key", "", "client key for pooler mTLS")
 	poolerCA := fs.String("pooler-tls-ca", "", "CA bundle pooler server certificates must chain to")
+	authorizeCallers := fs.Bool("tls-authorize-callers", false, "refuse callers whose certificate does not carry a pgshard identity allowed to call this listener; needs certificates the operator issued")
 	insecureDev := fs.Bool("insecure-dev", false, "talk plaintext gRPC to poolers (development only)")
 	rolesTTL := fs.Duration("roles-ttl", 5*time.Second, "how long catalog role verifiers are cached")
 	snapshotWait := fs.Duration("snapshot-wait", 30*time.Second, "time to wait for the first catalog snapshot")
@@ -261,7 +264,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	// traffic to a router that cannot say it is unwell.
 	errc := make(chan error, 4)
 	if *peerListen != "" {
-		serverCreds, err := peerCredentials(*poolerCert, *poolerKey, *poolerCA, *insecureDev)
+		serverCreds, err := peerCredentials(*poolerCert, *poolerKey, *poolerCA, *insecureDev, *authorizeCallers, pki.RoleRouter)
 		if err != nil {
 			fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
 			return cli.ExitUsage
@@ -280,7 +283,9 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		fmt.Fprintf(stdout, "pgshard-router serve: peer cancels on %s (instance %d)\n", pl.Addr(), srv.InstanceID())
 	}
 	if *vstreamListen != "" {
-		serverCreds, err := peerCredentials(*poolerCert, *poolerKey, *poolerCA, *insecureDev)
+		// No role: the change stream's callers are the cluster's
+		// consumers, which carry no pgshard identity.
+		serverCreds, err := peerCredentials(*poolerCert, *poolerKey, *poolerCA, *insecureDev, false, "")
 		if err != nil {
 			fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
 			return cli.ExitUsage
@@ -425,26 +430,23 @@ func waitSnapshot(ctx context.Context, w *snapshot.Watcher, wait time.Duration) 
 	return true
 }
 
-// peerCredentials secures the RouterPeer listener with the same certificate
-// the router presents to poolers; peers must chain to the pooler CA.
-func peerCredentials(certFile, keyFile, caFile string, insecureDev bool) (credentials.TransportCredentials, error) {
-	if insecureDev {
-		return insecure.NewCredentials(), nil
+// peerCredentials secures a router's own listeners with the same
+// certificate it presents to poolers.
+//
+// It was a second copy of the mTLS settings, which is the thing grpccreds
+// exists to prevent: a copy that quietly dropped ClientCAs or asked for
+// RequireAnyClientCert would authenticate nothing and look identical here.
+// roles, when non-empty, is the listener's role, and its callers are
+// authorised by identity; the change-stream listener passes none, because
+// its callers are consumers outside the cluster and hold no identity.
+func peerCredentials(certFile, keyFile, caFile string, insecureDev, authorizeCallers bool, role string) (credentials.TransportCredentials, error) {
+	var opts []grpccreds.Option
+	if authorizeCallers && role != "" {
+		if allow, ok := pki.AllowedCallers(role); ok {
+			opts = append(opts, grpccreds.Authorize(allow))
+		}
 	}
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, err
-	}
-	pem, err := os.ReadFile(caFile)
-	if err != nil {
-		return nil, err
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		return nil, fmt.Errorf("%s: no certificates found", caFile)
-	}
-	return credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}, ClientCAs: pool,
-		ClientAuth: tls.RequireAndVerifyClientCert, MinVersion: tls.VersionTLS13}), nil
+	return grpccreds.Listener(certFile, keyFile, caFile, insecureDev, opts...)
 }
 
 func poolerCredentials(certFile, keyFile, caFile string, insecureDev bool) (credentials.TransportCredentials, error) {

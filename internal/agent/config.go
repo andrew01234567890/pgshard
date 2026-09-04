@@ -136,6 +136,12 @@ type TLSFiles struct {
 	CertFile string `json:"certFile"`
 	KeyFile  string `json:"keyFile"`
 	CAFile   string `json:"caFile"`
+	// AuthorizeCallers refuses a peer whose certificate does not carry a
+	// pgshard identity allowed to call this listener. It needs
+	// certificates the operator issued: supplied ones carry no identity,
+	// and the check is fail-closed, so turning it on without them refuses
+	// every caller.
+	AuthorizeCallers bool `json:"authorizeCallers,omitempty"`
 }
 
 // LeaseConfig controls the coordination.k8s.io Lease guarding the primary.

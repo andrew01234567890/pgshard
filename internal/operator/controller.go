@@ -83,6 +83,9 @@ func (r Renderer) ControllerDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv
 			"--tls-cert="+internalTLSMountPath+"/tls.crt",
 			"--tls-key="+internalTLSMountPath+"/tls.key",
 			"--tls-ca="+internalTLSMountPath+"/ca.crt")
+		if c.Spec.InternalTLS.Issue {
+			args = append(args, "--tls-authorize-callers")
+		}
 		mounts = append(mounts, corev1.VolumeMount{Name: internalTLSVolume, MountPath: internalTLSMountPath, ReadOnly: true})
 		volumes = append(volumes, corev1.Volume{Name: internalTLSVolume, VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: ref.Name}}})
 	} else if c.Spec.InternalTLS.Insecure {
