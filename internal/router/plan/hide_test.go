@@ -312,3 +312,58 @@ func TestUndeclaredReferenceWriteWaitsForItsInspection(t *testing.T) {
 		t.Fatalf("reads must not wait for the inspection: %v", err)
 	}
 }
+
+// TestIntrospectionStillSeesAHiddenRewriteColumn DOCUMENTS A DEFECT, it does
+// not assert desired behaviour. PGS-590 records it as unverified and says
+// the probe decides whether the ticket is HIGH or MEDIUM; this is the probe.
+//
+// A table under an online rewrite carries a working column that the router
+// hides: `select *` is rewritten to name the visible columns, and naming
+// the column directly is refused as if it did not exist. Introspection goes
+// somewhere else entirely. Explicit pg_catalog and information_schema
+// relations short-circuit in the planner before any placement lookup
+// (planner.go, the system-schema branch), so they route to the home shard
+// untouched, and hide.go only ever rewrites the user table's own column
+// lists.
+//
+// The result is that a client is told two different things about one table
+// by one router. Anything that reads the schema and then writes SQL from it
+// -- an ORM's model check, a migration diff, a schema dump -- sees a column
+// the router will then refuse to let it name.
+//
+// When PGS-590 is fixed this test should fail. Invert it then: it exists so
+// the fix has something to flip rather than something to remember.
+func TestIntrospectionStillSeesAHiddenRewriteColumn(t *testing.T) {
+	p := New()
+	snap := rewriteFixture(t, "tenant_id", "id", "amount")
+	ctx := context.Background()
+
+	// The hiding that does work, as the contrast.
+	pl, err := p.Plan(ctx, session(snap), "select * from orders where tenant_id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(pl.Rewritten, "_pgshard_amount_deadbeef") || pl.Rewritten == "" {
+		t.Fatalf("the user-table path must hide the working column, got %q", pl.Rewritten)
+	}
+
+	// The same router, asked what columns the table has, does nothing at
+	// all: no rewrite, and no filter on the rows the home shard will
+	// return -- which include the working column, because it is a real
+	// column on the real table.
+	for _, sql := range []string{
+		"select column_name from information_schema.columns where table_name = 'orders'",
+		"select attname from pg_catalog.pg_attribute where attrelid = 'orders'::regclass",
+	} {
+		pl, err := p.Plan(ctx, session(snap), sql)
+		if err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		if pl.Rewritten != "" {
+			t.Fatalf("introspection is rewritten after all -- PGS-590 may be fixed; invert this test: %q", pl.Rewritten)
+		}
+		if pl.Kind != Unsharded {
+			t.Fatalf("%s: kind = %v, want Unsharded (the home shard's own catalog)", sql, pl.Kind)
+		}
+	}
+}
