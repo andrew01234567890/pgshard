@@ -113,8 +113,14 @@ Workflows are exposed through the `pgshard.v1.Controller` gRPC service:
 `status.paused_from`) and `ResumeWorkflow` (back to that state).
 `ResolveTransactions` is served when the controller runs a resolver, and
 `CreateBarrier` when it runs a barrier; each answers `UNIMPLEMENTED` when its
-component is not configured. `ApplyDDL` is declared in the service and has no
-implementation at all: it always answers `UNIMPLEMENTED` (PGS-489).
+component is not configured.
+
+DDL is not among them. It enters through the router, which is the only process
+that links the parser and can classify a statement into what the applier needs:
+the role to run it as, the object to resume against after a restart, and the
+shard set it was planned for. A controller RPC taking a bare statement could
+supply none of that, so the one that was declared and never implemented
+(`ApplyDDL`) has been removed rather than wired up.
 
 ```
 pgshard-controller run --catalog-dsn postgres://... \

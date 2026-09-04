@@ -27,7 +27,6 @@ const (
 	Controller_ResumeWorkflow_FullMethodName      = "/pgshard.v1.Controller/ResumeWorkflow"
 	Controller_CancelWorkflow_FullMethodName      = "/pgshard.v1.Controller/CancelWorkflow"
 	Controller_ResolveTransactions_FullMethodName = "/pgshard.v1.Controller/ResolveTransactions"
-	Controller_ApplyDDL_FullMethodName            = "/pgshard.v1.Controller/ApplyDDL"
 	Controller_CreateBarrier_FullMethodName       = "/pgshard.v1.Controller/CreateBarrier"
 	Controller_ListBarriers_FullMethodName        = "/pgshard.v1.Controller/ListBarriers"
 	Controller_ListRoleStatus_FullMethodName      = "/pgshard.v1.Controller/ListRoleStatus"
@@ -56,14 +55,12 @@ type ControllerClient interface {
 	// ResolveTransactions triggers a resolution pass over in-doubt
 	// distributed transactions.
 	ResolveTransactions(ctx context.Context, in *ResolveTransactionsRequest, opts ...grpc.CallOption) (*ResolveTransactionsResponse, error)
-	// ApplyDDL starts a DDL migration and streams per-shard progress.
-	//
-	// NOT IMPLEMENTED: the server has no handler for this and answers
-	// UNIMPLEMENTED. It is declared because the shape is settled and the
-	// applier it would drive exists; wiring it up is PGS-489. Said here
-	// because this file is what clients are generated from, and a method
-	// that only fails when called is worse to discover at run time.
-	ApplyDDL(ctx context.Context, in *ApplyDDLRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ApplyDDLResponse], error)
+	// ApplyDDL was declared here and never implemented; removed in PGS-629.
+	// Do not add it back: DDL enters through the router, which is the only
+	// process that links the parser and can classify a statement into the
+	// metadata the applier needs (the role to run as, the object to resume
+	// against, the shard set it was planned for). A controller-side entry
+	// point taking a bare statement can supply none of that.
 	// CreateBarrier pauses writes, drains two-phase commits, creates a named
 	// restore point on every group and records a certified restore point.
 	CreateBarrier(ctx context.Context, in *CreateBarrierRequest, opts ...grpc.CallOption) (*CreateBarrierResponse, error)
@@ -147,25 +144,6 @@ func (c *controllerClient) ResolveTransactions(ctx context.Context, in *ResolveT
 	return out, nil
 }
 
-func (c *controllerClient) ApplyDDL(ctx context.Context, in *ApplyDDLRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ApplyDDLResponse], error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &Controller_ServiceDesc.Streams[0], Controller_ApplyDDL_FullMethodName, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &grpc.GenericClientStream[ApplyDDLRequest, ApplyDDLResponse]{ClientStream: stream}
-	if err := x.ClientStream.SendMsg(in); err != nil {
-		return nil, err
-	}
-	if err := x.ClientStream.CloseSend(); err != nil {
-		return nil, err
-	}
-	return x, nil
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type Controller_ApplyDDLClient = grpc.ServerStreamingClient[ApplyDDLResponse]
-
 func (c *controllerClient) CreateBarrier(ctx context.Context, in *CreateBarrierRequest, opts ...grpc.CallOption) (*CreateBarrierResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CreateBarrierResponse)
@@ -237,14 +215,12 @@ type ControllerServer interface {
 	// ResolveTransactions triggers a resolution pass over in-doubt
 	// distributed transactions.
 	ResolveTransactions(context.Context, *ResolveTransactionsRequest) (*ResolveTransactionsResponse, error)
-	// ApplyDDL starts a DDL migration and streams per-shard progress.
-	//
-	// NOT IMPLEMENTED: the server has no handler for this and answers
-	// UNIMPLEMENTED. It is declared because the shape is settled and the
-	// applier it would drive exists; wiring it up is PGS-489. Said here
-	// because this file is what clients are generated from, and a method
-	// that only fails when called is worse to discover at run time.
-	ApplyDDL(*ApplyDDLRequest, grpc.ServerStreamingServer[ApplyDDLResponse]) error
+	// ApplyDDL was declared here and never implemented; removed in PGS-629.
+	// Do not add it back: DDL enters through the router, which is the only
+	// process that links the parser and can classify a statement into the
+	// metadata the applier needs (the role to run as, the object to resume
+	// against, the shard set it was planned for). A controller-side entry
+	// point taking a bare statement can supply none of that.
 	// CreateBarrier pauses writes, drains two-phase commits, creates a named
 	// restore point on every group and records a certified restore point.
 	CreateBarrier(context.Context, *CreateBarrierRequest) (*CreateBarrierResponse, error)
@@ -285,9 +261,6 @@ func (UnimplementedControllerServer) CancelWorkflow(context.Context, *CancelWork
 }
 func (UnimplementedControllerServer) ResolveTransactions(context.Context, *ResolveTransactionsRequest) (*ResolveTransactionsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ResolveTransactions not implemented")
-}
-func (UnimplementedControllerServer) ApplyDDL(*ApplyDDLRequest, grpc.ServerStreamingServer[ApplyDDLResponse]) error {
-	return status.Errorf(codes.Unimplemented, "method ApplyDDL not implemented")
 }
 func (UnimplementedControllerServer) CreateBarrier(context.Context, *CreateBarrierRequest) (*CreateBarrierResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CreateBarrier not implemented")
@@ -433,17 +406,6 @@ func _Controller_ResolveTransactions_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Controller_ApplyDDL_Handler(srv interface{}, stream grpc.ServerStream) error {
-	m := new(ApplyDDLRequest)
-	if err := stream.RecvMsg(m); err != nil {
-		return err
-	}
-	return srv.(ControllerServer).ApplyDDL(m, &grpc.GenericServerStream[ApplyDDLRequest, ApplyDDLResponse]{ServerStream: stream})
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type Controller_ApplyDDLServer = grpc.ServerStreamingServer[ApplyDDLResponse]
-
 func _Controller_CreateBarrier_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CreateBarrierRequest)
 	if err := dec(in); err != nil {
@@ -586,12 +548,6 @@ var Controller_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Controller_DropStream_Handler,
 		},
 	},
-	Streams: []grpc.StreamDesc{
-		{
-			StreamName:    "ApplyDDL",
-			Handler:       _Controller_ApplyDDL_Handler,
-			ServerStreams: true,
-		},
-	},
+	Streams:  []grpc.StreamDesc{},
 	Metadata: "pgshard/v1/controller.proto",
 }
