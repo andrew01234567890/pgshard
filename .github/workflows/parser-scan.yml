@@ -7,11 +7,14 @@
 # analyser without touching that setting; if C/C++ is later added to the
 # default setup, this workflow is the thing to delete.
 #
-# It reports and does not gate. The vendored tree is 600 files of upstream
-# C that has never been read by this analyser, so the first honest baseline
-# is whatever the first run prints -- gating on it before anyone has seen
-# it would only teach people to ignore a red check. Promoting it to a gate
-# once that baseline is agreed is PGS-585.
+# It GATES, on the part of the result that is ours to act on. The first
+# baseline (nightly 33837983681) was 59 findings and every one of them was
+# in vendored upstream C -- none in code this repository writes. Gating on
+# those would have been gating on upstream forever, which is the red check
+# nobody reads. So the ids upstream owns are suppressed by id in
+# hack/pgparser/cppcheck-suppressions.txt, with the reason for each, and
+# anything else fails: a class of finding never seen before, or any finding
+# in our own C.
 name: Parser scan
 
 on:
@@ -29,7 +32,7 @@ permissions:
 
 jobs:
   cppcheck:
-    name: C static analysis (report only)
+    name: C static analysis
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -49,8 +52,13 @@ jobs:
             # --force because the generated parser has more #if branches
             # than cppcheck explores by default, and missingInclude is
             # noise: the real include path is assembled by cgo, not here.
+            # --error-exitcode stays 0 here so the report is always
+            # produced and uploaded; the gate below reads it. A scan that
+            # aborted on its first finding would upload nothing, which is
+            # the opposite of useful when the question is what changed.
             cppcheck --force --quiet --enable=warning,performance,portability \
               --suppress=missingInclude --suppress=missingIncludeSystem \
+              --suppressions-list=hack/pgparser/cppcheck-suppressions.txt \
               --inline-suppr --error-exitcode=0 \
               --xml "$dir" 2> "parser-scan/cppcheck-$major.xml" || true
             python3 - "parser-scan/cppcheck-$major.xml" <<'PY' | tee "parser-scan/cppcheck-$major.txt"
@@ -71,3 +79,21 @@ jobs:
           name: parser-scan
           path: parser-scan/
           retention-days: 14
+      - name: Gate on findings that are ours
+        run: |
+          set -euo pipefail
+          total=0
+          for f in parser-scan/cppcheck-*.txt; do
+            n=$(sed -n '1s/^\([0-9]*\) finding.*/\1/p' "$f")
+            total=$((total + ${n:-0}))
+          done
+          if [ "$total" -eq 0 ]; then
+            echo "no unsuppressed findings"
+            exit 0
+          fi
+          echo "::error::$total cppcheck finding(s) outside the accepted set"
+          echo "Every finding in the agreed baseline was upstream's and is suppressed by id in"
+          echo "hack/pgparser/cppcheck-suppressions.txt. Something here is either a class of"
+          echo "finding never seen before or is in code we write; both are worth reading."
+          cat parser-scan/cppcheck-*.txt
+          exit 1
