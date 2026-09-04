@@ -81,7 +81,7 @@ func TestBarrierOnPostgres(t *testing.T) {
 	f.prepare(1, "pgshard-live", "live")
 	b.DrainTimeout = 300 * time.Millisecond
 	resp, err = srv.CreateBarrier(ctx, &pgshardv1.CreateBarrierRequest{Name: "b2"})
-	if err != nil || resp.GetError() == nil || !strings.Contains(resp.GetError().GetMessage(), "drain: still in flight") {
+	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), "drain: still in flight") || resp != nil {
 		t.Fatalf("blocked barrier: %v %v", err, resp)
 	}
 	if err := f.pool.QueryRow(ctx, `SELECT write_fence FROM pgshard.shard_map_generation`).Scan(&fenced); err != nil || fenced {
