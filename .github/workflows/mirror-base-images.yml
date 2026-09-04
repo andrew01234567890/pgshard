@@ -1,0 +1,84 @@
+name: Mirror base images
+
+# The e2e cells build every image from a Docker Hub base, anonymously, from a
+# shared runner pool whose IP is rate-limited by other people's traffic. When
+# Docker Hub answers an error for longer than a retry window, six required
+# contexts go red on a change that is fine, and somebody reruns a job by hand.
+#
+# So the bases are copied into our own registry, and the builds pull them from
+# there. crane copies the manifest untouched, which is the point: the mirrored
+# image has the same digest, so a Dockerfile that pinned sha256:X still gets
+# exactly sha256:X, from a host that is not throttling us.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly. The mirror only goes stale when a pinned digest changes, and the
+    # push trigger below covers that; this is for a package GHCR has expired.
+    - cron: "17 4 * * 1"
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile.control
+      - Dockerfile.router
+      - postgres/Dockerfile
+      - hack/kind/config.yaml
+      - hack/ci/base-images.sh
+      - .github/workflows/mirror-base-images.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-base-images
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    name: Copy pinned Docker Hub bases into GHCR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install crane
+        run: |
+          set -euo pipefail
+          hack/tools/install.sh crane
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Log in to GHCR
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | crane auth login ghcr.io -u "$GHCR_USER" --password-stdin
+      - name: Copy each base and assert the digest survived
+        env:
+          MIRROR: ghcr.io/${{ github.repository_owner }}/pgshard-base
+        run: |
+          set -euo pipefail
+          # A copy that changed the bytes would be worse than no mirror: the
+          # build would pull something the Dockerfile did not pin and nothing
+          # downstream would notice. So every copy is checked, and one that
+          # does not round-trip fails the job.
+          fail=0
+          while IFS=$'\t' read -r ref slug; do
+            want="${ref#*@}"
+            echo "::group::$ref -> $MIRROR:$slug"
+            hack/ci/retry.sh -n 3 -d 10 -- crane copy "$ref" "$MIRROR:$slug"
+            got="$(crane digest "$MIRROR:$slug")"
+            if [ "$got" != "$want" ]; then
+              echo "::error::$MIRROR:$slug is $got, but $ref pins $want"
+              fail=1
+            else
+              echo "$slug ok at $got"
+            fi
+            echo "::endgroup::"
+          done < <(hack/ci/base-images.sh)
+          exit "$fail"
