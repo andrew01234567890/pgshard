@@ -1132,6 +1132,30 @@ const peekChanges = 2000
 // way, because it only ever advances once the whole round is applied.
 const applyFlushOps = 2000
 
+// applyFlushBytes bounds the same hold by size, and it is the bound that
+// matters for a wide table. An operation carries a whole row rendered as
+// SQL, so 2000 of them is 2000 rows -- a few hundred kilobytes for a
+// narrow table and gigabytes for one with a megabyte in a column. Counting
+// operations bounds the count of something that has no bounded size, which
+// is not a bound at all.
+const applyFlushBytes = 8 << 20
+
+// catchUpMaxOpenBytes bounds the ONE transaction being decoded, which no
+// flush can shorten: its operations cannot be applied until it commits, so
+// they are held whole.
+//
+// A peek that fills without reaching a commit quadruples its limit and
+// starts again from the slot, decoding the same transaction from its
+// beginning each time and retaining more of it. Nothing stopped that, so a
+// large enough source transaction took the controller's memory -- and the
+// controller is not running only this workflow.
+//
+// Failing is the answer rather than spilling, for now. A workflow that
+// stops with a message naming the table and the size is one an operator
+// can act on; a controller killed by the kernel takes every other workflow
+// with it and says nothing.
+const catchUpMaxOpenBytes = 256 << 20
+
 func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn ShardConn, targets targetConns, s int32, drain bool) (int64, int, error) {
 	dec := NewDecoder()
 	applied := 0
@@ -1156,12 +1180,15 @@ func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn 
 		var ready, open []applyOp
 		var commitLSN string
 		readyN, n := 0, 0
+		// Held bytes, tracked alongside the counts: the operations of the
+		// transaction being decoded and of the ones already committed.
+		readyBytes, openBytes := 0, 0
 		flush := func() error {
 			if err := applyOps(ctx, targets, ready); err != nil {
 				return err
 			}
 			applied += readyN
-			ready, readyN = nil, 0
+			ready, readyN, readyBytes = nil, 0, 0
 			return nil
 		}
 		for _, m := range msgs {
@@ -1172,8 +1199,9 @@ func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn 
 			if committed {
 				ready = append(ready, open...)
 				readyN += n
-				open, n, commitLSN = nil, 0, m.LSN
-				if len(ready) >= applyFlushOps {
+				readyBytes += openBytes
+				open, n, openBytes, commitLSN = nil, 0, 0, m.LSN
+				if len(ready) >= applyFlushOps || readyBytes >= applyFlushBytes {
 					if err := flush(); err != nil {
 						return 0, applied, err
 					}
@@ -1189,6 +1217,13 @@ func (p *Placer) catchUpSource(ctx context.Context, wf *placementWorkflow, conn 
 			ops, err := routeChange(wf.rt, wf.shape, wf.shadow(), c)
 			if err != nil {
 				return 0, applied, fatal("%w", err)
+			}
+			for _, op := range ops {
+				openBytes += len(op.sql)
+			}
+			if openBytes > catchUpMaxOpenBytes {
+				return 0, applied, fatal("a single source transaction on %s/%d holds %d bytes of changes to %s, past the %d-byte catch-up bound: it cannot be applied until it commits, so it cannot be flushed",
+					wf.st.SourceSet, s, openBytes, wf.spec.table(), catchUpMaxOpenBytes)
 			}
 			open = append(open, ops...)
 			n++
