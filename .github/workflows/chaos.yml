@@ -10,6 +10,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # The chaos suite stands up a kind cluster and installs Chaos Mesh, so a
+  # superseded run is an expensive thing to leave holding a runner. The
+  # nightly is not cancelled: it is the one that reports.
+  group: chaos-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   chaos:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'chaos')

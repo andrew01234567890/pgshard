@@ -2,12 +2,34 @@ name: perf
 
 on:
   pull_request:
+    # A paths filter is safe HERE and not on e2e-kind, and the difference is
+    # the only thing that matters when copying this: perf contributes no
+    # required status check, so a run that never happens blocks nothing. Six
+    # of e2e-kind's cells ARE required, and a required check that never runs
+    # never reports, which blocks the pull request for ever.
+    paths:
+      - "cmd/**"
+      - "internal/**"
+      - "api/**"
+      - "proto/**"
+      - "test/perf/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/perf.yml"
   schedule:
     - cron: "41 4 * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  # A force-push otherwise leaves the superseded run holding a runner while
+  # the run that replaced it queues behind it. Not cancelled on a schedule
+  # or a manual dispatch: those are the trend measurements, and a nightly
+  # killed by the next one is a gap in the series.
+  group: perf-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   benchstat:
