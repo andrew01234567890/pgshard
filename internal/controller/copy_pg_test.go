@@ -398,6 +398,35 @@ func TestReshardCopyOnPostgres(t *testing.T) {
 	if strings.Contains(msg, "pgshard_reshard_") && !strings.Contains(msg, "app/pgshard_reshard_") {
 		t.Fatalf("a subscription is named without its database: %s", msg)
 	}
+	// The reshard's slots are read from the slots themselves, not from the
+	// SQL that asked for them. #529 fixed a Copier field that was threaded
+	// everywhere and never set, so every subscription slot was created
+	// without failover = true; the test that shipped with it asserted the
+	// flag appears in --help, which would stay green if the assignment were
+	// deleted again. A slot without failover is not synchronised to a
+	// standby, so a promotion on this source mid-copy leaves the
+	// subscription pointing at a slot the new primary does not have.
+	assertFailoverSlots := func(name string, conn *pgx.Conn) {
+		t.Helper()
+		var total, plain int64
+		if err := conn.QueryRow(ctx,
+			`SELECT count(*), count(*) FILTER (WHERE NOT failover) FROM pg_replication_slots WHERE slot_type = 'logical'`).
+			Scan(&total, &plain); err != nil {
+			t.Fatal(err)
+		}
+		// Without this the check passes on a source that has no slots at
+		// all, which is the shape of a vacuous assertion: nothing to be
+		// wrong means nothing was proved.
+		if total == 0 {
+			t.Fatalf("%s holds no logical slots, so this proves nothing about failover", name)
+		}
+		if plain != 0 {
+			t.Errorf("%s: %d of %d reshard slots lack failover = true", name, plain, total)
+		}
+	}
+	assertFailoverSlots("source 0", src0)
+	assertFailoverSlots("source 1", src1)
+
 	// Per target, not just the aggregate. "the copy is behind" does not
 	// say which target is behind, and that is the thing an operator acts
 	// on -- the admin reshard panel reads this map.
