@@ -54,6 +54,28 @@ type stack struct {
 	// shardDSNs are the superuser DSNs of the shards by id, for the
 	// controller's resolver and DDL applier.
 	shardDSNs map[int]string
+	// resolveInterval is how often the controller's resolver sweeps
+	// in-doubt transactions. Zero means the default below. A test that
+	// measures an in-doubt transaction has to turn this off, or the sweep
+	// resolves the thing being measured -- see quietResolver.
+	resolveInterval time.Duration
+}
+
+// defaultResolveInterval keeps in-doubt transactions from sitting around in
+// the suite; it is short because most tests want them cleaned up promptly.
+const defaultResolveInterval = 5 * time.Second
+
+// quietResolver restarts the controller with its resolver effectively off,
+// for a test that asserts on an in-doubt transaction rather than on its
+// resolution. The background sweep is not a bystander there: it reads the
+// same decision row the test is about to read and acts on it, so a test
+// that samples pg_prepared_xacts after killing a router is racing it. This
+// is what made TestRouterCrashMatrix/during_commit_prepared report
+// "prepared at the crash: [] [], want 1" on a loaded machine.
+func (s *stack) quietResolver(tb testing.TB) {
+	tb.Helper()
+	s.resolveInterval = time.Hour
+	s.startController(tb)
 }
 
 // routerProc is one extra router process on the stack.
@@ -220,7 +242,12 @@ func (s *stack) startController(tb testing.TB) {
 	tb.Helper()
 	s.stopController()
 	s.controllerLog = &logBuffer{}
-	args := []string{"run", "--catalog-dsn", s.catalogDSN, "--listen", "", "--election-retry", "500ms", "--apply-interval", "200ms", "--verify-roles-interval", "1s"}
+	resolve := s.resolveInterval
+	if resolve == 0 {
+		resolve = defaultResolveInterval
+	}
+	args := []string{"run", "--catalog-dsn", s.catalogDSN, "--listen", "", "--election-retry", "500ms", "--apply-interval", "200ms",
+		"--verify-roles-interval", "1s", "--resolve-interval", resolve.String()}
 	for id, dsn := range s.shardDSNs {
 		args = append(args, "--shard-dsn", fmt.Sprintf("default/%d=%s", id, dsn))
 	}

@@ -262,6 +262,10 @@ func TestRouterRefusesTwoPhaseWithoutPreparedCapacity(t *testing.T) {
 // decision.
 func TestRouterCrashMatrix(t *testing.T) {
 	s := startShardedStackWith(t, []string{preparedXacts}, []string{preparedXacts})
+	// This test asserts on the state a crash left behind, so nothing else
+	// may resolve it: the controller's sweep reads the same decision row
+	// and commits the participant the assertion below is counting.
+	s.quietResolver(t)
 	_, crashRouter := buildBinariesTagged(t, "pgshard_crashpoints")
 	ctx := context.Background()
 	t0, t1 := twoTenants(t)
@@ -320,7 +324,11 @@ func TestRouterCrashMatrix(t *testing.T) {
 				t.Fatalf("decision rows %v, want one in state %s", decisions, wantState)
 			}
 			if p0, p1 := s.preparedOn(t, 0), s.preparedOn(t, 1); len(p0)+len(p1) != c.prepared {
-				t.Fatalf("prepared at the crash: %v %v, want %d", p0, p1, c.prepared)
+				// The decision row is printed too: a count lower than
+				// expected means something resolved the transaction between
+				// the kill and this read, and the row says which way it
+				// would have gone.
+				t.Fatalf("prepared at the crash: shard0=%v shard1=%v, want %d; decision %v", p0, p1, c.prepared, decisions)
 			}
 			// The resolver reads the decision, never the crash point.
 			out, err := s.resolver(t).Resolve(ctx, "")

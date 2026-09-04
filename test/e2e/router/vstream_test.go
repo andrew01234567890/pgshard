@@ -33,6 +33,10 @@ type vstreamStack struct {
 func startVStreamStack(tb testing.TB) *vstreamStack {
 	tb.Helper()
 	s := &vstreamStack{shardedStack: startShardedStackWith(tb, []string{preparedXacts}, []string{preparedXacts})}
+	// Both controllers must agree to leave in-doubt transactions alone: the
+	// one started below asks for that, and the stack's own would otherwise
+	// keep its short interval and win the election half the time.
+	s.quietResolver(tb)
 	controllerAddr := fmt.Sprintf("127.0.0.1:%d", freePort(tb))
 	startProcess(tb, &logBuffer{}, "listening on", s.controllerBin, "run", "--insecure-dev", "--listen", controllerAddr,
 		"--catalog-dsn", s.catalogDSN, "--resolve-interval", "1h",
