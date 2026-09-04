@@ -288,6 +288,59 @@ func TestHealthStreamReflectsSourceAndDrain(t *testing.T) {
 	t.Fatalf("last status %v", st)
 }
 
+// A pooler that has not measured its replay lag must not answer zero:
+// zero is what a caught-up standby and every primary report, so a
+// fabricated one is indistinguishable from a measurement and anything
+// gating on lag would conclude there is none.
+func TestHealthOmitsAReplayLagNothingMeasured(t *testing.T) {
+	h := startHarness(t, PoolConfig{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream, err := h.client.Health(ctx, &pgshardv1.HealthRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := stream.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.ReplayLagBytes != nil {
+		t.Fatalf("nothing measured the lag, so it must be absent, got %d", st.GetReplayLagBytes())
+	}
+}
+
+func TestHealthReportsAReplayLagThatWasMeasured(t *testing.T) {
+	h := startHarness(t, PoolConfig{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream, err := h.client.Health(ctx, &pgshardv1.HealthRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Recv(); err != nil {
+		t.Fatal(err)
+	}
+	// Including zero: a measured zero is a real answer and must be
+	// reported as present, which is the whole distinction being drawn.
+	for _, want := range []uint64{4096, 0} {
+		h.src.Set(View{Generation: 7, Epoch: 3, Serving: true, LagBytes: &want})
+		deadline := time.Now().Add(2 * time.Second)
+		var got *pgshardv1.HealthStatus
+		for time.Now().Before(deadline) {
+			got, err = stream.Recv()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.ReplayLagBytes != nil && got.GetReplayLagBytes() == want {
+				break
+			}
+		}
+		if got.ReplayLagBytes == nil || got.GetReplayLagBytes() != want {
+			t.Fatalf("measured lag %d was not reported: %v", want, got)
+		}
+	}
+}
+
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)

@@ -15,8 +15,13 @@ type View struct {
 	Generation uint64
 	Epoch      uint64
 	Role       pgshardv1.HealthStatus_Role
-	LagBytes   uint64
-	Serving    bool
+	// LagBytes is the member's replay lag, nil when nothing measured it.
+	// Nothing does today: the value belongs to the agent, which measures
+	// this member's streaming lag, and the pooler has no client for it.
+	// Publishing a zero in the meantime would assert "caught up" to
+	// anything that gates on lag.
+	LagBytes *uint64
+	Serving  bool
 	// Migrating is set while a reshard cutover fences the shard's ranges:
 	// new PREPARE TRANSACTIONs are refused so the sources drain.
 	Migrating bool
