@@ -1256,8 +1256,22 @@ func (r *ClusterReconciler) observePod(ctx context.Context, c *pgshardv1alpha1.P
 		}
 	}
 	m.pod = &pod
-	m.running = pod.Status.Phase == corev1.PodRunning
-	m.ready = podReady(&pod)
+	// A pod that is going away is not one this group has. Kubernetes keeps
+	// a terminating pod Running and Ready for its whole grace period --
+	// which is long here, deliberately, so PostgreSQL shuts down cleanly --
+	// and counting it made a rollout believe the member it had just deleted
+	// was back.
+	//
+	// That is how a storage rebuild took two of three members out at once:
+	// the step that deleted a standby was declared complete thirteen
+	// seconds later, because the settled check found three ready pods and
+	// the standby it had deleted was one of them. The rollout moved on,
+	// deleted the second standby, then asked to switch away from the
+	// primary and found no candidate -- one member still cloning, one just
+	// deleted -- and held the fence for the rest of the run.
+	terminating := pod.DeletionTimestamp != nil
+	m.running = !terminating && pod.Status.Phase == corev1.PodRunning
+	m.ready = !terminating && podReady(&pod)
 	m.ip = pod.Status.PodIP
 	// Recorded before anything dials this member: the annotation says what
 	// its agent was started requiring, and during a rollout that differs
