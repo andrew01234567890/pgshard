@@ -61,7 +61,7 @@ func TestPostgres(t *testing.T) {
 	}
 }
 
-func startPostgres(t *testing.T, image string) (addr, adminDSN string) {
+func startPostgres(t testing.TB, image string) (addr, adminDSN string) {
 	t.Helper()
 	// Admission here rather than in each test: a test that starts a
 	// container is exactly the one that needs a slot, and putting it at

@@ -290,13 +290,13 @@ func copyRows(ctx context.Context, conn *pgconn.PgConn, t copyTable, lastpk []st
 		for _, v := range lastpk {
 			args = append(args, []byte(v))
 		}
-		res := conn.ExecParams(ctx, sql, args, nil, nil, nil).Read()
-		if res.Err != nil {
-			return status.Errorf(codes.Aborted, "copy %s: %v", t.qualified(), res.Err)
-		}
-		if len(res.Rows) == 0 {
-			return nil
-		}
+		// Iterated rather than Read(): Read materialises the whole page
+		// before any of it is converted, so at BatchRows rows of a wide
+		// table the page's bytes and the converted Values coexist. The
+		// chunking below already bounds what goes OUT; this bounds what is
+		// held to produce it, and the two together make the copy's memory
+		// a function of the chunk rather than of the page.
+		rr := conn.ExecParams(ctx, sql, args, nil, nil, nil)
 		keyOf := func(row [][]byte) []string {
 			if t.byCtid {
 				return []string{string(row[0])}
@@ -318,11 +318,11 @@ func copyRows(ctx context.Context, conn *pgconn.PgConn, t copyTable, lastpk []st
 		// Each chunk carries the key of its own last row, so the resume
 		// point advances with what was actually delivered rather than
 		// with the page it came from.
-		flush := func(row [][]byte) error {
+		flush := func(key []string) error {
 			if len(out.Rows) == 0 {
 				return nil
 			}
-			lastpk = keyOf(row)
+			lastpk = key
 			out.Lastpk = EncodeLastPK(lastpk)
 			if err := send(&pgshardv1.CopyTablesResponse{Response: &pgshardv1.CopyTablesResponse_Rows_{Rows: out}}); err != nil {
 				return err
@@ -330,7 +330,17 @@ func copyRows(ctx context.Context, conn *pgconn.PgConn, t copyTable, lastpk []st
 			out, size = &pgshardv1.CopyTablesResponse_Rows{}, 0
 			return nil
 		}
-		for _, row := range res.Rows {
+		rows := 0
+		// The key of the row most recently converted. Taken per row
+		// because a borrowed row is only valid until the next NextRow, so
+		// the final flush cannot reach back for the page's last row the
+		// way it could when the whole page was in memory. keyOf copies
+		// through string(), so what is kept here outlives the buffer.
+		var lastKey []string
+		for rr.NextRow() {
+			row := rr.Values()
+			rows++
+			lastKey = keyOf(row)
 			vals := row
 			if t.byCtid {
 				vals = row[1:]
@@ -346,15 +356,23 @@ func copyRows(ctx context.Context, conn *pgconn.PgConn, t copyTable, lastpk []st
 			}
 			out.Rows = append(out.Rows, r)
 			if size >= copyChunkBytes {
-				if err := flush(row); err != nil {
+				if err := flush(lastKey); err != nil {
 					return err
 				}
 			}
 		}
-		if err := flush(res.Rows[len(res.Rows)-1]); err != nil {
+		// Close reports the error the iteration could not: NextRow simply
+		// stops, whether the rows ran out or the connection did.
+		if _, err := rr.Close(); err != nil {
+			return status.Errorf(codes.Aborted, "copy %s: %v", t.qualified(), err)
+		}
+		if rows == 0 {
+			return nil
+		}
+		if err := flush(lastKey); err != nil {
 			return err
 		}
-		if len(res.Rows) < batch {
+		if rows < batch {
 			return nil
 		}
 	}
