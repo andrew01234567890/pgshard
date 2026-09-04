@@ -33,6 +33,7 @@ func TestPsqlConformance(t *testing.T) {
 			dockertest.Unavailable(t, "image %s is not present and could not be pulled (%v); skipping psql conformance test", psqlImage, perr)
 		}
 	}
+	dockertest.Parallel(t)
 	scram, err := BuildSCRAMVerifier("s3cret", nil, 0)
 	if err != nil {
 		t.Fatal(err)

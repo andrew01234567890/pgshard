@@ -91,6 +91,10 @@ func docker(t *testing.T, args ...string) string {
 
 func newHarness(t *testing.T, image, bin string) *harness {
 	t.Helper()
+	// Admission here rather than in each test: a test that starts a
+	// container is exactly the one that needs a slot, and putting it at
+	// the one place that starts them means a new test cannot forget.
+	dockertest.Parallel(t)
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano()%1_000_000)
 	h := &harness{t: t, image: image, bin: bin, net: "pgshard-agent-" + suffix, suffix: suffix, nodes: map[string]*node{}}
 	h.cfgDir = filepath.Join(t.TempDir(), "cfg")

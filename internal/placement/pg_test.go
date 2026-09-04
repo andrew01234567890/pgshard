@@ -22,6 +22,10 @@ var pgImages = []struct{ label, name string }{
 
 func startPostgres(t *testing.T, image string) *pgx.Conn {
 	t.Helper()
+	// Admission here rather than in each test: a test that starts a
+	// container is exactly the one that needs a slot, and putting it at
+	// the one place that starts them means a new test cannot forget.
+	dockertest.Parallel(t)
 	if err := exec.Command("docker", "info").Run(); err != nil {
 		dockertest.Unavailable(t, "docker unavailable; skipping differential hash tests")
 	}

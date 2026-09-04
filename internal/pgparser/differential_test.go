@@ -144,6 +144,10 @@ func serverVerdict(t *testing.T, conn *pgx.Conn, sql string) bool {
 
 func startPostgres18(t *testing.T) string {
 	t.Helper()
+	// Admission here rather than in each test: a test that starts a
+	// container is exactly the one that needs a slot, and putting it at
+	// the one place that starts them means a new test cannot forget.
+	dockertest.Parallel(t)
 	if _, err := exec.LookPath("docker"); err != nil {
 		dockertest.Unavailable(t, "docker not on PATH; skipping differential test")
 	}

@@ -43,6 +43,9 @@ func TestLiveEveryGUCExists(t *testing.T) {
 }
 
 func liveCheck(t *testing.T, img string, p Profile) {
+	// The subtest is what starts a container, so the slot is taken here
+	// rather than in the parent, which starts none.
+	dockertest.Parallel(t)
 	in := baseInput(2000, 4*GiB, p)
 	in.Major = 18
 	if strings.HasSuffix(img, ":19") {

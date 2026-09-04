@@ -170,6 +170,10 @@ func imageAvailable(t *testing.T, name string) bool {
 
 func startPostgres(t *testing.T, img pgImage) string {
 	t.Helper()
+	// Admission here rather than in each test: a test that starts a
+	// container is exactly the one that needs a slot, and putting it at
+	// the one place that starts them means a new test cannot forget.
+	dockertest.Parallel(t)
 	args := []string{"run", "-d", "--rm", "-p", "127.0.0.1::5432"}
 	if img.bare {
 		args = append(args, "--entrypoint", "sh", img.name, "-ec",

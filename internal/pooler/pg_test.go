@@ -63,6 +63,10 @@ func TestPostgres(t *testing.T) {
 
 func startPostgres(t *testing.T, image string) (addr, adminDSN string) {
 	t.Helper()
+	// Admission here rather than in each test: a test that starts a
+	// container is exactly the one that needs a slot, and putting it at
+	// the one place that starts them means a new test cannot forget.
+	dockertest.Parallel(t)
 	script := `initdb -D /tmp/pgdata --auth=trust -U postgres >/dev/null &&
 		 printf 'host all postgres all trust\nhost replication postgres all trust\nhost all all all scram-sha-256\n' >> /tmp/pgdata/pg_hba.conf &&
 		 exec postgres -D /tmp/pgdata -c listen_addresses='*' -c wal_level=logical -c max_prepared_transactions=16`

@@ -157,6 +157,10 @@ func seedCatalog(t *testing.T, dsn, verifier string, mapGeneration int64) {
 // restart: the operator's catalog-group upgrade repoints the stable
 // catalog Service the same way.
 func TestRouterSurvivesCatalogFlip18To19(t *testing.T) {
+	// One slot for the test, not one per container: this test starts two,
+	// and a slot taken per container deadlocks as soon as every slot is
+	// held by a test still waiting for its next one.
+	dockertest.Parallel(t)
 	const verifier = "SCRAM-SHA-256$4096:c2FsdA==$c3RvcmVk:c2VydmVy"
 	oldDSN := startCatalogContainer(t, "ghcr.io/andrew01234567890/pgshard-postgres:18")
 	newDSN := startCatalogContainer(t, "ghcr.io/andrew01234567890/pgshard-postgres:19")
