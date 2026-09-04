@@ -132,6 +132,7 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 			p.SequenceColumns = t.SequenceColumns
 			p.ReferenceChecked = ts.ReferenceCheckedGeneration != nil && *ts.ReferenceCheckedGeneration == ts.EffectiveGeneration
 			p.ReferenceHazards = ts.ReferenceHazards
+			p.ShardKeyChecked = shardKeyChecked(ts)
 			p.ShardKeyError = shardKeyError(ts)
 			p.ShardKeyType = shardKeyType(ts)
 			s.Tables[key] = p
@@ -156,6 +157,7 @@ func Load(ctx context.Context, db Beginner) (*Snapshot, error) {
 		}
 		p.ReferenceChecked = ts.ReferenceCheckedGeneration != nil && *ts.ReferenceCheckedGeneration == ts.EffectiveGeneration
 		p.ReferenceHazards = ts.ReferenceHazards
+		p.ShardKeyChecked = shardKeyChecked(ts)
 		p.ShardKeyError = shardKeyError(ts)
 		p.ShardKeyType = shardKeyType(ts)
 		s.Tables[key] = p
@@ -214,6 +216,15 @@ func LoadRoles(ctx context.Context, q catalog.Querier) (*Roles, error) {
 		r.verifiers[name] = cred
 	}
 	return r, rows.Err()
+}
+
+// shardKeyChecked reports that a verdict was recorded for the generation
+// now in force. The controller publishes the verdict on its own pass, after
+// the reconciler has already made the table effective, so a sharded table
+// is routable-looking before anything has asked the shards what its key
+// column really is.
+func shardKeyChecked(ts catalog.TableStatus) bool {
+	return ts.ShardKeyCheckedGeneration != nil && *ts.ShardKeyCheckedGeneration == ts.EffectiveGeneration
 }
 
 // shardKeyError reports the controller's verdict on a table's shard key,

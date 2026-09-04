@@ -40,6 +40,11 @@ func startScatterStack(tb testing.TB) *scatterStack {
 	for id := int32(1); id <= 2; id++ {
 		addr, dsn := startPostgres(tb, fmt.Sprintf("shard%d", id))
 		s.shardDSNs = append(s.shardDSNs, dsn)
+		// Also on the embedded stack, whose map is what the controller is
+		// started with. Without it the controller knows shard 0 only, and
+		// anything that has to ask every shard -- the shard-key check, the
+		// resolver -- fails on the two it cannot dial and retries for ever.
+		s.stack.shardDSNs[int(id)] = dsn
 		pooler := fmt.Sprintf("127.0.0.1:%d", freePort(tb))
 		err := router.DevBootstrap{CatalogDSN: s.catalogDSN, ShardDSN: dsn, ShardID: id, Database: appDatabase, Role: appRole,
 			Password: appPassword, PoolerEndpoint: pooler, Epoch: 1}.Run(context.Background())
@@ -79,6 +84,9 @@ func startScatterStack(tb testing.TB) *scatterStack {
 			tb.Fatalf("shard range %d: %v", i, err)
 		}
 	}
+	// Restart it now that every shard is registered: startStack started one
+	// knowing shard 0 only.
+	s.startController(tb)
 	for _, sql := range []string{
 		`INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('app', 'public', 'events', 'sharded', 'tenant_id')`,
 		`INSERT INTO pgshard.table_status (database, schema_name, table_name, effective_placement, effective_shard_key) VALUES ('app', 'public', 'events', 'sharded', 'tenant_id')`,
