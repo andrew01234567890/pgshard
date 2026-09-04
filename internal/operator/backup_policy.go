@@ -144,6 +144,7 @@ func (r *BackupPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 	meta.SetStatusCondition(&pol.Status.Conditions, valid)
 	r.setBarrierHealthy(&pol)
+	r.setVerifyHealthy(&pol)
 	meta.SetStatusCondition(&pol.Status.Conditions, repositoryEncryption(&pol))
 
 	clusters, err := clustersOfPolicy(ctx, r.Client, req.NamespacedName)
@@ -286,6 +287,38 @@ func (r *BackupPolicyReconciler) setBarrierHealthy(pol *pgshardv1alpha1.PgShardB
 		if last.Error != "" {
 			cond.Status, cond.Reason = metav1.ConditionFalse, "BarrierFailed"
 			cond.Message = fmt.Sprintf("barrier tick at %s: %s", last.At.UTC().Format(time.RFC3339), last.Error)
+		}
+		cond.ObservedGeneration = pol.Generation
+	}
+	meta.SetStatusCondition(&pol.Status.Conditions, cond)
+}
+
+// ConditionVerifyHealthy reports whether the last scheduled verification of
+// a policy with a verifySchedule found every bound repository intact.
+const ConditionVerifyHealthy = "VerifyHealthy"
+
+// setVerifyHealthy derives VerifyHealthy from the scheduler's last tick; a
+// policy without a verification schedule carries no such condition. It
+// keeps a recorded outcome across an operator restart for the same reason
+// the barrier condition does: the scheduler's memory is empty after a
+// restart, and turning "the last verification failed" into "nothing is
+// known" is exactly the wrong direction for a backup that may not restore.
+func (r *BackupPolicyReconciler) setVerifyHealthy(pol *pgshardv1alpha1.PgShardBackupPolicy) {
+	if pol.Spec.VerifySchedule == "" {
+		meta.RemoveStatusCondition(&pol.Status.Conditions, ConditionVerifyHealthy)
+		return
+	}
+	cond := metav1.Condition{Type: ConditionVerifyHealthy, Status: metav1.ConditionUnknown, Reason: "NotFiredYet", Message: "no scheduled verification has run yet", ObservedGeneration: pol.Generation}
+	if prev := meta.FindStatusCondition(pol.Status.Conditions, ConditionVerifyHealthy); prev != nil && prev.Reason != "NotFiredYet" {
+		cond = *prev
+		cond.ObservedGeneration = pol.Generation
+	}
+	if last, ok := r.Scheduler.LastVerify(client.ObjectKeyFromObject(pol)); ok {
+		cond.Status, cond.Reason = metav1.ConditionTrue, "Verified"
+		cond.Message = fmt.Sprintf("verification at %s found every bound repository intact", last.At.UTC().Format(time.RFC3339))
+		if last.Error != "" {
+			cond.Status, cond.Reason = metav1.ConditionFalse, "VerifyFailed"
+			cond.Message = fmt.Sprintf("verification at %s: %s", last.At.UTC().Format(time.RFC3339), last.Error)
 		}
 		cond.ObservedGeneration = pol.Generation
 	}

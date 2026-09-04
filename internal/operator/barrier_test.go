@@ -729,3 +729,65 @@ func TestVerifyScheduleArmsAndDisarms(t *testing.T) {
 		t.Fatal("a removed policy left its verification schedule armed")
 	}
 }
+
+// TestVerifyHealthySurvivesAnOperatorRestart: the scheduler's record of the
+// last tick is in memory, so a restarted operator has none. The outcome it
+// already wrote is still on the object, and keeping it is the difference
+// between "the last verification failed" and "nothing is known" -- the
+// wrong direction for a backup that may not restore.
+func TestVerifyHealthySurvivesAnOperatorRestart(t *testing.T) {
+	pol := newPolicy()
+	pol.Spec.VerifySchedule = "@daily"
+	cl := fakeClient(t, pol, boundCluster("demo"))
+	tick := time.Date(2026, 9, 4, 4, 0, 0, 0, time.UTC)
+	key := client.ObjectKeyFromObject(pol)
+
+	s := NewBackupScheduler(cl)
+	s.now = func() time.Time { return tick }
+	s.Agents = &fakeBackupAgents{fail: map[string]error{}}
+	r := &BackupPolicyReconciler{Client: cl, Scheduler: s, Now: func() time.Time { return tick }}
+
+	cond := func() *metav1.Condition {
+		t.Helper()
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+			t.Fatal(err)
+		}
+		var got pgshardv1alpha1.PgShardBackupPolicy
+		if err := cl.Get(context.Background(), key, &got); err != nil {
+			t.Fatal(err)
+		}
+		return meta.FindStatusCondition(got.Status.Conditions, ConditionVerifyHealthy)
+	}
+	if c := cond(); c == nil || c.Status != metav1.ConditionUnknown || c.Reason != "NotFiredYet" {
+		t.Fatalf("before any tick: %+v", c)
+	}
+
+	// A cluster with no primaries yet is skipped, so the tick succeeds.
+	if err := s.FireVerify(context.Background(), key); err != nil {
+		t.Fatal(err)
+	}
+	if c := cond(); c == nil || c.Status != metav1.ConditionTrue || c.Reason != "Verified" {
+		t.Fatalf("after a clean tick: %+v", c)
+	}
+
+	// A fresh scheduler is an operator that restarted: it knows nothing,
+	// and must not downgrade what the object already records.
+	r.Scheduler = NewBackupScheduler(cl)
+	if c := cond(); c == nil || c.Status != metav1.ConditionTrue || c.Reason != "Verified" {
+		t.Fatalf("a restart lost the recorded outcome: %+v", c)
+	}
+
+	// Dropping the schedule drops the condition: a policy that does not
+	// verify should not carry a verdict about verification.
+	var live pgshardv1alpha1.PgShardBackupPolicy
+	if err := cl.Get(context.Background(), key, &live); err != nil {
+		t.Fatal(err)
+	}
+	live.Spec.VerifySchedule = ""
+	if err := cl.Update(context.Background(), &live); err != nil {
+		t.Fatal(err)
+	}
+	if c := cond(); c != nil {
+		t.Fatalf("a policy with no verifySchedule still carries %+v", c)
+	}
+}
