@@ -259,3 +259,65 @@ func TestStepAgeIsExportedForARunningCutover(t *testing.T) {
 		t.Fatalf("step ages reported as %v, want exactly [%s]", samples, want)
 	}
 }
+
+// TestMetricsPollerReportsTheCutoverPause: the guide promises a sub-second
+// write pause at cutover and nothing outside the test suite measured it.
+// pgshard_controller_cutover_paused counts workflows held at a CONFIGURED
+// pause point, which is a different thing entirely, so an operator whose
+// cutover paused for seconds had nothing that would say so.
+func TestMetricsPollerReportsTheCutoverPause(t *testing.T) {
+	parallelPG(t)
+	dsn := startPostgres(t)
+	ctx := context.Background()
+	conn := connect(t, dsn)
+	if err := catalog.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, `INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES
+		('cccccccc-9999-9999-9999-999999999999', 'reshard', 'completed', '{}'::jsonb,
+		 '{"cutover": {"pause_ms": 2159}}'::jsonb),
+		('dddddddd-9999-9999-9999-999999999999', 'reshard', 'running', '{}'::jsonb,
+		 '{"cutover": {"step": "verify"}}'::jsonb)`)
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	reg := prometheus.NewRegistry()
+	p := &MetricsPoller{Pool: pool, Metrics: metrics.NewController(reg)}
+	if err := p.Refresh(ctx); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	got := map[string]float64{}
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range families {
+		if f.GetName() != "pgshard_controller_cutover_pause_seconds" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			var id string
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "id" {
+					id = l.GetValue()
+				}
+			}
+			got[id] = m.GetGauge().GetValue()
+		}
+	}
+	// Seconds, not milliseconds: the alert threshold and the documented
+	// guarantee are both stated in seconds, and a gauge that disagreed with
+	// its own alert by a factor of a thousand would never fire.
+	if v, ok := got["cccccccc-9999-9999-9999-999999999999"]; !ok || v < 2.15 || v > 2.16 {
+		t.Fatalf("completed cutover pause = %v (present=%t), want ~2.159s", v, ok)
+	}
+	// A workflow that has not cut over yet reports nothing rather than a
+	// zero, which would read as a sub-second pause that never happened.
+	if _, ok := got["dddddddd-9999-9999-9999-999999999999"]; ok {
+		t.Fatal("a workflow that has not cut over must not report a pause")
+	}
+}

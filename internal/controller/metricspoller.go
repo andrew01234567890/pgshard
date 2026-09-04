@@ -133,6 +133,33 @@ func (p *MetricsPoller) Refresh(ctx context.Context) error {
 		return err
 	}
 
+	// The pause each completed cutover actually took. The guide promises a
+	// sub-second write pause and nothing outside the test suite measured
+	// it, so a cutover that paused for seconds looked exactly like one that
+	// did not. Read from the workflow rather than observed at the moment of
+	// the switch because the value is already durable there, and a poller
+	// that restarts still reports the last real cutover instead of nothing.
+	rows, err = p.Pool.Query(ctx, `SELECT kind, id::text, (status->'cutover'->>'pause_ms')::float8 / 1000
+		FROM pgshard.workflows
+		WHERE status->'cutover'->>'pause_ms' IS NOT NULL`)
+	if err != nil {
+		return err
+	}
+	m.CutoverPauseSeconds.Reset()
+	for rows.Next() {
+		var kind, id string
+		var pause float64
+		if err := rows.Scan(&kind, &id, &pause); err != nil {
+			rows.Close()
+			return err
+		}
+		m.CutoverPauseSeconds.WithLabelValues(kind, id).Set(pause)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
 	// A row survives its decision only while the resolver cannot finish it:
 	// finishing deletes it. So a decided row is not history, it is a
 	// transaction still holding locks, WAL and a vacuum horizon on every
