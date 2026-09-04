@@ -1022,6 +1022,101 @@ reclaimPolicy: Delete
 			t.Errorf("catalog claims untouched: got %d", n)
 		}
 	})
+
+	// Last, because it leaves the shard group with two members: lowering a
+	// replica count is the one operation here that does not end where it
+	// started.
+	t.Run("LoweringReplicasRetiresAMemberWithoutLosingCommits", func(t *testing.T) {
+		oldPrimary := primaryOf()
+		retired := clusterName + "-shard-0-2"
+		w := startWriter(ctx, c, rw, lastID)
+
+		// synchronous_standby_names must never list a member that is gone.
+		// Sampled throughout rather than checked at the end: the hazard is
+		// a window in which the primary waits for acknowledgements from a
+		// standby that has been deleted, and a window closes.
+		var badSync []string
+		stop, sampled := make(chan struct{}), make(chan struct{})
+		go func() {
+			defer close(sampled)
+			for {
+				select {
+				case <-stop:
+					return
+				case <-time.After(2 * time.Second):
+				}
+				names, err := psql(ctx, c, rw, "SHOW synchronous_standby_names")
+				if err != nil || !strings.Contains(names, retired) {
+					continue
+				}
+				out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pod", retired, "-o", "jsonpath={.metadata.name}")
+				if err != nil || strings.TrimSpace(out) == "" {
+					badSync = append(badSync, names)
+				}
+			}
+		}()
+
+		started := time.Now()
+		patchCluster(`{"spec":{"replicasPerShard":2}}`)
+		waitForWhy(ctx, t, "the third shard member to be retired", 15*time.Minute, func() string {
+			return fmt.Sprintf("shard pods=%d rolloutIdle=%v",
+				count(ctx, t, c, "pods", "pgshard.io/cluster="+clusterName+",pgshard.io/group=shard-0"), rolloutIdle())
+		}, func() bool {
+			return count(ctx, t, c, "pods", "pgshard.io/cluster="+clusterName+",pgshard.io/group=shard-0") == 2 && rolloutIdle()
+		})
+		close(stop)
+		<-sampled
+
+		acked, failures, pause := w.finish()
+		t.Logf("retiring a member took %s; writer: %d acknowledged, %d failed, unavailability window %s",
+			time.Since(started).Round(time.Second), len(acked), failures, pause)
+		if len(acked) > 0 {
+			lastID = acked[len(acked)-1]
+		}
+		if len(acked) == 0 {
+			t.Fatal("writer acknowledged nothing")
+		}
+		// The point of the whole operation: a member leaving must not cost
+		// a commit that was already acknowledged.
+		assertAllAcked(ctx, t, c, rw, acked)
+		if failures > 0 {
+			t.Errorf("retiring a standby must not fail a write: %d failed over %s", failures, pause)
+		}
+		if len(badSync) > 0 {
+			t.Errorf("synchronous_standby_names listed a member that was gone: %q", badSync[0])
+		}
+		if primaryOf() != oldPrimary {
+			t.Errorf("retiring a standby must not move the primary: %s -> %s", oldPrimary, primaryOf())
+		}
+
+		// Nothing of the member survives except its claim, which is
+		// retained on purpose: it is the only copy of whatever had not
+		// replicated when it left.
+		// The exact name, not a pattern: "_" is a LIKE wildcard, so a
+		// pattern here would match slots this test is not about and could
+		// pass while the slot it cares about survived.
+		slot := "pgshard_" + strings.NewReplacer("-", "_", ".", "_").Replace(retired)
+		slots, err := psql(ctx, c, rw,
+			"SELECT count(*) FROM pg_replication_slots WHERE slot_name = '"+slot+"'")
+		if err != nil || slots != "0" {
+			t.Errorf("the retired member's slot %s must be dropped, got %q %v", slot, slots, err)
+		}
+		// And the assertion is not vacuous: the surviving standby still has
+		// one, so a query that finds nothing whatever the state would fail
+		// here too.
+		kept := "pgshard_" + strings.NewReplacer("-", "_", ".", "_").Replace(clusterName+"-shard-0-1")
+		if n, err := psql(ctx, c, rw,
+			"SELECT count(*) FROM pg_replication_slots WHERE slot_name = '"+kept+"'"); err != nil || n != "1" {
+			t.Errorf("the remaining standby must still have its slot %s, got %q %v", kept, n, err)
+		}
+		if n := count(ctx, t, c, "pvc", "pgshard.io/cluster="+clusterName+",pgshard.io/member="+retired); n != 1 {
+			t.Errorf("the retired member's claim is kept by default, got %d", n)
+		}
+		waitFor(ctx, t, "the remaining standby to stream", 5*time.Minute, func() bool {
+			out, err := psql(ctx, c, rw, "SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming'")
+			return err == nil && out == "1"
+		})
+	})
 }
 
 func gatherNamespace(ctx context.Context, c *e2e.Cluster) {
