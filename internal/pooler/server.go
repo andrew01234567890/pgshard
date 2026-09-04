@@ -995,6 +995,9 @@ func (s *Server) Health(_ *pgshardv1.HealthRequest, stream pgshardv1.Pooler_Heal
 	for {
 		s.expireReservations(time.Now())
 		v := s.cfg.Source.View()
+		// ReplayLagBytes is left absent rather than zero when nothing
+		// measured it: zero is what a caught-up standby reports, so a
+		// fabricated one cannot be told apart from a real one.
 		if err := stream.Send(&pgshardv1.HealthStatus{Role: v.Role, ReplayLagBytes: v.LagBytes,
 			Epoch: v.Epoch, Generation: v.Generation, Serving: v.Serving && !s.draining.Load()}); err != nil {
 			return err

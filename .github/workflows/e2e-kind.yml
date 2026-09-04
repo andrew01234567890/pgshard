@@ -104,9 +104,22 @@ jobs:
         id: setup_go
         with:
           go-version-file: go.mod
+      # Retried by hand rather than through hack/ci/retry.sh, which wraps
+      # commands and cannot wrap an action. These two steps are pure
+      # downloads and were the only unretried ones left: across sixty runs
+      # they took down three failing cells between them, each costing a
+      # required context and roughly forty minutes of somebody's rerun.
+      # The SHA stays pinned; only the attempt is repeated.
       - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
         if: needs.changes.outputs.code == 'true'
         id: install_kind
+        continue-on-error: true
+        with:
+          version: v0.32.0
+          install_only: true
+      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        id: install_kind_retry
+        if: steps.install_kind.outcome == 'failure' && needs.changes.outputs.code == 'true'
         with:
           version: v0.32.0
           install_only: true
@@ -115,7 +128,14 @@ jobs:
           version: v0.36.1
           driver-opts: image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
         id: setup_buildx
+        continue-on-error: true
         if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true'
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          version: v0.36.1
+          driver-opts: image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+        id: setup_buildx_retry
+        if: matrix.suite != 'smoke' && steps.setup_buildx.outcome == 'failure' && needs.changes.outputs.code == 'true'
       - name: Warm the module and base-image caches
         if: needs.changes.outputs.code == 'true'
         id: warm_caches
@@ -214,8 +234,8 @@ jobs:
           SETUP_OUTCOMES: |
             check out the repository=${{ steps.checkout.outcome }}
             install Go=${{ steps.setup_go.outcome }}
-            install kind=${{ steps.install_kind.outcome }}
-            set up buildx=${{ steps.setup_buildx.outcome }}
+            install kind=${{ steps.install_kind_retry.conclusion == 'skipped' && steps.install_kind.outcome || steps.install_kind_retry.outcome }}
+            set up buildx=${{ steps.setup_buildx_retry.conclusion == 'skipped' && steps.setup_buildx.outcome || steps.setup_buildx_retry.outcome }}
             warm the module and base-image caches=${{ steps.warm_caches.outcome }}
             build PostgreSQL image=${{ steps.build_postgres.outcome }}
             build operator and admin images=${{ steps.build_control.outcome }}

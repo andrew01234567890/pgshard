@@ -2,6 +2,7 @@ package operator
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +13,48 @@ import (
 	pgshardv1alpha1 "github.com/andrew01234567890/pgshard/api/v1alpha1"
 	"k8s.io/utils/ptr"
 )
+
+// A refusal must carry the state it saw. The message named a conclusion --
+// "unreachable synchronous standbys may hold acknowledged commits" -- which
+// in the case that prompted this was true of one member of three and silent
+// about the other two. It must also distinguish a member that answered a
+// probe from one that could not be probed: both arrive as Reachable=false
+// and only one of them says anything about the member.
+func TestARefusalNamesTheStateItSaw(t *testing.T) {
+	members := []memberView{
+		{Name: "g-0", Listed: true, Reachable: true, InRecovery: true, Streaming: false, FlushLSN: 100663456},
+		{Name: "g-2", Listed: true, Reachable: false, Why: "dial tcp 10.0.0.2:5432: i/o timeout"},
+	}
+	_, err := chooseCandidate(members, "g-1", "", 1)
+	if err == nil {
+		t.Fatal("a group with no promotable member must refuse")
+	}
+	if !errors.Is(err, errNoCandidate) {
+		t.Fatalf("the sentinel must survive wrapping: %v", err)
+	}
+	for _, want := range []string{
+		"g-0",                                 // the member that was reachable
+		"in-recovery",                         // and what it was doing
+		"not-streaming",                       // the reason it cannot be promoted
+		"flush=100663456",                     // and how far it had got
+		"g-2",                                 // the member that was not reachable
+		"dial tcp 10.0.0.2:5432: i/o timeout", // and why, rather than an inference
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not say %q", err, want)
+		}
+	}
+}
+
+// An unreachable member whose probe recorded no reason must say so rather
+// than read as a member that reported something.
+func TestAnUnprobedMemberSaysSoRatherThanImplyingAnswer(t *testing.T) {
+	members := []memberView{{Name: "g-0", Listed: true, Reachable: false}}
+	_, err := chooseCandidate(members, "", "", 1)
+	if err == nil || !strings.Contains(err.Error(), "no reason recorded") {
+		t.Fatalf("want an explicit absence of a reason, got %v", err)
+	}
+}
 
 func TestChooseCandidatePrefersHighestFlushedReachableStandby(t *testing.T) {
 	members := []memberView{

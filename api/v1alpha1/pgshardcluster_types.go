@@ -50,6 +50,15 @@ const (
 	RolloutPhaseHeld       = "Held"
 )
 
+// RequiresNamedImage reports whether a major may only be run by naming an
+// image explicitly, rather than by resolving the default moving tag.
+//
+// It exists so the CEL rule on PostgreSQLSpec below and the operator's
+// image selection cannot drift: the rule refuses `major: 19` without an
+// image, and anything that fills an image in for a group must refuse the
+// same way rather than quietly resolving pgshard-postgres:19.
+func RequiresNamedImage(major int) bool { return major == 19 }
+
 // PostgreSQLSpec selects the PostgreSQL build and its base configuration.
 //
 // A prerelease major has to be asked for by name. PostgreSQL 19 is Beta 3,

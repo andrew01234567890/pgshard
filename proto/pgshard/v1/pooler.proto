@@ -406,7 +406,13 @@ message HealthStatus {
   }
   Role role = 1;
   // Bytes of WAL received but not yet replayed; zero on a primary.
-  uint64 replay_lag_bytes = 2;
+  //
+  // Optional because a pooler that cannot measure lag must be able to say
+  // so. Zero is a legitimate answer here -- it is what a caught-up standby
+  // and every primary report -- so a pooler with no measurement that sent 0
+  // would be indistinguishable from one that had measured, and a consumer
+  // gating on lag would conclude there is none. Absent means unknown.
+  optional uint64 replay_lag_bytes = 2;
   // Primary epoch the instance serves under.
   uint64 epoch = 3;
   // Shard map generation the pooler is configured with.
