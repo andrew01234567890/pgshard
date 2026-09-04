@@ -2415,14 +2415,10 @@ func (*RestoreInfoRequest) Descriptor() ([]byte, []int) {
 
 // RestoreInfoResponse describes the stanza in the repository.
 type RestoreInfoResponse struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	Epoch uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	// Backup the data directory was restored from; empty if never restored.
-	BackupRef string `protobuf:"bytes,2,opt,name=backup_ref,json=backupRef,proto3" json:"backup_ref,omitempty"`
-	// LSN at which recovery ended.
-	RecoveryEndLsn uint64 `protobuf:"varint,3,opt,name=recovery_end_lsn,json=recoveryEndLsn,proto3" json:"recovery_end_lsn,omitempty"`
-	Error          *Error `protobuf:"bytes,4,opt,name=error,proto3" json:"error,omitempty"`
-	Stanza         string `protobuf:"bytes,5,opt,name=stanza,proto3" json:"stanza,omitempty"`
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Epoch  uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	Error  *Error                 `protobuf:"bytes,4,opt,name=error,proto3" json:"error,omitempty"`
+	Stanza string                 `protobuf:"bytes,5,opt,name=stanza,proto3" json:"stanza,omitempty"`
 	// pgBackRest stanza status code and message (0 = ok).
 	StatusCode    int64  `protobuf:"varint,6,opt,name=status_code,json=statusCode,proto3" json:"status_code,omitempty"`
 	StatusMessage string `protobuf:"bytes,7,opt,name=status_message,json=statusMessage,proto3" json:"status_message,omitempty"`
@@ -2467,20 +2463,6 @@ func (*RestoreInfoResponse) Descriptor() ([]byte, []int) {
 func (x *RestoreInfoResponse) GetEpoch() uint64 {
 	if x != nil {
 		return x.Epoch
-	}
-	return 0
-}
-
-func (x *RestoreInfoResponse) GetBackupRef() string {
-	if x != nil {
-		return x.BackupRef
-	}
-	return ""
-}
-
-func (x *RestoreInfoResponse) GetRecoveryEndLsn() uint64 {
-	if x != nil {
-		return x.RecoveryEndLsn
 	}
 	return 0
 }
@@ -3673,12 +3655,9 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\x05error\x18\x03 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\x12*\n" +
 	"\x04info\x18\x04 \x01(\v2\x16.pgshard.v1.BackupInfoR\x04info\x12\x10\n" +
 	"\x03log\x18\x05 \x03(\tR\x03log\"\x14\n" +
-	"\x12RestoreInfoRequest\"\xf1\x02\n" +
+	"\x12RestoreInfoRequest\"\xd2\x02\n" +
 	"\x13RestoreInfoResponse\x12\x14\n" +
-	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x1d\n" +
-	"\n" +
-	"backup_ref\x18\x02 \x01(\tR\tbackupRef\x12(\n" +
-	"\x10recovery_end_lsn\x18\x03 \x01(\x04R\x0erecoveryEndLsn\x12'\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12'\n" +
 	"\x05error\x18\x04 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\x12\x16\n" +
 	"\x06stanza\x18\x05 \x01(\tR\x06stanza\x12\x1f\n" +
 	"\vstatus_code\x18\x06 \x01(\x03R\n" +
@@ -3689,7 +3668,8 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\varchive_max\x18\t \x01(\tR\n" +
 	"archiveMax\x120\n" +
 	"\abackups\x18\n" +
-	" \x03(\v2\x16.pgshard.v1.BackupInfoR\abackups\"%\n" +
+	" \x03(\v2\x16.pgshard.v1.BackupInfoR\abackupsJ\x04\b\x02\x10\x03J\x04\b\x03\x10\x04R\n" +
+	"backup_refR\x10recovery_end_lsn\"%\n" +
 	"\rExpireRequest\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\"a\n" +
 	"\x0eExpireResponse\x12\x14\n" +
