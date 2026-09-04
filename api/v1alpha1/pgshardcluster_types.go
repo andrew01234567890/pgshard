@@ -26,6 +26,17 @@ const (
 	ConditionControllerReady   = "ControllerReady"
 	ConditionTuningApplied     = "TuningApplied"
 	ConditionRolloutInProgress = "RolloutInProgress"
+	// ConditionSQLSurfaceBehindServers is true while the shards run a
+	// PostgreSQL major newer than the grammar the routers parse with.
+	//
+	// An upgrade that moved every group to 19 reports success, and it did
+	// succeed -- the data is there and the servers are 19. What it did not
+	// do is give clients a 19 SQL surface: the routers parse with one
+	// grammar chosen at build time, so 19-only syntax is refused and
+	// server_version still names the grammar's major. Nothing said so,
+	// which made a real and documented limitation look like a bug in
+	// whichever statement hit it first.
+	ConditionSQLSurfaceBehindServers = "SQLSurfaceBehindServers"
 )
 
 // Rollout phases reported in status.rollout.phase.
