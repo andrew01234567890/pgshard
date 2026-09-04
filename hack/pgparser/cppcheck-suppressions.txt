@@ -16,7 +16,9 @@
 # When a suppression stops being needed, delete it: an id listed here that
 # no longer fires is not reported by cppcheck, so this file only shrinks
 # deliberately.
-
+# NO BLANK LINES: cppcheck reads this with --suppressions-list and rejects
+# an empty line with "Failed to add suppression. No id.", which aborts the
+# scan before it writes anything. Comments are fine; blank lines are not.
 # cppcheck cannot expand PostgreSQL's macros, so it misparses rather than
 # finds anything. foreach/foreach_ptr are the usual culprits, and the
 # implicit-int and syntax errors below are consequences of the same thing:
@@ -26,14 +28,12 @@ unknownMacro
 syntaxError
 returnImplicitInt
 internalError
-
 # PostgreSQL's memory contexts. The "leaks" are blocks handed to a context
 # that frees them wholesale, and the null-check patterns are aset.c's
 # deliberate style. Upstream's to change, not ours.
 memleak
 nullPointerRedundantCheck
 nullPointerArithmeticRedundantCheck
-
 # Generated parser tables (gram.c, pl_gram.c, scan.c) and the bison
 # skeletons they come from. Not written by hand and not ours to edit.
 uselessAssignmentPtrArg

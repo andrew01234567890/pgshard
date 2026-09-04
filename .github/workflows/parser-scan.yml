@@ -62,7 +62,13 @@ jobs:
               --inline-suppr --error-exitcode=0 \
               --xml "$dir" 2> "parser-scan/cppcheck-$major.xml" || true
             python3 - "parser-scan/cppcheck-$major.xml" <<'PY' | tee "parser-scan/cppcheck-$major.txt"
-          import collections, sys, xml.etree.ElementTree as ET
+          import collections, os, sys, xml.etree.ElementTree as ET
+          # cppcheck writes nothing at all when it refuses to start -- a
+          # malformed suppressions file does exactly that -- and a bare
+          # ParseError traceback says only that the XML is empty, not why.
+          if os.path.getsize(sys.argv[1]) == 0:
+              sys.exit("cppcheck produced no report; it failed before analysing "
+                       "(a malformed --suppressions-list entry does this). See the step log above.")
           errors = ET.parse(sys.argv[1]).getroot().findall("./errors/error")
           by = collections.Counter(e.get("severity") for e in errors)
           print("%d finding(s): %s" % (len(errors), dict(by)))
