@@ -1,15 +1,15 @@
 // Package agentauth authenticates control-plane calls to member agents with
-// a token both sides derive from the cluster's superuser password, which the
-// operator provisions and every agent already holds. The password itself
-// never travels on the wire.
+// a token the operator generates and mounts into every member.
+//
+// It used to be derived from the cluster's superuser password instead, which
+// made that password a control-plane credential: anything holding it could
+// call Promote, Demote, Rewind and Reclone. The derived token was withdrawn
+// in PGS-572 once every caller sent the mounted one.
 package agentauth
 
 import (
 	"context"
 	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
-	"errors"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -20,35 +20,9 @@ import (
 // MetadataKey carries the token on agent RPCs.
 const MetadataKey = "pgshard-agent-token"
 
-var derivationKey = []byte("pgshard-agent-auth-v1")
-
-// Token derives the shared token from the superuser password. An empty
-// password is refused: its token would be a well-known constant any caller
-// could derive.
-func Token(password string) (string, error) {
-	if password == "" {
-		return "", errors.New("agentauth: refusing to derive a token from an empty password")
-	}
-	mac := hmac.New(sha256.New, derivationKey)
-	mac.Write([]byte(password))
-	return hex.EncodeToString(mac.Sum(nil)), nil
-}
-
 // WithToken returns a context whose outgoing gRPC metadata carries the token.
 func WithToken(ctx context.Context, token string) context.Context {
 	return metadata.AppendToOutgoingContext(ctx, MetadataKey, token)
-}
-
-// WithTokens carries several tokens, so one caller reaches agents that
-// expect different ones during a rolling update. The server accepts a call
-// presenting any token it knows.
-func WithTokens(ctx context.Context, tokens ...string) context.Context {
-	for _, t := range tokens {
-		if t != "" {
-			ctx = metadata.AppendToOutgoingContext(ctx, MetadataKey, t)
-		}
-	}
-	return ctx
 }
 
 // ErrUnauthenticated is returned to callers without a valid token.

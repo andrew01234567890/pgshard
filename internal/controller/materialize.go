@@ -44,8 +44,9 @@ type AgentMaterializer struct {
 	// what an agent without GRPCTLS serves; the two have to agree.
 	Creds credentials.TransportCredentials
 	// AgentToken is the cluster's own agent control-plane token, mounted
-	// by the operator. Empty falls back to the token derived from the
-	// catalog password alone, which is what this did before it had one.
+	// by the operator. It is the only token sent; empty is a
+	// misconfiguration and materialisation refuses rather than deriving
+	// one from the catalog password.
 	AgentToken string
 }
 
@@ -87,16 +88,17 @@ func (m *AgentMaterializer) MaterializeSchema(ctx context.Context, target ShardR
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	// The cluster's own token first, then the one derived from the catalog
-	// password. Sending both reaches an agent either side of a rollout, and
-	// the derived one exists only until PGS-572 withdraws it -- while it
-	// does, anything holding the superuser password holds a credential that
-	// unlocks Promote, Demote, Rewind and Reclone.
-	derived, err := agentauth.Token(m.Pool.Config().ConnConfig.Password)
-	if err != nil {
-		return fmt.Errorf("agent auth token: %w", err)
+	// The cluster's own token, and only it. The controller used to also
+	// derive one from the catalog password, which meant anything holding
+	// that password held a credential unlocking Promote, Demote, Rewind and
+	// Reclone. The operator mounts this token into the controller's own
+	// Deployment, so a controller without one is misconfigured rather than
+	// mid-rollout, and saying so beats an Unauthenticated that reads like a
+	// network fault.
+	if m.AgentToken == "" {
+		return fmt.Errorf("agent %s: no agent control-plane token: start the controller with --agent-token-file", addr)
 	}
-	ctx = agentauth.WithTokens(ctx, m.AgentToken, derived)
+	ctx = agentauth.WithToken(ctx, m.AgentToken)
 	resp, err := pgshardv1.NewAgentClient(conn).MaterializeSchema(ctx, &pgshardv1.MaterializeSchemaRequest{SourceConninfo: sourceConnInfo, Database: database, Epoch: proto.Uint64(uint64(epoch))})
 	if err != nil {
 		return fmt.Errorf("agent %s: %w", addr, err)

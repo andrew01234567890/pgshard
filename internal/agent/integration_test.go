@@ -104,6 +104,12 @@ func newHarness(t *testing.T, image, bin string) *harness {
 	if err := os.WriteFile(filepath.Join(h.cfgDir, "pw"), []byte("pgshard-test\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// The agent accepts exactly the token in this file. It used to also
+	// accept one derived from the password above, which is what made the
+	// superuser password a control-plane credential (PGS-572).
+	if err := os.WriteFile(filepath.Join(h.cfgDir, "token"), []byte(agentTestToken+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	docker(t, "network", "create", h.net)
 	t.Cleanup(func() {
 		for _, n := range h.nodes {
@@ -122,7 +128,7 @@ func (h *harness) writeConfig(member string, role Role, source string, peers []s
 	h.t.Helper()
 	cfg := map[string]any{
 		"cluster": "it", "shard": "s0", "member": member, "role": string(role),
-		"pgdata": "/var/lib/postgresql/data", "passwordFile": "/cfg/pw",
+		"pgdata": "/var/lib/postgresql/data", "passwordFile": "/cfg/pw", "authTokenFile": "/cfg/token",
 		"primaryConninfo": "host=" + h.containerName(source) + " port=5432 user=postgres",
 		"podCIDR":         "0.0.0.0/0", "peerFailsafeURLs": peers, "isolationGrace": "5s",
 		"lease":           map[string]any{"enabled": false},
@@ -153,17 +159,18 @@ func (h *harness) start(member string, role Role, source string, peers []string)
 	return n
 }
 
+// agentTestToken is the control-plane token the harness mounts and every
+// call presents; it is arbitrary and unrelated to the superuser password,
+// which is the point.
+const agentTestToken = "integration-agent-token"
+
 // connect (re)reads the published ports; docker restart reassigns them.
 func (n *node) connect() {
 	n.t.Helper()
 	n.http = "http://" + docker(n.t, "port", n.container, "8080/tcp")
 	conn, err := grpc.NewClient(docker(n.t, "port", n.container, "9090/tcp"), grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-			tok, err := agentauth.Token("pgshard-test")
-			if err != nil {
-				return err
-			}
-			return invoker(agentauth.WithToken(ctx, tok), method, req, reply, cc, opts...)
+			return invoker(agentauth.WithToken(ctx, agentTestToken), method, req, reply, cc, opts...)
 		}))
 	if err != nil {
 		n.t.Fatal(err)

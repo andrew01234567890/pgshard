@@ -62,15 +62,17 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("reading the instance role: %w", err)
 	}
-	// Checked before anything is acquired: an agent that cannot derive its
-	// control-plane token will not serve, and finding that out after taking
-	// the lease and starting PostgreSQL means unwinding both.
-	password, err := inst.password()
-	if err != nil {
-		return fmt.Errorf("agent auth token: %w", err)
-	}
-	if _, err := agentauth.Token(password); err != nil {
-		return fmt.Errorf("agent auth token: %w", err)
+	// Checked before anything is acquired: an agent whose control-plane
+	// token cannot be read will refuse every RPC, and finding that out
+	// after taking the lease and starting PostgreSQL means unwinding both.
+	if cfg.AuthTokenFile != "" {
+		b, err := os.ReadFile(cfg.AuthTokenFile)
+		if err != nil {
+			return fmt.Errorf("agent auth token: %w", err)
+		}
+		if strings.TrimSpace(string(b)) == "" {
+			return fmt.Errorf("agent auth token: %s is empty", cfg.AuthTokenFile)
+		}
 	}
 
 	// Startup takes a lease, a PostgreSQL process and two listeners, and
@@ -158,39 +160,29 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 	// Both tokens, re-read on every call so a rotated Secret is honoured
 	// without an agent restart.
 	//
-	// The mounted one is this cluster's own. The derived one is what agents
-	// used before that Secret existed, and is still accepted so a cluster
-	// can be rolled onto the new token a member at a time -- callers send
-	// both, so an old agent and a new one are both reachable throughout.
-	//
-	// REMOVE the derived token once every caller sends the mounted one --
-	// PGS-572. The controller still derives its own from the catalog
-	// password, so until that changes, anything holding the superuser
-	// password also holds a token that unlocks Promote, Demote, Rewind and
-	// Reclone.
+	// The token is the one the operator generates and mounts into every
+	// member, and it is the only one accepted. Agents used to also accept a
+	// token derived from the superuser password, so a cluster could be
+	// rolled onto the mounted one a member at a time; that path is gone
+	// (PGS-572), and with it a credential that let anything holding the
+	// superuser password call Promote, Demote, Rewind and Reclone.
 	//
 	// Both interceptors read the same tokens. The service is unary
 	// throughout, so the streaming one gates nothing today -- it is
 	// registered so that adding a streaming method cannot quietly add an
 	// unauthenticated one.
+	// An agent with no token file accepts nothing: authorized() skips empty
+	// tokens and answers false on an empty list, so a misconfigured agent
+	// refuses every call rather than serving them unauthenticated.
 	agentTokens := func() ([]string, error) {
-		var tokens []string
-		if cfg.AuthTokenFile != "" {
-			b, err := os.ReadFile(cfg.AuthTokenFile)
-			if err != nil {
-				return nil, err
-			}
-			tokens = append(tokens, strings.TrimSpace(string(b)))
+		if cfg.AuthTokenFile == "" {
+			return nil, nil
 		}
-		pw, err := inst.password()
+		b, err := os.ReadFile(cfg.AuthTokenFile)
 		if err != nil {
 			return nil, err
 		}
-		derived, err := agentauth.Token(pw)
-		if err != nil {
-			return nil, err
-		}
-		return append(tokens, derived), nil
+		return []string{strings.TrimSpace(string(b))}, nil
 	}
 	// Transport security is opt-in and off by default. Both callers can dial
 	// with credentials, but each decides per member from
