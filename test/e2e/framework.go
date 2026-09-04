@@ -287,14 +287,59 @@ func (c *Cluster) MustGather(ctx context.Context, name string) {
 		`custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name,UID:.metadata.uid,RESTARTS:.status.containerStatuses[*].restartCount,START:.status.startTime`)
 	save("nodes.txt", "describe", "nodes")
 	save("describe-"+SystemNamespace+".txt", "-n", SystemNamespace, "describe", "all")
-	pods, err := c.Kubectl(ctx, nil, "-n", SystemNamespace, "get", "pods", "-o", "name")
+
+	// Member pods and their PVCs, explicitly. `get all` does not include
+	// PersistentVolumeClaims at all, and a storage test polls precisely the
+	// storageClassName on them -- so the bundle omitted the object the
+	// failing assertion was about. Phase and conditions are spelled out
+	// because a pod that is Running but not Ready is the common shape of
+	// these failures and a phase alone does not show it.
+	save("pods.txt", "get", "pods", "-A", "-o", "wide")
+	save("pod-conditions.txt", "get", "pods", "-A", "-o",
+		`custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name,PHASE:.status.phase,READY:.status.conditions[?(@.type=="Ready")].status,REASON:.status.conditions[?(@.type=="Ready")].reason`)
+	save("pvcs.txt", "get", "pvc", "-A", "-o",
+		`custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name,STATUS:.status.phase,CLASS:.spec.storageClassName,VOLUME:.spec.volumeName,REQUESTED:.spec.resources.requests.storage`)
+	save("pgshard-objects.yaml", "get", "pgshardclusters,pgshardgroups,pgshardbackups,pgshardrestores,pgshardreshards",
+		"-A", "-o", "yaml")
+
+	// Logs for every pod the operator manages, in whatever namespace the
+	// suite put its cluster in. Only SystemNamespace was collected before,
+	// so an operator failure kept its own log and none of the members it
+	// was failing to reconcile -- which is the half that says what the
+	// members were actually doing.
+	c.gatherPodLogs(ctx, save, SystemNamespace, "")
+	c.gatherPodLogs(ctx, save, "", LabelCluster)
+}
+
+// LabelCluster marks every pod the operator creates for a cluster. It is
+// duplicated from internal/operator rather than imported so the e2e module
+// does not depend on the operator's internals.
+const LabelCluster = "pgshard.io/cluster"
+
+// gatherPodLogs saves current and previous logs for the pods matching
+// selector, in one namespace or across all of them when namespace is empty.
+func (c *Cluster) gatherPodLogs(ctx context.Context, save func(string, ...string), namespace, selector string) {
+	args := []string{"get", "pods", "-o", "custom-columns=NS:.metadata.namespace,NAME:.metadata.name", "--no-headers"}
+	if namespace == "" {
+		args = append(args, "-A")
+	} else {
+		args = append([]string{"-n", namespace}, args...)
+	}
+	if selector != "" {
+		args = append(args, "-l", selector)
+	}
+	out, err := c.Kubectl(ctx, nil, args...)
 	if err != nil {
 		return
 	}
-	for _, p := range strings.Fields(pods) {
-		short := strings.TrimPrefix(p, "pod/")
-		save("logs-"+short+".txt", "-n", SystemNamespace, "logs", "--all-containers", "--prefix", p)
-		save("logs-"+short+"-previous.txt", "-n", SystemNamespace, "logs", "--all-containers", "--previous", p)
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			continue
+		}
+		ns, name := f[0], f[1]
+		save("logs-"+ns+"-"+name+".txt", "-n", ns, "logs", "--all-containers", "--prefix", "pod/"+name)
+		save("logs-"+ns+"-"+name+"-previous.txt", "-n", ns, "logs", "--all-containers", "--previous", "pod/"+name)
 	}
 }
 
