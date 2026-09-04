@@ -24,14 +24,12 @@ service Controller {
   // ResolveTransactions triggers a resolution pass over in-doubt
   // distributed transactions.
   rpc ResolveTransactions(ResolveTransactionsRequest) returns (ResolveTransactionsResponse);
-  // ApplyDDL starts a DDL migration and streams per-shard progress.
-  //
-  // NOT IMPLEMENTED: the server has no handler for this and answers
-  // UNIMPLEMENTED. It is declared because the shape is settled and the
-  // applier it would drive exists; wiring it up is PGS-489. Said here
-  // because this file is what clients are generated from, and a method
-  // that only fails when called is worse to discover at run time.
-  rpc ApplyDDL(ApplyDDLRequest) returns (stream ApplyDDLResponse);
+  // ApplyDDL was declared here and never implemented; removed in PGS-629.
+  // Do not add it back: DDL enters through the router, which is the only
+  // process that links the parser and can classify a statement into the
+  // metadata the applier needs (the role to run as, the object to resume
+  // against, the shard set it was planned for). A controller-side entry
+  // point taking a bare statement can supply none of that.
   // CreateBarrier pauses writes, drains two-phase commits, creates a named
   // restore point on every group and records a certified restore point.
   rpc CreateBarrier(CreateBarrierRequest) returns (CreateBarrierResponse);
@@ -149,38 +147,6 @@ message ResolveTransactionsResponse {
   // Transactions still in doubt after the pass.
   uint32 unresolved = 3;
   Error error = 4;
-}
-
-// ApplyDDLRequest starts a DDL migration.
-message ApplyDDLRequest {
-  // Target database.
-  string database = 1;
-  // DDL statement to apply on every shard.
-  string statement = 2;
-  // True returns after the migration is registered; false streams to completion.
-  bool async = 3;
-}
-
-// ShardDDLState is the migration state on one shard.
-message ShardDDLState {
-  // Per-shard migration state.
-  enum State {
-    STATE_UNSPECIFIED = 0;
-    STATE_QUEUED = 1;
-    STATE_RUNNING = 2;
-    STATE_COMPLETED = 3;
-    STATE_FAILED = 4;
-  }
-  ShardRef shard = 1;
-  State state = 2;
-  Error error = 3;
-}
-
-// ApplyDDLResponse is the first message with the migration id, then per-shard
-// state updates until the stream ends.
-message ApplyDDLResponse {
-  string migration_id = 1;
-  ShardDDLState shard_state = 2;
 }
 
 // CreateBarrierRequest names the barrier; the restore point on every group
