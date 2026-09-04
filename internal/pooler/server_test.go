@@ -120,11 +120,24 @@ func TestReserveAndRelease(t *testing.T) {
 	stream, _ := h.client.Execute(ctx)
 	roundTrip(t, stream, queryReq("s", "set x = 1", gen(7, 3), identity("alice")))
 	roundTrip(t, stream, queryReq("s", "begin", gen(7, 3), nil))
-	shortCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	const releaseBudget = 200 * time.Millisecond
+	shortCtx, cancel := context.WithTimeout(ctx, releaseBudget)
+	start := time.Now()
 	_, err = h.client.Release(shortCtx, &pgshardv1.ReleaseRequest{SessionId: "s"})
+	waited := time.Since(start)
 	cancel()
-	if status.Code(err) != codes.DeadlineExceeded {
+	// The property is that Release waited: it must not detach a backend out
+	// from under a live stream. Which terminal code the deadline produces is
+	// not that property -- gRPC surfaces Canceled rather than DeadlineExceeded
+	// when the deadline fires while the call is being torn down, which a
+	// loaded runner reaches often enough to fail the gate on nothing. The
+	// elapsed floor is what makes accepting either code safe: a Release that
+	// returned early would be short, whatever it called itself.
+	if code := status.Code(err); code != codes.DeadlineExceeded && code != codes.Canceled {
 		t.Fatalf("Release with a live stream must wait for it to detach: %v", err)
+	}
+	if waited < releaseBudget {
+		t.Fatalf("Release returned after %s, inside its %s budget: it did not wait for the stream", waited, releaseBudget)
 	}
 	if h.srv.held() != 1 {
 		t.Fatal("reserved session must hold its backend between batches")
