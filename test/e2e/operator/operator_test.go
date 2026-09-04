@@ -293,6 +293,29 @@ func (w *writer) finish() ([]int64, int, time.Duration) {
 
 func waitFor(ctx context.Context, t *testing.T, what string, timeout time.Duration, cond func() bool) {
 	t.Helper()
+	waitForWhy(ctx, t, what, timeout, nil, cond)
+}
+
+// waitForWhy is waitFor with the state it is waiting on reported, in the
+// progress lines and in the timeout.
+//
+// Without it a twenty-five minute wait produces twenty-five identical
+// "still waiting" lines and a final message carrying no evidence, so a
+// budget that is too small for the hardware and a rebuild that is
+// genuinely stuck look exactly the same from the outside. That is the
+// whole difficulty in PGS-578: the failure cannot be read after the fact,
+// only re-run.
+func waitForWhy(ctx context.Context, t *testing.T, what string, timeout time.Duration, why func() string, cond func() bool) {
+	t.Helper()
+	saw := func() string {
+		if why == nil {
+			return ""
+		}
+		if s := why(); s != "" {
+			return "; saw " + s
+		}
+		return ""
+	}
 	started := time.Now()
 	deadline := started.Add(timeout)
 	nextProgress := started.Add(time.Minute)
@@ -301,10 +324,10 @@ func waitFor(ctx context.Context, t *testing.T, what string, timeout time.Durati
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out after %s waiting for %s", timeout, what)
+			t.Fatalf("timed out after %s waiting for %s%s", timeout, what, saw())
 		}
 		if time.Now().After(nextProgress) {
-			t.Logf("still waiting for %s (%s elapsed)", what, time.Since(started).Round(time.Second))
+			t.Logf("still waiting for %s (%s elapsed)%s", what, time.Since(started).Round(time.Second), saw())
 			nextProgress = time.Now().Add(time.Minute)
 		}
 		select {
@@ -944,7 +967,18 @@ reclaimPolicy: Delete
 			return c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pvc", "-l", "pgshard.io/cluster="+clusterName+",pgshard.io/group=shard-0", "-o",
 				`jsonpath={range .items[*]}{.metadata.name}:{.spec.storageClassName}{" "}{end}`)
 		}
-		waitFor(ctx, t, "every shard member to move onto the new class", 25*time.Minute, func() bool {
+		// The class each claim is on, every minute and at the deadline.
+		// One claim moved and two not is a rebuild working through the
+		// members slowly; none moved after twenty-five minutes is a
+		// rebuild that never started, and only this tells them apart.
+		classWhy := func() string {
+			out, err := pvcs()
+			if err != nil {
+				return "claims unreadable: " + err.Error()
+			}
+			return strings.TrimSpace(out) + " rolloutIdle=" + strconv.FormatBool(rolloutIdle())
+		}
+		waitForWhy(ctx, t, "every shard member to move onto the new class", 25*time.Minute, classWhy, func() bool {
 			out, err := pvcs()
 			if err != nil {
 				return false
