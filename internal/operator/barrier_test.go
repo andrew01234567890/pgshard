@@ -626,3 +626,106 @@ func TestTheLastBarrierNeverMovesBackwards(t *testing.T) {
 		t.Fatalf("a newer barrier did not land: %v", last.At)
 	}
 }
+
+// TestSchedulerVerifiesEveryGroupRepository: Agent.Verify existed and had no
+// caller, so pgbackrest verify never ran in production -- a repository could
+// stop being restorable and nothing would say so until a restore was needed.
+// It reaches every group's primary, a cluster still coming up is skipped
+// rather than reported as a failure, and one unverifiable repository does not
+// stop the others.
+func TestSchedulerVerifiesEveryGroupRepository(t *testing.T) {
+	pol := newPolicy()
+	pol.Spec.VerifySchedule = "@daily"
+	cl := fakeClient(t, pol, boundCluster("demo"))
+	s := NewBackupScheduler(cl)
+	tick := time.Date(2026, 9, 4, 3, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return tick }
+	key := client.ObjectKeyFromObject(pol)
+
+	if err := s.FireVerify(context.Background(), key); err == nil || !strings.Contains(err.Error(), "no agent client") {
+		t.Fatalf("without a client: %v", err)
+	}
+	agents := &fakeBackupAgents{fail: map[string]error{}}
+	s.Agents = agents
+
+	// No groups yet: nothing to verify, and that is not a failure. Saying so
+	// every tick would bury the repositories that really are unverifiable.
+	if err := s.FireVerify(context.Background(), key); err != nil {
+		t.Fatalf("a cluster still coming up must not fail the tick: %v", err)
+	}
+	if len(agents.calls) != 0 {
+		t.Fatalf("verified something before any group had a primary: %v", agents.calls)
+	}
+
+	var c pgshardv1alpha1.PgShardCluster
+	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "demo"}, &c); err != nil {
+		t.Fatal(err)
+	}
+	var addrs []string
+	for i, g := range Groups(&c) {
+		pg := &pgshardv1alpha1.PgShardGroup{ObjectMeta: metav1.ObjectMeta{Name: g.Prefix(), Namespace: "default"}}
+		if err := cl.Create(context.Background(), pg); err != nil {
+			t.Fatal(err)
+		}
+		pg.Status.Primary = g.MemberName(0)
+		if err := cl.Status().Update(context.Background(), pg); err != nil {
+			t.Fatal(err)
+		}
+		ip := fmt.Sprintf("10.2.0.%d", i+1)
+		if err := cl.Create(context.Background(), readyPod(g.MemberName(0), ip)); err != nil {
+			t.Fatal(err)
+		}
+		addrs = append(addrs, agentAddr(ip))
+	}
+	if len(addrs) < 2 {
+		t.Fatalf("this test needs more than one group, got %d", len(addrs))
+	}
+
+	if err := s.FireVerify(context.Background(), key); err != nil {
+		t.Fatalf("every repository verifiable: %v", err)
+	}
+	if len(agents.calls) != len(addrs) {
+		t.Fatalf("verified %d of %d groups: %v", len(agents.calls), len(addrs), agents.calls)
+	}
+	if last, ok := s.LastVerify(key); !ok || !last.At.Equal(tick) || last.Error != "" {
+		t.Fatalf("last verify %+v ok=%v", last, ok)
+	}
+
+	// One repository that cannot be verified is reported and does not stop
+	// the rest: a partial answer is worth more than none.
+	agents.calls = nil
+	agents.fail["verify "+addrs[0]] = errors.New("checksum mismatch")
+	err := s.FireVerify(context.Background(), key)
+	if err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Fatalf("an unverifiable repository must be reported: %v", err)
+	}
+	if len(agents.calls) != len(addrs) {
+		t.Fatalf("one failure stopped the others: %v", agents.calls)
+	}
+	if last, ok := s.LastVerify(key); !ok || !strings.Contains(last.Error, "checksum mismatch") {
+		t.Fatalf("last verify %+v ok=%v", last, ok)
+	}
+}
+
+// TestVerifyScheduleArmsAndDisarms: a bad expression must not arm, and a
+// removed policy must take its schedule with it -- an entry that outlives
+// its policy fires for ever against something that is gone.
+func TestVerifyScheduleArmsAndDisarms(t *testing.T) {
+	pol := newPolicy()
+	cl := fakeClient(t, pol)
+	s := NewBackupScheduler(cl)
+	key := client.ObjectKeyFromObject(pol)
+
+	if err := s.SetVerify(key, "bad cron"); err == nil || s.VerifyArmed(key) {
+		t.Fatalf("a bad expression armed a schedule: %v", err)
+	}
+	if err := s.SetVerify(key, "@daily"); err != nil || !s.VerifyArmed(key) {
+		t.Fatalf("a good expression did not arm: %v", err)
+	}
+	s.mu.Lock()
+	s.removeLocked(key)
+	s.mu.Unlock()
+	if s.VerifyArmed(key) {
+		t.Fatal("a removed policy left its verification schedule armed")
+	}
+}
