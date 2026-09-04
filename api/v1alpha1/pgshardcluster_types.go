@@ -47,6 +47,7 @@ const (
 	RolloutPhaseSwitchover = "Switchover"
 	RolloutPhaseRebuilding = "Rebuilding"
 	RolloutPhaseExpanding  = "Expanding"
+	RolloutPhaseRetiring   = "Retiring"
 	RolloutPhaseHeld       = "Held"
 )
 
@@ -109,16 +110,37 @@ type StorageSpec struct {
 	Size resource.Quantity `json:"size"`
 	// +optional
 	StorageClassName *string `json:"storageClassName,omitempty"`
+	// ReclaimRetiredClaims deletes the volume of a member retired by
+	// lowering a replica count. It defaults to Retain, and deliberately: a
+	// retired member's volume is the only copy of whatever had not yet
+	// replicated when it left, and deleting data is a decision an operator
+	// makes rather than a side effect of editing a number. Retained claims
+	// are labelled with the member they belonged to and can be deleted by
+	// hand once the group is healthy without them.
+	//
+	// This is not the storage-rebuild path: the claim a rebuild supersedes
+	// is deleted once the member streams from its successor, because the
+	// successor is a copy of it.
+	// +kubebuilder:validation:Enum=Retain;Delete
+	// +kubebuilder:default=Retain
+	// +optional
+	ReclaimRetiredClaims string `json:"reclaimRetiredClaims,omitempty"`
 }
+
+// ReclaimRetain and ReclaimDelete are StorageSpec.ReclaimRetiredClaims.
+const (
+	ReclaimRetain = "Retain"
+	ReclaimDelete = "Delete"
+)
 
 // CatalogSpec configures the control-plane catalog group.
 type CatalogSpec struct {
-	// Replicas is the catalog group's member count. Like
-	// replicasPerShard it may be raised and not lowered, and for the same
-	// reason: nothing retires a member it stops rendering.
+	// Replicas is the catalog group's member count. It may be raised or
+	// lowered; lowering retires the members above the new count one at a
+	// time, switching away first if one of them is the primary. What
+	// happens to their volumes is spec.storage.reclaimRetiredClaims.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=3
-	// +kubebuilder:validation:XValidation:rule="self >= oldSelf",message="catalog.replicas cannot be lowered: a member removed by lowering this is left running: it keeps its pod, its PVC, its replication slot and its place in synchronous_standby_names, because nothing drains or deletes it yet. Raising it is supported"
 	// +optional
 	Replicas int         `json:"replicas,omitempty"`
 	Storage  StorageSpec `json:"storage"`
@@ -337,12 +359,17 @@ const ConditionTopologyDegraded = "TopologyDegraded"
 // is no path the other way -- nothing discovers the members outside the new
 // range, switches away from one that is primary, drains it, updates
 // synchronous and slot membership, and then removes its pod and claim. A
-// decrease would leave those members running with a replication membership
-// the generated configuration no longer describes, and their volumes with
-// them. Refused until that path exists rather than half-done on a live
-// cluster; a group can still be replaced by resharding to a new set.
-// +kubebuilder:validation:XValidation:rule="self.replicasPerShard >= oldSelf.replicasPerShard",message="replicasPerShard cannot be decreased: removing members needs a drain that pgshard does not implement yet, and the removed pods and volumes would be left running"
-// +kubebuilder:validation:XValidation:rule="self.catalog.replicas >= oldSelf.catalog.replicas",message="catalog.replicas cannot be decreased: removing members needs a drain that pgshard does not implement yet, and the removed pods and volumes would be left running"
+// decrease retires them one at a time instead, switching away from a
+// removed primary first and dropping each member's slot and its place in
+// synchronous_standby_names before its pod goes.
+//
+// What a lowering may not do is take the group below the durability it is
+// configured for. A group of n members has n-1 standbys, so n must stay
+// above minSyncStandbys; without this rule a lowering could ask for more
+// acknowledgements than the group can ever produce, and every commit would
+// wait for a standby that does not exist.
+// +kubebuilder:validation:XValidation:rule="self.unsafeSingleReplica || !has(self.durability) || self.replicasPerShard > self.durability.minSyncStandbys",message="replicasPerShard must stay above durability.minSyncStandbys: a group of n members has n-1 standbys, and a commit cannot wait for more acknowledgements than that"
+// +kubebuilder:validation:XValidation:rule="self.unsafeSingleReplica || !has(self.durability) || self.catalog.replicas > self.durability.minSyncStandbys",message="catalog.replicas must stay above durability.minSyncStandbys: a group of n members has n-1 standbys, and a commit cannot wait for more acknowledgements than that"
 // A group of n members has n-1 standbys, so asking for more
 // acknowledgements than that is asking for something no configuration can
 // deliver. SyncStandbyNames clamps it to what exists, which means the
@@ -373,12 +400,12 @@ type PgShardClusterSpec struct {
 	// running, their PVCs stay, their slots stay, and they stay in
 	// synchronous_standby_names -- so a commit can still be acknowledged
 	// by a member the cluster has stopped managing. Refusing the edit is
-	// the honest containment until there is a path that switches away from
-	// a removed primary, drains one member at a time, and retires each
-	// one's volume deliberately.
+	// Lowering it retires the members above the new count one at a time,
+	// switching away first if one of them is the primary, and taking each
+	// out of synchronous_standby_names and dropping its slot before its pod
+	// goes. What happens to their volumes is spec.storage.reclaimRetiredClaims.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=3
-	// +kubebuilder:validation:XValidation:rule="self >= oldSelf",message="replicasPerShard cannot be lowered: a member removed by lowering this is left running: it keeps its pod, its PVC, its replication slot and its place in synchronous_standby_names, because nothing drains or deletes it yet. Raising it is supported"
 	// +optional
 	ReplicasPerShard int `json:"replicasPerShard,omitempty"`
 	// UnsafeSingleReplica relaxes the replicasPerShard and catalog.replicas

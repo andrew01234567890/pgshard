@@ -781,14 +781,12 @@ func TestARestoreSpecDoesNotChangeUnderTheOperator(t *testing.T) {
 	}
 }
 
-// TestAReplicaCountOnlyGrows: growing a group is reconciled -- the new
-// ordinals get pods and join. There is no path the other way: nothing
-// discovers the members outside the new range, switches away from one that
-// is primary, drains it, updates synchronous and slot membership, and then
-// removes its pod and claim. A decrease would leave those members running
-// with a replication membership the generated configuration no longer
-// describes.
-func TestAReplicaCountOnlyGrows(t *testing.T) {
+// TestAReplicaCountMayShrinkButNotBelowItsDurability: lowering a count is
+// reconciled now -- the members outside the new range are retired one at a
+// time. What the API still refuses is a lowering that would leave the group
+// unable to keep the durability it is configured for: a group of n members
+// has n-1 standbys, so a commit cannot wait for n acknowledgements.
+func TestAReplicaCountMayShrinkButNotBelowItsDurability(t *testing.T) {
 	c := validCluster("scale")
 	c.Spec.ReplicasPerShard = 5
 	c.Spec.Catalog.Replicas = 5
@@ -801,17 +799,26 @@ func TestAReplicaCountOnlyGrows(t *testing.T) {
 		mutate func(*pgshardv1alpha1.PgShardCluster)
 		want   string
 	}{
-		{"fewer members per shard", func(x *pgshardv1alpha1.PgShardCluster) { x.Spec.ReplicasPerShard = 3 },
-			"replicasPerShard cannot be decreased"},
-		{"fewer catalog members", func(x *pgshardv1alpha1.PgShardCluster) { x.Spec.Catalog.Replicas = 3 },
-			"catalog.replicas cannot be decreased"},
+		{"a shard group left with fewer standbys than commits wait for",
+			func(x *pgshardv1alpha1.PgShardCluster) {
+				x.Spec.Durability.MinSyncStandbys = 2
+				x.Spec.ReplicasPerShard = 2
+			}, "replicasPerShard must stay above durability.minSyncStandbys"},
+		{"a catalog group left with fewer standbys than commits wait for",
+			func(x *pgshardv1alpha1.PgShardCluster) {
+				x.Spec.Durability.MinSyncStandbys = 2
+				x.Spec.Catalog.Replicas = 2
+			}, "catalog.replicas must stay above durability.minSyncStandbys"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			smaller := c.DeepCopy()
-			tc.mutate(smaller)
-			err := k8sClient.Update(context.Background(), smaller)
+			var cur pgshardv1alpha1.PgShardCluster
+			if err := k8sClient.Get(context.Background(), client.ObjectKeyFromObject(c), &cur); err != nil {
+				t.Fatal(err)
+			}
+			tc.mutate(&cur)
+			err := k8sClient.Update(context.Background(), &cur)
 			if err == nil {
-				t.Fatal("a decrease must be refused while nothing drains the removed members")
+				t.Fatal("a group cannot promise more acknowledgements than it has standbys")
 			}
 			if !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("refused for the wrong reason: %v", err)
@@ -819,13 +826,18 @@ func TestAReplicaCountOnlyGrows(t *testing.T) {
 		})
 	}
 
-	// Growing is reconciled, so it stays allowed -- containment here must
-	// not cost the direction that works.
-	bigger := c.DeepCopy()
-	bigger.Spec.ReplicasPerShard = 7
-	bigger.Spec.Catalog.Replicas = 7
-	if err := k8sClient.Update(context.Background(), bigger); err != nil {
-		t.Fatalf("growing a group must stay allowed: %v", err)
+	// Both directions are reconciled now. Lowering retires the members
+	// above the new count one at a time; growing gives the new ordinals
+	// pods and lets them join.
+	for _, n := range []int{7, 3} {
+		var cur pgshardv1alpha1.PgShardCluster
+		if err := k8sClient.Get(context.Background(), client.ObjectKeyFromObject(c), &cur); err != nil {
+			t.Fatal(err)
+		}
+		cur.Spec.ReplicasPerShard, cur.Spec.Catalog.Replicas = n, n
+		if err := k8sClient.Update(context.Background(), &cur); err != nil {
+			t.Fatalf("resizing a group to %d must be allowed: %v", n, err)
+		}
 	}
 }
 
