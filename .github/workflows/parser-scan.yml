@@ -59,6 +59,9 @@ jobs:
             cppcheck --force --quiet --enable=warning,performance,portability \
               --suppress=missingInclude --suppress=missingIncludeSystem \
               --suppressions-list=hack/pgparser/cppcheck-suppressions.txt \
+              `# that file is ids and nothing else: cppcheck parses every` \
+              `# line as a suppression spec, so a comment aborts the scan.` \
+              `# The reasons are in cppcheck-suppressions.md beside it.` \
               --inline-suppr --error-exitcode=0 \
               --xml "$dir" 2> "parser-scan/cppcheck-$major.xml" || true
             python3 - "parser-scan/cppcheck-$major.xml" <<'PY' | tee "parser-scan/cppcheck-$major.txt"
