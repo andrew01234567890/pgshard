@@ -790,6 +790,15 @@ func (w *walker) statement(node *pgquerypb.Node) error {
 				"DELETE the rows, or wait for the reshard to complete")
 		}
 		return w.maintenanceList("TRUNCATE", n.TruncateStmt.GetRelations())
+	case *pgquerypb.Node_RefreshMatViewStmt:
+		// A matview only ever exists over unsharded data -- CREATE
+		// MATERIALIZED VIEW over a sharded or reference table is refused --
+		// so it lives on the home shard and refreshing it is a single-shard
+		// statement, routed exactly as the CREATE and the SELECT that reads
+		// it already are. Without this the view was frozen at its creation
+		// contents for the life of the cluster, and nothing said so until
+		// somebody tried to refresh it.
+		return w.maintenance("REFRESH MATERIALIZED VIEW", n.RefreshMatViewStmt.GetRelation())
 	case *pgquerypb.Node_LockStmt:
 		return w.maintenanceList("LOCK TABLE", n.LockStmt.GetRelations())
 	case *pgquerypb.Node_VacuumStmt:

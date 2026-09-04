@@ -392,7 +392,16 @@ func golden() []want {
 		{sql: "do $$ begin delete from orders; end $$", kind: Refuse, msg: "DO is not supported through the router"},
 		{sql: "call cleanup_orders()", kind: Refuse, msg: "CALL is not supported through the router"},
 		{sql: "create function f() returns int language sql as 'select 1'", kind: Refuse, msg: "CREATE FUNCTION is not supported through the router"},
-		{sql: "refresh materialized view mv", kind: Refuse, msg: "REFRESH MATERIALIZED VIEW is not supported through the router"},
+		// A matview can only have been created over unsharded data, so it
+		// lives on the home shard and refreshing it goes there. Before this
+		// the view was frozen at its creation contents for good.
+		{sql: "refresh materialized view mv", kind: Unsharded, shards: "0"},
+		{sql: "refresh materialized view concurrently mv", kind: Unsharded, shards: "0"},
+		// The defensive half: a matview cannot be created over a sharded
+		// table today, so this is unreachable through the router -- but if
+		// one ever existed, refreshing it must refuse rather than silently
+		// refresh the home shard's copy of a table that lives on all of them.
+		{sql: "refresh materialized view orders", kind: Refuse, msg: "REFRESH MATERIALIZED VIEW on sharded and reference tables is not available yet"},
 		{sql: "security label on table orders is 'x'", kind: Refuse, msg: "SECURITY LABEL is not supported through the router"},
 		{sql: "select 1; select 2", kind: Refuse, msg: "multi-statement queries are not supported through the router"},
 	}
