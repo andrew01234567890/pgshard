@@ -193,6 +193,14 @@ func (c *Cluster) WaitPodsReady(ctx context.Context, namespace, selector string,
 			return fmt.Errorf("pods %q in %s cannot pull an image, which waiting does not fix:\n%s", selector, namespace, stuck)
 		}
 		if time.Now().After(deadline) {
+			// err is nil when the selector matched nothing at all, and
+			// %w on a nil error renders "%!w(<nil>)" -- which reads as a
+			// broken harness and hides the one fact that explains the
+			// timeout. A selector that matches no pod is the common
+			// mistake and deserves to be said outright.
+			if err == nil {
+				return fmt.Errorf("pods %q in %s not ready after %s: no pod matched the selector", selector, namespace, timeout)
+			}
 			return fmt.Errorf("pods %q in %s not ready after %s: %w", selector, namespace, timeout, err)
 		}
 		select {
