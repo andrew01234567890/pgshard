@@ -331,6 +331,17 @@ func scanStatement(root *pgquerypb.Node) preScan {
 		if rt := n.GetResTarget(); rt != nil && out.hiddenName == "" && strings.HasPrefix(rt.GetName(), catalog.HiddenPrefix) {
 			out.hiddenName = rt.GetName()
 		}
+		// DDL names a column as a plain string rather than a ColumnRef, so
+		// the two cases above miss it entirely: ALTER TABLE ... DROP COLUMN
+		// _pgshard_x, RENAME COLUMN, and CREATE INDEX on one were all
+		// accepted. That matters because introspection still lists the
+		// working column (PGS-590), so a migration tool that diffs the
+		// schema and writes SQL from it proposes exactly these statements
+		// -- and dropping the column mid-rewrite destroys the backfill and
+		// the dual-write triggers with it.
+		if out.hiddenName == "" {
+			out.hiddenName = hiddenDDLName(n)
+		}
 		if out.setConfigErr == nil {
 			out.setConfigErr = setConfigRefusal(n)
 		}
@@ -1859,4 +1870,42 @@ func (w *walker) delete(s *pgquerypb.DeleteStmt) error {
 		return err
 	}
 	return w.decide(true)
+}
+
+// hiddenDDLName is the migration working column a DDL statement names, if
+// it names one. DDL carries a column name as a plain string on the command
+// rather than as a ColumnRef, so the scan's other two cases do not see it.
+//
+// Only the nodes that name an EXISTING column are listed. A ColumnDef, for
+// instance, names one being created, and refusing that would refuse a
+// migration the applier itself is running.
+func hiddenDDLName(n *pgquerypb.Node) string {
+	hidden := func(s string) string {
+		if strings.HasPrefix(s, catalog.HiddenPrefix) {
+			return s
+		}
+		return ""
+	}
+	if c := n.GetAlterTableCmd(); c != nil {
+		if name := hidden(c.GetName()); name != "" {
+			return name
+		}
+	}
+	if r := n.GetRenameStmt(); r != nil {
+		// Subname is the column on a RENAME COLUMN; Newname is what it
+		// would become, and renaming something else INTO the reserved
+		// prefix is just as bad as renaming the working column away.
+		if name := hidden(r.GetSubname()); name != "" {
+			return name
+		}
+		if name := hidden(r.GetNewname()); name != "" {
+			return name
+		}
+	}
+	if e := n.GetIndexElem(); e != nil {
+		if name := hidden(e.GetName()); name != "" {
+			return name
+		}
+	}
+	return ""
 }

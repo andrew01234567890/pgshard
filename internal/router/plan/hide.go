@@ -15,6 +15,20 @@ import (
 // without a column list gets one, so the shards' extra column never
 // reaches a client. The rewritten text is left in plan.Rewritten.
 func (w *walker) hideRewriteColumns() error {
+	// Ahead of the switch below, because a DDL statement plans as
+	// MigrationKind and used to walk straight past this: ALTER TABLE ...
+	// DROP COLUMN on a working column, RENAME COLUMN, and CREATE INDEX on
+	// one were all accepted. Introspection still lists the working column
+	// (PGS-590), so a migration tool that diffs the schema proposes exactly
+	// those, and dropping the column mid-rewrite destroys the backfill and
+	// the dual-write triggers with it.
+	//
+	// The rewrite's own steps do not come through here -- the applier runs
+	// them on the shards directly -- so nothing legitimate names a working
+	// column at this point.
+	if err := w.refuseHiddenNames(); err != nil {
+		return err
+	}
 	switch w.plan.Kind {
 	case Refuse, SessionLocal, MigrationKind:
 		return nil
@@ -24,9 +38,6 @@ func (w *walker) hideRewriteColumns() error {
 		if len(r.hidden) > 0 {
 			under = append(under, r)
 		}
-	}
-	if err := w.refuseHiddenNames(); err != nil {
-		return err
 	}
 	if len(under) == 0 {
 		return nil
