@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -439,6 +440,22 @@ func TestController(t *testing.T) {
 				t.Fatalf("no event %+v", want)
 			}
 		}
+		expectBoth := func(want ...event) {
+			t.Helper()
+			left := append([]event(nil), want...)
+			for range want {
+				select {
+				case got := <-events:
+					i := slices.Index(left, got)
+					if i < 0 {
+						t.Fatalf("event %+v, want one of %+v", got, left)
+					}
+					left = slices.Delete(left, i, i+1)
+				case <-time.After(15 * time.Second):
+					t.Fatalf("no event, still waiting for %+v", left)
+				}
+			}
+		}
 		expect(event{"a", true})
 		<-results
 		ctxB, cancelB := context.WithCancel(ctx)
@@ -458,9 +475,16 @@ func TestController(t *testing.T) {
 		case <-time.After(15 * time.Second):
 			t.Fatal("leader did not react to pgshard_desired")
 		}
+		// The handover has no order to assert. Cancelling a makes it drop
+		// the advisory lock and report the loss; b is polling for that
+		// lock and reports the gain the moment it takes it. Those are two
+		// goroutines writing one channel with nothing between them, so b
+		// can announce leadership before a has been scheduled to announce
+		// losing it -- which is what CI saw ("event {who:b leader:true},
+		// want {who:a leader:false}") and what eight local runs did not.
+		// Require both events, in either order.
 		cancelA()
-		expect(event{"a", false})
-		expect(event{"b", true})
+		expectBoth(event{"a", false}, event{"b", true})
 	})
 
 	t.Run("periodic_pass_keeps_leadership", func(t *testing.T) {
