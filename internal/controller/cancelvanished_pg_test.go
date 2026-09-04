@@ -58,3 +58,45 @@ func TestCancelsWorkflowWhoseSourceVanished(t *testing.T) {
 		t.Logf("target status rows retained: %d", rows)
 	}
 }
+
+// TestCancelsPendingWorkflowWhoseSetVanished: an in-place range edit creates
+// a reshard workflow in 'pending', and nothing drives it yet. Dropping the
+// set it was created for used to leave that row active for ever -- the
+// cancel pass listed it, then skipped it through the default arm. It
+// outlived the set, and because the catalog counts an active workflow as
+// moving data out of its source, it also held off the next reshard that
+// wanted to.
+func TestCancelsPendingWorkflowWhoseSetVanished(t *testing.T) {
+	parallelPG(t)
+	dsn := startPostgres(t)
+	ctx := context.Background()
+	conn := connect(t, dsn)
+	if err := catalog.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, `UPDATE pgshard.shard_sets SET generation = 1, state = 'serving' WHERE shard_set = 'default'`)
+	mustExec(t, conn, `INSERT INTO pgshard.shard_ranges (shard_set, shard_id, range) VALUES ('default', 0, '[,)')`)
+	mustExec(t, conn, `INSERT INTO pgshard.shard_status (shard_set, shard_id, group_name, serving_state, primary_epoch, primary_endpoint) VALUES
+		('default', 0, 'shard0', 'serving', 1, 'shard0-0:5432')`)
+	// The workflow's own set never existed as far as this pass can see.
+	mustExec(t, conn, `INSERT INTO pgshard.workflows (id, kind, state, spec, status) VALUES
+		('16161616-1616-1616-1616-161616161616', 'reshard', 'pending',
+		 '{"shard_set": "gone", "source_set": "default"}'::jsonb, '{}'::jsonb)`)
+
+	res := reconcile(t, conn)
+	if res.ReshardsCancelled != 1 {
+		t.Fatalf("a pending workflow whose set is gone must be cancelled, got %+v", res)
+	}
+
+	var state, stage string
+	if err := conn.QueryRow(ctx, `SELECT state, status->>'stage'
+		FROM pgshard.workflows WHERE id = '16161616-1616-1616-1616-161616161616'`).Scan(&state, &stage); err != nil {
+		t.Fatal(err)
+	}
+	if state != StateCancelled {
+		t.Fatalf("state = %s, want %s", state, StateCancelled)
+	}
+	if stage != StageCancelled {
+		t.Fatalf("stage = %s, want %s: a pending workflow created nothing to clean up", stage, StageCancelled)
+	}
+}
