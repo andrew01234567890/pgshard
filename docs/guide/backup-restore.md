@@ -26,6 +26,7 @@ spec:
     full: "0 2 * * *"
     incremental: "*/30 * * * *"
   barrierSchedule: "0 * * * *"     # hourly certified restore points
+  verifySchedule: "0 4 * * 0"      # weekly pgbackrest verify of every repo
   retention:
     full: 7
     differential: 4

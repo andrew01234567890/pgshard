@@ -621,6 +621,9 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 			"--tls-cert", dir+"/tls.crt",
 			"--tls-key", dir+"/tls.key",
 			"--tls-ca", dir+"/ca.crt")
+		if c.Spec.InternalTLS.Issue {
+			args = append(args, "--tls-authorize-callers")
+		}
 		mounts = append(mounts, corev1.VolumeMount{Name: vol, MountPath: dir, ReadOnly: true})
 	} else if c.Spec.InternalTLS.Insecure {
 		args = append(args, "--insecure-dev")
@@ -692,9 +695,12 @@ func agentGRPCTLS(c *pgshardv1alpha1.PgShardCluster) agent.TLSFiles {
 		return agent.TLSFiles{}
 	}
 	return agent.TLSFiles{
-		CertFile: internalTLSMountPath + "/tls.crt",
-		KeyFile:  internalTLSMountPath + "/tls.key",
-		CAFile:   internalTLSMountPath + "/ca.crt",
+		// Only when the operator issued them: supplied certificates carry
+		// no identity to authorise.
+		AuthorizeCallers: c.Spec.InternalTLS.Issue,
+		CertFile:         internalTLSMountPath + "/tls.crt",
+		KeyFile:          internalTLSMountPath + "/tls.key",
+		CAFile:           internalTLSMountPath + "/ca.crt",
 	}
 }
 

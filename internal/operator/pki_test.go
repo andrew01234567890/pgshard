@@ -260,3 +260,68 @@ func TestEveryListenerGetsACertificateItCanServeWith(t *testing.T) {
 		}
 	}
 }
+
+// TestIssuedCertificatesTurnAuthorisationOn pins the pairing: the flag is
+// only correct where the certificates carry identities, so it must follow
+// issuing and nothing else. On without them, every caller is refused; off
+// with them, the identities are carried and ignored.
+func TestIssuedCertificatesTurnAuthorisationOn(t *testing.T) {
+	const flag = "--tls-authorize-callers"
+	for _, tc := range []struct {
+		name string
+		tls  pgshardv1alpha1.InternalTLSSpec
+		want bool
+	}{
+		{"issued", pgshardv1alpha1.InternalTLSSpec{Issue: true}, true},
+		{"supplied", pgshardv1alpha1.InternalTLSSpec{SecretRef: &corev1.LocalObjectReference{Name: "given"}}, false},
+		{"insecure", pgshardv1alpha1.InternalTLSSpec{Insecure: true}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newCluster("authz-" + tc.name)
+			c.Spec.InternalTLS = tc.tls
+			g := Group{Cluster: c.Name, Kind: "shard", ShardID: 0, Replicas: 3}
+			pod := Renderer{}.Pod(c, g, 0, RolePrimary, g.MemberName(0), Template(c, g, nil, nil))
+			var pooler bool
+			for _, ct := range pod.Spec.Containers {
+				if strings.Contains(ct.Name, "pooler") {
+					pooler = slices.Contains(ct.Args, flag)
+				}
+			}
+			if pooler != tc.want {
+				t.Fatalf("pooler authorisation is %v, want %v", pooler, tc.want)
+			}
+			dep := Renderer{}.RouterDeployment(c)
+			if dep != nil {
+				for _, ct := range dep.Spec.Template.Spec.Containers {
+					if got := slices.Contains(ct.Args, flag); got != tc.want {
+						t.Fatalf("router authorisation is %v, want %v", got, tc.want)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestTheAgentAuthorisesOnlyWithIssuedCertificates(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tls  pgshardv1alpha1.InternalTLSSpec
+		want bool
+	}{
+		{"issued", pgshardv1alpha1.InternalTLSSpec{Issue: true, AgentMTLS: true}, true},
+		{"supplied", pgshardv1alpha1.InternalTLSSpec{
+			SecretRef: &corev1.LocalObjectReference{Name: "given"}, AgentMTLS: true}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newCluster("agentauthz-" + tc.name)
+			c.Spec.InternalTLS = tc.tls
+			tls := agentGRPCTLS(c)
+			if tls.CertFile == "" {
+				t.Fatal("agentMTLS must give the agent material")
+			}
+			if tls.AuthorizeCallers != tc.want {
+				t.Fatalf("agent authorisation is %v, want %v", tls.AuthorizeCallers, tc.want)
+			}
+		})
+	}
+}
