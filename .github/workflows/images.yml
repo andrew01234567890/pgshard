@@ -71,6 +71,8 @@ jobs:
         env:
           CI: "true"
           GIT_SHA: ${{ github.sha }}
+          VERSION: ${{ github.ref_name }}
+          BUILD_DATE: ${{ github.event.repository.updated_at }}
       - name: smoke
         run: |
           image=ghcr.io/andrew01234567890/pgshard-postgres:${{ matrix.major }}
@@ -78,6 +80,20 @@ jobs:
           docker run --rm --entrypoint pgbackrest "$image" version
           docker run --rm "$image" --version
           docker run --rm --entrypoint pgshard-pooler "$image" --version
+          # The agent and the pooler ship inside this image and are as
+          # deployed as anything the control plane publishes. Built without
+          # the build arguments they answer "dev (none, unknown)", which
+          # cannot tell anyone which commit is running on a member -- so the
+          # smoke test asks, rather than trusting that the arguments arrived.
+          for name in pgshard-agent pgshard-pooler; do
+            got=$(docker run --rm --entrypoint "$name" "$image" --version)
+            echo "$got"
+            case "$got" in
+              *"(none,"*|*"unknown)"*)
+                echo "::error::$name reports no build metadata: $got" >&2
+                exit 1 ;;
+            esac
+          done
 
   # Publishing is main's alone, and it happens after the smoke test rather
   # than before it. workflow_dispatch lets anyone with write access choose
@@ -178,3 +194,5 @@ jobs:
         env:
           CI: "true"
           GIT_SHA: ${{ github.sha }}
+          VERSION: ${{ github.ref_name }}
+          BUILD_DATE: ${{ github.event.repository.updated_at }}
