@@ -392,10 +392,16 @@ message RestoreInfoRequest {}
 // RestoreInfoResponse describes the stanza in the repository.
 message RestoreInfoResponse {
   uint64 epoch = 1;
-  // Backup the data directory was restored from; empty if never restored.
-  string backup_ref = 2;
-  // LSN at which recovery ended.
-  uint64 recovery_end_lsn = 3;
+  // 2 and 3 were backup_ref and recovery_end_lsn: the backup the data
+  // directory was restored from, and the LSN recovery ended at. Nothing
+  // ever set them, so every caller read "" and 0 -- and an unset scalar is
+  // indistinguishable from a measured one, so they did not read as missing,
+  // they read as answers. They also described the local instance, while
+  // every other field here describes the repository this member's stanza
+  // lives in, which is what the message is for. A recovery position belongs
+  // on a message about the instance and can take a fresh tag there.
+  reserved 2, 3;
+  reserved "backup_ref", "recovery_end_lsn";
   Error error = 4;
   string stanza = 5;
   // pgBackRest stanza status code and message (0 = ok).
