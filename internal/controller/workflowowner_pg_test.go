@@ -368,3 +368,92 @@ func TestARevokedPassDoesNotTearDownTheWorkflowItLost(t *testing.T) {
 		t.Fatal("a revoked pass failed a workflow another replica owns")
 	}
 }
+
+// cutoverParked inserts a running reshard workflow parked mid-cutover at
+// step, claimed by owner as of now (or never claimed when owner is empty).
+func cutoverParked(t *testing.T, f *placementFixture, step, owner string) string {
+	t.Helper()
+	var id string
+	var ownerArg any
+	if owner != "" {
+		ownerArg = owner
+	}
+	if err := f.catalog.QueryRow(context.Background(),
+		`INSERT INTO pgshard.workflows (id, kind, state, spec, status, owner, owned_at)
+		 VALUES (gen_random_uuid(), $1, $2, '{"database": "app", "shard_set": "g2"}'::jsonb,
+		         jsonb_build_object('stage', $3::text, 'cutover', jsonb_build_object('step', $4::text)),
+		         $5, CASE WHEN $5::text IS NULL THEN NULL ELSE now() END)
+		 RETURNING id::text`, KindReshard, StateRunning, StageSwitching, step, ownerArg).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// TestNoCutoverStepIsDrivenByTwoControllers is parameterised over every
+// step of the switch, so a step added later is covered by construction
+// rather than by remembering to add a case.
+//
+// A controller killed between any two steps leaves the workflow claimed
+// until its lease runs out. A second controller that believes it leads must
+// not touch it meanwhile: the steps before the journal hold a write fence
+// and table locks, and a pass that acted on a workflow it does not own
+// would lift a fence the owner is still relying on.
+func TestNoCutoverStepIsDrivenByTwoControllers(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	ctx := context.Background()
+	for _, step := range switchSteps {
+		t.Run(step, func(t *testing.T) {
+			id := cutoverParked(t, f, step, "replica-a")
+			stageBefore, updatedBefore, ownerBefore := cutoverRow(t, f, id)
+
+			other := &Copier{Pool: f.pool, Shards: f.placer.Shards, Logger: f.placer.Logger, Replica: "replica-b"}
+			out, err := other.Pass(ctx)
+			if err != nil {
+				t.Fatalf("a pass that owns nothing must not fail: %v", err)
+			}
+			if out.Driven != 0 {
+				t.Fatalf("replica-b drove a workflow claimed by replica-a at step %s: %+v", step, out)
+			}
+			stage, updated, owner := cutoverRow(t, f, id)
+			if stage != stageBefore || !updated.Equal(updatedBefore) || owner != ownerBefore {
+				t.Fatalf("replica-b mutated a workflow it does not own at step %s: stage %s(was %s) owner %s(was %s) updated %s(was %s)",
+					step, stage, stageBefore, owner, ownerBefore, updated, updatedBefore)
+			}
+			mustExec(t, f.catalog, `DELETE FROM pgshard.workflows WHERE id = $1::uuid`, id)
+		})
+	}
+}
+
+// TestAnUnclaimedCutoverStepIsPickedUp is the control for the test above.
+// Two processes that never actually contend pass whether or not the claim
+// works: if Pass simply did not select a workflow parked mid-cutover, every
+// case above would pass for the wrong reason. Here the same workflow, left
+// unclaimed, IS claimed -- so the refusals above are the claim doing its job.
+func TestAnUnclaimedCutoverStepIsPickedUp(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	ctx := context.Background()
+	id := cutoverParked(t, f, StepFence, "")
+
+	other := &Copier{Pool: f.pool, Shards: f.placer.Shards, Logger: f.placer.Logger, Replica: "replica-b"}
+	if _, err := other.Pass(ctx); err != nil {
+		t.Fatalf("pass: %v", err)
+	}
+	if _, _, owner := cutoverRow(t, f, id); owner != "replica-b" {
+		t.Fatalf("an unclaimed workflow parked mid-cutover was not claimed: owner %q", owner)
+	}
+}
+
+func cutoverRow(t *testing.T, f *placementFixture, id string) (stage string, updated time.Time, owner string) {
+	t.Helper()
+	var o *string
+	if err := f.catalog.QueryRow(context.Background(),
+		`SELECT status->>'stage', updated_at, owner FROM pgshard.workflows WHERE id = $1::uuid`, id).Scan(&stage, &updated, &o); err != nil {
+		t.Fatal(err)
+	}
+	if o != nil {
+		owner = *o
+	}
+	return stage, updated, owner
+}
