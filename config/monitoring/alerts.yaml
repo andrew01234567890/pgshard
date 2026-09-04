@@ -119,6 +119,26 @@ spec:
               outlives its decision is holding locks, WAL and a vacuum
               horizon on each participant meanwhile. Check
               pgshard_controller_resolver_unresolved and the resolver logs.
+        - alert: PgshardCutoverPauseTooLong
+          # Not "for:", because a cutover pause is a moment that has already
+          # happened by the time it is measured; waiting to see it persist
+          # would mean never firing.
+          expr: pgshard_controller_cutover_pause_seconds > 2
+          labels:
+            severity: warning
+          annotations:
+            summary: A cutover paused writes for longer than expected
+            description: >-
+              {{ $labels.kind }} workflow {{ $labels.id }} held writes for
+              {{ $value }}s at its cutover. This is the one moment a reshard
+              is visible to a workload, and nothing reported it before:
+              pgshard_controller_cutover_paused counts workflows held at a
+              CONFIGURED pause point, which is a different thing. The guide
+              documents a sub-second pause; the threshold here is 2s because
+              pauses above the documented bound have been observed on small
+              runners and whether the guarantee or the implementation is
+              wrong is not yet settled. Treat a value near the threshold as
+              a question, not noise.
         - alert: PgshardCutoverPaused
           expr: pgshard_controller_cutover_paused > 0
           for: 30m

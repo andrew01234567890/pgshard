@@ -203,6 +203,14 @@ type Controller struct {
 	// WorkflowStepAge is how long each running workflow has been on its
 	// current cutover step.
 	WorkflowStepAge *prometheus.GaugeVec
+	// CutoverPauseSeconds is the write pause each completed cutover took.
+	//
+	// The guide promises a sub-second pause, which is the one moment a
+	// reshard is visible to a workload, and nothing measured it outside the
+	// test suite: CutoverPaused counts workflows held at a CONFIGURED pause
+	// point, which is a different thing entirely. An operator whose pause
+	// was seconds rather than sub-second had no way to know.
+	CutoverPauseSeconds *prometheus.GaugeVec
 	// ResolverUnresolved is what the last resolver pass could not settle:
 	// decisions it could not finish, shards it could not search, and a
 	// failed orphan sweep.
@@ -235,6 +243,9 @@ func NewController(reg *prometheus.Registry) *Controller {
 		WorkflowStepAge: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "pgshard_controller_workflow_step_age_seconds",
 			Help: "How long a running workflow has been on its current cutover step."}, []string{"kind", "id", "stage", "step"}),
+		CutoverPauseSeconds: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "pgshard_controller_cutover_pause_seconds",
+			Help: "Write pause of each completed cutover, from raising the fence to serving the new map."}, []string{"kind", "id"}),
 		ResolverUnresolved: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "pgshard_controller_resolver_unresolved",
 			Help: "Transactions, shard scans and sweeps the last resolver pass could not settle."}),
@@ -244,7 +255,7 @@ func NewController(reg *prometheus.Registry) *Controller {
 			Name: "pgshard_controller_resolved_transactions_total", Help: "In-doubt transactions the resolver finished, by outcome."}, []string{"outcome"}),
 	}
 	reg.MustRegister(m.Workflows, m.WorkflowProgress, m.CutoverPaused, m.InDoubt, m.InDoubtOldestAge,
-		m.Decided, m.DecidedOldestAge, m.WorkflowStepAge, m.ResolverUnresolved, m.Migrations, m.ResolvedTxns)
+		m.Decided, m.DecidedOldestAge, m.WorkflowStepAge, m.CutoverPauseSeconds, m.ResolverUnresolved, m.Migrations, m.ResolvedTxns)
 	return m
 }
 
