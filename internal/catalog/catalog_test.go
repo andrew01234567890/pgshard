@@ -1775,3 +1775,64 @@ func TestUnownedCatalogObjectsAreGone(t *testing.T) {
 		t.Fatalf("streams state = %q", got)
 	}
 }
+
+// TestTheDocumentedCompareAndSwapHolds pins the property the sharding guide
+// tells automation to rely on: desired_generation, as read, can be used as
+// an expected-version predicate on the write back.
+//
+// It works because the BEFORE trigger stamps the NEW row, so the value a
+// reader sees is the value of the row a writer is about to replace. Nothing
+// verified that. A trigger that stamped differently -- after the row, or
+// from the old value -- would leave the documented predicate matching
+// everything or nothing, and the guide is explicit about what that costs:
+// "a lost update here is not a lost edit -- it is an unintended workflow".
+func TestTheDocumentedCompareAndSwapHolds(t *testing.T) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		dockertest.Unavailable(t, "docker not on PATH")
+	}
+	selected, err := selectImages(candidateImages, os.Getenv(requireProjectImagesEnv) != "", func(name string) bool { return imageAvailable(t, name) })
+	if err != nil || len(selected) == 0 {
+		t.Skipf("no PostgreSQL image available: %v", err)
+	}
+	ctx := context.Background()
+	conn := connect(t, startPostgres(t, selected[0]))
+	if err := Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, conn, `INSERT INTO pgshard.databases (name, default_placement, home_shard) VALUES ('app', 'unsharded', 0)`)
+	mustExec(t, conn, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key)
+		VALUES ('app', 'public', 'orders', 'sharded', 'tenant_id')`)
+
+	read := func() int64 {
+		t.Helper()
+		return queryOne[int64](t, conn, `SELECT desired_generation FROM pgshard.tables WHERE table_name = 'orders'`)
+	}
+	swap := func(expected int64, key string) int64 {
+		t.Helper()
+		tag, err := conn.Exec(ctx, `UPDATE pgshard.tables SET shard_key = $2
+			WHERE database = 'app' AND schema_name = 'public' AND table_name = 'orders'
+			  AND desired_generation = $1`, expected, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tag.RowsAffected()
+	}
+
+	// The generation just read is the one the write back must carry.
+	gen := read()
+	if n := swap(gen, "customer_id"); n != 1 {
+		t.Fatalf("a write back carrying the generation it read updated %d rows, want 1", n)
+	}
+	// The stamp moved, so the value that just worked must not work again --
+	// that is what makes it a compare-and-swap rather than a decoration.
+	after := read()
+	if after <= gen {
+		t.Fatalf("desired_generation did not advance: read %d, now %d", gen, after)
+	}
+	if n := swap(gen, "stale_id"); n != 0 {
+		t.Fatalf("a stale generation updated %d rows, want 0: the documented predicate does not detect a concurrent edit", n)
+	}
+	if got := queryOne[string](t, conn, `SELECT shard_key FROM pgshard.tables WHERE table_name = 'orders'`); got != "customer_id" {
+		t.Fatalf("shard_key is %q; the stale write was applied anyway", got)
+	}
+}

@@ -113,5 +113,9 @@ client can make here: `08007` means the original transaction may still
 commit, and a blanket retry policy duplicates it. Every outcome that *is*
 safe to retry is named above.
 
-Metrics: `pgshard_router_in_doubt_transactions_total` on the router's
-`/metrics` endpoint.
+Metrics: `pgshard_router_twopc_in_doubt_total` on the router's `/metrics`
+endpoint counts commits left to the resolver. To see what is still
+undecided *now*, and how old it is, watch the controller's
+`pgshard_controller_in_doubt_transactions` and
+`pgshard_controller_in_doubt_oldest_age_seconds` -- those are the ones to
+alert on, because they return to zero when the resolver has finished.

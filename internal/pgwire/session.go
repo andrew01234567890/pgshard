@@ -313,6 +313,13 @@ func (s *session) drain() {
 		er := toErrorResponse(Errorf(CodeAdminShutdown, "terminating connection due to administrator command"))
 		er.Severity, er.SeverityUnlocalized = "FATAL", "FATAL"
 		if buf, err := er.Encode(nil); err == nil {
+			// Bounded for the same reason the startup refusal is: the
+			// goodbye is a courtesy and the close is the part that
+			// matters, so a peer that has stopped reading must not be
+			// able to hold a drain open by never taking it. This one
+			// runs on the shutdown path, where the wait would be the
+			// whole server's.
+			_ = s.conn.SetWriteDeadline(time.Now().Add(refusalWriteTimeout))
 			_, _ = s.conn.Write(buf)
 		}
 		s.close()

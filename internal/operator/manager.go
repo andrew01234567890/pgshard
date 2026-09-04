@@ -124,6 +124,7 @@ func Run(ctx context.Context, o Options) error {
 	}
 	scheduler := NewBackupScheduler(mgr.GetClient())
 	scheduler.Barriers = barriers
+	scheduler.Agents = agents
 	if err := (&BackupPolicyReconciler{Client: mgr.GetClient(), Scheduler: scheduler}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup backup policy reconciler: %w", err)
 	}

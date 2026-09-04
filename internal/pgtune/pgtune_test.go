@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -413,5 +414,47 @@ func TestDecodingTermBreaksBudget(t *testing.T) {
 	small.LogicalSlots = 4
 	if _, err := Derive(small); !errors.Is(err, ErrOverCommitted) {
 		t.Fatalf("4 slots on 1GiB must overcommit: err = %v", err)
+	}
+}
+
+// TestTheReservedConnectionsAreActuallyReserved: max_connections is sized as
+// the pooler's budget plus headroom for the control plane, but headroom is
+// only headroom if PostgreSQL is told to keep it. Without
+// superuser_reserved_connections the default is 3 and the rest goes to
+// whoever asks first -- and the control plane is what asks last, since the
+// resolver reaches a shard when something has already gone wrong.
+//
+// The property is the relationship, not the number: non-superusers must get
+// exactly the pooler's budget, whatever the budget is.
+func TestTheReservedConnectionsAreActuallyReserved(t *testing.T) {
+	for _, backends := range []int{10, 100, 500} {
+		in := baseInput(4000, 16*GiB, ProfileMixed)
+		in.MaxBackends = backends
+		s, err := Derive(in)
+		if err != nil {
+			t.Fatalf("%d backends: %v", backends, err)
+		}
+		get := func(name string) int {
+			t.Helper()
+			for _, st := range s {
+				if st.Name == name {
+					n, cerr := strconv.Atoi(st.Value)
+					if cerr != nil {
+						t.Fatalf("%s = %q: %v", name, st.Value, cerr)
+					}
+					return n
+				}
+			}
+			t.Fatalf("%s is not derived", name)
+			return 0
+		}
+		maxConns, reserved := get("max_connections"), get("superuser_reserved_connections")
+		if reserved >= maxConns {
+			t.Fatalf("superuser_reserved_connections %d >= max_connections %d: PostgreSQL refuses to start", reserved, maxConns)
+		}
+		if got := maxConns - reserved; got != backends {
+			t.Fatalf("non-superusers get %d connections, want the pooler budget %d (max_connections %d - reserved %d)",
+				got, backends, maxConns, reserved)
+		}
 	}
 }
