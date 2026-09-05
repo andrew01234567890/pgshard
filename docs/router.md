@@ -242,8 +242,9 @@ shard of the first real statement and on every further participant
 session GUCs are replayed on every shard the session moves to.
 
 **Scatter (multi-shard reads).** A read-only `SELECT` over **one sharded
-table** whose plan needs several shards (no key predicate, or `IN` spanning
-shards) runs on every target shard at once: the router opens one pooler
+table, or a colocated join of several** (below), whose plan needs several
+shards (no key predicate, or `IN` spanning shards) runs on every target
+shard at once: the router opens one pooler
 stream per shard (session id `<sid>-x<shard>`, stamped with the shard's
 generation, on a fresh unpinned backend), sends the same statement — possibly
 rewritten as described below — and streams the merged rows to the client
@@ -261,6 +262,21 @@ participant (each reports `57014`). Supported shapes:
 | `LIMIT n [OFFSET k]` | `LIMIT n+k`, no `OFFSET` (saturating at `int8` max) | `OFFSET k` then `LIMIT n` after the merge; a bare `OFFSET` is removed from the shard statement and applied at the router |
 | `count(*)`, `count(x)`, `sum(x)`, `min(x)`, `max(x)` without `GROUP BY` — every select-list entry must be one of these, unadorned | unchanged (`LIMIT`/`OFFSET` removed) | one row per shard is combined: counts and sums are added (`int8` and `numeric` exactly, `numeric` keeps the widest scale, `float4/8` in float arithmetic with PostgreSQL's shortest output format), `min`/`max` use the ORDER BY comparators; NULL inputs are skipped and an all-NULL input stays NULL; `LIMIT`/`OFFSET` then apply to the single row |
 | `GROUP BY` including the shard key, `DISTINCT` (or `DISTINCT ON`) including the shard key | unchanged | every group or distinct row lives on one shard, so the streams are concatenated (or merged for `ORDER BY`); aggregates in such a query are computed on the shards |
+
+**Colocated joins.** More than one relation may take part, provided every
+row a join can match is already on the shard that holds it. That holds when
+every **sharded** relation is joined to the others on its shard key — by
+`ON a.key = b.key`, `USING (key)` or `NATURAL` — and the key has the same
+type on both sides, since the same value under two types hashes to two
+different shards. **Reference** relations join in place because each shard
+has all of their rows, and **unsharded** relations cannot take part at all
+because they are on the home shard alone. A reference table must not be on
+the *preserved* side of an outer join: a reference row that matches nothing
+would be emitted NULL-extended by every shard, so `regions LEFT JOIN orders`
+is refused where `orders LEFT JOIN regions` is not. Everything above the
+join is unchanged — the whole join runs on each shard and the merge is the
+one a single table gets, so `GROUP BY` still has to include the shard key.
+Anything else is `cross-shard join is not available yet`.
 
 Refused with `0A000` (message names the reason): `avg()` and every other
 aggregate ("multi-shard avg() is not available yet" — compute `sum(x)` and
@@ -337,9 +353,9 @@ could act on.
 
 | Statement shape | Message |
 |---|---|
-| multi-shard `SELECT` outside the *Scatter* shapes below (window functions, FOR UPDATE/SHARE, SELECT INTO, set operations, CTEs, subqueries, joins, function scans; `EXPLAIN`/`DECLARE` of one) | multi-shard SELECT with … is not available yet; cross-shard join is not available yet; only a plain SELECT can run on multiple shards |
+| multi-shard `SELECT` outside the *Scatter* shapes below (window functions, FOR UPDATE/SHARE, SELECT INTO, set operations, CTEs, subqueries, function scans; `EXPLAIN`/`DECLARE` of one) | multi-shard SELECT with … is not available yet; only a plain SELECT can run on multiple shards |
 | `UPDATE`/`DELETE` without a key predicate | scatter UPDATE/DELETE without a shard key predicate is not available yet |
-| tables that do not resolve to one shard (joins, subqueries, set operations, an unsharded table joined to a sharded row off the home shard) | cross-shard join is not available yet |
+| tables that do not resolve to one shard (a join that is not colocated, subqueries, set operations, an unsharded table joined to a sharded row off the home shard) | cross-shard join is not available yet |
 | `INSERT` without the key in the column list | insert requires the shard key |
 | `INSERT` key that is not a constant or parameter; `INSERT … SELECT` | shard key of an INSERT must be a constant or a parameter; INSERT … SELECT into a sharded table is not available yet |
 | multi-row `INSERT` whose rows hash to different shards | multi-row INSERT spanning shards is not available yet |
@@ -823,7 +839,9 @@ tables stay on the home shard. `TestRouterScatterDifferential` starts an
 oracle PostgreSQL and three shards, loads the same 5,000 rows into the
 oracle and hash-partitioned into the shards, and runs a corpus of scatter
 queries (ORDER BY asc/desc/nulls/multi-key, LIMIT/OFFSET, count/sum/min/max,
-GROUP BY and DISTINCT on the key, plain scans compared as multisets)
+GROUP BY and DISTINCT on the key, plain scans compared as multisets, and
+colocated joins — inner, left, right and full, to a second sharded table and
+to a reference table)
 through the router and against the oracle, requiring identical results in
 both protocols; it also cancels a `pg_sleep` scatter and checks that every
 shard reported `57014`. `TestRouterOps` adds a second router that cancels a
