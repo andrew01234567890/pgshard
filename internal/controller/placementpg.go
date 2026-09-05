@@ -154,6 +154,9 @@ func (p *Placer) describe(ctx context.Context, wf *placementWorkflow) error {
 		wf.st.Columns = append(wf.st.Columns, c.name)
 		wf.st.Identity = append(wf.st.Identity, c.identity)
 	}
+	if wf.st.SequenceLast, err = sourceSequencePositions(ctx, conn, wf.spec.SchemaName, wf.spec.TableName); err != nil {
+		return err
+	}
 	if wf.spec.To.Placement == "sharded" {
 		key := wf.spec.To.key()
 		i := slices.IndexFunc(cols, func(c tableColumn) bool { return c.name == key })
@@ -2167,7 +2170,7 @@ func (p *Placer) swapOn(ctx context.Context, wf *placementWorkflow, conn ShardCo
 		// The shadow's serial/identity sequences start fresh, so advance
 		// each to the greatest value already copied onto this shard; without
 		// it the next implicit insert reuses a copied identifier.
-		if err := advanceSequences(ctx, conn, wf.spec.SchemaName, wf.spec.TableName); err != nil {
+		if err := advanceSequences(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, wf.old(), wf.st.SequenceLast); err != nil {
 			return err
 		}
 		// Last, and inside the rename's transaction: the policies were
@@ -2240,6 +2243,48 @@ func enableRowSecurity(ctx context.Context, conn ShardConn, wf *placementWorkflo
 	return nil
 }
 
+// sourceSequencePositions reads how far each of the source table's
+// sequence-backed columns has actually been issued, which is not the same as
+// the greatest value present: rows are deleted, and an identity sequence is
+// never moved to the shadow (its dependency is of kind 'i', and
+// moveOwnedSequences moves 'a').
+//
+// is_called is the difference between a sequence that has issued its
+// last_value and one still sitting on its start; counting the latter would
+// skip an identifier.
+func sourceSequencePositions(ctx context.Context, conn ShardConn, schema, table string) (map[string]int64, error) {
+	qual := QuoteIdent(schema) + "." + QuoteIdent(table)
+	rows, err := conn.Query(ctx, `SELECT a.attname, pg_get_serial_sequence($1, a.attname)
+		FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $2 AND c.relname = $3 AND a.attnum > 0 AND NOT a.attisdropped
+		AND pg_get_serial_sequence($1, a.attname) IS NOT NULL`, qual, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	cols, err := pgx.CollectRows(rows, pgx.RowToStructByPos[struct{ Col, Seq string }])
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]int64{}
+	for _, c := range cols {
+		vals, err := conn.Query(ctx, fmt.Sprintf(`SELECT last_value FROM %s WHERE is_called`, c.Seq))
+		if err != nil {
+			return nil, err
+		}
+		last, err := pgx.CollectRows(vals, pgx.RowTo[int64])
+		if err != nil {
+			return nil, err
+		}
+		if len(last) == 1 {
+			out[c.Col] = last[0]
+		}
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
 func moveOwnedSequences(ctx context.Context, conn ShardConn, schema, from, to string) error {
 	rows, err := conn.Query(ctx, `SELECT s.oid::regclass::text, a.attname FROM pg_depend d
 		JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S'
@@ -2261,19 +2306,56 @@ func moveOwnedSequences(ctx context.Context, conn ShardConn, schema, from, to st
 }
 
 // advanceSequences sets every serial or identity sequence backing a column of
-// the table to the greatest value present, so a later implicit insert does not
-// reuse an identifier that was copied in. GREATEST with the current last_value
+// the table past everything the old one had issued, so a later implicit
+// insert cannot reuse an identifier. GREATEST with the current last_value
 // never moves a shared sequence backwards.
-func advanceSequences(ctx context.Context, conn ShardConn, schema, table string) error {
+//
+// The greatest value PRESENT is not enough, and that was the bug. An identity
+// column's sequence is a dependency of kind 'i', which moveOwnedSequences
+// does not move -- it moves 'a', the serial kind -- so the shadow gets the
+// fresh sequence LIKE INCLUDING ALL created for it, and the source's is
+// dropped with the old table at retirement. Advancing only to max(col) then
+// REISSUES every identifier whose row was deleted: a source at 10000 whose
+// newest 500 rows are gone hands out 9501 again, an id other systems, logs
+// and change-stream consumers have already seen.
+//
+// So previous -- the table this one replaces, still present under its old
+// name inside the swap's transaction -- is consulted for the value its own
+// sequence had reached. Its last_value counts only when is_called: a
+// sequence that has never issued anything is sitting on its start value, and
+// treating that as issued would skip an identifier.
+//
+// GREATEST and LEAST ignore NULL arguments, so a column the old table has no
+// sequence for simply contributes nothing.
+func advanceSequences(ctx context.Context, conn ShardConn, schema, table, previous string, sourceLast map[string]int64) error {
 	qual := QuoteIdent(schema) + "." + QuoteIdent(table)
-	rows, err := conn.Query(ctx, `SELECT a.attname, pg_get_serial_sequence($1, a.attname)
+	// A shard that never held the table has no previous one to read: this
+	// runs on every holder of the new placement, not only where the data
+	// came from. pg_get_serial_sequence raises 42P01 on a relation that is
+	// not there, so the question is asked before the query rather than
+	// inside it.
+	hadPrevious := false
+	if previous != "" {
+		var err error
+		if hadPrevious, err = tableExists(ctx, conn, schema, previous); err != nil {
+			return err
+		}
+	}
+	prevArg := qual
+	if hadPrevious {
+		prevArg = QuoteIdent(schema) + "." + QuoteIdent(previous)
+	}
+	rows, err := conn.Query(ctx, `SELECT a.attname, pg_get_serial_sequence($1, a.attname),
+			CASE WHEN $5 THEN coalesce(pg_get_serial_sequence($4, a.attname), '') ELSE '' END
 		FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE n.nspname = $2 AND c.relname = $3 AND a.attnum > 0 AND NOT a.attisdropped
-		AND pg_get_serial_sequence($1, a.attname) IS NOT NULL`, qual, schema, table)
+		AND pg_get_serial_sequence($1, a.attname) IS NOT NULL`, qual, schema, table, prevArg, hadPrevious)
 	if err != nil {
 		return err
 	}
-	cols, err := pgx.CollectRows(rows, pgx.RowToStructByPos[struct{ Col, Seq string }])
+	cols, err := pgx.CollectRows(rows, pgx.RowToStructByPos[struct {
+		Col, Seq, PrevSeq string
+	}])
 	if err != nil {
 		return err
 	}
@@ -2282,15 +2364,28 @@ func advanceSequences(ctx context.Context, conn ShardConn, schema, table string)
 		// the min; GREATEST/LEAST with last_value never moves a shared
 		// sequence the wrong way. An empty shard advances nothing (the WHERE
 		// yields no row), so a fresh sequence keeps its start value.
+		// Two sources for the same fact, and they cannot disagree
+		// harmfully because GREATEST takes the higher: the old table's own
+		// sequence, exact on the shard that held it, and the position
+		// captured from the source before the copy, which is the only one a
+		// shard that never held the table has.
+		prev := "NULL::bigint"
+		if c.PrevSeq != "" {
+			prev = fmt.Sprintf("(SELECT last_value FROM %s WHERE is_called)", c.PrevSeq)
+		}
+		src := "NULL::bigint"
+		if v, ok := sourceLast[c.Col]; ok {
+			src = fmt.Sprintf("%d::bigint", v)
+		}
 		if _, err := conn.Exec(ctx, fmt.Sprintf(
 			`SELECT setval(%[1]s::regclass,
 				CASE WHEN sq.seqincrement > 0
-					THEN GREATEST(x.v, (SELECT last_value FROM %[4]s))
-					ELSE LEAST(x.v, (SELECT last_value FROM %[4]s)) END, true)
+					THEN GREATEST(x.v, (SELECT last_value FROM %[4]s), %[5]s, %[6]s)
+					ELSE LEAST(x.v, (SELECT last_value FROM %[4]s), %[5]s, %[6]s) END, true)
 			FROM pg_sequence sq,
 				LATERAL (SELECT CASE WHEN sq.seqincrement > 0 THEN max(%[2]s) ELSE min(%[2]s) END AS v FROM %[3]s) x
 			WHERE sq.seqrelid = %[1]s::regclass AND x.v IS NOT NULL`,
-			QuoteLiteral(&c.Seq), QuoteIdent(c.Col), qual, c.Seq)); err != nil {
+			QuoteLiteral(&c.Seq), QuoteIdent(c.Col), qual, c.Seq, prev, src)); err != nil {
 			return err
 		}
 	}

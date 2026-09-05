@@ -1382,3 +1382,55 @@ func TestAFailedPlacementDropsItsReplication(t *testing.T) {
 		}
 	}
 }
+
+// TestAPlacementCarriesAnIdentitySequencePastDeletedRows.
+//
+// An identity column's sequence is a dependency of kind 'i'.
+// moveOwnedSequences moves kind 'a' -- the serial kind -- so the shadow keeps
+// the fresh sequence LIKE INCLUDING ALL made for it and the source's is
+// dropped with the old table. advanceSequences then set it to the greatest
+// value PRESENT, which reissues every identifier whose row was deleted: a
+// source at 10 000 whose newest rows are gone hands out 9 501 again, an id
+// other systems and change-stream consumers have already seen.
+//
+// docs/resharding.md says "sequences owned by the old table's columns move to
+// the new one", which was true of serial columns and never of identity ones.
+func TestAPlacementCarriesAnIdentitySequencePastDeletedRows(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	ctx := context.Background()
+	home := f.app(0)
+	mustExec(t, home, `CREATE TABLE tickets (id bigint GENERATED ALWAYS AS IDENTITY, tenant_id bigint NOT NULL, v text, PRIMARY KEY (tenant_id, id))`)
+	mustExec(t, home, `INSERT INTO tickets (tenant_id, v) SELECT g, 'v' || g FROM generate_series(1, 30) g`)
+	// The newest rows go, so the highest id PRESENT is well below the
+	// sequence's position. This is the whole point of the test.
+	mustExec(t, home, `DELETE FROM tickets WHERE id > 20`)
+	var sourceLast int64
+	if err := home.QueryRow(ctx, `SELECT last_value FROM pg_sequences
+		WHERE schemaname = 'public' AND sequencename = 'tickets_id_seq'`).Scan(&sourceLast); err != nil {
+		t.Fatal(err)
+	}
+	if sourceLast <= 20 {
+		t.Fatalf("the fixture must leave the sequence past the highest surviving id, got %d", sourceLast)
+	}
+
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('app', 'public', 'tickets', 'unsharded', NULL)`)
+	f.reconcile()
+	mustExec(t, f.catalog, `UPDATE pgshard.tables SET placement = 'sharded', shard_key = 'tenant_id' WHERE table_name = 'tickets'`)
+	f.reconcile()
+	mustExec(t, f.catalog, `UPDATE pgshard.workflows SET spec = spec || '{"drop_old_after_seconds": 0}'`)
+	f.driveUntil("tickets", 3*time.Minute, StageCompleted)
+
+	// Every shard that now holds the table must refuse to reissue an id the
+	// source had already handed out.
+	for id := range int32(2) {
+		c := f.app(id)
+		var next int64
+		if err := c.QueryRow(ctx, `INSERT INTO tickets (tenant_id, v) VALUES (999, 'after') RETURNING id`).Scan(&next); err != nil {
+			t.Fatal(err)
+		}
+		if next <= sourceLast {
+			t.Errorf("shard %d issued id %d, which the source had already issued (its sequence was at %d)", id, next, sourceLast)
+		}
+	}
+}
