@@ -1111,7 +1111,17 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 		// And the assertion above is not vacuous: a surviving standby still
 		// has its slot, so a query that finds nothing whatever the state
 		// would fail here too.
-		kept := "pgshard_" + strings.NewReplacer("-", "_", ".", "_").Replace(clusterName+"-shard-0-1")
+		//
+		// Which member that is has to be read, not assumed. A primary has
+		// no slot of its own, and the switchover subtests before this one
+		// leave the role on whichever member they moved it to.
+		standby := ""
+		for i := 0; i < 3 && standby == ""; i++ {
+			if name := fmt.Sprintf("%s-%d", group, i); name != oldPrimary {
+				standby = name
+			}
+		}
+		kept := "pgshard_" + strings.NewReplacer("-", "_", ".", "_").Replace(standby)
 		if n, err := psql(ctx, c, rw, "SELECT count(*) FROM pg_replication_slots WHERE slot_name = '"+kept+"'"); err != nil || n != "1" {
 			t.Errorf("a surviving standby must still have its slot %s, got %q %v", kept, n, err)
 		}
