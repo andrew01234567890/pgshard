@@ -30,7 +30,15 @@ type scatterStack struct {
 
 const scatterTable = `create table events (
 	tenant_id int8 not null, id int not null, amount numeric(12,3), price float8, qty int2,
-	name text, ts timestamptz, d date, ok bool, u uuid, primary key (tenant_id, id))`
+	name text, ts timestamptz, d date, ok bool, u uuid, region int4, primary key (tenant_id, id))`
+
+// event_lines is sharded on the same key as events, so a join between them
+// on that key matches only rows that already live on the same shard.
+// regions is a reference table, present in full on every shard.
+const joinTables = `create table event_lines (
+	tenant_id int8 not null, id int not null, line int4 not null, sku text, units int4,
+	primary key (tenant_id, id, line));
+create table regions (id int4 primary key, name text not null)`
 
 func startScatterStack(tb testing.TB) *scatterStack {
 	tb.Helper()
@@ -90,6 +98,10 @@ func startScatterStack(tb testing.TB) *scatterStack {
 	for _, sql := range []string{
 		`INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('app', 'public', 'events', 'sharded', 'tenant_id')`,
 		`INSERT INTO pgshard.table_status (database, schema_name, table_name, effective_placement, effective_shard_key) VALUES ('app', 'public', 'events', 'sharded', 'tenant_id')`,
+		`INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('app', 'public', 'event_lines', 'sharded', 'tenant_id')`,
+		`INSERT INTO pgshard.table_status (database, schema_name, table_name, effective_placement, effective_shard_key) VALUES ('app', 'public', 'event_lines', 'sharded', 'tenant_id')`,
+		`INSERT INTO pgshard.tables (database, schema_name, table_name, placement) VALUES ('app', 'public', 'regions', 'reference')`,
+		`INSERT INTO pgshard.table_status (database, schema_name, table_name, effective_placement) VALUES ('app', 'public', 'regions', 'reference')`,
 	} {
 		if _, err := tx.Exec(ctx, sql); err != nil {
 			tb.Fatalf("%s: %v", sql, err)
@@ -100,7 +112,7 @@ func startScatterStack(tb testing.TB) *scatterStack {
 	}
 	for _, dsn := range s.shardDSNs {
 		app := s.appConn(tb, dsn)
-		if _, err := app.Exec(ctx, scatterTable+"; grant all on events to "+appRole); err != nil {
+		if _, err := app.Exec(ctx, scatterTable+"; "+joinTables+"; grant all on events, event_lines, regions to "+appRole); err != nil {
 			tb.Fatal(err)
 		}
 	}
@@ -112,7 +124,7 @@ func startScatterStack(tb testing.TB) *scatterStack {
 		tb.Fatal(err)
 	}
 	_ = admin.Close(ctx)
-	if _, err := s.appConn(tb, s.oracleDSN).Exec(ctx, scatterTable); err != nil {
+	if _, err := s.appConn(tb, s.oracleDSN).Exec(ctx, scatterTable+"; "+joinTables); err != nil {
 		tb.Fatal(err)
 	}
 	return s
@@ -147,14 +159,17 @@ func (s *scatterStack) shardOf(tb testing.TB, tenant int64) int {
 func (s *scatterStack) loadRows(tb testing.TB, n int) {
 	tb.Helper()
 	rng := rand.New(rand.NewSource(42))
-	cols := []string{"tenant_id", "id", "amount", "price", "qty", "name", "ts", "d", "ok", "u"}
+	cols := []string{"tenant_id", "id", "amount", "price", "qty", "name", "ts", "d", "ok", "u", "region"}
 	perShard := make([][][]any, len(s.shardDSNs))
 	var all [][]any
+	lineCols := []string{"tenant_id", "id", "line", "sku", "units"}
+	linesPerShard := make([][][]any, len(s.shardDSNs))
+	var allLines [][]any
 	names := []string{"alpha", "Bravo", "charlie", "delta", "Echo", "foxtrot", "golf", "hotel", "india", "Juliet", "kilo", "lima"}
 	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 	for i := 0; i < n; i++ {
 		tenant := int64(rng.Intn(400)) - 50
-		row := []any{tenant, i, nil, nil, nil, nil, nil, nil, nil, nil}
+		row := []any{tenant, i, nil, nil, nil, nil, nil, nil, nil, nil, nil}
 		if rng.Intn(10) != 0 {
 			row[2] = fmt.Sprintf("%d.%03d", rng.Intn(20000)-10000, rng.Intn(1000))
 		}
@@ -179,24 +194,49 @@ func (s *scatterStack) loadRows(tb testing.TB, n int) {
 		if rng.Intn(10) != 0 {
 			row[9] = fmt.Sprintf("%08x-%04x-4%03x-8%03x-%012x", rng.Uint32(), rng.Intn(1<<16), rng.Intn(1<<12), rng.Intn(1<<12), rng.Int63n(1<<48))
 		}
+		// A tenth of the rows have no region, so an outer join to the
+		// reference table has unmatched rows to preserve.
+		if rng.Intn(10) != 0 {
+			row[10] = int32(rng.Intn(len(regionNames)))
+		}
 		all = append(all, row)
 		sh := s.shardOf(tb, tenant)
 		perShard[sh] = append(perShard[sh], row)
-	}
-	load := func(dsn string, rows [][]any) {
-		conn := s.appConn(tb, dsn)
-		if _, err := conn.CopyFrom(context.Background(), pgx.Identifier{"events"}, cols, pgx.CopyFromRows(rows)); err != nil {
-			tb.Fatalf("load %s: %v", dsn, err)
+		// Zero, one or two lines per event, so a join drops rows, keeps
+		// them and multiplies them within the same query.
+		for line := 0; line < rng.Intn(3); line++ {
+			l := []any{tenant, i, line, names[rng.Intn(len(names))], rng.Intn(50)}
+			allLines = append(allLines, l)
+			linesPerShard[sh] = append(linesPerShard[sh], l)
 		}
 	}
-	load(s.oracleDSN, all)
+	load := func(dsn, table string, columns []string, rows [][]any) {
+		conn := s.appConn(tb, dsn)
+		if _, err := conn.CopyFrom(context.Background(), pgx.Identifier{table}, columns, pgx.CopyFromRows(rows)); err != nil {
+			tb.Fatalf("load %s into %s: %v", dsn, table, err)
+		}
+	}
+	regionCols := []string{"id", "name"}
+	var regions [][]any
+	for i, n := range regionNames {
+		regions = append(regions, []any{int32(i), n})
+	}
+	load(s.oracleDSN, "events", cols, all)
+	load(s.oracleDSN, "event_lines", lineCols, allLines)
+	// The reference table is loaded whole everywhere, which is what makes
+	// it join in place on each shard.
+	load(s.oracleDSN, "regions", regionCols, regions)
 	for i, rows := range perShard {
 		if len(rows) == 0 {
 			tb.Fatalf("shard %d received no rows; the fixture must cover every shard", i)
 		}
-		load(s.shardDSNs[i], rows)
+		load(s.shardDSNs[i], "events", cols, rows)
+		load(s.shardDSNs[i], "event_lines", lineCols, linesPerShard[i])
+		load(s.shardDSNs[i], "regions", regionCols, regions)
 	}
 }
+
+var regionNames = []string{"north", "south", "east", "west", "central"}
 
 // resultOf runs sql and renders every row as text, NULL as "NULL".
 func resultOf(tb testing.TB, conn *pgx.Conn, sql string, mode pgx.QueryExecMode) []string {
@@ -289,6 +329,40 @@ var scatterCorpus = []corpusQuery{
 	{`select distinct tenant_id, ok from events order by tenant_id, ok`, true},
 	{`select distinct on (tenant_id) tenant_id, id from events order by tenant_id, id desc`, true},
 	{`select tenant_id, avg(qty)::text from events group by tenant_id order by 1 limit 15`, true},
+	// Two client columns ordered by a third: the shard statement carries
+	// a hidden sort column, so the client's per-column result formats no
+	// longer match its column count. Every other ordered query here asks
+	// for one column or sorts by one it selects, which is why nothing
+	// caught this.
+	{`select id, qty from events order by price, id`, true},
+}
+
+// joinCorpus is PGS-614: joins whose sharded relations are joined on the
+// shard key, plus reference-table joins. Every one of them must produce
+// exactly what one PostgreSQL holding all the rows produces.
+//
+// The reference table is on the null-supplying side throughout. Preserved
+// by an outer join it would be planned differently -- a reference row that
+// matches nothing is emitted NULL-extended by every shard -- and the
+// refusal for that shape is asserted in the plan tests.
+var joinCorpus = []corpusQuery{
+	{`select count(*) from events e join event_lines l on e.tenant_id = l.tenant_id and e.id = l.id`, true},
+	{`select e.id, l.line, l.units from events e join event_lines l on e.tenant_id = l.tenant_id and e.id = l.id order by e.id, l.line`, true},
+	{`select e.id, l.line from events e left join event_lines l on e.tenant_id = l.tenant_id and e.id = l.id order by e.id, l.line nulls first`, true},
+	{`select e.id, l.line from events e right join event_lines l on e.tenant_id = l.tenant_id and e.id = l.id order by e.id, l.line`, true},
+	{`select count(*) from events e full join event_lines l on e.tenant_id = l.tenant_id and e.id = l.id`, true},
+	{`select e.id, l.line from events e join event_lines l using (tenant_id) where l.line = 0 order by e.id, l.id`, true},
+	{`select count(*), sum(l.units) from events e join event_lines l on e.tenant_id = l.tenant_id and e.id = l.id where e.qty > 0`, true},
+	{`select e.tenant_id, count(*) from events e join event_lines l on e.tenant_id = l.tenant_id and e.id = l.id group by e.tenant_id order by 1 limit 20`, true},
+	{`select e.id from events e join event_lines l on e.tenant_id = l.tenant_id and e.id = l.id order by e.id limit 30 offset 15`, true},
+	{`select distinct e.tenant_id from events e join event_lines l on e.tenant_id = l.tenant_id and e.id = l.id order by 1 limit 25`, true},
+	// A sharded table joined to a reference table: the reference side is
+	// complete on every shard, so each shard answers for its own rows.
+	{`select count(*) from events e join regions r on r.id = e.region`, true},
+	{`select e.id, r.name from events e join regions r on r.id = e.region order by e.id limit 40`, true},
+	{`select e.id, r.name from events e left join regions r on r.id = e.region order by e.id limit 40`, true},
+	// Three relations at once, two sharded and one reference.
+	{`select count(*) from events e join event_lines l on e.tenant_id = l.tenant_id and e.id = l.id join regions r on r.id = e.region`, true},
 }
 
 func TestRouterScatterDifferential(t *testing.T) {
@@ -309,10 +383,28 @@ func TestRouterScatterDifferential(t *testing.T) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+	// And the join separately. Serving `events` says the controller
+	// inspected THAT table's shard key; a join is only plannable once it
+	// has inspected both, because the two key types have to be compared.
+	// Waiting on one and asking about two is a race the corpus loses about
+	// as often as it wins.
+	deadline = time.Now().Add(60 * time.Second)
+	for {
+		var n int64
+		err := conn.QueryRow(ctx, "select count(*) from events e join event_lines l on e.tenant_id = l.tenant_id and e.id = l.id",
+			pgx.QueryExecModeSimpleProtocol).Scan(&n)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("router never planned the colocated join (%v)\nrouter log:\n%s", err, s.routerLog.String())
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 	if len(scatterCorpus) < 40 {
 		t.Fatalf("corpus has %d queries, want at least 40", len(scatterCorpus))
 	}
-	for _, q := range scatterCorpus {
+	for _, q := range append(append([]corpusQuery(nil), scatterCorpus...), joinCorpus...) {
 		want := resultOf(t, oracle, q.sql, pgx.QueryExecModeSimpleProtocol)
 		for _, mode := range []pgx.QueryExecMode{pgx.QueryExecModeSimpleProtocol, pgx.QueryExecModeCacheStatement} {
 			t.Run(fmt.Sprintf("%s/%v", q.sql, mode), func(t *testing.T) {
@@ -360,6 +452,13 @@ func TestRouterScatterDifferential(t *testing.T) {
 			{`select max(name) from events`, "multi-shard min()/max() over a text column is not available yet"},
 			{`select id from events order by id limit $1`, "multi-shard LIMIT must be an integer constant"},
 			{`select ok, count(*) from events group by ok`, "multi-shard GROUP BY without the shard key"},
+			// A colocated join is planned per shard; what it may compute
+			// there is unchanged. Grouping by a reference table's column
+			// spreads one group over every shard, so it is refused for the
+			// same reason grouping by any non-key column is.
+			{`select r.name, count(*) from events e join regions r on r.id = e.region group by r.name`, "multi-shard GROUP BY without the shard key"},
+			{`select e.id from events e join event_lines l on e.id = l.id`, "cross-shard join is not available yet"},
+			{`select r.name from regions r left join events e on r.id = e.region`, "cross-shard join is not available yet"},
 		} {
 			_, err := conn.Exec(ctx, c.sql, pgx.QueryExecModeSimpleProtocol)
 			if sqlstate(err) != "0A000" || !strings.Contains(err.Error(), c.msg) {
