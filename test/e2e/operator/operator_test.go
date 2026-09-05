@@ -953,8 +953,18 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 	// It also has to go up before it can come down: replicasPerShard has an
 	// HA floor of 3, so a lowering has to start from a group above it.
 	t.Run("LoweringReplicasRetiresMembersWithoutLosingCommits", func(t *testing.T) {
+		// Not count(): this is read from a sampling goroutine as well as
+		// from the test, and count() fails the test on a kubectl error --
+		// which from a goroutine outliving the subtest is a panic rather
+		// than a failure. An unreadable count is reported as -1 and every
+		// caller treats it as "not yet".
 		shardPods := func() int {
-			return count(ctx, t, c, "pods", "pgshard.io/cluster="+clusterName+",pgshard.io/group=shard-0")
+			out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pods", "-l",
+				"pgshard.io/cluster="+clusterName+",pgshard.io/group=shard-0", "-o", "name")
+			if err != nil {
+				return -1
+			}
+			return len(strings.Fields(out))
 		}
 		patchCluster(`{"spec":{"replicasPerShard":5}}`)
 		waitForWhy(ctx, t, "two more shard members to join", 15*time.Minute, func() string {
@@ -990,6 +1000,19 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 		var badSync []string
 		minPods, sawFour := 5, false
 		stop, sampled := make(chan struct{}), make(chan struct{})
+		// Stopped explicitly before the samples are read, and deferred as
+		// well: a wait that times out fails the subtest, and a sampler
+		// left running past that reports into a test that has finished,
+		// which panics the whole binary and takes every later subtest
+		// with it.
+		var once sync.Once
+		stopSampling := func() {
+			once.Do(func() {
+				close(stop)
+				<-sampled
+			})
+		}
+		defer stopSampling()
 		go func() {
 			defer close(sampled)
 			for {
@@ -999,6 +1022,7 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 				case <-time.After(2 * time.Second):
 				}
 				switch n := shardPods(); {
+				case n < 0:
 				case n < minPods:
 					minPods = n
 				case n == 4:
@@ -1025,8 +1049,7 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 		waitForWhy(ctx, t, "the two extra shard members to be retired", 20*time.Minute, func() string {
 			return fmt.Sprintf("shard pods=%d rolloutIdle=%v", shardPods(), rolloutIdle())
 		}, func() bool { return shardPods() == 3 && rolloutIdle() })
-		close(stop)
-		<-sampled
+		stopSampling()
 
 		acked, failures, pause := w.finish()
 		t.Logf("retiring two members took %s; writer: %d acknowledged, %d failed, unavailability window %s; fewest pods seen %d, saw the intermediate 4: %v",

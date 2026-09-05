@@ -29,10 +29,6 @@ func (r *ClusterReconciler) extraMembers(ctx context.Context, c *pgshardv1alpha1
 	if err := r.List(ctx, &pods, client.InNamespace(c.Namespace), sel); err != nil {
 		return nil, err
 	}
-	var claims corev1.PersistentVolumeClaimList
-	if err := r.List(ctx, &claims, client.InNamespace(c.Namespace), sel); err != nil {
-		return nil, err
-	}
 	extra := map[string]bool{}
 	note := func(name, ordinal string) {
 		n, err := strconv.Atoi(ordinal)
@@ -44,8 +40,19 @@ func (r *ClusterReconciler) extraMembers(ctx context.Context, c *pgshardv1alpha1
 	for i := range pods.Items {
 		note(pods.Items[i].Name, pods.Items[i].Labels[LabelOrdinal])
 	}
-	for i := range claims.Items {
-		note(claims.Items[i].Labels[LabelMember], claims.Items[i].Labels[LabelOrdinal])
+	// A claim counts only when the spec says to reclaim it. Under Retain --
+	// the default -- the claim is kept on purpose, so treating it as work
+	// left to do makes the member extra for ever: its pod is already gone,
+	// every pass picks it again as the highest ordinal, and no lower
+	// ordinal is ever reached. That stalls a lowering half way.
+	if storageOf(c, g).ReclaimRetiredClaims == pgshardv1alpha1.ReclaimDelete {
+		var claims corev1.PersistentVolumeClaimList
+		if err := r.List(ctx, &claims, client.InNamespace(c.Namespace), sel); err != nil {
+			return nil, err
+		}
+		for i := range claims.Items {
+			note(claims.Items[i].Labels[LabelMember], claims.Items[i].Labels[LabelOrdinal])
+		}
 	}
 	out := make([]string, 0, len(extra))
 	for name := range extra {
@@ -115,10 +122,6 @@ func (r *ClusterReconciler) reclaimClaims(ctx context.Context, c *pgshardv1alpha
 		return err
 	}
 	if storageOf(c, g).ReclaimRetiredClaims != pgshardv1alpha1.ReclaimDelete {
-		if len(claims.Items) > 0 {
-			log.Info("member retired; its claim is kept", "claims", len(claims.Items),
-				"reclaimRetiredClaims", pgshardv1alpha1.ReclaimRetain)
-		}
 		return nil
 	}
 	for i := range claims.Items {

@@ -67,13 +67,43 @@ func TestLoweringReplicasRetiresMembersOneAtATime(t *testing.T) {
 
 	// Its claim is kept: a retired member's volume is the only copy of
 	// whatever had not replicated when it left.
+	keptClaim(t, "shrink-shard-0-4")
+
+	// And then the next one. A kept claim carries the retired member's
+	// labels for ever, so a retirement that treats a claim as work left to
+	// do picks the same highest ordinal on every pass and never reaches a
+	// lower one -- a lowering that stops half way with the group one member
+	// short of both counts, and idle.
+	for range 6 {
+		reconcile(t, r, c)
+		if !podExists(t, "shrink-shard-0-3") {
+			break
+		}
+	}
+	if podExists(t, "shrink-shard-0-3") {
+		t.Fatal("the second extra member was never retired")
+	}
+	keptClaim(t, "shrink-shard-0-3")
+
+	// Settled: with nothing left to retire the group stops reporting a
+	// step, which is what the count being reached actually means.
+	reconcile(t, r, c)
+	if st := groupStatus(t, "shrink-shard-0"); st.Rollout != nil {
+		t.Errorf("the rollout must be idle once the group is at its count: %+v", st.Rollout)
+	}
+}
+
+// keptClaim asserts a retired member's claim survives under the default
+// Retain policy.
+func keptClaim(t *testing.T, member string) {
+	t.Helper()
 	var kept corev1.PersistentVolumeClaimList
 	if err := k8sClient.List(context.Background(), &kept, client.InNamespace("default"),
-		client.MatchingLabels{LabelMember: "shrink-shard-0-4"}); err != nil {
+		client.MatchingLabels{LabelMember: member}); err != nil {
 		t.Fatal(err)
 	}
 	if len(kept.Items) == 0 {
-		t.Error("the retired member's claim must be kept under the default reclaim policy")
+		t.Errorf("the claim of %s must be kept under the default reclaim policy", member)
 	}
 	for i := range kept.Items {
 		if kept.Items[i].DeletionTimestamp != nil {
