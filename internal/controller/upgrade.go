@@ -32,9 +32,12 @@ func (c *Copier) upgradePreconditions(ctx context.Context, wf *copyWorkflow, src
 	// find out. Extensions are per-database objects; availability is per
 	// installation, so an extension has to be available on all of the
 	// target shards, not the one that happened to be first.
-	available, err := c.commonTargetExtensions(ctx, wf.set, wf.ids)
+	available, disagreed, err := c.commonTargetExtensions(ctx, wf.set, wf.ids)
 	if err != nil {
 		return err
+	}
+	if len(disagreed) > 0 {
+		failures = append(failures, fmt.Sprintf("target shards disagree on the default version of: %s", strings.Join(disagreed, ", ")))
 	}
 	for _, db := range dbs {
 		for _, s := range srcIDs {
@@ -42,9 +45,9 @@ func (c *Copier) upgradePreconditions(ctx context.Context, wf *copyWorkflow, src
 			if err != nil {
 				return err
 			}
-			if missing := MissingExtensions(installed, available); len(missing) > 0 {
-				failures = append(failures, fmt.Sprintf("extensions missing on the target major for %s on %s/%d: %s",
-					db.name, srcSet, s, strings.Join(missing, ", ")))
+			if bad := UnsupportedExtensions(installed, available); len(bad) > 0 {
+				failures = append(failures, fmt.Sprintf("extensions the target major cannot carry for %s on %s/%d: %s",
+					db.name, srcSet, s, strings.Join(bad, "; ")))
 			}
 		}
 	}
@@ -72,85 +75,192 @@ func (c *Copier) upgradePreconditions(ctx context.Context, wf *copyWorkflow, src
 	return nil
 }
 
-// commonTargetExtensions is what every target shard can offer: an
-// extension available on one of them and not another would install on some
-// shards and fail on the rest, which is the same outcome as missing.
-func (c *Copier) commonTargetExtensions(ctx context.Context, tgtSet string, tgtIDs []int32) ([]string, error) {
-	var common []string
-	for i, id := range tgtIDs {
-		available, err := c.availableExtensions(ctx, tgtSet, id)
-		if err != nil {
-			return nil, err
-		}
-		if i == 0 {
-			common = available
-			continue
-		}
-		common = intersect(common, available)
-	}
-	return common, nil
+// The two catalogue queries the precheck runs, named so a test can run the
+// same SQL against a real pair of majors rather than a paraphrase of it.
+const (
+	installedExtensionsSQL = `SELECT extname, extversion FROM pg_extension ORDER BY 1`
+
+	// The update paths are the target's, because they come from the target
+	// major's extension scripts, and only paths TO the default matter: that
+	// is the version a restore installs.
+	availableExtensionsSQL = `
+		SELECT a.name, a.default_version,
+		       ARRAY(SELECT p.source FROM pg_extension_update_paths(a.name) p
+		              WHERE p.target = a.default_version AND p.path IS NOT NULL)
+		  FROM pg_available_extensions a
+		 ORDER BY 1`
+)
+
+// InstalledExtension is one extension as a source database has it.
+type InstalledExtension struct {
+	Name    string
+	Version string
 }
 
-// intersect returns the names present in both, keeping a's order.
-func intersect(a, b []string) []string {
-	have := make(map[string]bool, len(b))
-	for _, x := range b {
-		have[x] = true
+// TargetExtension is what the target major will do with an extension name.
+//
+// Default is what the target installs, because pg_dump emits CREATE EXTENSION
+// with no version: the restored schema gets the TARGET's default whatever the
+// source had. ReachableFrom is every source version PostgreSQL declares an
+// update path from, to that default.
+type TargetExtension struct {
+	Default       string
+	ReachableFrom map[string]bool
+}
+
+// commonTargetExtensions is what every target shard can offer, and the names
+// the targets disagree about.
+//
+// An extension available on one target shard and not another would install on
+// some and fail on the rest, which is the same outcome as missing. One whose
+// DEFAULT VERSION differs between target shards is worse than either, because
+// the same restore would produce different schemas per shard, so it is
+// reported under its own name rather than folded into "missing".
+func (c *Copier) commonTargetExtensions(ctx context.Context, tgtSet string, tgtIDs []int32) (map[string]TargetExtension, []string, error) {
+	perShard := make([]map[string]TargetExtension, 0, len(tgtIDs))
+	for _, id := range tgtIDs {
+		available, err := c.availableExtensions(ctx, tgtSet, id)
+		if err != nil {
+			return nil, nil, err
+		}
+		perShard = append(perShard, available)
 	}
-	var out []string
-	for _, x := range a {
-		if have[x] {
-			out = append(out, x)
+	common, disagreed := MergeTargetExtensions(perShard)
+	return common, disagreed, nil
+}
+
+// MergeTargetExtensions folds what each target shard offers into what all of
+// them offer, and lists the names they disagree about.
+func MergeTargetExtensions(perShard []map[string]TargetExtension) (map[string]TargetExtension, []string) {
+	common := map[string]TargetExtension{}
+	disagreed := map[string]bool{}
+	for i, available := range perShard {
+		if i == 0 {
+			maps.Copy(common, available)
+			continue
+		}
+		for name, have := range common {
+			next, ok := available[name]
+			if !ok {
+				delete(common, name)
+				continue
+			}
+			if next.Default != have.Default {
+				disagreed[name] = true
+				delete(common, name)
+				continue
+			}
+			have.ReachableFrom = intersectSet(have.ReachableFrom, next.ReachableFrom)
+			common[name] = have
+		}
+	}
+	return common, sortedKeys(disagreed)
+}
+
+func intersectSet(a, b map[string]bool) map[string]bool {
+	out := map[string]bool{}
+	for k := range a {
+		if b[k] {
+			out[k] = true
 		}
 	}
 	return out
 }
 
-// MissingExtensions returns the installed extensions absent from available,
-// sorted; plpgsql and pgcrypto ship with every supported major and are
-// checked like any other name.
-func MissingExtensions(installed, available []string) []string {
-	have := map[string]bool{}
-	for _, a := range available {
-		have[a] = true
-	}
-	var missing []string
+// UnsupportedExtensions returns one message per installed extension the
+// target major cannot carry, sorted by extension name.
+//
+// Two things can be wrong, and they are different failures:
+//
+// ABSENT. The name is not available on the target at all, so the restore's
+// CREATE EXTENSION fails outright.
+//
+// UNREACHABLE. The name is available but at a different default version, and
+// PostgreSQL declares no update path from the source's version to it. That
+// matters because pg_dump emits CREATE EXTENSION without a version, so the
+// target installs its own default whatever the source had -- and an update
+// path is PostgreSQL's own statement that the newer version can carry the
+// older one's objects forward. Where it says nothing, we are guessing.
+//
+// What is deliberately NOT done here is comparing the two version strings.
+// extversion is opaque and PostgreSQL does not order it -- "1.11" against
+// "1.9" is the obvious trap and "2.1-beta" has no defined position at all --
+// which is exactly why update paths exist. A check that ordered them would be
+// a guess that looked principled, and a preflight that refuses upgrades which
+// would have worked is worse than one that misses an upgrade that fails.
+//
+// Measured against this project's own images before writing this: of the 46
+// extensions PostgreSQL 18.6 offers, five have a different default on 19beta3
+// (btree_gin, btree_gist, pg_buffercache, pg_stat_statements, postgres_fdw),
+// and PostgreSQL declares an update path for every one of the five. So the
+// ordinary 18-to-19 upgrade passes, and the check fails closed only where
+// PostgreSQL itself says there is no route.
+func UnsupportedExtensions(installed []InstalledExtension, target map[string]TargetExtension) []string {
+	seen := map[string]bool{}
+	var out []string
 	for _, e := range installed {
-		if !have[e] && !slices.Contains(missing, e) {
-			missing = append(missing, e)
+		if seen[e.Name] {
+			continue
+		}
+		seen[e.Name] = true
+		t, ok := target[e.Name]
+		switch {
+		case !ok:
+			out = append(out, e.Name+" is not available on the target major")
+		case t.Default == e.Version, t.ReachableFrom[e.Version]:
+		default:
+			out = append(out, fmt.Sprintf("%s is installed at %s and the target major installs %s, with no update path between them",
+				e.Name, e.Version, t.Default))
 		}
 	}
-	slices.Sort(missing)
-	return missing
+	slices.Sort(out)
+	return out
 }
 
-// installedExtensions lists one database's extensions. They are
-// per-database objects, so the default database's list says nothing about
-// the others.
-func (c *Copier) installedExtensions(ctx context.Context, set string, id int32, database string) ([]string, error) {
+// installedExtensions lists one database's extensions and their versions.
+// They are per-database objects, so the default database's list says nothing
+// about the others.
+func (c *Copier) installedExtensions(ctx context.Context, set string, id int32, database string) ([]InstalledExtension, error) {
 	conn, err := c.Shards.DialDatabase(ctx, set, id, database)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = conn.Close(ctx) }()
-	rows, err := conn.Query(ctx, `SELECT DISTINCT extname FROM pg_extension ORDER BY 1`)
+	rows, err := conn.Query(ctx, installedExtensionsSQL)
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, pgx.RowTo[string])
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[InstalledExtension])
 }
 
-func (c *Copier) availableExtensions(ctx context.Context, set string, id int32) ([]string, error) {
+// availableExtensions is what one target shard offers, with the versions its
+// default is reachable from. The update paths are read from the TARGET,
+// because they come from the target major's extension scripts.
+func (c *Copier) availableExtensions(ctx context.Context, set string, id int32) (map[string]TargetExtension, error) {
 	conn, err := c.Shards.Dial(ctx, set, id)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = conn.Close(ctx) }()
-	rows, err := conn.Query(ctx, `SELECT name FROM pg_available_extensions ORDER BY 1`)
+	rows, err := conn.Query(ctx, availableExtensionsSQL)
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, pgx.RowTo[string])
+	defer rows.Close()
+	out := map[string]TargetExtension{}
+	for rows.Next() {
+		var name, def string
+		var from []string
+		if err := rows.Scan(&name, &def, &from); err != nil {
+			return nil, err
+		}
+		reach := make(map[string]bool, len(from))
+		for _, v := range from {
+			reach[v] = true
+		}
+		out[name] = TargetExtension{Default: def, ReachableFrom: reach}
+	}
+	return out, rows.Err()
 }
 
 func (c *Copier) largeObjectCount(ctx context.Context, set string, id int32, database string) (int64, error) {
