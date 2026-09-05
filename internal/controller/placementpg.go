@@ -97,6 +97,10 @@ func (p *Placer) describe(ctx context.Context, wf *placementWorkflow) error {
 	if wf.st.Triggers, err = triggerStates(ctx, conn, wf.spec.SchemaName, wf.spec.TableName); err != nil {
 		return err
 	}
+	if wf.st.Owner, wf.st.Grants, err = tableOwnerAndGrants(ctx, conn, wf.spec.SchemaName, wf.spec.TableName,
+		wf.shape.qualified(wf.spec.TableName)); err != nil {
+		return err
+	}
 	// A column defaulting to a sequence in another schema cannot be moved
 	// safely: the target's rebuilt sequence would not be advanced past the
 	// copied rows (it is not owned, so pg_get_serial_sequence cannot find it),
@@ -295,17 +299,18 @@ func uniqueConstraintsMissingKey(ctx context.Context, conn ShardConn, schema, na
 	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
-// unsupportedTableFeatures lists what a placement move cannot yet preserve on
-// the table. The shadow is rebuilt from columns, constraints and indexes, so
-// everything below would be silently lost at the swap: row-level security
-// (an enabled-but-policy-less table denies all today and would allow all
-// after), the owner and table/column privileges (an outage for application
-// roles, or a privilege leak), user triggers, foreign keys in either direction
-// (inbound ones would keep pointing at the retired table's OID), rewrite
-// rules, inheritance/partition membership, user publications (downstream
-// subscribers would silently stop receiving), and a non-default replica
-// identity (the shadow is created with DEFAULT, so downstream logical
-// replication of UPDATE/DELETE would break after the move).
+// unsupportedTableFeatures lists what a placement move cannot yet preserve
+// on the table. The shadow is rebuilt from columns, constraints and indexes,
+// so everything below would be silently lost at the swap: foreign keys in
+// either direction (inbound ones would keep pointing at the retired table's
+// OID), rewrite rules, inheritance/partition membership, user publications
+// (downstream subscribers would silently stop receiving), and a non-default
+// replica identity (the shadow is created with DEFAULT, so downstream
+// logical replication of UPDATE/DELETE would break after the move).
+//
+// Reproduced rather than refused, each with its own function below:
+// row-level security, user triggers, and the owner and table/column
+// privileges.
 // tableExtensions are the extensions the table's indexes and constraints
 // depend on: the owners of the operator classes its indexes use and of the
 // operators its exclusion constraints name.
@@ -509,6 +514,88 @@ func tableTriggers(ctx context.Context, conn ShardConn, schema, table, shadow st
 	return out, nil
 }
 
+// tableOwnerAndGrants is the source table's owner and the statements that
+// reproduce its table and column privileges on the moved table.
+//
+// Rendered from aclexplode rather than by parsing relacl: an aclitem prints
+// as grantee=privs/grantor, and reading that back means re-implementing
+// PostgreSQL's own abbreviations. aclexplode already returns one row per
+// (grantee, privilege), which is one GRANT each.
+//
+// Statements name the FINAL table, not the shadow: they run at the swap,
+// after the rename, so the controller keeps the rights it needs while it is
+// still building and hands ownership over at the end. Their grantor is the
+// controller's role rather than the source's owner, which a REVOKE by the
+// new owner is unaffected by.
+func tableOwnerAndGrants(ctx context.Context, conn ShardConn, schema, table, final string) (string, []string, error) {
+	rows, err := conn.Query(ctx, `SELECT quote_ident(pg_get_userbyid(c.relowner))
+		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2`, schema, table)
+	if err != nil {
+		return "", nil, err
+	}
+	owner, err := pgx.CollectExactlyOneRow(rows, pgx.RowTo[string])
+	if err != nil {
+		return "", nil, err
+	}
+	rows, err = conn.Query(ctx, `WITH t AS (
+			SELECT c.oid, c.relacl FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = $1 AND c.relname = $2)
+		SELECT a.privilege_type,
+		       CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(a.grantee)) END,
+		       a.is_grantable, ''
+		  FROM t, aclexplode(t.relacl) a
+		UNION ALL
+		SELECT a.privilege_type,
+		       CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(a.grantee)) END,
+		       a.is_grantable, quote_ident(att.attname)
+		  FROM t, pg_attribute att, aclexplode(att.attacl) a
+		 WHERE att.attrelid = t.oid AND att.attnum > 0 AND NOT att.attisdropped
+		 ORDER BY 4, 2, 1`, schema, table)
+	if err != nil {
+		return "", nil, err
+	}
+	type grant struct {
+		Privilege string
+		Grantee   string
+		Grantable bool
+		Column    string
+	}
+	gs, err := pgx.CollectRows(rows, pgx.RowToStructByPos[grant])
+	if err != nil {
+		return "", nil, err
+	}
+	var out []string
+	for _, g := range gs {
+		if !validPrivilege(g.Privilege) {
+			// A privilege name this build does not know would be pasted
+			// into a GRANT unquoted. Refuse rather than construct a
+			// statement from an unvalidated catalog string.
+			return "", nil, fatal("table %s.%s carries privilege %q, which this version of pgshard cannot reproduce", schema, table, g.Privilege)
+		}
+		stmt := "GRANT " + g.Privilege
+		if g.Column != "" {
+			stmt += " (" + g.Column + ")"
+		}
+		stmt += " ON " + final + " TO " + g.Grantee
+		if g.Grantable {
+			stmt += " WITH GRANT OPTION"
+		}
+		out = append(out, stmt)
+	}
+	return owner, out, nil
+}
+
+// validPrivilege is the set of table and column privileges PostgreSQL can
+// report, checked because the name is pasted into a statement.
+func validPrivilege(p string) bool {
+	switch p {
+	case "SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN":
+		return true
+	}
+	return false
+}
+
 // triggerStates is each user trigger's tgenabled on the source table.
 func triggerStates(ctx context.Context, conn ShardConn, schema, table string) (map[string]string, error) {
 	rows, err := conn.Query(ctx, `SELECT tg.tgname, tg.tgenabled::text
@@ -547,11 +634,6 @@ func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name 
 		SELECT f FROM (
 			SELECT 'replica identity ' || CASE t.relreplident WHEN 'f' THEN 'FULL' WHEN 'i' THEN 'USING INDEX' ELSE 'NOTHING' END AS f
 				FROM t WHERE t.relreplident <> 'd'
-			UNION ALL SELECT 'owner ' || pg_get_userbyid(t.relowner) FROM t
-				WHERE t.relowner <> (SELECT oid FROM pg_roles WHERE rolname = current_user)
-			UNION ALL SELECT 'table privileges' FROM t WHERE t.relacl IS NOT NULL
-			UNION ALL SELECT 'column privileges on ' || attname FROM pg_attribute, t
-				WHERE attrelid = t.oid AND attnum > 0 AND NOT attisdropped AND attacl IS NOT NULL
 			UNION ALL SELECT 'foreign key ' || conname FROM pg_constraint, t
 				WHERE contype = 'f' AND (conrelid = t.oid OR confrelid = t.oid)
 			UNION ALL SELECT 'rule ' || rulename FROM pg_rewrite, t WHERE ev_class = t.oid AND rulename <> '_RETURN'
@@ -1984,11 +2066,31 @@ func (p *Placer) swapOn(ctx context.Context, wf *placementWorkflow, conn ShardCo
 		if err := restoreTriggers(ctx, conn, wf); err != nil {
 			return err
 		}
+		if err := restorePrivileges(ctx, conn, wf); err != nil {
+			return err
+		}
 		if err := enableRowSecurity(ctx, conn, wf); err != nil {
 			return err
 		}
 	}
 	_, err = conn.Exec(ctx, "COMMIT")
+	return err
+}
+
+// restorePrivileges re-grants what the source table granted and hands the
+// table back to its owner, in that order: the grants are made while the
+// controller still owns the table, and the owner change is the last thing
+// that happens to it.
+func restorePrivileges(ctx context.Context, conn ShardConn, wf *placementWorkflow) error {
+	for _, stmt := range wf.st.Grants {
+		if _, err := conn.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("%s: %w", stmt, err)
+		}
+	}
+	if wf.st.Owner == "" {
+		return nil
+	}
+	_, err := conn.Exec(ctx, "ALTER TABLE "+wf.shape.qualified(wf.spec.TableName)+" OWNER TO "+wf.st.Owner)
 	return err
 }
 

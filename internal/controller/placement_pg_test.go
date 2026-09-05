@@ -940,8 +940,6 @@ func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 	// Shapes lost by both shadow paths that carry no policy/trigger/FK.
 	mustExec(t, home, `CREATE ROLE reader`)
 	for _, c := range []struct{ ddl, table, want string }{
-		{`CREATE TABLE granted (id bigint PRIMARY KEY); GRANT SELECT ON granted TO reader`, "granted", "table privileges"},
-		{`CREATE TABLE colgrant (id bigint PRIMARY KEY, v text); GRANT SELECT (v) ON colgrant TO reader`, "colgrant", "column privileges on v"},
 		{`CREATE TABLE ruled (id bigint PRIMARY KEY); CREATE RULE r1 AS ON DELETE TO ruled DO INSTEAD NOTHING`, "ruled", "rule r1"},
 		{`CREATE TABLE base (id bigint PRIMARY KEY); CREATE TABLE inh (x int) INHERITS (base)`, "inh", "inheritance/partition membership"},
 		{`CREATE TABLE ri (id bigint PRIMARY KEY); ALTER TABLE ri REPLICA IDENTITY FULL`, "ri", "replica identity FULL"},
@@ -960,8 +958,12 @@ func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 	mustExec(t, home, `CREATE FUNCTION stamp_owner() RETURNS trigger LANGUAGE plpgsql AS $$
 		BEGIN NEW.owner := current_user; RETURN NEW; END $$`)
 	mustExec(t, home, `CREATE TRIGGER stamp_it BEFORE INSERT ON rlsonly FOR EACH ROW EXECUTE FUNCTION stamp_owner()`)
+	mustExec(t, home, `GRANT SELECT ON rlsonly TO reader`)
+	mustExec(t, home, `GRANT UPDATE (owner) ON rlsonly TO reader`)
+	mustExec(t, home, `CREATE ROLE keeper`)
+	mustExec(t, home, `ALTER TABLE rlsonly OWNER TO keeper`)
 	if got, err := unsupportedTableFeatures(ctx, pgxShardConn{home}, "public", "rlsonly"); err != nil || len(got) != 0 {
-		t.Fatalf("row-level security and triggers are reproduced now, not refused: %v %v", got, err)
+		t.Fatalf("row-level security, triggers, owner and grants are reproduced now, not refused: %v %v", got, err)
 	}
 }
 
