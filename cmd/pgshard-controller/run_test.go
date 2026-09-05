@@ -3,9 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
-	"github.com/jackc/pgx/v5"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/andrew01234567890/pgshard/internal/cli"
 	"github.com/andrew01234567890/pgshard/internal/controller"
