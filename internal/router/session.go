@@ -297,13 +297,51 @@ func startupSearchPath(options string) []string {
 		}
 		path = []string{}
 		for _, part := range strings.Split(value, ",") {
-			part = strings.Trim(strings.TrimSpace(part), `"`)
+			part = strings.TrimSpace(part)
+			// An UNQUOTED element is downcased, a quoted one is not,
+			// because that is what the backend does with this value.
+			//
+			// A startup option stores the string raw, and PostgreSQL splits
+			// it with SplitIdentifierString when it resolves a name, which
+			// downcases every unquoted element. Keeping the case here made
+			// the planner look up "MySchema" while the backend searched
+			// myschema: the planner found nothing, fell through to the
+			// database default, and sent a sharded table's statement to the
+			// home shard -- where the table also exists, so the answer was
+			// the home shard's rows and no error.
+			//
+			// Measured: PGOPTIONS="-c search_path=MySchema" gives
+			// current_setting 'MySchema' and current_schemas '{myschema}'.
+			//
+			// NOT true of `SET search_path = 'MySchema'`, which PostgreSQL
+			// stores already quoted and resolves with its case intact -- the
+			// planner's own SET parsing matches that and is left alone.
+			if quoted := strings.HasPrefix(part, `"`) && strings.HasSuffix(part, `"`) && len(part) >= 2; quoted {
+				part = strings.ReplaceAll(part[1:len(part)-1], `""`, `"`)
+			} else {
+				part = downcaseIdentifier(part)
+			}
 			if part != "" {
 				path = append(path, part)
 			}
 		}
 	}
 	return path
+}
+
+// downcaseIdentifier lowercases an unquoted identifier the way PostgreSQL
+// does: ASCII A-Z only. downcase_identifier (scansup.c) touches a high-bit
+// byte only in a single-byte encoding, so under UTF-8 -- which is what a
+// pgshard cluster runs -- anything above ASCII is left as it is. Using a
+// Unicode-aware lowercase here would fold characters the backend does not.
+func downcaseIdentifier(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
 }
 
 // searchPath is the schema list in force for the next statement: the
