@@ -20,6 +20,15 @@ while IFS=$'\t' read -r ref slug; do
   case "$slug" in
     *[!a-zA-Z0-9._-]*) echo "base-images: $slug is not a usable tag"; exit 1 ;;
   esac
+  # The tag has to distinguish DIGESTS, not just names. The same name:tag is
+  # pinned at two digests whenever a bump is split across pull requests --
+  # dependabot raises one per directory -- and a tag derived from the name
+  # alone made those collide, refused, and deadlocked both.
+  digest="${ref#*@sha256:}"
+  case "$slug" in
+    *-"${digest:0:12}") ;;
+    *) echo "base-images: $slug does not end in the digest of $ref, so two digests of one tag would collide"; exit 1 ;;
+  esac
   case "$ref" in
     */*) case "${ref%%/*}" in
            *.*|*:*|localhost) echo "base-images: $ref is not on Docker Hub and should not be listed"; exit 1 ;;

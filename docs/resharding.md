@@ -383,9 +383,17 @@ that ended within a day).
 - A move is refused at preflight when the table carries something the
   shadow build cannot reproduce, because a swap that dropped it would leave
   the table looking correct and enforcing nothing: foreign keys in either
-  direction, rules, table or column privileges, a non-default owner, a
-  non-default replica identity, inheritance or partition membership, and
-  publication membership.
+  direction, rules, a non-default replica identity, inheritance or partition
+  membership, and publication membership.
+- **The owner and table/column privileges are reproduced.** The shadow is
+  built by the controller, so without this the swap would hand the
+  application's table to the controller's role with every grant gone. Both
+  are applied at the swap, after the rename and in that order — the grants
+  while the controller still owns the table, the owner change last — so it
+  keeps the rights it needs while it is still building. Statements are
+  rendered from `aclexplode`, including column grants and `WITH GRANT
+  OPTION`; their grantor is the controller's role rather than the source's
+  owner, which a later `REVOKE` by the owner is unaffected by.
 - **Row-level security is reproduced**, not refused: the policies are
   recreated on the shadow (from `pg_policy`, since PostgreSQL has no
   `pg_get_policydef()`) while RLS is still off there, so the copy is not

@@ -45,13 +45,13 @@ jobs:
       # wrap because it is an action rather than a command. Retried by hand
       # for the same reason the e2e matrix does: a failed fetch takes the
       # whole cell down without saying anything about the product.
-      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+      - uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         id: install_kind
         continue-on-error: true
         with:
           version: v0.32.0
           install_only: true
-      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+      - uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         if: steps.install_kind.outcome == 'failure'
         with:
           version: v0.32.0
