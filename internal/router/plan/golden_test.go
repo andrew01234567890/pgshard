@@ -122,6 +122,18 @@ func golden() []want {
 		// holds, so the same value picks a different row on each. The
 		// volatility rule cannot see it: ctid is a column, not a call.
 		{sql: "delete from regions where ctid = '(0,1)'", kind: Refuse, msg: "a write to reference table \"regions\" cannot name the system column ctid"},
+		// A DEFAULT on a reference table is evaluated by every shard. The
+		// write path already refuses the same calls; ADD COLUMN is worse,
+		// because it gives EXISTING rows a value on each shard at once.
+		{sql: "alter table regions add column u uuid default gen_random_uuid()", kind: Refuse, msg: "a DEFAULT on reference table \"regions\" cannot call gen_random_uuid()"},
+		{sql: "alter table regions add column made timestamptz default clock_timestamp()", kind: Refuse, msg: "a DEFAULT on reference table \"regions\" cannot call clock_timestamp()"},
+		// now() is metadata-only to PostgreSQL and still once PER SHARD.
+		{sql: "alter table regions add column made timestamptz default now()", kind: Refuse, msg: "a DEFAULT on reference table \"regions\" cannot call now()"},
+		{sql: "alter table regions alter column name set default random()::text", kind: Refuse, msg: "a DEFAULT on reference table \"regions\" cannot call random()"},
+		// A constant default is the same everywhere and still allowed, and
+		// a sharded table is not this rule's business.
+		{sql: "alter table regions add column flag boolean default true", kind: MigrationKind, mig: "ALTER TABLE all"},
+		{sql: "alter table orders add column made timestamptz default clock_timestamp()", kind: MigrationKind, mig: "ALTER TABLE all rewrite"},
 		{sql: "update regions set name = 'x' where ctid = '(0,1)'", kind: Refuse, msg: "a write to reference table \"regions\" cannot name the system column ctid"},
 		{sql: "delete from regions where xmin::text <> '0'", kind: Refuse, msg: "a write to reference table \"regions\" cannot name the system column xmin"},
 		{sql: "update regions set name = tableoid::text", kind: Refuse, msg: "a write to reference table \"regions\" cannot name the system column tableoid"},
