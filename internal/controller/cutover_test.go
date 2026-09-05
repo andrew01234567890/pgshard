@@ -55,6 +55,11 @@ type fakeOps struct {
 	// onwards, so a test can park the run at a chosen check.
 	caughtUpUntil int
 	caughtUpCalls int
+	// seqFP is what the sequence carry reports carrying; seqAdvances is how
+	// many more times a sequence moves before the flip's check, as a source
+	// still handing out values does.
+	seqFP       string
+	seqAdvances int
 }
 
 func newFakeOps() *fakeOps {
@@ -106,8 +111,20 @@ func (f *fakeOps) Verify(context.Context) (VerifyReport, error) {
 	f.lsn += f.verifyAdvance
 	return f.verify, f.step(StepVerify)
 }
-func (f *fakeOps) Sequences(context.Context) error { return f.step(StepSequences) }
-func (f *fakeOps) Reverse(context.Context) error   { return f.step(StepReverse) }
+func (f *fakeOps) Sequences(context.Context) (string, error) {
+	return f.seqFP, f.step(StepSequences)
+}
+
+// SequenceFingerprint answers what the carry carried, unless the test asked
+// for advances still to come.
+func (f *fakeOps) SequenceFingerprint(context.Context) (string, error) {
+	if f.seqAdvances > 0 {
+		f.seqAdvances--
+		return fmt.Sprintf("%s-moved-%d", f.seqFP, f.seqAdvances), nil
+	}
+	return f.seqFP, nil
+}
+func (f *fakeOps) Reverse(context.Context) error { return f.step(StepReverse) }
 func (f *fakeOps) SchemaFingerprints(context.Context) (map[string]string, error) {
 	if f.fingerprints == nil {
 		return map[string]string{"default/0/app": "before"}, nil
@@ -464,9 +481,8 @@ func TestCutoverFlipRecarriesSequencesThenFlipsAnyway(t *testing.T) {
 	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); !errors.Is(err, boom) {
 		t.Fatalf("err %v", err)
 	}
-	// The source never stops moving, not even between the journal and the
-	// flip.
-	h.ops.advance = 10
+	// A source whose SEQUENCES keep moving, not merely whose WAL does.
+	h.ops.seqAdvances = maxSeqRecarries + 5
 	for i := range maxSeqRecarries {
 		_, err := h.c.cutover(context.Background(), h.wf, h.ops)
 		if err == nil || isFatal(err) {
@@ -483,6 +499,37 @@ func TestCutoverFlipRecarriesSequencesThenFlipsAnyway(t *testing.T) {
 	}
 	if h.wf.cutover.Recarries != maxSeqRecarries {
 		t.Fatalf("re-carries %d, want the bound %d", h.wf.cutover.Recarries, maxSeqRecarries)
+	}
+}
+
+// TestCutoverFlipDoesNotRecarryForWALMovementAlone: the check used to ask
+// whether pg_current_wal_lsn had moved, which is a far wider question than
+// the one it needs. A checkpoint or an autovacuum moves it with no user
+// write behind it, so the answer was yes on every cutover -- twice, until
+// the bound stopped it -- and each re-carry cost a full pass over every
+// source and target INSIDE THE WRITE FENCE while writing nothing, because
+// the carry takes the greater of the two positions. Measured at rest, that
+// was about 500ms of a 1.2s pause.
+//
+// Safety does not rest on this check: StepSwap carries the sequences again
+// with the sources PAUSED, which is what nothing can consume a value after.
+func TestCutoverFlipDoesNotRecarryForWALMovementAlone(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.runUntil(t, StageSwitching)
+	boom := errors.New("boom")
+	h.ops.fail[StepJournal] = boom
+	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); !errors.Is(err, boom) {
+		t.Fatalf("err %v", err)
+	}
+	// From here the source never stops moving, and no sequence advances
+	// with it -- which is every cutover, because a checkpoint is enough.
+	h.ops.advance = 10
+	h.runUntil(t, StageSwitched)
+	if h.wf.cutover.Recarries != 0 {
+		t.Fatalf("re-carried %d times for WAL movement with no sequence behind it", h.wf.cutover.Recarries)
+	}
+	if !strings.Contains(strings.Join(h.ops.calls, ","), StepFlip) {
+		t.Fatalf("the flip must happen: %v", h.ops.calls)
 	}
 }
 
@@ -731,11 +778,11 @@ func TestNoAbortOnceTheJournalIsWritten(t *testing.T) {
 		t.Fatal("the journal step must surface its error")
 	}
 	delete(h.ops.fail, StepJournal)
-	h.ops.advance = 10
+	h.ops.seqAdvances = 1
 	// The rewind reports itself as a retry, which pass would treat as
 	// fatal, so the pass is driven directly here.
 	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); err == nil || isFatal(err) {
-		t.Fatalf("movement at the flip must ask for a retry, got %v", err)
+		t.Fatalf("a sequence advance at the flip must ask for a retry, got %v", err)
 	}
 	if h.wf.cutover.Step != StepSequences {
 		t.Fatalf("step %s, want the rewind to the sequence carry", h.wf.cutover.Step)
@@ -746,7 +793,6 @@ func TestNoAbortOnceTheJournalIsWritten(t *testing.T) {
 
 	// A step now fails with the fence well past its timeout: the old gate
 	// would have aborted here, because the cursor is before the journal.
-	h.ops.advance = 0
 	h.ops.fail[StepSequences] = errors.New("target unreachable")
 	h.clock = h.clock.Add(4 * DefaultCutoverTimeout)
 	aborts := len(h.wf.cutover.Aborts)
@@ -778,15 +824,14 @@ func TestJournalRefreshesItsTargetsAfterARewind(t *testing.T) {
 		t.Fatal("the journal step must surface its error")
 	}
 	delete(h.ops.fail, StepJournal)
-	h.ops.advance = 10
+	h.ops.seqAdvances = 1
 	if _, err := h.c.cutover(context.Background(), h.wf, h.ops); err == nil || isFatal(err) {
-		t.Fatalf("movement at the flip must ask for a retry, got %v", err)
+		t.Fatalf("a sequence advance at the flip must ask for a retry, got %v", err)
 	}
 	first := h.ops.journaled[h.wf.cutover.JournalID]
 	if first == 0 {
 		t.Fatal("the journal was never written")
 	}
-	h.ops.advance = 0
 	h.runUntil(t, StageSwitched)
 	if again := h.ops.journaled[h.wf.cutover.JournalID]; again <= first {
 		t.Errorf("the journal was written %d times and not again after the rewind", again)

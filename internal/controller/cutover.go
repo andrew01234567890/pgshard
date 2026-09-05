@@ -88,8 +88,12 @@ type cutoverState struct {
 	FlippedAt  *time.Time       `json:"flipped_at,omitempty"`
 	ReleasedAt *time.Time       `json:"released_at,omitempty"`
 	// Recarries counts how many times the flip has sent the switch back to
-	// re-carry sequences because the sources moved.
+	// re-carry sequences because a sequence moved.
 	Recarries int `json:"recarries,omitempty"`
+	// SeqFingerprint is what the sequence carry carried, so the flip can
+	// ask whether a sequence advanced since rather than whether the WAL
+	// did.
+	SeqFingerprint string `json:"seq_fingerprint,omitempty"`
 	// PauseMS is the router-visible write pause: fence raised to new map
 	// published. FenceMS is fence raised to fence released.
 	PauseMS    int64      `json:"pause_ms,omitempty"`
@@ -215,7 +219,12 @@ type cutoverOps interface {
 	Verify(ctx context.Context) (VerifyReport, error)
 	// Sequences carries every user-database sequence position from the
 	// sources to the targets inside the fence.
-	Sequences(ctx context.Context) error
+	// Sequences carries the sources' sequence positions to the targets and
+	// returns a fingerprint of what it carried.
+	Sequences(ctx context.Context) (string, error)
+	// SequenceFingerprint recomputes that fingerprint from the sources, so
+	// the flip can tell an advance from an unchanged position.
+	SequenceFingerprint(ctx context.Context) (string, error)
 	// Reverse creates the reverse publications and disabled subscriptions.
 	Reverse(ctx context.Context) error
 	// SchemaFingerprints hashes every database on both sets, keyed
@@ -542,9 +551,11 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 			return false, fatal("verification failed: %s", strings.Join(report.Mismatches, "; "))
 		}
 	case StepSequences:
-		if err := ops.Sequences(ctx); err != nil {
+		fp, err := ops.Sequences(ctx)
+		if err != nil {
 			return false, err
 		}
+		wf.cutover.SeqFingerprint = fp
 	case StepReverse:
 		if err := ops.Reverse(ctx); err != nil {
 			return false, err
@@ -587,28 +598,32 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 		if !ok {
 			return true, retryf("%s", why)
 		}
-		if !maps.Equal(pos, wf.cutover.Positions) && wf.cutover.Recarries < maxSeqRecarries {
-			// The movement may carry sequence advances the earlier
-			// StepSequences did not see, so the switch jumps back there
-			// and re-carries them before another flip attempt.
-			//
-			// Bounded, because a source is never obliged to stand still:
-			// a checkpoint or an autovacuum moves pg_current_wal_lsn with
-			// no user write behind it, and after the journal there is no
-			// timeout to end the wait. What the flip needs is that the
-			// targets hold everything the sources hold, which CaughtUp
-			// has just established for these very positions. Sequence
-			// positions are the part CaughtUp cannot speak for, and the
-			// headroom collectSequences adds is finite, so the swap
-			// carries them again with the sources paused rather than
-			// leaving this bound to be what keeps them right.
+		// Sequence positions are the part CaughtUp cannot speak for, so
+		// the flip asks the sources directly whether one advanced since
+		// the carry. It used to ask whether the WAL POSITION had moved,
+		// which is a much wider question than the one it needs: a
+		// checkpoint or an autovacuum moves pg_current_wal_lsn with no
+		// user write behind it, so the answer was yes on every cutover,
+		// twice, until the bound below stopped it. Each of those recarried
+		// sequences that had not moved -- Apply takes the greater of the
+		// two, so it wrote nothing -- and each cost a full pass over every
+		// source and target INSIDE THE WRITE FENCE. Measured at rest, that
+		// was about 500ms of a 1.2s pause.
+		//
+		// Still bounded, because a source is never obliged to stand still
+		// and after the journal there is no timeout to end the wait.
+		seqFP, err := ops.SequenceFingerprint(ctx)
+		if err != nil {
+			return false, err
+		}
+		if seqFP != wf.cutover.SeqFingerprint && wf.cutover.Recarries < maxSeqRecarries {
 			wf.cutover.Positions = pos
 			wf.cutover.Recarries++
 			wf.cutover.Step = StepSequences
-			if err := c.saveCutover(ctx, wf, "switching: sources advanced before the flip; re-carrying sequences"); err != nil {
+			if err := c.saveCutover(ctx, wf, "switching: a sequence advanced before the flip; re-carrying sequences"); err != nil {
 				return false, err
 			}
-			return true, retryf("sources advanced past the recorded positions before the flip")
+			return true, retryf("a sequence advanced past the carried position before the flip")
 		}
 		if err := ops.Flip(ctx, wf.cutover.JournalID); err != nil {
 			return false, err
@@ -657,7 +672,7 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 		// with the sources paused, so nothing can consume a value after
 		// it -- which is what makes the flip's bounded re-carry a
 		// liveness measure rather than the thing safety rests on.
-		if err := ops.Sequences(ctx); err != nil {
+		if _, err := ops.Sequences(ctx); err != nil {
 			return false, errors.Join(err, ops.PauseSources(ctx, false))
 		}
 		if err := ops.DisableForward(ctx); err != nil {

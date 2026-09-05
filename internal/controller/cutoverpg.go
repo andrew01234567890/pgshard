@@ -736,6 +736,16 @@ func (o *pgCutover) Reverse(ctx context.Context) error {
 // columns, constraints and indexes outside the system and pgshard schemas.
 // It is only ever compared with an earlier hash of the SAME set, so the two
 // sides of an upgrade never have to render identically across majors.
+//
+// pgshard_journal is excluded for a reason worth keeping: the journal table
+// is created on the sources at StepJournal, which runs AFTER the
+// fingerprints are taken at StepReverse. Including it made every recorded
+// fingerprint describe a source that did not yet have the journal, so a
+// rollback compared against it saw drift and refused -- "schema changed
+// since the switch ... needs reconciling by hand" -- on a set whose
+// structure nobody had touched. It was invisible because the flip's
+// re-carry rewound through StepReverse and re-took the fingerprints once
+// the journal existed; a cutover that did not re-carry had no rollback.
 const schemaFingerprintSQL = `SELECT coalesce(md5(string_agg(line, E'\n' ORDER BY line)), '')
 FROM (
     SELECT 'col ' || n.nspname || ' ' || c.relname || ' ' || c.relkind::text || ' ' || a.attname
@@ -744,18 +754,18 @@ FROM (
       JOIN pg_namespace n ON n.oid = c.relnamespace
       JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
      WHERE c.relkind IN ('r', 'p', 'm', 'v')
-       AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgshard')
+       AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgshard', 'pgshard_journal')
        AND n.nspname NOT LIKE 'pg\_toast%'
     UNION ALL
     SELECT 'con ' || n.nspname || ' ' || r.relname || ' ' || k.conname || ' ' || pg_get_constraintdef(k.oid)
       FROM pg_constraint k
       JOIN pg_class r ON r.oid = k.conrelid
       JOIN pg_namespace n ON n.oid = r.relnamespace
-     WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgshard')
+     WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgshard', 'pgshard_journal')
     UNION ALL
     SELECT 'idx ' || schemaname || ' ' || indexname || ' ' || indexdef
       FROM pg_indexes
-     WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pgshard')
+     WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pgshard', 'pgshard_journal')
 ) parts`
 
 // scalarString runs a query that returns exactly one text value.
