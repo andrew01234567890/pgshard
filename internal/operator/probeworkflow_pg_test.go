@@ -87,6 +87,7 @@ func startProbePostgres(t *testing.T) string {
 		"--entrypoint", "sh", image, "-ec",
 		`initdb -D /tmp/pgdata --auth=trust -U postgres --no-sync >/dev/null &&
 		 echo "host all all all trust" >> /tmp/pgdata/pg_hba.conf &&
+		 echo "host replication all all trust" >> /tmp/pgdata/pg_hba.conf &&
 		 exec postgres -D /tmp/pgdata -c listen_addresses='*'`).CombinedOutput()
 	if err != nil {
 		t.Fatalf("docker run: %v: %s", err, out)

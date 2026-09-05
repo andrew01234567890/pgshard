@@ -2,7 +2,9 @@ package operator
 
 import (
 	"context"
+	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -174,4 +176,38 @@ func TestADesignatedPrimaryOutsideTheMemberSetIsNotDereferenced(t *testing.T) {
 		t.Fatalf("loadState designated %q, which is not a member", st.primary)
 	}
 	reconcile(t, r, c)
+}
+
+// A retirement that cannot drop the member's slot must not delete the pod.
+// Once the pod is gone nothing lists the member any more -- its claim is
+// kept on purpose and no longer counts as work -- so there is no later pass
+// to try again on, and the slot would pin WAL on the primary until the disk
+// filled. That is the failure the old refusal existed to prevent.
+func TestARetirementThatCannotDropTheSlotKeepsThePod(t *testing.T) {
+	r, fp, fa, c := healthyCluster(t, "slotstuck")
+	grow(t, r, fp, fa, c, 5)
+	fp.dropSlotErr = errors.New("slot is still there after dropping it")
+
+	patchSpec(t, c, func(c *pgshardv1alpha1.PgShardCluster) { c.Spec.ReplicasPerShard = 3 })
+	for range 4 {
+		reconcile(t, r, c)
+	}
+	if !podExists(t, "slotstuck-shard-0-4") {
+		t.Fatal("the pod went although its slot is still on the primary")
+	}
+	if !slices.ContainsFunc(fp.slots, func(s string) bool { return strings.Contains(s, "drop:"+SlotName("slotstuck-shard-0-4")) }) {
+		t.Fatalf("the retirement must keep trying to drop the slot: %v", fp.slots)
+	}
+
+	// It proceeds once the drop works.
+	fp.dropSlotErr = nil
+	for range 4 {
+		reconcile(t, r, c)
+		if !podExists(t, "slotstuck-shard-0-4") {
+			break
+		}
+	}
+	if podExists(t, "slotstuck-shard-0-4") {
+		t.Fatal("the retirement must proceed once the slot is gone")
+	}
 }

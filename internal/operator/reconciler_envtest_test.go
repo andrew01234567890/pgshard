@@ -94,9 +94,13 @@ type fakeProber struct {
 	standbys map[string]StandbyState
 	// published records shard_status upserts as "shard-<id>:<epoch>:<endpoint>".
 	published []string
-	// slots records EnsureSlots calls as "<dsn host>:<want>:-<drop>".
-	slots      []string
-	placements []PlacementWorkflowInfo
+	// slots records EnsureSlots calls as "<dsn host>:<want>:-<drop>" and
+	// DropSlot calls as "<dsn host>:drop:<name>".
+	slots []string
+	// dropSlotErr makes DropSlot fail, as it does when the slot is still
+	// there after the attempt.
+	dropSlotErr error
+	placements  []PlacementWorkflowInfo
 	// journal records fence writes and promotions in order.
 	journal *[]string
 	// routerPasswords records every ALTER ROLE the reconcile asked for.
@@ -403,6 +407,13 @@ func (f *fakeProber) EnsureSlots(_ context.Context, dsn string, want []string, d
 	defer f.mu.Unlock()
 	f.slots = append(f.slots, fmt.Sprintf("%s:%s:-%s", dsn[strings.Index(dsn, "@")+1:], strings.Join(want, ","), drop))
 	return nil
+}
+
+func (f *fakeProber) DropSlot(_ context.Context, dsn, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.slots = append(f.slots, fmt.Sprintf("%s:drop:%s", dsn[strings.Index(dsn, "@")+1:], name))
+	return f.dropSlotErr
 }
 
 type fakeAgents struct {

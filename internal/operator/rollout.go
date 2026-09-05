@@ -334,12 +334,29 @@ func (r *ClusterReconciler) stepRetire(ctx context.Context, c *pgshardv1alpha1.P
 			Reason: "waiting for synchronous_standby_names to drop " + next + " before retiring it"}
 		return nil
 	}
+	// The slot goes before the pod, and the pod does not go until it has.
+	// A slot left behind pins WAL on the primary until the disk fills --
+	// the failure the old refusal existed to prevent -- and once the pod is
+	// gone nothing lists this member any more (its claim is kept on
+	// purpose and is not work), so there is no later pass to try again on.
+	//
+	// DropSlot, not EnsureSlots' drop: that one drops only an INACTIVE
+	// slot, which is right for the slot a new primary holds for itself and
+	// wrong here, because a member being retired streams from its slot
+	// until the moment its pod goes. It did nothing and said nothing.
+	if primary := members[obs.state.primary]; primary != nil && primary.ip != "" {
+		if err := r.Prober.DropSlot(ctx, HostDSN(primary.ip, password), SlotName(next)); err != nil {
+			obs.rollout = &pgshardv1alpha1.GroupRollout{Phase: pgshardv1alpha1.RolloutPhaseHeld, Member: next,
+				Reason: "cannot drop the replication slot of " + next + " on the primary: " + err.Error()}
+			return r.setGroupRollout(ctx, c, g, obs.rollout)
+		}
+	}
 	step := &pgshardv1alpha1.GroupRollout{Phase: pgshardv1alpha1.RolloutPhaseRetiring, Member: next,
 		Reason: "replica count lowered to " + strconv.Itoa(g.Replicas), Since: r.metaNow()}
 	if err := r.setGroupRollout(ctx, c, g, step); err != nil {
 		return err
 	}
-	if err := r.retireMember(ctx, c, g, obs, members, password, next); err != nil {
+	if err := r.retireMember(ctx, c, g, next); err != nil {
 		return err
 	}
 	obs.rollout = step

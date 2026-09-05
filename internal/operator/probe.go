@@ -93,6 +93,15 @@ type Prober interface {
 	// SetReshardCutoverSpec mirrors spec.resharding and the proceed
 	// annotation into the workflow spec the controller's cutover reads.
 	SetReshardCutoverSpec(ctx context.Context, dsn, workflowID, pauseBefore string, proceed []string, retireAfterSeconds int64) error
+	// DropSlot removes one replication slot, terminating whatever is using
+	// it first, and reports an error if it is still there afterwards.
+	//
+	// EnsureSlots drops only an INACTIVE slot, which is right for the
+	// slot a new primary holds for itself but wrong for a retirement: the
+	// member being retired is streaming from its slot right up to the
+	// moment its pod goes, so that drop silently does nothing and leaves a
+	// slot pinning WAL for a standby that is never coming back.
+	DropSlot(ctx context.Context, dsn, name string) error
 	// EnsureSlots creates the missing physical slots in want on the primary
 	// and drops an inactive slot named drop (the primary's own, inherited
 	// from its time as a standby, which would otherwise pin WAL forever).
@@ -584,6 +593,42 @@ func (PgxProber) EnsureSlots(ctx context.Context, dsn string, want []string, dro
 	return err
 }
 
+// DropSlot terminates a slot's user and drops it, then checks.
+//
+// pg_drop_replication_slot refuses a slot that is in use, so terminating
+// the walsender is what makes this happen at all rather than silently do
+// nothing. The standby can reconnect between the two statements, so the
+// result is verified rather than assumed: the caller retries, and a
+// retirement that cannot drop the slot must not delete the pod, because
+// the leaked slot would pin WAL until the disk filled.
+func (PgxProber) DropSlot(ctx context.Context, dsn, name string) error {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if _, err := conn.Exec(ctx, `SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots
+		WHERE slot_name = $1 AND active_pid IS NOT NULL`, name); err != nil {
+		return fmt.Errorf("terminate the user of slot %s: %w", name, err)
+	}
+	// Errors are ignored here and the check below is what decides: a drop
+	// that loses the race with a reconnecting walsender fails with 55006,
+	// which is not a reason to stop -- it is a reason to look.
+	_, _ = conn.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1`, name)
+	rows, err := conn.Query(ctx, `SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1`, name)
+	if err != nil {
+		return err
+	}
+	n, err := pgx.CollectExactlyOneRow(rows, pgx.RowTo[int64])
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return fmt.Errorf("slot %s is still there after dropping it", name)
+	}
+	return nil
+}
+
 // Settings reads the named rows of pg_settings.
 func (PgxProber) Settings(ctx context.Context, dsn string, names []string) (map[string]SettingState, error) {
 	conn, err := pgx.Connect(ctx, dsn)
@@ -997,6 +1042,12 @@ func (b boundedProber) SetReshardCutoverSpec(ctx context.Context, dsn, workflowI
 	ctx, cancel := b.bound(ctx)
 	defer cancel()
 	return b.Inner.SetReshardCutoverSpec(ctx, dsn, workflowID, pauseBefore, proceed, retireAfterSeconds)
+}
+
+func (b boundedProber) DropSlot(ctx context.Context, dsn, name string) error {
+	ctx, cancel := b.bound(ctx)
+	defer cancel()
+	return b.Inner.DropSlot(ctx, dsn, name)
 }
 
 func (b boundedProber) EnsureSlots(ctx context.Context, dsn string, want []string, drop string) error {

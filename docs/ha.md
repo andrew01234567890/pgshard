@@ -171,6 +171,15 @@ first, then rebuilt as a standby.
   sets `Degraded=True/RolloutHeld` and `status.rollout.phase=Held`; nothing
   further is deleted. The missing member is still recreated and the rollout
   resumes by itself when it is back.
+- A **retirement** (lowering `replicasPerShard` or `catalog.replicas`) drops
+  the member's replication slot on the primary **before** deleting its pod,
+  and does not delete the pod until the slot is gone: a slot left behind
+  pins WAL until the disk fills, and once the pod is gone nothing lists the
+  member any more, so there is no later pass to retry on. The drop
+  terminates whatever is using the slot first — a member being retired
+  streams from its slot until its pod goes — and verifies the result, so a
+  slot that cannot be dropped holds the rollout with the reason instead of
+  leaking.
 
 ## Invariants
 
