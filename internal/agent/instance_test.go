@@ -200,3 +200,25 @@ func TestPromotionPendingMarkerLifecycle(t *testing.T) {
 		t.Fatal("marker still reported after clear")
 	}
 }
+
+// TestACloneDoesNotEmptyPGDATABeforeItHasReachedTheSource: a rewind that
+// failed because the primary was unreachable falls through to a full clone,
+// and the clone emptied PGDATA before it had contacted anything. The clone
+// then failed for the same reason, leaving the member with no data at all
+// where waiting would have cost only time.
+func TestACloneDoesNotEmptyPGDATABeforeItHasReachedTheSource(t *testing.T) {
+	in := newTestInstance(t)
+	// A source that nothing is listening on: the address is unroutable, so
+	// the connection attempt fails rather than hanging for its timeout.
+	in.cfg.PrimaryConninfo = "host=127.0.0.1 port=1 user=postgres dbname=postgres connect_timeout=1"
+	marker := filepath.Join(in.cfg.PGData, "PG_VERSION")
+	if err := os.WriteFile(marker, []byte("18\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.baseBackup(context.Background()); err == nil {
+		t.Fatal("a clone from an unreachable source must fail")
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("PGDATA was emptied before the source was reached: %v", err)
+	}
+}

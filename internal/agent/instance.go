@@ -184,10 +184,15 @@ func (in *Instance) baseBackup(ctx context.Context) error {
 		return errors.New("cannot reclone while postgres is running")
 	}
 	in.log.Info("cloning from primary", "slot", in.cfg.SlotName())
-	if err := clearDir(in.cfg.PGData); err != nil {
+	// The source is contacted BEFORE PGDATA is emptied. A rewind that failed
+	// because the primary was unreachable used to land here, wipe the only
+	// copy of this member's data, and then fail the clone for the same
+	// reason -- leaving a member with nothing, where waiting would have cost
+	// only time.
+	if err := in.ensureSlotOnSource(ctx, in.cfg.PrimaryConninfo); err != nil {
 		return err
 	}
-	if err := in.ensureSlotOnSource(ctx, in.cfg.PrimaryConninfo); err != nil {
+	if err := clearDir(in.cfg.PGData); err != nil {
 		return err
 	}
 	cmd := in.sup.Command(ctx, "pg_basebackup", "-D", in.cfg.PGData, "-d", PrimaryConninfo(in.cfg),
@@ -396,12 +401,24 @@ func (in *Instance) waitWALReceiverStopped(ctx context.Context) error {
 // pg_rewind (falling back to a full reclone), stale slot removal, standby
 // configuration and restart.
 func (in *Instance) Demote(ctx context.Context, source string) error {
-	// This node's term as primary is over: nothing of it may still be
-	// talking to the repository when the next one starts.
-	in.stopStanzaWorker()
-	if err := in.sup.Stop(ctx, ShutdownFast, time.Duration(in.cfg.ShutdownTimeout)); err != nil {
+	if err := in.StopForDemote(ctx); err != nil {
 		return err
 	}
+	return in.Follow(ctx, source)
+}
+
+// StopForDemote ends this node's term as primary: the stanza worker stops --
+// nothing of this term may still be talking to the repository when the next
+// one starts -- and PostgreSQL is shut down. It is separate from Follow so a
+// caller can hand the primary Lease back as soon as the database is down,
+// rather than only if the rejoin that follows succeeds.
+func (in *Instance) StopForDemote(ctx context.Context) error {
+	in.stopStanzaWorker()
+	return in.sup.Stop(ctx, ShutdownFast, time.Duration(in.cfg.ShutdownTimeout))
+}
+
+// Follow makes a stopped former primary a standby of source and starts it.
+func (in *Instance) Follow(ctx context.Context, source string) error {
 	if source == "" {
 		source = in.cfg.PrimaryConninfo
 	}
