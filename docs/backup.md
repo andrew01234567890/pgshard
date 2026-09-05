@@ -344,7 +344,20 @@ one bound cluster after another) runs `controller.Barrier`:
 5. verify no decision row was created since the fence was raised (a router
    that had not yet seen the fence), then insert `pgshard.restore_points`
    `{name, shard_map_generation, per_group, certified: true}`;
-6. release the fence — on every failure path too, and nothing is recorded.
+6. release the fence — on every failure path the RUNNING controller takes,
+   and nothing is recorded.
+
+**A controller that dies mid-barrier leaves the fence up.** The release is the
+running process's, so a pod that is OOM-killed or a node that disappears
+between step 1 and step 6 leaves `write_fence = true` in
+`pgshard.shard_map_generation`, and every router refuses writes with `57P03`
+once its buffering window expires. Recovery on the next leader resumes the
+shards but **does not lower the fence** (`Barrier.Recover`, and see the
+runbook): a fence is also what a cluster restored to a barrier comes back
+holding, and clearing that would unfence a cluster mid two-phase
+reconciliation. The fence is cleared by the next barrier, which takes it over
+— so a cluster with no `barrierSchedule` stays fenced until someone runs one
+or clears it by hand. `docs/runbooks/stuck-workflows.md` has the command.
 
 `Controller.ListBarriers` (`certified_only`) lists them newest first; the
 restore point name every group shares is `pgshard-<name>`.

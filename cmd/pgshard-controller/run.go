@@ -174,7 +174,11 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		go applier.Run(ctx, *applyEvery, leader.Load)
 		go (&controller.StreamMonitor{Pool: pool, Logger: logger, Shards: dialer}).Run(ctx, *resolveEvery, leader.Load)
 		// A barrier whose controller died leaves the cluster fenced and its
-		// shards paused; lift that as soon as no barrier is running.
+		// shards paused. This lifts the PAUSE as soon as no barrier is
+		// running; the fence stays up deliberately, because a restored
+		// cluster comes back holding one and lowering that would unfence it
+		// mid two-phase reconciliation. Barrier.Recover says the same, and
+		// this comment used to claim it lifted both.
 		go barrier.RunRecovery(ctx, *resolveEvery, leader.Load)
 		subTemplate := *subscriptionTemplate
 		if subTemplate == "" {
