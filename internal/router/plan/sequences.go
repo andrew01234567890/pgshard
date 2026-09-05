@@ -90,6 +90,51 @@ func builtinName(names []string) bool {
 // rows, and LIMIT without a total order, TABLESAMPLE and DISTINCT ON do not
 // promise that - no function is involved, so the volatility check cannot
 // see them.
+// perShardColumn is the first system column the statement names, or "".
+//
+// A system column is a fact about where a row physically IS on one server,
+// not about what it holds: ctid is a page and offset, xmin and xmax are that
+// server's transaction ids, tableoid is that server's catalog. A reference
+// write runs on every shard, and the same ctid names a DIFFERENT ROW on
+// each of them -- so `DELETE ... WHERE ctid = '(0,1)'` deletes whatever
+// happens to sit first on each shard and leaves the copies disagreeing,
+// with no error anywhere.
+//
+// The volatility rule does not see this: ctid is a column, not a call. Two
+// common shapes were already refused, but only by accident -- the
+// deduplication idiom through min(ctid) trips the volatility rule, and
+// `ctid IN (SELECT ... LIMIT 1)` trips the unordered-pick rule. A bare
+// equality on ctid tripped neither.
+func perShardColumn(node *pgquerypb.Node) string {
+	found := ""
+	visit(node, func(n *pgquerypb.Node) bool {
+		if found != "" {
+			return false
+		}
+		cr := n.GetColumnRef()
+		if cr == nil {
+			return true
+		}
+		fields := stringList(cr.GetFields())
+		if len(fields) == 0 || len(fields) != len(cr.GetFields()) {
+			return true
+		}
+		if name := fields[len(fields)-1]; systemColumns[name] {
+			found = name
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// systemColumns are PostgreSQL's own per-row system columns. Every one of
+// them describes this server's storage or transactions rather than the
+// row's content, so none of them means the same thing on two shards.
+var systemColumns = map[string]bool{
+	"ctid": true, "xmin": true, "xmax": true, "cmin": true, "cmax": true, "tableoid": true,
+}
+
 func unorderedPick(node *pgquerypb.Node) string {
 	found := ""
 	visit(node, func(n *pgquerypb.Node) bool {

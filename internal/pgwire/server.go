@@ -275,10 +275,19 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // harmless.
 //
 // This is what makes a revocation reach a session that is already open: a
-// role that loses its login, expires or has its allowance cut keeps working
-// otherwise, because authentication only gates new connections. Idle
-// sessions go at once, active ones when their statement or transaction
-// finishes, the same way a drain treats them.
+// role that loses its login or expires keeps working otherwise, because
+// authentication only gates new connections.
+//
+// It is NOT a drain, and the difference is the point. A drain lets a
+// transaction finish; a revocation cancels the running statement and closes
+// the socket, in a transaction or not. Waiting would let a role that may no
+// longer log in go on working for as long as it kept a transaction open,
+// which is the thing being revoked. TestTerminateWhereEndsOnlyThatRolesSessions
+// holds one open and requires it to end.
+//
+// (This comment said the opposite until 2026-09-05 -- "active ones when
+// their statement or transaction finishes, the same way a drain treats
+// them" -- which the test beside it had always contradicted.)
 func (s *Server) TerminateWhere(revoked func(user string) bool) int {
 	s.mu.Lock()
 	sessions := make([]*session, 0, len(s.sessions))

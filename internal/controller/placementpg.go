@@ -86,6 +86,9 @@ func (p *Placer) describe(ctx context.Context, wf *placementWorkflow) error {
 	if err := p.checkTriggerFunctions(ctx, conn, wf); err != nil {
 		return err
 	}
+	if err := p.checkForeignKeys(ctx, conn, wf); err != nil {
+		return err
+	}
 	comment, err := tableComment(ctx, conn, wf.spec.SchemaName, wf.spec.TableName)
 	if err != nil {
 		return err
@@ -451,6 +454,30 @@ func triggerFunctions(ctx context.Context, conn ShardConn, schema, table string)
 	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
+// tableForeignKeys renders the table's own foreign keys onto the shadow.
+//
+// Added while the shadow is EMPTY, so the constraint is created validated at
+// no cost and every copied row is checked as it arrives. The ticket's
+// suggestion was NOT VALID followed by VALIDATE at the swap; that is what
+// you need when the rows are already there, and here they are not yet --
+// VALIDATE would scan the whole table inside the write fence to prove
+// something the inserts had already proved one row at a time.
+//
+// The definition names the referenced table by name, and that name does not
+// change, so unlike a trigger there is nothing to retarget: only the table
+// the constraint is ON is different, and ALTER TABLE says which that is.
+func tableForeignKeys(ctx context.Context, conn ShardConn, schema, table, shadow string) ([]string, error) {
+	fks, err := outboundForeignKeys(ctx, conn, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, fk := range fks {
+		out = append(out, "ALTER TABLE "+shadow+" ADD CONSTRAINT "+QuoteIdent(fk.Name)+" "+fk.Definition)
+	}
+	return out, nil
+}
+
 // tableTriggers renders the table's user triggers onto the shadow.
 //
 // pg_get_triggerdef writes the statement PostgreSQL would need to recreate
@@ -596,6 +623,80 @@ func validPrivilege(p string) bool {
 	return false
 }
 
+// outboundForeignKeys are the table's own foreign keys, with the table each
+// one references.
+func outboundForeignKeys(ctx context.Context, conn ShardConn, schema, table string) ([]foreignKey, error) {
+	rows, err := conn.Query(ctx, `SELECT k.conname, pg_get_constraintdef(k.oid),
+			rn.nspname, r.relname
+		FROM pg_constraint k
+		JOIN pg_class c ON c.oid = k.conrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		JOIN pg_class r ON r.oid = k.confrelid
+		JOIN pg_namespace rn ON rn.oid = r.relnamespace
+		WHERE k.contype = 'f' AND n.nspname = $1 AND c.relname = $2
+		ORDER BY k.conname`, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[foreignKey])
+}
+
+// foreignKey is one of the table's own foreign keys.
+type foreignKey struct {
+	Name       string
+	Definition string
+	RefSchema  string
+	RefTable   string
+}
+
+// checkForeignKeys refuses a move whose foreign keys the targets could not
+// satisfy.
+//
+// A foreign key holds only where the referenced ROWS are, and after a move
+// the referencing rows are on every holder. A REFERENCE table is on every
+// shard in full, so a key pointing at one holds wherever the moved table
+// lands; anything else does not, and the two that look closest are the two
+// that fail: an unsharded table is on the home shard alone, and a sharded
+// one is split, so a row and the row it references can land apart.
+//
+// Deciding this needs the catalog, not the shard: the shard cannot say what
+// placement a table has, only what rows it happens to hold.
+func (p *Placer) checkForeignKeys(ctx context.Context, source ShardConn, wf *placementWorkflow) error {
+	fks, err := outboundForeignKeys(ctx, source, wf.spec.SchemaName, wf.spec.TableName)
+	if err != nil || len(fks) == 0 {
+		return err
+	}
+	var bad []string
+	for _, fk := range fks {
+		var placement string
+		rows, qerr := p.Pool.Query(ctx, `SELECT coalesce(effective_placement, '')
+			FROM pgshard.table_status WHERE database = $1 AND schema_name = $2 AND table_name = $3`,
+			wf.spec.Database, fk.RefSchema, fk.RefTable)
+		if qerr != nil {
+			return qerr
+		}
+		got, cerr := pgx.CollectRows(rows, pgx.RowTo[string])
+		if cerr != nil {
+			return cerr
+		}
+		if len(got) == 1 {
+			placement = got[0]
+		}
+		if placement == "reference" {
+			continue
+		}
+		if placement == "" {
+			placement = "not declared in pgshard.tables"
+		}
+		bad = append(bad, fmt.Sprintf("%s references %s.%s, which is %s", fk.Name, fk.RefSchema, fk.RefTable, placement))
+	}
+	if len(bad) == 0 {
+		return nil
+	}
+	return fatal("table %s has foreign keys the target shards could not satisfy (%s); a foreign key survives a move only when it references a reference table, which every shard holds in full",
+		wf.spec.table(), strings.Join(bad, "; "))
+}
+
 // triggerStates is each user trigger's tgenabled on the source table.
 func triggerStates(ctx context.Context, conn ShardConn, schema, table string) (map[string]string, error) {
 	rows, err := conn.Query(ctx, `SELECT tg.tgname, tg.tgenabled::text
@@ -634,8 +735,8 @@ func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name 
 		SELECT f FROM (
 			SELECT 'replica identity ' || CASE t.relreplident WHEN 'f' THEN 'FULL' WHEN 'i' THEN 'USING INDEX' ELSE 'NOTHING' END AS f
 				FROM t WHERE t.relreplident <> 'd'
-			UNION ALL SELECT 'foreign key ' || conname FROM pg_constraint, t
-				WHERE contype = 'f' AND (conrelid = t.oid OR confrelid = t.oid)
+			UNION ALL SELECT 'inbound foreign key ' || conname FROM pg_constraint, t
+				WHERE contype = 'f' AND confrelid = t.oid
 			UNION ALL SELECT 'rule ' || rulename FROM pg_rewrite, t WHERE ev_class = t.oid AND rulename <> '_RETURN'
 			UNION ALL SELECT 'inheritance/partition membership' FROM pg_inherits, t
 				WHERE inhrelid = t.oid OR inhparent = t.oid
@@ -817,8 +918,15 @@ func (p *Placer) ensureShadows(ctx context.Context, wf *placementWorkflow) error
 				if terr != nil {
 					return terr
 				}
+				fks, ferr := tableForeignKeys(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, wf.shape.qualified(wf.shadow()))
+				if ferr != nil {
+					return ferr
+				}
 				stmts = append([]string{fmt.Sprintf("CREATE TABLE %s (LIKE %s INCLUDING ALL)", wf.shape.qualified(wf.shadow()), wf.shape.qualified(wf.spec.TableName))}, opts...)
 				stmts = append(stmts, pols...)
+				// Before the triggers, and both before any row is copied: a
+				// key on an empty table costs nothing to validate.
+				stmts = append(stmts, fks...)
 				stmts = append(stmts, tgs...)
 			} else {
 				if ddl == nil {
@@ -1113,7 +1221,11 @@ func extendedStatistics(ctx context.Context, conn ShardConn, wf *placementWorkfl
 	if err != nil {
 		return nil, err
 	}
-	return append(append(out, pols...), tgs...), nil
+	fks, err := tableForeignKeys(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, wf.shape.qualified(wf.shadow()))
+	if err != nil {
+		return nil, err
+	}
+	return append(append(append(out, pols...), fks...), tgs...), nil
 }
 
 // tableReloptions renders the source table's storage parameters. Neither

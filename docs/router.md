@@ -293,8 +293,8 @@ expressions), `FETCH … WITH TIES`, `ORDER BY … USING`, `ORDER BY` on a
 type without a comparator (`jsonb`, arrays, …), `min()`/`max()` over a text
 column, `sum()` over a non-numeric type, `SELECT DISTINCT` ordered by an
 expression outside the select list, window functions, `FOR UPDATE/SHARE`,
-`SELECT INTO`, set operations, CTEs, subqueries, joins (including with
-reference tables) and function scans, and `EXPLAIN`/`DECLARE CURSOR` of a
+`SELECT INTO`, set operations, CTEs, subqueries, joins that are not
+colocated (above) and function scans, and `EXPLAIN`/`DECLARE CURSOR` of a
 scatter. `ORDER BY 3` past the select list is `42P10`, a negative `LIMIT`
 `2201W`, as in PostgreSQL.
 
@@ -365,7 +365,7 @@ could act on.
 | `INSERT` key that is not a constant or parameter; `INSERT … SELECT` | shard key of an INSERT must be a constant or a parameter; INSERT … SELECT into a sharded table is not available yet |
 | multi-row `INSERT` whose rows hash to different shards | multi-row INSERT spanning shards is not available yet |
 | `UPDATE … SET key`, `ON CONFLICT DO UPDATE SET key` | shard key is immutable |
-| reference-table write that reads a sharded or unsharded table, or calls a volatile function | a write to reference table … cannot read sharded or unsharded tables; … cannot call now() (see *Reference tables*) |
+| reference-table write that reads a sharded or unsharded table, calls a volatile function, picks rows without an order, or names a **system column** (`ctid`, `xmin`, `xmax`, `cmin`, `cmax`, `tableoid`) | a write to reference table … cannot read sharded or unsharded tables; … cannot call now(); … cannot use LIMIT or OFFSET; … cannot name the system column ctid (see *Reference tables*) |
 | `TRUNCATE`, `VACUUM`, `LOCK`, `COPY` on sharded or reference tables | TRUNCATE/LOCK TABLE/VACUUM and ANALYZE on sharded and reference tables is not available yet; COPY on sharded and reference tables is not available yet |
 | `CREATE TABLE`, `CREATE UNIQUE INDEX`, `ALTER TABLE ADD PRIMARY KEY/UNIQUE` on a declared sharded table without the key column, or with a PRIMARY KEY/UNIQUE that omits it | sharded table must define its shard key column; primary key or unique constraint (…) must include the shard key |
 | `SET`, `SET LOCAL`, `set_config` or `ALTER ROLE … SET` of `standard_conforming_strings` | changing standard_conforming_strings is not permitted through pgshard — the router parses and hashes shard keys with it on, so a session reading literals differently would place rows on a shard the router would not look on |
@@ -439,7 +439,17 @@ refuses what would produce different rows on different shards:
   literal or parameter);
 - reading a sharded or unsharded table (`INSERT … SELECT`, `UPDATE … FROM`,
   a subquery): those rows live on one shard only. Reading other reference
-  tables is fine.
+  tables is fine;
+- naming a **system column** — `ctid`, `xmin`, `xmax`, `cmin`, `cmax`,
+  `tableoid`. These describe where a row is stored on one server and which
+  of that server's transactions touched it, not what the row holds, so the
+  same value picks a **different row on each shard**. `DELETE FROM t WHERE
+  ctid = '(0,1)'` deletes whatever happens to sit first on each shard and
+  leaves the copies disagreeing, with no error anywhere. The volatility rule
+  above cannot see it, because `ctid` is a column and not a call: identify
+  rows by their own columns instead;
+- choosing rows without a total order — `LIMIT`, `OFFSET`, `DISTINCT ON`,
+  `TABLESAMPLE` — since each shard would choose its own.
 
 This rule is conservative and only covers what the router can see. Column
 defaults are evaluated by each shard: a reference table whose column
