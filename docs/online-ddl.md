@@ -20,8 +20,14 @@ finished its backfill:
    columns from a shard and stores them in the migration's meta. A trigger
    on `pgshard.migrations` notifies every router, which reloads its
    snapshot and starts hiding the migration's working column *before it
-   exists*; the applier waits a settle interval (default 2s) for the
-   reload.
+   exists*; the applier then waits `snapshot.MaxAge` (the watcher's reload
+   interval plus 5s, so 35s by default) for the reload.
+
+   The wait is that quantity and not a shorter one on purpose: a router
+   whose `LISTEN` has dropped only sees the column list on its periodic
+   reload, and `MaxAge` is also the age past which a router stops serving.
+   So after this wait every router still answering has reloaded inside it —
+   which is what makes hiding the column a guarantee rather than a hope.
 2. **Add the working column** `_pgshard_<col>_<mig8>` of the new type —
    nullable, no default, so the `ADD COLUMN` is metadata-only and never
    rewrites.
@@ -33,10 +39,13 @@ finished its backfill:
 4. **Backfill in batches.** With a single-column primary key, batches of
    `batch_size` (default 1000) rows selected by the remaining-rows
    predicate (`working IS DISTINCT FROM (<using>)`, or `working IS NULL`
-   for the add form) are updated and committed one at a time; a composite
-   or missing primary key falls back to one full-table `UPDATE`
-   (documented trade-off). Rows written after the trigger installed are
-   already in sync.
+   for the add form) are updated and committed one at a time. A composite
+   or missing primary key is batched by `ctid` instead, the same size at a
+   time; there is no full-table `UPDATE` path. Each batch reports the last
+   key or `ctid` it selected and the next starts there, so no batch
+   rescans what an earlier one converted, and the loop ends only when a
+   scan of the whole table finds nothing left. Rows written after the
+   trigger installed are already in sync.
 5. **Cut over**, per shard, in one transaction under the applier's
    `lock_timeout` retry loop: drop the trigger, drop the old column,
    rename the working column to the original name, re-install the old
@@ -111,10 +120,17 @@ the `pg_class.oid`.
 * `ADD COLUMN` with a volatile default cannot carry other constraints in
   the same action.
 * The shard key column can never be retyped (rekey workflow instead).
-* Indexes, constraints (other than `NOT NULL` and the column default) and
-  identity/generated properties referencing the old column are dropped
-  with it at cutover — add them again afterwards; a future iteration will
-  re-create them on the working column before cutover.
+* Indexes, constraints (other than `NOT NULL` and the column default),
+  inbound foreign keys, generated columns, extended statistics, views,
+  rules, RLS policies and an identity column's owned sequence are objects
+  the cutover's `DROP COLUMN` would cascade away without recreating, so a
+  rewrite of a column carrying any of them is **refused** rather than
+  performed — the check is a `pg_depend` sweep, and it runs again under
+  the cutover lock, because a dependent added during a long backfill would
+  otherwise be dropped by a cutover that was admissible when it started.
+  Nothing is silently dropped and nothing has to be recreated afterwards;
+  a future iteration will re-create dependents on the working column
+  before cutover and lift the refusal.
 * A shadow-table swap (new table + copy + swap) is **not** implemented:
   everything in scope here is done in place precisely so `pg_class.oid`
   is preserved. If a swap path ever lands, publications must be refreshed
