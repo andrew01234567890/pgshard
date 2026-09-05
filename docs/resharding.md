@@ -382,12 +382,22 @@ that ended within a day).
   Rows with a NULL new shard key fail the run.
 - A move is refused at preflight when the table carries something the
   shadow build cannot reproduce, because a swap that dropped it would leave
-  the table looking correct and enforcing nothing: user triggers, foreign
-  keys in either direction, rules, table or column privileges, a non-default
-  owner, a non-default replica identity, inheritance or partition
-  membership, and publication membership. **Row-level security is
-  reproduced**, not refused: the policies are recreated on the shadow (from
-  `pg_policy`, since PostgreSQL has no `pg_get_policydef()`) while RLS is
-  still off there, so the copy is not filtered by the policies it is
-  copying, and the swap enables `ROW LEVEL SECURITY` and `FORCE ROW LEVEL
-  SECURITY` in the transaction that renames the table.
+  the table looking correct and enforcing nothing: foreign keys in either
+  direction, rules, table or column privileges, a non-default owner, a
+  non-default replica identity, inheritance or partition membership, and
+  publication membership.
+- **Row-level security is reproduced**, not refused: the policies are
+  recreated on the shadow (from `pg_policy`, since PostgreSQL has no
+  `pg_get_policydef()`) while RLS is still off there, so the copy is not
+  filtered by the policies it is copying, and the swap enables `ROW LEVEL
+  SECURITY` and `FORCE ROW LEVEL SECURITY` in the transaction that renames
+  the table.
+- **User triggers are reproduced** from `pg_get_triggerdef`, retargeted onto
+  the shadow, and then **disabled for the copy**: a `BEFORE` trigger would
+  rewrite every copied row and an `AFTER` trigger would fire for a row the
+  source already fired on. The swap restores each to the state the source
+  had, disabled and `REPLICA`/`ALWAYS` triggers included. A move is still
+  refused when a trigger calls a function the target shards do not have —
+  pgshard does not fan out function DDL, so the refusal names the function
+  and where to create it, rather than failing part-way through building the
+  shadow.

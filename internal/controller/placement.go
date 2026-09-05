@@ -74,15 +74,20 @@ type placementState struct {
 	// They are applied at the SWAP, not on the shadow: enabling row-level
 	// security while the copy is running would filter the copier's own
 	// rows, and FORCE applies to the table owner too.
-	RowSecurity      bool             `json:"row_security,omitempty"`
-	ForceRowSecurity bool             `json:"force_row_security,omitempty"`
-	PK               []string         `json:"pk,omitempty"`
-	KeyType          string           `json:"key_type,omitempty"`
-	Copied           map[string]bool  `json:"copied,omitempty"`
-	Applied          map[string]int64 `json:"applied,omitempty"`
-	LagBytes         int64            `json:"lag_bytes"`
-	FencedAt         *time.Time       `json:"fenced_at,omitempty"`
-	SwappedAt        *time.Time       `json:"swapped_at,omitempty"`
+	RowSecurity      bool `json:"row_security,omitempty"`
+	ForceRowSecurity bool `json:"force_row_security,omitempty"`
+	// Triggers is each user trigger's pg_trigger.tgenabled on the source.
+	// Applied at the SWAP for the same reason: a trigger firing while the
+	// copy writes the shadow runs for every copied row, which is a row the
+	// source has already triggered on.
+	Triggers  map[string]string `json:"triggers,omitempty"`
+	PK        []string          `json:"pk,omitempty"`
+	KeyType   string            `json:"key_type,omitempty"`
+	Copied    map[string]bool   `json:"copied,omitempty"`
+	Applied   map[string]int64  `json:"applied,omitempty"`
+	LagBytes  int64             `json:"lag_bytes"`
+	FencedAt  *time.Time        `json:"fenced_at,omitempty"`
+	SwappedAt *time.Time        `json:"swapped_at,omitempty"`
 	// Swapped lists the shards whose swap transaction was started; the
 	// marker is persisted before the first rename on a shard, so only a
 	// resume that finds it may treat a missing shadow as already swapped.

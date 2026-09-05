@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"regexp"
 	"slices"
 	"strings"
@@ -82,12 +83,18 @@ func (p *Placer) describe(ctx context.Context, wf *placementWorkflow) error {
 	if err := p.checkExtensions(ctx, conn, wf); err != nil {
 		return err
 	}
+	if err := p.checkTriggerFunctions(ctx, conn, wf); err != nil {
+		return err
+	}
 	comment, err := tableComment(ctx, conn, wf.spec.SchemaName, wf.spec.TableName)
 	if err != nil {
 		return err
 	}
 	wf.st.TableComment = comment
 	if wf.st.RowSecurity, wf.st.ForceRowSecurity, err = tableRowSecurity(ctx, conn, wf.spec.SchemaName, wf.spec.TableName); err != nil {
+		return err
+	}
+	if wf.st.Triggers, err = triggerStates(ctx, conn, wf.spec.SchemaName, wf.spec.TableName); err != nil {
 		return err
 	}
 	// A column defaulting to a sequence in another schema cannot be moved
@@ -375,6 +382,163 @@ func (p *Placer) checkExtensions(ctx context.Context, source ShardConn, wf *plac
 		wf.spec.table(), strings.Join(parts, "; "))
 }
 
+// checkTriggerFunctions refuses a move whose triggers call a function the
+// target shards do not have.
+//
+// A trigger is reproduced on the shadow by its definition, and the
+// definition names a function. pgshard does not fan out function DDL
+// (PGS-411), so a function created on one shard exists only there -- and a
+// CREATE TRIGGER naming a missing one fails in the middle of building the
+// shadow, where the workflow retries against a condition that will not
+// change on its own. Named here instead, with what to create and where.
+func (p *Placer) checkTriggerFunctions(ctx context.Context, source ShardConn, wf *placementWorkflow) error {
+	needed, err := triggerFunctions(ctx, source, wf.spec.SchemaName, wf.spec.TableName)
+	if err != nil || len(needed) == 0 {
+		return err
+	}
+	missing := map[string][]string{}
+	for _, t := range wf.rt.Holders() {
+		conn, err := p.Shards.DialDatabase(ctx, wf.st.SourceSet, t, wf.spec.Database)
+		if err != nil {
+			return err
+		}
+		for _, fn := range needed {
+			rows, qerr := conn.Query(ctx, `SELECT to_regprocedure($1) IS NOT NULL`, fn)
+			if qerr != nil {
+				_ = conn.Close(ctx)
+				return qerr
+			}
+			have, cerr := pgx.CollectExactlyOneRow(rows, pgx.RowTo[bool])
+			if cerr != nil {
+				_ = conn.Close(ctx)
+				return cerr
+			}
+			if !have {
+				missing[fn] = append(missing[fn], fmt.Sprintf("%s/%d", wf.st.SourceSet, t))
+			}
+		}
+		_ = conn.Close(ctx)
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	var parts []string
+	for _, fn := range needed {
+		if shards := missing[fn]; len(shards) > 0 {
+			parts = append(parts, fmt.Sprintf("%s on %s", fn, strings.Join(shards, ", ")))
+		}
+	}
+	return fatal("table %s has triggers calling functions its target shards do not have (%s); create them there, then retry the move",
+		wf.spec.table(), strings.Join(parts, "; "))
+}
+
+// triggerFunctions are the functions the table's user triggers call, as
+// regprocedure text so a target can be asked for the same signature.
+func triggerFunctions(ctx context.Context, conn ShardConn, schema, table string) ([]string, error) {
+	rows, err := conn.Query(ctx, `SELECT DISTINCT tg.tgfoid::regprocedure::text
+		FROM pg_trigger tg JOIN pg_class c ON c.oid = tg.tgrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2 AND NOT tg.tgisinternal
+		ORDER BY 1`, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
+// tableTriggers renders the table's user triggers onto the shadow.
+//
+// pg_get_triggerdef writes the statement PostgreSQL would need to recreate
+// the trigger, including its timing, events, columns, WHEN clause,
+// deferrability and arguments -- rendering it by hand would be a list of
+// the parts someone thought of. Only the table it names is rewritten, and
+// the needle is the same regclass text pg_get_triggerdef itself embeds, so
+// the two agree about quoting and schema qualification.
+//
+// A trigger that is not in its default enabled state carries that too: a
+// disabled trigger reproduced as enabled starts firing on a moved table,
+// which is a behaviour change nothing would report.
+func tableTriggers(ctx context.Context, conn ShardConn, schema, table, shadow string) ([]string, error) {
+	rows, err := conn.Query(ctx, `SELECT pg_get_triggerdef(tg.oid), tg.tgenabled::text, quote_ident(tg.tgname),
+			quote_ident(n.nspname) || '.' || quote_ident(c.relname), c.oid::regclass::text
+		FROM pg_trigger tg JOIN pg_class c ON c.oid = tg.tgrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2 AND NOT tg.tgisinternal
+		ORDER BY tg.tgname`, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	type trigger struct {
+		Def       string
+		Enabled   string
+		Name      string
+		Qualified string
+		Visible   string
+	}
+	tgs, err := pgx.CollectRows(rows, pgx.RowToStructByPos[trigger])
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, tg := range tgs {
+		// Both renderings come from the catalog rather than from a guess
+		// about which one PostgreSQL used: pg_get_triggerdef qualifies the
+		// table unconditionally, while regclass respects search_path, and
+		// which of the two appears is not something to assume.
+		def, ok := "", false
+		for _, name := range []string{tg.Qualified, tg.Visible} {
+			if needle := " ON " + name + " "; strings.Contains(tg.Def, needle) {
+				def, ok = strings.Replace(tg.Def, needle, " ON "+shadow+" ", 1), true
+				break
+			}
+		}
+		if !ok {
+			// Refuse rather than run a statement that would create the
+			// trigger on the SOURCE table.
+			return nil, fatal("cannot retarget the definition of trigger %s on %s.%s onto the shadow table: %q", tg.Name, schema, table, tg.Def)
+		}
+		out = append(out, def)
+	}
+	if len(out) > 0 {
+		// Created and then switched off, in that order, so the copy writes
+		// through them: a BEFORE trigger would rewrite every copied row and
+		// an AFTER trigger would fire for a row the source already fired
+		// on. The swap restores each to what the source had.
+		out = append(out, "ALTER TABLE "+shadow+" DISABLE TRIGGER USER")
+	}
+	return out, nil
+}
+
+// triggerStates is each user trigger's tgenabled on the source table.
+func triggerStates(ctx context.Context, conn ShardConn, schema, table string) (map[string]string, error) {
+	rows, err := conn.Query(ctx, `SELECT tg.tgname, tg.tgenabled::text
+		FROM pg_trigger tg JOIN pg_class c ON c.oid = tg.tgrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2 AND NOT tg.tgisinternal`, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	type state struct {
+		Name    string
+		Enabled string
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowToStructByPos[state])
+	if err != nil || len(got) == 0 {
+		return nil, err
+	}
+	out := map[string]string{}
+	for _, g := range got {
+		out[g.Name] = g.Enabled
+	}
+	return out, nil
+}
+
+// triggerEnableWords maps pg_trigger.tgenabled to the ALTER TABLE clause
+// that puts a trigger back into that state. Every state is named, the
+// default included: the shadow's triggers are all disabled while the copy
+// runs, so even "as it was by default" has to be said.
+var triggerEnableWords = map[string]string{"O": "ENABLE", "D": "DISABLE", "R": "ENABLE REPLICA", "A": "ENABLE ALWAYS"}
+
 func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name string) ([]string, error) {
 	rows, err := conn.Query(ctx, `WITH t AS (
 			SELECT c.oid, c.relowner, c.relacl, c.relrowsecurity, c.relforcerowsecurity, c.relreplident
@@ -388,7 +552,6 @@ func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name 
 			UNION ALL SELECT 'table privileges' FROM t WHERE t.relacl IS NOT NULL
 			UNION ALL SELECT 'column privileges on ' || attname FROM pg_attribute, t
 				WHERE attrelid = t.oid AND attnum > 0 AND NOT attisdropped AND attacl IS NOT NULL
-			UNION ALL SELECT 'trigger ' || tgname FROM pg_trigger, t WHERE tgrelid = t.oid AND NOT tgisinternal
 			UNION ALL SELECT 'foreign key ' || conname FROM pg_constraint, t
 				WHERE contype = 'f' AND (conrelid = t.oid OR confrelid = t.oid)
 			UNION ALL SELECT 'rule ' || rulename FROM pg_rewrite, t WHERE ev_class = t.oid AND rulename <> '_RETURN'
@@ -568,8 +731,13 @@ func (p *Placer) ensureShadows(ctx context.Context, wf *placementWorkflow) error
 				if perr != nil {
 					return perr
 				}
+				tgs, terr := tableTriggers(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, wf.shape.qualified(wf.shadow()))
+				if terr != nil {
+					return terr
+				}
 				stmts = append([]string{fmt.Sprintf("CREATE TABLE %s (LIKE %s INCLUDING ALL)", wf.shape.qualified(wf.shadow()), wf.shape.qualified(wf.spec.TableName))}, opts...)
 				stmts = append(stmts, pols...)
+				stmts = append(stmts, tgs...)
 			} else {
 				if ddl == nil {
 					if ddl, err = p.shadowDDL(ctx, wf); err != nil {
@@ -859,7 +1027,11 @@ func extendedStatistics(ctx context.Context, conn ShardConn, wf *placementWorkfl
 	if err != nil {
 		return nil, err
 	}
-	return append(out, pols...), nil
+	tgs, err := tableTriggers(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, wf.shape.qualified(wf.shadow()))
+	if err != nil {
+		return nil, err
+	}
+	return append(append(out, pols...), tgs...), nil
 }
 
 // tableReloptions renders the source table's storage parameters. Neither
@@ -1809,12 +1981,33 @@ func (p *Placer) swapOn(ctx context.Context, wf *placementWorkflow, conn ShardCo
 		// the copy could write through them. Turning it on here is what
 		// makes them enforce, at the same instant the table becomes the
 		// one clients see.
+		if err := restoreTriggers(ctx, conn, wf); err != nil {
+			return err
+		}
 		if err := enableRowSecurity(ctx, conn, wf); err != nil {
 			return err
 		}
 	}
 	_, err = conn.Exec(ctx, "COMMIT")
 	return err
+}
+
+// restoreTriggers puts each user trigger back into the state the source had,
+// at the swap. They were created disabled so the copy could write through
+// them; this is the moment the table becomes the one clients see.
+func restoreTriggers(ctx context.Context, conn ShardConn, wf *placementWorkflow) error {
+	table := wf.shape.qualified(wf.spec.TableName)
+	for _, name := range slices.Sorted(maps.Keys(wf.st.Triggers)) {
+		word, ok := triggerEnableWords[wf.st.Triggers[name]]
+		if !ok {
+			return fmt.Errorf("trigger %s on %s was in state %q, which this version of pgshard cannot restore",
+				name, wf.spec.table(), wf.st.Triggers[name])
+		}
+		if _, err := conn.Exec(ctx, "ALTER TABLE "+table+" "+word+" TRIGGER "+QuoteIdent(name)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // enableRowSecurity turns on what the source table had, at the swap.
