@@ -219,7 +219,15 @@ first, then rebuilt as a standby.
 
 ## Not yet
 
-- Operator-to-agent gRPC is plaintext inside the cluster; mTLS is a later layer.
+- Operator-to-agent gRPC is plaintext unless `spec.internalTLS.agentMTLS` is
+  set, which is **off by default** and is not implied by
+  `spec.internalTLS.issue`. Until it is on, the only credential on that
+  listener is the mounted agent token, sent in clear on every RPC, so
+  anything that can observe the traffic can replay `Promote`, `Demote`,
+  `SetWriteFence` and `Reclone`. Turning it on is a rollout rather than a
+  setting -- members restart one at a time, so the fleet is mixed for its
+  length and the operator dials each member according to the spec that
+  member is running.
 - A postgres crash inside a running pod is a container restart, not a failover,
   until the pod stops being Ready and `Status` fails for the failover delay.
 - `synchronous_standby_names` set via `ALTER SYSTEM` is dropped by an agent

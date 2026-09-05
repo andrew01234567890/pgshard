@@ -25,10 +25,13 @@ the rest with `0A000`. See *Routing* below.
 
   It is deliberately **not** the superuser: the router is the one component
   untrusted clients connect to, parsing their protocol and their SQL, and the
-  superuser password is also the seed of the agent control-plane token
-  (`internal/agentauth`) — one compromised router would otherwise be the
-  whole cluster. Running the router by hand with a superuser DSN still works
-  and is what the development harnesses do.
+  superuser password is direct write access to every shard — `pg_hba` accepts
+  it over TCP from anywhere, so it is the whole cluster past the router, the
+  planner and every refusal they enforce. (It was once also the seed of the
+  agent control-plane token; that derivation was withdrawn, and the agent
+  accepts only the token the operator mounts — `internal/agentauth`. Rotating
+  the password does not rotate that token.) Running the router by hand with a
+  superuser DSN still works and is what the development harnesses do.
 
   The router follows the catalog through the snapshot watcher (LISTEN/NOTIFY
   plus periodic reload) and refuses to listen until the first snapshot
