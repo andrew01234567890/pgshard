@@ -78,7 +78,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	placementBuffer := fs.Duration("placement-buffer-timeout", controller.DefaultBufferTimeout, "longest table-scoped write pause of one placement swap attempt")
 	placementDropOld := fs.Duration("placement-drop-old-after", controller.DefaultDropOldAfter, "grace before a placement workflow drops the previous tables")
 	agentPort := fs.Int("agent-port", controller.DefaultAgentPort, "gRPC port of member agents (schema materialization)")
-	agentTokenFile := fs.String("agent-token-file", "", "file holding the cluster's agent control-plane token; without it the controller falls back to deriving one from the catalog password")
+	agentTokenFile := fs.String("agent-token-file", "", "file holding the cluster's agent control-plane token; agent RPCs are refused without it")
 	pgBin := fs.String("pg-bin", os.Getenv("PGSHARD_PG_BIN"), "directory with pg_dump and psql; when set, schemas are materialized from the controller host instead of through agents (PGSHARD_PG_BIN)")
 	var shardDSNs shardDSNFlag
 	fs.Var(&shardDSNs, "shard-dsn", "explicit shard DSN as <set>/<id>=<dsn>; repeatable")

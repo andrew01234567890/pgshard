@@ -593,10 +593,10 @@ func poolerSidecar(c *pgshardv1alpha1.PgShardCluster, g Group) corev1.Container 
 		// The superuser password stays in PGPASSWORD for the local socket
 		// below, which creates and reads replication slots and genuinely
 		// needs it. So the container holds two credentials and one of them
-		// is still the superuser's -- which is also the seed the derived
-		// agent control-plane token is hashed from, so a compromised
-		// pooler still reaches Promote, Demote, Rewind and Reclone until
-		// that derived token is withdrawn (PGS-572, PGS-591).
+		// is still the superuser's. That no longer reaches the agent
+		// control plane -- the token hashed from this password was
+		// withdrawn in PGS-572 -- but the shard access it grants is its
+		// own problem, which is PGS-591.
 		"--catalog-dsn", RouterCatalogDSN(c),
 		"--catalog-password-file", poolerCatalogPasswordDir + "/" + secretKey,
 		"--shard-set", shardSet,

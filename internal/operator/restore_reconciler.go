@@ -93,9 +93,17 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err != nil {
 		return ctrl.Result{}, r.fail(ctx, &rs, err.Error())
 	}
-	// The new cluster's secret is a copy of the source's, so either yields
-	// the token the restored agents expect.
-	ctx = withClusterAgentToken(ctx, r.Client, rs.Namespace, rs.Spec.ClusterName)
+	// Both clusters, because this pass reaches agents of both: it lists and
+	// reconciles prepared transactions on the source, and polls the
+	// primaries of the new one. Their agent tokens are unrelated --
+	// ensureAgentSecret generates a fresh random one per cluster and
+	// nothing copies it -- so a single token reaches only half of them.
+	//
+	// This used to say the new cluster's secret was a copy of the source's.
+	// It is not; only the superuser Secret is copied, which is why the
+	// restore authenticated at all while a token derived from that password
+	// was still accepted (PGS-572).
+	ctx = withClusterAgentTokens(ctx, r.Client, rs.Namespace, rs.Spec.ClusterName, rs.Spec.NewClusterName)
 	var newCluster pgshardv1alpha1.PgShardCluster
 	err = r.Get(ctx, types.NamespacedName{Namespace: rs.Namespace, Name: rs.Spec.NewClusterName}, &newCluster)
 	switch {

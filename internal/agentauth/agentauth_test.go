@@ -17,29 +17,11 @@ import (
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 )
 
-func TestTokenIsNotThePassword(t *testing.T) {
-	tok, err := Token("hunter2")
-	if err != nil || tok == "hunter2" || len(tok) != 64 {
-		t.Fatalf("token = %q, err = %v", tok, err)
-	}
-	a, _ := Token("a")
-	b, _ := Token("b")
-	if a == b {
-		t.Fatal("tokens must differ per password")
-	}
-}
-
-func TestTokenRefusesEmptyPassword(t *testing.T) {
-	if tok, err := Token(""); err == nil {
-		t.Fatalf("Token(\"\") = %q, want error", tok)
-	}
-}
-
 func TestServerInterceptorGatesEveryRPC(t *testing.T) {
-	token, err := Token("pw")
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Not a hex string: a 32-character one reads as a real key to the
+	// secret scanner, and a test fixture that fails the gate is a fixture
+	// nobody can commit.
+	const token = "the-agents-control-plane-token"
 	ln := bufconn.Listen(1 << 20)
 	srv := grpc.NewServer(grpc.UnaryInterceptor(UnaryServerInterceptor(token)))
 	pgshardv1.RegisterAgentServer(srv, &pgshardv1.UnimplementedAgentServer{})
@@ -58,7 +40,7 @@ func TestServerInterceptorGatesEveryRPC(t *testing.T) {
 	if _, err := cl.Promote(ctx, &pgshardv1.PromoteRequest{}); status.Code(err) != codes.Unauthenticated {
 		t.Fatalf("no token: %v, want Unauthenticated", err)
 	}
-	wrong, err := Token("wrong")
+	const wrong = "not-the-token"
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,21 +80,20 @@ func TestEmptyExpectedTokenRejectsEverything(t *testing.T) {
 }
 
 func TestDynamicInterceptorFollowsRotation(t *testing.T) {
-	password := "pw-old"
+	const oldTok, newTok = "token-before-rotation", "token-after-rotation"
+	current := oldTok
 	var mu sync.Mutex
 	cl := dialInterceptedAgent(t, DynamicUnaryServerInterceptor(func() (string, error) {
 		mu.Lock()
 		defer mu.Unlock()
-		return Token(password)
+		return current, nil
 	}))
-	oldTok, _ := Token("pw-old")
-	newTok, _ := Token("pw-new")
 	ctx := context.Background()
 	if _, err := cl.Promote(WithToken(ctx, oldTok), &pgshardv1.PromoteRequest{}); status.Code(err) != codes.Unimplemented {
 		t.Fatalf("old token before rotation: %v", err)
 	}
 	mu.Lock()
-	password = "pw-new"
+	current = newTok
 	mu.Unlock()
 	if _, err := cl.Promote(WithToken(ctx, newTok), &pgshardv1.PromoteRequest{}); status.Code(err) != codes.Unimplemented {
 		t.Fatalf("rotated token must be accepted without a restart: %v", err)
@@ -122,26 +103,16 @@ func TestDynamicInterceptorFollowsRotation(t *testing.T) {
 	}
 }
 
-// TestAnAgentAcceptsEitherTokenDuringTheRoll: the control-plane token is
-// moving from something derived from the superuser password to a Secret of
-// its own. For one release an agent accepts both and callers send both, so
-// an agent that has been rolled onto the new token and one that has not are
-// each reachable by the same operator.
-//
-// REMOVE this behaviour, and the derived token with it, when every caller
-// sends the mounted one -- PGS-572.
-func TestAnAgentAcceptsEitherTokenDuringTheRoll(t *testing.T) {
-	derived, err := Token("superuser-password")
-	if err != nil {
-		t.Fatal(err)
-	}
+// TestAnAgentAcceptsOnlyItsOwnToken. The control-plane token used to be
+// derived from the superuser password, and for one release an agent
+// accepted that as well as the mounted one so a cluster could be rolled a
+// member at a time. PGS-572 withdrew the derived half: the password is no
+// longer a credential that unlocks Promote, Demote, Rewind and Reclone.
+func TestAnAgentAcceptsOnlyItsOwnToken(t *testing.T) {
 	const own = "0123456789abcdef"
-
-	// A caller in the middle of the roll sends both.
-	both := WithTokens(context.Background(), own, derived)
-	md, _ := metadata.FromOutgoingContext(both)
-	if got := md.Get(MetadataKey); len(got) != 2 {
-		t.Fatalf("a caller must send both tokens: %v", got)
+	md, _ := metadata.FromOutgoingContext(WithToken(context.Background(), own))
+	if got := md.Get(MetadataKey); len(got) != 1 || got[0] != own {
+		t.Fatalf("a caller sends one token: %v", got)
 	}
 
 	for _, tc := range []struct {
@@ -149,9 +120,7 @@ func TestAnAgentAcceptsEitherTokenDuringTheRoll(t *testing.T) {
 		expect []string
 		accept bool
 	}{
-		{"an agent that has been rolled", []string{own, derived}, true},
-		{"an agent that has not", []string{derived}, true},
-		{"an agent past the removal", []string{own}, true},
+		{"the agent's own token", []string{own}, true},
 		{"an agent of another cluster", []string{"someone-elses"}, false},
 		{"an agent with no token at all", nil, false},
 		{"an agent whose token is empty", []string{""}, false},
@@ -165,15 +134,6 @@ func TestAnAgentAcceptsEitherTokenDuringTheRoll(t *testing.T) {
 				t.Fatalf("reached = %v, want %v (err %v)", reached, tc.accept, err)
 			}
 		})
-	}
-
-	// A caller that sends nothing is refused whatever the agent knows.
-	var reached bool
-	_, _ = AnyOfUnaryServerInterceptor(func() ([]string, error) { return []string{own, derived}, nil })(
-		metadata.NewIncomingContext(context.Background(), metadata.MD{}), nil, nil,
-		func(context.Context, any) (any, error) { reached = true; return nil, nil })
-	if reached {
-		t.Fatal("a call presenting no token was accepted")
 	}
 }
 

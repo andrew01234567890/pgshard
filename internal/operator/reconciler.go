@@ -198,19 +198,14 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	derived, err := agentauth.Token(password)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("agent auth token: %w", err)
-	}
 	agentToken, err := r.ensureAgentSecret(ctx, &cluster)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	// Both, so one operator reaches an agent that has been rolled onto the
-	// cluster's own token and one that has not. The server accepts a call
-	// presenting either. REMOVE the derived one with the agent's acceptance
-	// of it -- PGS-572.
-	ctx = agentauth.WithTokens(ctx, agentToken, derived)
+	// The cluster's own token, and only it. Agents no longer accept one
+	// derived from the superuser password, so nothing that holds that
+	// password can call Promote, Demote, Rewind or Reclone.
+	ctx = agentauth.WithToken(ctx, agentToken)
 	if err := r.reconcilePKI(ctx, &cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("internal certificates: %w", err)
 	}

@@ -70,10 +70,10 @@ func (r Renderer) ControllerDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv
 	}
 	var mounts []corev1.VolumeMount
 	var volumes []corev1.Volume
-	// The cluster's own agent token, so the controller's agent RPCs do not
-	// depend on the superuser password. It derives one from that password
-	// as well and sends both, so an agent not yet rolled onto the cluster
-	// token is still reachable; PGS-572 drops the derived half.
+	// The cluster's own agent token, and the only one the controller has:
+	// agent RPCs no longer depend on the superuser password, and a
+	// controller started without this file refuses to materialise rather
+	// than falling back to deriving one.
 	args = append(args, "--agent-token-file="+agentTokenDir+"/"+agentTokenKey)
 	mounts = append(mounts, corev1.VolumeMount{Name: agentTokenVolume, MountPath: agentTokenDir, ReadOnly: true})
 	volumes = append(volumes, corev1.Volume{Name: agentTokenVolume, VolumeSource: corev1.VolumeSource{
