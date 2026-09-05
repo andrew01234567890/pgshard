@@ -293,8 +293,8 @@ expressions), `FETCH … WITH TIES`, `ORDER BY … USING`, `ORDER BY` on a
 type without a comparator (`jsonb`, arrays, …), `min()`/`max()` over a text
 column, `sum()` over a non-numeric type, `SELECT DISTINCT` ordered by an
 expression outside the select list, window functions, `FOR UPDATE/SHARE`,
-`SELECT INTO`, set operations, CTEs, subqueries, joins (including with
-reference tables) and function scans, and `EXPLAIN`/`DECLARE CURSOR` of a
+`SELECT INTO`, set operations, CTEs, subqueries, joins that are not
+colocated (above) and function scans, and `EXPLAIN`/`DECLARE CURSOR` of a
 scatter. `ORDER BY 3` past the select list is `42P10`, a negative `LIMIT`
 `2201W`, as in PostgreSQL.
 
