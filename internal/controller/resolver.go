@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -592,19 +593,47 @@ func ConnInfo(dsn, database string) (string, error) {
 	if err := catalog.CheckDatabaseName(database); err != nil {
 		return "", err
 	}
-	cfg, err := pgx.ParseConfig(dsn)
-	if err != nil {
+	// Parsed only to reject a DSN that is not one; the RESULT is built from
+	// the original text.
+	//
+	// It used to be rebuilt from the parsed fields -- host, port, user,
+	// password, dbname -- which silently dropped every other option. A DSN
+	// configured "sslmode=verify-full sslrootcert=/ca.crt" produced a
+	// conninfo with no sslmode at all, so the subscription fell back to
+	// libpq's default and connected without verifying anything, over a
+	// string that carries a shard superuser credential. sslcert/sslkey went
+	// the same way, so a certificate-authenticated subscription could not
+	// connect at all. A tls.Config cannot be turned back into sslrootcert,
+	// which is why reconstruction cannot be made safe and the text is kept.
+	if _, err := pgx.ParseConfig(dsn); err != nil {
 		return "", err
 	}
-	parts := []string{"host=" + quoteConnValue(cfg.Host), "port=" + fmt.Sprint(cfg.Port),
-		"user=" + quoteConnValue(cfg.User), "dbname=" + quoteConnValue(database)}
-	if cfg.Password != "" {
-		parts = append(parts, "password="+quoteConnValue(cfg.Password))
+	return withDatabase(dsn, database)
+}
+
+// withDatabase replaces the database in a DSN and changes nothing else.
+//
+// libpq accepts two forms and they need different treatment: a URL, whose
+// database is the path, and a keyword/value string, where the LAST
+// occurrence of a keyword wins -- so appending is a replacement, and one
+// that cannot disturb a value it does not understand.
+func withDatabase(dsn, database string) (string, error) {
+	trimmed := strings.TrimSpace(dsn)
+	if strings.HasPrefix(trimmed, "postgres://") || strings.HasPrefix(trimmed, "postgresql://") {
+		u, err := url.Parse(trimmed)
+		if err != nil {
+			return "", err
+		}
+		u.Path = "/" + database
+		// A dbname in the query string would override the path.
+		q := u.Query()
+		if q.Has("dbname") {
+			q.Set("dbname", database)
+			u.RawQuery = q.Encode()
+		}
+		return u.String(), nil
 	}
-	if cfg.TLSConfig == nil {
-		parts = append(parts, "sslmode=disable")
-	}
-	return strings.Join(parts, " "), nil
+	return trimmed + " dbname=" + quoteConnValue(database), nil
 }
 
 func quoteConnValue(v string) string {
