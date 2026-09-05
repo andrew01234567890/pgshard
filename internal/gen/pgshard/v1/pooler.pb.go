@@ -3157,8 +3157,13 @@ func (x *AckRequest) GetLsn() uint64 {
 
 // AckResponse reports the outcome.
 type AckResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Error         *Error                 `protobuf:"bytes,1,opt,name=error,proto3" json:"error,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Error *Error                 `protobuf:"bytes,1,opt,name=error,proto3" json:"error,omitempty"`
+	// LSN the pooler actually confirmed to PostgreSQL, which is the ack
+	// clamped to what this reader has delivered. A caller that records the
+	// LSN it asked for rather than this one believes a slot advanced when it
+	// did not, and never asks again.
+	ConfirmedLsn  uint64 `protobuf:"varint,2,opt,name=confirmed_lsn,json=confirmedLsn,proto3" json:"confirmed_lsn,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3198,6 +3203,13 @@ func (x *AckResponse) GetError() *Error {
 		return x.Error
 	}
 	return nil
+}
+
+func (x *AckResponse) GetConfirmedLsn() uint64 {
+	if x != nil {
+		return x.ConfirmedLsn
+	}
+	return 0
 }
 
 // CopyTablesRequest starts or resumes the initial copy of a shard.
@@ -5519,9 +5531,10 @@ const file_pgshard_v1_pooler_proto_rawDesc = "" +
 	"AckRequest\x12\x12\n" +
 	"\x04slot\x18\x01 \x01(\tR\x04slot\x12\x16\n" +
 	"\x06stream\x18\x02 \x01(\tR\x06stream\x12\x10\n" +
-	"\x03lsn\x18\x03 \x01(\x04R\x03lsn\"6\n" +
+	"\x03lsn\x18\x03 \x01(\x04R\x03lsn\"[\n" +
 	"\vAckResponse\x12'\n" +
-	"\x05error\x18\x01 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"\xb3\x02\n" +
+	"\x05error\x18\x01 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\x12#\n" +
+	"\rconfirmed_lsn\x18\x02 \x01(\x04R\fconfirmedLsn\"\xb3\x02\n" +
 	"\x11CopyTablesRequest\x12\x16\n" +
 	"\x06stream\x18\x01 \x01(\tR\x06stream\x12\x1a\n" +
 	"\bdatabase\x18\x02 \x01(\tR\bdatabase\x12 \n" +

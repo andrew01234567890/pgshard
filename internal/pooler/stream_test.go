@@ -166,19 +166,19 @@ func TestStreamRefusals(t *testing.T) {
 		t.Fatalf("draining: %v", err)
 	}
 	s.draining.Store(false)
-	r, err := s.claimSlot("a")
+	r, err := s.claimSlot("a", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.claimSlot("a"); status.Code(err) != codes.FailedPrecondition {
+	if _, err := s.claimSlot("a", 0); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("second claim: %v", err)
 	}
 	s.releaseSlot("a", &streamReader{})
-	if _, err := s.claimSlot("a"); err == nil {
+	if _, err := s.claimSlot("a", 0); err == nil {
 		t.Fatal("release by a different reader must not free the slot")
 	}
 	s.releaseSlot("a", r)
-	if _, err := s.claimSlot("a"); err != nil {
+	if _, err := s.claimSlot("a", 0); err != nil {
 		t.Fatal("slot not released")
 	}
 	d := s.streamDefaults()
@@ -292,5 +292,67 @@ func TestOnlyAGonePositionSaysPositionTooOld(t *testing.T) {
 		if positionGone(e) {
 			t.Errorf("%s %q: a consumer must not be told to re-snapshot for this", e.Code, e.Message)
 		}
+	}
+}
+
+// TestAnAckAtTheStartPositionIsNotClampedToNothing: a reader began with
+// delivered == 0, so an ack that arrived before its first batch -- which is
+// exactly what a router sends after reconnecting at the position it already
+// holds -- was clamped to zero, reported as confirmed, and never asked for
+// again. The slot stayed where it was and the shard's WAL was retained until
+// the next commit on it.
+func TestAnAckAtTheStartPositionIsNotClampedToNothing(t *testing.T) {
+	s := &Server{}
+	s.cfg.Stream.Shard = "shard0"
+	r, err := s.claimSlot("pgshard_orders_shard0", 4000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := r.delivered.Load(); got != 4000 {
+		t.Fatalf("a reader claimed at 4000 starts delivered at %d", got)
+	}
+	// The reader confirms whatever it is asked for, as the real one does
+	// once it has sent its standby status.
+	go func() {
+		<-r.wake
+		r.flushed.Store(r.acked.Load())
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := s.Ack(ctx, &pgshardv1.AckRequest{Stream: "orders", Lsn: 4000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.GetError() != nil {
+		t.Fatalf("ack refused: %v", resp.GetError())
+	}
+	if resp.GetConfirmedLsn() != 4000 {
+		t.Fatalf("confirmed %d, want the 4000 that was asked for", resp.GetConfirmedLsn())
+	}
+}
+
+// TestAnAckBeyondWhatWasDeliveredSaysWhatItConfirmed: the clamp is right --
+// confirmed_flush must not overtake what the client has seen -- but the
+// caller has to be told, or it records the LSN it asked for as done and
+// never asks again.
+func TestAnAckBeyondWhatWasDeliveredSaysWhatItConfirmed(t *testing.T) {
+	s := &Server{}
+	s.cfg.Stream.Shard = "shard0"
+	r, err := s.claimSlot("pgshard_orders_shard0", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		<-r.wake
+		r.flushed.Store(r.acked.Load())
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := s.Ack(ctx, &pgshardv1.AckRequest{Stream: "orders", Lsn: 9999})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.GetConfirmedLsn() != 100 {
+		t.Fatalf("confirmed %d, want the delivered 100", resp.GetConfirmedLsn())
 	}
 }

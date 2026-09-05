@@ -130,7 +130,12 @@ func (s *Server) slotOf(slot, stream string) (string, error) {
 	return catalog.StreamSlotName(stream, s.cfg.Stream.Shard), nil
 }
 
-func (s *Server) claimSlot(slot string) (*streamReader, error) {
+// claimSlot takes the slot's single reader seat. start is what the caller
+// says it already holds, and the reader begins there: delivered starts at
+// zero otherwise, so an ack that arrives between the claim and the first
+// batch -- exactly what a router that has just reconnected sends -- would be
+// clamped to nothing and reported as confirmed.
+func (s *Server) claimSlot(slot string, start uint64) (*streamReader, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.readers == nil {
@@ -140,6 +145,7 @@ func (s *Server) claimSlot(slot string) (*streamReader, error) {
 		return nil, reasoned(status.Newf(codes.FailedPrecondition, "slot %s already has an active reader", slot), ReasonReaderActive)
 	}
 	r := &streamReader{wake: make(chan struct{}, 1)}
+	r.delivered.Store(start)
 	s.readers[slot] = r
 	return r, nil
 }
@@ -173,7 +179,9 @@ func (s *Server) StreamChanges(req *pgshardv1.StreamRequest, srv pgshardv1.Poole
 // Ack implements Pooler.Ack: it hands the position to the slot's reader and
 // waits until the reader has reported it to the server. Positions beyond the
 // last delivered batch end are clamped so confirmed_flush never overtakes
-// what the client has actually seen.
+// what the client has actually seen, and the response says which LSN was
+// confirmed -- a caller that records what it asked for instead believes the
+// slot advanced when it did not, and never asks again.
 func (s *Server) Ack(ctx context.Context, req *pgshardv1.AckRequest) (*pgshardv1.AckResponse, error) {
 	slot, err := s.slotOf(req.GetSlot(), req.GetStream())
 	if err != nil {
@@ -206,7 +214,7 @@ func (s *Server) Ack(ctx context.Context, req *pgshardv1.AckRequest) (*pgshardv1
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	return &pgshardv1.AckResponse{}, nil
+	return &pgshardv1.AckResponse{ConfirmedLsn: lsn}, nil
 }
 
 func (s *Server) runStream(ctx context.Context, req *pgshardv1.StreamRequest, emit func(*pgshardv1.ChangeBatch) error, perEvent bool) error {
@@ -221,7 +229,7 @@ func (s *Server) runStream(ctx context.Context, req *pgshardv1.StreamRequest, em
 	if err != nil {
 		return err
 	}
-	reader, err := s.claimSlot(slot)
+	reader, err := s.claimSlot(slot, req.GetStartLsn())
 	if err != nil {
 		return err
 	}

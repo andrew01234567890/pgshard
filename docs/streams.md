@@ -186,8 +186,17 @@ generated from.
     between transactions;
   - `ack` positions are clamped to what was delivered and forwarded per
     shard to the pooler's `Ack`, advancing the slot's `confirmed_flush_lsn`.
-    `VStream.Ack(stream, position)` does the same out of band (it needs an
-    open reader on the shard's pooler);
+    `VStream.Ack(stream, position)` is the same thing out of band, and is
+    clamped the same way -- so it requires the stream to be **open on the
+    router it is sent to**, which is what tells that router what the
+    consumer has seen. A router not serving the stream refuses it with
+    `55000`. The clamp is not tidiness: PostgreSQL will not resend anything
+    below `confirmed_flush_lsn`, so an ack above what was delivered
+    discards transactions still sitting in the router's buffers;
+  - the pooler answers an ack with the LSN it actually confirmed, which is
+    the ack clamped to what that reader delivered. The router records that
+    rather than what it asked for -- recording the request would leave a
+    slot behind while the router believed it had advanced;
   - a promotion (`primary_epoch` bump in the snapshot) or a dropped pooler
     stream makes the router reconnect the shard to the current primary's
     pooler at the last delivered LSN with backoff; the failover slot exists
