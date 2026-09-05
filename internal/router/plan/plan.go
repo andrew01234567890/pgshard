@@ -288,8 +288,11 @@ func (p *Plan) finish(values [][]any) error {
 			return notYet("cross-shard join is not available yet", "join sharded tables only on equal shard keys")
 		}
 	}
+	// Not necessarily a join: an INSERT ... SELECT reaches here too, and
+	// naming a join it does not contain sent the reader looking for one.
 	if p.touches == Unsharded && !slices.Equal(shards, []int32{p.home}) {
-		return notYet("cross-shard join is not available yet", "unsharded tables live on the home shard; join them only with rows of that shard")
+		return notYet("a statement including an unsharded table must resolve to the home shard alone",
+			"unsharded tables live on the home shard; combine them only with rows of that shard")
 	}
 	// Already sorted and unique by construction; kept explicit because the
 	// order is part of what callers rely on.
