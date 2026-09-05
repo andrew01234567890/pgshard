@@ -128,10 +128,14 @@ workflow throttles on replica lag and bloat pressure on both sides rather
 than copying as fast as the disks allow.
 
 The copy competes with the workload for I/O on the source. The cutover
-itself is a brief write pause; everything before it is background. On a
-four-vCPU CI runner under load, twenty consecutive cutovers paused for a
-median of 1.3 seconds (range 1.0-1.4s). Your own hardware decides the
-number; `status.cutover.pause_ms` records what each one actually cost.
+itself is a brief write pause; everything before it is background. Measured
+at rest on an idle machine, five consecutive cutovers paused for a median of
+0.77 seconds (range 0.73-0.98s); the same five on the same machine took a
+median of 1.23 seconds (range 1.13-1.40s) before the flip stopped re-carrying
+sequences that had not moved. A loaded four-vCPU CI runner is slower again.
+Your own hardware decides the number; `status.cutover.pause_ms` records what
+each one actually cost, and `pgshard_controller_cutover_pause_seconds`
+exports it.
 
 ## Observing and controlling workflows
 
