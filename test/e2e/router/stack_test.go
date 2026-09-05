@@ -278,6 +278,11 @@ func (s *stack) killController() {
 	s.controller = nil
 }
 
+// procReadyTimeout is how long a started process has to log its ready line.
+// A variable so the test of this helper's own failure path does not have to
+// wait it out.
+var procReadyTimeout = 60 * time.Second
+
 func startProcess(tb testing.TB, log *logBuffer, ready string, bin string, args ...string) (*exec.Cmd, <-chan struct{}) {
 	tb.Helper()
 	return startProcessEnv(tb, log, ready, nil, bin, args...)
@@ -303,14 +308,44 @@ func startProcessEnv(tb testing.TB, log *logBuffer, ready string, env []string, 
 			<-waited
 		}
 	})
-	deadline := time.Now().Add(60 * time.Second)
+	deadline := time.Now().Add(procReadyTimeout)
 	for !strings.Contains(log.String(), ready) {
+		// Why it is not ready, not just that it is not. A process that
+		// died and one that is merely slow both leave the log without the
+		// ready line, and the log is EMPTY in the case that actually
+		// happens on a loaded runner -- so the failure printed nothing at
+		// all after the colon and there was no way to tell them apart.
+		select {
+		case <-waited:
+			tb.Fatalf("%s exited before reporting %q (%s):\n%s",
+				filepath.Base(bin), ready, exitOf(cmd), logOrEmpty(log))
+		default:
+		}
 		if time.Now().After(deadline) {
-			tb.Fatalf("%s did not report %q:\n%s", filepath.Base(bin), ready, log.String())
+			tb.Fatalf("%s did not report %q within %s and is still running:\n%s",
+				filepath.Base(bin), ready, procReadyTimeout, logOrEmpty(log))
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	return cmd, waited
+}
+
+// exitOf describes how a process ended, for a start that never became ready.
+func exitOf(cmd *exec.Cmd) string {
+	if cmd.ProcessState == nil {
+		return "no exit status"
+	}
+	return cmd.ProcessState.String()
+}
+
+// logOrEmpty says so when there is nothing, rather than printing nothing:
+// an empty capture reads as a truncated message and sends the reader
+// looking for output that was never produced.
+func logOrEmpty(log fmt.Stringer) string {
+	if s := log.String(); s != "" {
+		return s
+	}
+	return "(the process wrote nothing at all)"
 }
 
 // startRouter launches another router on the stack with the given instance
