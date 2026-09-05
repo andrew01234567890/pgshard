@@ -130,6 +130,46 @@ logs in. A password changed out of band on one shard is reported as
 `drifted` / `verifier: differs` and put back at the next verifier pass; the
 router never served it.
 
+## Revocation, and what happens to a session that is already open
+
+PostgreSQL checks `rolcanlogin`, `VALID UNTIL` and `CONNECTION LIMIT` only
+when a backend starts (`InitializeSessionUserId`), and never revisits them:
+a role set `NOLOGIN`, expired, or given a lower connection limit keeps every
+backend it already had. pgshard's router **diverges deliberately for the
+first two**, because a router session outlives a backend and a revocation
+that took effect only for new logins would be no revocation at all.
+
+After each role refresh (`--roles-ttl`, 5s) the router ends every session
+whose role may no longer log in — `NOLOGIN`, expired, or gone from the
+catalog. So a revocation takes effect within one refresh interval rather
+than at the next login.
+
+What that does to work in flight — **a revocation is not a drain**:
+
+- The session's running statement is **cancelled** and its connection closed,
+  whether or not a transaction is open. An open transaction is rolled back by
+  the disconnection, as any lost connection rolls one back. Letting it finish
+  would let a role that may no longer log in keep working for as long as it
+  held a transaction open, which is the thing being revoked.
+- The client is told why first: a `FATAL` carrying `57P01`
+  (`admin_shutdown`), *"terminating connection because the role may no longer
+  log in"*. That courtesy write is bounded, so one client that has stopped
+  reading cannot delay the revocation of the others.
+- The decision is taken from the roles the router holds **now**, not from
+  what changed, so a revocation cannot be missed because something else
+  refreshed the cache first, and repeating it is harmless.
+- A refresh that **fails** terminates nothing. Failing closed on a catalog
+  blip would disconnect every session in the cluster, which is a worse
+  outage than a revocation landing one interval later.
+
+**`CONNECTION LIMIT` is not part of this.** Lowering it refuses new sessions
+and leaves open ones alone, exactly as PostgreSQL does. The limit is also
+per router instance, so `n` behind an HPA of `r` routers admits up to
+`n × r` — PostgreSQL documents its own limit as approximate for a
+comparable reason, but the factor here is the router count rather than a
+race. Cluster-wide accounting, and whether lowering a limit should close
+sessions at all, are open (PGS-309).
+
 ## DEGRADED
 
 A role migration that failed on a shard leaves the desired state untouched
