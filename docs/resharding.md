@@ -380,3 +380,14 @@ that ended within a day).
 - Placement workflows need a primary key and refuse TRUNCATE in the
   stream; DDL on the table during a run fails it (the columns changed).
   Rows with a NULL new shard key fail the run.
+- A move is refused at preflight when the table carries something the
+  shadow build cannot reproduce, because a swap that dropped it would leave
+  the table looking correct and enforcing nothing: user triggers, foreign
+  keys in either direction, rules, table or column privileges, a non-default
+  owner, a non-default replica identity, inheritance or partition
+  membership, and publication membership. **Row-level security is
+  reproduced**, not refused: the policies are recreated on the shadow (from
+  `pg_policy`, since PostgreSQL has no `pg_get_policydef()`) while RLS is
+  still off there, so the copy is not filtered by the policies it is
+  copying, and the swap enables `ROW LEVEL SECURITY` and `FORCE ROW LEVEL
+  SECURITY` in the transaction that renames the table.

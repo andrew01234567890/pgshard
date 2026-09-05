@@ -87,6 +87,9 @@ func (p *Placer) describe(ctx context.Context, wf *placementWorkflow) error {
 		return err
 	}
 	wf.st.TableComment = comment
+	if wf.st.RowSecurity, wf.st.ForceRowSecurity, err = tableRowSecurity(ctx, conn, wf.spec.SchemaName, wf.spec.TableName); err != nil {
+		return err
+	}
 	// A column defaulting to a sequence in another schema cannot be moved
 	// safely: the target's rebuilt sequence would not be advanced past the
 	// copied rows (it is not owned, so pg_get_serial_sequence cannot find it),
@@ -378,10 +381,8 @@ func unsupportedTableFeatures(ctx context.Context, conn ShardConn, schema, name 
 			FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 			WHERE n.nspname = $1 AND c.relname = $2)
 		SELECT f FROM (
-			SELECT 'row-level security policy ' || polname AS f FROM pg_policy, t WHERE polrelid = t.oid
-			UNION ALL SELECT 'replica identity ' || CASE t.relreplident WHEN 'f' THEN 'FULL' WHEN 'i' THEN 'USING INDEX' ELSE 'NOTHING' END
+			SELECT 'replica identity ' || CASE t.relreplident WHEN 'f' THEN 'FULL' WHEN 'i' THEN 'USING INDEX' ELSE 'NOTHING' END AS f
 				FROM t WHERE t.relreplident <> 'd'
-			UNION ALL SELECT 'row-level security enabled' FROM t WHERE t.relrowsecurity OR t.relforcerowsecurity
 			UNION ALL SELECT 'owner ' || pg_get_userbyid(t.relowner) FROM t
 				WHERE t.relowner <> (SELECT oid FROM pg_roles WHERE rolname = current_user)
 			UNION ALL SELECT 'table privileges' FROM t WHERE t.relacl IS NOT NULL
@@ -560,7 +561,15 @@ func (p *Placer) ensureShadows(ctx context.Context, wf *placementWorkflow) error
 				if oerr != nil {
 					return oerr
 				}
+				// LIKE INCLUDING ALL carries no row-level security policy
+				// and neither RLS flag, so a swap without these would leave
+				// the table looking correct and enforcing nothing.
+				pols, perr := tablePolicies(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, wf.shape.qualified(wf.shadow()))
+				if perr != nil {
+					return perr
+				}
 				stmts = append([]string{fmt.Sprintf("CREATE TABLE %s (LIKE %s INCLUDING ALL)", wf.shape.qualified(wf.shadow()), wf.shape.qualified(wf.spec.TableName))}, opts...)
+				stmts = append(stmts, pols...)
 			} else {
 				if ddl == nil {
 					if ddl, err = p.shadowDDL(ctx, wf); err != nil {
@@ -843,13 +852,109 @@ func extendedStatistics(ctx context.Context, conn ShardConn, wf *placementWorkfl
 		}
 		out = append(out, stmt+" ON "+st.Columns+" FROM "+wf.shape.qualified(wf.shadow()))
 	}
-	return out, nil
+	// Same for the remote path: a shadow built from the catalog carries no
+	// policies either, and the swap enables row-level security on whatever
+	// it finds.
+	pols, err := tablePolicies(ctx, conn, wf.spec.SchemaName, wf.spec.TableName, wf.shape.qualified(wf.shadow()))
+	if err != nil {
+		return nil, err
+	}
+	return append(out, pols...), nil
 }
 
 // tableReloptions renders the source table's storage parameters. Neither
 // path carried them: LIKE INCLUDING ALL does not copy reloptions, so a
 // table with a tuned fillfactor or its own autovacuum thresholds came back
 // from a move with the defaults.
+// tableRowSecurity reads the source table's two row-level security flags.
+func tableRowSecurity(ctx context.Context, conn ShardConn, schema, table string) (enabled, forced bool, err error) {
+	rows, qerr := conn.Query(ctx, `SELECT c.relrowsecurity, c.relforcerowsecurity
+		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2`, schema, table)
+	if qerr != nil {
+		return false, false, qerr
+	}
+	type flags struct {
+		Enabled bool
+		Forced  bool
+	}
+	f, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[flags])
+	if err != nil {
+		return false, false, err
+	}
+	return f.Enabled, f.Forced, nil
+}
+
+// tablePolicies renders the source table's row-level security policies onto
+// the shadow.
+//
+// PostgreSQL has no pg_get_policydef(), so they are rebuilt from pg_policy.
+// They are created on the shadow while row-level security is still DISABLED
+// there, which makes them inert until the swap enables it, in the
+// transaction that renames the table.
+//
+// The order matters for two reasons. A policy in force during the copy
+// filters the copier's own rows -- how much depends on the role it holds,
+// and pgshard's DDL role is NOBYPASSRLS -- and losing rows that way is
+// silent. And a shadow is not the table clients see, so nothing should be
+// enforcing on it before it is.
+func tablePolicies(ctx context.Context, conn ShardConn, schema, table, shadow string) ([]string, error) {
+	rows, err := conn.Query(ctx, `SELECT p.polname, p.polcmd::text, p.polpermissive,
+			(SELECT coalesce(string_agg(CASE WHEN u.oid = 0 THEN 'PUBLIC' ELSE quote_ident(r.rolname) END, ', '), '')
+			   FROM unnest(p.polroles) AS u(oid) LEFT JOIN pg_roles r ON r.oid = u.oid) AS roles,
+			coalesce(pg_get_expr(p.polqual, p.polrelid), '') AS qual,
+			coalesce(pg_get_expr(p.polwithcheck, p.polrelid), '') AS wcheck
+		FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2 ORDER BY p.polname`, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	type policy struct {
+		Name       string
+		Cmd        string
+		Permissive bool
+		Roles      string
+		Qual       string
+		WithCheck  string
+	}
+	ps, err := pgx.CollectRows(rows, pgx.RowToStructByPos[policy])
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, p := range ps {
+		cmd, ok := policyCommands[p.Cmd]
+		if !ok {
+			// A polcmd this build does not know is a policy it would
+			// recreate as something else. Refuse rather than guess: a
+			// weaker policy on the moved table enforces nothing and looks
+			// like it does.
+			return nil, fatal("table %s.%s has a row-level security policy %s for an unknown command %q; drop it before moving the table",
+				schema, table, p.Name, p.Cmd)
+		}
+		stmt := "CREATE POLICY " + QuoteIdent(p.Name) + " ON " + shadow
+		if !p.Permissive {
+			stmt += " AS RESTRICTIVE"
+		}
+		stmt += " FOR " + cmd
+		if p.Roles != "" {
+			stmt += " TO " + p.Roles
+		}
+		if p.Qual != "" {
+			stmt += " USING (" + p.Qual + ")"
+		}
+		if p.WithCheck != "" {
+			stmt += " WITH CHECK (" + p.WithCheck + ")"
+		}
+		out = append(out, stmt)
+	}
+	return out, nil
+}
+
+// policyCommands maps pg_policy.polcmd to the command a CREATE POLICY names.
+var policyCommands = map[string]string{"*": "ALL", "r": "SELECT", "a": "INSERT", "w": "UPDATE", "d": "DELETE"}
+
 func tableReloptions(ctx context.Context, conn ShardConn, wf *placementWorkflow) ([]string, error) {
 	rows, err := conn.Query(ctx, `SELECT coalesce(array_to_string(c.reloptions, ', '), '') FROM pg_class c WHERE c.oid = $1::regclass`,
 		wf.shape.qualified(wf.spec.TableName))
@@ -1699,9 +1804,33 @@ func (p *Placer) swapOn(ctx context.Context, wf *placementWorkflow, conn ShardCo
 		if err := advanceSequences(ctx, conn, wf.spec.SchemaName, wf.spec.TableName); err != nil {
 			return err
 		}
+		// Last, and inside the rename's transaction: the policies were
+		// created on the shadow while row-level security was off, so that
+		// the copy could write through them. Turning it on here is what
+		// makes them enforce, at the same instant the table becomes the
+		// one clients see.
+		if err := enableRowSecurity(ctx, conn, wf); err != nil {
+			return err
+		}
 	}
 	_, err = conn.Exec(ctx, "COMMIT")
 	return err
+}
+
+// enableRowSecurity turns on what the source table had, at the swap.
+func enableRowSecurity(ctx context.Context, conn ShardConn, wf *placementWorkflow) error {
+	table := wf.shape.qualified(wf.spec.TableName)
+	if wf.st.RowSecurity {
+		if _, err := conn.Exec(ctx, "ALTER TABLE "+table+" ENABLE ROW LEVEL SECURITY"); err != nil {
+			return err
+		}
+	}
+	if wf.st.ForceRowSecurity {
+		if _, err := conn.Exec(ctx, "ALTER TABLE "+table+" FORCE ROW LEVEL SECURITY"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func moveOwnedSequences(ctx context.Context, conn ShardConn, schema, from, to string) error {
