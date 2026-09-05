@@ -417,27 +417,37 @@ type fakeAgents struct {
 	reloads    []string
 	// syncSlots records the last SetSynchronizedStandbySlots call per addr.
 	syncSlots map[string][]string
-	// ready is how many logical slots each member reports would survive
-	// its promotion; absent means none, as a member that cannot answer.
-	ready map[string]int
+	// slots is what each member reports about its logical slots; absent
+	// means none, as for a member that cannot answer.
+	slots map[string]LogicalSlots
 }
 
-func (f *fakeAgents) ReadySlots(_ context.Context, addr string) (int, error) {
+func (f *fakeAgents) LogicalSlots(_ context.Context, addr string) (LogicalSlots, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.errs[addr]; err != nil {
-		return 0, err
+		return LogicalSlots{}, err
 	}
-	return f.ready[addr], nil
+	return f.slots[addr], nil
 }
 
+// setReady gives a member n ready slots with generated names, for the
+// tie-break tests, which care only how many there are.
 func (f *fakeAgents) setReady(addr string, n int) {
+	names := make([]string, n)
+	for i := range names {
+		names[i] = fmt.Sprintf("slot_%d", i)
+	}
+	f.setSlots(addr, LogicalSlots{All: names, Ready: names})
+}
+
+func (f *fakeAgents) setSlots(addr string, sl LogicalSlots) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.ready == nil {
-		f.ready = map[string]int{}
+	if f.slots == nil {
+		f.slots = map[string]LogicalSlots{}
 	}
-	f.ready[addr] = n
+	f.slots[addr] = sl
 }
 
 func (f *fakeAgents) SetSynchronizedStandbySlots(_ context.Context, addr string, slots []string) ([]string, error) {

@@ -405,6 +405,20 @@ func (r *ClusterReconciler) stepAwayFromPrimary(ctx context.Context, c *pgshardv
 		obs.rollout = &pgshardv1alpha1.GroupRollout{Phase: pgshardv1alpha1.RolloutPhaseHeld, Member: obs.state.primary, Reason: why}
 		return nil
 	}
+	// A planned switchover is discretionary and can wait; an emergency
+	// failover cannot, and takes the best candidate there is. So this is
+	// the one place that may REFUSE over slots rather than merely prefer
+	// them: switching to a member missing a logical slot the primary has
+	// destroys whatever depends on it -- a reshard's reverse replication,
+	// a stream's resumable position -- to save a wait.
+	//
+	// Checked by name, not by count: two members with one slot each do not
+	// necessarily hold the same one.
+	if missing := r.slotsLostBySwitchover(ctx, g, obs.state.primary, target, members); len(missing) > 0 {
+		obs.rollout = &pgshardv1alpha1.GroupRollout{Phase: pgshardv1alpha1.RolloutPhaseHeld, Member: obs.state.primary,
+			Reason: "switching over to " + target + " would lose logical slots not yet synchronised there: " + strings.Join(missing, ", ")}
+		return nil
+	}
 	step := &pgshardv1alpha1.GroupRollout{Phase: pgshardv1alpha1.RolloutPhaseSwitchover, Member: obs.state.primary, Reason: "switching over to " + target + " before restarting the primary", Since: r.metaNow()}
 	if err := r.setGroupRollout(ctx, c, g, step); err != nil {
 		return err
@@ -464,6 +478,34 @@ func (r *ClusterReconciler) freshestStandby(ctx context.Context, g Group, state 
 		return "", "no sync-set standby eligible to switch over to"
 	}
 	return best, ""
+}
+
+// slotsLostBySwitchover names the primary's logical slots the target does
+// not hold ready, sorted, so a hold can say which they are.
+//
+// A group with no logical slots -- no reshard in flight, no change stream
+// -- has nothing to lose and is never held by this.
+func (r *ClusterReconciler) slotsLostBySwitchover(ctx context.Context, g Group, primary, target string, members map[string]*memberInfo) []string {
+	pm, tm := members[primary], members[target]
+	if pm == nil || tm == nil {
+		return nil
+	}
+	required := r.logicalSlots(ctx, g, primary, pm.ip).All
+	if len(required) == 0 {
+		return nil
+	}
+	ready := map[string]bool{}
+	for _, n := range r.logicalSlots(ctx, g, target, tm.ip).Ready {
+		ready[n] = true
+	}
+	var missing []string
+	for _, n := range required {
+		if !ready[n] {
+			missing = append(missing, n)
+		}
+	}
+	sort.Strings(missing)
+	return missing
 }
 
 // unreachableStandbys names the sync-set standbys whose probe did not

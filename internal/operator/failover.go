@@ -136,13 +136,24 @@ func (r *ClusterReconciler) readySlots(ctx context.Context, g Group, name, ip st
 	if r.Agents == nil {
 		return 0
 	}
-	n, err := r.Agents.ReadySlots(ctx, agentAddr(ip))
+	return len(r.logicalSlots(ctx, g, name, ip).Ready)
+}
+
+// logicalSlots asks one member for its logical slots, reporting none when
+// it cannot be asked. A member that did not answer is treated as holding
+// nothing, which costs it a tie-break and holds a planned switchover --
+// both the conservative direction.
+func (r *ClusterReconciler) logicalSlots(ctx context.Context, g Group, name, ip string) LogicalSlots {
+	if r.Agents == nil || ip == "" {
+		return LogicalSlots{}
+	}
+	sl, err := r.Agents.LogicalSlots(ctx, agentAddr(ip))
 	if err != nil {
 		logf.FromContext(ctx).Info("member did not report its slots; counting none",
 			"group", g.Name(), "member", name, "err", err.Error())
-		return 0
+		return LogicalSlots{}
 	}
-	return n
+	return sl
 }
 
 // errQuorum is returned when unreachable listed standbys could hold an

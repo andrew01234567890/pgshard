@@ -46,16 +46,33 @@ type AgentClient interface {
 	// SetSynchronizedStandbySlots tells the primary's agent which physical
 	// slots failover slots must wait for; it returns the slots applied.
 	SetSynchronizedStandbySlots(ctx context.Context, addr string, slots []string) ([]string, error)
-	// ReadySlots is how many logical replication slots on this member
-	// would survive its promotion: synchronised from the primary, not
-	// temporary, and not invalidated.
+	// LogicalSlots is this member's logical replication slots: every one it
+	// has, and the ones that would still work after promoting it --
+	// synchronised from the primary, not temporary, and not invalidated.
 	//
 	// A reshard's subscription, the reverse replication that makes a
 	// cutover reversible, and a change stream's resumable position each
-	// depend on one, so promoting a member that has fewer of them costs
-	// work that promoting one with more does not: a stranded subscription,
-	// a rollback window that is gone, a stream that must re-baseline.
-	ReadySlots(ctx context.Context, addr string) (int, error)
+	// depend on one, so promoting a member missing some costs work that
+	// promoting one holding them does not: a stranded subscription, a
+	// rollback window that is gone, a stream that must re-baseline.
+	//
+	// Both halves are needed because they answer different questions. How
+	// MANY are ready orders candidates for an emergency failover, which
+	// has to promote someone. WHICH are ready decides a planned
+	// switchover, which does not: the primary's own list is what a
+	// candidate has to hold, and a count cannot say that two members with
+	// one slot each hold the same one.
+	LogicalSlots(ctx context.Context, addr string) (LogicalSlots, error)
+}
+
+// LogicalSlots is what a member reported about its logical slots.
+type LogicalSlots struct {
+	// All is every logical slot the member has.
+	All []string
+	// Ready is the subset that would survive promoting it. On a primary
+	// this is empty and means nothing: a primary does not synchronise its
+	// own slots from anywhere.
+	Ready []string
 }
 
 // GRPCAgentClient is the production AgentClient. It keeps one connection
@@ -432,36 +449,38 @@ func (c *GRPCAgentClient) Info(ctx context.Context, addr string) (RepoInfo, erro
 	return info, nil
 }
 
-// ReadySlots counts the logical slots that would survive a promotion here.
+// LogicalSlots lists this member's logical slots and the ones that would
+// survive a promotion here.
 //
-// The three conditions are PostgreSQL's own: a slot the standby
+// The three readiness conditions are PostgreSQL's own: a slot the standby
 // synchronised from the primary, that is not temporary (a temporary slot
 // dies with the session that made it), and that has not been invalidated
 // -- most often by the primary discarding WAL the slot still needed.
 // A slot failing any of them exists on the standby and would not work
 // after promotion, which is worse than not being there, because nothing
 // would notice until a subscription stalled.
-func (c *GRPCAgentClient) ReadySlots(ctx context.Context, addr string) (int, error) {
+func (c *GRPCAgentClient) LogicalSlots(ctx context.Context, addr string) (LogicalSlots, error) {
 	cl, err := c.dial(ctx, addr)
 	if err != nil {
-		return 0, err
+		return LogicalSlots{}, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, agentCallTimeout)
 	defer cancel()
 	resp, err := cl.ListSlots(ctx, &pgshardv1.ListSlotsRequest{})
 	if err != nil {
-		return 0, err
+		return LogicalSlots{}, err
 	}
-	n := 0
+	var out LogicalSlots
 	for _, s := range resp.GetSlots() {
 		if s.GetKind() != pgshardv1.SlotKind_SLOT_KIND_LOGICAL {
 			continue
 		}
+		out.All = append(out.All, s.GetName())
 		if s.GetSynced() && !s.GetTemporary() && s.GetInvalidationReason() == "" {
-			n++
+			out.Ready = append(out.Ready, s.GetName())
 		}
 	}
-	return n, nil
+	return out, nil
 }
 
 // SetSynchronizedStandbySlots reads the agent's epoch and calls
