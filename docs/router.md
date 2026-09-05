@@ -872,6 +872,22 @@ and its SQL in plaintext to a deployment that asked to be protected.
 `--allow-plaintext` lifts that for development. Cancel requests are exempt, as
 they are in PostgreSQL: libpq before 17 sends them without negotiating TLS.
 
+### What a router pod has to survive
+
+A frontend message declares its length in a five-byte header and the buffer
+for it is allocated before any of the body arrives, so **`--max-message-body`
+times `--max-sessions` is the heap one router can be made to commit** by
+clients that send headers and then stall. The defaults are 16 MiB and 5000. A
+deployment that sends larger single messages raises the first knowing what it
+multiplies by; one that expects fewer sessions should lower the second.
+
+`--max-sessions-per-role` bounds what a *single credential* can take of that,
+for the roles whose `pgshard.roles.connection_limit` is unset (the catalog
+default is unlimited). It is off by default, because a single-tenant cluster
+wants its one application role to have the whole router; set it wherever more
+than one tenant shares a router, so one of them cannot take it from the
+others. A role that carries its own `connection_limit` keeps it.
+
 For a local stack, `pgshard-router dev-bootstrap` migrates the catalog and
 registers a database, a role (password from `PGSHARD_DEV_PASSWORD`) and one
 shard's pooler endpoint (`--shard-id`, default 0), and creates the same role
