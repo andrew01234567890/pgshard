@@ -12,9 +12,13 @@
   (proof = `ClientKey XOR HMAC(H(ClientKey), authMessage)`, server signature
   checked with `ServerKey`). No password ever reaches the pooler.
 - **Trust boundary.** The router authenticated the client; the pooler trusts
-  the router (mTLS on the gRPC listener). Keys are needed only to *dial*: a
-  session that names a role with an idle pooled backend reuses it without
-  re-proving keys. Consequently the gRPC listener refuses to start without
+  the router (mTLS on the gRPC listener). Keys are needed to *dial* **and to
+  reuse**: an idle backend is bound to a digest of the keys that
+  authenticated it, and `popIdle` closes one whose digest does not match the
+  caller's rather than handing it over; a session id is bound to (role,
+  keys) and a reattach presenting different ones is refused with
+  `PermissionDenied`. mTLS is not the only thing separating roles.
+  Consequently the gRPC listener refuses to start without
   `--tls-cert/--tls-key/--tls-ca` unless `--insecure-dev` is passed.
 - **Backend authentication.** A backend connection is accepted only after
   a complete SCRAM-SHA-256 exchange whose server signature verified against
@@ -70,8 +74,12 @@
   fresh connection.
 - **COPY.** `CopyInResponse` returns control to the router; `CopyData`,
   `CopyDone` and `CopyFail` are relayed; COPY OUT data is streamed back.
-- **Health.** `Health` streams role, lag, epoch, generation and `serving`
-  (false once draining) from the `Source`.
+- **Health.** `Health` streams epoch, generation and `serving` (false once
+  draining) from the `Source`. **`role` and `lag_bytes` are not derived**:
+  the pooler is started with `role` fixed at `PRIMARY` and never revises it,
+  so one beside a standby reports itself primary, and `lag_bytes` is always
+  zero. Nothing in this repository consumes the stream today; do not read
+  either field until they are computed.
 - **Stream / Ack.** `Stream` opens the shard's logical slot (`slot`, or
   `pgshard_<stream>_<group>` derived from `stream` and `--stream-shard`) over
   a replication connection (`--stream-dsn`) and streams decoded pgoutput v4
@@ -81,7 +89,11 @@
   a `Keepalive` batch is sent when idle; a second reader on the same slot is
   refused with `FAILED_PRECONDITION`. `Ack(lsn)` advances the slot's
   `confirmed_flush_lsn` through the reader's standby status update and
-  returns once the server has it. `StreamChanges` is the same stream one
+  returns once that update **has been sent** — the replication protocol does
+  not acknowledge a standby status, so what is known is that the kernel took
+  the bytes, not that the walsender applied them. A stalled walsender or a
+  half-open connection still lets `Ack` succeed; read
+  `pg_replication_slots.confirmed_flush_lsn` if a durable answer is needed. `StreamChanges` is the same stream one
   event per message. See [streams.md](streams.md).
 - **CopyTables.** The copy phase of an initial copy: exports a snapshot
   from the stream's slot (created on the spot) or a temporary one, and

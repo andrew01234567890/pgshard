@@ -79,8 +79,11 @@ The primary is unhealthy when its pod is missing, or the pod is not Ready and
    `PgShardGroup.status`, then the Lease (holder handed to the candidate,
    annotations set). The catalog group is fenced by its status and Lease only.
 5. `Agent.Promote{epoch, lease_holder}` on the candidate: the agent accepts only
-   a strictly greater epoch, takes the Lease (already its own), disconnects
-   its WAL receiver, runs `pg_ctl promote` and checkpoints.
+   a strictly greater epoch, refuses when `lease_holder` is not the identity it
+   holds its own Lease under (both sides derive it from the member name, and a
+   mismatch used to surface as an unexplained `ErrLeaseHeld`), takes the Lease
+   (already its own), disconnects its WAL receiver, runs `pg_ctl promote` and
+   checkpoints.
 6. relabels the candidate `role=primary`, re-renders the ConfigMap so the old
    primary's config says `standby`, and requeues.
 

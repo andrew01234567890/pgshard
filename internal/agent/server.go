@@ -149,6 +149,19 @@ func (s *Server) Promote(ctx context.Context, req *pgshardv1.PromoteRequest) (*p
 		return nil, s.rpcErr(err)
 	}
 	resp.Epoch = req.GetEpoch()
+	// The operator hands the lease to a member BY NAME and then asks that
+	// member to promote. Both sides derive the same string from the member
+	// name today, and nothing checked that they had -- the field was sent
+	// and never read. A rename, or a PodName set to something else, would
+	// have failed every promotion with ErrLeaseHeld from Acquire below and
+	// said nothing about why.
+	//
+	// An operator too old to send the field leaves it empty and is accepted,
+	// as before.
+	if want := req.GetLeaseHolder(); want != "" && s.lease != nil && want != s.lease.Holder() {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"promote names lease holder %q but this agent holds its lease as %q", want, s.lease.Holder())
+	}
 	ctx, cancel := context.WithTimeout(ctx, s.opTimeout)
 	defer cancel()
 	// Acquire the lease only when no hold is renewing it yet: a re-promote of

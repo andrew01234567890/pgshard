@@ -17,6 +17,14 @@ import (
 	"k8s.io/utils/ptr"
 )
 
+// Holder is the identity this agent takes the lease under.
+func (l *Lease) Holder() string {
+	if l == nil {
+		return ""
+	}
+	return l.holder
+}
+
 // ErrLeaseHeld is returned when another holder owns an unexpired lease.
 var ErrLeaseHeld = errors.New("lease held by another identity")
 

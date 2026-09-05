@@ -276,9 +276,12 @@ Delivery is at-least-once at batch boundaries and around a resume:
 
 Consumers therefore apply copy rows with upsert semantics keyed by the
 primary key (and treat stream inserts the same way during and right after
-the copy). Tables without a primary key are copied by `ctid`; across a
-resume their rows are identified by position only, so a `VACUUM FULL` or
-`CLUSTER` between the two snapshots can repeat or skip rows of such a table.
+the copy). Tables without a primary key are copied by `ctid` and carry **no
+checkpoint**: both the pooler and the router drop it, so a resume or a
+reconnect re-sends such a table from its start. That is at-least-once and
+never skips — an earlier design resumed from the ctid and could miss rows
+after a heap rewrite, which is what this avoids — and the cost is that a
+large keyless table is copied again on every reconnect.
 The row-count oracle in `test/e2e/router` (`TestRouterVStreamInitialCopy`:
 10k rows per shard, concurrent inserts, the consumer killed twice mid-copy)
 checks that the upserted consumer state equals the tables on both shards.
