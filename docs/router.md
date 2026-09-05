@@ -276,7 +276,12 @@ would be emitted NULL-extended by every shard, so `regions LEFT JOIN orders`
 is refused where `orders LEFT JOIN regions` is not. Everything above the
 join is unchanged — the whole join runs on each shard and the merge is the
 one a single table gets, so `GROUP BY` still has to include the shard key.
-Anything else is `cross-shard join is not available yet`.
+Anything else is `cross-shard join is not available yet`. A join whose
+tables *are* joined on their shard key, but whose key types the
+controller has not inspected yet, gets its own message naming the table:
+the plain one advises doing what the statement already does. A single
+sharded table has nothing to compare against, needs no such verdict, and
+scatters as usual.
 
 Refused with `0A000` (message names the reason): `avg()` and every other
 aggregate ("multi-shard avg() is not available yet" — compute `sum(x)` and
