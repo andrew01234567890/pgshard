@@ -52,3 +52,49 @@ func TestAnOrdinarySequenceIsStillAlterable(t *testing.T) {
 		})
 	}
 }
+
+// TestDestroyingTheSequenceBehindAGlobalOneIsRefused: ALTER SEQUENCE was
+// guarded and the statements that DESTROY the same object, or move the name
+// the guard is derived from, were not. A DROP takes the column's default
+// with it under CASCADE; a RENAME or a SET SCHEMA leaves the next ALTER
+// SEQUENCE matching nothing, so it is fanned out again with no one the
+// wiser.
+func TestDestroyingTheSequenceBehindAGlobalOneIsRefused(t *testing.T) {
+	for _, sql := range []string{
+		"drop sequence tickets_id_seq",
+		"drop sequence public.tickets_id_seq cascade",
+		"drop sequence if exists unrelated_seq, tickets_id_seq",
+		"alter sequence tickets_id_seq rename to something_else",
+		"alter sequence tickets_id_seq set schema other",
+	} {
+		t.Run(sql, func(t *testing.T) {
+			_, err := New().Plan(context.Background(), session(fixture(t)), sql)
+			if err == nil {
+				t.Fatal("fanned out to the per-shard sequences")
+			}
+			if !strings.Contains(err.Error(), "global sequence "+fixtureDB+".public.tickets.id") {
+				t.Fatalf("the refusal must name the global sequence: %v", err)
+			}
+		})
+	}
+}
+
+// The other side: what is inert on the physical sequence stays allowed,
+// because refusing it would break the migration tools that grant over every
+// object they find and would protect nothing.
+func TestInertStatementsOnAGlobalSequenceObjectAreAllowed(t *testing.T) {
+	for _, sql := range []string{
+		"grant select on sequence tickets_id_seq to reader",
+		"alter sequence tickets_id_seq owner to someone",
+		// And an ordinary sequence is untouched by any of it.
+		"drop sequence unrelated_seq",
+		"alter sequence unrelated_seq rename to other_seq",
+		"drop sequence tickets_other_seq",
+	} {
+		t.Run(sql, func(t *testing.T) {
+			if _, err := New().Plan(context.Background(), session(fixture(t)), sql); err != nil {
+				t.Fatalf("must still be planned: %v", err)
+			}
+		})
+	}
+}

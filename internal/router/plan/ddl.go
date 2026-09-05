@@ -398,7 +398,12 @@ func (w *walker) rename(s *pgquerypb.RenameStmt) error {
 	case pgquerypb.ObjectType_OBJECT_ROLE:
 		return notYet("renaming a role is not available through the router",
 			"the catalog records roles, memberships and grants by name; create the new role and drop the old one")
-	case pgquerypb.ObjectType_OBJECT_SCHEMA, pgquerypb.ObjectType_OBJECT_SEQUENCE, pgquerypb.ObjectType_OBJECT_TYPE,
+	case pgquerypb.ObjectType_OBJECT_SEQUENCE:
+		if err := w.refuseRegisteredSequenceObject("ALTER SEQUENCE RENAME", s.GetRelation()); err != nil {
+			return err
+		}
+		return w.migration(Migration{Kind: "ALTER " + objectWord(s.GetRenameType()), Scope: ScopeAll})
+	case pgquerypb.ObjectType_OBJECT_SCHEMA, pgquerypb.ObjectType_OBJECT_TYPE,
 		pgquerypb.ObjectType_OBJECT_DATABASE:
 		return w.migration(Migration{Kind: "ALTER " + objectWord(s.GetRenameType()), Scope: ScopeAll})
 	}
@@ -456,7 +461,14 @@ func (w *walker) drop(d *pgquerypb.DropStmt) error {
 			m.Object = ObjectRef{Kind: "schema", Name: objs[0].GetString_().GetSval(), Expect: objectAbsent}
 		}
 		return w.migration(m)
-	case pgquerypb.ObjectType_OBJECT_SEQUENCE, pgquerypb.ObjectType_OBJECT_TYPE:
+	case pgquerypb.ObjectType_OBJECT_SEQUENCE:
+		for _, obj := range d.GetObjects() {
+			if err := w.refuseRegisteredSequenceObject(kind, qualifiedName(obj)); err != nil {
+				return err
+			}
+		}
+		return w.migration(Migration{Kind: kind, Scope: ScopeAll})
+	case pgquerypb.ObjectType_OBJECT_TYPE:
 		return w.migration(Migration{Kind: kind, Scope: ScopeAll})
 	}
 	return w.unshardedOnly()
@@ -729,7 +741,17 @@ func (w *walker) alterObject(kind string, objType pgquerypb.ObjectType, rv *pgqu
 		return w.migration(Migration{Kind: "ALTER TABLE", Scope: scope})
 	case pgquerypb.ObjectType_OBJECT_INDEX, pgquerypb.ObjectType_OBJECT_VIEW:
 		return w.migration(Migration{Kind: "ALTER " + objectWord(objType), Scope: ScopeExisting})
-	case pgquerypb.ObjectType_OBJECT_SCHEMA, pgquerypb.ObjectType_OBJECT_SEQUENCE, pgquerypb.ObjectType_OBJECT_TYPE,
+	case pgquerypb.ObjectType_OBJECT_SEQUENCE:
+		// Only the schema move: an OWNER change on the physical sequence
+		// is inert for a registered global sequence and refusing it would
+		// cost more than it saves.
+		if kind == "ALTER TABLE SET SCHEMA" {
+			if err := w.refuseRegisteredSequenceObject("ALTER SEQUENCE SET SCHEMA", rv); err != nil {
+				return err
+			}
+		}
+		return w.migration(Migration{Kind: "ALTER " + objectWord(objType), Scope: ScopeAll})
+	case pgquerypb.ObjectType_OBJECT_SCHEMA, pgquerypb.ObjectType_OBJECT_TYPE,
 		pgquerypb.ObjectType_OBJECT_DATABASE:
 		return w.migration(Migration{Kind: "ALTER " + objectWord(objType), Scope: ScopeAll})
 	}

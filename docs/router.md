@@ -494,6 +494,23 @@ after the relation is resolved and the refusal runs before that.
 A sequence that is not registered as global is untouched: it
 lives on one shard and means there what it says.
 
+**DDL on the object behind one.** pgshard registers a global sequence as
+`<database>.<schema>.<table>.<column>`; PostgreSQL names the physical
+sequence a `serial` creates `<table>_<column>_seq`. They are the same
+sequence to a user and different objects here, so a statement naming the
+physical one is fanned out to per-shard objects the router never allocates
+from. `ALTER SEQUENCE`, `DROP SEQUENCE`, `ALTER SEQUENCE … RENAME TO` and
+`… SET SCHEMA` over such a name are **refused** (`0A000`, naming the global
+sequence): the first changes each shard's own counter while the router's
+carries on, the second takes the column's default with it under `CASCADE`,
+and the last two move the name the refusal is derived from, so the next
+`ALTER SEQUENCE` would be fanned out unnoticed. A `GRANT` or an `OWNER`
+change is **allowed**: it is inert on a sequence nothing reads, and
+refusing it would break tools that grant over every object they find. A
+name PostgreSQL truncated to 63 characters will not match and is fanned out
+as before — missing one leaves today's behaviour rather than refusing
+something unrelated.
+
 Each column is backed by a row of `pgshard.sequences` named
 `<database>.<schema>.<table>.<column>` (`app.public.tickets.id`), created
 on first use with `next_value = 1` and `block_size = 1000`; both fields can
