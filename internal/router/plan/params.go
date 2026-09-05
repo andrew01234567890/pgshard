@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/andrew01234567890/pgshard/internal/placement"
 )
 
 // PostgreSQL type OIDs the router understands as shard keys.
@@ -18,6 +20,7 @@ const (
 	oidVarchar = 1043
 	oidUnknown = 705
 	oidName    = 19
+	oidUUID    = 2950
 )
 
 // BindParams adapts one Bind message to Params: values are decoded from
@@ -71,6 +74,8 @@ func DecodeShardKey(oid uint32, hint TypeHint, format int16, raw []byte) (any, e
 			oid = oidInt8
 		case HintText:
 			oid = oidText
+		case HintUUID:
+			oid = oidUUID
 		}
 	}
 	if format == 1 {
@@ -103,6 +108,15 @@ func DecodeShardKey(oid uint32, hint TypeHint, format int16, raw []byte) (any, e
 				return int64(int16(binary.BigEndian.Uint16(raw))), nil
 			}
 			return nil, ErrAmbiguousKey
+		case oidUUID:
+			// The binary wire form of a uuid IS the sixteen bytes the hash
+			// takes, so there is nothing to parse.
+			if len(raw) != 16 {
+				return nil, fmt.Errorf("uuid parameter has %d bytes", len(raw))
+			}
+			var b [16]byte
+			copy(b[:], raw)
+			return b, nil
 		case oidText, oidVarchar, oidName:
 			return string(raw), nil
 		case oidBpchar:
@@ -123,6 +137,12 @@ func DecodeShardKey(oid uint32, hint TypeHint, format int16, raw []byte) (any, e
 			return nil, fmt.Errorf("integer parameter %q: %w", s, err)
 		}
 		return i, nil
+	case oidUUID:
+		b, ok := placement.ParseUUID(s)
+		if !ok {
+			return nil, fmt.Errorf("uuid parameter %q is not a uuid", s)
+		}
+		return b, nil
 	case oidText, oidVarchar, oidName:
 		return s, nil
 	case oidBpchar:

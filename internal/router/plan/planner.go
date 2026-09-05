@@ -1674,6 +1674,8 @@ func castItem(item keyItem, tn *pgquerypb.TypeName) (keyItem, bool) {
 		hint = HintInt
 	case "text", "varchar", "name":
 		hint = HintText
+	case "uuid":
+		hint = HintUUID
 	case "bpchar", "char", "character":
 		// Routable now: the key's declared type reaches the planner, and
 		// normaliseKey trims the trailing spaces the ::text cast strips on
@@ -1692,8 +1694,8 @@ func castItem(item keyItem, tn *pgquerypb.TypeName) (keyItem, bool) {
 			return item, true
 		}
 	case string:
-		if hint == HintText {
-			item.hint = HintText
+		if hint == HintText || hint == HintUUID {
+			item.hint = hint
 			return item, true
 		}
 		if i, err := parseInt(strings.TrimSpace(x)); err == nil {

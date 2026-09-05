@@ -178,6 +178,9 @@ const (
 	HintInt
 	// HintText means the parameter was cast to a text type.
 	HintText
+	// HintUUID means the parameter was cast to uuid, which is hashed over
+	// its sixteen bytes and not over its text.
+	HintUUID
 )
 
 // Params supplies bind-parameter values ($1 is index 1) to Resolve.
