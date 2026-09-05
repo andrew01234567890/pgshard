@@ -47,8 +47,16 @@ type Copier struct {
 	// workflow with a clear message.
 	Schema SchemaMaterializer
 	// SourceConnInfo renders the libpq connection string a target uses to
-	// subscribe to one database of a source.
+	// subscribe to one database of a source. It carries no password: the
+	// same string is handed to a member's agent for a schema copy, where it
+	// would become a pg_dump argument.
 	SourceConnInfo func(ctx context.Context, source ShardRef, database string) (string, error)
+	// SubscriptionPassword is spliced into SourceConnInfo when a CREATE
+	// SUBSCRIPTION is rendered, and only then: PostgreSQL on the target
+	// opens that connection, so it is the one place the secret has to
+	// travel in. Empty leaves the conninfo alone, which is what a DSN that
+	// already carries its own credentials wants.
+	SubscriptionPassword string
 	// Resolver finishes in-doubt two-phase commits that block slot
 	// creation; nil means wait without driving.
 	Resolver *Resolver
@@ -954,6 +962,9 @@ func (c *Copier) subscribeOn(ctx context.Context, wf *copyWorkflow, conn ShardCo
 		wf.copy.BlockedBy, wf.copy.BlockedSince = "", nil
 		conninfo, err := c.SourceConnInfo(ctx, ShardRef{Set: srcSet, ID: s}, db.name)
 		if err != nil {
+			return err
+		}
+		if conninfo, err = WithPassword(conninfo, c.SubscriptionPassword); err != nil {
 			return err
 		}
 		cctx, cancel := context.WithTimeout(ctx, createSubscriptionTimeout)

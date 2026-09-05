@@ -35,8 +35,10 @@ func (s *Server) MaterializeSchema(ctx context.Context, req *pgshardv1.Materiali
 }
 
 // MaterializeSchema runs pg_dump --schema-only on source and pipes it into
-// psql against the local database. The source password must be resolvable
-// through the conninfo or the agent's pgpass file.
+// psql against the local database. The source conninfo must carry no
+// password: it becomes a pg_dump argument, and argv is readable through
+// /proc by anything on the node. The password comes from the agent's pgpass
+// file, which every child inherits through PGPASSFILE.
 func (in *Instance) MaterializeSchema(ctx context.Context, source, database string) error {
 	if err := catalog.CheckDatabaseName(database); err != nil {
 		return fmt.Errorf("invalid database name %q", database)
