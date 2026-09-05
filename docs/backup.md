@@ -229,13 +229,19 @@ Phases: `Pending` (waiting for every group to have a ready primary, or for
 another backup of the same cluster to finish: pgBackRest holds one backup
 lock per stanza),
 `Running`, `Completed`, `Failed`. The operator calls `Agent.Backup` on the
-catalog primary and then each shard primary in order; a failing group stops
-the run. `status.groups[]` carries per group the stanza, backup label, start
-and stop LSN, first and last WAL segment, database and repository sizes,
-timings and error; `status.backupId` is the catalog label once every group
-completed. `pgbackrest expire` runs on every group after its backup; a
-retention failure is reported in the `RetentionApplied` condition without
-failing the backup. An operator restart during a run fails the object with an
+catalog primary and then each shard primary in order. **A failing group fails
+the run, not the groups after it**: each group has its own stanza and its own
+repository, so one failing says nothing about the next, and the run's
+`status.error` names every group that failed. `status.groups[]` carries per
+group the stanza, backup label, start and stop LSN, first and last WAL
+segment, database and repository sizes, timings and error; `status.backupId`
+is the catalog label once every group completed. `pgbackrest expire` runs on
+every group after **every** backup, and only when all of them succeeded —
+expiring on a group whose backup landed can retire the set a group that
+failed still depends on, so a run with any failure reports
+`RetentionApplied=False` with reason `RunIncomplete` and applies no
+retention. A retention failure of its own is reported in the same condition
+(reason `ExpireFailed`) without failing the backup. An operator restart during a run fails the object with an
 explicit message; create a new one.
 
 ## Local object stores

@@ -47,6 +47,9 @@ type backupRun struct {
 	groups []pgshardv1alpha1.GroupBackupStatus
 	// expireErr collects retention failures; they do not fail the backup.
 	expireErr error
+	// expireSkipped marks a run that did not reach retention because a
+	// group failed or the run was cancelled.
+	expireSkipped bool
 	// cancel ends the worker. A backup whose record is deleted has nothing
 	// left to report to, and it holds an agent and a repository for as long
 	// as it runs -- long enough for a replacement to start against the same
@@ -331,16 +334,29 @@ func (r *BackupReconciler) start(ctx context.Context, b *pgshardv1alpha1.PgShard
 		defer close(run.done)
 		defer cancel()
 		runCtx := withClusterAgentToken(runCtx, r.Client, c.Namespace, c.Name)
+		failed := false
 		for _, t := range targets {
+			// A cancelled run has nothing left to try; a failed GROUP does.
+			if runCtx.Err() != nil {
+				break
+			}
 			st := pgshardv1alpha1.GroupBackupStatus{Group: t.group.Name(), Stanza: t.stanza, StartedAt: ptrTime(r.now())}
 			res, err := r.Agents.Backup(runCtx, t.addr, typ)
 			st.CompletedAt = ptrTime(r.now())
 			st.Duration = st.CompletedAt.Sub(st.StartedAt.Time).Round(time.Second).String()
 			if err != nil {
+				// Every other group is still attempted. Each has its own
+				// stanza and its own repository, so one group's failure
+				// says nothing about the next -- and abandoning the run
+				// left every group after the failure with whatever backup
+				// it had from the previous run, which is exactly the
+				// recovery-point window a backup is taken to close.
 				st.Error = err.Error()
-				log.Error(err, "group backup failed", "group", t.group.Name(), "log", strings.Join(res.Log, "\n"))
+				failed = true
+				log.Error(err, "group backup failed; continuing with the remaining groups",
+					"group", t.group.Name(), "log", strings.Join(res.Log, "\n"))
 				run.groups = append(run.groups, st)
-				return
+				continue
 			}
 			st.BackupID = res.Label
 			st.StartLSN = formatLSN(res.StartLSN)
@@ -352,11 +368,16 @@ func (r *BackupReconciler) start(ctx context.Context, b *pgshardv1alpha1.PgShard
 			run.groups = append(run.groups, st)
 			log.Info("group backup completed", "group", t.group.Name(), "label", res.Label)
 		}
-		// Only now: a group that expires as soon as its own backup lands
-		// can retire the set the last complete cluster backup depends on
-		// while a later group is still running, and a failure there leaves
-		// nothing restorable cluster-wide. The loop returns on the first
-		// failure, so reaching here means every group has a new backup.
+		// Only now, and only if every group succeeded: a group that
+		// expires as soon as its own backup lands can retire the set the
+		// last complete cluster backup depends on while a later group is
+		// still running, and a failure there leaves nothing restorable
+		// cluster-wide. Retention is what the early return used to buy,
+		// and it is the one thing that must still wait for the whole run.
+		if failed || runCtx.Err() != nil {
+			run.expireSkipped = true
+			return
+		}
 		for _, t := range targets {
 			if err := r.Agents.Expire(runCtx, t.addr); err != nil {
 				run.expireErr = errors.Join(run.expireErr, fmt.Errorf("group %s: %w", t.group.Name(), err))
@@ -372,11 +393,18 @@ func (r *BackupReconciler) finish(ctx context.Context, b *pgshardv1alpha1.PgShar
 	b.Status.CompletedAt = ptrTime(r.now())
 	b.Status.Phase = pgshardv1alpha1.BackupPhaseCompleted
 	b.Status.Error = ""
+	// Every failed group, not the last one seen: a run now continues past a
+	// failure, so naming one hides the others from whoever has to decide
+	// what is restorable.
+	var failures []string
 	for _, g := range run.groups {
 		if g.Error != "" {
-			b.Status.Phase = pgshardv1alpha1.BackupPhaseFailed
-			b.Status.Error = fmt.Sprintf("group %s: %s", g.Group, g.Error)
+			failures = append(failures, fmt.Sprintf("group %s: %s", g.Group, g.Error))
 		}
+	}
+	if len(failures) > 0 {
+		b.Status.Phase = pgshardv1alpha1.BackupPhaseFailed
+		b.Status.Error = strings.Join(failures, "; ")
 	}
 	if b.Status.Phase == pgshardv1alpha1.BackupPhaseCompleted && len(run.groups) > 0 {
 		b.Status.BackupID = run.groups[0].BackupID
@@ -384,7 +412,12 @@ func (r *BackupReconciler) finish(ctx context.Context, b *pgshardv1alpha1.PgShar
 	meta.SetStatusCondition(&b.Status.Conditions, metav1.Condition{Type: "Progressing", Status: metav1.ConditionFalse, Reason: b.Status.Phase,
 		Message: firstNonEmpty(b.Status.Error, "all groups backed up"), ObservedGeneration: b.Generation})
 	retention := metav1.Condition{Type: ConditionRetentionApplied, Status: metav1.ConditionTrue, Reason: "Expired", Message: "pgbackrest expire ran on every group", ObservedGeneration: b.Generation}
-	if run.expireErr != nil {
+	switch {
+	case run.expireSkipped:
+		retention.Status = metav1.ConditionFalse
+		retention.Reason = "RunIncomplete"
+		retention.Message = "retention was not applied: expiring on a group whose backup landed can retire the set a group that failed still depends on"
+	case run.expireErr != nil:
 		retention.Status = metav1.ConditionFalse
 		retention.Reason = "ExpireFailed"
 		retention.Message = run.expireErr.Error()
