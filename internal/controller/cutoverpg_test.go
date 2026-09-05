@@ -65,12 +65,17 @@ func (r *slotRows) Values() ([]any, error) { return []any{r.names[r.i-1], r.vals
 func (r *slotRows) RawValues() [][]byte    { return nil }
 func (r *slotRows) Conn() *pgx.Conn        { return nil }
 
+// testCutover carries TWO databases, because the slots are per-database and
+// a fixture with one cannot tell a per-database expectation from a
+// per-target one -- which is the confusion that let the second database's
+// subscriptions be skipped.
 func testCutover(d *slotDialer) *pgCutover {
 	return &pgCutover{
 		c:      &Copier{Shards: d},
 		wf:     &copyWorkflow{gen: 5, set: "g2", ids: []int32{0, 1}},
 		srcSet: "default",
 		srcIDs: []int32{0, 1},
+		dbs:    []dbPlan{{name: "app"}, {name: "reports"}},
 	}
 }
 
@@ -83,16 +88,17 @@ func TestCaughtUpRequiresEveryForwardSlot(t *testing.T) {
 	ctx := context.Background()
 	positions := map[string]int64{"0": 100, "1": 100}
 	full := func() map[string]map[string]int64 {
-		return map[string]map[string]int64{
-			slotShardKey("default", 0): {
-				SubscriptionName(5, 0, 0): 150,
-				SubscriptionName(5, 1, 0): 150,
-			},
-			slotShardKey("default", 1): {
-				SubscriptionName(5, 0, 1): 150,
-				SubscriptionName(5, 1, 1): 150,
-			},
+		out := map[string]map[string]int64{}
+		for _, src := range []int32{0, 1} {
+			m := map[string]int64{}
+			for _, db := range []string{"app", "reports"} {
+				for _, tgt := range []int32{0, 1} {
+					m[SlotName(5, tgt, src, db)] = 150
+				}
+			}
+			out[slotShardKey("default", src)] = m
 		}
+		return out
 	}
 
 	o := testCutover(&slotDialer{slots: full()})
@@ -101,9 +107,9 @@ func TestCaughtUpRequiresEveryForwardSlot(t *testing.T) {
 	}
 
 	vanished := full()
-	delete(vanished[slotShardKey("default", 1)], SubscriptionName(5, 1, 1))
+	delete(vanished[slotShardKey("default", 1)], SlotName(5, 1, 1, "reports"))
 	o = testCutover(&slotDialer{slots: vanished})
-	if ok, why, _ := o.CaughtUp(ctx, positions); ok || !strings.Contains(why, SubscriptionName(5, 1, 1)) || !strings.Contains(why, "missing") {
+	if ok, why, _ := o.CaughtUp(ctx, positions); ok || !strings.Contains(why, SlotName(5, 1, 1, "reports")) || !strings.Contains(why, "missing") {
 		t.Fatalf("a vanished forward slot must block the flip: %v %q", ok, why)
 	}
 
@@ -113,7 +119,7 @@ func TestCaughtUpRequiresEveryForwardSlot(t *testing.T) {
 	}
 
 	unconfirmed := full()
-	unconfirmed[slotShardKey("default", 0)][SubscriptionName(5, 0, 0)] = -1
+	unconfirmed[slotShardKey("default", 0)][SlotName(5, 0, 0, "app")] = -1
 	o = testCutover(&slotDialer{slots: unconfirmed})
 	if ok, why, _ := o.CaughtUp(ctx, positions); ok || !strings.Contains(why, "no confirmed flush position") {
 		t.Fatalf("a NULL confirmed_flush_lsn must block the flip: %v %q", ok, why)
@@ -128,16 +134,17 @@ func TestReverseBehindRequiresEveryReverseSlot(t *testing.T) {
 	ctx := context.Background()
 	positions := map[int32]int64{0: 100, 1: 100}
 	full := func() map[string]map[string]int64 {
-		return map[string]map[string]int64{
-			slotShardKey("g2", 0): {
-				ReverseSubscriptionName(5, 0, 0): 150,
-				ReverseSubscriptionName(5, 1, 0): 150,
-			},
-			slotShardKey("g2", 1): {
-				ReverseSubscriptionName(5, 0, 1): 150,
-				ReverseSubscriptionName(5, 1, 1): 150,
-			},
+		out := map[string]map[string]int64{}
+		for _, tgt := range []int32{0, 1} {
+			m := map[string]int64{}
+			for _, db := range []string{"app", "reports"} {
+				for _, src := range []int32{0, 1} {
+					m[ReverseSlotName(5, src, tgt, db)] = 150
+				}
+			}
+			out[slotShardKey("g2", tgt)] = m
 		}
+		return out
 	}
 
 	o := testCutover(&slotDialer{slots: full()})
@@ -146,15 +153,15 @@ func TestReverseBehindRequiresEveryReverseSlot(t *testing.T) {
 	}
 
 	vanished := full()
-	delete(vanished[slotShardKey("g2", 0)], ReverseSubscriptionName(5, 1, 0))
+	delete(vanished[slotShardKey("g2", 0)], ReverseSlotName(5, 1, 0, "reports"))
 	o = testCutover(&slotDialer{slots: vanished})
 	behind, err := o.reverseBehind(ctx, positions)
-	if err != nil || len(behind) != 1 || !strings.Contains(behind[0], ReverseSubscriptionName(5, 1, 0)) || !strings.Contains(behind[0], "missing") {
+	if err != nil || len(behind) != 1 || !strings.Contains(behind[0], ReverseSlotName(5, 1, 0, "reports")) || !strings.Contains(behind[0], "missing") {
 		t.Fatalf("a vanished reverse slot must block the flip back: %v %v", behind, err)
 	}
 
 	o = testCutover(&slotDialer{slots: map[string]map[string]int64{}})
-	if behind, err := o.reverseBehind(ctx, positions); err != nil || len(behind) != 4 {
+	if behind, err := o.reverseBehind(ctx, positions); err != nil || len(behind) != 8 {
 		t.Fatalf("an empty reverse listing must report every expected slot behind: %v %v", behind, err)
 	}
 }

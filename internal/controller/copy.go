@@ -921,7 +921,13 @@ func (c *Copier) ensureSubscriptions(ctx context.Context, wf *copyWorkflow, srcS
 }
 
 func (c *Copier) subscribeOn(ctx context.Context, wf *copyWorkflow, conn ShardConn, srcSet string, srcIDs []int32, db dbPlan, t int32) error {
-	rows, err := conn.Query(ctx, `SELECT subname FROM pg_subscription WHERE subname LIKE $1`, fmt.Sprintf("pgshard\\_reshard\\_g%d\\_t%d\\_%%", wf.gen, t))
+	// subdbid, because pg_subscription is SHARED: without it the first
+	// database's subscriptions were visible from the second, which then
+	// took its own as already made and copied none of its rows. A cluster
+	// with one database never noticed.
+	rows, err := conn.Query(ctx, `SELECT subname FROM pg_subscription
+		 WHERE subname LIKE $1 AND subdbid = (SELECT oid FROM pg_database WHERE datname = current_database())`,
+		fmt.Sprintf("pgshard\\_reshard\\_g%d\\_t%d\\_%%", wf.gen, t))
 	if err != nil {
 		return err
 	}
@@ -951,7 +957,8 @@ func (c *Copier) subscribeOn(ctx context.Context, wf *copyWorkflow, conn ShardCo
 			return err
 		}
 		cctx, cancel := context.WithTimeout(ctx, createSubscriptionTimeout)
-		_, err = conn.Exec(cctx, CreateSubscriptionSQL(name, conninfo, c.publicationsFor(wf, db, t, s), SubscriptionOptions{Slot: name, Failover: !c.SlotFailoverDisabled}))
+		_, err = conn.Exec(cctx, CreateSubscriptionSQL(name, conninfo, c.publicationsFor(wf, db, t, s),
+			SubscriptionOptions{Slot: SlotName(wf.gen, t, s, db.name), Failover: !c.SlotFailoverDisabled}))
 		cancel()
 		if err != nil {
 			return err
