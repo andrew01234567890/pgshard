@@ -302,13 +302,21 @@ func (o *pgCutover) CaughtUp(ctx context.Context, positions map[string]int64) (b
 			continue
 		}
 		flushed, err := slotFlushPositions(ctx, o.c.Shards, o.srcSet, s,
-			fmt.Sprintf("pgshard\\_reshard\\_g%d\\_t%%\\_s%d", o.wf.gen, s))
+			// The trailing %% is load-bearing: a slot name now carries a
+			// database suffix, and a pattern ending at _s<id> matches
+			// nothing at all, so every slot read as missing.
+			fmt.Sprintf("pgshard\\_reshard\\_g%d\\_t%%\\_s%d\\_%%", o.wf.gen, s))
 		if err != nil {
 			return false, "", err
 		}
-		expected := make([]string, 0, len(o.wf.ids))
-		for _, t := range o.wf.ids {
-			expected = append(expected, SubscriptionName(o.wf.gen, t, s))
+		// One slot per (database, target): the slots are per-database now,
+		// so expecting only the per-target names would look for slots that
+		// do not exist and miss every database but one.
+		expected := make([]string, 0, len(o.wf.ids)*len(o.dbs))
+		for _, db := range o.dbs {
+			for _, t := range o.wf.ids {
+				expected = append(expected, SlotName(o.wf.gen, t, s, db.name))
+			}
 		}
 		behind = append(behind, slotsBehind(expected, flushed, want, fmt.Sprintf("%s/%d", o.srcSet, s))...)
 	}
@@ -925,7 +933,9 @@ func (o *pgCutover) reversePublishOn(ctx context.Context, conn ShardConn, db dbP
 }
 
 func (o *pgCutover) reverseSubscribeOn(ctx context.Context, conn ShardConn, db dbPlan, s, homeTarget int32) error {
-	rows, err := conn.Query(ctx, `SELECT subname FROM pg_subscription WHERE subname LIKE $1`, o.reversePattern(s))
+	rows, err := conn.Query(ctx, `SELECT subname FROM pg_subscription
+		 WHERE subname LIKE $1 AND subdbid = (SELECT oid FROM pg_database WHERE datname = current_database())`,
+		o.reversePattern(s))
 	if err != nil {
 		return err
 	}
@@ -951,7 +961,8 @@ func (o *pgCutover) reverseSubscribeOn(ctx context.Context, conn ShardConn, db d
 			return err
 		}
 		cctx, cancel := context.WithTimeout(ctx, createSubscriptionTimeout)
-		_, err = conn.Exec(cctx, CreateReverseSubscriptionSQL(name, conninfo, pubs, SubscriptionOptions{Slot: name, Failover: !o.c.SlotFailoverDisabled}))
+		_, err = conn.Exec(cctx, CreateReverseSubscriptionSQL(name, conninfo, pubs,
+			SubscriptionOptions{Slot: ReverseSlotName(o.wf.gen, s, t, db.name), Failover: !o.c.SlotFailoverDisabled}))
 		cancel()
 		if err != nil {
 			return err

@@ -443,13 +443,17 @@ func (o *pgCutover) reverseBehind(ctx context.Context, positions map[int32]int64
 	var behind []string
 	for _, t := range o.wf.ids {
 		flushed, err := slotFlushPositions(ctx, o.c.Shards, o.wf.set, t,
-			fmt.Sprintf("pgshard\\_reshard\\_g%d\\_rev\\_s%%\\_t%d", o.wf.gen, t))
+			fmt.Sprintf("pgshard\\_reshard\\_g%d\\_rev\\_s%%\\_t%d\\_%%", o.wf.gen, t))
 		if err != nil {
 			return nil, err
 		}
-		expected := make([]string, 0, len(o.srcIDs))
-		for _, s := range o.srcIDs {
-			expected = append(expected, ReverseSubscriptionName(o.wf.gen, s, t))
+		// One slot per (database, source), for the same reason CaughtUp
+		// enumerates per database: the reverse slots are per-database too.
+		expected := make([]string, 0, len(o.srcIDs)*len(o.dbs))
+		for _, db := range o.dbs {
+			for _, s := range o.srcIDs {
+				expected = append(expected, ReverseSlotName(o.wf.gen, s, t, db.name))
+			}
 		}
 		behind = append(behind, slotsBehind(expected, flushed, positions[t], fmt.Sprintf("%s/%d", o.wf.set, t))...)
 	}

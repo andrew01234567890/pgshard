@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"sort"
@@ -35,6 +37,36 @@ func HomePublicationName(generation int64) string {
 // one (target, source) pair in one database.
 func SubscriptionName(generation int64, target, source int32) string {
 	return fmt.Sprintf("pgshard_reshard_g%d_t%d_s%d", generation, target, source)
+}
+
+// SlotName names the SOURCE slot a subscription creates, which is not the
+// same namespace as the subscription itself.
+//
+// pg_subscription is a SHARED catalog but its unique index is per database,
+// so two databases may each hold a subscription called
+// pgshard_reshard_g5_t0_s0. A REPLICATION SLOT is cluster-wide: the second
+// CREATE SUBSCRIPTION asking the source for that slot fails with
+// "replication slot ... already exists". Verified on 18: creating dup_slot
+// from a second database is refused, while a same-named subscription is not.
+//
+// The database is a hash rather than its name because a slot name is capped
+// at 63 characters and a database name may itself use all of them. Neither
+// side needs to read it: pg_replication_slots.database already says which
+// database a slot decodes, and pg_subscription.subdbid says which database
+// holds the subscription.
+func SlotName(generation int64, target, source int32, database string) string {
+	return SubscriptionName(generation, target, source) + "_d" + databaseTag(database)
+}
+
+// ReverseSlotName is SlotName for the reverse direction, whose slots live on
+// the targets.
+func ReverseSlotName(generation int64, source, target int32, database string) string {
+	return ReverseSubscriptionName(generation, source, target) + "_d" + databaseTag(database)
+}
+
+func databaseTag(database string) string {
+	sum := sha256.Sum256([]byte(database))
+	return hex.EncodeToString(sum[:])[:12]
 }
 
 // KeyHashExpr renders the PostgreSQL expression that hashes column col of
