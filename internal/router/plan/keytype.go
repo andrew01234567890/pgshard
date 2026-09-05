@@ -3,6 +3,8 @@ package plan
 import (
 	"strconv"
 	"strings"
+
+	"github.com/andrew01234567890/pgshard/internal/placement"
 )
 
 // normaliseKey applies the normalisation the shard key column's own type
@@ -25,6 +27,23 @@ func normaliseKey(v any, columnType string) any {
 		return v
 	}
 	base, n, hasLimit := parseCharType(columnType)
+	// A uuid column is hashed by uuid_hash_extended over its SIXTEEN RAW
+	// BYTES -- which is what every row filter, copy and re-key the
+	// controller builds uses. Left as a string it reached HashTextExtended
+	// over the 36 characters instead, so the router placed and found rows at
+	// one keyspace position while the copy moved them to another: after a
+	// reshard the row existed and the router looked on a different shard.
+	// Measured on four shards, three of four sample uuids landed elsewhere.
+	//
+	// A value that does not parse is left alone: PostgreSQL will reject the
+	// statement for invalid uuid syntax, so where it routed first does not
+	// matter.
+	if base == "uuid" {
+		if u, ok := placement.ParseUUID(s); ok {
+			return u
+		}
+		return v
+	}
 	// character(n) is stored blank-padded and compares with its trailing
 	// spaces ignored, and the ::text cast the row filter and the copy use
 	// strips them. Trimming here is what makes the router hash the value

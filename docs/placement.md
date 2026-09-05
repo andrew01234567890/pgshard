@@ -30,6 +30,17 @@ the same value land on the same shard. Numeric and floating-point shard keys
 are refused: their PostgreSQL hash depends on the internal representation and
 is not ported yet.
 
+A **uuid** key reaches `[16]byte` through `placement.ParseUUID`, a port of
+PostgreSQL's `string_to_uuid`, because a client writes a uuid as text and the
+copy filter hashes the sixteen bytes. The port matters for what it ACCEPTS as
+much as for what it produces: PostgreSQL takes optional braces, omits hyphens
+entirely, and allows a hyphen after any even number of bytes rather than only
+the four canonical positions, so a stricter parser would refuse values a shard
+stores. Until this existed the router hashed the 36 characters with
+`hashtextextended`, which put the router's idea of a row's shard and the
+copy's in different places — measured on four shards, three of four sample
+uuids landed elsewhere.
+
 Verified goldens on PostgreSQL 18:
 
 ```
