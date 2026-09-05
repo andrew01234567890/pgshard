@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"github.com/jackc/pgx/v5"
 	"strings"
 	"testing"
 
@@ -39,20 +40,41 @@ func TestRunUnreachableCatalogIsNotReady(t *testing.T) {
 	}
 }
 
+// TestShardConnInfo checks what the conninfo MEANS rather than how it is
+// spelled. It used to pin the exact reconstructed string, which is what made
+// the reconstruction look deliberate: every option the rebuild did not know
+// about -- sslmode, sslrootcert, sslcert, sslkey -- was silently dropped and
+// the assertion still passed.
 func TestShardConnInfo(t *testing.T) {
 	ctx := context.Background()
 	ref := controller.ShardRef{Set: "default", ID: 1}
 	explicit := shardDSNFlag{ref: "postgres://postgres:p%27w@10.0.0.5:5433/postgres?sslmode=disable"}
 	got, err := shardConnInfo(ctx, nil, explicit, "", ref, "app")
-	if err != nil || got != "host='10.0.0.5' port=5433 user='postgres' dbname='app' password='p\\'w' sslmode=disable" {
-		t.Fatalf("explicit DSN: %q %v", got, err)
+	if err != nil {
+		t.Fatalf("explicit DSN: %v", err)
+	}
+	cfg, err := pgx.ParseConfig(got)
+	if err != nil {
+		t.Fatalf("explicit DSN: %q does not parse: %v", got, err)
+	}
+	if cfg.Host != "10.0.0.5" || cfg.Port != 5433 || cfg.User != "postgres" || cfg.Database != "app" || cfg.Password != "p'w" {
+		t.Fatalf("explicit DSN: host=%s port=%d user=%s db=%s password=%q", cfg.Host, cfg.Port, cfg.User, cfg.Database, cfg.Password)
+	}
+	if cfg.TLSConfig != nil {
+		t.Fatalf("sslmode=disable did not survive: %q", got)
 	}
 	if _, err := shardConnInfo(ctx, nil, nil, "", ref, "app"); err == nil {
 		t.Fatal("no DSN and no template must fail")
 	}
 	got, err = controller.ConnInfo("host=h port=5432 user=u sslmode=disable", "db")
-	if err != nil || got != "host='h' port=5432 user='u' dbname='db' sslmode=disable" {
-		t.Fatalf("ConnInfo: %q %v", got, err)
+	if err != nil {
+		t.Fatalf("ConnInfo: %v", err)
+	}
+	if cfg, err = pgx.ParseConfig(got); err != nil {
+		t.Fatalf("ConnInfo: %q does not parse: %v", got, err)
+	}
+	if cfg.Host != "h" || cfg.Port != 5432 || cfg.User != "u" || cfg.Database != "db" || cfg.TLSConfig != nil {
+		t.Fatalf("ConnInfo: %q", got)
 	}
 	if _, err := controller.ConnInfo("postgres://[bad", "db"); err == nil {
 		t.Fatal("unparsable DSN must fail")
