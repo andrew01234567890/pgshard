@@ -26,6 +26,18 @@ added before the mirror workflow ran -- goes to Docker Hub exactly as
 before. `hack/ci/test-mirror-args.sh` checks every override names a `FROM`
 that exists and redirects it to the same digest, because buildx accepts an
 override that matches nothing and silently ignores it.
+
+The mirror tag ends in the first twelve characters of the digest
+(`golang-1.27-bookworm-ded31c68586d`), so **one name:tag at two digests is
+two mirror tags**. That happens routinely rather than exceptionally:
+dependabot raises one pull request per directory, so a `golang` bump reaches
+`Dockerfile.control` and `Dockerfile.router` in one and `postgres/Dockerfile`
+in another, and between them the tree pins the same tag at both digests. A
+tag derived from the name alone made those collide, `hack/ci/base-images.sh`
+reported *two images share a mirror tag*, and neither pull request could
+merge -- each was blocked by the state only the other could clear. Consumers
+reference the mirror by digest, so the tag is a label rather than an address
+and lengthening it changes nothing else.
 | `dependency-review.yml`, `dependabot-automerge.yml` | dependency hygiene |
 
 ## Container images on GHCR (one-time bootstrap)
