@@ -40,4 +40,33 @@ if printf '%s\n' "${out[@]}" | grep -q 'kindest/'; then
   exit 1
 fi
 
-echo "mirror-args: OK ($(( ${#out[@]} / 2 )) override(s))"
+# An override for a digest the mirror does not have fails the build; it does
+# not fall back. So the presence filter is the fallback, and it has to hold
+# for the case that matters: a base-image bump, whose new digest the mirror
+# has never seen because the mirror is filled on push to main.
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+: > "$tmp/none"
+mapfile -t filtered < <(PGSHARD_MIRROR_PRESENT="$tmp/none" hack/ci/mirror-args.sh)
+[ "${#filtered[@]}" -eq 0 ] || {
+  echo "mirror-args: an empty mirror still produced ${#filtered[@]} line(s); the build would resolve a digest that is not there"
+  exit 1
+}
+
+# One digest present, the rest absent: exactly that one is overridden.
+one="${out[1]%%=*}"
+one="${one#*@}"
+printf '%s\n' "$one" > "$tmp/one"
+mapfile -t filtered < <(PGSHARD_MIRROR_PRESENT="$tmp/one" hack/ci/mirror-args.sh)
+[ "${#filtered[@]}" -eq 2 ] || { echo "mirror-args: expected 1 override for a mirror holding 1 digest, got $(( ${#filtered[@]} / 2 ))"; exit 1; }
+[ "${filtered[1]}" = "${out[1]}" ] || { echo "mirror-args: filtered to ${filtered[1]}, wanted ${out[1]}"; exit 1; }
+
+# A file that is named but missing is a wiring mistake, and silently emitting
+# every override would put the build back in the state this prevents.
+if PGSHARD_MIRROR_PRESENT="$tmp/absent" hack/ci/mirror-args.sh >/dev/null 2>&1; then
+  echo "mirror-args: a missing presence file was accepted"
+  exit 1
+fi
+
+echo "mirror-args: OK ($(( ${#out[@]} / 2 )) override(s), presence filter honoured)"
