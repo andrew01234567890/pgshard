@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -59,9 +60,11 @@ type RestorePointResult struct {
 type BarrierGroups interface {
 	// List returns every group: the catalog first, then the shards.
 	List(ctx context.Context) ([]GroupRef, error)
-	// PreparedCount counts the prepared transactions on g, whoever
-	// prepared them.
-	PreparedCount(ctx context.Context, g GroupRef) (int, error)
+	// PreparedGIDs lists the prepared transactions on g, whoever prepared
+	// them. The names are what the caller reports: the resolver finishes
+	// only the ones pgshard coordinated, so a drain that cannot converge is
+	// told apart from one that has not converged yet by the gids alone.
+	PreparedGIDs(ctx context.Context, g GroupRef) ([]string, error)
 	// CreateRestorePoint creates the named restore point on g's primary and
 	// forces the WAL segment holding it out to the archive.
 	CreateRestorePoint(ctx context.Context, g GroupRef, name string) (RestorePointResult, error)
@@ -630,6 +633,18 @@ func (b *Barrier) drain(ctx context.Context, name string, groups []GroupRef) err
 	}
 }
 
+// blockingGIDs names the transactions holding a drain up. A gid outside the
+// pgshard- namespace is the case worth naming: the resolver will not finish a
+// transaction it did not coordinate, so that drain fails every barrier until
+// somebody commits or rolls it back by hand.
+func blockingGIDs(gids []string) string {
+	const most = 5
+	if len(gids) > most {
+		return strings.Join(gids[:most], ", ") + fmt.Sprintf(", and %d more", len(gids)-most)
+	}
+	return strings.Join(gids, ", ")
+}
+
 // inFlight describes what still blocks the drain, "" when nothing does.
 func (b *Barrier) inFlight(ctx context.Context, groups []GroupRef) (string, error) {
 	n, err := b.Store.PreparingCount(ctx)
@@ -640,12 +655,12 @@ func (b *Barrier) inFlight(ctx context.Context, groups []GroupRef) (string, erro
 		return fmt.Sprintf("%d decision row(s) preparing", n), nil
 	}
 	for _, g := range groups {
-		c, err := b.Groups.PreparedCount(ctx, g)
+		gids, err := b.Groups.PreparedGIDs(ctx, g)
 		if err != nil {
 			return "", fmt.Errorf("%s: %w", g.Name, err)
 		}
-		if c > 0 {
-			return fmt.Sprintf("%d prepared transaction(s) on %s", c, g.Name), nil
+		if len(gids) > 0 {
+			return fmt.Sprintf("%d prepared transaction(s) on %s: %s", len(gids), g.Name, blockingGIDs(gids)), nil
 		}
 	}
 	return "", nil
@@ -987,7 +1002,7 @@ func scalar[T any](ctx context.Context, c groupConn, sql string, args ...any) (T
 	return pgx.CollectExactlyOneRow(rows, pgx.RowTo[T])
 }
 
-// PreparedCount implements BarrierGroups. Every prepared transaction
+// PreparedGIDs implements BarrierGroups. Every prepared transaction
 // counts, not only the ones pgshard coordinated: after PREPARE a backend
 // holds no transaction id, and COMMIT PREPARED is transaction control,
 // which PostgreSQL allows under a read-only default. So a two-phase
@@ -997,13 +1012,17 @@ func scalar[T any](ctx context.Context, c groupConn, sql string, args ...any) (T
 //
 // The resolver keeps its own filter: finishing a transaction it did not
 // coordinate is a decision it has no right to make.
-func (s *SQLBarrierGroups) PreparedCount(ctx context.Context, g GroupRef) (int, error) {
-	var n int
-	err := s.with(ctx, g, func(c groupConn) (err error) {
-		n, err = scalar[int](ctx, c, `SELECT count(*)::int FROM pg_prepared_xacts`)
+func (s *SQLBarrierGroups) PreparedGIDs(ctx context.Context, g GroupRef) ([]string, error) {
+	var gids []string
+	err := s.with(ctx, g, func(c groupConn) error {
+		rows, err := c.Query(ctx, `SELECT gid FROM pg_prepared_xacts ORDER BY prepared, gid`)
+		if err != nil {
+			return err
+		}
+		gids, err = pgx.CollectRows(rows, pgx.RowTo[string])
 		return err
 	})
-	return n, err
+	return gids, err
 }
 
 // CreateRestorePoint implements BarrierGroups.

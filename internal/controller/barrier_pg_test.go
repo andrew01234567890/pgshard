@@ -302,20 +302,20 @@ func TestDrainCountsAPreparedTransactionPgshardDidNotMake(t *testing.T) {
 	shard := connect(t, f.shardDSN(0))
 	mustExec(t, shard, `CREATE TABLE outsider (id int)`)
 
-	if n, err := groups.PreparedCount(ctx, g); err != nil || n != 0 {
-		t.Fatalf("idle shard prepared = %d %v", n, err)
+	if gids, err := groups.PreparedGIDs(ctx, g); err != nil || len(gids) != 0 {
+		t.Fatalf("idle shard prepared = %v %v", gids, err)
 	}
 	for _, sql := range []string{`BEGIN`, `INSERT INTO outsider VALUES (1)`, `PREPARE TRANSACTION 'someone-elses-2pc'`} {
 		mustExec(t, shard, sql)
 	}
 	t.Cleanup(func() { mustExec(t, shard, `ROLLBACK PREPARED 'someone-elses-2pc'`) })
 
-	n, err := groups.PreparedCount(ctx, g)
+	gids, err := groups.PreparedGIDs(ctx, g)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 1 {
-		t.Fatalf("prepared = %d, want the drain to see a transaction whatever prepared it", n)
+	if len(gids) != 1 || gids[0] != "someone-elses-2pc" {
+		t.Fatalf("prepared = %v, want the drain to see a transaction whatever prepared it, by name", gids)
 	}
 
 	// The resolver keeps its own filter: finishing a transaction it did not

@@ -46,6 +46,31 @@ SELECT gid, prepared, database FROM pg_prepared_xacts WHERE gid LIKE 'pgshard-%'
 
 Prepared transactions with gids not starting `pgshard-` are never touched.
 
+## A foreign prepared transaction fails every barrier
+
+A barrier's drain counts **every** prepared transaction on every group, not
+only the `pgshard-*` ones, because one pgshard did not coordinate can commit
+inside the window the fence is meant to have emptied
+([backup.md](../backup.md)). The resolver will not finish it, so the drain
+cannot converge on its own and every scheduled barrier fails after
+`--barrier-drain-timeout` with `BarrierHealthy` going False:
+
+```text
+barrier b: drain: still in flight after 30s: 1 prepared transaction(s) on shard1: someone-elses-2pc
+```
+
+The gids in that message are the whole diagnosis: one outside the `pgshard-`
+namespace is somebody's manual `PREPARE TRANSACTION` or an external tool's,
+and it has to be finished by hand on the shard that holds it, in the database
+it was prepared in:
+
+```sql
+SELECT gid, prepared, database, owner FROM pg_prepared_xacts;
+COMMIT PREPARED 'someone-elses-2pc';    -- or ROLLBACK PREPARED
+```
+
+Barriers resume on the next pass; nothing else has to be reset.
+
 ## Manual resolution — last resort only
 
 Only when the catalog's decision log is available and the resolver is
