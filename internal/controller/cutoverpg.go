@@ -1166,6 +1166,13 @@ func (o *pgCutover) PauseSources(ctx context.Context, pause bool) error {
 	return o.pauseSet(ctx, o.srcSet, o.srcIDs, pause)
 }
 
+// DrainSources waits out the writers the pause could not stop. The rollback
+// path has always done this; the forward swap did not, and the write it let
+// through was acknowledged on a source about to be retired.
+func (o *pgCutover) DrainSources(ctx context.Context) error {
+	return o.drainWriters(ctx, o.srcSet, o.srcIDs)
+}
+
 // pauseSet flips default_transaction_read_only on every primary of a set.
 func (o *pgCutover) pauseSet(ctx context.Context, set string, ids []int32, pause bool) error {
 	stmt := `ALTER SYSTEM RESET default_transaction_read_only`
