@@ -333,8 +333,15 @@ one bound cluster after another) runs `controller.Barrier`:
 1. raise `pgshard.shard_map_generation.write_fence` — routers hold new writes
    and two-phase commits (see [router.md](router.md#write-fence));
 2. drain: run a resolver pass and wait until no `xact_decisions` row is
-   `preparing` and no group holds a `pgshard-*` prepared transaction
-   (`--barrier-drain-timeout`, 30s);
+   `preparing` and no group holds **any** prepared transaction
+   (`--barrier-drain-timeout`, 30s). Every gid counts, not only `pgshard-*`
+   ones: a two-phase transaction pgshard did not coordinate can still commit
+   inside the window the fence is meant to have emptied, and land on one side
+   of a barrier the other shards know nothing about. The resolver keeps the
+   narrower filter — finishing a transaction it did not coordinate is not its
+   decision — so a foreign prepared transaction blocks every barrier until
+   somebody commits or rolls it back. The drain error names the gids holding
+   it up, which is how the two cases are told apart;
 3. `pg_create_restore_point('pgshard-<name>')` on the catalog and every shard
    primary (through the resolver's shard DSNs), followed by `pg_switch_wal()`,
    recording LSN, timeline and WAL segment;

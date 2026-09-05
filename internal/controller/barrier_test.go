@@ -175,6 +175,10 @@ func (s *fakeBarrierStore) FenceOwnedBy(_ context.Context, owner string) (bool, 
 type fakeGroups struct {
 	mu       sync.Mutex
 	prepared map[string]int
+	// preparedGIDs names the transactions a group holds; nil means they are
+	// generated from prepared, so a test that only cares about the count
+	// does not have to name them.
+	preparedGIDs map[string][]string
 	// clearPreparedAfter counts down per group on each read, so a test can
 	// hold a shard in flight for a number of polls rather than a duration.
 	clearPreparedAfter map[string]int
@@ -203,11 +207,11 @@ func (g *fakeGroups) List(context.Context) ([]GroupRef, error) {
 	return []GroupRef{{Name: CatalogGroup}, {Name: "shard0", Set: "default", ID: 0}, {Name: "shard1", Set: "default", ID: 1}}, nil
 }
 
-func (g *fakeGroups) PreparedCount(_ context.Context, ref GroupRef) (int, error) {
+func (g *fakeGroups) PreparedGIDs(_ context.Context, ref GroupRef) ([]string, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if err := g.fail["prepared:"+ref.Name]; err != nil {
-		return 0, err
+		return nil, err
 	}
 	*g.journal = append(*g.journal, fmt.Sprintf("prepared %s=%d", ref.Name, g.prepared[ref.Name]))
 	n := g.prepared[ref.Name]
@@ -217,7 +221,14 @@ func (g *fakeGroups) PreparedCount(_ context.Context, ref GroupRef) (int, error)
 			g.prepared[ref.Name] = 0
 		}
 	}
-	return n, nil
+	if names := g.preparedGIDs[ref.Name]; names != nil {
+		return names, nil
+	}
+	gids := make([]string, n)
+	for i := range gids {
+		gids[i] = fmt.Sprintf("pgshard-%s-%d", ref.Name, i)
+	}
+	return gids, nil
 }
 
 func (g *fakeGroups) CreateRestorePoint(_ context.Context, ref GroupRef, name string) (RestorePointResult, error) {
@@ -418,6 +429,14 @@ func TestBarrierFailuresReleaseTheFence(t *testing.T) {
 		{"drain timeout", func(f *barrierFixture) { f.store.preparing = 1 }, "drain: still in flight after 50ms: 1 decision row(s) preparing"},
 		{"prepared on a shard", func(f *barrierFixture) { f.groups.prepared["shard1"] = 3 }, "3 prepared transaction(s) on shard1"},
 		{"prepared count error", func(f *barrierFixture) { f.groups.fail["prepared:shard0"] = errors.New("shard0 down") }, "drain: shard0: shard0 down"},
+		// The resolver finishes only what pgshard coordinated, so a
+		// transaction somebody else prepared blocks every barrier until a
+		// human ends it. Naming it is the difference between a drain an
+		// operator can act on and one that just says "1".
+		{"a foreign prepared transaction is named", func(f *barrierFixture) {
+			f.groups.prepared["shard1"] = 1
+			f.groups.preparedGIDs = map[string][]string{"shard1": {"someone-elses-2pc"}}
+		}, "1 prepared transaction(s) on shard1: someone-elses-2pc"},
 		{"restore point error", func(f *barrierFixture) { f.groups.fail["restorepoint:shard1"] = errors.New("read only") }, "restore point on shard1: read only"},
 		{"archive error", func(f *barrierFixture) { f.groups.fail["archive:catalog"] = errors.New("archive_mode is off") }, "archive of catalog: archive_mode is off"},
 		{"archive timeout", func(f *barrierFixture) { f.groups.archiveAfter["shard0"] = 1 << 20 }, "archive of shard0: 000000010000000000000001 not archived after 50ms"},
