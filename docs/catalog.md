@@ -142,6 +142,15 @@ Migration `0004_status_notify` adds a statement-level trigger on
 `NOTIFY pgshard_serving` with the table name as payload, so routers learn of
 effective-map changes without polling.
 
+A notification costs its sender nothing and costs every router a full catalog
+load and every pooler a serving load, and `pg_notify()` is an ordinary
+function call rather than a statement the router can refuse. Reloads driven
+by notifications are therefore drawn from a budget: five immediately, then
+one per second. A real change still reloads every component at once -- a
+cutover flip is measured by how fast they do -- while a sender in a loop
+settles to one load per second per component. The periodic reload is not
+drawn from the budget.
+
 ## Router snapshots
 
 `internal/catalog/snapshot` gives the router an immutable view of the catalog.
