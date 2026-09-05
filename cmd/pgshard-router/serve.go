@@ -99,7 +99,8 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	serverVersion := fs.String("server-version", "18.6 (pgshard)", "value reported as the server_version parameter to clients")
 	maxStartupConns := fs.Int("max-startup-conns", 100, "concurrent connections allowed in the pre-authentication phase (refused with 53300 past the cap)")
 	maxSessions := fs.Int("max-sessions", router.DefaultMaxSessions, "authenticated sessions this router holds at once, whatever role they belong to (refused with 53300 past the cap; negative means no cap)")
-	maxMessageBody := fs.Int("max-message-body", pgwire.DefaultMaxMessageBodyLen, "largest frontend message body accepted, in bytes; the buffer is allocated from the message header before the body arrives")
+	maxMessageBody := fs.Int("max-message-body", pgwire.DefaultMaxMessageBodyLen, "largest frontend message body accepted, in bytes; the buffer is allocated from the message header before the body arrives, so this times --max-sessions is the heap a router must survive")
+	maxSessionsPerRole := fs.Int("max-sessions-per-role", 0, "sessions one role may hold when the role carries no connection_limit of its own (0 leaves it unlimited); bounds what one credential can commit of the memory above")
 	drain := fs.Duration("drain-timeout", 30*time.Second, "time to wait for open transactions and active queries on shutdown")
 	drainDelay := fs.Duration("drain-delay", 5*time.Second, "time between readiness turning false and closing the listener")
 	healthListen := fs.String("health-listen", "", "HTTP address for /readyz and /healthz (empty disables)")
@@ -256,6 +257,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		CatalogPhysicalDatabase: catalogPhysicalDatabase(*catalogDSN),
 		RoleLimits:              roles,
 		MaxSessions:             *maxSessions,
+		MaxSessionsPerRole:      *maxSessionsPerRole,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)

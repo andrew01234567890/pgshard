@@ -25,9 +25,16 @@ var ErrCopyFail = errors.New("pgwire: COPY failed by client")
 // backend: it never needs to hold a 1 GiB Bind or Query, and pgproto3
 // allocates the whole declared length before a single body byte arrives, so
 // the ceiling is what one authenticated session can make the router allocate
-// from a five-byte header. 64 MiB is far above any realistic Query, Bind or
-// CopyData chunk and three orders of magnitude below the old ceiling.
-const DefaultMaxMessageBodyLen = 64 << 20
+// from a five-byte header.
+//
+// It is the WHOLE budget that matters, and the budget is this times the
+// session cap: at 64 MiB two thousand sessions parked on a header they never
+// finish sending were 128 GiB of committed heap, which is the router pod and
+// every other tenant on it. 16 MiB covers a Query, a Bind carrying a large
+// value and any CopyData chunk (libpq sends about 64 KiB), and a deployment
+// that really does send a bigger single message raises --max-message-body
+// knowing what it multiplies by.
+const DefaultMaxMessageBodyLen = 16 << 20
 
 // preAuthMaxMessageBodyLen bounds a frontend message body before the client
 // has authenticated. The ceiling above is what one AUTHENTICATED session can

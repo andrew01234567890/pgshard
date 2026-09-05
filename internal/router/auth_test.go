@@ -441,3 +441,54 @@ func TestARefusedRoleIsLookedUpAgain(t *testing.T) {
 		t.Errorf("refusals must be rate-limited: %d catalog reads for five attempts", q.calls-before)
 	}
 }
+
+// TestTheDefaultPerRoleCapAppliesOnlyWhereTheRoleHasNone: a role's own
+// connection_limit is the cluster's answer and wins. The router-side default
+// exists for the roles that carry none (-1 in the catalog is the default),
+// because every authenticated session may declare a message body of
+// pgwire.DefaultMaxMessageBodyLen and one credential holding thousands of
+// them is the router's memory, and every other tenant's sessions with it.
+func TestTheDefaultPerRoleCapAppliesOnlyWhereTheRoleHasNone(t *testing.T) {
+	dial := func(t *testing.T, own int32, hasOwn bool) func() error {
+		fp := newFakePooler()
+		h := newHarnessWith(t, fp, startFakePooler(t, fp), func(cfg *Config) {
+			cfg.MaxSessionsPerRole = 1
+			cfg.RoleLimits = limiter(func(string) (int32, bool) { return own, hasOwn })
+		})
+		var open []*pgx.Conn
+		t.Cleanup(func() {
+			for _, c := range open {
+				_ = c.Close(context.Background())
+			}
+		})
+		return func() error {
+			c, err := pgx.Connect(context.Background(), h.dsn("app", "secret", "app"))
+			if err == nil {
+				open = append(open, c)
+			}
+			return err
+		}
+	}
+
+	t.Run("a role with no limit of its own falls back to the default", func(t *testing.T) {
+		connect := dial(t, 0, false)
+		if err := connect(); err != nil {
+			t.Fatalf("first session of a default cap of 1: %v", err)
+		}
+		if err := connect(); sqlstate(err) != "53300" {
+			t.Fatalf("second session past the default cap of 1: %v", err)
+		}
+	})
+
+	t.Run("a role with its own limit keeps it", func(t *testing.T) {
+		connect := dial(t, 2, true)
+		for i := range 2 {
+			if err := connect(); err != nil {
+				t.Fatalf("session %d of a role allowed 2: %v", i, err)
+			}
+		}
+		if err := connect(); sqlstate(err) != "53300" {
+			t.Fatalf("third session past the role's own limit of 2: %v", err)
+		}
+	})
+}

@@ -63,6 +63,14 @@ type Config struct {
 	// memory and took every tenant with it. Zero means DefaultMaxSessions;
 	// negative means no cap.
 	MaxSessions int
+	// MaxSessionsPerRole caps the sessions one role may hold when the role
+	// itself carries no connection limit, so a single credential cannot
+	// take the whole router and the memory that goes with it: every
+	// authenticated session may declare a message body up to
+	// pgwire.DefaultMaxMessageBodyLen, and that product is what a router
+	// pod has to survive. Zero leaves roles without a limit unlimited,
+	// which is what a single-tenant deployment wants.
+	MaxSessionsPerRole int
 	// RoleLimits reports a role's connection limit; nil leaves limits
 	// unenforced.
 	RoleLimits RoleLimiter
@@ -232,12 +240,19 @@ func (r *Router) maxSessions() int {
 	return r.cfg.MaxSessions
 }
 
-// limitFor is Config.RoleLimits, with nil meaning unlimited.
+// limitFor is the role's own connection limit, falling back to
+// MaxSessionsPerRole for a role that carries none. nil RoleLimits leaves
+// only the fallback.
 func (r *Router) limitFor(user string) (int32, bool) {
-	if r.cfg.RoleLimits == nil {
-		return 0, false
+	if r.cfg.RoleLimits != nil {
+		if limit, ok := r.cfg.RoleLimits.ConnectionLimit(user); ok {
+			return limit, true
+		}
 	}
-	return r.cfg.RoleLimits.ConnectionLimit(user)
+	if r.cfg.MaxSessionsPerRole > 0 {
+		return int32(r.cfg.MaxSessionsPerRole), true
+	}
+	return 0, false
 }
 
 func (r *Router) homeShard(database string) (Shard, error) {
