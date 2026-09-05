@@ -25,7 +25,8 @@ materialized:
 
 Controller-side (`upgradePreconditions`), checked before the copy starts:
 
-- Every extension present on the source must exist on the target major.
+- Every extension present on the source must exist on the target major, at a
+  version the target can carry (see below).
 - No large objects in any database: logical replication does not carry
   `pg_largeobject`, so those need the offline strategy.
 
@@ -84,6 +85,21 @@ clear message (controller) otherwise:
   available on only some target shards would install on those and fail on
   the others, which is the same outcome as missing, found after the target
   groups are provisioned;
+- **the target's default version can carry the source's.** `pg_dump` emits
+  `CREATE EXTENSION` with no version, so the restored schema gets the
+  *target's* default whatever the source had. That is accepted when the two
+  are equal, or when PostgreSQL declares an update path from the source's
+  version to the target's default (`pg_extension_update_paths`). Nothing here
+  compares the two version strings: `extversion` is opaque and PostgreSQL does
+  not order it — `1.11` sorts before `1.9` as text and after it as anybody
+  reading it means — which is precisely why update paths exist. Measured on
+  this project's own images, five of the 46 extensions PostgreSQL 18.6 offers
+  have a different default on 19beta3 (`btree_gin`, `btree_gist`,
+  `pg_buffercache`, `pg_stat_statements`, `postgres_fdw`), and PostgreSQL
+  declares a path for all five, so the ordinary upgrade passes;
+- target shards must **agree** on an extension's default version. One that
+  differs between them would restore a different schema per shard, so it is
+  refused under its own message rather than reported as missing;
 - no large objects (`pg_largeobject_metadata` must be empty): logical
   replication does not carry `pg_largeobject` — use the offline strategy.
 
