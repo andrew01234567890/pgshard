@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 # Router and pooler binaries for the local compose stack. The router links the
 # PostgreSQL parser through cgo, so the build stage needs a C toolchain and a glibc with strlcpy (Debian trixie or newer).
-FROM golang:1.27-trixie@sha256:ae28539d2ef595b9a2930dd7f031d9592376829dc0eae7cb869559f7d5812c3a AS build
+FROM golang:1.27-trixie@sha256:9baa6b4187bbb98d240372a8a235ac0bb6b5ddd52bba1431dc2f7c0705862728 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 # Retried: the module proxy answers a build with a stream error often
