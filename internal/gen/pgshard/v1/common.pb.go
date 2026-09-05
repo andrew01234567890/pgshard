@@ -34,6 +34,21 @@ const (
 	// A table is mid online-rewrite and its column list is not published;
 	// the caller should wait rather than treat it as a fault.
 	Reason_REASON_REWRITE_IN_PROGRESS Reason = 2
+	// The error came from the PostgreSQL backend, relayed unchanged. It is
+	// NOT the pooler refusing, whatever its SQLSTATE says.
+	//
+	// 55000 is object_not_in_prerequisite_state, which the pooler uses for
+	// every fencing refusal and which PostgreSQL itself answers for the
+	// placement-fence trigger, REFRESH MATERIALIZED VIEW CONCURRENTLY without
+	// a unique index, ALTER TABLE ... DETACH PARTITION FINALIZE and more. A
+	// router that reads the code alone takes all of them for a topology
+	// change: inside a transaction that becomes 40001 "retry the
+	// transaction", the client retries, and it loops on an error retrying
+	// cannot fix.
+	//
+	// The pooler is the only party that knows which of the two it is, because
+	// it either refused the request itself or relayed an answer.
+	Reason_REASON_BACKEND_ERROR Reason = 3
 )
 
 // Enum value maps for Reason.
@@ -42,11 +57,13 @@ var (
 		0: "REASON_UNSPECIFIED",
 		1: "REASON_STALE_GENERATION",
 		2: "REASON_REWRITE_IN_PROGRESS",
+		3: "REASON_BACKEND_ERROR",
 	}
 	Reason_value = map[string]int32{
 		"REASON_UNSPECIFIED":         0,
 		"REASON_STALE_GENERATION":    1,
 		"REASON_REWRITE_IN_PROGRESS": 2,
+		"REASON_BACKEND_ERROR":       3,
 	}
 )
 
@@ -471,11 +488,12 @@ const file_pgshard_v1_common_proto_rawDesc = "" +
 	"\x03end\x18\x02 \x01(\x03R\x03end\"&\n" +
 	"\n" +
 	"StaleEpoch\x12\x18\n" +
-	"\acurrent\x18\x01 \x01(\x04R\acurrent*]\n" +
+	"\acurrent\x18\x01 \x01(\x04R\acurrent*w\n" +
 	"\x06Reason\x12\x16\n" +
 	"\x12REASON_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17REASON_STALE_GENERATION\x10\x01\x12\x1e\n" +
-	"\x1aREASON_REWRITE_IN_PROGRESS\x10\x02B\xae\x01\n" +
+	"\x1aREASON_REWRITE_IN_PROGRESS\x10\x02\x12\x18\n" +
+	"\x14REASON_BACKEND_ERROR\x10\x03B\xae\x01\n" +
 	"\x0ecom.pgshard.v1B\vCommonProtoP\x01ZFgithub.com/andrew01234567890/pgshard/internal/gen/pgshard/v1;pgshardv1\xa2\x02\x03PXX\xaa\x02\n" +
 	"Pgshard.V1\xca\x02\n" +
 	"Pgshard\\V1\xe2\x02\x16Pgshard\\V1\\GPBMetadata\xea\x02\vPgshard::V1b\x06proto3"

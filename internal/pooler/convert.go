@@ -145,8 +145,12 @@ func toResponse(msg pgproto3.BackendMessage, packed bool) *pgshardv1.ExecuteResp
 	case *pgproto3.CommandComplete:
 		r.Message = &pgshardv1.ExecuteResponse_CommandComplete{CommandComplete: &pgshardv1.CommandComplete{Tag: string(m.CommandTag)}}
 	case *pgproto3.ErrorResponse:
+		// Marked as the backend's own, so a 55000 from PostgreSQL is not
+		// read as the pooler fencing: the pooler's fence refusals carry
+		// REASON_STALE_GENERATION and these carry this instead.
 		r.Message = &pgshardv1.ExecuteResponse_Error{Error: &pgshardv1.ErrorResponse{Error: &pgshardv1.Error{
-			Sqlstate: m.Code, Message: m.Message, Detail: m.Detail, Hint: m.Hint}}}
+			Sqlstate: m.Code, Message: m.Message, Detail: m.Detail, Hint: m.Hint,
+			Reason: pgshardv1.Reason_REASON_BACKEND_ERROR}}}
 	case *pgproto3.NoticeResponse:
 		r.Message = &pgshardv1.ExecuteResponse_Notice{Notice: &pgshardv1.NoticeResponse{Notice: &pgshardv1.Error{
 			Sqlstate: m.Code, Message: m.Message, Detail: m.Detail, Hint: m.Hint}}}

@@ -58,6 +58,21 @@ enum Reason {
   // A table is mid online-rewrite and its column list is not published;
   // the caller should wait rather than treat it as a fault.
   REASON_REWRITE_IN_PROGRESS = 2;
+  // The error came from the PostgreSQL backend, relayed unchanged. It is
+  // NOT the pooler refusing, whatever its SQLSTATE says.
+  //
+  // 55000 is object_not_in_prerequisite_state, which the pooler uses for
+  // every fencing refusal and which PostgreSQL itself answers for the
+  // placement-fence trigger, REFRESH MATERIALIZED VIEW CONCURRENTLY without
+  // a unique index, ALTER TABLE ... DETACH PARTITION FINALIZE and more. A
+  // router that reads the code alone takes all of them for a topology
+  // change: inside a transaction that becomes 40001 "retry the
+  // transaction", the client retries, and it loops on an error retrying
+  // cannot fix.
+  //
+  // The pooler is the only party that knows which of the two it is, because
+  // it either refused the request itself or relayed an answer.
+  REASON_BACKEND_ERROR = 3;
 }
 
 // KeyRange is a closed interval of hashed shard keys, [start, end], over the

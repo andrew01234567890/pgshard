@@ -34,6 +34,20 @@ func TestAFenceSaysItIsAFence(t *testing.T) {
 		t.Error("a pooler that predates the reason field must still be judged by its SQLSTATE")
 	}
 
+	// A 55000 PostgreSQL itself raised is not a fence, whatever the code
+	// says: the placement-fence trigger raises one, and so does REFRESH
+	// MATERIALIZED VIEW CONCURRENTLY without a unique index. Read as a
+	// topology change inside a transaction it becomes 40001 "retry the
+	// transaction", so the client retries and loops on an error retrying
+	// cannot fix.
+	backend := toPgwireError(&pgshardv1.Error{Sqlstate: codeStaleGeneration,
+		Message: "table public.orders is being moved; writes are paused",
+		Hint:    "retry once the placement change is published",
+		Reason:  pgshardv1.Reason_REASON_BACKEND_ERROR})
+	if isStaleGeneration(backend) {
+		t.Error("a 55000 raised by PostgreSQL was treated as a topology change; the client would be told to retry for ever")
+	}
+
 	// Every existing caller looks for a *pgwire.Error and must still find
 	// one, code and message intact.
 	var pe *pgwire.Error
