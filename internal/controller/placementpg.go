@@ -2354,7 +2354,11 @@ func (p *Placer) dropReplication(ctx context.Context, wf *placementWorkflow) err
 			if _, err := conn.Exec(ctx, "DROP PUBLICATION IF EXISTS "+QuoteIdent(wf.publicationName())); err != nil {
 				return err
 			}
-			if wf.stage == StageCancelling && slices.Contains(wf.st.ReplicaIdentityFull, s) {
+			// On the failure path too, not only when cancelling: a failed
+			// workflow is never revisited, so REPLICA IDENTITY FULL left
+			// behind makes every UPDATE on the source log the whole old row
+			// for good.
+			if (wf.stage == StageCancelling || wf.stage == StageFailed) && slices.Contains(wf.st.ReplicaIdentityFull, s) {
 				if _, err := conn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s REPLICA IDENTITY DEFAULT", wf.shape.qualified(wf.spec.TableName))); err != nil {
 					return err
 				}

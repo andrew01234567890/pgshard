@@ -367,10 +367,33 @@ func (p *Placer) fail(ctx context.Context, wf *placementWorkflow, cause error) e
 		return err
 	}
 	wf.stage, wf.state = StageFailed, StateFailed
+	// The slots go with the fence and the lock, for the same reason the
+	// comment above gives: a failed workflow is never revisited. list()
+	// selects pending, running and cancelling, so nothing drives this one
+	// again -- and the slot ensureReplication created pins WAL on every
+	// source until someone notices pg_wal filling. That reasoning was
+	// applied to the fence and stopped there.
+	//
+	// Best effort, and its failures are RECORDED rather than returned: a
+	// source that cannot be reached must not stop the workflow being marked
+	// failed, or the next pass gives up the fence and the lock again and the
+	// workflow never ends.
+	residue := ""
+	if wf.from != nil {
+		if err := p.dropReplication(ctx, wf); err != nil {
+			residue = err.Error()
+			p.logger().Warn("failed placement left replication objects behind; they pin WAL on the source until dropped",
+				"workflow", wf.id, "table", wf.spec.TableName, "err", residue)
+		}
+	}
+	status := map[string]any{"stage": StageFailed, "placement": wf.st, "message": cause.Error()}
+	if residue != "" {
+		status["leaked"] = residue
+	}
 	if err := ownedExec(ctx, p.Pool, wf.owner,
 		`UPDATE pgshard.workflows SET state = $2, error = $3, status = status || $4::jsonb, updated_at = now()
 		 WHERE id = $1::uuid AND ($5::text IS NULL OR (owner = $5 AND state = $6))`,
-		wf.id, StateFailed, cause.Error(), mustJSON(map[string]any{"stage": StageFailed, "placement": wf.st, "message": cause.Error()}),
+		wf.id, StateFailed, cause.Error(), mustJSON(status),
 		nullIfEmpty(wf.owner), wf.fence); err != nil {
 		return err
 	}

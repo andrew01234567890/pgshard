@@ -1312,3 +1312,73 @@ func TestPlacementRefusesATemporalPrimaryKeyOnPostgres(t *testing.T) {
 		t.Fatalf("workflow ended %s: %q, want a refusal naming the temporal key", state, msg)
 	}
 }
+
+// TestAFailedPlacementDropsItsReplication.
+//
+// fail() releases the fence and the table lock because "a failed workflow is
+// never revisited" -- list() selects pending, running and cancelling, so
+// nothing drives it again. That reasoning stopped at the fence. The slot
+// ensureReplication created on every source stayed, pinning WAL until
+// somebody noticed pg_wal filling, and the source table kept REPLICA
+// IDENTITY FULL, so every UPDATE logged the whole old row for good.
+func TestAFailedPlacementDropsItsReplication(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	ctx := context.Background()
+	home := f.app(0)
+	mustExec(t, home, `CREATE TABLE leak (id bigint PRIMARY KEY, v text)`)
+	mustExec(t, home, `INSERT INTO leak SELECT g, 'g' || g FROM generate_series(1, 20) g`)
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('app', 'public', 'leak', 'unsharded', NULL)`)
+	f.reconcile()
+	mustExec(t, f.catalog, `UPDATE pgshard.tables SET placement = 'sharded', shard_key = 'id' WHERE table_name = 'leak'`)
+	f.reconcile()
+	id, _ := f.driveUntil("leak", 2*time.Minute, StagePlacementSwapping)
+	wf := f.load(id)
+
+	// The slots have to exist before this proves anything.
+	before := 0
+	for _, s := range wf.from.Sources() {
+		var ok bool
+		if err := f.app(s).QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)`, wf.slotName(s)).Scan(&ok); err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			before++
+		}
+	}
+	if before == 0 {
+		t.Fatal("no replication slot existed before the failure; this test would pass without checking anything")
+	}
+
+	if err := f.placer.fail(ctx, wf, fatal("test: verification failed after the copy")); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, s := range wf.from.Sources() {
+		var left bool
+		if err := f.app(s).QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)`, wf.slotName(s)).Scan(&left); err != nil {
+			t.Fatal(err)
+		}
+		if left {
+			t.Errorf("shard %d still holds slot %s; it pins WAL and nothing revisits a failed workflow", s, wf.slotName(s))
+		}
+		var pub bool
+		if err := f.app(s).QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)`, wf.publicationName()).Scan(&pub); err != nil {
+			t.Fatal(err)
+		}
+		if pub {
+			t.Errorf("shard %d still holds publication %s", s, wf.publicationName())
+		}
+		var identity string
+		if err := f.app(s).QueryRow(ctx,
+			`SELECT relreplident FROM pg_class WHERE relname = 'leak'`).Scan(&identity); err != nil {
+			t.Fatal(err)
+		}
+		if identity == "f" {
+			t.Errorf("shard %d left REPLICA IDENTITY FULL on the source: every UPDATE logs the whole old row", s)
+		}
+	}
+}
