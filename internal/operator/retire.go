@@ -2,7 +2,6 @@ package operator
 
 import (
 	"context"
-	"fmt"
 	"sort"
 	"strconv"
 
@@ -65,31 +64,11 @@ func (r *ClusterReconciler) extraMembers(ctx context.Context, c *pgshardv1alpha1
 	return out, nil
 }
 
-// retireMember takes one member out of a group: its slot on the primary,
-// then its pod, then its claim if the spec says to reclaim it.
-//
-// The order is the point. synchronous_standby_names is rewritten from
-// MemberNames() on every pass, so a lowered count has already removed this
-// member from it before anything here runs -- and stepRetire refuses to act
-// until the primary confirms that, because deleting a member the primary is
-// still waiting for acknowledgements from would stall every commit.
-func (r *ClusterReconciler) retireMember(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, obs *groupObservation, members map[string]*memberInfo, password, name string) error {
+// retireMember takes one member's pod out of a group, and then its claim if
+// the spec says to reclaim it. Its slot is dropped by stepRetire first,
+// because a retirement that cannot drop the slot must not delete the pod.
+func (r *ClusterReconciler) retireMember(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, name string) error {
 	log := logf.FromContext(ctx).WithValues("group", g.Name(), "member", name)
-	if primary := members[obs.state.primary]; primary != nil && primary.ip != "" {
-		var want []string
-		for _, n := range g.MemberNames() {
-			if n != obs.state.primary {
-				want = append(want, SlotName(n))
-			}
-		}
-		// Dropping it before the pod goes means the primary stops keeping
-		// WAL for a standby that is never coming back. A slot left behind
-		// pins WAL until the disk fills, which is the failure this ticket's
-		// refusal was protecting against.
-		if err := r.Prober.EnsureSlots(ctx, HostDSN(primary.ip, password), want, SlotName(name)); err != nil {
-			return fmt.Errorf("drop the slot of %s: %w", name, err)
-		}
-	}
 	// Read the pod rather than taking it from members: that map is keyed by
 	// MemberNames(), which is exactly the set this member is no longer in.
 	// A retirement has to reach the members the spec has stopped
