@@ -670,6 +670,47 @@ func (r *ClusterReconciler) pollInterval() time.Duration {
 // converge repairs a group whose designated primary is not acting as one:
 // a standby that must be (re)promoted, or a former primary that must be
 // demoted. It returns the possibly bumped state.
+// switchoverCandidate reports why a PLANNED switchover to target cannot
+// succeed, or "" when it can, asked BEFORE the primary is taken away.
+//
+// It is admissiblePrimary's question with the old primary excluded rather
+// than disqualifying: during a switchover the old primary is still running
+// as one, which is the normal state and not a reason to refuse. The views
+// are built the same way and handed to the same chooseCandidate that
+// failover will ask a moment later, so the pre-check and the real check
+// cannot disagree about the rule.
+//
+// Without it, switchover deleted the primary pod and only then discovered
+// that no candidate qualified -- leaving the group with no primary, the
+// annotation still set, and every later pass repeating the discovery.
+func (r *ClusterReconciler) switchoverCandidate(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, state groupState, members map[string]*memberInfo, password, target string) string {
+	old := state.primary
+	views := make([]memberView, 0, len(members))
+	for _, name := range g.MemberNames() {
+		if name == old {
+			continue
+		}
+		v := memberView{Name: name, Listed: true}
+		if m := members[name]; m != nil && m.pod != nil && m.ip != "" {
+			if st, err := r.Prober.ProbeStandby(ctx, HostDSN(m.ip, password)); err != nil {
+				v.Why = err.Error()
+			} else {
+				v.Reachable, v.InRecovery, v.Streaming, v.FlushLSN = true, st.InRecovery, st.Streaming, st.FlushLSN
+				v.ReadySlots = r.readySlots(ctx, g, name, m.ip)
+			}
+		}
+		views = append(views, v)
+	}
+	candidate, err := chooseCandidate(views, old, target, minSyncStandbys(c))
+	switch {
+	case err != nil:
+		return err.Error()
+	case candidate != target:
+		return fmt.Sprintf("%s holds a higher flushed LSN", candidate)
+	}
+	return ""
+}
+
 // admissiblePrimary reports why target must not be promoted, or "" when it
 // may be. Promotion is safe only for the member that holds every
 // acknowledged commit, which is what chooseCandidate encodes; the failover
