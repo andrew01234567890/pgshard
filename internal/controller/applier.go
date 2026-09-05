@@ -189,8 +189,15 @@ type Applier struct {
 
 	ddlMu       sync.Mutex
 	ddlPassword string
-	ddlReady    map[int32]bool
-	leader      func() bool
+	// ddlReady is keyed by shard SET and id, not by id alone. A reshard or
+	// a major upgrade promotes a new set whose shard ids start again at 0,
+	// so an id-keyed cache reported the new set's shard 0 as provisioned
+	// because the OLD set's shard 0 was -- and the applier then dialled it
+	// as a role that had never been created there. Nothing else creates
+	// pgshard_ddl: pg_dump --schema-only does not carry roles and it is not
+	// in pgshard.roles, so every DDL failed until the process restarted.
+	ddlReady map[ShardRef]bool
+	leader   func() bool
 }
 
 func (a *Applier) lostLeadership() bool { return a.leader != nil && !a.leader() }
@@ -636,6 +643,18 @@ func (a *Applier) prepare(ctx context.Context, m *catalog.DDLMigration, key stri
 			return nil, err
 		}
 		conn, err = a.Shards.DialDatabaseAs(ctx, set, id, db, a.ddlRole(), password)
+		if err != nil && authFailed(err) {
+			// The cache said the role was there and the shard says
+			// otherwise, so the cache is what is wrong: someone dropped the
+			// role, or the shard was rebuilt under the same set and id.
+			// Believing the cache here costs every later migration too,
+			// because nothing else ever creates this role.
+			a.forgetDDLRole(ShardRef{Set: set, ID: id})
+			if password, err = a.provisionDDLRole(ctx, set, id, m.Meta.RunAs); err != nil {
+				return nil, err
+			}
+			conn, err = a.Shards.DialDatabaseAs(ctx, set, id, db, a.ddlRole(), password)
+		}
 		if err != nil {
 			return nil, &dialError{err}
 		}
@@ -734,6 +753,25 @@ func (a *Applier) step(ctx context.Context, m *catalog.DDLMigration, key string,
 	return catalog.ShardApplied, nil
 }
 
+// forgetDDLRole drops one shard's cached readiness, so the next attempt
+// creates the role again.
+func (a *Applier) forgetDDLRole(ref ShardRef) {
+	a.ddlMu.Lock()
+	defer a.ddlMu.Unlock()
+	delete(a.ddlReady, ref)
+}
+
+// authFailed reports PostgreSQL refusing the login itself -- an invalid
+// password (28P01) or an invalid authorization specification (28000), which
+// is what a role that does not exist answers.
+func authFailed(err error) bool {
+	var pge *pgconn.PgError
+	if !errors.As(err, &pge) {
+		return false
+	}
+	return pge.Code == "28P01" || pge.Code == "28000"
+}
+
 // provisionDDLRole makes sure the DDL role exists on shard id with this
 // process's password and no memberships (once per shard) and may SET ROLE
 // into runAs, then returns the password. A superuser runAs is refused: the
@@ -747,9 +785,10 @@ func (a *Applier) provisionDDLRole(ctx context.Context, set string, id int32, ru
 			return "", err
 		}
 		a.ddlPassword = hex.EncodeToString(buf)
-		a.ddlReady = map[int32]bool{}
+		a.ddlReady = map[ShardRef]bool{}
 	}
-	if a.ddlReady[id] && runAs == "" {
+	ref := ShardRef{Set: set, ID: id}
+	if a.ddlReady[ref] && runAs == "" {
 		return a.ddlPassword, nil
 	}
 	conn, err := a.Shards.DialDatabase(ctx, set, id, "")
@@ -758,7 +797,7 @@ func (a *Applier) provisionDDLRole(ctx context.Context, set string, id int32, ru
 	}
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
 	role := pgx.Identifier{a.ddlRole()}.Sanitize()
-	if !a.ddlReady[id] {
+	if !a.ddlReady[ref] {
 		for _, sql := range []string{
 			fmt.Sprintf(`DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s) THEN
 				CREATE ROLE %s LOGIN NOSUPERUSER NOINHERIT NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION; END IF; END $$`, quoteLiteral(a.ddlRole()), role),
@@ -769,7 +808,7 @@ func (a *Applier) provisionDDLRole(ctx context.Context, set string, id int32, ru
 				return "", fmt.Errorf("provisioning %s: %w", a.ddlRole(), err)
 			}
 		}
-		a.ddlReady[id] = true
+		a.ddlReady[ref] = true
 	}
 	if runAs == "" {
 		return a.ddlPassword, nil

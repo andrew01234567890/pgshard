@@ -157,6 +157,14 @@ type fakeShards struct {
 	dialErr           func(shard int32) error
 	// dialed records the shard sets the applier actually connected to.
 	dialed []string
+	// provisioned models the DDL role EXISTING on a shard, per shard set
+	// and id, because that is how a real shard holds it: a set promoted by
+	// a reshard is a different PostgreSQL and knows nothing of the role the
+	// retired set was given. With enforceDDLRole set, dialling as that role
+	// where it was never created fails the way PostgreSQL fails it.
+	provisioned    map[ShardRef]bool
+	enforceDDLRole bool
+	ddlRoleName    string
 	// rewrite scripting
 	columns      []string
 	pks          []string
@@ -179,7 +187,8 @@ type fakeShards struct {
 }
 
 func newFakeShards() *fakeShards {
-	return &fakeShards{ran: map[int32][]string{}, super: map[int32][]string{}, dbs: map[int32][]string{}, logins: map[int32][]string{}}
+	return &fakeShards{ran: map[int32][]string{}, super: map[int32][]string{}, dbs: map[int32][]string{},
+		logins: map[int32][]string{}, provisioned: map[ShardRef]bool{}}
 }
 
 func (f *fakeShards) DialDatabase(_ context.Context, set string, id int32, _ string) (ShardConn, error) {
@@ -191,7 +200,7 @@ func (f *fakeShards) DialDatabase(_ context.Context, set string, id int32, _ str
 			return nil, err
 		}
 	}
-	return &fakeConn{f: f, id: id, superuser: true}, nil
+	return &fakeConn{f: f, id: id, set: set, superuser: true}, nil
 }
 
 func (f *fakeShards) DialDatabaseAs(_ context.Context, set string, id int32, db, user, password string) (ShardConn, error) {
@@ -199,7 +208,13 @@ func (f *fakeShards) DialDatabaseAs(_ context.Context, set string, id int32, db,
 	f.dialed = append(f.dialed, set)
 	f.dbs[id] = append(f.dbs[id], db)
 	f.logins[id] = append(f.logins[id], user+"/"+password)
+	enforce, made := f.enforceDDLRole, f.provisioned[ShardRef{Set: set, ID: id}]
+	role := f.ddlRoleName
 	f.mu.Unlock()
+	if enforce && user == role && !made {
+		return nil, &pgconn.PgError{Severity: "FATAL", Code: "28P01",
+			Message: fmt.Sprintf("password authentication failed for user %q", user)}
+	}
 	if f.dialErr != nil {
 		if err := f.dialErr(id); err != nil {
 			return nil, err
@@ -225,6 +240,7 @@ func (f *fakeShards) superuserStatements(id int32) []string {
 type fakeConn struct {
 	f         *fakeShards
 	id        int32
+	set       string
 	superuser bool
 }
 
@@ -232,6 +248,10 @@ func (c *fakeConn) Exec(_ context.Context, sql string, _ ...any) (CommandTag, er
 	c.f.mu.Lock()
 	if c.superuser {
 		c.f.super[c.id] = append(c.f.super[c.id], sql)
+		// Creating the role is what makes it exist, on THIS set.
+		if strings.Contains(sql, "CREATE ROLE") || strings.Contains(sql, "ALTER ROLE") {
+			c.f.provisioned[ShardRef{Set: c.set, ID: c.id}] = true
+		}
 	} else {
 		c.f.ran[c.id] = append(c.f.ran[c.id], sql)
 	}
@@ -1525,5 +1545,76 @@ func TestASaveFailureIsRetryable(t *testing.T) {
 	}
 	if !transient(fmt.Errorf("wrapped: %w", &saveFailed{errors.New("catalog unavailable")})) {
 		t.Fatal("wrapping it must not make it permanent")
+	}
+}
+
+// TestTheDDLRoleIsProvisionedOnEveryShardSet.
+//
+// The applier creates pgshard_ddl on a shard the first time it needs it and
+// remembers that it did. The memory was keyed by shard ID ALONE, and a
+// reshard or a major upgrade promotes a set whose shard ids start again at
+// 0 -- so the new set's shard 0 was already "ready" because the retired
+// set's shard 0 was, and the applier dialled it as a role that had never
+// been created there.
+//
+// Nothing else would have created it: pg_dump --schema-only does not carry
+// roles, and pgshard_ddl is not in pgshard.roles. So every migration failed,
+// after the full retry budget, until the controller process restarted.
+//
+// The fake enforces the role the way PostgreSQL does -- dialling as one that
+// was never created answers 28P01 -- so this test fails on the old key
+// rather than merely describing it.
+func TestTheDDLRoleIsProvisionedOnEveryShardSet(t *testing.T) {
+	f := newApplierFixture(t)
+	f.shards.enforceDDLRole = true
+	f.shards.ddlRoleName = DefaultDDLRole
+	f.store.shards = []int32{0, 1}
+
+	first := f.queue(catalog.DDLMigration{Statement: "create table a (id int)", Kind: "CREATE TABLE", Scope: "all"})
+	f.run(t)
+	if m := f.store.get(t, first); m.State != catalog.MigrationComplete {
+		t.Fatalf("before the cutover: %s: %s", m.State, m.Error)
+	}
+
+	// A reshard or upgrade promotes a new set with the same shard ids.
+	f.store.serving = "g2"
+
+	second := f.queue(catalog.DDLMigration{Statement: "create table b (id int)", Kind: "CREATE TABLE", Scope: "all"})
+	f.run(t)
+	if m := f.store.get(t, second); m.State != catalog.MigrationComplete {
+		t.Fatalf("after the cutover: %s: %s", m.State, m.Error)
+	}
+	for _, id := range []int32{0, 1} {
+		if !f.shards.provisioned[ShardRef{Set: "g2", ID: id}] {
+			t.Errorf("the DDL role was never created on g2/%d", id)
+		}
+	}
+}
+
+// A role dropped out of band leaves the cache saying it is there. Believing
+// the cache costs every later migration too, because nothing else creates
+// it, so an authentication failure re-provisions and retries once.
+func TestADroppedDDLRoleIsRecreatedRatherThanRetriedForever(t *testing.T) {
+	f := newApplierFixture(t)
+	f.shards.enforceDDLRole = true
+	f.shards.ddlRoleName = DefaultDDLRole
+	f.store.shards = []int32{0}
+
+	first := f.queue(catalog.DDLMigration{Statement: "create table a (id int)", Kind: "CREATE TABLE", Scope: "all"})
+	f.run(t)
+	if m := f.store.get(t, first); m.State != catalog.MigrationComplete {
+		t.Fatalf("first migration: %s: %s", m.State, m.Error)
+	}
+
+	// Someone drops the role on the shard; the applier's cache still says
+	// it is there.
+	f.shards.mu.Lock()
+	delete(f.shards.provisioned, ShardRef{Set: "default", ID: 0})
+	f.shards.mu.Unlock()
+
+	second := f.queue(catalog.DDLMigration{Statement: "create table b (id int)", Kind: "CREATE TABLE", Scope: "all"})
+	f.run(t)
+	if m := f.store.get(t, second); m.State != catalog.MigrationComplete {
+		t.Fatalf("after the role was dropped: %s: %s", m.State, m.Error)
 	}
 }
