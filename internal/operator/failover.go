@@ -423,17 +423,30 @@ func (r *ClusterReconciler) memberEndpoint(c *pgshardv1alpha1.PgShardCluster, g 
 
 func agentAddr(ip string) string { return fmt.Sprintf("%s:%d", ip, agentGRPCPort) }
 
-// fencePod deletes the old primary's Pod and waits for it to be gone, so a
-// primary that is alive but unreachable cannot keep writing while a successor
-// is promoted. A Pod that is already absent needs nothing. This is not
-// positive fencing under every failure: a node that is up but partitioned from
-// the API server will not act on the delete, which is why the agent also has a
-// watchdog whose deadline the kubelet enforces.
+// podFenceGrace is the grace period the old primary's Pod is deleted with.
+// It has to be non-zero for the wait below to mean anything: a delete with
+// grace zero is a force delete, which removes the object from the API server
+// without the kubelet confirming anything, so "the Pod is gone" would be
+// observed while the container was still running. Ten seconds is enough for
+// the kubelet to signal the agent and stop PostgreSQL, and short enough that
+// a failover on a healthy node is not held up by it.
+const podFenceGrace = 10 * time.Second
+
+// fencePod deletes the old primary's Pod and waits for the kubelet to confirm
+// it is gone, so a primary that is alive but unreachable to the operator is
+// stopped rather than assumed stopped. A Pod that is already absent needs
+// nothing. This is not positive fencing under every failure: a node that is
+// down or partitioned from the API server never confirms, and its Pod object
+// stays Terminating for as long as the node object lasts. Refusing to promote
+// in that case would turn every node failure into an outage, so the wait is
+// bounded: after it the delete is escalated to a force delete and the
+// promotion goes ahead on the fences that do cover it -- the Lease the old
+// primary self-fences on, and the epoch the poolers reject writes at.
 func (r *ClusterReconciler) fencePod(ctx context.Context, m *memberInfo) error {
 	if m == nil || m.pod == nil {
 		return nil
 	}
-	if err := r.Delete(ctx, m.pod, client.GracePeriodSeconds(0)); client.IgnoreNotFound(err) != nil {
+	if err := r.Delete(ctx, m.pod, client.GracePeriodSeconds(int64(podFenceGrace/time.Second))); client.IgnoreNotFound(err) != nil {
 		return err
 	}
 	deadline := r.now().Add(r.podFenceTimeout())
@@ -451,7 +464,12 @@ func (r *ClusterReconciler) fencePod(ctx context.Context, m *memberInfo) error {
 			return nil
 		}
 		if r.now().After(deadline) {
-			return fmt.Errorf("pod %s still present after %s", m.pod.Name, r.podFenceTimeout())
+			logf.FromContext(ctx).Info("kubelet did not confirm the old primary stopped; forcing the delete and promoting on the Lease and epoch fences",
+				"pod", m.pod.Name, "after", r.podFenceTimeout())
+			if err := r.Delete(ctx, m.pod, client.GracePeriodSeconds(0)); client.IgnoreNotFound(err) != nil {
+				return fmt.Errorf("force deleting %s after %s: %w", m.pod.Name, r.podFenceTimeout(), err)
+			}
+			return nil
 		}
 		select {
 		case <-ctx.Done():
@@ -461,8 +479,11 @@ func (r *ClusterReconciler) fencePod(ctx context.Context, m *memberInfo) error {
 	}
 }
 
-// DefaultPodFenceTimeout bounds the wait for the old primary's Pod to go.
-const DefaultPodFenceTimeout = 60 * time.Second
+// DefaultPodFenceTimeout bounds the wait for the kubelet to confirm the old
+// primary's Pod is gone before the delete is escalated to a force delete. It
+// is the failover latency a node failure costs, so it is only as long as a
+// healthy kubelet needs to act on podFenceGrace.
+const DefaultPodFenceTimeout = 30 * time.Second
 
 func (r *ClusterReconciler) podFenceTimeout() time.Duration {
 	if r.PodFenceTimeout > 0 {

@@ -73,18 +73,25 @@ The primary is unhealthy when its pod is missing, or the pod is not Ready and
    hold every acknowledgement (`reachable + minSyncStandbys <= listed`), no
    candidate is admissible: the fence is released and the primary pod is
    recreated as primary (same PVC) — durability over availability.
-4. computes `epoch = max(group epoch, candidate agent epoch) + 1` and **writes
+4. deletes the old primary's pod with a 10s grace period and waits (30s
+   bound) for the kubelet to confirm it is gone, so a primary the operator
+   cannot reach is stopped rather than assumed stopped. A pod on a down or
+   partitioned node never confirms — it stays `Terminating` until its node
+   object goes — so on that timeout the delete is escalated to a force delete
+   and the promotion proceeds on the fences that do cover the case: the Lease
+   the old primary self-fences on, and the epoch the poolers reject writes at.
+5. computes `epoch = max(group epoch, candidate agent epoch) + 1` and **writes
    the fence first**: `pgshard.shard_status` (`primary_epoch`,
    `primary_endpoint`, never lowered) for shard groups, then
    `PgShardGroup.status`, then the Lease (holder handed to the candidate,
    annotations set). The catalog group is fenced by its status and Lease only.
-5. `Agent.Promote{epoch, lease_holder}` on the candidate: the agent accepts only
+6. `Agent.Promote{epoch, lease_holder}` on the candidate: the agent accepts only
    a strictly greater epoch, refuses when `lease_holder` is not the identity it
    holds its own Lease under (both sides derive it from the member name, and a
    mismatch used to surface as an unexplained `ErrLeaseHeld`), takes the Lease
    (already its own), disconnects its WAL receiver, runs `pg_ctl promote` and
    checkpoints.
-6. relabels the candidate `role=primary`, re-renders the ConfigMap so the old
+7. relabels the candidate `role=primary`, re-renders the ConfigMap so the old
    primary's config says `standby`, and requeues.
 
 The next passes recreate the old primary pod as a `replica` (it rejoins via
