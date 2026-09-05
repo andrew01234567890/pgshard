@@ -475,6 +475,28 @@ func (w *walker) claimedNextval(root *pgquerypb.Node) map[*pgquerypb.FuncCall]bo
 // characters will not match and the statement is fanned out as before:
 // missing one is the safe direction, since the outcome is the behaviour
 // that exists today rather than a refusal of something unrelated.
+// refuseRegisteredSequenceObject refuses a statement naming the per-shard
+// sequence behind a registered global sequence, when acting on it would
+// either destroy something or defeat the guard above.
+//
+// Not every statement over it: a GRANT or an OWNER change on the physical
+// sequence is inert for a registered global sequence -- the router
+// allocates from the catalog and nothing reads that sequence -- and
+// refusing what costs nothing would break the migration tools that grant
+// over every object they find. What is refused is what does not come back:
+// a DROP takes the column's default with it under CASCADE, and a RENAME or
+// a SET SCHEMA moves the name this guard is derived from, so the next
+// ALTER SEQUENCE would be fanned out unnoticed.
+func (w *walker) refuseRegisteredSequenceObject(verb string, rv *pgquerypb.RangeVar) error {
+	seq := w.registeredSequenceObject(rv)
+	if seq == "" {
+		return nil
+	}
+	return notYet(verb+" on "+rv.GetRelname()+" is not available through the router: it is the per-shard sequence behind the global sequence "+seq+
+		", and the router allocates from the catalog rather than from it",
+		"drop the column's registration in pgshard.tables first if the global sequence is really going away")
+}
+
 func (w *walker) registeredSequenceObject(rv *pgquerypb.RangeVar) string {
 	if rv == nil || w.sess.Snapshot == nil || rv.GetRelname() == "" {
 		return ""
