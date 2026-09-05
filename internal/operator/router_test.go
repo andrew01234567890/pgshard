@@ -157,8 +157,8 @@ func TestPoolerSidecarInMemberPod(t *testing.T) {
 	// the one that creates and reads replication slots. The catalog
 	// connection reads the shard map as the router's login role, with its
 	// password mounted from that role's own Secret, so a compromised pooler
-	// no longer holds the credential that is also the seed of the agent
-	// control-plane token.
+	// no longer holds the credential that is direct write access to every
+	// shard.
 	if len(pooler.Env) != 1 || pooler.Env[0].Name != "PGPASSWORD" || pooler.Env[0].ValueFrom == nil ||
 		pooler.Env[0].ValueFrom.SecretKeyRef.Name != SecretName(c.Name) {
 		t.Errorf("PGPASSWORD must be the superuser Secret, for the local socket: %+v", pooler.Env)

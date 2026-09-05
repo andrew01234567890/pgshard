@@ -417,8 +417,8 @@ func (r *ClusterReconciler) ensureSecret(ctx context.Context, c *pgshardv1alpha1
 
 // ensureRouterSecret generates the router's catalog password. Like the
 // admin's, it is the cluster's own and separate from the superuser's: the
-// router terminates untrusted client connections, and the superuser
-// password is also the seed of the agent control-plane token.
+// router terminates untrusted client connections, and the superuser password
+// is direct write access to every shard.
 func (r *ClusterReconciler) ensureRouterSecret(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) (string, error) {
 	key := types.NamespacedName{Namespace: c.Namespace, Name: RouterSecretName(c.Name)}
 	var sec corev1.Secret
