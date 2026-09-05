@@ -485,11 +485,22 @@ func (Renderer) PVC(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, nam
 	}
 }
 
-func httpProbe(path string, period, failures int32) *corev1.Probe {
+// httpProbe renders one agent probe.
+//
+// TimeoutSeconds is set explicitly because the kubelet's default is ONE
+// SECOND, and /livez legitimately takes longer than that: it asks the kube
+// API (2s) and, only if that fails, the peers. Under an API-server stall the
+// handler needs more than a second, the kubelet failed it regardless of what
+// the peers would have said, and after three failures it killed the
+// container -- which is PostgreSQL, since the agent is PID 1. A control-plane
+// incident therefore restarted every primary at once, in exactly the case the
+// peer failsafe exists to survive.
+func httpProbe(path string, period, failures, timeout int32) *corev1.Probe {
 	return &corev1.Probe{
 		ProbeHandler:     corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: path, Port: intstr.FromInt32(agentHTTPPort)}},
 		PeriodSeconds:    period,
 		FailureThreshold: failures,
+		TimeoutSeconds:   timeout,
 	}
 }
 
@@ -529,10 +540,14 @@ func (Renderer) Pod(c *pgshardv1alpha1.PgShardCluster, g Group, ordinal int, rol
 					{Name: "grpc", ContainerPort: agentGRPCPort},
 				},
 				Resources:      c.Spec.Resources,
-				StartupProbe:   httpProbe("/startz", 5, 120),
-				ReadinessProbe: httpProbe("/readyz", 5, 1),
-				LivenessProbe:  httpProbe("/livez", 10, 3),
-				VolumeMounts:   agentMounts(c),
+				StartupProbe:   httpProbe("/startz", 5, 120, 3),
+				ReadinessProbe: httpProbe("/readyz", 5, 1, 3),
+				// 8s covers the kube check (2s) and one concurrent round of
+				// peer checks (2s) with room to spare, and stays under the
+				// 10s period. The peers are asked concurrently precisely so
+				// this bound does not have to grow with the member count.
+				LivenessProbe: httpProbe("/livez", 10, 3, 8),
+				VolumeMounts:  agentMounts(c),
 			}, poolerSidecar(c, g)},
 			Volumes: []corev1.Volume{
 				{Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvc}}},

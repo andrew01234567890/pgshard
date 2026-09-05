@@ -160,23 +160,49 @@ func (p *Probes) Live(ctx context.Context) error {
 	if client == nil {
 		client = &http.Client{Timeout: 2 * time.Second}
 	}
-	var errs []error
+	// Concurrently, and this is not an optimisation. The kubelet gives the
+	// whole handler ONE timeout, and asking peers one after another makes
+	// the worst case grow with the member count -- three replicas cost the
+	// kube probe plus two peer timeouts, five cost four. A probe that
+	// outruns the kubelet's patience is failed regardless of what the peers
+	// would have said, which is precisely the vote this failsafe exists to
+	// take. One round trip now, whatever the group size.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type result struct {
+		ok  bool
+		err error
+	}
+	results := make(chan result, len(p.Peers))
 	for _, peer := range p.Peers {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, peer, nil)
-		if err != nil {
-			return err
+		go func(peer string) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, peer, nil)
+			if err != nil {
+				results <- result{err: err}
+				return
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				results <- result{err: fmt.Errorf("peer %s unreachable: %w", peer, err)}
+				return
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				results <- result{err: fmt.Errorf("peer %s returned %d", peer, resp.StatusCode)}
+				return
+			}
+			results <- result{ok: true}
+		}(peer)
+	}
+	var errs []error
+	for range p.Peers {
+		r := <-results
+		if r.ok {
+			// One peer that can see us is the whole answer; the cancel
+			// above ends the rest.
+			return nil
 		}
-		resp, err := client.Do(req)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("peer %s unreachable: %w", peer, err))
-			continue
-		}
-		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			errs = append(errs, fmt.Errorf("peer %s returned %d", peer, resp.StatusCode))
-			continue
-		}
-		return nil
+		errs = append(errs, r.err)
 	}
 	if len(errs) == 0 {
 		return errors.New("kube API unreachable and no peers configured")
