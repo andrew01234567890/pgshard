@@ -88,12 +88,24 @@ const migratingSQLState = "57P03"
 // fenceMigrating refuses a new PREPARE TRANSACTION on a migrating shard; every
 // other statement (reads, the commit or rollback of an already prepared
 // transaction, the writes of a transaction the router let finish) passes.
+//
+// Both protocols are inspected. The router runs its own PREPARE TRANSACTION as
+// a simple query, and refuses a client's when it plans the Parse, so the
+// extended path carries nothing today -- but the pooler is the fence that
+// makes a stateless router safe, and a fence that holds only while the router
+// is correct is not one.
 func fenceMigrating(v View, req *pgshardv1.ExecuteRequest) *pgshardv1.Error {
 	if !v.Migrating {
 		return nil
 	}
-	q, ok := req.Message.(*pgshardv1.ExecuteRequest_SimpleQuery)
-	if !ok || !isPrepareTransaction(q.SimpleQuery.Sql) {
+	var sql string
+	switch m := req.Message.(type) {
+	case *pgshardv1.ExecuteRequest_SimpleQuery:
+		sql = m.SimpleQuery.GetSql()
+	case *pgshardv1.ExecuteRequest_Parse:
+		sql = m.Parse.GetSql()
+	}
+	if !isPrepareTransaction(sql) {
 		return nil
 	}
 	return &pgshardv1.Error{Sqlstate: migratingSQLState, Message: "shard is migrating: new prepared transactions are refused",
