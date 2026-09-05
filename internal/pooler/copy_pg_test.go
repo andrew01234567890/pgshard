@@ -3,6 +3,7 @@ package pooler
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -252,6 +253,23 @@ func (h *pgHarness) testCopyTables(t *testing.T) {
 //
 // Run it with -benchmem; B/op is the figure that moves.
 func BenchmarkCopyWideTable(b *testing.B) {
+	// Opt-in, because it starts a PostgreSQL container and copies 25 MiB
+	// through it. hack/perf/benchstat.sh runs `-bench .` over
+	// ./internal/pooler/... on every pull request, and this took twenty
+	// minutes there before failing -- the script's own comment warns that
+	// packages are named explicitly because some need Docker, and a
+	// benchmark that needs it is the same hazard.
+	//
+	// It is a measurement tool for one question, not a regression gate:
+	// the number depends on a container's I/O, so comparing two runs of it
+	// across machines says nothing. Run it by hand, on both sides of a
+	// change, when the question is what the copy allocates:
+	//
+	//	PGSHARD_BENCH_PG=1 go test ./internal/pooler/ -run '^$' \
+	//	  -bench BenchmarkCopyWideTable -benchmem -benchtime 3x
+	if os.Getenv("PGSHARD_BENCH_PG") == "" {
+		b.Skip("set PGSHARD_BENCH_PG=1 to run the container-backed copy benchmark")
+	}
 	ctx := context.Background()
 	if _, err := exec.LookPath("docker"); err != nil {
 		b.Skip("docker not on PATH")
