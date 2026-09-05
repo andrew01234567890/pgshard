@@ -217,6 +217,10 @@ func (s *Server) Backup(ctx context.Context, req *pgshardv1.BackupRequest) (*pgs
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
+	// Embedded, not a status error: the log is pgBackRest's own output and
+	// on a FAILED backup it is the only diagnostic there is -- the backup
+	// reconciler writes it into the group's status. One channel per RPC, so
+	// the failures with nothing to carry go the same way as the one that has.
 	res, err := s.inst.Backup(ctx, t)
 	resp.Log = res.Log
 	if err != nil {
@@ -233,13 +237,11 @@ func (s *Server) RestoreInfo(ctx context.Context, _ *pgshardv1.RestoreInfoReques
 	resp := &pgshardv1.RestoreInfoResponse{Epoch: s.epoch.Current()}
 	r, err := s.inst.backupRunner()
 	if err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	st, err := r.Info(ctx)
 	if err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	resp.Stanza = st.Name
 	resp.StatusCode = st.StatusCode
@@ -257,25 +259,23 @@ func (s *Server) Expire(ctx context.Context, req *pgshardv1.ExpireRequest) (*pgs
 	resp := &pgshardv1.ExpireResponse{Epoch: s.epoch.Current()}
 	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
 	if err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	defer endTerm()
 	resp.Epoch = req.GetEpoch()
 	r, err := s.inst.backupRunner()
 	if err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	// Expire takes the same stanza lock a backup does.
 	release, err := s.inst.holdRepo(ctx)
 	if err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	defer release()
-	resp.Log, err = r.Expire(ctx)
-	resp.Error = pgErr(err)
+	if resp.Log, err = r.Expire(ctx); err != nil {
+		return nil, s.rpcErr(err)
+	}
 	return resp, nil
 }
 
@@ -287,6 +287,8 @@ func (s *Server) Verify(ctx context.Context, _ *pgshardv1.VerifyRequest) (*pgsha
 		resp.Error = pgErr(err)
 		return resp, nil
 	}
+	// Embedded for the same reason as Backup: what pgBackRest said is the
+	// finding when a repository fails verification.
 	resp.Log, err = r.Verify(ctx)
 	resp.Error = pgErr(err)
 	return resp, nil

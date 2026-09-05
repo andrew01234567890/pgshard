@@ -71,3 +71,15 @@ message KeyRange {
   // Inclusive upper bound.
   int64 end = 2;
 }
+
+// StaleEpoch is attached as a gRPC status detail to a FailedPrecondition
+// from an agent whose epoch does not match the caller's.
+//
+// It exists because the refusal used to arrive in the response body, where
+// the response also carried the agent's current epoch: a caller could see
+// what it should have sent without a second round trip. Moving the failure
+// to a status code would have dropped that, so it moves with it.
+message StaleEpoch {
+  // The epoch the agent has actually accepted.
+  uint64 current = 1;
+}

@@ -9,6 +9,9 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/andrew01234567890/pgshard/internal/buildinfo"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 )
@@ -40,6 +43,9 @@ func NewServer(inst *Instance, epoch *EpochStore, lease *Lease, log *slog.Logger
 	return &Server{inst: inst, epoch: epoch, lease: lease, log: log, fatal: fatal, opTimeout: 10 * time.Minute, bgCtx: context.Background()}
 }
 
+// pgErr builds the embedded error of the three responses that keep one --
+// Status, Backup and Verify, each of which carries a partial answer beside
+// it. Every other RPC reports failure through rpcErr.
 func pgErr(err error) *pgshardv1.Error {
 	if err == nil {
 		return nil
@@ -49,6 +55,36 @@ func pgErr(err error) *pgshardv1.Error {
 		code = "55000"
 	}
 	return &pgshardv1.Error{Sqlstate: code, Message: err.Error()}
+}
+
+// rpcErr is how an operation that did not happen fails its RPC.
+//
+// A stale epoch is FailedPrecondition because it is the caller's view that is
+// wrong: re-read the epoch and the same call can succeed. Everything else is
+// Internal, which says only that it failed -- not knowing whether a retry
+// helps is different from knowing it does not, and a code that promised
+// retryability we cannot establish would be worse than one that promises
+// nothing.
+//
+// The point is the channel, not the code. These failures used to be returned
+// in the response body with an OK status, so a Promote that did not happen
+// was a successful RPC to every interceptor, retry policy and metric that
+// only sees the status.
+func (s *Server) rpcErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, ErrStaleEpoch) {
+		return status.Error(codes.Internal, err.Error())
+	}
+	st := status.New(codes.FailedPrecondition, err.Error())
+	// The refusal used to arrive in a body that also carried this, so a
+	// caller could see what it should have sent. It travels with the code
+	// rather than being dropped by the move.
+	if d, derr := st.WithDetails(&pgshardv1.StaleEpoch{Current: s.epoch.Current()}); derr == nil {
+		st = d
+	}
+	return st.Err()
 }
 
 // fence accepts a strictly greater epoch (role changes) or returns the
@@ -110,8 +146,7 @@ func (s *Server) Promote(ctx context.Context, req *pgshardv1.PromoteRequest) (*p
 	defer s.mu.Unlock()
 	resp := &pgshardv1.PromoteResponse{Epoch: s.epoch.Current()}
 	if err := s.fence(req.GetEpoch()); err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	resp.Epoch = req.GetEpoch()
 	ctx, cancel := context.WithTimeout(ctx, s.opTimeout)
@@ -123,8 +158,7 @@ func (s *Server) Promote(ctx context.Context, req *pgshardv1.PromoteRequest) (*p
 	// healthy primary.
 	if s.lease != nil && s.holdStop == nil {
 		if err := s.lease.Acquire(ctx); err != nil {
-			resp.Error = pgErr(fmt.Errorf("acquire lease: %w", err))
-			return resp, nil
+			return nil, s.rpcErr(fmt.Errorf("acquire lease: %w", err))
 		}
 	}
 	// Renew from here on: if a promote step below fails after pg_ctl promote,
@@ -137,8 +171,7 @@ func (s *Server) Promote(ctx context.Context, req *pgshardv1.PromoteRequest) (*p
 	// still returns an error, but the hold above keeps the lease so there is
 	// no split brain while it is resolved.
 	if err := s.promoteWithRetry(ctx); err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	s.inst.startStanzaWorker(s.bgCtx, stanzaRetry)
 	st, _ := s.Status(ctx, nil)
@@ -215,8 +248,7 @@ func (s *Server) Demote(ctx context.Context, req *pgshardv1.DemoteRequest) (*pgs
 	defer s.mu.Unlock()
 	resp := &pgshardv1.DemoteResponse{Epoch: s.epoch.Current()}
 	if err := s.fence(req.GetEpoch()); err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	resp.Epoch = req.GetEpoch()
 	ctx, cancel := context.WithTimeout(ctx, s.opTimeout)
@@ -226,8 +258,7 @@ func (s *Server) Demote(ctx context.Context, req *pgshardv1.DemoteRequest) (*pgs
 	// promote, producing two writable primaries. The hold keeps renewing
 	// until the database is down.
 	if err := s.inst.Demote(ctx, ""); err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	s.stopHold(ctx)
 	return resp, nil
@@ -246,8 +277,7 @@ func (s *Server) Rewind(ctx context.Context, req *pgshardv1.RewindRequest) (*pgs
 	resp := &pgshardv1.RewindResponse{Epoch: s.epoch.Current()}
 	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
 	if err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	defer endTerm()
 	resp.Epoch = req.GetEpoch()
@@ -255,7 +285,7 @@ func (s *Server) Rewind(ctx context.Context, req *pgshardv1.RewindRequest) (*pgs
 	defer cancel()
 	s.stopHold(ctx)
 	if err := s.inst.Rewind(ctx, req.GetSource()); err != nil {
-		resp.Error = pgErr(err)
+		return nil, s.rpcErr(err)
 	}
 	return resp, nil
 }
@@ -269,8 +299,7 @@ func (s *Server) Reclone(ctx context.Context, req *pgshardv1.RecloneRequest) (*p
 	resp := &pgshardv1.RecloneResponse{Epoch: s.epoch.Current()}
 	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
 	if err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	defer endTerm()
 	resp.Epoch = req.GetEpoch()
@@ -278,7 +307,7 @@ func (s *Server) Reclone(ctx context.Context, req *pgshardv1.RecloneRequest) (*p
 	defer cancel()
 	s.stopHold(ctx)
 	if err := s.inst.Reclone(ctx, fromRepo); err != nil {
-		resp.Error = pgErr(err)
+		return nil, s.rpcErr(err)
 	}
 	return resp, nil
 }
@@ -291,13 +320,12 @@ func (s *Server) Reload(ctx context.Context, req *pgshardv1.ReloadRequest) (*pgs
 	resp := &pgshardv1.ReloadResponse{Epoch: s.epoch.Current()}
 	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
 	if err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	defer endTerm()
 	resp.Epoch = req.GetEpoch()
 	if err := s.inst.Reload(ctx); err != nil {
-		resp.Error = pgErr(err)
+		return nil, s.rpcErr(err)
 	}
 	resp.SettingsHash = s.inst.cfg.SettingsHash
 	return resp, nil
@@ -311,8 +339,7 @@ func (s *Server) Restart(ctx context.Context, req *pgshardv1.RestartRequest) (*p
 	resp := &pgshardv1.RestartResponse{Epoch: s.epoch.Current()}
 	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
 	if err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	defer endTerm()
 	resp.Epoch = req.GetEpoch()
@@ -326,7 +353,7 @@ func (s *Server) Restart(ctx context.Context, req *pgshardv1.RestartRequest) (*p
 	ctx, cancel := context.WithTimeout(ctx, s.opTimeout)
 	defer cancel()
 	if err := s.inst.Restart(ctx, mode); err != nil {
-		resp.Error = pgErr(err)
+		return nil, s.rpcErr(err)
 	}
 	return resp, nil
 }
@@ -337,15 +364,16 @@ func (s *Server) CreateRestorePoint(ctx context.Context, req *pgshardv1.CreateRe
 	resp := &pgshardv1.CreateRestorePointResponse{Epoch: s.epoch.Current()}
 	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
 	if err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	defer endTerm()
 	resp.Epoch = req.GetEpoch()
 	err = s.withConn(ctx, func(q querier) error {
 		return q.QueryRow(ctx, "SELECT pg_create_restore_point($1) - '0/0'::pg_lsn", req.GetName()).Scan(&resp.Lsn)
 	})
-	resp.Error = pgErr(err)
+	if err != nil {
+		return nil, s.rpcErr(err)
+	}
 	return resp, nil
 }
 
@@ -356,8 +384,7 @@ func (s *Server) CreateSlot(ctx context.Context, req *pgshardv1.CreateSlotReques
 	resp := &pgshardv1.CreateSlotResponse{Epoch: s.epoch.Current()}
 	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
 	if err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	defer endTerm()
 	resp.Epoch = req.GetEpoch()
@@ -381,7 +408,9 @@ func (s *Server) CreateSlot(ctx context.Context, req *pgshardv1.CreateSlotReques
 		}
 		return nil
 	})
-	resp.Error = pgErr(err)
+	if err != nil {
+		return nil, s.rpcErr(err)
+	}
 	return resp, nil
 }
 
@@ -390,8 +419,7 @@ func (s *Server) DropSlot(ctx context.Context, req *pgshardv1.DropSlotRequest) (
 	resp := &pgshardv1.DropSlotResponse{Epoch: s.epoch.Current()}
 	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
 	if err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	defer endTerm()
 	resp.Epoch = req.GetEpoch()
@@ -399,7 +427,9 @@ func (s *Server) DropSlot(ctx context.Context, req *pgshardv1.DropSlotRequest) (
 		_, err := q.Exec(ctx, "SELECT pg_drop_replication_slot($1)", req.GetName())
 		return err
 	})
-	resp.Error = pgErr(err)
+	if err != nil {
+		return nil, s.rpcErr(err)
+	}
 	return resp, nil
 }
 
@@ -430,6 +460,8 @@ func (s *Server) ListSlots(ctx context.Context, _ *pgshardv1.ListSlotsRequest) (
 		}
 		return rows.Err()
 	})
-	resp.Error = pgErr(err)
+	if err != nil {
+		return nil, s.rpcErr(err)
+	}
 	return resp, nil
 }

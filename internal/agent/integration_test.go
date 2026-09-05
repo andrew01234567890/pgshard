@@ -275,8 +275,21 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pgshardv1.NewAgentClient(rawConn).Status(context.Background(), &pgshardv1.StatusRequest{}); status.Code(err) != codes.Unauthenticated {
-		t.Fatalf("tokenless agent RPC must be rejected, got %v", err)
+	// grpc.NewClient dials lazily, so the first RPC both connects and calls.
+	// A refused dial is the port not being accepted yet, not the agent
+	// accepting a tokenless call, and asserting on the first attempt read one
+	// as the other: Unavailable/connection refused failed this line twice on
+	// a loaded machine while the agent was fine.
+	var authErr error
+	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); {
+		_, authErr = pgshardv1.NewAgentClient(rawConn).Status(context.Background(), &pgshardv1.StatusRequest{})
+		if status.Code(authErr) != codes.Unavailable {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if status.Code(authErr) != codes.Unauthenticated {
+		t.Fatalf("tokenless agent RPC must be rejected, got %v", authErr)
 	}
 	_ = rawConn.Close()
 	p.psql("CREATE TABLE t (id int primary key, note text)")
@@ -305,9 +318,9 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	ctx := context.Background()
 	t.Log("promote with stale epoch is refused")
 	if err := s.status(); err == nil {
-		resp, err := s.grpc.Promote(ctx, &pgshardv1.PromoteRequest{Epoch: 0})
-		if err != nil || resp.GetError() == nil || !strings.Contains(resp.GetError().GetMessage(), "stale epoch") {
-			t.Fatalf("promote epoch 0: err=%v resp=%v", err, resp)
+		_, err := s.grpc.Promote(ctx, &pgshardv1.PromoteRequest{Epoch: 0})
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "stale epoch") {
+			t.Fatalf("promote epoch 0: %v", err)
 		}
 		if s.status().GetRole() != pgshardv1.StatusResponse_ROLE_STANDBY {
 			t.Fatal("stale promote changed the role")
@@ -316,8 +329,8 @@ func runAgentSuite(t *testing.T, image, bin string) {
 
 	t.Log("promote with epoch 1")
 	resp, err := s.grpc.Promote(ctx, &pgshardv1.PromoteRequest{Epoch: 1})
-	if err != nil || resp.GetError() != nil {
-		t.Fatalf("promote: err=%v resp=%v\n%s", err, resp, s.logs())
+	if err != nil {
+		t.Fatalf("promote: err=%v\n%s", err, s.logs())
 	}
 	if resp.GetEpoch() != 1 || resp.GetTimeline() != 2 {
 		t.Fatalf("promote response: %v", resp)
@@ -333,27 +346,27 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	s.psql("INSERT INTO t VALUES (2, 'after-promote')")
 
 	t.Log("replay of a stale epoch on the new primary is refused")
-	if r, err := s.grpc.Promote(ctx, &pgshardv1.PromoteRequest{Epoch: 1}); err != nil || r.GetError() == nil {
-		t.Fatalf("epoch 1 replayed: %v %v", r, err)
+	if _, err := s.grpc.Promote(ctx, &pgshardv1.PromoteRequest{Epoch: 1}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("epoch 1 replayed: %v", err)
 	}
-	if r, err := s.grpc.Reload(ctx, &pgshardv1.ReloadRequest{Epoch: 0}); err != nil || r.GetError() == nil {
-		t.Fatalf("reload with stale epoch accepted: %v %v", r, err)
+	if _, err := s.grpc.Reload(ctx, &pgshardv1.ReloadRequest{Epoch: 0}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("reload with stale epoch accepted: %v", err)
 	}
-	if r, err := s.grpc.Reload(ctx, &pgshardv1.ReloadRequest{Epoch: 2}); err != nil || r.GetError() == nil {
-		t.Fatalf("reload with a future epoch accepted: %v %v", r, err)
+	if _, err := s.grpc.Reload(ctx, &pgshardv1.ReloadRequest{Epoch: 2}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("reload with a future epoch accepted: %v", err)
 	}
-	if r, err := s.grpc.Reload(ctx, &pgshardv1.ReloadRequest{Epoch: 1}); err != nil || r.GetError() != nil {
-		t.Fatalf("reload with the current epoch refused: %v %v", r, err)
+	if _, err := s.grpc.Reload(ctx, &pgshardv1.ReloadRequest{Epoch: 1}); err != nil {
+		t.Fatalf("reload with the current epoch refused: %v", err)
 	}
 
 	t.Log("old primary diverges, then demotes via pg_rewind")
 	p.psql("INSERT INTO t VALUES (100, 'diverged')")
 	p.psql("CHECKPOINT")
 	dctx, dcancel := context.WithTimeout(ctx, 5*time.Minute)
-	dresp, err := p.grpc.Demote(dctx, &pgshardv1.DemoteRequest{Epoch: 1})
+	_, err = p.grpc.Demote(dctx, &pgshardv1.DemoteRequest{Epoch: 1})
 	dcancel()
-	if err != nil || dresp.GetError() != nil {
-		t.Fatalf("demote: err=%v resp=%v\n%s", err, dresp, p.logs())
+	if err != nil {
+		t.Fatalf("demote: err=%v\n%s", err, p.logs())
 	}
 	if strings.Contains(p.logs(), "pg_rewind failed") {
 		t.Fatalf("demote fell back to reclone; expected rewind\n%s", p.logs())
@@ -382,7 +395,7 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	rctx, rcancel := context.WithTimeout(ctx, 5*time.Minute)
 	rresp, err := p.grpc.Reclone(rctx, &pgshardv1.RecloneRequest{Epoch: 1, SourceKind: pgshardv1.RecloneRequest_SOURCE_KIND_PRIMARY})
 	rcancel()
-	if err != nil || rresp.GetError() != nil || rresp.GetEpoch() != 1 {
+	if err != nil || rresp.GetEpoch() != 1 {
 		t.Fatalf("reclone: err=%v resp=%v\n%s", err, rresp, p.logs())
 	}
 	if !strings.Contains(p.logs(), "cloning from primary") {
@@ -396,33 +409,34 @@ func runAgentSuite(t *testing.T, image, bin string) {
 	}
 
 	t.Log("slot RPCs and backup RPCs without a policy")
-	cs, err := s.grpc.CreateSlot(ctx, &pgshardv1.CreateSlotRequest{Epoch: 1, Name: "extra", Kind: pgshardv1.SlotKind_SLOT_KIND_PHYSICAL})
-	if err != nil || cs.GetError() != nil {
-		t.Fatalf("create slot: %v %v", cs, err)
+	if _, err := s.grpc.CreateSlot(ctx, &pgshardv1.CreateSlotRequest{Epoch: 1, Name: "extra", Kind: pgshardv1.SlotKind_SLOT_KIND_PHYSICAL}); err != nil {
+		t.Fatalf("create slot: %v", err)
 	}
 	ls, err := s.grpc.ListSlots(ctx, &pgshardv1.ListSlotsRequest{})
 	if err != nil || len(ls.GetSlots()) != 2 || ls.GetSlots()[0].GetName() != "extra" || ls.GetSlots()[1].GetName() != "pgshard_s0_0" || !ls.GetSlots()[1].GetActive() {
 		t.Fatalf("list slots: %v %v", ls, err)
 	}
-	if ds, err := s.grpc.DropSlot(ctx, &pgshardv1.DropSlotRequest{Epoch: 1, Name: "extra"}); err != nil || ds.GetError() != nil {
-		t.Fatalf("drop slot: %v %v", ds, err)
+	if _, err := s.grpc.DropSlot(ctx, &pgshardv1.DropSlotRequest{Epoch: 1, Name: "extra"}); err != nil {
+		t.Fatalf("drop slot: %v", err)
 	}
 	t.Log("stream slot lifecycle: failover slot, publication, standby sync, synchronized_standby_slots")
-	if r, err := s.grpc.CreateStreamSlot(ctx, &pgshardv1.CreateStreamSlotRequest{Epoch: 0, Stream: "orders", Database: "postgres"}); err != nil || r.GetError() == nil {
-		t.Fatalf("stale create stream slot accepted: %v %v", r, err)
+	if _, err := s.grpc.CreateStreamSlot(ctx, &pgshardv1.CreateStreamSlotRequest{Epoch: 0, Stream: "orders", Database: "postgres"}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("stale create stream slot accepted: %v", err)
 	}
-	if r, err := s.grpc.CreateStreamSlot(ctx, &pgshardv1.CreateStreamSlotRequest{Epoch: 1, Stream: "Bad-Name", Database: "postgres"}); err != nil || r.GetError() == nil {
-		t.Fatalf("bad stream name accepted: %v %v", r, err)
+	// A name the agent will not accept is the caller's mistake, not a
+	// failure of this member, and says so.
+	if _, err := s.grpc.CreateStreamSlot(ctx, &pgshardv1.CreateStreamSlotRequest{Epoch: 1, Stream: "Bad-Name", Database: "postgres"}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("bad stream name accepted: %v", err)
 	}
 	css, err := s.grpc.CreateStreamSlot(ctx, &pgshardv1.CreateStreamSlotRequest{Epoch: 1, Stream: "orders", Database: "postgres", TwoPhase: true})
-	if err != nil || css.GetError() != nil || css.GetSlot() != "pgshard_orders_s0" || css.GetLsn() == 0 {
+	if err != nil || css.GetSlot() != "pgshard_orders_s0" || css.GetLsn() == 0 {
 		t.Fatalf("create stream slot: %v %v", css, err)
 	}
-	if again, err := s.grpc.CreateStreamSlot(ctx, &pgshardv1.CreateStreamSlotRequest{Epoch: 1, Stream: "orders", Database: "postgres", TwoPhase: true}); err != nil || again.GetError() != nil || again.GetSlot() != css.GetSlot() || again.GetLsn() == 0 {
+	if again, err := s.grpc.CreateStreamSlot(ctx, &pgshardv1.CreateStreamSlotRequest{Epoch: 1, Stream: "orders", Database: "postgres", TwoPhase: true}); err != nil || again.GetSlot() != css.GetSlot() || again.GetLsn() == 0 {
 		t.Fatalf("recreate with same two_phase must be idempotent: %v %v", again, err)
 	}
-	if again, err := s.grpc.CreateStreamSlot(ctx, &pgshardv1.CreateStreamSlotRequest{Epoch: 1, Stream: "orders", Database: "postgres", TwoPhase: false}); err != nil || again.GetError() == nil {
-		t.Fatalf("recreate with different two_phase must fail: %v %v", again, err)
+	if _, err := s.grpc.CreateStreamSlot(ctx, &pgshardv1.CreateStreamSlotRequest{Epoch: 1, Stream: "orders", Database: "postgres", TwoPhase: false}); err == nil {
+		t.Fatal("recreate with different two_phase must fail")
 	}
 	if got := s.psql("SELECT puballtables FROM pg_publication WHERE pubname = 'pgshard_all'"); got != "t" {
 		t.Fatalf("publication: %q", got)
@@ -436,7 +450,7 @@ func runAgentSuite(t *testing.T, image, bin string) {
 		t.Fatalf("stream slot: %v", sl)
 	}
 	sss, err := s.grpc.SetSynchronizedStandbySlots(ctx, &pgshardv1.SetSynchronizedStandbySlotsRequest{Epoch: 1, Slots: []string{"pgshard_s0_0", "pgshard_missing"}})
-	if err != nil || sss.GetError() != nil || len(sss.GetApplied()) != 1 || sss.GetApplied()[0] != "pgshard_s0_0" {
+	if err != nil || len(sss.GetApplied()) != 1 || sss.GetApplied()[0] != "pgshard_s0_0" {
 		t.Fatalf("set synchronized standby slots: %v %v", sss, err)
 	}
 	if got := s.psql("SHOW synchronized_standby_slots"); got != "pgshard_s0_0" {
@@ -454,40 +468,39 @@ func runAgentSuite(t *testing.T, image, bin string) {
 		}
 		time.Sleep(time.Second)
 	}
-	if r, err := s.grpc.SetSynchronizedStandbySlots(ctx, &pgshardv1.SetSynchronizedStandbySlotsRequest{Epoch: 1}); err != nil || r.GetError() != nil || len(r.GetApplied()) != 0 {
+	if r, err := s.grpc.SetSynchronizedStandbySlots(ctx, &pgshardv1.SetSynchronizedStandbySlotsRequest{Epoch: 1}); err != nil || len(r.GetApplied()) != 0 {
 		t.Fatalf("clear synchronized standby slots: %v %v", r, err)
 	}
 	if got := s.psql("SHOW synchronized_standby_slots"); got != "" {
 		t.Fatalf("synchronized_standby_slots after clear: %q", got)
 	}
-	if r, err := s.grpc.DropStreamSlot(ctx, &pgshardv1.DropStreamSlotRequest{Epoch: 1, Stream: "orders"}); err != nil || r.GetError() != nil {
-		t.Fatalf("drop stream slot: %v %v", r, err)
+	if _, err := s.grpc.DropStreamSlot(ctx, &pgshardv1.DropStreamSlotRequest{Epoch: 1, Stream: "orders"}); err != nil {
+		t.Fatalf("drop stream slot: %v", err)
 	}
-	if r, err := s.grpc.DropStreamSlot(ctx, &pgshardv1.DropStreamSlotRequest{Epoch: 1, Stream: "orders"}); err != nil || r.GetError() != nil {
-		t.Fatalf("drop stream slot twice: %v %v", r, err)
+	if _, err := s.grpc.DropStreamSlot(ctx, &pgshardv1.DropStreamSlotRequest{Epoch: 1, Stream: "orders"}); err != nil {
+		t.Fatalf("drop stream slot twice: %v", err)
 	}
 	if got := s.psql("SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pgshard_orders_s0'"); got != "0" {
 		t.Fatalf("stream slot still present: %s", got)
 	}
 
 	rp, err := s.grpc.CreateRestorePoint(ctx, &pgshardv1.CreateRestorePointRequest{Epoch: 1, Name: "rp1"})
-	if err != nil || rp.GetError() != nil || rp.GetLsn() == 0 {
+	if err != nil || rp.GetLsn() == 0 {
 		t.Fatalf("restore point: %v %v", rp, err)
 	}
 	if bk, err := s.grpc.Backup(ctx, &pgshardv1.BackupRequest{Epoch: 1}); err != nil || !strings.Contains(bk.GetError().GetMessage(), "no backup policy") {
 		t.Fatalf("backup without policy: %v %v", bk, err)
 	}
-	if ri, err := s.grpc.RestoreInfo(ctx, &pgshardv1.RestoreInfoRequest{}); err != nil || !strings.Contains(ri.GetError().GetMessage(), "no backup policy") {
-		t.Fatalf("restore info without policy: %v %v", ri, err)
+	if _, err := s.grpc.RestoreInfo(ctx, &pgshardv1.RestoreInfoRequest{}); err == nil || !strings.Contains(err.Error(), "no backup policy") {
+		t.Fatalf("restore info without policy: %v", err)
 	}
 	if s.status().GetEpoch() != 1 {
 		t.Fatalf("epoch after refused backup: %d", s.status().GetEpoch())
 	}
 
 	t.Log("restart RPC")
-	rs, err := s.grpc.Restart(ctx, &pgshardv1.RestartRequest{Epoch: 1, Mode: pgshardv1.RestartRequest_MODE_FAST})
-	if err != nil || rs.GetError() != nil {
-		t.Fatalf("restart: %v %v\n%s", rs, err, s.logs())
+	if _, err := s.grpc.Restart(ctx, &pgshardv1.RestartRequest{Epoch: 1, Mode: pgshardv1.RestartRequest_MODE_FAST}); err != nil {
+		t.Fatalf("restart: %v\n%s", err, s.logs())
 	}
 	s.waitHTTP("/readyz", 200, 60*time.Second)
 

@@ -12,6 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/andrew01234567890/pgshard/internal/agent/backup"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 )
@@ -115,8 +118,7 @@ func TestBackupRPCRefusesStandbyAndMissingPolicy(t *testing.T) {
 	if resp.GetError() == nil || !strings.Contains(resp.GetError().GetMessage(), "no backup policy") || len(f.calls) != 0 {
 		t.Fatalf("no policy: %v %v", resp.GetError(), f.calls)
 	}
-	info, _ := s.RestoreInfo(context.Background(), nil)
-	if info.GetError() == nil {
+	if _, err := s.RestoreInfo(context.Background(), nil); err == nil {
 		t.Fatal("restore info without policy must fail")
 	}
 }
@@ -135,13 +137,13 @@ func TestBackupRPCReportsPgbackrestFailure(t *testing.T) {
 
 func TestRestoreInfoExpireVerify(t *testing.T) {
 	s, f := newBackupServer(t, false)
-	info, _ := s.RestoreInfo(context.Background(), nil)
-	if info.GetError() != nil || info.GetStanza() != "t-catalog-pg18" || info.GetArchiveMax() != "000000010000000000000004" || len(info.GetBackups()) != 2 || info.GetStatusMessage() != "ok" {
-		t.Fatalf("info %v", info)
+	info, err := s.RestoreInfo(context.Background(), nil)
+	if err != nil || info.GetStanza() != "t-catalog-pg18" || info.GetArchiveMax() != "000000010000000000000004" || len(info.GetBackups()) != 2 || info.GetStatusMessage() != "ok" {
+		t.Fatalf("info %v %v", info, err)
 	}
-	exp, _ := s.Expire(context.Background(), &pgshardv1.ExpireRequest{})
-	if exp.GetError() != nil || len(exp.GetLog()) != 1 || !strings.HasSuffix(f.calls[len(f.calls)-1], " expire") {
-		t.Fatalf("expire %v %v", exp, f.calls)
+	exp, err := s.Expire(context.Background(), &pgshardv1.ExpireRequest{})
+	if err != nil || len(exp.GetLog()) != 1 || !strings.HasSuffix(f.calls[len(f.calls)-1], " expire") {
+		t.Fatalf("expire %v %v %v", exp, err, f.calls)
 	}
 	f.fail["verify"] = errors.New("exit status 1")
 	ver, _ := s.Verify(context.Background(), nil)
@@ -151,8 +153,10 @@ func TestRestoreInfoExpireVerify(t *testing.T) {
 	if err := s.epoch.Accept(1); err != nil {
 		t.Fatal(err)
 	}
-	if exp, _ := s.Expire(context.Background(), &pgshardv1.ExpireRequest{Epoch: 0}); exp.GetError().GetSqlstate() != "55000" {
-		t.Fatalf("expire must be fenced: %v", exp)
+	// The stale epoch fails the RPC now, with the code that says the caller's
+	// view is what is wrong.
+	if _, err := s.Expire(context.Background(), &pgshardv1.ExpireRequest{Epoch: 0}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expire must be fenced: %v", err)
 	}
 }
 

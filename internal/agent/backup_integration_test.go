@@ -135,8 +135,8 @@ func TestBackupIntegration(t *testing.T) {
 		deadline := time.Now().Add(2 * time.Minute)
 		var last *pgshardv1.RestoreInfoResponse
 		for time.Now().Before(deadline) {
-			last, _ = p.grpc.RestoreInfo(ctx, &pgshardv1.RestoreInfoRequest{})
-			if last.GetError() == nil && cond(last) {
+			var err error
+			if last, err = p.grpc.RestoreInfo(ctx, &pgshardv1.RestoreInfoRequest{}); err == nil && cond(last) {
 				return last
 			}
 			time.Sleep(time.Second)
@@ -186,9 +186,8 @@ func TestBackupIntegration(t *testing.T) {
 	if err != nil || ver.GetError() != nil {
 		t.Fatalf("verify: %v %v", err, ver.GetError())
 	}
-	exp, err := p.grpc.Expire(ctx, &pgshardv1.ExpireRequest{})
-	if err != nil || exp.GetError() != nil {
-		t.Fatalf("expire: %v %v", err, exp.GetError())
+	if _, err := p.grpc.Expire(ctx, &pgshardv1.ExpireRequest{}); err != nil {
+		t.Fatalf("expire: %v", err)
 	}
 	if resp, _ := s.grpc.Backup(ctx, &pgshardv1.BackupRequest{}); resp.GetError() == nil || !strings.Contains(resp.GetError().GetMessage(), "primary only") {
 		t.Fatalf("standby backup must be refused: %v", resp)
@@ -203,9 +202,8 @@ func TestBackupIntegration(t *testing.T) {
 	// Replica re-clone from the repository: rows written after the last
 	// backup arrive through the archive and the stream.
 	p.psql("INSERT INTO b SELECT generate_series(6001, 6500)")
-	rc, err := s.grpc.Reclone(ctx, &pgshardv1.RecloneRequest{SourceKind: pgshardv1.RecloneRequest_SOURCE_KIND_BACKUP})
-	if err != nil || rc.GetError() != nil {
-		t.Fatalf("reclone from backup: %v %v\n%s", err, rc.GetError(), s.logs())
+	if _, err := s.grpc.Reclone(ctx, &pgshardv1.RecloneRequest{SourceKind: pgshardv1.RecloneRequest_SOURCE_KIND_BACKUP}); err != nil {
+		t.Fatalf("reclone from backup: %v\n%s", err, s.logs())
 	}
 	if !strings.Contains(s.logs(), "recloning from the repository") {
 		t.Fatalf("standby did not restore from the repository:\n%s", s.logs())

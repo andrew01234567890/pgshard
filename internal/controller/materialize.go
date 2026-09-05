@@ -99,12 +99,8 @@ func (m *AgentMaterializer) MaterializeSchema(ctx context.Context, target ShardR
 		return fmt.Errorf("agent %s: no agent control-plane token: start the controller with --agent-token-file", addr)
 	}
 	ctx = agentauth.WithToken(ctx, m.AgentToken)
-	resp, err := pgshardv1.NewAgentClient(conn).MaterializeSchema(ctx, &pgshardv1.MaterializeSchemaRequest{SourceConninfo: sourceConnInfo, Database: database, Epoch: proto.Uint64(uint64(epoch))})
-	if err != nil {
+	if _, err := pgshardv1.NewAgentClient(conn).MaterializeSchema(ctx, &pgshardv1.MaterializeSchemaRequest{SourceConninfo: sourceConnInfo, Database: database, Epoch: proto.Uint64(uint64(epoch))}); err != nil {
 		return fmt.Errorf("agent %s: %w", addr, err)
-	}
-	if e := resp.GetError(); e != nil {
-		return fmt.Errorf("agent %s: %s", addr, e.GetMessage())
 	}
 	return nil
 }

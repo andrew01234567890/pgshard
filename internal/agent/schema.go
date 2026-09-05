@@ -21,20 +21,17 @@ func (s *Server) MaterializeSchema(ctx context.Context, req *pgshardv1.Materiali
 	// refused rather than read as zero: a caller that does not know the
 	// epoch cannot be shown to mean this member.
 	if req.Epoch == nil {
-		resp.Error = pgErr(errors.New("materialize schema: no epoch in the request; the caller must name the epoch it believes this member serves at"))
-		return resp, nil
+		return nil, s.rpcErr(errors.New("materialize schema: no epoch in the request; the caller must name the epoch it believes this member serves at"))
 	}
 	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
 	if err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	defer endTerm()
 	resp.Epoch = req.GetEpoch()
 	ctx, cancel := context.WithTimeout(ctx, s.opTimeout)
 	defer cancel()
-	resp.Error = pgErr(s.inst.MaterializeSchema(ctx, req.GetSourceConninfo(), req.GetDatabase()))
-	return resp, nil
+	return nil, s.rpcErr(s.inst.MaterializeSchema(ctx, req.GetSourceConninfo(), req.GetDatabase()))
 }
 
 // MaterializeSchema runs pg_dump --schema-only on source and pipes it into

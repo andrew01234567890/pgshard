@@ -384,8 +384,11 @@ type StatusResponse struct {
 	// Current timeline id.
 	Timeline uint32 `protobuf:"varint,4,opt,name=timeline,proto3" json:"timeline,omitempty"`
 	// True when PostgreSQL accepts connections.
-	Running bool   `protobuf:"varint,5,opt,name=running,proto3" json:"running,omitempty"`
-	Error   *Error `protobuf:"bytes,6,opt,name=error,proto3" json:"error,omitempty"`
+	Running bool `protobuf:"varint,5,opt,name=running,proto3" json:"running,omitempty"`
+	// Set when the role or position could not be read. Kept in the body
+	// because the rest of this response is still true: reconciliation
+	// publishes the build of an agent whose PostgreSQL is not answering.
+	Error *Error `protobuf:"bytes,6,opt,name=error,proto3" json:"error,omitempty"`
 	// True while a promotion has run pg_ctl promote but not yet finished its
 	// post-promotion setup; the operator re-issues Promote to complete it.
 	PromotionPending bool `protobuf:"varint,7,opt,name=promotion_pending,json=promotionPending,proto3" json:"promotion_pending,omitempty"`
@@ -547,7 +550,6 @@ type PromoteResponse struct {
 	Epoch uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
 	// Timeline id after promotion.
 	Timeline      uint32 `protobuf:"varint,2,opt,name=timeline,proto3" json:"timeline,omitempty"`
-	Error         *Error `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -594,13 +596,6 @@ func (x *PromoteResponse) GetTimeline() uint32 {
 		return x.Timeline
 	}
 	return 0
-}
-
-func (x *PromoteResponse) GetError() *Error {
-	if x != nil {
-		return x.Error
-	}
-	return nil
 }
 
 // DemoteRequest demotes the instance.
@@ -653,7 +648,6 @@ func (x *DemoteRequest) GetEpoch() uint64 {
 type DemoteResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Epoch         uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	Error         *Error                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -693,13 +687,6 @@ func (x *DemoteResponse) GetEpoch() uint64 {
 		return x.Epoch
 	}
 	return 0
-}
-
-func (x *DemoteResponse) GetError() *Error {
-	if x != nil {
-		return x.Error
-	}
-	return nil
 }
 
 // RewindRequest rewinds the instance to follow a source.
@@ -761,7 +748,6 @@ func (x *RewindRequest) GetSource() string {
 type RewindResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Epoch         uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	Error         *Error                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -801,13 +787,6 @@ func (x *RewindResponse) GetEpoch() uint64 {
 		return x.Epoch
 	}
 	return 0
-}
-
-func (x *RewindResponse) GetError() *Error {
-	if x != nil {
-		return x.Error
-	}
-	return nil
 }
 
 // RecloneRequest rebuilds the data directory.
@@ -876,7 +855,6 @@ func (x *RecloneRequest) GetBackupRef() string {
 type RecloneResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Epoch         uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	Error         *Error                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -916,13 +894,6 @@ func (x *RecloneResponse) GetEpoch() uint64 {
 		return x.Epoch
 	}
 	return 0
-}
-
-func (x *RecloneResponse) GetError() *Error {
-	if x != nil {
-		return x.Error
-	}
-	return nil
 }
 
 // ReloadRequest reloads configuration.
@@ -975,7 +946,6 @@ func (x *ReloadRequest) GetEpoch() uint64 {
 type ReloadResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Epoch uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	Error *Error                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
 	// settings_hash identifies the configuration the agent applied, as
 	// published by the operator in the agent config.
 	SettingsHash  string `protobuf:"bytes,3,opt,name=settings_hash,json=settingsHash,proto3" json:"settings_hash,omitempty"`
@@ -1018,13 +988,6 @@ func (x *ReloadResponse) GetEpoch() uint64 {
 		return x.Epoch
 	}
 	return 0
-}
-
-func (x *ReloadResponse) GetError() *Error {
-	if x != nil {
-		return x.Error
-	}
-	return nil
 }
 
 func (x *ReloadResponse) GetSettingsHash() string {
@@ -1091,7 +1054,6 @@ func (x *RestartRequest) GetMode() RestartRequest_Mode {
 type RestartResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Epoch         uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	Error         *Error                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1131,13 +1093,6 @@ func (x *RestartResponse) GetEpoch() uint64 {
 		return x.Epoch
 	}
 	return 0
-}
-
-func (x *RestartResponse) GetError() *Error {
-	if x != nil {
-		return x.Error
-	}
-	return nil
 }
 
 // CreateRestorePointRequest creates a named restore point.
@@ -1199,7 +1154,6 @@ type CreateRestorePointResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Epoch         uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
 	Lsn           uint64                 `protobuf:"varint,2,opt,name=lsn,proto3" json:"lsn,omitempty"`
-	Error         *Error                 `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1246,13 +1200,6 @@ func (x *CreateRestorePointResponse) GetLsn() uint64 {
 		return x.Lsn
 	}
 	return 0
-}
-
-func (x *CreateRestorePointResponse) GetError() *Error {
-	if x != nil {
-		return x.Error
-	}
-	return nil
 }
 
 // CreateSlotRequest creates a replication slot.
@@ -1340,7 +1287,6 @@ type CreateSlotResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Epoch         uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
 	Lsn           uint64                 `protobuf:"varint,2,opt,name=lsn,proto3" json:"lsn,omitempty"`
-	Error         *Error                 `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1387,13 +1333,6 @@ func (x *CreateSlotResponse) GetLsn() uint64 {
 		return x.Lsn
 	}
 	return 0
-}
-
-func (x *CreateSlotResponse) GetError() *Error {
-	if x != nil {
-		return x.Error
-	}
-	return nil
 }
 
 // DropSlotRequest drops a replication slot.
@@ -1454,7 +1393,6 @@ func (x *DropSlotRequest) GetName() string {
 type DropSlotResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Epoch         uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	Error         *Error                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1494,13 +1432,6 @@ func (x *DropSlotResponse) GetEpoch() uint64 {
 		return x.Epoch
 	}
 	return 0
-}
-
-func (x *DropSlotResponse) GetError() *Error {
-	if x != nil {
-		return x.Error
-	}
-	return nil
 }
 
 // ListSlotsRequest lists replication slots.
@@ -1765,7 +1696,6 @@ type CreateStreamSlotResponse struct {
 	Slot  string                 `protobuf:"bytes,2,opt,name=slot,proto3" json:"slot,omitempty"`
 	// Consistent point the slot starts from.
 	Lsn           uint64 `protobuf:"varint,3,opt,name=lsn,proto3" json:"lsn,omitempty"`
-	Error         *Error `protobuf:"bytes,4,opt,name=error,proto3" json:"error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1819,13 +1749,6 @@ func (x *CreateStreamSlotResponse) GetLsn() uint64 {
 		return x.Lsn
 	}
 	return 0
-}
-
-func (x *CreateStreamSlotResponse) GetError() *Error {
-	if x != nil {
-		return x.Error
-	}
-	return nil
 }
 
 // DropStreamSlotRequest drops a change stream's slot on this shard.
@@ -1886,7 +1809,6 @@ func (x *DropStreamSlotRequest) GetStream() string {
 type DropStreamSlotResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Epoch         uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	Error         *Error                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1926,13 +1848,6 @@ func (x *DropStreamSlotResponse) GetEpoch() uint64 {
 		return x.Epoch
 	}
 	return 0
-}
-
-func (x *DropStreamSlotResponse) GetError() *Error {
-	if x != nil {
-		return x.Error
-	}
-	return nil
 }
 
 // SetSynchronizedStandbySlotsRequest names the physical slots of the
@@ -1996,7 +1911,6 @@ type SetSynchronizedStandbySlotsResponse struct {
 	Epoch uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
 	// Subset of the requested slots that exist and are active.
 	Applied       []string `protobuf:"bytes,2,rep,name=applied,proto3" json:"applied,omitempty"`
-	Error         *Error   `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2045,19 +1959,11 @@ func (x *SetSynchronizedStandbySlotsResponse) GetApplied() []string {
 	return nil
 }
 
-func (x *SetSynchronizedStandbySlotsResponse) GetError() *Error {
-	if x != nil {
-		return x.Error
-	}
-	return nil
-}
-
 // ListSlotsResponse returns the slots.
 type ListSlotsResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Epoch         uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
 	Slots         []*Slot                `protobuf:"bytes,2,rep,name=slots,proto3" json:"slots,omitempty"`
-	Error         *Error                 `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2102,13 +2008,6 @@ func (x *ListSlotsResponse) GetEpoch() uint64 {
 func (x *ListSlotsResponse) GetSlots() []*Slot {
 	if x != nil {
 		return x.Slots
-	}
-	return nil
-}
-
-func (x *ListSlotsResponse) GetError() *Error {
-	if x != nil {
-		return x.Error
 	}
 	return nil
 }
@@ -2417,7 +2316,6 @@ func (*RestoreInfoRequest) Descriptor() ([]byte, []int) {
 type RestoreInfoResponse struct {
 	state  protoimpl.MessageState `protogen:"open.v1"`
 	Epoch  uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	Error  *Error                 `protobuf:"bytes,4,opt,name=error,proto3" json:"error,omitempty"`
 	Stanza string                 `protobuf:"bytes,5,opt,name=stanza,proto3" json:"stanza,omitempty"`
 	// pgBackRest stanza status code and message (0 = ok).
 	StatusCode    int64  `protobuf:"varint,6,opt,name=status_code,json=statusCode,proto3" json:"status_code,omitempty"`
@@ -2465,13 +2363,6 @@ func (x *RestoreInfoResponse) GetEpoch() uint64 {
 		return x.Epoch
 	}
 	return 0
-}
-
-func (x *RestoreInfoResponse) GetError() *Error {
-	if x != nil {
-		return x.Error
-	}
-	return nil
 }
 
 func (x *RestoreInfoResponse) GetStanza() string {
@@ -2566,7 +2457,6 @@ func (x *ExpireRequest) GetEpoch() uint64 {
 type ExpireResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Epoch         uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	Error         *Error                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
 	Log           []string               `protobuf:"bytes,3,rep,name=log,proto3" json:"log,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -2607,13 +2497,6 @@ func (x *ExpireResponse) GetEpoch() uint64 {
 		return x.Epoch
 	}
 	return 0
-}
-
-func (x *ExpireResponse) GetError() *Error {
-	if x != nil {
-		return x.Error
-	}
-	return nil
 }
 
 func (x *ExpireResponse) GetLog() []string {
@@ -2878,7 +2761,6 @@ type ListTransactionDecisionsResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Epoch         uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
 	Decisions     []*TransactionDecision `protobuf:"bytes,2,rep,name=decisions,proto3" json:"decisions,omitempty"`
-	Error         *Error                 `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2923,13 +2805,6 @@ func (x *ListTransactionDecisionsResponse) GetEpoch() uint64 {
 func (x *ListTransactionDecisionsResponse) GetDecisions() []*TransactionDecision {
 	if x != nil {
 		return x.Decisions
-	}
-	return nil
-}
-
-func (x *ListTransactionDecisionsResponse) GetError() *Error {
-	if x != nil {
-		return x.Error
 	}
 	return nil
 }
@@ -3030,7 +2905,6 @@ type ListPreparedTransactionsResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Epoch         uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
 	Prepared      []*PreparedTransaction `protobuf:"bytes,2,rep,name=prepared,proto3" json:"prepared,omitempty"`
-	Error         *Error                 `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3075,13 +2949,6 @@ func (x *ListPreparedTransactionsResponse) GetEpoch() uint64 {
 func (x *ListPreparedTransactionsResponse) GetPrepared() []*PreparedTransaction {
 	if x != nil {
 		return x.Prepared
-	}
-	return nil
-}
-
-func (x *ListPreparedTransactionsResponse) GetError() *Error {
-	if x != nil {
-		return x.Error
 	}
 	return nil
 }
@@ -3157,7 +3024,6 @@ type ReconcilePreparedTransactionsResponse struct {
 	RolledBack uint32                 `protobuf:"varint,3,opt,name=rolled_back,json=rolledBack,proto3" json:"rolled_back,omitempty"`
 	// Commit-decided gids that are neither prepared nor committed here.
 	Contradictions []string `protobuf:"bytes,4,rep,name=contradictions,proto3" json:"contradictions,omitempty"`
-	Error          *Error   `protobuf:"bytes,5,opt,name=error,proto3" json:"error,omitempty"`
 	// Commit-decided gids that are not prepared here and whose recorded
 	// transaction id no longer resolves (frozen, unrecorded or in the
 	// future), so the commit cannot be verified.
@@ -3223,13 +3089,6 @@ func (x *ReconcilePreparedTransactionsResponse) GetRolledBack() uint32 {
 func (x *ReconcilePreparedTransactionsResponse) GetContradictions() []string {
 	if x != nil {
 		return x.Contradictions
-	}
-	return nil
-}
-
-func (x *ReconcilePreparedTransactionsResponse) GetError() *Error {
-	if x != nil {
-		return x.Error
 	}
 	return nil
 }
@@ -3314,7 +3173,6 @@ func (x *SetWriteFenceRequest) GetReason() string {
 type SetWriteFenceResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Epoch         uint64                 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	Error         *Error                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3354,13 +3212,6 @@ func (x *SetWriteFenceResponse) GetEpoch() uint64 {
 		return x.Epoch
 	}
 	return 0
-}
-
-func (x *SetWriteFenceResponse) GetError() *Error {
-	if x != nil {
-		return x.Error
-	}
-	return nil
 }
 
 // MaterializeSchemaRequest names the source and the database to copy.
@@ -3434,7 +3285,6 @@ func (x *MaterializeSchemaRequest) GetEpoch() uint64 {
 // MaterializeSchemaResponse reports the outcome.
 type MaterializeSchemaResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	Error *Error                 `protobuf:"bytes,1,opt,name=error,proto3" json:"error,omitempty"`
 	// Epoch the member is serving at now.
 	Epoch         uint64 `protobuf:"varint,2,opt,name=epoch,proto3" json:"epoch,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -3471,13 +3321,6 @@ func (*MaterializeSchemaResponse) Descriptor() ([]byte, []int) {
 	return file_pgshard_v1_agent_proto_rawDescGZIP(), []int{50}
 }
 
-func (x *MaterializeSchemaResponse) GetError() *Error {
-	if x != nil {
-		return x.Error
-	}
-	return nil
-}
-
 func (x *MaterializeSchemaResponse) GetEpoch() uint64 {
 	if x != nil {
 		return x.Epoch
@@ -3507,22 +3350,19 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\fROLE_STANDBY\x10\x02\"I\n" +
 	"\x0ePromoteRequest\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12!\n" +
-	"\flease_holder\x18\x02 \x01(\tR\vleaseHolder\"l\n" +
+	"\flease_holder\x18\x02 \x01(\tR\vleaseHolder\"P\n" +
 	"\x0fPromoteResponse\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x1a\n" +
-	"\btimeline\x18\x02 \x01(\rR\btimeline\x12'\n" +
-	"\x05error\x18\x03 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"%\n" +
+	"\btimeline\x18\x02 \x01(\rR\btimelineJ\x04\b\x03\x10\x04R\x05error\"%\n" +
 	"\rDemoteRequest\x12\x14\n" +
-	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\"O\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\"3\n" +
 	"\x0eDemoteResponse\x12\x14\n" +
-	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12'\n" +
-	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"=\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epochJ\x04\b\x02\x10\x03R\x05error\"=\n" +
 	"\rRewindRequest\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x16\n" +
-	"\x06source\x18\x02 \x01(\tR\x06source\"O\n" +
+	"\x06source\x18\x02 \x01(\tR\x06source\"3\n" +
 	"\x0eRewindResponse\x12\x14\n" +
-	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12'\n" +
-	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"\xe9\x01\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epochJ\x04\b\x02\x10\x03R\x05error\"\xe9\x01\n" +
 	"\x0eRecloneRequest\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12F\n" +
 	"\vsource_kind\x18\x02 \x01(\x0e2%.pgshard.v1.RecloneRequest.SourceKindR\n" +
@@ -3533,16 +3373,14 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"SourceKind\x12\x1b\n" +
 	"\x17SOURCE_KIND_UNSPECIFIED\x10\x00\x12\x17\n" +
 	"\x13SOURCE_KIND_PRIMARY\x10\x01\x12\x16\n" +
-	"\x12SOURCE_KIND_BACKUP\x10\x02\"P\n" +
+	"\x12SOURCE_KIND_BACKUP\x10\x02\"4\n" +
 	"\x0fRecloneResponse\x12\x14\n" +
-	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12'\n" +
-	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"%\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epochJ\x04\b\x02\x10\x03R\x05error\"%\n" +
 	"\rReloadRequest\x12\x14\n" +
-	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\"t\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\"X\n" +
 	"\x0eReloadResponse\x12\x14\n" +
-	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12'\n" +
-	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\x12#\n" +
-	"\rsettings_hash\x18\x03 \x01(\tR\fsettingsHash\"\xac\x01\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12#\n" +
+	"\rsettings_hash\x18\x03 \x01(\tR\fsettingsHashJ\x04\b\x02\x10\x03R\x05error\"\xac\x01\n" +
 	"\x0eRestartRequest\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x123\n" +
 	"\x04mode\x18\x02 \x01(\x0e2\x1f.pgshard.v1.RestartRequest.ModeR\x04mode\"O\n" +
@@ -3551,33 +3389,29 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\n" +
 	"MODE_SMART\x10\x01\x12\r\n" +
 	"\tMODE_FAST\x10\x02\x12\x12\n" +
-	"\x0eMODE_IMMEDIATE\x10\x03\"P\n" +
+	"\x0eMODE_IMMEDIATE\x10\x03\"4\n" +
 	"\x0fRestartResponse\x12\x14\n" +
-	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12'\n" +
-	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"E\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epochJ\x04\b\x02\x10\x03R\x05error\"E\n" +
 	"\x19CreateRestorePointRequest\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x12\n" +
-	"\x04name\x18\x02 \x01(\tR\x04name\"m\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\"Q\n" +
 	"\x1aCreateRestorePointResponse\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x10\n" +
-	"\x03lsn\x18\x02 \x01(\x04R\x03lsn\x12'\n" +
-	"\x05error\x18\x03 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"\x9b\x01\n" +
+	"\x03lsn\x18\x02 \x01(\x04R\x03lsnJ\x04\b\x03\x10\x04R\x05error\"\x9b\x01\n" +
 	"\x11CreateSlotRequest\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12(\n" +
 	"\x04kind\x18\x03 \x01(\x0e2\x14.pgshard.v1.SlotKindR\x04kind\x12\x16\n" +
 	"\x06plugin\x18\x04 \x01(\tR\x06plugin\x12\x1a\n" +
-	"\bfailover\x18\x05 \x01(\bR\bfailover\"e\n" +
+	"\bfailover\x18\x05 \x01(\bR\bfailover\"I\n" +
 	"\x12CreateSlotResponse\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x10\n" +
-	"\x03lsn\x18\x02 \x01(\x04R\x03lsn\x12'\n" +
-	"\x05error\x18\x03 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\";\n" +
+	"\x03lsn\x18\x02 \x01(\x04R\x03lsnJ\x04\b\x03\x10\x04R\x05error\";\n" +
 	"\x0fDropSlotRequest\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x12\n" +
-	"\x04name\x18\x02 \x01(\tR\x04name\"Q\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\"5\n" +
 	"\x10DropSlotResponse\x12\x14\n" +
-	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12'\n" +
-	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"\x12\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epochJ\x04\b\x02\x10\x03R\x05error\"\x12\n" +
 	"\x10ListSlotsRequest\"\xa0\x03\n" +
 	"\x04Slot\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12(\n" +
@@ -3600,29 +3434,25 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x16\n" +
 	"\x06stream\x18\x02 \x01(\tR\x06stream\x12\x1a\n" +
 	"\bdatabase\x18\x03 \x01(\tR\bdatabase\x12\x1b\n" +
-	"\ttwo_phase\x18\x04 \x01(\bR\btwoPhase\"\x7f\n" +
+	"\ttwo_phase\x18\x04 \x01(\bR\btwoPhase\"c\n" +
 	"\x18CreateStreamSlotResponse\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x12\n" +
 	"\x04slot\x18\x02 \x01(\tR\x04slot\x12\x10\n" +
-	"\x03lsn\x18\x03 \x01(\x04R\x03lsn\x12'\n" +
-	"\x05error\x18\x04 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"E\n" +
+	"\x03lsn\x18\x03 \x01(\x04R\x03lsnJ\x04\b\x04\x10\x05R\x05error\"E\n" +
 	"\x15DropStreamSlotRequest\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x16\n" +
-	"\x06stream\x18\x02 \x01(\tR\x06stream\"W\n" +
+	"\x06stream\x18\x02 \x01(\tR\x06stream\";\n" +
 	"\x16DropStreamSlotResponse\x12\x14\n" +
-	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12'\n" +
-	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"P\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epochJ\x04\b\x02\x10\x03R\x05error\"P\n" +
 	"\"SetSynchronizedStandbySlotsRequest\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x14\n" +
-	"\x05slots\x18\x02 \x03(\tR\x05slots\"~\n" +
+	"\x05slots\x18\x02 \x03(\tR\x05slots\"b\n" +
 	"#SetSynchronizedStandbySlotsResponse\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x18\n" +
-	"\aapplied\x18\x02 \x03(\tR\aapplied\x12'\n" +
-	"\x05error\x18\x03 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"z\n" +
+	"\aapplied\x18\x02 \x03(\tR\aappliedJ\x04\b\x03\x10\x04R\x05error\"^\n" +
 	"\x11ListSlotsResponse\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12&\n" +
-	"\x05slots\x18\x02 \x03(\v2\x10.pgshard.v1.SlotR\x05slots\x12'\n" +
-	"\x05error\x18\x03 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"\xa4\x01\n" +
+	"\x05slots\x18\x02 \x03(\v2\x10.pgshard.v1.SlotR\x05slotsJ\x04\b\x03\x10\x04R\x05error\"\xa4\x01\n" +
 	"\rBackupRequest\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x122\n" +
 	"\x04type\x18\x02 \x01(\x0e2\x1e.pgshard.v1.BackupRequest.TypeR\x04type\"I\n" +
@@ -3655,10 +3485,9 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\x05error\x18\x03 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\x12*\n" +
 	"\x04info\x18\x04 \x01(\v2\x16.pgshard.v1.BackupInfoR\x04info\x12\x10\n" +
 	"\x03log\x18\x05 \x03(\tR\x03log\"\x14\n" +
-	"\x12RestoreInfoRequest\"\xd2\x02\n" +
+	"\x12RestoreInfoRequest\"\xb6\x02\n" +
 	"\x13RestoreInfoResponse\x12\x14\n" +
-	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12'\n" +
-	"\x05error\x18\x04 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\x12\x16\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x16\n" +
 	"\x06stanza\x18\x05 \x01(\tR\x06stanza\x12\x1f\n" +
 	"\vstatus_code\x18\x06 \x01(\x03R\n" +
 	"statusCode\x12%\n" +
@@ -3668,14 +3497,13 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\varchive_max\x18\t \x01(\tR\n" +
 	"archiveMax\x120\n" +
 	"\abackups\x18\n" +
-	" \x03(\v2\x16.pgshard.v1.BackupInfoR\abackupsJ\x04\b\x02\x10\x03J\x04\b\x03\x10\x04R\n" +
-	"backup_refR\x10recovery_end_lsn\"%\n" +
+	" \x03(\v2\x16.pgshard.v1.BackupInfoR\abackupsJ\x04\b\x02\x10\x03J\x04\b\x03\x10\x04J\x04\b\x04\x10\x05R\n" +
+	"backup_refR\x10recovery_end_lsnR\x05error\"%\n" +
 	"\rExpireRequest\x12\x14\n" +
-	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\"a\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\"E\n" +
 	"\x0eExpireResponse\x12\x14\n" +
-	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12'\n" +
-	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\x12\x10\n" +
-	"\x03log\x18\x03 \x03(\tR\x03log\"\x0f\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x10\n" +
+	"\x03log\x18\x03 \x03(\tR\x03logJ\x04\b\x02\x10\x03R\x05error\"\x0f\n" +
 	"\rVerifyRequest\"a\n" +
 	"\x0eVerifyResponse\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12'\n" +
@@ -3689,49 +3517,44 @@ const file_pgshard_v1_agent_proto_rawDesc = "" +
 	"\x03gid\x18\x01 \x01(\tR\x03gid\x12:\n" +
 	"\x05state\x18\x05 \x01(\x0e2$.pgshard.v1.TransactionDecisionStateR\x05state\x12F\n" +
 	"\fparticipants\x18\x06 \x03(\v2\".pgshard.v1.TransactionParticipantR\fparticipantsJ\x04\b\x02\x10\x03J\x04\b\x03\x10\x04J\x04\b\x04\x10\x05\"!\n" +
-	"\x1fListTransactionDecisionsRequest\"\xa0\x01\n" +
+	"\x1fListTransactionDecisionsRequest\"\x84\x01\n" +
 	" ListTransactionDecisionsResponse\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12=\n" +
-	"\tdecisions\x18\x02 \x03(\v2\x1f.pgshard.v1.TransactionDecisionR\tdecisions\x12'\n" +
-	"\x05error\x18\x03 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"!\n" +
+	"\tdecisions\x18\x02 \x03(\v2\x1f.pgshard.v1.TransactionDecisionR\tdecisionsJ\x04\b\x03\x10\x04R\x05error\"!\n" +
 	"\x1fListPreparedTransactionsRequest\"C\n" +
 	"\x13PreparedTransaction\x12\x10\n" +
 	"\x03gid\x18\x01 \x01(\tR\x03gid\x12\x1a\n" +
-	"\bdatabase\x18\x02 \x01(\tR\bdatabase\"\x9e\x01\n" +
+	"\bdatabase\x18\x02 \x01(\tR\bdatabase\"\x82\x01\n" +
 	" ListPreparedTransactionsResponse\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12;\n" +
-	"\bprepared\x18\x02 \x03(\v2\x1f.pgshard.v1.PreparedTransactionR\bprepared\x12'\n" +
-	"\x05error\x18\x03 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"\x96\x01\n" +
+	"\bprepared\x18\x02 \x03(\v2\x1f.pgshard.v1.PreparedTransactionR\bpreparedJ\x04\b\x03\x10\x04R\x05error\"\x96\x01\n" +
 	"$ReconcilePreparedTransactionsRequest\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12=\n" +
 	"\tdecisions\x18\x02 \x03(\v2\x1f.pgshard.v1.TransactionDecisionR\tdecisions\x12\x19\n" +
-	"\bshard_id\x18\x03 \x01(\x05R\ashardId\"\x91\x02\n" +
+	"\bshard_id\x18\x03 \x01(\x05R\ashardId\"\xf5\x01\n" +
 	"%ReconcilePreparedTransactionsResponse\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x1c\n" +
 	"\tcommitted\x18\x02 \x01(\rR\tcommitted\x12\x1f\n" +
 	"\vrolled_back\x18\x03 \x01(\rR\n" +
 	"rolledBack\x12&\n" +
-	"\x0econtradictions\x18\x04 \x03(\tR\x0econtradictions\x12'\n" +
-	"\x05error\x18\x05 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\x12\"\n" +
+	"\x0econtradictions\x18\x04 \x03(\tR\x0econtradictions\x12\"\n" +
 	"\funverifiable\x18\x06 \x03(\tR\funverifiable\x12\x1e\n" +
 	"\n" +
 	"unreadable\x18\a \x03(\tR\n" +
-	"unreadable\"\\\n" +
+	"unreadableJ\x04\b\x05\x10\x06R\x05error\"\\\n" +
 	"\x14SetWriteFenceRequest\x12\x14\n" +
 	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12\x16\n" +
 	"\x06active\x18\x02 \x01(\bR\x06active\x12\x16\n" +
-	"\x06reason\x18\x03 \x01(\tR\x06reason\"V\n" +
+	"\x06reason\x18\x03 \x01(\tR\x06reason\":\n" +
 	"\x15SetWriteFenceResponse\x12\x14\n" +
-	"\x05epoch\x18\x01 \x01(\x04R\x05epoch\x12'\n" +
-	"\x05error\x18\x02 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\"\x84\x01\n" +
+	"\x05epoch\x18\x01 \x01(\x04R\x05epochJ\x04\b\x02\x10\x03R\x05error\"\x84\x01\n" +
 	"\x18MaterializeSchemaRequest\x12'\n" +
 	"\x0fsource_conninfo\x18\x01 \x01(\tR\x0esourceConninfo\x12\x1a\n" +
 	"\bdatabase\x18\x02 \x01(\tR\bdatabase\x12\x19\n" +
 	"\x05epoch\x18\x03 \x01(\x04H\x00R\x05epoch\x88\x01\x01B\b\n" +
-	"\x06_epoch\"Z\n" +
-	"\x19MaterializeSchemaResponse\x12'\n" +
-	"\x05error\x18\x01 \x01(\v2\x11.pgshard.v1.ErrorR\x05error\x12\x14\n" +
-	"\x05epoch\x18\x02 \x01(\x04R\x05epoch*T\n" +
+	"\x06_epoch\">\n" +
+	"\x19MaterializeSchemaResponse\x12\x14\n" +
+	"\x05epoch\x18\x02 \x01(\x04R\x05epochJ\x04\b\x01\x10\x02R\x05error*T\n" +
 	"\bSlotKind\x12\x19\n" +
 	"\x15SLOT_KIND_UNSPECIFIED\x10\x00\x12\x16\n" +
 	"\x12SLOT_KIND_PHYSICAL\x10\x01\x12\x15\n" +
@@ -3848,92 +3671,72 @@ var file_pgshard_v1_agent_proto_goTypes = []any{
 var file_pgshard_v1_agent_proto_depIdxs = []int32{
 	2,  // 0: pgshard.v1.StatusResponse.role:type_name -> pgshard.v1.StatusResponse.Role
 	57, // 1: pgshard.v1.StatusResponse.error:type_name -> pgshard.v1.Error
-	57, // 2: pgshard.v1.PromoteResponse.error:type_name -> pgshard.v1.Error
-	57, // 3: pgshard.v1.DemoteResponse.error:type_name -> pgshard.v1.Error
-	57, // 4: pgshard.v1.RewindResponse.error:type_name -> pgshard.v1.Error
-	3,  // 5: pgshard.v1.RecloneRequest.source_kind:type_name -> pgshard.v1.RecloneRequest.SourceKind
-	57, // 6: pgshard.v1.RecloneResponse.error:type_name -> pgshard.v1.Error
-	57, // 7: pgshard.v1.ReloadResponse.error:type_name -> pgshard.v1.Error
-	4,  // 8: pgshard.v1.RestartRequest.mode:type_name -> pgshard.v1.RestartRequest.Mode
-	57, // 9: pgshard.v1.RestartResponse.error:type_name -> pgshard.v1.Error
-	57, // 10: pgshard.v1.CreateRestorePointResponse.error:type_name -> pgshard.v1.Error
-	0,  // 11: pgshard.v1.CreateSlotRequest.kind:type_name -> pgshard.v1.SlotKind
-	57, // 12: pgshard.v1.CreateSlotResponse.error:type_name -> pgshard.v1.Error
-	57, // 13: pgshard.v1.DropSlotResponse.error:type_name -> pgshard.v1.Error
-	0,  // 14: pgshard.v1.Slot.kind:type_name -> pgshard.v1.SlotKind
-	57, // 15: pgshard.v1.CreateStreamSlotResponse.error:type_name -> pgshard.v1.Error
-	57, // 16: pgshard.v1.DropStreamSlotResponse.error:type_name -> pgshard.v1.Error
-	57, // 17: pgshard.v1.SetSynchronizedStandbySlotsResponse.error:type_name -> pgshard.v1.Error
-	27, // 18: pgshard.v1.ListSlotsResponse.slots:type_name -> pgshard.v1.Slot
-	57, // 19: pgshard.v1.ListSlotsResponse.error:type_name -> pgshard.v1.Error
-	5,  // 20: pgshard.v1.BackupRequest.type:type_name -> pgshard.v1.BackupRequest.Type
-	57, // 21: pgshard.v1.BackupResponse.error:type_name -> pgshard.v1.Error
-	36, // 22: pgshard.v1.BackupResponse.info:type_name -> pgshard.v1.BackupInfo
-	57, // 23: pgshard.v1.RestoreInfoResponse.error:type_name -> pgshard.v1.Error
-	36, // 24: pgshard.v1.RestoreInfoResponse.backups:type_name -> pgshard.v1.BackupInfo
-	57, // 25: pgshard.v1.ExpireResponse.error:type_name -> pgshard.v1.Error
-	57, // 26: pgshard.v1.VerifyResponse.error:type_name -> pgshard.v1.Error
-	1,  // 27: pgshard.v1.TransactionDecision.state:type_name -> pgshard.v1.TransactionDecisionState
-	44, // 28: pgshard.v1.TransactionDecision.participants:type_name -> pgshard.v1.TransactionParticipant
-	45, // 29: pgshard.v1.ListTransactionDecisionsResponse.decisions:type_name -> pgshard.v1.TransactionDecision
-	57, // 30: pgshard.v1.ListTransactionDecisionsResponse.error:type_name -> pgshard.v1.Error
-	49, // 31: pgshard.v1.ListPreparedTransactionsResponse.prepared:type_name -> pgshard.v1.PreparedTransaction
-	57, // 32: pgshard.v1.ListPreparedTransactionsResponse.error:type_name -> pgshard.v1.Error
-	45, // 33: pgshard.v1.ReconcilePreparedTransactionsRequest.decisions:type_name -> pgshard.v1.TransactionDecision
-	57, // 34: pgshard.v1.ReconcilePreparedTransactionsResponse.error:type_name -> pgshard.v1.Error
-	57, // 35: pgshard.v1.SetWriteFenceResponse.error:type_name -> pgshard.v1.Error
-	57, // 36: pgshard.v1.MaterializeSchemaResponse.error:type_name -> pgshard.v1.Error
-	6,  // 37: pgshard.v1.Agent.Status:input_type -> pgshard.v1.StatusRequest
-	8,  // 38: pgshard.v1.Agent.Promote:input_type -> pgshard.v1.PromoteRequest
-	10, // 39: pgshard.v1.Agent.Demote:input_type -> pgshard.v1.DemoteRequest
-	12, // 40: pgshard.v1.Agent.Rewind:input_type -> pgshard.v1.RewindRequest
-	14, // 41: pgshard.v1.Agent.Reclone:input_type -> pgshard.v1.RecloneRequest
-	16, // 42: pgshard.v1.Agent.Reload:input_type -> pgshard.v1.ReloadRequest
-	18, // 43: pgshard.v1.Agent.Restart:input_type -> pgshard.v1.RestartRequest
-	20, // 44: pgshard.v1.Agent.CreateRestorePoint:input_type -> pgshard.v1.CreateRestorePointRequest
-	22, // 45: pgshard.v1.Agent.CreateSlot:input_type -> pgshard.v1.CreateSlotRequest
-	24, // 46: pgshard.v1.Agent.DropSlot:input_type -> pgshard.v1.DropSlotRequest
-	26, // 47: pgshard.v1.Agent.ListSlots:input_type -> pgshard.v1.ListSlotsRequest
-	28, // 48: pgshard.v1.Agent.CreateStreamSlot:input_type -> pgshard.v1.CreateStreamSlotRequest
-	30, // 49: pgshard.v1.Agent.DropStreamSlot:input_type -> pgshard.v1.DropStreamSlotRequest
-	32, // 50: pgshard.v1.Agent.SetSynchronizedStandbySlots:input_type -> pgshard.v1.SetSynchronizedStandbySlotsRequest
-	35, // 51: pgshard.v1.Agent.Backup:input_type -> pgshard.v1.BackupRequest
-	38, // 52: pgshard.v1.Agent.RestoreInfo:input_type -> pgshard.v1.RestoreInfoRequest
-	40, // 53: pgshard.v1.Agent.Expire:input_type -> pgshard.v1.ExpireRequest
-	42, // 54: pgshard.v1.Agent.Verify:input_type -> pgshard.v1.VerifyRequest
-	46, // 55: pgshard.v1.Agent.ListTransactionDecisions:input_type -> pgshard.v1.ListTransactionDecisionsRequest
-	48, // 56: pgshard.v1.Agent.ListPreparedTransactions:input_type -> pgshard.v1.ListPreparedTransactionsRequest
-	51, // 57: pgshard.v1.Agent.ReconcilePreparedTransactions:input_type -> pgshard.v1.ReconcilePreparedTransactionsRequest
-	53, // 58: pgshard.v1.Agent.SetWriteFence:input_type -> pgshard.v1.SetWriteFenceRequest
-	55, // 59: pgshard.v1.Agent.MaterializeSchema:input_type -> pgshard.v1.MaterializeSchemaRequest
-	7,  // 60: pgshard.v1.Agent.Status:output_type -> pgshard.v1.StatusResponse
-	9,  // 61: pgshard.v1.Agent.Promote:output_type -> pgshard.v1.PromoteResponse
-	11, // 62: pgshard.v1.Agent.Demote:output_type -> pgshard.v1.DemoteResponse
-	13, // 63: pgshard.v1.Agent.Rewind:output_type -> pgshard.v1.RewindResponse
-	15, // 64: pgshard.v1.Agent.Reclone:output_type -> pgshard.v1.RecloneResponse
-	17, // 65: pgshard.v1.Agent.Reload:output_type -> pgshard.v1.ReloadResponse
-	19, // 66: pgshard.v1.Agent.Restart:output_type -> pgshard.v1.RestartResponse
-	21, // 67: pgshard.v1.Agent.CreateRestorePoint:output_type -> pgshard.v1.CreateRestorePointResponse
-	23, // 68: pgshard.v1.Agent.CreateSlot:output_type -> pgshard.v1.CreateSlotResponse
-	25, // 69: pgshard.v1.Agent.DropSlot:output_type -> pgshard.v1.DropSlotResponse
-	34, // 70: pgshard.v1.Agent.ListSlots:output_type -> pgshard.v1.ListSlotsResponse
-	29, // 71: pgshard.v1.Agent.CreateStreamSlot:output_type -> pgshard.v1.CreateStreamSlotResponse
-	31, // 72: pgshard.v1.Agent.DropStreamSlot:output_type -> pgshard.v1.DropStreamSlotResponse
-	33, // 73: pgshard.v1.Agent.SetSynchronizedStandbySlots:output_type -> pgshard.v1.SetSynchronizedStandbySlotsResponse
-	37, // 74: pgshard.v1.Agent.Backup:output_type -> pgshard.v1.BackupResponse
-	39, // 75: pgshard.v1.Agent.RestoreInfo:output_type -> pgshard.v1.RestoreInfoResponse
-	41, // 76: pgshard.v1.Agent.Expire:output_type -> pgshard.v1.ExpireResponse
-	43, // 77: pgshard.v1.Agent.Verify:output_type -> pgshard.v1.VerifyResponse
-	47, // 78: pgshard.v1.Agent.ListTransactionDecisions:output_type -> pgshard.v1.ListTransactionDecisionsResponse
-	50, // 79: pgshard.v1.Agent.ListPreparedTransactions:output_type -> pgshard.v1.ListPreparedTransactionsResponse
-	52, // 80: pgshard.v1.Agent.ReconcilePreparedTransactions:output_type -> pgshard.v1.ReconcilePreparedTransactionsResponse
-	54, // 81: pgshard.v1.Agent.SetWriteFence:output_type -> pgshard.v1.SetWriteFenceResponse
-	56, // 82: pgshard.v1.Agent.MaterializeSchema:output_type -> pgshard.v1.MaterializeSchemaResponse
-	60, // [60:83] is the sub-list for method output_type
-	37, // [37:60] is the sub-list for method input_type
-	37, // [37:37] is the sub-list for extension type_name
-	37, // [37:37] is the sub-list for extension extendee
-	0,  // [0:37] is the sub-list for field type_name
+	3,  // 2: pgshard.v1.RecloneRequest.source_kind:type_name -> pgshard.v1.RecloneRequest.SourceKind
+	4,  // 3: pgshard.v1.RestartRequest.mode:type_name -> pgshard.v1.RestartRequest.Mode
+	0,  // 4: pgshard.v1.CreateSlotRequest.kind:type_name -> pgshard.v1.SlotKind
+	0,  // 5: pgshard.v1.Slot.kind:type_name -> pgshard.v1.SlotKind
+	27, // 6: pgshard.v1.ListSlotsResponse.slots:type_name -> pgshard.v1.Slot
+	5,  // 7: pgshard.v1.BackupRequest.type:type_name -> pgshard.v1.BackupRequest.Type
+	57, // 8: pgshard.v1.BackupResponse.error:type_name -> pgshard.v1.Error
+	36, // 9: pgshard.v1.BackupResponse.info:type_name -> pgshard.v1.BackupInfo
+	36, // 10: pgshard.v1.RestoreInfoResponse.backups:type_name -> pgshard.v1.BackupInfo
+	57, // 11: pgshard.v1.VerifyResponse.error:type_name -> pgshard.v1.Error
+	1,  // 12: pgshard.v1.TransactionDecision.state:type_name -> pgshard.v1.TransactionDecisionState
+	44, // 13: pgshard.v1.TransactionDecision.participants:type_name -> pgshard.v1.TransactionParticipant
+	45, // 14: pgshard.v1.ListTransactionDecisionsResponse.decisions:type_name -> pgshard.v1.TransactionDecision
+	49, // 15: pgshard.v1.ListPreparedTransactionsResponse.prepared:type_name -> pgshard.v1.PreparedTransaction
+	45, // 16: pgshard.v1.ReconcilePreparedTransactionsRequest.decisions:type_name -> pgshard.v1.TransactionDecision
+	6,  // 17: pgshard.v1.Agent.Status:input_type -> pgshard.v1.StatusRequest
+	8,  // 18: pgshard.v1.Agent.Promote:input_type -> pgshard.v1.PromoteRequest
+	10, // 19: pgshard.v1.Agent.Demote:input_type -> pgshard.v1.DemoteRequest
+	12, // 20: pgshard.v1.Agent.Rewind:input_type -> pgshard.v1.RewindRequest
+	14, // 21: pgshard.v1.Agent.Reclone:input_type -> pgshard.v1.RecloneRequest
+	16, // 22: pgshard.v1.Agent.Reload:input_type -> pgshard.v1.ReloadRequest
+	18, // 23: pgshard.v1.Agent.Restart:input_type -> pgshard.v1.RestartRequest
+	20, // 24: pgshard.v1.Agent.CreateRestorePoint:input_type -> pgshard.v1.CreateRestorePointRequest
+	22, // 25: pgshard.v1.Agent.CreateSlot:input_type -> pgshard.v1.CreateSlotRequest
+	24, // 26: pgshard.v1.Agent.DropSlot:input_type -> pgshard.v1.DropSlotRequest
+	26, // 27: pgshard.v1.Agent.ListSlots:input_type -> pgshard.v1.ListSlotsRequest
+	28, // 28: pgshard.v1.Agent.CreateStreamSlot:input_type -> pgshard.v1.CreateStreamSlotRequest
+	30, // 29: pgshard.v1.Agent.DropStreamSlot:input_type -> pgshard.v1.DropStreamSlotRequest
+	32, // 30: pgshard.v1.Agent.SetSynchronizedStandbySlots:input_type -> pgshard.v1.SetSynchronizedStandbySlotsRequest
+	35, // 31: pgshard.v1.Agent.Backup:input_type -> pgshard.v1.BackupRequest
+	38, // 32: pgshard.v1.Agent.RestoreInfo:input_type -> pgshard.v1.RestoreInfoRequest
+	40, // 33: pgshard.v1.Agent.Expire:input_type -> pgshard.v1.ExpireRequest
+	42, // 34: pgshard.v1.Agent.Verify:input_type -> pgshard.v1.VerifyRequest
+	46, // 35: pgshard.v1.Agent.ListTransactionDecisions:input_type -> pgshard.v1.ListTransactionDecisionsRequest
+	48, // 36: pgshard.v1.Agent.ListPreparedTransactions:input_type -> pgshard.v1.ListPreparedTransactionsRequest
+	51, // 37: pgshard.v1.Agent.ReconcilePreparedTransactions:input_type -> pgshard.v1.ReconcilePreparedTransactionsRequest
+	53, // 38: pgshard.v1.Agent.SetWriteFence:input_type -> pgshard.v1.SetWriteFenceRequest
+	55, // 39: pgshard.v1.Agent.MaterializeSchema:input_type -> pgshard.v1.MaterializeSchemaRequest
+	7,  // 40: pgshard.v1.Agent.Status:output_type -> pgshard.v1.StatusResponse
+	9,  // 41: pgshard.v1.Agent.Promote:output_type -> pgshard.v1.PromoteResponse
+	11, // 42: pgshard.v1.Agent.Demote:output_type -> pgshard.v1.DemoteResponse
+	13, // 43: pgshard.v1.Agent.Rewind:output_type -> pgshard.v1.RewindResponse
+	15, // 44: pgshard.v1.Agent.Reclone:output_type -> pgshard.v1.RecloneResponse
+	17, // 45: pgshard.v1.Agent.Reload:output_type -> pgshard.v1.ReloadResponse
+	19, // 46: pgshard.v1.Agent.Restart:output_type -> pgshard.v1.RestartResponse
+	21, // 47: pgshard.v1.Agent.CreateRestorePoint:output_type -> pgshard.v1.CreateRestorePointResponse
+	23, // 48: pgshard.v1.Agent.CreateSlot:output_type -> pgshard.v1.CreateSlotResponse
+	25, // 49: pgshard.v1.Agent.DropSlot:output_type -> pgshard.v1.DropSlotResponse
+	34, // 50: pgshard.v1.Agent.ListSlots:output_type -> pgshard.v1.ListSlotsResponse
+	29, // 51: pgshard.v1.Agent.CreateStreamSlot:output_type -> pgshard.v1.CreateStreamSlotResponse
+	31, // 52: pgshard.v1.Agent.DropStreamSlot:output_type -> pgshard.v1.DropStreamSlotResponse
+	33, // 53: pgshard.v1.Agent.SetSynchronizedStandbySlots:output_type -> pgshard.v1.SetSynchronizedStandbySlotsResponse
+	37, // 54: pgshard.v1.Agent.Backup:output_type -> pgshard.v1.BackupResponse
+	39, // 55: pgshard.v1.Agent.RestoreInfo:output_type -> pgshard.v1.RestoreInfoResponse
+	41, // 56: pgshard.v1.Agent.Expire:output_type -> pgshard.v1.ExpireResponse
+	43, // 57: pgshard.v1.Agent.Verify:output_type -> pgshard.v1.VerifyResponse
+	47, // 58: pgshard.v1.Agent.ListTransactionDecisions:output_type -> pgshard.v1.ListTransactionDecisionsResponse
+	50, // 59: pgshard.v1.Agent.ListPreparedTransactions:output_type -> pgshard.v1.ListPreparedTransactionsResponse
+	52, // 60: pgshard.v1.Agent.ReconcilePreparedTransactions:output_type -> pgshard.v1.ReconcilePreparedTransactionsResponse
+	54, // 61: pgshard.v1.Agent.SetWriteFence:output_type -> pgshard.v1.SetWriteFenceResponse
+	56, // 62: pgshard.v1.Agent.MaterializeSchema:output_type -> pgshard.v1.MaterializeSchemaResponse
+	40, // [40:63] is the sub-list for method output_type
+	17, // [17:40] is the sub-list for method input_type
+	17, // [17:17] is the sub-list for extension type_name
+	17, // [17:17] is the sub-list for extension extendee
+	0,  // [0:17] is the sub-list for field type_name
 }
 
 func init() { file_pgshard_v1_agent_proto_init() }

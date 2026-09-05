@@ -389,6 +389,58 @@ func (x *KeyRange) GetEnd() int64 {
 	return 0
 }
 
+// StaleEpoch is attached as a gRPC status detail to a FailedPrecondition
+// from an agent whose epoch does not match the caller's.
+//
+// It exists because the refusal used to arrive in the response body, where
+// the response also carried the agent's current epoch: a caller could see
+// what it should have sent without a second round trip. Moving the failure
+// to a status code would have dropped that, so it moves with it.
+type StaleEpoch struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The epoch the agent has actually accepted.
+	Current       uint64 `protobuf:"varint,1,opt,name=current,proto3" json:"current,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StaleEpoch) Reset() {
+	*x = StaleEpoch{}
+	mi := &file_pgshard_v1_common_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StaleEpoch) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StaleEpoch) ProtoMessage() {}
+
+func (x *StaleEpoch) ProtoReflect() protoreflect.Message {
+	mi := &file_pgshard_v1_common_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StaleEpoch.ProtoReflect.Descriptor instead.
+func (*StaleEpoch) Descriptor() ([]byte, []int) {
+	return file_pgshard_v1_common_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *StaleEpoch) GetCurrent() uint64 {
+	if x != nil {
+		return x.Current
+	}
+	return 0
+}
+
 var File_pgshard_v1_common_proto protoreflect.FileDescriptor
 
 const file_pgshard_v1_common_proto_rawDesc = "" +
@@ -416,7 +468,10 @@ const file_pgshard_v1_common_proto_rawDesc = "" +
 	"\x06reason\x18\x05 \x01(\x0e2\x12.pgshard.v1.ReasonR\x06reason\"2\n" +
 	"\bKeyRange\x12\x14\n" +
 	"\x05start\x18\x01 \x01(\x03R\x05start\x12\x10\n" +
-	"\x03end\x18\x02 \x01(\x03R\x03end*]\n" +
+	"\x03end\x18\x02 \x01(\x03R\x03end\"&\n" +
+	"\n" +
+	"StaleEpoch\x12\x18\n" +
+	"\acurrent\x18\x01 \x01(\x04R\acurrent*]\n" +
 	"\x06Reason\x12\x16\n" +
 	"\x12REASON_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17REASON_STALE_GENERATION\x10\x01\x12\x1e\n" +
@@ -438,7 +493,7 @@ func file_pgshard_v1_common_proto_rawDescGZIP() []byte {
 }
 
 var file_pgshard_v1_common_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_pgshard_v1_common_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
+var file_pgshard_v1_common_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
 var file_pgshard_v1_common_proto_goTypes = []any{
 	(Reason)(0),        // 0: pgshard.v1.Reason
 	(*ShardRef)(nil),   // 1: pgshard.v1.ShardRef
@@ -446,10 +501,11 @@ var file_pgshard_v1_common_proto_goTypes = []any{
 	(*Position)(nil),   // 3: pgshard.v1.Position
 	(*Error)(nil),      // 4: pgshard.v1.Error
 	(*KeyRange)(nil),   // 5: pgshard.v1.KeyRange
-	nil,                // 6: pgshard.v1.Position.ShardLsnEntry
+	(*StaleEpoch)(nil), // 6: pgshard.v1.StaleEpoch
+	nil,                // 7: pgshard.v1.Position.ShardLsnEntry
 }
 var file_pgshard_v1_common_proto_depIdxs = []int32{
-	6, // 0: pgshard.v1.Position.shard_lsn:type_name -> pgshard.v1.Position.ShardLsnEntry
+	7, // 0: pgshard.v1.Position.shard_lsn:type_name -> pgshard.v1.Position.ShardLsnEntry
 	0, // 1: pgshard.v1.Error.reason:type_name -> pgshard.v1.Reason
 	2, // [2:2] is the sub-list for method output_type
 	2, // [2:2] is the sub-list for method input_type
@@ -469,7 +525,7 @@ func file_pgshard_v1_common_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pgshard_v1_common_proto_rawDesc), len(file_pgshard_v1_common_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   6,
+			NumMessages:   7,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

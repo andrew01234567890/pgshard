@@ -23,19 +23,16 @@ func (s *Server) ListTransactionDecisions(ctx context.Context, _ *pgshardv1.List
 	resp := &pgshardv1.ListTransactionDecisionsResponse{Epoch: s.epoch.Current()}
 	conn, err := s.inst.ConnectDB(ctx, catalogDatabase)
 	if err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	defer func() { _ = conn.Close(ctx) }()
 	rows, err := conn.Query(ctx, `SELECT gid, state, participants, participant_xids FROM pgshard.xact_decisions ORDER BY created_at, gid`)
 	if err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	stored, err := pgx.CollectRows(rows, pgx.RowToStructByPos[decisionRow])
 	if err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	for _, r := range stored {
 		resp.Decisions = append(resp.Decisions, twopc.DecisionToProto(r.decision()))
@@ -78,8 +75,7 @@ func (s *Server) ListPreparedTransactions(ctx context.Context, _ *pgshardv1.List
 	resp := &pgshardv1.ListPreparedTransactionsResponse{Epoch: s.epoch.Current()}
 	prepared, err := (&instanceParticipant{inst: s.inst}).Prepared(ctx)
 	if err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	for _, gid := range slices.Sorted(maps.Keys(prepared)) {
 		resp.Prepared = append(resp.Prepared, &pgshardv1.PreparedTransaction{Gid: gid, Database: prepared[gid]})
@@ -93,8 +89,7 @@ func (s *Server) ReconcilePreparedTransactions(ctx context.Context, req *pgshard
 	resp := &pgshardv1.ReconcilePreparedTransactionsResponse{Epoch: s.epoch.Current()}
 	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
 	if err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	defer endTerm()
 	resp.Epoch = req.GetEpoch()
@@ -105,7 +100,9 @@ func (s *Server) ReconcilePreparedTransactions(ctx context.Context, req *pgshard
 	out, err := twopc.Reconcile(ctx, &instanceParticipant{inst: s.inst}, req.GetShardId(), decisions)
 	resp.Committed, resp.RolledBack = uint32(out.Committed), uint32(out.RolledBack)
 	resp.Contradictions, resp.Unverifiable, resp.Unreadable = out.Contradictions, out.Unverifiable, out.Unreadable
-	resp.Error = pgErr(err)
+	if err != nil {
+		return nil, s.rpcErr(err)
+	}
 	return resp, nil
 }
 
@@ -115,19 +112,16 @@ func (s *Server) SetWriteFence(ctx context.Context, req *pgshardv1.SetWriteFence
 	resp := &pgshardv1.SetWriteFenceResponse{Epoch: s.epoch.Current()}
 	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
 	if err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	defer endTerm()
 	resp.Epoch = req.GetEpoch()
 	conn, err := s.inst.ConnectDB(ctx, catalogDatabase)
 	if err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	defer func() { _ = conn.Close(ctx) }()
-	resp.Error = pgErr(catalog.SetWriteFence(ctx, conn, req.GetActive(), req.GetReason()))
-	return resp, nil
+	return nil, s.rpcErr(catalog.SetWriteFence(ctx, conn, req.GetActive(), req.GetReason()))
 }
 
 // instanceParticipant finishes prepared transactions from the database

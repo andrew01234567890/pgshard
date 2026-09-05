@@ -11,6 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/andrew01234567890/pgshard/internal/dockertest"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
@@ -47,14 +50,14 @@ func TestRestoreReconciliationMatrix(t *testing.T) {
 		t.Helper()
 		deadline := time.Now().Add(2 * time.Minute)
 		var last *pgshardv1.RestoreInfoResponse
+		var lastErr error
 		for time.Now().Before(deadline) {
-			last, _ = p.grpc.RestoreInfo(ctx, &pgshardv1.RestoreInfoRequest{})
-			if last.GetError() == nil && cond(last) {
+			if last, lastErr = p.grpc.RestoreInfo(ctx, &pgshardv1.RestoreInfoRequest{}); lastErr == nil && cond(last) {
 				return
 			}
 			time.Sleep(time.Second)
 		}
-		t.Fatalf("timed out waiting for %s; last %v\n%s", what, last, p.logs())
+		t.Fatalf("timed out waiting for %s; last %v err %v\n%s", what, last, lastErr, p.logs())
 	}
 	waitInfo(func(r *pgshardv1.RestoreInfoResponse) bool {
 		return r.GetStatusCode() != 0 || r.GetStanza() == "it-s0-pg18"
@@ -94,7 +97,7 @@ func TestRestoreReconciliationMatrix(t *testing.T) {
 	xidW = xidW[strings.LastIndex(xidW, "\n")+1:]
 	p.psql("SELECT pg_create_restore_point('pgshard-b1')")
 	listed, err := p.grpc.ListPreparedTransactions(ctx, &pgshardv1.ListPreparedTransactionsRequest{})
-	if err != nil || listed.GetError() != nil || len(listed.GetPrepared()) != 3 || listed.GetPrepared()[0].GetGid() != "pgshard-x" || listed.GetPrepared()[0].GetDatabase() != "postgres" || listed.GetPrepared()[2].GetGid() != "pgshard-z" {
+	if err != nil || len(listed.GetPrepared()) != 3 || listed.GetPrepared()[0].GetGid() != "pgshard-x" || listed.GetPrepared()[0].GetDatabase() != "postgres" || listed.GetPrepared()[2].GetGid() != "pgshard-z" {
 		t.Fatalf("ListPreparedTransactions: %v %v", err, listed)
 	}
 	p.psql("COMMIT PREPARED 'pgshard-x'")
@@ -107,7 +110,7 @@ func TestRestoreReconciliationMatrix(t *testing.T) {
 	// Catalog-side RPCs on the source: the decision log and the fence.
 	p.psql("INSERT INTO pgshard.xact_decisions (gid, state, participants, participant_xids) VALUES ('pgshard-x', 'commit', '{0}', '{" + xidX + "}'), ('pgshard-z', 'abort', '{0,1}', '{" + xidW + ",7}')")
 	decisions, err := p.grpc.ListTransactionDecisions(ctx, &pgshardv1.ListTransactionDecisionsRequest{})
-	if err != nil || decisions.GetError() != nil || len(decisions.GetDecisions()) != 2 {
+	if err != nil || len(decisions.GetDecisions()) != 2 {
 		t.Fatalf("ListTransactionDecisions: %v %v", err, decisions)
 	}
 	if d := decisions.GetDecisions()[1]; d.GetGid() != "pgshard-z" || d.GetState() != pgshardv1.TransactionDecisionState_TRANSACTION_DECISION_STATE_ABORT ||
@@ -118,17 +121,34 @@ func TestRestoreReconciliationMatrix(t *testing.T) {
 		t.Fatalf("decision %v", d)
 	}
 	epoch := p.status().GetEpoch()
-	if resp, err := p.grpc.SetWriteFence(ctx, &pgshardv1.SetWriteFenceRequest{Epoch: epoch, Active: true, Reason: "test"}); err != nil || resp.GetError() != nil {
-		t.Fatalf("SetWriteFence: %v %v", err, resp)
+	if _, err := p.grpc.SetWriteFence(ctx, &pgshardv1.SetWriteFenceRequest{Epoch: epoch, Active: true, Reason: "test"}); err != nil {
+		t.Fatalf("SetWriteFence: %v", err)
 	}
 	if got := p.psql("SELECT write_fence || ':' || write_fence_reason FROM pgshard.shard_map_generation"); got != "true:test" {
 		t.Fatalf("fence row %s", got)
 	}
-	if resp, _ := p.grpc.SetWriteFence(ctx, &pgshardv1.SetWriteFenceRequest{Epoch: epoch + 1, Active: false}); resp.GetError() == nil || resp.GetError().GetSqlstate() != "55000" {
-		t.Fatalf("stale epoch must be refused: %v", resp)
+	// Over a real connection, so this also proves the code and its detail
+	// survive the wire rather than only the in-process call.
+	_, err = p.grpc.SetWriteFence(ctx, &pgshardv1.SetWriteFenceRequest{Epoch: epoch + 1, Active: false})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("stale epoch must be refused: %v", err)
 	}
-	if resp, err := p.grpc.SetWriteFence(ctx, &pgshardv1.SetWriteFenceRequest{Epoch: epoch, Active: false}); err != nil || resp.GetError() != nil {
-		t.Fatalf("SetWriteFence release: %v %v", err, resp)
+	var carried uint64
+	var present bool
+	if st, ok := status.FromError(err); ok {
+		for _, d := range st.Details() {
+			if se, ok := d.(*pgshardv1.StaleEpoch); ok {
+				carried, present = se.GetCurrent(), true
+			}
+		}
+	}
+	// Presence, not just the value: this member's epoch can legitimately be
+	// zero, and a detail that is absent would report zero too.
+	if !present || carried != epoch {
+		t.Fatalf("the refusal must carry the agent's epoch %d, got %d (present=%v)", epoch, carried, present)
+	}
+	if _, err := p.grpc.SetWriteFence(ctx, &pgshardv1.SetWriteFenceRequest{Epoch: epoch, Active: false}); err != nil {
+		t.Fatalf("SetWriteFence release: %v", err)
 	}
 	if got := p.psql("SELECT write_fence || ':' || write_fence_reason || ':' || coalesce(write_fenced_at::text, '-') FROM pgshard.shard_map_generation"); got != "false::-" {
 		t.Fatalf("fence row after release %s", got)
@@ -143,8 +163,8 @@ func TestRestoreReconciliationMatrix(t *testing.T) {
 	reconcile := func(n *node) *pgshardv1.ReconcilePreparedTransactionsResponse {
 		t.Helper()
 		resp, err := n.grpc.ReconcilePreparedTransactions(ctx, &pgshardv1.ReconcilePreparedTransactionsRequest{Epoch: n.status().GetEpoch(), Decisions: log, ShardId: 0})
-		if err != nil || resp.GetError() != nil {
-			t.Fatalf("%s reconcile: %v %v\n%s", n.name, err, resp.GetError(), n.logs())
+		if err != nil {
+			t.Fatalf("%s reconcile: %v\n%s", n.name, err, n.logs())
 		}
 		return resp
 	}
@@ -202,7 +222,7 @@ func TestRestoreReconciliationMatrix(t *testing.T) {
 	if got := b2.psql("SELECT string_agg(v, ',') FROM t"); got != "x" {
 		t.Fatalf("b2 rows %s", got)
 	}
-	if resp, _ := b2.grpc.ReconcilePreparedTransactions(ctx, &pgshardv1.ReconcilePreparedTransactionsRequest{Epoch: b2.status().GetEpoch() + 1, Decisions: log}); resp.GetError() == nil || resp.GetError().GetSqlstate() != "55000" {
-		t.Fatalf("stale epoch must be refused: %v", resp)
+	if _, err := b2.grpc.ReconcilePreparedTransactions(ctx, &pgshardv1.ReconcilePreparedTransactionsRequest{Epoch: b2.status().GetEpoch() + 1, Decisions: log}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("stale epoch must be refused: %v", err)
 	}
 }
