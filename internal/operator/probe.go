@@ -611,23 +611,50 @@ func (PgxProber) DropSlot(ctx context.Context, dsn, name string) error {
 		WHERE slot_name = $1 AND active_pid IS NOT NULL`, name); err != nil {
 		return fmt.Errorf("terminate the user of slot %s: %w", name, err)
 	}
-	// Errors are ignored here and the check below is what decides: a drop
-	// that loses the race with a reconnecting walsender fails with 55006,
-	// which is not a reason to stop -- it is a reason to look.
-	_, _ = conn.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1`, name)
-	rows, err := conn.Query(ctx, `SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1`, name)
-	if err != nil {
-		return err
+	// pg_terminate_backend only SIGNALS the walsender: it returns before
+	// that backend has exited and released the slot, and
+	// pg_drop_replication_slot on a slot that is still active fails with
+	// 55006. Dropping once and then reading the count turned that ordinary
+	// race into a hard failure, whose outcome depended on whether the
+	// walsender happened to exit within one round trip.
+	//
+	// So the drop is retried within a bound. The error of the last attempt
+	// is what a slot that really is held -- by something that is not going
+	// away -- is reported with, because "still there" on its own says
+	// nothing about why.
+	deadline := time.Now().Add(dropSlotTimeout)
+	for {
+		_, dropErr := conn.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1`, name)
+		rows, err := conn.Query(ctx, `SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1`, name)
+		if err != nil {
+			return err
+		}
+		n, err := pgx.CollectExactlyOneRow(rows, pgx.RowTo[int64])
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			if dropErr != nil {
+				return fmt.Errorf("slot %s is still there after %s of dropping it: %w", name, dropSlotTimeout, dropErr)
+			}
+			return fmt.Errorf("slot %s is still there after %s of dropping it", name, dropSlotTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
-	n, err := pgx.CollectExactlyOneRow(rows, pgx.RowTo[int64])
-	if err != nil {
-		return err
-	}
-	if n > 0 {
-		return fmt.Errorf("slot %s is still there after dropping it", name)
-	}
-	return nil
 }
+
+// dropSlotTimeout bounds the wait for a terminated walsender to release its
+// slot. It is short: the backend has been signalled, so this is the time it
+// takes one process to notice a signal and exit, not the time some remote
+// thing takes to give up.
+const dropSlotTimeout = 5 * time.Second
 
 // Settings reads the named rows of pg_settings.
 func (PgxProber) Settings(ctx context.Context, dsn string, names []string) (map[string]SettingState, error) {
