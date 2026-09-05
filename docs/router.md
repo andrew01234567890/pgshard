@@ -276,12 +276,23 @@ would be emitted NULL-extended by every shard, so `regions LEFT JOIN orders`
 is refused where `orders LEFT JOIN regions` is not. Everything above the
 join is unchanged — the whole join runs on each shard and the merge is the
 one a single table gets, so `GROUP BY` still has to include the shard key.
-Anything else is `cross-shard join is not available yet`. A join whose
-tables *are* joined on their shard key, but whose key types the
-controller has not inspected yet, gets its own message naming the table:
-the plain one advises doing what the statement already does. A single
-sharded table has nothing to compare against, needs no such verdict, and
-scatters as usual.
+Anything else is refused, and **the message names which of those it is**,
+because most of them are not a join:
+
+| What the statement did | Message |
+|---|---|
+| a set operation (`UNION`, `EXCEPT`, `INTERSECT`) | multi-shard SELECT with set operations is not available yet |
+| a subquery over another sharded table | multi-shard SELECT with subqueries is not available yet |
+| included an unsharded table | a multi-shard statement cannot include unsharded table "…", which is on the home shard alone |
+| preserved a reference table's rows in an outer join | an outer join that preserves the rows of a reference table is not available yet |
+| joined sharded tables whose key types are not inspected yet | a join of sharded tables cannot be planned until the shard key type of "…" has been inspected |
+| joined sharded tables on anything but their shard key | cross-shard join is not available yet |
+
+Only the last is a cross-shard join, and only it gets that message: `select
+* from orders union all select * from orders` contains no join, and being
+told it had one sent the reader looking for something that was not there.
+A single sharded table has nothing to compare against, needs no type
+verdict, and scatters as usual.
 
 Refused with `0A000` (message names the reason): `avg()` and every other
 aggregate ("multi-shard avg() is not available yet" — compute `sum(x)` and
@@ -360,7 +371,8 @@ could act on.
 |---|---|
 | multi-shard `SELECT` outside the *Scatter* shapes below (window functions, FOR UPDATE/SHARE, SELECT INTO, set operations, CTEs, subqueries, function scans; `EXPLAIN`/`DECLARE` of one) | multi-shard SELECT with … is not available yet; only a plain SELECT can run on multiple shards |
 | `UPDATE`/`DELETE` without a key predicate | scatter UPDATE/DELETE without a shard key predicate is not available yet |
-| tables that do not resolve to one shard (a join that is not colocated, subqueries, set operations, an unsharded table joined to a sharded row off the home shard) | cross-shard join is not available yet |
+| tables that do not resolve to one shard | a message naming which one it is — see *Colocated joins*; only a join of sharded tables on a non-key column is "cross-shard join is not available yet" |
+| a single-shard statement that also includes an unsharded table, resolving off the home shard | a statement including an unsharded table must resolve to the home shard alone |
 | `INSERT` without the key in the column list | insert requires the shard key |
 | `INSERT` key that is not a constant or parameter; `INSERT … SELECT` | shard key of an INSERT must be a constant or a parameter; INSERT … SELECT into a sharded table is not available yet |
 | multi-row `INSERT` whose rows hash to different shards | multi-row INSERT spanning shards is not available yet |
@@ -451,11 +463,23 @@ refuses what would produce different rows on different shards:
 - choosing rows without a total order — `LIMIT`, `OFFSET`, `DISTINCT ON`,
   `TABLESAMPLE` — since each shard would choose its own.
 
-This rule is conservative and only covers what the router can see. Column
-defaults are evaluated by each shard: a reference table whose column
-default is volatile (`DEFAULT now()`, `DEFAULT gen_random_uuid()`, a
-per-shard `serial`) diverges when an `INSERT` omits that column, and the
-router cannot detect it because it does not read the shards' catalogs.
+The same rule applies to a **`DEFAULT` set through the router**:
+`ALTER TABLE … ADD COLUMN … DEFAULT gen_random_uuid()` and `ALTER COLUMN …
+SET DEFAULT` are refused on a reference table when the expression is not
+immutable. `ADD COLUMN` is the sharper case, because PostgreSQL gives every
+**existing** row a value — so one ordinary statement would diverge the whole
+table at once rather than one row. `DEFAULT now()` is refused too: PostgreSQL
+evaluates it once for the `ALTER` and stores a metadata-only default, but
+once *per shard*, so the stored constants differ. A constant default is the
+same everywhere and is allowed.
+
+This rule is conservative and only covers what the router can see. A default
+set **out of band** — directly on a shard, or present before the table was
+declared a reference table — still diverges when an `INSERT` omits that
+column, and the router cannot detect that because it does not read the
+shards' catalogs. The controller's inspection does, and publishes what it
+found as `reference_hazards`; a write to a table with hazards is refused
+until they are gone.
 Declare defaults on reference tables as constants, or always supply the
 column. DDL on reference tables goes through the migration model (see *DDL*).
 `SELECT … FOR UPDATE` on a reference table locks the row on the

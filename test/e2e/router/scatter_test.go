@@ -458,7 +458,11 @@ func TestRouterScatterDifferential(t *testing.T) {
 			// same reason grouping by any non-key column is.
 			{`select r.name, count(*) from events e join regions r on r.id = e.region group by r.name`, "multi-shard GROUP BY without the shard key"},
 			{`select e.id from events e join event_lines l on e.id = l.id`, "cross-shard join is not available yet"},
-			{`select r.name from regions r left join events e on r.id = e.region`, "cross-shard join is not available yet"},
+			{`select r.name from regions r left join events e on r.id = e.region`, "an outer join that preserves the rows of a reference table"},
+			// Neither of these contains a join, and both used to be told
+			// they contained a cross-shard one.
+			{`select id from events union all select id from event_lines`, "multi-shard SELECT with set operations"},
+			{`select id from events where id in (select id from event_lines)`, "multi-shard SELECT with subqueries"},
 		} {
 			_, err := conn.Exec(ctx, c.sql, pgx.QueryExecModeSimpleProtocol)
 			if sqlstate(err) != "0A000" || !strings.Contains(err.Error(), c.msg) {
