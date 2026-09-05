@@ -107,6 +107,41 @@ type GRPCAgentClient struct {
 	// flips from plaintext to TLS mid-roll is redialled rather than answered
 	// from a connection that can no longer reach it.
 	mode map[string]bool
+	// used is when each connection was last dialled, so one to an address
+	// nothing asks for any more is closed. Addresses are pod IPs, and a
+	// member that is deleted, rolled or failed over never appears again.
+	used map[string]time.Time
+	// now exists for the eviction test; nil means time.Now.
+	now func() time.Time
+}
+
+// agentConnTTL is how long a connection outlives its last dial. It is longer
+// than the longest call this client makes, so eviction cannot close a
+// connection an RPC is still using: every call dials first, and every call
+// is bounded by agentPromoteTimeout.
+const agentConnTTL = 10 * time.Minute
+
+func (c *GRPCAgentClient) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+// evictIdle closes every connection whose last dial is older than
+// agentConnTTL, except keep. The caller holds c.mu.
+func (c *GRPCAgentClient) evictIdle(now time.Time, keep string) {
+	for addr, at := range c.used {
+		if addr == keep || now.Sub(at) <= agentConnTTL {
+			continue
+		}
+		if cc := c.conns[addr]; cc != nil {
+			_ = cc.Close()
+		}
+		delete(c.conns, addr)
+		delete(c.mode, addr)
+		delete(c.used, addr)
+	}
 }
 
 // NewGRPCAgentClient builds a client that keeps its connections and dials
@@ -133,6 +168,8 @@ func (c *GRPCAgentClient) Close() {
 	for addr, cc := range c.conns {
 		_ = cc.Close()
 		delete(c.conns, addr)
+		delete(c.mode, addr)
+		delete(c.used, addr)
 	}
 }
 
@@ -143,6 +180,8 @@ func (c *GRPCAgentClient) drop(addr string, cc *grpc.ClientConn) {
 	defer c.mu.Unlock()
 	if c.conns[addr] == cc {
 		delete(c.conns, addr)
+		delete(c.mode, addr)
+		delete(c.used, addr)
 		_ = cc.Close()
 	}
 }
@@ -181,6 +220,9 @@ func (c *GRPCAgentClient) dial(ctx context.Context, addr string) (pgshardv1.Agen
 	if c.mode == nil {
 		c.mode = map[string]bool{}
 	}
+	if c.used == nil {
+		c.used = map[string]time.Time{}
+	}
 	wantTLS := c.wantTLS(addr)
 	conn, ok := c.conns[addr]
 	if ok && c.mode[addr] != wantTLS {
@@ -205,6 +247,9 @@ func (c *GRPCAgentClient) dial(ctx context.Context, addr string) (pgshardv1.Agen
 		c.conns[addr] = conn
 		c.mode[addr] = wantTLS
 	}
+	now := c.clock()
+	c.used[addr] = now
+	c.evictIdle(now, addr)
 	c.mu.Unlock()
 
 	dialCtx, cancel := context.WithTimeout(ctx, agentDialTimeout)

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -63,12 +64,19 @@ func newUpgradeFixture(t *testing.T) *copyFixture {
 
 var copyFixtureSeq atomic.Int64
 
+// copyFixtureRun distinguishes this process's networks and containers from
+// the ones an interrupted run left behind: the sequence restarts at 1 in
+// every process, and `docker network create` fails outright on a name that
+// already exists, so the next run's first fixture died on the corpse of the
+// previous one rather than starting clean.
+var copyFixtureRun = strconv.FormatInt(time.Now().UnixNano(), 36)
+
 func newCopyFixtureOpts(t *testing.T, targets int, tgtImage string) *copyFixture {
 	t.Helper()
 	if err := exec.Command("docker", "info").Run(); err != nil {
 		dockertest.Unavailable(t, "docker unavailable; skipping reshard copy integration test")
 	}
-	f := &copyFixture{t: t, net: fmt.Sprintf("pgshard-copy-%d", copyFixtureSeq.Add(1))}
+	f := &copyFixture{t: t, net: fmt.Sprintf("pgshard-copy-%s-%d", copyFixtureRun, copyFixtureSeq.Add(1))}
 	if out, err := exec.Command("docker", "network", "create", f.net).CombinedOutput(); err != nil {
 		t.Fatalf("docker network create: %v: %s", err, out)
 	}

@@ -208,3 +208,52 @@ func (l *countingListener) Accept() (net.Conn, error) {
 	}
 	return c, err
 }
+
+// TestAConnectionToAnAddressNothingDialsAnyMoreIsClosed: connections are
+// keyed by pod IP, and a member that is deleted, rolled or failed over never
+// answers to that address again. Nothing dropped those connections, so the
+// map and the transport goroutines behind it grew for the operator's life.
+func TestAConnectionToAnAddressNothingDialsAnyMoreIsClosed(t *testing.T) {
+	serve := func() string {
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv := grpc.NewServer()
+		pgshardv1.RegisterAgentServer(srv, &deadlineAgent{deadlines: make(chan time.Duration, 4)})
+		go func() { _ = srv.Serve(lis) }()
+		t.Cleanup(srv.Stop)
+		return lis.Addr().String()
+	}
+	gone, live := serve(), serve()
+
+	now := time.Now()
+	c := NewGRPCAgentClient()
+	c.now = func() time.Time { return now }
+	ctx := context.Background()
+	if _, err := c.Status(ctx, gone); err != nil {
+		t.Fatal(err)
+	}
+	conn := c.conns[gone]
+	if conn == nil {
+		t.Fatal("no connection was kept for the address that was dialled")
+	}
+
+	// The pod behind gone is replaced: nothing dials that address again.
+	now = now.Add(agentConnTTL + time.Second)
+	if _, err := c.Status(ctx, live); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.conns[gone]; ok {
+		t.Errorf("connection to %s kept %s after its last use", gone, agentConnTTL)
+	}
+	if _, ok := c.used[gone]; ok {
+		t.Errorf("last-use entry for %s kept after eviction", gone)
+	}
+	if s := conn.GetState().String(); s != "SHUTDOWN" {
+		t.Errorf("evicted connection state %s, want SHUTDOWN: the entry went but the transport stayed", s)
+	}
+	if _, ok := c.conns[live]; !ok {
+		t.Errorf("connection to the address in use was evicted too")
+	}
+}
