@@ -179,7 +179,14 @@ func agentConfig(c *pgshardv1alpha1.PgShardCluster, g Group, member, primary str
 		HTTPAddr:         fmt.Sprintf(":%d", agentHTTPPort),
 		GRPCAddr:         fmt.Sprintf(":%d", agentGRPCPort),
 		Postgres: agent.PostgresSettings{
-			SynchronousStandbyNames: SyncStandbyNames(g, primary, c.Spec.Durability.MinSyncStandbys, nil),
+			// Every member except this one. The value is only read where
+			// the member is the primary, and a member that is promoted
+			// rewrites this file before it reloads: rendering the list
+			// around the designated primary instead put the promoted
+			// member's own name in it, which no walsender ever matches,
+			// so on a two-member shard every commit blocked until the
+			// operator's next probe pass set the names by ALTER SYSTEM.
+			SynchronousStandbyNames: SyncStandbyNames(g, member, c.Spec.Durability.MinSyncStandbys, nil),
 			Parameters:              c.Spec.PostgreSQL.Parameters,
 		},
 		GRPCTLS:         agentGRPCTLS(c),
