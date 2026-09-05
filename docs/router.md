@@ -498,8 +498,13 @@ UPDATE pgshard.tables SET sequence_columns = '{id}'
  WHERE database = 'app' AND schema_name = 'public' AND table_name = 'tickets';
 ```
 
-`currval()`, `setval()` and `lastval()` are **refused** (`0A000`) over a
-global sequence. The router's counter is the sequence; the per-shard
+`currval()`, `setval()`, `pg_sequence_last_value()` and `lastval()` are
+**refused** (`0A000`) over a global sequence, whether it is named by its
+registration or by the per-shard object behind it — `currval('tickets_id_seq')`
+is the same refusal as `currval('tickets.id')`. So is **reading the sequence as
+a table**: `SELECT last_value FROM tickets_id_seq` and `SELECT * FROM
+invoice_numbers` return the home shard's own counter, which is the same wrong
+answer by a route with no function in it at all. The router's counter is the sequence; the per-shard
 sequence objects the DDL fanned out are not it, so those functions would
 read or write an unrelated physical counter and return an answer that looks
 ordinary and is about something else. `lastval()` is refused outright — it
@@ -508,8 +513,9 @@ from the statement which that was. Keep the value `INSERT … RETURNING`
 gave you.
 
 `nextval()` over a global sequence is answered by the router in exactly two
-places: `SELECT nextval('<name>')` as the whole statement, and a value of an
-INSERT's registered sequence column (written out, or given as `DEFAULT` or
+places: `SELECT nextval('<name>')` as the whole statement — by either name, so
+`SELECT nextval('tickets_id_seq')` allocates from the global counter rather
+than from one shard's — and a value of an INSERT's registered sequence column (written out, or given as `DEFAULT` or
 `nextval()`). **Anywhere else it is refused** (`0A000`) rather than sent to a
 shard — `SELECT nextval('g') + 1`, `UPDATE … SET c = nextval('g')`,
 `INSERT … SELECT nextval('g')` and `SELECT nextval('g') FROM t` all take the
@@ -540,7 +546,15 @@ carries on, the second takes the column's default with it under `CASCADE`,
 and the last two move the name the refusal is derived from, so the next
 `ALTER SEQUENCE` would be fanned out unnoticed. A `GRANT` or an `OWNER`
 change is **allowed**: it is inert on a sequence nothing reads, and
-refusing it would break tools that grant over every object they find. A
+refusing it would break tools that grant over every object they find.
+
+The sequence **functions** know that name too, and did not always: `nextval`,
+`currval`, `setval` and `pg_sequence_last_value` over `<table>_<column>_seq`
+behave exactly as they do over the registration. Before that, the same
+operation was refused when written one way and sent to a shard when written
+the other — `SELECT nextval('tickets_id_seq')` handed the client a shard-local
+number as the next id, which collides with the global counter as soon as the
+client inserts it. A
 name PostgreSQL truncated to 63 characters will not match and is fanned out
 as before — missing one leaves today's behaviour rather than refusing
 something unrelated.

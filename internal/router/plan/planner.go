@@ -1184,6 +1184,16 @@ func (w *walker) nestedStatement(node *pgquerypb.Node) error {
 func (w *walker) fromItem(node *pgquerypb.Node) error {
 	switch n := node.GetNode().(type) {
 	case *pgquerypb.Node_RangeVar:
+		// A sequence is a relation, so `SELECT last_value FROM s` reads it
+		// directly and no function guard sees the statement at all. On a
+		// global sequence that is the home shard's own counter, reported as
+		// though it were the sequence's -- the same wrong answer currval()
+		// is refused for, reached the ordinary way a script inspects one.
+		if seq := w.globalSequenceRelation(n.RangeVar); seq != "" {
+			return notYet("reading the global sequence "+seq+" as a table is not available through the router: "+
+				n.RangeVar.GetRelname()+" is one shard's own sequence object, and the value the router allocates from lives in the catalog",
+				"read pgshard.sequences for the global counter, or keep the value INSERT ... RETURNING gave you")
+		}
 		r, err := w.lookup(n.RangeVar)
 		if err != nil {
 			return err
