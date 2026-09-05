@@ -256,7 +256,15 @@ func (b *mergeBuilder) isShardKeyRef(e *pgquerypb.Node) bool {
 // aggregates validates an aggregate-only select list without GROUP BY.
 func (b *mergeBuilder) aggregates() error {
 	for _, t := range b.sel.GetTargetList() {
-		fc := t.GetResTarget().GetVal().GetFuncCall()
+		val := t.GetResTarget().GetVal()
+		// A SQL/JSON aggregate is its own node type rather than a FuncCall,
+		// so say what it is rather than that an aggregate "must be
+		// top-level" -- which this one is.
+		if jsonAggConstructor(val) != nil {
+			return notYet("multi-shard JSON_ARRAYAGG/JSON_OBJECTAGG is not available yet",
+				"combine the shards in the client, or filter on one shard key value")
+		}
+		fc := val.GetFuncCall()
 		if fc == nil {
 			return notYet("multi-shard aggregates must be top-level: expressions around or beside an aggregate are not available yet",
 				"select only count(*), count(x), sum(x), min(x) or max(x), or filter on one shard key value")

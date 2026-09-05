@@ -1100,9 +1100,33 @@ func hasWindow(node *pgquerypb.Node) bool {
 		if fc := n.GetFuncCall(); fc != nil && fc.GetOver() != nil {
 			found = true
 		}
+		// JSON_ARRAYAGG(x) OVER () is not a FuncCall at all, so looking only
+		// at FuncCall.Over let the window form past the blocker.
+		if c := jsonAggConstructor(n); c != nil && c.GetOver() != nil {
+			found = true
+		}
 		return !found
 	})
 	return found
+}
+
+// jsonAggConstructor returns the shared constructor of the SQL/JSON
+// aggregates, or nil for any other node.
+//
+// JSON_ARRAYAGG and JSON_OBJECTAGG are aggregates that the grammar gives
+// their own node types rather than a FuncCall, so nothing that looks for a
+// FuncCall -- by agg flags or by name -- can see them. On a scatter that
+// meant no aggregate was detected, the merge concatenated the shards, and
+// SELECT json_arrayagg(id) FROM orders returned one row PER SHARD, each a
+// partial answer, with no error.
+func jsonAggConstructor(n *pgquerypb.Node) *pgquerypb.JsonAggConstructor {
+	if a := n.GetJsonArrayAgg(); a != nil {
+		return a.GetConstructor()
+	}
+	if o := n.GetJsonObjectAgg(); o != nil {
+		return o.GetConstructor()
+	}
+	return nil
 }
 
 var aggregateNames = map[string]bool{
@@ -1134,6 +1158,10 @@ func hasStar(node *pgquerypb.Node) bool {
 func hasAggregate(node *pgquerypb.Node) bool {
 	found := false
 	visit(node, func(n *pgquerypb.Node) bool {
+		if jsonAggConstructor(n) != nil {
+			found = true
+			return false
+		}
 		fc := n.GetFuncCall()
 		if fc == nil {
 			return !found
