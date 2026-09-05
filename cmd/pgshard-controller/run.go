@@ -200,8 +200,16 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		// and the operator maintains synchronized_standby_slots -- and
 		// these subscriptions are created with two_phase = false, which is
 		// the combination PostgreSQL supports.
+		// Only CREATE SUBSCRIPTION gets the password, and it is read here
+		// rather than carried in the template: a template carrying
+		// password=$(PGPASSWORD) is expanded by the kubelet, so the secret
+		// ends up in this process's argv, which anyone with exec on the pod
+		// can read out of /proc. The same string is also handed to a
+		// member's agent for a schema copy, where it would become a pg_dump
+		// argument on that pod as well.
 		copier := &controller.Copier{Pool: pool, Shards: dialer, Schema: schema, SourceConnInfo: connInfo, Resolver: resolver, Logger: logger,
-			LagBytes: *copyLag, ThrottleHigh: *throttleHigh, ThrottleLow: *throttleLow, PreparedWait: *preparedWait,
+			SubscriptionPassword: os.Getenv("PGPASSWORD"),
+			LagBytes:             *copyLag, ThrottleHigh: *throttleHigh, ThrottleLow: *throttleLow, PreparedWait: *preparedWait,
 			CutoverTimeout: *cutoverTimeout, CutoverAttempts: *cutoverAttempts,
 			SlotFailoverDisabled: !*slotFailover}
 		go copier.Run(ctx, *copyEvery, leader.Load)

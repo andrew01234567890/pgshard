@@ -168,3 +168,52 @@ func TestConnInfoLeavesAPlaintextDSNPlaintext(t *testing.T) {
 		t.Fatalf("a plaintext DSN gained TLS: %s", got)
 	}
 }
+
+// TestWithPasswordSplicesOnlyWhereItMust: the superuser password is kept out
+// of every template, argument list and environment until a CREATE
+// SUBSCRIPTION is rendered, because PostgreSQL on the target opens that
+// connection. Both libpq forms have to carry it, and neither may lose the
+// options around it.
+func TestWithPasswordSplicesOnlyWhereItMust(t *testing.T) {
+	cases := []struct {
+		name string
+		dsn  string
+		pw   string
+		want []string
+		skip []string
+	}{
+		{"keyword value", "host=src port=5432 user=postgres dbname=app sslmode=verify-full", "s3cr3t",
+			[]string{"password='s3cr3t'", "sslmode=verify-full", "dbname=app"}, nil},
+		{"a quote in the password", "host=src dbname=app", "p'w\\x", []string{`password='p\'w\\x'`}, nil},
+		{"url", "postgres://postgres@src:5432/app?sslmode=require", "s3cr3t",
+			[]string{"postgres:s3cr3t@", "sslmode=require", "/app"}, nil},
+		{"url with a password already in the query", "postgres://postgres@src/app?password=old", "new",
+			[]string{"password=new"}, []string{"password=old"}},
+		{"no password leaves the string alone", "host=src dbname=app", "", nil, []string{"password"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := WithPassword(c.dsn, c.pw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range c.want {
+				if !strings.Contains(got, want) {
+					t.Errorf("%q does not carry %q", got, want)
+				}
+			}
+			for _, skip := range c.skip {
+				if strings.Contains(got, skip) {
+					t.Errorf("%q still carries %q", got, skip)
+				}
+			}
+			if _, err := pgx.ParseConfig(got); err != nil {
+				t.Fatalf("result is not a connection string: %v", err)
+			}
+			cfg, err := pgx.ParseConfig(got)
+			if err == nil && c.pw != "" && cfg.Password != c.pw {
+				t.Errorf("libpq reads the password as %q, want %q", cfg.Password, c.pw)
+			}
+		})
+	}
+}

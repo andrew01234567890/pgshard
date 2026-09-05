@@ -35,8 +35,11 @@ type copyFixture struct {
 	dialer  *PgxShardDialer
 	dsns    map[ShardRef]string
 	srcRng  placement.RangeSet
-	tgtRng  placement.RangeSet
-	copier  *Copier
+	// schemaArgv is where the pg_dump and psql wrappers record their
+	// arguments.
+	schemaArgv string
+	tgtRng     placement.RangeSet
+	copier     *Copier
 }
 
 var logicalOpts = []string{"-c wal_level=logical", "-c max_prepared_transactions=16", "-c max_replication_slots=16", "-c max_wal_senders=16",
@@ -60,6 +63,11 @@ func newUpgradeFixture(t *testing.T) *copyFixture {
 	f := newCopyFixtureOpts(t, 2, pgImage19)
 	return f
 }
+
+// fixtureSubscriptionPassword stands in for the superuser password the
+// controller splices into CREATE SUBSCRIPTION. The containers authenticate
+// with trust, so it changes nothing except where it is allowed to appear.
+const fixtureSubscriptionPassword = "fixture-subscription-secret"
 
 var copyFixtureSeq atomic.Int64
 
@@ -170,7 +178,8 @@ func newCopyFixtureOpts(t *testing.T, targets int, tgtImage string) *copyFixture
 	mustExec(t, home, `INSERT INTO items (v) SELECT 'item-' || g FROM generate_series(1, 50) g`)
 	mustExec(t, home, `INSERT INTO notes SELECT 'note-' || g FROM generate_series(1, 20) g`)
 
-	f.copier = &Copier{Pool: pool, Shards: f.dialer, Schema: f.materializer(), SourceConnInfo: f.connInfo, LagBytes: 1 << 20, PreparedWait: time.Hour}
+	f.copier = &Copier{Pool: pool, Shards: f.dialer, Schema: f.materializer(), SourceConnInfo: f.connInfo, LagBytes: 1 << 20, PreparedWait: time.Hour,
+		SubscriptionPassword: fixtureSubscriptionPassword}
 	return f
 }
 
@@ -199,13 +208,26 @@ func (f *copyFixture) connInfo(_ context.Context, ref ShardRef, database string)
 // has no PostgreSQL binaries and no route to the container names.
 func (f *copyFixture) materializer() *ExecMaterializer {
 	dir := f.t.TempDir()
+	f.schemaArgv = filepath.Join(dir, "argv.log")
 	for _, bin := range []string{"pg_dump", "psql"} {
-		script := fmt.Sprintf("#!/bin/sh\nexec docker exec -i %s %s \"$@\"\n", f.container("src", 0), bin)
+		// The arguments are recorded because they are a place a secret must
+		// never reach: argv is world-readable through /proc on the node.
+		script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$*\" >> %s\nexec docker exec -i %s %s \"$@\"\n", f.schemaArgv, f.container("src", 0), bin)
 		if err := os.WriteFile(filepath.Join(dir, bin), []byte(script), 0o755); err != nil {
 			f.t.Fatal(err)
 		}
 	}
 	return &ExecMaterializer{BinDir: dir, TargetConnInfo: f.connInfo}
+}
+
+// schemaCopyArgs is every argument line the recorded pg_dump and psql runs
+// were given.
+func (f *copyFixture) schemaCopyArgs() string {
+	b, err := os.ReadFile(f.schemaArgv)
+	if err != nil {
+		f.t.Fatalf("no schema copy was recorded: %v", err)
+	}
+	return string(b)
 }
 
 // seed inserts n orders and docs with keys from start on, each on the source
@@ -338,6 +360,9 @@ func TestReshardCopyOnPostgres(t *testing.T) {
 	if state != StateRunning || stage != StageCopying || !strings.Contains(msg, "waits for prepared transactions [pgshard-indoubt]") {
 		t.Fatalf("after first pass: %s %s %q", state, stage, msg)
 	}
+	if argv := f.schemaCopyArgs(); strings.Contains(argv, "password=") {
+		t.Errorf("the schema copy put a password in argv:\n%s", argv)
+	}
 	for id := range 2 {
 		tgt := connect(t, f.appDSN("g2", int32(id)))
 		if n := queryOne[int64](t, tgt, `SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname IN ('orders', 'docs', 'regions', 'items', 'notes', 'orders_note_idx', 'ticket_seq', 'order_count')`); n != 8 {
@@ -390,6 +415,20 @@ func TestReshardCopyOnPostgres(t *testing.T) {
 	_, _, msg = f.workflow(id)
 	if strings.Contains(msg, "prepared") {
 		t.Fatalf("still blocked: %s", msg)
+	}
+	// PostgreSQL on the target opens the subscription's connection, so the
+	// password has to be in that statement. It must not be anywhere else:
+	// the same conninfo goes to a schema copy, where it would become a
+	// pg_dump argument and /proc would make it readable on the node.
+	for id := range 2 {
+		tgt := connect(t, f.appDSN("g2", int32(id)))
+		ci := queryOne[string](t, tgt, `SELECT subconninfo FROM pg_subscription ORDER BY subname LIMIT 1`)
+		if !strings.Contains(ci, fixtureSubscriptionPassword) {
+			t.Errorf("target %d subscription conninfo has no password: %s", id, ci)
+		}
+	}
+	if argv := f.schemaCopyArgs(); strings.Contains(argv, "password=") {
+		t.Errorf("the schema copy put a password in argv:\n%s", argv)
 	}
 	// Whatever the copy is waiting on, the status names the database as
 	// well as the subscription: the subscription name carries the target

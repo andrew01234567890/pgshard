@@ -179,6 +179,12 @@ record under `status.copy` is informational except for the schema flags.
    `copy_data=true, create_slot=true, streaming=parallel, two_phase=false,
    origin=any` and the source's direct conninfo
    (`--subscription-dsn-template`, placeholders `{set} {id} {group} {db}`).
+   The template carries no password: the controller splices `PGPASSWORD`
+   into the statement it renders, and only there. The same conninfo is
+   handed to a target's agent for the schema copy, where a password would
+   become a `pg_dump` argument, and argv is readable through `/proc` by
+   anything on the node; the agent authenticates from its own pgpass file
+   instead.
    Slot creation waits for every running transaction on the source, so
    before creating one the controller lists `pg_prepared_xacts` there,
    runs the resolver once, and retries next pass while any remain

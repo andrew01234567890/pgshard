@@ -636,6 +636,40 @@ func withDatabase(dsn, database string) (string, error) {
 	return trimmed + " dbname=" + quoteConnValue(database), nil
 }
 
+// WithPassword returns dsn carrying password, and dsn unchanged when the
+// password is empty. It exists so the password can be kept out of every
+// process's argv and environment until the moment a CREATE SUBSCRIPTION is
+// rendered: PostgreSQL on the target opens that connection, so it is the one
+// place the secret has to travel in.
+//
+// It follows withDatabase: appending wins in a keyword/value string, and a
+// URL carries the password in its userinfo.
+func WithPassword(dsn, password string) (string, error) {
+	if password == "" {
+		return dsn, nil
+	}
+	trimmed := strings.TrimSpace(dsn)
+	if strings.HasPrefix(trimmed, "postgres://") || strings.HasPrefix(trimmed, "postgresql://") {
+		u, err := url.Parse(trimmed)
+		if err != nil {
+			return "", err
+		}
+		user := ""
+		if u.User != nil {
+			user = u.User.Username()
+		}
+		u.User = url.UserPassword(user, password)
+		// A password in the query string would override the userinfo.
+		q := u.Query()
+		if q.Has("password") {
+			q.Set("password", password)
+			u.RawQuery = q.Encode()
+		}
+		return u.String(), nil
+	}
+	return trimmed + " password=" + quoteConnValue(password), nil
+}
+
 func quoteConnValue(v string) string {
 	return "'" + strings.NewReplacer("\\", "\\\\", "'", "\\'").Replace(v) + "'"
 }

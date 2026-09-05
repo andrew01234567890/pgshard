@@ -160,10 +160,15 @@ func TestTheControllerCanReachTheShards(t *testing.T) {
 	if !strings.Contains(sub, "demo-{group}-rw.ns.svc") || !strings.Contains(sub, "dbname={db}") {
 		t.Errorf("subscription DSN template = %q, want the source group's rw Service and a {db} placeholder", sub)
 	}
-	// PostgreSQL on the target opens this one, not the controller, so it
-	// cannot pick the password up from the controller's environment.
-	if !strings.Contains(sub, "password=$(PGPASSWORD)") {
-		t.Errorf("subscription DSN template = %q, want the password Kubernetes expands from the container's environment", sub)
+	// Neither template carries a password. This one used to carry
+	// password=$(PGPASSWORD), which the kubelet expands before starting the
+	// container: the manifest stayed clean and the running process's argv
+	// carried the superuser password in clear. The controller splices it in
+	// from its environment when it renders CREATE SUBSCRIPTION.
+	for _, arg := range args {
+		if strings.Contains(arg, "password") {
+			t.Errorf("controller argument %q carries a password; argv is readable through /proc", arg)
+		}
 	}
 	if strings.Contains(shard, "password=") {
 		t.Errorf("shard DSN template must leave the password to PGPASSWORD, got %q", shard)

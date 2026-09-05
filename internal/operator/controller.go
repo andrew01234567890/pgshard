@@ -60,9 +60,14 @@ func (r Renderer) ControllerDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv
 		// finish an in-doubt transaction -- the one job nothing else does.
 		"--shard-dsn-template=" + ShardDSNTemplate(c),
 		// PostgreSQL on the target opens this connection, not the
-		// controller, so this one carries the password rather than reading
-		// PGPASSWORD. Kubernetes expands $(PGPASSWORD) from the container's
-		// environment, so the secret stays out of the manifest.
+		// controller, so the password has to travel in the CREATE
+		// SUBSCRIPTION statement -- but not through here. This template used
+		// to carry password=$(PGPASSWORD), which the kubelet expands before
+		// starting the container: the manifest stayed clean and the running
+		// process's argv carried the superuser password in clear, readable
+		// with cat /proc/<pid>/cmdline by anyone with exec on the pod. The
+		// controller splices it in from PGPASSWORD when it renders the
+		// statement.
 		"--subscription-dsn-template=" + SubscriptionDSNTemplate(c),
 	}
 	if d := r.ControllerPlacementDropOldAfter; d > 0 {
@@ -142,8 +147,11 @@ func ShardDSNTemplate(c *pgshardv1alpha1.PgShardCluster) string {
 
 // SubscriptionDSNTemplate is what a target's PostgreSQL uses to subscribe to
 // a source database: {group} names the source group and {db} the database.
+// It carries no password: the controller adds one from its own environment
+// when it renders CREATE SUBSCRIPTION, so the secret is never an argument of
+// a running process.
 func SubscriptionDSNTemplate(c *pgshardv1alpha1.PgShardCluster) string {
-	return fmt.Sprintf("host=%s-{group}-rw.%s.svc port=%d user=%s password=$(PGPASSWORD) dbname={db}", c.Name, c.Namespace, postgresPort, superuserName)
+	return fmt.Sprintf("host=%s-{group}-rw.%s.svc port=%d user=%s dbname={db}", c.Name, c.Namespace, postgresPort, superuserName)
 }
 
 // ControllerService is the address DefaultControllerEndpoint names.
