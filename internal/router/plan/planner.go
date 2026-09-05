@@ -1308,36 +1308,72 @@ func (w *walker) notePreservedReference(jt pgquerypb.JoinType, left, right []*re
 //
 // Reference relations take part -- they are on every shard -- subject to
 // notePreservedReference. An unsharded relation is on the home shard alone
-// and cannot. The key TYPE has to match as well as the name: the same value
-// under two types hashes to two different shards, so tables that agree on
-// the column and not on its type are not colocated at all.
+// and cannot.
+//
+// Between TWO sharded relations the key TYPE has to match as well as the
+// name: the same value under two types hashes to two different shards, so
+// tables agreeing on the column and not on its type are not colocated at
+// all, and an unverified type is not a match. One sharded relation has
+// nothing to compare against, so it carries no such requirement -- adding
+// one there would refuse every ordinary scatter over a table whose key
+// check has not run yet.
 func (w *walker) colocatedKey() (string, bool) {
 	if w.refPreserved {
 		return "", false
 	}
-	var root *rel
+	var sharded []*rel
 	for _, r := range w.rels {
 		switch r.kind {
 		case placeReference:
 		case placeSharded:
-			if !r.shardKeyChecked {
-				return "", false
-			}
-			if root == nil {
-				root = r.root()
-				continue
-			}
-			if r.root() != root || r.shardKeyType != root.shardKeyType {
-				return "", false
-			}
+			sharded = append(sharded, r)
 		default:
 			return "", false
 		}
 	}
-	if root == nil {
+	if len(sharded) == 0 {
 		return "", false
 	}
+	root := sharded[0].root()
+	for _, r := range sharded[1:] {
+		if r.root() != root || !r.shardKeyChecked || !root.shardKeyChecked || r.shardKeyType != root.shardKeyType {
+			return "", false
+		}
+	}
 	return root.shardKey, true
+}
+
+// crossShardJoinError is why a statement cannot run per shard.
+//
+// "Not colocated" and "not yet decidable" are different answers and the
+// caller can only tell them apart here. A join of two sharded tables on
+// their shard key IS colocated, but only if the keys have the same type,
+// and until the controller has inspected them the router does not know
+// that -- so it refuses, correctly, and must not tell the user to do the
+// thing they have already done.
+func (w *walker) crossShardJoinError() error {
+	var unverified string
+	var sharded []*rel
+	for _, r := range w.rels {
+		if r.kind == placeSharded {
+			sharded = append(sharded, r)
+			if !r.shardKeyChecked {
+				unverified = r.name
+			}
+		}
+	}
+	if len(sharded) > 1 && unverified != "" {
+		same := true
+		for _, r := range sharded[1:] {
+			same = same && r.root() == sharded[0].root()
+		}
+		if same {
+			return notYet("a join of sharded tables cannot be planned until the shard key type of \""+unverified+"\" has been inspected",
+				"the controller records what type each shard key has; retry once it has run")
+		}
+	}
+	return notYet("cross-shard join is not available yet",
+		"join sharded tables on equal shard keys and filter on one key value")
 }
 
 func unify(a, b *rel) {
@@ -1757,8 +1793,7 @@ func (w *walker) scatter(write bool, rels int) error {
 			"add WHERE <shard key> = ... or IN (...); this will fan out once multi-shard writes land")
 	}
 	if _, ok := w.colocatedKey(); rels > 1 && !ok {
-		return notYet("cross-shard join is not available yet",
-			"join sharded tables on equal shard keys and filter on one key value")
+		return w.crossShardJoinError()
 	}
 	p := w.plan
 	w.mergeSpec()
@@ -1776,7 +1811,7 @@ func (w *walker) mergeSpec() {
 	p := w.plan
 	key, ok := w.colocatedKey()
 	if w.outer == nil || !ok {
-		p.mergeErr = notYet("cross-shard join is not available yet", "join sharded tables on equal shard keys and filter on one key value")
+		p.mergeErr = w.crossShardJoinError()
 		return
 	}
 	// "joins" is a blocker only while the join might be cross-shard. A

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 )
 
 func mergeOf(t *testing.T, sql string) *Merge {
@@ -305,5 +307,46 @@ func TestColocatedJoinGroupByStillNeedsTheShardKey(t *testing.T) {
 		"select o.status, count(*) from orders o join order_lines l on o.tenant_id = l.tenant_id group by o.status")
 	if err == nil || !strings.Contains(err.Error(), "GROUP BY without the shard key") {
 		t.Fatalf("grouping by a non-key column: %v", err)
+	}
+}
+
+// A sharded table whose shard-key TYPE has not been verified yet still
+// scatters. The type is compared between two relations of a join, where a
+// mismatch would route the sides to different shards; one relation has
+// nothing to compare against, and requiring a verdict there refused every
+// ordinary multi-shard read of a table the controller had not inspected --
+// which is every table for as long as a freshly started cluster takes to
+// inspect it, reported as "cross-shard join is not available yet".
+func TestAnUncheckedShardKeyStillScatters(t *testing.T) {
+	snap := fixture(t)
+	k := snapshot.TableKey{Database: fixtureDB, SchemaName: "public", TableName: "orders"}
+	pl := snap.Tables[k]
+	pl.ShardKeyChecked = false
+	snap.Tables[k] = pl
+
+	for _, sql := range []string{"select id from orders", "select count(*) from orders", "select id from orders order by id limit 3"} {
+		p, err := New().Plan(context.Background(), session(snap), sql)
+		if err != nil {
+			t.Errorf("%s: %v", sql, err)
+			continue
+		}
+		if p.Kind != Scatter {
+			t.Errorf("%s: kind %v, want Scatter", sql, p.Kind)
+		}
+	}
+	// Two of them is the case the verdict is for, and without one the join
+	// is refused rather than routed to the wrong shard -- naming the reason,
+	// because "join sharded tables on equal shard keys" is advice this
+	// statement has already taken.
+	_, err := New().Plan(context.Background(), session(snap),
+		"select * from orders o join order_lines l on o.tenant_id = l.tenant_id")
+	if err == nil || !strings.Contains(err.Error(), `shard key type of "orders" has been inspected`) {
+		t.Errorf("a join on an unverified key must say why it is refused: %v", err)
+	}
+	// A join that is not colocated at all keeps the plain message.
+	if _, err := New().Plan(context.Background(), session(snap),
+		"select * from orders o join order_lines l on o.id = l.order_id"); err == nil ||
+		!strings.Contains(err.Error(), "cross-shard join is not available yet") {
+		t.Errorf("a join on a non-key column: %v", err)
 	}
 }

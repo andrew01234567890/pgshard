@@ -383,6 +383,24 @@ func TestRouterScatterDifferential(t *testing.T) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+	// And the join separately. Serving `events` says the controller
+	// inspected THAT table's shard key; a join is only plannable once it
+	// has inspected both, because the two key types have to be compared.
+	// Waiting on one and asking about two is a race the corpus loses about
+	// as often as it wins.
+	deadline = time.Now().Add(60 * time.Second)
+	for {
+		var n int64
+		err := conn.QueryRow(ctx, "select count(*) from events e join event_lines l on e.tenant_id = l.tenant_id and e.id = l.id",
+			pgx.QueryExecModeSimpleProtocol).Scan(&n)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("router never planned the colocated join (%v)\nrouter log:\n%s", err, s.routerLog.String())
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 	if len(scatterCorpus) < 40 {
 		t.Fatalf("corpus has %d queries, want at least 40", len(scatterCorpus))
 	}
