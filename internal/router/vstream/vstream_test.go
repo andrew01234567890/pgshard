@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/pooler"
+	"github.com/andrew01234567890/pgshard/internal/router"
 )
 
 var update = os.Getenv("UPDATE_GOLDEN") != ""
@@ -568,9 +571,42 @@ func TestStreamRequestValidation(t *testing.T) {
 			t.Fatalf("orders slots: %v", s)
 		}
 	}
+	// A unary ack for a stream this router is not serving is refused: it
+	// has nothing to check the position against, and an ack above what the
+	// consumer was sent discards transactions for good.
 	ack, err := h.client.Ack(ctx, &pgshardv1.VStreamAckRequest{Stream: "plain", Position: &pgshardv1.VPosition{Shards: []*pgshardv1.VPosition_Shard{{Shard: shardRef(shard0), Lsn: 5}}}})
-	if err != nil || ack.GetError() != nil || h.pool[0].ackedLSNs()[0] != 5 {
-		t.Fatalf("unary ack: %v %v %v", ack, err, h.pool[0].ackedLSNs())
+	if err != nil || ack.GetError() == nil || ack.GetError().GetSqlstate() != "55000" {
+		t.Fatalf("unary ack without an open stream: %v %v", ack, err)
+	}
+	if n := len(h.pool[0].ackedLSNs()); n != 0 {
+		t.Fatalf("a refused ack still reached the pooler: %v", h.pool[0].ackedLSNs())
+	}
+}
+
+// TestAUnaryAckCannotOutrunWhatTheConsumerWasSent: an ack moves the slot's
+// confirmed_flush_lsn, and PostgreSQL will not resend anything below it. The
+// in-stream ack has always been clamped to the delivered position by the
+// merger; the unary one went straight to the pooler with whatever number the
+// caller had -- a position read out of band, or another consumer's VGtid --
+// so it could confirm past transactions still sitting in this router's
+// buffers, which the next restart would then never redeliver.
+func TestAUnaryAckCannotOutrunWhatTheConsumerWasSent(t *testing.T) {
+	h := newHarness(t, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st := h.open(ctx, &pgshardv1.VStreamRequest_Start{Stream: "plain"})
+	h.pool[0].feed("plain", batch(0, evRelation(16384, "t", "id")))
+	h.pool[0].feed("plain", txn(16384, 7, 1000, 2000, "1"))
+	recvN(t, st, 4, 5*time.Second)
+
+	ack, err := h.client.Ack(ctx, &pgshardv1.VStreamAckRequest{Stream: "plain", Position: &pgshardv1.VPosition{
+		Shards: []*pgshardv1.VPosition_Shard{{Shard: shardRef(shard0), Lsn: 999999}}}})
+	if err != nil || ack.GetError() != nil {
+		t.Fatalf("unary ack on an open stream: %v %v", ack, err)
+	}
+	waitFor(t, func() bool { return len(h.pool[0].ackedLSNs()) == 1 })
+	if a := h.pool[0].ackedLSNs(); a[0] != 2000 {
+		t.Fatalf("unary ack = %v, want it clamped to the delivered 2000", a)
 	}
 }
 
@@ -653,4 +689,62 @@ func TestAnOmittedShardSetFollowsTheCutover(t *testing.T) {
 	if _, err := st.Recv(); status.Code(err) == codes.FailedPrecondition {
 		t.Fatalf("an explicit set must still be honoured: %v", err)
 	}
+}
+
+// TestAShortConfirmationIsNotRecordedAsDone: the pooler clamps an ack to
+// what it delivered, so the LSN it confirms can be lower than the one asked
+// for. Recording the asked-for one as done makes the router believe a slot
+// advanced when it did not, and the operator-visible signal that it did not
+// is this warning.
+func TestAShortConfirmationIsNotRecordedAsDone(t *testing.T) {
+	var buf lockedBuffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	// wg.Wait is deferred first so it runs LAST: the acker loop only
+	// returns once the context is done, so waiting before cancelling
+	// deadlocks.
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	asked := make(chan uint64, 4)
+	a := newAckers(ctx, &wg, func(_ router.Shard, lsn uint64) (uint64, error) {
+		asked <- lsn
+		return 100, nil // the pooler only ever delivered 100
+	}, logger)
+	a.request(shard0, 200)
+
+	select {
+	case got := <-asked:
+		if got != 200 {
+			t.Fatalf("acked %d, want the requested 200", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the ack was never forwarded")
+	}
+	waitFor(t, func() bool { return strings.Contains(buf.String(), "confirmed less than the ack asked for") })
+	// And nothing spins: a shard that cannot confirm waits for the next
+	// request rather than re-asking as fast as it can.
+	select {
+	case got := <-asked:
+		t.Fatalf("the same ack was re-sent (%d) instead of waiting for a later one", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
