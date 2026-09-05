@@ -153,13 +153,24 @@ jobs:
           # contexts down on a change that is fine -- which is what happened
           # to #641.
           #
-          # Best effort per image: the build has its own fallback, because
-          # the FROM lines are unchanged and a missing override just goes to
-          # Docker Hub. A warm step that failed the job would turn a mirror
-          # that is merely behind into an outage of its own.
+          # Best effort per image: a warm step that failed the job would turn
+          # a mirror that is merely behind into an outage of its own.
+          #
+          # This is also the probe that decides which overrides the builds
+          # get. A digest the mirror cannot serve must get NO override, or
+          # buildx resolves the mirror, gets "not found", and the build fails
+          # -- the pull that just failed here is the whole fallback, and
+          # without this file it would not be one. Every base-image bump is
+          # in that state: the mirror is filled on push to main, so while the
+          # bump is a pull request its new digest exists nowhere but Docker
+          # Hub. #675 died that way on six required contexts.
+          : > "$RUNNER_TEMP/mirror-present.txt"
           while IFS=$'\t' read -r ref slug; do
-            hack/ci/retry.sh -n 2 -d 5 -- docker pull "ghcr.io/${{ github.repository_owner }}/pgshard-base@${ref#*@}" \
-              || echo "::warning::${slug} not available from the mirror; the build will fall back to Docker Hub"
+            if hack/ci/retry.sh -n 2 -d 5 -- docker pull "ghcr.io/${{ github.repository_owner }}/pgshard-base@${ref#*@}"; then
+              printf '%s\n' "${ref#*@}" >> "$RUNNER_TEMP/mirror-present.txt"
+            else
+              echo "::warning::${slug} not available from the mirror; the build will pull it from Docker Hub"
+            fi
           done < <(hack/ci/base-images.sh)
       - name: Build PostgreSQL image
         id: build_postgres
@@ -180,7 +191,7 @@ jobs:
           # digest. With none -- a fork without the mirror, or a base added
           # before the mirror workflow ran -- the Dockerfiles are unchanged
           # and the build goes to Docker Hub as before.
-          mapfile -t mirror < <(hack/ci/mirror-args.sh)
+          mapfile -t mirror < <(PGSHARD_MIRROR_PRESENT="$RUNNER_TEMP/mirror-present.txt" hack/ci/mirror-args.sh)
           hack/ci/retry.sh -- docker buildx build "${mirror[@]}" --load -f Dockerfile.control --build-arg CMD=pgshard-operator -t pgshard-operator:e2e .
           hack/ci/retry.sh -- docker buildx build "${mirror[@]}" --load -f Dockerfile.control --build-arg CMD=pgshard-admin -t pgshard-admin:e2e .
           hack/ci/retry.sh -- docker buildx build "${mirror[@]}" --load -f Dockerfile.router -t pgshard-router:e2e .
@@ -191,7 +202,7 @@ jobs:
         if: matrix.suite != 'smoke' && needs.changes.outputs.code == 'true'
         run: |
           set -euo pipefail
-          mapfile -t mirror < <(hack/ci/mirror-args.sh)
+          mapfile -t mirror < <(PGSHARD_MIRROR_PRESENT="$RUNNER_TEMP/mirror-present.txt" hack/ci/mirror-args.sh)
           hack/ci/retry.sh -- docker buildx build "${mirror[@]}" --load -f Dockerfile.control --build-arg CMD=pgshard-controller -t pgshard-controller:e2e .
       - name: Build the target-major PostgreSQL image
         id: build_postgres_target
