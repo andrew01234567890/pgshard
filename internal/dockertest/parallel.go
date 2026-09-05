@@ -72,9 +72,15 @@ var Limit = func() int {
 // Parallel marks a PostgreSQL-backed test parallel and holds a slot for its
 // whole lifetime. The release is registered before any container cleanup so
 // it runs last, after the containers are actually gone.
-func Parallel(t *testing.T) {
+func Parallel(t testing.TB) {
 	t.Helper()
-	t.Parallel()
+	// A benchmark has no Parallel: it is already the only thing running,
+	// and calling it would be a compile error rather than a no-op. The
+	// admission below is what actually bounds the containers, and it
+	// applies either way.
+	if p, ok := t.(interface{ Parallel() }); ok {
+		p.Parallel()
+	}
 	pgSlots <- struct{}{}
 	t.Cleanup(func() { <-pgSlots })
 	release, err := acquireSlot(slotDir, GlobalLimit)

@@ -3,9 +3,14 @@ package pooler
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 )
@@ -233,5 +238,75 @@ func (h *pgHarness) testCopyTables(t *testing.T) {
 			t.Fatalf("temporary slots left: %d: %s", slots, info)
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// BenchmarkCopyWideTable measures what an initial copy allocates per page
+// of a wide table. It is the evidence PGS-214 asked for and PGS-626
+// inherited: the change it justifies is allocation behaviour, not a visible
+// failure, so without a number there is nothing to argue from.
+//
+// copyRows used to call ExecParams(...).Read(), which materialises the whole
+// page before any of it is converted -- so at BatchRows rows of a wide table
+// the page's bytes and the converted Values coexist. Iterating the reader
+// instead makes what is held a function of the chunk rather than the page.
+//
+// Run it with -benchmem; B/op is the figure that moves.
+func BenchmarkCopyWideTable(b *testing.B) {
+	// Opt-in, because it starts a PostgreSQL container and copies 25 MiB
+	// through it. hack/perf/benchstat.sh runs `-bench .` over
+	// ./internal/pooler/... on every pull request, and this took twenty
+	// minutes there before failing -- the script's own comment warns that
+	// packages are named explicitly because some need Docker, and a
+	// benchmark that needs it is the same hazard.
+	//
+	// It is a measurement tool for one question, not a regression gate:
+	// the number depends on a container's I/O, so comparing two runs of it
+	// across machines says nothing. Run it by hand, on both sides of a
+	// change, when the question is what the copy allocates:
+	//
+	//	PGSHARD_BENCH_PG=1 go test ./internal/pooler/ -run '^$' \
+	//	  -bench BenchmarkCopyWideTable -benchmem -benchtime 3x
+	if os.Getenv("PGSHARD_BENCH_PG") == "" {
+		b.Skip("set PGSHARD_BENCH_PG=1 to run the container-backed copy benchmark")
+	}
+	ctx := context.Background()
+	if _, err := exec.LookPath("docker"); err != nil {
+		b.Skip("docker not on PATH")
+	}
+	if err := exec.Command("docker", "info").Run(); err != nil {
+		b.Skip("docker daemon unavailable")
+	}
+	_, dsn := startPostgres(b, pgImages[0].name)
+	conn, err := pgconn.Connect(ctx, dsn)
+	if err != nil {
+		b.Skipf("postgres unavailable: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	for _, sql := range []string{
+		"DROP TABLE IF EXISTS benchwide",
+		"CREATE TABLE benchwide (id int primary key, body text)",
+		"INSERT INTO benchwide SELECT g, repeat('x', 256 * 1024) FROM generate_series(1, 100) g",
+	} {
+		if err := conn.Exec(ctx, sql).Close(); err != nil {
+			b.Fatalf("%s: %v", sql, err)
+		}
+	}
+	tbl := copyTable{schema: "public", table: "benchwide", keyNames: []string{pgx.Identifier{"id"}.Sanitize()}, keyTypes: []string{"int4"},
+		relation: &pgshardv1.ChangeEvent_Relation{Columns: []*pgshardv1.ChangeEvent_Relation_Column{{Name: "id"}, {Name: "body"}}}}
+	sent := 0
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := copyRows(ctx, conn, tbl, nil, 100, func(*pgshardv1.CopyTablesResponse) error {
+			sent++
+			return nil
+		}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	if sent == 0 {
+		b.Fatal("the benchmark sent nothing; it is measuring the wrong thing")
 	}
 }

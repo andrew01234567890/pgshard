@@ -20,7 +20,7 @@ func Required() bool { return os.Getenv(RequireEnv) == "1" }
 // Unavailable ends the test: fatally where containers are required, as a skip
 // otherwise. A developer without docker still gets a usable `go test ./...`;
 // CI does not get a green run out of tests that never executed.
-func Unavailable(t *testing.T, format string, args ...any) {
+func Unavailable(t testing.TB, format string, args ...any) {
 	t.Helper()
 	if Required() {
 		t.Fatalf("%s is set, so this must run: "+format, append([]any{RequireEnv}, args...)...)
@@ -34,7 +34,7 @@ func Unavailable(t *testing.T, format string, args ...any) {
 // choosing and binding, any other test or process on the machine can take
 // it, and the failure that produces -- "ports are not available", or a
 // server that never comes up -- says nothing about the code under test.
-func HostPort(t *testing.T, id, port string) string {
+func HostPort(t testing.TB, id, port string) string {
 	t.Helper()
 	out, err := exec.Command("docker", "port", id, port).Output()
 	if err != nil {
