@@ -123,7 +123,7 @@ spec:
           # Not "for:", because a cutover pause is a moment that has already
           # happened by the time it is measured; waiting to see it persist
           # would mean never firing.
-          expr: pgshard_controller_cutover_pause_seconds > 2
+          expr: pgshard_controller_cutover_pause_seconds > 1.5
           labels:
             severity: warning
           annotations:
@@ -134,11 +134,14 @@ spec:
               is visible to a workload, and nothing reported it before:
               pgshard_controller_cutover_paused counts workflows held at a
               CONFIGURED pause point, which is a different thing. The guide
-              documents a sub-second pause; the threshold here is 2s because
-              pauses above the documented bound have been observed on small
-              runners and whether the guarantee or the implementation is
-              wrong is not yet settled. Treat a value near the threshold as
-              a question, not noise.
+              documents a sub-second pause, and twenty consecutive cutovers
+              on a four-vCPU CI runner came in at a median of 0.86s with a
+              maximum of 0.91s -- so the threshold is 1.5s: above what a
+              small runner does, and well below the 2.2-2.3s that was normal
+              before the flip stopped re-carrying unmoved sequences. It is
+              not set at the documented 1s, because an alert on the
+              guarantee's own boundary fires on ordinary variation and
+              teaches people to ignore it.
         - alert: PgshardCutoverPaused
           expr: pgshard_controller_cutover_paused > 0
           for: 30m
