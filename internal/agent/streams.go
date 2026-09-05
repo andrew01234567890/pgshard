@@ -9,6 +9,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
@@ -24,18 +26,15 @@ func (s *Server) CreateStreamSlot(ctx context.Context, req *pgshardv1.CreateStre
 	resp := &pgshardv1.CreateStreamSlotResponse{Epoch: s.epoch.Current()}
 	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
 	if err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	defer endTerm()
 	resp.Epoch = req.GetEpoch()
 	if !catalog.ValidStreamName(req.GetStream()) {
-		resp.Error = &pgshardv1.Error{Sqlstate: "22023", Message: fmt.Sprintf("invalid stream name %q", req.GetStream())}
-		return resp, nil
+		return nil, status.Errorf(codes.InvalidArgument, "invalid stream name %q", req.GetStream())
 	}
 	if req.GetDatabase() == "" {
-		resp.Error = &pgshardv1.Error{Sqlstate: "22023", Message: "database is required"}
-		return resp, nil
+		return nil, status.Error(codes.InvalidArgument, "database is required")
 	}
 	resp.Slot = catalog.StreamSlotName(req.GetStream(), s.inst.cfg.Shard)
 	err = s.withDB(ctx, req.GetDatabase(), func(q querier) error {
@@ -57,7 +56,9 @@ func (s *Server) CreateStreamSlot(ctx context.Context, req *pgshardv1.CreateStre
 		}
 		return nil
 	})
-	resp.Error = pgErr(err)
+	if err != nil {
+		return nil, s.rpcErr(err)
+	}
 	return resp, nil
 }
 
@@ -91,21 +92,21 @@ func (s *Server) DropStreamSlot(ctx context.Context, req *pgshardv1.DropStreamSl
 	resp := &pgshardv1.DropStreamSlotResponse{Epoch: s.epoch.Current()}
 	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
 	if err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	defer endTerm()
 	resp.Epoch = req.GetEpoch()
 	if !catalog.ValidStreamName(req.GetStream()) {
-		resp.Error = &pgshardv1.Error{Sqlstate: "22023", Message: fmt.Sprintf("invalid stream name %q", req.GetStream())}
-		return resp, nil
+		return nil, status.Errorf(codes.InvalidArgument, "invalid stream name %q", req.GetStream())
 	}
 	slot := catalog.StreamSlotName(req.GetStream(), s.inst.cfg.Shard)
 	err = s.withConn(ctx, func(q querier) error {
 		_, err := q.Exec(ctx, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1`, slot)
 		return err
 	})
-	resp.Error = pgErr(err)
+	if err != nil {
+		return nil, s.rpcErr(err)
+	}
 	return resp, nil
 }
 
@@ -117,8 +118,7 @@ func (s *Server) SetSynchronizedStandbySlots(ctx context.Context, req *pgshardv1
 	resp := &pgshardv1.SetSynchronizedStandbySlotsResponse{Epoch: s.epoch.Current()}
 	ctx, endTerm, err := s.fenceCurrent(ctx, req.GetEpoch())
 	if err != nil {
-		resp.Error = pgErr(err)
-		return resp, nil
+		return nil, s.rpcErr(err)
 	}
 	defer endTerm()
 	resp.Epoch = req.GetEpoch()
@@ -147,7 +147,9 @@ func (s *Server) SetSynchronizedStandbySlots(ctx context.Context, req *pgshardv1
 		_, err = q.Exec(ctx, "SELECT pg_reload_conf()")
 		return err
 	})
-	resp.Error = pgErr(err)
+	if err != nil {
+		return nil, s.rpcErr(err)
+	}
 	return resp, nil
 }
 

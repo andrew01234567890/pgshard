@@ -17,6 +17,20 @@ option go_package = "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v
 // only when it EQUALS the last accepted epoch, so a stale controller is fenced
 // while same-term operations and idempotent retries remain possible.
 // Read-only commands (Status, ListSlots, RestoreInfo) are not fenced.
+//
+// Failure channel: an operation that did not happen fails the RPC, with a
+// gRPC status code. FailedPrecondition means the caller's epoch is stale --
+// re-read the epoch and retry; Internal means the operation failed and is not
+// known to be retryable. An embedded Error survives only in the three
+// responses that carry a PARTIAL ANSWER the caller uses when the operation
+// failed: Status (role, epoch and build are still reported when the role
+// cannot be read), Backup and Verify (pgBackRest's own output, which on a
+// failed backup is the only diagnostic there is).
+//
+// Every other response used to carry the failure in its body and return OK,
+// so a Promote that did not happen was a successful RPC: retry policies,
+// interceptors and telemetry counted it as success, and only a caller that
+// also read the body could tell.
 service Agent {
   // Status reports role, epoch and replication position. Read-only.
   rpc Status(StatusRequest) returns (StatusResponse);
@@ -96,6 +110,9 @@ message StatusResponse {
   uint32 timeline = 4;
   // True when PostgreSQL accepts connections.
   bool running = 5;
+  // Set when the role or position could not be read. Kept in the body
+  // because the rest of this response is still true: reconciliation
+  // publishes the build of an agent whose PostgreSQL is not answering.
   Error error = 6;
   // True while a promotion has run pg_ctl promote but not yet finished its
   // post-promotion setup; the operator re-issues Promote to complete it.
@@ -122,7 +139,8 @@ message PromoteResponse {
   uint64 epoch = 1;
   // Timeline id after promotion.
   uint32 timeline = 2;
-  Error error = 3;
+  reserved 3;
+  reserved "error";
 }
 
 // DemoteRequest demotes the instance.
@@ -134,7 +152,8 @@ message DemoteRequest {
 // DemoteResponse reports the outcome.
 message DemoteResponse {
   uint64 epoch = 1;
-  Error error = 2;
+  reserved 2;
+  reserved "error";
 }
 
 // RewindRequest rewinds the instance to follow a source.
@@ -148,7 +167,8 @@ message RewindRequest {
 // RewindResponse reports the outcome.
 message RewindResponse {
   uint64 epoch = 1;
-  Error error = 2;
+  reserved 2;
+  reserved "error";
 }
 
 // RecloneRequest rebuilds the data directory.
@@ -170,7 +190,8 @@ message RecloneRequest {
 // RecloneResponse reports the outcome.
 message RecloneResponse {
   uint64 epoch = 1;
-  Error error = 2;
+  reserved 2;
+  reserved "error";
 }
 
 // ReloadRequest reloads configuration.
@@ -182,7 +203,8 @@ message ReloadRequest {
 // ReloadResponse reports the outcome.
 message ReloadResponse {
   uint64 epoch = 1;
-  Error error = 2;
+  reserved 2;
+  reserved "error";
   // settings_hash identifies the configuration the agent applied, as
   // published by the operator in the agent config.
   string settings_hash = 3;
@@ -204,7 +226,8 @@ message RestartRequest {
 // RestartResponse reports the outcome.
 message RestartResponse {
   uint64 epoch = 1;
-  Error error = 2;
+  reserved 2;
+  reserved "error";
 }
 
 // CreateRestorePointRequest creates a named restore point.
@@ -218,7 +241,8 @@ message CreateRestorePointRequest {
 message CreateRestorePointResponse {
   uint64 epoch = 1;
   uint64 lsn = 2;
-  Error error = 3;
+  reserved 3;
+  reserved "error";
 }
 
 // SlotKind distinguishes physical from logical slots.
@@ -244,7 +268,8 @@ message CreateSlotRequest {
 message CreateSlotResponse {
   uint64 epoch = 1;
   uint64 lsn = 2;
-  Error error = 3;
+  reserved 3;
+  reserved "error";
 }
 
 // DropSlotRequest drops a replication slot.
@@ -257,7 +282,8 @@ message DropSlotRequest {
 // DropSlotResponse reports the outcome.
 message DropSlotResponse {
   uint64 epoch = 1;
-  Error error = 2;
+  reserved 2;
+  reserved "error";
 }
 
 // ListSlotsRequest lists replication slots.
@@ -302,7 +328,8 @@ message CreateStreamSlotResponse {
   string slot = 2;
   // Consistent point the slot starts from.
   uint64 lsn = 3;
-  Error error = 4;
+  reserved 4;
+  reserved "error";
 }
 
 // DropStreamSlotRequest drops a change stream's slot on this shard.
@@ -315,7 +342,8 @@ message DropStreamSlotRequest {
 // DropStreamSlotResponse reports the outcome.
 message DropStreamSlotResponse {
   uint64 epoch = 1;
-  Error error = 2;
+  reserved 2;
+  reserved "error";
 }
 
 // SetSynchronizedStandbySlotsRequest names the physical slots of the
@@ -331,14 +359,16 @@ message SetSynchronizedStandbySlotsResponse {
   uint64 epoch = 1;
   // Subset of the requested slots that exist and are active.
   repeated string applied = 2;
-  Error error = 3;
+  reserved 3;
+  reserved "error";
 }
 
 // ListSlotsResponse returns the slots.
 message ListSlotsResponse {
   uint64 epoch = 1;
   repeated Slot slots = 2;
-  Error error = 3;
+  reserved 3;
+  reserved "error";
 }
 
 // BackupRequest takes a backup.
@@ -402,7 +432,8 @@ message RestoreInfoResponse {
   // on a message about the instance and can take a fresh tag there.
   reserved 2, 3;
   reserved "backup_ref", "recovery_end_lsn";
-  Error error = 4;
+  reserved 4;
+  reserved "error";
   string stanza = 5;
   // pgBackRest stanza status code and message (0 = ok).
   int64 status_code = 6;
@@ -422,7 +453,8 @@ message ExpireRequest {
 // ExpireResponse reports the outcome.
 message ExpireResponse {
   uint64 epoch = 1;
-  Error error = 2;
+  reserved 2;
+  reserved "error";
   repeated string log = 3;
 }
 
@@ -471,7 +503,8 @@ message ListTransactionDecisionsRequest {}
 message ListTransactionDecisionsResponse {
   uint64 epoch = 1;
   repeated TransactionDecision decisions = 2;
-  Error error = 3;
+  reserved 3;
+  reserved "error";
 }
 
 // ListPreparedTransactionsRequest lists the pgshard prepared transactions.
@@ -488,7 +521,8 @@ message PreparedTransaction {
 message ListPreparedTransactionsResponse {
   uint64 epoch = 1;
   repeated PreparedTransaction prepared = 2;
-  Error error = 3;
+  reserved 3;
+  reserved "error";
 }
 
 // ReconcilePreparedTransactionsRequest carries the decision log to apply.
@@ -507,7 +541,8 @@ message ReconcilePreparedTransactionsResponse {
   uint32 rolled_back = 3;
   // Commit-decided gids that are neither prepared nor committed here.
   repeated string contradictions = 4;
-  Error error = 5;
+  reserved 5;
+  reserved "error";
   // Commit-decided gids that are not prepared here and whose recorded
   // transaction id no longer resolves (frozen, unrecorded or in the
   // future), so the commit cannot be verified.
@@ -528,7 +563,8 @@ message SetWriteFenceRequest {
 // SetWriteFenceResponse reports the outcome.
 message SetWriteFenceResponse {
   uint64 epoch = 1;
-  Error error = 2;
+  reserved 2;
+  reserved "error";
 }
 
 // MaterializeSchemaRequest names the source and the database to copy.
@@ -547,7 +583,8 @@ message MaterializeSchemaRequest {
 
 // MaterializeSchemaResponse reports the outcome.
 message MaterializeSchemaResponse {
-  Error error = 1;
+  reserved 1;
+  reserved "error";
   // Epoch the member is serving at now.
   uint64 epoch = 2;
 }

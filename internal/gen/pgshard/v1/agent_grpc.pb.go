@@ -60,6 +60,20 @@ const (
 // only when it EQUALS the last accepted epoch, so a stale controller is fenced
 // while same-term operations and idempotent retries remain possible.
 // Read-only commands (Status, ListSlots, RestoreInfo) are not fenced.
+//
+// Failure channel: an operation that did not happen fails the RPC, with a
+// gRPC status code. FailedPrecondition means the caller's epoch is stale --
+// re-read the epoch and retry; Internal means the operation failed and is not
+// known to be retryable. An embedded Error survives only in the three
+// responses that carry a PARTIAL ANSWER the caller uses when the operation
+// failed: Status (role, epoch and build are still reported when the role
+// cannot be read), Backup and Verify (pgBackRest's own output, which on a
+// failed backup is the only diagnostic there is).
+//
+// Every other response used to carry the failure in its body and return OK,
+// so a Promote that did not happen was a successful RPC: retry policies,
+// interceptors and telemetry counted it as success, and only a caller that
+// also read the body could tell.
 type AgentClient interface {
 	// Status reports role, epoch and replication position. Read-only.
 	Status(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResponse, error)
@@ -371,6 +385,20 @@ func (c *agentClient) MaterializeSchema(ctx context.Context, in *MaterializeSche
 // only when it EQUALS the last accepted epoch, so a stale controller is fenced
 // while same-term operations and idempotent retries remain possible.
 // Read-only commands (Status, ListSlots, RestoreInfo) are not fenced.
+//
+// Failure channel: an operation that did not happen fails the RPC, with a
+// gRPC status code. FailedPrecondition means the caller's epoch is stale --
+// re-read the epoch and retry; Internal means the operation failed and is not
+// known to be retryable. An embedded Error survives only in the three
+// responses that carry a PARTIAL ANSWER the caller uses when the operation
+// failed: Status (role, epoch and build are still reported when the role
+// cannot be read), Backup and Verify (pgBackRest's own output, which on a
+// failed backup is the only diagnostic there is).
+//
+// Every other response used to carry the failure in its body and return OK,
+// so a Promote that did not happen was a successful RPC: retry policies,
+// interceptors and telemetry counted it as success, and only a caller that
+// also read the body could tell.
 type AgentServer interface {
 	// Status reports role, epoch and replication position. Read-only.
 	Status(context.Context, *StatusRequest) (*StatusResponse, error)

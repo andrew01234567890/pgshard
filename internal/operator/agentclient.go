@@ -8,8 +8,10 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	pgshardv1 "github.com/andrew01234567890/pgshard/internal/gen/pgshard/v1"
 	"github.com/andrew01234567890/pgshard/internal/grpccreds"
@@ -219,6 +221,37 @@ func (c *GRPCAgentClient) dial(ctx context.Context, addr string) (pgshardv1.Agen
 
 func stateReady(s interface{ String() string }) bool { return s.String() == "READY" }
 
+// StaleEpochOf reports the epoch an agent has actually accepted, when err is
+// its refusal of a caller whose epoch is behind.
+//
+// The refusal is a FailedPrecondition, and the epoch rides with it as a
+// status detail. Reading it is how a caller learns what it should have sent
+// without a second Status round trip -- which is what the response body used
+// to give it, before the failure moved to where retry policies, interceptors
+// and telemetry can see it.
+func StaleEpochOf(err error) (uint64, bool) {
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.FailedPrecondition {
+		return 0, false
+	}
+	for _, d := range st.Details() {
+		if se, ok := d.(*pgshardv1.StaleEpoch); ok {
+			return se.GetCurrent(), true
+		}
+	}
+	return 0, false
+}
+
+// withEpoch names the agent's own epoch in a refusal that carries it, so a
+// log line says what the caller should have sent rather than only that it
+// was wrong.
+func withEpoch(what string, err error) error {
+	if cur, ok := StaleEpochOf(err); ok {
+		return fmt.Errorf("%s: %w (the agent has accepted epoch %d)", what, err, cur)
+	}
+	return fmt.Errorf("%s: %w", what, err)
+}
+
 // Status calls Agent.Status.
 func (c *GRPCAgentClient) Status(ctx context.Context, addr string) (AgentStatus, error) {
 	cl, err := c.dial(ctx, addr)
@@ -238,7 +271,8 @@ func (c *GRPCAgentClient) Status(ctx context.Context, addr string) (AgentStatus,
 	return st, nil
 }
 
-// Promote calls Agent.Promote and turns an embedded error into a Go error.
+// Promote calls Agent.Promote. A promotion that did not happen fails the
+// RPC, so err alone decides.
 func (c *GRPCAgentClient) Promote(ctx context.Context, addr string, epoch uint64, holder string) error {
 	cl, err := c.dial(ctx, addr)
 	if err != nil {
@@ -246,17 +280,13 @@ func (c *GRPCAgentClient) Promote(ctx context.Context, addr string, epoch uint64
 	}
 	ctx, cancel := context.WithTimeout(ctx, agentPromoteTimeout)
 	defer cancel()
-	resp, err := cl.Promote(ctx, &pgshardv1.PromoteRequest{Epoch: epoch, LeaseHolder: holder})
-	if err != nil {
-		return err
-	}
-	if e := resp.GetError(); e != nil {
-		return fmt.Errorf("promote: %s (%s)", e.GetMessage(), e.GetSqlstate())
+	if _, err := cl.Promote(ctx, &pgshardv1.PromoteRequest{Epoch: epoch, LeaseHolder: holder}); err != nil {
+		return withEpoch("promote", err)
 	}
 	return nil
 }
 
-// Demote calls Agent.Demote and turns an embedded error into a Go error.
+// Demote calls Agent.Demote. A demotion that did not happen fails the RPC.
 func (c *GRPCAgentClient) Demote(ctx context.Context, addr string, epoch uint64) error {
 	cl, err := c.dial(ctx, addr)
 	if err != nil {
@@ -264,12 +294,8 @@ func (c *GRPCAgentClient) Demote(ctx context.Context, addr string, epoch uint64)
 	}
 	ctx, cancel := context.WithTimeout(ctx, agentPromoteTimeout)
 	defer cancel()
-	resp, err := cl.Demote(ctx, &pgshardv1.DemoteRequest{Epoch: epoch})
-	if err != nil {
-		return err
-	}
-	if e := resp.GetError(); e != nil {
-		return fmt.Errorf("demote: %s (%s)", e.GetMessage(), e.GetSqlstate())
+	if _, err := cl.Demote(ctx, &pgshardv1.DemoteRequest{Epoch: epoch}); err != nil {
+		return withEpoch("demote", err)
 	}
 	return nil
 }
@@ -288,10 +314,7 @@ func (c *GRPCAgentClient) Reload(ctx context.Context, addr string) (string, erro
 	}
 	resp, err := cl.Reload(ctx, &pgshardv1.ReloadRequest{Epoch: st.GetEpoch()})
 	if err != nil {
-		return "", err
-	}
-	if e := resp.GetError(); e != nil {
-		return resp.GetSettingsHash(), fmt.Errorf("reload: %s (%s)", e.GetMessage(), e.GetSqlstate())
+		return "", withEpoch("reload", err)
 	}
 	return resp.GetSettingsHash(), nil
 }
@@ -394,12 +417,8 @@ func (c *GRPCAgentClient) Expire(ctx context.Context, addr string) error {
 	if err != nil {
 		return err
 	}
-	resp, err := cl.Expire(ctx, &pgshardv1.ExpireRequest{Epoch: st.GetEpoch()})
-	if err != nil {
-		return err
-	}
-	if e := resp.GetError(); e != nil {
-		return fmt.Errorf("expire: %s (%s)", e.GetMessage(), e.GetSqlstate())
+	if _, err := cl.Expire(ctx, &pgshardv1.ExpireRequest{Epoch: st.GetEpoch()}); err != nil {
+		return withEpoch("expire", err)
 	}
 	return nil
 }
@@ -437,10 +456,7 @@ func (c *GRPCAgentClient) Info(ctx context.Context, addr string) (RepoInfo, erro
 	}
 	resp, err := cl.RestoreInfo(ctx, &pgshardv1.RestoreInfoRequest{})
 	if err != nil {
-		return RepoInfo{}, err
-	}
-	if e := resp.GetError(); e != nil {
-		return RepoInfo{}, fmt.Errorf("info: %s (%s)", e.GetMessage(), e.GetSqlstate())
+		return RepoInfo{}, withEpoch("info", err)
 	}
 	info := RepoInfo{Stanza: resp.GetStanza(), StatusCode: resp.GetStatusCode(), StatusMessage: resp.GetStatusMessage(), ArchiveMin: resp.GetArchiveMin(), ArchiveMax: resp.GetArchiveMax()}
 	for _, b := range resp.GetBackups() {
@@ -498,10 +514,7 @@ func (c *GRPCAgentClient) SetSynchronizedStandbySlots(ctx context.Context, addr 
 	}
 	resp, err := cl.SetSynchronizedStandbySlots(ctx, &pgshardv1.SetSynchronizedStandbySlotsRequest{Epoch: st.GetEpoch(), Slots: slots})
 	if err != nil {
-		return nil, err
-	}
-	if e := resp.GetError(); e != nil {
-		return nil, fmt.Errorf("set synchronized standby slots: %s (%s)", e.GetMessage(), e.GetSqlstate())
+		return nil, withEpoch("set synchronized standby slots", err)
 	}
 	return resp.GetApplied(), nil
 }

@@ -56,10 +56,7 @@ func (c *GRPCAgentClient) ListPrepared(ctx context.Context, addr string) (map[st
 	defer cancel()
 	resp, err := cl.ListPreparedTransactions(ctx, &pgshardv1.ListPreparedTransactionsRequest{})
 	if err != nil {
-		return nil, err
-	}
-	if e := resp.GetError(); e != nil {
-		return nil, fmt.Errorf("list prepared transactions: %s", e.GetMessage())
+		return nil, withEpoch("list prepared transactions", err)
 	}
 	out := make(map[string]string, len(resp.GetPrepared()))
 	for _, p := range resp.GetPrepared() {
@@ -78,10 +75,7 @@ func (c *GRPCAgentClient) ListTransactionDecisions(ctx context.Context, addr str
 	defer cancel()
 	resp, err := cl.ListTransactionDecisions(ctx, &pgshardv1.ListTransactionDecisionsRequest{})
 	if err != nil {
-		return nil, err
-	}
-	if e := resp.GetError(); e != nil {
-		return nil, fmt.Errorf("list transaction decisions: %s", e.GetMessage())
+		return nil, withEpoch("list transaction decisions", err)
 	}
 	out := make([]twopc.Decision, 0, len(resp.GetDecisions()))
 	for _, d := range resp.GetDecisions() {
@@ -102,15 +96,15 @@ func (c *GRPCAgentClient) ReconcilePrepared(ctx context.Context, addr string, ep
 	}
 	ctx, cancel := context.WithTimeout(ctx, twopcReconcileTimeout)
 	defer cancel()
+	// A reconcile that failed reports no counts: the RPC fails, so nothing
+	// comes back beside the error. Its per-item outcomes -- contradictions,
+	// unverifiable, unreadable -- are fields of a SUCCESSFUL reconcile, and
+	// are what the restore refuses to unfence on.
 	resp, err := cl.ReconcilePreparedTransactions(ctx, req)
 	if err != nil {
-		return twopc.Outcome{}, err
+		return twopc.Outcome{}, withEpoch("reconcile prepared transactions", err)
 	}
-	out := twopc.Outcome{Committed: int(resp.GetCommitted()), RolledBack: int(resp.GetRolledBack()), Contradictions: resp.GetContradictions(), Unverifiable: resp.GetUnverifiable(), Unreadable: resp.GetUnreadable()}
-	if e := resp.GetError(); e != nil {
-		return out, fmt.Errorf("reconcile prepared transactions: %s", e.GetMessage())
-	}
-	return out, nil
+	return twopc.Outcome{Committed: int(resp.GetCommitted()), RolledBack: int(resp.GetRolledBack()), Contradictions: resp.GetContradictions(), Unverifiable: resp.GetUnverifiable(), Unreadable: resp.GetUnreadable()}, nil
 }
 
 // SetWriteFence calls Agent.SetWriteFence.
@@ -121,12 +115,8 @@ func (c *GRPCAgentClient) SetWriteFence(ctx context.Context, addr string, epoch 
 	}
 	ctx, cancel := context.WithTimeout(ctx, twopcFenceTimeout)
 	defer cancel()
-	resp, err := cl.SetWriteFence(ctx, &pgshardv1.SetWriteFenceRequest{Epoch: epoch, Active: active, Reason: reason})
-	if err != nil {
-		return err
-	}
-	if e := resp.GetError(); e != nil {
-		return fmt.Errorf("set write fence: %s", e.GetMessage())
+	if _, err := cl.SetWriteFence(ctx, &pgshardv1.SetWriteFenceRequest{Epoch: epoch, Active: active, Reason: reason}); err != nil {
+		return withEpoch("set write fence", err)
 	}
 	return nil
 }
