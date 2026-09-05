@@ -376,7 +376,11 @@ func (w *walker) sequenceRefusal(root *pgquerypb.Node) error {
 		case "lastval":
 			refusal = notYet("lastval() is not available through the router: it names whichever sequence nextval last touched, and for a global sequence that was the router's counter rather than this backend's",
 				"use currval('<sequence>') on a sequence that is not global, or keep the value the INSERT ... RETURNING gave you")
-		case "currval", "setval":
+		// pg_sequence_last_value is here for the same reason as currval: it
+		// reads one shard's counter and the answer looks ordinary. It is
+		// what pg_sequences is built on, so a tool inspecting sequences
+		// reaches it without ever writing currval.
+		case "currval", "setval", "pg_sequence_last_value":
 			if seq := w.sequenceArg(fc); seq != "" {
 				refusal = notYet(strings.ToLower(names[len(names)-1])+"() on the global sequence "+seq+" is not available through the router: the value it would read or set belongs to one shard's own sequence object, not to the counter the router allocates from",
 					"keep the value the INSERT ... RETURNING gave you; global sequence state is not stored on a shard")
@@ -441,6 +445,15 @@ func (w *walker) registeredSequence(arg *pgquerypb.Node) string {
 	if w.sess.Snapshot.Sequences[lit] {
 		return lit
 	}
+	// The PHYSICAL name too, which is the same sequence to a user and a
+	// different object here. Without this, nextval('tickets_id_seq')
+	// allocated from one shard's own counter for a column the router
+	// allocates globally -- the duplicate-id case this file refuses when the
+	// statement happens to spell the sequence the other way. The DDL guard
+	// already derived that name; only this resolver did not know it.
+	if seq := w.sequenceObjectLiteral(lit); seq != "" {
+		return seq
+	}
 	parts := strings.Split(lit, ".")
 	for i := range parts {
 		parts[i] = strings.Trim(parts[i], `"`)
@@ -502,6 +515,44 @@ func (w *walker) claimedNextval(root *pgquerypb.Node) map[*pgquerypb.FuncCall]bo
 		}
 	}
 	return claimed
+}
+
+// globalSequenceRelation reports the global sequence a FROM item names,
+// whether by the registration or by the per-shard object behind it.
+func (w *walker) globalSequenceRelation(rv *pgquerypb.RangeVar) string {
+	if rv == nil || w.sess.Snapshot == nil || rv.GetRelname() == "" {
+		return ""
+	}
+	name := rv.GetRelname()
+	if rv.GetSchemaname() != "" {
+		name = rv.GetSchemaname() + "." + name
+	}
+	if w.sess.Snapshot.Sequences[name] {
+		return name
+	}
+	return w.registeredSequenceObject(rv)
+}
+
+// sequenceObjectLiteral resolves a sequence-function argument that names the
+// PER-SHARD object behind a registered global sequence -- "tickets_id_seq",
+// or schema-qualified. It is registeredSequenceObject reached through a
+// string literal rather than a RangeVar, so the two guards agree about which
+// names belong to a global sequence.
+func (w *walker) sequenceObjectLiteral(lit string) string {
+	parts := strings.Split(lit, ".")
+	for i := range parts {
+		parts[i] = strings.Trim(parts[i], `"`)
+	}
+	rv := &pgquerypb.RangeVar{}
+	switch len(parts) {
+	case 1:
+		rv.Relname = parts[0]
+	case 2:
+		rv.Schemaname, rv.Relname = parts[0], parts[1]
+	default:
+		return ""
+	}
+	return w.registeredSequenceObject(rv)
 }
 
 // registeredSequenceObject reports the registered global sequence whose
