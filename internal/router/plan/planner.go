@@ -1750,6 +1750,10 @@ func (w *walker) referenceWrite(otherRels int) error {
 		return notYet("a write to reference table \""+w.target.name+"\" cannot use "+pick+": each shard would choose its own rows",
 			"select the rows the write should use with a fully ordered, deterministic condition")
 	}
+	if col := perShardColumn(w.root); col != "" {
+		return notYet("a write to reference table \""+w.target.name+"\" cannot name the system column "+col+": it describes where a row is stored on one shard, so the same value picks a different row on each",
+			"identify the rows by their own columns")
+	}
 	// An unqualified name is only the built-in while pg_catalog is searched
 	// first, which it is by default. A session that puts its own schema
 	// ahead of it can shadow any of them, so the proof no longer holds.
