@@ -438,17 +438,49 @@ func TestBackupReconcilerRunsEveryGroupPrimaryInOrder(t *testing.T) {
 	}
 }
 
-func TestBackupReconcilerFailsOnGroupErrorAndStops(t *testing.T) {
+// A group's failure fails the RUN and not the groups after it. Each group
+// has its own stanza and its own repository, so one failing says nothing
+// about the next -- and abandoning the run left every later group with
+// whatever backup it had from the run before, which is the recovery-point
+// window a backup is taken to close.
+func TestBackupReconcilerBacksUpEveryGroupEvenAfterOneFails(t *testing.T) {
 	agents := &fakeBackupAgents{fail: map[string]error{"10.0.0.1:9090": errors.New("exit status 41")}}
 	r, _, b := backupFixture(t, agents)
 	reconcileBackup(t, r, b)
 	waitRun(t, r, b)
 	_, got := reconcileBackup(t, r, b)
-	if got.Status.Phase != pgshardv1alpha1.BackupPhaseFailed || !strings.Contains(got.Status.Error, "group catalog: exit status 41") || len(got.Status.Groups) != 1 || got.Status.BackupID != "" {
+	if got.Status.Phase != pgshardv1alpha1.BackupPhaseFailed || !strings.Contains(got.Status.Error, "group catalog: exit status 41") || got.Status.BackupID != "" {
 		t.Fatalf("status %+v", got.Status)
 	}
-	if len(agents.journal()) != 1 {
-		t.Fatalf("shard must not be backed up after the catalog failed: %v", agents.journal())
+	if len(got.Status.Groups) != 2 || got.Status.Groups[1].Group != "shard-0" || got.Status.Groups[1].Error != "" || got.Status.Groups[1].BackupID == "" {
+		t.Fatalf("the shard must be backed up although the catalog failed: %+v", got.Status.Groups)
+	}
+	if want := []string{"backup 10.0.0.1:9090 incr", "backup 10.0.0.2:9090 incr"}; strings.Join(agents.journal(), ",") != strings.Join(want, ",") {
+		t.Fatalf("calls %v", agents.journal())
+	}
+	// Retention is the one thing that still waits for the whole run:
+	// expiring on the group that succeeded can retire the set the group
+	// that failed still depends on.
+	if c := meta.FindStatusCondition(got.Status.Conditions, ConditionRetentionApplied); c == nil || c.Status != metav1.ConditionFalse || c.Reason != "RunIncomplete" {
+		t.Errorf("retention condition %+v", c)
+	}
+}
+
+// Both groups failing is still one run, and the status names both. Naming
+// only the last hides from whoever has to decide what is restorable.
+func TestBackupReconcilerNamesEveryFailedGroup(t *testing.T) {
+	agents := &fakeBackupAgents{fail: map[string]error{
+		"10.0.0.1:9090": errors.New("exit status 41"),
+		"10.0.0.2:9090": errors.New("exit status 42"),
+	}}
+	r, _, b := backupFixture(t, agents)
+	reconcileBackup(t, r, b)
+	waitRun(t, r, b)
+	_, got := reconcileBackup(t, r, b)
+	if got.Status.Phase != pgshardv1alpha1.BackupPhaseFailed ||
+		!strings.Contains(got.Status.Error, "group catalog: exit status 41") ||
+		!strings.Contains(got.Status.Error, "group shard-0: exit status 42") {
+		t.Fatalf("status %+v", got.Status)
 	}
 }
 
