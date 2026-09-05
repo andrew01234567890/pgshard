@@ -639,6 +639,9 @@ type walker struct {
 	// outerQuals is set while walking the ON clause of an outer join: a key
 	// literal there filters only the inner side, so it must not pin the query.
 	outerQuals bool
+	// refPreserved marks a reference relation on the preserved side of an
+	// outer join, which stops the whole statement being planned per shard.
+	refPreserved bool
 	// locking marks a SELECT with FOR UPDATE/SHARE, which holds row locks
 	// until the transaction ends and so counts as a write participant.
 	locking bool
@@ -1192,9 +1195,11 @@ func (w *walker) fromItem(node *pgquerypb.Node) error {
 		if err := w.fromItem(n.JoinExpr.GetLarg()); err != nil {
 			return err
 		}
+		mid := len(w.rels)
 		if err := w.fromItem(n.JoinExpr.GetRarg()); err != nil {
 			return err
 		}
+		w.notePreservedReference(n.JoinExpr.GetJointype(), w.rels[scope:mid], w.rels[mid:])
 		if len(n.JoinExpr.GetUsingClause()) > 0 || n.JoinExpr.GetIsNatural() {
 			w.joinUsing(n.JoinExpr, w.rels[scope:])
 		}
@@ -1266,6 +1271,73 @@ func (w *walker) joinUsing(j *pgquerypb.JoinExpr, rels []*rel) {
 			unify(sharded[0], sharded[i])
 		}
 	}
+}
+
+// notePreservedReference records a reference relation on the side of an
+// outer join whose rows survive without a match.
+//
+// A reference table is on every shard, so it usually joins in place. Not
+// here: a preserved reference row that matches nothing is emitted
+// NULL-extended by EVERY shard, and the merge returns one copy per shard
+// rather than the one PostgreSQL would. On the null-supplying side there is
+// no such row, so that direction stays safe.
+func (w *walker) notePreservedReference(jt pgquerypb.JoinType, left, right []*rel) {
+	var preserved [][]*rel
+	switch jt {
+	case pgquerypb.JoinType_JOIN_LEFT:
+		preserved = [][]*rel{left}
+	case pgquerypb.JoinType_JOIN_RIGHT:
+		preserved = [][]*rel{right}
+	case pgquerypb.JoinType_JOIN_FULL:
+		preserved = [][]*rel{left, right}
+	default:
+		return
+	}
+	for _, side := range preserved {
+		for _, r := range side {
+			if r.kind == placeReference {
+				w.refPreserved = true
+			}
+		}
+	}
+}
+
+// colocatedKey is the shard key a whole join can be planned on: every
+// sharded relation must be joined to the others on it, so the rows a join
+// can match are on the shard that holds them.
+//
+// Reference relations take part -- they are on every shard -- subject to
+// notePreservedReference. An unsharded relation is on the home shard alone
+// and cannot. The key TYPE has to match as well as the name: the same value
+// under two types hashes to two different shards, so tables that agree on
+// the column and not on its type are not colocated at all.
+func (w *walker) colocatedKey() (string, bool) {
+	if w.refPreserved {
+		return "", false
+	}
+	var root *rel
+	for _, r := range w.rels {
+		switch r.kind {
+		case placeReference:
+		case placeSharded:
+			if !r.shardKeyChecked {
+				return "", false
+			}
+			if root == nil {
+				root = r.root()
+				continue
+			}
+			if r.root() != root || r.shardKeyType != root.shardKeyType {
+				return "", false
+			}
+		default:
+			return "", false
+		}
+	}
+	if root == nil {
+		return "", false
+	}
+	return root.shardKey, true
 }
 
 func unify(a, b *rel) {
@@ -1684,7 +1756,7 @@ func (w *walker) scatter(write bool, rels int) error {
 		return notYet("scatter "+w.stmt+" without a shard key predicate is not available yet",
 			"add WHERE <shard key> = ... or IN (...); this will fan out once multi-shard writes land")
 	}
-	if rels > 1 {
+	if _, ok := w.colocatedKey(); rels > 1 && !ok {
 		return notYet("cross-shard join is not available yet",
 			"join sharded tables on equal shard keys and filter on one key value")
 	}
@@ -1702,11 +1774,29 @@ func (w *walker) scatter(write bool, rels int) error {
 // it cannot.
 func (w *walker) mergeSpec() {
 	p := w.plan
-	if w.outer == nil || len(w.rels) != 1 || w.rels[0].kind != placeSharded {
+	key, ok := w.colocatedKey()
+	if w.outer == nil || !ok {
 		p.mergeErr = notYet("cross-shard join is not available yet", "join sharded tables on equal shard keys and filter on one key value")
 		return
 	}
-	p.merge, p.mergeErr = buildMerge(w.tree, w.outer, w.rels[0].shardKey, w.scatterBlockers)
+	// "joins" is a blocker only while the join might be cross-shard. A
+	// colocated one runs on each shard as the ordinary join it is, and the
+	// merge above it is the same merge a single table needs.
+	blockers := w.scatterBlockers
+	if len(w.rels) > 1 {
+		blockers = without(blockers, "joins")
+	}
+	p.merge, p.mergeErr = buildMerge(w.tree, w.outer, key, blockers)
+}
+
+func without(list []string, drop string) []string {
+	out := make([]string, 0, len(list))
+	for _, s := range list {
+		if s != drop {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func (w *walker) allShards() []int32 {

@@ -160,7 +160,14 @@ func TestMergeSpecRefusals(t *testing.T) {
 		{"select * into tmp from orders", "multi-shard SELECT with SELECT INTO"},
 		{"select * from orders union all select * from orders", "cross-shard join is not available yet"},
 		{"select * from orders where tenant_id in (select 1)", "multi-shard SELECT with subqueries"},
-		{"select * from orders o join regions r on r.id = o.region_id", "cross-shard join is not available yet"},
+		// Still cross-shard, for the three reasons a colocated join is not:
+		// a sharded pair that is not joined on the key, an unsharded table
+		// (home shard only), and a reference table PRESERVED by an outer
+		// join, whose unmatched rows every shard would emit.
+		{"select * from orders o join order_lines l on o.id = l.order_id", "cross-shard join is not available yet"},
+		{"select * from orders o join items i on o.item = i.id", "cross-shard join is not available yet"},
+		{"select * from regions r left join orders o on o.region = r.id", "cross-shard join is not available yet"},
+		{"select * from orders o full join regions r on o.region = r.id", "cross-shard join is not available yet"},
 		{"explain select * from orders", "only a plain SELECT can run on multiple shards"},
 		{"declare c cursor for select * from orders", "only a plain SELECT can run on multiple shards"},
 	}
@@ -242,4 +249,61 @@ func TestMergeSortKeysIndexTheShardRowNotTheSelectList(t *testing.T) {
 func TestMergeRefusesOrderByPositionWithAStar(t *testing.T) {
 	pl, err := New().Plan(context.Background(), session(fixture(t)), "select * from orders order by 2")
 	checkRefusal(t, pl, err, "multi-shard ORDER BY by position with * in the select list is not available yet", "0A000")
+}
+
+// TestColocatedJoinsMergeAcrossShards is PGS-614. A join whose sharded
+// relations are joined on their shard key matches only rows that live
+// together, so each shard can run the whole join and the merge above it is
+// the one a single table needs.
+func TestColocatedJoinsMergeAcrossShards(t *testing.T) {
+	for _, c := range []struct{ sql, shardSQL string }{
+		{"select * from orders o join order_lines l on o.tenant_id = l.tenant_id", ""},
+		{"select * from orders o join order_lines l using (tenant_id)", ""},
+		{"select * from orders o natural join order_lines l", ""},
+		{"select * from orders o left join order_lines l on o.tenant_id = l.tenant_id", ""},
+		{"select * from orders o join regions r on o.region = r.id", ""},
+		{"select * from orders o left join regions r on o.region = r.id", ""},
+		// The merge is a real one, not a pass-through: the join runs on
+		// every shard and the router orders and truncates what comes back.
+		{"select o.id from orders o join order_lines l on o.tenant_id = l.tenant_id order by o.id limit 2",
+			"SELECT o.id FROM orders o JOIN order_lines l ON o.tenant_id = l.tenant_id ORDER BY o.id LIMIT 2"},
+	} {
+		pl, err := New().Plan(context.Background(), session(fixture(t)), c.sql)
+		if err != nil {
+			t.Errorf("%s: %v", c.sql, err)
+			continue
+		}
+		if pl.Kind != Scatter {
+			t.Errorf("%s: kind %v, want Scatter", c.sql, pl.Kind)
+			continue
+		}
+		m, err := pl.MultiShard()
+		if err != nil {
+			t.Errorf("%s: merge: %v", c.sql, err)
+			continue
+		}
+		if c.shardSQL != "" && m.ShardSQL != c.shardSQL {
+			t.Errorf("%s: shard SQL %q", c.sql, m.ShardSQL)
+		}
+	}
+}
+
+// A grouped colocated join still needs the shard key in its GROUP BY, and
+// the key it is checked against is the one the join is on.
+func TestColocatedJoinGroupByStillNeedsTheShardKey(t *testing.T) {
+	pl, err := New().Plan(context.Background(), session(fixture(t)),
+		"select o.tenant_id, count(*) from orders o join order_lines l on o.tenant_id = l.tenant_id group by o.tenant_id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pl.MultiShard(); err != nil {
+		t.Fatalf("grouping by the shard key the join is on: %v", err)
+	}
+	// A scatter reports its merge refusal from Plan, not from MultiShard:
+	// there is no shard count that could make it plannable later.
+	_, err = New().Plan(context.Background(), session(fixture(t)),
+		"select o.status, count(*) from orders o join order_lines l on o.tenant_id = l.tenant_id group by o.status")
+	if err == nil || !strings.Contains(err.Error(), "GROUP BY without the shard key") {
+		t.Fatalf("grouping by a non-key column: %v", err)
+	}
 }
