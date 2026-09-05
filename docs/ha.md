@@ -97,7 +97,14 @@ failover slots never confirm past a synchronous standby; see
 [streams.md](streams.md)), and publish `pgshard.shard_status` again. Convergence rules run every pass:
 a designated primary answering as a standby is (re)promoted with an epoch
 above whatever it accepted; a non-designated member answering as a primary is
-labelled `unhealthy` and sent `Agent.Demote{group epoch}`.
+labelled `unhealthy` and sent `Agent.Demote{group epoch}`. `Demote` stops
+PostgreSQL, hands the primary Lease back as soon as it is down, and only then
+rejoins (`pg_rewind`, falling back to a clone). The Lease goes back on the
+stop rather than on the rejoin because a rejoin can fail for as long as the
+new primary is unreachable, and a member holding the Lease through that
+refuses the designated primary's own fence on every pass. A clone contacts
+the source before it empties PGDATA, so a member does not lose its only copy
+to a source that was never reachable.
 
 A missing primary pod is never recreated while a candidate may exist: a fresh
 pod would take the Lease back and no promotion would happen.

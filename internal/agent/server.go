@@ -270,10 +270,18 @@ func (s *Server) Demote(ctx context.Context, req *pgshardv1.DemoteRequest) (*pgs
 	// still a writable primary would let a successor acquire the lease and
 	// promote, producing two writable primaries. The hold keeps renewing
 	// until the database is down.
-	if err := s.inst.Demote(ctx, ""); err != nil {
+	if err := s.inst.StopForDemote(ctx); err != nil {
 		return nil, s.rpcErr(err)
 	}
+	// And release it as soon as it is down, not only if the rejoin below
+	// succeeds. A rejoin can fail for as long as the new primary is
+	// unreachable, and this member holding the Lease through that refuses
+	// the designated primary's own fence on every pass -- a group with no
+	// primary, held there by the member that no longer has a database.
 	s.stopHold(ctx)
+	if err := s.inst.Follow(ctx, ""); err != nil {
+		return nil, s.rpcErr(err)
+	}
 	return resp, nil
 }
 

@@ -56,3 +56,25 @@ func TestPromoteChecksTheLeaseHolderItWasGiven(t *testing.T) {
 		t.Fatalf("an empty lease_holder must not be refused: %v", err)
 	}
 }
+
+// TestAFailedRejoinStillHandsBackThePrimaryLease: Demote released the lease
+// only if the whole rejoin succeeded. A rejoin fails for as long as the new
+// primary is unreachable, and a member holding the Lease through that
+// refuses the designated primary's own fence on every pass -- a group left
+// with no primary by the member that no longer has a database.
+func TestAFailedRejoinStillHandsBackThePrimaryLease(t *testing.T) {
+	in := newTestInstance(t)
+	in.rewindFn = func(context.Context, string) error { return errors.New("no common ancestor") }
+	in.recloneFn = func(context.Context) error { return errors.New("source unreachable") }
+	srv := NewServer(in, in.epoch, nil, in.log, nil)
+	released := false
+	srv.holdStop = func() { released = true }
+
+	_, err := srv.Demote(context.Background(), &pgshardv1.DemoteRequest{Epoch: 1})
+	if err == nil {
+		t.Fatal("a rejoin that cannot reach the source must be reported")
+	}
+	if !released {
+		t.Error("the primary lease is still held by a member whose database is down")
+	}
+}
