@@ -9,6 +9,23 @@ lint:
     - RPC_REQUEST_RESPONSE_UNIQUE
     - RPC_REQUEST_STANDARD_NAME
     - RPC_RESPONSE_STANDARD_NAME
+# WIRE, not FILE, and the difference is a decision rather than a default.
+#
+# FILE forbids removing an rpc or a message. pgshard.v1 has never been
+# released -- no tag, no release, and the images carry moving tags -- so
+# there is no client that could be broken by a removal, and holding the
+# proto to a promise nothing depends on costs real work: PGS-629 removed an
+# rpc that was declared and implemented nowhere, which FILE would have
+# refused.
+#
+# What WIRE still forbids is the thing that breaks a deployment silently: a
+# field number reused for a different type, a type changed under a field
+# that keeps its number. Those corrupt data on the wire between a router and
+# a pooler of different versions, and no amount of "it is pre-1.0" makes
+# that acceptable.
+#
+# Tighten this to FILE when pgshard.v1 is released and something outside
+# this repository generates clients from it.
 breaking:
   use:
-    - FILE
+    - WIRE

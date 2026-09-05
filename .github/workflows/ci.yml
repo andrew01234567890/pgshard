@@ -101,6 +101,11 @@ jobs:
           hack/tools/install.sh buf protoc-gen-go protoc-gen-go-grpc
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - run: make proto-lint
+      # The target existed and nothing ran it, so the repository had a
+      # wire-compatibility gate that was configured, working and never
+      # consulted -- a declaration nobody honours, which is the same shape
+      # as the defects it would be catching.
+      - run: make proto-breaking
       - run: make proto
       - name: Fail on generated code drift
         run: |
@@ -174,13 +179,42 @@ jobs:
       # git, not dir: dir scans the working tree, so a secret committed and
       # then deleted would pass. That is why the checkout above asks for
       # the whole history.
+      #
+      # -v because without it the only output is "leaks found: N" -- no
+      # file, no line, no commit -- and `gh run view --log-failed` shows
+      # exactly that. An author whose PR just went red has nothing to act
+      # on. The finding is redacted, so naming it is safe.
       - name: Scan history for secrets
+        id: scan
         run: |
           docker run --rm \
             --user "$(id -u):$(id -g)" \
             -v "$GITHUB_WORKSPACE":/repo \
             ghcr.io/gitleaks/gitleaks:v8.30.0@sha256:691af3c7c5a48b16f187ce3446d5f194838f91238f27270ed36eef6359a574d9 \
-            git /repo --config /repo/.gitleaks.toml --no-banner --redact
+            git /repo --config /repo/.gitleaks.toml --no-banner --redact -v
+      # A full-depth checkout on a pull_request fetches every branch, not
+      # just this one, so the scan covers the whole repository. That is the
+      # stronger guarantee for a public repository -- a secret on any
+      # branch is a leak -- but it means a finding on someone else's branch
+      # fails this check here, on a change that has nothing to do with it.
+      # Saying so is the difference between a gate people act on and one
+      # they rerun.
+      - name: Say where a finding may be
+        if: failure() && steps.scan.outcome == 'failure'
+        run: |
+          {
+            echo "### Secret scan"
+            echo
+            echo "The scan covers **every branch**, not just this pull request: a full-depth"
+            echo "checkout fetches them all, and a secret on any branch of a public repository"
+            echo "is a leak."
+            echo
+            echo "So a finding above may be on a branch that has nothing to do with this change."
+            echo "Check the \`Commit:\` and \`File:\` it names before assuming it is yours."
+            echo
+            echo "If it is yours: **amend**, do not add a commit. The scan reads history, so the"
+            echo "original blob stays reachable until the branch is force-pushed."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   actionlint:
     name: Workflow lint and policy
