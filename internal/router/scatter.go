@@ -209,7 +209,7 @@ func (e *Executor) scatterBatch(ctx context.Context, pl plan.Plan, stmt string, 
 			}
 			b := r.Bind
 			reqs = append(reqs, &pgshardv1.ExecuteRequest{Message: &pgshardv1.ExecuteRequest_Bind{Bind: &pgshardv1.Bind{
-				Params: b.Params, ParamFormats: b.ParamFormats, ResultFormats: b.ResultFormats}}})
+				Params: b.Params, ParamFormats: b.ParamFormats, ResultFormats: shardResultFormats(b.ResultFormats, m.Hidden)}}})
 			// The merge needs the row shape even when the client, holding a
 			// cached description, does not ask for it.
 			reqs = append(reqs, describeReq(pgwire.DescribePortal, ""))
@@ -237,6 +237,39 @@ func (e *Executor) scatterBatch(ctx context.Context, pl plan.Plan, stmt string, 
 		return nil
 	}
 	return e.runScatter(ctx, pl.Shards, m, reqs, scatterOutput{execute: executes, describe: described}, w, e.rewriting(pl))
+}
+
+// shardResultFormats maps the client's per-column result formats onto the
+// shard statement, which returns the ORDER BY columns that are not in the
+// select list as extra trailing ones.
+//
+// PostgreSQL accepts a format count of 0, 1, or exactly the number of
+// result columns (postgres.c, exec_bind_message), so forwarding a client's
+// two formats to a three-column shard query is rejected outright:
+//
+//	bind message has 2 result formats but query has 3 columns (08P01)
+//
+// One format applies to every column, which is why the shapes clients
+// actually send -- all text, or all binary -- have always worked and hid
+// this. Collapsing a uniform list to one keeps that; a genuinely mixed list
+// is padded, and the format of a column the client never sees is free.
+func shardResultFormats(client []int32, hidden int) []int32 {
+	if hidden == 0 || len(client) < 2 {
+		return client
+	}
+	uniform := true
+	for _, f := range client[1:] {
+		uniform = uniform && f == client[0]
+	}
+	if uniform {
+		return client[:1]
+	}
+	out := make([]int32, 0, len(client)+hidden)
+	out = append(out, client...)
+	for range hidden {
+		out = append(out, client[len(client)-1])
+	}
+	return out
 }
 
 // scatterOutput says which client-visible responses a scatter batch owes:

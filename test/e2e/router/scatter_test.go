@@ -289,6 +289,12 @@ var scatterCorpus = []corpusQuery{
 	{`select distinct tenant_id, ok from events order by tenant_id, ok`, true},
 	{`select distinct on (tenant_id) tenant_id, id from events order by tenant_id, id desc`, true},
 	{`select tenant_id, avg(qty)::text from events group by tenant_id order by 1 limit 15`, true},
+	// Two client columns ordered by a third: the shard statement carries
+	// a hidden sort column, so the client's per-column result formats no
+	// longer match its column count. Every other ordered query here asks
+	// for one column or sorts by one it selects, which is why nothing
+	// caught this.
+	{`select id, qty from events order by price, id`, true},
 }
 
 func TestRouterScatterDifferential(t *testing.T) {
