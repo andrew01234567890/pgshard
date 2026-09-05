@@ -886,21 +886,20 @@ func TestPlacementRefusesCrossSchemaSerialOnPostgres(t *testing.T) {
 }
 
 // TestPlacementRefusesUnsupportedFeaturesOnPostgres: a table carrying a
-// user trigger or a foreign key is refused at preflight, because the shadow
-// build recreates neither and the swap would silently drop enforcement.
+// rule or a foreign key is refused at preflight, because the shadow build
+// recreates neither and the swap would silently drop enforcement.
 //
-// Row-level security used to be on that list and is not: policies and both
-// RLS flags are reproduced now (TestAMoveKeepsRowLevelSecurity), so it is
-// the one class this refusal has stopped covering.
+// Two classes have come off that list and are reproduced instead:
+// row-level security (TestAMoveKeepsRowLevelSecurity) and user triggers
+// (TestAMoveKeepsTriggers). A trigger is still refused when its FUNCTION is
+// missing on a target, which is a different refusal and is asserted below.
 func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 	parallelPG(t)
 	f := newPlacementFixture(t)
 	ctx := context.Background()
 	home := f.app(0)
 	mustExec(t, home, `CREATE TABLE guarded (id bigint PRIMARY KEY, owner text)`)
-	mustExec(t, home, `CREATE FUNCTION stamp_owner() RETURNS trigger LANGUAGE plpgsql AS $$
-		BEGIN NEW.owner := current_user; RETURN NEW; END $$`)
-	mustExec(t, home, `CREATE TRIGGER own_rows BEFORE INSERT ON guarded FOR EACH ROW EXECUTE FUNCTION stamp_owner()`)
+	mustExec(t, home, `CREATE RULE own_rows AS ON DELETE TO guarded DO INSTEAD NOTHING`)
 	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('app', 'public', 'guarded', 'unsharded', NULL)`)
 	f.reconcile()
 
@@ -916,15 +915,15 @@ func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 			break
 		}
 		if state == StateCompleted {
-			t.Fatal("move of a table with a user trigger completed instead of being refused")
+			t.Fatal("move of a table with a rule completed instead of being refused")
 		}
 	}
-	if state != StateFailed || !strings.Contains(msg, "trigger own_rows") {
-		t.Fatalf("expected refusal naming the trigger, got %s %q", state, msg)
+	if state != StateFailed || !strings.Contains(msg, "rule own_rows") {
+		t.Fatalf("expected refusal naming the rule, got %s %q", state, msg)
 	}
-	// The trigger is untouched.
-	if n := queryOne[int64](t, home, `SELECT count(*) FROM pg_trigger WHERE tgname = 'own_rows'`); n != 1 {
-		t.Fatal("the trigger was dropped")
+	// The rule is untouched.
+	if n := queryOne[int64](t, home, `SELECT count(*) FROM pg_rules WHERE rulename = 'own_rows'`); n != 1 {
+		t.Fatal("the rule was dropped")
 	}
 	// The pure-feature detector covers each unsupported shape.
 	mustExec(t, home, `CREATE TABLE parent (pid bigint PRIMARY KEY)`)
@@ -953,13 +952,16 @@ func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 			t.Fatalf("%s: unsupported = %v (%v), want %q", c.table, got, err, c.want)
 		}
 	}
-	// And what is no longer refused: a table with row-level security and a
-	// policy is moved, not stopped.
+	// And what is no longer refused: row-level security and user triggers
+	// are reproduced, so the feature detector reports neither.
 	mustExec(t, home, `CREATE TABLE rlsonly (id bigint PRIMARY KEY, owner text)`)
 	mustExec(t, home, `ALTER TABLE rlsonly ENABLE ROW LEVEL SECURITY`)
 	mustExec(t, home, `CREATE POLICY own_rows ON rlsonly USING (owner = current_user)`)
+	mustExec(t, home, `CREATE FUNCTION stamp_owner() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN NEW.owner := current_user; RETURN NEW; END $$`)
+	mustExec(t, home, `CREATE TRIGGER stamp_it BEFORE INSERT ON rlsonly FOR EACH ROW EXECUTE FUNCTION stamp_owner()`)
 	if got, err := unsupportedTableFeatures(ctx, pgxShardConn{home}, "public", "rlsonly"); err != nil || len(got) != 0 {
-		t.Fatalf("row-level security is reproduced now, not refused: %v %v", got, err)
+		t.Fatalf("row-level security and triggers are reproduced now, not refused: %v %v", got, err)
 	}
 }
 
