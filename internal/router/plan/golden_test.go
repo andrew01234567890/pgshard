@@ -118,6 +118,17 @@ func golden() []want {
 		{sql: "insert into regions values (1, 'x'::app.mytype::text)", kind: Refuse, msg: "a write to reference table \"regions\" cannot call cast to app.mytype"},
 		{sql: "update regions set name = name operator(app.###) 'x'", kind: Refuse, msg: "a write to reference table \"regions\" cannot call operator app.###"},
 		{sql: "insert into regions select id, name from regions limit 1", kind: Refuse, msg: "a write to reference table \"regions\" cannot use LIMIT or OFFSET"},
+		// A system column is where a row IS on one shard, not what it
+		// holds, so the same value picks a different row on each. The
+		// volatility rule cannot see it: ctid is a column, not a call.
+		{sql: "delete from regions where ctid = '(0,1)'", kind: Refuse, msg: "a write to reference table \"regions\" cannot name the system column ctid"},
+		{sql: "update regions set name = 'x' where ctid = '(0,1)'", kind: Refuse, msg: "a write to reference table \"regions\" cannot name the system column ctid"},
+		{sql: "delete from regions where xmin::text <> '0'", kind: Refuse, msg: "a write to reference table \"regions\" cannot name the system column xmin"},
+		{sql: "update regions set name = tableoid::text", kind: Refuse, msg: "a write to reference table \"regions\" cannot name the system column tableoid"},
+		{sql: "delete from regions where ctid in (select ctid from regions)", kind: Refuse, msg: "a write to reference table \"regions\" cannot name the system column ctid"},
+		// A column merely NAMED like one on a sharded table is not a
+		// reference write and is not this rule's business.
+		{sql: "delete from orders where tenant_id = 1 and id = 2", kind: EqualUnique, shards: "k:1"},
 		{sql: "insert into regions select distinct on (id) id, name from regions", kind: Refuse, msg: "a write to reference table \"regions\" cannot use DISTINCT ON"},
 		{sql: "insert into regions values (1, DEFAULT)", kind: Refuse, msg: "a write to reference table \"regions\" cannot call DEFAULT"},
 		{sql: "update regions set name = DEFAULT", kind: Refuse, msg: "a write to reference table \"regions\" cannot call DEFAULT"},
