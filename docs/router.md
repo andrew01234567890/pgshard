@@ -295,8 +295,9 @@ A single sharded table has nothing to compare against, needs no type
 verdict, and scatters as usual.
 
 Refused with `0A000` (message names the reason): `avg()` and every other
-aggregate ("multi-shard avg() is not available yet" — compute `sum(x)` and
-`count(x)`), aggregates with `DISTINCT`/`FILTER`/`ORDER BY`/`OVER`,
+aggregate PostgreSQL ships ("multi-shard avg() is not available yet" —
+compute `sum(x)` and `count(x)`), `JSON_ARRAYAGG`/`JSON_OBJECTAGG`,
+aggregates with `DISTINCT`/`FILTER`/`ORDER BY`/`OVER`,
 expressions around or beside an aggregate (`count(*) + 1`, `id, count(*)`),
 `GROUP BY`/`DISTINCT` without the shard key, `HAVING` without such a
 `GROUP BY`, `LIMIT`/`OFFSET` that are not integer constants (`$1`,
@@ -525,6 +526,18 @@ the same numbers from a sequence declared global. That matters more than the
 `nextval` allocates from it, and the duplicates arrive later as a primary
 key violation or as two rows sharing an id that could not. Select the value
 first and bind it, or let the INSERT fill the column.
+
+**A USER-DEFINED aggregate is not recognised, and that is a hole rather than
+a refusal.** An aggregate is detected from the parse tree — by its `DISTINCT`,
+`FILTER`, `ORDER BY` or `OVER` clause, or by its name against the list of
+PostgreSQL's own — because nothing in a parsed statement distinguishes
+`first(x)` (an extension aggregate, one row per shard) from `upper(x)` (a
+scalar, one row per input row). A `CREATE AGGREGATE` the router has never
+heard of therefore scatters and its per-shard partials are **concatenated**:
+four shards answer four rows and a client reading the first gets a quarter of
+the answer, with no error. Filter on one shard key value, or combine the
+shards in the client, until the router can ask the catalog which functions
+are aggregates. Tracked as PGS-655.
 
 One gap remains: a `nextval()` on a global sequence written into a VALUES
 position of a column that is **not** a registered sequence column is still
