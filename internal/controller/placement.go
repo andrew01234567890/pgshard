@@ -86,14 +86,22 @@ type placementState struct {
 	// Applied at the SWAP for the same reason: a trigger firing while the
 	// copy writes the shadow runs for every copied row, which is a row the
 	// source has already triggered on.
-	Triggers  map[string]string `json:"triggers,omitempty"`
-	PK        []string          `json:"pk,omitempty"`
-	KeyType   string            `json:"key_type,omitempty"`
-	Copied    map[string]bool   `json:"copied,omitempty"`
-	Applied   map[string]int64  `json:"applied,omitempty"`
-	LagBytes  int64             `json:"lag_bytes"`
-	FencedAt  *time.Time        `json:"fenced_at,omitempty"`
-	SwappedAt *time.Time        `json:"swapped_at,omitempty"`
+	Triggers map[string]string `json:"triggers,omitempty"`
+	// SequenceLast is each sequence-backed column's last_value ON THE
+	// SOURCE, captured before the copy. Every target needs it, not only the
+	// shard that held the table: a shard receives its slice of the rows, so
+	// the greatest value PRESENT there is lower still, and advancing to that
+	// reissues identifiers the source had already handed out. Only a
+	// sequence that has been called contributes; one sitting on its start
+	// value has issued nothing.
+	SequenceLast map[string]int64 `json:"sequence_last,omitempty"`
+	PK           []string         `json:"pk,omitempty"`
+	KeyType      string           `json:"key_type,omitempty"`
+	Copied       map[string]bool  `json:"copied,omitempty"`
+	Applied      map[string]int64 `json:"applied,omitempty"`
+	LagBytes     int64            `json:"lag_bytes"`
+	FencedAt     *time.Time       `json:"fenced_at,omitempty"`
+	SwappedAt    *time.Time       `json:"swapped_at,omitempty"`
 	// Swapped lists the shards whose swap transaction was started; the
 	// marker is persisted before the first rename on a shard, so only a
 	// resume that finds it may treat a missing shadow as already swapped.
