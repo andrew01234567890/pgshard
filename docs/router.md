@@ -451,11 +451,23 @@ refuses what would produce different rows on different shards:
 - choosing rows without a total order — `LIMIT`, `OFFSET`, `DISTINCT ON`,
   `TABLESAMPLE` — since each shard would choose its own.
 
-This rule is conservative and only covers what the router can see. Column
-defaults are evaluated by each shard: a reference table whose column
-default is volatile (`DEFAULT now()`, `DEFAULT gen_random_uuid()`, a
-per-shard `serial`) diverges when an `INSERT` omits that column, and the
-router cannot detect it because it does not read the shards' catalogs.
+The same rule applies to a **`DEFAULT` set through the router**:
+`ALTER TABLE … ADD COLUMN … DEFAULT gen_random_uuid()` and `ALTER COLUMN …
+SET DEFAULT` are refused on a reference table when the expression is not
+immutable. `ADD COLUMN` is the sharper case, because PostgreSQL gives every
+**existing** row a value — so one ordinary statement would diverge the whole
+table at once rather than one row. `DEFAULT now()` is refused too: PostgreSQL
+evaluates it once for the `ALTER` and stores a metadata-only default, but
+once *per shard*, so the stored constants differ. A constant default is the
+same everywhere and is allowed.
+
+This rule is conservative and only covers what the router can see. A default
+set **out of band** — directly on a shard, or present before the table was
+declared a reference table — still diverges when an `INSERT` omits that
+column, and the router cannot detect that because it does not read the
+shards' catalogs. The controller's inspection does, and publishes what it
+found as `reference_hazards`; a write to a table with hazards is refused
+until they are gone.
 Declare defaults on reference tables as constants, or always supply the
 column. DDL on reference tables goes through the migration model (see *DDL*).
 `SELECT … FOR UPDATE` on a reference table locks the row on the

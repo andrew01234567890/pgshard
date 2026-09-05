@@ -275,6 +275,9 @@ func (w *walker) alterTable(a *pgquerypb.AlterTableStmt) error {
 // the shard key column of a sharded table.
 func checkAlterCmd(r *rel, c *pgquerypb.AlterTableCmd) error {
 	sharded := r != nil && r.kind == placeSharded
+	if err := checkReferenceDefault(r, c); err != nil {
+		return err
+	}
 	switch c.GetSubtype() {
 	case pgquerypb.AlterTableType_AT_AlterColumnType:
 		if sharded && c.GetName() == r.shardKey {
@@ -316,6 +319,64 @@ func checkAlterCmd(r *rel, c *pgquerypb.AlterTableCmd) error {
 		}
 	}
 	return nil
+}
+
+// checkReferenceDefault refuses a DEFAULT on a reference table that every
+// shard would evaluate for itself.
+//
+// A reference table is the same rows on every shard, and the write path
+// already refuses `INSERT INTO regions VALUES (1, now())` for exactly this
+// reason. The DDL path did not, and it is the worse of the two: ADD COLUMN
+// with a DEFAULT gives every EXISTING row a value, so one ordinary
+// statement diverges the whole table at once rather than one row.
+//
+// Measured before this check, on two shards holding the same three rows:
+//
+//	alter table regions add column u uuid default gen_random_uuid()
+//	shard0: 46ac952b… 8f35e059… 9273d587…
+//	shard1: 23b5e784… 426e79d4… ec6ae563…
+//
+// "Stable" is not safe here either, which is why this uses the write
+// path's rule rather than stableDefault. PostgreSQL evaluates now() ONCE
+// for an ADD COLUMN and stores the result as a metadata-only default -- but
+// once per shard, at each shard's own ALTER, so the stored constants differ.
+// stableDefault answers "does this rewrite the table", which is a different
+// question from "does this mean the same thing on every shard".
+func checkReferenceDefault(r *rel, c *pgquerypb.AlterTableCmd) error {
+	if r == nil || r.kind != placeReference {
+		return nil
+	}
+	var defs []*pgquerypb.Node
+	switch c.GetSubtype() {
+	case pgquerypb.AlterTableType_AT_AddColumn:
+		col := c.GetDef().GetColumnDef()
+		// A column's DEFAULT arrives as a CONSTR_DEFAULT constraint in the
+		// raw parse tree, not as RawDefault, which the analyser fills in
+		// later. Both are read so this does not depend on which tree it
+		// is handed.
+		defs = append(defs, col.GetRawDefault())
+		for _, con := range col.GetConstraints() {
+			if cs := con.GetConstraint(); cs.GetContype() == pgquerypb.ConstrType_CONSTR_DEFAULT {
+				defs = append(defs, cs.GetRawExpr())
+			}
+		}
+	case pgquerypb.AlterTableType_AT_ColumnDefault:
+		defs = append(defs, c.GetDef())
+	default:
+		return nil
+	}
+	fn := ""
+	for _, d := range defs {
+		if fn = nonImmutableCall(d); fn != "" {
+			break
+		}
+	}
+	if fn == "" {
+		return nil
+	}
+	err := notYet("a DEFAULT on reference table \""+r.name+"\" cannot call "+fn+"(): the statement runs on every shard and each would evaluate it for itself, so the copies would differ",
+		"compute the value in the client and use a constant default, or leave the column without one and supply it on every INSERT")
+	return err
 }
 
 func serialType(name string) bool {
