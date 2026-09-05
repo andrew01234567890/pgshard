@@ -150,6 +150,19 @@ and the group is settled again once it streams. One switchover per group,
 writes pause only for its shutdown-to-promotion window. Only one switchover
 runs per cluster at a time; groups otherwise proceed independently.
 
+A planned switchover **refuses** a target that does not hold, ready, every
+logical replication slot the primary has: the rollout is `Held` and the
+reason names the slots. A logical slot carries a reshard's subscription, the
+reverse replication that makes a cutover reversible, or a change stream's
+resumable position, and promoting a member without one destroys what depends
+on it. A switchover is discretionary and can wait; an emergency failover
+cannot, so there the slots are only a tie-break between candidates holding
+the same data — never a reason to promote a member with less of it. Readiness
+is PostgreSQL's own: synchronised from the primary, not temporary, not
+invalidated. Slots are matched **by name**, since two members holding one
+slot each need not hold the same one, and a group with no logical slots is
+never held by this.
+
 ### Storage rebuild
 
 For each stale member: create the successor claim `<member>-v<n>` on the new
