@@ -34,6 +34,11 @@ type Watcher struct {
 	subs    map[chan Change]struct{}
 	kick    chan struct{}
 	logf    func(format string, args ...any)
+
+	// Notification budget, touched only by Run's own goroutine.
+	tokens     float64
+	lastRefill time.Time
+	now        func() time.Time
 }
 
 // Change is published to subscribers whenever a reload observes a different
@@ -46,6 +51,24 @@ type Change struct {
 // DefaultReloadInterval is the fallback full reload period when LISTEN
 // delivers nothing (or its connection is down).
 const DefaultReloadInterval = 30 * time.Second
+
+// A NOTIFY costs its sender nothing and costs every router a full catalog
+// load and every pooler a serving load. pg_notify() is an ordinary function
+// call, so anything that can reach the catalog database can send one in a
+// loop, and the debounce alone still allowed twenty loads a second on every
+// component in the cluster.
+//
+// Notification-driven reloads are therefore drawn from a budget: notifyBurst
+// of them immediately, then one per notifyRefill. The burst is what keeps a
+// real change fast -- a cutover flip bumps the generation and wants every
+// router reloading now, and that window is the write pause it is measured by
+// -- while a flood settles to one load per second per component. The
+// periodic reload is not drawn from the budget, so a component still
+// converges on its own.
+const (
+	notifyBurst  = 5
+	notifyRefill = time.Second
+)
 
 // Backoff for the first reload, which has to keep trying: nothing restarts a
 // watcher that gives up.
@@ -82,6 +105,8 @@ func NewWatcher(dsn string, opts Options) *Watcher {
 		subs:           map[chan Change]struct{}{},
 		kick:           make(chan struct{}, 1),
 		logf:           opts.Logf,
+		tokens:         notifyBurst,
+		now:            time.Now,
 	}
 }
 
@@ -169,11 +194,42 @@ func (w *Watcher) Run(ctx context.Context) error {
 			case <-w.kick:
 			default:
 			}
+			if wait := w.notifyDelay(); wait > 0 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-ticker.C:
+				case <-time.After(wait):
+				}
+			}
 		}
 		if err := w.reload(ctx); err != nil && ctx.Err() == nil {
 			w.logf("snapshot reload: %v", err)
 		}
 	}
+}
+
+// notifyDelay draws one notification-driven reload from the budget and
+// returns how long to wait for it. Called only from Run's goroutine.
+func (w *Watcher) notifyDelay() time.Duration {
+	now := w.now()
+	if !w.lastRefill.IsZero() {
+		w.tokens += now.Sub(w.lastRefill).Seconds() / notifyRefill.Seconds()
+	}
+	w.lastRefill = now
+	if w.tokens > notifyBurst {
+		w.tokens = notifyBurst
+	}
+	if w.tokens >= 1 {
+		w.tokens--
+		return 0
+	}
+	// The reload this returns for is charged now, so the balance goes
+	// negative and the refill has to catch up: charging it on the next call
+	// instead would let a flood through at twice the rate.
+	wait := time.Duration((1 - w.tokens) * float64(notifyRefill))
+	w.tokens--
+	return wait
 }
 
 func (w *Watcher) requestReload() {
