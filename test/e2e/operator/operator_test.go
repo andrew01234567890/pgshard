@@ -814,6 +814,23 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 		return jsonpath(ctx, t, c, "pgshardcluster", clusterName, `{.status.conditions[?(@.type=="RolloutInProgress")].status}`) == "False" &&
 			jsonpath(ctx, t, c, "pgshardcluster", clusterName, `{.status.conditions[?(@.type=="Ready")].status}`) == "True"
 	}
+	// The step the shard group is on, for a wait that is blocked by the
+	// rollout. "rolloutIdle=false" says a step is in flight and no more:
+	// twenty-five minutes of that is twenty-five identical lines, and the
+	// step doing it is one field away. A rollout stuck on an unrelated
+	// member -- a retirement, a restart it will not take -- reads as the
+	// waited-for one never starting.
+	rolloutWhy := func() string {
+		out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pgshardgroup", group, "-o",
+			`jsonpath={.status.rollout.phase}/{.status.rollout.member}:{.status.rollout.reason}`)
+		if err != nil {
+			return "rollout unreadable: " + err.Error()
+		}
+		if step := strings.TrimSpace(out); step != "/:" {
+			return "rollout=" + step
+		}
+		return "rolloutIdle=" + strconv.FormatBool(rolloutIdle())
+	}
 	ro := group + "-ro"
 
 	t.Run("SighupParameterChangeReloadsWithoutRestart", func(t *testing.T) {
@@ -943,6 +960,189 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 		})
 	})
 
+	// Before the storage-class change, not after it. That subtest creates
+	// pgshard-e2e-alt and deletes it in its own t.Cleanup while the cluster
+	// spec still names it, so a member created afterwards asks for a
+	// storage class that no longer exists and sits Pending for ever:
+	//
+	//	ProvisioningFailed  storageclass "pgshard-e2e-alt" not found
+	//
+	// It also has to go up before it can come down: replicasPerShard has an
+	// HA floor of 3, so a lowering has to start from a group above it.
+	t.Run("LoweringReplicasRetiresMembersWithoutLosingCommits", func(t *testing.T) {
+		// Not count(): this is read from a sampling goroutine as well as
+		// from the test, and count() fails the test on a kubectl error --
+		// which from a goroutine outliving the subtest is a panic rather
+		// than a failure. An unreadable count is reported as -1 and every
+		// caller treats it as "not yet".
+		shardPods := func() int {
+			out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pods", "-l",
+				"pgshard.io/cluster="+clusterName+",pgshard.io/group=shard-0", "-o", "name")
+			if err != nil {
+				return -1
+			}
+			return len(strings.Fields(out))
+		}
+		patchCluster(`{"spec":{"replicasPerShard":5}}`)
+		waitForWhy(ctx, t, "two more shard members to join", 15*time.Minute, func() string {
+			return fmt.Sprintf("shard pods=%d %s", shardPods(), rolloutWhy())
+		}, func() bool {
+			if shardPods() != 5 {
+				return false
+			}
+			out, err := psql(ctx, c, rw, "SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming'")
+			return err == nil && out == "4" && rolloutIdle()
+		})
+
+		oldPrimary := primaryOf()
+		retired := []string{clusterName + "-shard-0-4", clusterName + "-shard-0-3"}
+		w := startWriter(ctx, c, rw, lastID)
+
+		// synchronous_standby_names must never list a member that is gone.
+		// Sampled throughout rather than checked at the end: the hazard is
+		// a window in which the primary waits for acknowledgements from a
+		// standby that has been deleted, and a window closes.
+		//
+		// The pod count is sampled for the same reason. Retiring two at
+		// once is what leaves a group without a promotable standby, and it
+		// is invisible afterwards -- 5 and 3 look the same whether the
+		// members left one at a time or together.
+		//
+		// The count going 5 -> 4 -> 3 is one at a time; never dropping
+		// below 3 is the property, because a step that took both would
+		// show 3 with one of them still terminating and then 2. Seeing 4
+		// is the positive evidence and is logged rather than asserted: at
+		// two-second sampling a fast pair of steps could miss it, and a
+		// flaky assertion about sampling is worse than none.
+		var badSync []string
+		minPods, sawFour := 5, false
+		stop, sampled := make(chan struct{}), make(chan struct{})
+		// Stopped explicitly before the samples are read, and deferred as
+		// well: a wait that times out fails the subtest, and a sampler
+		// left running past that reports into a test that has finished,
+		// which panics the whole binary and takes every later subtest
+		// with it.
+		var once sync.Once
+		stopSampling := func() {
+			once.Do(func() {
+				close(stop)
+				<-sampled
+			})
+		}
+		defer stopSampling()
+		go func() {
+			defer close(sampled)
+			for {
+				select {
+				case <-stop:
+					return
+				case <-time.After(2 * time.Second):
+				}
+				switch n := shardPods(); {
+				case n < 0:
+				case n < minPods:
+					minPods = n
+				case n == 4:
+					sawFour = true
+				}
+				names, err := psql(ctx, c, rw, "SHOW synchronous_standby_names")
+				if err != nil {
+					continue
+				}
+				for _, name := range retired {
+					if !strings.Contains(names, name) {
+						continue
+					}
+					out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pod", name, "-o", "jsonpath={.metadata.name}")
+					if err != nil || strings.TrimSpace(out) == "" {
+						badSync = append(badSync, name+" in "+names)
+					}
+				}
+			}
+		}()
+
+		started := time.Now()
+		patchCluster(`{"spec":{"replicasPerShard":3}}`)
+		waitForWhy(ctx, t, "the two extra shard members to be retired", 20*time.Minute, func() string {
+			return fmt.Sprintf("shard pods=%d %s", shardPods(), rolloutWhy())
+		}, func() bool { return shardPods() == 3 && rolloutIdle() })
+		stopSampling()
+
+		acked, failures, pause := w.finish()
+		t.Logf("retiring two members took %s; writer: %d acknowledged, %d failed, unavailability window %s; fewest pods seen %d, saw the intermediate 4: %v",
+			time.Since(started).Round(time.Second), len(acked), failures, pause, minPods, sawFour)
+		if len(acked) > 0 {
+			lastID = acked[len(acked)-1]
+		}
+		if len(acked) == 0 {
+			t.Fatal("writer acknowledged nothing")
+		}
+		// The point of the whole operation: a member leaving must not cost
+		// a commit that was already acknowledged.
+		assertAllAcked(ctx, t, c, rw, acked)
+		if failures > 0 {
+			t.Errorf("retiring a standby must not fail a write: %d failed over %s", failures, pause)
+		}
+		if len(badSync) > 0 {
+			t.Errorf("synchronous_standby_names listed a member that was gone: %q", badSync[0])
+		}
+		if primaryOf() != oldPrimary {
+			t.Errorf("retiring standbys must not move the primary: %s -> %s", oldPrimary, primaryOf())
+		}
+		if minPods < 3 {
+			t.Errorf("the group dropped to %d members: retirements must take one member at a time", minPods)
+		}
+
+		// Nothing of a retired member survives except its claim, which is
+		// retained on purpose: it is the only copy of whatever had not
+		// replicated when it left.
+		for _, name := range retired {
+			// The exact slot name, not a pattern: "_" is a LIKE wildcard,
+			// so a pattern would match slots this test is not about and
+			// could pass while the slot it cares about survived.
+			slot := "pgshard_" + strings.NewReplacer("-", "_", ".", "_").Replace(name)
+			if n, err := psql(ctx, c, rw, "SELECT count(*) FROM pg_replication_slots WHERE slot_name = '"+slot+"'"); err != nil || n != "0" {
+				t.Errorf("the retired member's slot %s must be dropped, got %q %v", slot, n, err)
+			}
+			if n := count(ctx, t, c, "pvc", "pgshard.io/cluster="+clusterName+",pgshard.io/member="+name); n != 1 {
+				t.Errorf("the claim of retired %s is kept by default, got %d", name, n)
+			}
+		}
+		// And the assertion above is not vacuous: a surviving standby still
+		// has its slot, so a query that finds nothing whatever the state
+		// would fail here too.
+		//
+		// Which member that is has to be read, not assumed. A primary has
+		// no slot of its own, and the switchover subtests before this one
+		// leave the role on whichever member they moved it to.
+		standby := ""
+		for i := 0; i < 3 && standby == ""; i++ {
+			if name := fmt.Sprintf("%s-%d", group, i); name != oldPrimary {
+				standby = name
+			}
+		}
+		kept := "pgshard_" + strings.NewReplacer("-", "_", ".", "_").Replace(standby)
+		if n, err := psql(ctx, c, rw, "SELECT count(*) FROM pg_replication_slots WHERE slot_name = '"+kept+"'"); err != nil || n != "1" {
+			t.Errorf("a surviving standby must still have its slot %s, got %q %v", kept, n, err)
+		}
+		waitFor(ctx, t, "both remaining standbys to stream", 5*time.Minute, func() bool {
+			out, err := psql(ctx, c, rw, "SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming'")
+			return err == nil && out == "2"
+		})
+
+		// Retired claims are kept by default, which is what the assertion
+		// above checks -- and they would otherwise be counted by the
+		// storage-class subtest that follows, which expects one claim per
+		// member. Deleting them here is the operator's own answer to
+		// "retain means the operator leaves them for you".
+		for _, name := range retired {
+			if _, err := c.Kubectl(ctx, nil, "-n", testNamespace, "delete", "pvc",
+				"-l", "pgshard.io/cluster="+clusterName+",pgshard.io/member="+name); err != nil {
+				t.Errorf("clearing the retained claim of %s: %v", name, err)
+			}
+		}
+	})
+
 	t.Run("StorageClassChangeRebuildsMembersOneByOne", func(t *testing.T) {
 		alt := `
 apiVersion: storage.k8s.io/v1
@@ -976,7 +1176,7 @@ reclaimPolicy: Delete
 			if err != nil {
 				return "claims unreadable: " + err.Error()
 			}
-			return strings.TrimSpace(out) + " rolloutIdle=" + strconv.FormatBool(rolloutIdle())
+			return strings.TrimSpace(out) + " " + rolloutWhy()
 		}
 		waitForWhy(ctx, t, "every shard member to move onto the new class", 25*time.Minute, classWhy, func() bool {
 			out, err := pvcs()
@@ -1022,6 +1222,7 @@ reclaimPolicy: Delete
 			t.Errorf("catalog claims untouched: got %d", n)
 		}
 	})
+
 }
 
 func gatherNamespace(ctx context.Context, c *e2e.Cluster) {

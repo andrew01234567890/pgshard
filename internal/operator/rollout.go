@@ -237,6 +237,17 @@ func (r *ClusterReconciler) rollout(ctx context.Context, c *pgshardv1alpha1.PgSh
 		log.Info("rollout step complete", "phase", inFlight.Phase, "member", inFlight.Member)
 	}
 
+	// A member the spec has stopped describing is retired before anything
+	// else: while it is there the group has more members than it should,
+	// and every other step reasons about the ones it does.
+	extras, err := r.extraMembers(ctx, c, g)
+	if err != nil {
+		return err
+	}
+	if len(extras) > 0 {
+		return r.stepRetire(ctx, c, g, obs, members, password, extras)
+	}
+
 	if len(restartList) == 0 && len(rebuildList) == 0 && len(reloadList) == 0 && len(expandList) == 0 {
 		if pg.Status.SettingsRestartPending {
 			if err := r.patchGroupStatus(ctx, c, g, func(pg *pgshardv1alpha1.PgShardGroup) { pg.Status.SettingsRestartPending = false }); err != nil {
@@ -277,6 +288,62 @@ func (r *ClusterReconciler) rollout(ctx context.Context, c *pgshardv1alpha1.PgSh
 	}
 
 	return r.stepReload(ctx, g, obs, members, reloadList)
+}
+
+// stepRetire removes one member the lowered replica count no longer
+// describes, and only one: the group is down a member while it happens, and
+// taking two out at once is what leaves a group with no promotable standby.
+//
+// It runs from the same settled gate as every other step, so the previous
+// retirement has to have finished before the next begins.
+func (r *ClusterReconciler) stepRetire(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, obs *groupObservation,
+	members map[string]*memberInfo, password string, extras []string) error {
+	next := extras[0]
+	// Whether this member is the primary is asked of the pod, not of the
+	// designation. loadState re-designates a primary that is outside the
+	// member set (the guard PGS-466 added), so by the time a retirement
+	// runs, state.primary already names someone else -- while PostgreSQL
+	// on the retired member may still be the primary. Deleting it then
+	// would be a failover the operator did to itself, and to a member it
+	// was in the middle of removing.
+	//
+	// Held rather than switched: the switchover path moves the designated
+	// primary, which is not this one. What has to happen first is that the
+	// role moves off the member being retired, and holding says so instead
+	// of guessing at it.
+	if primaryPod, err := r.memberIsPrimary(ctx, c, next); err != nil {
+		return err
+	} else if primaryPod {
+		obs.rollout = &pgshardv1alpha1.GroupRollout{Phase: pgshardv1alpha1.RolloutPhaseHeld, Member: next,
+			Reason: next + " is still the primary; retiring it would fail the group over to a member it is removing"}
+		return r.setGroupRollout(ctx, c, g, obs.rollout)
+	}
+	if next == obs.state.primary {
+		// A planned switchover, not a failover: the primary is healthy and
+		// the point is to leave it that way. Retirement continues on a
+		// later pass, once the group has a primary it is keeping.
+		return r.stepAwayFromPrimary(ctx, c, g, obs, members, password)
+	}
+	// synchronous_standby_names is rewritten from MemberNames() every pass,
+	// so a lowered count has already taken this member out of it. Confirm
+	// that reached the primary before the pod goes: deleting a member the
+	// primary is still waiting on would stall every commit until the wait
+	// timed out.
+	if !obs.syncApplied {
+		obs.rollout = &pgshardv1alpha1.GroupRollout{Phase: pgshardv1alpha1.RolloutPhaseHeld, Member: next,
+			Reason: "waiting for synchronous_standby_names to drop " + next + " before retiring it"}
+		return nil
+	}
+	step := &pgshardv1alpha1.GroupRollout{Phase: pgshardv1alpha1.RolloutPhaseRetiring, Member: next,
+		Reason: "replica count lowered to " + strconv.Itoa(g.Replicas), Since: r.metaNow()}
+	if err := r.setGroupRollout(ctx, c, g, step); err != nil {
+		return err
+	}
+	if err := r.retireMember(ctx, c, g, obs, members, password, next); err != nil {
+		return err
+	}
+	obs.rollout = step
+	return nil
 }
 
 // stepRestart deletes one stale standby pod; it comes back with the new
