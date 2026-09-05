@@ -687,3 +687,49 @@ func TestConvergeRelabelsAPromotedPrimaryThatKeptTheReplicaLabel(t *testing.T) {
 		t.Fatalf("relabelling must not re-promote a primary that is already promoted: %v", fa.promotes[before:])
 	}
 }
+
+// TestASwitchoverThatCannotSucceedKeepsThePrimary.
+//
+// switchover pre-checked only state.syncSet, which is what an EARLIER pass
+// observed streaming. A standby that has since started crash-looping is
+// still in that set, so the check passed, the primary pod was deleted, and
+// only then did chooseCandidate refuse -- leaving the group with no primary,
+// the annotation still set, and every later pass repeating the discovery.
+// The recovery that recreates a missing primary lives on the unplanned path,
+// which the annotation prevents ever being reached.
+//
+// The runbook says "the annotation disappears when the switchover finished
+// or was refused". This is the refused case.
+func TestASwitchoverThatCannotSucceedKeepsThePrimary(t *testing.T) {
+	r, fp, _, c := healthyCluster(t, "swx")
+	// The target is in the observed sync set but no longer answers: this is
+	// the crash-looping standby.
+	delete(fp.standbys, podIP(1, 1))
+	fp.standbys[podIP(1, 2)] = StandbyState{InRecovery: true, FlushLSN: 500}
+	get(t, "swx", c)
+	base := c.DeepCopy()
+	c.Annotations = map[string]string{AnnotationSwitchover: "swx-shard-0-1"}
+	if err := k8sClient.Patch(context.Background(), c, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+	oldUID := func() string {
+		var pod corev1.Pod
+		get(t, "swx-shard-0-0", &pod)
+		return string(pod.UID)
+	}()
+
+	reconcile(t, r, c)
+
+	get(t, "swx", c)
+	if _, ok := c.Annotations[AnnotationSwitchover]; ok {
+		t.Fatal("a switchover that cannot promote its target must clear the annotation, or every later pass repeats it")
+	}
+	var pod corev1.Pod
+	get(t, "swx-shard-0-0", &pod)
+	if string(pod.UID) != oldUID {
+		t.Fatal("the primary must not be taken down for a switchover that was going to be refused")
+	}
+	if st := groupStatus(t, "swx-shard-0"); st.Primary != "swx-shard-0-0" {
+		t.Fatalf("the group must keep its primary: %+v", st)
+	}
+}

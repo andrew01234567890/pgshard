@@ -1174,6 +1174,14 @@ func (r *ClusterReconciler) switchover(ctx context.Context, c *pgshardv1alpha1.P
 		log.Info("switchover refused: target was not a streaming standby at the last observation")
 		return obs, clearAnnotation()
 	}
+	// Asked BEFORE the primary is taken away. syncSet is what was observed
+	// on an earlier pass, so it can say a member is streaming that is now
+	// crash-looping -- and the old code found that out only after deleting
+	// the primary pod, which left the group with no primary at all.
+	if why := r.switchoverCandidate(ctx, c, g, state, members, password, target); why != "" {
+		log.Info("switchover refused: the target cannot be promoted", "reason", why)
+		return obs, clearAnnotation()
+	}
 	if old := members[state.primary]; old != nil && old.pod != nil {
 		if err := r.patchRole(ctx, old.pod, RoleUnhealthy); err != nil {
 			return obs, err
@@ -1189,6 +1197,15 @@ func (r *ClusterReconciler) switchover(ctx context.Context, c *pgshardv1alpha1.P
 	state, err := r.failover(ctx, c, g, state, members, password, target)
 	obs.state = state
 	if err != nil {
+		// The primary is gone by now, so leaving the annotation set repeats
+		// this every pass and the group never gets a primary back: the
+		// recovery that recreates one lives on the unplanned path, which
+		// the annotation prevents ever being reached. Clearing it hands the
+		// group to that path, which is what restores writes.
+		if errors.Is(err, errNoCandidate) {
+			log.Info("switchover refused after the primary was taken down; clearing the annotation so the group can recover", "err", err.Error())
+			return obs, errors.Join(err, clearAnnotation())
+		}
 		return obs, err
 	}
 	if err := r.ensureConfigMap(ctx, c, g, state.primary, obs.tuning, obs.policy, obs.repoReady); err != nil {
