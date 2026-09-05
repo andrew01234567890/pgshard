@@ -814,6 +814,23 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 		return jsonpath(ctx, t, c, "pgshardcluster", clusterName, `{.status.conditions[?(@.type=="RolloutInProgress")].status}`) == "False" &&
 			jsonpath(ctx, t, c, "pgshardcluster", clusterName, `{.status.conditions[?(@.type=="Ready")].status}`) == "True"
 	}
+	// The step the shard group is on, for a wait that is blocked by the
+	// rollout. "rolloutIdle=false" says a step is in flight and no more:
+	// twenty-five minutes of that is twenty-five identical lines, and the
+	// step doing it is one field away. A rollout stuck on an unrelated
+	// member -- a retirement, a restart it will not take -- reads as the
+	// waited-for one never starting.
+	rolloutWhy := func() string {
+		out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pgshardgroup", group, "-o",
+			`jsonpath={.status.rollout.phase}/{.status.rollout.member}:{.status.rollout.reason}`)
+		if err != nil {
+			return "rollout unreadable: " + err.Error()
+		}
+		if step := strings.TrimSpace(out); step != "/:" {
+			return "rollout=" + step
+		}
+		return "rolloutIdle=" + strconv.FormatBool(rolloutIdle())
+	}
 	ro := group + "-ro"
 
 	t.Run("SighupParameterChangeReloadsWithoutRestart", func(t *testing.T) {
@@ -968,7 +985,7 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 		}
 		patchCluster(`{"spec":{"replicasPerShard":5}}`)
 		waitForWhy(ctx, t, "two more shard members to join", 15*time.Minute, func() string {
-			return fmt.Sprintf("shard pods=%d rolloutIdle=%v", shardPods(), rolloutIdle())
+			return fmt.Sprintf("shard pods=%d %s", shardPods(), rolloutWhy())
 		}, func() bool {
 			if shardPods() != 5 {
 				return false
@@ -1047,7 +1064,7 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 		started := time.Now()
 		patchCluster(`{"spec":{"replicasPerShard":3}}`)
 		waitForWhy(ctx, t, "the two extra shard members to be retired", 20*time.Minute, func() string {
-			return fmt.Sprintf("shard pods=%d rolloutIdle=%v", shardPods(), rolloutIdle())
+			return fmt.Sprintf("shard pods=%d %s", shardPods(), rolloutWhy())
 		}, func() bool { return shardPods() == 3 && rolloutIdle() })
 		stopSampling()
 
@@ -1149,7 +1166,7 @@ reclaimPolicy: Delete
 			if err != nil {
 				return "claims unreadable: " + err.Error()
 			}
-			return strings.TrimSpace(out) + " rolloutIdle=" + strconv.FormatBool(rolloutIdle())
+			return strings.TrimSpace(out) + " " + rolloutWhy()
 		}
 		waitForWhy(ctx, t, "every shard member to move onto the new class", 25*time.Minute, classWhy, func() bool {
 			out, err := pvcs()
