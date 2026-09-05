@@ -925,17 +925,19 @@ func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 	if n := queryOne[int64](t, home, `SELECT count(*) FROM pg_rules WHERE rulename = 'own_rows'`); n != 1 {
 		t.Fatal("the rule was dropped")
 	}
-	// The pure-feature detector covers each unsupported shape.
+	// The two directions of a foreign key are not the same problem, and the
+	// detector now reports only the one it still refuses. An INBOUND key is
+	// a constraint on ANOTHER table pointing at this one by OID, which the
+	// swap leaves aimed at the retired table; an outbound key is this
+	// table's own and is reproduced when it can be (checkForeignKeys).
 	mustExec(t, home, `CREATE TABLE parent (pid bigint PRIMARY KEY)`)
 	mustExec(t, home, `CREATE TABLE child (id bigint PRIMARY KEY, pid bigint REFERENCES parent(pid))`)
-	for _, c := range []struct{ table, want string }{{"child", "foreign key"}, {"parent", "foreign key"}} {
-		got, err := unsupportedTableFeatures(ctx, pgxShardConn{home}, "public", c.table)
-		if err != nil || len(got) != 1 || !strings.HasPrefix(got[0], c.want) {
-			t.Fatalf("%s: unsupported = %v (%v), want one %q", c.table, got, err, c.want)
-		}
+	if got, err := unsupportedTableFeatures(ctx, pgxShardConn{home}, "public", "parent"); err != nil ||
+		len(got) != 1 || !strings.HasPrefix(got[0], "inbound foreign key") {
+		t.Fatalf("parent is referenced and must still be refused: %v %v", got, err)
 	}
-	if got, err := unsupportedTableFeatures(ctx, pgxShardConn{home}, "public", "parent"); err != nil || len(got) != 1 {
-		t.Fatalf("parent inbound fk: %v %v", got, err)
+	if got, err := unsupportedTableFeatures(ctx, pgxShardConn{home}, "public", "child"); err != nil || len(got) != 0 {
+		t.Fatalf("child's own key is not this detector's business: %v %v", got, err)
 	}
 	// Shapes lost by both shadow paths that carry no policy/trigger/FK.
 	mustExec(t, home, `CREATE ROLE reader`)

@@ -382,9 +382,18 @@ that ended within a day).
   Rows with a NULL new shard key fail the run.
 - A move is refused at preflight when the table carries something the
   shadow build cannot reproduce, because a swap that dropped it would leave
-  the table looking correct and enforcing nothing: foreign keys in either
-  direction, rules, a non-default replica identity, inheritance or partition
-  membership, and publication membership.
+  the table looking correct and enforcing nothing: **inbound** foreign keys
+  (a constraint on another table points at this one by OID, and the swap
+  leaves it aimed at the retired table), rules, a non-default replica
+  identity, inheritance or partition membership, and publication membership.
+- **A table's own foreign keys are reproduced when they can hold**, which is
+  when the referenced table is a **reference** table: every shard has all of
+  its rows, so the key holds wherever the moved table lands. A key pointing
+  at an unsharded table (home shard only) or a sharded one (split, so a row
+  and the row it references can land apart) is refused, naming the table and
+  its placement. They are added while the shadow is still empty, so the
+  constraint validates at no cost and every copied row is checked as it
+  arrives.
 - **The owner and table/column privileges are reproduced.** The shadow is
   built by the controller, so without this the swap would hand the
   application's table to the controller's role with every grant gone. Both
