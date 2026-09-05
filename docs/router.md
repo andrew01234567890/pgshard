@@ -46,7 +46,12 @@ the rest with `0A000`. See *Routing* below.
   caller who got the password right. Answering it earlier told anyone who
   asked whether a role existed, since an unknown one gets a mock exchange.
   PostgreSQL draws the same line -- `rolcanlogin` is checked after
-  authentication, not before. The keys recovered from the exchange
+  authentication, not before. The mock exchange's salt is
+  `HMAC(pgshard.auth_nonce, user)`: seeded once per cluster by a migration
+  and read by every router at startup, because a salt that differed between
+  two replicas -- or across a restart -- would answer by itself whether the
+  role exists. It is PostgreSQL's `mock_authentication_nonce` in the
+  catalog rather than in `pg_control`. The keys recovered from the exchange
   (`ClientKey`/`ServerKey`) become the `UserIdentity` sent to the pooler on
   the first message of each stream, so no password ever leaves the client.
   That is not the same as the keys being safe from the shards, and the

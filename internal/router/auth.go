@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/catalog/snapshot"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
@@ -44,6 +46,18 @@ type RoleCache struct {
 type rolesAt struct {
 	roles *snapshot.Roles
 	at    time.Time
+}
+
+// MockAuthNonce reads the cluster-wide seed of the mock SCRAM salt. Every
+// router must show the same salt for a role that does not exist, or two
+// probes against two replicas answer whether the role exists -- which is the
+// one thing the mock exchange is there to hide.
+func MockAuthNonce(ctx context.Context, q catalog.Querier) ([]byte, error) {
+	rows, err := q.Query(ctx, `SELECT nonce FROM pgshard.auth_nonce`)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectExactlyOneRow(rows, pgx.RowTo[[]byte])
 }
 
 // NewRoleCache builds a cache over q; ttl <= 0 means 5s.
