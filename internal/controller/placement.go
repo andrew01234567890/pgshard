@@ -76,6 +76,12 @@ type placementState struct {
 	// rows, and FORCE applies to the table owner too.
 	RowSecurity      bool `json:"row_security,omitempty"`
 	ForceRowSecurity bool `json:"force_row_security,omitempty"`
+	// Owner is the source table's owner and Grants the statements that
+	// reproduce its table and column privileges. Both are applied at the
+	// SWAP, after the rename, so they name the table clients see and the
+	// controller keeps the rights it needs while it is still building.
+	Owner  string   `json:"owner,omitempty"`
+	Grants []string `json:"grants,omitempty"`
 	// Triggers is each user trigger's pg_trigger.tgenabled on the source.
 	// Applied at the SWAP for the same reason: a trigger firing while the
 	// copy writes the shadow runs for every copied row, which is a row the
