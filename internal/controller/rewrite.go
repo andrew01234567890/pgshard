@@ -48,7 +48,7 @@ const DefaultRewriteSettle = snapshot.MaxAge
 func (a *Applier) driveRewrite(ctx context.Context, logger *slog.Logger, m *catalog.DDLMigration) error {
 	rw := m.Meta.Rewrite
 	if err := a.recordRewriteColumns(ctx, m); err != nil {
-		return a.failRewrite(ctx, logger, m, false, fmt.Sprintf("recording the column list: %v", err))
+		return a.failRewrite(ctx, logger, m, fmt.Sprintf("recording the column list: %v", err))
 	}
 	shards := sortedShardKeys(m.PerShard)
 	for phase := rewriteAdd; phase < rewriteDone; phase++ {
@@ -70,14 +70,21 @@ func (a *Applier) driveRewrite(ctx context.Context, logger *slog.Logger, m *cata
 			if s.State == catalog.ShardApplied && phase < rewriteDone-1 {
 				s.State = catalog.ShardRunning
 			}
-			s.Step = phase + 1
+			if s.State != catalog.ShardFailed {
+				// Step is the phase this shard has reached, and it is what
+				// says whether the shard cut over. Advancing it past a phase
+				// the shard did not finish told failRewrite that the shard
+				// whose cutover had just rolled back was on the far side of
+				// it, so its trigger and hidden column were left in place and
+				// the migration was reported DEGRADED with nothing diverged.
+				s.Step = phase + 1
+			}
 			m.PerShard[key] = s
 			if err := a.Store.Save(ctx, *m); err != nil {
 				return err
 			}
 			if s.State == catalog.ShardFailed {
-				return a.failRewrite(ctx, logger, m, phase >= rewriteCutover,
-					fmt.Sprintf("shard %s: %s", key, s.Error))
+				return a.failRewrite(ctx, logger, m, fmt.Sprintf("shard %s: %s", key, s.Error))
 			}
 		}
 	}
@@ -95,11 +102,12 @@ func shardID(key string) int32 {
 	return id
 }
 
-// failRewrite marks the migration failed. Unless a shard already cut over,
-// every shard is reverted so the table is left as it was.
-func (a *Applier) failRewrite(ctx context.Context, logger *slog.Logger, m *catalog.DDLMigration, cutoverStarted bool, msg string) error {
+// failRewrite marks the migration failed. Every shard that has not cut over
+// is reverted so the table is left as it was; a shard that has is left alone
+// and reported.
+func (a *Applier) failRewrite(ctx context.Context, logger *slog.Logger, m *catalog.DDLMigration, msg string) error {
 	m.State, m.Error = catalog.MigrationFailed, msg
-	if cutoverStarted {
+	if anyShardCutOver(m) {
 		m.Error += "; some shards may already be cut over (schema is DEGRADED until resolved)"
 	}
 	for _, key := range sortedShardKeys(m.PerShard) {
@@ -123,6 +131,19 @@ func (a *Applier) failRewrite(ctx context.Context, logger *slog.Logger, m *catal
 	}
 	logger.Warn("rewrite migration failed", "error", m.Error)
 	return nil
+}
+
+// anyShardCutOver reports whether any shard is past the cutover phase, which
+// is what makes the schema divergent and the migration DEGRADED. Reaching the
+// cutover is not the same as finishing it: a cutover that rolls back leaves
+// its shard exactly as it was.
+func anyShardCutOver(m *catalog.DDLMigration) bool {
+	for _, s := range m.PerShard {
+		if s.Step > rewriteCutover {
+			return true
+		}
+	}
+	return false
 }
 
 // rewriteColumnDependents lists the objects an ALTER TABLE ... DROP COLUMN of

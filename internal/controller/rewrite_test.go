@@ -347,3 +347,73 @@ func TestAResumedRewriteWaitsOutTheSettleWindowAgain(t *testing.T) {
 		t.Fatalf("a rewrite that recorded a finished wait waited %s again", slept)
 	}
 }
+
+// TestAFailedCutoverIsRevertedAndNotCalledDegraded: Step was advanced past
+// every phase the shard attempted, including one it failed, so failRewrite
+// read the shard whose cutover had just rolled back as being on the far side
+// of the cutover: it skipped the revert, left the trigger and the hidden
+// column on that shard, and reported the migration DEGRADED although nothing
+// had cut over.
+func TestAFailedCutoverIsRevertedAndNotCalledDegraded(t *testing.T) {
+	store := &memStore{migrations: []catalog.DDLMigration{rewriteMigration("00000000-0000-0000-0000-00000000ab0a")},
+		shards: []int32{0, 1}}
+	shards := newFakeShards()
+	shards.columns = []string{"tenant_id", "id", "amount"}
+	shards.pks = []string{"id"}
+	shards.exec = func(id int32, sql string) error {
+		if id == 0 && strings.Contains(sql, "RENAME COLUMN") {
+			return pgErr("22P02", "invalid input syntax")
+		}
+		return nil
+	}
+	a := newRewriteApplier(store, shards)
+	if _, err := a.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m := store.get(t, "00000000-0000-0000-0000-00000000ab0a")
+	if m.State != catalog.MigrationFailed {
+		t.Fatalf("state = %s error %q", m.State, m.Error)
+	}
+	if strings.Contains(m.Error, "already be cut over") {
+		t.Errorf("no shard cut over, but the migration says it may have: %q", m.Error)
+	}
+	hidden := m.Meta.Rewrite.HiddenColumn(m.ID)
+	for _, id := range []int32{0, 1} {
+		sup := shards.superuserStatements(id)
+		if !has(sup, `DROP COLUMN IF EXISTS "`+hidden+`"`) || !has(sup, "DROP TRIGGER IF EXISTS") {
+			t.Errorf("shard %d not reverted:\n%s", id, strings.Join(sup, "\n"))
+		}
+	}
+}
+
+// TestAShardThatCutOverIsLeftAloneAndReported: the other half of the same
+// rule -- a shard that finished its cutover must not be reverted, and the
+// migration must say the schema diverged.
+func TestAShardThatCutOverIsLeftAloneAndReported(t *testing.T) {
+	store := &memStore{migrations: []catalog.DDLMigration{rewriteMigration("00000000-0000-0000-0000-00000000ab0b")},
+		shards: []int32{0, 1}}
+	shards := newFakeShards()
+	shards.columns = []string{"tenant_id", "id", "amount"}
+	shards.pks = []string{"id"}
+	shards.exec = func(id int32, sql string) error {
+		if id == 1 && strings.Contains(sql, "RENAME COLUMN") {
+			return pgErr("22P02", "invalid input syntax")
+		}
+		return nil
+	}
+	a := newRewriteApplier(store, shards)
+	if _, err := a.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m := store.get(t, "00000000-0000-0000-0000-00000000ab0b")
+	if m.State != catalog.MigrationFailed || !strings.Contains(m.Error, "already be cut over") {
+		t.Fatalf("state = %s error %q", m.State, m.Error)
+	}
+	hidden := m.Meta.Rewrite.HiddenColumn(m.ID)
+	if has(shards.superuserStatements(0), `DROP COLUMN IF EXISTS "`+hidden+`"`) {
+		t.Error("the shard that cut over was reverted, which drops the rewritten column")
+	}
+	if !has(shards.superuserStatements(1), `DROP COLUMN IF EXISTS "`+hidden+`"`) {
+		t.Error("the shard whose cutover failed was not reverted")
+	}
+}
