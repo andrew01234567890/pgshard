@@ -223,4 +223,8 @@ first, then rebuilt as a standby.
 - A postgres crash inside a running pod is a container restart, not a failover,
   until the pod stops being Ready and `Status` fails for the failover delay.
 - `synchronous_standby_names` set via `ALTER SYSTEM` is dropped by an agent
-  `Reload`/`Promote` and re-applied by the operator on its next probe.
+  `Reload`/`Promote` and re-applied by the operator on its next probe. What
+  the agent falls back to is the member's own rendered list — every other
+  member of the group, which is the correct list for it as a primary — so the
+  window costs the ordering the operator computed from what is streaming, not
+  the synchronous set.
