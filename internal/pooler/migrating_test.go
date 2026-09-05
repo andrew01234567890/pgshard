@@ -10,6 +10,9 @@ func TestFenceMigratingRefusesOnlyNewPrepares(t *testing.T) {
 	simple := func(sql string) *pgshardv1.ExecuteRequest {
 		return &pgshardv1.ExecuteRequest{Message: &pgshardv1.ExecuteRequest_SimpleQuery{SimpleQuery: &pgshardv1.SimpleQuery{Sql: sql}}}
 	}
+	parse := func(sql string) *pgshardv1.ExecuteRequest {
+		return &pgshardv1.ExecuteRequest{Message: &pgshardv1.ExecuteRequest_Parse{Parse: &pgshardv1.Parse{Sql: sql}}}
+	}
 	cases := []struct {
 		name    string
 		view    View
@@ -23,7 +26,9 @@ func TestFenceMigratingRefusesOnlyNewPrepares(t *testing.T) {
 		{"rollback prepared passes", View{Migrating: true}, simple("ROLLBACK PREPARED 'x'"), false},
 		{"prepared statement passes", View{Migrating: true}, simple("PREPARE s AS SELECT 1"), false},
 		{"read passes", View{Migrating: true}, simple("SELECT 1"), false},
-		{"extended messages pass", View{Migrating: true}, &pgshardv1.ExecuteRequest{Message: &pgshardv1.ExecuteRequest_Sync{Sync: &pgshardv1.Sync{}}}, false},
+		{"other extended messages pass", View{Migrating: true}, &pgshardv1.ExecuteRequest{Message: &pgshardv1.ExecuteRequest_Sync{Sync: &pgshardv1.Sync{}}}, false},
+		{"prepare through Parse", View{Migrating: true}, parse("PREPARE TRANSACTION 'x'"), true},
+		{"other Parse passes", View{Migrating: true}, parse("SELECT 1"), false},
 	}
 	for _, tc := range cases {
 		e := fenceMigrating(tc.view, tc.req)
