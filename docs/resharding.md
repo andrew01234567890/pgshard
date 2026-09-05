@@ -281,8 +281,21 @@ idempotent, so a controller crash anywhere repeats at most one step:
    `pgshard.serving` published for the new set, database home shards
    moved, `shard_map_generation` bumped so poolers reject the old
    generation.
-10. `swap_replication` — forward subscriptions disabled (dropped on
-    complete), reverse subscriptions enabled.
+10. `swap_replication` — the sources stop taking new writing transactions
+    (`default_transaction_read_only`), **the writers already open are waited
+    out**, the final positions are sampled and confirmed applied on the
+    targets, forward subscriptions are disabled (dropped on complete), the
+    sources are made writable again and reverse subscriptions are enabled.
+
+    The drain is not belt and braces. `default_transaction_read_only` is
+    read when a transaction *starts*, so the pause stops new writers and
+    nothing else — and the router deliberately lets a transaction that
+    opened before the fence carry on writing. Without the wait, such a
+    commit lands after the positions were sampled and after forward
+    replication is gone, acknowledged on a source that is about to be
+    retired and replicated nowhere. A drain that does not finish within
+    the writer-drain timeout retries the step with the sources writable
+    again, rather than failing the workflow or holding writes down.
 11. `release` — `migrating=false`, lock row removed. Routers replay the
     buffered writes against the new map.
 

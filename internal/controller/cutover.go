@@ -240,7 +240,15 @@ type cutoverOps interface {
 	// disabling of the forward subscriptions have to happen with nothing
 	// able to arrive in between, or a write acknowledged in that gap is
 	// left on a source nothing replicates from any more.
+	//
+	// The pause alone does not buy that, which is what DrainSources is
+	// for: default_transaction_read_only is read when a transaction
+	// STARTS, so one already open commits straight through it.
 	PauseSources(ctx context.Context, pause bool) error
+	// DrainSources waits for the writing transactions that were already
+	// open when the pause went up. Until it returns, "paused" means only
+	// that no NEW writer can begin.
+	DrainSources(ctx context.Context) error
 	// DisableForward stops the forward subscriptions; EnableReverse starts
 	// the reverse ones. They were one step, which meant the sources had to
 	// be writable again before the reverse apply could run and could not
@@ -650,6 +658,20 @@ func (c *Copier) runStep(ctx context.Context, wf *copyWorkflow, ops cutoverOps, 
 		// since their apply workers need the sources writable.
 		if err := ops.PauseSources(ctx, true); err != nil {
 			return false, err
+		}
+		// The pause stops transactions that BEGIN after it. One that began
+		// before commits straight through it, because
+		// default_transaction_read_only is read at transaction start --
+		// and the router lets a transaction opened before the fence carry
+		// on writing, deliberately. Such a write lands after the positions
+		// below are sampled and after the forward subscriptions are gone,
+		// on a source that is about to be retired, and nothing carries it
+		// anywhere: an acknowledged commit is lost when the source goes.
+		//
+		// A drain timing out is a long transaction, not a broken cutover,
+		// so the sources are made writable again and the step retries.
+		if err := ops.DrainSources(ctx); err != nil {
+			return true, errors.Join(retryf("%s", err), ops.PauseSources(ctx, false))
 		}
 		pos, err := ops.Positions(ctx)
 		if err != nil {

@@ -60,6 +60,16 @@ type fakeOps struct {
 	// still handing out values does.
 	seqFP       string
 	seqAdvances int
+	// openWriters are transactions that were already writing when the
+	// pause went up. The pause cannot stop them --
+	// default_transaction_read_only is read at transaction start -- so
+	// they keep the source advancing until DrainSources waits them out.
+	openWriters int
+	// lostWrite records one of them committing after the positions were
+	// sampled and after forward replication was disabled: an acknowledged
+	// write on a source that is about to be retired, replicated nowhere.
+	lostWrite bool
+	drains    int
 }
 
 func newFakeOps() *fakeOps {
@@ -93,6 +103,16 @@ func (f *fakeOps) Positions(context.Context) (map[string]int64, error) {
 		f.lsn += f.advance
 	}
 	return map[string]int64{"0": f.lsn}, f.step(StepPositions)
+}
+
+// DrainSources ends the writers the pause could not.
+func (f *fakeOps) DrainSources(context.Context) error {
+	if err := f.step("drain_sources"); err != nil {
+		return err
+	}
+	f.drains++
+	f.openWriters = 0
+	return nil
 }
 func (f *fakeOps) CaughtUp(_ context.Context, pos map[string]int64) (bool, string, error) {
 	if pos["0"] != f.lsn {
@@ -135,9 +155,17 @@ func (f *fakeOps) Journal(_ context.Context, id string) error {
 	f.journaled[id]++
 	return f.step(StepJournal)
 }
-func (f *fakeOps) Flip(context.Context, string) error   { return f.step(StepFlip) }
-func (f *fakeOps) DisableForward(context.Context) error { return f.step(StepSwap) }
-func (f *fakeOps) EnableReverse(context.Context) error  { return f.step("enable_reverse") }
+func (f *fakeOps) Flip(context.Context, string) error { return f.step(StepFlip) }
+func (f *fakeOps) DisableForward(context.Context) error {
+	// A writer still open at this point commits with the forward
+	// subscriptions already gone, so its row stays on a source nothing
+	// replicates from.
+	if f.openWriters > 0 {
+		f.lostWrite = true
+	}
+	return f.step(StepSwap)
+}
+func (f *fakeOps) EnableReverse(context.Context) error { return f.step("enable_reverse") }
 
 // PauseSources records the pause and, while paused, stops the fake source
 // advancing: that is what a write pause buys, and a test that keeps the
@@ -209,7 +237,7 @@ func TestCutoverHappyPath(t *testing.T) {
 	h.runUntil(t, StageSwitched)
 	want := []string{"gate", StepFence, StepDrain, StepSweep, StepPositions, StepCatchUp, StepPositions, StepVerify, StepSequences, StepReverse, StepJournal,
 		StepPositions, StepCatchUp, StepFlip,
-		"pause_sources", StepPositions, StepCatchUp, StepSequences, StepSwap, "pause_sources", "enable_reverse", StepRelease}
+		"pause_sources", "drain_sources", StepPositions, StepCatchUp, StepSequences, StepSwap, "pause_sources", "enable_reverse", StepRelease}
 	if got := strings.Join(h.ops.calls, ","); got != strings.Join(want, ",") {
 		t.Fatalf("calls %s", got)
 	}
@@ -707,6 +735,68 @@ func TestSwapPausesTheSourcesAroundTheLastCheck(t *testing.T) {
 	// the pause is lifted.
 	if strings.Index(calls, "enable_reverse") < strings.LastIndex(calls, "pause_sources") {
 		t.Fatalf("reverse replication must start after the pause is lifted: %s", calls)
+	}
+}
+
+// TestSwapWaitsOutTheWritersThePauseCannotStop.
+//
+// default_transaction_read_only is read when a transaction STARTS, so the
+// pause stops new writers and nothing else: a transaction already open
+// commits straight through it. The router lets one that opened before the
+// fence carry on writing, deliberately, so this is the ordinary case and not
+// a race.
+//
+// Such a write lands after the positions were sampled and after the forward
+// subscriptions are disabled -- an acknowledged commit on a source that is
+// about to be retired, which nothing replicates and nothing carries back.
+// The rollback path waited for these from the start; the forward swap did
+// not.
+func TestSwapWaitsOutTheWritersThePauseCannotStop(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.ops.openWriters = 1
+	h.runUntil(t, StageSwitched)
+
+	if h.ops.drains == 0 {
+		t.Fatal("the swap must wait for the writers that were open when the pause went up")
+	}
+	if h.ops.lostWrite {
+		t.Fatal("a writer open across the swap committed on a source whose forward replication was already off")
+	}
+	calls := strings.Join(h.ops.calls, ",")
+	swap := strings.Index(calls, StepSwap)
+	pause := strings.LastIndex(calls[:swap], "pause_sources")
+	drain := strings.Index(calls[pause:swap], "drain_sources")
+	pos := strings.Index(calls[pause:swap], StepPositions)
+	if drain < 0 || pos < 0 || drain > pos {
+		// Draining after the sample proves nothing: the sample would
+		// already be missing the write.
+		t.Fatalf("the drain must happen inside the pause and before the positions are sampled: %s", calls[pause:swap])
+	}
+}
+
+// A drain that does not finish is a long transaction, not a broken cutover:
+// the sources go back to writable and the step retries rather than failing
+// the workflow or holding writes down for ever.
+func TestASlowWriterRetriesTheSwapRatherThanFailingIt(t *testing.T) {
+	h := newCutoverHarness(t)
+	h.ops.openWriters = 1
+	h.runUntil(t, StageSwitching)
+	h.ops.fail["drain_sources"] = errors.New("2 write transactions on default still open after 30s")
+	var err error
+	for i := 0; h.wf.cutover.Step != StepSwap || err == nil; i++ {
+		if i > 50 {
+			t.Fatalf("never parked at %s; at %s (%v)", StepSwap, h.wf.cutover.Step, err)
+		}
+		_, err = h.c.cutover(context.Background(), h.wf, h.ops)
+	}
+	if !errors.Is(err, errRetry) {
+		t.Fatalf("a drain that timed out gave up with %v, want a retry", err)
+	}
+	if h.ops.paused {
+		t.Fatal("a swap that could not drain must leave the sources writable")
+	}
+	if h.ops.lostWrite {
+		t.Fatal("the attempt that could not drain must not have disabled forward replication")
 	}
 }
 
