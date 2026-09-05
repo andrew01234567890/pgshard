@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
@@ -165,6 +166,12 @@ const probePrimarySQL = `SELECT pg_is_in_recovery(),
 	FROM pg_stat_replication`
 
 // Probe reads liveness and replication state from the primary.
+// Not pooled, unlike ProbeStandby: this reads synchronous_standby_names,
+// and a backend that has not yet processed the SIGHUP from a reload answers
+// with the list from before it. A fresh connection sees the new value by
+// construction. The operator decides sync policy from this, so a stale read
+// is worth a connection per group per pass; the standby probes, which are
+// the bulk of them and read only LSNs and recovery state, are pooled.
 func (PgxProber) Probe(ctx context.Context, dsn string) (PrimaryState, error) {
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
@@ -190,22 +197,23 @@ func (PgxProber) Probe(ctx context.Context, dsn string) (PrimaryState, error) {
 
 // ProbeStandby reads recovery and WAL receiver state from one member.
 func (PgxProber) ProbeStandby(ctx context.Context, dsn string) (StandbyState, error) {
-	conn, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		return StandbyState{}, err
-	}
-	defer func() { _ = conn.Close(ctx) }()
 	var st StandbyState
-	var lsn *int64
-	err = conn.QueryRow(ctx, `SELECT pg_is_in_recovery(),
-		EXISTS (SELECT 1 FROM pg_stat_wal_receiver WHERE status = 'streaming'),
-		CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn() ELSE pg_current_wal_flush_lsn() END - '0/0'::pg_lsn`).
-		Scan(&st.InRecovery, &st.Streaming, &lsn)
+	err := withProbeConn(ctx, dsn, func(conn *pgxpool.Conn) error {
+		var lsn *int64
+		err := conn.QueryRow(ctx, `SELECT pg_is_in_recovery(),
+			EXISTS (SELECT 1 FROM pg_stat_wal_receiver WHERE status = 'streaming'),
+			CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn() ELSE pg_current_wal_flush_lsn() END - '0/0'::pg_lsn`).
+			Scan(&st.InRecovery, &st.Streaming, &lsn)
+		if err != nil {
+			return err
+		}
+		if lsn != nil {
+			st.FlushLSN = uint64(*lsn)
+		}
+		return nil
+	})
 	if err != nil {
 		return StandbyState{}, err
-	}
-	if lsn != nil {
-		st.FlushLSN = uint64(*lsn)
 	}
 	return st, nil
 }
