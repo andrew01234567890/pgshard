@@ -31,7 +31,16 @@ while read -r ref; do
   slug="${slug#library/}"
   slug="${slug//\//-}"
   slug="${slug//:/-}"
-  printf '%s\t%s\n' "$ref" "$slug"
+  # The digest is part of the tag, because the same name:tag can appear at
+  # two digests at once and did: dependabot raises one pull request per
+  # directory, so a golang bump lands in Dockerfile.control and
+  # Dockerfile.router in one and in postgres/Dockerfile in another, and
+  # between them the tree pins golang:1.27-bookworm at both. Deriving the
+  # tag from name:tag alone made those two collide, the check refused
+  # ("two images share a mirror tag"), and NEITHER pull request could
+  # merge -- each was blocked by the state the other would resolve.
+  digest="${ref#*@sha256:}"
+  printf '%s\t%s\n' "$ref" "$slug-${digest:0:12}"
 done < <(
   # The files are discovered, not listed. A hardcoded list is how the e2e
   # cache-warming step came to cover two of the three Dockerfiles: the third
