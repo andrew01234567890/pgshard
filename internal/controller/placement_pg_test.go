@@ -886,17 +886,21 @@ func TestPlacementRefusesCrossSchemaSerialOnPostgres(t *testing.T) {
 }
 
 // TestPlacementRefusesUnsupportedFeaturesOnPostgres: a table carrying a
-// row-level security policy, a user trigger or a foreign key is refused at
-// preflight, because the shadow build recreates none of them and the swap
-// would silently drop enforcement.
+// user trigger or a foreign key is refused at preflight, because the shadow
+// build recreates neither and the swap would silently drop enforcement.
+//
+// Row-level security used to be on that list and is not: policies and both
+// RLS flags are reproduced now (TestAMoveKeepsRowLevelSecurity), so it is
+// the one class this refusal has stopped covering.
 func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 	parallelPG(t)
 	f := newPlacementFixture(t)
 	ctx := context.Background()
 	home := f.app(0)
 	mustExec(t, home, `CREATE TABLE guarded (id bigint PRIMARY KEY, owner text)`)
-	mustExec(t, home, `ALTER TABLE guarded ENABLE ROW LEVEL SECURITY`)
-	mustExec(t, home, `CREATE POLICY own_rows ON guarded USING (owner = current_user)`)
+	mustExec(t, home, `CREATE FUNCTION stamp_owner() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN NEW.owner := current_user; RETURN NEW; END $$`)
+	mustExec(t, home, `CREATE TRIGGER own_rows BEFORE INSERT ON guarded FOR EACH ROW EXECUTE FUNCTION stamp_owner()`)
 	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement, shard_key) VALUES ('app', 'public', 'guarded', 'unsharded', NULL)`)
 	f.reconcile()
 
@@ -912,15 +916,15 @@ func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 			break
 		}
 		if state == StateCompleted {
-			t.Fatal("move of an RLS table completed instead of being refused")
+			t.Fatal("move of a table with a user trigger completed instead of being refused")
 		}
 	}
-	if state != StateFailed || !strings.Contains(msg, "row-level security policy own_rows") {
-		t.Fatalf("expected refusal naming the policy, got %s %q", state, msg)
+	if state != StateFailed || !strings.Contains(msg, "trigger own_rows") {
+		t.Fatalf("expected refusal naming the trigger, got %s %q", state, msg)
 	}
-	// The policy is untouched.
-	if n := queryOne[int64](t, home, `SELECT count(*) FROM pg_policy WHERE polname = 'own_rows'`); n != 1 {
-		t.Fatal("the RLS policy was dropped")
+	// The trigger is untouched.
+	if n := queryOne[int64](t, home, `SELECT count(*) FROM pg_trigger WHERE tgname = 'own_rows'`); n != 1 {
+		t.Fatal("the trigger was dropped")
 	}
 	// The pure-feature detector covers each unsupported shape.
 	mustExec(t, home, `CREATE TABLE parent (pid bigint PRIMARY KEY)`)
@@ -937,7 +941,6 @@ func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 	// Shapes lost by both shadow paths that carry no policy/trigger/FK.
 	mustExec(t, home, `CREATE ROLE reader`)
 	for _, c := range []struct{ ddl, table, want string }{
-		{`CREATE TABLE rlsempty (id bigint PRIMARY KEY); ALTER TABLE rlsempty ENABLE ROW LEVEL SECURITY`, "rlsempty", "row-level security enabled"},
 		{`CREATE TABLE granted (id bigint PRIMARY KEY); GRANT SELECT ON granted TO reader`, "granted", "table privileges"},
 		{`CREATE TABLE colgrant (id bigint PRIMARY KEY, v text); GRANT SELECT (v) ON colgrant TO reader`, "colgrant", "column privileges on v"},
 		{`CREATE TABLE ruled (id bigint PRIMARY KEY); CREATE RULE r1 AS ON DELETE TO ruled DO INSTEAD NOTHING`, "ruled", "rule r1"},
@@ -950,8 +953,13 @@ func TestPlacementRefusesUnsupportedFeaturesOnPostgres(t *testing.T) {
 			t.Fatalf("%s: unsupported = %v (%v), want %q", c.table, got, err, c.want)
 		}
 	}
-	if got, err := unsupportedTableFeatures(ctx, pgxShardConn{home}, "public", "guarded"); err != nil || len(got) < 2 {
-		t.Fatalf("guarded must report both the policy and RLS enabled: %v %v", got, err)
+	// And what is no longer refused: a table with row-level security and a
+	// policy is moved, not stopped.
+	mustExec(t, home, `CREATE TABLE rlsonly (id bigint PRIMARY KEY, owner text)`)
+	mustExec(t, home, `ALTER TABLE rlsonly ENABLE ROW LEVEL SECURITY`)
+	mustExec(t, home, `CREATE POLICY own_rows ON rlsonly USING (owner = current_user)`)
+	if got, err := unsupportedTableFeatures(ctx, pgxShardConn{home}, "public", "rlsonly"); err != nil || len(got) != 0 {
+		t.Fatalf("row-level security is reproduced now, not refused: %v %v", got, err)
 	}
 }
 

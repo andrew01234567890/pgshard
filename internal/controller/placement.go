@@ -63,20 +63,26 @@ func (s placementSpec) table() string { return s.Database + "." + s.SchemaName +
 
 // placementState is the workflow's record under status->'placement'.
 type placementState struct {
-	SourceSet    string           `json:"source_set,omitempty"`
-	Sources      []int32          `json:"sources,omitempty"`
-	Targets      []int32          `json:"targets,omitempty"`
-	Holders      []int32          `json:"holders,omitempty"`
-	Columns      []string         `json:"columns,omitempty"`
-	Identity     []string         `json:"identity,omitempty"`
-	TableComment *string          `json:"table_comment,omitempty"`
-	PK           []string         `json:"pk,omitempty"`
-	KeyType      string           `json:"key_type,omitempty"`
-	Copied       map[string]bool  `json:"copied,omitempty"`
-	Applied      map[string]int64 `json:"applied,omitempty"`
-	LagBytes     int64            `json:"lag_bytes"`
-	FencedAt     *time.Time       `json:"fenced_at,omitempty"`
-	SwappedAt    *time.Time       `json:"swapped_at,omitempty"`
+	SourceSet    string   `json:"source_set,omitempty"`
+	Sources      []int32  `json:"sources,omitempty"`
+	Targets      []int32  `json:"targets,omitempty"`
+	Holders      []int32  `json:"holders,omitempty"`
+	Columns      []string `json:"columns,omitempty"`
+	Identity     []string `json:"identity,omitempty"`
+	TableComment *string  `json:"table_comment,omitempty"`
+	// RowSecurity and ForceRowSecurity are the source table's RLS flags.
+	// They are applied at the SWAP, not on the shadow: enabling row-level
+	// security while the copy is running would filter the copier's own
+	// rows, and FORCE applies to the table owner too.
+	RowSecurity      bool             `json:"row_security,omitempty"`
+	ForceRowSecurity bool             `json:"force_row_security,omitempty"`
+	PK               []string         `json:"pk,omitempty"`
+	KeyType          string           `json:"key_type,omitempty"`
+	Copied           map[string]bool  `json:"copied,omitempty"`
+	Applied          map[string]int64 `json:"applied,omitempty"`
+	LagBytes         int64            `json:"lag_bytes"`
+	FencedAt         *time.Time       `json:"fenced_at,omitempty"`
+	SwappedAt        *time.Time       `json:"swapped_at,omitempty"`
 	// Swapped lists the shards whose swap transaction was started; the
 	// marker is persisted before the first rename on a shard, so only a
 	// resume that finds it may treat a missing shadow as already swapped.
