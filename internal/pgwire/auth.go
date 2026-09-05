@@ -78,8 +78,13 @@ func (a CleartextAuthenticator) Authenticate(ctx context.Context, startup map[st
 //
 // MockSecret seeds the deterministic salt of the throwaway exchange run for
 // unknown users, so that repeated probes see a stable salt exactly like a
-// real user would (PostgreSQL derives its mock salt the same way). When nil a
-// process-wide random secret is used.
+// real user would (PostgreSQL derives its mock salt the same way, from
+// mock_authentication_nonce). It must be the same on every router: the
+// routers are replicas behind one Service, and a salt that differs between
+// two of them answers the question the mock exchange exists to hide. The
+// router reads it from pgshard.auth_nonce. When nil a process-wide random
+// secret is used, which is safe only for a single process -- a test, or a
+// router whose catalog has not been migrated that far yet.
 type SCRAMAuthenticator struct {
 	Lookup     PasswordLookup
 	MockSecret []byte

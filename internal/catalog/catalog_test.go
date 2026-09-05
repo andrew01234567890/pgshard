@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -315,6 +316,44 @@ func runSuite(t *testing.T, img pgImage) {
 		if _, err := rc.Exec(ctx, `SELECT id, database, kind, state, error, created_at FROM pgshard.migrations_public`); err != nil {
 			t.Errorf("a reader lost the migration state it watches: %v", err)
 		}
+		// Knowing the seed lets anyone compute the salt a router shows for a
+		// name and compare it, which is the enumeration the mock exchange
+		// exists to prevent.
+		if _, err := rc.Exec(ctx, `SELECT nonce FROM pgshard.auth_nonce`); err == nil {
+			t.Error("a reader can read the mock auth nonce")
+		}
+	})
+
+	t.Run("the_mock_auth_salt_is_seeded_once_per_cluster", func(t *testing.T) {
+		if err := Migrate(ctx, conn); err != nil {
+			t.Fatal(err)
+		}
+		var first []byte
+		if err := conn.QueryRow(ctx, `SELECT nonce FROM pgshard.auth_nonce`).Scan(&first); err != nil {
+			t.Fatal(err)
+		}
+		if len(first) != 32 {
+			t.Fatalf("nonce is %d bytes, want 32", len(first))
+		}
+		if err := Migrate(ctx, conn); err != nil {
+			t.Fatal(err)
+		}
+		var again []byte
+		var rows int
+		if err := conn.QueryRow(ctx, `SELECT count(*)::int FROM pgshard.auth_nonce`).Scan(&rows); err != nil {
+			t.Fatal(err)
+		}
+		if err := conn.QueryRow(ctx, `SELECT nonce FROM pgshard.auth_nonce`).Scan(&again); err != nil {
+			t.Fatal(err)
+		}
+		// Re-seeding would change the salt every router shows for an unknown
+		// role, which is the property this table exists to hold still.
+		if rows != 1 || !bytes.Equal(first, again) {
+			t.Fatalf("nonce rows=%d changed=%v across a second migrate", rows, !bytes.Equal(first, again))
+		}
+		if _, err := conn.Exec(ctx, `INSERT INTO pgshard.auth_nonce (nonce) VALUES (sha256('x'))`); err == nil {
+			t.Error("a second nonce row was accepted")
+		}
 	})
 
 	t.Run("router_role_is_least_privilege", func(t *testing.T) {
@@ -339,6 +378,9 @@ func runSuite(t *testing.T, img pgImage) {
 		// reads, and the decision log it writes for two-phase commit.
 		if _, err := rc.Exec(ctx, `SELECT verifier FROM pgshard.roles`); err != nil {
 			t.Errorf("reading role verifiers: %v", err)
+		}
+		if _, err := rc.Exec(ctx, `SELECT nonce FROM pgshard.auth_nonce`); err != nil {
+			t.Errorf("reading the mock auth nonce: %v", err)
 		}
 		if _, err := rc.Exec(ctx, `INSERT INTO pgshard.xact_decisions (gid, state, participants) VALUES ('pgshard-t-1', 'preparing', '{0}')`); err != nil {
 			t.Errorf("writing the decision log: %v", err)

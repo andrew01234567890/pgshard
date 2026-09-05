@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -201,9 +202,26 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 			logger.Warn("random instance id; peers cannot address this instance statically", "instance_id", *instanceID)
 		}
 	}
+	// Every replica must show the same salt for a role that does not exist.
+	// Without this each drew its own seed at startup, so two probes -- against
+	// two replicas, or across a rollout -- told an unauthenticated client
+	// whether the role exists, which is what the mock exchange is for.
+	mockNonce, err := router.MockAuthNonce(ctx, pool)
+	if err != nil {
+		// A catalog that has not been migrated this far yet is the one case
+		// worth serving through: the alternative is that a router rolled out
+		// ahead of the control plane refuses every connection. It costs the
+		// stable salt until the migration lands, which the log says.
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "42P01" {
+			fmt.Fprintf(stderr, "pgshard-router serve: mock auth nonce: %v\n", err)
+			return cli.ExitNotReady
+		}
+		logger.Warn("catalog has no auth_nonce yet; the salt shown for unknown roles is per-process until it is migrated", "err", err)
+	}
 	var srv *pgwire.Server
 	srvCfg := pgwire.Config{
-		Authenticator:     pgwire.SCRAMAuthenticator{Lookup: roles.Lookup},
+		Authenticator:     pgwire.SCRAMAuthenticator{Lookup: roles.Lookup, MockSecret: mockNonce},
 		TLSConfig:         tlsCfg,
 		AllowPlaintext:    *allowPlaintext,
 		ServerVersion:     *serverVersion,
