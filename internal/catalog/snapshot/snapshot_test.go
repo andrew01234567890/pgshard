@@ -52,20 +52,6 @@ func TestLocate(t *testing.T) {
 	}
 }
 
-func TestCheckGeneration(t *testing.T) {
-	if err := CheckGeneration(3, 3); err != nil {
-		t.Fatal(err)
-	}
-	if err := CheckGeneration(3, 0); err != nil {
-		t.Fatal(err)
-	}
-	err := CheckGeneration(3, 4)
-	var stale *StaleGeneration
-	if !errors.As(err, &stale) || stale.Routed != 3 || stale.Observed != 4 {
-		t.Fatalf("expected StaleGeneration, got %v", err)
-	}
-}
-
 func TestRolesNeverPrinted(t *testing.T) {
 	r := &Roles{verifiers: map[string]RoleCred{"alice": {Verifier: "SCRAM-SHA-256$4096:secretsalt$stored:server", CanLogin: true}}}
 	for _, out := range []string{fmt.Sprint(r), fmt.Sprintf("%v", r), fmt.Sprintf("%+v", r), fmt.Sprintf("%#v", r), r.String()} {

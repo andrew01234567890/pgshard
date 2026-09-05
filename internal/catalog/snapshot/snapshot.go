@@ -439,26 +439,6 @@ type Generation int64
 // Generation returns the shard-map generation the snapshot was routed with.
 func (s *Snapshot) Generation() Generation { return Generation(s.ShardMapGeneration) }
 
-// StaleGeneration describes a pooler response stamped with a different
-// shard-map generation than the snapshot that produced the request.
-type StaleGeneration struct {
-	Routed, Observed Generation
-}
-
-func (e *StaleGeneration) Error() string {
-	return fmt.Sprintf("snapshot: routed with shard map generation %d but pooler reported %d", e.Routed, e.Observed)
-}
-
-// CheckGeneration returns a *StaleGeneration error when observed differs
-// from routed. A zero observed generation means the pooler did not report one
-// and is accepted.
-func CheckGeneration(routed, observed Generation) error {
-	if observed == 0 || observed == routed {
-		return nil
-	}
-	return &StaleGeneration{Routed: routed, Observed: observed}
-}
-
 func rangeFromCatalog(r catalog.ShardRange) Range {
 	out := Range{ShardID: r.ShardID, Start: math.MinInt64, End: math.MaxInt64}
 	if r.Lower != nil {
