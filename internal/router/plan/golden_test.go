@@ -212,7 +212,7 @@ func golden() []want {
 		{sql: "select * from docs where slug in ('a', 'acme')", kind: In, shards: "k:a,k:acme"},
 		{sql: "delete from orders where tenant_id in (1, 42)", kind: In, shards: "k:1"},
 		{sql: "update orders set status = 'x' where tenant_id in (1, 2)", kind: In, shards: "k:1,k:2"},
-		{sql: "select * from orders where tenant_id in (select tenant_id from items)", kind: Refuse, msg: "cross-shard join"},
+		{sql: "select * from orders where tenant_id in (select tenant_id from items)", kind: Refuse, msg: `a multi-shard statement cannot include unsharded table "items", which is on the home shard alone`},
 
 		// Parameters: deferred until bind.
 		{sql: "select * from orders where tenant_id = $1", kind: EqualUnique, shards: "k:42", values: map[int32]any{1: int64(42)}},
@@ -256,7 +256,7 @@ func golden() []want {
 		{sql: "insert into docs (slug, body) values ('acme', 'x')", kind: EqualUnique, shards: "k:acme"},
 		{sql: "insert into docs (slug, body) values ('123', 'x')", kind: Refuse, msg: "shard key literal '123' is untyped and looks numeric"},
 		{sql: "insert into docs (slug, body) values ('123'::text, 'x')", kind: EqualUnique, shards: "k:123s"},
-		{sql: "insert into items (id) select id from orders where tenant_id = 1", kind: Refuse, msg: "cross-shard join"},
+		{sql: "insert into items (id) select id from orders where tenant_id = 1", kind: Refuse, msg: "a statement including an unsharded table must resolve to the home shard alone"},
 
 		// UPDATE and DELETE rules.
 		{sql: "update orders set status = 'x' where tenant_id = 1", kind: EqualUnique, shards: "k:1"},
@@ -269,7 +269,7 @@ func golden() []want {
 		{sql: "update orders o set status = 'x' from order_lines l where o.tenant_id = 1 and l.tenant_id = 1", kind: EqualUnique, shards: "k:1"},
 		{sql: "update orders o set status = 'x' from order_lines l where o.tenant_id = 1 and l.tenant_id = 2", kind: Refuse, msg: "cross-shard join"},
 		{sql: "update orders o set status = 'x' from order_lines l where o.tenant_id = l.tenant_id and l.tenant_id = 7", kind: EqualUnique, shards: "k:7"},
-		{sql: "update orders o set status = 'x' from items i where o.tenant_id = 1 and i.id = o.item", kind: Refuse, msg: "cross-shard join"},
+		{sql: "update orders o set status = 'x' from items i where o.tenant_id = 1 and i.id = o.item", kind: Refuse, msg: "a statement including an unsharded table must resolve to the home shard alone"},
 		{sql: "update docs set body = 'y' where slug = 'acme'", kind: EqualUnique, shards: "k:acme"},
 		{sql: "update docs set slug = 'other' where slug = 'acme'", kind: Refuse, msg: "shard key is immutable"},
 		{sql: "delete from orders where tenant_id = 1", kind: EqualUnique, shards: "k:1"},
@@ -307,13 +307,13 @@ func golden() []want {
 		{sql: "select * from orders order by id limit 10", kind: Scatter, shards: "all"},
 		{sql: "select row_number() over () from orders", kind: Refuse, msg: "multi-shard SELECT with window functions is not available yet"},
 		{sql: "select * from orders for update", kind: Refuse, msg: "multi-shard SELECT with FOR UPDATE/SHARE is not available yet"},
-		{sql: "select * from orders union all select * from order_lines", kind: Refuse, msg: "cross-shard join"},
-		{sql: "select * from orders where tenant_id = 1 union all select * from orders", kind: Refuse, msg: "cross-shard join"},
+		{sql: "select * from orders union all select * from order_lines", kind: Refuse, msg: "multi-shard SELECT with set operations"},
+		{sql: "select * from orders where tenant_id = 1 union all select * from orders", kind: Refuse, msg: "multi-shard SELECT with set operations"},
 		{sql: "select * from orders where tenant_id = 1 union select * from orders where tenant_id = 2", kind: Refuse, msg: "cross-shard join"},
 		{sql: "with c as (select * from orders) select * from c", kind: Refuse, msg: "multi-shard SELECT with common table expressions is not available yet"},
-		{sql: "select (select count(*) from order_lines) from orders", kind: Refuse, msg: "cross-shard join"},
+		{sql: "select (select count(*) from order_lines) from orders", kind: Refuse, msg: "multi-shard SELECT with subqueries"},
 		{sql: "select * from (select * from orders) s", kind: Refuse, msg: "multi-shard SELECT with subqueries is not available yet"},
-		{sql: "select * from orders where id in (select order_id from order_lines)", kind: Refuse, msg: "cross-shard join"},
+		{sql: "select * from orders where id in (select order_id from order_lines)", kind: Refuse, msg: "multi-shard SELECT with subqueries"},
 		{sql: "select * from orders o cross join generate_series(1, 3) g", kind: Refuse, msg: "multi-shard SELECT with joins, function scans is not available yet"},
 
 		// Joins.
@@ -334,15 +334,15 @@ func golden() []want {
 		{sql: "select * from orders o join docs d on o.id = d.id where o.tenant_id = 1 and d.slug = 'acme'", kind: Refuse, msg: "cross-shard join"},
 		{sql: "select * from orders o join docs d on o.id = d.id where o.tenant_id = 2 and d.slug = 'a'", kind: EqualUnique, shards: "k:2"},
 		{sql: "select * from orders o join regions r on o.region = r.id where o.tenant_id = 1", kind: EqualUnique, shards: "k:1"},
-		{sql: "select * from orders o join items i on o.item = i.id where o.tenant_id = 1", kind: Refuse, msg: "cross-shard join"},
+		{sql: "select * from orders o join items i on o.item = i.id where o.tenant_id = 1", kind: Refuse, msg: "a statement including an unsharded table must resolve to the home shard alone"},
 		{sql: "select * from orders o join items i on o.item = i.id where o.tenant_id = 2", kind: EqualUnique, shards: "0"},
 		{sql: "select * from orders o join items i on o.item = i.id where o.tenant_id in (2, 3)", kind: In, shards: "0"},
-		{sql: "select * from orders o join items i on o.item = i.id where o.tenant_id in (1, 2)", kind: Refuse, msg: "cross-shard join"},
+		{sql: "select * from orders o join items i on o.item = i.id where o.tenant_id in (1, 2)", kind: Refuse, msg: "a statement including an unsharded table must resolve to the home shard alone"},
 		{sql: "select * from orders o join order_lines l on o.tenant_id = l.tenant_id where o.tenant_id in (1, 2)", kind: In, shards: "k:1,k:2"},
 		{sql: "select * from orders o join order_lines l on o.tenant_id = l.tenant_id where o.tenant_id in (1, 2) and l.tenant_id in (2, 1)", kind: In, shards: "k:1,k:2"},
 		{sql: "select * from orders o join order_lines l on o.tenant_id = l.tenant_id where o.tenant_id in (1, 2) and l.tenant_id in (1, 7)", kind: Refuse, msg: "cross-shard join"},
 		{sql: "select * from orders o join order_lines l on o.tenant_id = l.tenant_id where o.tenant_id = 1 and l.tenant_id = 2", kind: Refuse, msg: "cross-shard join"},
-		{sql: "select * from orders o join order_lines l on o.tenant_id = l.tenant_id join items i on i.id = o.item where o.tenant_id = 1", kind: Refuse, msg: "cross-shard join"},
+		{sql: "select * from orders o join order_lines l on o.tenant_id = l.tenant_id join items i on i.id = o.item where o.tenant_id = 1", kind: Refuse, msg: "a statement including an unsharded table must resolve to the home shard alone"},
 		{sql: "select * from orders o left join order_lines l on o.tenant_id = l.tenant_id where o.tenant_id = 1", kind: EqualUnique, shards: "k:1"},
 		{sql: "select * from orders o join order_lines l on o.tenant_id = l.tenant_id where o.tenant_id = 1 order by o.id limit 3", kind: EqualUnique, shards: "k:1"},
 

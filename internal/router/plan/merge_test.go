@@ -160,16 +160,20 @@ func TestMergeSpecRefusals(t *testing.T) {
 		{"select row_number() over (order by id) from orders", "multi-shard SELECT with window functions"},
 		{"select * from orders for share", "multi-shard SELECT with FOR UPDATE/SHARE"},
 		{"select * into tmp from orders", "multi-shard SELECT with SELECT INTO"},
-		{"select * from orders union all select * from orders", "cross-shard join is not available yet"},
 		{"select * from orders where tenant_id in (select 1)", "multi-shard SELECT with subqueries"},
-		// Still cross-shard, for the three reasons a colocated join is not:
-		// a sharded pair that is not joined on the key, an unsharded table
-		// (home shard only), and a reference table PRESERVED by an outer
-		// join, whose unmatched rows every shard would emit.
+		// Each reason a colocated plan is impossible says which one it is.
+		// They used to share the join message, so a statement with no join
+		// in it -- the set operation below is the plainest -- was told it
+		// had a cross-shard one, and the reader looked for a join that was
+		// not there.
+		{"select * from orders union all select * from orders", "multi-shard SELECT with set operations is not available yet"},
+		{"select * from orders o join items i on o.item = i.id", `unsharded table "items", which is on the home shard alone`},
+		{"select * from orders where tenant_id in (select tenant_id from items)", `unsharded table "items", which is on the home shard alone`},
+		{"select * from regions r left join orders o on o.region = r.id", "an outer join that preserves the rows of a reference table"},
+		{"select * from orders o full join regions r on o.region = r.id", "an outer join that preserves the rows of a reference table"},
+		// A sharded pair joined on something that is not the shard key is
+		// the one shape the original sentence was ever true of.
 		{"select * from orders o join order_lines l on o.id = l.order_id", "cross-shard join is not available yet"},
-		{"select * from orders o join items i on o.item = i.id", "cross-shard join is not available yet"},
-		{"select * from regions r left join orders o on o.region = r.id", "cross-shard join is not available yet"},
-		{"select * from orders o full join regions r on o.region = r.id", "cross-shard join is not available yet"},
 		{"explain select * from orders", "only a plain SELECT can run on multiple shards"},
 		{"declare c cursor for select * from orders", "only a plain SELECT can run on multiple shards"},
 	}

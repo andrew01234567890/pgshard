@@ -1345,6 +1345,13 @@ func (w *walker) colocatedKey() (string, bool) {
 
 // crossShardJoinError is why a statement cannot run per shard.
 //
+// Every reason colocatedKey has for saying no ends up here, and most of
+// them are not a join. Reporting them all as one made the message describe
+// neither the statement nor the cause: a reader looks for a join and there
+// is none to find. So each shape names itself, in the order colocatedKey
+// rejects them, and only a genuine mismatch between shard keys keeps the
+// original wording.
+//
 // "Not colocated" and "not yet decidable" are different answers and the
 // caller can only tell them apart here. A join of two sharded tables on
 // their shard key IS colocated, but only if the keys have the same type,
@@ -1352,15 +1359,49 @@ func (w *walker) colocatedKey() (string, bool) {
 // that -- so it refuses, correctly, and must not tell the user to do the
 // thing they have already done.
 func (w *walker) crossShardJoinError() error {
-	var unverified string
+	// A top-level set operation has no outermost SELECT: both arms are
+	// walked as nested statements, so nothing recorded the shape a merge
+	// would be built from, and the arms' relations are unrelated by
+	// construction, which is the other reason colocatedKey says no. Neither
+	// is a join, and the statement need not contain one -- "select * from
+	// orders union all select * from orders" has none and was told it had a
+	// cross-shard one. buildMerge writes the sentence because it writes
+	// every other blocker's, and it returns before it can reach the nil
+	// SELECT.
+	if w.outer == nil {
+		blockers := w.scatterBlockers
+		if !contains(blockers, "set operations") {
+			blockers = append(blockers, "set operations")
+		}
+		_, err := buildMerge(w.tree, nil, "", blockers)
+		return err
+	}
+	if w.refPreserved {
+		return notYet("an outer join that preserves the rows of a reference table is not available yet",
+			"put the reference table on the null-supplying side, or join it inner")
+	}
+	var unverified, unsharded string
 	var sharded []*rel
 	for _, r := range w.rels {
-		if r.kind == placeSharded {
+		switch r.kind {
+		case placeSharded:
 			sharded = append(sharded, r)
 			if !r.shardKeyChecked {
 				unverified = r.name
 			}
+		case placeReference:
+		default:
+			if unsharded == "" {
+				unsharded = r.name
+			}
 		}
+	}
+	// Not necessarily a join: an unsharded relation reaches here from a
+	// subquery too, so the sentence says where the table is rather than
+	// what the statement did with it.
+	if unsharded != "" {
+		return notYet("a multi-shard statement cannot include unsharded table \""+unsharded+"\", which is on the home shard alone",
+			"declare it a reference table to have a copy on every shard, or filter the sharded table to one shard key value")
 	}
 	if len(sharded) > 1 && unverified != "" {
 		same := true
@@ -1371,6 +1412,16 @@ func (w *walker) crossShardJoinError() error {
 			return notYet("a join of sharded tables cannot be planned until the shard key type of \""+unverified+"\" has been inspected",
 				"the controller records what type each shard key has; retry once it has run")
 		}
+	}
+	// Two sharded relations that do not share a shard key. That is a
+	// cross-shard join when a join is what put them together -- and a
+	// subquery does it too: "select * from orders where id in (select
+	// order_id from order_lines)" contains no join and was told it had one.
+	// Where the walk recorded no join and did record something else, that
+	// something else is the answer.
+	if len(w.scatterBlockers) > 0 && !contains(w.scatterBlockers, "joins") {
+		_, err := buildMerge(w.tree, nil, "", w.scatterBlockers)
+		return err
 	}
 	return notYet("cross-shard join is not available yet",
 		"join sharded tables on equal shard keys and filter on one key value")
