@@ -943,90 +943,15 @@ func TestOperatorProvisionsCatalogAndShard(t *testing.T) {
 		})
 	})
 
-	t.Run("StorageClassChangeRebuildsMembersOneByOne", func(t *testing.T) {
-		alt := `
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: pgshard-e2e-alt
-provisioner: rancher.io/local-path
-volumeBindingMode: WaitForFirstConsumer
-reclaimPolicy: Delete
-`
-		if err := c.Apply(ctx, alt); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = c.Delete(context.Background(), alt) })
-		rows, err := psql(ctx, c, rw, "SELECT count(*) FROM ha_writes")
-		if err != nil {
-			t.Fatal(err)
-		}
-		oldEpoch := epochOf()
-		patchCluster(`{"spec":{"storage":{"storageClassName":"pgshard-e2e-alt"}}}`)
-		pvcs := func() (string, error) {
-			return c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pvc", "-l", "pgshard.io/cluster="+clusterName+",pgshard.io/group=shard-0", "-o",
-				`jsonpath={range .items[*]}{.metadata.name}:{.spec.storageClassName}{" "}{end}`)
-		}
-		// The class each claim is on, every minute and at the deadline.
-		// One claim moved and two not is a rebuild working through the
-		// members slowly; none moved after twenty-five minutes is a
-		// rebuild that never started, and only this tells them apart.
-		classWhy := func() string {
-			out, err := pvcs()
-			if err != nil {
-				return "claims unreadable: " + err.Error()
-			}
-			return strings.TrimSpace(out) + " rolloutIdle=" + strconv.FormatBool(rolloutIdle())
-		}
-		waitForWhy(ctx, t, "every shard member to move onto the new class", 25*time.Minute, classWhy, func() bool {
-			out, err := pvcs()
-			if err != nil {
-				return false
-			}
-			fields := strings.Fields(out)
-			if len(fields) != 3 {
-				return false
-			}
-			for _, f := range fields {
-				if !strings.HasSuffix(f, "-v2:pgshard-e2e-alt") {
-					return false
-				}
-			}
-			return rolloutIdle()
-		})
-		out, _ := pvcs()
-		t.Logf("shard claims after the rebuild: %s; epoch %d -> %d", out, oldEpoch, epochOf())
-		if got := epochOf(); got != oldEpoch+1 {
-			t.Errorf("rebuilding the primary needs exactly one switchover: epoch %d -> %d", oldEpoch, got)
-		}
-		for i := 0; i < 3; i++ {
-			pod := fmt.Sprintf("%s-%d", group, i)
-			waitFor(ctx, t, pod+" to exist and be Ready after the rebuild", 5*time.Minute, func() bool {
-				out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pod", pod, "-o", `jsonpath={.status.conditions[?(@.type=="Ready")].status}`)
-				return err == nil && strings.TrimSpace(out) == "True"
-			})
-			if got := jsonpath(ctx, t, c, "pod", pod, "{.spec.volumes[0].persistentVolumeClaim.claimName}"); got != pod+"-v2" {
-				t.Errorf("pod %s mounts %q", pod, got)
-			}
-		}
-		if got := jsonpath(ctx, t, c, "pgshardgroup", group, "{.status.members[*].pvc}"); got != group+"-0-v2 "+group+"-1-v2 "+group+"-2-v2" {
-			t.Errorf("group status claims: %q", got)
-		}
-		if after, err := psqlRetry(ctx, c, rw, "SELECT count(*) FROM ha_writes", 2*time.Minute); err != nil || after != rows {
-			t.Errorf("data after the rebuild: %q (before %q) %v", after, rows, err)
-		}
-		if out, err := psqlRetry(ctx, c, ro, "SELECT count(*) FROM ha_writes", 2*time.Minute); err != nil || out != rows {
-			t.Errorf("standby data after the rebuild: %q (before %q) %v", out, rows, err)
-		}
-		if n := count(ctx, t, c, "pvc", "pgshard.io/cluster="+clusterName+",pgshard.io/group=catalog"); n != 3 {
-			t.Errorf("catalog claims untouched: got %d", n)
-		}
-	})
-
-	// Last, because it is the one operation here that does not end where it
-	// started. It also has to go up before it can come down:
-	// replicasPerShard has an HA floor of 3, so a lowering has to start
-	// from a group that is above it.
+	// Before the storage-class change, not after it. That subtest creates
+	// pgshard-e2e-alt and deletes it in its own t.Cleanup while the cluster
+	// spec still names it, so a member created afterwards asks for a
+	// storage class that no longer exists and sits Pending for ever:
+	//
+	//	ProvisioningFailed  storageclass "pgshard-e2e-alt" not found
+	//
+	// It also has to go up before it can come down: replicasPerShard has an
+	// HA floor of 3, so a lowering has to start from a group above it.
 	t.Run("LoweringReplicasRetiresMembersWithoutLosingCommits", func(t *testing.T) {
 		shardPods := func() int {
 			return count(ctx, t, c, "pods", "pgshard.io/cluster="+clusterName+",pgshard.io/group=shard-0")
@@ -1154,7 +1079,100 @@ reclaimPolicy: Delete
 			out, err := psql(ctx, c, rw, "SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming'")
 			return err == nil && out == "2"
 		})
+
+		// Retired claims are kept by default, which is what the assertion
+		// above checks -- and they would otherwise be counted by the
+		// storage-class subtest that follows, which expects one claim per
+		// member. Deleting them here is the operator's own answer to
+		// "retain means the operator leaves them for you".
+		for _, name := range retired {
+			if _, err := c.Kubectl(ctx, nil, "-n", testNamespace, "delete", "pvc",
+				"-l", "pgshard.io/cluster="+clusterName+",pgshard.io/member="+name); err != nil {
+				t.Errorf("clearing the retained claim of %s: %v", name, err)
+			}
+		}
 	})
+
+	t.Run("StorageClassChangeRebuildsMembersOneByOne", func(t *testing.T) {
+		alt := `
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: pgshard-e2e-alt
+provisioner: rancher.io/local-path
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+`
+		if err := c.Apply(ctx, alt); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = c.Delete(context.Background(), alt) })
+		rows, err := psql(ctx, c, rw, "SELECT count(*) FROM ha_writes")
+		if err != nil {
+			t.Fatal(err)
+		}
+		oldEpoch := epochOf()
+		patchCluster(`{"spec":{"storage":{"storageClassName":"pgshard-e2e-alt"}}}`)
+		pvcs := func() (string, error) {
+			return c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pvc", "-l", "pgshard.io/cluster="+clusterName+",pgshard.io/group=shard-0", "-o",
+				`jsonpath={range .items[*]}{.metadata.name}:{.spec.storageClassName}{" "}{end}`)
+		}
+		// The class each claim is on, every minute and at the deadline.
+		// One claim moved and two not is a rebuild working through the
+		// members slowly; none moved after twenty-five minutes is a
+		// rebuild that never started, and only this tells them apart.
+		classWhy := func() string {
+			out, err := pvcs()
+			if err != nil {
+				return "claims unreadable: " + err.Error()
+			}
+			return strings.TrimSpace(out) + " rolloutIdle=" + strconv.FormatBool(rolloutIdle())
+		}
+		waitForWhy(ctx, t, "every shard member to move onto the new class", 25*time.Minute, classWhy, func() bool {
+			out, err := pvcs()
+			if err != nil {
+				return false
+			}
+			fields := strings.Fields(out)
+			if len(fields) != 3 {
+				return false
+			}
+			for _, f := range fields {
+				if !strings.HasSuffix(f, "-v2:pgshard-e2e-alt") {
+					return false
+				}
+			}
+			return rolloutIdle()
+		})
+		out, _ := pvcs()
+		t.Logf("shard claims after the rebuild: %s; epoch %d -> %d", out, oldEpoch, epochOf())
+		if got := epochOf(); got != oldEpoch+1 {
+			t.Errorf("rebuilding the primary needs exactly one switchover: epoch %d -> %d", oldEpoch, got)
+		}
+		for i := 0; i < 3; i++ {
+			pod := fmt.Sprintf("%s-%d", group, i)
+			waitFor(ctx, t, pod+" to exist and be Ready after the rebuild", 5*time.Minute, func() bool {
+				out, err := c.Kubectl(ctx, nil, "-n", testNamespace, "get", "pod", pod, "-o", `jsonpath={.status.conditions[?(@.type=="Ready")].status}`)
+				return err == nil && strings.TrimSpace(out) == "True"
+			})
+			if got := jsonpath(ctx, t, c, "pod", pod, "{.spec.volumes[0].persistentVolumeClaim.claimName}"); got != pod+"-v2" {
+				t.Errorf("pod %s mounts %q", pod, got)
+			}
+		}
+		if got := jsonpath(ctx, t, c, "pgshardgroup", group, "{.status.members[*].pvc}"); got != group+"-0-v2 "+group+"-1-v2 "+group+"-2-v2" {
+			t.Errorf("group status claims: %q", got)
+		}
+		if after, err := psqlRetry(ctx, c, rw, "SELECT count(*) FROM ha_writes", 2*time.Minute); err != nil || after != rows {
+			t.Errorf("data after the rebuild: %q (before %q) %v", after, rows, err)
+		}
+		if out, err := psqlRetry(ctx, c, ro, "SELECT count(*) FROM ha_writes", 2*time.Minute); err != nil || out != rows {
+			t.Errorf("standby data after the rebuild: %q (before %q) %v", out, rows, err)
+		}
+		if n := count(ctx, t, c, "pvc", "pgshard.io/cluster="+clusterName+",pgshard.io/group=catalog"); n != 3 {
+			t.Errorf("catalog claims untouched: got %d", n)
+		}
+	})
+
 }
 
 func gatherNamespace(ctx context.Context, c *e2e.Cluster) {
