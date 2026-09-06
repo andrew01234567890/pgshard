@@ -61,7 +61,8 @@
   role so a hot role cannot starve others. When the shard budget is full of
   idle backends of other roles one is evicted. Backends retire after
   `--backend-max-lifetime` and `--backend-max-idle`.
-- **Fencing.** Every `Execute` message and every `Reserve` carries
+- **Fencing.** Every `Execute` message, every `Reserve` and every
+  change-stream call (`Stream`, `StreamChanges`, `Ack`, `CopyTables`) carries
   `Generation{shard_map_generation, primary_epoch}`. A mismatch with the
   pooler's view is refused *before* anything reaches PostgreSQL with
   SQLSTATE `55000` and message `stale routing generation` or `stale primary
@@ -100,6 +101,16 @@
   primary's PostgreSQL before the operator bumps the epoch (see
   [ha.md](ha.md)); the epoch is the fence against a stale router, and this
   probe is the fence against a stale route to a demoted member.
+  A change stream is fenced at its open **and on every pass of the receive
+  loop**, because the fence that matters for a long-lived call is the one
+  that ends it: a promotion moves the shard's epoch while the call sits in
+  `Receive`, and the router's own check runs only after a batch has been
+  delivered — one batch too late, since those commits have already reached
+  the consumer and a position has been recorded for them. `Ack` is fenced
+  because advancing a slot is a write: confirming a position on a member the
+  shard has moved off discards WAL the new primary's slot still needs.
+  `CopyTables` is fenced before it does anything, because it creates the
+  stream slot and exports a snapshot on whatever member it reaches.
 - **Cancel.** The `Cancel` RPC (or an in-stream `CancelRequest`) sends a
   PostgreSQL `CancelRequest` for the backend bound to that session over a
   fresh connection.

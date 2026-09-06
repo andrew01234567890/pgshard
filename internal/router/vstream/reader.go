@@ -197,7 +197,12 @@ func (r *reader) once(ctx context.Context) error {
 	}
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	req := &pgshardv1.StreamRequest{Stream: r.stream, Database: r.database, StartLsn: r.delivered}
+	// The same epoch this loop latched, so the pooler refuses the open the
+	// moment its own view has moved on -- and keeps refusing on every pass
+	// of its receive loop. The check below only runs once a batch has been
+	// received, which is one batch too late.
+	req := &pgshardv1.StreamRequest{Stream: r.stream, Database: r.database, StartLsn: r.delivered,
+		Generation: &pgshardv1.Generation{ShardMapGeneration: r.topo.Generation(), PrimaryEpoch: epoch}}
 	if r.twoPhase {
 		req.Options = map[string]string{"two_phase": "on"}
 	}

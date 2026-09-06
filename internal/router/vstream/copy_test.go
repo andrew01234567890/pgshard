@@ -179,12 +179,12 @@ func TestCopyPhaseStateRoundTrip(t *testing.T) {
 	if describePos(&pgshardv1.VPosition{CopyState: []*pgshardv1.VCopyState{back}}) != describePos(&pgshardv1.VPosition{CopyState: []*pgshardv1.VCopyState{st}}) {
 		t.Fatalf("round trip: %v vs %v", back, st)
 	}
-	req := p.request("s", "db", true)
+	req := p.request("s", "db", true, nil)
 	if req.GetResumeTable() != "c" || string(req.GetResumeLastpk()) != `["7","x"]` || len(req.GetDoneTables()) != 2 || req.GetBatchRows() != 500 || !req.GetTwoPhase() {
 		t.Fatalf("request: %v", req)
 	}
 	p.current.Lastpk = nil
-	if r := p.request("s", "db", false); r.GetResumeTable() != "" {
+	if r := p.request("s", "db", false, nil); r.GetResumeTable() != "" {
 		t.Fatalf("a table without a delivered key restarts from its beginning: %v", r)
 	}
 	if !p.isDone("public", "a") || p.isDone("public", "c") {

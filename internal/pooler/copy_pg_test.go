@@ -96,7 +96,7 @@ func (h *pgHarness) testCopyWideRowsChunksOnBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	st, err := h.client.CopyTables(ctx, &pgshardv1.CopyTablesRequest{Stream: "wide", BatchRows: 100, Publication: "pgshard_wide_all"})
+	st, err := h.client.CopyTables(ctx, &pgshardv1.CopyTablesRequest{Stream: "wide", BatchRows: 100, Publication: "pgshard_wide_all", Generation: gen(3, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,13 +144,13 @@ func (h *pgHarness) testCopyTables(t *testing.T) {
 		}
 	})
 
-	if st, err := h.client.CopyTables(ctx, &pgshardv1.CopyTablesRequest{Stream: "bad name"}); err == nil {
+	if st, err := h.client.CopyTables(ctx, &pgshardv1.CopyTablesRequest{Stream: "bad name", Generation: gen(3, 1)}); err == nil {
 		if _, err := st.Recv(); err == nil {
 			t.Fatal("invalid stream name accepted")
 		}
 	}
 
-	st, err := h.client.CopyTables(ctx, &pgshardv1.CopyTablesRequest{Stream: "copyt", BatchRows: 10})
+	st, err := h.client.CopyTables(ctx, &pgshardv1.CopyTablesRequest{Stream: "copyt", BatchRows: 10, Generation: gen(3, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +186,7 @@ func (h *pgHarness) testCopyTables(t *testing.T) {
 		t.Fatal(err)
 	}
 	sctx, cancel := context.WithCancel(ctx)
-	st, err = h.client.CopyTables(sctx, &pgshardv1.CopyTablesRequest{Stream: "copyt", BatchRows: 4})
+	st, err = h.client.CopyTables(sctx, &pgshardv1.CopyTablesRequest{Stream: "copyt", BatchRows: 4, Generation: gen(3, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,8 @@ func (h *pgHarness) testCopyTables(t *testing.T) {
 		t.Fatalf("partial: %v %v", partial.snapshot, partial.rows["public.citems"])
 	}
 	st, err = h.client.CopyTables(ctx, &pgshardv1.CopyTablesRequest{Stream: "copyt", BatchRows: 4, ResumeSchema: "public", ResumeTable: "citems",
-		ResumeLastpk: partial.batches["public.citems"][2], DoneTables: []string{"public.items", "public.secret_t", "public.nopk"}})
+		ResumeLastpk: partial.batches["public.citems"][2], DoneTables: []string{"public.items", "public.secret_t", "public.nopk"},
+		Generation: gen(3, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +216,8 @@ func (h *pgHarness) testCopyTables(t *testing.T) {
 	// checkpoint the caller kept -- the copy is at-least-once, so repeating
 	// rows is within the contract and losing one is not.
 	st, err = h.client.CopyTables(ctx, &pgshardv1.CopyTablesRequest{Stream: "copyt", BatchRows: 100, ResumeSchema: "public", ResumeTable: "nopk",
-		ResumeLastpk: []byte(`["(0,3)"]`), DoneTables: []string{"public.citems", "public.items", "public.pairs", "public.secret_t"}})
+		ResumeLastpk: []byte(`["(0,3)"]`), DoneTables: []string{"public.citems", "public.items", "public.pairs", "public.secret_t"},
+		Generation: gen(3, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}

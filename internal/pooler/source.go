@@ -191,6 +191,27 @@ func member(v View) *pgshardv1.Error {
 		Reason:  pgshardv1.Reason_REASON_STALE_GENERATION}
 }
 
+// streamFence is the whole fence for one change-stream RPC: the member is
+// the primary, the view is fresh, and the request's generation and epoch are
+// the ones this pooler serves.
+//
+// The three stream RPCs carried no generation and checked nothing, while
+// docs/pooler.md said "Every Execute message and every Reserve carries
+// Generation". A change stream is long-lived and its slot lives on the
+// primary, so an unfenced one lets a demoted-but-running primary keep
+// delivering commits that exist only on the old timeline -- and the
+// consumer records a position for them. CopyTables was worse: it creates
+// the stream slot and exports a snapshot on whatever member it reaches.
+func streamFence(v View, g *pgshardv1.Generation) *pgshardv1.Error {
+	if e := member(v); e != nil {
+		return e
+	}
+	if e := serving(v); e != nil {
+		return e
+	}
+	return fence(v, g)
+}
+
 // fence checks a request's generation against the view; nil means admitted.
 func fence(v View, g *pgshardv1.Generation) *pgshardv1.Error {
 	if g == nil {

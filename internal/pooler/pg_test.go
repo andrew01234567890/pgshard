@@ -218,6 +218,7 @@ func runPGSuite(t *testing.T, image string) {
 	t.Run("copy_tables", h.testCopyTables)
 	t.Run("copy_wide_rows_chunk_on_bytes", h.testCopyWideRowsChunksOnBytes)
 	t.Run("change_stream", h.testStream)
+	t.Run("a_stream_ends_when_the_view_moves_under_it", h.testStreamEndsOnEpochChange)
 	t.Run("drain_lets_txn_commit", h.testDrain)
 }
 

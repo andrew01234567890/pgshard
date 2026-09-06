@@ -48,8 +48,9 @@ func (p *copyPhase) state(sh router.Shard) *pgshardv1.VCopyState {
 }
 
 // request builds the pooler request that continues the copy from the phase.
-func (p *copyPhase) request(stream, database string, twoPhase bool) *pgshardv1.CopyTablesRequest {
-	req := &pgshardv1.CopyTablesRequest{Stream: stream, Database: database, TwoPhase: twoPhase, BatchRows: p.batch, DoneTables: append([]string(nil), p.done...)}
+func (p *copyPhase) request(stream, database string, twoPhase bool, g *pgshardv1.Generation) *pgshardv1.CopyTablesRequest {
+	req := &pgshardv1.CopyTablesRequest{Stream: stream, Database: database, TwoPhase: twoPhase, BatchRows: p.batch,
+		DoneTables: append([]string(nil), p.done...), Generation: g}
 	if p.current != nil && len(p.current.Lastpk) > 0 {
 		req.ResumeSchema, req.ResumeTable, req.ResumeLastpk = p.current.Schema, p.current.Table, p.current.Lastpk
 	}
@@ -74,7 +75,10 @@ func (r *reader) copyOnce(ctx context.Context) error {
 	}
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	stream, err := client.CopyTables(sctx, r.copy.request(r.stream, r.database, r.twoPhase))
+	// A copy creates the stream slot and exports a snapshot on it, so it
+	// carries the same fence an Execute does.
+	g := &pgshardv1.Generation{ShardMapGeneration: r.topo.Generation(), PrimaryEpoch: r.topo.Epoch(r.shard)}
+	stream, err := client.CopyTables(sctx, r.copy.request(r.stream, r.database, r.twoPhase, g))
 	if err != nil {
 		return err
 	}
