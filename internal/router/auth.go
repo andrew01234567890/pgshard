@@ -167,6 +167,17 @@ func (c *RoleCache) ConnectionLimit(user string) (int32, bool) {
 	return cred.ConnectionLimit, true
 }
 
+// MayUseCatalog reports whether user holds a control-plane role, from the
+// cache the authentication populated. An unloaded cache answers false: a
+// privilege it cannot confirm is not one it may grant.
+func (c *RoleCache) MayUseCatalog(user string) bool {
+	cur := c.cur.Load()
+	if cur == nil {
+		return false
+	}
+	return cur.roles.MayUseCatalog(user)
+}
+
 // Refresh reloads the roles from the catalog.
 func (c *RoleCache) Refresh(ctx context.Context) error {
 	c.mu.Lock()

@@ -206,7 +206,7 @@ func LoadRoles(ctx context.Context, q catalog.Querier) (*Roles, error) {
 		return nil, fmt.Errorf("snapshot: roles: %w", err)
 	}
 	defer rows.Close()
-	r := &Roles{verifiers: map[string]RoleCred{}}
+	r := &Roles{verifiers: map[string]RoleCred{}, catalogAccess: map[string]bool{}}
 	for rows.Next() {
 		var name string
 		var cred RoleCred
@@ -215,7 +215,31 @@ func LoadRoles(ctx context.Context, q catalog.Querier) (*Roles, error) {
 		}
 		r.verifiers[name] = cred
 	}
-	return r, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Who may open a session on the catalog database is asked of the
+	// catalog server rather than read from pgshard.role_members, because
+	// the server's answer is the one that matters and it is the only
+	// complete one: pg_has_role is transitive, it is true for a superuser,
+	// and the bootstrap credential a new cluster is first used with is a
+	// superuser that no GRANT in the desired state ever mentions. The join
+	// keeps a role queued in the catalog but not yet materialized on this
+	// group from erroring the whole load.
+	access, err := q.Query(ctx, `SELECT r.rolname FROM pgshard.roles r JOIN pg_roles pr ON pr.rolname = r.rolname
+		WHERE pg_has_role(pr.oid, 'pgshard_admin'::regrole, 'USAGE') OR pg_has_role(pr.oid, 'pgshard_reader'::regrole, 'USAGE')`)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot: catalog access: %w", err)
+	}
+	defer access.Close()
+	for access.Next() {
+		var name string
+		if err := access.Scan(&name); err != nil {
+			return nil, err
+		}
+		r.catalogAccess[name] = true
+	}
+	return r, access.Err()
 }
 
 // shardKeyChecked reports that a verdict was recorded for the generation
