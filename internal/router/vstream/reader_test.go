@@ -70,3 +70,26 @@ func TestAReaderConflictIsReadFromItsReasonNotItsWording(t *testing.T) {
 		t.Fatal("a failure with no reason and no matching text must still reach the consumer")
 	}
 }
+
+// A change stream must survive a failover, and the pooler now refuses one it
+// no longer serves. That refusal is the same event as the reader's own epoch
+// check, seen from the other end: the reader reopens against the member the
+// topology names. Reported to the consumer instead, it ends a stream for
+// exactly the event the stream is meant to ride through.
+func TestAPoolerFenceRefusalIsNotReportedToTheConsumer(t *testing.T) {
+	st := status.Newf(codes.FailedPrecondition, "stale primary epoch (55000)")
+	detailed, err := st.WithDetails(&errdetails.ErrorInfo{
+		Reason: pgshardv1.Reason_REASON_STALE_GENERATION.String(), Domain: pooler.ErrorDomain})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sh := router.Shard{Set: "default", ID: 1}
+	if ev := fatal(detailed.Err(), sh); ev != nil {
+		t.Fatalf("the consumer was told %v; the reader must reopen instead", ev)
+	}
+	// A refusal with no reason attached is still reported: only the fence
+	// is known to be worth reopening for.
+	if ev := fatal(status.Error(codes.FailedPrecondition, "something else"), sh); ev == nil {
+		t.Fatal("an unexplained refusal was swallowed")
+	}
+}

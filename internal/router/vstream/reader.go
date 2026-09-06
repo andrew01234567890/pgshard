@@ -168,6 +168,16 @@ func fatal(err error, sh router.Shard) *pgshardv1.VEvent_Error {
 			// Another reader holds the slot: the consumer reconnects, and
 			// telling it the position is gone would make it re-copy.
 			return nil
+		case pgshardv1.Reason_REASON_STALE_GENERATION.String():
+			// The pooler's own view of the shard moved: the primary was
+			// promoted, or the shard map changed, under a stream now open
+			// against the wrong member. That is errEpochChanged seen from
+			// the other end, and it is answered the same way -- reopen
+			// against the member the topology now names, after a backoff,
+			// because this router may not have reloaded yet. Reporting it
+			// would end a change stream for a failover it is meant to
+			// survive.
+			return nil
 		}
 	}
 	// A pooler from before the structured reason only carries the text.
