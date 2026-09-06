@@ -1787,7 +1787,8 @@ func castItem(item keyItem, tn *pgquerypb.TypeName) (keyItem, bool) {
 		return keyItem{}, false
 	}
 	var hint TypeHint
-	switch strings.ToLower(names[len(names)-1]) {
+	name := strings.ToLower(names[len(names)-1])
+	switch name {
 	case "int8", "int4", "int2", "bigint", "integer", "int", "smallint":
 		hint = HintInt
 	case "text", "varchar", "name":
@@ -1802,7 +1803,22 @@ func castItem(item keyItem, tn *pgquerypb.TypeName) (keyItem, bool) {
 	default:
 		return keyItem{}, false
 	}
+	// PostgreSQL evaluates the cast before the comparison or the insert, so
+	// a length the router does not apply is a value the router does not
+	// route: 'abcdef'::varchar(3) is 'abc' on the shard and hashed as
+	// 'abcdef' here, which is a different shard. A length that cannot be
+	// applied exactly is refused rather than guessed -- the statement then
+	// scatters or is refused, which is slower or louder, but never wrong.
+	limit, hasLimit, ok := castLength(name, tn.GetTypmods())
+	if !ok {
+		return keyItem{}, false
+	}
 	if item.param != 0 {
+		if hasLimit {
+			// The value arrives at Bind, and nothing carries the length
+			// that far. Refused rather than routed on the untruncated one.
+			return keyItem{}, false
+		}
 		item.hint = hint
 		return item, true
 	}
@@ -1813,7 +1829,15 @@ func castItem(item keyItem, tn *pgquerypb.TypeName) (keyItem, bool) {
 		}
 	case string:
 		if hint == HintText || hint == HintUUID {
-			item.hint = hint
+			if hasLimit {
+				// Truncated, never padded: character(n) pads to n, and
+				// both the ::text cast the shard-side row filters use and
+				// normaliseKey strip those trailing spaces again.
+				if r := []rune(x); len(r) > limit {
+					x = string(r[:limit])
+				}
+			}
+			item.value, item.hint = x, hint
 			return item, true
 		}
 		if i, err := parseInt(strings.TrimSpace(x)); err == nil {
@@ -1821,6 +1845,38 @@ func castItem(item keyItem, tn *pgquerypb.TypeName) (keyItem, bool) {
 		}
 	}
 	return keyItem{}, false
+}
+
+// castLength reads the length of a character cast. ok is false for a typmod
+// this cannot evaluate exactly, which the caller refuses rather than ignore.
+func castLength(name string, typmods []*pgquerypb.Node) (limit int, hasLimit, ok bool) {
+	if len(typmods) == 0 {
+		return 0, false, true
+	}
+	switch name {
+	case "varchar", "bpchar", "char", "character":
+	default:
+		// Every other supported type takes no length: int8 and uuid have
+		// no typmod at all, and a "text(3)" the parser accepted is not
+		// something to hash a guess for.
+		return 0, false, false
+	}
+	if len(typmods) != 1 {
+		return 0, false, false
+	}
+	c := typmods[0].GetAConst()
+	if c == nil || c.GetIsnull() {
+		return 0, false, false
+	}
+	iv, isInt := c.GetVal().(*pgquerypb.A_Const_Ival)
+	if !isInt {
+		return 0, false, false
+	}
+	n := int(iv.Ival.GetIval())
+	if n < 0 {
+		return 0, false, false
+	}
+	return n, true, true
 }
 
 // finishRead decides the plan for a SELECT after every relation was seen.

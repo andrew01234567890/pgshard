@@ -255,6 +255,15 @@ carry the right type), else a cast in the statement text; an undeclared
 text-format value that looks numeric is refused with the same hint (`$1::int8`
 or `$1::text`), never guessed.
 
+A cast that carries a **length** is applied before the value is hashed:
+PostgreSQL evaluates `'abcdef'::varchar(3)` to `abc` before the comparison,
+so hashing the untruncated string picks a shard the row is not on. Lengths on
+`varchar`, `char`, `bpchar` and `character` truncate (never pad — the `::text`
+the shard-side row filters use strips the padding again); any other length,
+and a length on a **parameter** (whose value arrives at `Bind`, where nothing
+carries it), does not route at all. The statement then scatters or is
+refused — slower or louder, never the wrong shard.
+
 **Bind-time routing.** A statement whose key is a parameter is planned at
 `Parse` as *deferred*; the shard is computed at `Bind`, when the router also
 switches the session's pooler stream to that shard. A statement prepared
