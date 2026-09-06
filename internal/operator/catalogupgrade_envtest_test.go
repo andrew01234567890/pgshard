@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -667,5 +668,74 @@ func TestNoCatalogMigrationWhileAnUpgradeIsInFlight(t *testing.T) {
 	}
 	if cond == nil || cond.Reason != "MigrationDeferred" || cond.Status != metav1.ConditionTrue {
 		t.Fatalf("catalog condition %+v", cond)
+	}
+}
+
+// failServiceUpdate makes the stable catalog endpoint Service impossible to
+// write, which is what a transient API error at that moment looks like.
+type failServiceUpdate struct {
+	client.Client
+	name string
+}
+
+func (c failServiceUpdate) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	if svc, ok := obj.(*corev1.Service); ok && svc.Name == c.name {
+		return fmt.Errorf("simulated API error updating %s", c.name)
+	}
+	return c.Client.Update(ctx, obj, opts...)
+}
+
+func (c failServiceUpdate) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	if svc, ok := obj.(*corev1.Service); ok && svc.Name == c.name {
+		return fmt.Errorf("simulated API error creating %s", c.name)
+	}
+	return c.Client.Create(ctx, obj, opts...)
+}
+
+// TestTheCutoverIsRecordedBeforeTheEndpointMoves: the cutover mutated the
+// stage, the switched-at stamp and the active generation in memory and then
+// moved the stable endpoint, returning without patching if that failed. The
+// next pass re-entered the cutover: CutoverCatalog is idempotent, but
+// SwitchedAt was stamped again, so the rollback retention window ran from
+// the retry rather than from the switch -- and until a pass succeeded,
+// status still named the catalog that had just been fenced.
+func TestTheCutoverIsRecordedBeforeTheEndpointMoves(t *testing.T) {
+	r, fp, c := setup(t, "cu-persist")
+	startCatalogUpgrade(t, r, fp, c)
+	for i := 0; i < 8 && catalogStage(t, c.Name) != CatalogUpgradeCutover; i++ {
+		reconcile(t, r, c)
+	}
+	if got := catalogStage(t, c.Name); got != CatalogUpgradeCutover {
+		t.Fatalf("stage %s, want cutover", got)
+	}
+
+	endpoint := CatalogServiceRW(c.Name)
+	r2 := &ClusterReconciler{Client: failServiceUpdate{Client: k8sClient, name: endpoint},
+		Renderer: r.Renderer, Prober: r.Prober, Agents: r.Agents,
+		FailoverDelay: r.FailoverDelay, PollInterval: r.PollInterval, QuiesceTimeout: r.QuiesceTimeout}
+	fresh := getCluster(t, c.Name)
+	if _, err := r2.reconcileCatalogUpgrade(context.Background(), fresh, CatalogDSN(fresh), "pw", nil, false); err == nil {
+		t.Fatal("the endpoint move was supposed to fail")
+	}
+
+	// The switch happened, so it must be on record even though the pass
+	// that made it did not finish.
+	cur := getCluster(t, c.Name)
+	up := cur.Status.CatalogUpgrade
+	if up == nil || up.Stage != CatalogUpgradeRetiring {
+		t.Fatalf("stage %q after a failed endpoint move; the cutover is not recorded", catalogStage(t, c.Name))
+	}
+	if up.SwitchedAt == nil {
+		t.Fatal("SwitchedAt not recorded, so the retention window would start from a retry")
+	}
+	if cur.Status.CatalogGeneration != up.Generation {
+		t.Fatalf("status still names generation %d, which has been fenced", cur.Status.CatalogGeneration)
+	}
+	first := up.SwitchedAt.DeepCopy()
+
+	// A later pass must not re-stamp it.
+	reconcile(t, r, c)
+	if again := getCluster(t, c.Name).Status.CatalogUpgrade.SwitchedAt; again == nil || !again.Equal(first) {
+		t.Fatalf("SwitchedAt moved from %v to %v on a later pass", first, again)
 	}
 }

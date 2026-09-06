@@ -202,6 +202,19 @@ func (r *ClusterReconciler) reconcileCatalogUpgrade(ctx context.Context, c *pgsh
 		c.Status.CatalogPGMajor = up.ToMajor
 		up.Stage = CatalogUpgradeRetiring
 		up.Message = ""
+		// Persisted before the endpoint is moved. Everything above is in
+		// memory: a failure below returned without patching, so the next
+		// pass re-entered the cutover -- and while CutoverCatalog itself is
+		// idempotent, SwitchedAt was stamped again, moving the rollback
+		// retention window to the retry rather than to the switch. Until
+		// then status also still named the old generation, so schema
+		// reconciliation and probes aimed through it addressed the catalog
+		// that had just been fenced. The rollback path below patches at the
+		// same point for the same reason.
+		if err := patch(); err != nil {
+			return obs, err
+		}
+		up = c.Status.CatalogUpgrade
 		if err := r.ensureCatalogEndpoint(ctx, c); err != nil {
 			return obs, err
 		}
