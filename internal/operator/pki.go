@@ -35,6 +35,11 @@ var issuedRoles = map[string]pki.Request{
 	pki.RoleController: {Server: true, Client: true},
 	pki.RoleOperator:   {Client: true},
 	pki.RoleAdmin:      {Client: true},
+	// Client only, and no DNS names: a change-stream consumer dials the
+	// router's VStream API and serves nothing. Issued so that operators
+	// have something to hand a consumer other than the router's own
+	// certificate, which is also a pooler and controller credential.
+	pki.RoleConsumer: {Client: true},
 }
 
 // issuedRoleNames is the roles in a stable order, so anything digesting

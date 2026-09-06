@@ -321,13 +321,43 @@ func TestOnlyARouterMayCallAPooler(t *testing.T) {
 	}
 }
 
-func TestTheChangeStreamHasNoRuleBecauseItsCallersHaveNoIdentity(t *testing.T) {
-	// Consumers of the change stream are outside the cluster. A rule here
-	// would refuse exactly the traffic the listener exists to serve, so
-	// its absence is deliberate and this says so out loud.
-	for _, role := range []string{RoleAdmin, "vstream", "consumer"} {
+func TestTheChangeStreamHasNoRuleYet(t *testing.T) {
+	// Consumers of the change stream are outside the cluster, and a rule
+	// here would refuse every consumer still using the material the docs
+	// used to name. Its absence is deliberate, and this says so out loud
+	// so that adding one is a decision rather than an accident.
+	for _, role := range []string{RoleAdmin, "vstream"} {
 		if _, ok := AllowedCallers(role); ok {
 			t.Fatalf("%s gained a caller rule; check that its callers carry identities", role)
+		}
+	}
+}
+
+// A change-stream credential must not be a credential for anything else.
+// The docs used to tell operators to hand consumers the ROUTER's material,
+// which satisfies the pooler's rule ({router}) and the controller's
+// ({router, operator}) -- so that consumer could call every pooler's Stream
+// and CopyTables directly, and the controller's CancelWorkflow. A consumer
+// identity appears in no list, and this pins that.
+func TestAConsumerMayCallNothingButTheChangeStream(t *testing.T) {
+	consumer := Identity{Namespace: "ns", Cluster: "demo", Role: RoleConsumer}
+	for _, listener := range []string{RolePooler, RoleAgent, RoleController, RoleRouter} {
+		allow, ok := AllowedCallers(listener)
+		if !ok {
+			t.Fatalf("%s has no rule", listener)
+		}
+		if allow(consumer) {
+			t.Errorf("a change-stream consumer may call the %s listener", listener)
+		}
+	}
+	// And the reverse, which is what made the old advice dangerous: the
+	// router's own identity is a key to those listeners, so it is not
+	// something to hand out.
+	router := Identity{Namespace: "ns", Cluster: "demo", Role: RoleRouter}
+	for _, listener := range []string{RolePooler, RoleController} {
+		allow, _ := AllowedCallers(listener)
+		if !allow(router) {
+			t.Errorf("test premise is stale: the router identity no longer opens the %s listener", listener)
 		}
 	}
 }

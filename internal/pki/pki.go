@@ -51,6 +51,14 @@ const (
 	RoleController = "controller"
 	RoleOperator   = "operator"
 	RoleAdmin      = "admin"
+	// RoleConsumer is a change-stream consumer: outside the cluster, and
+	// deliberately in no listener's caller list. A consumer needs a
+	// certificate the cluster CA signed to reach the VStream API, and the
+	// docs used to say to hand it the ROUTER's -- which also satisfies the
+	// pooler's rule ({router}) and the controller's ({router, operator}),
+	// so a consumer credential was also a credential for every pooler's
+	// Stream and CopyTables and for the controller's CancelWorkflow.
+	RoleConsumer = "consumer"
 )
 
 // URI renders the identity as it appears in a certificate.
@@ -304,8 +312,11 @@ func serialNumber() (*big.Int, error) {
 // different policy.
 //
 // The router's change-stream listener is deliberately absent. Its callers
-// are the cluster's consumers, which hold no pgshard identity, so a rule
-// there would refuse the traffic it exists to serve.
+// are the cluster's consumers, and a rule there would refuse every consumer
+// still using the material the docs used to name. What RoleConsumer buys
+// today is the other direction: a consumer identity appears in NO list
+// below, so a leaked change-stream credential is not also a credential for
+// a pooler, an agent or the controller.
 var callers = map[string][]string{
 	RolePooler:     {RoleRouter},
 	RoleAgent:      {RoleController, RoleOperator},

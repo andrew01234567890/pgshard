@@ -136,6 +136,28 @@ the cluster's controller Service. Consumers dial the router Service, which
 serves `pgshard.v1.VStream` with the router↔pooler mTLS material
 (`--pooler-tls-*`, or plaintext with `--insecure-dev`).
 
+**Give a consumer the consumer certificate, not the router's.** With
+`internalTLS.issue` the operator mints `<cluster>-tls-consumer`, a
+client-only certificate carrying the `consumer` identity and no DNS names.
+Hand that out. The router's own certificate is what the earlier version of
+this page named, and it is a key to more than the change stream: it
+satisfies the pooler listener's rule (`{router}`) and the controller's
+(`{router, operator}`), so anyone holding it can call every pooler's
+`Stream` and `CopyTables` directly, and the controller's `CancelWorkflow`,
+`PauseWorkflow`, `CreateBarrier` and `ResolveTransactions`. A `consumer`
+identity is in no listener's caller list, so a leaked one reaches nothing
+else.
+
+**What a change-stream credential grants.** The pooler reads each shard over
+a superuser replication connection and `Create` makes a `FOR ALL TABLES`
+publication, so a consumer that can open a stream on a database sees every
+row change of every table in it, whatever PostgreSQL grants that consumer's
+role would allow. Treat it as superuser read of that database. The VStream
+listener does not yet enforce the `consumer` identity — it accepts any
+certificate the cluster CA signed, so that consumers on the old advice keep
+working — and `pgshard.streams` does not record who created or is reading a
+stream.
+
 ### What `pgshard.v1` does and does not promise
 
 The wire contract is `pgshard.v1.VStream`, and a consumer reaches it the way
