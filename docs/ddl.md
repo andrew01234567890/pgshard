@@ -193,7 +193,13 @@ client ──DDL──▶ router ──INSERT queued──▶ pgshard.migrations
   catalog, one at a time; a migration retrying against a long lock delays
   the ones behind it.
 * **Singleton.** Only the controller leader applies; a second controller
-  waits for the leader lock.
+  waits for the leader lock. Leadership is read between passes, so every
+  write also carries the leadership *term* the pass began under, and a term
+  rises each time the lock is taken: a leader that lost the lock part-way
+  through a pass stops at its next write instead of applying the rest of the
+  statement alongside the new leader. The new leader takes the higher term
+  and drives the migration on its next pass, so a controller killed
+  mid-fanout converges as soon as one restarts.
 
 ## DEGRADED
 

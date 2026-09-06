@@ -1273,6 +1273,58 @@ func runSuite(t *testing.T, img pgImage) {
 		}
 	})
 
+	t.Run("only_the_current_leader_term_may_write_a_migration", func(t *testing.T) {
+		id, err := EnqueueMigration(ctx, conn, DDLMigration{Database: "app", Statement: "create table termed (id int)",
+			Kind: "CREATE TABLE", Strategy: "direct", Scope: "all", Meta: MigrationMeta{RunAs: "app"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		first, err := TakeLeaderTerm(ctx, conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, err := LoadMigration(ctx, conn, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.State = MigrationRunning
+		if err := SaveMigrationProgress(ctx, conn, m, first); err != nil {
+			t.Fatal(err)
+		}
+		second, err := TakeLeaderTerm(ctx, conn)
+		if err != nil || second <= first {
+			t.Fatalf("a leadership term must rise: %d then %d (%v)", first, second, err)
+		}
+		m.State = MigrationFailed
+		m.Error = "written by a controller that no longer leads"
+		if err := SaveMigrationProgress(ctx, conn, m, first); !errors.Is(err, ErrNotLeaderTerm) {
+			t.Fatalf("a write from the term that ended: %v", err)
+		}
+		if err := SaveMigrationMeta(ctx, conn, id, first, m.Meta); !errors.Is(err, ErrNotLeaderTerm) {
+			t.Fatalf("a meta write from the term that ended: %v", err)
+		}
+		refused, err := LoadMigration(ctx, conn, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if refused.State != MigrationRunning {
+			t.Fatalf("the refused write landed anyway: %s", refused.State)
+		}
+		if now, err := LeaderTerm(ctx, conn); err != nil || now != second {
+			t.Fatalf("leader term reads back as %d (%v), want %d", now, err, second)
+		}
+		// The new leader writes at once: nothing the old one left behind
+		// holds it up, which is what a controller killed mid-fanout and
+		// restarted depends on.
+		if err := SaveMigrationProgress(ctx, conn, m, second); err != nil {
+			t.Fatal(err)
+		}
+		// The subtests share one catalog and a later one counts the rows.
+		if _, err := conn.Exec(ctx, `DELETE FROM pgshard.migrations WHERE id = $1`, id); err != nil {
+			t.Fatal(err)
+		}
+	})
+
 	t.Run("rewrite_migration_round_trips_and_lists_as_pending", func(t *testing.T) {
 		rw := &RewriteChange{Schema: "public", Table: "orders", Column: "amount", NewType: "bigint",
 			Using: "amount::bigint", BatchSize: 500}
@@ -1308,7 +1360,7 @@ func runSuite(t *testing.T, img pgImage) {
 			t.Fatalf("pending rewrites: %+v", pending)
 		}
 		m.Meta.Rewrite.Columns = []string{"id", "amount"}
-		if err := SaveMigrationMeta(ctx, conn, id, m.Meta); err != nil {
+		if err := SaveMigrationMeta(ctx, conn, id, 0, m.Meta); err != nil {
 			t.Fatal(err)
 		}
 		again, err := LoadMigration(ctx, conn, id)
@@ -1316,7 +1368,7 @@ func runSuite(t *testing.T, img pgImage) {
 			t.Fatalf("meta not saved: %+v %v", again.Meta.Rewrite, err)
 		}
 		m.State = MigrationComplete
-		if err := SaveMigrationProgress(ctx, conn, m); err != nil {
+		if err := SaveMigrationProgress(ctx, conn, m, 0); err != nil {
 			t.Fatal(err)
 		}
 		pending, err = PendingRewrites(ctx, conn)
@@ -1364,7 +1416,7 @@ func runSuite(t *testing.T, img pgImage) {
 			t.Fatalf("round trip %+v", m)
 		}
 		m.State, m.PerShard = MigrationRunning, map[string]ShardMigration{"0": {State: ShardRunning, Attempts: 1, Step: 1}}
-		if err := SaveMigrationProgress(ctx, conn, m); err != nil {
+		if err := SaveMigrationProgress(ctx, conn, m, 0); err != nil {
 			t.Fatal(err)
 		}
 		if m, err = LoadMigration(ctx, conn, id); err != nil || m.PerShard["0"].Step != 1 {
@@ -1382,7 +1434,7 @@ func runSuite(t *testing.T, img pgImage) {
 		}
 		failed, _ := LoadMigration(ctx, conn, failedID)
 		failed.State, failed.Error = MigrationFailed, "boom"
-		if err := SaveMigrationProgress(ctx, conn, failed); err != nil {
+		if err := SaveMigrationProgress(ctx, conn, failed, 0); err != nil {
 			t.Fatal(err)
 		}
 		all, total, err := ListMigrations(ctx, conn, MigrationFilter{})

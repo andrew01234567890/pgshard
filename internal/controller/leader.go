@@ -27,8 +27,9 @@ type Reconciler struct {
 	RetryInterval time.Duration
 	// OnResult, when set, observes every completed pass.
 	OnResult func(Result)
-	// OnLeader, when set, observes leadership changes.
-	OnLeader func(leader bool)
+	// OnLeader, when set, observes leadership changes. term is the
+	// leadership term just taken, and 0 when leadership ends.
+	OnLeader func(leader bool, term int64)
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
 }
@@ -114,11 +115,21 @@ func (r *Reconciler) lead(ctx context.Context) error {
 	if !locked {
 		return errNotLeader
 	}
-	if r.OnLeader != nil {
-		r.OnLeader(true)
-		defer r.OnLeader(false)
+	// Taken before the first pass and only once the previous holder's
+	// connection is gone, so a bumped term is proof that the controller
+	// which held it no longer leads. The workers stamp their writes with
+	// it, which is what stops a pass that lost the lock part-way through:
+	// the in-process flag below is read between ticks, and says "leader"
+	// for the rest of a pass that is no longer one.
+	term, err := catalog.TakeLeaderTerm(ctx, conn)
+	if err != nil {
+		return err
 	}
-	logger.Info("controller is leader")
+	if r.OnLeader != nil {
+		r.OnLeader(true, term)
+		defer r.OnLeader(false, 0)
+	}
+	logger.Info("controller is leader", "term", term)
 	for _, ch := range []string{catalog.DesiredChannel, catalog.ServingChannel} {
 		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
 			return err

@@ -152,9 +152,13 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	}
 	go (&controller.MetricsPoller{Pool: pool, Metrics: cm, Logger: logger}).Run(ctx, *interval)
 
-	var leader atomic.Bool
+	// 0 means "not the leader": the term doubles as the flag, so a worker
+	// can both gate its pass on leadership and stamp its writes with the
+	// leadership it gated on.
+	var term atomic.Int64
+	leader := func() bool { return term.Load() != 0 }
 	rec := &controller.Reconciler{DSN: *catalogDSN, Logger: logger, LockKey: *lockKey, Interval: *interval, RetryInterval: *retry,
-		OnLeader: leader.Store}
+		OnLeader: func(_ bool, t int64) { term.Store(t) }}
 	go func() { _ = rec.Run(ctx) }()
 	var resolver *controller.Resolver
 	var barrier *controller.Barrier
@@ -163,23 +167,23 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		dialer := &controller.PgxShardDialer{Pool: pool, DSNs: shardDSNs, Template: *shardDSNTemplate}
 		resolver = &controller.Resolver{Pool: pool, Logger: logger, Shards: dialer, Metrics: cm}
 		streams = &controller.StreamAdmin{Pool: pool, Shards: dialer}
-		go resolver.Run(ctx, *resolveEvery, leader.Load)
+		go resolver.Run(ctx, *resolveEvery, leader)
 		barrier = &controller.Barrier{Store: &controller.PGBarrierStore{Pool: pool}, Groups: &controller.SQLBarrierGroups{Pool: pool, Shards: dialer},
 			Resolver: resolver, Logger: logger, DrainTimeout: *barrierDrain, ArchiveTimeout: *barrierArchive}
 		roles := &controller.RoleVerifier{Store: &controller.PGRoleStore{Pool: pool}, Shards: dialer, Catalog: controller.CatalogDialer(pool), Logger: logger}
-		go roles.Run(ctx, *verifyRolesEvery, leader.Load)
+		go roles.Run(ctx, *verifyRolesEvery, leader)
 		keyCheck := &controller.ShardKeyCheck{Pool: pool, Shards: dialer, Logger: logger}
 		applier := &controller.Applier{Store: &controller.PGMigrationStore{Pool: pool}, Logger: logger, Shards: dialer, DDLRole: *ddlRole,
-			Catalog: controller.CatalogDialer(pool), Roles: roles, KeyCheck: keyCheck}
-		go applier.Run(ctx, *applyEvery, leader.Load)
-		go (&controller.StreamMonitor{Pool: pool, Logger: logger, Shards: dialer}).Run(ctx, *resolveEvery, leader.Load)
+			Catalog: controller.CatalogDialer(pool), Roles: roles, KeyCheck: keyCheck, Term: term.Load}
+		go applier.Run(ctx, *applyEvery, leader)
+		go (&controller.StreamMonitor{Pool: pool, Logger: logger, Shards: dialer}).Run(ctx, *resolveEvery, leader)
 		// A barrier whose controller died leaves the cluster fenced and its
 		// shards paused. This lifts the PAUSE as soon as no barrier is
 		// running; the fence stays up deliberately, because a restored
 		// cluster comes back holding one and lowering that would unfence it
 		// mid two-phase reconciliation. Barrier.Recover says the same, and
 		// this comment used to claim it lifted both.
-		go barrier.RunRecovery(ctx, *resolveEvery, leader.Load)
+		go barrier.RunRecovery(ctx, *resolveEvery, leader)
 		subTemplate := *subscriptionTemplate
 		if subTemplate == "" {
 			subTemplate = *shardDSNTemplate
@@ -212,13 +216,13 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 			LagBytes:             *copyLag, ThrottleHigh: *throttleHigh, ThrottleLow: *throttleLow, PreparedWait: *preparedWait,
 			CutoverTimeout: *cutoverTimeout, CutoverAttempts: *cutoverAttempts,
 			SlotFailoverDisabled: !*slotFailover}
-		go copier.Run(ctx, *copyEvery, leader.Load)
+		go copier.Run(ctx, *copyEvery, leader)
 		placer := &controller.Placer{Pool: pool, Shards: dialer, Logger: logger, LagBytes: *copyLag, BufferTimeout: *placementBuffer, DropOldAfter: *placementDropOld,
 			SlotFailoverDisabled: !*slotFailover}
-		go placer.Run(ctx, *placementEvery, leader.Load)
-		go (&controller.ReferenceCheck{Pool: pool, Shards: dialer, Logger: logger}).Run(ctx, *refCheckEvery, leader.Load)
-		go keyCheck.Run(ctx, *keyCheckEvery, leader.Load)
-		go (&controller.DurabilityCheck{Pool: pool, Shards: dialer, Logger: logger}).Run(ctx, *durabilityCheckEvery, leader.Load)
+		go placer.Run(ctx, *placementEvery, leader)
+		go (&controller.ReferenceCheck{Pool: pool, Shards: dialer, Logger: logger}).Run(ctx, *refCheckEvery, leader)
+		go keyCheck.Run(ctx, *keyCheckEvery, leader)
+		go (&controller.DurabilityCheck{Pool: pool, Shards: dialer, Logger: logger}).Run(ctx, *durabilityCheckEvery, leader)
 	}
 
 	if *listen == "" {
@@ -232,7 +236,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return cli.ExitNotReady
 	}
 	g := grpc.NewServer(grpc.Creds(creds))
-	pgshardv1.RegisterControllerServer(g, &controller.Server{Pool: pool, Resolver: resolver, Barrier: barrier, Streams: streams, Leader: leader.Load})
+	pgshardv1.RegisterControllerServer(g, &controller.Server{Pool: pool, Resolver: resolver, Barrier: barrier, Streams: streams, Leader: leader})
 	mode := "mTLS"
 	if *insecureDev {
 		mode = "INSECURE plaintext"

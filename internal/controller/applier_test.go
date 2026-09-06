@@ -35,6 +35,8 @@ type memStore struct {
 	failRunningSaves  int
 	ddlLocks          map[string]string
 	serving           string
+	// term is the controller leadership the catalog now records.
+	term int64
 }
 
 func (s *memStore) ServingShardSet(context.Context) (string, error) {
@@ -66,9 +68,12 @@ func (s *memStore) Pending(context.Context) ([]catalog.DDLMigration, error) {
 
 func (s *memStore) Databases(context.Context) ([]string, error) { return s.dbs, nil }
 
-func (s *memStore) SaveMeta(_ context.Context, id string, meta catalog.MigrationMeta) error {
+func (s *memStore) SaveMeta(_ context.Context, id string, term int64, meta catalog.MigrationMeta) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.heldTerm(term); err != nil {
+		return err
+	}
 	for i := range s.migrations {
 		if s.migrations[i].ID == id {
 			s.migrations[i].Meta = meta
@@ -76,6 +81,23 @@ func (s *memStore) SaveMeta(_ context.Context, id string, meta catalog.Migration
 		}
 	}
 	return fmt.Errorf("unknown migration %s", id)
+}
+
+// takeLeadership models another controller taking the leader lock, which is
+// the only way the term moves.
+func (s *memStore) takeLeadership() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.term++
+}
+
+// heldTerm is the fake's version of the catalog's leader-term predicate: a
+// write carrying a term that is no longer the current one matches nothing.
+func (s *memStore) heldTerm(term int64) error {
+	if term != 0 && term != s.term {
+		return catalog.ErrNotLeaderTerm
+	}
+	return nil
 }
 
 func cloneMigration(m catalog.DDLMigration) catalog.DDLMigration {
@@ -87,10 +109,13 @@ func cloneMigration(m catalog.DDLMigration) catalog.DDLMigration {
 	return m
 }
 
-func (s *memStore) Save(_ context.Context, m catalog.DDLMigration) error {
+func (s *memStore) Save(_ context.Context, m catalog.DDLMigration, term int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.saves++
+	if err := s.heldTerm(term); err != nil {
+		return err
+	}
 	if s.failCompleteSaves > 0 && m.State == catalog.MigrationComplete {
 		s.failCompleteSaves--
 		return errors.New("catalog unavailable")
@@ -116,22 +141,26 @@ func (s *memStore) Save(_ context.Context, m catalog.DDLMigration) error {
 
 // MirrorAndSave is the fake's version of the one transaction the real store
 // uses: either both the mirror and the row land, or neither does.
-func (s *memStore) MirrorAndSave(ctx context.Context, stmts []catalog.Statement, m catalog.DDLMigration) error {
+func (s *memStore) MirrorAndSave(ctx context.Context, stmts []catalog.Statement, m catalog.DDLMigration, term int64) error {
 	s.mu.Lock()
 	failNext := s.failCompleteSaves > 0 && m.State == catalog.MigrationComplete
 	if failNext {
 		s.failCompleteSaves--
 	}
+	termErr := s.heldTerm(term)
 	s.mu.Unlock()
 	if failNext {
 		return errors.New("catalog unavailable")
+	}
+	if termErr != nil {
+		return termErr
 	}
 	for _, st := range stmts {
 		if err := s.Exec(ctx, st.SQL, st.Args...); err != nil {
 			return err
 		}
 	}
-	return s.Save(ctx, m)
+	return s.Save(ctx, m, term)
 }
 
 func (s *memStore) Shards(context.Context, string) ([]int32, error) { return s.shards, nil }
@@ -568,12 +597,17 @@ type applierFixture struct {
 	app    *Applier
 	sleeps []time.Duration
 	clock  time.Time
+	// term is the leadership this applier believes it holds. Its in-process
+	// view is deliberately separate from the store's, which is the whole
+	// point: leadership can end without the pass noticing.
+	term int64
 }
 
 func newApplierFixture(t *testing.T) *applierFixture {
 	t.Helper()
-	f := &applierFixture{store: &memStore{shards: []int32{0, 1, 2}}, shards: newFakeShards(), clock: time.Unix(1_700_000_000, 0)}
+	f := &applierFixture{store: &memStore{shards: []int32{0, 1, 2}, term: 1}, shards: newFakeShards(), clock: time.Unix(1_700_000_000, 0), term: 1}
 	f.app = &Applier{Store: f.store, Shards: f.shards, Logger: slog.New(slog.DiscardHandler),
+		Term:    func() int64 { return f.term },
 		Backoff: Backoff{Min: 500 * time.Millisecond, Max: 4 * time.Second, Total: 30 * time.Second},
 		Sleep: func(_ context.Context, d time.Duration) error {
 			f.sleeps = append(f.sleeps, d)
@@ -615,6 +649,111 @@ func states(m catalog.DDLMigration) string {
 		parts = append(parts, fmt.Sprintf("%s=%s/%d", k, s.State, s.Attempts))
 	}
 	return strings.Join(parts, " ")
+}
+
+// A migration is driven by the controller leader. Leadership is a
+// pg_try_advisory_lock whose loss is only noticed between ticks, so the
+// in-process flag says "leader" for the rest of a pass that has already lost
+// it -- and that pass went on applying the statement shard by shard while
+// the new leader drove the same row from the start. Every write carries the
+// term the pass took, so the pass stops at its next write instead.
+func TestAPassThatLostLeadershipMidStatementStops(t *testing.T) {
+	f := newApplierFixture(t)
+	id := f.queue(catalog.DDLMigration{Statement: "create table t (id int)", Kind: "CREATE TABLE", Scope: "all"})
+	f.shards.exec = func(shard int32, sql string) error {
+		if shard == 0 && strings.HasPrefix(sql, "create table") {
+			f.store.takeLeadership()
+		}
+		return nil
+	}
+	done, err := f.app.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("leadership passing on is not a failure: %v", err)
+	}
+	if done != 0 {
+		t.Fatalf("the old pass reported %d migrations finished", done)
+	}
+	for _, shard := range []int32{1, 2} {
+		for _, sql := range f.shards.statements(shard) {
+			if strings.HasPrefix(sql, "create table") {
+				t.Fatalf("shard %d ran the statement after leadership moved: %v", shard, f.shards.statements(shard))
+			}
+		}
+	}
+	m := f.store.get(t, id)
+	if m.State != catalog.MigrationRunning {
+		t.Fatalf("the old pass wrote a final state: %s %q", m.State, m.Error)
+	}
+	if s := m.PerShard["0"].State; s != catalog.ShardRunning {
+		t.Fatalf("the old pass recorded shard 0 as %s", s)
+	}
+	// A step not run is not a step failed: a refused write is leadership
+	// moving, so it must end the pass rather than take the transient path
+	// and retry the shard until the backoff budget runs out.
+	if len(f.sleeps) != 0 {
+		t.Fatalf("the old pass retried a refused write: %v", f.sleeps)
+	}
+}
+
+// A shard step backs off and retries, and leadership can move while it
+// waits. The retry records the step as running before it runs it, so that
+// refused write is the pass's last chance to notice: taking the transient
+// path there instead would retry the shard for the whole backoff budget and
+// then mark it failed, which is a step not run reported as a step that
+// failed.
+func TestAPassThatLostLeadershipWhileAStepBacksOffDoesNotRetry(t *testing.T) {
+	f := newApplierFixture(t)
+	id := f.queue(catalog.DDLMigration{Statement: "create table t (id int)", Kind: "CREATE TABLE", Scope: "all"})
+	f.shards.exec = func(shard int32, sql string) error {
+		if shard == 0 && strings.HasPrefix(sql, "create table") {
+			return pgErr("55P03", "canceling statement due to lock timeout")
+		}
+		return nil
+	}
+	backoff := f.app.Sleep
+	f.app.Sleep = func(ctx context.Context, d time.Duration) error {
+		f.store.takeLeadership()
+		return backoff(ctx, d)
+	}
+	if done, err := f.app.RunOnce(context.Background()); err != nil || done != 0 {
+		t.Fatalf("RunOnce: %d %v", done, err)
+	}
+	if len(f.sleeps) != 1 {
+		t.Fatalf("the old pass kept retrying after leadership moved: %v", f.sleeps)
+	}
+	m := f.store.get(t, id)
+	if s := m.PerShard["0"].State; s != catalog.ShardRetrying {
+		t.Fatalf("a step that was never run is recorded as %s", s)
+	}
+	if m.State != catalog.MigrationRunning {
+		t.Fatalf("the old pass wrote a final state: %s %q", m.State, m.Error)
+	}
+}
+
+// The new leader is not held up by anything the old one left behind: it
+// takes the higher term and drives the migration on its next pass. A
+// controller killed mid-fanout and restarted is the same case, and it has to
+// converge at once rather than wait a lease out.
+func TestTheNewLeaderDrivesTheMigrationImmediately(t *testing.T) {
+	f := newApplierFixture(t)
+	id := f.queue(catalog.DDLMigration{Statement: "create table t (id int)", Kind: "CREATE TABLE", Scope: "all"})
+	f.shards.exec = func(shard int32, sql string) error {
+		if shard == 0 && strings.HasPrefix(sql, "create table") {
+			f.store.takeLeadership()
+		}
+		return nil
+	}
+	if _, err := f.app.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.shards.exec = nil
+	f.term = f.store.term
+	if done, err := f.app.RunOnce(context.Background()); err != nil || done != 1 {
+		t.Fatalf("the new leader finished %d migrations: %v", done, err)
+	}
+	if m := f.store.get(t, id); m.State != catalog.MigrationComplete || states(m) != "0=applied/2 1=applied/1 2=applied/1" {
+		t.Fatalf("%s %s", m.State, states(m))
+	}
 }
 
 func TestApplierRunsOnEveryTargetInsideATransaction(t *testing.T) {

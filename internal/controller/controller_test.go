@@ -419,7 +419,7 @@ func TestController(t *testing.T) {
 		results := make(chan Result, 16)
 		newRec := func(name string) *Reconciler {
 			return &Reconciler{DSN: dsn, Interval: time.Hour, RetryInterval: 200 * time.Millisecond,
-				OnLeader: func(l bool) { events <- event{name, l} },
+				OnLeader: func(l bool, _ int64) { events <- event{name, l} },
 				OnResult: func(r Result) {
 					if name == "a" {
 						results <- r
@@ -494,7 +494,7 @@ func TestController(t *testing.T) {
 		defer cancel()
 		go func() {
 			_ = (&Reconciler{DSN: dsn, LockKey: 4242, Interval: 200 * time.Millisecond, RetryInterval: 100 * time.Millisecond,
-				OnLeader: func(l bool) { events <- l }, OnResult: func(r Result) { passes <- r }}).Run(rctx)
+				OnLeader: func(l bool, _ int64) { events <- l }, OnResult: func(r Result) { passes <- r }}).Run(rctx)
 		}()
 		if l := <-events; !l {
 			t.Fatal("first event was not leadership")
