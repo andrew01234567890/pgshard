@@ -1795,10 +1795,16 @@ func castItem(item keyItem, tn *pgquerypb.TypeName) (keyItem, bool) {
 		hint = HintText
 	case "uuid":
 		hint = HintUUID
-	case "bpchar", "char", "character":
+	case "bpchar", "character":
 		// Routable now: the key's declared type reaches the planner, and
 		// normaliseKey trims the trailing spaces the ::text cast strips on
 		// the shard, so the operand hashes to where the row is.
+		hint = HintText
+	case "char":
+		// The QUOTED "char", which is one byte and nothing like character(n)
+		// -- unquoted char reaches here as bpchar with a typmod of 1.
+		// 'abcdef'::"char" is 'a' on the shard, and hashing the whole
+		// string put the router on another one.
 		hint = HintText
 	default:
 		return keyItem{}, false
@@ -1809,7 +1815,7 @@ func castItem(item keyItem, tn *pgquerypb.TypeName) (keyItem, bool) {
 	// 'abcdef' here, which is a different shard. A length that cannot be
 	// applied exactly is refused rather than guessed -- the statement then
 	// scatters or is refused, which is slower or louder, but never wrong.
-	limit, hasLimit, ok := castLength(name, tn.GetTypmods())
+	limit, hasLimit, byteWise, ok := castLength(name, tn.GetTypmods())
 	if !ok {
 		return keyItem{}, false
 	}
@@ -1829,11 +1835,26 @@ func castItem(item keyItem, tn *pgquerypb.TypeName) (keyItem, bool) {
 		}
 	case string:
 		if hint == HintText || hint == HintUUID {
+			// ::name truncates at 63 BYTES, and doing that exactly means
+			// not splitting a multibyte character, the way PostgreSQL's
+			// pg_mbcliplen does not. A value that cannot reach the limit
+			// needs no truncation; one that can is refused rather than
+			// guessed at.
+			if name == "name" && len(x) > nameDataLen {
+				return keyItem{}, false
+			}
 			if hasLimit {
 				// Truncated, never padded: character(n) pads to n, and
 				// both the ::text cast the shard-side row filters use and
 				// normaliseKey strip those trailing spaces again.
-				if r := []rune(x); len(r) > limit {
+				//
+				// "char" counts BYTES, character(n) and varchar(n) count
+				// characters, which is PostgreSQL's own distinction.
+				if byteWise {
+					if len(x) > limit {
+						x = x[:limit]
+					}
+				} else if r := []rune(x); len(r) > limit {
 					x = string(r[:limit])
 				}
 			}
@@ -1847,37 +1868,50 @@ func castItem(item keyItem, tn *pgquerypb.TypeName) (keyItem, bool) {
 	return keyItem{}, false
 }
 
-// castLength reads the length of a character cast. ok is false for a typmod
-// this cannot evaluate exactly, which the caller refuses rather than ignore.
-func castLength(name string, typmods []*pgquerypb.Node) (limit int, hasLimit, ok bool) {
+// castLength reads the length a cast truncates to. byteWise says the length
+// counts bytes rather than characters. ok is false for a typmod this cannot
+// evaluate exactly, which the caller refuses rather than ignore.
+func castLength(name string, typmods []*pgquerypb.Node) (limit int, hasLimit, byteWise, ok bool) {
+	// The quoted "char" carries its length in the type, not a typmod: it is
+	// one byte, always. Unquoted char is bpchar with a typmod of 1 and is
+	// handled below like any other length.
+	if name == "char" {
+		if len(typmods) != 0 {
+			return 0, false, false, false
+		}
+		return 1, true, true, true
+	}
 	if len(typmods) == 0 {
-		return 0, false, true
+		return 0, false, false, true
 	}
 	switch name {
-	case "varchar", "bpchar", "char", "character":
+	case "varchar", "bpchar", "character":
 	default:
 		// Every other supported type takes no length: int8 and uuid have
 		// no typmod at all, and a "text(3)" the parser accepted is not
 		// something to hash a guess for.
-		return 0, false, false
+		return 0, false, false, false
 	}
 	if len(typmods) != 1 {
-		return 0, false, false
+		return 0, false, false, false
 	}
 	c := typmods[0].GetAConst()
 	if c == nil || c.GetIsnull() {
-		return 0, false, false
+		return 0, false, false, false
 	}
 	iv, isInt := c.GetVal().(*pgquerypb.A_Const_Ival)
 	if !isInt {
-		return 0, false, false
+		return 0, false, false, false
 	}
 	n := int(iv.Ival.GetIval())
 	if n < 0 {
-		return 0, false, false
+		return 0, false, false, false
 	}
-	return n, true, true
+	return n, true, false, true
 }
+
+// nameDataLen is what ::name truncates at, NAMEDATALEN-1 in PostgreSQL.
+const nameDataLen = 63
 
 // finishRead decides the plan for a SELECT after every relation was seen.
 func (w *walker) finishRead() error { return w.decide(false) }

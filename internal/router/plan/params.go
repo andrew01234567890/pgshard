@@ -66,6 +66,11 @@ func (b BindParams) ShardKey(n int32, hint TypeHint, columnType string) (any, er
 // compared with, which is what PostgreSQL itself does: a parameter the
 // client left untyped takes its type from the context of the expression.
 //
+// The WIDTH matters: a binary parameter is decoded by the OID's own width,
+// so mapping an int4 column to int8 refuses the four bytes PostgreSQL sends
+// for it ("int8 parameter has 4 bytes") -- a statement the old length guess
+// routed correctly.
+//
 // Without it an undeclared BINARY value was read as an integer whenever its
 // length happened to be 2, 4 or 8 bytes -- so a four-byte text key sent in
 // binary by a client that never issued a Describe was hashed as an int32
@@ -76,8 +81,12 @@ func inferredOID(columnType string) uint32 {
 	switch base {
 	case "text", "character varying", "varchar", "name", "character", "bpchar", "char":
 		return oidText
-	case "bigint", "int8", "integer", "int4", "int", "smallint", "int2":
+	case "bigint", "int8":
 		return oidInt8
+	case "integer", "int4", "int":
+		return oidInt4
+	case "smallint", "int2":
+		return oidInt2
 	case "uuid":
 		return oidUUID
 	}

@@ -264,10 +264,13 @@ comparison uses, and `$1::text` bound to an `int8` hashes as `"7"`.
 A cast that carries a **length** is applied before the value is hashed:
 PostgreSQL evaluates `'abcdef'::varchar(3)` to `abc` before the comparison,
 so hashing the untruncated string picks a shard the row is not on. Lengths on
-`varchar`, `char`, `bpchar` and `character` truncate (never pad — the `::text`
-the shard-side row filters use strips the padding again); any other length,
-and a length on a **parameter** (whose value arrives at `Bind`, where nothing
-carries it), does not route at all. The statement then scatters or is
+`varchar`, `char`, `bpchar` and `character` truncate by character (never pad —
+the `::text` the shard-side row filters use strips the padding again); the
+quoted `"char"` is the one-byte type and truncates by byte; `::name` truncates
+at 63 bytes, and a value that could reach that is refused rather than clipped
+where PostgreSQL would not. Any other length, and a length on a **parameter**
+(whose value arrives at `Bind`, where nothing carries it), does not route at
+all. The statement then scatters or is
 refused — slower or louder, never the wrong shard.
 
 **Bind-time routing.** A statement whose key is a parameter is planned at
