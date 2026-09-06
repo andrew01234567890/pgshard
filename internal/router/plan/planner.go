@@ -1163,17 +1163,63 @@ func jsonAggConstructor(n *pgquerypb.Node) *pgquerypb.JsonAggConstructor {
 	return nil
 }
 
-var aggregateNames = map[string]bool{
-	"count": true, "sum": true, "avg": true, "min": true, "max": true, "array_agg": true, "string_agg": true,
-	"bool_and": true, "bool_or": true, "every": true, "json_agg": true, "jsonb_agg": true, "json_object_agg": true,
-	"jsonb_object_agg": true, "stddev": true, "stddev_pop": true, "stddev_samp": true, "variance": true,
-	"var_pop": true, "var_samp": true, "bit_and": true, "bit_or": true, "bit_xor": true, "xmlagg": true,
-	"percentile_cont": true, "percentile_disc": true, "mode": true, "rank": true, "dense_rank": true,
-	"row_number": true, "first_value": true, "last_value": true, "lag": true, "lead": true, "ntile": true,
-	"cume_dist": true, "percent_rank": true, "nth_value": true, "range_agg": true, "range_intersect_agg": true,
-	"any_value": true, "corr": true, "covar_pop": true, "covar_samp": true, "regr_avgx": true, "regr_avgy": true,
-	"regr_count": true, "regr_intercept": true, "regr_r2": true, "regr_slope": true, "regr_sxx": true,
-	"regr_sxy": true, "regr_syy": true,
+var (
+	aggregateNames = nameSet(builtinAggregateNames)
+	functionNames  = nameSet(builtinFunctionNames)
+)
+
+func nameSet(names string) map[string]bool {
+	set := map[string]bool{}
+	for _, n := range strings.Split(names, "\n") {
+		if n != "" {
+			set[n] = true
+		}
+	}
+	return set
+}
+
+// builtinFunc names the pg_catalog function fc calls, if it can be one.
+// A call qualified with any other schema is a user's own, whatever it is
+// named: pgshard.sum(x) is not PostgreSQL's sum.
+func builtinFunc(fc *pgquerypb.FuncCall) (string, bool) {
+	names := stringList(fc.GetFuncname())
+	if len(names) == 0 {
+		return "", false
+	}
+	if len(names) == 2 && names[0] == "pg_catalog" {
+		names = names[1:]
+	}
+	if len(names) != 1 {
+		return names[len(names)-1], false
+	}
+	return strings.ToLower(names[0]), true
+}
+
+// unknownFunction names the first function called under node that is not a
+// PostgreSQL built-in, or "" when every call is one.
+//
+// It exists because an aggregate is recognised by name. A user-defined
+// aggregate -- first(x), an extension's approx_count_distinct, anything
+// from CREATE AGGREGATE -- is a plain FuncCall with no agg flags set, so it
+// reads as a scalar function, and a scatter that concatenates its shards
+// then answers with one partial row per shard and no error at all. Nothing
+// in the parse tree separates that call from a user-defined scalar, so a
+// scatter refuses both.
+func unknownFunction(node *pgquerypb.Node) string {
+	unknown := ""
+	visit(node, func(n *pgquerypb.Node) bool {
+		fc := n.GetFuncCall()
+		if fc == nil {
+			return true
+		}
+		name, builtin := builtinFunc(fc)
+		if !builtin || (!aggregateNames[name] && !functionNames[name]) {
+			unknown = name
+			return false
+		}
+		return true
+	})
+	return unknown
 }
 
 // hasStar reports whether the expression expands to an unknown number of
@@ -1200,9 +1246,9 @@ func hasAggregate(node *pgquerypb.Node) bool {
 		if fc == nil {
 			return !found
 		}
-		names := stringList(fc.GetFuncname())
-		if fc.GetAggStar() || fc.GetAggDistinct() || fc.GetAggFilter() != nil || len(fc.GetAggOrder()) > 0 || fc.GetOver() != nil ||
-			(len(names) > 0 && aggregateNames[strings.ToLower(names[len(names)-1])]) {
+		name, builtin := builtinFunc(fc)
+		if fc.GetAggStar() || fc.GetAggDistinct() || fc.GetAggFilter() != nil || len(fc.GetAggOrder()) > 0 ||
+			fc.GetAggWithinGroup() || fc.GetOver() != nil || (builtin && aggregateNames[name]) {
 			found = true
 		}
 		return !found

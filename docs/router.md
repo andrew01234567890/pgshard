@@ -327,6 +327,13 @@ verdict, and scatters as usual.
 Refused with `0A000` (message names the reason): `avg()` and every other
 aggregate PostgreSQL ships ("multi-shard avg() is not available yet" —
 compute `sum(x)` and `count(x)`), `JSON_ARRAYAGG`/`JSON_OBJECTAGG`,
+any function that is not a PostgreSQL built-in ("multi-shard first() is not
+available yet: it is not a PostgreSQL built-in") — the router classifies a
+function by name, from the `pg_proc` of the majors it targets, and nothing
+in a parse tree separates a user-defined aggregate from a user-defined
+scalar, so it refuses both rather than concatenate one partial row per
+shard; grouping on the shard key makes every group shard-local and lifts
+the refusal,
 aggregates with `DISTINCT`/`FILTER`/`ORDER BY`/`OVER`,
 expressions around or beside an aggregate (`count(*) + 1`, `id, count(*)`),
 `GROUP BY`/`DISTINCT` without the shard key, `HAVING` without such a
