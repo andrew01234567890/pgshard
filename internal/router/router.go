@@ -136,7 +136,17 @@ func New(cfg Config) (*Router, error) {
 	}
 	cfg.Buffering = cfg.Buffering.withDefaults()
 	cfg.Scatter = cfg.Scatter.withDefaults()
-	var b [4]byte
+	// The session-id prefix has to be unique across every router process
+	// that is alive at the same time, because the pooler keys reservations,
+	// backends, Release and Cancel by session id, and a two-phase gid is
+	// derived from it. Two processes sharing a prefix have one router's
+	// Release recycling the other's pinned backend, and its PREPARE
+	// TRANSACTION failing on a duplicate gid.
+	//
+	// Four bytes made that a birthday problem over the life of a cluster
+	// whose routers restart with the HPA: n**2/2**33 for n process starts.
+	// Sixteen puts it out of reach.
+	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return nil, err
 	}

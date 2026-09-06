@@ -182,7 +182,15 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	}
 	// Explicitly what grpc-go would default to, so the limit is pgshard's
 	// and testable rather than a dependency's.
+	// The routers ping this server every 20s, including while a change
+	// stream is sitting in Recv with nothing to deliver, so that a pooler
+	// whose host has vanished shows up in seconds instead of whenever the
+	// kernel gives up on the connection. gRPC's DEFAULT enforcement would
+	// answer those pings with GOAWAY too_many_pings and tear the connection
+	// down -- it permits one every five minutes and none at all without an
+	// active stream -- so the two halves have to be set together.
 	g := grpc.NewServer(grpc.Creds(creds),
+		grpc.KeepaliveEnforcementPolicy(pooler.KeepaliveEnforcement),
 		grpc.MaxRecvMsgSize(pooler.MaxMessageBytes), grpc.MaxSendMsgSize(pooler.MaxMessageBytes))
 	srv.Register(g)
 	mode := "mTLS"
