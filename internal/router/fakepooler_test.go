@@ -739,6 +739,12 @@ func (s *fakeStream) query(ctx context.Context, sql string) (ready bool, err err
 		case <-ctx.Done():
 			return true, ctx.Err()
 		}
+	case strings.Contains(q, "wedged_scatter"):
+		// The scatter version of the case below: every participant accepts
+		// the Cancel RPC and answers nothing, so the merge has no batch to
+		// finish and no error to end on.
+		<-ctx.Done()
+		return true, ctx.Err()
 	case strings.HasPrefix(q, "select wedged()"):
 		// A backend PostgreSQL will not interrupt: the Cancel RPC is
 		// accepted, recorded and changes nothing. This is the case the

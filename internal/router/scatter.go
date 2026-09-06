@@ -481,15 +481,30 @@ func (e *Executor) scatterOnce(ctx context.Context, shards []int32, m *plan.Merg
 	stopWatch := context.AfterFunc(ctx, cancelAll)
 	defer stopWatch()
 	for _, p := range parts {
-		go p.pump(cancelAll)
+		go p.pump(ctx, cancelAll)
 	}
 	err := e.mergeScatter(parts, m, out, w, rewriting)
 	if err != nil {
 		cancelAll()
 	}
+	// Bounded, for the same reason the single-shard path bounds its drain: a
+	// participant whose pooler never answers must not hold the session, its
+	// stream, its reserved backend and its scatter slot for as long as the
+	// client stays connected. cancelAll has already asked each of them; past
+	// the grace the stream is aborted, which is what wakes a pump that is
+	// still waiting on a batch nobody is going to send. One timer for the
+	// set, not one each: the grace is how long the statement may take to
+	// stop, not how long each shard may.
+	grace := time.NewTimer(cancelGrace)
+	defer grace.Stop()
 	for _, p := range parts {
 		p.stopRows()
-		<-p.done
+		select {
+		case <-p.done:
+		case <-grace.C:
+			p.ps.abort()
+			<-p.done
+		}
 	}
 	if err == nil {
 		for _, p := range parts {
@@ -676,7 +691,11 @@ func (p *participant) drain(ctx context.Context) error {
 
 // pump reads one participant's stream to ReadyForQuery, publishing the
 // prelude, then rows, then the outcome. onError interrupts the others.
-func (p *participant) pump(onError func()) {
+// pump reads the participant's stream. ctx is the statement's, so a client
+// cancel ends the read after cancelGrace rather than waiting on a pooler
+// that may never answer -- reading with context.Background() meant the grace
+// the docs promise never applied to a scatter at all.
+func (p *participant) pump(ctx context.Context, onError func()) {
 	defer close(p.done)
 	headerSent := false
 	sendHeader := func() {
@@ -709,7 +728,7 @@ func (p *participant) pump(onError func()) {
 		}
 	}
 	for {
-		resp, err := p.ps.recv(context.Background(), nil)
+		resp, err := p.ps.recv(ctx, nil)
 		if err != nil {
 			p.err = poolerTransportError("pooler stream", err)
 			onError()
