@@ -24,6 +24,12 @@ type Cluster struct {
 	Kubeconfig string
 	Context    string
 	Artifacts  string
+
+	// gather dumps the cluster's state, armed by GatherOnFailure and run by
+	// Delete before it removes anything. Nil until armed; it runs at most
+	// once, and only for a test that has already failed.
+	gather   func()
+	gathered bool
 }
 
 // NewCluster resolves cluster access from the environment.
@@ -171,8 +177,20 @@ func (c *Cluster) Apply(ctx context.Context, manifest string) error {
 
 // Delete deletes the objects in a manifest, ignoring missing ones.
 func (c *Cluster) Delete(ctx context.Context, manifest string) error {
+	// Before anything goes: a dump taken after the objects are deleted
+	// describes the teardown, not the failure. See GatherOnFailure.
+	c.gatherBeforeTeardown()
 	_, err := c.Kubectl(ctx, []byte(manifest), "delete", "--ignore-not-found", "--wait=true", "-f", "-")
 	return err
+}
+
+// gatherBeforeTeardown runs the armed dump once, if the test has failed.
+func (c *Cluster) gatherBeforeTeardown() {
+	if c.gather == nil || c.gathered {
+		return
+	}
+	c.gathered = true
+	c.gather()
 }
 
 // WaitPodsReady blocks until all pods matching selector in namespace are Ready.
@@ -377,14 +395,33 @@ func (c *Cluster) Summary(ctx context.Context, namespace string) string {
 	return b.String()
 }
 
-// GatherOnFailure registers a cleanup that collects diagnostics when the test fails.
+// GatherOnFailure arranges for a failing test to dump the cluster's state
+// while there is still a cluster to dump.
+//
+// The cleanup below is not enough on its own and never was: t.Cleanup runs
+// LIFO, every suite calls this at the top of its test, and the teardown that
+// deletes the cluster is registered afterwards -- so the teardown always ran
+// first and the dump described an empty namespace. A real failure was
+// diagnosed with a pvcs.txt holding nothing but its header row while the
+// events showed the claims being deleted forty seconds earlier.
+//
+// So Delete is armed as well: whichever cleanup removes the cluster dumps
+// the state before removing it, whatever order the cleanups were registered
+// in. The cleanup remains for a test that never calls Delete, and the dump
+// runs at most once.
 func (c *Cluster) GatherOnFailure(t testing.TB) {
 	t.Helper()
+	c.gather = func() {
+		if !t.Failed() {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		c.MustGather(ctx, t.Name())
+	}
 	t.Cleanup(func() {
 		if t.Failed() {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
-			c.MustGather(ctx, t.Name())
+			c.gatherBeforeTeardown()
 		}
 	})
 }
