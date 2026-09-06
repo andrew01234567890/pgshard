@@ -1055,7 +1055,8 @@ func (r *ClusterReconciler) reconcileGroup(ctx context.Context, c *pgshardv1alph
 		logf.FromContext(ctx).Info("could not record the synchronous set on the lease; continuing", "group", g.Name(), "err", err)
 	}
 	if primary.ip != "" {
-		if _, err := r.Agents.SetSynchronizedStandbySlots(ctx, agentAddr(primary.ip), SynchronizedStandbySlots(g, state.primary, c.Spec.Durability.MinSyncStandbys, obs.streaming)); err != nil {
+		if _, err := r.Agents.SetSynchronizedStandbySlots(ctx, agentAddr(primary.ip), uint64(state.epoch),
+			SynchronizedStandbySlots(g, state.primary, c.Spec.Durability.MinSyncStandbys, obs.streaming)); err != nil {
 			obs.primaryErr = "set synchronized_standby_slots: " + err.Error()
 			return obs, nil
 		}

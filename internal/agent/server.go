@@ -286,9 +286,17 @@ func (s *Server) Demote(ctx context.Context, req *pgshardv1.DemoteRequest) (*pgs
 }
 
 // Every mutating RPC below fences on the epoch before it touches
-// PostgreSQL, so a controller that has been superseded cannot act on a
-// member that has moved on without it. Status and ListSlots do not fence,
-// because they read.
+// PostgreSQL. Status and ListSlots do not fence, because they read.
+//
+// What the fence is worth depends entirely on where the caller's epoch came
+// from. A caller that carries the epoch it decided on -- the controller from
+// shard_status, the operator from PgShardGroup.status -- cannot act on a
+// member that has moved on without it, which is the point. A caller that
+// asks this agent for its epoch and sends it straight back proves only that
+// it can reach the agent, and the check passes for anyone. Two of the
+// operator's wrappers still do that (Reload, and the backup RPCs, whose
+// target may be a standby whose local epoch legitimately lags the group's);
+// they are unfenced in practice and PGS-680 records it.
 
 // Rewind runs pg_rewind against req.Source, which is how a demoted primary
 // rejoins without a full copy.

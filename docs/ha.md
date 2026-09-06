@@ -222,7 +222,13 @@ first, then rebuilt as a standby.
   before the promotion, so a router that reads `shard_status.primary_epoch`
   sees the new epoch no later than the new primary.
 - Standbys' local epochs may lag the group epoch (only role changes bump them);
-  same-term RPCs to them must use their own epoch.
+  same-term RPCs to them must use their own epoch. That is why those calls are
+  **not** fenced in practice: the caller has to ask the standby what epoch to
+  send, and a check whose input comes from the agent passes for anyone who can
+  reach it. `Reload` and the backup RPCs are in that position today. Calls to
+  the **primary** carry the group epoch the operator holds
+  (`SetSynchronizedStandbySlots`), and those are fenced: an operator that lost
+  leadership mid-reconcile is refused by the epoch it was published under.
 
 ## Not yet
 
