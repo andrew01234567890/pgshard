@@ -433,7 +433,7 @@ func golden() []want {
 // staticParams serves the golden values; nil marks a NULL.
 type staticParams map[int32]any
 
-func (s staticParams) ShardKey(n int32, _ TypeHint) (any, error) {
+func (s staticParams) ShardKey(n int32, _ TypeHint, _ string) (any, error) {
 	v, ok := s[n]
 	if !ok {
 		return nil, fmt.Errorf("parameter $%d was not bound", n)

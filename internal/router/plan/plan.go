@@ -203,7 +203,10 @@ const (
 // Params supplies bind-parameter values ($1 is index 1) to Resolve.
 type Params interface {
 	// ShardKey returns the value of parameter n as an int64 or a string.
-	ShardKey(n int32, hint TypeHint) (any, error)
+	// columnType is the shard key column's declared type, which is what
+	// PostgreSQL infers an undeclared parameter's type from; it is empty
+	// when the controller has not recorded one.
+	ShardKey(n int32, hint TypeHint, columnType string) (any, error)
 }
 
 // ParamRef is a bind parameter used as a shard key.
@@ -239,7 +242,7 @@ func (p Plan) Resolve(params Params) (Plan, error) {
 	for i, t := range p.terms {
 		vals := append([]any(nil), t.values...)
 		for _, ref := range t.params {
-			v, err := params.ShardKey(ref.Number, ref.Hint)
+			v, err := params.ShardKey(ref.Number, ref.Hint, t.keyType)
 			if err != nil {
 				return refusal(fmt.Errorf("parameter $%d cannot be a shard key: %w", ref.Number, err),
 					"shard keys are int8 or text values; cast an untyped parameter ($1::int8 or $1::text)")
