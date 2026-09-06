@@ -163,6 +163,13 @@ the rest with `0A000`. See *Routing* below.
   means both proceed. The transaction-scoped forms
   (`pg_advisory_xact_lock` and friends) are allowed: the transaction is
   already pinned to one backend and PostgreSQL releases them with it.
+- **One snapshot per statement.** A statement is planned against the
+  snapshot the session holds when planning starts, and every request it
+  sends is stamped with that snapshot's generation and epoch. The watcher
+  swaps the pointer on every reload, so reading it again at send time could
+  stamp a generation the plan was never made under -- which a pooler already
+  at that generation would admit. Between statements (an out-of-band `Sync`
+  or `Close`) the live snapshot is used.
 - **Cancel grace.** A cancelled statement is drained to `ReadyForQuery` so
   the stream stays in sync, but only for 5s. The cancel is best-effort —
   it can fail, and a backend can be wedged somewhere PostgreSQL will not
