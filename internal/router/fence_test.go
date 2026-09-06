@@ -485,3 +485,41 @@ func TestAMigratingTableHoldsOnlyItsOwnWrites(t *testing.T) {
 		t.Fatalf("the held write must go through once the move published: %v", err)
 	}
 }
+
+// TestATransactionOpenedBeforeThePauseMayStillWrite: PostgreSQL reads
+// default_transaction_read_only at BEGIN, so a transaction whose backend
+// opened it before the pause can still write -- and a barrier's drain waits
+// for exactly those transactions before it takes its restore point, so
+// holding their statements holds the drain that is waiting for them. That is
+// what the txnPreFence branch is for, but holdsShard only recognised a
+// transaction that had already touched or written to the shard, so one that
+// had merely opened was refused outright with 57P03.
+func TestATransactionOpenedBeforeThePauseMayStillWrite(t *testing.T) {
+	h := newTxnHarness(t)
+	ctx := context.Background()
+	// A tenant on the session's own shard: BEGIN opens the transaction
+	// there, and the exemption is only ever about the shard the
+	// transaction is already on. A key on another shard would open a
+	// second transaction under the pause and is refused whatever this
+	// test asserts.
+	var home int64
+	for i := int64(1); i < 100 && home == 0; i++ {
+		if h.shardOf(t, i) == 0 {
+			home = i
+		}
+	}
+	if home == 0 {
+		t.Fatal("fixture has no tenant on the home shard")
+	}
+	conn := h.connect(t, h.dsn())
+	if _, err := conn.Exec(ctx, "begin"); err != nil {
+		t.Fatal(err)
+	}
+	h.fenced(true)
+	if _, err := conn.Exec(ctx, "insert into orders (tenant_id, id) values ($1, 1)", home); err != nil {
+		t.Fatalf("a transaction whose backend opened it before the pause must still be able to write: %v", err)
+	}
+	if _, err := conn.Exec(ctx, "commit"); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+}
