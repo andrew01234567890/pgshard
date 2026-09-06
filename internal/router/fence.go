@@ -231,7 +231,13 @@ func (e *Executor) holdsShard(s Shard) bool {
 	if e.tx == pgwire.TxIdle {
 		return false
 	}
-	if s == e.shard && (e.txnTouched || e.wroteHere) {
+	// txnOnBackend is the whole point: PostgreSQL read
+	// default_transaction_read_only when the backend opened this
+	// transaction, which was before the pause. A transaction that has only
+	// opened -- BEGIN and nothing else -- is in exactly that position, and
+	// requiring it to have touched or written first refused its first write
+	// outright, while the drain waiting for it to end held on.
+	if s == e.shard && (e.txnTouched || e.wroteHere || e.txnOnBackend) {
 		return true
 	}
 	return e.parked[s] != nil

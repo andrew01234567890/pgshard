@@ -833,8 +833,14 @@ the controller raises while it takes a certified barrier (see
   200ms poll) or `--buffer-window` elapses, then is refused with **`57P03`
   (cannot_connect_now) "cluster write pause for a certified restore point"**.
   Nothing of it reaches a shard. Reads pass.
-- Later statements of a transaction that already wrote before the fence are
-  not held, so open transactions finish; a single-shard COMMIT is never held.
+- Later statements of a transaction whose backend opened it before the fence
+  are not held **on that shard**, so open transactions finish; a single-shard
+  COMMIT is never held. PostgreSQL read `default_transaction_read_only` when
+  the backend opened the transaction, so it may still write, and the drain
+  the barrier is running is waiting for exactly these transactions to end --
+  holding their statements would hold the drain. A shard the transaction has
+  **not** reached is refused with `57P03`: opening a transaction there now
+  would open it under the pause.
 - A two-phase COMMIT waits the same way and, if the window passes, rolls the
   transaction back with `57P03` before any participant prepares, so no
   distributed transaction straddles the barrier's restore points.
