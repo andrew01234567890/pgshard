@@ -537,12 +537,13 @@ func (b *Barrier) drainWriters(ctx context.Context, name string, groups []GroupR
 //
 // A cluster restored to a barrier comes back holding that barrier's fence --
 // owner, reason and all -- and it must stay up until two-phase
-// reconciliation finishes. What separates the two is the restore point: a run
-// reserves its row uncertified before raising the fence and certifies it just
-// before releasing, so a fence naming an uncertified row is an interrupted
-// run's, and a restored catalog's names a certified one. A run that certified
-// and then died before releasing is the narrow case this still leaves to the
-// next barrier or an operator.
+// reconciliation finishes. What separates the two is WHEN the fence was
+// written: a restore recovers to the WAL restore point the barrier made
+// before it certified anything, so a restored fence came out of the backup
+// and predates this postmaster, while an interrupted run's was written by a
+// live process while this one has been up. The restore point's own
+// certification cannot be used -- the restored catalog is rewound to before
+// the certifying write, so its row is uncertified too.
 //
 // It acts only when no run can still be in flight: the barrier lock is free
 // (so no live run holds it) and the fence has been up longer than the longest

@@ -84,14 +84,20 @@ func TestARestoredCatalogCanBeUnfenced(t *testing.T) {
 	}
 }
 
-// TestOnlyAnInterruptedRunsFenceIsClearedByRecovery: a barrier whose
+// TestOnlyAFenceWrittenOnThisServerIsClearedByRecovery: a barrier whose
 // controller died leaves a fence nothing would ever clear, and recovery has
 // to lift it. A cluster restored to a barrier comes back holding that
-// barrier's fence -- owner, reason and all -- and that one must stay up until
-// two-phase reconciliation finishes. What separates them is the restore
-// point: a run reserves its row uncertified before raising the fence and
-// certifies it just before releasing.
-func TestOnlyAnInterruptedRunsFenceIsClearedByRecovery(t *testing.T) {
+// barrier's fence -- owner, reason and all -- and that one must stay up
+// until two-phase reconciliation finishes.
+//
+// What separates them is WHEN the fence was written. A restore recovers to
+// the WAL restore point the barrier created BEFORE it certified anything, so
+// a restored fence is data that came out of a backup and predates this
+// postmaster; an interrupted run's was written by a live process while this
+// postmaster has been up. Keying on the restore point being uncertified is
+// exactly backwards -- the restored catalog is rewound to before the
+// certifying write, so its row is uncertified too.
+func TestOnlyAFenceWrittenOnThisServerIsClearedByRecovery(t *testing.T) {
 	requireDocker(t)
 	ctx := context.Background()
 	conn := connect(t, startPostgres(t, candidateImages[0]))
@@ -106,13 +112,6 @@ func TestOnlyAnInterruptedRunsFenceIsClearedByRecovery(t *testing.T) {
 			t.Fatal(err)
 		}
 		return fenced, owner
-	}
-	reserve := func(name string, certified bool) {
-		t.Helper()
-		if _, err := conn.Exec(ctx, `INSERT INTO pgshard.restore_points (id, name, shard_map_generation, certified)
-			VALUES (gen_random_uuid(), $1, 1, $2)`, name, certified); err != nil {
-			t.Fatal(err)
-		}
 	}
 
 	// Nothing raised: nothing to clear.
@@ -131,10 +130,20 @@ func TestOnlyAnInterruptedRunsFenceIsClearedByRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// What a restored cluster comes back holding: the fence of a barrier
-	// that completed, so its row is certified.
-	reserve("nightly", true)
-	if err := RaiseWriteFence(ctx, conn, "barrier nightly", "the-barrier-that-completed"); err != nil {
+	// What a RESTORED cluster comes back holding: the fence is in the data
+	// the backup carried, so it predates this postmaster -- and its restore
+	// point is UNCERTIFIED, because the recovery target is the point the
+	// barrier made before it certified anything. Both facts are set here so
+	// the test fails if the predicate ever goes back to reading the row.
+	if _, err := conn.Exec(ctx, `INSERT INTO pgshard.restore_points (id, name, shard_map_generation, certified)
+		VALUES (gen_random_uuid(), 'nightly', 1, false)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := RaiseWriteFence(ctx, conn, "barrier nightly", "the-barrier-in-the-backup"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, `UPDATE pgshard.shard_map_generation
+		SET write_fenced_at = pg_postmaster_start_time() - interval '1 hour'`); err != nil {
 		t.Fatal(err)
 	}
 	if cleared, err := ClearStaleBarrierFence(ctx, conn); err != nil || cleared {
@@ -144,9 +153,8 @@ func TestOnlyAnInterruptedRunsFenceIsClearedByRecovery(t *testing.T) {
 		t.Fatal("the restored cluster's fence was lifted under it")
 	}
 
-	// What an interrupted run leaves: the row was reserved and never
-	// certified.
-	reserve("interrupted", false)
+	// What an interrupted run leaves: written by a live process on this
+	// server, so after the postmaster started.
 	if err := RaiseWriteFence(ctx, conn, "barrier interrupted", "a-controller-that-died"); err != nil {
 		t.Fatal(err)
 	}

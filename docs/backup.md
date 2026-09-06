@@ -362,17 +362,25 @@ once its buffering window expires. `Barrier.Recover` on the next leader lifts
 both halves — the shard pauses first, then the fence — once the barrier lock
 is free and the fence is older than the longest a run can take.
 
-It lifts **only the fence of a run that never certified**. A cluster restored
-to a barrier comes back holding that barrier's fence — owner, reason and all,
+It lifts **only a fence written on this server**. A cluster restored to a
+barrier comes back holding that barrier's fence — owner, reason and all,
 because the restore point was taken while the fence was up — and that one must
 stay up until two-phase reconciliation finishes. Reason and owner cannot
-separate the two; the restore point can, because a run reserves its row
-uncertified before raising the fence (step 1) and certifies it just before
-releasing (step 5). A fence naming an uncertified row is an interrupted run's;
-one naming a certified row is a restored cluster's.
+separate the two; **when** the fence was written can. A restore recovers to
+`recovery_target_name = pgshard-<barrier>`, the WAL restore point of step 3,
+so everything the barrier wrote after it is past the recovery target: a
+restored fence is data that came out of a backup and predates this postmaster.
+An interrupted run's was written by a live process while this postmaster has
+been up.
 
-The narrow case still left to an operator is a run that certified and then
-died before step 6. `docs/runbooks/stuck-workflows.md` has the command.
+Note that the **restore point's own certification cannot be used** for this,
+and reading it the obvious way gets it backwards: the restored catalog is
+rewound to before the certifying write of step 5, so its row is uncertified
+too.
+
+A catalog primary that restarted after a barrier died also puts the fence
+before the postmaster and is then not cleared — the safe direction, and where
+this was before. `docs/runbooks/stuck-workflows.md` has the manual command.
 
 `Controller.ListBarriers` (`certified_only`) lists them newest first; the
 restore point name every group shares is `pgshard-<name>`.

@@ -35,13 +35,18 @@ type fakeBarrierStore struct {
 	// set of restore_points rows that have been certified -- what the
 	// catalog predicate joins on to tell an interrupted run's fence from
 	// the one a restored cluster comes back holding.
-	fenceName string
-	certified map[string]bool
-	reserved  []string
-	failed    map[string]string
-	journal   *[]string
-	fail      map[string]error
-	now       func() time.Time
+	// fenceName is the barrier the raised fence names; fromBackup says the
+	// fence came out of a backup rather than being written on this server,
+	// which is what the catalog predicate tests and what tells a restored
+	// cluster's fence from an interrupted run's.
+	fenceName  string
+	fromBackup bool
+	certified  map[string]bool
+	reserved   []string
+	failed     map[string]string
+	journal    *[]string
+	fail       map[string]error
+	now        func() time.Time
 }
 
 func (s *fakeBarrierStore) log(step string) {
@@ -72,15 +77,15 @@ func (s *fakeBarrierStore) Fence(_ context.Context, active bool, reason, owner s
 }
 
 // ClearStaleBarrierFence is the fake's version of the catalog predicate: a
-// fence naming a certified restore point is a restored cluster's and is left
-// alone; one naming an uncertified row is an interrupted run's.
+// fence written before this server started came out of a backup and belongs
+// to a restore; one written while it has been up is an interrupted run's.
 func (s *fakeBarrierStore) ClearStaleBarrierFence(context.Context) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.fail["clearstale"]; err != nil {
 		return false, err
 	}
-	if !s.fenced || s.owner == "" || s.certified[s.fenceName] {
+	if !s.fenced || s.owner == "" || s.fromBackup {
 		return false, nil
 	}
 	s.fenced, s.owner, s.fencedAt, s.fenceName = false, "", time.Time{}, ""
@@ -741,13 +746,18 @@ func TestBarrierRecoveryLiftsAStrandedFenceWithNoPause(t *testing.T) {
 // owner, reason and all, because the restore point was taken while the fence
 // was up -- and it must stay up until two-phase reconciliation finishes.
 // Reason and owner cannot separate it from an interrupted run's fence: both
-// say "barrier <name>". The restore point can, because a run certifies its
-// row only just before releasing the fence.
+// say "barrier <name>". WHEN it was written can: a restored fence came out
+// of the backup and predates this postmaster, an interrupted run's was
+// written by a live process while this one has been up.
+//
+// The restore point cannot, which an earlier version of this got backwards.
+// A restore recovers to the point the barrier created BEFORE it certified
+// anything, so the restored row is uncertified too.
 func TestBarrierRecoveryLeavesTheFenceARestoredClusterCameBackHolding(t *testing.T) {
 	f := newBarrierFixture()
-	f.store.fenced, f.store.owner, f.store.fencedAt = true, "the-barrier-that-completed", f.clock
+	f.store.fenced, f.store.owner, f.store.fencedAt = true, "the-barrier-in-the-backup", f.clock
 	f.store.fenceName = "nightly"
-	f.store.certified = map[string]bool{"nightly": true}
+	f.store.fromBackup = true
 	f.clock = f.clock.Add(2 * f.b.maxRunTime())
 	if err := f.b.Recover(context.Background()); err != nil {
 		t.Fatal(err)
@@ -755,8 +765,9 @@ func TestBarrierRecoveryLeavesTheFenceARestoredClusterCameBackHolding(t *testing
 	if !f.store.fenced {
 		t.Fatal("recovery unfenced a cluster that is still reconciling a restore")
 	}
-	// The same fence, with its run never certified, is an interrupted one.
-	f.store.certified = nil
+	// The same fence, written by a live process on this server, is an
+	// interrupted run's.
+	f.store.fromBackup = false
 	if err := f.b.Recover(context.Background()); err != nil {
 		t.Fatal(err)
 	}
