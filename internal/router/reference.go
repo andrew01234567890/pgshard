@@ -321,14 +321,14 @@ type injectedParams struct {
 	values []int64
 }
 
-func (p injectedParams) ShardKey(n int32, hint plan.TypeHint) (any, error) {
+func (p injectedParams) ShardKey(n int32, hint plan.TypeHint, columnType string) (any, error) {
 	if i := int(n) - 1 - p.base; i >= 0 && i < len(p.values) {
 		return p.values[i], nil
 	}
 	if p.client == nil {
 		return nil, pgwire.Errorf(pgwire.CodeInternalError, "router: parameter $%d has no value", n)
 	}
-	return p.client.ShardKey(n, hint)
+	return p.client.ShardKey(n, hint, columnType)
 }
 
 // extendOIDs pads the client's parameter types to base and appends int8 for

@@ -78,24 +78,24 @@ func TestDecodeShardKey(t *testing.T) {
 
 func TestBindParamsFormatsAndNulls(t *testing.T) {
 	b := BindParams{OIDs: []uint32{oidInt8, 0}, Formats: []int16{0, 1}, Values: [][]byte{[]byte("42"), be64(7)}}
-	if v, err := b.ShardKey(1, HintNone); err != nil || v != int64(42) {
+	if v, err := b.ShardKey(1, HintNone, ""); err != nil || v != int64(42) {
 		t.Fatalf("$1 = %v, %v", v, err)
 	}
-	if v, err := b.ShardKey(2, HintNone); err != nil || v != int64(7) {
+	if v, err := b.ShardKey(2, HintNone, ""); err != nil || v != int64(7) {
 		t.Fatalf("$2 = %v, %v", v, err)
 	}
-	if _, err := b.ShardKey(3, HintNone); err == nil {
+	if _, err := b.ShardKey(3, HintNone, ""); err == nil {
 		t.Fatal("unbound parameter must fail")
 	}
-	if _, err := b.ShardKey(0, HintNone); err == nil {
+	if _, err := b.ShardKey(0, HintNone, ""); err == nil {
 		t.Fatal("$0 must fail")
 	}
 	all := BindParams{Formats: []int16{1}, Values: [][]byte{be64(1), be64(2)}}
-	if v, err := all.ShardKey(2, HintNone); err != nil || v != int64(2) {
+	if v, err := all.ShardKey(2, HintNone, ""); err != nil || v != int64(2) {
 		t.Fatalf("single format applies to all: %v, %v", v, err)
 	}
 	null := BindParams{Values: [][]byte{nil}}
-	if _, err := null.ShardKey(1, HintNone); err == nil {
+	if _, err := null.ShardKey(1, HintNone, ""); err == nil {
 		t.Fatal("NULL shard key must fail")
 	}
 }

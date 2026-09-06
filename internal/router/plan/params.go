@@ -33,7 +33,7 @@ type BindParams struct {
 }
 
 // ShardKey implements Params.
-func (b BindParams) ShardKey(n int32, hint TypeHint) (any, error) {
+func (b BindParams) ShardKey(n int32, hint TypeHint, columnType string) (any, error) {
 	i := int(n) - 1
 	if i < 0 || i >= len(b.Values) {
 		return nil, fmt.Errorf("parameter $%d was not bound", n)
@@ -56,7 +56,32 @@ func (b BindParams) ShardKey(n int32, hint TypeHint) (any, error) {
 			format = b.Formats[i]
 		}
 	}
+	if oid == 0 || oid == oidUnknown {
+		oid = inferredOID(columnType)
+	}
 	return DecodeShardKey(oid, hint, format, raw)
+}
+
+// inferredOID types an undeclared parameter from the shard key column it is
+// compared with, which is what PostgreSQL itself does: a parameter the
+// client left untyped takes its type from the context of the expression.
+//
+// Without it an undeclared BINARY value was read as an integer whenever its
+// length happened to be 2, 4 or 8 bytes -- so a four-byte text key sent in
+// binary by a client that never issued a Describe was hashed as an int32
+// and routed to a shard the row is not on. Returns 0 for a column type the
+// router does not recognise, leaving the caller's own rules to apply.
+func inferredOID(columnType string) uint32 {
+	base, _, _ := parseCharType(columnType)
+	switch base {
+	case "text", "character varying", "varchar", "name", "character", "bpchar", "char":
+		return oidText
+	case "bigint", "int8", "integer", "int4", "int", "smallint", "int2":
+		return oidInt8
+	case "uuid":
+		return oidUUID
+	}
+	return 0
 }
 
 // ErrAmbiguousKey reports an untyped value that could be an int8 or a text

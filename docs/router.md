@@ -251,7 +251,10 @@ literal '1' is untyped and looks numeric") until it is cast. Bind parameters
 take the type the client declared at `Parse`, else the type the backend
 reported in `ParameterDescription` for that statement (drivers that
 prepare-and-describe, such as pgx's default mode and JDBC, therefore always
-carry the right type), else a cast in the statement text; an undeclared
+carry the right type), else a cast in the statement text, else the **shard
+key column's own recorded type** — which is what PostgreSQL infers from, and
+what stops an undeclared *binary* value being read as an integer merely
+because it is 2, 4 or 8 bytes long; an undeclared
 text-format value that looks numeric is refused with the same hint (`$1::int8`
 or `$1::text`), never guessed.
 
