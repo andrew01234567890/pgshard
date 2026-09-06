@@ -9,11 +9,20 @@ import (
 	"testing"
 
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
+	"github.com/andrew01234567890/pgshard/internal/placement"
 )
 
 func be64(v int64) []byte { b := make([]byte, 8); binary.BigEndian.PutUint64(b, uint64(v)); return b }
 func be32(v int32) []byte { b := make([]byte, 4); binary.BigEndian.PutUint32(b, uint32(v)); return b }
 func be16(v int16) []byte { b := make([]byte, 2); binary.BigEndian.PutUint16(b, uint16(v)); return b }
+
+func mustUUID(s string) [16]byte {
+	b, ok := placement.ParseUUID(s)
+	if !ok {
+		panic("test uuid does not parse: " + s)
+	}
+	return b
+}
 
 func TestDecodeShardKey(t *testing.T) {
 	cases := []struct {
@@ -37,7 +46,18 @@ func TestDecodeShardKey(t *testing.T) {
 		{name: "unknown oid 705 numeric is ambiguous", oid: oidUnknown, raw: []byte("123"), err: ErrAmbiguousKey},
 		{name: "unknown text numeric with int hint", oid: 0, hint: HintInt, raw: []byte("123"), want: int64(123)},
 		{name: "unknown text numeric with text hint", oid: 0, hint: HintText, raw: []byte("123"), want: "123"},
-		{name: "declared type beats hint", oid: oidText, hint: HintInt, raw: []byte("123"), want: "123"},
+		// The declared type decodes the wire value; the statement's cast is
+		// then evaluated over it, because that is the expression PostgreSQL
+		// compares. $1::int8 bound to text '123' is the INTEGER 123 there,
+		// and hashing the string put the router on another shard.
+		{name: "a cast is evaluated over the declared type", oid: oidText, hint: HintInt, raw: []byte("123"), want: int64(123)},
+		{name: "int8 parameter cast to text", oid: oidInt8, hint: HintText, raw: []byte("123"), want: "123"},
+		{name: "binary int8 parameter cast to text", oid: oidInt8, hint: HintText, format: 1, raw: be64(123), want: "123"},
+		{name: "text parameter cast to int8 that is not an integer", oid: oidText, hint: HintInt, raw: []byte("acme"), fails: true},
+		{name: "text parameter cast to uuid", oid: oidText, hint: HintUUID,
+			raw: []byte("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"), want: mustUUID("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")},
+		{name: "uuid parameter cast to text", oid: oidUUID, hint: HintText,
+			raw: []byte("A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11"), want: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"},
 		{name: "int8 binary", oid: oidInt8, format: 1, raw: be64(-99), want: int64(-99)},
 		{name: "int4 binary", oid: oidInt4, format: 1, raw: be32(5), want: int64(5)},
 		{name: "int2 binary", oid: oidInt2, format: 1, raw: be16(-2), want: int64(-2)},

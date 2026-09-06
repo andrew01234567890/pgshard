@@ -64,9 +64,20 @@ func (b BindParams) ShardKey(n int32, hint TypeHint) (any, error) {
 var ErrAmbiguousKey = errors.New("value is untyped and looks numeric: cast it to int8 or text")
 
 // DecodeShardKey turns one bound parameter into an int64 or string shard
-// key. The declared parameter type wins; a cast in the statement text
-// (hint) types an undeclared parameter; an undeclared text-format value
-// that parses as an integer is refused as ambiguous.
+// key.
+//
+// Two separate things happen, in PostgreSQL's own order. The wire value is
+// decoded with the type the client DECLARED at Parse, and then the cast in
+// the statement text -- hint -- is applied to the decoded value, because
+// that is the expression PostgreSQL evaluates before it compares.
+//
+// The cast used to be read only as a decoding hint for an undeclared
+// parameter, so `WHERE tenant_id = $1::int8` with a text parameter bound to
+// '7' hashed the STRING "7" while PostgreSQL compared the INTEGER 7 -- a
+// different shard, and the row silently missing.
+//
+// An undeclared text-format value that parses as an integer is still
+// refused as ambiguous.
 func DecodeShardKey(oid uint32, hint TypeHint, format int16, raw []byte) (any, error) {
 	if oid == 0 || oid == oidUnknown {
 		switch hint {
@@ -77,7 +88,74 @@ func DecodeShardKey(oid uint32, hint TypeHint, format int16, raw []byte) (any, e
 		case HintUUID:
 			oid = oidUUID
 		}
+		// The cast has typed it; there is nothing left for the cast to do.
+		hint = HintNone
 	}
+	v, err := decodeParam(oid, format, raw)
+	if err != nil {
+		return nil, err
+	}
+	return applyCast(v, hint)
+}
+
+// applyCast evaluates the statement's cast over the decoded value, which is
+// what PostgreSQL does before the comparison. A value the cast cannot
+// produce is an error rather than a guess: PostgreSQL would fail the
+// statement too, and routing it somewhere first helps nobody.
+func applyCast(v any, hint TypeHint) (any, error) {
+	switch hint {
+	case HintInt:
+		switch x := v.(type) {
+		case int64:
+			return x, nil
+		case string:
+			i, err := strconv.ParseInt(strings.TrimSpace(x), 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("parameter %q cast to an integer: %w", x, err)
+			}
+			return i, nil
+		}
+	case HintText:
+		switch x := v.(type) {
+		case string:
+			return x, nil
+		case int64:
+			return strconv.FormatInt(x, 10), nil
+		case [16]byte:
+			return uuidText(x), nil
+		}
+	case HintUUID:
+		switch x := v.(type) {
+		case [16]byte:
+			return x, nil
+		case string:
+			b, ok := placement.ParseUUID(x)
+			if !ok {
+				return nil, fmt.Errorf("parameter %q cast to a uuid is not a uuid", x)
+			}
+			return b, nil
+		}
+	default:
+		return v, nil
+	}
+	return nil, fmt.Errorf("parameter of type %T cannot be cast to a shard key of the statement's type", v)
+}
+
+// uuidText is a uuid cast to text: PostgreSQL's canonical 8-4-4-4-12
+// lowercase form, which is what the comparison then hashes.
+func uuidText(b [16]byte) string {
+	const hex = "0123456789abcdef"
+	out := make([]byte, 0, 36)
+	for i, c := range b {
+		if i == 4 || i == 6 || i == 8 || i == 10 {
+			out = append(out, '-')
+		}
+		out = append(out, hex[c>>4], hex[c&0x0f])
+	}
+	return string(out)
+}
+
+func decodeParam(oid uint32, format int16, raw []byte) (any, error) {
 	if format == 1 {
 		switch oid {
 		case oidInt8:
