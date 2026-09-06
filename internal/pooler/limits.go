@@ -1,5 +1,11 @@
 package pooler
 
+import (
+	"time"
+
+	"google.golang.org/grpc/keepalive"
+)
+
 // MaxMessageBytes is the largest protobuf message the router and pooler
 // exchange, and so the largest a single Bind value, DataRow or COPY chunk
 // may be once encoded.
@@ -26,3 +32,29 @@ package pooler
 // judgement about that single allocation, taken against a measurement,
 // rather than a thing that cannot be done.
 const MaxMessageBytes = 4 << 20
+
+// Keepalive is how the router keeps a pooler connection honest, and
+// KeepaliveEnforcement is what the pooler's server must permit for it. They
+// live together because they are one setting with two halves: gRPC's DEFAULT
+// enforcement answers a client pinging more often than every five minutes,
+// or pinging at all without an active stream, with GOAWAY too_many_pings and
+// tears the connection down. Setting only the client half is worse than
+// setting neither.
+//
+// The reason for pinging at all is a change stream: the reader sits in
+// stream.Recv() until a batch arrives and compares the shard's epoch only
+// after Recv returns, so a pooler whose host has vanished -- power loss, a
+// partition -- leaves a half-open connection that Recv waits on for the
+// kernel's retransmit timeout, minutes during which the reconnect window has
+// not started counting and the consumer sees a healthy idle stream.
+var (
+	Keepalive = keepalive.ClientParameters{
+		Time:                20 * time.Second,
+		Timeout:             10 * time.Second,
+		PermitWithoutStream: true,
+	}
+	KeepaliveEnforcement = keepalive.EnforcementPolicy{
+		MinTime:             10 * time.Second,
+		PermitWithoutStream: true,
+	}
+)

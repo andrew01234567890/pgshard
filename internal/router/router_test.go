@@ -761,3 +761,29 @@ func TestReadWriteTransactionModeReachesTheShardNeutralised(t *testing.T) {
 		t.Errorf("the shard never saw the neutralised form: %v", h.fp.ran())
 	}
 }
+
+// TestTheSessionIdPrefixIsWideEnoughToBeUniquePerProcess: the pooler keys
+// reservations, backends, Release and Cancel by session id, and a two-phase
+// gid is derived from it, so two router processes that draw the same prefix
+// have one recycling the other's pinned backend and failing its PREPARE
+// TRANSACTION on a duplicate gid. Four bytes made that a birthday problem
+// over the life of a cluster whose routers restart with the HPA.
+func TestTheSessionIdPrefixIsWideEnoughToBeUniquePerProcess(t *testing.T) {
+	newRouter := func() *Router {
+		r, err := New(Config{Snapshot: func() *snapshot.Snapshot { return nil },
+			Poolers: NewPoolers(nil, func() *snapshot.Snapshot { return nil }, nil)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	const wantHex = 32 // 128 bits
+	a, b := newRouter(), newRouter()
+	if len(a.prefix) < wantHex {
+		t.Errorf("session id prefix is %d hex characters (%d bits); want at least %d bits of randomness",
+			len(a.prefix), len(a.prefix)*4, wantHex*4)
+	}
+	if a.prefix == b.prefix {
+		t.Errorf("two routers in one process drew the same prefix %q", a.prefix)
+	}
+}

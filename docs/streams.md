@@ -197,6 +197,13 @@ generated from.
     the ack clamped to what that reader delivered. The router records that
     rather than what it asked for -- recording the request would leave a
     slot behind while the router believed it had advanced;
+  - the router pings each pooler connection every 20s, with or without an
+    active stream, so a pooler whose host has vanished is a failed call in
+    seconds. Without it a change stream sits in `Recv` until the kernel gives
+    up on the connection -- minutes, during which the reconnect window has
+    not started and the consumer sees a healthy idle stream, heartbeats and
+    all. The pooler's server permits those pings; the two halves are one
+    setting (`pooler.Keepalive` and `pooler.KeepaliveEnforcement`);
   - a promotion (`primary_epoch` bump in the snapshot) or a dropped pooler
     stream makes the router reconnect the shard to the current primary's
     pooler at the last delivered LSN with backoff; the failover slot exists
