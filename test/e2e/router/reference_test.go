@@ -82,6 +82,7 @@ func (s *shardedStack) declareReferenceAndSequences(tb testing.TB) {
 func (s *shardedStack) awaitReference(tb testing.TB, conn *pgx.Conn) {
 	tb.Helper()
 	ctx := context.Background()
+	s.standInForTheInspection(tb)
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		// The mode has to be the first argument pgx sees, so the id is in
@@ -100,6 +101,57 @@ func (s *shardedStack) awaitReference(tb testing.TB, conn *pgx.Conn) {
 			tb.Fatalf("router never learned the reference placement (last: %v)\nrouter log:\n%s", err, s.routerLog.String())
 		}
 		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// standInForTheInspection waits for the reconciler to publish the effective
+// generation of the reference tables and then stamps the inspection against
+// THAT generation.
+//
+// The declaration seeds reference_checked_generation = 0 in the same
+// transaction as the table, which stops the reconciler's first upsert
+// clearing it -- but the reconciler then publishes an effective_generation
+// of its own, and the router compares the two. Once they differ the write is
+// refused until an inspection pass runs, and this stack does not run one, so
+// the refusal is permanent. On an idle machine the reconciler had already
+// published before the declaration landed and the two matched by luck; on a
+// loaded runner it published afterwards and every reference write in the
+// suite failed with "cannot be planned until its shards have been
+// inspected" (PGS-699).
+func (s *shardedStack) standInForTheInspection(tb testing.TB) {
+	tb.Helper()
+	ctx := context.Background()
+	cat, err := pgx.Connect(ctx, s.catalogDSN)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer func() { _ = cat.Close(ctx) }()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		// Settled means the reconciler has nothing left to publish for
+		// these tables, so no later pass moves the generation out from
+		// under the stamp below.
+		var pending int
+		if err := cat.QueryRow(ctx, `SELECT count(*) FROM pgshard.tables t
+			LEFT JOIN pgshard.table_status s USING (database, schema_name, table_name)
+			WHERE t.placement = 'reference'
+			  AND (s.effective_placement IS DISTINCT FROM t.placement
+			       OR s.effective_generation IS DISTINCT FROM t.desired_generation)`).Scan(&pending); err != nil {
+			tb.Fatal(err)
+		}
+		if pending == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			tb.Fatalf("the reconciler never published the reference tables (%d still pending)", pending)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if _, err := cat.Exec(ctx, `UPDATE pgshard.table_status s SET reference_checked_generation = s.effective_generation
+		FROM pgshard.tables t
+		WHERE t.database = s.database AND t.schema_name = s.schema_name AND t.table_name = s.table_name
+		  AND t.placement = 'reference'`); err != nil {
+		tb.Fatal(err)
 	}
 }
 
