@@ -910,6 +910,22 @@ func CatalogDialer(pool *pgxpool.Pool) func(ctx context.Context) (ShardConn, err
 	}
 }
 
+// DSNDialer dials the catalog group on its own connection rather than
+// through the pool. Role and DCL work is superuser work on every group, the
+// catalog group included -- CREATE ROLE needs CREATEROLE, a membership grant
+// needs ADMIN on the role, and reading a verifier back out of pg_authid to
+// compare it needs superuser -- while the pool logs in as the least-privilege
+// role the rest of the controller uses.
+func DSNDialer(dsn string) func(ctx context.Context) (ShardConn, error) {
+	return func(ctx context.Context) (ShardConn, error) {
+		conn, err := pgx.Connect(ctx, dsn)
+		if err != nil {
+			return nil, err
+		}
+		return pgxShardConn{conn}, nil
+	}
+}
+
 type poolShardConn struct{ *pgxpool.Conn }
 
 func (c poolShardConn) Exec(ctx context.Context, sql string, args ...any) (CommandTag, error) {

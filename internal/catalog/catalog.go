@@ -41,6 +41,13 @@ const (
 // which the agent control-plane token is also derived.
 const RouterRole = "pgshard_router"
 
+// ControllerRole is the login role the controller uses to reach the catalog.
+// It is a member of pgshard_system -- it drives every workflow, so it writes
+// the whole schema -- plus the handful of server capabilities the barrier
+// needs on the catalog group, and nothing else. Notably not superuser: the
+// controller's environment used to be direct write access to every shard.
+const ControllerRole = "pgshard_controller"
+
 //go:embed schema/*.sql
 var schemaFS embed.FS
 

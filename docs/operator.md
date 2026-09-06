@@ -63,11 +63,30 @@ is enabled (see [Network policy](#network-policy)) and
 changing what a running cluster does, and each has an explicit opt-out for
 the case where the plain thing is what was wanted.
 `pg_hba.conf` admits only the control plane over TCP: the superuser, and
-`pgshard_router` for the router's catalog connection, which exists only
-where the catalog schema does. Everything else is rejected, so an
-application role reaches a shard through the pooler's unix socket and the
-router, which is where shard-key routing, the write fences and the
-coordination of a multi-shard write happen.
+`pgshard_router` and `pgshard_controller` for the router's and the
+controller's catalog connections, both of which exist only where the catalog
+schema does. Everything else is rejected, so an application role reaches a
+shard through the pooler's unix socket and the router, which is where
+shard-key routing, the write fences and the coordination of a multi-shard
+write happen.
+
+The controller reaches the catalog as `pgshard_controller`: `pgshard_system`
+membership for the schema it drives, plus `pg_read_all_stats` and the
+`pg_create_restore_point`, `pg_switch_wal`, `pg_control_checkpoint`,
+`pg_reload_conf` and `ALTER SYSTEM ON PARAMETER
+default_transaction_read_only` grants the barrier needs on the catalog
+group. Its password is generated per cluster into
+`<cluster>-controller-login` and mounted at `/etc/pgshard/controller`, read
+through `--catalog-password-file` rather than passed in argv, where
+`/proc/<pid>/cmdline` would expose it.
+
+`PGPASSWORD` in that container is still the superuser's, and two paths use
+it. The shard and subscription DSNs: DDL, replication and finishing another
+session's prepared transaction are superuser work on a shard. And
+`--catalog-role-dsn`, which is role and DCL work on the *catalog group* —
+`CREATE ROLE` needs `CREATEROLE`, a membership grant needs `ADMIN` on the
+role, and comparing a SCRAM verifier means reading `pg_authid`, none of
+which a least-privilege login has. Both are tracked separately from this.
 
 The agent's own gRPC port (9090) requires a per-cluster token on every RPC,
 so reaching the port is not enough to drive failovers. The token is

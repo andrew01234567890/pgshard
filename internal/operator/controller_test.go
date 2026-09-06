@@ -58,17 +58,15 @@ func TestTheControllerIsReachableWhereEverythingLooksForIt(t *testing.T) {
 	}
 }
 
-// TestTheControllerRunsAsTheSuperuser: it applies DDL on every shard,
-// mutates replication and finishes prepared transactions other sessions
-// started, so it holds the catalog superuser rather than the router's
-// least-privilege role.
-func TestTheControllerRunsAsTheSuperuser(t *testing.T) {
+// TestTheControllerHoldsTheSuperuserForTheShards: it applies DDL on every
+// shard, mutates replication and finishes prepared transactions other
+// sessions started, so the shard credential is the superuser. Its CATALOG
+// login is its own role, which TestTheControllerReachesTheCatalogAsItsOwnRole
+// covers.
+func TestTheControllerHoldsTheSuperuserForTheShards(t *testing.T) {
 	c := controllerCluster()
 	dep := Renderer{}.ControllerDeployment(c)
 	ct := dep.Spec.Template.Spec.Containers[0]
-	if got := argOf(ct.Args, "--catalog-dsn="); got != CatalogDSN(c) {
-		t.Fatalf("catalog dsn %q, want %q", got, CatalogDSN(c))
-	}
 	if len(ct.Env) != 1 || ct.Env[0].Name != "PGPASSWORD" ||
 		ct.Env[0].ValueFrom.SecretKeyRef.Name != SecretName(c.Name) {
 		t.Fatalf("password env %+v, want the cluster superuser secret", ct.Env)
@@ -166,6 +164,9 @@ func TestTheControllerCanReachTheShards(t *testing.T) {
 	// carried the superuser password in clear. The controller splices it in
 	// from its environment when it renders CREATE SUBSCRIPTION.
 	for _, arg := range args {
+		if strings.HasPrefix(arg, "--catalog-password-file=") {
+			continue // a path to a mounted Secret, not a password
+		}
 		if strings.Contains(arg, "password") {
 			t.Errorf("controller argument %q carries a password; argv is readable through /proc", arg)
 		}

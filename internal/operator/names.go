@@ -100,6 +100,8 @@ const (
 	// rather than as the superuser.
 	poolerCatalogSecretVolume = "catalog-secret"
 	poolerCatalogPasswordDir  = "/etc/pgshard/catalog"
+	controllerLoginVolume     = "controller-login"
+	controllerLoginDir        = "/etc/pgshard/controller"
 	// LabelShardSet on a shard group's objects names the catalog shard set
 	// it belongs to.
 	LabelShardSet = "pgshard.io/shard-set"
@@ -362,6 +364,18 @@ func SecretName(cluster string) string { return cluster + "-superuser" }
 
 // RouterSecretName holds the router's catalog login password.
 func RouterSecretName(cluster string) string { return cluster + "-router" }
+
+// ControllerSecretName holds the controller's catalog login password. Its
+// own Secret, so rotating it and rotating the superuser's are separate acts.
+func ControllerSecretName(cluster string) string { return cluster + "-controller-login" }
+
+// The catalog login roles the operator maintains passwords for. Named here
+// because the reconciler function that applies them has a local called
+// "catalog", which shadows the package.
+const (
+	routerLoginRole     = catalog.RouterRole
+	controllerLoginRole = catalog.ControllerRole
+)
 
 // AgentSecretName holds the control-plane token the member agents accept.
 // It is generated for the cluster rather than derived from the superuser

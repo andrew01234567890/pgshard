@@ -138,5 +138,16 @@ pgshard-controller run --catalog-dsn postgres://... \
     --listen 127.0.0.1:15500 --tls-cert ... --tls-key ... --tls-ca ...
 ```
 
+`--catalog-password-file PATH` splices a password read from that file into
+`--catalog-dsn`. The catalog login is `pgshard_controller`, not the
+superuser, while `PGPASSWORD` is still the superuser's for the shard and
+subscription DSNs — and libpq would otherwise apply that variable to the
+catalog connection too.
+
+`--catalog-role-dsn DSN` is the superuser connection role and DCL work on
+the catalog group uses, the same way that work reaches a shard. Unset, it
+falls back to `--catalog-dsn`, which is right only when that DSN is already
+the superuser's.
+
 `--insecure-dev` serves plaintext gRPC for development; `--listen ""` runs
 the reconciler without a gRPC listener.
