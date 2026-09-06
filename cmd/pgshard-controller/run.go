@@ -191,7 +191,24 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 		connInfo := func(ctx context.Context, ref controller.ShardRef, database string) (string, error) {
 			return shardConnInfo(ctx, pool, shardDSNs, subTemplate, ref, database)
 		}
-		var schema controller.SchemaMaterializer = &controller.AgentMaterializer{Pool: pool, Port: *agentPort, AgentToken: agentToken}
+		// The controller's own certificate is what an agent's caller rule
+		// wants ({controller, operator}), and it is already mounted for the
+		// controller's own listener. Without it here, MaterializeSchema
+		// dialled every agent plaintext -- so a member that had restarted
+		// into the mTLS requirement refused the handshake and its schema
+		// was never materialised. The dial is still per member: the
+		// materializer reads agent_mtls with the endpoint and uses these
+		// only for a member that says it requires them.
+		var agentCreds credentials.TransportCredentials
+		if *certFile != "" || *keyFile != "" || *caFile != "" {
+			agentCreds, err = grpccreds.Dialer(*certFile, *keyFile, *caFile, "", false)
+			if err != nil {
+				fmt.Fprintf(stderr, "pgshard-controller run: agent credentials: %v\n", err)
+				return cli.ExitUsage
+			}
+		}
+		var schema controller.SchemaMaterializer = &controller.AgentMaterializer{Pool: pool, Port: *agentPort,
+			AgentToken: agentToken, Creds: agentCreds}
 		if *pgBin != "" {
 			schema = &controller.ExecMaterializer{BinDir: *pgBin, TargetConnInfo: connInfo}
 		}

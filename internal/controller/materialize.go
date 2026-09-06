@@ -70,14 +70,7 @@ func (m *AgentMaterializer) MaterializeSchema(ctx context.Context, target ShardR
 	if err != nil {
 		return err
 	}
-	// Plaintext unless this member says otherwise, even when credentials
-	// exist: an agent that has not restarted into the requirement refuses a
-	// TLS handshake, and half a rolled-over fleet is in that state.
-	tc := m.Creds
-	if tc == nil || !agentMTLS {
-		tc = insecure.NewCredentials()
-	}
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(tc))
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(m.dialCreds(agentMTLS)))
 	if err != nil {
 		return err
 	}
@@ -103,6 +96,19 @@ func (m *AgentMaterializer) MaterializeSchema(ctx context.Context, target ShardR
 		return fmt.Errorf("agent %s: %w", addr, err)
 	}
 	return nil
+}
+
+// dialCreds is how THIS member is dialled. Plaintext unless the member's own
+// row says otherwise, even when credentials exist: an agent that has not
+// restarted into the requirement refuses a TLS handshake, and half a
+// rolled-over fleet is in that state. Plaintext also when there are none to
+// present -- believing the row without the material fails every call, and
+// says nothing useful about why.
+func (m *AgentMaterializer) dialCreds(agentMTLS bool) credentials.TransportCredentials {
+	if m.Creds == nil || !agentMTLS {
+		return insecure.NewCredentials()
+	}
+	return m.Creds
 }
 
 // AgentAddr turns a primary endpoint (host:5432) into the agent's host:port.
