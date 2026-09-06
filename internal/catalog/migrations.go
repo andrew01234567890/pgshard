@@ -3,6 +3,7 @@ package catalog
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -396,7 +397,7 @@ func collectMigrations(rows pgx.Rows) ([]DDLMigration, error) {
 }
 
 // SaveMigrationProgress writes the state, per-shard detail and error of m.
-func SaveMigrationProgress(ctx context.Context, db RowQuerier, m DDLMigration) error {
+func SaveMigrationProgress(ctx context.Context, db RowQuerier, m DDLMigration, term int64) error {
 	perShard, err := json.Marshal(m.PerShard)
 	if err != nil {
 		return err
@@ -406,12 +407,64 @@ func SaveMigrationProgress(ctx context.Context, db RowQuerier, m DDLMigration) e
 		errText = &m.Error
 	}
 	rows, err := db.Query(ctx, `UPDATE pgshard.migrations SET state = $2, per_shard = $3, error = $4, updated_at = now(),
-		finished_at = CASE WHEN $2 IN ('complete', 'failed') THEN now() ELSE finished_at END WHERE id = $1`, m.ID, m.State, perShard, errText)
+		finished_at = CASE WHEN $2 IN ('complete', 'failed') THEN now() ELSE finished_at END
+		WHERE id = $1 AND `+leaderTermPredicate, m.ID, m.State, perShard, errText, termArg(term))
 	if err != nil {
 		return err
 	}
 	rows.Close()
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return termHeld(term, rows.CommandTag().RowsAffected())
+}
+
+// ErrNotLeaderTerm reports a write refused because the writer's leadership
+// has since passed to another controller. It is not a failure of the
+// statement: the work has moved.
+var ErrNotLeaderTerm = errors.New("catalog: the controller leadership this write carries has ended")
+
+// leaderTermPredicate admits a write only from the leader whose term is the
+// one now recorded. Leadership passes only after the previous holder's
+// advisory lock is gone, so a bumped term is proof that the writer no longer
+// leads -- and it needs no lease and no clock to say so.
+const leaderTermPredicate = `($5::bigint IS NULL OR $5 = (SELECT term FROM pgshard.leader_term))`
+
+// TakeLeaderTerm records a new controller leadership and returns its term.
+// Called once per acquisition of the leader lock.
+func TakeLeaderTerm(ctx context.Context, db RowQuerier) (int64, error) {
+	var term int64
+	if err := db.QueryRow(ctx, `UPDATE pgshard.leader_term SET term = term + 1, took_at = now() WHERE id RETURNING term`).Scan(&term); err != nil {
+		return 0, fmt.Errorf("catalog: taking a leader term: %w", err)
+	}
+	return term, nil
+}
+
+// LeaderTerm reads the term of the controller leadership now in force.
+func LeaderTerm(ctx context.Context, db RowQuerier) (int64, error) {
+	var term int64
+	if err := db.QueryRow(ctx, `SELECT term FROM pgshard.leader_term WHERE id`).Scan(&term); err != nil {
+		return 0, fmt.Errorf("catalog: leader term: %w", err)
+	}
+	return term, nil
+}
+
+// termArg renders an unstamped write as SQL NULL, so a writer that carries
+// no term -- the router queueing a statement, a test -- writes as before.
+func termArg(term int64) *int64 {
+	if term == 0 {
+		return nil
+	}
+	return &term
+}
+
+// termHeld turns a stamped write that matched no row into ErrNotLeaderTerm.
+// An unstamped write is not checked: it was never guarded.
+func termHeld(term int64, affected int64) error {
+	if term != 0 && affected == 0 {
+		return ErrNotLeaderTerm
+	}
+	return nil
 }
 
 // PendingRewrite is an in-flight rewrite migration a router must hide the
@@ -452,15 +505,19 @@ func PendingRewrites(ctx context.Context, db Querier) ([]PendingRewrite, error) 
 
 // SaveMigrationMeta rewrites the meta of a migration (the applier records
 // the visible column list of a rewrite there).
-func SaveMigrationMeta(ctx context.Context, db RowQuerier, id string, meta MigrationMeta) error {
+func SaveMigrationMeta(ctx context.Context, db RowQuerier, id string, term int64, meta MigrationMeta) error {
 	raw, err := json.Marshal(meta)
 	if err != nil {
 		return err
 	}
-	rows, err := db.Query(ctx, `UPDATE pgshard.migrations SET meta = $2, updated_at = now() WHERE id = $1`, id, raw)
+	rows, err := db.Query(ctx, `UPDATE pgshard.migrations SET meta = $2, updated_at = now()
+		WHERE id = $1 AND ($3::bigint IS NULL OR $3 = (SELECT term FROM pgshard.leader_term))`, id, raw, termArg(term))
 	if err != nil {
 		return err
 	}
 	rows.Close()
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return termHeld(term, rows.CommandTag().RowsAffected())
 }

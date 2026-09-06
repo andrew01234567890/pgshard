@@ -80,7 +80,7 @@ func (a *Applier) driveRewrite(ctx context.Context, logger *slog.Logger, m *cata
 				s.Step = phase + 1
 			}
 			m.PerShard[key] = s
-			if err := a.Store.Save(ctx, *m); err != nil {
+			if err := a.Store.Save(ctx, *m, a.term()); err != nil {
 				return err
 			}
 			if s.State == catalog.ShardFailed {
@@ -89,7 +89,7 @@ func (a *Applier) driveRewrite(ctx context.Context, logger *slog.Logger, m *cata
 		}
 	}
 	m.State, m.Error = catalog.MigrationComplete, ""
-	if err := a.Store.Save(ctx, *m); err != nil {
+	if err := a.Store.Save(ctx, *m, a.term()); err != nil {
 		return err
 	}
 	logger.Info("rewrite migration finished", "table", rw.Table, "column", rw.Column)
@@ -126,7 +126,7 @@ func (a *Applier) failRewrite(ctx context.Context, logger *slog.Logger, m *catal
 			logger.Warn("rewrite revert failed", "shard", key, "err", err)
 		}
 	}
-	if err := a.Store.Save(ctx, *m); err != nil {
+	if err := a.Store.Save(ctx, *m, a.term()); err != nil {
 		return err
 	}
 	logger.Warn("rewrite migration failed", "error", m.Error)
@@ -253,7 +253,7 @@ func (a *Applier) recordRewriteColumns(ctx context.Context, m *catalog.DDLMigrat
 		return fmt.Errorf("table %q has no columns on shard %s", rw.Table, keys[0])
 	}
 	rw.Columns = cols
-	if err := a.Store.SaveMeta(ctx, m.ID, m.Meta); err != nil {
+	if err := a.Store.SaveMeta(ctx, m.ID, a.term(), m.Meta); err != nil {
 		return err
 	}
 	return a.settleColumns(ctx, m)
@@ -277,7 +277,7 @@ func (a *Applier) settleColumns(ctx context.Context, m *catalog.DDLMigration) er
 		}
 	}
 	m.Meta.Rewrite.Settled = true
-	return a.Store.SaveMeta(ctx, m.ID, m.Meta)
+	return a.Store.SaveMeta(ctx, m.ID, a.term(), m.Meta)
 }
 
 // rewritePhase runs one phase of the rewrite on one shard.

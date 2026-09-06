@@ -233,7 +233,7 @@ func TestSnapshotWithPostgres(t *testing.T) {
 			t.Fatal(err)
 		}
 		m.State = catalog.MigrationFailed
-		if err := catalog.SaveMigrationProgress(ctx, conn, m); err != nil {
+		if err := catalog.SaveMigrationProgress(ctx, conn, m, 0); err != nil {
 			t.Fatal(err)
 		}
 		s, err = Load(ctx, conn)

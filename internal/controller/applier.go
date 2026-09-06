@@ -41,14 +41,15 @@ const DefaultShardConnectTimeout = 10 * time.Second
 type MigrationStore interface {
 	// Pending lists queued and running migrations oldest first.
 	Pending(ctx context.Context) ([]catalog.DDLMigration, error)
-	// Save writes state, per-shard detail and error of m.
-	Save(ctx context.Context, m catalog.DDLMigration) error
+	// Save writes state, per-shard detail and error of m under the
+	// controller leadership term the pass took; 0 writes unconditionally.
+	Save(ctx context.Context, m catalog.DDLMigration, term int64) error
 	// Shards lists the shard ids of a shard set.
 	Shards(ctx context.Context, shardSet string) ([]int32, error)
 	// Databases lists the logical databases of the catalog.
 	Databases(ctx context.Context) ([]string, error)
 	// SaveMeta rewrites the meta of a migration.
-	SaveMeta(ctx context.Context, id string, meta catalog.MigrationMeta) error
+	SaveMeta(ctx context.Context, id string, term int64, meta catalog.MigrationMeta) error
 	// Exec runs a catalog statement (desired-state mirroring).
 	Exec(ctx context.Context, sql string, args ...any) error
 	// MirrorAndSave applies the desired-state statements of a finished
@@ -59,7 +60,7 @@ type MigrationStore interface {
 	// NOTHING and DELETE, the role deltas are not idempotent -- a grant
 	// delta is applied twice and the roles generation bumped twice, so
 	// every group looks stale to the role verifier once more than it is.
-	MirrorAndSave(ctx context.Context, stmts []catalog.Statement, m catalog.DDLMigration) error
+	MirrorAndSave(ctx context.Context, stmts []catalog.Statement, m catalog.DDLMigration, term int64) error
 	// LockedDatabases lists the databases a workflow currently holds the
 	// DDL lock on.
 	LockedDatabases(ctx context.Context) (map[string]string, error)
@@ -81,8 +82,8 @@ func (s *PGMigrationStore) Pending(ctx context.Context) ([]catalog.DDLMigration,
 }
 
 // Save implements MigrationStore.
-func (s *PGMigrationStore) Save(ctx context.Context, m catalog.DDLMigration) error {
-	return catalog.SaveMigrationProgress(ctx, s.Pool, m)
+func (s *PGMigrationStore) Save(ctx context.Context, m catalog.DDLMigration, term int64) error {
+	return catalog.SaveMigrationProgress(ctx, s.Pool, m, term)
 }
 
 // Shards implements MigrationStore.
@@ -129,8 +130,8 @@ func (s *PGMigrationStore) ServingShardSet(ctx context.Context) (string, error) 
 }
 
 // SaveMeta implements MigrationStore.
-func (s *PGMigrationStore) SaveMeta(ctx context.Context, id string, meta catalog.MigrationMeta) error {
-	return catalog.SaveMigrationMeta(ctx, s.Pool, id, meta)
+func (s *PGMigrationStore) SaveMeta(ctx context.Context, id string, term int64, meta catalog.MigrationMeta) error {
+	return catalog.SaveMigrationMeta(ctx, s.Pool, id, term, meta)
 }
 
 // Exec implements MigrationStore.
@@ -140,7 +141,7 @@ func (s *PGMigrationStore) Exec(ctx context.Context, sql string, args ...any) er
 }
 
 // MirrorAndSave implements MigrationStore.
-func (s *PGMigrationStore) MirrorAndSave(ctx context.Context, stmts []catalog.Statement, m catalog.DDLMigration) error {
+func (s *PGMigrationStore) MirrorAndSave(ctx context.Context, stmts []catalog.Statement, m catalog.DDLMigration, term int64) error {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -151,7 +152,7 @@ func (s *PGMigrationStore) MirrorAndSave(ctx context.Context, stmts []catalog.St
 			return fmt.Errorf("applier: mirroring %s into the catalog: %w", m.Kind, err)
 		}
 	}
-	if err := catalog.SaveMigrationProgress(ctx, tx, m); err != nil {
+	if err := catalog.SaveMigrationProgress(ctx, tx, m, term); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -202,6 +203,12 @@ type Applier struct {
 	// ShardSet pins the shard set to apply to; empty means whichever set
 	// is serving at the time of each pass.
 	ShardSet string
+	// Term reports the controller leadership term this process holds, or 0
+	// while it holds none. Every write the applier makes carries it, so a
+	// pass whose leadership ended stops at its next write instead of
+	// driving a migration the new leader is already driving. A nil Term
+	// writes unconditionally, which only a single-writer test wants.
+	Term func() int64
 	// LockTimeout defaults to DefaultLockTimeout.
 	LockTimeout time.Duration
 	// Backoff defaults to DefaultBackoff.
@@ -228,6 +235,14 @@ type Applier struct {
 }
 
 func (a *Applier) lostLeadership() bool { return a.leader != nil && !a.leader() }
+
+// term is the controller leadership this pass stamps its writes with.
+func (a *Applier) term() int64 {
+	if a.Term == nil {
+		return 0
+	}
+	return a.Term()
+}
 
 func (a *Applier) ddlRole() string {
 	if a.DDLRole == "" {
@@ -341,6 +356,10 @@ func (a *Applier) RunOnce(ctx context.Context) (int, error) {
 			continue
 		}
 		if err := a.drive(ctx, m); err != nil {
+			if errors.Is(err, catalog.ErrNotLeaderTerm) {
+				a.logger().Info("stopping: leadership passed to another controller", "migration", m.ID)
+				return done, nil
+			}
 			return done, err
 		}
 		done++
@@ -362,7 +381,7 @@ func (a *Applier) drive(ctx context.Context, m catalog.DDLMigration) error {
 				"per-shard progress cannot be read against another set, so this migration needs reconciling by hand",
 				m.Meta.ShardSet, serving)
 			logger.Error("migration straddled a cutover", "planned", m.Meta.ShardSet, "serving", serving)
-			return a.Store.Save(ctx, m)
+			return a.Store.Save(ctx, m, a.term())
 		}
 		logger.Info("replanning migration onto the serving shard set", "planned", m.Meta.ShardSet, "serving", serving)
 		m.State, m.Meta.ShardSet = catalog.MigrationQueued, ""
@@ -380,7 +399,7 @@ func (a *Applier) drive(ctx context.Context, m catalog.DDLMigration) error {
 			m.PerShard[catalogKey] = catalog.ShardMigration{State: catalog.ShardPending}
 		}
 		m.State, m.Meta.ShardSet = catalog.MigrationRunning, serving
-		if err := a.Store.Save(ctx, m); err != nil {
+		if err := a.Store.Save(ctx, m, a.term()); err != nil {
 			return err
 		}
 		logger.Info("migration started", "shards", len(targets), "shard_set", serving)
@@ -407,7 +426,7 @@ func (a *Applier) drive(ctx context.Context, m catalog.DDLMigration) error {
 			return ctx.Err()
 		}
 		m.PerShard[key] = s
-		if err := a.Store.Save(ctx, m); err != nil {
+		if err := a.Store.Save(ctx, m, a.term()); err != nil {
 			return err
 		}
 	}
@@ -438,11 +457,11 @@ func (a *Applier) drive(ctx context.Context, m catalog.DDLMigration) error {
 	if m.State == catalog.MigrationComplete {
 		// One transaction: see MirrorAndSave. A mirror that lands without
 		// its row is applied again by the next pass.
-		if err := a.Store.MirrorAndSave(ctx, mirrorStatements(m), m); err != nil {
+		if err := a.Store.MirrorAndSave(ctx, mirrorStatements(m), m, a.term()); err != nil {
 			return err
 		}
 		a.recheckShardKey(ctx, m, logger)
-	} else if err := a.Store.Save(ctx, m); err != nil {
+	} else if err := a.Store.Save(ctx, m, a.term()); err != nil {
 		return err
 	}
 	logger.Info("migration finished", "state", m.State, "error", m.Error)
@@ -560,7 +579,10 @@ func (a *Applier) applyOn(ctx context.Context, logger *slog.Logger, m *catalog.D
 		}
 		s.Step++
 		m.PerShard[key] = s
-		if err := a.Store.Save(ctx, *m); err != nil {
+		if err := a.Store.Save(ctx, *m, a.term()); err != nil {
+			if errors.Is(err, catalog.ErrNotLeaderTerm) {
+				return s
+			}
 			logger.Warn("progress not saved", "err", err)
 		}
 	}
@@ -583,10 +605,20 @@ func (a *Applier) retrying(ctx context.Context, logger *slog.Logger, m *catalog.
 	b := a.backoff()
 	start, wait := a.now(), b.Min
 	for {
+		prior := s
 		s.Attempts++
 		s.State = catalog.ShardRunning
 		m.PerShard[key] = s
-		saveErr := a.Store.Save(ctx, *m)
+		saveErr := a.Store.Save(ctx, *m, a.term())
+		if errors.Is(saveErr, catalog.ErrNotLeaderTerm) {
+			// Leadership moved while this pass was running: the new leader
+			// is driving the migration and has its own view of the row.
+			// Running the step anyway is the double-drive the term exists
+			// to prevent, and a step not run is not a step failed, so the
+			// entry is left exactly as it was found.
+			m.PerShard[key] = prior
+			return prior
+		}
 		var outcome string
 		var err error
 		if saveErr != nil {
@@ -632,7 +664,10 @@ func (a *Applier) retrying(ctx context.Context, logger *slog.Logger, m *catalog.
 		}
 		s.State = catalog.ShardRetrying
 		m.PerShard[key] = s
-		if err := a.Store.Save(ctx, *m); err != nil {
+		if err := a.Store.Save(ctx, *m, a.term()); err != nil {
+			if errors.Is(err, catalog.ErrNotLeaderTerm) {
+				return s
+			}
 			logger.Warn("progress not saved", "err", err)
 		}
 		logger.Info("shard step retrying", "shard", id, "step", s.Step, "attempt", s.Attempts, "wait", wait, "err", err)
