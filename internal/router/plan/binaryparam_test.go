@@ -83,3 +83,31 @@ func TestTheColumnTypeOnlyTypesAnUndeclaredParameter(t *testing.T) {
 		})
 	}
 }
+
+// The inferred type has to carry the column's WIDTH, not just its family: a
+// binary parameter is decoded by the OID's own width, so mapping an int4
+// column to int8 refused the four bytes PostgreSQL sends for it ("int8
+// parameter has 4 bytes") -- a statement the old length guess routed
+// correctly.
+func TestAnUndeclaredBinaryParameterTakesTheKeyColumnsWidth(t *testing.T) {
+	for _, c := range []struct {
+		columnType string
+		raw        []byte
+	}{
+		{"bigint", be64(7)},
+		{"integer", be32(7)},
+		{"int4", be32(7)},
+		{"smallint", be16(7)},
+		{"int2", be16(7)},
+	} {
+		b := BindParams{Formats: []int16{1}, Values: [][]byte{c.raw}}
+		got, err := b.ShardKey(1, HintNone, c.columnType)
+		if err != nil {
+			t.Errorf("%s: %v", c.columnType, err)
+			continue
+		}
+		if got != any(int64(7)) {
+			t.Errorf("%s: decoded %#v, want the integer 7", c.columnType, got)
+		}
+	}
+}

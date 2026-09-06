@@ -2,6 +2,7 @@ package plan
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -72,5 +73,46 @@ func TestALengthTheRouterCannotApplyIsNotRoutedOn(t *testing.T) {
 		if p.Kind == EqualUnique || len(p.Shards) == 1 {
 			t.Errorf("%s: routed as %v to %v on a length it cannot apply", sql, p.Kind, p.Shards)
 		}
+	}
+}
+
+// The QUOTED "char" is one byte and nothing like character(n): unquoted char
+// reaches the planner as bpchar with a typmod of 1, but `"char"` carries its
+// length in the type itself and so had no typmod to apply. PostgreSQL
+// evaluates 'abcdef'::"char" to 'a'; the router hashed the whole string and
+// picked another shard.
+func TestTheQuotedCharCastTakesOneByte(t *testing.T) {
+	snap := varcharFixture(t, "text")
+	first := shardOf(t, snap, "a")
+	whole := shardOf(t, snap, "abcdef")
+	if first == whole {
+		t.Fatal("fixture no longer separates 'a' from 'abcdef'; the test proves nothing")
+	}
+	for _, sql := range []string{
+		`select * from codes where code = 'abcdef'::"char"`,
+		`select * from codes where code = 'abcdef'::pg_catalog."char"`,
+		// Unquoted char is bpchar(1) and already routed correctly; it must
+		// keep doing so.
+		"select * from codes where code = 'abcdef'::char",
+	} {
+		if got := routeOf(t, snap, sql); len(got) != 1 || got[0] != first {
+			t.Errorf("%s: routed to %v, want the shard of 'a' (%d)", sql, got, first)
+		}
+	}
+}
+
+// ::name truncates at 63 bytes. Doing that exactly means not splitting a
+// multibyte character, so a value that could reach the limit is refused
+// rather than guessed at; a shorter one is unaffected.
+func TestANameCastIsRefusedOnlyWhenItCouldTruncate(t *testing.T) {
+	snap := varcharFixture(t, "text")
+	short := shardOf(t, snap, "abcdef")
+	if got := routeOf(t, snap, "select * from codes where code = 'abcdef'::name"); len(got) != 1 || got[0] != short {
+		t.Errorf("a short ::name was not routed: %v", got)
+	}
+	long := strings.Repeat("x", 70)
+	p, err := New().Plan(context.Background(), session(snap), "select * from codes where code = '"+long+"'::name")
+	if err == nil && p.Kind == EqualUnique {
+		t.Error("a ::name longer than 63 bytes was routed on the untruncated value")
 	}
 }
