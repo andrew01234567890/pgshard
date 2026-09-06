@@ -1837,3 +1837,42 @@ func TestAMirrorThatLosesItsRowIsNotAppliedTwice(t *testing.T) {
 		}
 	}
 }
+
+// The published term goes to ZERO the moment the process notices the
+// advisory lock is gone: cmd/pgshard-controller stores what OnLeader hands
+// it, and leader.go's deferred OnLeader(false, 0) is that zero. A zero term
+// is the "no leadership to carry" value, which writes UNCONDITIONALLY -- so
+// a term read per write turned the fence off at exactly the moment it was
+// needed, and a pass already in flight went on driving a migration the new
+// leader had taken over. The term the pass began under is what has to reach
+// the catalog.
+func TestAPassKeepsTheTermItBeganUnderWhenLeadershipDrops(t *testing.T) {
+	f := newApplierFixture(t)
+	id := f.queue(catalog.DDLMigration{Statement: "create table t (id int)", Kind: "CREATE TABLE", Scope: "all"})
+	f.shards.exec = func(shard int32, sql string) error {
+		if shard == 0 && strings.HasPrefix(sql, "create table") {
+			// The lock is gone: the catalog hands leadership on, and this
+			// process publishes zero.
+			f.store.takeLeadership()
+			f.term = 0
+		}
+		return nil
+	}
+	done, err := f.app.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("leadership passing on is not a failure: %v", err)
+	}
+	if done != 0 {
+		t.Fatalf("the old pass reported %d migrations finished after its leadership ended", done)
+	}
+	for _, shard := range []int32{1, 2} {
+		for _, sql := range f.shards.statements(shard) {
+			if strings.HasPrefix(sql, "create table") {
+				t.Fatalf("shard %d ran the statement after leadership moved: %v", shard, f.shards.statements(shard))
+			}
+		}
+	}
+	if m := f.store.get(t, id); m.State != catalog.MigrationRunning {
+		t.Fatalf("the old pass wrote a final state: %s %q", m.State, m.Error)
+	}
+}

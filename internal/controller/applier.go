@@ -232,16 +232,31 @@ type Applier struct {
 	// in pgshard.roles, so every DDL failed until the process restarted.
 	ddlReady map[ShardRef]bool
 	leader   func() bool
+	// passTerm is the leadership term of the pass in flight; see term().
+	passTerm int64
 }
 
 func (a *Applier) lostLeadership() bool { return a.leader != nil && !a.leader() }
 
 // term is the controller leadership this pass stamps its writes with.
-func (a *Applier) term() int64 {
+//
+// Latched once per pass by RunOnce, not read per write. The published term
+// goes to ZERO the moment this process notices the advisory lock is gone
+// (OnLeader(false, 0)), and a zero term is the "no leadership to carry"
+// value that writes unconditionally -- so reading it per write turned the
+// fence OFF at exactly the moment it was needed, and a pass already in
+// flight went on driving a migration the new leader had taken over. The
+// term the pass began under is the one that has to reach the catalog: it is
+// what the leader-term row will refuse.
+func (a *Applier) term() int64 { return a.passTerm }
+
+// latchTerm fixes the term for one pass.
+func (a *Applier) latchTerm() {
 	if a.Term == nil {
-		return 0
+		a.passTerm = 0
+		return
 	}
-	return a.Term()
+	a.passTerm = a.Term()
 }
 
 func (a *Applier) ddlRole() string {
@@ -325,6 +340,7 @@ func (a *Applier) Run(ctx context.Context, interval time.Duration, leader func()
 // RunOnce drives every pending migration to completion or failure and
 // returns how many it finished.
 func (a *Applier) RunOnce(ctx context.Context) (int, error) {
+	a.latchTerm()
 	pending, err := a.Store.Pending(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("applier: pending migrations: %w", err)
