@@ -1434,3 +1434,92 @@ func TestAPlacementCarriesAnIdentitySequencePastDeletedRows(t *testing.T) {
 		}
 	}
 }
+
+// brokenShard makes one shard unreachable, as a primary that has gone away
+// mid-workflow is.
+type brokenShard struct {
+	ShardDBDialer
+	broken atomic.Int32
+}
+
+func (b *brokenShard) DialDatabase(ctx context.Context, set string, id int32, db string) (ShardConn, error) {
+	if b.broken.Load() == id+1 {
+		return nil, fmt.Errorf("shard %s/%d: connection refused", set, id)
+	}
+	return b.ShardDBDialer.DialDatabase(ctx, set, id, db)
+}
+
+// TestPlacementReleasesTheFenceAfterPublishDespiteAnUnreachableShardOnPostgres.
+//
+// publish commits the catalog flip -- routers reload and write to the new
+// placement -- and only then is the shards' own fence released. SwappedAt,
+// which the stage reads to decide the swap is done, was set in memory
+// AFTER that commit, so a pass that then failed on an unreachable shard
+// left the catalog saying the placement was live and the workflow saying it
+// was not. The next pass re-armed the fence and re-ran catch-up and the
+// swap, both of which dial every shard -- so one shard being down kept the
+// table refused on the healthy ones, for as long as it stayed down, even
+// though the placement was already live.
+func TestPlacementReleasesTheFenceAfterPublishDespiteAnUnreachableShardOnPostgres(t *testing.T) {
+	parallelPG(t)
+	f := newPlacementFixture(t)
+	ctx := context.Background()
+	broken := &brokenShard{ShardDBDialer: f.placer.Shards}
+	f.placer.Shards = broken
+
+	src := f.app(0)
+	mustExec(t, src, `CREATE TABLE notes (id text PRIMARY KEY, v text)`)
+	for i := range 20 {
+		mustExec(t, src, `INSERT INTO notes VALUES ($1, $2)`, fmt.Sprintf("k%02d", i), fmt.Sprintf("v%d", i))
+	}
+	mustExec(t, f.catalog, `INSERT INTO pgshard.tables (database, schema_name, table_name, placement) VALUES ('app', 'public', 'notes', 'unsharded')`)
+	if res := f.reconcile(); res.TablesMadeEffective != 1 {
+		t.Fatalf("%+v", res)
+	}
+	mustExec(t, f.catalog, `UPDATE pgshard.tables SET placement = 'reference' WHERE table_name = 'notes'`)
+	if res := f.reconcile(); res.WorkflowsCreated != 1 {
+		t.Fatalf("%+v", res)
+	}
+
+	id, _ := f.driveUntil("notes", 2*time.Minute, StagePlacementSwapping)
+	wf := f.load(id)
+	// Everything the swapping stage does up to and including publish.
+	if err := f.placer.fenceShards(ctx, wf); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := f.placer.catchUp(ctx, wf, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.placer.verifyPlacement(ctx, wf); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.placer.swapAll(ctx, wf); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.placer.publish(ctx, wf); err != nil {
+		t.Fatal(err)
+	}
+
+	// The commit that made the placement live has to have recorded that it
+	// did, or the next pass cannot tell this from a swap that never ran.
+	var swapped *time.Time
+	if err := f.catalog.QueryRow(ctx, `SELECT (status->'placement'->>'swapped_at')::timestamptz FROM pgshard.workflows WHERE id = $1::uuid`, id).Scan(&swapped); err != nil {
+		t.Fatal(err)
+	}
+	if swapped == nil {
+		t.Fatal("publish committed the placement without recording that it had swapped")
+	}
+
+	// Now a shard goes away, before the fence has been released anywhere.
+	broken.broken.Store(2) // shard 1
+	if _, err := f.placer.Pass(ctx); err != nil {
+		t.Logf("pass reported %v, which is expected while a shard is down", err)
+	}
+
+	// The healthy shard must have its table back: the placement is live and
+	// nothing about shard 1 being down is a reason to keep refusing writes
+	// on shard 0.
+	if _, err := src.Exec(ctx, `INSERT INTO notes VALUES ('after', 'unfenced')`); err != nil {
+		t.Fatalf("the live table is still write-fenced on a healthy shard: %v", err)
+	}
+}
