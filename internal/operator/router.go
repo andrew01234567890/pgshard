@@ -73,8 +73,9 @@ func CatalogDSN(c *pgshardv1alpha1.PgShardCluster) string {
 // state machine, the SQL parser, the planner -- so it holds a credential
 // that is only what it needs: the roles table with its verifiers, the
 // decision log, the migration queue, the sequence allocator. Not the
-// superuser password, which is also the seed of the agent control-plane
-// token, and would turn one compromised router into the whole cluster.
+// superuser password, which pg_hba accepts over TCP from anywhere: that is
+// direct write access to every shard, so one compromised router would be the
+// whole cluster past every refusal the router itself enforces.
 func RouterCatalogDSN(c *pgshardv1alpha1.PgShardCluster) string {
 	return fmt.Sprintf("host=%s.%s.svc port=%d user=%s dbname=postgres", CatalogServiceRW(c.Name), c.Namespace, postgresPort, catalog.RouterRole)
 }

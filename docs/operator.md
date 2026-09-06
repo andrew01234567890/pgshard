@@ -146,7 +146,7 @@ For every cluster the operator owns `<cluster>-router`:
 | Object | Content |
 |--------|---------|
 | ServiceAccount | Identity of the router pods. |
-| Deployment | `serve --listen=:5432 --catalog-dsn=host=<cluster>-catalog-rw.<ns>.svc port=5432 user=pgshard_router dbname=postgres --catalog-pooler=<cluster>-catalog-rw.<ns>.svc:9091 --insecure-dev`; the password arrives as `PGPASSWORD` from the `<cluster>-router` Secret. That role is the catalog's own least-privilege login (see [router.md](router.md#startup-and-authentication)) -- not the superuser, whose password is also the seed of the agent control-plane token. Replicas start at `spec.router.minReplicas` and are then owned by the HPA. |
+| Deployment | `serve --listen=:5432 --catalog-dsn=host=<cluster>-catalog-rw.<ns>.svc port=5432 user=pgshard_router dbname=postgres --catalog-pooler=<cluster>-catalog-rw.<ns>.svc:9091 --insecure-dev`; the password arrives as `PGPASSWORD` from the `<cluster>-router` Secret. That role is the catalog's own least-privilege login (see [router.md](router.md#startup-and-authentication)) -- not the superuser, whose password `pg_hba` accepts over TCP from anywhere and is therefore direct write access to every shard. Replicas start at `spec.router.minReplicas` and are then owned by the HPA. |
 | Service | ClusterIP on 5432, the endpoint applications connect to. |
 | HorizontalPodAutoscaler | `autoscaling/v2`, CPU utilization target `spec.router.hpa.cpuUtilization` (default 70) between `minReplicas` and `maxReplicas`. |
 | PodDisruptionBudget | `minAvailable: 1`. |
