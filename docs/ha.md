@@ -250,15 +250,19 @@ first, then rebuilt as a standby.
 
 ## Not yet
 
-- Operator-to-agent gRPC is plaintext unless `spec.internalTLS.agentMTLS` is
-  set, which is **off by default** and is not implied by
-  `spec.internalTLS.issue`. Until it is on, the only credential on that
+- Operator-to-agent gRPC requires mutual TLS whenever the operator issues the
+  certificates (`spec.internalTLS.issue`); a `secretRef` cluster asks for it
+  with `spec.internalTLS.agentMTLS`. Without it the only credential on that
   listener is the mounted agent token, sent in clear on every RPC, so
   anything that can observe the traffic can replay `Promote`, `Demote`,
-  `SetWriteFence` and `Reclone`. Turning it on is a rollout rather than a
-  setting -- members restart one at a time, so the fleet is mixed for its
-  length and the operator dials each member according to the spec that
-  member is running.
+  `SetWriteFence` and `Reclone` -- and the agent says so at startup. Turning
+  it on is a rollout rather than a setting: members restart one at a time, so
+  the fleet is mixed for its length, and every caller dials each member by
+  what that member RECORDED at start -- the `pgshard.io/agent-mtls`
+  annotation, published per shard as `shard_status.agent_mtls` -- rather than
+  by what the spec asks for. The controller reads the same row, with its own
+  certificate, so schema materialisation reaches a member that has already
+  restarted into the requirement.
 - A postgres crash inside a running pod is a container restart, not a failover,
   until the pod stops being Ready and `Status` fails for the failover delay.
 - `synchronous_standby_names` set via `ALTER SYSTEM` is dropped by an agent

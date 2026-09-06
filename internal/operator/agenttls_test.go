@@ -120,3 +120,40 @@ func TestAModeIsRecordedFromThePodNotTheSpec(t *testing.T) {
 		t.Error("a nil set must answer plaintext rather than panic")
 	}
 }
+
+// An issued cluster requires agent mTLS without being asked for it.
+//
+// Mounting the material and requiring it used to be separate acts because
+// the fleet is mixed for the length of a roll -- but that is now handled
+// rather than avoided: each pod records what it started with, the operator
+// publishes it per shard as shard_status.agent_mtls, and both callers dial
+// each member by its own row. Leaving the requirement off meant a cluster
+// carrying a full internal PKI still served Promote, Demote, SetWriteFence,
+// Reclone and DropSlot behind a bearer token in clear.
+func TestAnIssuedClusterRequiresAgentMTLS(t *testing.T) {
+	c := &pgshardv1alpha1.PgShardCluster{}
+	c.Spec.InternalTLS.Issue = true
+	got := agentGRPCTLS(c)
+	if got.CertFile == "" || got.KeyFile == "" || got.CAFile == "" {
+		t.Fatalf("an issuing cluster did not require agent mTLS: %+v", got)
+	}
+	if !got.AuthorizeCallers {
+		t.Error("issued certificates carry identities, so the agent must authorise them")
+	}
+	if got.Plaintext() {
+		t.Error("the listener still reports itself plaintext")
+	}
+
+	// Supplied certificates still have to ask. They carry no pgshard
+	// identity to authorise, and the operator cannot know they are on
+	// every member.
+	c.Spec.InternalTLS.Issue = false
+	c.Spec.InternalTLS.SecretRef = &corev1.LocalObjectReference{Name: "internal-tls"}
+	if got := agentGRPCTLS(c); got != agentTLSZero {
+		t.Errorf("a secretRef cluster required agent mTLS without asking: %+v", got)
+	}
+	c.Spec.InternalTLS.AgentMTLS = true
+	if got := agentGRPCTLS(c); got == agentTLSZero {
+		t.Error("a secretRef cluster that asked for agent mTLS did not get it")
+	}
+}

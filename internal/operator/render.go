@@ -708,12 +708,25 @@ func internalTLSDataChecksum(data map[string][]byte) string {
 // agentGRPCTLS is the material the agent's gRPC listener requires, or the
 // zero value for a listener that serves plaintext.
 //
-// Only when spec.internalTLS.agentMTLS is on. Mounting the certificates is
-// not the same as requiring them: agentMounts puts them on every member as
-// soon as the cluster has any, precisely so that turning this on later is a
-// restart and not a provisioning step.
+// Required whenever the operator issues the certificates. It used to need
+// spec.internalTLS.agentMTLS as well, because turning it on is a rollout
+// rather than a setting: members restart one at a time, so the fleet is
+// mixed for its length. That staging is now built -- each member's pod
+// records what it started with, the operator publishes it per shard as
+// shard_status.agent_mtls, and both callers (the operator and the
+// controller) dial each member according to its own row -- so the mixed
+// fleet is handled rather than avoided, and a cluster with a full internal
+// PKI no longer serves Promote, Demote, SetWriteFence and Reclone behind a
+// bearer token in clear.
+//
+// A cluster given its certificates through secretRef still has to ask:
+// those carry no pgshard identity to authorise, and the operator cannot
+// know they are on every member.
 func agentGRPCTLS(c *pgshardv1alpha1.PgShardCluster) agent.TLSFiles {
-	if !c.Spec.InternalTLS.AgentMTLS || !internalTLSEnabled(c) {
+	if !internalTLSEnabled(c) {
+		return agent.TLSFiles{}
+	}
+	if !c.Spec.InternalTLS.Issue && !c.Spec.InternalTLS.AgentMTLS {
 		return agent.TLSFiles{}
 	}
 	return agent.TLSFiles{
