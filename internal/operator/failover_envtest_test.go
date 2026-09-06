@@ -733,3 +733,90 @@ func TestASwitchoverThatCannotSucceedKeepsThePrimary(t *testing.T) {
 		t.Fatalf("the group must keep its primary: %+v", st)
 	}
 }
+
+// TestSwitchoverWaitsForATargetThatIsMomentarilyBehind: the pre-check asked
+// chooseCandidate -- the failover rule, "promote whoever holds the highest
+// flushed LSN" -- and treated "the winner is not the member you asked for"
+// as a refusal, dropping the annotation. Two healthy standbys of a live
+// primary are a few bytes apart all the time, so an ordinary switchover
+// failed whenever replication happened to be skewed at the instant of the
+// check, and the operator then had nothing left to retry from. That is the
+// e2e failure recorded as PGS-702, which read as a flaky test for a day.
+//
+// The target must not be promoted while it is behind: after a clean shutdown
+// the standbys can legitimately differ, and with ANY 1 only one of them is
+// guaranteed to hold each commit. So the answer is to wait, not to promote
+// the other member and not to refuse.
+func TestSwitchoverWaitsForATargetThatIsMomentarilyBehind(t *testing.T) {
+	r, fp, fa, c := healthyCluster(t, "swb")
+	// The target is behind its peer by a few bytes, as any two standbys are.
+	fp.standbys[podIP(1, 1)] = StandbyState{InRecovery: true, FlushLSN: 480}
+	fp.standbys[podIP(1, 2)] = StandbyState{InRecovery: true, FlushLSN: 500}
+	get(t, "swb", c)
+	base := c.DeepCopy()
+	c.Annotations = map[string]string{AnnotationSwitchover: "swb-shard-0-1"}
+	if err := k8sClient.Patch(context.Background(), c, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+	oldUID := func() string {
+		var pod corev1.Pod
+		get(t, "swb-shard-0-0", &pod)
+		return string(pod.UID)
+	}()
+
+	reconcile(t, r, c)
+
+	get(t, "swb", c)
+	if _, ok := c.Annotations[AnnotationSwitchover]; !ok {
+		t.Fatal("the request was dropped for a difference that passes on its own")
+	}
+	if len(fa.promotes) != 0 {
+		t.Fatalf("nothing may be promoted while the target is behind: %v", fa.promotes)
+	}
+	var pod corev1.Pod
+	get(t, "swb-shard-0-0", &pod)
+	if string(pod.UID) != oldUID {
+		t.Fatal("the primary must not be taken down while the switchover is waiting")
+	}
+
+	// It catches up, as a streaming standby does.
+	fp.standbys[podIP(1, 1)] = StandbyState{InRecovery: true, FlushLSN: 500}
+	fa.set(podIP(1, 0), AgentStatus{}, errors.New("stopped"))
+	reconcile(t, r, c)
+	if st := groupStatus(t, "swb-shard-0"); st.Primary != "swb-shard-0-1" {
+		t.Fatalf("the switchover must go ahead once the target is level: %+v", st)
+	}
+	get(t, "swb", c)
+	if _, ok := c.Annotations[AnnotationSwitchover]; ok {
+		t.Fatal("annotation must be cleared once the switchover is done")
+	}
+}
+
+// TestSwitchoverGivesUpOnATargetThatNeverCatchesUp: waiting cannot be
+// unbounded, or a target with something else wrong with it leaves the
+// annotation set for ever and every pass repeats the wait.
+func TestSwitchoverGivesUpOnATargetThatNeverCatchesUp(t *testing.T) {
+	r, fp, fa, c := healthyCluster(t, "swg")
+	r.SwitchoverCatchUp = time.Nanosecond
+	fp.standbys[podIP(1, 1)] = StandbyState{InRecovery: true, FlushLSN: 100}
+	fp.standbys[podIP(1, 2)] = StandbyState{InRecovery: true, FlushLSN: 500}
+	get(t, "swg", c)
+	base := c.DeepCopy()
+	c.Annotations = map[string]string{AnnotationSwitchover: "swg-shard-0-1"}
+	if err := k8sClient.Patch(context.Background(), c, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+
+	reconcile(t, r, c)
+
+	get(t, "swg", c)
+	if _, ok := c.Annotations[AnnotationSwitchover]; ok {
+		t.Fatal("a target that will not catch up must end in a refusal, not a permanent wait")
+	}
+	if len(fa.promotes) != 0 {
+		t.Fatalf("nothing may be promoted: %v", fa.promotes)
+	}
+	if st := groupStatus(t, "swg-shard-0"); st.Primary != "swg-shard-0-0" {
+		t.Fatalf("the group must keep its primary: %+v", st)
+	}
+}

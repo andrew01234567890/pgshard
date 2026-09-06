@@ -124,8 +124,25 @@ observation. The operator relabels the current primary `unhealthy`, deletes
 its pod (the agent shuts postgres down: smart for 5s, then fast, then releases
 the Lease) and runs the failover path with the target as the preferred
 candidate; it wins when it holds the maximum flushed LSN, otherwise the
-highest one does. The annotation is removed when the switchover finished (or
-was refused). Writes fail only between the shutdown and the promotion.
+highest one does.
+
+Before any of that, the operator checks the target can actually be promoted.
+Two outcomes, and the difference matters:
+
+- The target cannot hold every acknowledged commit -- it is unreachable, not
+  in recovery, or the reachable members cannot be shown to cover the
+  synchronous set. The switchover is **refused** and the annotation removed.
+- The target is admissible but another standby is **ahead of it right now**.
+  Two healthy standbys of a live primary are a few bytes apart all the time,
+  so this is not a reason to refuse: the request is kept and re-checked each
+  pass until the target draws level, for up to
+  `DefaultSwitchoverCatchUp` (60s), after which it is refused with the member
+  that stayed ahead named. The target is never promoted while it is behind --
+  after a clean shutdown standbys can legitimately differ, and under `ANY 1`
+  only one of them is guaranteed to hold each commit.
+
+The annotation is removed when the switchover finished (or was refused).
+Writes fail only between the shutdown and the promotion.
 
 ## Rolling operations
 

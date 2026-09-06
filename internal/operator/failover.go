@@ -324,6 +324,42 @@ func (r *ClusterReconciler) repromoteDue(key string) bool {
 	return true
 }
 
+// switchoverWaiting records that a switchover is waiting for its target to
+// catch up and returns how long it has been. It is the same shape as
+// unhealthyFor: in memory, per group, cleared as soon as the wait ends. An
+// operator restart resets it, which costs a switchover one more wait rather
+// than anything durable.
+func (r *ClusterReconciler) switchoverWaiting(key string, waiting bool) time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.switchoverSince == nil {
+		r.switchoverSince = map[string]time.Time{}
+	}
+	if !waiting {
+		delete(r.switchoverSince, key)
+		return 0
+	}
+	since, ok := r.switchoverSince[key]
+	if !ok {
+		since = r.now()
+		r.switchoverSince[key] = since
+	}
+	return r.now().Sub(since)
+}
+
+// DefaultSwitchoverCatchUp bounds that wait. A target that is streaming from
+// a live primary catches up in milliseconds; one that has not after this has
+// something else wrong with it, and saying so beats waiting for ever with the
+// annotation still set.
+const DefaultSwitchoverCatchUp = 60 * time.Second
+
+func (r *ClusterReconciler) switchoverCatchUp() time.Duration {
+	if r.SwitchoverCatchUp > 0 {
+		return r.SwitchoverCatchUp
+	}
+	return DefaultSwitchoverCatchUp
+}
+
 // unhealthyFor records that the group's primary was unhealthy at now and
 // returns how long it has been continuously so.
 func (r *ClusterReconciler) unhealthyFor(key string, unhealthy bool) time.Duration {
@@ -704,7 +740,9 @@ func (r *ClusterReconciler) pollInterval() time.Duration {
 // Without it, switchover deleted the primary pod and only then discovered
 // that no candidate qualified -- leaving the group with no primary, the
 // annotation still set, and every later pass repeating the discovery.
-func (r *ClusterReconciler) switchoverCandidate(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, state groupState, members map[string]*memberInfo, password, target string) string {
+// catchUp reports that the obstacle passes on its own: the target is
+// admissible and merely behind another standby right now.
+func (r *ClusterReconciler) switchoverCandidate(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, state groupState, members map[string]*memberInfo, password, target string) (why string, catchUp bool) {
 	old := state.primary
 	views := make([]memberView, 0, len(members))
 	for _, name := range g.MemberNames() {
@@ -725,11 +763,20 @@ func (r *ClusterReconciler) switchoverCandidate(ctx context.Context, c *pgshardv
 	candidate, err := chooseCandidate(views, old, target, minSyncStandbys(c))
 	switch {
 	case err != nil:
-		return err.Error()
+		return err.Error(), false
 	case candidate != target:
-		return fmt.Sprintf("%s holds a higher flushed LSN", candidate)
+		// Not a refusal. Both are streaming standbys of a primary that is
+		// still writing, so the target is behind only until it replays what
+		// it has already received -- milliseconds, and more of them on a
+		// busy machine, which is what made this look like a flaky test
+		// rather than a rule applied in the wrong place. Promoting the
+		// other member instead would be safe but is not what was asked, and
+		// promoting the target NOW would not be safe: after a clean
+		// shutdown the standbys can legitimately differ, and with ANY 1
+		// only one of them is guaranteed to hold each commit.
+		return fmt.Sprintf("%s holds a higher flushed LSN", candidate), true
 	}
-	return ""
+	return "", false
 }
 
 // admissiblePrimary reports why target must not be promoted, or "" when it

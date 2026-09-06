@@ -63,14 +63,21 @@ type ClusterReconciler struct {
 	// PodFenceTimeout bounds the wait for the old primary's Pod to go
 	// before a successor is promoted; zero means DefaultPodFenceTimeout.
 	PodFenceTimeout time.Duration
-	RolloutTimeout  time.Duration
-	Now             func() time.Time
+	// SwitchoverCatchUp bounds how long a planned switchover waits for its
+	// target to draw level with the furthest-ahead standby; zero means
+	// DefaultSwitchoverCatchUp.
+	SwitchoverCatchUp time.Duration
+	RolloutTimeout    time.Duration
+	Now               func() time.Time
 	// Metrics counts failovers and rolling-update progress; nil disables it.
 	Metrics *metrics.Operator
 
 	mu             sync.Mutex
 	unhealthySince map[string]time.Time
-	lastRepromote  map[string]time.Time
+	// switchoverSince is when a planned switchover started waiting for its
+	// target to catch up, per group.
+	switchoverSince map[string]time.Time
+	lastRepromote   map[string]time.Time
 }
 
 // SetupWithManager registers the reconciler and its watches.
@@ -1179,10 +1186,26 @@ func (r *ClusterReconciler) switchover(ctx context.Context, c *pgshardv1alpha1.P
 	// on an earlier pass, so it can say a member is streaming that is now
 	// crash-looping -- and the old code found that out only after deleting
 	// the primary pod, which left the group with no primary at all.
-	if why := r.switchoverCandidate(ctx, c, g, state, members, password, target); why != "" {
+	if why, catchUp := r.switchoverCandidate(ctx, c, g, state, members, password, target); why != "" {
+		key := g.Prefix()
+		if catchUp {
+			// The target is admissible and merely behind another standby
+			// for the moment. Keep the request: refusing here dropped the
+			// annotation for a difference that disappears in milliseconds,
+			// so an ordinary switchover failed whenever replication
+			// happened to be a few bytes skewed at the instant of the
+			// check.
+			if waited := r.switchoverWaiting(key, true); waited < r.switchoverCatchUp() {
+				log.Info("switchover waiting for the target to catch up", "reason", why, "waited", waited.Round(time.Second))
+				return obs, nil
+			}
+			why = fmt.Sprintf("%s, still after %s", why, r.switchoverCatchUp())
+		}
+		r.switchoverWaiting(key, false)
 		log.Info("switchover refused: the target cannot be promoted", "reason", why)
 		return obs, clearAnnotation()
 	}
+	r.switchoverWaiting(g.Prefix(), false)
 	if old := members[state.primary]; old != nil && old.pod != nil {
 		if err := r.patchRole(ctx, old.pod, RoleUnhealthy); err != nil {
 			return obs, err
