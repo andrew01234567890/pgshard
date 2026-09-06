@@ -27,9 +27,14 @@ type memStore struct {
 	saves      int
 	// failRunningSaves is how many times the save that records a step as
 	// running fails. Nothing else is failed.
-	failRunningSaves int
-	ddlLocks         map[string]string
-	serving          string
+	// failCompleteSaves fails that many writes of a COMPLETED migration
+	// row: the catalog blinking at the moment the applier records that a
+	// migration finished. MirrorAndSave honours it without applying
+	// anything, which is what its transaction does.
+	failCompleteSaves int
+	failRunningSaves  int
+	ddlLocks          map[string]string
+	serving           string
 }
 
 func (s *memStore) ServingShardSet(context.Context) (string, error) {
@@ -86,6 +91,10 @@ func (s *memStore) Save(_ context.Context, m catalog.DDLMigration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.saves++
+	if s.failCompleteSaves > 0 && m.State == catalog.MigrationComplete {
+		s.failCompleteSaves--
+		return errors.New("catalog unavailable")
+	}
 	// The catalog failing at exactly the moment that matters: the save
 	// that records a step is about to run.
 	if s.failRunningSaves > 0 {
@@ -103,6 +112,26 @@ func (s *memStore) Save(_ context.Context, m catalog.DDLMigration) error {
 		}
 	}
 	return fmt.Errorf("unknown migration %s", m.ID)
+}
+
+// MirrorAndSave is the fake's version of the one transaction the real store
+// uses: either both the mirror and the row land, or neither does.
+func (s *memStore) MirrorAndSave(ctx context.Context, stmts []catalog.Statement, m catalog.DDLMigration) error {
+	s.mu.Lock()
+	failNext := s.failCompleteSaves > 0 && m.State == catalog.MigrationComplete
+	if failNext {
+		s.failCompleteSaves--
+	}
+	s.mu.Unlock()
+	if failNext {
+		return errors.New("catalog unavailable")
+	}
+	for _, st := range stmts {
+		if err := s.Exec(ctx, st.SQL, st.Args...); err != nil {
+			return err
+		}
+	}
+	return s.Save(ctx, m)
 }
 
 func (s *memStore) Shards(context.Context, string) ([]int32, error) { return s.shards, nil }
@@ -1616,5 +1645,56 @@ func TestADroppedDDLRoleIsRecreatedRatherThanRetriedForever(t *testing.T) {
 	f.run(t)
 	if m := f.store.get(t, second); m.State != catalog.MigrationComplete {
 		t.Fatalf("after the role was dropped: %s: %s", m.State, m.Error)
+	}
+}
+
+// TestAMirrorThatLosesItsRowIsNotAppliedTwice: the applier mirrored the
+// desired state into the catalog and then saved the migration row. If the
+// save failed the mirror had already landed, the row still said running, and
+// the next pass recomputed the same completion and mirrored again. The
+// database rows tolerate that (ON CONFLICT DO NOTHING, DELETE); the role
+// deltas do not -- a grant delta is applied twice and the roles generation
+// bumped twice, so every group looks stale to the role verifier once more
+// than it should.
+func TestAMirrorThatLosesItsRowIsNotAppliedTwice(t *testing.T) {
+	f := newApplierFixture(t)
+	f.store.failCompleteSaves = 1
+	id := f.queue(catalog.DDLMigration{Statement: "grant select on orders to r", Kind: "GRANT", Scope: "all",
+		Meta: catalog.MigrationMeta{Roles: &catalog.RoleChanges{
+			Grants: []catalog.GrantChange{{Kind: "table", Name: "orders", Grantee: "r", Privileges: []string{"SELECT"}}}}}})
+
+	// The pass that finishes the migration cannot record it.
+	if _, err := f.app.RunOnce(context.Background()); err == nil {
+		t.Fatal("the save was supposed to fail")
+	}
+	if got := f.store.get(t, id).State; got == catalog.MigrationComplete {
+		t.Fatalf("state %q: the row was not saved, so it cannot say complete", got)
+	}
+	if n := len(f.store.execs); n != 0 {
+		t.Fatalf("the mirror was applied without its row: %v", f.store.execs)
+	}
+
+	// The next pass finishes it, once.
+	f.run(t)
+	if got := f.store.get(t, id).State; got != catalog.MigrationComplete {
+		t.Fatalf("state %q after the retry", got)
+	}
+	grants := 0
+	for _, e := range f.store.execs {
+		if strings.Contains(e, "grant") || strings.Contains(e, "GRANT") || strings.Contains(e, "role_grants") {
+			grants++
+		}
+	}
+	if grants == 0 {
+		t.Fatalf("the migration completed without mirroring anything: %v", f.store.execs)
+	}
+	seen := map[string]int{}
+	for _, e := range f.store.execs {
+		seen[e]++
+	}
+	for e, n := range seen {
+		if n > 1 {
+			t.Errorf("mirror statement applied %d times: %s", n, e)
+		}
 	}
 }

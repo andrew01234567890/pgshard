@@ -51,6 +51,15 @@ type MigrationStore interface {
 	SaveMeta(ctx context.Context, id string, meta catalog.MigrationMeta) error
 	// Exec runs a catalog statement (desired-state mirroring).
 	Exec(ctx context.Context, sql string, args ...any) error
+	// MirrorAndSave applies the desired-state statements of a finished
+	// migration and writes its row, in ONE transaction. Doing them in two
+	// left a window where the mirror had been applied and the row still
+	// said running: the next pass recomputed the same completion and
+	// mirrored again, and while the database rows use ON CONFLICT DO
+	// NOTHING and DELETE, the role deltas are not idempotent -- a grant
+	// delta is applied twice and the roles generation bumped twice, so
+	// every group looks stale to the role verifier once more than it is.
+	MirrorAndSave(ctx context.Context, stmts []catalog.Statement, m catalog.DDLMigration) error
 	// LockedDatabases lists the databases a workflow currently holds the
 	// DDL lock on.
 	LockedDatabases(ctx context.Context) (map[string]string, error)
@@ -128,6 +137,24 @@ func (s *PGMigrationStore) SaveMeta(ctx context.Context, id string, meta catalog
 func (s *PGMigrationStore) Exec(ctx context.Context, sql string, args ...any) error {
 	_, err := s.Pool.Exec(ctx, sql, args...)
 	return err
+}
+
+// MirrorAndSave implements MigrationStore.
+func (s *PGMigrationStore) MirrorAndSave(ctx context.Context, stmts []catalog.Statement, m catalog.DDLMigration) error {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	for _, st := range stmts {
+		if _, err := tx.Exec(ctx, st.SQL, st.Args...); err != nil {
+			return fmt.Errorf("applier: mirroring %s into the catalog: %w", m.Kind, err)
+		}
+	}
+	if err := catalog.SaveMigrationProgress(ctx, tx, m); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // Backoff bounds the retries of a shard step that could not take its lock.
@@ -409,12 +436,13 @@ func (a *Applier) drive(ctx context.Context, m catalog.DDLMigration) error {
 		}
 	}
 	if m.State == catalog.MigrationComplete {
-		if err := a.mirror(ctx, m); err != nil {
+		// One transaction: see MirrorAndSave. A mirror that lands without
+		// its row is applied again by the next pass.
+		if err := a.Store.MirrorAndSave(ctx, mirrorStatements(m), m); err != nil {
 			return err
 		}
 		a.recheckShardKey(ctx, m, logger)
-	}
-	if err := a.Store.Save(ctx, m); err != nil {
+	} else if err := a.Store.Save(ctx, m); err != nil {
 		return err
 	}
 	logger.Info("migration finished", "state", m.State, "error", m.Error)
@@ -1108,7 +1136,7 @@ func objectMatches(ctx context.Context, conn ShardConn, o catalog.MigrationObjec
 }
 
 // mirror writes the desired-state rows a completed DCL statement implies.
-func (a *Applier) mirror(ctx context.Context, m catalog.DDLMigration) error {
+func mirrorStatements(m catalog.DDLMigration) []catalog.Statement {
 	meta := m.Meta
 	stmts := catalog.RoleMirrorStatements(m.Database, meta)
 	switch meta.DatabaseOp {
@@ -1117,12 +1145,7 @@ func (a *Applier) mirror(ctx context.Context, m catalog.DDLMigration) error {
 	case "drop":
 		stmts = append(stmts, catalog.Statement{SQL: `DELETE FROM pgshard.databases WHERE name = $1`, Args: []any{meta.Database}})
 	}
-	for _, st := range stmts {
-		if err := a.Store.Exec(ctx, st.SQL, st.Args...); err != nil {
-			return fmt.Errorf("applier: mirroring %s into the catalog: %w", m.Kind, err)
-		}
-	}
-	return nil
+	return stmts
 }
 
 // skippedError marks a shard step whose object does not exist on that
