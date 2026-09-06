@@ -161,11 +161,28 @@ type Plan struct {
 type Session struct {
 	Database  string
 	HomeShard int32
+	// User is the login role, which is what "$user" in a search path
+	// resolves to. Without it the planner cannot look in the schema the
+	// backend will look in first.
+	User string
 	// SearchPath lists the schemas an unqualified table name is looked up
-	// in; nil means {"public"}.
+	// in; nil means DefaultSearchPath.
 	SearchPath []string
 	Snapshot   *snapshot.Snapshot
 }
+
+// DefaultSearchPath is what a backend runs with when nothing set one, and
+// what the router advertises in its startup ParameterStatus. The planner
+// used to default to {"public"} alone, so a declared table in the schema
+// named after the login role -- the PostgreSQL convention -- was resolved by
+// the backend and missed by the planner, which routed the statement as
+// undeclared.
+var DefaultSearchPath = []string{UserSchema, "public"}
+
+// UserSchema is the search-path element PostgreSQL resolves to the schema
+// named after session_user. It survives parsing as this literal string
+// whether it was written quoted or not.
+const UserSchema = "$user"
 
 // TypeHint is what the statement text says about a shard key parameter's
 // type: an explicit cast such as $1::int8 or $1::text.

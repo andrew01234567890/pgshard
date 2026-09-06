@@ -656,6 +656,28 @@ type walker struct {
 	sql  string
 }
 
+// resolveSearchPath substitutes "$user" with the login role's name, the way
+// PostgreSQL resolves it against session_user, and drops it when there is no
+// user to name a schema after. The path itself keeps the literal "$user"
+// wherever it is replayed onto a backend, which is what makes the backend
+// look in the same place this just did.
+func resolveSearchPath(path []string, user string) []string {
+	out := make([]string, 0, len(path))
+	for _, s := range path {
+		if s == UserSchema {
+			if user == "" {
+				continue
+			}
+			s = user
+		}
+		out = append(out, s)
+	}
+	if len(out) == 0 {
+		return []string{"public"}
+	}
+	return out
+}
+
 func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
 	name := rv.GetRelname()
 	if rv.GetSchemaname() == "" && w.ctes[name] {
@@ -669,13 +691,25 @@ func (w *walker) lookup(rv *pgquerypb.RangeVar) (*rel, error) {
 		return nil, pgwire.Errorf("0A000", "cross-database references are not implemented: %q", rv.GetCatalogname())
 	}
 	schemas := w.sess.SearchPath
+	defaulted := false
 	if rv.GetSchemaname() != "" {
 		schemas = []string{rv.GetSchemaname()}
 	} else if len(schemas) == 0 {
-		schemas = []string{"public"}
+		schemas, defaulted = DefaultSearchPath, true
 	}
+	schemas = resolveSearchPath(schemas, w.sess.User)
 	snap := w.sess.Snapshot
+	// Where a name that matches nothing is reported. PostgreSQL would put an
+	// unqualified CREATE in the first schema of the path that EXISTS, which
+	// the planner cannot know -- the snapshot lists declared tables, not
+	// schemas. So a defaulted path still reports public, exactly as it did
+	// before it started looking in the user's schema at all: changing where
+	// an unresolved name is reported is a change to where DDL is recorded,
+	// and that is not this fix.
 	r.schema = schemas[0]
+	if defaulted {
+		r.schema = "public"
+	}
 	for _, schema := range schemas {
 		if schema == "pg_catalog" || schema == "information_schema" || schema == "pg_temp" {
 			// System schemas never hold pgshard tables. An explicit qualifier

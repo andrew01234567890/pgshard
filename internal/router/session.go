@@ -392,7 +392,7 @@ func (e *Executor) Shard() Shard { return e.shard }
 // catalog shard set see no table placement and plan everything onto their
 // home shard.
 func (e *Executor) planSession() plan.Session {
-	sess := plan.Session{Database: e.info.Database, HomeShard: e.Home().ID, SearchPath: e.searchPath()}
+	sess := plan.Session{Database: e.info.Database, HomeShard: e.Home().ID, User: e.info.User, SearchPath: e.searchPath()}
 	if !e.catalogSession() {
 		sess.Snapshot = e.r.cfg.Snapshot()
 	}
