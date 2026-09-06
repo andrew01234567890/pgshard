@@ -89,6 +89,15 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		fmt.Fprintln(stderr, "pgshard-pooler run: --catalog-dsn and --shard-set must be given together")
 		return cli.ExitUsage
 	}
+	// A static generation or epoch alongside the catalog is a fence that
+	// disagrees with itself: it is what the pooler falls back to when its
+	// catalog view goes stale, so a pooler that has lost the catalog would
+	// go on admitting whatever those values happen to match instead of
+	// refusing.
+	if *catalogDSN != "" && (*generation != 0 || *epoch != 0) {
+		fmt.Fprintln(stderr, "pgshard-pooler run: --generation and --epoch are for a pooler without --catalog-dsn; with the catalog they are the values a stale pooler would wrongly keep serving")
+		return cli.ExitUsage
+	}
 	logger := slog.New(slog.NewTextHandler(stderr, nil))
 
 	addr := net.JoinHostPort(*pgHost, strconv.Itoa(*pgPort))

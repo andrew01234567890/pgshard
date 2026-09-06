@@ -69,6 +69,14 @@
   from a `Source`: static flags (`--generation`, `--epoch`) or the catalog
   (`--catalog-dsn --shard-set --shard-id`) through the snapshot watcher. The
   agent/operator will drive it later.
+
+  A pooler whose catalog view has stopped being refreshed refuses
+  **everything**, including a request whose generation matches: the numbers
+  in a stale view are the last ones it read, and enforcing a fence from those
+  admits a router that has moved on. The refusal names the pooler as the
+  stale party rather than the router. That is also why `--generation` and
+  `--epoch` are refused together with `--catalog-dsn` — they are exactly the
+  values a pooler that lost the catalog would otherwise keep serving.
 - **Cancel.** The `Cancel` RPC (or an in-stream `CancelRequest`) sends a
   PostgreSQL `CancelRequest` for the backend bound to that session over a
   fresh connection.
