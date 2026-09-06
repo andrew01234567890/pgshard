@@ -59,6 +59,15 @@ const (
 	ReasonReaderActive = "SLOT_READER_ACTIVE"
 )
 
+// fenceStatus turns a fence refusal into the error the stream RPCs return.
+// FailedPrecondition rather than an error message on the response: a stream
+// is a long-lived call, and the caller's move is to reopen it against the
+// member the shard now names.
+func fenceStatus(e *pgshardv1.Error) error {
+	st := status.Newf(codes.FailedPrecondition, "%s (%s)", e.GetMessage(), e.GetSqlstate())
+	return reasoned(st, e.GetReason().String())
+}
+
 // reasoned attaches a structured reason to st, returning st unchanged if
 // the detail cannot be attached.
 func reasoned(st *status.Status, reason string) error {
@@ -183,6 +192,12 @@ func (s *Server) StreamChanges(req *pgshardv1.StreamRequest, srv pgshardv1.Poole
 // confirmed -- a caller that records what it asked for instead believes the
 // slot advanced when it did not, and never asks again.
 func (s *Server) Ack(ctx context.Context, req *pgshardv1.AckRequest) (*pgshardv1.AckResponse, error) {
+	// An ack advances a slot, which is a write: confirming a position on a
+	// member the shard has moved off discards WAL the new primary's slot
+	// still needs.
+	if e := streamFence(s.cfg.Source.View(), req.GetGeneration()); e != nil {
+		return &pgshardv1.AckResponse{Error: e}, nil
+	}
 	slot, err := s.slotOf(req.GetSlot(), req.GetStream())
 	if err != nil {
 		return nil, err
@@ -224,6 +239,9 @@ func (s *Server) runStream(ctx context.Context, req *pgshardv1.StreamRequest, em
 	}
 	if s.draining.Load() {
 		return errUnavailable
+	}
+	if e := streamFence(s.cfg.Source.View(), req.GetGeneration()); e != nil {
+		return fenceStatus(e)
 	}
 	slot, err := s.slotOf(req.GetSlot(), req.GetStream())
 	if err != nil {
@@ -313,6 +331,15 @@ func (s *Server) runStream(ctx context.Context, req *pgshardv1.StreamRequest, em
 	for {
 		if ctx.Err() != nil {
 			return nil
+		}
+		// Re-checked every pass, not only at the open: the fence that
+		// matters for a stream is the one that ends it. A promotion moves
+		// the shard's epoch while this call sits in Receive, and the
+		// router's own check only runs after a batch has already been
+		// delivered -- so without this the commits in that batch reach the
+		// consumer, and a position is recorded for them.
+		if e := streamFence(s.cfg.Source.View(), req.GetGeneration()); e != nil {
+			return fenceStatus(e)
 		}
 		select {
 		case <-reader.wake:

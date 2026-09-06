@@ -93,6 +93,12 @@ func (s *Server) runCopy(ctx context.Context, req *pgshardv1.CopyTablesRequest, 
 	if s.draining.Load() {
 		return errUnavailable
 	}
+	// Before the slot: a copy creates the stream slot and exports a
+	// snapshot on it, so an unfenced one puts both on a member the shard
+	// has moved off.
+	if e := streamFence(s.cfg.Source.View(), req.GetGeneration()); e != nil {
+		return fenceStatus(e)
+	}
 	if !catalog.ValidStreamName(req.GetStream()) {
 		return status.Error(codes.InvalidArgument, "a valid stream name is required")
 	}

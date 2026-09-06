@@ -156,13 +156,13 @@ func TestStreamRefusals(t *testing.T) {
 	if slot, _ := s.slotOf("", "orders"); slot != "pgshard_orders_shard0" {
 		t.Fatal(slot)
 	}
-	err := s.runStream(context.Background(), &pgshardv1.StreamRequest{Stream: "orders"}, nil, false)
+	err := s.runStream(context.Background(), &pgshardv1.StreamRequest{Stream: "orders", Generation: gen(0, 0)}, nil, false)
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("no DSN: %v", err)
 	}
 	s.cfg.Stream.DSN = "postgres://localhost/x"
 	s.draining.Store(true)
-	if err := s.runStream(context.Background(), &pgshardv1.StreamRequest{Stream: "orders"}, nil, false); status.Code(err) != codes.Unavailable {
+	if err := s.runStream(context.Background(), &pgshardv1.StreamRequest{Stream: "orders", Generation: gen(0, 0)}, nil, false); status.Code(err) != codes.Unavailable {
 		t.Fatalf("draining: %v", err)
 	}
 	s.draining.Store(false)
@@ -187,7 +187,7 @@ func TestStreamRefusals(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	if _, err := s.Ack(ctx, &pgshardv1.AckRequest{}); status.Code(err) != codes.InvalidArgument {
+	if _, err := s.Ack(ctx, &pgshardv1.AckRequest{Generation: gen(0, 0)}); status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("ack without slot: %v", err)
 	}
 	unconfirmed := &streamReader{wake: make(chan struct{}, 1)}
@@ -195,7 +195,7 @@ func TestStreamRefusals(t *testing.T) {
 	s.mu.Lock()
 	s.readers["b"] = unconfirmed
 	s.mu.Unlock()
-	if _, err := s.Ack(ctx, &pgshardv1.AckRequest{Slot: "b", Lsn: 5}); err == nil {
+	if _, err := s.Ack(ctx, &pgshardv1.AckRequest{Slot: "b", Lsn: 5, Generation: gen(0, 0)}); err == nil {
 		t.Fatal("ack must give up when no reader confirms")
 	}
 }
@@ -208,7 +208,7 @@ func TestAckClampsToDelivered(t *testing.T) {
 	s.mu.Lock()
 	s.readers = map[string]*streamReader{"b": r}
 	s.mu.Unlock()
-	resp, err := s.Ack(context.Background(), &pgshardv1.AckRequest{Slot: "b", Lsn: 250})
+	resp, err := s.Ack(context.Background(), &pgshardv1.AckRequest{Slot: "b", Lsn: 250, Generation: gen(0, 0)})
 	if err != nil || resp.GetError() != nil {
 		t.Fatalf("over-ack: %v %v", resp, err)
 	}
@@ -217,7 +217,7 @@ func TestAckClampsToDelivered(t *testing.T) {
 	}
 	r.delivered.Store(300)
 	r.flushed.Store(300)
-	if _, err := s.Ack(context.Background(), &pgshardv1.AckRequest{Slot: "b", Lsn: 250}); err != nil {
+	if _, err := s.Ack(context.Background(), &pgshardv1.AckRequest{Slot: "b", Lsn: 250, Generation: gen(0, 0)}); err != nil {
 		t.Fatal(err)
 	}
 	if got := r.acked.Load(); got != 250 {
@@ -302,7 +302,7 @@ func TestOnlyAGonePositionSaysPositionTooOld(t *testing.T) {
 // again. The slot stayed where it was and the shard's WAL was retained until
 // the next commit on it.
 func TestAnAckAtTheStartPositionIsNotClampedToNothing(t *testing.T) {
-	s := &Server{}
+	s := NewServer(Config{Source: NewStaticSource(View{})})
 	s.cfg.Stream.Shard = "shard0"
 	r, err := s.claimSlot("pgshard_orders_shard0", 4000)
 	if err != nil {
@@ -319,7 +319,7 @@ func TestAnAckAtTheStartPositionIsNotClampedToNothing(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	resp, err := s.Ack(ctx, &pgshardv1.AckRequest{Stream: "orders", Lsn: 4000})
+	resp, err := s.Ack(ctx, &pgshardv1.AckRequest{Stream: "orders", Lsn: 4000, Generation: gen(0, 0)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -336,7 +336,7 @@ func TestAnAckAtTheStartPositionIsNotClampedToNothing(t *testing.T) {
 // caller has to be told, or it records the LSN it asked for as done and
 // never asks again.
 func TestAnAckBeyondWhatWasDeliveredSaysWhatItConfirmed(t *testing.T) {
-	s := &Server{}
+	s := NewServer(Config{Source: NewStaticSource(View{})})
 	s.cfg.Stream.Shard = "shard0"
 	r, err := s.claimSlot("pgshard_orders_shard0", 100)
 	if err != nil {
@@ -348,7 +348,7 @@ func TestAnAckBeyondWhatWasDeliveredSaysWhatItConfirmed(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	resp, err := s.Ack(ctx, &pgshardv1.AckRequest{Stream: "orders", Lsn: 9999})
+	resp, err := s.Ack(ctx, &pgshardv1.AckRequest{Stream: "orders", Lsn: 9999, Generation: gen(0, 0)})
 	if err != nil {
 		t.Fatal(err)
 	}

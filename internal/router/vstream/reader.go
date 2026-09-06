@@ -168,6 +168,16 @@ func fatal(err error, sh router.Shard) *pgshardv1.VEvent_Error {
 			// Another reader holds the slot: the consumer reconnects, and
 			// telling it the position is gone would make it re-copy.
 			return nil
+		case pgshardv1.Reason_REASON_STALE_GENERATION.String():
+			// The pooler's own view of the shard moved: the primary was
+			// promoted, or the shard map changed, under a stream now open
+			// against the wrong member. That is errEpochChanged seen from
+			// the other end, and it is answered the same way -- reopen
+			// against the member the topology now names, after a backoff,
+			// because this router may not have reloaded yet. Reporting it
+			// would end a change stream for a failover it is meant to
+			// survive.
+			return nil
 		}
 	}
 	// A pooler from before the structured reason only carries the text.
@@ -197,7 +207,12 @@ func (r *reader) once(ctx context.Context) error {
 	}
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	req := &pgshardv1.StreamRequest{Stream: r.stream, Database: r.database, StartLsn: r.delivered}
+	// The same epoch this loop latched, so the pooler refuses the open the
+	// moment its own view has moved on -- and keeps refusing on every pass
+	// of its receive loop. The check below only runs once a batch has been
+	// received, which is one batch too late.
+	req := &pgshardv1.StreamRequest{Stream: r.stream, Database: r.database, StartLsn: r.delivered,
+		Generation: &pgshardv1.Generation{ShardMapGeneration: r.topo.Generation(), PrimaryEpoch: epoch}}
 	if r.twoPhase {
 		req.Options = map[string]string{"two_phase": "on"}
 	}

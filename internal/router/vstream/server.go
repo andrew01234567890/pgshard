@@ -225,7 +225,8 @@ func (s *Server) ackShard(ctx context.Context, stream string, sh router.Shard, l
 	if err != nil {
 		return 0, err
 	}
-	r, err := client.Ack(ctx, &pgshardv1.AckRequest{Stream: stream, Lsn: lsn})
+	r, err := client.Ack(ctx, &pgshardv1.AckRequest{Stream: stream, Lsn: lsn,
+		Generation: &pgshardv1.Generation{ShardMapGeneration: s.Topology.Generation(), PrimaryEpoch: s.Topology.Epoch(sh)}})
 	if err != nil {
 		return 0, err
 	}

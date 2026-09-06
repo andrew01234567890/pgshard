@@ -3,6 +3,7 @@ package pooler
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,13 +32,13 @@ func (h *pgHarness) testStream(t *testing.T) {
 		_, _ = h.admin.Exec(ctx, "SELECT pg_drop_replication_slot('pgshard_orders_shard0')")
 	})
 
-	if _, err := h.client.Ack(ctx, &pgshardv1.AckRequest{}); status.Code(err) != codes.InvalidArgument {
+	if _, err := h.client.Ack(ctx, &pgshardv1.AckRequest{Generation: gen(3, 1)}); status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("ack without slot: %v", err)
 	}
-	if r, err := h.client.Ack(ctx, &pgshardv1.AckRequest{Stream: "orders", Lsn: 1}); err != nil || r.GetError() == nil {
+	if r, err := h.client.Ack(ctx, &pgshardv1.AckRequest{Stream: "orders", Lsn: 1, Generation: gen(3, 1)}); err != nil || r.GetError() == nil {
 		t.Fatalf("ack without reader: %v %v", r, err)
 	}
-	if s, err := h.client.Stream(ctx, &pgshardv1.StreamRequest{Slot: "nope"}); err == nil {
+	if s, err := h.client.Stream(ctx, &pgshardv1.StreamRequest{Slot: "nope", Generation: gen(3, 1)}); err == nil {
 		if _, err := s.Recv(); status.Code(err) != codes.FailedPrecondition {
 			t.Fatalf("missing slot: %v", err)
 		}
@@ -45,7 +46,7 @@ func (h *pgHarness) testStream(t *testing.T) {
 
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	stream, err := h.client.Stream(sctx, &pgshardv1.StreamRequest{Stream: "orders", Options: map[string]string{"two_phase": "on"}})
+	stream, err := h.client.Stream(sctx, &pgshardv1.StreamRequest{Stream: "orders", Options: map[string]string{"two_phase": "on"}, Generation: gen(3, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +96,7 @@ func (h *pgHarness) testStream(t *testing.T) {
 	}
 
 	// A second reader on the same slot is refused.
-	if dup, err := h.client.Stream(ctx, &pgshardv1.StreamRequest{Stream: "orders"}); err == nil {
+	if dup, err := h.client.Stream(ctx, &pgshardv1.StreamRequest{Stream: "orders", Generation: gen(3, 1)}); err == nil {
 		if _, err := dup.Recv(); status.Code(err) != codes.FailedPrecondition {
 			t.Fatalf("concurrent reader: %v", err)
 		}
@@ -107,7 +108,7 @@ func (h *pgHarness) testStream(t *testing.T) {
 		t.Fatalf("heartbeat: %v", kinds(hb))
 	}
 
-	ack, err := h.client.Ack(ctx, &pgshardv1.AckRequest{Stream: "orders", Lsn: cp.EndLsn})
+	ack, err := h.client.Ack(ctx, &pgshardv1.AckRequest{Stream: "orders", Lsn: cp.EndLsn, Generation: gen(3, 1)})
 	if err != nil || ack.GetError() != nil {
 		t.Fatalf("ack: %v %v", ack, err)
 	}
@@ -128,7 +129,7 @@ func (h *pgHarness) testStream(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	const overAck = uint64(1) << 62
-	if ack, err = h.client.Ack(ctx, &pgshardv1.AckRequest{Stream: "orders", Lsn: overAck}); err != nil || ack.GetError() != nil {
+	if ack, err = h.client.Ack(ctx, &pgshardv1.AckRequest{Stream: "orders", Lsn: overAck, Generation: gen(3, 1)}); err != nil || ack.GetError() != nil {
 		t.Fatalf("over-ack: %v %v", ack, err)
 	}
 	// A single read here would pass whether the over-ack was clamped or
@@ -161,7 +162,7 @@ func (h *pgHarness) testStream(t *testing.T) {
 	if _, err := h.admin.Exec(ctx, "INSERT INTO orders VALUES (4, 'after-ack')"); err != nil {
 		t.Fatal(err)
 	}
-	stream2, err := h.client.Stream(ctx, &pgshardv1.StreamRequest{Slot: "pgshard_orders_shard0", BatchBytes: 1})
+	stream2, err := h.client.Stream(ctx, &pgshardv1.StreamRequest{Slot: "pgshard_orders_shard0", BatchBytes: 1, Generation: gen(3, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,11 +180,61 @@ func (h *pgHarness) testStream(t *testing.T) {
 	}
 
 	// The per-event RPC delivers the same stream one event at a time.
-	single, err := h.client.StreamChanges(ctx, &pgshardv1.StreamRequest{Slot: "pgshard_orders_shard0"})
+	single, err := h.client.StreamChanges(ctx, &pgshardv1.StreamRequest{Slot: "pgshard_orders_shard0", Generation: gen(3, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := single.Recv(); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("StreamChanges must be refused while Stream holds the slot: %v", err)
+	}
+}
+
+// A change stream is a long-lived call, and the fence that matters for one
+// is the one that ends it. The router's own check runs only after a batch
+// has been received -- one batch too late, since those commits have already
+// reached the consumer and a position has been recorded for them -- so the
+// pooler re-checks its view on every pass of the receive loop.
+//
+// The first batch is taken before the view moves, deliberately: it proves
+// the stream was established and running, so what ends it is the re-check
+// and not the one at the open.
+func (h *pgHarness) testStreamEndsOnEpochChange(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	for _, sql := range []string{
+		"create table fenced (id int primary key)",
+		"select pg_create_logical_replication_slot('pgshard_fenced_shard0', 'pgoutput')",
+	} {
+		if _, err := h.admin.Exec(ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	t.Cleanup(func() {
+		_, _ = h.admin.Exec(context.Background(), "select pg_drop_replication_slot('pgshard_fenced_shard0')")
+	})
+	t.Cleanup(func() {
+		h.src.Set(View{Generation: 3, Epoch: 1, Role: pgshardv1.HealthStatus_ROLE_PRIMARY})
+	})
+
+	stream, err := h.client.Stream(ctx, &pgshardv1.StreamRequest{Stream: "fenced", Generation: gen(3, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Recv(); err != nil {
+		t.Fatalf("the stream never started: %v", err)
+	}
+	// Now the shard fails over under the running stream.
+	h.src.Set(View{Generation: 3, Epoch: 2, Role: pgshardv1.HealthStatus_ROLE_PRIMARY})
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if _, err := stream.Recv(); err != nil {
+			if !strings.Contains(err.Error(), "stale primary epoch") {
+				t.Fatalf("the stream ended with %v, want the epoch fence", err)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the stream went on delivering after the shard's epoch moved")
+		}
 	}
 }

@@ -439,6 +439,12 @@ message StreamRequest {
   // Flush a batch once it holds this many bytes of tuple data; zero means
   // one batch per transaction (64 KiB cap).
   uint32 batch_bytes = 7;
+  // Shard map generation and primary epoch this stream is opened under, as
+  // Execute carries. A change stream is long-lived and its slot lives on
+  // the primary, so an unfenced one delivers a demoted primary's commits --
+  // which exist only on the old timeline -- and the consumer records a
+  // position for them.
+  Generation generation = 8;
 }
 
 // AckRequest confirms events up to lsn for a slot.
@@ -448,6 +454,10 @@ message AckRequest {
   string stream = 2;
   // Highest end position processed by the consumer.
   uint64 lsn = 3;
+  // Shard map generation and primary epoch, as Execute carries. An ack
+  // advances a slot, which is a write: confirming a position on a member
+  // the shard has moved off discards WAL the new primary still needs.
+  Generation generation = 4;
 }
 
 // AckResponse reports the outcome.
@@ -481,6 +491,10 @@ message CopyTablesRequest {
   string resume_table = 8;
   // Last key delivered for the resumed table, as sent in Rows.lastpk.
   bytes resume_lastpk = 9;
+  // Shard map generation and primary epoch, as Execute carries. A copy
+  // creates the stream slot and exports a snapshot on it, so an unfenced
+  // one puts both on a member the shard has moved off.
+  Generation generation = 10;
 }
 
 // CopyTablesResponse is one message of the copy.
