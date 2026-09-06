@@ -58,7 +58,7 @@ type Prober interface {
 	// WriteFenced reads the catalog write fence, given a catalog DSN.
 	WriteFenced(ctx context.Context, dsn string) (bool, error)
 	MigrateCatalog(ctx context.Context, dsn string) error
-	SetRouterPassword(ctx context.Context, dsn, password string) error
+	SetLoginPassword(ctx context.Context, dsn, role, password string) error
 	// SeedBootstrapRole publishes a SCRAM verifier for rolname in
 	// pgshard.roles, so the generated credential can reach the cluster
 	// through the router and create the first role of its own.
@@ -744,19 +744,19 @@ func (PgxProber) MigrateCatalog(ctx context.Context, dsn string) error {
 	return catalog.Migrate(ctx, conn)
 }
 
-// SetRouterPassword gives the router's login role the password the operator
+// SetLoginPassword gives one of the cluster's own login roles the password the operator
 // generated for this cluster. It runs on every pass: the role is the same
 // for every cluster and its password is not, so the catalog has to be told
 // which one, and saying it again is how a restored or rebuilt catalog gets
 // back in step with the Secret.
-func (PgxProber) SetRouterPassword(ctx context.Context, dsn, password string) error {
+func (PgxProber) SetLoginPassword(ctx context.Context, dsn, role, password string) error {
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = conn.Close(ctx) }()
 	// ALTER ROLE takes no parameters, so the password is a quoted literal.
-	_, err = conn.Exec(ctx, `ALTER ROLE `+catalog.RouterRole+` WITH LOGIN PASSWORD `+quoteLiteral(password))
+	_, err = conn.Exec(ctx, `ALTER ROLE `+pgx.Identifier{role}.Sanitize()+` WITH LOGIN PASSWORD `+quoteLiteral(password))
 	return err
 }
 
@@ -897,10 +897,10 @@ func (b boundedProber) MigrateCatalog(ctx context.Context, dsn string) error {
 	return b.Inner.MigrateCatalog(ctx, dsn)
 }
 
-func (b boundedProber) SetRouterPassword(ctx context.Context, dsn, password string) error {
+func (b boundedProber) SetLoginPassword(ctx context.Context, dsn, role, password string) error {
 	ctx, cancel := b.bound(ctx)
 	defer cancel()
-	return b.Inner.SetRouterPassword(ctx, dsn, password)
+	return b.Inner.SetLoginPassword(ctx, dsn, role, password)
 }
 
 // BootstrapVerifier implements Prober.

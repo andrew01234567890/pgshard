@@ -599,10 +599,10 @@ func (f *fakeProber) MigrateCatalog(_ context.Context, dsn string) error {
 	return nil
 }
 
-func (f *fakeProber) SetRouterPassword(_ context.Context, dsn, password string) error {
+func (f *fakeProber) SetLoginPassword(_ context.Context, dsn, role, password string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.routerPasswords = append(f.routerPasswords, hostOf(dsn)+"="+password)
+	f.routerPasswords = append(f.routerPasswords, hostOf(dsn)+"/"+role+"="+password)
 	return nil
 }
 
@@ -1345,8 +1345,24 @@ func TestRouterCredentialIsGeneratedAndApplied(t *testing.T) {
 	if len(applied) == 0 {
 		t.Fatal("the catalog was never told the router's password")
 	}
-	if got := applied[len(applied)-1]; got != "rc-catalog-rw.default.svc="+pw {
-		t.Errorf("last ALTER ROLE = %q, want the generated password on the catalog", got)
+	if want := "rc-catalog-rw.default.svc/" + catalog.RouterRole + "=" + pw; !slices.Contains(applied, want) {
+		t.Errorf("ALTER ROLE calls %v, want %q", applied, want)
+	}
+
+	// The controller has its own login on the same catalog, and the same
+	// reason for the password to be applied on every pass.
+	var ctl corev1.Secret
+	get(t, ControllerSecretName(c.Name), &ctl)
+	ownedBy(t, &ctl, c)
+	ctlPw := string(ctl.Data["password"])
+	if ctlPw == pw || ctlPw == string(su.Data["password"]) {
+		t.Error("the controller's password must be its own")
+	}
+	if string(ctl.Data["username"]) != catalog.ControllerRole {
+		t.Errorf("username %q, want %q", ctl.Data["username"], catalog.ControllerRole)
+	}
+	if want := "rc-catalog-rw.default.svc/" + catalog.ControllerRole + "=" + ctlPw; !slices.Contains(applied, want) {
+		t.Errorf("ALTER ROLE calls %v, want %q", applied, want)
 	}
 
 	reconcile(t, r, c)

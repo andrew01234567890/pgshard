@@ -96,7 +96,8 @@ passes between migrations:
    `unmanaged` for a non-superuser role on the group that is not in
    `pgshard.roles` (reported, never touched), or `unmanaged_superuser`
    (`details.superuser = true`) for a role listed in `pgshard.roles` that is
-   a superuser on the group — `postgres`, the controller's own login — which
+   a superuser on the group — `postgres`, which the controller still uses to
+   reach a shard — which
    is reported and never altered, granted or given settings, so a listing
    can never demote it. Drifted and missing managed
    roles are repaired at once by re-materializing just those roles; the row

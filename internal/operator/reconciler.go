@@ -234,6 +234,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// readiness was going to create. Nothing here needs the catalog: it is a
 	// generated password, and the role it belongs to is given that password
 	// later, once there is a catalog to give it to.
+	if _, err := r.ensureControllerSecret(ctx, &cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("controller secret: %w", err)
+	}
 	if _, err := r.ensureRouterSecret(ctx, &cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("router secret: %w", err)
 	}
@@ -455,6 +458,46 @@ func (r *ClusterReconciler) ensureRouterSecret(ctx context.Context, c *pgshardv1
 	if err := r.Create(ctx, &sec); err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			return r.ensureRouterSecret(ctx, c)
+		}
+		return "", err
+	}
+	return pw, nil
+}
+
+// ensureControllerSecret generates the controller's catalog password. The
+// controller drives every workflow, so it writes the whole pgshard schema --
+// but it does not need the superuser to do that, and holding one made
+// anything that could read its environment direct write access to every
+// shard and the catalog, bypassing the router entirely.
+func (r *ClusterReconciler) ensureControllerSecret(ctx context.Context, c *pgshardv1alpha1.PgShardCluster) (string, error) {
+	key := types.NamespacedName{Namespace: c.Namespace, Name: ControllerSecretName(c.Name)}
+	var sec corev1.Secret
+	err := r.Get(ctx, key, &sec)
+	if err == nil {
+		if pw := sec.Data[secretKey]; len(pw) > 0 {
+			return string(pw), nil
+		}
+		return "", fmt.Errorf("secret %s has no %q key", key.Name, secretKey)
+	}
+	if !apierrors.IsNotFound(err) {
+		return "", err
+	}
+	buf := make([]byte, 24)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	pw := hex.EncodeToString(buf)
+	sec = corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace, Labels: map[string]string{LabelCluster: c.Name}},
+		Type:       corev1.SecretTypeBasicAuth,
+		StringData: map[string]string{"username": catalog.ControllerRole, secretKey: pw},
+	}
+	if err := controllerutil.SetControllerReference(c, &sec, r.Scheme()); err != nil {
+		return "", err
+	}
+	if err := r.Create(ctx, &sec); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return r.ensureControllerSecret(ctx, c)
 		}
 		return "", err
 	}
@@ -1371,7 +1414,14 @@ func (r *ClusterReconciler) reconcileCatalogSchema(ctx context.Context, c *pgsha
 		if err != nil {
 			return err
 		}
-		return r.Prober.SetRouterPassword(ctx, dsn, pw)
+		if err := r.Prober.SetLoginPassword(ctx, dsn, routerLoginRole, pw); err != nil {
+			return err
+		}
+		cpw, err := r.ensureControllerSecret(ctx, c)
+		if err != nil {
+			return err
+		}
+		return r.Prober.SetLoginPassword(ctx, dsn, controllerLoginRole, cpw)
 	}
 	// The router authenticates against pgshard.roles and the migrations
 	// leave it empty, so without this nobody can reach the cluster through

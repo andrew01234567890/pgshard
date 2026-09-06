@@ -138,5 +138,11 @@ pgshard-controller run --catalog-dsn postgres://... \
     --listen 127.0.0.1:15500 --tls-cert ... --tls-key ... --tls-ca ...
 ```
 
+`--catalog-password-file PATH` splices a password read from that file into
+`--catalog-dsn`. The catalog login is `pgshard_controller`, not the
+superuser, while `PGPASSWORD` is still the superuser's for the shard and
+subscription DSNs — and libpq would otherwise apply that variable to the
+catalog connection too.
+
 `--insecure-dev` serves plaintext gRPC for development; `--listen ""` runs
 the reconciler without a gRPC listener.

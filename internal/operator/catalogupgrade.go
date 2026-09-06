@@ -156,8 +156,20 @@ func (r *ClusterReconciler) reconcileCatalogUpgrade(ctx context.Context, c *pgsh
 			up.Message = "router credential: " + err.Error()
 			break
 		}
-		if err := r.Prober.SetRouterPassword(ctx, targetDSN, routerPW); err != nil {
+		if err := r.Prober.SetLoginPassword(ctx, targetDSN, routerLoginRole, routerPW); err != nil {
 			up.Message = "router credential on the new catalog: " + err.Error()
+			break
+		}
+		// The new catalog has the controller's role from its own migration
+		// and no password for it; without this the controller cannot reach
+		// the catalog it has just been switched to.
+		controllerPW, err := r.ensureControllerSecret(ctx, c)
+		if err != nil {
+			up.Message = "controller credential: " + err.Error()
+			break
+		}
+		if err := r.Prober.SetLoginPassword(ctx, targetDSN, controllerLoginRole, controllerPW); err != nil {
+			up.Message = "controller credential on the new catalog: " + err.Error()
 			break
 		}
 		up.Stage = CatalogUpgradeCopying

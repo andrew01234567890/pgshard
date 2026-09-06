@@ -172,10 +172,14 @@ func PrimaryConninfo(c *Config) string {
 // component connects as; see instance.go, which runs initdb -U postgres.
 const superuserRole = "postgres"
 
-// routerRole mirrors catalog.RouterRole. The agent renders configuration
-// for a member and does not otherwise know the catalog schema, so the name
-// is repeated rather than imported; a test keeps them equal.
-const routerRole = "pgshard_router"
+// routerRole and controllerRole mirror catalog.RouterRole and
+// catalog.ControllerRole. The agent renders configuration for a member and
+// does not otherwise know the catalog schema, so the names are repeated
+// rather than imported; a test keeps them equal.
+const (
+	routerRole     = "pgshard_router"
+	controllerRole = "pgshard_controller"
+)
 
 // RenderPgHBAConf renders pg_hba.conf.
 func RenderPgHBAConf(c *Config) string {
@@ -194,10 +198,11 @@ func RenderPgHBAConf(c *Config) string {
 	b.WriteString("local   all             all                                     scram-sha-256\n")
 	b.WriteString("local   replication     all                                     scram-sha-256\n")
 	b.WriteString(tlsLine)
-	// TCP is the control plane's path and nothing else's. Replicas, the
-	// controller and the router all reach a member as the superuser; the
-	// pooler an application actually talks through connects over the unix
-	// socket above, so an application role has no reason to arrive here.
+	// TCP is the control plane's path and nothing else's. Replicas and the
+	// controller's shard work reach a member as the superuser, the router
+	// and the controller reach the catalog as their own roles; the pooler
+	// an application actually talks through connects over the unix socket
+	// above, so an application role has no reason to arrive here.
 	//
 	// It had one before: any role could authenticate over TCP, and the
 	// roles are materialised with their verifiers on every group. A client
@@ -206,16 +211,19 @@ func RenderPgHBAConf(c *Config) string {
 	// shard-key routing, the write fences a cutover raises, and the
 	// coordination that makes a multi-shard write atomic. SCRAM proved who
 	// it was; nothing checked it had come the right way.
-	fmt.Fprintf(&b, "%-8s all             %-15s %-23s scram-sha-256\n", hostKeyword(host), superuserRole, cidr)
-	fmt.Fprintf(&b, "%-8s replication     %-15s %-23s scram-sha-256\n", hostKeyword(host), superuserRole, cidr)
-	// The router reaches the catalog as its own least-privilege role rather
-	// than as the superuser, and it does so over TCP like the rest of the
-	// control plane. The role exists only where the catalog schema does, so
-	// on a shard this line matches nothing.
-	fmt.Fprintf(&b, "%-8s all             %-15s %-23s scram-sha-256\n", hostKeyword(host), routerRole, cidr)
-	fmt.Fprintf(&b, "%-8s all             all             %-23s reject\n", hostKeyword(host), cidr)
+	fmt.Fprintf(&b, "%-8s all             %-18s %-23s scram-sha-256\n", hostKeyword(host), superuserRole, cidr)
+	fmt.Fprintf(&b, "%-8s replication     %-18s %-23s scram-sha-256\n", hostKeyword(host), superuserRole, cidr)
+	// The router and the controller reach the catalog as their own
+	// least-privilege roles rather than as the superuser, and they do so
+	// over TCP like the rest of the control plane. The roles exist only
+	// where the catalog schema does, so on a shard these lines match
+	// nothing -- the controller's shard connections are still the
+	// superuser's, and matched by the line above.
+	fmt.Fprintf(&b, "%-8s all             %-18s %-23s scram-sha-256\n", hostKeyword(host), routerRole, cidr)
+	fmt.Fprintf(&b, "%-8s all             %-18s %-23s scram-sha-256\n", hostKeyword(host), controllerRole, cidr)
+	fmt.Fprintf(&b, "%-8s all             all                %-23s reject\n", hostKeyword(host), cidr)
 	if host == "hostssl" {
-		fmt.Fprintf(&b, "%-8s all             all             %-23s reject\n", "hostnossl", cidr)
+		fmt.Fprintf(&b, "%-8s all             all                %-23s reject\n", "hostnossl", cidr)
 	}
 	return b.String()
 }

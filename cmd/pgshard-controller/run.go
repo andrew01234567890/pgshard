@@ -46,6 +46,7 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 	fs := flag.NewFlagSet("pgshard-controller run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	catalogDSN := fs.String("catalog-dsn", "", "catalog DSN with pgshard_system privileges (required)")
+	catalogPasswordFile := fs.String("catalog-password-file", "", "file holding the password for --catalog-dsn; the environment's PGPASSWORD is left for the shard DSNs")
 	listen := fs.String("listen", "127.0.0.1:15500", "gRPC address for the Controller service (empty disables)")
 	metricsListen := fs.String("metrics-listen", "", "HTTP address for /metrics (empty disables)")
 	certFile := fs.String("tls-cert", "", "server certificate for the gRPC listener (mTLS)")
@@ -117,6 +118,16 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer)
 			return cli.ExitUsage
 		}
 	}
+	// The catalog DSN carries its own password rather than taking
+	// PGPASSWORD. PGPASSWORD is the SUPERUSER's, which the shard and
+	// subscription DSNs still need -- libpq would apply it to the catalog
+	// connection too, and the catalog login is deliberately not that role.
+	withPassword, err := withPasswordFile(*catalogDSN, *catalogPasswordFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "pgshard-controller run: %v\n", err)
+		return cli.ExitUsage
+	}
+	*catalogDSN = withPassword
 	logger := slog.New(slog.NewTextHandler(stderr, nil))
 
 	poolCfg, err := pgxpool.ParseConfig(*catalogDSN)
@@ -312,6 +323,26 @@ func (f *shardDSNFlag) Set(v string) error {
 	}
 	(*f)[controller.ShardRef{Set: set, ID: int32(id)}] = dsn
 	return nil
+}
+
+// withPasswordFile splices a password read from a file into a DSN, so it
+// never appears in argv where /proc/<pid>/cmdline exposes it.
+func withPasswordFile(dsn, path string) (string, error) {
+	if path == "" {
+		return dsn, nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("catalog password file: %w", err)
+	}
+	pw := strings.TrimRight(string(b), "\r\n")
+	if pw == "" {
+		return "", fmt.Errorf("catalog password file %s is empty", path)
+	}
+	// libpq quoting: single quotes around the value, backslash before a
+	// quote or a backslash inside it.
+	esc := strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(pw)
+	return dsn + " password='" + esc + "'", nil
 }
 
 // authorize turns the flag into the option grpccreds takes. Off it is

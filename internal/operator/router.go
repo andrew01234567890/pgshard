@@ -68,6 +68,15 @@ func CatalogDSN(c *pgshardv1alpha1.PgShardCluster) string {
 	return fmt.Sprintf("host=%s.%s.svc port=%d user=%s dbname=postgres", CatalogServiceRW(c.Name), c.Namespace, postgresPort, superuserName)
 }
 
+// ControllerCatalogDSN is the same catalog, reached as the controller's own
+// login role. The controller drives every workflow, so it writes the whole
+// pgshard schema -- but it does not need the superuser to do that, and
+// holding one made anything that could read its environment direct write
+// access to every shard and the catalog, bypassing the router entirely.
+func ControllerCatalogDSN(c *pgshardv1alpha1.PgShardCluster) string {
+	return fmt.Sprintf("host=%s.%s.svc port=%d user=%s dbname=postgres", CatalogServiceRW(c.Name), c.Namespace, postgresPort, catalog.ControllerRole)
+}
+
 // RouterCatalogDSN is the same catalog, reached as the router's own login
 // role. The router terminates untrusted client connections -- the pgwire
 // state machine, the SQL parser, the planner -- so it holds a credential

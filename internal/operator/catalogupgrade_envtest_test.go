@@ -594,13 +594,22 @@ func TestCatalogUpgradeGivesTheNewCatalogTheRouterPassword(t *testing.T) {
 
 	var sec corev1.Secret
 	get(t, RouterSecretName(c.Name), &sec)
-	want := "cp-catalog-g2-rw.default.svc=" + string(sec.Data["password"])
+	want := "cp-catalog-g2-rw.default.svc/" + catalog.RouterRole + "=" + string(sec.Data["password"])
 
 	fp.mu.Lock()
 	applied := append([]string(nil), fp.routerPasswords...)
 	fp.mu.Unlock()
 	if !slices.Contains(applied, want) {
 		t.Errorf("the new catalog was never given the router password: %v", applied)
+	}
+	// And the controller's, for the same reason: the new catalog has the
+	// role from its own migration and no password for it, so without this
+	// the controller cannot reach the catalog it was switched to.
+	var csec corev1.Secret
+	get(t, ControllerSecretName(c.Name), &csec)
+	wantCtl := "cp-catalog-g2-rw.default.svc/" + catalog.ControllerRole + "=" + string(csec.Data["password"])
+	if !slices.Contains(applied, wantCtl) {
+		t.Errorf("the new catalog was never given the controller password: %v", applied)
 	}
 }
 

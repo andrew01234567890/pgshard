@@ -52,7 +52,8 @@ func (r Renderer) ControllerDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv
 	}
 	labels := controllerLabels(c)
 	args := []string{"run",
-		"--catalog-dsn=" + CatalogDSN(c),
+		"--catalog-dsn=" + ControllerCatalogDSN(c),
+		"--catalog-password-file=" + controllerLoginDir + "/" + secretKey,
 		fmt.Sprintf("--listen=:%d", controllerPort),
 		fmt.Sprintf("--metrics-listen=:%d", controllerHTTPPort),
 		// Without the shard template the resolver does not run at all, so a
@@ -83,6 +84,12 @@ func (r Renderer) ControllerDeployment(c *pgshardv1alpha1.PgShardCluster) *appsv
 	mounts = append(mounts, corev1.VolumeMount{Name: agentTokenVolume, MountPath: agentTokenDir, ReadOnly: true})
 	volumes = append(volumes, corev1.Volume{Name: agentTokenVolume, VolumeSource: corev1.VolumeSource{
 		Secret: &corev1.SecretVolumeSource{SecretName: AgentSecretName(c.Name)}}})
+	// The catalog login, mounted rather than passed as PGPASSWORD: that
+	// variable is the superuser's, which the shard and subscription DSNs
+	// still need, and libpq would apply it to the catalog connection too.
+	mounts = append(mounts, corev1.VolumeMount{Name: controllerLoginVolume, MountPath: controllerLoginDir, ReadOnly: true})
+	volumes = append(volumes, corev1.Volume{Name: controllerLoginVolume, VolumeSource: corev1.VolumeSource{
+		Secret: &corev1.SecretVolumeSource{SecretName: ControllerSecretName(c.Name)}}})
 	if ref := internalTLSRefFor(c, pki.RoleController); ref != nil {
 		args = append(args,
 			"--tls-cert="+internalTLSMountPath+"/tls.crt",

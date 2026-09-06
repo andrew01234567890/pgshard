@@ -304,9 +304,9 @@ func TestLogicalWorkersExceedSubscriptions(t *testing.T) {
 // write atomic. SCRAM proved who the client was; nothing checked it had
 // come the right way.
 //
-// TCP is the control plane's path: replicas, the controller and the router
-// all arrive as the superuser, and the pooler an application talks through
-// connects over the unix socket.
+// TCP is the control plane's path: replicas arrive as the superuser, the
+// router and the controller as their own catalog logins, and the pooler an
+// application talks through connects over the unix socket.
 func TestPgHBARefusesApplicationRolesOverTCP(t *testing.T) {
 	for _, tls := range []bool{false, true} {
 		c := testConfig()
@@ -314,11 +314,11 @@ func TestPgHBARefusesApplicationRolesOverTCP(t *testing.T) {
 			c.TLS = TLSFiles{CertFile: "/certs/tls.crt", KeyFile: "/certs/tls.key", CAFile: "/certs/ca.crt"}
 		}
 		// The control plane's own roles, and nothing else. The superuser is
-		// how the operator, the controller and a replica reach a member;
-		// the router's catalog role is how the router reaches the catalog,
-		// and it exists only where the catalog schema does, so on a shard
-		// this line matches no role at all.
-		controlPlane := map[string]bool{"postgres": true, catalog.RouterRole: true}
+		// how the operator, a replica and the controller's SHARD work reach
+		// a member; the router's and the controller's catalog roles are how
+		// each reaches the catalog, and they exist only where the catalog
+		// schema does, so on a shard those lines match no role at all.
+		controlPlane := map[string]bool{"postgres": true, catalog.RouterRole: true, catalog.ControllerRole: true}
 		var host, superuser, reject int
 		for _, line := range strings.Split(RenderPgHBAConf(c), "\n") {
 			f := strings.Fields(line)
