@@ -94,6 +94,12 @@ func TestSnapshotWithPostgres(t *testing.T) {
 	mustExec(t, conn, `INSERT INTO pgshard.table_status (database, schema_name, table_name, effective_placement, effective_shard_key, effective_generation) VALUES
 		('app', 'public', 'orders', 'sharded', 'customer_id', 7)`)
 	mustExec(t, conn, `INSERT INTO pgshard.roles (rolname, verifier) VALUES ('alice', 'SCRAM-SHA-256$4096:salt$a:b')`)
+	mustExec(t, conn, `INSERT INTO pgshard.roles (rolname) VALUES ('ops'), ('outsider')`)
+	mustExec(t, conn, `CREATE ROLE alice`)
+	mustExec(t, conn, `CREATE ROLE ops`)
+	mustExec(t, conn, `CREATE ROLE outsider`)
+	mustExec(t, conn, `GRANT pgshard_admin TO ops`)
+	mustExec(t, conn, `GRANT ops TO alice`)
 	mustExec(t, conn, `UPDATE pgshard.shard_map_generation SET generation = 5`)
 
 	// A verdict on the shard key is about the key the table had when the
@@ -205,6 +211,16 @@ func TestSnapshotWithPostgres(t *testing.T) {
 		}
 		if out := fmt.Sprintf("%+v %#v", roles, roles); strings.Contains(out, "SCRAM") {
 			t.Fatalf("roles leaked: %s", out)
+		}
+		// The router gates the catalog database on this, so it has to
+		// arrive with the verifiers rather than be an empty set that
+		// admits nobody -- and it has to be transitive, because alice
+		// holds pgshard_admin only through ops.
+		if !roles.MayUseCatalog("ops") || !roles.MayUseCatalog("alice") {
+			t.Fatal("control-plane access was not loaded")
+		}
+		if roles.MayUseCatalog("outsider") {
+			t.Fatal("a role with no control-plane grant was admitted")
 		}
 	})
 

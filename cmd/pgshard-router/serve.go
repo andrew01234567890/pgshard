@@ -256,6 +256,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		Migrations:              &router.PGMigrationQueue{Pool: pool},
 		CatalogPhysicalDatabase: catalogPhysicalDatabase(*catalogDSN),
 		RoleLimits:              roles,
+		CatalogAccess:           roles,
 		MaxSessions:             *maxSessions,
 		MaxSessionsPerRole:      *maxSessionsPerRole,
 	})

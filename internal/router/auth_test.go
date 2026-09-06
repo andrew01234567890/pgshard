@@ -44,18 +44,42 @@ func (r *fakeRows) Scan(dest ...any) error {
 	return nil
 }
 
+// nameRows is the single-column shape of the catalog-access query.
+type nameRows struct {
+	rows []string
+	i    int
+}
+
+func (r *nameRows) Close()                                       {}
+func (r *nameRows) Err() error                                   { return nil }
+func (r *nameRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (r *nameRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (r *nameRows) Next() bool                                   { r.i++; return r.i <= len(r.rows) }
+func (r *nameRows) Values() ([]any, error)                       { return nil, nil }
+func (r *nameRows) RawValues() [][]byte                          { return nil }
+func (r *nameRows) Conn() *pgx.Conn                              { return nil }
+func (r *nameRows) Scan(dest ...any) error {
+	*dest[0].(*string) = r.rows[r.i-1]
+	return nil
+}
+
 type fakeQuerier struct {
 	roles map[string]string
 	attrs map[string]fakeRole
-	calls int
-	err   error
+	// access is what the catalog server answers for pg_has_role.
+	access []string
+	calls  int
+	err    error
 }
 
-func (q *fakeQuerier) Query(context.Context, string, ...any) (pgx.Rows, error) {
-	q.calls++
+func (q *fakeQuerier) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
 	if q.err != nil {
 		return nil, q.err
 	}
+	if strings.Contains(sql, "pg_has_role") {
+		return &nameRows{rows: q.access}, nil
+	}
+	q.calls++
 	var rows []fakeRole
 	for k, v := range q.roles {
 		row := q.attrs[k]

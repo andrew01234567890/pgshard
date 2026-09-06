@@ -361,6 +361,16 @@ type RoleCred struct {
 // GoString methods print only a count so a Roles can never leak into logs.
 type Roles struct {
 	verifiers map[string]RoleCred
+	// catalogAccess is the roles the catalog server itself says hold a
+	// control-plane role.
+	catalogAccess map[string]bool
+}
+
+// MayUseCatalog reports whether the role holds pgshard_admin or
+// pgshard_reader on the catalog server -- directly, through another role,
+// or by being a superuser.
+func (r *Roles) MayUseCatalog(role string) bool {
+	return r != nil && r.catalogAccess[role]
 }
 
 // Verifier returns the SCRAM verifier of a role, if any.
@@ -372,9 +382,18 @@ func (r *Roles) Verifier(rolname string) (string, bool) {
 // NewRoles builds a Roles from credentials that did not come from the
 // catalog, for callers that assemble one themselves.
 func NewRoles(creds map[string]RoleCred) *Roles {
-	r := &Roles{verifiers: map[string]RoleCred{}}
+	return NewRolesWithCatalogAccess(creds, nil)
+}
+
+// NewRolesWithCatalogAccess is NewRoles plus the roles that may open a
+// session on the catalog database.
+func NewRolesWithCatalogAccess(creds map[string]RoleCred, catalogAccess []string) *Roles {
+	r := &Roles{verifiers: map[string]RoleCred{}, catalogAccess: map[string]bool{}}
 	for name, c := range creds {
 		r.verifiers[name] = c
+	}
+	for _, name := range catalogAccess {
+		r.catalogAccess[name] = true
 	}
 	return r
 }

@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/andrew01234567890/pgshard/internal/catalog"
 	"github.com/andrew01234567890/pgshard/internal/metrics"
 	"github.com/andrew01234567890/pgshard/internal/pgwire"
 )
@@ -74,12 +75,23 @@ type Config struct {
 	// RoleLimits reports a role's connection limit; nil leaves limits
 	// unenforced.
 	RoleLimits RoleLimiter
+	// CatalogAccess answers who may open a session on the catalog
+	// database. nil admits nobody to it: the control-plane server is not a
+	// tenant database, and a router that cannot answer the question must
+	// not guess.
+	CatalogAccess CatalogAccessCheck
 }
 
 // RoleLimiter reports how many sessions a role may hold open at once. ok is
 // false when the role has no limit.
 type RoleLimiter interface {
 	ConnectionLimit(user string) (int32, bool)
+}
+
+// CatalogAccessCheck reports whether a role holds a control-plane role on
+// the catalog server.
+type CatalogAccessCheck interface {
+	MayUseCatalog(role string) bool
 }
 
 // CancelForwarder delivers a cancel key to the router instances it may
@@ -208,6 +220,9 @@ func (r *Router) NewExecutor(info pgwire.SessionInfo) (pgwire.Executor, error) {
 	if info.Auth == nil || info.Auth.SCRAM == nil {
 		return nil, pgwire.Errorf(pgwire.CodeInvalidAuthorization, "session was not authenticated with SCRAM")
 	}
+	if err := r.mayUseCatalog(info.Database, info.User); err != nil {
+		return nil, err
+	}
 	home, err := r.homeShard(info.Database)
 	if err != nil {
 		return nil, err
@@ -278,6 +293,31 @@ func (r *Router) homeShard(database string) (Shard, error) {
 		return Shard{}, pgwire.Errorf("3D000", "database %q does not exist", database)
 	}
 	return Shard{Set: snap.ServingShardSet(), ID: d.HomeShard}, nil
+}
+
+// mayUseCatalog gates the catalog database on control-plane membership.
+//
+// Every role pgshard knows is materialized on the catalog group with LOGIN
+// and its verifier, because that is how the router authenticates and how
+// the pooler dials as the real user. Routing dbname=pgshard by name alone
+// therefore handed an ordinary application credential a session on the
+// control-plane server, whose max_connections is tuned to the pooler's
+// budget: one tenant holding it open takes the slots the routers, the
+// poolers' LISTEN connections and every role reload need, and the cluster
+// stops seeing generation and epoch changes.
+//
+// Reading the catalog is a control-plane privilege, so opening a session on
+// it is one too. docs/guide/sharding.md already tells operators to grant
+// pgshard_admin for this; nothing enforced it.
+func (r *Router) mayUseCatalog(database, user string) error {
+	if database != r.cfg.CatalogDatabase {
+		return nil
+	}
+	if r.cfg.CatalogAccess != nil && r.cfg.CatalogAccess.MayUseCatalog(user) {
+		return nil
+	}
+	return pgwire.Errorf(pgwire.CodeInsufficientPrivilege, "permission denied for database %q: it is the pgshard control plane, which needs membership of %s or %s",
+		database, catalog.RoleAdmin, catalog.RoleReader)
 }
 
 func (r *Router) forget(e *Executor) {

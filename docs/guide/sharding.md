@@ -6,6 +6,15 @@ database, edited with ordinary SQL. Connect to the router with
 `pgshard_admin`, and every component follows your edits through
 LISTEN/NOTIFY. The full schema is in [catalog.md](../catalog.md).
 
+That grant is enforced, not merely expected. The catalog database is the
+control-plane server, and its connection budget is the one the routers, the
+poolers' LISTEN connections and every role reload draw on; a session on it
+is a control-plane privilege. The router refuses `dbname=pgshard` for a role
+the catalog server does not report as holding `pgshard_admin` or
+`pgshard_reader` — directly, through another role, or by being a superuser —
+with `42501`. Ordinary databases are not gated: an application role reaches
+its own data as before.
+
 On a cluster nobody has logged into yet, that role is the superuser whose
 password the operator generated; see
 [the first login](getting-started.md#the-first-login) for how to read it
