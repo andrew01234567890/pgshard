@@ -84,15 +84,17 @@ with no barrier running.
 
 A certified barrier raises the catalog write fence, and the running
 controller lowers it — including on its failure paths. If that process dies
-between the two, the fence stays up. Recovery on the next leader resumes the
-paused shards but **leaves the fence alone on purpose**: a cluster restored to
-a barrier also comes back fenced, and lowering that one would admit writes
-before two-phase reconciliation has finished. The controller cannot tell the
-two apart from the catalog alone, because both carry the reason
-`barrier <name>`.
+between the two, the fence stays up. Recovery on the next leader lifts it
+automatically once the barrier lock is free and the fence is older than the
+longest a run can take — but **only when the run never certified**. A cluster
+restored to a barrier also comes back fenced, carrying the same reason and
+owner, and lowering that one would admit writes before two-phase
+reconciliation has finished; what tells them apart is the restore point, which
+a run certifies only just before releasing the fence.
 
-Confirm it is the dead-barrier case and not a restore in progress — a restore
-has a `PgShardRestore` that has not reported `Unfenced`:
+So this section is for the case recovery leaves alone: a run that certified
+and then died before releasing. Confirm it is that, and not a restore in
+progress — a restore has a `PgShardRestore` that has not reported `Unfenced`:
 
 ```sql
 SELECT write_fence, write_fence_reason, write_fence_owner, write_fenced_at
@@ -103,8 +105,8 @@ SELECT write_fence, write_fence_reason, write_fence_owner, write_fenced_at
 kubectl get pgshardrestore -A
 ```
 
-If no restore is running, the next barrier takes the fence over and releases
-it, which is the ordinary recovery. A policy with a `barrierSchedule` runs one
+If no restore is running and the fence's barrier certified, recovery will not
+lift it: the next barrier takes it over and releases it. A policy with a `barrierSchedule` runs one
 on its own; otherwise ask the controller for one directly
 (`Controller.CreateBarrier`, port 15500 on the controller Service):
 

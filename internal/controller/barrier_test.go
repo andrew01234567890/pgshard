@@ -31,11 +31,17 @@ type fakeBarrierStore struct {
 	watermark           int64
 	recorded            []RestorePoint
 	owner               string
-	reserved            []string
-	failed              map[string]string
-	journal             *[]string
-	fail                map[string]error
-	now                 func() time.Time
+	// fenceName is the barrier the raised fence names, and certified is the
+	// set of restore_points rows that have been certified -- what the
+	// catalog predicate joins on to tell an interrupted run's fence from
+	// the one a restored cluster comes back holding.
+	fenceName string
+	certified map[string]bool
+	reserved  []string
+	failed    map[string]string
+	journal   *[]string
+	fail      map[string]error
+	now       func() time.Time
 }
 
 func (s *fakeBarrierStore) log(step string) {
@@ -57,11 +63,29 @@ func (s *fakeBarrierStore) Fence(_ context.Context, active bool, reason, owner s
 	if active {
 		s.owner = owner
 		s.fencedAt = s.now()
+		s.fenceName = strings.TrimPrefix(reason, "barrier ")
 		s.log("fence " + reason)
 	} else {
 		s.log("release")
 	}
 	return nil
+}
+
+// ClearStaleBarrierFence is the fake's version of the catalog predicate: a
+// fence naming a certified restore point is a restored cluster's and is left
+// alone; one naming an uncertified row is an interrupted run's.
+func (s *fakeBarrierStore) ClearStaleBarrierFence(context.Context) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.fail["clearstale"]; err != nil {
+		return false, err
+	}
+	if !s.fenced || s.owner == "" || s.certified[s.fenceName] {
+		return false, nil
+	}
+	s.fenced, s.owner, s.fencedAt, s.fenceName = false, "", time.Time{}, ""
+	s.log("clear stale fence")
+	return true, nil
 }
 
 func (s *fakeBarrierStore) FencedAt(context.Context) (time.Time, error) {
@@ -152,6 +176,10 @@ func (s *fakeBarrierStore) Record(_ context.Context, rp RestorePoint) (string, e
 	}
 	rp.ID = fmt.Sprintf("id-%d", len(s.recorded)+1)
 	s.recorded = append(s.recorded, rp)
+	if s.certified == nil {
+		s.certified = map[string]bool{}
+	}
+	s.certified[rp.Name] = true
 	s.log("record " + rp.Name)
 	return rp.ID, nil
 }
@@ -626,10 +654,10 @@ func TestBarrierRecoveryLiftsAStrandedPause(t *testing.T) {
 	if f.groups.paused["shard0"] || f.groups.paused["shard1"] {
 		t.Fatalf("groups left paused: %v", f.groups.paused)
 	}
-	// The fence is never cleared by recovery: a barrier restore raises it
-	// deliberately and must stay fenced until its reconciliation finishes.
+	// This fence carries no owner, so no barrier raised it. Recovery leaves
+	// it alone.
 	if !f.store.fenced {
-		t.Fatal("recovery cleared a fence it does not own")
+		t.Fatal("recovery cleared an unowned fence")
 	}
 	f.store.fenced = false
 	// With no fence raised it is a no-op.
@@ -676,6 +704,92 @@ func TestBarrierRefusesToCertifyAfterAPauseIsLost(t *testing.T) {
 	}
 	if len(f.store.recorded) != 0 {
 		t.Fatal("a point was certified after the pause was lost")
+	}
+}
+
+// A controller killed after the fence went up and before any shard was
+// paused left write_fence = true with nothing that would ever clear it:
+// recovery returned early because nothing was paused, and only the NEXT
+// barrier takes a fence over. With no schedule -- or a schedule that cannot
+// run because the cluster is fenced -- there is no next barrier, and every
+// router answers 57P03 to every write for good.
+func TestBarrierRecoveryLiftsAStrandedFenceWithNoPause(t *testing.T) {
+	f := newBarrierFixture()
+	f.store.fenced, f.store.owner, f.store.fencedAt = true, "dead-controller", f.clock
+
+	// Still young enough to belong to a live run.
+	if err := f.b.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !f.store.fenced {
+		t.Fatal("recovery cleared a fence that could still belong to a live barrier")
+	}
+
+	f.clock = f.clock.Add(2 * f.b.maxRunTime())
+	if err := f.b.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if f.store.fenced {
+		t.Fatal("the cluster is still write-fenced by a controller that died")
+	}
+	if f.store.owner != "" {
+		t.Fatalf("the fence owner outlived the fence: %q", f.store.owner)
+	}
+}
+
+// A cluster restored to a barrier comes back holding that barrier's fence --
+// owner, reason and all, because the restore point was taken while the fence
+// was up -- and it must stay up until two-phase reconciliation finishes.
+// Reason and owner cannot separate it from an interrupted run's fence: both
+// say "barrier <name>". The restore point can, because a run certifies its
+// row only just before releasing the fence.
+func TestBarrierRecoveryLeavesTheFenceARestoredClusterCameBackHolding(t *testing.T) {
+	f := newBarrierFixture()
+	f.store.fenced, f.store.owner, f.store.fencedAt = true, "the-barrier-that-completed", f.clock
+	f.store.fenceName = "nightly"
+	f.store.certified = map[string]bool{"nightly": true}
+	f.clock = f.clock.Add(2 * f.b.maxRunTime())
+	if err := f.b.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !f.store.fenced {
+		t.Fatal("recovery unfenced a cluster that is still reconciling a restore")
+	}
+	// The same fence, with its run never certified, is an interrupted one.
+	f.store.certified = nil
+	if err := f.b.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if f.store.fenced {
+		t.Fatal("an interrupted run's fence was left up")
+	}
+}
+
+// The shards come back before the fence does. The fence is what stops
+// routers sending writes, so lifting it while a shard is still paused sends
+// them at a shard that refuses them.
+func TestBarrierRecoveryResumesTheShardsBeforeItLiftsTheFence(t *testing.T) {
+	f := newBarrierFixture()
+	f.store.fenced, f.store.owner, f.store.fencedAt = true, "dead-controller", f.clock
+	f.groups.paused["shard0"] = true
+	f.clock = f.clock.Add(2 * f.b.maxRunTime())
+	if err := f.b.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if f.groups.paused["shard0"] || f.store.fenced {
+		t.Fatalf("recovery left work behind: paused=%v fenced=%v", f.groups.paused, f.store.fenced)
+	}
+	resume, lifted := -1, -1
+	for i, e := range f.journal {
+		if strings.Contains(e, "resume") && resume < 0 {
+			resume = i
+		}
+		if strings.Contains(e, "clear stale fence") {
+			lifted = i
+		}
+	}
+	if resume < 0 || lifted < 0 || lifted < resume {
+		t.Fatalf("the fence was lifted before the shards resumed: %v", f.journal)
 	}
 }
 

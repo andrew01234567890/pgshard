@@ -377,6 +377,37 @@ func ClearWriteFenceAfterRestore(ctx context.Context, q Execer) error {
 	return err
 }
 
+// ClearStaleBarrierFence clears the fence of a barrier run that never
+// finished, and reports whether it cleared one.
+//
+// The distinction it has to make is against a RESTORE. A cluster restored to
+// a barrier comes back holding that barrier's fence -- owner, reason and all,
+// because the restore point was taken while the fence was up -- and that one
+// must stay up until two-phase reconciliation finishes. Reason and owner
+// cannot separate the two: both say "barrier <name>".
+//
+// The restore point can. A run reserves its row uncertified before it raises
+// the fence and certifies it just before releasing, so a fence naming an
+// UNCERTIFIED row belongs to a run that died between those two points. A
+// restored catalog's fence names a CERTIFIED one -- a cluster is restored to
+// a barrier that completed.
+//
+// The narrow window this does not cover is a run that certified and died
+// before releasing: that fence names a certified row and is left for the
+// next barrier or an operator, as before.
+func ClearStaleBarrierFence(ctx context.Context, q Execer) (bool, error) {
+	tag, err := q.Exec(ctx, `UPDATE pgshard.shard_map_generation g
+		SET write_fence = false, write_fence_reason = '', write_fence_owner = '',
+		    write_fenced_at = NULL, updated_at = now()
+		WHERE g.write_fence AND g.write_fence_owner <> ''
+		  AND EXISTS (SELECT 1 FROM pgshard.restore_points rp
+		               WHERE 'barrier ' || rp.name = g.write_fence_reason AND NOT rp.certified)`)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // SetWriteFence raises or releases the write fence; the change notifies
 // routers through ServingChannel.
 //
