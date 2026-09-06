@@ -93,8 +93,13 @@ type mergeBuilder struct {
 	tree     proto.Message
 	sel      *pgquerypb.SelectStmt
 	shardKey string
-	spec     Merge
-	changed  bool
+	// sharded names the relations the shard key column belongs to, by
+	// alias and by name, and onlySharded says every relation in play is
+	// one of them.
+	sharded     map[string]bool
+	onlySharded bool
+	spec        Merge
+	changed     bool
 	// clone is the mutable copy of the tree, made on first change.
 	clone  *pgquerypb.SelectStmt
 	cloneT *pgquerypb.ParseResult
@@ -102,12 +107,14 @@ type mergeBuilder struct {
 
 // buildMerge computes the Merge for sel; err is the refusal when the shape
 // cannot be merged.
-func buildMerge(tree proto.Message, sel *pgquerypb.SelectStmt, shardKey string, blockers []string) (*Merge, error) {
+func buildMerge(tree proto.Message, sel *pgquerypb.SelectStmt, shardKey string, blockers []string,
+	sharded map[string]bool, onlySharded bool) (*Merge, error) {
 	if len(blockers) > 0 {
 		return nil, notYet("multi-shard SELECT with "+strings.Join(blockers, ", ")+" is not available yet",
 			"filter on one shard key value")
 	}
-	b := &mergeBuilder{tree: tree, sel: sel, shardKey: shardKey, spec: Merge{Limit: -1, Offset: -1}}
+	b := &mergeBuilder{tree: tree, sel: sel, shardKey: shardKey, sharded: sharded, onlySharded: onlySharded,
+		spec: Merge{Limit: -1, Offset: -1}}
 	if err := b.run(); err != nil {
 		return nil, err
 	}
@@ -257,13 +264,32 @@ func (b *mergeBuilder) namesShardKey(exprs []*pgquerypb.Node) bool {
 	return false
 }
 
+// isShardKeyRef reports that e names the SHARDED relations' key column.
+//
+// The qualifier is the point. A reference table is copied to every shard, so
+// a same-named column on one -- regions.tenant_id joined to orders -- has
+// rows for a single value on every shard, and grouping by it is not
+// shard-local at all. Reading only the last field accepted it, marked the
+// GROUP BY shard-local, and the router concatenated one partial count per
+// shard for the same group.
 func (b *mergeBuilder) isShardKeyRef(e *pgquerypb.Node) bool {
 	cr := e.GetColumnRef()
 	if cr == nil {
 		return false
 	}
 	fields := stringList(cr.GetFields())
-	return len(fields) > 0 && len(fields) == len(cr.GetFields()) && fields[len(fields)-1] == b.shardKey
+	if len(fields) == 0 || len(fields) != len(cr.GetFields()) || fields[len(fields)-1] != b.shardKey {
+		return false
+	}
+	if len(fields) == 1 {
+		// Unqualified. PostgreSQL would have refused it as ambiguous if it
+		// matched more than one relation, but it does not say which one it
+		// resolved to, and the router does not know a reference table's
+		// columns. Safe exactly when every relation in play is sharded on
+		// this key -- which a colocated join has already established.
+		return b.onlySharded
+	}
+	return b.sharded[fields[len(fields)-2]]
 }
 
 // aggregates validates an aggregate-only select list without GROUP BY.

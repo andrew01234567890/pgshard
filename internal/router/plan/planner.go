@@ -1491,7 +1491,7 @@ func (w *walker) crossShardJoinError() error {
 		if !contains(blockers, "set operations") {
 			blockers = append(blockers, "set operations")
 		}
-		_, err := buildMerge(w.tree, nil, "", blockers)
+		_, err := buildMerge(w.tree, nil, "", blockers, nil, false)
 		return err
 	}
 	if w.refPreserved {
@@ -1538,7 +1538,7 @@ func (w *walker) crossShardJoinError() error {
 	// Where the walk recorded no join and did record something else, that
 	// something else is the answer.
 	if len(w.scatterBlockers) > 0 && !contains(w.scatterBlockers, "joins") {
-		_, err := buildMerge(w.tree, nil, "", w.scatterBlockers)
+		_, err := buildMerge(w.tree, nil, "", w.scatterBlockers, nil, false)
 		return err
 	}
 	return notYet("cross-shard join is not available yet",
@@ -2052,7 +2052,24 @@ func (w *walker) mergeSpec() {
 	if len(w.rels) > 1 {
 		blockers = without(blockers, "joins")
 	}
-	p.merge, p.mergeErr = buildMerge(w.tree, w.outer, key, blockers)
+	// Which relations the key column belongs to. A same-named column on a
+	// reference table joined in is not the shard key, and grouping by it
+	// spans every shard.
+	sharded := map[string]bool{}
+	onlySharded := true
+	for _, r := range w.rels {
+		if r.kind != placeSharded {
+			onlySharded = false
+			continue
+		}
+		if r.alias != "" {
+			sharded[r.alias] = true
+		}
+		if r.name != "" {
+			sharded[r.name] = true
+		}
+	}
+	p.merge, p.mergeErr = buildMerge(w.tree, w.outer, key, blockers, sharded, onlySharded)
 }
 
 func without(list []string, drop string) []string {
