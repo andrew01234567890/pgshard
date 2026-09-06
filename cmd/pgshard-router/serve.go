@@ -304,9 +304,13 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		fmt.Fprintf(stdout, "pgshard-router serve: peer cancels on %s (instance %d)\n", pl.Addr(), srv.InstanceID())
 	}
 	if *vstreamListen != "" {
-		// No role: the change stream's callers are the cluster's
-		// consumers, which carry no pgshard identity.
-		serverCreds, err := peerCredentials(*poolerCert, *poolerKey, *poolerCA, *insecureDev, false, "")
+		// The change stream's callers are the cluster's consumers, which
+		// carry the consumer identity the operator issues as
+		// <cluster>-tls-consumer. Authorising it here is what stops a
+		// workload certificate -- the router's own included -- being a
+		// change-stream credential, and stops a consumer's being anything
+		// else: the consumer role is in no other listener's rule.
+		serverCreds, err := peerCredentials(*poolerCert, *poolerKey, *poolerCA, *insecureDev, *authorizeCallers, pki.ListenerVStream)
 		if err != nil {
 			fmt.Fprintf(stderr, "pgshard-router serve: %v\n", err)
 			return cli.ExitUsage
