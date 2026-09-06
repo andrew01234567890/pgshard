@@ -47,7 +47,12 @@ type AgentClient interface {
 	Reload(ctx context.Context, addr string) (string, error)
 	// SetSynchronizedStandbySlots tells the primary's agent which physical
 	// slots failover slots must wait for; it returns the slots applied.
-	SetSynchronizedStandbySlots(ctx context.Context, addr string, slots []string) ([]string, error)
+	// SetSynchronizedStandbySlots applies the list on the group's PRIMARY
+	// at epoch, which is the group epoch the caller holds -- not one read
+	// back from the agent. Asking the agent for the epoch to send it makes
+	// the fence pass for anyone who can reach the agent, which is exactly
+	// the superseded caller it exists to stop.
+	SetSynchronizedStandbySlots(ctx context.Context, addr string, epoch uint64, slots []string) ([]string, error)
 	// LogicalSlots is this member's logical replication slots: every one it
 	// has, and the ones that would still work after promoting it --
 	// synchronised from the primary, not temporary, and not invalidated.
@@ -544,20 +549,18 @@ func (c *GRPCAgentClient) LogicalSlots(ctx context.Context, addr string) (Logica
 	return out, nil
 }
 
-// SetSynchronizedStandbySlots reads the agent's epoch and calls
-// Agent.SetSynchronizedStandbySlots at that epoch.
-func (c *GRPCAgentClient) SetSynchronizedStandbySlots(ctx context.Context, addr string, slots []string) ([]string, error) {
+// SetSynchronizedStandbySlots calls Agent.SetSynchronizedStandbySlots at the
+// epoch the caller holds. It used to ask the agent for its epoch and send
+// that straight back, which made the agent's same-term check pass for any
+// caller that could reach it.
+func (c *GRPCAgentClient) SetSynchronizedStandbySlots(ctx context.Context, addr string, epoch uint64, slots []string) ([]string, error) {
 	cl, err := c.dial(ctx, addr)
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, agentCallTimeout)
 	defer cancel()
-	st, err := cl.Status(ctx, &pgshardv1.StatusRequest{})
-	if err != nil {
-		return nil, err
-	}
-	resp, err := cl.SetSynchronizedStandbySlots(ctx, &pgshardv1.SetSynchronizedStandbySlotsRequest{Epoch: st.GetEpoch(), Slots: slots})
+	resp, err := cl.SetSynchronizedStandbySlots(ctx, &pgshardv1.SetSynchronizedStandbySlotsRequest{Epoch: epoch, Slots: slots})
 	if err != nil {
 		return nil, withEpoch("set synchronized standby slots", err)
 	}

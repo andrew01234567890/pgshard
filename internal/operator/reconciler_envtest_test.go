@@ -426,8 +426,11 @@ type fakeAgents struct {
 	// reloadHash is what Reload reports per addr; reloads records calls.
 	reloadHash map[string]string
 	reloads    []string
-	// syncSlots records the last SetSynchronizedStandbySlots call per addr.
+	// syncSlots records the last SetSynchronizedStandbySlots call per addr,
+	// and syncEpoch the epoch it was sent at -- the operator must send the
+	// group epoch it holds rather than one read back from the agent.
 	syncSlots map[string][]string
+	syncEpoch map[string]uint64
 	// slots is what each member reports about its logical slots; absent
 	// means none, as for a member that cannot answer.
 	slots map[string]LogicalSlots
@@ -461,7 +464,7 @@ func (f *fakeAgents) setSlots(addr string, sl LogicalSlots) {
 	f.slots[addr] = sl
 }
 
-func (f *fakeAgents) SetSynchronizedStandbySlots(_ context.Context, addr string, slots []string) ([]string, error) {
+func (f *fakeAgents) SetSynchronizedStandbySlots(_ context.Context, addr string, epoch uint64, slots []string) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.errs[addr]; err != nil {
@@ -469,8 +472,10 @@ func (f *fakeAgents) SetSynchronizedStandbySlots(_ context.Context, addr string,
 	}
 	if f.syncSlots == nil {
 		f.syncSlots = map[string][]string{}
+		f.syncEpoch = map[string]uint64{}
 	}
 	f.syncSlots[addr] = slots
+	f.syncEpoch[addr] = epoch
 	return slots, nil
 }
 
@@ -991,6 +996,22 @@ func TestSyncStandbyNamesAppliedHealthyFirst(t *testing.T) {
 	}
 	if slots := fa.syncSlots[agentAddr(podIP(0, 0))]; !reflect.DeepEqual(slots, []string{SlotName("sync-catalog-2")}) {
 		t.Fatalf("synchronized_standby_slots must list the streaming standby's slot only: %v", slots)
+	}
+	// The epoch is the group's, held by the operator -- not one read back
+	// from the agent, which would make the agent's same-term check pass for
+	// anyone who can reach it. Published as a distinctive value so the
+	// assertion cannot pass on two zeroes.
+	var pg pgshardv1alpha1.PgShardGroup
+	get(t, "sync-catalog", &pg)
+	base := pg.DeepCopy()
+	pg.Status.Epoch = 9
+	if err := k8sClient.Status().Patch(context.Background(), &pg, client.MergeFrom(base)); err != nil {
+		t.Fatal(err)
+	}
+	fa.syncSlots = nil
+	reconcile(t, r, c)
+	if got := fa.syncEpoch[agentAddr(podIP(0, 0))]; got != 9 {
+		t.Fatalf("synchronized_standby_slots sent at epoch %d, want the group's 9", got)
 	}
 	if got := fp.syncNames[DSN("sync-shard-0-rw", "default", currentPassword(t, "sync"))]; got != `ANY 1 ("sync-shard-0-1", "sync-shard-0-2")` {
 		t.Fatalf("shard sync names: %q", got)
