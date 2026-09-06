@@ -61,6 +61,12 @@ const (
 	RoleConsumer = "consumer"
 )
 
+// ListenerVStream is the caller-rule key for the router's change-stream
+// listener. It is not an identity -- nothing presents it -- but the router
+// serves two listeners with one certificate, and they admit different
+// callers: its peers are routers, and the VStream API's are consumers.
+const ListenerVStream = "router-vstream"
+
 // URI renders the identity as it appears in a certificate.
 func (i Identity) URI() *url.URL {
 	p := "/" + i.Cluster + "/" + i.Role
@@ -311,17 +317,18 @@ func serialNumber() (*big.Int, error) {
 // cluster where that is untrue is a cluster with a bug, not one with a
 // different policy.
 //
-// The router's change-stream listener is deliberately absent. Its callers
-// are the cluster's consumers, and a rule there would refuse every consumer
-// still using the material the docs used to name. What RoleConsumer buys
-// today is the other direction: a consumer identity appears in NO list
-// below, so a leaked change-stream credential is not also a credential for
-// a pooler, an agent or the controller.
+// The change-stream listener admits consumers and nothing else, which is
+// the other half of RoleConsumer appearing in no other list: a leaked
+// change-stream credential is not a credential for a pooler, an agent or
+// the controller, and a workload credential is not one for the change
+// stream. Operators are given <cluster>-tls-consumer to hand out; the
+// router's own certificate is not a consumer credential any more.
 var callers = map[string][]string{
-	RolePooler:     {RoleRouter},
-	RoleAgent:      {RoleController, RoleOperator},
-	RoleController: {RoleRouter, RoleOperator},
-	RoleRouter:     {RoleRouter},
+	RolePooler:      {RoleRouter},
+	RoleAgent:       {RoleController, RoleOperator},
+	RoleController:  {RoleRouter, RoleOperator},
+	RoleRouter:      {RoleRouter},
+	ListenerVStream: {RoleConsumer},
 }
 
 // AllowedCallers reports whether an identity may call a listener serving

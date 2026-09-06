@@ -133,30 +133,36 @@ it forwards `VStream.Create`/`Drop` to the controller (`--controller`).
 In an operator-deployed cluster both are set for you: the routers listen on
 `9091`, published by the router Service as the `vstream` port, and point at
 the cluster's controller Service. Consumers dial the router Service, which
-serves `pgshard.v1.VStream` with the router↔pooler mTLS material
-(`--pooler-tls-*`, or plaintext with `--insecure-dev`).
+serves `pgshard.v1.VStream` with the router's server certificate
+(`--pooler-tls-*`, or plaintext with `--insecure-dev`) and, when
+`--tls-authorize-callers` is on, requires the caller to present a `consumer`
+certificate.
 
-**Give a consumer the consumer certificate, not the router's.** With
-`internalTLS.issue` the operator mints `<cluster>-tls-consumer`, a
+**A consumer needs the consumer certificate — the router's no longer works.**
+With `internalTLS.issue` the operator mints `<cluster>-tls-consumer`, a
 client-only certificate carrying the `consumer` identity and no DNS names.
-Hand that out. The router's own certificate is what the earlier version of
-this page named, and it is a key to more than the change stream: it
-satisfies the pooler listener's rule (`{router}`) and the controller's
-(`{router, operator}`), so anyone holding it can call every pooler's
-`Stream` and `CopyTables` directly, and the controller's `CancelWorkflow`,
-`PauseWorkflow`, `CreateBarrier` and `ResolveTransactions`. A `consumer`
-identity is in no listener's caller list, so a leaked one reaches nothing
-else.
+Hand that out. The VStream listener requires it: a certificate carrying any
+other pgshard identity is refused, and so is one carrying none.
+
+This is a **breaking change** for a consumer set up against an earlier
+version of this page, which named the router's `--pooler-tls-*` material.
+Re-credential such consumers from `<cluster>-tls-consumer` before upgrading.
+The reason the old advice was dangerous is worth stating: the router's
+certificate satisfies the pooler listener's rule (`{router}`) and the
+controller's (`{router, operator}`), so anyone holding it could call every
+pooler's `Stream` and `CopyTables` directly, and the controller's
+`CancelWorkflow`, `PauseWorkflow`, `CreateBarrier` and
+`ResolveTransactions`. A `consumer` identity is in no other listener's
+caller list, so a leaked one now reaches nothing else.
 
 **What a change-stream credential grants.** The pooler reads each shard over
 a superuser replication connection and `Create` makes a `FOR ALL TABLES`
 publication, so a consumer that can open a stream on a database sees every
 row change of every table in it, whatever PostgreSQL grants that consumer's
-role would allow. Treat it as superuser read of that database. The VStream
-listener does not yet enforce the `consumer` identity — it accepts any
-certificate the cluster CA signed, so that consumers on the old advice keep
-working — and `pgshard.streams` does not record who created or is reading a
-stream.
+role would allow. Treat it as superuser read of that database.
+`pgshard.streams` still does not record which consumer created or is reading
+a stream, so the identity gates the listener but does not yet appear in the
+audit trail.
 
 ### What `pgshard.v1` does and does not promise
 

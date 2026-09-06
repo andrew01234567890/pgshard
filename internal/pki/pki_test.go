@@ -321,25 +321,31 @@ func TestOnlyARouterMayCallAPooler(t *testing.T) {
 	}
 }
 
-func TestTheChangeStreamHasNoRuleYet(t *testing.T) {
-	// Consumers of the change stream are outside the cluster, and a rule
-	// here would refuse every consumer still using the material the docs
-	// used to name. Its absence is deliberate, and this says so out loud
-	// so that adding one is a decision rather than an accident.
-	for _, role := range []string{RoleAdmin, "vstream"} {
-		if _, ok := AllowedCallers(role); ok {
-			t.Fatalf("%s gained a caller rule; check that its callers carry identities", role)
+// The change-stream listener admits consumers and nothing else. It used to
+// admit anything the cluster CA had signed, and the docs told operators to
+// hand consumers the ROUTER's certificate -- which also satisfies the
+// pooler's rule ({router}) and the controller's ({router, operator}), so a
+// consumer could call every pooler's Stream and CopyTables directly and the
+// controller's CancelWorkflow.
+func TestOnlyAConsumerMayCallTheChangeStream(t *testing.T) {
+	allow, ok := AllowedCallers(ListenerVStream)
+	if !ok {
+		t.Fatal("the change-stream listener has no rule")
+	}
+	id := func(role string) Identity { return Identity{Namespace: "ns", Cluster: "demo", Role: role} }
+	if !allow(id(RoleConsumer)) {
+		t.Fatal("the change stream must serve consumers; it exists for them")
+	}
+	for _, role := range []string{RoleRouter, RolePooler, RoleAgent, RoleController, RoleOperator, RoleAdmin} {
+		if allow(id(role)) {
+			t.Errorf("the change stream serves %s: a workload certificate is a change-stream credential", role)
 		}
 	}
 }
 
-// A change-stream credential must not be a credential for anything else.
-// The docs used to tell operators to hand consumers the ROUTER's material,
-// which satisfies the pooler's rule ({router}) and the controller's
-// ({router, operator}) -- so that consumer could call every pooler's Stream
-// and CopyTables directly, and the controller's CancelWorkflow. A consumer
-// identity appears in no list, and this pins that.
-func TestAConsumerMayCallNothingButTheChangeStream(t *testing.T) {
+// A consumer identity is in no other listener's rule, so the credential an
+// operator hands out for the change stream opens nothing else.
+func TestAConsumerMayCallNothingElse(t *testing.T) {
 	consumer := Identity{Namespace: "ns", Cluster: "demo", Role: RoleConsumer}
 	for _, listener := range []string{RolePooler, RoleAgent, RoleController, RoleRouter} {
 		allow, ok := AllowedCallers(listener)
@@ -350,9 +356,10 @@ func TestAConsumerMayCallNothingButTheChangeStream(t *testing.T) {
 			t.Errorf("a change-stream consumer may call the %s listener", listener)
 		}
 	}
-	// And the reverse, which is what made the old advice dangerous: the
+	// The reverse, which is what made the old advice dangerous: the
 	// router's own identity is a key to those listeners, so it is not
-	// something to hand out.
+	// something to hand out. If this stops being true the test above is
+	// asserting less than it looks like it is.
 	router := Identity{Namespace: "ns", Cluster: "demo", Role: RoleRouter}
 	for _, listener := range []string{RolePooler, RoleController} {
 		allow, _ := AllowedCallers(listener)
