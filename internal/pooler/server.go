@@ -578,6 +578,9 @@ func (r *relay) handle(ctx context.Context, req *pgshardv1.ExecuteRequest) error
 	r.packed = r.packed || req.PackedRows
 	r.batched = r.batched || req.BatchedRows
 	view := r.srv.cfg.Source.View()
+	if e := member(view); e != nil {
+		return r.refuse(e)
+	}
 	if e := serving(view); e != nil {
 		return r.refuse(e)
 	}
@@ -826,6 +829,9 @@ func (s *Server) Reserve(_ context.Context, req *pgshardv1.ReserveRequest) (*pgs
 		return nil, errUnavailable
 	}
 	view := s.cfg.Source.View()
+	if e := member(view); e != nil {
+		return &pgshardv1.ReserveResponse{Error: e}, nil
+	}
 	if e := serving(view); e != nil {
 		return &pgshardv1.ReserveResponse{Error: e}, nil
 	}

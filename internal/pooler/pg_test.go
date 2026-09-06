@@ -152,6 +152,39 @@ func runPGSuite(t *testing.T, image string) {
 	}
 	ck, sk := deriveKeys(ctx, t, admin, "appuser", "app-secret")
 
+	t.Run("recovery_probe_reads_the_local_server", func(t *testing.T) {
+		probe := &RecoveryProbe{DSN: adminDSN, Interval: 10 * time.Millisecond}
+		if _, known := probe.InRecovery(); known {
+			t.Fatal("a probe that has not run reports an answer")
+		}
+		pctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		go probe.Run(pctx)
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			inRecovery, known := probe.InRecovery()
+			if known {
+				if inRecovery {
+					t.Fatal("a primary reported itself in recovery")
+				}
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("the probe never answered")
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		// A server it cannot reach has told it nothing, and the last
+		// answer -- "this member is the primary" -- is exactly the one it
+		// must not keep.
+		gone := &RecoveryProbe{DSN: "host=127.0.0.1 port=1 dbname=postgres connect_timeout=1", Interval: 10 * time.Millisecond}
+		gone.state.Store(recoveryPrimary)
+		gone.poll(ctx)
+		if _, known := gone.InRecovery(); known {
+			t.Fatal("a probe kept its last answer after losing its server")
+		}
+	})
+
 	src := NewStaticSource(View{Generation: 3, Epoch: 1, Role: pgshardv1.HealthStatus_ROLE_PRIMARY, Serving: true})
 	dialer := Dialer{Address: addr, Timeout: 5 * time.Second}
 	srv := NewServer(Config{Pool: NewPool(PoolConfig{MaxBackends: 4}, dialer), Source: src, Dialer: dialer, Database: "postgres",

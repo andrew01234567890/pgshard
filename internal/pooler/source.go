@@ -25,6 +25,10 @@ type View struct {
 	// Migrating is set while a reshard cutover fences the shard's ranges:
 	// new PREPARE TRANSACTIONs are refused so the sources drain.
 	Migrating bool
+	// Standby is set when this pooler's own server says it is in recovery,
+	// which is the one fact about the member that the catalog cannot
+	// supply. Left false while nothing has asked it.
+	Standby bool
 }
 
 // Source supplies the View. The agent/operator will drive it later; today it
@@ -59,11 +63,22 @@ func (s *StaticSource) Set(v View) {
 func (s *StaticSource) View() View { return *s.v.Load() }
 
 // SnapshotSource derives generation and epoch for one shard from a catalog
-// snapshot watcher; role/lag come from Base.
+// snapshot watcher; lag comes from Base.
 type SnapshotSource struct {
 	Watcher *snapshot.Watcher
 	Shard   snapshot.ShardKey
 	Base    View
+	// Local, when set, reports whether this pooler's own server is in
+	// recovery. Without it the view's role is whatever Base was configured
+	// with, which is what let a pooler in front of a demoted primary keep
+	// answering as one.
+	Local LocalMember
+}
+
+// LocalMember reports the recovery state of the server a pooler stands in
+// front of. known is false while nothing has answered yet.
+type LocalMember interface {
+	InRecovery() (inRecovery, known bool)
 }
 
 // View implements Source. Before the first snapshot it reports Base.
@@ -84,6 +99,15 @@ func (s *SnapshotSource) View() View {
 	if sv, ok := snap.Serving[s.Shard]; ok {
 		v.Epoch = uint64(sv.Epoch)
 		v.Migrating = sv.Migrating
+	}
+	if s.Local != nil {
+		if inRecovery, known := s.Local.InRecovery(); known {
+			v.Standby = inRecovery
+			v.Role = pgshardv1.HealthStatus_ROLE_PRIMARY
+			if inRecovery {
+				v.Role = pgshardv1.HealthStatus_ROLE_STANDBY
+			}
+		}
 	}
 	return v
 }
@@ -143,6 +167,27 @@ func serving(v View) *pgshardv1.Error {
 	return &pgshardv1.Error{Sqlstate: fenceSQLState,
 		Message: "this pooler's catalog view is stale, so it cannot say which shard map or epoch it serves",
 		Hint:    "the pooler cannot reach the catalog; the request is not wrong and can be retried",
+		Reason:  pgshardv1.Reason_REASON_STALE_GENERATION}
+}
+
+// member refuses a request that reached a pooler standing in front of a
+// server that is not the primary of its shard.
+//
+// The epoch the pooler fences with is the catalog's for the shard, and it is
+// the same value the router stamps its requests with: both sides of that
+// comparison come from one row, so it catches a router that is behind the
+// catalog and never a pooler in front of the wrong member. A member's own
+// recovery state is the fact the catalog cannot supply, and it is the one
+// that says a promotion has moved on without this pooler -- whether because
+// the router still holds a stream to the member that was demoted, or
+// because this pooler's catalog view has not caught up yet.
+func member(v View) *pgshardv1.Error {
+	if !v.Standby {
+		return nil
+	}
+	return &pgshardv1.Error{Sqlstate: fenceSQLState,
+		Message: "this pooler's server is in recovery, so it is not the primary of its shard",
+		Hint:    "the shard's primary has moved; the request is not wrong and can be retried once the router routes to the member that holds it",
 		Reason:  pgshardv1.Reason_REASON_STALE_GENERATION}
 }
 

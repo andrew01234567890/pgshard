@@ -136,7 +136,19 @@ func runPooler(ctx context.Context, args []string, stdout, stderr io.Writer) int
 				logger.Error("catalog watcher stopped", "err", err)
 			}
 		}()
-		source = &pooler.SnapshotSource{Watcher: w, Shard: snapshot.ShardKey{ShardSet: *shardSet, ShardID: int32(*shardID)}, Base: base}
+		snapSource := &pooler.SnapshotSource{Watcher: w, Shard: snapshot.ShardKey{ShardSet: *shardSet, ShardID: int32(*shardID)}, Base: base}
+		// The epoch a pooler fences with is the catalog's for the shard,
+		// and so is the one the router stamps: that comparison catches a
+		// router behind the catalog and never a pooler in front of a
+		// member that is no longer the primary. Its own server is the only
+		// thing that can answer that, so ask it.
+		if *streamDSN != "" {
+			probe := &pooler.RecoveryProbe{DSN: *streamDSN,
+				Logf: func(f string, a ...any) { logger.Warn(fmt.Sprintf(f, a...)) }}
+			go probe.Run(ctx)
+			snapSource.Local = probe
+		}
+		source = snapSource
 		snapshotAge = func() float64 { return w.AgeSeconds(time.Now()) }
 	}
 	reg := metrics.NewRegistry("pooler")
