@@ -77,17 +77,42 @@
   stale party rather than the router. That is also why `--generation` and
   `--epoch` are refused together with `--catalog-dsn` — they are exactly the
   values a pooler that lost the catalog would otherwise keep serving.
+
+  The epoch a pooler fences with is the catalog's for its shard, and it is
+  the same value the router stamps its requests with. Both sides of that
+  comparison come from one row, so **the epoch fence catches a router that
+  is behind the catalog and never a pooler standing in front of a member
+  that is no longer the primary.** The one fact the catalog cannot supply is
+  the member's own recovery state, so the pooler asks its server directly
+  (`pg_is_in_recovery()` on `--stream-dsn`, every two seconds) and refuses
+  with `55000` "this pooler's server is in recovery, so it is not the
+  primary of its shard" — before anything is dialled. A probe that has not
+  answered yet, or that has lost contact with its server, refuses nothing:
+  it has learned nothing, and the requests it would refuse fail on their own
+  anyway. A probe that loses contact forgets its last answer rather than
+  keeping it, because that answer is "this member is the primary".
+
+  This is a fence against a router holding a stream to the member that was
+  demoted, not against split brain. A member partitioned from the catalog
+  cannot learn that a promotion superseded it, and while it is still
+  running as a primary its own `pg_is_in_recovery()` says so. **The write
+  fence for that case is the agent's Lease self-fence**, which stops the old
+  primary's PostgreSQL before the operator bumps the epoch (see
+  [ha.md](ha.md)); the epoch is the fence against a stale router, and this
+  probe is the fence against a stale route to a demoted member.
 - **Cancel.** The `Cancel` RPC (or an in-stream `CancelRequest`) sends a
   PostgreSQL `CancelRequest` for the backend bound to that session over a
   fresh connection.
 - **COPY.** `CopyInResponse` returns control to the router; `CopyData`,
   `CopyDone` and `CopyFail` are relayed; COPY OUT data is streamed back.
 - **Health.** `Health` streams epoch, generation and `serving` (false once
-  draining) from the `Source`. **`role` and `lag_bytes` are not derived**:
-  the pooler is started with `role` fixed at `PRIMARY` and never revises it,
-  so one beside a standby reports itself primary, and `lag_bytes` is always
-  zero. Nothing in this repository consumes the stream today; do not read
-  either field until they are computed.
+  draining) from the `Source`. `role` follows the recovery probe above where
+  one is wired (`--catalog-dsn` with `--stream-dsn`), and otherwise stays at
+  the configured `PRIMARY`. **`lag_bytes` is still not derived**: the value
+  belongs to the agent, which measures this member's streaming lag, and the
+  pooler has no client for it — it is left absent rather than zero, because
+  zero is what a caught-up standby reports. Nothing in this repository
+  consumes the stream today.
 - **Stream / Ack.** `Stream` opens the shard's logical slot (`slot`, or
   `pgshard_<stream>_<group>` derived from `stream` and `--stream-shard`) over
   a replication connection (`--stream-dsn`) and streams decoded pgoutput v4
