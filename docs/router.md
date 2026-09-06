@@ -192,15 +192,25 @@ the rest with `0A000`. See *Routing* below.
 The planner parses each statement with the bound PostgreSQL 18 grammar and
 looks up every relation it references in the snapshot: `(database, schema,
 table)` where an unqualified name is searched along the session's search
-path: `public` by default, a startup `options=-c search_path=…`, then every
-session-level `SET search_path` / `RESET search_path` / `RESET ALL` in order
+path: `"$user", public` by default -- what a backend runs with and what the
+router advertises at startup -- a startup `options=-c search_path=…`, then
+every session-level `SET search_path` / `RESET search_path` / `RESET ALL` in
+order
 (staged ones included, so a `SET` inside a transaction takes effect for the
 next statement and is dropped on rollback). `pg_catalog`, `information_schema`
 and `pg_temp` are always home-shard. `SET LOCAL search_path` and `SET
 search_path FROM CURRENT` are refused, as is a shard-key literal in the ON
 clause of an outer join (it filters one side only and does not pin the
-statement). The effective
-placement in `pgshard.table_status` decides:
+statement).
+
+`"$user"` resolves to the schema named after the login role, as it does in
+PostgreSQL, so a declared table in the schema a role owns is routed rather
+than treated as undeclared. One limit: an unqualified name that matches
+nothing in the path is reported in `public`. PostgreSQL would use the first
+schema of the path that **exists**, and the snapshot lists declared tables
+rather than schemas, so the planner cannot tell which those are.
+
+The effective placement in `pgshard.table_status` decides:
 
 | Placement | Reads | Writes | DDL |
 |---|---|---|---|
