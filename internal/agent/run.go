@@ -201,8 +201,19 @@ func Run(ctx context.Context, cfg *Config, log *slog.Logger) error {
 			authz = append(authz, grpccreds.Authorize(allow))
 		}
 	}
-	grpcCreds, err := grpccreds.Listener(cfg.GRPCTLS.CertFile, cfg.GRPCTLS.KeyFile, cfg.GRPCTLS.CAFile,
-		cfg.GRPCTLS.CertFile == "" && cfg.GRPCTLS.KeyFile == "" && cfg.GRPCTLS.CAFile == "", authz...)
+	plaintext := cfg.GRPCTLS.Plaintext()
+	if plaintext {
+		// Said once, loudly, at the one moment an operator is looking:
+		// internalTLS.issue mounts the certificates on every member
+		// without requiring them, so a cluster can carry a full internal
+		// PKI and still serve Promote, Demote, SetWriteFence and Reclone
+		// behind a bearer token in clear. Nothing else says so -- the
+		// listener starts, the RPCs work, and the only evidence is a
+		// field that was not set.
+		log.Warn("agent gRPC is PLAINTEXT: Promote, Demote, SetWriteFence, Reclone and DropSlot are authorised by a bearer token sent in clear",
+			"enable", "spec.internalTLS.agentMTLS", "reachable_by", "every peer spec.networkPolicy.clients admits to the agent port")
+	}
+	grpcCreds, err := grpccreds.Listener(cfg.GRPCTLS.CertFile, cfg.GRPCTLS.KeyFile, cfg.GRPCTLS.CAFile, plaintext, authz...)
 	if err != nil {
 		return fmt.Errorf("agent gRPC credentials: %w", err)
 	}

@@ -144,6 +144,13 @@ type TLSFiles struct {
 	AuthorizeCallers bool `json:"authorizeCallers,omitempty"`
 }
 
+// Plaintext reports that the listener carries no transport security, so the
+// only thing between a caller and Promote, Demote, SetWriteFence, Reclone
+// and DropSlot is a bearer token sent in clear.
+func (t TLSFiles) Plaintext() bool {
+	return t.CertFile == "" && t.KeyFile == "" && t.CAFile == ""
+}
+
 // LeaseConfig controls the coordination.k8s.io Lease guarding the primary.
 type LeaseConfig struct {
 	Enabled   bool     `json:"enabled"`
