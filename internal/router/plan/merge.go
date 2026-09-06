@@ -169,6 +169,19 @@ func (b *mergeBuilder) run() error {
 			return err
 		}
 	}
+	if !aggregated && !shardLocal {
+		// An aggregate is recognised by name, so a user-defined one reads
+		// as a scalar function and the shards would be concatenated: one
+		// partial row per shard, reported as the answer. Refuse the call
+		// this router cannot classify instead. Grouping on the shard key
+		// makes every group shard-local, which is why shardLocal is exempt.
+		for _, t := range s.GetTargetList() {
+			if name := unknownFunction(t); name != "" {
+				return notYet("multi-shard "+name+"() is not available yet: it is not a PostgreSQL built-in, and a user-defined aggregate cannot be told from a scalar function by name",
+					"filter on one shard key value, or group by the shard key \""+b.shardKey+"\" so that every group lives on one shard")
+			}
+		}
+	}
 	limit, offset, err := b.limits()
 	if err != nil {
 		return err
