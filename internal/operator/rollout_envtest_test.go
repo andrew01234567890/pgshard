@@ -506,3 +506,47 @@ func TestARebuildWaitsForTheDeletedPodToGoAway(t *testing.T) {
 		}
 	}
 }
+
+// TestAClaimAMemberHasMovedOffIsCollectedWithoutAStepInFlight: retiring the
+// old claim used to happen only in the pass that saw a rebuild complete. If
+// that pass was missed -- a lost status write, two passes racing -- nothing
+// collected it ever again: the member is on its new claim by then, so
+// classifyMemberStorage calls it unchanged, no rebuild is listed and nothing
+// is in flight. A cluster was seen holding the old claim of its last member
+// for 25 minutes with the rollout reporting idle (PGS-704).
+func TestAClaimAMemberHasMovedOffIsCollectedWithoutAStepInFlight(t *testing.T) {
+	r, _, _, c := healthyCluster(t, "sweep")
+	member := "sweep-shard-0-1"
+	stale := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Namespace: c.Namespace, Name: member + "-v9",
+			Labels: map[string]string{LabelCluster: c.Name, LabelGroup: "shard-0", LabelMember: member}},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources:   corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")}},
+		},
+	}
+	if err := k8sClient.Create(context.Background(), stale); err != nil {
+		t.Fatal(err)
+	}
+	if st := groupStatus(t, "sweep-shard-0"); st.Rollout != nil {
+		t.Fatalf("the group must be idle for this to be the case under test: %+v", st.Rollout)
+	}
+
+	reconcile(t, r, c)
+
+	var got corev1.PersistentVolumeClaim
+	err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: c.Namespace, Name: member + "-v9"}, &got)
+	if err == nil && got.DeletionTimestamp == nil {
+		t.Fatal("a claim the member is not using was left behind by a settled pass with no step in flight")
+	}
+	if err != nil && !apierrors.IsNotFound(err) {
+		t.Fatal(err)
+	}
+	// The claim it IS using is untouched.
+	if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: c.Namespace, Name: member}, &got); err != nil {
+		t.Fatalf("the member's own claim was swept: %v", err)
+	}
+	if got.DeletionTimestamp != nil {
+		t.Fatal("the member's own claim was deleted")
+	}
+}

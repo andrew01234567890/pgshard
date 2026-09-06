@@ -223,18 +223,36 @@ func (r *ClusterReconciler) rollout(ctx context.Context, c *pgshardv1alpha1.PgSh
 		return nil
 	}
 
-	// A step in flight has completed once the group is settled again; a
-	// rebuild also retires the old claim now that the new member streams.
+	// A step in flight has completed once the group is settled again.
 	if inFlight != nil {
-		if inFlight.Phase == pgshardv1alpha1.RolloutPhaseRebuilding {
-			if err := r.deleteRetiredPVCs(ctx, c, g, inFlight.Member, obs.state.pvcs[inFlight.Member]); err != nil {
-				return err
-			}
-		}
 		if err := r.setGroupRollout(ctx, c, g, nil); err != nil {
 			return err
 		}
 		log.Info("rollout step complete", "phase", inFlight.Phase, "member", inFlight.Member)
+	}
+
+	// Claims a member has moved off are collected on every settled pass,
+	// not only in the pass that saw a rebuild complete. Tying it to that
+	// one transition meant a missed pass -- a lost status write, two passes
+	// racing -- left the old claim behind for good: by then the member is
+	// on its new claim, so classifyMemberStorage calls it unchanged, no
+	// rebuild is listed, nothing is in flight, and no later pass has any
+	// reason to look. The group ends up on the new storage class with the
+	// old claim still there and the rollout reporting idle.
+	//
+	// Settled is what makes this safe to do for every member: each one is
+	// ready and streaming on the claim it currently holds, so anything
+	// older is garbage.
+	for _, name := range g.MemberNames() {
+		keep := obs.state.pvcs[name]
+		if keep == "" {
+			// Nothing to measure "older" against; a member whose claim is
+			// unknown is left alone rather than swept by guesswork.
+			continue
+		}
+		if err := r.deleteRetiredPVCs(ctx, c, g, name, keep); err != nil {
+			return err
+		}
 	}
 
 	// A member the spec has stopped describing is retired before anything
