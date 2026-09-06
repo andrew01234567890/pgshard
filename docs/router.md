@@ -253,7 +253,10 @@ reported in `ParameterDescription` for that statement (drivers that
 prepare-and-describe, such as pgx's default mode and JDBC, therefore always
 carry the right type), else a cast in the statement text; an undeclared
 text-format value that looks numeric is refused with the same hint (`$1::int8`
-or `$1::text`), never guessed.
+or `$1::text`), never guessed. That type decodes the **wire value**; a cast in
+the statement is then evaluated **over** it, in PostgreSQL's own order — so
+`$1::int8` bound to a `text` `'7'` hashes as the integer 7, which is what the
+comparison uses, and `$1::text` bound to an `int8` hashes as `"7"`.
 
 A cast that carries a **length** is applied before the value is hashed:
 PostgreSQL evaluates `'abcdef'::varchar(3)` to `abc` before the comparison,
