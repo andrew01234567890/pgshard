@@ -115,6 +115,10 @@ type BarrierStore interface {
 	FenceOwnedBy(ctx context.Context, owner string) (bool, error)
 	// FencedAt returns when the current fence was raised.
 	FencedAt(ctx context.Context) (time.Time, error)
+	// ClearStaleBarrierFence clears the fence of a run that never finished
+	// and reports whether it cleared one. It leaves the fence a restored
+	// cluster comes back holding, which names a certified restore point.
+	ClearStaleBarrierFence(ctx context.Context) (bool, error)
 	// DecisionWatermark returns a value that grows with every decision row
 	// ever inserted, whether or not the row still exists.
 	DecisionWatermark(ctx context.Context) (int64, error)
@@ -521,11 +525,24 @@ func (b *Barrier) drainWriters(ctx context.Context, name string, groups []GroupR
 	}
 }
 
-// Recover lifts a pause left behind by a barrier whose controller died. It
-// never touches the write fence: a fence is also raised deliberately by a
-// barrier restore, which keeps it up until two-phase reconciliation finishes,
-// and clearing that would unfence a cluster that must stay fenced. The fence
-// of a dead barrier is cleared by the next barrier, which takes it over.
+// Recover lifts the pause AND the write fence left behind by a barrier whose
+// controller died.
+//
+// It used to lift only the pause, and only when a shard was still paused --
+// so a controller killed after the fence went up and before any shard was
+// paused left write_fence = true with nothing that would ever clear it. The
+// next barrier takes a fence over, but with no schedule, or with a schedule
+// that cannot run because the cluster is fenced, there is no next barrier:
+// every router answers 57P03 to every write, for good.
+//
+// A cluster restored to a barrier comes back holding that barrier's fence --
+// owner, reason and all -- and it must stay up until two-phase
+// reconciliation finishes. What separates the two is the restore point: a run
+// reserves its row uncertified before raising the fence and certifies it just
+// before releasing, so a fence naming an uncertified row is an interrupted
+// run's, and a restored catalog's names a certified one. A run that certified
+// and then died before releasing is the narrow case this still leaves to the
+// next barrier or an operator.
 //
 // It acts only when no run can still be in flight: the barrier lock is free
 // (so no live run holds it) and the fence has been up longer than the longest
@@ -571,11 +588,23 @@ func (b *Barrier) Recover(ctx context.Context) error {
 			break
 		}
 	}
-	if !paused {
-		return nil
+	if paused {
+		b.logger().Warn("barrier: shards left paused by an interrupted run; resuming writes")
+		if err := b.resumeAll(ctx, "recovery", groups); err != nil {
+			return err
+		}
 	}
-	b.logger().Warn("barrier: shards left paused by an interrupted run; resuming writes")
-	return b.resumeAll(ctx, "recovery", groups)
+	// After the shards, never before: the fence is what stops routers
+	// sending writes, and lifting it while a shard is still paused sends
+	// them at a shard that refuses them.
+	cleared, err := b.Store.ClearStaleBarrierFence(ctx)
+	if err != nil {
+		return err
+	}
+	if cleared {
+		b.logger().Warn("barrier: cleared the cluster write fence of an interrupted run")
+	}
+	return nil
 }
 
 // maxRunTime is the longest a barrier can take before recovery may assume no
@@ -837,6 +866,11 @@ func (s *PGBarrierStore) FenceOwnedBy(ctx context.Context, owner string) (bool, 
 	var mine bool
 	err := s.Pool.QueryRow(ctx, `SELECT write_fence AND write_fence_owner = $1 FROM pgshard.shard_map_generation`, owner).Scan(&mine)
 	return mine, err
+}
+
+// ClearStaleBarrierFence implements BarrierStore.
+func (s *PGBarrierStore) ClearStaleBarrierFence(ctx context.Context) (bool, error) {
+	return catalog.ClearStaleBarrierFence(ctx, s.Pool)
 }
 
 // FencedAt implements BarrierStore.

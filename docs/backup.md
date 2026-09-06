@@ -354,17 +354,25 @@ one bound cluster after another) runs `controller.Barrier`:
 6. release the fence — on every failure path the RUNNING controller takes,
    and nothing is recorded.
 
-**A controller that dies mid-barrier leaves the fence up.** The release is the
-running process's, so a pod that is OOM-killed or a node that disappears
-between step 1 and step 6 leaves `write_fence = true` in
+**A controller that dies mid-barrier is repaired by the next leader.** The
+release in step 6 is the running process's, so a pod that is OOM-killed or a
+node that disappears between step 1 and step 6 leaves `write_fence = true` in
 `pgshard.shard_map_generation`, and every router refuses writes with `57P03`
-once its buffering window expires. Recovery on the next leader resumes the
-shards but **does not lower the fence** (`Barrier.Recover`, and see the
-runbook): a fence is also what a cluster restored to a barrier comes back
-holding, and clearing that would unfence a cluster mid two-phase
-reconciliation. The fence is cleared by the next barrier, which takes it over
-— so a cluster with no `barrierSchedule` stays fenced until someone runs one
-or clears it by hand. `docs/runbooks/stuck-workflows.md` has the command.
+once its buffering window expires. `Barrier.Recover` on the next leader lifts
+both halves — the shard pauses first, then the fence — once the barrier lock
+is free and the fence is older than the longest a run can take.
+
+It lifts **only the fence of a run that never certified**. A cluster restored
+to a barrier comes back holding that barrier's fence — owner, reason and all,
+because the restore point was taken while the fence was up — and that one must
+stay up until two-phase reconciliation finishes. Reason and owner cannot
+separate the two; the restore point can, because a run reserves its row
+uncertified before raising the fence (step 1) and certifies it just before
+releasing (step 5). A fence naming an uncertified row is an interrupted run's;
+one naming a certified row is a restored cluster's.
+
+The narrow case still left to an operator is a run that certified and then
+died before step 6. `docs/runbooks/stuck-workflows.md` has the command.
 
 `Controller.ListBarriers` (`certified_only`) lists them newest first; the
 restore point name every group shares is `pgshard-<name>`.

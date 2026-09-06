@@ -83,3 +83,78 @@ func TestARestoredCatalogCanBeUnfenced(t *testing.T) {
 		t.Fatalf("fence=%v owner=%q; a restored catalog must come back unfenced and unowned", fenced, owner)
 	}
 }
+
+// TestOnlyAnInterruptedRunsFenceIsClearedByRecovery: a barrier whose
+// controller died leaves a fence nothing would ever clear, and recovery has
+// to lift it. A cluster restored to a barrier comes back holding that
+// barrier's fence -- owner, reason and all -- and that one must stay up until
+// two-phase reconciliation finishes. What separates them is the restore
+// point: a run reserves its row uncertified before raising the fence and
+// certifies it just before releasing.
+func TestOnlyAnInterruptedRunsFenceIsClearedByRecovery(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	conn := connect(t, startPostgres(t, candidateImages[0]))
+	if err := Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	read := func() (bool, string) {
+		t.Helper()
+		var fenced bool
+		var owner string
+		if err := conn.QueryRow(ctx, `SELECT write_fence, write_fence_owner FROM pgshard.shard_map_generation`).Scan(&fenced, &owner); err != nil {
+			t.Fatal(err)
+		}
+		return fenced, owner
+	}
+	reserve := func(name string, certified bool) {
+		t.Helper()
+		if _, err := conn.Exec(ctx, `INSERT INTO pgshard.restore_points (id, name, shard_map_generation, certified)
+			VALUES (gen_random_uuid(), $1, 1, $2)`, name, certified); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Nothing raised: nothing to clear.
+	if cleared, err := ClearStaleBarrierFence(ctx, conn); err != nil || cleared {
+		t.Fatalf("cleared=%v err=%v with no fence raised", cleared, err)
+	}
+
+	// An unowned fence was raised by something that is not a barrier.
+	if err := SetWriteFence(ctx, conn, true, "restoring"); err != nil {
+		t.Fatal(err)
+	}
+	if cleared, err := ClearStaleBarrierFence(ctx, conn); err != nil || cleared {
+		t.Fatalf("an unowned fence was cleared: cleared=%v err=%v", cleared, err)
+	}
+	if err := SetWriteFence(ctx, conn, false, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// What a restored cluster comes back holding: the fence of a barrier
+	// that completed, so its row is certified.
+	reserve("nightly", true)
+	if err := RaiseWriteFence(ctx, conn, "barrier nightly", "the-barrier-that-completed"); err != nil {
+		t.Fatal(err)
+	}
+	if cleared, err := ClearStaleBarrierFence(ctx, conn); err != nil || cleared {
+		t.Fatalf("a restored cluster was unfenced mid-reconciliation: cleared=%v err=%v", cleared, err)
+	}
+	if fenced, _ := read(); !fenced {
+		t.Fatal("the restored cluster's fence was lifted under it")
+	}
+
+	// What an interrupted run leaves: the row was reserved and never
+	// certified.
+	reserve("interrupted", false)
+	if err := RaiseWriteFence(ctx, conn, "barrier interrupted", "a-controller-that-died"); err != nil {
+		t.Fatal(err)
+	}
+	cleared, err := ClearStaleBarrierFence(ctx, conn)
+	if err != nil || !cleared {
+		t.Fatalf("an interrupted run's fence was left up: cleared=%v err=%v", cleared, err)
+	}
+	if fenced, owner := read(); fenced || owner != "" {
+		t.Fatalf("fence=%v owner=%q after recovery", fenced, owner)
+	}
+}
