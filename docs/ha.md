@@ -62,7 +62,8 @@ The primary is unhealthy when its pod is missing, or the pod is not Ready and
    (`ErrLeaseHeldByOther`) when the Lease is renewed by any identity other than
    the old primary or the operator. A still-running old primary sees the
    foreign holder on its next renewal and self-fences (fast shutdown, exit).
-2. waits (30s bound, 1s poll) until the old primary no longer answers
+2. waits (30s bound, 1s poll, and the fence Lease renewed on every poll so
+   the wait cannot outlive it) until the old primary no longer answers
    `Status` as a running primary and every other reachable member reports no
    streaming WAL receiver; on timeout it proceeds only if the old primary is gone.
 3. picks the candidate: highest `pg_last_wal_receive_lsn()` among **all**

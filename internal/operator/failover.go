@@ -564,7 +564,7 @@ func (r *ClusterReconciler) failover(ctx context.Context, c *pgshardv1alpha1.PgS
 		r.Metrics.Failovers.Inc()
 	}
 
-	views, err := r.quiesce(ctx, g, old, members, password)
+	views, err := r.quiesce(ctx, c, g, old, members, password)
 	if err != nil {
 		return state, err
 	}
@@ -659,10 +659,26 @@ func (r *ClusterReconciler) pauseIfFenced(ctx context.Context, c *pgshardv1alpha
 // and every other reachable member has stopped streaming, then returns the
 // members' views. After standbyQuiesceTimeout it proceeds with whatever is
 // reachable, unless the old primary is still live.
-func (r *ClusterReconciler) quiesce(ctx context.Context, g Group, old string, members map[string]*memberInfo, password string) ([]memberView, error) {
+func (r *ClusterReconciler) quiesce(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group, old string, members map[string]*memberInfo, password string) ([]memberView, error) {
 	log := logf.FromContext(ctx).WithValues("group", g.Name(), "oldPrimary", old)
 	deadline := r.now().Add(r.quiesceTimeout())
+	// Every probe in the loop is bounded by the quiesce deadline as well as
+	// by its own timeout. A ProbeStandby (15s) for each standby meant one
+	// iteration could run for longer than the whole quiesce, and the
+	// deadline is only tested between iterations -- so with two hung
+	// standbys the wait outlived the fence Lease, which is written once
+	// when the failover starts and was renewed by nothing until the
+	// promotion.
+	qctx, cancelQ := context.WithDeadline(ctx, deadline)
+	defer cancelQ()
 	for {
+		// The fence has to outlive the wait it is fencing. Without this a
+		// restarted old primary finds the Lease expired, takes it, and
+		// starts PostgreSQL writable while the operator is still deciding
+		// who to promote.
+		if err := r.renewFence(ctx, c, g); err != nil {
+			log.Info("could not renew the fence while quiescing", "err", err)
+		}
 		oldGone := true
 		if m := members[old]; m != nil && m.pod != nil && m.ip != "" {
 			if st, err := r.Agents.Status(ctx, agentAddr(m.ip)); err == nil && st.Running && st.Primary {
@@ -677,14 +693,13 @@ func (r *ClusterReconciler) quiesce(ctx context.Context, g Group, old string, me
 			}
 			v := memberView{Name: name}
 			if m := members[name]; m != nil && m.pod != nil && m.ip != "" {
-				st, err := r.Prober.ProbeStandby(ctx, HostDSN(m.ip, password))
+				st, err := r.Prober.ProbeStandby(qctx, HostDSN(m.ip, password))
 				if err != nil {
 					// quiesce polls, so logging each failure would bury the
 					// run. The views are already logged every iteration.
 					v.Why = err.Error()
 				} else {
 					v.Reachable, v.InRecovery, v.Streaming, v.FlushLSN = true, st.InRecovery, st.Streaming, st.FlushLSN
-					v.ReadySlots = r.readySlots(ctx, g, name, m.ip)
 				}
 			}
 			if !v.Reachable || v.Streaming {
@@ -693,14 +708,14 @@ func (r *ClusterReconciler) quiesce(ctx context.Context, g Group, old string, me
 			views = append(views, v)
 		}
 		if oldGone && allStopped {
-			return views, nil
+			return r.withReadySlots(ctx, g, members, views), nil
 		}
 		log.V(1).Info("quiesce: waiting", "oldGone", oldGone, "views", fmt.Sprintf("%+v", views))
 		if r.now().After(deadline) {
 			if !oldGone {
 				return nil, errPrimaryStillLive
 			}
-			return views, nil
+			return r.withReadySlots(ctx, g, members, views), nil
 		}
 		select {
 		case <-ctx.Done():
@@ -708,6 +723,45 @@ func (r *ClusterReconciler) quiesce(ctx context.Context, g Group, old string, me
 		case <-time.After(r.pollInterval()):
 		}
 	}
+}
+
+// readySlotsBudget bounds the one slot listing pass quiesce makes. It is
+// asked once the wait is over rather than on every iteration: a listing
+// costs a round trip to each member's agent, and paying that per poll was
+// most of what made an iteration outlast the fence it was quiescing under.
+// The answer is only a tie-break between candidates holding the same LSN, so
+// a member that cannot answer in time simply does not win the tie.
+const readySlotsBudget = 10 * time.Second
+
+// withReadySlots fills in the slot counts of the members that answered.
+func (r *ClusterReconciler) withReadySlots(ctx context.Context, g Group, members map[string]*memberInfo, views []memberView) []memberView {
+	sctx, cancel := context.WithTimeout(ctx, readySlotsBudget)
+	defer cancel()
+	for i := range views {
+		if !views[i].Reachable {
+			continue
+		}
+		if m := members[views[i].Name]; m != nil && m.ip != "" {
+			views[i].ReadySlots = r.readySlots(sctx, g, views[i].Name, m.ip)
+		}
+	}
+	return views
+}
+
+// renewFence bumps the fence Lease while the operator holds it, so a wait
+// under the fence cannot outlive it.
+func (r *ClusterReconciler) renewFence(ctx context.Context, c *pgshardv1alpha1.PgShardCluster, g Group) error {
+	var lease coordinationv1.Lease
+	if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: g.LeaseName()}, &lease); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if ptr.Deref(lease.Spec.HolderIdentity, "") != FenceHolder {
+		return nil
+	}
+	now := metav1.NewMicroTime(r.now())
+	lease.Spec.RenewTime = &now
+	lease.Spec.LeaseDurationSeconds = ptr.To(fenceLeaseSeconds)
+	return r.Update(ctx, &lease)
 }
 
 func (r *ClusterReconciler) quiesceTimeout() time.Duration {

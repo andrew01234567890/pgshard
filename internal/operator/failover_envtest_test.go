@@ -820,3 +820,52 @@ func TestSwitchoverGivesUpOnATargetThatNeverCatchesUp(t *testing.T) {
 		t.Fatalf("the group must keep its primary: %+v", st)
 	}
 }
+
+// leaseUpdates counts writes to a named Lease, which is how the renewal
+// below is observed: without it the fence is written once and nothing
+// touches it again until the promotion.
+type leaseUpdates struct {
+	client.Client
+	name string
+	n    *int
+}
+
+func (c leaseUpdates) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	if l, ok := obj.(*coordinationv1.Lease); ok && l.Name == c.name {
+		*c.n++
+	}
+	return c.Client.Update(ctx, obj, opts...)
+}
+
+// TestTheFenceIsRenewedWhileQuiescing: the fence Lease is written once when
+// the failover starts, with a 60s duration meant to "cover the wait for
+// standbys plus promotion". Nothing renewed it. A quiesce that runs long --
+// each iteration probes every standby, and the deadline is only tested
+// between iterations -- outlives it, and then a restarted old primary finds
+// the Lease expired, takes it, and starts PostgreSQL writable while the
+// operator is still deciding who to promote.
+func TestTheFenceIsRenewedWhileQuiescing(t *testing.T) {
+	r, fp, fa, c := healthyCluster(t, "fr")
+	shard := Groups(c)[1]
+	updates := 0
+	r.Client = leaseUpdates{Client: r.Client, name: shard.LeaseName(), n: &updates}
+	// Long enough to iterate, short enough to be a test.
+	r.QuiesceTimeout, r.PollInterval = 400*time.Millisecond, 50*time.Millisecond
+
+	deletePod(t, "fr-shard-0-0")
+	fa.set(podIP(1, 0), AgentStatus{}, errors.New("connection refused"))
+	// A standby that never stops streaming keeps quiesce iterating to its
+	// deadline, which is the case the renewal is for.
+	fp.standbys[podIP(1, 1)] = StandbyState{InRecovery: true, Streaming: true, FlushLSN: 100}
+	fp.standbys[podIP(1, 2)] = StandbyState{InRecovery: true, Streaming: true, FlushLSN: 200}
+	fp.err = errors.New("no primary")
+
+	reconcile(t, r, c)
+
+	// One write publishes the fence and one hands the Lease to the new
+	// primary; anything above that is the renewal, and without it the
+	// count stops at those two.
+	if updates < 3 {
+		t.Fatalf("the fence Lease was written %d times during a failover whose quiesce ran to its deadline; it is not being renewed", updates)
+	}
+}
