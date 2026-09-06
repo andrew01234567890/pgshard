@@ -325,3 +325,34 @@ func TestTheAgentAuthorisesOnlyWithIssuedCertificates(t *testing.T) {
 		})
 	}
 }
+
+// The consumer certificate exists so an operator has something to hand a
+// change-stream consumer other than the router's own, which is also a
+// credential for every pooler and for the controller. It must be client
+// only and carry no DNS names: a consumer dials the VStream API and serves
+// nothing, so a leaked one cannot be stood up as a server for anything.
+func TestTheConsumerCertificateIsClientOnly(t *testing.T) {
+	c := issuingCluster("consumer")
+	r := pkiReconciler(t, time.Now(), c)
+	if err := r.reconcilePKI(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	sec := secretOf(t, r, c.Namespace, RoleTLSSecretName(c.Name, pki.RoleConsumer))
+	block, _ := pem.Decode(sec.Data["tls.crt"])
+	if block == nil {
+		t.Fatal("no certificate in the consumer secret")
+	}
+	crt, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(crt.DNSNames) != 0 {
+		t.Errorf("the consumer certificate is valid to serve %v", crt.DNSNames)
+	}
+	if slices.Contains(crt.ExtKeyUsage, x509.ExtKeyUsageServerAuth) {
+		t.Error("the consumer certificate may be used as a server")
+	}
+	if !slices.Contains(crt.ExtKeyUsage, x509.ExtKeyUsageClientAuth) {
+		t.Error("the consumer certificate cannot be used as a client, which is all it is for")
+	}
+}
